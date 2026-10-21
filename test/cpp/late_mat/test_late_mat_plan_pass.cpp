@@ -490,7 +490,7 @@ TEST_CASE("a join-child wrap concat carries the payload past", "[late_mat][lifet
   opaque_op reader(2);
 
   wide_scan scan(2);
-  test_concat wrap(make_string_types(2), 0, &downstream, /*is_build=*/false);
+  test_concat wrap(make_string_types(2), 0, false);
   wrap.children.push_back(duckdb::make_uniq<wide_scan>(2));
   scan.link(&wrap);
   wrap.link(&reader);

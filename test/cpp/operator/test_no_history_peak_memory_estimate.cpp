@@ -104,8 +104,7 @@ TEST_CASE("concat no_history_peak_memory_estimate: 0 batches returns 0",
           "[no_history_peak_memory_estimate][concat]")
 {
   auto f = make_hash_join();
-  sirius_physical_concat concat{
-    sirius::from_duckdb_vec(f.logical_join->types), 0, f.hash_join.get(), /*is_build=*/false};
+  sirius_physical_concat concat{sirius::from_duckdb_vec(f.logical_join->types), 0, false};
   REQUIRE(concat.no_history_peak_memory_estimate({0, 500}) == 0);
 }
 
@@ -113,8 +112,7 @@ TEST_CASE("concat no_history_peak_memory_estimate: 1 batch returns 0",
           "[no_history_peak_memory_estimate][concat]")
 {
   auto f = make_hash_join();
-  sirius_physical_concat concat{
-    sirius::from_duckdb_vec(f.logical_join->types), 0, f.hash_join.get(), false};
+  sirius_physical_concat concat{sirius::from_duckdb_vec(f.logical_join->types), 0, false};
   REQUIRE(concat.no_history_peak_memory_estimate({1, 500}) == 0);
 }
 
@@ -122,8 +120,7 @@ TEST_CASE("concat no_history_peak_memory_estimate: 2 batches returns bytes",
           "[no_history_peak_memory_estimate][concat]")
 {
   auto f = make_hash_join();
-  sirius_physical_concat concat{
-    sirius::from_duckdb_vec(f.logical_join->types), 0, f.hash_join.get(), false};
+  sirius_physical_concat concat{sirius::from_duckdb_vec(f.logical_join->types), 0, false};
   REQUIRE(concat.no_history_peak_memory_estimate({2, 500}) == 500);
 }
 
@@ -131,8 +128,7 @@ TEST_CASE("concat no_history_peak_memory_estimate: many batches returns bytes",
           "[no_history_peak_memory_estimate][concat]")
 {
   auto f = make_hash_join();
-  sirius_physical_concat concat{
-    sirius::from_duckdb_vec(f.logical_join->types), 0, f.hash_join.get(), false};
+  sirius_physical_concat concat{sirius::from_duckdb_vec(f.logical_join->types), 0, false};
   REQUIRE(concat.no_history_peak_memory_estimate({10, 1024}) == 1024);
 }
 

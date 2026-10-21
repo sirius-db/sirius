@@ -935,23 +935,20 @@ void test_dictionary_width_metadata(rmm::device_async_resource_ref mr)
     std::vector<bool> valid;
     std::int64_t width;
   };
-  std::array<fixture, 8> const fixtures{{
+  // Null-free inputs only: validity never reaches the codec, it rides the plan tree's sidecar.
+  std::array<fixture, 5> const fixtures{{
     {{"aa", "bb", "aa", "cc"}, {}, 2},
     {{"only", "only", "only"}, {}, 4},
     {{"a", "bbb", "", "cc"}, {}, 0},
-    {{"aa", "ignored", "bb", "aa"}, {true, false, true, true}, 2},
-    {{"a", "ignored", "bbb", "a"}, {true, false, true, true}, 0},
     {{"", "", ""}, {}, 0},
     {{}, {}, 0},
-    {{"aa", "b", ""}, {false, false, false}, 0},
   }};
   rmm::cuda_stream stream(rmm::cuda_stream::flags::non_blocking);
   simpatico::stream_pool pool;
   expect(pool.init(2), "dictionary width pool init");
   for (auto const& fixture : fixtures) {
     auto input = make_strings_column(fixture.values, fixture.valid, stream.view());
-    // Use the codec directly so nullable inputs exercise dictionary metadata without changing
-    // the table compressor's independent null-input policy.
+    // Use the codec directly so the dictionary metadata is exercised without a plan.
     auto encoded = simpatico::dictionary_compressor{}.compress(input->view(), stream.view(), mr);
     auto const* original =
       dynamic_cast<simpatico::dictionary_compressed_representation const*>(encoded.get());
@@ -1201,50 +1198,46 @@ void test_dictionary_predicate_lookup(rmm::device_async_resource_ref mr)
     stream.synchronize();
     return mask;
   };
-  auto const make_input = [&](std::size_t key_count, bool nullable) {
+  // Null-free inputs only: validity never reaches the codec, it rides the plan tree's sidecar and
+  // the caller reattaches it to the predicate.
+  auto const make_input = [&](std::size_t key_count) {
     std::vector<std::string> values(rows);
-    std::vector<bool> valid;
-    if (nullable) valid.assign(rows, true);
-    for (std::size_t i = 0; i < values.size(); ++i) {
+    for (std::size_t i = 0; i < values.size(); ++i)
       values[i] = key_pool[(i * 7 + i / 3) % key_count];
-      if (nullable && i % 11 == 0) valid[i] = false;
-    }
-    return make_strings_column(values, valid, stream.view());
+    return make_strings_column(values, {}, stream.view());
   };
 
   for (std::size_t key_count : {std::size_t{1}, std::size_t{2}, std::size_t{4}, std::size_t{5}}) {
-    for (bool nullable : {false, true}) {
-      auto input   = make_input(key_count, nullable);
-      auto encoded = simpatico::dictionary_compressor{}.compress(input->view(), stream.view(), mr);
-      auto const& dictionary =
-        dynamic_cast<simpatico::dictionary_compressed_representation const&>(*encoded);
-      auto const& first = key_pool.front();
-      auto const& last  = key_pool[key_count - 1];
-      std::vector<std::vector<std::string>> const needle_sets{
-        {first},
-        {first, last},
-        {"absent"},
-        {""},
-        {first + " AND MORE BYTES THAN ANY KEY"},
-        {first.substr(0, first.size() - 1)},
-        {"absent", last, first},
-      };
-      for (auto const& needles : needle_sets) {
-        auto result = evaluate(dictionary, needles);
-        expect(result != nullptr, "dictionary predicate declined a supported shape");
-        expect(result->type().id() == cudf::type_id::BOOL8 && result->size() == rows,
-               "dictionary predicate result shape");
-        auto expected = reference(input->view(), needles);
-        expect(bool8_equal_where_valid_completed(expected->view(), result->view()),
-               "dictionary predicate lookup differs from the cuDF reference");
-      }
+    auto input   = make_input(key_count);
+    auto encoded = simpatico::dictionary_compressor{}.compress(input->view(), stream.view(), mr);
+    auto const& dictionary =
+      dynamic_cast<simpatico::dictionary_compressed_representation const&>(*encoded);
+    auto const& first = key_pool.front();
+    auto const& last  = key_pool[key_count - 1];
+    std::vector<std::vector<std::string>> const needle_sets{
+      {first},
+      {first, last},
+      {"absent"},
+      {""},
+      {first + " AND MORE BYTES THAN ANY KEY"},
+      {first.substr(0, first.size() - 1)},
+      {"absent", last, first},
+    };
+    for (auto const& needles : needle_sets) {
+      auto result = evaluate(dictionary, needles);
+      expect(result != nullptr, "dictionary predicate declined a supported shape");
+      expect(result->type().id() == cudf::type_id::BOOL8 && result->size() == rows,
+             "dictionary predicate result shape");
+      auto expected = reference(input->view(), needles);
+      expect(bool8_equal_where_valid_completed(expected->view(), result->view()),
+             "dictionary predicate lookup differs from the cuDF reference");
     }
   }
 
   // Without a cuDF scalar the lookup table needs no host wait, so the predicate returns while the
   // frame's stream is still gated.
   {
-    auto input   = make_input(4, false);
+    auto input   = make_input(4);
     auto encoded = simpatico::dictionary_compressor{}.compress(input->view(), stream.view(), mr);
     auto const& dictionary =
       dynamic_cast<simpatico::dictionary_compressed_representation const&>(*encoded);
@@ -1268,17 +1261,6 @@ void test_dictionary_predicate_lookup(rmm::device_async_resource_ref mr)
            "gated dictionary predicate lookup differs from the cuDF reference");
   }
 
-  // Zero keys: an all-null column has no key set, so every comparison is null.
-  {
-    auto input = make_strings_column(
-      std::vector<std::string>(rows, "x"), std::vector<bool>(rows, false), stream.view());
-    auto encoded = simpatico::dictionary_compressor{}.compress(input->view(), stream.view(), mr);
-    auto const& dictionary =
-      dynamic_cast<simpatico::dictionary_compressed_representation const&>(*encoded);
-    auto result = evaluate(dictionary, {"x"});
-    expect(result != nullptr && result->size() == rows && result->null_count() == rows,
-           "all-null dictionary predicate is not all null");
-  }
   // Indices narrower than INT32 are left to the generic path.
   {
     auto input  = make_strings_column({"a", "b", "a"}, {}, stream.view());

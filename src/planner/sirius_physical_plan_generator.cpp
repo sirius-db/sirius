@@ -1419,9 +1419,47 @@ void wrap_order_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slo
   });
 }
 
+//! Extract the join's initial whole-partition requirement at the wrapping boundary.
+bool join_concat_all(sirius::op::sirius_physical_operator const& join, bool is_build)
+{
+  using T = sirius::op::SiriusPhysicalOperatorType;
+  if (join.type == T::NESTED_LOOP_JOIN) {
+    // The join runs one task per batch pair, so the side that rows are padded, kept or marked
+    // against must arrive whole.
+    auto const& nested_loop_join = join.Cast<sirius::op::sirius_physical_nested_loop_join>();
+    switch (nested_loop_join.join_type) {
+      case duckdb::JoinType::INNER: return false;
+      case duckdb::JoinType::LEFT:
+      case duckdb::JoinType::SEMI:
+      case duckdb::JoinType::ANTI:
+      case duckdb::JoinType::MARK: return is_build;
+      case duckdb::JoinType::RIGHT: return !is_build;
+      case duckdb::JoinType::OUTER: return true;
+      default:
+        throw duckdb::NotImplementedException(
+          "sirius_physical_nested_loop_join: unsupported join type: " +
+          duckdb::JoinTypeToString(nested_loop_join.join_type));
+    }
+  }
+  auto const& hash_join = join.Cast<sirius::op::sirius_physical_hash_join>();
+  switch (hash_join.join_type) {
+    case duckdb::JoinType::LEFT:
+    case duckdb::JoinType::SEMI:
+    case duckdb::JoinType::ANTI: return is_build;
+    case duckdb::JoinType::RIGHT:
+    case duckdb::JoinType::RIGHT_SEMI:
+    case duckdb::JoinType::RIGHT_ANTI: return !is_build;
+    case duckdb::JoinType::OUTER: return true;
+    case duckdb::JoinType::INNER:
+    case duckdb::JoinType::MARK: return false;
+    default:
+      throw duckdb::NotImplementedException("sirius_physical_hash_join: unsupported join type: " +
+                                            duckdb::JoinTypeToString(hash_join.join_type));
+  }
+}
+
 //! Wrap `join_op.children[child_idx]` with `CONCAT → PARTITION → original_child`. `is_build`
-//! flips build/probe semantics in both wrappers; `join_op` is PARTITION's `key_source`
-//! (determines partition keys) and CONCAT's `downstream_join` (picks the coalescing mode).
+//! identifies the join edge; CONCAT receives only the resulting grouping requirement.
 void wrap_join_child(sirius::op::sirius_physical_operator& join_op,
                      std::size_t child_idx,
                      bool is_build,
@@ -1454,12 +1492,8 @@ void wrap_join_child(sirius::op::sirius_physical_operator& join_op,
         }
       }
 
-      auto concat =
-        duckdb::make_uniq<sirius::op::sirius_physical_concat>(child_types,
-                                                              est_card,
-                                                              /*downstream_join=*/join_op_ptr,
-                                                              is_build,
-                                                              op_params.concat_batch_bytes);
+      auto concat = duckdb::make_uniq<sirius::op::sirius_physical_concat>(
+        child_types, est_card, join_concat_all(join_op, is_build), op_params.concat_batch_bytes);
       auto partition = duckdb::make_uniq<sirius::op::sirius_physical_partition>(
         std::move(child_types),
         est_card,
@@ -1470,6 +1504,7 @@ void wrap_join_child(sirius::op::sirius_physical_operator& join_op,
         partition->set_physical_types(child_physical);
         concat->set_physical_types(std::move(child_physical));
       }
+      partition->set_join_concat(concat.get());
       partition->children.push_back(std::move(child_orig));
       concat->children.push_back(std::move(partition));
       return concat;

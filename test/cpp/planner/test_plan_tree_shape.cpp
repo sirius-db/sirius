@@ -292,9 +292,8 @@ sirius_physical_operator* require_join_child_wrap(sirius_physical_operator* op,
 {
   REQUIRE(op != nullptr);
   REQUIRE(op->type == SiriusPhysicalOperatorType::CONCAT);
-  auto& concat = op->Cast<sirius::op::sirius_physical_concat>();
-  CHECK(concat.is_build_concat() == is_build);
-  CHECK(concat.get_downstream_join() == join);
+  CHECK(join->children[is_build ? 1 : 0].get() == op);
+  CHECK(join->input_port_for(*op) == (is_build ? "build" : "default"));
 
   REQUIRE(op->children.size() == 1);
   auto* partition = op->children[0].get();
@@ -2000,6 +1999,50 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   REQUIRE(plan->type == SiriusPhysicalOperatorType::NESTED_LOOP_JOIN);
   require_wrap_sidecars(plan->children[0].get(), {});
   require_wrap_sidecars(plan->children[1].get(), {});
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - nested-loop-join wrap folds the side rows are decided against",
+                 "[plan_tree_shape]")
+{
+  struct expectation {
+    duckdb::JoinType join_type;
+    bool fold_build;
+    bool fold_probe;
+  };
+  for (auto const& e : {expectation{duckdb::JoinType::INNER, false, false},
+                        expectation{duckdb::JoinType::LEFT, true, false},
+                        expectation{duckdb::JoinType::SEMI, true, false},
+                        expectation{duckdb::JoinType::ANTI, true, false},
+                        expectation{duckdb::JoinType::MARK, true, false},
+                        expectation{duckdb::JoinType::RIGHT, false, true},
+                        expectation{duckdb::JoinType::OUTER, true, true}}) {
+    DYNAMIC_SECTION(duckdb::JoinTypeToString(e.join_type))
+    {
+      sirius::planner::sirius_physical_plan_generator gen(*con->context);
+
+      duckdb::LogicalDummyScan stub(duckdb::TableIndex(0));
+      stub.types = {duckdb::LogicalType::INTEGER, duckdb::LogicalType::INTEGER};
+      duckdb::unique_ptr<sirius_physical_operator> plan =
+        duckdb::make_uniq<sirius::op::sirius_physical_nested_loop_join>(
+          stub,
+          make_projection_leaf(1),
+          make_projection_leaf(1),
+          duckdb::vector<sirius::join_condition>{},
+          e.join_type,
+          /*estimated_cardinality=*/1);
+
+      gen.insert_gpu_pipeline_operators(plan);
+
+      REQUIRE(plan->type == SiriusPhysicalOperatorType::NESTED_LOOP_JOIN);
+      require_join_child_wrap(plan->children[0].get(), plan.get(), /*is_build=*/false);
+      require_join_child_wrap(plan->children[1].get(), plan.get(), /*is_build=*/true);
+      CHECK(plan->children[0]->Cast<sirius::op::sirius_physical_concat>().concat_all() ==
+            e.fold_probe);
+      CHECK(plan->children[1]->Cast<sirius::op::sirius_physical_concat>().concat_all() ==
+            e.fold_build);
+    }
+  }
 }
 
 TEST_CASE_METHOD(plan_tree_shape_fixture,
