@@ -39,7 +39,8 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(60);
 /// - `SIRIUS_CN_RING_SEND_BYTES` / `SIRIUS_CN_RING_RECV_BYTES`: ring sizes; by default 0.6% of the
 ///   GPU in whole frames, within [8 frames, 1 GiB], and 1.5 times that;
 /// - `SIRIUS_CN_RING_GPU_LANDING_FRACTION`: share of the GPU space landed batches may hold, 0.1;
-/// - `SIRIUS_CN_RING_HOST_LANDING_BYTES`: host bytes landed batches may hold, 48 GiB;
+/// - `SIRIUS_CN_RING_HOST_LANDING_BYTES`: host bytes landed batches may hold; by default half the
+///   host tier;
 /// - `SIRIUS_CN_RING_DISK_WRITERS`: threads writing batches that land on disk, 1.
 ///
 /// Sizes take a `KiB`, `MiB` or `GiB` suffix.
@@ -67,7 +68,7 @@ pub fn ring_options_from_env() -> Result<sirius::RingOptions, String> {
         send_bytes: bytes("SIRIUS_CN_RING_SEND_BYTES", 0)?,
         recv_bytes: bytes("SIRIUS_CN_RING_RECV_BYTES", 0)?,
         gpu_landing_fraction: fraction,
-        host_landing_bytes: bytes("SIRIUS_CN_RING_HOST_LANDING_BYTES", 48 << 30)?,
+        host_landing_bytes: bytes("SIRIUS_CN_RING_HOST_LANDING_BYTES", 0)?,
         disk_writers: match env("SIRIUS_CN_RING_DISK_WRITERS") {
             None => 1,
             Some(value) => value

@@ -308,6 +308,15 @@ TEST_CASE("ring sizes follow the device's memory, and the frame stays the same o
   CHECK(small.recv_bytes == 288 * MiB);
 }
 
+TEST_CASE("landings may hold half the host tier unless the embedder sets a size",
+          "[exchange_ring][ends]")
+{
+  constexpr std::size_t GiB = std::size_t{1} << 30;
+  CHECK(ring_exchange::default_host_landing_bytes(256 * GiB) == 128 * GiB);
+  CHECK(ring_exchange::default_host_landing_bytes(32 * GiB) == 16 * GiB);
+  CHECK(ring_exchange::default_host_landing_bytes(0) == 0);
+}
+
 TEST_CASE("a GPU batch lands on the GPU through the rings", "[exchange_ring][ends]")
 {
   auto sender         = make_ring();

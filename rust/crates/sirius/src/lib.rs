@@ -400,7 +400,8 @@ pub struct RingOptions {
     pub recv_bytes: u64,
     /// Share of the GPU space that landed batches may hold until their receivers take them.
     pub gpu_landing_fraction: f64,
-    /// Host bytes that landed batches may hold until their receivers take them.
+    /// Host bytes that landed batches may hold until their receivers take them; 0 is half the
+    /// host tier.
     pub host_landing_bytes: u64,
     /// Threads writing batches that land on disk.
     pub disk_writers: u64,

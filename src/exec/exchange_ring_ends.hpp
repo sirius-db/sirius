@@ -101,6 +101,12 @@ class ring_exchange {
                                            std::size_t frame_bytes = 0) noexcept;
   };
 
+  /// Host bytes landed batches may hold when the embedder sets none: half of the host tier.
+  [[nodiscard]] static std::size_t default_host_landing_bytes(std::size_t host_tier_bytes) noexcept
+  {
+    return host_tier_bytes / 2;
+  }
+
   /// Allocates both rings on @p device. Call before the engine's pool is built, so the rings are
   /// not carved out of its budget.
   ring_exchange(int device, options const& opts);

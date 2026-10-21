@@ -254,9 +254,14 @@ struct Context::Impl {
         !disks.empty()) {
       tiers.disk = const_cast<cucascade::memory::memory_space*>(disks.front());
     }
-    tiers.gpu_bytes  = static_cast<std::size_t>(opts.gpu_landing_fraction *
+    tiers.gpu_bytes = static_cast<std::size_t>(opts.gpu_landing_fraction *
                                                static_cast<double>(gpu.get_max_memory()));
-    tiers.host_bytes = tiers.host ? opts.host_landing_bytes : 0;
+    // Without a size from the embedder, landings may hold half the host tier, whatever its size.
+    tiers.host_bytes =
+      tiers.host == nullptr ? 0
+      : opts.host_landing_bytes != 0
+        ? opts.host_landing_bytes
+        : sirius::exec::ring_exchange::default_host_landing_bytes(tiers.host->get_max_memory());
     ring->attach(exchange, tiers);
   }
 

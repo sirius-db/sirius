@@ -390,7 +390,7 @@ SIRIUS_FFI_EXPORT std::unique_ptr<Context> make_context_from_config(const std::s
 /// space and `host_landing_bytes` of the host tier until their receivers take them; beyond that
 /// they land on disk, if the configuration has a disk tier, written by `disk_writers` threads.
 /// A ring size of 0 follows the device's memory (sirius::exec::ring_exchange::options::sized_for);
-/// the frame size must be the same on every CN.
+/// the frame size must be the same on every CN. A `host_landing_bytes` of 0 is half the host tier.
 SIRIUS_FFI_EXPORT std::unique_ptr<Context> make_context_with_ring(const std::string& config_path,
                                                                   std::uint64_t frame_bytes,
                                                                   std::uint64_t send_bytes,
