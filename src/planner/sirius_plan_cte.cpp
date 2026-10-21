@@ -16,16 +16,68 @@
 
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
+#include "duckdb/planner/operator/logical_cteref.hpp"
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
 #include "op/sirius_physical_cte.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 
+#include <unordered_map>
+
 namespace sirius::planner {
+
+namespace {
+
+using cte_read_cache =
+  std::unordered_map<const duckdb::LogicalOperator*, std::unordered_map<duckdb::idx_t, bool>>;
+
+// Whether `op` will plan a CTE_SCAN of CTE `cte_index`. A nested CTE that is itself unread
+// keeps no definition, so references inside it do not count. Cache each (operator, CTE) pair:
+// checking nested CTE liveness otherwise revisits the same consumer exponentially often.
+bool reads_cte(const duckdb::LogicalOperator& op,
+               duckdb::TableIndex cte_index,
+               cte_read_cache& cache)
+{
+  auto& results = cache[&op];
+  if (auto it = results.find(cte_index.index); it != results.end()) { return it->second; }
+
+  bool found = false;
+  if (op.type == duckdb::LogicalOperatorType::LOGICAL_CTE_REF) {
+    found = op.Cast<duckdb::LogicalCTERef>().cte_index.index == cte_index.index;
+  } else if (op.type == duckdb::LogicalOperatorType::LOGICAL_MATERIALIZED_CTE &&
+             !reads_cte(
+               *op.children[1], op.Cast<duckdb::LogicalMaterializedCTE>().table_index, cache)) {
+    found = reads_cte(*op.children[1], cte_index, cache);
+  } else {
+    for (auto const& child : op.children) {
+      if (reads_cte(*child, cte_index, cache)) {
+        found = true;
+        break;
+      }
+    }
+  }
+  results[cte_index.index] = found;
+  return found;
+}
+
+}  // namespace
 
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::LogicalMaterializedCTE& op)
 {
   D_ASSERT(op.children.size() == 2);
+
+  // Optimizers can fold every reference away (e.g. statistics proving the CTE empty) after
+  // unused-CTE removal has run. Plan only the consumer: a CTE pipeline with no CTE_SCAN has
+  // no outgoing edge, so the active task creator never reaches the consumer's sources.
+  cte_read_cache cache;
+  if (!reads_cte(*op.children[1], op.table_index, cache)) {
+    // DuckDB retains unreferenced modifying CTEs so they execute once. Sirius cannot plan their
+    // writes; reject the GPU plan so DuckDB executes the original statement on the CPU.
+    if (op.children[0]->HasSideEffects()) {
+      throw duckdb::NotImplementedException("Side-effecting materialized CTE not supported");
+    }
+    return create_plan(*op.children[1]);
+  }
 
   // Create the working_table that the PhysicalCTE will use for evaluation.
   auto working_table =
