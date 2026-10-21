@@ -121,6 +121,14 @@ constexpr double DEFAULT_DENSE_COUNT_JOIN_MEMORY_FRACTION = 0.10;
 /// Budget when GPU tier capacity cannot be read at planning time.
 constexpr uint64_t DENSE_COUNT_JOIN_FALLBACK_MAX_BYTES = 2ULL * 1024 * 1024 * 1024;  // 2 GiB
 
+/// 0 = auto: a share of the pinning GPU memory space's capacity, below.
+constexpr uint64_t DEFAULT_PIN_TABLE_UNIQUE_EXACT_MAX_BYTES = 0;
+
+/// Share of the GPU memory space capacity one column may occupy in the pin-time exact uniqueness
+/// check when its cap is auto. The check's peak is about three times the column, so this keeps it
+/// near 30% of the space.
+constexpr double PIN_TABLE_UNIQUE_EXACT_MEMORY_FRACTION = 0.10;
+
 }  // namespace config
 
 /// Parameters controlling operator-level resource sizing.
@@ -242,6 +250,22 @@ struct operator_params {
   /// metadata; other scans use native carriers. Logical types remain unchanged, and type-sensitive
   /// boundaries restore native carriers.
   bool enable_compressed_materialization = true;
+
+  /// Prove pinned parquet columns distinct at pin time and let the join planner treat a build key
+  /// proven distinct like a PRIMARY KEY, so the join takes the single-pass distinct hash join.
+  /// When on, pin_table observes every column it is not already asked to observe; an observed
+  /// column must be an integer column without a repeated value in any chunk to stay a candidate.
+  /// When off, the planner ignores pin-time facts and the pin observes only the columns that
+  /// late materialization asks for.
+  bool prove_unique_keys{true};
+
+  /// Cap, in bytes, on one column in the pin-time exact uniqueness check, which sorts the whole
+  /// column when its chunks overlap in range. The cap bounds the concatenated column; the check's
+  /// peak GPU use is about three times that. A column past the cap stays unproven. 0 = a share
+  /// (config::PIN_TABLE_UNIQUE_EXACT_MEMORY_FRACTION) of the pinning GPU memory space's capacity.
+  /// Applies to every observed column, whether late materialization or join-key proofs asked
+  /// for it.
+  uint64_t unique_exact_max_bytes{config::DEFAULT_PIN_TABLE_UNIQUE_EXACT_MAX_BYTES};
 
   /// Enable DENSE_COUNT_JOIN planning for eligible aggregates.
   bool enable_dense_count_join = config::DEFAULT_ENABLE_DENSE_COUNT_JOIN;
