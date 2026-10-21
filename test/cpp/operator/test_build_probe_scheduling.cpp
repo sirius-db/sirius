@@ -453,10 +453,71 @@ TEST_CASE("compute_hash_join_partition_strategy - lone STANDARD partition follow
       CHECK(input.get_partition_idx() == std::optional<std::size_t>{0});
       CHECK_FALSE(input.get_preferred_device_id().has_value());
     }
-    auto const mixed = strategy(
-      1024 * 1024, true, true, num_gpus, duckdb::JoinType::INNER, HASH_JOIN_MODE::MIXED_JOIN);
-    CHECK_FALSE(mixed.placement.any_pinned());
+    // A foldable lone MIXED build follows locality on one GPU; on several it is broadcast (below).
+    if (num_gpus == 1) {
+      auto const mixed = strategy(
+        1024 * 1024, true, true, num_gpus, duckdb::JoinType::INNER, HASH_JOIN_MODE::MIXED_JOIN);
+      CHECK_FALSE(mixed.placement.any_pinned());
+    }
   }
+}
+
+TEST_CASE(
+  "compute_hash_join_partition_strategy - lone STANDARD / MIXED build on several GPUs broadcasts",
+  "[hash_join][broadcast][partition_placement][unit]")
+{
+  // A lone unpinned partition clones the build onto every task's GPU (#2200); one slot per GPU
+  // keeps every task local. The mode is unchanged: no BUILD_PROBE hash table.
+  for (auto join_type : {duckdb::JoinType::INNER,
+                         duckdb::JoinType::LEFT,
+                         duckdb::JoinType::SEMI,
+                         duckdb::JoinType::ANTI}) {
+    auto const s =
+      strategy(1024 * 1024, true, true, /*num_gpus=*/4, join_type, HASH_JOIN_MODE::MIXED_JOIN);
+    REQUIRE(s.broadcast);
+    REQUIRE_FALSE(s.build_probe);
+    REQUIRE(s.num_partitions == 4);
+    CHECK(s.placement == partition_placement::one_per_device({0, 1, 2, 3}));
+  }
+
+  // STANDARD too, when the hash-table budget refuses BUILD_PROBE for a build that still fits one
+  // partition.
+  auto const standard = strategy(1024 * 1024,
+                                 true,
+                                 true,
+                                 /*num_gpus=*/4,
+                                 duckdb::JoinType::INNER,
+                                 HASH_JOIN_MODE::STANDARD,
+                                 kBigPartitionBytes,
+                                 /*max_build_hash_table_bytes=*/512 * 1024);
+  REQUIRE(standard.broadcast);
+  REQUIRE_FALSE(standard.build_probe);
+  REQUIRE(standard.num_partitions == 4);
+
+  // Not on one GPU, not without a build CONCAT to fold, and not for joins that emit build rows.
+  CHECK_FALSE(
+    strategy(1024 * 1024, true, true, 1, duckdb::JoinType::INNER, HASH_JOIN_MODE::MIXED_JOIN)
+      .broadcast);
+  CHECK_FALSE(
+    strategy(1024 * 1024, true, false, 4, duckdb::JoinType::INNER, HASH_JOIN_MODE::MIXED_JOIN)
+      .broadcast);
+  CHECK_FALSE(
+    strategy(1024 * 1024, true, true, 4, duckdb::JoinType::OUTER, HASH_JOIN_MODE::MIXED_JOIN)
+      .broadcast);
+  CHECK_FALSE(
+    strategy(1024 * 1024, true, true, 4, duckdb::JoinType::RIGHT, HASH_JOIN_MODE::MIXED_JOIN)
+      .broadcast);
+  // Those stay a lone partition placed by locality.
+  CHECK_FALSE(
+    strategy(1024 * 1024, true, false, 4, duckdb::JoinType::INNER, HASH_JOIN_MODE::MIXED_JOIN)
+      .placement.any_pinned());
+
+  // Above the small-table threshold the build hash-partitions across the GPUs as before.
+  auto const big = strategy(
+    k100MB, true, true, /*num_gpus=*/4, duckdb::JoinType::INNER, HASH_JOIN_MODE::MIXED_JOIN);
+  REQUIRE_FALSE(big.broadcast);
+  REQUIRE(big.num_partitions == 4);
+  CHECK(big.placement == partition_placement::round_robin(4, {0, 1, 2, 3}));
 }
 
 TEST_CASE("compute_hash_join_partition_strategy - multiple STANDARD partitions stay pinned",

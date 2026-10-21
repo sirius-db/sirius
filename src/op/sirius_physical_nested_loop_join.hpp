@@ -47,12 +47,26 @@ namespace op {
 
 //! Task input of a cross product: a left and a right batch, and which of `num_slices` equal row
 //! ranges of the left batch to join with the right batch.
-class cross_join_slice_data : public pipelineable_operator_data {
+class cross_join_slice_data : public partitioned_operator_data {
  public:
+  //! A slice of partition `partition_idx` of an exchange placed by `placement`; a pinned
+  //! partition's GPU becomes the task's preferred device.
+  cross_join_slice_data(std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches,
+                        std::size_t partition_idx,
+                        partition_placement const& placement,
+                        std::size_t slice,
+                        std::size_t num_slices)
+    : partitioned_operator_data(std::move(data_batches), partition_idx, placement),
+      slice(slice),
+      num_slices(num_slices)
+  {
+  }
+
+  //! A slice with no partition index and no preferred device.
   cross_join_slice_data(std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches,
                         std::size_t slice,
                         std::size_t num_slices)
-    : pipelineable_operator_data(std::move(data_batches)), slice(slice), num_slices(num_slices)
+    : partitioned_operator_data(std::move(data_batches)), slice(slice), num_slices(num_slices)
   {
   }
 
@@ -161,8 +175,15 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
   //! larger is split into tasks over row ranges of the left batch.
   void set_cross_join_task_bytes(uint64_t bytes) noexcept { cross_join_task_bytes = bytes; }
 
-  //! A nested-loop join always runs on a single partition (its build side is not hash-partitioned),
-  //! so it never broadcasts or enters build-probe.
+  //! Largest right side replicated to every GPU (see get_partition_strategy).
+  void set_max_broadcast_join_size(uint64_t bytes) noexcept { _max_broadcast_join_size = bytes; }
+
+  //! A nested-loop join is never hash-partitioned and never enters build-probe. On one GPU it runs
+  //! as a single unpinned partition. On several GPUs a right side that `broadcast_build_candidate`
+  //! accepts is replicated to every GPU, one pinned partition each, and every left batch is routed
+  //! to the partition on its own GPU, so no task copies an input; a lone unpinned partition would
+  //! clone the right side onto a task's GPU once per task (#2200). RIGHT and full OUTER joins emit
+  //! unmatched right rows, which every replica would emit again, so they keep one partition.
   partition_strategy get_partition_strategy(const partition_sizing_input& in);
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
@@ -202,7 +223,8 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
   //! The next task to hand out. Tasks run over partitions, then left batches, then right batches,
   //! then slices.
   pair_task next_task;
-  uint64_t cross_join_task_bytes = config::DEFAULT_BATCH_SIZE;
+  uint64_t cross_join_task_bytes   = config::DEFAULT_BATCH_SIZE;
+  uint64_t _max_broadcast_join_size = config::DEFAULT_MAX_BROADCAST_JOIN_SIZE;
 };
 
 }  // namespace op

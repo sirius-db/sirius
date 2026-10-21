@@ -768,6 +768,10 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       op.estimated_cardinality,
       std::move(left_projection_map),
       std::move(right_projection_map));
+    if (sirius_context) {
+      join->set_max_broadcast_join_size(
+        duckdb::query_operator_options(context)->max_broadcast_join_size);
+    }
     return join;
   }
 

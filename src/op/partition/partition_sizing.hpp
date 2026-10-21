@@ -89,6 +89,21 @@ struct partition_strategy {
   return static_cast<uint64_t>(num_gpus) * config::PARTITION_SMALL_TABLE_BYTES_PER_GPU;
 }
 
+/// Whether a build side of `total_bytes` is worth replicating to every one of `num_gpus` GPUs
+/// instead of being routed to one GPU: below the small-table threshold, or below
+/// `max_broadcast_join_size` while the estimated probe side is large relative to the build
+/// (`estimated_probe_to_build_ratio >= num_gpus * 1.25`), so that the copies of the build cost
+/// less than moving the probe. Callers decide what a single GPU does with a candidate.
+[[nodiscard]] inline bool broadcast_build_candidate(uint64_t total_bytes,
+                                                    int num_gpus,
+                                                    uint64_t max_broadcast_join_size,
+                                                    double estimated_probe_to_build_ratio)
+{
+  return total_bytes < partition_small_table_bytes(num_gpus) ||
+         (total_bytes < max_broadcast_join_size &&
+          estimated_probe_to_build_ratio >= static_cast<double>(num_gpus) * 1.25);
+}
+
 /// The "natural" partition count for `total_bytes`: ceil(total_bytes / hash_partition_bytes),
 /// floored to `partition_min_num_partitions(num_gpus)` once the input clears the small-table
 /// threshold. Pure counterpart of the old sirius_physical_partition::determine_num_partitions

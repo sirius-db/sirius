@@ -76,8 +76,13 @@ void bind_partition_inputs(sirius_physical_hash_join& join,
       auto strategy = empty ? partition_strategy{1, false, false, partition_placement::unpinned(1)}
                             : join.get_partition_strategy(in);
       bool build_arrives_whole = false;
-      if (strategy.build_probe) {
-        if (!build_concat) { throw std::logic_error("BUILD_PROBE requires a bound build CONCAT"); }
+      // BUILD_PROBE cannot run without a complete build batch. A broadcast STANDARD / MIXED join
+      // folds too: every task of a slot borrows the same local build copy, and one batch per slot
+      // keeps whole-build publication open.
+      if (strategy.build_probe || strategy.broadcast) {
+        if (!build_concat) {
+          throw std::logic_error("BUILD_PROBE or broadcast requires a bound build CONCAT");
+        }
         build_concat->set_concat_all(true);
         build_arrives_whole = strategy.num_partitions == 1 || strategy.broadcast;
       } else if (!empty && in.is_build_side && strategy.num_partitions == 1 &&
@@ -102,14 +107,20 @@ void bind_partition_inputs(sirius_physical_nested_loop_join& join,
 {
   build.set_input_barrier(MemoryBarrierType::FULL);
   probe.set_input_barrier(MemoryBarrierType::PARTIAL);
-  partition_exchange::bind({&build, &probe}, 0, false, [&join](auto const& stats, bool) {
-    auto strategy =
-      join.get_partition_strategy({stats[0].bytes,
-                                   true,
-                                   false,
-                                   sirius::memory::saturating_add(stats[0].bytes, stats[1].bytes),
-                                   stats[0].rows});
+  partition_exchange::bind({&build, &probe}, 0, false, [&join](auto const& stats, bool empty) {
+    // An empty right side has nothing to replicate.
+    auto strategy = empty ? partition_strategy{1, false, false, partition_placement::unpinned(1)}
+                          : join.get_partition_strategy(
+                              {stats[0].bytes,
+                               true,
+                               false,
+                               sirius::memory::saturating_add(stats[0].bytes, stats[1].bytes),
+                               stats[0].rows});
     install_placement(join, strategy);
+    if (strategy.broadcast) {
+      return std::vector<partition_layout>{{partition_mode::broadcast, join.placement()},
+                                           {partition_mode::local, join.placement()}};
+    }
     return std::vector<partition_layout>(2, {partition_mode::single, join.placement()});
   });
 }

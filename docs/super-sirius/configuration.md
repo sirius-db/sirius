@@ -569,7 +569,7 @@ individually.
 | `cross_join_task_bytes` | Shared physical/effective GPU batch default described above | Target output size of each cross product task; a larger pair of input batches is split into tasks over row ranges of the left batch |
 | `sort_sample_bytes` | Shared physical/effective GPU batch default described above | Bytes sampled before computing sort partition boundaries |
 | `max_build_hash_table_bytes` | 2× batch default | Max build-side size for BUILD_PROBE join mode |
-| `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join. A build below this size is replicated to every GPU (instead of hash-partitioned) when it is tiny, or when the DuckDB-estimated probe-to-build row ratio is at least `num_gpus * 1.25`. |
+| `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join. A build below this size is replicated to every GPU (instead of hash-partitioned) when it is tiny, or when the DuckDB-estimated probe-to-build row ratio is at least `num_gpus * 1.25`. The same rule bounds the right side a multi-GPU nested-loop join replicates. |
 | `max_sort_partition_memory_fraction` | 0.33 | Fraction of GPU memory per sort partition when `max_sort_partition_bytes` is 0 |
 | `mark_join_build_switch_ratio` | 8.0 | For STANDARD MARK joins, build on the smaller (left) side when `right_rows >= ratio * left_rows` (0 disables) |
 | `enable_dynamic_filter` | true | Enable runtime filters for eligible hash joins. Plan-time wiring admits keys by join type (not join mode); at delivery, any join whose build side arrives as one whole batch publishes — a single-partition or broadcast `BUILD_PROBE` build, and a single-partition `STANDARD`/`MIXED_JOIN` build on the same terms. Targets may be probe scans or join-edge endpoints. An eligible build selects a raw exact IN-list for 1–12 supported build rows, otherwise a hash IN-list within the L2 budget or a Bloom. |
@@ -804,7 +804,7 @@ SET enable_compressed_materialization = false;
 | `hash_partition_bytes` | Shared physical/effective GPU batch default | Hash partition target size; must be greater than zero |
 | `sort_sample_bytes` | Shared physical/effective GPU batch default | Bytes sampled before computing sort boundaries |
 | `max_build_hash_table_bytes` | 2× batch default | Max build-side hash table bytes |
-| `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join |
+| `max_broadcast_join_size` | 256 MiB | Max build-side (or nested-loop right-side) size eligible for a broadcast join |
 | `mark_join_build_switch_ratio` | 8.0 | STANDARD MARK join build-side switch ratio (0 disables) |
 | `enable_dense_count_join` | true | Enable the fused count-over-outer-join operator; accepted only as a strict boolean under `sirius.operator_params`. |
 

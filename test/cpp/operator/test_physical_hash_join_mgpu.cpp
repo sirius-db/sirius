@@ -795,6 +795,79 @@ TEST_CASE("physical_hash_join - broadcast BUILD_PROBE publishes dynamic filters 
   fs::remove_all(tmp, ec);
 }
 
+//===----------------------------------------------------------------------===//
+// A small MIXED_JOIN build (equality plus an inequality) cannot use BUILD_PROBE
+// and fits one partition. That partition used to be unpinned: every join task
+// ran where its probe batch was and cloned the build there, once per task on a
+// foreign GPU (#2200). The build is now broadcast, one slot per GPU, with the
+// mode unchanged, and it still arrives whole, so the dynamic filter publishes.
+// 2-GPU-gated.
+//===----------------------------------------------------------------------===//
+TEST_CASE("physical_hash_join - MIXED_JOIN small build broadcasts across two GPUs",
+          "[mgpu][operator-mgpu][hash_join][broadcast][dynamic_filter][gpu_execution][multi_gpu]")
+{
+  if (!require_two_gpus()) return;
+
+  auto tmp = make_tmp("broadcast-mixed");
+  std::error_code ec;
+  fs::remove_all(tmp, ec);
+  fs::create_directories(tmp);
+
+  auto build_dir = tmp / "build";
+  auto probe_dir = tmp / "probe";
+  generate_small_build_side(build_dir);  // ~80 KiB << small_table_bytes (2 * 16 MiB)
+  generate_large_probe_side(probe_dir);
+
+  scoped_log_dir log_dir(tmp / "logs", "debug");
+
+  mgpu_env_params params{};
+  params.cache   = "none";
+  auto yaml_path = tmp / "broadcast-mixed.yaml";
+  write_mgpu_yaml(yaml_path, params);
+  scoped_mgpu_env env(yaml_path);
+
+  // The inequality keeps the join in MIXED_JOIN mode. The build-side predicate is the evidence
+  // dynamic-filter discovery needs to wire a producer (see the BUILD_PROBE test above).
+  auto inner_query =
+    "SELECT probe.k, probe.v, build.v AS build_v "
+    "FROM read_parquet('" +
+    parquet_glob(probe_dir) +
+    "') AS probe "
+    "JOIN read_parquet('" +
+    parquet_glob(build_dir) +
+    "') AS build "
+    "  ON probe.k = build.k AND probe.v > build.v "
+    "WHERE build.k % 2 = 0 "
+    "ORDER BY probe.k, probe.v "
+    "LIMIT 100";
+
+  std::map<int, size_t> tasks_per_gpu;
+  {
+    auto con = env.make_connection();
+    require_gpu_matches_cpu(con, inner_query, /*force_cpu_reference=*/true);
+    auto& scheduler = env.get_task_scheduler(con);
+    scheduler.visit_executors(
+      [&](int device_id, const sirius::pipeline::gpu_pipeline_executor& exec) {
+        tasks_per_gpu[device_id] = exec.get_metrics().tasks_executed;
+      });
+  }
+
+  INFO("log dir: " << log_dir.path());
+  // Broadcast engaged in MIXED_JOIN mode (not promoted to BUILD_PROBE), and one replica of the
+  // whole build published the filter.
+  REQUIRE(log_dir_contains(log_dir.path(), "Join Mode: MIXED_JOIN  [broadcast]"));
+  REQUIRE(log_dir_contains(log_dir.path(), "dynamic-filter publication:"));
+  REQUIRE_FALSE(log_dir_contains(log_dir.path(), "build is not one whole delivery"));
+
+  // Each slot joined its own probe batches against its local build copy.
+  REQUIRE(tasks_per_gpu.count(0));
+  REQUIRE(tasks_per_gpu.count(1));
+  REQUIRE(tasks_per_gpu.at(0) >= 1);
+  REQUIRE(tasks_per_gpu.at(1) >= 1);
+
+  fs::remove_all(tmp, ec);
+}
+
 TEST_CASE("native prepared join keys compare with CPU through multi-partition execution",
           "[mgpu][multi_gpu][native_join_keys][gpu_execution]")
 {
