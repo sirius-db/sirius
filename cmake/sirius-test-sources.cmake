@@ -139,6 +139,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_union.cpp
     test/cpp/integration/test_gpu_execution_unfolded_constants.cpp
     test/cpp/integration/test_gpu_execution_vector_search.cpp
+    test/cpp/integration/test_gpu_execution_window.cpp
     test/cpp/integration/test_pin_registry_epoch.cpp
     test/cpp/integration/test_pin_table_host_streaming.cpp
     test/cpp/integration/test_pin_table_merge_columns.cpp
@@ -279,6 +280,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_query_id.cpp
     test/cpp/planner/test_query_index.cpp
     test/cpp/planner/test_tier_narrowing_policy.cpp
+    test/cpp/planner/test_window_plan.cpp
     test/cpp/pipeline/test_batch_lock_utils.cpp
     test/cpp/pipeline/test_completion_signal.cpp
     test/cpp/pipeline/test_gpu_pipeline_executor.cpp
