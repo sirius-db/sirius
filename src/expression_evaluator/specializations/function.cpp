@@ -488,8 +488,9 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
     return evaluate_result(std::move(result_column));
   }
   if (resolved_id == function_id::regexp_replace) {
-    // The input should be <input column, pattern string scalar, replace string scalar>
-    D_ASSERT(args.size() == 3);
+    // The input should be <input column, pattern string scalar, replace string scalar> and
+    // optionally an options string scalar.
+    D_ASSERT(args.size() == 3 || args.size() == 4);
     D_ASSERT(args[1]->holds<sirius::ast::constant>());
     D_ASSERT(args[2]->holds<sirius::ast::constant>());
 
@@ -498,8 +499,13 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
 
     auto const& pattern_str = std::get<std::string>(args[1]->get<sirius::ast::constant>().payload);
     auto const& replace_str = std::get<std::string>(args[2]->get<sirius::ast::constant>().payload);
+    // The planner rejected every option other than 'g' that changes the result.
+    auto const global =
+      args.size() == 4 &&
+      std::get<std::string>(args[3]->get<sirius::ast::constant>().payload).find('g') !=
+        std::string::npos;
     // The planner validated the RE2 pattern; give cuDF RE2's end-of-text anchor semantics.
-    auto const cudf_pattern = ::sirius::regex::to_cudf_regex_pattern(pattern_str);
+    auto const cudf_pattern = *::sirius::regex::to_cudf_regex_pattern(pattern_str);
     auto const has_backrefs = std::regex_search(replace_str, std::regex(R"(\\[0-9])"));
     if (has_backrefs) {
       if (_policy.regex_jit) {
@@ -508,28 +514,31 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
             input.get_column_view(), _stream, _mr);
         }
       }
-      // replace_with_backrefs has no replacement-count parameter. Anchor a lazy prefix to
-      // the beginning of the input so the program can match only once, at the first original
-      // match. Restore the prefix in the replacement; cuDF preserves the unmatched suffix.
+      // replace_with_backrefs has no replacement-count parameter. A global replacement wraps
+      // the whole match as group 1. Otherwise, anchor a lazy prefix to the beginning of the
+      // input so the program can match only once, at the first original match. Restore the prefix
+      // in the replacement; cuDF preserves the unmatched suffix.
       // [\s\S] includes newlines without changing the original pattern's dot semantics.
       // Group 1 is the prefix, group 2 is the whole original match (RE2's \0), and original
       // capture groups move by two. Braced references avoid treating e.g. \12 as group 12:
       // DuckDB interprets it as group 1 followed by the literal character '2'.
-      auto const first_pattern      = std::string{"^([\\s\\S]*?)("} + cudf_pattern + ")";
-      auto regex_prog               = cudf::strings::regex_program::create(first_pattern);
-      std::string first_replacement = "${1}";
+      auto const cudf_backref_pattern =
+        global ? "(" + cudf_pattern + ")" : "^([\\s\\S]*?)(" + cudf_pattern + ")";
+      auto const group_offset      = global ? 1 : 2;
+      auto regex_prog              = cudf::strings::regex_program::create(cudf_backref_pattern);
+      std::string cudf_replacement = global ? "" : "${1}";
       for (std::size_t i = 0; i < replace_str.size(); ++i) {
         if (replace_str[i] == '\\') {
           auto const group = replace_str[++i] - '0';
-          first_replacement += "${" + std::to_string(group + 2) + "}";
+          cudf_replacement += "${" + std::to_string(group + group_offset) + "}";
         } else {
-          first_replacement += replace_str[i];
+          cudf_replacement += replace_str[i];
         }
       }
       return cudf::strings::replace_with_backrefs(
         cudf::strings_column_view(input.get_column_view()),
         *regex_prog,
-        first_replacement,
+        cudf_replacement,
         _stream,
         _mr);
     } else {
@@ -537,7 +546,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
       return cudf::strings::replace_re(cudf::strings_column_view(input.get_column_view()),
                                        *regex_prog,
                                        cudf::string_scalar(replace_str, true, _stream, _mr),
-                                       1,
+                                       global ? std::nullopt : std::optional<cudf::size_type>{1},
                                        _stream,
                                        _mr);
     }
