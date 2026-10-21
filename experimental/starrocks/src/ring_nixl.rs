@@ -38,7 +38,7 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(60);
 /// - `SIRIUS_CN_RING_FRAME_BYTES`: frame size, 64 MiB; it must be the same on every CN;
 /// - `SIRIUS_CN_RING_SEND_BYTES` / `SIRIUS_CN_RING_RECV_BYTES`: ring sizes; by default 0.6% of the
 ///   GPU in whole frames, within [8 frames, 1 GiB], and 1.5 times that;
-/// - `SIRIUS_CN_RING_GPU_LANDING_FRACTION`: share of the GPU space landed batches may hold, 0.1;
+/// - `SIRIUS_CN_RING_GPU_LANDING_FRACTION`: share of the GPU space landed batches may hold, 0.2;
 /// - `SIRIUS_CN_RING_HOST_LANDING_BYTES`: host bytes landed batches may hold; by default half the
 ///   host tier;
 /// - `SIRIUS_CN_RING_DISK_WRITERS`: threads writing batches that land on disk, 1.
@@ -53,7 +53,7 @@ pub fn ring_options_from_env() -> Result<sirius::RingOptions, String> {
             .ok_or_else(|| format!("{name} must be a positive size, not '{value}'")),
     };
     let fraction = match env("SIRIUS_CN_RING_GPU_LANDING_FRACTION") {
-        None => 0.1,
+        None => 0.2,
         Some(value) => value
             .trim()
             .parse::<f64>()
