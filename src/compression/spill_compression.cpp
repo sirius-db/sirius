@@ -163,7 +163,7 @@ std::vector<std::string> column_names(std::size_t num_columns)
 /// Encode @p source with its default plans. Throws spill_compression_declined when the
 /// encode cannot get its headroom or does not save enough; any other exception is a
 /// failure the caller treats the same way.
-encoded_batch encode_for_spill(cucascade::gpu_table_representation& source,
+encoded_batch encode_for_spill(const cucascade::gpu_table_representation& source,
                                ::cuda::stream_ref stream)
 {
   nvtx_scoped_range nvtx_range{"sirius::compression::spill_encode"};
@@ -253,13 +253,13 @@ class spill_file {
 /// gpu_table to compressed_host: encode on the device, stage the payload in pinned
 /// blocks of the target host space.
 std::unique_ptr<cucascade::idata_representation> compress_gpu_to_host(
-  cucascade::idata_representation& source,
+  const cucascade::idata_representation& source,
   const cucascade::memory::memory_space* target_memory_space,
   ::cuda::stream_ref stream,
   cucascade::memory::reservation* reservation)
 {
   nvtx_scoped_range nvtx_range{"sirius::compression::gpu_to_compressed_host"};
-  auto& gpu        = source.cast<cucascade::gpu_table_representation>();
+  auto const& gpu  = source.cast<cucascade::gpu_table_representation>();
   auto encoded     = encode_for_spill(gpu, stream);
   auto* host_space = const_cast<cucascade::memory::memory_space*>(target_memory_space);
   auto* host_mr    = host_space->get_memory_resource_of<cucascade::memory::Tier::HOST>();
@@ -295,14 +295,14 @@ std::unique_ptr<cucascade::idata_representation> compress_gpu_to_host(
 
 /// gpu_table to compressed_disk: encode on the device, write the .hpln file.
 std::unique_ptr<cucascade::idata_representation> compress_gpu_to_disk(
-  cucascade::idata_representation& source,
+  const cucascade::idata_representation& source,
   const cucascade::memory::memory_space* target_memory_space,
   ::cuda::stream_ref stream,
   [[maybe_unused]] cucascade::memory::reservation* reservation)
 {
   nvtx_scoped_range nvtx_range{"sirius::compression::gpu_to_compressed_disk"};
-  auto& gpu    = source.cast<cucascade::gpu_table_representation>();
-  auto encoded = encode_for_spill(gpu, stream);
+  auto const& gpu = source.cast<cucascade::gpu_table_representation>();
+  auto encoded    = encode_for_spill(gpu, stream);
   spill_file file(*target_memory_space);
   auto const error = simpatico::write_compressed_table(encoded.table, file.path(), stream);
   if (!error.empty()) { throw std::runtime_error("write_compressed_table: " + error); }
@@ -318,13 +318,13 @@ std::unique_ptr<cucascade::idata_representation> compress_gpu_to_disk(
 /// compressed_host to compressed_disk: write the pinned header and payload as an .hpln
 /// file, with no decode and no device work.
 std::unique_ptr<cucascade::idata_representation> flush_host_to_disk(
-  cucascade::idata_representation& source,
+  const cucascade::idata_representation& source,
   const cucascade::memory::memory_space* target_memory_space,
   [[maybe_unused]] ::cuda::stream_ref stream,
   [[maybe_unused]] cucascade::memory::reservation* reservation)
 {
   nvtx_scoped_range nvtx_range{"sirius::compression::compressed_host_to_disk"};
-  auto& host = source.cast<compressed_host_representation>();
+  auto const& host = source.cast<compressed_host_representation>();
   if (host.selected_indices().has_value()) {
     // A projection is a view of a pinned table, never a spilled batch.
     throw std::runtime_error("cannot flush a column projection to disk");

@@ -63,7 +63,7 @@ compressed_disk_representation::compressed_disk_representation(
 }
 
 std::unique_ptr<cucascade::idata_representation> compressed_disk_representation::clone(
-  [[maybe_unused]] ::cuda::stream_ref stream)
+  [[maybe_unused]] ::cuda::stream_ref stream) const
 {
   return std::unique_ptr<cucascade::idata_representation>(new compressed_disk_representation(
     get_memory_space(), _file, _compressed_bytes, _uncompressed_bytes, _num_rows));

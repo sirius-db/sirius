@@ -261,13 +261,13 @@ std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
 // compressed_disk_representation (.hpln file) → GPU. Spilled batches carry no
 // projection, pushdown or visibility mask, so every column decodes in full.
 std::unique_ptr<cucascade::idata_representation> decompress_disk_to_gpu(
-  cucascade::idata_representation& source,
+  const cucascade::idata_representation& source,
   const cucascade::memory::memory_space* target_memory_space,
   ::cuda::stream_ref stream,
   [[maybe_unused]] cucascade::memory::reservation* reservation)
 {
   nvtx_scoped_range nvtx_range{"sirius::compression::disk_to_gpu"};
-  auto& rep          = source.cast<compressed_disk_representation>();
+  auto const& rep    = source.cast<compressed_disk_representation>();
   auto const& space  = gpu_decode_space(target_memory_space, "disk-to-GPU decompression");
   auto* const gpu_mr = space.get_memory_resource_of<cucascade::memory::Tier::GPU>();
   if (!gpu_mr) { throw std::logic_error("decompress_disk_to_gpu: missing GPU allocator"); }
@@ -314,7 +314,7 @@ bool is_transient_device_failure(std::exception const& e)
 // CUDA message, hence the message match.
 template <auto Decode>
 std::unique_ptr<cucascade::idata_representation> retryable_decode(
-  cucascade::idata_representation& source,
+  const cucascade::idata_representation& source,
   const cucascade::memory::memory_space* target_memory_space,
   ::cuda::stream_ref stream,
   cucascade::memory::reservation* reservation)

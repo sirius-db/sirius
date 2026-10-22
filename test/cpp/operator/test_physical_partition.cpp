@@ -573,7 +573,7 @@ class compressed_size_representation : public idata_representation {
   {
     return _decoded;
   }
-  [[nodiscard]] std::unique_ptr<idata_representation> clone(::cuda::stream_ref) override
+  [[nodiscard]] std::unique_ptr<idata_representation> clone(::cuda::stream_ref) const override
   {
     return nullptr;
   }

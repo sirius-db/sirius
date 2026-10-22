@@ -71,7 +71,7 @@ class compressed_disk_representation : public simpatico_compressed_representatio
 
   /// Shares the file rather than copying it: the bytes on disk are immutable.
   [[nodiscard]] std::unique_ptr<cucascade::idata_representation> clone(
-    ::cuda::stream_ref stream) override;
+    ::cuda::stream_ref stream) const override;
 
   [[nodiscard]] std::string const& path() const noexcept { return _file->path; }
 
