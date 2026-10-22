@@ -55,6 +55,7 @@ set(TEST_SOURCES
     test/cpp/downgrade/test_fs_cache_reclaim.cpp
     test/cpp/downgrade/test_spill_policy.cpp
     test/cpp/exchange/test_exchange_batch_io.cpp
+    test/cpp/exchange/test_exchange_transport.cpp
     test/cpp/exchange/test_exchange_wire.cpp
     test/cpp/exec/test_arrow_result_stream.cpp
     test/cpp/exec/test_batch_stream.cpp
