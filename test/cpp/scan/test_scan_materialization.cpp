@@ -150,6 +150,8 @@ TEST_CASE("Arrow layout rejects unsupported metadata and inconsistent buffers",
   REQUIRE_THROWS(validate_arrow_host_flat(f.schema, f.array));
   f.child_schema.format = "d:39,2";
   REQUIRE_THROWS(validate_arrow_host_flat(f.schema, f.array));
+  __int128 decimal_values[3]{10, 20, 30};
+  f.buffers[1]          = decimal_values;
   f.child_schema.format = "d:18,2";
   REQUIRE(validate_arrow_host_flat(f.schema, f.array)[0] ==
           cudf::data_type(cudf::type_id::DECIMAL128, -2));
