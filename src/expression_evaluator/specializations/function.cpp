@@ -299,6 +299,11 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
     auto input = evaluate(*args[0], evaluation_mode::MATERIALIZE);
     auto result_column =
       cudf::datetime::extract_datetime_component(input.get_column_view(), component, _stream, _mr);
+    // cuDF returns INT16, while SQL extraction returns BIGINT. Restore the declared type before
+    // a parent AST operation or CASE consumes this result; final-output reconciliation is too late.
+    if (result_column->type() != output_type) {
+      result_column = cudf::cast(result_column->view(), output_type, _stream, _mr);
+    }
     return evaluate_result(std::move(result_column));
   };
   if (resolved_id == function_id::year) {
