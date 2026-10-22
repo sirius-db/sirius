@@ -18,6 +18,7 @@
 #include <catch.hpp>
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
+#include <duckdb/main/attached_database.hpp>
 #include <duckdb/storage/data_table.hpp>
 #include <duckdb/storage/storage_manager.hpp>
 #include <helper/type_conversions.hpp>
@@ -70,7 +71,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     auto result = con->Query("SELECT sum(x) FROM native_matrix_negative");
     if (result->HasError()) INFO(result->GetError());
     REQUIRE_FALSE(result->HasError());
-    CHECK(result->GetValue(0, 0).ToString() == "8386560");
+    CHECK(result->Collection().GetValue(0, 0).ToString() == "8386560");
     auto after = sirius::test::get_transparent_execution_stats(*con);
     CHECK(after.runtime_fallbacks == before.runtime_fallbacks + 1);
     CHECK(after.native_decoder_calls == before.native_decoder_calls);
@@ -102,7 +103,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     manifest.open(path);
     manifest << "version,logical_type,requested,segment_type,compression,rows\n";
   }
-  for (auto version : {"v0.10.2", "v1.2.0", "v1.5.0"}) {
+  for (auto version : {"v0.10.2", "v1.2.0", "v1.5.0", "v2.0.0"}) {
     auto file = directory.file_literal(std::string(version) + ".duckdb");
     run_ok("ATTACH " + file + " AS matrix_db (STORAGE_VERSION '" + version + "')");
     run_ok("USE matrix_db");
@@ -111,9 +112,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
                                    .GetAttached()
                                    .GetStorageManager()
                                    .GetStorageVersion();
-    CHECK(storage_version == (std::string(version) == "v0.10.2"  ? 1
-                              : std::string(version) == "v1.2.0" ? 4
-                                                                 : 7));
+    CHECK(storage_version == duckdb::GetStorageVersion(version));
     run_ok("COMMIT");
     for (auto const& cell : cells) {
       auto codecs =
@@ -135,11 +134,12 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
         REQUIRE_FALSE(actual->HasError());
         bool negative = false;
         for (duckdb::idx_t row = 0; row < actual->RowCount(); ++row) {
-          auto segment     = actual->GetValue(0, row).ToString();
-          auto compression = actual->GetValue(1, row).ToString();
+          auto segment     = actual->Collection().GetValue(0, row).ToString();
+          auto compression = actual->Collection().GetValue(1, row).ToString();
           std::ostringstream observation;
           observation << version << ',' << '"' << cell.type << '"' << ',' << codec << ',' << segment
-                      << ',' << compression << ',' << actual->GetValue(2, row).ToString();
+                      << ',' << compression << ','
+                      << actual->Collection().GetValue(2, row).ToString();
           observed.insert(observation.str());
           if (manifest) manifest << observation.str() << '\n';
           negative |= (segment == "VARCHAR" && compression == "ZSTD") ||
@@ -226,7 +226,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   auto before = sirius::test::get_transparent_execution_stats(*con);
   auto result = con->Query("SELECT sum(x) FROM admission_pin");
   REQUIRE_FALSE(result->HasError());
-  CHECK(result->GetValue(0, 0).ToString() == "8128");
+  CHECK(result->Collection().GetValue(0, 0).ToString() == "8128");
   auto after = sirius::test::get_transparent_execution_stats(*con);
   CHECK(after.runtime_fallbacks == before.runtime_fallbacks + 1);
   CHECK(after.certificate_incompletes == before.certificate_incompletes + 1);
@@ -262,7 +262,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   REQUIRE_FALSE(database->HasError());
   auto other =
     std::make_unique<duckdb::Connection>(sirius::test::g_integration_env->make_connection());
-  auto use = other->Query("USE " + database->GetValue(0, 0).ToString());
+  auto use = other->Query("USE " + database->Collection().GetValue(0, 0).ToString());
   REQUIRE_FALSE(use->HasError());
   REQUIRE_FALSE(other->Query("SET gpu_execution=true")->HasError());
   REQUIRE_FALSE(con->Query("SET sirius_test_invalidate_pin_witness=true")->HasError());
@@ -281,8 +281,8 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   auto admitted_result = admitted.get();
   REQUIRE_FALSE(rejected_result->HasError());
   REQUIRE_FALSE(admitted_result->HasError());
-  CHECK(rejected_result->GetValue(0, 0).ToString() == "33550336");
-  CHECK(admitted_result->GetValue(0, 0).ToString() == "33550336");
+  CHECK(rejected_result->Collection().GetValue(0, 0).ToString() == "33550336");
+  CHECK(admitted_result->Collection().GetValue(0, 0).ToString() == "33550336");
   auto after = sirius::test::get_transparent_execution_stats(*con);
   CHECK(after.successful_rebinds == before.successful_rebinds + 2);
   CHECK(after.executions == before.executions + 2);

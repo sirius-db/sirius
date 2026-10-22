@@ -17,6 +17,7 @@
 #pragma once
 
 // sirius
+#include <op/scan/dynamic_filter_merge.hpp>
 #include <op/scan/gpu_ingestible.hpp>
 #include <op/scan/table_scan/scan_contract.hpp>
 #include <op/sirius_physical_operator.hpp>
@@ -41,10 +42,6 @@ namespace sirius::transparent {
 class read_view_registry;
 }
 
-namespace sirius::op {
-class sirius_dynamic_filter_set;  // membership channel (op/sirius_dynamic_filter.hpp)
-}
-
 namespace duckdb {
 class SiriusContext;
 }  // namespace duckdb
@@ -55,6 +52,17 @@ class scan_operator_input;
 //===----------------------------------------------------------------------===//
 // sirius_gpu_scan_operator
 //===----------------------------------------------------------------------===//
+/**
+ * @brief Maps a scan's output ordinals to the decoder slots of @p ingestible, for the
+ * `dynamic_filter_consumer` the scan shares with its endpoint
+ *
+ * Decoder slots match output ordinals only when the output assembly of @p ingestible leads with at
+ * least @p output_width decoded columns. Otherwise the map is empty, and decodes attach no
+ * membership probes.
+ */
+[[nodiscard]] std::vector<binding> scan_decode_bindings(gpu_ingestible const& ingestible,
+                                                        std::size_t output_width);
+
 /**
  * @brief Unified GPU scan source operator.
  *
@@ -94,15 +102,43 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
    *                               narrowing observability; may be null.
    * @param read_views             Registry owning the bound scan contract; may be null
    *                               when bound contract lookup is not needed.
+   * @param consumer               Shared with the immediate sirius_physical_dynamic_filter endpoint
+   * and created with `scan_decode_bindings` over @p ingestible; null when no endpoint is planned.
    */
   sirius_gpu_scan_operator(duckdb::vector<sirius::logical_type> types,
                            duckdb::idx_t estimated_cardinality,
                            std::shared_ptr<gpu_ingestible> ingestible,
                            scan_contract_id contract_id,
                            duckdb::SiriusContext* compressed_materialization_observer  = nullptr,
-                           std::shared_ptr<transparent::read_view_registry> read_views = nullptr);
+                           std::shared_ptr<transparent::read_view_registry> read_views = nullptr,
+                           std::shared_ptr<dynamic_filter_consumer> consumer           = nullptr);
 
   ~sirius_gpu_scan_operator() override;
+
+  /**
+   * @brief The consumer shared with the immediate sirius_physical_dynamic_filter endpoint
+   *
+   * It names the endpoint in the scan's receipts whether or not the decode may use it (see
+   * decode_consumer()).
+   */
+  [[nodiscard]] std::shared_ptr<dynamic_filter_consumer> const& consumer() const noexcept
+  {
+    return _dynamic_filter_consumer;
+  }
+
+  /**
+   * @brief The consumer for decode-time membership attachment, or null when the decode may not
+   * remove rows
+   *
+   * Null while a late-materialization deferral is installed on this scan: a deferral addresses
+   * whole pinned chunks, and the decode cannot report which rows survive it. Such a scan's rows are
+   * filtered by the endpoint instead, after substitution. Valid once
+   * `sirius_scan_manager::prepare_for_query` has installed the query's deferrals.
+   */
+  [[nodiscard]] std::shared_ptr<dynamic_filter_consumer> decode_consumer() const noexcept
+  {
+    return deferred_output().empty() ? _dynamic_filter_consumer : nullptr;
+  }
 
   // -----------------------------
   // Source interface
@@ -217,11 +253,7 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
   /// fresh.
   std::shared_ptr<std::atomic<bool>> _decode_selection_unprofitable =
     std::make_shared<std::atomic<bool>>(false);
-  /// The scan's dynamic-filter channel (null for non-parquet ingestibles),
-  /// resolved once at construction and stamped onto every split so
-  /// prepare_for_processing can snapshot membership filters at DECODE time
-  /// (see scan_operator_input::dynamic_filters).
-  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> _dynamic_filters_channel;
+  std::shared_ptr<dynamic_filter_consumer> _dynamic_filter_consumer;
   /// Non-owning observer. The registered-state shared_ptr owns the context for
   /// at least as long as the query plan; unit-test operators may leave it null.
   duckdb::SiriusContext* _compressed_materialization_observer;

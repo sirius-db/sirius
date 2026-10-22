@@ -32,3 +32,38 @@ To run specific tests, call the test binary directly with a Catch2 tag or test n
 pixi run build/release/test/cpp/sirius_unittest "[uri_parser]"
 pixi run build/release/test/cpp/sirius_unittest "uri_parser parses bare absolute paths as file URIs"
 ```
+
+## TPC-Havoc queries
+
+[TPC-Havoc](https://github.com/BenchBox-dev/BenchBox/blob/develop/docs/benchmarks/tpc-havoc.md)
+rewrites each of the 22 TPC-H queries ten ways: scalar subqueries, CTEs, UNION ALL, window
+functions and so on. Each rewrite returns the same rows as the original query, so the set covers
+many plan shapes over the same data.
+
+The query files come from [BenchBox](https://github.com/BenchBox-dev/BenchBox), which is MIT-licensed;
+TPC-Havoc is derived from TPC-H. They aren't checked in. Instead, `cmake/sirius-tpch-havoc.cmake`
+downloads the 22 `qNN.yaml` files and BenchBox's `LICENSE` from a pinned commit into
+`build/<preset>/test/tpch_havoc/` when tests are enabled, and checks each file's SHA-256.
+Tests load them with `test/cpp/utils/tpch_havoc_queries.hpp`. There are 220 variants, 184 of them
+distinct.
+
+```bash
+pixi run build/release/test/cpp/sirius_unittest "[tpch_havoc]"
+```
+
+To classify them on the GPU outside the test process, one CLI process per query, run
+`test/scripts/classify_queries.py --benchmark tpch-havoc`. Its docstring describes the options.
+
+- **Offline builds:** configure with `-DSIRIUS_TPCH_HAVOC_DIR=<dir>` to use a copy of the same files,
+  or with `-DSIRIUS_TPCH_HAVOC=OFF` to skip them. With `OFF`, the TPC-Havoc tests skip.
+- **Another copy at runtime:** set the `SIRIUS_TPCH_HAVOC_DIR` environment variable.
+- **Moving the pin:** update the commit in `cmake/sirius-tpch-havoc.cmake`, then replace its file list
+  with the output of:
+
+  ```bash
+  commit=<new commit>
+  for f in LICENSE benchbox/core/tpchavoc/variant_sets/q{01..22}.yaml; do
+    url=https://raw.githubusercontent.com/BenchBox-dev/BenchBox/$commit/$f
+    echo "$f=$(curl -sfL "$url" | sha256sum | cut -d' ' -f1)"
+  done
+  ```

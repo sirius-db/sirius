@@ -25,7 +25,7 @@
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
-#include "telemetry/batch_telemetry.hpp"
+#include "telemetry-bridge/gen/quent.hpp"
 #include "telemetry/nvtx.hpp"
 #include "telemetry/telemetry_context.hpp"
 
@@ -38,12 +38,15 @@
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <data/data_batch_utils.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <format>
 #include <limits>
+#include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
-#include <unordered_set>
+#include <vector>
 
 namespace sirius {
 namespace pipeline {
@@ -88,10 +91,11 @@ void validate_operator_output_types(const op::operator_data* data,
     }
     for (cudf::size_type c = 0; c < tbl.num_columns(); c++) {
       cudf::data_type expected_cudf = physical_types.empty()
-                                        ? sirius::get_cudf_type(expected_types[c])
+                                        ? sirius::require_cudf_type(expected_types[c])
                                         : physical_types[static_cast<std::size_t>(c)];
       cudf::data_type actual        = tbl.column(c).type();
-      if (actual != expected_cudf) {
+      if (actual != expected_cudf &&
+          !op.is_alternate_physical_type(static_cast<std::size_t>(c), actual)) {
         SIRIUS_LOG_WARN(
           "gpu_pipeline_task: operator '{}' (id={}) output batch {} column {} datatype "
           "mismatch: got {}, expected {}",
@@ -177,6 +181,10 @@ void log_operator_data(const op::sirius_physical_operator& op,
 /// receive batches from more than one producer, so a decline is ordinary — and
 /// declining is the only safe answer, since materializing against a stranger's
 /// batch reads arbitrary rows of the pinned table.
+///
+/// Restoration changes column values, never rows or their order, so the result is built by
+/// `with_batches_preserving_rows`: it keeps the input's dynamic type and everything that type
+/// records about its rows, such as original batch IDs, a partition index or a scan receipt.
 std::unique_ptr<op::operator_data> materialize_deferred_input(
   op::sirius_physical_operator const& op,
   op::operator_data const& input_data,
@@ -206,16 +214,31 @@ std::unique_ptr<op::operator_data> materialize_deferred_input(
       " received a mix of deferred and materialized batches for one deferral");
   }
 
+  // The read-only leases skip null batches, so pair them with the input's non-null batches and keep
+  // each null in its position.
+  auto const& originals = input->get_data_batches();
+  if (static_cast<std::size_t>(std::ranges::count_if(
+        originals, [](auto const& batch) { return batch != nullptr; })) != batches.size()) {
+    throw std::runtime_error("[gpu_pipeline_task] operator " +
+                             std::to_string(op.get_operator_id()) +
+                             " received an input whose leases do not match its batches");
+  }
   std::vector<std::shared_ptr<cucascade::data_batch>> output;
-  output.reserve(batches.size());
-  for (std::size_t i = 0; i < batches.size(); ++i) {
-    auto* space = batches[i].get_memory_space();
+  output.reserve(originals.size());
+  std::size_t next = 0;
+  for (auto const& original : originals) {
+    if (!original) {
+      output.push_back(nullptr);
+      continue;
+    }
+    auto const i = next++;
+    auto* space  = batches[i].get_memory_space();
     auto restored =
       late_mat::materialize_at_port(directive, views[i], stream, space->get_default_allocator());
     output.push_back(
       sirius::make_data_batch(std::move(restored), *space, stream, op.batch_telemetry()));
   }
-  return input->with_data_batches(std::move(output));
+  return input->with_batches_preserving_rows(std::move(output));
 }
 
 /// Quiesce work already submitted to a task stream without replacing the exception being handled.
@@ -332,13 +355,16 @@ std::size_t gpu_pipeline_task_local_state::get_estimated_bytes_to_materialize_in
 
   if (auto* scan_input = dynamic_cast<const op::scan::scan_operator_input*>(_input_data.get());
       scan_input && scan_input->is_resident()) {
-    // Cached scan inputs can still reside in HOST and require an upload before execution.
+    // Cached scans need space for host uploads and copies from an excluded GPU.
     auto batch = scan_input->get_cached_batch();
     if (!batch) { return 0; }
 
     auto ro          = batch->to_read_only();
     auto const* data = ro.get_data();
-    if (!data || ro.get_current_tier() == cucascade::memory::Tier::GPU) { return 0; }
+    if (!data) return 0;
+    const bool cross_space = target_space && ro.get_memory_space() &&
+                             ro.get_memory_space()->get_id() != target_space->get_id();
+    if (ro.get_current_tier() == cucascade::memory::Tier::GPU && !cross_space) return 0;
     return peak_materialization_bytes(data);
   }
 
@@ -382,26 +408,11 @@ gpu_pipeline_task::gpu_pipeline_task(
   }
   if (auto* pipeline = _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline()) {
     pipeline->mark_task_created();
-    auto& registry = telemetry::batch_telemetry_registry::instance();
-    for (const auto& weak_batch : _subscribed_batches) {
-      if (auto batch = weak_batch.lock()) {
-        registry.on_packaged(batch, pipeline->pipeline_uuid(), telemetry_handle().uuid());
-        _claimed_batch_ids.push_back(batch->get_batch_id());
-      }
-    }
   }
 }
 
 gpu_pipeline_task::~gpu_pipeline_task()
 {
-  {
-    auto& registry       = telemetry::batch_telemetry_registry::instance();
-    const auto task_uuid = telemetry_handle().uuid();
-    for (const auto batch_id : _claimed_batch_ids) {
-      registry.on_consumed(batch_id, task_uuid);
-    }
-  }
-
   for (const auto& weak_batch : _subscribed_batches) {
     auto batch = weak_batch.lock();
     if (!batch) { continue; }
@@ -431,8 +442,9 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(::cuda::strea
   auto pipeline     = _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline();
   auto& local_state = _local_state->cast<gpu_pipeline_task_local_state>();
   auto operator_input_output_data = std::move(local_state._input_data);
-  auto operators                  = pipeline->get_operators();
-  auto start_index                = local_state._start_operator_index;
+  if (not pipeline) { throw std::invalid_argument("task global state has null pipeline"); }
+  auto operators   = pipeline->get_operators();
+  auto start_index = local_state._start_operator_index;
 
   if (start_index > 0) {
     SIRIUS_LOG_INFO("Pipeline {}: resuming task {} from operator index {} (of {})",
@@ -442,9 +454,9 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(::cuda::strea
                     operators.size());
   }
 
-  auto executor_thread_resource_id = uuid::new_nil();
-  if (telemetry::executor_thread_telemetry_handle.has_value()) {
-    executor_thread_resource_id = telemetry::executor_thread_telemetry_handle->handle->uuid();
+  auto executor_thread_resource_id = quent::executor_thread::ExecutorThreadId{quent::nil_uuid()};
+  if (auto const& h = telemetry::executor_thread_telemetry_state.handle) {
+    executor_thread_resource_id = h->id();
   } else {
     SIRIUS_LOG_ERROR(
       "gpu_pipeline_task::execute_operator: executor thread telemetry handle is not "
@@ -454,16 +466,27 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(::cuda::strea
   for (size_t i = start_index; i < operators.size(); i++) {
     auto& op = operators[i].get();
     try {
-      this->telemetry_handle().computing({
-        .instance_name       = std::format("{}({})", op.get_name(), op.get_operator_id()),
-        .current_operator_id = static_cast<uint32_t>(
-          op.get_operator_id()),  // TODO(dhruv9vats): look into possible overflow
-        .input_bytes          = operator_input_output_data->get_estimated_size_in_bytes(),
-        .peak_allocated_bytes = _allocator ? _allocator->get_peak_allocated_bytes(stream) : 0,
-        .executor_thread_resource_id = executor_thread_resource_id,
-        .reservation_resource_id     = _reservation_tier_resource_id,
-        .reservation_capacity_bytes  = _reservation_bytes,
-      });
+      // TODO(dhruv9vats): include resident scan_operator_input batches in compute attribution.
+      std::vector<uint64_t> batch_ids{};
+      if (const auto* pipelineable_data =
+            dynamic_cast<const op::pipelineable_operator_data*>(operator_input_output_data.get())) {
+        batch_ids.reserve(pipelineable_data->get_data_batches().size());
+        for (auto const& batch : pipelineable_data->get_data_batches()) {
+          batch_ids.push_back(batch->get_batch_id());
+        }
+      }
+
+      this->telemetry_fsm().computing(
+        {.current_operator_id = static_cast<uint32_t>(
+           op.get_operator_id()),  // TODO(dhruv9vats): look into possible overflow
+         .input_bytes          = operator_input_output_data->get_estimated_size_in_bytes(),
+         .input_batch_ids      = batch_ids,
+         .peak_allocated_bytes = _allocator ? _allocator->get_peak_allocated_bytes(stream) : 0,
+         .executor_thread      = {.target = executor_thread_resource_id, .data = {}},
+         .reservation          = {
+                    .target = quent::memory_space::MemorySpaceId{_reservation_memory_resource_id},
+                    .data   = {.bytes = _reservation_bytes},
+         }});
       if (auto completion = get_completion_handler(); completion && completion->injections) {
         auto const& inject = *completion->injections;
         if (inject.gpu_task_oom &&
@@ -661,27 +684,30 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
     throw std::runtime_error("gpu_pipeline_task::execute: input_data is null");
   }
 
-  auto executor_thread_resource_id = uuid::new_nil();
-  if (telemetry::executor_thread_telemetry_handle.has_value()) {
-    executor_thread_resource_id = telemetry::executor_thread_telemetry_handle->handle->uuid();
+  auto executor_thread_resource_id = quent::executor_thread::ExecutorThreadId{quent::nil_uuid()};
+  if (auto const& h = telemetry::executor_thread_telemetry_state.handle) {
+    executor_thread_resource_id = h->id();
   } else {
     SIRIUS_LOG_ERROR(
       "gpu_pipeline_task::execute: executor thread telemetry handle is not initialized");
   }
   _reservation_bytes = reservation_bytes;
   if (requested_memory_space != nullptr) {
-    _reservation_tier_resource_id = telemetry::batch_telemetry_registry::instance().tier_resource(
-      requested_memory_space->get_tier(), requested_memory_space->get_id().device_id);
+    const auto memory_handle = _global_state->cast<gpu_pipeline_task_global_state>()
+                                 .get_telemetry_context()
+                                 .get_memory_context()
+                                 ->get_memory_handle(requested_memory_space->get_id());
+    if (memory_handle) { _reservation_memory_resource_id = memory_handle->get().id().raw(); }
   }
-  telemetry_handle().preparing({
-    .instance_name               = "",
-    .origin_tier                 = local_state._input_data->get_origin_tiers(),
-    .target_tier                 = "GPU",
-    .input_bytes                 = local_state._input_data->get_estimated_size_in_bytes(),
-    .executor_thread_resource_id = executor_thread_resource_id,
-    .reservation_resource_id     = _reservation_tier_resource_id,
-    .reservation_capacity_bytes  = _reservation_bytes,
-  });
+  telemetry_fsm().preparing(
+    {.origin_tier     = local_state._input_data->get_origin_tiers(),
+     .target_tier     = "GPU",
+     .input_bytes     = local_state._input_data->get_estimated_size_in_bytes(),
+     .executor_thread = {.target = executor_thread_resource_id, .data = {}},
+     .reservation     = {
+           .target = quent::memory_space::MemorySpaceId{_reservation_memory_resource_id},
+           .data   = {.bytes = _reservation_bytes},
+     }});
   try {
     local_state._input_data->prepare_for_processing(requested_memory_space, stream);
     // synchronizing here to ensure the timing collected by Quent and logging for preparing the task
@@ -730,24 +756,6 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
                      first_op->get_name(),
                      first_op->get_operator_id(),
                      prepare_duration.count() / 1000.0);
-  }
-
-  // All input batches are now locked for reading via _read_only_data_batches inside
-  // local_state._input_data. The locks are released when the pipelineable_operator_data
-  // is destroyed after the first operator's execute() consumes it.
-  {
-    auto& registry       = telemetry::batch_telemetry_registry::instance();
-    const auto task_uuid = telemetry_handle().uuid();
-    std::unordered_set<uint64_t> live_ids;
-    for (const auto& weak_batch : _subscribed_batches) {
-      if (auto batch = weak_batch.lock()) {
-        live_ids.insert(batch->get_batch_id());
-        registry.on_processing(batch, task_uuid);
-      }
-    }
-    for (const auto batch_id : _claimed_batch_ids) {
-      if (!live_ids.contains(batch_id)) { registry.on_processing_by_id(batch_id, task_uuid); }
-    }
   }
 
   // 2. Set reservation_aware_memory_resource_ref as the default cudf allocator

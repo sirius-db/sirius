@@ -235,7 +235,7 @@ TEST_CASE_METHOD(UnionAllFixture,
 {
   // Distinct UNION, EXCEPT and INTERSECT must leave the GPU path cleanly via a fallback -- not
   // error, and not silently produce a bag union. All three are refused during plan generation
-  // (sirius_plan_set_operation.cpp for distinct UNION, the generator switch for the other two),
+  // (sirius_plan_distinct.cpp for distinct UNION, the generator switch for the other two),
   // so this asserts a plan-time fallback. The helper also compares against the CPU result, which
   // is what pins "still the right answer" without a hand-rolled second check.
   expect_plan_fallback_matches_cpu("SELECT k FROM ua UNION SELECT k FROM ub");

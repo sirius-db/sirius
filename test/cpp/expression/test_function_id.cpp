@@ -19,7 +19,7 @@
 //
 // Round-trips every supported function_id through to_duckdb_function_name /
 // from_duckdb_function_name, verifies the substring/substr alias collapse
-// (D-SUB-1), the std::nullopt return on unknown names, and locks the 33-entry
+// (D-SUB-1), the std::nullopt return on unknown names, and locks the 34-entry
 // ABI cardinality at compile time.
 
 #include "catch.hpp"
@@ -41,8 +41,8 @@ using sirius::to_duckdb_function_name;
 static_assert(std::is_enum_v<function_id>, "sirius::function_id must be an enum class.");
 static_assert(sizeof(function_id) == 2,
               "sirius::function_id is uint16_t-backed (D-01 — locked ABI).");
-static_assert(static_cast<uint16_t>(function_id::round) + 1 == 33,
-              "sirius::function_id has exactly 33 entries (D-01 — locked ABI).");
+static_assert(static_cast<uint16_t>(function_id::abs) + 1 == 34,
+              "sirius::function_id has exactly 34 entries (D-01 — locked ABI).");
 
 // ============================================================================
 // Round-trip every function_id entry through the name mappers
@@ -391,4 +391,10 @@ TEST_CASE("ast_function_id - round round-trips through name mappers", "[ast_func
 {
   REQUIRE(to_duckdb_function_name(function_id::round) == "round");
   REQUIRE(from_duckdb_function_name("round") == function_id::round);
+}
+
+TEST_CASE("ast_function_id - abs round-trips through name mappers", "[ast_function_id]")
+{
+  REQUIRE(to_duckdb_function_name(function_id::abs) == "abs");
+  REQUIRE(from_duckdb_function_name("abs") == function_id::abs);
 }

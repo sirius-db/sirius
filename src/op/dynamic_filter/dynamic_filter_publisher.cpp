@@ -19,6 +19,7 @@
 #include "data/data_batch_utils.hpp"
 #include "helper/numeric_narrowing.hpp"
 #include "log/logging.hpp"
+#include "memory/runtime_stream_pool.hpp"
 #include "op/dynamic_filter/detail/accumulated_bloom_builder.hpp"
 #include "op/dynamic_filter/detail/accumulation_failure.hpp"
 #include "op/dynamic_filter/dynamic_filter_key_domain.hpp"
@@ -34,6 +35,7 @@
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/types.hpp>
+#include <cudf/utilities/error.hpp>
 
 #include <rmm/cuda_device.hpp>
 #include <rmm/error.hpp>
@@ -868,16 +870,14 @@ void dynamic_filter_publication_session::observe_whole_build(
     }
 
     rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{space->get_device_id()}};
-    ::cuda::stream_ref stream = space->acquire_stream();
+    auto stream_lease         = sirius::memory::runtime_stream_pool::acquire(*space);
+    ::cuda::stream_ref stream = stream_lease.get();
     auto const writer         = source.get_writer_event();
     auto const ready =
       writer ? cudaStreamWaitEvent(stream.get(), writer, 0) : cudaDeviceSynchronize();
-    if (ready != cudaSuccess) {
-      throw std::runtime_error(
-        std::string(
-          "[dynamic_filter_publication_session::observe_whole_build] source readiness failed: ") +
-        cudaGetErrorString(ready));
-    }
+    // Use cuDF's standard clearing/sticky-error probe while retaining CUDA status
+    // for the runtime-health reporter in the execution owner.
+    CUDF_CUDA_TRY(ready);
 
     dynamic_filter_publication_outcome outcome;
     try {

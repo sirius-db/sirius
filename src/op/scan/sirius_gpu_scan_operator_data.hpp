@@ -19,6 +19,7 @@
 // sirius
 #include <compression/compressed_scan.hpp>
 #include <late_mat/column_origin.hpp>
+#include <op/scan/dynamic_filter_merge.hpp>
 #include <op/scan/gpu_ingestible.hpp>
 #include <op/sirius_physical_operator.hpp>
 #include <scan_manager/mvcc_chunk_mask.hpp>
@@ -58,26 +59,87 @@ namespace sirius::op::scan {
 // Dynamic join filters, snapshotted for a decode
 //===----------------------------------------------------------------------===//
 /**
- * @brief One coherent dynamic-filter snapshot shaped into owning decode probes.
+ * @brief Consumer-selected dynamic filters shaped into owning decode probes.
  */
 struct membership_snapshot {
   std::vector<std::vector<sirius::membership_probe>>
-    probes;                          ///< Parallel to selected slots; closures retain filters.
-  std::uint64_t generation     = 0;  ///< Channel generation captured with these probes.
-  std::size_t attached_probes  = 0;
-  std::size_t skipped_non_mask = 0;  ///< filters without the mask-applicable mixin (zone maps)
+    probes;                      ///< Parallel to selected slots; closures retain filters.
+  std::uint64_t generation = 0;  ///< Channel generation captured with these probes.
+  std::vector<applied_entry> attached;
 };
 
 /**
- * @brief Shapes a coherent snapshot into probes over decoded slots.
+ * @brief Shapes a consumer selection into probes over decoded slots.
  *
- * The scan manager and decode-time refresh use output columns first, in output order, followed by
- * pure-filter columns. Snapshot bindings are output-column positions, so slot i corresponds to
- * output position i; trailing pure-filter slots have no bindings. Each probe closure retains its
- * filter through the decode's existing stream retirement.
+ * The selection maps canonical output ordinals to decoded slots;
+ * `dynamic_filter_consumer::select_for_decode` over bindings whose decoder slots are below @p
+ * n_slots produces a valid one. Each probe closure retains its filter through the decode's existing
+ * stream retirement, and probes keep the selection's step order. The attached identities
+ * conservatively record every represented binding, even if the decoder declines its probe.
+ *
+ * @throws std::invalid_argument if a step's filter cannot compute masks or its slot is not below @p
+ * n_slots
  */
-[[nodiscard]] membership_snapshot snapshot_membership_probes(
-  sirius::op::dynamic_filter_snapshot const& snapshot, std::size_t n_slots);
+[[nodiscard]] membership_snapshot snapshot_membership_probes(decode_selection const& selection,
+                                                             std::size_t n_slots);
+
+/**
+ * @brief Conditions under which one decode attachment offers no membership probes
+ *
+ * `sirius::scan_manager` attaches when it serves a cached chunk and passes the defaults.
+ * `scan_operator_input::prepare_for_processing` attaches again right before decode and passes the
+ * split's own state.
+ */
+struct membership_attach_options {
+  /// The scan latched decode-time compaction as unprofitable, so offer no probes.
+  bool selection_unprofitable = false;
+  /// The split carries an MVCC keep-mask that the representation does not compose into the decode.
+  bool uncomposed_mvcc_mask = false;
+};
+
+namespace detail {
+/**
+ * @brief A replacement decode request and the bindings its membership probes represent
+ */
+struct membership_refresh {
+  /// The request to install, or null to keep the current one, which then carries no membership
+  /// probes.
+  std::shared_ptr<const sirius::decompression_pushdown_scan> request;
+  std::vector<applied_entry> attached;
+};
+
+/**
+ * @brief Selects membership probes from @p consumer and rebuilds @p current around them
+ *
+ * Returns empty when there is neither a consumer nor a current request, so nothing changes.
+ */
+[[nodiscard]] std::optional<membership_refresh> refresh_membership_probes(
+  std::shared_ptr<const sirius::decompression_pushdown_scan> const& current,
+  std::size_t n_slots,
+  dynamic_filter_consumer const* consumer,
+  membership_attach_options options);
+}  // namespace detail
+
+/**
+ * @brief Replaces the membership probes on a compressed representation's decode request
+ *
+ * Probes come from @p consumer's decode bindings that address the representation's selected slots,
+ * and @p attached receives the bindings they represent. When there is neither a consumer nor an
+ * existing request, both stay unchanged.
+ */
+template <typename Representation>
+void attach_membership_probes(Representation& rep,
+                              dynamic_filter_consumer const* consumer,
+                              membership_attach_options options,
+                              std::vector<applied_entry>& attached)
+{
+  auto const n_slots =
+    rep.selected_indices().has_value() ? rep.selected_indices()->size() : rep.column_names().size();
+  auto refresh = detail::refresh_membership_probes(rep.pushdown_scan(), n_slots, consumer, options);
+  if (!refresh) { return; }
+  if (refresh->request) { rep.set_pushdown_scan(std::move(refresh->request)); }
+  attached = std::move(refresh->attached);
+}
 
 //===----------------------------------------------------------------------===//
 // scan_operator_input
@@ -92,6 +154,7 @@ struct membership_snapshot {
  */
 class scan_operator_input : public op::operator_data {
  public:
+  enum class prefetch_start { immediate, deferred };
   /// Hint the IO layer about every range this split will read, then publish it
   /// to @p readahead -- in that order, which is why both belong here.
   /// Registration makes the split eligible for prefetching and takes the
@@ -101,11 +164,17 @@ class scan_operator_input : public op::operator_data {
   /// datasources have no prefetch handle yet, and would leave the handle write
   /// racing the worker's read of it.  @p preferred_device is passed in for the
   /// same reason: an fadvise names the GPU its bytes are headed for.
+  /// With @p start set to deferred, call initialize_prefetch() after publication admission.
   explicit scan_operator_input(
     std::shared_ptr<scan_info> metadata,
     std::shared_ptr<scan_manager::readahead_scan_manager> readahead = nullptr,
     std::size_t operator_id                                         = 0,
-    std::optional<int> preferred_device                             = std::nullopt);
+    std::optional<int> preferred_device                             = std::nullopt,
+    prefetch_start start                                            = prefetch_start::immediate);
+
+  /// Initialize hints, buffers and readahead before exposing this input to consumers.
+  /// Single-owner, at most once; an exception requires discarding the input, not retrying it.
+  void initialize_prefetch();
 
   explicit scan_operator_input(
     std::shared_ptr<cucascade::data_batch> cached_batch,
@@ -273,12 +342,12 @@ class scan_operator_input : public op::operator_data {
   /// again. False whenever the answers came from the plain predicated decode,
   /// which drops no rows.
   bool pushdown_predicates_enforced{false};
-  /// The operator's dynamic-filter channel (may be null), stamped by
-  /// sirius_gpu_scan_operator::get_next_task_input_data. prepare_for_processing
-  /// snapshots it at DECODE time — the scan-manager drain runs at query
-  /// prepare, before any join build has published, so only a decode-time
-  /// snapshot can see any join filters at all.
-  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> dynamic_filters;
+  /// The scan's decode consumer (`sirius_gpu_scan_operator::decode_consumer`), which selects
+  /// membership probes for this split's decode through its decode bindings; null when no decode
+  /// attachment is permitted.
+  std::shared_ptr<dynamic_filter_consumer> consumer;
+  /// Possible membership applications attached to this split's current decoded rows.
+  std::vector<applied_entry> decode_attached;
   /// Operator-shared latch for "compacting this scan's batches during decode
   /// does not pay off", stamped by
   /// sirius_gpu_scan_operator::get_next_task_input_data on every split it hands
@@ -331,11 +400,14 @@ class scan_operator_input : public op::operator_data {
   /// @throws std::runtime_error if the decode compacted rows but left an mvcc keep-mask unconsumed.
   void record_decode_outcome(::cucascade::idata_representation const* data);
 
+  /// Whether the input has already been decoded for a retry (preserve dynamic filter history)
+  bool _decoded_input_reused{false};
   /// Per-query readahead bookkeeping this split reports into; null when the
   /// producer does not track readahead.
   std::shared_ptr<scan_manager::readahead_scan_manager> _readahead;
   /// Operator id this split was emitted under, the key @ref _readahead uses.
   std::size_t _operator_id{0};
+  bool _prefetch_started{false};
 };
 
 }  // namespace sirius::op::scan

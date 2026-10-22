@@ -55,10 +55,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalSetOperation& op)
     sirius::from_duckdb_vec(op.types), op.estimated_cardinality);
 
   for (auto& child : op.children) {
-    // Re-check the binder's arity invariant on the *logical* arm, not on `create_plan`'s result:
-    // a physical root's types are not always its output schema. `sirius_physical_cte` declares its
-    // materialization side (`sirius_plan_cte.cpp`), so reading the physical plan declines a valid
-    // query whose arm is a materialized CTE.
+    // Check the binder's arity invariant before lowering each arm.
     if (child->types.size() != op.types.size()) {
       throw duckdb::NotImplementedException(
         "UNION ALL: input column count does not match the set operation output");

@@ -139,7 +139,12 @@ bool column_has_real_nulls(duckdb_column_metadata const& col)
 
 cudf::data_type sirius_to_cudf_type(sirius::logical_type const& t)
 {
-  return duckdb::GetCudfType(sirius::to_duckdb(t));
+  auto const type = sirius::get_cudf_type(sirius::to_duckdb(t));
+  if (!type) {
+    throw duckdb::InvalidInputException("Native scan type %s cannot be mapped to cuDF",
+                                        t.to_string());
+  }
+  return *type;
 }
 
 /// @brief Pinned host bytes for a segment (only for CONSTANT and ROARING validity segments for now)
@@ -205,16 +210,12 @@ pinned_segment_bytes decode_roaring_validity(duckdb::DatabaseInstance& db,
   constexpr duckdb::idx_t CHUNK = duckdb::roaring::ROARING_CONTAINER_SIZE;
 
   auto validity_type = duckdb::LogicalType(duckdb::LogicalTypeId::VALIDITY);
-  auto seg           = duckdb::ColumnSegment::CreatePersistentSegment(
-    db,
-    block_manager,
-    desc.block_id,
-    desc.block_offset,
-    validity_type,
-    desc.segment_count,
-    duckdb::CompressionType::COMPRESSION_ROARING,
-    duckdb::BaseStatistics::CreateEmpty(validity_type),
-    /*segment_state=*/nullptr);
+  duckdb::DataPointer data_pointer(duckdb::BaseStatistics::CreateEmpty(validity_type));
+  data_pointer.row_start        = 0;
+  data_pointer.tuple_count      = desc.segment_count;
+  data_pointer.block_pointer    = duckdb::BlockPointer(desc.block_id, desc.block_offset);
+  data_pointer.compression_type = duckdb::CompressionType::COMPRESSION_ROARING;
+  auto seg = duckdb::ColumnSegment::CreatePersistentSegment(db, block_manager, data_pointer);
 
   auto const row_count = static_cast<duckdb::idx_t>(desc.segment_count);
   pinned_segment_bytes out;
@@ -222,13 +223,12 @@ pinned_segment_bytes decode_roaring_validity(duckdb::DatabaseInstance& db,
   out.owned_bytes.assign(words * sizeof(uint64_t), 0xff);
 
   duckdb::roaring::RoaringScanState rs(*seg);
-  duckdb::Vector tmp(duckdb::LogicalType::BOOLEAN, CHUNK);
+  duckdb::ValidityMask vm(CHUNK);
 
   for (duckdb::idx_t scanned = 0; scanned < row_count; scanned += CHUNK) {
     auto const to_scan = std::min<duckdb::idx_t>(CHUNK, row_count - scanned);
-    auto& vm           = duckdb::FlatVector::Validity(tmp);
     vm.SetAllValid(CHUNK);
-    rs.ScanPartial(scanned, tmp, /*offset=*/0, to_scan);
+    rs.ScanPartial(scanned, vm, /*offset=*/0, to_scan);
     if (!vm.AllValid()) {
       std::size_t const byte_offset   = scanned / 8;
       std::size_t const bytes_to_copy = (to_scan + 7) / 8;

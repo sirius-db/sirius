@@ -181,7 +181,8 @@ TEST_CASE("physical_union - unequal arms drain across many batches",
     auto rows = con.Query("SELECT count(*) FROM (" + query + ") t;");
     REQUIRE(rows);
     REQUIRE_FALSE(rows->HasError());
-    REQUIRE(rows->GetValue(0, 0).GetValue<int64_t>() == static_cast<int64_t>(kExpectedRows));
+    REQUIRE(rows->Collection().GetValue(0, 0).GetValue<int64_t>() ==
+            static_cast<int64_t>(kExpectedRows));
   }
 
   std::error_code ec;
@@ -214,7 +215,8 @@ TEST_CASE("physical_union - three arms of descending width",
     auto rows = con.Query("SELECT count(*) FROM (" + query + ") t;");
     REQUIRE(rows);
     REQUIRE_FALSE(rows->HasError());
-    REQUIRE(rows->GetValue(0, 0).GetValue<int64_t>() == static_cast<int64_t>(kExpectedRows));
+    REQUIRE(rows->Collection().GetValue(0, 0).GetValue<int64_t>() ==
+            static_cast<int64_t>(kExpectedRows));
   }
 
   std::error_code ec;

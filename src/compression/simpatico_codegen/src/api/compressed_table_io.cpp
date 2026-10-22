@@ -9,9 +9,11 @@
 #include "codegen/plan/plan_interpreter.hpp"
 #include "codegen/plan/representation.hpp"
 #include "codegen/util/nvtx.hpp"
+#include "util/host_observation.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/types.hpp>
 
@@ -27,6 +29,7 @@
 #include <cstring>
 #include <fstream>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -256,11 +259,13 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
   auto make_col = [&](std::size_t i) -> std::unique_ptr<cudf::column> {
     auto const& bd     = bufs[i];
     cudf::data_type dt = tag_to_dtype(bd.type_tag);
-    auto col           = cudf::make_numeric_column(dt,
-                                         static_cast<cudf::size_type>(bd.num_rows),
-                                         cudf::mask_state::UNALLOCATED,
-                                         stream,
-                                         leaf_mr);
+    // Fixed-width, not numeric: an identity leaf keeps its column's type, which may
+    // be a decimal or chrono type that make_numeric_column rejects.
+    auto col = cudf::make_fixed_width_column(dt,
+                                             static_cast<cudf::size_type>(bd.num_rows),
+                                             cudf::mask_state::UNALLOCATED,
+                                             stream,
+                                             leaf_mr);
     if (bd.size_bytes > 0) {
       fill(i, col->mutable_view().head<void>(), static_cast<std::size_t>(bd.size_bytes), stream);
     }
@@ -323,7 +328,68 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
 // 11: a Bitpack "packed" buffer counts its decode gather guard words in num_rows, so the
 //     stored word count is what the reader allocates and the guard needs no read-side
 //     reconstruction (see compact_bitpack_packed).
-static constexpr std::uint8_t kVersion = 11;
+//
+// 12: a per-column validity sidecar record sits beside each column's plan tree (see
+//     push_validity), so a nullable column compresses instead of falling back.
+//
+// 13: a Bitpack "packed" buffer carries five decode guard words rather than three,
+//     because the 128-bit gather spans five uint32 words. The count is part of the
+//     buffer's num_rows, so a v12 payload read with a v13 decoder would over-read.
+static constexpr std::uint8_t kVersion = 13;
+
+// Per-column validity record, written right after num_rows:
+//
+//   kind (uint8)                        [validity_kind]
+//   if kind != all_valid: null_count (int64 LE)
+//   if kind == mask:      size_bytes (uint64 LE) + payload_offset (uint64 LE)
+//
+// An all-valid column costs exactly one byte, and an all-null one costs nine
+// with no payload at all -- only a genuinely mixed column pays for a bitmask.
+// The mask is appended to the payload region like any leaf buffer, so callers
+// that stage the payload themselves need no special case for it.
+static void push_validity(std::vector<std::uint8_t>& hdr,
+                          validity_sidecar const& v,
+                          std::uint64_t column_index,
+                          std::vector<payload_buffer_ref>& out_buffers,
+                          std::uint64_t& payload_offset)
+{
+  push_le(hdr, static_cast<std::uint8_t>(v.kind));
+  if (v.kind == validity_kind::all_valid) return;
+
+  push_le(hdr, v.null_count);
+  if (v.kind != validity_kind::mask) return;
+
+  auto const size_bytes = static_cast<std::uint64_t>(v.mask.size());
+  push_le(hdr, size_bytes);
+  push_le(hdr, payload_offset);
+  out_buffers.push_back(
+    payload_buffer_ref{payload_offset, v.mask.data(), size_bytes, size_bytes, column_index});
+  payload_offset += size_bytes;
+}
+
+// Parsed form of the record above; the mask bytes are pulled from the payload
+// later (reconstruct_from_records), like every leaf buffer.
+struct ValidityRecord {
+  validity_kind kind           = validity_kind::all_valid;
+  std::int64_t null_count      = 0;
+  std::uint64_t size_bytes     = 0;
+  std::uint64_t payload_offset = 0;
+};
+
+// Inverse of push_validity. Returns false on a truncated or unknown record.
+static bool read_validity(Reader& r, ValidityRecord& v)
+{
+  std::uint8_t k;
+  if (!r.read_le(k)) return false;
+  if (k > static_cast<std::uint8_t>(validity_kind::mask)) return false;
+  v.kind = static_cast<validity_kind>(k);
+  if (v.kind == validity_kind::all_valid) return true;
+
+  if (!r.read_le(v.null_count)) return false;
+  if (v.kind != validity_kind::mask) return true;
+
+  return r.read_le(v.size_bytes) && r.read_le(v.payload_offset);
+}
 
 // Serialize one node's structure (op, bitjoin params, edges, output names).
 // Other ops carry their params in the op name, so only bitjoin needs attrs.
@@ -413,6 +479,7 @@ struct ColRecord {
   std::uint8_t dtype_tag = 0;
   std::int32_t scale     = 0;  // fixed-point scale for the column dtype (0 otherwise)
   std::int64_t num_rows  = 0;
+  ValidityRecord validity;
   PlanTree tree;
   std::vector<leaf_desc> leaf_descs;
   std::vector<std::vector<std::uint64_t>> buf_offsets;  // [leaf][buffer] -> payload offset
@@ -450,6 +517,22 @@ static bool parse_hpln_header(Reader& r, std::vector<ColRecord>& out, std::strin
     if (!r.read_le(cr.dtype_tag)) return bad("truncated col dtype");
     if (!r.read_le(cr.scale)) return bad("truncated col scale");
     if (!r.read_le(cr.num_rows)) return bad("truncated col num_rows");
+    if (!read_validity(r, cr.validity)) return bad("truncated/unknown col validity");
+    // Reject an inconsistent record here: a corrupt file must not reach attach_validity
+    // with a short mask or a null_count that disagrees with the row count.
+    if (cr.validity.kind == validity_kind::mask) {
+      auto const min_mask_bytes =
+        cr.num_rows < 0 ? std::uint64_t{0}
+                        : static_cast<std::uint64_t>(
+                            cudf::num_bitmask_words(static_cast<cudf::size_type>(cr.num_rows))) *
+                            sizeof(cudf::bitmask_type);
+      if (cr.num_rows < 0 || cr.validity.size_bytes < min_mask_bytes ||
+          cr.validity.null_count < 0 || cr.validity.null_count > cr.num_rows)
+        return bad("col validity mask undersized or null_count out of range");
+    } else if (cr.validity.kind == validity_kind::all_null) {
+      if (cr.validity.null_count != cr.num_rows)
+        return bad("all-null col validity null_count != num_rows");
+    }
 
     std::uint16_t nn;
     if (!r.read_le(nn)) return bad("truncated num_nodes");
@@ -497,6 +580,66 @@ static bool parse_hpln_header(Reader& r, std::vector<ColRecord>& out, std::strin
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// PlanNode::dictionary_key_width_hint derivation
+// ---------------------------------------------------------------------------
+
+// Bounds the host derivation; a larger key set leaves the hint unknown and decode measures the
+// width as before. TPC-H dictionary key sets hold a few keys.
+static constexpr std::size_t kMaxHintOffsets = std::size_t{1} << 16;
+
+// -1 when the offsets do not start at zero, since the decoders assume the key chars begin at
+// offsets[0] == 0.
+static std::int64_t constant_key_width_from_offsets(std::span<std::int32_t const> offsets)
+{
+  if (offsets.size() < 2) return 0;
+  if (offsets.front() != 0) return -1;
+  auto const width = static_cast<std::int64_t>(offsets[1]) - offsets[0];
+  if (width <= 0) return 0;
+  for (std::size_t i = 2; i < offsets.size(); ++i) {
+    if (static_cast<std::int64_t>(offsets[i]) - offsets[i - 1] != width) return 0;
+  }
+  return width;
+}
+
+// Sets the hint on every `dictionary` node of `tree` before the tree is published: from the
+// self-stored representation, or from a terminal identity INT32 `keys_offsets` leaf whose offsets
+// are read back on `stream`, the stream the leaf fetches were enqueued on (one staged read per such
+// column, host memory only). INT64 offsets and a consumed `keys_offsets` stay unknown. Returns an
+// error message, or empty on success.
+static std::string derive_dictionary_key_width_hints(PlanTree& tree, ::cuda::stream_ref stream)
+{
+  for (auto& node : tree.nodes) {
+    if (op_id_from_name(node.op) != OpId::Dictionary) continue;
+    if (node.rep) {
+      if (auto const* dictionary =
+            dynamic_cast<dictionary_compressed_representation const*>(node.rep.get())) {
+        node.dictionary_key_width_hint = dictionary->constant_key_width;
+      }
+      continue;
+    }
+    auto const* stored = terminal_identity_channel(node, "keys_offsets");
+    if (!stored) continue;
+    cudf::column_view const offsets = stored->view();
+    if (offsets.type().id() != cudf::type_id::INT32 || offsets.null_count() != 0) continue;
+    auto const count = static_cast<std::size_t>(offsets.size());
+    if (count < 2) {
+      node.dictionary_key_width_hint = 0;
+      continue;
+    }
+    if (count > kMaxHintOffsets) continue;
+    std::vector<std::int32_t> host(count);
+    try {
+      read_device_bytes_completed(
+        host.data(), offsets.data<std::int32_t>(), count * sizeof(std::int32_t), stream);
+    } catch (std::exception const& error) {
+      return std::string("dictionary key width readback: ") + error.what();
+    }
+    node.dictionary_key_width_hint = constant_key_width_from_offsets(host);
+  }
+  return {};
+}
+
 // Reconstruct a compressed_table from parsed column records, pulling each leaf
 // buffer's bytes into device memory via `fetch(offset, size, dst_device, stream)`.
 // `recs` is consumed (plan trees are moved into the result).
@@ -534,6 +677,21 @@ static compressed_table reconstruct_from_records(std::vector<ColRecord>& recs,
     *plan_tree     = std::move(cr.tree);
     auto& nodes    = plan_tree->nodes;
 
+    // Rebuild the validity sidecar. all_valid and all_null carry no payload, so
+    // only a mixed column costs a fetch here.
+    auto& validity      = plan_tree->validity;
+    validity.kind       = cr.validity.kind;
+    validity.null_count = cr.validity.null_count;
+    if (validity.kind == validity_kind::mask) {
+      auto const sz = static_cast<std::size_t>(cr.validity.size_bytes);
+      // From leaf_mr, like every enumerated payload buffer: the writer lists the mask
+      // among them (push_validity), and a caller placing them in its own slab hands
+      // slices out by allocation order, so a mask taken from mr would shift every
+      // later leaf onto the wrong slice.
+      validity.mask = rmm::device_buffer(sz, stream, leaf_mr);
+      if (sz > 0) fetch(cr.validity.payload_offset, sz, validity.mask.data(), stream);
+    }
+
     for (std::size_t li = 0; li < cr.leaf_descs.size(); ++li) {
       auto const& ld    = cr.leaf_descs[li];
       auto const& boffs = cr.buf_offsets[li];
@@ -559,7 +717,14 @@ static compressed_table reconstruct_from_records(std::vector<ColRecord>& recs,
       }
     }
 
-    compute_input_sources(*plan_tree);
+    try {
+      compute_input_sources(*plan_tree);
+    } catch (std::invalid_argument const& error) {
+      return fail(std::string{error.what()} + " in col " + std::to_string(ci));
+    }
+    if (auto message = derive_dictionary_key_width_hints(*plan_tree, stream); !message.empty()) {
+      return fail(message + " in col " + std::to_string(ci));
+    }
     out_col.plan_tree = std::move(plan_tree);
   }
 
@@ -635,17 +800,22 @@ compressed_table read_compressed_table(std::string const& path,
 
   // Bounds-check every buffer up front so a truncated file is reported here
   // rather than faulting mid-copy, then copy each buffer straight to device.
+  auto in_payload = [&](std::uint64_t off, std::size_t sz) {
+    // Subtraction form: `off + sz` could overflow for a corrupt/hostile file's
+    // huge declared offset and wrap below payload_total, passing the check and
+    // then faulting in fetch(). Compare against the remaining space instead so
+    // it can never overflow.
+    return sz == 0 || (off <= payload_total && sz <= payload_total - off);
+  };
   for (auto const& cr : col_records) {
+    if (cr.validity.kind == validity_kind::mask &&
+        !in_payload(cr.validity.payload_offset, static_cast<std::size_t>(cr.validity.size_bytes)))
+      return fail("payload out of bounds");
     for (std::size_t li = 0; li < cr.leaf_descs.size(); ++li) {
       for (std::size_t bi = 0; bi < cr.leaf_descs[li].buffers.size(); ++bi) {
         std::size_t sz = static_cast<std::size_t>(cr.leaf_descs[li].buffers[bi].size_bytes);
         std::uint64_t const off = cr.buf_offsets[li][bi];
-        // Subtraction form: `off + sz` could overflow for a corrupt/hostile
-        // file's huge declared offset and wrap below payload_total, passing the
-        // check and then faulting in fetch(). Compare against the remaining space
-        // instead so it can never overflow.
-        if (sz > 0 && (off > payload_total || sz > payload_total - off))
-          return fail("payload out of bounds");
+        if (!in_payload(off, sz)) return fail("payload out of bounds");
       }
     }
   }
@@ -771,6 +941,10 @@ std::string build_compressed_table_header(compressed_table const& table,
     // Structural plan tree (identical layout to the file header, so the same
     // parser reconstructs it): the node array is the source of truth on read.
     PlanTree const& tree = col.plan_tree ? *col.plan_tree : kEmptyTree;
+
+    // Validity rides beside the tree, not inside it: it is not a leaf and has no
+    // node, so it is written here rather than through describe().
+    push_validity(hdr, tree.validity, ci, out_buffers, payload_offset);
     push_le(hdr, static_cast<std::uint16_t>(tree.nodes.size()));
     for (auto const& node : tree.nodes)
       push_node(hdr, node);

@@ -791,7 +791,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
            " (FORMAT PARQUET, ROW_GROUP_SIZE 2048)");
   auto batch_setting = con->Query("SELECT current_setting('scan_task_batch_size')");
   REQUIRE_FALSE(batch_setting->HasError());
-  auto previous_batch = batch_setting->GetValue(0, 0).ToString();
+  auto previous_batch = batch_setting->Collection().GetValue(0, 0).ToString();
   run_ok("SET scan_task_batch_size=1");
   run_ok("SET gpu_execution=true");
   auto state = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
@@ -824,7 +824,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     con->Query("SELECT sum(x) FROM read_parquet(" + directory.file_literal("*.parquet") + ")");
   REQUIRE_FALSE(result->HasError());
   REQUIRE(result->RowCount() == 1);
-  CHECK(result->GetValue(0, 0).ToString() == "16773120");
+  CHECK(result->Collection().GetValue(0, 0).ToString() == "16773120");
   auto after = sirius::test::get_transparent_execution_stats(*con);
   CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
   CHECK(observed);
@@ -847,4 +847,61 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   CHECK(after.split_physical_rejections == before.split_physical_rejections);
   CHECK(after.parquet_reader_calls[directory.file("two_groups.parquet")] ==
         before.parquet_reader_calls[directory.file("two_groups.parquet")] + 1);
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "Parquet footer cache is shared across query projections and reader options",
+                 "[scan][parquet][integration][metadata_retention]")
+{
+  sirius::test::scratch_dir directory("parquet_r3_projection");
+  run_ok("SET gpu_execution=false");
+  auto path = directory.file("columns.parquet");
+  run_ok("COPY (SELECT 1::INTEGER x, 2::BIGINT y) TO " + sirius::test::sql_literal(path) +
+         " (FORMAT PARQUET)");
+  auto& manager = sirius::test::get_registered_sirius_context(*con)->get_scan_manager();
+  auto source   = manager.create_datasource(path);
+  REQUIRE(source);
+  auto options = cudf::io::parquet_reader_options::builder().build();
+  bool hit     = true;
+  auto all     = resolve_parquet_metadata(*source, 0, path, options, &hit);
+  CHECK_FALSE(hit);
+  CHECK(all->built_for_identity == source->get_io_object().identity_cache_key());
+  options.set_column_names({"y"});
+  auto projected = resolve_parquet_metadata(*source, 0, path, options, &hit);
+  CHECK(hit);
+  CHECK(projected == all);
+  CHECK(projected->file_metadata()->schema.size() == 3);
+  CHECK(source->metadata() == all);
+  options.enable_use_arrow_schema(!options.is_enabled_use_arrow_schema());
+  auto different_profile = resolve_parquet_metadata(*source, 0, path, options, &hit);
+  CHECK(hit);
+  CHECK(different_profile == all);
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "Parquet cache hits preserve artifact provenance",
+                 "[scan][parquet][integration][metadata_retention]")
+{
+  sirius::test::scratch_dir directory("parquet_r3_provenance");
+  run_ok("SET gpu_execution=false");
+  auto path = directory.file("columns.parquet");
+  run_ok("COPY (SELECT 1::INTEGER x) TO " + sirius::test::sql_literal(path) + " (FORMAT PARQUET)");
+  auto& manager = sirius::test::get_registered_sirius_context(*con)->get_scan_manager();
+  auto source   = manager.create_datasource(path);
+  REQUIRE(source);
+  // A foreign identity must not be accepted as a cache hit.
+  auto foreign = std::make_shared<parquet_metadata>(nullptr,
+                                                    64,
+                                                    parquet_encryption_evidence{},
+                                                    std::vector<uint8_t>{},
+                                                    std::string{},
+                                                    std::vector<uint8_t>{},
+                                                    "foreign-open");
+  REQUIRE(source->store_metadata(foreign));
+  auto options = cudf::io::parquet_reader_options::builder().build();
+  bool hit     = false;
+  auto result  = resolve_parquet_metadata_with_identity(*source, 0, path, options, &hit);
+  CHECK_FALSE(hit);
+  CHECK(result.artifact != foreign);
+  CHECK(result.identity == source->get_io_object().identity_cache_key());
 }

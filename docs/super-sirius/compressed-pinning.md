@@ -13,11 +13,16 @@ CALL pin_table('/data/lineitem/*.parquet',
 
 Tables with no plan file pin uncompressed. Each plan file carries one `---`-separated DSL
 block per full-table column in schema order; a pin of a column subset selects the matching
-blocks (`select_plan_blocks`). Scans of a compressed entry decompress the projected columns
-at task-prepare time via the `compressed_host_representation` /
-`compressed_device_blob` → `gpu_table_representation` converters, column-parallel across
-4 fixed streams (measured strictly better than serial; the stream count is deliberately
-not configurable).
+blocks (`select_plan_blocks`). Each pin reads its plan from the calling connection's
+`pin_table_input_compression_plan_dir`; plans are not stored in a process-wide registry.
+Scans of a compressed entry decompress the projected columns at task-prepare time via the
+`compressed_host_representation` / `compressed_device_blob` → `gpu_table_representation`
+converters. With per-thread reservation tracking, multi-column decodes use up to 4
+column-parallel streams (the limit is not configurable); otherwise they use the task stream.
+Simpatico leases the parallel streams exclusively from its per-device cuCascade pool.
+The scan orders their input reads after writes on the task stream, waits for the decode
+before returning, and rebinds the decoded columns to the task stream (`decompress_chunk`
+in `src/compression/compressed_scan.cpp`).
 
 ## Decode-time equality pushdown
 
@@ -91,9 +96,10 @@ scan skips its own filter pass when the decode carried the whole predicate.
 When the decode carries the scan's whole filter it returns only the projected columns: a column
 the scan reads only for its filter is tested while the selection is built and is never decoded or
 gathered. When the projected columns are also the scan's output in order (no reordering, duplicate
-or synthesized column), the scan then takes ownership of the batch without copying it. With any
-conjunct left to the scan (a join filter, an unsupported shape) or on any decline, every column
-comes back as before.
+or synthesized column), the scan then takes ownership of the batch without copying it. A join
+filter the decode applies alongside does not change this: it is optional, so whether it ran on a
+batch does not bear on the scan's own filter. With any conjunct of the scan's own filter left to
+the scan (an unsupported shape) or on any decline, every column comes back as before.
 
 It is off by default and inert when off (byte-identical to an ordinary decompress):
 
@@ -175,3 +181,19 @@ python test/tpch_performance/performance_test.py --engine gpu --mode grouped \
 Checked-in SF1000 plans live in `src/compression/simpatico_codegen/plans/tpch_sf1000/`;
 per-column ratio and throughput annotations are in each file's comments. Re-measure with
 `simpatico_cli benchmark` when hardware changes.
+
+## Compression streams
+
+In Sirius builds, Simpatico leases its column-parallel CUDA streams from
+`cucascade::memory::exclusive_stream_pool`. Both scan decoding's four-stream
+thread/device cache and the compression/decompression APIs' temporary leases use
+this backend. Leases are exclusive and grow the per-device pool when needed, so
+concurrent callers cannot deadlock while acquiring several streams.
+
+These pools use the same implementation as pipeline execution, but have separate,
+process-lifetime owners: compressed and decoded buffers can retain their allocation
+stream after a call or submitting thread exits. Releasing a lease synchronizes its
+streams before returning them. Input-ready events and decode completion preserve
+the ordering needed for the downstream pipeline stream.
+Allocations still run on the calling thread for cuCascade reservation accounting.
+Standalone Simpatico builds retain their CUDA-only stream backend.

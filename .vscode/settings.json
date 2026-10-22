@@ -1,0 +1,3 @@
+{
+  "clangd.path": "${workspaceFolder}/.pixi/envs/default/bin/clangd"
+}

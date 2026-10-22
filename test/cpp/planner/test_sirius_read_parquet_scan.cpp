@@ -125,7 +125,7 @@ TEST_CASE("tree pipeline build plans sirius_read_parquet scans",
     REQUIRE(res);
     if (res->HasError()) { UNSCOPED_INFO("sirius_read_parquet query error: " << res->GetError()); }
     REQUIRE_FALSE(res->HasError());  // pre-fix: "Unsupported scan function: sirius_read_parquet"
-    REQUIRE(res->GetValue(0, 0).GetValue<int64_t>() == kRows - 1);
-    REQUIRE(res->GetValue(1, 0).GetValue<int64_t>() == kRows);
+    REQUIRE(res->Collection().GetValue(0, 0).GetValue<int64_t>() == kRows - 1);
+    REQUIRE(res->Collection().GetValue(1, 0).GetValue<int64_t>() == kRows);
   }
 }

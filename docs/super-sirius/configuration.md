@@ -113,7 +113,7 @@ sirius:
     dynamic_filter_keep_threshold: 0.9  # disable a scan's filtering when a split keeps > this fraction
     enable_pinned_zone_map_pruning: true  # capture and use per-chunk stats for pinned tables
     enable_runtime_size_estimation: false  # project total port input from upstream ratios
-    enable_decimal_sum_stats_bound: true  # decide decimal SUM widening from statistics at plan time
+    enable_decimal_sum_stats_bound: true  # decide decimal and BIGINT SUM width from statistics at plan time
   telemetry:
     enable_quent: true
     output_directory: telemetry_data
@@ -353,8 +353,10 @@ against the pipeline pool's width rather than the backend's depth — one prefet
 deployment is only useful while a pipeline thread could still pick up another scan. An explicit
 `max_readahead_scans` wins over that substitution.
 
-Both are resolved against a single backend: the live one publishing the widest
-`n_max_concurrent_scans`, so the budget and the strategy always describe the same reactor.
+A query's local policy is selected from the serving backend publishing the widest budget.
+A runtime budget additionally accounts for every backend touched by each split across all
+queries. Demand reads borrow immediately; their debt pauses speculative prefetch. Events are
+routed by query ID. A failed cache allocation gets one eviction retry before speculation yields.
 
 Six optional nested sub-configs tune the individual backends, the cache, and the memory prefetcher:
 
@@ -483,21 +485,62 @@ Those two knobs derive the settings below, which are therefore **not** individua
 | `ca_bundle_path` | string | "" | Sole YAML source for the REST endpoint's PEM CA bundle. |
 | `tls_verify` | bool | true | Sole YAML source for REST endpoint certificate verification. |
 
+### `sirius.executor.scan_manager.preparation`
+
+These settings are loaded at initialization. Metadata jobs default to a limit of 4096; DV jobs have no configured count cap by default. `0` disables either job limit. Other count limits must be positive integers. Control limits default to the scan worker count, N (`scan_manager.num_threads`); `lookahead_batches` defaults to 2. Timing values accept suffixes such as `20ms` or `1s`; bare integers are milliseconds.
+
+| Key | Default | Description |
+|---|---|---|
+| `max_inflight_metadata_jobs` | 4096 | Maximum submitted metadata preparation jobs across the query, including queued work. `0` means unlimited. Completion returns the job slot. |
+| `max_inflight_dv_jobs` | unlimited | Maximum DV preparation jobs holding temporary-memory permits, including queued work. Omitted or `0` imposes no configured count cap. Admission may grant fewer permits when HOST memory is insufficient. |
+| `lookahead_batches` | 2 | Per-scan preparation target in multiples of `scan_task_batch_size`, using decoded read-column bytes, including predicate-only columns. Results, retained coalescer input, and published batches stay charged until downstream takes the batch. Already submitted jobs may overshoot the target. |
+| `max_control_work` | N | Maximum coordinator actions per iteration. |
+| `drain_quantum` | N | Maximum coalescing work per result advancement. |
+| `partial_batch` | enabled | Partial-publication policy. An omitted or empty block uses the defaults below. |
+| `partial_batch.min_fill_percent` | 50 | Minimum retained size as a percentage of the normal batch target for early publication. Integer from 1 to 100. Uses the coalescer's batch-size accounting. |
+| `partial_batch.min_residence` | 50 ms | Minimum age before early publication. Also requires the size threshold and no batch from this scan waiting for downstream consumption. Must be positive. |
+| `partial_batch.max_residence` | 2 s | Maximum wait for more metadata, even below the size threshold or with a batch waiting downstream. Must be at least `min_residence`. Output backpressure and scheduling can delay publication. |
+| `interrupt_check_interval` | 10 ms | Maximum wait between interruption checks while preparation is idle. Must be positive. Draining an active read can take longer. |
+
+Both residence times start when the first input enters an empty accumulator; later arrivals do not reset them. Normal full-batch, compatibility-boundary, final-flush, and window-progress publication still apply. Downstream consumption means taking the batch from the connector, not completing GPU execution. To express a fixed time limit, set both residence values to the same duration.
+
+A file with a DV currently reads its footer and prepares its DV in the same job, so it uses a metadata job slot and a DV permit. The metadata limit does not size the DV reservation: admission reserves retained results plus K temporary workspaces, where K is bounded by the DV unit count, `scan_manager.num_threads`, and the DV limit when nonzero. Insufficient HOST memory may reduce K further. Neither setting changes the worker thread count. The previous `max_inflight_jobs` key is no longer accepted; use `max_inflight_metadata_jobs`.
+
+```yaml
+sirius:
+  executor:
+    scan_manager:
+      preparation:
+        max_inflight_metadata_jobs: 4096
+        max_inflight_dv_jobs: 0
+        lookahead_batches: 2
+        max_control_work: 4
+        drain_quantum: 4
+        partial_batch:
+          min_fill_percent: 50
+          min_residence: 50ms
+          max_residence: 2s
+        interrupt_check_interval: 5ms
+```
+
 ### `scan_manager.memory_prefetcher` — background host→GPU upload of pinned-cache scan splits (`scan_manager/config.hpp`)
 
 Overlaps the host→GPU upload of queued pinned-cache scan splits with compute:
 worker threads walk the pending splits in scan execution order and convert
-resident batches to GPU tier ahead of task creation, gated on GPU memory
-headroom (see `scan_manager/memory_prefetcher.hpp`). Disabled by default;
-single-GPU configurations only (logs a warning and disables itself otherwise).
+resident batches to GPU tier ahead of task execution, gated on GPU memory
+headroom (see `scan_manager/memory_prefetcher.hpp`). Disabled by default. Background memory
+prefetch runs only when the query has exactly one eligible GPU after admission filtering.
+Workers use that device's reservations and exclusive stream leases, releasing leases before
+parking. With multiple eligible GPUs, scan tasks perform their own uploads on their assigned
+devices; independent background placement could conflict with a task's already selected device.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enable` | bool | false | Master switch for the prefetcher. |
-| `num_threads` | int (**> 0**) | 2 | Prefetch worker threads; each drives one in-flight batch conversion on its own stream. |
+| `num_threads` | int (**> 0**) | 2 | Prefetch worker threads; each acquires an exclusive stream lease for a sweep and returns it before parking. |
 | `min_free_fraction` | double [0,1] | 0.4 | Keep at least this fraction of the GPU space free after each prefetch; conversions (and their reservations) are only attempted above this floor. |
 | `poll_interval_ms` | int (**> 0**) | 2 | Worker sweep interval while waiting for headroom / new splits. |
-| `drain_quiet_ms` | int (ms) | 100 | A connector counts as actively draining (and is skipped) until this long passes since its last pop. Must exceed the scan's inter-pop interval. |
+| `drain_quiet_ms` | int (ms) | 100 | A connector counts as actively draining until this long passes since its last pop. One worker may prefetch it tail-first, leaving four batches at the head for scan tasks; other workers skip it. Must exceed the scan's inter-pop interval. |
 
 ### Programmatic S3 credentials
 
@@ -544,9 +587,14 @@ and still override each value individually.
 | `admission_bytes_per_gpu` | 0 (off) | Target projected scan-output bytes per GPU. At admission the engine estimates a query's total scan output and takes the smallest GPU subset that keeps each GPU under this figure, bounded by `topology.gpus_per_query`. `0` disables the estimate, leaving the allocation to `topology.gpus_per_query` alone. |
 | `avg_variable_column_bytes` | 32 | Per-row width assumed for variable-width columns (VARCHAR, LIST, STRUCT, ARRAY) when estimating scan output. Fixed-width columns use their real carrier width. Only consulted when `admission_bytes_per_gpu` is non-zero. |
 | `enable_runtime_size_estimation` | false | Size grouped-aggregation partitions from projected input, allowing a partial ingress barrier. |
-| `enable_decimal_sum_stats_bound` | true | Decide at plan time, from base-table statistics, whether a DECIMAL32/DECIMAL64 SUM or AVG input must be widened before aggregation. An input whose magnitude bound the planner can prove skips the per-batch min/max scan and its stream synchronization; unproven inputs are still measured per batch. |
+| `enable_decimal_sum_stats_bound` | true | Decide at plan time, from base-table statistics, whether a DECIMAL32/DECIMAL64 SUM or AVG input, or the BIGINT input of a SUM or AVG that DuckDB accumulates in HUGEINT, must be widened before aggregation, or whether a DECIMAL128 SUM input can be summed as DECIMAL64. An input whose magnitude bound the planner can prove skips the per-batch min/max scan and its stream synchronization; unproven inputs are still measured per batch. |
 
 **Note:** `admission_bytes_per_gpu` is a parallelism dial, not a memory budget. Peak GPU residency is bounded by partition sizing (`hash_partition_bytes` and the batch settings), not by the admitted GPU count — a query on fewer GPUs processes more partitions sequentially at roughly unchanged peak memory, trading wall-clock for freed devices. Tune it against how much of the fleet a query should occupy, not against VRAM.
+
+`max_build_probe_resident_bytes` is connection-local: `SET` and `RESET` affect only the
+issuing connection, and `SET GLOBAL` is rejected. Planning captures its value from the
+immutable query options; existing plans retain their admission budget. `RESET` restores
+the registered default (including a YAML override).
 
 **Note:** `max_build_probe_resident_bytes` can be larger than `concat_batch_bytes`. When the partition operator selects BUILD_PROBE, or folds a single-partition build whole for dynamic-filter publication (both admissions bounded by `max_build_probe_resident_bytes`), it configures CONCAT to concatenate all build batches into one. Other joins (STANDARD, MIXED) still use `concat_batch_bytes` as the batch size threshold.
 
@@ -572,7 +620,7 @@ sirius:
 |-----|------|---------|-------------|
 | `enable_quent` | bool | true | Emit Quent telemetry using the configured exporter. When false, telemetry uses the noop exporter. |
 | `enable_nvtx` | bool | false | Capture NVTX ranges from Sirius and dependency images such as libcudf into Quent. No-op when `enable_quent` is false. |
-| `exporter` | string | `ndjson` | Quent filesystem exporter: `ndjson`, `msgpack`, or `postcard`. |
+| `exporter` | string | `ndjson` | Quent filesystem exporter; only `ndjson` is supported. |
 | `output_directory` | non-empty string | `telemetry_data` | Directory for Quent telemetry files. |
 | `engine_name` | non-empty string | `siriusDB` | Engine name reported in engine-level telemetry. |
 | `nvtx_injection_lib` | string | empty | Optional NVTX injection-library override. Normally unnecessary: a loadable Sirius uses its own DSO, while a Sirius-enabled DuckDB executable resolves the initializer from itself. `NVTX_INJECTION64_PATH` takes precedence. Used only when `enable_nvtx` is true. |
@@ -614,8 +662,7 @@ sirius:
 
 Load that config through the normal config resolution path, usually by setting
 `SIRIUS_CONFIG_FILE=/path/to/sirius.yaml`. Any Sirius query run with
-`enable_quent: true` writes Quent ndjson files into `output_directory` by default. Set
-`exporter: postcard` for compact benchmark or CI telemetry.
+`enable_quent: true` writes Quent ndjson files into `output_directory` as NDJSON.
 
 For TPC-H Parquet runs, the helper script runs queries and labels each
 `(query, iteration)` pair before executing it:
@@ -665,9 +712,27 @@ The task-creator, downgrade, and scan-manager pools support optional CPU affinit
 GPU's CPU topology. `num_threads` must be `> 0` for every pool except `scan_manager`, which requires
 `> 2`.
 
+## DuckDB Settings Changed by Sirius
+
+Loading Sirius changes the database-wide default of one DuckDB setting. A session `SET` still wins, and a value the database already carries explicitly (from the connection config or a `SET GLOBAL` before `LOAD`) is left alone.
+
+| Setting | DuckDB default | Default with Sirius | Description |
+|---------|----------------|---------------------|-------------|
+| `delim_join_as_cte` | `true` | `false` | Whether DuckDB rewrites the delim joins it creates while decorrelating subqueries into materialized CTEs |
+
+DuckDB v2 rewrites decorrelated subqueries (correlated `EXISTS`, `NOT EXISTS`, `IN` and scalar subqueries) into materialized CTEs by default. Sirius does not yet plan those shapes well: at TPC-H SF1000, Q20, Q21 and Q22 ran 1.2-3.5x slower than with explicit delim joins, because Q21's `NOT EXISTS` became an anti join that hashes every late `lineitem` row and Q20/Q22 lost their dynamic filters behind mark joins. Sirius therefore keeps the explicit `LEFT_DELIM_JOIN` / `RIGHT_DELIM_JOIN` plans. This is a stopgap until Sirius handles the CTE plan shapes, and DuckDB already marks the setting as deprecated, so it must be revisited when DuckDB removes it. To get DuckDB's CTE plans in one session:
+
+```sql
+SET delim_join_as_cte = true;
+```
+
 ## DuckDB SET Variables
 
-Registered in `src/sirius_extension.cpp`. These can be changed at runtime:
+Registered in `src/sirius_extension.cpp`. The `operator_params` setters, expression settings, and
+pin-compression settings are connection-local overrides of the defaults registered for the database;
+GLOBAL writes are rejected and RESET restores the registered default. Each execution uses one
+immutable operator-options snapshot. Logging updates serialize runtime-wide. Hardware decompression
+requires startup configuration.
 
 ### Logging
 
@@ -701,11 +766,17 @@ leaving the previous sink active.
 
 ### Expression Evaluation
 
-**File:** `src/include/expression_evaluator/expression_evaluator_strategy.hpp`
+**File:** `src/expression_evaluator/expression_evaluator_strategy.hpp`
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `expression_evaluator_strategy` | `ast_interpret` | Expression evaluator strategy: `materialize`, `ast_interpret`, or `ast_jit` |
+| `enable_regex_jit_impl` | true | Enable the specialized JIT implementation for supported regex patterns |
+
+These settings are connection-local: use `SET` or `SET SESSION`; `SET GLOBAL` is
+rejected. `RESET` restores the registered default. Query initialization captures both
+settings in an immutable snapshot, so later changes do not affect an existing query.
+Evaluators retain their own policy values rather than reading mutable global defaults.
 
 `expression_executor_strategy` remains registered as a deprecated compatibility alias for
 `expression_evaluator_strategy`; new configuration should use the evaluator name.
@@ -889,7 +960,6 @@ Static constants from `namespace duckdb::Config` and `namespace sirius::Config`:
 
 | Flag | Value | Namespace |
 |------|-------|-----------|
-| `EXPRESSION_EVALUATOR_STRATEGY` | `ast_interpret` | `duckdb::Config` |
 | `NUM_GPU_EXECUTOR_THREADS` | 2 | `sirius::Config` |
 | `NUM_PIPELINE_EXECUTOR_THREADS` | 1 | `sirius::Config` |
 | `NUM_GPU` | 1 | `sirius::Config` |

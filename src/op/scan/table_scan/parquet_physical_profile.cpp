@@ -162,42 +162,90 @@ parquet_encryption_evidence inspect_parquet_encryption(std::span<uint8_t const> 
     return {};
   }
 }
+parquet_metadata_resolution resolve_parquet_metadata_with_identity(
+  io::sirius_datasource& source,
+  scan_contract_id contract,
+  std::string const& identity,
+  cudf::io::parquet_reader_options const& options,
+  bool* cache_hit,
+  std::stop_token stop)
+{
+  auto const observed_identity = source.get_io_object().identity_cache_key();
+  // Metadata is always parsed from the complete footer with canonical reader
+  // options. Query projection and filter options belong to the data-read path,
+  // not to the metadata cache identity.
+  bool const cacheable     = !options.get_column_schema().has_value();
+  auto const metadata_opts = cudf::io::parquet_reader_options::builder().build();
+  if (cache_hit) *cache_hit = false;
+  auto build = [&]() -> std::shared_ptr<io::io_object_metadata> {
+    auto footer = fetch_plaintext_parquet_footer(source, contract, identity);
+    crypto_reader probe({footer->data(), footer->size()});
+    auto encryption = probe.read();
+    if (!encryption.complete || probe.original_schema().empty()) {
+      throw std::runtime_error("incomplete Parquet footer evidence: " + identity);
+    }
+    cudf::io::parquet::experimental::hybrid_scan_reader reader(
+      cudf::host_span<uint8_t const>(footer->data(), footer->size()), metadata_opts);
+    auto parsed =
+      std::make_shared<cudf::io::parquet::FileMetaData const>(reader.parquet_metadata());
+    std::string arrow_schema;
+    // Stable cuDF returns a string here; nightly cuDF wraps the value in an optional.
+    auto metadata_value = [](auto const& value) -> std::string {
+      if constexpr (requires { value.has_value(); }) {
+        return value.value_or(std::string{});
+      } else {
+        return std::string{value};
+      }
+    };
+    for (auto const& entry : parsed->key_value_metadata) {
+      if (entry.key == "ARROW:schema") {
+        arrow_schema = metadata_value(entry.value);
+        break;
+      }
+    }
+    auto result = std::make_shared<parquet_metadata>(parsed,
+                                                     footer->size(),
+                                                     encryption,
+                                                     probe.original_schema(),
+                                                     std::move(arrow_schema),
+                                                     probe.original_logical_annotations(),
+                                                     observed_identity);
+    return result;
+  };
+  std::shared_ptr<io::io_object_metadata> metadata;
+  if (cacheable && source.io_ctx()) {
+    metadata =
+      source.io_ctx()->metadata_store().get_or_load(source.get_io_object(), build, cache_hit, stop);
+  } else {
+    metadata = build();
+  }
+  auto result = std::dynamic_pointer_cast<parquet_metadata>(metadata);
+  if (!result) {
+    // Preserve the existing miss behavior for a payload of another metadata type.
+    if (cache_hit) *cache_hit = false;
+    result = std::static_pointer_cast<parquet_metadata>(build());
+    if (cacheable) std::ignore = source.store_metadata(result);
+  }
+  if (result->built_for_identity != observed_identity) {
+    if (cache_hit) *cache_hit = false;
+    result = std::dynamic_pointer_cast<parquet_metadata>(build());
+    if (cacheable) std::ignore = source.store_metadata(result);
+  }
+  auto resolved_identity = result->built_for_identity;
+  return {result, std::move(resolved_identity)};
+}
+
 std::shared_ptr<parquet_metadata> resolve_parquet_metadata(
   io::sirius_datasource& source,
   scan_contract_id contract,
   std::string const& identity,
   cudf::io::parquet_reader_options const& options,
-  bool* cache_hit)
+  bool* cache_hit,
+  std::stop_token stop)
 {
-  if (auto cached = std::dynamic_pointer_cast<parquet_metadata>(source.metadata())) {
-    if (cache_hit) *cache_hit = true;
-    return cached;
-  }
-  if (cache_hit) *cache_hit = false;
-  auto footer = fetch_plaintext_parquet_footer(source, contract, identity);
-  crypto_reader probe({footer->data(), footer->size()});
-  auto encryption = probe.read();
-  if (!encryption.complete || probe.original_schema().empty()) {
-    throw std::runtime_error("incomplete Parquet footer evidence: " + identity);
-  }
-  cudf::io::parquet::experimental::hybrid_scan_reader reader(
-    cudf::host_span<uint8_t const>(footer->data(), footer->size()), options);
-  auto parsed = std::make_shared<cudf::io::parquet::FileMetaData const>(reader.parquet_metadata());
-  std::string arrow_schema;
-  for (auto const& entry : parsed->key_value_metadata) {
-    if (entry.key == "ARROW:schema") {
-      arrow_schema = entry.value;
-      break;
-    }
-  }
-  auto result = std::make_shared<parquet_metadata>(parsed,
-                                                   footer->size(),
-                                                   encryption,
-                                                   probe.original_schema(),
-                                                   std::move(arrow_schema),
-                                                   probe.original_logical_annotations());
-  std::ignore = source.store_metadata(result);
-  return result;
+  return resolve_parquet_metadata_with_identity(
+           source, contract, identity, options, cache_hit, stop)
+    .artifact;
 }
 std::unique_ptr<cudf::io::datasource::buffer> fetch_plaintext_parquet_footer(
   cudf::io::datasource& source, scan_contract_id contract, std::string const& identity)
