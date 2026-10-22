@@ -20,10 +20,12 @@
 #include "exchange/all_gather.hpp"
 #include "exchange/exchange_service.hpp"
 #include "op/cudf_sort_order.hpp"
+#include "op/sirius_physical_cte.hpp"
 #include "op/sirius_physical_exchange_sink.hpp"
 #include "op/sirius_physical_exchange_source.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_hash_join.hpp"
+#include "op/sirius_physical_nested_loop_join.hpp"
 #include "op/sirius_physical_partition.hpp"
 #include "op/sirius_physical_sort_sample.hpp"
 #include "sirius/exception.hpp"
@@ -38,6 +40,7 @@
 
 #include <algorithm>
 #include <functional>
+#include <map>
 #include <set>
 #include <string>
 #include <utility>
@@ -72,6 +75,8 @@ struct rewriter {
   std::uint32_t next_stream{1};
   /// The plan's shape, compared across ranks.
   std::string shape;
+  /// Each CTE_SCAN's rows are where its CTE's materialization put them.
+  std::map<op::sirius_physical_operator const*, placement> cte_scans;
 
   exchange::stream_id stream() { return (query << exchange::query_stream_bits) | next_stream++; }
 
@@ -121,12 +126,12 @@ struct rewriter {
     return sink_ref;
   }
 
-  /// A hash exchange on @p partition's keys, between it and its input.
+  /// A hash exchange on @p partition's keys, between it and its input. An input on rank 0 alone
+  /// (a gathered aggregate) is spread from there; the other ranks' copies of it hold no rows.
   placement hash_below(op::sirius_physical_operator& partition_node)
   {
-    auto& partition  = expect(partition_node, T::PARTITION).Cast<op::sirius_physical_partition>();
-    auto const below = visit(partition.children[0]);
-    if (below == placement::rank0) { return placement::rank0; }
+    auto& partition = expect(partition_node, T::PARTITION).Cast<op::sirius_physical_partition>();
+    visit(partition.children[0]);
     exchange_spec spec;
     spec.key_columns    = partition.partition_keys();
     spec.key_cast_types = partition.specification().key_cast_types;
@@ -170,14 +175,50 @@ struct rewriter {
         // Both sides are CONCAT → PARTITION → input; each side's rows meet their matches once
         // both are exchanged on the join keys.
         for (auto& side : node.children) {
-          auto& concat = expect(*side, T::CONCAT);
-          if (hash_below(*concat.children[0]) == placement::rank0) {
-            throw sirius::not_implemented_exception(
-              "distributed execution: a join over a gathered input");
-          }
+          hash_below(*expect(*side, T::CONCAT).children[0]);
         }
         return done(placement::spread);
       }
+
+      case T::NESTED_LOOP_JOIN: {
+        // NESTED_LOOP_JOIN → CONCAT → PARTITION → input, probe then build. Every rank keeps its
+        // probe rows and gets the whole build side, so each pair meets once; an unmatched build
+        // row would be emitted by every rank, so no join type that emits those.
+        auto const join_type = node.Cast<op::sirius_physical_nested_loop_join>().join_type;
+        if (join_type == duckdb::JoinType::RIGHT || join_type == duckdb::JoinType::OUTER ||
+            join_type == duckdb::JoinType::RIGHT_SEMI ||
+            join_type == duckdb::JoinType::RIGHT_ANTI) {
+          throw sirius::not_implemented_exception("distributed execution: a {} nested-loop join",
+                                                  duckdb::JoinTypeToString(join_type));
+        }
+        auto& probe = expect(*expect(*node.children[0], T::CONCAT).children[0], T::PARTITION);
+        auto& build = expect(*expect(*node.children[1], T::CONCAT).children[0], T::PARTITION);
+        auto const probe_rows = visit(probe.children[0]);
+        visit(build.children[0]);
+        insert(build.children[0], exchange_spec{.routing = exchange_spec::mode::broadcast}, false);
+        return done(probe_rows == placement::rank0 ? placement::rank0 : placement::spread);
+      }
+
+      case T::DENSE_COUNT_JOIN: {
+        // DENSE_COUNT_JOIN → PARTITION → input, both sides: exchanged on the join key, a rank
+        // counts the preserved keys it holds, every match of which is on it too.
+        for (auto& side : node.children) {
+          hash_below(*side);
+        }
+        return done(placement::spread);
+      }
+
+      case T::CTE: {
+        // CTE → (materialization, consumer): each rank materializes its share, and the CTE_SCANs
+        // under the consumer read it where it is.
+        auto const materialized = visit(node.children[0]);
+        for (auto const& scan : node.Cast<op::sirius_physical_cte>().cte_scans) {
+          cte_scans[&scan.get()] = materialized;
+        }
+        return done(visit(node.children[1]));
+      }
+
+      case T::CTE_SCAN: return done(cte_scans.at(&node));
 
       case T::MERGE_GROUP_BY: {
         // MERGE_GROUP_BY → PARTITION → HASH_GROUP_BY: partial results meet by group key.
@@ -185,8 +226,17 @@ struct rewriter {
         auto& grouped   = expect(*partition.children[0], T::HASH_GROUP_BY)
                           .Cast<op::sirius_physical_grouped_aggregate>();
         if (grouped.has_count_distinct) {
-          throw sirius::not_implemented_exception(
-            "distributed execution: COUNT(DISTINCT) partial results");
+          // Partial distinct sets are LIST columns, which the exchange does not carry: the input
+          // rows meet by group key instead, and each rank's partials hold whole groups.
+          if (grouped.has_grouping_sets()) {
+            throw sirius::not_implemented_exception(
+              "distributed execution: COUNT(DISTINCT) with grouping sets");
+          }
+          visit(grouped.children[0]);
+          exchange_spec spec;
+          spec.key_columns = grouped.group_idx;
+          insert(grouped.children[0], std::move(spec), false);
+          return done(placement::spread);
         }
         return done(hash_below(partition));
       }
