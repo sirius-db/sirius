@@ -7,7 +7,7 @@ ranks=${1:-2}
 port=${2:-27000}
 here=$(cd "$(dirname "$0")" && pwd)
 source "$here/nixl_env.sh"
-test_bin="$here/../build/release/extension/sirius/test/cpp/sirius_unittest"
+test_bin="$here/../build/release/test/cpp/sirius_unittest"
 
 peers=""
 for ((i = 0; i < ranks; i++)); do peers+="${peers:+,}127.0.0.1:$((port + i))"; done

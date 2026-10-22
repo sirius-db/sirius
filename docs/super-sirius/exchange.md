@@ -1,7 +1,7 @@
 # Distributed Execution: the Exchange
 
 Sirius can run one SQL query across several processes, one per GPU, on one host or several.
-Every rank runs the same SQL. Each scans its own share of the files, and the plan moves rows
+Every rank runs the same SQL. Each scans its own share of each table, and the plan moves rows
 between ranks with two operators, `EXCHANGE_SINK` and `EXCHANGE_SOURCE`, over
 [NIXL](https://github.com/ai-dynamo/nixl). Rank 0 returns the query's result.
 
@@ -170,8 +170,12 @@ is refused with `not_implemented_exception`: a nested-loop join, `TOP_N`, a CTE,
 `COUNT(DISTINCT)` partials, or a join over a gathered input. Running such an operator on each
 rank's share would return a wrong answer.
 
-- **Files.** Each parquet scan keeps files `rank, rank + world, …`. Every rank binds every file,
-  so DuckDB plans every rank from the same statistics.
+- **Scan shares.** A table's local parquet files are laid end to end and cut into equal byte
+  spans, one per rank (`byte_ranges_for_rank`). A rank reads the row groups whose start offset
+  falls in its span ([`parquet_byte_range`](../../src/op/scan/parquet_byte_range.hpp)), so every
+  row group is read once, and a one-file table still splits. A table of one row group lands on
+  one rank. Remote files take no byte ranges: each rank keeps files `rank, rank + world, …`.
+  Every rank binds every file, so DuckDB plans every rank from the same statistics.
 - **Stream ids** come from the connection's distributed-query count, the same on every rank
   because every rank runs the same statements.
 - **Plan-shape check.** Before running, every rank all-gathers a hash of its plan's shape, and
@@ -189,7 +193,11 @@ carries a `distributed_merge`. Every rank then:
 3. ORs the others into its own, and publishes it.
 
 A key whose filters cannot all be merged publishes nothing: a rank sent none, a header differs,
-or a rank missed the 2-minute wait. IN-lists and zone maps are not published in distributed mode.
+or a rank missed the 2-minute wait. IN-lists and zone maps are not published in distributed mode,
+nor are Blooms accumulated across a multi-partition build: the merge runs on whole-build
+publication only. A rank with an empty build still merges, contributing an empty Bloom. A rank
+that never saw a whole build joins each key's all-gather without a filter, so the others drop
+that key at once instead of waiting out the timeout.
 Filters stay optional and the join authoritative, so a missing filter costs speed, never
 correctness.
 
@@ -207,7 +215,8 @@ alone would return a wrong answer.
 NIXL is an optional build dependency, linked from an out-of-tree install:
 
 ```bash
-pixi run cmake build/release -DSIRIUS_WITH_NIXL=ON -DSIRIUS_NIXL_PREFIX=$HOME/tools/nvda_nixl
+pixi run cmake --preset release -DSIRIUS_DUCKDB_SOURCE_DIR=$PWD/duckdb \
+  -DSIRIUS_WITH_NIXL=ON -DSIRIUS_NIXL_PREFIX=$HOME/tools/nvda_nixl
 pixi run make
 ```
 
@@ -256,7 +265,8 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
 
 - **Joins:** equality hash joins only. Nested-loop joins, delim joins, CTEs and `TOP_N` are
   refused rather than run per rank.
-- **Files:** a table needs at least as many files as there are ranks.
+- **Remote files:** an S3 table needs at least as many files as there are ranks; local files
+  split by byte range have no such limit.
 - **Query start:** every rank must run the same statements in the same order, which is what
   numbers the exchanges' streams.
 - **Unspillable buffers:** batches queued in an `EXCHANGE_SOURCE`, or held for a stream not yet
@@ -275,6 +285,7 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
 | `[exchange][wire]`, `[exchange][batch_io]` | Headers and refusals; batches through 64 KiB to 1 MiB frames to the GPU and host |
 | `[exchange][transport]` | All-to-all on 3 and 4 ranks over the loopback fabric; one credit per peer; shuffled notifications; no room; failed writes |
 | `[exchange][operators]` | Hash, range, broadcast, gather, ordered gather, early arrivals, hints, failure |
+| `[exchange][byte_range]` | Byte spans tile every file exactly once across ranks; one file split in two; balance by bytes |
 | `[exchange][collectives]` | All-gather; distributed `SORT_SAMPLE` on skewed and empty inputs; `SORT_SAMPLE` feeding a range exchange |
 | `[exchange][nixl]` | Two ranks in one process over NIXL (NIXL builds only) |
 | `[nixl_multiprocess]` (hidden) | One rank per process and GPU: `pixi run scripts/exchange_nixl_ranks.sh 4` |
