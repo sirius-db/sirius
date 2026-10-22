@@ -38,6 +38,7 @@
 #include "scan_manager/readahead_scan_manager.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "utils/telemetry_utils.hpp"
+#include "utils/test_physical_operator.hpp"
 
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_space.hpp>
@@ -528,15 +529,15 @@ TEST_CASE("readahead bounds memory retries and returns capacity on abandonment",
 
   // A real query order and real cache pressure exercise the production worker,
   // preparation, eviction and completion paths without injected allocation failures.
-  struct scan_operator : sirius::op::sirius_physical_operator {
+  struct scan_operator : sirius::op::test_physical_operator {
     scan_operator()
-      : sirius_physical_operator(sirius::op::SiriusPhysicalOperatorType::GPU_SCAN, {}, 0)
+      : test_physical_operator(sirius::op::SiriusPhysicalOperatorType::GPU_SCAN, {}, 0)
     {
       operator_id = 1;
     }
   } op;
   auto telemetry = sirius::test::make_test_telemetry_context();
-  sirius::pipeline::pipeline_build_context ctx{nullptr, true};
+  sirius::pipeline::pipeline_build_context ctx{nullptr};
   auto pipeline = std::make_shared<sirius::pipeline::sirius_pipeline>(ctx);
   sirius::pipeline::sirius_pipeline_build_state build;
   build.set_pipeline_source(*pipeline, op);
