@@ -156,6 +156,71 @@ TEST_CASE("Arrow layout rejects unsupported metadata and inconsistent buffers",
   REQUIRE_THROWS(validate_arrow_host_flat(f.schema, f.array));
 }
 
+TEST_CASE("Arrow preflight checks selected null totals and numeric bounds",
+          "[materialization][scan][arrow_migration]")
+{
+  int released = 0;
+  arrow_fixture f(released);
+  SECTION("known whole-column null total must match")
+  {
+    f.child.null_count = 2;
+    REQUIRE_THROWS(validate_arrow_host_flat(f.schema, f.array));
+  }
+  SECTION("a slice cannot hide more nulls than the remaining rows")
+  {
+    f.array.offset     = 1;
+    f.array.length     = 2;
+    f.child.null_count = 3;
+    REQUIRE_THROWS(validate_arrow_host_flat(f.schema, f.array));
+    f.child.null_count = 2;
+    REQUIRE_NOTHROW(validate_arrow_host_flat(f.schema, f.array));
+    f.child.null_count = -1;
+    REQUIRE_NOTHROW(validate_arrow_host_flat(f.schema, f.array));
+  }
+  SECTION("non-nullable fields cannot contain selected nulls")
+  {
+    f.child_schema.flags = 0;
+    REQUIRE_THROWS(validate_arrow_host_flat(f.schema, f.array));
+  }
+  SECTION("combined offsets are bounded before reading buffers")
+  {
+    f.child.offset = std::numeric_limits<cudf::size_type>::max();
+    REQUIRE_THROWS(validate_arrow_host_flat(f.schema, f.array));
+    f.child.offset = 0;
+    f.array.offset = std::numeric_limits<cudf::size_type>::max();
+    REQUIRE_THROWS(validate_arrow_host_flat(f.schema, f.array));
+  }
+  SECTION("decimal payloads must fit their declared precision")
+  {
+    __int128 values[3]{999, 0, -999};
+    f.child_schema.format = "d:3,2";
+    f.buffers[1]          = values;
+    REQUIRE_NOTHROW(validate_arrow_host_flat(f.schema, f.array));
+    values[0] = 1000;
+    REQUIRE_THROWS(validate_arrow_host_flat(f.schema, f.array));
+    values[0] = -1000;
+    REQUIRE_THROWS(validate_arrow_host_flat(f.schema, f.array));
+    values[0] = -(__int128{1} << 126);
+    REQUIRE_THROWS(validate_arrow_host_flat(f.schema, f.array));
+  }
+  SECTION("absent bitmaps normalize both known-zero and unknown null counts")
+  {
+    f.root_buffers[0] = f.buffers[0] = nullptr;
+    for (int root_nulls : {0, -1}) {
+      for (int child_nulls : {0, -1}) {
+        f.array.null_count = root_nulls;
+        f.child.null_count = child_nulls;
+        REQUIRE_NOTHROW(validate_arrow_host_flat(f.schema, f.array));
+      }
+    }
+    f.child.null_count = 1;
+    REQUIRE_THROWS(validate_arrow_host_flat(f.schema, f.array));
+    f.child.null_count = 0;
+    f.array.null_count = 1;
+    REQUIRE_THROWS(validate_arrow_host_flat(f.schema, f.array));
+  }
+}
+
 TEST_CASE("Arrow import owns its source through retirement and shared finish",
           "[materialization][scan]")
 {

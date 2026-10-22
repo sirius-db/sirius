@@ -67,6 +67,25 @@ cudf::data_type type_for(std::string_view f)
   }
   invalid();
 }
+uint8_t const* validity_for(ArrowArray const& array)
+{
+  return array.null_count == 0 ? nullptr : static_cast<uint8_t const*>(array.buffers[0]);
+}
+int64_t count_nulls(uint8_t const* validity, int64_t begin, int64_t end)
+{
+  int64_t count = 0;
+  if (validity) {
+    for (auto row = begin; row < end; ++row)
+      count += !(validity[row / 8] & (1U << (row % 8)));
+  }
+  return count;
+}
+int32_t string_offset(void const* buffer, int64_t index)
+{
+  int32_t value;
+  std::memcpy(&value, static_cast<uint8_t const*>(buffer) + index * sizeof(value), sizeof(value));
+  return value;
+}
 void validate_metadata(char const* metadata, arrow_metadata_lengths const& metadata_lengths)
 {
   if (!metadata) return;
@@ -125,6 +144,7 @@ std::vector<cudf::data_type> validate_arrow_host_flat(
   common(schema, array, metadata_lengths);
   if (std::string_view(schema.format) != "+s" || schema.n_children < 0 ||
       schema.n_children != array.n_children || array.n_buffers != 1 ||
+      array.offset > std::numeric_limits<cudf::size_type>::max() - array.length ||
       (array.n_children && (!array.children || !schema.children)))
     invalid();
   if (array.null_count > 0) invalid();
@@ -139,18 +159,44 @@ std::vector<cudf::data_type> validate_arrow_host_flat(
     auto const& a = *array.children[i];
     auto const& s = *schema.children[i];
     common(s, a, metadata_lengths);
-    if (a.n_children || s.n_children || a.length < array.offset + array.length) invalid();
+    if (a.n_children || s.n_children || a.length < array.offset + array.length ||
+        a.offset > std::numeric_limits<cudf::size_type>::max() - array.offset - array.length)
+      invalid();
     auto type    = type_for(s.format);
     bool strings = type.id() == cudf::type_id::STRING;
     if (a.n_buffers != (strings ? 3 : 2)) invalid();
-    if (a.length && !a.buffers[1]) invalid();
-    if (strings && a.buffers[1]) {
-      auto offsets = static_cast<int32_t const*>(a.buffers[1]);
-      auto end     = a.offset + a.length;
-      if (offsets[a.offset] < 0) invalid();
-      for (int64_t j = a.offset; j < end; ++j)
-        if (offsets[j + 1] < offsets[j]) invalid();
-      if (offsets[end] && !a.buffers[2]) invalid();
+    if (array.length && !a.buffers[1]) invalid();
+    auto const begin     = a.offset + array.offset;
+    auto const end       = begin + array.length;
+    auto const* validity = validity_for(a);
+    auto const nulls     = count_nulls(validity, begin, end);
+    if ((a.null_count >= 0 &&
+         (nulls > a.null_count || a.null_count > nulls + (a.length - array.length))) ||
+        (!(s.flags & ARROW_FLAG_NULLABLE) && nulls))
+      invalid();
+    if (strings && array.length) {
+      if (array.length == std::numeric_limits<cudf::size_type>::max() ||
+          string_offset(a.buffers[1], begin) < 0)
+        invalid();
+      for (auto row = begin; row < end; ++row)
+        if (string_offset(a.buffers[1], row + 1) < string_offset(a.buffers[1], row)) invalid();
+      if (string_offset(a.buffers[1], end) != string_offset(a.buffers[1], begin) && !a.buffers[2])
+        invalid();
+    } else if (type.id() == cudf::type_id::DECIMAL128) {
+      int precision = 0;
+      std::string_view format(s.format);
+      (void)std::from_chars(format.data() + 2, format.data() + format.size(), precision);
+      __uint128_t limit = 1;
+      for (int digit = 0; digit < precision; ++digit)
+        limit *= 10;
+      for (auto row = begin; row < end; ++row) {
+        if (validity && !(validity[row / 8] & (1U << (row % 8)))) continue;
+        __int128_t value;
+        std::memcpy(&value, static_cast<uint8_t const*>(a.buffers[1]) + row * 16, 16);
+        auto magnitude = static_cast<__uint128_t>(value);
+        if (value < 0) magnitude = __uint128_t{0} - magnitude;
+        if (magnitude >= limit) invalid();
+      }
     }
     types.push_back(type);
   }
