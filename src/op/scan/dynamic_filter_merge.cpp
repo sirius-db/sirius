@@ -18,6 +18,7 @@
 #include <cudf/copying.hpp>
 #include <cudf/cudf_utils.hpp>
 #include <cudf/filling.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/utilities/memory_resource.hpp>
@@ -936,7 +937,10 @@ void apply_cached(application_result_state& result,
         counts,
         true,
         stream);
-      if (nullable) { conjunction.set_null_mask(rmm::device_buffer{}, 0); }
+      if (nullable) {
+        conjunction.set_null_mask(
+          cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr), 0);
+      }
     } else {
       result.conjunction = cudf::make_numeric_column(cudf::data_type{cudf::type_id::BOOL8},
                                                      input.num_rows(),
