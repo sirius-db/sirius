@@ -2304,7 +2304,8 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
   auto* aggregate = require_distinct_wrap_chain(plan.get());
   CHECK(aggregate->group_idx == std::vector<int>{0});
-  // Nothing sits between the dedup and the union, not even an identity projection.
+  // DuckDB v2 plans an identity projection between the DISTINCT and the union, but
+  // create_plan(LogicalProjection&) elides it, so nothing sits between the dedup and the union.
   REQUIRE(aggregate->children.size() == 1);
   auto* union_op = aggregate->children[0].get();
   REQUIRE(union_op->type == SiriusPhysicalOperatorType::UNION);
