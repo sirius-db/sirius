@@ -140,6 +140,12 @@ TEST_CASE_METHOD(TimestampExtractionFixture,
   check_extraction(
     "SELECT id, CASE WHEN id BETWEEN 1 AND 2 THEN extract(year FROM d) ELSE NULL END "
     "FROM timestamps");
+  // Issue #2293 (TPC-Havoc Q09_V10) filters and groups the nullable CASE result.
+  check_extraction(
+    "SELECT o_year, count(*) FROM ("
+    "SELECT CASE WHEN extract(year FROM d) BETWEEN 1995 AND 1996 "
+    "THEN extract(year FROM d) ELSE NULL END AS o_year FROM timestamps"
+    ") AS profit WHERE o_year IS NOT NULL GROUP BY o_year");
 
   struct extraction_case {
     std::string part;
