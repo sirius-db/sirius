@@ -67,6 +67,7 @@ target_sources(
           sirius_physical_gpu_values.cpp
           sirius_physical_grouped_aggregate.cpp
           sirius_physical_grouped_aggregate_merge.cpp
+          join_cross_schedule.cpp
           sirius_physical_hash_join.cpp
           sirius_physical_limit.cpp
           sirius_physical_merge_sort.cpp

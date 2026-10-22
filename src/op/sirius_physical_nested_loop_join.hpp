@@ -26,6 +26,7 @@
 #include "duckdb/planner/operator/logical_join.hpp"
 #include "expression/ast/node.hpp"  // complete sirius::ast::node for join_condition's destructor
 #include "expression/join_condition.hpp"
+#include "op/join_cross_schedule.hpp"
 #include "op/partition/partition_sizing.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "sirius_config.hpp"
@@ -62,6 +63,20 @@ class cross_join_slice_data : public pipelineable_operator_data {
 
   std::size_t slice;
   std::size_t num_slices;
+};
+
+//! One surviving input when the opposite producer emitted no batches. The empty table is made
+//! on the executor's GPU after normal preparation, so a spilled survivor is safe to schedule.
+class nested_loop_join_orphan_data : public pipelineable_operator_data {
+ public:
+  nested_loop_join_orphan_data(std::vector<std::shared_ptr<cucascade::data_batch>> batches,
+                               bool present_is_build)
+    : pipelineable_operator_data(std::move(batches)), present_is_build(present_is_build)
+  {
+  }
+  [[nodiscard]] std::unique_ptr<pipelineable_operator_data> with_batches_preserving_rows(
+    std::vector<std::shared_ptr<cucascade::data_batch>> batches) const override;
+  bool present_is_build;
 };
 
 //! sirius_physical_nested_loop_join represents a nested loop join between two tables
@@ -155,6 +170,9 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
   //! Returns a list of the types of the join conditions
   duckdb::vector<sirius::logical_type> get_join_types() const;
 
+  [[nodiscard]] MemoryBarrierType input_barrier_for(
+    sirius_physical_operator const& producer) const override;
+  std::optional<task_creation_hint> get_next_task_hint() override;
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
   //! Output bytes a cross product task aims for. A pair of input batches whose cross join is
@@ -185,23 +203,19 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
 
  protected:
   std::mutex batches_to_processed_mutex;
-  std::vector<std::vector<uint64_t>> left_batch_ids;
-  std::vector<std::vector<uint64_t>> right_batch_ids;
-  //! Sizes of the batches in left_batch_ids and right_batch_ids. Read for a cross product only.
-  std::vector<std::vector<batch_rows_and_bytes>> left_batch_sizes;
-  std::vector<std::vector<batch_rows_and_bytes>> right_batch_sizes;
+  //! Called under batches_to_processed_mutex; discovers arrivals and retires consumed batches.
+  std::pair<bool, bool> refresh_cross_schedule();
+  std::vector<partition_cross_schedule> cross_schedule;
 
-  //! One task: a pair of input batches and, for a cross product, a slice of the left batch.
-  struct pair_task {
-    std::size_t partition  = 0;
-    std::size_t left       = 0;  //!< index into left_batch_ids[partition]
-    std::size_t right      = 0;  //!< index into right_batch_ids[partition]
+  //! A claimed cross-product pair can issue several slices. Keep its inputs in the repositories
+  //! until every slice has been handed out, even though the shared scheduler has claimed the pair.
+  struct pending_pair {
+    std::shared_ptr<cucascade::data_batch> left;
+    std::shared_ptr<cucascade::data_batch> right;
     std::size_t slice      = 0;
-    std::size_t num_slices = 0;  //!< 0 until the task's pair is reached
+    std::size_t num_slices = 0;
   };
-  //! The next task to hand out. Tasks run over partitions, then left batches, then right batches,
-  //! then slices.
-  pair_task next_task;
+  pending_pair pending;
   uint64_t cross_join_task_bytes = config::DEFAULT_BATCH_SIZE;
 };
 
