@@ -73,7 +73,7 @@ struct rewriter {
   /// The plan's shape, compared across ranks.
   std::string shape;
 
-  exchange::stream_id stream() { return (query << 20) | next_stream++; }
+  exchange::stream_id stream() { return (query << exchange::query_stream_bits) | next_stream++; }
 
   op::sirius_physical_operator& expect(op::sirius_physical_operator& node, T type)
   {

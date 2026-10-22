@@ -17,6 +17,7 @@
 #pragma once
 
 #include "exchange/fabric.hpp"
+#include "exchange/messages.hpp"
 
 #include <rmm/cuda_stream.hpp>
 
@@ -28,7 +29,9 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
+#include <vector>
 
 namespace cucascade {
 class data_batch;
@@ -41,6 +44,14 @@ namespace sirius::exchange {
 
 /// The exchange's id for one logical flow of batches, the same on every rank.
 using stream_id = std::uint64_t;
+
+/// A stream id's bits above these number its query, the same on every rank.
+constexpr unsigned query_stream_bits = 20;
+
+[[nodiscard]] constexpr std::uint64_t query_of(stream_id stream) noexcept
+{
+  return stream >> query_stream_bits;
+}
 
 /**
  * @brief Moves batches between the ranks of an exchange, through a fabric.
@@ -63,7 +74,8 @@ using stream_id = std::uint64_t;
  *
  * **Failure.** Fail-stop: a failed write, a malformed notification, a peer's error or a stall
  * longer than options::stall_timeout calls on_error() once, tells every peer, and ends the
- * transport; send() and close() then rethrow.
+ * transport; send() and close() then rethrow. A failed query is narrower: abort() tells every
+ * peer, whose on_abort() ends that query's streams, and the transport carries on.
  *
  * One engine thread drives the fabric and calls on_batch(), on_end() and on_error() for remote
  * senders; for this rank's own batches they run on the caller's thread.
@@ -77,6 +89,8 @@ class transport {
       on_batch;
     std::function<void(stream_id, rank_t from)> on_end;
     std::function<void(std::exception_ptr)> on_error;
+    /// Rank @p from's run of query @p query failed with @p what.
+    std::function<void(std::uint64_t query, rank_t from, std::string what)> on_abort;
   };
 
   struct options {
@@ -127,6 +141,10 @@ class transport {
   /// @throws the transport's error once it has failed.
   void close(stream_id stream, rank_t to);
 
+  /// Tells every peer that this rank's run of @p query failed with @p what. Does nothing once the
+  /// transport has failed: its peers have heard of that.
+  void abort(std::uint64_t query, std::string what);
+
  private:
   struct engine;
 
@@ -136,6 +154,8 @@ class transport {
   std::mutex _mutex;
   std::condition_variable _room;
   std::exception_ptr _error;
+  /// abort() notices for the engine thread to send to every peer.
+  std::vector<abort_message> _aborts;
   bool _stop{false};
   std::thread _thread;
 };

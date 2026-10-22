@@ -148,6 +148,25 @@ std::unique_ptr<sirius_physical_sort_sample> make_sample()
 
 }  // namespace
 
+TEST_CASE("an aborted query wakes an all-gather waiting on its peer", "[exchange][collectives]")
+{
+  ranks c(2);
+  auto const stream = (std::uint64_t{7} << sirius::exchange::query_stream_bits) | 1;
+  std::thread peer([&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds{100});
+    c.all[1].service->abort(7, "injected failure");
+  });
+  auto const start = std::chrono::steady_clock::now();
+  CHECK_THROWS(sirius::exchange::all_gather(*c.all[0].service,
+                                            stream,
+                                            nullptr,
+                                            *env().gpu,
+                                            utils::default_stream(),
+                                            std::chrono::minutes{2}));
+  peer.join();
+  CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds{30});
+}
+
 TEST_CASE("all-gather gives every rank every rank's table, in rank order",
           "[exchange][collectives]")
 {

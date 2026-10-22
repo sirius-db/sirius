@@ -66,7 +66,16 @@ struct error_message {
   bool operator==(error_message const&) const = default;
 };
 
-using message = std::variant<frame_message, credit_message, end_message, error_message>;
+/// The sender's run of query @p query failed: every stream of that query is over, on every rank.
+struct abort_message {
+  std::uint64_t query{0};
+  std::string what;
+
+  bool operator==(abort_message const&) const = default;
+};
+
+using message =
+  std::variant<frame_message, credit_message, end_message, error_message, abort_message>;
 
 [[nodiscard]] std::string encode(message const& m);
 

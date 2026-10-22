@@ -31,7 +31,8 @@ static_assert(std::endian::native == std::endian::little, "exchange messages are
 //   credit: u32 n | n x u32 frame
 //   end:    u64 stream | u64 batches
 //   error:  utf-8 text to the end
-enum class kind : std::uint8_t { frame = 1, credit = 2, end = 3, error = 4 };
+//   abort:  u64 query | utf-8 text to the end
+enum class kind : std::uint8_t { frame = 1, credit = 2, end = 3, error = 4, abort = 5 };
 
 template <typename T>
 void put(std::string& out, T value)
@@ -80,6 +81,10 @@ std::string encode(message const& m)
     put(out, kind::end);
     put(out, e->stream);
     put(out, e->batches);
+  } else if (auto const* a = std::get_if<abort_message>(&m)) {
+    put(out, kind::abort);
+    put(out, a->query);
+    out.append(a->what);
   } else {
     put(out, kind::error);
     out.append(std::get<error_message>(m).what);
@@ -130,6 +135,12 @@ message decode(std::string_view in)
       return e;
     }
     case kind::error: return error_message{std::string{in}};
+    case kind::abort: {
+      abort_message a;
+      a.query = take<std::uint64_t>(in);
+      a.what  = std::string{in};
+      return a;
+    }
   }
   throw sirius::invalid_input_exception("exchange message: unknown kind");
 }

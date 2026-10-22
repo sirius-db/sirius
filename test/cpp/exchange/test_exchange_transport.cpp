@@ -146,7 +146,8 @@ TEST_CASE("exchange messages round-trip and refuse malformed bytes", "[exchange]
                                  credit_message{{1, 2, 3}},
                                  credit_message{},
                                  end_message{7, 12},
-                                 error_message{"out of memory"}};
+                                 error_message{"out of memory"},
+                                 abort_message{3, "rank 1: out of memory"}};
   for (auto const& m : all) {
     CHECK(decode(encode(m)) == m);
   }
