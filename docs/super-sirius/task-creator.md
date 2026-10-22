@@ -122,7 +122,11 @@ BUILT: probe_size>0 → READY
 
 ### HASH_JOIN (STANDARD mode)
 
-Uses base class for both `get_next_task_hint()` and `get_next_task_input_data()`. Input data walks the partition × left × right grid using snapshot batch IDs for Cartesian product iteration.
+Overrides both task-driver methods. The CONCAT inputs are PARTIAL barriers; newly arrived batch IDs extend the per-partition pair schedule in `join_cross_schedule`. Each build/probe pair is issued once, and a batch is retired after its opposite producer finishes and all its pairings have been issued.
+
+### NESTED_LOOP_JOIN
+
+Both join inputs are PARTIAL barriers. Readiness and input selection discover newly arrived batch IDs and use `join_cross_schedule` to claim each pair once. `concat_all` still folds build for LEFT/SEMI/ANTI/MARK, probe for RIGHT, and both for FULL OUTER. A missing probe is nominated once build data exists. Cross products retain a pending pair until all slices have been issued. Empty producers use orphan tasks after both producers finish; the surviving input is prepared normally before empty-side execution. Repository retirement waits for opposite-side completion and all required pair/slice claims.
 
 ### PARTITION
 
@@ -209,7 +213,8 @@ Same pattern as MERGE_SORT: drains all batches from one partition per call.
 | Operator | `get_next_task_hint()` | `get_next_task_input_data()` | Why Custom |
 |----------|------------------------|------------------------------|------------|
 | HASH_JOIN (BUILD_PROBE) | Build state machine | Build+probe or probe only | Build/probe asymmetry |
-| HASH_JOIN (STANDARD) | Base class | Cartesian product walk | Multi-partition iteration |
+| HASH_JOIN (STANDARD) | Incremental pair readiness | Incremental batch-pair claims | Multi-partition streaming |
+| NESTED_LOOP_JOIN | Incremental pair / pending-slice readiness | Batch pairs, cross-product slices, empty-side tasks | Single-partition streaming with whole-side CONCAT rules |
 | PARTITION | Resolves the bound input policy, then checks port readiness | Resolves once before claiming | Shared exchange layout |
 | CONCAT | Byte-threshold check | Accumulate until threshold | Batching + blocking mode |
 | SORT_SAMPLE | Wait for N batches | Base class | Two-phase sampling |

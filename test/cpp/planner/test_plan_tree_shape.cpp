@@ -2142,6 +2142,8 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
             e.fold_probe);
       CHECK(plan->children[1]->Cast<sirius::op::sirius_physical_concat>().concat_all() ==
             e.fold_build);
+      CHECK(plan->input_barrier_for(*plan->children[0]) == sirius::op::MemoryBarrierType::PARTIAL);
+      CHECK(plan->input_barrier_for(*plan->children[1]) == sirius::op::MemoryBarrierType::PARTIAL);
     }
   }
 }
