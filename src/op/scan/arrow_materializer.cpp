@@ -1,8 +1,12 @@
 /* Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0 */
 #include "op/scan/arrow_materializer.hpp"
 
-#include <cudf/interop.hpp>
-#include <cudf/unary.hpp>
+#include <cudf/column/column_factories.hpp>
+#include <cudf/null_mask.hpp>
+#include <cudf/utilities/error.hpp>
+#include <cudf/utilities/traits.hpp>
+
+#include <rmm/device_buffer.hpp>
 
 #include <bit>
 #include <charconv>
@@ -15,8 +19,11 @@ namespace sirius::op::scan {
 owned_arrow_batch::owned_arrow_batch(ArrowSchema& s,
                                      ArrowArray& a,
                                      std::shared_ptr<void> permit,
+                                     std::pmr::memory_resource& staging_resource,
                                      arrow_metadata_lengths metadata_lengths)
-  : capacity(std::move(permit)), metadata_lengths(std::move(metadata_lengths))
+  : capacity(std::move(permit)),
+    staging_resource(staging_resource),
+    metadata_lengths(std::move(metadata_lengths))
 {
   if (!s.release || !a.release || !capacity)
     throw std::invalid_argument("Arrow input requires ownership and capacity");
@@ -85,6 +92,113 @@ int32_t string_offset(void const* buffer, int64_t index)
   int32_t value;
   std::memcpy(&value, static_cast<uint8_t const*>(buffer) + index * sizeof(value), sizeof(value));
   return value;
+}
+
+struct normalized_column {
+  explicit normalized_column(cudf::data_type type, std::pmr::memory_resource& resource)
+    : type(type), values(&resource), offsets(&resource), validity(&resource)
+  {
+  }
+  cudf::data_type type;
+  void const* source    = nullptr;
+  cudf::size_type nulls = 0;
+  std::pmr::vector<uint8_t> values;
+  std::pmr::vector<int32_t> offsets;
+  std::pmr::vector<uint8_t> validity;
+};
+
+struct normalized_batch {
+  normalized_batch(std::shared_ptr<owned_arrow_batch> owner, std::pmr::memory_resource& resource)
+    : owner(std::move(owner)), columns(&resource)
+  {
+  }
+  // Release PMR buffers before the producer/capacity owner that keeps the resource alive.
+  std::shared_ptr<owned_arrow_batch> owner;
+  std::pmr::vector<normalized_column> columns;
+};
+
+void normalize_columns(normalized_batch& batch,
+                       ArrowArray const& array,
+                       std::vector<cudf::data_type> const& types,
+                       std::pmr::memory_resource& resource)
+{
+  batch.columns.reserve(types.size());
+  for (std::size_t i = 0; i < types.size(); ++i) {
+    auto const& child    = *array.children[i];
+    auto const begin     = child.offset + array.offset;
+    auto const end       = begin + array.length;
+    auto const* validity = validity_for(child);
+    auto& column         = batch.columns.emplace_back(types[i], resource);
+    column.nulls         = static_cast<cudf::size_type>(count_nulls(validity, begin, end));
+    if (types[i].id() == cudf::type_id::STRING) {
+      column.offsets.resize(static_cast<std::size_t>(array.length) + 1);
+      if (array.length) {
+        auto first = string_offset(child.buffers[1], begin);
+        for (int64_t row = 0; row <= array.length; ++row)
+          column.offsets[row] = string_offset(child.buffers[1], begin + row) - first;
+        if (column.offsets.back())
+          column.source = static_cast<uint8_t const*>(child.buffers[2]) + first;
+      }
+    } else if (types[i].id() == cudf::type_id::BOOL8) {
+      column.values.resize(array.length);
+      auto const* bits = static_cast<uint8_t const*>(child.buffers[1]);
+      for (int64_t row = 0; row < array.length; ++row)
+        column.values[row] = (bits[(begin + row) / 8] >> ((begin + row) % 8)) & 1U;
+    } else if (array.length) {
+      column.source =
+        static_cast<uint8_t const*>(child.buffers[1]) + begin * cudf::size_of(types[i]);
+    }
+    if (column.nulls) {
+      column.validity.resize(cudf::bitmask_allocation_size_bytes(array.length), 0);
+      for (int64_t row = 0; row < array.length; ++row) {
+        auto bit = (validity[(begin + row) / 8] >> ((begin + row) % 8)) & 1U;
+        column.validity[row / 8] |= static_cast<uint8_t>(bit << (row % 8));
+      }
+    }
+  }
+}
+
+std::unique_ptr<cudf::table> copy_columns(normalized_batch const& batch,
+                                          cudf::size_type rows,
+                                          rmm::cuda_stream_view stream,
+                                          rmm::device_async_resource_ref mr)
+{
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.reserve(batch.columns.size());
+  auto copy = [&](void* destination, void const* source, std::size_t bytes) {
+    if (bytes)
+      CUDF_CUDA_TRY(
+        cudaMemcpyAsync(destination, source, bytes, cudaMemcpyHostToDevice, stream.value()));
+  };
+  for (auto const& input : batch.columns) {
+    rmm::device_buffer mask(input.validity.size(), stream, mr);
+    copy(mask.data(), input.validity.data(), input.validity.size());
+    std::unique_ptr<cudf::column> column;
+    if (input.type.id() == cudf::type_id::STRING) {
+      auto offsets =
+        cudf::make_fixed_width_column(cudf::data_type{cudf::type_id::INT32},
+                                      static_cast<cudf::size_type>(input.offsets.size()),
+                                      cudf::mask_state::UNALLOCATED,
+                                      stream,
+                                      mr);
+      copy(offsets->mutable_view().head<uint8_t>(),
+           input.offsets.data(),
+           input.offsets.size() * sizeof(int32_t));
+      rmm::device_buffer chars(static_cast<std::size_t>(input.offsets.back()), stream, mr);
+      copy(chars.data(), input.source, chars.size());
+      column = cudf::make_strings_column(
+        rows, std::move(offsets), std::move(chars), input.nulls, std::move(mask));
+    } else {
+      column =
+        cudf::make_fixed_width_column(input.type, rows, cudf::mask_state::UNALLOCATED, stream, mr);
+      copy(column->mutable_view().head<uint8_t>(),
+           input.values.empty() ? input.source : input.values.data(),
+           static_cast<std::size_t>(rows) * cudf::size_of(input.type));
+      column->set_null_mask(std::move(mask), input.nulls);
+    }
+    columns.push_back(std::move(column));
+  }
+  return std::make_unique<cudf::table>(std::move(columns));
 }
 void validate_metadata(char const* metadata, arrow_metadata_lengths const& metadata_lengths)
 {
@@ -222,57 +336,19 @@ materialized_batch import_arrow_host(std::shared_ptr<owned_arrow_batch> input,
         program.decimal_precisions[i] != precision)
       throw std::invalid_argument("Arrow decimal precision does not match its bound program");
   }
-  // The pinned importer consumes each child array independently and does not
-  // apply a struct root slice. Normalize the root range into every child while
-  // retaining both these headers and the original callback-owned tree.
-  struct import_view {
-    std::shared_ptr<owned_arrow_batch> owner;
-    ArrowArray root;
-    void const* root_buffers[1]{nullptr};
-    std::vector<ArrowArray> children;
-    std::vector<ArrowArray*> pointers;
-  };
-  auto view             = std::make_shared<import_view>();
-  view->owner           = input;
-  view->root            = input->array;
-  view->root.offset     = 0;
-  view->root.null_count = 0;
-  view->root.buffers    = view->root_buffers;
-  view->children.reserve(input->array.n_children);
-  for (int64_t i = 0; i < input->array.n_children; ++i) {
-    auto child = *input->array.children[i];
-    if (input->array.offset || child.length != input->array.length) {
-      child.offset += input->array.offset;
-      child.length     = input->array.length;
-      child.null_count = child.null_count == 0 || !child.buffers[0] ? 0 : -1;
-    }
-    view->children.push_back(child);
-  }
-  for (auto& child : view->children)
-    view->pointers.push_back(&child);
-  view->root.children = view->pointers.data();
-  auto submission     = lane.begin();
-  // Register ownership before cuDF can enqueue even a partially failing import.
-  submission.on_retire([owner = view](cudaError_t) noexcept {});
-  ::cuda::stream_ref stream{submission.stream()};
-  auto table = cudf::from_arrow(&input->schema, &view->root, stream, mr);
-  if (table->num_columns() != static_cast<cudf::size_type>(types.size()))
-    throw std::invalid_argument("Arrow import returned a different column layout");
-  auto columns = table->release();
-  for (std::size_t i = 0; i < types.size(); ++i) {
-    if (columns[i]->type() == types[i]) continue;
-    auto actual = columns[i]->type();
-    if (types[i].id() != cudf::type_id::DECIMAL128 ||
-        (actual.id() != cudf::type_id::DECIMAL32 && actual.id() != cudf::type_id::DECIMAL64) ||
-        actual.scale() != types[i].scale())
-      throw std::invalid_argument("Arrow import returned an unqualified physical type");
-    columns[i] = cudf::cast(columns[i]->view(), types[i], stream, mr);
-  }
+  auto normalized = std::make_shared<normalized_batch>(input, input->staging_resource);
+  normalize_columns(*normalized, input->array, types, input->staging_resource);
+  auto submission = lane.begin();
+  // Register roots, capacity and PMR staging before any partially failing copy.
+  submission.on_retire([owner = normalized](cudaError_t) noexcept {});
+  rmm::cuda_stream_view stream{submission.stream()};
+  auto table =
+    copy_columns(*normalized, static_cast<cudf::size_type>(input->array.length), stream, mr);
   materialized_batch batch;
-  batch.table      = owning_table_view(std::make_unique<cudf::table>(std::move(columns)));
-  batch.rows       = input->array.length;
-  batch.contract   = program.contract;
-  batch.generation = program.generation;
+  batch.table                   = owning_table_view(std::move(table));
+  batch.rows                    = input->array.length;
+  batch.contract                = program.contract;
+  batch.generation              = program.generation;
   batch.logical_schema_complete = true;
   ensure_row_count_carrier(batch, stream, mr);
   validate_materialized_batch(batch, program);

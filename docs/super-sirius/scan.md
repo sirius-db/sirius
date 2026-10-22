@@ -747,10 +747,25 @@ Two reusable entry points additionally exercise this finish contract:
   callbacks before ownership transfer. Input/staging capacity remains owned through
   retirement, even if import throws. The caller reserves output/temporary memory and
   drains the lane.
-  The current importer calls cuDF directly after validation. Future integration with
-  the shared host-Arrow conversion in [#2216](https://github.com/sirius-db/sirius/pull/2216)
-  can reuse a conversion leaf that does not inspect metadata; bounded metadata checks
-  and the other consumer responsibilities above remain with this scan consumer.
+  The conversion leaf incorporates the checked host normalization from
+  [#2216](https://github.com/sirius-db/sirius/pull/2216), whose original helper was
+  extracted from [#1965](https://github.com/sirius-db/sirius/pull/1965). It checks the
+  entire selected batch before GPU work, then builds owning cuDF columns with the
+  supplied device resource and lane stream, without intermediate cuDF Arrow import
+  or decimal casts. Decimal payloads must fit their declared precision; the output
+  remains DECIMAL128, and zero-column batches retain their separate row count.
+  `owned_arrow_batch` requires an explicit staging PMR. Boolean bytes, rebased UTF8
+  offsets and selected validity bits use that resource; roots, capacity and staging
+  stay retained on the lane until completion, including post-enqueue failures. The
+  capacity owner must keep the PMR alive until those staging buffers are destroyed.
+  An absent bitmap with unknown null count is treated as all-valid; positive null
+  counts without a bitmap are refused. No decimal rescaling or large-string support
+  is added. Metadata semantics and the other consumer responsibilities above remain
+  unchanged. Normal import does not synchronize the stream on the host; neither a
+  returned table nor an exception permits releasing pending inputs or replaying a
+  query before a successful attempt-level drain. A failed drain retains ownership,
+  not permission to release it. No CPU/GPU overlap or throughput guarantee is made;
+  pageable producer or PMR buffers may cause CUDA-internal staging/synchronization.
   `materialize_arrow_stream()` is the internal sequential verifier above this
   single-batch importer. Its source returns independently owned batches with a
   contiguous sequence, declared row/byte envelope, and explicit `nullopt` EOS;

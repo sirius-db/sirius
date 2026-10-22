@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <memory_resource>
 #include <optional>
 #include <unordered_map>
 
@@ -26,6 +27,7 @@ class owned_arrow_batch {
   owned_arrow_batch(ArrowSchema& schema,
                     ArrowArray& array,
                     std::shared_ptr<void> capacity,
+                    std::pmr::memory_resource& staging_resource,
                     arrow_metadata_lengths metadata_lengths = {});
   ~owned_arrow_batch();
   owned_arrow_batch(owned_arrow_batch const&)            = delete;
@@ -41,6 +43,8 @@ class owned_arrow_batch {
   ArrowSchema schema{};
   ArrowArray array{};
   std::shared_ptr<void> capacity;
+  // The producer's capacity owner must keep this resource alive through retirement.
+  std::pmr::memory_resource& staging_resource;
   arrow_metadata_lengths metadata_lengths;
 };
 
@@ -48,6 +52,10 @@ std::vector<cudf::data_type> validate_arrow_host_flat(
   ArrowSchema const&, ArrowArray const&, arrow_metadata_lengths const& metadata_lengths = {});
 // The caller owns/drains the completion lane and its stream for the entire attempt.
 // Output device reservations are the same task reservation used for Parquet decode.
+// Producer buffers must be readable to their declared Arrow extents. All host
+// normalization uses the input's staging resource and stays retained on the lane.
+// Neither return nor an exception establishes completion: the caller must drain
+// the lane before releasing resources or considering any otherwise permitted replay.
 materialized_batch import_arrow_host(std::shared_ptr<owned_arrow_batch>,
                                      materialization_program const&,
                                      exec::retire_lane&,
