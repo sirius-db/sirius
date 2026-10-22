@@ -6,6 +6,7 @@
 
 #include <rmm/cuda_stream.hpp>
 #include <rmm/error.hpp>
+#include <rmm/mr/cuda_async_memory_resource.hpp>
 
 #include <catch.hpp>
 
@@ -227,6 +228,11 @@ thread_local completion_fault* completion_fault::active = nullptr;
 // Negative control only; the production importer never changes this process-wide resource.
 class current_resource_guard {
  public:
+  explicit current_resource_guard(rmm::device_async_resource_ref resource)
+    : previous_(cudf::set_current_device_resource(
+        ::cuda::mr::any_resource<::cuda::mr::device_accessible>{resource}))
+  {
+  }
   explicit current_resource_guard(observed_device_resource const& resource)
     : previous_(cudf::set_current_device_resource(
         ::cuda::mr::any_resource<::cuda::mr::device_accessible>{resource}))
@@ -471,9 +477,12 @@ TEST_CASE("Arrow migration does not route allocations through the process defaul
   release_counts released;
   bounded_host_resource host;
   rmm::cuda_stream stream;
+  rmm::mr::cuda_async_memory_resource upstream;
+  // Match Sirius's resource-ref default. Replacing it must not invalidate our supplied resource.
+  current_resource_guard installed_default(rmm::device_async_resource_ref{upstream});
   sirius::exec::retire_lane lane(stream.value());
-  auto upstream = cudf::get_current_device_resource_ref();
-  observed_device_resource supplied(upstream), rejecting(upstream);
+  observed_device_resource supplied(rmm::device_async_resource_ref{upstream});
+  observed_device_resource rejecting(rmm::device_async_resource_ref{upstream});
   supplied.state->expected_stream = stream.value();
   rejecting.state->fail_at        = -2;
   auto producer                   = std::make_shared<producer_batch>(released);
