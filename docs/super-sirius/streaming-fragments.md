@@ -203,9 +203,23 @@ use-after-free): repositories, then `_result_plan` (a `RESULT_COLLECTOR` referen
 
 `Context` owns one engine (`duckdb::SiriusContext`), an embedded `duckdb::DuckDB` plus
 `Connection`, and a `stream_bind_catalog`, shared by every `Fragment` from `make_fragment()`.
+The embedded `DuckDB` statically loads the core-functions and Parquet extensions
+(`LoadStaticExtension`), so Substrait plans lower and `local_files` reads resolve to
+`parquet_scan` without an external extension file.
 `Fragment` is a PIMPL around one `streaming_fragment` and keeps only its declarations; built, run,
 and result state, the relay checks, and output poisoning all live in `streaming_fragment`. No
 declared output means a result fragment, drained with `result_to_arrow()`.
+
+A `Context` is configured at construction: `Context()` / `make_context()` use the built-in
+defaults, and `Context(config_path)` / `make_context_from_config(path)` read the YAML file at
+`path` (schema in [Configuration](configuration.md)); either throws on an invalid file or a GPU
+bring-up failure. C++ embedders can validate a configuration ahead of bring-up with the public
+API in `include/sirius/context/` (C++23, `std::expected`): `sirius::ContextConfigBuilder{}.build()`
+yields the defaults, `ContextConfigBuilder::from_yaml(path)` reads one YAML file, and `build()`
+returns an immutable `sirius::ContextConfig` snapshot; failures are reported as `sirius::Error`
+(`configuration_io`, `malformed_yaml`, `invalid_configuration`), and neither call touches CUDA —
+GPU availability and capacity-derived defaults are resolved at context creation. No context
+constructor consumes a `ContextConfig` yet.
 
 ```
 build():  ┌─ in_transaction ──────────────────────────────────────────────────┐

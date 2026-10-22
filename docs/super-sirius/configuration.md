@@ -321,10 +321,10 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `num_threads` | int (**> 2**) | remaining cores (min 4) | Threads in the scan-manager pool that run metadata tasks. Defaults to every core left after the other default pools (1 downgrade + 1 task_creator + 4 pipeline + 1 uring reactor), with a floor of 4. Rejected unless strictly greater than 2 (i.e. minimum 3). |
+| `num_threads` | int (**> 2**) | remaining cores (min 4) | Threads in the scan-manager pool that run metadata tasks. Defaults to every core left after the other default pools (1 downgrade + 1 task_creator + 4 pipeline + 4 uring reactors), with a floor of 4. Rejected unless strictly greater than 2 (i.e. minimum 3). |
 | `cpu_affinity` | list of int | — | Cores to pin scan-manager threads to. |
 | `backend` | enum: `sirius`, `kvikio` | `sirius` | IO backend for reads. `sirius` uses the Sirius IO stack (`io_uring` for local paths, REST for `s3://`); `kvikio` serves both local files and `s3://` objects through kvikIO (local files through its file handle, objects through its remote handle); listing and glob expansion of `s3://` still go through the REST backend. Single-GPU only: a multi-GPU configuration is forced back to `sirius`. Values are lowercase. |
-| `uring_n_reactors` | int (**> 0**) | 1 | Number of io_uring reactor threads for local-disk reads. |
+| `uring_n_reactors` | int (**> 0**) | 4 | Number of io_uring reactor threads for local-disk reads. A single reactor serializes the local read path. |
 | `rest_n_reactors` | int (**> 0**) | 2 | Number of REST reactor threads for object-store (`s3://`) reads. |
 | `max_readahead_scans` | int | — (unset) | Scans the readahead may keep in flight, and the switch that runs it at all. See below. |
 | `readahead_strategy` | enum: `eager`, `opportunistic` | — (unset) | When the readahead issues. Unset takes the serving backend's own preference: `eager` for object-store (REST) reads, `opportunistic` for local (uring) ones. Values are lowercase. |
@@ -336,7 +336,7 @@ sub-config below.
 
 | Value | Effect |
 |-------|--------|
-| unset (default) | Defers to `cache`: with `mode` other than `none`, the budget is the backend reactor's own `n_max_concurrent_scans`; with `mode: none` the readahead does not run. |
+| unset (default) | Defers to `cache`: with `mode` other than `none`, the budget is the serving backend's own `n_max_concurrent_scans` — `0` for local (uring) reads, so the readahead does not run for them by default, and `max(8, 2 ×` the pipeline `num_threads)` for object-store (REST) reads; with `mode: none` the readahead does not run. |
 | `0` | The readahead does not run, whatever the cache mode. |
 | `n > 0` | The readahead runs with a budget of `n`, whatever the cache mode. |
 
@@ -350,8 +350,8 @@ sub-config below.
 
 When the readahead ends up `opportunistic` (either way), an *unset* `max_readahead_scans` schedules
 against the pipeline pool's width rather than the backend's depth — one prefetch per non-scan
-deployment is only useful while a pipeline thread could still pick up another scan. An explicit
-`max_readahead_scans` wins over that substitution.
+deployment is only useful while a pipeline thread could still pick up another scan. A backend
+budget of `0` opts out and is not substituted. An explicit `max_readahead_scans` wins over both.
 
 Both are resolved against a single backend: the live one publishing the widest
 `n_max_concurrent_scans`, so the budget and the strategy always describe the same reactor.
@@ -363,6 +363,10 @@ Six optional nested sub-configs tune the individual backends, the cache, and the
 There are no static chunk-size or `readv`-fusion knobs. The worker chooses physical
 operation sizes dynamically from backlog pressure, available slots, and the pinned block size.
 
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `n_max_concurrent_scans` | int | 0 | Scans the readahead may keep in flight against local reads. `0` keeps the readahead off for local reads: on local NVMe it competes with the executor's own reads for the same device instead of adding throughput. An explicit `scan_manager.max_readahead_scans` takes precedence. |
+
 ### `scan_manager.rest` — REST / S3 backend (`io/rest/config.hpp`)
 
 TLS verification policy and the CA bundle are configured only under
@@ -372,6 +376,7 @@ and transport use one trust policy; there are no separate REST YAML controls.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `request_timeout_s` | int (seconds) | 30 | Whole-request timeout for control-plane requests (HEAD / LIST / footer probe / warmup) and the presigned-URL TTL, which is this value plus 60 s. `0` does not remove the limit: control-plane requests then keep the transport's built-in 30 s limit, and presigned URLs get a 300 s TTL. Data GETs use the stall detector below instead. |
+| `n_max_concurrent_scans` | int | `max(8, 2 × pipeline num_threads)` | Scans the readahead may keep in flight against object-store reads. The default scales with the configured pipeline pool because ranged GETs are latency-bound; an explicit value is used as given. |
 | `stall_speed_limit_bytes` | int (bytes/s) | 65536 | Stall detector for data GETs: a transfer below this rate for `stall_time_s` consecutive seconds fails and is retried (0 disables). |
 | `stall_time_s` | int (seconds) | 30 | How long a data GET may stay below `stall_speed_limit_bytes` before it is cut loose (0 disables). |
 | `merge_max_gap` | bytes | 512Ki | Largest gap between two segments still fetched by a single GET. The bridged bytes are read and discarded, trading them for a saved round trip. 0 fuses only adjacent segments. |
@@ -932,7 +937,7 @@ SET enable_runtime_size_estimation = true;   -- off by default
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `gpu_execution` | true | Enable transparent GPU execution for plain SQL queries. When enabled, supported queries are automatically intercepted and executed on the GPU. When disabled, only explicit `CALL gpu_execution('...')` uses the GPU. |
+| `gpu_execution` | true | Enable transparent GPU execution for plain SQL queries. When enabled, supported queries are automatically intercepted and executed on the GPU. When disabled, only explicit `CALL gpu_execution('...')` uses the GPU. SESSION-scoped by default: an unqualified `SET` affects the current connection, and `SET GLOBAL` applies to connections without a session-level value. |
 
 ### Debug
 
@@ -949,15 +954,17 @@ SET enable_runtime_size_estimation = true;   -- off by default
 
 **File:** `src/config.hpp`
 
-Static constants from `namespace duckdb::Config` and `namespace sirius::Config`:
+Constants in `namespace sirius::Config`. The engine does not read them; thread-pool defaults come from the per-pool config headers (see the executor sections above).
 
-| Flag | Value | Namespace |
-|------|-------|-----------|
-| `NUM_GPU_EXECUTOR_THREADS` | 2 | `sirius::Config` |
-| `NUM_PIPELINE_EXECUTOR_THREADS` | 1 | `sirius::Config` |
-| `NUM_GPU` | 1 | `sirius::Config` |
+| Flag | Value |
+|------|-------|
+| `NUM_GPU_EXECUTOR_THREADS` | 2 |
+| `NUM_PIPELINE_EXECUTOR_THREADS` | 1 |
+| `NUM_DUCKDB_SCAN_EXECUTOR_THREADS` | 2 |
+| `NUM_DOWNGRADE_EXECUTOR_THREADS` | 1 |
+| `NUM_GPU` | 1 |
 
-These are compile-time defaults. Runtime configuration via `sirius_config` and DuckDB SET variables takes precedence.
+`namespace duckdb::Config` in the same file holds the mutable process-wide logging settings (`LOG_BACKEND`, `LOG_LEVEL`, `LOG_DIR`, `LOG_FLUSH_SECONDS`); see [Logging](#logging).
 
 ## Key Files
 

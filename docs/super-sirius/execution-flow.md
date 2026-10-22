@@ -16,11 +16,11 @@ The explicit `CALL gpu_execution('...')` function is also still supported.
 
 **Files:** `src/transparent/sirius_optimizer_extension.cpp`, `src/sirius_context.cpp`
 
-DuckDB's optimizer calls one Sirius hook registered via `OptimizerExtension`:
+DuckDB calls two Sirius optimizer hooks registered via `OptimizerExtension` — `sirius_pre_optimizer_hook` before optimization and `sirius_optimizer_hook` after — plus `SiriusContext::OnFinalizePrepare`. All three share one decision function, `should_use_duckdb` (`src/transparent/connection_provenance.cpp`), so provider-internal SQL and hidden catalogs are never intercepted: a connection carrying DuckLake's `ducklake_internal_connection` marker, or whose default catalog is hidden with `catalog_error_max_schemas = 0`, is classified provider-internal for its lifetime; a statement that reads or modifies a hidden catalog is excluded for the current planning attempt (the pre-optimizer hook classifies before optimization can remove the scans). Counters record provider-internal skips, hidden-catalog skips, and classification failures.
 
 1. **Optimizer mask (at extension load, not per query)**: `IN_CLAUSE`, `COMPRESSED_MATERIALIZATION`, `LATE_MATERIALIZATION`, and the [shared aggregate and scan exclusions](../../src/planner/unsupported_optimizers.hpp) are unioned into `disabled_optimizers` once when the extension loads, because those can produce DuckDB-internal plan shapes the transparent rebind path cannot yet execute. `STATISTICS_PROPAGATION` remains enabled; its folded `EXPRESSION_GET`/`COLUMN_DATA_SCAN` and `DUMMY_SCAN` sources are translated to `GPU_VALUES`.
 
-2. **Post-optimization** (`sirius_optimizer_hook`): Copies the optimized logical plan via `LogicalOperator::Copy()` and stores it on the connection's per-connection state, stamped with the connection's current planning generation.
+2. **Post-optimization** (`sirius_optimizer_hook`): Copies the optimized logical plan via `copy_logical_plan()` — `LogicalOperator::Copy()` plus restoration of what serialization drops: verified Parquet bind data and DuckDB's cardinality estimates — and stores it on the connection's per-connection state, stamped with the connection's current planning generation.
 
 3. **OnFinalizePrepare** (`SiriusContext::OnFinalizePrepare`): After DuckDB generates its CPU physical plan, this hook:
    - Retrieves the stored logical plan copy
@@ -50,23 +50,22 @@ For transparent execution, DuckDB's executor calls `PhysicalSiriusExecution::Get
 
 If GPU execution fails at runtime (and `enable_duckdb_fallback` is true), the operator runs the stashed DuckDB CPU plan on a private `duckdb::Executor` bound to the same `ClientContext` — so the fallback executes under the same transaction and MVCC snapshot as the failed attempt, including that transaction's own uncommitted writes. The GPU result is fully materialized before any row is emitted, so the fallback cannot duplicate rows. S3-reading queries have no CPU path and surface a clear error instead of falling back. A `runtime_fallbacks` counter and a WARN log record each occurrence.
 
+A replay that itself fails reports its own error, not the interrupt it raised: DuckDB's executors share cancellation state but not errors, so the failed nested executor would otherwise surface as `Interrupted` on the outer query. `run_cpu_fallback_plan` records the nested executor's error on the connection state, and the connection's `QueryEnd` replaces an INTERRUPT result error with the recorded one; a replay that was itself interrupted is not recorded, so a real user cancellation still reports `Interrupted`.
+
 ## Step 3: Query Lifecycle Setup
 
 **File:** `src/sirius_interface.cpp`
 
-`sirius_execute_query()` delegates to:
+`sirius_execute_query()` runs the query synchronously:
 
-1. `sirius_pending_statement_or_prepared_statement()`:
-   - Calls `begin_query_internal()` to set up the active query context
-   - Calls `sirius_pending_statement_internal()` which:
-     - Creates a `sirius_engine(context, query_id, query_label, session_label)` (the labels are optional telemetry names)
-     - Creates a `sirius_physical_materialized_collector` as the result sink
-     - Calls `engine.initialize(collector)` to build pipelines (see Step 4)
-     - Returns a `PendingQueryResult`
+1. Creates the active query context (query text, `sirius_prepared_statement_data`, engine); `cleanup_internal()` resets it on exit
+2. Binds the prepared statement with no parameters
+3. Creates a `sirius_engine(context, query_id, query_label, session_label)` (the labels are optional telemetry names) and a `sirius_physical_materialized_collector` as the result sink
+4. Calls `engine.initialize(collector)` to build pipelines (see Step 4)
+5. Calls `engine.execute()` to run the GPU pipelines (see Step 5)
+6. Calls `engine.get_result()` to detach the materialized result before the plan and executor are released
 
-2. `sirius_execute_pending_query_result(pending)`:
-   - Calls `engine.execute()` to run the GPU pipelines (see Step 5)
-   - On completion, calls `fetch_result_internal()` which extracts the materialized result
+`SiriusBeginWindowFailureException` and `SiriusRuntimeUnavailableException` propagate unchanged to the caller's fallback routing; any other `std::exception` becomes an error-carrying `QueryResult`.
 
 ## Step 4: Pipeline Construction
 
@@ -144,7 +143,7 @@ The GPU executor's manager loop:
 3. **Pop task** — blocks until a `gpu_pipeline_task` is available
 4. **Reserve memory** — acquires GPU memory reservation from `memory_space`
 5. **Dispatch to worker thread** — on the thread pool with a CUDA stream:
-   - Lock input batches and convert to GPU if needed (`lock_or_prepare_batch`)
+   - Lock input batches and convert to GPU if needed (`lock_and_prepare_batch`)
    - `compute_task()`: iterate **all** operators in the pipeline (source through sink), calling `execute()` on each
    - `publish_output()`: call the sink's `sink()` method to push results to downstream ports
    - On OOM: catch `oom_reschedule_exception`, retry up to 100 times with 50ms backoff
@@ -175,10 +174,10 @@ After a GPU task completes and schedules downstream operators:
 
 After the future resolves:
 
-1. `fetch_result_internal()` calls `engine.get_result()`
+1. `sirius_execute_query()` calls `engine.get_result()`
 2. The result collector (`sirius_physical_materialized_collector`) returns its `ColumnDataCollection`
 3. The materialized result is wrapped in a `MaterializedQueryResult` and returned to DuckDB
-4. `cleanup_internal()` resets the progress bar and calls `end_query_internal()`
+4. `cleanup_internal()` releases the active query context (engine and prepared statement)
 
 ## Error Handling
 
