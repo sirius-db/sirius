@@ -2873,7 +2873,8 @@ TEST_CASE("consumer exceptional cleanup retains reachable owners and replaces re
   REQUIRE(storage.has_source);
   REQUIRE(storage.filter_owners == 3);
   REQUIRE(storage.has_ast);
-  REQUIRE(storage.has_mask);
+  // Gather-once releases each probe mask after folding it into the retained conjunction.
+  REQUIRE(storage.has_mask == (strategy != compaction_strategy::GATHER_ONCE));
   REQUIRE(storage.has_output);
   REQUIRE_FALSE(storage.completed);
   REQUIRE(storage.has_row_ids == (strategy == compaction_strategy::DEFERRED_KEYS));
