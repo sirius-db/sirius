@@ -51,6 +51,7 @@ struct node;
 #include "expression/ast/conjunction.hpp"
 #include "expression/ast/constant.hpp"
 #include "expression/ast/function_call.hpp"
+#include "expression/ast/gpu_function_call.hpp"
 #include "expression/ast/in_list.hpp"
 #include "expression/ast/reference.hpp"
 #include "expression/ast/unary_op.hpp"
@@ -124,7 +125,8 @@ struct node {
                                  coalesce,
                                  in_list,
                                  function_call,
-                                 aggregate>;
+                                 aggregate,
+                                 gpu_function_call>;
 
   static_assert(detail::all_have_cudf_ast_op_count<variant_t>::value,
                 "Every alternative in sirius::ast::node::variant_t must implement "

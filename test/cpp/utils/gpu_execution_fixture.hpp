@@ -39,6 +39,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
@@ -210,6 +211,63 @@ class GpuExecutionFixture {
   void compare_gpu_vs_cpu_ordered(const std::string& query)
   {
     compare_gpu_vs_cpu_impl(query, true);
+  }
+
+  /// Compare a rewritten GPU query with an independently expressed CPU reference.
+  /// NULL is compared separately from its spelling so a VARCHAR containing "NULL"
+  /// cannot match a SQL NULL. The candidate must execute without any fallback.
+  void compare_gpu_candidate_to_cpu(const std::string& cpu_reference_query,
+                                    const std::string& gpu_candidate_query,
+                                    bool ordered = false)
+  {
+    INFO("CPU reference: " << cpu_reference_query);
+    INFO("GPU candidate: " << gpu_candidate_query);
+    run_ok("SET gpu_execution = true;");
+    auto const before = sirius::test::get_transparent_execution_stats(*con);
+    auto gpu_result   = con->Query(gpu_candidate_query);
+    REQUIRE(gpu_result);
+    if (gpu_result->HasError()) { UNSCOPED_INFO("GPU query error: " << gpu_result->GetError()); }
+    REQUIRE_FALSE(gpu_result->HasError());
+    auto const after = sirius::test::get_transparent_execution_stats(*con);
+    CHECK(after.read_view_mismatches == before.read_view_mismatches);
+    sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1);
+
+    run_ok("SET gpu_execution = false;");
+    auto cpu_result = con->Query(cpu_reference_query);
+    run_ok("SET gpu_execution = true;");
+    REQUIRE(cpu_result);
+    if (cpu_result->HasError()) { UNSCOPED_INFO("CPU query error: " << cpu_result->GetError()); }
+    REQUIRE_FALSE(cpu_result->HasError());
+    REQUIRE(gpu_result->GetTypes() == cpu_result->GetTypes());
+    REQUIRE(gpu_result->RowCount() == cpu_result->RowCount());
+
+    auto nullable_rows = [ordered](duckdb::QueryResult& result) {
+      using cell = std::pair<bool, std::string>;
+      std::vector<std::vector<cell>> rows;
+      auto values = result.Collection().GetRows();
+      for (duckdb::idx_t r = 0; r < result.RowCount(); ++r) {
+        std::vector<cell> row;
+        for (duckdb::idx_t c = 0; c < result.ColumnCount(); ++c) {
+          auto value = values.GetValue(c, r);
+          std::string encoded;
+          if (!value.IsNull()) {
+            auto const type = result.GetTypes()[c].id();
+            if (type == duckdb::LogicalTypeId::DOUBLE) {
+              encoded = std::to_string(std::bit_cast<uint64_t>(value.GetValue<double>()));
+            } else if (type == duckdb::LogicalTypeId::FLOAT) {
+              encoded = std::to_string(std::bit_cast<uint32_t>(value.GetValue<float>()));
+            } else {
+              encoded = value.ToString();
+            }
+          }
+          row.emplace_back(value.IsNull(), std::move(encoded));
+        }
+        rows.push_back(std::move(row));
+      }
+      if (!ordered) { std::sort(rows.begin(), rows.end()); }
+      return rows;
+    };
+    REQUIRE(nullable_rows(*gpu_result) == nullable_rows(*cpu_result));
   }
 
   /// GPU-vs-CPU comparison with a relative tolerance applied ONLY to the columns

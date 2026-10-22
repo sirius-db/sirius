@@ -139,6 +139,50 @@ The Python benchmark and power/throughput runners require a Python DuckDB client
 built from the pinned v2 revision; the default environment's 1.5 client cannot
 load this extension. The CLI-based scripts use the built v2 host.
 
+## GPU Scalar UDFs
+
+SQL scalar macros execute through the existing expression planner when their
+expanded expressions are supported on the GPU. Native UDFs register a DuckDB CPU
+implementation and a GPU implementation together with
+`sirius::register_gpu_scalar_function` from `<sirius/udf.hpp>`. GPU callbacks compose
+libcudf operations or launch CUDA kernels over whole batches; the CPU function
+remains available for ordinary CPU execution and fallback.
+
+Build native functions as external packages with the installed SDK:
+
+```cmake
+find_package(sirius REQUIRED CONFIG COMPONENTS udf)
+target_link_libraries(my_udf PRIVATE sirius::udf_sdk)
+```
+
+The SDK supplies the matching DuckDB headers and links the selected Sirius,
+cuDF, and RMM targets. Use the same DuckDB build, configuration, CUDA, and cuDF
+dependencies as the provider. Adding a function does not require rebuilding
+Sirius. Keep the library supplying its callbacks loaded until the database and
+all plans using them have retired.
+
+The [Sirius UDF conversion skill](../.agents/skills/sirius-udf/SKILL.md) guides an
+agent through reference tests, SQL/cuDF/CUDA rewriting, external package builds,
+GPU verification, and benchmarks. It includes independently written examples
+and a scaffold for new external projects. Private source and generated business
+logic stay outside this repository.
+
+`sirius_execution_stats()` exposes cumulative counters for the database's Sirius
+runtime, shared by its connections. Validate a candidate in an isolated database
+without concurrent queries. Read snapshots with GPU interception disabled so
+observing the counters does not itself attempt a GPU plan:
+
+```sql
+SET gpu_execution = false;
+SELECT executions, plan_fallbacks, runtime_fallbacks FROM sirius_execution_stats();
+SET gpu_execution = true;
+```
+
+For verification, disable fallback, execute the candidate against a real table,
+and require increased GPU executions with unchanged fallback counters, in
+addition to matching the CPU reference. See the [expression execution
+contract](super-sirius/expression-executor.md#native-gpu-scalar-functions).
+
 ## Pinning Tables for Hot Runs
 
 Sirius reads table data from storage on every query. For the best hot-run performance, pin

@@ -1,0 +1,41 @@
+# Optional native UDF SDK. Ordinary Sirius consumers do not need cuDF headers or
+# the DuckDB C++ API; only COMPONENTS udf opts into these dependencies.
+set(_sirius_udf_prefix "${PACKAGE_PREFIX_DIR}")
+include(CMakeFindDependencyMacro)
+set(SIRIUS_UDF_CUDF_VERSION "@cudf_VERSION@")
+set(SIRIUS_UDF_RMM_VERSION "@rmm_VERSION@")
+if(SIRIUS_UDF_CUDF_VERSION)
+  find_dependency(cudf ${SIRIUS_UDF_CUDF_VERSION} EXACT CONFIG)
+else()
+  find_dependency(cudf CONFIG)
+endif()
+if(SIRIUS_UDF_RMM_VERSION)
+  find_dependency(rmm ${SIRIUS_UDF_RMM_VERSION} EXACT CONFIG)
+else()
+  find_dependency(rmm CONFIG)
+endif()
+
+set(SIRIUS_UDF_DUCKDB_REVISION "@SIRIUS_UDF_DUCKDB_REVISION@")
+set(SIRIUS_UDF_BUILD_CONFIG "$<CONFIG>")
+if(NOT TARGET sirius::udf_sdk)
+  if("static" IN_LIST sirius_FIND_COMPONENTS)
+    set(_sirius_udf_library sirius::sirius_static)
+  elseif(TARGET sirius::sirius)
+    set(_sirius_udf_library sirius::sirius)
+  else()
+    set(_sirius_udf_library sirius::sirius_static)
+  endif()
+  add_library(sirius::udf_sdk INTERFACE IMPORTED)
+  set_target_properties(
+    sirius::udf_sdk
+    PROPERTIES
+      INTERFACE_LINK_LIBRARIES "${_sirius_udf_library};cudf::cudf;rmm::rmm"
+      INTERFACE_INCLUDE_DIRECTORIES
+      "${_sirius_udf_prefix}/@CMAKE_INSTALL_INCLUDEDIR@;${_sirius_udf_prefix}/@CMAKE_INSTALL_INCLUDEDIR@/sirius/duckdb;${_sirius_udf_prefix}/@CMAKE_INSTALL_INCLUDEDIR@/sirius/duckdb-fmt"
+      INTERFACE_COMPILE_DEFINITIONS
+      "@_sirius_udf_duckdb_definitions@;SIRIUS_UDF_DUCKDB_REVISION=\"@SIRIUS_UDF_DUCKDB_REVISION@\""
+  )
+endif()
+set(sirius_udf_FOUND TRUE)
+unset(_sirius_udf_library)
+unset(_sirius_udf_prefix)

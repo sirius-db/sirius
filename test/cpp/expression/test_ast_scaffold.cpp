@@ -55,8 +55,26 @@ static_assert(!std::is_copy_constructible_v<node>,
 static_assert(!std::is_copy_assignable_v<node>, "sirius::ast::node must be move-only.");
 static_assert(std::is_move_constructible_v<node>, "sirius::ast::node must be move-constructible.");
 static_assert(std::is_move_assignable_v<node>, "sirius::ast::node must be move-assignable.");
-static_assert(std::variant_size_v<node::variant_t> == 12,
-              "sirius::ast::node has exactly 12 alternatives.");
+static_assert(std::variant_size_v<node::variant_t> == 13,
+              "sirius::ast::node has exactly 13 alternatives.");
+static_assert(
+  std::is_same_v<std::variant_alternative_t<12, node::variant_t>, sirius::ast::gpu_function_call>,
+  "GPU UDF calls append to the variant without shifting existing alternatives.");
+static_assert(std::is_same_v<node::variant_t,
+                             std::variant<reference,
+                                          constant,
+                                          comparison,
+                                          conjunction,
+                                          between,
+                                          case_expr,
+                                          cast,
+                                          unary_op,
+                                          coalesce,
+                                          in_list,
+                                          function_call,
+                                          sirius::ast::aggregate,
+                                          sirius::ast::gpu_function_call>>,
+              "The published AST alternative indices must remain stable.");
 
 // ============================================================================
 // Per-node instantiation

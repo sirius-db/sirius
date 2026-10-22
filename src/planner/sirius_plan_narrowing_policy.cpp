@@ -247,7 +247,8 @@ void classify_expression(sirius::ast::node const& expr,
         for (auto const& child : alt.values) {
           classify_child(child, inputs, state);
         }
-      } else if constexpr (std::is_same_v<T, sirius::ast::function_call>) {
+      } else if constexpr (std::is_same_v<T, sirius::ast::function_call> ||
+                           std::is_same_v<T, sirius::ast::gpu_function_call>) {
         for (auto const& child : alt.arguments()) {
           classify_child(child, inputs, state);
         }

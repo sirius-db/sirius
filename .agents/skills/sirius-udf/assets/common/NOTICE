@@ -1,0 +1,6 @@
+Synthetic GPU UDF infrastructure example
+Copyright 2026, Sirius Contributors.
+
+The scaffold source is licensed under Apache License 2.0 (see LICENSE).
+It is independently authored and contains no customer UDF logic.
+Source introduced when adapting this project retains its own applicable license.

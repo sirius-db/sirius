@@ -12,6 +12,7 @@ target_sources(
           specializations/conjunction.cpp
           specializations/constant.cpp
           specializations/function.cpp
+          specializations/gpu_function.cpp
           specializations/narrow_domain.cpp
           specializations/operator.cpp
           specializations/reference.cpp)

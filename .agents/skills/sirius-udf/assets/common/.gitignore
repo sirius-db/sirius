@@ -1,0 +1,5 @@
+build/
+*.db
+*.db.wal
+results/
+__pycache__/

@@ -4,12 +4,12 @@ set(SIRIUS_TARGET
     sirius::sirius
     CACHE STRING "Installed Sirius target to link")
 if(SIRIUS_TARGET STREQUAL "sirius::sirius_static")
-  find_package(sirius REQUIRED CONFIG COMPONENTS static)
+  find_package(sirius REQUIRED CONFIG COMPONENTS static udf)
 else()
-  find_package(sirius REQUIRED CONFIG)
+  find_package(sirius REQUIRED CONFIG COMPONENTS udf)
 endif()
 add_executable(consumer main.cpp)
-target_link_libraries(consumer PRIVATE ${SIRIUS_TARGET})
+target_link_libraries(consumer PRIVATE ${SIRIUS_TARGET} sirius::udf_sdk)
 
 if(SIRIUS_TARGET STREQUAL "sirius::sirius_static")
   target_link_options(consumer PRIVATE -static-libgcc -static-libstdc++)

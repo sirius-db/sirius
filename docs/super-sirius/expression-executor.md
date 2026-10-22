@@ -100,7 +100,8 @@ struct node {
                                  coalesce,
                                  in_list,
                                  function_call,
-                                 aggregate>;
+                                 aggregate,
+                                 gpu_function_call>;
   variant_t v;
 };
 ```
@@ -121,6 +122,7 @@ The alternative order is part of the ABI: `std::variant` indexes by position and
 | `in_list` | `sirius::ast::in_list` | `x IN (1, 2, 3)` |
 | `function_call` | `sirius::ast::function_call` | Named function (`YEAR`, `UPPER`, `concat`, etc.) — `sirius::function_id` enum |
 | `aggregate` | `sirius::ast::aggregate` | Aggregate function (`SUM`, `COUNT`, etc.) — `sirius::aggregate_id` enum |
+| `gpu_function_call` | `sirius::ast::gpu_function_call` | Resolved native scalar UDF implementation and arguments |
 
 **Translation boundary:** `sirius::ast::from_duckdb(expr)` produces a `sirius::ast::node` from a `duckdb::Expression`. This happens once at plan time in the plan builders (and at the scan boundary for pushdown filters); the resulting node is owned by the operator and never re-translated.
 
@@ -135,6 +137,45 @@ The alternative order is part of the ABI: `std::variant` indexes by position and
 | `src/expression/function_id.hpp` | `sirius::function_id` closed enum of supported functions |
 | `src/expression/aggregate_id.hpp` | `sirius::aggregate_id` closed enum of supported aggregates |
 | `src/expression/join_condition.hpp` | `sirius::join_condition` — `{left, right, comparison}` with AST-node sides |
+
+## Native GPU Scalar Functions
+
+`<sirius/udf.hpp>` exposes paired CPU/GPU registration. The GPU binder receives
+the resolved DuckDB bound expression at plan time, can specialize constant
+arguments, and returns an immutable `gpu_scalar_function` or `nullptr` to decline
+GPU execution. Captures must own their configuration; execution does not retain
+DuckDB expression or catalog pointers. The function metadata is database-local,
+and binding identity is preserved through expression copies. Different fixed
+overloads may share a name; existing overloads are not replaced.
+The CPU definition's explicit schema is used, or `main` when unspecified; loader
+schema overrides do not change that choice. Named schemas must already exist.
+
+Native calls have their own appended AST alternative. The evaluator materializes
+arguments, broadcasts constants to the batch row count, and restores declared
+logical input types before calling the implementation. The callback receives
+borrowed `cudf::column_view`s, row count, task stream, and RMM memory resource and
+returns an owning column with the declared output type and row count. All device
+allocations and launches use those supplied resources. Callbacks must be pure,
+thread-safe, and usable concurrently on different devices.
+
+For DuckDB's default NULL handling, Sirius intersects input and output validity
+after execution, preserving NULLs introduced by the callback. Callbacks must still
+respect input validity when accessing values. With special NULL handling, the
+callback determines the entire output validity mask. Result shape and type are
+checked before the output enters the pipeline.
+
+Supported signatures use booleans, fixed-width integers through 64 bits, floats,
+strings, DATE, and the supported timestamp precisions. Zero-argument functions,
+variadic signatures, decimals, nested types, and preexisting custom CPU bind,
+resolve, serialization, or function metadata are rejected. Table-reading,
+stateful, and aggregate functions require separate execution contracts.
+
+Native calls materialize GPU temporaries at AST boundaries, so they compose with
+interpreted and JIT expressions. They are not lowered into standalone cuDF ASTs
+used for parquet pushdown or mixed-join residual predicates. Unsupported binding
+forms follow the existing planning fallback policy; ordinary native execution
+failures follow the existing runtime error and replay policy. No LLM participates
+in query execution.
 
 ## Execution Strategies
 

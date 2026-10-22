@@ -2315,6 +2315,48 @@ static void SiriusSetSessionLabelFunction(ClientContext& context,
   data.finished = true;
 }
 
+namespace {
+
+struct SiriusExecutionStatsState : GlobalTableFunctionState {
+  bool finished = false;
+};
+
+unique_ptr<FunctionData> SiriusExecutionStatsBind(ClientContext&,
+                                                  TableFunctionBindInput&,
+                                                  vector<LogicalType>& return_types,
+                                                  vector<Identifier>& names)
+{
+  return_types = {LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT};
+  names        = {"executions", "plan_fallbacks", "runtime_fallbacks"};
+  return nullptr;
+}
+
+unique_ptr<GlobalTableFunctionState> SiriusExecutionStatsInit(ClientContext&,
+                                                              TableFunctionInitInput&)
+{
+  return make_uniq<SiriusExecutionStatsState>();
+}
+
+void SiriusExecutionStatsFunction(ClientContext& context,
+                                  TableFunctionInput& input,
+                                  DataChunk& output)
+{
+  auto& state = input.global_state->Cast<SiriusExecutionStatsState>();
+  if (state.finished) { return; }
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) {
+    throw InvalidInputException("sirius_execution_stats requires Sirius on this connection");
+  }
+  auto const stats = sirius_ctx->get_transparent_execution_stats();
+  output.SetChildCardinality(1);
+  output.data[0].SetValue(0, Value::UBIGINT(stats.executions));
+  output.data[1].SetValue(0, Value::UBIGINT(stats.fallbacks));
+  output.data[2].SetValue(0, Value::UBIGINT(stats.runtime_fallbacks));
+  state.finished = true;
+}
+
+}  // namespace
+
 void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
 {
   // A fragment plan reads each of its input streams through sirius_stream_source(id). Register
@@ -2324,6 +2366,14 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
 
   auto transaction = CatalogTransaction::GetSystemTransaction(instance);
   auto& catalog    = Catalog::GetSystemCatalog(instance);
+
+  TableFunction execution_stats("sirius_execution_stats",
+                                {},
+                                SiriusExecutionStatsFunction,
+                                SiriusExecutionStatsBind,
+                                SiriusExecutionStatsInit);
+  CreateTableFunctionInfo execution_stats_info(execution_stats);
+  catalog.CreateTableFunction(transaction, execution_stats_info);
 
   TableFunction gpu_execution("gpu_execution",
                               {LogicalType::VARCHAR},

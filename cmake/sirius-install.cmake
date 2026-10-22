@@ -7,6 +7,29 @@ write_basic_package_version_file(
   VERSION "${PROJECT_VERSION}"
   COMPATIBILITY SameMinorVersion)
 
+# UDFs use DuckDB's C++ registration API. Ship the headers from the actual
+# provider build rather than picking up an unrelated system DuckDB installation.
+set(SIRIUS_UDF_DUCKDB_REVISION
+    ""
+    CACHE STRING "DuckDB source revision for the installed native UDF SDK")
+if(NOT SIRIUS_UDF_DUCKDB_REVISION AND EXISTS "${SIRIUS_DUCKDB_SOURCE_DIR}/.git")
+  execute_process(
+    COMMAND git -C "${SIRIUS_DUCKDB_SOURCE_DIR}" rev-parse HEAD
+    OUTPUT_VARIABLE SIRIUS_UDF_DUCKDB_REVISION
+    OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+endif()
+get_target_property(_sirius_udf_duckdb_definitions sirius_duckdb_dependency
+                    INTERFACE_COMPILE_DEFINITIONS)
+configure_file(cmake/sirius-udf-config.cmake.in
+               "${CMAKE_CURRENT_BINARY_DIR}/sirius-udf-config.cmake.in" @ONLY)
+# Resolve DuckDB's layout-changing definitions in the provider configuration,
+# not in the configuration chosen later by an installed consumer.
+file(
+  GENERATE
+  OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/sirius-udf-config-$<CONFIG>.cmake"
+  INPUT "${CMAKE_CURRENT_BINARY_DIR}/sirius-udf-config.cmake.in"
+  TARGET sirius_objects)
+
 install(
   DIRECTORY include/sirius
   DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
@@ -15,6 +38,33 @@ install(
   FILES "${CMAKE_CURRENT_BINARY_DIR}/sirius-config.cmake"
         "${CMAKE_CURRENT_BINARY_DIR}/sirius-config-version.cmake"
   DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/sirius"
+  COMPONENT sirius_library)
+install(
+  FILES "${CMAKE_CURRENT_BINARY_DIR}/sirius-udf-config-$<CONFIG>.cmake"
+  DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/sirius"
+  RENAME sirius-udf-config.cmake
+  COMPONENT sirius_library)
+install(
+  DIRECTORY "${SIRIUS_DUCKDB_SOURCE_DIR}/src/include/"
+  DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/sirius/duckdb"
+  COMPONENT sirius_library
+  FILES_MATCHING
+  PATTERN "*.h"
+  PATTERN "*.hpp")
+install(
+  DIRECTORY "${SIRIUS_DUCKDB_SOURCE_DIR}/third_party/fmt/include/"
+  DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/sirius/duckdb-fmt"
+  COMPONENT sirius_library
+  FILES_MATCHING
+  PATTERN "*.h"
+  PATTERN "*.hpp")
+install(
+  FILES "${SIRIUS_DUCKDB_SOURCE_DIR}/LICENSE"
+  DESTINATION "${CMAKE_INSTALL_DATADIR}/sirius/duckdb"
+  COMPONENT sirius_library)
+install(
+  FILES "${SIRIUS_DUCKDB_SOURCE_DIR}/third_party/fmt/LICENSE"
+  DESTINATION "${CMAKE_INSTALL_DATADIR}/sirius/duckdb-fmt"
   COMPONENT sirius_library)
 
 if(SIRIUS_BUILD_SHARED)
