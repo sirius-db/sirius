@@ -43,10 +43,10 @@ namespace sirius::temporal {
                                                         rmm::device_async_resource_ref mr);
 
 /**
- * Converts second, millisecond, or nanosecond timestamps to microseconds.
- * Preserves infinity and NULL; rounds nanoseconds to nearest with ties away from the epoch; throws
- * sirius::invalid_input_exception on finite overflow or unsupported input type.
- * The overflow check synchronizes the supplied stream to read its result.
+ * Converts second, millisecond, or nanosecond timestamps to microseconds. Preserves infinity and
+ * NULL; rounds nanoseconds to nearest with ties away from the epoch; throws
+ * `sirius::out_of_range_exception` on finite overflow and `sirius::invalid_input_exception` on
+ * unsupported input type. The overflow check synchronizes the supplied stream to read its result.
  */
 [[nodiscard]] std::unique_ptr<cudf::column> cast_to_microseconds_checked(
   cudf::column_view const& input, ::cuda::stream_ref stream, rmm::device_async_resource_ref mr);

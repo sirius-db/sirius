@@ -166,14 +166,17 @@ class CastDatePredicateFixture : public sirius::test::GpuExecutionFixture {
     REQUIRE(cpu_result->HasError());
     REQUIRE(cpu_result->GetError().find("Conversion Error") != std::string::npos);
 
-    run_ok("SET enable_duckdb_fallback = false;");
-    auto gpu_result = con->Query(query);
-    run_ok("SET enable_duckdb_fallback = true;");
+    auto const before = sirius::test::get_transparent_execution_stats(*con);
+    auto gpu_result   = con->Query(query);
+    auto const after  = sirius::test::get_transparent_execution_stats(*con);
     REQUIRE(gpu_result);
     REQUIRE(gpu_result->HasError());
     INFO(gpu_result->GetError());
+    REQUIRE(gpu_result->GetErrorType() == duckdb::ExceptionType::OUT_OF_RANGE);
+    REQUIRE(gpu_result->GetError().find("Out of Range Error") != std::string::npos);
     REQUIRE(gpu_result->GetError().find("DATE value is out of range for TIMESTAMP") !=
             std::string::npos);
+    sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1, 0);
   }
 
  private:

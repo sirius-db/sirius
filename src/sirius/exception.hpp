@@ -55,4 +55,15 @@ class invalid_input_exception : public std::runtime_error {
   }
 };
 
+class out_of_range_exception : public std::runtime_error {
+ public:
+  explicit out_of_range_exception(const std::string& msg) : std::runtime_error(msg) {}
+
+  template <typename... Args>
+  explicit out_of_range_exception(std::format_string<Args...> fmt, Args&&... args)
+    : std::runtime_error(std::format(fmt, std::forward<Args>(args)...))
+  {
+  }
+};
+
 }  // namespace sirius

@@ -466,9 +466,8 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
           }
         });
       if (cudf::contains(column, *lowest, _stream)) {
-        throw not_implemented_exception(
-          "[expression_evaluator:function] abs overflows for the smallest value of a signed "
-          "integer type, expected to fall back to CPU execution");
+        throw out_of_range_exception("Overflow on abs of signed integer minimum ({})",
+                                     cudf::type_to_name(column.type()));
       }
     }
     return evaluate_result(cudf::unary_operation(column, cudf::unary_operator::ABS, _stream, _mr));

@@ -1370,5 +1370,5 @@ TEST_CASE("native nested-loop semantic timestamp casts retain checked overflow",
     std::make_unique<sirius::ast::node>(sirius::ast::reference{0, seconds}), micros});
   f.nlj->conditions[0].right =
     std::make_unique<sirius::ast::node>(sirius::ast::reference{0, micros});
-  REQUIRE_THROWS_AS(execute_projected_nlj(*f.nlj, left, right), sirius::invalid_input_exception);
+  REQUIRE_THROWS_AS(execute_projected_nlj(*f.nlj, left, right), sirius::out_of_range_exception);
 }

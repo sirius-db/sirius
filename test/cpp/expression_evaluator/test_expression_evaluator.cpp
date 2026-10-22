@@ -3248,7 +3248,7 @@ TEST_CASE("timestamp casts check microsecond overflow", "[expression_evaluator][
   {
     for (auto ticks : {min / scale - 1, max / scale + 1, min, -max + 1, max - 1}) {
       CAPTURE(ticks);
-      REQUIRE_THROWS_AS(run({0, ticks, max}), sirius::invalid_input_exception);
+      REQUIRE_THROWS_AS(run({0, ticks, max}), sirius::out_of_range_exception);
     }
   }
   SECTION("null payloads do not cause overflow")
@@ -3261,6 +3261,75 @@ TEST_CASE("timestamp casts check microsecond overflow", "[expression_evaluator][
     auto out = run({});
     CHECK(out->num_rows() == 0);
   }
+}
+
+TEST_CASE("DATE to TIMESTAMP casts check overflow with out_of_range_exception",
+          "[expression_evaluator][timestamp_bounds]")
+{
+  auto* space         = get_default_gpu_space();
+  auto const strategy = GENERATE(MAT, exp_strategy_enum::AST_INTERPRET, exp_strategy_enum::AST_JIT);
+  auto const target   = GENERATE(sirius::type_id::TIMESTAMP_SEC,
+                               sirius::type_id::TIMESTAMP_MS,
+                               sirius::type_id::TIMESTAMP,
+                               sirius::type_id::TIMESTAMP_NS);
+  auto const date_type   = sirius::logical_type::make(sirius::type_id::DATE);
+  auto const target_type = sirius::logical_type::make(target);
+  auto expr     = sirius::ast::node{sirius::ast::cast{make_ref_typed(0, date_type), target_type}};
+  auto try_expr = sirius::ast::node{
+    sirius::ast::cast{make_ref_typed(0, date_type), target_type, /*try_cast=*/true}};
+  auto stream = cudf::get_default_stream();
+  auto mr     = get_resource_ref(*space);
+
+  // Year ~300000 exceeds the microsecond-intermediate day limit (106751991 days) and the
+  // nanosecond day limit (106751 days).
+  int32_t const out_of_range_day = 110'000'000;
+  auto col                       = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, 2, cudf::mask_state::UNALLOCATED, stream, mr);
+  std::vector<int32_t> days = {0, out_of_range_day};
+  REQUIRE(cudaMemcpy(col->mutable_view().data<int32_t>(),
+                     days.data(),
+                     days.size() * sizeof(int32_t),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  auto view = cudf::bit_cast(col->view(), cudf::data_type{cudf::type_id::TIMESTAMP_DAYS});
+
+  REQUIRE_THROWS_AS(run_native_ast(*space, &expr, cudf::table_view{{view}}, strategy),
+                    sirius::out_of_range_exception);
+
+  auto try_out = run_native_ast(*space, &try_expr, cudf::table_view{{view}}, strategy);
+  REQUIRE(try_out->view().column(0).null_count() == 1);
+}
+
+TEST_CASE("abs on signed integer minimum throws out_of_range_exception",
+          "[expression_evaluator][abs]")
+{
+  auto* space         = get_default_gpu_space();
+  auto const strategy = GENERATE(MAT, exp_strategy_enum::AST_INTERPRET, exp_strategy_enum::AST_JIT);
+  auto stream         = cudf::get_default_stream();
+  auto mr             = get_resource_ref(*space);
+
+  auto check_signed_min = [&]<typename T>(sirius::type_id logical_id, cudf::type_id physical_id) {
+    auto const type = sirius::logical_type::make(logical_id);
+    std::vector<std::unique_ptr<sirius::ast::node>> args;
+    args.push_back(make_ref_typed(0, type));
+    auto expr = sirius::ast::node{
+      sirius::ast::function_call{sirius::function_id::abs, std::move(args), type}};
+
+    auto col = cudf::make_numeric_column(
+      cudf::data_type{physical_id}, 2, cudf::mask_state::UNALLOCATED, stream, mr);
+    std::vector<T> values = {T{-5}, std::numeric_limits<T>::lowest()};
+    REQUIRE(cudaMemcpy(col->mutable_view().data<T>(),
+                       values.data(),
+                       values.size() * sizeof(T),
+                       cudaMemcpyHostToDevice) == cudaSuccess);
+
+    REQUIRE_THROWS_AS(run_native_ast(*space, &expr, cudf::table_view{{col->view()}}, strategy),
+                      sirius::out_of_range_exception);
+  };
+
+  check_signed_min.template operator()<int8_t>(sirius::type_id::TINYINT, cudf::type_id::INT8);
+  check_signed_min.template operator()<int16_t>(sirius::type_id::SMALLINT, cudf::type_id::INT16);
+  check_signed_min.template operator()<int32_t>(sirius::type_id::INTEGER, cudf::type_id::INT32);
+  check_signed_min.template operator()<int64_t>(sirius::type_id::BIGINT, cudf::type_id::INT64);
 }
 
 TEST_CASE("subsecond extraction preserves minimum finite ticks",

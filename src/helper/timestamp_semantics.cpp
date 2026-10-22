@@ -97,8 +97,8 @@ std::unique_ptr<cudf::column> cast_to_microseconds_checked(cudf::column_view con
                                      mr);
     auto const& invalid = static_cast<cudf::numeric_scalar<bool> const&>(*any_overflow);
     if (invalid.is_valid(stream) && invalid.value(stream)) {
-      throw invalid_input_exception("Could not convert Timestamp({}) to Timestamp(US)",
-                                    source_type == cudf::type_id::TIMESTAMP_SECONDS ? "S" : "MS");
+      throw out_of_range_exception("Could not convert Timestamp({}) to Timestamp(US)",
+                                   source_type == cudf::type_id::TIMESTAMP_SECONDS ? "S" : "MS");
     }
   }
   cudf::numeric_scalar<int64_t> factor(nanos ? scale / 2 : scale, true, stream, mr);
