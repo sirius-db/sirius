@@ -674,7 +674,9 @@ static bool can_use_perfect_hash_aggregate(duckdb::ClientContext& context,
 
 /// cuDF does not support HUGEINT (int128). DuckDB widens aggregates like sum(int32) to HUGEINT
 /// to avoid overflow. We downcast to BIGINT at the plan level so all downstream operators
-/// (including the result collector) use the correct type.
+/// (including the result collector) use the correct type. The aggregate operators still sum
+/// such inputs without wrapping (op::is_wide_integer_sum): over DECIMAL128 where INT64 could
+/// overflow, and a SUM whose total does not fit BIGINT falls back to DuckDB at runtime.
 static void downcast_hugeint_types(duckdb::vector<duckdb::LogicalType>& types,
                                    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>& exprs)
 {
@@ -745,7 +747,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_grouping_sets_aggr
                          op.estimated_cardinality);
 }
 
-/// Whether plan-time statistics may decide decimal SUM widening
+/// Whether plan-time statistics may decide decimal and wide integer SUM widening
 /// (sirius.operator_params.enable_decimal_sum_stats_bound); on without a Sirius context.
 bool decimal_sum_stats_bound_enabled(duckdb::ClientContext& context)
 {
@@ -809,7 +811,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
 
   // Resolved before the child is planned: planning moves expressions out of the logical subtree.
   auto const decimal_sum_bounds = decimal_sum_stats_bound_enabled(context)
-                                    ? resolve_decimal_sum_input_bounds(context, op)
+                                    ? resolve_sum_input_bounds(context, op)
                                     : std::vector<std::optional<std::uint64_t>>{};
 
   auto plan = create_plan(*op.children[0]);

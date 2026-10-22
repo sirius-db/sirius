@@ -586,6 +586,33 @@ class sirius_physical_operator {
     _physical_types = std::move(schema);
   }
 
+  //! Return the optional per-column alternate carriers. A column with an entry may arrive, batch
+  //! by batch, in either its expected carrier or this one. Empty means no column has one.
+  [[nodiscard]] const std::vector<std::optional<cudf::data_type>>& get_alternate_physical_types()
+    const noexcept
+  {
+    return _alternate_physical_types;
+  }
+
+  //! Whether @p type is the alternate carrier recorded for output column @p column.
+  [[nodiscard]] bool is_alternate_physical_type(std::size_t column,
+                                                cudf::data_type type) const noexcept
+  {
+    return column < _alternate_physical_types.size() && _alternate_physical_types[column] == type;
+  }
+
+  //! Install the per-column alternate carriers, one entry per logical column, or none.
+  void set_alternate_physical_types(std::vector<std::optional<cudf::data_type>> schema)
+  {
+    if (!schema.empty() && schema.size() != types.size()) {
+      throw internal_exception(
+        "alternate physical schema width {} does not match logical schema width {}",
+        schema.size(),
+        types.size());
+    }
+    _alternate_physical_types = std::move(schema);
+  }
+
   //! Get the unique operator ID.
   //! Throws if the plan was not numbered by `pipeline::assign_operator_ids`. An unassigned
   //! id would otherwise silently collide in the operator-id-keyed maps (repositories,
@@ -923,6 +950,9 @@ class sirius_physical_operator {
   //! about their logical type. Private so the complete-or-absent invariant enforced by
   //! set_physical_types() cannot be bypassed by direct assignment.
   std::vector<cudf::data_type> _physical_types;
+  //! Optional second carrier per output column, for columns whose carrier varies between batches
+  //! (a wide integer SUM's partials are INT64 or DECIMAL128). See set_alternate_physical_types().
+  std::vector<std::optional<cudf::data_type>> _alternate_physical_types;
 
   //! See `deferred_output()` / `port_directive()`. Private and written through one friend, so
   //! the two halves cannot be installed apart.

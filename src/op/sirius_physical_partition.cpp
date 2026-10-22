@@ -205,8 +205,10 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
         std::min<std::size_t>(static_cast<std::size_t>(view.num_columns()), types.size());
       uint64_t narrow_columns = 0;
       for (std::size_t column_idx = 0; column_idx < width; ++column_idx) {
-        if (view.column(static_cast<cudf::size_type>(column_idx)).type() !=
-            sirius::require_cudf_type(types[column_idx])) {
+        auto const actual = view.column(static_cast<cudf::size_type>(column_idx)).type();
+        // An alternate carrier (a widened SUM partial) is wider, not narrow.
+        if (actual != sirius::require_cudf_type(types[column_idx]) &&
+            !is_alternate_physical_type(column_idx, actual)) {
           ++narrow_columns;
         }
       }

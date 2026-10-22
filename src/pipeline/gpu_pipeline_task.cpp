@@ -94,7 +94,8 @@ void validate_operator_output_types(const op::operator_data* data,
                                         ? sirius::require_cudf_type(expected_types[c])
                                         : physical_types[static_cast<std::size_t>(c)];
       cudf::data_type actual        = tbl.column(c).type();
-      if (actual != expected_cudf) {
+      if (actual != expected_cudf &&
+          !op.is_alternate_physical_type(static_cast<std::size_t>(c), actual)) {
         SIRIUS_LOG_WARN(
           "gpu_pipeline_task: operator '{}' (id={}) output batch {} column {} datatype "
           "mismatch: got {}, expected {}",
