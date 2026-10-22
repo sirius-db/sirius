@@ -42,10 +42,7 @@ detail::batched_codec_ops const& ans_ops()
     nvcompBatchedANSDecompressOpts_t dopts = nvcompBatchedANSDecompressDefaultOpts;
 
     detail::batched_codec_ops o;
-    o.chunk_size = kAnsManagerChunkSize;
-#if NVCOMP_VER_MAJOR >= 6
-    o.frame_format_version = 6;
-#endif
+    o.chunk_size             = kAnsManagerChunkSize;
     o.compress_get_temp_size = [copts](
                                  size_t nc, size_t mc, size_t* tb, size_t mt, cudaStream_t stream) {
       return SIMPATICO_NVCOMP_GET_TEMP_SIZE(
@@ -91,6 +88,7 @@ detail::batched_codec_ops const& ans_ops()
 
 std::unique_ptr<cudf::column> ans_compressed_representation::decompress(decode_frame& frame) const
 {
+  detail::require_nvcomp_payload_format("ans", payload_format);
   return detail::nvcomp_decompress_impl(
     ans_ops(), payload_data(), payload_size(), original_type, num_rows, frame);
 }

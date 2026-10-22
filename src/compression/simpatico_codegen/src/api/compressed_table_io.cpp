@@ -10,6 +10,7 @@
 #include "codegen/plan/representation.hpp"
 #include "codegen/util/nvtx.hpp"
 #include "util/host_observation.hpp"
+#include "util/nvcomp_payload_format.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -21,8 +22,6 @@
 #include <rmm/mr/per_device_resource.hpp>
 
 #include <cuda_runtime.h>
-
-#include <nvcomp/version.h>
 
 #include <algorithm>
 #include <array>
@@ -122,6 +121,7 @@ static void push_meta(std::vector<std::uint8_t>& v, leaf_meta_v const& m)
       push_le(v, META_ANS);
       push_le(v, a.uncompressed_size);
       push_le(v, a.original_type_id);
+      push_le(v, a.payload_format);
     }
     void operator()(leaf_meta::bitcomp const& b)
     {
@@ -138,6 +138,7 @@ static void push_meta(std::vector<std::uint8_t>& v, leaf_meta_v const& m)
       push_le(v, c.num_deltas);
       push_le(v, c.num_RLEs);
       push_le(v, c.use_bp);
+      push_le(v, c.payload_format);
     }
     void operator()(leaf_meta::snappy const& s)
     {
@@ -175,7 +176,9 @@ static bool read_meta(Reader& r, leaf_meta_v& out)
     }
     case META_ANS: {
       leaf_meta::ans a;
-      if (!r.read_le(a.uncompressed_size) || !r.read_le(a.original_type_id)) return false;
+      if (!r.read_le(a.uncompressed_size) || !r.read_le(a.original_type_id) ||
+          !r.read_le(a.payload_format))
+        return false;
       out = a;
       return true;
     }
@@ -190,10 +193,11 @@ static bool read_meta(Reader& r, leaf_meta_v& out)
     case META_CASCADED: {
       std::uint64_t us;
       std::int32_t ti, num_deltas, nr, bp;
+      std::uint8_t payload_format;
       if (!r.read_le(us) || !r.read_le(ti) || !r.read_le(num_deltas) || !r.read_le(nr) ||
-          !r.read_le(bp))
+          !r.read_le(bp) || !r.read_le(payload_format))
         return false;
-      out = leaf_meta::nvcomp_cascaded{us, ti, num_deltas, nr, bp};
+      out = leaf_meta::nvcomp_cascaded{us, ti, num_deltas, nr, bp, payload_format};
       return true;
     }
     case META_SNAPPY: {
@@ -261,11 +265,13 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
   auto make_col = [&](std::size_t i) -> std::unique_ptr<cudf::column> {
     auto const& bd     = bufs[i];
     cudf::data_type dt = tag_to_dtype(bd.type_tag);
-    auto col           = cudf::make_numeric_column(dt,
-                                         static_cast<cudf::size_type>(bd.num_rows),
-                                         cudf::mask_state::UNALLOCATED,
-                                         stream,
-                                         leaf_mr);
+    // Fixed-width, not numeric: an identity leaf keeps its column's type, which may
+    // be a decimal or chrono type that make_numeric_column rejects.
+    auto col = cudf::make_fixed_width_column(dt,
+                                             static_cast<cudf::size_type>(bd.num_rows),
+                                             cudf::mask_state::UNALLOCATED,
+                                             stream,
+                                             leaf_mr);
     if (bd.size_bytes > 0) {
       fill(i, col->mutable_view().head<void>(), static_cast<std::size_t>(bd.size_bytes), stream);
     }
@@ -320,7 +326,10 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
     std::string(cname), names, std::move(cols), stream, mr, err, ld.meta);
 }
 
-// Payload layout identifier. Advance when the meaning of serialized bytes changes.
+// Payload layout identifier. A reader accepts only an exact match (parse_hpln_header),
+// so this must advance whenever the meaning of the serialized bytes changes — including
+// changes that keep every field in place but reinterpret one, which no structural check
+// downstream could catch.
 //
 // 11: a Bitpack "packed" buffer counts its decode gather guard words in num_rows, so the
 //     stored word count is what the reader allocates and the guard needs no read-side
@@ -328,11 +337,14 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
 //
 // 12: a per-column validity sidecar record sits beside each column's plan tree (see
 //     push_validity), so a nullable column compresses instead of falling back.
-static constexpr std::uint8_t kVersion = 12;
-#if NVCOMP_VER_MAJOR >= 6
-// 13: ANS payloads use nvCOMP 6's incompatible chunk format.
-static constexpr std::uint8_t kAns6Version = 13;
-#endif
+//
+// 13: a Bitpack "packed" buffer carries five decode guard words rather than three,
+//     because the 128-bit gather spans five uint32 words. The count is part of the
+//     buffer's num_rows, so a v12 payload read with a v13 decoder would over-read.
+//
+// 14: ANS and Cascaded leaf metadata explicitly records the nvCOMP payload format.
+//     File layout and codec compatibility can now evolve independently.
+static constexpr std::uint8_t kVersion = 14;
 
 // Per-column validity record, written right after num_rows:
 //
@@ -499,12 +511,7 @@ static bool parse_hpln_header(Reader& r, std::vector<ColRecord>& out, std::strin
     return bad("not a HPLN file");
   std::uint8_t ver;
   if (!r.read_le(ver)) return bad("truncated header");
-#if NVCOMP_VER_MAJOR >= 6
-  bool const supported_version = ver == kVersion || ver == kAns6Version;
-#else
-  bool const supported_version = ver == kVersion;
-#endif
-  if (!supported_version)
+  if (ver != kVersion)
     return bad("unsupported version " + std::to_string(ver) + " (expected " +
                std::to_string(kVersion) + ")");
 
@@ -558,14 +565,15 @@ static bool parse_hpln_header(Reader& r, std::vector<ColRecord>& out, std::strin
       if (!r.read_le(ld.type_tag)) return bad("truncated leaf type_tag");
       if (!r.read_le(ld.num_rows)) return bad("truncated leaf num_rows");
       if (!read_meta(r, ld.meta)) return bad("truncated/unknown leaf meta");
-#if NVCOMP_VER_MAJOR >= 6
-      auto const* ans_meta = std::get_if<leaf_meta::ans>(&ld.meta);
-      if (ver == kVersion && ans_meta && (ld.num_rows != 0 || ans_meta->uncompressed_size != 0))
-        return bad("ANS payload requires nvCOMP 5");
-      auto const* cascaded_meta = std::get_if<leaf_meta::nvcomp_cascaded>(&ld.meta);
-      if (cascaded_meta && (ld.num_rows != 0 || cascaded_meta->uncompressed_size != 0))
-        return bad("Cascaded payload requires nvCOMP 5");
-#endif
+      if (auto const* meta = std::get_if<leaf_meta::ans>(&ld.meta)) {
+        auto const error = detail::nvcomp_payload_compatibility_error("ans", meta->payload_format);
+        if (!error.empty()) return bad(error);
+      }
+      if (auto const* meta = std::get_if<leaf_meta::nvcomp_cascaded>(&ld.meta)) {
+        auto const error =
+          detail::nvcomp_payload_compatibility_error("nvcomp_cascaded", meta->payload_format);
+        if (!error.empty()) return bad(error);
+      }
 
       std::uint8_t nb;
       if (!r.read_le(nb)) return bad("truncated num_bufs");
@@ -920,15 +928,6 @@ std::string build_compressed_table_header(compressed_table const& table,
   nvtx_scoped_range nvtx_range{"simpatico::io::build_header"};
   auto const all_descs = table.describe(stream);
 
-  std::uint8_t version = kVersion;
-#if NVCOMP_VER_MAJOR >= 6
-  for (auto const& descs : all_descs) {
-    for (auto const& ld : descs) {
-      if (std::holds_alternative<leaf_meta::ans>(ld.meta)) version = kAns6Version;
-    }
-  }
-#endif
-
   out_header.clear();
   out_buffers.clear();
 
@@ -937,7 +936,7 @@ std::string build_compressed_table_header(compressed_table const& table,
   hdr.push_back('P');
   hdr.push_back('L');
   hdr.push_back('N');
-  push_le(hdr, version);
+  push_le(hdr, kVersion);
   push_le(hdr, static_cast<std::uint16_t>(table.columns.size()));
 
   std::uint64_t payload_offset = 0;

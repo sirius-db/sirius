@@ -53,6 +53,7 @@
 #include <catch.hpp>
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <cucascade/memory/null_device_memory_resource.hpp>
 #include <data/data_batch_utils.hpp>
 #include <op/dynamic_filter/detail/accumulated_bloom_builder.hpp>
 #include <op/dynamic_filter/detail/accumulation_failure.hpp>
@@ -2986,11 +2987,21 @@ class any_device_filter final : public sirius_dynamic_filter,
   std::shared_ptr<sirius::op::sirius_dynamic_in_list_filter> _inner;
 };
 
+/// Host memory space whose ID names @p device_id, so a batch placed in it reports that device while
+/// its table stays on the current one. It reserves no memory.
+std::unique_ptr<cucascade::memory::memory_space> make_space_naming_device(int device_id)
+{
+  return std::make_unique<cucascade::memory::memory_space>(
+    cucascade::memory::host_memory_space_config{
+      .numa_id = device_id, .initial_number_pools = 0, .mr_factory_fn = [](int, std::size_t) {
+        return ::cuda::mr::any_resource<::cuda::mr::device_accessible>{
+          cucascade::memory::null_device_memory_resource{}};
+      }});
+}
 }  // namespace
 
-TEST_CASE(
-  "consumer passes a program prepared for another device through without filtering or claims",
-  "[dynamic_filter][scan_merge][consumer_device]")
+TEST_CASE("consumer passes mismatched device inputs through without filtering or claims",
+          "[dynamic_filter][scan_merge][consumer_device]")
 {
   ::cuda::stream_ref stream                = cudf::get_default_stream();
   std::shared_ptr<cudf::table const> input = make_int64_sequence_table(10, stream);
@@ -3026,11 +3037,30 @@ TEST_CASE(
     REQUIRE(stats.snapshot().applications_skipped_other_device == 1);
   };
 
-  // The bare table has no memory space, so only the program names the other device.
-  auto program = prepare_identity(consumer, input->view(), std::nullopt, other_device);
-  REQUIRE(program.has_value());
-  require_passed_through(
-    consumer_test_access::apply(consumer, std::move(*program), input, stream, mr));
+  SECTION("the batch's memory space names another device")
+  {
+    // The program is prepared for the current device, so only the batch's memory space differs.
+    auto const space = make_space_naming_device(other_device);
+    // This synthetic space cannot own the current device's writer stream. Keep the real table
+    // alive through a view with an unknown writer; the consumer must decline before GPU access.
+    auto representation = std::make_unique<cucascade::gpu_table_representation>(
+      input->view(), input, input->alloc_size(), *space, ::cuda::stream_ref{cudaStream_t{nullptr}});
+    auto batch =
+      cucascade::data_batch::make(sirius::get_next_batch_id(), std::move(representation));
+    auto program = prepare_identity(consumer, input->view());
+    REQUIRE(program.has_value());
+    auto source = batch->to_read_only();
+    require_passed_through(
+      consumer_test_access::apply(consumer, std::move(*program), std::move(source), stream, mr));
+  }
+  SECTION("the program was prepared for another device")
+  {
+    // The bare table has no memory space, so only the program names the other device.
+    auto program = prepare_identity(consumer, input->view(), std::nullopt, other_device);
+    REQUIRE(program.has_value());
+    require_passed_through(
+      consumer_test_access::apply(consumer, std::move(*program), input, stream, mr));
+  }
 
   // The same batch on the current device filters, so the filter itself is not what declined.
   auto batch = batch_for(*gpu_space);

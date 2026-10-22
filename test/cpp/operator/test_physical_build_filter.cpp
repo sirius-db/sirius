@@ -256,18 +256,33 @@ TEST_CASE("a build filter scratch bound covers peer reduction",
   REQUIRE(fixture.possible_rows(0, second, 1) == 300);
 }
 
+// The probe partition sizes a right-family join. Give it an empty, finished input.
+void add_finished_probe_input(op::sirius_physical_partition& probe,
+                              cucascade::shared_data_repository& repository)
+{
+  auto input          = std::make_unique<op::sirius_physical_operator::port>();
+  input->type         = op::MemoryBarrierType::FULL;
+  input->repo         = &repository;
+  input->src_pipeline = std::make_shared<util::controllable_pipeline>(true);
+  probe.add_port("default", std::move(input));
+}
+
 TEST_CASE("right-family build partition finishes filter publication before requesting probe sizing",
           "[dynamic_filter][build_filter][scheduling]")
 {
-  auto tree        = util::make_partitioned_join({.join_type = duckdb::JoinType::RIGHT_SEMI});
-  auto& build      = *tree.build_partition;
+  auto tree   = util::make_partitioned_join({.join_type = duckdb::JoinType::RIGHT_SEMI});
+  auto& build = *tree.build_partition;
+  // No pipelines exist here, so number the operators the exchange reads.
+  tree.join->operator_id            = 0;
+  build.operator_id                 = 1;
+  tree.probe_partition->operator_id = 2;
+  cucascade::shared_data_repository probe_repository;
+  add_finished_probe_input(*tree.probe_partition, probe_repository);
   auto publication = duckdb::make_uniq<op::sirius_physical_build_filter>(
     build.types, 100, tree.join->dynamic_filter_session());
   auto* const publication_ptr = publication.get();
   publication->children.push_back(std::move(build.children.front()));
   build.children.front() = std::move(publication);
-  build.set_sibling_partition_op(tree.probe_partition);
-  build.set_drives_partition_count(false);
 
   auto source = std::make_shared<util::controllable_pipeline>(false);
   sirius::pipeline::sirius_pipeline_build_state state;
@@ -292,15 +307,19 @@ TEST_CASE("an empty build filter pipeline finishes without tasks and releases it
 {
   auto const join_type =
     GENERATE(duckdb::JoinType::RIGHT, duckdb::JoinType::RIGHT_SEMI, duckdb::JoinType::RIGHT_ANTI);
-  auto tree        = util::make_partitioned_join({.join_type = join_type});
-  auto& build      = *tree.build_partition;
+  auto tree   = util::make_partitioned_join({.join_type = join_type});
+  auto& build = *tree.build_partition;
+  // No pipelines exist here, so number the operators the exchange reads.
+  tree.join->operator_id            = 0;
+  build.operator_id                 = 1;
+  tree.probe_partition->operator_id = 2;
+  cucascade::shared_data_repository probe_repository;
+  add_finished_probe_input(*tree.probe_partition, probe_repository);
   auto publication = duckdb::make_uniq<op::sirius_physical_build_filter>(
     build.types, 0, tree.join->dynamic_filter_session());
   auto* const publication_ptr = publication.get();
   publication->children.push_back(std::move(build.children.front()));
   build.children.front() = std::move(publication);
-  build.set_sibling_partition_op(tree.probe_partition);
-  build.set_drives_partition_count(false);
 
   sirius::pipeline::sirius_pipeline_build_state state;
   auto upstream = std::make_shared<util::controllable_pipeline>(false);

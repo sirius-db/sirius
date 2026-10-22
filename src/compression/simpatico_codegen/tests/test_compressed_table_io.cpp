@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Tests for write_compressed_table / read_compressed_table (.hpln v6).
+// Tests for write_compressed_table / read_compressed_table (.hpln v14).
 //
 // Each test_* function throws std::runtime_error on failure; main() catches and
 // reports.  Tests are intentionally independent so a failure in one does not
@@ -10,6 +10,8 @@
 #include "api/simpatico_codegen.hpp"
 #include "codegen/jit/nvrtc_compiler.hpp"
 #include "codegen/plan/leaf_desc.hpp"
+#include "codegen/plan/plan_interpreter.hpp"
+#include "codegen/plan/representation.hpp"
 #include "codegen/plan/validity.hpp"
 #include "test_utils.hpp"
 
@@ -99,28 +101,12 @@ void io_roundtrip(char const* label,
   expect(ct2.columns.size() == ct1.columns.size(),
          (std::string(label) + ": read column count").c_str());
 
-  if (dsl.find("-> ans") != std::string::npos) {
-    std::fstream file(tmp.path, std::ios::binary | std::ios::in | std::ios::out);
+  {
+    std::ifstream file(tmp.path, std::ios::binary);
     file.seekg(4);
     char version = 0;
     file.read(&version, 1);
-    expect(version == (NVCOMP_VER_MAJOR >= 6 ? 13 : 12), "ANS file version");
-#if NVCOMP_VER_MAJOR >= 6
-    version = 12;
-    file.seekp(4);
-    file.write(&version, 1);
-    file.close();
-    std::string old_err;
-    auto old = simpatico::read_compressed_table(
-      tmp.path, stream, rmm::mr::get_current_device_resource_ref(), &old_err);
-    expect(
-      old.columns.empty() && old_err.find("ANS payload requires nvCOMP 5") != std::string::npos,
-      "nvCOMP 5 ANS payload must be rejected by nvCOMP 6");
-    std::fstream restore(tmp.path, std::ios::binary | std::ios::in | std::ios::out);
-    version = 13;
-    restore.seekp(4);
-    restore.write(&version, 1);
-#endif
+    expect(version == 14, "file version is independent of codec and nvCOMP build");
   }
 
   // Metadata survives.
@@ -152,31 +138,26 @@ void io_roundtrip(char const* label,
     expect(columns_equal_any(input.column(i), out->view().column(i), stream),
            (std::string(label) + ": data mismatch col " + std::to_string(i)).c_str());
 
-  if (std::string_view(label) == "ans_only") {
-    std::vector<std::uint8_t> header;
-    std::vector<simpatico::payload_buffer_ref> buffers;
-    std::uint64_t payload_bytes = 0;
-    auto const err =
-      simpatico::build_compressed_table_header(ct1, header, buffers, payload_bytes, stream);
-    expect(err.empty() && buffers.size() == 1, "ANS frame layout");
-    std::fstream file(tmp.path, std::ios::binary | std::ios::in | std::ios::out);
-    file.seekp(static_cast<std::streamoff>(header.size() + buffers[0].offset + 15));
-    char marker = NVCOMP_VER_MAJOR >= 6 ? 0 : 6;
-    file.write(&marker, 1);
-    file.close();
-
-    std::string read_err;
-    auto changed = simpatico::read_compressed_table(
-      tmp.path, stream, rmm::mr::get_current_device_resource_ref(), &read_err);
-    expect(read_err.empty(), "ANS frame with mismatched marker loads");
-    bool rejected = false;
-    try {
-      (void)simpatico::decompress(changed, stream, rmm::mr::get_current_device_resource_ref());
-    } catch (std::runtime_error const& e) {
-      rejected =
-        std::string_view(e.what()).find("incompatible frame format") != std::string_view::npos;
+  // Codec format identifiers survive reconstruction and re-description.
+  auto const before = ct1.describe(stream);
+  auto const after  = ct2.describe(stream);
+  for (std::size_t ci = 0; ci < before.size(); ++ci) {
+    for (std::size_t li = 0; li < before[ci].size(); ++li) {
+      auto const& a = before[ci][li].meta;
+      auto const& b = after[ci][li].meta;
+      if (auto const* meta = std::get_if<simpatico::leaf_meta::ans>(&a)) {
+        auto const* restored = std::get_if<simpatico::leaf_meta::ans>(&b);
+        expect(restored && restored->payload_format == meta->payload_format &&
+                 restored->payload_format == (NVCOMP_VER_MAJOR >= 6 ? 6 : 5),
+               "ANS payload format survives reconstruction");
+      }
+      if (auto const* meta = std::get_if<simpatico::leaf_meta::nvcomp_cascaded>(&a)) {
+        auto const* restored = std::get_if<simpatico::leaf_meta::nvcomp_cascaded>(&b);
+        expect(restored && restored->payload_format == meta->payload_format &&
+                 restored->payload_format == 5,
+               "Cascaded payload format survives reconstruction");
+      }
     }
-    expect(rejected, "ANS frame with mismatched marker must be rejected");
   }
 }
 
@@ -325,6 +306,9 @@ void test_zigzag()
 {
   auto t = make_int32_table(1, 4096, 113);
   io_roundtrip("ans_only", t->view(), "input -> ans\n");
+#if NVCOMP_VER_MAJOR < 6
+  io_roundtrip("cascaded_only", t->view(), "input -> nvcomp_cascaded\n");
+#endif
   io_roundtrip("zigzag_terminal",
                t->view(),
                "input -> delta -> differences\n"
@@ -731,19 +715,144 @@ void test_error_bad_magic()
   expect(!err.empty(), "error_bad_magic: expected non-empty error");
 }
 
+// Malformed/incompatible codec metadata must be rejected while parsing, before
+// payload allocation/fetch or a codec call. Construct only the header prefix
+// through the format byte: parsing an accepted format would hit a truncated
+// buffer count instead, which must not satisfy these assertions.
+void test_nvcomp_payload_compatibility()
+{
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = rmm::mr::get_current_device_resource_ref();
+  for (bool cascaded : {false, true}) {
+    for (std::uint8_t format :
+         {std::uint8_t{0}, std::uint8_t{5}, std::uint8_t{6}, std::uint8_t{255}}) {
+      bool const matches     = format == (NVCOMP_VER_MAJOR >= 6 ? 6 : 5);
+      bool const unavailable = cascaded && NVCOMP_VER_MAJOR >= 6;
+      if (matches && !unavailable) continue;
+      std::vector<std::uint8_t> header{'H', 'P', 'L', 'N', 14};
+      auto append = [&](std::uint64_t value, int bytes) {
+        for (int i = 0; i < bytes; ++i)
+          header.push_back(static_cast<std::uint8_t>(value >> (8 * i)));
+      };
+      append(1, 2);  // columns
+      append(0, 2);  // name length
+      append(static_cast<std::uint8_t>(cudf::type_id::INT32), 1);
+      append(0, 4);           // scale
+      append(1, 8);           // rows
+      append(0, 1);           // all-valid
+      append(0, 2);           // nodes
+      append(1, 2);           // leaves
+      append(0, 4);           // node index
+      append(0xffffffff, 4);  // own representation
+      append(static_cast<std::uint8_t>(cascaded ? simpatico::OpId::NvcompCascaded
+                                                : simpatico::OpId::Ans),
+             1);
+      append(static_cast<std::uint8_t>(cudf::type_id::INT32), 1);
+      append(1, 8);                 // leaf rows
+      append(cascaded ? 4 : 2, 1);  // metadata kind
+      append(4, 8);                 // uncompressed bytes
+      append(static_cast<std::int32_t>(cudf::type_id::INT32), 4);
+      if (cascaded) {
+        append(1, 4);  // deltas
+        append(2, 4);  // RLEs
+        append(1, 4);  // bitpack
+      }
+      append(format, 1);
+      bool fetched = false;
+      std::string error;
+      auto result = simpatico::read_compressed_table_from_memory(
+        header,
+        [&](std::uint64_t, std::size_t, void*, ::cuda::stream_ref) { fetched = true; },
+        stream,
+        mr,
+        &error);
+      expect(result.columns.empty() && !fetched,
+             "incompatible codec rejected before payload fetch");
+      auto const expected = matches ? "unavailable with nvCOMP 6" : "incompatible payload format";
+      expect(error.find(expected) != std::string::npos, "codec metadata compatibility error");
+    }
+  }
+}
+
+// Reconstruction must preserve the format, and must guard callers that do not
+// come through the .hpln parser (e.g. the decode bridge).
+void test_nvcomp_reconstruction_metadata()
+{
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = rmm::mr::get_current_device_resource_ref();
+  for (bool cascaded : {false, true}) {
+    for (std::uint8_t format :
+         {std::uint8_t{0}, std::uint8_t{5}, std::uint8_t{6}, std::uint8_t{255}}) {
+      simpatico::leaf_meta_v meta;
+      if (cascaded) {
+        meta = simpatico::leaf_meta::nvcomp_cascaded{
+          0, static_cast<std::int32_t>(cudf::type_id::INT32), 1, 2, 1, format};
+      } else {
+        meta =
+          simpatico::leaf_meta::ans{0, static_cast<std::int32_t>(cudf::type_id::INT32), format};
+      }
+      std::vector<std::unique_ptr<cudf::column>> channels;
+      channels.push_back(cudf::make_fixed_width_column(
+        cudf::data_type{cudf::type_id::UINT8}, 0, cudf::mask_state::UNALLOCATED, stream, mr));
+      std::string error;
+      auto rep = simpatico::reconstruct_representation(cascaded ? "nvcomp_cascaded" : "ans",
+                                                       {"output"},
+                                                       std::move(channels),
+                                                       stream,
+                                                       mr,
+                                                       &error,
+                                                       meta);
+      bool const supported =
+        format == (NVCOMP_VER_MAJOR >= 6 ? 6 : 5) && !(cascaded && NVCOMP_VER_MAJOR >= 6);
+      if (!supported) {
+        expect(!rep && !error.empty(), "reconstruction rejects incompatible codec metadata");
+        continue;
+      }
+      expect(rep != nullptr && error.empty(), "compatible codec reconstructs");
+      auto const described = rep->describe_meta();
+      auto const restored_format =
+        cascaded ? std::get<simpatico::leaf_meta::nvcomp_cascaded>(described).payload_format
+                 : std::get<simpatico::leaf_meta::ans>(described).payload_format;
+      expect(restored_format == format, "reconstruction preserves codec format in describe_meta");
+
+      // Directly constructed representations must also reject a mismatched
+      // format, even when the empty payload would otherwise bypass the codec.
+      auto const other_format = static_cast<std::uint8_t>(format == 5 ? 6 : 5);
+      if (cascaded) {
+        dynamic_cast<simpatico::cascaded_compressed_representation&>(*rep).payload_format =
+          other_format;
+      } else {
+        dynamic_cast<simpatico::ans_compressed_representation&>(*rep).payload_format = other_format;
+      }
+      bool rejected = false;
+      try {
+        (void)simpatico::decompress_standalone_representation(rep.get(), stream, mr, &error);
+      } catch (std::runtime_error const& e) {
+        rejected =
+          std::string_view(e.what()).find("incompatible payload format") != std::string_view::npos;
+      }
+      expect(rejected, "standalone decode rejects incompatible codec metadata");
+    }
+  }
+}
+
 // Error: correct magic but unsupported version number.
 void test_error_bad_version()
 {
-  TmpFile tmp;
-  {
-    std::ofstream f(tmp.path, std::ios::binary);
-    char data[] = {'H', 'P', 'L', 'N', 99, 0, 0};  // version 99
-    f.write(data, sizeof(data));
+  for (std::uint8_t version : {std::uint8_t{12}, std::uint8_t{13}, std::uint8_t{99}}) {
+    std::vector<std::uint8_t> header{'H', 'P', 'L', 'N', version, 0, 0};
+    bool fetched = false;
+    std::string error;
+    auto result = simpatico::read_compressed_table_from_memory(
+      header,
+      [&](std::uint64_t, std::size_t, void*, ::cuda::stream_ref) { fetched = true; },
+      cudf::get_default_stream(),
+      rmm::mr::get_current_device_resource_ref(),
+      &error);
+    expect(result.columns.empty() && !fetched, "old/unknown file version rejected before fetch");
+    expect(error.find("unsupported version") != std::string::npos,
+           "unsupported file version error");
   }
-  std::string err;
-  auto ct = simpatico::read_compressed_table(
-    tmp.path, cudf::get_default_stream(), rmm::mr::get_current_device_resource_ref(), &err);
-  expect(!err.empty(), "error_bad_version: expected non-empty error");
 }
 
 // Error: identity on a STRING column has no single contiguous payload buffer;
@@ -933,6 +1042,51 @@ void test_validity_header_integrity()
 
 }  // namespace
 
+// DECIMAL128 through bitpack, over BOTH serialization seams.
+//
+// This is the only layer that can catch a meta channel whose cudf dtype is
+// narrower than its real elements. describe() derives a channel's serialized
+// length as size() * size_of(type), so a 16-byte chunk_min/chunk_divisors
+// mislabelled as INT32 ships a quarter of itself and decode reads the rest as
+// whatever follows. An in-memory roundtrip cannot see it: compress_with_plan ->
+// decompress binds those columns by pointer and never consults the dtype.
+//
+// The values are small multiples of 100 rather than magnitudes above 2^64, so
+// bitpack's `_gwide` flag stays clear and the folded-in GCD actually reduces --
+// the 128-bit divisor path is otherwise skipped entirely.
+void test_decimal128_bitpack_roundtrip()
+{
+  auto t = make_decimal128_table(1, 4096, 17);
+  io_roundtrip("decimal128_bitpack", t->view(), "input -> bitpack\n");
+  // The spill path stages through build_compressed_table_header, not the file
+  // writer, so cover that seam too.
+  memory_roundtrip("decimal128_bitpack_memory", t->view(), "input -> bitpack\n");
+}
+
+// An identity leaf keeps its column's type, so a decimal read back must be rebuilt
+// as a fixed-width column; make_numeric_column rejects decimal and chrono types.
+void test_decimal128_identity_roundtrip()
+{
+  auto t = make_decimal128_table(1, 4096, 23);
+  io_roundtrip("decimal128_identity", t->view(), "input -> identity\n");
+  memory_roundtrip("decimal128_identity_memory", t->view(), "input -> identity\n");
+}
+
+// The same column under the plan the spill path actually emits, which names the
+// four original channels and leaves `chunk_divisors` to ride along as a trailing
+// one. A channel that is written but not named is exactly where a width bug
+// hides, so pin it explicitly rather than relying on the bare-op form above.
+void test_decimal128_bitpack_named_channels()
+{
+  auto t = make_decimal128_table(1, 4096, 19);
+  io_roundtrip("decimal128_bitpack_named",
+               t->view(),
+               "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n");
+  memory_roundtrip("decimal128_bitpack_named_memory",
+                   t->view(),
+                   "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n");
+}
+
 int main()
 {
   if (cudaSetDevice(0) != cudaSuccess) {
@@ -966,10 +1120,15 @@ int main()
     {"error_garbage", test_error_garbage},
     {"error_bad_magic", test_error_bad_magic},
     {"error_bad_version", test_error_bad_version},
+    {"nvcomp_payload_compatibility", test_nvcomp_payload_compatibility},
+    {"nvcomp_reconstruction_metadata", test_nvcomp_reconstruction_metadata},
     {"identity_string_roundtrip", test_identity_string_roundtrip},
     {"str_split_plan_shapes", test_str_split_plan_shapes_roundtrip},
     {"validity_sidecar", test_validity_sidecar_roundtrip},
     {"validity_header_integrity", test_validity_header_integrity},
+    {"decimal128_bitpack", test_decimal128_bitpack_roundtrip},
+    {"decimal128_identity", test_decimal128_identity_roundtrip},
+    {"decimal128_bitpack_named_channels", test_decimal128_bitpack_named_channels},
   };
 
   int failures = 0;

@@ -150,6 +150,7 @@ bool parse_nvcomp_cascaded_suffix(std::string_view suffix, int* deltas, int* rle
 std::unique_ptr<cudf::column> cascaded_compressed_representation::decompress(
   decode_frame& frame) const
 {
+  detail::require_nvcomp_payload_format("nvcomp_cascaded", payload_format);
   if (num_rows == 0 || payload_data() == nullptr || payload_size() == 0) {
     return cudf::make_fixed_width_column(
       original_type, num_rows, cudf::mask_state::UNALLOCATED, frame.stream(), frame.mr());

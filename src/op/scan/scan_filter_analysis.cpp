@@ -248,7 +248,7 @@ std::optional<sirius::numeric_range> to_decoded_bound(duckdb::Value const& value
   }
 
   if (!col_type.is_decimal() && !col_type.is_integer()) { return std::nullopt; }
-  // Wider decimals are int128-backed and never bitpack-planned.
+  // Wider decimals are int128-backed, and the range ballot compares in int64.
   if (col_type.is_decimal() &&
       col_type.decimal_precision() > sirius::logical_type::decimal_max_precision_int64) {
     return std::nullopt;

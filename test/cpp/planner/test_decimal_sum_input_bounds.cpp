@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-// Plan-time magnitude bounds for decimal SUM inputs: resolve_decimal_sum_input_bounds reads
+// Plan-time magnitude bounds for decimal SUM inputs: resolve_sum_input_bounds reads
 // base-table statistics through value-preserving operators and declines everything else. The
 // operator shapes the tracer accepts are covered one by one in test_scan_column_origin.cpp.
 
@@ -55,7 +55,7 @@ bounds_t bounds_of(duckdb::Connection& con, std::string const& sql)
   auto plan       = sirius::test::extract_logical_plan_sirius_order(context, sql).logical_plan;
   auto* aggregate = find_aggregate(*plan);
   REQUIRE(aggregate != nullptr);
-  return sirius::planner::resolve_decimal_sum_input_bounds(context, *aggregate);
+  return sirius::planner::resolve_sum_input_bounds(context, *aggregate);
 }
 
 /// Resolves @p sql's bounds inside a transaction of its own.
@@ -220,4 +220,23 @@ TEST_CASE_METHOD(decimal_bounds_fixture,
   REQUIRE(bounds.size() == 2);
   CHECK_FALSE(bounds[0].has_value());
   CHECK(bounds[1] == std::uint64_t{2});  // s in [-2, -1]: the magnitude of -2
+}
+
+TEST_CASE_METHOD(decimal_bounds_fixture,
+                 "sum bounds - wide BIGINT SUM and AVG carry a bound, proven sums do not",
+                 "[planner][aggregate][wide_integer_sum]")
+{
+  // big is up to 4e18 over 3000 rows, so DuckDB keeps sum (HUGEINT accumulation); small sums to
+  // at most 3000 * 99, which DuckDB's statistics prove fits and rewrite to sum_no_overflow.
+  run(
+    "CREATE TABLE ints AS SELECT (i % 3)::INTEGER g, (4000000000000000000 - i)::BIGINT big, "
+    "(i % 100)::BIGINT small, (-(i % 5))::INTEGER i32 FROM range(3000) r(i);");
+  auto const bounds = bounds_in_transaction(
+    *con, "SELECT g, sum(big), avg(big), sum(small), sum(i32), avg(i32) FROM ints GROUP BY g");
+  REQUIRE(bounds.size() == 5);
+  CHECK(bounds[0] == std::uint64_t{4000000000000000000});  // sum(big)
+  CHECK(bounds[1] == std::uint64_t{4000000000000000000});  // avg(big)
+  CHECK_FALSE(bounds[2].has_value());  // sum_no_overflow(small) is already proven
+  CHECK_FALSE(bounds[3].has_value());  // INTEGER cannot overflow INT64 within one batch
+  CHECK_FALSE(bounds[4].has_value());
 }

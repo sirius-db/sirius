@@ -21,6 +21,7 @@
 
 // cudf
 #include <cudf/binaryop.hpp>
+#include <cudf/column/column_factories.hpp>
 #include <cudf/cudf_utils.hpp>
 
 namespace sirius {
@@ -79,6 +80,10 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::between const& alt,
     evaluate_narrow_domain_operand(*alt.lower, narrow_carrier, evaluation_mode::MATERIALIZE);
   auto upper =
     evaluate_narrow_domain_operand(*alt.upper, narrow_carrier, evaluation_mode::MATERIALIZE);
+  if (input.is_scalar()) {
+    input = evaluate_result(
+      cudf::make_column_from_scalar(input.get_scalar(), _input_table.num_rows(), _stream, _mr));
+  }
   // BETWEEN always returns BOOLEAN.
   auto const output_type = cudf::data_type{cudf::type_id::BOOL8};
 

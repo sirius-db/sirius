@@ -260,10 +260,13 @@ std::unique_ptr<cudf::column> compact_bitpack_packed(cudf::column const& chunk_c
 
   const std::size_t live = static_cast<std::size_t>(live_packed_bytes);
 
-  // simpatico_bitunpack_one loads three consecutive uint32 words (w0/w1/w2);
-  // three guard words keep the last element's gather in-bounds.  They travel
-  // as part of the stored payload so num_rows already accounts for them.
-  constexpr std::size_t kGuardWords = 3;
+  // simpatico_bitunpack_one loads three consecutive uint32 words (w0/w1/w2),
+  // and its 128-bit counterpart loads five (a 128-bit value at an arbitrary bit
+  // offset spans ceil((128+31)/32) = 5 words). Five guard words keep the last
+  // element's gather in-bounds for either. They travel as part of the stored
+  // payload so num_rows already accounts for them; sizing them unconditionally
+  // costs 8 bytes per bitpack buffer and keeps one layout for every width.
+  constexpr std::size_t kGuardWords = 5;
   const std::size_t guard_bytes     = kGuardWords * sizeof(std::uint32_t);
 
   rmm::device_buffer dense(live + guard_bytes, stream, mr);
@@ -446,6 +449,9 @@ const char* dtype_to_cxx(const char* dtype)
   // codecs roundtrip either way); the output column keeps the original UINT type.
   if (s == "uint32" || s == "uint32_t") return "int32_t";
   if (s == "uint64" || s == "uint64_t") return "int64_t";
+  // DECIMAL128 storage. NVRTC needs --device-int128 (see nvrtc_compiler.cpp);
+  // the ops are emulated, so this is for reach, not speed.
+  if (s == "int128" || s == "__int128") return "__int128";
   return nullptr;
 }
 
@@ -1224,8 +1230,19 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
           // the column's original_type.  For the values channel this matches
           // original_type, but for the runs channel (int32 counts) it must
           // be INT32 regardless of the column dtype.
+          //
+          // The dtype is not cosmetic: describe() derives a channel's serialized
+          // length from it as size() * size_of(type), so a dtype narrower than the
+          // buffer's real elements truncates the payload. A 16-byte channel with no
+          // arm here fell through to INT32 and shipped a quarter of chunk_min and
+          // chunk_divisors; decode then read them back as __int128 on a 16-byte
+          // stride and reconstructed chunk_min + divisor * residual from garbage.
+          // That is invisible to an in-memory roundtrip, which binds these columns
+          // by pointer and never consults the dtype -- only a serialized roundtrip
+          // (i.e. a spill) sees it.
           const cudf::data_type bp_elem_type =
-            (spec.buffers[i_min].elem_size == 8)   ? cudf::data_type(cudf::type_id::INT64)
+            (spec.buffers[i_min].elem_size == 16)  ? cudf::data_type(cudf::type_id::DECIMAL128, 0)
+            : (spec.buffers[i_min].elem_size == 8) ? cudf::data_type(cudf::type_id::INT64)
             : (spec.buffers[i_min].elem_size == 2) ? cudf::data_type(cudf::type_id::INT16)
             : (spec.buffers[i_min].elem_size == 1) ? cudf::data_type(cudf::type_id::UINT8)
                                                    : cudf::data_type(cudf::type_id::INT32);
@@ -1664,6 +1681,14 @@ bool launch_encode_fused_tree(CodegenHead const& head,
     case cudf::type_id::DECIMAL64:
       dtype           = "int64";
       storage_type_id = cudf::type_id::INT64;
+      break;
+    // DECIMAL128's storage is __int128, for which cudf has no integer type_id.
+    // The storage column therefore stays DECIMAL128 (scale 0 -- the scale is
+    // restored from the stored column dtype by apply_stored_dtype, as for the
+    // narrower decimals); it is just a 16-byte fixed-width column here.
+    case cudf::type_id::DECIMAL128:
+      dtype           = "int128";
+      storage_type_id = cudf::type_id::DECIMAL128;
       break;
     // Chrono columns are physically their integer storage (DATE32 = days as
     // int32, timestamps/durations as int64); like DECIMAL, encode/decode run
