@@ -23,6 +23,7 @@
 #include "op/sirius_physical_exchange_sink.hpp"
 #include "op/sirius_physical_exchange_source.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
+#include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_partition.hpp"
 #include "op/sirius_physical_sort_sample.hpp"
 #include "sirius/exception.hpp"
@@ -35,6 +36,7 @@
 #include <cucascade/data/data_batch.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 
+#include <algorithm>
 #include <functional>
 #include <set>
 #include <string>
@@ -54,6 +56,13 @@ enum class placement {
   ranged,  ///< Across ranks, rank i holding the i-th range of a sort order.
   rank0,   ///< On rank 0; what other ranks hold is not part of the result.
 };
+
+/// A join's Bloom filters are sized for its estimated build rows, within these bounds: the same
+/// size on every rank, since every rank plans the same estimate.
+constexpr std::size_t min_bloom_keys = std::size_t{1} << 16;
+constexpr std::size_t max_bloom_keys = std::size_t{1} << 26;
+/// Stream ids a join reserves for merging its filters, one per admitted key.
+constexpr std::uint32_t max_filter_keys = 64;
 
 struct rewriter {
   std::shared_ptr<exchange::exchange_service> service;
@@ -135,10 +144,27 @@ struct rewriter {
       case T::GPU_SCAN: return done(placement::spread);
       case T::FILTER:
       case T::PROJECTION:
+      // A join-edge dynamic filter: its filter holds every rank's keys (see HASH_JOIN).
+      case T::DYNAMIC_FILTER:
       // A partial aggregate keeps its input's placement; its merge above decides the exchange.
       case T::HASH_GROUP_BY: return done(visit(node.children[0]));
 
       case T::HASH_JOIN: {
+        // After the exchanges a rank's build holds only its share of the keys: a filter from it
+        // alone would drop rows other ranks' builds match, so every rank's Bloom is merged.
+        auto& join = node.Cast<op::sirius_physical_hash_join>();
+        if (join.publishes_dynamic_filters()) {
+          auto const first = stream();
+          next_stream += max_filter_keys;
+          auto const build_rows =
+            node.children.size() > 1 ? node.children[1]->estimated_cardinality : std::size_t{0};
+          join.set_distributed_dynamic_filters(
+            {.service      = service,
+             .first_stream = first,
+             .gpu          = gpu,
+             .bloom_keys   = std::clamp(build_rows, min_bloom_keys, max_bloom_keys)});
+          shape += "F";
+        }
         // Both sides are CONCAT → PARTITION → input; each side's rows meet their matches once
         // both are exchanged on the join keys.
         for (auto& side : node.children) {
