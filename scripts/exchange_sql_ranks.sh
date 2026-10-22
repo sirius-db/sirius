@@ -11,7 +11,7 @@ port=${3:-27000}
 logs=${4:-/tmp}
 here=$(cd "$(dirname "$0")" && pwd)
 source "$here/nixl_env.sh"
-build="$here/../build/release"
+build="$here/../sirius-duckdb/build/release"
 
 peers=""
 for ((i = 0; i < ranks; i++)); do peers+="${peers:+,}127.0.0.1:$((port + i))"; done
@@ -25,7 +25,7 @@ for ((i = 0; i < ranks; i++)); do
     echo "SET sirius_exchange_peers = '$peers';"
     echo "SET sirius_exchange_rank = $i;"
     cat "$sql"
-  } | CUDA_VISIBLE_DEVICES=$i timeout -s KILL "${EXCHANGE_TIMEOUT:-1800}" "$build/duckdb" \
+  } | CUDA_VISIBLE_DEVICES=$i timeout -s KILL "${EXCHANGE_TIMEOUT:-1800}" "$build/duckdb" -unsigned \
     > "$logs/exchange_rank_$i.log" 2>&1 &
   pids+=($!)
 done
