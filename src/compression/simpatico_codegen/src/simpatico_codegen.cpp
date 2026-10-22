@@ -18,6 +18,7 @@
 #include <cudf/null_mask.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
+#include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/traits.hpp>
 
 #include <rmm/device_buffer.hpp>
@@ -38,11 +39,15 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
 namespace simpatico {
 
 namespace {
+
+// Match join_streams' span element type on both stable and nightly cuDF.
+using cudf_stream_type = std::remove_cv_t<decltype(cudf::get_default_stream())>;
 
 // ── Internal helpers for the public compress/decompress API ───────────────────
 // (Formerly compress_internals.hpp; this TU is the only consumer.)
@@ -536,14 +541,12 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     std::vector<std::uint32_t const*> mask_ptrs;
     mask_ptrs.reserve(k_total + 1);  // +1: the optional positional keep mask
     // Lanes other than s0 that produced a source, which the combine on s0 must wait for.
-    std::vector<rmm::cuda_stream_view> producer_lanes;
+    std::vector<cudf_stream_type> producer_lanes;
     decode_session wave1{streams, mr};
     auto next_destination = [&] {
       auto const lane = wave1.next_stream();
       if (lane.get() != s0.get() &&
-          std::none_of(producer_lanes.begin(), producer_lanes.end(), [&](auto other) {
-            return other.value() == lane.get();
-          }))
+          std::none_of(producer_lanes.begin(), producer_lanes.end(), same_stream(lane)))
         producer_lanes.emplace_back(lane);
       auto* words =
         mask_ptrs.empty()
@@ -768,7 +771,7 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     auto const wait_for_indices = [&](::cuda::stream_ref lane) {
       if (!indices_needed || std::any_of(index_lanes.begin(), index_lanes.end(), same_stream(lane)))
         return;
-      rmm::cuda_stream_view const producer{s0};
+      cudf_stream_type const producer{s0};
       cudf::detail::join_streams({&producer, 1}, lane);
       index_lanes.push_back(lane);
     };

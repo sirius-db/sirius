@@ -13,7 +13,7 @@ namespace simpatico {
 
 cudf::column_view strip_validity(cudf::column_view input,
                                  validity_sidecar& out,
-                                 rmm::cuda_stream_view stream,
+                                 ::cuda::stream_ref stream,
                                  rmm::device_async_resource_ref mr)
 {
   auto const n     = input.size();
@@ -62,7 +62,7 @@ cudf::column_view strip_validity(cudf::column_view input,
 
 void attach_validity(cudf::column& col,
                      validity_sidecar const& v,
-                     rmm::cuda_stream_view stream,
+                     ::cuda::stream_ref stream,
                      rmm::device_async_resource_ref mr)
 {
   switch (v.kind) {
@@ -82,7 +82,7 @@ void attach_validity(cudf::column& col,
       // The copy above is stream-ordered but v.mask belongs to the caller's tree, which it
       // may free as soon as decompress returns. Wait for the copy to land, as every other
       // decode route does before handing back.
-      stream.synchronize();
+      stream.sync();
       return;
   }
 }
