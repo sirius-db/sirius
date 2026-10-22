@@ -105,7 +105,7 @@ TEST_CASE("prefetch conversion reports fatal errors without treating OOM as runt
   converters
     .register_converter<cucascade::host_data_representation, cucascade::gpu_table_representation>(
       [calls, status, exception_type](
-        cucascade::idata_representation&,
+        const cucascade::idata_representation&,
         const cucascade::memory::memory_space*,
         ::cuda::stream_ref,
         cucascade::memory::reservation*) -> std::unique_ptr<cucascade::idata_representation> {
