@@ -37,7 +37,8 @@
 
 // rmm
 #include <rmm/cuda_stream.hpp>
-#include <rmm/cuda_stream_view.hpp>
+
+#include <cuda/stream>
 
 // standard library
 #include <algorithm>
@@ -159,7 +160,7 @@ std::vector<cudf::size_type> build_null_indices(size_t num_rows,
 
 void apply_null_mask(cudf::column& column,
                      std::vector<cudf::size_type> const& null_rows,
-                     rmm::cuda_stream_view stream,
+                     ::cuda::stream_ref stream,
                      rmm::device_async_resource_ref mr)
 {
   if (null_rows.empty() || column.size() == 0) { return; }
@@ -171,7 +172,10 @@ void apply_null_mask(cudf::column& column,
     cudf::clear_bit_unsafe(host_mask.data(), idx);
   }
 
-  rmm::device_buffer mask_buffer(host_mask.data(), bytes, stream, mr);
+  auto mask_buffer =
+    cudf::create_null_mask(column.size(), cudf::mask_state::UNINITIALIZED, stream, mr);
+  cudaMemcpyAsync(
+    mask_buffer.data(), host_mask.data(), bytes, cudaMemcpyHostToDevice, stream.get());
   column.set_null_mask(std::move(mask_buffer), static_cast<cudf::size_type>(null_rows.size()));
 }
 
@@ -217,7 +221,7 @@ size_t estimate_packed_data_bytes(cudf::table_view const& view)
 host_data_representation const& convert_to_host_table(
   duckdb::shared_ptr<duckdb::SiriusContext> sirius_ctx,
   std::shared_ptr<data_batch> const& batch,
-  rmm::cuda_stream_view stream)
+  ::cuda::stream_ref stream)
 {
   // Verify batch has data (use read-only accessor to check).
   {
@@ -251,7 +255,7 @@ host_data_representation const& convert_to_host_table(
 std::unique_ptr<cudf::table> make_timestamp_table(std::vector<int64_t> const& ticks,
                                                   cudf::type_id ts_type_id,
                                                   std::vector<cudf::size_type> const& null_rows,
-                                                  rmm::cuda_stream_view stream,
+                                                  ::cuda::stream_ref stream,
                                                   rmm::device_async_resource_ref mr)
 {
   auto col = cudf::make_timestamp_column(cudf::data_type{ts_type_id},
@@ -273,7 +277,7 @@ std::unique_ptr<cudf::table> make_timestamp_table(std::vector<int64_t> const& ti
 
 std::shared_ptr<data_batch> make_test_batch(std::unique_ptr<cudf::table> table,
                                             cucascade::memory::memory_space& gpu_space,
-                                            rmm::cuda_stream_view stream)
+                                            ::cuda::stream_ref stream)
 {
   return sirius::make_data_batch(
     std::move(table), gpu_space, stream, sirius::telemetry::batch_telemetry_info{});
@@ -284,7 +288,7 @@ std::vector<duckdb::timestamp_t> read_timestamp_chunks(
   duckdb::shared_ptr<duckdb::SiriusContext> sirius_ctx,
   std::shared_ptr<data_batch> const& batch,
   duckdb::LogicalType const& output_type,
-  rmm::cuda_stream_view stream)
+  ::cuda::stream_ref stream)
 {
   auto const& host_table = convert_to_host_table(sirius_ctx, batch, stream);
   duckdb::vector<duckdb::LogicalType> types{output_type};
@@ -352,7 +356,7 @@ TEST_CASE("host_table_chunk_reader produces correct DataChunks",
     REQUIRE(reader.get_next_chunk(chunk));
 
     auto const count = static_cast<size_t>(chunk.size());
-    REQUIRE(chunk.GetCapacity() == static_cast<duckdb::idx_t>(count));
+    REQUIRE(count == std::min<size_t>(STANDARD_VECTOR_SIZE, num_rows - row_base));
     auto* int32_data = duckdb::FlatVector::GetData<int32_t>(chunk.data[0]);
     auto* int64_data = duckdb::FlatVector::GetData<int64_t>(chunk.data[1]);
     auto* str_data   = duckdb::FlatVector::GetData<duckdb::string_t>(chunk.data[2]);
@@ -608,7 +612,8 @@ TEST_CASE("host_table_chunk_reader converts TIMESTAMP_SECONDS and TIMESTAMP_NS t
       read_timestamp_chunks(con, sirius_ctx, batch, duckdb::LogicalType::TIMESTAMP, stream);
     REQUIRE(values.size() == nanos.size());
     REQUIRE(values[0].value == 873431589000000LL);
-    REQUIRE(values[1].value == 1);
+    // DuckDB v2 rounds nanoseconds to the nearest microsecond.
+    REQUIRE(values[1].value == 2);
     REQUIRE(values[2].value == -2);
   }
 }

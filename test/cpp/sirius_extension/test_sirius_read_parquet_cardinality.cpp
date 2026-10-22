@@ -33,6 +33,8 @@ TEST_CASE("SiriusReadParquetBindData preserves URI and row-count planner metadat
           "[planner-metadata][sirius_read_parquet]")
 {
   duckdb::SiriusReadParquetBindData bind_data{"s3://bucket/orders.parquet", orders_row_count};
+  bind_data.bound_types = {duckdb::LogicalType::INTEGER, duckdb::LogicalType::VARCHAR};
+  bind_data.bound_names = {"order_key", "comment"};
 
   CHECK(bind_data.uri == "s3://bucket/orders.parquet");
   CHECK(bind_data.total_num_rows == orders_row_count);
@@ -43,6 +45,8 @@ TEST_CASE("SiriusReadParquetBindData preserves URI and row-count planner metadat
   REQUIRE(typed_copy != nullptr);
   CHECK(typed_copy->uri == bind_data.uri);
   CHECK(typed_copy->total_num_rows == bind_data.total_num_rows);
+  CHECK(typed_copy->bound_types == bind_data.bound_types);
+  CHECK(typed_copy->bound_names == bind_data.bound_names);
   CHECK(bind_data.Equals(*copy));
 
   duckdb::SiriusReadParquetBindData different_uri{"s3://bucket/lineitem.parquet", orders_row_count};

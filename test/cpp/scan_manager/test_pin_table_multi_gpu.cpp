@@ -120,7 +120,8 @@ void generate_4file_surface(fs::path const& dir)
 // Distribution gate: assert pinned_entry.chunk_memory_spaces lands chunks
 // on at least 2 distinct GPU device_ids.
 //===----------------------------------------------------------------------===//
-TEST_CASE("pin_table - PIN-MGPU-01 multi-GPU chunk distribution", "[pin_mgpu][scan_manager]")
+TEST_CASE("pin_table - PIN-MGPU-01 multi-GPU chunk distribution",
+          "[pin_mgpu][scan_manager][multi_gpu]")
 {
   if (!require_two_gpus()) return;
 
@@ -198,7 +199,7 @@ TEST_CASE("pin_table - PIN-MGPU-01 multi-GPU chunk distribution", "[pin_mgpu][sc
 // and GPU 1.
 //===----------------------------------------------------------------------===//
 TEST_CASE("pin_table - PIN-MGPU-01 routing via [mgpu-audit]",
-          "[pin_mgpu][scan_manager][mgpu-audit]")
+          "[pin_mgpu][scan_manager][mgpu-audit][multi_gpu]")
 {
   if (!require_two_gpus()) return;
 
@@ -295,7 +296,8 @@ TEST_CASE("pin_table - PIN-MGPU-01 routing via [mgpu-audit]",
 // On single-NUMA hosts, the host space is shared but the test passes
 // trivially via the >=1 chunk assertion.
 //===----------------------------------------------------------------------===//
-TEST_CASE("pin_table - PIN-MGPU-01 host-tier multi-GPU pin", "[pin_mgpu][scan_manager][host_tier]")
+TEST_CASE("pin_table - PIN-MGPU-01 host-tier multi-GPU pin",
+          "[pin_mgpu][scan_manager][host_tier][multi_gpu]")
 {
   if (!require_two_gpus()) return;
 
@@ -361,14 +363,14 @@ TEST_CASE("pin_table - PIN-MGPU-01 host-tier multi-GPU pin", "[pin_mgpu][scan_ma
   auto baseline = con.Query("SELECT count(*) FROM read_parquet('" + glob + "');");
   REQUIRE(baseline);
   REQUIRE_FALSE(baseline->HasError());
-  auto baseline_rows = baseline->GetValue(0, 0).GetValue<int64_t>();
+  auto baseline_rows = baseline->Collection().GetValue(0, 0).GetValue<int64_t>();
 
   auto cached =
     con.Query("CALL gpu_execution(\"SELECT count(*) FROM read_parquet('" + glob + "')\");");
   REQUIRE(cached);
   if (cached->HasError()) { UNSCOPED_INFO("gpu_execution error: " << cached->GetError()); }
   REQUIRE_FALSE(cached->HasError());
-  auto cached_rows = cached->GetValue(0, 0).GetValue<int64_t>();
+  auto cached_rows = cached->Collection().GetValue(0, 0).GetValue<int64_t>();
   REQUIRE(cached_rows == baseline_rows);
 
   auto unpin = con.Query("CALL unpin_table('host_pin');");
@@ -416,7 +418,7 @@ TEST_CASE("pin_table - host-tier cached path serves column read after overwrite 
   auto pre = con.Query("CALL gpu_execution(\"SELECT MAX(k) FROM read_parquet('" + glob + "')\");");
   REQUIRE(pre);
   REQUIRE_FALSE(pre->HasError());
-  REQUIRE(pre->GetValue(0, 0).GetValue<int64_t>() == 99999);
+  REQUIRE(pre->Collection().GetValue(0, 0).GetValue<int64_t>() == 99999);
 
   // Overwrite with a higher k ceiling: cached host pin -> 99999, fall-through -> 199999.
   generate_parquet_surface(
@@ -428,7 +430,7 @@ TEST_CASE("pin_table - host-tier cached path serves column read after overwrite 
   if (cached->HasError()) { UNSCOPED_INFO("gpu_execution error: " << cached->GetError()); }
   REQUIRE_FALSE(cached->HasError());
   INFO("expected cached MAX(k)=99999 (fall-through to overwritten parquet would be 199999)");
-  REQUIRE(cached->GetValue(0, 0).GetValue<int64_t>() == 99999);
+  REQUIRE(cached->Collection().GetValue(0, 0).GetValue<int64_t>() == 99999);
 
   auto unpin = con.Query("CALL unpin_table('host_serve_1gpu');");
   REQUIRE(unpin);
@@ -447,7 +449,7 @@ TEST_CASE("pin_table - host-tier cached path serves column read after overwrite 
 // fall-through to the mutated parquet would return 199999.
 //===----------------------------------------------------------------------===//
 TEST_CASE("pin_table - host-tier cached path serves MAX(k) after overwrite (multi-GPU)",
-          "[pin_mgpu][scan_manager][host_tier]")
+          "[pin_mgpu][scan_manager][host_tier][multi_gpu]")
 {
   if (!require_two_gpus()) return;
 
@@ -478,7 +480,7 @@ TEST_CASE("pin_table - host-tier cached path serves MAX(k) after overwrite (mult
   auto baseline = con.Query("SELECT count(*) FROM read_parquet('" + glob + "');");
   REQUIRE(baseline);
   REQUIRE_FALSE(baseline->HasError());
-  auto baseline_rows = baseline->GetValue(0, 0).GetValue<int64_t>();
+  auto baseline_rows = baseline->Collection().GetValue(0, 0).GetValue<int64_t>();
   REQUIRE(baseline_rows == 400000);  // 4 files × 100k rows
   REQUIRE_FALSE(con.Query("SET gpu_execution = true;")->HasError());
 
@@ -526,7 +528,7 @@ TEST_CASE("pin_table - host-tier cached path serves MAX(k) after overwrite (mult
   REQUIRE(pre_overwrite);
   REQUIRE_FALSE(pre_overwrite->HasError());
   // range(100000) -> k goes 0..99999; MAX(k) across 4 identical files is 99999.
-  REQUIRE(pre_overwrite->GetValue(0, 0).GetValue<int64_t>() == 99999);
+  REQUIRE(pre_overwrite->Collection().GetValue(0, 0).GetValue<int64_t>() == 99999);
 
   // Overwrite the parquet files with a HIGHER `k` ceiling (200k per file
   // instead of 100k). The glob still resolves so DuckDB's read_parquet bind
@@ -542,7 +544,7 @@ TEST_CASE("pin_table - host-tier cached path serves MAX(k) after overwrite (mult
   REQUIRE(cached);
   if (cached->HasError()) { UNSCOPED_INFO("gpu_execution error: " << cached->GetError()); }
   REQUIRE_FALSE(cached->HasError());
-  auto cached_max = cached->GetValue(0, 0).GetValue<int64_t>();
+  auto cached_max = cached->Collection().GetValue(0, 0).GetValue<int64_t>();
   INFO("expected cached_max=99999 (silent fall-through would return 199999)");
   REQUIRE(cached_max == 99999);
 
@@ -565,7 +567,7 @@ TEST_CASE("pin_table - host-tier cached path serves MAX(k) after overwrite (mult
 // gate but with tier='host'.
 //===----------------------------------------------------------------------===//
 TEST_CASE("pin_table - host-tier cached scan dispatches on both GPUs (multi-GPU)",
-          "[pin_mgpu][scan_manager][host_tier][mgpu-audit]")
+          "[pin_mgpu][scan_manager][host_tier][mgpu-audit][multi_gpu]")
 {
   if (!require_two_gpus()) return;
 
@@ -605,7 +607,7 @@ TEST_CASE("pin_table - host-tier cached scan dispatches on both GPUs (multi-GPU)
     REQUIRE(sel);
     if (sel->HasError()) { UNSCOPED_INFO("gpu_execution error: " << sel->GetError()); }
     REQUIRE_FALSE(sel->HasError());
-    REQUIRE(sel->GetValue(0, 0).GetValue<int64_t>() == 99999);
+    REQUIRE(sel->Collection().GetValue(0, 0).GetValue<int64_t>() == 99999);
 
     auto unpin = con.Query("CALL unpin_table('host_dispatch');");
     REQUIRE(unpin);
@@ -638,7 +640,7 @@ TEST_CASE("pin_table - host-tier cached scan dispatches on both GPUs (multi-GPU)
 // the new files' total.
 //===----------------------------------------------------------------------===//
 TEST_CASE("pin_table - host-tier cached path serves SUM(v) after overwrite (multi-GPU)",
-          "[pin_mgpu][scan_manager][host_tier]")
+          "[pin_mgpu][scan_manager][host_tier][multi_gpu]")
 {
   if (!require_two_gpus()) return;
 
@@ -669,7 +671,7 @@ TEST_CASE("pin_table - host-tier cached path serves SUM(v) after overwrite (mult
   auto baseline = con.Query("SELECT SUM(v) FROM read_parquet('" + glob + "');");
   REQUIRE(baseline);
   REQUIRE_FALSE(baseline->HasError());
-  auto baseline_sum = baseline->GetValue(0, 0).GetValue<int64_t>();
+  auto baseline_sum = baseline->Collection().GetValue(0, 0).GetValue<int64_t>();
   REQUIRE(baseline_sum == 39999600000LL);
   REQUIRE_FALSE(con.Query("SET gpu_execution = true;")->HasError());
 
@@ -690,7 +692,7 @@ TEST_CASE("pin_table - host-tier cached path serves SUM(v) after overwrite (mult
   REQUIRE(cached);
   if (cached->HasError()) { UNSCOPED_INFO("gpu_execution error: " << cached->GetError()); }
   REQUIRE_FALSE(cached->HasError());
-  auto cached_sum = cached->GetValue(0, 0).GetValue<int64_t>();
+  auto cached_sum = cached->Collection().GetValue(0, 0).GetValue<int64_t>();
   INFO("expected cached_sum=" << baseline_sum << " (silent fall-through would return 99999000000)");
   REQUIRE(cached_sum == baseline_sum);
 
@@ -720,7 +722,7 @@ TEST_CASE("pin_table - host-tier cached path serves SUM(v) after overwrite (mult
 // number of chunks as `chunk_memory_spaces`.
 //===----------------------------------------------------------------------===//
 TEST_CASE("pin_table - same-row-count merge appends every chunk for new columns",
-          "[pin_mgpu][scan_manager][merge]")
+          "[pin_mgpu][scan_manager][merge][multi_gpu]")
 {
   if (!require_two_gpus()) return;
 

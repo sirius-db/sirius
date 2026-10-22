@@ -21,7 +21,7 @@
 #include <optional>
 #include <stdexcept>
 
-namespace sirius::io::s3 {
+namespace sirius::io::rest::s3 {
 
 namespace {
 
@@ -247,4 +247,4 @@ list_objects_v2_page parse_list_objects_v2(std::string_view xml)
   return page;
 }
 
-}  // namespace sirius::io::s3
+}  // namespace sirius::io::rest::s3

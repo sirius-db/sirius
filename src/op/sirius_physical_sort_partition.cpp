@@ -51,7 +51,7 @@ sirius_physical_sort_partition::sirius_physical_sort_partition(
 }
 
 std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(
-  const operator_data& input_data, rmm::cuda_stream_view stream)
+  const operator_data& input_data, ::cuda::stream_ref stream)
 {
   nvtx_scoped_range nvtx_range{"sirius_physical_sort_partition::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
@@ -62,7 +62,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(
     SIRIUS_LOG_DEBUG("Sort partition: passthrough ({} batches, {} partitions)",
                      input_batches.size(),
                      _sample_op ? _sample_op->get_num_partitions() : 1);
-    return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
+    return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
   }
 
   auto start           = std::chrono::high_resolution_clock::now();
@@ -79,10 +79,10 @@ std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(
   null_precedence.reserve(orders.size());
 
   for (auto const& ord : orders) {
-    if (ord.expression->expression_class != duckdb::ExpressionClass::BOUND_REF) {
+    if (ord.expression->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
       throw not_implemented_exception("Sort partition only supports bound reference expressions");
     }
-    auto idx = static_cast<int>(ord.expression->Cast<duckdb::BoundReferenceExpression>().index);
+    auto idx = static_cast<int>(ord.expression->Cast<duckdb::BoundReferenceExpression>().Index());
     order_key_idx.push_back(idx);
     column_order.push_back(to_cudf_order(ord.type));
     null_precedence.push_back(to_cudf_null_order(ord.type, ord.null_order));
@@ -121,8 +121,8 @@ std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(
                                   split_positions_col->view().data<int32_t>(),
                                   num_splits * sizeof(int32_t),
                                   cudaMemcpyDeviceToHost,
-                                  stream.value()));
-    CUDF_CUDA_TRY(cudaStreamSynchronize(stream.value()));
+                                  stream.get()));
+    CUDF_CUDA_TRY(cudaStreamSynchronize(stream.get()));
 
     // Build slice indices: [0, split[0], split[0], split[1], ..., split[P-2], num_rows]
     std::vector<cudf::size_type> slice_indices;

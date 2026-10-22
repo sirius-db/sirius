@@ -53,13 +53,13 @@ std::unique_ptr<cudf::table> make_empty_vss_output(
 
 void restore_native_carriers(std::vector<std::unique_ptr<cudf::column>>& cols,
                              const std::vector<sirius::logical_type>& native_types,
-                             rmm::cuda_stream_view stream,
+                             ::cuda::stream_ref stream,
                              rmm::device_async_resource_ref mr)
 {
   auto const n = std::min(cols.size(), native_types.size());
   for (std::size_t j = 0; j < n; ++j) {
     if (cols[j] == nullptr) { continue; }
-    auto const native = sirius::get_cudf_type(native_types[j]);
+    auto const native = sirius::require_cudf_type(native_types[j]);
     // Only widen a genuinely-narrowed carrier; leave native columns and any type we can't
     // safely widen back (e.g. non-numeric) untouched. cast_through_rep handles DATE, which a
     // plain cudf::cast cannot restore from its narrowed integer carrier.
@@ -75,7 +75,7 @@ std::unique_ptr<cucascade::host_data_representation> vss_result_to_host(
   cucascade::gpu_table_representation gpu_repr(std::move(table), c.space, c.stream);
   auto host_repr = converter_registry::get().convert<cucascade::host_data_representation>(
     gpu_repr, &c.host_space, c.stream);
-  c.stream.synchronize();
+  c.stream.sync();
   return host_repr;
 }
 
@@ -94,12 +94,15 @@ std::unique_ptr<cucascade::host_data_representation> run_vector_search(
   // The GPU->host converter's cudaMemcpyBatchAsync rejects the default stream.
   // Synchronized before we return, so the owned stream is safe to destroy on exit.
   rmm::cuda_stream stream_owner;
-  auto stream = stream_owner.view();
+  ::cuda::stream_ref stream = stream_owner;
 
   // The table must be GPU-pinned: the search reads its vectors and gathers the
   // output columns straight from GPU-resident chunks (same order the index built in).
-  const auto* pin = ctx.get_scan_manager().find_pinned_entry_for_duckdb_table(
-    req.catalog, req.schema, req.table_name);
+  // OWNING: pin_owner is kept alive for the whole search below (vector_search_context::pin
+  // binds to it), so a concurrent unpin on another connection cannot invalidate it mid-search.
+  auto pin_owner = ctx.get_scan_manager().find_pinned_entry_for_duckdb_table(
+    req.catalog, req.schema, req.table_name, req.table_identity);
+  const auto* pin = pin_owner.get();
   if (pin == nullptr || pin->tier != cucascade::memory::Tier::GPU) {
     throw duckdb::InvalidInputException("sirius_knn_search: table '" + req.table_name +
                                         "' must be pinned on the GPU tier");
@@ -137,8 +140,8 @@ std::unique_ptr<cucascade::host_data_representation> run_vector_search(
   // Upload the (constant) query vector once; both search impls read it on the device.
   rmm::device_buffer query_buf(req.query.size() * sizeof(float), stream, mr);
   CUDF_CUDA_TRY(cudaMemcpyAsync(
-    query_buf.data(), req.query.data(), query_buf.size(), cudaMemcpyHostToDevice, stream.value()));
-  stream.synchronize();
+    query_buf.data(), req.query.data(), query_buf.size(), cudaMemcpyHostToDevice, stream.get()));
+  stream.sync();
 
   vector_search_context c{ctx,
                           req,

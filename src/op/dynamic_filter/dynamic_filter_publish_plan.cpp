@@ -17,6 +17,7 @@
 #include "op/dynamic_filter/dynamic_filter_publish_plan.hpp"
 
 #include "log/logging.hpp"
+#include "op/dynamic_filter/dynamic_filter_key_domain.hpp"
 
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
@@ -102,13 +103,16 @@ dynamic_filter_publish_plan::dynamic_filter_publish_plan(
           "exist");
       }
       if (target.route_class == dynamic_filter_route_class::direct) {
+        // A join-edge probe is an operator output at the key's native type, so the binding must
+        // name a membership-supported build type and an identical, adaptable probe type (for a
+        // decimal key, identical includes the scale).
         auto const& key = _admitted_keys[binding.admitted_key_index];
-        if ((binding.probe_storage_type.id() != cudf::type_id::INT32 &&
-             binding.probe_storage_type.id() != cudf::type_id::INT64) ||
+        if (!membership_key_supported(key.storage_type) ||
             binding.probe_storage_type != key.storage_type) {
           throw std::invalid_argument(
-            "[dynamic_filter_publish_plan] A join-edge endpoint binding requires an INT32/INT64 "
-            "probe storage type equal to the admitted key's build storage type");
+            "[dynamic_filter_publish_plan] A join-edge endpoint binding requires a "
+            "membership-supported probe storage type equal to the admitted key's build storage "
+            "type");
         }
       }
       bound_keys.push_back(binding.admitted_key_index);

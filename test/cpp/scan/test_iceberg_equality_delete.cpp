@@ -52,7 +52,7 @@ using namespace sirius::op::scan;
 
 namespace {
 
-rmm::cuda_stream_view test_stream() { return cudf::get_default_stream(); }
+::cuda::stream_ref test_stream() { return cudf::get_default_stream(); }
 
 rmm::device_async_resource_ref test_mr() { return cudf::get_current_device_resource_ref(); }
 
@@ -69,8 +69,8 @@ std::unique_ptr<cudf::column> int32_column(std::vector<int32_t> const& values,
                                 values.data(),
                                 values.size() * sizeof(int32_t),
                                 cudaMemcpyHostToDevice,
-                                stream.value()));
-  stream.synchronize();
+                                stream.get()));
+  stream.sync();
   if (!nulls.empty()) {
     REQUIRE(nulls.size() == values.size());
     // Built on the host and copied whole: sized with bitmask_allocation_size_bytes because a
@@ -85,8 +85,10 @@ std::unique_ptr<cudf::column> int32_column(std::vector<int32_t> const& values,
       ++null_count;
     }
     if (null_count > 0) {
-      rmm::device_buffer mask{host_mask.data(), bytes, stream};
-      stream.synchronize();
+      auto mask = cudf::create_null_mask(col->size(), cudf::mask_state::UNINITIALIZED, stream);
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+        mask.data(), host_mask.data(), bytes, cudaMemcpyHostToDevice, stream.get()));
+      stream.sync();
       col->set_null_mask(std::move(mask), null_count);
     }
   }
@@ -101,8 +103,8 @@ std::vector<int32_t> to_host(cudf::column_view const& col)
                                 col.data<int32_t>(),
                                 out.size() * sizeof(int32_t),
                                 cudaMemcpyDeviceToHost,
-                                stream.value()));
-  stream.synchronize();
+                                stream.get()));
+  stream.sync();
   return out;
 }
 
@@ -111,8 +113,8 @@ std::vector<uint8_t> mask_to_host(cudf::column_view const& col)
   std::vector<uint8_t> out(static_cast<std::size_t>(col.size()));
   auto stream = test_stream();
   CUDF_CUDA_TRY(cudaMemcpyAsync(
-    out.data(), col.data<uint8_t>(), out.size(), cudaMemcpyDeviceToHost, stream.value()));
-  stream.synchronize();
+    out.data(), col.data<uint8_t>(), out.size(), cudaMemcpyDeviceToHost, stream.get()));
+  stream.sync();
   return out;
 }
 
@@ -124,8 +126,8 @@ rmm::device_uvector<cudf::size_type> device_indices(std::vector<cudf::size_type>
                                 host.data(),
                                 host.size() * sizeof(cudf::size_type),
                                 cudaMemcpyHostToDevice,
-                                stream.value()));
-  stream.synchronize();
+                                stream.get()));
+  stream.sync();
   return dev;
 }
 
@@ -134,7 +136,7 @@ class counting_filter : public iceberg_delete_filter {
  public:
   std::unique_ptr<cudf::table> apply(std::unique_ptr<cudf::table> tbl,
                                      batch_layout,
-                                     rmm::cuda_stream_view,
+                                     ::cuda::stream_ref,
                                      rmm::device_async_resource_ref) override
   {
     ++calls;
@@ -310,4 +312,40 @@ TEST_CASE("iceberg delete pipeline - refuses a batch that is all appended keys",
   std::vector<batch_row_run> runs{{"data-0.parquet", 0, 0, 2}};
   REQUIRE_THROWS_AS(pipeline.apply(std::move(batch), batch_layout{runs}, test_stream(), test_mr()),
                     std::invalid_argument);
+}
+
+TEST_CASE("Iceberg per-file positional filters preserve multi-file row positions",
+          "[scan_preparation][iceberg][positional_filter]")
+{
+  auto const legacy = GENERATE(false, true);
+  CAPTURE(legacy);
+  auto payload                             = std::make_shared<IcebergDeleteData>();
+  payload->positional_deletes["a.parquet"] = {1, 1, 6};
+  payload->positional_deletes["b.parquet"] = {2};
+  std::unique_ptr<positional_delete_filter> filter;
+  if (legacy) {
+    filter = std::make_unique<positional_delete_filter>(payload);
+  } else {
+    iceberg_delete_sets sets;
+    for (auto const& [path, positions] : payload->positional_deletes) {
+      auto owner = std::shared_ptr<std::vector<int64_t> const>(payload, &positions);
+      sets.emplace(path, std::make_shared<iceberg_delete_set const>(path, std::move(owner)));
+    }
+    sets.emplace("c.parquet", std::make_shared<iceberg_delete_set const>("c.parquet"));
+    filter = std::make_unique<positional_delete_filter>(std::move(sets));
+  }
+  std::weak_ptr<IcebergDeleteData const> owner = payload;
+  payload.reset();
+  CHECK_FALSE(owner.expired());
+  std::vector<batch_row_run> layout{
+    {"a.parquet", 5, 0, 4}, {"b.parquet", 0, 4, 3}, {"c.parquet", 0, 7, 3}};
+  CHECK(filter->affects(layout));
+  CHECK_FALSE(filter->affects(std::vector<batch_row_run>{{"c.parquet", 0, 0, 3}}));
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(int32_column({0, 1, 2, 3, 4, 5, 6, 7, 8, 9}));
+  auto result = filter->apply(
+    std::make_unique<cudf::table>(std::move(columns)), layout, test_stream(), test_mr());
+  CHECK(to_host(result->view().column(0)) == std::vector<int32_t>{0, 2, 3, 4, 5, 7, 8, 9});
+  filter.reset();
+  CHECK(owner.expired());
 }

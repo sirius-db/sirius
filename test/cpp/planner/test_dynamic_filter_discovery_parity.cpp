@@ -29,6 +29,7 @@
 #include "op/dynamic_filter/dynamic_filter_publish_plan.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
+#include "op/scan/sirius_physical_dynamic_filter.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "planner/dynamic_filter/build_filter_evidence.hpp"
 #include "planner/dynamic_filter/duckdb_join_filter_candidate_adapter.hpp"
@@ -42,6 +43,7 @@
 #include <duckdb/execution/column_binding_resolver.hpp>
 #include <duckdb/execution/operator/join/join_filter_pushdown.hpp>
 #include <duckdb/main/config.hpp>
+#include <duckdb/main/settings.hpp>
 #include <duckdb/optimizer/join_filter_pushdown_optimizer.hpp>
 #include <duckdb/optimizer/optimizer.hpp>
 #include <duckdb/parser/parser.hpp>
@@ -52,6 +54,7 @@
 #include <duckdb/planner/planner.hpp>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdio>
 #include <filesystem>
@@ -159,6 +162,7 @@ duckdb::unique_ptr<duckdb::LogicalOperator> optimize_query(
   disabled.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
   disabled.insert(OptimizerType::STATISTICS_PROPAGATION);
   disabled.insert(OptimizerType::JOIN_ORDER);
+  disabled.insert(OptimizerType::OUTER_JOIN_SIMPLIFICATION);
   disabled.insert(OptimizerType::BUILD_SIDE_PROBE_SIDE);
   for (auto const optimizer : also_disabled) {
     disabled.insert(optimizer);
@@ -167,7 +171,7 @@ duckdb::unique_ptr<duckdb::LogicalOperator> optimize_query(
   con.Query("BEGIN TRANSACTION");
   duckdb::unique_ptr<duckdb::LogicalOperator> plan;
   try {
-    Parser parser(context.GetParserOptions());
+    Parser parser(context);
     parser.ParseQuery(query);
     REQUIRE(!parser.statements.empty());
 
@@ -176,7 +180,7 @@ duckdb::unique_ptr<duckdb::LogicalOperator> optimize_query(
     REQUIRE(planner.plan);
 
     plan = std::move(planner.plan);
-    if (context.config.enable_optimizer) {
+    if (duckdb::Settings::Get<duckdb::EnableOptimizerSetting>(context)) {
       Optimizer optimizer(*planner.binder, context);
       plan = optimizer.Optimize(std::move(plan));
     }
@@ -210,7 +214,8 @@ parity_case plan_parity_case(Connection& con,
     }
 
     ColumnBindingResolver resolver;
-    ColumnBindingResolver::Verify(*original);
+    duckdb::ColumnBindingResolver verifier(true);
+    verifier.VisitOperator(*original);
     resolver.VisitOperator(*original);
 
     sirius::planner::sirius_physical_plan_generator gen(context);
@@ -226,21 +231,22 @@ parity_case plan_parity_case(Connection& con,
 // Return the binding DuckDB tracks for a plain reference or supported integral cast chain.
 std::optional<duckdb::ColumnBinding> oracle_probe_binding(duckdb::Expression const& expr)
 {
-  if (expr.return_type.IsNested()) { return std::nullopt; }
-  if (expr.return_type.id() == duckdb::LogicalTypeId::INTERVAL) { return std::nullopt; }
+  if (expr.GetReturnType().IsNested()) { return std::nullopt; }
+  if (expr.GetReturnType().id() == duckdb::LogicalTypeId::INTERVAL) { return std::nullopt; }
   switch (expr.GetExpressionClass()) {
     case duckdb::ExpressionClass::BOUND_COLUMN_REF:
-      return expr.Cast<duckdb::BoundColumnRefExpression>().binding;
-    case duckdb::ExpressionClass::BOUND_CAST: {
-      auto const& cast = expr.Cast<duckdb::BoundCastExpression>();
-      auto const& src  = cast.child->return_type;
-      auto const& tgt  = cast.return_type;
+      return expr.Cast<duckdb::BoundColumnRefExpression>().Binding();
+    case duckdb::ExpressionClass::BOUND_FUNCTION: {
+      if (!duckdb::BoundCastExpression::IsCast(expr)) { return std::nullopt; }
+      auto const& cast = expr.Cast<duckdb::BoundFunctionExpression>();
+      auto const& src  = duckdb::BoundCastExpression::Child(cast).GetReturnType();
+      auto const& tgt  = cast.GetReturnType();
       if (!src.IsIntegral() || !tgt.IsIntegral()) { return std::nullopt; }
       if (GetTypeIdSize(src.InternalType()) > GetTypeIdSize(duckdb::PhysicalType::INT64) ||
           GetTypeIdSize(tgt.InternalType()) > GetTypeIdSize(duckdb::PhysicalType::INT64)) {
         return std::nullopt;
       }
-      return oracle_probe_binding(*cast.child);
+      return oracle_probe_binding(duckdb::BoundCastExpression::Child(cast));
     }
     default: return std::nullopt;
   }
@@ -260,8 +266,8 @@ std::vector<oracle_key_target> oracle_targets_for_join(duckdb::LogicalComparison
   for (std::size_t condition_index = 0; condition_index < join_copy.conditions.size();
        ++condition_index) {
     auto const& condition = join_copy.conditions[condition_index];
-    if (condition.comparison != duckdb::ExpressionType::COMPARE_EQUAL) { continue; }
-    auto const binding = oracle_probe_binding(*condition.left);
+    if (condition.GetComparisonType() != duckdb::ExpressionType::COMPARE_EQUAL) { continue; }
+    auto const binding = oracle_probe_binding(condition.GetLHS());
     if (!binding.has_value()) { continue; }
 
     duckdb::JoinFilterPushdownColumn column;
@@ -283,9 +289,10 @@ std::vector<oracle_key_target> oracle_targets_for_join(duckdb::LogicalComparison
       }
       REQUIRE(output_ordinal.has_value());
       auto const table = get.GetTable();
-      found.push_back(oracle_key_target{.condition_index = condition_index,
-                                        .table_name      = table ? table->name : std::string{},
-                                        .output_ordinal  = *output_ordinal});
+      found.push_back(
+        oracle_key_target{.condition_index = condition_index,
+                          .table_name     = table ? table->name.GetIdentifierName() : std::string{},
+                          .output_ordinal = *output_ordinal});
     }
   }
   return found;
@@ -321,10 +328,13 @@ struct sirius_scan_binding {
   [[nodiscard]] bool operator==(sirius_scan_binding const&) const = default;
 };
 
-// Resolve the unique GPU scan that owns filter_set and return its base table name.
+// Resolve the unique GPU scan that owns filter_set and return its base table name. The scan's
+// consumer must carry the decode bindings of every endpoint column in push_ordinals; a native
+// scan's assembly is a leading identity, so each binds the decoder slot of the same index.
 std::string owning_scan_table_of(
   sirius_physical_operator* root,
-  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> const& filter_set)
+  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> const& filter_set,
+  std::vector<std::size_t> const& push_ordinals)
 {
   std::vector<sirius::op::scan::duckdb_native_ingestible_table_info const*> owners;
   for_each_operator(root, [&](sirius_physical_operator* op) {
@@ -333,7 +343,27 @@ std::string owning_scan_table_of(
     auto const* info = dynamic_cast<sirius::op::scan::duckdb_native_ingestible_table_info const*>(
       &scan.get_ingestible().table_info());
     REQUIRE(info != nullptr);
-    if (info->sirius_dynamic_filters.get() == filter_set.get()) { owners.push_back(info); }
+    if (scan.consumer() && scan.consumer()->channel() == filter_set) {
+      std::size_t wrappers = 0;
+      for_each_operator(root, [&](sirius_physical_operator* candidate) {
+        if (candidate->type != SiriusPhysicalOperatorType::DYNAMIC_FILTER ||
+            candidate->children.size() != 1 || candidate->children[0].get() != &scan) {
+          return;
+        }
+        auto const& endpoint = candidate->Cast<sirius::op::scan::sirius_physical_dynamic_filter>();
+        REQUIRE(endpoint.consumer() == scan.consumer());
+        ++wrappers;
+      });
+      REQUIRE(wrappers == 1);
+      auto const decode_bindings = scan.consumer()->decode_bindings();
+      REQUIRE_FALSE(decode_bindings.empty());
+      for (auto const ordinal : push_ordinals) {
+        REQUIRE(std::ranges::any_of(decode_bindings, [&](sirius::op::scan::binding const& entry) {
+          return entry.output_ordinal == ordinal && std::cmp_equal(entry.column_index, ordinal);
+        }));
+      }
+      owners.push_back(info);
+    }
   });
   REQUIRE(owners.size() == 1);
   return owners[0]->table_name;
@@ -346,7 +376,11 @@ std::vector<sirius_scan_binding> scan_bindings_of(sirius::op::sirius_physical_ha
   auto const& plan = hj.dynamic_filter_plan();
   for (auto const& target : plan.probe_targets()) {
     if (target.route_class != sirius::op::dynamic_filter_route_class::scan) { continue; }
-    auto table_name = owning_scan_table_of(root, target.filter_set);
+    std::vector<std::size_t> push_ordinals;
+    for (auto const& binding : target.key_bindings) {
+      push_ordinals.push_back(binding.channel_push_ordinal);
+    }
+    auto table_name = owning_scan_table_of(root, target.filter_set, push_ordinals);
     for (auto const& binding : target.key_bindings) {
       bindings.push_back(sirius_scan_binding{
         .condition_index =
@@ -484,11 +518,10 @@ TEST_CASE_METHOD(discovery_parity_fixture,
 }
 
 TEST_CASE_METHOD(discovery_parity_fixture,
-                 "discovery parity - LIMIT on the probe spine: DuckDB binds, Sirius refuses",
+                 "discovery parity - LIMIT on the probe spine: both refuse",
                  "[dynamic_filter][parity][isolated_context]")
 {
-  // Filtering below a position selection can change which rows LIMIT selects, so Sirius stops
-  // where DuckDB continues.
+  // Filtering below a position selection can change which rows LIMIT selects.
   dynamic_filter_on_guard filter_on(*con);
   auto c = plan_parity_case(*con,
                             "SELECT * FROM (SELECT * FROM big_left LIMIT 15) l "
@@ -497,8 +530,7 @@ TEST_CASE_METHOD(discovery_parity_fixture,
   auto joins = comparison_joins_of(*c.oracle_plan);
   REQUIRE(joins.size() == 1);
   auto const oracle = oracle_targets_for_join(*joins[0]);
-  REQUIRE(oracle.size() == 1);
-  REQUIRE(oracle[0].table_name == "big_left");
+  REQUIRE(oracle.empty());
 
   auto physical_joins = hash_joins_of(c.physical.get());
   REQUIRE(physical_joins.size() == 1);
@@ -506,7 +538,7 @@ TEST_CASE_METHOD(discovery_parity_fixture,
 }
 
 TEST_CASE_METHOD(discovery_parity_fixture,
-                 "discovery parity - TOP_N on the probe spine: DuckDB binds, Sirius refuses",
+                 "discovery parity - TOP_N on the probe spine: both refuse",
                  "[dynamic_filter][parity][isolated_context]")
 {
   dynamic_filter_on_guard filter_on(*con);
@@ -517,8 +549,7 @@ TEST_CASE_METHOD(discovery_parity_fixture,
   auto joins = comparison_joins_of(*c.oracle_plan);
   REQUIRE(joins.size() == 1);
   auto const oracle = oracle_targets_for_join(*joins[0]);
-  REQUIRE(oracle.size() == 1);
-  REQUIRE(oracle[0].table_name == "big_left");
+  REQUIRE(oracle.empty());
 
   auto physical_joins = hash_joins_of(c.physical.get());
   REQUIRE(physical_joins.size() == 1);
@@ -602,6 +633,38 @@ TEST_CASE_METHOD(discovery_parity_fixture,
                                               .table_name      = oracle[0].table_name,
                                               .push_ordinal    = oracle[0].output_ordinal}});
   }
+}
+
+TEST_CASE_METHOD(discovery_parity_fixture,
+                 "discovery parity - a UNION ALL probe fans into every arm",
+                 "[dynamic_filter][parity][isolated_context]")
+{
+  // Both walks descend a union positionally into every child, so one scan binds per arm. Every
+  // other case in this file follows a single spine.
+  dynamic_filter_on_guard filter_on(*con);
+  auto c = plan_parity_case(*con,
+                            "SELECT * FROM (SELECT id FROM big_left UNION ALL "
+                            "SELECT ckey FROM small_c) t "
+                            "JOIN small_right r ON t.id = r.rid WHERE r.other > 0");
+
+  auto joins = comparison_joins_of(*c.oracle_plan);
+  REQUIRE(joins.size() == 1);
+  auto const oracle = oracle_targets_for_join(*joins[0]);
+  REQUIRE(oracle.size() == 2);
+  REQUIRE(oracle[0].condition_index == 0);
+  REQUIRE(oracle[1].condition_index == 0);
+  REQUIRE(oracle[0].table_name == "big_left");
+  REQUIRE(oracle[1].table_name == "small_c");
+
+  auto physical_joins = hash_joins_of(c.physical.get());
+  REQUIRE(physical_joins.size() == 1);
+  REQUIRE(scan_bindings_of(*physical_joins[0], c.physical.get()) ==
+          std::vector<sirius_scan_binding>{{.condition_index = 0,
+                                            .table_name      = oracle[0].table_name,
+                                            .push_ordinal    = oracle[0].output_ordinal},
+                                           {.condition_index = 0,
+                                            .table_name      = oracle[1].table_name,
+                                            .push_ordinal    = oracle[1].output_ordinal}});
 }
 
 TEST_CASE_METHOD(discovery_parity_fixture,
@@ -712,21 +775,17 @@ TEST_CASE_METHOD(discovery_parity_fixture,
 }
 
 TEST_CASE_METHOD(discovery_parity_fixture,
-                 "discovery parity - per-key discovery binds the clean key DuckDB's joint walk "
-                 "abandons",
+                 "discovery parity - per-key discovery binds the clean key on both sides",
                  "[dynamic_filter][parity][isolated_context]")
 {
-  // DuckDB walks all hinted columns jointly and abandons the whole branch when any column fails;
-  // Sirius walks per key. The extra binding is still one DuckDB itself makes for that key in
-  // isolation.
+  // A computed key does not prevent either engine from binding the plain column key.
   dynamic_filter_on_guard filter_on(*con);
   auto c = plan_parity_case(*con,
                             "SELECT * FROM (SELECT id, val + 1 AS w FROM big_left) l "
                             "JOIN small_right r ON l.id = r.rid AND l.w = r.other "
                             "WHERE r.other > 0");
 
-  // DuckDB's own joint walk found nothing: no filter_pushdown was attached to the original join.
-  REQUIRE(c.original_join_had_pushdown == std::vector<bool>{false});
+  REQUIRE(c.original_join_had_pushdown == std::vector<bool>{true});
 
   auto joins = comparison_joins_of(*c.oracle_plan);
   REQUIRE(joins.size() == 1);
@@ -890,7 +949,8 @@ TEST_CASE_METHOD(discovery_parity_fixture,
   try {
     c.oracle_plan->ResolveOperatorTypes();
     ColumnBindingResolver resolver;
-    ColumnBindingResolver::Verify(*c.oracle_plan);
+    ColumnBindingResolver verifier(true);
+    verifier.VisitOperator(*c.oracle_plan);
     resolver.VisitOperator(*c.oracle_plan);
 
     sirius::planner::sirius_physical_plan_generator gen(*con->context);

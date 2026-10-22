@@ -18,6 +18,7 @@
 #include <cub/device/device_scan.cuh>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -36,27 +37,44 @@ inline void throw_on_cuda(cudaError_t err, char const* what)
   }
 }
 
-// Set this chunk's mask bits, and record how many survivors it has.
+// Set this chunk's mask words, and record how many survivors it has.
 //
-// The bit writes are atomic because a 32-bit word covers 32 rows and a chunk's
-// survivors are spread over the block's threads; the count is a single plain
-// store, since exactly one block owns each touched chunk.
+// One warp per touched chunk: a chunk typically holds only tens to hundreds of survivors, far too
+// little for a 256-thread block. The warp assembles the chunk's 32 mask words in a warp-private
+// shared buffer (shared atomics contend only within the warp) and writes them out as one coalesced
+// 128-byte store, instead of one global atomicOr per survivor. The warp owns the chunk's words, so
+// it writes all 32, zeros included. The count is a single plain store, since exactly one warp owns
+// each touched chunk.
 __global__ void to_mask_kernel(std::uint32_t const* __restrict__ chunk_ids,
                                std::uint32_t const* __restrict__ block_offsets,
                                std::uint16_t const* __restrict__ in_chunk_rows,
+                               std::int64_t num_touched,
                                std::uint32_t* __restrict__ mask_words,
                                std::uint32_t* __restrict__ counts)
 {
-  auto const b         = static_cast<std::int64_t>(blockIdx.x);
-  auto const chunk     = static_cast<std::int64_t>(chunk_ids[b]);
-  auto const word_base = chunk * (::codegen::kChunkSize / 32);
-  auto const lo        = block_offsets[b];
-  auto const hi        = block_offsets[b + 1];
-  for (std::uint32_t k = lo + threadIdx.x; k < hi; k += blockDim.x) {
-    std::uint32_t const pos = in_chunk_rows[k];
-    atomicOr(&mask_words[word_base + pos / 32], 1u << (pos % 32));
+  constexpr int kWordsPerChunk = ::codegen::kChunkSize / 32;
+  static_assert(kWordsPerChunk == 32, "one lane per mask word");
+  extern __shared__ std::uint32_t smem_words[];
+  int const lane             = threadIdx.x & 31;
+  std::uint32_t* const words = smem_words + (threadIdx.x >> 5) * kWordsPerChunk;
+  auto const warps_per_grid  = (static_cast<std::int64_t>(gridDim.x) * blockDim.x) >> 5;
+  for (auto b = (static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) >> 5;
+       b < num_touched;
+       b += warps_per_grid) {
+    auto const chunk = static_cast<std::int64_t>(chunk_ids[b]);
+    auto const lo    = block_offsets[b];
+    auto const hi    = block_offsets[b + 1];
+    words[lane]      = 0u;
+    __syncwarp();
+    for (std::uint32_t k = lo + lane; k < hi; k += 32) {
+      std::uint32_t const pos = in_chunk_rows[k];
+      atomicOr(&words[pos / 32], 1u << (pos % 32));
+    }
+    __syncwarp();
+    mask_words[chunk * kWordsPerChunk + lane] = words[lane];
+    if (lane == 0) { counts[chunk] = hi - lo; }
+    __syncwarp();
   }
-  if (threadIdx.x == 0) { counts[chunk] = hi - lo; }
 }
 
 __global__ void offsets_tail_kernel(std::uint32_t const* __restrict__ counts,
@@ -71,7 +89,7 @@ __global__ void offsets_tail_kernel(std::uint32_t const* __restrict__ counts,
 void row_set_to_mask(chunk_row_set const& rows,
                      std::uint32_t* mask_words,
                      std::uint32_t* all_chunk_offsets,
-                     rmm::cuda_stream_view stream,
+                     ::cuda::stream_ref stream,
                      rmm::device_async_resource_ref mr)
 {
   if (mask_words == nullptr || all_chunk_offsets == nullptr || rows.num_rows <= 0) {
@@ -85,27 +103,32 @@ void row_set_to_mask(chunk_row_set const& rows,
   // read as a survivor that does not exist.
   throw_on_cuda(
     cudaMemsetAsync(
-      mask_words, 0, static_cast<std::size_t>(num_words) * sizeof(std::uint32_t), stream.value()),
+      mask_words, 0, static_cast<std::size_t>(num_words) * sizeof(std::uint32_t), stream.get()),
     "mask clear");
 
   rmm::device_buffer counts(
     static_cast<std::size_t>(num_chunks) * sizeof(std::uint32_t), stream, mr);
-  throw_on_cuda(cudaMemsetAsync(counts.data(),
-                                0,
-                                static_cast<std::size_t>(num_chunks) * sizeof(std::uint32_t),
-                                stream.value()),
-                "counts clear");
+  throw_on_cuda(
+    cudaMemsetAsync(
+      counts.data(), 0, static_cast<std::size_t>(num_chunks) * sizeof(std::uint32_t), stream.get()),
+    "counts clear");
 
   if (rows.num_survivors > 0) {
     if (!rows.valid()) {
       throw std::runtime_error("chunk_row_set_convert: mask expansion from an invalid row set");
     }
-    to_mask_kernel<<<static_cast<unsigned>(rows.num_touched), kBlock, 0, stream.value()>>>(
-      rows.chunk_ids,
-      rows.block_offsets,
-      rows.in_chunk_rows,
-      mask_words,
-      static_cast<std::uint32_t*>(counts.data()));
+    constexpr int kWarpsPerBlock = kBlock / 32;
+    auto const grid              = static_cast<unsigned>(
+      std::min<std::int64_t>((rows.num_touched + kWarpsPerBlock - 1) / kWarpsPerBlock, 65535));
+    to_mask_kernel<<<grid,
+                     kBlock,
+                     kWarpsPerBlock*(::codegen::kChunkSize / 32) * sizeof(std::uint32_t),
+                     stream.get()>>>(rows.chunk_ids,
+                                     rows.block_offsets,
+                                     rows.in_chunk_rows,
+                                     rows.num_touched,
+                                     mask_words,
+                                     static_cast<std::uint32_t*>(counts.data()));
     throw_on_cuda(cudaPeekAtLastError(), "to_mask launch");
   }
 
@@ -115,7 +138,7 @@ void row_set_to_mask(chunk_row_set const& rows,
                                               static_cast<std::uint32_t const*>(counts.data()),
                                               all_chunk_offsets,
                                               static_cast<int>(num_chunks),
-                                              stream.value()),
+                                              stream.get()),
                 "chunk offsets scan probe");
   rmm::device_buffer tmp(tmp_bytes, stream, mr);
   throw_on_cuda(cub::DeviceScan::ExclusiveSum(tmp.data(),
@@ -123,9 +146,9 @@ void row_set_to_mask(chunk_row_set const& rows,
                                               static_cast<std::uint32_t const*>(counts.data()),
                                               all_chunk_offsets,
                                               static_cast<int>(num_chunks),
-                                              stream.value()),
+                                              stream.get()),
                 "chunk offsets scan");
-  offsets_tail_kernel<<<1, 1, 0, stream.value()>>>(
+  offsets_tail_kernel<<<1, 1, 0, stream.get()>>>(
     static_cast<std::uint32_t const*>(counts.data()), num_chunks, all_chunk_offsets);
   throw_on_cuda(cudaPeekAtLastError(), "chunk offsets tail launch");
 }

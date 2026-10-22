@@ -1,0 +1,36 @@
+target_sources(
+  sirius_objects
+  PRIVATE config.cpp
+          debug_utils.cpp
+          pin_table.cpp
+          sirius_config.cpp
+          sirius_context.cpp
+          sirius_engine.cpp
+          sirius_extension.cpp
+          sirius_ffi.cpp
+          sirius_interface.cpp
+          sirius_sql_rewrite.cpp)
+
+add_subdirectory(compression)
+add_subdirectory(creator)
+add_subdirectory(cuda)
+add_subdirectory(data)
+add_subdirectory(downgrade)
+add_subdirectory(event)
+add_subdirectory(exec)
+add_subdirectory(expression)
+add_subdirectory(expression_evaluator)
+add_subdirectory(helper)
+add_subdirectory(io)
+add_subdirectory(late_mat)
+add_subdirectory(log)
+add_subdirectory(memory)
+add_subdirectory(op)
+add_subdirectory(parallel)
+add_subdirectory(pipeline)
+add_subdirectory(planner)
+add_subdirectory(scan_manager)
+add_subdirectory(telemetry)
+add_subdirectory(transparent)
+add_subdirectory(util)
+add_subdirectory(vss)

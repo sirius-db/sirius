@@ -35,6 +35,10 @@ namespace {
 template <event_type>
 inline constexpr bool unhandled_event_type = false;
 
+// A hook may stop itself while another thread is joining it under _mtx.
+// Identify that call without reading _worker or acquiring the lifecycle lock.
+thread_local query_event_subscriber* current_subscriber = nullptr;
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -42,8 +46,9 @@ inline constexpr bool unhandled_event_type = false;
 // ---------------------------------------------------------------------------
 
 query_event_subscriber::query_event_subscriber(query_event_publisher& publisher,
-                                               std::span<event_type const> events)
-  : _publisher(publisher.weak_from_this())
+                                               std::span<event_type const> events,
+                                               bool drain_on_stop)
+  : _publisher(publisher.weak_from_this()), _drain_on_stop(drain_on_stop)
 {
   if (_publisher.expired()) {
     throw std::invalid_argument("query_event_publisher must be owned by a shared_ptr");
@@ -58,19 +63,14 @@ query_event_subscriber::query_event_subscriber(query_event_publisher& publisher,
 }
 
 query_event_subscriber::query_event_subscriber(query_event_publisher& publisher,
-                                               std::initializer_list<event_type> events)
-  : query_event_subscriber(publisher, std::span<event_type const>{events.begin(), events.size()})
+                                               std::initializer_list<event_type> events,
+                                               bool drain_on_stop)
+  : query_event_subscriber(
+      publisher, std::span<event_type const>{events.begin(), events.size()}, drain_on_stop)
 {
 }
 
-query_event_subscriber::~query_event_subscriber()
-{
-  stop();  // A hook that stops its own subscriber would be joining itself, which throws
-  // -- and throwing out of a noexcept function terminates.  Leave instead: the
-  // mailbox is closed, so the worker exits as soon as the hook returns, and
-  // @c ~jthread joins it.
-  if (_worker.joinable()) { _worker.join(); }
-}
+query_event_subscriber::~query_event_subscriber() { stop(); }
 
 // ---------------------------------------------------------------------------
 // lifecycle (just a gate on the worker)
@@ -90,26 +90,28 @@ void query_event_subscriber::start()
   set_thread_name();
 }
 
-void query_event_subscriber::stop() noexcept
+void query_event_subscriber::close_mailbox() noexcept
 {
-  std::lock_guard g{_mtx};
-  if (_state == worker_state::stopped) { return; }
-  auto const was_running = _state == worker_state::running;
-  _state                 = worker_state::stopped;  // terminal: @ref start is a no-op from here
-
   if (auto publisher = _publisher.lock()) { publisher->unregister_subscriber(_queue); }
-
   try {
     _queue->interrupt();
   } catch (...) {  // NOLINT(bugprone-empty-catch)
   }
+}
 
-  // A hook that stops its own subscriber would be joining itself, which throws
-  // -- and throwing out of a noexcept function terminates.  Leave instead: the
-  // mailbox is closed, so the worker exits as soon as the hook returns, and
-  // the destructor's @c ~jthread joins it.
-  if (!was_running || _worker.get_id() == std::this_thread::get_id()) { return; }
-  _worker.join();
+void query_event_subscriber::stop() noexcept
+{
+  if (current_subscriber == this) {
+    // The owner may already be joining this worker. Close without taking _mtx
+    // or joining ourselves; the owner's next stop still joins the final drain.
+    close_mailbox();
+    return;
+  }
+  std::lock_guard g{_mtx};
+  if (_state == worker_state::stopped) { return; }
+  _state = worker_state::stopped;  // terminal: @ref start is a no-op from here
+  close_mailbox();
+  if (_worker.joinable()) { _worker.join(); }
 }
 
 // ---------------------------------------------------------------------------
@@ -158,13 +160,30 @@ void query_event_subscriber::on_wait_for_memory_for_task(
 // worker
 // ---------------------------------------------------------------------------
 
+void query_event_subscriber::on_compressed_materialization(event_id_t,
+                                                           timestamp_t,
+                                                           compressed_materialization_activity,
+                                                           std::uint64_t) noexcept
+{
+}
+
 void query_event_subscriber::run() noexcept
 {
+  current_subscriber = this;
   // pop() returns null exactly once the mailbox closes, which every teardown
   // path does -- so the loop needs no second exit condition of its own.
   while (auto event = _queue->pop()) {
     dispatch(*event);
   }
+  // Both stop paths remove the mailbox from routing under the exclusive lock
+  // before interrupting it, so no producer can enqueue after this drain starts.
+  // try_pop skips interrupt sentinels, including those in other producer queues.
+  if (_drain_on_stop) {
+    while (auto event = _queue->try_pop()) {
+      dispatch(*event);
+    }
+  }
+  current_subscriber = nullptr;
   _worker_live.store(false, std::memory_order_release);
 }
 
@@ -191,6 +210,8 @@ void query_event_subscriber::dispatch(query_events const& event) noexcept
             on_memory_downgrade_for_task(e.event_id, e.timestamp, args...);
           } else if constexpr (type == event_type::wait_for_memory_for_task) {
             on_wait_for_memory_for_task(e.event_id, e.timestamp, args...);
+          } else if constexpr (type == event_type::compressed_materialization) {
+            on_compressed_materialization(e.event_id, e.timestamp, args...);
           } else {
             static_assert(unhandled_event_type<type>, "unhandled event_type");
           }

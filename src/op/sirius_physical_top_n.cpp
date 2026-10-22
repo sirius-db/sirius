@@ -56,7 +56,7 @@ std::unique_ptr<cudf::table> sorted_order_top_k(cudf::table_view input,
                                                 std::vector<cudf::order> const& key_orders,
                                                 std::vector<cudf::null_order> const& null_orders,
                                                 cudf::size_type keep_rows,
-                                                rmm::cuda_stream_view stream,
+                                                ::cuda::stream_ref stream,
                                                 rmm::device_async_resource_ref memory_resource)
 {
   auto indices = cudf::sorted_order(keys, key_orders, null_orders, stream, memory_resource);
@@ -76,24 +76,24 @@ std::unique_ptr<cudf::table> compute_top_n_table(
   duckdb::vector<duckdb::BoundOrderByNode> const& orders,
   std::size_t limit,
   std::size_t offset,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref memory_resource)
 {
-  if (limit == 0 || input.num_rows() == 0) { return duckdb::make_empty_like(input); }
+  if (limit == 0 || input.num_rows() == 0) { return cudf::empty_like(input); }
   if (orders.empty()) { throw internal_exception("TopN requires at least one ordering key"); }
 
   auto const keep_rows =
     std::min<cudf::size_type>(input.num_rows(), static_cast<cudf::size_type>(offset + limit));
-  if (keep_rows == 0) { return duckdb::make_empty_like(input); }
+  if (keep_rows == 0) { return cudf::empty_like(input); }
 
   std::unique_ptr<cudf::table> kept;
   if (orders.size() == 1) {
     auto const& ord = orders[0];
-    if (ord.expression->expression_class != duckdb::ExpressionClass::BOUND_REF) {
+    if (ord.expression->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
       throw not_implemented_exception("TopN only supports bound reference expressions");
     }
-    auto const idx =
-      static_cast<cudf::size_type>(ord.expression->Cast<duckdb::BoundReferenceExpression>().index);
+    auto const idx = static_cast<cudf::size_type>(
+      ord.expression->Cast<duckdb::BoundReferenceExpression>().Index());
     if (idx < 0 || idx >= input.num_columns()) {
       throw internal_exception("TopN order index out of range");
     }
@@ -134,11 +134,11 @@ std::unique_ptr<cudf::table> compute_top_n_table(
     null_orders.reserve(orders.size());
 
     for (auto const& ord : orders) {
-      if (ord.expression->expression_class != duckdb::ExpressionClass::BOUND_REF) {
+      if (ord.expression->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
         throw not_implemented_exception("TopN only supports bound reference expressions");
       }
       auto const idx = static_cast<cudf::size_type>(
-        ord.expression->Cast<duckdb::BoundReferenceExpression>().index);
+        ord.expression->Cast<duckdb::BoundReferenceExpression>().Index());
       if (idx < 0 || idx >= input.num_columns()) {
         throw internal_exception("TopN order index out of range");
       }
@@ -180,7 +180,7 @@ sirius_physical_top_n::sirius_physical_top_n(
 sirius_physical_top_n::~sirius_physical_top_n() {}
 
 std::unique_ptr<operator_data> sirius_physical_top_n::execute(const operator_data& input_data,
-                                                              rmm::cuda_stream_view stream)
+                                                              ::cuda::stream_ref stream)
 {
   nvtx_scoped_range nvtx_range{"sirius_physical_top_n::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
@@ -266,7 +266,7 @@ sirius_physical_top_n_merge::sirius_physical_top_n_merge(
 }
 
 std::unique_ptr<operator_data> sirius_physical_top_n_merge::execute(const operator_data& input_data,
-                                                                    rmm::cuda_stream_view stream)
+                                                                    ::cuda::stream_ref stream)
 {
   nvtx_scoped_range nvtx_range{"sirius_physical_top_n_merge::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
@@ -312,7 +312,7 @@ std::unique_ptr<operator_data> sirius_physical_top_n_merge::execute(const operat
   auto output_table = compute_top_n_table(
     combined->view(), orders, limit, offset, stream, space->get_default_allocator());
   if (output_table->num_rows() <= static_cast<cudf::size_type>(offset)) {
-    output_table = duckdb::make_empty_like(output_table->view());
+    output_table = cudf::empty_like(output_table->view());
   } else if (offset > 0) {
     auto out_start = static_cast<cudf::size_type>(offset);
     auto out_slices =

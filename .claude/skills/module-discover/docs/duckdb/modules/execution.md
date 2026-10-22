@@ -39,9 +39,7 @@ public:
 **Description**: Base class for all physical operators. Sirius walks the physical plan tree to map operators to GPU equivalents.
 
 **Our usage**:
-- `src/gpu_physical_plan_generator.cpp` — Read operator type, children, types to create GPU operators
 - `src/planner/sirius_physical_plan_generator.cpp` — Same for new code path
-- `test/cpp/pipeline/test_modified_pipeline.cpp` — Build test physical plans
 
 ### ExecutionContext
 
@@ -58,7 +56,6 @@ struct ExecutionContext {
 **Description**: Bundles the client context, thread context, and current pipeline for operator execution.
 
 **Our usage**:
-- `src/operator/gpu_physical_table_scan.cpp` — Passed to DuckDB scan functions
 - `src/op/scan/duckdb_scan_task.cpp` — Created for DuckDB-side table scans
 - `test/cpp/config/test_context.cpp` — Test execution context creation
 
@@ -78,7 +75,6 @@ public:
 
 **Our usage**:
 - `src/sirius_extension.cpp` — Run on logical plan before GPU physical plan generation
-- `test/cpp/pipeline/test_modified_pipeline.cpp` — Resolve bindings in test plans
 - `test/cpp/integration/test_tpcds_plan_translation.cpp` — Resolve bindings for TPC-DS plans
 
 ### PhysicalPlanGenerator
@@ -96,8 +92,6 @@ public:
 **Description**: Converts a logical plan to a physical plan. Sirius uses a modified version to generate GPU physical operators.
 
 **Our usage**:
-- `src/plan/gpu_plan_aggregate.cpp` — Reference DuckDB's aggregate physical plan generation
-- `src/plan/gpu_plan_recursive_cte.cpp` — Reference DuckDB's CTE handling
 
 ### PhysicalHashAggregate / PhysicalPerfectHashAggregate
 
@@ -106,7 +100,6 @@ public:
 **Description**: DuckDB's concrete aggregate operators. Sirius reads their configuration (groups, aggregates, filter) but replaces execution with GPU.
 
 **Our usage**:
-- `src/plan/gpu_plan_aggregate.cpp` — Read aggregate configuration from DuckDB's physical plan
 
 ## APIs Available but Not Used
 

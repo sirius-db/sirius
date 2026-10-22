@@ -1,0 +1,710 @@
+/*
+ * Copyright 2026, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "planner/connector_registry.hpp"
+
+#include "exec/stream_plan_bindings.hpp"
+#include "helper/type_conversions.hpp"
+#include "log/logging.hpp"
+#include "op/scan/duckdb_native_metadata.hpp"
+#include "op/scan/dynamic_filter_merge.hpp"
+#include "op/sirius_physical_table_scan.hpp"
+#include "planner/connector_reference_cache.hpp"
+#include "planner/duckdb_host.hpp"
+#include "sirius_registration.hpp"
+
+#include <dlfcn.h>
+#include <duckdb/catalog/catalog.hpp>
+#include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
+#include <duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp>
+#include <duckdb/common/file_system.hpp>
+#include <duckdb/common/multi_file/multi_file_reader.hpp>
+#include <duckdb/common/multi_file/multi_file_states.hpp>
+#include <duckdb/common/multi_file/table_function_multi_file.hpp>
+#include <duckdb/execution/operator/scan/physical_table_scan.hpp>
+#include <duckdb/function/table/table_scan.hpp>
+#include <duckdb/main/attached_database.hpp>
+#include <duckdb/main/database.hpp>
+#include <duckdb/main/extension/extension_loader.hpp>
+#include <duckdb/main/extension/external_extension_provider.hpp>
+#include <duckdb/main/extension_helper.hpp>
+#include <duckdb/main/extension_manager.hpp>
+#include <duckdb/main/settings.hpp>
+#include <duckdb/planner/extension_callback.hpp>
+#include <duckdb/planner/operator/logical_get.hpp>
+#include <duckdb/storage/single_file_block_manager.hpp>
+#include <duckdb/storage/storage_manager.hpp>
+#include <link.h>
+#include <parquet_extension.hpp>
+
+#include <array>
+#include <mutex>
+#include <tuple>
+#include <unordered_set>
+
+extern "C" int32_t duckdb_extension_parquet_describe(duckdb_extension_descriptor*);
+
+namespace sirius::planner {
+namespace {
+using kind  = op::scan::source_kind;
+using mode  = op::scan::dynamic_filter_apply_mode;
+using bytes = transparent::byte_source_class;
+
+template <class T>
+bool matches_bind(duckdb::FunctionData const* bind)
+{
+  return dynamic_cast<T const*>(bind) != nullptr;
+}
+
+bool collect_iceberg_field_ids(std::vector<duckdb::MultiFileColumnDefinition> const& columns)
+{
+  if (columns.empty()) return false;
+  for (auto const& column : columns) {
+    if (column.identifier.IsNull() ||
+        column.identifier.type().id() != duckdb::LogicalTypeId::INTEGER)
+      return false;
+    if (!column.children.empty() && !collect_iceberg_field_ids(column.children)) return false;
+  }
+  return true;
+}
+
+op::scan::certification_result supported_parquet(op::scan::bound_table_scan const&,
+                                                 op::sirius_physical_table_scan const&,
+                                                 duckdb::ClientContext&,
+                                                 scan_contract_provenance&)
+{
+  op::scan::certification_result result;
+  result.verdict      = op::scan::eligibility_verdict::supported;
+  result.later_checks = op::scan::check_bit(op::scan::later_check::footer_per_file) |
+                        op::scan::check_bit(op::scan::later_check::profile_per_file);
+  return result;
+}
+
+op::scan::certification_result supported_iceberg(op::scan::bound_table_scan const& contract,
+                                                 op::sirius_physical_table_scan const& scan,
+                                                 duckdb::ClientContext& context,
+                                                 scan_contract_provenance& provenance)
+{
+  auto result = supported_parquet(contract, scan, context, provenance);
+  if (!iceberg_table_schema_has_field_ids(scan.bind_data.get())) {
+    result.verdict = op::scan::eligibility_verdict::unsupported;
+    result.reason  = op::scan::verdict_reason::iceberg_table_schema_no_field_ids;
+    result.reason_text =
+      "iceberg_scan table schema has no complete field-id mapping; the GPU path requires "
+      "field IDs to prove per-file schema correspondence";
+    result.later_checks = {};
+    return result;
+  }
+  result.later_checks |= op::scan::check_bit(op::scan::later_check::schema_per_file);
+  return result;
+}
+
+op::scan::certification_result supported_native(op::scan::bound_table_scan const&,
+                                                op::sirius_physical_table_scan const& scan,
+                                                duckdb::ClientContext&,
+                                                scan_contract_provenance&)
+{
+  op::scan::certification_result result;
+  result.verdict      = op::scan::eligibility_verdict::supported;
+  result.later_checks = op::scan::check_bit(op::scan::later_check::segments_per_range) |
+                        op::scan::check_bit(op::scan::later_check::matrix_per_range);
+
+  duckdb::vector<duckdb::idx_t> fallback_ids;
+  if (scan.projection_ids.empty()) {
+    for (duckdb::idx_t index = 0; index < scan.column_ids.size(); ++index) {
+      fallback_ids.push_back(index);
+    }
+  }
+  auto const& source_ids = scan.projection_ids.empty() ? fallback_ids : scan.projection_ids;
+  std::vector<op::scan::projected_column> projected_cols;
+  std::vector<sirius::logical_type> projected_types;
+  projected_cols.reserve(source_ids.size());
+  projected_types.reserve(source_ids.size());
+  for (std::size_t index = 0; index < source_ids.size(); ++index) {
+    auto const& column = scan.column_ids.at(source_ids[index]);
+    op::scan::projected_column projected;
+    projected.is_rowid = column.IsRowIdColumn();
+    if (!projected.is_rowid) {
+      projected.storage_idx = duckdb::StorageIndex(column.GetPrimaryIndex());
+    }
+    projected_cols.push_back(projected);
+    projected_types.push_back(index < scan.types.size()
+                                ? scan.types[index]
+                                : scan.returned_types.at(column.GetPrimaryIndex()));
+  }
+  if (auto text = op::scan::unsupported_projected_type_reason(projected_cols, projected_types)) {
+    result.verdict = op::scan::eligibility_verdict::unsupported;
+    result.reason  = op::scan::verdict_reason::native_type_unenumerated;
+    for (std::size_t index = 0; index < projected_types.size(); ++index) {
+      if (projected_cols[index].is_rowid) continue;
+      if (!op::scan::unsupported_projected_type_reason({projected_cols[index]},
+                                                       {projected_types[index]})) {
+        continue;
+      }
+      auto const& type = projected_types[index];
+      switch (type.id()) {
+        case sirius::type_id::HUGEINT:
+        case sirius::type_id::UHUGEINT:
+          result.reason = op::scan::verdict_reason::native_type_128bit;
+          break;
+        case sirius::type_id::STRUCT:
+        case sirius::type_id::LIST:
+          result.reason = op::scan::verdict_reason::native_type_nested;
+          break;
+        case sirius::type_id::DECIMAL:
+          result.reason = op::scan::verdict_reason::native_type_decimal128;
+          break;
+        case sirius::type_id::ARRAY:
+          result.reason = type.has_child() ? op::scan::verdict_reason::native_array_element
+                                           : op::scan::verdict_reason::native_array_child;
+          break;
+        case sirius::type_id::INVALID:
+        case sirius::type_id::SQLNULL:
+          result.reason = op::scan::verdict_reason::native_type_sentinel;
+          break;
+        default: break;
+      }
+      break;
+    }
+    result.reason_text = "duckdb-native scan rejected query: " + *text;
+    return result;
+  }
+
+  auto const* bind = dynamic_cast<duckdb::TableScanBindData const*>(scan.bind_data.get());
+  if (!bind || !bind->table.IsDuckTable()) {
+    result.verdict = op::scan::eligibility_verdict::unsupported;
+    result.reason  = op::scan::verdict_reason::native_block_manager;
+    result.reason_text =
+      "[prepare_duckdb_native_walk] duckdb-native scan rejected query: "
+      "requires a single-file block manager";
+    return result;
+  }
+  auto& storage = bind->table.Cast<duckdb::DuckTableEntry>().GetStorage();
+  auto& manager = storage.GetAttached().GetStorageManager();
+  if (!dynamic_cast<duckdb::SingleFileBlockManager const*>(&manager.GetBlockManager())) {
+    result.verdict = op::scan::eligibility_verdict::unsupported;
+    result.reason  = op::scan::verdict_reason::native_block_manager;
+    result.reason_text =
+      "[prepare_duckdb_native_walk] duckdb-native scan rejected query: "
+      "requires a single-file block manager";
+    return result;
+  }
+  if (manager.IsEncrypted()) {
+    result.verdict = op::scan::eligibility_verdict::unsupported;
+    result.reason  = op::scan::verdict_reason::native_encrypted;
+    result.reason_text =
+      "duckdb-native scan rejected query: encrypted storage is not GPU-decodable";
+    return result;
+  }
+  if (!manager.HasStorageVersion() ||
+      manager.GetStorageVersion() < duckdb::StorageVersion::V0_10_2 ||
+      manager.GetStorageVersion() > duckdb::StorageVersion::V2_0_0) {
+    result.verdict     = op::scan::eligibility_verdict::unsupported;
+    result.reason      = op::scan::verdict_reason::native_storage_version_unqualified;
+    result.reason_text = "duckdb-native scan rejected query: storage version is not qualified";
+    return result;
+  }
+  result.storage_version = static_cast<uint64_t>(manager.GetStorageVersion());
+  return result;
+}
+
+connector make_seq_scan_connector()
+{
+  return {.function_name              = "seq_scan",
+          .kind                       = kind::duckdb_native,
+          .registry_profile           = "duckdb.seq_scan.v1",
+          .bind_data_matches          = matches_bind<duckdb::TableScanBindData>,
+          .lower                      = lower_native_scan,
+          .filter_mode                = mode::INCLUDE_AST_ROW_MASKS,
+          .byte_source                = bytes::duckdb_native,
+          .permits_cpu_replay         = true,
+          .selector_outside_bind_data = false,
+          .decline_reason             = nullptr,
+          .provider                   = std::nullopt,
+          .certify                    = supported_native};
+}
+
+connector make_parquet_scan_connector()
+{
+  return {.function_name              = "parquet_scan",
+          .kind                       = kind::parquet_local,
+          .registry_profile           = "duckdb.parquet_scan.v1",
+          .bind_data_matches          = matches_bind<duckdb::MultiFileBindData>,
+          .lower                      = lower_parquet_scan,
+          .filter_mode                = mode::MEMBERSHIP_MASKS_ONLY,
+          .byte_source                = bytes::local_file,
+          .permits_cpu_replay         = true,
+          .selector_outside_bind_data = false,
+          .decline_reason             = nullptr,
+          .provider                   = std::nullopt,
+          .certify                    = supported_parquet};
+}
+
+connector make_read_parquet_connector()
+{
+  return {.function_name              = "read_parquet",
+          .kind                       = kind::parquet_local,
+          .registry_profile           = "duckdb.read_parquet.v1",
+          .bind_data_matches          = matches_bind<duckdb::MultiFileBindData>,
+          .lower                      = lower_parquet_scan,
+          .filter_mode                = mode::MEMBERSHIP_MASKS_ONLY,
+          .byte_source                = bytes::local_file,
+          .permits_cpu_replay         = true,
+          .selector_outside_bind_data = false,
+          .decline_reason             = nullptr,
+          .provider                   = std::nullopt,
+          .certify                    = supported_parquet};
+}
+
+connector make_sirius_read_parquet_connector()
+{
+  return {.function_name              = "sirius_read_parquet",
+          .kind                       = kind::parquet_s3,
+          .registry_profile           = "sirius.read_parquet.v1",
+          .bind_data_matches          = matches_bind<duckdb::SiriusReadParquetBindData>,
+          .lower                      = lower_parquet_scan,
+          .filter_mode                = mode::MEMBERSHIP_MASKS_ONLY,
+          .byte_source                = bytes::sirius_owned_s3,
+          .permits_cpu_replay         = false,
+          .selector_outside_bind_data = false,
+          .decline_reason             = nullptr,
+          .provider                   = std::nullopt,
+          .certify                    = supported_parquet};
+}
+
+connector make_iceberg_scan_connector()
+{
+  return {.function_name              = "iceberg_scan",
+          .kind                       = kind::parquet_local,
+          .registry_profile           = "duckdb.iceberg_scan.v1",
+          .bind_data_matches          = matches_bind<duckdb::MultiFileBindData>,
+          .lower                      = lower_iceberg_scan,
+          .filter_mode                = mode::MEMBERSHIP_MASKS_ONLY,
+          .byte_source                = bytes::local_file,
+          .permits_cpu_replay         = true,
+          .selector_outside_bind_data = true,
+          .decline_reason             = registered_iceberg_decline_reason,
+          .provider                   = std::nullopt,
+          .certify                    = supported_iceberg};
+}
+
+connector make_sirius_stream_source_connector()
+{
+  return {.function_name              = "sirius_stream_source",
+          .kind                       = kind::stream_source,
+          .registry_profile           = "sirius.stream_source.v1",
+          .bind_data_matches          = matches_bind<exec::stream_source_bind_data>,
+          .lower                      = nullptr,
+          .filter_mode                = mode::MEMBERSHIP_MASKS_ONLY,
+          .byte_source                = bytes::stream,
+          .permits_cpu_replay         = false,
+          .selector_outside_bind_data = false,
+          .decline_reason             = nullptr,
+          .provider                   = std::nullopt,
+          .certify                    = nullptr};
+}
+
+std::array<connector, 6> const entries{make_seq_scan_connector(),
+                                       make_parquet_scan_connector(),
+                                       make_read_parquet_connector(),
+                                       make_sirius_read_parquet_connector(),
+                                       make_iceberg_scan_connector(),
+                                       make_sirius_stream_source_connector()};
+
+duckdb::vector<duckdb::TableFunction> copy_functions(duckdb::TableFunctionSet const& functions)
+{
+  duckdb::vector<duckdb::TableFunction> result;
+  for (auto const& function : functions.functions)
+    result.push_back(*function);
+  return result;
+}
+
+duckdb_extension_describe_t host_parquet_descriptor(duckdb::DatabaseInstance& db)
+{
+  return detail::host_factory(
+    db, &duckdb_extension_parquet_describe, "duckdb_extension_parquet_describe");
+}
+
+duckdb::vector<duckdb::TableFunction> parquet_reference_functions(duckdb::DatabaseInstance& db,
+                                                                  std::string const& name)
+{
+  auto init = host_parquet_descriptor(db);
+  if (!init) return {};
+  duckdb::DBConfig config;
+  config.options.load_extensions = false;
+  config.options.maximum_threads = 1;
+  duckdb::DuckDB reference(nullptr, &config);
+  // Register the host's implementation in a private catalog, independent of user replacements.
+  reference.LoadStaticExtension(init);
+  duckdb::ExtensionLoader loader(*reference.instance, "parquet");
+  auto entry = loader.TryGetTableFunction(duckdb::Identifier(name));
+  return entry ? copy_functions(entry->Cast<duckdb::TableFunctionCatalogEntry>().functions)
+               : duckdb::vector<duckdb::TableFunction>{};
+}
+
+duckdb::vector<duckdb::TableFunction> iceberg_reference_functions(duckdb::DatabaseInstance& db)
+{
+  auto info = duckdb::ExtensionManager::Get(db).GetExtensionInfo("iceberg");
+  if (!info || !info->is_loaded || !info->install_info) return {};
+
+  auto& fs = db.GetFileSystem();
+  duckdb::vector<std::string> paths;
+  if (info->install_info->mode == duckdb::ExtensionInstallMode::NOT_INSTALLED) {
+    paths.push_back(info->install_info->full_path);
+  } else {
+    for (auto const& directory : duckdb::ExtensionHelper::GetExtensionDirectoryPath(db, fs))
+      paths.push_back(fs.JoinPath(directory, "iceberg.duckdb_extension"));
+  }
+  for (auto const& path : paths) {
+    // Only an extension DuckDB has already loaded may supply the reference definition.
+    auto* handle = ::dlopen(path.c_str(), RTLD_NOW | RTLD_NOLOAD);
+    if (!handle) continue;
+    auto close = [](void* value) { ::dlclose(value); };
+    std::unique_ptr<void, decltype(close)> guard(handle, close);
+    using initialize = void (*)(duckdb::ExtensionLoader&);
+    auto init        = reinterpret_cast<initialize>(::dlsym(handle, "iceberg_duckdb_cpp_init"));
+    if (!init) continue;
+
+    // Iceberg hides its function factory. Run its existing registration entry point in a
+    // private, CPU-only catalog, never the caller's mutable catalog. No scan is bound here.
+    duckdb::DBConfig config;
+    config.options.load_extensions = false;
+    config.options.maximum_threads = 1;
+    // Iceberg loads Avro into this private catalog under the host's signature policy.
+    config.SetOptionByName(
+      "allow_unsigned_extensions",
+      duckdb::Value::BOOLEAN(duckdb::Settings::Get<duckdb::AllowUnsignedExtensionsSetting>(db)));
+    duckdb::DuckDB reference(nullptr, &config);
+    // The host outlives this private catalog; reuse its provider for Iceberg's Avro dependency.
+    duckdb::DBConfig::GetConfig(*reference.instance)
+      .SetExternalExtensionProvider(duckdb::shared_ptr<duckdb::ExternalExtensionProvider>(
+        &duckdb::DBConfig::GetConfig(db).GetExternalExtensionProvider(),
+        [](duckdb::ExternalExtensionProvider*) {}));
+    auto parquet_init = host_parquet_descriptor(db);
+    if (!parquet_init) return {};
+    reference.LoadStaticExtension(parquet_init);
+    duckdb::ExtensionLoader loader(*reference.instance, "iceberg");
+    init(loader);
+    auto entry = loader.TryGetTableFunction("iceberg_scan");
+    if (entry) return copy_functions(entry->Cast<duckdb::TableFunctionCatalogEntry>().functions);
+  }
+  return {};
+}
+
+duckdb::vector<duckdb::TableFunction> reference_functions(std::string const& name,
+                                                          duckdb::ClientContext& context)
+{
+  auto& db = duckdb::DatabaseInstance::GetDatabase(context);
+  if (name == "seq_scan") {
+    auto get = detail::host_factory(
+      db, &duckdb::TableScanFunction::GetFunction, "_ZN6duckdb17TableScanFunction11GetFunctionEv");
+    return get ? duckdb::vector<duckdb::TableFunction>{get()}
+               : duckdb::vector<duckdb::TableFunction>{};
+  }
+  if (name == "parquet_scan" || name == "read_parquet") {
+    return parquet_reference_functions(db, name);
+  }
+  if (name == "sirius_read_parquet") return {duckdb::GetSiriusReadParquetFunction()};
+  if (name == "sirius_stream_source") return {exec::get_stream_source_function()};
+  // Iceberg is initialized at extension load, never during a planning lookup.
+  return {};
+}
+
+/// Compares a candidate scan against an independently obtained trusted function definition.
+struct verified_callbacks {
+  explicit verified_callbacks(duckdb::TableFunction const& value) : reference(value) {}
+  /// Borrowed trusted definition; it must outlive this comparison object.
+  duckdb::TableFunction const& reference;
+
+  template <class Function>
+  bool matches(Function const& candidate, unsigned depth = 0) const
+  {
+    // Initialization, binding/copy, and optimizer callbacks can change the reader's semantics
+    // even when its scan body is unchanged. Only presentation/profiling callbacks are excluded.
+    return std::tie(reference.function,
+                    reference.bind,
+                    reference.bind_replace,
+                    reference.bind_operator,
+                    reference.init_global,
+                    reference.init_local,
+                    reference.in_out_function,
+                    reference.in_out_function_final,
+                    reference.statistics,
+                    reference.statistics_extended,
+                    reference.dependency,
+                    reference.cardinality,
+                    reference.pushdown_complex_filter,
+                    reference.pushdown_expression,
+                    reference.get_partition_data,
+                    reference.get_bind_info,
+                    reference.projection_expression_pushdown,
+                    reference.get_multi_file_reader,
+                    reference.supports_pushdown_type,
+                    reference.supports_pushdown_extract,
+                    reference.get_partition_info,
+                    reference.get_partition_stats,
+                    reference.get_virtual_columns,
+                    reference.get_row_id_columns,
+                    reference.set_scan_order,
+                    reference.serialize,
+                    reference.deserialize,
+                    reference.projection_pushdown,
+                    reference.filter_pushdown,
+                    reference.filter_prune,
+                    reference.sampling_pushdown,
+                    reference.late_materialization,
+                    reference.order_preservation_type,
+                    reference.global_initialization,
+                    reference.GetSignature(),
+                    reference.is_repeatable,
+                    reference.set_partitions_to_scan,
+                    reference.parallelism) == std::tie(candidate.function,
+                                                       candidate.bind,
+                                                       candidate.bind_replace,
+                                                       candidate.bind_operator,
+                                                       candidate.init_global,
+                                                       candidate.init_local,
+                                                       candidate.in_out_function,
+                                                       candidate.in_out_function_final,
+                                                       candidate.statistics,
+                                                       candidate.statistics_extended,
+                                                       candidate.dependency,
+                                                       candidate.cardinality,
+                                                       candidate.pushdown_complex_filter,
+                                                       candidate.pushdown_expression,
+                                                       candidate.get_partition_data,
+                                                       candidate.get_bind_info,
+                                                       candidate.projection_expression_pushdown,
+                                                       candidate.get_multi_file_reader,
+                                                       candidate.supports_pushdown_type,
+                                                       candidate.supports_pushdown_extract,
+                                                       candidate.get_partition_info,
+                                                       candidate.get_partition_stats,
+                                                       candidate.get_virtual_columns,
+                                                       candidate.get_row_id_columns,
+                                                       candidate.set_scan_order,
+                                                       candidate.serialize,
+                                                       candidate.deserialize,
+                                                       candidate.projection_pushdown,
+                                                       candidate.filter_pushdown,
+                                                       candidate.filter_prune,
+                                                       candidate.sampling_pushdown,
+                                                       candidate.late_materialization,
+                                                       candidate.order_preservation_type,
+                                                       candidate.global_initialization,
+                                                       candidate.GetSignature(),
+                                                       candidate.is_repeatable,
+                                                       candidate.set_partitions_to_scan,
+                                                       candidate.parallelism) &&
+           matches_info(candidate.function_info.get(), depth);
+  }
+
+  bool matches_info(duckdb::TableFunctionInfo const* candidate, unsigned depth) const
+  {
+    auto const* trusted = reference.function_info.get();
+    if (!trusted || !candidate) return trusted == candidate;
+    // Multi-file callbacks delegate to this nested function and its reader settings.
+    // Unknown info types and recursive wrappers cannot establish independent trust.
+    if (depth >= 2) return false;
+    auto const* left  = dynamic_cast<duckdb::TableFunctionMultiFileInfo const*>(trusted);
+    auto const* right = dynamic_cast<duckdb::TableFunctionMultiFileInfo const*>(candidate);
+    if (!left || !right) return false;
+    auto const& a = left->settings;
+    auto const& b = right->settings;
+    return std::tie(a.glob_input.behavior,
+                    a.glob_input.allow_empty,
+                    a.glob_input.extension,
+                    a.reader_type,
+                    a.maximum_sample_files,
+                    a.sample_files_parameter,
+                    a.sampled_schema_is_union,
+                    a.claim_batch,
+                    a.finish_batch,
+                    a.supports_read_ahead,
+                    a.schedule_io,
+                    a.prepare_read_ahead,
+                    a.combine_schema,
+                    a.get_file_columns,
+                    a.reuses_local_state,
+                    a.supports_cast_map) == std::tie(b.glob_input.behavior,
+                                                     b.glob_input.allow_empty,
+                                                     b.glob_input.extension,
+                                                     b.reader_type,
+                                                     b.maximum_sample_files,
+                                                     b.sample_files_parameter,
+                                                     b.sampled_schema_is_union,
+                                                     b.claim_batch,
+                                                     b.finish_batch,
+                                                     b.supports_read_ahead,
+                                                     b.schedule_io,
+                                                     b.prepare_read_ahead,
+                                                     b.combine_schema,
+                                                     b.get_file_columns,
+                                                     b.reuses_local_state,
+                                                     b.supports_cast_map) &&
+           verified_callbacks(left->function).matches(right->function, depth + 1);
+  }
+};
+/// Process-wide verification state for one connector, indexed alongside entries.
+/// Catalog entries are checked against this independent reference and never grant trust.
+struct accepted_callbacks {
+  /// Serializes reference resolution/publication and the one-time warning state.
+  std::mutex mutex;
+  /// Caches trusted definitions, including an unavailable resolution result.
+  detail::connector_reference_cache reference;
+  /// Prevents repeated warnings when a connector has no trusted definition.
+  std::unordered_set<void const*> missing_reference_reported;
+};
+std::array<accepted_callbacks, entries.size()> accepted;
+
+void initialize_iceberg_callbacks(duckdb::DatabaseInstance& db)
+{
+  if (!duckdb::ExtensionManager::Get(db).ExtensionIsLoaded("iceberg")) return;
+  auto const* host = detail::host_code_address(duckdb::Catalog::GetSystemCatalog(db));
+  for (std::size_t i = 0; i < entries.size(); ++i) {
+    if (entries[i].function_name != "iceberg_scan") continue;
+    auto& cache = accepted[i];
+    std::lock_guard lock(cache.mutex);
+    if (cache.reference.has_verified_functions(host)) return;
+    try {
+      // Publish the complete independent reference only after registration succeeds.
+      cache.reference.publish(host, iceberg_reference_functions(db));
+    } catch (std::exception const& error) {
+      // Optional GPU admission must not break LOAD or fall back to trusting the caller's
+      // catalog. An empty cache makes lookup decline without retrying initialization there.
+      SIRIUS_LOG_WARN("Iceberg scan source verification failed during extension load: {}",
+                      error.what());
+    }
+    return;
+  }
+}
+
+/// Publishes trusted Iceberg callbacks when Iceberg loads after Sirius.
+class scan_source_extension_callback final : public duckdb::ExtensionCallback {
+ public:
+  void OnExtensionLoaded(duckdb::DatabaseInstance& db, std::string const& name) override
+  {
+    if (name == "iceberg") initialize_iceberg_callbacks(db);
+  }
+};
+}  // namespace
+
+std::span<connector const> registered_connectors() { return entries; }
+
+bool iceberg_table_schema_has_field_ids(duckdb::FunctionData const* bind_data)
+{
+  auto const* bind = dynamic_cast<duckdb::MultiFileBindData const*>(bind_data);
+  if (bind == nullptr) return false;
+  auto const& columns = bind->reader_bind.schema.empty() ? bind->columns : bind->reader_bind.schema;
+  return collect_iceberg_field_ids(columns);
+}
+
+void register_scan_source_callbacks(duckdb::DatabaseInstance& db)
+{
+  // Register first so a subsequent Iceberg load is observed. The explicit initialization
+  // also covers Iceberg loaded before Sirius, including a catalog already modified by users.
+  duckdb::DBConfig::GetConfig(db).GetCallbackManager().Register(
+    duckdb::make_shared_ptr<scan_source_extension_callback>());
+  initialize_iceberg_callbacks(db);
+}
+
+template <class Function>
+lookup_outcome lookup_connector_classified_impl(Function const& function,
+                                                duckdb::FunctionData const* bind,
+                                                duckdb::ClientContext& context)
+{
+  bool function_known = false;
+  for (size_t i = 0; i < entries.size(); ++i) {
+    auto const& entry = entries[i];
+    if (entry.function_name != function.GetName()) continue;
+    function_known = true;
+    if (!entry.bind_data_matches(bind)) continue;
+    // The catalog's destructor identifies its host without a loader lookup per scan.
+    auto const* host = detail::host_code_address(duckdb::Catalog::GetSystemCatalog(context));
+    auto& cache      = accepted[i];
+    std::lock_guard lock(cache.mutex);
+    auto catalog_entry =
+      duckdb::Catalog::GetSystemCatalog(context).GetEntry<duckdb::TableFunctionCatalogEntry>(
+        context,
+        DEFAULT_SCHEMA,
+        duckdb::Identifier(entry.function_name),
+        duckdb::OnEntryNotFound::RETURN_NULL);
+    if (!catalog_entry) return {nullptr, lookup_decline::catalog_entry_missing};
+    // A mutable catalog can confirm registration, but must never grant trust.
+    auto const& references = cache.reference.get_or_resolve(
+      host, [&] { return reference_functions(entry.function_name, context); });
+    if (references.empty()) {
+      if (cache.missing_reference_reported.insert(host).second) {
+        auto const* requirement =
+          "The source extension must provide a verifiable function definition.";
+        if (entry.function_name == "seq_scan" || entry.function_name == "parquet_scan" ||
+            entry.function_name == "read_parquet") {
+          requirement =
+            "An external DuckDB host must export "
+            "TableScanFunction::GetFunction and duckdb_extension_parquet_describe.";
+        }
+        SIRIUS_LOG_WARN(
+          "GPU scan source '{}' has no trusted reference definition; GPU lowering "
+          "is disabled for this source. {}",
+          entry.function_name,
+          requirement);
+      }
+      return {nullptr, lookup_decline::no_trusted_reference};
+    }
+    for (auto const& reference : references) {
+      verified_callbacks const callbacks(reference);
+      if (!callbacks.matches(function)) continue;
+      for (auto const& registered : catalog_entry->functions.functions) {
+        if (callbacks.matches(*registered)) return {&entry, lookup_decline::none};
+      }
+    }
+    return {nullptr, lookup_decline::callback_mismatch};
+  }
+  return {nullptr,
+          function_known ? lookup_decline::bind_data_mismatch : lookup_decline::unknown_function};
+}
+
+lookup_outcome lookup_connector_classified(duckdb::LogicalGet const& get,
+                                           duckdb::ClientContext& context)
+{
+  return lookup_connector_classified_impl(get.function, get.bind_data.get(), context);
+}
+
+connector const* lookup_connector(duckdb::TableFunction const& function,
+                                  duckdb::FunctionData const* bind,
+                                  duckdb::ClientContext& context)
+{
+  return lookup_connector_classified_impl(function, bind, context).entry;
+}
+
+connector const* lookup_connector(duckdb::BoundTableFunction const& function,
+                                  duckdb::FunctionData const* bind,
+                                  duckdb::ClientContext& context)
+{
+  return lookup_connector_classified_impl(function, bind, context).entry;
+}
+
+connector const* lookup_connector(duckdb::LogicalGet const& get, duckdb::ClientContext& context)
+{
+  return lookup_connector(get.function, get.bind_data.get(), context);
+}
+
+connector const* lookup_connector(duckdb::PhysicalTableScan const& get,
+                                  duckdb::ClientContext& context)
+{
+  return lookup_connector(get.function, get.bind_data.get(), context);
+}
+}  // namespace sirius::planner

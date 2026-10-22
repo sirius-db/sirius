@@ -21,25 +21,45 @@
 //      exercises the in-kernel early return; a constant (bits==0) chunk
 //      exercises the chunk_min short-circuit.
 //   4. mask_consume without chunk_offsets (CNT not run) fails cleanly.
+//   5. the ballot at the predicate boundaries the engine actually emits:
+//      one-sided conjuncts arrive as INT64_MIN / INT64_MAX and an empty range
+//      as {0, -1}, so the packed-domain bound arithmetic must saturate; checked
+//      on every lane width with negative chunk minima, a full-width (32-bit)
+//      int32 chunk, a 40-bit int64 chunk (the decoded-domain path), constant
+//      chunks among packed ones and a partial tail.
+//   6. the index walk across its operating selectivities (0.1% .. 50%) on a
+//      chunk count that leaves the last block's warps partially past the batch.
 //
 // GPU required (encode/decode kernels + NVRTC). Same standalone-main harness
 // as the other tests in this directory.
 
+#include "api/simpatico_codegen.hpp"
 #include "codegen/codegen_bridge.hpp"
 #include "codegen/decode/jit/renderer.hpp"
 #include "codegen/decode/masked_launch.hpp"
 #include "codegen/jit/fused_tree.hpp"
 #include "codegen/jit/nvrtc_compiler.hpp"
 #include "codegen/selection/selection.hpp"
+#include "decode_session_test_access.hpp"
 #include "gpu_encode.hpp"
+#include "test_utils.hpp"
 
-#include <rmm/cuda_stream_view.hpp>
+#include <rmm/cuda_stream.hpp>
+#include <rmm/mr/per_device_resource.hpp>
 
+#include <cuda/stream>
 #include <cuda_runtime.h>
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdio>
+#include <initializer_list>
+#include <limits>
+#include <stdexcept>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 namespace jit = codegen::jit;
@@ -56,6 +76,19 @@ constexpr std::int64_t kChunk = codegen::kChunkSize;  // 1024
 constexpr int kWordsPerChunk  = static_cast<int>(kChunk / 32);
 
 int g_failures = 0;
+
+// These tests deliberately exercise raw launchers with externally owned buffers. The session owns
+// their frame and drains both normal and exceptional paths before any test owner can unwind.
+template <auto Launch, typename... Args>
+bool completed_decode(::cuda::stream_ref stream, Args&&... args)
+{
+  std::array const streams{stream};
+  simpatico::decode_session session{streams, rmm::mr::get_current_device_resource_ref()};
+  auto& frame = simpatico::decode_session_test_access::frame(session);
+  Launch(std::forward<Args>(args)..., frame);
+  session.finish();
+  return true;
+}
 
 #define REQUIRE_MSG(cond, ...)                    \
   do {                                            \
@@ -165,19 +198,43 @@ bool compact_packed_on_host(GpuEncoded& enc, std::int64_t nc, std::int32_t node_
 }
 
 // Arbitrary host-side selection mask (the consuming variants accept ANY mask,
-// e.g. one ANDed together from other columns' ballot outputs): ~keep_pct% bits
-// set, chunk ``zero_chunk`` fully cleared (mask-walk early-return path), tail
+// e.g. one ANDed together from other columns' ballot outputs): ~keep_bp/10000
+// of the bits set, chunk ``zero_chunk`` fully cleared (early-return path), tail
 // bits/words beyond n zero (contract).
 std::vector<std::uint32_t> make_host_mask(
-  std::int64_t n, std::int64_t nc, unsigned seed, unsigned keep_pct, std::int64_t zero_chunk)
+  std::int64_t n, std::int64_t nc, unsigned seed, unsigned keep_bp, std::int64_t zero_chunk)
 {
   std::vector<std::uint32_t> m(static_cast<std::size_t>(nc) * kWordsPerChunk, 0u);
   for (std::int64_t r = 0; r < n; ++r) {
     if (r / kChunk == zero_chunk) continue;
     std::uint64_t s = seed ^ (0x9E3779B97F4A7C15ull * static_cast<std::uint64_t>(r + 1));
-    if (splitmix64(s) % 100ull < keep_pct) m[static_cast<std::size_t>(r) / 32] |= (1u << (r % 32));
+    if (splitmix64(s) % 10000ull < keep_bp) m[static_cast<std::size_t>(r) / 32] |= (1u << (r % 32));
   }
   return m;
+}
+
+// Survivors of ``mask`` in row order: what every compacting decode must produce.
+template <typename Element>
+std::vector<Element> host_filter(const std::vector<Element>& data,
+                                 const std::vector<std::uint32_t>& mask)
+{
+  std::vector<Element> out;
+  for (std::size_t r = 0; r < data.size(); ++r) {
+    if ((mask[r / 32] >> (r % 32)) & 1u) out.push_back(data[r]);
+  }
+  return out;
+}
+
+// The ascending global row-id list the mask->indices wave would build.
+std::vector<std::int32_t> host_row_indices(const std::vector<std::uint32_t>& mask, std::int64_t n)
+{
+  std::vector<std::int32_t> out;
+  for (std::int64_t r = 0; r < n; ++r) {
+    if ((mask[static_cast<std::size_t>(r) / 32] >> (r % 32)) & 1u) {
+      out.push_back(static_cast<std::int32_t>(r));
+    }
+  }
+  return out;
 }
 
 // Exclusive per-chunk survivor prefix (host CNT-equivalent). Returns total.
@@ -202,7 +259,7 @@ bool run_roundtrip(const std::string& dtype, std::int64_t base, std::int64_t ran
 {
   const std::int64_t n  = 5 * kChunk + 700;  // partial tail chunk
   const std::int64_t nc = codegen::num_chunks_for(n);
-  const rmm::cuda_stream_view stream{};
+  const ::cuda::stream_ref stream{cudaStream_t{}};
 
   const std::vector<Element> data = gen_data<Element>(n, base, range);
 
@@ -213,8 +270,8 @@ bool run_roundtrip(const std::string& dtype, std::int64_t base, std::int64_t ran
 
   // --- Plain reference through the production launcher. -------------------
   CUdeviceptr d_plain = enc.alloc(static_cast<std::size_t>(n) * sizeof(Element));
-  REQUIRE_MSG(simpatico::launch_decode_fused_tree(
-                *tree, enc.buffers, dtype.c_str(), n, reinterpret_cast<void*>(d_plain), stream),
+  REQUIRE_MSG(completed_decode<simpatico::launch_decode_fused_tree>(
+                stream, *tree, enc.buffers, dtype.c_str(), n, reinterpret_cast<void*>(d_plain)),
               "[%s] plain launch_decode_fused_tree failed",
               dtype.c_str());
   std::vector<Element> plain(static_cast<std::size_t>(n));
@@ -243,20 +300,23 @@ bool run_roundtrip(const std::string& dtype, std::int64_t base, std::int64_t ran
 
     // mask_consume before CNT ran (no chunk_offsets) must fail cleanly.
     if (p == 0) {
-      REQUIRE_MSG(!simpatico::launch_decode_fused_tree_compacted(*tree,
-                                                                 enc.buffers,
-                                                                 dtype.c_str(),
-                                                                 n,
-                                                                 sm,
-                                                                 simpatico::row_enumeration{},
-                                                                 reinterpret_cast<void*>(d_plain),
-                                                                 stream),
+      REQUIRE_MSG(throws<std::invalid_argument>([&] {
+                    completed_decode<simpatico::launch_decode_fused_tree_compacted>(
+                      stream,
+                      *tree,
+                      enc.buffers,
+                      dtype.c_str(),
+                      n,
+                      sm,
+                      simpatico::row_enumeration{},
+                      reinterpret_cast<void*>(d_plain));
+                  }),
                   "[%s] mask_consume without chunk_offsets should fail",
                   dtype.c_str());
     }
 
-    REQUIRE_MSG(simpatico::launch_decode_fused_tree_mask_out(
-                  *tree, enc.buffers, dtype.c_str(), n, preds[p], sm, stream),
+    REQUIRE_MSG(completed_decode<simpatico::launch_decode_fused_tree_mask_out>(
+                  stream, *tree, enc.buffers, dtype.c_str(), n, preds[p], sm),
                 "[%s/%s] launch_decode_fused_tree_mask_out failed",
                 dtype.c_str(),
                 pred_names[p]);
@@ -292,14 +352,15 @@ bool run_roundtrip(const std::string& dtype, std::int64_t base, std::int64_t ran
                0xAB,
                static_cast<std::size_t>(survivors > 0 ? survivors : 1) * sizeof(Element));
 
-    REQUIRE_MSG(simpatico::launch_decode_fused_tree_compacted(*tree,
-                                                              enc.buffers,
-                                                              dtype.c_str(),
-                                                              n,
-                                                              sm,
-                                                              simpatico::row_enumeration{},
-                                                              reinterpret_cast<void*>(d_out),
-                                                              stream),
+    REQUIRE_MSG(completed_decode<simpatico::launch_decode_fused_tree_compacted>(
+                  stream,
+                  *tree,
+                  enc.buffers,
+                  dtype.c_str(),
+                  n,
+                  sm,
+                  simpatico::row_enumeration{},
+                  reinterpret_cast<void*>(d_out)),
                 "[%s/%s] compacted (mask walk) launch failed",
                 dtype.c_str(),
                 pred_names[p]);
@@ -344,15 +405,15 @@ bool run_roundtrip(const std::string& dtype, std::int64_t base, std::int64_t ran
     cudaMemset(reinterpret_cast<void*>(d_out4),
                0xCD,
                static_cast<std::size_t>(survivors > 0 ? survivors : 1) * sizeof(Element));
-    REQUIRE_MSG(simpatico::launch_decode_fused_tree_compacted(
+    REQUIRE_MSG(completed_decode<simpatico::launch_decode_fused_tree_compacted>(
+                  stream,
                   *tree,
                   enc.buffers,
                   dtype.c_str(),
                   n,
                   sm,
                   simpatico::row_enumeration{reinterpret_cast<const std::int32_t*>(d_idx), nullptr},
-                  reinterpret_cast<void*>(d_out4),
-                  stream),
+                  reinterpret_cast<void*>(d_out4)),
                 "[%s/%s] compacted (index walk) launch failed",
                 dtype.c_str(),
                 pred_names[p]);
@@ -411,18 +472,18 @@ bool run_roundtrip(const std::string& dtype, std::int64_t base, std::int64_t ran
         cudaMemset(reinterpret_cast<void*>(d_sparse),
                    0xEF,
                    static_cast<std::size_t>(survivors) * sizeof(Element));
-        REQUIRE_MSG(
-          simpatico::launch_decode_fused_tree_compacted(*tree,
-                                                        enc.buffers,
-                                                        dtype.c_str(),
-                                                        n,
-                                                        sm,
-                                                        simpatico::row_enumeration{nullptr, &rs},
-                                                        reinterpret_cast<void*>(d_sparse),
-                                                        stream),
-          "[%s/%s] sparse (chunk_csr) launch failed",
-          dtype.c_str(),
-          pred_names[p]);
+        REQUIRE_MSG(completed_decode<simpatico::launch_decode_fused_tree_compacted>(
+                      stream,
+                      *tree,
+                      enc.buffers,
+                      dtype.c_str(),
+                      n,
+                      sm,
+                      simpatico::row_enumeration{nullptr, &rs},
+                      reinterpret_cast<void*>(d_sparse)),
+                    "[%s/%s] sparse (chunk_csr) launch failed",
+                    dtype.c_str(),
+                    pred_names[p]);
         std::vector<Element> got_sparse(static_cast<std::size_t>(survivors));
         cudaMemcpy(got_sparse.data(),
                    reinterpret_cast<const void*>(d_sparse),
@@ -465,15 +526,15 @@ bool run_roundtrip(const std::string& dtype, std::int64_t base, std::int64_t ran
     CUdeviceptr d_idx1 = enc.upload_bytes(&idx_host, sizeof(idx_host));
     CUdeviceptr d_out1 = enc.alloc(sizeof(Element));
     REQUIRE_MSG(
-      simpatico::launch_decode_fused_tree_compacted(
+      completed_decode<simpatico::launch_decode_fused_tree_compacted>(
+        stream,
         *tree,
         enc.buffers,
         dtype.c_str(),
         n,
         sm1,
         simpatico::row_enumeration{reinterpret_cast<const std::int32_t*>(d_idx1), nullptr},
-        reinterpret_cast<void*>(d_out1),
-        stream),
+        reinterpret_cast<void*>(d_out1)),
       "[%s] index-walk singleton launch failed",
       dtype.c_str());
     Element got1{};
@@ -487,6 +548,196 @@ bool run_roundtrip(const std::string& dtype, std::int64_t base, std::int64_t ran
   return true;
 }
 
+// Saturating int64 arithmetic for predicate construction: a fixture whose base
+// sits near the int64 limits must still be able to state "below the domain".
+std::int64_t sat64(__int128 v)
+{
+  constexpr __int128 lo = std::numeric_limits<std::int64_t>::min();
+  constexpr __int128 hi = std::numeric_limits<std::int64_t>::max();
+  return static_cast<std::int64_t>(v < lo ? lo : (v > hi ? hi : v));
+}
+
+// The range ballot at the boundaries the roundtrip's finite predicates never
+// reach. The engine emits INT64_MIN / INT64_MAX for one-sided conjuncts and
+// {0, -1} for an empty range, so the ballot's per-chunk bound arithmetic must
+// saturate rather than overflow; lane-typed extremes, a predicate that misses
+// the domain on either side, one that straddles the chunk minimum and a point
+// predicate on the constant (bits==0) chunk's value cover the accept-all /
+// reject-all / packed-compare branches. The data keeps gen_data's constant
+// chunk and partial tail; the (base, range) pair picks the lane width, the
+// sign of the chunk minima and the bit width (32 on int32 = the full lane,
+// 40 on int64 = the decoded-domain path). Masks are compared bit-for-bit
+// against the host reference from a 0xFF-filled buffer, proving the tail
+// words are written zero.
+template <typename Element>
+bool run_ballot_edges(
+  const std::string& dtype, const char* label, std::int64_t base, std::int64_t range, int arch)
+{
+  const std::int64_t n  = 5 * kChunk + 700;
+  const std::int64_t nc = codegen::num_chunks_for(n);
+  const ::cuda::stream_ref stream{cudaStream_t{}};
+
+  const std::vector<Element> data = gen_data<Element>(n, base, range);
+  auto tree                       = jit::FusedTree::make(OpKind::Bitpack);
+  GpuEncoded enc = codegen_test::gpu_encode_tree<Element>(*tree, dtype, data.data(), n, arch);
+  if (!compact_packed_on_host(enc, nc)) return false;
+
+  constexpr std::int64_t kMin64 = std::numeric_limits<std::int64_t>::min();
+  constexpr std::int64_t kMax64 = std::numeric_limits<std::int64_t>::max();
+  const auto t_min              = static_cast<std::int64_t>(std::numeric_limits<Element>::min());
+  const auto t_max              = static_cast<std::int64_t>(std::numeric_limits<Element>::max());
+  const __int128 b              = base;
+  const __int128 r              = range;
+  const std::int64_t mid        = sat64(b + r / 2);
+  const std::int64_t constant   = base + range / 3;  // gen_data's chunk 2
+  // The straddle case brackets chunk 0's ACTUAL minimum: on a 2^32 range `base` itself is almost
+  // never drawn, so a straddle around it would have no survivors and pin nothing new.
+  const __int128 chunk0_min = *std::min_element(data.begin(), data.begin() + kChunk);
+  struct Case {
+    const char* name;
+    range_predicate pred;
+  };
+  const Case cases[] = {
+    {"two_sided", {sat64(b + r / 4), mid}},
+    {"open_low_INT64_MIN", {kMin64, mid}},
+    {"open_high_INT64_MAX", {mid, kMax64}},
+    {"all_INT64", {kMin64, kMax64}},
+    {"disjoint_above", {sat64(b + r + 100), sat64(b + r + 200)}},
+    {"disjoint_below", {kMin64, sat64(b - 1)}},
+    {"lane_typed_open_low", {t_min, mid}},
+    {"lane_typed_open_high", {mid, t_max}},
+    {"straddle_minimum", {sat64(chunk0_min - 100), sat64(chunk0_min + 3)}},
+    {"point_on_constant_chunk", {constant, constant}},
+    {"empty_range", {mid, mid - 1}},
+    {"empty_range_canonical", {0, -1}},  // clamp_to_decode_range's empty range
+  };
+
+  const std::size_t nwords = static_cast<std::size_t>(nc) * kWordsPerChunk;
+  std::string survivors_report;
+  for (const Case& c : cases) {
+    CUdeviceptr d_mask = enc.alloc(nwords * 4);
+    cudaMemset(reinterpret_cast<void*>(d_mask), 0xFF, nwords * 4);
+    selection_mask sm;
+    sm.words    = reinterpret_cast<std::uint32_t*>(d_mask);
+    sm.num_rows = n;
+    REQUIRE_MSG(completed_decode<simpatico::launch_decode_fused_tree_mask_out>(
+                  stream, *tree, enc.buffers, dtype.c_str(), n, c.pred, sm),
+                "[ballot-edges/%s/%s] mask_out launch failed",
+                label,
+                c.name);
+    std::vector<std::uint32_t> got(nwords);
+    cudaMemcpy(
+      got.data(), reinterpret_cast<const void*>(d_mask), nwords * 4, cudaMemcpyDeviceToHost);
+    const std::vector<std::uint32_t> ref = host_mask(data, nc, c.pred);
+    std::size_t survivors                = 0;
+    for (const auto w : ref)
+      survivors += static_cast<std::size_t>(__builtin_popcount(w));
+    REQUIRE_MSG(
+      got == ref,
+      "[ballot-edges/%s/%s] ballot mask != host reference for [%lld, %lld] (%zu survivors)",
+      label,
+      c.name,
+      static_cast<long long>(c.pred.lo),
+      static_cast<long long>(c.pred.hi),
+      survivors);
+    REQUIRE_MSG(std::string_view{c.name} != "straddle_minimum" || survivors > 0,
+                "[ballot-edges/%s] straddle_minimum fixture has no survivors",
+                label);
+    survivors_report += std::string(" ") + c.name + "=" + std::to_string(survivors);
+  }
+  std::printf("PASS: ballot-edges/%s (of %lld rows:%s)\n",
+              label,
+              static_cast<long long>(n),
+              survivors_report.c_str());
+  return true;
+}
+
+// The index walk across its operating range of selectivities. The batch's
+// chunk count is deliberately not a multiple of the chunks a block serves, so
+// the last block's trailing warps address chunks past the batch and must
+// return before touching per-chunk metadata; chunk 5 has no survivors; the tail
+// chunk is partial. chunk_offsets and row_indices follow the CNT and
+// mask->indices contracts, and the output must equal plain decode + host filter.
+// The (base, range) pair picks the packed width, so the 32-bit funnel-shift
+// unpack (int32, full lane) and the int64 wide select (bits > 32) get a value
+// roundtrip and not only a render-text check.
+template <typename Element>
+bool run_index_walk_selectivities(const std::string& dtype,
+                                  const char* label,
+                                  std::int64_t base,
+                                  std::int64_t range,
+                                  std::initializer_list<unsigned> keep_bps,
+                                  int arch)
+{
+  const std::int64_t n  = 37 * kChunk + 500;
+  const std::int64_t nc = codegen::num_chunks_for(n);
+  REQUIRE_MSG(nc % cdj::chunks_per_block(cdj::kShapeIndexConsume) != 0,
+              "fixture must leave the last block of the index walk partially past the batch");
+  const ::cuda::stream_ref stream{cudaStream_t{}};
+
+  const std::vector<Element> data = gen_data<Element>(n, base, range);
+  auto tree                       = jit::FusedTree::make(OpKind::Bitpack);
+  GpuEncoded enc = codegen_test::gpu_encode_tree<Element>(*tree, dtype, data.data(), n, arch);
+  if (!compact_packed_on_host(enc, nc)) return false;
+
+  for (const unsigned keep_bp : keep_bps) {
+    const std::vector<std::uint32_t> mask =
+      make_host_mask(n, nc, 0x1D8 + keep_bp, keep_bp, /*zero_chunk=*/5);
+    std::vector<std::uint32_t> chunk_offsets;
+    const std::int64_t survivors = host_cnt(mask, nc, chunk_offsets);
+    REQUIRE_MSG(
+      chunk_offsets[5] == chunk_offsets[6], "[index/%s] fixture lost its empty chunk", label);
+    const std::vector<std::int32_t> row_indices = host_row_indices(mask, n);
+    const std::vector<Element> expect           = host_filter(data, mask);
+    REQUIRE_MSG(static_cast<std::int64_t>(expect.size()) == survivors && survivors > 0,
+                "[index/%s/%u bp] internal: survivor count mismatch",
+                label,
+                keep_bp);
+
+    selection_mask sm;
+    sm.words    = reinterpret_cast<std::uint32_t*>(enc.upload_bytes(mask.data(), mask.size() * 4));
+    sm.num_rows = n;
+    sm.chunk_offsets = reinterpret_cast<std::uint32_t*>(
+      enc.upload_bytes(chunk_offsets.data(), chunk_offsets.size() * 4));
+    sm.survivor_count = survivors;
+    CUdeviceptr d_idx =
+      enc.upload_bytes(row_indices.data(), row_indices.size() * sizeof(std::int32_t));
+    CUdeviceptr d_out = enc.alloc(static_cast<std::size_t>(survivors) * sizeof(Element));
+    cudaMemset(
+      reinterpret_cast<void*>(d_out), 0xCD, static_cast<std::size_t>(survivors) * sizeof(Element));
+
+    REQUIRE_MSG(completed_decode<simpatico::launch_decode_fused_tree_compacted>(
+                  stream,
+                  *tree,
+                  enc.buffers,
+                  dtype.c_str(),
+                  n,
+                  sm,
+                  simpatico::row_enumeration{reinterpret_cast<const std::int32_t*>(d_idx), nullptr},
+                  reinterpret_cast<void*>(d_out)),
+                "[index/%s/%u bp] index-walk launch failed",
+                label,
+                keep_bp);
+    std::vector<Element> got(static_cast<std::size_t>(survivors));
+    cudaMemcpy(got.data(),
+               reinterpret_cast<const void*>(d_out),
+               got.size() * sizeof(Element),
+               cudaMemcpyDeviceToHost);
+    REQUIRE_MSG(got == expect,
+                "[index/%s/%u bp] index-walk output != plain decode + host filter (%lld survivors)",
+                label,
+                keep_bp,
+                static_cast<long long>(survivors));
+    std::printf("PASS: index-walk/%s at %.2f%% (survivors=%lld of %lld, %lld chunks)\n",
+                label,
+                keep_bp / 100.0,
+                static_cast<long long>(survivors),
+                static_cast<long long>(n),
+                static_cast<long long>(nc));
+  }
+  return true;
+}
+
 // the delta mask walk: masked compacting decode of a delta->bitpack column.
 // The mask is host-generated (arbitrary — in production it comes from other
 // columns' ballot wave), CNT-equivalent on host, then mask_consume must equal
@@ -496,7 +747,7 @@ bool run_delta_masked(const std::string& dtype, int arch)
 {
   const std::int64_t n  = 5 * kChunk + 700;
   const std::int64_t nc = codegen::num_chunks_for(n);
-  const rmm::cuda_stream_view stream{};
+  const ::cuda::stream_ref stream{cudaStream_t{}};
 
   // Orderkey-like: monotone with small steps (delta diffs bitpack tightly).
   std::vector<Element> data(static_cast<std::size_t>(n));
@@ -515,8 +766,8 @@ bool run_delta_masked(const std::string& dtype, int arch)
   if (!compact_packed_on_host(enc, nc, /*node_id=*/1)) return false;
 
   CUdeviceptr d_plain = enc.alloc(static_cast<std::size_t>(n) * sizeof(Element));
-  REQUIRE_MSG(simpatico::launch_decode_fused_tree(
-                *tree, enc.buffers, dtype.c_str(), n, reinterpret_cast<void*>(d_plain), stream),
+  REQUIRE_MSG(completed_decode<simpatico::launch_decode_fused_tree>(
+                stream, *tree, enc.buffers, dtype.c_str(), n, reinterpret_cast<void*>(d_plain)),
               "[delta/%s] plain launch failed",
               dtype.c_str());
   std::vector<Element> plain(static_cast<std::size_t>(n));
@@ -526,7 +777,7 @@ bool run_delta_masked(const std::string& dtype, int arch)
              cudaMemcpyDeviceToHost);
   REQUIRE_MSG(plain == data, "[delta/%s] plain decode != original input", dtype.c_str());
 
-  const std::vector<std::uint32_t> mask = make_host_mask(n, nc, 0x5EED, 37, /*zero_chunk=*/1);
+  const std::vector<std::uint32_t> mask = make_host_mask(n, nc, 0x5EED, 3700, /*zero_chunk=*/1);
   std::vector<std::uint32_t> chunk_offsets;
   const std::int64_t survivors = host_cnt(mask, nc, chunk_offsets);
 
@@ -539,16 +790,17 @@ bool run_delta_masked(const std::string& dtype, int arch)
 
   CUdeviceptr d_out =
     enc.alloc(static_cast<std::size_t>(survivors > 0 ? survivors : 1) * sizeof(Element));
-  REQUIRE_MSG(simpatico::launch_decode_fused_tree_compacted(*tree,
-                                                            enc.buffers,
-                                                            dtype.c_str(),
-                                                            n,
-                                                            sm,
-                                                            simpatico::row_enumeration{},
-                                                            reinterpret_cast<void*>(d_out),
-                                                            stream),
-              "[delta/%s] mask-walk decode launch failed",
-              dtype.c_str());
+  REQUIRE_MSG(
+    completed_decode<simpatico::launch_decode_fused_tree_compacted>(stream,
+                                                                    *tree,
+                                                                    enc.buffers,
+                                                                    dtype.c_str(),
+                                                                    n,
+                                                                    sm,
+                                                                    simpatico::row_enumeration{},
+                                                                    reinterpret_cast<void*>(d_out)),
+    "[delta/%s] mask-walk decode launch failed",
+    dtype.c_str());
 
   std::vector<Element> expect;
   expect.reserve(static_cast<std::size_t>(survivors));
@@ -594,8 +846,8 @@ bool run_delta_masked(const std::string& dtype, int arch)
       selection_mask sm1;
       sm1.words    = reinterpret_cast<std::uint32_t*>(d_mask1);
       sm1.num_rows = n;
-      REQUIRE_MSG(simpatico::launch_decode_fused_tree_mask_out(
-                    *tree, enc.buffers, dtype.c_str(), n, preds[p], sm1, stream),
+      REQUIRE_MSG(completed_decode<simpatico::launch_decode_fused_tree_mask_out>(
+                    stream, *tree, enc.buffers, dtype.c_str(), n, preds[p], sm1),
                   "[delta-k1/%s/%s] mask_out launch failed",
                   dtype.c_str(),
                   names[p]);
@@ -623,7 +875,7 @@ bool run_dict_gather(std::int32_t key_width, int arch)
   const std::int64_t n        = 3 * kChunk + 511;
   const std::int64_t nc       = codegen::num_chunks_for(n);
   const std::int32_t num_keys = 3;
-  const rmm::cuda_stream_view stream{};
+  const ::cuda::stream_ref stream{cudaStream_t{}};
 
   std::vector<std::int32_t> codes(static_cast<std::size_t>(n));
   for (std::int64_t i = 0; i < n; ++i) {
@@ -646,7 +898,7 @@ bool run_dict_gather(std::int32_t key_width, int arch)
       keys[static_cast<std::size_t>(k) * key_width + b] = static_cast<char>('A' + k);
   CUdeviceptr d_keys = enc.upload_bytes(keys.data(), keys.size());
 
-  const std::vector<std::uint32_t> mask = make_host_mask(n, nc, 0xD1C7, 42, /*zero_chunk=*/2);
+  const std::vector<std::uint32_t> mask = make_host_mask(n, nc, 0xD1C7, 4200, /*zero_chunk=*/2);
   std::vector<std::uint32_t> chunk_offsets;
   const std::int64_t survivors = host_cnt(mask, nc, chunk_offsets);
 
@@ -661,16 +913,17 @@ bool run_dict_gather(std::int32_t key_width, int arch)
   CUdeviceptr d_out           = enc.alloc(out_bytes);
   cudaMemset(reinterpret_cast<void*>(d_out), 0xEE, out_bytes);
 
-  REQUIRE_MSG(simpatico::launch_decode_fused_tree_dict_gather(*tree,
-                                                              enc.buffers,
-                                                              "int32_t",
-                                                              n,
-                                                              sm,
-                                                              simpatico::row_enumeration{},
-                                                              reinterpret_cast<const void*>(d_keys),
-                                                              key_width,
-                                                              reinterpret_cast<void*>(d_out),
-                                                              stream),
+  REQUIRE_MSG(completed_decode<simpatico::launch_decode_fused_tree_dict_gather>(
+                stream,
+                *tree,
+                enc.buffers,
+                "int32_t",
+                n,
+                sm,
+                simpatico::row_enumeration{},
+                reinterpret_cast<const void*>(d_keys),
+                key_width,
+                reinterpret_cast<void*>(d_out)),
               "[dict/w%d] dict_gather launch failed",
               key_width);
 
@@ -709,7 +962,7 @@ bool run_str_split_masked(bool deep, int arch)
   const std::int64_t n     = 4 * kChunk + 300;            // string rows
   const std::int64_t n_off = n + 1;                       // offsets elements
   const std::int64_t nc    = codegen::num_chunks_for(n);  // row chunks
-  const rmm::cuda_stream_view stream{};
+  const ::cuda::stream_ref stream{cudaStream_t{}};
   const char* tag = deep ? "str-deep" : "str-shallow";
 
   // Host strings: offsets cumulative; chars pseudo-random bytes.
@@ -749,8 +1002,8 @@ bool run_str_split_masked(bool deep, int arch)
 
   // Plain offsets decode through the production launcher = cascade sanity.
   CUdeviceptr d_plain = enc.alloc(static_cast<std::size_t>(n_off) * sizeof(std::int32_t));
-  REQUIRE_MSG(simpatico::launch_decode_fused_tree(
-                *tree, enc.buffers, "int32_t", n_off, reinterpret_cast<void*>(d_plain), stream),
+  REQUIRE_MSG(completed_decode<simpatico::launch_decode_fused_tree>(
+                stream, *tree, enc.buffers, "int32_t", n_off, reinterpret_cast<void*>(d_plain)),
               "[%s] plain offsets decode failed",
               tag);
   std::vector<std::int32_t> plain(static_cast<std::size_t>(n_off));
@@ -762,7 +1015,7 @@ bool run_str_split_masked(bool deep, int arch)
 
   // Row-space mask; force the chunk-boundary rows of chunks 0 and 2 on so
   // the next-chunk first-offset peek is exercised (chunk 1 is all-zero).
-  std::vector<std::uint32_t> mask = make_host_mask(n, nc, 0x57A7, 40, /*zero_chunk=*/1);
+  std::vector<std::uint32_t> mask = make_host_mask(n, nc, 0x57A7, 4000, /*zero_chunk=*/1);
   mask[(0 * kChunk + 1023) / 32] |= (1u << ((0 * kChunk + 1023) % 32));
   mask[(2 * kChunk + 1023) / 32] |= (1u << ((2 * kChunk + 1023) % 32));
   std::vector<std::uint32_t> chunk_offsets;
@@ -777,18 +1030,18 @@ bool run_str_split_masked(bool deep, int arch)
 
   CUdeviceptr d_src = enc.alloc(static_cast<std::size_t>(survivors) * sizeof(std::int64_t));
   CUdeviceptr d_len = enc.alloc(static_cast<std::size_t>(survivors) * sizeof(std::int32_t));
-  REQUIRE_MSG(
-    simpatico::launch_decode_fused_tree_str_split_meta(*tree,
-                                                       enc.buffers,
-                                                       "int32_t",
-                                                       n,
-                                                       sm,
-                                                       simpatico::row_enumeration{},
-                                                       reinterpret_cast<std::int64_t*>(d_src),
-                                                       reinterpret_cast<std::int32_t*>(d_len),
-                                                       stream),
-    "[%s] str_split_meta launch failed",
-    tag);
+  REQUIRE_MSG(completed_decode<simpatico::launch_decode_fused_tree_str_split_meta>(
+                stream,
+                *tree,
+                enc.buffers,
+                "int32_t",
+                n,
+                sm,
+                simpatico::row_enumeration{},
+                reinterpret_cast<std::int64_t*>(d_src),
+                reinterpret_cast<std::int32_t*>(d_len)),
+              "[%s] str_split_meta launch failed",
+              tag);
 
   std::vector<std::int64_t> src_got(static_cast<std::size_t>(survivors));
   std::vector<std::int32_t> len_got(static_cast<std::size_t>(survivors));
@@ -826,12 +1079,13 @@ bool run_str_split_masked(bool deep, int arch)
   const std::size_t out_bytes = chars_ref.empty() ? 1 : chars_ref.size();
   CUdeviceptr d_out_chars     = enc.alloc(out_bytes);
   cudaMemset(reinterpret_cast<void*>(d_out_chars), 0xEE, out_bytes);
-  REQUIRE_MSG(simpatico::launch_masked_char_copy(reinterpret_cast<const void*>(d_chars),
-                                                 reinterpret_cast<const std::int64_t*>(d_src),
-                                                 reinterpret_cast<const std::int32_t*>(d_out_off),
-                                                 survivors,
-                                                 reinterpret_cast<void*>(d_out_chars),
-                                                 stream),
+  REQUIRE_MSG(completed_decode<simpatico::launch_masked_char_copy>(
+                stream,
+                reinterpret_cast<const void*>(d_chars),
+                reinterpret_cast<const std::int64_t*>(d_src),
+                reinterpret_cast<const std::int32_t*>(d_out_off),
+                survivors,
+                reinterpret_cast<void*>(d_out_chars)),
               "[%s] masked_char_copy launch failed",
               tag);
   std::vector<char> chars_got(chars_ref.size());
@@ -984,7 +1238,222 @@ bool render_checks()
                 kfor.source.find("compacted output (generic)") != std::string::npos,
               "FOR-rooted mask_consume must render via the generic seam");
 
+  // 8. Launch geometry the launcher follows: the index walk serves one chunk
+  //    per warp, every other shape one chunk per block; the walk is
+  //    lane-strided over the two-word unpack and never synchronizes the
+  //    block, which its per-warp early returns rely on.
+  REQUIRE_MSG(cdj::chunks_per_block(cdj::kShapeIndexConsume) == codegen::kTBSize / 32,
+              "index walk must pack one chunk per warp");
+  REQUIRE_MSG(cdj::chunks_per_block(cdj::kShapePlain) == 1 &&
+                cdj::chunks_per_block(cdj::kShapeMaskOut) == 1 &&
+                cdj::chunks_per_block(cdj::kShapeMaskConsume) == 1 &&
+                cdj::chunks_per_block(cdj::kShapeDictGather) == 1 &&
+                cdj::chunks_per_block(cdj::kShapeStrSplitMeta) == 1 &&
+                cdj::chunks_per_block(cdj::kShapeSparseConsume) == 1,
+              "only the index walk changes the block-to-chunk mapping");
+  REQUIRE_MSG(k4.source.find("slot += 32") != std::string::npos &&
+                k4.source.find("simpatico_bp_at32") != std::string::npos &&
+                k4.source.find("__syncthreads") == std::string::npos,
+              "index walk must be lane-strided over the two-word unpack without block barriers");
+
+  // 9. The Bitpack ballot compares in the packed domain; only the int64 lane
+  //    can pack more than 32 bits and so only it carries the decoded-domain
+  //    path. The Delta ballot stays on the generic seam, and no other render
+  //    carries the two-word helpers (their JIT keys must not move).
+  const cdj::DecodeKernelSpec k1_32 = cdj::render(*bp, "int32_t", 8, cdj::kShapeMaskOut);
+  REQUIRE_MSG(k1.source.find("(packed domain)") != std::string::npos &&
+                k1.source.find("simpatico_bp_field32") != std::string::npos &&
+                k1_32.source.find("(packed domain)") != std::string::npos &&
+                k1_32.source.find("simpatico_bp_field32") != std::string::npos,
+              "bitpack ballot must compare in the packed domain");
+  REQUIRE_MSG(k1.source.find("bpbits_0 > 32") != std::string::npos &&
+                k1_32.source.find("bpbits_0 > 32") == std::string::npos,
+              "only the int64 ballot needs a path for widths above 32 bits");
+  const auto carries_narrow_prelude = [](const cdj::DecodeKernelSpec& k) {
+    return k.source.find("simpatico_bp_field32") != std::string::npos ||
+           k.source.find("simpatico_bp_at32") != std::string::npos;
+  };
+  REQUIRE_MSG(dk1.source.find("selection mask (generic)") != std::string::npos &&
+                !carries_narrow_prelude(dk1),
+              "the delta ballot must stay on the generic seam without the two-word helpers");
+  REQUIRE_MSG(!carries_narrow_prelude(s3) && !carries_narrow_prelude(k3) &&
+                !carries_narrow_prelude(k5) && !carries_narrow_prelude(k6) &&
+                !carries_narrow_prelude(kfor) &&
+                !carries_narrow_prelude(cdj::render(*bp, "int64_t", 8, cdj::kShapeSparseConsume)),
+              "the two-word prelude must join only the kernels that use it");
+
   std::printf("PASS: render contract checks\n");
+  return true;
+}
+
+bool selection_validation_checks()
+{
+  rmm::cuda_stream owned_stream(rmm::cuda_stream::flags::non_blocking);
+  ::cuda::stream_ref const stream = owned_stream;
+  auto const mr                   = rmm::mr::get_current_device_resource_ref();
+  auto input                      = make_int32_table(1, 35, 91);
+  // The fixture's default-stream upload must finish before the nonblocking decode stream reads it.
+  cudf::get_default_stream().synchronize();
+  auto compressed  = simpatico::compress_with_plan(input->view(), "input -> bitpack\n", stream, mr);
+  auto const& tree = *compressed.columns[0].plan_tree;
+  std::vector<std::uint32_t> words(kWordsPerChunk, 0);
+  words[0] = 5;
+  std::array<std::uint32_t, 2> counts{0, 2};
+  std::array<std::int32_t, 2> indices{0, 2};
+  rmm::device_buffer device_words(words.data(), words.size() * sizeof(words[0]), stream, mr);
+  rmm::device_buffer device_counts(counts.data(), sizeof(counts), stream, mr);
+  rmm::device_buffer device_indices(indices.data(), sizeof(indices), stream, mr);
+  stream.sync();
+  selection_mask mask{static_cast<std::uint32_t*>(device_words.data()),
+                      input->num_rows(),
+                      2,
+                      static_cast<std::uint32_t*>(device_counts.data())};
+  simpatico::decode_selection selection;
+  selection.mask               = &mask;
+  selection.survivor_count     = 2;
+  selection.route              = sirius::codegen::decode_route::bitpack_mask;
+  selection.enumerate_by_index = true;
+  selection.survivor_indices =
+    cudf::column_view{cudf::data_type{cudf::type_id::INT32}, 2, device_indices.data(), nullptr, 0};
+  auto rejects = [&](simpatico::decode_selection const& candidate) {
+    return throws<std::invalid_argument>(
+      [&] { (void)simpatico::validated_selection(tree, candidate); });
+  };
+  REQUIRE_MSG(!rejects(selection), "valid compacted INT32 index map rejected");
+  auto malformed = selection;
+  malformed.survivor_indices =
+    cudf::column_view{cudf::data_type{cudf::type_id::INT64}, 2, device_indices.data(), nullptr, 0};
+  REQUIRE_MSG(rejects(malformed), "equal-sized compacted INT64 index map accepted");
+  malformed.survivor_indices =
+    cudf::column_view{cudf::data_type{cudf::type_id::INT32},
+                      2,
+                      device_indices.data(),
+                      static_cast<cudf::bitmask_type const*>(device_words.data()),
+                      1};
+  REQUIRE_MSG(rejects(malformed), "nullable compacted index map accepted");
+  malformed.survivor_indices =
+    cudf::column_view{cudf::data_type{cudf::type_id::INT64}, 1, device_indices.data(), nullptr, 0};
+  REQUIRE_MSG(!rejects(malformed),
+              "size-mismatched optional index map did not retain mask fallback");
+  malformed.survivor_indices = {};
+  REQUIRE_MSG(!rejects(malformed), "missing optional index map did not retain mask fallback");
+
+  sirius::codegen::chunk_row_set rows;
+  rows.chunk_ids           = static_cast<std::uint32_t const*>(device_counts.data());
+  rows.block_offsets       = static_cast<std::uint32_t const*>(device_counts.data());
+  rows.in_chunk_rows       = static_cast<std::uint16_t const*>(device_indices.data());
+  rows.num_touched         = 1;
+  rows.num_survivors       = 2;
+  rows.num_rows            = std::numeric_limits<std::int64_t>::max();
+  malformed                = {};
+  malformed.rows           = &rows;
+  malformed.route          = sirius::codegen::decode_route::bitpack_mask;
+  malformed.survivor_count = rows.num_survivors;
+  REQUIRE_MSG(rejects(malformed), "oversized CSR row domain accepted before valid() arithmetic");
+  std::string error;
+  auto rejected_rows = simpatico::decompress_column_rows(compressed, 0, rows, stream, mr, &error);
+  REQUIRE_MSG(!rejected_rows && !error.empty(),
+              "public CSR entry accepted an oversized row domain");
+  rows.num_rows = -1;
+  REQUIRE_MSG(rejects(malformed), "negative CSR row domain accepted");
+
+  auto rejects_decode = [&](simpatico::PlanTree const& plan,
+                            simpatico::decode_selection const& candidate) {
+    return throws<std::invalid_argument>([&] {
+      (void)simpatico::decode_one(
+        simpatico::column_decode_request{
+          .source = std::cref(plan), .selection = simpatico::validated_selection(plan, candidate)},
+        stream,
+        mr);
+    });
+  };
+  malformed       = selection;
+  malformed.route = sirius::codegen::decode_route::full;
+  mask.num_rows   = input->num_rows() + 1;
+  REQUIRE_MSG(rejects_decode(tree, malformed), "FULL mask domain mismatch accepted");
+
+  auto strings = make_strings_table({"a", "bb", "ccc", "dddd"}, {}, stream);
+  auto split   = simpatico::compress_with_plan(
+    strings->view(),
+    "input -> str_split -> offsets, chars\nstr_split.offsets -> bitpack\n",
+    stream,
+    mr);
+  mask.num_rows   = strings->num_rows() + 1;
+  malformed.route = sirius::codegen::decode_route::str_split;
+  REQUIRE_MSG(rejects_decode(*split.columns[0].plan_tree, malformed),
+              "str_split mask domain mismatch accepted");
+
+  auto refuses_without_work = [&](auto&& operation) {
+    if (cudaStreamBeginCapture(stream.get(), cudaStreamCaptureModeGlobal) != cudaSuccess)
+      throw std::runtime_error("preflight capture failed to start");
+    cudaGraph_t graph = nullptr;
+    bool refused      = false;
+    try {
+      refused = operation();
+    } catch (...) {
+      (void)cudaStreamEndCapture(stream.get(), &graph);
+      if (graph) (void)cudaGraphDestroy(graph);
+      throw;
+    }
+    if (cudaStreamEndCapture(stream.get(), &graph) != cudaSuccess)
+      throw std::runtime_error("preflight submitted non-capturable work");
+    std::size_t nodes         = 0;
+    auto const node_status    = cudaGraphGetNodes(graph, nullptr, &nodes);
+    auto const destroy_status = cudaGraphDestroy(graph);
+    return refused && node_status == cudaSuccess && destroy_status == cudaSuccess && nodes == 0;
+  };
+
+  mask.num_rows         = strings->num_rows();
+  auto expected_strings = make_strings_column({"a", "ccc"}, {}, stream);
+  auto selected_strings = simpatico::decompress_column_compacted(split, 0, mask, stream, mr);
+  bool const selected_equal =
+    selected_strings && strings_equal(selected_strings->view(), expected_strings->view(), stream);
+  // Complete test readbacks before an assertion can release nonblocking-stream owners.
+  ::cuda::stream_ref{cudaStream_t{}}.sync();
+  REQUIRE_MSG(selected_equal, "raw str_split chars lost selected decode support");
+  auto& split_plan       = *split.columns[0].plan_tree;
+  auto& split_node       = split_plan.nodes[1];
+  auto const chars_index = static_cast<std::size_t>(
+    std::find(split_node.output_names.begin(), split_node.output_names.end(), "chars") -
+    split_node.output_names.begin());
+  REQUIRE_MSG(chars_index < split_node.output_paths.size(), "str_split chars fixture missing");
+  auto& chars         = split_node.channels.at(split_node.output_paths[chars_index]);
+  auto const channels = chars->named_channels(stream);
+  REQUIRE_MSG(channels.size() == 1 && channels.front().view.type().id() == cudf::type_id::UINT8,
+              "str_split chars fixture is not raw UINT8");
+  chars = simpatico::bitcomp_compressor{}.compress(channels.front().view, stream, mr);
+  REQUIRE_MSG(
+    chars->kind() == simpatico::OpId::Bitcomp && chars->decoded_type().id() == cudf::type_id::UINT8,
+    "compressed chars fixture has the wrong representation");
+  REQUIRE_MSG(
+    simpatico::probe_column(split_plan).compact_route == sirius::codegen::decode_route::full,
+    "encoded UINT8 chars were classified as raw chars");
+  REQUIRE_MSG(refuses_without_work([&] {
+                return !simpatico::decompress_column_compacted(
+                         split, 0, mask, stream, mr, &error) &&
+                       error == "decompress_column_compacted: this plan has no compacted route";
+              }),
+              "compressed str_split chars did not refuse before submission");
+  auto full_strings = simpatico::decompress_column_full(split, 0, stream, mr);
+  bool const full_equal =
+    full_strings && strings_equal(full_strings->view(), strings->view().column(0), stream);
+  ::cuda::stream_ref{cudaStream_t{}}.sync();
+  REQUIRE_MSG(full_equal, "compressed str_split chars full decode mismatch");
+
+  auto missing_root = simpatico::plan_tree_from_dsl("input -> bitpack\n");
+  REQUIRE_MSG(missing_root && simpatico::probe_column(*missing_root).can_produce_mask(),
+              "missing-representation ballot fixture is not range-capable");
+  REQUIRE_MSG(refuses_without_work([&] {
+                return !simpatico::decompress_column_selection_mask(
+                         *missing_root, {0, 1000}, mask.words, stream, mr, &error) &&
+                       error == "decode: range ballot root has no representation";
+              }),
+              "missing ballot representation escaped the preflight refusal contract");
+  REQUIRE_MSG(
+    simpatico::decompress_column_selection_mask(tree, {0, 1000}, mask.words, stream, mr, &error) &&
+      error.empty(),
+    "valid ballot failed after a preflight refusal");
+  std::printf("PASS: selected request boundary validation\n");
   return true;
 }
 
@@ -1005,10 +1474,44 @@ int main()
 
   try {
     render_checks();
+    selection_validation_checks();
     // int32 date-like domain; int64 with a base above INT32_MAX so the widened
     // int64 compare path is exercised on genuinely 64-bit decoded values.
     run_roundtrip<std::int32_t>("int32_t", 8035, 2526, arch);
     run_roundtrip<std::int64_t>("int64_t", 3'000'000'000LL, 5052, arch);
+    // The ballot at open-ended / lane-typed bounds: engine lanes (int16 dates,
+    // int32 decimals), negative minima, the full 32-bit int32 width, a 40-bit
+    // int64 chunk and an int64 minimum next to INT64_MIN.
+    run_ballot_edges<std::int8_t>("int8_t", "int8/7b/neg-min", -64, 120, arch);
+    run_ballot_edges<std::int16_t>("int16_t", "int16/12b", 8035, 2526, arch);
+    run_ballot_edges<std::int16_t>("int16_t", "int16/12b/neg-min", -3000, 4000, arch);
+    run_ballot_edges<std::int32_t>("int32_t", "int32/13b", 8035, 4885, arch);
+    run_ballot_edges<std::int32_t>(
+      "int32_t", "int32/32b", std::numeric_limits<std::int32_t>::min(), (1LL << 32) - 1, arch);
+    run_ballot_edges<std::int32_t>("int32_t", "int32/24b/neg-min", -5'000'000, 1LL << 24, arch);
+    run_ballot_edges<std::int64_t>("int64_t", "int64/40b", 8035, 1LL << 40, arch);
+    run_ballot_edges<std::int64_t>("int64_t",
+                                   "int64/13b/INT64_MIN+5",
+                                   std::numeric_limits<std::int64_t>::min() + 5,
+                                   1LL << 13,
+                                   arch);
+    // The index walk from 0.1% to 50% selectivity on 38 chunks (not a multiple of the chunks a
+    // block serves), then the full-width int32 unpack and the int64 wide select at one selectivity.
+    const auto index_walk_selectivities = {10u, 180u, 1400u, 5000u};
+    run_index_walk_selectivities<std::int16_t>(
+      "int16_t", "int16/12b", 8035, 2526, index_walk_selectivities, arch);
+    run_index_walk_selectivities<std::int32_t>(
+      "int32_t", "int32/12b", 8035, 2526, index_walk_selectivities, arch);
+    run_index_walk_selectivities<std::int64_t>(
+      "int64_t", "int64/12b", 8035, 2526, index_walk_selectivities, arch);
+    run_index_walk_selectivities<std::int32_t>("int32_t",
+                                               "int32/32b",
+                                               std::numeric_limits<std::int32_t>::min(),
+                                               (1LL << 32) - 1,
+                                               {180u},
+                                               arch);
+    run_index_walk_selectivities<std::int64_t>(
+      "int64_t", "int64/40b", 8035, 1LL << 40, {180u}, arch);
     // The delta mask walk and the dictionary gather.
     run_delta_masked<std::int64_t>("int64_t", arch);
     run_delta_masked<std::int32_t>("int32_t", arch);

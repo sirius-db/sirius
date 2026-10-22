@@ -155,18 +155,21 @@ class mock_pipeline_builder {
  */
 class testable_task_creator : public task_creator {
  public:
-  testable_task_creator(int num_threads,
+  testable_task_creator(sirius::exec::query_lifecycle_registry& lifecycle,
+                        int num_threads,
                         duckdb::ClientContext& client_context,
                         task_scheduler& task_sched,
                         sirius::memory::sirius_memory_reservation_manager& mem_res_mgr,
                         sirius::query_id_t query_id = sirius::make_query_id(1))
     : task_creator(
+        lifecycle,
         creator::task_creator_config{
           .thread_pool = {.num_threads = num_threads, .thread_name_prefix = "task_creator"}},
         mem_res_mgr),
       _query_id(query_id)
   {
-    // Binding a client context is what registers the query's state.
+    lifecycle.open_query(query_id);
+    // Binding a client context registers the creator state.
     this->set_client_context(query_id, client_context);
     this->set_task_scheduler(task_sched);
   }
@@ -248,7 +251,8 @@ class test_fixture {
         return std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
           std::move(space_configs));
       }()),
-      pipeline_exec(exec::thread_pool_config{.num_threads = 1},
+      pipeline_exec(lifecycle,
+                    exec::thread_pool_config{.num_threads = 1},
                     *memory_manager,
                     sirius::test::make_test_telemetry_context()),
       empty_pipelines()
@@ -267,6 +271,7 @@ class test_fixture {
   duckdb::Connection con;
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager;
   pipeline::pipeline_build_context build_ctx{nullptr, true};
+  sirius::exec::query_lifecycle_registry lifecycle;
   task_scheduler pipeline_exec;
   std::vector<std::shared_ptr<sirius_pipeline>> empty_pipelines;
 };
@@ -280,7 +285,7 @@ TEST_CASE("task_creator thread pool starts and stops", "[task_creator]")
   test_fixture fixture;
 
   testable_task_creator creator(
-    2, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
+    fixture.lifecycle, 2, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
 
   SECTION("Creator starts not running") { REQUIRE_FALSE(creator.is_running()); }
 
@@ -315,7 +320,7 @@ TEST_CASE("task_creator thread pool is idempotent", "[task_creator]")
   test_fixture fixture;
 
   testable_task_creator creator(
-    2, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
+    fixture.lifecycle, 2, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
 
   SECTION("Multiple start_thread_pool calls don't create extra threads")
   {
@@ -356,7 +361,7 @@ TEST_CASE("task_creator destructor stops thread pool", "[task_creator]")
 
   {
     testable_task_creator creator(
-      2, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
+      fixture.lifecycle, 2, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
     creator.start_thread_pool();
     // Destructor should stop threads
   }
@@ -375,7 +380,7 @@ TEST_CASE("get_operator_for_next_task records every pipeline the hint walk visit
   test_fixture fixture;
 
   testable_task_creator creator(
-    2, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
+    fixture.lifecycle, 2, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
 
   auto pipeline_a = std::make_shared<mock_gpu_pipeline>(fixture.build_ctx);
   auto pipeline_b = std::make_shared<mock_gpu_pipeline>(fixture.build_ctx);
@@ -392,9 +397,12 @@ TEST_CASE("get_operator_for_next_task records every pipeline the hint walk visit
     task_creation_hint{.hint = TaskCreationHint::WAITING_FOR_INPUT_DATA, .producer = op_b.get()});
 
   std::vector<std::shared_ptr<sirius_pipeline>> visited;
-  auto* next = creator.get_operator_for_next_task(op_a.get(), visited);
+  auto const next = creator.get_operator_for_next_task(op_a.get(), visited);
 
-  REQUIRE(next == nullptr);
+  REQUIRE_FALSE(next.is_ready);
+  // The last operator actually asked, not the one the request named -- that is
+  // what makes a depleted walk attributable.
+  REQUIRE(next.op == op_b.get());
   // The caller re-evaluates every visited pipeline on the nullptr path. If the
   // walk reported only the requesting pipeline, an upstream pipeline whose
   // tasks all completed earlier would never be marked finished — no later
@@ -410,7 +418,7 @@ TEST_CASE("get_operator_for_next_task with monostate hint and empty priority_sca
   test_fixture fixture;
 
   testable_task_creator creator(
-    2, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
+    fixture.lifecycle, 2, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
 
   // Create a mock operator with no ports (will return monostate)
   auto mock_op = std::make_unique<mock_sirius_physical_operator>();
@@ -418,10 +426,10 @@ TEST_CASE("get_operator_for_next_task with monostate hint and empty priority_sca
   // process_next_task should just return nullptr because there its not really connected to anything
   // and has no data
   std::vector<std::shared_ptr<sirius_pipeline>> visited;
-  auto next_op = creator.get_operator_for_next_task(mock_op.get(), visited);
+  auto const next_op = creator.get_operator_for_next_task(mock_op.get(), visited);
 
   // Nothing should be scheduled
-  REQUIRE(next_op == nullptr);
+  REQUIRE_FALSE(next_op.is_ready);
 }
 
 TEST_CASE("get_operator_for_next_task for operator with data returns the operator",
@@ -430,7 +438,7 @@ TEST_CASE("get_operator_for_next_task for operator with data returns the operato
   test_fixture fixture;
 
   testable_task_creator creator(
-    2, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
+    fixture.lifecycle, 2, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
 
   // Create the source operator that we will call process_next_task on
   auto source_op = std::make_unique<mock_sirius_physical_operator>();
@@ -459,7 +467,14 @@ TEST_CASE("get_operator_for_next_task for operator with data returns the operato
 
   // Following source_op's READY hint must land on hint_op.
   std::vector<std::shared_ptr<sirius_pipeline>> visited;
-  auto next_op = creator.get_operator_for_next_task(source_op.get(), visited);
+  auto const next_op = creator.get_operator_for_next_task(source_op.get(), visited);
 
-  REQUIRE(next_op == hint_op.get());
+  REQUIRE(next_op.is_ready);
+  REQUIRE(next_op.op == hint_op.get());
+
+  // // Verify that schedule was called with the hint_op
+  // auto scheduled_nodes = creator.get_scheduled_nodes();
+  // REQUIRE(creator.get_schedule_count() == 1);
+  // REQUIRE(scheduled_nodes.size() == 1);
+  // REQUIRE(scheduled_nodes[0] == hint_op.get());
 }

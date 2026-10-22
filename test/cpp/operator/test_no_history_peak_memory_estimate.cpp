@@ -62,10 +62,10 @@ hash_join_fixture make_hash_join()
     0);
 
   duckdb::vector<duckdb::JoinCondition> conditions;
-  duckdb::JoinCondition cond;
-  cond.left  = duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
-  cond.right = duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
-  cond.comparison = duckdb::ExpressionType::COMPARE_EQUAL;
+  duckdb::JoinCondition cond(
+    duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0),
+    duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0),
+    duckdb::ExpressionType::COMPARE_EQUAL);
   conditions.push_back(std::move(cond));
 
   f.hash_join = duckdb::make_uniq<sirius_physical_hash_join>(
@@ -104,8 +104,7 @@ TEST_CASE("concat no_history_peak_memory_estimate: 0 batches returns 0",
           "[no_history_peak_memory_estimate][concat]")
 {
   auto f = make_hash_join();
-  sirius_physical_concat concat{
-    sirius::from_duckdb_vec(f.logical_join->types), 0, f.hash_join.get(), /*is_build=*/false};
+  sirius_physical_concat concat{sirius::from_duckdb_vec(f.logical_join->types), 0, false};
   REQUIRE(concat.no_history_peak_memory_estimate({0, 500}) == 0);
 }
 
@@ -113,8 +112,7 @@ TEST_CASE("concat no_history_peak_memory_estimate: 1 batch returns 0",
           "[no_history_peak_memory_estimate][concat]")
 {
   auto f = make_hash_join();
-  sirius_physical_concat concat{
-    sirius::from_duckdb_vec(f.logical_join->types), 0, f.hash_join.get(), false};
+  sirius_physical_concat concat{sirius::from_duckdb_vec(f.logical_join->types), 0, false};
   REQUIRE(concat.no_history_peak_memory_estimate({1, 500}) == 0);
 }
 
@@ -122,8 +120,7 @@ TEST_CASE("concat no_history_peak_memory_estimate: 2 batches returns bytes",
           "[no_history_peak_memory_estimate][concat]")
 {
   auto f = make_hash_join();
-  sirius_physical_concat concat{
-    sirius::from_duckdb_vec(f.logical_join->types), 0, f.hash_join.get(), false};
+  sirius_physical_concat concat{sirius::from_duckdb_vec(f.logical_join->types), 0, false};
   REQUIRE(concat.no_history_peak_memory_estimate({2, 500}) == 500);
 }
 
@@ -131,8 +128,7 @@ TEST_CASE("concat no_history_peak_memory_estimate: many batches returns bytes",
           "[no_history_peak_memory_estimate][concat]")
 {
   auto f = make_hash_join();
-  sirius_physical_concat concat{
-    sirius::from_duckdb_vec(f.logical_join->types), 0, f.hash_join.get(), false};
+  sirius_physical_concat concat{sirius::from_duckdb_vec(f.logical_join->types), 0, false};
   REQUIRE(concat.no_history_peak_memory_estimate({10, 1024}) == 1024);
 }
 
@@ -191,7 +187,8 @@ TEST_CASE("partition no_history_peak_memory_estimate: many partitions returns by
 TEST_CASE("GPU scan preserves fresh-read expansion and filter-only accounting",
           "[no_history_peak_memory_estimate][gpu_scan]")
 {
-  scan::sirius_gpu_scan_operator scan{/*types=*/{}, /*estimated_cardinality=*/0, /*ingestible=*/{}};
+  scan::sirius_gpu_scan_operator scan{
+    /*types=*/{}, /*estimated_cardinality=*/0, /*ingestible=*/{}, /*contract_id=*/1};
 
   CHECK(scan.no_history_peak_memory_estimate({1, 100, operator_data_type::GPU_SCAN, false, 100}) ==
         800);
@@ -205,7 +202,7 @@ TEST_CASE("GPU scan resident estimate follows actual carrier conversion",
           "[no_history_peak_memory_estimate][gpu_scan]")
 {
   scan::sirius_gpu_scan_operator native_scan{
-    /*types=*/{}, /*estimated_cardinality=*/0, /*ingestible=*/{}};
+    /*types=*/{}, /*estimated_cardinality=*/0, /*ingestible=*/{}, /*contract_id=*/1};
 
   // Five-field aggregate initialization remains source-compatible: the fifth
   // value is working_set_bytes and the trailing conversion marker defaults off. A resident chunk
@@ -236,7 +233,8 @@ TEST_CASE("GPU scan resident estimate follows actual carrier conversion",
   scan::sirius_gpu_scan_operator sidecar_scan{
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::BIGINT}),
     /*estimated_cardinality=*/0,
-    /*ingestible=*/{}};
+    /*ingestible=*/{},
+    /*contract_id=*/1};
   sidecar_scan.set_physical_types({cudf::data_type{cudf::type_id::INT8}});
 
   // A native cached carrier converting to a narrow plan sidecar the serve site did not size: the
@@ -251,7 +249,8 @@ TEST_CASE("GPU scan resident estimate follows actual carrier conversion",
 TEST_CASE("GPU scan no-history estimates saturate instead of wrapping",
           "[no_history_peak_memory_estimate][gpu_scan]")
 {
-  scan::sirius_gpu_scan_operator scan{/*types=*/{}, /*estimated_cardinality=*/0, /*ingestible=*/{}};
+  scan::sirius_gpu_scan_operator scan{
+    /*types=*/{}, /*estimated_cardinality=*/0, /*ingestible=*/{}, /*contract_id=*/1};
   auto const max                     = std::numeric_limits<std::size_t>::max();
   auto const multiplication_overflow = max / 8 + 1;
 

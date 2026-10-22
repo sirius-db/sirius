@@ -48,7 +48,6 @@ public:
 **Our usage**:
 - `src/op/scan/duckdb_scan_task.cpp` — Receives scanned data from DuckDB as DataChunks, converts to GPU format
 - `src/op/result/host_table_chunk_reader.cpp` — Converts GPU results back to DataChunks for DuckDB
-- `src/operator/gpu_physical_table_scan.cpp` — Scans data into DataChunks
 - `src/sirius_extension.cpp` — Used in table function execute callbacks
 
 ### Vector
@@ -72,7 +71,6 @@ public:
 
 **Our usage**:
 - `src/op/result/host_table_chunk_reader.cpp` — Access raw vector data for GPU→CPU transfer
-- `src/gpu_columns.cpp` — Read vector data to build GPU columns
 
 ### FlatVector
 
@@ -96,7 +94,6 @@ struct StringVector {
 
 **Our usage**:
 - `src/op/result/host_table_chunk_reader.cpp` — `FlatVector::GetData()` to get raw pointers, `FlatVector::Validity()` for null masks
-- `src/gpu_columns.cpp` — Read raw data from vectors
 - `test/cpp/memory/test_host_table_utils.cpp` — Test vector data access
 
 ### ValidityMask
@@ -150,7 +147,6 @@ struct DecimalType {
 **Description**: DuckDB's type system. `LogicalTypeId` identifies the SQL type, `LogicalType` wraps it with extra info (e.g., decimal precision). Sirius maps these to cuDF data types.
 
 **Our usage**:
-- `src/gpu_columns.cpp` — Map DuckDB types to cuDF types
 - `src/expression_executor/gpu_expression_translator.cpp` — Determine GPU operation types from expression types
 - `src/planner/sirius_physical_plan_generator.cpp` — Check supported types for GPU execution
 - `src/fallback.cpp` — Check type support to decide CPU vs GPU execution
@@ -184,7 +180,6 @@ struct UBigIntValue { static uint64_t Get(const Value &value); };
 **Our usage**:
 - `src/sirius_extension.cpp` — Extract function arguments (e.g., SQL query string, memory sizes)
 - `src/expression_executor/gpu_expression_translator.cpp` — Extract constant values for GPU expressions
-- `src/operator/gpu_physical_table_scan.cpp` — Build filter constants
 
 ### ColumnDataCollection
 
@@ -205,8 +200,6 @@ public:
 **Description**: In-memory columnar storage that can hold arbitrary amounts of data (unlike DataChunk which is limited to STANDARD_VECTOR_SIZE). Used for materialization.
 
 **Our usage**:
-- `src/plan/gpu_plan_recursive_cte.cpp` — CTE materialization
-- `src/operator/gpu_physical_table_scan.cpp` — Collect scanned data
 
 ### ExpressionType / PhysicalOperatorType / LogicalOperatorType (Enums)
 
@@ -233,7 +226,6 @@ LOGICAL_ORDER_BY, LOGICAL_TOP_N, LOGICAL_LIMIT, LOGICAL_WINDOW, LOGICAL_CTE, ...
 
 **Our usage**:
 - `src/expression_executor/gpu_expression_translator.cpp` — Switch on expression types to dispatch GPU evaluation
-- `src/gpu_physical_plan_generator.cpp` — Switch on physical/logical operator types to create GPU operators
 - `src/planner/sirius_physical_plan_generator.cpp` — Same as above for new Sirius code path
 - `src/fallback.cpp` — Check operator types for fallback decisions
 

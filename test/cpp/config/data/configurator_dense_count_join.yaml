@@ -22,6 +22,10 @@ sirius:
     downgrade:
       num_threads: 1
       monitor_period: 10ms
+    scan_manager:
+      # One reactor keeps uring pinned staging at 64 MiB so it fits this
+      # deliberately small host pool; the production default is 4.
+      uring_n_reactors: 1
   operator_params:
     enable_dense_count_join: true
   telemetry:

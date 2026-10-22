@@ -36,8 +36,8 @@
 #include "sirius/exception.hpp"
 
 // duckdb
-#include <duckdb/main/materialized_query_result.hpp>
 #include <duckdb/main/prepared_statement_data.hpp>
+#include <duckdb/main/query_result.hpp>
 
 // standard library
 #include <algorithm>
@@ -63,11 +63,11 @@ sirius_physical_result_collector::sirius_physical_result_collector(
 }
 
 std::unique_ptr<operator_data> sirius_physical_result_collector::execute(
-  const operator_data& input_data, rmm::cuda_stream_view stream)
+  const operator_data& input_data, ::cuda::stream_ref stream)
 {
   nvtx_scoped_range nvtx_range{"sirius_physical_result_collector::execute"};
   return std::make_unique<pipelineable_operator_data>(
-    dynamic_cast<const pipelineable_operator_data&>(input_data).get_read_only_batches());
+    dynamic_cast<const pipelineable_operator_data&>(input_data).get_data_batches());
 }
 
 duckdb::vector<duckdb::const_reference<sirius_physical_operator>>
@@ -113,12 +113,12 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_physical_materialized_collector::
       duckdb::make_uniq<duckdb::ColumnDataCollection>(_client_ctx, result_column_types);
   }
 
-  return duckdb::make_uniq<duckdb::MaterializedQueryResult>(
+  return duckdb::make_uniq<duckdb::QueryResult>(
     statement_type, properties, names, std::move(result_collection), props);
 }
 
 void sirius_physical_materialized_collector::sink(const operator_data& input_data,
-                                                  rmm::cuda_stream_view stream)
+                                                  ::cuda::stream_ref stream)
 {
   nvtx_scoped_range nvtx_range{"sirius_physical_materialized_collector::sink"};
   auto& pipelineable_input  = dynamic_cast<const pipelineable_operator_data&>(input_data);
@@ -219,8 +219,11 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
     }
 
     host_table_chunk_reader chunk_reader(_client_ctx, host_table, result_column_types);
+    duckdb::ColumnDataCollection local_collection(_client_ctx, result_column_types);
+    duckdb::ColumnDataAppendState append_state;
+    local_collection.InitializeAppend(append_state);
 
-    // Push chunks to result collection
+    // Append into a task-local collection so chunk copies do not hold the shared lock.
     while (true) {
       // TODO(amin): it is fishy that append take a mutable reference to the chunk reader and we
       // are passing local variable chunk reader by reference. We should investigate if this can
@@ -230,14 +233,16 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
       duckdb::DataChunk chunk;
       if (!chunk_reader.get_next_chunk(chunk)) { break; }
 
-      std::lock_guard<std::mutex> guard(lock);
-      // Initialize result collection if it is null (from a move)
-      if (!result_collection) {
-        result_collection =
-          duckdb::make_uniq<duckdb::ColumnDataCollection>(_client_ctx, result_column_types);
-      }
-      result_collection->Append(chunk);
+      local_collection.Append(append_state, chunk);
     }
+
+    // Combine moves the local segments into the result collection without copying their rows.
+    std::lock_guard<std::mutex> guard(lock);
+    if (!result_collection) {
+      result_collection =
+        duckdb::make_uniq<duckdb::ColumnDataCollection>(_client_ctx, result_column_types);
+    }
+    result_collection->Combine(local_collection);
   };
 
   std::for_each(input_batches.begin(), input_batches.end(), sink_single_batch);

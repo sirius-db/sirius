@@ -1,6 +1,6 @@
 # Vector Similarity Search (VSS)
 
-**Files:** `src/vss/`, `src/cuda/vss/`, `src/include/vss/`, table functions in
+**Files:** `src/vss/`, `src/cuda/vss/`, `src/vss/`, table functions in
 `src/sirius_extension.cpp:1740-2571`
 
 GPU-native k-nearest-neighbor search over the vector column of a GPU-pinned table, built on
@@ -98,7 +98,7 @@ iff at least one entry was removed.
 3. Clamps `k` to `min(num_rows, k)`; an empty table or `k == 0` returns the empty result
    schema immediately.
 4. Uploads the query vector once to the device; both impls read it there.
-5. Builds a `vector_search_context` (`src/include/vss/vector_search_internal.hpp:51`) — the
+5. Builds a `vector_search_context` (`src/vss/vector_search_internal.hpp:51`) — the
    resolved spaces, pin, allocator, stream, device query pointer — and dispatches on
    `use_index` to `run_vector_search_ann` or `run_vector_search_enn`.
 
@@ -163,7 +163,7 @@ incrementally, one batch at a time (`build_ivf_flat_index_from_batches`,
   at low `n_probes`.
 
 **Memory admission:** the build's GPU footprint is estimated up front
-(`ivf_flat_reservation_bytes`, `src/include/vss/ivf_flat_index.hpp:38` — roughly twice the
+(`ivf_flat_reservation_bytes`, `src/vss/ivf_flat_index.hpp:38` — roughly twice the
 vector+id payload plus per-list rounding and centroids) and reserved through the cache
 (`reserve_index_memory`, `src/vss/cuvs_index_cache.cpp:57` — non-blocking, pinned to the GPU
 that holds the table). The reservation is attached to a dedicated build stream so every cuVS
@@ -174,14 +174,14 @@ first and the reservation retried (the *destructive* path); if it still fails, t
 reports the needed vs. free MiB and lists other-metric indexes on the column that could be
 dropped. On the non-destructive path the old index is only erased after the new one is built.
 
-### The cache (`cuvs_index_cache`, `src/include/vss/cuvs_index_cache.hpp:166`)
+### The cache (`cuvs_index_cache`, `src/vss/cuvs_index_cache.hpp:166`)
 
 A session-lifetime, mutex-guarded registry of GPU-resident cuVS indexes — the ANN analogue of
 the scan manager's pin-table cache, deliberately standalone so future index kinds can add their
 own search operators without touching shared scan code.
 
 - **Key:** the length-prefixed routing identity `(catalog, schema, table, column, metric)`
-  (`build_ann_index_cache_key`, `src/include/vss/cuvs_index_cache.hpp:71`). One index per
+  (`build_ann_index_cache_key`, `src/vss/cuvs_index_cache.hpp:71`). One index per
   (column, metric); inserting under an existing key replaces it.
 - **Entries** (`pinned_index_entry`): copyable metadata (kind, identity, `dim`, `num_rows`,
   `n_lists`, metric, `resident_bytes`), the type-erased index payload (`any_cuvs_index` /
@@ -191,7 +191,7 @@ own search operators without touching shared scan code.
 - **Lookups return `shared_ptr`:** a caller mid-search keeps the whole entry (and its GPU
   memory) alive even if the entry is erased or replaced concurrently; the mutex only guards the
   map.
-- **Ownership:** the cache lives on `SiriusContext` (`src/include/sirius_context.hpp:687`),
+- **Ownership:** the cache lives on `SiriusContext` (`src/sirius_context.hpp:687`),
   constructed with the memory reservation manager during initialization
   (`src/sirius_context.cpp:701`) and reset in `terminate()` after a device sync, before the
   memory manager is torn down (`src/sirius_context.cpp:974`); the member is also declared after
@@ -268,12 +268,12 @@ exact cuVS enum.
 | cuVS brute-force search | `src/cuda/vss/brute_force_search.cu:32` |
 | LIST-column → RAFT matrix view | `src/cuda/vss/cudf_raft_interop.cu:27` |
 | IVF-Flat batched build, search kernel | `src/cuda/vss/ivf_flat_index.cu:68`, `:160` |
-| Build footprint estimate | `src/include/vss/ivf_flat_index.hpp:38` |
-| Index cache (key, entries, API) | `src/include/vss/cuvs_index_cache.hpp:71`, `:123`, `:166` |
+| Build footprint estimate | `src/vss/ivf_flat_index.hpp:38` |
+| Index cache (key, entries, API) | `src/vss/cuvs_index_cache.hpp:71`, `:123`, `:166` |
 | Metric canonicalization, identity lookup | `src/vss/cuvs_index_cache.cpp:37`, `:90` |
 | ANN search impl, global-id gather | `src/vss/vector_search_ann.cpp:106`, `:54` |
 | Pinned chunk views (single-GPU check) | `src/vss/pinned_column.cpp:32` |
 | Metric mapping | `src/vss/distance_metric.cpp:24-47` |
-| Cache ownership on `SiriusContext` | `src/include/sirius_context.hpp:687`, `src/sirius_context.cpp:701`, `:974` |
+| Cache ownership on `SiriusContext` | `src/sirius_context.hpp:687`, `src/sirius_context.cpp:701`, `:974` |
 | End-to-end SQL tests | `test/cpp/integration/test_gpu_execution_vector_search.cpp` |
 | Unit tests | `test/cpp/vss/` |

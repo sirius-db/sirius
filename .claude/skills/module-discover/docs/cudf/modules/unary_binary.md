@@ -28,11 +28,6 @@ std::unique_ptr<column> binary_operation(column_view const& lhs, scalar const& r
 **Description**: Element-wise binary operation producing a new column.
 
 **Our usage** (40+ call sites):
-- `src/expression_executor/specializations/gpu_execute_operator.cpp` — Arithmetic ops (+, -, *, /, %)
-- `src/expression_executor/specializations/gpu_execute_comparison.cpp` — Comparison ops (<, >, =, etc.)
-- `src/expression_executor/specializations/gpu_execute_between.cpp` — BETWEEN as two comparisons + AND
-- `src/expression_executor/specializations/gpu_execute_conjunction.cpp` — AND/OR logical ops
-- `src/expression_executor/specializations/gpu_execute_function.cpp` — Date arithmetic
 
 ### `cudf::binary_operator` (enum)
 
@@ -52,7 +47,6 @@ std::unique_ptr<column> unary_operation(column_view const& input, unary_operator
 ```
 
 **Our usage**:
-- `src/expression_executor/specializations/gpu_execute_operator.cpp` — NOT, ABS, negation
 - `src/cuda/expression_executor/gpu_dispatch_string.cu` — IS_NULL checks
 
 ### `cudf::cast`
@@ -65,8 +59,6 @@ std::unique_ptr<column> cast(column_view const& input, data_type out_type, ...);
 **Description**: Type casting between cuDF data types.
 
 **Our usage** (10+ call sites):
-- `src/expression_executor/specializations/gpu_execute_cast.cpp:20` — SQL CAST expressions
-- `src/operator/gpu_physical_ungrouped_aggregate.cpp` — Cast before aggregation
 - `src/op/sirius_physical_hash_join.cpp:25` — Type alignment before join
 - `src/op/partition/gpu_partition_impl.cpp:22` — Cast for partitioning
 
@@ -79,7 +71,6 @@ std::unique_ptr<column> is_valid(column_view const& input, ...);
 ```
 
 **Our usage**:
-- `src/expression_executor/specializations/gpu_execute_operator.cpp` — IS NULL / IS NOT NULL
 
 ### `cudf::replace_nulls`
 
@@ -90,7 +81,6 @@ std::unique_ptr<column> replace_nulls(column_view const& input, column_view cons
 ```
 
 **Our usage**:
-- `src/operator/gpu_physical_table_scan.cpp` — Replace nulls in boolean filter masks
 
 ## APIs Available but Not Used
 

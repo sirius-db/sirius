@@ -193,7 +193,7 @@ TEST_CASE("gpu_execution - compressed materialization residency gate states end 
     auto registered_default =
       con.Query("SELECT current_setting('enable_compressed_materialization')::BOOLEAN;");
     require_ok(registered_default, "read registered default");
-    REQUIRE(registered_default->GetValue(0, 0).GetValue<bool>());
+    REQUIRE(registered_default->Collection().GetValue(0, 0).GetValue<bool>());
 
     // A gate regression must fail loudly instead of silently falling back.
     require_ok(con.Query("SET enable_duckdb_fallback = false;"), "disable fallback");
@@ -298,7 +298,7 @@ TEST_CASE("gpu_execution - compressed materialization residency gate states end 
       auto other_setting =
         other.Query("SELECT current_setting('enable_compressed_materialization')::BOOLEAN;");
       require_ok(other_setting, "read other's setting");
-      REQUIRE(other_setting->GetValue(0, 0).GetValue<bool>());
+      REQUIRE(other_setting->Collection().GetValue(0, 0).GetValue<bool>());
 
       // The setting still describes what other actually does: its pin narrows.
       auto const pin_before = sirius::test::get_compressed_materialization_stats(other);
@@ -312,7 +312,7 @@ TEST_CASE("gpu_execution - compressed materialization residency gate states end 
       auto con_setting =
         con.Query("SELECT current_setting('enable_compressed_materialization')::BOOLEAN;");
       require_ok(con_setting, "read con's setting");
-      REQUIRE_FALSE(con_setting->GetValue(0, 0).GetValue<bool>());
+      REQUIRE_FALSE(con_setting->Collection().GetValue(0, 0).GetValue<bool>());
 
       require_ok(other.Query("CALL unpin_table('t');"), "unpin");
       require_ok(con.Query("SET enable_compressed_materialization = true;"), "restore flag");

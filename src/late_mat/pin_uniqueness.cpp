@@ -48,33 +48,33 @@ std::string lowered(std::string_view s)
 /// Host value of an integer scalar, widened into the probe's common domain.
 /// Returns nullopt for anything the probe must not interpret — an invalid
 /// scalar (an all-null chunk reduces to one) or a non-integer type.
-std::optional<__int128> integer_scalar_value(cudf::scalar const& s, rmm::cuda_stream_view stream)
+std::optional<__int128_t> integer_scalar_value(cudf::scalar const& s, ::cuda::stream_ref stream)
 {
   if (!s.is_valid(stream)) { return std::nullopt; }
   switch (s.type().id()) {
     case cudf::type_id::INT8:
-      return static_cast<__int128>(
+      return static_cast<__int128_t>(
         static_cast<cudf::numeric_scalar<int8_t> const&>(s).value(stream));
     case cudf::type_id::INT16:
-      return static_cast<__int128>(
+      return static_cast<__int128_t>(
         static_cast<cudf::numeric_scalar<int16_t> const&>(s).value(stream));
     case cudf::type_id::INT32:
-      return static_cast<__int128>(
+      return static_cast<__int128_t>(
         static_cast<cudf::numeric_scalar<int32_t> const&>(s).value(stream));
     case cudf::type_id::INT64:
-      return static_cast<__int128>(
+      return static_cast<__int128_t>(
         static_cast<cudf::numeric_scalar<int64_t> const&>(s).value(stream));
     case cudf::type_id::UINT8:
-      return static_cast<__int128>(
+      return static_cast<__int128_t>(
         static_cast<cudf::numeric_scalar<uint8_t> const&>(s).value(stream));
     case cudf::type_id::UINT16:
-      return static_cast<__int128>(
+      return static_cast<__int128_t>(
         static_cast<cudf::numeric_scalar<uint16_t> const&>(s).value(stream));
     case cudf::type_id::UINT32:
-      return static_cast<__int128>(
+      return static_cast<__int128_t>(
         static_cast<cudf::numeric_scalar<uint32_t> const&>(s).value(stream));
     case cudf::type_id::UINT64:
-      return static_cast<__int128>(
+      return static_cast<__int128_t>(
         static_cast<cudf::numeric_scalar<uint64_t> const&>(s).value(stream));
     default: return std::nullopt;
   }
@@ -133,7 +133,7 @@ std::size_t exact_uniqueness_row_cap()
 }
 
 std::optional<bool> exact_distinct_over_chunks(std::span<cudf::column_view const> chunks,
-                                               rmm::cuda_stream_view stream)
+                                               ::cuda::stream_ref stream)
 {
   if (chunks.empty()) { return std::nullopt; }
 
@@ -188,7 +188,7 @@ void unique_probe::drop(std::size_t column_pos, std::string_view why)
   --_live_candidates;
 }
 
-void unique_probe::observe(cudf::table_view const& chunk, rmm::cuda_stream_view stream)
+void unique_probe::observe(cudf::table_view const& chunk, ::cuda::stream_ref stream)
 {
   if (_live_candidates == 0) { return; }
 

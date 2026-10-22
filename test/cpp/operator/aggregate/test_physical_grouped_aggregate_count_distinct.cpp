@@ -79,7 +79,7 @@ template <typename ValTraits>
 std::unique_ptr<cudf::table> make_count_distinct_input(
   const std::vector<int32_t>& keys,
   const std::vector<typename ValTraits::type>& values,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
   std::vector<std::unique_ptr<cudf::column>> cols;
@@ -93,7 +93,7 @@ std::unique_ptr<cudf::table> make_count_distinct_input(
 // ---------------------------------------------------------------------------
 std::unique_ptr<cudf::table> make_count_distinct_expected(const std::vector<int32_t>& exp_keys,
                                                           const std::vector<int64_t>& exp_counts,
-                                                          rmm::cuda_stream_view stream,
+                                                          ::cuda::stream_ref stream,
                                                           rmm::device_async_resource_ref mr)
 {
   std::vector<std::unique_ptr<cudf::column>> cols;
@@ -403,8 +403,12 @@ TEST_CASE("count distinct: mixed with regular aggregations, multiple batches",
     ch.push_back(duckdb::make_uniq<duckdb::BoundReferenceExpression>(ValTraits::logical_type(), 1));
     auto fn = sirius::test::MakeDummyAggregate(
       "count", {ValTraits::logical_type()}, duckdb::LogicalType::BIGINT);
-    aggregates.push_back(duckdb::make_uniq<duckdb::BoundAggregateExpression>(
-      fn, std::move(ch), nullptr, nullptr, duckdb::AggregateType::DISTINCT));
+    aggregates.push_back(
+      duckdb::make_uniq<duckdb::BoundAggregateExpression>(duckdb::BoundAggregateFunction(fn),
+                                                          std::move(ch),
+                                                          nullptr,
+                                                          nullptr,
+                                                          duckdb::AggregateType::DISTINCT));
   }
   // min(col1)
   {
@@ -412,8 +416,12 @@ TEST_CASE("count distinct: mixed with regular aggregations, multiple batches",
     ch.push_back(duckdb::make_uniq<duckdb::BoundReferenceExpression>(ValTraits::logical_type(), 1));
     auto fn = sirius::test::MakeDummyAggregate(
       "min", {ValTraits::logical_type()}, ValTraits::logical_type());
-    aggregates.push_back(duckdb::make_uniq<duckdb::BoundAggregateExpression>(
-      fn, std::move(ch), nullptr, nullptr, duckdb::AggregateType::NON_DISTINCT));
+    aggregates.push_back(
+      duckdb::make_uniq<duckdb::BoundAggregateExpression>(duckdb::BoundAggregateFunction(fn),
+                                                          std::move(ch),
+                                                          nullptr,
+                                                          nullptr,
+                                                          duckdb::AggregateType::NON_DISTINCT));
   }
   // count(col1)
   {
@@ -421,8 +429,12 @@ TEST_CASE("count distinct: mixed with regular aggregations, multiple batches",
     ch.push_back(duckdb::make_uniq<duckdb::BoundReferenceExpression>(ValTraits::logical_type(), 1));
     auto fn = sirius::test::MakeDummyAggregate(
       "count", {ValTraits::logical_type()}, ValTraits::logical_type());
-    aggregates.push_back(duckdb::make_uniq<duckdb::BoundAggregateExpression>(
-      fn, std::move(ch), nullptr, nullptr, duckdb::AggregateType::NON_DISTINCT));
+    aggregates.push_back(
+      duckdb::make_uniq<duckdb::BoundAggregateExpression>(duckdb::BoundAggregateFunction(fn),
+                                                          std::move(ch),
+                                                          nullptr,
+                                                          nullptr,
+                                                          duckdb::AggregateType::NON_DISTINCT));
   }
 
   // Clone expressions for merge operator (it takes the same spec)

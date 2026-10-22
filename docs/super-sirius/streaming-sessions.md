@@ -49,7 +49,7 @@ There is no bounded channel and no channel-level backpressure; see
 
 ## `exec::batch_stream`
 
-**Files:** `src/include/exec/batch_stream.hpp`, `src/exec/batch_stream.cpp`
+**Files:** `src/exec/batch_stream.hpp`, `src/exec/batch_stream.cpp`
 
 One direction of batch flow: N declared senders push into one repository; consumers pull, poll,
 or block.
@@ -158,7 +158,7 @@ Reading S1–S5 against the diagram:
 
 ## `STREAMING_SOURCE` — the input boundary
 
-**Files:** `src/include/op/sirius_physical_streaming_source.hpp`,
+**Files:** `src/op/sirius_physical_streaming_source.hpp`,
 `src/op/sirius_physical_streaming_source.cpp`
 
 Wraps one `batch_stream` constructed with the fragment's expected sender set. Remote producers
@@ -226,7 +226,7 @@ pipeline finish and schedules its consumers.
 
 ## `STREAMING_SINK` — the output boundary
 
-**Files:** `src/include/op/sirius_physical_streaming_sink.hpp`,
+**Files:** `src/op/sirius_physical_streaming_sink.hpp`,
 `src/op/sirius_physical_streaming_sink.cpp`
 
 A pipeline-terminal operator. `sink()` pushes each output batch into an output `batch_stream`;
@@ -300,12 +300,12 @@ Construction invariants:
 
 ## `exec::stream_session` — the id-addressed router
 
-**Files:** `src/include/exec/stream_session.hpp`, `src/exec/stream_session.cpp`
+**Files:** `src/exec/stream_session.hpp`, `src/exec/stream_session.cpp`
 
 ```
 push(stream_id, batch)              // → source.push
 close_input(stream_id, sender_id)   // → source.close_input(sender)
-fail_input(stream_id, error)        // → source.fail_input(error)   — poison an input stream
+input_closed(stream_id) -> bool     // → source.stream().terminal() — every sender closed
 pull(stream_id) -> optional         // → sink.pull(partition)
 wait(stream_id)                     // → sink.wait(partition)
 drained(stream_id) -> bool          // → sink.drained(partition)
@@ -313,14 +313,15 @@ fail_output(stream_id, error)       // → sink.fail_output(error)    — poison
 ```
 
 - Stream ids are **session-local** and **direction-separated** — two independent namespaces:
-  `push`/`close_input` resolve input streams (sources); `pull`/`wait`/`drained` resolve output
-  streams (sink partitions). A partitioned sink registers N ids, one per destination. An unknown
-  id is a defined error.
+  `push`/`close_input`/`input_closed` resolve input streams (sources); `pull`/`wait`/`drained`
+  resolve output streams (sink partitions). A partitioned sink registers N ids, one per
+  destination. An unknown id is a defined error.
 - The session holds **no repositories** — it forwards to the operators, which own the queues. It
   builds no plan, submits nothing to the scheduler, and owns no teardown; it wraps
   already-instantiated operators.
 - A **leaf**-fragment session registers only sink ids (a session with no input streams is
-  legitimate); a **root**-fragment session registers a source id plus sink ids.
+  legitimate); a **result**-fragment session registers only source ids, because its terminal
+  is a `RESULT_COLLECTOR`, not a sink.
 
 > **Gotcha for plan-launcher work.** The sink is the pipeline **tail**, and it must be a member of
 > that pipeline's `operators` vector — being the pipeline's `sink` member is not enough. Pipeline
@@ -365,8 +366,8 @@ additive — nothing in this design forecloses it.
 ## Fragments: `exec::streaming_fragment` and the FFI
 
 The layer above these primitives — building a plan around them, bridging DuckDB bind time to
-physical-plan time via `stream_bind_catalog`, and the cross-language `sirius::ffi::Fragment`
-lifecycle — has its own document: [Streaming Fragments](streaming-fragments.md).
+physical-plan time via `stream_bind_catalog`, and the embedder API (`sirius::ffi::Context` plus
+`Fragment`) — has its own document: [Streaming Fragments](streaming-fragments.md).
 
 ## Tests
 
@@ -379,7 +380,7 @@ lifecycle — has its own document: [Streaming Fragments](streaming-fragments.md
 | `test/cpp/pipeline/test_streaming_sink_root.cpp` | `[integration][pipeline][streaming_sink_root]`, `[integration][pipeline][streaming_sink_root_exec]` |
 
 Fragment-layer tests (`test_stream_bind_catalog.cpp`, `test_streaming_fragment.cpp`,
-`test_sirius_ffi_fragment.cpp`) are listed in [Streaming Fragments](streaming-fragments.md#tests).
+`test_sirius_ffi_embedder.cpp`, `test_sirius_ffi_fragment.cpp`) are listed in [Streaming Fragments](streaming-fragments.md#tests).
 
 A `recording_task_creator` stands in for the scheduler, so the live re-arm and the `on_data`
 hook path are proven without a live executor. The `[pipeline_completion]` cases drive the real

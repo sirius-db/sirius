@@ -20,12 +20,18 @@
 // combine_masks_and is worth its own case for a specific reason: the decode
 // only calls it with two or more sources, and no end-to-end test builds a
 // request with more than one, so it is otherwise unexecuted.
+//
+// mask_from_bool8 gets a layout sweep because its fast path reads flags 16 bytes
+// at a time: a base pointer that is not 16-byte aligned must take the byte-wise
+// path rather than fault, a row count off any multiple of 32 must pack a partial
+// tail word, any non-zero byte (not only 1) must count as true, and a strip
+// longer than the capped grid must be covered by the grid-stride loop.
 
 #include "codegen/selection/selection.hpp"
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
+#include <cuda/stream>
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -84,13 +90,21 @@ std::uint64_t splitmix64(std::uint64_t& s)
 }
 
 /// A BOOL8 keep-flag per row, ~`keep_percent`% set, with row 0 and the last row
-/// forced set so the edges are never accidentally empty.
-std::vector<std::uint8_t> gen_flags(std::int64_t num_rows, int keep_percent, std::uint64_t seed)
+/// forced set so the edges are never accidentally empty. A set flag is 1 unless
+/// `any_nonzero`, in which case it is any byte in 1..255: cudf BOOL8 is "non-zero
+/// is true", and a packer that tests for exactly 1 would pass the plain case.
+std::vector<std::uint8_t> gen_flags(std::int64_t num_rows,
+                                    int keep_percent,
+                                    std::uint64_t seed,
+                                    bool any_nonzero = false)
 {
   std::vector<std::uint8_t> flags(static_cast<std::size_t>(num_rows));
   for (std::int64_t i = 0; i < num_rows; ++i) {
-    flags[static_cast<std::size_t>(i)] = static_cast<std::uint8_t>(
-      (splitmix64(seed) % 100) < static_cast<std::uint64_t>(keep_percent));
+    auto const x    = splitmix64(seed);
+    bool const keep = (x % 100) < static_cast<std::uint64_t>(keep_percent);
+    auto const value =
+      any_nonzero ? static_cast<std::uint8_t>(1 + (x >> 8) % 255) : std::uint8_t{1};
+    flags[static_cast<std::size_t>(i)] = keep ? value : std::uint8_t{0};
   }
   flags.front() = 1;
   flags.back()  = 1;
@@ -112,7 +126,7 @@ std::vector<std::uint32_t> pack_reference(std::vector<std::uint8_t> const& flags
   return words;
 }
 
-rmm::cuda_stream_view test_stream() { return rmm::cuda_stream_view{}; }
+::cuda::stream_ref test_stream() { return ::cuda::stream_ref{cudaStream_t{}}; }
 
 //===----------------------------------------------------------------------===//
 
@@ -134,7 +148,7 @@ void test_mask_from_bool8()
   d_words.upload(poison);
 
   sirius::codegen::mask_from_bool8(d_flags.ptr, kRows, d_words.ptr, test_stream());
-  cudaStreamSynchronize(test_stream().value());
+  cudaStreamSynchronize(test_stream().get());
 
   auto const got = d_words.download(reference.size());
   REQUIRE_MSG(got == reference, "mask_from_bool8: packed mask != host reference");
@@ -147,6 +161,56 @@ void test_mask_from_bool8()
                 static_cast<long long>(r));
   }
   std::printf("PASS: mask_from_bool8\n");
+}
+
+void test_mask_from_bool8_layouts()
+{
+  struct Layout {
+    std::int64_t rows;
+    std::size_t offset;  // bytes into a padded device buffer
+    char const* what;
+  };
+  // 5 rows: no full word at all, the strip is one live tail word plus zeros.
+  // 2597 = 2 full chunks + 549 rows: off every multiple of 32 and 128.
+  // 33 555 461 rows = 1 048 608 words, past the 4096 x 256 grid cap.
+  Layout const layouts[] = {
+    {5, 0, "tail word only"},
+    {2597, 0, "aligned, partial tail word"},
+    {2597, 1, "misaligned by 1 byte"},
+    {2597, 7, "misaligned by 7 bytes"},
+    {2597, 16, "aligned at a 16-byte offset"},
+    {static_cast<std::int64_t>(4096) * 256 * 32 + 1029, 0, "grid-stride strip"},
+  };
+  for (Layout const& l : layouts) {
+    auto const flags     = gen_flags(l.rows, 30, 0xB00 + l.offset, /*any_nonzero=*/true);
+    auto const reference = pack_reference(flags, l.rows);
+
+    device_array<std::uint8_t> d_flags(flags.size() + 64);
+    device_array<std::uint32_t> d_words(reference.size());
+    REQUIRE_MSG(
+      d_flags.ptr && d_words.ptr, "mask_from_bool8 (%s): device allocation failed", l.what);
+    cudaMemcpy(d_flags.ptr + l.offset, flags.data(), flags.size(), cudaMemcpyHostToDevice);
+    std::vector<std::uint32_t> poison(reference.size(), 0xFFFFFFFFu);
+    d_words.upload(poison);
+
+    sirius::codegen::mask_from_bool8(d_flags.ptr + l.offset, l.rows, d_words.ptr, test_stream());
+    auto const status = cudaStreamSynchronize(test_stream().get());
+    REQUIRE_MSG(status == cudaSuccess,
+                "mask_from_bool8 (%s): kernel failed: %s",
+                l.what,
+                cudaGetErrorString(status));
+
+    auto const got = d_words.download(reference.size());
+    REQUIRE_MSG(got == reference, "mask_from_bool8 (%s): packed mask != host reference", l.what);
+    for (std::int64_t r = l.rows; r < selection_mask::ChunksFor(l.rows) * 1024; ++r) {
+      REQUIRE_MSG((got[static_cast<std::size_t>(r >> 5)] & (1u << (r & 31))) == 0,
+                  "mask_from_bool8 (%s): bit %lld past num_rows is set",
+                  l.what,
+                  static_cast<long long>(r));
+    }
+    std::printf(
+      "PASS: mask_from_bool8 layout: %s (%lld rows)\n", l.what, static_cast<long long>(l.rows));
+  }
 }
 
 void test_combine_masks_and()
@@ -178,7 +242,7 @@ void test_combine_masks_and()
 
   sirius::codegen::combine_masks_and(
     d_dst.ptr, pointers.data(), 3, static_cast<std::int64_t>(words), test_stream());
-  cudaStreamSynchronize(test_stream().value());
+  cudaStreamSynchronize(test_stream().get());
 
   REQUIRE_MSG(d_dst.download(words) == reference,
               "combine_masks_and: 3-source AND != host reference");
@@ -189,7 +253,7 @@ void test_combine_masks_and()
                                      3,
                                      static_cast<std::int64_t>(words),
                                      test_stream());
-  cudaStreamSynchronize(test_stream().value());
+  cudaStreamSynchronize(test_stream().get());
   REQUIRE_MSG(device_sources[0].download(words) == reference,
               "combine_masks_and: aliased dst == src[0] != host reference");
   std::printf("PASS: combine_masks_and\n");
@@ -237,7 +301,7 @@ void test_cnt_and_indices()
   device_array<std::int32_t> d_indices(static_cast<std::size_t>(survivors));
   REQUIRE_MSG(d_indices.ptr, "indices: device allocation failed");
   sirius::codegen::mask_to_row_indices(mask, d_indices.ptr, test_stream());
-  cudaStreamSynchronize(test_stream().value());
+  cudaStreamSynchronize(test_stream().get());
 
   auto const got = d_indices.download(static_cast<std::size_t>(survivors));
   REQUIRE_MSG(got == indices_reference, "mask_to_row_indices: ids != host reference");
@@ -310,7 +374,7 @@ void test_all_survive()
   device_array<std::int32_t> d_indices(static_cast<std::size_t>(kRows));
   REQUIRE_MSG(d_indices.ptr, "all: device allocation failed");
   sirius::codegen::mask_to_row_indices(mask, d_indices.ptr, test_stream());
-  cudaStreamSynchronize(test_stream().value());
+  cudaStreamSynchronize(test_stream().get());
 
   auto const got = d_indices.download(static_cast<std::size_t>(kRows));
   for (std::int64_t r = 0; r < kRows; ++r) {
@@ -334,6 +398,7 @@ int main()
 
   try {
     test_mask_from_bool8();
+    test_mask_from_bool8_layouts();
     test_combine_masks_and();
     test_cnt_and_indices();
     test_empty_selection();

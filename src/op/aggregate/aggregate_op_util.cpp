@@ -20,11 +20,25 @@
 #include "duckdb/common/assert.hpp"
 #include "expression/aggregate_id.hpp"
 #include "expression/ast/node.hpp"
+#include "sirius/exception.hpp"
 
+#include <cudf/fixed_point/fixed_point.hpp>
+#include <cudf/reduction.hpp>
+#include <cudf/scalar/scalar.hpp>
+#include <cudf/utilities/error.hpp>
+#include <cudf/utilities/pinned_memory.hpp>
+
+#include <rmm/device_buffer.hpp>
+
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
 #include <format>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 
 namespace sirius {
 namespace op {
@@ -53,6 +67,7 @@ std::optional<cudf::aggregation::Kind> to_cudf_aggregation_kind(sirius::aggregat
     case sirius::aggregate_id::count_star: return cudf::aggregation::Kind::COUNT_ALL;
     case sirius::aggregate_id::min: return cudf::aggregation::Kind::MIN;
     case sirius::aggregate_id::max: return cudf::aggregation::Kind::MAX;
+    case sirius::aggregate_id::stddev_samp: return cudf::aggregation::Kind::M2;
     case sirius::aggregate_id::avg:
     case sirius::aggregate_id::first: return std::nullopt;
   }
@@ -70,6 +85,7 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
     auto const& ref =
       sirius::ast::require_reference(group.get(), "convert_duckdb_aggregates_to_cudf group");
     result.group_idx.push_back(static_cast<int>(ref.column_index));
+    result.local_types.push_back(group->return_type());
   }
 
   // 2. Extract aggregates (cudf::aggregation::Kind) from expressions
@@ -78,6 +94,10 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
       aggregate.get(), "convert_duckdb_aggregates_to_cudf aggregate");
     auto const fid       = aggr.function();
     auto const& children = aggr.arguments();
+
+    if (fid == sirius::aggregate_id::stddev_samp && aggr.distinct()) {
+      throw_unsupported_aggregate(fid, "with DISTINCT");
+    }
 
     // Handle AVG specially: it expands into SUM + COUNT_VALID
     if (fid == sirius::aggregate_id::avg) {
@@ -93,7 +113,31 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
       result.cudf_aggregate_idx.push_back(col_idx);
       result.cudf_aggregate_struct_col_indices.push_back({});
       result.aggregate_slots.push_back(
-        AggregateSlot{true, false, sum_position, sirius::get_cudf_type(aggr.return_type())});
+        AggregateSlot{true, false, sum_position, sirius::require_cudf_type(aggr.return_type())});
+      auto sum_type = children[0]->return_type();
+      switch (sum_type.id()) {
+        case sirius::type_id::TINYINT:
+        case sirius::type_id::SMALLINT:
+        case sirius::type_id::INTEGER:
+          sum_type = sirius::logical_type::make(sirius::type_id::BIGINT);
+          break;
+        case sirius::type_id::UTINYINT:
+        case sirius::type_id::USMALLINT:
+        case sirius::type_id::UINTEGER:
+          sum_type = sirius::logical_type::make(sirius::type_id::UBIGINT);
+          break;
+        default: break;
+      }
+      // Groupby widens decimal SUM by one carrier width.
+      if (sum_type.id() == sirius::type_id::DECIMAL) {
+        auto const ct = sirius::require_cudf_type(sum_type);
+        if (ct.id() == cudf::type_id::DECIMAL32)
+          sum_type = sirius::logical_type::make_decimal(18, sum_type.decimal_scale());
+        if (ct.id() == cudf::type_id::DECIMAL64)
+          sum_type = sirius::logical_type::make_decimal(38, sum_type.decimal_scale());
+      }
+      result.local_types.push_back(sum_type);
+      result.local_types.push_back(sirius::logical_type::make(sirius::type_id::BIGINT));
       result.has_avg = true;
       continue;
     }
@@ -126,6 +170,7 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
       }
 
       result.aggregate_slots.push_back(AggregateSlot{false, true, position});
+      result.local_types.push_back(sirius::logical_type::make(sirius::type_id::LIST));
       result.has_count_distinct = true;
       continue;
     }
@@ -154,10 +199,314 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
       }
     }
     result.cudf_aggregate_struct_col_indices.push_back({});
-    result.aggregate_slots.push_back(AggregateSlot{false, false, current_position});
+    AggregateSlot slot{false, false, current_position};
+    slot.is_stddev_samp = fid == sirius::aggregate_id::stddev_samp;
+    result.aggregate_slots.push_back(slot);
+    result.local_types.push_back(slot.is_stddev_samp
+                                   ? sirius::logical_type::make(sirius::type_id::STRUCT)
+                                   : aggr.return_type());
   }
 
   return result;
+}
+
+namespace {
+
+/// A DECIMAL32 or DECIMAL64 scalar's unscaled value: its device address and size in bytes, both
+/// derived from the scalar's own type so they cannot disagree. Anything else is a caller bug.
+struct scalar_rep {
+  void const* data;
+  size_t bytes;
+  cudf::type_id id;
+};
+
+scalar_rep scalar_rep_of(cudf::scalar& s)
+{
+  switch (s.type().id()) {
+    case cudf::type_id::DECIMAL32:
+      return {static_cast<cudf::fixed_point_scalar<numeric::decimal32>&>(s).data(),
+              sizeof(int32_t),
+              cudf::type_id::DECIMAL32};
+    case cudf::type_id::DECIMAL64:
+      return {static_cast<cudf::fixed_point_scalar<numeric::decimal64>&>(s).data(),
+              sizeof(int64_t),
+              cudf::type_id::DECIMAL64};
+    default:
+      throw sirius::internal_exception("scalar_rep_of: expected a DECIMAL32 or DECIMAL64 scalar");
+  }
+}
+
+/// A small pinned host buffer for a device-to-host readback. It comes from cuDF's pinned resource,
+/// which Sirius backs with a slab pool for allocations this small (cuDF's default pool is used when
+/// no Sirius context is installed). Allocation and release are ordered on @p stream.
+class pinned_host_buffer {
+ public:
+  pinned_host_buffer(size_t bytes, ::cuda::stream_ref stream)
+    : mr_(cudf::get_pinned_memory_resource()),
+      stream_(stream),
+      bytes_(bytes),
+      data_(mr_.allocate(stream, bytes, alignof(int64_t)))
+  {
+  }
+  ~pinned_host_buffer() { mr_.deallocate(stream_, data_, bytes_, alignof(int64_t)); }
+  pinned_host_buffer(pinned_host_buffer const&)            = delete;
+  pinned_host_buffer& operator=(pinned_host_buffer const&) = delete;
+
+  int64_t* data() const { return static_cast<int64_t*>(data_); }
+
+ private:
+  rmm::host_device_async_resource_ref mr_;
+  ::cuda::stream_ref stream_;
+  size_t bytes_;
+  void* data_;
+};
+
+}  // namespace
+
+std::optional<cudf::data_type> widened_decimal_sum_type(cudf::data_type type)
+{
+  switch (type.id()) {
+    case cudf::type_id::DECIMAL32: return cudf::data_type(cudf::type_id::DECIMAL64, type.scale());
+    case cudf::type_id::DECIMAL64: return cudf::data_type(cudf::type_id::DECIMAL128, type.scale());
+    default: return std::nullopt;
+  }
+}
+
+std::unordered_set<int> decimal_sums_needing_widening(cudf::table_view const& table,
+                                                      std::vector<int> const& candidates,
+                                                      ::cuda::stream_ref stream,
+                                                      rmm::device_async_resource_ref mr)
+{
+  for (int col_id : candidates) {
+    if (!widened_decimal_sum_type(table.column(col_id).type())) {
+      throw sirius::internal_exception(
+        "decimal_sums_needing_widening: column {} is not DECIMAL32 or DECIMAL64", col_id);
+    }
+  }
+  std::unordered_set<int> widen;
+  if (table.num_rows() == 0 || candidates.empty()) { return widen; }
+
+  // Per candidate, one 3 x int64 slot {min, max, is_valid}. The minmax scalars are copied into
+  // the slots on the stream, so the host waits for the device and copies back exactly once.
+  constexpr size_t slot_words = 3;
+  size_t const slot_bytes     = slot_words * sizeof(int64_t);
+  rmm::device_buffer slots(candidates.size() * slot_bytes, stream, mr);
+  CUDF_CUDA_TRY(cudaMemsetAsync(slots.data(), 0, slots.size(), stream.get()));
+
+  auto copy_to_slot = [&](size_t slot, size_t word, void const* src, size_t bytes) {
+    auto* dst = static_cast<char*>(slots.data()) + slot * slot_bytes + word * sizeof(int64_t);
+    CUDF_CUDA_TRY(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, stream.get()));
+  };
+  // The scalars own the device memory read by the copies, so they live until the host copy ends.
+  std::vector<std::pair<std::unique_ptr<cudf::scalar>, std::unique_ptr<cudf::scalar>>> extremes;
+  std::vector<cudf::type_id> rep_ids;
+  extremes.reserve(candidates.size());
+  rep_ids.reserve(candidates.size());
+  for (size_t i = 0; i < candidates.size(); ++i) {
+    auto [lo, hi]     = cudf::minmax(table.column(candidates[i]), stream, mr);
+    auto const lo_rep = scalar_rep_of(*lo);
+    auto const hi_rep = scalar_rep_of(*hi);
+    copy_to_slot(i, 0, lo_rep.data, lo_rep.bytes);
+    copy_to_slot(i, 1, hi_rep.data, hi_rep.bytes);
+    copy_to_slot(i, 2, lo->validity_data(), sizeof(bool));
+    rep_ids.push_back(lo_rep.id);
+    extremes.emplace_back(std::move(lo), std::move(hi));
+  }
+
+  pinned_host_buffer host(slots.size(), stream);
+  CUDF_CUDA_TRY(
+    cudaMemcpyAsync(host.data(), slots.data(), slots.size(), cudaMemcpyDeviceToHost, stream.get()));
+  stream.sync();
+
+  for (size_t i = 0; i < candidates.size(); ++i) {
+    auto const type_id = rep_ids[i];
+    auto const* slot   = host.data() + i * slot_words;
+    bool is_valid      = false;
+    std::memcpy(&is_valid, slot + 2, sizeof(bool));
+    if (!is_valid) { continue; }  // no valid value: nothing to overflow
+    auto const read = [&](int64_t const* word) -> int64_t {
+      if (type_id == cudf::type_id::DECIMAL32) {
+        int32_t v;
+        std::memcpy(&v, word, sizeof(v));
+        return v;
+      }
+      int64_t v;
+      std::memcpy(&v, word, sizeof(v));
+      return v;
+    };
+    auto const max_abs = std::max(decimal_magnitude(read(slot)), decimal_magnitude(read(slot + 1)));
+    if (decimal_sum_may_overflow(cudf::data_type{type_id}, table.num_rows(), max_abs)) {
+      widen.insert(candidates[i]);
+    }
+  }
+  return widen;
+}
+
+bool decimal_sum_may_overflow(cudf::data_type type, cudf::size_type num_rows, std::uint64_t max_abs)
+{
+  unsigned __int128 limit = 0;
+  switch (type.id()) {
+    case cudf::type_id::DECIMAL32: limit = std::numeric_limits<int32_t>::max(); break;
+    case cudf::type_id::DECIMAL64: limit = std::numeric_limits<int64_t>::max(); break;
+    default:
+      throw sirius::internal_exception(
+        "decimal_sum_may_overflow: expected a DECIMAL32 or DECIMAL64 type");
+  }
+  if (num_rows <= 0) { return false; }
+  return static_cast<unsigned __int128>(num_rows) * static_cast<unsigned __int128>(max_abs) > limit;
+}
+
+namespace {
+
+/// One SUM input column and its plan-time bound: the largest bound over the column's candidates, or
+/// nullopt once any candidate is unproven.
+struct column_bound {
+  int column;
+  std::optional<std::uint64_t> max_abs;
+};
+
+/// The candidates' columns in first-seen order, each with its combined bound.
+std::vector<column_bound> combine_candidate_bounds(
+  std::vector<decimal_sum_candidate> const& candidates)
+{
+  std::vector<column_bound> columns;
+  for (auto const& candidate : candidates) {
+    auto const known = std::ranges::find(columns, candidate.column, &column_bound::column);
+    if (known == columns.end()) {
+      columns.push_back({candidate.column, candidate.max_abs});
+    } else if (!known->max_abs || !candidate.max_abs) {
+      known->max_abs = std::nullopt;
+    } else {
+      known->max_abs = std::max(*known->max_abs, *candidate.max_abs);
+    }
+  }
+  return columns;
+}
+
+/// |v| of a 128-bit unscaled decimal value; the most negative value's 2^127 fits.
+constexpr unsigned __int128 decimal128_magnitude(__int128 v)
+{
+  auto const bits = static_cast<unsigned __int128>(v);
+  return v < 0 ? static_cast<unsigned __int128>(0) - bits : bits;
+}
+
+/// Whether a SUM of @p num_rows values of magnitude at most @p max_abs fits DECIMAL64 throughout.
+bool decimal_sum_fits_int64(cudf::size_type num_rows, unsigned __int128 max_abs)
+{
+  if (max_abs > static_cast<unsigned __int128>(std::numeric_limits<std::uint64_t>::max())) {
+    return false;
+  }
+  return !decimal_sum_may_overflow(
+    cudf::data_type{cudf::type_id::DECIMAL64}, num_rows, static_cast<std::uint64_t>(max_abs));
+}
+
+/// The DECIMAL128 columns among @p columns whose measured values let their SUM run over DECIMAL64.
+std::unordered_set<int> decimal128_sums_measured_narrow(cudf::table_view const& table,
+                                                        std::vector<int> const& columns,
+                                                        ::cuda::stream_ref stream,
+                                                        rmm::device_async_resource_ref mr)
+{
+  std::unordered_set<int> narrow;
+  // Per column, one slot {min (16 B), max (16 B), is_valid (8 B)}. The minmax scalars are copied
+  // into the slots on the stream, so the host waits for the device and copies back exactly once.
+  constexpr size_t value_bytes = sizeof(__int128);
+  constexpr size_t slot_bytes  = 2 * value_bytes + sizeof(int64_t);
+  rmm::device_buffer slots(columns.size() * slot_bytes, stream, mr);
+  CUDF_CUDA_TRY(cudaMemsetAsync(slots.data(), 0, slots.size(), stream.get()));
+  auto copy_to_slot = [&](size_t slot, size_t offset, void const* src, size_t bytes) {
+    auto* dst = static_cast<char*>(slots.data()) + slot * slot_bytes + offset;
+    CUDF_CUDA_TRY(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, stream.get()));
+  };
+  // The scalars own the device memory read by the copies, so they live until the host copy ends.
+  std::vector<std::pair<std::unique_ptr<cudf::scalar>, std::unique_ptr<cudf::scalar>>> extremes;
+  extremes.reserve(columns.size());
+  for (size_t i = 0; i < columns.size(); ++i) {
+    auto [lo, hi] = cudf::minmax(table.column(columns[i]), stream, mr);
+    using scalar  = cudf::fixed_point_scalar<numeric::decimal128>;
+    copy_to_slot(i, 0, static_cast<scalar&>(*lo).data(), value_bytes);
+    copy_to_slot(i, value_bytes, static_cast<scalar&>(*hi).data(), value_bytes);
+    copy_to_slot(i, 2 * value_bytes, lo->validity_data(), sizeof(bool));
+    extremes.emplace_back(std::move(lo), std::move(hi));
+  }
+  pinned_host_buffer host(slots.size(), stream);
+  CUDF_CUDA_TRY(
+    cudaMemcpyAsync(host.data(), slots.data(), slots.size(), cudaMemcpyDeviceToHost, stream.get()));
+  stream.sync();
+
+  auto const* bytes = reinterpret_cast<char const*>(host.data());
+  for (size_t i = 0; i < columns.size(); ++i) {
+    auto const* slot = bytes + i * slot_bytes;
+    bool is_valid    = false;
+    std::memcpy(&is_valid, slot + 2 * value_bytes, sizeof(bool));
+    // A column with no valid value sums to NULL in every group at any width.
+    if (!is_valid) {
+      narrow.insert(columns[i]);
+      continue;
+    }
+    __int128 lo_value;
+    __int128 hi_value;
+    std::memcpy(&lo_value, slot, value_bytes);
+    std::memcpy(&hi_value, slot + value_bytes, value_bytes);
+    auto const max_abs = std::max(decimal128_magnitude(lo_value), decimal128_magnitude(hi_value));
+    if (decimal_sum_fits_int64(table.num_rows(), max_abs)) { narrow.insert(columns[i]); }
+  }
+  return narrow;
+}
+
+}  // namespace
+
+std::unordered_set<int> decimal_sums_to_widen(cudf::table_view const& table,
+                                              std::vector<decimal_sum_candidate> const& candidates,
+                                              ::cuda::stream_ref stream,
+                                              rmm::device_async_resource_ref mr)
+{
+  std::unordered_set<int> widen;
+  if (candidates.empty() || table.num_rows() == 0) { return widen; }
+  std::vector<int> measured;
+  for (auto const& [column, max_abs] : combine_candidate_bounds(candidates)) {
+    if (!max_abs) {
+      measured.push_back(column);
+    } else if (decimal_sum_may_overflow(table.column(column).type(), table.num_rows(), *max_abs)) {
+      widen.insert(column);
+    }
+  }
+  if (!measured.empty()) {
+    widen.merge(decimal_sums_needing_widening(table, measured, stream, mr));
+  }
+  return widen;
+}
+
+std::optional<cudf::data_type> narrowed_decimal_sum_type(cudf::data_type type)
+{
+  if (type.id() != cudf::type_id::DECIMAL128) { return std::nullopt; }
+  return cudf::data_type(cudf::type_id::DECIMAL64, type.scale());
+}
+
+std::unordered_set<int> decimal_sums_to_narrow(cudf::table_view const& table,
+                                               std::vector<decimal_sum_candidate> const& candidates,
+                                               ::cuda::stream_ref stream,
+                                               rmm::device_async_resource_ref mr)
+{
+  for (auto const& candidate : candidates) {
+    if (!narrowed_decimal_sum_type(table.column(candidate.column).type())) {
+      throw sirius::internal_exception("decimal_sums_to_narrow: column {} is not DECIMAL128",
+                                       candidate.column);
+    }
+  }
+  std::unordered_set<int> narrow;
+  if (candidates.empty() || table.num_rows() == 0) { return narrow; }
+  std::vector<int> measured;
+  for (auto const& [column, max_abs] : combine_candidate_bounds(candidates)) {
+    if (!max_abs) {
+      measured.push_back(column);
+    } else if (decimal_sum_fits_int64(table.num_rows(), *max_abs)) {
+      narrow.insert(column);
+    }
+  }
+  if (!measured.empty()) {
+    narrow.merge(decimal128_sums_measured_narrow(table, measured, stream, mr));
+  }
+  return narrow;
 }
 
 }  // namespace op

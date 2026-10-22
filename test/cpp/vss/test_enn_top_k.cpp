@@ -78,8 +78,11 @@ std::unique_ptr<cudf::column> make_vec_column(std::vector<float> const& values,
              offsets.data(),
              sizeof(int32_t) * offsets.size(),
              cudaMemcpyHostToDevice);
-  return cudf::make_lists_column(
-    n_rows, std::move(offsets_col), std::move(child), 0, rmm::device_buffer{});
+  return cudf::make_lists_column(n_rows,
+                                 std::move(offsets_col),
+                                 std::move(child),
+                                 0,
+                                 cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
 }
 
 std::unique_ptr<cudf::column> make_int32_column(std::vector<int32_t> const& values)
@@ -124,7 +127,7 @@ struct EnnHarness {
   vector_search_request req;
   cucascade::memory::memory_space* space = ou::get_default_gpu_space();
   rmm::device_async_resource_ref mr      = ou::get_resource_ref(*space);
-  rmm::cuda_stream_view stream           = ou::default_stream();
+  ::cuda::stream_ref stream              = ou::default_stream();
   rmm::device_uvector<float> query_dev{0, ou::default_stream()};
 
   EnnHarness(cudf::size_type dim, std::string metric, std::vector<float> query)
@@ -136,7 +139,7 @@ struct EnnHarness {
                     query.data(),
                     sizeof(float) * query.size(),
                     cudaMemcpyHostToDevice,
-                    stream.value());
+                    stream.get());
   }
 
   vector_search_context context(std::int64_t k)
@@ -171,7 +174,7 @@ TEST_CASE("compute_enn_top_k returns nearest passthrough rows plus distance", "[
     cudf::table_view input({vec_col->view(), id_col->view()});
 
     auto out = compute_enn_top_k(h.context(/*k=*/3), input, res);
-    h.stream.synchronize();
+    h.stream.sync();
 
     // Schema is [id, distance] (the vector column is dropped, distance appended).
     REQUIRE(out->num_columns() == 2);
@@ -194,7 +197,7 @@ TEST_CASE("compute_enn_top_k returns nearest passthrough rows plus distance", "[
     cudf::table_view input({vec_col->view(), id_col->view()});
 
     auto out = compute_enn_top_k(h.context(/*k=*/100), input, res);
-    h.stream.synchronize();
+    h.stream.sync();
     REQUIRE(out->num_rows() == n_rows);
   }
 
@@ -233,14 +236,14 @@ TEST_CASE("compute_enn_top_k compacts null and sliced vector rows before search"
     auto vec_col  = make_vec_column(vecs, n_rows, dim);
     auto contents = vec_col->release();
     auto mask     = cudf::create_null_mask(n_rows, cudf::mask_state::ALL_VALID);
-    cudf::set_null_mask(static_cast<cudf::bitmask_type*>(mask.data()), 2, 3, false);
+    cudf::set_null_mask(reinterpret_cast<cudf::bitmask_type*>(mask.data()), 2, 3, false);
     auto null_vec = cudf::make_lists_column(
       n_rows, std::move(contents.children[0]), std::move(contents.children[1]), 1, std::move(mask));
     auto id_col = make_int32_column(ids);
     cudf::table_view input({null_vec->view(), id_col->view()});
 
     auto out = compute_enn_top_k(h.context(/*k=*/3), input, res);
-    h.stream.synchronize();
+    h.stream.sync();
 
     auto got_ids = to_host<int32_t>(out->get_column(0).view());
     REQUIRE(got_ids == std::vector<int32_t>{0, 1, 3});
@@ -257,7 +260,7 @@ TEST_CASE("compute_enn_top_k compacts null and sliced vector rows before search"
     cudf::table_view input({sliced_vec, sliced_id});
 
     auto out = compute_enn_top_k(h.context(/*k=*/2), input, res);
-    h.stream.synchronize();
+    h.stream.sync();
 
     auto got_ids = to_host<int32_t>(out->get_column(0).view());
     REQUIRE(got_ids == std::vector<int32_t>{1, 2});
@@ -286,7 +289,7 @@ TEST_CASE("merge_enn_top_k keeps the globally nearest rows sorted by distance", 
   SECTION("top-k by ascending distance, sorted nearest-first")
   {
     auto out = merge_enn_top_k(h.context(/*k=*/2), candidates);
-    h.stream.synchronize();
+    h.stream.sync();
 
     REQUIRE(out->num_rows() == 2);
     auto got_ids  = to_host<int32_t>(out->get_column(0).view());
@@ -299,7 +302,7 @@ TEST_CASE("merge_enn_top_k keeps the globally nearest rows sorted by distance", 
   SECTION("k beyond the row count returns every row, still sorted")
   {
     auto out = merge_enn_top_k(h.context(/*k=*/100), candidates);
-    h.stream.synchronize();
+    h.stream.sync();
 
     auto got_ids = to_host<int32_t>(out->get_column(0).view());
     REQUIRE(got_ids == std::vector<int32_t>{3, 1, 2, 0});

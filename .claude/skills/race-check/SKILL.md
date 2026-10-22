@@ -27,7 +27,7 @@ Detect and diagnose race conditions using ThreadSanitizer (CPU threads) and NVID
    for i in $(seq 1 5); do
      export SIRIUS_LOG_DIR=build/release/log/run_${i}_$(date +%s)
      mkdir -p $SIRIUS_LOG_DIR
-     build/release/duckdb <db_path> -c "CALL gpu_execution('...');" > /tmp/claude-1000/result_${i}.txt 2>&1
+     sirius-duckdb/build/release/duckdb -unsigned -cmd "LOAD 'sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension';" <db_path> -c "CALL gpu_execution('...');" > /tmp/claude-1000/result_${i}.txt 2>&1
    done
    ```
    Compare all results pairwise. If any differ, confirm non-deterministic behavior.
@@ -41,7 +41,7 @@ Detect and diagnose race conditions using ThreadSanitizer (CPU threads) and NVID
      ```
    - Run the reproduction case:
      ```bash
-     TSAN_OPTIONS="second_deadlock_stack=1:history_size=7" build/clang-debug/duckdb <db_path> <<'EOF'
+     TSAN_OPTIONS="second_deadlock_stack=1:history_size=7" sirius-duckdb/build/debug/duckdb -unsigned -cmd "LOAD 'sirius-duckdb/build/debug/extension/sirius/sirius.duckdb_extension';" <db_path> <<'EOF'
      CALL gpu_execution('<QUERY>');
      EOF
      ```
@@ -58,7 +58,7 @@ Detect and diagnose race conditions using ThreadSanitizer (CPU threads) and NVID
    - Build with debug symbols (`relwithdebinfo` or `clang-debug`):
    - Run with Compute Sanitizer:
      ```bash
-     compute-sanitizer --tool memcheck build/<preset>/duckdb <<'EOF'
+     compute-sanitizer --tool memcheck sirius-duckdb/build/<preset>/duckdb -unsigned -cmd "LOAD 'sirius-duckdb/build/<preset>/extension/sirius/sirius.duckdb_extension';" <<'EOF'
      CALL gpu_execution('<QUERY>');
      EOF
      ```
@@ -98,4 +98,4 @@ Detect and diagnose race conditions using ThreadSanitizer (CPU threads) and NVID
 
 ## Scope
 
-Only analyze code in `namespace sirius` plus exceptions listed in shared build-and-query.md. Ignore legacy `namespace duckdb` code.
+Analyze active code in both `namespace sirius` and `namespace duckdb`; see shared build-and-query.md.

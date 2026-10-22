@@ -17,6 +17,7 @@
 #include <catch.hpp>
 #include <cucascade/data/data_repository.hpp>
 #include <duckdb.hpp>
+#include <duckdb/planner/logical_operator.hpp>
 #include <exec/stream_bind_catalog.hpp>
 #include <exec/stream_plan_bindings.hpp>
 #include <helper/type_conversions.hpp>
@@ -119,25 +120,6 @@ TEST_CASE("stream_bind_catalog CAT-4: the built operator is recorded", "[stream_
 }
 
 // ============================================================================
-// CAT-5: a fragment's declarations do not leak into the next one
-// ============================================================================
-
-TEST_CASE("stream_bind_catalog CAT-5: clear drops every declaration", "[stream_bind_catalog]")
-{
-  stream_bind_catalog catalog;
-  catalog.declare(1, make_binding());
-  catalog.declare(2, make_binding());
-  REQUIRE(catalog.declared_streams() == std::vector<stream_id_t>{1, 2});
-
-  catalog.clear();
-
-  REQUIRE(catalog.declared_streams().empty());
-  REQUIRE_FALSE(catalog.contains(1));
-  // A reused connection must not serve a stale schema for a recycled id.
-  REQUIRE_THROWS_AS(catalog.get(1), sirius::invalid_input_exception);
-}
-
-// ============================================================================
 // CAT-5b: erase is scoped to one id, so fragments sharing a connection don't
 // wipe each other's declarations
 // ============================================================================
@@ -150,8 +132,8 @@ TEST_CASE("stream_bind_catalog CAT-5b: erase drops only the named stream", "[str
 
   catalog.erase(1);
 
-  // The catalog is one ClientContextState per connection. A fragment tearing down must remove
-  // only the ids it declared — clear() here would take a peer fragment's schema with it.
+  // The catalog is one ClientContextState per connection. A fragment must remove only the ids
+  // it declared, or it would take a peer fragment's schema with it.
   REQUIRE_FALSE(catalog.contains(1));
   REQUIRE(catalog.contains(2));
   REQUIRE(catalog.declared_streams() == std::vector<stream_id_t>{2});
@@ -208,7 +190,7 @@ TEST_CASE("stream_bind_catalog CAT-7: sirius_stream_source binds a declared stre
   auto prepared = con.Prepare("SELECT * FROM sirius_stream_source(0)");
   REQUIRE_FALSE(prepared->HasError());
 
-  REQUIRE(prepared->GetNames() == duckdb::vector<std::string>{"l_orderkey", "l_comment"});
+  REQUIRE(prepared->GetNames() == duckdb::vector<duckdb::Identifier>{"l_orderkey", "l_comment"});
   REQUIRE(prepared->GetTypes() == duckdb::vector<duckdb::LogicalType>{
                                     duckdb::LogicalType::BIGINT, duckdb::LogicalType::VARCHAR});
 
@@ -250,4 +232,30 @@ TEST_CASE("stream_bind_catalog CAT-9: no catalog on the connection is an error",
 
   auto prepared = con.Prepare("SELECT * FROM sirius_stream_source(0)");
   REQUIRE(prepared->HasError());
+}
+
+// ============================================================================
+// CAT-10: a declared row count is the scan's cardinality estimate
+// ============================================================================
+
+TEST_CASE("stream_bind_catalog CAT-10: a declared row count reaches the optimizer",
+          "[stream_bind_catalog]")
+{
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  register_stream_source_function(*db.instance);
+
+  auto catalog = duckdb::make_shared_ptr<stream_bind_catalog>();
+  con.context->registered_state->Insert(stream_bind_catalog::kStateKey, catalog);
+
+  auto counted           = make_binding();
+  counted.estimated_rows = 1'000'000;
+  catalog->declare(0, std::move(counted));
+  catalog->declare(1, make_binding());
+
+  auto estimate = [&](const std::string& query) {
+    return con.ExtractPlan(query)->EstimateCardinality(*con.context);
+  };
+  REQUIRE(estimate("SELECT * FROM sirius_stream_source(0)") == 1'000'000);
+  REQUIRE(estimate("SELECT * FROM sirius_stream_source(1)") == 1);
 }

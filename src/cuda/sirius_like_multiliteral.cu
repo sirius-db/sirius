@@ -313,7 +313,7 @@ std::size_t like_multiliteral_cache::classification_count_for_testing() const
 std::unique_ptr<cudf::column> like_multiliteral(cudf::strings_column_view const& input,
                                                 like_multiliteral_pattern const& pattern,
                                                 bool invert,
-                                                rmm::cuda_stream_view stream,
+                                                ::cuda::stream_ref stream,
                                                 rmm::device_async_resource_ref mr)
 {
   auto const& literals = pattern.literals();
@@ -360,14 +360,14 @@ std::unique_ptr<cudf::column> like_multiliteral(cudf::strings_column_view const&
 
   if (offsets_id == cudf::type_id::INT32) {
     auto const* offsets = input.offsets().data<int>() + input.offset();
-    like_multiliteral_kernel<int><<<num_blocks, threads_per_block, 0, stream.value()>>>(
+    like_multiliteral_kernel<int><<<num_blocks, threads_per_block, 0, stream.get()>>>(
       words, offsets, nrows, null_mask, input.offset(), pat, invert, out);
   } else {
     auto const* offsets = input.offsets().data<int64_t>() + input.offset();
-    like_multiliteral_kernel<int64_t><<<num_blocks, threads_per_block, 0, stream.value()>>>(
+    like_multiliteral_kernel<int64_t><<<num_blocks, threads_per_block, 0, stream.get()>>>(
       words, offsets, nrows, null_mask, input.offset(), pat, invert, out);
   }
-  CUDF_CHECK_CUDA(stream.value());
+  CUDF_CHECK_CUDA(stream.get());
   return result;
 }
 

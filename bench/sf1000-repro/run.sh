@@ -60,5 +60,6 @@ echo
 cd "$REPO"
 python3 test/tpch_performance/performance_test.py \
   --input "$DATA" \
+  --scale-factor 1000 \
   --mode grouped --iterations 3 --engine gpu --pin host \
   --queries 1-22 --config "$CFG" --name "$NAME"

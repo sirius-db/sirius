@@ -35,7 +35,7 @@ For example, in a GROUP BY query after pipeline splitting (see [Physical Plan Ge
 
 ## Physical Operators
 
-**File:** `src/include/op/sirius_physical_operator.hpp`, `src/op/sirius_physical_operator.cpp`
+**File:** `src/op/sirius_physical_operator.hpp`, `src/op/sirius_physical_operator.cpp`
 
 See [Operators](operators.md) for the complete operator reference.
 
@@ -79,7 +79,7 @@ parallel::itask                          // base: local_state + global_state + e
 
 ### `gpu_pipeline_task`
 
-**File:** `src/include/pipeline/gpu_pipeline_task.hpp`, `src/pipeline/gpu_pipeline_task.cpp`
+**File:** `src/pipeline/gpu_pipeline_task.hpp`, `src/pipeline/gpu_pipeline_task.cpp`
 
 **State classes:**
 - `gpu_pipeline_task_global_state` — holds the `sirius_pipeline` to execute
@@ -181,7 +181,7 @@ Every batch is fed through `lock_or_prepare_batch`. There is no early-exit short
 
 **Layer 4 — `lock_or_prepare_batch` does the actual clone/conversion.**
 
-`src/include/pipeline/batch_lock_utils.hpp`:
+`src/pipeline/batch_lock_utils.hpp`:
 
 ```cpp
 inline std::optional<cucascade::read_only_data_batch> lock_or_prepare_batch(
@@ -253,7 +253,7 @@ If you cannot satisfy the contract — for example, your operator legitimately n
 
 ## Pipeline Executor
 
-**File:** `src/include/pipeline/task_scheduler.hpp`, `src/pipeline/task_scheduler.cpp`
+**File:** `src/pipeline/task_scheduler.hpp`, `src/pipeline/task_scheduler.cpp`
 
 The `task_scheduler` is the top-level GPU-pipeline orchestrator. It owns the shared pipeline-task
 queue, one `gpu_pipeline_executor` per active GPU, and the management thread that matches queued
@@ -273,11 +273,10 @@ queue without touching another's.
 |--------|---------|
 | `start()` | Starts every GPU executor, then launches the management thread |
 | `stop()` | Interrupts/closes scheduler channels, joins the management thread, then stops GPU executors |
-| `start_query(query)` | Schedules `query.get_scan_operators().front()` through `task_creator`; completion is signalled through the query's own `completion_handler`, whose future the `sirius_engine` already holds |
-| `terminate_query(handler, error)` | Reports the error to that query's completion handler (report-only; the query thread's catch block does the draining) |
-| `drain_query_tasks(query_id)` | Drops one query's queued tasks from the scheduler's queue and every GPU executor's queue; other queries' tasks stay |
-| `drain_after_error(query_id)` | Multi-stage drain for clean shutdown after a query error |
-| `wait_for_completion(query_id)` | After the future resolves: validates every queue is empty (throws otherwise) and drops the query's remaining creation requests |
+| `start_query(query)` | Schedules `query.get_scan_operators().front()` through `task_creator` |
+| `terminate_query(handler, exception)` | Reports an error to that query's completion handler |
+| `validate_query_complete(query_id)` | Checks execution queues after the owner settles publication; does not wait |
+| `discard_query_tasks(query_id)` | Disposes of queued scheduler/pool work; the owner waits for work leases |
 
 ### Management Event Loop
 
@@ -317,7 +316,10 @@ work is exposed by task hints and completion-driven downstream scheduling — pl
 
 The scheduler is filter-agnostic: it does not inspect hash joins or reorder queued work to advance
 dynamic-filter publication. Immediate probes remain strictly ordered by synchronous build-CONCAT
-publication in the join pipeline. A scan reached transitively through an intervening join has no
+publication in the join pipeline. An accumulated multi-partition filter is published inside the
+elected build PARTITION task, before its deposit. Work requiring that deposit or build completion
+observes the publication outcome; already-runnable CONCAT/probe work may see an earlier snapshot.
+A scan reached transitively through an intervening join has no
 such edge and samples whatever complete filters are visible at its reader and post-decode
 checkpoints.
 
@@ -329,7 +331,7 @@ for the consumer semantics.
 
 ## GPU Pipeline Executor
 
-**File:** `src/include/pipeline/gpu_pipeline_executor.hpp`, `src/pipeline/gpu_pipeline_executor.cpp`
+**File:** `src/pipeline/gpu_pipeline_executor.hpp`, `src/pipeline/gpu_pipeline_executor.cpp`
 
 One `gpu_pipeline_executor` exists per GPU device. It manages a thread pool for executing GPU pipeline tasks.
 
@@ -395,15 +397,17 @@ This epilogue is the usual signaller, but not the only one — see the completio
 query-terminal pipeline signals completion there because task-creator, streaming-source, and
 parent-cascade paths can finish a pipeline without returning through the GPU epilogue.
 
-`task_creator::prepare_for_query()` installs the handler on terminal pipelines as a
-`std::weak_ptr`, preventing retired pipelines from retaining or signaling a later query's handler.
+`sirius_engine::execute()` creates the handler and future, then passes the handler through
+`SiriusContext::create_query()` to `task_creator::prepare_for_query()`. Terminal pipelines hold it
+as a `std::weak_ptr`, preventing retired pipelines from retaining a handler.
 The pipeline obtains a strong reference under `_status_mutex` and calls `mark_completed()` only
 after releasing the lock and finishing all pipeline access.
 
 The GPU epilogue also keeps its completion signal. Duplicate signals are safe because
 `completion_handler` accepts only the first one. After the future resolves,
-`task_scheduler::wait_for_completion(query_id)` validates that every queue is empty and drops the
-query's remaining creation requests before operators are destroyed.
+`SiriusContext::retire_query_work(query_id, completed)` closes publication, joins scan producers,
+validates execution queues, discards redundant creator hints, and waits for work leases before
+operators can be destroyed.
 
 ### Task Request Flow
 
@@ -416,7 +420,7 @@ gpu_executor → task_request_publisher.send() → task_scheduler.management_eve
 
 ## Completion Handler
 
-**File:** `src/include/pipeline/completion_handler.hpp`
+**File:** `src/pipeline/completion_handler.hpp`
 
 One `completion_handler` exists per query. `sirius_engine::execute()` creates it and holds the
 future; `task_creator::prepare_for_query()` stamps a `shared_ptr` to it onto every pipeline's task
@@ -439,7 +443,7 @@ and only the first call takes effect.
 
 ## Query Event Publisher
 
-**Files:** `src/include/event/event.hpp`, `src/include/event/query_event_publisher.hpp`, `src/include/event/query_event_subscriber.hpp`
+**Files:** `src/event/event.hpp`, `src/event/query_event_publisher.hpp`, `src/event/query_event_subscriber.hpp`
 
 `event::query_event_publisher` is an observer channel for execution progress. The task creator
 and the task scheduler each see one half of the picture — the creator knows what work exists and
@@ -464,7 +468,7 @@ readahead can observe execution without a direct dependency on the creator or sc
 
 ## Reschedule Handling (OOM and CUDA launch failures)
 
-**File:** `src/include/pipeline/oom_reschedule_exception.hpp`
+**File:** `src/pipeline/oom_reschedule_exception.hpp`
 
 Retryable execution failures are modeled as a small exception hierarchy: `task_reschedule_exception` is the base, with two subclasses —
 
@@ -486,32 +490,31 @@ If max retries are exceeded, the error propagates and terminates the query.
 
 ## Error Handling and Draining
 
-**File:** `src/pipeline/task_scheduler.cpp`
+**File:** `src/sirius_context.cpp` — `retire_query_work(query_id, mode)`
 
-`drain_after_error()` performs a multi-stage clean shutdown:
+The runtime owner closes the query's publication gate, waits for admitted publishers, and joins
+its scan producers. It then discards that query's creator/scheduler queues and queued pool work.
+GPU staging tasks stay with their managers so accepted handoffs return readiness normally.
+The owner waits for the query's work leases before releasing its resources. Other queries keep
+running; per-query retirement does not stop shared pools or managers.
 
-1. **Stop task creator thread pool** — prevents new tasks from being created
-2. **Drain the task queue** — clears pending pipeline tasks
-3. **Drain GPU executors** — `drain_and_wait()` per device: interrupts the queue, joins the manager thread, waits for all in-flight tasks
-4. **Drain the task creator's pending tasks** — `drain_pending_tasks()` (also clears look-ahead state)
-5. **Clear the task queue again** — catches tasks enqueued during the drain
-
-This ensures that when `drain_after_error()` returns, no tasks are referencing operators or data repositories that are about to be destroyed.
+Successful completion validates execution queues before the work barrier rather than silently
+dropping unfinished execution tasks. See [Query lifetime and retirement](query-lifecycle.md).
 
 ## Key Files
 
 | File | Purpose |
 |------|---------|
-| `src/include/pipeline/task_scheduler.hpp` | Top-level executor |
+| `src/pipeline/task_scheduler.hpp` | Top-level executor |
 | `src/pipeline/task_scheduler.cpp` | Event loop, query lifecycle |
-| `src/include/pipeline/gpu_pipeline_executor.hpp` | Per-GPU executor |
+| `src/pipeline/gpu_pipeline_executor.hpp` | Per-GPU executor |
 | `src/pipeline/gpu_pipeline_executor.cpp` | Manager loop, OOM handling |
-| `src/include/pipeline/gpu_pipeline_task.hpp` | GPU task class |
+| `src/pipeline/gpu_pipeline_task.hpp` | GPU task class |
 | `src/pipeline/gpu_pipeline_task.cpp` | Task execution |
-| `src/include/pipeline/completion_handler.hpp` | Promise/future completion |
-| `src/include/pipeline/oom_reschedule_exception.hpp` | OOM retry mechanism |
-| `src/include/pipeline/sirius_pipeline.hpp` | Pipeline structure |
-| `src/include/pipeline/sirius_pipeline_itask.hpp` | Task interface |
-| `src/include/pipeline/task_request.hpp` | Executor↔pipeline request |
-| `src/include/exec/bounded_thread_pool.hpp` | Slot-based thread pool with RAII concurrency control |
-| `src/include/parallel/task_executor.hpp` | `itask_executor` base class for all executors |
+| `src/pipeline/completion_handler.hpp` | Promise/future completion |
+| `src/pipeline/oom_reschedule_exception.hpp` | OOM retry mechanism |
+| `src/pipeline/sirius_pipeline.hpp` | Pipeline structure |
+| `src/pipeline/sirius_pipeline_itask.hpp` | Task interface |
+| `src/pipeline/task_request.hpp` | Executor↔pipeline request |
+| `src/exec/bounded_thread_pool.hpp` | Slot-based thread pool with RAII concurrency control |
+| `src/parallel/task_executor.hpp` | `itask_executor` base class for all executors |

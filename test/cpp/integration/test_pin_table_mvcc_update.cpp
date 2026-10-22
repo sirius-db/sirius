@@ -38,9 +38,11 @@ void require_pinned_update_error(duckdb::QueryResult& result,
                                  const std::string& pinned_name)
 {
   REQUIRE(result.HasError());
-  REQUIRE_THAT(result.GetError(), Catch::Contains("does not support UPDATE"));
-  REQUIRE_THAT(result.GetError(), Catch::Contains("pinned DuckDB table '" + table_name + "'"));
-  REQUIRE_THAT(result.GetError(), Catch::Contains("CALL unpin_table('" + pinned_name + "')"));
+  REQUIRE_THAT(result.GetError(), Catch::Matchers::ContainsSubstring("does not support UPDATE"));
+  REQUIRE_THAT(result.GetError(),
+               Catch::Matchers::ContainsSubstring("pinned DuckDB table '" + table_name + "'"));
+  REQUIRE_THAT(result.GetError(),
+               Catch::Matchers::ContainsSubstring("CALL unpin_table('" + pinned_name + "')"));
 }
 
 }  // namespace
@@ -61,7 +63,7 @@ TEST_CASE_METHOD(PinMvccUpdateFixture,
   auto unchanged = con->Query("SELECT v FROM t;");
   REQUIRE(unchanged);
   REQUIRE_FALSE(unchanged->HasError());
-  REQUIRE(unchanged->GetValue(0, 0) == duckdb::Value::INTEGER(10));
+  REQUIRE(unchanged->Collection().GetValue(0, 0) == duckdb::Value::INTEGER(10));
 
   run_ok("CALL unpin_table('t');");
   run_ok("UPDATE t SET v = 99 WHERE k = 1;");
@@ -106,7 +108,7 @@ TEST_CASE_METHOD(PinMvccUpdateFixture,
   auto unchanged = con->Query("SELECT v FROM t;");
   REQUIRE(unchanged);
   REQUIRE_FALSE(unchanged->HasError());
-  REQUIRE(unchanged->GetValue(0, 0) == duckdb::Value::INTEGER(20));
+  REQUIRE(unchanged->Collection().GetValue(0, 0) == duckdb::Value::INTEGER(20));
   run_ok("CALL unpin_table('t');");
 }
 
@@ -138,7 +140,7 @@ TEST_CASE_METHOD(PinMvccUpdateFixture,
   auto prepared = con->Prepare("UPDATE t SET v = v WHERE false;");
   REQUIRE(prepared);
   REQUIRE_FALSE(prepared->HasError());
-  auto pending_update = prepared->PendingQuery();
+  auto pending_update = prepared->Submit();
   REQUIRE(pending_update);
   REQUIRE_FALSE(pending_update->HasError());
   auto connection_state = duckdb::get_sirius_connection_state(*con->context);
@@ -154,7 +156,8 @@ TEST_CASE_METHOD(PinMvccUpdateFixture,
   });
   auto const wait_status = pin.wait_for(std::chrono::milliseconds(100));
 
-  auto update_result = pending_update->Execute();
+  pending_update->Complete();
+  auto update_result = std::move(pending_update);
   REQUIRE(update_result);
   REQUIRE_FALSE(update_result->HasError());
   REQUIRE(wait_status == std::future_status::timeout);
@@ -200,8 +203,9 @@ TEST_CASE_METHOD(PinMvccUpdateFixture,
   auto pin = con->Query("CALL pin_table(format='duckdb', name='t', tier='gpu');");
   REQUIRE(pin);
   REQUIRE(pin->HasError());
-  REQUIRE_THAT(pin->GetError(), Catch::Contains("has in-memory update chains"));
-  REQUIRE_THAT(pin->GetError(), Catch::Contains("run CHECKPOINT before pinning"));
+  REQUIRE_THAT(pin->GetError(), Catch::Matchers::ContainsSubstring("has in-memory update chains"));
+  REQUIRE_THAT(pin->GetError(),
+               Catch::Matchers::ContainsSubstring("run CHECKPOINT before pinning"));
 
   run_ok("CHECKPOINT;");
   run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu');");
@@ -224,8 +228,9 @@ TEST_CASE_METHOD(PinMvccUpdateFixture,
   auto result = con->Query("SELECT sum(v) FROM t;");
   REQUIRE(result);
   REQUIRE(result->HasError());
-  REQUIRE_THAT(result->GetError(), Catch::Contains("checkpointed after pin_table"));
-  REQUIRE_THAT(result->GetError(), Catch::Contains("CALL unpin_table('t')"));
+  REQUIRE_THAT(result->GetError(),
+               Catch::Matchers::ContainsSubstring("checkpointed after pin_table"));
+  REQUIRE_THAT(result->GetError(), Catch::Matchers::ContainsSubstring("CALL unpin_table('t')"));
 
   run_ok("SET enable_duckdb_fallback = true;");
   run_ok("CALL unpin_table('t');");
@@ -240,7 +245,8 @@ TEST_CASE_METHOD(PinMvccUpdateFixture,
   run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu');");
   run_ok("SET gpu_execution = true;");
 
-  auto attached = duckdb::DatabaseManager::Get(*con->context).GetDatabase(attach_alias);
+  auto attached =
+    duckdb::DatabaseManager::Get(*con->context).GetDatabase(duckdb::Identifier(attach_alias));
   REQUIRE(attached);
   auto checkpoint_lock = duckdb::DuckTransactionManager::Get(*attached).TryGetCheckpointLock();
   REQUIRE(checkpoint_lock);

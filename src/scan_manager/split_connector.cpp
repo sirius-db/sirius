@@ -34,13 +34,26 @@ void split_connector::push_split(std::unique_ptr<op::operator_data> split)
   // Sized before the lock: a cached-batch split reads its size through the blocking
   // to_read_only(), which waits on a downgrade — under _mutex that stalls every consumer pop.
   auto const split_bytes = split->get_estimated_size_in_bytes();
+  push_split_sized(std::move(split), split_bytes);
+}
+void split_connector::set_consumption_callback(std::function<void(size_t)> callback)
+{
+  auto owning = std::make_shared<std::function<void(size_t)> const>(std::move(callback));
+  std::lock_guard lock(_mutex);
+  _on_consumption = std::move(owning);
+}
+void split_connector::push_split_sized(std::unique_ptr<op::operator_data>&& split,
+                                       size_t split_bytes,
+                                       size_t preparation_bytes)
+{
   {
     std::lock_guard<std::mutex> lock(_mutex);
     assert(!_closed && "push_split after close() is forbidden");
+    _splits.emplace_back();
+    _splits.back() = {std::move(split), preparation_bytes};
     // A zero estimate means unknown, not empty; latch it so the total remains conservative.
     _discovered_bytes += split_bytes;
     _has_unsized_splits = _has_unsized_splits || split_bytes == 0;
-    _splits.push_back(std::move(split));
   }
   _cv.notify_one();
 }
@@ -71,7 +84,10 @@ std::optional<std::unique_ptr<op::operator_data>> split_connector::get_next_spli
                          std::chrono::steady_clock::now().time_since_epoch())
                          .count(),
                        std::memory_order_relaxed);
-    return std::optional<std::unique_ptr<op::operator_data>>{std::move(split)};
+    auto consumed = _on_consumption;
+    lock.unlock();
+    if (consumed) (*consumed)(split.preparation_bytes);
+    return std::optional<std::unique_ptr<op::operator_data>>{std::move(split.input)};
   }
   return std::nullopt;
 }
@@ -89,7 +105,10 @@ bool split_connector::is_draining(std::size_t quiet_ms) const
 bool split_connector::is_closed() const
 {
   std::lock_guard<std::mutex> lock(_mutex);
-  return _closed && _splits.empty();
+  // A failed source still has terminal work: the scheduler must call
+  // get_next_split() so the original exception reaches the query window.
+  // Otherwise a metadata failure before the first pop looks like empty input.
+  return _closed && _splits.empty() && !_exception;
 }
 
 [[nodiscard]] bool split_connector::has_more_splits() const
@@ -104,7 +123,7 @@ std::vector<std::shared_ptr<::cucascade::data_batch>> split_connector::peek_resi
   std::lock_guard<std::mutex> lock(_mutex);
   batches.reserve(_splits.size());
   for (const auto& split : _splits) {
-    auto* scan_input = dynamic_cast<const op::scan::scan_operator_input*>(split.get());
+    auto* scan_input = dynamic_cast<const op::scan::scan_operator_input*>(split.input.get());
     if (scan_input != nullptr && scan_input->is_resident()) {
       batches.push_back(scan_input->get_cached_batch());
     }

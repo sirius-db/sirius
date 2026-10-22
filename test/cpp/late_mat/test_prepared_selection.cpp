@@ -26,10 +26,10 @@
 // the global ids back out of the prepared per-batch state and requires the
 // caller's own set in return.
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
+#include <cuda/stream>
 #include <cuda_runtime.h>
 
 #include <catch.hpp>
@@ -49,7 +49,7 @@ namespace {
 
 constexpr std::int64_t kChunk = 1024;
 
-rmm::device_buffer upload(std::vector<std::uint64_t> const& host, rmm::cuda_stream_view stream)
+rmm::device_buffer upload(std::vector<std::uint64_t> const& host, ::cuda::stream_ref stream)
 {
   rmm::device_buffer buf(
     host.size() * sizeof(std::uint64_t), stream, rmm::mr::get_current_device_resource_ref());
@@ -58,8 +58,8 @@ rmm::device_buffer upload(std::vector<std::uint64_t> const& host, rmm::cuda_stre
                     host.data(),
                     host.size() * sizeof(std::uint64_t),
                     cudaMemcpyHostToDevice,
-                    stream.value());
-    cudaStreamSynchronize(stream.value());
+                    stream.get());
+    cudaStreamSynchronize(stream.get());
   }
   return buf;
 }
@@ -115,7 +115,7 @@ TEST_CASE("a layout derives its row starts from its batches", "[late_mat][prepar
 
 TEST_CASE("an unordered selection with repeats prepares to its own id set", "[late_mat][prepare]")
 {
-  auto const stream = rmm::cuda_stream_view{};
+  auto const stream = ::cuda::stream_ref{cudaStream_t{}};
   auto const mr     = rmm::mr::get_current_device_resource_ref();
   auto const layout = pinned_table_layout::from_batch_rows({4 * kChunk, 7 * kChunk, 2 * kChunk});
 
@@ -136,7 +136,7 @@ TEST_CASE("an unordered selection with repeats prepares to its own id set", "[la
                                                 static_cast<std::int64_t>(host_ids.size()),
                                                 false});
   auto const& canonical = prepared.canonical(stream, mr);
-  cudaStreamSynchronize(stream.value());
+  cudaStreamSynchronize(stream.get());
 
   std::set<std::uint64_t> const distinct(host_ids.begin(), host_ids.end());
   REQUIRE(prepared.original_count() == static_cast<std::int64_t>(host_ids.size()));
@@ -160,7 +160,7 @@ TEST_CASE("an unordered selection with repeats prepares to its own id set", "[la
 TEST_CASE("a batch whose rows all survive is marked dense and prepares nothing",
           "[late_mat][prepare]")
 {
-  auto const stream = rmm::cuda_stream_view{};
+  auto const stream = ::cuda::stream_ref{cudaStream_t{}};
   auto const mr     = rmm::mr::get_current_device_resource_ref();
   auto const layout = pinned_table_layout::from_batch_rows({2 * kChunk, 3 * kChunk});
 
@@ -177,7 +177,7 @@ TEST_CASE("a batch whose rows all survive is marked dense and prepares nothing",
                                                 static_cast<std::int64_t>(host_ids.size()),
                                                 true});
   auto const& canonical = prepared.canonical(stream, mr);
-  cudaStreamSynchronize(stream.value());
+  cudaStreamSynchronize(stream.get());
 
   REQUIRE(canonical.batches[0].dense);
   REQUIRE(canonical.batches[0].survivors == 2 * kChunk);
@@ -198,7 +198,7 @@ TEST_CASE("a batch whose rows all survive is marked dense and prepares nothing",
 
 TEST_CASE("an empty selection prepares to nothing, per batch", "[late_mat][prepare]")
 {
-  auto const stream = rmm::cuda_stream_view{};
+  auto const stream = ::cuda::stream_ref{cudaStream_t{}};
   auto const mr     = rmm::mr::get_current_device_resource_ref();
   auto const layout = pinned_table_layout::from_batch_rows({kChunk, kChunk});
   prepared_selection const prepared(layout, row_id_list{});
@@ -212,7 +212,7 @@ TEST_CASE("an empty selection prepares to nothing, per batch", "[late_mat][prepa
 
 TEST_CASE("a batch nothing selected still holds its place", "[late_mat][prepare]")
 {
-  auto const stream = rmm::cuda_stream_view{};
+  auto const stream = ::cuda::stream_ref{cudaStream_t{}};
   auto const mr     = rmm::mr::get_current_device_resource_ref();
   auto const layout = pinned_table_layout::from_batch_rows({kChunk, kChunk, kChunk});
 
@@ -224,7 +224,7 @@ TEST_CASE("a batch nothing selected still holds its place", "[late_mat][prepare]
   prepared_selection const prepared(
     layout, row_id_list{static_cast<std::uint64_t const*>(d_ids.data()), 3, true});
   auto const& canonical = prepared.canonical(stream, mr);
-  cudaStreamSynchronize(stream.value());
+  cudaStreamSynchronize(stream.get());
 
   REQUIRE(canonical.batches[1].survivors == 0);
   REQUIRE_FALSE(canonical.batches[1].dense);
@@ -234,7 +234,7 @@ TEST_CASE("a batch nothing selected still holds its place", "[late_mat][prepare]
 
 TEST_CASE("constructing a prepared selection does no device work", "[late_mat][prepare]")
 {
-  auto const stream = rmm::cuda_stream_view{};
+  auto const stream = ::cuda::stream_ref{cudaStream_t{}};
   auto const mr     = rmm::mr::get_current_device_resource_ref();
   auto const layout = pinned_table_layout::from_batch_rows({kChunk, kChunk});
   std::vector<std::uint64_t> const host_ids{9, 3, 9, 1500};
@@ -255,7 +255,7 @@ TEST_CASE("constructing a prepared selection does no device work", "[late_mat][p
 
 TEST_CASE("an id past the end of the pinned table is refused", "[late_mat][prepare]")
 {
-  auto const stream = rmm::cuda_stream_view{};
+  auto const stream = ::cuda::stream_ref{cudaStream_t{}};
   auto const mr     = rmm::mr::get_current_device_resource_ref();
   auto const layout = pinned_table_layout::from_batch_rows({kChunk, kChunk});
 

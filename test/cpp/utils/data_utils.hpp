@@ -20,6 +20,7 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/fixed_point/fixed_point.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
@@ -57,7 +58,7 @@ namespace test {
 template <typename Traits>
 inline std::unique_ptr<cudf::column> vector_to_cudf_column(
   const std::vector<typename Traits::type>& values,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  ::cuda::stream_ref stream         = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref())
 {
   auto size = static_cast<cudf::size_type>(values.size());
@@ -90,7 +91,7 @@ inline std::unique_ptr<cudf::column> vector_to_cudf_column(
                     offsets.data(),
                     offsets.size() * sizeof(cudf::size_type),
                     cudaMemcpyHostToDevice,
-                    stream.value());
+                    stream.get());
 
     // Chars buffer
     rmm::device_buffer chars_buf(total_chars, stream, mr);
@@ -99,11 +100,15 @@ inline std::unique_ptr<cudf::column> vector_to_cudf_column(
                       chars.data(),
                       chars.size() * sizeof(char),
                       cudaMemcpyHostToDevice,
-                      stream.value());
+                      stream.get());
     }
 
     return cudf::make_strings_column(
-      size, std::move(offsets_col), std::move(chars_buf), 0, rmm::device_buffer{0, stream, mr});
+      size,
+      std::move(offsets_col),
+      std::move(chars_buf),
+      0,
+      cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr));
   }
   // Handle decimal types
   else if constexpr (Traits::is_decimal) {
@@ -182,7 +187,7 @@ inline std::unique_ptr<cudf::column> vector_to_cudf_column(
 inline std::vector<std::unique_ptr<cudf::table>> make_random_striped_split(
   std::unique_ptr<cudf::table> input,
   std::size_t num_splits,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  ::cuda::stream_ref stream         = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref())
 {
   if (num_splits == 0) { return {}; }
@@ -228,7 +233,7 @@ inline std::vector<std::unique_ptr<cudf::table>> make_random_striped_split(
                     split_indices.data(),
                     split_indices.size() * sizeof(cudf::size_type),
                     cudaMemcpyHostToDevice,
-                    stream.value());
+                    stream.get());
 
     // Use cuDF gather to create the split table
     auto split_table = cudf::gather(

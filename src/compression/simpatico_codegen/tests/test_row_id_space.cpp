@@ -17,9 +17,9 @@
 #include "codegen/selection/chunk_row_set.hpp"
 #include "codegen/selection/row_id_space.hpp"
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
+#include <cuda/stream>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -98,7 +98,7 @@ std::vector<std::uint64_t> scattered_ids(std::int64_t total_rows, std::size_t co
 
 void test_sort_unique()
 {
-  auto const stream = rmm::cuda_stream_view{};
+  auto const stream = ::cuda::stream_ref{cudaStream_t{}};
   auto const mr     = rmm::mr::get_current_device_resource_ref();
 
   std::vector<std::uint64_t> const host_ids = scattered_ids(9 * kChunk, 500);
@@ -107,7 +107,7 @@ void test_sort_unique()
 
   auto sorted =
     sort_unique_global_ids(d_ids.ptr, static_cast<std::int64_t>(host_ids.size()), stream, mr);
-  cudaStreamSynchronize(stream.value());
+  cudaStreamSynchronize(stream.get());
 
   std::set<std::uint64_t> const distinct(host_ids.begin(), host_ids.end());
   auto const unique_count = download<std::int32_t>(sorted.count_dev.data(), 1)[0];
@@ -137,7 +137,7 @@ void test_sort_unique()
 
 void test_split_by_batch()
 {
-  auto const stream = rmm::cuda_stream_view{};
+  auto const stream = ::cuda::stream_ref{cudaStream_t{}};
   auto const mr     = rmm::mr::get_current_device_resource_ref();
 
   // Batches of 2, 3 and 1 chunks. The ids deliberately include a batch's first
@@ -165,11 +165,11 @@ void test_split_by_batch()
 
 void test_empty()
 {
-  auto const stream = rmm::cuda_stream_view{};
+  auto const stream = ::cuda::stream_ref{cudaStream_t{}};
   auto const mr     = rmm::mr::get_current_device_resource_ref();
 
   auto sorted = sort_unique_global_ids(nullptr, 0, stream, mr);
-  cudaStreamSynchronize(stream.value());
+  cudaStreamSynchronize(stream.get());
   REQUIRE_MSG(download<std::int32_t>(sorted.count_dev.data(), 1)[0] == 0,
               "an empty id list has a nonzero unique count");
 
@@ -185,7 +185,7 @@ void test_empty()
 /// against what the batch's rows should have been.
 void test_round_trip()
 {
-  auto const stream = rmm::cuda_stream_view{};
+  auto const stream = ::cuda::stream_ref{cudaStream_t{}};
   auto const mr     = rmm::mr::get_current_device_resource_ref();
 
   std::vector<std::int64_t> const batch_rows{4 * kChunk, 7 * kChunk, 2 * kChunk};
@@ -230,7 +230,7 @@ void test_round_trip()
                           local.ptr,
                           stream);
     auto built = build_chunk_row_set(local.ptr, count, batch_rows[b], stream, mr);
-    cudaStreamSynchronize(stream.value());
+    cudaStreamSynchronize(stream.get());
 
     // What this batch's local ids should be, straight from the host id set.
     std::vector<std::int64_t> expect_local;

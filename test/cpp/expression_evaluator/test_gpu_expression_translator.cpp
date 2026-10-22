@@ -46,6 +46,7 @@
 #include <cudf/ast/expressions.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/types.hpp>
@@ -229,8 +230,12 @@ std::unique_ptr<cudf::table> make_string_table(std::vector<std::string> const& v
                cudaMemcpyHostToDevice);
   }
 
-  auto col = cudf::make_strings_column(
-    n, std::move(offsets_col), std::move(chars_buf), 0, rmm::device_buffer{0, stream, mr});
+  auto col =
+    cudf::make_strings_column(n,
+                              std::move(offsets_col),
+                              std::move(chars_buf),
+                              0,
+                              cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr));
   std::vector<std::unique_ptr<cudf::column>> cols;
   cols.push_back(std::move(col));
   return std::make_unique<cudf::table>(std::move(cols));
@@ -507,14 +512,13 @@ TEST_CASE("translator: join condition uses requested comparison operator",
   }
 }
 
-TEST_CASE("translator: join condition unsupported comparison returns nullopt",
-          "[expression_translator]")
+TEST_CASE("translator: DISTINCT FROM join condition is supported", "[expression_translator]")
 {
   auto condition  = make_reference_join_condition(duckdb::ExpressionType::COMPARE_DISTINCT_FROM);
   auto translator = make_translator();
   auto translated = translator.translate_join_condition(condition);
 
-  REQUIRE_FALSE(translated.has_value());
+  REQUIRE(translated.has_value());
 }
 
 //===----------------------------------------------------------------------===//
@@ -1642,4 +1646,29 @@ TEST_CASE("translator: string column NOT EQUAL string literal", "[expression_tra
   auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
   auto host_vals = copy_bool_column_to_host(result->view());
   REQUIRE(host_vals == std::vector<uint8_t>{0, 1, 0, 1});
+}
+
+TEST_CASE("translator: checked DATE arithmetic is an AST boundary",
+          "[expression_translator][date_arithmetic]")
+{
+  auto const signature  = GENERATE(0, 1, 2, 3);
+  auto const date       = logical_type::make(type_id::DATE);
+  auto const integer    = logical_type::make(type_id::INTEGER);
+  auto const difference = signature == 3;
+  std::vector<std::unique_ptr<ast_node>> args;
+  args.push_back(make_ref_typed(0, signature == 1 ? integer : date));
+  args.push_back(make_ref_typed(1, signature == 1 || difference ? date : integer));
+  auto expr = make_func(signature < 2 ? sirius::function_id::add : sirius::function_id::sub,
+                        std::move(args),
+                        difference ? logical_type::make(type_id::BIGINT) : date);
+  REQUIRE(expr->cudf_ast_op_count() == 0);
+  auto translator = make_translator();
+  REQUIRE_FALSE(translate(translator, *expr).has_value());
+  // An enclosing comparison must decline too, not bypass the checked child.
+  auto parent =
+    make_cmp(sirius::comparison_type::equal,
+             std::move(expr),
+             make_ref_typed(2, difference ? logical_type::make(type_id::BIGINT) : date));
+  auto parent_translator = make_translator();
+  REQUIRE_FALSE(translate(parent_translator, *parent).has_value());
 }

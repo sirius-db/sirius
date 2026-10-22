@@ -27,15 +27,19 @@
 
 // test
 #include <catch.hpp>
+#include <utils/table_filter_test_utils.hpp>
 
 // sirius
 #include <io/kvikio/kvikio_context.hpp>
+#include <op/scan/parquet_batch_layout.hpp>
 #include <op/scan/parquet_gpu_ingestible.hpp>
 #include <op/scan/scan_plan.hpp>
 #include <utils/parquet_fixture_utils.hpp>
 
 // duckdb
 #include <duckdb.hpp>
+#include <duckdb/common/multi_file/multi_file_reader.hpp>
+#include <duckdb/planner/filter/constant_filter.hpp>
 #include <duckdb/planner/filter/null_filter.hpp>
 
 // standard library
@@ -105,15 +109,15 @@ class NullCountFixture {
 
     std::vector<std::int64_t> const expected_nulls{2048, 0, 1024};
     for (duckdb::idx_t i = 0; i < 3; i++) {
-      auto const rows = layout->GetValue(0, i).GetValue<std::int64_t>();
+      auto const rows = layout->Collection().GetValue(0, i).GetValue<std::int64_t>();
       if (rows != 2048) {
         UNSCOPED_INFO("row group " << i << " has " << rows << " rows, expected 2048");
         REQUIRE(rows == 2048);
       }
       // Absent statistics would make the pruning untestable, not merely
       // unverified — null_count is what the feature reads.
-      REQUIRE_FALSE(layout->GetValue(1, i).IsNull());
-      auto const nulls = layout->GetValue(1, i).GetValue<std::int64_t>();
+      REQUIRE_FALSE(layout->Collection().GetValue(1, i).IsNull());
+      auto const nulls = layout->Collection().GetValue(1, i).GetValue<std::int64_t>();
       if (nulls != expected_nulls[i]) {
         UNSCOPED_INFO("row group " << i << " has " << nulls << " NULLs, expected "
                                    << expected_nulls[i]);
@@ -133,16 +137,18 @@ class NullCountFixture {
     info->returned_types.push_back(sirius::logical_type::make(sirius::type_id::INTEGER));
     info->column_ids.push_back(duckdb::ColumnIndex(0));
     info->column_ids.push_back(duckdb::ColumnIndex(1));
-    info->scan_output_arity      = 2;
+    info->projected_output_count = 2;
     info->approximate_batch_size = std::size_t{1} << 30;
 
     if (filter_expects_null) {
       auto filters = duckdb::make_uniq<duckdb::TableFilterSet>();
       // Column 1 is `v`; the index is into column_ids.
       if (*filter_expects_null) {
-        filters->PushFilter(duckdb::ColumnIndex(1), duckdb::make_uniq<duckdb::IsNullFilter>());
+        filters->PushFilter(duckdb::ProjectionIndex(1),
+                            sirius::test::null_filter(duckdb::LogicalType::INTEGER));
       } else {
-        filters->PushFilter(duckdb::ColumnIndex(1), duckdb::make_uniq<duckdb::IsNotNullFilter>());
+        filters->PushFilter(duckdb::ProjectionIndex(1),
+                            sirius::test::null_filter(duckdb::LogicalType::INTEGER, true));
       }
       info->table_filters = std::move(filters);
     }
@@ -157,7 +163,7 @@ class NullCountFixture {
     auto task       = ingestible->next_split_provider(
       [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
     REQUIRE(task);
-    auto info = task();
+    auto info = task({});
     REQUIRE(info);
     auto* file = dynamic_cast<scan::parquet_file_scan_info*>(info.get());
     REQUIRE(file);
@@ -199,4 +205,50 @@ TEST_CASE_METHOD(NullCountFixture,
                  "[scan][parquet][pruning][null_count]")
 {
   REQUIRE(surviving_row_groups(/*filter_expects_null=*/false) == 2);
+}
+
+TEST_CASE_METHOD(NullCountFixture,
+                 "parquet virtual provenance keeps the original offset after stats pruning",
+                 "[scan][parquet][pruning][virtual_columns]")
+{
+  auto info        = make_info(std::nullopt);
+  info->column_ids = {
+    duckdb::ColumnIndex(0),
+    duckdb::ColumnIndex(duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER)};
+  info->projected_output_count = 2;
+  info->virtual_columns        = {{duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER,
+                                   "file_row_number",
+                                   sirius::logical_type::make(sirius::type_id::BIGINT),
+                                   scan::scan_plan::parquet_virtual_column_kind::FILE_ROW_NUMBER}};
+  auto filters                 = duckdb::make_uniq<duckdb::TableFilterSet>();
+  auto lower_third_rg          = sirius::test::constant_filter(
+    duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO, duckdb::Value::INTEGER(4097));
+  filters->PushFilter(duckdb::ProjectionIndex(0), std::move(lower_third_rg));
+  info->table_filters = std::move(filters);
+
+  auto ingestible = scan::make_ingestible(std::move(info));
+  auto ioctx      = std::make_shared<sirius::io::kvikio_context>();
+  auto task       = ingestible->next_split_provider(
+    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+  REQUIRE(task);
+  auto file_info = task({});
+  auto* file     = dynamic_cast<scan::parquet_file_scan_info*>(file_info.get());
+  REQUIRE(file);
+  REQUIRE(file->row_groups.size() == 1);
+  CHECK(file->row_groups.front().index == 2);
+
+  auto coalescer = ingestible->create_batch_coalescer();
+  auto splits    = coalescer->push(std::move(file_info));
+  auto tail      = coalescer->flush();
+  for (auto& split : tail) {
+    splits.push_back(std::move(split));
+  }
+  REQUIRE(splits.size() == 1);
+  auto* split = dynamic_cast<scan::parquet_split_info*>(splits.front().get());
+  REQUIRE(split);
+  auto layout = scan::build_batch_layout(*split);
+  REQUIRE(layout.size() == 1);
+  CHECK(layout.front().file_row_offset == 4096);
+  CHECK(layout.front().num_rows == 2048);
+  CHECK(layout.front().file_index == 0);
 }

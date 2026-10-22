@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include "memory/runtime_stream_pool.hpp"
+
 #include <rmm/cuda_device.hpp>
 
 #include <cuda_runtime.h>
@@ -58,7 +60,7 @@ replica_transfer_route enqueue_replica_copy(
   void const* source,
   cucascade::memory::memory_space const& source_space,
   std::size_t bytes,
-  rmm::cuda_stream_view destination_stream,
+  ::cuda::stream_ref destination_stream,
   cucascade::memory::memory_space const& host_staging_space,
   replica_transfer_policy policy)
 {
@@ -76,7 +78,7 @@ replica_transfer_route enqueue_replica_copy(
   if (destination_device == source_device && policy == replica_transfer_policy::automatic) {
     rmm::cuda_set_device_raii guard{destination_device};
     CUCASCADE_CUDA_TRY(cudaMemcpyAsync(
-      destination, source, bytes, cudaMemcpyDeviceToDevice, destination_stream.value()));
+      destination, source, bytes, cudaMemcpyDeviceToDevice, destination_stream.get()));
     return replica_transfer_route::local;
   }
 
@@ -90,7 +92,7 @@ replica_transfer_route enqueue_replica_copy(
                                            source,
                                            source_device.value(),
                                            bytes,
-                                           destination_stream.value()));
+                                           destination_stream.get()));
     return replica_transfer_route::peer_dma;
   }
 
@@ -114,7 +116,8 @@ replica_transfer_route enqueue_replica_copy(
     offset += copy_bytes;
   }
 
-  auto const source_stream = source_space.acquire_stream();
+  auto source_lease        = sirius::memory::runtime_stream_pool::acquire(source_space);
+  auto const source_stream = source_lease.get();
   {
     rmm::cuda_set_device_raii guard{source_device};
     if (d2h_sizes.size() == 1) {
@@ -180,7 +183,7 @@ replica_transfer_route enqueue_replica_copy(
                                          h2d_sources.front(),
                                          h2d_sizes.front(),
                                          cudaMemcpyHostToDevice,
-                                         destination_stream.value()));
+                                         destination_stream.get()));
     } else {
 #if CUDART_VERSION >= 12080
       cudaMemcpyAttributes attributes{};
@@ -193,14 +196,14 @@ replica_transfer_route enqueue_replica_copy(
                                               h2d_sizes.size(),
                                               attributes,
                                               nullptr,
-                                              destination_stream.value()));
+                                              destination_stream.get()));
 #else
       CUCASCADE_CUDA_TRY(cudaMemcpyBatchAsync(h2d_destinations.data(),
                                               h2d_sources.data(),
                                               h2d_sizes.data(),
                                               h2d_sizes.size(),
                                               attributes,
-                                              destination_stream.value()));
+                                              destination_stream.get()));
 #endif
 #else
       for (std::size_t i = 0; i < h2d_sizes.size(); ++i) {
@@ -208,11 +211,11 @@ replica_transfer_route enqueue_replica_copy(
                                            h2d_sources[i],
                                            h2d_sizes[i],
                                            cudaMemcpyHostToDevice,
-                                           destination_stream.value()));
+                                           destination_stream.get()));
       }
 #endif
     }
-    CUCASCADE_CUDA_TRY(cudaStreamSynchronize(destination_stream.value()));
+    CUCASCADE_CUDA_TRY(cudaStreamSynchronize(destination_stream.get()));
   }
   staging.reset();
   return replica_transfer_route::host_staging;

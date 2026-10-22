@@ -38,6 +38,7 @@
 #include <op/scan/duckdb_native_gpu_ingestible.hpp>
 #include <op/scan/duckdb_native_metadata.hpp>
 #include <unistd.h>
+#include <utils/table_filter_test_utils.hpp>
 
 #include <cstdio>
 #include <memory>
@@ -93,7 +94,8 @@ duckdb::DataTable& resolve_storage(duckdb::Connection& con, const std::string& t
   auto& catalog = duckdb::Catalog::GetCatalog(ctx, "");
   duckdb::CatalogTransaction txn(catalog, ctx);
   auto& schema = catalog.GetSchema(txn, "main");
-  auto entry   = schema.GetEntry(txn, duckdb::CatalogType::TABLE_ENTRY, table_name);
+  auto entry =
+    schema.GetEntry(txn, duckdb::CatalogType::TABLE_ENTRY, duckdb::Identifier(table_name));
   REQUIRE(entry);
   return entry->Cast<duckdb::DuckTableEntry>().GetStorage();
 }
@@ -135,8 +137,8 @@ TEST_CASE("empty split with an ARRAY projection decodes to a 0-row LIST column",
   info.projected_types = {array_of(sirius::type_id::INTEGER, 3)};
 
   std::unique_ptr<cudf::table> table;
-  REQUIRE_NOTHROW(table = decode_duckdb_native_split(
-                    {}, info, /*datasource=*/nullptr, *gpu_space, stream.view()));
+  REQUIRE_NOTHROW(
+    table = decode_duckdb_native_split({}, info, /*datasource=*/nullptr, *gpu_space, stream));
   REQUIRE(table != nullptr);
   REQUIRE(table->num_columns() == 1);
   REQUIRE(table->num_rows() == 0);
@@ -159,8 +161,7 @@ TEST_CASE("empty split preserves rowid, ARRAY, and scalar projection order",
                           array_of(sirius::type_id::INTEGER, 3),
                           sirius::logical_type::make(sirius::type_id::INTEGER)};
 
-  auto table =
-    decode_duckdb_native_split({}, info, /*datasource=*/nullptr, *gpu_space, stream.view());
+  auto table = decode_duckdb_native_split({}, info, /*datasource=*/nullptr, *gpu_space, stream);
   REQUIRE(table->num_columns() == 3);
   REQUIRE(table->num_rows() == 0);
   REQUIRE(table->get_column(0).type().id() == cudf::type_id::INT64);
@@ -189,8 +190,10 @@ TEST_CASE("all-pruned split stays viable and decodes to a 0-row table",
   // every row group. Keyed by the relative scan-column index (0 = id) with the
   // parallel column_ids mapping it back to storage column 0.
   duckdb::TableFilterSet filters;
-  filters.filters[0] = duckdb::make_uniq<duckdb::ConstantFilter>(
-    duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO, duckdb::Value::INTEGER(1000000));
+  filters.SetFilterByColumnIndex(
+    duckdb::ProjectionIndex(0),
+    sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO,
+                                  duckdb::Value::INTEGER(1000000)));
   duckdb::vector<duckdb::ColumnIndex> column_ids;
   column_ids.push_back(duckdb::ColumnIndex(0));
 
@@ -217,7 +220,7 @@ TEST_CASE("all-pruned split stays viable and decodes to a 0-row table",
 
   std::unique_ptr<cudf::table> table;
   REQUIRE_NOTHROW(table = decode_duckdb_native_split(
-                    range.row_groups, info, /*datasource=*/nullptr, *gpu_space, stream.view()));
+                    range.row_groups, info, /*datasource=*/nullptr, *gpu_space, stream));
   REQUIRE(table != nullptr);
   REQUIRE(table->num_columns() == 2);
   REQUIRE(table->num_rows() == 0);

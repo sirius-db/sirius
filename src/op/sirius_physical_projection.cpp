@@ -68,7 +68,7 @@ sirius_physical_projection::sirius_physical_projection(
 }
 
 std::unique_ptr<operator_data> sirius_physical_projection::execute(const operator_data& input_data,
-                                                                   rmm::cuda_stream_view stream)
+                                                                   ::cuda::stream_ref stream)
 {
   nvtx_scoped_range nvtx_range{"sirius_physical_projection::execute"};
   auto& input = dynamic_cast<const pipelineable_operator_data&>(input_data);
@@ -104,7 +104,7 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
     evaluator.emplace(evaluated_exprs,
                       cudf::get_current_device_resource_ref(),
                       stream,
-                      strategy_from_config(),
+                      expression_policy(),
                       expression_evaluator::default_min_ast_size,
                       like_swar_fastpath_enabled(),
                       like_cache());

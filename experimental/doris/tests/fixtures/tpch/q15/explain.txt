@@ -1,0 +1,197 @@
+Explain String(Nereids Planner)
+PLAN FRAGMENT 0
+  OUTPUT EXPRS:
+    s_suppkey[#78]
+    s_name[#79]
+    s_address[#80]
+    s_phone[#81]
+    total_revenue[#82]
+  PARTITION: UNPARTITIONED
+
+  HAS_COLO_PLAN_NODE: true
+
+  VRESULT SINK
+     MYSQL_PROTOCOL
+
+  16:VSORT(1539)
+  |  order by: s_suppkey[#78] ASC
+  |  algorithm: full sort
+  |  offset: 0
+  |  distribute expr lists: 
+  |  
+  15:VHASH JOIN(1531)
+  |  join op: INNER JOIN(BROADCAST)[]
+  |  equal join conjunct: (supplier_no[#65] = s_suppkey[#7])
+  |  cardinality=1
+  |  vec output tuple id: 17
+  |  output tuple id: 17
+  |  vIntermediate tuple ids: 16 
+  |  hash output slot ids: 66 7 8 9 10 
+  |  final projections: s_suppkey[#69], s_name[#70], s_address[#71], s_phone[#72], total_revenue[#68]
+  |  final project output tuple id: 17
+  |  distribute expr lists: 
+  |  distribute expr lists: 
+  |  
+  |----1:VEXCHANGE
+  |       offset: 0
+  |       distribute expr lists: 
+  |    
+  14:VHASH JOIN(1514)
+  |  join op: INNER JOIN(BROADCAST)[]
+  |  equal join conjunct: (max(total_revenue)[#61] = total_revenue[#35])
+  |  cardinality=1
+  |  vec output tuple id: 15
+  |  output tuple id: 15
+  |  vIntermediate tuple ids: 14 
+  |  hash output slot ids: 34 35 
+  |  final projections: supplier_no[#63], total_revenue[#64]
+  |  final project output tuple id: 15
+  |  distribute expr lists: 
+  |  distribute expr lists: 
+  |  
+  |----6:VEXCHANGE
+  |       offset: 0
+  |       distribute expr lists: supplier_no[#34]
+  |    
+  13:VAGGREGATE (merge finalize)(1481)
+  |  output: max(partial_max(total_revenue)[#60])[#61]
+  |  group by: 
+  |  sortByGroupKey:false
+  |  cardinality=1
+  |  distribute expr lists: 
+  |  
+  12:VEXCHANGE
+     offset: 0
+     distribute expr lists: 
+
+PLAN FRAGMENT 1
+
+  PARTITION: HASH_PARTITIONED: l_suppkey[#55]
+
+  HAS_COLO_PLAN_NODE: true
+
+  STREAM DATA SINK
+    EXCHANGE ID: 12
+    UNPARTITIONED
+
+  11:VAGGREGATE (update serialize)(1473)
+  |  output: partial_max(total_revenue[#59])[#60]
+  |  group by: 
+  |  sortByGroupKey:false
+  |  cardinality=1
+  |  distribute expr lists: 
+  |  
+  10:VAGGREGATE (merge finalize)(1465)
+  |  output: sum(partial_sum((l_extendedprice * (1.00 - cast(l_discount as DECIMALV3(16, 2)))))[#56])[#58]
+  |  group by: l_suppkey[#55]
+  |  sortByGroupKey:false
+  |  cardinality=0
+  |  final projections: total_revenue[#58]
+  |  final project output tuple id: 11
+  |  distribute expr lists: l_suppkey[#55]
+  |  
+  9:VEXCHANGE
+     offset: 0
+     distribute expr lists: 
+
+PLAN FRAGMENT 2
+
+  PARTITION: RANDOM
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 09
+    HASH_PARTITIONED: l_suppkey[#55]
+
+  8:VAGGREGATE (update serialize)(1457)
+  |  STREAMING
+  |  output: partial_sum((l_extendedprice[#53] * (1.00 - CAST(l_discount[#54] AS decimalv3(16,2)))))[#56]
+  |  group by: l_suppkey[#52]
+  |  sortByGroupKey:false
+  |  cardinality=0
+  |  distribute expr lists: 
+  |  
+  7:VTVF_SCAN_NODE(1445)
+     table: null.null.LocalTableValuedFunction
+     predicates: (_tvf_local.l_shipdate[#46] >= '1996-01-01'), (_tvf_local.l_shipdate[#46] < '1996-04-01')
+     inputSplitNum=1, totalFileSize=162140518, scanRanges=1
+     partition=0/0
+     numNodes=2
+     pushdown agg=NONE
+     final projections: _tvf_local.l_suppkey[#38], _tvf_local.l_extendedprice[#41], _tvf_local.l_discount[#42]
+     final project output tuple id: 8
+
+PLAN FRAGMENT 3
+
+  PARTITION: HASH_PARTITIONED: l_suppkey[#30]
+
+  HAS_COLO_PLAN_NODE: true
+
+  STREAM DATA SINK
+    EXCHANGE ID: 06
+    UNPARTITIONED
+
+  5:VAGGREGATE (merge finalize)(1502)
+  |  output: sum(partial_sum((l_extendedprice * (1.00 - cast(l_discount as DECIMALV3(16, 2)))))[#31])[#33]
+  |  group by: l_suppkey[#30]
+  |  sortByGroupKey:false
+  |  cardinality=0
+  |  final projections: l_suppkey[#32], total_revenue[#33]
+  |  final project output tuple id: 6
+  |  distribute expr lists: l_suppkey[#30]
+  |  
+  4:VEXCHANGE
+     offset: 0
+     distribute expr lists: 
+
+PLAN FRAGMENT 4
+
+  PARTITION: RANDOM
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 04
+    HASH_PARTITIONED: l_suppkey[#30]
+
+  3:VAGGREGATE (update serialize)(1494)
+  |  STREAMING
+  |  output: partial_sum((l_extendedprice[#28] * (1.00 - CAST(l_discount[#29] AS decimalv3(16,2)))))[#31]
+  |  group by: l_suppkey[#27]
+  |  sortByGroupKey:false
+  |  cardinality=0
+  |  distribute expr lists: 
+  |  
+  2:VTVF_SCAN_NODE(1482)
+     table: null.null.LocalTableValuedFunction
+     predicates: (_tvf_local.l_shipdate[#21] >= '1996-01-01'), (_tvf_local.l_shipdate[#21] < '1996-04-01')
+     inputSplitNum=1, totalFileSize=162140518, scanRanges=1
+     partition=0/0
+     numNodes=2
+     pushdown agg=NONE
+     final projections: _tvf_local.l_suppkey[#13], _tvf_local.l_extendedprice[#16], _tvf_local.l_discount[#17]
+     final project output tuple id: 3
+
+PLAN FRAGMENT 5
+
+  PARTITION: RANDOM
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 01
+    UNPARTITIONED
+
+  0:VTVF_SCAN_NODE(1519)
+     table: null.null.LocalTableValuedFunction
+     inputSplitNum=1, totalFileSize=690978, scanRanges=1
+     partition=0/0
+     numNodes=2
+     pushdown agg=NONE
+     final projections: _tvf_local.s_suppkey[#0], _tvf_local.s_name[#1], _tvf_local.s_address[#2], _tvf_local.s_phone[#4]
+     final project output tuple id: 1
+
+
+
+========== STATISTICS ==========

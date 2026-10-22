@@ -29,6 +29,7 @@
 #include <cucascade/memory/topology_discovery.hpp>
 #include <duckdb/common/column_index.hpp>
 #include <duckdb/common/types.hpp>
+#include <utils/duckdb_table_identity.hpp>
 
 #include <cstddef>
 #include <memory>
@@ -45,9 +46,10 @@ using sirius::scan_manager::pinned_entry;
 using sirius::scan_manager::scan_manager_config;
 using sirius::scan_manager::sirius_scan_manager;
 
-constexpr char const* kCatalog = "memory";
-constexpr char const* kSchema  = "main";
-constexpr char const* kTable   = "orders";
+constexpr char const* kCatalog    = "memory";
+constexpr char const* kSchema     = "main";
+constexpr char const* kTable      = "orders";
+constexpr duckdb::idx_t kTableOid = 42;
 
 cucascade::memory::system_topology_info single_gpu_topology()
 {
@@ -70,9 +72,10 @@ cache_entry_info make_cache_info(std::vector<std::size_t> const& primary_indices
                                  std::string const& table = kTable)
 {
   cache_entry_info info;
-  info.catalog_name = kCatalog;
-  info.schema_name  = kSchema;
-  info.table_name   = table;
+  info.catalog_name   = kCatalog;
+  info.schema_name    = kSchema;
+  info.table_name     = table;
+  info.table_identity = sirius::test::test_table_identity(kTableOid);
   for (auto const idx : primary_indices) {
     info.column_ids.emplace_back(idx);
     info.names.push_back("c" + std::to_string(idx));
@@ -102,7 +105,8 @@ void pin_metadata_entry(sirius_scan_manager& manager,
 struct split_pin_fixture {
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory =
     initialize_memory_manager(1);
-  sirius_scan_manager manager{scan_manager_config{}, *memory, single_gpu_index()};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, scan_manager_config{}, *memory, single_gpu_index()};
 
   split_pin_fixture()
   {
@@ -158,7 +162,8 @@ void pin_typed_entry(sirius_scan_manager& manager,
 struct type_match_fixture {
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory =
     initialize_memory_manager(1);
-  sirius_scan_manager manager{scan_manager_config{}, *memory, single_gpu_index()};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, scan_manager_config{}, *memory, single_gpu_index()};
   duckdb::vector<duckdb::LogicalType> returned_types{duckdb::LogicalType::BIGINT,
                                                      duckdb::LogicalType::BIGINT};
   std::string matching_name;
@@ -187,10 +192,10 @@ TEST_CASE("split pin: a request only the wide entry covers lands on the wide ent
   split_pin_fixture fixture;
 
   auto const wide_only = request({2, 3});
-  auto const* chosen =
-    fixture.manager.find_pinned_entry_for_duckdb_table(kCatalog, kSchema, kTable, &wide_only);
+  auto const chosen    = fixture.manager.find_pinned_entry_for_duckdb_table(
+    kCatalog, kSchema, kTable, sirius::test::test_table_identity(kTableOid), &wide_only);
   REQUIRE(chosen != nullptr);
-  REQUIRE(is_wide_entry(chosen));
+  REQUIRE(is_wide_entry(chosen.get()));
   REQUIRE_FALSE(chosen->cache_info.column_projection_for(wide_only).empty());
 }
 
@@ -200,10 +205,10 @@ TEST_CASE("split pin: a request only the split entry covers lands on the split e
   split_pin_fixture fixture;
 
   auto const split_only = request({1, 8});
-  auto const* chosen =
-    fixture.manager.find_pinned_entry_for_duckdb_table(kCatalog, kSchema, kTable, &split_only);
+  auto const chosen     = fixture.manager.find_pinned_entry_for_duckdb_table(
+    kCatalog, kSchema, kTable, sirius::test::test_table_identity(kTableOid), &split_only);
   REQUIRE(chosen != nullptr);
-  REQUIRE_FALSE(is_wide_entry(chosen));
+  REQUIRE_FALSE(is_wide_entry(chosen.get()));
   REQUIRE_FALSE(chosen->cache_info.column_projection_for(split_only).empty());
 }
 
@@ -213,9 +218,9 @@ TEST_CASE("split pin: a request both entries cover returns a serving entry",
   split_pin_fixture fixture;
 
   // {c0, c1} is a subset of both entries; either answer is valid if it serves.
-  auto const both = request({0, 1});
-  auto const* chosen =
-    fixture.manager.find_pinned_entry_for_duckdb_table(kCatalog, kSchema, kTable, &both);
+  auto const both   = request({0, 1});
+  auto const chosen = fixture.manager.find_pinned_entry_for_duckdb_table(
+    kCatalog, kSchema, kTable, sirius::test::test_table_identity(kTableOid), &both);
   REQUIRE(chosen != nullptr);
   REQUIRE_FALSE(chosen->cache_info.column_projection_for(both).empty());
 }
@@ -227,14 +232,16 @@ TEST_CASE("split pin: no covering entry falls back to a non-null identity match"
 
   // No entry covers {c1, c7, c8}; the guard declines the scan on the fallback.
   auto const uncovered = request({1, 7, 8});
-  auto const* chosen =
-    fixture.manager.find_pinned_entry_for_duckdb_table(kCatalog, kSchema, kTable, &uncovered);
+  auto const chosen    = fixture.manager.find_pinned_entry_for_duckdb_table(
+    kCatalog, kSchema, kTable, sirius::test::test_table_identity(kTableOid), &uncovered);
   REQUIRE(chosen != nullptr);
   REQUIRE(chosen->cache_info.table_name == kTable);
   REQUIRE(chosen->cache_info.column_projection_for(uncovered).empty());
 
-  REQUIRE(fixture.manager.find_pinned_entry_for_duckdb_table(
-            kCatalog, kSchema, "lineitem", &uncovered) == nullptr);
+  REQUIRE(
+    fixture.manager.find_pinned_entry_for_duckdb_table(
+      kCatalog, kSchema, "lineitem", sirius::test::test_table_identity(kTableOid), &uncovered) ==
+    nullptr);
 }
 
 TEST_CASE("split pin: null or empty requested ids keep the first-identity-match behavior",
@@ -242,18 +249,20 @@ TEST_CASE("split pin: null or empty requested ids keep the first-identity-match 
 {
   split_pin_fixture fixture;
 
-  auto const* chosen =
-    fixture.manager.find_pinned_entry_for_duckdb_table(kCatalog, kSchema, kTable, nullptr);
+  auto chosen = fixture.manager.find_pinned_entry_for_duckdb_table(
+    kCatalog, kSchema, kTable, sirius::test::test_table_identity(kTableOid), nullptr);
   REQUIRE(chosen != nullptr);
   REQUIRE(chosen->cache_info.table_name == kTable);
 
   duckdb::vector<duckdb::ColumnIndex> const empty;
-  chosen = fixture.manager.find_pinned_entry_for_duckdb_table(kCatalog, kSchema, kTable, &empty);
+  chosen = fixture.manager.find_pinned_entry_for_duckdb_table(
+    kCatalog, kSchema, kTable, sirius::test::test_table_identity(kTableOid), &empty);
   REQUIRE(chosen != nullptr);
   REQUIRE(chosen->cache_info.table_name == kTable);
 
-  // Defaulted three-argument form, as existing callers use it.
-  chosen = fixture.manager.find_pinned_entry_for_duckdb_table(kCatalog, kSchema, kTable);
+  // Requested ids remain optional when only identity matching is needed.
+  chosen = fixture.manager.find_pinned_entry_for_duckdb_table(
+    kCatalog, kSchema, kTable, sirius::test::test_table_identity(kTableOid));
   REQUIRE(chosen != nullptr);
 }
 
@@ -264,23 +273,55 @@ TEST_CASE("type match: a covering entry whose recorded types no longer match los
   auto const matching_name = GENERATE(std::string{"orders"}, std::string{"main.orders"});
   type_match_fixture fixture{matching_name};
 
-  auto const both    = request({0, 1});
-  auto const* chosen = fixture.manager.find_pinned_entry_for_duckdb_table(
-    kCatalog, kSchema, kTable, &both, &fixture.returned_types);
-  REQUIRE(type_match_fixture::types_match(chosen));
+  auto const both = request({0, 1});
+  auto const chosen =
+    fixture.manager.find_pinned_entry_for_duckdb_table(kCatalog,
+                                                       kSchema,
+                                                       kTable,
+                                                       sirius::test::test_table_identity(kTableOid),
+                                                       &both,
+                                                       &fixture.returned_types);
+  REQUIRE(type_match_fixture::types_match(chosen.get()));
 }
 
 TEST_CASE("type match: when no covering entry still matches, one is returned anyway",
           "[pinned_lookup][scan_manager]")
 {
   auto memory = initialize_memory_manager(1);
-  sirius_scan_manager manager{scan_manager_config{}, *memory, single_gpu_index()};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, scan_manager_config{}, *memory, single_gpu_index()};
   pin_typed_entry(manager, *memory, "orders", {0, 1}, kInt32);
   duckdb::vector<duckdb::LogicalType> const returned_types{duckdb::LogicalType::BIGINT,
                                                            duckdb::LogicalType::BIGINT};
 
   // nullptr here would read as an unpinned table and route to the disk-native path.
   auto const both = request({0, 1});
-  REQUIRE(manager.find_pinned_entry_for_duckdb_table(
-            kCatalog, kSchema, kTable, &both, &returned_types) != nullptr);
+  REQUIRE(manager.find_pinned_entry_for_duckdb_table(kCatalog,
+                                                     kSchema,
+                                                     kTable,
+                                                     sirius::test::test_table_identity(kTableOid),
+                                                     &both,
+                                                     &returned_types) != nullptr);
+}
+
+TEST_CASE("pin publication includes visibility and uniqueness facts",
+          "[pinned_lookup][scan_manager]")
+{
+  auto memory = initialize_memory_manager(1);
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, scan_manager_config{}, *memory, single_gpu_index()};
+  sirius::scan_manager::pinned_entry_metadata metadata;
+  metadata.mvcc                  = sirius::scan_manager::duckdb_mvcc_metadata{42, {}, 7};
+  metadata.proven_unique_columns = {"c0"};
+  std::ignore                    = manager.insert_pinned_entry(
+    "orders", make_cache_info({0, 1}), {}, {}, {}, {}, {}, std::move(metadata));
+  auto entry = manager.find_pinned_entry_for_duckdb_table(
+    kCatalog, kSchema, kTable, sirius::test::test_table_identity(kTableOid));
+  REQUIRE(entry);
+  REQUIRE(entry->mvcc);
+  CHECK(entry->mvcc->v_base == 42);
+  CHECK(entry->mvcc->checkpoint_iteration == 7);
+  REQUIRE(entry->proven_unique_columns.size() == 2);
+  CHECK(entry->proven_unique_columns[0]);
+  CHECK_FALSE(entry->proven_unique_columns[1]);
 }

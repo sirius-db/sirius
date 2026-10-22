@@ -26,11 +26,46 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <new>
 #include <optional>
 #include <stdexcept>
 #include <variant>
 
 using namespace sirius;
+
+namespace {
+struct allocation_failure {
+  static void from_yaml(const YAML::Node&, allocation_failure&) { throw std::bad_alloc(); }
+};
+}  // namespace
+
+TEST_CASE("yaml reader preserves allocation failures", "[config_opt][allocation]")
+{
+  yaml::reader reader(YAML::Load("value: {}"));
+  allocation_failure value;
+  SECTION("optional") { REQUIRE_THROWS_AS(reader.optional("value", value), std::bad_alloc); }
+  SECTION("optional value")
+  {
+    std::optional<allocation_failure> optional;
+    REQUIRE_THROWS_AS(reader.optional("value", optional), std::bad_alloc);
+  }
+  SECTION("validated")
+  {
+    REQUIRE_THROWS_AS(reader.optional("value", value, [](const auto&) { return true; }),
+                      std::bad_alloc);
+  }
+  SECTION("required") { REQUIRE_THROWS_AS(reader.required("value", value), std::bad_alloc); }
+}
+
+TEST_CASE("operator parameters start with hardware-independent defaults", "[config_opt][defaults]")
+{
+  const operator_params params;
+  CHECK(params.scan_task_batch_size == config::DEFAULT_BATCH_SIZE);
+  CHECK(params.hash_partition_bytes == config::DEFAULT_BATCH_SIZE);
+  CHECK(params.concat_batch_bytes == config::DEFAULT_BATCH_SIZE);
+  CHECK(params.sort_sample_bytes == config::DEFAULT_BATCH_SIZE);
+  CHECK(params.max_build_hash_table_bytes == 2 * config::DEFAULT_BATCH_SIZE);
+}
 
 TEST_CASE("yaml reader basic types", "[config_opt][basic]")
 {
@@ -168,7 +203,7 @@ bi: "1.5Gi")");
     std::uint64_t size = 4096;
     yaml::reader r(node);
     REQUIRE_THROWS_WITH(r.required("size", yaml::bytes(size)),
-                        Catch::Contains("byte value must be non-negative"));
+                        Catch::Matchers::ContainsSubstring("byte value must be non-negative"));
     REQUIRE(size == 4096);
   }
 
@@ -178,7 +213,7 @@ bi: "1.5Gi")");
     std::uint64_t size = 4096;
     yaml::reader r(node);
     REQUIRE_THROWS_WITH(r.required("size", yaml::bytes(size)),
-                        Catch::Contains("byte value must be non-negative"));
+                        Catch::Matchers::ContainsSubstring("byte value must be non-negative"));
     REQUIRE(size == 4096);
   }
 
@@ -188,7 +223,7 @@ bi: "1.5Gi")");
     std::optional<std::uint64_t> size = 4096;
     yaml::reader r(node);
     REQUIRE_THROWS_WITH(r.optional("size", yaml::bytes(size)),
-                        Catch::Contains("byte value must be non-negative"));
+                        Catch::Matchers::ContainsSubstring("byte value must be non-negative"));
     REQUIRE(size == 4096);
   }
 
@@ -198,7 +233,7 @@ bi: "1.5Gi")");
     std::optional<std::uint64_t> size = 4096;
     yaml::reader r(node);
     REQUIRE_THROWS_WITH(r.optional("size", yaml::bytes(size)),
-                        Catch::Contains("byte value must be non-negative"));
+                        Catch::Matchers::ContainsSubstring("byte value must be non-negative"));
     REQUIRE(size == 4096);
   }
 
@@ -230,6 +265,112 @@ bi: "1.5Gi")");
     std::uint64_t size = 0;
     yaml::reader r(node);
     REQUIRE_THROWS_AS(r.optional("size", size), std::runtime_error);
+  }
+
+  SECTION("integers above 2^53 parse exactly")
+  {
+    // 2^53 + 1 is not representable as a double, so parsing through double would round it.
+    constexpr std::uint64_t exact = 9007199254740993ULL;
+    REQUIRE(yaml::parse_bytes("9007199254740993") == exact);
+
+    auto node          = YAML::Load(R"(size: "9007199254740993")");
+    std::uint64_t size = 0;
+    yaml::reader r(node);
+    r.optional("size", yaml::bytes(size));
+    REQUIRE(size == exact);
+  }
+
+  SECTION("uint64 max parses exactly")
+  {
+    constexpr auto exact = std::numeric_limits<std::uint64_t>::max();
+    REQUIRE(yaml::parse_bytes("18446744073709551615") == exact);
+    REQUIRE(yaml::parse_bytes("18446744073709551615B") == exact);
+    REQUIRE(yaml::parse_bytes("18446744073709551615b") == exact);
+
+    auto node          = YAML::Load("size: 18446744073709551615");
+    std::uint64_t size = 0;
+    yaml::reader r(node);
+    r.required("size", yaml::bytes(size));
+    REQUIRE(size == exact);
+
+    auto quoted               = YAML::Load(R"(size: "18446744073709551615")");
+    std::uint64_t quoted_size = 1;
+    yaml::reader quoted_reader(quoted);
+    quoted_reader.optional("size", yaml::bytes(quoted_size));
+    REQUIRE(quoted_size == exact);
+  }
+
+  SECTION("unsuffixed integers above uint64 max are rejected without mutation")
+  {
+    REQUIRE_THROWS_WITH(yaml::parse_bytes("18446744073709551616"),
+                        Catch::Matchers::ContainsSubstring("byte value out of range"));
+
+    auto node          = YAML::Load("size: 18446744073709551616");
+    std::uint64_t size = 4096;
+    yaml::reader r(node);
+    REQUIRE_THROWS_WITH(r.required("size", yaml::bytes(size)),
+                        Catch::Matchers::ContainsSubstring("byte value out of range"));
+    REQUIRE(size == 4096);
+
+    std::optional<std::uint64_t> optional_size = 4096;
+    yaml::reader optional_reader(node);
+    REQUIRE_THROWS_WITH(optional_reader.optional("size", yaml::bytes(optional_size)),
+                        Catch::Matchers::ContainsSubstring("byte value out of range"));
+    REQUIRE(optional_size == 4096);
+  }
+
+  SECTION("suffixed values that do not fit in uint64 are rejected without mutation")
+  {
+    REQUIRE_THROWS_WITH(yaml::parse_bytes("16777216TiB"),
+                        Catch::Matchers::ContainsSubstring("byte value out of range"));
+
+    auto node          = YAML::Load(R"(size: "16777216TiB")");
+    std::uint64_t size = 4096;
+    yaml::reader r(node);
+    REQUIRE_THROWS_WITH(r.required("size", yaml::bytes(size)),
+                        Catch::Matchers::ContainsSubstring("byte value out of range"));
+    REQUIRE(size == 4096);
+
+    std::optional<std::uint64_t> optional_size = 4096;
+    yaml::reader optional_reader(node);
+    REQUIRE_THROWS_WITH(optional_reader.optional("size", yaml::bytes(optional_size)),
+                        Catch::Matchers::ContainsSubstring("byte value out of range"));
+    REQUIRE(optional_size == 4096);
+  }
+
+  SECTION("a scaled value that overflows double is rejected")
+  {
+    // 300 nines fit in double; times TiB the product is non-finite.
+    REQUIRE_THROWS_WITH(yaml::parse_bytes(std::string(300, '9') + ".0TiB"),
+                        Catch::Matchers::ContainsSubstring("byte value out of range"));
+    // 400 nines do not fit in double, so stod itself fails.
+    REQUIRE_THROWS_WITH(yaml::parse_bytes(std::string(400, '9') + ".0TiB"),
+                        Catch::Matchers::ContainsSubstring("byte value out of range"));
+  }
+
+  SECTION("a numeric token must be fully consumed")
+  {
+    REQUIRE_THROWS_WITH(yaml::parse_bytes("1.2.3G"),
+                        Catch::Matchers::ContainsSubstring("invalid byte value"));
+    REQUIRE_THROWS_WITH(yaml::parse_bytes("."),
+                        Catch::Matchers::ContainsSubstring("invalid byte value"));
+  }
+
+  SECTION("largest integer GiB that fits parses exactly")
+  {
+    // 17179869183 GiB == (2^34 - 1) * 2^30 == 2^64 - 2^30, the largest integer GiB count that still
+    // fits. One more GiB is exactly 2^64 and must be rejected.
+    constexpr std::uint64_t exact = 17179869183ULL * 1024ULL * 1024ULL * 1024ULL;
+    static_assert(exact == std::numeric_limits<std::uint64_t>::max() - (1ULL << 30) + 1);
+
+    REQUIRE(yaml::parse_bytes("17179869183GiB") == exact);
+    REQUIRE(yaml::parse_bytes("17179869183 GiB") == exact);
+
+    auto node          = YAML::Load(R"(size: "17179869183GiB")");
+    std::uint64_t size = 0;
+    yaml::reader r(node);
+    r.optional("size", yaml::bytes(size));
+    REQUIRE(size == exact);
   }
 }
 
@@ -694,6 +835,61 @@ TEST_CASE("the dynamic-filter switch is consumed from the operator_params YAML s
   cfg.load_from_file(path);
   CHECK_FALSE(cfg.get_operator_params().enable_dynamic_filter);
 
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+}
+
+TEST_CASE("multi-partition dynamic-filter settings preserve defaults and parse byte budgets",
+          "[config_opt][dynamic_filter][multi_partition]")
+{
+  auto const budget         = GENERATE(std::string{"32MiB"}, std::string{"1024"});
+  auto const expected_bytes = budget == "32MiB" ? 32ULL * 1024 * 1024 : std::stoull(budget);
+  auto const path = std::filesystem::temp_directory_path() / "sirius_dynamic_filter_multi.yaml";
+  {
+    std::ofstream out(path);
+    out << "sirius:\n"
+           "  operator_params:\n"
+           "    enable_dynamic_filter_multi_partition: false\n"
+           "    max_dynamic_filter_bloom_bytes_per_gpu: "
+        << budget << '\n';
+  }
+
+  sirius_config cfg;
+  CHECK(cfg.get_operator_params().enable_dynamic_filter_multi_partition);
+  CHECK(cfg.get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu == 256ULL * 1024 * 1024);
+  cfg.load_from_file(path);
+  CHECK_FALSE(cfg.get_operator_params().enable_dynamic_filter_multi_partition);
+  CHECK(cfg.get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu == expected_bytes);
+  CHECK(cfg.get_operator_params().enable_dynamic_filter);
+  CHECK(cfg.get_operator_params().dynamic_filter_domain_coverage_threshold == Approx(0.9));
+  cfg.apply_defaults();
+  CHECK(cfg.get_operator_params().enable_dynamic_filter_multi_partition);
+  CHECK(cfg.get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu == 256ULL * 1024 * 1024);
+
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+}
+
+TEST_CASE("multi-partition dynamic-filter byte budgets reject zero and negative YAML",
+          "[config_opt][dynamic_filter][multi_partition]")
+{
+  auto const budget = GENERATE(std::string{"-1"}, std::string{"0"});
+  auto const path = std::filesystem::temp_directory_path() / "sirius_dynamic_filter_multi_bad.yaml";
+  {
+    std::ofstream out(path);
+    out << "sirius:\n"
+           "  operator_params:\n"
+           "    max_dynamic_filter_bloom_bytes_per_gpu: "
+        << budget << '\n';
+  }
+  sirius_config cfg;
+  if (budget == "0") {
+    // Zero is not a way to disable accumulation; the message names the switch that is.
+    CHECK_THROWS_WITH(cfg.load_from_file(path),
+                      Catch::Matchers::ContainsSubstring("enable_dynamic_filter_multi_partition"));
+  } else {
+    CHECK_THROWS(cfg.load_from_file(path));
+  }
   std::error_code ec;
   std::filesystem::remove(path, ec);
 }

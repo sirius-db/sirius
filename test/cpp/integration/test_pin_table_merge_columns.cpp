@@ -31,6 +31,7 @@
 
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
+#include "utils/transparent_execution_test_utils.hpp"
 
 #include <catch.hpp>
 #include <duckdb.hpp>
@@ -149,7 +150,7 @@ TEST_CASE("pin_table - same-row-count merge extends cache_info to the column uni
 
     auto sirius_ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
     REQUIRE(sirius_ctx != nullptr);
-    auto const stats_before = sirius_ctx->get_compressed_materialization_stats();
+    auto const stats_before = sirius::test::get_compressed_materialization_stats(con);
 
     // First pin: columns [k, v].
     auto pin1 = con.Query("CALL pin_table('" + parquet_path.string() +
@@ -165,7 +166,7 @@ TEST_CASE("pin_table - same-row-count merge extends cache_info to the column uni
     REQUIRE(pin2);
     if (pin2->HasError()) { UNSCOPED_INFO("pin_table 2 error: " << pin2->GetError()); }
     REQUIRE_FALSE(pin2->HasError());
-    auto const stats_after = sirius_ctx->get_compressed_materialization_stats();
+    auto const stats_after = sirius::test::get_compressed_materialization_stats(con);
     REQUIRE(stats_after.pin_columns_narrowed > stats_before.pin_columns_narrowed);
 
     auto const& mgr = sirius_ctx->get_scan_manager();
@@ -220,12 +221,10 @@ TEST_CASE("pin_table - same-row-count merge extends cache_info to the column uni
     REQUIRE(sum_w);
     if (sum_w->HasError()) { UNSCOPED_INFO("sum(w) error: " << sum_w->GetError()); }
     REQUIRE_FALSE(sum_w->HasError());
-    REQUIRE(sum_w->GetValue(0, 0).ToString() == std::to_string(expected_w_sum));
+    REQUIRE(sum_w->Collection().GetValue(0, 0).ToString() == std::to_string(expected_w_sum));
 
-    // A re-pin whose chunk shape disagrees with the existing entry must report the merge
-    // mismatch itself. A host pin holds no chunk_memory_spaces, so re-pinning the same name on
-    // the GPU tier fails the very first merge guard; the storage-matrix shape check runs after
-    // the guards, so the diagnosis names the boundary disagreement and not a matrix shape.
+    // A host pin cannot be extended by the column-major GPU merge path. Report that storage
+    // incompatibility explicitly, before any chunk-boundary or storage-matrix shape check.
     auto host_pin = con.Query("CALL pin_table('" + parquet_path.string() +
                               "', tier='host', name='tier_swap', cols=['k']);");
     REQUIRE(host_pin);
@@ -237,7 +236,8 @@ TEST_CASE("pin_table - same-row-count merge extends cache_info to the column uni
     REQUIRE(gpu_repin);
     REQUIRE(gpu_repin->HasError());
     UNSCOPED_INFO("re-pin error: " << gpu_repin->GetError());
-    REQUIRE(gpu_repin->GetError().find("merge mismatch") != std::string::npos);
+    REQUIRE(gpu_repin->GetError().find("existing pin does not use column-major GPU storage") !=
+            std::string::npos);
     REQUIRE(gpu_repin->GetError().find("column_storage") == std::string::npos);
 
     auto unpin_swap = con.Query("CALL unpin_table('tier_swap');");

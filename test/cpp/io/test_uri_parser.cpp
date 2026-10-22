@@ -18,6 +18,8 @@
 #include "io/uri_parser.hpp"
 
 #include <stdexcept>
+#include <string>
+#include <string_view>
 
 using sirius::io::parse;
 
@@ -85,7 +87,27 @@ TEST_CASE("uri_parser applies the literal S3 path to uppercase schemes", "[uri_p
   CHECK(parsed.query.empty());
 }
 
-TEST_CASE("uri_parser preserves S3 leading slashes in object key", "[uri_parser]")
+TEST_CASE("uri_parser keeps S3 keys byte for byte including encoded slashes and spaces",
+          "[uri_parser][s3]")
+{
+  for (auto const key : {std::string_view{"a%2Fb.p"},
+                         std::string_view{"a%20b.p"},
+                         std::string_view{"a#b.p"},
+                         std::string_view{"a?b.p"},
+                         std::string_view{"100%x.p"},
+                         std::string_view{"plain.parquet"},
+                         std::string_view{"year=2026/part 0.parquet"},
+                         std::string_view{"nested/path/file.parquet"}}) {
+    DYNAMIC_SECTION("key=" << key)
+    {
+      auto const parsed = parse("s3://bkt/" + std::string{key});
+      CHECK(parsed.host == "bkt");
+      CHECK(parsed.path == key);
+    }
+  }
+}
+
+TEST_CASE("uri_parser preserves S3 leading slashes in object key", "[uri_parser][s3]")
 {
   CHECK(parse("s3://bucket/key").path == "key");
   CHECK(parse("s3://bucket//key").path == "/key");
@@ -138,8 +160,6 @@ TEST_CASE("uri_parser rejects malformed input", "[uri_parser]")
   CHECK_THROWS_AS(parse("./file.parquet"), std::invalid_argument);
   CHECK_THROWS_AS(parse("://bucket/key"), std::invalid_argument);
   CHECK_THROWS_AS(parse("file://relative/path"), std::invalid_argument);
-  CHECK_THROWS_AS(parse("s3://bucket"), std::invalid_argument);
-  CHECK_THROWS_AS(parse("s3://bucket/"), std::invalid_argument);
 }
 
 //===----------------------------------------------------------------------===//
@@ -160,13 +180,6 @@ TEST_CASE("uri_parser rejects malformed input", "[uri_parser]")
 
 using sirius::io::strip_file_scheme;
 
-TEST_CASE("strip_file_scheme removes a file:// scheme", "[uri_parser]")
-{
-  CHECK(strip_file_scheme("file:///abs/path.parquet") == "/abs/path.parquet");
-  CHECK(strip_file_scheme("file:///var/tmp/t/data/00000-0-abc.parquet") ==
-        "/var/tmp/t/data/00000-0-abc.parquet");
-}
-
 TEST_CASE("strip_file_scheme handles every legal file URI form", "[uri_parser]")
 {
   // https://iceberg.apache.org/spec/#paths-in-metadata points at the file URI scheme, which has
@@ -174,6 +187,8 @@ TEST_CASE("strip_file_scheme handles every legal file URI form", "[uri_parser]")
   // poisons the connection rather than declining at plan time.
   CHECK(strip_file_scheme("file:/abs/path.parquet") == "/abs/path.parquet");
   CHECK(strip_file_scheme("file:///abs/path.parquet") == "/abs/path.parquet");
+  CHECK(strip_file_scheme("file:///var/tmp/t/data/00000-0-abc.parquet") ==
+        "/var/tmp/t/data/00000-0-abc.parquet");
   CHECK(strip_file_scheme("file://localhost/abs/path.parquet") == "/abs/path.parquet");
 }
 

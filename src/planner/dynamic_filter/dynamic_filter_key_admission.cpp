@@ -18,10 +18,12 @@
 
 #include "cudf/cudf_utils.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/joinside.hpp"
 #include "expression/ast/node.hpp"
 #include "expression/ast/reference.hpp"
 #include "helper/type_conversions.hpp"
+#include "op/dynamic_filter/dynamic_filter_key_domain.hpp"
 
 #include <cstdint>
 #include <limits>
@@ -70,7 +72,7 @@ std::optional<op::dynamic_filter_publish_plan::admitted_key> admit_scan_route_ke
   if (!condition.right->is_reference()) { return std::nullopt; }
   auto const& build_ref = condition.right->as_reference();
 
-  auto const storage_type = sirius::try_get_cudf_type(build_ref.return_type());
+  auto const storage_type = sirius::get_cudf_type(build_ref.return_type());
   if (!storage_type.has_value()) { return std::nullopt; }
 
   auto const build_key_ordinal = to_key_column_ordinal(build_ref.column_index);
@@ -79,7 +81,7 @@ std::optional<op::dynamic_filter_publish_plan::admitted_key> admit_scan_route_ke
   auto const& probe_side = *condition.left;
   if (!probe_side.is_reference()) { return std::nullopt; }
   auto const probe_key_ordinal  = to_key_column_ordinal(probe_side.as_reference().column_index);
-  auto const probe_storage_type = sirius::try_get_cudf_type(probe_side.as_reference().return_type())
+  auto const probe_storage_type = sirius::get_cudf_type(probe_side.as_reference().return_type())
                                     .value_or(cudf::data_type{cudf::type_id::EMPTY});
 
   return op::dynamic_filter_publish_plan::admitted_key{
@@ -102,9 +104,9 @@ op::dynamic_filter_key_shape classify_key_side(duckdb::Expression const& key_sid
   if (expression_class == duckdb::ExpressionClass::BOUND_REF) {
     return op::dynamic_filter_key_shape::direct;
   }
-  if (expression_class == duckdb::ExpressionClass::BOUND_CAST) {
-    return key_side.Cast<duckdb::BoundCastExpression>().child->GetExpressionClass() ==
-               duckdb::ExpressionClass::BOUND_REF
+  if (duckdb::BoundCastExpression::IsCast(key_side)) {
+    return duckdb::BoundCastExpression::Child(key_side.Cast<duckdb::BoundFunctionExpression>())
+                 .GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF
              ? op::dynamic_filter_key_shape::cast
              : op::dynamic_filter_key_shape::computed;
   }
@@ -117,8 +119,9 @@ std::vector<op::dynamic_filter_condition_shape> classify_join_key_shapes(
   std::vector<op::dynamic_filter_condition_shape> shapes;
   shapes.reserve(conditions.size());
   for (auto const& condition : conditions) {
-    shapes.push_back(op::dynamic_filter_condition_shape{
-      .probe = classify_key_side(*condition.left), .build = classify_key_side(*condition.right)});
+    shapes.push_back(
+      op::dynamic_filter_condition_shape{.probe = classify_key_side(condition.GetLHS()),
+                                         .build = classify_key_side(condition.GetRHS())});
   }
   return shapes;
 }
@@ -168,8 +171,7 @@ bool direct_route_admissible(duckdb::JoinType join_type,
   bool const shapes_supported = shape.probe == op::dynamic_filter_key_shape::direct &&
                                 shape.build == op::dynamic_filter_key_shape::direct;
   bool const storage_type_supported =
-    probe_storage_type == build_storage_type && (build_storage_type.id() == cudf::type_id::INT32 ||
-                                                 build_storage_type.id() == cudf::type_id::INT64);
+    probe_storage_type == build_storage_type && op::membership_key_supported(build_storage_type);
   return join_type_supported && comparison == sirius::comparison_type::equal && shapes_supported &&
          storage_type_supported;
 }

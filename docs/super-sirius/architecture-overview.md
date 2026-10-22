@@ -39,7 +39,7 @@ graph TD
 
 ## Ownership Hierarchy
 
-`SiriusContext` (`src/include/sirius_context.hpp`) is a `ClientContextState` subclass that owns the lifetime of all Sirius subsystems within a DuckDB connection:
+`SiriusContext` (`src/sirius_context.hpp`) is a `ClientContextState` subclass that owns the lifetime of all Sirius subsystems within a DuckDB connection:
 
 ```
 SiriusContext
@@ -130,8 +130,8 @@ A query through Super Sirius follows these steps:
    - Converts each TABLE_SCAN source into a unified GPU scan source with a per-table `gpu_ingestible`
    - Injects PARTITION, CONCAT, MERGE operators at pipeline boundaries
    - Wires data repositories between pipelines with barrier types
-4. **Query Preparation** — `sirius_engine::execute()` creates the query's `completion_handler` and calls `SiriusContext::create_query()`, which registers per-query state: `task_creator::prepare_for_query()` stamps the handler onto every pipeline's task global state and onto query-terminal pipelines, and `sirius_scan_manager::prepare_for_query()` builds each scan's split provider, installs its split connector, and matches any pinned-cache entries
-5. **Query Start** — `task_scheduler::start_query(query)` schedules the initial scan operator; the engine blocks on the future of the handler it owns
+4. **Query Preparation** — `sirius_engine::execute()` creates this query's `completion_handler` and future. `SiriusContext::create_query()` passes the handler to `task_creator::prepare_for_query()`, which makes it available to the query's pipeline tasks, while `sirius_scan_manager::prepare_for_query()` registers per-query scan state, builds split providers, and matches pinned-cache entries
+5. **Query Start** — `task_scheduler::start_query(query)` schedules the initial scan operator; the engine waits on the future it already owns
 6. **Scan Phase** — The scan manager drives split providers that pull bytes through the `io_context` (io_uring locally, or REST/kvikio backends) and the prefetching cache; the unified GPU scan source consumes splits and materializes GPU-ready batches into data repositories
 7. **Pipeline Execution** — GPU executor threads pull tasks from the queue, acquire memory reservations, and call `execute()` on every operator in the pipeline (source through sink) on CUDA streams, then call the sink's `sink()` to push results downstream
 8. **Task Creation** — After each task completes, the task creator is notified to schedule downstream consumers based on data availability in ports
@@ -143,17 +143,17 @@ A query through Super Sirius follows these steps:
 
 | File | Role |
 |------|------|
-| `src/include/sirius_context.hpp` | Ownership hierarchy, subsystem lifecycle |
+| `src/sirius_context.hpp` | Ownership hierarchy, subsystem lifecycle |
 | `src/sirius_extension.cpp` | Extension registration, table functions, config |
 | `src/sirius_interface.cpp` | DuckDB-facing API, query lifecycle |
 | `src/sirius_engine.cpp` | Pipeline construction, execution orchestration |
 | `src/planner/sirius_physical_plan_generator.cpp` | Logical-to-physical plan translation |
-| `src/include/pipeline/task_scheduler.hpp` | Top-level executor (owns GPU executors) |
-| `src/include/pipeline/gpu_pipeline_executor.hpp` | Per-GPU task executor |
-| `src/include/creator/task_creator.hpp` | Task creation and scheduling |
-| `src/include/op/scan/sirius_gpu_scan_operator.hpp` | Unified GPU scan source operator |
-| `src/include/op/scan/gpu_ingestible.hpp` | Per-format split materialization (parquet, duckdb-native) |
-| `src/include/scan_manager/sirius_scan_manager.hpp` | Per-scan preparation, split providers, I/O ownership |
-| `src/include/io/io_context.hpp` | I/O backends (uring / rest / kvikio) + prefetch cache |
-| `src/include/downgrade/downgrade_executor.hpp` | Memory spilling |
-| `src/include/memory/sirius_memory_reservation_manager.hpp` | Memory management |
+| `src/pipeline/task_scheduler.hpp` | Top-level executor (owns GPU executors) |
+| `src/pipeline/gpu_pipeline_executor.hpp` | Per-GPU task executor |
+| `src/creator/task_creator.hpp` | Task creation and scheduling |
+| `src/op/scan/sirius_gpu_scan_operator.hpp` | Unified GPU scan source operator |
+| `src/op/scan/gpu_ingestible.hpp` | Per-format split materialization (parquet, duckdb-native) |
+| `src/scan_manager/sirius_scan_manager.hpp` | Per-scan preparation, split providers, I/O ownership |
+| `src/io/io_context.hpp` | I/O backends (uring / rest / kvikio) + prefetch cache |
+| `src/downgrade/downgrade_executor.hpp` | Memory spilling |
+| `src/memory/sirius_memory_reservation_manager.hpp` | Memory management |

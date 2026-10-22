@@ -89,7 +89,7 @@ Ten changes, each measured in isolation on this machine.
 | 1 | `expression_evaluator_strategy = 'ast_jit'` | **−4.17% suite** (q6 −49.7%, q12 −21.9%, q14/q15 −24%, q1 −8.8%) | **config only** — `src/config.cpp:27` ships the slow `AST_INTERPRET` |
 | 2 | cuDF `strings::like` backtrack skip | **q13 −36.5%** | `felipeblazing/cudf` `4a345cc` |
 | 3 | q17 `LOGICAL_DELIM_GET` in `build_side_is_derived` | −6.7% suite | `sirius_plan_comparison_join.cpp` |
-| 4 | `interruptible_mpmc` wake-up sentinels | −5.7% suite | `src/include/exec/interruptible_mpmc.hpp` |
+| 4 | `interruptible_mpmc` wake-up sentinels | −5.7% suite | `src/exec/interruptible_mpmc.hpp` |
 | 5 | q16 count-distinct → radix-sortable label | **q16 −39.0%** | `gpu_aggregate_impl.cpp` |
 | 6 | q19 OR-branch derivation + dictionary predicate pushdown | −3.0% suite, q19 −21.4% | optimizer hook + scan |
 | 7 | `scan_task_batch_size` 5GB → 8GB | −1.85% (q4 −25%, q12 −18%) | config only |
@@ -154,7 +154,7 @@ first-iteration cost fell 28.99 s → 10.50 s on a warm cache.
 - **~256 GB GPU.** Peak usage is **251.7 GB of 256 GB**. There is under 2 GB of headroom; this
   will not run on a smaller card without lowering `scan_task_batch_size` and re-tuning.
 - **~470 GB host RAM** for the host memory pool (`capacity_bytes` in the YAML).
-- The pixi environment (`pixi run …`). Do not use a bare `build/release/duckdb` — see *Gotchas*.
+- The pixi environment (`pixi run …`). Do not use a bare `sirius-duckdb/build/release/duckdb` — see *Gotchas*.
 
 ---
 

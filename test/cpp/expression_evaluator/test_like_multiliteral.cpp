@@ -98,7 +98,7 @@ std::unique_ptr<cudf::column> make_strings(std::vector<std::string> const& rows,
     stream.sync();  // offsets32 goes out of scope here
   }
 
-  rmm::device_buffer mask_buf{};
+  auto mask_buf              = cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr);
   cudf::size_type null_count = 0;
   if (!valids.empty()) {
     // cudf null masks must be padded to bitmask_allocation_size_bytes (64B multiples).
@@ -111,8 +111,12 @@ std::unique_ptr<cudf::column> make_strings(std::vector<std::string> const& rows,
         ++null_count;
       }
     }
-    mask_buf = rmm::device_buffer(
-      mask_words.data(), mask_words.size() * sizeof(cudf::bitmask_type), stream, mr);
+    mask_buf = cudf::create_null_mask(n, cudf::mask_state::UNINITIALIZED, stream, mr);
+    cudaMemcpyAsync(mask_buf.data(),
+                    mask_words.data(),
+                    mask_words.size() * sizeof(cudf::bitmask_type),
+                    cudaMemcpyHostToDevice,
+                    stream.get());
   }
 
   auto col = cudf::make_strings_column(

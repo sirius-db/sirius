@@ -56,9 +56,7 @@ std::vector<OperatorInfo> const& operator_registry()
     {OpId::Bitextract,     "bitextract",      {},                                                                     true,  false, true,  false},
     {OpId::Identity,       "identity",        {"data"},                                                               false, false, false, false},
     {OpId::NvcompCascaded, "nvcomp_cascaded", {"output"},                                                             false, false, false, false},
-    // 2 or 3 channels: offsets, chars[, null_mask]. null_mask is optional (present only when
-    // nullable); the generic named_channels() skips nullptr slots so arity is correct at runtime.
-    {OpId::StrSplit,       "str_split",       {"offsets", "chars", "null_mask"},                                     true,  false, true,  false},
+    {OpId::StrSplit,       "str_split",       {"offsets", "chars"},                                                   true,  false, true,  false},
   };
   // clang-format on
   return kTable;
@@ -152,6 +150,7 @@ std::unique_ptr<compressor> make_compressor(std::string const& name)
   auto id = op_id_from_name(name);
   if (!id) return nullptr;
   switch (*id) {
+    case OpId::Unknown: return nullptr;
     case OpId::Identity: return std::make_unique<identity_compressor>();
     case OpId::Dictionary: return std::make_unique<dictionary_compressor>();
     case OpId::StrSplit: return std::make_unique<str_split_compressor>();

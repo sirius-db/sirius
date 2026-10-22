@@ -1,0 +1,156 @@
+Explain String(Nereids Planner)
+PLAN FRAGMENT 0
+  OUTPUT EXPRS:
+    avg_yearly[#66]
+  PARTITION: UNPARTITIONED
+
+  HAS_COLO_PLAN_NODE: true
+
+  VRESULT SINK
+     MYSQL_PROTOCOL
+
+  12:VAGGREGATE (merge finalize)(883)
+  |  output: sum(partial_sum(l_extendedprice)[#64])[#65]
+  |  group by: 
+  |  sortByGroupKey:false
+  |  cardinality=1
+  |  final projections: (CAST(sum(l_extendedprice)[#65] AS decimalv3(38,7)) / 7.0)
+  |  final project output tuple id: 14
+  |  distribute expr lists: 
+  |  
+  11:VEXCHANGE
+     offset: 0
+     distribute expr lists: 
+
+PLAN FRAGMENT 1
+
+  PARTITION: HASH_PARTITIONED: l_partkey[#48]
+
+  HAS_COLO_PLAN_NODE: true
+
+  STREAM DATA SINK
+    EXCHANGE ID: 11
+    UNPARTITIONED
+
+  10:VAGGREGATE (update serialize)(875)
+  |  output: partial_sum(l_extendedprice[#63])[#64]
+  |  group by: 
+  |  sortByGroupKey:false
+  |  cardinality=1
+  |  distribute expr lists: 
+  |  
+  9:VHASH JOIN(867)
+  |  join op: INNER JOIN(PARTITIONED)[]
+  |  equal join conjunct: (p_partkey[#57] = l_partkey[#20])
+  |  other join predicates: (CAST(l_quantity[#58] AS decimalv3(38,5)) < (0.2 * avg(l_quantity)[#62]))
+  |  cardinality=1
+  |  vec output tuple id: 11
+  |  output tuple id: 11
+  |  vIntermediate tuple ids: 10 
+  |  hash output slot ids: 21 55 56 
+  |  final projections: l_extendedprice[#59]
+  |  final project output tuple id: 11
+  |  distribute expr lists: p_partkey[#57]
+  |  distribute expr lists: l_partkey[#20]
+  |  
+  |----3:VAGGREGATE (merge finalize)(863)
+  |    |  output: avg(partial_avg(l_quantity)[#19])[#21]
+  |    |  group by: l_partkey[#18]
+  |    |  sortByGroupKey:false
+  |    |  cardinality=0
+  |    |  distribute expr lists: l_partkey[#18]
+  |    |  
+  |    2:VEXCHANGE
+  |       offset: 0
+  |       distribute expr lists: 
+  |    
+  8:VHASH JOIN(842)
+  |  join op: INNER JOIN(PARTITIONED)[]
+  |  equal join conjunct: (l_partkey[#48] = p_partkey[#31])
+  |  cardinality=1
+  |  vec output tuple id: 9
+  |  output tuple id: 9
+  |  vIntermediate tuple ids: 8 
+  |  hash output slot ids: 49 50 31 
+  |  final projections: l_quantity[#52], l_extendedprice[#53], p_partkey[#54]
+  |  final project output tuple id: 9
+  |  distribute expr lists: l_partkey[#48]
+  |  distribute expr lists: p_partkey[#31]
+  |  
+  |----5:VEXCHANGE
+  |       offset: 0
+  |       distribute expr lists: 
+  |    
+  7:VEXCHANGE
+     offset: 0
+     distribute expr lists: 
+
+PLAN FRAGMENT 2
+
+  PARTITION: RANDOM
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 07
+    HASH_PARTITIONED: l_partkey[#48]
+
+  6:VTVF_SCAN_NODE(817)
+     table: null.null.LocalTableValuedFunction
+     inputSplitNum=1, totalFileSize=162140518, scanRanges=1
+     partition=0/0
+     numNodes=2
+     pushdown agg=NONE
+     final projections: _tvf_local.l_partkey[#33], _tvf_local.l_quantity[#36], _tvf_local.l_extendedprice[#37]
+     final project output tuple id: 7
+
+PLAN FRAGMENT 3
+
+  PARTITION: RANDOM
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 05
+    HASH_PARTITIONED: p_partkey[#31]
+
+  4:VTVF_SCAN_NODE(826)
+     table: null.null.LocalTableValuedFunction
+     predicates: (_tvf_local.p_brand[#25] = 'Brand#23'), (_tvf_local.p_container[#28] = 'MED BOX')
+     inputSplitNum=1, totalFileSize=5130885, scanRanges=1
+     partition=0/0
+     numNodes=2
+     pushdown agg=NONE
+     final projections: _tvf_local.p_partkey[#22]
+     final project output tuple id: 5
+
+PLAN FRAGMENT 4
+
+  PARTITION: RANDOM
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 02
+    HASH_PARTITIONED: l_partkey[#18]
+
+  1:VAGGREGATE (update serialize)(855)
+  |  STREAMING
+  |  output: partial_avg(l_quantity[#17])[#19]
+  |  group by: l_partkey[#16]
+  |  sortByGroupKey:false
+  |  cardinality=0
+  |  distribute expr lists: 
+  |  
+  0:VTVF_SCAN_NODE(847)
+     table: null.null.LocalTableValuedFunction
+     inputSplitNum=1, totalFileSize=162140518, scanRanges=1
+     partition=0/0
+     numNodes=2
+     pushdown agg=NONE
+     final projections: _tvf_local.l_partkey[#1], _tvf_local.l_quantity[#4]
+     final project output tuple id: 1
+
+
+
+========== STATISTICS ==========

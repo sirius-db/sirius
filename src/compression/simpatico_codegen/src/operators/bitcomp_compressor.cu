@@ -23,10 +23,10 @@
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
+#include <cuda/stream>
 #include <cuda_runtime.h>
 
 #include <nvcomp/bitcomp.h>
@@ -106,20 +106,19 @@ bool parse_bitcomp_suffix(std::string_view suffix, int* algorithm)
 }
 
 std::unique_ptr<cudf::column> bitcomp_compressed_representation::decompress(
-  rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr) const
+  decode_frame& frame) const
 {
   return detail::nvcomp_decompress_impl(make_bitcomp_ops(compress_algorithm),
                                         payload_data(),
                                         payload_size(),
                                         original_type,
                                         num_rows,
-                                        stream,
-                                        mr);
+                                        frame);
 }
 
 std::unique_ptr<compressed_representation> bitcomp_compressor::compress(
   cudf::column_view column_to_compress,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
   auto const dt = column_to_compress.type();

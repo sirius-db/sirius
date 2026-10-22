@@ -21,7 +21,9 @@ The `sirius_physical_plan_generator::create_plan()` method is the entry point. I
 | `LOGICAL_PROJECTION` | `PROJECTION` | `src/planner/sirius_plan_projection.cpp` |
 | `LOGICAL_FILTER` | `FILTER` | `src/planner/sirius_plan_filter.cpp` |
 | `LOGICAL_AGGREGATE_AND_GROUP_BY` | `HASH_GROUP_BY` / `UNGROUPED_AGGREGATE` | `src/planner/sirius_plan_aggregate.cpp` |
+| `LOGICAL_DISTINCT` | `HASH_GROUP_BY` (zero aggregates) | `src/planner/sirius_plan_distinct.cpp` (some shapes fall back to CPU) |
 | `LOGICAL_COMPARISON_JOIN` | `HASH_JOIN` / `NESTED_LOOP_JOIN` | `src/planner/sirius_plan_comparison_join.cpp` |
+| `LOGICAL_CROSS_PRODUCT` | `NESTED_LOOP_JOIN` (no conditions) | `src/planner/sirius_plan_cross_product.cpp` |
 | `LOGICAL_DELIM_JOIN` | `LEFT_DELIM_JOIN` / `RIGHT_DELIM_JOIN` | `src/planner/sirius_plan_comparison_join.cpp` |
 | `LOGICAL_ORDER_BY` | `ORDER_BY` | `src/planner/sirius_plan_order.cpp` |
 | `LOGICAL_TOP_N` | `TOP_N` | `src/planner/sirius_plan_top_n.cpp` |
@@ -34,10 +36,12 @@ The `sirius_physical_plan_generator::create_plan()` method is the entry point. I
 | `LOGICAL_DUMMY_SCAN` | `DUMMY_SCAN` | `src/planner/sirius_plan_dummy_scan.cpp` |
 | `LOGICAL_EMPTY_RESULT` | `EMPTY_RESULT` | `src/planner/sirius_plan_empty_result.cpp` |
 
-**Unsupported operators** (throw `NotImplementedException`, triggering CPU fallback):
-`LOGICAL_WINDOW`, `LOGICAL_UNNEST`, `LOGICAL_SAMPLE`, `LOGICAL_ANY_JOIN`, `LOGICAL_ASOF_JOIN`, `LOGICAL_CROSS_PRODUCT`, `LOGICAL_RECURSIVE_CTE`
+`LOGICAL_DELIM_JOIN` reaches Sirius because Sirius loads with DuckDB's `delim_join_as_cte` defaulting to `false`. With the setting at DuckDB v2's own default (`true`), the same subqueries arrive as `LOGICAL_MATERIALIZED_CTE` plus `LOGICAL_CTE_REF` and ordinary semi, anti and mark joins; see [DuckDB Settings Changed by Sirius](configuration.md#duckdb-settings-changed-by-sirius).
 
-**Unsupported expressions** are rejected the same way, during plan construction rather than at execution time. Wherever a plan builder translates a DuckDB expression via `sirius::ast::from_duckdb()`, a `nullptr` result (untranslatable expression) throws `NotImplementedException` so the query falls back to CPU instead of reaching the GPU evaluator with a hole in its expression list. Rejection sites: projections (`sirius_plan_projection.cpp`), filter predicates (`sirius_plan_filter.cpp`), pushed-down scan filters (`sirius_plan_get.cpp`, `src/op/scan/parquet_gpu_ingestible.cpp`, `sirius_physical_table_scan.cpp` — where a *skipped* pushdown translation is distinguished from a *failed* one so a predicate is never silently dropped), and join conditions (`src/expression/join_condition.cpp`). Nested-typed (STRUCT/LIST/MAP) columns are accepted for scan and projection passthrough but rejected as *operands* — in WHERE, GROUP BY, JOIN ON, and sort keys (`sirius_plan_order.cpp`, `sirius_plan_top_n.cpp`) — via `reject_nested_column_operation()` in `sirius_physical_plan_generator.cpp`. Two further non-operator reject conditions: any plan node whose output types contain `SQLNULL` (e.g. an uncast `NULL` in `VALUES`), and any aggregate expression the translator declines (e.g. ORDER BY aggregates lowered to `arg_min_null`/`create_sort_key`) — both throw in `sirius_physical_plan_generator.cpp` / `sirius_plan_aggregate.cpp`. Because rejection is a plan-capability decision, an unsupported expression falls back even when the input is empty.
+**Unsupported operators** (throw `NotImplementedException`, triggering CPU fallback):
+`LOGICAL_WINDOW`, `LOGICAL_UNNEST`, `LOGICAL_SAMPLE`, `LOGICAL_ANY_JOIN`, `LOGICAL_ASOF_JOIN`, `LOGICAL_RECURSIVE_CTE`
+
+**Unsupported expressions** are rejected the same way, during plan construction rather than at execution time. Wherever a plan builder translates a DuckDB expression via `sirius::ast::from_duckdb()`, a `nullptr` result (untranslatable expression) throws `NotImplementedException` so the query falls back to CPU instead of reaching the GPU evaluator with a hole in its expression list. Rejection sites: projections (`sirius_plan_projection.cpp`), filter predicates (`sirius_plan_filter.cpp`), pushed-down scan filters (`sirius_plan_get.cpp`, `src/op/scan/parquet_gpu_ingestible.cpp`, `sirius_physical_table_scan.cpp` — where a *skipped* pushdown translation is distinguished from a *failed* one so a predicate is never silently dropped), and join conditions (`src/expression/join_condition.cpp`). Nested-typed (STRUCT/LIST/MAP) columns are accepted for scan and projection passthrough but rejected as *operands* — in WHERE, GROUP BY, DISTINCT, JOIN ON, and sort keys (`sirius_plan_order.cpp`, `sirius_plan_top_n.cpp`) — via `reject_nested_column_operation()` in `sirius_physical_plan_generator.cpp`. Two further non-operator reject conditions: any plan node whose output types contain `SQLNULL` (e.g. an uncast `NULL` in `VALUES`), and any aggregate expression the translator declines (e.g. ORDER BY aggregates lowered to `arg_min_null`/`create_sort_key`) — both throw in `sirius_physical_plan_generator.cpp` / `sirius_plan_aggregate.cpp`. Because rejection is a plan-capability decision, an unsupported expression falls back even when the input is empty.
 
 ### Join Planning
 
@@ -54,16 +58,29 @@ Left side = probe (streamed), right side = build (materialized).
 
 Before either is chosen, `materialize_expression_join_keys()` pushes a projection below the join that turns complex equality-key expressions into real columns, rewriting the condition side to a plain reference so `PARTITION` (which hashes by column index) can consume it. It also materializes the *cast* on a null-safe key that will be routed to the mixed join's cuDF AST predicate: a routed key skips the hash-key path's `cudf::cast`, and a cuDF AST can only cast to INT64 / UINT64 / FLOAT64, so e.g. the INTEGER cast DuckDB inserts for a SMALLINT/INTEGER `IS NOT DISTINCT FROM` has to become a column. `are_conditions_supported()` rejects any routed null-safe key still carrying an untranslatable expression, so the join lands on the nested loop join (or CPU) instead of throwing mid-query.
 
+A `LOGICAL_CROSS_PRODUCT` (`CROSS JOIN`, a comma join without a join predicate, `JOIN ... ON true`) becomes a `NESTED_LOOP_JOIN` without conditions (`src/planner/sirius_plan_cross_product.cpp`).
+
 ### Aggregate Planning
 
 **File:** `src/planner/sirius_plan_aggregate.cpp`
 
 - **Ungrouped aggregate** — when no GROUP BY columns exist
 - **Grouped aggregate** — hash-based GROUP BY using cuDF's `groupby()` API
+- **Decimal SUM bounds** — before the child is planned, `resolve_decimal_sum_input_bounds()` (`src/planner/decimal_sum_input_bounds.cpp`) traces each decimal SUM or AVG input to its base scan with `resolve_scan_column_origin()` (`src/planner/scan_column_origin.cpp`, the tracer the dynamic-filter key-domain estimate also uses) under its value-preserving policy, which accepts bare-reference projections, filters, sorts, limits, DISTINCT, group keys and either side of any join or cross product, then reads the table function's column statistics. The resulting magnitude bound lets the aggregate operators decide from the batch row count instead of scanning the batch whether a DECIMAL32/DECIMAL64 SUM must be widened or a DECIMAL128 SUM can run over DECIMAL64; unproven inputs keep the per-batch scan, and a bound beyond 64 bits counts as unproven. Gated by `sirius.operator_params.enable_decimal_sum_stats_bound`.
 - **AVG decomposition** — AVG is split into SUM + COUNT_VALID (cuDF doesn't support AVG directly)
 - **COUNT(DISTINCT)** — implemented via `COLLECT_SET` aggregation, then counting unique rows
 - **HUGEINT downcast** — HUGEINT types are downcast to BIGINT (cuDF doesn't support int128)
 - **Unsupported aggregate expressions** — `translate_expressions()` rejects any aggregate expression `from_duckdb` cannot translate (see *Unsupported expressions* above), and `can_use_partitioned_aggregate()` declines on a failed translation
+
+### Distinct Planning
+
+**File:** `src/planner/sirius_plan_distinct.cpp`
+
+`LOGICAL_DISTINCT` becomes a single `sirius_physical_grouped_aggregate` with an empty aggregate list. The distinct targets are the group keys, so deduplication is grouping with nothing to compute per group, and `insert_gpu_pipeline_operators` wraps the result exactly as it wraps a GROUP BY.
+
+- **Reorder projection** — pushed above the aggregate only when a key sits at an output position other than its own (`SELECT DISTINCT ON (b, a) a, b`). Plain `SELECT DISTINCT a, b` never needs one: the binder synthesizes one target per select-list entry, so every output column is already a key at its own position
+- **Unsupported shapes** — refused during `create_plan`, so each is a plan-time CPU fallback: a DISTINCT over a `LOGICAL_UNION`, through any identity projection (how the binder lowers a distinct `UNION`), an output column that no distinct target covers (it would need a grouped `FIRST`, which Sirius cannot lower yet), `DISTINCT ON` under an `ORDER BY`, a node with no distinct targets, a VARCHAR key under a non-binary `default_collation`, a nested key (`reject_nested_column_operation()`), and a child whose output schema disagrees with the types the node declares other than by the aggregate builder's HUGEINT→BIGINT narrowing (`planned_aggregate_type()`)
+- **The ordered guard tests `LogicalDistinct::order_by`, not `distinct_type`** — the binder sets `order_by` only for a `DISTINCT ON` under an `ORDER BY`, so a plain `SELECT DISTINCT a, b FROM t ORDER BY a` runs on the GPU with its `ORDER BY` as a separate `LOGICAL_ORDER` above the node. A `distinct_type == DISTINCT_ON` check would also send every unordered `DISTINCT ON` (e.g. `SELECT DISTINCT ON (a) a`) to the CPU
 
 ### Filter Pushdown
 
@@ -90,7 +107,7 @@ Composition substitutes each outer select-list reference (`#i`) with a clone of 
 
 ### `sirius_pipeline`
 
-**File:** `src/include/pipeline/sirius_pipeline.hpp`
+**File:** `src/pipeline/sirius_pipeline.hpp`
 
 A pipeline is an ordered list of operators:
 
@@ -116,7 +133,7 @@ Key methods:
 
 ### `sirius_meta_pipeline`
 
-**File:** `src/include/pipeline/sirius_meta_pipeline.hpp`
+**File:** `src/pipeline/sirius_meta_pipeline.hpp`
 
 Groups pipelines that share the same sink operator. Manages inter-pipeline dependencies and build order.
 
@@ -134,7 +151,7 @@ Build order rules:
 
 ### `sirius_pipeline_build_state`
 
-**File:** `src/include/pipeline/sirius_pipeline.hpp`
+**File:** `src/pipeline/sirius_pipeline.hpp`
 
 Provides controlled write access to pipeline internals during construction:
 - `set_pipeline_source()` / `set_pipeline_sink()` — assign source/sink operators
@@ -206,7 +223,7 @@ The plan generator inserts every GPU pipeline operator into the plan tree (Part 
 3. `setup_pipeline_parents()` — derive parent pipeline edges from the wiring descriptors
 4. `finalize_pipeline_structure()` — populate `dependencies`, build-side-first for joins (see [Pipeline Finalization](#pipeline-finalization))
 5. `link_join_partition_siblings()` — link PARTITION/JOIN/CONCAT sibling chains
-6. `configure_partition_min_partitions()` — apply the multi-GPU partition floor
+6. `configure_partition_consumers()` — hand the admitted GPU ids to every partition consumer, which derives its partition count, multi-GPU floor, and partition placement from them
 7. `reorder_pipelines_topologically()` — permute the schedule into a strict leaf-first topological order (every pipeline after its producers) and renumber pipeline IDs to match; join dependencies stay build-side-first so a join publishes its dynamic filters before the probe-side scans they prune are launched
 
 `sirius_engine::initialize_internal()` is a thin orchestrator calling `sirius_pipeline_converter(build_ctx, op_params).convert(*root_pipeline)` and materializing the wiring descriptors into runtime repositories and ports.
@@ -283,16 +300,7 @@ graph LR
 - Build-side CONCAT pushes to the HASH_JOIN's `"build"` port with `FULL` barrier (default)
 - The probe and build PARTITION operators are linked as siblings for partition count coordination
 
-For a dynamic-filter-producing `BUILD_PROBE` join, the build CONCAT switches to `concat_all` and
-its synchronous `"build"`-port push completes filter construction, multi-GPU replication, and
-channel publication before downstream task creation follows that join into its **immediate** probe
-producer. In a **broadcast** join there are `num_gpus` build CONCATs (one per replicated slot), each
-doing a `concat_all` push of the full build; the first to arrive publishes (exactly-once via the
-`OPEN -> PUBLISHING` compare-exchange). This edge ordering does not gate a base scan reached
-transitively through an intervening join; such a scan samples the channel opportunistically under
-normal scheduler order. See
-[Immediate-probe ordering](dynamic-filters.md#immediate-probe-ordering) and
-[Transitive scan targets and publication timing](dynamic-filters.md#transitive-scan-targets-and-publication-timing).
+For a dynamic-filter-producing `BUILD_PROBE` join, the build CONCAT switches to `concat_all` and its synchronous `"build"`-port push completes filter construction, multi-GPU replication, and channel publication before downstream task creation follows that join into its **immediate** probe producer. In a **broadcast** join there are `num_gpus` build CONCATs (one per replicated slot), each doing a `concat_all` push of the full build. `dynamic_filter_publication_session` elects and pins one delivery, invokes the hash join's repository deposit, then checks source usability/readiness and publishes inline before the push returns. An unusable delivery can release the claim only while input remains open. This edge ordering does not gate a base scan reached transitively through an intervening join; such a scan samples the channel opportunistically under normal scheduler order. See [Immediate-probe ordering](dynamic-filters.md#immediate-probe-ordering) and [Transitive scan targets and publication timing](dynamic-filters.md#transitive-scan-targets-and-publication-timing).
 
 ### ORDER_BY → 3-Phase Sort
 
@@ -435,7 +443,7 @@ graph LR
 
 ### Repository Wiring
 
-**Files:** `src/include/pipeline/repository_wiring.hpp`, `src/pipeline/repository_wiring_materializer.cpp`
+**Files:** `src/pipeline/repository_wiring.hpp`, `src/pipeline/repository_wiring_materializer.cpp`
 
 Repository creation is split into a plan-time and a runtime half:
 

@@ -19,6 +19,7 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/storage/statistics/node_statistics.hpp"
 #include "helper/type_conversions.hpp"
 #include "sirius/exception.hpp"
 
@@ -32,7 +33,7 @@ duckdb::unique_ptr<duckdb::FunctionData> stream_source_bind(
   duckdb::ClientContext& context,
   duckdb::TableFunctionBindInput& input,
   duckdb::vector<duckdb::LogicalType>& return_types,
-  duckdb::vector<std::string>& names)
+  duckdb::vector<duckdb::Identifier>& names)
 {
   if (input.inputs.size() != 1 || input.inputs[0].IsNull()) {
     throw sirius::invalid_input_exception(
@@ -51,9 +52,21 @@ duckdb::unique_ptr<duckdb::FunctionData> stream_source_bind(
   // Undeclared id = bind error (not a silent empty scan).
   auto const& binding = catalog_for(context)->get(stream_id);
 
-  names        = duckdb::vector<std::string>(binding.names.begin(), binding.names.end());
+  names.clear();
+  for (auto const& name : binding.names) {
+    names.emplace_back(name);
+  }
   return_types = sirius::to_duckdb_vec(binding.types);
   return duckdb::make_uniq<stream_source_bind_data>(stream_id);
+}
+
+duckdb::unique_ptr<duckdb::NodeStatistics> stream_source_cardinality(
+  duckdb::ClientContext& context, const duckdb::FunctionData* bind_data)
+{
+  auto const stream_id = bind_data->Cast<stream_source_bind_data>().stream_id;
+  auto const rows      = catalog_for(context)->get(stream_id).estimated_rows;
+  if (!rows) { return nullptr; }
+  return duckdb::make_uniq<duckdb::NodeStatistics>(*rows);
 }
 
 /// Never runs: plan generator replaces this scan with STREAMING_SOURCE.
@@ -66,15 +79,25 @@ void stream_source_function(duckdb::ClientContext&, duckdb::TableFunctionInput&,
 
 }  // namespace
 
+duckdb::TableFunction get_stream_source_function()
+{
+  duckdb::TableFunction stream_source(kStreamSourceFunctionName,
+                                      {duckdb::LogicalType::BIGINT},
+                                      stream_source_function,
+                                      stream_source_bind);
+  // Set here, not at registration: the scan contract compares a planned scan's callbacks,
+  // cardinality included, against this definition.
+  stream_source.cardinality = stream_source_cardinality;
+
+  return stream_source;
+}
+
 void register_stream_source_function(duckdb::DatabaseInstance& instance)
 {
   auto transaction = duckdb::CatalogTransaction::GetSystemTransaction(instance);
   auto& catalog    = duckdb::Catalog::GetSystemCatalog(instance);
 
-  duckdb::TableFunction stream_source(kStreamSourceFunctionName,
-                                      {duckdb::LogicalType::BIGINT},
-                                      stream_source_function,
-                                      stream_source_bind);
+  auto stream_source = get_stream_source_function();
 
   duckdb::CreateTableFunctionInfo info(stream_source);
   // Idempotent: extension callback and explicit callers may both register.

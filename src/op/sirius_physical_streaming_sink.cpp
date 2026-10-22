@@ -115,15 +115,15 @@ sirius_physical_streaming_sink::sirius_physical_streaming_sink(
 }
 
 std::unique_ptr<operator_data> sirius_physical_streaming_sink::execute(
-  const operator_data& input_data, rmm::cuda_stream_view /*stream*/)
+  const operator_data& input_data, ::cuda::stream_ref /*stream*/)
 {
   // Match RESULT_COLLECTOR: return batches for sink().
   return std::make_unique<pipelineable_operator_data>(
-    dynamic_cast<const pipelineable_operator_data&>(input_data).get_read_only_batches());
+    dynamic_cast<const pipelineable_operator_data&>(input_data).get_data_batches());
 }
 
 void sirius_physical_streaming_sink::sink(const operator_data& input_data,
-                                          rmm::cuda_stream_view stream)
+                                          ::cuda::stream_ref stream)
 {
   const auto& input = dynamic_cast<const pipelineable_operator_data&>(input_data);
 

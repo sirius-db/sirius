@@ -1,0 +1,20 @@
+{
+  "12": {
+    "linux-sbsa": {
+      "sha512": "ad93a03c474344fbe85e38884f621a39a2ef7cb598ad8f923447e4e21eb01fe00c36b87fc0c5e3ceab4f2f86a1fe8de916ac413bce762204fccc58c53497ab0a"
+    },
+    "linux-x86_64": {
+      "sha512": "565ce975ff3e0e5c8d09745001dbef6d636f732f6993e8d17d5f4ada44e0fd91703a3addcf7e5dfc76a5bfd6ed44a734a84faaae5b7653e9e38f06d326e108c3"
+    },
+    "version": "12.9.1.4"
+  },
+  "13": {
+    "linux-sbsa": {
+      "sha512": "baa017979a179b619a76229d799b8c1c681eb70430c4f1b34074484865d7c84d02c30c4574a1b17c6616aa5796c94a62a3641229f1c2c9fda91be5e742b882ea"
+    },
+    "linux-x86_64": {
+      "sha512": "5d2e79fe657c73d0980974d15f7b6f3b73b3350f3c42fbf35512e98b9b2ee46e206651a7d78283f49c99c6391fc99cf2e2bb228e4ac2a3f3dba427f468a80837"
+    },
+    "version": "13.5.1.27"
+  }
+}

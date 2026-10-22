@@ -43,7 +43,7 @@ struct anti_join_to_bool {
 std::unique_ptr<cudf::column> make_anti_join_mask(
   rmm::device_uvector<cudf::size_type> const& build_indices,
   cudf::size_type n_rows,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
   auto bool_col = cudf::make_fixed_width_column(

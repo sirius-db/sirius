@@ -17,6 +17,7 @@
 #include "io/s3/sirius_httpfs.hpp"
 
 #include "io/io_context.hpp"
+#include "io/s3/duckdb_secret_config.hpp"
 #include "io/sirius_datasource.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
@@ -247,6 +248,14 @@ duckdb::unique_ptr<duckdb::FileHandle> sirius_httpfs::OpenFile(
                               "' is read-only; S3 writes (COPY TO) are not supported");
   }
   auto sirius_ctx = resolve_gated_sirius_context(opener, path, "reading");
+  auto client     = duckdb::FileOpener::TryGetClientContext(opener);
+  if (!client) {
+    throw duckdb::IOException(
+      "[sirius_httpfs] client context unavailable while resolving S3 credentials");
+  }
+  auto s3_config = resolve_duckdb_s3_secret(
+    *client, path, sirius_ctx->get_config().get_scan_manager_config().object_store);
+  sirius_ctx->get_scan_manager().install_s3_config(path, std::move(s3_config));
   // Resolve through the scan_manager's datasource factory (the routed seam):
   // the returned sirius_datasource performs the HEAD and carries the backend;
   // HEAD failures (missing key / auth / network) propagate as exceptions for
@@ -270,6 +279,14 @@ duckdb::unique_ptr<duckdb::FileHandle> sirius_httpfs::OpenFileExtended(
                               "' is read-only; S3 writes (COPY TO) are not supported");
   }
   auto sirius_ctx = resolve_gated_sirius_context(opener, file.path, "reading");
+  auto client     = duckdb::FileOpener::TryGetClientContext(opener);
+  if (!client) {
+    throw duckdb::IOException(
+      "[sirius_httpfs] client context unavailable while resolving S3 credentials");
+  }
+  auto s3_config = resolve_duckdb_s3_secret(
+    *client, file.path, sirius_ctx->get_config().get_scan_manager_config().object_store);
+  sirius_ctx->get_scan_manager().install_s3_config(file.path, std::move(s3_config));
   // A parquet_footer_probe open: one suffix-range GET resolves the size (== the
   // LIST size that rode the glob expansion) and stashes the footer, so the
   // binder's footer reads are served locally (no HEAD, no separate footer GETs).
@@ -346,6 +363,14 @@ duckdb::vector<duckdb::OpenFileInfo> sirius_httpfs::Glob(const std::string& path
   // list is only ever consumed by a GPU-only scan, so failing here gives the
   // clear error at the earliest point.
   auto sirius_ctx = resolve_gated_sirius_context(opener, path, "glob-expanding");
+  auto client     = duckdb::FileOpener::TryGetClientContext(opener);
+  if (!client) {
+    throw duckdb::IOException(
+      "[sirius_httpfs] client context unavailable while resolving S3 credentials");
+  }
+  auto s3_config = resolve_duckdb_s3_secret(
+    *client, path, sirius_ctx->get_config().get_scan_manager_config().object_store);
+  sirius_ctx->get_scan_manager().install_s3_config(path, std::move(s3_config));
   return expand_glob(path, sirius_ctx->get_scan_manager());
 }
 
@@ -418,7 +443,7 @@ duckdb::vector<duckdb::OpenFileInfo> expand_glob(
   std::vector<std::string_view> key_segments;
   std::vector<std::int8_t> memo;
   scan_manager.list_objects_paged(
-    list_uri, /*page_size=*/1000, [&](sirius::io::s3::list_objects_v2_page const& page) {
+    list_uri, /*page_size=*/1000, [&](sirius::io::rest::s3::list_objects_v2_page const& page) {
       for (auto const& entry : page.entries) {
         split_segments(entry.key, key_segments);
         bool matched;

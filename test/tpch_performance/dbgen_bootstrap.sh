@@ -28,7 +28,10 @@ ensure_tpch_tools() {
     for tool in "$@"; do
         if [ ! -x "$dbgen_dir/$tool" ] && [ -f "$dbgen_dir/makefile" ]; then
             echo "Building $tool in $dbgen_dir"
-            make -C "$dbgen_dir" "$tool" >/dev/null
+            # The reference sources use pre-C23 function declarations. GCC 15
+            # defaults to C23, where an empty parameter list means no arguments.
+            make -C "$dbgen_dir" "$tool" \
+                CPPFLAGS="${CPPFLAGS:-} -std=gnu17" >/dev/null
         fi
         if [ ! -x "$dbgen_dir/$tool" ]; then
             echo "ERROR: $tool not found or not executable at $dbgen_dir/$tool"

@@ -67,15 +67,14 @@ detail::batched_codec_ops const& lz4_ops()
 
 }  // namespace
 
-std::unique_ptr<cudf::column> lz4_compressed_representation::decompress(
-  rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr) const
+std::unique_ptr<cudf::column> lz4_compressed_representation::decompress(decode_frame& frame) const
 {
   return detail::nvcomp_decompress_impl(
-    lz4_ops(), payload_data(), payload_size(), original_type, num_rows, stream, mr);
+    lz4_ops(), payload_data(), payload_size(), original_type, num_rows, frame);
 }
 
 std::unique_ptr<compressed_representation> lz4_compressor::compress(
-  cudf::column_view col, rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr)
+  cudf::column_view col, ::cuda::stream_ref stream, rmm::device_async_resource_ref mr)
 {
   auto const dt = col.type();
   auto const n  = col.size();

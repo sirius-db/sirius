@@ -40,13 +40,14 @@ using sirius::late_mat::row_selection_kind;
 
 namespace {
 
-// The handle only ever stores and compares this pointer, so a distinct address
-// is all a test needs; constructing a real pinned_entry would drag in the whole
-// scan manager to prove nothing extra.
-sirius::scan_manager::pinned_entry const* fake_entry()
+// The handle only needs weak/shared ownership and a distinct address, so an
+// aliasing owner avoids dragging the whole scan manager into this CPU-only test.
+std::shared_ptr<sirius::scan_manager::pinned_entry const> fake_entry()
 {
-  static int marker = 0;
-  return reinterpret_cast<sirius::scan_manager::pinned_entry const*>(&marker);
+  static auto marker = std::make_shared<int>(0);
+  static auto entry  = std::shared_ptr<sirius::scan_manager::pinned_entry const>(
+    marker, reinterpret_cast<sirius::scan_manager::pinned_entry const*>(marker.get()));
+  return entry;
 }
 
 column_origin origin_against(std::shared_ptr<pin_entry_handle> const& handle,
@@ -81,7 +82,7 @@ TEST_CASE("a default-constructed origin fails closed", "[late_mat][origin]")
   REQUIRE(origin.resolve() == nullptr);
 }
 
-TEST_CASE("an origin captured before an unpin fails closed", "[late_mat][origin]")
+TEST_CASE("an explicitly revoked origin fails closed", "[late_mat][origin]")
 {
   auto handle = std::make_shared<pin_entry_handle>("lineitem", 7);
   handle->set_entry(fake_entry());

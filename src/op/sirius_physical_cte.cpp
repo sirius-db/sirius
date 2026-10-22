@@ -72,11 +72,11 @@ duckdb::vector<duckdb::const_reference<sirius_physical_operator>> sirius_physica
 }
 
 std::unique_ptr<operator_data> sirius_physical_cte::execute(const operator_data& input_data,
-                                                            rmm::cuda_stream_view stream)
+                                                            ::cuda::stream_ref stream)
 {
   nvtx_scoped_range nvtx_range{"sirius_physical_cte::execute"};
   return std::make_unique<pipelineable_operator_data>(
-    dynamic_cast<const pipelineable_operator_data&>(input_data).get_read_only_batches(false));
+    dynamic_cast<const pipelineable_operator_data&>(input_data).get_data_batches());
 }
 
 }  // namespace op

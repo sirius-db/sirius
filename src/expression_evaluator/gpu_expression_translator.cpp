@@ -277,6 +277,11 @@ std::optional<expr_ref> gpu_expression_translator::add_join_condition(
     case ge:
       return _ast_tree.emplace<cudf::ast::operation>(
         cudf::ast::ast_operator::GREATER_EQUAL, *left_expr, *right_expr);
+    case distinct_from: {
+      auto& equal = _ast_tree.emplace<cudf::ast::operation>(
+        cudf::ast::ast_operator::NULL_EQUAL, *left_expr, *right_expr);
+      return _ast_tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::NOT, equal);
+    }
     case not_distinct_from:
       return _ast_tree.emplace<cudf::ast::operation>(
         cudf::ast::ast_operator::NULL_EQUAL, *left_expr, *right_expr);
@@ -408,7 +413,7 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
     return std::nullopt;
   }
 
-  auto const cudf_type = sirius::get_cudf_type(alt.return_type());
+  auto const cudf_type = sirius::require_cudf_type(alt.return_type());
   // TODO: Expand type support as needed. See constant.cpp.
   switch (cudf_type.id()) {
     case cudf::type_id::INT8: {
@@ -655,7 +660,7 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
 
   // Construct the CAST expression, if possible
   // CuDF AST only supports casts to INT64, UINT64, FLOAT64
-  auto const cudf_return_type = sirius::get_cudf_type(alt.target_type);
+  auto const cudf_return_type = sirius::require_cudf_type(alt.target_type);
   switch (cudf_return_type.id()) {
     case cudf::type_id::INT64:
       return _ast_tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::CAST_TO_INT64,
@@ -748,6 +753,9 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
 std::optional<expr_ref> gpu_expression_translator::add_expression(
   sirius::ast::function_call const& alt, cudf::ast::table_reference const table_src)
 {
+  // Standalone ASTs cannot implement DATE infinity and overflow checks.
+  if (alt.date_operation().has_value()) { return std::nullopt; }
+
   // cuDF AST only supports numeric binary functions. We must also disable any
   // operation that propagates decimal types up the expression tree, pending the
   // cuDF fix: https://github.com/rapidsai/cudf/pull/21996. Unsupported functions

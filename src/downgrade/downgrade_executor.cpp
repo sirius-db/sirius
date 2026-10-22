@@ -47,13 +47,15 @@ static std::string tier_to_string(cucascade::memory::Tier tier)
 }
 
 downgrade_executor::downgrade_executor(
+  sirius::exec::query_lifecycle_registry& lifecycle,
   exec::downgrade_executor_config config,
   sirius::data::data_repository_manager_registry& data_repo_registry,
   cucascade::memory::memory_space_id space_id,
   cucascade::memory::memory_space* memory_space,
   sirius::memory::sirius_memory_reservation_manager& reservation_manager,
   sirius::exec::multi_index_priority_queue<sirius::parallel::itask>* pipeline_task_queue)
-  : _config(std::move(config)),
+  : _query_lifecycle(lifecycle),
+    _config(std::move(config)),
     _data_repo_registry(data_repo_registry),
     _space_id(space_id),
     _memory_space(memory_space),
@@ -86,7 +88,7 @@ void downgrade_executor::start()
 
   _request_queue.reactivate();
 
-  absl::AnyInvocable<void() noexcept> per_thread_init = nullptr;
+  sirius::exec::invocable<void() noexcept> per_thread_init = nullptr;
   if (_memory_space && _space_id.tier == cucascade::memory::Tier::GPU) {
     auto device_id  = _memory_space->get_device_id();
     per_thread_init = [device_id]() noexcept {
@@ -268,8 +270,10 @@ void downgrade_executor::processing_loop()
     // re-scanned before leaving idle. Managers are held by shared_ptr for the duration of the
     // sweep, so a query ending concurrently cannot pull one out from under this loop.
     bool pool_interrupted = false;
-    auto const managers   = _data_repo_registry.get_all();
-    for (auto const& manager : std::views::reverse(managers)) {
+    auto const managers   = _data_repo_registry.candidates();
+    for (auto const& [victim_id, manager] : std::views::reverse(managers)) {
+      auto borrow = _query_lifecycle.try_acquire_work(victim_id);
+      if (!borrow) { continue; }
       if (req->satisfied.load() || pool_interrupted || target_completed()) break;
       auto repos = manager->get_repositories();
       for (auto* repo : repos) {
@@ -301,6 +305,12 @@ void downgrade_executor::processing_loop()
           already_dispatched[*pick] = true;
           auto candidate            = std::move(candidates[*pick]);
           auto candidate_bytes      = candidate_sizes[*pick];
+          // The manager-local borrow protects candidate discovery. Transfer a separate
+          // victim claim into each candidate before handing it to another thread.
+
+          auto work = _query_lifecycle.try_acquire_work(victim_id);
+          if (!work) { break; }
+          candidate->retain_work(std::move(work));
 
           auto slot = _pool->reserve();
           if (!slot) {
@@ -336,7 +346,7 @@ void downgrade_executor::processing_loop()
               try {
                 nvtx3::scoped_range nvtx_range{"sirius::downgrade::convert_batch"};
                 auto result =
-                  cand->convert(targets, rmm::cuda_stream_view{exc_stream.get()}, res_mgr, false);
+                  cand->convert(targets, ::cuda::stream_ref{exc_stream.get()}, res_mgr, false);
                 if (result) {
                   std::move(rollback).Cancel();
                   req_ptr->bytes_freed.fetch_add(candidate_bytes, std::memory_order_relaxed);
@@ -373,7 +383,10 @@ void downgrade_executor::processing_loop()
       size_t max_tasks_to_convert = _pipeline_task_queue->size();
       size_t tasks_converted      = 0;
       failed_pipeline_candidates.reserve(max_tasks_to_convert);
-      convertible_gpu_pipeline_task_provider pipeline_provider(*_pipeline_task_queue);
+      // The gate travels with the provider: each wrapper it hands out consults it before its RAII
+      // re-push, so a task extracted here cannot land back in the queue after its query's drain.
+      convertible_gpu_pipeline_task_provider pipeline_provider(*_pipeline_task_queue,
+                                                               _query_lifecycle);
       while (!req->satisfied.load() && tasks_converted < max_tasks_to_convert) {
         if (predicate_satisfied(req.get()) || wait_if_target_reached()) break;
         auto candidate =
@@ -416,7 +429,7 @@ void downgrade_executor::processing_loop()
             try {
               nvtx3::scoped_range nvtx_range{"sirius::downgrade::convert_task_batches"};
               auto result =
-                cand->convert(targets, rmm::cuda_stream_view{exc_stream.get()}, res_mgr, false);
+                cand->convert(targets, ::cuda::stream_ref{exc_stream.get()}, res_mgr, false);
               if (result) {
                 std::move(rollback).Cancel();
                 req_ptr->bytes_freed.fetch_add(candidate_bytes, std::memory_order_relaxed);
@@ -467,6 +480,24 @@ void downgrade_executor::processing_loop()
     std::string request_label = req->is_monitor_request ? "monitor " : "";
     if (req->is_monitor_request) {
       _monitor_request_enqueued.store(false, std::memory_order_relaxed);
+      // Outcome of the periodic check, at INFO so a normal run shows what the
+      // monitor path actually accomplished. `satisfied` is the honest signal:
+      // bytes freed can be non-zero while the request still failed to reach its
+      // target, which is exactly the silent-failure case that hid the broken
+      // spill directory (every convert threw, nothing was freed, no warning).
+      SIRIUS_LOG_INFO(
+        "[downgrade][monitor] [{}] request done: {} batches, {} bytes in {:.2f} ms ({:.1f} MB/s), "
+        "satisfied={} | to_host: {}/{} batches/bytes, to_disk: {}/{} batches/bytes",
+        _source_label,
+        total_batches,
+        total_bytes,
+        duration_ms,
+        throughput_mbs,
+        req->satisfied.load(),
+        host_target_stats.batches.load(std::memory_order_relaxed),
+        host_target_stats.bytes.load(std::memory_order_relaxed),
+        disk_target_stats.batches.load(std::memory_order_relaxed),
+        disk_target_stats.bytes.load(std::memory_order_relaxed));
     }
 
     SIRIUS_LOG_DEBUG(
@@ -570,8 +601,18 @@ void downgrade_executor::monitor_loop()
             return freed.load(std::memory_order_relaxed) >= amount ||
                    space->should_stop_downgrading_memory();
           };
-          _monitor_requests_issued.fetch_add(1, std::memory_order_relaxed);
+          auto const issued = _monitor_requests_issued.fetch_add(1, std::memory_order_relaxed) + 1;
           _monitor_request_enqueued.store(true, std::memory_order_relaxed);
+          // Periodic-path attribution, counterpart to the "[downgrade][reserve]" line
+          // in gpu_pipeline_executor. Throttled in practice by _monitor_request_enqueued
+          // (one monitor request in flight at a time), so this is one line per
+          // request round-trip -- not one per candidate batch like the convert errors.
+          SIRIUS_LOG_INFO(
+            "[downgrade][monitor] [{}] memory pressure: requesting downgrade of {} bytes "
+            "(monitor request #{})",
+            _source_label,
+            amount,
+            issued);
           // Fire-and-forget: monitor does not wait for the result
           _request_queue.push(std::move(req));
         }
