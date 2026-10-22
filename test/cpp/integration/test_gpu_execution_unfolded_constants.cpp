@@ -38,7 +38,8 @@ class UnfoldedConstantsFixture : public sirius::test::GpuExecutionFixture {
       " CASE WHEN i % 5 = 0 THEN NULL ELSE 'v' || (i % 13)::VARCHAR || 'a' END AS s,"
       " CASE WHEN i % 11 = 0 THEN NULL"
       " ELSE TIMESTAMP '2001-02-03 04:05:06' + to_seconds(i * 3607) END AS ts,"
-      " CASE WHEN i % 3 = 0 THEN NULL ELSE (i * 0.5)::DOUBLE END AS f"
+      " CASE WHEN i % 3 = 0 THEN NULL ELSE (i * 0.5)::DOUBLE END AS f,"
+      " CASE WHEN i % 4 = 0 THEN NULL ELSE i % 2 = 0 END AS b"
       " FROM range(2000) r(i);");
     run_ok("CHECKPOINT;");
   }
@@ -113,4 +114,18 @@ TEST_CASE_METHOD(UnfoldedConstantsFixture,
   compare_all_strategies("SELECT i, (coalesce(2, x) + 1) * coalesce(3, x) FROM t");
   compare_all_strategies("SELECT i, coalesce(2.5::DOUBLE, f) / 2 FROM t");
   compare_all_strategies("SELECT i, coalesce(2, x) IN (1, 2), coalesce(2, x) NOT IN (2, 3) FROM t");
+}
+
+TEST_CASE_METHOD(UnfoldedConstantsFixture,
+                 "predicates over constants left by coalesce simplification",
+                 "[integration][gpu_execution][unfolded_constants]")
+{
+  compare_all_strategies(
+    "SELECT i, coalesce('apple', s) = 'apple', coalesce('apple', s) < 'pear' FROM t");
+  compare_all_strategies(
+    "SELECT i, coalesce('apple', s) IS DISTINCT FROM 'pear',"
+    " coalesce(2, x) IS NOT DISTINCT FROM 2 FROM t");
+  compare_all_strategies("SELECT i, coalesce(2, x) BETWEEN 1 AND 3 FROM t");
+  compare_all_strategies("SELECT i, NOT coalesce(true, b) FROM t");
+  compare_all_strategies("SELECT i, coalesce(2, x) IS NULL, coalesce(2, x) IS NOT NULL FROM t");
 }

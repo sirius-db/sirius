@@ -317,7 +317,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::unary_op const& alt,
     return materialize_as_ast_column(result.release_column());
   }
 
-  auto child = evaluate(*alt.child, evaluation_mode::MATERIALIZE);
+  auto child = evaluate_as_column(*alt.child);
   switch (alt.op) {
     case sirius::ast::unary_op::kind::op_not:
       return evaluate_result(
