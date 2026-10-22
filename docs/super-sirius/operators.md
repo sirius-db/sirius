@@ -69,12 +69,11 @@ and its pipeline boundary. The planner chooses `UNORDERED_STREAMING_LIMIT` only 
 | HASH_JOIN, NESTED_LOOP_JOIN, DENSE_COUNT_JOIN, LEFT_DELIM_JOIN, RIGHT_DELIM_JOIN | `NO_ORDER` |
 | HASH_GROUP_BY, UNGROUPED_AGGREGATE, MERGE_GROUP_BY, MERGE_AGGREGATE | `NO_ORDER` |
 | GPU_SCAN, UNORDERED_STREAMING_LIMIT | `NO_ORDER` |
-| PROJECTION, FILTER, DYNAMIC_FILTER, STREAMING_LIMIT | `INSERTION_ORDER` |
+| PROJECTION, FILTER, DYNAMIC_FILTER, BUILD_FILTER, STREAMING_LIMIT | `INSERTION_ORDER` |
 | PASSTHROUGH_SINK, CTE, materialized RESULT_COLLECTOR | `INSERTION_ORDER` |
 | TABLE_SCAN, COLUMN_DATA_SCAN (including CTE_SCAN / DELIM_SCAN), GPU_VALUES | `INSERTION_ORDER` |
-| DUMMY_SCAN, EMPTY_RESULT, STREAMING_SOURCE | `INSERTION_ORDER` |
-| STREAMING_SINK: one destination or broadcast | `INSERTION_ORDER` per destination |
-| STREAMING_SINK: hash redistribution to multiple destinations | `NO_ORDER` |
+| DUMMY_SCAN, EMPTY_RESULT | `INSERTION_ORDER` |
+| STREAMING_SOURCE, STREAMING_SINK (all routing modes) | `NO_ORDER` |
 
 Abstract intermediates (partition consumer, delim join, result collector) leave the declaration
 pure virtual so concrete implementations must choose. Test-only structural placeholders use an

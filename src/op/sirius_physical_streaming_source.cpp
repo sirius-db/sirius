@@ -111,18 +111,18 @@ bool sirius_physical_streaming_source::all_ports_empty() { return _input->draine
 
 std::unique_ptr<operator_data> sirius_physical_streaming_source::get_next_task_input_data()
 {
-  auto [batch, position] = _input->try_pull_with_position();
+  auto batch = _input->try_pull();
   if (!batch) return nullptr;
 
   std::vector<std::shared_ptr<cucascade::data_batch>> batches{std::move(batch)};
-  return std::make_unique<pipelineable_operator_data>(std::move(batches), position);
+  return std::make_unique<pipelineable_operator_data>(std::move(batches));
 }
 
 std::unique_ptr<operator_data> sirius_physical_streaming_source::execute(
   const operator_data& input, ::cuda::stream_ref /*stream*/)
 {
   const auto& pod = dynamic_cast<const pipelineable_operator_data&>(input);
-  return std::make_unique<pipelineable_operator_data>(pod.get_data_batches(), pod.get_position());
+  return std::make_unique<pipelineable_operator_data>(pod.get_data_batches());
 }
 
 std::size_t sirius_physical_streaming_source::no_history_peak_memory_estimate(

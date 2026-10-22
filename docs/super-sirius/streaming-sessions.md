@@ -27,6 +27,15 @@ A session is built from three pieces:
 
 The session (`exec::stream_session`) is the id-addressed router over these operators.
 
+## Ordering across fragment boundaries
+
+Streams carry batches without logical positions. Both `STREAMING_SOURCE` and `STREAMING_SINK`
+declare `NO_ORDER`, including single-destination and broadcast sinks. Positions established within
+one fragment are local to that producer; independent senders can reuse the same position and
+transport relays do not preserve it. A global `ORDER BY` therefore requires a merge or sort on the
+sort keys in the receiving plan. A LIMIT directly over a stream can use `UNORDERED_STREAMING_LIMIT`.
+Available batches can be consumed before all senders close.
+
 ## The model: the repository is the queue
 
 A `cucascade::shared_data_repository` already *is* a thread-safe queue of `data_batch`es, and it
@@ -62,20 +71,18 @@ class batch_stream {
   batch_stream(shared_ptr<shared_data_repository> repo, set<sender_id_t> expected);
 
   // Producer
-  // push returns false once terminal
-  [[nodiscard]] bool push(shared_ptr<data_batch>, optional<size_t> position = nullopt);
+  [[nodiscard]] bool push(shared_ptr<data_batch>);  // false once terminal
   void close(sender_id_t);       // idempotent per sender; set-based fan-in
   void fail(exception_ptr);      // immediate, first failure wins
 
   // Consumer
   shared_ptr<data_batch> try_pull();  // rethrows a pending error before popping
-  positioned_data_batch try_pull_with_position();  // batch and optional logical position
   availability classify() const;
   bool drained() const;               // clean end only
   void wait();                        // not atomic with try_pull — loop and re-check
 
   // Hooks (single slot; fire after unlocking)
-  void set_on_data(function<void()>);  // persists across pushes; consumed at ordered EOS
+  void set_on_data(function<void()>);           // persistent — fires on every push and on fail()
   void set_on_end_of_stream(function<void()>);  // registration on a terminal stream fires it
 };
 ```
@@ -92,25 +99,6 @@ Three behaviors are load-bearing:
   reported while an accepted batch is still pullable. A pending error reads as `HAS_DATA` even
   over an empty queue — the only way out is the rethrow from `try_pull()`, never a clean finish
   that would let a failed query succeed silently.
-
-### Positioned delivery and hook lifetime
-
-The first accepted batch establishes the repository's ordering mode. Positioned and unpositioned
-pushes cannot be mixed. For ordered streams, queued batches remain unavailable until every expected
-sender closes: `classify()` reports `WAITING`, `try_pull()` and `try_pull_with_position()` return no
-batch, and `wait()` keeps waiting. Successful EOS makes batches available in ascending position
-order, including sparse positions. `try_pull()` discards the returned position metadata.
-Unordered streams make batches available on arrival. A pending error takes precedence in either mode.
-Multiple senders publishing positioned batches must share a position namespace. Queued batches
-remain in the registered repository, where memory management can spill them while waiting for EOS.
-
-`on_data` fires after each successful push, on the first failure while the hook is retained, and
-at ordered EOS. A push notification alone does not imply that an ordered batch is pullable;
-consumers must re-check availability. The hook persists across pushes without re-arming, but ordered
-EOS moves it out and invokes it once. This avoids a throwing callback copy after terminal state has
-been published. A subsequent failure still records the error and notifies `wait()`, but does not
-invoke the consumed hook. An ordered stream past EOS cannot return to `WAITING`.
-`set_on_data()` replaces the hook without invoking it, even on a terminal stream.
 
 ### Contracts S1-S5
 
@@ -138,47 +126,31 @@ S2 is the stream-level name for "poison wakes / dominates".
 - **P1 — immediate visibility.** `pending_error()` returns it as soon as `fail()` returns.
 - **P2 — first failure wins.** Later failures and clean closes never displace the original cause.
 - **P3 — fail-fast terminal.** The stream ends at once rather than waiting for remaining senders.
-- **P4 — poison is data.** A pending error classifies as `HAS_DATA` even over an empty queue. The
-  first failure fires any retained `on_data` hook so a parked engine consumer comes back for the
-  rethrow. After ordered EOS has consumed the hook, failure still notifies external `wait()` callers.
+- **P4 — poison is data.** A pending error classifies as `HAS_DATA` even over an empty queue, and
+  fires `on_data` so a parked engine consumer comes back for the rethrow.
 
-| terminal? | error? | ordering mode | repo empty? | `classify()` |
-|---|---|---|---|---|
-| no | no | `ORDERED` | either | `WAITING` |
-| no | no | `UNORDERED` | no | `HAS_DATA` |
-| no | no | `UNKNOWN` or `UNORDERED` | yes | `WAITING` |
-| yes | no | any | no | `HAS_DATA` |
-| yes | no | any | yes | `END_OF_STREAM` |
-| either | yes | any | either | `HAS_DATA` |
+| terminal? | error? | repo empty? | `classify()` |
+|---|---|---|---|
+| no | no | no | `HAS_DATA` |
+| no | no | yes | `WAITING` |
+| yes | no | no | `HAS_DATA` |
+| yes | no | yes | `END_OF_STREAM` |
+| either | yes | either | `HAS_DATA` |
 
 `wait()` blocks until `classify() != WAITING`. Engine workers never call it — it is for the
 wrapper's external threads.
 
 ### Availability state machine
 
-Transitions are driven by producers (`push`, `close`, `fail`) and consumers (`try_pull`).
-For unordered streams:
+Transitions are driven by producers (`push`, `close`, `fail`) and consumers (`try_pull`):
 
 ```
-                  push()                       last pull; stream terminal
+                  push()                       close(last sender) + repo empty
 WAITING ───────────────────────► HAS_DATA ──────────────────────────────────► END_OF_STREAM
   ▲                                  │
   └──────────────────────────────────┘
         try_pull() drains repo; stream still open
 
-WAITING ──close(last sender), repo empty──► END_OF_STREAM
-```
-
-For ordered streams, pushes leave the stream in `WAITING` until the last sender closes:
-
-```
-WAITING ──close(last sender), repo nonempty──► HAS_DATA ──last pull──► END_OF_STREAM
-WAITING ──close(last sender), repo empty───────────────────────────► END_OF_STREAM
-```
-
-In either mode:
-
-```
 fail() (any state) ──► HAS_DATA  ──try_pull()──► rethrow
                        ^^^^^^^^
                        classify() cannot tell poison from data — both read HAS_DATA (P4). What
@@ -187,8 +159,8 @@ fail() (any state) ──► HAS_DATA  ──try_pull()──► rethrow
 ```
 
 Reading S1–S5 against the diagram:
-- **S1** — `push()` deposits the batch before notifying consumers. For unordered input this can make data available immediately; ordered input remains `WAITING` until EOS. Consumers re-check readiness after notifications.
-- **S2 / P4** — the first `fail()` drives a transition to `HAS_DATA` and fires any retained `on_data` hook, so a parked engine consumer comes back and exits via the rethrow in `try_pull()`. External waiters are notified even after ordered EOS has consumed the hook.
+- **S1** — `push()` deposits the batch in the repo *before* the `WAITING → HAS_DATA` transition fires; a consumer that wakes on `HAS_DATA` is guaranteed to find the batch.
+- **S2 / P4** — `fail()` drives a transition to `HAS_DATA` and fires `on_data`, so a parked engine consumer comes back and exits via the rethrow in `try_pull()`.
 - **S3** — `fail()` has no arc to `END_OF_STREAM`; the `HAS_DATA → END_OF_STREAM` arc requires no pending error.
 - **S4** — `try_pull()` checks `pending_error()` before popping; batches queued behind a failure are never handed out.
 - **S5** — `wait()` and the following `try_pull()` are separate critical sections; another consumer may traverse `HAS_DATA → WAITING` between the two calls.
@@ -311,7 +283,7 @@ struct partition_spec {
 };
 ```
 
-**Hash mode** discards global batch positions. `sink()` GPU-hash-partitions each batch by the key columns (same `hash_partition`
+**Hash mode** — `sink()` GPU-hash-partitions each batch by the key columns (same `hash_partition`
 kernel as `PARTITION`) and pushes slice *i* into stream *i*; empty slices are skipped. A slow
 receiver's backlog accumulates in its own repository — spillable by the downgrade executor —
 without head-of-line-blocking the others.

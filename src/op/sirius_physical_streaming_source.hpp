@@ -34,7 +34,7 @@ class sirius_physical_streaming_source : public sirius_physical_operator {
  public:
   [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
   {
-    return sirius::OrderPreservationType::INSERTION_ORDER;
+    return sirius::OrderPreservationType::NO_ORDER;
   }
 
   static constexpr SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::STREAMING_SOURCE;
