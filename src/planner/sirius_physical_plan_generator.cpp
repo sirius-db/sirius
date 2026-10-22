@@ -78,6 +78,7 @@
 #include "op/sirius_physical_union.hpp"
 #include "op/sirius_physical_window.hpp"
 #include "planner/connector_registry.hpp"
+#include "planner/distributed_plan.hpp"
 #include "planner/sirius_plan_compressed_schema.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "planner/sirius_plan_window.hpp"
@@ -242,6 +243,25 @@ void attach_byte_ranges(sirius::op::scan::parquet_ingestible_table_info& info,
   }
 }
 
+//! Distributed: every rank binds every file of a table, and scans files rank, rank + world, ...
+std::vector<std::string> stripe_for_rank(std::vector<std::string> files,
+                                         const sirius::operator_params& op_params)
+{
+  auto const world = op_params.exchange_peers.size();
+  if (world <= 1) { return files; }
+  if (files.size() < world) {
+    throw sirius::not_implemented_exception(
+      "distributed execution: a table of {} files across {} ranks; each rank needs one",
+      files.size(),
+      world);
+  }
+  std::vector<std::string> mine;
+  for (std::size_t i = op_params.exchange_rank; i < files.size(); i += world) {
+    mine.push_back(std::move(files[i]));
+  }
+  return mine;
+}
+
 //! Fill the parquet bind data from a TABLE_SCAN. Split out from
 //! `build_parquet_table_info` so the iceberg path can populate the same fields into its own
 //! subclass — an iceberg table's data files are parquet, so every field here applies unchanged.
@@ -340,7 +360,7 @@ void populate_parquet_table_info(sirius::op::scan::parquet_ingestible_table_info
       throw std::runtime_error(
         "[sirius_physical_plan_generator::build_parquet_table_info] No input files to scan");
     }
-    info->resolved_file_paths = std::move(resolved_file_paths);
+    info->resolved_file_paths = stripe_for_rank(std::move(resolved_file_paths), op_params);
   }
 
   info->approximate_batch_size = op_params.scan_task_batch_size;
@@ -2366,6 +2386,13 @@ void sirius_physical_plan_generator::insert_gpu_pipeline_operators(
   prepare_scan_statement(*plan, op_params, context);
   insert_gpu_pipeline_operators_recursive(
     plan, op_params, context, sirius_ctx.get(), contract_provenance);
+  if (sirius_ctx && !op_params.exchange_peers.empty()) {
+    auto* gpu = sirius_ctx->get_memory_manager().get_memory_space(cucascade::memory::Tier::GPU, 0);
+    sirius::planner::distribute_plan(plan,
+                                     sirius_ctx->get_exchange_service(op_params),
+                                     *gpu,
+                                     sirius_ctx->next_distributed_query());
+  }
 }
 
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
