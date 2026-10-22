@@ -54,4 +54,12 @@ class exchange_service;
   rmm::cuda_stream_view cuda_stream,
   std::chrono::milliseconds timeout = std::chrono::minutes{10});
 
+/**
+ * @brief Takes part in @p stream's all-gather with nothing, without waiting for the other ranks.
+ *
+ * Every rank gets this rank's end; what they send here is dropped. For a rank that would ignore the
+ * gathered tables, so that it never waits on a peer that may be waiting on it.
+ */
+void leave_all_gather(exchange_service& service, stream_id stream);
+
 }  // namespace sirius::exchange
