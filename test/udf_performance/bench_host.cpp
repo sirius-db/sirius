@@ -17,10 +17,13 @@
 #include "compatibility.hpp"
 #include "udfs/fast_cpu.hpp"
 
+#include <cuda_runtime_api.h>
+
 #include <dlfcn.h>
 #include <duckdb.hpp>
 #include <duckdb/main/database.hpp>
 #include <duckdb/main/extension/extension_loader.hpp>
+#include <duckdb/main/profiler/profiler_print_format.hpp>
 #include <sirius/duckdb.hpp>
 
 #include <algorithm>
@@ -370,6 +373,129 @@ void validate_q1_oracle(duckdb::Connection& connection,
     "\"rows_compared\":50000,\"gpu_executions\":1,\"plan_fallbacks\":0,\"runtime_fallbacks\":0}");
 }
 
+int run_stage_profiles(fs::path const& job,
+                       duckdb::Connection& connection,
+                       duckdb::Connection& observer,
+                       config_type const& config,
+                       std::vector<mode> const& cpus,
+                       mode const& gpu,
+                       uint64_t rows,
+                       int warmups,
+                       int repetitions,
+                       bool projection,
+                       validation_evidence& evidence)
+{
+  bool const aggregate = config.contains("stage_aggregate") && flag(config, "stage_aggregate");
+  if ((!aggregate && !projection) || flag(config, "pin") || flag(config, "validate_only")) {
+    throw std::runtime_error("Stage profiles require a query kind, no pinning and timed execution");
+  }
+  validate_samples(connection, observer, cpus, gpu, "warm_storage", rows, evidence);
+  query(connection, "PRAGMA disable_profiling");
+  std::ostringstream profiles;
+  profiles << std::setprecision(17);
+  bool first           = true;
+  uint64_t gpu_queries = 0;
+  for (std::string const kind : {std::string{"projection"}, std::string{"aggregate"}}) {
+    if ((kind == "projection" && !projection) || (kind == "aggregate" && !aggregate)) { continue; }
+    auto const sql_for = [&kind](mode const& candidate) -> std::string const& {
+      return kind == "aggregate" ? candidate.aggregate_sql : candidate.projection_sql;
+    };
+    query(connection, "SET gpu_execution=false");
+    auto reference           = query(connection, sql_for(cpus.front()));
+    auto const logical_types = reference->GetTypes();
+    auto const expected_rows = kind == "aggregate" ? 1 : rows;
+    if (reference->RowCount() != expected_rows) {
+      throw std::runtime_error("Stage reference query result row count mismatch");
+    }
+    // Unordered full projections are checked by shape here and exact ordered
+    // samples above. Release this full result before running profiled queries.
+    if (kind == "projection") { reference.reset(); }
+    auto modes = cpus;
+    modes.push_back(gpu);
+    for (int iteration = 0; iteration < warmups + repetitions; ++iteration) {
+      for (std::size_t step = 0; step < modes.size(); ++step) {
+        auto const& candidate = modes[(step + iteration) % modes.size()];
+        auto const sample_id  = candidate.id + "_" + kind + "_" + std::to_string(iteration);
+        auto sql              = sql_for(candidate);
+        auto const last       = sql.find_last_not_of(" \t\r\n");
+        auto const marker     = " /*sirius_stage:" + sample_id + "*/";
+        if (last != std::string::npos && sql[last] == ';') {
+          sql.insert(last, marker);
+        } else {
+          sql += marker;
+        }
+        query(connection, candidate.gpu ? "SET gpu_execution=true" : "SET gpu_execution=false");
+        if (!candidate.gpu) { query(connection, "PRAGMA enable_profiling='no_output'"); }
+        auto const before  = candidate.gpu ? snapshot(observer) : counters{};
+        auto const started = clock_type::now();
+        auto output        = query(connection, sql);
+        auto const milliseconds =
+          std::chrono::duration<double, std::milli>(clock_type::now() - started).count();
+        std::string profile_file;
+        if (!candidate.gpu) {
+          // Read before any later query on this connection replaces its profile.
+          auto const profile =
+            connection.GetProfilingInformation(duckdb::ProfilerPrintFormat::JSON());
+          query(connection, "PRAGMA disable_profiling");
+          if (profile.empty()) { throw std::runtime_error("Missing CPU query profile"); }
+          profile_file = "cpu-profile-" + sample_id + ".json";
+          std::ofstream saved{job / profile_file};
+          saved.exceptions(std::ios::failbit | std::ios::badbit);
+          saved << profile;
+        }
+        if (candidate.gpu) {
+          auto const delta = checked_delta(before, snapshot(observer));
+          gpu_queries += delta.executions;
+        }
+        if (output->RowCount() != expected_rows || output->GetTypes() != logical_types) {
+          throw std::runtime_error("Profiled query result logical types or row count mismatch");
+        }
+        if (kind == "aggregate") { compare(*reference, *output); }
+        if (!first) { profiles << ','; }
+        first = false;
+        profiles << "{\"sample_id\":" << json_quote(sample_id)
+                 << ",\"engine\":" << json_quote(candidate.gpu ? "gpu" : "cpu")
+                 << ",\"cpu_mode\":" << json_quote(candidate.id)
+                 << ",\"cpu_baseline\":" << json_quote(candidate.label)
+                 << ",\"query_kind\":" << json_quote(kind)
+                 << ",\"warmup\":" << (iteration < warmups ? "true" : "false")
+                 << ",\"iteration\":" << iteration << ",\"query_wall_ms\":" << milliseconds
+                 << ",\"profile_file\":" << json_quote(profile_file)
+                 << ",\"sql\":" << json_quote(sql);
+        if (candidate.gpu) {
+          profiles
+            << ",\"gpu_counters\":{\"executions\":1,\"plan_fallbacks\":0,\"runtime_fallbacks\":0}";
+        }
+        profiles << '}';
+      }
+    }
+    std::cout << config.at("workload") << ' ' << rows << " stage " << kind << " passed\n"
+              << std::flush;
+  }
+  auto const kinds = static_cast<uint64_t>(aggregate) + static_cast<uint64_t>(projection);
+  if (gpu_queries != kinds * static_cast<uint64_t>(warmups + repetitions)) {
+    throw std::runtime_error("GPU stage evidence does not cover every warmup and measured query");
+  }
+  std::ostringstream report;
+  report << "{\"correctness_verified\":true,\"rows\":" << rows << ",\"input_rows\":" << rows
+         << ",\"gpu_validation_queries\":" << evidence.gpu_queries
+         << ",\"gpu_counters\":{\"executions\":" << gpu_queries
+         << ",\"plan_fallbacks\":0,\"runtime_fallbacks\":0},\"validation_records\":[";
+  for (std::size_t index = 0; index < evidence.records.size(); ++index) {
+    if (index) { report << ','; }
+    report << evidence.records[index];
+  }
+  report << "],\"profiles\":[" << profiles.str() << "]}\n";
+  auto const temporary = job / "stage-measurements.json.tmp";
+  {
+    std::ofstream output{temporary};
+    output.exceptions(std::ios::failbit | std::ios::badbit);
+    output << report.str();
+  }
+  fs::rename(temporary, job / "stage-measurements.json");
+  return 0;
+}
+
 int run(fs::path const& job)
 {
   auto const config        = read_config(job);
@@ -453,6 +579,19 @@ int run(fs::path const& job)
   bool first_record = true;
   if (config.at("workload") == "udfbench_q1") {
     validate_q1_oracle(connection, observer, evidence);
+  }
+  if (config.contains("stage_profile") && flag(config, "stage_profile")) {
+    return run_stage_profiles(job,
+                              connection,
+                              observer,
+                              config,
+                              cpus,
+                              gpu_mode,
+                              rows,
+                              warmups,
+                              repetitions,
+                              projection,
+                              evidence);
   }
   for (std::string const cache : {std::string{"warm_storage"}, std::string{"pinned_gpu"}}) {
     if (cache == "pinned_gpu" && !pin) { continue; }
@@ -559,6 +698,22 @@ int run(fs::path const& job)
 int main(int argc, char** argv)
 {
   try {
+    if (argc == 2 && std::string{argv[1]} == "--device-info") {
+      auto const check = [](cudaError_t status) {
+        if (status != cudaSuccess) { throw std::runtime_error(cudaGetErrorString(status)); }
+      };
+      int count = 0;
+      check(cudaGetDeviceCount(&count));
+      if (count == 0) { throw std::runtime_error("No visible CUDA devices"); }
+      cudaDeviceProp device{};
+      std::size_t free = 0, total = 0;
+      check(cudaSetDevice(0));
+      check(cudaGetDeviceProperties(&device, 0));
+      check(cudaMemGetInfo(&free, &total));
+      std::cout << "{\"device_count\":" << count << ",\"name\":" << json_quote(device.name)
+                << ",\"total_bytes\":" << total << ",\"free_bytes\":" << free << "}\n";
+      return 0;
+    }
     if (argc != 2) { throw std::runtime_error("Usage: bench_host job-directory"); }
     require_compatible_duckdb(SIRIUS_UDF_DUCKDB_REVISION, duckdb::DuckDB::SourceID());
     return run(std::filesystem::absolute(argv[1]));

@@ -28,7 +28,7 @@ set_target_properties(benchmark_cuda PROPERTIES CUDA_STANDARD 20
 
 add_executable(bench_host bench_host.cpp)
 target_link_libraries(bench_host PRIVATE sirius::udf_sdk provider_duckdb
-                                         ${CMAKE_DL_LIBS})
+                                         CUDA::cudart ${CMAKE_DL_LIBS})
 target_include_directories(
   bench_host
   PRIVATE

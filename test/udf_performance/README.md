@@ -184,6 +184,83 @@ GPU speedups depend on workload, transfer costs, cache state, and result size;
 the original full projections were slower on GPU. Machine load and GPU clocks
 are uncontrolled, so reproducing exact milliseconds is not expected.
 
+## Compare actual query stages on smaller devices
+
+The stage runner profiles the same aggregate and full-projection queries using
+DuckDB's CPU operator profiler and Sirius's existing synchronized operator TRACE
+timings. It does not require Nsight or an engine rebuild beyond the benchmark
+host. Rebuild that host from this checkout before running it:
+
+```bash
+pixi run --locked -e cuda12 cmake --build "$BENCH_BUILD" -j2
+pixi run --locked -e cuda12 python test/udf_performance/run_stages.py \
+  --build-dir "$BENCH_BUILD" --output-dir "$BENCH_WORK/stage-results" \
+  --workloads sql cudf cuda --sizes 100000 1000000 \
+  --batch-mib 8 --gpu-budget-mib 512 --host-budget-mib 1024 \
+  --threads 1 --warmups 3 --repetitions 7
+```
+
+This uses one visible GPU and one Sirius pipeline executor, with a fixed 8 MiB
+scan batch target and a 512 MiB tracked GPU pool budget, rather than the larger
+integration-test configuration. The driver probes the first visible CUDA device
+and rejects a budget larger than its currently free memory. Budgets and batch
+sizes are targets, not a hard global VRAM cap: CUDA contexts, libraries, scratch
+space and queued/live batches can require additional memory. Start with
+`--sizes 100000` and reduce the input or targets if pressure is reported. Input
+is checkpointed and warmed; it is not pinned to the GPU. To include Q1, add
+`udfbench_q1` to `--workloads` and pass the prepared `--q1-data` CSV described
+above. The default stage sizes remain 100K/1M for every selected workload.
+
+Every CPU alternative runs, and correctness comparisons precede profiling.
+Each GPU sample must prove one GPU execution and zero fallbacks. Warmups are
+retained in the raw evidence and excluded from summaries. The stages are:
+
+- `input_prepare_scan`: input preparation and scan work, including applicable
+  decoding and host-to-device transfers.
+- `projection_expressions`: actual plan projections, including the UDF or SQL
+  macro, other expressions, allocations and NULL handling. This measures the
+  projection stage, rather than an isolated callback or CUDA kernel. For example,
+  the cuDF aggregate can also evaluate `length(result)` in a projection.
+- `aggregation`: partial/final aggregation and merge work.
+- `output_transfer_materialization`: result collector work, combining
+  device-to-host transfer and DuckDB host result construction on the GPU path.
+  Stages unavailable in either engine's profile are omitted from comparisons.
+- `other`: remaining measured operator work.
+
+`summary.csv` reports each engine/baseline/stage's median accumulated operator
+wall time, with query wall time kept separately. `comparison.csv` compares each
+CPU alternative with the GPU for stages available in both profiles:
+`operator_work_ratio = CPU operator milliseconds / GPU operator milliseconds`.
+Compare all baselines and keep slowdowns visible; do not choose the generated
+CPU callback alone as the headline comparison.
+
+These durations accumulate across operator calls and workers. They are not
+device-only times, CPU instruction times, or a partition of query latency:
+operators can overlap and stage boundaries differ across engines. One CPU
+thread is the default; `--threads 8` is supported but makes CPU results sums
+across parallel workers, rather than latency. TRACE/profiling also adds overhead,
+so this diagnostic experiment is separate from the end-to-end benchmark.
+GPU durations have 0.01 ms resolution; a rounded zero produces an empty ratio,
+not an infinite speedup. Real device kernel/copy attribution requires a device
+profiler; existing NVTX `native_reads` and `native_h2d` ranges can help with that.
+
+`results.json` keeps every raw profile, stage availability, operator rows/bytes,
+pool observations and pressure events, plus machine/build/configuration metadata.
+Each job preserves `stage-measurements.json`, CPU profile JSON, exact marked SQL,
+`sirius.yaml`, and engine TRACE logs. Pool peaks are lifetime high-water marks,
+not isolated per-query peaks. Inspect downgrade/OOM/reschedule evidence before
+interpreting a result as free of memory pressure. An OOM attempt that fails before
+the operator emits its timing can leave some retry work unmeasured; pressure
+results should not be presented as complete stage costs. Failed jobs preserve their
+artifacts, are recorded in `failures`, and make the runner exit nonzero.
+
+Run the stage driver/parser checks without a GPU:
+
+```bash
+pixi run --locked -e cuda12 python -m unittest discover \
+  -s test/udf_performance -p 'test_*.py'
+```
+
 ## Outputs and harness tests
 
 - `results.json`: machine/revision metadata, all raw CPU/GPU timing samples,
