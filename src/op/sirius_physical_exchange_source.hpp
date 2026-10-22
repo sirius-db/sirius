@@ -26,6 +26,10 @@ namespace sirius::exchange {
 class exchange_service;
 }
 
+namespace sirius::exec {
+class query_lifecycle_registry;
+}
+
 namespace sirius::op {
 
 /**
@@ -61,6 +65,10 @@ class sirius_physical_exchange_source : public sirius_physical_operator {
   [[nodiscard]] exchange::stream_id stream() const noexcept { return _stream; }
   [[nodiscard]] bool ordered() const noexcept;
 
+  /// Unordered arrivals land in this source's port repository, where they can be spilled, only
+  /// while @p lifecycle grants this query work; without one they stay in a private queue.
+  void set_query_lifecycle(exec::query_lifecycle_registry& lifecycle);
+
   /// Arrivals schedule this pipeline; the last sender's end re-checks whether it finished.
   void set_pipeline(std::shared_ptr<pipeline::sirius_pipeline> pipeline) override;
 
@@ -92,6 +100,9 @@ class sirius_physical_exchange_source : public sirius_physical_operator {
  private:
   struct state;
   struct receiver;
+
+  /// Unordered: queues arrivals in the port's repository from now on. Under the state mutex.
+  void bind_repository();
 
   std::shared_ptr<exchange::exchange_service> _service;
   exchange::stream_id _stream;

@@ -21,13 +21,17 @@
 #include "exchange/exchange_service.hpp"
 #include "exchange/exchange_test_utils.hpp"
 #include "exchange/loopback_fabric.hpp"
+#include "exec/query_lifecycle_registry.hpp"
 #include "helper/type_conversions.hpp"
 #include "op/partition/gpu_partition_impl.hpp"
 #include "op/sirius_physical_exchange_sink.hpp"
 #include "op/sirius_physical_exchange_source.hpp"
+#include "pipeline/sirius_pipeline.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/table/table.hpp>
+
+#include <cucascade/data/data_repository.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -335,6 +339,46 @@ TEST_CASE("an exchange source hints READY with data, waits while open, ends when
   sink.finalize_operator();
   CHECK(source.all_ports_empty());
   CHECK_FALSE(source.get_next_task_hint().has_value());
+}
+
+TEST_CASE("an exchange source queues arrivals where they can be spilled, while its query is open",
+          "[exchange][operators]")
+{
+  ranks c(1);
+  auto const query = sirius::make_query_id(41);
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(query);
+  sirius_physical_exchange_source source(key_value_types(), 0, c.all[0].service, 9, {0}, false);
+  sirius_physical_exchange_sink sink(
+    key_value_types(), 0, c.all[0].service, 9, exchange_spec{.routing = mode::broadcast});
+  source.set_query_lifecycle(lifecycle);
+  auto pipeline = std::make_shared<sirius::pipeline::sirius_pipeline>(
+    sirius::pipeline::pipeline_build_context{nullptr, true});
+  pipeline->set_query_id(query);
+  source.set_pipeline(pipeline);
+
+  // Before the port is wired, an arrival waits outside any repository.
+  sink_batch(sink, key_value_batch(0, 0));
+  cucascade::shared_data_repository repo;
+  auto port  = std::make_unique<sirius::op::sirius_physical_operator::port>();
+  port->type = sirius::op::MemoryBarrierType::PIPELINE;
+  port->repo = &repo;
+  source.add_port("default", std::move(port));
+  REQUIRE(source.get_next_task_hint().has_value());
+  CHECK(repo.total_size() == 1);
+
+  sink_batch(sink, key_value_batch(1, 1));
+  CHECK(repo.total_size() == 2);
+  REQUIRE(source.get_next_task_input_data() != nullptr);
+  CHECK(repo.total_size() == 1);
+
+  // A query that is ending takes no more work: a late arrival is dropped, not queued.
+  lifecycle.quiesce(query);
+  sink_batch(sink, key_value_batch(2, 2));
+  CHECK(repo.total_size() == 1);
+  REQUIRE(source.get_next_task_input_data() != nullptr);
+  sink.finalize_operator();
+  CHECK(source.all_ports_empty());
 }
 
 TEST_CASE("a failed exchange fails the next task of its sources", "[exchange][operators]")
