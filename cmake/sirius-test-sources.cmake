@@ -374,3 +374,7 @@ set(TEST_SOURCES
 # caught by the check-orphan-tests pre-commit hook
 # (scripts/check_orphan_tests.py) rather than a configure-time glob — see
 # test/cpp/orphan_test_allowlist.txt.
+
+if(SIRIUS_WITH_NIXL)
+  list(APPEND TEST_SOURCES test/cpp/exchange/test_exchange_nixl.cpp)
+endif()

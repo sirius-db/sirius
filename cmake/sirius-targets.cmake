@@ -67,6 +67,9 @@ set(SIRIUS_LINK_LIBRARIES
 if(BUILD_WITH_CTRACK)
   list(APPEND SIRIUS_LINK_LIBRARIES $<BUILD_INTERFACE:ctrack::ctrack>)
 endif()
+if(SIRIUS_WITH_NIXL)
+  list(APPEND SIRIUS_LINK_LIBRARIES ${NIXL_LIBRARY} ${NIXL_BUILD_LIBRARY})
+endif()
 
 foreach(_target sirius_objects sirius_context_config sirius_core sirius_shared)
   set_target_properties(${_target} PROPERTIES CXX_SCAN_FOR_MODULES OFF)
