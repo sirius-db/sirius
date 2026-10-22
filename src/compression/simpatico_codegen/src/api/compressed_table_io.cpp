@@ -259,11 +259,13 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
   auto make_col = [&](std::size_t i) -> std::unique_ptr<cudf::column> {
     auto const& bd     = bufs[i];
     cudf::data_type dt = tag_to_dtype(bd.type_tag);
-    auto col           = cudf::make_numeric_column(dt,
-                                         static_cast<cudf::size_type>(bd.num_rows),
-                                         cudf::mask_state::UNALLOCATED,
-                                         stream,
-                                         leaf_mr);
+    // Fixed-width, not numeric: an identity leaf keeps its column's type, which may
+    // be a decimal or chrono type that make_numeric_column rejects.
+    auto col = cudf::make_fixed_width_column(dt,
+                                             static_cast<cudf::size_type>(bd.num_rows),
+                                             cudf::mask_state::UNALLOCATED,
+                                             stream,
+                                             leaf_mr);
     if (bd.size_bytes > 0) {
       fill(i, col->mutable_view().head<void>(), static_cast<std::size_t>(bd.size_bytes), stream);
     }
@@ -329,7 +331,11 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
 //
 // 12: a per-column validity sidecar record sits beside each column's plan tree (see
 //     push_validity), so a nullable column compresses instead of falling back.
-static constexpr std::uint8_t kVersion = 12;
+//
+// 13: a Bitpack "packed" buffer carries five decode guard words rather than three,
+//     because the 128-bit gather spans five uint32 words. The count is part of the
+//     buffer's num_rows, so a v12 payload read with a v13 decoder would over-read.
+static constexpr std::uint8_t kVersion = 13;
 
 // Per-column validity record, written right after num_rows:
 //
