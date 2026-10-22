@@ -495,6 +495,11 @@ When filter pushdown is enabled and the `gpu_expression_translator` successfully
 
    Before cuDF 26.12, the reader's bloom filter probe is wrong for some column types (rapidsai/cudf#24319). The reader filter (`_reader_pushdown_expression`) therefore leaves out equalities on the types listed by `has_unreliable_bloom_filter_probe()`, and they are applied post-decode. From cuDF 26.12 the list is empty.
 
+   `NOT IN` translates to inequalities joined by `NULL_LOGICAL_AND`, preserving SQL NULL semantics.
+   It must not become `NOT` over an OR of equalities: the reader rewrites those equalities to
+   Bloom membership probes, whose positive answers only mean a row group may contain a value.
+   Negating those answers can discard mixed groups that also contain rows satisfying `NOT IN`.
+
 Reader-side pushdown is a per-split decision: an FLBA-decimal safety probe can disable it for a file, in which case the cached DuckDB filter expression is evaluated through `expression_evaluator` on the decoded batch in `post_filter_and_project`.
 
 Virtual-column scans currently disable reader-side row filtering, including dynamic-filter AST merging. Row-group statistics pruning remains enabled, but all rows in selected row groups are decoded before residual predicates and membership filters run—even for a selective `WHERE filename = ...`.

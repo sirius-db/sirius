@@ -75,6 +75,72 @@ class ParquetBloomFilterFixture : public sirius::test::GpuExecutionFixture {
   std::string hive_scan_;
 };
 
+class ParquetNotInBloomFilterFixture : public sirius::test::GpuExecutionFixture {
+ public:
+  ParquetNotInBloomFilterFixture()
+  {
+    auto const pq_path    = dir_.file("priorities.parquet");
+    auto const plain_path = dir_.file("without_bloom.parquet");
+    auto const hive_root  = dir_.file("hive");
+    auto const hive_glob  = hive_root + "/part=*/*.parquet";
+    using sirius::test::sql_literal;
+
+    {
+      scoped_sirius_disable disable_guard;
+      duckdb::DuckDB gen_db(nullptr);
+      duckdb::Connection gen(gen_db);
+      for (auto const& sql : std::vector<std::string>{
+             "CREATE TABLE priorities AS SELECT i::INTEGER AS id,"
+             " CASE i % 6 WHEN 0 THEN '1-URGENT' WHEN 1 THEN '2-HIGH'"
+             " WHEN 2 THEN '3-MEDIUM' WHEN 3 THEN '4-NOT SPECIFIED'"
+             " WHEN 4 THEN '5-LOW' ELSE NULL END AS priority,"
+             " ((i // 6) % 2)::INTEGER AS part FROM range(6144) AS r(i)",
+             "COPY (SELECT id, priority FROM priorities) TO " + sql_literal(pq_path) +
+               " (FORMAT PARQUET, ROW_GROUP_SIZE 2048, WRITE_BLOOM_FILTER true)",
+             "COPY (SELECT id, priority FROM priorities) TO " + sql_literal(plain_path) +
+               " (FORMAT PARQUET, ROW_GROUP_SIZE 2048, WRITE_BLOOM_FILTER false)",
+             "COPY priorities TO " + sql_literal(hive_root) +
+               " (FORMAT PARQUET, ROW_GROUP_SIZE 2048, PARTITION_BY (part),"
+               " WRITE_BLOOM_FILTER true)",
+           }) {
+        auto result = gen.Query(sql);
+        REQUIRE(result);
+        if (result->HasError()) { UNSCOPED_INFO("fixture setup error: " << result->GetError()); }
+        REQUIRE_FALSE(result->HasError());
+      }
+
+      // Bloom filters depend on dictionary encoding even when explicitly enabled.
+      // Verify every priority row group, including both hive partitions, so a
+      // writer change cannot silently remove the condition that exposed #2295.
+      for (auto const& path : {pq_path, hive_glob, plain_path}) {
+        INFO(path);
+        auto metadata = gen.Query(
+          "SELECT bloom_filter_offset IS NOT NULL AND coalesce(bloom_filter_length, 0) > 0 "
+          "FROM parquet_metadata(" +
+          sql_literal(path) + ") WHERE path_in_schema = 'priority'");
+        REQUIRE(metadata);
+        if (metadata->HasError()) { UNSCOPED_INFO(metadata->GetError()); }
+        REQUIRE_FALSE(metadata->HasError());
+        REQUIRE(metadata->RowCount() > 1);
+        for (duckdb::idx_t row = 0; row < metadata->RowCount(); ++row) {
+          REQUIRE(metadata->Collection().GetValue(0, row).GetValue<bool>() == (path != plain_path));
+        }
+      }
+    }
+
+    scan_       = "read_parquet(" + sql_literal(pq_path) + ")";
+    plain_scan_ = "read_parquet(" + sql_literal(plain_path) + ")";
+    hive_scan_  = "read_parquet(" + sql_literal(hive_glob) + ", hive_partitioning=true)";
+    run_ok("SET enable_duckdb_fallback = false");
+  }
+
+ protected:
+  sirius::test::scratch_dir dir_{"not_in_bloom_filter"};
+  std::string scan_;
+  std::string plain_scan_;
+  std::string hive_scan_;
+};
+
 }  // namespace
 
 // Returned 0 rows on the GPU: the probe hashed the literal as 1 or 2 bytes.
@@ -119,4 +185,34 @@ TEST_CASE_METHOD(ParquetBloomFilterFixture,
   compare_gpu_vs_cpu("SELECT COUNT(*) FROM " + hive_scan_ + " WHERE s = 3");
   compare_gpu_vs_cpu_ordered("SELECT id, d, part FROM " + hive_scan_ +
                              " WHERE d = -5 AND id < 1000 ORDER BY id");
+}
+
+TEST_CASE_METHOD(ParquetNotInBloomFilterFixture,
+                 "parquet NOT IN preserves mixed row groups with bloom filters",
+                 "[integration][gpu_execution][scan][parquet][pushdown]")
+{
+  // Issue #2295: NOT(OR(equalities)) inverted the reader's positive Bloom probes,
+  // discarding mixed row groups. Every group here contains both excluded values,
+  // allowed values, and NULLs, so rejecting the whole group loses matching rows.
+  auto const not_in = "priority NOT IN ('1-URGENT', '2-HIGH')";
+  compare_gpu_vs_cpu("SELECT COUNT(*) FROM " + plain_scan_ + " WHERE " + not_in);
+  for (auto const& scan : {scan_, hive_scan_}) {
+    CAPTURE(scan);
+    compare_gpu_vs_cpu("SELECT COUNT(*) FROM " + scan + " WHERE " + not_in);
+    compare_gpu_vs_cpu("SELECT COUNT(*) FROM " + scan +
+                       " WHERE priority <> '1-URGENT' AND priority <> '2-HIGH'");
+    compare_gpu_vs_cpu("SELECT COUNT(*) FROM " + scan +
+                       " WHERE priority IN ('1-URGENT', '2-HIGH')");
+    compare_gpu_vs_cpu_ordered("SELECT id, priority FROM " + scan + " WHERE " + not_in +
+                               " AND id BETWEEN 6080 AND 6100 ORDER BY id");
+    compare_gpu_vs_cpu_ordered("SELECT id, priority FROM " + scan + " WHERE (" + not_in +
+                               " OR priority = '1-URGENT') AND id < 30 ORDER BY id");
+    // NULL probes stay UNKNOWN under NOT IN. A NULL list element also makes
+    // nonmatching probes UNKNOWN; the explicit IS NULL branch still returns rows.
+    compare_gpu_vs_cpu("SELECT COUNT(*) FROM " + scan +
+                       " WHERE priority NOT IN ('1-URGENT', NULL)");
+    compare_gpu_vs_cpu_ordered("SELECT id, priority FROM " + scan +
+                               " WHERE (priority NOT IN ('1-URGENT', NULL) OR priority IS NULL)"
+                               " AND id < 30 ORDER BY id");
+  }
 }
