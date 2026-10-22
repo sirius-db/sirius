@@ -16,15 +16,25 @@
 
 #pragma once
 
+#include "exchange/transport.hpp"
 #include "op/dynamic_filter/config.hpp"
 #include "op/dynamic_filter/dynamic_filter_replica_space.hpp"
 
 #include <cudf/types.hpp>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <vector>
+
+namespace cucascade::memory {
+class memory_space;
+}
+
+namespace sirius::exchange {
+class exchange_service;
+}
 
 namespace sirius::op {
 
@@ -165,11 +175,34 @@ class dynamic_filter_publish_plan final {
    */
   void restrict_replicas_to(std::vector<int> const& admitted_gpu_ids);
 
+  /**
+   * @brief Distributed execution: after an exchange, a rank's build holds only its share of the
+   * keys, so a filter from it alone would drop rows another rank's build matches. Each rank
+   * instead builds a Bloom of the same size per key, and every rank ORs them all. A key whose
+   * filters cannot all be merged publishes nothing; other filter kinds are not published.
+   */
+  struct distributed_merge {
+    std::shared_ptr<exchange::exchange_service> service;
+    /// Admitted key i merges on stream first_stream + i, the same on every rank.
+    exchange::stream_id first_stream     = 0;
+    cucascade::memory::memory_space* gpu = nullptr;
+    /// Every rank's Bloom is sized for this many keys.
+    std::size_t bloom_keys = 0;
+    /// A rank that has not sent its filter by then is given up on: the key publishes nothing.
+    std::chrono::milliseconds timeout{std::chrono::minutes{2}};
+  };
+  void set_distributed(distributed_merge merge)
+  {
+    _distributed = std::make_shared<distributed_merge const>(std::move(merge));
+  }
+  [[nodiscard]] distributed_merge const* distributed() const noexcept { return _distributed.get(); }
+
  private:
   std::vector<admitted_key> _admitted_keys;
   std::vector<probe_target> _probe_targets;
   dynamic_filter_publication_policy _policy{};
   std::vector<dynamic_filter_replica_space> _replica_spaces;
+  std::shared_ptr<distributed_merge const> _distributed;
 };
 
 }  // namespace sirius::op
