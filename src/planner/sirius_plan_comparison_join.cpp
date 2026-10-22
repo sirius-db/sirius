@@ -401,11 +401,8 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   std::size_t rhs_cardinality = op.children[1]->EstimateCardinality(context);
 
   auto sirius_context = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  // Distributed: a rank's build holds only its share of the keys after the join's exchange, so a
-  // filter pushed below the exchange would drop rows other ranks' builds match.
   bool const dynamic_filter_enabled =
-    sirius_context && duckdb::query_operator_options(context)->enable_dynamic_filter &&
-    duckdb::query_operator_options(context)->exchange_peers.empty();
+    sirius_context && duckdb::query_operator_options(context)->enable_dynamic_filter;
 
   bool const build_filtered = dynamic_filter_enabled && build_subtree_is_filtering(*op.children[1]);
   bool const build_opaque   = dynamic_filter_enabled && build_relation_is_opaque(*op.children[1]);
@@ -501,6 +498,10 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     auto options          = duckdb::query_operator_options(context);
     const auto& op_params = *options;
     auto* const stats     = &sirius_context->get_dynamic_filter_stats();
+    // Distributed: Blooms merge across ranks on whole-build publication only, so no build
+    // accumulates one across its partitions (and no BUILD_FILTER is planned for it).
+    bool const multi_partition =
+      op_params.enable_dynamic_filter_multi_partition && op_params.exchange_peers.empty();
 
     // Resolve placements before registering any producer channel.
     auto& memory_manager  = sirius_context->get_memory_manager();
@@ -524,8 +525,8 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     bool const discovery_runs =
       build_evidence && op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
       !gpu_spaces.empty() && !host_spaces.empty() &&
-      (!needs_early_publication || (op_params.enable_dynamic_filter_multi_partition &&
-                                    op_params.max_dynamic_filter_bloom_bytes_per_gpu > 0));
+      (!needs_early_publication ||
+       (multi_partition && op_params.max_dynamic_filter_bloom_bytes_per_gpu > 0));
     if (discovery_runs) {
       bool const scan_bind_armed = scan_route_join_type_admissible(op.join_type);
       descent_policy const policy{.descend_build_blocks = true};
@@ -686,7 +687,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       {.emit_zone_map_filters     = op_params.enable_dynamic_zone_map_filter,
        .domain_coverage_threshold = op_params.dynamic_filter_domain_coverage_threshold,
        .inlist_max_l2_fraction    = op_params.dynamic_filter_inlist_max_l2_fraction,
-       .enable_multi_partition    = op_params.enable_dynamic_filter_multi_partition,
+       .enable_multi_partition    = multi_partition,
        .max_bloom_bytes_per_gpu   = op_params.max_dynamic_filter_bloom_bytes_per_gpu}};
 
     auto join = duckdb::make_uniq<sirius::op::sirius_physical_hash_join>(

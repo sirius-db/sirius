@@ -317,6 +317,11 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     _dynamic_filter_session.restrict_replicas_to(admitted_gpu_ids);
   }
 
+  void set_distributed_dynamic_filters(dynamic_filter_publish_plan::distributed_merge merge)
+  {
+    _dynamic_filter_session.set_distributed(std::move(merge));
+  }
+
   void seal_dynamic_filter_plan() noexcept { _dynamic_filter_session.seal_plan(); }
   void cancel_dynamic_filter_publication() noexcept { _dynamic_filter_session.cancel(); }
 

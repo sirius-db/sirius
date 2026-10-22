@@ -87,6 +87,9 @@ class dynamic_filter_publication_session final {
   [[nodiscard]] dynamic_filter_publish_plan const& plan() const noexcept;
   void restrict_replicas_to(std::vector<int> const& admitted_gpu_ids);
 
+  /// See dynamic_filter_publish_plan::distributed_merge. Before the plan is sealed.
+  void set_distributed(dynamic_filter_publish_plan::distributed_merge merge);
+
   /**
    * @brief Starts accumulating against @p inventory. Call on an untracked thread (the task
    * creator).

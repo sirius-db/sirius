@@ -416,6 +416,15 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
   sirius_dynamic_bloom_filter(cudf::column_view const& keys,
                               ::cuda::stream_ref stream,
                               rmm::device_async_resource_ref mr);
+
+  /**
+   * @brief Builds a Bloom filter sized for @p capacity_keys keys, whatever @p keys holds, so
+   * filters built apart with the same capacity can be ORed together (merge_from()).
+   */
+  sirius_dynamic_bloom_filter(cudf::column_view const& keys,
+                              std::size_t capacity_keys,
+                              ::cuda::stream_ref stream,
+                              rmm::device_async_resource_ref mr);
   ~sirius_dynamic_bloom_filter() override;
 
   sirius_dynamic_bloom_filter(sirius_dynamic_bloom_filter const&)            = delete;
@@ -448,6 +457,19 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
   [[nodiscard]] membership_key_domain const& domain() const noexcept { return _domain; }
   [[nodiscard]] static bool supports(cudf::data_type t) noexcept;
   [[nodiscard]] static std::size_t estimated_bytes(std::size_t num_keys) noexcept;
+
+  /// The source replica's bit storage on the device: equal sizes and domains mean the same layout.
+  [[nodiscard]] void const* storage() const;
+  [[nodiscard]] std::size_t storage_bytes() const;
+
+  /**
+   * @brief ORs another filter's bit storage into the source replica, which then also holds that
+   * filter's keys. Call before replicate_to_devices().
+   *
+   * @param words Device storage of a filter of this size and domain, as storage() gives it.
+   * @throw std::invalid_argument when @p bytes is not this filter's storage_bytes()
+   */
+  void merge_from(void const* words, std::size_t bytes, ::cuda::stream_ref stream);
 
  private:
   [[nodiscard]] std::unique_ptr<cudf::column> compute_mask_impl(
