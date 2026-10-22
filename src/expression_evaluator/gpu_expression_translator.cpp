@@ -688,14 +688,13 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
   if (alt.op == sirius::ast::unary_op::kind::op_not) {
     auto const* child = alt.child.get();
     bool negated      = true;
-    while (child->holds<sirius::ast::unary_op>() &&
-           child->get<sirius::ast::unary_op>().op == sirius::ast::unary_op::kind::op_not) {
+    while (auto const* unary = std::get_if<sirius::ast::unary_op>(&child->v)) {
+      if (unary->op != sirius::ast::unary_op::kind::op_not) { break; }
       negated = !negated;
-      child   = child->get<sirius::ast::unary_op>().child.get();
+      child   = unary->child.get();
     }
-    if (child->holds<sirius::ast::in_list>()) {
-      auto const& list = child->get<sirius::ast::in_list>();
-      return add_in_list(list, table_src, list.negated != negated);
+    if (auto const* list = std::get_if<sirius::ast::in_list>(&child->v)) {
+      return add_in_list(*list, table_src, list->negated != negated);
     }
   }
 
@@ -742,40 +741,33 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
 std::optional<expr_ref> gpu_expression_translator::add_in_list(
   sirius::ast::in_list const& alt, cudf::ast::table_reference const table_src, bool negated)
 {
-  // IN expressions must have at least one comparator value.
-  if (alt.values.empty()) { return std::nullopt; }
-
   // Lower NOT IN as a conjunction of inequalities. Parquet Bloom filters answer
   // whether a row group may contain a value; negating an OR of those answers can
   // discard a mixed group that also contains values satisfying NOT IN (#2295).
   // Kleene AND preserves SQL NULL semantics when a probe or list value is NULL.
-  auto const comparison_op =
-    negated ? cudf::ast::ast_operator::NOT_EQUAL : cudf::ast::ast_operator::EQUAL;
-  auto const conjunction_op =
-    negated ? cudf::ast::ast_operator::NULL_LOGICAL_AND : cudf::ast::ast_operator::NULL_LOGICAL_OR;
-
-  // Translate the first comparison expression
-  auto test_expr = add_expression(*alt.probe, table_src);
-  if (!test_expr) { return std::nullopt; }
-  auto comparator_expr = add_expression(*alt.values[0], table_src);
-  if (!comparator_expr) { return std::nullopt; }
-  expr_ref comparison_expr =
-    _ast_tree.emplace<cudf::ast::operation>(comparison_op, *test_expr, *comparator_expr);
+  using enum cudf::ast::ast_operator;
+  auto const comparison_op  = negated ? NOT_EQUAL : EQUAL;
+  auto const conjunction_op = negated ? NULL_LOGICAL_AND : NULL_LOGICAL_OR;
+  std::optional<expr_ref> result;
 
   // Re-translate the probe each time to avoid shared AST subgraphs.
-  for (size_t i = 1; i < alt.values.size(); ++i) {
+  for (auto const& value : alt.values) {
     auto probe_expr = add_expression(*alt.probe, table_src);
     if (!probe_expr) { return std::nullopt; }
-    auto value_expr = add_expression(*alt.values[i], table_src);
+    auto value_expr = add_expression(*value, table_src);
     if (!value_expr) { return std::nullopt; }
 
-    expr_ref next_comparison_expr =
+    expr_ref comparison_expr =
       _ast_tree.emplace<cudf::ast::operation>(comparison_op, *probe_expr, *value_expr);
-    comparison_expr = _ast_tree.emplace<cudf::ast::operation>(
-      conjunction_op, comparison_expr, next_comparison_expr);
+    if (result) {
+      result = _ast_tree.emplace<cudf::ast::operation>(conjunction_op, *result, comparison_expr);
+    } else {
+      result = comparison_expr;
+    }
   }
 
-  return comparison_expr;
+  // An empty list has no comparison to translate.
+  return result;
 }
 
 //===----------FUNCTION----------===//

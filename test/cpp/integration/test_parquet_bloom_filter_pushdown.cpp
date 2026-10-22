@@ -27,6 +27,7 @@
 #include <duckdb.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/parquet_fixture_utils.hpp>
+#include <utils/scoped_temp_directory.hpp>
 
 #include <string>
 #include <vector>
@@ -83,6 +84,7 @@ class ParquetNotInBloomFilterFixture : public sirius::test::GpuExecutionFixture 
     auto const plain_path = dir_.file("without_bloom.parquet");
     auto const hive_root  = dir_.file("hive");
     auto const hive_glob  = hive_root + "/part=*/*.parquet";
+    using sirius::test::query;
     using sirius::test::sql_literal;
 
     {
@@ -103,10 +105,7 @@ class ParquetNotInBloomFilterFixture : public sirius::test::GpuExecutionFixture 
                " (FORMAT PARQUET, ROW_GROUP_SIZE 2048, PARTITION_BY (part),"
                " WRITE_BLOOM_FILTER true)",
            }) {
-        auto result = gen.Query(sql);
-        REQUIRE(result);
-        if (result->HasError()) { UNSCOPED_INFO("fixture setup error: " << result->GetError()); }
-        REQUIRE_FALSE(result->HasError());
+        query(gen, sql);
       }
 
       // Bloom filters depend on dictionary encoding even when explicitly enabled.
@@ -114,13 +113,11 @@ class ParquetNotInBloomFilterFixture : public sirius::test::GpuExecutionFixture 
       // writer change cannot silently remove the condition that exposed #2295.
       for (auto const& path : {pq_path, hive_glob, plain_path}) {
         INFO(path);
-        auto metadata = gen.Query(
-          "SELECT bloom_filter_offset IS NOT NULL AND coalesce(bloom_filter_length, 0) > 0 "
-          "FROM parquet_metadata(" +
-          sql_literal(path) + ") WHERE path_in_schema = 'priority'");
-        REQUIRE(metadata);
-        if (metadata->HasError()) { UNSCOPED_INFO(metadata->GetError()); }
-        REQUIRE_FALSE(metadata->HasError());
+        auto metadata =
+          query(gen,
+                "SELECT bloom_filter_offset IS NOT NULL AND coalesce(bloom_filter_length, 0) > 0 "
+                "FROM parquet_metadata(" +
+                  sql_literal(path) + ") WHERE path_in_schema = 'priority'");
         REQUIRE(metadata->RowCount() > 1);
         for (duckdb::idx_t row = 0; row < metadata->RowCount(); ++row) {
           REQUIRE(metadata->Collection().GetValue(0, row).GetValue<bool>() == (path != plain_path));
