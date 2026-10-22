@@ -33,7 +33,8 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::hash_par
   int num_partitions,
   ::cuda::stream_ref stream,
   cucascade::memory::memory_space& memory_space,
-  const telemetry::batch_telemetry_info& telemetry_info)
+  const telemetry::batch_telemetry_info& telemetry_info,
+  uint32_t seed)
 {
   // Sanity check.
   if (num_partitions < 2) {
@@ -77,7 +78,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::hash_par
                                                effective_key_idx,
                                                num_partitions,
                                                cudf::hash_id::HASH_MURMUR3,
-                                               cudf::DEFAULT_HASH_SEED,
+                                               seed,
                                                stream,
                                                memory_space.get_default_allocator());
 

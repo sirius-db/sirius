@@ -18,6 +18,7 @@
 
 #include "op/partition_placement.hpp"
 
+#include <cudf/hashing.hpp>
 #include <cudf/types.hpp>
 
 #include <memory>
@@ -44,6 +45,9 @@ struct partition_spec {
 
   /// Per-key cast before hashing (e.g. INT32 vs INT64). Empty = hash as-is. Ignored in broadcast.
   std::vector<cudf::data_type> key_cast_types;
+
+  /// Murmur3 seed. A sink that routes across ranks must not share PARTITION's default seed.
+  uint32_t hash_seed = cudf::DEFAULT_HASH_SEED;
 
   partition_spec() = default;
 
