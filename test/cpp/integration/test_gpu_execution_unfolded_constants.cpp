@@ -39,7 +39,9 @@ class UnfoldedConstantsFixture : public sirius::test::GpuExecutionFixture {
       " CASE WHEN i % 11 = 0 THEN NULL"
       " ELSE TIMESTAMP '2001-02-03 04:05:06' + to_seconds(i * 3607) END AS ts,"
       " CASE WHEN i % 3 = 0 THEN NULL ELSE (i * 0.5)::DOUBLE END AS f,"
-      " CASE WHEN i % 4 = 0 THEN NULL ELSE i % 2 = 0 END AS b"
+      " CASE WHEN i % 4 = 0 THEN NULL ELSE i % 2 = 0 END AS b,"
+      " CASE WHEN i % 9 = 0 THEN NULL ELSE (i * 0.25)::DECIMAL(10, 2) END AS dd,"
+      " NULL::DATE AS null_date"
       " FROM range(2000) r(i);");
     run_ok("CHECKPOINT;");
   }
@@ -77,7 +79,10 @@ TEST_CASE_METHOD(UnfoldedConstantsFixture,
                  "date part of a constant left by coalesce simplification",
                  "[integration][gpu_execution][unfolded_constants]")
 {
-  // Reduced from fuzz finding 010-gpu_error-5f584789.
+  // Fuzz finding 010-gpu_error-5f584789. Without `i` the scan projects no columns.
+  compare_all_strategies(
+    "SELECT month(coalesce(DATE '2020-02-01', CASE WHEN s LIKE '%a%' THEN DATE '2000-12-05'"
+    " ELSE DATE '2019-01-01' END)) FROM t");
   compare_all_strategies(
     "SELECT i, month(coalesce(DATE '2020-02-01', CASE WHEN s LIKE '%a%' THEN DATE '2000-12-05'"
     " ELSE DATE '2019-01-01' END)) FROM t");
@@ -85,6 +90,7 @@ TEST_CASE_METHOD(UnfoldedConstantsFixture,
   compare_all_strategies(
     "SELECT i, hour(coalesce(TIMESTAMP '2020-02-01 13:14:15', ts)),"
     " day(coalesce(TIMESTAMP '2020-02-01 13:14:15', ts)) FROM t");
+  compare_all_strategies("SELECT i, month(coalesce(null_date, NULL::DATE)) FROM t");
   compare_all_strategies(
     "SELECT i, date_trunc('hour', coalesce(TIMESTAMP '2020-02-01 13:14:15', ts)) FROM t");
 }
@@ -98,8 +104,10 @@ TEST_CASE_METHOD(UnfoldedConstantsFixture,
   compare_all_strategies(
     "SELECT i, upper(coalesce('apple', s)), lower(coalesce('APPLE', s)) FROM t");
   compare_all_strategies("SELECT i, substring(coalesce('apple', s), 2, 3) FROM t");
+  // DuckDB rewrites `LIKE '%lit%'` to contains(), so these patterns keep the LIKE handler.
   compare_all_strategies(
-    "SELECT i, coalesce('apple', s) LIKE '%pp%', coalesce('apple', s) NOT LIKE '%x%' FROM t");
+    "SELECT i, coalesce('apple', s) LIKE '%pp%le%', coalesce('apple', s) NOT LIKE '%pp%x%',"
+    " coalesce('apple', s) LIKE 'a_ple' FROM t");
   compare_all_strategies(
     "SELECT i, contains(coalesce('apple', s), 'pl'), prefix(coalesce('apple', s), 'ap'),"
     " suffix(coalesce('apple', s), 'le') FROM t");
@@ -114,6 +122,10 @@ TEST_CASE_METHOD(UnfoldedConstantsFixture,
   compare_all_strategies("SELECT i, (coalesce(2, x) + 1) * coalesce(3, x) FROM t");
   compare_all_strategies("SELECT i, coalesce(2.5::DOUBLE, f) / 2 FROM t");
   compare_all_strategies("SELECT i, coalesce(2, x) IN (1, 2), coalesce(2, x) NOT IN (2, 3) FROM t");
+  compare_all_strategies("SELECT i, coalesce('apple', s) IN ('apple', 'pear') FROM t");
+  compare_all_strategies("SELECT i, coalesce(2, x) IN (x, i) FROM t");
+  // DECIMAL arithmetic has no AST form, so every strategy takes the materialize path.
+  compare_all_strategies("SELECT i, coalesce(2.5, dd) + 1 FROM t");
 }
 
 TEST_CASE_METHOD(UnfoldedConstantsFixture,
