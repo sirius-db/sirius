@@ -37,7 +37,8 @@
 #include "expression/function_id.hpp"
 #include "expression/join_condition.hpp"  // sirius::comparison_type, sirius::from_duckdb(ExpressionType)
 #include "expression/substring_slice.hpp"
-#include "expression/value.hpp"         // sirius::from_duckdb(Value const&, logical_type const&)
+#include "expression/value.hpp"  // sirius::from_duckdb(Value const&, logical_type const&)
+#include "expression_evaluator/regex/cudf_regex_pattern.hpp"
 #include "helper/type_conversions.hpp"  // sirius::from_duckdb(LogicalType const&)
 
 // duckdb
@@ -301,30 +302,43 @@ std::unique_ptr<node> translate_function(duckdb::BoundFunctionExpression const& 
   if (*func_id_opt == function_id::round && !gpu_supports_round(expr)) { return nullptr; }
   if (*func_id_opt == function_id::abs && !gpu_supports_abs(expr)) { return nullptr; }
   if (*func_id_opt == function_id::regexp_replace) {
-    // The GPU implementation supports constant patterns/replacements and DuckDB's default
-    // options only. In particular, never silently discard the fourth (options) argument.
-    if (expr.GetChildren().size() != 3) { return nullptr; }
-    for (std::size_t i = 1; i < 3; ++i) {
-      if (expr.GetChildren()[i]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) {
+    // The GPU implementation supports constant patterns, replacements and options.
+    auto const& children = expr.GetChildren();
+    if (children.size() != 3 && children.size() != 4) { return nullptr; }
+    for (std::size_t i = 1; i < children.size(); ++i) {
+      if (children[i]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) {
         return nullptr;
       }
-      auto const& value = expr.GetChildren()[i]->Cast<duckdb::BoundConstantExpression>().GetValue();
+      auto const& value = children[i]->Cast<duckdb::BoundConstantExpression>().GetValue();
       if (value.IsNull() || value.type() != duckdb::LogicalType::VARCHAR) { return nullptr; }
     }
-    auto const& pattern = duckdb::StringValue::Get(
-      expr.GetChildren()[1]->Cast<duckdb::BoundConstantExpression>().GetValue());
-    // RE2's shorthand classes and word boundaries are ASCII-only; cuDF's are Unicode-aware.
-    // cuDF also does not implement POSIX classes. Skip escaped characters so a literal \\w
-    // remains supported, but reject these constructs wherever they occur in the pattern.
+    bool global = false;
+    if (children.size() == 4) {
+      // 'c', 'm', 'n' and 'p' restate RE2's defaults. 'i', 'l' and 's' change what the
+      // pattern matches, which the GPU does not implement.
+      for (char const option : duckdb::StringValue::Get(
+             children[3]->Cast<duckdb::BoundConstantExpression>().GetValue())) {
+        switch (option) {
+          case 'g': global = true; break;
+          case 'c':
+          case 'm':
+          case 'n':
+          case 'p':
+          case ' ':
+          case '\t':
+          case '\n': break;
+          default: return nullptr;
+        }
+      }
+    }
+    auto const& pattern =
+      duckdb::StringValue::Get(children[1]->Cast<duckdb::BoundConstantExpression>().GetValue());
+    // RE2's word boundaries are ASCII-only; cuDF's are Unicode-aware. cuDF also does not
+    // implement POSIX classes. Skip escaped characters so a literal \\b remains supported,
+    // but reject these constructs wherever they occur in the pattern.
     for (std::size_t i = 0; i < pattern.size(); ++i) {
       if (pattern[i] == '\\' && i + 1 < pattern.size()) {
         switch (pattern[++i]) {
-          case 'w':
-          case 'W':
-          case 'd':
-          case 'D':
-          case 's':
-          case 'S':
           case 'b':
           case 'B': return nullptr;
           default: break;
@@ -337,10 +351,16 @@ std::unique_ptr<node> translate_function(duckdb::BoundFunctionExpression const& 
         return nullptr;
       }
     }
+    // Perl classes inside a bracket class have no ASCII rewrite.
+    if (!::sirius::regex::to_cudf_regex_pattern(pattern)) { return nullptr; }
     duckdb_re2::RE2::Options options;
     options.set_log_errors(false);
     duckdb_re2::RE2 const regex(pattern, options);
     if (!regex.ok()) { return nullptr; }
+    // cuDF and RE2 place empty matches differently when replacing every match. Without \\b
+    // and \\B, a pattern that matches empty anywhere also matches the empty string, because
+    // every remaining zero-width assertion holds there.
+    if (global && duckdb_re2::RE2::PartialMatch("", regex)) { return nullptr; }
     // cuDF can compile empty-only patterns such as (?:) and a{0} into programs that never
     // replace anything. RE2 bounds every possible match; two empty bounds prove that no
     // nonempty match is possible. One byte is enough to distinguish this from a* or a?.
