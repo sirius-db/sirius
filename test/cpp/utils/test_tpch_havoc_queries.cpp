@@ -13,9 +13,9 @@
 
 #include <catch.hpp>
 #include <duckdb.hpp>
+#include <utils/dynamic_filter_test_utils.hpp>
 #include <utils/tpch_havoc_queries.hpp>
 
-#include <cstdlib>
 #include <filesystem>
 #include <map>
 #include <set>
@@ -31,14 +31,6 @@ std::filesystem::path havoc_dir_or_skip()
   auto dir = sirius::test::tpch_havoc_dir();
   if (!dir) { SKIP("TPC-Havoc queries not downloaded: configured with -DSIRIUS_TPCH_HAVOC=OFF"); }
   return *dir;
-}
-
-std::filesystem::path tpch_db_path()
-{
-  char const* env = std::getenv("SIRIUS_INTEGRATION_TEST_DB_PATH");
-  return env ? std::filesystem::path{env}
-             : std::filesystem::path{SIRIUS_PROJECT_ROOT} /
-                 "test/cpp/integration/data/duckdb/integration.duckdb";
 }
 
 void run_ok(duckdb::Connection& con, std::string const& sql)
@@ -93,7 +85,8 @@ TEST_CASE("tpch_havoc: every query runs on DuckDB at SF 0.1", "[tpch_havoc]")
   sirius::util::env_guard const disable_sirius("SIRIUS_DISABLE", "1");
   duckdb::DuckDB db(nullptr);
   duckdb::Connection con(db);
-  run_ok(con, "ATTACH '" + tpch_db_path().string() + "' AS tpch (READ_ONLY)");
+  run_ok(con,
+         "ATTACH '" + sirius::test::integration_tpch_db_path().string() + "' AS tpch (READ_ONLY)");
   run_ok(con, "USE tpch");
   run_ok(con, sirius::test::kTpchHavocSessionSetup);
 
