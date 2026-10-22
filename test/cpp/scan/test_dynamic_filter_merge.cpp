@@ -46,6 +46,7 @@
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_uvector.hpp>
+#include <rmm/mr/statistics_resource_adaptor.hpp>
 
 #include <cuda/stream>
 #include <cuda_runtime.h>
@@ -55,14 +56,20 @@
 #include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/null_device_memory_resource.hpp>
 #include <data/data_batch_utils.hpp>
+#include <duckdb/planner/filter/constant_filter.hpp>
 #include <op/dynamic_filter/detail/accumulated_bloom_builder.hpp>
 #include <op/dynamic_filter/detail/accumulation_failure.hpp>
 #include <op/dynamic_filter/dynamic_filter_mask_ops.hpp>
 #include <op/dynamic_filter/dynamic_filter_stats.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
+#include <op/scan/detail/read_retirement.hpp>
 #include <op/scan/dynamic_filter_merge.hpp>
+#include <op/scan/parquet_gpu_ingestible.hpp>
 #include <op/scan/scan_plan.hpp>
+#include <op/scan/sirius_gpu_scan_operator.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
+#include <sirius/exception.hpp>
+#include <utils/table_filter_test_utils.hpp>
 
 #include <array>
 #include <atomic>
@@ -1090,7 +1097,20 @@ class counting_in_list_filter final : public sirius_dynamic_filter,
     return _inner->compute_mask(probe, prior_mask_words, device_id, stream, mr);
   }
 
+  /// Counts the hint and probes through the unhinted default, which compute_mask counts too.
+  [[nodiscard]] std::unique_ptr<cudf::column> compute_mask_if(
+    cudf::column_view const& probe,
+    cudf::column_view const& prior_keep,
+    int device_id,
+    ::cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) const override
+  {
+    ++_hinted_calls;
+    return sirius_mask_applicable::compute_mask_if(probe, prior_keep, device_id, stream, mr);
+  }
+
   [[nodiscard]] int mask_calls() const noexcept { return _mask_calls; }
+  [[nodiscard]] int hinted_calls() const noexcept { return _hinted_calls; }
   [[nodiscard]] std::vector<cudf::size_type> const& probe_rows() const noexcept
   {
     return _probe_rows;
@@ -1098,7 +1118,8 @@ class counting_in_list_filter final : public sirius_dynamic_filter,
 
  private:
   std::shared_ptr<sirius::op::sirius_dynamic_in_list_filter> _inner;
-  mutable int _mask_calls = 0;
+  mutable int _mask_calls   = 0;
+  mutable int _hinted_calls = 0;
   mutable std::vector<cudf::size_type> _probe_rows;
 };
 
@@ -2558,7 +2579,7 @@ TEST_CASE("consumer completion failure retains owned source and pending state wi
                                                 cudf::get_current_device_resource_ref(),
                                                 execution_fault::FAILED_COMPLETION,
                                                 &retained),
-                    sirius::op::detail::unjoined_gpu_work);
+                    sirius::unjoined_gpu_work);
   REQUIRE(retained.has_value());
   REQUIRE_FALSE(source_lifetime.expired());
   REQUIRE_FALSE(gate_test_access::filter_keep_ratio(
@@ -2836,7 +2857,7 @@ TEST_CASE("consumer exceptional cleanup retains reachable owners and replaces re
       error = std::current_exception();
     }
     REQUIRE(error != nullptr);
-    REQUIRE_THROWS_AS(std::rethrow_exception(error), sirius::op::detail::unjoined_gpu_work);
+    REQUIRE_THROWS_AS(std::rethrow_exception(error), sirius::unjoined_gpu_work);
     auto const classification = sirius::op::detail::classify_failure(error);
     REQUIRE(classification == sirius::op::detail::accumulation_failure::LEAK);
     REQUIRE_FALSE(sirius::op::detail::recoverable(classification));
@@ -2853,7 +2874,8 @@ TEST_CASE("consumer exceptional cleanup retains reachable owners and replaces re
   REQUIRE(storage.has_source);
   REQUIRE(storage.filter_owners == 3);
   REQUIRE(storage.has_ast);
-  REQUIRE(storage.has_mask);
+  // Gather-once releases each probe mask after folding it into the retained conjunction.
+  REQUIRE(storage.has_mask == (strategy != compaction_strategy::GATHER_ONCE));
   REQUIRE(storage.has_output);
   REQUIRE_FALSE(storage.completed);
   REQUIRE(storage.has_row_ids == (strategy == compaction_strategy::DEFERRED_KEYS));
@@ -3022,6 +3044,7 @@ TEST_CASE("consumer passes mismatched device inputs through without filtering or
       std::make_unique<cudf::table>(input->view(), stream), space, stream, {});
   };
   auto const require_passed_through = [&](application_result result) {
+    REQUIRE_FALSE(result.completed());
     REQUIRE(result.take_output() == nullptr);
     REQUIRE(result.prefix_counts().empty());
     REQUIRE(filter->requested_devices.empty());
@@ -3029,7 +3052,8 @@ TEST_CASE("consumer passes mismatched device inputs through without filtering or
     REQUIRE_FALSE(storage.completed);
     REQUIRE_FALSE(storage.has_source);
     auto receipt = consumer.finish(std::move(result), 1);
-    REQUIRE(receipt.endpoint == nullptr);
+    REQUIRE(receipt.endpoint == channel);
+    REQUIRE(receipt.original_batch_id == 1);
     REQUIRE(receipt.applied.empty());
     auto& gate = consumer_test_access::gate(consumer);
     REQUIRE_FALSE(gate_test_access::filter_keep_ratio(gate, {filter.get(), 0}, 1).has_value());
@@ -3068,6 +3092,7 @@ TEST_CASE("consumer passes mismatched device inputs through without filtering or
   REQUIRE(local.has_value());
   auto filtered =
     consumer_test_access::apply(consumer, std::move(*local), batch->to_read_only(), stream, mr);
+  REQUIRE(filtered.completed());
   REQUIRE(filtered.take_output()->num_rows() == 4);
   REQUIRE(filter->requested_devices == std::vector<int>{current_device});
   consumer.commit(std::move(filtered));
@@ -3108,6 +3133,7 @@ TEST_CASE("consumer passes a batch on another device through without filtering o
   REQUIRE(program.has_value());
   auto result =
     consumer_test_access::apply(consumer, std::move(*program), remote->to_read_only(), stream, mr);
+  REQUIRE_FALSE(result.completed());
   REQUIRE(result.take_output() == nullptr);
   REQUIRE(result.prefix_counts().empty());
   REQUIRE(filter->requested_devices.empty());
@@ -3115,7 +3141,8 @@ TEST_CASE("consumer passes a batch on another device through without filtering o
   REQUIRE_FALSE(storage.completed);
   REQUIRE_FALSE(storage.has_source);
   auto receipt = consumer.finish(std::move(result), 1);
-  REQUIRE(receipt.endpoint == nullptr);
+  REQUIRE(receipt.endpoint == channel);
+  REQUIRE(receipt.original_batch_id == 1);
   REQUIRE(receipt.applied.empty());
   auto& gate = consumer_test_access::gate(consumer);
   REQUIRE_FALSE(gate_test_access::filter_keep_ratio(gate, {filter.get(), 0}, 1).has_value());
@@ -3127,11 +3154,47 @@ TEST_CASE("consumer passes a batch on another device through without filtering o
   auto batch = sirius::make_data_batch(std::move(input), *consumer_space, stream, {});
   auto filtered =
     consumer_test_access::apply(consumer, std::move(*local), batch->to_read_only(), stream, mr);
+  REQUIRE(filtered.completed());
   REQUIRE(filtered.take_output()->num_rows() == 4);
   REQUIRE(filter->requested_devices == std::vector<int>{0});
   consumer.commit(std::move(filtered));
   REQUIRE(stats.snapshot().applications_skipped_other_device == 1);
   stream.sync();
+}
+
+TEST_CASE("consumer pass-through finishes with the prior receipt's history unchanged",
+          "[dynamic_filter][scan_merge][consumer_device][decode_history]")
+{
+  ::cuda::stream_ref stream                = cudf::get_default_stream();
+  std::shared_ptr<cudf::table const> input = make_int64_sequence_table(10, stream);
+  int current_device                       = -1;
+  REQUIRE(cudaGetDevice(&current_device) == cudaSuccess);
+  auto channel  = std::make_shared<sirius_dynamic_filter_set>();
+  auto producer = channel->register_producer({0, 1});
+  // The program names another device, so the filter it would run must claim that device.
+  auto attached = std::make_shared<any_device_filter>(make_in_list_prefix(4, stream));
+  auto applied  = make_in_list_prefix(6, stream);
+  REQUIRE(producer.push_filter(0, attached));
+  REQUIRE(producer.push_filter(1, applied));
+  sirius::op::dynamic_filter_stats stats;
+  dynamic_filter_consumer consumer(channel, {.stats = &stats}, {});
+  std::vector<binding> bindings{{0, 0}, {1, 0}};
+  // A scan's receipt: the decoder was offered `attached`, and a checkpoint already ran `applied`.
+  batch_receipt const prior{channel, 0, {{applied, 1}}, {{attached, 0}}};
+  auto program = consumer.prepare({.source    = input->view(),
+                                   .bindings  = bindings,
+                                   .prior     = &prior,
+                                   .device_id = current_device + 1000});
+  REQUIRE(program.has_value());
+  auto result = consumer_test_access::apply(
+    consumer, std::move(*program), input, stream, cudf::get_current_device_resource_ref());
+  REQUIRE(result.take_output() == nullptr);
+  REQUIRE(stats.snapshot().applications_skipped_other_device == 1);
+  auto const receipt = consumer.finish(std::move(result), 7);
+  CHECK(receipt.endpoint == channel);
+  CHECK(receipt.original_batch_id == 7);
+  CHECK(receipt.applied == prior.applied);
+  CHECK(receipt.decode_attached == prior.decode_attached);
 }
 
 TEST_CASE("decode selection ranks unmeasured filters by kind and key count after measured ones",
@@ -3171,4 +3234,890 @@ TEST_CASE("decode selection ranks unmeasured filters by kind and key count after
   gate.record_filter_keep_ratio({bloom.get(), 0}, 0.1, 4);
   REQUIRE(order() == std::vector<sirius_dynamic_filter const*>{
                        bloom.get(), small.get(), few.get(), large.get()});
+}
+
+namespace {
+using sirius::op::scan::cached_view_layout;
+using sirius::op::scan::owning_table_view;
+using sirius::op::scan::detail::read_checkpoint;
+using sirius::op::scan::detail::read_retirement_test_hooks;
+using sirius::op::scan::detail::scan_operator_test_access;
+
+std::shared_ptr<cudf::table const> make_cached_residual_input(cudf::size_type rows,
+                                                              cudf::size_type residual_rows,
+                                                              ::cuda::stream_ref stream)
+{
+  std::vector<uint8_t> keep(static_cast<std::size_t>(rows), 0);
+  std::fill_n(keep.begin(), residual_rows, uint8_t{1});
+  auto mask    = make_values_table(keep, cudf::data_type{cudf::type_id::BOOL8}, stream);
+  auto columns = mask->release();
+  columns.insert(columns.begin(), make_sequence_column<int64_t>(rows, stream));
+  return std::make_shared<cudf::table>(std::move(columns));
+}
+
+cached_view_layout cached_layout(bool residual = false)
+{
+  cached_view_layout layout;
+  layout.output_columns    = {0};
+  layout.projected_columns = {0};
+  if (residual) {
+    layout.residual = std::make_unique<sirius::ast::node>(
+      sirius::ast::reference{1, sirius::logical_type::make(sirius::type_id::BOOLEAN)});
+  }
+  return layout;
+}
+
+application_result run_cached(dynamic_filter_consumer& consumer,
+                              std::shared_ptr<cudf::table const> const& input,
+                              std::span<binding const> bindings,
+                              cached_view_layout& layout,
+                              ::cuda::stream_ref stream,
+                              batch_receipt const* prior = nullptr,
+                              bool positions             = false)
+{
+  auto program = consumer.prepare({.source             = input->view(),
+                                   .bindings           = bindings,
+                                   .prior              = prior,
+                                   .cached_layout      = &layout,
+                                   .want_row_positions = positions});
+  REQUIRE(program.has_value());
+  return consumer.apply(std::move(*program),
+                        owning_table_view{input, input->view()},
+                        stream,
+                        cudf::get_current_device_resource_ref());
+}
+}  // namespace
+
+TEST_CASE("cached consumer owns prepared layout and gathers duplicate nested payload once",
+          "[dynamic_filter][scan_merge][cached_checkpoint]")
+{
+  ::cuda::stream_ref stream = cudf::get_default_stream();
+  auto const mr             = cudf::get_current_device_resource_ref();
+  auto columns              = make_sequence_table<int64_t>(100, stream)->release();
+  columns.push_back(make_nullable_list_payload(100, stream));
+  std::shared_ptr<cudf::table const> input = std::make_shared<cudf::table>(std::move(columns));
+  auto channel                             = std::make_shared<sirius_dynamic_filter_set>();
+  auto producer                            = channel->register_producer({0, 1});
+  auto filter = std::make_shared<counting_in_list_filter>(make_in_list_prefix(40, stream));
+  REQUIRE(producer.push_filter(0, filter));
+  REQUIRE(producer.push_filter(1, filter));
+  dynamic_filter_consumer consumer(channel, {.force_counts = true}, {});
+  std::vector<binding> bindings{{0, 0}, {1, 0}};
+  auto layout              = cached_layout();
+  layout.output_columns    = {0, 0, 1};
+  layout.projected_columns = {1, 0, 0};
+  auto program             = consumer.prepare({.source             = input->view(),
+                                               .bindings           = bindings,
+                                               .cached_layout      = &layout,
+                                               .want_row_positions = true});
+  REQUIRE(program);
+  layout.projected_columns.clear();
+  bindings.clear();
+  auto result =
+    consumer.apply(std::move(*program), owning_table_view{input, input->view()}, stream, mr);
+  REQUIRE(result.strategy() == compaction_strategy::GATHER_ONCE);
+  REQUIRE(filter->probe_rows() == std::vector<cudf::size_type>{100});
+  REQUIRE(counts_of(result) == std::vector<cudf::size_type>{100, 40});
+  auto output    = result.take_output();
+  auto positions = result.take_row_positions();
+  REQUIRE(output->num_columns() == 3);
+  REQUIRE(output->num_rows() == 40);
+  REQUIRE(output->view().column(1).head<int64_t>() != output->view().column(2).head<int64_t>());
+  auto expected =
+    cudf::table(input->view().select(std::vector<cudf::size_type>{1, 0, 0}), stream, mr);
+  auto first = cudf::slice(expected.view(), std::vector<cudf::size_type>{0, 40});
+  REQUIRE(sirius::test::expect_tables_equivalent_impl(output->view(), first.front(), stream));
+  std::vector<int32_t> expected_positions(40);
+  std::iota(expected_positions.begin(), expected_positions.end(), 0);
+  REQUIRE(to_host_int32(positions->view(), stream) == expected_positions);
+  REQUIRE(input->num_rows() == 100);
+  auto receipt = consumer.finish(std::move(result), 19);
+  REQUIRE(receipt.applied.size() == 2);
+  REQUIRE(receipt.original_batch_id == 19);
+}
+
+TEST_CASE("cached residual uses original positions and residual denominator",
+          "[dynamic_filter][scan_merge][cached_checkpoint][consumer_counts]")
+{
+  ::cuda::stream_ref stream = cudf::get_default_stream();
+  auto input                = make_cached_residual_input(100, 40, stream);
+  auto channel              = std::make_shared<sirius_dynamic_filter_set>();
+  auto producer             = channel->register_producer({0});
+  auto filter = std::make_shared<counting_in_list_filter>(make_in_list_prefix(30, stream));
+  REQUIRE(producer.push_filter(0, filter));
+  dynamic_filter_consumer consumer(channel, {.keep_threshold = 0.5}, {});
+  std::vector<binding> bindings{{0, 0}};
+  auto layout  = cached_layout(true);
+  auto program = consumer.prepare({.source             = input->view(),
+                                   .bindings           = bindings,
+                                   .cached_layout      = &layout,
+                                   .want_row_positions = true});
+  REQUIRE(program);
+  REQUIRE_FALSE(layout.residual);
+  auto result = consumer.apply(std::move(*program),
+                               owning_table_view{input, input->view()},
+                               stream,
+                               cudf::get_current_device_resource_ref());
+  REQUIRE(counts_of(result) == std::vector<cudf::size_type>{40, 30});
+  REQUIRE(result.counts_read_back());
+  REQUIRE(filter->probe_rows() == std::vector<cudf::size_type>{100});
+  // The residual ran first, so its conjunction hints the only membership probe.
+  REQUIRE(filter->hinted_calls() == 1);
+  REQUIRE(result.take_output()->num_rows() == 30);
+  auto positions = result.take_row_positions();
+  REQUIRE(to_host_int32(positions->view(), stream).back() == 29);
+  (void)consumer.finish(std::move(result), 1);
+  auto& gate = consumer_test_access::gate(consumer);
+  REQUIRE(gate_test_access::filter_keep_ratio(gate, {filter.get(), 0}, 1) == Approx(0.75));
+  REQUIRE_FALSE(gate_test_access::applicable(gate, channel->snapshot()));
+  REQUIRE_FALSE(gate_test_access::needs_combined_sample(gate, channel->snapshot()));
+}
+
+TEST_CASE("cached masks preserve correlated prefixes across original-row probes",
+          "[dynamic_filter][scan_merge][cached_checkpoint][consumer_counts]")
+{
+  auto const rows                          = GENERATE(0, 100);
+  auto const count                         = GENERATE(1, 4, 9);
+  ::cuda::stream_ref stream                = cudf::get_default_stream();
+  std::shared_ptr<cudf::table const> input = make_int64_sequence_table(rows, stream);
+  auto channel                             = std::make_shared<sirius_dynamic_filter_set>();
+  std::vector<std::shared_ptr<counting_in_list_filter>> filters;
+  for (int i = 0; i < count; ++i) {
+    auto producer = channel->register_producer({0});
+    auto filter =
+      std::make_shared<counting_in_list_filter>(make_in_list_prefix(90 - i * 10, stream));
+    REQUIRE(producer.push_filter(0, filter));
+    filters.push_back(std::move(filter));
+  }
+  dynamic_filter_consumer consumer(channel, {.force_counts = true}, {});
+  std::vector<binding> bindings{{0, 0}};
+  auto layout = cached_layout();
+  if (rows == 0) {
+    REQUIRE_FALSE(consumer.prepare({.source             = input->view(),
+                                    .bindings           = bindings,
+                                    .cached_layout      = &layout,
+                                    .want_row_positions = true}));
+    for (auto const& filter : filters) {
+      REQUIRE(filter->mask_calls() == 0);
+    }
+    return;
+  }
+  auto result = run_cached(consumer, input, bindings, layout, stream, nullptr, true);
+  std::vector<cudf::size_type> expected_counts{rows};
+  for (int i = 0; i < count; ++i) {
+    expected_counts.push_back(90 - i * 10);
+    REQUIRE(filters[i]->probe_rows() == std::vector<cudf::size_type>{rows});
+    // Without a residual nothing precedes the first probe, so only later probes take a hint.
+    REQUIRE(filters[i]->hinted_calls() == (i == 0 ? 0 : 1));
+  }
+  REQUIRE(counts_of(result) == expected_counts);
+  auto output    = result.take_output();
+  auto positions = result.take_row_positions();
+  REQUIRE(output->num_rows() == expected_counts.back());
+  REQUIRE(positions->size() == output->num_rows());
+  REQUIRE(to_host_int64(output->view().column(0), stream).size() ==
+          static_cast<std::size_t>(expected_counts.back()));
+  auto receipt = consumer.finish(std::move(result), 2);
+  REQUIRE(receipt.applied.size() == static_cast<std::size_t>(count));
+}
+
+TEST_CASE("cached checkpoint declines without membership and retains runtime declined source",
+          "[dynamic_filter][scan_merge][cached_checkpoint]")
+{
+  auto const residual       = GENERATE(false, true);
+  ::cuda::stream_ref stream = cudf::get_default_stream();
+  auto input                = make_cached_residual_input(100, 40, stream);
+  auto channel              = std::make_shared<sirius_dynamic_filter_set>();
+  dynamic_filter_consumer consumer(channel, {}, {});
+  std::vector<binding> bindings{{0, 0}};
+  auto layout                 = cached_layout(residual);
+  auto const* residual_before = layout.residual.get();
+  REQUIRE_FALSE(
+    consumer.prepare({.source = input->view(), .bindings = bindings, .cached_layout = &layout}));
+  REQUIRE(layout.residual.get() == residual_before);
+  auto producer  = channel->register_producer({0});
+  auto declining = std::make_shared<nullable_declining_filter>();
+  REQUIRE(producer.push_filter(0, declining));
+  auto result = run_cached(consumer, input, bindings, layout, stream, nullptr, true);
+  auto output = result.take_output();
+  if (residual) {
+    REQUIRE(output);
+    REQUIRE(output->num_rows() == 40);
+    REQUIRE(result.take_row_positions()->size() == 40);
+  } else {
+    REQUIRE_FALSE(output);
+    REQUIRE_FALSE(result.take_row_positions());
+    auto source = result.take_source();
+    REQUIRE(source.view().column(0).head<int64_t>() == input->view().column(0).head<int64_t>());
+    REQUIRE(source.num_rows() == 100);
+  }
+  auto receipt = consumer.finish(std::move(result), 1);
+  REQUIRE(receipt.applied.empty());
+  REQUIRE(gate_test_access::needs_combined_sample(consumer_test_access::gate(consumer),
+                                                  channel->snapshot()));
+}
+
+TEST_CASE("cached clean sample remains available after late endpoint publication",
+          "[dynamic_filter][scan_merge][cached_checkpoint][consumer_receipt]")
+{
+  ::cuda::stream_ref stream                = cudf::get_default_stream();
+  std::shared_ptr<cudf::table const> input = make_int64_sequence_table(100, stream);
+  auto channel                             = std::make_shared<sirius_dynamic_filter_set>();
+  auto producer                            = channel->register_producer({0});
+  auto first                               = make_in_list_prefix(100, stream);
+  auto late                                = make_in_list_prefix(10, stream);
+  REQUIRE(producer.push_filter(0, first));
+  dynamic_filter_consumer consumer(channel, {}, {});
+  auto& gate = consumer_test_access::gate(consumer);
+  std::vector<binding> bindings{{0, 0}};
+  auto layout = cached_layout();
+  auto scan   = run_cached(consumer, input, bindings, layout, stream);
+  REQUIRE(scan.take_output()->num_rows() == 100);
+  auto receipt = consumer.finish(std::move(scan), 3);
+  REQUIRE_FALSE(gate_test_access::applicable(gate, channel->snapshot()));
+  REQUIRE(producer.push_filter(0, late));
+  auto endpoint = run_owned(consumer, input, bindings, stream, &receipt);
+  REQUIRE(endpoint.take_output()->num_rows() == 10);
+  (void)consumer.finish(std::move(endpoint), 3);
+  REQUIRE(gate_test_access::filter_keep_ratio(gate, {late.get(), 0}, 2) == Approx(0.1));
+  REQUIRE(gate_test_access::needs_combined_sample(gate, channel->snapshot()));
+  auto clean = run_cached(consumer, input, bindings, layout, stream);
+  REQUIRE(clean.take_output()->num_rows() == 10);
+  (void)consumer.finish(std::move(clean), 4);
+  REQUIRE_FALSE(gate_test_access::needs_combined_sample(gate, channel->snapshot()));
+  REQUIRE(gate_test_access::applicable(gate, channel->snapshot()));
+}
+
+TEST_CASE("cached alias receipts suppress represented work and attached training",
+          "[dynamic_filter][scan_merge][cached_checkpoint][consumer_alias]")
+{
+  auto const applied                       = GENERATE(false, true);
+  ::cuda::stream_ref stream                = cudf::get_default_stream();
+  std::shared_ptr<cudf::table const> input = make_int64_sequence_table(100, stream);
+  auto channel                             = std::make_shared<sirius_dynamic_filter_set>();
+  auto producer                            = channel->register_producer({0, 1});
+  auto alias = std::make_shared<counting_in_list_filter>(make_in_list_prefix(40, stream));
+  auto fresh = make_in_list_prefix(10, stream);
+  REQUIRE(producer.push_filter(0, alias));
+  REQUIRE(producer.push_filter(1, alias));
+  REQUIRE(producer.push_filter(0, fresh));
+  dynamic_filter_consumer consumer(channel, {.force_counts = true}, {});
+  std::vector<binding> bindings{{0, 0}, {1, 0}};
+  auto layout = cached_layout();
+  batch_receipt prior{channel, 2, {}, {}};
+  (applied ? prior.applied : prior.decode_attached).push_back({alias, 1});
+  auto result = run_cached(consumer, input, bindings, layout, stream, &prior);
+  REQUIRE(alias->mask_calls() == (applied ? 0 : 1));
+  REQUIRE(result.take_output()->num_rows() == 10);
+  auto receipt = consumer.finish(std::move(result), 2);
+  REQUIRE(receipt.applied.size() == (applied ? 2 : 3));
+  auto& gate = consumer_test_access::gate(consumer);
+  REQUIRE_FALSE(gate_test_access::filter_keep_ratio(gate, {alias.get(), 0}, 3));
+  REQUIRE_FALSE(gate_test_access::filter_keep_ratio(gate, {alias.get(), 1}, 3));
+  REQUIRE(gate_test_access::filter_keep_ratio(gate, {fresh.get(), 0}, 3) ==
+          Approx(applied ? 0.1 : 0.25));
+  REQUIRE(gate_test_access::needs_combined_sample(gate, channel->snapshot()));
+}
+
+TEST_CASE("cached retirement retains all owners on failed completion and permits safe retry",
+          "[dynamic_filter][scan_merge][cached_checkpoint][consumer_retirement]")
+{
+  auto const point          = GENERATE(read_checkpoint::RESIDUAL,
+                              read_checkpoint::MASK_FOLD,
+                              read_checkpoint::COUNTS_COPY,
+                              read_checkpoint::PAYLOAD_GATHER,
+                              read_checkpoint::READER_EVENT);
+  auto const fail_join      = GENERATE(false, true);
+  ::cuda::stream_ref stream = cudf::get_default_stream();
+  std::weak_ptr<cudf::table const> source_lifetime;
+  std::weak_ptr<sirius_dynamic_filter const> filter_lifetime;
+  std::weak_ptr<sirius_dynamic_filter_set> channel_lifetime;
+  {
+    read_retirement_test_hooks faults{point, fail_join};
+    {
+      auto input    = make_cached_residual_input(100, 80, stream);
+      auto channel  = std::make_shared<sirius_dynamic_filter_set>();
+      auto producer = channel->register_producer({0});
+      auto first    = make_in_list_prefix(40, stream);
+      auto second   = make_in_list_prefix(10, stream);
+      REQUIRE(producer.push_filter(0, first));
+      REQUIRE(producer.push_filter(0, second));
+      source_lifetime  = input;
+      filter_lifetime  = first;
+      channel_lifetime = channel;
+      dynamic_filter_consumer consumer(channel, {.force_counts = true}, {});
+      std::vector<binding> bindings{{0, 0}};
+      auto layout = cached_layout(true);
+      if (fail_join) {
+        REQUIRE_THROWS_AS(run_cached(consumer, input, bindings, layout, stream, nullptr, true),
+                          sirius::unjoined_gpu_work);
+      } else {
+        REQUIRE_THROWS_AS(run_cached(consumer, input, bindings, layout, stream, nullptr, true),
+                          rmm::out_of_memory);
+      }
+      REQUIRE(gate_test_access::needs_combined_sample(consumer_test_access::gate(consumer),
+                                                      channel->snapshot()));
+      REQUIRE_FALSE(gate_test_access::filter_keep_ratio(
+        consumer_test_access::gate(consumer), {first.get(), 0}, 2));
+      if (fail_join) {
+        REQUIRE(faults.retained.has_value());
+        // The retained state answers only as the consumer's own type.
+        REQUIRE_FALSE(scan_operator_test_access::retained_assembly(faults));
+        auto const retained = consumer_test_access::retained_cached_storage(faults);
+        REQUIRE(retained);
+        auto const& storage = *retained;
+        REQUIRE(storage.has_source);
+        REQUIRE(storage.filter_owners == 2);
+        // The residual's evaluator is freed once its result is folded into the conjunction.
+        REQUIRE(storage.has_ast == (point == read_checkpoint::RESIDUAL));
+        REQUIRE_FALSE(storage.completed);
+        // Each membership mask is freed right after its fold into the conjunction.
+        REQUIRE_FALSE(storage.has_mask);
+        if (point != read_checkpoint::RESIDUAL) { REQUIRE(storage.has_counters); }
+        if (point == read_checkpoint::COUNTS_COPY || point == read_checkpoint::PAYLOAD_GATHER ||
+            point == read_checkpoint::READER_EVENT) {
+          REQUIRE(std::vector<cudf::size_type>(storage.copied_counts.begin(),
+                                               storage.copied_counts.end()) ==
+                  std::vector<cudf::size_type>{80, 40, 10});
+        }
+        if (point == read_checkpoint::PAYLOAD_GATHER || point == read_checkpoint::READER_EVENT) {
+          REQUIRE(storage.has_output);
+        }
+        if (point == read_checkpoint::PAYLOAD_GATHER || point == read_checkpoint::READER_EVENT) {
+          REQUIRE(storage.has_row_ids);
+        }
+      } else {
+        REQUIRE_FALSE(faults.retained.has_value());
+        REQUIRE_FALSE(consumer_test_access::retained_cached_storage(faults));
+        faults.fail_at.reset();
+        // Each selected program consumes its residual, including a failed execution.
+        layout     = cached_layout(true);
+        auto retry = run_cached(consumer, input, bindings, layout, stream, nullptr, true);
+        REQUIRE(counts_of(retry) == std::vector<cudf::size_type>{80, 40, 10});
+        REQUIRE(retry.take_output()->num_rows() == 10);
+        auto receipt = consumer.finish(std::move(retry), 5);
+        REQUIRE(receipt.applied.size() == 2);
+      }
+    }
+    REQUIRE(source_lifetime.expired() == !fail_join);
+    REQUIRE(filter_lifetime.expired() == !fail_join);
+    REQUIRE(channel_lifetime.expired() == !fail_join);
+  }
+  REQUIRE(source_lifetime.expired());
+  REQUIRE(filter_lifetime.expired());
+  REQUIRE(channel_lifetime.expired());
+}
+
+TEST_CASE("cached single-mask retirement retains its owners on failed completion",
+          "[dynamic_filter][scan_merge][cached_checkpoint][consumer_retirement]")
+{
+  // Without a residual one membership mask selects the payload and the positions directly.
+  auto const point     = GENERATE(read_checkpoint::PAYLOAD_GATHER, read_checkpoint::READER_EVENT);
+  auto const fail_join = GENERATE(false, true);
+  ::cuda::stream_ref stream = cudf::get_default_stream();
+  CAPTURE(point, fail_join);
+  std::weak_ptr<cudf::table const> source_lifetime;
+  std::weak_ptr<sirius_dynamic_filter const> filter_lifetime;
+  {
+    read_retirement_test_hooks faults{point, fail_join};
+    {
+      std::shared_ptr<cudf::table const> input = make_int64_sequence_table(100, stream);
+      auto channel                             = std::make_shared<sirius_dynamic_filter_set>();
+      auto producer                            = channel->register_producer({0});
+      auto filter                              = make_in_list_prefix(40, stream);
+      REQUIRE(producer.push_filter(0, filter));
+      source_lifetime = input;
+      filter_lifetime = filter;
+      dynamic_filter_consumer consumer(channel, {}, {});
+      std::vector<binding> bindings{{0, 0}};
+      auto layout = cached_layout();
+      if (fail_join) {
+        REQUIRE_THROWS_AS(run_cached(consumer, input, bindings, layout, stream, nullptr, true),
+                          sirius::unjoined_gpu_work);
+      } else {
+        REQUIRE_THROWS_AS(run_cached(consumer, input, bindings, layout, stream, nullptr, true),
+                          rmm::out_of_memory);
+      }
+      auto& gate = consumer_test_access::gate(consumer);
+      REQUIRE(gate_test_access::needs_combined_sample(gate, channel->snapshot()));
+      REQUIRE_FALSE(gate_test_access::filter_keep_ratio(gate, {filter.get(), 0}, 1));
+      if (fail_join) {
+        auto const retained = consumer_test_access::retained_cached_storage(faults);
+        REQUIRE(retained);
+        REQUIRE(retained->has_source);
+        REQUIRE(retained->filter_owners == 1);
+        REQUIRE(retained->has_mask);
+        REQUIRE(retained->has_output);
+        REQUIRE_FALSE(retained->has_counters);
+        REQUIRE_FALSE(retained->completed);
+        // The positions ride the payload's gather.
+        REQUIRE(retained->has_row_ids);
+      } else {
+        REQUIRE_FALSE(faults.retained.has_value());
+        faults.fail_at.reset();
+        auto retry = run_cached(consumer, input, bindings, layout, stream, nullptr, true);
+        REQUIRE(retry.take_output()->num_rows() == 40);
+        REQUIRE(retry.take_row_positions()->size() == 40);
+        auto receipt = consumer.finish(std::move(retry), 7);
+        REQUIRE(receipt.applied.size() == 1);
+      }
+    }
+    REQUIRE(source_lifetime.expired() == !fail_join);
+    REQUIRE(filter_lifetime.expired() == !fail_join);
+  }
+  REQUIRE(source_lifetime.expired());
+  REQUIRE(filter_lifetime.expired());
+}
+
+TEST_CASE("cached checkpoint retains its owners when its count readback join fails",
+          "[dynamic_filter][scan_merge][cached_checkpoint][consumer_retirement]")
+{
+  ::cuda::stream_ref stream = cudf::get_default_stream();
+  std::weak_ptr<cudf::table const> source_lifetime;
+  std::weak_ptr<sirius_dynamic_filter const> filter_lifetime;
+  {
+    // No checkpoint fails, so the readback's success-path join is the one that fails.
+    read_retirement_test_hooks faults{std::nullopt, true};
+    {
+      auto input    = make_cached_residual_input(100, 80, stream);
+      auto channel  = std::make_shared<sirius_dynamic_filter_set>();
+      auto producer = channel->register_producer({0});
+      auto first    = make_in_list_prefix(40, stream);
+      REQUIRE(producer.push_filter(0, first));
+      REQUIRE(producer.push_filter(0, make_in_list_prefix(10, stream)));
+      source_lifetime = input;
+      filter_lifetime = first;
+      dynamic_filter_consumer consumer(channel, {.force_counts = true}, {});
+      std::vector<binding> bindings{{0, 0}};
+      auto layout = cached_layout(true);
+      REQUIRE_THROWS_AS(run_cached(consumer, input, bindings, layout, stream, nullptr, true),
+                        sirius::unjoined_gpu_work);
+      auto& gate = consumer_test_access::gate(consumer);
+      REQUIRE(gate_test_access::needs_combined_sample(gate, channel->snapshot()));
+      REQUIRE_FALSE(gate_test_access::filter_keep_ratio(gate, {first.get(), 0}, 2));
+      auto const retained = consumer_test_access::retained_cached_storage(faults);
+      REQUIRE(retained);
+      REQUIRE(retained->has_source);
+      REQUIRE(retained->filter_owners == 2);
+      REQUIRE(retained->has_output);
+      REQUIRE(retained->has_row_ids);
+      REQUIRE(retained->has_counters);
+      REQUIRE_FALSE(retained->completed);
+      REQUIRE(std::vector<cudf::size_type>(retained->copied_counts.begin(),
+                                           retained->copied_counts.end()) ==
+              std::vector<cudf::size_type>{80, 40, 10});
+    }
+    REQUIRE_FALSE(source_lifetime.expired());
+    REQUIRE_FALSE(filter_lifetime.expired());
+  }
+  REQUIRE(source_lifetime.expired());
+  REQUIRE(filter_lifetime.expired());
+}
+
+TEST_CASE("cached checkpoint allocates no device counters when nothing reads them",
+          "[dynamic_filter][scan_merge][cached_checkpoint][consumer_counts]")
+{
+  ::cuda::stream_ref stream                = cudf::get_default_stream();
+  std::shared_ptr<cudf::table const> input = make_int64_sequence_table(100, stream);
+  auto channel                             = std::make_shared<sirius_dynamic_filter_set>();
+  auto producer                            = channel->register_producer({0});
+  auto first                               = make_in_list_prefix(40, stream);
+  auto second                              = make_in_list_prefix(10, stream);
+  REQUIRE(producer.push_filter(0, first));
+  REQUIRE(producer.push_filter(0, second));
+  dynamic_filter_consumer consumer(channel, {}, {});
+  // Every marginal is current and the gate is active, so no step samples.
+  auto& gate = consumer_test_access::gate(consumer);
+  gate.record_keep_ratio(100, 10, 2);
+  gate.record_filter_keep_ratio({first.get(), 0}, 0.4, 2);
+  gate.record_filter_keep_ratio({second.get(), 0}, 0.25, 2);
+  std::vector<binding> bindings{{0, 0}};
+  auto layout = cached_layout();
+  {
+    read_retirement_test_hooks faults{read_checkpoint::MASK_FOLD, true};
+    REQUIRE_THROWS_AS(run_cached(consumer, input, bindings, layout, stream),
+                      sirius::unjoined_gpu_work);
+    auto const retained = consumer_test_access::retained_cached_storage(faults);
+    REQUIRE(retained);
+    REQUIRE_FALSE(retained->has_counters);
+  }
+  auto result = run_cached(consumer, input, bindings, layout, stream);
+  REQUIRE_FALSE(result.counts_read_back());
+  REQUIRE(result.prefix_counts().empty());
+  REQUIRE(result.take_output()->num_rows() == 10);
+  auto receipt = consumer.finish(std::move(result), 1);
+  REQUIRE(receipt.applied.size() == 2);
+}
+
+TEST_CASE("cached residual checkpoint holds one probe mask beside its conjunction",
+          "[dynamic_filter][scan_merge][cached_checkpoint]")
+{
+  // The residual keeps 1/64 of the rows and two membership filters halve them twice. The residual's
+  // column becomes the conjunction and each probe mask is freed after its fold, so the peak holds
+  // two row-sized BOOL8 buffers, not three.
+  constexpr cudf::size_type kRows = cudf::size_type{1} << 22;
+  ::cuda::stream_ref stream       = cudf::get_default_stream();
+  auto input                      = make_cached_residual_input(kRows, kRows / 64, stream);
+  auto channel                    = std::make_shared<sirius_dynamic_filter_set>();
+  auto producer                   = channel->register_producer({0});
+  REQUIRE(producer.push_filter(0, make_in_list_prefix(kRows / 128, stream)));
+  REQUIRE(producer.push_filter(0, make_in_list_prefix(kRows / 256, stream)));
+  dynamic_filter_consumer consumer(channel, {.force_counts = true}, {});
+  std::vector<binding> bindings{{0, 0}};
+  auto layout = cached_layout(true);
+  auto program =
+    consumer.prepare({.source = input->view(), .bindings = bindings, .cached_layout = &layout});
+  REQUIRE(program);
+  rmm::mr::statistics_resource_adaptor allocations{
+    cuda::mr::any_resource<cuda::mr::device_accessible>{cudf::get_current_device_resource_ref()}};
+  auto result = consumer.apply(std::move(*program),
+                               owning_table_view{input, input->view()},
+                               stream,
+                               rmm::device_async_resource_ref{allocations});
+  REQUIRE(counts_of(result) == std::vector<cudf::size_type>{kRows / 64, kRows / 128, kRows / 256});
+  auto const output = result.take_output();
+  REQUIRE(output->num_rows() == kRows / 256);
+  auto const mask_bytes = static_cast<std::size_t>(kRows);
+  auto const peak       = static_cast<std::size_t>(allocations.get_bytes_counter().peak);
+  CHECK(peak >= 2 * mask_bytes);
+  // Counters and the probe's own scratch fit in the slack.
+  CHECK(peak <= 2 * mask_bytes + output->alloc_size() + (std::size_t{1} << 20));
+  (void)consumer.finish(std::move(result), 1);
+}
+
+TEST_CASE("cached sliced nullable residual and key masks preserve nonconsecutive positions",
+          "[dynamic_filter][scan_merge][cached_checkpoint]")
+{
+  ::cuda::stream_ref stream = cudf::get_default_stream();
+  auto const mr             = cudf::get_current_device_resource_ref();
+  auto key_table =
+    make_values_table<int64_t>({5, 7, 35}, cudf::data_type{cudf::type_id::INT64}, stream);
+  auto filter = std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(
+    key_table->view().column(0), stream, mr);
+  std::vector<uint8_t> keep(100, 0);
+  std::fill_n(keep.begin(), 40, uint8_t{1});
+  auto mask_table = make_values_table(keep, cudf::data_type{cudf::type_id::BOOL8}, stream);
+  auto columns    = mask_table->release();
+  auto nulls      = cudf::create_null_mask(100, cudf::mask_state::ALL_VALID, stream, mr);
+  cudf::set_null_mask(static_cast<cudf::bitmask_type*>(nulls.data()), 7, 8, false, stream);
+  columns.front()->set_null_mask(std::move(nulls), 1);
+  columns.insert(columns.begin(), make_sequence_column<int64_t>(100, stream));
+  std::shared_ptr<cudf::table const> input = std::make_shared<cudf::table>(std::move(columns));
+  auto slices   = cudf::slice(input->view(), std::vector<cudf::size_type>{5, 55});
+  auto view     = slices.front();
+  auto channel  = std::make_shared<sirius_dynamic_filter_set>();
+  auto producer = channel->register_producer({0});
+  REQUIRE(producer.push_filter(0, filter));
+  dynamic_filter_consumer consumer(channel, {}, {});
+  auto layout = cached_layout(true);
+  std::vector<binding> bindings{{0, 0}};
+  auto program = consumer.prepare(
+    {.source = view, .bindings = bindings, .cached_layout = &layout, .want_row_positions = true});
+  REQUIRE(program);
+  auto result = consumer.apply(std::move(*program), owning_table_view{input, view}, stream, mr);
+  REQUIRE(counts_of(result) == std::vector<cudf::size_type>{34, 2});
+  auto output    = result.take_output();
+  auto positions = result.take_row_positions();
+  REQUIRE(to_host_int64(output->view().column(0), stream) == std::vector<int64_t>{5, 35});
+  REQUIRE(to_host_int32(positions->view(), stream) == std::vector<int32_t>{0, 30});
+  (void)consumer.finish(std::move(result), 1);
+}
+
+TEST_CASE("cached dead residual prefix does not claim membership coverage",
+          "[dynamic_filter][scan_merge][cached_checkpoint][consumer_receipt]")
+{
+  ::cuda::stream_ref stream = cudf::get_default_stream();
+  auto input                = make_cached_residual_input(100, 0, stream);
+  auto channel              = std::make_shared<sirius_dynamic_filter_set>();
+  auto producer             = channel->register_producer({0});
+  auto first                = make_in_list_prefix(40, stream);
+  auto second               = make_in_list_prefix(10, stream);
+  REQUIRE(producer.push_filter(0, first));
+  REQUIRE(producer.push_filter(0, second));
+  dynamic_filter_consumer consumer(channel, {}, {});
+  auto layout = cached_layout(true);
+  std::vector<binding> bindings{{0, 0}};
+  auto result = run_cached(consumer, input, bindings, layout, stream, nullptr, true);
+  REQUIRE(counts_of(result) == std::vector<cudf::size_type>{0, 0, 0});
+  REQUIRE(result.take_output()->num_rows() == 0);
+  REQUIRE(result.take_row_positions()->size() == 0);
+  auto receipt = consumer.finish(std::move(result), 6);
+  REQUIRE(receipt.applied.empty());
+  auto& gate = consumer_test_access::gate(consumer);
+  REQUIRE_FALSE(gate_test_access::filter_keep_ratio(gate, {first.get(), 0}, 2));
+  REQUIRE_FALSE(gate_test_access::filter_keep_ratio(gate, {second.get(), 0}, 2));
+}
+
+TEST_CASE("ordinary Parquet residual retirement protects source without a consumer",
+          "[dynamic_filter][scan_merge][cached_checkpoint][consumer_retirement]")
+{
+  // The evaluator's selection submits the residual and the payload gather together.
+  auto const point     = GENERATE(read_checkpoint::PAYLOAD_GATHER, read_checkpoint::READER_EVENT);
+  auto const fail_join = GENERATE(false, true);
+  // A deferral asks the selection for survivor positions as well.
+  auto const with_survivors = GENERATE(false, true);
+  CAPTURE(point, fail_join, with_survivors);
+  ::cuda::stream_ref stream = cudf::get_default_stream();
+  auto manager              = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space               = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  auto info                 = std::make_unique<sirius::op::scan::parquet_ingestible_table_info>();
+  info->names               = {"key", "predicate"};
+  info->returned_types      = {sirius::logical_type::make(sirius::type_id::BIGINT),
+                               sirius::logical_type::make(sirius::type_id::BIGINT)};
+  info->column_ids          = {duckdb::ColumnIndex(0), duckdb::ColumnIndex(1)};
+  info->projection_ids      = {0, 1};
+  info->projected_output_count = 1;
+  info->table_filters          = duckdb::make_uniq<duckdb::TableFilterSet>();
+  info->table_filters->PushFilter(
+    duckdb::ProjectionIndex(1),
+    sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_LESSTHAN,
+                                  duckdb::Value::BIGINT(40)));
+  auto ingestible = sirius::op::scan::make_ingestible(std::move(info));
+  std::weak_ptr<cudf::table const> source_lifetime;
+  {
+    read_retirement_test_hooks faults{point, fail_join};
+    {
+      std::shared_ptr<cudf::table const> input =
+        make_sequence_table<int64_t>(100, stream, {{0, 1}, {0, 1}});
+      source_lifetime = input;
+      std::unique_ptr<cudf::column> survivors;
+      auto apply = [&] {
+        sirius::op::scan::filtered_table source{owning_table_view{input, input->view()},
+                                                sirius::op::scan::filter_state::UNFILTERED};
+        return ingestible->post_filter_and_project(std::move(source),
+                                                   *space,
+                                                   stream,
+                                                   false,
+                                                   nullptr,
+                                                   with_survivors ? &survivors : nullptr,
+                                                   {});
+      };
+      if (fail_join) {
+        REQUIRE_THROWS_AS(apply(), sirius::unjoined_gpu_work);
+        REQUIRE(faults.retained.has_value());
+      } else {
+        REQUIRE_THROWS_AS(apply(), rmm::out_of_memory);
+        REQUIRE_FALSE(faults.retained.has_value());
+        faults.fail_at.reset();
+        auto output = apply();
+        REQUIRE(output->num_rows() == 40);
+        REQUIRE(output->num_columns() == 1);
+        REQUIRE(to_host_int64(output->view().column(0), stream).back() == 39);
+        REQUIRE((survivors != nullptr) == with_survivors);
+        if (with_survivors) {
+          std::vector<int32_t> expected(40);
+          std::iota(expected.begin(), expected.end(), 0);
+          REQUIRE(to_host_int32(survivors->view(), stream) == expected);
+        }
+      }
+    }
+    REQUIRE(source_lifetime.expired() == !fail_join);
+  }
+  REQUIRE(source_lifetime.expired());
+}
+
+namespace {
+/// Allocation tally shared by the copies of one counting_resource
+struct allocation_tally {
+  rmm::device_async_resource_ref upstream;
+  std::size_t calls   = 0;
+  std::size_t live    = 0;
+  std::size_t fail_at = 0;  ///< The call to refuse with rmm::out_of_memory; zero refuses none
+};
+
+/// Device resource that counts its allocations and refuses the one `allocation_tally::fail_at`
+/// names
+struct counting_resource {
+  std::shared_ptr<allocation_tally> tally;
+
+  void* allocate_sync(std::size_t bytes, std::size_t alignment)
+  {
+    return tally->upstream.allocate_sync(bytes, alignment);
+  }
+  void deallocate_sync(void* pointer, std::size_t bytes, std::size_t alignment) noexcept
+  {
+    tally->upstream.deallocate_sync(pointer, bytes, alignment);
+  }
+  void* allocate(::cuda::stream_ref stream, std::size_t bytes, std::size_t alignment)
+  {
+    if (++tally->calls == tally->fail_at) {
+      throw rmm::out_of_memory{"injected allocation failure"};
+    }
+    auto* pointer = tally->upstream.allocate(stream, bytes, alignment);
+    ++tally->live;
+    return pointer;
+  }
+  void deallocate(::cuda::stream_ref stream,
+                  void* pointer,
+                  std::size_t bytes,
+                  std::size_t alignment) noexcept
+  {
+    --tally->live;
+    tally->upstream.deallocate(stream, pointer, bytes, alignment);
+  }
+  friend void get_property(counting_resource const&, ::cuda::mr::device_accessible) noexcept {}
+  bool operator==(counting_resource const& other) const noexcept { return tally == other.tally; }
+};
+}  // namespace
+
+TEST_CASE("ordinary Parquet projection copies each repeat of a borrowed source before release",
+          "[dynamic_filter][scan_merge][cached_checkpoint][consumer_retirement]")
+{
+  ::cuda::stream_ref stream = cudf::get_default_stream();
+  auto manager              = sirius::test::operator_utils::initialize_memory_manager();
+  auto* const gpu           = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  auto tally = std::make_shared<allocation_tally>(allocation_tally{gpu->get_default_allocator()});
+  cucascade::memory::memory_space space(cucascade::memory::gpu_memory_space_config{
+    .device_id       = gpu->get_device_id(),
+    .memory_capacity = gpu->get_max_memory(),
+    .mr_factory_fn   = [&](int, std::size_t) {
+      return cuda::mr::any_resource<cuda::mr::device_accessible>{counting_resource{tally}};
+    }});
+  // One materialized column, output three times: the second and third outputs are repeats.
+  auto info            = std::make_unique<sirius::op::scan::parquet_ingestible_table_info>();
+  info->names          = {"key"};
+  info->returned_types = {sirius::logical_type::make(sirius::type_id::BIGINT)};
+  info->column_ids     = {duckdb::ColumnIndex(0)};
+  info->projection_ids = {0, 0, 0};
+  info->projected_output_count = 3;
+  auto ingestible              = sirius::op::scan::make_ingestible(std::move(info));
+  std::vector<int64_t> expected(100);
+  std::iota(expected.begin(), expected.end(), 0);
+  auto project = [&](std::shared_ptr<cudf::table const> const& input) {
+    sirius::op::scan::filtered_table source{owning_table_view{input, input->view()},
+                                            sirius::op::scan::filter_state::UNFILTERED};
+    return ingestible->post_filter_and_project(
+      std::move(source), space, stream, false, nullptr, nullptr, {});
+  };
+
+  SECTION("every output is an owned copy and the borrowed source is unchanged")
+  {
+    std::shared_ptr<cudf::table const> input = make_sequence_table<int64_t>(100, stream);
+    auto output                              = project(input);
+    // Two repeat copies, then the copy that releases the borrowed column itself.
+    CHECK(tally->calls == 3);
+    REQUIRE(output->num_columns() == 3);
+    auto const view = output->view();
+    for (cudf::size_type column = 0; column < view.num_columns(); ++column) {
+      CAPTURE(column);
+      REQUIRE(to_host_int64(view.column(column), stream) == expected);
+      CHECK(view.column(column).head() != input->view().column(0).head());
+    }
+    CHECK(view.column(0).head() != view.column(1).head());
+    CHECK(view.column(1).head() != view.column(2).head());
+    CHECK(view.column(0).head() != view.column(2).head());
+    REQUIRE(to_host_int64(input->view().column(0), stream) == expected);
+  }
+  SECTION("a failed repeat copy retires the borrowed source it read")
+  {
+    auto const fail_join = GENERATE(false, true);
+    CAPTURE(fail_join);
+    tally->fail_at = 2;  // the second repeat, after the first repeat's copy was submitted
+    std::weak_ptr<cudf::table const> source_lifetime;
+    {
+      read_retirement_test_hooks faults{std::nullopt, fail_join};
+      {
+        std::shared_ptr<cudf::table const> input = make_sequence_table<int64_t>(100, stream);
+        source_lifetime                          = input;
+        if (fail_join) {
+          REQUIRE_THROWS_AS(project(input), sirius::unjoined_gpu_work);
+          REQUIRE(faults.retained.has_value());
+        } else {
+          REQUIRE_THROWS_AS(project(input), rmm::out_of_memory);
+          REQUIRE_FALSE(faults.retained.has_value());
+        }
+        CHECK(tally->calls == 2);
+        // The submitted repeat copy is freed in stream order; only the source may stay retained.
+        CHECK(tally->live == 0);
+      }
+      REQUIRE(source_lifetime.expired() == !fail_join);
+    }
+    REQUIRE(source_lifetime.expired());
+  }
+}
+
+TEST_CASE(
+  "cached alias selection uses the eligible representative without reviving a skipped alias",
+  "[dynamic_filter][scan_merge][cached_checkpoint][consumer_alias]")
+{
+  ::cuda::stream_ref stream                = cudf::get_default_stream();
+  std::shared_ptr<cudf::table const> input = make_int64_sequence_table(10, stream);
+  auto channel                             = std::make_shared<sirius_dynamic_filter_set>();
+  auto producer                            = channel->register_producer({0, 1});
+  auto alias       = std::make_shared<counting_in_list_filter>(make_in_list_prefix(4, stream));
+  auto intervening = make_in_list_prefix(6, stream);
+  REQUIRE(producer.push_filter(0, alias));
+  REQUIRE(producer.push_filter(1, alias));
+  auto const skipped  = channel->snapshot().entries().front().column_index;
+  auto const eligible = 1 - skipped;
+  REQUIRE(producer.push_filter(skipped, intervening));
+  dynamic_filter_consumer consumer(channel, {.force_counts = true}, {});
+  auto& gate = consumer_test_access::gate(consumer);
+  gate.record_keep_ratio(10, 4, 3);
+  gate.record_filter_keep_ratio({alias.get(), skipped}, 0.8, 3);
+  std::vector<binding> bindings{{0, 0}, {1, 0}};
+  auto layout = cached_layout();
+  auto result = run_cached(consumer, input, bindings, layout, stream);
+  REQUIRE(counts_of(result) == std::vector<cudf::size_type>{10, 6, 4});
+  REQUIRE(alias->mask_calls() == 1);
+  auto receipt = consumer.finish(std::move(result), 8);
+  REQUIRE(receipt.applied ==
+          std::vector<sirius::op::scan::applied_entry>{{intervening, skipped}, {alias, eligible}});
+  REQUIRE(gate_test_access::filter_keep_ratio(gate, {alias.get(), skipped}, 3) == Approx(0.8));
+  REQUIRE(gate_test_access::filter_keep_ratio(gate, {alias.get(), eligible}, 3) ==
+          Approx(4.0 / 6.0));
+}
+
+TEST_CASE("cached projected nullable string and nested payload matches manual survivor rows",
+          "[dynamic_filter][scan_merge][cached_checkpoint]")
+{
+  ::cuda::stream_ref stream = cudf::get_default_stream();
+  auto const mr             = cudf::get_current_device_resource_ref();
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(make_sequence_column<int64_t>(10, stream));
+  auto strings = sirius::test::operator_utils::make_string_column(
+    {"pad", "alpha", "b", "", "delta", "ee", "null", "gggg", "omega", "tail"}, stream, mr);
+  auto string_nulls = cudf::create_null_mask(10, cudf::mask_state::ALL_VALID, stream, mr);
+  cudf::set_null_mask(static_cast<cudf::bitmask_type*>(string_nulls.data()), 6, 7, false, stream);
+  strings->set_null_mask(std::move(string_nulls), 1);
+  columns.push_back(std::move(strings));
+  columns.push_back(make_nullable_list_payload(10, stream));
+  std::shared_ptr<cudf::table const> input = std::make_shared<cudf::table>(std::move(columns));
+  auto slices = cudf::slice(input->view(), std::vector<cudf::size_type>{1, 9});
+  auto view   = slices.front();
+  auto keys =
+    make_values_table<int64_t>({2, 3, 6, 8}, cudf::data_type{cudf::type_id::INT64}, stream);
+  auto filter =
+    std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(keys->view().column(0), stream, mr);
+  auto channel  = std::make_shared<sirius_dynamic_filter_set>();
+  auto producer = channel->register_producer({0});
+  REQUIRE(producer.push_filter(0, filter));
+  dynamic_filter_consumer consumer(channel, {}, {});
+  std::vector<binding> bindings{{0, 0}};
+  auto layout              = cached_layout();
+  layout.output_columns    = {0, 1, 2};
+  layout.projected_columns = {2, 1, 0, 1};
+  auto program             = consumer.prepare(
+    {.source = view, .bindings = bindings, .cached_layout = &layout, .want_row_positions = true});
+  REQUIRE(program);
+  auto result    = consumer.apply(std::move(*program), owning_table_view{input, view}, stream, mr);
+  auto output    = result.take_output();
+  auto positions = result.take_row_positions();
+  REQUIRE(output->num_rows() == 4);
+  REQUIRE(to_host_int64(output->view().column(2), stream) == std::vector<int64_t>{2, 3, 6, 8});
+  REQUIRE(to_host_int32(positions->view(), stream) == std::vector<int32_t>{1, 2, 5, 7});
+  REQUIRE(output->view().column(0).null_count() == 1);
+  REQUIRE(output->view().column(1).null_count() == 1);
+  REQUIRE(output->view().column(3).null_count() == 1);
+  auto expected_indices =
+    make_values_table<int32_t>({2, 3, 6, 8}, cudf::data_type{cudf::type_id::INT32}, stream);
+  auto expected = cudf::gather(input->view().select(std::vector<cudf::size_type>{2, 1, 0, 1}),
+                               expected_indices->view().column(0),
+                               cudf::out_of_bounds_policy::DONT_CHECK,
+                               cudf::negative_index_policy::NOT_ALLOWED,
+                               stream,
+                               mr);
+  REQUIRE(sirius::test::expect_tables_equivalent_impl(output->view(), expected->view(), stream));
+  auto receipt = consumer.finish(std::move(result), 11);
+  REQUIRE(receipt.applied.size() == 1);
 }

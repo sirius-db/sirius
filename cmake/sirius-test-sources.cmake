@@ -113,6 +113,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_semantic_cast_fallback.cpp
     test/cpp/integration/test_gpu_execution_setting_scope.cpp
     test/cpp/integration/test_gpu_execution_abs.cpp
+    test/cpp/integration/test_gpu_execution_negate.cpp
     test/cpp/integration/test_gpu_execution_round.cpp
     test/cpp/integration/test_gpu_execution_substring.cpp
     test/cpp/integration/test_parquet_bloom_filter_pushdown.cpp
@@ -177,6 +178,7 @@ set(TEST_SOURCES
     test/cpp/scan_manager/test_s3_config_scopes.cpp
     test/cpp/scan_manager/test_prefetching_scheduler.cpp
     test/cpp/scan_manager/test_readahead_lifecycle.cpp
+    test/cpp/scan_manager/test_shared_scan_budget.cpp
     test/cpp/scan_manager/test_scan_manager_query_state.cpp
     test/cpp/scan_manager/test_reset_caches.cpp
     test/cpp/scan_manager/test_pin_table_multi_gpu.cpp

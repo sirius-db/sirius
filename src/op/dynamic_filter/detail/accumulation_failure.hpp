@@ -18,6 +18,7 @@
 
 #include "op/dynamic_filter/detail/accumulated_bloom_builder.hpp"
 #include "op/dynamic_filter/dynamic_filter_stats.hpp"
+#include "sirius/exception.hpp"
 
 #include <cstdint>
 #include <exception>
