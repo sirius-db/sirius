@@ -57,7 +57,10 @@ struct received {
 inline transport::callbacks recording(received& got)
 {
   auto* g = &got;
-  return {[g](stream_id stream, rank_t from, std::shared_ptr<cucascade::data_batch> batch) {
+  return {[g](stream_id stream,
+              rank_t from,
+              std::uint64_t /*batch*/,
+              std::shared_ptr<cucascade::data_batch> batch) {
             auto d = digest(batch);
             std::lock_guard lock{g->mutex};
             g->batches[{from, stream}].push_back(std::move(d));
