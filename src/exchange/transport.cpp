@@ -297,7 +297,7 @@ struct transport::engine {
       if (++l.copied < l.seen.size()) { continue; }
       auto received = l.in->seal(recv_stream.view());
       landings.erase(it);
-      cb.on_batch(stream, from, std::move(received));
+      cb.on_batch(stream, from, batch, std::move(received));
       ++ends[{from, stream}].delivered;
       check_end(from, stream);
     }
@@ -451,7 +451,12 @@ void transport::send(stream_id stream, rank_t to, std::shared_ptr<cucascade::dat
     if (_error) { std::rethrow_exception(_error); }
   }
   if (to == rank()) {
-    e.cb.on_batch(stream, to, std::move(batch));
+    std::uint64_t index = 0;
+    {
+      std::lock_guard lock{_mutex};
+      index = e.sent[to][stream]++;
+    }
+    e.cb.on_batch(stream, to, index, std::move(batch));
     return;
   }
   auto out = outgoing_batch::make(std::move(batch), e.send_stream.view());
