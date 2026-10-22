@@ -190,7 +190,7 @@ inline std::optional<cucascade::read_only_data_batch> lock_or_prepare_batch(
   rmm::cuda_stream_view stream);
 ```
 
-If the batch is already on `target_space`, it is locked in place under a shared (read) lock. If it lives on a *different GPU*, it is **cloned** into the target space under the same shared lock (`read_accessor.clone_to<...>`) — the source batch is never exclusively locked and never mutated, so concurrent readers on its home GPU proceed unhindered (see [Multi-GPU Architecture](multi-gpu-architecture.md)). Host/disk-resident batches are converted via `mut_accessor.convert_to<...>` (an upgrade, not a clone). The cross-GPU route goes through `cucascade::convert_gpu_to_gpu` (peer-DMA on server hardware, automatic host-staging on consumer hardware whose chipset misreports peer-access support). For HOST-targeted conversions the helper first attempts a caller-owned reservation (`make_reservation_or_null`) and passes it to the reservation-taking `convert_to` overload, using the conversion path described in [Memory Management](memory-management.md). Materialized result transfer requires a real HOST reservation.
+If the batch is already on `target_space`, it is locked in place under a shared (read) lock. If it lives on a *different GPU*, it is **cloned** into the target space under the same shared lock (`read_accessor.clone_to<...>`) — the source batch is never exclusively locked and never mutated, so concurrent readers on its home GPU proceed unhindered (see [Multi-GPU Architecture](multi-gpu-architecture.md)). Host/disk-resident batches are converted via `mut_accessor.convert_to<...>` (an upgrade, not a clone). The cross-GPU route goes through `cucascade::convert_gpu_to_gpu` (peer-DMA on server hardware, automatic host-staging on consumer hardware whose chipset misreports peer-access support). For HOST-targeted conversions the helper first attempts a caller-owned reservation (`make_reservation_or_null`) and passes it to the reservation-taking `convert_to` overload, using the conversion path described in [Memory Management](memory-management.md). Materialized result collection also attempts a HOST reservation, but this baseline falls back to conversion without one if the reservation is unavailable; that conversion may OOM. Mandatory reservation-backed collection is introduced by the later memory-progress PR (#2001).
 
 **Postcondition.** When `prepare_for_processing` returns, every input accessor references data on `requested_memory_space`. Therefore the per-operator expression `batches[0].get_memory_space() == target_space` holds at every audited read site. Operators that walk every batch and adopt the first non-null batch's space (e.g. `sirius_physical_sort_sample.cpp`, `sirius_physical_merge_sort.cpp`, `sirius_physical_table_scan.cpp`) are safe by the same postcondition.
 
@@ -208,9 +208,10 @@ if (evt->kind == task_request_kind::device_ready) {
 
 `schedule()` pushes directly into the task queue and also publishes `task_available`. The queue push wakes a matcher waiting for work while a device is already ready; the channel event wakes it when it is waiting for a device signal.
 
-**Per-device match.** The scheduler atomically compares exact-device and unbound tasks by
-query/pipeline priority, choosing the oldest compatible runnable task. A future retry deadline
-makes a memory- or lock-waiting task temporarily ineligible. A device preference remains binding;
+**Per-device match.** The scheduler first selects the highest-priority exact-device task and
+considers the unbound bucket only if no exact-device task is available. Priority ordering applies
+within each bucket; the two bucket heads are not compared. Retry backoff sleeps in the worker
+before resubmission, rather than attaching a deadline to a queued task. A device preference remains binding;
 another GPU cannot claim that task. The creator confines tasks to their query's admitted GPU set.
 There is no equal-share or round-robin guarantee.
 
@@ -281,8 +282,8 @@ while running:
        (schedule_lookahead(first ready device) — speculatively warms up a
        not-yet-activated scan; no-op unless strategy is `lookahead`)
     3. For each ready device, select a compatible queued task:
-       a. compare exact-preference and unbound tasks in one priority-ordered selection
-       b. skip tasks whose retry deadline has not arrived
+       a. pop the highest-priority exact-preference task
+       b. if none exists, pop the highest-priority unbound task
     4. Dispatch; consume readiness only if the executor accepts the task
 ```
 

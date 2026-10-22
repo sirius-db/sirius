@@ -600,8 +600,7 @@ class SiriusContext : public ClientContextState {
     /// while waiting is polled promptly and checked before admission.
     SlotGuard(SiriusContext& ctx,
               ClientContext& context,
-              sirius::exec::query_admission::access kind =
-                sirius::exec::query_admission::access::maintenance);
+              sirius::exec::query_admission::access kind);
     ~SlotGuard() noexcept;
     SlotGuard(const SlotGuard&)            = delete;
     SlotGuard& operator=(const SlotGuard&) = delete;

@@ -1476,7 +1476,8 @@ void SiriusRegistration::UnpinTableFunction(ClientContext& context,
     // Registry removal must be serialized against execution windows (plan
     // generation reads pinned entries); a maintenance permit also excludes writers. Unpin
     // creates no per-query runtime state to clean.
-    duckdb::SiriusContext::SlotGuard slot(*sirius_ctx, context);
+    duckdb::SiriusContext::SlotGuard slot(
+      *sirius_ctx, context, sirius::exec::query_admission::access::maintenance);
     sirius_ctx->get_scan_manager().remove_pinned_entry(data.name);
   }
 
@@ -1519,7 +1520,8 @@ void SiriusRegistration::ResetSiriusCacheFunction(ClientContext& context,
     // point at, so the reset has to be serialized against execution windows the
     // same way pinned-registry mutation is.  A lock-only guard suffices --
     // rebuilding a cache creates no per-query runtime state to clean up.
-    duckdb::SiriusContext::SlotGuard slot(*sirius_ctx, context);
+    duckdb::SiriusContext::SlotGuard slot(
+      *sirius_ctx, context, sirius::exec::query_admission::access::maintenance);
     sirius_ctx->get_scan_manager().reset_caches();
   }
 
@@ -1700,7 +1702,8 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
 
   // Required to hold the query-lifecycle slot for the whole build since the pinned entry is
   // non-owning. The slot also serializes the current-device-resource swap the build does.
-  duckdb::SiriusContext::SlotGuard slot(*sirius_ctx, context);
+  duckdb::SiriusContext::SlotGuard slot(
+    *sirius_ctx, context, sirius::exec::query_admission::access::maintenance);
 
   // --- Resolve the vector column's fixed dimensionality from the catalog. ---
   auto const qname   = QualifiedName::Parse(data.table_name);
@@ -2010,7 +2013,8 @@ static void SiriusDropAnnIndexFunction(ClientContext& context,
   }
 
   // Hold the query-lifecycle slot while the registry is read and mutated
-  duckdb::SiriusContext::SlotGuard slot(*sirius_ctx, context);
+  duckdb::SiriusContext::SlotGuard slot(
+    *sirius_ctx, context, sirius::exec::query_admission::access::maintenance);
 
   auto const qname   = QualifiedName::Parse(data.table_name);
   auto const catalog = qname.Catalog();  // empty => search path
@@ -2167,7 +2171,8 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
   // The slot serializes the current-device-resource swap the build does. pin_owner keeps the
   // entry itself alive across the build regardless — a concurrent unpin on another connection
   // must not invalidate it mid-search.
-  duckdb::SiriusContext::SlotGuard slot(*sirius_ctx, context);
+  duckdb::SiriusContext::SlotGuard slot(
+    *sirius_ctx, context, sirius::exec::query_admission::access::maintenance);
   auto pin_owner = sirius_ctx->get_scan_manager().find_pinned_entry_for_duckdb_table(
     req.catalog, req.schema, req.table_name, req.table_identity);
   const auto* pin = pin_owner.get();
@@ -2255,7 +2260,8 @@ static unique_ptr<GlobalTableFunctionState> SiriusVectorSearchInit(ClientContext
 
   // Required to hold the query-lifecycle slot for the whole build since the pinned entry is
   // non-owning. The slot also serializes the current-device-resource swap the build does.
-  duckdb::SiriusContext::SlotGuard slot(*sirius_ctx, context);
+  duckdb::SiriusContext::SlotGuard slot(
+    *sirius_ctx, context, sirius::exec::query_admission::access::maintenance);
 
   // A prepared table function can retain its bind data across DDL: the table
   // name is a string argument, not a bound table scan dependency. Compare with

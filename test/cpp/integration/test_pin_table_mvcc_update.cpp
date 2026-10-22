@@ -146,7 +146,8 @@ TEST_CASE_METHOD(PinMvccUpdateFixture,
   // Upgrading a writer to exclusive maintenance on the same connection must fail promptly.
   auto runtime = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
   REQUIRE(runtime);
-  CHECK_THROWS_WITH(duckdb::SiriusContext::SlotGuard(*runtime, *con->context),
+  CHECK_THROWS_WITH(duckdb::SiriusContext::SlotGuard(
+                      *runtime, *con->context, sirius::exec::query_admission::access::maintenance),
                     Catch::Matchers::ContainsSubstring("maintenance cannot run inside"));
   pending.reset();
   run_ok("SELECT 1;");

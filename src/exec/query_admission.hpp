@@ -122,7 +122,8 @@ class query_admission {
     _state->limit = limit;
   }
 
-  /// check_cancel throws the caller's cancellation/health error. Polling is bounded because
+  /// check_cancel runs without the monitor mutex and throws the caller's cancellation/health
+  /// error. Polling is bounded because
   /// DuckDB interruption does not currently offer a condition-variable notification hook.
   /// A held writer permit may authorize query/planning continuations ahead of pending
   /// maintenance: otherwise maintenance and the writer could each wait for the other.
@@ -131,8 +132,8 @@ class query_admission {
   permit acquire(access kind, CheckCancel check_cancel, const permit* writer = nullptr)
   {
     auto s = _state;
-    std::unique_lock lock(s->mutex);
     check_cancel();
+    std::unique_lock lock(s->mutex);
     if (writer && (writer->_state != s || writer->_kind != access::writer ||
                    (kind != access::query && kind != access::planning)))
       throw std::logic_error("invalid writer continuation permit");
@@ -153,7 +154,6 @@ class query_admission {
     };
     try {
       for (;;) {
-        check_cancel();
         if (s->current.closing) throw std::runtime_error("Sirius admission is closed");
         auto const& c = s->current;
         bool ready    = !c.maintenance_active;
@@ -179,6 +179,11 @@ class query_admission {
         }
         if (ready) break;
         s->changed.wait_for(lock, std::chrono::milliseconds(20));
+        lock.unlock();
+        check_cancel();
+        lock.lock();
+        // Recheck closure and eligibility: other callers may have changed either
+        // while the cancellation callback ran.
       }
       const auto ticket = it->ticket;
       remove();
@@ -195,6 +200,7 @@ class query_admission {
       s->changed.notify_all();
       return permit(std::move(s), kind, ticket);
     } catch (...) {
+      if (!lock.owns_lock()) lock.lock();
       remove();
       lock.unlock();
       s->changed.notify_all();

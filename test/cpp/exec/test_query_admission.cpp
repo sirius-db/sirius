@@ -266,3 +266,55 @@ TEST_CASE("writer permits enforce ownership and participate in shutdown", "[quer
   CHECK(waited);
   CHECK(monitor.snapshot().writers == 0);
 }
+
+TEST_CASE("admission cancellation callbacks can inspect the monitor", "[query_admission]")
+{
+  query_admission monitor;
+  auto query =
+    monitor.acquire(access_kind::query, [&] { CHECK(monitor.snapshot().active_queries == 0); });
+  CHECK(monitor.snapshot().active_queries == 1);
+}
+
+TEST_CASE("admission rechecks state after an unlocked cancellation callback", "[query_admission]")
+{
+  query_admission monitor;
+  auto held  = monitor.acquire(access_kind::query, [] {});
+  int calls  = 0;
+  auto query = monitor.acquire(access_kind::query, [&] {
+    if (++calls == 1) return;
+    CHECK(monitor.snapshot().queued_queries == 1);
+    held.reset();
+  });
+  CHECK(calls >= 2);
+  CHECK(monitor.snapshot().queued_queries == 0);
+  CHECK(monitor.snapshot().active_queries == 1);
+}
+
+TEST_CASE("unlocked admission callbacks clean up queued failures", "[query_admission]")
+{
+  query_admission monitor;
+  auto kind  = GENERATE(access_kind::query, access_kind::maintenance);
+  auto held  = monitor.acquire(access_kind::query, [] {});
+  bool close = false;
+  SECTION("cancellation") {}
+  SECTION("closure") { close = true; }
+  int calls = 0;
+  CHECK_THROWS_WITH(monitor.acquire(kind,
+                                    [&] {
+                                      if (++calls == 1) return;
+                                      CHECK(monitor.snapshot().queued_queries ==
+                                            (kind == access_kind::query ? 1 : 0));
+                                      CHECK(monitor.snapshot().maintenance_waiters ==
+                                            (kind == access_kind::maintenance ? 1 : 0));
+                                      if (close)
+                                        monitor.close();
+                                      else
+                                        throw std::runtime_error("cancelled");
+                                    }),
+                    close ? "Sirius admission is closed" : "cancelled");
+  CHECK(monitor.snapshot().queued_queries == 0);
+  CHECK(monitor.snapshot().maintenance_waiters == 0);
+  CHECK(monitor.snapshot().active_queries == 1);
+  held.reset();
+  monitor.wait_until_idle();
+}

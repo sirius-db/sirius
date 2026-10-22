@@ -34,9 +34,11 @@ contract. Multiple connections to one DatabaseInstance use the shared runtime de
 
 ## Admission, planning and maintenance
 
-Queries receive scheduling IDs from their arrival tickets. Tasks favor the oldest runnable query
-that can use a ready GPU. Running kernels are not preempted. A task waiting for memory releases its
-worker slot, letting another task run and potentially free memory. Equal GPU shares are not promised.
+Queries receive scheduling IDs from their arrival tickets. Within each device-preference bucket,
+tasks favor older queries. A ready GPU takes an exact-device task before considering unbound
+tasks. Running kernels are not preempted. Blocking GPU reservation and synchronous downgrade
+waits retain reserved worker capacity in this baseline. The later memory-progress PR (#2001)
+introduces worker release during reservation retries. Equal GPU shares are not promised.
 IDs fail explicitly at the 31-bit scheduling limit rather than wrapping.
 
 The shared scan metadata pool also uses strict query-age priority: older queries' queued tasks
