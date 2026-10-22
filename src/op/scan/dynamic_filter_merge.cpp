@@ -574,9 +574,7 @@ std::unique_ptr<application_program_state> prepare_state(
         })) {
       throw std::invalid_argument("cached dynamic-filter projection is invalid");
     }
-    if (input.cached_layout->residual) {
-      program->residual = sirius::ast::clone(*input.cached_layout->residual);
-    }
+    program->residual = std::move(input.cached_layout->residual);
   }
   std::vector<std::optional<double>> estimates;
   for (auto const& step : program->membership) {
@@ -796,6 +794,64 @@ void apply_deferred_keys(application_result_state& result,
 }
 
 //===----------GATHER_ONCE compaction strategy----------===//
+/// @brief Allocates optional prefix counters, including the initial mask's count when present.
+void allocate_prefix_counters(application_result_state& result,
+                              bool has_initial_mask,
+                              ::cuda::stream_ref stream,
+                              rmm::device_async_resource_ref mr)
+{
+  if (!result.program->want_counts) { return; }
+  // Without an initial mask, the host already knows how many rows enter the first probe.
+  auto const size = result.program->membership.size() + static_cast<std::size_t>(has_initial_mask);
+  result.counters.emplace(size, stream, mr);
+  RMM_CUDA_TRY(
+    cudaMemsetAsync(result.counters->data(), 0, size * sizeof(cudf::size_type), stream.get()));
+}
+
+/// @brief Folds membership masks into the conjunction and submits optional prefix count readback.
+///
+/// With an initial mask, the caller has already folded it and counted its survivors in counter 0.
+/// Otherwise the first membership fold initializes the conjunction with no prior-mask hint.
+void fold_membership_masks(application_result_state& result,
+                           cudf::table_view input,
+                           bool has_initial_mask,
+                           ::cuda::stream_ref stream,
+                           rmm::device_async_resource_ref mr)
+{
+  auto const& program           = *result.program;
+  auto* const counts            = result.counters ? result.counters->data() : nullptr;
+  auto* const membership_counts = counts && has_initial_mask ? counts + 1 : counts;
+  for (std::size_t i = 0; i < program.membership.size(); ++i) {
+    auto const& step      = program.membership[i];
+    auto const probe      = input.column(step.column_index);
+    result.mask           = i != 0 || has_initial_mask
+                              ? step.mask_source->compute_mask_if(
+                        probe, result.conjunction->view(), program.device_id, stream, mr)
+                              : step.mask_source->compute_mask(probe, program.device_id, stream, mr);
+    result.contributed[i] = result.mask != nullptr;
+    sirius::op::fold_dynamic_filter_mask(
+      result.conjunction->mutable_view(),
+      result.mask ? std::optional{result.mask->view()} : std::nullopt,
+      membership_counts ? membership_counts + i : nullptr,
+      i == 0 && !has_initial_mask,
+      stream);
+    result.mask.reset();
+  }
+  detail::check_read_checkpoint(detail::read_checkpoint::MASK_FOLD);
+  if (program.want_counts) {
+    auto const device_counts = result.counters->size();
+    result.readback          = std::make_unique<detail::pinned_counts>(device_counts, stream);
+    result.counts.resize(program.membership.size() + 1);
+    if (!has_initial_mask) { result.counts[0] = input.num_rows(); }
+    RMM_CUDA_TRY(cudaMemcpyAsync(result.readback->data(),
+                                 result.counters->data(),
+                                 device_counts * sizeof(cudf::size_type),
+                                 cudaMemcpyDeviceToHost,
+                                 stream.get()));
+  }
+  detail::check_read_checkpoint(detail::read_checkpoint::COUNTS_COPY);
+}
+
 /// @brief Apply the GATHER_ONCE compaction strategy.
 void apply_gather_once(application_result_state& result,
                        cudf::table_view input,
@@ -809,55 +865,19 @@ void apply_gather_once(application_result_state& result,
     apply_cascade(result, input, stream, mr);
     return;
   }
-  auto const size = program.membership.size() + 1;
-  // Without an AST mask, every input row enters the first membership step: the host already knows
-  // that count, and the first membership fold initializes the conjunction.
-  auto const device_counts = result.ast_mask ? size : size - 1;
-  if (program.want_counts) {
-    result.counters.emplace(device_counts, stream, mr);
-    RMM_CUDA_TRY(cudaMemsetAsync(
-      result.counters->data(), 0, device_counts * sizeof(cudf::size_type), stream.get()));
-  }
-  auto* const counts = result.counters ? result.counters->data() : nullptr;
+  bool const has_initial_mask = result.ast_mask != nullptr;
+  allocate_prefix_counters(result, has_initial_mask, stream, mr);
   result.conjunction = cudf::make_numeric_column(cudf::data_type{cudf::type_id::BOOL8},
                                                  input.num_rows(),
                                                  cudf::mask_state::UNALLOCATED,
                                                  stream,
                                                  mr);
   if (result.ast_mask) {
+    auto* const counts = result.counters ? result.counters->data() : nullptr;
     sirius::op::fold_dynamic_filter_mask(
       result.conjunction->mutable_view(), result.ast_mask->view(), counts, true, stream);
   }
-  auto* const membership_counts = counts && result.ast_mask ? counts + 1 : counts;
-  for (std::size_t i = 0; i < program.membership.size(); ++i) {
-    auto const& step      = program.membership[i];
-    result.mask           = i != 0 || result.ast_mask
-                              ? step.mask_source->compute_mask_if(input.column(step.column_index),
-                                                        result.conjunction->view(),
-                                                        program.device_id,
-                                                        stream,
-                                                        mr)
-                              : step.mask_source->compute_mask(
-                        input.column(step.column_index), program.device_id, stream, mr);
-    result.contributed[i] = result.mask != nullptr;
-    sirius::op::fold_dynamic_filter_mask(
-      result.conjunction->mutable_view(),
-      result.mask ? std::optional{result.mask->view()} : std::nullopt,
-      membership_counts ? membership_counts + i : nullptr,
-      i == 0 && !result.ast_mask,
-      stream);
-  }
-  if (program.want_counts) {
-    result.readback = std::make_unique<detail::pinned_counts>(device_counts, stream);
-    result.counts.resize(size);
-    if (!result.ast_mask) { result.counts[0] = input.num_rows(); }
-    RMM_CUDA_TRY(cudaMemcpyAsync(result.readback->data(),
-                                 result.counters->data(),
-                                 device_counts * sizeof(cudf::size_type),
-                                 cudaMemcpyDeviceToHost,
-                                 stream.get()));
-  }
-  detail::check_read_checkpoint(detail::read_checkpoint::COUNTS_COPY);
+  fold_membership_masks(result, input, has_initial_mask, stream, mr);
   if (any_contributed(result)) {
     result.output = sirius::apply_retention_mask(input, result.conjunction->view(), stream, mr);
   }
@@ -900,15 +920,7 @@ void apply_cached(application_result_state& result,
     result.contributed.front() = result.mask != nullptr;
     if (!result.mask) { return; }
   } else {
-    auto const size = program.membership.size() + 1;
-    // Without a residual, every input row enters the first membership step: the host already knows
-    // that count, and the first membership fold initializes the conjunction.
-    auto const device_counts = residual ? size : size - 1;
-    if (program.want_counts) {
-      result.counters.emplace(device_counts, stream, mr);
-      RMM_CUDA_TRY(cudaMemsetAsync(
-        result.counters->data(), 0, device_counts * sizeof(cudf::size_type), stream.get()));
-    }
+    allocate_prefix_counters(result, residual, stream, mr);
     auto* const counts = result.counters ? result.counters->data() : nullptr;
     if (residual) {
       // Folding the residual into its own column turns null into false in place.
@@ -932,35 +944,7 @@ void apply_cached(application_result_state& result,
                                                      stream,
                                                      mr);
     }
-    auto* const membership_counts = counts && residual ? counts + 1 : counts;
-    for (std::size_t i = 0; i < program.membership.size(); ++i) {
-      auto const& step      = program.membership[i];
-      auto const probe      = input.column(step.column_index);
-      result.mask           = i != 0 || residual
-                                ? step.mask_source->compute_mask_if(
-                          probe, result.conjunction->view(), program.device_id, stream, mr)
-                                : step.mask_source->compute_mask(probe, program.device_id, stream, mr);
-      result.contributed[i] = result.mask != nullptr;
-      sirius::op::fold_dynamic_filter_mask(
-        result.conjunction->mutable_view(),
-        result.mask ? std::optional{result.mask->view()} : std::nullopt,
-        membership_counts ? membership_counts + i : nullptr,
-        i == 0 && !residual,
-        stream);
-      result.mask.reset();
-    }
-    detail::check_read_checkpoint(detail::read_checkpoint::MASK_FOLD);
-    if (program.want_counts) {
-      result.readback = std::make_unique<detail::pinned_counts>(device_counts, stream);
-      result.counts.resize(size);
-      if (!residual) { result.counts[0] = input.num_rows(); }
-      RMM_CUDA_TRY(cudaMemcpyAsync(result.readback->data(),
-                                   result.counters->data(),
-                                   device_counts * sizeof(cudf::size_type),
-                                   cudaMemcpyDeviceToHost,
-                                   stream.get()));
-    }
-    detail::check_read_checkpoint(detail::read_checkpoint::COUNTS_COPY);
+    fold_membership_masks(result, input, residual, stream, mr);
     if (!residual && !any_contributed(result)) { return; }
   }
   auto const keep = single_mask ? result.mask->view() : result.conjunction->view();

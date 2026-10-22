@@ -123,11 +123,12 @@ struct binding {
 struct application_input {
   cudf::table_view source;
   std::span<binding const> bindings;
-  std::optional<std::size_t> input_bytes  = std::nullopt;
-  batch_receipt const* prior              = nullptr;
-  int device_id                           = -1;
-  cached_view_layout const* cached_layout = nullptr;
-  bool want_row_positions                 = false;
+  std::optional<std::size_t> input_bytes = std::nullopt;
+  batch_receipt const* prior             = nullptr;
+  int device_id                          = -1;
+  /// A selected program takes ownership of this layout's residual; a declined attempt leaves it.
+  cached_view_layout* cached_layout = nullptr;
+  bool want_row_positions           = false;
 };
 
 struct consumer_config {

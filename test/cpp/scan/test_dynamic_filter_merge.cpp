@@ -3200,7 +3200,7 @@ cached_view_layout cached_layout(bool residual = false)
 application_result run_cached(dynamic_filter_consumer& consumer,
                               std::shared_ptr<cudf::table const> const& input,
                               std::span<binding const> bindings,
-                              cached_view_layout const& layout,
+                              cached_view_layout& layout,
                               ::cuda::stream_ref stream,
                               batch_receipt const* prior = nullptr,
                               bool positions             = false)
@@ -3283,7 +3283,7 @@ TEST_CASE("cached residual uses original positions and residual denominator",
                                    .cached_layout      = &layout,
                                    .want_row_positions = true});
   REQUIRE(program);
-  layout.residual.reset();
+  REQUIRE_FALSE(layout.residual);
   auto result = consumer.apply(std::move(*program),
                                owning_table_view{input, input->view()},
                                stream,
@@ -3360,9 +3360,11 @@ TEST_CASE("cached checkpoint declines without membership and retains runtime dec
   auto channel              = std::make_shared<sirius_dynamic_filter_set>();
   dynamic_filter_consumer consumer(channel, {}, {});
   std::vector<binding> bindings{{0, 0}};
-  auto layout = cached_layout(residual);
+  auto layout                 = cached_layout(residual);
+  auto const* residual_before = layout.residual.get();
   REQUIRE_FALSE(
     consumer.prepare({.source = input->view(), .bindings = bindings, .cached_layout = &layout}));
+  REQUIRE(layout.residual.get() == residual_before);
   auto producer  = channel->register_producer({0});
   auto declining = std::make_shared<nullable_declining_filter>();
   REQUIRE(producer.push_filter(0, declining));
@@ -3518,7 +3520,10 @@ TEST_CASE("cached retirement retains all owners on failed completion and permits
         REQUIRE_FALSE(faults.retained.has_value());
         REQUIRE_FALSE(consumer_test_access::retained_cached_storage(faults));
         faults.fail_at.reset();
+        // Each selected program consumes its residual, including a failed execution.
+        layout     = cached_layout(true);
         auto retry = run_cached(consumer, input, bindings, layout, stream, nullptr, true);
+        REQUIRE(counts_of(retry) == std::vector<cudf::size_type>{80, 40, 10});
         REQUIRE(retry.take_output()->num_rows() == 10);
         auto receipt = consumer.finish(std::move(retry), 5);
         REQUIRE(receipt.applied.size() == 2);
