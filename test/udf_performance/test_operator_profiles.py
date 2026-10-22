@@ -314,6 +314,69 @@ class OperatorProfilesTests(unittest.TestCase):
         self.assertEqual(observations["downgrade_bytes"], 2112)
         self.assertTrue(observations["pressure_observed"])
 
+    def test_current_zero_byte_monitor_request_is_pressure_but_not_transfer(self):
+        lines = gpu_log()
+        lines[5:5] = [
+            f"{PREFIX} [info] [downgrade_executor.cpp:610] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 49230644 bytes (monitor request #6)",
+            f"{PREFIX} [info] [downgrade_executor.cpp:488] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.01 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes",
+            f"{PREFIX} [debug] [downgrade_executor.cpp:503] [downgrade] [GPU:0] request monitor done: 0 batches, 0 bytes (target 49230644, planned 0) in 0.01 ms (0.0 MB/s) | repos: 0/0 batches/bytes, pipeline_queue: 0/0 | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes",
+        ]
+        observed = self.collect_gpu(lines)["memory_observations"]
+        self.assertTrue(observed["pressure_observed"])
+        self.assertEqual(observed["downgrade_request_count"], 1)
+        self.assertEqual(observed["monitor_request_count"], 1)
+        self.assertEqual(observed["monitor_completion_count"], 1)
+        self.assertEqual(observed["downgrade_count"], 0)
+        self.assertEqual(observed["downgrade_bytes"], 0)
+        self.assertFalse(observed["monitor_completions"][0]["satisfied"])
+        self.assertEqual(observed["downgrade_requests"][0]["target_bytes"], 49230644)
+        self.assertEqual(observed["downgrade_requests"][0]["planned_bytes"], 0)
+
+    def test_current_transfers_are_counted_once_without_duplicate_info_summary(self):
+        lines = gpu_log()
+        lines[5:5] = [
+            f"{PREFIX} [info] [downgrade_executor.cpp:488] [downgrade][monitor] [GPU:0] request done: 2 batches, 1024 bytes in 0.25 ms (0.0 MB/s), satisfied=true | to_host: 2/1024 batches/bytes, to_disk: 0/0 batches/bytes",
+            f"{PREFIX} [debug] [downgrade_executor.cpp:503] [downgrade] [GPU:0] request monitor done: 2 batches, 1024 bytes (target 1000, planned 2048) in 0.25 ms (0.0 MB/s) | repos: 2/1024 batches/bytes, pipeline_queue: 0/0 | to_host: 2/1024 batches/bytes, to_disk: 0/0 batches/bytes",
+        ]
+        observed = self.collect_gpu(lines)["memory_observations"]
+        self.assertEqual(observed["downgrade_request_count"], 1)
+        self.assertEqual(observed["downgrade_count"], 1)
+        self.assertEqual(observed["downgrade_bytes"], 1024)
+        self.assertEqual(observed["downgrade_requests"][0]["planned_bytes"], 2048)
+
+    def test_current_predicate_request_accepts_none_target(self):
+        lines = gpu_log()
+        lines.insert(
+            5,
+            f"{PREFIX} [debug] [downgrade_executor.cpp:503] [downgrade] [GPU:0] request done: 0 batches, 0 bytes (target none, planned 0) in 0.01 ms (0.0 MB/s) | repos: 0/0 batches/bytes, pipeline_queue: 0/0 | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes",
+        )
+        observed = self.collect_gpu(lines)["memory_observations"]
+        self.assertEqual(observed["downgrade_request_count"], 1)
+        self.assertIsNone(observed["downgrade_requests"][0]["target_bytes"])
+        self.assertEqual(observed["downgrade_count"], 0)
+
+    def test_unknown_monitor_and_request_summary_formats_fail(self):
+        examples = [
+            f"{PREFIX} [info] [downgrade_executor.cpp:488] [downgrade][monitor] request changed format",
+            f"{PREFIX} [debug] [downgrade_executor.cpp:503] [downgrade] [GPU:0] request monitor done: 0 batches, 0 bytes (target invalid, planned 0) in 0.01 ms (0.0 MB/s) | repos: 0/0 batches/bytes, pipeline_queue: 0/0 | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes",
+        ]
+        for example in examples:
+            lines = gpu_log()
+            lines.insert(5, example)
+            with self.subTest(example=example), self.assertRaises(ValueError):
+                self.collect_gpu(lines)
+
+    def test_monitor_issued_inside_window_is_pressure_even_without_completion(self):
+        lines = gpu_log()
+        lines.insert(
+            5,
+            f"{PREFIX} [info] [downgrade_executor.cpp:610] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 49230644 bytes (monitor request #6)",
+        )
+        observed = self.collect_gpu(lines)["memory_observations"]
+        self.assertTrue(observed["pressure_observed"])
+        self.assertEqual(observed["monitor_request_count"], 1)
+        self.assertEqual(observed["downgrade_count"], 0)
+
     def test_manifest_rejects_duplicate_ids_or_mismatched_tag(self):
         entry = self.entry("cpu")
         for manifest in (

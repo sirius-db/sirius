@@ -33,6 +33,109 @@ AUXILIARY = re.compile(
     r"\(id=(?P<op_id>\d+)\) (?P<kind>prepare|sink) execution time: "
     r"(?P<execution_time_ms>[\d.]+) ms"
 )
+MONITOR_REQUEST = re.compile(
+    r"\[downgrade\]\[monitor\] \[(?P<source_tier>GPU|HOST|DISK):"
+    r"(?P<source_device_id>-?\d+)\] memory pressure: requesting downgrade of "
+    r"(?P<target_bytes>\d+) bytes \(monitor request #(?P<request_id>\d+)\)$"
+)
+MONITOR_COMPLETION = re.compile(
+    r"\[downgrade\]\[monitor\] \[(?P<source_tier>GPU|HOST|DISK):"
+    r"(?P<source_device_id>-?\d+)\] request done: "
+    r"(?P<total_batches>\d+) batches, (?P<total_bytes>\d+) bytes in "
+    r"(?P<duration_ms>[\d.]+) ms \((?P<throughput_mbs>[\d.]+) MB/s\), "
+    r"satisfied=(?P<satisfied>true|false) \| to_host: "
+    r"(?P<to_host_batches>\d+)/(?P<to_host_bytes>\d+) batches/bytes, "
+    r"to_disk: (?P<to_disk_batches>\d+)/(?P<to_disk_bytes>\d+) batches/bytes$"
+)
+RESERVE_DOWNGRADE = re.compile(
+    r"\[downgrade\]\[reserve\] pipeline (?P<pipeline_id>\d+) task (?P<task_id>\d+): "
+    r"needed (?P<needed_bytes>\d+) bytes \(shortfall (?P<shortfall_bytes>\d+)\), "
+    r"downgrade freed (?P<freed_bytes>\d+) bytes, reservation "
+    r"(?P<reservation>satisfied|partial|failed)$"
+)
+
+
+def _request_fields(match):
+    fields = match.groupdict()
+    for key, value in fields.items():
+        if key == "monitor":
+            continue
+        if key in ("duration_ms", "throughput_mbs"):
+            fields[key] = _number(float(value), key)
+        elif key == "satisfied":
+            fields[key] = value == "true"
+        elif key == "target_bytes" and value == "none":
+            fields[key] = None
+        elif key.endswith("_bytes") or key.endswith("_batches") or key.endswith("_id"):
+            fields[key] = int(value)
+    if "monitor" in fields:
+        fields["is_monitor"] = fields.pop("monitor") is not None
+    return fields
+
+
+def _downgrade_observations(lines, warnings):
+    """Separate pressure/control requests from completed data transfers.
+
+    Current TRACE emits a DEBUG request summary and an additional INFO monitor
+    completion for the same request. Only DEBUG summaries contribute transfer
+    counts/bytes; the INFO records retain control outcomes without double count.
+    A positive-target monitor request is pressure evidence even if no batch
+    could be moved. Neither planned nor requested bytes are transferred bytes.
+    """
+    monitor_requests = []
+    monitor_completions = []
+    reserve_requests = []
+    summary_lines = []
+    for line in lines:
+        if "[downgrade]" not in line:
+            continue
+        if "[downgrade][monitor]" in line:
+            if match := MONITOR_REQUEST.search(line):
+                monitor_requests.append(_request_fields(match))
+            elif match := MONITOR_COMPLETION.search(line):
+                monitor_completions.append(_request_fields(match))
+            else:
+                raise ValueError("Unrecognized Sirius downgrade monitor control record")
+        elif "[downgrade][reserve]" in line:
+            match = RESERVE_DOWNGRADE.search(line)
+            if not match:
+                raise ValueError("Unrecognized Sirius reserve downgrade control record")
+            reserve_requests.append(_request_fields(match))
+        elif " request " in line and " done: " in line:
+            summary_lines.append(line)
+    requests = downgrade.parse(summary_lines, warnings)
+    transfers = [request for request in requests if request["total_bytes"] > 0]
+    return {
+        "downgrade_requests": requests,
+        "downgrade_request_count": len(requests),
+        "downgrades": transfers,
+        "downgrade_count": len(transfers),
+        "downgrade_bytes": sum(request["total_bytes"] for request in transfers),
+        "monitor_requests": monitor_requests,
+        "monitor_request_count": len(monitor_requests),
+        "monitor_completions": monitor_completions,
+        "monitor_completion_count": len(monitor_completions),
+        "reserve_downgrade_requests": reserve_requests,
+        "reserve_downgrade_request_count": len(reserve_requests),
+        "pressure_scope": "engine memory/reservation accounting signals; not proof of physical device exhaustion or spilling",
+        "pressure_control_observed": bool(
+            monitor_requests
+            or monitor_completions
+            or reserve_requests
+            or any(
+                request.get("is_monitor")
+                or request.get("target_bytes", 0)
+                or request.get("planned_bytes", 0)
+                or request["total_bytes"]
+                for request in requests
+            )
+            or any(
+                "memory pressure but no viable downgrade target" in line
+                for line in lines
+            )
+        ),
+        "downgrade_byte_scope": "completed DEBUG request transfers only; requested/planned bytes and duplicate INFO completions excluded",
+    }
 
 
 def _number(value, label):
@@ -213,7 +316,7 @@ def _gpu_operators(window):
                 ),
             }
         )
-    downgrades = downgrade.parse(window.lines, warnings)
+    downgrade_observations = _downgrade_observations(window.lines, warnings)
     if warnings.has_drift:
         raise ValueError(f"Sirius TRACE format drift: {warnings.to_dict()}")
     if not any(
@@ -250,9 +353,7 @@ def _gpu_operators(window):
             row["peak_allocated_bytes"] for row in rows if "peak_allocated_bytes" in row
         ],
         "task_peak_scope": "allocator-reported stream peak; not a query-global high-water mark",
-        "downgrades": downgrades,
-        "downgrade_count": len(downgrades),
-        "downgrade_bytes": sum(row["total_bytes"] for row in downgrades),
+        **downgrade_observations,
         "oom_event_count": sum(
             any(
                 marker in line
@@ -273,7 +374,12 @@ def _gpu_operators(window):
     }
     observations["pressure_observed"] = any(
         observations[key]
-        for key in ("downgrade_count", "oom_event_count", "reschedule_count")
+        for key in (
+            "pressure_control_observed",
+            "downgrade_count",
+            "oom_event_count",
+            "reschedule_count",
+        )
     )
     if observations["fallback_event_count"]:
         raise ValueError("GPU window contains fallback events")

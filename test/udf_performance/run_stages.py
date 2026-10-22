@@ -268,6 +268,24 @@ def summarize(records):
                 key,
             )
         )
+        observations = [s.get("memory_observations", {}) for s in samples]
+        pressure = [memory.get("pressure_observed") for memory in observations]
+        gpu_pressure_samples = (
+            sum(pressure)
+            if common["engine"] == "gpu" and all(type(p) is bool for p in pressure)
+            else None
+        )
+        task_peaks = [
+            peak
+            for memory in observations
+            for peak in memory.get("task_allocator_peaks_bytes", [])
+        ]
+        common.update(
+            {
+                "gpu_pressure_samples": gpu_pressure_samples,
+                "max_task_allocator_peak_bytes": max(task_peaks, default=None),
+            }
+        )
         for stage in STAGES:
             if not all(s["stage_available"].get(stage, False) for s in samples):
                 continue
@@ -301,6 +319,16 @@ def summarize(records):
             cpu["median_operator_work_ms"],
             match["median_operator_work_ms"],
         )
+        pressure = match["gpu_pressure_samples"]
+        status = (
+            "gpu_pressure_unknown"
+            if pressure is None
+            else (
+                "gpu_memory_pressure"
+                if pressure
+                else "below_timer_resolution" if gpu_ms == 0 else "ok"
+            )
+        )
         comparisons.append(
             {
                 **{
@@ -309,7 +337,10 @@ def summarize(records):
                 },
                 "cpu_operator_work_ms": cpu_ms,
                 "gpu_operator_work_ms": gpu_ms,
-                "operator_work_ratio": cpu_ms / gpu_ms if gpu_ms > 0 else None,
+                "gpu_pressure_samples": pressure,
+                "max_task_allocator_peak_bytes": match["max_task_allocator_peak_bytes"],
+                "comparison_status": status,
+                "operator_work_ratio": cpu_ms / gpu_ms if status == "ok" else None,
             }
         )
     return summary, comparisons
@@ -339,6 +370,8 @@ def save(output, directory):
                 "min_operator_work_ms",
                 "max_operator_work_ms",
                 "median_query_wall_ms",
+                "gpu_pressure_samples",
+                "max_task_allocator_peak_bytes",
             ],
         ),
         (
@@ -353,6 +386,9 @@ def save(output, directory):
                 "cpu_operator_work_ms",
                 "gpu_operator_work_ms",
                 "operator_work_ratio",
+                "gpu_pressure_samples",
+                "max_task_allocator_peak_bytes",
+                "comparison_status",
             ],
         ),
     ):

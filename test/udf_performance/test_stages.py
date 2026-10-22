@@ -204,6 +204,7 @@ class StageRunnerTests(unittest.TestCase):
                         "query_kind": "projection",
                         "warmup": warmup,
                         "query_wall_ms": 9,
+                        "memory_observations": {"pressure_observed": False},
                         "stages": {"projection_expressions": duration, "other": 0},
                         "stage_available": {
                             "projection_expressions": True,
@@ -226,6 +227,39 @@ class StageRunnerTests(unittest.TestCase):
             if record["engine"] == "gpu":
                 record["stages"]["projection_expressions"] = 0
         self.assertIsNone(run_stages.summarize(records)[1][0]["operator_work_ratio"])
+
+    def test_pressure_or_missing_evidence_suppresses_only_the_ratio(self):
+        records = [
+            {
+                "workload": "sql",
+                "rows": 64,
+                "engine": engine,
+                "cpu_mode": engine,
+                "cpu_baseline": engine,
+                "query_kind": "projection",
+                "warmup": False,
+                "query_wall_ms": 7,
+                "stages": {"projection_expressions": 4 if engine == "cpu" else 2},
+                "stage_available": {"projection_expressions": True},
+                "memory_observations": {
+                    "pressure_observed": engine == "gpu",
+                    "task_allocator_peaks_bytes": [1024, 2048],
+                },
+            }
+            for engine in ("cpu", "gpu")
+        ]
+        summary, comparisons = run_stages.summarize(records)
+        gpu = next(row for row in summary if row["engine"] == "gpu")
+        self.assertEqual(gpu["median_operator_work_ms"], 2)
+        self.assertEqual(gpu["gpu_pressure_samples"], 1)
+        self.assertEqual(gpu["max_task_allocator_peak_bytes"], 2048)
+        self.assertIsNone(comparisons[0]["operator_work_ratio"])
+        self.assertEqual(comparisons[0]["comparison_status"], "gpu_memory_pressure")
+        records[1].pop("memory_observations")
+        comparison = run_stages.summarize(records)[1][0]
+        self.assertIsNone(comparison["operator_work_ratio"])
+        self.assertIsNone(comparison["gpu_pressure_samples"])
+        self.assertEqual(comparison["comparison_status"], "gpu_pressure_unknown")
 
     def test_failed_host_preserves_generated_inputs_and_nonzero_report(self):
         device = {

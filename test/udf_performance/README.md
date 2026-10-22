@@ -234,6 +234,13 @@ CPU alternative with the GPU for stages available in both profiles:
 Compare all baselines and keep slowdowns visible; do not choose the generated
 CPU callback alone as the headline comparison.
 
+Both CSVs expose `gpu_pressure_samples` and `max_task_allocator_peak_bytes`.
+An empty pressure count means evidence is unavailable (or not applicable to a
+CPU summary row). `comparison_status` explains suppressed ratios: GPU memory
+pressure, missing pressure evidence, or timer resolution. Raw milliseconds remain
+available for diagnosis; pressure-affected stage work can omit failed OOM attempts
+and must not be used as a complete CPU/GPU speed comparison.
+
 These durations accumulate across operator calls and workers. They are not
 device-only times, CPU instruction times, or a partition of query latency:
 operators can overlap and stage boundaries differ across engines. One CPU
