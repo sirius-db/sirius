@@ -59,6 +59,7 @@
 
 // rmm
 #include <rmm/device_buffer.hpp>
+#include <rmm/resource_ref.hpp>
 
 // standard library
 #include <algorithm>
@@ -73,6 +74,31 @@
 
 namespace sirius {
 using evaluate_result = expression_evaluator::evaluate_result;
+
+namespace {
+
+// Whether a signed integer column holds its type's minimum, whose negation and abs overflow.
+// Synchronizes the stream.
+bool holds_signed_minimum(cudf::column_view const& column,
+                          ::cuda::stream_ref stream,
+                          rmm::device_async_resource_ref mr)
+{
+  if (!cudf::is_integral(column.type()) || cudf::is_unsigned(column.type()) || column.is_empty()) {
+    return false;
+  }
+  auto const lowest =
+    cudf::type_dispatcher(column.type(), [&]<typename T>() -> std::unique_ptr<cudf::scalar> {
+      if constexpr (std::is_integral_v<T> && std::is_signed_v<T>) {
+        return std::make_unique<cudf::numeric_scalar<T>>(
+          std::numeric_limits<T>::lowest(), true, stream, mr);
+      } else {
+        throw internal_exception("holds_signed_minimum needs a signed integer type");
+      }
+    });
+  return cudf::contains(column, *lowest, stream);
+}
+
+}  // namespace
 
 like_multiliteral_cache::entry_ptr const& expression_evaluator::get_or_classify_like(
   std::string_view pattern)
@@ -201,6 +227,21 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
   }
   if (resolved_id == function_id::mod) {
     return execute_numeric_binary_func(cudf::binary_operator::MOD);
+  }
+
+  //----------Negation----------//
+  if (resolved_id == function_id::negate) {
+    auto input = evaluate(*args[0], evaluation_mode::MATERIALIZE);
+    if (input.is_scalar()) {
+      input = evaluate_result(
+        cudf::make_column_from_scalar(input.get_scalar(), _input_table.num_rows(), _stream, _mr));
+    }
+    auto const column = input.get_column_view();
+    if (holds_signed_minimum(column, _stream, _mr)) {
+      throw invalid_input_exception("Overflow in negation of numeric value!");
+    }
+    return evaluate_result(
+      cudf::unary_operation(column, cudf::unary_operator::NEGATE, _stream, _mr));
   }
 
   //----------Substring Function----------//
@@ -462,26 +503,12 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
       input = evaluate_result(
         cudf::make_column_from_scalar(input.get_scalar(), _input_table.num_rows(), _stream, _mr));
     }
-    // In cuDF the absolute value of the smallest value of a signed integer type wraps to a negative
-    // value. DuckDB raises an overflow error, so we check for the smallest value of the type
-    // and throw manually here to match DuckDB.
+    // cuDF wraps abs of a signed minimum; fall back so DuckDB raises its overflow error.
     auto const column = input.get_column_view();
-    if (cudf::is_integral(column.type()) && !cudf::is_unsigned(column.type()) &&
-        column.size() > 0) {
-      auto const lowest =
-        cudf::type_dispatcher(column.type(), [&]<typename T>() -> std::unique_ptr<cudf::scalar> {
-          if constexpr (std::is_integral_v<T> && std::is_signed_v<T>) {
-            return std::make_unique<cudf::numeric_scalar<T>>(
-              std::numeric_limits<T>::lowest(), true, _stream, _mr);
-          } else {
-            throw internal_exception("abs overflow check needs a signed integer type");
-          }
-        });
-      if (cudf::contains(column, *lowest, _stream)) {
-        throw not_implemented_exception(
-          "[expression_evaluator:function] abs overflows for the smallest value of a signed "
-          "integer type, expected to fall back to CPU execution");
-      }
+    if (holds_signed_minimum(column, _stream, _mr)) {
+      throw not_implemented_exception(
+        "[expression_evaluator:function] abs overflows for the smallest value of a signed "
+        "integer type, expected to fall back to CPU execution");
     }
     return evaluate_result(cudf::unary_operation(column, cudf::unary_operator::ABS, _stream, _mr));
   }
