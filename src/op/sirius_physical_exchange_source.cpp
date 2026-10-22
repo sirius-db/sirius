@@ -183,6 +183,14 @@ sirius::OrderPreservationType sirius_physical_exchange_source::source_order() co
                          : sirius::OrderPreservationType::NO_ORDER;
 }
 
+bool sirius_physical_exchange_source::is_sink() const
+{
+  auto const* parent = get_parent_op();
+  return sirius_physical_operator::is_sink() ||
+         (parent != nullptr && (parent->type == SiriusPhysicalOperatorType::MERGE_AGGREGATE ||
+                                parent->type == SiriusPhysicalOperatorType::MERGE_TOP_N));
+}
+
 MemoryBarrierType sirius_physical_exchange_source::input_barrier_for(
   sirius_physical_operator const& /*producer*/) const
 {
