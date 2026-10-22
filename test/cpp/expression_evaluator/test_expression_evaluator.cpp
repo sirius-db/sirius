@@ -59,6 +59,7 @@
 #include <cuda_runtime_api.h>
 
 // standard library
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -3069,6 +3070,94 @@ TEMPLATE_TEST_CASE("CASE accepts scalar WHEN conditions",
     for (size_t i = 0; i < actual.size(); ++i) {
       CHECK(actual[i] == (condition == 1 ? 100 : expected[i]));
     }
+  }
+}
+
+// DuckDB can leave calls whose operands are all constants, e.g. after statistics propagation
+// reduces coalesce(<non-null constant>, x) to the constant. Each must yield one row per input row.
+TEMPLATE_TEST_CASE("operands that are all constants are broadcast",
+                   "[expression_evaluator][unfolded_constants]",
+                   mat_strategy,
+                   ast_interpret_strategy,
+                   ast_jit_strategy)
+{
+  auto* space         = get_default_gpu_space();
+  auto input          = make_int32_input(*space);
+  auto const num_rows = input.view.num_rows();
+  auto const boolean  = logical_type::make(type_id::BOOLEAN);
+  auto const run      = [&](std::unique_ptr<ast_node> expr) {
+    auto output = run_native_ast(*space, expr.get(), input.view, TestType::value);
+    REQUIRE(output->num_rows() == num_rows);
+    return output;
+  };
+  auto const require_all_true = [&](std::unique_ptr<ast_node> expr) {
+    auto output = run(std::move(expr));
+    REQUIRE(output->view().column(0).null_count() == 0);
+    auto const actual = copy_bool_column_to_host(output->view().column(0));
+    CHECK(std::all_of(actual.begin(), actual.end(), [](uint8_t v) { return v == 1; }));
+  };
+  auto const args = [](auto... nodes) {
+    std::vector<std::unique_ptr<ast_node>> v;
+    (v.push_back(std::move(nodes)), ...);
+    return v;
+  };
+
+  SECTION("comparison")
+  {
+    require_all_true(
+      make_cmp(sirius::comparison_type::equal, make_str_const("apple"), make_str_const("apple")));
+    require_all_true(make_cmp(
+      sirius::comparison_type::distinct_from, make_str_const("apple"), make_str_const("pear")));
+  }
+  SECTION("between")
+  {
+    require_all_true(
+      make_between(make_int_const(2), make_int_const(1), make_int_const(3), true, true));
+  }
+  SECTION("unary operators")
+  {
+    require_all_true(
+      make_unary(sirius::ast::unary_op::kind::op_not,
+                 std::make_unique<ast_node>(sirius::ast::constant{sirius::value{false}, boolean})));
+    require_all_true(make_unary(sirius::ast::unary_op::kind::op_is_not_null, make_int_const(2)));
+    require_all_true(make_unary(sirius::ast::unary_op::kind::op_is_null,
+                                make_null_const(logical_type::make(type_id::INTEGER))));
+  }
+  SECTION("IN probe")
+  {
+    require_all_true(make_in(
+      make_str_const("apple"), args(make_str_const("apple"), make_str_const("pear")), false));
+  }
+  SECTION("LIKE")
+  {
+    require_all_true(make_func(
+      sirius::function_id::like, args(make_str_const("apple"), make_str_const("a_ple")), boolean));
+  }
+  SECTION("arithmetic")
+  {
+    auto output       = run(make_func(sirius::function_id::add,
+                                args(make_int_const(2), make_int_const(3)),
+                                logical_type::make(type_id::INTEGER)));
+    auto const actual = copy_column_to_host<int32_t>(output->view().column(0));
+    CHECK(std::all_of(actual.begin(), actual.end(), [](int32_t v) { return v == 5; }));
+  }
+  SECTION("date part")
+  {
+    // 2020-02-01 is day 18293 of the epoch.
+    auto output       = run(make_func(sirius::function_id::month,
+                                args(make_date_const(18293)),
+                                logical_type::make(type_id::BIGINT)));
+    auto const months = cudf::cast(output->view().column(0), cudf::data_type{cudf::type_id::INT64});
+    auto const actual = copy_column_to_host<int64_t>(months->view());
+    CHECK(std::all_of(actual.begin(), actual.end(), [](int64_t v) { return v == 2; }));
+  }
+  SECTION("string function")
+  {
+    auto output       = run(make_func(sirius::function_id::upper,
+                                args(make_str_const("apple")),
+                                logical_type::make(type_id::VARCHAR)));
+    auto const actual = copy_string_column_to_host(output->view().column(0));
+    CHECK(std::all_of(actual.begin(), actual.end(), [](auto const& v) { return v == "APPLE"; }));
   }
 }
 

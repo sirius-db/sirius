@@ -78,22 +78,31 @@ CUfunction CompiledKernel::func_for_current_device() const
 {
   if (!kern) return nullptr;
 
-  int device_id = 0;
-  cudaGetDevice(&device_id);  // runtime API — no driver context required
+  // cuKernelGetFunction binds the kernel to the calling thread's current context,
+  // and cuLaunchKernel rejects the result from any other context
+  // (CUDA_ERROR_INVALID_HANDLE). Threads on one device can hold different
+  // contexts, so a device-keyed cache would hand every thread but the first a
+  // function it cannot launch.
+  CUcontext ctx = nullptr;
+  if (cuCtxGetCurrent(&ctx) != CUDA_SUCCESS) return nullptr;
+  if (ctx == nullptr) {
+    // A thread that never touched the runtime has no context; make the current
+    // device's primary context current instead of deriving against none.
+    cudaFree(nullptr);
+    if (cuCtxGetCurrent(&ctx) != CUDA_SUCCESS || ctx == nullptr) return nullptr;
+  }
 
   {
     std::lock_guard<std::mutex> lock(func_mu_);
-    auto it = func_per_dev_.find(device_id);
-    if (it != func_per_dev_.end()) return it->second;
+    auto it = func_per_ctx_.find(ctx);
+    if (it != func_per_ctx_.end()) return it->second;
   }
 
-  // cuKernelGetFunction binds the kernel to the current device context,
-  // which RMM/cuDF sets up correctly per-thread before calling encode/decode.
   CUfunction fn = nullptr;
   if (cuKernelGetFunction(&fn, kern) != CUDA_SUCCESS) return nullptr;
 
   std::lock_guard<std::mutex> lock(func_mu_);
-  func_per_dev_[device_id] = fn;
+  func_per_ctx_[ctx] = fn;
   return fn;
 }
 
@@ -112,7 +121,7 @@ CompiledKernel::CompiledKernel(CompiledKernel&& other) noexcept
     cubin(std::move(other.cubin)),
     rendered_source(std::move(other.rendered_source))
 {
-  func_per_dev_ = std::move(other.func_per_dev_);
+  func_per_ctx_ = std::move(other.func_per_ctx_);
   other.library = nullptr;
   other.kern    = nullptr;
 }
@@ -125,7 +134,7 @@ CompiledKernel& CompiledKernel::operator=(CompiledKernel&& other) noexcept
     kern            = other.kern;
     cubin           = std::move(other.cubin);
     rendered_source = std::move(other.rendered_source);
-    func_per_dev_   = std::move(other.func_per_dev_);
+    func_per_ctx_   = std::move(other.func_per_ctx_);
     other.library   = nullptr;
     other.kern      = nullptr;
   }

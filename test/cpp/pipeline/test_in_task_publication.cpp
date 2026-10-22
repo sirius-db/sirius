@@ -19,6 +19,7 @@
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_partition.hpp"
 #include "operator/dynamic_filter_accumulation_test_utils.hpp"
+#include "operator/partition_test_utils.hpp"
 #include "operator/partitioned_join_test_utils.hpp"
 #include "pipeline/completion_handler.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
@@ -215,7 +216,8 @@ struct harness {
          .make_build_partition = [](duckdb::vector<sirius::logical_type> types,
                                     op::sirius_physical_hash_join& join)
            -> duckdb::unique_ptr<op::sirius_physical_partition> {
-           return duckdb::make_uniq<observed_partition>(std::move(types), 1, &join, true);
+           return duckdb::make_uniq<observed_partition>(
+             std::move(types), 1, sirius::test::operator_utils::hash_partition_spec(join, true));
          }})},
       partition{static_cast<observed_partition*>(tree.build_partition)}
   {
@@ -223,7 +225,7 @@ struct harness {
     tree.join->operator_id = 1;
     partition->operator_id = 2;
     receiver->operator_id  = 3;
-    partition->set_num_partitions(2);
+    partition->set_fixed_layout(sirius::test::operator_utils::fixed_hash_layout(2));
 
     pipeline = std::make_shared<pl::sirius_pipeline>(pl::pipeline_build_context{nullptr, true});
     pipeline->set_pipeline_id(7);

@@ -298,7 +298,7 @@ sirius_physical_operator* require_join_child_wrap(sirius_physical_operator* op,
   REQUIRE(op->children.size() == 1);
   auto* partition = op->children[0].get();
   REQUIRE(partition->type == SiriusPhysicalOperatorType::PARTITION);
-  CHECK(partition->Cast<sirius::op::sirius_physical_partition>().is_build_partition() == is_build);
+  CHECK(partition->Cast<sirius::op::sirius_physical_partition>().exchange() != nullptr);
 
   REQUIRE(partition->children.size() == 1);
   return partition->children[0].get();
@@ -318,7 +318,7 @@ void require_delim_join_common(sirius::op::sirius_physical_delim_join& delim)
   REQUIRE(merge->children.size() == 1);
   auto* partition = merge->children[0].get();
   REQUIRE(partition->type == SiriusPhysicalOperatorType::PARTITION);
-  CHECK_FALSE(partition->Cast<sirius::op::sirius_physical_partition>().is_build_partition());
+  CHECK(partition->Cast<sirius::op::sirius_physical_partition>().exchange() != nullptr);
 
   REQUIRE(partition->children.size() == 1);
   auto* hgb = partition->children[0].get();
@@ -1255,7 +1255,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
     auto* partition = merge->children[0].get();
     REQUIRE(partition->type == SiriusPhysicalOperatorType::PARTITION);
-    CHECK_FALSE(partition->Cast<sirius::op::sirius_physical_partition>().is_build_partition());
+    CHECK(partition->Cast<sirius::op::sirius_physical_partition>().exchange() != nullptr);
 
     REQUIRE(partition->children.size() == 1);
     CHECK(partition->children[0]->type == SiriusPhysicalOperatorType::HASH_GROUP_BY);
@@ -1286,6 +1286,49 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     CHECK(local->get_types()[1].id() == sirius::type_id::LIST);
   }
 
+  SECTION("a wide integer SUM accepts INT64 or DECIMAL128 partials until the merge")
+  {
+    // The statistics cannot prove the BIGINT sum fits INT64, so the SUM is wide.
+    REQUIRE_FALSE(con->Query("CREATE TABLE wide_sum (k INTEGER, x BIGINT)")->HasError());
+    REQUIRE_FALSE(
+      con->Query("INSERT INTO wide_sum VALUES (1, 4000000000000000000), (1, 4000000000000000000)")
+        ->HasError());
+    auto plan = generate_sirius_plan(*con, "SELECT k, sum(x) FROM wide_sum GROUP BY k");
+    INFO(tree_to_string(plan.get()));
+
+    auto* merge = find_first(plan.get(), SiriusPhysicalOperatorType::MERGE_GROUP_BY);
+    REQUIRE(merge != nullptr);
+    CHECK(merge->get_alternate_physical_types().empty());
+    auto* partition = merge->children[0].get();
+    REQUIRE(partition->type == SiriusPhysicalOperatorType::PARTITION);
+    auto* local = partition->children[0].get();
+    REQUIRE(local->type == SiriusPhysicalOperatorType::HASH_GROUP_BY);
+
+    auto const int64      = cudf::data_type{cudf::type_id::INT64};
+    auto const decimal128 = cudf::data_type{cudf::type_id::DECIMAL128, 0};
+    for (auto const* op : {local, partition}) {
+      REQUIRE(op->get_types().size() == 2);
+      CHECK(op->get_types()[1].id() == sirius::type_id::BIGINT);
+      CHECK(op->is_alternate_physical_type(1, decimal128));
+      CHECK_FALSE(op->is_alternate_physical_type(1, int64));
+      CHECK_FALSE(op->is_alternate_physical_type(0, decimal128));
+    }
+  }
+
+  SECTION("a decimal SUM has no alternate partial carrier")
+  {
+    auto plan =
+      generate_sirius_plan(*con, "SELECT amount, sum(amount) FROM decimal_values GROUP BY amount");
+    INFO(tree_to_string(plan.get()));
+
+    auto* local = find_first(plan.get(), SiriusPhysicalOperatorType::HASH_GROUP_BY);
+    REQUIRE(local != nullptr);
+    CHECK(local->get_alternate_physical_types().empty());
+    auto* partition = find_first(plan.get(), SiriusPhysicalOperatorType::PARTITION);
+    REQUIRE(partition != nullptr);
+    CHECK(partition->get_alternate_physical_types().empty());
+  }
+
   SECTION("ungrouped aggregate gains MERGE_AGGREGATE with no PARTITION")
   {
     auto plan = generate_sirius_plan(*con, "SELECT sum(val) FROM big_left");
@@ -1299,6 +1342,8 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
   SECTION("AVG records its two-column local accumulator schema below MERGE_AGGREGATE")
   {
+    // AVG(INTEGER) accumulates in 128 bits (a wide integer sum), so its local sum is
+    // DECIMAL(38, 0) and its count BIGINT.
     auto plan = generate_sirius_plan(
       *con, "SELECT avg(val) FROM big_left", {OptimizerType::AGGREGATE_FUNCTION_REWRITER});
     INFO(tree_to_string(plan.get()));
@@ -1311,7 +1356,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     auto* local = merge->children[0].get();
     REQUIRE(local->type == SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE);
     duckdb::vector<sirius::logical_type> const expected_local_types{
-      sirius::logical_type::make(sirius::type_id::BIGINT),
+      sirius::logical_type::make_decimal(38, 0),
       sirius::logical_type::make(sirius::type_id::BIGINT)};
     CHECK(local->get_types() == expected_local_types);
   }
@@ -1349,7 +1394,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
     auto* partition = merge->children[0].get();
     REQUIRE(partition->type == SiriusPhysicalOperatorType::PARTITION);
-    CHECK_FALSE(partition->Cast<sirius::op::sirius_physical_partition>().is_build_partition());
+    CHECK(partition->Cast<sirius::op::sirius_physical_partition>().exchange() != nullptr);
     REQUIRE(partition->children.size() == 1);
 
     auto* hgb = partition->children[0].get();
@@ -1630,6 +1675,62 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     REQUIRE(merge != nullptr);
     REQUIRE(merge->children.size() == 1);
     CHECK(merge->children[0]->type == SiriusPhysicalOperatorType::TOP_N);
+  }
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - join input partitions get their ingress barrier at planning",
+                 "[plan_tree_shape][isolated_context]")
+{
+  using sirius::op::MemoryBarrierType;
+  auto const barriers = [](sirius_physical_operator* join) {
+    auto& probe = join->children[0]->children[0]->Cast<sirius::op::sirius_physical_partition>();
+    auto& build = join->children[1]->children[0]->Cast<sirius::op::sirius_physical_partition>();
+    return std::make_pair(probe.input_barrier(), build.input_barrier());
+  };
+  const std::vector<OptimizerType> keep_shape{OptimizerType::JOIN_ORDER,
+                                              OptimizerType::BUILD_SIDE_PROBE_SIDE};
+
+  SECTION("INNER join: the probe streams and the build arrives whole")
+  {
+    auto plan =
+      generate_sirius_plan(*con, "SELECT * FROM big_left l JOIN small_right r ON l.id = r.rid");
+    INFO(tree_to_string(plan.get()));
+    auto* join = find_first(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN);
+    REQUIRE(join != nullptr);
+    REQUIRE(join->Cast<sirius::op::sirius_physical_hash_join>().join_type == JoinType::INNER);
+    auto const [probe, build] = barriers(join);
+    CHECK(probe == MemoryBarrierType::PARTIAL);
+    CHECK(build == MemoryBarrierType::FULL);
+  }
+
+  SECTION("RIGHT join: the probe drives partition sizing and arrives whole")
+  {
+    auto plan = generate_sirius_plan(
+      *con, "SELECT * FROM big_left l RIGHT JOIN small_right r ON l.id = r.rid", keep_shape);
+    INFO(tree_to_string(plan.get()));
+    auto* join = find_first(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN);
+    REQUIRE(join != nullptr);
+    REQUIRE(join->Cast<sirius::op::sirius_physical_hash_join>().is_right_family());
+    auto const [probe, build] = barriers(join);
+    CHECK(probe == MemoryBarrierType::FULL);
+    CHECK(build == MemoryBarrierType::FULL);
+  }
+
+  SECTION("RIGHT_DELIM_JOIN: the inner join is sized from its build side")
+  {
+    auto plan = generate_sirius_plan(
+      *con,
+      "SELECT SUM(i.qty) FROM items i, parts p WHERE p.pk = i.fk AND p.pname = 'p1' "
+      "AND i.qty < (SELECT 2 * AVG(i2.qty) FROM items i2 WHERE i2.fk = p.pk)");
+    INFO(tree_to_string(plan.get()));
+    auto* node = find_first(plan.get(), SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN);
+    REQUIRE(node != nullptr);
+    auto& delim = node->Cast<sirius::op::sirius_physical_right_delim_join>();
+    REQUIRE(delim.join);
+    auto const [probe, build] = barriers(delim.join.get());
+    CHECK(probe == MemoryBarrierType::PARTIAL);
+    CHECK(build == MemoryBarrierType::FULL);
   }
 }
 

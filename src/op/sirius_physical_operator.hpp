@@ -384,6 +384,30 @@ class pipelineable_operator_data : public operator_data {
   std::optional<std::vector<::cucascade::read_only_data_batch>> _read_only_data_batches;
 };
 
+/// Output of a row router. Each batch has its own destination; omitted empty slices retain IDs.
+class routed_operator_data : public pipelineable_operator_data {
+ public:
+  routed_operator_data(std::vector<std::shared_ptr<cucascade::data_batch>> batches,
+                       std::vector<std::size_t> destinations)
+    : pipelineable_operator_data(std::move(batches)), _destinations(std::move(destinations))
+  {
+    if (get_data_batches().size() != _destinations.size()) {
+      throw std::invalid_argument("routed_operator_data: destination/batch count mismatch");
+    }
+  }
+  [[nodiscard]] std::vector<std::size_t> const& destinations() const { return _destinations; }
+  [[nodiscard]] std::unique_ptr<pipelineable_operator_data> with_batches_preserving_rows(
+    std::vector<std::shared_ptr<cucascade::data_batch>> batches) const override
+  {
+    auto replacement = std::make_unique<routed_operator_data>(std::move(batches), _destinations);
+    replacement->adopt_row_identity(*this);
+    return replacement;
+  }
+
+ private:
+  std::vector<std::size_t> _destinations;
+};
+
 /**
  * @brief Operator data with partition index for partitioned pipeline execution.
  *
@@ -560,6 +584,33 @@ class sirius_physical_operator {
                                types.size());
     }
     _physical_types = std::move(schema);
+  }
+
+  //! Return the optional per-column alternate carriers. A column with an entry may arrive, batch
+  //! by batch, in either its expected carrier or this one. Empty means no column has one.
+  [[nodiscard]] const std::vector<std::optional<cudf::data_type>>& get_alternate_physical_types()
+    const noexcept
+  {
+    return _alternate_physical_types;
+  }
+
+  //! Whether @p type is the alternate carrier recorded for output column @p column.
+  [[nodiscard]] bool is_alternate_physical_type(std::size_t column,
+                                                cudf::data_type type) const noexcept
+  {
+    return column < _alternate_physical_types.size() && _alternate_physical_types[column] == type;
+  }
+
+  //! Install the per-column alternate carriers, one entry per logical column, or none.
+  void set_alternate_physical_types(std::vector<std::optional<cudf::data_type>> schema)
+  {
+    if (!schema.empty() && schema.size() != types.size()) {
+      throw internal_exception(
+        "alternate physical schema width {} does not match logical schema width {}",
+        schema.size(),
+        types.size());
+    }
+    _alternate_physical_types = std::move(schema);
   }
 
   //! Get the unique operator ID.
@@ -804,8 +855,13 @@ class sirius_physical_operator {
   };
 
   /**
-   * @brief Pushes @p batch into port @p port_id after `on_input_batch_pushed` observes it.
+   * @brief Publishes @p batch to an explicit destination after observing its arrival.
    */
+  virtual void push_data_batch_partitioned(std::string_view port_id,
+                                           std::shared_ptr<cucascade::data_batch> batch,
+                                           std::size_t partition_idx);
+
+  /// Publish to destination zero after on_input_batch_pushed observes the batch.
   void push_data_batch(std::string_view port_id, std::shared_ptr<::cucascade::data_batch> batch);
   //! Add a port to the operator
   void add_port(std::string_view port_id, std::unique_ptr<port> p);
@@ -894,6 +950,9 @@ class sirius_physical_operator {
   //! about their logical type. Private so the complete-or-absent invariant enforced by
   //! set_physical_types() cannot be bypassed by direct assignment.
   std::vector<cudf::data_type> _physical_types;
+  //! Optional second carrier per output column, for columns whose carrier varies between batches
+  //! (a wide integer SUM's partials are INT64 or DECIMAL128). See set_alternate_physical_types().
+  std::vector<std::optional<cudf::data_type>> _alternate_physical_types;
 
   //! See `deferred_output()` / `port_directive()`. Private and written through one friend, so
   //! the two halves cannot be installed apart.
