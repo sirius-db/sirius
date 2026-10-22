@@ -23,8 +23,8 @@
 #include "sirius/exception.hpp"
 
 #include <cudf/copying.hpp>
-#include <cudf/partitioning.hpp>
 #include <cudf/search.hpp>
+#include <cudf/utilities/error.hpp>
 
 #include <cucascade/data/data_batch.hpp>
 
@@ -131,8 +131,9 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_exchange_sin
     return slices;
   }
 
-  // Range: rank of a row = how many boundaries are at or below it, which puts a row equal to
-  // boundary i on rank i + 1, as SORT_PARTITION's lower_bound split does.
+  // Range: the batch is sorted on the keys, so each rank's rows are one contiguous run. Rank i
+  // starts at the first row not below boundary i - 1: a row equal to a boundary goes to the
+  // higher rank, as SORT_PARTITION splits, and each run stays sorted.
   std::shared_ptr<cudf::table const> boundaries;
   {
     std::lock_guard lock{_boundaries_mutex};
@@ -141,28 +142,31 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_exchange_sin
   if (!boundaries) {
     throw sirius::internal_exception("exchange sink: range routing before its boundaries are set");
   }
-  auto const table    = get_cudf_table_view(batch);
-  auto const keys     = table.select(_spec.key_columns);
-  auto const mr       = space->get_default_allocator();
-  auto const ranks_of = cudf::upper_bound(
-    boundaries->view(), keys, _spec.column_order, _spec.null_precedence, stream, mr);
-  auto [grouped, offsets] =
-    cudf::partition(table, ranks_of->view(), static_cast<cudf::size_type>(ranks), stream, mr);
-  // offsets has ranks + 1 entries: rank r's rows are [offsets[r], offsets[r + 1]).
-  std::shared_ptr<cudf::table> owner = std::move(grouped);
-  std::vector<cudf::size_type> bounds;
-  for (std::size_t r = 0; r < ranks; ++r) {
-    bounds.push_back(offsets[r]);
-    bounds.push_back(offsets[r + 1]);
+  auto const table  = get_cudf_table_view(batch);
+  auto const starts = cudf::lower_bound(table.select(_spec.key_columns),
+                                        boundaries->view(),
+                                        _spec.column_order,
+                                        _spec.null_precedence,
+                                        stream,
+                                        space->get_default_allocator());
+  std::vector<cudf::size_type> split(ranks - 1);
+  CUDF_CUDA_TRY(cudaMemcpyAsync(split.data(),
+                                starts->view().data<cudf::size_type>(),
+                                split.size() * sizeof(cudf::size_type),
+                                cudaMemcpyDeviceToHost,
+                                stream.get()));
+  CUDF_CUDA_TRY(cudaStreamSynchronize(stream.get()));
+  std::vector<cudf::size_type> bounds{0};
+  for (auto const at : split) {
+    bounds.push_back(at);
+    bounds.push_back(at);
   }
-  auto const pieces = cudf::slice(owner->view(), bounds, stream);
-  auto const total  = std::max<std::size_t>(1, static_cast<std::size_t>(owner->num_rows()));
+  bounds.push_back(table.num_rows());
+  auto const pieces = cudf::slice(table, bounds, stream);
   for (std::size_t r = 0; r < ranks; ++r) {
     if (pieces[r].num_rows() == 0) { continue; }
-    // Each slice is charged its share of the partitioned table.
-    auto const bytes = owner->alloc_size() * static_cast<std::size_t>(pieces[r].num_rows()) / total;
-    slices[r] =
-      make_data_batch_from_view(pieces[r], owner, bytes, *space, stream, batch_telemetry());
+    auto owned = std::make_unique<cudf::table>(pieces[r], stream, space->get_default_allocator());
+    slices[r]  = make_data_batch(std::move(owned), *space, stream, batch_telemetry());
   }
   return slices;
 }

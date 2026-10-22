@@ -37,7 +37,9 @@ namespace sirius::op {
 struct exchange_spec {
   enum class mode {
     hash,       ///< By a hash of key_columns.
-    range,      ///< By key_columns against range boundaries, set before the first batch.
+    range,      ///< By key_columns against range boundaries, set before the first batch. Each
+                ///< input batch must be sorted on key_columns, as ORDER_BY leaves it; each
+                ///< slice stays sorted.
     broadcast,  ///< Every row to every rank.
     gather,     ///< Every row to rank `target`.
   };
