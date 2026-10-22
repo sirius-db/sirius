@@ -3551,6 +3551,27 @@ static void publish_transparent_optimizer_mask(DBConfig& config)
   live.swap(updated);
 }
 
+// Make DuckDB keep explicit delim joins when it decorrelates subqueries, unless the database
+// already carries an explicit global value (for example from the connection config or a
+// `SET GLOBAL` before LOAD). A session-level `SET delim_join_as_cte = true` still wins, because
+// DuckDB resolves a session value before the global one.
+//
+// Why: DuckDB v2 defaults `delim_join_as_cte` to true and rewrites each delim join into a
+// materialized CTE. Sirius does not yet plan those CTE shapes well: TPC-H Q21's NOT EXISTS then
+// builds a mixed anti-join hash table over every late lineitem, and Q20/Q22 lose dynamic filters
+// behind mark joins, which made them 1.2-3.5x slower at SF1000 than the delim-join plans. This is a
+// stopgap until Sirius handles the v2 CTE plan shapes. DuckDB already flags the setting as
+// deprecated, so revisit this when DuckDB removes it.
+//
+// The value is written into the global user settings directly rather than through `SET`, which
+// would run DuckDB's deprecation callback and log a warning on every database that loads Sirius.
+static void default_to_explicit_delim_joins(DBConfig& config)
+{
+  constexpr idx_t setting_index = DelimJoinAsCteSetting::SettingIndex;
+  if (config.user_settings.IsSet(setting_index)) { return; }
+  Settings::Set<DelimJoinAsCteSetting>(config, SetScope::GLOBAL, Value::BOOLEAN(false));
+}
+
 static void LoadInternal(ExtensionLoader& loader)
 {
   sirius::util::install_segfault_backtrace_handler();
@@ -3597,9 +3618,8 @@ static void LoadInternal(ExtensionLoader& loader)
   db.GetFileSystem().RegisterSubSystem(make_uniq<sirius::io::s3::sirius_httpfs>());
 
   // Register optimizer extension for transparent GPU execution. The post-hook
-  // captures the optimized plan; the pre-hook derives the single-table
-  // restrictions implied by OR-ed multi-table filters so DuckDB's own pushdown,
-  // join-order and build/probe-side passes can act on them. (The optimizer mask
+  // captures the optimized plan; the pre-hook classifies the query while every
+  // scan is still in the plan. (The optimizer mask
   // an earlier pre-hook used to write per query is published once at load — see
   // publish_transparent_optimizer_mask above.)
   OptimizerExtension opt_ext;
@@ -3616,8 +3636,11 @@ static void LoadInternal(ExtensionLoader& loader)
   // Publish the optimizer mask last, only after every initialization step
   // above succeeded, so a failed load leaves no mask behind. SIRIUS_DISABLE
   // means no Sirius runtime initialization and no mask publication (the
-  // extension binary itself may still be loaded).
-  if (!sirius_disabled) { publish_transparent_optimizer_mask(config); }
+  // extension binary itself may still be loaded). The delim-join default follows the same rule.
+  if (!sirius_disabled) {
+    publish_transparent_optimizer_mask(config);
+    default_to_explicit_delim_joins(config);
+  }
 }
 
 }  // namespace duckdb

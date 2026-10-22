@@ -69,7 +69,11 @@ TEST_CASE("Local identity separates replacement with preserved mtime", "[object_
   REQUIRE(::unlink(name) == 0);
   object_identity held;
   REQUIRE(capture_local_identity(fd, held));
-  CHECK(held == replaced);
+  // Removing a directory entry can change ctime as the link count drops. The open descriptor
+  // still holds the same object, but its captured version need not match the pre-unlink one.
+  CHECK(held.device == replaced.device);
+  CHECK(held.inode == replaced.inode);
+  CHECK(held.size == replaced.size);
   // io_uring reopens the owned descriptor for O_DIRECT, so pathname removal
   // cannot switch the data descriptor to another object.
   auto proc_path = "/proc/self/fd/" + std::to_string(fd);

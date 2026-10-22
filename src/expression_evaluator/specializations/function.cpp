@@ -99,7 +99,9 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
   // TODO: Remove this special-case once Sirius pins cuDF >= 26.10 (cuDF PR
   // https://github.com/rapidsai/cudf/pull/21996 merged after the 26.08 cut,
   // so the fix will ship in 26.10).
-  auto const skip_ast      = alt.return_type().id() == sirius::type_id::DECIMAL;
+  auto const date_operation = alt.date_operation();
+  auto const skip_ast =
+    alt.return_type().id() == sirius::type_id::DECIMAL || date_operation.has_value();
   auto const ast_supported = !skip_ast && std::find(supported_ast_functions.begin(),
                                                     supported_ast_functions.end(),
                                                     resolved_id) != supported_ast_functions.end();
@@ -153,11 +155,27 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
   }
   auto const output_type = sirius::require_cudf_type(alt.return_type());
 
+  if (date_operation.has_value()) {
+    auto left               = evaluate(*args[0], evaluation_mode::MATERIALIZE);
+    auto right              = evaluate(*args[1], evaluation_mode::MATERIALIZE);
+    auto as_transform_input = [&](evaluate_result& value) -> cudf::transform_input {
+      if (!value.is_scalar()) { return value.get_column_view(); }
+      // Retain the one-row column in the evaluation result while its view is broadcast.
+      value = evaluate_result(cudf::make_column_from_scalar(value.get_scalar(), 1, _stream, _mr));
+      return cudf::scalar_column_view{value.get_column_view()};
+    };
+    auto const left_input  = as_transform_input(left);
+    auto const right_input = as_transform_input(right);
+    return evaluate_result(temporal::date_arithmetic_checked(
+      left_input, right_input, *date_operation, _input_table.num_rows(), _stream, _mr));
+  }
+
   //----------Numeric Binary Functions----------//
   auto execute_numeric_binary_func = [&](cudf::binary_operator op) -> evaluate_result {
-    auto left  = evaluate(*args[0], evaluation_mode::MATERIALIZE);
-    auto right = evaluate(*args[1], evaluation_mode::MATERIALIZE);
-    D_ASSERT(!left.is_scalar() || !right.is_scalar());  // Both sides cannot be scalars
+    auto left = evaluate(*args[0], evaluation_mode::MATERIALIZE);
+    // cuDF has no scalar-scalar binary operation; broadcast one side when both are constants.
+    auto right = left.is_scalar() ? evaluate_as_column(*args[1])
+                                  : evaluate(*args[1], evaluation_mode::MATERIALIZE);
     if (left.is_scalar()) {
       return evaluate_result(cudf::binary_operation(
         left.get_scalar(), right.get_column_view(), op, output_type, _stream, _mr));
@@ -204,7 +222,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
         length);
     }
 
-    auto input               = evaluate(*args[0], evaluation_mode::MATERIALIZE);
+    auto input               = evaluate_as_column(*args[0]);
     auto const input_strings = cudf::strings_column_view(input.get_column_view());
     auto result_column       = cudf::strings::slice_strings(
       input_strings, slice->start, slice->stop, std::optional<cudf::size_type>{1}, _stream, _mr);
@@ -216,7 +234,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
     D_ASSERT(args.size() == 2);
     D_ASSERT(args[1]->holds<sirius::ast::constant>());
 
-    auto input            = evaluate(*args[0], evaluation_mode::MATERIALIZE);
+    auto input            = evaluate_as_column(*args[0]);
     auto const& match_str = std::get<std::string>(args[1]->get<sirius::ast::constant>().payload);
     return {evaluate_result(std::move(input)), std::string_view(match_str)};
   };
@@ -226,7 +244,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
 
     // `%lit1%lit2%...%litN%` patterns take a SWAR digram fast path (NOT fused in);
     // everything else — and any ineligible column layout — takes cudf::strings::like.
-    if (_like_swar_fastpath && !input.is_scalar()) {
+    if (_like_swar_fastpath) {
       auto const& parsed = get_or_classify_like(match_str);
       if (*parsed) {
         if (auto result_column = like_multiliteral(
@@ -279,9 +297,14 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
   auto execute_datetime_extract_func =
     [&](cudf::datetime::datetime_component component) -> evaluate_result {
     D_ASSERT(args.size() == 1);
-    auto input = evaluate(*args[0], evaluation_mode::MATERIALIZE);
+    auto input = evaluate_as_column(*args[0]);
     auto result_column =
       cudf::datetime::extract_datetime_component(input.get_column_view(), component, _stream, _mr);
+    // cuDF returns INT16, while SQL extraction returns BIGINT. Restore the declared type before
+    // a parent AST operation or CASE consumes this result; final-output reconciliation is too late.
+    if (result_column->type() != output_type) {
+      result_column = cudf::cast(result_column->view(), output_type, _stream, _mr);
+    }
     return evaluate_result(std::move(result_column));
   };
   if (resolved_id == function_id::year) {
@@ -304,11 +327,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
   }
   if (resolved_id == function_id::millisecond || resolved_id == function_id::microsecond) {
     D_ASSERT(args.size() == 1);
-    auto input = evaluate(*args[0], evaluation_mode::MATERIALIZE);
-    if (input.is_scalar()) {
-      input = evaluate_result(
-        cudf::make_column_from_scalar(input.get_scalar(), _input_table.num_rows(), _stream, _mr));
-    }
+    auto input         = evaluate_as_column(*args[0]);
     auto const extract = [&](cudf::datetime::datetime_component component) {
       return cudf::datetime::extract_datetime_component(
         input.get_column_view(), component, _stream, _mr);
@@ -351,8 +370,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
         "[expression_evaluator:function] unrecognized/unsupported date_trunc frequency: {}",
         freq_str);
     }
-    auto input = evaluate(*args[1], evaluation_mode::MATERIALIZE);
-    D_ASSERT(!input.is_scalar());
+    auto input = evaluate_as_column(*args[1]);
 
     auto frequency = [](date_trunc_unit unit) -> cudf::datetime::rounding_frequency {
       switch (unit) {
@@ -414,11 +432,9 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
   }
 
   //----------Unary Functions----------//
-  // TODO: Handle scalar inputs to these column-only string functions when DuckDB
-  // cannot constant-fold them (e.g. when expression rewriting is disabled).
   if (resolved_id == function_id::upper || resolved_id == function_id::lower) {
     D_ASSERT(args.size() == 1);
-    auto input         = evaluate(*args[0], evaluation_mode::MATERIALIZE);
+    auto input         = evaluate_as_column(*args[0]);
     auto const strings = cudf::strings_column_view(input.get_column_view());
     // Use cuDF's Unicode mappings, including multi-character expansions. These can
     // differ from DuckDB's single-code-point mappings (e.g. upper('ß'), lower('İ')).
@@ -435,11 +451,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
       D_ASSERT(args[1]->holds<sirius::ast::constant>());
       precision = std::get<int32_t>(args[1]->get<sirius::ast::constant>().payload);
     }
-    auto input = evaluate(*args[0], evaluation_mode::MATERIALIZE);
-    if (input.is_scalar()) {
-      input = evaluate_result(
-        cudf::make_column_from_scalar(input.get_scalar(), _input_table.num_rows(), _stream, _mr));
-    }
+    auto input = evaluate_as_column(*args[0]);
     return evaluate_result(round_floating_point(input.get_column_view(), precision, _stream, _mr));
   }
   if (resolved_id == function_id::abs) {
@@ -475,14 +487,14 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
   }
   if (resolved_id == function_id::strlen) {
     D_ASSERT(args.size() == 1);
-    auto input = evaluate(*args[0], evaluation_mode::MATERIALIZE);
+    auto input = evaluate_as_column(*args[0]);
     auto result_column =
       cudf::strings::count_bytes(cudf::strings_column_view(input.get_column_view()), _stream, _mr);
     return evaluate_result(std::move(result_column));
   }
   if (resolved_id == function_id::length) {
     D_ASSERT(args.size() == 1);
-    auto input         = evaluate(*args[0], evaluation_mode::MATERIALIZE);
+    auto input         = evaluate_as_column(*args[0]);
     auto result_column = cudf::strings::count_characters(
       cudf::strings_column_view(input.get_column_view()), _stream, _mr);
     return evaluate_result(std::move(result_column));
@@ -493,8 +505,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
     D_ASSERT(args[1]->holds<sirius::ast::constant>());
     D_ASSERT(args[2]->holds<sirius::ast::constant>());
 
-    auto input = evaluate(*args[0], evaluation_mode::MATERIALIZE);
-    D_ASSERT(!input.is_scalar());
+    auto input = evaluate_as_column(*args[0]);
 
     auto const& pattern_str = std::get<std::string>(args[1]->get<sirius::ast::constant>().payload);
     auto const& replace_str = std::get<std::string>(args[2]->get<sirius::ast::constant>().payload);

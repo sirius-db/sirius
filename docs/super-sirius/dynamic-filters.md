@@ -43,7 +43,7 @@ flowchart LR
 
     subgraph RUN["Runtime"]
         B["complete build batch"] --> U["publication session"]
-        A["certified multi-partition build batches"] --> U
+        A["certified complete build batches"] --> U
         P --> U
         U --> C[("append-only channel")]
         C --> S["scan consumer"]
@@ -58,11 +58,15 @@ The main components are:
 - **Evidence and key admission.** `build_subtree_is_filtering` and `build_relation_is_opaque` decide whether discovery should run. `admit_dynamic_filter_keys` accepts supported equality keys and records the build/probe metadata needed at runtime.
 - **Target discovery.** `trace_probe_key` follows a key through physical operators only while its value and row semantics remain safe. A reachable GPU scan wins; otherwise `place_endpoint` may insert a membership-only `sirius_physical_dynamic_filter` at the deepest safe point. Unknown or unsafe transformations stop descent.
 - **Publication plan.** `dynamic_filter_publish_plan` binds admitted build keys to target channels and target output ordinals, carries filter policy, and identifies the admitted GPU/HOST replica spaces.
-- **Publication session.** `dynamic_filter_publication_session` owns the whole-build claim, source pin/readiness, one-shot construction, terminal outcome, and producer completion rights. The session claims and pins a whole-build delivery, invokes the join's existing repository deposit synchronously, then validates readiness and publishes inline. For an eligible multi-partition build it instead accumulates a Bloom filter from every build batch (see [Multi-partition build accumulation](#multi-partition-build-accumulation)).
+- **Publication session.** `dynamic_filter_publication_session` owns the whole-build claim, source pin/readiness, one-shot construction, terminal outcome, and producer completion rights. The session claims and pins a whole-build delivery, invokes the join's existing repository deposit synchronously, then validates readiness and publishes inline. An eligible PARTITION or BUILD_FILTER stage can instead accumulate a Bloom filter from every certified build batch (see [Multi-partition build accumulation](#multi-partition-build-accumulation)).
 - **Channel.** `sirius_dynamic_filter_set` is a thread-safe, append-only channel shared by identified producers and one logical consumer endpoint. It returns coherent owning snapshots and is not a readiness barrier.
 - **Consumer.** `dynamic_filter_consumer` owns the endpoint channel and its usefulness gate. The planner shares one consumer among `sirius_gpu_scan_operator`, its immediate `sirius_physical_dynamic_filter`, and both cached-decode attachment sites. A join-edge endpoint has its own consumer.
 
 The probe key's entry ordinal and a target's output ordinal are different coordinate spaces. The discovery walk performs that translation; channel push, storage, and lookup all use the target output ordinal.
+
+For build evidence, projections and a plain deduplication aggregate over a `CTE_REF` or `DELIM_GET` retain the underlying opaque-relation evidence. The aggregate must have no aggregate expressions or grouping functions and use ordinary grouping over all its keys. This permits filters built from the deduplicated output; it does not trace scan lineage through a CTE reference or push filters into a shared CTE producer.
+
+`RIGHT_SEMI` and `RIGHT_ANTI` may publish ordinary equality-key filters into their left/probe subtree. Both output only right/build rows, so removing probe rows that cannot match any build key preserves their results. Existing key and target-lineage restrictions still apply; this does not enable descent through right-only join outputs.
 
 ## Publication and consumption
 
@@ -94,9 +98,9 @@ Filter presence is separate from attempt completion. A successfully examined emp
 
 ### Multi-partition build accumulation
 
-`enable_dynamic_filter_multi_partition` enables Bloom accumulation for a non-broadcast HASH build with more than one partition. Whole-build publication keeps its existing selection and lifecycle. Accumulation admits INT32 and INT64 keys independently, using the existing domain-coverage and probe-compatibility gates. `max_dynamic_filter_bloom_bytes_per_gpu` limits the aligned arrays across all active keys on each replica GPU and must be greater than zero; cap refusal logs the row count, active-key count, required bytes (or arithmetic overflow), and cap. Only `enable_dynamic_filter_multi_partition` turns accumulation off.
+`enable_dynamic_filter_multi_partition` enables Bloom accumulation in a non-broadcast HASH build PARTITION with more than one downstream partition, and in the early BUILD_FILTER stage described below. Whole-build publication keeps its existing selection and lifecycle. Accumulation admits INT32 and INT64 keys independently, using the existing domain-coverage and probe-compatibility gates. `max_dynamic_filter_bloom_bytes_per_gpu` limits the aligned arrays across all active keys on each replica GPU and must be greater than zero; cap refusal logs the row count, active-key count, required bytes (or arithmetic overflow), and cap.
 
-**Complete input and stable identity.** `build_arrival_ledger` records original IDs, exact row counts, and consistent top-level types before each batch is deposited into the build PARTITION's `default` port. Certification requires one single-partition input behind a FULL barrier, a finished source pipeline, and an exact match with repository batch count. Unreadable or non-GPU arrivals decline certification. A missing or retyped column makes that ordinal permanently unavailable while independently valid sibling keys remain eligible. Payload columns and nested child layouts do not constrain key admission. A late arrival with rows violates the FULL-barrier contract and throws; a readable empty batch adds no keys and is ignored. `ORDER BY` inputs use a PIPELINE barrier and decline accumulation.
+**Complete input and stable identity.** `build_arrival_ledger` records original IDs, exact row counts, and consistent top-level types before each batch is deposited into the PARTITION or BUILD_FILTER stage's `default` port. Certification requires one single-partition input behind a FULL barrier, a finished source pipeline, and an exact match with repository batch count. The resulting `complete_build_inventory` is independent of the downstream partition count; the ordinary PARTITION path still requires more than one downstream partition. Unreadable or non-GPU arrivals decline certification. A missing or retyped column makes that ordinal permanently unavailable while independently valid sibling keys remain eligible. Payload columns and nested child layouts do not constrain key admission. A late arrival with rows violates the FULL-barrier contract and throws; a readable empty batch adds no keys and is ignored. Direct `ORDER BY` inputs to PARTITION use a PIPELINE barrier and decline accumulation.
 
 **Contribution and retry.** `pipelineable_operator_data::original_batch_ids()` preserves logical IDs across preparation, GPU clones, and retries; preparation records an original ID only when it replaces a batch with a cross-GPU clone. Before mandatory scatter, the PARTITION synchronously calls `contribute`: an already claimed original ID is deduplicated before inspecting its current representation; a new contribution checks its recorded row count, active key ordinals/types, and admitted GPU. It inserts on the task stream and orders the partial stream after those inserts without a host wait. An input with multiple originals or late-materialization directives declines the optional attempt. The final committed contribution records its original ID as the one pending publication. A mandatory scatter or output-construction OOM may reschedule the task without losing that identity or reinserting its keys.
 
@@ -109,6 +113,16 @@ The builder merges chunks through peer DMA, ORs them into the root array, and co
 **Storage and downgrade.** Input batches remain ordinary spillable data. A batch can be downgraded after certification and re-upgraded before contribution; exact identity, rows, and active key types remain authoritative even when string payload offsets or child layouts are canonicalized. Bloom arrays are raw device storage and are not themselves spillable. The builder retains every completed filter, including keys no channel accepted. It allocates all host wrappers and shared ownership control blocks before transferring any leased array, then performs only nonthrowing ownership moves. Closing input, cancellation, and settling channel rights never release persistent storage. After build tasks and retries drain, the eligible build PARTITION finalizer closes accumulated input and then calls `release_retired_storage`, so incomplete or abandoned attempts also release before downstream completion. Release checks every admitted allocator, even after arrays have moved into filter wrappers, and defers if accounting is still tracked or an operation remains active. Hash-join finalization repeats closure and release (`finalize_input`) as an idempotent fallback; session destruction follows task drain. Published channels may extend filter lifetime.
 
 This placement holds the final task's reservation, input pins, scatter outputs, and stream through publication. The publication host wait also covers scatter queued earlier on that stream. The design accepts the longer final-task lifetime and recorded scratch peak to order visibility before its deposit. Under memory pressure, publication waits for the elected task's successful retry. Deferred work remains named: the cross-device downgrade bug, making raw partial arrays spillable, and the q13 reservation issue.
+
+### Early publication for right semi/anti joins
+
+`RIGHT_SEMI` and `RIGHT_ANTI` size their partitions from the complete probe input. Publishing only while partitioning the build would therefore be too late for that probe. For eligible filters, the planner inserts `sirius_physical_build_filter` between the build subtree and its PARTITION. It requires dynamic filters, `enable_dynamic_filter_multi_partition`, a positive Bloom cap, and admitted INT32 or INT64 keys.
+
+The stage certifies its complete FULL input before popping any batch. Scheduled GPU tasks contribute the original batch IDs to the join's publication session and forward the same batches unchanged. The final contribution publishes before the stage completes. The non-driving build PARTITION follows this stage's readiness before asking the probe to determine partition sizing; the existing rules for partition count, placement, broadcast eligibility, and execution mode still apply.
+
+Unsupported inputs or failed optional publication remain pass-through, and the exact join still runs. The stage introduces no dependency through filter targets and no global scan barrier: already-runnable or lookahead consumers may still observe an earlier snapshot. Retry, cancellation, replica readiness, and publication rights use the same accumulation lifecycle as PARTITION.
+
+### Consumer paths
 
 DuckDB static filters remain on their existing, authoritative path. Dynamic filters add redundant conjuncts through these consumer paths:
 
@@ -208,7 +222,9 @@ Adding a key family means one new value of `membership_key_family`, one arm in `
 
 ### Nulls
 
-Nullable keys are handled exactly on both sides, not approximately. Admission never routes a null-safe (`IS NOT DISTINCT FROM`) comparison to a dynamic filter (`src/planner/dynamic_filter/dynamic_filter_key_admission.cpp`), and the authoritative hash join runs its admitted keys with `null_equality::UNEQUAL` (`src/op/sirius_physical_hash_join.hpp`), so a NULL build key never matches any probe and a NULL probe key never matches any build key.
+Nullable keys are handled exactly on both sides, not approximately. Admission rejects comparisons that remain null-safe (`IS NOT DISTINCT FROM`); admitted ordinary equality keys cannot match a NULL build or probe key.
+
+Before admission, `normalize_non_null_join_keys` can replace null-safe equality with ordinary equality when an explicit native-table `NOT NULL` constraint proves at least one operand non-null. The proof follows direct references through projections, filters, ordering, limits, and DISTINCT, and stops at joins, grouping, CTE references, casts, and computed expressions. Every null-safe equality key in the join must be proven before any is changed, preserving the hash join's uniform null policy. The proof uses catalog constraints rather than data statistics. MARK joins are excluded because their observable FALSE/UNKNOWN results require separate semantics.
 
 - **Build side.** All three representations accept a nullable build column and `cudf::drop_nulls` it before building; `supports()` no longer requires `null_count() == 0`, so a fact-table foreign key with nulls (a TPC-DS `EXISTS`/`IN` semi-join whose build side is a fact table) gets an exact IN-list where it previously fell through to Bloom. The raw IN-list's 1–12 gate and the hash IN-list's size estimate count the valid rows; the publisher passes the valid row count to the selection policy.
 - **Probe side.** `compute_mask` reads the probe's validity bitmask in-kernel (`probe_validity` in `dynamic_filter_probe.cuh`) and writes `false` for a null row, so the returned BOOL8 mask is **never nullable**. Previously the probe's null mask was copied onto the output; `apply_boolean_mask` dropped those rows either way, so the post-decode consumer's behavior is unchanged, but the filtered (fused) decode requires a non-nullable mask (`simpatico_codegen.cpp` treats a null-masked probe result as a broken probe contract), and a nullable probe column no longer aborts it.
@@ -234,7 +250,7 @@ The safety model has four invariants:
 
 Under demand-driven scheduling, build-side `CONCAT` synchronously completes whole-build publication before an immediate `BUILD_PROBE` consumer is activated. The immediate probe therefore normally sees the completed fan-out. An accumulated filter resolves publication inside the elected build PARTITION task before its deposit. This orders work that requires that deposit or build completion; already-runnable CONCAT or probe work can observe earlier snapshots.
 
-This ordering is specific to `BUILD_PROBE`. Eligible single-partition `STANDARD` or `MIXED_JOIN` builds can also publish, but their probe work is not held behind the same build-before-probe edge.
+This whole-build ordering is specific to `BUILD_PROBE`. Eligible single-partition `STANDARD` or `MIXED_JOIN` builds can also publish, but their probe work is not held behind the same edge. The explicit BUILD_FILTER stage provides the separate ordering described above for eligible `RIGHT_SEMI` and `RIGHT_ANTI` joins.
 
 ### Transitive scan targets and publication timing
 
@@ -244,6 +260,7 @@ A scan reached through an intervening join, a non-`BUILD_PROBE` consumer, or wor
 |---|---|
 | Immediate demand-driven `BUILD_PROBE` probe, whole-build publication | Publication normally completes before probe activation |
 | Accumulated build work requiring the elected PARTITION deposit or build completion | Publication resolves before that readiness condition; earlier runnable work may see earlier snapshots |
+| Right semi/anti probe reached through partition-sizing demand | BUILD_FILTER completes before the build partition follows probe-sizing readiness |
 | Transitive, cross-scheduled, or lookahead target | Opportunistic owning snapshots at each consumer checkpoint |
 
 Already-processed batches are not revisited. The channel never creates a scheduling dependency, and late filters improve only later work.
@@ -257,7 +274,7 @@ The settings live under `sirius.operator_params`:
 | Setting | Default | Meaning |
 |---|---:|---|
 | `enable_dynamic_filter` | `true` | Enable key discovery, membership publication, scan targets, and join-edge endpoints |
-| `enable_dynamic_filter_multi_partition` | `true` | Accumulate a Bloom filter for a non-broadcast HASH build with more than one partition |
+| `enable_dynamic_filter_multi_partition` | `true` | Enable PARTITION accumulation and early BUILD_FILTER publication for right semi/anti joins |
 | `max_dynamic_filter_bloom_bytes_per_gpu` | 256 MiB | Per-GPU cap on one join's accumulated arrays (active keys times the array size rounded up to 256 bytes); must be greater than zero |
 | `enable_dynamic_zone_map_filter` | `false` | Also emit a global min/max filter; requires dynamic filters |
 | `dynamic_filter_domain_coverage_threshold` | `0.9` | Skip a proven-unique key at or above this known-domain coverage; values above `1.0` disable the gate |
@@ -275,9 +292,9 @@ The settings live under `sirius.operator_params`:
 - The fused (filtered) decode cannot yet carry a nullable *key chunk* to a membership probe: the compression planner fails closed on nullable input to the integer codecs and the filtered-decode assembly refuses null-masked columns, so nullable probe columns reach the membership filters only through the post-decode cascade today. The probe side is null-ready for when that lifts.
 - The join-edge (direct) route additionally requires identical build and probe storage types (including decimal scale).
 - The publisher emits one global zone map per key; multi-zone publication is not implemented.
-- A multi-partition build publishes only a Bloom filter (no IN-list or zone map), only from a closed FULL input, and only when every pair of replica GPUs has working peer DMA. A single-partition multi-batch build still needs one folded delivery.
+- Accumulation publishes only a Bloom filter (no IN-list or zone map), only from a closed FULL input, and only when every pair of replica GPUs has working peer DMA. A single-partition multi-batch build needs one folded delivery unless it has an eligible BUILD_FILTER stage.
 - Accumulation accepts only `INT32` and `INT64` keys; other admitted key types are counted in `keys_skipped_bloom_unsupported` and publish only from a whole build. An accumulated filter is probed through the same per-carrier adapter as every other membership filter, so it serves every probe carrier its key family accepts. Accumulation applies the fan-out's probe-type rule too: a key none of whose bindings it could serve is skipped before any array is allocated, and each binding the accumulated fan-out cannot serve gets no filter; both are counted as `bindings_skipped_incompatible_probe`.
-- Accumulated publication keeps the elected build PARTITION task's worker slot and reservation through reduction and its host wait, then permits that task's deposit. It delays work requiring that deposit or build completion; it adds no barrier to already-runnable CONCAT, probe, or scan work.
+- Accumulated publication keeps the elected PARTITION or BUILD_FILTER task's worker slot and reservation through reduction and its host wait, then permits that task's deposit. It delays work requiring that deposit or build completion; it adds no barrier to already-runnable CONCAT, probe, or scan work.
 - The peer-DMA gate proves that peer copies work, not that they bypass the host: without peer access on the Bloom arrays' memory pool, the accumulated-Bloom copies are staged through host memory. On PCIe topologies that traffic delays the elected task's deposit and any CONCAT shuffle that depends on it.
 - Accumulation does not yet judge selectivity: a Bloom filter that keeps most probe rows is still built and applied. Such a filter can cost more than it saves.
 - Identified producer completion is implemented, but other producer kinds, incremental refinement, and completion-driven early scheduling are not.
@@ -285,9 +302,11 @@ The settings live under `sirius.operator_params`:
 ## Implementation map
 
 - Planning and routing: `src/planner/sirius_plan_comparison_join.cpp` and `src/planner/dynamic_filter/`
+- Catalog non-null proof: `src/planner/join_key_nullability.cpp`
 - Publication metadata and policy: `src/op/dynamic_filter/dynamic_filter_publish_plan.hpp` and `src/op/dynamic_filter/dynamic_filter_source_policy.hpp`
 - Runtime publication: `src/op/dynamic_filter/dynamic_filter_publisher.cpp` and `src/op/sirius_physical_hash_join.cpp`
 - Multi-partition accumulation: the ledger and inventory in `src/op/dynamic_filter/complete_build_inventory.hpp`, the partial builder in `src/op/dynamic_filter/detail/accumulated_bloom_builder.hpp` (implemented in `src/cuda/sirius_dynamic_bloom_filter.cu`), and the PARTITION hooks in `src/op/sirius_physical_partition.cpp`
+- Early build publication: `src/op/dynamic_filter/sirius_physical_build_filter.cpp`
 - Filter capabilities and channel: `src/op/dynamic_filter/sirius_dynamic_filter.hpp`
 - Consumer application: `src/op/scan/dynamic_filter_merge.cpp`, `src/op/scan/sirius_physical_dynamic_filter.cpp`, and `src/op/scan/parquet_gpu_ingestible.cpp`
 - GPU membership implementations: `src/cuda/sirius_dynamic_small_in_list_filter.cu`, `src/cuda/sirius_dynamic_in_list_filter.cu`, and `src/cuda/sirius_dynamic_bloom_filter.cu`

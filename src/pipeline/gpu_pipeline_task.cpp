@@ -94,7 +94,8 @@ void validate_operator_output_types(const op::operator_data* data,
                                         ? sirius::require_cudf_type(expected_types[c])
                                         : physical_types[static_cast<std::size_t>(c)];
       cudf::data_type actual        = tbl.column(c).type();
-      if (actual != expected_cudf) {
+      if (actual != expected_cudf &&
+          !op.is_alternate_physical_type(static_cast<std::size_t>(c), actual)) {
         SIRIUS_LOG_WARN(
           "gpu_pipeline_task: operator '{}' (id={}) output batch {} column {} datatype "
           "mismatch: got {}, expected {}",
@@ -354,13 +355,16 @@ std::size_t gpu_pipeline_task_local_state::get_estimated_bytes_to_materialize_in
 
   if (auto* scan_input = dynamic_cast<const op::scan::scan_operator_input*>(_input_data.get());
       scan_input && scan_input->is_resident()) {
-    // Cached scan inputs can still reside in HOST and require an upload before execution.
+    // Cached scans need space for host uploads and copies from an excluded GPU.
     auto batch = scan_input->get_cached_batch();
     if (!batch) { return 0; }
 
     auto ro          = batch->to_read_only();
     auto const* data = ro.get_data();
-    if (!data || ro.get_current_tier() == cucascade::memory::Tier::GPU) { return 0; }
+    if (!data) return 0;
+    const bool cross_space = target_space && ro.get_memory_space() &&
+                             ro.get_memory_space()->get_id() != target_space->get_id();
+    if (ro.get_current_tier() == cucascade::memory::Tier::GPU && !cross_space) return 0;
     return peak_materialization_bytes(data);
   }
 

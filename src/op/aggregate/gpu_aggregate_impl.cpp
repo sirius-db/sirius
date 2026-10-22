@@ -145,7 +145,8 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
   const std::vector<std::vector<int>>& aggregate_struct_col_indices,
   ::cuda::stream_ref stream,
   cucascade::memory::memory_space& memory_space,
-  const std::vector<std::optional<std::uint64_t>>& aggregate_input_max_abs = {})
+  const std::vector<std::optional<std::uint64_t>>& aggregate_input_max_abs = {},
+  const std::vector<bool>& aggregate_is_wide_integer_sum                   = {})
 {
   // Sanity check
   if (aggregates.size() != aggregate_idx.size()) {
@@ -299,25 +300,55 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
   // For multi-column COLLECT_SET, a synthetic negative key -(i+1) is used so that each such
   // aggregate gets its own request with a freshly synthesized struct column.
   // A SUM over a DECIMAL32 or DECIMAL64 column that could overflow the input width in this batch
-  // (see decimal_sums_to_widen) is computed over the column widened to the next decimal type. It
-  // uses the key column index + widened_sum_key_offset, which keeps it in a request of its own.
-  // Every other decimal SUM runs at the input width and its result is widened below.
+  // (see sums_to_widen) is computed over the column widened to the next decimal type. It uses the
+  // key column index + widened_sum_key_offset, which keeps it in a request of its own. Every other
+  // decimal SUM runs at the input width and its result is widened below. A wide integer SUM over
+  // INT64 is gated the same way and widened to DECIMAL128; one proven safe stays INT64 end to
+  // end, so its per-group result is not widened and the merge decides for itself (see
+  // gpu_merge_impl::merge_grouped_aggregate). A wide SUM over INT32 cannot overflow INT64 within
+  // one batch (fewer than 2^31 rows of magnitude at most 2^31) and is never a candidate.
   auto const widened_sum_key_offset = input_table.num_columns();
   std::unordered_set<int> widened_sum_cols;
   {
-    std::vector<decimal_sum_candidate> candidates;
+    std::vector<sum_candidate> candidates;
     for (size_t i = 0; i < aggregates.size(); ++i) {
       bool const is_struct = has_struct_col_indices && !aggregate_struct_col_indices[i].empty();
       // Only SUM is gated: MIN, MAX and COUNT cannot overflow, and PRODUCT / SUM_OF_SQUARES are
       // not reachable (get_local_aggregation rejects them).
       if (is_struct || aggregates[i] != cudf::aggregation::Kind::SUM) { continue; }
-      auto const col_id = aggregate_idx[i];
-      if (!widened_decimal_sum_type(input_table.column(col_id).type())) { continue; }
+      auto const col_id   = aggregate_idx[i];
+      auto const col_type = input_table.column(col_id).type();
+      bool const is_wide_integer_sum =
+        i < aggregate_is_wide_integer_sum.size() && aggregate_is_wide_integer_sum[i];
+      if (!widened_decimal_sum_type(col_type) &&
+          !(is_wide_integer_sum && col_type.id() == cudf::type_id::INT64)) {
+        continue;
+      }
       candidates.push_back(
         {col_id, i < aggregate_input_max_abs.size() ? aggregate_input_max_abs[i] : std::nullopt});
     }
     if (!candidates.empty()) {
-      widened_sum_cols = decimal_sums_to_widen(input_table, candidates, stream, mr);
+      widened_sum_cols = sums_to_widen(input_table, candidates, stream, mr);
+    }
+  }
+  // A SUM over a DECIMAL128 column whose values in this batch provably keep every partial sum
+  // within 64 bits (see decimal_sums_to_narrow) is computed over the column narrowed to DECIMAL64,
+  // which cuDF aggregates much faster, and its result is widened back below. It uses the key column
+  // index + narrowed_sum_key_offset, which keeps it in a request of its own.
+  auto const narrowed_sum_key_offset = 2 * input_table.num_columns();
+  std::unordered_set<int> narrowed_sum_cols;
+  {
+    std::vector<sum_candidate> candidates;
+    for (size_t i = 0; i < aggregates.size(); ++i) {
+      bool const is_struct = has_struct_col_indices && !aggregate_struct_col_indices[i].empty();
+      if (is_struct || aggregates[i] != cudf::aggregation::Kind::SUM) { continue; }
+      auto const col_id = aggregate_idx[i];
+      if (!narrowed_decimal_sum_type(input_table.column(col_id).type())) { continue; }
+      candidates.push_back(
+        {col_id, i < aggregate_input_max_abs.size() ? aggregate_input_max_abs[i] : std::nullopt});
+    }
+    if (!candidates.empty()) {
+      narrowed_sum_cols = decimal_sums_to_narrow(input_table, candidates, stream, mr);
     }
   }
   // TODO: Deduplicate aggregation requests for compound aggregations.
@@ -335,6 +366,9 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
       if (aggregate_kind == cudf::aggregation::Kind::SUM &&
           widened_sum_cols.contains(aggregate_col_id)) {
         aggregate_col_id += widened_sum_key_offset;
+      } else if (aggregate_kind == cudf::aggregation::Kind::SUM &&
+                 narrowed_sum_cols.contains(aggregate_col_id)) {
+        aggregate_col_id += narrowed_sum_key_offset;
       }
     }
     if (!input_col_to_agg.contains(aggregate_col_id)) {
@@ -385,10 +419,16 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
                                   memory_space.get_default_allocator());
       request.values = struct_col->view();
       temp_struct_cols.push_back(std::move(struct_col));
+    } else if (aggregate_col_id >= narrowed_sum_key_offset) {
+      auto const& col = input_table.column(aggregate_col_id - narrowed_sum_key_offset);
+      auto narrow_col = cudf::cast(
+        col, *narrowed_decimal_sum_type(col.type()), stream, memory_space.get_default_allocator());
+      request.values = narrow_col->view();
+      temp_struct_cols.push_back(std::move(narrow_col));
     } else if (aggregate_col_id >= widened_sum_key_offset) {
       auto const& col  = input_table.column(aggregate_col_id - widened_sum_key_offset);
       auto widened_col = cudf::cast(
-        col, *widened_decimal_sum_type(col.type()), stream, memory_space.get_default_allocator());
+        col, *widened_sum_type(col.type()), stream, memory_space.get_default_allocator());
       request.values = widened_col->view();
       temp_struct_cols.push_back(std::move(widened_col));
     } else {
@@ -486,6 +526,14 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
           aggregation_result.results[k] =
             cudf::cast(aggregation_result.results[k]->view(), *widened_type, stream, mr);
         }
+      }
+      // A narrowed SUM returns to the DECIMAL128 type of its input column.
+      if (requests[i].aggregations[k]->kind == cudf::aggregation::Kind::SUM &&
+          aggregate_col_id >= narrowed_sum_key_offset) {
+        auto const original_type =
+          input_table.column(aggregate_col_id - narrowed_sum_key_offset).type();
+        aggregation_result.results[k] =
+          cudf::cast(aggregation_result.results[k]->view(), original_type, stream, mr);
       }
       size_t output_col_id       = group_idx.size() + output_idx[j];
       output_cols[output_col_id] = std::move(aggregation_result.results[k]);
@@ -689,7 +737,8 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
   ::cuda::stream_ref stream,
   cucascade::memory::memory_space& memory_space,
   const telemetry::batch_telemetry_info& telemetry_info,
-  const std::vector<std::optional<std::uint64_t>>& aggregate_input_max_abs)
+  const std::vector<std::optional<std::uint64_t>>& aggregate_input_max_abs,
+  const std::vector<bool>& aggregate_is_wide_integer_sum)
 {
   auto output_table = grouped_aggregate_table(get_cudf_table_view(input),
                                               group_idx,
@@ -698,7 +747,8 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
                                               aggregate_struct_col_indices,
                                               stream,
                                               memory_space,
-                                              aggregate_input_max_abs);
+                                              aggregate_input_max_abs,
+                                              aggregate_is_wide_integer_sum);
   return make_data_batch(std::move(output_table), memory_space, stream, telemetry_info);
 }
 
@@ -713,7 +763,8 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouping_sets_a
   ::cuda::stream_ref stream,
   cucascade::memory::memory_space& memory_space,
   const telemetry::batch_telemetry_info& telemetry_info,
-  const std::vector<std::optional<std::uint64_t>>& aggregate_input_max_abs)
+  const std::vector<std::optional<std::uint64_t>>& aggregate_input_max_abs,
+  const std::vector<bool>& aggregate_is_wide_integer_sum)
 {
   auto partial      = grouped_aggregate_table(get_cudf_table_view(input),
                                          group_idx,
@@ -722,7 +773,8 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouping_sets_a
                                          aggregate_struct_col_indices,
                                          stream,
                                          memory_space,
-                                         aggregate_input_max_abs);
+                                         aggregate_input_max_abs,
+                                         aggregate_is_wide_integer_sum);
   auto output_table = expand_grouping_sets(partial->view(),
                                            group_idx.size(),
                                            aggregates,

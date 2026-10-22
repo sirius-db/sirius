@@ -731,8 +731,8 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
   expr_ref comparison_expr = _ast_tree.emplace<cudf::ast::operation>(
     cudf::ast::ast_operator::EQUAL, *test_expr, *comparator_expr);
 
-  // Loop over values, building an OR tree of comparisons.
-  // Re-translate the probe expression each time to avoid shared AST subgraphs.
+  // Loop over values, building a Kleene OR tree of comparisons so a match is TRUE even when
+  // another comparison is NULL. Re-translate the probe each time to avoid shared AST subgraphs.
   for (size_t i = 1; i < alt.values.size(); ++i) {
     auto probe_expr = add_expression(*alt.probe, table_src);
     if (!probe_expr) { return std::nullopt; }
@@ -742,7 +742,7 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
     expr_ref next_comparison_expr = _ast_tree.emplace<cudf::ast::operation>(
       cudf::ast::ast_operator::EQUAL, *probe_expr, *value_expr);
     comparison_expr = _ast_tree.emplace<cudf::ast::operation>(
-      cudf::ast::ast_operator::LOGICAL_OR, comparison_expr, next_comparison_expr);
+      cudf::ast::ast_operator::NULL_LOGICAL_OR, comparison_expr, next_comparison_expr);
   }
 
   if (!alt.negated) { return comparison_expr; }
@@ -753,6 +753,9 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
 std::optional<expr_ref> gpu_expression_translator::add_expression(
   sirius::ast::function_call const& alt, cudf::ast::table_reference const table_src)
 {
+  // Standalone ASTs cannot implement DATE infinity and overflow checks.
+  if (alt.date_operation().has_value()) { return std::nullopt; }
+
   // cuDF AST only supports numeric binary functions. We must also disable any
   // operation that propagates decimal types up the expression tree, pending the
   // cuDF fix: https://github.com/rapidsai/cudf/pull/21996. Unsupported functions

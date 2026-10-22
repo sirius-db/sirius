@@ -19,7 +19,6 @@
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb_table_identity.hpp"
 #include "event/query_event_publisher.hpp"
-#include "exec/query_lifecycle_registry.hpp"
 #include "exec/scoped_dispatcher.hpp"
 #include "exec/thread_pool.hpp"
 #include "io/datasource_factory.hpp"
@@ -963,6 +962,7 @@ class sirius_scan_manager {
     //! Per-query snapshot of the serve-side pruning flag; the manager's _config is a
     //! construction-time copy, so SET changes arrive per query via prepare_for_query.
     bool pruning_enabled{true};
+    std::vector<int> active_gpu_ids;
 
     //! One mask computation per distinct pinned entry matched by THIS query (recorded by
     //! try_match_cached_entry, deduped by entry name); run block-in-prepare, then copied
@@ -1069,6 +1069,8 @@ class sirius_scan_manager {
   std::shared_ptr<const sirius::memory::topology_index> _topology_index;
   std::shared_ptr<op::scan::physical_check_counters> _physical_counters;
   exec::static_thread_pool _thread_pool;
+  std::shared_ptr<shared_scan_budget> _shared_readahead_budget =
+    std::make_shared<shared_scan_budget>();
   std::shared_ptr<sirius::io::ioctx> _io_ctx;
   /// Lazily-built per-backend ioctxs for path-routed datasources (e.g. an s3://
   /// REST or kvikIO context alongside the local `_io_ctx`). Contexts are keyed

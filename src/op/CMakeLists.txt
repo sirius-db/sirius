@@ -7,6 +7,9 @@ target_sources(
           merge/gpu_merge_impl.cpp
           order/gpu_order_impl.cpp
           partition/gpu_partition_impl.cpp
+          partition/partition_exchange.cpp
+          partition/consumer_partition_policy.cpp
+          dynamic_filter/hash_join_partition_observer.cpp
           result/host_table_chunk_reader.cpp
           scan/cached_ranges.cpp
           scan/duckdb_insert_delta.cpp
@@ -44,6 +47,7 @@ target_sources(
           dynamic_filter/complete_build_inventory.cpp
           dynamic_filter/dynamic_filter_replica_space.cpp
           dynamic_filter/dynamic_filter_publisher.cpp
+          dynamic_filter/sirius_physical_build_filter.cpp
           dynamic_filter/sirius_dynamic_filter.cpp
           sirius_physical_column_data_scan.cpp
           sirius_physical_streaming_sink.cpp
@@ -76,5 +80,6 @@ target_sources(
           sirius_physical_top_n.cpp
           sirius_physical_ungrouped_aggregate.cpp
           sirius_physical_union.cpp
+          aggregate/wide_integer_sum.cu
           partition/crc32_partition_hash.cu
           scan/equality_delete_mask.cu)

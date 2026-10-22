@@ -264,6 +264,16 @@ A lock-protected queue of pre-built splits. The producer (sequencer) enqueues vi
 
 `scan_manager_config` (`config.hpp`) tunes the thread pool, the IO backend selector (`backend`), uring/REST reactor counts, the prefetching cache, and object-store credentials.
 
+### Shared scan I/O capacity
+
+`shared_scan_budget` accounts for active reads across query readahead managers. A split that uses several backends reserves them atomically. Demand reads never wait for speculative capacity: they accrue debt that prevents further speculation on those backends until the reads finish. Nonempty speculative requests retain global oldest-query priority; backend-scoped priority is deferred to the performance work following the concurrency benchmark baseline.
+
+The readahead manager coordinates the local gatekeeper credit and shared backend ticket through one per-split ownership record. It publishes speculative ownership before preparing or issuing I/O. A demand read joining that attempt reuses its credits; if demand wins first, speculation is abandoned. Successful prefetch of the entire split releases both credits at completion and remembers coverage until disposal. I/O success and coverage are reported separately: each requested chunk must either be filled by that prefetch or already resident with a sufficient extent. A chunk skipped because another read owns it leaves coverage incomplete even if every submitted prefetch read succeeds. Failed, abandoned, or partial prefetch transfers the existing credits to an overlapping demand read, which returns them at disposal. Without an overlapping reader, those credits return immediately. Disposal does not release an in-flight prefetch's credits early: its callback retains the shared ticket even if the manager is destroyed.
+
+Each backend's limit stays fixed while it has active tickets or waiting requests. Conflicting limits are rejected, and entries are removed after their last user leaves. Waiting is cancellation-aware; ticket destruction releases capacity even after the budget facade has been destroyed. Empty requests consume no capacity and do not queue.
+
+Readahead preparation makes an initial attempt, retries with synchronous eviction, and permits one further eviction-assisted attempt after a 10 ms backoff. Speculation holds no credits during backoff; if demand has joined, the credits transfer to that reader instead. A retry checks cancellation and whether demand has overtaken the split before preparing it. Persistent pressure records one `skipped_memory_pressure` outcome for the candidate; `memory_retries` counts preparations actually retried. Demand I/O remains available when speculation is abandoned.
+
 ## Pinned Tables
 
 **Files:** `src/pin_table.hpp`, `src/pin_table.cpp`; pinned-entry storage + cache matching in `src/scan_manager/sirius_scan_manager.hpp` and `src/scan_manager/sirius_scan_manager.cpp`; zone-map capture and pruning in `src/scan_manager/pinned_chunk_stats.hpp` and `src/scan_manager/pinned_chunk_stats.cpp`; MVCC reconciliation in `src/op/scan/duckdb_mvcc_visibility.cpp`, `src/scan_manager/mvcc_mask_job.cpp`, `src/op/scan/duckdb_insert_delta.cpp`, and `src/scan_manager/insert_delta_job.cpp` (with their headers).

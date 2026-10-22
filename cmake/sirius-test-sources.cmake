@@ -12,6 +12,7 @@ set(TEST_SOURCES
     test/cpp/scan_manager/test_preparation_config.cpp
     test/cpp/scan/test_native_physical_matrix.cpp
     test/cpp/scan/test_parquet_physical_profile.cpp
+    test/cpp/memory/test_numa_small_pinned_mr.cpp
     test/cpp/scan/test_native_checkpoint_lease.cpp
     test/cpp/transparent/test_read_view_comparison.cpp
     test/cpp/transparent/test_read_view_scaling.cpp
@@ -19,6 +20,7 @@ set(TEST_SOURCES
     test/cpp/scan/test_split_certificates.cpp
     test/cpp/transparent/test_late_failure.cpp
     test/cpp/transparent/test_plan_source_policy.cpp
+    test/cpp/transparent/test_pre_optimizer_hook.cpp
     test/cpp/scan/test_scan_contracts.cpp
     test/cpp/scan/test_scan_verdicts.cpp
     test/cpp/scan/test_certification_cost.cpp
@@ -93,13 +95,16 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_dynamic_filter_native.cpp
     test/cpp/integration/test_gpu_execution_dynamic_filter_sip.cpp
     test/cpp/integration/test_gpu_execution_dynamic_filter_multi_partition.cpp
+    test/cpp/integration/test_gpu_execution_date_arithmetic.cpp
     test/cpp/integration/test_gpu_execution_expression_fallback.cpp
     test/cpp/integration/test_gpu_execution_filter_nulls.cpp
     test/cpp/integration/test_gpu_execution_grouping_sets.cpp
+    test/cpp/integration/test_gpu_execution_integer_sum_overflow.cpp
     test/cpp/integration/test_gpu_execution_join_nulls.cpp
     test/cpp/integration/test_gpu_execution_unsigned_narrowing.cpp
     test/cpp/integration/test_gpu_execution_locality.cpp
     test/cpp/integration/test_gpu_execution_multi_format.cpp
+    test/cpp/integration/test_gpu_execution_nested_loop_join_batches.cpp
     test/cpp/integration/test_gpu_execution_null_safe_join.cpp
     test/cpp/integration/test_gpu_execution_order_nulls.cpp
     test/cpp/integration/test_gpu_execution_regexp_replace.cpp
@@ -120,6 +125,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_tpch_mgpu_audit.cpp
     test/cpp/integration/test_gpu_execution_unique_join.cpp
     test/cpp/integration/test_gpu_execution_union_all.cpp
+    test/cpp/integration/test_gpu_execution_unfolded_constants.cpp
     test/cpp/integration/test_gpu_execution_vector_search.cpp
     test/cpp/integration/test_pin_registry_epoch.cpp
     test/cpp/integration/test_pin_table_host_streaming.cpp
@@ -171,6 +177,7 @@ set(TEST_SOURCES
     test/cpp/scan_manager/test_s3_config_scopes.cpp
     test/cpp/scan_manager/test_prefetching_scheduler.cpp
     test/cpp/scan_manager/test_readahead_lifecycle.cpp
+    test/cpp/scan_manager/test_shared_scan_budget.cpp
     test/cpp/scan_manager/test_scan_manager_query_state.cpp
     test/cpp/scan_manager/test_reset_caches.cpp
     test/cpp/scan_manager/test_pin_table_multi_gpu.cpp
@@ -194,6 +201,7 @@ set(TEST_SOURCES
     test/cpp/memory/test_topology_index.cpp
     test/cpp/operator/test_build_probe_scheduling.cpp
     test/cpp/operator/test_partition_placement.cpp
+    test/cpp/operator/test_partition_exchange.cpp
     test/cpp/operator/test_cross_schedule.cpp
     test/cpp/operator/test_cross_join_slicing.cpp
     test/cpp/operator/aggregate/test_decimal_sum_widening.cpp
@@ -228,6 +236,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_dynamic_filter_publication_claim.cpp
     test/cpp/operator/test_dynamic_filter_publisher.cpp
     test/cpp/operator/test_complete_build_inventory.cpp
+    test/cpp/operator/test_physical_build_filter.cpp
     test/cpp/operator/test_dynamic_filter_accumulation.cpp
     test/cpp/operator/test_dynamic_filter_source_policy.cpp
     test/cpp/operator/test_sirius_dynamic_filter_mgpu.cpp
@@ -242,6 +251,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_copy_logical_plan.cpp
     test/cpp/planner/test_decimal_sum_input_bounds.cpp
     test/cpp/planner/test_scan_column_origin.cpp
+    test/cpp/planner/test_join_key_nullability.cpp
     test/cpp/planner/test_scan_filter_projection.cpp
     test/cpp/planner/test_dynamic_filter_discovery_parity.cpp
     test/cpp/planner/test_dynamic_filter_key_admission.cpp
@@ -329,6 +339,8 @@ set(TEST_SOURCES
     test/cpp/utils/sirius_test_env.cpp
     test/cpp/utils/test_child_process_environment.cpp
     test/cpp/utils/test_gpu_execution_comparator.cpp
+    test/cpp/utils/test_tpch_havoc_queries.cpp
+    test/cpp/utils/tpch_havoc_queries.cpp
     test/cpp/utils/utils.cpp
     test/cpp/utils/s3_backend.cpp
     test/cpp/io/s3/test_sirius_httpfs.cpp

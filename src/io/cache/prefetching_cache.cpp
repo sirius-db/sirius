@@ -617,7 +617,17 @@ cache_handle prefetching_cache::initiate_prefetching_request(const io_object& ob
   req.timestamp  = _ticker.load(std::memory_order_relaxed);
 
   auto chunks_to_fetch = file.update_and_get_chunks(chunk_offsets, desired);
-  std::erase(chunks_to_fetch, nullptr);  // offsets past EOF have no slot
+  // Keep extents parallel if an out-of-range offset has no slot. Reuse the
+  // normalized extents instead of allocating a second per-chunk vector.
+  std::size_t count = 0;
+  for (std::size_t i = 0; i < chunks_to_fetch.size(); ++i) {
+    if (!chunks_to_fetch[i]) continue;
+    chunks_to_fetch[count] = chunks_to_fetch[i];
+    desired[count++]       = desired[i];
+  }
+  chunks_to_fetch.resize(count);
+  desired.resize(count);
+  req.required_fills = std::make_shared<const std::vector<chunk_fill>>(std::move(desired));
   req.chunks = std::make_shared<const std::vector<cached_chunk*>>(std::move(chunks_to_fetch));
   // Resolve the preferred NUMA node for staging buffers from the target GPU's
   // topology; -1 (no preference) when no GPU hint or the GPU is out of scope.
@@ -1320,47 +1330,62 @@ prepare_result prefetching_cache::prepare(cache_handle& handle, bool wait_for_ev
   return prepare_request(handle._req, wait_for_eviction);
 }
 
-bool prefetching_cache::prefetch(cache_handle& handle, exec::invocable<void(bool) noexcept> on_done)
+bool prefetching_cache::prefetch(cache_handle& handle,
+                                 exec::invocable<void(prefetch_result) noexcept> on_done)
 {
   auto& req   = handle._req;
-  auto settle = [&on_done](bool ok) {
-    on_done(ok);
+  auto settle = [&on_done](prefetch_result result) {
+    on_done(result);
     return false;
   };
 
-  if (!req || req.has_fallen_behind() || !req.chunks) { return settle(false); }
-  if (!_io_ctx->supports_vector_host_read()) { return settle(false); }
-  if (!req.producer->mark_loading()) { return settle(false); }
+  if (!req || req.has_fallen_behind() || !req.chunks) { return settle({}); }
+  if (!_io_ctx->supports_vector_host_read()) { return settle({}); }
+  if (!req.producer->mark_loading()) { return settle({}); }
 
   std::vector<prepared_io_slice> prepared;
   std::vector<cached_chunk*> claimed_chunks;
-  std::shared_ptr<exec::invocable<void(bool) noexcept>> done_owner;
+  std::shared_ptr<exec::invocable<void(prefetch_result) noexcept>> done_owner;
   size_terminal terminal;
+  bool covered    = true;
   auto fail_setup = [&]() noexcept {
     for (auto* chunk : claimed_chunks) {
       std::ignore = chunk->state.mark_load_failed();
     }
     std::ignore = req.producer->mark_load_failed();
     if (done_owner != nullptr) {
-      (*done_owner)(false);
+      (*done_owner)({});
     } else {
-      on_done(false);
+      on_done({});
     }
     return false;
   };
 
   try {
+    if (_before_prefetch_claim) _before_prefetch_claim();
     prepared.reserve(req.chunks->size());
     claimed_chunks.reserve(req.chunks->size());
-    for (cached_chunk* c : *req.chunks) {
+    for (std::size_t i = 0; i < req.chunks->size(); ++i) {
+      auto* c = (*req.chunks)[i];
+      auto const [needed_lo, needed_hi] =
+        fill_span((*req.required_fills)[i], c->offset, _chunk_size);
       // Claim the chunk and preserve the promised fill as this prefetch's logical
       // range. The reactor owns any further physical chunking and alignment.
       chunk_fill fill;
       if (c->state.take_loading(fill)) {
         auto const [seg_lo, seg_hi] = fill_span(fill, c->offset, _chunk_size);
+        covered &= covers(fill, c->offset, _chunk_size, needed_lo, needed_hi);
         claimed_chunks.push_back(c);
         prepared.emplace_back(range{seg_lo, seg_hi - seg_lo},
                               host_buffer{std::vector<cached_chunk*>{c}});
+      } else {
+        // Read state and extent together. A loading chunk belongs to another
+        // IO, whose completion this prefetch does not observe. Never promote
+        // that incomplete coverage when our own submitted subset finishes.
+        auto const snapshot = c->state.load();
+        covered &=
+          (snapshot.state() == chunk_state::cached || snapshot.state() == chunk_state::in_use) &&
+          covers(snapshot.fill(), c->offset, _chunk_size, needed_lo, needed_hi);
       }
     }
   } catch (...) {
@@ -1370,7 +1395,7 @@ bool prefetching_cache::prefetch(cache_handle& handle, exec::invocable<void(bool
     // Nothing was claimable: the ranges are already cached or host-backed, or
     // demand reached them before the prefetch could attach buffers.
     std::ignore = req.producer->mark_ready();
-    return settle(true);
+    return settle({true, covered});
   }
 
   if (req.is_cancelled()) { return fail_setup(); }
@@ -1386,18 +1411,19 @@ bool prefetching_cache::prefetch(cache_handle& handle, exec::invocable<void(bool
           std::ignore = host_ok ? chunk->state.mark_cached() : chunk->state.mark_load_failed();
         }
       });
-    done_owner = std::make_shared<exec::invocable<void(bool) noexcept>>(std::move(on_done));
-    terminal   = size_terminal{
-      [req, done_owner, owner = handle._generation](exec::try_t<size_t>&& res) mutable noexcept {
-        owner.reset();
-        auto const ok = res.has_value();
-        if (!ok && req.failure) {
-          std::lock_guard lk(req.failure->mtx);
-          req.failure->failure = std::move(res).exception();
-        }
-        std::ignore = ok ? req.producer->mark_ready() : req.producer->mark_load_failed();
-        (*done_owner)(ok);
-      }};
+    done_owner =
+      std::make_shared<exec::invocable<void(prefetch_result) noexcept>>(std::move(on_done));
+    terminal = size_terminal{[req, done_owner, covered, owner = handle._generation](
+                               exec::try_t<size_t>&& res) mutable noexcept {
+      owner.reset();
+      auto const ok = res.has_value();
+      if (!ok && req.failure) {
+        std::lock_guard lk(req.failure->mtx);
+        req.failure->failure = std::move(res).exception();
+      }
+      std::ignore = ok ? req.producer->mark_ready() : req.producer->mark_load_failed();
+      (*done_owner)({ok, ok && covered});
+    }};
     for (auto& slice : prepared) {
       slice.on_complete = completion;
     }

@@ -34,6 +34,7 @@
 #include "expression/join_condition.hpp"
 #include "op/dynamic_filter/dynamic_filter_publish_plan.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
+#include "op/scan/sirius_physical_dynamic_filter.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_delim_join.hpp"
@@ -43,10 +44,14 @@
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "op/sirius_physical_partition.hpp"
 #include "op/sirius_physical_projection.hpp"
+#include "pipeline/sirius_pipeline_converter.hpp"
 #include "planner/gpu_admission.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
+#include "util/env_guard.hpp"
+#include "utils/pipeline_conversion_test_utils.hpp"
+#include "utils/scoped_sirius_setting.hpp"
 #include "utils/sirius_test_env.hpp"
 
 #include <cudf/types.hpp>
@@ -293,7 +298,7 @@ sirius_physical_operator* require_join_child_wrap(sirius_physical_operator* op,
   REQUIRE(op->children.size() == 1);
   auto* partition = op->children[0].get();
   REQUIRE(partition->type == SiriusPhysicalOperatorType::PARTITION);
-  CHECK(partition->Cast<sirius::op::sirius_physical_partition>().is_build_partition() == is_build);
+  CHECK(partition->Cast<sirius::op::sirius_physical_partition>().exchange() != nullptr);
 
   REQUIRE(partition->children.size() == 1);
   return partition->children[0].get();
@@ -313,7 +318,7 @@ void require_delim_join_common(sirius::op::sirius_physical_delim_join& delim)
   REQUIRE(merge->children.size() == 1);
   auto* partition = merge->children[0].get();
   REQUIRE(partition->type == SiriusPhysicalOperatorType::PARTITION);
-  CHECK_FALSE(partition->Cast<sirius::op::sirius_physical_partition>().is_build_partition());
+  CHECK(partition->Cast<sirius::op::sirius_physical_partition>().exchange() != nullptr);
 
   REQUIRE(partition->children.size() == 1);
   auto* hgb = partition->children[0].get();
@@ -939,6 +944,303 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 }
 
 TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - native CTE deduplication preserves build-filter evidence",
+                 "[plan_tree_shape][isolated_context][dynamic_filter][cte_dedup]")
+{
+  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
+  bool const enable_filter = GENERATE(false, true);
+  // A per-connection SET: plans read the connection's operator-options snapshot, so writing the
+  // shared config (dynamic_filter_switch_guard) no longer turns the filter off.
+  sirius::test::scoped_sirius_setting filter_switch(*con, "enable_dynamic_filter", enable_filter);
+  auto plan = generate_sirius_plan(
+    *con,
+    "SELECT i.qty FROM items i JOIN parts p ON p.pk = i.fk WHERE p.pname = 'p1' "
+    "AND i.qty < (SELECT 2 * AVG(i2.qty) FROM items i2 WHERE i2.fk = p.pk)");
+  INFO(tree_to_string(plan.get()));
+
+  REQUIRE(find_first(plan.get(), SiriusPhysicalOperatorType::CTE) != nullptr);
+  REQUIRE(collect(plan.get(), SiriusPhysicalOperatorType::LEFT_DELIM_JOIN).empty());
+  REQUIRE(collect(plan.get(), SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN).empty());
+
+  auto skip_projections = [](sirius_physical_operator* op) {
+    while (op->type == SiriusPhysicalOperatorType::PROJECTION) {
+      REQUIRE(op->children.size() == 1);
+      op = op->children[0].get();
+    }
+    return op;
+  };
+  std::size_t dedup_builds = 0;
+  for (auto* node : collect(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN)) {
+    auto& join = node->Cast<sirius::op::sirius_physical_hash_join>();
+    REQUIRE(join.children.size() == 2);
+    auto* build =
+      skip_projections(require_join_child_wrap(join.children[1].get(), &join, /*is_build=*/true));
+    if (build->type != SiriusPhysicalOperatorType::MERGE_GROUP_BY) { continue; }
+    REQUIRE(build->children.size() == 1);
+    auto* partition = build->children[0].get();
+    if (partition->type != SiriusPhysicalOperatorType::PARTITION) { continue; }
+    REQUIRE(partition->children.size() == 1);
+    auto* aggregate = partition->children[0].get();
+    REQUIRE(aggregate->type == SiriusPhysicalOperatorType::HASH_GROUP_BY);
+    auto& group_by = aggregate->Cast<sirius::op::sirius_physical_grouped_aggregate>();
+    if (!group_by.cudf_aggregates.empty()) { continue; }
+    REQUIRE(aggregate->children.size() == 1);
+    if (skip_projections(aggregate->children[0].get())->type !=
+        SiriusPhysicalOperatorType::CTE_SCAN) {
+      continue;
+    }
+
+    ++dedup_builds;
+    auto const& targets = join.dynamic_filter_plan().probe_targets();
+    if (enable_filter) {
+      REQUIRE_FALSE(targets.empty());
+      CHECK(std::any_of(targets.begin(), targets.end(), [](auto const& target) {
+        return target.route_class == sirius::op::dynamic_filter_route_class::scan;
+      }));
+      CHECK(find_first(join.children[0].get(), SiriusPhysicalOperatorType::DYNAMIC_FILTER) !=
+            nullptr);
+    } else {
+      CHECK(targets.empty());
+    }
+  }
+  REQUIRE(dedup_builds > 0);
+  require_parent_links(plan.get(), /*expected_parent=*/nullptr);
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - shared CTE filtering stays within one consumer",
+                 "[plan_tree_shape][isolated_context][dynamic_filter][cte_dedup]")
+{
+  dynamic_filter_switch_guard switch_on(*con, /*enabled=*/true);
+  auto plan = generate_sirius_plan(
+    *con,
+    "WITH shared AS MATERIALIZED (SELECT id, val FROM big_left), "
+    "domain AS MATERIALIZED (SELECT rid FROM small_right WHERE other = 0) "
+    "SELECT s.id, s.val FROM shared s JOIN (SELECT rid FROM domain GROUP BY rid) d "
+    "ON s.id = d.rid UNION ALL SELECT id, val FROM shared WHERE val > 3");
+  INFO(tree_to_string(plan.get()));
+  auto ctes = collect(plan.get(), SiriusPhysicalOperatorType::CTE);
+  REQUIRE(ctes.size() == 2);
+  for (auto* cte : ctes) {
+    REQUIRE(cte->children.size() == 2);
+    CHECK(collect(cte->children[0].get(), SiriusPhysicalOperatorType::DYNAMIC_FILTER).empty());
+    CHECK(find_first(cte->children[0].get(), SiriusPhysicalOperatorType::GPU_SCAN) != nullptr);
+  }
+
+  auto joins = collect(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN);
+  REQUIRE(joins.size() == 1);
+  auto& join = joins.front()->Cast<sirius::op::sirius_physical_hash_join>();
+  REQUIRE(join.children.size() == 2);
+  auto skip_projections = [](sirius_physical_operator* op) {
+    while (op->type == SiriusPhysicalOperatorType::PROJECTION) {
+      REQUIRE(op->children.size() == 1);
+      op = op->children[0].get();
+    }
+    return op;
+  };
+
+  auto* probe =
+    skip_projections(require_join_child_wrap(join.children[0].get(), &join, /*is_build=*/false));
+  REQUIRE(probe->type == SiriusPhysicalOperatorType::DYNAMIC_FILTER);
+  REQUIRE(probe->children.size() == 1);
+  REQUIRE(skip_projections(probe->children[0].get())->type == SiriusPhysicalOperatorType::CTE_SCAN);
+  auto* build =
+    skip_projections(require_join_child_wrap(join.children[1].get(), &join, /*is_build=*/true));
+  REQUIRE(build->type == SiriusPhysicalOperatorType::MERGE_GROUP_BY);
+  REQUIRE(build->children.size() == 1);
+  auto* aggregate = build->children[0].get();
+  if (aggregate->type == SiriusPhysicalOperatorType::PARTITION) {
+    REQUIRE(aggregate->children.size() == 1);
+    aggregate = aggregate->children[0].get();
+  }
+  REQUIRE(aggregate->type == SiriusPhysicalOperatorType::HASH_GROUP_BY);
+  CHECK(aggregate->Cast<sirius::op::sirius_physical_grouped_aggregate>().cudf_aggregates.empty());
+  REQUIRE(aggregate->children.size() == 1);
+  REQUIRE(skip_projections(aggregate->children[0].get())->type ==
+          SiriusPhysicalOperatorType::CTE_SCAN);
+  auto const& targets = join.dynamic_filter_plan().probe_targets();
+  REQUIRE(targets.size() == 1);
+  CHECK(targets[0].route_class == sirius::op::dynamic_filter_route_class::direct);
+  CHECK_FALSE(targets[0].accepts_zone_map_filters);
+  REQUIRE(targets[0].filter_set != nullptr);
+  REQUIRE(targets[0].key_bindings.size() == 1);
+  CHECK(collect(plan.get(), SiriusPhysicalOperatorType::DYNAMIC_FILTER).size() == 1);
+  require_parent_links(plan.get(), /*expected_parent=*/nullptr);
+
+  // Closing this consumer must close the channel advertised by its producing join.
+  REQUIRE(targets[0].filter_set->accepting_filters());
+  probe->Cast<sirius::op::scan::sirius_physical_dynamic_filter>().on_finalize_operator();
+  CHECK_FALSE(targets[0].filter_set->accepting_filters());
+}
+
+TEST_CASE_METHOD(
+  plan_tree_shape_fixture,
+  "plan tree shape - null-safe right-family filters require a nonnull key and early publication",
+  "[plan_tree_shape][isolated_context][dynamic_filter][right_family][join_key_nullability]")
+{
+  std::string const join_type    = GENERATE("SEMI", "ANTI");
+  std::string const key_type     = GENERATE("INTEGER", "BIGINT");
+  bool const enable_accumulation = GENERATE(false, true);
+  bool const probe_not_null      = GENERATE(false, true);
+  CAPTURE(join_type, key_type, enable_accumulation, probe_not_null);
+  REQUIRE_FALSE(
+    con->Query("CREATE TABLE right_probe(k " + key_type + (probe_not_null ? " NOT NULL" : "") + ")")
+      ->HasError());
+  REQUIRE_FALSE(con->Query("INSERT INTO right_probe SELECT range FROM range(20)")->HasError());
+  REQUIRE_FALSE(
+    con->Query("CREATE TABLE right_build(k " + key_type + ", keep INTEGER)")->HasError());
+  REQUIRE_FALSE(con->Query("INSERT INTO right_build VALUES (0,0), (1,1), (NULL,0)")->HasError());
+
+  dynamic_filter_switch_guard switch_on(*con, /*enabled=*/true);
+  sirius::test::scoped_sirius_setting accumulation(
+    *con, "enable_dynamic_filter_multi_partition", enable_accumulation);
+  auto plan = generate_sirius_plan(*con,
+                                   "SELECT r.k FROM right_build r " + join_type +
+                                     " JOIN right_probe l ON r.k IS NOT DISTINCT FROM l.k "
+                                     "WHERE r.keep = 0");
+  INFO(tree_to_string(plan.get()));
+
+  auto joins = collect(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN);
+  REQUIRE(joins.size() == 1);
+  auto& join = joins.front()->Cast<sirius::op::sirius_physical_hash_join>();
+  REQUIRE(join.join_type == (join_type == "SEMI" ? JoinType::RIGHT_SEMI : JoinType::RIGHT_ANTI));
+  REQUIRE(join.conditions.size() == 1);
+  CHECK(
+    join.conditions[0].comparison ==
+    (probe_not_null ? sirius::comparison_type::equal : sirius::comparison_type::not_distinct_from));
+  auto const& targets = join.dynamic_filter_plan().probe_targets();
+  REQUIRE(join.children.size() == 2);
+  auto* build_root = require_join_child_wrap(join.children[1].get(), &join, /*is_build=*/true);
+  if (enable_accumulation && probe_not_null) {
+    REQUIRE(targets.size() == 1);
+    CHECK(targets[0].route_class == sirius::op::dynamic_filter_route_class::scan);
+    CHECK(find_first(join.children[0].get(), SiriusPhysicalOperatorType::DYNAMIC_FILTER) !=
+          nullptr);
+    CHECK(find_first(join.children[1].get(), SiriusPhysicalOperatorType::DYNAMIC_FILTER) ==
+          nullptr);
+    REQUIRE(build_root->type == SiriusPhysicalOperatorType::BUILD_FILTER);
+    REQUIRE(build_root->children.size() == 1);
+    CHECK(collect(plan.get(), SiriusPhysicalOperatorType::BUILD_FILTER).size() == 1);
+  } else {
+    CHECK(targets.empty());
+    CHECK(collect(plan.get(), SiriusPhysicalOperatorType::DYNAMIC_FILTER).empty());
+    CHECK(collect(plan.get(), SiriusPhysicalOperatorType::BUILD_FILTER).empty());
+  }
+  require_parent_links(plan.get(), /*expected_parent=*/nullptr);
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - early build publication stays separate from merge fusion",
+                 "[plan_tree_shape][isolated_context][dynamic_filter][right_family][pipeline]")
+{
+  dynamic_filter_switch_guard switch_on(*con, /*enabled=*/true);
+  sirius::test::scoped_sirius_setting accumulation(
+    *con, "enable_dynamic_filter_multi_partition", true);
+  sirius::test::scoped_sirius_setting fusion(*con, "fuse_merge_pipelines", true);
+  sirius::test::with_conversion_result(
+    *con,
+    "SELECT r.rid FROM (SELECT rid FROM small_right WHERE other = 0 GROUP BY rid) r "
+    "SEMI JOIN big_left l ON r.rid = l.id",
+    [](auto const& result) {
+      sirius::pipeline::sirius_pipeline const* publication_pipeline = nullptr;
+      for (auto const& pipeline : result.scheduled_pipelines) {
+        auto const* source = pipeline->get_source().get();
+        if (source && source->type == SiriusPhysicalOperatorType::BUILD_FILTER) {
+          REQUIRE(publication_pipeline == nullptr);
+          publication_pipeline = pipeline.get();
+        }
+      }
+      REQUIRE(publication_pipeline != nullptr);
+      auto const operators = publication_pipeline->get_operators();
+      REQUIRE(operators.size() == 1);
+      auto const* publisher = &operators[0].get();
+      CHECK(publication_pipeline->get_sink().get() == publisher);
+      REQUIRE(publisher->children.size() == 1);
+      auto* merge =
+        find_first(publisher->children[0].get(), SiriusPhysicalOperatorType::MERGE_GROUP_BY);
+      REQUIRE(merge != nullptr);
+      if (publisher->children[0].get() == merge) {
+        CHECK_FALSE(
+          merge->Cast<sirius::op::sirius_physical_grouped_aggregate_merge>().fuse_into_parent());
+      }
+
+      std::size_t input_count = 0;
+      for (auto const& wiring : result.repository_wirings) {
+        if (wiring.dest_pipeline.get() != publication_pipeline) { continue; }
+        ++input_count;
+        CHECK(wiring.barrier_type == sirius::op::MemoryBarrierType::FULL);
+        REQUIRE(wiring.source_pipeline);
+        CHECK(wiring.source_pipeline.get() != publication_pipeline);
+        CHECK(wiring.source_pipeline->get_sink().get() == publisher->children[0].get());
+      }
+      REQUIRE(input_count == 1);
+    });
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - early CTE build filtering preserves materialization boundaries",
+                 "[plan_tree_shape][isolated_context][dynamic_filter][right_family][cte_dedup]")
+{
+  std::string const join_type = GENERATE("SEMI", "ANTI");
+  bool const deduplicate      = GENERATE(false, true);
+  CAPTURE(join_type, deduplicate);
+  dynamic_filter_switch_guard switch_on(*con, /*enabled=*/true);
+  sirius::test::scoped_sirius_setting accumulation(
+    *con, "enable_dynamic_filter_multi_partition", true);
+  auto const grouping = deduplicate ? " GROUP BY rid" : "";
+  auto plan =
+    generate_sirius_plan(*con,
+                         "WITH shared AS MATERIALIZED (SELECT rid FROM small_right) "
+                         "SELECT r.rid FROM (SELECT rid FROM shared" +
+                           std::string(grouping) + ") r " + join_type +
+                           " JOIN big_left l ON r.rid = l.id UNION ALL SELECT rid FROM shared");
+  INFO(tree_to_string(plan.get()));
+  auto ctes = collect(plan.get(), SiriusPhysicalOperatorType::CTE);
+  REQUIRE(ctes.size() == 1);
+  REQUIRE(ctes[0]->children.size() == 2);
+  CHECK(collect(ctes[0]->children[0].get(), SiriusPhysicalOperatorType::DYNAMIC_FILTER).empty());
+  CHECK(collect(ctes[0]->children[0].get(), SiriusPhysicalOperatorType::BUILD_FILTER).empty());
+
+  auto joins = collect(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN);
+  REQUIRE(joins.size() == 1);
+  auto& join = joins[0]->Cast<sirius::op::sirius_physical_hash_join>();
+  REQUIRE(join.join_type == (join_type == "SEMI" ? JoinType::RIGHT_SEMI : JoinType::RIGHT_ANTI));
+  REQUIRE(join.children.size() == 2);
+  REQUIRE(join.dynamic_filter_plan().probe_targets().size() == 1);
+  CHECK(join.dynamic_filter_plan().probe_targets()[0].route_class ==
+        sirius::op::dynamic_filter_route_class::scan);
+  auto* stage = require_join_child_wrap(join.children[1].get(), &join, /*is_build=*/true);
+  REQUIRE(stage->type == SiriusPhysicalOperatorType::BUILD_FILTER);
+  REQUIRE(stage->children.size() == 1);
+  CHECK(collect(plan.get(), SiriusPhysicalOperatorType::BUILD_FILTER).size() == 1);
+
+  auto skip_projections = [](sirius_physical_operator* op) {
+    while (op->type == SiriusPhysicalOperatorType::PROJECTION) {
+      REQUIRE(op->children.size() == 1);
+      op = op->children[0].get();
+    }
+    return op;
+  };
+  auto* input = skip_projections(stage->children[0].get());
+  if (deduplicate) {
+    REQUIRE(input->type == SiriusPhysicalOperatorType::MERGE_GROUP_BY);
+    REQUIRE(input->children.size() == 1);
+    input = input->children[0].get();
+    if (input->type == SiriusPhysicalOperatorType::PARTITION) {
+      REQUIRE(input->children.size() == 1);
+      input = input->children[0].get();
+    }
+    REQUIRE(input->type == SiriusPhysicalOperatorType::HASH_GROUP_BY);
+    CHECK(input->Cast<sirius::op::sirius_physical_grouped_aggregate>().cudf_aggregates.empty());
+    REQUIRE(input->children.size() == 1);
+    input = skip_projections(input->children[0].get());
+  }
+  REQUIRE(input->type == SiriusPhysicalOperatorType::CTE_SCAN);
+  CHECK(collect(plan.get(), SiriusPhysicalOperatorType::CTE_SCAN).size() == 2);
+  require_parent_links(plan.get(), /*expected_parent=*/nullptr);
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "plan tree shape - aggregates wrap to MERGE (-> PARTITION) -> original",
                  "[plan_tree_shape][isolated_context]")
 {
@@ -953,7 +1255,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
     auto* partition = merge->children[0].get();
     REQUIRE(partition->type == SiriusPhysicalOperatorType::PARTITION);
-    CHECK_FALSE(partition->Cast<sirius::op::sirius_physical_partition>().is_build_partition());
+    CHECK(partition->Cast<sirius::op::sirius_physical_partition>().exchange() != nullptr);
 
     REQUIRE(partition->children.size() == 1);
     CHECK(partition->children[0]->type == SiriusPhysicalOperatorType::HASH_GROUP_BY);
@@ -984,6 +1286,49 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     CHECK(local->get_types()[1].id() == sirius::type_id::LIST);
   }
 
+  SECTION("a wide integer SUM accepts INT64 or DECIMAL128 partials until the merge")
+  {
+    // The statistics cannot prove the BIGINT sum fits INT64, so the SUM is wide.
+    REQUIRE_FALSE(con->Query("CREATE TABLE wide_sum (k INTEGER, x BIGINT)")->HasError());
+    REQUIRE_FALSE(
+      con->Query("INSERT INTO wide_sum VALUES (1, 4000000000000000000), (1, 4000000000000000000)")
+        ->HasError());
+    auto plan = generate_sirius_plan(*con, "SELECT k, sum(x) FROM wide_sum GROUP BY k");
+    INFO(tree_to_string(plan.get()));
+
+    auto* merge = find_first(plan.get(), SiriusPhysicalOperatorType::MERGE_GROUP_BY);
+    REQUIRE(merge != nullptr);
+    CHECK(merge->get_alternate_physical_types().empty());
+    auto* partition = merge->children[0].get();
+    REQUIRE(partition->type == SiriusPhysicalOperatorType::PARTITION);
+    auto* local = partition->children[0].get();
+    REQUIRE(local->type == SiriusPhysicalOperatorType::HASH_GROUP_BY);
+
+    auto const int64      = cudf::data_type{cudf::type_id::INT64};
+    auto const decimal128 = cudf::data_type{cudf::type_id::DECIMAL128, 0};
+    for (auto const* op : {local, partition}) {
+      REQUIRE(op->get_types().size() == 2);
+      CHECK(op->get_types()[1].id() == sirius::type_id::BIGINT);
+      CHECK(op->is_alternate_physical_type(1, decimal128));
+      CHECK_FALSE(op->is_alternate_physical_type(1, int64));
+      CHECK_FALSE(op->is_alternate_physical_type(0, decimal128));
+    }
+  }
+
+  SECTION("a decimal SUM has no alternate partial carrier")
+  {
+    auto plan =
+      generate_sirius_plan(*con, "SELECT amount, sum(amount) FROM decimal_values GROUP BY amount");
+    INFO(tree_to_string(plan.get()));
+
+    auto* local = find_first(plan.get(), SiriusPhysicalOperatorType::HASH_GROUP_BY);
+    REQUIRE(local != nullptr);
+    CHECK(local->get_alternate_physical_types().empty());
+    auto* partition = find_first(plan.get(), SiriusPhysicalOperatorType::PARTITION);
+    REQUIRE(partition != nullptr);
+    CHECK(partition->get_alternate_physical_types().empty());
+  }
+
   SECTION("ungrouped aggregate gains MERGE_AGGREGATE with no PARTITION")
   {
     auto plan = generate_sirius_plan(*con, "SELECT sum(val) FROM big_left");
@@ -997,6 +1342,8 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
   SECTION("AVG records its two-column local accumulator schema below MERGE_AGGREGATE")
   {
+    // AVG(INTEGER) accumulates in 128 bits (a wide integer sum), so its local sum is
+    // DECIMAL(38, 0) and its count BIGINT.
     auto plan = generate_sirius_plan(
       *con, "SELECT avg(val) FROM big_left", {OptimizerType::AGGREGATE_FUNCTION_REWRITER});
     INFO(tree_to_string(plan.get()));
@@ -1009,7 +1356,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     auto* local = merge->children[0].get();
     REQUIRE(local->type == SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE);
     duckdb::vector<sirius::logical_type> const expected_local_types{
-      sirius::logical_type::make(sirius::type_id::BIGINT),
+      sirius::logical_type::make_decimal(38, 0),
       sirius::logical_type::make(sirius::type_id::BIGINT)};
     CHECK(local->get_types() == expected_local_types);
   }
@@ -1047,7 +1394,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
     auto* partition = merge->children[0].get();
     REQUIRE(partition->type == SiriusPhysicalOperatorType::PARTITION);
-    CHECK_FALSE(partition->Cast<sirius::op::sirius_physical_partition>().is_build_partition());
+    CHECK(partition->Cast<sirius::op::sirius_physical_partition>().exchange() != nullptr);
     REQUIRE(partition->children.size() == 1);
 
     auto* hgb = partition->children[0].get();
@@ -1328,6 +1675,62 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     REQUIRE(merge != nullptr);
     REQUIRE(merge->children.size() == 1);
     CHECK(merge->children[0]->type == SiriusPhysicalOperatorType::TOP_N);
+  }
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - join input partitions get their ingress barrier at planning",
+                 "[plan_tree_shape][isolated_context]")
+{
+  using sirius::op::MemoryBarrierType;
+  auto const barriers = [](sirius_physical_operator* join) {
+    auto& probe = join->children[0]->children[0]->Cast<sirius::op::sirius_physical_partition>();
+    auto& build = join->children[1]->children[0]->Cast<sirius::op::sirius_physical_partition>();
+    return std::make_pair(probe.input_barrier(), build.input_barrier());
+  };
+  const std::vector<OptimizerType> keep_shape{OptimizerType::JOIN_ORDER,
+                                              OptimizerType::BUILD_SIDE_PROBE_SIDE};
+
+  SECTION("INNER join: the probe streams and the build arrives whole")
+  {
+    auto plan =
+      generate_sirius_plan(*con, "SELECT * FROM big_left l JOIN small_right r ON l.id = r.rid");
+    INFO(tree_to_string(plan.get()));
+    auto* join = find_first(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN);
+    REQUIRE(join != nullptr);
+    REQUIRE(join->Cast<sirius::op::sirius_physical_hash_join>().join_type == JoinType::INNER);
+    auto const [probe, build] = barriers(join);
+    CHECK(probe == MemoryBarrierType::PARTIAL);
+    CHECK(build == MemoryBarrierType::FULL);
+  }
+
+  SECTION("RIGHT join: the probe drives partition sizing and arrives whole")
+  {
+    auto plan = generate_sirius_plan(
+      *con, "SELECT * FROM big_left l RIGHT JOIN small_right r ON l.id = r.rid", keep_shape);
+    INFO(tree_to_string(plan.get()));
+    auto* join = find_first(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN);
+    REQUIRE(join != nullptr);
+    REQUIRE(join->Cast<sirius::op::sirius_physical_hash_join>().is_right_family());
+    auto const [probe, build] = barriers(join);
+    CHECK(probe == MemoryBarrierType::FULL);
+    CHECK(build == MemoryBarrierType::FULL);
+  }
+
+  SECTION("RIGHT_DELIM_JOIN: the inner join is sized from its build side")
+  {
+    auto plan = generate_sirius_plan(
+      *con,
+      "SELECT SUM(i.qty) FROM items i, parts p WHERE p.pk = i.fk AND p.pname = 'p1' "
+      "AND i.qty < (SELECT 2 * AVG(i2.qty) FROM items i2 WHERE i2.fk = p.pk)");
+    INFO(tree_to_string(plan.get()));
+    auto* node = find_first(plan.get(), SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN);
+    REQUIRE(node != nullptr);
+    auto& delim = node->Cast<sirius::op::sirius_physical_right_delim_join>();
+    REQUIRE(delim.join);
+    auto const [probe, build] = barriers(delim.join.get());
+    CHECK(probe == MemoryBarrierType::PARTIAL);
+    CHECK(build == MemoryBarrierType::FULL);
   }
 }
 
@@ -1700,6 +2103,50 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 }
 
 TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - nested-loop-join wrap folds the side rows are decided against",
+                 "[plan_tree_shape]")
+{
+  struct expectation {
+    duckdb::JoinType join_type;
+    bool fold_build;
+    bool fold_probe;
+  };
+  for (auto const& e : {expectation{duckdb::JoinType::INNER, false, false},
+                        expectation{duckdb::JoinType::LEFT, true, false},
+                        expectation{duckdb::JoinType::SEMI, true, false},
+                        expectation{duckdb::JoinType::ANTI, true, false},
+                        expectation{duckdb::JoinType::MARK, true, false},
+                        expectation{duckdb::JoinType::RIGHT, false, true},
+                        expectation{duckdb::JoinType::OUTER, true, true}}) {
+    DYNAMIC_SECTION(duckdb::JoinTypeToString(e.join_type))
+    {
+      sirius::planner::sirius_physical_plan_generator gen(*con->context);
+
+      duckdb::LogicalDummyScan stub(duckdb::TableIndex(0));
+      stub.types = {duckdb::LogicalType::INTEGER, duckdb::LogicalType::INTEGER};
+      duckdb::unique_ptr<sirius_physical_operator> plan =
+        duckdb::make_uniq<sirius::op::sirius_physical_nested_loop_join>(
+          stub,
+          make_projection_leaf(1),
+          make_projection_leaf(1),
+          duckdb::vector<sirius::join_condition>{},
+          e.join_type,
+          /*estimated_cardinality=*/1);
+
+      gen.insert_gpu_pipeline_operators(plan);
+
+      REQUIRE(plan->type == SiriusPhysicalOperatorType::NESTED_LOOP_JOIN);
+      require_join_child_wrap(plan->children[0].get(), plan.get(), /*is_build=*/false);
+      require_join_child_wrap(plan->children[1].get(), plan.get(), /*is_build=*/true);
+      CHECK(plan->children[0]->Cast<sirius::op::sirius_physical_concat>().concat_all() ==
+            e.fold_probe);
+      CHECK(plan->children[1]->Cast<sirius::op::sirius_physical_concat>().concat_all() ==
+            e.fold_build);
+    }
+  }
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "plan generation rejects an untranslatable pushed-down table filter",
                  "[plan_tree_shape][table_filter][isolated_context]")
 {
@@ -1820,4 +2267,84 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   require_sinks_match_union(
     "(WITH m AS MATERIALIZED (SELECT rid FROM small_right) SELECT rid, rid * 2 FROM m) "
     "UNION ALL SELECT id, id * 2 FROM big_left");
+}
+
+namespace {
+
+bool delim_join_as_cte(Connection& con)
+{
+  auto result = con.Query("SELECT current_setting('delim_join_as_cte')");
+  REQUIRE_FALSE(result->HasError());
+  return result->Collection().GetValue(0, 0).GetValue<bool>();
+}
+
+std::size_t count_delim_joins(sirius_physical_operator* plan)
+{
+  return collect(plan, SiriusPhysicalOperatorType::LEFT_DELIM_JOIN).size() +
+         collect(plan, SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN).size();
+}
+
+}  // namespace
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - Sirius defaults decorrelation to explicit delim joins",
+                 "[plan_tree_shape][isolated_context][delim_join]")
+{
+  // The fixture pins the session value; drop it so the database default Sirius installs applies.
+  REQUIRE_FALSE(con->Query("RESET delim_join_as_cte")->HasError());
+  REQUIRE_FALSE(delim_join_as_cte(*con));
+  // A connection opened after LOAD sees the same default without any SET.
+  Connection fresh(*db);
+  REQUIRE_FALSE(delim_join_as_cte(fresh));
+
+  std::string const correlated_aggregate =
+    "SELECT SUM(i.qty) FROM items i, parts p WHERE p.pk = i.fk AND p.pname = 'p1' "
+    "AND i.qty < (SELECT 2 * AVG(i2.qty) FROM items i2 WHERE i2.fk = p.pk)";
+  // The TPC-H Q21 pattern: correlated EXISTS and NOT EXISTS with an inequality on a second key.
+  std::string const correlated_exists =
+    "SELECT COUNT(*) FROM items i1, parts p WHERE p.pk = i1.fk AND p.pname = 'p1' "
+    "AND EXISTS (SELECT 1 FROM items i2 WHERE i2.fk = i1.fk AND i2.qty <> i1.qty) "
+    "AND NOT EXISTS (SELECT 1 FROM items i3 WHERE i3.fk = i1.fk AND i3.qty <> i1.qty "
+    "AND i3.qty > 20)";
+
+  SECTION("default: delim joins and no CTE")
+  {
+    for (auto const& query : {correlated_aggregate, correlated_exists}) {
+      auto plan = generate_sirius_plan(*con, query);
+      INFO(query << "\n" << tree_to_string(plan.get()));
+      CHECK(count_delim_joins(plan.get()) > 0);
+      CHECK(find_first(plan.get(), SiriusPhysicalOperatorType::CTE) == nullptr);
+    }
+  }
+
+  SECTION("an explicit session SET restores DuckDB's CTE rewrite")
+  {
+    sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
+    REQUIRE(delim_join_as_cte(*con));
+    // The other session keeps the database default.
+    REQUIRE_FALSE(delim_join_as_cte(fresh));
+    for (auto const& query : {correlated_aggregate, correlated_exists}) {
+      auto plan = generate_sirius_plan(*con, query);
+      INFO(query << "\n" << tree_to_string(plan.get()));
+      CHECK(count_delim_joins(plan.get()) == 0);
+    }
+    auto plan = generate_sirius_plan(*con, correlated_aggregate);
+    CHECK(find_first(plan.get(), SiriusPhysicalOperatorType::CTE) != nullptr);
+  }
+}
+
+TEST_CASE("plan tree shape - an explicit global delim_join_as_cte survives loading Sirius",
+          "[plan_tree_shape][isolated_context][delim_join]")
+{
+  scoped_temp_db_path db_path;
+  auto const cfg = std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" / "config" / "data" /
+                   "minimal.yaml";
+  sirius::util::env_guard const config("SIRIUS_CONFIG_FILE", cfg.string());
+  sirius::util::env_guard const enabled("SIRIUS_DISABLE", std::nullopt);
+  DBConfig db_config;
+  db_config.SetOptionByName("allow_unsigned_extensions", Value::BOOLEAN(true));
+  db_config.SetOptionByName("delim_join_as_cte", Value::BOOLEAN(true));
+  DuckDB db(db_path.path().c_str(), &db_config);
+  Connection con(db);
+  CHECK(delim_join_as_cte(con));
 }

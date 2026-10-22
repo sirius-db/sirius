@@ -1647,3 +1647,28 @@ TEST_CASE("translator: string column NOT EQUAL string literal", "[expression_tra
   auto host_vals = copy_bool_column_to_host(result->view());
   REQUIRE(host_vals == std::vector<uint8_t>{0, 1, 0, 1});
 }
+
+TEST_CASE("translator: checked DATE arithmetic is an AST boundary",
+          "[expression_translator][date_arithmetic]")
+{
+  auto const signature  = GENERATE(0, 1, 2, 3);
+  auto const date       = logical_type::make(type_id::DATE);
+  auto const integer    = logical_type::make(type_id::INTEGER);
+  auto const difference = signature == 3;
+  std::vector<std::unique_ptr<ast_node>> args;
+  args.push_back(make_ref_typed(0, signature == 1 ? integer : date));
+  args.push_back(make_ref_typed(1, signature == 1 || difference ? date : integer));
+  auto expr = make_func(signature < 2 ? sirius::function_id::add : sirius::function_id::sub,
+                        std::move(args),
+                        difference ? logical_type::make(type_id::BIGINT) : date);
+  REQUIRE(expr->cudf_ast_op_count() == 0);
+  auto translator = make_translator();
+  REQUIRE_FALSE(translate(translator, *expr).has_value());
+  // An enclosing comparison must decline too, not bypass the checked child.
+  auto parent =
+    make_cmp(sirius::comparison_type::equal,
+             std::move(expr),
+             make_ref_typed(2, difference ? logical_type::make(type_id::BIGINT) : date));
+  auto parent_translator = make_translator();
+  REQUIRE_FALSE(translate(parent_translator, *parent).has_value());
+}

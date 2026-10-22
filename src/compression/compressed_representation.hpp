@@ -151,7 +151,7 @@ class compressed_host_representation : public simpatico_compressed_representatio
 
   /// Clone shares the same backing blob (increments shared ownership).
   [[nodiscard]] std::unique_ptr<cucascade::idata_representation> clone(
-    ::cuda::stream_ref stream) override;
+    ::cuda::stream_ref stream) const override;
 
   // ── Projection ──────────────────────────────────────────────────────────────
 
@@ -285,7 +285,7 @@ class compressed_device_representation : public simpatico_compressed_representat
 
   /// Clone shares the same cached table (increments shared ownership).
   [[nodiscard]] std::unique_ptr<cucascade::idata_representation> clone(
-    ::cuda::stream_ref stream) override;
+    ::cuda::stream_ref stream) const override;
 
   /// Projection sharing the same cached blob; decompress will skip non-selected columns.
   [[nodiscard]] std::unique_ptr<compressed_device_representation> select_columns(
