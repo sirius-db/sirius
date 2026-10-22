@@ -1394,7 +1394,7 @@ TEST_CASE(
   cucascade::shared_data_repository output_repo;
   input_repo.set_num_partitions(6);
   output_repo.set_num_partitions(6);
-  sirius_physical_operator producer(SiriusPhysicalOperatorType::PROJECTION, types, 0);
+  sirius::op::test_physical_operator producer(SiriusPhysicalOperatorType::PROJECTION, types, 0);
   auto source = std::make_shared<sirius::pipeline::sirius_pipeline>(
     sirius::pipeline::pipeline_build_context{nullptr});
   sirius::pipeline::sirius_pipeline_build_state build_state;
