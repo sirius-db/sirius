@@ -292,6 +292,7 @@ TEST_CASE_METHOD(UnionFixture,
   // 'a' stay apart on the CPU, and the GPU must keep them apart too.
   run_ok("CREATE TABLE ucase (v VARCHAR);");
   run_ok("INSERT INTO ucase VALUES ('A'), ('a'), ('A');");
+  run_ok("CHECKPOINT;");
   sirius::test::scoped_sirius_setting collation{*con, "default_collation", "nocase"};
   compare_gpu_vs_cpu(
     "WITH RECURSIVE c AS (SELECT v FROM ucase UNION SELECT v FROM ucase) "
