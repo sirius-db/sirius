@@ -1457,6 +1457,36 @@ bool selection_validation_checks()
   return true;
 }
 
+// A bitpacked DECIMAL128 column decodes compacted, but the range ballot compares in int64, so the
+// column must not offer to produce a mask and a direct ballot request must be refused.
+bool decimal128_range_ballot_refused()
+{
+  rmm::cuda_stream owned_stream(rmm::cuda_stream::flags::non_blocking);
+  ::cuda::stream_ref const stream = owned_stream;
+  auto const mr                   = rmm::mr::get_current_device_resource_ref();
+  auto input                      = make_decimal128_table(1, 3 * kChunk, 7);
+  cudf::get_default_stream().synchronize();
+  auto compressed  = simpatico::compress_with_plan(input->view(), "input -> bitpack\n", stream, mr);
+  auto const& tree = *compressed.columns[0].plan_tree;
+  auto const caps  = simpatico::probe_column(tree);
+  REQUIRE_MSG(caps.compact_route == sirius::codegen::decode_route::bitpack_mask,
+              "bitpacked DECIMAL128 lost its compacted route");
+  REQUIRE_MSG(!caps.can_produce_mask(), "bitpacked DECIMAL128 offered an int64 range ballot");
+  rmm::device_buffer words(
+    static_cast<std::size_t>(selection_mask::AllocWordsFor(input->num_rows())) *
+      sizeof(std::uint32_t),
+    stream,
+    mr);
+  std::string error;
+  REQUIRE_MSG(!simpatico::decompress_column_selection_mask(
+                tree, {0, 50000}, static_cast<std::uint32_t*>(words.data()), stream, mr, &error) &&
+                error == "decode: plan or destination cannot serve range ballot",
+              "DECIMAL128 range ballot was not refused (error: %s)",
+              error.c_str());
+  std::printf("PASS: DECIMAL128 range ballot refused\n");
+  return true;
+}
+
 }  // namespace
 
 int main()
@@ -1475,6 +1505,7 @@ int main()
   try {
     render_checks();
     selection_validation_checks();
+    decimal128_range_ballot_refused();
     // int32 date-like domain; int64 with a base above INT32_MAX so the widened
     // int64 compare path is exercised on genuinely 64-bit decoded values.
     run_roundtrip<std::int32_t>("int32_t", 8035, 2526, arch);
@@ -1512,6 +1543,10 @@ int main()
                                                arch);
     run_index_walk_selectivities<std::int64_t>(
       "int64_t", "int64/40b", 8035, 1LL << 40, {180u}, arch);
+    // DECIMAL128 storage: a narrow chunk and one wider than 32 bits, which needs the full-width
+    // unpack rather than the 32-bit one.
+    run_index_walk_selectivities<__int128>("__int128", "int128/12b", 8035, 2526, {180u}, arch);
+    run_index_walk_selectivities<__int128>("__int128", "int128/40b", 8035, 1LL << 40, {180u}, arch);
     // The delta mask walk and the dictionary gather.
     run_delta_masked<std::int64_t>("int64_t", arch);
     run_delta_masked<std::int32_t>("int32_t", arch);

@@ -1355,6 +1355,10 @@ column_decode_caps probe_column(PlanTree const& tree)
     // route stays `full`
   } else if (bitpack_selection_root(tree)) {
     caps.compact_route = sc::decode_route::bitpack_mask;
+    // A root without a representation is refused later, when the ballot binds it.
+    if (auto const* rep = node_rep(root_value_producer(tree), tree)) {
+      caps.range_comparable_lane = cudf::size_of(rep->decoded_type()) <= sizeof(std::int64_t);
+    }
   } else if (delta_selection_root(tree)) {
     caps.compact_route = sc::decode_route::delta_mask;
   } else if (dict_codes_selection_root(tree)) {

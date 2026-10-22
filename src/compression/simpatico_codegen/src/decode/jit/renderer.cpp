@@ -891,8 +891,8 @@ void Walker::emit_bitpack_mask_dict_gather(const ::codegen::jit::FusedTree& node
 // a chunk with no survivors returns at `cnt == 0`. The loop over slots is lane-strided.
 //
 // Unpack: bits <= 32 via simpatico_bp_at32 (bits == 0 yields the chunk minimum); bits > 32 (int64
-// lanes only) via simpatico_bp_at, chosen by a warp-uniform branch. Output is bit-identical to
-// the plain decode.
+// and int128 lanes only) via simpatico_bp_at, chosen by a warp-uniform branch. Output is
+// bit-identical to the plain decode.
 // =====================================================================
 void Walker::emit_bitpack_index_consume(const ::codegen::jit::FusedTree& node)
 {
@@ -918,7 +918,7 @@ void Walker::emit_bitpack_index_consume(const ::codegen::jit::FusedTree& node)
   const std::string narrow = "simpatico_bp_at32(packed_" + idstr + " + bpbase_" + idstr + ", " +
                              bits + ", " + vmask + ", bpmin_" + idstr + ", i)";
   const std::string value =
-    dtype_elem_size(dtype_) == 8
+    dtype_elem_size(dtype_) > 4
       ? "(" + bits + " > 32) ? " + at_pos(vs.read_expr, "i") + " : " + narrow
       : narrow;
   emit_survivor_loop("            (out + out_base)[rank] = " + value + ";\n");
