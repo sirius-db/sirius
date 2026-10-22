@@ -332,13 +332,14 @@ TEST_CASE("publication waits for contributions still queued on every GPU",
 {
   if (!sirius::test::has_gpus(2)) { return; }
   auto const gpus = std::min(acc::visible_gpus(), 3);
-  if (!acc::has_peer_connected_gpus(gpus)) { return; }
+  if (!sirius::test::has_gpus(gpus)) { return; }
   // "sources": GPU 1 contributes, so the root merges it (fold, source-ready wait, merge, egress).
   // "root only": only the root contributes, so every other GPU copies the root's array directly
   // (fold, root-ready wait, egress). With three GPUs, GPU 2 is a target that contributes nothing.
   bool const with_sources = GENERATE(true, false);
   acc::load_accumulation_kernels(static_cast<std::size_t>(gpus));
   acc::fixture fixture({.devices = static_cast<std::size_t>(gpus)});
+  if (!acc::has_pool_access(fixture.spaces)) { return; }
   auto const settled = fixture.make_batch(with_sources ? 1 : 0, 0, 4000);
   auto const on_root = fixture.make_batch(0, 10'000, 4000);
   auto const queued  = fixture.make_batch(with_sources ? 1 : 0, 20'000, 4000);
@@ -367,7 +368,7 @@ TEST_CASE("the chunk pipeline publishes the exact union to every GPU",
 {
   if (!sirius::test::has_gpus(2)) { return; }
   auto const gpus = std::min(acc::visible_gpus(), 4);
-  if (!acc::has_peer_connected_gpus(gpus)) { return; }
+  if (!sirius::test::has_gpus(gpus)) { return; }
   // 4'718'593 rows give 9'437'216-byte arrays: five 2 MiB chunks per key with a short last chunk,
   // so two keys cross both scratch buffers several times.
   constexpr cudf::size_type rows_per_batch = 1'179'649;
@@ -395,6 +396,7 @@ TEST_CASE("the chunk pipeline publishes the exact union to every GPU",
   }
 
   acc::fixture fixture({.devices = static_cast<std::size_t>(gpus), .gpu_bytes = 2048 * mib});
+  if (!acc::has_pool_access(fixture.spaces)) { return; }
   // GPU 0 holds two batches. With more than two GPUs the last GPU holds none, so it is a target
   // that is not a source.
   std::array<int, 4> const device_of{0, 0, 1, gpus > 2 ? 2 : 1};
@@ -438,7 +440,7 @@ TEST_CASE("the chunk pipeline publishes the exact union to every GPU",
 TEST_CASE("non-aligned geometries publish with exactly the scratch lease free",
           "[dynamic_filter][multi_partition][mgpu][multi_gpu]")
 {
-  if (!acc::has_peer_connected_gpus(2)) { return; }
+  if (!sirius::test::has_gpus(2)) { return; }
   struct case_shape {
     cudf::size_type first_rows;
     cudf::size_type second_rows;
@@ -450,6 +452,7 @@ TEST_CASE("non-aligned geometries publish with exactly the scratch lease free",
   auto const shape_case = GENERATE(case_shape{500'000, 500'000, 1, 16 * mib},
                                    case_shape{10'485'768, 10'485'768, 0, 96 * mib});
   acc::fixture fixture({.devices = 2, .gpu_bytes = 4096 * mib});
+  if (!acc::has_pool_access(fixture.spaces)) { return; }
   auto const first    = fixture.make_batch(0, 0, shape_case.first_rows);
   auto const second   = fixture.make_batch(1, 100'000'000, shape_case.second_rows);
   auto const extra    = fixture.make_batch(1, 200'000'000, shape_case.extra_rows);
@@ -539,8 +542,9 @@ TEST_CASE("duplicates and retries count once and only the final original ID publ
 TEST_CASE("a refused task scratch allocation skips publication before enqueueing anything",
           "[dynamic_filter][multi_partition][mgpu][multi_gpu]")
 {
-  if (!acc::has_peer_connected_gpus(2)) { return; }
+  if (!sirius::test::has_gpus(2)) { return; }
   acc::fixture fixture({.devices = 2});
+  if (!acc::has_pool_access(fixture.spaces)) { return; }
   auto const first  = fixture.make_batch(0, 0, 4000);
   auto const second = fixture.make_batch(1, 10'000, 4000);
   REQUIRE(fixture.begin({first, second}));
@@ -675,8 +679,9 @@ TEST_CASE("a tracked task thread publishes without releasing partial storage",
 TEST_CASE("a tracked task thread charges the merge scratch to its own reservation",
           "[dynamic_filter][multi_partition][mgpu][multi_gpu]")
 {
-  if (!acc::has_peer_connected_gpus(2)) { return; }
+  if (!sirius::test::has_gpus(2)) { return; }
   acc::fixture fixture({.devices = 2});
+  if (!acc::has_pool_access(fixture.spaces)) { return; }
   auto const first    = fixture.make_batch(1, 0, 4000);
   auto const second   = fixture.make_batch(0, 10'000, 4000);
   auto const baseline = fixture.allocated_bytes();
@@ -713,8 +718,9 @@ TEST_CASE(
   "a tracked task thread admits a merge scratch larger than its reservation as its task would",
   "[dynamic_filter][multi_partition][mgpu][multi_gpu]")
 {
-  if (!acc::has_peer_connected_gpus(2)) { return; }
+  if (!sirius::test::has_gpus(2)) { return; }
   acc::fixture fixture({.devices = 2});
+  if (!acc::has_pool_access(fixture.spaces)) { return; }
   // One million rows: one 2,000,128-byte chunk per key, so the root's double-buffered scratch
   // for its one source exceeds a 1 MiB task reservation.
   auto const first    = fixture.make_batch(1, 0, 500'000);
@@ -795,6 +801,7 @@ TEST_CASE("a contribution that does not match its partial's GPU fails the attemp
 {
   if (!sirius::test::has_gpus(2)) { return; }
   acc::fixture fixture({.devices = 2});
+  if (!acc::has_pool_access(fixture.spaces)) { return; }
   auto const first  = fixture.make_batch(0, 0, 300);
   auto const remote = fixture.make_batch(1, 900, 300);
   REQUIRE(fixture.begin({first, remote},
@@ -935,6 +942,7 @@ void exercise_pending_cuda_error(bool per_stream, bool reduction)
   CAPTURE(per_stream, reduction);
   {
     acc::fixture fixture({.devices = reduction ? 2U : 1U, .per_stream_tracking = per_stream});
+    if (!acc::has_pool_access(fixture.spaces)) { return; }
     auto const first    = fixture.make_batch(0, 0, 300);
     auto const second   = fixture.make_batch(reduction ? 1 : 0, 900, 300);
     auto const baseline = fixture.allocated_bytes();
@@ -1004,7 +1012,7 @@ TEST_CASE("a pending CUDA error propagates from contribution", "[dynamic_filter]
 TEST_CASE("a pending CUDA error propagates from reduction",
           "[dynamic_filter][multi_partition][mgpu][multi_gpu]")
 {
-  if (!acc::has_peer_connected_gpus(2)) { return; }
+  if (!sirius::test::has_gpus(2)) { return; }
   exercise_pending_cuda_error(GENERATE(false, true), true);
 }
 
@@ -1061,8 +1069,9 @@ TEST_CASE("a tracked thread never releases partial storage", "[dynamic_filter][m
 TEST_CASE("a refused partial lease on a later GPU rolls back every partial",
           "[dynamic_filter][multi_partition][mgpu][multi_gpu]")
 {
-  if (!acc::has_peer_connected_gpus(2)) { return; }
+  if (!sirius::test::has_gpus(2)) { return; }
   acc::fixture fixture({.devices = 2});
+  if (!acc::has_pool_access(fixture.spaces)) { return; }
   auto const first    = fixture.make_batch(0, 0, 300'000);
   auto const second   = fixture.make_batch(1, 900'000, 300'000);
   auto const baseline = fixture.allocated_bytes();
@@ -1085,6 +1094,7 @@ TEST_CASE("a publication root without a partial declines and settles",
 {
   if (!sirius::test::has_gpus(2)) { return; }
   acc::fixture fixture({.devices = 2});
+  if (!acc::has_pool_access(fixture.spaces)) { return; }
   auto const first    = fixture.make_batch(0, 0, 300);
   auto const second   = fixture.make_batch(0, 900, 300);
   auto const baseline = fixture.allocated_bytes();
@@ -1112,6 +1122,7 @@ TEST_CASE("a publication on another GPU's stream fails before it enqueues anythi
 {
   if (!sirius::test::has_gpus(2)) { return; }
   acc::fixture fixture({.devices = 2});
+  if (!acc::has_pool_access(fixture.spaces)) { return; }
   auto const first    = fixture.make_batch(0, 0, 300);
   auto const second   = fixture.make_batch(0, 900, 300);
   auto const baseline = fixture.allocated_bytes();

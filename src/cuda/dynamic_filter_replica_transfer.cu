@@ -24,11 +24,15 @@
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <log/logging.hpp>
+#include <memory/pool_peer_access.hpp>
 #include <op/dynamic_filter/dynamic_filter_replica_transfer.hpp>
 
 #include <algorithm>
 #include <cstddef>
+#include <exception>
 #include <stdexcept>
+#include <string_view>
 #include <vector>
 
 namespace sirius::op::detail {
@@ -84,7 +88,7 @@ replica_transfer_route enqueue_replica_copy(
 
   bool const peer_dma =
     policy == replica_transfer_policy::automatic &&
-    cucascade::memory::probe_peer_dma_works(source_device.value(), destination_device.value());
+    sirius::memory::try_grant_pool_access(source_space, destination_device.value());
   if (peer_dma) {
     rmm::cuda_set_device_raii guard{destination_device};
     CUCASCADE_CUDA_TRY(cudaMemcpyPeerAsync(destination,
@@ -219,6 +223,34 @@ replica_transfer_route enqueue_replica_copy(
   }
   staging.reset();
   return replica_transfer_route::host_staging;
+}
+
+bool replica_fanout_failures::skip_if_recoverable(std::string_view filter_name,
+                                                  int source_device,
+                                                  int destination_device)
+{
+  auto const failure = std::current_exception();
+  try {
+    std::rethrow_exception(failure);
+  } catch (cucascade::cuda_error const&) {
+  } catch (std::logic_error const&) {
+  } catch (std::exception const& e) {
+    SIRIUS_LOG_WARN(
+      "{} replica GPU {} -> GPU {} unavailable: {}. That GPU will skip this optional filter.",
+      filter_name,
+      source_device,
+      destination_device,
+      e.what());
+    return true;
+  } catch (...) {
+  }
+  _fatal = failure;
+  return false;
+}
+
+void replica_fanout_failures::rethrow_if_fatal() const
+{
+  if (_fatal) { std::rethrow_exception(_fatal); }
 }
 
 }  // namespace sirius::op::detail

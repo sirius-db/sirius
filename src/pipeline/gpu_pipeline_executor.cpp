@@ -304,14 +304,15 @@ void gpu_pipeline_executor::process_task(
             })
             .get();
       } catch (const std::exception& e) {
-        // The downgrade executor cancelled this request (its queue was drained). This task cannot
-        // get its reservation, so fail its query
-        SIRIUS_LOG_INFO("GPU Pipeline Executor: downgrade request cancelled for task {}: {}",
-                        gpu_task->get_task_id(),
-                        e.what());
+        // The downgrade request failed or was cancelled. This task cannot get its reservation, so
+        // fail its query
+        SIRIUS_LOG_INFO(
+          "GPU Pipeline Executor: downgrade request failed or cancelled for task {}: {}",
+          gpu_task->get_task_id(),
+          e.what());
         if (iteration_completion) {
           iteration_completion->report_error(
-            "GPU Pipeline Executor: downgrade request cancelled for task " +
+            "GPU Pipeline Executor: downgrade request failed or cancelled for task " +
             std::to_string(gpu_task->get_task_id()) + ": " + e.what());
         }
         return;

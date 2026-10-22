@@ -741,23 +741,6 @@ class SiriusContext : public ClientContextState {
   [[nodiscard]] const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>&
   get_downgrade_executors() const;
 
-  /// @brief Check whether cudaDeviceEnablePeerAccess succeeded for the given
-  ///        (src, dst) GPU pair at SiriusContext::initialize() time.
-  ///
-  /// Used by Sirius-side P2P-aware converter override (if registered) and by
-  /// integration tests verifying the adaptive-scan + P2P path. Returns false
-  /// if either device index is out of range, if cudaDeviceCanAccessPeer
-  /// reported no access, or if cudaDeviceEnablePeerAccess returned an error
-  /// other than cudaErrorPeerAccessAlreadyEnabled.
-  ///
-  /// @param src Source GPU device id
-  /// @param dst Destination GPU device id
-  /// @return true iff peer access was successfully enabled at init time.
-  [[nodiscard]] bool is_peer_access_enabled(int src, int dst) const noexcept
-  {
-    return peer_access_enabled_pairs_.count({src, dst}) > 0;
-  }
-
   [[nodiscard]] sirius::creator::task_creator& get_task_creator();
   [[nodiscard]] const sirius::creator::task_creator& get_task_creator() const;
 
@@ -952,18 +935,6 @@ class SiriusContext : public ClientContextState {
   // index instead of rebuilding ad-hoc device<->NUMA maps. Owns a copy of the
   // topology and holds no device resources, so teardown order is unconstrained.
   std::shared_ptr<const sirius::memory::topology_index> topology_index_;
-  // P2P: set of (src, dst) GPU pairs where cudaDeviceEnablePeerAccess
-  // succeeded in initialize(). Populated under rmm::cuda_set_device_raii, one
-  // call per pair. Consumed by is_peer_access_enabled() and any Sirius-side
-  // converter override. Holds no CUDA resources — just a set of int pairs —
-  // so destruction order relative to memory_manager_ is unconstrained.
-  struct peer_pair_hash {
-    size_t operator()(std::pair<int, int> const& p) const noexcept
-    {
-      return (static_cast<size_t>(p.first) << 32) ^ static_cast<size_t>(p.second);
-    }
-  };
-  std::unordered_set<std::pair<int, int>, peer_pair_hash> peer_access_enabled_pairs_;
   // NUMA-aware cuDF small-pinned MR. Owns one
   // small_pinned_host_memory_resource per host space (one per NUMA node)
   // and dispatches each cuDF allocate/deallocate to the slab pool whose

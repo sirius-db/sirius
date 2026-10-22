@@ -171,13 +171,10 @@ inline cudf::table_view get_cudf_table_view(cucascade::data_batch& batch)
 /**
  * @brief Create a shared_ptr<data_batch> from a cudf::table, recording the writer event.
  *
- * STREAM-LINEAGE: @p writer_stream is REQUIRED. Every data_batch carrying a
- * gpu_table_representation is born with a recorded writer event so
- * cucascade::convert_gpu_to_gpu() can call
- * cudaStreamWaitEvent(reader_stream, writer_event, 0) before peer-copying
- * source buffers. This closes the cross-mempool stream-ordered race in
- * multi-GPU runs. Record on the producing thread/device, including when the actual writer
- * is the default stream: cuCascade's constructor treats its null handle as a legacy sentinel.
+ * STREAM-LINEAGE: @p writer_stream must be ordered after every write to the table.
+ * `gpu_table_representation::make_written_on` records its event on the producing device, including
+ * when a null handle names the actual default stream. Readers can then wait before accessing the
+ * bytes on another stream or GPU.
  *
  * @param table The cudf table (will be moved from).
  * @param memory_space The memory space where the table resides.
@@ -196,9 +193,8 @@ inline std::shared_ptr<cucascade::data_batch> make_data_batch(
   ::cuda::stream_ref writer_stream,
   const telemetry::batch_telemetry_info& telemetry_info)
 {
-  auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
+  auto gpu_repr = cucascade::gpu_table_representation::make_written_on(
     std::make_unique<cudf::table>(std::move(table)), memory_space, writer_stream);
-  if (gpu_repr->get_writer_event() == nullptr) { gpu_repr->record_writer_event(writer_stream); }
   const auto batch_id = get_next_batch_id();
   return cucascade::data_batch::make(
     batch_id,
@@ -219,9 +215,8 @@ inline std::shared_ptr<cucascade::data_batch> make_data_batch(
   ::cuda::stream_ref writer_stream,
   const telemetry::batch_telemetry_info& telemetry_info)
 {
-  auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
+  auto gpu_repr = cucascade::gpu_table_representation::make_written_on(
     std::move(table), memory_space, writer_stream);
-  if (gpu_repr->get_writer_event() == nullptr) { gpu_repr->record_writer_event(writer_stream); }
   const auto batch_id = get_next_batch_id();
   return cucascade::data_batch::make(
     batch_id,

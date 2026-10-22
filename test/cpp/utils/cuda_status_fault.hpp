@@ -20,6 +20,8 @@
 
 #include <catch.hpp>
 
+#include <cstddef>
+
 namespace sirius::test {
 // One-shot CUDA readiness failure on the calling thread, armed only after test
 // setup. These wrappers are linked into the test executable, never production.
@@ -31,5 +33,16 @@ class scoped_cuda_status_fault {
   scoped_cuda_status_fault(scoped_cuda_status_fault const&)            = delete;
   scoped_cuda_status_fault& operator=(scoped_cuda_status_fault const&) = delete;
   bool consumed();
+};
+
+// One-shot cudaMemPoolGetAccess failure for one pool and accessor, from any thread. The first
+// @p skip matching queries succeed.
+class scoped_pool_access_fault {
+ public:
+  scoped_pool_access_fault(cudaMemPool_t pool, int accessor, std::size_t skip, cudaError_t status);
+  ~scoped_pool_access_fault();
+  scoped_pool_access_fault(scoped_pool_access_fault const&)            = delete;
+  scoped_pool_access_fault& operator=(scoped_pool_access_fault const&) = delete;
+  bool consumed() const;
 };
 }  // namespace sirius::test

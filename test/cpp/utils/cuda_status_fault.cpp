@@ -14,9 +14,12 @@
  * limitations under the License.
  */
 
-// Linked only into sirius_cuda_fault_test, together with --wrap for these two calls.
+// Linked only into sirius_cuda_fault_test, together with --wrap for these calls.
 #include "utils/cuda_status_fault.hpp"
 
+#include <cstddef>
+#include <mutex>
+#include <optional>
 #include <utility>
 
 namespace {
@@ -29,6 +32,16 @@ cudaError_t take_status(int operation)
   armed_operation = 0;
   return armed_status;
 }
+
+struct pool_access_fault {
+  cudaMemPool_t pool;
+  int accessor;
+  std::size_t skip;
+  cudaError_t status;
+};
+std::mutex pool_access_mutex;
+std::optional<pool_access_fault> armed_pool_access;
+bool pool_access_consumed = false;
 }  // namespace
 
 namespace sirius::test {
@@ -40,10 +53,34 @@ scoped_cuda_status_fault::scoped_cuda_status_fault(operation op, cudaError_t sta
 }
 scoped_cuda_status_fault::~scoped_cuda_status_fault() { armed_operation = 0; }
 bool scoped_cuda_status_fault::consumed() { return armed_operation == 0; }
+
+scoped_pool_access_fault::scoped_pool_access_fault(cudaMemPool_t pool,
+                                                   int accessor,
+                                                   std::size_t skip,
+                                                   cudaError_t status)
+{
+  std::scoped_lock lock(pool_access_mutex);
+  REQUIRE_FALSE(armed_pool_access.has_value());
+  armed_pool_access    = pool_access_fault{pool, accessor, skip, status};
+  pool_access_consumed = false;
+}
+scoped_pool_access_fault::~scoped_pool_access_fault()
+{
+  std::scoped_lock lock(pool_access_mutex);
+  armed_pool_access.reset();
+}
+bool scoped_pool_access_fault::consumed() const
+{
+  std::scoped_lock lock(pool_access_mutex);
+  return pool_access_consumed;
+}
 }  // namespace sirius::test
 
 extern "C" cudaError_t __real_cudaStreamWaitEvent(cudaStream_t, cudaEvent_t, unsigned int);
 extern "C" cudaError_t __real_cudaDeviceSynchronize();
+extern "C" cudaError_t __real_cudaMemPoolGetAccess(cudaMemAccessFlags*,
+                                                   cudaMemPool_t,
+                                                   cudaMemLocation*);
 
 extern "C" cudaError_t __wrap_cudaStreamWaitEvent(cudaStream_t stream,
                                                   cudaEvent_t event,
@@ -61,4 +98,24 @@ extern "C" cudaError_t __wrap_cudaDeviceSynchronize()
       status != cudaSuccess)
     return status;
   return __real_cudaDeviceSynchronize();
+}
+
+extern "C" cudaError_t __wrap_cudaMemPoolGetAccess(cudaMemAccessFlags* flags,
+                                                   cudaMemPool_t pool,
+                                                   cudaMemLocation* location)
+{
+  {
+    std::scoped_lock lock(pool_access_mutex);
+    auto& fault = armed_pool_access;
+    if (fault && pool == fault->pool && location && location->id == fault->accessor) {
+      if (fault->skip == 0) {
+        auto const status = fault->status;
+        fault.reset();
+        pool_access_consumed = true;
+        return status;
+      }
+      --fault->skip;
+    }
+  }
+  return __real_cudaMemPoolGetAccess(flags, pool, location);
 }

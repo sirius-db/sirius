@@ -471,12 +471,12 @@ std::unique_ptr<cudf::column> transfer_column(std::unique_ptr<cudf::column> colu
 /// A batch pinned on another GPU: gather its survivors where it lives, then
 /// bring only those rows over.
 ///
-/// Two transfers cross, both the size of the SELECTION rather than the batch:
-/// the batch-local indices go to the owner, the gathered rows come back. Both
-/// are cudaMemcpyPeerAsync, so a pair with working peer DMA takes it and a pair
-/// without is staged through host by the driver. The owner's work runs on a
-/// stream of its own space, ordered by events behind the consumer's selection
-/// build and ahead of the consumer's copy.
+/// Two transfers cross, both the size of the SELECTION rather than the batch: the batch-local
+/// indices go to the owner, the gathered rows come back. Both use cudaMemcpyPeerAsync over managed
+/// pools configured during manager initialization; this does not establish the physical driver
+/// route or promise staging when a grant is unavailable. The owner's work runs on a stream of its
+/// own space, ordered by events behind the consumer's selection build and ahead of the consumer's
+/// copy.
 std::unique_ptr<cudf::column> materialize_remote_batch(batch_source const& source,
                                                        batch_selection const& selection,
                                                        int consumer_device,

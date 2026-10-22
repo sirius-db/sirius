@@ -277,6 +277,7 @@ void sirius_dynamic_in_list_filter::replicate_to_devices(
     pending;
   pending.reserve(spaces.size());
   _set->replicas.reserve(_set->replicas.size() + spaces.size());
+  detail::replica_fanout_failures failures;
   for (auto const& target : spaces) {
     auto const& target_space = target.get_gpu_space();
     auto const device_id     = target_space.get_device_id();
@@ -332,14 +333,13 @@ void sirius_dynamic_in_list_filter::replicate_to_devices(
         continue;
       }
       pending.emplace_back(std::move(replica), std::move(stream_lease));
-    } catch (std::exception const& e) {
-      SIRIUS_LOG_WARN(
-        "[sirius_dynamic_in_list_filter] replica GPU {} -> GPU {} unavailable: {}. "
-        "That GPU will skip this optional filter.",
-        _set->source_device,
-        device_id,
-        e.what());
-      continue;
+    } catch (...) {
+      if (failures.skip_if_recoverable(
+            "[sirius_dynamic_in_list_filter]", _set->source_device, device_id)) {
+        continue;
+      }
+      // Earlier destinations still own asynchronous copies; drain them before propagating.
+      break;
     }
     SIRIUS_LOG_DEBUG("[sirius_dynamic_in_list_filter] queued {}-byte replica GPU {} -> GPU {}.",
                      bytes,
@@ -363,6 +363,7 @@ void sirius_dynamic_in_list_filter::replicate_to_devices(
         e.what());
     }
   }
+  failures.rethrow_if_fatal();
 }
 
 bool sirius_dynamic_in_list_filter::is_available_on_device(int device_id) const noexcept

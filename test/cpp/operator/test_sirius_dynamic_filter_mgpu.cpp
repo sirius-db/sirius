@@ -19,6 +19,7 @@
 // GPUs. Before replica support, the corresponding cross-device dereference is the
 // cudaErrorIllegalAddress reported by TPC-H Q2.
 
+#include "dynamic_filter_replica_test_utils.hpp"
 #include "op/dynamic_filter/dynamic_filter_replica_transfer.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "operator_test_utils.hpp"
@@ -36,23 +37,30 @@
 #include <rmm/aligned.hpp>
 #include <rmm/cuda_device.hpp>
 #include <rmm/device_buffer.hpp>
+#include <rmm/error.hpp>
 
 #include <cuda/stream>
 #include <cuda_runtime.h>
 
 #include <catch.hpp>
+#include <cucascade/error.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
+#include <memory/pool_peer_access.hpp>
 
-#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
 namespace {
+
+using sirius::test::replica::get_replica_spaces;
+using sirius::test::replica::make_values;
+using sirius::test::replica::mask_to_host;
 
 constexpr int kBuildDevice = 0;
 constexpr int kProbeDevice = 1;
@@ -62,42 +70,6 @@ bool require_two_gpus() { return sirius::test::has_gpus(2); }
 
 bool require_three_gpus() { return sirius::test::has_gpus(3); }
 
-template <typename T>
-std::unique_ptr<cudf::column> make_values(std::vector<T> const& values,
-                                          cudf::data_type type,
-                                          ::cuda::stream_ref stream)
-{
-  auto col       = cudf::make_numeric_column(type,
-                                       static_cast<cudf::size_type>(values.size()),
-                                       cudf::mask_state::UNALLOCATED,
-                                       stream,
-                                       cudf::get_current_device_resource_ref());
-  auto const err = cudaMemcpyAsync(col->mutable_view().data<T>(),
-                                   values.data(),
-                                   values.size() * sizeof(T),
-                                   cudaMemcpyHostToDevice,
-                                   stream.get());
-  REQUIRE(err == cudaSuccess);
-  // Callers commonly pass a temporary initializer vector. Complete the pageable-host transfer
-  // before that vector is destroyed; these focused tests do not benchmark ingestion.
-  stream.sync();
-  return col;
-}
-
-std::vector<std::uint8_t> mask_to_host(cudf::column_view const& mask, ::cuda::stream_ref stream)
-{
-  REQUIRE(mask.type().id() == cudf::type_id::BOOL8);
-  std::vector<std::uint8_t> host(static_cast<std::size_t>(mask.size()));
-  auto const err = cudaMemcpyAsync(host.data(),
-                                   mask.data<bool>(),
-                                   host.size() * sizeof(bool),
-                                   cudaMemcpyDeviceToHost,
-                                   stream.get());
-  REQUIRE(err == cudaSuccess);
-  stream.sync();
-  return host;
-}
-
 template <typename Filter>
 void replicate_to_both_devices(
   Filter& filter, std::span<sirius::op::dynamic_filter_replica_space const> replica_spaces)
@@ -105,37 +77,6 @@ void replicate_to_both_devices(
   filter.replicate_to_devices(replica_spaces);
   REQUIRE(filter.is_available_on_device(kBuildDevice));
   REQUIRE(filter.is_available_on_device(kProbeDevice));
-}
-
-template <typename MemoryManager>
-std::vector<sirius::op::dynamic_filter_replica_space> get_replica_spaces(
-  MemoryManager& memory_manager, std::size_t expected_device_count = kReplicaDevices.size())
-{
-  auto const gpu_spaces  = memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
-  auto const host_spaces = memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
-  REQUIRE(gpu_spaces.size() == expected_device_count);
-  REQUIRE_FALSE(host_spaces.empty());
-
-  std::vector<sirius::op::dynamic_filter_replica_space> result;
-  result.reserve(gpu_spaces.size());
-  for (auto const* gpu_space_view : gpu_spaces) {
-    auto* gpu_space = memory_manager.get_memory_space(cucascade::memory::Tier::GPU,
-                                                      gpu_space_view->get_device_id());
-    REQUIRE(gpu_space != nullptr);
-    auto const local_host =
-      std::find_if(host_spaces.begin(), host_spaces.end(), [gpu_space](auto const* host_space) {
-        return host_space->get_device_id() == gpu_space->get_device_id();
-      });
-    auto const* host_space = local_host == host_spaces.end() ? host_spaces.front() : *local_host;
-    result.emplace_back(*gpu_space, *host_space);
-  }
-  std::sort(result.begin(), result.end(), [](auto const& lhs, auto const& rhs) {
-    return lhs.get_gpu_space().get_device_id() < rhs.get_gpu_space().get_device_id();
-  });
-  for (std::size_t i = 0; i < result.size(); ++i) {
-    REQUIRE(result[i].get_gpu_space().get_device_id() == static_cast<int>(i));
-  }
-  return result;
 }
 
 }  // namespace
@@ -276,10 +217,10 @@ TEST_CASE("IN-list peer copies fan out to three GPUs before publication",
   constexpr std::size_t device_count = 3;
   auto memory_manager = sirius::test::operator_utils::initialize_memory_manager(device_count);
   auto replica_spaces = get_replica_spaces(*memory_manager, device_count);
-  if (!cucascade::memory::probe_peer_dma_works(0, 1) ||
-      !cucascade::memory::probe_peer_dma_works(0, 2)) {
+  if (!sirius::memory::try_grant_pool_access(replica_spaces.front().get_gpu_space(), 1) ||
+      !sirius::memory::try_grant_pool_access(replica_spaces.front().get_gpu_space(), 2)) {
     WARN(
-      "dynamic-filter overlap test requires direct peer DMA from GPU 0 to GPUs 1 and 2; "
+      "dynamic-filter overlap test requires source-pool access from GPUs 1 and 2; "
       "skipping");
     return;
   }
@@ -552,4 +493,47 @@ TEST_CASE("small IN-list replica built on GPU 0 computes an exact mask on GPU 1"
   REQUIRE(target_space.get_total_reserved_memory() == target_reserved_before);
   REQUIRE(target_space.get_active_reservation_count() == target_active_before);
   REQUIRE(target_mr->get_total_allocated_bytes() == target_allocated_before);
+}
+
+namespace {
+
+template <class Error>
+bool skips_replica_failure(sirius::op::detail::replica_fanout_failures& failures, Error error)
+{
+  try {
+    throw error;
+  } catch (...) {
+    return failures.skip_if_recoverable("[test]", 0, 1);
+  }
+}
+
+template <class Error>
+void require_fatal_replica_failure(Error error)
+{
+  sirius::op::detail::replica_fanout_failures failures;
+  REQUIRE_FALSE(skips_replica_failure(failures, error));
+  REQUIRE_THROWS_AS(failures.rethrow_if_fatal(), Error);
+}
+
+}  // namespace
+
+TEST_CASE("replica fan-out skips recoverable failures and keeps fatal ones",
+          "[dynamic_filter][replica_failure]")
+{
+  SECTION("unavailable memory or staging skips only that GPU")
+  {
+    sirius::op::detail::replica_fanout_failures failures;
+    REQUIRE(skips_replica_failure(failures, rmm::out_of_memory{"destination reservation"}));
+    REQUIRE(skips_replica_failure(failures, std::runtime_error{"host staging unavailable"}));
+    REQUIRE_NOTHROW(failures.rethrow_if_fatal());
+  }
+  SECTION("CUDA errors propagate")
+  {
+    require_fatal_replica_failure(cucascade::cuda_error{"grant"});
+  }
+  SECTION("programming and configuration errors propagate")
+  {
+    require_fatal_replica_failure(std::invalid_argument{"device ID outside the visible set"});
+    require_fatal_replica_failure(std::logic_error{"unrecognized pool access status"});
+  }
 }

@@ -21,6 +21,8 @@
 #include <cuda/stream>
 
 #include <cstddef>
+#include <exception>
+#include <string_view>
 
 namespace cucascade::memory {
 class memory_space;
@@ -28,6 +30,9 @@ class memory_space;
 
 namespace sirius::op::detail {
 
+/**
+ * @brief Selected copy API; peer_dma means cudaMemcpyPeerAsync, not a measured physical route
+ */
 enum class replica_transfer_route { none, local, peer_dma, host_staging };
 
 enum class replica_transfer_policy { automatic, force_host_staging };
@@ -53,5 +58,38 @@ replica_transfer_route enqueue_replica_copy(
   ::cuda::stream_ref destination_stream,
   cucascade::memory::memory_space const& host_staging_space,
   replica_transfer_policy policy = replica_transfer_policy::automatic);
+
+/**
+ * @brief Sorts the failures raised while a filter queues its replica copies to several GPUs
+ *
+ * Replicas are optional, so a recoverable failure, such as an unavailable reservation or
+ * allocation, only makes its destination GPU skip the filter. A CUDA error
+ * (`cucascade::cuda_error`), a programming or configuration error (`std::logic_error`, including
+ * `std::invalid_argument`), or a non-standard exception is fatal: the caller stops queueing, drains
+ * the copies it already queued, and then calls `rethrow_if_fatal`.
+ */
+class replica_fanout_failures final {
+ public:
+  /**
+   * @brief Classifies the exception currently being handled; call only from a catch handler
+   *
+   * @param filter_name Log prefix naming the filter type
+   * @param source_device GPU holding the source replica
+   * @param destination_device GPU whose copy failed
+   * @return True when the failure was recoverable and has been logged, so the caller continues with
+   * the next GPU; false when it is fatal and the caller must stop queueing
+   */
+  [[nodiscard]] bool skip_if_recoverable(std::string_view filter_name,
+                                         int source_device,
+                                         int destination_device);
+
+  /**
+   * @brief Rethrows the fatal failure, if any
+   */
+  void rethrow_if_fatal() const;
+
+ private:
+  std::exception_ptr _fatal;
+};
 
 }  // namespace sirius::op::detail

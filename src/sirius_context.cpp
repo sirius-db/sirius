@@ -973,76 +973,6 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
   topology_index_ = std::make_shared<const sirius::memory::topology_index>(
     config_.get_hw_topology(), *memory_manager_);
 
-  // Enable P2P peer access for every configured GPU pair.
-  // cucascade::convert_gpu_to_gpu calls cudaMemcpyPeerAsync on every GPU->GPU
-  // conversion. For that call to bypass host staging, peer access must be
-  // enabled ONCE at init for every (src, dst) pair the host supports.
-  // Non-fatal failure mode: SIRIUS_LOG_ERROR and continue — host-staged fallback
-  // in cucascade's converter is a correct alternate path.
-  {
-    if (active_gpu_ids.size() >= 2) {
-      // cucascade's first peer-DMA query probes every visible GPU pair and caches the results. Run
-      // it here, before any pair is enabled below and even when no pair supports peer access, so
-      // later queries (dynamic-filter accumulation admission runs under a task-creation lock) only
-      // read the cache.
-      (void)cucascade::memory::probe_peer_dma_works(active_gpu_ids[0], active_gpu_ids[1]);
-      peer_access_enabled_pairs_.reserve(active_gpu_ids.size() * (active_gpu_ids.size() - 1));
-      for (int source_device : active_gpu_ids) {
-        rmm::cuda_set_device_raii guard_i{rmm::cuda_device_id{source_device}};
-        for (int target_device : active_gpu_ids) {
-          if (source_device == target_device) continue;
-          int can_access = 0;
-          cudaError_t probe_err =
-            cudaDeviceCanAccessPeer(&can_access, source_device, target_device);
-          if (probe_err != cudaSuccess) {
-            SIRIUS_LOG_ERROR("SiriusContext: cudaDeviceCanAccessPeer({},{}) failed: {}",
-                             source_device,
-                             target_device,
-                             cudaGetErrorString(probe_err));
-            continue;
-          }
-          if (can_access == 0) {
-            SIRIUS_LOG_INFO("SiriusContext: no P2P access {} -> {} -- falling back to host staging",
-                            source_device,
-                            target_device);
-            continue;
-          }
-          // cucascade probes whether peer copies actually move data and disables peer access
-          // for the pairs where they do not. Enabling it again would let peer copies outside
-          // cucascade's converters silently skip the transfer.
-          if (!cucascade::memory::probe_peer_dma_works(source_device, target_device)) {
-            SIRIUS_LOG_INFO(
-              "SiriusContext: peer DMA {} -> {} does not work on this host -- falling back to "
-              "host staging",
-              source_device,
-              target_device);
-            continue;
-          }
-          cudaError_t enable_err = cudaDeviceEnablePeerAccess(target_device, 0);
-          // Always consume sticky error state — cudaErrorPeerAccessAlreadyEnabled
-          // (and any other non-fatal condition) persists in the runtime until
-          // cudaGetLastError() is called, which would make the NEXT CUDA API
-          // call fail spuriously in unrelated code (e.g., thrust::exclusive_scan).
-          (void)cudaGetLastError();
-          if (enable_err == cudaSuccess || enable_err == cudaErrorPeerAccessAlreadyEnabled) {
-            peer_access_enabled_pairs_.emplace(source_device, target_device);
-            SIRIUS_LOG_INFO("SiriusContext: P2P enabled {} -> {}", source_device, target_device);
-          } else {
-            SIRIUS_LOG_ERROR("SiriusContext: cudaDeviceEnablePeerAccess({}) from ctx {} failed: {}",
-                             target_device,
-                             source_device,
-                             cudaGetErrorString(enable_err));
-          }
-        }
-      }
-    } else {
-      SIRIUS_LOG_INFO(
-        "SiriusContext: skipping peer-access enable loop (num_gpus={}); "
-        "configured GPU set has no pairs to enable",
-        active_gpu_ids.size());
-    }
-  }
-
   // cucascade topology exposes hw-decompression availability as a runtime attribute populated
   // only when discovery is asked to touch the CUDA driver. Context initialization requests
   // with_runtime_attributes=true, so an unpopulated optional here is a real "not supported".
@@ -1219,8 +1149,6 @@ void SiriusContext::terminate()
   downgrade_executors_.clear();
   task_scheduler_.reset();
   telemetry_context_.reset();
-
-  peer_access_enabled_pairs_.clear();
 
   if (memory_manager_) {
     auto gpu_spaces = memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
