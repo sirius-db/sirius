@@ -30,7 +30,7 @@ namespace {
 // Forward table: DuckDB function name -> Sirius function id.
 // Symbolic SQL operators and their Substrait spellings resolve to the same ids.
 // Linear scan; called once per BoundFunctionExpression at executor entry.
-constexpr std::array<std::pair<std::string_view, function_id>, 40> kForwardTable = {{
+constexpr std::array<std::pair<std::string_view, function_id>, 41> kForwardTable = {{
   {"+", function_id::add},
   {"add", function_id::add},
   {"-", function_id::sub},
@@ -71,24 +71,25 @@ constexpr std::array<std::pair<std::string_view, function_id>, 40> kForwardTable
   {"lower", function_id::lower},
   {"round", function_id::round},
   {"abs", function_id::abs},
+  {"sirius_decimal_divide", function_id::decimal_divide},
 }};
 
 // Reverse table: Sirius function id -> canonical DuckDB function name.
 // Indexed directly by enum value; never searched.
-constexpr std::array<std::string_view, 34> kReverseTable = {
+constexpr std::array<std::string_view, 35> kReverseTable = {
   "+",          "-",         "*",           "/",           "//",
   "%",          "substring", "~~",          "!~~",         "contains",
   "prefix",     "suffix",    "strlen",      "length",      "regexp_replace",
   "concat",     "||",        "year",        "month",       "day",
   "hour",       "minute",    "second",      "millisecond", "microsecond",
   "date_trunc", "row",       "struct_pack", "error",       "constant_or_null",
-  "upper",      "lower",     "round",       "abs"};
+  "upper",      "lower",     "round",       "abs",         "sirius_decimal_divide"};
 
-static_assert(static_cast<std::size_t>(function_id::abs) + 1 == 34,
-              "function_id::abs must be the last entry; cardinality locked at 34.");
-static_assert(kReverseTable.size() == 34,
+static_assert(static_cast<std::size_t>(function_id::decimal_divide) + 1 == 35,
+              "function_id::decimal_divide must be the last entry; cardinality locked at 35.");
+static_assert(kReverseTable.size() == 35,
               "kReverseTable must have one slot per function_id value.");
-static_assert(kForwardTable.size() == 40,
+static_assert(kForwardTable.size() == 41,
               "kForwardTable includes SQL and Substrait aliases for supported function ids.");
 
 // Walks both tables to ensure every enum value has exactly one canonical

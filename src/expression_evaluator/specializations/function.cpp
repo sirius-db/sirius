@@ -22,6 +22,7 @@
 #include <expression/substring_slice.hpp>
 #include <expression/value.hpp>
 #include <expression_evaluator/ast_supported_types.hpp>
+#include <expression_evaluator/decimal_divide.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <expression_evaluator/like_multiliteral.hpp>
 #include <expression_evaluator/regex/cudf_regex_pattern.hpp>
@@ -200,6 +201,28 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
   }
   if (resolved_id == function_id::mod) {
     return execute_numeric_binary_func(cudf::binary_operator::MOD);
+  }
+
+  //----------Exact Decimal Division----------//
+  // cudf::binary_operation DIV on fixed-point truncates; sirius_decimal_divide rounds half away
+  // from zero and makes a zero divisor NULL.
+  if (resolved_id == function_id::decimal_divide) {
+    // The third argument is the constant result scale, which the return type also carries.
+    D_ASSERT(args.size() == 3);
+    auto const num_rows  = _input_table.num_rows();
+    auto dividend        = evaluate(*args[0], evaluation_mode::MATERIALIZE);
+    auto divisor         = evaluate(*args[1], evaluation_mode::MATERIALIZE);
+    auto const as_column = [&](evaluate_result& operand) {
+      if (operand.is_scalar()) {
+        operand = evaluate_result(
+          cudf::make_column_from_scalar(operand.get_scalar(), num_rows, _stream, _mr));
+      }
+      return operand.get_column_view();
+    };
+    auto const dividend_view = as_column(dividend);
+    auto const divisor_view  = as_column(divisor);
+    return evaluate_result(
+      decimal_divide(dividend_view, divisor_view, -output_type.scale(), _stream, _mr));
   }
 
   //----------Substring Function----------//
