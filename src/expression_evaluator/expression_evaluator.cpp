@@ -20,6 +20,7 @@
 #include <expression/ast/aggregate.hpp>  // sirius::ast::aggregate
 #include <expression/ast/node.hpp>       // sirius::ast::node alternatives
 #include <expression_evaluator/expression_evaluator.hpp>
+#include <expression_evaluator/nvrtc/nvrtc_project_sink.hpp>
 #include <helper/numeric_narrowing.hpp>
 #include <sirius/exception.hpp>
 
@@ -282,6 +283,25 @@ std::unique_ptr<cudf::table> expression_evaluator::evaluate(cudf::table_view inp
   // Get the table_view from the input_batch
   _input_table = std::move(input);
 
+  for (auto const* ast_expr : _ast_expressions) {
+    if (!ast_expr) {
+      // This is a Sirius bug, not a user error: a null slot means from_duckdb
+      // declined an expression as unsupported, but the planner still routed it
+      // to the GPU executor.  This hard-fails the query instead of falling back to CPU.
+      // TODO fix to ensure the planner never builds a GPU projection containing unsupported
+      // expressions.
+      throw internal_exception(
+        "[expression_evaluator] null expression in select list — "
+        "from_duckdb returned nullptr for an unsupported expression; "
+        "cannot evaluate on GPU");
+    }
+  }
+
+  if (_policy.strategy == expression_evaluator_strategy::NVRTC_JIT &&
+      nvrtc::can_compile_project_sink(_ast_expressions, _input_table)) {
+    return nvrtc::evaluate_project_sink(_ast_expressions, _input_table, _stream, _mr);
+  }
+
   // Per-result column post-processing. The node's kind and result type are read
   // natively from the Sirius AST (no DuckDB round-trip).
   auto post_process = [this](sirius::ast::node const& expr, evaluate_result result) {
@@ -330,17 +350,6 @@ std::unique_ptr<cudf::table> expression_evaluator::evaluate(cudf::table_view inp
   // Iterate _ast_expressions and route through the std::visit dispatcher, then
   // post-process each result using the node's native kind + return type.
   for (auto const* ast_expr : _ast_expressions) {
-    if (!ast_expr) {
-      // This is a Sirius bug, not a user error: a null slot means from_duckdb
-      // declined an expression as unsupported, but the planner still routed it
-      // to the GPU executor.  This hard-fails the query instead of falling back to CPU.
-      // TODO fix to ensure the planner never builds a GPU projection containing unsupported
-      // expressions.
-      throw internal_exception(
-        "[expression_evaluator] null expression in select list — "
-        "from_duckdb returned nullptr for an unsupported expression; "
-        "cannot evaluate on GPU");
-    }
     auto result = evaluate(*ast_expr, evaluation_mode::MATERIALIZE);
     post_process(*ast_expr, std::move(result));
   }

@@ -4,6 +4,7 @@ target_sources(
           ast_op_counter.cpp
           expression_evaluator.cpp
           gpu_expression_translator.cpp
+          nvrtc/nvrtc_project_sink.cpp
           regex/regex_playground.cpp
           specializations/between.cpp
           specializations/case.cpp

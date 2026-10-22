@@ -21,6 +21,8 @@
 #include <utils/utils.hpp>
 
 // sirius
+#include "codegen/jit/kernel_cache.hpp"
+
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <data/data_batch_utils.hpp>
@@ -3381,4 +3383,453 @@ TEST_CASE("subsecond extraction preserves minimum finite ticks",
                                                     : function == sirius::function_id::microsecond
                                                       ? 5224192
                                                       : 5224));
+}
+
+TEST_CASE("expression_evaluator_strategy - nvrtc_jit round-trip",
+          "[expression_evaluator][nvrtc_jit]")
+{
+  sirius::expression_evaluator_strategy parsed{};
+  REQUIRE(sirius::string_to_strategy("nvrtc_jit", parsed));
+  CHECK(parsed == sirius::expression_evaluator_strategy::NVRTC_JIT);
+  CHECK(sirius::strategy_to_string(sirius::expression_evaluator_strategy::NVRTC_JIT) ==
+        "nvrtc_jit");
+}
+
+TEST_CASE("nvrtc_jit - Carrier Restoration inline in registers without temporary cast columns",
+          "[expression_evaluator][nvrtc_jit][compressed_materialization]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = get_resource_ref(*space);
+
+  // Column 0: INT16 physical carrier with BIGINT logical type
+  std::vector<int16_t> int16_vals = {-32000, -1, 0, 42, 32000};
+  auto col0                       = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT16}, 5, cudf::mask_state::UNALLOCATED, stream, mr);
+  REQUIRE(cudaMemcpy(col0->mutable_view().data<int16_t>(),
+                     int16_vals.data(),
+                     int16_vals.size() * sizeof(int16_t),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+
+  // Column 1: DECIMAL32(scale=-2) physical carrier with DECIMAL(15, 2) (DECIMAL64) logical type
+  std::vector<int32_t> dec32_vals = {-99999, 0, 12345, 500, -1};
+  auto col1                       = cudf::make_fixed_point_column(
+    cudf::data_type{cudf::type_id::DECIMAL32, -2}, 5, cudf::mask_state::ALL_VALID, stream, mr);
+  REQUIRE(cudaMemcpy(col1->mutable_view().data<int32_t>(),
+                     dec32_vals.data(),
+                     dec32_vals.size() * sizeof(int32_t),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  cudf::set_null_mask(col1->mutable_view().null_mask(), 2, 3, false, stream);
+  col1->set_null_count(1);
+
+  // Column 2: INT16 physical carrier with DATE (TIMESTAMP_DAYS) logical type
+  std::vector<int16_t> date_vals = {-1000, 0, 18000, 19500, 20000};
+  auto col2                      = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT16}, 5, cudf::mask_state::UNALLOCATED, stream, mr);
+  REQUIRE(cudaMemcpy(col2->mutable_view().data<int16_t>(),
+                     date_vals.data(),
+                     date_vals.size() * sizeof(int16_t),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+
+  cudf::table_view tv{{col0->view(), col1->view(), col2->view()}};
+
+  auto const bigint_type = logical_type::make(type_id::BIGINT);
+  auto const dec64_type  = logical_type::make_decimal(15, 2);
+  auto const date_type   = logical_type::make(type_id::DATE);
+
+  duckdb::vector<std::unique_ptr<ast_node>> exprs;
+  exprs.push_back(make_ref_typed(0, bigint_type));
+  exprs.push_back(make_ref_typed(1, dec64_type));
+  exprs.push_back(make_ref_typed(2, date_type));
+  // Reference column 0 a second time to verify deduplication in TranslationContext
+  exprs.push_back(make_ref_typed(0, bigint_type));
+
+  exp_executor mat_exec(
+    exprs, mr, stream, sirius::expression_query_policy{exp_strategy_enum::MATERIALIZE});
+  auto mat_out = mat_exec.evaluate(tv);
+  REQUIRE(mat_out != nullptr);
+  CHECK(mat_exec.restored_reference_cast_count_for_testing() == 3);
+
+  exp_executor jit_exec(
+    exprs, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+  auto jit_out = jit_exec.evaluate(tv);
+  REQUIRE(jit_out != nullptr);
+  CHECK(jit_exec.restored_reference_cast_count_for_testing() == 0);
+
+  REQUIRE(jit_out->num_columns() == 4);
+  CHECK(jit_out->view().column(0).type() == cudf::data_type{cudf::type_id::INT64});
+  CHECK(jit_out->view().column(1).type() == cudf::data_type{cudf::type_id::DECIMAL64, -2});
+  CHECK(jit_out->view().column(2).type() == cudf::data_type{cudf::type_id::TIMESTAMP_DAYS});
+  CHECK(jit_out->view().column(3).type() == cudf::data_type{cudf::type_id::INT64});
+
+  CHECK(copy_column_to_host<int64_t>(jit_out->view().column(0)) ==
+        copy_column_to_host<int64_t>(mat_out->view().column(0)));
+  CHECK(copy_column_to_host<int64_t>(jit_out->view().column(3)) ==
+        copy_column_to_host<int64_t>(mat_out->view().column(3)));
+  CHECK(jit_out->view().column(0).null_count() == 0);
+  CHECK(!jit_out->view().column(0).nullable());
+
+  CHECK(jit_out->view().column(1).null_count() == 1);
+  CHECK(copy_valids_to_host(jit_out->view().column(1)) ==
+        copy_valids_to_host(mat_out->view().column(1)));
+  auto const jit_dec = copy_column_to_host<int64_t>(jit_out->view().column(1));
+  auto const mat_dec = copy_column_to_host<int64_t>(mat_out->view().column(1));
+  auto const valids  = copy_valids_to_host(jit_out->view().column(1));
+  for (std::size_t i = 0; i < valids.size(); ++i) {
+    if (valids[i]) { CHECK(jit_dec[i] == mat_dec[i]); }
+  }
+
+  CHECK(copy_column_to_host<int32_t>(jit_out->view().column(2)) ==
+        copy_column_to_host<int32_t>(mat_out->view().column(2)));
+}
+
+TEST_CASE("nvrtc_jit - ProjectSink evaluates references and constants across all fixed-width types",
+          "[expression_evaluator][nvrtc_jit]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = get_resource_ref(*space);
+
+  constexpr cudf::size_type n_rows = 73;  // non-multiple of 32 (3 warps: 32, 32, 9)
+
+  auto make_col = [&]<typename Rep>(cudf::data_type dt,
+                                    Rep base_val,
+                                    bool with_nulls) -> std::unique_ptr<cudf::column> {
+    std::vector<Rep> vals(n_rows);
+    for (cudf::size_type i = 0; i < n_rows; ++i) {
+      if constexpr (std::is_same_v<Rep, bool>) {
+        vals[i] = ((i % 3) != 0);
+      } else {
+        vals[i] = static_cast<Rep>(base_val + static_cast<Rep>(i));
+      }
+    }
+    rmm::device_buffer mask{0, stream, mr};
+    cudf::size_type null_count = 0;
+    if (with_nulls) {
+      mask         = cudf::create_null_mask(n_rows, cudf::mask_state::ALL_VALID, stream, mr);
+      auto* mask_p = static_cast<cudf::bitmask_type*>(mask.data());
+      for (cudf::size_type i = 0; i < n_rows; ++i) {
+        if ((i % 5) == 2 || i == 0 || i == n_rows - 1) {
+          cudf::set_null_mask(mask_p, i, i + 1, false, stream);
+          ++null_count;
+        }
+      }
+    }
+    std::unique_ptr<cudf::column> col;
+    if (cudf::is_numeric(dt) || cudf::is_boolean(dt)) {
+      if (with_nulls) {
+        col = cudf::make_numeric_column(dt, n_rows, std::move(mask), null_count, stream, mr);
+      } else {
+        col = cudf::make_numeric_column(dt, n_rows, cudf::mask_state::UNALLOCATED, stream, mr);
+      }
+    } else if (cudf::is_timestamp(dt)) {
+      if (with_nulls) {
+        col = cudf::make_timestamp_column(dt, n_rows, std::move(mask), null_count, stream, mr);
+      } else {
+        col = cudf::make_timestamp_column(dt, n_rows, cudf::mask_state::UNALLOCATED, stream, mr);
+      }
+    } else {
+      if (with_nulls) {
+        col = cudf::make_fixed_point_column(dt, n_rows, std::move(mask), null_count, stream, mr);
+      } else {
+        col = cudf::make_fixed_point_column(dt, n_rows, cudf::mask_state::UNALLOCATED, stream, mr);
+      }
+    }
+    if constexpr (std::is_same_v<Rep, bool>) {
+      std::vector<std::uint8_t> bytes(n_rows);
+      for (cudf::size_type i = 0; i < n_rows; ++i) {
+        bytes[i] = vals[i] ? 1U : 0U;
+      }
+      REQUIRE(cudaMemcpy(col->mutable_view().data<bool>(),
+                         bytes.data(),
+                         n_rows * sizeof(std::uint8_t),
+                         cudaMemcpyHostToDevice) == cudaSuccess);
+    } else {
+      REQUIRE(cudaMemcpy(col->mutable_view().data<Rep>(),
+                         vals.data(),
+                         n_rows * sizeof(Rep),
+                         cudaMemcpyHostToDevice) == cudaSuccess);
+    }
+    return col;
+  };
+
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(
+    make_col.template operator()<std::int8_t>(cudf::data_type{cudf::type_id::INT8}, -20, true));
+  cols.push_back(make_col.template operator()<std::int16_t>(
+    cudf::data_type{cudf::type_id::INT16}, -1000, false));
+  cols.push_back(make_col.template operator()<std::int32_t>(
+    cudf::data_type{cudf::type_id::INT32}, -50000, true));
+  cols.push_back(make_col.template operator()<std::int64_t>(
+    cudf::data_type{cudf::type_id::INT64}, -1000000LL, false));
+  cols.push_back(
+    make_col.template operator()<std::uint8_t>(cudf::data_type{cudf::type_id::UINT8}, 10U, false));
+  cols.push_back(make_col.template operator()<std::uint16_t>(
+    cudf::data_type{cudf::type_id::UINT16}, 500U, true));
+  cols.push_back(make_col.template operator()<std::uint32_t>(
+    cudf::data_type{cudf::type_id::UINT32}, 10000U, false));
+  cols.push_back(make_col.template operator()<std::uint64_t>(
+    cudf::data_type{cudf::type_id::UINT64}, 999999ULL, true));
+  cols.push_back(
+    make_col.template operator()<float>(cudf::data_type{cudf::type_id::FLOAT32}, -12.5f, true));
+  cols.push_back(
+    make_col.template operator()<double>(cudf::data_type{cudf::type_id::FLOAT64}, 1024.125, false));
+  cols.push_back(
+    make_col.template operator()<bool>(cudf::data_type{cudf::type_id::BOOL8}, true, true));
+  cols.push_back(make_col.template operator()<std::int32_t>(
+    cudf::data_type{cudf::type_id::TIMESTAMP_DAYS}, 18000, true));
+  cols.push_back(make_col.template operator()<std::int64_t>(
+    cudf::data_type{cudf::type_id::TIMESTAMP_SECONDS}, 1700000000LL, false));
+  cols.push_back(make_col.template operator()<std::int64_t>(
+    cudf::data_type{cudf::type_id::TIMESTAMP_MILLISECONDS}, 1700000000000LL, true));
+  cols.push_back(make_col.template operator()<std::int64_t>(
+    cudf::data_type{cudf::type_id::TIMESTAMP_MICROSECONDS}, 1700000000000000LL, false));
+  cols.push_back(make_col.template operator()<std::int64_t>(
+    cudf::data_type{cudf::type_id::TIMESTAMP_NANOSECONDS}, 1700000000000000000LL, true));
+  cols.push_back(make_col.template operator()<std::int32_t>(
+    cudf::data_type{cudf::type_id::DECIMAL32, -2}, -12345, true));
+  cols.push_back(make_col.template operator()<std::int64_t>(
+    cudf::data_type{cudf::type_id::DECIMAL64, -4}, 987654321LL, false));
+  cols.push_back(
+    make_col.template operator()<__int128_t>(cudf::data_type{cudf::type_id::DECIMAL128, -6},
+                                             (static_cast<__int128_t>(123456789LL) << 40) + 42,
+                                             true));
+
+  std::vector<cudf::column_view> col_views;
+  for (auto const& c : cols) {
+    col_views.push_back(c->view());
+  }
+  cudf::table_view tv{col_views};
+
+  // Build a multi-expression projection covering all 19 references, all 19 non-null constants,
+  // and typed NULL constants.
+  duckdb::vector<std::unique_ptr<ast_node>> exprs;
+  for (std::uint32_t i = 0; i < cols.size(); ++i) {
+    exprs.push_back(make_ref(i));
+  }
+
+  // Non-null constants for all 19 types:
+  exprs.push_back(std::make_unique<ast_node>(
+    sirius::ast::constant{sirius::value{std::int8_t{-42}}, logical_type::make(type_id::TINYINT)}));
+  exprs.push_back(std::make_unique<ast_node>(sirius::ast::constant{
+    sirius::value{std::int16_t{-12345}}, logical_type::make(type_id::SMALLINT)}));
+  exprs.push_back(make_int_const(12345678));
+  exprs.push_back(make_bigint_const(-9876543210123LL));
+  exprs.push_back(std::make_unique<ast_node>(sirius::ast::constant{
+    sirius::value{std::uint8_t{200}}, logical_type::make(type_id::UTINYINT)}));
+  exprs.push_back(std::make_unique<ast_node>(sirius::ast::constant{
+    sirius::value{std::uint16_t{60000}}, logical_type::make(type_id::USMALLINT)}));
+  exprs.push_back(std::make_unique<ast_node>(sirius::ast::constant{
+    sirius::value{std::uint32_t{3000000000U}}, logical_type::make(type_id::UINTEGER)}));
+  exprs.push_back(std::make_unique<ast_node>(sirius::ast::constant{
+    sirius::value{std::uint64_t{1234567890123456789ULL}}, logical_type::make(type_id::UBIGINT)}));
+  exprs.push_back(std::make_unique<ast_node>(
+    sirius::ast::constant{sirius::value{float{3.25f}}, logical_type::make(type_id::FLOAT)}));
+  exprs.push_back(make_double_const(-99.875));
+  exprs.push_back(std::make_unique<ast_node>(
+    sirius::ast::constant{sirius::value{true}, logical_type::make(type_id::BOOLEAN)}));
+  exprs.push_back(make_date_const(19723));
+  exprs.push_back(std::make_unique<ast_node>(
+    sirius::ast::constant{sirius::value{sirius::timestamp_sec_value{1700000123LL}},
+                          logical_type::make(type_id::TIMESTAMP_SEC)}));
+  exprs.push_back(std::make_unique<ast_node>(
+    sirius::ast::constant{sirius::value{sirius::timestamp_ms_value{1700000123456LL}},
+                          logical_type::make(type_id::TIMESTAMP_MS)}));
+  exprs.push_back(std::make_unique<ast_node>(
+    sirius::ast::constant{sirius::value{sirius::timestamp_us_value{1700000123456789LL}},
+                          logical_type::make(type_id::TIMESTAMP)}));
+  exprs.push_back(std::make_unique<ast_node>(
+    sirius::ast::constant{sirius::value{sirius::timestamp_ns_value{1700000123456789123LL}},
+                          logical_type::make(type_id::TIMESTAMP_NS)}));
+  exprs.push_back(make_dec32_const(-54321, 9, 2));
+  exprs.push_back(make_dec64_const(1234567890123LL, 18, 4));
+  exprs.push_back(make_dec128_const((static_cast<__int128_t>(-42) << 64) | 999999ULL, 38, 6));
+
+  // Typed NULL constants:
+  exprs.push_back(make_null_const(logical_type::make(type_id::INTEGER)));
+  exprs.push_back(make_null_const(logical_type::make(type_id::BOOLEAN)));
+  exprs.push_back(make_null_const(logical_type::make(type_id::DATE)));
+  exprs.push_back(make_null_const(logical_type::make(type_id::TIMESTAMP)));
+  exprs.push_back(make_null_const(logical_type::make_decimal(18, 4)));
+  exprs.push_back(make_null_const(logical_type::make_decimal(38, 6)));
+
+  exp_executor mat_exec(
+    exprs, mr, stream, sirius::expression_query_policy{exp_strategy_enum::MATERIALIZE});
+  auto mat_out = mat_exec.evaluate(tv);
+  REQUIRE(mat_out != nullptr);
+
+  exp_executor jit_exec(
+    exprs, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+  auto jit_out = jit_exec.evaluate(tv);
+  REQUIRE(jit_out != nullptr);
+
+  REQUIRE(jit_out->num_columns() == mat_out->num_columns());
+  REQUIRE(jit_out->num_rows() == n_rows);
+
+  for (cudf::size_type c = 0; c < jit_out->num_columns(); ++c) {
+    CAPTURE(c);
+    auto const jcol = jit_out->view().column(c);
+    auto const mcol = mat_out->view().column(c);
+    REQUIRE(jcol.type() == mcol.type());
+    REQUIRE(jcol.null_count() == mcol.null_count());
+    auto const jvalids = copy_valids_to_host(jcol);
+    auto const mvalids = copy_valids_to_host(mcol);
+    REQUIRE(jvalids == mvalids);
+
+    auto const elem_size = cudf::size_of(jcol.type());
+    std::vector<std::uint8_t> jbytes(n_rows * elem_size);
+    std::vector<std::uint8_t> mbytes(n_rows * elem_size);
+    REQUIRE(cudaMemcpy(jbytes.data(),
+                       jcol.head<std::uint8_t>() + jcol.offset() * elem_size,
+                       jbytes.size(),
+                       cudaMemcpyDeviceToHost) == cudaSuccess);
+    REQUIRE(cudaMemcpy(mbytes.data(),
+                       mcol.head<std::uint8_t>() + mcol.offset() * elem_size,
+                       mbytes.size(),
+                       cudaMemcpyDeviceToHost) == cudaSuccess);
+    for (cudf::size_type r = 0; r < n_rows; ++r) {
+      if (jvalids[r]) {
+        CHECK(std::memcmp(
+                jbytes.data() + r * elem_size, mbytes.data() + r * elem_size, elem_size) == 0);
+      }
+    }
+  }
+}
+
+TEST_CASE("nvrtc_jit - sliced input column_views with non-zero offset and 0-row batches",
+          "[expression_evaluator][nvrtc_jit]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = get_resource_ref(*space);
+
+  constexpr cudf::size_type full_rows = 110;
+  std::vector<std::int64_t> values(full_rows);
+  std::vector<bool> valids(full_rows);
+  for (cudf::size_type i = 0; i < full_rows; ++i) {
+    values[i] = static_cast<std::int64_t>(i * 100 - 500);
+    valids[i] = ((i % 4) != 1);
+  }
+
+  auto mask   = cudf::create_null_mask(full_rows, cudf::mask_state::ALL_VALID, stream, mr);
+  auto* maskp = static_cast<cudf::bitmask_type*>(mask.data());
+  cudf::size_type null_count = 0;
+  for (cudf::size_type i = 0; i < full_rows; ++i) {
+    if (!valids[i]) {
+      cudf::set_null_mask(maskp, i, i + 1, false, stream);
+      ++null_count;
+    }
+  }
+  auto col = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT64}, full_rows, std::move(mask), null_count, stream, mr);
+  REQUIRE(cudaMemcpy(col->mutable_view().data<std::int64_t>(),
+                     values.data(),
+                     full_rows * sizeof(std::int64_t),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+
+  duckdb::vector<std::unique_ptr<ast_node>> exprs;
+  exprs.push_back(make_ref_typed(0, logical_type::make(type_id::BIGINT)));
+  exprs.push_back(make_int_const(77));
+  exprs.push_back(make_null_const(logical_type::make(type_id::BIGINT)));
+
+  exp_executor mat_exec(
+    exprs, mr, stream, sirius::expression_query_policy{exp_strategy_enum::MATERIALIZE});
+  exp_executor jit_exec(
+    exprs, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+
+  SECTION("non-zero unaligned slice offset (offset 7, length 70)")
+  {
+    auto slices = cudf::slice(col->view(), {7, 77}, stream);
+    REQUIRE(slices.size() == 1);
+    REQUIRE(slices[0].offset() == 7);
+    REQUIRE(slices[0].size() == 70);
+
+    cudf::table_view sliced_tv{{slices[0]}};
+    auto mat_out = mat_exec.evaluate(sliced_tv);
+    auto jit_out = jit_exec.evaluate(sliced_tv);
+    REQUIRE(mat_out != nullptr);
+    REQUIRE(jit_out != nullptr);
+    REQUIRE(jit_out->num_rows() == 70);
+
+    for (cudf::size_type c = 0; c < 3; ++c) {
+      auto const jcol = jit_out->view().column(c);
+      auto const mcol = mat_out->view().column(c);
+      CHECK(jcol.null_count() == mcol.null_count());
+      CHECK(copy_valids_to_host(jcol) == copy_valids_to_host(mcol));
+    }
+
+    auto const jvals  = copy_column_to_host<std::int64_t>(jit_out->view().column(0));
+    auto const mvals  = copy_column_to_host<std::int64_t>(mat_out->view().column(0));
+    auto const jvalid = copy_valids_to_host(jit_out->view().column(0));
+    for (std::size_t i = 0; i < jvals.size(); ++i) {
+      if (jvalid[i]) { CHECK(jvals[i] == mvals[i]); }
+    }
+    CHECK(copy_column_to_host<std::int32_t>(jit_out->view().column(1)) ==
+          copy_column_to_host<std::int32_t>(mat_out->view().column(1)));
+    CHECK(jit_out->view().column(2).null_count() == 70);
+  }
+
+  SECTION("0-row empty batch")
+  {
+    auto slices = cudf::slice(col->view(), {15, 15}, stream);
+    REQUIRE(slices.size() == 1);
+    REQUIRE(slices[0].size() == 0);
+
+    cudf::table_view empty_tv{{slices[0]}};
+    auto jit_out = jit_exec.evaluate(empty_tv);
+    REQUIRE(jit_out != nullptr);
+    CHECK(jit_out->num_rows() == 0);
+    REQUIRE(jit_out->num_columns() == 3);
+    CHECK(jit_out->view().column(0).type() == cudf::data_type{cudf::type_id::INT64});
+    CHECK(jit_out->view().column(1).type() == cudf::data_type{cudf::type_id::INT32});
+    CHECK(jit_out->view().column(2).type() == cudf::data_type{cudf::type_id::INT64});
+  }
+}
+
+TEST_CASE("nvrtc_jit - changing scalar constant values reuses cached compiled kernel",
+          "[expression_evaluator][nvrtc_jit]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = get_resource_ref(*space);
+
+  auto in = make_int32_input(*space);
+
+  auto eval_with_constants = [&](std::int32_t c1, std::int64_t c2, bool c2_null) {
+    duckdb::vector<std::unique_ptr<ast_node>> exprs;
+    exprs.push_back(make_ref_typed(0, logical_type::make(type_id::INTEGER)));
+    exprs.push_back(make_int_const(c1));
+    if (c2_null) {
+      exprs.push_back(make_null_const(logical_type::make(type_id::BIGINT)));
+    } else {
+      exprs.push_back(make_bigint_const(c2));
+    }
+    exp_executor exec(
+      exprs, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+    return exec.evaluate(in.view);
+  };
+
+  auto out1 = eval_with_constants(10, 1000LL, false);
+  REQUIRE(out1 != nullptr);
+  auto const cache_size_after_first = codegen::jit::KernelCache::instance().size();
+  CHECK(cache_size_after_first >= 1);
+
+  auto out2 = eval_with_constants(999, -5555555555LL, false);
+  REQUIRE(out2 != nullptr);
+  CHECK(codegen::jit::KernelCache::instance().size() == cache_size_after_first);
+
+  auto out3 = eval_with_constants(-42, 0LL, true);
+  REQUIRE(out3 != nullptr);
+  CHECK(codegen::jit::KernelCache::instance().size() == cache_size_after_first);
+
+  CHECK(copy_column_to_host<std::int32_t>(out1->view().column(1))[0] == 10);
+  CHECK(copy_column_to_host<std::int32_t>(out2->view().column(1))[0] == 999);
+  CHECK(copy_column_to_host<std::int32_t>(out3->view().column(1))[0] == -42);
+  CHECK(out1->view().column(2).null_count() == 0);
+  CHECK(out2->view().column(2).null_count() == 0);
+  CHECK(out3->view().column(2).null_count() == in.view.num_rows());
 }
