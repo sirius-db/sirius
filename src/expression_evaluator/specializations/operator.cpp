@@ -408,8 +408,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::in_list const& alt,
   auto test = evaluate(*alt.probe, evaluation_mode::MATERIALIZE);
   D_ASSERT(!test.is_scalar());  // IN with scalar LHS should have been already resolved
 
-  auto const output_type = cudf::data_type{cudf::type_id::BOOL8};
-  cudf::numeric_scalar<bool> const null_bool(false, /*is_valid=*/false, _stream, _mr);
+  auto const output_type      = cudf::data_type{cudf::type_id::BOOL8};
   auto const negate_if_needed = [&](std::unique_ptr<cudf::column> in_result) {
     if (!alt.negated) { return evaluate_result(std::move(in_result)); }
     return evaluate_result(
@@ -424,6 +423,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::in_list const& alt,
   if (all_constants) {
     // A NULL entry never matches, but it turns every non-match into NULL instead of FALSE.
     in_list_values haystack;
+    haystack.reserve(alt.values.size());
     bool has_null_value = false;
     for (auto const& v : alt.values) {
       if (std::holds_alternative<sirius::null_value>(v->get<sirius::ast::constant>().payload)) {
@@ -434,8 +434,9 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::in_list const& alt,
     }
 
     if (haystack.empty()) {
-      return negate_if_needed(
-        cudf::make_column_from_scalar(null_bool, test.get_column_view().size(), _stream, _mr));
+      // All entries are NULL, so IN and NOT IN are both NULL on every row.
+      return evaluate_result(cudf::make_numeric_column(
+        output_type, test.get_column_view().size(), cudf::mask_state::ALL_NULL, _stream, _mr));
     }
 
     std::unique_ptr<cudf::column> contains_column;
@@ -524,6 +525,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::in_list const& alt,
           static_cast<int>(test.get_column_view().type().id()));
     }
     if (has_null_value) {
+      cudf::numeric_scalar<bool> const null_bool(false, /*is_valid=*/false, _stream, _mr);
       contains_column = cudf::binary_operation(contains_column->view(),
                                                null_bool,
                                                cudf::binary_operator::NULL_LOGICAL_OR,
