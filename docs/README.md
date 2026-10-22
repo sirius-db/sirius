@@ -183,6 +183,11 @@ and require increased GPU executions with unchanged fallback counters, in
 addition to matching the CPU reference. See the [expression execution
 contract](super-sirius/expression-executor.md#native-gpu-scalar-functions).
 
+To reproduce the UDF POC measurements, follow the [benchmark instructions](../test/udf_performance/README.md).
+They build the synthetic native packages, generate the input tables, verify
+CPU/GPU results and execution counters, and collect query wall times. The public
+UDFBench Q1-derived workload is an optional, hash-verified download.
+
 ## Pinning Tables for Hot Runs
 
 Sirius reads table data from storage on every query. For the best hot-run performance, pin
