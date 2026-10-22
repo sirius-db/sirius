@@ -199,6 +199,15 @@ struct rewriter {
         return done(placement::rank0);
       }
 
+      case T::MERGE_TOP_N: {
+        // MERGE_TOP_N → TOP_N: each rank's top rows gathered to rank 0, whose merge keeps the
+        // overall top. A row outside its rank's top N is outside the overall top N too.
+        auto& partial = expect(*node.children[0], T::TOP_N);
+        if (visit(partial.children[0]) == placement::rank0) { return done(placement::rank0); }
+        insert(node.children[0], exchange_spec{.routing = exchange_spec::mode::gather}, false);
+        return done(placement::rank0);
+      }
+
       case T::MERGE_SORT: {
         // MERGE_SORT → SORT_PARTITION → SORT_SAMPLE → ORDER_BY → input: rows range-exchanged
         // after the sample, on boundaries every rank's sample agrees on.
