@@ -22,6 +22,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
 
 namespace sirius::exchange {
@@ -46,7 +47,8 @@ class inbound {
  * EXCHANGE_SINKs send through it; each EXCHANGE_SOURCE attaches to its stream id. A peer may send
  * before this process has planned the query, so what arrives for a stream not yet attached is held
  * and replayed on attach. A transport error reaches every attached receiver, and any attached
- * later.
+ * later. An aborted query's error reaches its streams' receivers, attached now or later, on
+ * every rank, and its later arrivals are dropped.
  */
 class exchange_service {
  public:
@@ -82,6 +84,10 @@ class exchange_service {
   /// Stops routing @p stream; later arrivals for it are dropped.
   void detach(stream_id stream);
 
+  /// This rank's run of @p query failed with @p what: fails its streams here and on every peer,
+  /// so no rank waits for the others. Once per query; a query a peer aborted is not re-sent.
+  void abort(std::uint64_t query, std::string const& what);
+
  private:
   struct held {
     rank_t from;
@@ -90,11 +96,14 @@ class exchange_service {
   };
 
   [[nodiscard]] std::shared_ptr<inbound> receiver_of(stream_id stream, held event);
+  /// Fails @p query's receivers with @p error. @return false if it had already ended.
+  bool end_query(std::uint64_t query, std::exception_ptr error);
 
   std::mutex _mutex;
   std::map<stream_id, std::shared_ptr<inbound>> _receivers;
   std::map<stream_id, std::vector<held>> _held;
   std::map<stream_id, bool> _detached;
+  std::map<std::uint64_t, std::exception_ptr> _aborted;
   std::exception_ptr _error;
   // Last: its engine thread calls back into the members above until it is destroyed.
   std::unique_ptr<transport> _transport;

@@ -408,6 +408,8 @@ struct transport::engine {
       }
       end.expected = e->batches;
       check_end(from, e->stream);
+    } else if (auto* a = std::get_if<abort_message>(&m)) {
+      cb.on_abort(a->query, from, std::move(a->what));
     } else {
       throw sirius::internal_exception(
         "exchange: rank {} failed: {}", from, std::get<error_message>(m).what);
@@ -490,6 +492,13 @@ void transport::close(stream_id stream, rank_t to)
   e.cb.on_end(stream, to);
 }
 
+void transport::abort(std::uint64_t query, std::string what)
+{
+  std::lock_guard lock{_mutex};
+  if (_error) { return; }
+  _aborts.push_back({query, std::move(what)});
+}
+
 void transport::run()
 {
   auto& e = *_engine;
@@ -503,6 +512,17 @@ void transport::run()
         if (_stop) { return; }
       }
       bool progress = false;
+      std::vector<abort_message> aborts;
+      {
+        std::lock_guard lock{_mutex};
+        aborts.swap(_aborts);
+      }
+      for (auto const& a : aborts) {
+        for (rank_t peer = 0; peer < e.fab.world_size(); ++peer) {
+          if (peer != e.fab.rank()) { e.fab.notify(peer, encode(a)); }
+        }
+        progress = true;
+      }
       notes.clear();
       e.fab.poll(notes);
       for (auto& n : notes) {

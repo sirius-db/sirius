@@ -382,6 +382,37 @@ TEST_CASE("an exchange source queues arrivals where they can be spilled, while i
   CHECK(source.all_ports_empty());
 }
 
+TEST_CASE("an aborted query fails its streams on every rank, and only its streams",
+          "[exchange][operators]")
+{
+  ranks c(2);
+  using sirius::exchange::query_stream_bits;
+  stream_id const aborted = (std::uint64_t{5} << query_stream_bits) | 1;
+  stream_id const other   = (std::uint64_t{6} << query_stream_bits) | 1;
+  sirius_physical_exchange_source here(
+    key_value_types(), 0, c.all[0].service, aborted, {0, 1}, false);
+  sirius_physical_exchange_source there(
+    key_value_types(), 0, c.all[1].service, aborted, {0, 1}, false);
+  sirius_physical_exchange_source unrelated(
+    key_value_types(), 0, c.all[1].service, other, {0, 1}, false);
+
+  c.all[0].service->abort(5, "injected failure");
+
+  CHECK_THROWS(here.get_next_task_input_data());
+  auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds{30};
+  while (there.get_next_task_hint()->hint != sirius::op::TaskCreationHint::READY) {
+    REQUIRE(std::chrono::steady_clock::now() < deadline);
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+  }
+  CHECK_THROWS(there.get_next_task_input_data());
+  CHECK(unrelated.get_next_task_hint()->hint != sirius::op::TaskCreationHint::READY);
+
+  // A stream of the query attached after the abort fails at once.
+  sirius_physical_exchange_source late(
+    key_value_types(), 0, c.all[1].service, aborted + 1, {0, 1}, false);
+  CHECK_THROWS(late.get_next_task_input_data());
+}
+
 TEST_CASE("a failed exchange fails the next task of its sources", "[exchange][operators]")
 {
   ranks c(2, {.fail_after_writes = 0});
