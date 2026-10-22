@@ -71,7 +71,10 @@ using stream_id = std::uint64_t;
 class transport {
  public:
   struct callbacks {
-    std::function<void(stream_id, rank_t from, std::shared_ptr<cucascade::data_batch>)> on_batch;
+    /// @p batch numbers the batches of one stream from one sender, from 0, in send() order.
+    std::function<void(
+      stream_id, rank_t from, std::uint64_t batch, std::shared_ptr<cucascade::data_batch>)>
+      on_batch;
     std::function<void(stream_id, rank_t from)> on_end;
     std::function<void(std::exception_ptr)> on_error;
   };

@@ -57,6 +57,8 @@ target_sources(
           dynamic_filter/sirius_physical_build_filter.cpp
           dynamic_filter/sirius_dynamic_filter.cpp
           sirius_physical_column_data_scan.cpp
+          sirius_physical_exchange_sink.cpp
+          sirius_physical_exchange_source.cpp
           sirius_physical_streaming_sink.cpp
           sirius_physical_streaming_source.cpp
           sirius_physical_concat.cpp
