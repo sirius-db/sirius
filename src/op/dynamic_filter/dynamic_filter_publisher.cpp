@@ -1062,15 +1062,18 @@ void merge_across_ranks(dynamic_filter_publish_plan::distributed_merge const& d,
 
 /// Distributed: this rank's share of every key's merge when it publishes nothing, so the other
 /// ranks drop each key's filter at once instead of at the merge timeout.
+///
+/// Without waiting for the other ranks, since this rank keeps nothing from the merge: the caller
+/// finalizes a pipeline, and may be the exchange's engine thread delivering an end of stream, which
+/// a waiting merge would itself need to move its messages.
 void merge_without_filters(dynamic_filter_publish_plan const& plan) noexcept
 {
   auto const* d = plan.distributed();
   if (d == nullptr) { return; }
   try {
-    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{d->gpu->get_device_id()}};
-    auto stream_lease = sirius::memory::runtime_stream_pool::acquire(*d->gpu);
-    std::vector<key_filters> none(plan.admitted_keys().size());
-    merge_across_ranks(*d, none, stream_lease.get());
+    for (std::size_t k = 0; k < plan.admitted_keys().size(); ++k) {
+      exchange::leave_all_gather(*d->service, d->first_stream + k);
+    }
   } catch (std::exception const& e) {
     SIRIUS_LOG_WARN("[publish_dynamic_filters] taking part in the merge without filters: {}",
                     e.what());

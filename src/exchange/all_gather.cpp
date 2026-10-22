@@ -115,4 +115,12 @@ std::vector<std::shared_ptr<cucascade::data_batch>> all_gather(
   return tables;
 }
 
+void leave_all_gather(exchange_service& service, stream_id stream)
+{
+  service.detach(stream);
+  for (rank_t r = 0; r < service.world_size(); ++r) {
+    service.close(stream, r);
+  }
+}
+
 }  // namespace sirius::exchange

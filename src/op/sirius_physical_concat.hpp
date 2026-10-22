@@ -69,6 +69,10 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
     const op::input_stats& stats) const override;
 
+ protected:
+  /// Under a distributed hash join's build port, closes the join's dynamic-filter publication.
+  void on_finalize_operator() override;
+
  private:
   /**
    * @brief Plans the next batch group for one partition without removing data

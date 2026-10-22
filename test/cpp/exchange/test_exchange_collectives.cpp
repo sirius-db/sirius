@@ -167,6 +167,31 @@ TEST_CASE("an aborted query wakes an all-gather waiting on its peer", "[exchange
   CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds{30});
 }
 
+TEST_CASE("a rank that leaves an all-gather does not wait, and the others go on without it",
+          "[exchange][collectives]")
+{
+  ranks c(3);
+  // Rank 2 leaves before the others start: it must not need them, as its peers' all-gathers may be
+  // what it would otherwise wait behind.
+  sirius::exchange::leave_all_gather(*c.all[2].service, 12);
+  std::vector<std::vector<std::shared_ptr<cucascade::data_batch>>> got(2);
+  on_every_rank(2, [&](rank_t r) {
+    got[r] = sirius::exchange::all_gather(*c.all[r].service,
+                                          12,
+                                          keys_batch(r * 1000, 1, 10),
+                                          *env().gpu,
+                                          utils::default_stream(),
+                                          std::chrono::seconds{30});
+  });
+  for (rank_t r = 0; r < 2; ++r) {
+    REQUIRE(got[r].size() == 3);
+    REQUIRE(got[r][0] != nullptr);
+    REQUIRE(got[r][1] != nullptr);
+    CHECK(got[r][2] == nullptr);
+    CHECK(keys_of(*got[r][1]).front() == 1000);
+  }
+}
+
 TEST_CASE("all-gather gives every rank every rank's table, in rank order",
           "[exchange][collectives]")
 {

@@ -18,6 +18,7 @@
 
 #include "data/data_batch_utils.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
+#include "op/sirius_physical_hash_join.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "telemetry/nvtx.hpp"
 
@@ -250,6 +251,20 @@ std::size_t sirius_physical_concat::no_history_peak_memory_estimate(
 {
   if (stats.num_batches <= 1) { return 0; }
   return stats.bytes;
+}
+
+void sirius_physical_concat::on_finalize_operator()
+{
+  // The build side has ended. A rank whose build did not arrive as one whole batch (an empty one,
+  // say) owes its peers its share of each filter merge; left to the join's own finalize, after its
+  // probe side, that share would wait on probe rows from a peer whose publication waits on it.
+  auto* join = get_parent_op();
+  if (join == nullptr || join->type != SiriusPhysicalOperatorType::HASH_JOIN ||
+      join->input_port_for(*this) != "build") {
+    return;
+  }
+  auto& session = join->Cast<sirius_physical_hash_join>().dynamic_filter_session();
+  if (session.plan().distributed() != nullptr) { session.finish_input(); }
 }
 
 }  // namespace op
