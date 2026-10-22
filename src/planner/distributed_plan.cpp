@@ -68,6 +68,7 @@ struct rewriter {
   std::shared_ptr<exchange::exchange_service> service;
   cucascade::memory::memory_space* gpu;
   std::uint64_t query;
+  exec::query_lifecycle_registry* lifecycle;
   std::uint32_t next_stream{1};
   /// The plan's shape, compared across ranks.
   std::string shape;
@@ -108,6 +109,7 @@ struct rewriter {
       types, rows, service, id, std::move(spec));
     auto source = duckdb::make_uniq<op::sirius_physical_exchange_source>(
       types, rows, service, id, std::move(senders), ordered);
+    source->set_query_lifecycle(*lifecycle);
     if (child->has_physical_overrides()) {
       sink->set_physical_types(child->get_physical_types());
       source->set_physical_types(child->get_physical_types());
@@ -267,9 +269,10 @@ void require_same_shape(rewriter& r)
 void distribute_plan(duckdb::unique_ptr<op::sirius_physical_operator>& plan,
                      std::shared_ptr<exchange::exchange_service> service,
                      cucascade::memory::memory_space& gpu,
-                     std::uint64_t query)
+                     std::uint64_t query,
+                     exec::query_lifecycle_registry& lifecycle)
 {
-  rewriter r{std::move(service), &gpu, query};
+  rewriter r{std::move(service), &gpu, query, &lifecycle};
   auto const where = r.visit(plan);
   if (where != placement::rank0) {
     r.insert(plan,
