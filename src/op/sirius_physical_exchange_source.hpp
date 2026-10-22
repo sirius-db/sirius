@@ -74,6 +74,11 @@ class sirius_physical_exchange_source : public sirius_physical_operator {
 
   bool is_source() const override { return true; }
 
+  /// Also ends its pipeline under MERGE_AGGREGATE / MERGE_TOP_N, which otherwise rely on their
+  /// partial child being a sink: pipelined behind this source, a merge would run once per
+  /// arriving batch instead of once over every rank's partials.
+  bool is_sink() const override;
+
   sirius::OrderPreservationType source_order() const override;
 
   /// The sink's port is a dependency, not a barrier.
