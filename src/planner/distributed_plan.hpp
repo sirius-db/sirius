@@ -18,8 +18,11 @@
 
 #include "op/sirius_physical_operator.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <span>
+#include <vector>
 
 namespace cucascade::memory {
 class memory_space;
@@ -54,5 +57,25 @@ void distribute_plan(duckdb::unique_ptr<op::sirius_physical_operator>& plan,
                      std::shared_ptr<exchange::exchange_service> service,
                      cucascade::memory::memory_space& gpu,
                      std::uint64_t query);
+
+/// Bytes `[start, start + length)` of file `file` (an index into the table's files).
+struct file_byte_range {
+  std::size_t file     = 0;
+  std::uint64_t start  = 0;
+  std::uint64_t length = 0;
+
+  bool operator==(file_byte_range const&) const = default;
+};
+
+/**
+ * @brief The byte ranges rank @p rank of @p world scans, of files of @p file_bytes bytes each.
+ *
+ * The files are laid end to end and cut into @p world equal spans; rank r gets span r, as one
+ * range per file it touches, in file order. The spans tile every file exactly, so with row groups
+ * owned by the range holding their start offset (`parquet_byte_range.hpp`), every row group is
+ * read by exactly one rank. A rank may get no row group at all, e.g. of a one-row-group table.
+ */
+[[nodiscard]] std::vector<file_byte_range> byte_ranges_for_rank(
+  std::span<std::uint64_t const> file_bytes, std::size_t rank, std::size_t world);
 
 }  // namespace sirius::planner
