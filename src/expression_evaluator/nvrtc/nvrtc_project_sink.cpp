@@ -27,12 +27,16 @@
 
 #include <cuda.h>
 
+#include <expression/ast/constant_range.hpp>
+#include <expression/function_id.hpp>
+#include <expression/join_condition.hpp>
 #include <expression_evaluator/nvrtc/nvrtc_project_sink.hpp>
 #include <expression_evaluator/nvrtc/translation_context.hpp>
 #include <helper/numeric_narrowing.hpp>
 #include <sirius/exception.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <sstream>
@@ -43,6 +47,50 @@ namespace sirius::nvrtc {
 
 namespace {
 
+[[nodiscard]] bool is_integer_or_float(cudf::data_type type) noexcept
+{
+  switch (type.id()) {
+    case cudf::type_id::INT8:
+    case cudf::type_id::INT16:
+    case cudf::type_id::INT32:
+    case cudf::type_id::INT64:
+    case cudf::type_id::UINT8:
+    case cudf::type_id::UINT16:
+    case cudf::type_id::UINT32:
+    case cudf::type_id::UINT64:
+    case cudf::type_id::FLOAT32:
+    case cudf::type_id::FLOAT64: return true;
+    default: return false;
+  }
+}
+
+[[nodiscard]] bool is_untyped_reference_type(sirius::logical_type const& t) noexcept
+{
+  return t.id() == sirius::type_id::INVALID || t.id() == sirius::type_id::SQLNULL;
+}
+
+[[nodiscard]] cudf::data_type effective_node_cudf_type(sirius::ast::node const& expr,
+                                                       cudf::table_view const& input) noexcept
+{
+  if (expr.holds<sirius::ast::reference>()) {
+    auto const& ref = expr.get<sirius::ast::reference>();
+    if (ref.column_index >= static_cast<std::uint32_t>(input.num_columns())) {
+      return cudf::data_type{cudf::type_id::EMPTY};
+    }
+    auto const col_view = input.column(ref.column_index);
+    auto const& logical = ref.return_type();
+    if (is_untyped_reference_type(logical)) { return col_view.type(); }
+    auto const opt_native = sirius::get_cudf_type(logical);
+    if (!opt_native) { return cudf::data_type{cudf::type_id::EMPTY}; }
+    if (is_narrowable_numeric_type(logical) && can_restore_to(col_view.type(), *opt_native)) {
+      return *opt_native;
+    }
+    return col_view.type();
+  }
+  auto const opt_cudf = sirius::get_cudf_type(expr.return_type());
+  return opt_cudf.value_or(cudf::data_type{cudf::type_id::EMPTY});
+}
+
 [[nodiscard]] bool is_node_supported(sirius::ast::node const& expr,
                                      cudf::table_view const& input) noexcept
 {
@@ -52,7 +100,7 @@ namespace {
     auto const col_view = input.column(ref.column_index);
     if (!is_supported_fixed_width(col_view.type())) { return false; }
     auto const& logical = ref.return_type();
-    if (logical.id() != sirius::type_id::INVALID) {
+    if (!is_untyped_reference_type(logical)) {
       auto const opt_cudf = sirius::get_cudf_type(logical);
       if (!opt_cudf || !is_supported_fixed_width(*opt_cudf)) { return false; }
       if (col_view.type() != *opt_cudf) {
@@ -70,6 +118,109 @@ namespace {
     return opt_cudf.has_value() && is_supported_fixed_width(*opt_cudf);
   }
 
+  if (expr.holds<sirius::ast::comparison>()) {
+    auto const& cmp = expr.get<sirius::ast::comparison>();
+    if (!cmp.left || !cmp.right) { return false; }
+    if (!is_node_supported(*cmp.left, input) || !is_node_supported(*cmp.right, input)) {
+      return false;
+    }
+    auto const lt = effective_node_cudf_type(*cmp.left, input);
+    auto const rt = effective_node_cudf_type(*cmp.right, input);
+    if (!is_supported_fixed_width(lt) || !is_supported_fixed_width(rt)) { return false; }
+    if (cudf::is_fixed_point(lt) || cudf::is_fixed_point(rt)) {
+      return cudf::is_fixed_point(lt) && cudf::is_fixed_point(rt) && lt.scale() == rt.scale();
+    }
+    return true;
+  }
+
+  if (expr.holds<sirius::ast::between>()) {
+    auto const& btw = expr.get<sirius::ast::between>();
+    if (!btw.input || !btw.lower || !btw.upper) { return false; }
+    if (!is_node_supported(*btw.input, input) || !is_node_supported(*btw.lower, input) ||
+        !is_node_supported(*btw.upper, input)) {
+      return false;
+    }
+    auto const it = effective_node_cudf_type(*btw.input, input);
+    auto const lt = effective_node_cudf_type(*btw.lower, input);
+    auto const ut = effective_node_cudf_type(*btw.upper, input);
+    if (!is_supported_fixed_width(it) || !is_supported_fixed_width(lt) ||
+        !is_supported_fixed_width(ut)) {
+      return false;
+    }
+    if (cudf::is_fixed_point(it) || cudf::is_fixed_point(lt) || cudf::is_fixed_point(ut)) {
+      return cudf::is_fixed_point(it) && cudf::is_fixed_point(lt) && cudf::is_fixed_point(ut) &&
+             it.scale() == lt.scale() && it.scale() == ut.scale();
+    }
+    return true;
+  }
+
+  if (expr.holds<sirius::ast::unary_op>()) {
+    auto const& uo = expr.get<sirius::ast::unary_op>();
+    if (!uo.child || !is_node_supported(*uo.child, input)) { return false; }
+    switch (uo.op) {
+      case sirius::ast::unary_op::kind::op_not: {
+        auto const ct = effective_node_cudf_type(*uo.child, input);
+        return ct.id() == cudf::type_id::BOOL8;
+      }
+      case sirius::ast::unary_op::kind::op_is_null:
+      case sirius::ast::unary_op::kind::op_is_not_null: return true;
+      case sirius::ast::unary_op::kind::op_try: {
+        auto const rt = effective_node_cudf_type(*uo.child, input);
+        return is_supported_fixed_width(rt);
+      }
+      default: return false;
+    }
+  }
+
+  if (expr.holds<sirius::ast::function_call>()) {
+    auto const& fc   = expr.get<sirius::ast::function_call>();
+    auto const& args = fc.arguments();
+    for (auto const& arg : args) {
+      if (!arg || !is_node_supported(*arg, input)) { return false; }
+    }
+    auto const opt_ret = sirius::get_cudf_type(fc.return_type());
+    if (!opt_ret || !is_supported_fixed_width(*opt_ret)) { return false; }
+    auto const ret_type = *opt_ret;
+
+    switch (fc.function()) {
+      case sirius::function_id::add:
+      case sirius::function_id::sub:
+      case sirius::function_id::mul:
+      case sirius::function_id::div:
+      case sirius::function_id::int_div:
+      case sirius::function_id::mod: {
+        if (args.size() != 2) { return false; }
+        if (!is_integer_or_float(ret_type)) { return false; }
+        auto const lt = effective_node_cudf_type(*args[0], input);
+        auto const rt = effective_node_cudf_type(*args[1], input);
+        return is_integer_or_float(lt) && is_integer_or_float(rt);
+      }
+      case sirius::function_id::abs: {
+        if (args.size() != 1) { return false; }
+        auto const ct = effective_node_cudf_type(*args[0], input);
+        return is_integer_or_float(ret_type) && ct == ret_type;
+      }
+      case sirius::function_id::round: {
+        if (args.size() != 1 && args.size() != 2) { return false; }
+        auto const ct = effective_node_cudf_type(*args[0], input);
+        if ((ct.id() != cudf::type_id::FLOAT32 && ct.id() != cudf::type_id::FLOAT64) ||
+            ret_type != ct) {
+          return false;
+        }
+        if (args.size() == 2) {
+          if (!args[1]->holds<sirius::ast::constant>()) { return false; }
+          auto const& prec_cst = args[1]->get<sirius::ast::constant>();
+          if (!std::holds_alternative<std::int32_t>(prec_cst.payload)) { return false; }
+        }
+        return true;
+      }
+      case sirius::function_id::constant_or_null: {
+        return args.size() >= 2 && is_supported_fixed_width(ret_type);
+      }
+      default: return false;
+    }
+  }
+
   return false;
 }
 
@@ -80,12 +231,16 @@ namespace {
     auto const& ref     = expr.get<sirius::ast::reference>();
     auto const col_view = input.column(ref.column_index);
     auto const& logical = ref.return_type();
-    if (logical.id() == sirius::type_id::INVALID) { return col_view.type(); }
+    if (is_untyped_reference_type(logical)) { return col_view.type(); }
     auto const native = sirius::require_cudf_type(logical);
     if (is_narrowable_numeric_type(logical) && can_restore_to(col_view.type(), native)) {
       return native;
     }
     return col_view.type();
+  }
+  if (expr.holds<sirius::ast::unary_op>() &&
+      expr.get<sirius::ast::unary_op>().op == sirius::ast::unary_op::kind::op_try) {
+    return resolve_output_cudf_type(*expr.get<sirius::ast::unary_op>().child, input);
   }
   return sirius::require_cudf_type(expr.return_type());
 }
@@ -328,7 +483,7 @@ register_value translation_context::produce_reference(sirius::ast::reference con
   cudf::data_type restored_type = col_view.type();
   sirius::logical_type sql_type = logical;
 
-  if (logical.id() != sirius::type_id::INVALID) {
+  if (!is_untyped_reference_type(logical)) {
     auto const native = sirius::require_cudf_type(logical);
     if (is_narrowable_numeric_type(logical) && can_restore_to(col_view.type(), native)) {
       restored_type = native;
@@ -385,6 +540,397 @@ register_value translation_context::produce_constant(sirius::ast::constant const
   return reg;
 }
 
+std::optional<cudf::data_type> translation_context::narrow_domain_carrier(
+  sirius::ast::node const& column_operand,
+  std::initializer_list<sirius::ast::node const*> constant_operands) const
+{
+  if (!column_operand.holds<sirius::ast::reference>()) { return std::nullopt; }
+  auto const& ref = column_operand.get<sirius::ast::reference>();
+  if (ref.column_index >= static_cast<std::uint32_t>(_input.num_columns())) { return std::nullopt; }
+  auto const carrier = _input.column(ref.column_index).type();
+  if (!sirius::ast::narrow_domain_carrier_eligible(ref.return_type(), carrier, constant_operands)) {
+    return std::nullopt;
+  }
+  return carrier;
+}
+
+std::optional<cudf::data_type> translation_context::narrow_domain_reference_pair_carrier(
+  sirius::ast::node const& lhs, sirius::ast::node const& rhs) const
+{
+  if (!lhs.holds<sirius::ast::reference>() || !rhs.holds<sirius::ast::reference>()) {
+    return std::nullopt;
+  }
+  auto const& lhs_ref    = lhs.get<sirius::ast::reference>();
+  auto const& rhs_ref    = rhs.get<sirius::ast::reference>();
+  auto const num_columns = static_cast<std::uint32_t>(_input.num_columns());
+  if (lhs_ref.column_index >= num_columns || rhs_ref.column_index >= num_columns) {
+    return std::nullopt;
+  }
+  auto const lhs_carrier = _input.column(lhs_ref.column_index).type();
+  auto const rhs_carrier = _input.column(rhs_ref.column_index).type();
+  if (!sirius::ast::narrow_domain_reference_pair_eligible(
+        lhs_ref.return_type(), lhs_carrier, rhs_ref.return_type(), rhs_carrier)) {
+    return std::nullopt;
+  }
+  return lhs_carrier;
+}
+
+register_value translation_context::produce_constant_in_carrier(sirius::ast::constant const& expr,
+                                                                cudf::data_type carrier)
+{
+  bool const is_valid = !std::holds_alternative<sirius::null_value>(expr.payload);
+  __int128_t raw_val  = 0;
+  if (is_valid) {
+    auto const range = sirius::ast::constant_numeric_range(expr);
+    if (!range) {
+      throw internal_exception("[nvrtc] narrow-domain constant lost its numeric range");
+    }
+    raw_val = range->minimum;
+  }
+
+  sirius::value narrowed_payload{};
+  if (is_valid) {
+    switch (carrier.id()) {
+      case cudf::type_id::INT8: narrowed_payload = static_cast<std::int8_t>(raw_val); break;
+      case cudf::type_id::INT16: narrowed_payload = static_cast<std::int16_t>(raw_val); break;
+      case cudf::type_id::INT32: narrowed_payload = static_cast<std::int32_t>(raw_val); break;
+      case cudf::type_id::UINT8: narrowed_payload = static_cast<std::uint8_t>(raw_val); break;
+      case cudf::type_id::UINT16: narrowed_payload = static_cast<std::uint16_t>(raw_val); break;
+      case cudf::type_id::UINT32: narrowed_payload = static_cast<std::uint32_t>(raw_val); break;
+      case cudf::type_id::DECIMAL32:
+        narrowed_payload = sirius::decimal32{static_cast<std::int32_t>(raw_val),
+                                             static_cast<std::uint8_t>(-carrier.scale())};
+        break;
+      case cudf::type_id::DECIMAL64:
+        narrowed_payload = sirius::decimal64{static_cast<std::int64_t>(raw_val),
+                                             static_cast<std::uint8_t>(-carrier.scale())};
+        break;
+      default:
+        throw internal_exception("[nvrtc] unsupported narrow constant carrier: {}",
+                                 cudf::type_to_name(carrier));
+    }
+  }
+
+  auto const binding_id = _constants.size();
+  auto const var_name   = next_var_name();
+  auto const type_str   = cuda_type_name(carrier);
+
+  emit_line("reg_val<" + type_str + "> " + var_name + "{c_" + std::to_string(binding_id) +
+            "_val, c_" + std::to_string(binding_id) + "_valid != 0, false};");
+
+  register_value reg{var_name,
+                     expr.return_type(),
+                     carrier,
+                     /*is_statically_non_null=*/false,
+                     /*can_overflow=*/false};
+  _constants.push_back(scalar_constant_binding{
+    binding_id, expr.return_type(), carrier, std::move(narrowed_payload), is_valid, reg});
+  return reg;
+}
+
+register_value translation_context::produce_narrow_domain_operand(
+  sirius::ast::node const& operand, std::optional<cudf::data_type> narrow_carrier)
+{
+  if (!narrow_carrier) { return produce(operand); }
+  if (operand.holds<sirius::ast::reference>()) {
+    auto const& ref = operand.get<sirius::ast::reference>();
+    // Load the reference directly at its raw carrier width without restoring to the wider type.
+    sirius::ast::reference raw_ref{ref.column_index, sirius::logical_type{}};
+    return produce_reference(raw_ref);
+  }
+  return produce_constant_in_carrier(operand.get<sirius::ast::constant>(), *narrow_carrier);
+}
+
+register_value translation_context::produce_comparison(sirius::ast::comparison const& expr)
+{
+  auto narrow_carrier = narrow_domain_carrier(*expr.left, {expr.right.get()});
+  if (!narrow_carrier) { narrow_carrier = narrow_domain_carrier(*expr.right, {expr.left.get()}); }
+  if (!narrow_carrier) {
+    narrow_carrier = narrow_domain_reference_pair_carrier(*expr.left, *expr.right);
+  }
+  if (narrow_carrier) { ++_narrow_domain_comparison_count; }
+
+  auto const lhs      = produce_narrow_domain_operand(*expr.left, narrow_carrier);
+  auto const rhs      = produce_narrow_domain_operand(*expr.right, narrow_carrier);
+  auto const var_name = next_var_name();
+
+  auto const cmp_type_str = [&]() -> std::string {
+    if (lhs.device_type == rhs.device_type) { return cuda_type_name(lhs.device_type); }
+    if (lhs.device_type.id() == cudf::type_id::FLOAT64 ||
+        rhs.device_type.id() == cudf::type_id::FLOAT64) {
+      return "double";
+    }
+    if (lhs.device_type.id() == cudf::type_id::FLOAT32 ||
+        rhs.device_type.id() == cudf::type_id::FLOAT32) {
+      return "float";
+    }
+    if (cudf::is_unsigned(lhs.device_type) && cudf::is_unsigned(rhs.device_type)) {
+      return "uint64_t";
+    }
+    if (!cudf::is_unsigned(lhs.device_type) && !cudf::is_unsigned(rhs.device_type)) {
+      return "int64_t";
+    }
+    return "__int128_t";
+  }();
+
+  auto const lhs_val = "static_cast<" + cmp_type_str + ">(" + lhs.var_name + ".val)";
+  auto const rhs_val = "static_cast<" + cmp_type_str + ">(" + rhs.var_name + ".val)";
+  bool const can_ovf = lhs.can_overflow || rhs.can_overflow;
+  std::string const ovf_e =
+    can_ovf ? (lhs.var_name + ".overflow || " + rhs.var_name + ".overflow") : "false";
+
+  if (expr.op == sirius::comparison_type::not_distinct_from) {
+    emit_line("reg_val<bool> " + var_name + "{(!" + lhs.var_name + ".valid && !" + rhs.var_name +
+              ".valid) || (" + lhs.var_name + ".valid && " + rhs.var_name + ".valid && (" +
+              lhs_val + " == " + rhs_val + ")), true, " + ovf_e + "};");
+    return register_value{var_name,
+                          sirius::logical_type::make(sirius::type_id::BOOLEAN),
+                          cudf::data_type{cudf::type_id::BOOL8},
+                          /*is_statically_non_null=*/true,
+                          can_ovf};
+  }
+
+  if (expr.op == sirius::comparison_type::distinct_from) {
+    emit_line("reg_val<bool> " + var_name + "{(" + lhs.var_name + ".valid != " + rhs.var_name +
+              ".valid) || (" + lhs.var_name + ".valid && " + rhs.var_name + ".valid && (" +
+              lhs_val + " != " + rhs_val + ")), true, " + ovf_e + "};");
+    return register_value{var_name,
+                          sirius::logical_type::make(sirius::type_id::BOOLEAN),
+                          cudf::data_type{cudf::type_id::BOOL8},
+                          /*is_statically_non_null=*/true,
+                          can_ovf};
+  }
+
+  std::string op_sym;
+  switch (expr.op) {
+    case sirius::comparison_type::equal: op_sym = "=="; break;
+    case sirius::comparison_type::not_equal: op_sym = "!="; break;
+    case sirius::comparison_type::lt: op_sym = "<"; break;
+    case sirius::comparison_type::le: op_sym = "<="; break;
+    case sirius::comparison_type::gt: op_sym = ">"; break;
+    case sirius::comparison_type::ge: op_sym = ">="; break;
+    default:
+      throw invalid_input_exception("[nvrtc] Unrecognized comparison operator: {}",
+                                    static_cast<int>(expr.op));
+  }
+
+  bool const non_null = lhs.is_statically_non_null && rhs.is_statically_non_null;
+  if (non_null) {
+    emit_line("reg_val<bool> " + var_name + "{(" + lhs_val + " " + op_sym + " " + rhs_val +
+              "), true, " + ovf_e + "};");
+  } else {
+    emit_line("bool const " + var_name + "_valid = " + lhs.var_name + ".valid && " + rhs.var_name +
+              ".valid;");
+    emit_line("reg_val<bool> " + var_name + "{" + var_name + "_valid ? (" + lhs_val + " " + op_sym +
+              " " + rhs_val + ") : false, " + var_name + "_valid, " + ovf_e + "};");
+  }
+
+  return register_value{var_name,
+                        sirius::logical_type::make(sirius::type_id::BOOLEAN),
+                        cudf::data_type{cudf::type_id::BOOL8},
+                        non_null,
+                        can_ovf};
+}
+
+register_value translation_context::produce_between(sirius::ast::between const& expr)
+{
+  auto const narrow_carrier =
+    narrow_domain_carrier(*expr.input, {expr.lower.get(), expr.upper.get()});
+  if (narrow_carrier) { ++_narrow_domain_comparison_count; }
+
+  auto const in_reg   = produce_narrow_domain_operand(*expr.input, narrow_carrier);
+  auto const lo_reg   = produce_narrow_domain_operand(*expr.lower, narrow_carrier);
+  auto const hi_reg   = produce_narrow_domain_operand(*expr.upper, narrow_carrier);
+  auto const var_name = next_var_name();
+
+  auto const cmp_type_str = cuda_type_name(in_reg.device_type);
+  auto const in_val       = "static_cast<" + cmp_type_str + ">(" + in_reg.var_name + ".val)";
+  auto const lo_val       = "static_cast<" + cmp_type_str + ">(" + lo_reg.var_name + ".val)";
+  auto const hi_val       = "static_cast<" + cmp_type_str + ">(" + hi_reg.var_name + ".val)";
+
+  std::string const lo_op = expr.lower_inclusive ? ">=" : ">";
+  std::string const hi_op = expr.upper_inclusive ? "<=" : "<";
+
+  bool const non_null =
+    in_reg.is_statically_non_null && lo_reg.is_statically_non_null && hi_reg.is_statically_non_null;
+  bool const can_ovf      = in_reg.can_overflow || lo_reg.can_overflow || hi_reg.can_overflow;
+  std::string const ovf_e = can_ovf ? (in_reg.var_name + ".overflow || " + lo_reg.var_name +
+                                       ".overflow || " + hi_reg.var_name + ".overflow")
+                                    : "false";
+
+  if (non_null) {
+    emit_line("reg_val<bool> " + var_name + "{((" + in_val + " " + lo_op + " " + lo_val + ") && (" +
+              in_val + " " + hi_op + " " + hi_val + ")), true, " + ovf_e + "};");
+  } else {
+    emit_line("bool const " + var_name + "_valid = " + in_reg.var_name + ".valid && " +
+              lo_reg.var_name + ".valid && " + hi_reg.var_name + ".valid;");
+    emit_line("reg_val<bool> " + var_name + "{" + var_name + "_valid ? ((" + in_val + " " + lo_op +
+              " " + lo_val + ") && (" + in_val + " " + hi_op + " " + hi_val + ")) : false, " +
+              var_name + "_valid, " + ovf_e + "};");
+  }
+
+  return register_value{var_name,
+                        sirius::logical_type::make(sirius::type_id::BOOLEAN),
+                        cudf::data_type{cudf::type_id::BOOL8},
+                        non_null,
+                        can_ovf};
+}
+
+register_value translation_context::produce_unary_op(sirius::ast::unary_op const& expr)
+{
+  auto const child    = produce(*expr.child);
+  auto const var_name = next_var_name();
+
+  switch (expr.op) {
+    case sirius::ast::unary_op::kind::op_not: {
+      emit_line("reg_val<bool> " + var_name + "{!" + child.var_name + ".val, " + child.var_name +
+                ".valid, " + child.var_name + ".overflow};");
+      return register_value{var_name,
+                            sirius::logical_type::make(sirius::type_id::BOOLEAN),
+                            cudf::data_type{cudf::type_id::BOOL8},
+                            child.is_statically_non_null,
+                            child.can_overflow};
+    }
+    case sirius::ast::unary_op::kind::op_is_null: {
+      emit_line("reg_val<bool> " + var_name + "{!" + child.var_name + ".valid, true, " +
+                child.var_name + ".overflow};");
+      return register_value{var_name,
+                            sirius::logical_type::make(sirius::type_id::BOOLEAN),
+                            cudf::data_type{cudf::type_id::BOOL8},
+                            /*is_statically_non_null=*/true,
+                            child.can_overflow};
+    }
+    case sirius::ast::unary_op::kind::op_is_not_null: {
+      emit_line("reg_val<bool> " + var_name + "{" + child.var_name + ".valid, true, " +
+                child.var_name + ".overflow};");
+      return register_value{var_name,
+                            sirius::logical_type::make(sirius::type_id::BOOLEAN),
+                            cudf::data_type{cudf::type_id::BOOL8},
+                            /*is_statically_non_null=*/true,
+                            child.can_overflow};
+    }
+    case sirius::ast::unary_op::kind::op_try: {
+      auto const type_str = cuda_type_name(child.device_type);
+      emit_line("reg_val<" + type_str + "> " + var_name + "{" + child.var_name + ".overflow ? " +
+                type_str + "{} : " + child.var_name + ".val, " + child.var_name + ".valid && !" +
+                child.var_name + ".overflow, false};");
+      return register_value{var_name,
+                            expr.return_type(),
+                            child.device_type,
+                            /*is_statically_non_null=*/false,
+                            /*can_overflow=*/false};
+    }
+    default:
+      throw not_implemented_exception("[nvrtc] Unsupported unary_op kind: {}",
+                                      static_cast<int>(expr.op));
+  }
+}
+
+register_value translation_context::produce_function_call(sirius::ast::function_call const& expr)
+{
+  auto const fid      = expr.function();
+  auto const& args    = expr.arguments();
+  auto const ret_type = sirius::require_cudf_type(expr.return_type());
+  auto const type_str = cuda_type_name(ret_type);
+  auto const var_name = next_var_name();
+
+  if (fid == sirius::function_id::add || fid == sirius::function_id::sub ||
+      fid == sirius::function_id::mul || fid == sirius::function_id::div ||
+      fid == sirius::function_id::int_div || fid == sirius::function_id::mod) {
+    auto const lhs = produce(*args[0]);
+    auto const rhs = produce(*args[1]);
+
+    std::string fn_name;
+    switch (fid) {
+      case sirius::function_id::add: fn_name = "eval_add"; break;
+      case sirius::function_id::sub: fn_name = "eval_sub"; break;
+      case sirius::function_id::mul: fn_name = "eval_mul"; break;
+      case sirius::function_id::div:
+      case sirius::function_id::int_div: fn_name = "eval_div"; break;
+      case sirius::function_id::mod: fn_name = "eval_mod"; break;
+      default: break;
+    }
+
+    emit_line("reg_val<" + type_str + "> " + var_name + " = " + fn_name + "<" + type_str + ">(" +
+              lhs.var_name + ", " + rhs.var_name + ");");
+
+    bool const is_div_or_mod =
+      (fid == sirius::function_id::div || fid == sirius::function_id::int_div ||
+       fid == sirius::function_id::mod);
+    bool const is_int_type = cudf::is_integral(ret_type);
+    bool const can_ovf =
+      lhs.can_overflow || rhs.can_overflow ||
+      (is_int_type && (fid == sirius::function_id::add || fid == sirius::function_id::sub ||
+                       fid == sirius::function_id::mul ||
+                       ((fid == sirius::function_id::div || fid == sirius::function_id::int_div) &&
+                        !cudf::is_unsigned(ret_type))));
+    bool const non_null =
+      lhs.is_statically_non_null && rhs.is_statically_non_null && !(is_div_or_mod && is_int_type);
+
+    return register_value{var_name, expr.return_type(), ret_type, non_null, can_ovf};
+  }
+
+  if (fid == sirius::function_id::abs) {
+    auto const child = produce(*args[0]);
+    emit_line("reg_val<" + type_str + "> " + var_name + " = eval_abs<" + type_str + ">(" +
+              child.var_name + ");");
+    bool const can_ovf =
+      child.can_overflow || (cudf::is_integral(ret_type) && !cudf::is_unsigned(ret_type));
+    return register_value{
+      var_name, expr.return_type(), ret_type, child.is_statically_non_null, can_ovf};
+  }
+
+  if (fid == sirius::function_id::round) {
+    auto const child       = produce(*args[0]);
+    std::int32_t precision = 0;
+    if (args.size() == 2) {
+      precision = std::get<std::int32_t>(args[1]->get<sirius::ast::constant>().payload);
+    }
+    bool const neg_prec = precision < 0;
+    double const modifier =
+      (ret_type.id() == cudf::type_id::FLOAT32)
+        ? static_cast<double>(std::pow(
+            10, static_cast<float>(neg_prec ? -static_cast<std::int64_t>(precision) : precision)))
+        : std::pow(
+            10, static_cast<double>(neg_prec ? -static_cast<std::int64_t>(precision) : precision));
+
+    sirius::ast::constant mod_cst{sirius::value{modifier},
+                                  sirius::logical_type::make(sirius::type_id::DOUBLE)};
+    auto const mod_reg = produce_constant(mod_cst);
+    emit_line("reg_val<" + type_str + "> " + var_name + " = eval_round<" + type_str + ", " +
+              (neg_prec ? "true" : "false") + ">(" + child.var_name + ", " + mod_reg.var_name +
+              ".val);");
+    return register_value{
+      var_name, expr.return_type(), ret_type, child.is_statically_non_null, child.can_overflow};
+  }
+
+  if (fid == sirius::function_id::constant_or_null) {
+    auto const val_reg = produce(*args[0]);
+    std::vector<register_value> arg_regs;
+    arg_regs.reserve(args.size() - 1);
+    for (std::size_t i = 1; i < args.size(); ++i) {
+      arg_regs.push_back(produce(*args[i]));
+    }
+    std::string valid_expr = val_reg.var_name + ".valid";
+    std::string ovf_expr   = val_reg.var_name + ".overflow";
+    bool any_ovf           = val_reg.can_overflow;
+    for (auto const& r : arg_regs) {
+      valid_expr += " && " + r.var_name + ".valid";
+      ovf_expr += " || " + r.var_name + ".overflow";
+      if (r.can_overflow) { any_ovf = true; }
+    }
+    emit_line("bool const " + var_name + "_valid = " + valid_expr + ";");
+    emit_line("reg_val<" + type_str + "> " + var_name + "{" + var_name + "_valid ? static_cast<" +
+              type_str + ">(" + val_reg.var_name + ".val) : " + type_str + "{}, " + var_name +
+              "_valid, " + (any_ovf ? ("(" + ovf_expr + ")") : "false") + "};");
+    return register_value{
+      var_name, expr.return_type(), ret_type, /*is_statically_non_null=*/false, any_ovf};
+  }
+
+  throw not_implemented_exception("[nvrtc] Unsupported function_id in translation_context: {}",
+                                  static_cast<int>(fid));
+}
+
 register_value translation_context::produce(sirius::ast::node const& expr)
 {
   if (expr.holds<sirius::ast::reference>()) {
@@ -392,6 +938,18 @@ register_value translation_context::produce(sirius::ast::node const& expr)
   }
   if (expr.holds<sirius::ast::constant>()) {
     return produce_constant(expr.get<sirius::ast::constant>());
+  }
+  if (expr.holds<sirius::ast::comparison>()) {
+    return produce_comparison(expr.get<sirius::ast::comparison>());
+  }
+  if (expr.holds<sirius::ast::between>()) {
+    return produce_between(expr.get<sirius::ast::between>());
+  }
+  if (expr.holds<sirius::ast::unary_op>()) {
+    return produce_unary_op(expr.get<sirius::ast::unary_op>());
+  }
+  if (expr.holds<sirius::ast::function_call>()) {
+    return produce_function_call(expr.get<sirius::ast::function_call>());
   }
   throw not_implemented_exception("[nvrtc] Unsupported AST node in translation_context::produce");
 }
@@ -410,10 +968,18 @@ std::unique_ptr<cudf::table> evaluate_project_sink(
   std::span<sirius::ast::node const* const> expressions,
   cudf::table_view const& input,
   ::cuda::stream_ref stream,
-  rmm::device_async_resource_ref mr)
+  rmm::device_async_resource_ref mr,
+  std::size_t* narrow_domain_comparison_count)
 {
   auto const num_rows = input.num_rows();
   if (num_rows == 0) {
+    if (narrow_domain_comparison_count != nullptr) {
+      translation_context count_ctx(input);
+      for (auto const* expr : expressions) {
+        (void)count_ctx.produce(*expr);
+      }
+      *narrow_domain_comparison_count += count_ctx.narrow_domain_comparison_count();
+    }
     std::vector<std::unique_ptr<cudf::column>> empty_cols;
     empty_cols.reserve(expressions.size());
     for (auto const* expr : expressions) {
@@ -429,6 +995,9 @@ std::unique_ptr<cudf::table> evaluate_project_sink(
   for (auto const* expr : expressions) {
     out_regs.push_back(ctx.produce(*expr));
   }
+  if (narrow_domain_comparison_count != nullptr) {
+    *narrow_domain_comparison_count += ctx.narrow_domain_comparison_count();
+  }
 
   constexpr int block_threads = 256;
   constexpr int num_warps     = block_threads / 32;
@@ -441,17 +1010,163 @@ std::unique_ptr<cudf::table> evaluate_project_sink(
 
   // Assemble the CUDA kernel source string.
   std::ostringstream src;
-  src << "#include \"codegen/stdint_shim.hpp\"\n\n";
-  src << "template <typename T>\n"
-      << "struct reg_val {\n"
-      << "  T val;\n"
-      << "  bool valid;\n"
-      << "  bool overflow;\n"
-      << "};\n\n"
-      << "__device__ __forceinline__ bool is_bit_set(uint32_t const* mask, int32_t bit_idx) {\n"
-      << "  return ((mask[bit_idx >> 5] >> (bit_idx & 31)) & 1u) != 0u;\n"
-      << "}\n\n"
-      << "extern \"C\" __global__ void sirius_nvrtc_project_kernel(\n";
+  src
+    << "#include \"codegen/stdint_shim.hpp\"\n"
+    << "#include <cuda/std/limits>\n"
+    << "#include <cuda/std/type_traits>\n\n"
+    << "template <typename T>\n"
+    << "struct reg_val {\n"
+    << "  T val;\n"
+    << "  bool valid;\n"
+    << "  bool overflow;\n"
+    << "};\n\n"
+    << "__device__ __forceinline__ bool is_bit_set(uint32_t const* mask, int32_t bit_idx) {\n"
+    << "  return ((mask[bit_idx >> 5] >> (bit_idx & 31)) & 1u) != 0u;\n"
+    << "}\n\n"
+    << "template <typename T, typename L, typename R>\n"
+    << "__device__ __forceinline__ reg_val<T> eval_add(reg_val<L> l, reg_val<R> r) {\n"
+    << "  bool const ovf_in = l.overflow || r.overflow;\n"
+    << "  bool const valid = l.valid && r.valid;\n"
+    << "  if (!valid || ovf_in) { return reg_val<T>{T{}, valid, ovf_in}; }\n"
+    << "  if constexpr (cuda::std::is_floating_point_v<T>) {\n"
+    << "    return reg_val<T>{static_cast<T>(l.val) + static_cast<T>(r.val), true, false};\n"
+    << "  } else if constexpr (cuda::std::is_signed_v<T>) {\n"
+    << "    using Wide = cuda::std::conditional_t<(sizeof(T) < 8), int64_t, __int128_t>;\n"
+    << "    Wide const res = static_cast<Wide>(static_cast<T>(l.val)) + "
+       "static_cast<Wide>(static_cast<T>(r.val));\n"
+    << "    bool const ovf = (res < static_cast<Wide>(cuda::std::numeric_limits<T>::lowest())) ||\n"
+    << "                     (res > static_cast<Wide>(cuda::std::numeric_limits<T>::max()));\n"
+    << "    return reg_val<T>{ovf ? T{} : static_cast<T>(res), true, ovf};\n"
+    << "  } else {\n"
+    << "    using Wide = cuda::std::conditional_t<(sizeof(T) < 8), uint64_t, unsigned __int128>;\n"
+    << "    Wide const res = static_cast<Wide>(static_cast<T>(l.val)) + "
+       "static_cast<Wide>(static_cast<T>(r.val));\n"
+    << "    bool const ovf = res > static_cast<Wide>(cuda::std::numeric_limits<T>::max());\n"
+    << "    return reg_val<T>{ovf ? T{} : static_cast<T>(res), true, ovf};\n"
+    << "  }\n"
+    << "}\n\n"
+    << "template <typename T, typename L, typename R>\n"
+    << "__device__ __forceinline__ reg_val<T> eval_sub(reg_val<L> l, reg_val<R> r) {\n"
+    << "  bool const ovf_in = l.overflow || r.overflow;\n"
+    << "  bool const valid = l.valid && r.valid;\n"
+    << "  if (!valid || ovf_in) { return reg_val<T>{T{}, valid, ovf_in}; }\n"
+    << "  if constexpr (cuda::std::is_floating_point_v<T>) {\n"
+    << "    return reg_val<T>{static_cast<T>(l.val) - static_cast<T>(r.val), true, false};\n"
+    << "  } else if constexpr (cuda::std::is_signed_v<T>) {\n"
+    << "    using Wide = cuda::std::conditional_t<(sizeof(T) < 8), int64_t, __int128_t>;\n"
+    << "    Wide const res = static_cast<Wide>(static_cast<T>(l.val)) - "
+       "static_cast<Wide>(static_cast<T>(r.val));\n"
+    << "    bool const ovf = (res < static_cast<Wide>(cuda::std::numeric_limits<T>::lowest())) ||\n"
+    << "                     (res > static_cast<Wide>(cuda::std::numeric_limits<T>::max()));\n"
+    << "    return reg_val<T>{ovf ? T{} : static_cast<T>(res), true, ovf};\n"
+    << "  } else {\n"
+    << "    T const lv = static_cast<T>(l.val);\n"
+    << "    T const rv = static_cast<T>(r.val);\n"
+    << "    bool const ovf = lv < rv;\n"
+    << "    return reg_val<T>{ovf ? T{} : static_cast<T>(lv - rv), true, ovf};\n"
+    << "  }\n"
+    << "}\n\n"
+    << "template <typename T, typename L, typename R>\n"
+    << "__device__ __forceinline__ reg_val<T> eval_mul(reg_val<L> l, reg_val<R> r) {\n"
+    << "  bool const ovf_in = l.overflow || r.overflow;\n"
+    << "  bool const valid = l.valid && r.valid;\n"
+    << "  if (!valid || ovf_in) { return reg_val<T>{T{}, valid, ovf_in}; }\n"
+    << "  if constexpr (cuda::std::is_floating_point_v<T>) {\n"
+    << "    return reg_val<T>{static_cast<T>(l.val) * static_cast<T>(r.val), true, false};\n"
+    << "  } else if constexpr (cuda::std::is_signed_v<T>) {\n"
+    << "    using Wide = cuda::std::conditional_t<(sizeof(T) < 8), int64_t, __int128_t>;\n"
+    << "    Wide const res = static_cast<Wide>(static_cast<T>(l.val)) * "
+       "static_cast<Wide>(static_cast<T>(r.val));\n"
+    << "    bool const ovf = (res < static_cast<Wide>(cuda::std::numeric_limits<T>::lowest())) ||\n"
+    << "                     (res > static_cast<Wide>(cuda::std::numeric_limits<T>::max()));\n"
+    << "    return reg_val<T>{ovf ? T{} : static_cast<T>(res), true, ovf};\n"
+    << "  } else {\n"
+    << "    using Wide = cuda::std::conditional_t<(sizeof(T) < 8), uint64_t, unsigned __int128>;\n"
+    << "    Wide const res = static_cast<Wide>(static_cast<T>(l.val)) * "
+       "static_cast<Wide>(static_cast<T>(r.val));\n"
+    << "    bool const ovf = res > static_cast<Wide>(cuda::std::numeric_limits<T>::max());\n"
+    << "    return reg_val<T>{ovf ? T{} : static_cast<T>(res), true, ovf};\n"
+    << "  }\n"
+    << "}\n\n"
+    << "template <typename T, typename L, typename R>\n"
+    << "__device__ __forceinline__ reg_val<T> eval_div(reg_val<L> l, reg_val<R> r) {\n"
+    << "  bool const ovf_in = l.overflow || r.overflow;\n"
+    << "  bool const valid = l.valid && r.valid;\n"
+    << "  if (!valid || ovf_in) { return reg_val<T>{T{}, valid, ovf_in}; }\n"
+    << "  T const lv = static_cast<T>(l.val);\n"
+    << "  T const rv = static_cast<T>(r.val);\n"
+    << "  if constexpr (cuda::std::is_floating_point_v<T>) {\n"
+    << "    return reg_val<T>{lv / rv, true, false};\n"
+    << "  } else {\n"
+    << "    if (rv == T{0}) { return reg_val<T>{T{}, false, false}; }\n"
+    << "    if constexpr (cuda::std::is_signed_v<T>) {\n"
+    << "      if (lv == cuda::std::numeric_limits<T>::lowest() && rv == T{-1}) {\n"
+    << "        return reg_val<T>{T{}, true, true};\n"
+    << "      }\n"
+    << "    }\n"
+    << "    return reg_val<T>{static_cast<T>(lv / rv), true, false};\n"
+    << "  }\n"
+    << "}\n\n"
+    << "template <typename T, typename L, typename R>\n"
+    << "__device__ __forceinline__ reg_val<T> eval_mod(reg_val<L> l, reg_val<R> r) {\n"
+    << "  bool const ovf_in = l.overflow || r.overflow;\n"
+    << "  bool const valid = l.valid && r.valid;\n"
+    << "  if (!valid || ovf_in) { return reg_val<T>{T{}, valid, ovf_in}; }\n"
+    << "  T const lv = static_cast<T>(l.val);\n"
+    << "  T const rv = static_cast<T>(r.val);\n"
+    << "  if constexpr (cuda::std::is_floating_point_v<T>) {\n"
+    << "    if constexpr (sizeof(T) == 4) {\n"
+    << "      return reg_val<T>{::fmodf(lv, rv), true, false};\n"
+    << "    } else {\n"
+    << "      return reg_val<T>{::fmod(lv, rv), true, false};\n"
+    << "    }\n"
+    << "  } else {\n"
+    << "    if (rv == T{0}) { return reg_val<T>{T{}, false, false}; }\n"
+    << "    if constexpr (cuda::std::is_signed_v<T>) {\n"
+    << "      if (lv == cuda::std::numeric_limits<T>::lowest() && rv == T{-1}) {\n"
+    << "        return reg_val<T>{T{0}, true, false};\n"
+    << "      }\n"
+    << "    }\n"
+    << "    return reg_val<T>{static_cast<T>(lv % rv), true, false};\n"
+    << "  }\n"
+    << "}\n\n"
+    << "template <typename T, typename InT>\n"
+    << "__device__ __forceinline__ reg_val<T> eval_abs(reg_val<InT> in) {\n"
+    << "  if (!in.valid || in.overflow) { return reg_val<T>{T{}, in.valid, in.overflow}; }\n"
+    << "  T const v = static_cast<T>(in.val);\n"
+    << "  if constexpr (cuda::std::is_floating_point_v<T>) {\n"
+    << "    if constexpr (sizeof(T) == 4) {\n"
+    << "      return reg_val<T>{::fabsf(v), true, false};\n"
+    << "    } else {\n"
+    << "      return reg_val<T>{::fabs(v), true, false};\n"
+    << "    }\n"
+    << "  } else if constexpr (cuda::std::is_signed_v<T>) {\n"
+    << "    if (v == cuda::std::numeric_limits<T>::lowest()) {\n"
+    << "      return reg_val<T>{T{}, true, true};\n"
+    << "    }\n"
+    << "    return reg_val<T>{static_cast<T>(v < T{0} ? -v : v), true, false};\n"
+    << "  } else {\n"
+    << "    return reg_val<T>{v, true, false};\n"
+    << "  }\n"
+    << "}\n\n"
+    << "__device__ __forceinline__ bool is_finite_double(double x) {\n"
+    << "  return (x - x) == 0.0;\n"
+    << "}\n\n"
+    << "template <typename T, bool NegativePrecision>\n"
+    << "__device__ __forceinline__ reg_val<T> eval_round(reg_val<T> in, double modifier) {\n"
+    << "  if (!in.valid || in.overflow) { return reg_val<T>{T{}, in.valid, in.overflow}; }\n"
+    << "  double const x = static_cast<double>(in.val);\n"
+    << "  double rounded;\n"
+    << "  if constexpr (NegativePrecision) {\n"
+    << "    rounded = ::round(x / modifier) * modifier;\n"
+    << "    if (!is_finite_double(rounded)) { rounded = 0.0; }\n"
+    << "  } else {\n"
+    << "    rounded = ::round(x * modifier) / modifier;\n"
+    << "    if (!is_finite_double(rounded)) { rounded = x; }\n"
+    << "  }\n"
+    << "  return reg_val<T>{static_cast<T>(rounded), true, false};\n"
+    << "}\n\n"
+    << "extern \"C\" __global__ void sirius_nvrtc_project_kernel(\n";
 
   for (auto const& in_col : ctx.input_columns()) {
     auto const id_str   = std::to_string(in_col.binding_id);
@@ -558,9 +1273,15 @@ std::unique_ptr<cudf::table> evaluate_project_sink(
   src << "}\n";
 
   codegen::jit::CompileOptions opts;
-  opts.arch_cc        = codegen::jit::arch_cc_for_current_device();
-  auto const compiled = codegen::jit::KernelCache::instance().get_or_compile_plain(
-    src.str(), "sirius_nvrtc_project_kernel", opts);
+  opts.arch_cc       = codegen::jit::arch_cc_for_current_device();
+  opts.device_int128 = true;
+  std::shared_ptr<const codegen::jit::CompiledKernel> compiled;
+  try {
+    compiled = codegen::jit::KernelCache::instance().get_or_compile_plain(
+      src.str(), "sirius_nvrtc_project_kernel", opts);
+  } catch (codegen::jit::CompileError const& err) {
+    throw internal_exception("[nvrtc] {}\nLog:\n{}\nSource:\n{}", err.what(), err.log, err.source);
+  }
   CUfunction const fn = compiled->func_for_current_device();
 
   // Allocate output columns and bitmasks.

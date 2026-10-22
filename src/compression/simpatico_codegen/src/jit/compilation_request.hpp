@@ -15,26 +15,34 @@ struct CompilationRequest {
   CompilationRequest(const std::string& source,
                      const std::string& entry,
                      const CompileOptions& opts)
-    : source(source), entry(entry)
+    : source(source), entry(entry), option_count(opts.device_int128 ? 5U : 4U)
   {
     if (opts.arch_cc <= 0) throw std::invalid_argument("NVRTC architecture must be positive");
     std::snprintf(architecture.data(), architecture.size(), "-arch=sm_%d", opts.arch_cc);
-    options = {"-std=c++20", architecture.data(), "--no-source-include", "-default-device"};
+    options = {"-std=c++20",
+               architecture.data(),
+               "--no-source-include",
+               "-default-device",
+               "-device-int128"};
     for (std::size_t i = 0; i < options.size(); ++i)
       option_views[i] = options[i];
   }
   CompilationRequest(const CompilationRequest&)            = delete;
   CompilationRequest& operator=(const CompilationRequest&) = delete;
 
-  RequestView identity_view() const { return {source, entry, program_name, option_views}; }
+  RequestView identity_view() const
+  {
+    return {source, entry, program_name, std::span(option_views).first(option_count)};
+  }
 
   const std::string& source;
   const std::string& entry;
+  std::size_t option_count{4};
   static constexpr const char* program_name = "codegen_jit.cu";
   // Prefix, every possible decimal int digit, sign, and terminator.
   std::array<char, sizeof("-arch=sm_") + std::numeric_limits<int>::digits10 + 2> architecture{};
-  std::array<const char*, 4> options{};
-  std::array<std::string_view, 4> option_views{};
+  std::array<const char*, 5> options{};
+  std::array<std::string_view, 5> option_views{};
 };
 
 CompiledKernel compile_request(const CompilationRequest& request);

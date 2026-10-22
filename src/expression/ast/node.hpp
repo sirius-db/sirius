@@ -194,6 +194,19 @@ struct node {
   [[nodiscard]] sirius::logical_type return_type() const;
 };
 
+inline sirius::logical_type unary_op::return_type() const
+{
+  switch (op) {
+    case kind::op_not:
+    case kind::op_is_null:
+    case kind::op_is_not_null: return sirius::logical_type::make(sirius::type_id::BOOLEAN);
+    case kind::op_try: return child ? child->return_type() : sirius::logical_type{};
+    default:
+      throw internal_exception("[ast::unary_op::return_type] unknown kind: {}",
+                               static_cast<int>(op));
+  }
+}
+
 /// Strict accessors for operator boundaries: return the held alternative or throw
 /// not_implemented_exception (with `context`) when `n` is null or holds a different type.
 [[nodiscard]] reference const& require_reference(node const* n, std::string_view context);

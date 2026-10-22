@@ -101,9 +101,7 @@ std::size_t unary_op::cudf_ast_op_count() const
     case kind::op_not: return 1 + child->cudf_ast_op_count();
     case kind::op_is_null: return 1 + child->cudf_ast_op_count();
     case kind::op_is_not_null: return 2 + child->cudf_ast_op_count();  // NOT(IS_NULL(...))
-    case kind::op_try:
-      throw not_implemented_exception(
-        "[ast::unary_op::cudf_ast_op_count] TRY operator is not implemented.");
+    case kind::op_try: return 0;
     default:
       throw internal_exception("[ast::unary_op::cudf_ast_op_count] unknown kind: {}",
                                static_cast<int>(op));

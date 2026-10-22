@@ -53,6 +53,7 @@ namespace sirius::nvrtc {
   std::span<sirius::ast::node const* const> expressions,
   cudf::table_view const& input,
   ::cuda::stream_ref stream,
-  rmm::device_async_resource_ref mr);
+  rmm::device_async_resource_ref mr,
+  std::size_t* narrow_domain_comparison_count = nullptr);
 
 }  // namespace sirius::nvrtc

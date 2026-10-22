@@ -3833,3 +3833,566 @@ TEST_CASE("nvrtc_jit - changing scalar constant values reuses cached compiled ke
   CHECK(out2->view().column(2).null_count() == 0);
   CHECK(out3->view().column(2).null_count() == in.view.num_rows());
 }
+
+// ============================================================================
+// Ticket #6: Checked integer/float arithmetic, comparisons, BETWEEN, and
+// unary_op (NOT, IS [NOT] NULL, TRY)
+// ============================================================================
+
+TEST_CASE("nvrtc_jit - binary arithmetic, abs, round, and constant_or_null match MATERIALIZE",
+          "[expression_evaluator][nvrtc_jit][ticket6]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = get_resource_ref(*space);
+
+  // Column 0: nullable INT32 (with Carrier Restoration from INT16!)
+  // Column 1: non-nullable INT32
+  // Column 2: nullable DOUBLE
+  std::vector<std::int16_t> col0_vals = {10, -25, 0, 100, -7, 42};
+  std::vector<bool> col0_valids       = {true, true, false, true, true, false};
+  std::vector<std::int32_t> col1_vals = {3, 4, 5, -10, 2, 7};
+  std::vector<double> col2_vals       = {2.675, -2.675, 123.456, 0.0, -98.765, 1.005};
+  std::vector<bool> col2_valids       = {true, true, true, false, true, true};
+  auto const n_rows                   = static_cast<cudf::size_type>(col0_vals.size());
+
+  auto mask0             = cudf::create_null_mask(n_rows, cudf::mask_state::ALL_VALID, stream, mr);
+  auto* mptr0            = static_cast<cudf::bitmask_type*>(mask0.data());
+  cudf::size_type nulls0 = 0;
+  for (cudf::size_type i = 0; i < n_rows; ++i) {
+    if (!col0_valids[i]) {
+      cudf::set_null_mask(mptr0, i, i + 1, false, stream);
+      ++nulls0;
+    }
+  }
+  auto col0 = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT16}, n_rows, std::move(mask0), nulls0, stream, mr);
+  REQUIRE(cudaMemcpy(col0->mutable_view().data<std::int16_t>(),
+                     col0_vals.data(),
+                     n_rows * sizeof(std::int16_t),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+
+  auto col1 = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, n_rows, cudf::mask_state::UNALLOCATED, stream, mr);
+  REQUIRE(cudaMemcpy(col1->mutable_view().data<std::int32_t>(),
+                     col1_vals.data(),
+                     n_rows * sizeof(std::int32_t),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+
+  auto mask2             = cudf::create_null_mask(n_rows, cudf::mask_state::ALL_VALID, stream, mr);
+  auto* mptr2            = static_cast<cudf::bitmask_type*>(mask2.data());
+  cudf::size_type nulls2 = 0;
+  for (cudf::size_type i = 0; i < n_rows; ++i) {
+    if (!col2_valids[i]) {
+      cudf::set_null_mask(mptr2, i, i + 1, false, stream);
+      ++nulls2;
+    }
+  }
+  auto col2 = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::FLOAT64}, n_rows, std::move(mask2), nulls2, stream, mr);
+  REQUIRE(cudaMemcpy(col2->mutable_view().data<double>(),
+                     col2_vals.data(),
+                     n_rows * sizeof(double),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+
+  cudf::table_view tv{{col0->view(), col1->view(), col2->view()}};
+
+  auto const int_t = logical_type::make(type_id::INTEGER);
+  auto const dbl_t = logical_type::make(type_id::DOUBLE);
+
+  auto make_bin = [&](sirius::function_id fid,
+                      std::unique_ptr<ast_node> l,
+                      std::unique_ptr<ast_node> r,
+                      logical_type ret) {
+    std::vector<std::unique_ptr<ast_node>> args;
+    args.push_back(std::move(l));
+    args.push_back(std::move(r));
+    return make_func(fid, std::move(args), ret);
+  };
+
+  duckdb::vector<std::unique_ptr<ast_node>> exprs;
+  // 0: col0 (narrowed INT16->INT32) + col1
+  exprs.push_back(
+    make_bin(sirius::function_id::add, make_ref_typed(0, int_t), make_ref_typed(1, int_t), int_t));
+  // 1: col0 - col1
+  exprs.push_back(
+    make_bin(sirius::function_id::sub, make_ref_typed(0, int_t), make_ref_typed(1, int_t), int_t));
+  // 2: col0 * col1
+  exprs.push_back(
+    make_bin(sirius::function_id::mul, make_ref_typed(0, int_t), make_ref_typed(1, int_t), int_t));
+  // 3: col0 // col1
+  exprs.push_back(make_bin(
+    sirius::function_id::int_div, make_ref_typed(0, int_t), make_ref_typed(1, int_t), int_t));
+  // 4: col0 % col1
+  exprs.push_back(
+    make_bin(sirius::function_id::mod, make_ref_typed(0, int_t), make_ref_typed(1, int_t), int_t));
+  // 5: abs(col0)
+  {
+    std::vector<std::unique_ptr<ast_node>> args;
+    args.push_back(make_ref_typed(0, int_t));
+    exprs.push_back(make_func(sirius::function_id::abs, std::move(args), int_t));
+  }
+  // 6: round(col2, 2)
+  {
+    std::vector<std::unique_ptr<ast_node>> args;
+    args.push_back(make_ref_typed(2, dbl_t));
+    args.push_back(make_int_const(2));
+    exprs.push_back(make_func(sirius::function_id::round, std::move(args), dbl_t));
+  }
+  // 7: round(col2, -1)
+  {
+    std::vector<std::unique_ptr<ast_node>> args;
+    args.push_back(make_ref_typed(2, dbl_t));
+    args.push_back(make_int_const(-1));
+    exprs.push_back(make_func(sirius::function_id::round, std::move(args), dbl_t));
+  }
+  // 8: constant_or_null(777, col0, col2)
+  {
+    std::vector<std::unique_ptr<ast_node>> args;
+    args.push_back(make_int_const(777));
+    args.push_back(make_ref_typed(0, int_t));
+    args.push_back(make_ref_typed(2, dbl_t));
+    exprs.push_back(make_func(sirius::function_id::constant_or_null, std::move(args), int_t));
+  }
+
+  exp_executor mat_exec(
+    exprs, mr, stream, sirius::expression_query_policy{exp_strategy_enum::MATERIALIZE});
+  auto mat_out = mat_exec.evaluate(tv);
+  REQUIRE(mat_out != nullptr);
+  CHECK(mat_exec.restored_reference_cast_count_for_testing() == 1);
+
+  exp_executor jit_exec(
+    exprs, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+  auto jit_out = jit_exec.evaluate(tv);
+  REQUIRE(jit_out != nullptr);
+  // NVRTC_JIT restores col0 inline in registers!
+  CHECK(jit_exec.restored_reference_cast_count_for_testing() == 0);
+
+  REQUIRE(jit_out->num_columns() == mat_out->num_columns());
+  for (cudf::size_type c = 0; c < jit_out->num_columns(); ++c) {
+    CAPTURE(c);
+    auto const jcol = jit_out->view().column(c);
+    auto const mcol = mat_out->view().column(c);
+    REQUIRE(jcol.type() == mcol.type());
+    CHECK(jcol.null_count() == mcol.null_count());
+    auto const jvalids = copy_valids_to_host(jcol);
+    auto const mvalids = copy_valids_to_host(mcol);
+    REQUIRE(jvalids == mvalids);
+    if (jcol.type().id() == cudf::type_id::INT32) {
+      auto const jv = copy_column_to_host<std::int32_t>(jcol);
+      auto const mv = copy_column_to_host<std::int32_t>(mcol);
+      for (std::size_t r = 0; r < jv.size(); ++r) {
+        if (jvalids[r]) { CHECK(jv[r] == mv[r]); }
+      }
+    } else if (jcol.type().id() == cudf::type_id::FLOAT64) {
+      auto const jv = copy_column_to_host<double>(jcol);
+      auto const mv = copy_column_to_host<double>(mcol);
+      for (std::size_t r = 0; r < jv.size(); ++r) {
+        if (jvalids[r]) { CHECK(jv[r] == mv[r]); }
+      }
+    }
+  }
+}
+
+TEST_CASE("nvrtc_jit - division and modulo by zero produce NULL without trapping",
+          "[expression_evaluator][nvrtc_jit][ticket6]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = get_resource_ref(*space);
+
+  // Row 0: 20 / 4 -> 5
+  // Row 1: 20 / 0 (valid divisor 0) -> NULL
+  // Row 2: NULL / 0 (NULL dividend with garbage 0 divisor) -> NULL
+  // Row 3: 20 / NULL (NULL divisor with garbage 0 in buffer) -> NULL
+  // Row 4: -15 / 2 -> -7
+  std::vector<std::int32_t> a_vals = {20, 20, 99, 20, -15};
+  std::vector<bool> a_valids       = {true, true, false, true, true};
+  std::vector<std::int32_t> b_vals = {4, 0, 0, 0, 2};
+  std::vector<bool> b_valids       = {true, true, true, false, true};
+
+  auto batch = make_two_int32_batch_with_nulls(*space, a_vals, a_valids, b_vals, b_valids);
+  auto ro    = batch->to_read_only();
+  auto tv    = ro.get_data()->cast<gpu_table_representation>().get_table_view();
+
+  auto const int_t = logical_type::make(type_id::INTEGER);
+  auto make_bin    = [&](sirius::function_id fid) {
+    std::vector<std::unique_ptr<ast_node>> args;
+    args.push_back(make_ref_typed(0, int_t));
+    args.push_back(make_ref_typed(1, int_t));
+    return make_func(fid, std::move(args), int_t);
+  };
+
+  duckdb::vector<std::unique_ptr<ast_node>> exprs;
+  exprs.push_back(make_bin(sirius::function_id::div));
+  exprs.push_back(make_bin(sirius::function_id::int_div));
+  exprs.push_back(make_bin(sirius::function_id::mod));
+
+  exp_executor jit_exec(
+    exprs, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+  auto jit_out = jit_exec.evaluate(tv);
+  REQUIRE(jit_out != nullptr);
+  REQUIRE(jit_out->num_columns() == 3);
+
+  std::vector<bool> expected_valids = {true, false, false, false, true};
+  for (cudf::size_type c = 0; c < 3; ++c) {
+    auto const col = jit_out->view().column(c);
+    CHECK(col.null_count() == 3);
+    CHECK(copy_valids_to_host(col) == expected_valids);
+  }
+  auto const div_vals  = copy_column_to_host<std::int32_t>(jit_out->view().column(0));
+  auto const idiv_vals = copy_column_to_host<std::int32_t>(jit_out->view().column(1));
+  auto const mod_vals  = copy_column_to_host<std::int32_t>(jit_out->view().column(2));
+  CHECK(div_vals[0] == 5);
+  CHECK(div_vals[4] == -7);
+  CHECK(idiv_vals[0] == 5);
+  CHECK(idiv_vals[4] == -7);
+  CHECK(mod_vals[0] == 0);
+  CHECK(mod_vals[4] == -1);
+}
+
+TEST_CASE(
+  "nvrtc_jit - checked integer overflow throws out_of_range_exception and TRY suppresses it",
+  "[expression_evaluator][nvrtc_jit][ticket6]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = get_resource_ref(*space);
+
+  auto const int_t   = logical_type::make(type_id::INTEGER);
+  auto const int_min = std::numeric_limits<std::int32_t>::min();
+  auto const int_max = std::numeric_limits<std::int32_t>::max();
+
+  auto eval_two_col = [&](std::vector<std::int32_t> const& a_vals,
+                          std::vector<bool> const& a_valids,
+                          std::vector<std::int32_t> const& b_vals,
+                          std::vector<bool> const& b_valids,
+                          ast_node const& expr) {
+    auto batch = make_two_int32_batch_with_nulls(*space, a_vals, a_valids, b_vals, b_valids);
+    auto ro    = batch->to_read_only();
+    auto tv    = ro.get_data()->cast<gpu_table_representation>().get_table_view();
+    exp_executor exec(
+      expr, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+    return exec.evaluate(tv);
+  };
+
+  auto make_bin = [&](sirius::function_id fid) {
+    std::vector<std::unique_ptr<ast_node>> args;
+    args.push_back(make_ref_typed(0, int_t));
+    args.push_back(make_ref_typed(1, int_t));
+    return make_func(fid, std::move(args), int_t);
+  };
+
+  SECTION("signed add overflow throws on valid row, ignored on NULL row, suppressed by TRY")
+  {
+    auto add_expr = make_bin(sirius::function_id::add);
+    REQUIRE_THROWS_AS(eval_two_col({10, int_max}, {true, true}, {5, 1}, {true, true}, *add_expr),
+                      sirius::out_of_range_exception);
+
+    // When the overflowing row is NULL, no exception is thrown!
+    auto null_out = eval_two_col({10, int_max}, {true, false}, {5, 1}, {true, true}, *add_expr);
+    CHECK(null_out->view().column(0).null_count() == 1);
+    CHECK(copy_column_to_host<std::int32_t>(null_out->view().column(0))[0] == 15);
+
+    // When wrapped in TRY, the overflowing row becomes NULL and valid rows are preserved!
+    auto try_expr =
+      make_unary(sirius::ast::unary_op::kind::op_try, make_bin(sirius::function_id::add));
+    auto try_out =
+      eval_two_col({10, int_max, -5}, {true, true, true}, {5, 1, 2}, {true, true, true}, *try_expr);
+    CHECK(try_out->view().column(0).null_count() == 1);
+    CHECK(copy_valids_to_host(try_out->view().column(0)) == std::vector<bool>{true, false, true});
+    auto const try_vals = copy_column_to_host<std::int32_t>(try_out->view().column(0));
+    CHECK(try_vals[0] == 15);
+    CHECK(try_vals[2] == -3);
+  }
+
+  SECTION("signed sub, mul, INT_MIN / -1, and abs(INT_MIN) overflow and INT_MIN % -1 == 0")
+  {
+    auto sub_expr = make_bin(sirius::function_id::sub);
+    REQUIRE_THROWS_AS(eval_two_col({int_min}, {true}, {1}, {true}, *sub_expr),
+                      sirius::out_of_range_exception);
+
+    auto mul_expr = make_bin(sirius::function_id::mul);
+    REQUIRE_THROWS_AS(eval_two_col({int_min}, {true}, {-1}, {true}, *mul_expr),
+                      sirius::out_of_range_exception);
+
+    auto div_expr = make_bin(sirius::function_id::div);
+    REQUIRE_THROWS_AS(eval_two_col({int_min}, {true}, {-1}, {true}, *div_expr),
+                      sirius::out_of_range_exception);
+
+    auto idiv_expr = make_bin(sirius::function_id::int_div);
+    REQUIRE_THROWS_AS(eval_two_col({int_min}, {true}, {-1}, {true}, *idiv_expr),
+                      sirius::out_of_range_exception);
+
+    // INT_MIN % -1 must yield 0 without trapping hardware %
+    auto mod_expr = make_bin(sirius::function_id::mod);
+    auto mod_out  = eval_two_col({int_min}, {true}, {-1}, {true}, *mod_expr);
+    CHECK(mod_out->view().column(0).null_count() == 0);
+    CHECK(copy_column_to_host<std::int32_t>(mod_out->view().column(0))[0] == 0);
+
+    // abs(INT_MIN) throws, TRY(abs(INT_MIN)) yields NULL
+    std::vector<std::unique_ptr<ast_node>> abs_args;
+    abs_args.push_back(make_ref_typed(0, int_t));
+    auto abs_expr = make_func(sirius::function_id::abs, std::move(abs_args), int_t);
+    REQUIRE_THROWS_AS(eval_two_col({-42, int_min}, {true, true}, {0, 0}, {true, true}, *abs_expr),
+                      sirius::out_of_range_exception);
+
+    std::vector<std::unique_ptr<ast_node>> try_abs_args;
+    try_abs_args.push_back(make_ref_typed(0, int_t));
+    auto try_abs     = make_unary(sirius::ast::unary_op::kind::op_try,
+                              make_func(sirius::function_id::abs, std::move(try_abs_args), int_t));
+    auto try_abs_out = eval_two_col({-42, int_min}, {true, true}, {0, 0}, {true, true}, *try_abs);
+    CHECK(try_abs_out->view().column(0).null_count() == 1);
+    CHECK(copy_valids_to_host(try_abs_out->view().column(0)) == std::vector<bool>{true, false});
+    CHECK(copy_column_to_host<std::int32_t>(try_abs_out->view().column(0))[0] == 42);
+  }
+
+  SECTION("unsigned integer overflow on add, sub, mul throws and TRY suppresses it")
+  {
+    auto const u64_t               = logical_type::make(type_id::UBIGINT);
+    std::vector<std::uint64_t> u_a = {10ULL, std::numeric_limits<std::uint64_t>::max()};
+    std::vector<std::uint64_t> u_b = {20ULL, 1ULL};
+    auto col_a                     = cudf::make_numeric_column(
+      cudf::data_type{cudf::type_id::UINT64}, 2, cudf::mask_state::UNALLOCATED, stream, mr);
+    auto col_b = cudf::make_numeric_column(
+      cudf::data_type{cudf::type_id::UINT64}, 2, cudf::mask_state::UNALLOCATED, stream, mr);
+    REQUIRE(cudaMemcpy(col_a->mutable_view().data<std::uint64_t>(),
+                       u_a.data(),
+                       2 * sizeof(std::uint64_t),
+                       cudaMemcpyHostToDevice) == cudaSuccess);
+    REQUIRE(cudaMemcpy(col_b->mutable_view().data<std::uint64_t>(),
+                       u_b.data(),
+                       2 * sizeof(std::uint64_t),
+                       cudaMemcpyHostToDevice) == cudaSuccess);
+    cudf::table_view tv{{col_a->view(), col_b->view()}};
+
+    auto make_u64_bin = [&](sirius::function_id fid) {
+      std::vector<std::unique_ptr<ast_node>> args;
+      args.push_back(make_ref_typed(0, u64_t));
+      args.push_back(make_ref_typed(1, u64_t));
+      return make_func(fid, std::move(args), u64_t);
+    };
+
+    auto u_add = make_u64_bin(sirius::function_id::add);
+    exp_executor exec_add(
+      *u_add, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+    REQUIRE_THROWS_AS(exec_add.evaluate(tv), sirius::out_of_range_exception);
+
+    // Sub underflow: 10 - 20 on unsigned!
+    auto u_sub = make_u64_bin(sirius::function_id::sub);
+    exp_executor exec_sub(
+      *u_sub, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+    REQUIRE_THROWS_AS(exec_sub.evaluate(tv), sirius::out_of_range_exception);
+
+    auto try_sub =
+      make_unary(sirius::ast::unary_op::kind::op_try, make_u64_bin(sirius::function_id::sub));
+    exp_executor exec_try_sub(
+      *try_sub, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+    auto out_sub = exec_try_sub.evaluate(tv);
+    CHECK(out_sub->view().column(0).null_count() == 1);
+    CHECK(copy_valids_to_host(out_sub->view().column(0)) == std::vector<bool>{false, true});
+    CHECK(copy_column_to_host<std::uint64_t>(out_sub->view().column(0))[1] ==
+          std::numeric_limits<std::uint64_t>::max() - 1ULL);
+
+    // Mul overflow: UINT64_MAX * 2 on unsigned!
+    std::vector<std::uint64_t> u_m = {2ULL, 2ULL};
+    REQUIRE(cudaMemcpy(col_b->mutable_view().data<std::uint64_t>(),
+                       u_m.data(),
+                       2 * sizeof(std::uint64_t),
+                       cudaMemcpyHostToDevice) == cudaSuccess);
+    auto u_mul = make_u64_bin(sirius::function_id::mul);
+    exp_executor exec_mul(
+      *u_mul, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+    REQUIRE_THROWS_AS(exec_mul.evaluate(tv), sirius::out_of_range_exception);
+
+    auto try_mul =
+      make_unary(sirius::ast::unary_op::kind::op_try, make_u64_bin(sirius::function_id::mul));
+    exp_executor exec_try_mul(
+      *try_mul, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+    auto out_mul = exec_try_mul.evaluate(tv);
+    CHECK(out_mul->view().column(0).null_count() == 1);
+    CHECK(copy_valids_to_host(out_mul->view().column(0)) == std::vector<bool>{true, false});
+    CHECK(copy_column_to_host<std::uint64_t>(out_mul->view().column(0))[0] == 20ULL);
+  }
+
+  SECTION("signed integer overflow across INT8, INT16, and INT64")
+  {
+    auto check_int_type = [&]<typename T>(type_id tid, cudf::type_id cid) {
+      auto const lt     = logical_type::make(tid);
+      std::vector<T> va = {T{5}, std::numeric_limits<T>::max(), std::numeric_limits<T>::min()};
+      std::vector<T> vb = {T{3}, T{2}, T{-1}};
+      auto ca           = cudf::make_numeric_column(
+        cudf::data_type{cid}, 3, cudf::mask_state::UNALLOCATED, stream, mr);
+      auto cb = cudf::make_numeric_column(
+        cudf::data_type{cid}, 3, cudf::mask_state::UNALLOCATED, stream, mr);
+      REQUIRE(cudaMemcpy(
+                ca->mutable_view().data<T>(), va.data(), 3 * sizeof(T), cudaMemcpyHostToDevice) ==
+              cudaSuccess);
+      REQUIRE(cudaMemcpy(
+                cb->mutable_view().data<T>(), vb.data(), 3 * sizeof(T), cudaMemcpyHostToDevice) ==
+              cudaSuccess);
+      cudf::table_view tv_t{{ca->view(), cb->view()}};
+
+      std::vector<std::unique_ptr<ast_node>> add_args;
+      add_args.push_back(make_ref_typed(0, lt));
+      add_args.push_back(make_ref_typed(1, lt));
+      auto add_node = make_func(sirius::function_id::add, std::move(add_args), lt);
+      exp_executor exec_a(
+        *add_node, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+      REQUIRE_THROWS_AS(exec_a.evaluate(tv_t), sirius::out_of_range_exception);
+
+      std::vector<std::unique_ptr<ast_node>> try_add_args;
+      try_add_args.push_back(make_ref_typed(0, lt));
+      try_add_args.push_back(make_ref_typed(1, lt));
+      auto try_add_node =
+        make_unary(sirius::ast::unary_op::kind::op_try,
+                   make_func(sirius::function_id::add, std::move(try_add_args), lt));
+      exp_executor exec_ta(
+        *try_add_node, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+      auto out_ta = exec_ta.evaluate(tv_t);
+      CHECK(out_ta->view().column(0).null_count() == 2);
+      CHECK(copy_valids_to_host(out_ta->view().column(0)) == std::vector<bool>{true, false, false});
+      CHECK(copy_column_to_host<T>(out_ta->view().column(0))[0] == T{8});
+    };
+
+    check_int_type.template operator()<std::int8_t>(type_id::TINYINT, cudf::type_id::INT8);
+    check_int_type.template operator()<std::int16_t>(type_id::SMALLINT, cudf::type_id::INT16);
+    check_int_type.template operator()<std::int64_t>(type_id::BIGINT, cudf::type_id::INT64);
+  }
+}
+
+TEST_CASE("nvrtc_jit - comparisons, IS [NOT] DISTINCT FROM, BETWEEN, NOT, and IS [NOT] NULL",
+          "[expression_evaluator][nvrtc_jit][ticket6][narrow_domain]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = get_resource_ref(*space);
+
+  // Nullable columns to test all comparison operators, DISTINCT FROM, BETWEEN, NOT, IS [NOT] NULL
+  std::vector<std::int32_t> a_vals = {10, 20, 30, 99, 99, 50};
+  std::vector<bool> a_valids       = {true, true, true, false, false, true};
+  std::vector<std::int32_t> b_vals = {10, 25, 20, 99, 30, 50};
+  std::vector<bool> b_valids       = {true, true, true, false, true, false};
+
+  auto batch = make_two_int32_batch_with_nulls(*space, a_vals, a_valids, b_vals, b_valids);
+  auto ro    = batch->to_read_only();
+  auto tv    = ro.get_data()->cast<gpu_table_representation>().get_table_view();
+
+  auto const int_t = logical_type::make(type_id::INTEGER);
+
+  duckdb::vector<std::unique_ptr<ast_node>> exprs;
+  exprs.push_back(
+    make_cmp(sirius::comparison_type::equal, make_ref_typed(0, int_t), make_ref_typed(1, int_t)));
+  exprs.push_back(make_cmp(
+    sirius::comparison_type::not_equal, make_ref_typed(0, int_t), make_ref_typed(1, int_t)));
+  exprs.push_back(
+    make_cmp(sirius::comparison_type::lt, make_ref_typed(0, int_t), make_ref_typed(1, int_t)));
+  exprs.push_back(
+    make_cmp(sirius::comparison_type::le, make_ref_typed(0, int_t), make_ref_typed(1, int_t)));
+  exprs.push_back(
+    make_cmp(sirius::comparison_type::gt, make_ref_typed(0, int_t), make_ref_typed(1, int_t)));
+  exprs.push_back(
+    make_cmp(sirius::comparison_type::ge, make_ref_typed(0, int_t), make_ref_typed(1, int_t)));
+  exprs.push_back(make_cmp(
+    sirius::comparison_type::distinct_from, make_ref_typed(0, int_t), make_ref_typed(1, int_t)));
+  exprs.push_back(make_cmp(sirius::comparison_type::not_distinct_from,
+                           make_ref_typed(0, int_t),
+                           make_ref_typed(1, int_t)));
+  exprs.push_back(
+    make_between(make_ref_typed(0, int_t), make_int_const(10), make_int_const(30), true, true));
+  exprs.push_back(
+    make_between(make_ref_typed(0, int_t), make_int_const(10), make_int_const(30), false, false));
+  exprs.push_back(make_unary(
+    sirius::ast::unary_op::kind::op_not,
+    make_cmp(sirius::comparison_type::equal, make_ref_typed(0, int_t), make_int_const(20))));
+  exprs.push_back(make_unary(sirius::ast::unary_op::kind::op_is_null, make_ref_typed(0, int_t)));
+  exprs.push_back(
+    make_unary(sirius::ast::unary_op::kind::op_is_not_null, make_ref_typed(0, int_t)));
+
+  exp_executor mat_exec(
+    exprs, mr, stream, sirius::expression_query_policy{exp_strategy_enum::MATERIALIZE});
+  auto mat_out = mat_exec.evaluate(tv);
+  REQUIRE(mat_out != nullptr);
+
+  exp_executor jit_exec(
+    exprs, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+  auto jit_out = jit_exec.evaluate(tv);
+  REQUIRE(jit_out != nullptr);
+
+  REQUIRE(jit_out->num_columns() == mat_out->num_columns());
+  for (cudf::size_type c = 0; c < jit_out->num_columns(); ++c) {
+    CAPTURE(c);
+    auto const jcol = jit_out->view().column(c);
+    auto const mcol = mat_out->view().column(c);
+    CHECK(jcol.null_count() == mcol.null_count());
+    auto const jvalids = copy_valids_to_host(jcol);
+    auto const mvalids = copy_valids_to_host(mcol);
+    REQUIRE(jvalids == mvalids);
+    auto const jv = copy_bool_column_to_host(jcol);
+    auto const mv = copy_bool_column_to_host(mcol);
+    for (std::size_t r = 0; r < jv.size(); ++r) {
+      if (jvalids[r]) { CHECK(jv[r] == mv[r]); }
+    }
+  }
+
+  SECTION(
+    "narrow-domain comparison and BETWEEN preserve narrow_domain_comparison_count under NVRTC_JIT")
+  {
+    auto const bigint_t                = logical_type::make(type_id::BIGINT);
+    auto const date_t                  = logical_type::make(type_id::DATE);
+    std::vector<std::int16_t> narrow_a = {-10, 5, 15, 20, 100};
+    std::vector<std::int16_t> narrow_b = {-5, 5, 20, 10, 100};
+    auto col_na = make_carrier_column(*space, cudf::data_type{cudf::type_id::INT16}, narrow_a);
+    auto col_nb = make_carrier_column(*space, cudf::data_type{cudf::type_id::INT16}, narrow_b);
+    cudf::table_view narrow_tv{{col_na->view(), col_nb->view()}};
+
+    duckdb::vector<std::unique_ptr<ast_node>> narrow_exprs;
+    // 1. narrow ref vs constant
+    narrow_exprs.push_back(
+      make_cmp(sirius::comparison_type::gt, make_ref_typed(0, bigint_t), make_bigint_const(10)));
+    // 2. narrow ref vs narrow ref
+    narrow_exprs.push_back(
+      make_cmp(sirius::comparison_type::le, make_ref_typed(0, date_t), make_ref_typed(1, date_t)));
+    // 3. narrow BETWEEN
+    narrow_exprs.push_back(make_between(
+      make_ref_typed(0, bigint_t), make_bigint_const(0), make_bigint_const(20), true, false));
+
+    exp_executor narrow_mat(
+      narrow_exprs, mr, stream, sirius::expression_query_policy{exp_strategy_enum::MATERIALIZE});
+    auto n_mat_out = narrow_mat.evaluate(narrow_tv);
+
+    exp_executor narrow_jit(
+      narrow_exprs, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+    auto n_jit_out = narrow_jit.evaluate(narrow_tv);
+
+    CHECK(narrow_jit.restored_reference_cast_count_for_testing() == 0);
+    CHECK(narrow_jit.narrow_domain_comparison_count_for_testing() == 3);
+    CHECK(narrow_mat.narrow_domain_comparison_count_for_testing() == 3);
+
+    for (cudf::size_type c = 0; c < 3; ++c) {
+      CHECK(copy_bool_column_to_host(n_jit_out->view().column(c)) ==
+            copy_bool_column_to_host(n_mat_out->view().column(c)));
+    }
+  }
+
+  SECTION(
+    "select() with NVRTC_JIT evaluates comparison, BETWEEN, NOT, and IS [NOT] NULL predicates")
+  {
+    auto pred =
+      make_between(make_ref_typed(0, int_t), make_int_const(15), make_int_const(50), true, true);
+    exp_executor sel_mat(
+      *pred, mr, stream, sirius::expression_query_policy{exp_strategy_enum::MATERIALIZE});
+    exp_executor sel_jit(
+      *pred, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+
+    auto sel_mat_out = sel_mat.select(tv);
+    auto sel_jit_out = sel_jit.select(tv);
+    REQUIRE(sel_jit_out->num_rows() == sel_mat_out->num_rows());
+    CHECK(copy_column_to_host<std::int32_t>(sel_jit_out->view().column(0)) ==
+          copy_column_to_host<std::int32_t>(sel_mat_out->view().column(0)));
+  }
+}

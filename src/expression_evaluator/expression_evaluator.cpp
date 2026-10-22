@@ -299,7 +299,8 @@ std::unique_ptr<cudf::table> expression_evaluator::evaluate(cudf::table_view inp
 
   if (_policy.strategy == expression_evaluator_strategy::NVRTC_JIT &&
       nvrtc::can_compile_project_sink(_ast_expressions, _input_table)) {
-    return nvrtc::evaluate_project_sink(_ast_expressions, _input_table, _stream, _mr);
+    return nvrtc::evaluate_project_sink(
+      _ast_expressions, _input_table, _stream, _mr, &_narrow_domain_comparison_count);
   }
 
   // Per-result column post-processing. The node's kind and result type are read

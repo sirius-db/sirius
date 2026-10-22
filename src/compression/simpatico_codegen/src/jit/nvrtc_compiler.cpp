@@ -175,7 +175,7 @@ CompiledKernel detail::compile_request(const CompilationRequest& request)
                                     hdr_names.data()));
 
   nvrtcResult compile_result =
-    nvrtcCompileProgram(prog, static_cast<int>(request.options.size()), request.options.data());
+    nvrtcCompileProgram(prog, static_cast<int>(request.option_count), request.options.data());
 
   // Capture the log unconditionally so warnings on success and errors
   // on failure surface to callers symmetrically.

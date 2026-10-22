@@ -25,6 +25,8 @@
 #include <helper/logical_type.hpp>
 
 #include <cstdint>
+#include <initializer_list>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -97,11 +99,33 @@ class translation_context {
     return _constants;
   }
 
+  [[nodiscard]] std::size_t narrow_domain_comparison_count() const noexcept
+  {
+    return _narrow_domain_comparison_count;
+  }
+
   [[nodiscard]] std::string body_code() const { return _body.str(); }
 
  private:
   [[nodiscard]] register_value produce_reference(sirius::ast::reference const& expr);
   [[nodiscard]] register_value produce_constant(sirius::ast::constant const& expr);
+  [[nodiscard]] register_value produce_comparison(sirius::ast::comparison const& expr);
+  [[nodiscard]] register_value produce_between(sirius::ast::between const& expr);
+  [[nodiscard]] register_value produce_unary_op(sirius::ast::unary_op const& expr);
+  [[nodiscard]] register_value produce_function_call(sirius::ast::function_call const& expr);
+
+  [[nodiscard]] std::optional<cudf::data_type> narrow_domain_carrier(
+    sirius::ast::node const& column_operand,
+    std::initializer_list<sirius::ast::node const*> constant_operands) const;
+
+  [[nodiscard]] std::optional<cudf::data_type> narrow_domain_reference_pair_carrier(
+    sirius::ast::node const& lhs, sirius::ast::node const& rhs) const;
+
+  [[nodiscard]] register_value produce_narrow_domain_operand(
+    sirius::ast::node const& operand, std::optional<cudf::data_type> narrow_carrier);
+
+  [[nodiscard]] register_value produce_constant_in_carrier(sirius::ast::constant const& expr,
+                                                           cudf::data_type carrier);
 
   [[nodiscard]] std::size_t get_or_bind_input_column(std::uint32_t column_index);
 
@@ -109,6 +133,7 @@ class translation_context {
   std::vector<input_column_binding> _input_columns;
   std::vector<loaded_reference_entry> _loaded_references;
   std::vector<scalar_constant_binding> _constants;
+  std::size_t _narrow_domain_comparison_count{0};
   std::ostringstream _body;
   std::size_t _next_var_id{0};
 };
