@@ -1001,6 +1001,14 @@ unique_ptr<FunctionData> SiriusRegistration::PinTableBind(ClientContext& context
     result->args.cols = std::move(cols);
   }
 
+  auto numa_it = input.named_parameters.find("numa_id");
+  if (numa_it != input.named_parameters.end() && !numa_it->second.IsNull()) {
+    if (result->args.tier != "host") {
+      throw BinderException("pin_table 'numa_id' only applies to tier='host'");
+    }
+    result->args.numa_id = numa_it->second.GetValue<int32_t>();
+  }
+
   auto compression_it = input.named_parameters.find("compression");
   if (compression_it != input.named_parameters.end() && !compression_it->second.IsNull()) {
     result->args.compression = compression_it->second.GetValue<bool>();
@@ -1094,15 +1102,33 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
     throw InvalidInputException("pin_table: no GPU memory space available");
   }
 
-  // For host tier, build a target_gpu_id -> NUMA-local host memory_space map.
-  // Each round-robin GPU's host conversion should pin its data on the host
-  // memory_space whose NUMA node matches the GPU. Fall back to host_spaces[0]
-  // when the GPU's NUMA node is unknown or no matching host space exists.
+  // For host tier, build a target_gpu_id -> host memory_space map. With an explicit
+  // numa_id every GPU's chunks go to that host space. Otherwise each round-robin GPU's
+  // host conversion pins its data on the host memory_space whose NUMA node matches the
+  // GPU, falling back to host_spaces[0] when the GPU's NUMA node is unknown or no
+  // matching host space exists.
   std::unordered_map<int, cucascade::memory::memory_space*> host_space_by_gpu;
   if (data.args.tier == "host") {
     auto host_spaces = memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
     if (host_spaces.empty()) {
       throw InvalidInputException("pin_table: no HOST memory space available");
+    }
+    cucascade::memory::memory_space* requested_host = nullptr;
+    if (data.args.numa_id) {
+      std::string available;
+      for (auto const* hs : host_spaces) {
+        if (hs->get_device_id() == *data.args.numa_id) {
+          requested_host = const_cast<cucascade::memory::memory_space*>(hs);
+          break;
+        }
+        available += (available.empty() ? "" : ", ") + std::to_string(hs->get_device_id());
+      }
+      if (requested_host == nullptr) {
+        throw InvalidInputException(
+          "pin_table: no HOST memory space with numa_id %d (configured host spaces: %s)",
+          *data.args.numa_id,
+          available);
+      }
     }
     auto* fallback_host = const_cast<cucascade::memory::memory_space*>(host_spaces[0]);
     auto const& topo    = sirius_ctx->get_config().get_hw_topology();
@@ -1113,7 +1139,9 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
         numa_node = topo.gpus[gpu_id].numa_node;
       }
       cucascade::memory::memory_space* picked = fallback_host;
-      if (numa_node >= 0) {
+      if (requested_host != nullptr) {
+        picked = requested_host;
+      } else if (numa_node >= 0) {
         for (auto* hs : host_spaces) {
           if (hs->get_device_id() == numa_node) {
             picked = const_cast<cucascade::memory::memory_space*>(hs);
@@ -1122,6 +1150,10 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
         }
       }
       host_space_by_gpu[gpu_id] = picked;
+      SIRIUS_LOG_INFO("[pin_table] '{}' tier=host: GPU:{} chunks pin on HOST:{}",
+                      data.args.name,
+                      gpu_id,
+                      picked->get_device_id());
     }
   }
 
@@ -2384,6 +2416,7 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
       options.Add("compression", LogicalType::BOOLEAN);
       options.Add("format", LogicalType::VARCHAR);
       options.Add("schema_name", LogicalType::VARCHAR);
+      options.Add("numa_id", LogicalType::INTEGER);
     });
     pin_table_set.AddFunction(std::move(pin_table));
   };

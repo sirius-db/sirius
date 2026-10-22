@@ -49,6 +49,9 @@ struct PinTableArgs {
   /// duckdb-native only: schema that contains the table named by `name`. Defaults
   /// to "main"; the catalog search path (current/USE'd database) still applies.
   std::string schema = "main";
+  /// tier='host' only: NUMA id of the HOST memory space every chunk is pinned on.
+  /// When omitted, each GPU's chunks go to the host space on that GPU's NUMA node.
+  std::optional<int> numa_id;
 };
 
 void pin_table_to(const PinTableArgs& args);
