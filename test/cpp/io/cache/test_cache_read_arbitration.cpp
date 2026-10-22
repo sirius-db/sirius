@@ -485,6 +485,13 @@ TEST_CASE("prefetch coverage distinguishes resident extents from successful subm
           "[cache][read-arbitration][prefetch-coverage]")
 {
   cache_fixture fixture;
+  // Independent opens share cached bytes only with a stable object identity.
+  // Without a validator, each open deliberately gets its own generation.
+  auto open = [&] {
+    return std::make_unique<sirius::io::sirius_datasource>(
+      fixture.context, std::make_shared<controlled_object>("controlled://resident-coverage", "v1"));
+  };
+  fixture.datasource = open();
   fixture.advise(0);
   REQUIRE(fixture.datasource->prefetch_async([](sirius::io::cache::prefetch_result) noexcept {}) ==
           sirius::io::prefetch_refusal::issued);
@@ -499,8 +506,9 @@ TEST_CASE("prefetch coverage distinguishes resident extents from successful subm
   SECTION("resident A is narrower than requested") { wider_a = true; }
   SECTION("all requested bytes already resident") { include_b = false; }
   SECTION("resident A and failed B") { fail_b = true; }
-  auto ds = fixture.context->open_datasource("controlled://cache-read-arbitration");
-  std::vector<cudf::io::text::byte_range_info> ranges{{0, wider_a ? 2 * read_size : read_size}};
+  auto ds = open();
+  std::vector<cudf::io::text::byte_range_info> ranges{
+    {0, static_cast<std::int64_t>(wider_a ? 2 * read_size : read_size)}};
   if (include_b) ranges.emplace_back(chunk_size, read_size);
   ds->fadvise(ranges, 0);
   REQUIRE(ds->prepare_prefetch(false) == sirius::io::prepare_result::prepared);
@@ -510,9 +518,11 @@ TEST_CASE("prefetch coverage distinguishes resident extents from successful subm
   auto const issued = ds->prefetch_async([&](sirius::io::cache::prefetch_result out) noexcept {
     if (calls.fetch_add(1) == 0) done.set_value(out);
   });
+  // Issue is synchronous even though completion is controlled by the test.
+  // Own unexpected IO too, so a failed no-IO assertion cannot hang teardown.
+  held_request io{fixture.context->reactor().take_next(0ms)};
   if (include_b) {
     CHECK(issued == sirius::io::prefetch_refusal::issued);
-    held_request io{fixture.context->reactor().take_next()};
     REQUIRE(io);
     if (fail_b)
       complete_failure(*io);
@@ -520,7 +530,8 @@ TEST_CASE("prefetch coverage distinguishes resident extents from successful subm
       complete_success(*io);
   } else {
     CHECK(issued != sirius::io::prefetch_refusal::issued);
-    CHECK(fixture.context->reactor().pending() == 0);
+    CHECK_FALSE(io);
+    if (io) complete_failure(*io);
   }
   REQUIRE(result.wait_for(2s) == std::future_status::ready);
   auto const out = result.get();
