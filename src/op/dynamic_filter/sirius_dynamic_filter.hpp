@@ -46,7 +46,8 @@ namespace sirius::op {
 
 namespace detail {
 class accumulated_bloom_builder;
-}
+struct fused_probe;
+}  // namespace detail
 
 enum class sirius_dynamic_filter_kind { ZONE_MAP, IN_LIST, BLOOM };
 
@@ -168,6 +169,26 @@ class sirius_mask_applicable {
   virtual ~sirius_mask_applicable() = default;
 
   /**
+   * @brief Describes a device-local probe for try_fused_membership_mask
+   *
+   * Unlike compute_mask[_if](),his host-only operation submits no GPU work and allocates no device
+   * storage. It simply describes how a fused kernel should perform a given membership test. A
+   * successful descriptor borrows this filter's replica and the probe column until GPU completion.
+   * False leaves `out` unchanged and does not imply that compute_mask must decline.
+   *
+   * @param probe Keys to probe
+   * @param device_id Device holding the filter replica
+   * @param out Destination for a supported descriptor
+   * @return Whether the descriptor is ready
+   */
+  [[nodiscard]] virtual bool prepare_fused_probe(cudf::column_view const& probe,
+                                                 int device_id,
+                                                 detail::fused_probe& out) const
+  {
+    return false;
+  }
+
+  /**
    * @brief Returns `probe.size()` BOOL8 values (`true` keeps), or null for an incompatible probe
    *
    * The membership implementations accept any integer carrier of the key's signedness
@@ -194,6 +215,34 @@ class sirius_mask_applicable {
     int device_id,
     ::cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) const = 0;
+
+  /**
+   * @brief Probes with a BOOL8 hint using the same key and result semantics as compute_mask
+   *
+   * The default ignores the hint without validating it; the membership filters skip rejected rows
+   * without packing. Callers must AND the result with the running conjunction even when the hint is
+   * honored.
+   *
+   * @pre `prior_keep` is nonnullable BOOL8 with `probe.size()` rows in probe order. Both views may
+   * be slices; their storage and this filter must outlive work submitted on `stream`.
+   * @throw std::invalid_argument if an implementation that honors the hint finds `prior_keep`
+   * violating the precondition
+   * @param probe Keys to probe
+   * @param prior_keep Running conjunction; false permits skipping a lookup
+   * @param device_id Device holding the filter replica
+   * @param stream Stream ordering the probe
+   * @param mr Resource for the result
+   * @return Nonnullable keep mask, or null when the probe or device cannot be served
+   */
+  [[nodiscard]] virtual std::unique_ptr<cudf::column> compute_mask_if(
+    cudf::column_view const& probe,
+    cudf::column_view const& prior_keep,
+    int device_id,
+    ::cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) const
+  {
+    return compute_mask(probe, nullptr, device_id, stream, mr);
+  }
 
   /// The prior-free form: every implementation is the overload above with no prior mask, so the
   /// forwarder is defined once here. Implementations re-expose it with a using-declaration.
@@ -255,6 +304,17 @@ class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
     ::cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) const override;
 
+  [[nodiscard]] std::unique_ptr<cudf::column> compute_mask_if(
+    cudf::column_view const& probe,
+    cudf::column_view const& prior_keep,
+    int device_id,
+    ::cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) const override;
+
+  [[nodiscard]] bool prepare_fused_probe(cudf::column_view const& probe,
+                                         int device_id,
+                                         detail::fused_probe& out) const override;
+
   void replicate_to_devices(std::span<dynamic_filter_replica_space const> spaces) override;
   [[nodiscard]] bool is_available_on_device(int device_id) const noexcept override;
 
@@ -268,6 +328,14 @@ class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
                                                        cudf::data_type key_type) noexcept;
 
  private:
+  [[nodiscard]] std::unique_ptr<cudf::column> compute_mask_impl(
+    cudf::column_view const& probe,
+    std::uint32_t const* prior_mask_words,
+    bool const* prior_keep,
+    int device_id,
+    ::cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) const;
+
   membership_key_domain _domain{};
   std::size_t _num_keys = 0;
 
@@ -321,17 +389,35 @@ class sirius_dynamic_small_in_list_filter final : public sirius_dynamic_filter,
     ::cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) const override;
 
+  [[nodiscard]] std::unique_ptr<cudf::column> compute_mask_if(
+    cudf::column_view const& probe,
+    cudf::column_view const& prior_keep,
+    int device_id,
+    ::cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) const override;
+
+  [[nodiscard]] bool prepare_fused_probe(cudf::column_view const& probe,
+                                         int device_id,
+                                         detail::fused_probe& out) const override;
+
   void replicate_to_devices(std::span<dynamic_filter_replica_space const> spaces) override;
   [[nodiscard]] bool is_available_on_device(int device_id) const noexcept override;
 
   [[nodiscard]] std::size_t replica_count() const noexcept;
-  [[nodiscard]] std::size_t size() const noexcept { return _num_keys; }
+  [[nodiscard]] std::size_t size() const noexcept;
   [[nodiscard]] membership_key_domain const& domain() const noexcept { return _domain; }
   [[nodiscard]] static bool supports(cudf::column_view const& keys) noexcept;
 
  private:
+  [[nodiscard]] std::unique_ptr<cudf::column> compute_mask_impl(
+    cudf::column_view const& probe,
+    std::uint32_t const* prior_mask_words,
+    bool const* prior_keep,
+    int device_id,
+    ::cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) const;
+
   membership_key_domain _domain{};
-  std::size_t _num_keys = 0;
 
   struct needle_store;
   std::unique_ptr<needle_store> _store;
@@ -376,6 +462,17 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
     ::cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) const override;
 
+  [[nodiscard]] std::unique_ptr<cudf::column> compute_mask_if(
+    cudf::column_view const& probe,
+    cudf::column_view const& prior_keep,
+    int device_id,
+    ::cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) const override;
+
+  [[nodiscard]] bool prepare_fused_probe(cudf::column_view const& probe,
+                                         int device_id,
+                                         detail::fused_probe& out) const override;
+
   void replicate_to_devices(std::span<dynamic_filter_replica_space const> spaces) override;
   [[nodiscard]] bool is_available_on_device(int device_id) const noexcept override;
 
@@ -385,6 +482,14 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
   [[nodiscard]] static std::size_t estimated_bytes(std::size_t num_keys) noexcept;
 
  private:
+  [[nodiscard]] std::unique_ptr<cudf::column> compute_mask_impl(
+    cudf::column_view const& probe,
+    std::uint32_t const* prior_mask_words,
+    bool const* prior_keep,
+    int device_id,
+    ::cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) const;
+
   friend class detail::accumulated_bloom_builder;
   membership_key_domain _domain{};
   struct impl;

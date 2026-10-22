@@ -407,6 +407,11 @@ class parquet_gpu_ingestible : public gpu_ingestible {
     std::span<std::size_t const> elided,
     expression_query_policy policy = {}) override;
 
+  [[nodiscard]] bool can_serve_cached_view() const noexcept override;
+
+  [[nodiscard]] std::optional<cached_view_layout> view_layout(
+    filtered_table const& input, std::span<std::size_t const> elided) const override;
+
   [[nodiscard]] const ingestible_table_info& table_info() const noexcept override { return *_info; }
 
   [[nodiscard]] std::vector<std::size_t> materialized_column_order() const override;
@@ -431,6 +436,10 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   }
 
  private:
+  /// The remaining predicate after the ingestible has applied its pushdown filter and projection.
+  [[nodiscard]] std::unique_ptr<sirius::ast::node> remaining_residual(
+    filtered_table const& input) const;
+
   /// Read one file's footer, prune its row groups against the file's byte ranges
   /// (@ref parquet_ingestible_table_info::resolved_file_ranges at @p file_index) and the
   /// filter, and record per-row-group byte accounting. Returns a single

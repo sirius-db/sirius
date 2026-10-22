@@ -18,8 +18,11 @@
 #include "op/dynamic_filter/detail/accumulated_bloom_builder.hpp"
 #include "op/dynamic_filter/detail/accumulation_failure.hpp"
 #include "op/dynamic_filter/dynamic_filter_replica_reservation.hpp"
+#include "op/scan/dynamic_filter_merge.hpp"
+#include "sirius/exception.hpp"
 #include "utils/host_allocation_fault.hpp"
 #include "utils/sirius_test_env.hpp"
+#include "utils/test_validation_utility.hpp"
 
 #include <cudf/column/column_view.hpp>
 #include <cudf/copying.hpp>
@@ -64,8 +67,8 @@ static_assert(std::is_nothrow_constructible_v<op::detail::accumulation_cuda_erro
 static_assert(std::is_nothrow_copy_constructible_v<op::detail::accumulation_cuda_error>);
 static_assert(
   std::is_nothrow_constructible_v<op::detail::accumulation_invariant_error, char const*>);
-static_assert(std::is_nothrow_default_constructible_v<op::detail::unjoined_gpu_work>);
-static_assert(std::is_nothrow_copy_constructible_v<op::detail::unjoined_gpu_work>);
+static_assert(std::is_nothrow_default_constructible_v<sirius::unjoined_gpu_work>);
+static_assert(std::is_nothrow_copy_constructible_v<sirius::unjoined_gpu_work>);
 
 /**
  * @brief Bytes one GPU's partials occupy for @p keys keys over @p rows total rows.
@@ -865,7 +868,7 @@ TEST_CASE("each accumulation failure kind sets exactly its counters",
       throw op::detail::accumulation_cuda_error{cudaErrorIllegalAddress, false, "body"};
     } catch (...) {
       try {
-        std::throw_with_nested(op::detail::unjoined_gpu_work{});
+        std::throw_with_nested(sirius::unjoined_gpu_work{});
       } catch (...) {
         return std::current_exception();
       }
@@ -1683,11 +1686,11 @@ TEST_CASE("fatal accumulation diagnostics do not allocate during host OOM",
       try {
         throw std::bad_alloc{};
       } catch (...) {
-        if (unjoined) { std::throw_with_nested(op::detail::unjoined_gpu_work{}); }
+        if (unjoined) { std::throw_with_nested(sirius::unjoined_gpu_work{}); }
         std::throw_with_nested(
           op::detail::accumulation_cuda_error{cudaErrorIllegalAddress, false, "failure cleanup"});
       }
-    } catch (op::detail::unjoined_gpu_work const&) {
+    } catch (sirius::unjoined_gpu_work const&) {
       preserved = unjoined;
     } catch (op::detail::accumulation_cuda_error const& error) {
       preserved =
@@ -1698,4 +1701,56 @@ TEST_CASE("fatal accumulation diagnostics do not allocate during host OOM",
   }
   REQUIRE(preserved);
   REQUIRE(allocations == 0);
+}
+
+TEST_CASE("cached fusion probes accumulated Bloom replicas through narrower carriers",
+          "[dynamic_filter][multi_partition][fused_consumer]")
+{
+  acc::fixture fixture;
+  auto first  = fixture.make_batch(0, 0, 300);
+  auto second = fixture.make_batch(0, 900, 300);
+  REQUIRE(fixture.begin({first, second}));
+  fixture.contribute(first);
+  fixture.contribute(second);
+  fixture.publish(0, second->get_batch_id());
+  auto const stream = fixture.task_stream(0);
+  auto const mr     = fixture.gpu(0).get_default_allocator();
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(
+    make_probe<int16_t>({0, 1, 299, 500, 900}, stream, {true, false, true, true, true}));
+  columns.push_back(make_probe<int32_t>({1, 4, 898, 1501, 2701}, stream));
+  auto source = sirius::make_data_batch(
+    std::make_unique<cudf::table>(std::move(columns)), fixture.gpu(0), stream, {});
+  auto const view = sirius::get_cudf_table_view(*source);
+  op::scan::dynamic_filter_consumer ordinary(
+    fixture.channel, {.force_counts = true, .fused_membership = false}, {});
+  op::scan::dynamic_filter_consumer fused(
+    fixture.channel, {.force_counts = true, .fused_membership = true}, {});
+  std::array bindings{op::scan::binding{0, 0}, op::scan::binding{1, 1}};
+  op::scan::cached_view_layout layout;
+  layout.output_columns    = {0, 1};
+  layout.projected_columns = {1, 0};
+  op::scan::application_input input{
+    .source = view, .bindings = bindings, .cached_layout = &layout, .want_row_positions = true};
+  auto a = ordinary.prepare(input);
+  auto b = fused.prepare(input);
+  REQUIRE(a);
+  REQUIRE(b);
+  REQUIRE(op::scan::detail::consumer_test_access::same_selection(*a, *b));
+  auto left = ordinary.apply(
+    std::move(*a), op::scan::owning_table_view{source->to_read_only(), view}, stream, mr);
+  auto right = fused.apply(
+    std::move(*b), op::scan::owning_table_view{source->to_read_only(), view}, stream, mr);
+  REQUIRE(op::scan::detail::consumer_test_access::storage(left).fused_rounds == 0);
+  REQUIRE(op::scan::detail::consumer_test_access::storage(right).fused_rounds == 1);
+  REQUIRE(std::vector<cudf::size_type>(left.prefix_counts().begin(), left.prefix_counts().end()) ==
+          std::vector<cudf::size_type>(right.prefix_counts().begin(), right.prefix_counts().end()));
+  auto output_a = left.take_output();
+  auto output_b = right.take_output();
+  REQUIRE(sirius::test::expect_tables_equivalent_impl(output_a->view(), output_b->view(), stream));
+  auto positions_a = left.take_row_positions();
+  auto positions_b = right.take_row_positions();
+  REQUIRE(sirius::test::operator_utils::copy_column_to_host<int32_t>(positions_a->view(), stream) ==
+          sirius::test::operator_utils::copy_column_to_host<int32_t>(positions_b->view(), stream));
+  REQUIRE(ordinary.finish(std::move(left), 1).applied == fused.finish(std::move(right), 1).applied);
 }

@@ -160,6 +160,8 @@ decode (see [Compressed Pinning](compressed-pinning.md)).
 
 Dynamic membership filters cannot meet a deferral during decode today: the decode attaches them only to compressed pins, and install refuses every compressed origin (see Known limits). A guard keeps it that way should compressed origins become deferrable: `sirius_gpu_scan_operator::decode_consumer` is null once a deferral is installed, and `prepare_for_query` installs every deferral, riders included, before it builds any provider, so the scan's dynamic-filter endpoint would apply those filters after substitution instead. Should a deferring scan's decode remove rows anyway, `execute` fails with a named internal error, before any filtering or projection, rather than addressing rows the batch no longer holds.
 
+With the internal resident Parquet checkpoint enabled, the scan can apply membership masks before substitution. It checks the original materialized row count against the chunk origin before any mask, then selects original positions with the same conjunction used for the payload. Substitution forms each rowid from the origin offset plus that selected position, including when all deferred output columns were elided. The scan keeps the ordinary owned output representation. The placement flag is true by default.
+
 Port restoration changes values, not rows, so it keeps the payload it restores: its dynamic type, original batch IDs, preferred device, partition index and scan receipt (see [Dynamic Filters](dynamic-filters.md#scan-receipts-and-decode-history)).
 
 A column every reader only COUNTs needs no far end at all: `install_count_deferral` is the one
