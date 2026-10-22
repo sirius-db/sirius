@@ -1289,7 +1289,7 @@ TEST_CASE("fixed hash routing and concat-all assemble fragmented input for an op
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER});
   sirius_physical_partition router(types, 6, partition_spec{{0}});
   sirius_physical_concat concat(types, 6, true);
-  sirius_physical_operator consumer(SiriusPhysicalOperatorType::WINDOW, types, 6);
+  sirius::op::test_physical_operator consumer(SiriusPhysicalOperatorType::WINDOW, types, 6);
   cucascade::shared_data_repository concat_repo;
   cucascade::shared_data_repository consumer_repo;
   auto producer             = std::make_shared<controllable_pipeline>(false);
