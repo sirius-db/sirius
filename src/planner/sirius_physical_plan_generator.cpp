@@ -94,9 +94,11 @@
 #include <duckdb/common/serializer/binary_serializer.hpp>
 #include <duckdb/common/serializer/memory_stream.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <filesystem>
 #include <limits>
 #include <numeric>
 #include <set>
@@ -217,6 +219,44 @@ void wrap_above(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
   slot          = std::forward<WrapperFactory>(factory)(std::move(original));
 }
 
+//! Distributed: every rank binds every file of a table and scans its share of them. Local files
+//! are split by byte range (`byte_ranges_for_rank`); remote ones, which take no byte ranges,
+//! whole, files rank, rank + world, ...
+void assign_files_to_rank(sirius::op::scan::parquet_ingestible_table_info& info,
+                          std::vector<std::string> files,
+                          const sirius::operator_params& op_params)
+{
+  auto const world = op_params.exchange_peers.size();
+  auto const rank  = op_params.exchange_rank;
+  if (world <= 1) {
+    info.resolved_file_paths = std::move(files);
+    return;
+  }
+  auto const remote = std::any_of(
+    files.begin(), files.end(), [](auto const& f) { return f.find("://") != std::string::npos; });
+  if (remote) {
+    if (files.size() < world) {
+      throw sirius::not_implemented_exception(
+        "distributed execution: a remote table of {} files across {} ranks; each rank needs one",
+        files.size(),
+        world);
+    }
+    for (std::size_t i = rank; i < files.size(); i += world) {
+      info.resolved_file_paths.push_back(std::move(files[i]));
+    }
+    return;
+  }
+  std::vector<std::uint64_t> bytes;
+  bytes.reserve(files.size());
+  for (auto const& f : files) {
+    bytes.push_back(std::filesystem::file_size(f));
+  }
+  for (auto const& r : sirius::planner::byte_ranges_for_rank(bytes, rank, world)) {
+    info.resolved_file_paths.push_back(std::move(files[r.file]));
+    info.resolved_file_ranges.push_back({{r.start, r.length}});
+  }
+}
+
 //! Attach the plan-carried byte ranges to the scan's files, claiming each file's ranges from the
 //! per-plan registry. A file keeps ONE entry holding all its ranges: the bound read view requires
 //! one entry per bound file. If the bind kept repeated occurrences of a ranged path, the first
@@ -239,25 +279,6 @@ void attach_byte_ranges(sirius::op::scan::parquet_ingestible_table_info& info,
       info.resolved_file_ranges[i] = {kOwnsNothing};
     }
   }
-}
-
-//! Distributed: every rank binds every file of a table, and scans files rank, rank + world, ...
-std::vector<std::string> stripe_for_rank(std::vector<std::string> files,
-                                         const sirius::operator_params& op_params)
-{
-  auto const world = op_params.exchange_peers.size();
-  if (world <= 1) { return files; }
-  if (files.size() < world) {
-    throw sirius::not_implemented_exception(
-      "distributed execution: a table of {} files across {} ranks; each rank needs one",
-      files.size(),
-      world);
-  }
-  std::vector<std::string> mine;
-  for (std::size_t i = op_params.exchange_rank; i < files.size(); i += world) {
-    mine.push_back(std::move(files[i]));
-  }
-  return mine;
 }
 
 //! Fill the parquet bind data from a TABLE_SCAN. Split out from
@@ -358,7 +379,7 @@ void populate_parquet_table_info(sirius::op::scan::parquet_ingestible_table_info
       throw std::runtime_error(
         "[sirius_physical_plan_generator::build_parquet_table_info] No input files to scan");
     }
-    info->resolved_file_paths = stripe_for_rank(std::move(resolved_file_paths), op_params);
+    assign_files_to_rank(*info, std::move(resolved_file_paths), op_params);
   }
 
   info->approximate_batch_size = op_params.scan_task_batch_size;

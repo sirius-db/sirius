@@ -50,6 +50,7 @@ set(TEST_SOURCES
     test/cpp/downgrade/test_downgrade_lifecycle.cpp
     test/cpp/downgrade/test_spill_policy.cpp
     test/cpp/exchange/test_exchange_batch_io.cpp
+    test/cpp/exchange/test_exchange_byte_ranges.cpp
     test/cpp/exchange/test_exchange_collectives.cpp
     test/cpp/exchange/test_exchange_operators.cpp
     test/cpp/exchange/test_exchange_transport.cpp

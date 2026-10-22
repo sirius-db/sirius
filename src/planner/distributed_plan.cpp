@@ -279,4 +279,28 @@ void distribute_plan(duckdb::unique_ptr<op::sirius_physical_operator>& plan,
   require_same_shape(r);
 }
 
+std::vector<file_byte_range> byte_ranges_for_rank(std::span<std::uint64_t const> file_bytes,
+                                                  std::size_t rank,
+                                                  std::size_t world)
+{
+  std::uint64_t total = 0;
+  for (auto const bytes : file_bytes) {
+    total += bytes;
+  }
+  // floor(total * r / world), without the product overflowing.
+  auto const cut = [total, world](std::size_t r) {
+    return total / world * r + total % world * r / world;
+  };
+  auto const begin = cut(rank);
+  auto const end   = cut(rank + 1);
+  std::vector<file_byte_range> mine;
+  std::uint64_t offset = 0;
+  for (std::size_t f = 0; f < file_bytes.size(); offset += file_bytes[f], ++f) {
+    auto const from = std::max(begin, offset);
+    auto const to   = std::min(end, offset + file_bytes[f]);
+    if (from < to) { mine.push_back({f, from - offset, to - from}); }
+  }
+  return mine;
+}
+
 }  // namespace sirius::planner
