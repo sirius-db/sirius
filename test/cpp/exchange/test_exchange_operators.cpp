@@ -26,7 +26,10 @@
 #include "op/partition/gpu_partition_impl.hpp"
 #include "op/sirius_physical_exchange_sink.hpp"
 #include "op/sirius_physical_exchange_source.hpp"
+#include "op/sirius_physical_top_n_merge.hpp"
+#include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
 #include "pipeline/sirius_pipeline.hpp"
+#include "planner/sirius_physical_plan_generator.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/table/table.hpp>
@@ -340,6 +343,34 @@ TEST_CASE("an exchange source hints READY with data, waits while open, ends when
   sink.finalize_operator();
   CHECK(source.all_ports_empty());
   CHECK_FALSE(source.get_next_task_hint().has_value());
+}
+
+TEST_CASE("an exchange source ends its pipeline under a merge of partial results",
+          "[exchange][operators]")
+{
+  ranks c(1);
+  stream_id next    = 8;
+  auto const source = [&] {
+    return duckdb::make_uniq<sirius_physical_exchange_source>(
+      key_value_types(), 0, c.all[0].service, next++, std::set<rank_t>{0}, false);
+  };
+  using sirius::planner::sirius_physical_plan_generator;
+
+  auto alone = source();
+  sirius_physical_plan_generator::set_parent_ops(*alone, nullptr);
+  CHECK_FALSE(alone->is_sink());
+
+  // Pipelined behind the source instead, a merge would run once per arriving batch.
+  sirius::op::sirius_physical_ungrouped_aggregate_merge aggregate(
+    key_value_types(), {}, 0, duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES);
+  aggregate.children.push_back(source());
+  sirius_physical_plan_generator::set_parent_ops(aggregate, nullptr);
+  CHECK(aggregate.children[0]->is_sink());
+
+  sirius::op::sirius_physical_top_n_merge top_n(key_value_types(), {}, 1, 0, nullptr, 0);
+  top_n.children.push_back(source());
+  sirius_physical_plan_generator::set_parent_ops(top_n, nullptr);
+  CHECK(top_n.children[0]->is_sink());
 }
 
 TEST_CASE("an exchange source queues arrivals where they can be spilled, while its query is open",
