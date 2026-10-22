@@ -17,6 +17,7 @@
 #include <cudf/aggregation.hpp>
 #include <cudf/binaryop.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/errc.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/transform.hpp>
@@ -34,6 +35,29 @@
 #include <variant>
 
 namespace sirius::temporal {
+
+namespace {
+
+// Detect the enumerator instead of a release number: the rename can appear in
+// different nightly builds within the same cuDF release.
+// Some system math headers define OVERFLOW; preserve that macro around the
+// legacy enumerator reference, even when that template branch is discarded.
+#pragma push_macro("OVERFLOW")
+#undef OVERFLOW
+template <typename ErrorCode>
+constexpr ErrorCode overflow_error_code()
+{
+  if constexpr (requires { ErrorCode::ARITHMETIC_OVERFLOW; }) {
+    return ErrorCode::ARITHMETIC_OVERFLOW;
+  } else {
+    return ErrorCode::OVERFLOW;
+  }
+}
+#pragma pop_macro("OVERFLOW")
+
+constexpr auto overflow_error = overflow_error_code<cudf::errc>();
+
+}  // namespace
 
 std::unique_ptr<cudf::column> finite_mask(cudf::column_view const& input,
                                           ::cuda::stream_ref stream,
@@ -168,7 +192,7 @@ std::unique_ptr<cudf::column> date_arithmetic_checked(cudf::transform_input cons
   auto days_ticks = day_counts(reversed ? left : right, difference ? date_type : int32_type);
   // transform_extended skips rows with either input NULL and propagates their
   // validity. Infinity must be handled before invoking checked arithmetic.
-  static std::string const offset_prefix  = R"(
+  static std::string const offset_prefix = R"(
 #include <cuda/numeric>
 
 __device__ cudf::errc date_offset(int32_t* out, int32_t date, int32_t days)
@@ -179,9 +203,10 @@ __device__ cudf::errc date_offset(int32_t* out, int32_t date, int32_t days)
     return cudf::errc::SUCCESS;
   }
   auto result = cuda::)";
-  static std::string const offset_suffix  = R"((date, days);
+  static std::string const offset_suffix = std::string{R"((date, days);
   if (result.overflow || result.value == infinity || result.value == -infinity) {
-    return cudf::errc::OVERFLOW;
+    return cudf::errc::)"} + cudf::to_string(overflow_error) +
+                                           R"(;
   }
   *out = result.value;
   return cudf::errc::SUCCESS;
@@ -211,7 +236,7 @@ __device__ void date_difference(int64_t* out, int32_t left, int32_t right)
                                       stream,
                                       mr);
   } catch (cudf::evaluation_error const& error) {
-    if (error.error_code() != cudf::errc::OVERFLOW) { throw; }
+    if (error.error_code() != overflow_error) { throw; }
     throw invalid_input_exception("Date out of range");
   }
   if (difference) { return result; }
