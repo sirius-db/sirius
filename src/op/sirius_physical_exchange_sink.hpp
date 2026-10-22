@@ -91,10 +91,13 @@ class sirius_physical_exchange_sink : public sirius_physical_operator {
   /// order; rank i gets rows from boundary i - 1 (inclusive) to boundary i (exclusive).
   void set_range_boundaries(std::shared_ptr<cudf::table const> boundaries);
 
-  /// Pass-through, so sink() sees the batches.
+  /// Splits each batch into its ranks' slices, as routed_operator_data. Done here rather than in
+  /// sink(): an OOM here reschedules the task, while one in sink() fails the query, since sink()
+  /// may already have sent earlier slices.
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          ::cuda::stream_ref stream) override;
 
+  /// Sends each slice to its rank.
   void sink(const operator_data& input_data, ::cuda::stream_ref stream) override;
 
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
