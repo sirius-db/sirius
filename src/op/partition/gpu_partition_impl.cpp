@@ -44,16 +44,18 @@ namespace {
 /// them.
 using hash_partition_result = std::pair<std::unique_ptr<cudf::table>, std::vector<cudf::size_type>>;
 
-/// Partition number of each row: the MurmurHash3 row hash modulo @p num_partitions.
+/// Partition number of each row: the MurmurHash3 row hash (seeded with @p seed) modulo
+/// @p num_partitions.
 std::unique_ptr<cudf::column> partition_ids(cudf::table_view const& input,
                                             std::vector<cudf::size_type> const& key_indices,
                                             int num_partitions,
+                                            uint32_t seed,
                                             ::cuda::stream_ref stream)
 {
   CUDF_EXPECTS(num_partitions > 0, "hash partition: num_partitions must be positive");
   auto const temp_mr = cudf::get_current_device_resource_ref();
-  auto const hashes  = cudf::hashing::murmurhash3_x86_32(
-    input.select(key_indices), cudf::DEFAULT_HASH_SEED, stream, temp_mr);
+  auto const hashes =
+    cudf::hashing::murmurhash3_x86_32(input.select(key_indices), seed, stream, temp_mr);
   cudf::numeric_scalar<uint32_t> const partition_count(
     static_cast<uint32_t>(num_partitions), true, stream, temp_mr);
   auto const ids = cudf::binary_operation(hashes->view(),
@@ -67,16 +69,17 @@ std::unique_ptr<cudf::column> partition_ids(cudf::table_view const& input,
 
 /// Hash-partitions @p input and keeps the input order within each partition, which lets a merge of
 /// partitions of sorted inputs treat them as sorted. A row's partition is its MurmurHash3 row hash
-/// modulo @p num_partitions, which is how `cudf::hash_partition` assigns rows too, so equal keys
-/// land in the same partition whichever of the two functions partitions a batch.
+/// with @p seed modulo @p num_partitions, which is how `cudf::hash_partition` assigns rows too, so
+/// equal keys land in the same partition whichever of the two functions partitions a batch.
 hash_partition_result stable_hash_partition(cudf::table_view const& input,
                                             std::vector<cudf::size_type> const& key_indices,
                                             int num_partitions,
+                                            uint32_t seed,
                                             ::cuda::stream_ref stream,
                                             rmm::device_async_resource_ref mr)
 {
   auto const temp_mr = cudf::get_current_device_resource_ref();
-  auto const ids     = partition_ids(input, key_indices, num_partitions, stream);
+  auto const ids     = partition_ids(input, key_indices, num_partitions, seed, stream);
 
   // The stable sort of the partition numbers is the gather map, so rows of one partition keep
   // their input order.
@@ -119,6 +122,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::hash_par
   ::cuda::stream_ref stream,
   cucascade::memory::memory_space& memory_space,
   const telemetry::batch_telemetry_info& telemetry_info,
+  uint32_t seed,
   bool preserve_input_order)
 {
   // Sanity check.
@@ -182,13 +186,14 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::hash_par
                             ? stable_hash_partition(effective_table,
                                                     effective_key_idx,
                                                     num_partitions,
+                                                    seed,
                                                     stream,
                                                     memory_space.get_default_allocator())
                             : cudf::hash_partition(effective_table,
                                                    effective_key_idx,
                                                    num_partitions,
                                                    cudf::hash_id::HASH_MURMUR3,
-                                                   cudf::DEFAULT_HASH_SEED,
+                                                   seed,
                                                    stream,
                                                    memory_space.get_default_allocator());
 
