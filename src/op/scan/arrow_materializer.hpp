@@ -54,8 +54,11 @@ std::vector<cudf::data_type> validate_arrow_host_flat(
 // Output device reservations are the same task reservation used for Parquet decode.
 // Producer buffers must be readable to their declared Arrow extents. All host
 // normalization uses the input's staging resource and stays retained on the lane.
-// Neither return nor an exception establishes completion: the caller must drain
-// the lane before releasing resources or considering any otherwise permitted replay.
+// Neither return nor an exception establishes full-attempt completion. Keep the
+// output MR/backing reservation alive through output destruction and a subsequent
+// lane.quiesce(), even if lane.idle(): commit recovery can precede queued output
+// frees during unwinding. drain()/input retirement alone is not that barrier and
+// does not authorize replay. Failed quiescence retains unconfirmed input ownership.
 materialized_batch import_arrow_host(std::shared_ptr<owned_arrow_batch>,
                                      materialization_program const&,
                                      exec::retire_lane&,

@@ -353,6 +353,8 @@ materialized_batch import_arrow_host(std::shared_ptr<owned_arrow_batch> input,
   ensure_row_count_carrier(batch, stream, mr);
   validate_materialized_batch(batch, program);
   auto error = submission.commit();
+  // On commit failure, unwinding can enqueue output frees after its recovery
+  // boundary. The caller must quiesce after unwinding, retaining the output MR.
   if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
   return batch;
 }

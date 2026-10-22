@@ -764,7 +764,11 @@ Two reusable entry points additionally exercise this finish contract:
   unchanged. Normal import does not synchronize the stream on the host; neither a
   returned table nor an exception permits releasing pending inputs or replaying a
   query before a successful attempt-level drain. A failed drain retains ownership,
-  not permission to release it. No CPU/GPU overlap or throughput guarantee is made;
+  not permission to release it. After output destruction/unwinding, the caller must
+  call `lane.quiesce()` even if `lane.idle()` or input retirement already completed:
+  commit-error recovery may precede subsequently queued output frees. The output
+  allocator and its backing reservation must outlive that final barrier.
+  No CPU/GPU overlap or throughput guarantee is made;
   pageable producer or PMR buffers may cause CUDA-internal staging/synchronization.
   `materialize_arrow_stream()` is the internal sequential verifier above this
   single-batch importer. Its source returns independently owned batches with a

@@ -806,10 +806,16 @@ TEST_CASE("Arrow query drain retires cancelled batches and returns their credit"
   int credits   = 0;
   auto fixture  = std::make_shared<arrow_fixture>(released);
   auto capacity = std::make_shared<credit_token>(&credits);
+  // The admission owner must retain producer storage, not just the accounting token.
+  struct admitted_input {
+    std::shared_ptr<arrow_fixture> fixture;
+    std::shared_ptr<credit_token> credit;
+  };
+  auto admitted = std::make_shared<admitted_input>(admitted_input{fixture, capacity});
   test_arrow_source source;
   source.queue.push_back(
     {std::make_shared<owned_arrow_batch>(
-       fixture->schema, fixture->array, capacity, *std::pmr::new_delete_resource()),
+       fixture->schema, fixture->array, admitted, *std::pmr::new_delete_resource()),
      0,
      3,
      12});
@@ -823,6 +829,7 @@ TEST_CASE("Arrow query drain retires cancelled batches and returns their credit"
   REQUIRE(source.cancel_calls == 1);
   fixture.reset();
   capacity.reset();
+  admitted.reset();
   // Cancellation stops production, but cannot release an owner submitted to the GPU lane.
   CHECK(released == 0);
   CHECK(credits == 0);
