@@ -63,9 +63,13 @@ enum class placement {
 /// A join's Bloom filters are sized for its estimated build rows, within these bounds: the same
 /// size on every rank, since every rank plans the same estimate.
 constexpr std::size_t min_bloom_keys = std::size_t{1} << 16;
-constexpr std::size_t max_bloom_keys = std::size_t{1} << 26;
+constexpr std::size_t max_bloom_keys = std::size_t{1} << 30;
 /// Stream ids a join reserves for merging its filters, one per admitted key.
 constexpr std::uint32_t max_filter_keys = 64;
+/// A join whose estimated build is smaller publishes no filters: its build can be empty on some
+/// rank, and an empty build only takes part in the merge once its probe has finished, while the
+/// ranks with build rows hold their probe until the merge completes.
+constexpr std::size_t min_merged_build_rows = std::size_t{1} << 14;
 
 struct rewriter {
   std::shared_ptr<exchange::exchange_service> service;
@@ -160,11 +164,14 @@ struct rewriter {
         // After the exchanges a rank's build holds only its share of the keys: a filter from it
         // alone would drop rows other ranks' builds match, so every rank's Bloom is merged.
         auto& join = node.Cast<op::sirius_physical_hash_join>();
-        if (join.publishes_dynamic_filters()) {
+        auto const build_rows =
+          node.children.size() > 1 ? node.children[1]->estimated_cardinality : std::size_t{0};
+        if (join.publishes_dynamic_filters() && build_rows < min_merged_build_rows) {
+          join.cancel_dynamic_filter_publication();
+          shape += "f";
+        } else if (join.publishes_dynamic_filters()) {
           auto const first = stream();
           next_stream += max_filter_keys;
-          auto const build_rows =
-            node.children.size() > 1 ? node.children[1]->estimated_cardinality : std::size_t{0};
           join.set_distributed_dynamic_filters(
             {.service      = service,
              .first_stream = first,
