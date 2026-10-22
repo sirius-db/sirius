@@ -51,6 +51,9 @@ distinct.
 pixi run build/release/test/cpp/sirius_unittest "[tpch_havoc]"
 ```
 
+To classify them on the GPU outside the test process, one CLI process per query, run
+`test/scripts/classify_queries.py --benchmark tpch-havoc`. Its docstring describes the options.
+
 - **Offline builds:** configure with `-DSIRIUS_TPCH_HAVOC_DIR=<dir>` to use a copy of the same files,
   or with `-DSIRIUS_TPCH_HAVOC=OFF` to skip them. With `OFF`, the TPC-Havoc tests skip.
 - **Another copy at runtime:** set the `SIRIUS_TPCH_HAVOC_DIR` environment variable.
