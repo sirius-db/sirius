@@ -335,6 +335,8 @@ set(TEST_SOURCES
     test/cpp/utils/sirius_test_env.cpp
     test/cpp/utils/test_child_process_environment.cpp
     test/cpp/utils/test_gpu_execution_comparator.cpp
+    test/cpp/utils/test_tpch_havoc_queries.cpp
+    test/cpp/utils/tpch_havoc_queries.cpp
     test/cpp/utils/utils.cpp
     test/cpp/utils/s3_backend.cpp
     test/cpp/io/s3/test_sirius_httpfs.cpp
