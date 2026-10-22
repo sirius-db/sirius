@@ -90,4 +90,92 @@ std::vector<tpch_havoc_query> load_tpch_havoc_queries(std::filesystem::path cons
   return queries;
 }
 
+std::string to_string(tpch_havoc_outcome outcome)
+{
+  switch (outcome) {
+    case tpch_havoc_outcome::gpu: return "gpu";
+    case tpch_havoc_outcome::mismatch: return "mismatch";
+    case tpch_havoc_outcome::plan_rejected: return "plan_rejected";
+    case tpch_havoc_outcome::runtime_failed: return "runtime_failed";
+    case tpch_havoc_outcome::skip: return "skip";
+  }
+  return "unknown";
+}
+
+bool tpch_havoc_expectation::applies_to(std::string const& scan_name,
+                                        std::string const& evaluator_name) const
+{
+  return (scan.empty() || scan == scan_name) && (evaluator.empty() || evaluator == evaluator_name);
+}
+
+std::filesystem::path tpch_havoc_expectations_path()
+{
+  return std::filesystem::path{SIRIUS_PROJECT_ROOT} / "test/tpch_havoc/expectations.yaml";
+}
+
+std::vector<tpch_havoc_expectation> load_tpch_havoc_expectations(std::filesystem::path const& path)
+{
+  static std::unordered_map<std::string, tpch_havoc_outcome> const outcomes{
+    {"mismatch", tpch_havoc_outcome::mismatch},
+    {"plan_rejected", tpch_havoc_outcome::plan_rejected},
+    {"runtime_failed", tpch_havoc_outcome::runtime_failed},
+    {"skip", tpch_havoc_outcome::skip}};
+
+  std::vector<tpch_havoc_expectation> expectations;
+  for (auto const& entry : YAML::LoadFile(path.string())["expectations"]) {
+    tpch_havoc_expectation expectation;
+    auto const outcome    = entry["outcome"].as<std::string>("");
+    auto const known      = outcomes.find(outcome);
+    expectation.reason    = entry["reason"].as<std::string>("");
+    expectation.issue     = entry["issue"].as<int>(0);
+    expectation.scan      = entry["scan"].as<std::string>("");
+    expectation.evaluator = entry["evaluator"].as<std::string>("");
+    expectation.queries = entry["queries"].as<std::vector<std::string>>(std::vector<std::string>{});
+    auto const where    = path.string() + " line " + std::to_string(entry.Mark().line + 1);
+    if (known == outcomes.end()) {
+      throw std::runtime_error(where + ": unknown outcome '" + outcome + "'");
+    }
+    expectation.outcome = known->second;
+    if (expectation.issue <= 0) { throw std::runtime_error(where + ": needs an issue"); }
+    if (expectation.reason.empty()) { throw std::runtime_error(where + ": needs a reason"); }
+    if (expectation.queries.empty()) { throw std::runtime_error(where + ": lists no queries"); }
+    if (!expectation.scan.empty() && expectation.scan != "native" &&
+        expectation.scan != "parquet") {
+      throw std::runtime_error(where + ": unknown scan '" + expectation.scan + "'");
+    }
+    if (!expectation.evaluator.empty() && expectation.evaluator != "ast_interpret" &&
+        expectation.evaluator != "ast_jit") {
+      throw std::runtime_error(where + ": unknown evaluator '" + expectation.evaluator + "'");
+    }
+    try {
+      std::regex const reason{expectation.reason};
+    } catch (std::regex_error const& error) {
+      throw std::runtime_error(where + ": reason is not a valid regex: " + error.what());
+    }
+    expectations.push_back(std::move(expectation));
+  }
+  return expectations;
+}
+
+tpch_havoc_expectation const* find_tpch_havoc_expectation(
+  std::vector<tpch_havoc_expectation> const& expectations,
+  std::string const& label,
+  std::string const& scan,
+  std::string const& evaluator)
+{
+  tpch_havoc_expectation const* found = nullptr;
+  for (auto const& expectation : expectations) {
+    if (!expectation.applies_to(scan, evaluator)) { continue; }
+    for (auto const& query : expectation.queries) {
+      if (query != label) { continue; }
+      if (found != nullptr) {
+        throw std::runtime_error(label + " is listed by more than one expectation for " + scan +
+                                 " / " + evaluator);
+      }
+      found = &expectation;
+    }
+  }
+  return found;
+}
+
 }  // namespace sirius::test
