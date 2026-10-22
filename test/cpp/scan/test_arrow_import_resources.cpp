@@ -512,6 +512,8 @@ TEST_CASE("Arrow migration failed completion retains roots and staging until ver
   bounded_host_resource host;
   rmm::cuda_stream stream;
   completion_fault fault;
+  observed_device_resource device(cudf::get_current_device_resource_ref());
+  device.state->expected_stream = stream.value();
   sirius::exec::detail::completion_cuda_api api;
   api.add_callback = completion_fault::add;
   api.synchronize  = completion_fault::synchronize;
@@ -524,8 +526,21 @@ TEST_CASE("Arrow migration failed completion retains roots and staging until ver
   auto input =
     std::make_shared<owned_arrow_batch>(producer->schema, producer->array, producer, host);
   // A failed installation gives no completion frontier; failed sync cannot invent one.
-  REQUIRE_THROWS(
-    import_arrow_host(input, program_for_batch(), lane, cudf::get_current_device_resource_ref()));
+  SECTION("explicit commit fails after output construction")
+  {
+    REQUIRE_THROWS(
+      import_arrow_host(input, program_for_batch(), lane, rmm::device_async_resource_ref{device}));
+  }
+  SECTION("automatic commit fails while preserving the allocation exception")
+  {
+    device.state->fail_at =
+      1;  // The first validity copy precedes refusal of its values allocation.
+    REQUIRE_THROWS_AS(
+      import_arrow_host(input, program_for_batch(), lane, rmm::device_async_resource_ref{device}),
+      rmm::out_of_memory);
+    CHECK(device.state->attempts == 2);
+  }
+  CHECK(fault.sync_calls == 1);
   input.reset();
   producer.reset();
   CHECK(released.arrays == 0);

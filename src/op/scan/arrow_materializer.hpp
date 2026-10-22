@@ -44,6 +44,7 @@ class owned_arrow_batch {
   ArrowArray array{};
   std::shared_ptr<void> capacity;
   // The producer's capacity owner must keep this resource alive through retirement.
+  // It must support allocation here and deallocation on the lane's host drainer.
   std::pmr::memory_resource& staging_resource;
   arrow_metadata_lengths metadata_lengths;
 };
