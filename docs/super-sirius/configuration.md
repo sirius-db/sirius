@@ -1103,6 +1103,16 @@ The direct DuckDB session overrides are registered only when the process
 explicitly enables Sirius test options; they are not part of the normal user
 surface.
 
+### Distributed Execution
+
+See [Distributed Execution](distributed-sirius.md). Both settings must be set before the connection's first
+distributed query and cannot change after it.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `sirius_exchange_peers` | `''` | `host:port` of every rank's exchange listener, comma-separated in rank order. Empty runs in one process. Needs a build with `-DSIRIUS_WITH_NIXL=ON`. |
+| `sirius_exchange_rank` | 0 | This process's position in `sirius_exchange_peers`. |
+
 ### Pinned Tables
 
 Pinned-table zone-map capture and pruning are automatic. The advanced YAML escape hatch is under
@@ -1194,6 +1204,12 @@ SET enable_runtime_size_estimation = true;   -- off by default
 | `enable_regex_jit_impl` | true | Use JIT regex implementation |
 | `like_swar_fastpath` | true | Dispatch `%lit1%lit2%...%` LIKE/NOT LIKE patterns to the SWAR digram fast-path kernel instead of `cudf::strings::like` |
 
+
+## CMake options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `SIRIUS_WITH_NIXL` | OFF | Build the exchange's NIXL fabric for [distributed execution](distributed-sirius.md), linking the NIXL install at `SIRIUS_NIXL_PREFIX` (default: the `NIXL_PREFIX` environment variable). |
 
 ## Key Files
 
