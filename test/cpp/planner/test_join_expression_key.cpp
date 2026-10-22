@@ -410,6 +410,8 @@ TEST_CASE_METHOD(join_expression_key_fixture,
       auto* join = find_hash_join(&plan);
       REQUIRE(join);
       CHECK(join->max_build_probe_resident_bytes == budget);
+      // This planner-only fixture bypasses pipeline conversion, which normally assigns IDs.
+      join->operator_id = 0;
       // Measure a foldable two-row INTEGER build, well within the hash-table budget.
       auto strategy = join->get_partition_strategy({16, true, true, 16, 2, 2, 16});
       CHECK(strategy.build_probe == admitted);
