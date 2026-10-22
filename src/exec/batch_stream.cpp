@@ -38,18 +38,13 @@ batch_stream::batch_stream(std::shared_ptr<cucascade::shared_data_repository> re
   }
 }
 
-bool batch_stream::push(std::shared_ptr<cucascade::data_batch> batch,
-                        std::optional<std::size_t> position)
+bool batch_stream::push(std::shared_ptr<cucascade::data_batch> batch)
 {
   std::function<void()> on_data;
   {
     std::unique_lock<std::mutex> lock(_mutex);
     if (_terminal) { return false; }
-    if (position) {
-      _repo->add_data_batch_at_position(std::move(batch), *position);
-    } else {
-      _repo->add_data_batch(std::move(batch));
-    }
+    _repo->add_data_batch(std::move(batch));
     on_data = _on_data;
   }
   _cv.notify_all();
@@ -60,7 +55,6 @@ bool batch_stream::push(std::shared_ptr<cucascade::data_batch> batch,
 void batch_stream::close(sender_id_t sender)
 {
   std::function<void()> eos_hook;
-  std::function<void()> data_hook;
   {
     std::unique_lock<std::mutex> lock(_mutex);
     if (_expected.find(sender) == _expected.end()) {
@@ -76,13 +70,9 @@ void batch_stream::close(sender_id_t sender)
     // Move, don't copy: a throwing copy here would leave the stream terminal with the
     // notify_all() below never reached, stranding every sleeper in wait().
     eos_hook = std::move(_on_end_of_stream);
-    if (_repo->get_ordering() == cucascade::data_repository_ordering::ORDERED) {
-      data_hook = std::move(_on_data);
-    }
   }
   _cv.notify_all();
   if (eos_hook) { eos_hook(); }
-  if (data_hook) { data_hook(); }  // EOS makes positioned batches pullable.
 }
 
 void batch_stream::fail(std::exception_ptr error)
@@ -110,33 +100,16 @@ void batch_stream::fail(std::exception_ptr error)
 
 std::shared_ptr<cucascade::data_batch> batch_stream::try_pull()
 {
-  return try_pull_with_position().first;
-}
-
-cucascade::positioned_data_batch batch_stream::try_pull_with_position()
-{
-  std::lock_guard<std::mutex> lock(_mutex);
-  if (_error) { std::rethrow_exception(_error); }
-  if (_repo->get_ordering() != cucascade::data_repository_ordering::ORDERED) {
-    return _repo->pop_next_data_batch_with_position();
-  }
-  if (!_terminal) { return {}; }
-  if (!_positions) { _positions = _repo->get_positions(); }
-  if (_next_position == _positions->size()) { return {}; }
-  auto position = (*_positions)[_next_position++];
-  auto batch    = _repo->pop_data_batch_by_position(position);
-  if (!batch) { throw sirius::internal_exception("Stream position disappeared after EOS"); }
-  return {std::move(batch), position};
+  if (auto error = pending_error()) { std::rethrow_exception(error); }
+  // Outside the lock — the repository is thread-safe, and holding _mutex here would make
+  // every pop contend with producers for no correctness gain.
+  return _repo->pop_next_data_batch();
 }
 
 batch_stream::availability batch_stream::classify() const
 {
   std::lock_guard<std::mutex> lock(_mutex);
-  if (_error) { return availability::HAS_DATA; }
-  if (!_terminal && _repo->get_ordering() == cucascade::data_repository_ordering::ORDERED) {
-    return availability::WAITING;
-  }
-  if (!_repo->all_empty()) { return availability::HAS_DATA; }
+  if (_error || !_repo->all_empty()) { return availability::HAS_DATA; }
   return _terminal ? availability::END_OF_STREAM : availability::WAITING;
 }
 
@@ -155,11 +128,7 @@ std::exception_ptr batch_stream::pending_error() const
 void batch_stream::wait()
 {
   std::unique_lock<std::mutex> lock(_mutex);
-  _cv.wait(lock, [&] {
-    return _terminal || _error ||
-           (_repo->get_ordering() != cucascade::data_repository_ordering::ORDERED &&
-            !_repo->all_empty());
-  });
+  _cv.wait(lock, [&] { return _terminal || !_repo->all_empty(); });
 }
 
 void batch_stream::set_on_data(std::function<void()> hook)
