@@ -104,6 +104,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_multi_format.cpp
     test/cpp/integration/test_gpu_execution_nested_loop_join_batches.cpp
     test/cpp/integration/test_gpu_execution_null_safe_join.cpp
+    test/cpp/integration/test_gpu_execution_numeric_cast.cpp
     test/cpp/integration/test_gpu_execution_order_nulls.cpp
     test/cpp/integration/test_gpu_execution_regexp_replace.cpp
     test/cpp/integration/test_gpu_execution_size_estimation.cpp

@@ -37,7 +37,6 @@
 #include "duckdb/common/exception.hpp"
 #include "expression/ast/node.hpp"
 #include "expression/ast/utils.hpp"
-#include "expression_evaluator/ast_supported_types.hpp"
 #include "expression_evaluator/gpu_expression_translator_internal.hpp"
 #include "helper/numeric_narrowing.hpp"
 #include "helper/type_conversions.hpp"
@@ -162,16 +161,14 @@ static bool is_hash_equality_key(sirius::comparison_type c, bool route_null_safe
   return false;
 }
 
-// Routed keys must be references or use one of cuDF AST's three supported casts.
+// Routed keys must be references or casts that lower to a cuDF AST op.
 // The planner materializes other expressions into referenced columns before this check.
 static bool is_ast_translatable_key_side(sirius::ast::node const& side)
 {
   if (side.holds<sirius::ast::reference>()) { return true; }
   if (side.holds<sirius::ast::cast>()) {
-    auto const& c         = side.get<sirius::ast::cast>();
-    auto const& supported = sirius::supported_ast_cast_types_native;
-    return std::find(supported.begin(), supported.end(), c.target_type.id()) != supported.end() &&
-           is_ast_translatable_key_side(*c.child);
+    auto const& c = side.get<sirius::ast::cast>();
+    return c.lowers_to_cudf_ast() && is_ast_translatable_key_side(*c.child);
   }
   return false;
 }
