@@ -404,11 +404,18 @@ std::unique_ptr<sirius::op::scan::iceberg_ingestible_table_info> build_iceberg_t
     for (std::size_t p = 0; p < info->names.size(); ++p) {
       auto found = std::find_if(columns.begin(), columns.end(), [&](auto const& column) {
         return column.name == info->names[p] &&
-               column.type == sirius::to_duckdb(info->returned_types.at(p));
+               (!column.children.empty() ||
+                column.type == sirius::to_duckdb(info->returned_types.at(p)));
       });
       if (found == columns.end()) {
         requirements.clear();
         break;
+      }
+      if (!found->children.empty()) {
+        // Keep the bound slot and exact type: Sirius nested types cannot round-trip
+        // through to_duckdb. The mapper rejects this field if the scan needs it.
+        requirements.push_back({found->GetIdentifierFieldId(), found->type, std::nullopt});
+        continue;
       }
       std::optional<duckdb::Value> missing;
       if (found->default_expression) {

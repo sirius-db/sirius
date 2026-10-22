@@ -1966,6 +1966,74 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "gpu_execution iceberg - unrequested nested fields preserve flat evolution",
+                 "[integration][gpu_execution][iceberg][schema_evolution][nested]")
+{
+  // The physical files stay flat. Add an optional nested field to the current
+  // binding, before, between or after the scalar fields that need ID mapping.
+  auto const nested_type = GENERATE(
+    std::string{
+      R"({"type":"struct","fields":[{"id":7,"name":"x","required":false,"type":"int"}]})"},
+    std::string{R"({"type":"list","element-id":7,"element-required":false,"element":"int"})"},
+    std::string{
+      R"({"type":"map","key-id":7,"key":"string","value-id":8,"value-required":false,"value":"int"})"});
+  auto const position = GENERATE(0, 2, 4);
+  CAPTURE(nested_type, position);
+  sirius::test::scratch_dir scratch{"iceberg_nested_evolution"};
+  auto const metadata_dir = scratch.path() / "metadata";
+  fs::create_directories(metadata_dir);
+  fs::copy_file(fs::path(r4_evolution_path) / "metadata/version-hint.text",
+                metadata_dir / "version-hint.text");
+
+  using namespace duckdb_yyjson;
+  std::unique_ptr<yyjson_doc, decltype(&yyjson_doc_free)> original(
+    yyjson_read_file(
+      (fs::path(r4_evolution_path) / "metadata/v1.metadata.json").c_str(), 0, nullptr, nullptr),
+    yyjson_doc_free);
+  REQUIRE(original);
+  std::unique_ptr<yyjson_mut_doc, decltype(&yyjson_mut_doc_free)> metadata(
+    yyjson_doc_mut_copy(original.get(), nullptr), yyjson_mut_doc_free);
+  REQUIRE(metadata);
+  auto const field_json = R"({"id":6,"name":"nested","required":false,"type":)" + nested_type + "}";
+  std::unique_ptr<yyjson_doc, decltype(&yyjson_doc_free)> field(
+    yyjson_read(field_json.data(), field_json.size(), 0), yyjson_doc_free);
+  REQUIRE(field);
+  auto* root   = yyjson_mut_doc_get_root(metadata.get());
+  auto* schema = yyjson_mut_arr_get(yyjson_mut_obj_get(root, "schemas"), 0);
+  auto* fields = yyjson_mut_obj_get(schema, "fields");
+  REQUIRE(yyjson_mut_arr_insert(
+    fields, yyjson_val_mut_copy(metadata.get(), yyjson_doc_get_root(field.get())), position));
+  REQUIRE(yyjson_mut_obj_put(
+    root, yyjson_mut_str(metadata.get(), "last-column-id"), yyjson_mut_int(metadata.get(), 8)));
+  REQUIRE(yyjson_mut_write_file(
+    (metadata_dir / "v1.metadata.json").c_str(), metadata.get(), 0, nullptr, nullptr));
+
+  auto const scan = pinned_scan(scratch.path().string());
+  // Reorder the output and read scalar slots after the nested field. The rows
+  // exercise promotion, renaming, missing defaults and positional deletes.
+  auto const query =
+    "SELECT added, count, score, fruit FROM " + scan + " WHERE count >= 3 ORDER BY count";
+  auto const expected =
+    std::vector<std::vector<std::string>>{{"7", "3", "NULL", "NULL"}, {"7", "5", "5.5", "NULL"}};
+  expect_iceberg_rows(query, gpu_route::gpu, expected);
+
+  // Keeping a placeholder must not admit nested materialization to the flat mapper.
+  {
+    sirius::test::scoped_recording_log_sink logs;
+    expect_iceberg_rows("SELECT nested, count FROM " + scan + " ORDER BY count",
+                        gpu_route::runtime_fallback,
+                        {{"NULL", "1"}, {"NULL", "3"}, {"NULL", "5"}});
+    bool refused = false;
+    for (auto const& record : logs.records())
+      if (record.message.find("adapter field mapping does not support a required nested field") !=
+          std::string::npos)
+        refused = true;
+    CHECK(refused);
+  }
+  expect_iceberg_rows(query, gpu_route::gpu, expected);
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "gpu_execution iceberg - snapshot-aware deletes",
                  "[integration][gpu_execution][iceberg]")
 {
