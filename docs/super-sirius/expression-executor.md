@@ -204,7 +204,7 @@ mutable process globals. Standalone callers may omit the policy to use fixed def
 
 `coalesce` is materialized via `cudf::replace_nulls` iteratively across children: the first child is materialized (scalars are lifted to a column); each subsequent child replaces the residual nulls in the running result. Children are only evaluated when the running result still has nulls. The result is wrapped via `materialize_as_ast_column` so COALESCE composes inside AST-capable parents. `cudf_ast_op_count` returns 0 — `coalesce` always takes the materialize-only path.
 
-`in_list` covers the full numeric set (INT8–INT64, UINT8–UINT64, BOOL8, FLOAT, DOUBLE, DECIMAL32/64/128, all TIMESTAMP precisions, DATE) plus VARCHAR. BOOL8 dispatches via `uint8_t` because `std::vector<bool>::data()` is deleted.
+`in_list` covers the full numeric set (INT8–INT64, UINT8–UINT64, BOOL8, FLOAT, DOUBLE, DECIMAL32/64/128, all TIMESTAMP precisions, DATE) plus VARCHAR. BOOL8 dispatches via `uint8_t` because `std::vector<bool>::data()` is deleted. `x IN (a, b)` follows SQL semantics: TRUE on any match, otherwise NULL if `x` or any list entry is NULL, otherwise FALSE; NOT IN negates that. The AST lowerings chain the per-entry `EQUAL`s with `NULL_LOGICAL_OR`. The all-constant materialize path runs `cudf::contains` over the non-NULL entries and, when the list also has a NULL, ORs the result with a NULL scalar.
 
 ### String concatenation
 
