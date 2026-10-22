@@ -41,6 +41,7 @@
 #include "scan/test_utils.hpp"
 #include "scan_manager/readahead_scan_manager.hpp"
 #include "utils/telemetry_utils.hpp"
+#include "utils/test_physical_operator.hpp"
 
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
@@ -285,9 +286,9 @@ struct readahead_query {
   using scan_info = sirius::op::scan::scan_info;
   using stage     = sirius::io::cache::scan_stage;
   using outcome   = sirius::scan_manager::prefetch_outcome_kind;
-  struct scan_operator : sirius::op::sirius_physical_operator {
+  struct scan_operator : sirius::op::test_physical_operator {
     scan_operator()
-      : sirius_physical_operator(sirius::op::SiriusPhysicalOperatorType::GPU_SCAN, {}, 0)
+      : test_physical_operator(sirius::op::SiriusPhysicalOperatorType::GPU_SCAN, {}, 0)
     {
       operator_id = 1;
     }
@@ -299,7 +300,7 @@ struct readahead_query {
   {
     scan_operator op;
     auto telemetry = sirius::test::make_test_telemetry_context();
-    sirius::pipeline::pipeline_build_context ctx{nullptr, true};
+    sirius::pipeline::pipeline_build_context ctx{nullptr};
     auto pipeline = std::make_shared<sirius::pipeline::sirius_pipeline>(ctx);
     sirius::pipeline::sirius_pipeline_build_state build;
     build.set_pipeline_source(*pipeline, op);
