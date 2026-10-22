@@ -18,10 +18,12 @@
 
 #include "creator/task_creator.hpp"
 #include "exchange/exchange_service.hpp"
+#include "exec/query_lifecycle_registry.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
 
 #include <cucascade/data/data_batch.hpp>
+#include <cucascade/data/data_repository.hpp>
 
 #include <algorithm>
 #include <deque>
@@ -36,7 +38,14 @@ struct sirius_physical_exchange_source::state {
   std::mutex mutex;
   std::set<exchange::rank_t> const senders;
   bool const ordered;
-  /// Unordered: batches in arrival order.
+  /// Unordered: the repository of the port from this rank's sink, once wired. Batches queued
+  /// there can be spilled under memory pressure; a deque outside any repository cannot.
+  cucascade::shared_data_repository* repo = nullptr;
+  /// The query's repositories are cleared at its end, while a peer may still be sending: an
+  /// arrival adds to `repo` only under a work lease, which the clearing waits for.
+  exec::query_lifecycle_registry* lifecycle = nullptr;
+  sirius::query_id_t query_id{};
+  /// Unordered: batches that arrived before the port was wired, in arrival order.
   std::deque<std::shared_ptr<cucascade::data_batch>> queue;
   /// Ordered: batches by (sender, batch number), released together.
   std::map<std::pair<exchange::rank_t, std::uint64_t>, std::shared_ptr<cucascade::data_batch>> held;
@@ -48,6 +57,12 @@ struct sirius_physical_exchange_source::state {
 
   /// Under mutex.
   [[nodiscard]] bool all_ended() const { return ended.size() == senders.size(); }
+
+  /// Under mutex.
+  [[nodiscard]] bool unordered_empty() const
+  {
+    return queue.empty() && (repo == nullptr || repo->total_size() == 0);
+  }
 
   /// Nominates the pipeline's head for a task, as STREAMING_SOURCE does on data.
   void schedule()
@@ -83,6 +98,10 @@ struct sirius_physical_exchange_source::receiver : exchange::inbound {
       } else if (s->ordered) {
         s->held.emplace(std::make_pair(from, batch), std::move(data));
         return;  // released once every sender has ended
+      } else if (s->repo != nullptr) {
+        auto const lease = s->lifecycle->try_acquire_work(s->query_id);
+        if (!lease) { return; }  // the query is ending, and nothing will take this batch
+        s->repo->add_data_batch(std::move(data));
       } else {
         s->queue.push_back(std::move(data));
       }
@@ -142,6 +161,12 @@ sirius_physical_exchange_source::~sirius_physical_exchange_source() { _service->
 
 bool sirius_physical_exchange_source::ordered() const noexcept { return _state->ordered; }
 
+void sirius_physical_exchange_source::set_query_lifecycle(exec::query_lifecycle_registry& lifecycle)
+{
+  std::lock_guard lock{_state->mutex};
+  _state->lifecycle = &lifecycle;
+}
+
 void sirius_physical_exchange_source::set_pipeline(
   std::shared_ptr<pipeline::sirius_pipeline> pipeline)
 {
@@ -164,13 +189,33 @@ MemoryBarrierType sirius_physical_exchange_source::input_barrier_for(
   return MemoryBarrierType::PIPELINE;
 }
 
+void sirius_physical_exchange_source::bind_repository()
+{
+  // Ports are wired after the plan is built, and a peer may send before then; the task creator
+  // only asks once they are.
+  if (_state->repo != nullptr || _state->ordered || _state->lifecycle == nullptr) { return; }
+  auto pipeline = _state->pipeline.lock();
+  if (!pipeline) { return; }
+  for (auto const& p : get_ports()) {
+    if (p->repo == nullptr) { continue; }
+    _state->query_id = pipeline->get_query_id();
+    _state->repo     = p->repo;
+    for (auto& batch : _state->queue) {
+      _state->repo->add_data_batch(std::move(batch));
+    }
+    _state->queue.clear();
+    return;
+  }
+}
+
 std::optional<task_creation_hint> sirius_physical_exchange_source::get_next_task_hint()
 {
   bool finished = false;
   {
     std::lock_guard lock{_state->mutex};
+    bind_repository();
     bool const ready =
-      _state->error || !_state->queue.empty() || (_state->all_ended() && !_state->held.empty());
+      _state->error || !_state->unordered_empty() || (_state->all_ended() && !_state->held.empty());
     if (ready) { return task_creation_hint{TaskCreationHint::READY, this}; }
     finished = _state->all_ended();
   }
@@ -188,7 +233,8 @@ std::optional<task_creation_hint> sirius_physical_exchange_source::get_next_task
 bool sirius_physical_exchange_source::all_ports_empty()
 {
   std::lock_guard lock{_state->mutex};
-  return !_state->error && _state->all_ended() && _state->queue.empty() && _state->held.empty();
+  bind_repository();
+  return !_state->error && _state->all_ended() && _state->unordered_empty() && _state->held.empty();
 }
 
 std::unique_ptr<operator_data> sirius_physical_exchange_source::get_next_task_input_data()
@@ -197,9 +243,12 @@ std::unique_ptr<operator_data> sirius_physical_exchange_source::get_next_task_in
   {
     std::lock_guard lock{_state->mutex};
     if (_state->error) { std::rethrow_exception(_state->error); }
+    bind_repository();
     if (!_state->queue.empty()) {
       batches.push_back(std::move(_state->queue.front()));
       _state->queue.pop_front();
+    } else if (auto batch = _state->repo ? _state->repo->pop_next_data_batch() : nullptr) {
+      batches.push_back(std::move(batch));
     } else if (_state->all_ended() && !_state->held.empty()) {
       for (auto& [key, batch] : _state->held) {
         batches.push_back(std::move(batch));

@@ -269,9 +269,11 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
   split by byte range have no such limit.
 - **Query start:** every rank must run the same statements in the same order, which is what
   numbers the exchanges' streams.
-- **Unspillable buffers:** batches queued in an `EXCHANGE_SOURCE`, or held for a stream not yet
-  attached, are outside any repository, so they cannot spill. Sends block once a rank's queued
-  sends exceed 1 GiB (`transport::options::max_queued_bytes`).
+- **Unspillable buffers:** an unordered `EXCHANGE_SOURCE` queues arrivals in its port's
+  repository, where they spill like any port's batches. Arrivals before the port is wired, an
+  ordered gather's batches, and batches held for a stream not yet attached stay outside any
+  repository and cannot spill. Sends block once a rank's queued sends exceed 1 GiB
+  (`transport::options::max_queued_bytes`).
 - **Blocking collectives:** `SORT_SAMPLE` and Bloom merges block a GPU worker thread until every
   rank's contribution arrives.
 - **Failures:** fail-stop. A lost peer fails the query on every rank; nothing reconnects.

@@ -32,6 +32,10 @@ namespace sirius::exchange {
 class exchange_service;
 }
 
+namespace sirius::exec {
+class query_lifecycle_registry;
+}
+
 namespace sirius::planner {
 
 /**
@@ -50,13 +54,15 @@ namespace sirius::planner {
  * mismatch fails the query on every rank.
  *
  * @param query This query's number, the same on every rank: its exchanges' stream ids.
+ * @param lifecycle Gates the exchange sources' landing into their ports' repositories.
  * @throws sirius::not_implemented_exception on an operator distributed execution does not
  *         support, rather than a wrong answer.
  */
 void distribute_plan(duckdb::unique_ptr<op::sirius_physical_operator>& plan,
                      std::shared_ptr<exchange::exchange_service> service,
                      cucascade::memory::memory_space& gpu,
-                     std::uint64_t query);
+                     std::uint64_t query,
+                     exec::query_lifecycle_registry& lifecycle);
 
 /// Bytes `[start, start + length)` of file `file` (an index into the table's files).
 struct file_byte_range {

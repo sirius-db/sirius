@@ -2293,7 +2293,8 @@ void sirius_physical_plan_generator::insert_gpu_pipeline_operators(
     sirius::planner::distribute_plan(plan,
                                      sirius_ctx->get_exchange_service(op_params),
                                      *gpu,
-                                     sirius_ctx->next_distributed_query());
+                                     sirius_ctx->next_distributed_query(),
+                                     sirius_ctx->get_query_lifecycle_registry());
   }
 }
 
