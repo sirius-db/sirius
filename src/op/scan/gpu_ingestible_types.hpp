@@ -18,6 +18,7 @@
 #include "op/scan/owning_table_view.hpp"
 #include "op/scan/table_scan/scan_contract.hpp"
 
+#include <expression/ast/node.hpp>
 #include <io/sirius_datasource.hpp>
 
 #include <algorithm>
@@ -388,6 +389,23 @@ struct filtered_table {
   /// sirius::pushdown_outcome::predicates_enforced), so post_filter_and_project
   /// drops them from the residual instead of referencing the answer.
   bool predicates_enforced{false};
+  /// Bytes the cached batch behind a resident view stores, read through the lease @c table holds;
+  /// zero on every other path.
+  std::size_t stored_bytes{0};
+};
+
+/**
+ * @brief Owns the original materialized-column coordinates and residual for a cached checkpoint.
+ */
+struct cached_view_layout {
+  /// Maps each canonical endpoint ordinal to its source column; a layout that cannot map every
+  /// ordinal is declined rather than produced. output_columns[endpoint_ordinal] = source_column
+  std::vector<cudf::size_type> output_columns;
+  /// The source columns to gather after payload elision, in output order and including duplicates.
+  /// The residual references the same unmodified source rows.
+  std::vector<cudf::size_type> projected_columns;
+  /// The residual expression that must still be applied to the projected columns.
+  std::unique_ptr<sirius::ast::node> residual;
 };
 
 }  // namespace sirius::op::scan
