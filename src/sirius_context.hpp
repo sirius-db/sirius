@@ -34,6 +34,7 @@
 #include "sirius_config.hpp"
 #include "telemetry/telemetry_context.hpp"
 #include "transparent/connection_provenance.hpp"
+#include "transparent/plan_source_policy.hpp"
 #include "util/env_guard.hpp"
 
 #include <rmm/resource_ref.hpp>
@@ -285,14 +286,25 @@ class SiriusConnectionState : public ClientContextState {
     return internal_query_depth_.load(std::memory_order_relaxed) > 0;
   }
 
-  void enter_cpu_fallback() noexcept
+  void enter_cpu_fallback(sirius::transparent::cpu_replay_decision decision) noexcept
   {
-    cpu_fallback_depth_.fetch_add(1, std::memory_order_relaxed);
+    if (cpu_fallback_depth_.fetch_add(1, std::memory_order_relaxed) == 0) {
+      cpu_replay_s3_allowed_.store(decision.s3_allowed, std::memory_order_relaxed);
+    }
   }
   void exit_cpu_fallback() noexcept { cpu_fallback_depth_.fetch_sub(1, std::memory_order_relaxed); }
   [[nodiscard]] bool is_cpu_fallback_active() const noexcept
   {
     return cpu_fallback_depth_.load(std::memory_order_relaxed) > 0;
+  }
+  /// The decision of the CPU replay this connection is executing, if any.  The
+  /// outermost admission owns it; nested guards inherit it.
+  [[nodiscard]] std::optional<sirius::transparent::cpu_replay_decision> active_cpu_replay()
+    const noexcept
+  {
+    if (!is_cpu_fallback_active()) { return std::nullopt; }
+    return sirius::transparent::cpu_replay_decision{
+      cpu_replay_s3_allowed_.load(std::memory_order_relaxed)};
   }
 
   /// \brief Monotonic id for window-keyed logging (colliding DuckDB connection
@@ -317,6 +329,7 @@ class SiriusConnectionState : public ClientContextState {
   std::optional<std::string> session_label_;
   std::atomic<int> internal_query_depth_{0};
   std::atomic<int> cpu_fallback_depth_{0};
+  std::atomic<bool> cpu_replay_s3_allowed_{false};
   std::optional<std::shared_lock<std::shared_mutex>> pinned_update_guard_;
   /// The failed CPU replay's error and the query it belongs to. Written by a worker thread.
   struct cpu_replay_error {
@@ -539,16 +552,18 @@ class SiriusContext : public ClientContextState {
    * @brief RAII guard marking a CPU-fallback replay of a failed GPU query.
    *
    * Narrower than InternalQueryGuard: it fires ONLY around the CPU-fallback
-   * replay, and is read ONLY by the sirius_httpfs s3:// open guard, which must
-   * refuse serving s3:// data to a CPU plan. Binds to the TARGET executing
-   * connection's state (the explicit fallback path replays on a different
-   * Connection than the one that issued the query).
+   * replay and carries the replay's cpu_replay_decision. The sirius_httpfs
+   * s3:// gates and the explicit replay's source validator read it: they serve
+   * s3:// to the CPU plan only when that decision allows it. Binds to the
+   * TARGET executing connection's state (the explicit fallback path replays on
+   * a different Connection than the one that issued the query).
    */
   struct CpuFallbackGuard {
-    explicit CpuFallbackGuard(ClientContext& context) noexcept
+    explicit CpuFallbackGuard(ClientContext& context,
+                              sirius::transparent::cpu_replay_decision decision = {}) noexcept
       : state_(get_sirius_connection_state(context))
     {
-      if (state_) { state_->enter_cpu_fallback(); }
+      if (state_) { state_->enter_cpu_fallback(decision); }
     }
     ~CpuFallbackGuard() noexcept
     {
@@ -566,8 +581,8 @@ class SiriusContext : public ClientContextState {
   /// state can no longer be trusted, so every later attempt to enter a Sirius
   /// execution or plan-generation window gets a stable, session-preserving
   /// error (never INTERNAL/FATAL — those would invalidate the whole
-  /// DatabaseInstance and defeat "CPU queries continue"). CPU / non-Sirius
-  /// paths never consult this.
+  /// DatabaseInstance and defeat "CPU queries continue"). Plain non-Sirius CPU
+  /// paths never consult this; the S3 CPU-fallback admissions do.
   enum class runtime_health : uint8_t { OK, UNAVAILABLE };
   [[nodiscard]] runtime_health get_runtime_health() const noexcept
   {
@@ -830,6 +845,14 @@ class SiriusContext : public ClientContextState {
   /// via DuckDB CPU fallback (same transaction).
   void record_transparent_runtime_fallback() noexcept;
 
+  /// \brief Record one execution of a plan whose GPU planning was declined and
+  /// which therefore runs its retained CPU plan under a CPU-replay admission.
+  void record_cpu_only_execution() noexcept;
+  [[nodiscard]] std::uint64_t cpu_only_executions() const noexcept
+  {
+    return cpu_only_execution_count_.load(std::memory_order_relaxed);
+  }
+
   /// \brief Record a fresh split rejected because it belongs to another scan contract.
   void record_transparent_certificate_mismatch() noexcept;
   void record_transparent_certificate_incomplete() noexcept;
@@ -1006,6 +1029,7 @@ class SiriusContext : public ClientContextState {
   std::atomic<uint64_t> transparent_fallback_count_{0};
   std::atomic<uint64_t> transparent_execution_count_{0};
   std::atomic<uint64_t> transparent_runtime_fallback_count_{0};
+  std::atomic<uint64_t> cpu_only_execution_count_{0};
   std::atomic<uint64_t> transparent_provider_internal_skip_count_{0};
   std::atomic<uint64_t> transparent_hidden_catalog_skip_count_{0};
   std::shared_ptr<sirius::op::scan::physical_check_counters> physical_counters_ =
@@ -1103,6 +1127,10 @@ class SiriusContextExtensionCallback : public ExtensionCallback {
 /// Gates both plan-time and runtime fallback from GPU to DuckDB CPU. Set per
 /// connection via `SET enable_duckdb_fallback = ...`.
 bool duckdb_fallback_enabled(ClientContext& context);
+/// The `sirius_s3_cpu_fallback` setting (default false): whether Sirius-owned
+/// s3:// data may be read by DuckDB CPU execution — fallback replays and plain
+/// reads with gpu_execution off.
+bool s3_cpu_fallback_enabled(ClientContext& context);
 
 /// \brief Read the per-session `like_swar_fastpath` setting (default true).
 bool like_swar_fastpath_enabled(ClientContext& context);
