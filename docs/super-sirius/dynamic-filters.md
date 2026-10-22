@@ -128,8 +128,8 @@ DuckDB static filters remain on their existing, authoritative path. Dynamic filt
 
 | Consumer | Zone map | Membership filter |
 |---|---|---|
-| Parquet scan | Reader AST via `reader_options::set_filter`; may prune row groups and rows during decode | Post-decode mask |
-| DuckDB-native scan | Post-decode AST row mask | Post-decode mask |
+| Parquet scan | Reader AST via `reader_options::set_filter`; may prune row groups and rows during decode | Post-decode mask; compressed pinned chunks probe membership during decode |
+| DuckDB-native scan | Post-decode AST row mask | Post-decode mask; compressed pinned chunks probe membership during decode |
 | Join-edge endpoint | Not used | Post-decode mask |
 | Cached compressed scan, with filtered decode enabled | Existing static decode predicates remain separate | Consumer-selected membership probes during decode, followed by the endpoint mask; no decode probes on a scan with an installed late-materialization deferral |
 
@@ -279,7 +279,7 @@ The settings live under `sirius.operator_params`:
 - Routing is deliberately allowlisted by join type, key shape, and lineage; unsupported shapes lose optimization rather than results.
 - Membership filters currently support integer keys (`INT8`..`INT64`, `UINT8`..`UINT64`), `DATE` and same-unit `TIMESTAMP` keys, fixed-point keys (`DECIMAL32`/`64`, and `DECIMAL128` whose unscaled build values fit int64), and `STRING` keys (as 64-bit fingerprints, no false negatives), nullable or not; floating-point, duration, and nested keys are declined (see "Key types" for where a family plugs in).
 - A `DECIMAL128` key whose build values exceed int64 receives no membership filter (only the zone map); a 16-byte Bloom rep would lift this and is not implemented.
-- The fused (filtered) decode cannot yet carry a nullable *key chunk* to a membership probe: the compression planner fails closed on nullable input to the integer codecs and the filtered-decode assembly refuses null-masked columns, so nullable probe columns reach the membership filters only through the post-decode cascade today. The probe side is null-ready for when that lifts.
+- The fused (filtered) decode cannot yet carry a nullable *key chunk* to a membership probe: a compressed column with nulls keeps its validity bitmask as a whole-chunk sidecar that a compacted decode cannot reattach, so the filtered-decode assembly refuses any chunk with a null-masked column, and nullable probe columns reach the membership filters only through the post-decode cascade today. The probe side is null-ready for when that lifts.
 - The join-edge (direct) route additionally requires identical build and probe storage types (including decimal scale).
 - The publisher emits one global zone map per key; multi-zone publication is not implemented.
 - Accumulation publishes only a Bloom filter (no IN-list or zone map), only from a closed FULL input, and only when every pair of replica GPUs has working peer DMA. A single-partition multi-batch build needs one folded delivery unless it has an eligible BUILD_FILTER stage.

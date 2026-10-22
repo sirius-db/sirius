@@ -79,6 +79,36 @@ details.
 **Policy:** internal. The current shipped policy is active and demand-driven;
 look-ahead is not a user-selectable YAML setting.
 
+### Two-Sleep-Site Scheduler Loop (PR #1478)
+
+**Motivation:** The management event loop slept only on the task-request channel, but the downgrade executor returns extracted pipeline tasks by pushing directly into the scheduler's task queue — an RAII return that emits no channel event. With every executor parked, runnable tasks could sit next to ready devices forever (deterministic hang at SF1000 TPC-H q18 with host-pinned tables).
+
+**Mechanism:** Each pass of `management_eventloop()` tops up the two things the matcher needs, sleeping at most once per missing ingredient: it blocks on the request channel only when no device is parked (a busy executor will post `device_ready`), and sleeps on the task queue's own `multi_index_priority_queue::wait()` when the queue is empty and a device is parked (a `task_available` wake can carry no ready device, and a per-query drain can empty the queue), issuing `schedule_lookahead` first. The queue's condvar hears every push — `schedule()` or a silent direct return — so any producer that bypasses `schedule()` is tolerated by construction. `wait()` blocks until non-empty without extracting, keeping device-preference selection via `try_pop_from`; `push()` uses `notify_all` because mixed waiter kinds share one condvar. Both sleeps are interrupted by `stop()`.
+
+**Code path:** `src/pipeline/task_scheduler.cpp` — `management_eventloop()`; `src/exec/multi_index_priority_queue.hpp` — `wait()`
+
+**Config:** none
+
+### Single Plan Build per Query (PR #1548)
+
+**Motivation:** `OnFinalizePrepare` must build the full Sirius physical plan to decide whether a query is GPU-supported; discarding that plan and rebuilding an identical one at execution doubles plan-construction work on every transparent query.
+
+**Mechanism:** `OnFinalizePrepare` hands the validated plan to the `PhysicalSiriusExecution` operator together with the pin-registry epoch it was built under. The first `GetData` consumes it (one-shot — the move empties the slot) while the epoch still matches; a pin or unpin landing between the finalize and execution windows discards it, and the plan is rebuilt against the current registry. Re-executions of the same prepared operator rebuild from the retained logical-plan template, or re-plan from the SQL string when the template cannot be copied, so data-drift and rebind semantics are unchanged.
+
+**Code path:** `src/sirius_context.cpp` — `OnFinalizePrepare` plan handoff; `src/transparent/physical_sirius_execution.hpp` — `validated_sirius_plan_`, `validated_plan_pin_epoch_`; `src/transparent/physical_sirius_execution.cpp` — epoch check and one-shot consumption in `GetDataInternal`
+
+**Config:** none
+
+### Cardinality Estimates Preserved in the Plan Copy (PR #1945)
+
+**Motivation:** Transparent execution plans from a copy of DuckDB's optimized plan, and `LogicalOperator::Copy()` is a serialization round trip that carries neither `estimated_cardinality` nor `has_estimated_cardinality`. Every node of the copy recomputes its estimate — scans as whole tables, joins from their largest child — so filtered inputs look like full tables to the Sirius planner, flipping hash-join mode decisions and mis-sizing the PARTITION and CONCAT operators ahead of `DELIM_GET`/`CTE_SCAN` build sides.
+
+**Mechanism:** `copy_logical_plan()` wraps `Copy()` and walks the original and the copy in lockstep with `copy_cardinality_estimates()`, copying both fields onto every node; a subtree whose type or child count differs is left untouched and logged at debug level. Every plan copy on the transparent path goes through it — the optimizer hook's capture, the finalize-time validation copy, and the execute-time rebuild — so DuckDB's estimates survive to each execution. The explicit `CALL gpu_execution(...)` path does not copy the plan and is unaffected.
+
+**Code path:** `src/transparent/sirius_optimizer_extension.cpp` — `copy_logical_plan()`, `copy_cardinality_estimates()`
+
+**Config:** none
+
 ## Operator-Level Optimizations
 
 ### Multi-Literal LIKE SWAR Fast Path (PR #1610)
@@ -155,24 +185,43 @@ Two fast paths live inside the dense path. When every slot in the domain is occu
 
 **Motivation:** `cudf::hash_join` does not exploit build-side uniqueness, performing unnecessary work for 1:1 joins.
 
-**Mechanism:** When build-side keys are proven unique via logical plan analysis, Sirius uses `cudf::distinct_hash_join` instead of `cudf::hash_join` in BUILD_PROBE mode. `prove_unique_columns()` walks the DuckDB logical plan subtree and detects uniqueness from:
+**Mechanism:** When build-side keys are proven unique via logical plan analysis, Sirius uses `cudf::distinct_hash_join` instead of `cudf::hash_join`, in both STANDARD and BUILD_PROBE modes. `prove_unique_columns()` walks the DuckDB logical plan subtree and detects uniqueness from:
 - PRIMARY KEY constraints on `LogicalGet`
-- GROUP BY columns on `LogicalAggregate`
+- GROUP BY columns on `LogicalAggregate` (single grouping set)
+- Delim scans (`LogicalDelimGet`) — unique by construction over the complete column set (see the next entry)
 - Propagation through `LogicalFilter`, `LogicalOrder`, `LogicalLimit`, `LogicalTopN`, `LogicalProjection`, `LogicalComparisonJoin`
 
 Only applies to INNER and LEFT joins with pure equality conditions (excludes IS NOT DISTINCT FROM due to `null_equality::UNEQUAL` semantics).
 
 **Code path:** `src/planner/sirius_plan_comparison_join.cpp` — `prove_unique_columns()`, `src/op/sirius_physical_hash_join.cpp` — distinct hash table construction
 
+### DELIM_GET Build-Side Uniqueness Proof (PR #1550)
+
+**Motivation:** The distinct hash join's plan-time uniqueness proof recognizes PRIMARY KEY constraints and GROUP BY outputs, so on schemas with no declared keys (TPC-H declares none) delim-join build sides — duplicate-eliminated by construction — still took the general two-pass `cudf::hash_join`. Measured at SF1000: q22 -24%, q2 -9%.
+
+**Mechanism:** `prove_unique_columns()` claims a `LOGICAL_DELIM_GET` build side as unique: a delim scan replays the enclosing delim join's duplicate-eliminated chunk, which Sirius materializes with a grouped aggregate over all delim columns (globalized via `PARTITION_DISTINCT → DISTINCT_MERGE`), so the full output row set is unique by construction — under EQUAL and UNEQUAL null semantics alike, since GROUP BY collapses NULL keys into one group. Only the complete column set is claimed as a key; subsets stay refused. Being a plan-time proof, it fires in STANDARD mode as well as BUILD_PROBE, adds no runtime pass or stream synchronization, and has no build-size cap — complementing the runtime distinct-build probe (next entry), which covers BUILD_PROBE builds the planner cannot prove.
+
+**Code path:** `src/planner/sirius_plan_comparison_join.cpp` — `LOGICAL_DELIM_GET` case in `prove_unique_columns()`
+
+**Config:** none
+
+### Runtime Distinct-Build Probe (PR #1466)
+
+**Motivation:** The single-pass `cudf::distinct_hash_join` is gated on a plan-time proof of build-key uniqueness, which (outside delim builds) needs a declared PRIMARY KEY — an ART index with memory and insert/update/delete cost. Builds that are distinct in fact but unprovably so pay `cudf::hash_join`'s two probe passes (count + retrieve) on every probe batch. TPC-H SF1000: 22-query suite -4.8%, q11 -48%, q9 -18%.
+
+**Mechanism:** In BUILD_PROBE mode — where one test amortizes across every streamed probe batch — an INNER/LEFT equality join whose uniqueness the planner could not prove tests build distinctness at runtime: `build_keys_are_distinct()` runs one `cudf::distinct_count` pass over the cached build keys (above 4M rows, a 1M-row prefix sample refutes non-distinct builds cheaply first) and, when the keys are distinct, the partition slot builds a `cudf::distinct_hash_join` instead of `cudf::hash_join`. The test reads a count back to the host (one stream synchronization per cached build), applies only under `null_equality::UNEQUAL`, and is skipped above 128M build rows. Non-distinct builds keep the general two-pass path.
+
+**Code path:** `src/op/sirius_physical_hash_join.cpp` — `build_keys_are_distinct()` and the BUILD_PROBE build-arm gate; `src/planner/sirius_plan_comparison_join.cpp` — wiring `enable_runtime_distinct_build_probe` into the operator
+
+**Config:** engine-internal policy, temporarily disabled by default while `cudf::distinct_count` carries a cuCollections defect (NVIDIA/cuCollections#834, tracked as issue #1600): `DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE = false` in `src/sirius_config.hpp`. Not YAML-configurable (the key is rejected); the `enable_runtime_distinct_build_probe` SET option exists only with `SIRIUS_ENABLE_TEST_OPTIONS=1`.
+
 ### Scan Scheduling Tuning (PR #507)
 
 **Motivation:** Eagerly depleting all scan sources at query startup wastes GPU memory on multi-scan plans (e.g., joins with two scanned tables).
 
-**Mechanism:** Two changes:
-1. At query startup, at most 2 scans are scheduled initially
-2. In `task_creator::manager_loop`, scan exhaustion (continuous creation) only runs when `_num_scans_in_plan == 1`. For 2+ scans, the `get_next_task_hint()` topology-driven mechanism controls task creation instead.
+**Mechanism:** At query startup, `task_scheduler::start_query()` schedules exactly the first operator in `query.get_scan_operators()` — the remaining scans are not eagerly depleted. Subsequent scan activation is topology-driven through `get_next_task_hint()` and completion-driven downstream scheduling (plus, under the `lookahead` task-creator strategy, the empty-queue look-ahead).
 
-**Code path:** `src/creator/task_creator.cpp` — `manager_loop()`, `src/pipeline/task_scheduler.cpp` — `schedule_next_scan_tasks()`
+**Code path:** `src/pipeline/task_scheduler.cpp` — `start_query()`; `src/creator/task_creator.cpp` — hint-driven task creation
 
 **Config:** `max_build_hash_table_bytes` (default: 500 MB) — now independent from `concat_batch_bytes`, enabling larger build sides in BUILD_PROBE mode without affecting other joins.
 
@@ -212,9 +261,19 @@ Both feed the same `resolve_mark_join_result()`, which scatters the match indice
 **Code path:**
 - `src/planner/sirius_plan_projection_utils.cpp` — `push_projection()`, `fold_adjacent_projections()`
 - `src/planner/sirius_physical_plan_generator.cpp` — post-pass invocation of `fold_adjacent_projections()`
-- `src/expression/ast/reference_utils.cpp` — `visit_references()`, `substitute_references()`
+- `src/expression/ast/utils.cpp` — `visit_references()`, `substitute_references()`
 
-### Decimal SUM Width Selection
+### Top-K Gather for TopN Sort Fallbacks (PR #1392)
+
+**Motivation:** TopN orderings that `cudf::top_k_order` cannot serve — a nullable key (it takes no `null_order` and treats NULLs as the largest value, so it cannot honor SQL NULLS FIRST/LAST) or a multi-column key (it is single-column only) — fell back to `cudf::sort_by_key` over the whole input, materializing a fully sorted copy of every payload column just to keep the first `offset + limit` rows.
+
+**Mechanism:** `sorted_order_top_k()` sorts only the key columns into an INT32 permutation with `cudf::sorted_order` (which honors null placement), slices the permutation to the first `keep_rows` indices, and gathers just the surviving rows from the full input: the sort materializes an index column rather than sorted payload copies, and the gather touches `keep_rows` rows instead of all of them. Both fallbacks — nullable single-key and multi-key — route through it, in the local TOP_N and in MERGE_TOP_N. The non-nullable single-key path keeps `cudf::top_k_order` followed by a `sort_by_key` over the k gathered rows for deterministic output order.
+
+**Code path:** `src/op/sirius_physical_top_n.cpp` — `sorted_order_top_k()`, `compute_top_n_table()`
+
+**Config:** none
+
+### Decimal SUM Width Selection (PRs #2027, #2073)
 
 **Motivation:** A decimal SUM must not overflow, but the widest type is also the slowest. cuDF sums
 64-bit decimals much faster than 128-bit ones, especially in a grouped aggregation with few groups,
@@ -243,20 +302,30 @@ costing one stream synchronization per batch for all measured columns together.
 **Config:** `enable_decimal_sum_stats_bound` (default: `true`) lets plan-time bounds skip the
 per-batch measurement.
 
+### Per-Task Result Collection (PR #2156)
+
+**Motivation:** The materialized collector receives one batch per final partition, so the last stage of a multi-partition query sinks several batches at once, one per task. Converting each batch into 2,048-row DuckDB chunks and appending every chunk to the one shared `ColumnDataCollection` under the operator mutex serializes the tasks on the lock — about 73,000 acquisitions for a 150M-row result, with tasks spending most of their time waiting for each other, and adding pipeline threads makes it worse.
+
+**Mechanism:** `sirius_physical_materialized_collector::sink()` appends each batch's chunks into a task-local `ColumnDataCollection`, then takes the collector mutex once and merges via `ColumnDataCollection::Combine`, which moves the local segments into the query result without copying rows. At most one local collection per pipeline thread is held before combining, so host memory peak is unchanged.
+
+**Code path:** `src/op/sirius_physical_result_collector.cpp` — `sirius_physical_materialized_collector::sink()`
+
+**Config:** none
+
 ## Memory Optimizations
 
 ### Memory-Pressure-Driven Downgrade (PR #368)
 
 **Motivation:** GPU memory can be exhausted during complex queries with many concurrent pipelines.
 
-**Mechanism:** Downgrade executor monitors GPU memory space every ~10ms. When `downgrade_trigger_fraction` is exceeded, `run_downgrade_pass()` selects candidates:
+**Mechanism:** Each downgrade executor is bound to one memory space and monitors it for pressure. When `should_downgrade_memory()` triggers (usage above `downgrade_trigger_fraction`), it enqueues a `downgrade_request`; the processing thread dequeues requests sequentially and collects candidates:
 1. Partitioned repositories first, sorted by data size descending
 2. Non-active partitions before active ones
 3. Last-to-first partition iteration
 
 Data is moved from GPU to HOST tier via converter registry.
 
-**Code path:** `src/downgrade/downgrade_executor.cpp` — `monitor_loop()`, `run_downgrade_pass()`
+**Code path:** `src/downgrade/downgrade_executor.cpp` — `monitor_loop()`, `processing_loop()`
 
 **Config:** `downgrade_trigger_fraction` (default: 0.8 for GPU, 0.9 for host), `downgrade_stop_fraction` (default: 0.6 for GPU, 0.8 for host). Configuration requires `0 < stop < trigger <= 1`.
 
@@ -266,8 +335,8 @@ Data is moved from GPU to HOST tier via converter registry.
 
 **Mechanism:** Operators throw `oom_reschedule_exception` carrying intermediate results and resume index. The GPU executor catches this and:
 1. Preserves intermediate operator data
-2. Creates a rescheduled task starting from the failure point
-3. Retries up to 10 times with 5ms backoff
+2. Creates a rescheduled task that resumes at the operator index the exception carries (an OOM at operator *i* resumes at *i*; a prepare-phase OOM keeps the task's existing start index)
+3. Retries up to 100 times with 50 ms backoff
 
 **Code path:**
 - `src/pipeline/oom_reschedule_exception.hpp` — exception class
@@ -293,7 +362,7 @@ Data is moved from GPU to HOST tier via converter registry.
 
 **Code path:**
 - `src/pipeline/pipeline_memory_history.hpp` — history ring buffer and estimation
-- `src/pipeline/gpu_pipeline_task.cpp` — `get_estimated_reservation_size()`
+- `src/pipeline/gpu_pipeline_task.cpp` — `get_estimated_reservation_size_info()`
 
 ### Downgrade Request Pattern (PR #579)
 
@@ -457,7 +526,7 @@ If translation fails, filtering falls back to `expression_evaluator` on the deco
 - `src/io/sirius_datasource.cpp` — `cudf::io::datasource` implementation
 - `src/io/cache/prefetching_cache.cpp` — chunk cache, worker, evictor, buffer pool
 - `src/io/uring/uring_reactor.cpp` — io_uring backend reactor
-- `src/include/io/io_request.hpp` — prepared request grouping and exact completion fan-in
+- `src/io/io_request.hpp` — prepared request grouping and exact completion fan-in
 
 ### DuckDB-Native Scan Metadata Walk (PRs #868, #895, #936, #900)
 
@@ -469,8 +538,18 @@ If translation fails, filtering falls back to `expression_evaluator` on the deco
 3. **Parallel range walk + early decode (#895):** `prepare_duckdb_native_walk()` runs as a cheap serial pre-step (partition stats, type-viability gate, row-group count) with no per-segment I/O; the row groups are sliced into fixed internal ranges of eight groups, and the scan-manager pool walks the ranges in parallel so cold segment reads for different ranges overlap. The batch coalescer packs parsed ranges into cap-sized batches that decode while later ranges are still being parsed.
 
 **Code path:**
-- `src/op/scan/duckdb_native_metadata.cpp` — `prepare_duckdb_native_walk()`, `walk_duckdb_native_row_group_range()`, `mark_row_groups_pruned_by_filter_stats()`
+- `src/op/scan/duckdb_native_metadata.cpp` — `prepare_duckdb_native_walk()`, `walk_duckdb_native_row_group_range()`, `run_fused_stats_pass()`
 - `src/op/scan/duckdb_native_gpu_ingestible.cpp` — parse-range slicing, per-range walk thunks, and the `duckdb_native_batch_coalescer`
+
+### Deferred Metadata Walk for Pin-Served Scans (PR #1548)
+
+**Motivation:** Running `prepare_duckdb_native_walk()` at ingestible construction — `GetPartitionStats` plus a statistics pass over every row group — is wasted for a scan the MVCC-pinned cache serves: its splits come from the pinned entry's chunk plan and insert-delta bundles, not from the walk.
+
+**Mechanism:** Every native walk is deferred to execution preparation; construction only seeds a safety value for the range count and keeps the projected-type gate eager (`unsupported_projected_type_reason`, also applied at plan time), so an undecodable projection still refuses where the throw is a clean CPU fallback. `sirius_scan_manager::prepare_for_query` runs the walk through `gpu_ingestible::ensure_metadata_prepared()` on the query thread (`GetPartitionStats` touches `ClientContext`/`LocalStorage`), under the shared checkpoint key it acquires for the scan's database, and only for scans that miss the pinned cache — a `try_match_cached_entry` hit skips the disk-reading provider and the walk entirely. The walk runs under a re-arming `call_once`, so a failure surfaces as a runtime scan error and is retried rather than latched, and a checkpoint-iteration change during preparation throws a checkpoint-revalidation error. `next_split_provider` keeps a warn-and-run backstop off the query thread. When the walk does run, the snapshot/product cache and fused parallel pass make it cheap (see "Cached, Fused, Parallel Native Metadata Prepare Walk").
+
+**Code path:** `src/op/scan/duckdb_native_gpu_ingestible.cpp:306-313` — unconditional deferral at construction; `:318-375` — `run_metadata_walk` with the checkpoint-iteration guard; `:377-402` — `ensure_metadata_prepared` (checkpoint-key check, re-arming `call_once`); `:427-433` — backstop; `src/scan_manager/sirius_scan_manager.cpp:1617-1649` — cache-hit skip, checkpoint-key acquisition, query-thread walk
+
+**Config:** none
 
 ### DuckDB-Native Async Coalesced Reads (PR #849)
 
@@ -509,7 +588,7 @@ If translation fails, filtering falls back to `expression_evaluator` on the deco
 **Mechanism:** The pinned-table scan path moves host-pinned data to the GPU during prepare-for-processing (so the work is attributed correctly and bounded by the per-task reservation) and avoids copying out of cached tables when the batch can be consumed directly. A synchronization point after prepare-for-processing makes the prepare cost observable in logs and Quent.
 
 **Code path:**
-- `src/scan_manager/sirius_scan_manager.cpp` — cached-entry assignment (`try_assign_cached_entries`) and zero-copy resident-batch handoff
+- `src/scan_manager/sirius_scan_manager.cpp` — cached-entry matching (`try_match_cached_entry`) and zero-copy resident-batch handoff
 - `src/pipeline/gpu_pipeline_task.cpp` — prepare-for-processing synchronization
 - `src/op/scan/sirius_gpu_scan_operator.cpp` — resident (cached) input path
 
@@ -566,3 +645,78 @@ chunk 0 is retained as a sentinel and emptied by the GPU filter so the pipeline 
 escape hatch `sirius.operator_params.enable_pinned_zone_map_pruning` gates both capture and
 pruning; entries pinned while it is disabled remain statless until re-pinned. The direct DuckDB
 session override is test-only. See [Pinned-table zone maps](scan.md#zone-maps) for limitations.
+
+### cuDF Hardware Decompression (PR #1302)
+
+**Motivation:** cuDF's parquet reader can route supported codecs through the GPU's hardware decompression engine, but only when `LIBCUDF_HW_DECOMPRESSION=ON` is exported, and exporting it on a machine with any unsupported GPU is unsafe.
+
+**Mechanism:** The opt-in operator param `use_hw_decompression` gates a one-time probe in `SiriusContext::initialize()`. Topology discovery is asked for runtime attributes (which touch the CUDA driver), and only when the flag is set, at least one GPU exists, and **every** GPU reports `runtime_attributes->hw_decomp` does the context emplace a move-only RAII `sirius::util::env_guard` exporting `LIBCUDF_HW_DECOMPRESSION=ON` for the context's lifetime. An unpopulated attribute is a real "not supported" and skips the export, leaving cuDF on software decompression. The guard restores the variable's prior state (previous value or unset) in `terminate()` and on destruction. The decision is startup-only: `SET use_hw_decompression` to a different value throws and points at the YAML.
+
+**Code path:** `src/util/env_guard.hpp` / `src/util/env_guard.cpp` — the RAII guard; `src/sirius_context.cpp:1046-1060` — all-GPU support check and export; `src/sirius_context.cpp:1198` — reset in terminate
+
+**Config:** `sirius.operator_params.use_hw_decompression` (YAML; default `false`, opt-in). The `use_hw_decompression` extension option exposes the value; changing it at runtime throws.
+
+### Decode-Time Membership Pushdown for DuckDB-Native Pins (PR #1555)
+
+**Motivation:** A dynamic join filter can compact a compressed pinned chunk during decode, but only when the scan's splits carry the dynamic-filter channel and the published probe matches the pinned carrier. A duckdb-native pin's splits carried no channel (the channel resolved from parquet bind data only), and a pin-time-narrowed key declined every probe published at the key's native carrier — either way the chunk abandoned its filtered decode and fell back to a full-width decode.
+
+**Mechanism:** The scan operator and the cached provider resolve the dynamic-filter channel from either format's `ingestible_table_info`, so duckdb-native pinned splits are stamped with it and the decode-time membership snapshot in `scan_operator_input::prepare_for_processing` composes join-published filters into the chunk's decompression pushdown. All three membership implementations probe through a shared key domain: build keys are stored at the domain's rep, and the probe kernel converts each probe element into that rep in place — per element, with no materialized widened copy — using the same carrier-family rules as compressed-materialization narrowing, so a pin-time-narrowed probe answers exactly as the native column would; this half is format-agnostic and also covers parquet pins. Decode-side attaches are gated per chunk rather than per entry: a chunk with no MVCC keep-mask still receives the row-selecting pushdown even when other chunks of the same entry are masked. The native ingestible's `post_filter_and_project` also honors the `ROW_FILTERED` contract, mirroring the parquet path.
+
+**Code path:** `src/planner/sirius_physical_plan_generator.cpp` — `make_dynamic_filter_consumer` built from either format's decode bindings and parked on the operator and the cached provider; `src/scan_manager/sirius_scan_manager.cpp` — cached-provider channel capture and per-chunk gate; `src/op/dynamic_filter/dynamic_filter_key_domain.{hpp,cpp}` — key reps and carrier families; `src/cuda/dynamic_filter_probe.cuh` + `src/cuda/sirius_dynamic_{small_in_list,in_list,bloom}_filter.cu` — in-kernel per-element probe conversion in `compute_mask`; `src/op/scan/duckdb_native_gpu_ingestible.cpp` — `ROW_FILTERED` bypass
+
+**Config:** rides the experimental `SIRIUS_EXP_FUSED_SCAN_FILTER` decompression-pushdown gate and `enable_dynamic_filter`; `SIRIUS_EXP_FUSED_SCAN_DIAG=1` traces per-chunk decisions
+
+### MVCC Keep-Mask Version Cache and Decode-Side Composition (PR #1556)
+
+**Motivation:** A pinned duckdb table with committed deletes pays for its visibility keep-masks on every query — visibility-plan capture, `GetSelVector` fill, pinned carve — even though a table's visible state only changes at commits. And a masked compressed chunk that excludes row selection from its decode loses compaction outright, falling back to a full-width decode plus filter-by-copy.
+
+**Mechanism:** Two parts. (1) Each pinned entry carries a single-version keep-mask cache keyed by `{DuckTransactionManager::GetLastCommit, the querying transaction's start_time, ChangesMade}`. `prepare_for_query` reuses the cached set when `last_commit` is unchanged, the query's snapshot covers it, and the query is writer-free; it publishes a fresh set only when the builder's snapshot covers every existing commit, since a writer sees its own uncommitted deletes. This is exact because DuckDB assigns start times and commit ids from one counter under the lock that publishes `last_commit`. `prepare_mvcc_mask_tasks` skips `masks_ready` requests; a (re-)pin resets the cache. (2) The per-chunk MVCC gate composes instead of excluding: a masked chunk's keep-mask is attached as a `decode_visibility_mask` (device and host tiers) alongside the pushdown scan and ANDed into the decode's selection as one additional combine source, so the decode compacts straight to the visible survivors. `pushdown_outcome::visibility_mask_applied` reports consumption; `prepare_for_processing` clears the split's mask on it (re-enabling the zero-copy steal) and throws on a compacted batch with an unconsumed mask. A mask is never a filter source on its own — with no real filter the request is refused, and every non-applied outcome keeps the full-width decode and the scan-side positional mask.
+
+**Code path:** `src/scan_manager/mvcc_mask_cache.hpp` — snapshot key and reuse/publish predicates; `src/scan_manager/sirius_scan_manager.cpp` — cache probe/publish in `prepare_for_query`, mask attach in the cached provider; `src/compression/compressed_scan.{hpp,cpp}` — `decode_visibility_mask`, `pushdown_outcome::visibility_mask_applied`; `src/op/scan/sirius_gpu_scan_operator_data.cpp` — consumption and steal re-enable
+
+**Config:** `SIRIUS_MVCC_MASK_CACHE` environment variable (default on; `0` disables the version cache). Decode-side composition rides the experimental `SIRIUS_EXP_FUSED_SCAN_FILTER` decompression-pushdown gate.
+
+### Cast-Through Range Extraction for DATE Predicates (PR #1577)
+
+**Motivation:** DuckDB constant-folds qgen-style date arithmetic (`l_shipdate <= DATE '1998-12-01' - INTERVAL '72' DAY`) into `CAST(l_shipdate AS TIMESTAMP) <= TIMESTAMP '1998-09-20 00:00:00'`, which arrives at the scan as an `EXPRESSION_FILTER`. A range extraction that only understands constant comparisons refuses the clause, and the scan loses its in-decode masking: full-width decode, a per-row cast AST filter, and a gather-compact. The shape appears in 9 predicates across TPC-H q1/q4/q5/q6/q10/q12/q14/q15/q20 under spec-official (qgen) parameters.
+
+**Mechanism:** `analyze_scan_filters` recognizes `cmp(CAST(date_col AS TIMESTAMP[_S|_MS|_NS]), ts_const)` in either operand order, recursing through AND conjunctions (`fold_expression_conjunct`); `to_decoded_bound` / `lower_timestamp_to_days` lower the timestamp constant into the stored-day domain by floor/ceil. Midnight of day d is strictly monotonic in d, so the bound is exact for every comparison op, coverage stays full, and the residual filter drops; `= non-midnight` folds to a provably empty range. `±infinity` constants lower exactly to the infinite date's stored days, and a finite date whose midnight overflows the timestamp domain is answered by the instant it denotes (DuckDB raises on such queries; a decode range cannot, and neither does the residual cast it replaces). Refused, keeping the residual filter: `TRY_CAST` (NULL-on-overflow diverges from day math), `TIMESTAMP_TZ` (midnight is session-timezone dependent), `INT64_MIN` ticks, and non-comparison shapes. The extracted ranges take effect where the decompression pushdown decodes a compressed pinned chunk.
+
+**Code path:** `src/op/scan/scan_filter_analysis.cpp` — `fold_expression_conjunct`, `to_decoded_bound`, `lower_timestamp_to_days`, `fold_comparison_bound`; contract in `src/op/scan/scan_filter_analysis.hpp`
+
+**Config:** none (the in-decode masking it feeds rides `SIRIUS_EXP_FUSED_SCAN_FILTER`)
+
+### Cached, Fused, Parallel Native Metadata Prepare Walk (PR #1578)
+
+**Motivation:** For unpinned duckdb-native tables, the prepare walk reads every row group's geometry, the min/max statistics of every prunable filter column, and the max string length of every projected varchar column — from scratch, serially, on the query thread, on every query.
+
+**Mechanism:** Three layers, each removing more of the walk.
+1. **Per-table snapshot.** A process-wide `duckdb_native_metadata_cache` captures the row-group geometry plus a copy of each needed column's per-row-group statistics into an immutable `table_walk_snapshot`, in one pass under DuckDB's segment-tree lock; a capture a commit tears mid-pass is detected and retried, never cached. Every acquire revalidates per-row-group identity through `weak_ptr` — a `weak_ptr` only locks back to the exact object it was created from, so a freed-and-reallocated row group (including checkpoint compaction, which does not bump the commit counter) never validates. Transaction-local appends (`LocalStorage`) bypass the cache for that query.
+2. **Per-query-shape product.** The pruning decisions and varchar-overflow verdict are additionally cached as a `walk_plan_product`, keyed by a `walk_product_key` (projection signature plus deep copies of the prunable pushed-down filters resolved to storage primary indexes). Each product is tagged with the snapshot generation it was computed from (a cache-wide monotonic clock, never reused) and is dropped when the snapshot rebuilds. A product hit reduces the prepare step to a validity probe.
+3. **Fused parallel pass.** When the product misses, `run_fused_stats_pass` checks all filter columns and varchar probes in a single pass over the row groups, parallelized by `parallel_over_row_groups` with deterministic results across worker counts; it runs over cached snapshot statistics on a snapshot hit, or over live `PartitionRowGroup` statistics on the uncached path.
+
+`prepare_duckdb_native_walk` tries the cache first and falls through to the uncached fused walk on a bypass; a refusal is reduced to the same (column, row group) the serial pass would report.
+
+**Code path:** `src/op/scan/duckdb_native_metadata_cache.hpp` / `.cpp` — snapshot, product cache, identity probe, torn-capture retry; `src/op/scan/duckdb_native_metadata.cpp:942-975` — cache-first prepare, `:516-532` — fused stats pass, `:1027-1042` — uncached pass; `src/op/scan/metadata_walk_parallel.hpp` — worker policy
+
+**Config:** env `SIRIUS_METADATA_WALK_THREADS` caps the walk's workers (`1` forces serial); env `SIRIUS_DISABLE_NATIVE_METADATA_CACHE` (set and not `"0"`) bypasses both caches. No YAML or extension options.
+
+### Distributed Byte-Range Parquet Splits (PR #2043)
+
+**Motivation:** A distributed frontend load-balances a parquet scan by cutting files at instance byte boundaries, so one file's row groups are split across compute nodes. A node that can only read whole files refuses such plans.
+
+**Mechanism:** Substrait `ReadRel` `LocalFiles` items carry `start`/`length`; `extract_scan_byte_ranges` collects them per canonical path by protobuf reflection (so reads nested under any rel type are found) and refuses remote schemes, a file named both whole and ranged, offset overflow, and a ranged path appearing in more than one read (ranges could not be attributed to one scan). The FFI parks the result as `scan_byte_ranges_state` on the client context; `attach_byte_ranges` claims each path exactly once onto `parquet_ingestible_table_info::resolved_file_ranges` — one entry per bound file holding all of its ranges — and after plan generation `assert_all_consumed` fails the plan if any range went unclaimed, since an unread range would silently drop rows. The per-file metadata task then keeps only the row groups the file's ranges own, before statistics pruning. Ownership is start-offset containment under the StarRocks reader rule (`row_group_start_offset`: the minimum of the first column chunk's data/index/dictionary page offsets and the row group's own `file_offset`, each counted only when present), so every reader of the same file derives the same owner and an exact tiling of the file reads every row group exactly once. A range ending past EOF throws (the producer sized the split against a different file); a zero-length range owns nothing; a range owning no row group is a valid empty scan served through the all-pruned empty-split fallback. The ranges join the split certificate's identity, so the scan-contract check covers them.
+
+**Code path:** `src/op/scan/parquet_byte_range.hpp` / `.cpp` — ownership rule; `src/planner/substrait_scan_ranges.hpp` / `.cpp` — extraction, claim, consumption check; `src/sirius_ffi.cpp:116-121` — plan-bytes entry point; `src/planner/sirius_physical_plan_generator.cpp:218-237,1817-1820,2271-2273` — attach and verify; `src/op/scan/parquet_gpu_ingestible.hpp:84-133`, `.cpp:1361-1389` — owned-row-group union before pruning
+
+**Config:** none
+
+### Per-File Parquet Footer Reader Reuse (PR #2090)
+
+**Motivation:** Computing a batch's column-chunk byte ranges constructs a cuDF `hybrid_scan_reader`, whose constructor copies the file's entire `FileMetaData`. A file split into N batches copies its footer N times — and since both N and the footer grow with the file, the cost is quadratic in file size. The copies run serially on the coalescer path, delaying the scan's first split (a 14.4 GB single-file table read in ~200 batches waited ~10 s before scanning a row).
+
+**Mechanism:** `column_chunk_range_cache` keeps the `hybrid_scan_reader` built for the last (file metadata, reader options) pair and reuses it for every batch of that file; a hit costs two pointer comparisons, and the reader (with its one footer copy) is rebuilt only when the batch's file or reader options change, destroying the old one first so at most one copy lives at a time. Each `parquet_batch_coalescer` owns one cache, consulted for every emitted split's per-slice ranges — which feed both the split's prefetch `fadvise` entries and the bulk materialize route. The ranges themselves are unchanged, and a file read in one batch still builds exactly one reader.
+
+**Code path:** `src/op/scan/parquet_materialize.hpp:69-86`, `src/op/scan/parquet_materialize.cpp:51-73` — the cache; `src/op/scan/parquet_gpu_ingestible.cpp:618,643-657,576-581` — per-coalescer ownership and per-split use
+
+**Config:** none

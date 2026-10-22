@@ -50,15 +50,16 @@ SiriusContext
 ├── task_scheduler                      # Top-level executor (owns the GPU pipeline executors)
 ├── sirius_scan_manager                 # Scan-side preparation + I/O (io_context, prefetch cache, split providers)
 ├── downgrade_executor[]                # Per-memory-space monitors for GPU→Host spilling
-├── task_creator                        # Creates GPU pipeline tasks based on data availability
-└── query                               # Current query context (pipeline hashmap)
+└── task_creator                        # Creates GPU pipeline tasks based on data availability
 ```
+
+The query object itself (`planner::query` — the pipeline set plus the operator and scan indices over the plan) is not owned here: `SiriusContext::create_query()` returns it to the calling `sirius_engine`, which owns it alongside the plan it indexes, together with the query's `completion_handler`. The subsystems above are shared by every in-flight query and keep per-query state keyed by `query_id`: the task creator's state entries, the repository registry's per-query managers, and the query index on every task queue.
 
 Key lifecycle methods on `SiriusContext`:
 - `initialize()` — initializes all subsystems with config
 - `terminate()` — releases all resources
 - `QueryBegin()` / `QueryEnd()` — DuckDB query lifecycle hooks
-- `create_query()` — creates a new query with pipeline metadata
+- `create_query()` — builds the query, registers its per-query state with the task creator and scan manager, and returns it to the calling engine
 
 Scans are not a separate executor. A unified `sirius_gpu_scan_operator` (operator type `GPU_SCAN`) is the pipeline source: it pulls splits from a `split_connector` and delegates per-split materialization to an installed `gpu_ingestible` (parquet or duckdb-native today). The `sirius_scan_manager` prepares this state per query — it builds the per-table ingestible, installs the split connector, drives a `split_provider`, and owns the I/O backends (an `io_context` over io_uring plus optional REST/kvikio paths) and the prefetching cache.
 
@@ -114,6 +115,8 @@ Super Sirius uses multiple dedicated thread pools, each with a specific role:
 │  - Worker threads: move data GPU→Host                           │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+All of these pools are shared across concurrent queries — a query brings no threads of its own. Isolation is by state, not by thread: per-query task-creator entries, per-query repository managers, and query-keyed task queues let one query's completion, failure, or cleanup drain exactly its own work while every other in-flight query keeps running.
 
 ## Execution Lifecycle
 

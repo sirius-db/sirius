@@ -11,7 +11,7 @@ A data batch flows through the system in these stages:
 2. Repository:     idle batch stored in shared_data_repository
 3. Consumption:    task_creator calls pop_next_data_batch(); batch is still idle
 4. Preparation:    prepare_for_processing() acquires read_only_data_batch handles,
-                   converting to GPU memory space if needed (lock_or_prepare_batch)
+                   converting to GPU memory space if needed (lock_and_prepare_batch)
 5. Execution:      GPU task reads data through read_only_data_batch accessors
 6. Output:         operators produce new idle batches, pushed to downstream repositories
 7. Downgrade:      if GPU memory pressure, downgrade executor upgrades to mutable,
@@ -141,7 +141,7 @@ lazily populated from each other on demand:
 Key methods:
 - `get_data_batches()` — returns idle batch pointers; if only `_read_only_data_batches` exist, calls `data_batch::to_idle()` on copies to populate `_data_batches`.
 - `get_read_only_batches(bool leave_locked)` — acquires `to_read_only()` on each idle batch; if `leave_locked=true`, caches result in `_read_only_data_batches`.
-- `prepare_for_processing(memory_space*, stream)` — **void**, throws on failure. Calls `lock_or_prepare_batch()` for each batch (clones/converts to the target memory space if needed, then acquires a shared lock). Stores resulting `read_only_data_batch` handles in `_read_only_data_batches` and resets `_data_batches` to `std::nullopt` — accessor *i* may reference a cross-GPU *clone* rather than the original batch, so the idle view is lazily rebuilt from the accessors rather than kept alongside them. Called by the GPU pipeline executor before `execute()`.
+- `prepare_for_processing(memory_space*, stream)` — **void**, throws on failure. Calls `lock_and_prepare_batch()` for each batch (clones/converts to the target memory space if needed, then acquires a shared lock). Stores resulting `read_only_data_batch` handles in `_read_only_data_batches`; a cross-GPU clone replaces the original in `_data_batches`, so `_data_batches[i]` stays the batch underlying accessor *i* and the original ID stays available through `original_batch_ids()`. Called by the GPU pipeline executor before `execute()`.
 - `remove_read_only_lock()` — releases `_read_only_data_batches` while ensuring `_data_batches` is populated first (so the data stays alive).
 - `original_batch_ids()` — the IDs of the non-null input batches in input order, as constructed. Preparation may replace a batch with a cross-GPU clone that has a new ID, and a retry reuses the same object, so these IDs identify the logical inputs across both (used by multi-partition dynamic filters). Only a replacement records an ID; other batches answer with their current ID.
 - A certified dynamic-filter input may spill and re-upgrade before contribution. Only its original ID, exact row count, and active key types must match; payload child layouts may change during conversion.
@@ -171,7 +171,7 @@ Global singleton for converting between data representations:
 - Thread-safe initialization via mutex
 - Used by:
   - Downgrade tasks: GPU representation → HOST representation
-  - GPU pipeline tasks: HOST representation → GPU representation (`lock_or_prepare_batch`)
+  - GPU pipeline tasks: HOST representation → GPU representation (`lock_and_prepare_batch`)
 
 ### Conversion Examples
 

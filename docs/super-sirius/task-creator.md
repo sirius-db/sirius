@@ -6,7 +6,7 @@ This document covers the task creation subsystem: how the system decides when an
 
 **File:** `src/creator/task_creator.hpp`, `src/creator/task_creator.cpp`
 
-The `task_creator` is a multi-threaded component that converts operator scheduling requests into concrete scan or GPU pipeline tasks. It maintains global state maps for each operator type and uses a hint-chain recursion to find the deepest ready operator.
+The `task_creator` is a multi-threaded component, shared by every in-flight query, that converts operator scheduling requests into concrete GPU pipeline tasks. It keeps one state entry per query, keyed by `query_id`, and uses a hint-chain recursion to find the deepest ready operator. Cleanup, draining, and teardown target exactly one query's entry without touching any other in-flight query.
 
 Task creation policy is internal and currently demand-driven, with source-side
 pipelines prioritized first within each branch. The engine retains its
@@ -239,6 +239,8 @@ while running:
 
 The `mark_task_created()` call before data popping prevents a race condition where the pipeline could appear finished between data check and task creation.
 
+The creation queue is a `multi_index_priority_queue` keyed per request (query id, pipeline scheduling priority, operator type, device hint): creation is ordered the same way execution is — earlier query first, then within-query pipeline rank — and one query's pending requests can be dropped via `drain(query_index{...})` without disturbing any other query's. The manager loop resolves the request's query state once and hands the `shared_ptr` to the creation worker; a request whose query was reset while it sat in the queue is dropped, since its operator pointer may already dangle.
+
 ### Look-ahead task creation
 
 **Files:** `src/creator/config.hpp`, `src/creator/task_creator.cpp`
@@ -259,19 +261,15 @@ The task creator does not choose that device. The partition's consumer chooses a
 
 Placements are drawn from the query's admitted set: `sirius_engine::initialize_internal` computes the admitted subset, installs it on the task creator via `set_active_gpu_ids()`, and builds `pipeline_build_context` from the same list, which the pipeline converter hands to every partition consumer. PARTITION rejects a placement that names a device outside it. See [configuration.md](configuration.md) for `topology.gpus_per_query`.
 
-The other device preferences the task creator computes — the operator's own hint, GPU-resident byte counts, NUMA locality via `gpus_of()`, and a cached chunk's home device — are all derived from where data already lives and can name a device outside the admitted subset. They are clamped back into `_active_gpu_ids` at the point the preference is written to the task's local state. The clamp applies to stamped preferences too, as a backstop.
+The other device preferences the task creator computes — the operator's own hint, GPU-resident byte counts, NUMA locality via `gpus_of()`, and a cached chunk's home device — are all derived from where data already lives and can name a device outside the admitted subset. They are clamped back into the query's `active_gpu_ids` at the point the preference is written to the task's local state. The clamp applies to stamped preferences too, as a backstop.
 
-A task with no preference at all is confined the same way, but only when the query was admitted onto a strict subset. The scheduler hands an unpreferred task to whichever executor asks first, excluded ones included (a GPU_VALUES task carries no device-bound state and so sets no preference), so on a subset those tasks are pinned round-robin over `_active_gpu_ids`. Pinning costs the scheduler's freedom to place the task on whatever device frees up first, so it is skipped when nothing was narrowed away and there is nothing to confine.
+A task with no preference at all is confined the same way, but only when the query was admitted onto a strict subset. The scheduler hands an unpreferred task to whichever executor asks first, excluded ones included (a GPU_VALUES task carries no device-bound state and so sets no preference), so on a subset those tasks are pinned round-robin over the query's `active_gpu_ids`. Pinning costs the scheduler's freedom to place the task on whatever device frees up first, so it is skipped when nothing was narrowed away and there is nothing to confine.
 
 The pin is reapplied on the OOM-reschedule path (`gpu_pipeline_executor`): when a task is rebuilt with a fresh local state, its per-task `preferred_device_id` is carried forward so a rescheduled probe doesn't lose its pin and scatter.
 
-## `can_create_more_tasks()` and `has_processed_all_tasks()`
+## `can_create_more_tasks()`
 
-These methods signal task exhaustion:
-- `can_create_more_tasks()` — returns false when no more tasks can be created (e.g., scan exhausted, all partitions processed)
-- `has_processed_all_tasks()` — returns false when tasks are still in flight
-
-Both throw `not implemented` in the base class and must be overridden by operators that need them.
+Signals task exhaustion: returns false when no more tasks can be created (e.g., scan exhausted, all partitions processed). Throws `not implemented` in the base class and must be overridden by operators that need it.
 
 ## Query retirement
 

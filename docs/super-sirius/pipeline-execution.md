@@ -102,7 +102,7 @@ pipeline->get_sink()->sink(output_data, stream);
 ```
 
 **`execute(stream)`** handles the full flow:
-1. Lock each input batch and convert to GPU if needed (`lock_or_prepare_batch`)
+1. Lock each input batch and convert to GPU if needed (`lock_and_prepare_batch`)
 2. Call `compute_task()` (iterates all operators' `execute()`)
 3. Call `publish_output()` (calls sink's `sink()` to push to downstream ports)
 4. Processing handles released automatically on scope exit
@@ -164,31 +164,36 @@ This is the gate. `compute_task(stream)` — which iterates the pipeline's opera
 
 ```cpp
 void pipelineable_operator_data::prepare_for_processing(
-  const ::cucascade::memory::memory_space* requested_memory_space, rmm::cuda_stream_view stream)
+  const ::cucascade::memory::memory_space* requested_memory_space, ::cuda::stream_ref stream)
 {
+  remove_read_only_lock();
   std::vector<::cucascade::read_only_data_batch> ro_batches;
-  for (const auto& batch : _data_batches) {
-    auto ro = pipeline::lock_or_prepare_batch(batch, requested_memory_space, stream);
-    ...  // throws sirius::internal_exception if a batch cannot be locked
-    ro_batches.emplace_back(std::move(*ro));
+  for (std::size_t position = 0; position < _data_batches.size(); ++position) {
+    auto& batch = _data_batches[position];
+    auto result = pipeline::lock_and_prepare_batch(batch, requested_memory_space, stream);
+    ...  // throws sirius::internal_exception on a null batch or one that cannot be locked
+    // lock_to_existing_batch: keep the batch, store its read-only lock.
+    // lock_to_new_batch (cross-GPU clone): record the original ID once, replace
+    // `batch` with the clone, store the clone's read-only lock.
   }
   _read_only_data_batches = std::move(ro_batches);
-  _data_batches = std::nullopt;  // accessors are the source of truth from here on
 }
 ```
 
-Every batch is fed through `lock_or_prepare_batch`. There is no early-exit short-circuit — partial colocation is not possible; a batch that cannot be locked throws `sirius::internal_exception`. After the walk, `_data_batches` is reset to `std::nullopt`: accessor *i* may reference a cross-GPU *clone* rather than the original batch, so the idle batch view is lazily rebuilt from the accessors rather than kept alongside them.
+Every batch is fed through `lock_and_prepare_batch`. There is no early-exit short-circuit — partial colocation is not possible; a batch that cannot be locked throws `sirius::internal_exception`. A cross-GPU input is replaced in `_data_batches` by its clone, so `_data_batches[i]` is always the batch underlying accessor *i*; the replaced batch's original ID is kept for `original_batch_ids()`.
 
-**Layer 4 — `lock_or_prepare_batch` does the actual clone/conversion.**
+**Layer 4 — `lock_and_prepare_batch` does the actual clone/conversion.**
 
 `src/pipeline/batch_lock_utils.hpp`:
 
 ```cpp
-inline std::optional<cucascade::read_only_data_batch> lock_or_prepare_batch(
+inline std::optional<lock_and_prepare_batch_result> lock_and_prepare_batch(
   const std::shared_ptr<cucascade::data_batch>& batch,
   const cucascade::memory::memory_space* requested_memory_space,
-  rmm::cuda_stream_view stream);
+  ::cuda::stream_ref stream);
 ```
+
+`lock_and_prepare_batch_result` is `std::variant<lock_to_existing_batch, lock_to_new_batch>`: the first holds a read-only lock on the same batch (already colocated, or upgraded in place from host or disk), the second holds the cross-GPU clone and a read-only lock on it. It returns `std::nullopt` for a null batch or an unresolvable target.
 
 If the batch is already on `target_space`, it is locked in place under a shared (read) lock. If it lives on a *different GPU*, it is **cloned** into the target space under the same shared lock (`read_accessor.clone_to<...>`) — the source batch is never exclusively locked and never mutated, so concurrent readers on its home GPU proceed unhindered (see [Multi-GPU Architecture](multi-gpu-architecture.md)). Host/disk-resident batches are converted via `mut_accessor.convert_to<...>` (an upgrade, not a clone). The cross-GPU route goes through `cucascade::convert_gpu_to_gpu` (peer-DMA on server hardware, automatic host-staging on consumer hardware whose chipset misreports peer-access support). For HOST-targeted conversions the helper first attempts a caller-owned reservation (`make_reservation_or_null`) and passes it to the reservation-taking `convert_to` overload, falling back with a warning to the no-reservation overload — see [Memory Management](memory-management.md).
 
@@ -233,7 +238,7 @@ If you are reading older operator code that says "all batches are expected to sh
 Two pieces of evidence corroborate that the contract holds for every currently-shipping operator:
 
 - **Phase 14 ship-validation** — `[mgpu]` 12/13 PASS, `[TPC-H][parquet]` 22/22 PASS, `[integration][TPC-H]` 48/48 PASS (71608 assertions). The single `[mgpu]` fail is the Phase-12-territory `physical_order - small sort stays single-GPU` `vector::_M_range_check`, fixed on `fix/order-small-sort-rangecheck` and unrelated to operator colocation.
-- **Phase 15 Wave 1 audit** — All 11 operator sites that read `valid_batches[0]->get_memory_space()` (or equivalent) are classified `SAFE` based on upstream-trace through `gpu_pipeline_task::execute -> pipelineable_operator_data::prepare_for_processing -> lock_or_prepare_batch`. The per-site classification table and justification were recorded in the Phase 15 audit log.
+- **Phase 15 Wave 1 audit** — All 11 operator sites that read `valid_batches[0]->get_memory_space()` (or equivalent) are classified `SAFE` based on upstream-trace through `gpu_pipeline_task::execute -> pipelineable_operator_data::prepare_for_processing -> lock_and_prepare_batch`. The per-site classification table and justification were recorded in the Phase 15 audit log.
 
 ### For new operator authors
 
@@ -242,14 +247,14 @@ When you write a new `sirius_physical_operator` subclass that calls `get_memory_
 ```cpp
 // INVARIANT: all input batches arrive on target_space via
 // gpu_pipeline_task::execute -> pipelineable_operator_data::prepare_for_processing
-// -> lock_or_prepare_batch.
+// -> lock_and_prepare_batch.
 // See docs/super-sirius/pipeline-execution.md "Per-task-device contract under SCHED-RR".
 cucascade::memory::memory_space* space = input_batches[0].get_memory_space();
 ```
 
 This makes the upstream-protection assumption explicit and reviewable. The comment is mandatory for any code touching `get_memory_space()` on a batch the operator did not itself construct. If your operator constructs an output batch (e.g. by calling `make_data_batch(table, mem_space, writer_stream)`), reads on *that* output are out of scope — the operator chose its own `mem_space` and is the authority for it.
 
-If you cannot satisfy the contract — for example, your operator legitimately needs to consume input batches from multiple GPUs without going through `pipelineable_operator_data` — then you must explicitly call `lock_or_prepare_batch` per batch yourself, or use `cucascade::convert_gpu_to_gpu` to colocate before reading. Do not assume `batches[0]`'s space is authoritative.
+If you cannot satisfy the contract — for example, your operator legitimately needs to consume input batches from multiple GPUs without going through `pipelineable_operator_data` — then you must explicitly call `lock_and_prepare_batch` per batch yourself, or use `cucascade::convert_gpu_to_gpu` to colocate before reading. Do not assume `batches[0]`'s space is authoritative.
 
 ## Pipeline Executor
 
@@ -259,6 +264,13 @@ The `task_scheduler` is the top-level GPU-pipeline orchestrator. It owns the sha
 queue, one `gpu_pipeline_executor` per active GPU, and the management thread that matches queued
 tasks to ready devices. Scan execution is reached through `task_creator`; there is no scan
 sub-executor or scan-priority queue owned here.
+
+The queue is shared by every in-flight query. Each task's priority packs its query id into the
+high bits (`query_priority_bits`) above its within-query pipeline rank, so an earlier query's
+tasks dispatch first and concurrent queries' tasks interleave deterministically. The queue is
+also indexed by query (`pipeline::index_keys_for`, the same extractor every GPU executor's queue
+uses), which is what lets `discard_query_tasks(query_id)` drop one query's pending work from every
+queue without touching another's.
 
 ### Key Methods
 
@@ -280,7 +292,8 @@ task. Ready devices remain recorded until a compatible task arrives:
 ```
 while running:
     1. Collect device_ready events; block on the request channel only when no device is ready
-    2. If the task queue is empty, ask the task creator to look ahead, then wait for a queue push
+    2. If the task queue is empty and a device is ready, publish `task_queue_empty`, ask the
+       task creator to look ahead, then wait for a queue push
        (schedule_lookahead(first ready device) — speculatively warms up a
        not-yet-activated scan; no-op unless strategy is `lookahead`)
     3. For each ready device, select a compatible queued task:
@@ -289,13 +302,17 @@ while running:
     4. Dispatch the selected task to that device's GPU executor
 ```
 
+The queue sleep (`multi_index_priority_queue::wait()`), not the channel, is what hears producers
+that push directly into the queue with no `task_available` event — the downgrade executor returns
+extracted tasks this way. Both sleeps are interrupted by `stop()`.
+
 Tasks stay in the top-level queue until a ready device can accept them, preserving visibility to
 the downgrade machinery. A live preferred device is binding because the task may reference
 device-local data.
 
 ### Initial Scan Scheduling
 
-`start_query()` schedules exactly the first operator in `query.get_scan_operators()`. Subsequent
+`start_query(query)` schedules exactly the first operator in `query.get_scan_operators()`. Subsequent
 work is exposed by task hints and completion-driven downstream scheduling — plus, under the
 `lookahead` task-creator strategy, the empty-queue look-ahead above (see
 [task-creator.md](task-creator.md)); there is no `schedule_next_scan_tasks()` or
@@ -341,7 +358,11 @@ Concurrency is managed via `exec::bounded_thread_pool`, which uses a two-phase `
 | `_memory_space` | `memory_space*` | GPU memory for making reservations |
 | `_task_request_publisher` | `publisher<task_request>` | Channel to signal pipeline executor |
 | `_task_creator` | `task_creator*` | For scheduling downstream consumer tasks |
-| `_completion_handler` | `completion_handler*` | For signaling query completion (the epilogue's copy; query-terminal pipelines hold one too) |
+
+There is no executor-held completion handler: each task carries its own query's
+`completion_handler` (a `shared_ptr` in its pipeline's global state, read via
+`gpu_pipeline_task::get_completion_handler()`), so error reports and completion signals are
+always scoped to the right query even with several queries' tasks in one executor.
 
 ### Manager Loop
 
@@ -407,6 +428,13 @@ gpu_executor → task_request_publisher.send() → task_scheduler.management_eve
 
 **File:** `src/pipeline/completion_handler.hpp`
 
+One `completion_handler` exists per query. `sirius_engine::execute()` creates it and holds the
+future; `task_creator::prepare_for_query()` stamps a `shared_ptr` to it onto every pipeline's task
+global state and a `weak_ptr` onto query-terminal pipelines, so no subsystem holds a "current
+query" handler and one query's failure cannot poison another's. The `shared_ptr` matters for
+lifetime: the engine is destroyed before the query's cleanup drains the task queues, and a task
+still unwinding reports through its own reference without touching freed memory.
+
 Thread-safe signaling for query completion using promise/future:
 
 | Method | Behavior |
@@ -418,6 +446,39 @@ Thread-safe signaling for query completion using promise/future:
 
 All methods are idempotent: the GPU epilogue and terminal pipeline may signal the same completion,
 and only the first call takes effect.
+
+## Query Event Publisher
+
+**Files:** `src/event/event.hpp`, `src/event/query_event_publisher.hpp`, `src/event/query_event_subscriber.hpp`
+
+`event::query_event_publisher` is an observer channel for execution progress. The task creator
+and the task scheduler each see one half of the picture — the creator knows what work exists and
+why it could not make more, the scheduler knows what got dispatched and when a GPU went hungry —
+and the publisher is the one place both halves can be reported so a subscriber can tell scan-bound
+from barrier-bound from done. Reporters call `publish_*` entry points; publishing is a push into
+each subscriber's mailbox, never a callback, so a reporter is never made to wait on what a
+subscriber does.
+
+Event taxonomy (`event::event_type`): `task_created`, `task_deployed`, `failed_to_create_task`,
+`task_queue_empty`, `pipeline_closed`, `executor_awaiting_task`, `memory_downgrade_for_task`,
+`wait_for_memory_for_task`, and `compressed_materialization` (whose payload is a
+compressed-materialization activity plus a column or scan-node count). Each publication carries a
+process-wide `event_id` (the ordering key —
+arrival order is guaranteed per reporter, not globally) and a system-clock timestamp, plus its
+payload (query id, operator id and type, GPU id, byte counts as applicable).
+
+Subscribers derive from `event::query_event_subscriber`, naming the events they want in the
+constructor. Each runs a worker thread of its own, draining a mailbox and dispatching into
+`on_<event>` hooks, so hook work cannot stall the creator, scheduler, or executor hot paths; with
+no subscriber registered for an event, its `publish_*` call costs a shared lock and a branch.
+
+The task creator publishes `task_created`, `failed_to_create_task`, and `pipeline_closed`; the
+task scheduler publishes `task_deployed`, `task_queue_empty`, and `executor_awaiting_task`; the
+GPU pipeline executor publishes `wait_for_memory_for_task` and `memory_downgrade_for_task`.
+Compressed-materialization reporters at plan, pin, scan, and partition time publish
+`compressed_materialization` — see [Compressed Materialization](compressed-materialization.md).
+The readahead scan manager is the shipping subscriber: the scan manager creates one per query
+when the readahead budget is non-zero, registering its mailbox for the query's lifetime.
 
 ## Reschedule Handling (OOM and CUDA launch failures)
 

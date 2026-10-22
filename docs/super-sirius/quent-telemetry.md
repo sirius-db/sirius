@@ -63,6 +63,26 @@ CALL gpu_execution(
 `gpu_execution(...)` call, an inline `query_label` parameter takes precedence over a pending label set
 with `sirius_set_query_label`. Unlabeled queries are reported as `unnamed_query`.
 
+### Group queries by phase
+
+By default every query in the process is reported under one Quent query group named
+`<engine_name>-session-<pid>`. `sirius_set_session_label` sets a sticky label on the current
+connection; every subsequent query on that connection is reported under a query group named
+`<engine_name>-<label>` instead, which keeps phases such as a benchmark's warmup, power, and
+throughput streams apart in the Quent UI:
+
+```sql
+CALL sirius_set_session_label('power');
+-- queries on this connection now land in the "siriusDB-power" group
+CALL sirius_set_session_label('');   -- back to the default session group
+```
+
+Unlike `sirius_set_query_label`, the session label is not consumed by a query: it stays in effect
+until it is replaced or cleared with an empty string. It applies to transparent plain-SQL execution
+and to explicit `gpu_execution(...)` calls alike, and is independent of the per-query label, which
+still names the individual query within its group. A group is declared the first time its label is
+used. The argument must be a non-NULL VARCHAR.
+
 ## 3. Generate telemetry
 
 Run any query with the exporter enabled and telemetry files appear under `output_directory`.

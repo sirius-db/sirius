@@ -24,16 +24,31 @@ The scan orders their input reads after writes on the task stream, waits for the
 before returning, and rebinds the decoded columns to the task stream (`decompress_chunk`
 in `src/compression/compressed_scan.cpp`).
 
+## Nullable columns
+
+A column with nulls compresses with the same plan as one without. Compression detaches the
+validity bitmask before the plan walk (`strip_validity`,
+`src/compression/simpatico_codegen/src/codegen/plan/validity.hpp`), so no plan block routes a
+null mask and no compressor sees a nullable input; decode reattaches it to the decoded column
+(`attach_validity`). The bitmask is a per-column sidecar stored beside the plan tree and is not
+itself compressed: a column with no nulls carries nothing, an all-null column records only its
+null count, and only a mixed column puts a bitmask in the payload. A compacted decode returns the
+surviving rows while the bitmask spans the whole chunk, so a column with nulls never takes a
+compacted route. A filtered decode that reads one is declined before any device work and the
+batch decodes in full, while decode-time equality still evaluates inside the decode, with the
+column's validity reattached to the match result.
+
 ## Decode-time equality pushdown
 
 A string equality filter over a compressed pinned column can be evaluated *inside* the
 decode instead of re-expressed as a post-decode comparison. At `prepare_for_query`, the
-scan manager derives a `sirius::decode_equality_pushdown` from the query's pushed-down
-filters and attaches it to the entry's scan (`set_equality_pushdown()`); the converter
-translates it into a `simpatico::decode_predicate`, so the decoder emits the match result
-directly. Interfaces: `src/compression/compressed_representation.hpp`
-(`decode_equality_pushdown`), `src/compression/compression_converters.cpp` (predicate
-translation), threaded through `sirius_scan_manager::prepare_for_query`.
+scan manager derives a `pushdown_request` from the query's pushed-down filters (equality
+values land in the request's per-column `equals_any` entries) and plans the entry's decode
+through `decompression_pushdown_scan`; the converter translates it into a
+`simpatico::decode_predicate`, so the decoder emits the match result directly. Interfaces:
+`src/compression/compressed_scan.hpp` (`pushdown_request`, `decompression_pushdown_scan`),
+`src/compression/compression_converters.cpp` (predicate translation), threaded through
+`sirius_scan_manager::prepare_for_query`.
 
 The compression settings can be staged before a table is pinned. Compression becomes active only
 when `CALL pin_table(..., compression => true)` requests it, the plan-directory setting is
@@ -178,9 +193,26 @@ python test/tpch_performance/performance_test.py --engine gpu --mode grouped \
   --iterations 3 --pin host --input /data/tpch_parquet_sf1000 --data-source parquet
 ```
 
-Checked-in SF1000 plans live in `src/compression/simpatico_codegen/plans/tpch_sf1000/`;
-per-column ratio and throughput annotations are in each file's comments. Re-measure with
-`simpatico_cli benchmark` when hardware changes.
+Checked-in SF1000 plans live in `src/compression/simpatico_codegen/plans/tpch_sf1000/`.
+`lineitem.txt` and `orders.txt` are active; the `part`, `partsupp`, `supplier` and `customer`
+plans are kept as `*_disabled.txt`, which the `<table>.txt` lookup does not match, so those
+tables (like `nation` and `region`) pin uncompressed. Per-column ratio and throughput
+annotations are in each file's comments. Re-measure with `simpatico_cli benchmark` when
+hardware changes.
+
+## JIT kernel cache
+
+Simpatico renders its fused compress and decode kernels as CUDA source per plan shape and
+compiles them with NVRTC on first use, so the first pin or decode of a new plan pays compile
+latency that later runs do not. Compiled kernels are cached in memory per process and on disk
+under `SIMPATICO_JIT_CACHE_DIR` (default `${XDG_CACHE_HOME:-$HOME/.cache}/simpatico/jit`; `off`,
+`0`, or empty disables the disk tier). The key is content, not paths or timestamps: the rendered
+source, entry symbol, program name, and ordered NVRTC options (which carry the target
+architecture), plus the embedded header bundles and the NVRTC major/minor version, so a header or
+compiler change selects a fresh namespace instead of reusing a stale cubin. Disk records are
+length- and checksum-validated and published by atomic rename, so concurrent processes can share
+one directory and a damaged record recompiles. Layout, retention, and `SIMPATICO_JIT_STATS` are
+in `src/compression/simpatico_codegen/README.md` and `CACHE_FORMAT.md`.
 
 ## Compression streams
 
