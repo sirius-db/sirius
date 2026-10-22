@@ -56,6 +56,11 @@ class parquet_scan_core {
     std::span<std::size_t const> elided,
     expression_query_policy policy = {});
 
+  [[nodiscard]] bool can_serve_cached_view() const noexcept;
+
+  [[nodiscard]] std::optional<cached_view_layout> view_layout(
+    filtered_table const& input, std::span<std::size_t const> elided) const;
+
   [[nodiscard]] const ingestible_table_info& table_info() const noexcept { return *_info; }
 
   [[nodiscard]] std::vector<std::size_t> materialized_column_order() const;
@@ -77,6 +82,9 @@ class parquet_scan_core {
   [[nodiscard]] scan_filter_analysis const& filter_analysis() const { return _filter_analysis; }
 
  private:
+  [[nodiscard]] std::unique_ptr<sirius::ast::node> remaining_residual(
+    filtered_table const& input) const;
+
   std::shared_ptr<pipeline::completion_handler> _execution_completion;
   /// Read one file's footer, prune its row groups against the filter, and record
   /// per-row-group byte accounting. Returns a single @c parquet_file_scan_info.

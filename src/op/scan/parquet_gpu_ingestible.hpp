@@ -16,6 +16,8 @@
 
 #pragma once
 #include "op/scan/parquet_scan_core.hpp"
+
+#include <typeinfo>
 namespace sirius::op::scan {
 class parquet_gpu_ingestible : public gpu_ingestible {
  public:
@@ -45,6 +47,17 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   std::optional<std::size_t> output_prefix_width() const noexcept override
   {
     return _core.output_prefix_width();
+  }
+  [[nodiscard]] bool can_serve_cached_view() const noexcept override
+  {
+    // Other adapters need their own proof for visibility and source positions.
+    return typeid(*this) == typeid(parquet_gpu_ingestible) && _core.can_serve_cached_view();
+  }
+  [[nodiscard]] std::optional<cached_view_layout> view_layout(
+    filtered_table const& input, std::span<std::size_t const> elided) const override
+  {
+    if (!can_serve_cached_view()) return std::nullopt;
+    return _core.view_layout(input, elided);
   }
   bool has_row_filter() const noexcept override { return _core.has_row_filter(); }
   bool can_report_survivors() const noexcept override { return true; }

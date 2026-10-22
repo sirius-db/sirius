@@ -32,6 +32,7 @@
 #include <log/logging.hpp>
 #include <memory/size_arithmetic.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
+#include <op/scan/detail/read_retirement.hpp>
 #include <op/scan/dynamic_filter_merge.hpp>
 #include <op/scan/parquet_batch_layout.hpp>
 #include <op/scan/parquet_byte_range.hpp>
@@ -42,6 +43,8 @@
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
 #include <transparent/read_view_registry.hpp>
+
+#include <ranges>
 
 // cudf
 #include <cudf/column/column_factories.hpp>
@@ -93,6 +96,8 @@
 #include <future>
 #include <iterator>
 #include <memory>
+#include <new>
+#include <numeric>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -2105,7 +2110,8 @@ filtered_table parquet_scan_core::materialize_metadata_to_table(
       view = project_output ? owning_table_view{exec.select(view.view(), data_positions)}
                             : owning_table_view{exec.select(view.view())};
     }
-    auto assembled = assemble_scan_output(*_plan, std::move(view), split.partition_values, stream);
+    auto assembled =
+      assemble_scan_output(*_plan, std::move(view), split.partition_values, stream, mr_ref);
     return op::scan::filtered_table{std::move(assembled),
                                     op::scan::filter_state::ROW_FILTERED_AND_PROJECTED};
   }
@@ -2125,23 +2131,89 @@ filtered_table parquet_scan_core::materialize_metadata_to_table(
 
 namespace {
 
-/// Positions of `width` minus `elided`, ascending. Empty when nothing would be
-/// left: a zero-column table carries no row count, and the rowid needs one.
-std::vector<std::size_t> kept_positions(std::size_t width, std::span<std::size_t const> elided)
+/// Materialized positions of `plan`'s outputs without the `elided` output ordinals. Keeps every
+/// output when nothing would be left: a zero-column table carries no row count, and the rowid needs
+/// one.
+std::vector<std::size_t> unelided_output_positions(scan_plan const& plan,
+                                                   std::span<std::size_t const> elided)
 {
-  if (elided.empty() || elided.size() >= width) { return {}; }
-  std::vector<std::size_t> kept;
-  kept.reserve(width - elided.size());
-  for (std::size_t pos = 0; pos < width; ++pos) {
-    if (std::find(elided.begin(), elided.end(), pos) == elided.end()) { kept.push_back(pos); }
+  auto const& layout = plan.output_layout;
+  bool const elide   = elided.size() < layout.size();
+  std::vector<std::size_t> positions;
+  positions.reserve(layout.size());
+  for (std::size_t ordinal = 0; ordinal < layout.size(); ++ordinal) {
+    if (!elide || std::ranges::find(elided, ordinal) == elided.end()) {
+      positions.push_back(layout[ordinal].idx);
+    }
   }
-  return kept;
+  return positions;
 }
 
 }  // namespace
 
+std::unique_ptr<sirius::ast::node> parquet_scan_core::remaining_residual(
+  filtered_table const& input) const
+{
+  if (input.state == filter_state::ROW_FILTERED ||
+      input.state == filter_state::ROW_FILTERED_AND_PROJECTED || _residual.empty()) {
+    return nullptr;
+  }
+  return _residual.against(input.predicate_columns, input.predicates_enforced);
+}
+
+bool parquet_scan_core::can_serve_cached_view() const noexcept
+{
+  return !_plan->has_partitions() && !_plan->has_user_virtual_columns() &&
+         !_plan->output_layout.empty() &&
+         std::ranges::all_of(_plan->output_layout, [](auto const& entry) {
+           return entry.source == scan_plan::output_entry::DATA;
+         });
+}
+
+std::optional<cached_view_layout> parquet_scan_core::view_layout(
+  filtered_table const& input, std::span<std::size_t const> elided) const
+{
+  if (!can_serve_cached_view() || input.state == filter_state::ROW_FILTERED_AND_PROJECTED) {
+    return std::nullopt;
+  }
+  auto const width  = input.table.n_columns();
+  auto const prefix = output_prefix_width();
+  if (width != _plan->data_columns.size() &&
+      !(input.state == filter_state::ROW_FILTERED && prefix && width == *prefix)) {
+    return std::nullopt;
+  }
+  cached_view_layout layout;
+  layout.output_columns.reserve(_plan->output_layout.size());
+  layout.projected_columns.reserve(_plan->output_layout.size());
+  for (std::size_t ordinal = 0; ordinal < _plan->output_layout.size(); ++ordinal) {
+    auto const& entry = _plan->output_layout[ordinal];
+    if (entry.idx >= width ||
+        std::ranges::find(input.predicate_columns, entry.idx) != input.predicate_columns.end()) {
+      return std::nullopt;
+    }
+    auto const column = static_cast<cudf::size_type>(entry.idx);
+    layout.output_columns.push_back(column);
+    if (std::ranges::find(elided, ordinal) == elided.end()) {
+      layout.projected_columns.push_back(column);
+    }
+  }
+  // All-elided scans still need the existing row-count carrier for substitution.
+  if (layout.projected_columns.empty()) { layout.projected_columns = layout.output_columns; }
+  layout.residual = remaining_residual(input);
+  return layout;
+}
+
+namespace {
+struct parquet_selection_state {
+  filtered_table input;
+  std::unique_ptr<sirius::ast::node> residual;
+  std::unique_ptr<sirius::expression_evaluator> evaluator;
+  owning_table_view assembled;
+};
+}  // namespace
+
 std::unique_ptr<cudf::table> parquet_scan_core::post_filter_and_project(
-  filtered_table&& input,
+  filtered_table&& source,
   ::cucascade::memory::memory_space const& mem_space,
   ::cuda::stream_ref stream,
   bool like_swar_fastpath,
@@ -2151,6 +2223,10 @@ std::unique_ptr<cudf::table> parquet_scan_core::post_filter_and_project(
   expression_query_policy policy)
 {
   rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
+  auto state          = std::make_unique<parquet_selection_state>();
+  auto const unjoined = detail::prepare_unjoined_failure();
+  state->input        = std::move(source);
+  auto& input         = state->input;
 
   // The legacy filter state is translated once at this boundary. Its residual
   // owns the conjunct-level answer binding; the finish program tracks completion
@@ -2189,16 +2265,17 @@ std::unique_ptr<cudf::table> parquet_scan_core::post_filter_and_project(
       // them, the conjunct becomes a reference to the BOOL8 rather than a
       // re-comparison. The residual owns the per-conjunct forms and must outlive
       // `exec`, which only borrows the AST.
-      auto sirius_filter_ast =
-        _residual.against(input.predicate_columns, input.predicates_enforced);
-      if (sirius_filter_ast) {
-        sirius::expression_evaluator exec(sirius_filter_ast.get(),
-                                          mr_ref,
-                                          stream,
-                                          policy,
-                                          sirius::expression_evaluator::default_min_ast_size,
-                                          like_swar_fastpath,
-                                          std::move(like_cache));
+      state->residual = remaining_residual(input);
+      if (state->residual) {
+        state->evaluator = std::make_unique<sirius::expression_evaluator>(
+          state->residual.get(),
+          mr_ref,
+          stream,
+          policy,
+          sirius::expression_evaluator::default_min_ast_size,
+          like_swar_fastpath,
+          std::move(like_cache));
+        auto& exec = *state->evaluator;
         std::unique_ptr<cudf::table> filtered;
         auto const data_positions = output_data_positions(*_plan);
         bool const project_output = !data_positions.empty() && can_project_during_filter();
@@ -2218,7 +2295,9 @@ std::unique_ptr<cudf::table> parquet_scan_core::post_filter_and_project(
           filtered = project_output ? exec.select(input.table.view(), data_positions)
                                     : exec.select(input.table.view());
         }
+        detail::check_read_checkpoint(detail::read_checkpoint::PAYLOAD_GATHER);
         // The select only enqueued its reads; record before the reassignment drops the read lock.
+        detail::check_read_checkpoint(detail::read_checkpoint::READER_EVENT);
         input.table.record_reader_event(stream);
         input = filtered_table{owning_table_view{std::move(filtered)}, filter_state::ROW_FILTERED};
         SIRIUS_LOG_DEBUG(
@@ -2241,24 +2320,32 @@ std::unique_ptr<cudf::table> parquet_scan_core::post_filter_and_project(
   steps.projection = [&](materialized_batch& batch) {
     input.table = std::move(batch.table);
 
-    // Project / reorder the materialized M-order batch to the plan's output layout.
-    // Unique outputs use a non-owning selection; duplicate outputs need copies.
-    // No partitions reach this path, so partition_values is unused. The release
-    // below moves the surviving column buffers out.
-    auto assembled =
-      assemble_scan_output(*_plan, std::move(input.table), /*partition_values=*/{}, stream);
+    // Elide outputs before copying repeated columns, preserving main's projection behavior.
+    // Partition values are per split and have already been assembled during materialization.
+    if (_plan->has_partitions()) {
+      throw sirius::internal_exception(
+        "[parquet_scan_core::post_filter_and_project] a partitioned scan reached the "
+        "post-decode projection");
+    }
+    state->assembled =
+      _plan->output_layout.empty()
+        ? std::move(input.table)
+        : select_scan_columns(
+            std::move(input.table), unelided_output_positions(*_plan, elided), stream, mr_ref);
     SIRIUS_LOG_DEBUG(
       "[parquet_scan_core::post_filter_and_project] Assembled scan output to plan layout.");
-    if (auto const kept =
-          kept_positions(static_cast<std::size_t>(assembled.view().num_columns()), elided);
-        !kept.empty()) {
-      assembled.select_columns(kept);
-    }
-    batch.table = std::move(assembled);
+    batch.table = std::move(state->assembled);
     batch.rows  = batch.table.num_rows();
   };
-  auto finished = finish_materialization(std::move(batch), program, steps);
-  return finished.table.release(stream, mr_ref);
+  try {
+    auto finished    = finish_materialization(std::move(batch), program, steps);
+    state->assembled = std::move(finished.table);
+  } catch (...) {
+    detail::retire_reads(state, stream, unjoined);
+    throw;
+  }
+  // A copying release retires its own reads when it fails.
+  return state->assembled.release(stream, mr_ref);
 }
 
 bool parquet_scan_core::output_assembly_is_leading_identity() const noexcept
