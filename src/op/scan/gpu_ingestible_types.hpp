@@ -130,6 +130,8 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
     /// per-split state at the moment the attempt completes.
     std::size_t declined_memory_pressure{0};
     bool ok{true};  ///< every datasource that started IO completed it
+    /// Every requested extent was covered by successful prefetch or resident data.
+    bool covered{true};
   };
 
   /// How preparing this split's prefetch requests turned out, across its
@@ -224,7 +226,8 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
     auto pending =
       std::make_shared<prefetch_completion>(_datasources.size() + 1, std::move(on_done));
     for (auto const& ds : _datasources) {
-      switch (ds->prefetch_async([pending](bool ok) noexcept { pending->arrive(ok); })) {
+      switch (ds->prefetch_async(
+        [pending](io::cache::prefetch_result result) noexcept { pending->arrive(result); })) {
         case sirius::io::prefetch_refusal::issued:
           pending->issued.fetch_add(1, std::memory_order_relaxed);
           continue;
@@ -307,9 +310,10 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
     {
     }
 
-    void arrive(bool success) noexcept
+    void arrive(io::cache::prefetch_result result) noexcept
     {
-      if (!success) { ok.store(false, std::memory_order_relaxed); }
+      if (!result.ok) { ok.store(false, std::memory_order_relaxed); }
+      if (!result.covered) { covered.store(false, std::memory_order_relaxed); }
       settle();
     }
 
@@ -321,6 +325,7 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
     std::atomic<std::size_t> declined{0};
     std::atomic<std::size_t> declined_memory_pressure{0};
     std::atomic<bool> ok{true};
+    std::atomic<bool> covered{true};
     sirius::exec::invocable<void(prefetch_outcome) noexcept> on_done;
 
    private:
@@ -331,7 +336,8 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
         .issued                   = issued.load(std::memory_order_relaxed),
         .declined                 = declined.load(std::memory_order_relaxed),
         .declined_memory_pressure = declined_memory_pressure.load(std::memory_order_relaxed),
-        .ok                       = ok.load(std::memory_order_relaxed)});
+        .ok                       = ok.load(std::memory_order_relaxed),
+        .covered                  = covered.load(std::memory_order_relaxed)});
     }
   };
 

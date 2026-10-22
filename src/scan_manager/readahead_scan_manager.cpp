@@ -352,7 +352,7 @@ void readahead_scan_manager::on_prefetch_complete(split_key const& split,
   auto const task = split.lock();
   // Only complete, successful coverage eliminates future demand IO. Merely
   // issuing one datasource says nothing about the rest of this split.
-  settle_prefetch(split, ticket, out.ok && out.declined == 0);
+  settle_prefetch(split, ticket, out.ok && out.covered && out.declined == 0);
   _counters.record(
     classify_prefetch(out.declined_memory_pressure > 0,
                       task != nullptr,

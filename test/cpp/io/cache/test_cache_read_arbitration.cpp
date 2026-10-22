@@ -262,6 +262,17 @@ void complete_failure(sirius::io::grouped_io_request& request)
   }
 }
 
+// Pending test IO must settle even when an assertion unwinds the fixture.
+struct held_request {
+  std::unique_ptr<sirius::io::grouped_io_request> request;
+  ~held_request()
+  {
+    if (request) complete_failure(*request);
+  }
+  explicit operator bool() const { return bool(request); }
+  sirius::io::grouped_io_request& operator*() const { return *request; }
+};
+
 bool await_condition(auto predicate)
 {
   auto deadline = std::chrono::steady_clock::now() + 2s;
@@ -397,6 +408,127 @@ TEST_CASE("demand joining prefetch issue spends one ticket and completion frees 
   CHECK(await_condition([&] { return budget->active(backend) == 0; }));
 }
 
+TEST_CASE("prefetch completing a subset retains the ticket for a demand-owned chunk",
+          "[cache][readahead][scan-tickets][prefetch-coverage]")
+{
+  cache_fixture fixture;
+  auto budget      = std::make_shared<sirius::scan_manager::shared_scan_budget>();
+  auto backend     = reinterpret_cast<std::uintptr_t>(fixture.context.get());
+  bool device_read = false;
+  SECTION("host demand") {}
+  SECTION("device demand") { device_read = true; }
+
+  std::array<std::uint8_t, read_size> destination{};
+  rmm::cuda_stream stream;
+  rmm::device_buffer device_destination(device_read ? read_size : 0, stream.view());
+  std::future<std::size_t> read;
+  std::atomic<bool> first{true};
+  readahead_query query(budget, 1);
+  readahead_query peer(budget, 2);
+  std::shared_ptr<sirius::io::sirius_datasource> ds =
+    fixture.context->open_datasource("controlled://split-coverage");
+  std::vector<cudf::io::text::byte_range_info> ranges{{0, read_size}, {chunk_size, read_size}};
+  ds->fadvise(ranges, 0);
+  auto split = std::make_shared<readahead_query::scan_info>(
+    std::vector<readahead_query::scan_info::fadvise_entry>{{ds, ranges}});
+  query.manager->register_scan_task(split, 1);
+
+  // Run demand at the claim boundary, after producer loading is visible but
+  // before any chunk is loading. Its wait check passes and it claims only A.
+  // Backend requests stay pending until this test explicitly completes them.
+  fixture.context->cache()->set_before_prefetch_claim_for_testing([&] {
+    if (!first.exchange(false)) return;
+    query.update(split, readahead_query::stage::reading);
+    read = device_read
+             ? ds->device_read_async(
+                 0, read_size, static_cast<std::uint8_t*>(device_destination.data()), stream.view())
+             : ds->host_read_async(0, read_size, destination.data());
+  });
+  query.manager->start();
+  held_request demand_io{fixture.context->reactor().take_next()};
+  held_request prefetch_io{fixture.context->reactor().take_next()};
+  REQUIRE(demand_io);
+  REQUIRE(prefetch_io);
+  CHECK(budget->active(backend) == 1);
+  CHECK(query.manager->counters().cold_read_tickets == 0);
+  CHECK(query.manager->counters().borrowed == 0);
+
+  // Prefetch skipped A and issued only B. Completing B must not free A's slot.
+  complete_success(*prefetch_io);
+  CHECK(await_condition([&] {
+    return query.manager->counters().outcome(readahead_query::outcome::wait_for_prefetch) == 1;
+  }));
+  CHECK(read.wait_for(0ms) == std::future_status::timeout);
+  CHECK(budget->active(backend) == 1);
+  auto peer_split = peer.add_split(*fixture.context, "controlled://coverage-peer");
+  peer.manager->start();
+  CHECK(await_condition([&] { return budget->pending() == 1; }));
+  CHECK(fixture.context->reactor().pending() == 0);
+
+  complete_success(*demand_io);
+  REQUIRE(read.wait_for(2s) == std::future_status::ready);
+  CHECK(read.get() == read_size);
+  CHECK(budget->active(backend) == 1);
+  query.update(split, readahead_query::stage::disposed);
+  query.update(split, readahead_query::stage::disposed);
+  held_request peer_io{fixture.context->reactor().take_next()};
+  REQUIRE(peer_io);
+  CHECK(budget->active(backend) == 1);
+  complete_success(*peer_io);
+  CHECK(await_condition([&] { return budget->active(backend) == 0; }));
+  query.manager->stop();
+  peer.manager->stop();
+  fixture.context->cache()->set_before_prefetch_claim_for_testing({});
+}
+
+TEST_CASE("prefetch coverage distinguishes resident extents from successful submitted IO",
+          "[cache][read-arbitration][prefetch-coverage]")
+{
+  cache_fixture fixture;
+  fixture.advise(0);
+  REQUIRE(fixture.datasource->prefetch_async([](sirius::io::cache::prefetch_result) noexcept {}) ==
+          sirius::io::prefetch_refusal::issued);
+  held_request warm{fixture.context->reactor().take_next()};
+  REQUIRE(warm);
+  complete_success(*warm);
+
+  bool include_b = true;
+  bool wider_a   = false;
+  bool fail_b    = false;
+  SECTION("resident A and successful B") {}
+  SECTION("resident A is narrower than requested") { wider_a = true; }
+  SECTION("all requested bytes already resident") { include_b = false; }
+  SECTION("resident A and failed B") { fail_b = true; }
+  auto ds = fixture.context->open_datasource("controlled://cache-read-arbitration");
+  std::vector<cudf::io::text::byte_range_info> ranges{{0, wider_a ? 2 * read_size : read_size}};
+  if (include_b) ranges.emplace_back(chunk_size, read_size);
+  ds->fadvise(ranges, 0);
+  REQUIRE(ds->prepare_prefetch(false) == sirius::io::prepare_result::prepared);
+  std::promise<sirius::io::cache::prefetch_result> done;
+  auto result = done.get_future();
+  std::atomic<int> calls{0};
+  auto const issued = ds->prefetch_async([&](sirius::io::cache::prefetch_result out) noexcept {
+    if (calls.fetch_add(1) == 0) done.set_value(out);
+  });
+  if (include_b) {
+    CHECK(issued == sirius::io::prefetch_refusal::issued);
+    held_request io{fixture.context->reactor().take_next()};
+    REQUIRE(io);
+    if (fail_b)
+      complete_failure(*io);
+    else
+      complete_success(*io);
+  } else {
+    CHECK(issued != sirius::io::prefetch_refusal::issued);
+    CHECK(fixture.context->reactor().pending() == 0);
+  }
+  REQUIRE(result.wait_for(2s) == std::future_status::ready);
+  auto const out = result.get();
+  CHECK(out.ok == !fail_b);
+  CHECK(out.covered == (!wider_a && !fail_b));
+  CHECK(calls == 1);
+}
+
 TEST_CASE("incomplete prefetch transfers its ticket to demand until disposal",
           "[cache][readahead][scan-tickets]")
 {
@@ -529,9 +661,11 @@ TEST_CASE("an overlapping cache read waits for prefetch and reuses its chunk",
   fixture.advise(0);
 
   std::atomic<bool> prefetched{false};
-  REQUIRE(fixture.datasource->prefetch_async([&prefetched](bool ok) noexcept {
-    prefetched.store(ok, std::memory_order_release);
-  }) == sirius::io::prefetch_refusal::issued);
+  REQUIRE(fixture.datasource->prefetch_async(
+            [&prefetched](sirius::io::cache::prefetch_result result) noexcept {
+              bool const ok = result.ok;
+              prefetched.store(ok, std::memory_order_release);
+            }) == sirius::io::prefetch_refusal::issued);
   auto prefetch = fixture.context->reactor().take_next();
   REQUIRE(prefetch != nullptr);
 
@@ -563,9 +697,11 @@ TEST_CASE("a cached device read retires its pin through the stream completion po
   fixture.advise(0);
 
   std::atomic<bool> prefetched{false};
-  REQUIRE(fixture.datasource->prefetch_async([&prefetched](bool ok) noexcept {
-    prefetched.store(ok, std::memory_order_release);
-  }) == sirius::io::prefetch_refusal::issued);
+  REQUIRE(fixture.datasource->prefetch_async(
+            [&prefetched](sirius::io::cache::prefetch_result result) noexcept {
+              bool const ok = result.ok;
+              prefetched.store(ok, std::memory_order_release);
+            }) == sirius::io::prefetch_refusal::issued);
   auto prefetch = fixture.context->reactor().take_next();
   REQUIRE(prefetch != nullptr);
   complete_success(*prefetch, 0x6c);
@@ -598,7 +734,7 @@ TEST_CASE("a cache read does not wait for unrelated chunks in the same handle",
   cache_fixture fixture;
   fixture.advise(0);
 
-  REQUIRE(fixture.datasource->prefetch_async([](bool) noexcept {}) ==
+  REQUIRE(fixture.datasource->prefetch_async([](sirius::io::cache::prefetch_result) noexcept {}) ==
           sirius::io::prefetch_refusal::issued);
   auto prefetch = fixture.context->reactor().take_next();
   REQUIRE(prefetch != nullptr);
@@ -722,7 +858,7 @@ TEST_CASE("raw cache validates identities across opens", "[cache][object_identit
   };
   fixture.datasource = open(version);
   fixture.advise(0);
-  REQUIRE(fixture.datasource->prefetch_async([](bool) noexcept {}) ==
+  REQUIRE(fixture.datasource->prefetch_async([](sirius::io::cache::prefetch_result) noexcept {}) ==
           sirius::io::prefetch_refusal::issued);
   auto fill = fixture.context->reactor().take_next();
   REQUIRE(fill);
@@ -751,14 +887,14 @@ TEST_CASE("a late old raw-cache fill cannot overwrite the new version", "[cache]
   };
   fixture.datasource = open("v1");
   fixture.advise(0);
-  REQUIRE(fixture.datasource->prefetch_async([](bool) noexcept {}) ==
+  REQUIRE(fixture.datasource->prefetch_async([](sirius::io::cache::prefetch_result) noexcept {}) ==
           sirius::io::prefetch_refusal::issued);
   auto old_fill = fixture.context->reactor().take_next();
   REQUIRE(old_fill);
   auto old_source    = std::move(fixture.datasource);
   fixture.datasource = open("v2");
   fixture.advise(0);
-  REQUIRE(fixture.datasource->prefetch_async([](bool) noexcept {}) ==
+  REQUIRE(fixture.datasource->prefetch_async([](sirius::io::cache::prefetch_result) noexcept {}) ==
           sirius::io::prefetch_refusal::issued);
   auto new_fill = fixture.context->reactor().take_next();
   REQUIRE(new_fill);
@@ -789,8 +925,8 @@ TEST_CASE("superseded raw cache entries release their arenas and handles without
     versions.emplace_back(object);
     fixture.datasource = std::make_unique<sirius::io::sirius_datasource>(fixture.context, object);
     fixture.advise(0);
-    REQUIRE(fixture.datasource->prefetch_async([](bool) noexcept {}) ==
-            sirius::io::prefetch_refusal::issued);
+    REQUIRE(fixture.datasource->prefetch_async([](sirius::io::cache::prefetch_result) noexcept {
+    }) == sirius::io::prefetch_refusal::issued);
     auto fill = fixture.context->reactor().take_next();
     REQUIRE(fill);
     complete_success(*fill);
@@ -822,7 +958,7 @@ TEST_CASE("retired raw arena survives an abandoned in-flight fill until physical
   fixture.datasource = std::make_unique<sirius::io::sirius_datasource>(fixture.context, object);
   object.reset();
   fixture.advise(0);
-  REQUIRE(fixture.datasource->prefetch_async([](bool) noexcept {}) ==
+  REQUIRE(fixture.datasource->prefetch_async([](sirius::io::cache::prefetch_result) noexcept {}) ==
           sirius::io::prefetch_refusal::issued);
   auto fill = fixture.context->reactor().take_next();
   REQUIRE(fill);
@@ -851,7 +987,7 @@ TEST_CASE("retired raw arena survives a cache-hit CUDA copy without a prefetch h
   fixture.datasource = std::make_unique<sirius::io::sirius_datasource>(fixture.context, object);
   object.reset();
   fixture.advise(0);
-  REQUIRE(fixture.datasource->prefetch_async([](bool) noexcept {}) ==
+  REQUIRE(fixture.datasource->prefetch_async([](sirius::io::cache::prefetch_result) noexcept {}) ==
           sirius::io::prefetch_refusal::issued);
   auto fill = fixture.context->reactor().take_next();
   REQUIRE(fill);

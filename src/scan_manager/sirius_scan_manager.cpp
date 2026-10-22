@@ -3359,10 +3359,12 @@ std::size_t sirius_scan_manager::pin_parquet_ranges(
     // cannot be left waiting.
     std::latch settled{1};
     bool loaded = false;
-    std::ignore = datasource->prefetch_async([&settled, &loaded](bool ok) noexcept {
-      loaded = ok;
-      settled.count_down();
-    });
+    std::ignore = datasource->prefetch_async(
+      [&settled, &loaded](sirius::io::cache::prefetch_result result) noexcept {
+        bool const ok = result.ok;
+        loaded        = ok;
+        settled.count_down();
+      });
     settled.wait();
     if (!loaded) { throw std::runtime_error("[pin_table] prefetch failed while pinning " + path); }
 
