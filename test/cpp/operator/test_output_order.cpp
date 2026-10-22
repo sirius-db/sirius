@@ -25,6 +25,7 @@
 #include "op/sirius_physical_projection.hpp"
 #include "op/sirius_physical_result_collector.hpp"
 #include "op/sirius_physical_streaming_sink.hpp"
+#include "op/sirius_physical_streaming_source.hpp"
 #include "op/sirius_physical_union.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius/exception.hpp"
@@ -142,17 +143,17 @@ TEST_CASE("Physical order analysis distinguishes local sorting from global merge
   REQUIRE(projection.output_order() == OrderPreservationType::NO_ORDER);
 }
 
-TEST_CASE("Streaming sink order follows routing configuration", "[output_order]")
+TEST_CASE("Streaming boundaries discard sender-local ordering", "[output_order]")
 {
   using namespace sirius::op;
   auto first  = std::make_shared<cucascade::shared_data_repository>();
   auto second = std::make_shared<cucascade::shared_data_repository>();
   sirius_physical_streaming_sink single({}, 0, first);
-  REQUIRE(single.output_order_preservation() == OrderPreservationType::INSERTION_ORDER);
+  REQUIRE(single.output_order_preservation() == OrderPreservationType::NO_ORDER);
   partition_spec broadcast;
   broadcast.mode = partition_mode::broadcast;
   sirius_physical_streaming_sink replicated({}, 0, {first, second}, broadcast);
-  REQUIRE(replicated.output_order_preservation() == OrderPreservationType::INSERTION_ORDER);
+  REQUIRE(replicated.output_order_preservation() == OrderPreservationType::NO_ORDER);
   sirius_physical_streaming_sink hashed(
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
     0,
@@ -197,5 +198,46 @@ TEST_CASE("LIMIT expansion optimizes only proven unordered input",
       CHECK(plan->children[0]->type == SiriusPhysicalOperatorType::PASSTHROUGH_SINK);
       CHECK(plan->input_barrier_for(*plan->children[0]) == sirius::op::MemoryBarrierType::FULL);
     }
+  }
+}
+
+TEST_CASE("LIMIT over a streaming source uses unordered execution",
+          "[output_order][unordered_limit_cpu]")
+{
+  using namespace sirius::op;
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection connection(db);
+  sirius::planner::sirius_physical_plan_generator generator(*connection.context);
+  duckdb::unique_ptr<sirius_physical_operator> plan =
+    duckdb::make_uniq<sirius_physical_streaming_limit>(duckdb::vector<sirius::logical_type>{},
+                                                       duckdb::BoundLimitNode::ConstantValue(7),
+                                                       duckdb::BoundLimitNode::ConstantValue(2),
+                                                       100,
+                                                       true);
+  auto source = duckdb::make_uniq<sirius_physical_streaming_source>(
+    duckdb::vector<sirius::logical_type>{},
+    100,
+    std::make_shared<cucascade::shared_data_repository>(),
+    std::set<sirius::exec::sender_id_t>{0, 1});
+  REQUIRE(source->output_order() == OrderPreservationType::NO_ORDER);
+  plan->children.push_back(std::move(source));
+  generator.insert_gpu_pipeline_operators(plan);
+  REQUIRE(plan->type == SiriusPhysicalOperatorType::UNORDERED_STREAMING_LIMIT);
+  REQUIRE_FALSE(plan->is_source());
+  REQUIRE(plan->children.size() == 1);
+  REQUIRE(plan->children[0]->type == SiriusPhysicalOperatorType::STREAMING_SOURCE);
+}
+
+TEST_CASE("Streaming boundary execution discards an incoming position", "[output_order]")
+{
+  using namespace sirius::op;
+  auto repo = std::make_shared<cucascade::shared_data_repository>();
+  sirius_physical_streaming_source source({}, 0, repo, {0, 1});
+  sirius_physical_streaming_sink sink({}, 0, repo);
+  pipelineable_operator_data input(std::vector<std::shared_ptr<cucascade::data_batch>>{}, 5);
+  for (sirius_physical_operator* boundary :
+       std::vector<sirius_physical_operator*>{&source, &sink}) {
+    auto output = boundary->execute(input, ::cuda::stream_ref{cudaStream_t{nullptr}});
+    REQUIRE_FALSE(dynamic_cast<pipelineable_operator_data&>(*output).get_position());
   }
 }

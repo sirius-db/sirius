@@ -122,22 +122,17 @@ std::unique_ptr<operator_data> sirius_physical_streaming_sink::execute(
 {
   // Match RESULT_COLLECTOR: return batches for sink().
   return std::make_unique<pipelineable_operator_data>(
-    dynamic_cast<const pipelineable_operator_data&>(input_data).get_data_batches(),
-    dynamic_cast<const pipelineable_operator_data&>(input_data).get_position());
+    dynamic_cast<const pipelineable_operator_data&>(input_data).get_data_batches());
 }
 
 void sirius_physical_streaming_sink::sink(const operator_data& input_data,
                                           ::cuda::stream_ref stream)
 {
   const auto& input = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  auto position     = input.get_position();
-  if (position && input.get_data_batches().size() != 1) {
-    throw sirius::internal_exception("Positioned streaming output requires one batch");
-  }
 
   if (_outputs.size() == 1) {
     for (const auto& batch : input.get_data_batches()) {
-      if (!_outputs[0]->push(batch, position)) { poison_refused_output(*_outputs[0], 0); }
+      if (!_outputs[0]->push(batch)) { poison_refused_output(*_outputs[0], 0); }
     }
     return;
   }
@@ -158,11 +153,9 @@ void sirius_physical_streaming_sink::sink(const operator_data& input_data,
           clone_batch_id,
           stream,
           telemetry::quent_data_batch_probe::create(batch_telemetry(), clone_batch_id));
-        if (!_outputs[i]->push(std::move(copy), position)) {
-          poison_refused_output(*_outputs[i], i);
-        }
+        if (!_outputs[i]->push(std::move(copy))) { poison_refused_output(*_outputs[i], i); }
       }
-      if (!_outputs[0]->push(batches[b], position)) { poison_refused_output(*_outputs[0], 0); }
+      if (!_outputs[0]->push(batches[b])) { poison_refused_output(*_outputs[0], 0); }
     }
     return;
   }
