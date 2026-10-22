@@ -89,10 +89,22 @@ void sirius_physical_exchange_sink::set_range_boundaries(
 }
 
 std::unique_ptr<operator_data> sirius_physical_exchange_sink::execute(
-  const operator_data& input_data, ::cuda::stream_ref /*stream*/)
+  const operator_data& input_data, ::cuda::stream_ref stream)
 {
-  return std::make_unique<pipelineable_operator_data>(
-    dynamic_cast<const pipelineable_operator_data&>(input_data).get_data_batches());
+  auto const& input   = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  auto const& handles = input.get_data_batches();
+  auto const batches  = input.get_read_only_batches();
+  std::vector<std::shared_ptr<cucascade::data_batch>> slices;
+  std::vector<std::size_t> ranks;
+  for (std::size_t b = 0; b < handles.size(); ++b) {
+    auto routed = route(batches[b], handles[b], stream);
+    for (exchange::rank_t r = 0; r < routed.size(); ++r) {
+      if (!routed[r] || get_cudf_table_view(*routed[r]).num_rows() == 0) { continue; }
+      slices.push_back(std::move(routed[r]));
+      ranks.push_back(r);
+    }
+  }
+  return std::make_unique<routed_operator_data>(std::move(slices), std::move(ranks));
 }
 
 std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_exchange_sink::route(
@@ -171,17 +183,13 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_exchange_sin
   return slices;
 }
 
-void sirius_physical_exchange_sink::sink(const operator_data& input_data, ::cuda::stream_ref stream)
+void sirius_physical_exchange_sink::sink(const operator_data& input_data,
+                                         ::cuda::stream_ref /*stream*/)
 {
-  auto const& input   = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  auto const& handles = input.get_data_batches();
-  auto const batches  = input.get_read_only_batches();
-  for (std::size_t b = 0; b < handles.size(); ++b) {
-    auto slices = route(batches[b], handles[b], stream);
-    for (exchange::rank_t r = 0; r < slices.size(); ++r) {
-      if (!slices[r] || get_cudf_table_view(*slices[r]).num_rows() == 0) { continue; }
-      _service->send(_stream, r, std::move(slices[r]));
-    }
+  auto const& routed  = dynamic_cast<const routed_operator_data&>(input_data);
+  auto const& batches = routed.get_data_batches();
+  for (std::size_t i = 0; i < batches.size(); ++i) {
+    _service->send(_stream, static_cast<exchange::rank_t>(routed.destinations()[i]), batches[i]);
   }
 }
 

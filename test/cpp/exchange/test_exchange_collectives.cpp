@@ -243,8 +243,9 @@ TEST_CASE("a range exchange on gathered boundaries leaves every rank a sorted ra
          sink.set_range_boundaries(std::move(b));
        }});
     pipelineable_operator_data data{inputs[r]};
-    auto out = sample->execute(data, utils::default_stream());
-    sink.sink(*out, utils::default_stream());
+    auto out    = sample->execute(data, utils::default_stream());
+    auto routed = sink.execute(*out, utils::default_stream());
+    sink.sink(*routed, utils::default_stream());
     sink.finalize_operator();
   });
 

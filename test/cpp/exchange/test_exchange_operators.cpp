@@ -116,7 +116,8 @@ std::vector<std::int64_t> keys_of(cucascade::data_batch& batch)
 void sink_batch(sirius_physical_exchange_sink& sink, std::shared_ptr<cucascade::data_batch> batch)
 {
   pipelineable_operator_data data{std::vector<std::shared_ptr<cucascade::data_batch>>{batch}};
-  sink.sink(data, utils::default_stream());
+  auto const routed = sink.execute(data, utils::default_stream());
+  sink.sink(*routed, utils::default_stream());
 }
 
 /// Drains @p source until its stream ends; @return each task's keys, in task order.
