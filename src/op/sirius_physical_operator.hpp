@@ -384,6 +384,30 @@ class pipelineable_operator_data : public operator_data {
   std::optional<std::vector<::cucascade::read_only_data_batch>> _read_only_data_batches;
 };
 
+/// Output of a row router. Each batch has its own destination; omitted empty slices retain IDs.
+class routed_operator_data : public pipelineable_operator_data {
+ public:
+  routed_operator_data(std::vector<std::shared_ptr<cucascade::data_batch>> batches,
+                       std::vector<std::size_t> destinations)
+    : pipelineable_operator_data(std::move(batches)), _destinations(std::move(destinations))
+  {
+    if (get_data_batches().size() != _destinations.size()) {
+      throw std::invalid_argument("routed_operator_data: destination/batch count mismatch");
+    }
+  }
+  [[nodiscard]] std::vector<std::size_t> const& destinations() const { return _destinations; }
+  [[nodiscard]] std::unique_ptr<pipelineable_operator_data> with_batches_preserving_rows(
+    std::vector<std::shared_ptr<cucascade::data_batch>> batches) const override
+  {
+    auto replacement = std::make_unique<routed_operator_data>(std::move(batches), _destinations);
+    replacement->adopt_row_identity(*this);
+    return replacement;
+  }
+
+ private:
+  std::vector<std::size_t> _destinations;
+};
+
 /**
  * @brief Operator data with partition index for partitioned pipeline execution.
  *
@@ -804,8 +828,13 @@ class sirius_physical_operator {
   };
 
   /**
-   * @brief Pushes @p batch into port @p port_id after `on_input_batch_pushed` observes it.
+   * @brief Publishes @p batch to an explicit destination after observing its arrival.
    */
+  virtual void push_data_batch_partitioned(std::string_view port_id,
+                                           std::shared_ptr<cucascade::data_batch> batch,
+                                           std::size_t partition_idx);
+
+  /// Publish to destination zero after on_input_batch_pushed observes the batch.
   void push_data_batch(std::string_view port_id, std::shared_ptr<::cucascade::data_batch> batch);
   //! Add a port to the operator
   void add_port(std::string_view port_id, std::unique_ptr<port> p);

@@ -27,6 +27,7 @@
 #include "duckdb/storage/data_table.hpp"
 #include "expression/ast/node.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
+#include "op/partition/partition_sizing.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
@@ -136,12 +137,15 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
   //! Decide the partition count for the upstream PARTITION operator that feeds this merge
-  partition_strategy get_partition_strategy(const partition_sizing_input& in) override;
+  partition_strategy get_partition_strategy(const partition_sizing_input& in);
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          ::cuda::stream_ref stream) override;
 
  private:
+  /// Consumer-owned sizing target; batch-only receivers have no sizing configuration.
+  uint64_t _hash_partition_bytes = config::DEFAULT_HASH_PARTITION_BYTES;
+
   friend class sirius::planner::sirius_physical_plan_generator;
   void set_fuse_into_parent(bool fuse) noexcept { _fuse_into_parent = fuse; }
 

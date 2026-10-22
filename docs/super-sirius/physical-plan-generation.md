@@ -210,7 +210,7 @@ After `is_ready()`:
 - `sink` points to `operators.back()`
 - `get_operators()` returns this full list
 
-`finalize_pipeline_structure()` in `sirius_pipeline_converter` then populates each pipeline's `dependencies` from the wiring-derived parents, inserting a join's build-side CONCAT producer at slot 0 — `link_join_partition_siblings()` and `reorder_pipelines_topologically()` read the slots positionally.
+`finalize_pipeline_structure()` in `sirius_pipeline_converter` then populates each pipeline's `dependencies` from the wiring-derived parents, inserting a join's build-side CONCAT producer first for dependency traversal. Exchange inputs and their sizing roles are already bound by physical planning; conversion does not recover them from dependency positions.
 
 ## Part 3: Pipeline Shapes
 
@@ -220,9 +220,8 @@ The plan generator inserts every GPU pipeline operator into the plan tree (Part 
 2. `compute_repository_wiring()` — emit sink→consumer wiring descriptors via tree-parent lookup; the logical consumer's `input_port_for(producer)` and `input_barrier_for(producer)` hooks pick each edge's port and barrier semantics
 3. `setup_pipeline_parents()` — derive parent pipeline edges from the wiring descriptors
 4. `finalize_pipeline_structure()` — populate `dependencies`, build-side-first for joins (see [Pipeline Finalization](#pipeline-finalization))
-5. `link_join_partition_siblings()` — link PARTITION/JOIN/CONCAT sibling chains
-6. `configure_partition_consumers()` — hand the admitted GPU ids to every partition consumer, which derives its partition count, multi-GPU floor, and partition placement from them
-7. `reorder_pipelines_topologically()` — permute the schedule into a strict leaf-first topological order (every pipeline after its producers) and renumber pipeline IDs to match; join dependencies stay build-side-first so a join publishes its dynamic filters before the probe-side scans they prune are launched
+5. `configure_partition_consumers()` — hand the admitted GPU ids to every partition consumer, which derives its partition count, multi-GPU floor, and partition placement from them
+6. `reorder_pipelines_topologically()` — permute the schedule into a strict leaf-first topological order (every pipeline after its producers) and renumber pipeline IDs to match; join dependencies stay build-side-first so a join publishes its dynamic filters before the probe-side scans they prune are launched
 
 `sirius_engine::initialize_internal()` is a thin orchestrator calling `sirius_pipeline_converter(build_ctx, op_params).convert(*root_pipeline)` and materializing the wiring descriptors into runtime repositories and ports.
 
@@ -296,7 +295,7 @@ graph LR
 - Pipeline 1's sink is the last intermediate operator before HASH_JOIN (pipeline breaker); it connects to the Partition Pipeline with `FULL` barrier (default)
 - PARTITION → CONCAT uses `PARTIAL` barrier (downstream is CONCAT — line 1014)
 - Build-side CONCAT pushes to the HASH_JOIN's `"build"` port with `FULL` barrier (default)
-- The probe and build PARTITION operators are linked as siblings for partition count coordination
+- The plan binds probe/build inputs to one exchange decision; routers receive compatible layouts before either claims input
 
 For a dynamic-filter-producing `BUILD_PROBE` join, the build CONCAT switches to `concat_all` and its synchronous `"build"`-port push completes filter construction, multi-GPU replication, and channel publication before downstream task creation follows that join into its **immediate** probe producer. In a **broadcast** join there are `num_gpus` build CONCATs (one per replicated slot), each doing a `concat_all` push of the full build. `dynamic_filter_publication_session` elects and pins one delivery, invokes the hash join's repository deposit, then checks source usability/readiness and publishes inline before the push returns. An unusable delivery can release the claim only while input remains open. This edge ordering does not gate a base scan reached transitively through an intervening join; such a scan samples the channel opportunistically under normal scheduler order. See [Immediate-probe ordering](dynamic-filters.md#immediate-probe-ordering) and [Transitive scan targets and publication timing](dynamic-filters.md#transitive-scan-targets-and-publication-timing).
 
@@ -409,7 +408,7 @@ graph LR
 With no intermediate operators, no breaker is needed — RIGHT_DELIM_JOIN is the current pipeline's sink directly.
 
 - `partition_join` (PARTITION_build) is a single-op pipeline fed by the fan-out; its build CONCAT feeds the HASH_JOIN `"build"` port.
-- Probe and build partitions are linked as siblings; the inner join is identified via its tree parent (`link_join_partition_siblings`) so the build (distinct) side drives the partition count.
+- Delim wrapping explicitly binds the internal join's inputs so its build (distinct) side drives the partition count; conversion does not infer the role from tree ancestry.
 
 #### LEFT_DELIM_JOIN
 

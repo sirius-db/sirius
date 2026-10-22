@@ -197,6 +197,7 @@ set(TEST_SOURCES
     test/cpp/memory/test_topology_index.cpp
     test/cpp/operator/test_build_probe_scheduling.cpp
     test/cpp/operator/test_partition_placement.cpp
+    test/cpp/operator/test_partition_exchange.cpp
     test/cpp/operator/test_cross_schedule.cpp
     test/cpp/operator/test_cross_join_slicing.cpp
     test/cpp/operator/aggregate/test_decimal_sum_widening.cpp

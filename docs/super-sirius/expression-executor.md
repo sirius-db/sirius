@@ -55,7 +55,7 @@ hash table uses the descriptors marked as hash keys. Predicate routing retains t
 distinction between ordinary equality and `IS NOT DISTINCT FROM`.
 
 Both partitioning and hash joining use
-[`restore_prepared_join_key`](../../src/op/join_key_preparation.hpp) to restore
+[`restore_prepared_key`](../../src/op/key_preparation.hpp) to restore
 narrowed carriers to the prepared type before hashing. This shared representation
 is a correctness requirement: equal numeric values in different physical types can
 hash differently, sending matching rows to different partitions. Carrier restoration

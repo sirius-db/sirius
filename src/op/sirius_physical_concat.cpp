@@ -214,16 +214,8 @@ void sirius_physical_concat::sink(const operator_data& output_data, ::cuda::stre
   auto partition_idx = *partition_idx_opt;
   for (auto& batch : partitioned_output_data->get_data_batches()) {
     for (auto& next_port_info : next_port_after_sink) {
-      auto partition_consumer_op =
-        dynamic_cast<sirius_physical_partition_consumer_operator*>(next_port_info.next_operator);
-      if (partition_consumer_op) {
-        partition_consumer_op->push_data_batch_partitioned(
-          next_port_info.next_operator_port_name, batch, partition_idx);
-      } else {
-        throw std::runtime_error(
-          "sirius_physical_concat::sink(): Next operator is not a partition consumer operator: " +
-          SiriusPhysicalOperatorToString(next_port_info.next_operator->type));
-      }
+      next_port_info.next_operator->push_data_batch_partitioned(
+        next_port_info.next_operator_port_name, batch, partition_idx);
     }
   }
 }
