@@ -18,6 +18,7 @@
 
 #include "config.hpp"
 #include "cucascade/memory/memory_reservation_manager.hpp"
+#include "cuda/device_health.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/multi_file/multi_file_states.hpp"
@@ -537,9 +538,12 @@ void SiriusContext::throw_runtime_unavailable() const
   // IS-A ExecutorException: deliberately non-invalidating (INTERNAL/FATAL
   // would invalidate the whole DatabaseInstance and defeat "CPU queries
   // continue"). Typed so entry points can classify it without text matching.
-  throw SiriusRuntimeUnavailableException(
-    "Sirius GPU runtime is unavailable after a mandatory cleanup failure; "
-    "CPU execution continues. Restart the process to restore GPU execution.");
+  std::string message =
+    "Sirius GPU runtime is unavailable after a mandatory cleanup failure or fatal device error; "
+    "CPU execution continues. Restart the process to restore GPU execution.";
+  auto cause = query_lifecycle_.runtime_failure_message();
+  if (!cause.empty()) message += " First fatal CUDA failure: " + cause;
+  throw SiriusRuntimeUnavailableException(message);
 }
 
 void SiriusContext::begin_execution_window(ClientContext& context,
@@ -547,6 +551,7 @@ void SiriusContext::begin_execution_window(ClientContext& context,
                                            std::string_view window_label,
                                            std::string_view pool_tag)
 {
+  if (get_runtime_health() == runtime_health::UNAVAILABLE) throw_runtime_unavailable();
   // Runs inside the held slot, after acquire and the health check.
   // Logging around the mutations is best-effort: a logging failure must never
   // leave the runtime half-begun (the mutations themselves are the only
@@ -564,7 +569,14 @@ void SiriusContext::begin_execution_window(ClientContext& context,
   }
   // Open the enqueue gate before anything can schedule. Every producer consults it, so this must
   // precede repository/task_creator registration.
-  query_lifecycle_.open_query(query_id);
+  try {
+    query_lifecycle_.open_query(query_id);
+  } catch (sirius::exec::query_lifecycle_registry::runtime_unavailable_error const&) {
+    // Health can fail after the check above. Nothing was registered by this refusal;
+    // discard the options snapshot and preserve the normal CPU fallback path.
+    if (connection_state) connection_state->execution_options.reset();
+    throw_runtime_unavailable();
+  }
   // Register this query's repository manager up front
   data_repository_registry_.create_for_query(query_id);
   // Registers this query's task_creator state. No reset of a previous query here: each query
@@ -693,8 +705,8 @@ void SiriusContext::run_mandatory_cleanup_backstop(sirius::query_id_t query_id,
 
 void SiriusContext::drop_query_runtime_state_best_effort(sirius::query_id_t query_id) noexcept
 {
-  // Never continue destruction after an unproven retirement. Keep the complete query state
-  // registered for shutdown, where all shared workers have been stopped.
+  // Stop borrowers without retrying a partially failed release. Remaining query resources,
+  // including checkpoint keys, stay registered until shutdown stops all shared workers.
   try {
     retire_query_work(query_id, query_retirement_mode::cancelled);
   } catch (...) {
@@ -729,11 +741,6 @@ SiriusContext::StandaloneQueryScope::StandaloneQueryScope(SiriusContext& ctx,
                                                           std::string_view window_label)
   : ctx_(ctx), window_id_(sirius::make_query_id(0)), connection_id_(0), query_ordinal_(0)
 {
-  completion_ = std::make_shared<sirius::pipeline::completion_handler>(ctx.window_task_counter());
-  completion_->injections = sirius::transparent::latch_replay_injections(context);
-  if (completion_->injections) ctx.record_certification_budget(false, false, 10);
-  completion_->non_rollbackable_state =
-    completion_->injections && completion_->injections->non_rollbackable_state;
   Value inject;
   inject_cleanup_failure_ =
     context.TryGetCurrentSetting("sirius_test_inject_checkpoint_cleanup_failure", inject) &&
@@ -747,6 +754,15 @@ SiriusContext::StandaloneQueryScope::StandaloneQueryScope(SiriusContext& ctx,
   // (and the noexcept destructor cannot terminate) for an allocation reason.
   window_id_ =
     sirius::make_query_id(ctx_.next_window_id_.fetch_add(1, std::memory_order_relaxed) + 1);
+  completion_ = std::make_shared<sirius::pipeline::completion_handler>(
+    ctx.window_task_counter(),
+    [registry = &ctx_.query_lifecycle_, id = window_id_](std::exception_ptr error) {
+      registry->report_failure(error, id);
+    });
+  completion_->injections = sirius::transparent::latch_replay_injections(context);
+  if (completion_->injections) ctx.record_certification_budget(false, false, 10);
+  completion_->non_rollbackable_state =
+    completion_->injections && completion_->injections->non_rollbackable_state;
   std::snprintf(begin_tag_,
                 sizeof(begin_tag_),
                 "QueryBegin instance=%p connection=%llu window=%llu query=%llu",
@@ -783,15 +799,28 @@ SiriusContext::StandaloneQueryScope::StandaloneQueryScope(SiriusContext& ctx,
     }
     ctx_.begin_execution_window(context, window_id_, window_label, begin_tag_);
     lease_release_.state = lease_release_state::cleanup_failed;
-  } catch (std::exception& e) {
-    // Roll back this execution's registrations. Only a failed cleanup latches shared
-    // unavailability; an ordinary setup failure does not poison another connection.
+  } catch (SiriusRuntimeUnavailableException&) {
+    // Both the initial health check and a refused lifecycle registration precede
+    // query resource registration. Preserve the typed refusal for CPU fallback.
     state_ = scope_state::FAILED;
     {
       std::lock_guard lock(ctx_.window_completions_mutex_);
       ctx_.window_completions_.erase(sirius::value_of(window_id_));
     }
     lease_release_.state = lease_release_state::begin_failed;
+    log_window_event("end", "unavailable");
+    ctx_.release_query_lifecycle_slot();
+    throw;
+  } catch (std::exception& e) {
+    // Roll back this execution's registrations. Report fatal CUDA evidence before wrapping
+    // the error; ordinary setup failures do not poison another connection.
+    state_ = scope_state::FAILED;
+    {
+      std::lock_guard lock(ctx_.window_completions_mutex_);
+      ctx_.window_completions_.erase(sirius::value_of(window_id_));
+    }
+    lease_release_.state = lease_release_state::begin_failed;
+    ctx_.query_lifecycle_.report_failure(std::current_exception(), window_id_);
     ctx_.run_mandatory_cleanup_backstop(window_id_, end_tag_);
     log_window_event("end", "begin_failed");
     ctx_.release_query_lifecycle_slot();
@@ -804,6 +833,7 @@ SiriusContext::StandaloneQueryScope::StandaloneQueryScope(SiriusContext& ctx,
     }
     state_               = scope_state::FAILED;
     lease_release_.state = lease_release_state::begin_failed;
+    ctx_.query_lifecycle_.report_failure(std::current_exception(), window_id_);
     ctx_.run_mandatory_cleanup_backstop(window_id_, end_tag_);
     log_window_event("end", "begin_failed");
     ctx_.release_query_lifecycle_slot();
@@ -2114,7 +2144,7 @@ void SiriusContext::acquire_query_lifecycle_slot(ClientContext* context)
   }
   // Fast-fail before waiting: no point queuing on an unavailable runtime or
   // for an already-cancelled query.
-  if (runtime_unavailable_.load(std::memory_order_acquire)) { throw_runtime_unavailable(); }
+  if (get_runtime_health() == runtime_health::UNAVAILABLE) { throw_runtime_unavailable(); }
   if (context && context->IsInterrupted()) { throw InterruptException(); }
 
   query_lifecycle_mutex_.lock();
@@ -2124,7 +2154,7 @@ void SiriusContext::acquire_query_lifecycle_slot(ClientContext* context)
   // Re-check AFTER acquiring, BEFORE any shared mutation: the previous holder
   // may have latched unavailability, and this waiter may have been cancelled,
   // while it was blocked. A cancelled waiter must never late-enter the window.
-  if (runtime_unavailable_.load(std::memory_order_acquire)) {
+  if (get_runtime_health() == runtime_health::UNAVAILABLE) {
     release_query_lifecycle_slot();
     throw_runtime_unavailable();
   }
