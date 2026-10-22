@@ -787,8 +787,9 @@ SiriusContext::StandaloneQueryScope::StandaloneQueryScope(
   window_id_  = sirius::make_query_id(static_cast<std::uint32_t>(permit_.ticket()));
   completion_ = std::make_shared<sirius::pipeline::completion_handler>(
     ctx.window_task_counter(),
-    [registry = &ctx_.query_lifecycle_, id = window_id_](std::exception_ptr error) {
+    [registry = &ctx_.query_lifecycle_, id = window_id_, owner = &ctx_](std::exception_ptr error) {
       registry->report_failure(error, id);
+      owner->abort_distributed_query(error);
     });
   completion_->injections = sirius::transparent::latch_replay_injections(context);
   if (completion_->injections) ctx.record_certification_budget(false, false, 10);
@@ -909,6 +910,7 @@ SiriusContext::StandaloneQueryScope::~StandaloneQueryScope() noexcept
     release();
     state_ = scope_state::FAILED;
   }
+  ctx_.window_distributed_query_.store(0);
   std::lock_guard lock(ctx_.window_completions_mutex_);
   ctx_.window_completions_.erase(sirius::value_of(window_id_));
 }
@@ -1258,6 +1260,30 @@ void SiriusContext::terminate()
   topology_index_.reset();
 
   is_initialized_ = false;
+}
+
+void SiriusContext::abort_distributed_query(std::exception_ptr const& error) noexcept
+{
+  try {
+    auto const query = window_distributed_query_.load();
+    if (query == 0) { return; }
+    std::shared_ptr<sirius::exchange::exchange_service> service;
+    {
+      std::lock_guard lock{exchange_mutex_};
+      service = exchange_service_;
+    }
+    if (!service) { return; }
+    std::string what = "unknown error";
+    try {
+      std::rethrow_exception(error);
+    } catch (std::exception const& e) {
+      what = e.what();
+    } catch (...) {
+    }
+    SIRIUS_LOG_WARN("Distributed query {} failed; aborting it on every rank: {}", query, what);
+    service->abort(query, what);
+  } catch (...) {  // best effort: the peers' own timeouts remain
+  }
 }
 
 std::shared_ptr<sirius::exchange::exchange_service> SiriusContext::get_exchange_service(

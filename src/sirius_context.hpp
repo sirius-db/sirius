@@ -804,7 +804,17 @@ class SiriusContext : public ClientContextState {
 
   /// \brief Numbers this connection's distributed queries, from 1; every rank runs the same
   /// statements, so the same query gets the same number, and its exchanges the same stream ids.
-  [[nodiscard]] uint64_t next_distributed_query() noexcept { return ++distributed_queries_; }
+  /// The current execution window runs it: abort_distributed_query() names it to the peers.
+  [[nodiscard]] uint64_t next_distributed_query() noexcept
+  {
+    auto const query = ++distributed_queries_;
+    window_distributed_query_.store(query);
+    return query;
+  }
+
+  /// \brief The current window's query failed with @p error: if it is a distributed query, every
+  /// peer's run of it fails too, rather than waiting for this rank's batches.
+  void abort_distributed_query(std::exception_ptr const& error) noexcept;
 
   /// \brief Whether the Sirius context has been initialized (config loaded, GPU ready).
   [[nodiscard]] bool is_initialized() const noexcept { return is_initialized_; }
@@ -1026,6 +1036,9 @@ class SiriusContext : public ClientContextState {
   uint32_t exchange_rank_{0};
   std::shared_ptr<sirius::exchange::exchange_service> exchange_service_;
   uint64_t distributed_queries_{0};
+  /// The distributed query last planned, which the execution window runs (the plan may be built
+  /// before the window opens); 0 once the window ends.
+  std::atomic<uint64_t> window_distributed_query_{0};
 };
 
 /// Installs the sink selected by `Config::LOG_BACKEND` (with `Config::LOG_*`).

@@ -276,7 +276,10 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
   (`transport::options::max_queued_bytes`).
 - **Blocking collectives:** `SORT_SAMPLE` and Bloom merges block a GPU worker thread until every
   rank's contribution arrives.
-- **Failures:** fail-stop. A lost peer fails the query on every rank; nothing reconnects.
+- **Failures:** a query that fails on one rank (an error, an exhausted retry) is aborted on every
+  rank: the rank tells its peers (`exchange_service::abort`), and each fails that query's sources
+  and all-gathers at once instead of waiting; the next query runs normally. A lost peer or a
+  failed transport is fail-stop: every query fails, and nothing reconnects.
 - **Credits:** each peer gets a fixed share of the receive ring (8 frames of 8 MiB by default).
   Clusters much larger than 8 ranks would need credits granted on demand.
 

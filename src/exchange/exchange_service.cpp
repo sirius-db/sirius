@@ -55,6 +55,12 @@ exchange_service::exchange_service(fabric& fabric,
                             for (auto& [stream, r] : receivers) {
                               r->on_error(error);
                             }
+                          },
+                          [this](std::uint64_t query, rank_t from, std::string what) {
+                            end_query(
+                              query,
+                              std::make_exception_ptr(sirius::internal_exception(
+                                "exchange: query {} failed on rank {}: {}", query, from, what)));
                           }};
   _transport = std::make_unique<transport>(fabric, send, recv, gpu, host, std::move(cb), opts);
 }
@@ -62,9 +68,34 @@ exchange_service::exchange_service(fabric& fabric,
 std::shared_ptr<inbound> exchange_service::receiver_of(stream_id stream, held event)
 {
   std::lock_guard lock{_mutex};
+  if (_aborted.contains(query_of(stream))) { return nullptr; }
   if (auto it = _receivers.find(stream); it != _receivers.end()) { return it->second; }
   if (!_detached.contains(stream)) { _held[stream].push_back(std::move(event)); }
   return nullptr;
+}
+
+bool exchange_service::end_query(std::uint64_t query, std::exception_ptr error)
+{
+  std::vector<std::shared_ptr<inbound>> receivers;
+  {
+    std::lock_guard lock{_mutex};
+    if (!_aborted.emplace(query, error).second) { return false; }
+    for (auto const& [stream, r] : _receivers) {
+      if (query_of(stream) == query) { receivers.push_back(r); }
+    }
+    std::erase_if(_held, [query](auto const& h) { return query_of(h.first) == query; });
+  }
+  for (auto const& r : receivers) {
+    r->on_error(error);
+  }
+  return true;
+}
+
+void exchange_service::abort(std::uint64_t query, std::string const& what)
+{
+  auto error = std::make_exception_ptr(
+    sirius::internal_exception("exchange: query {} failed on rank {}: {}", query, rank(), what));
+  if (end_query(query, std::move(error))) { _transport->abort(query, what); }
 }
 
 void exchange_service::attach(stream_id stream, std::shared_ptr<inbound> receiver)
@@ -85,6 +116,9 @@ void exchange_service::attach(stream_id stream, std::shared_ptr<inbound> receive
     _held.erase(it);
   }
   if (_error) { receiver->on_error(_error); }
+  if (auto it = _aborted.find(query_of(stream)); it != _aborted.end()) {
+    receiver->on_error(it->second);
+  }
 }
 
 void exchange_service::detach(stream_id stream)
