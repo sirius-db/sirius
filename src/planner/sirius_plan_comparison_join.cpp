@@ -401,8 +401,11 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   std::size_t rhs_cardinality = op.children[1]->EstimateCardinality(context);
 
   auto sirius_context = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  // Distributed: a rank's build holds only its share of the keys after the join's exchange, so a
+  // filter pushed below the exchange would drop rows other ranks' builds match.
   bool const dynamic_filter_enabled =
-    sirius_context && duckdb::query_operator_options(context)->enable_dynamic_filter;
+    sirius_context && duckdb::query_operator_options(context)->enable_dynamic_filter &&
+    duckdb::query_operator_options(context)->exchange_peers.empty();
 
   bool const build_filtered = dynamic_filter_enabled && build_subtree_is_filtering(*op.children[1]);
   bool const build_opaque   = dynamic_filter_enabled && build_relation_is_opaque(*op.children[1]);

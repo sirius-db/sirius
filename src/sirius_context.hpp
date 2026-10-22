@@ -20,6 +20,7 @@
 #include "data/data_repository_manager_registry.hpp"
 #include "downgrade/downgrade_executor.hpp"
 #include "event/query_event_publisher.hpp"
+#include "exchange/exchange_service.hpp"
 #include "exec/query_admission.hpp"
 #include "exec/query_lifecycle_registry.hpp"
 #include "memory/resource_ref_utils.hpp"
@@ -794,6 +795,17 @@ class SiriusContext : public ClientContextState {
   /// \brief Get the current Sirius configuration (mutable, e.g. for SET command callbacks).
   [[nodiscard]] sirius::sirius_config& get_config() noexcept { return config_; }
 
+  /// \brief This process's exchange for distributed execution, connected to every peer of the
+  /// current settings on first use.
+  /// @throws sirius::invalid_input_exception when the settings change after it connected, or
+  ///         Sirius was built without NIXL.
+  [[nodiscard]] std::shared_ptr<sirius::exchange::exchange_service> get_exchange_service(
+    sirius::operator_params const& params);
+
+  /// \brief Numbers this connection's distributed queries, from 1; every rank runs the same
+  /// statements, so the same query gets the same number, and its exchanges the same stream ids.
+  [[nodiscard]] uint64_t next_distributed_query() noexcept { return ++distributed_queries_; }
+
   /// \brief Whether the Sirius context has been initialized (config loaded, GPU ready).
   [[nodiscard]] bool is_initialized() const noexcept { return is_initialized_; }
 
@@ -1007,6 +1019,13 @@ class SiriusContext : public ClientContextState {
   std::atomic<uint64_t> lease_held_at_replay_count_{0};
   std::array<std::atomic<uint64_t>, transparent_execution_stats::semantic_reason_count>
     semantic_decline_counts_{};
+
+  // Last, so it goes first: its transport uses the memory spaces above.
+  std::mutex exchange_mutex_;
+  std::vector<std::string> exchange_peers_;
+  uint32_t exchange_rank_{0};
+  std::shared_ptr<sirius::exchange::exchange_service> exchange_service_;
+  uint64_t distributed_queries_{0};
 };
 
 /// Installs the sink selected by `Config::LOG_BACKEND` (with `Config::LOG_*`).

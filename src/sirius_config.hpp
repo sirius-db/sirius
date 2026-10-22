@@ -31,6 +31,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace YAML {
 class Node;
@@ -199,6 +200,12 @@ struct operator_params {
   /// Aggregate aligned Bloom-array budget per GPU for accumulation; must be greater than zero.
   uint64_t max_dynamic_filter_bloom_bytes_per_gpu =
     sirius::op::default_max_dynamic_filter_bloom_bytes_per_gpu;
+  /// Distributed execution: "host:port" of every rank's exchange listener, indexed by rank.
+  /// Empty runs in one process. Every rank runs the same SQL over every file of each table and
+  /// scans its own share of the files; rank 0 returns the result.
+  std::vector<std::string> exchange_peers;
+  /// This process's rank among exchange_peers.
+  uint32_t exchange_rank = 0;
 
   /// Emit build-key min/max filters in addition to membership filters.
   bool enable_dynamic_zone_map_filter = false;

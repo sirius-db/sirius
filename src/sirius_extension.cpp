@@ -2607,6 +2607,24 @@ static void SetMaxSortPartitionMemoryFraction(ClientContext& context,
                    params->max_sort_partition_memory_fraction);
 }
 
+static void SetExchangePeers(ClientContext& context, SetScope scope, Value& parameter)
+{
+  std::vector<std::string> peers;
+  auto const list = StringValue::Get(parameter);
+  for (std::size_t at = 0; at < list.size();) {
+    auto const comma = std::min(list.find(',', at), list.size());
+    if (comma > at) { peers.push_back(list.substr(at, comma - at)); }
+    at = comma + 1;
+  }
+  get_operator_params(context, scope)->exchange_peers = std::move(peers);
+}
+
+static void SetExchangeRank(ClientContext& context, SetScope scope, Value& parameter)
+{
+  get_operator_params(context, scope)->exchange_rank =
+    static_cast<uint32_t>(UBigIntValue::Get(parameter));
+}
+
 static void SetHashPartitionBytes(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto const bytes = UBigIntValue::Get(parameter);
@@ -3390,6 +3408,18 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                             LogicalType::INTEGER,
                             Value::INTEGER(Config::LOG_FLUSH_SECONDS),
                             SetLogFlushSeconds);
+
+  config.AddExtensionOption("sirius_exchange_peers",
+                            "Distributed execution: host:port of every rank's exchange listener, "
+                            "comma-separated in rank order; empty runs in one process",
+                            LogicalType::VARCHAR,
+                            Value(""),
+                            SetExchangePeers);
+  config.AddExtensionOption("sirius_exchange_rank",
+                            "Distributed execution: this process's rank in sirius_exchange_peers",
+                            LogicalType::UBIGINT,
+                            Value::UBIGINT(0),
+                            SetExchangeRank);
 
   config.AddExtensionOption("hash_partition_bytes",
                             "Target size in bytes per hash partition",

@@ -29,6 +29,7 @@
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/planner.hpp"
+#include "exchange/exchange_runtime.hpp"
 #include "exec/stream_bind_catalog.hpp"
 #include "helper/transaction_utils.hpp"
 #include "log/duckdb_sink.hpp"
@@ -41,6 +42,7 @@
 #include "memory/topology_index.hpp"
 #include "op/scan/iceberg_metadata_reader.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "sirius/exception.hpp"
 #include "sirius_sql_rewrite.hpp"
 #include "transparent/connection_provenance.hpp"
 #include "transparent/physical_sirius_execution.hpp"
@@ -1256,6 +1258,31 @@ void SiriusContext::terminate()
   topology_index_.reset();
 
   is_initialized_ = false;
+}
+
+std::shared_ptr<sirius::exchange::exchange_service> SiriusContext::get_exchange_service(
+  sirius::operator_params const& params)
+{
+  std::lock_guard lock{exchange_mutex_};
+  if (exchange_service_) {
+    if (params.exchange_peers != exchange_peers_ || params.exchange_rank != exchange_rank_) {
+      throw sirius::invalid_input_exception(
+        "sirius_exchange_peers and sirius_exchange_rank cannot change once connected");
+    }
+    return exchange_service_;
+  }
+  if (params.exchange_rank >= params.exchange_peers.size()) {
+    throw sirius::invalid_input_exception(
+      "sirius_exchange_rank {} of {} peers", params.exchange_rank, params.exchange_peers.size());
+  }
+  auto& memory = get_memory_manager();
+  auto* gpu    = memory.get_memory_space(cucascade::memory::Tier::GPU, 0);
+  auto* host   = memory.get_memory_space(cucascade::memory::Tier::HOST, 0);
+  exchange_service_ =
+    sirius::exchange::make_nixl_exchange(params.exchange_rank, params.exchange_peers, *gpu, host);
+  exchange_peers_ = params.exchange_peers;
+  exchange_rank_  = params.exchange_rank;
+  return exchange_service_;
 }
 
 sirius::memory::sirius_memory_reservation_manager& SiriusContext::get_memory_manager()
