@@ -2,7 +2,8 @@
 
 include("${CMAKE_CURRENT_LIST_DIR}/sirius-targets.cmake" OPTIONAL)
 if("static" IN_LIST sirius_FIND_COMPONENTS OR NOT TARGET sirius::sirius)
-  if(NOT TARGET sirius::sirius_static AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/sirius-static-targets.cmake")
+  if(NOT TARGET sirius::sirius_static
+     AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/sirius-static-targets.cmake")
     include("${CMAKE_CURRENT_LIST_DIR}/sirius-static-dependencies.cmake")
     include("${CMAKE_CURRENT_LIST_DIR}/sirius-static-targetsCorrosion.cmake")
     include("${CMAKE_CURRENT_LIST_DIR}/sirius-static-targets.cmake")
@@ -10,5 +11,8 @@ if("static" IN_LIST sirius_FIND_COMPONENTS OR NOT TARGET sirius::sirius)
   if(TARGET sirius::sirius_static)
     set(sirius_static_FOUND TRUE)
   endif()
+endif()
+if("udf" IN_LIST sirius_FIND_COMPONENTS)
+  include("${CMAKE_CURRENT_LIST_DIR}/sirius-udf-config.cmake")
 endif()
 check_required_components(sirius)

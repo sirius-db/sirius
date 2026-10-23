@@ -14,7 +14,7 @@ that consumes this data can detect mismatched parser versions.
 
 import re
 
-SHAPE_VERSION = "1.7"
+SHAPE_VERSION = "1.8"
 
 # Timestamp at the start of every log line, e.g. "[2026-05-20 14:25:02.368]"
 TS_RE = re.compile(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)\]")
@@ -242,7 +242,8 @@ DOWNGRADE_SUMMARY_RE = re.compile(
     r"\[(?P<ts>[\d\-: .]+)\] \[debug\] \[downgrade_executor\.cpp:\d+\] "
     r"\[downgrade\] \[(?P<source_tier>GPU|HOST|DISK):(?P<source_device_id>-?\d+)\] "
     r"request (?P<monitor>monitor )?done: "
-    r"(?P<total_batches>\d+) batches, (?P<total_bytes>\d+) bytes in "
+    r"(?P<total_batches>\d+) batches, (?P<total_bytes>\d+) bytes "
+    r"(?:\(target (?P<target_bytes>\d+|none), planned (?P<planned_bytes>\d+)\) )?in "
     r"(?P<duration_ms>[\d.]+) ms \((?P<throughput_mbs>[\d.]+) MB/s\) \| "
     r"repos: (?P<repos_batches>\d+)/(?P<repos_bytes>\d+) batches/bytes, "
     r"pipeline_queue: (?P<pipeline_queue_batches>\d+)/(?P<pipeline_queue_bytes>\d+) \| "

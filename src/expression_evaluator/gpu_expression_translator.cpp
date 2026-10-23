@@ -352,7 +352,8 @@ sirius::type_id node_logical_type_id(sirius::ast::node const& expr)
         return alt.return_type().id();
       } else if constexpr (std::is_same_v<T, sirius::ast::cast>) {
         return alt.target_type.id();
-      } else if constexpr (std::is_same_v<T, sirius::ast::function_call>) {
+      } else if constexpr (std::is_same_v<T, sirius::ast::function_call> ||
+                           std::is_same_v<T, sirius::ast::gpu_function_call>) {
         return alt.return_type().id();
       } else {
         return sirius::type_id::INVALID;
@@ -369,18 +370,22 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
   return std::visit(
     [this, table_src](auto const& alt) -> std::optional<expr_ref> {
       using T = std::decay_t<decltype(alt)>;
-      if constexpr (std::is_same_v<T, sirius::ast::reference> ||
-                    std::is_same_v<T, sirius::ast::constant> ||
-                    std::is_same_v<T, sirius::ast::comparison> ||
-                    std::is_same_v<T, sirius::ast::conjunction> ||
-                    std::is_same_v<T, sirius::ast::between> ||
-                    std::is_same_v<T, sirius::ast::case_expr> ||
-                    std::is_same_v<T, sirius::ast::cast> ||
-                    std::is_same_v<T, sirius::ast::unary_op> ||
-                    std::is_same_v<T, sirius::ast::coalesce> ||
-                    std::is_same_v<T, sirius::ast::in_list> ||
-                    std::is_same_v<T, sirius::ast::function_call> ||
-                    std::is_same_v<T, sirius::ast::aggregate>) {
+      if constexpr (std::is_same_v<T, sirius::ast::gpu_function_call>) {
+        // Custom calls must be materialized by the evaluator. They cannot be
+        // pushed into standalone cuDF predicates or join ASTs.
+        return std::nullopt;
+      } else if constexpr (std::is_same_v<T, sirius::ast::reference> ||
+                           std::is_same_v<T, sirius::ast::constant> ||
+                           std::is_same_v<T, sirius::ast::comparison> ||
+                           std::is_same_v<T, sirius::ast::conjunction> ||
+                           std::is_same_v<T, sirius::ast::between> ||
+                           std::is_same_v<T, sirius::ast::case_expr> ||
+                           std::is_same_v<T, sirius::ast::cast> ||
+                           std::is_same_v<T, sirius::ast::unary_op> ||
+                           std::is_same_v<T, sirius::ast::coalesce> ||
+                           std::is_same_v<T, sirius::ast::in_list> ||
+                           std::is_same_v<T, sirius::ast::function_call> ||
+                           std::is_same_v<T, sirius::ast::aggregate>) {
         return this->add_expression(alt, table_src);
       } else {
         static_assert(sizeof(T) == 0,

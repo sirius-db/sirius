@@ -1,0 +1,4 @@
+interface:
+  display_name: "Sirius GPU UDF"
+  short_description: "Convert and validate scalar and aggregate UDF rewrites"
+  default_prompt: "Use $sirius-udf to rewrite my scalar or aggregate UDF for Sirius, generate original-reference tests and external artifacts, verify GPU execution, and benchmark it."

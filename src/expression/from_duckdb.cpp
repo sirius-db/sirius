@@ -39,6 +39,7 @@
 #include "expression/substring_slice.hpp"
 #include "expression/value.hpp"         // sirius::from_duckdb(Value const&, logical_type const&)
 #include "helper/type_conversions.hpp"  // sirius::from_duckdb(LogicalType const&)
+#include "udf/registration.hpp"
 
 // duckdb
 #include <duckdb/common/assert.hpp>
@@ -281,6 +282,16 @@ std::unique_ptr<node> translate_function(duckdb::BoundFunctionExpression const& 
   // Optional scan predicates are hints; the required predicate remains in the plan.
   if (duckdb::ExpressionFilter::IsRootOptionalExpression(expr)) {
     return translate_constant(duckdb::BoundConstantExpression(duckdb::Value::BOOLEAN(true)));
+  }
+  if (auto binding = sirius::udf::bind_gpu_scalar_function(expr); binding.registered) {
+    if (!binding.implementation) { return nullptr; }
+    auto arguments = translate_children(expr.GetChildren());
+    if (!arguments) { return nullptr; }
+    return std::make_unique<node>(gpu_function_call{
+      std::move(binding.implementation),
+      std::move(*arguments),
+      sirius::from_duckdb(expr.GetReturnType()),
+      expr.Function().GetNullHandling() == duckdb::FunctionNullHandling::DEFAULT_NULL_HANDLING});
   }
   if (duckdb::BoundComparisonExpression::IsComparison(expr)) { return translate_comparison(expr); }
   if (duckdb::BoundCastExpression::IsCast(expr)) { return translate_cast(expr); }

@@ -92,6 +92,11 @@ std::unique_ptr<node> rebuild(node const& src, Xform const& xform)
       } else if constexpr (std::is_same_v<T, function_call>) {
         return std::make_unique<node>(function_call{
           alt.function(), rebuild_children(alt.arguments(), xform), alt.return_type()});
+      } else if constexpr (std::is_same_v<T, gpu_function_call>) {
+        return std::make_unique<node>(gpu_function_call{alt.implementation(),
+                                                        rebuild_children(alt.arguments(), xform),
+                                                        alt.return_type(),
+                                                        alt.propagate_nulls()});
       } else if constexpr (std::is_same_v<T, aggregate>) {
         return std::make_unique<node>(aggregate{alt.function(),
                                                 rebuild_children(alt.arguments(), xform),

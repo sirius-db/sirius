@@ -263,6 +263,13 @@ tools/log_analyzer/
 
 ## Parser shape version
 
-`patterns.SHAPE_VERSION = "1.0"` — recorded in `_summary.json`. Bump when
+`patterns.SHAPE_VERSION = "1.8"` — recorded in `_summary.json`. Bump when
 any pattern changes so a downstream skill can refuse to query data parsed
 by an incompatible version.
+
+Shape 1.8 accepts downgrade summaries with optional `(target N|none, planned N)`
+fields. The corresponding `target_bytes` and `planned_bytes` are empty for older
+logs; an explicit `target none` is also empty. These describe requested and
+selected work. Use `total_bytes`, `to_host_bytes`, and `to_disk_bytes` for completed
+transfers: a completed monitor request with zero freed bytes indicates a pressure
+check, not actual spilling.

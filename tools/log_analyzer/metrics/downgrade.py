@@ -1,4 +1,4 @@
-"""Parse downgrade-summary log lines (one row per satisfied downgrade request).
+"""Parse downgrade-summary log lines (one row per completed downgrade request).
 
 Source line example:
   [2026-05-28 10:36:55.124] [debug] [downgrade_executor.cpp:348]
@@ -14,6 +14,10 @@ finishes. The "source" identifies WHERE the data was downgraded *from*:
   source_tier=DISK, source_device_id=N   → reserved but no current emitter
 
 The "to_host" / "to_disk" pair tells you where the data WENT.
+Current summaries also contain `(target N|none, planned N)` before the
+duration. These optional fields describe requested and selected work, not
+completed transfers. A completed request can free zero bytes and remain
+unsatisfied; do not equate a parsed row with actual data spilling.
 
 `is_monitor` distinguishes background-pressure requests (the downgrade
 executor's monitor_loop) from caller-initiated requests (a pipeline task
@@ -28,7 +32,7 @@ CSV columns: timestamp, source_tier, source_device_id, is_monitor,
              repos_batches, repos_bytes,
              pipeline_queue_batches, pipeline_queue_bytes,
              to_host_batches, to_host_bytes,
-             to_disk_batches, to_disk_bytes
+             to_disk_batches, to_disk_bytes, target_bytes, planned_bytes
 """
 
 from typing import List
@@ -54,6 +58,8 @@ COLUMNS = [
     "to_host_bytes",
     "to_disk_batches",
     "to_disk_bytes",
+    "target_bytes",
+    "planned_bytes",
 ]
 
 
@@ -91,6 +97,19 @@ def parse(lines: List[str], warnings: FormatWarnings) -> List[dict]:
                 "to_host_bytes": int(m.group("to_host_bytes")),
                 "to_disk_batches": int(m.group("to_disk_batches")),
                 "to_disk_bytes": int(m.group("to_disk_bytes")),
+                # Older logs omit target/planned; "none" explicitly means a
+                # predicate-driven request with no byte target. Neither field
+                # describes bytes actually transferred.
+                "target_bytes": (
+                    int(m.group("target_bytes"))
+                    if m.group("target_bytes") not in (None, "none")
+                    else None
+                ),
+                "planned_bytes": (
+                    int(m.group("planned_bytes"))
+                    if m.group("planned_bytes") is not None
+                    else None
+                ),
             }
         )
     return rows

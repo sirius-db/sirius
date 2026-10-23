@@ -87,7 +87,8 @@ void visit_references(node const& root, Fn&& fn)
         for (auto const& child : alt.values) {
           detail::visit_child(child, fn);
         }
-      } else if constexpr (std::is_same_v<T, function_call>) {
+      } else if constexpr (std::is_same_v<T, function_call> ||
+                           std::is_same_v<T, gpu_function_call>) {
         for (auto const& child : alt.arguments()) {
           detail::visit_child(child, fn);
         }
