@@ -19,7 +19,9 @@
 #include "codegen/util/cuda_check.hpp"
 
 #include <cudf/column/column_factories.hpp>
+#include <cudf/copying.hpp>
 #include <cudf/cudf_utils.hpp>
+#include <cudf/filling.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/utilities/bit.hpp>
@@ -2079,54 +2081,10 @@ bool can_compile_project_sink(std::span<sirius::ast::node const* const> expressi
   return true;
 }
 
-std::unique_ptr<cudf::table> evaluate_project_sink(
-  std::span<sirius::ast::node const* const> expressions,
-  cudf::table_view const& input,
-  ::cuda::stream_ref stream,
-  rmm::device_async_resource_ref mr,
-  std::size_t* narrow_domain_comparison_count,
-  boundary_column_map const* boundary_map)
+namespace {
+
+void emit_nvrtc_device_runtime_preamble(std::ostringstream& src)
 {
-  auto const num_rows = input.num_rows();
-  if (num_rows == 0) {
-    if (narrow_domain_comparison_count != nullptr) {
-      translation_context count_ctx(input, boundary_map);
-      for (auto const* expr : expressions) {
-        (void)count_ctx.produce(*expr);
-      }
-      *narrow_domain_comparison_count += count_ctx.narrow_domain_comparison_count();
-    }
-    std::vector<std::unique_ptr<cudf::column>> empty_cols;
-    empty_cols.reserve(expressions.size());
-    for (auto const* expr : expressions) {
-      auto const out_type = resolve_output_cudf_type(*expr, input);
-      empty_cols.push_back(make_unallocated_fixed_width_output_column(out_type, 0, stream, mr));
-    }
-    return std::make_unique<cudf::table>(std::move(empty_cols));
-  }
-
-  translation_context ctx(input, boundary_map);
-  std::vector<register_value> out_regs;
-  out_regs.reserve(expressions.size());
-  for (auto const* expr : expressions) {
-    out_regs.push_back(ctx.produce(*expr));
-  }
-  if (narrow_domain_comparison_count != nullptr) {
-    *narrow_domain_comparison_count += ctx.narrow_domain_comparison_count();
-  }
-
-  constexpr int block_threads = 256;
-  constexpr int num_warps     = block_threads / 32;
-  bool any_nullable_output    = false;
-  bool any_can_overflow       = false;
-  bool const any_subquery_err = ctx.has_subquery_error();
-  for (auto const& reg : out_regs) {
-    if (!reg.is_statically_non_null) { any_nullable_output = true; }
-    if (reg.can_overflow) { any_can_overflow = true; }
-  }
-
-  // Assemble the CUDA kernel source string.
-  std::ostringstream src;
   src
     << "#include \"codegen/stdint_shim.hpp\"\n"
     << "#include <cuda/numeric>\n"
@@ -2890,8 +2848,61 @@ std::unique_ptr<cudf::table> evaluate_project_sink(
     << "    if (r < 0) { q -= 1LL; }\n"
     << "    return reg_val<int64_t>{q * Divisor, true, false};\n"
     << "  }\n"
-    << "}\n\n"
-    << "extern \"C\" __global__ void sirius_nvrtc_project_kernel(\n";
+    << "}\n\n";
+}
+
+}  // namespace
+
+std::unique_ptr<cudf::table> evaluate_project_sink(
+  std::span<sirius::ast::node const* const> expressions,
+  cudf::table_view const& input,
+  ::cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr,
+  std::size_t* narrow_domain_comparison_count,
+  boundary_column_map const* boundary_map)
+{
+  auto const num_rows = input.num_rows();
+  if (num_rows == 0) {
+    if (narrow_domain_comparison_count != nullptr) {
+      translation_context count_ctx(input, boundary_map);
+      for (auto const* expr : expressions) {
+        (void)count_ctx.produce(*expr);
+      }
+      *narrow_domain_comparison_count += count_ctx.narrow_domain_comparison_count();
+    }
+    std::vector<std::unique_ptr<cudf::column>> empty_cols;
+    empty_cols.reserve(expressions.size());
+    for (auto const* expr : expressions) {
+      auto const out_type = resolve_output_cudf_type(*expr, input);
+      empty_cols.push_back(make_unallocated_fixed_width_output_column(out_type, 0, stream, mr));
+    }
+    return std::make_unique<cudf::table>(std::move(empty_cols));
+  }
+
+  translation_context ctx(input, boundary_map);
+  std::vector<register_value> out_regs;
+  out_regs.reserve(expressions.size());
+  for (auto const* expr : expressions) {
+    out_regs.push_back(ctx.produce(*expr));
+  }
+  if (narrow_domain_comparison_count != nullptr) {
+    *narrow_domain_comparison_count += ctx.narrow_domain_comparison_count();
+  }
+
+  constexpr int block_threads = 256;
+  constexpr int num_warps     = block_threads / 32;
+  bool any_nullable_output    = false;
+  bool any_can_overflow       = false;
+  bool const any_subquery_err = ctx.has_subquery_error();
+  for (auto const& reg : out_regs) {
+    if (!reg.is_statically_non_null) { any_nullable_output = true; }
+    if (reg.can_overflow) { any_can_overflow = true; }
+  }
+
+  // Assemble the CUDA kernel source string.
+  std::ostringstream src;
+  emit_nvrtc_device_runtime_preamble(src);
+  src << "extern \"C\" __global__ void sirius_nvrtc_project_kernel(\n";
 
   std::size_t num_bsm_cols = 0;
   for (auto const& in_col : ctx.input_columns()) {
@@ -3278,6 +3289,537 @@ std::unique_ptr<cudf::table> evaluate_project_sink(
   }
 
   return std::make_unique<cudf::table>(std::move(final_columns));
+}
+
+bool can_compile_filter_sink(sirius::ast::node const& predicate,
+                             cudf::table_view const& input,
+                             boundary_column_map const* boundary_map) noexcept
+{
+  if (!is_node_supported(predicate, input, boundary_map)) { return false; }
+  return effective_node_cudf_type(predicate, input, boundary_map).id() == cudf::type_id::BOOL8;
+}
+
+namespace {
+
+constexpr char const* kFilterCompactMultiBlockSource = R"(
+#include "codegen/stdint_shim.hpp"
+
+extern "C" __global__ void sirius_nvrtc_filter_compact_kernel(
+    uint32_t const* __restrict__ warp_ballots,
+    uint32_t const* __restrict__ block_counts,
+    int32_t num_rows,
+    int32_t* __restrict__ out_survivors)
+{
+  constexpr int32_t kBlockThreads = 256;
+  constexpr int32_t kWarpsPerBlock = 8;
+
+  int32_t const row = static_cast<int32_t>(blockIdx.x) * kBlockThreads + static_cast<int32_t>(threadIdx.x);
+  int32_t const lane = static_cast<int32_t>(threadIdx.x) & 31;
+  int32_t const warp_in_block = static_cast<int32_t>(threadIdx.x) >> 5;
+  int32_t const global_warp = (static_cast<int32_t>(blockIdx.x) * kBlockThreads + static_cast<int32_t>(threadIdx.x)) >> 5;
+  bool const active = (row < num_rows);
+
+  uint32_t const my_ballot = active ? warp_ballots[global_warp] : 0u;
+  bool const survives = active && (((my_ballot >> lane) & 1u) != 0u);
+  uint32_t const lane_rank = static_cast<uint32_t>(__popc(my_ballot & ((1u << lane) - 1u)));
+
+  __shared__ uint32_t s_warp_offsets[kWarpsPerBlock];
+  __shared__ uint32_t s_block_base;
+
+  if (lane == 0) {
+    s_warp_offsets[warp_in_block] = static_cast<uint32_t>(__popc(my_ballot));
+  }
+  __syncthreads();
+
+  // Compute exclusive prefix sum of prior blocks in parallel across all 256 threads in the block.
+  uint32_t partial_block_sum = 0u;
+  for (uint32_t b = threadIdx.x; b < blockIdx.x; b += kBlockThreads) {
+    partial_block_sum += block_counts[b];
+  }
+  #pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    partial_block_sum += __shfl_down_sync(0xFFFFFFFFu, partial_block_sum, offset);
+  }
+
+  __shared__ uint32_t s_prefix_partials[kWarpsPerBlock];
+  if (lane == 0) {
+    s_prefix_partials[warp_in_block] = partial_block_sum;
+  }
+  __syncthreads();
+
+  if (threadIdx.x == 0) {
+    uint32_t bbase = 0u;
+    #pragma unroll
+    for (int w = 0; w < kWarpsPerBlock; ++w) {
+      bbase += s_prefix_partials[w];
+    }
+    s_block_base = bbase;
+
+    uint32_t wacc = 0u;
+    #pragma unroll
+    for (int w = 0; w < kWarpsPerBlock; ++w) {
+      uint32_t const cnt = s_warp_offsets[w];
+      s_warp_offsets[w] = wacc;
+      wacc += cnt;
+    }
+  }
+  __syncthreads();
+
+  if (survives) {
+    uint32_t const dst_idx = s_block_base + s_warp_offsets[warp_in_block] + lane_rank;
+    out_survivors[dst_idx] = row;
+  }
+}
+)";
+
+[[nodiscard]] std::unique_ptr<cudf::table> make_empty_projected_table(
+  cudf::table_view const& projected_input,
+  ::cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr)
+{
+  if (projected_input.num_columns() == 0) {
+    return std::make_unique<cudf::table>(std::vector<std::unique_ptr<cudf::column>>{});
+  }
+  auto sliced = cudf::slice(projected_input, {0, 0}, stream);
+  return std::make_unique<cudf::table>(sliced.front(), stream, mr);
+}
+
+}  // namespace
+
+std::unique_ptr<cudf::table> evaluate_filter_sink(sirius::ast::node const& predicate,
+                                                  cudf::table_view const& input,
+                                                  cudf::table_view const& projected_input,
+                                                  ::cuda::stream_ref stream,
+                                                  rmm::device_async_resource_ref mr,
+                                                  std::unique_ptr<cudf::column>* out_survivors,
+                                                  std::size_t* narrow_domain_comparison_count,
+                                                  boundary_column_map const* boundary_map)
+{
+  auto const num_rows = input.num_rows();
+  if (num_rows == 0) {
+    if (narrow_domain_comparison_count != nullptr) {
+      translation_context count_ctx(input, boundary_map);
+      (void)count_ctx.produce(predicate);
+      *narrow_domain_comparison_count += count_ctx.narrow_domain_comparison_count();
+    }
+    if (out_survivors != nullptr) {
+      *out_survivors = cudf::make_numeric_column(
+        cudf::data_type{cudf::type_id::INT32}, 0, cudf::mask_state::UNALLOCATED, stream, mr);
+    }
+    return make_empty_projected_table(projected_input, stream, mr);
+  }
+
+  translation_context ctx(input, boundary_map);
+  auto const pred_reg = ctx.produce(predicate);
+  if (narrow_domain_comparison_count != nullptr) {
+    *narrow_domain_comparison_count += ctx.narrow_domain_comparison_count();
+  }
+
+  constexpr int block_threads = 256;
+  constexpr int num_warps     = block_threads / 32;
+  bool const any_can_overflow = pred_reg.can_overflow;
+  bool const any_subquery_err = ctx.has_subquery_error();
+
+  std::ostringstream src;
+  emit_nvrtc_device_runtime_preamble(src);
+  src << "extern \"C\" __global__ void sirius_nvrtc_filter_kernel(\n";
+
+  std::size_t num_bsm_cols = 0;
+  for (auto const& in_col : ctx.input_columns()) {
+    if (in_col.physical_type.id() == cudf::type_id::STRING && in_col.use_bsm_cache) {
+      ++num_bsm_cols;
+    }
+  }
+  int32_t const bsm_budget_per_col =
+    (num_bsm_cols == 0)
+      ? 0
+      : static_cast<int32_t>(std::max<std::size_t>(1024, (16384 / num_bsm_cols) & ~7ULL));
+
+  for (auto const& in_col : ctx.input_columns()) {
+    auto const id_str = std::to_string(in_col.binding_id);
+    if (in_col.physical_type.id() == cudf::type_id::STRING) {
+      auto const off_type_str = cuda_type_name(in_col.offset_type);
+      src << "    " << off_type_str << " const* __restrict__ in_" << id_str << "_offsets,\n"
+          << "    char const* __restrict__ in_" << id_str << "_chars,\n"
+          << "    int64_t in_" << id_str << "_chars_size,\n"
+          << "    uint32_t const* __restrict__ in_" << id_str << "_mask,\n"
+          << "    int32_t in_" << id_str << "_bit_offset,\n";
+    } else {
+      auto const type_str = cuda_type_name(in_col.physical_type);
+      src << "    " << type_str << " const* __restrict__ in_" << id_str << "_data,\n"
+          << "    uint32_t const* __restrict__ in_" << id_str << "_mask,\n"
+          << "    int32_t in_" << id_str << "_bit_offset,\n";
+    }
+  }
+
+  for (auto const& cst : ctx.constants()) {
+    auto const id_str = std::to_string(cst.binding_id);
+    if (cst.device_type.id() == cudf::type_id::STRING) {
+      src << "    char const* __restrict__ c_" << id_str << "_ptr,\n"
+          << "    int32_t c_" << id_str << "_len,\n"
+          << "    uint8_t c_" << id_str << "_valid,\n";
+    } else {
+      auto const type_str = cuda_type_name(cst.device_type);
+      src << "    " << type_str << " c_" << id_str << "_val,\n"
+          << "    uint8_t c_" << id_str << "_valid,\n";
+    }
+  }
+
+  src << "    int32_t num_rows,\n"
+      << "    uint32_t* __restrict__ status_and_counts,\n"
+      << "    uint32_t* __restrict__ warp_ballots,\n"
+      << "    uint32_t* __restrict__ block_counts,\n"
+      << "    int32_t* __restrict__ single_block_survivors)\n"
+      << "{\n"
+      << "  int32_t const row = static_cast<int32_t>(blockIdx.x) * " << block_threads
+      << " + static_cast<int32_t>(threadIdx.x);\n"
+      << "  int32_t const lane = static_cast<int32_t>(threadIdx.x) & 31;\n"
+      << "  int32_t const warp_in_block = static_cast<int32_t>(threadIdx.x) >> 5;\n"
+      << "  int32_t const global_warp = (static_cast<int32_t>(blockIdx.x) * " << block_threads
+      << " + static_cast<int32_t>(threadIdx.x)) >> 5;\n"
+      << "  bool const active = (row < num_rows);\n";
+
+  for (auto const& in_col : ctx.input_columns()) {
+    if (in_col.physical_type.id() != cudf::type_id::STRING) { continue; }
+    auto const id_str = std::to_string(in_col.binding_id);
+    src << "  (void)in_" << id_str << "_chars_size;\n";
+    if (in_col.use_bsm_cache && bsm_budget_per_col > 0) {
+      src << "  __shared__ __align__(8) char bsm_buf_" << id_str << "[" << (bsm_budget_per_col + 8)
+          << "];\n"
+          << "  int32_t const bsm_row_begin_" << id_str << " = static_cast<int32_t>(blockIdx.x) * "
+          << block_threads << ";\n"
+          << "  int32_t const bsm_row_end_" << id_str << " = (bsm_row_begin_" << id_str << " + "
+          << block_threads << " < num_rows) ? (bsm_row_begin_" << id_str << " + " << block_threads
+          << ") : num_rows;\n"
+          << "  int64_t in_" << id_str << "_base_off = 0LL;\n"
+          << "  char const* in_" << id_str << "_active_chars = in_" << id_str << "_chars;\n"
+          << "  if (in_" << id_str << "_offsets != nullptr && in_" << id_str
+          << "_chars != nullptr && bsm_row_begin_" << id_str << " < bsm_row_end_" << id_str
+          << ") {\n"
+          << "    int64_t const raw_base = static_cast<int64_t>(in_" << id_str
+          << "_offsets[bsm_row_begin_" << id_str << "]);\n"
+          << "    int64_t const raw_end = static_cast<int64_t>(in_" << id_str
+          << "_offsets[bsm_row_end_" << id_str << "]);\n"
+          << "    int64_t const span = raw_end - raw_base;\n"
+          << "    if (span >= 0 && span <= " << bsm_budget_per_col << ") {\n"
+          << "      int32_t const align_off = static_cast<int32_t>(reinterpret_cast<uintptr_t>(in_"
+          << id_str << "_chars + raw_base) & 7u);\n"
+          << "      char* const bsm_dst = bsm_buf_" << id_str << " + align_off;\n"
+          << "      coop_load_bsm(bsm_dst, in_" << id_str
+          << "_chars + raw_base, static_cast<int32_t>(span));\n"
+          << "      in_" << id_str << "_base_off = raw_base;\n"
+          << "      in_" << id_str << "_active_chars = bsm_dst;\n"
+          << "    }\n"
+          << "  }\n";
+    } else {
+      src << "  int64_t const in_" << id_str << "_base_off = 0LL;\n"
+          << "  char const* const in_" << id_str << "_active_chars = in_" << id_str << "_chars;\n";
+    }
+  }
+  if (num_bsm_cols > 0) { src << "  __syncthreads();\n"; }
+
+  src << "  bool survives = false;\n";
+  if (any_can_overflow) { src << "  bool row_overflow = false;\n"; }
+  if (any_subquery_err) { src << "  bool row_subquery_error = false;\n"; }
+
+  src << "  if (active) {\n" << ctx.body_code();
+  if (pred_reg.can_overflow) {
+    src << "    row_overflow = (" << pred_reg.var_name << ".valid && " << pred_reg.var_name
+        << ".overflow);\n"
+        << "    survives = (" << pred_reg.var_name << ".valid && !" << pred_reg.var_name
+        << ".overflow && " << pred_reg.var_name << ".val);\n";
+  } else if (pred_reg.is_statically_non_null) {
+    src << "    survives = " << pred_reg.var_name << ".val;\n";
+  } else {
+    src << "    survives = (" << pred_reg.var_name << ".valid && " << pred_reg.var_name
+        << ".val);\n";
+  }
+  src << "  }\n";
+
+  if (any_can_overflow) {
+    src << "  uint32_t const ovf_ballot = __ballot_sync(0xFFFFFFFFu, active && row_overflow);\n"
+        << "  if (ovf_ballot != 0u && lane == 0) {\n"
+        << "    atomicOr(&status_and_counts[0], 1u);\n"
+        << "  }\n";
+  }
+  if (any_subquery_err) {
+    src << "  uint32_t const subq_ballot = __ballot_sync(0xFFFFFFFFu, active && "
+           "row_subquery_error);\n"
+        << "  if (subq_ballot != 0u && lane == 0) {\n"
+        << "    atomicOr(&status_and_counts[0], 2u);\n"
+        << "  }\n";
+  }
+
+  // TQP++ Section 5.3 3-Tier Sparse-to-Dense Compaction:
+  // Tier 1: Warp-level ballot & intra-warp rank in Thread-Private Registers (TPR).
+  // Tier 2: Block-Shared Memory (BSM) prefix sum across warps in the block.
+  // Tier 3: Global total count accumulation + single-block fastpath or multi-block ballot/count
+  //         staging for deterministic ascending row compaction.
+  src << "  uint32_t const warp_ballot = __ballot_sync(0xFFFFFFFFu, active && survives);\n"
+      << "  uint32_t const lane_rank = static_cast<uint32_t>(__popc(warp_ballot & ((1u << lane) - "
+         "1u)));\n"
+      << "  __shared__ uint32_t s_warp_offsets[" << num_warps << "];\n"
+      << "  if (lane == 0) {\n"
+      << "    uint32_t const wc = static_cast<uint32_t>(__popc(warp_ballot));\n"
+      << "    s_warp_offsets[warp_in_block] = wc;\n"
+      << "    if (warp_ballots != nullptr) {\n"
+      << "      warp_ballots[global_warp] = warp_ballot;\n"
+      << "    }\n"
+      << "  }\n"
+      << "  __syncthreads();\n"
+      << "  if (threadIdx.x == 0) {\n"
+      << "    uint32_t acc = 0u;\n"
+      << "    #pragma unroll\n"
+      << "    for (int w = 0; w < " << num_warps << "; ++w) {\n"
+      << "      uint32_t const c = s_warp_offsets[w];\n"
+      << "      s_warp_offsets[w] = acc;\n"
+      << "      acc += c;\n"
+      << "    }\n"
+      << "    if (block_counts != nullptr) {\n"
+      << "      block_counts[blockIdx.x] = acc;\n"
+      << "    }\n"
+      << "    if (acc > 0u) {\n"
+      << "      atomicAdd(&status_and_counts[1], acc);\n"
+      << "    }\n"
+      << "  }\n"
+      << "  __syncthreads();\n"
+      << "  if (single_block_survivors != nullptr && active && survives) {\n"
+      << "    uint32_t const in_block_idx = s_warp_offsets[warp_in_block] + lane_rank;\n"
+      << "    single_block_survivors[in_block_idx] = row;\n"
+      << "  }\n"
+      << "}\n";
+
+  codegen::jit::CompileOptions opts;
+  opts.arch_cc       = codegen::jit::arch_cc_for_current_device();
+  opts.device_int128 = true;
+  std::shared_ptr<const codegen::jit::CompiledKernel> compiled;
+  try {
+    compiled = codegen::jit::KernelCache::instance().get_or_compile_plain(
+      src.str(), "sirius_nvrtc_filter_kernel", opts);
+  } catch (codegen::jit::CompileError const& err) {
+    throw internal_exception("[nvrtc] {}\nLog:\n{}\nSource:\n{}", err.what(), err.log, err.source);
+  }
+  CUfunction const fn = compiled->func_for_current_device();
+
+  auto const grid_dim_x = static_cast<unsigned int>((num_rows + block_threads - 1) / block_threads);
+  bool const single_block = (grid_dim_x == 1U);
+
+  // For single_block: d_workspace holds [0]=status, [1]=total_survivors,
+  // [2..257]=single_block_survivors (256 int32s). For multi_block: d_workspace holds [0]=status,
+  // [1]=total_survivors, [2..2+num_blocks-1]=block_counts,
+  //                  followed by num_global_warps warp_ballots.
+  std::size_t const num_global_warps = static_cast<std::size_t>(grid_dim_x) * num_warps;
+  std::size_t const workspace_words =
+    single_block ? (2U + block_threads) : (2U + grid_dim_x + num_global_warps);
+  rmm::device_uvector<std::uint32_t> d_workspace(workspace_words, stream, mr);
+  std::uint32_t* status_ptr = d_workspace.data();
+  simpatico::throw_if_cuda_error(
+    cudaMemsetAsync(status_ptr, 0, 2U * sizeof(std::uint32_t), stream.get()),
+    "cudaMemsetAsync(filter_status_and_counts)");
+
+  std::uint32_t* block_counts_ptr = single_block ? nullptr : (d_workspace.data() + 2U);
+  std::uint32_t* warp_ballots_ptr = single_block ? nullptr : (d_workspace.data() + 2U + grid_dim_x);
+  std::int32_t* single_block_survivors_ptr =
+    single_block ? reinterpret_cast<std::int32_t*>(d_workspace.data() + 2U) : nullptr;
+
+  struct input_arg_storage {
+    void const* data_ptr{nullptr};
+    void const* offsets_ptr{nullptr};
+    char const* chars_ptr{nullptr};
+    std::int64_t chars_size{0};
+    std::uint32_t const* mask_ptr{nullptr};
+    std::int32_t bit_offset{0};
+  };
+  std::vector<input_arg_storage> in_args(ctx.input_columns().size());
+  for (std::size_t i = 0; i < ctx.input_columns().size(); ++i) {
+    auto const& binding = ctx.input_columns()[i];
+    auto const col_view = input.column(binding.column_index);
+    if (binding.physical_type.id() == cudf::type_id::STRING) {
+      if (col_view.size() > 0 && col_view.num_children() > 0) {
+        cudf::strings_column_view const scv(col_view);
+        auto const offsets_col = scv.offsets();
+        if (offsets_col.size() > col_view.offset() + col_view.size()) {
+          if (offsets_col.type().id() == cudf::type_id::INT64) {
+            in_args[i].offsets_ptr = offsets_col.data<std::int64_t>() + col_view.offset();
+          } else {
+            in_args[i].offsets_ptr = offsets_col.data<std::int32_t>() + col_view.offset();
+          }
+          in_args[i].chars_ptr  = scv.chars_begin(stream);
+          in_args[i].chars_size = scv.chars_size(stream);
+        }
+      }
+    } else {
+      in_args[i].data_ptr = get_input_data_ptr(col_view);
+    }
+    in_args[i].mask_ptr   = binding.is_nullable ? col_view.null_mask() : nullptr;
+    in_args[i].bit_offset = static_cast<std::int32_t>(col_view.offset());
+  }
+
+  struct string_constant_arg_storage {
+    char const* ptr{nullptr};
+    std::int32_t len{0};
+    std::uint8_t valid{0};
+  };
+  std::string h_const_chars;
+  std::vector<std::size_t> str_const_offsets(ctx.constants().size(), 0);
+  for (std::size_t i = 0; i < ctx.constants().size(); ++i) {
+    auto const& cst = ctx.constants()[i];
+    if (cst.device_type.id() == cudf::type_id::STRING && cst.is_valid) {
+      auto const& s        = std::get<std::string>(cst.payload);
+      str_const_offsets[i] = h_const_chars.size();
+      h_const_chars.append(s);
+    }
+  }
+  rmm::device_uvector<char> d_const_chars(h_const_chars.size(), stream, mr);
+  if (!h_const_chars.empty()) {
+    simpatico::throw_if_cuda_error(cudaMemcpyAsync(d_const_chars.data(),
+                                                   h_const_chars.data(),
+                                                   h_const_chars.size(),
+                                                   cudaMemcpyHostToDevice,
+                                                   stream.get()),
+                                   "cudaMemcpyAsync(d_const_chars)");
+  }
+
+  std::vector<constant_param_storage> const_args(ctx.constants().size());
+  std::vector<string_constant_arg_storage> str_const_args(ctx.constants().size());
+  for (std::size_t i = 0; i < ctx.constants().size(); ++i) {
+    auto const& cst = ctx.constants()[i];
+    if (cst.device_type.id() == cudf::type_id::STRING) {
+      str_const_args[i].valid = cst.is_valid ? 1U : 0U;
+      if (cst.is_valid) {
+        auto const& s         = std::get<std::string>(cst.payload);
+        str_const_args[i].ptr = d_const_chars.data() + str_const_offsets[i];
+        str_const_args[i].len = static_cast<std::int32_t>(s.size());
+      }
+    } else {
+      populate_constant_param(cst, const_args[i]);
+    }
+  }
+
+  std::int32_t num_rows_arg = static_cast<std::int32_t>(num_rows);
+
+  std::vector<void*> kernel_args;
+  kernel_args.reserve(in_args.size() * 5 + const_args.size() * 3 + 5);
+  for (std::size_t i = 0; i < in_args.size(); ++i) {
+    if (ctx.input_columns()[i].physical_type.id() == cudf::type_id::STRING) {
+      kernel_args.push_back(&in_args[i].offsets_ptr);
+      kernel_args.push_back(&in_args[i].chars_ptr);
+      kernel_args.push_back(&in_args[i].chars_size);
+      kernel_args.push_back(&in_args[i].mask_ptr);
+      kernel_args.push_back(&in_args[i].bit_offset);
+    } else {
+      kernel_args.push_back(&in_args[i].data_ptr);
+      kernel_args.push_back(&in_args[i].mask_ptr);
+      kernel_args.push_back(&in_args[i].bit_offset);
+    }
+  }
+  for (std::size_t i = 0; i < ctx.constants().size(); ++i) {
+    if (ctx.constants()[i].device_type.id() == cudf::type_id::STRING) {
+      kernel_args.push_back(&str_const_args[i].ptr);
+      kernel_args.push_back(&str_const_args[i].len);
+      kernel_args.push_back(&str_const_args[i].valid);
+    } else {
+      kernel_args.push_back(&const_args[i].val_bytes[0]);
+      kernel_args.push_back(&const_args[i].valid);
+    }
+  }
+  kernel_args.push_back(&num_rows_arg);
+  kernel_args.push_back(&status_ptr);
+  kernel_args.push_back(&warp_ballots_ptr);
+  kernel_args.push_back(&block_counts_ptr);
+  kernel_args.push_back(&single_block_survivors_ptr);
+
+  simpatico::throw_if_cu_error(cuLaunchKernel(fn,
+                                              grid_dim_x,
+                                              1,
+                                              1,
+                                              block_threads,
+                                              1,
+                                              1,
+                                              0,
+                                              reinterpret_cast<CUstream>(stream.get()),
+                                              kernel_args.data(),
+                                              nullptr),
+                               "cuLaunchKernel(sirius_nvrtc_filter_kernel)");
+
+  std::uint32_t h_status[2]{0U, 0U};
+  simpatico::throw_if_cuda_error(
+    cudaMemcpyAsync(
+      h_status, status_ptr, 2U * sizeof(std::uint32_t), cudaMemcpyDeviceToHost, stream.get()),
+    "cudaMemcpyAsync(filter_status_and_counts)");
+  simpatico::throw_if_cuda_error(cudaStreamSynchronize(stream.get()),
+                                 "cudaStreamSynchronize(sirius_nvrtc_filter_kernel)");
+
+  if ((h_status[0] & 2U) != 0U) {
+    throw internal_exception(
+      "[expression_evaluator:case]: More than one row returned by a subquery used as an "
+      "expression.");
+  }
+  if ((h_status[0] & 1U) != 0U) {
+    throw out_of_range_exception("Overflow in NVRTC expression evaluation");
+  }
+
+  auto const survivor_count = static_cast<cudf::size_type>(h_status[1]);
+  if (survivor_count == 0) {
+    if (out_survivors != nullptr) {
+      *out_survivors = cudf::make_numeric_column(
+        cudf::data_type{cudf::type_id::INT32}, 0, cudf::mask_state::UNALLOCATED, stream, mr);
+    }
+    return make_empty_projected_table(projected_input, stream, mr);
+  }
+
+  // 100% selectivity fastpath when `out_survivors` is not requested: no gather needed!
+  if (survivor_count == num_rows && out_survivors == nullptr) {
+    return std::make_unique<cudf::table>(projected_input, stream, mr);
+  }
+
+  // Materialize exact M-row ascending `INT32` survivors column.
+  auto survivors_col   = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                                 survivor_count,
+                                                 cudf::mask_state::UNALLOCATED,
+                                                 stream,
+                                                 mr);
+  auto* survivors_data = survivors_col->mutable_view().data<std::int32_t>();
+
+  if (single_block) {
+    simpatico::throw_if_cuda_error(
+      cudaMemcpyAsync(survivors_data,
+                      single_block_survivors_ptr,
+                      static_cast<std::size_t>(survivor_count) * sizeof(std::int32_t),
+                      cudaMemcpyDeviceToDevice,
+                      stream.get()),
+      "cudaMemcpyAsync(single_block_survivors)");
+  } else {
+    auto const compact_compiled = codegen::jit::KernelCache::instance().get_or_compile_plain(
+      kFilterCompactMultiBlockSource, "sirius_nvrtc_filter_compact_kernel", opts);
+    CUfunction const compact_fn = compact_compiled->func_for_current_device();
+    void* compact_args[] = {&warp_ballots_ptr, &block_counts_ptr, &num_rows_arg, &survivors_data};
+    simpatico::throw_if_cu_error(cuLaunchKernel(compact_fn,
+                                                grid_dim_x,
+                                                1,
+                                                1,
+                                                block_threads,
+                                                1,
+                                                1,
+                                                0,
+                                                reinterpret_cast<CUstream>(stream.get()),
+                                                compact_args,
+                                                nullptr),
+                                 "cuLaunchKernel(sirius_nvrtc_filter_compact_kernel)");
+  }
+
+  std::unique_ptr<cudf::table> result_table;
+  if (projected_input.num_columns() == 0) {
+    result_table = std::make_unique<cudf::table>(std::vector<std::unique_ptr<cudf::column>>{});
+  } else if (survivor_count == num_rows) {
+    result_table = std::make_unique<cudf::table>(projected_input, stream, mr);
+  } else {
+    result_table = cudf::gather(
+      projected_input, survivors_col->view(), cudf::out_of_bounds_policy::DONT_CHECK, stream, mr);
+  }
+
+  if (out_survivors != nullptr) { *out_survivors = std::move(survivors_col); }
+  return result_table;
 }
 
 }  // namespace sirius::nvrtc

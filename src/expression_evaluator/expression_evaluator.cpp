@@ -435,6 +435,76 @@ std::unique_ptr<cudf::table> expression_evaluator::evaluate(cudf::table_view inp
   return std::make_unique<cudf::table>(std::move(_output_columns));
 }
 
+std::optional<std::unique_ptr<cudf::table>> expression_evaluator::try_select_nvrtc_with_boundaries(
+  cudf::table_view input,
+  cudf::table_view projected_input,
+  std::unique_ptr<cudf::column>* out_survivors)
+{
+  D_ASSERT(_ast_expressions.size() == 1);
+  D_ASSERT(_ast_expressions[0] != nullptr);
+  D_ASSERT(_ast_expressions[0]->return_type().id() == sirius::type_id::BOOLEAN);
+
+  _restored_reference_cache.clear();
+  _restored_reference_cast_count  = 0;
+  _narrow_domain_comparison_count = 0;
+  _ast_tree                       = cudf::ast::tree{};
+  _temp_scalars.clear();
+  _temp_columns.clear();
+  _input_table = input;
+
+  auto const* pred = _ast_expressions[0];
+  if (nvrtc::can_compile_filter_sink(*pred, _input_table)) {
+    auto out = nvrtc::evaluate_filter_sink(*pred,
+                                           _input_table,
+                                           projected_input,
+                                           _stream,
+                                           _mr,
+                                           out_survivors,
+                                           &_narrow_domain_comparison_count);
+    _temp_scalars.clear();
+    _temp_columns.clear();
+    return out;
+  }
+
+  std::array<sirius::ast::node const*, 1> pred_span{pred};
+  std::vector<sirius::ast::node const*> boundaries;
+  nvrtc::collect_materialization_boundaries(pred_span, _input_table, boundaries);
+  if (boundaries.empty()) { return std::nullopt; }
+
+  std::vector<std::unique_ptr<cudf::column>> boundary_cols;
+  boundary_cols.reserve(boundaries.size());
+  std::vector<cudf::column_view> combined_views;
+  combined_views.reserve(_input_table.num_columns() + boundaries.size());
+  for (cudf::size_type c = 0; c < _input_table.num_columns(); ++c) {
+    combined_views.push_back(_input_table.column(c));
+  }
+
+  nvrtc::boundary_column_map bmap;
+  bmap.reserve(boundaries.size());
+  for (auto const* bnode : boundaries) {
+    auto b_res         = evaluate(*bnode, evaluation_mode::MATERIALIZE);
+    auto b_col         = materialize_result_column(*bnode, std::move(b_res));
+    auto const syn_idx = static_cast<std::uint32_t>(combined_views.size());
+    combined_views.push_back(b_col->view());
+    boundary_cols.push_back(std::move(b_col));
+    bmap.emplace(bnode, syn_idx);
+  }
+
+  cudf::table_view const combined_table(combined_views);
+  if (!nvrtc::can_compile_filter_sink(*pred, combined_table, &bmap)) { return std::nullopt; }
+  auto out = nvrtc::evaluate_filter_sink(*pred,
+                                         combined_table,
+                                         projected_input,
+                                         _stream,
+                                         _mr,
+                                         out_survivors,
+                                         &_narrow_domain_comparison_count,
+                                         &bmap);
+  _temp_scalars.clear();
+  _temp_columns.clear();
+  return out;
+}
+
 std::unique_ptr<cudf::column> expression_evaluator::compute_mask(cudf::table_view input)
 {
   D_ASSERT(_ast_expressions.size() == 1);
@@ -455,9 +525,14 @@ std::unique_ptr<cudf::table> expression_evaluator::select(
       "[expression_evaluator] select(): output_indices must be non-empty; use the "
       "all-columns select() overload for count(*)-style filters with no output columns");
   }
+  auto const projected_input = input.select(output_indices.begin(), output_indices.end());
+  if (_policy.strategy == expression_evaluator_strategy::NVRTC_JIT) {
+    if (auto out = try_select_nvrtc_with_boundaries(input, projected_input, nullptr)) {
+      return std::move(*out);
+    }
+  }
   auto mask = compute_mask(input);
-  return sirius::apply_retention_mask(
-    input.select(output_indices.begin(), output_indices.end()), mask->view(), _stream, _mr);
+  return sirius::apply_retention_mask(projected_input, mask->view(), _stream, _mr);
 }
 
 std::unique_ptr<cudf::table> expression_evaluator::select_with_survivors(
@@ -469,11 +544,16 @@ std::unique_ptr<cudf::table> expression_evaluator::select_with_survivors(
     throw internal_exception(
       "[expression_evaluator] select_with_survivors(): output_indices must be non-empty");
   }
+  auto const projected_input = input.select(output_indices.begin(), output_indices.end());
+  if (_policy.strategy == expression_evaluator_strategy::NVRTC_JIT) {
+    if (auto out = try_select_nvrtc_with_boundaries(input, projected_input, &survivors)) {
+      return std::move(*out);
+    }
+  }
   // ONE mask, used twice: the survivors must be exactly the rows the output
   // holds, so computing the predicate a second time would risk two answers.
   auto mask     = compute_mask(input);
-  auto selected = sirius::apply_retention_mask(
-    input.select(output_indices.begin(), output_indices.end()), mask->view(), _stream, _mr);
+  auto selected = sirius::apply_retention_mask(projected_input, mask->view(), _stream, _mr);
 
   auto const rows = input.num_rows();
   auto positions  = cudf::sequence(rows,
@@ -489,6 +569,11 @@ std::unique_ptr<cudf::table> expression_evaluator::select_with_survivors(
 
 std::unique_ptr<cudf::table> expression_evaluator::select(cudf::table_view input)
 {
+  if (_policy.strategy == expression_evaluator_strategy::NVRTC_JIT) {
+    if (auto out = try_select_nvrtc_with_boundaries(input, input, nullptr)) {
+      return std::move(*out);
+    }
+  }
   auto mask = compute_mask(input);
   return sirius::apply_retention_mask(input, mask->view(), _stream, _mr);
 }

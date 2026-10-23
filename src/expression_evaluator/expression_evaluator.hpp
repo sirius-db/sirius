@@ -459,6 +459,14 @@ class expression_evaluator {
   std::optional<std::unique_ptr<cudf::table>> try_evaluate_nvrtc_with_boundaries(
     std::span<sirius::ast::node const* const> expressions);
 
+  // Attempt to evaluate a single boolean filter predicate via the NVRTC_JIT FilterSink kernel
+  // (using TQP++ 3-tier Sparse-to-Dense Compaction), pre-evaluating any in-tree Materialization
+  // Boundaries into synthetic input columns.
+  std::optional<std::unique_ptr<cudf::table>> try_select_nvrtc_with_boundaries(
+    cudf::table_view input,
+    cudf::table_view projected_input,
+    std::unique_ptr<cudf::column>* out_survivors = nullptr);
+
   // Execute the AST tree rooted at the given expression reference and return the result as a
   // column.
   std::unique_ptr<cudf::column> evaluate_ast(expr_ref root_expr);
