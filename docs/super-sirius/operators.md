@@ -249,6 +249,9 @@ Joining each build batch against each probe batch and unioning the results is on
 
 **Empty-opposite side (orphan tasks).** When one side is a genuinely empty table, its concat emits *zero* batches. The surviving side's batches then have nothing to pair with, so once both producers finish, `next_cross_schedule_orphan` claims each survivor and `get_next_task_input_data` **synthesizes an empty opposite batch** for it (`sirius::make_empty_table` from the absent child's output types, built on the survivor's device) and returns an ordinary two-batch task. `execute()` then runs the normal join dispatch unchanged, so cuDF NULL-pads the survivor for LEFT/RIGHT/OUTER/ANTI and yields zero rows for INNER/SEMI. Popping the survivor also drains the repository, so the pipeline completes instead of hanging. FULL OUTER and RIGHT-family joins are the reachable cases (they always run STANDARD); small-build INNER/LEFT/SEMI/ANTI take BUILD_PROBE, which handles an empty side separately.
 
+For BUILD_PROBE, a closed zero-batch probe reclaims every never-probed build slot. If the join has issued no task and has no probe task left to issue, it retains one empty-output task so a downstream ungrouped aggregate can return `COUNT 0`. Task creation releases the unused build on its owning GPU, or directly for HOST/DISK storage. The task captures its reserved GPU space during preparation and constructs a zero-row output there without uploading the build or constructing a hash table. Failed output construction can retry the same task. MARK pre-sizing and empty-build semantics continue through the normal MARK paths.
+
+
 The following table summarizes, per join type, what concat folds, which side streams under this scheme, and the partition / broadcast / mode support:
 
 | JoinType | concat fold (whole side) | Streams multi-batch | batch×batch + union | Multi-partition | Broadcast | Supported modes |
