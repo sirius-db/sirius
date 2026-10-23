@@ -214,6 +214,14 @@ void launch_decode_kernel(cdj::DecodeKernelSpec const& spec,
                                "simpatico decode: cuLaunchKernel");
 }
 
+// Zeroed uint32 words after every dense bitpack `packed` buffer. simpatico_bitunpack_one loads
+// three consecutive words (w0/w1/w2) and its 128-bit counterpart five (a 128-bit value at an
+// arbitrary bit offset spans ceil((128+31)/32) = 5 words), so five keep the last element's
+// gather in-bounds for either. They travel as part of the stored payload, so num_rows already
+// accounts for them; sizing them unconditionally costs 20 bytes per bitpack buffer and keeps
+// one layout for every width.
+constexpr std::size_t kBitpackGuardWords = 5;
+
 }  // namespace
 
 namespace simpatico {
@@ -260,14 +268,7 @@ std::unique_ptr<cudf::column> compact_bitpack_packed(cudf::column const& chunk_c
 
   const std::size_t live = static_cast<std::size_t>(live_packed_bytes);
 
-  // simpatico_bitunpack_one loads three consecutive uint32 words (w0/w1/w2),
-  // and its 128-bit counterpart loads five (a 128-bit value at an arbitrary bit
-  // offset spans ceil((128+31)/32) = 5 words). Five guard words keep the last
-  // element's gather in-bounds for either. They travel as part of the stored
-  // payload so num_rows already accounts for them; sizing them unconditionally
-  // costs 8 bytes per bitpack buffer and keeps one layout for every width.
-  constexpr std::size_t kGuardWords = 5;
-  const std::size_t guard_bytes     = kGuardWords * sizeof(std::uint32_t);
+  const std::size_t guard_bytes = kBitpackGuardWords * sizeof(std::uint32_t);
 
   rmm::device_buffer dense(live + guard_bytes, stream, mr);
   if (live > 0) {
@@ -324,7 +325,7 @@ std::unique_ptr<cudf::column> compact_bitpack_packed(cudf::column const& chunk_c
   // extra allocation at the read site.  `live` is always a multiple of 4.
   return std::make_unique<cudf::column>(
     cudf::data_type(cudf::type_id::UINT32),
-    static_cast<cudf::size_type>(live / 4 + kGuardWords),
+    static_cast<cudf::size_type>(live / 4 + kBitpackGuardWords),
     std::move(dense),
     cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr),
     0);
@@ -1121,7 +1122,6 @@ int launch_encode_measure_pack(const simpatico::CodegenHead& head,
 {
   constexpr std::size_t kMaxBitsShards = 16;
   constexpr std::size_t kShardStride   = 32;
-  constexpr std::size_t kGuardWords    = 5;
   const auto nc                        = static_cast<std::size_t>(num_chunks);
 
   std::vector<rmm::device_buffer> bufs;
@@ -1219,7 +1219,7 @@ int launch_encode_measure_pack(const simpatico::CodegenHead& head,
     }
     // Its words are OR-ed in, so the output starts zeroed (guard words included).
     out.dense =
-      rmm::device_buffer(out.live_bytes + kGuardWords * sizeof(std::uint32_t), stream, mr);
+      rmm::device_buffer(out.live_bytes + kBitpackGuardWords * sizeof(std::uint32_t), stream, mr);
     cudaMemsetAsync(out.dense.data(), 0, out.dense.size(), stream.get());
   }
   // Rle's run counts become the exclusive-prefix offsets the decoder reads, in place; the
@@ -1311,7 +1311,8 @@ int launch_encode_measure_pack(const simpatico::CodegenHead& head,
           "packed",
           std::make_unique<cudf::column>(
             cudf::data_type(cudf::type_id::UINT32),
-            static_cast<cudf::size_type>(out.live_bytes / sizeof(std::uint32_t) + kGuardWords),
+            static_cast<cudf::size_type>(out.live_bytes / sizeof(std::uint32_t) +
+                                         kBitpackGuardWords),
             std::move(out.dense),
             cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream),
             0));
