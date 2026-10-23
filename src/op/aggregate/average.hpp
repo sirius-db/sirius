@@ -31,11 +31,16 @@ namespace sirius::op {
  * @brief AVG as FLOAT64 from its merged SUM column @p sum and COUNT column @p count.
  *
  * A DECIMAL sum is divided like DuckDB divides it: the unscaled integer sum over
- * `count * 10^scale`. Converting the scaled sum to FLOAT64 first would round twice, so equal
- * averages over different counts could differ in the last bit. The result is exact-rounded while
- * the unscaled sum and `count * 10^scale` stay below 2^53; past that DuckDB's `long double` can
- * still differ in the last bit. Any other sum is cast to FLOAT64 and divided. A row is NULL when
- * @p sum or @p count is.
+ * `count * P`, where P is 10^scale rounded to DOUBLE the way DuckDB rounds it (exact up to scale
+ * 22). Rounding the scaled sum, `count * P` or the sum itself to DOUBLE first would make equal
+ * averages over different counts differ in the last bit. Instead `count * P` is kept exact as two
+ * DOUBLEs, the sum is split into two DOUBLEs (exact below 2^106) and the quotient is formed with
+ * about 106 bits and rounded once. The result is therefore the correctly rounded value of
+ * `sum / (count * P)` except within about 2^-104 relative of a rounding tie, for any count below
+ * 2^53. DuckDB divides in `long double` (113-bit on aarch64, 64-bit on x86-64), or in DOUBLE for
+ * DECIMAL inputs of width 9 or less, so the two can still differ in the last bit where DuckDB's
+ * own quotient is not correctly rounded, e.g. such a narrow input whose unscaled sum exceeds
+ * 2^53. Any other sum is cast to FLOAT64 and divided. A row is NULL when @p sum or @p count is.
  */
 std::unique_ptr<cudf::column> average_as_double(cudf::column_view const& sum,
                                                 cudf::column_view const& count,

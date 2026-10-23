@@ -63,6 +63,22 @@ TEST_CASE_METHOD(DecimalAvgFixture,
 }
 
 TEST_CASE_METHOD(DecimalAvgFixture,
+                 "decimal avg - equal grouped averages at scale 23 are one value",
+                 "[integration][gpu_execution][aggregate][decimal_avg]")
+{
+  // 10^23 is not a DOUBLE, so count * 10^23 rounds differently for each count.
+  run_ok(
+    "CREATE TABLE eqs AS SELECT g::INTEGER g FROM range(1, 21) a(g), range(20) b(i) WHERE i < g;");
+  run_ok("CHECKPOINT;");
+  compare_gpu_vs_cpu(
+    "SELECT a FROM (SELECT avg(CAST(0.00000000000000000000001 AS DECIMAL(38,23))) a FROM eqs "
+    "GROUP BY g) GROUP BY a;");
+  compare_gpu_vs_cpu(
+    "SELECT a FROM (SELECT avg(CAST(123.45678901234567890123456 AS DECIMAL(38,23))) a FROM eqs "
+    "GROUP BY g) GROUP BY a;");
+}
+
+TEST_CASE_METHOD(DecimalAvgFixture,
                  "decimal avg - grouped AVG over DECIMAL keeps NULLs and NULL-only groups",
                  "[integration][gpu_execution][aggregate][decimal_avg]")
 {

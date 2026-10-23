@@ -37,17 +37,51 @@ namespace sirius::op {
 
 namespace {
 
-/// Row i's unscaled sum over its count times @p divisor_scale (10^scale), as DuckDB's AVG does.
+/// 10^@p scale rounded to DOUBLE the way DuckDB's AVG bind data rounds it: the HUGEINT's
+/// low and high 64-bit words converted separately and added.
+double duckdb_power_of_ten(int scale)
+{
+  unsigned __int128 power = 1;
+  for (int i = 0; i < scale; ++i) {
+    power *= 10;
+  }
+  auto const lower = static_cast<uint64_t>(power);
+  auto const upper = static_cast<uint64_t>(power >> 64);
+  return static_cast<double>(lower) + static_cast<double>(upper) * 0x1p64;
+}
+
+/// @p sum / (@p divisor_hi + @p divisor_lo) rounded once to DOUBLE. The sum is split into two
+/// DOUBLEs and the quotient corrected by its remainder, so it carries about 106 bits until the
+/// final rounding.
+__device__ double divide_double_double(__int128_t sum, double divisor_hi, double divisor_lo)
+{
+  double const sum_hi = static_cast<double>(sum);
+  // sum_hi rounds to 2^127 only for |sum| near 2^127, above any DECIMAL(38) total.
+  double const sum_lo =
+    fabs(sum_hi) < 0x1p127 ? static_cast<double>(sum - static_cast<__int128_t>(sum_hi)) : 0.0;
+  double const quotient      = sum_hi / divisor_hi;
+  double const product       = quotient * divisor_hi;
+  double const product_error = fma(quotient, divisor_hi, -product);
+  // sum_hi - product is exact: the two are within a factor of 2.
+  double const remainder = ((sum_hi - product) - product_error) + sum_lo - quotient * divisor_lo;
+  return quotient + remainder / divisor_hi;
+}
+
+/// Row i's unscaled sum over its count times @p power_of_ten, as DuckDB's AVG computes it.
 template <typename Rep>
 struct unscaled_average {
   cudf::column_device_view sum;
   cudf::column_device_view count;
-  double divisor_scale;
+  double power_of_ten;
 
   __device__ double operator()(cudf::size_type i) const
   {
-    return static_cast<double>(sum.data<Rep>()[i]) /
-           (static_cast<double>(count.element<int64_t>(i)) * divisor_scale);
+    // count * power_of_ten as an exact two-DOUBLE product; counts stay below 2^53.
+    double const count_value = static_cast<double>(count.element<int64_t>(i));
+    double const divisor_hi  = count_value * power_of_ten;
+    double const divisor_lo  = fma(count_value, power_of_ten, -divisor_hi);
+    return divide_double_double(
+      static_cast<__int128_t>(sum.data<Rep>()[i]), divisor_hi, divisor_lo);
   }
 };
 
@@ -60,12 +94,12 @@ void divide_unscaled(cudf::column_view const& sum,
   auto const sum_device   = cudf::column_device_view::create(sum, stream);
   auto const count_device = cudf::column_device_view::create(count, stream);
   // cuDF scales are negated: DECIMAL(p, s) has scale -s.
-  auto const divisor_scale = std::pow(10.0, -sum.type().scale());
+  auto const power_of_ten = duckdb_power_of_ten(-sum.type().scale());
   thrust::transform(rmm::exec_policy_nosync(stream),
                     thrust::make_counting_iterator<cudf::size_type>(0),
                     thrust::make_counting_iterator<cudf::size_type>(sum.size()),
                     out.data<double>(),
-                    unscaled_average<Rep>{*sum_device, *count_device, divisor_scale});
+                    unscaled_average<Rep>{*sum_device, *count_device, power_of_ten});
 }
 
 }  // namespace
