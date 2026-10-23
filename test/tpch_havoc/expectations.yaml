@@ -50,11 +50,6 @@ expectations:
     issue: 2290
     queries: [Q01_V07]
 
-  - outcome: plan_rejected
-    reason: "Unsupported aggregate function: count with no children"
-    issue: 2291
-    queries: [Q01_V08]
-
   # With Sirius loaded, binding fails with an INTERNAL error even on the CPU, which invalidates the
   # database for every later test.
   - outcome: skip
@@ -62,9 +57,3 @@ expectations:
     issue: 2294
     scan: native
     queries: [Q02_V08]
-
-  - outcome: mismatch
-    reason: NOT IN returns no rows on the parquet copy of orders, which has bloom filters
-    issue: 2295
-    scan: parquet
-    queries: [Q04_V04]
