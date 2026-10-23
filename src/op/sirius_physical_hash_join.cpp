@@ -879,7 +879,6 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
                                join_type == duckdb::JoinType::RIGHT_ANTI;
   bool const is_mixed      = join_mode == HASH_JOIN_MODE::MIXED_JOIN;
   bool const is_full_outer = join_type == duckdb::JoinType::OUTER;
-  uint64_t const small     = partition_small_table_bytes(num_gpus);
 
   // Broadcast candidacy. MARK multi-GPU is forced broadcast (build_has_null must be globally
   // consistent); otherwise a build is a candidate when it is below the small-table threshold, OR
@@ -887,9 +886,8 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
   // the build avoids shuffling a much larger probe across GPUs).
   bool const broadcast_candidate =
     is_mark ? num_gpus > 1
-            : (total_bytes < small ||
-               (total_bytes < max_broadcast_join_size &&
-                estimated_probe_to_build_ratio >= static_cast<double>(num_gpus) * 1.25));
+            : broadcast_build_candidate(
+                total_bytes, num_gpus, max_broadcast_join_size, estimated_probe_to_build_ratio);
 
   // BUILD_PROBE eligibility. MARK/SEMI/ANTI are eligible (persistent filtered_join built on the
   // right, reused across streamed left probe batches); RIGHT_SEMI/RIGHT_ANTI/RIGHT and full OUTER
@@ -913,7 +911,15 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
   // rejected at construction.
   if (is_mark) { build_probe = true; }
 
-  bool const broadcast = broadcast_candidate && build_probe;
+  // A STANDARD / MIXED_JOIN build that fits one partition on several GPUs would otherwise run
+  // unpinned: each task runs where its probe batch is and clones the build there, so the same
+  // build is copied once per task that lands off its GPU (#2200). Replicate it once per GPU
+  // instead, keeping the mode; every slot's tasks then borrow a local copy. RIGHT-family and full
+  // OUTER joins emit build rows and would emit them once per replica, so they keep one partition.
+  bool const broadcast_standard = !build_probe && natural == 1 && num_gpus > 1 && build_foldable &&
+                                  !is_right_family && !is_full_outer;
+
+  bool const broadcast = broadcast_candidate && (build_probe || broadcast_standard);
 
   // BUILD_PROBE runs at the count its eligibility was measured at; MARK single-GPU is clamped to
   // one partition; broadcast takes one partition per GPU; everything else the natural count.
@@ -927,7 +933,7 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
                                                           : natural;
   // A lone BUILD_PROBE partition picks its GPU by rotation so several small joins in one query
   // spread across GPUs instead of all landing on the first. STANDARD builds its hash table
-  // within each task, so a lone partition can follow input locality.
+  // within each task, so a lone partition on one GPU can follow input locality.
   auto placement = build_probe && num_partitions == 1
                      ? partition_placement::round_robin(
                          1, select_gpu_subset(active_gpu_ids, 1, single_partition_rotation))

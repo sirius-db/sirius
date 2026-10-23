@@ -44,9 +44,13 @@
 #include <cudf/table/table_view.hpp>
 #include <cudf/transform.hpp>
 
+#include <rmm/cuda_device.hpp>
 #include <rmm/resource_ref.hpp>
 
+#include <cucascade/memory/memory_space.hpp>
+
 #include <cstdio>
+#include <optional>
 #include <span>
 
 namespace sirius {
@@ -56,8 +60,23 @@ std::unique_ptr<pipelineable_operator_data> cross_join_slice_data::with_batches_
   std::vector<std::shared_ptr<::cucascade::data_batch>> batches) const
 {
   auto replacement = std::make_unique<cross_join_slice_data>(std::move(batches), slice, num_slices);
-  replacement->adopt_row_identity(*this);
+  replacement->adopt_partition_identity(*this);
   return replacement;
+}
+
+// Frees a batch this join will never read. rmm releases device memory under the owning device.
+static void release_batch(std::shared_ptr<cucascade::data_batch> batch)
+{
+  if (!batch) { return; }
+  std::optional<rmm::cuda_set_device_raii> device_guard;
+  {
+    auto ro = batch->to_read_only();
+    if (auto const* ms = ro.get_memory_space();
+        ms != nullptr && ms->get_tier() == cucascade::memory::Tier::GPU) {
+      device_guard.emplace(rmm::cuda_device_id{ms->get_device_id()});
+    }
+  }
+  batch.reset();
 }
 
 static bool nlj_is_equality(sirius::comparison_type c)
@@ -234,13 +253,43 @@ bool sirius_physical_nested_loop_join::is_supported(
 }
 
 partition_strategy sirius_physical_nested_loop_join::get_partition_strategy(
-  const partition_sizing_input& /*in*/)
+  const partition_sizing_input& in)
 {
-  // A nested-loop join is never hash-partitioned: it runs on a single partition and evaluates each
-  // pair of left and right batches as one task, so it never broadcasts or enters build-probe. Join
-  // wrapping folds the side rows are decided against (right for LEFT/SEMI/ANTI/MARK, left for
-  // RIGHT, both for FULL OUTER); INNER streams both. No GPU state is shared across tasks; leave the
-  // CONCATs and join tasks free to follow input locality.
+  // No GPU state is shared across tasks, so the join never hash-partitions or enters build-probe.
+  // Join wrapping folds the side rows are decided against (right for LEFT/SEMI/ANTI/MARK, left for
+  // RIGHT, both for FULL OUTER); INNER streams both. The right side drives sizing, so
+  // `in.total_bytes` is the right side when `in.is_build_side`.
+  auto const& gpus = active_gpu_ids();
+  bool const emits_unmatched_right =
+    join_type == duckdb::JoinType::RIGHT || join_type == duckdb::JoinType::OUTER;
+  if (gpus.size() > 1 && in.is_build_side && !emits_unmatched_right) {
+    std::size_t const probe_card_est = children.size() > 0 ? children[0]->estimated_cardinality : 0;
+    std::size_t const build_card_est =
+      std::max<std::size_t>(children.size() > 1 ? children[1]->estimated_cardinality : 0, 1);
+    double const estimated_probe_to_build_ratio =
+      static_cast<double>(probe_card_est) / static_cast<double>(build_card_est);
+    if (broadcast_build_candidate(
+          in.total_bytes, num_gpus(), _max_broadcast_join_size, estimated_probe_to_build_ratio)) {
+      // One slot per GPU. The right PARTITION replicates every batch into every slot and the left
+      // one routes each batch to the slot on its GPU. Both repositories must agree on the slot
+      // count up front: a GPU that receives no left batch would otherwise leave the left
+      // repository short.
+      auto placement          = partition_placement::one_per_device(gpus);
+      std::size_t const slots = placement.num_partitions();
+      for (std::string_view const port_id :
+           {std::string_view{"build"}, std::string_view{"default"}}) {
+        auto* p = try_get_port(port_id);
+        if (p != nullptr && p->repo != nullptr && slots > p->repo->num_partitions()) {
+          p->repo->set_num_partitions(slots);
+        }
+      }
+      return partition_strategy{static_cast<int>(slots),
+                                /*broadcast=*/true,
+                                /*build_probe=*/false,
+                                std::move(placement)};
+    }
+  }
+  // One partition, free to follow input locality.
   return partition_strategy{/*num_partitions=*/1,
                             /*broadcast=*/false,
                             /*build_probe=*/false,
@@ -328,6 +377,18 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::get_next_task_i
     for (size_t p = 0; p < num_partitions; p++) {
       left_batch_ids.push_back(default_port->repo->get_batch_ids(p));
       right_batch_ids.push_back(build_port->repo->get_batch_ids(p));
+      // A broadcast slot whose GPU received no left batch holds a replica of the right side that
+      // no task will read. Without left rows these join types emit nothing, so drop the replica;
+      // left in the repository it would keep the join from draining and its pipeline from
+      // finishing. Both inputs are complete here (the join's ports are FULL barriers).
+      bool const emits_unmatched_right =
+        join_type == duckdb::JoinType::RIGHT || join_type == duckdb::JoinType::OUTER;
+      if (left_batch_ids[p].empty() && !right_batch_ids[p].empty() && !emits_unmatched_right) {
+        for (uint64_t id : right_batch_ids[p]) {
+          release_batch(build_port->repo->pop_data_batch_by_id(id, p));
+        }
+        right_batch_ids[p].clear();
+      }
       // Only a cross product is split, so only its batch sizes are read.
       if (conditions.empty()) {
         left_batch_sizes.push_back(sizes(*default_port->repo, left_batch_ids[p], p));
@@ -381,11 +442,15 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::get_next_task_i
   input_batch.push_back(
     pop_right ? build_port->repo->pop_data_batch_by_id(right_ids[task.right], task.partition)
               : build_port->repo->get_data_batch_by_id(right_ids[task.right], task.partition));
+  // A pinned partition's GPU becomes the task's preferred device, so every task of a broadcast
+  // slot runs where that slot's inputs already are.
+  auto const placement = this->placement();
   if (conditions.empty()) {
     return std::make_unique<cross_join_slice_data>(
-      std::move(input_batch), task.slice, task.num_slices);
+      std::move(input_batch), task.partition, *placement, task.slice, task.num_slices);
   }
-  return std::make_unique<pipelineable_operator_data>(input_batch);
+  return std::make_unique<partitioned_operator_data>(
+    std::move(input_batch), task.partition, *placement);
 }
 
 namespace {

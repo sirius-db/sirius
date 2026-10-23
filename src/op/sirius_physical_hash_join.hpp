@@ -122,17 +122,21 @@ struct build_probe_decision {
 /// join is not right-family, mixed, or full-outer (those over-emit build rows on the streamed
 /// path). `join_mode` distinguishes MIXED_JOIN; `join_type` supplies the rest.
 ///
-/// Broadcast candidacy: a build is replicate-worthy when it is below the small-table threshold, OR
-/// when it is below `max_broadcast_join_size` AND the probe side is large relative to the build
-/// (`estimated_probe_to_build_ratio >= num_gpus * 1.25`) — replicating a medium build avoids
-/// shuffling a much larger probe across GPUs.
+/// Broadcast candidacy (`broadcast_build_candidate`): a build is replicate-worthy when it is
+/// below the small-table threshold, OR when it is below `max_broadcast_join_size` AND the probe
+/// side is large relative to the build (`estimated_probe_to_build_ratio >= num_gpus * 1.25`) —
+/// replicating a medium build avoids shuffling a much larger probe across GPUs. A BUILD_PROBE
+/// candidate is broadcast. So is a STANDARD / MIXED_JOIN build that fits one partition on several
+/// GPUs, folds to one batch, and is neither right-family nor full outer: it keeps its mode, but
+/// one slot per GPU replaces the lone unpinned partition that would clone the build onto every
+/// task's GPU (#2200).
 ///
 /// `num_gpus` is `active_gpu_ids.size()` (1 when empty). Placement: a broadcast join puts one
 /// partition on each GPU; a single-partition BUILD_PROBE join goes to
 /// `select_gpu_subset(active_gpu_ids, 1, single_partition_rotation)`, so several small joins in one
-/// query spread across GPUs; a single STANDARD partition is unpinned, and multiple partitions
-/// use `round_robin` over `active_gpu_ids`. An empty
-/// `active_gpu_ids` yields unpinned placements.
+/// query spread across GPUs; a single STANDARD partition on one GPU is unpinned, and multiple
+/// partitions use `round_robin` over `active_gpu_ids`. An empty `active_gpu_ids` yields unpinned
+/// placements.
 [[nodiscard]] partition_strategy compute_hash_join_partition_strategy(
   uint64_t total_bytes,
   bool is_build_side,
@@ -464,8 +468,9 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   uint64_t _max_broadcast_join_size = config::DEFAULT_MAX_BROADCAST_JOIN_SIZE;
   // The GPU list lives on sirius_physical_partition_consumer_operator (set via set_active_gpu_ids).
 
-  // Broadcast (small build table) BUILD_PROBE join: the build side is replicated to every slot and
-  // the probe side is streamed unpartitioned.
+  // Broadcast (small build table) join: the build side is replicated to every slot and the probe
+  // side is streamed unpartitioned. BUILD_PROBE builds one hash table per slot; STANDARD /
+  // MIXED_JOIN pairs each slot's local build copy with the probe batches routed to it.
   bool _broadcast = false;
 
   bool _build_arrives_whole = false;

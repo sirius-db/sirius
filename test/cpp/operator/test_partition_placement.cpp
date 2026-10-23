@@ -191,23 +191,13 @@ TEST_CASE("stateless single-partition consumers leave task placement to locality
       sirius::logical_type::make(sirius::type_id::INTEGER),
       sirius::logical_type::make(sirius::type_id::BIGINT)};
   };
-  duckdb::LogicalComparisonJoin logical_join(duckdb::JoinType::INNER);
-  logical_join.types = {duckdb::LogicalType::INTEGER, duckdb::LogicalType::BIGINT};
-  auto child         = [&] {
-    return duckdb::make_uniq<sirius_physical_operator>(
-      SiriusPhysicalOperatorType::PROJECTION, types(), 0);
-  };
-  sirius_physical_nested_loop_join nlj(
-    logical_join, child(), child(), {}, duckdb::JoinType::INNER, 0);
   sirius_physical_grouped_aggregate_merge merge(types(), {}, {}, {}, {}, {}, false, false, 0);
   sirius_physical_dense_count_join dense(types(), 0, 0, 0, std::nullopt, 1024);
-  nlj.set_active_gpu_ids({3, 7});
   merge.set_active_gpu_ids({3, 7});
   dense.set_active_gpu_ids({3, 7});
   partition_sizing_input small{1024, false, false, 2048};
-  for (auto const& strategy : {nlj.get_partition_strategy(small),
-                               merge.get_partition_strategy(small),
-                               dense.get_partition_strategy(small)}) {
+  for (auto const& strategy :
+       {merge.get_partition_strategy(small), dense.get_partition_strategy(small)}) {
     REQUIRE(strategy.num_partitions == 1);
     REQUIRE_FALSE(strategy.broadcast);
     REQUIRE_FALSE(strategy.build_probe);
@@ -216,7 +206,7 @@ TEST_CASE("stateless single-partition consumers leave task placement to locality
     CHECK_FALSE(input.get_preferred_device_id().has_value());
   }
 
-  // Large inputs retain the existing distribution; NLJ always has one partition.
+  // Large inputs retain the existing distribution.
   partition_sizing_input large{24 * sirius::config::DEFAULT_HASH_PARTITION_BYTES,
                                false,
                                false,
@@ -225,5 +215,82 @@ TEST_CASE("stateless single-partition consumers leave task placement to locality
        {merge.get_partition_strategy(large), dense.get_partition_strategy(large)}) {
     REQUIRE(strategy.num_partitions > 1);
     CHECK(strategy.placement == partition_placement::round_robin(strategy.num_partitions, {3, 7}));
+  }
+}
+
+TEST_CASE("nested loop join replicates a small right side to every GPU",
+          "[partition_placement][nested_loop_join][broadcast][unit]")
+{
+  using namespace sirius::op;
+  auto types = [] {
+    return duckdb::vector<sirius::logical_type>{
+      sirius::logical_type::make(sirius::type_id::INTEGER),
+      sirius::logical_type::make(sirius::type_id::BIGINT)};
+  };
+  duckdb::LogicalComparisonJoin logical_join(duckdb::JoinType::INNER);
+  logical_join.types = {duckdb::LogicalType::INTEGER, duckdb::LogicalType::BIGINT};
+  auto child         = [&] {
+    return duckdb::make_uniq<sirius_physical_operator>(
+      SiriusPhysicalOperatorType::PROJECTION, types(), 0);
+  };
+  auto make_nlj = [&](duckdb::JoinType join_type) {
+    return std::make_unique<sirius_physical_nested_loop_join>(
+      logical_join, child(), child(), duckdb::vector<sirius::join_condition>{}, join_type, 0);
+  };
+  // The right side drives sizing, so the sizing input describes it.
+  partition_sizing_input right_side{};
+  right_side.total_bytes          = 1024;
+  right_side.is_build_side        = true;
+  right_side.combined_total_bytes = 2048;
+
+  // One slot per GPU; a lone unpinned partition would clone the right side onto every task's GPU.
+  for (auto join_type : {duckdb::JoinType::INNER,
+                         duckdb::JoinType::LEFT,
+                         duckdb::JoinType::SEMI,
+                         duckdb::JoinType::ANTI,
+                         duckdb::JoinType::MARK}) {
+    auto nlj = make_nlj(join_type);
+    nlj->set_active_gpu_ids({3, 7});
+    auto const strategy = nlj->get_partition_strategy(right_side);
+    REQUIRE(strategy.num_partitions == 2);
+    REQUIRE(strategy.broadcast);
+    REQUIRE_FALSE(strategy.build_probe);
+    CHECK(strategy.placement == partition_placement::one_per_device({3, 7}));
+    // Every task of a slot is pinned to that slot's GPU.
+    partitioned_operator_data input(no_batches(), 1, strategy.placement);
+    CHECK(input.get_preferred_device_id() == std::optional<int>{7});
+  }
+
+  // One GPU: a single partition placed by locality.
+  {
+    auto nlj = make_nlj(duckdb::JoinType::INNER);
+    nlj->set_active_gpu_ids({3});
+    auto const strategy = nlj->get_partition_strategy(right_side);
+    REQUIRE(strategy.num_partitions == 1);
+    REQUIRE_FALSE(strategy.broadcast);
+    CHECK_FALSE(strategy.placement.any_pinned());
+  }
+
+  // RIGHT and full OUTER emit unmatched right rows, which every replica would emit again.
+  for (auto join_type : {duckdb::JoinType::RIGHT, duckdb::JoinType::OUTER}) {
+    auto nlj = make_nlj(join_type);
+    nlj->set_active_gpu_ids({3, 7});
+    auto const strategy = nlj->get_partition_strategy(right_side);
+    REQUIRE(strategy.num_partitions == 1);
+    REQUIRE_FALSE(strategy.broadcast);
+    CHECK_FALSE(strategy.placement.any_pinned());
+  }
+
+  // A right side at the small-table threshold, with no estimate of a much larger left side,
+  // stays on one partition.
+  {
+    auto nlj = make_nlj(duckdb::JoinType::INNER);
+    nlj->set_active_gpu_ids({3, 7});
+    partition_sizing_input large = right_side;
+    large.total_bytes            = partition_small_table_bytes(2);
+    large.combined_total_bytes   = large.total_bytes;
+    auto const strategy          = nlj->get_partition_strategy(large);
+    REQUIRE(strategy.num_partitions == 1);
+    REQUIRE_FALSE(strategy.broadcast);
   }
 }
