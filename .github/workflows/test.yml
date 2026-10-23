@@ -139,6 +139,11 @@ jobs:
           pixi run -e ${{ matrix.cuda.pixi-environment }} cmake --build build/release \
             --target simpatico_cache_gpu_tests
 
+      - name: Build preparation allocation fault helper
+        run: |
+          pixi run -e ${{ matrix.cuda.pixi-environment }} cmake --build build/release \
+            --target sirius_host_allocation_fault
+
       - name: Package build artifacts
         run: tar -cf build.tar build/release/ sirius-duckdb/build/release/
 
@@ -234,6 +239,17 @@ jobs:
         run: |
           nvidia-smi
           python3 scripts/run_unit_tests.py --require-gpus 2 -- --abort
+
+      - name: Test preparation allocation failures
+        timeout-minutes: 5
+        env:
+          LD_PRELOAD: ${{ github.workspace }}/build/release/libsirius_host_allocation_fault.so
+          SIRIUS_TEST_LOG_DIR: ${{ github.workspace }}/build/release/test/cpp/log/preparation-faults
+        run: |
+          mkdir -p build/release/test/cpp/log/preparation-faults
+          build/release/test/cpp/sirius_unittest '[preparation_allocation_fault]' \
+            --reporter xml \
+            --out build/release/test/cpp/log/preparation-faults/results.xml
 
       - name: Iceberg conformance (correctness + connection liveness)
         timeout-minutes: 20

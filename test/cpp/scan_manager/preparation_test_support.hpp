@@ -15,12 +15,44 @@
  */
 
 #pragma once
+#include "scan_manager/preparation.hpp"
 #include "scan_manager/preparation_ledger.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <limits>
+#include <thread>
 
 namespace sirius::scan_manager::test {
+struct cleanup_observation {
+  explicit cleanup_observation(std::shared_ptr<preparation_gate> gate) : gate(std::move(gate)) {}
+  std::shared_ptr<preparation_gate> gate;
+  std::atomic<size_t> releases{0}, outside{0}, errors{0}, callbacks_seen{0};
+  std::function<void()> after_probe;
+  void release() noexcept
+  {
+    try {
+      // Never attempt recursive locking on the destruction thread.
+      std::thread probe([&] {
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{200};
+        do {
+          std::unique_lock lock(gate->mutex, std::try_to_lock);
+          if (lock.owns_lock()) {
+            ++outside;
+            callbacks_seen = gate->callbacks;
+            return;
+          }
+          std::this_thread::yield();
+        } while (std::chrono::steady_clock::now() < deadline);
+      });
+      probe.join();
+      if (after_probe) after_probe();
+    } catch (...) {
+      ++errors;
+    }
+    ++releases;
+  }
+};
 struct reservation_observation {
   std::atomic<uint64_t> outstanding{0}, requests{0}, allocations{0}, allocated_bytes{0};
   bool fail_allocation = false;
