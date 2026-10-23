@@ -293,7 +293,8 @@ std::unique_ptr<cudf::column> materialize_compressed(batch_source const& source,
 /// Buffers released from a column on another GPU. They stay alive here until
 /// the copies that read them have been ordered ahead of their frees.
 using retired_buffer  = std::variant<std::unique_ptr<rmm::device_buffer>,
-                                     std::unique_ptr<::cuda::device_buffer<std::byte>>>;
+                                     std::unique_ptr<::cuda::device_buffer<std::byte>>,
+                                     std::unique_ptr<::cuda::device_buffer<cudf::bitmask_type>>>;
 using retired_buffers = std::vector<retired_buffer>;
 
 /// What a remote gather allocated on the owning GPU: the gather map and, once
@@ -383,11 +384,15 @@ std::unique_ptr<Buffer> peer_copy(std::unique_ptr<Buffer> source,
                                   rmm::device_async_resource_ref mr,
                                   retired_buffers& retire)
 {
+  auto const elements = source ? source->size() : std::size_t{0};
+  auto bytes          = elements;
   if constexpr (!std::is_same_v<Buffer, rmm::device_buffer>) {
-    static_assert(std::is_same_v<typename Buffer::value_type, std::byte>,
-                  "peer_copy only supports the cudf null-mask byte buffer type");
+    static_assert(std::is_same_v<typename Buffer::value_type, std::byte> ||
+                    std::is_same_v<typename Buffer::value_type, cudf::bitmask_type>,
+                  "peer_copy only supports cudf null-mask buffer types");
+    // CUDA buffers allocate elements; peer transfers always count bytes.
+    bytes *= sizeof(typename Buffer::value_type);
   }
-  auto const bytes       = source ? source->size() : std::size_t{0};
   Buffer const* retained = nullptr;
   {
     rmm::cuda_set_device_raii const owner_guard{rmm::cuda_device_id{source_device}};
@@ -408,7 +413,7 @@ std::unique_ptr<Buffer> peer_copy(std::unique_ptr<Buffer> source,
     if constexpr (std::is_same_v<Buffer, rmm::device_buffer>) {
       return std::make_unique<Buffer>(bytes, stream, mr);
     } else {
-      return std::make_unique<Buffer>(stream, mr, bytes, ::cuda::no_init);
+      return std::make_unique<Buffer>(stream, mr, elements, ::cuda::no_init);
     }
   }();
   if (bytes > 0) {

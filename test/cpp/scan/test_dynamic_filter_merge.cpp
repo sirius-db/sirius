@@ -29,6 +29,7 @@
 // clang-format on
 #include "operator/operator_test_utils.hpp"
 #include "utils/host_allocation_fault.hpp"
+#include "utils/sirius_test_env.hpp"
 #include "utils/test_validation_utility.hpp"
 
 #include <cudf/column/column_factories.hpp>
@@ -3021,7 +3022,7 @@ std::unique_ptr<cucascade::memory::memory_space> make_space_naming_device(int de
 }
 }  // namespace
 
-TEST_CASE("consumer passes a batch on another device through without filtering or claims",
+TEST_CASE("consumer passes mismatched device inputs through without filtering or claims",
           "[dynamic_filter][scan_merge][consumer_device]")
 {
   ::cuda::stream_ref stream                = cudf::get_default_stream();
@@ -3096,6 +3097,69 @@ TEST_CASE("consumer passes a batch on another device through without filtering o
   REQUIRE(filter->requested_devices == std::vector<int>{current_device});
   consumer.commit(std::move(filtered));
   REQUIRE(stats.snapshot().applications_skipped_other_device == 1);
+}
+
+TEST_CASE("consumer passes a batch on another device through without filtering or claims",
+          "[dynamic_filter][scan_merge][consumer_device][multi_gpu]")
+{
+  if (!sirius::test::has_gpus(2)) { return; }
+  auto manager         = sirius::test::operator_utils::initialize_memory_manager(2);
+  auto* consumer_space = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  auto* source_space   = manager->get_memory_space(cucascade::memory::Tier::GPU, 1);
+  REQUIRE(consumer_space != nullptr);
+  REQUIRE(source_space != nullptr);
+
+  // Construct the remote representation with memory and a writer stream on its actual owner.
+  std::shared_ptr<cucascade::data_batch> remote;
+  {
+    rmm::cuda_set_device_raii const owner_guard{rmm::cuda_device_id{1}};
+    auto const owner_stream = source_space->acquire_stream();
+    remote                  = sirius::make_data_batch(
+      make_int64_sequence_table(10, owner_stream), *source_space, owner_stream, {});
+    owner_stream.sync();
+  }
+
+  rmm::cuda_set_device_raii const consumer_guard{rmm::cuda_device_id{0}};
+  auto const stream = consumer_space->acquire_stream();
+  auto const mr     = consumer_space->get_default_allocator();
+  auto input        = make_int64_sequence_table(10, stream);
+  auto channel      = std::make_shared<sirius_dynamic_filter_set>();
+  auto producer     = channel->register_producer({0});
+  auto filter       = std::make_shared<any_device_filter>(make_in_list_prefix(4, stream));
+  REQUIRE(producer.push_filter(0, filter));
+  sirius::op::dynamic_filter_stats stats;
+  dynamic_filter_consumer consumer(channel, {.stats = &stats}, {});
+  auto program = prepare_identity(consumer, input->view());
+  REQUIRE(program.has_value());
+  auto result =
+    consumer_test_access::apply(consumer, std::move(*program), remote->to_read_only(), stream, mr);
+  REQUIRE_FALSE(result.completed());
+  REQUIRE(result.take_output() == nullptr);
+  REQUIRE(result.prefix_counts().empty());
+  REQUIRE(filter->requested_devices.empty());
+  auto const storage = consumer_test_access::storage(result);
+  REQUIRE_FALSE(storage.completed);
+  REQUIRE_FALSE(storage.has_source);
+  auto receipt = consumer.finish(std::move(result), 1);
+  REQUIRE(receipt.endpoint == channel);
+  REQUIRE(receipt.original_batch_id == 1);
+  REQUIRE(receipt.applied.empty());
+  auto& gate = consumer_test_access::gate(consumer);
+  REQUIRE_FALSE(gate_test_access::filter_keep_ratio(gate, {filter.get(), 0}, 1).has_value());
+  REQUIRE(gate_test_access::needs_combined_sample(gate, channel->snapshot()));
+  REQUIRE(stats.snapshot().applications_skipped_other_device == 1);
+
+  auto local = prepare_identity(consumer, input->view());
+  REQUIRE(local.has_value());
+  auto batch = sirius::make_data_batch(std::move(input), *consumer_space, stream, {});
+  auto filtered =
+    consumer_test_access::apply(consumer, std::move(*local), batch->to_read_only(), stream, mr);
+  REQUIRE(filtered.completed());
+  REQUIRE(filtered.take_output()->num_rows() == 4);
+  REQUIRE(filter->requested_devices == std::vector<int>{0});
+  consumer.commit(std::move(filtered));
+  REQUIRE(stats.snapshot().applications_skipped_other_device == 1);
+  stream.sync();
 }
 
 TEST_CASE("consumer pass-through finishes with the prior receipt's history unchanged",

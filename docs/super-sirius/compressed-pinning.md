@@ -86,6 +86,16 @@ Rules of thumb:
   `scan_task_batch_size` of the *pinned subset*, so a narrow pin concentrates a column's
   chars in each batch.
 
+All newly written `.hpln` files use version 14, with either nvCOMP 5 or 6. Version 13
+introduced five-word bitpack decode guards; version 14 additionally records a payload-format
+identifier in each ANS and Cascaded leaf's metadata. These identifiers distinguish pre-v6
+and v6 nvCOMP payloads independently of future file-layout versions. Incompatible codec
+metadata and older file versions are rejected before fetching or decoding payloads.
+
+With nvCOMP 6, `nvcomp_cascaded` plans remain unavailable because the old configurable Cascaded
+options were removed. Its metadata field reserves the distinction needed to support the new
+Cascaded API later. nvCOMP 5 builds continue to support the existing Cascaded plans.
+
 ## Filtering while decompressing (experimental)
 
 A scan can hand its row filter to the decompressor instead of evaluating it afterwards. Where
