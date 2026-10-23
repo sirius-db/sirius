@@ -31,10 +31,11 @@
  * tier is stored Simpatico-compressed instead of raw, and decoded on its way back
  * to the GPU.
  *
- * Every column gets a plan chosen from its type alone (default_spill_plan). The
- * compressed form is kept only when it saves enough (max_compressed_fraction);
- * otherwise, and on any failure, the batch spills uncompressed exactly as it
- * would with the feature off. See convertible_data_batch::convert for the hook.
+ * Every column gets a plan chosen from its type and a prefix sample
+ * (default_spill_plan). The compressed form is kept only when it saves enough
+ * (max_compressed_fraction); otherwise, and on any failure, the batch spills
+ * uncompressed exactly as it would with the feature off. See
+ * convertible_data_batch::convert for the hook.
  */
 namespace sirius {
 struct compression_config;
@@ -71,10 +72,13 @@ void apply_spill_compression_config(compression_config const& config);
 [[nodiscard]] bool spill_compression_applies(std::size_t bytes);
 
 /**
- * @brief The plan a spilled column is compressed with, chosen from its type.
+ * @brief The plan a spilled column is compressed with, chosen from its type and a sample.
  *
  * Fixed-width columns (including decimals and chrono types) up to 8 GiB are bitpacked;
- * larger ones exceed bitpack's encode scratch and are stored as is. A string
+ * larger ones exceed bitpack's encode scratch and are stored as is. Integer-valued
+ * columns up to 64 bits (integers, decimals, chrono types) instead use delta -> bitpack
+ * or delta -> rle -> bitpack when a size estimate on a prefix sample says that saves at
+ * least 10%. A string
  * column of at least 4096 rows is dictionary-encoded, with bitpacked indices, when a
  * sample of it has few distinct values; otherwise it is split into ans-coded chars and
  * delta-bitpacked offsets. Shorter string columns and every other type are stored as is.
