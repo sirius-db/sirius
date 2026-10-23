@@ -229,8 +229,8 @@ class SharedMemAllocator {
 // ---------------------------------------------------------------------
 class Walker {
  public:
-  Walker(std::string dtype, std::int32_t num_chunks)
-    : dtype_(std::move(dtype)), num_chunks_(num_chunks)
+  Walker(std::string dtype, std::int32_t num_chunks, EncodeRenderMode mode)
+    : dtype_(std::move(dtype)), num_chunks_(num_chunks), mode_(mode)
   {
   }
 
@@ -252,6 +252,14 @@ class Walker {
   // ----------------- Accumulators -----------------
   std::string dtype_;
   std::int32_t num_chunks_;
+  EncodeRenderMode mode_;
+  // measure and pack follow one Bitpack's metadata from one launch to the next.
+  void require_full_mode(char const* op) const
+  {
+    if (mode_ != EncodeRenderMode::full) {
+      throw RenderError(std::string("render: measure/pack modes do not support ") + op);
+    }
+  }
   std::int32_t next_node_id_ = 0;
   std::ostringstream params_;  // post-(flat,n) params, joined with ",\n"
   std::ostringstream body_;    // kernel body lines
@@ -650,6 +658,7 @@ void Walker::emit_for(const ::codegen::jit::FusedTree& node, LaneInput in)
 // =====================================================================
 void Walker::emit_rle(const ::codegen::jit::FusedTree& node, LaneInput in)
 {
+  require_full_mode("Rle");
   if (node.children.size() != 2) {
     throw RenderError(
       "render: Rle must have exactly two children ('runs' and "
@@ -830,6 +839,7 @@ void Walker::emit_rle(const ::codegen::jit::FusedTree& node, LaneInput in)
 // =====================================================================
 void Walker::emit_raw(const ::codegen::jit::FusedTree& node, LaneInput in)
 {
+  require_full_mode("Raw");
   if (!node.children.empty()) {
     throw RenderError(
       "render: Raw must be a leaf (no children) — it is a "
@@ -1057,6 +1067,10 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
   add_param("uint8_t*", p_bits);
   add_param("uint32_t*", p_pkd);
   add_param("uint32_t*", p_lws);  // sharded live-word counter (16-shard)
+  const bool measure      = mode_ == EncodeRenderMode::measure;
+  const bool pack         = mode_ == EncodeRenderMode::pack;
+  const std::string p_off = "bp_offsets_" + idstr;
+  if (pack) { add_param("const int32_t*", p_off); }
 
   const std::size_t stride_words =
     static_cast<std::size_t>(::codegen::kChunkSize) * op_dt->elem_size / sizeof(std::uint32_t);
@@ -1080,6 +1094,9 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
              nc * stride_words,
              /*no_pre_zero=*/use_smem);
   add_buffer(id, "lw_shards", sizeof(std::uint32_t), kMaxBitsShards * kShardStride);
+  // pack: the dense word offset of each chunk, an input the caller scans from the measure
+  // pass's chunk_bits x chunk_count.
+  if (pack) { add_buffer(id, "bp_offsets", sizeof(std::int32_t), nc + 1, /*no_pre_zero=*/true); }
   // Note: no per-chunk live_words buffer — live_packed_bytes is derived
   // from lw_shards (DtoH only 2 KB instead of num_chunks×4 B).
   // compact_in_place() reconstructs per-chunk offsets from chunk_bits+chunk_count.
@@ -1102,47 +1119,59 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
         << "        constexpr " << in.elem_type << " " << emax << " = static_cast<" << in.elem_type
         << ">(" << op_dt->max_literal << ");\n"
         << "        uint32_t* " << dst << " = " << p_pkd
-        << " + static_cast<int64_t>(chunk_id) * static_cast<int64_t>(" << sw_var << ");\n"
+        << (pack ? " + " + p_off + "[chunk_id];\n"
+                 : " + static_cast<int64_t>(chunk_id) * static_cast<int64_t>(" + sw_var + ");\n")
         << "        const int32_t " << bp_len << " = static_cast<int32_t>(" << in.length_expr
         << ");\n"
         << "        if (" << bp_len << " <= 0) {\n"
-        << "            if (tid == 0) { " << p_min << "[chunk_id] = " << in.elem_type << "{0}; "
-        << p_cnt << "[chunk_id] = 0; " << p_bits << "[chunk_id] = 1; }\n"
+        << (pack ? std::string{}
+                 : "            if (tid == 0) { " + p_min + "[chunk_id] = " + in.elem_type +
+                     "{0}; " + p_cnt + "[chunk_id] = 0; " + p_bits + "[chunk_id] = 1; }\n")
         << "            break;\n"
-        << "        }\n"
-        // Pass 1: combined min+max in a single grid-stride loop.
-        << "        " << in.elem_type << " _lmin = " << emax << ";\n"
-        << "        " << in.elem_type << " _lmax = static_cast<" << in.elem_type << ">("
-        << op_dt->min_literal << ");\n"
-        << "        for (int32_t i = tid; i < " << bp_len << "; i += 128) {\n"
-        << "            " << in.elem_type << " _vi = (" << at_lane(in.read_expr, "i") << ");\n"
-        << "            if (_vi < _lmin) _lmin = _vi;\n"
-        << "            if (_vi > _lmax) _lmax = _vi;\n"
-        << "        }\n"
-        << "        typedef cub::BlockReduce<" << in.elem_type << ", 128> BR_" << idstr << ";\n"
-        << "        __shared__ typename BR_" << idstr << "::TempStorage br_ts_" << idstr << ";\n"
-        << "        __shared__ " << in.elem_type << " " << sh_min << "_b;\n"
-        << "        __shared__ " << in.elem_type << " " << sh_max << "_b;\n"
-        << "        { " << in.elem_type << " _m = BR_" << idstr << "(br_ts_" << idstr
-        << ").Reduce(_lmin, SimpaticoMin()); if (tid == 0) " << sh_min << "_b = _m; }\n"
-        << "        __syncthreads();\n"
-        << "        { " << in.elem_type << " _m = BR_" << idstr << "(br_ts_" << idstr
-        << ").Reduce(_lmax, SimpaticoMax()); if (tid == 0) " << sh_max << "_b = _m; }\n"
-        << "        __syncthreads();\n"
-        << "        const " << in.elem_type << " " << cmin << " = " << sh_min << "_b;\n"
-        << "        const " << bp_utype << " " << max_r << " = static_cast<" << bp_utype << ">("
-        << sh_max << "_b) - static_cast<" << bp_utype << ">(" << cmin << ");\n"
-        << "        const int32_t " << bits_v << " = " << bp_width_fn << "("
-        << "static_cast<" << bp_utype << ">(" << max_r << "));\n"
-        << "        if (tid == 0) {\n"
-        << "            " << p_min << "[chunk_id] = " << cmin << ";\n"
-        << "            " << p_cnt << "[chunk_id] = " << bp_len << ";\n"
-        << "            " << p_bits << "[chunk_id] = static_cast<uint8_t>(" << bits_v << ");\n"
-        << "            const uint32_t _pw = static_cast<uint32_t>((static_cast<int32_t>(" << bp_len
-        << ") * " << bits_v << " + 31) / 32);\n"
-        << "            atomicAdd(" << p_lws
-        << " + (static_cast<uint32_t>(chunk_id) & 15u) * 32u, _pw);\n"
         << "        }\n";
+  if (pack) {
+    // The measure pass already reduced this chunk; read its range back.
+    body_ << "        const " << in.elem_type << " " << cmin << " = " << p_min << "[chunk_id];\n"
+          << "        const int32_t " << bits_v << " = static_cast<int32_t>(" << p_bits
+          << "[chunk_id]);\n";
+  } else {
+    body_
+      // Pass 1: combined min+max in a single grid-stride loop.
+      << "        " << in.elem_type << " _lmin = " << emax << ";\n"
+      << "        " << in.elem_type << " _lmax = static_cast<" << in.elem_type << ">("
+      << op_dt->min_literal << ");\n"
+      << "        for (int32_t i = tid; i < " << bp_len << "; i += 128) {\n"
+      << "            " << in.elem_type << " _vi = (" << at_lane(in.read_expr, "i") << ");\n"
+      << "            if (_vi < _lmin) _lmin = _vi;\n"
+      << "            if (_vi > _lmax) _lmax = _vi;\n"
+      << "        }\n"
+      << "        typedef cub::BlockReduce<" << in.elem_type << ", 128> BR_" << idstr << ";\n"
+      << "        __shared__ typename BR_" << idstr << "::TempStorage br_ts_" << idstr << ";\n"
+      << "        __shared__ " << in.elem_type << " " << sh_min << "_b;\n"
+      << "        __shared__ " << in.elem_type << " " << sh_max << "_b;\n"
+      << "        { " << in.elem_type << " _m = BR_" << idstr << "(br_ts_" << idstr
+      << ").Reduce(_lmin, SimpaticoMin()); if (tid == 0) " << sh_min << "_b = _m; }\n"
+      << "        __syncthreads();\n"
+      << "        { " << in.elem_type << " _m = BR_" << idstr << "(br_ts_" << idstr
+      << ").Reduce(_lmax, SimpaticoMax()); if (tid == 0) " << sh_max << "_b = _m; }\n"
+      << "        __syncthreads();\n"
+      << "        const " << in.elem_type << " " << cmin << " = " << sh_min << "_b;\n"
+      << "        const " << bp_utype << " " << max_r << " = static_cast<" << bp_utype << ">("
+      << sh_max << "_b) - static_cast<" << bp_utype << ">(" << cmin << ");\n"
+      << "        const int32_t " << bits_v << " = " << bp_width_fn << "("
+      << "static_cast<" << bp_utype << ">(" << max_r << "));\n"
+      << "        if (tid == 0) {\n"
+      << "            " << p_min << "[chunk_id] = " << cmin << ";\n"
+      << "            " << p_cnt << "[chunk_id] = " << bp_len << ";\n"
+      << "            " << p_bits << "[chunk_id] = static_cast<uint8_t>(" << bits_v << ");\n"
+      << "            const uint32_t _pw = static_cast<uint32_t>((static_cast<int32_t>(" << bp_len
+      << ") * " << bits_v << " + 31) / 32);\n"
+      << "            atomicAdd(" << p_lws
+      << " + (static_cast<uint32_t>(chunk_id) & 15u) * 32u, _pw);\n"
+      << "        }\n";
+    // measure: the metadata and the live-word count are this mode's whole output.
+    if (measure) { body_ << "        break;\n"; }
+  }
 
   // Fast path: when bits_v equals the full element width (int8→8, int16→16,
   // int32→32) elements sit flush on 32-bit word boundaries, so we can do a
@@ -1246,7 +1275,8 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
 // =====================================================================
 EncodeKernelSpec render(const ::codegen::jit::FusedTree& tree,
                         const std::string& element_dtype,
-                        std::int32_t num_chunks)
+                        std::int32_t num_chunks,
+                        EncodeRenderMode mode)
 {
   if (element_dtype.empty()) { throw std::invalid_argument("render: element_dtype is empty"); }
   if (num_chunks < 1) {
@@ -1259,7 +1289,7 @@ EncodeKernelSpec render(const ::codegen::jit::FusedTree& tree,
                       "'.  Supported: int32_t, int64_t");
   }
 
-  Walker w(element_dtype, num_chunks);
+  Walker w(element_dtype, num_chunks, mode);
   return w.build(tree);
 }
 
