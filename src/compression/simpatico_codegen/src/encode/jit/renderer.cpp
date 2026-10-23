@@ -658,7 +658,6 @@ void Walker::emit_for(const ::codegen::jit::FusedTree& node, LaneInput in)
 // =====================================================================
 void Walker::emit_rle(const ::codegen::jit::FusedTree& node, LaneInput in)
 {
-  require_full_mode("Rle");
   if (node.children.size() != 2) {
     throw RenderError(
       "render: Rle must have exactly two children ('runs' and "
@@ -670,7 +669,15 @@ void Walker::emit_rle(const ::codegen::jit::FusedTree& node, LaneInput in)
   if (rit == node.children.end() || vit == node.children.end()) {
     throw RenderError("render: Rle missing 'runs' or 'values' child");
   }
-  const DtypeInfo* op_dt = lookup_dtype(in.elem_type);
+  // measure and pack follow each child Bitpack's metadata from one launch to the next, so
+  // both children must be Bitpack leaves (no Raw passthrough slots).
+  auto const bitpack_leaf = [](::codegen::jit::FusedTree const& child) {
+    return child.op == ::codegen::OpKind::Bitpack && child.children.empty();
+  };
+  if (!bitpack_leaf(*rit->second) || !bitpack_leaf(*vit->second)) { require_full_mode("Rle"); }
+  // pack: the launcher has already scanned the measure pass's run counts in place.
+  const bool write_offsets = mode_ != EncodeRenderMode::pack;
+  const DtypeInfo* op_dt   = lookup_dtype(in.elem_type);
   if (op_dt == nullptr) {
     throw RenderError("render: Rle op-local dtype '" + in.elem_type + "' not in dtype table");
   }
@@ -752,8 +759,9 @@ void Walker::emit_rle(const ::codegen::jit::FusedTree& node, LaneInput in)
         << "        if (tid == 0) {\n"
         << "            rle_snruns_" << idstr << " = total_runs;\n"
         << "            " << sh_startpos << "[total_runs] = rle_n;\n"
-        << "            " << p_offsets << "[chunk_id + 1] = total_runs;\n"
-        << "            if (chunk_id == 0) " << p_offsets << "[0] = 0;\n"
+        << (write_offsets ? "            " + p_offsets + "[chunk_id + 1] = total_runs;\n" +
+                              "            if (chunk_id == 0) " + p_offsets + "[0] = 0;\n"
+                          : std::string{})
         << "        }\n"
         << "        __syncthreads();\n"
         << "        " << v_nruns << " = rle_snruns_" << idstr << ";\n"
@@ -960,6 +968,7 @@ void Walker::emit_zigzag(const ::codegen::jit::FusedTree& node, LaneInput in)
   }
 
   // ---- Leaf mode: store the ZigZag-mapped stream to the `zigzag` channel.
+  require_full_mode("a Zigzag leaf");
   const std::int32_t id    = take_id();
   const std::string idstr  = std::to_string(id);
   const std::string p_data = "zigzag_" + idstr;

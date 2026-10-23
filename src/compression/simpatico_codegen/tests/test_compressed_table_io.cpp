@@ -903,8 +903,8 @@ void test_decimal128_bitpack_named_channels()
                    "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n");
 }
 
-// A Bitpack, optionally behind Delta, is measured and then packed straight into place.
-// Columns of several chunks with a partial last one round-trip, for every lane width.
+// Bitpack leaves behind Delta, Rle, For or Zigzag are measured and then packed straight into
+// place. Columns of several chunks with a partial last one round-trip, for every lane width.
 void test_measured_bitpack_roundtrip()
 {
   constexpr int rows = 10 * 1024 + 500;
@@ -916,11 +916,23 @@ void test_measured_bitpack_roundtrip()
     "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n",
     "input -> delta -> differences\n"
     "delta.differences -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n",
+    "input -> delta -> differences\n"
+    "delta.differences -> rle -> runs, values\n"
+    "delta.differences.runs -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
+    "delta.differences.values -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n",
+    "input -> rle -> runs, values\n"
+    "rle.runs -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
+    "rle.values -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n",
+    "input -> for -> deltas, references\n"
+    "for.deltas -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n",
+    "input -> zigzag -> zigzag\n"
+    "zigzag.zigzag -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n",
   };
   for (auto const& table : tables) {
     for (auto const& plan : plans) {
-      io_roundtrip("measured bitpack", table->view(), plan);
-      memory_roundtrip("measured bitpack", table->view(), plan);
+      auto const label = "measured bitpack: " + plan;
+      io_roundtrip(label.c_str(), table->view(), plan);
+      memory_roundtrip(label.c_str(), table->view(), plan);
     }
   }
 }

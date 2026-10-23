@@ -131,8 +131,10 @@ using ::codegen::jit::RenderError;
 //   pack    : read each chunk's chunk_min and chunk_bits back from a measure pass instead
 //             of reducing, and write its packed words at word offset bp_offsets[chunk] of
 //             a dense, pre-zeroed `packed`, which the caller sizes from the measure pass.
-// measure and pack support a single Bitpack, optionally behind Delta/For/Zigzag; other
-// trees throw RenderError.
+// measure and pack support Bitpack leaves behind Delta, For, transformer Zigzag and Rle (whose
+// children must then both be Bitpack leaves); in pack mode Rle leaves its run offsets, which
+// the caller scanned after the measure pass, untouched. Raw passthrough and a Zigzag leaf
+// throw RenderError.
 enum class EncodeRenderMode { full, measure, pack };
 
 // Render an EncodeKernelSpec for `tree` parametrised over `element_dtype`.
