@@ -69,6 +69,9 @@ class sirius_physical_exchange_source : public sirius_physical_operator {
   /// while @p lifecycle grants this query work; without one they stay in a private queue.
   void set_query_lifecycle(exec::query_lifecycle_registry& lifecycle);
 
+  /// Where to make the one empty batch handed on when the stream ends having brought nothing.
+  void set_memory_space(cucascade::memory::memory_space& gpu);
+
   /// Arrivals schedule this pipeline; the last sender's end re-checks whether it finished.
   void set_pipeline(std::shared_ptr<pipeline::sirius_pipeline> pipeline) override;
 

@@ -100,6 +100,12 @@ class sirius_physical_exchange_sink : public sirius_physical_operator {
   /// Sends each slice to its rank.
   void sink(const operator_data& input_data, ::cuda::stream_ref stream) override;
 
+  /// An empty table shaped like the batches this sink's input produced, or null before the first
+  /// one. A producer's batches can carry more columns than its declared types (a partial
+  /// aggregate's AVG travels as a sum and a count), so this, not the types, is what an empty batch
+  /// of the stream must look like.
+  [[nodiscard]] std::unique_ptr<cudf::table> empty_like_input() const;
+
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
     const input_stats& stats) const override;
 
@@ -119,6 +125,9 @@ class sirius_physical_exchange_sink : public sirius_physical_operator {
   exchange_spec _spec;
   std::mutex _boundaries_mutex;
   std::shared_ptr<cudf::table const> _boundaries;
+  mutable std::mutex _input_schema_mutex;
+  /// Empty, with the columns of the first input batch.
+  std::unique_ptr<cudf::table> _input_schema;
 };
 
 }  // namespace sirius::op

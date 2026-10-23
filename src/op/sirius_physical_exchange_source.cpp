@@ -17,10 +17,15 @@
 #include "op/sirius_physical_exchange_source.hpp"
 
 #include "creator/task_creator.hpp"
+#include "cudf/cudf_utils.hpp"
+#include "data/data_batch_utils.hpp"
 #include "exchange/exchange_service.hpp"
 #include "exec/query_lifecycle_registry.hpp"
+#include "op/sirius_physical_exchange_sink.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
+
+#include <rmm/cuda_device.hpp>
 
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
@@ -52,6 +57,10 @@ struct sirius_physical_exchange_source::state {
   std::set<exchange::rank_t> ended;
   std::exception_ptr error;
   std::weak_ptr<pipeline::sirius_pipeline> pipeline;
+  /// Where the empty batch of a stream that brought nothing is made; none: no empty batch.
+  cucascade::memory::memory_space* gpu = nullptr;
+  /// Whether a task has taken any batch from this source.
+  bool delivered = false;
 
   state(std::set<exchange::rank_t> s, bool o) : senders(std::move(s)), ordered(o) {}
 
@@ -62,6 +71,16 @@ struct sirius_physical_exchange_source::state {
   [[nodiscard]] bool unordered_empty() const
   {
     return queue.empty() && (repo == nullptr || repo->total_size() == 0);
+  }
+
+  /// Under mutex. The stream ended having brought nothing: one empty batch is still owed, as a
+  /// local producer would hand on, since operators such as a hash join wait for a batch per side.
+  /// Not on a rank a gather does not target (no senders): what it holds is not part of the result,
+  /// and an aggregate there would make a row of nothing.
+  [[nodiscard]] bool owes_empty_batch() const
+  {
+    return gpu != nullptr && !senders.empty() && !delivered && !error && all_ended() &&
+           unordered_empty() && held.empty();
   }
 
   /// Nominates the pipeline's head for a task, as STREAMING_SOURCE does on data.
@@ -167,6 +186,12 @@ void sirius_physical_exchange_source::set_query_lifecycle(exec::query_lifecycle_
   _state->lifecycle = &lifecycle;
 }
 
+void sirius_physical_exchange_source::set_memory_space(cucascade::memory::memory_space& gpu)
+{
+  std::lock_guard lock{_state->mutex};
+  _state->gpu = &gpu;
+}
+
 void sirius_physical_exchange_source::set_pipeline(
   std::shared_ptr<pipeline::sirius_pipeline> pipeline)
 {
@@ -222,8 +247,8 @@ std::optional<task_creation_hint> sirius_physical_exchange_source::get_next_task
   {
     std::lock_guard lock{_state->mutex};
     bind_repository();
-    bool const ready =
-      _state->error || !_state->unordered_empty() || (_state->all_ended() && !_state->held.empty());
+    bool const ready = _state->error || !_state->unordered_empty() ||
+                       (_state->all_ended() && !_state->held.empty()) || _state->owes_empty_batch();
     if (ready) { return task_creation_hint{TaskCreationHint::READY, this}; }
     finished = _state->all_ended();
   }
@@ -242,12 +267,14 @@ bool sirius_physical_exchange_source::all_ports_empty()
 {
   std::lock_guard lock{_state->mutex};
   bind_repository();
-  return !_state->error && _state->all_ended() && _state->unordered_empty() && _state->held.empty();
+  return !_state->error && _state->all_ended() && _state->unordered_empty() &&
+         _state->held.empty() && !_state->owes_empty_batch();
 }
 
 std::unique_ptr<operator_data> sirius_physical_exchange_source::get_next_task_input_data()
 {
   std::vector<std::shared_ptr<cucascade::data_batch>> batches;
+  cucascade::memory::memory_space* empty_on = nullptr;
   {
     std::lock_guard lock{_state->mutex};
     if (_state->error) { std::rethrow_exception(_state->error); }
@@ -262,7 +289,24 @@ std::unique_ptr<operator_data> sirius_physical_exchange_source::get_next_task_in
         batches.push_back(std::move(batch));
       }
       _state->held.clear();
+    } else if (_state->owes_empty_batch()) {
+      empty_on = _state->gpu;
     }
+    _state->delivered = _state->delivered || !batches.empty() || empty_on != nullptr;
+  }
+  if (empty_on != nullptr) {
+    rmm::cuda_set_device_raii const device{rmm::cuda_device_id{empty_on->get_device_id()}};
+    // Shaped like what this rank's own sink on the stream was given, which can differ from the
+    // declared types; the types only when that sink saw nothing.
+    auto const* sink =
+      children.empty() ? nullptr : dynamic_cast<sirius_physical_exchange_sink*>(children[0].get());
+    auto empty = sink != nullptr ? sink->empty_like_input() : nullptr;
+    if (!empty) {
+      empty = has_physical_overrides() ? make_empty_table(get_physical_types())
+                                       : make_empty_table(get_types());
+    }
+    batches.push_back(
+      make_data_batch(std::move(empty), *empty_on, cudf::get_default_stream(), batch_telemetry()));
   }
   if (batches.empty()) { return nullptr; }
   return std::make_unique<pipelineable_operator_data>(std::move(batches));

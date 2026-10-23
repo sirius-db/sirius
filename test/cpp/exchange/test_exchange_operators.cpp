@@ -345,6 +345,38 @@ TEST_CASE("an exchange source hints READY with data, waits while open, ends when
   CHECK_FALSE(source.get_next_task_hint().has_value());
 }
 
+TEST_CASE("a stream that brings nothing hands on one empty batch, unless nothing is sent to it",
+          "[exchange][operators]")
+{
+  ranks c(1);
+  sirius_physical_exchange_source source(key_value_types(), 0, c.all[0].service, 9, {0}, false);
+  source.set_memory_space(*env().gpu);
+  sirius_physical_exchange_source untargeted(key_value_types(), 0, c.all[0].service, 10, {}, false);
+  untargeted.set_memory_space(*env().gpu);
+  sirius_physical_exchange_sink sink(
+    key_value_types(), 0, c.all[0].service, 9, exchange_spec{.routing = mode::broadcast});
+  sink.finalize_operator();
+
+  auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds{30};
+  while (source.all_ports_empty() || !source.get_next_task_hint()) {
+    REQUIRE(std::chrono::steady_clock::now() < deadline);
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+  }
+  CHECK(source.get_next_task_hint()->hint == sirius::op::TaskCreationHint::READY);
+  auto data = source.get_next_task_input_data();
+  REQUIRE(data != nullptr);
+  auto const& batches = dynamic_cast<pipelineable_operator_data&>(*data).get_data_batches();
+  REQUIRE(batches.size() == 1);
+  auto const view = sirius::get_cudf_table_view(batches[0]->to_read_only());
+  CHECK(view.num_rows() == 0);
+  CHECK(view.num_columns() == 2);
+  CHECK(source.all_ports_empty());
+  CHECK(source.get_next_task_input_data() == nullptr);
+
+  CHECK(untargeted.all_ports_empty());
+  CHECK(untargeted.get_next_task_input_data() == nullptr);
+}
+
 TEST_CASE("an exchange source ends its pipeline under a merge of partial results",
           "[exchange][operators]")
 {
