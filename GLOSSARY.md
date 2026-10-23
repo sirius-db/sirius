@@ -29,7 +29,7 @@ A sub-expression within an Expression Tree that cannot be evaluated inline in GP
 _Avoid_: AST breaker, fallback node, cogwheel
 
 **Sink Consumer**:
-The terminal consumer at the root of a compiled `produce`/`consume` tree that defines how surviving Register Values exit GPU registers—such as writing 1-to-1 projected columns (`ProjectSink`), compacting filtered rows (`FilterSink`), or accumulating into tiered state (`AggregateSink`).
+The terminal consumer at the root of a compiled `produce`/`consume` tree that defines how surviving Register Values exit GPU registers--such as writing 1-to-1 projected columns (`ProjectSink`), compacting filtered rows (`FilterSink`), or accumulating into tiered state (`AggregateSink`).
 _Avoid_: Root operator, output writer, epilogue
 
 **Carrier Restoration**:

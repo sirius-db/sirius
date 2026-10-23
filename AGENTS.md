@@ -92,4 +92,3 @@ GitHub Issues on the personal fork (`kevkrist/sirius`). See `docs/agents/issue-t
 ### Domain docs
 
 Single-context (`GLOSSARY.md` at repo root and `docs/adr/`). See `docs/agents/domain.md`.
-

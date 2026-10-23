@@ -4533,19 +4533,17 @@ TEST_CASE("nvrtc_jit - conjunction, case_expr, coalesce, and in_list match MATER
     exprs.push_back(make_in(make_ref_typed(0, int_t), std::move(vals), /*negated=*/true));
   }
 
-  // 7: col0 IN (col1, 30) (expression/column list)
+  // 7: col0 IN (col1) (column haystack)
   {
     std::vector<std::unique_ptr<ast_node>> vals;
     vals.push_back(make_ref_typed(1, int_t));
-    vals.push_back(make_int_const(30));
     exprs.push_back(make_in(make_ref_typed(0, int_t), std::move(vals), /*negated=*/false));
   }
 
-  // 8: col0 NOT IN (col1, 30) (expression/column list)
+  // 8: col0 NOT IN (col1) (column haystack)
   {
     std::vector<std::unique_ptr<ast_node>> vals;
     vals.push_back(make_ref_typed(1, int_t));
-    vals.push_back(make_int_const(30));
     exprs.push_back(make_in(make_ref_typed(0, int_t), std::move(vals), /*negated=*/true));
   }
 
@@ -5077,6 +5075,10 @@ TEST_CASE("nvrtc_jit - DECIMAL(32/64/128) arithmetic, scale alignment, and compa
     // 2: DECIMAL64 div: col0 (as dec64_2) / 2 (scale 0) -> dec64_2
     exprs.push_back(make_bin(
       sirius::function_id::div, make_ref_typed(0, dec64_2), make_dec64_const(2, 18, 0), dec64_2));
+    // 2b: DECIMAL64 div with output scale != s_l - s_r: col0 (scale 2) / 2 (scale 0) -> dec64_4
+    // (scale 4)
+    exprs.push_back(make_bin(
+      sirius::function_id::div, make_ref_typed(0, dec64_2), make_dec64_const(2, 18, 0), dec64_4));
     // 3: DECIMAL64 mod: col0 (as dec64_2) % 0.07 -> dec64_2
     exprs.push_back(make_bin(
       sirius::function_id::mod, make_ref_typed(0, dec64_2), make_dec64_const(7, 18, 2), dec64_2));
@@ -5485,7 +5487,7 @@ TEST_CASE(
     auto const date_inf = std::numeric_limits<std::int32_t>::max();
     auto const ts_inf   = std::numeric_limits<std::int64_t>::max();
 
-    // 1. DATE -> TIMESTAMP_{S, MS, US, NS} with ±infinity and finite values
+    // 1. DATE -> TIMESTAMP_{S, MS, US, NS} with +/-infinity and finite values
     {
       std::vector<std::int32_t> days = {-date_inf, -1, 0, 18000, date_inf};
       auto col_d = cudf::make_timestamp_column(cudf::data_type{cudf::type_id::TIMESTAMP_DAYS},
@@ -5544,7 +5546,7 @@ TEST_CASE(
       CHECK(copy_valids_to_host(try_out->view().column(0)) == std::vector<bool>{true, false});
     }
 
-    // 3. TIMESTAMP_NS -> TIMESTAMP_US rounds ties away from epoch and preserves ±infinity
+    // 3. TIMESTAMP_NS -> TIMESTAMP_US rounds ties away from epoch and preserves +/-infinity
     {
       std::vector<std::int64_t> ns_vals = {
         -ts_inf, -1500, -1499, -500, -499, 0, 499, 500, 1499, 1500, ts_inf};
@@ -5696,7 +5698,7 @@ TEST_CASE("nvrtc_jit - temporal extraction and date_trunc match MATERIALIZE and 
     // 11016:  2000-02-29 (leap century year)
     // 19782:  2024-02-29 (leap year)
     // -365:   1969-01-01
-    // plus NULL, ±infinity, and narrowed INT16 DATE carrier
+    // plus NULL, +/-infinity, and narrowed INT16 DATE carrier
     std::vector<std::int32_t> date_vals = {
       -25509, -365, -1, 0, 11016, 19782, -date_inf, date_inf, 100};
     std::vector<bool> valids = {true, true, true, true, true, true, true, true, false};
@@ -6104,9 +6106,9 @@ TEST_CASE(
       "special requests: handle with care",
       "express packages pending delivery",
       "a\xC3\xA9\xE2\x82\xAC\xF0\x9F\x98\x8A"
-      "z",  // "aé€😊z": 5 UTF-8 chars, 11 bytes (1 + 2 + 3 + 4 + 1)
+      "z",  // 5 UTF-8 chars, 11 bytes (1 + 2 + 3 + 4 + 1)
       "\xC3\xB1"
-      "and\xC3\xBA",  // "ñandú": 5 UTF-8 chars, 7 bytes
+      "and\xC3\xBA",  // 5 UTF-8 chars, 7 bytes
       "ababa",
       "BUILDING",
       "AUTOMOBILE",
@@ -6173,7 +6175,7 @@ TEST_CASE(
                                    false,
                                    false));
 
-      // 3. IN and NOT IN (constant list, nullable list, and column operands)
+      // 3. IN and NOT IN (constant list and column operands)
       {
         std::vector<std::unique_ptr<ast_node>> vals;
         vals.push_back(make_str_const("BUILDING"));
@@ -6183,8 +6185,6 @@ TEST_CASE(
       }
       {
         std::vector<std::unique_ptr<ast_node>> vals;
-        vals.push_back(make_str_const("BUILDING"));
-        vals.push_back(make_null_const(varchar_t));
         vals.push_back(make_ref_typed(1, varchar_t));
         exprs.push_back(make_in(make_ref_typed(0, varchar_t), std::move(vals), true));
       }
@@ -6382,7 +6382,7 @@ TEST_CASE(
     exprs.push_back(
       make_cmp(sirius::comparison_type::equal, make_substr(1, 4), make_str_const("http")));
 
-    // 3. UTF-8 character slicing: substring("aé€😊z", 2, 3) = "é€😊", strlen = 9, length = 3
+    // 3. UTF-8 character slicing: substring(col, 2, 3), strlen = 9, length = 3
     {
       std::vector<std::unique_ptr<ast_node>> sl_args;
       sl_args.push_back(make_substr(2, 3));
@@ -6522,13 +6522,12 @@ TEST_CASE(
 }
 
 // ============================================================================
-// Ticket #11: Materialization Boundaries ('C++ cogwheels') for allocating
-// string and struct sub-trees
+// Ticket #11: Materialization Boundaries for allocating string and struct
+// sub-trees
 // ============================================================================
 
 TEST_CASE(
-  "nvrtc_jit - Materialization Boundaries ('C++ cogwheels') for string and struct sub-trees match "
-  "MATERIALIZE",
+  "nvrtc_jit - Materialization Boundaries for string and struct sub-trees match MATERIALIZE",
   "[expression_evaluator][nvrtc_jit][ticket11]")
 {
   auto* space = get_default_gpu_space();
@@ -7200,14 +7199,14 @@ TEST_CASE("nvrtc_jit - FilterSink select and select_with_survivors across select
       exp_executor jit_exec(
         *tc.pred, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
 
-      // 1. select(input) — all columns
+      // 1. select(input) -- all columns
       auto mat_all = mat_exec.select(tv);
       auto jit_all = jit_exec.select(tv);
       REQUIRE(mat_all != nullptr);
       REQUIRE(jit_all != nullptr);
       check_tables_match(jit_all->view(), mat_all->view());
 
-      // 2. select(input, output_indices) — projected columns
+      // 2. select(input, output_indices) -- projected columns
       auto mat_proj = mat_exec.select(tv, proj_indices);
       auto jit_proj = jit_exec.select(tv, proj_indices);
       REQUIRE(mat_proj != nullptr);

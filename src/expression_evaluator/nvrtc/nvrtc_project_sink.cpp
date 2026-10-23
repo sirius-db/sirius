@@ -585,6 +585,47 @@ namespace {
   return false;
 }
 
+template <typename Fn>
+void for_each_child_node(sirius::ast::node const& expr, Fn&& fn)
+{
+  std::visit(
+    [&](auto const& alt) {
+      using T = std::decay_t<decltype(alt)>;
+      if constexpr (std::is_same_v<T, sirius::ast::comparison>) {
+        if (alt.left) { fn(*alt.left); }
+        if (alt.right) { fn(*alt.right); }
+      } else if constexpr (std::is_same_v<T, sirius::ast::between>) {
+        if (alt.input) { fn(*alt.input); }
+        if (alt.lower) { fn(*alt.lower); }
+        if (alt.upper) { fn(*alt.upper); }
+      } else if constexpr (std::is_same_v<T, sirius::ast::conjunction> ||
+                           std::is_same_v<T, sirius::ast::coalesce>) {
+        for (auto const& ch : alt.children) {
+          if (ch) { fn(*ch); }
+        }
+      } else if constexpr (std::is_same_v<T, sirius::ast::case_expr>) {
+        for (auto const& c : alt.cases) {
+          if (c.when_) { fn(*c.when_); }
+          if (c.then_) { fn(*c.then_); }
+        }
+        if (alt.else_) { fn(*alt.else_); }
+      } else if constexpr (std::is_same_v<T, sirius::ast::in_list>) {
+        if (alt.probe) { fn(*alt.probe); }
+        for (auto const& v : alt.values) {
+          if (v) { fn(*v); }
+        }
+      } else if constexpr (std::is_same_v<T, sirius::ast::cast> ||
+                           std::is_same_v<T, sirius::ast::unary_op>) {
+        if (alt.child) { fn(*alt.child); }
+      } else if constexpr (std::is_same_v<T, sirius::ast::function_call>) {
+        for (auto const& arg : alt.arguments()) {
+          if (arg) { fn(*arg); }
+        }
+      }
+    },
+    expr.v);
+}
+
 void collect_boundaries_from_node(sirius::ast::node const& expr,
                                   cudf::table_view const& input,
                                   std::vector<sirius::ast::node const*>& out_boundaries)
@@ -596,64 +637,9 @@ void collect_boundaries_from_node(sirius::ast::node const& expr,
     return;
   }
 
-  if (expr.holds<sirius::ast::comparison>()) {
-    auto const& cmp = expr.get<sirius::ast::comparison>();
-    if (cmp.left) { collect_boundaries_from_node(*cmp.left, input, out_boundaries); }
-    if (cmp.right) { collect_boundaries_from_node(*cmp.right, input, out_boundaries); }
-    return;
-  }
-  if (expr.holds<sirius::ast::between>()) {
-    auto const& btw = expr.get<sirius::ast::between>();
-    if (btw.input) { collect_boundaries_from_node(*btw.input, input, out_boundaries); }
-    if (btw.lower) { collect_boundaries_from_node(*btw.lower, input, out_boundaries); }
-    if (btw.upper) { collect_boundaries_from_node(*btw.upper, input, out_boundaries); }
-    return;
-  }
-  if (expr.holds<sirius::ast::conjunction>()) {
-    for (auto const& ch : expr.get<sirius::ast::conjunction>().children) {
-      if (ch) { collect_boundaries_from_node(*ch, input, out_boundaries); }
-    }
-    return;
-  }
-  if (expr.holds<sirius::ast::case_expr>()) {
-    auto const& ce = expr.get<sirius::ast::case_expr>();
-    for (auto const& c : ce.cases) {
-      if (c.when_) { collect_boundaries_from_node(*c.when_, input, out_boundaries); }
-      if (c.then_) { collect_boundaries_from_node(*c.then_, input, out_boundaries); }
-    }
-    if (ce.else_) { collect_boundaries_from_node(*ce.else_, input, out_boundaries); }
-    return;
-  }
-  if (expr.holds<sirius::ast::coalesce>()) {
-    for (auto const& ch : expr.get<sirius::ast::coalesce>().children) {
-      if (ch) { collect_boundaries_from_node(*ch, input, out_boundaries); }
-    }
-    return;
-  }
-  if (expr.holds<sirius::ast::in_list>()) {
-    auto const& inl = expr.get<sirius::ast::in_list>();
-    if (inl.probe) { collect_boundaries_from_node(*inl.probe, input, out_boundaries); }
-    for (auto const& v : inl.values) {
-      if (v) { collect_boundaries_from_node(*v, input, out_boundaries); }
-    }
-    return;
-  }
-  if (expr.holds<sirius::ast::cast>()) {
-    auto const& cst = expr.get<sirius::ast::cast>();
-    if (cst.child) { collect_boundaries_from_node(*cst.child, input, out_boundaries); }
-    return;
-  }
-  if (expr.holds<sirius::ast::unary_op>()) {
-    auto const& uo = expr.get<sirius::ast::unary_op>();
-    if (uo.child) { collect_boundaries_from_node(*uo.child, input, out_boundaries); }
-    return;
-  }
-  if (expr.holds<sirius::ast::function_call>()) {
-    for (auto const& arg : expr.get<sirius::ast::function_call>().arguments()) {
-      if (arg) { collect_boundaries_from_node(*arg, input, out_boundaries); }
-    }
-    return;
-  }
+  for_each_child_node(expr, [&](sirius::ast::node const& child) {
+    collect_boundaries_from_node(child, input, out_boundaries);
+  });
 }
 
 [[nodiscard]] cudf::data_type resolve_output_cudf_type(sirius::ast::node const& expr,
@@ -834,60 +820,44 @@ void populate_constant_param(scalar_constant_binding const& binding,
   }
 }
 
-[[nodiscard]] void const* get_input_data_ptr(cudf::column_view const& col)
+template <typename ColViewT>
+[[nodiscard]] auto get_column_data_ptr(ColViewT& col)
+  -> std::conditional_t<std::is_const_v<ColViewT>, void const*, void*>
 {
   switch (col.type().id()) {
-    case cudf::type_id::INT8: return col.data<std::int8_t>();
-    case cudf::type_id::INT16: return col.data<std::int16_t>();
-    case cudf::type_id::INT32: return col.data<std::int32_t>();
-    case cudf::type_id::INT64: return col.data<std::int64_t>();
-    case cudf::type_id::UINT8: return col.data<std::uint8_t>();
-    case cudf::type_id::UINT16: return col.data<std::uint16_t>();
-    case cudf::type_id::UINT32: return col.data<std::uint32_t>();
-    case cudf::type_id::UINT64: return col.data<std::uint64_t>();
-    case cudf::type_id::FLOAT32: return col.data<float>();
-    case cudf::type_id::FLOAT64: return col.data<double>();
-    case cudf::type_id::BOOL8: return col.data<bool>();
-    case cudf::type_id::TIMESTAMP_DAYS: return col.data<std::int32_t>();
+    case cudf::type_id::INT8: return col.template data<std::int8_t>();
+    case cudf::type_id::INT16: return col.template data<std::int16_t>();
+    case cudf::type_id::INT32: return col.template data<std::int32_t>();
+    case cudf::type_id::INT64: return col.template data<std::int64_t>();
+    case cudf::type_id::UINT8: return col.template data<std::uint8_t>();
+    case cudf::type_id::UINT16: return col.template data<std::uint16_t>();
+    case cudf::type_id::UINT32: return col.template data<std::uint32_t>();
+    case cudf::type_id::UINT64: return col.template data<std::uint64_t>();
+    case cudf::type_id::FLOAT32: return col.template data<float>();
+    case cudf::type_id::FLOAT64: return col.template data<double>();
+    case cudf::type_id::BOOL8: return col.template data<bool>();
+    case cudf::type_id::TIMESTAMP_DAYS: return col.template data<std::int32_t>();
     case cudf::type_id::TIMESTAMP_SECONDS:
     case cudf::type_id::TIMESTAMP_MILLISECONDS:
     case cudf::type_id::TIMESTAMP_MICROSECONDS:
-    case cudf::type_id::TIMESTAMP_NANOSECONDS: return col.data<std::int64_t>();
-    case cudf::type_id::DECIMAL32: return col.data<std::int32_t>();
-    case cudf::type_id::DECIMAL64: return col.data<std::int64_t>();
-    case cudf::type_id::DECIMAL128: return col.data<__int128_t>();
+    case cudf::type_id::TIMESTAMP_NANOSECONDS: return col.template data<std::int64_t>();
+    case cudf::type_id::DECIMAL32: return col.template data<std::int32_t>();
+    case cudf::type_id::DECIMAL64: return col.template data<std::int64_t>();
+    case cudf::type_id::DECIMAL128: return col.template data<__int128_t>();
     default:
-      throw not_implemented_exception("[nvrtc] Unsupported input column type: {}",
+      throw not_implemented_exception("[nvrtc] Unsupported column type: {}",
                                       cudf::type_to_name(col.type()));
   }
 }
 
+[[nodiscard]] void const* get_input_data_ptr(cudf::column_view const& col)
+{
+  return get_column_data_ptr(col);
+}
+
 [[nodiscard]] void* get_output_data_ptr(cudf::mutable_column_view& col)
 {
-  switch (col.type().id()) {
-    case cudf::type_id::INT8: return col.data<std::int8_t>();
-    case cudf::type_id::INT16: return col.data<std::int16_t>();
-    case cudf::type_id::INT32: return col.data<std::int32_t>();
-    case cudf::type_id::INT64: return col.data<std::int64_t>();
-    case cudf::type_id::UINT8: return col.data<std::uint8_t>();
-    case cudf::type_id::UINT16: return col.data<std::uint16_t>();
-    case cudf::type_id::UINT32: return col.data<std::uint32_t>();
-    case cudf::type_id::UINT64: return col.data<std::uint64_t>();
-    case cudf::type_id::FLOAT32: return col.data<float>();
-    case cudf::type_id::FLOAT64: return col.data<double>();
-    case cudf::type_id::BOOL8: return col.data<bool>();
-    case cudf::type_id::TIMESTAMP_DAYS: return col.data<std::int32_t>();
-    case cudf::type_id::TIMESTAMP_SECONDS:
-    case cudf::type_id::TIMESTAMP_MILLISECONDS:
-    case cudf::type_id::TIMESTAMP_MICROSECONDS:
-    case cudf::type_id::TIMESTAMP_NANOSECONDS: return col.data<std::int64_t>();
-    case cudf::type_id::DECIMAL32: return col.data<std::int32_t>();
-    case cudf::type_id::DECIMAL64: return col.data<std::int64_t>();
-    case cudf::type_id::DECIMAL128: return col.data<__int128_t>();
-    default:
-      throw not_implemented_exception("[nvrtc] Unsupported output column type: {}",
-                                      cudf::type_to_name(col.type()));
-  }
+  return get_column_data_ptr(col);
 }
 
 }  // namespace
@@ -1755,8 +1725,13 @@ register_value translation_context::produce_function_call(sirius::ast::function_
         emit_line("reg_val<" + type_str + "> " + var_name + " = eval_dec_mul<" + type_str + ">(" +
                   lhs.var_name + ", " + rhs.var_name + ");");
       } else if (fid == sirius::function_id::div || fid == sirius::function_id::int_div) {
-        emit_line("reg_val<" + type_str + "> " + var_name + " = eval_dec_div<" + type_str + ">(" +
-                  lhs.var_name + ", " + rhs.var_name + ");");
+        int const s_out     = sql_decimal_scale(ret_type);
+        int const s_diff    = s_out - (s_l - s_r);
+        auto const f_out    = format_int128_pow10(std::abs(s_diff));
+        bool const scale_up = (s_diff >= 0);
+        emit_line("reg_val<" + type_str + "> " + var_name + " = eval_dec_div<" + type_str + ", " +
+                  (scale_up ? "true" : "false") + ">(" + lhs.var_name + ", " + rhs.var_name + ", " +
+                  f_out + ");");
       } else {
         int const s_max = std::max(s_l, s_r);
         auto const f_l  = format_int128_pow10(s_max - s_l);
@@ -2020,38 +1995,37 @@ register_value translation_context::produce(sirius::ast::node const& expr)
       return produce_reference(syn_ref);
     }
   }
-  if (expr.holds<sirius::ast::reference>()) {
-    return produce_reference(expr.get<sirius::ast::reference>());
-  }
-  if (expr.holds<sirius::ast::constant>()) {
-    return produce_constant(expr.get<sirius::ast::constant>());
-  }
-  if (expr.holds<sirius::ast::comparison>()) {
-    return produce_comparison(expr.get<sirius::ast::comparison>());
-  }
-  if (expr.holds<sirius::ast::conjunction>()) {
-    return produce_conjunction(expr.get<sirius::ast::conjunction>());
-  }
-  if (expr.holds<sirius::ast::between>()) {
-    return produce_between(expr.get<sirius::ast::between>());
-  }
-  if (expr.holds<sirius::ast::case_expr>()) {
-    return produce_case_expr(expr.get<sirius::ast::case_expr>());
-  }
-  if (expr.holds<sirius::ast::coalesce>()) {
-    return produce_coalesce(expr.get<sirius::ast::coalesce>());
-  }
-  if (expr.holds<sirius::ast::in_list>()) {
-    return produce_in_list(expr.get<sirius::ast::in_list>());
-  }
-  if (expr.holds<sirius::ast::cast>()) { return produce_cast(expr.get<sirius::ast::cast>()); }
-  if (expr.holds<sirius::ast::unary_op>()) {
-    return produce_unary_op(expr.get<sirius::ast::unary_op>());
-  }
-  if (expr.holds<sirius::ast::function_call>()) {
-    return produce_function_call(expr.get<sirius::ast::function_call>());
-  }
-  throw not_implemented_exception("[nvrtc] Unsupported AST node in translation_context::produce");
+  return std::visit(
+    [this](auto const& alt) -> register_value {
+      using T = std::decay_t<decltype(alt)>;
+      if constexpr (std::is_same_v<T, sirius::ast::reference>) {
+        return produce_reference(alt);
+      } else if constexpr (std::is_same_v<T, sirius::ast::constant>) {
+        return produce_constant(alt);
+      } else if constexpr (std::is_same_v<T, sirius::ast::comparison>) {
+        return produce_comparison(alt);
+      } else if constexpr (std::is_same_v<T, sirius::ast::conjunction>) {
+        return produce_conjunction(alt);
+      } else if constexpr (std::is_same_v<T, sirius::ast::between>) {
+        return produce_between(alt);
+      } else if constexpr (std::is_same_v<T, sirius::ast::case_expr>) {
+        return produce_case_expr(alt);
+      } else if constexpr (std::is_same_v<T, sirius::ast::coalesce>) {
+        return produce_coalesce(alt);
+      } else if constexpr (std::is_same_v<T, sirius::ast::in_list>) {
+        return produce_in_list(alt);
+      } else if constexpr (std::is_same_v<T, sirius::ast::cast>) {
+        return produce_cast(alt);
+      } else if constexpr (std::is_same_v<T, sirius::ast::unary_op>) {
+        return produce_unary_op(alt);
+      } else if constexpr (std::is_same_v<T, sirius::ast::function_call>) {
+        return produce_function_call(alt);
+      } else {
+        throw not_implemented_exception(
+          "[nvrtc] Unsupported AST node in translation_context::produce");
+      }
+    },
+    expr.v);
 }
 
 void collect_materialization_boundaries(std::span<sirius::ast::node const* const> expressions,
@@ -2187,6 +2161,57 @@ void emit_nvrtc_device_runtime_preamble(std::ostringstream& src)
     << "  }\n"
     << "  return reg_val<bool>{true, true, false};\n"
     << "}\n\n"
+    << "__device__ __forceinline__ uint64_t swar_byte_eq_mask(uint64_t x, uint64_t bcast) {\n"
+    << "  uint64_t const v = x ^ bcast;\n"
+    << "  return (v - 0x0101010101010101ULL) & ~v & 0x8080808080808080ULL;\n"
+    << "}\n\n"
+    << "__device__ __forceinline__ uint64_t load_aligned_str_word(\n"
+    << "    char const* base_ptr, int32_t total_len, int32_t byte_pos) {\n"
+    << "  if (byte_pos >= total_len) { return 0ULL; }\n"
+    << "  uintptr_t const addr = reinterpret_cast<uintptr_t>(base_ptr + byte_pos);\n"
+    << "  if ((addr & 7u) == 0u && (total_len - byte_pos) >= 8) {\n"
+    << "    return *reinterpret_cast<uint64_t const*>(addr);\n"
+    << "  }\n"
+    << "  uintptr_t const aligned_addr = addr & ~static_cast<uintptr_t>(7u);\n"
+    << "  int32_t const shift = static_cast<int32_t>(addr & 7u) << 3;\n"
+    << "  uintptr_t const end_addr = reinterpret_cast<uintptr_t>(base_ptr + total_len);\n"
+    << "  if (aligned_addr + 8u <= end_addr) {\n"
+    << "    uint64_t const lo = *reinterpret_cast<uint64_t const*>(aligned_addr);\n"
+    << "    if (shift == 0) { return lo; }\n"
+    << "    if (aligned_addr + 16u <= end_addr) {\n"
+    << "      uint64_t const hi = *reinterpret_cast<uint64_t const*>(aligned_addr + 8u);\n"
+    << "      return (lo >> shift) | (hi << (64 - shift));\n"
+    << "    }\n"
+    << "  }\n"
+    << "  uint64_t val = 0ULL;\n"
+    << "  int32_t const rem = (total_len - byte_pos) < 8 ? (total_len - byte_pos) : 8;\n"
+    << "  for (int32_t i = 0; i < rem; ++i) {\n"
+    << "    val |= static_cast<uint64_t>(static_cast<uint8_t>(base_ptr[byte_pos + i])) << (i << "
+       "3);\n"
+    << "  }\n"
+    << "  return val;\n"
+    << "}\n\n"
+    << "__device__ __forceinline__ int32_t find_byte_swar(\n"
+    << "    char const* s, int32_t slen, int32_t start, char target) {\n"
+    << "  if (start >= slen) { return slen; }\n"
+    << "  uint64_t const bcast = 0x0101010101010101ULL * static_cast<uint8_t>(target);\n"
+    << "  int32_t pos = start;\n"
+    << "  while (pos + 8 <= slen) {\n"
+    << "    uint64_t const w = load_aligned_str_word(s, slen, pos);\n"
+    << "    uint64_t cand = swar_byte_eq_mask(w, bcast);\n"
+    << "    while (cand != 0ULL) {\n"
+    << "      int32_t const lane = (__ffsll(static_cast<long long>(cand)) - 1) >> 3;\n"
+    << "      cand &= (cand - 1ULL);\n"
+    << "      if (s[pos + lane] == target) { return pos + lane; }\n"
+    << "    }\n"
+    << "    pos += 8;\n"
+    << "  }\n"
+    << "  while (pos < slen) {\n"
+    << "    if (s[pos] == target) { return pos; }\n"
+    << "    ++pos;\n"
+    << "  }\n"
+    << "  return slen;\n"
+    << "}\n\n"
     << "__device__ __forceinline__ reg_val<bool> eval_contains(reg_val<str_view> s, "
        "reg_val<str_view> pat) {\n"
     << "  bool const ovf = s.overflow || pat.overflow;\n"
@@ -2197,14 +2222,24 @@ void emit_nvrtc_device_runtime_preamble(std::ostringstream& src)
     << "  char const first = pat.val.ptr[0];\n"
     << "  char const last = pat.val.ptr[pat.val.len - 1];\n"
     << "  int32_t const limit = s.val.len - pat.val.len;\n"
-    << "  for (int32_t i = 0; i <= limit; ++i) {\n"
-    << "    if (s.val.ptr[i] == first && s.val.ptr[i + pat.val.len - 1] == last) {\n"
+    << "  int32_t i = find_byte_swar(s.val.ptr, limit + 1, 0, first);\n"
+    << "  while (i <= limit) {\n"
+    << "    if (s.val.ptr[i + pat.val.len - 1] == last) {\n"
     << "      bool ok = true;\n"
-    << "      for (int32_t j = 1; j < pat.val.len - 1; ++j) {\n"
+    << "      int32_t j = 1;\n"
+    << "      for (; j + 8 <= pat.val.len - 1; j += 8) {\n"
+    << "        if (load_aligned_str_word(s.val.ptr, s.val.len, i + j) !=\n"
+    << "            load_aligned_str_word(pat.val.ptr, pat.val.len, j)) {\n"
+    << "          ok = false;\n"
+    << "          break;\n"
+    << "        }\n"
+    << "      }\n"
+    << "      for (; ok && j < pat.val.len - 1; ++j) {\n"
     << "        if (s.val.ptr[i + j] != pat.val.ptr[j]) { ok = false; break; }\n"
     << "      }\n"
     << "      if (ok) { return reg_val<bool>{true, true, false}; }\n"
     << "    }\n"
+    << "    i = find_byte_swar(s.val.ptr, limit + 1, i + 1, first);\n"
     << "  }\n"
     << "  return reg_val<bool>{false, true, false};\n"
     << "}\n\n"
@@ -2227,8 +2262,7 @@ void emit_nvrtc_device_runtime_preamble(std::ostringstream& src)
     << "      if (pi == pat.len) { return true; }\n"
     << "      star_pi = pi;\n"
     << "      if (pat.ptr[star_pi] != '_') {\n"
-    << "        char const target = pat.ptr[star_pi];\n"
-    << "        while (si < s.len && s.ptr[si] != target) { ++si; }\n"
+    << "        si = find_byte_swar(s.ptr, s.len, si, pat.ptr[star_pi]);\n"
     << "      }\n"
     << "      star_si = si;\n"
     << "    } else if (pi < pat.len && pat.ptr[pi] == '_') {\n"
@@ -2240,10 +2274,7 @@ void emit_nvrtc_device_runtime_preamble(std::ostringstream& src)
     << "    } else if (star_pi != -1) {\n"
     << "      pi = star_pi;\n"
     << "      if (pat.ptr[star_pi] != '_') {\n"
-    << "        char const target = pat.ptr[star_pi];\n"
-    << "        int32_t next_s = star_si + 1;\n"
-    << "        while (next_s < s.len && s.ptr[next_s] != target) { ++next_s; }\n"
-    << "        star_si = next_s;\n"
+    << "        star_si = find_byte_swar(s.ptr, s.len, star_si + 1, pat.ptr[star_pi]);\n"
     << "      } else {\n"
     << "        star_si = next_utf8_char(s.ptr, s.len, star_si);\n"
     << "      }\n"
@@ -2505,8 +2536,9 @@ void emit_nvrtc_device_runtime_preamble(std::ostringstream& src)
        "static_cast<OutRep>(r.val));\n"
     << "  return reg_val<OutRep>{prod.overflow ? OutRep{} : prod.value, true, prod.overflow};\n"
     << "}\n\n"
-    << "template <typename OutRep, typename L, typename R>\n"
-    << "__device__ __forceinline__ reg_val<OutRep> eval_dec_div(reg_val<L> l, reg_val<R> r) {\n"
+    << "template <typename OutRep, bool ScaleUp = true, typename L, typename R>\n"
+    << "__device__ __forceinline__ reg_val<OutRep> eval_dec_div(\n"
+    << "    reg_val<L> l, reg_val<R> r, __int128_t f_out = 1) {\n"
     << "  bool const ovf_in = l.overflow || r.overflow;\n"
     << "  bool const valid = l.valid && r.valid;\n"
     << "  if (!valid || ovf_in) { return reg_val<OutRep>{OutRep{}, valid, ovf_in}; }\n"
@@ -2516,7 +2548,16 @@ void emit_nvrtc_device_runtime_preamble(std::ostringstream& src)
     << "  if (lv == cuda::std::numeric_limits<__int128_t>::lowest() && rv == -1) {\n"
     << "    return reg_val<OutRep>{OutRep{}, true, true};\n"
     << "  }\n"
-    << "  __int128_t const q = lv / rv;\n"
+    << "  __int128_t q = lv / rv;\n"
+    << "  if constexpr (ScaleUp) {\n"
+    << "    if (f_out != 1) {\n"
+    << "      auto const scaled = cuda::mul_overflow<__int128_t>(q, f_out);\n"
+    << "      if (scaled.overflow) { return reg_val<OutRep>{OutRep{}, true, true}; }\n"
+    << "      q = scaled.value;\n"
+    << "    }\n"
+    << "  } else {\n"
+    << "    q /= f_out;\n"
+    << "  }\n"
     << "  auto const out = cuda::overflow_cast<OutRep>(q);\n"
     << "  return reg_val<OutRep>{out.overflow ? OutRep{} : out.value, true, out.overflow};\n"
     << "}\n\n"
@@ -2851,6 +2892,265 @@ void emit_nvrtc_device_runtime_preamble(std::ostringstream& src)
     << "}\n\n";
 }
 
+// Thread-local pinned host staging slab for reading back device status and count words without
+// synchronous pageable-memory staging overhead.
+class pinned_status_slab {
+ public:
+  pinned_status_slab() = default;
+  ~pinned_status_slab()
+  {
+    if (_data != nullptr) { (void)cudaFreeHost(_data); }
+  }
+  pinned_status_slab(pinned_status_slab const&)            = delete;
+  pinned_status_slab& operator=(pinned_status_slab const&) = delete;
+
+  [[nodiscard]] std::uint32_t* reserve(std::size_t words)
+  {
+    if (_data != nullptr && words <= _capacity_words) { return _data; }
+    std::size_t const grown = std::max({words, _capacity_words * 2U, std::size_t{64}});
+    void* fresh             = nullptr;
+    simpatico::throw_if_cuda_error(
+      cudaHostAlloc(&fresh, grown * sizeof(std::uint32_t), cudaHostAllocPortable),
+      "cudaHostAlloc(pinned_status_slab)");
+    if (_data != nullptr) { (void)cudaFreeHost(_data); }
+    _data           = static_cast<std::uint32_t*>(fresh);
+    _capacity_words = grown;
+    return _data;
+  }
+
+ private:
+  std::uint32_t* _data{nullptr};
+  std::size_t _capacity_words{0};
+};
+
+[[nodiscard]] std::uint32_t const* copy_status_words_from_device(std::uint32_t const* d_status,
+                                                                 std::size_t words,
+                                                                 ::cuda::stream_ref stream)
+{
+  thread_local pinned_status_slab slab;
+  std::uint32_t* const h_pinned = slab.reserve(words);
+  simpatico::throw_if_cuda_error(
+    cudaMemcpyAsync(
+      h_pinned, d_status, words * sizeof(std::uint32_t), cudaMemcpyDeviceToHost, stream.get()),
+    "cudaMemcpyAsync(status_words)");
+  simpatico::throw_if_cuda_error(cudaStreamSynchronize(stream.get()),
+                                 "cudaStreamSynchronize(status_words)");
+  if ((h_pinned[0] & 2U) != 0U) {
+    throw internal_exception(
+      "[expression_evaluator:case]: More than one row returned by a subquery used as an "
+      "expression.");
+  }
+  if ((h_pinned[0] & 1U) != 0U) {
+    throw out_of_range_exception("Overflow in NVRTC expression evaluation");
+  }
+  return h_pinned;
+}
+
+void emit_input_and_constant_kernel_params(std::ostringstream& src, translation_context const& ctx)
+{
+  for (auto const& in_col : ctx.input_columns()) {
+    auto const id_str = std::to_string(in_col.binding_id);
+    if (in_col.physical_type.id() == cudf::type_id::STRING) {
+      auto const off_type_str = cuda_type_name(in_col.offset_type);
+      src << "    " << off_type_str << " const* __restrict__ in_" << id_str << "_offsets,\n"
+          << "    char const* __restrict__ in_" << id_str << "_chars,\n"
+          << "    int64_t in_" << id_str << "_chars_size,\n"
+          << "    uint32_t const* __restrict__ in_" << id_str << "_mask,\n"
+          << "    int32_t in_" << id_str << "_bit_offset,\n";
+    } else {
+      auto const type_str = cuda_type_name(in_col.physical_type);
+      src << "    " << type_str << " const* __restrict__ in_" << id_str << "_data,\n"
+          << "    uint32_t const* __restrict__ in_" << id_str << "_mask,\n"
+          << "    int32_t in_" << id_str << "_bit_offset,\n";
+    }
+  }
+
+  for (auto const& cst : ctx.constants()) {
+    auto const id_str = std::to_string(cst.binding_id);
+    if (cst.device_type.id() == cudf::type_id::STRING) {
+      src << "    char const* __restrict__ c_" << id_str << "_ptr,\n"
+          << "    int32_t c_" << id_str << "_len,\n"
+          << "    uint8_t c_" << id_str << "_valid,\n";
+    } else {
+      auto const type_str = cuda_type_name(cst.device_type);
+      src << "    " << type_str << " c_" << id_str << "_val,\n"
+          << "    uint8_t c_" << id_str << "_valid,\n";
+    }
+  }
+}
+
+void emit_bsm_string_staging(std::ostringstream& src,
+                             translation_context const& ctx,
+                             int block_threads)
+{
+  std::size_t num_bsm_cols = 0;
+  for (auto const& in_col : ctx.input_columns()) {
+    if (in_col.physical_type.id() == cudf::type_id::STRING && in_col.use_bsm_cache) {
+      ++num_bsm_cols;
+    }
+  }
+  int32_t const bsm_budget_per_col =
+    (num_bsm_cols == 0)
+      ? 0
+      : static_cast<int32_t>(std::max<std::size_t>(1024, (16384 / num_bsm_cols) & ~7ULL));
+
+  for (auto const& in_col : ctx.input_columns()) {
+    if (in_col.physical_type.id() != cudf::type_id::STRING) { continue; }
+    auto const id_str = std::to_string(in_col.binding_id);
+    src << "  (void)in_" << id_str << "_chars_size;\n";
+    if (in_col.use_bsm_cache && bsm_budget_per_col > 0) {
+      src << "  __shared__ __align__(8) char bsm_buf_" << id_str << "[" << (bsm_budget_per_col + 8)
+          << "];\n"
+          << "  int32_t const bsm_row_begin_" << id_str << " = static_cast<int32_t>(blockIdx.x) * "
+          << block_threads << ";\n"
+          << "  int32_t const bsm_row_end_" << id_str << " = (bsm_row_begin_" << id_str << " + "
+          << block_threads << " < num_rows) ? (bsm_row_begin_" << id_str << " + " << block_threads
+          << ") : num_rows;\n"
+          << "  int64_t in_" << id_str << "_base_off = 0LL;\n"
+          << "  char const* in_" << id_str << "_active_chars = in_" << id_str << "_chars;\n"
+          << "  if (in_" << id_str << "_offsets != nullptr && in_" << id_str
+          << "_chars != nullptr && bsm_row_begin_" << id_str << " < bsm_row_end_" << id_str
+          << ") {\n"
+          << "    int64_t const raw_base = static_cast<int64_t>(in_" << id_str
+          << "_offsets[bsm_row_begin_" << id_str << "]);\n"
+          << "    int64_t const raw_end = static_cast<int64_t>(in_" << id_str
+          << "_offsets[bsm_row_end_" << id_str << "]);\n"
+          << "    int64_t const span = raw_end - raw_base;\n"
+          << "    if (span >= 0 && span <= " << bsm_budget_per_col << ") {\n"
+          << "      int32_t const align_off = static_cast<int32_t>(reinterpret_cast<uintptr_t>(in_"
+          << id_str << "_chars + raw_base) & 7u);\n"
+          << "      char* const bsm_dst = bsm_buf_" << id_str << " + align_off;\n"
+          << "      coop_load_bsm(bsm_dst, in_" << id_str
+          << "_chars + raw_base, static_cast<int32_t>(span));\n"
+          << "      in_" << id_str << "_base_off = raw_base;\n"
+          << "      in_" << id_str << "_active_chars = bsm_dst;\n"
+          << "    }\n"
+          << "  }\n";
+    } else {
+      src << "  int64_t const in_" << id_str << "_base_off = 0LL;\n"
+          << "  char const* const in_" << id_str << "_active_chars = in_" << id_str << "_chars;\n";
+    }
+  }
+  if (num_bsm_cols > 0) { src << "  __syncthreads();\n"; }
+}
+
+struct input_arg_storage {
+  void const* data_ptr{nullptr};
+  void const* offsets_ptr{nullptr};
+  char const* chars_ptr{nullptr};
+  std::int64_t chars_size{0};
+  std::uint32_t const* mask_ptr{nullptr};
+  std::int32_t bit_offset{0};
+};
+
+struct string_constant_arg_storage {
+  char const* ptr{nullptr};
+  std::int32_t len{0};
+  std::uint8_t valid{0};
+};
+
+struct bound_kernel_input_and_constant_args {
+  std::vector<input_arg_storage> in_args;
+  rmm::device_uvector<char> d_const_chars;
+  std::vector<constant_param_storage> const_args;
+  std::vector<string_constant_arg_storage> str_const_args;
+
+  bound_kernel_input_and_constant_args(translation_context const& ctx,
+                                       cudf::table_view const& input,
+                                       ::cuda::stream_ref stream,
+                                       rmm::device_async_resource_ref mr)
+    : in_args(ctx.input_columns().size()),
+      d_const_chars(0, stream, mr),
+      const_args(ctx.constants().size()),
+      str_const_args(ctx.constants().size())
+  {
+    for (std::size_t i = 0; i < ctx.input_columns().size(); ++i) {
+      auto const& binding = ctx.input_columns()[i];
+      auto const col_view = input.column(binding.column_index);
+      if (binding.physical_type.id() == cudf::type_id::STRING) {
+        if (col_view.size() > 0 && col_view.num_children() > 0) {
+          cudf::strings_column_view const scv(col_view);
+          auto const offsets_col = scv.offsets();
+          if (offsets_col.size() > col_view.offset() + col_view.size()) {
+            if (offsets_col.type().id() == cudf::type_id::INT64) {
+              in_args[i].offsets_ptr = offsets_col.data<std::int64_t>() + col_view.offset();
+            } else {
+              in_args[i].offsets_ptr = offsets_col.data<std::int32_t>() + col_view.offset();
+            }
+            in_args[i].chars_ptr  = scv.chars_begin(stream);
+            in_args[i].chars_size = scv.chars_size(stream);
+          }
+        }
+      } else {
+        in_args[i].data_ptr = get_input_data_ptr(col_view);
+      }
+      in_args[i].mask_ptr   = binding.is_nullable ? col_view.null_mask() : nullptr;
+      in_args[i].bit_offset = static_cast<std::int32_t>(col_view.offset());
+    }
+
+    std::string h_const_chars;
+    std::vector<std::size_t> str_const_offsets(ctx.constants().size(), 0);
+    for (std::size_t i = 0; i < ctx.constants().size(); ++i) {
+      auto const& cst = ctx.constants()[i];
+      if (cst.device_type.id() == cudf::type_id::STRING && cst.is_valid) {
+        auto const& s        = std::get<std::string>(cst.payload);
+        str_const_offsets[i] = h_const_chars.size();
+        h_const_chars.append(s);
+      }
+    }
+    if (!h_const_chars.empty()) {
+      d_const_chars.resize(h_const_chars.size(), stream);
+      simpatico::throw_if_cuda_error(cudaMemcpyAsync(d_const_chars.data(),
+                                                     h_const_chars.data(),
+                                                     h_const_chars.size(),
+                                                     cudaMemcpyHostToDevice,
+                                                     stream.get()),
+                                     "cudaMemcpyAsync(d_const_chars)");
+    }
+
+    for (std::size_t i = 0; i < ctx.constants().size(); ++i) {
+      auto const& cst = ctx.constants()[i];
+      if (cst.device_type.id() == cudf::type_id::STRING) {
+        str_const_args[i].valid = cst.is_valid ? 1U : 0U;
+        if (cst.is_valid) {
+          auto const& s         = std::get<std::string>(cst.payload);
+          str_const_args[i].ptr = d_const_chars.data() + str_const_offsets[i];
+          str_const_args[i].len = static_cast<std::int32_t>(s.size());
+        }
+      } else {
+        populate_constant_param(cst, const_args[i]);
+      }
+    }
+  }
+
+  void append_to_kernel_args(translation_context const& ctx, std::vector<void*>& kernel_args)
+  {
+    for (std::size_t i = 0; i < in_args.size(); ++i) {
+      if (ctx.input_columns()[i].physical_type.id() == cudf::type_id::STRING) {
+        kernel_args.push_back(&in_args[i].offsets_ptr);
+        kernel_args.push_back(&in_args[i].chars_ptr);
+        kernel_args.push_back(&in_args[i].chars_size);
+        kernel_args.push_back(&in_args[i].mask_ptr);
+        kernel_args.push_back(&in_args[i].bit_offset);
+      } else {
+        kernel_args.push_back(&in_args[i].data_ptr);
+        kernel_args.push_back(&in_args[i].mask_ptr);
+        kernel_args.push_back(&in_args[i].bit_offset);
+      }
+    }
+    for (std::size_t i = 0; i < ctx.constants().size(); ++i) {
+      if (ctx.constants()[i].device_type.id() == cudf::type_id::STRING) {
+        kernel_args.push_back(&str_const_args[i].ptr);
+        kernel_args.push_back(&str_const_args[i].len);
+        kernel_args.push_back(&str_const_args[i].valid);
+      } else {
+        kernel_args.push_back(&const_args[i].val_bytes[0]);
+        kernel_args.push_back(&const_args[i].valid);
+      }
+    }
+  }
+};
+
 }  // namespace
 
 std::unique_ptr<cudf::table> evaluate_project_sink(
@@ -2903,47 +3203,7 @@ std::unique_ptr<cudf::table> evaluate_project_sink(
   std::ostringstream src;
   emit_nvrtc_device_runtime_preamble(src);
   src << "extern \"C\" __global__ void sirius_nvrtc_project_kernel(\n";
-
-  std::size_t num_bsm_cols = 0;
-  for (auto const& in_col : ctx.input_columns()) {
-    if (in_col.physical_type.id() == cudf::type_id::STRING && in_col.use_bsm_cache) {
-      ++num_bsm_cols;
-    }
-  }
-  int32_t const bsm_budget_per_col =
-    (num_bsm_cols == 0)
-      ? 0
-      : static_cast<int32_t>(std::max<std::size_t>(1024, (16384 / num_bsm_cols) & ~7ULL));
-
-  for (auto const& in_col : ctx.input_columns()) {
-    auto const id_str = std::to_string(in_col.binding_id);
-    if (in_col.physical_type.id() == cudf::type_id::STRING) {
-      auto const off_type_str = cuda_type_name(in_col.offset_type);
-      src << "    " << off_type_str << " const* __restrict__ in_" << id_str << "_offsets,\n"
-          << "    char const* __restrict__ in_" << id_str << "_chars,\n"
-          << "    int64_t in_" << id_str << "_chars_size,\n"
-          << "    uint32_t const* __restrict__ in_" << id_str << "_mask,\n"
-          << "    int32_t in_" << id_str << "_bit_offset,\n";
-    } else {
-      auto const type_str = cuda_type_name(in_col.physical_type);
-      src << "    " << type_str << " const* __restrict__ in_" << id_str << "_data,\n"
-          << "    uint32_t const* __restrict__ in_" << id_str << "_mask,\n"
-          << "    int32_t in_" << id_str << "_bit_offset,\n";
-    }
-  }
-
-  for (auto const& cst : ctx.constants()) {
-    auto const id_str = std::to_string(cst.binding_id);
-    if (cst.device_type.id() == cudf::type_id::STRING) {
-      src << "    char const* __restrict__ c_" << id_str << "_ptr,\n"
-          << "    int32_t c_" << id_str << "_len,\n"
-          << "    uint8_t c_" << id_str << "_valid,\n";
-    } else {
-      auto const type_str = cuda_type_name(cst.device_type);
-      src << "    " << type_str << " c_" << id_str << "_val,\n"
-          << "    uint8_t c_" << id_str << "_valid,\n";
-    }
-  }
+  emit_input_and_constant_kernel_params(src, ctx);
 
   for (std::size_t k = 0; k < out_regs.size(); ++k) {
     auto const k_str    = std::to_string(k);
@@ -2963,45 +3223,7 @@ std::unique_ptr<cudf::table> evaluate_project_sink(
       << " + static_cast<int32_t>(threadIdx.x)) >> 5;\n"
       << "  int32_t const warp_base_row = global_warp << 5;\n"
       << "  bool const active = (row < num_rows);\n";
-
-  for (auto const& in_col : ctx.input_columns()) {
-    if (in_col.physical_type.id() != cudf::type_id::STRING) { continue; }
-    auto const id_str = std::to_string(in_col.binding_id);
-    src << "  (void)in_" << id_str << "_chars_size;\n";
-    if (in_col.use_bsm_cache && bsm_budget_per_col > 0) {
-      src << "  __shared__ __align__(8) char bsm_buf_" << id_str << "[" << (bsm_budget_per_col + 8)
-          << "];\n"
-          << "  int32_t const bsm_row_begin_" << id_str << " = static_cast<int32_t>(blockIdx.x) * "
-          << block_threads << ";\n"
-          << "  int32_t const bsm_row_end_" << id_str << " = (bsm_row_begin_" << id_str << " + "
-          << block_threads << " < num_rows) ? (bsm_row_begin_" << id_str << " + " << block_threads
-          << ") : num_rows;\n"
-          << "  int64_t in_" << id_str << "_base_off = 0LL;\n"
-          << "  char const* in_" << id_str << "_active_chars = in_" << id_str << "_chars;\n"
-          << "  if (in_" << id_str << "_offsets != nullptr && in_" << id_str
-          << "_chars != nullptr && bsm_row_begin_" << id_str << " < bsm_row_end_" << id_str
-          << ") {\n"
-          << "    int64_t const raw_base = static_cast<int64_t>(in_" << id_str
-          << "_offsets[bsm_row_begin_" << id_str << "]);\n"
-          << "    int64_t const raw_end = static_cast<int64_t>(in_" << id_str
-          << "_offsets[bsm_row_end_" << id_str << "]);\n"
-          << "    int64_t const span = raw_end - raw_base;\n"
-          << "    if (span >= 0 && span <= " << bsm_budget_per_col << ") {\n"
-          << "      int32_t const align_off = static_cast<int32_t>(reinterpret_cast<uintptr_t>(in_"
-          << id_str << "_chars + raw_base) & 7u);\n"
-          << "      char* const bsm_dst = bsm_buf_" << id_str << " + align_off;\n"
-          << "      coop_load_bsm(bsm_dst, in_" << id_str
-          << "_chars + raw_base, static_cast<int32_t>(span));\n"
-          << "      in_" << id_str << "_base_off = raw_base;\n"
-          << "      in_" << id_str << "_active_chars = bsm_dst;\n"
-          << "    }\n"
-          << "  }\n";
-    } else {
-      src << "  int64_t const in_" << id_str << "_base_off = 0LL;\n"
-          << "  char const* const in_" << id_str << "_active_chars = in_" << id_str << "_chars;\n";
-    }
-  }
-  if (num_bsm_cols > 0) { src << "  __syncthreads();\n"; }
+  emit_bsm_string_staging(src, ctx, block_threads);
 
   for (std::size_t k = 0; k < out_regs.size(); ++k) {
     if (!out_regs[k].is_statically_non_null) { src << "  bool out_" << k << "_valid = false;\n"; }
@@ -3133,108 +3355,13 @@ std::unique_ptr<cudf::table> evaluate_project_sink(
       "cudaMemsetAsync(status_and_null_counts)");
   }
 
-  // Prepare kernel argument storage.
-  struct input_arg_storage {
-    void const* data_ptr{nullptr};
-    void const* offsets_ptr{nullptr};
-    char const* chars_ptr{nullptr};
-    std::int64_t chars_size{0};
-    std::uint32_t const* mask_ptr{nullptr};
-    std::int32_t bit_offset{0};
-  };
-  std::vector<input_arg_storage> in_args(ctx.input_columns().size());
-  for (std::size_t i = 0; i < ctx.input_columns().size(); ++i) {
-    auto const& binding = ctx.input_columns()[i];
-    auto const col_view = input.column(binding.column_index);
-    if (binding.physical_type.id() == cudf::type_id::STRING) {
-      if (col_view.size() > 0 && col_view.num_children() > 0) {
-        cudf::strings_column_view const scv(col_view);
-        auto const offsets_col = scv.offsets();
-        if (offsets_col.size() > col_view.offset() + col_view.size()) {
-          if (offsets_col.type().id() == cudf::type_id::INT64) {
-            in_args[i].offsets_ptr = offsets_col.data<std::int64_t>() + col_view.offset();
-          } else {
-            in_args[i].offsets_ptr = offsets_col.data<std::int32_t>() + col_view.offset();
-          }
-          in_args[i].chars_ptr  = scv.chars_begin(stream);
-          in_args[i].chars_size = scv.chars_size(stream);
-        }
-      }
-    } else {
-      in_args[i].data_ptr = get_input_data_ptr(col_view);
-    }
-    in_args[i].mask_ptr   = binding.is_nullable ? col_view.null_mask() : nullptr;
-    in_args[i].bit_offset = static_cast<std::int32_t>(col_view.offset());
-  }
-
-  struct string_constant_arg_storage {
-    char const* ptr{nullptr};
-    std::int32_t len{0};
-    std::uint8_t valid{0};
-  };
-  std::string h_const_chars;
-  std::vector<std::size_t> str_const_offsets(ctx.constants().size(), 0);
-  for (std::size_t i = 0; i < ctx.constants().size(); ++i) {
-    auto const& cst = ctx.constants()[i];
-    if (cst.device_type.id() == cudf::type_id::STRING && cst.is_valid) {
-      auto const& s        = std::get<std::string>(cst.payload);
-      str_const_offsets[i] = h_const_chars.size();
-      h_const_chars.append(s);
-    }
-  }
-  rmm::device_uvector<char> d_const_chars(h_const_chars.size(), stream, mr);
-  if (!h_const_chars.empty()) {
-    simpatico::throw_if_cuda_error(cudaMemcpyAsync(d_const_chars.data(),
-                                                   h_const_chars.data(),
-                                                   h_const_chars.size(),
-                                                   cudaMemcpyHostToDevice,
-                                                   stream.get()),
-                                   "cudaMemcpyAsync(d_const_chars)");
-  }
-
-  std::vector<constant_param_storage> const_args(ctx.constants().size());
-  std::vector<string_constant_arg_storage> str_const_args(ctx.constants().size());
-  for (std::size_t i = 0; i < ctx.constants().size(); ++i) {
-    auto const& cst = ctx.constants()[i];
-    if (cst.device_type.id() == cudf::type_id::STRING) {
-      str_const_args[i].valid = cst.is_valid ? 1U : 0U;
-      if (cst.is_valid) {
-        auto const& s         = std::get<std::string>(cst.payload);
-        str_const_args[i].ptr = d_const_chars.data() + str_const_offsets[i];
-        str_const_args[i].len = static_cast<std::int32_t>(s.size());
-      }
-    } else {
-      populate_constant_param(cst, const_args[i]);
-    }
-  }
-
+  bound_kernel_input_and_constant_args bound_args(ctx, input, stream, mr);
   std::int32_t num_rows_arg = static_cast<std::int32_t>(num_rows);
 
   std::vector<void*> kernel_args;
-  kernel_args.reserve(in_args.size() * 5 + const_args.size() * 3 + outputs.size() * 2 + 2);
-  for (std::size_t i = 0; i < in_args.size(); ++i) {
-    if (ctx.input_columns()[i].physical_type.id() == cudf::type_id::STRING) {
-      kernel_args.push_back(&in_args[i].offsets_ptr);
-      kernel_args.push_back(&in_args[i].chars_ptr);
-      kernel_args.push_back(&in_args[i].chars_size);
-      kernel_args.push_back(&in_args[i].mask_ptr);
-      kernel_args.push_back(&in_args[i].bit_offset);
-    } else {
-      kernel_args.push_back(&in_args[i].data_ptr);
-      kernel_args.push_back(&in_args[i].mask_ptr);
-      kernel_args.push_back(&in_args[i].bit_offset);
-    }
-  }
-  for (std::size_t i = 0; i < ctx.constants().size(); ++i) {
-    if (ctx.constants()[i].device_type.id() == cudf::type_id::STRING) {
-      kernel_args.push_back(&str_const_args[i].ptr);
-      kernel_args.push_back(&str_const_args[i].len);
-      kernel_args.push_back(&str_const_args[i].valid);
-    } else {
-      kernel_args.push_back(&const_args[i].val_bytes[0]);
-      kernel_args.push_back(&const_args[i].valid);
-    }
-  }
+  kernel_args.reserve(bound_args.in_args.size() * 5 + bound_args.const_args.size() * 3 +
+                      outputs.size() * 2 + 2);
+  bound_args.append_to_kernel_args(ctx, kernel_args);
   for (auto& out_arg : outputs) {
     kernel_args.push_back(&out_arg.data_ptr);
     kernel_args.push_back(&out_arg.mask_ptr);
@@ -3256,26 +3383,8 @@ std::unique_ptr<cudf::table> evaluate_project_sink(
                                               nullptr),
                                "cuLaunchKernel(sirius_nvrtc_project_kernel)");
 
-  std::vector<std::uint32_t> h_status;
-  if (need_status_buffer) {
-    h_status.resize(status_words, 0);
-    simpatico::throw_if_cuda_error(cudaMemcpyAsync(h_status.data(),
-                                                   status_ptr,
-                                                   status_words * sizeof(std::uint32_t),
-                                                   cudaMemcpyDeviceToHost,
-                                                   stream.get()),
-                                   "cudaMemcpyAsync(status_and_null_counts)");
-    simpatico::throw_if_cuda_error(cudaStreamSynchronize(stream.get()),
-                                   "cudaStreamSynchronize(sirius_nvrtc_project_kernel)");
-    if ((h_status[0] & 2U) != 0U) {
-      throw internal_exception(
-        "[expression_evaluator:case]: More than one row returned by a subquery used as an "
-        "expression.");
-    }
-    if ((h_status[0] & 1U) != 0U) {
-      throw out_of_range_exception("Overflow in NVRTC expression evaluation");
-    }
-  }
+  std::uint32_t const* h_status =
+    need_status_buffer ? copy_status_words_from_device(status_ptr, status_words, stream) : nullptr;
 
   std::vector<std::unique_ptr<cudf::column>> final_columns;
   final_columns.reserve(outputs.size());
@@ -3423,47 +3532,7 @@ std::unique_ptr<cudf::table> evaluate_filter_sink(sirius::ast::node const& predi
   std::ostringstream src;
   emit_nvrtc_device_runtime_preamble(src);
   src << "extern \"C\" __global__ void sirius_nvrtc_filter_kernel(\n";
-
-  std::size_t num_bsm_cols = 0;
-  for (auto const& in_col : ctx.input_columns()) {
-    if (in_col.physical_type.id() == cudf::type_id::STRING && in_col.use_bsm_cache) {
-      ++num_bsm_cols;
-    }
-  }
-  int32_t const bsm_budget_per_col =
-    (num_bsm_cols == 0)
-      ? 0
-      : static_cast<int32_t>(std::max<std::size_t>(1024, (16384 / num_bsm_cols) & ~7ULL));
-
-  for (auto const& in_col : ctx.input_columns()) {
-    auto const id_str = std::to_string(in_col.binding_id);
-    if (in_col.physical_type.id() == cudf::type_id::STRING) {
-      auto const off_type_str = cuda_type_name(in_col.offset_type);
-      src << "    " << off_type_str << " const* __restrict__ in_" << id_str << "_offsets,\n"
-          << "    char const* __restrict__ in_" << id_str << "_chars,\n"
-          << "    int64_t in_" << id_str << "_chars_size,\n"
-          << "    uint32_t const* __restrict__ in_" << id_str << "_mask,\n"
-          << "    int32_t in_" << id_str << "_bit_offset,\n";
-    } else {
-      auto const type_str = cuda_type_name(in_col.physical_type);
-      src << "    " << type_str << " const* __restrict__ in_" << id_str << "_data,\n"
-          << "    uint32_t const* __restrict__ in_" << id_str << "_mask,\n"
-          << "    int32_t in_" << id_str << "_bit_offset,\n";
-    }
-  }
-
-  for (auto const& cst : ctx.constants()) {
-    auto const id_str = std::to_string(cst.binding_id);
-    if (cst.device_type.id() == cudf::type_id::STRING) {
-      src << "    char const* __restrict__ c_" << id_str << "_ptr,\n"
-          << "    int32_t c_" << id_str << "_len,\n"
-          << "    uint8_t c_" << id_str << "_valid,\n";
-    } else {
-      auto const type_str = cuda_type_name(cst.device_type);
-      src << "    " << type_str << " c_" << id_str << "_val,\n"
-          << "    uint8_t c_" << id_str << "_valid,\n";
-    }
-  }
+  emit_input_and_constant_kernel_params(src, ctx);
 
   src << "    int32_t num_rows,\n"
       << "    uint32_t* __restrict__ status_and_counts,\n"
@@ -3478,45 +3547,7 @@ std::unique_ptr<cudf::table> evaluate_filter_sink(sirius::ast::node const& predi
       << "  int32_t const global_warp = (static_cast<int32_t>(blockIdx.x) * " << block_threads
       << " + static_cast<int32_t>(threadIdx.x)) >> 5;\n"
       << "  bool const active = (row < num_rows);\n";
-
-  for (auto const& in_col : ctx.input_columns()) {
-    if (in_col.physical_type.id() != cudf::type_id::STRING) { continue; }
-    auto const id_str = std::to_string(in_col.binding_id);
-    src << "  (void)in_" << id_str << "_chars_size;\n";
-    if (in_col.use_bsm_cache && bsm_budget_per_col > 0) {
-      src << "  __shared__ __align__(8) char bsm_buf_" << id_str << "[" << (bsm_budget_per_col + 8)
-          << "];\n"
-          << "  int32_t const bsm_row_begin_" << id_str << " = static_cast<int32_t>(blockIdx.x) * "
-          << block_threads << ";\n"
-          << "  int32_t const bsm_row_end_" << id_str << " = (bsm_row_begin_" << id_str << " + "
-          << block_threads << " < num_rows) ? (bsm_row_begin_" << id_str << " + " << block_threads
-          << ") : num_rows;\n"
-          << "  int64_t in_" << id_str << "_base_off = 0LL;\n"
-          << "  char const* in_" << id_str << "_active_chars = in_" << id_str << "_chars;\n"
-          << "  if (in_" << id_str << "_offsets != nullptr && in_" << id_str
-          << "_chars != nullptr && bsm_row_begin_" << id_str << " < bsm_row_end_" << id_str
-          << ") {\n"
-          << "    int64_t const raw_base = static_cast<int64_t>(in_" << id_str
-          << "_offsets[bsm_row_begin_" << id_str << "]);\n"
-          << "    int64_t const raw_end = static_cast<int64_t>(in_" << id_str
-          << "_offsets[bsm_row_end_" << id_str << "]);\n"
-          << "    int64_t const span = raw_end - raw_base;\n"
-          << "    if (span >= 0 && span <= " << bsm_budget_per_col << ") {\n"
-          << "      int32_t const align_off = static_cast<int32_t>(reinterpret_cast<uintptr_t>(in_"
-          << id_str << "_chars + raw_base) & 7u);\n"
-          << "      char* const bsm_dst = bsm_buf_" << id_str << " + align_off;\n"
-          << "      coop_load_bsm(bsm_dst, in_" << id_str
-          << "_chars + raw_base, static_cast<int32_t>(span));\n"
-          << "      in_" << id_str << "_base_off = raw_base;\n"
-          << "      in_" << id_str << "_active_chars = bsm_dst;\n"
-          << "    }\n"
-          << "  }\n";
-    } else {
-      src << "  int64_t const in_" << id_str << "_base_off = 0LL;\n"
-          << "  char const* const in_" << id_str << "_active_chars = in_" << id_str << "_chars;\n";
-    }
-  }
-  if (num_bsm_cols > 0) { src << "  __syncthreads();\n"; }
+  emit_bsm_string_staging(src, ctx, block_threads);
 
   src << "  bool survives = false;\n";
   if (any_can_overflow) { src << "  bool row_overflow = false;\n"; }
@@ -3622,107 +3653,12 @@ std::unique_ptr<cudf::table> evaluate_filter_sink(sirius::ast::node const& predi
   std::int32_t* single_block_survivors_ptr =
     single_block ? reinterpret_cast<std::int32_t*>(d_workspace.data() + 2U) : nullptr;
 
-  struct input_arg_storage {
-    void const* data_ptr{nullptr};
-    void const* offsets_ptr{nullptr};
-    char const* chars_ptr{nullptr};
-    std::int64_t chars_size{0};
-    std::uint32_t const* mask_ptr{nullptr};
-    std::int32_t bit_offset{0};
-  };
-  std::vector<input_arg_storage> in_args(ctx.input_columns().size());
-  for (std::size_t i = 0; i < ctx.input_columns().size(); ++i) {
-    auto const& binding = ctx.input_columns()[i];
-    auto const col_view = input.column(binding.column_index);
-    if (binding.physical_type.id() == cudf::type_id::STRING) {
-      if (col_view.size() > 0 && col_view.num_children() > 0) {
-        cudf::strings_column_view const scv(col_view);
-        auto const offsets_col = scv.offsets();
-        if (offsets_col.size() > col_view.offset() + col_view.size()) {
-          if (offsets_col.type().id() == cudf::type_id::INT64) {
-            in_args[i].offsets_ptr = offsets_col.data<std::int64_t>() + col_view.offset();
-          } else {
-            in_args[i].offsets_ptr = offsets_col.data<std::int32_t>() + col_view.offset();
-          }
-          in_args[i].chars_ptr  = scv.chars_begin(stream);
-          in_args[i].chars_size = scv.chars_size(stream);
-        }
-      }
-    } else {
-      in_args[i].data_ptr = get_input_data_ptr(col_view);
-    }
-    in_args[i].mask_ptr   = binding.is_nullable ? col_view.null_mask() : nullptr;
-    in_args[i].bit_offset = static_cast<std::int32_t>(col_view.offset());
-  }
-
-  struct string_constant_arg_storage {
-    char const* ptr{nullptr};
-    std::int32_t len{0};
-    std::uint8_t valid{0};
-  };
-  std::string h_const_chars;
-  std::vector<std::size_t> str_const_offsets(ctx.constants().size(), 0);
-  for (std::size_t i = 0; i < ctx.constants().size(); ++i) {
-    auto const& cst = ctx.constants()[i];
-    if (cst.device_type.id() == cudf::type_id::STRING && cst.is_valid) {
-      auto const& s        = std::get<std::string>(cst.payload);
-      str_const_offsets[i] = h_const_chars.size();
-      h_const_chars.append(s);
-    }
-  }
-  rmm::device_uvector<char> d_const_chars(h_const_chars.size(), stream, mr);
-  if (!h_const_chars.empty()) {
-    simpatico::throw_if_cuda_error(cudaMemcpyAsync(d_const_chars.data(),
-                                                   h_const_chars.data(),
-                                                   h_const_chars.size(),
-                                                   cudaMemcpyHostToDevice,
-                                                   stream.get()),
-                                   "cudaMemcpyAsync(d_const_chars)");
-  }
-
-  std::vector<constant_param_storage> const_args(ctx.constants().size());
-  std::vector<string_constant_arg_storage> str_const_args(ctx.constants().size());
-  for (std::size_t i = 0; i < ctx.constants().size(); ++i) {
-    auto const& cst = ctx.constants()[i];
-    if (cst.device_type.id() == cudf::type_id::STRING) {
-      str_const_args[i].valid = cst.is_valid ? 1U : 0U;
-      if (cst.is_valid) {
-        auto const& s         = std::get<std::string>(cst.payload);
-        str_const_args[i].ptr = d_const_chars.data() + str_const_offsets[i];
-        str_const_args[i].len = static_cast<std::int32_t>(s.size());
-      }
-    } else {
-      populate_constant_param(cst, const_args[i]);
-    }
-  }
-
+  bound_kernel_input_and_constant_args bound_args(ctx, input, stream, mr);
   std::int32_t num_rows_arg = static_cast<std::int32_t>(num_rows);
 
   std::vector<void*> kernel_args;
-  kernel_args.reserve(in_args.size() * 5 + const_args.size() * 3 + 5);
-  for (std::size_t i = 0; i < in_args.size(); ++i) {
-    if (ctx.input_columns()[i].physical_type.id() == cudf::type_id::STRING) {
-      kernel_args.push_back(&in_args[i].offsets_ptr);
-      kernel_args.push_back(&in_args[i].chars_ptr);
-      kernel_args.push_back(&in_args[i].chars_size);
-      kernel_args.push_back(&in_args[i].mask_ptr);
-      kernel_args.push_back(&in_args[i].bit_offset);
-    } else {
-      kernel_args.push_back(&in_args[i].data_ptr);
-      kernel_args.push_back(&in_args[i].mask_ptr);
-      kernel_args.push_back(&in_args[i].bit_offset);
-    }
-  }
-  for (std::size_t i = 0; i < ctx.constants().size(); ++i) {
-    if (ctx.constants()[i].device_type.id() == cudf::type_id::STRING) {
-      kernel_args.push_back(&str_const_args[i].ptr);
-      kernel_args.push_back(&str_const_args[i].len);
-      kernel_args.push_back(&str_const_args[i].valid);
-    } else {
-      kernel_args.push_back(&const_args[i].val_bytes[0]);
-      kernel_args.push_back(&const_args[i].valid);
-    }
-  }
+  kernel_args.reserve(bound_args.in_args.size() * 5 + bound_args.const_args.size() * 3 + 5);
+  bound_args.append_to_kernel_args(ctx, kernel_args);
   kernel_args.push_back(&num_rows_arg);
   kernel_args.push_back(&status_ptr);
   kernel_args.push_back(&warp_ballots_ptr);
@@ -3742,24 +3678,8 @@ std::unique_ptr<cudf::table> evaluate_filter_sink(sirius::ast::node const& predi
                                               nullptr),
                                "cuLaunchKernel(sirius_nvrtc_filter_kernel)");
 
-  std::uint32_t h_status[2]{0U, 0U};
-  simpatico::throw_if_cuda_error(
-    cudaMemcpyAsync(
-      h_status, status_ptr, 2U * sizeof(std::uint32_t), cudaMemcpyDeviceToHost, stream.get()),
-    "cudaMemcpyAsync(filter_status_and_counts)");
-  simpatico::throw_if_cuda_error(cudaStreamSynchronize(stream.get()),
-                                 "cudaStreamSynchronize(sirius_nvrtc_filter_kernel)");
-
-  if ((h_status[0] & 2U) != 0U) {
-    throw internal_exception(
-      "[expression_evaluator:case]: More than one row returned by a subquery used as an "
-      "expression.");
-  }
-  if ((h_status[0] & 1U) != 0U) {
-    throw out_of_range_exception("Overflow in NVRTC expression evaluation");
-  }
-
-  auto const survivor_count = static_cast<cudf::size_type>(h_status[1]);
+  std::uint32_t const* const h_status = copy_status_words_from_device(status_ptr, 2U, stream);
+  auto const survivor_count           = static_cast<cudf::size_type>(h_status[1]);
   if (survivor_count == 0) {
     if (out_survivors != nullptr) {
       *out_survivors = cudf::make_numeric_column(

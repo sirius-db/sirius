@@ -40,33 +40,48 @@ using boundary_column_map = std::unordered_map<sirius::ast::node const*, std::ui
  * @brief Descriptor for a referenced input column bound to the compiled kernel.
  */
 struct input_column_binding {
-  std::uint32_t column_index{0};    ///< Index of the column in the input `cudf::table_view`
-  cudf::data_type physical_type{};  ///< Physical carrier type in the input `cudf::column_view`
-  cudf::data_type offset_type{};  ///< Offset column type (`INT32` or `INT64`) for `STRING` columns
-  bool is_nullable{false};        ///< True if the input column has nulls in the current batch
-  bool use_bsm_cache{false};      ///< True if the `STRING` column uses Overlapped-Segment Cache
-  std::size_t binding_id{0};      ///< Ordinal index among bound input columns (`in_{id}_...`)
+  /** @brief Index of the column in the input `cudf::table_view`. */
+  std::uint32_t column_index{0};
+  /** @brief Physical carrier type in the input `cudf::column_view`. */
+  cudf::data_type physical_type{};
+  /** @brief Offset column type (`INT32` or `INT64`) for `STRING` columns. */
+  cudf::data_type offset_type{};
+  /** @brief True if the input column has nulls in the current batch. */
+  bool is_nullable{false};
+  /** @brief True if the `STRING` column uses Overlapped-Segment Cache. */
+  bool use_bsm_cache{false};
+  /** @brief Ordinal index among bound input columns (`in_{id}_...`). */
+  std::size_t binding_id{0};
 };
 
 /**
  * @brief Descriptor for a deduplicated per-row Register Value loaded from an input column.
  */
 struct loaded_reference_entry {
-  std::uint32_t column_index{0};    ///< Index of the column in the input `cudf::table_view`
-  cudf::data_type restored_type{};  ///< Target cuDF type after in-register Carrier Restoration
-  register_value reg{};             ///< Register Value holding the loaded (and restored) attribute
+  /** @brief Index of the column in the input `cudf::table_view`. */
+  std::uint32_t column_index{0};
+  /** @brief Target cuDF type after in-register Carrier Restoration. */
+  cudf::data_type restored_type{};
+  /** @brief Register Value holding the loaded (and restored) attribute. */
+  register_value reg{};
 };
 
 /**
  * @brief Descriptor for a runtime scalar constant passed as a `(val, valid)` kernel parameter.
  */
 struct scalar_constant_binding {
-  std::size_t binding_id{0};        ///< Ordinal index among bound constants (`c_{id}_...`)
-  sirius::logical_type sql_type{};  ///< Declared SQL logical type of the constant
-  cudf::data_type device_type{};    ///< Physical cuDF type of the constant payload
-  sirius::value payload{};          ///< Runtime constant value (or `sirius::null_value`)
-  bool is_valid{false};             ///< Runtime validity flag (`!holds_alternative<null_value>`)
-  register_value reg{};             ///< Register Value initialized from the kernel parameter
+  /** @brief Ordinal index among bound constants (`c_{id}_...`). */
+  std::size_t binding_id{0};
+  /** @brief Declared SQL logical type of the constant. */
+  sirius::logical_type sql_type{};
+  /** @brief Physical cuDF type of the constant payload. */
+  cudf::data_type device_type{};
+  /** @brief Runtime constant value (or `sirius::null_value`). */
+  sirius::value payload{};
+  /** @brief Runtime validity flag (`!holds_alternative<null_value>`). */
+  bool is_valid{false};
+  /** @brief Register Value initialized from the kernel parameter. */
+  register_value reg{};
 };
 
 /**

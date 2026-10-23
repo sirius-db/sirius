@@ -103,11 +103,16 @@ namespace sirius::nvrtc {
  * redundant null masks or overflow checks at the Sink Consumer.
  */
 struct register_value {
-  std::string var_name;           ///< Identifier of the local `reg_val<T>` variable in CUDA code
-  sirius::logical_type sql_type;  ///< Declared SQL logical type of the expression
-  cudf::data_type device_type;    ///< Physical cuDF type of the register payload
-  bool is_statically_non_null{false};  ///< True if `valid` is guaranteed true for all rows in batch
-  bool can_overflow{false};            ///< True if `overflow` may become true on any valid row
+  /** @brief Identifier of the local `reg_val<T>` variable in CUDA code. */
+  std::string var_name;
+  /** @brief Declared SQL logical type of the expression. */
+  sirius::logical_type sql_type;
+  /** @brief Physical cuDF type of the register payload. */
+  cudf::data_type device_type;
+  /** @brief True if `valid` is guaranteed true for all rows in batch. */
+  bool is_statically_non_null{false};
+  /** @brief True if `overflow` may become true on any valid row. */
+  bool can_overflow{false};
 };
 
 }  // namespace sirius::nvrtc

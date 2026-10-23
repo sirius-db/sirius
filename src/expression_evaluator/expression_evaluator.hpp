@@ -454,6 +454,24 @@ class expression_evaluator {
   std::unique_ptr<cudf::column> materialize_result_column(sirius::ast::node const& expr,
                                                           evaluate_result result);
 
+  // Pre-evaluated in-tree Materialization Boundaries and the augmented input table view binding
+  // them to synthetic column indices.
+  struct materialized_boundary_state {
+    std::vector<std::unique_ptr<cudf::column>> boundary_cols;
+    std::vector<cudf::column_view> combined_views;
+    std::unordered_map<sirius::ast::node const*, std::uint32_t> boundary_map;
+
+    [[nodiscard]] cudf::table_view combined_table() const noexcept
+    {
+      return cudf::table_view{combined_views};
+    }
+  };
+
+  // Collects and evaluates in-tree Materialization Boundaries for @p expressions, returning
+  // std::nullopt if no boundaries exist.
+  [[nodiscard]] std::optional<materialized_boundary_state> evaluate_materialization_boundaries(
+    std::span<sirius::ast::node const* const> expressions);
+
   // Attempt to evaluate a batch of fixed-width expressions via a single fused NVRTC_JIT kernel,
   // pre-evaluating any in-tree Materialization Boundaries into synthetic input columns.
   std::optional<std::unique_ptr<cudf::table>> try_evaluate_nvrtc_with_boundaries(
