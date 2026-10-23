@@ -38,7 +38,7 @@ The single GPU scan source operator. It owns:
 **Execution.** `execute(input_data, stream)` runs one split:
 
 1. `gpu_ingestible::materialize_table(split, stream)` produces a `filtered_table` — the materialized `cudf::table` (wrapped in an `owning_table_view`) plus a `filter_state` tag describing how much filter/projection the materialize step already applied.
-2. If the tag is `ROW_FILTERED_AND_PROJECTED` the table is already in final output layout and is released directly; otherwise `gpu_ingestible::post_filter_and_project(...)` applies any pending row filter and projection.
+2. If the tag is `ROW_FILTERED_AND_PROJECTED` the table is already in final output layout and is released directly; otherwise `gpu_ingestible::post_filter_and_project(...)` applies any pending row filter and projection. The internal resident Parquet checkpoint can instead combine the residual with membership masks before one projected gather; its placement flag is true by default (see [Dynamic Filters](dynamic-filters.md#resident-parquet-checkpoint)).
 3. If the plan carries a compressed-materialization physical sidecar, exact runtime bounds verify wider-to-narrower casts for columns containing non-null values before the table is normalized to that complete physical schema. Such a sidecar exists only for scans the pinned cache serves with pin-time-narrowed columns (the plan-time residency gate); fresh unpinned scans carry no sidecar and skip normalization entirely. A resident cached input without an override is restored to the native schema when its stored numeric carrier is narrow. Fresh feature-off scans retain their existing natural shape and types. See [Compressed Materialization](compressed-materialization.md) for the narrowing/restoration rules and [Compressed Pinning](compressed-pinning.md) for Simpatico-compressed pinned chunks.
 4. The result is wrapped in a `data_batch` tagged with the split's target `memory_space` and returned as a `pipelineable_operator_data` for the downstream pipeline.
 
@@ -46,7 +46,7 @@ The operator handles two split shapes transparently, both delivered as `scan_ope
 
 Before execution, a resident split is converted or decompressed to a plain GPU table when necessary. An unmasked split with no filtering ahead of it — unfiltered, or decode-row-filtered by the pushdown decode — may detach that per-query table: a split needing no carrier cast transfers it directly to the output, while a carrier-casting split keeps the wrapper as the retained source of a transactional steal in which execute builds every replacement column before committing the take, so an OOM mid-cast leaves the split rematerializable. Because the transactional steal bypasses `post_filter_and_project`, a decode-row-filtered split takes it only when the planned column layout says its output is a leading identity (no partition synthesis or output reordering) and the decoded batch is exactly the output width. A compressed pin's filtered decode reaches that width by omitting slots marked filter-only after it has applied the whole filter. A width match alone cannot prove the layout, since filter-only slots can offset synthesized output columns. Masked or still-to-be-filtered splits retain the wrapper view, which preserves the source for copy-based filtering.
 
-`no_history_peak_memory_estimate()` uses the larger of stored and working-set bytes for resident inputs that need no carrier conversion. For a known conversion it adds the exact destination bytes to the working set. The named maximum carrier expansion (8) is used only when a converting destination cannot be sized. A resident input with a physical sidecar but no reported conversion reserves the working set plus stored bytes as a source-bounded floor. For fresh reads the estimate remains 8 times the projected-column estimate plus decoded filter-only column buffers. The projected-column estimate remains the execution-history basis, and history-based reservations are clamped to the known decoded column-buffer footprint.
+`no_history_peak_memory_estimate()` uses the larger of stored and working-set bytes for resident inputs that need no carrier conversion. For a known conversion it adds the exact destination bytes to the working set. The named maximum carrier expansion (8) is used only when a converting destination cannot be sized. A resident input with a physical sidecar but no reported conversion reserves the working set plus stored bytes as a source-bounded floor. For fresh reads the estimate remains 8 times the projected-column estimate plus decoded filter-only column buffers. The projected-column estimate remains the execution-history basis, and history-based reservations are clamped to the known decoded column-buffer footprint. A resident split that can reach the resident Parquet checkpoint (`scan_operator_input::cached_checkpoint_possible`) reports a working set of twice its batch bytes, for the membership masks and one gather, whether or not decompression pushdown is enabled, unless its decode is forecast to compact. The splits of other ingestibles never reach it and keep their estimate; a split whose table a transfer will take may also report twice its batch bytes, because the estimate runs before `prepare_for_processing` (see [Memory Management](memory-management.md#integration)).
 
 > `sirius_physical_table_scan` (`TABLE_SCAN`) remains only as the plan-time carrier that `wrap_table_scan_source` consumes; the read path for parquet and DuckDB-native tables runs entirely through `GPU_SCAN`.
 
@@ -66,6 +66,8 @@ Before execution, a resident split is converted or decompressed to a plain GPU t
 | `materialize_table(split, stream)` | Produce the `filtered_table` for one split (dispatches to `materialize_metadata_to_table` for a fresh read, or wraps the resident batch for a cache hit). |
 | `materialize_metadata_to_table(info, mem_space, stream)` | Issue the read/decode for one split into a `cudf::table`. `mem_space` names the destination: its allocator is where the decoded columns land. It does not select an ioctx. |
 | `post_filter_and_project(table, mem_space, stream)` | Apply a pending post-decode filter and/or projection to output layout. |
+| `can_serve_cached_view()` | Plan-static: whether `view_layout` can describe any resident batch of the scan. Only plain Parquet with an all-data output layout answers true; the base implementation answers false, which keeps the scan's splits out of the resident checkpoint and its reservation envelope. |
+| `view_layout(table, elided)` | Optional owned host mapping and residual for the resident checkpoint. Exact Parquet data layouts opt in; the base implementation declines. |
 | `table_info()` | The per-table bind data (`ingestible_table_info`). |
 | `materialized_column_order()` | Storage indices from the planned column layout, in the order `materialize_table` emits them. The pinned-cache path serves columns in this order so a cached batch matches a fresh read. |
 | `output_prefix_width()` | A view of the planned layout's output prefix. A compressed pin's filtered decode may omit trailing filter-only slots after applying the scan's whole filter. Nullopt makes no promise; zero-output scans have no output prefix. |
@@ -88,7 +90,7 @@ Two polymorphic carriers separate per-table from per-split state (`gpu_ingestibl
 | `ROW_FILTERED` | The reader applied the row-level filter (parquet reader-side pushdown). |
 | `ROW_FILTERED_AND_PROJECTED` | Fully assembled to output layout (parquet hive-partition path, or a per-query-cached table). |
 
-The operator skips `post_filter_and_project` only when the state is already `ROW_FILTERED_AND_PROJECTED`.
+The operator skips `post_filter_and_project` when the state is already `ROW_FILTERED_AND_PROJECTED`, a permitted table transfer succeeds, or the enabled resident checkpoint supplies the projected output.
 
 Required scan predicates, including `IS NOT NULL` introduced by DuckDB's string-predicate
 rewrites, belong to the scan's row-level evaluator. Native reads and pinned batches retain
@@ -132,7 +134,27 @@ Row mapping is a **list of runs, not one offset**. `build_batch_layout` emits on
 
 Eligible deletion-vector inputs are prepared per file during execution; positional-delete files and scans without a bounded reservation keep eager loading. See [Preparation and publication](scan-contracts-design.md#preparation-and-publication) for admission and lifetime rules.
 
+#### Deferred Puffin ownership and bounds
+
+The deferred Puffin route keeps each allocation with the component that owns its lifetime:
+
+| State | Owner | Bound and accounting |
+|-------|-------|----------------------|
+| Footer text and yyjson parser pool | The DV unit's `preparation_ledger` permit | The lowering envelope proves `footer bytes + parser pool`; `charging_allocator` charges it once as temporary memory and releases it when the read finishes. |
+| Puffin blob bytes | The same DV unit permit | The manifest content size is checked against the real footer boundary before allocation; the charged blob is bounded by the unit envelope. |
+| Decoded deletion positions | The `iceberg_delete_set` retained result | `record_count` and `kMaxDeletionVectorPositions` bound the retained `int64_t` buffer; `allocate_retained` transfers ownership from the permit to the result exactly once. |
+| REST request state, transport staging, footer stash, and backend cache | The opened `ioctx`/`sirius_datasource` | These allocations belong to the IO backend's configured connection/cache limits and are released with the datasource or ioctx. They are not charged again to the DV decode permit. |
+| Descriptor and manifest control state | `iceberg_dv_preparation` and its query admission | The inventory/envelope bounds are established during planning; cancellation and route refusal destroy the provisional admission and descriptors. |
+
+The datasource fills caller-owned charged buffers directly, so the deferred path does not add an uncharged temporary copy. A statement may receive more than one permit when the grant and limits allow it; each DV unit owns its permit and charged buffers independently. Cancellation releases that unit's permit and temporary allocations while other permitted units continue, so serialization is not used as a substitute for a bound. The IOctx-scoped metadata/cache retention budget remains tied to the cuCascade ownership decision in #2108.
+
 **Failures throw; they never degrade to empty delete data.** An empty result is indistinguishable from "this table has no deletes", so swallowing a read error would turn *could not read the deletes* into *there are none* and return rows the table logically removed.
+
+Puffin outcome classification is site-specific. Ordinary parser short/error results at the footer or
+blob magic remain `iceberg_delete_corrupt` with the parser's original message. Backend read errors,
+including an opened-object version change, are terminal `reader_io` at the charged scan wrapper;
+the version-change counter is recorded before that classification. Cancellation, allocation
+failures, and typed planning refusals retain their own outcomes.
 
 Known unsupported bindings **decline at plan time** (`sirius_plan_get.cpp`); file-schema checks and admitted deletion-vector reads run during metadata preparation. Execution-time failures stop and drain the query before the [CPU replay policy](scan-contracts-design.md#cpu-replay-policy) is applied.
 
@@ -241,6 +263,16 @@ A lock-protected queue of pre-built splits. The producer (sequencer) enqueues vi
 ### Configuration
 
 `scan_manager_config` (`config.hpp`) tunes the thread pool, the IO backend selector (`backend`), uring/REST reactor counts, the prefetching cache, and object-store credentials.
+
+### Shared scan I/O capacity
+
+`shared_scan_budget` accounts for active reads across query readahead managers. A split that uses several backends reserves them atomically. Demand reads never wait for speculative capacity: they accrue debt that prevents further speculation on those backends until the reads finish. Nonempty speculative requests retain global oldest-query priority; backend-scoped priority is deferred to the performance work following the concurrency benchmark baseline.
+
+The readahead manager coordinates the local gatekeeper credit and shared backend ticket through one per-split ownership record. It publishes speculative ownership before preparing or issuing I/O. A demand read joining that attempt reuses its credits; if demand wins first, speculation is abandoned. Successful prefetch of the entire split releases both credits at completion and remembers coverage until disposal. I/O success and coverage are reported separately: each requested chunk must either be filled by that prefetch or already resident with a sufficient extent. A chunk skipped because another read owns it leaves coverage incomplete even if every submitted prefetch read succeeds. Failed, abandoned, or partial prefetch transfers the existing credits to an overlapping demand read, which returns them at disposal. Without an overlapping reader, those credits return immediately. Disposal does not release an in-flight prefetch's credits early: its callback retains the shared ticket even if the manager is destroyed.
+
+Each backend's limit stays fixed while it has active tickets or waiting requests. Conflicting limits are rejected, and entries are removed after their last user leaves. Waiting is cancellation-aware; ticket destruction releases capacity even after the budget facade has been destroyed. Empty requests consume no capacity and do not queue.
+
+Readahead preparation makes an initial attempt, retries with synchronous eviction, and permits one further eviction-assisted attempt after a 10 ms backoff. Speculation holds no credits during backoff; if demand has joined, the credits transfer to that reader instead. A retry checks cancellation and whether demand has overtaken the split before preparing it. Persistent pressure records one `skipped_memory_pressure` outcome for the candidate; `memory_retries` counts preparations actually retried. Demand I/O remains available when speculation is abandoned.
 
 ## Pinned Tables
 
@@ -373,10 +405,16 @@ pipeline completion; the normal GPU filter then removes its rows.
 
 **Statless entries and re-pinning.** Disabling the option before pinning skips the extra GPU work
 and creates an entry without zone maps. Turning the option on later does not retrofit statistics.
-A HOST re-pin replaces the entry. For an in-place GPU merge, the re-pin must cover every cached
-column and pass the normal merge-alignment checks; a strict subset cannot restore statistics.
-Unpinning and then re-pinning all required columns is the safest recovery. Merging a new GPU
-column while capture is disabled also drops the entry's existing zone maps.
+A HOST re-pin replaces the entry. A column-major GPU merge also builds a replacement generation
+privately, sharing the existing data columns and copying their metadata before appending new
+columns. To restore statistics, the re-pin must cover every cached column and pass the normal
+merge-alignment checks; a strict subset cannot restore statistics. Unpinning and then re-pinning
+all required columns is the safest recovery. Merging a new GPU column while capture is disabled
+drops the replacement generation's zone maps.
+
+Data and metadata are published together under the pin-registry lock. A failure before
+publication leaves the previous entry intact. SQL pin operations require exclusive maintenance;
+the direct column-merge API also rejects a merge while readers retain the existing entry.
 
 ## Batch Coalescing
 
@@ -459,6 +497,8 @@ When filter pushdown is enabled and the `gpu_expression_translator` successfully
 
    Before cuDF 26.12, the reader's bloom filter probe is wrong for some column types (rapidsai/cudf#24319). The reader filter (`_reader_pushdown_expression`) therefore leaves out equalities on the types listed by `has_unreliable_bloom_filter_probe()`, and they are applied post-decode. From cuDF 26.12 the list is empty.
 
+   `NOT IN` translates to inequalities joined by `NULL_LOGICAL_AND`, preserving SQL NULL semantics. It must not become `NOT` over an OR of equalities: the reader rewrites those equalities to Bloom membership probes, whose positive answers only mean a row group may contain a value. Negating those answers can discard mixed groups that also contain rows satisfying `NOT IN`.
+
 Reader-side pushdown is a per-split decision: an FLBA-decimal safety probe can disable it for a file, in which case the cached DuckDB filter expression is evaluated through `expression_evaluator` on the decoded batch in `post_filter_and_project`.
 
 Virtual-column scans currently disable reader-side row filtering, including dynamic-filter AST merging. Row-group statistics pruning remains enabled, but all rows in selected row groups are decoded before residual predicates and membership filters run—even for a selective `WHERE filename = ...`.
@@ -491,7 +531,7 @@ Only statically-known DuckDB `TableFilter`s participate in this DuckDB-native me
 | `io_context_registry` | `io/datasource_factory.{hpp,cpp}` | Scheme→backend registry. Each backend registers a scheme checker (the reactor's static `supports()`) and a factory; `lookup(scheme)` resolves a URI scheme to a backend type, `make_ioctx(type)` builds one. |
 | `prefetching_cache` | `io/cache/prefetching_cache.{hpp,cpp}` | Pinned-memory chunk cache with a lock-free per-chunk state machine, caller-driven preparation/prefetch, a background evictor, and tiered LRU scoring. Serves partial reads and populates itself on read. |
 | `buffer_pool` | `io/cache/types.{hpp,cpp}` | Growable pool of fixed-size pinned chunks, backed by a `cucascade::memory::fixed_size_host_memory_resource` per NUMA arena. Chunk size is the resource's block size. |
-| `metadata_store` | `io/cache/metadata_store.{hpp,cpp}` | Per-file metadata cache keyed by `io_object::raw_file_cache_id()`. Always present, independent of the prefetching cache; callers park parsed footers here so a later scan of the same path skips the parse. |
+| `metadata_store` | `io/cache/metadata_store.{hpp,cpp}` | Per-ioctx identity/profile metadata cache. Always present, independent of the prefetching cache; callers park parsed footers here so a later scan of the same object identity and profile skips the parse. |
 | `completion_controller` | `exec/completion_controller.hpp` | Unbounded RAII lifetime tracking. Cache-backed I/O and cached-copy waiters hold slots so teardown cannot destroy file entries or pinned chunks while a completion may still touch them; it is not a rate limit. |
 | `semi_future` / `try_t` / `completion_controller` | `exec/semi_future.hpp`, `exec/try.hpp`, `exec/completion_controller.hpp` | Async primitives the IO layer is built on. `semi_future<T>`/`promise<T>` are the wait-or-callback handles every async read returns; `try_t<T>` is the value-or-error result type; `completion_controller` + `completion_token` provide one-shot completion subscriptions. |
 
@@ -589,9 +629,11 @@ The cache does two things beyond classic prefetch:
 - **Partial reads.** A `device_read` over a range whose chunks are only partially cached copies the cached chunks straight to device and completes the rest from the backend in the same call, instead of treating a partial overlap as a miss.
 - **Populate-on-read.** On a backend that supports bounce-staged host-to-device reads, an uncached chunk being read for the device is loaded into a cache buffer (file → cache chunk → device) and published to the cache, so the next read of the same chunk is a hit — caching as a side effect of reading, like an OS page cache. A heavily-partial boundary chunk whose over-read would exceed ~25% of the chunk is instead read through an internal bounce slot and left uncached (zero over-read).
 
-Separately from the prefetching cache, the ioctx always exposes a `metadata_store` so parsed file metadata (e.g. a parquet footer) survives across scans of the same object generation regardless of whether prefetching is wired up. The store keeps one generation per path — a registration replaces whatever the path held — and `has_path()` is only an *open hint* (skip the footer probe when some generation's footer is known); the exact-key lookup decides whether the footer is reused.
+Separately from the prefetching cache, the ioctx always exposes a `metadata_store` so parsed file metadata (e.g. a parquet footer) survives across scans of the same object generation regardless of whether prefetching is wired up. The resident store has one entry per exact path and parser profile; the entry carries the object identity and the opened object's identity must match before reuse. For local files, the reusable identity is `{device, inode, size, ctime_ns}` captured from the opened descriptor. A same-inode in-place rewrite that preserves that tuple can therefore reuse older raw bytes or a parsed footer; local inputs are required to be immutable during a scan and should be updated by atomic replacement, which produces a new descriptor identity. A normal hit performs one exact index lookup and an identity check; there is no recency update or LRU scan. `has_path()` is only an *open hint* (skip the footer probe when some generation's footer is known); a path-level reverse index is used only to invalidate profiles when that path's identity changes. There is currently no per-statement opt-out for cross-statement local footer/byte reuse; an opt-out can be revisited with the retention owner after #209/#2108. HOST/runtime residency budgets, byte accounting, eviction limits, and their diagnostics remain a follow-up owned by the finalized cuCascade IO lifecycle in #2108, after the #209/#2108 identity-header handoff. R3 keeps the existing ioctx-scoped residency behavior and does not claim those bounds are implemented here.
 
 **fadvise protocol.** `sirius_datasource::fadvise(ranges, dev_id)` registers a scan range set and stashes its `cache_handle`. The readahead manager later drives that handle through allocation and asynchronous prefetch; the consumer stage records when reading begins so stale work can be refused or awaited instead of issuing duplicate I/O.
+
+Metadata opens advance a per-path observation fence using the existing monotonic `open_generation`; an unchanged identity keeps its cached artifact. A producer for a superseded identity can finish for its callers but cannot republish into the index. Concurrent misses for the same path, identity and parser profile share one result or exception; a failed flight is removed so a later request can retry. The store's stop-token wait cancels only that waiter, leaving the producer and other waiters intact. `statistics()` and `describe_metadata_store()` expose hits, misses, joined waits, builds, failures, cancelled waiters, stale publications and in-flight work. The dump also lists entry keys, identities, generations and holder counts. These are event counts and ownership diagnostics, not memory budgets.
 
 ### Cache Internals
 
@@ -604,6 +646,13 @@ Separately from the prefetching cache, the ioctx always exposes a `metadata_stor
 - **Evictor as backpressure.** When the buffer pool can't satisfy a load, the worker posts an eviction request and blocks until the evictor returns enough chunks; pool exhaustion is never a silent failure. Eviction walks LRU candidates using a per-chunk `chunk_lifecycle` score (query-tick aging plus insert/consume counts), so never-consumed entries are not evicted first.
 - **Multi-GPU safe.** Device reads carry the caller's device id; the reactor sets the device before the H2D copy, and pinned chunks are portable across CUDA contexts.
 - **Generations.** Cache entries are keyed by the io_object's cache id (path plus strong ETag for object stores, path for local files) and shared-owned: the map holds one owner while a generation is current, and a `cache_handle`, an in-flight fill, a queued completion, or a cached-copy retirement holds another for as long as it may touch the generation's chunks. Admitting a newer generation of a path retires the older ones — they leave the map, keep serving their holders, and are reclaimed synchronously when the last owner releases. The evictor only borrows. `generation_count(path)` and `retired_generation_count()` expose the state.
+
+Cache summaries report cumulative `global` counters and `last_cycle` deltas over a cache-wide
+interval between refreshes, not work attributed to one query. A refresh samples each counter
+once and advances the reporting baseline under one mutex; formatting and logging happen after
+releasing it. The scan manager logs that same captured report. Diagnostic `summary()` calls do
+not advance the baseline. Counter writers remain lock-free with respect to this mutex, so the
+five counters are individually sampled rather than an atomic snapshot of an entire read.
 
 ### Constants
 

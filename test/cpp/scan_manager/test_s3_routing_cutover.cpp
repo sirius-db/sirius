@@ -114,41 +114,13 @@ std::vector<std::uint8_t> read_binary_file(std::filesystem::path const& path)
   return std::vector<std::uint8_t>(chars.begin(), chars.end());
 }
 
-std::unique_ptr<cudf::io::datasource::buffer> read_local_parquet_footer(
-  cudf::io::datasource& source)
+void prime_parquet_metadata(sirius::io::sirius_datasource& source, std::string const& path)
 {
-  auto constexpr footer_tail_size = sizeof(cudf::io::parquet::file_ender_s);
-  auto const file_size            = source.size();
-  REQUIRE(file_size >= footer_tail_size);
-
-  auto tail = source.host_read(file_size - footer_tail_size, footer_tail_size);
-
-  std::uint32_t footer_size = 0;
-  std::memcpy(&footer_size, tail->data(), sizeof(footer_size));
-  REQUIRE(file_size >= footer_tail_size + footer_size);
-
-  return source.host_read(file_size - footer_tail_size - footer_size, footer_size);
-}
-
-std::shared_ptr<cudf::io::parquet::FileMetaData const> read_local_parquet_metadata(
-  std::filesystem::path const& path)
-{
-  auto source = cudf::io::datasource::create(path.string());
-  auto footer = read_local_parquet_footer(*source);
-  auto opts   = cudf::io::parquet_reader_options::builder().build();
-  cudf::io::parquet::experimental::hybrid_scan_reader reader{
-    cudf::host_span<std::uint8_t const>(footer->data(), footer->size()), opts};
-  return std::make_shared<cudf::io::parquet::FileMetaData const>(reader.parquet_metadata());
-}
-
-sirius::op::scan::parquet_encryption_evidence read_local_parquet_encryption(
-  std::filesystem::path const& path)
-{
-  auto source   = cudf::io::datasource::create(path.string());
-  auto footer   = read_local_parquet_footer(*source);
-  auto evidence = sirius::op::scan::inspect_parquet_encryption({footer->data(), footer->size()});
-  REQUIRE(evidence.complete);
-  return evidence;
+  auto const options = cudf::io::parquet_reader_options::builder().build();
+  auto metadata      = sirius::op::scan::resolve_parquet_metadata(source, 0, path, options);
+  REQUIRE(metadata != nullptr);
+  REQUIRE(metadata->built_for_identity == source.get_io_object().identity_cache_key());
+  REQUIRE(source.metadata() == metadata);
 }
 
 std::string strip_file_scheme_for_registry(std::string const& path)
@@ -233,7 +205,7 @@ routing_observations collect_routing_observations(
   while (ingestible.has_processed_all_metadata() == false) {
     auto task = ingestible.next_split_provider(resolver);
     if (!task) { continue; }
-    auto scan = task();
+    auto scan = task({});
     REQUIRE(scan != nullptr);
     auto* file_scan = dynamic_cast<sirius::op::scan::parquet_file_scan_info*>(scan.get());
     REQUIRE(file_scan != nullptr);
@@ -571,6 +543,23 @@ TEST_CASE("scan_manager concurrent first-touch reuses one routed S3 ioctx", "[s3
   CHECK(datasource->io_ctx().get() == expected);
 }
 
+TEST_CASE("scan_manager planning backend lookup does not open remote objects", "[s3][routing]")
+{
+  scan_manager_fixture fixture;
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{
+    scan_lifecycle,
+    make_s3_scan_config("http://127.0.0.1:1", sirius::scan_manager::io_backend::sirius),
+    *fixture.memory,
+    fixture.topology};
+
+  // Port 1 has no test server. A successful lookup proves the planner only
+  // consulted URI/backend capability and did not construct an ioctx or issue
+  // a HEAD/credential probe.
+  CHECK(manager.planning_io_backend("s3://planning-bucket/data/a.puffin") ==
+        io_context_type::restful);
+}
+
 TEST_CASE("scan_manager create_datasource normalizes file URI paths before routing",
           "[s3][routing]")
 {
@@ -783,22 +772,18 @@ TEST_CASE("parquet_gpu_ingestible resolver routes each parquet file independentl
 
   std::string const s3_uri     = "s3://routing-bucket/nation.parquet";
   std::string const local_path = fixture_path.string();
-  auto const metadata          = read_local_parquet_metadata(fixture_path);
-  auto const encryption        = read_local_parquet_encryption(fixture_path);
 
   auto s3_ds = manager.create_datasource(s3_uri);
   REQUIRE(s3_ds != nullptr);
   REQUIRE(s3_ds->io_ctx() != nullptr);
   REQUIRE(s3_ds->io_ctx()->type() == io_context_type::restful);
-  REQUIRE(s3_ds->store_metadata(std::make_shared<sirius::op::scan::parquet_metadata>(
-    metadata, /*footer_byte_len=*/0, encryption)));
+  prime_parquet_metadata(*s3_ds, s3_uri);
 
   auto local_ds = manager.create_datasource(local_path);
   REQUIRE(local_ds != nullptr);
   REQUIRE(local_ds->io_ctx() != nullptr);
   REQUIRE(is_local_backend(local_ds->io_ctx()->type()));
-  REQUIRE(local_ds->store_metadata(std::make_shared<sirius::op::scan::parquet_metadata>(
-    metadata, /*footer_byte_len=*/0, encryption)));
+  prime_parquet_metadata(*local_ds, local_path);
 
   auto ingestible = sirius::op::scan::make_ingestible(
     make_nation_table_info(std::vector<std::string>{s3_uri, local_path}));
@@ -826,18 +811,14 @@ TEST_CASE("split_provider resolver routes mixed parquet files independently", "[
 
   std::string const s3_uri     = "s3://routing-bucket/nation.parquet";
   std::string const local_path = fixture_path.string();
-  auto const metadata          = read_local_parquet_metadata(fixture_path);
-  auto const encryption        = read_local_parquet_encryption(fixture_path);
 
   auto s3_ds = manager.create_datasource(s3_uri);
   REQUIRE(s3_ds != nullptr);
-  REQUIRE(s3_ds->store_metadata(std::make_shared<sirius::op::scan::parquet_metadata>(
-    metadata, /*footer_byte_len=*/0, encryption)));
+  prime_parquet_metadata(*s3_ds, s3_uri);
 
   auto local_ds = manager.create_datasource(local_path);
   REQUIRE(local_ds != nullptr);
-  REQUIRE(local_ds->store_metadata(std::make_shared<sirius::op::scan::parquet_metadata>(
-    metadata, /*footer_byte_len=*/0, encryption)));
+  prime_parquet_metadata(*local_ds, local_path);
 
   auto provider_ingestible = sirius::op::scan::make_ingestible(
     make_nation_table_info(std::vector<std::string>{s3_uri, local_path}));
@@ -848,7 +829,7 @@ TEST_CASE("split_provider resolver routes mixed parquet files independently", "[
   while (provider.has_more_splits()) {
     auto task = provider.next_split_provider();
     if (!task) { continue; }
-    auto scan = task();
+    auto scan = task({});
     REQUIRE(scan != nullptr);
     auto* file_scan = dynamic_cast<sirius::op::scan::parquet_file_scan_info*>(scan.get());
     REQUIRE(file_scan != nullptr);

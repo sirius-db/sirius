@@ -22,6 +22,7 @@
 #include "planner/query_index.hpp"
 #include "scan_manager/config.hpp"
 #include "scan_manager/gatekeeper.hpp"
+#include "scan_manager/shared_scan_budget.hpp"
 
 #include <array>
 #include <atomic>
@@ -31,6 +32,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -143,7 +145,7 @@ struct readahead_counters {
 
 /// Bytes the readahead holds in prefetches the consumer has not yet disposed.
 ///
-/// The gatekeeper caps IO in flight (a ticket returns when a prefetch lands);
+/// The IO budget caps reads in flight (a ticket returns when a prefetch lands);
 /// a landed prefetch still pins its chunks until its split is disposed, so this
 /// is the byte-denominated bound.  Each charge is recorded on the split
 /// (@c scan_info::set_readahead_resident_bytes) so that whichever release path
@@ -175,11 +177,11 @@ class readahead_byte_budget {
   /// take ran before our set, our set's acquire sees the stage and we take the
   /// record back ourselves; otherwise the dispose's take sees our bytes.
   /// Returns the resident total after the charge.
-  std::size_t charge(op::scan::scan_info& split, std::size_t bytes);
+  std::size_t charge(op::scan::scan_info const& split, std::size_t bytes);
 
   /// Return whatever is still charged for @p split.  Safe to call from every
   /// release path; only the first finds anything.
-  void release(op::scan::scan_info& split) noexcept;
+  void release(op::scan::scan_info const& split) noexcept;
 
  private:
   std::size_t _max_bytes{0};
@@ -217,8 +219,10 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
   /// pressure.
   readahead_scan_manager(event::query_event_publisher& publisher,
                          std::size_t budget,
-                         std::size_t max_resident_bytes                                       = 0,
-                         std::function<bool()> host_under_pressure                            = {},
+                         std::shared_ptr<shared_scan_budget> shared_budget = nullptr,
+                         std::optional<std::size_t> budget_override        = std::nullopt,
+                         std::size_t max_resident_bytes                    = 0,
+                         std::function<bool()> host_under_pressure         = {},
                          std::shared_ptr<op::scan::physical_check_counters> physical_counters = {})
     : event::query_event_subscriber(publisher,
                                     {event::event_type::task_deployed,
@@ -228,6 +232,8 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
       _budget(budget),
       _gatekeeper(static_cast<int>(budget)),
       _physical_counters(std::move(physical_counters)),
+      _shared_budget(std::move(shared_budget)),
+      _budget_override(budget_override),
       _resident(max_resident_bytes),
       _host_under_pressure(std::move(host_under_pressure))
   {
@@ -239,7 +245,8 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
 
   [[nodiscard]] std::string_view name() const noexcept override { return "readahead"; }
 
-  /// Seed the per-operator readahead order for @p query.
+  /// Seed the per-operator readahead order for @p query once, before start() or
+  /// publishing splits. The query ID and order are immutable once workers start.
   void prepare_for_query(const sirius::planner::query& query);
 
   /// Start the worker that drives the readahead.  Idempotent: a second call
@@ -293,7 +300,9 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
                                    std::size_t bytes_needed) noexcept override;
 
   /// Report that @p task, emitted under @p operator_id, reached @p stage.
-  /// Wakes the worker so a freed slot is refilled.
+  /// The split is owned by shared_ptr, as in register_scan_task. Its stage must
+  /// be published via set_scan_stage before this notification. Wakes the worker
+  /// so a freed slot is refilled.
   void update_scan_state(std::size_t operator_id,
                          const op::scan::scan_info* task,
                          io::cache::scan_stage stage);
@@ -352,13 +361,25 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
 
   prefetch_candidate get_next_prefetching_candidate();
 
-  /// Classify and record one settled prefetch, then hand its slot back.
-  /// @p split is weak: a completion firing after the split was consumed still
-  /// has to release the slot, and "gone" is itself an answer.
-  void on_prefetch_complete(std::size_t operator_id,
-                            std::weak_ptr<op::scan::scan_info> const& split,
-                            bool issued_io,
-                            bool allocation_failed);
+  /// Both budgets have one owner per split. A prefetch publishes this before
+  /// preparing/issuing IO; demand joins it rather than charging another ticket.
+  /// A covered entry holds no capacity, but remembers success until disposal.
+  struct scan_ticket {
+    enum class phase { prefetching, demand, covered };
+    phase owner{phase::prefetching};
+    bool demand_started{false};
+    shared_scan_budget::token shared;
+  };
+  using split_key = std::weak_ptr<const op::scan::scan_info>;
+
+  void on_prefetch_complete(split_key const& split,
+                            std::shared_ptr<scan_ticket> const& ticket,
+                            op::scan::scan_info::prefetch_outcome out);
+  /// Release capacity, or transfer it to an overlapping demand read if prefetch
+  /// failed/was abandoned. Called only after preparation/IO has settled.
+  void settle_prefetch(split_key const& split,
+                       std::shared_ptr<scan_ticket> const& ticket,
+                       bool covered);
 
   void arm_prefetching();
 
@@ -439,6 +460,14 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
   /// for stage events -- which happens before @ref start runs.  It hands out no
   /// tickets until armed, so existing this early costs nothing.
   gatekeeper _gatekeeper;
+  query_id_t _query_id{make_query_id(0)};
+  std::shared_ptr<shared_scan_budget> _shared_budget;
+  std::optional<std::size_t> _budget_override;
+  std::mutex _tickets_mutex;
+  // Ownership identity avoids confusing a late completion with a new split
+  // allocated at the same address. Neither the map nor callbacks retain splits.
+  std::map<split_key, std::shared_ptr<scan_ticket>, std::owner_less<>> _tickets;
+  shared_scan_budget::token acquire_shared_ticket(const op::scan::scan_info& task, bool demand);
   std::atomic<bool> _prefetching_started{false};
   std::atomic<size_t> _cursor{0};
 
@@ -446,17 +475,13 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
   readahead_byte_budget _resident;
   /// True while the host tier wants memory back; empty = never.
   std::function<bool()> _host_under_pressure;
+  /// Generation of disposed splits, which a candidate held back for room waits
+  /// on (bounded by its retry timer).
+  std::mutex _disposal_mutex;
+  std::condition_variable _disposal_cv;
+  std::uint64_t _disposal_generation{0};
 
-  /// Generation of fully-published `disposed` scan transitions. A preparation
-  /// retry snapshots this before synchronous eviction and waits for it to move
-  /// (or for its bounded timer) when the pool is still short afterwards.
-  std::mutex _disposable_mutex;
-  std::condition_variable _disposable_cv;
-  std::uint64_t _disposable_generation{0};
-
-  /// Tops the in-flight scan set back up from the scheduler. Under memory
-  /// pressure it waits for a disposed scan notification, bounded by 25 ms so a
-  /// missed/coalesced notification cannot strand the worker.
+  /// Fill speculative capacity; abandon a candidate after bounded eviction attempts.
   void worker_loop(const std::stop_token& st);
 
   prefetch_strategy _strategy{prefetch_strategy::eager};

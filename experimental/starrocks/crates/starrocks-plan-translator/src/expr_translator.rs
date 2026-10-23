@@ -118,6 +118,7 @@ fn translate_expr_node(
         TExprNodeType::IN_PRED => translate_in_pred(node, children, ctx),
         TExprNodeType::CASE_EXPR => translate_case(node, children),
         TExprNodeType::FUNCTION_CALL => translate_function_call(node, children, ctx),
+        TExprNodeType::CLONE_EXPR => translate_clone(node, children),
         _ => Err(TranslateError::UnsupportedExpression {
             node_type: node.node_type,
             reason: "expression node is outside the v1 StarRocks slice",
@@ -483,6 +484,12 @@ fn translate_case(node: &TExprNode, children: Vec<Expression>) -> Result<Express
     })
 }
 
+/// Unwraps a StarRocks `CLONE_EXPR`, which the FE inserts when two slots share one column.
+fn translate_clone(node: &TExprNode, children: Vec<Expression>) -> Result<Expression> {
+    expect_child_count(node, &children, 1)?;
+    Ok(children.into_iter().next().unwrap())
+}
+
 /// Converts a StarRocks `FUNCTION_CALL` into a Substrait expression.
 ///
 /// Functions are allowlisted so an unknown StarRocks builtin fails loudly instead of silently
@@ -500,14 +507,16 @@ fn translate_function_call(
     let output_type = type_mapper::map_type_desc(&node.type_, node.is_nullable.unwrap_or(true))?;
 
     // Null checks the frontend planned as builtin calls rather than IS_NULL_PRED nodes.
-    let (urn, mapped) = match name {
+    // `widens_to_bigint`: DuckDB returns BIGINT where the FE slot is narrower (year SMALLINT,
+    // month/day TINYINT, length INT), so the result is cast back for the next hop's schema.
+    let (urn, mapped, widens_to_bigint) = match name {
         "is_null_pred" => {
             expect_child_count(node, &children, 1)?;
-            (URN_COMPARISON, "is_null")
+            (URN_COMPARISON, "is_null", false)
         }
         "is_not_null_pred" => {
             expect_child_count(node, &children, 1)?;
-            (URN_COMPARISON, "is_not_null")
+            (URN_COMPARISON, "is_not_null", false)
         }
         "if" => {
             expect_child_count(node, &children, 3)?;
@@ -538,7 +547,7 @@ fn translate_function_call(
                     });
                 }
             }
-            (URN_STRING, "like")
+            (URN_STRING, "like", false)
         }
         "substring" | "substr" => {
             // The GPU evaluator supports exactly `substring(col, start, length)` with constant,
@@ -556,17 +565,17 @@ fn translate_function_call(
                     reason: "substring requires constant positive start and length",
                 });
             }
-            (URN_STRING, "substring")
+            (URN_STRING, "substring", false)
         }
         // StarRocks `length` counts bytes; `octet_length` remaps to DuckDB's byte-length
         // (`strlen`), while `char_length` keeps codepoint semantics on both sides.
-        "length" => (URN_STRING, "octet_length"),
-        "char_length" => (URN_STRING, "char_length"),
+        "length" => (URN_STRING, "octet_length", true),
+        "char_length" => (URN_STRING, "char_length", true),
         // `concat` is intentionally absent: StarRocks concat is NULL-strict while DuckDB's
         // ignores NULL arguments, so a name-level mapping would change results. Other string
         // and math builtins (upper/lower/trim/abs/floor/...) are absent because the GPU
         // expression evaluator has no implementations for them yet.
-        "year" | "month" | "day" => (URN_DATETIME, name),
+        "year" | "month" | "day" => (URN_DATETIME, name, true),
         _ => {
             return Err(TranslateError::malformed(format!(
                 "unsupported StarRocks function call {name:?}"
@@ -574,6 +583,16 @@ fn translate_function_call(
         }
     };
     let anchor = ctx.registry.register_function(urn, mapped);
+    if widens_to_bigint {
+        let produced = type_mapper::i64_type(node.is_nullable.unwrap_or(true));
+        return Ok(Expression {
+            rex_type: Some(expression::RexType::Cast(Box::new(expression::Cast {
+                r#type: Some(output_type),
+                input: Some(Box::new(scalar_function(anchor, children, produced))),
+                failure_behavior: expression::cast::FailureBehavior::ThrowException as i32,
+            }))),
+        });
+    }
     Ok(scalar_function(anchor, children, output_type))
 }
 
@@ -629,18 +648,6 @@ pub(crate) fn aggregate_call(expr: &TExpr, ctx: &mut ExprContext<'_>) -> Result<
         return Err(TranslateError::UnsupportedExpression {
             node_type: root.node_type,
             reason: "aggregate function root is not an aggregate expression",
-        });
-    }
-    // One-phase aggregation only: a merge aggregate consumes partial states this translator
-    // does not model (run with `new_planner_agg_stage = 1`).
-    if root
-        .agg_expr
-        .as_ref()
-        .is_some_and(|agg_expr| agg_expr.is_merge_agg)
-    {
-        return Err(TranslateError::UnsupportedExpression {
-            node_type: root.node_type,
-            reason: "merge-phase aggregate functions are not supported (one-phase only)",
         });
     }
     let function = root.fn_.as_ref().ok_or(TranslateError::MissingField {

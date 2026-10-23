@@ -28,6 +28,8 @@
  *        through 64-bit XXHash_64 fingerprints (pinned against a host reference of the same hash).
  */
 
+#include "operator/dynamic_filter_accumulation_test_utils.hpp"
+
 #include <cudf/aggregation.hpp>
 #include <cudf/ast/expressions.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -46,6 +48,7 @@
 #include <cudf/wrappers/timestamps.hpp>
 
 #include <rmm/device_buffer.hpp>
+#include <rmm/device_uvector.hpp>
 
 #include <cuda_runtime.h>
 
@@ -53,9 +56,11 @@
 #include <helper/numeric_carrier_rule.hpp>
 #include <helper/numeric_narrowing.hpp>
 #include <op/dynamic_filter/dynamic_filter_key_domain.hpp>
+#include <op/dynamic_filter/dynamic_filter_mask_ops.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -151,7 +156,8 @@ void attach_validity(cudf::column& col, std::vector<bool> const& valid, ::cuda::
     static_cast<cudf::size_type>(std::count(valid.begin(), valid.end(), false));
   auto const words = upload_prior_mask(valid, stream);
   auto mask        = cudf::create_null_mask(col.size(), cudf::mask_state::UNINITIALIZED, stream);
-  REQUIRE(mask.size() >= words.size());
+  // create_null_mask allocates bytes for the rows, while typed buffer sizes count words.
+  REQUIRE(cudf::bitmask_allocation_size_bytes(col.size()) >= words.size());
   REQUIRE(cudaMemcpyAsync(
             mask.data(), words.data(), words.size(), cudaMemcpyDeviceToDevice, stream.get()) ==
           cudaSuccess);
@@ -2426,4 +2432,221 @@ TEST_CASE("device probe conversion matches the host fit rule at every carrier bo
     STATIC_REQUIRE(sirius::range_fits<std::int16_t>(-32768, 32767));
     STATIC_REQUIRE_FALSE(sirius::range_fits<std::int16_t>(-32768, 32768));
   }
+}
+
+namespace {
+
+void check_bool8_prior(sirius::op::sirius_mask_applicable const& filter,
+                       cudf::column_view const& probe,
+                       ::cuda::stream_ref stream)
+{
+  auto const mr = cudf::get_current_device_resource_ref();
+  auto const n  = probe.size();
+  auto unhinted = filter.compute_mask(probe, nullptr, kDevice, stream, mr);
+  REQUIRE(unhinted != nullptr);
+  auto const plain = mask_to_host(unhinted->view(), stream);
+  for (int pattern = 0; pattern < 3; ++pattern) {
+    CAPTURE(pattern);
+    // Prior and probe offsets deliberately differ.
+    std::vector<std::uint8_t> values(static_cast<std::size_t>(n) + 7, 0);
+    std::vector<bool> keep(static_cast<std::size_t>(n));
+    for (cudf::size_type row = 0; row < n; ++row) {
+      keep[row]       = pattern == 0 || (pattern == 1 && row % 3 == 0);
+      values[row + 5] = keep[row];
+    }
+    auto prior_owner   = make_values(values, cudf::data_type{cudf::type_id::BOOL8}, stream);
+    auto const prior   = cudf::slice(prior_owner->view(), {5, 5 + n}, stream).front();
+    auto const packed  = upload_prior_mask(keep, stream);
+    auto stencilled    = filter.compute_mask_if(probe, prior, kDevice, stream, mr);
+    auto packed_result = filter.compute_mask(
+      probe, static_cast<std::uint32_t const*>(packed.data()), kDevice, stream, mr);
+    REQUIRE(stencilled != nullptr);
+    REQUIRE(packed_result != nullptr);
+    REQUIRE_FALSE(stencilled->nullable());
+    rmm::device_uvector<cudf::size_type> counts(3, stream, mr);
+    REQUIRE(
+      cudaMemsetAsync(counts.data(), 0, counts.size() * sizeof(cudf::size_type), stream.get()) ==
+      cudaSuccess);
+    auto reference = std::make_unique<cudf::column>(unhinted->view(), stream, mr);
+    sirius::op::fold_dynamic_filter_mask(
+      reference->mutable_view(), prior, counts.data(), false, stream);
+    sirius::op::fold_dynamic_filter_mask(
+      stencilled->mutable_view(), prior, counts.data() + 1, false, stream);
+    sirius::op::fold_dynamic_filter_mask(
+      packed_result->mutable_view(), prior, counts.data() + 2, false, stream);
+    auto expected = plain;
+    for (cudf::size_type row = 0; row < n; ++row) {
+      expected[row] = expected[row] && keep[row];
+    }
+    CHECK(mask_to_host(reference->view(), stream) == expected);
+    CHECK(mask_to_host(stencilled->view(), stream) == expected);
+    CHECK(mask_to_host(packed_result->view(), stream) == expected);
+    std::vector<cudf::size_type> host_counts(3);
+    REQUIRE(cudaMemcpyAsync(host_counts.data(),
+                            counts.data(),
+                            counts.size() * sizeof(cudf::size_type),
+                            cudaMemcpyDeviceToHost,
+                            stream.get()) == cudaSuccess);
+    stream.sync();
+    auto const expected_count =
+      static_cast<cudf::size_type>(std::count(expected.begin(), expected.end(), 1));
+    CHECK(host_counts == std::vector<cudf::size_type>(3, expected_count));
+  }
+}
+
+void check_all_bool8_priors(cudf::column_view const& keys,
+                            cudf::column_view const& probe,
+                            ::cuda::stream_ref stream)
+{
+  auto const mr = cudf::get_current_device_resource_ref();
+  sirius_dynamic_small_in_list_filter small{keys, stream, mr};
+  sirius_dynamic_in_list_filter hash{keys, stream, mr};
+  sirius_dynamic_bloom_filter bloom{keys, stream, mr};
+  for (sirius::op::sirius_mask_applicable const* filter :
+       std::array<sirius::op::sirius_mask_applicable const*, 3>{&small, &hash, &bloom}) {
+    check_bool8_prior(*filter, probe, stream);
+  }
+}
+
+}  // namespace
+
+TEST_CASE("BOOL8 prior preserves sliced nullable key family conjunctions",
+          "[dynamic_filter][probe][bool8_prior]")
+{
+  ::cuda::stream_ref const stream = cudf::get_default_stream();
+  SECTION("signed carriers and conservative sentinel")
+  {
+    auto keys = make_int32({7, 11, std::numeric_limits<std::int32_t>::min()}, stream);
+    std::vector<std::int64_t> values(74);
+    for (std::size_t i = 0; i < values.size(); ++i) {
+      values[i] = i % 4 == 0   ? std::numeric_limits<std::int32_t>::min()
+                  : i % 4 == 1 ? 7
+                  : i % 4 == 2 ? 11
+                               : 5'000'000'000LL;
+    }
+    auto probe = make_int64(values, stream);
+    std::vector<bool> valid(values.size(), true);
+    for (std::size_t i = 0; i < valid.size(); i += 7) {
+      valid[i] = false;
+    }
+    attach_validity(*probe, valid, stream);
+    check_all_bool8_priors(
+      keys->view(), cudf::slice(probe->view(), {3, 73}, stream).front(), stream);
+  }
+  SECTION("unsigned carriers and sentinel")
+  {
+    auto keys  = make_values<std::uint32_t>({7, 9, std::numeric_limits<std::uint32_t>::max()},
+                                           cudf::data_type{cudf::type_id::UINT32},
+                                           stream);
+    auto probe = make_values<std::uint64_t>({0,
+                                             7,
+                                             9,
+                                             std::numeric_limits<std::uint32_t>::max(),
+                                             std::numeric_limits<std::uint64_t>::max(),
+                                             7},
+                                            cudf::data_type{cudf::type_id::UINT64},
+                                            stream);
+    check_all_bool8_priors(
+      keys->view(), cudf::slice(probe->view(), {1, 6}, stream).front(), stream);
+  }
+  SECTION("narrow DATE carrier")
+  {
+    auto keys  = make_days({-7, 0, 9}, stream);
+    auto probe = make_values<std::int16_t>(
+      {99, -7, 0, 8, 9, 99}, cudf::data_type{cudf::type_id::INT16}, stream);
+    check_all_bool8_priors(
+      keys->view(), cudf::slice(probe->view(), {1, 5}, stream).front(), stream);
+  }
+  SECTION("timestamp")
+  {
+    auto const type = cudf::data_type{cudf::type_id::TIMESTAMP_MICROSECONDS};
+    auto keys       = make_temporal<std::int64_t>({-7, 0, 9}, type, stream);
+    auto probe      = make_temporal<std::int64_t>({99, -7, 0, 8, 9, 99}, type, stream);
+    check_all_bool8_priors(
+      keys->view(), cudf::slice(probe->view(), {1, 5}, stream).front(), stream);
+  }
+  SECTION("wide decimal range rejection")
+  {
+    auto keys = make_decimal<std::int32_t>({-7, 0, 9}, stream);
+    auto probe =
+      make_decimal<__int128_t>({99, -7, 0, static_cast<__int128_t>(1) << 100, 9, 99}, stream);
+    check_all_bool8_priors(
+      keys->view(), cudf::slice(probe->view(), {1, 5}, stream).front(), stream);
+  }
+  SECTION("nullable strings including empty strings")
+  {
+    auto keys  = make_strings({"", "pear", "apple", std::nullopt}, stream);
+    auto probe = make_strings({"pad", "apple", std::nullopt, "", "pear", "absent", "pad"}, stream);
+    check_all_bool8_priors(
+      keys->view(), cudf::slice(probe->view(), {1, 6}, stream).front(), stream);
+  }
+  SECTION("empty probe")
+  {
+    auto keys  = make_int32({7}, stream);
+    auto probe = make_int32({}, stream);
+    check_all_bool8_priors(keys->view(), probe->view(), stream);
+  }
+}
+
+TEST_CASE("BOOL8 prior rejects malformed hints and preserves capability declines",
+          "[dynamic_filter][probe][bool8_prior]")
+{
+  ::cuda::stream_ref const stream = cudf::get_default_stream();
+  auto const mr                   = cudf::get_current_device_resource_ref();
+  auto keys                       = make_int32({7}, stream);
+  auto probe                      = make_int32({7, 8}, stream);
+  auto keep     = make_values<std::uint8_t>({1, 0}, cudf::data_type{cudf::type_id::BOOL8}, stream);
+  auto nullable = std::make_unique<cudf::column>(keep->view(), stream, mr);
+  attach_validity(*nullable, {true, true}, stream);
+  sirius_dynamic_small_in_list_filter small{keys->view(), stream, mr};
+  sirius_dynamic_in_list_filter hash{keys->view(), stream, mr};
+  sirius_dynamic_bloom_filter bloom{keys->view(), stream, mr};
+  for (sirius::op::sirius_mask_applicable const* filter :
+       std::array<sirius::op::sirius_mask_applicable const*, 3>{&small, &hash, &bloom}) {
+    CHECK_THROWS_AS(filter->compute_mask_if(probe->view(), probe->view(), kDevice, stream, mr),
+                    std::invalid_argument);
+    CHECK_THROWS_AS(filter->compute_mask_if(probe->view(), nullable->view(), kDevice, stream, mr),
+                    std::invalid_argument);
+    CHECK_THROWS_AS(
+      filter->compute_mask_if(
+        probe->view(), cudf::slice(keep->view(), {0, 1}, stream).front(), kDevice, stream, mr),
+      std::invalid_argument);
+    CHECK(filter->compute_mask_if(keep->view(), keep->view(), kDevice, stream, mr) == nullptr);
+    CHECK(filter->compute_mask_if(probe->view(), keep->view(), 1'000'000, stream, mr) == nullptr);
+  }
+}
+
+TEST_CASE("BOOL8 prior default remains a sound unhinted capability fallback",
+          "[dynamic_filter][probe][bool8_prior]")
+{
+  class ignores_prior final : public sirius::op::sirius_mask_applicable {
+   public:
+    std::unique_ptr<cudf::column> compute_mask(cudf::column_view const& probe,
+                                               std::uint32_t const*,
+                                               int,
+                                               ::cuda::stream_ref stream,
+                                               rmm::device_async_resource_ref mr) const override
+    {
+      return std::make_unique<cudf::column>(probe, stream, mr);
+    }
+  } filter;
+  ::cuda::stream_ref const stream = cudf::get_default_stream();
+  auto probe =
+    make_values<std::uint8_t>({1, 1, 0, 1, 0, 1}, cudf::data_type{cudf::type_id::BOOL8}, stream);
+  check_bool8_prior(filter, probe->view(), stream);
+}
+
+TEST_CASE("BOOL8 prior probes accumulated Bloom replicas",
+          "[dynamic_filter][probe][bool8_prior][multi_partition]")
+{
+  sirius::test::accumulation::fixture fixture;
+  auto first  = fixture.make_batch(0, 0, 100);
+  auto second = fixture.make_batch(0, 1000, 100);
+  REQUIRE(fixture.begin({first, second}));
+  fixture.contribute(first);
+  fixture.contribute(second);
+  fixture.publish(0, second->get_batch_id());
+  auto const stream = fixture.task_stream(0);
+  auto probe        = make_int32({0, 50, 99, 1000, 1099, 9999}, stream);
+  check_bool8_prior(fixture.published_bloom(0), probe->view(), stream);
 }

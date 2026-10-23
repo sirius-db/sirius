@@ -15,6 +15,7 @@
  */
 
 #pragma once
+#include "expression_evaluator/query_policy.hpp"
 
 // cudf
 #include <cudf/table/table.hpp>
@@ -37,6 +38,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -90,7 +92,7 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
     _execution_completion = std::move(completion);
   }
 
-  using metadata_scan_task_t = std::function<std::unique_ptr<scan_info>()>;
+  using metadata_scan_task_t = std::function<std::unique_ptr<scan_info>(std::stop_token)>;
 
   virtual ~gpu_ingestible() = default;
 
@@ -108,13 +110,15 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
    *        fail closed for non-query callers.
    * @param like_cache Query-owned immutable LIKE classifications. A null value gives any
    *        evaluator a private cache.
+   * @param policy Immutable expression settings from the query or pin invocation.
    * @return Materialized table and filtering state
    */
   filtered_table materialize_table(
     const op::scan::scan_operator_input& split,
     ::cuda::stream_ref stream,
     bool like_swar_fastpath                                           = false,
-    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache = nullptr);
+    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache = nullptr,
+    expression_query_policy policy                                    = {});
 
   virtual std::unique_ptr<batch_coalescer> create_batch_coalescer() const = 0;
 
@@ -154,6 +158,7 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
    *        fail closed for non-query callers.
    * @param like_cache Query-owned immutable LIKE classifications. A null value gives any
    *        evaluator a private cache.
+   * @param policy Immutable expression settings from the query or pin invocation.
    *
    * Implementations allocate through this space's allocator. The caller must
    * make its device current before calling this method. I/O uses the datasource
@@ -164,7 +169,33 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
     const cucascade::memory::memory_space& mem_space,
     ::cuda::stream_ref stream,
     bool like_swar_fastpath                                           = false,
-    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache = nullptr) = 0;
+    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache = nullptr,
+    expression_query_policy policy                                    = {}) = 0;
+
+  /**
+   * @brief Whether `view_layout` can describe any resident batch of this scan
+   *
+   * A plan-static fact that `sirius_gpu_scan_operator::cached_view_possible` reads before any
+   * batch is materialized. When false, view_layout declines every batch.
+   *
+   * @return True if this ingestible can serve a cached view, false if it cannot.
+   */
+  [[nodiscard]] virtual bool can_serve_cached_view() const noexcept { return false; }
+
+  /**
+   * @brief Prepares an owned host layout without reading device data or surrendering source
+   *        columns.
+   *
+   * @param table Materialized table/batch to describe
+   * @param elided Endpoint output positions the caller is going to overwrite (a late
+   *               materialization's deferral's rowid and placeholders).
+   * @return A cached_view_layout if the ingestible can serve a cached view, std::nullopt otherwise.
+   */
+  [[nodiscard]] virtual std::optional<cached_view_layout> view_layout(
+    filtered_table const&, std::span<std::size_t const> elided) const
+  {
+    return std::nullopt;
+  }
 
   /**
    * @brief Apply post-decode filter and/or projection to the materialized
@@ -184,6 +215,7 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
    *        fail closed for non-query callers.
    * @param like_cache Query-owned immutable LIKE classifications. A null value gives any
    *        evaluator a private cache.
+   * @param policy Immutable expression settings from the query or pin invocation.
    * @param survivors When non-null AND this call applies a row filter here,
    *        receives an INT32 column of the input row positions that survived,
    *        ascending. Late materialization needs it: a filtered batch is no
@@ -207,7 +239,8 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
     bool like_swar_fastpath                                           = false,
     std::shared_ptr<const sirius::like_multiliteral_cache> like_cache = nullptr,
     std::unique_ptr<cudf::column>* survivors                          = nullptr,
-    std::span<std::size_t const> elided                               = {}) = 0;
+    std::span<std::size_t const> elided                               = {},
+    expression_query_policy policy                                    = {}) = 0;
 
   /**
    * @brief Whether this ingestible holds a row-filter expression that

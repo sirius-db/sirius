@@ -23,7 +23,6 @@
 #include "exec/semi_future.hpp"
 #include "exec/thread_pool.hpp"
 #include "io/cache/config.hpp"
-#include "io/cache/metadata_store.hpp"
 #include "io/cache/types.hpp"
 
 #include <cudf/io/text/byte_range_info.hpp>
@@ -35,6 +34,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <functional>
 #include <latch>
 #include <memory>
 #include <mutex>
@@ -120,6 +120,13 @@ struct prefetch_failure_slot {
   std::exception_ptr failure;
 };
 
+/// Completion of the IO submitted by one prefetch. Success alone does not
+/// imply coverage: another loader may own some of the requested chunks.
+struct prefetch_result {
+  bool ok{false};
+  bool covered{false};
+};
+
 /// One prefetch request: the two stage machines plus the chunk set they cover.
 /// Held by value — the cache's queues and the owning @ref cache_handle
 /// each carry a copy, so the stages outlive whichever side finishes first.
@@ -133,6 +140,9 @@ struct prefetch_request {
   std::shared_ptr<producer_stage> producer;
   std::shared_ptr<consumer_stage> consumer;
   std::shared_ptr<const std::vector<cached_chunk*>> chunks;
+  // Immutable requested extents, index-parallel with chunks. A resident chunk
+  // can have a narrower fill than this request needs.
+  std::shared_ptr<const std::vector<chunk_fill>> required_fills;
   std::weak_ptr<cache_generation> generation;
   std::shared_ptr<prefetch_failure_slot> failure;
   std::uint32_t timestamp{0};
@@ -361,7 +371,14 @@ class prefetching_cache {
   /// Issue prefetch IO for @p handle's request.  @p on_done fires exactly once
   /// with the outcome — inline when no IO is issued, otherwise from the IO
   /// completion.  Returns whether IO was issued.
-  bool prefetch(cache_handle& handle, exec::invocable<void(bool) noexcept> on_done);
+  bool prefetch(cache_handle& handle, exec::invocable<void(prefetch_result) noexcept> on_done);
+
+  /// Configure only while prefetch workers are stopped. Runs after producer
+  /// loading is published and before any chunk is claimed.
+  void set_before_prefetch_claim_for_testing(std::function<void()> hook)
+  {
+    _before_prefetch_claim = std::move(hook);
+  }
 
   /// Bytes of staging memory the cache currently holds: every chunk buffer
   /// handed out by the pool and not yet reclaimed.  This is what an explicit
@@ -417,9 +434,18 @@ class prefetching_cache {
   /// Synchronous; for a spill that would otherwise move data to disk.
   std::size_t release_idle(std::size_t bytes);
 
+  /// Observe totals and activity since the last refresh without advancing the baseline.
   [[nodiscard]] std::string summary() const;
 
-  void prepare_for_query() noexcept;
+  /// Advance the query epoch and close one cache-wide reporting interval. Returns
+  /// the report for that exact sample; concurrent queries may contribute to it.
+  std::string prepare_for_query();
+
+  [[nodiscard]] std::size_t file_entry_count_for_testing() const noexcept
+  {
+    std::shared_lock lock(_map_mtx);
+    return _file_cache.size();
+  }
 
   [[nodiscard]] uint32_t query_epoch() const noexcept
   {
@@ -533,6 +559,7 @@ class prefetching_cache {
 
   void reclaim_idle_chunks(cache_generation& generation) noexcept;
 
+  std::function<void()> _before_prefetch_claim;
   const config _cfg;
   std::shared_ptr<buffer_pool> _pool;
   size_t _chunk_size = 1;
@@ -551,7 +578,7 @@ class prefetching_cache {
 
   // ---- Telemetry counters --------------------------------------------------
   // Global cumulative counts.  @c _last_reported snapshots them on every cache
-  // refresh (prepare_for_query) so summary() can also report per-cycle deltas.
+  // refresh (prepare_for_query). Intervals are cache-wide, not attributed to a query.
   struct counters {
     std::atomic<uint64_t> n_reads{0};    // device read requests served by the cache
     std::atomic<uint64_t> hits{0};       // chunks served from cache (read pin acquired, in_use)
@@ -567,7 +594,12 @@ class prefetching_cache {
     uint64_t evictions{0};
   };
 
+  [[nodiscard]] counters_snapshot sample_counters() const noexcept;
+  [[nodiscard]] static std::string format_summary(counters_snapshot const& sample,
+                                                  counters_snapshot const& baseline);
+
   counters _counters;
+  mutable std::mutex _summary_mutex;
   counters_snapshot _last_reported;
 
   /// One slot per issued cache-backed IO, retained by its physical completion
@@ -596,10 +628,7 @@ class prefetching_cache {
 
   mutable std::shared_mutex _map_mtx;
   std::unordered_map<std::string, std::shared_ptr<cache_generation>> _file_cache;
-  std::unordered_map<std::string,
-                     std::vector<std::weak_ptr<cache_generation>>,
-                     detail::string_hash,
-                     std::equal_to<>>
+  std::unordered_map<std::string, std::vector<std::weak_ptr<cache_generation>>>
     _generations_by_path;
   std::shared_ptr<std::shared_mutex> _retire_mtx;
 

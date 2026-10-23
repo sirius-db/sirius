@@ -602,16 +602,14 @@ TEST_CASE_METHOD(dense_count_join_fixture,
       auto& preserved_partition = dense->children[0]->Cast<sirius_physical_partition>();
       auto& counted_partition   = dense->children[1]->Cast<sirius_physical_partition>();
 
-      // The preserved side is the build side, which makes it the sizing driver.
-      CHECK(preserved_partition.is_build_partition());
-      CHECK_FALSE(counted_partition.is_build_partition());
-
-      // Sizing reads both sides' bytes, so each partition must be able to reach the other and
-      // must route its count decision through the fused operator.
-      CHECK(preserved_partition.get_downstream_consumer_op() == dense);
-      CHECK(counted_partition.get_downstream_consumer_op() == dense);
-      CHECK(preserved_partition.get_sibling_partition_op() == &counted_partition);
-      CHECK(counted_partition.get_sibling_partition_op() == &preserved_partition);
+      CHECK(preserved_partition.partition_keys() ==
+            std::vector<int>{static_cast<int>(
+              dense->Cast<sirius::op::sirius_physical_dense_count_join>().preserved_key_idx())});
+      CHECK(counted_partition.partition_keys() ==
+            std::vector<int>{static_cast<int>(
+              dense->Cast<sirius::op::sirius_physical_dense_count_join>().counted_key_idx())});
+      REQUIRE(preserved_partition.exchange());
+      CHECK(preserved_partition.exchange() == counted_partition.exchange());
     });
 }
 

@@ -247,6 +247,7 @@ struct range_fault_policy {
   std::string successful_get_etag;
   std::string successful_head_etag;
   bool truncate_error_body{false};
+  std::string required_if_match;
 };
 
 struct listed_object {
@@ -602,6 +603,13 @@ class range_http_server {
       interim += "\r\n\r\n";
       send_all(fd, interim);
     }
+    if (!_fault.required_if_match.empty() && !is_suffix_range(request) &&
+        request.find("If-Match: " + _fault.required_if_match + "\r\n") == std::string::npos) {
+      send_all(
+        fd, "HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+      return;
+    }
+
     if (auto range = parse_range(request)) {
       auto const [start, end] = *range;
       if (_fault.fail_suffix_with_416 && is_suffix_range(request)) {
@@ -1956,9 +1964,14 @@ TEST_CASE("describe_parquet over S3 uses footer probe and preserves schema",
           "[s3][integration][rest][footerbind]")
 {
   auto const parquet = read_binary_file(committed_parquet_fixture("nation.parquet"));
-  range_fault_policy fault;
-  fault.successful_head_etag = "\"nation-generation\"";
-  fault.successful_get_etag  = fault.successful_head_etag;
+  bool has_validator = false;
+  SECTION("ETag permits cross-open footer reuse") { has_validator = true; }
+  SECTION("missing ETag requires a fresh suffix probe") {}
+  range_fault_policy fault{};
+  if (has_validator) {
+    fault.successful_get_etag  = "\"footer-v1\"";
+    fault.successful_head_etag = "\"footer-v1\"";
+  }
   range_http_server server(parquet, fault);
   scan_manager_fixture fixture;
   sirius::exec::query_lifecycle_registry scan_lifecycle;
@@ -1981,8 +1994,8 @@ TEST_CASE("describe_parquet over S3 uses footer probe and preserves schema",
   CHECK(second.object_size == result.object_size);
   CHECK(second.total_num_rows == result.total_num_rows);
   CHECK(second.names == result.names);
-  CHECK(server.head_count() == 1);
-  CHECK(server.get_count() == 1);
+  CHECK(server.head_count() == (has_validator ? 1 : 0));
+  CHECK(server.get_count() == (has_validator ? 1 : 2));
 }
 
 TEST_CASE("footer suffix probe falls back safely on unusable suffix responses",
@@ -3207,4 +3220,62 @@ TEST_CASE("rest read fails after staging_wait_timeout without staging",
   CHECK_THROWS_AS(std::move(future).get(10s), rmm::out_of_memory);
   CHECK(std::chrono::steady_clock::now() - start >= 200ms);
   CHECK(server.get_count() == 0);
-}
+  TEST_CASE("rest range reads bind to the identity captured by HEAD or footer probe",
+            "[s3][integration][rest][object_identity]")
+  {
+    using namespace sirius::io::rest;
+    auto payload           = deterministic_payload(4096);
+    bool const from_footer = GENERATE(false, true);
+    range_fault_policy fault{};
+    fault.successful_head_etag = "\"v1\"";
+    fault.successful_get_etag  = "\"v1\"";
+    fault.required_if_match    = "\"v1\"";
+    bool replaced              = false;
+    SECTION("unchanged object accepts the captured tag") {}
+    SECTION("replacement rejects the captured tag without retry")
+    {
+      fault.required_if_match = "\"v2\"";
+      replaced                = true;
+    }
+    range_http_server server(payload, fault);
+    auto context = std::make_shared<rest_reactor::reactor_context>(
+      direct_rest_test_config(),
+      std::make_shared<fixed_url_authorizer>(server.endpoint()),
+      nullptr);
+    rest_reactor reactor(context, "identity-test");
+    reactor.start();
+    std::shared_ptr<rest_io_object> file;
+    if (from_footer) {
+      auto probe = reactor.fetch_footer_suffix("identity-bucket", "object.bin", 64);
+      REQUIRE(probe.bytes);
+      file = std::make_shared<rest_io_object>("s3://identity-bucket/object.bin",
+                                              "identity-bucket",
+                                              "object.bin",
+                                              probe.object_size,
+                                              probe.window_lo,
+                                              probe.bytes,
+                                              probe.etag);
+    } else {
+      auto head = reactor.head_object("identity-bucket", "object.bin");
+      file      = std::make_shared<rest_io_object>("s3://identity-bucket/object.bin",
+                                              "identity-bucket",
+                                              "object.bin",
+                                              head.object_size,
+                                              head.etag);
+    }
+    CHECK(file->validation_tag() == "\"v1\"");
+    std::vector<std::uint8_t> destination(128);
+    if (replaced) {
+      require_conditional_error<sirius::io::object_changed_error>(
+        [&] { reactor.host_read(*file, 0, destination.size(), destination.data()); },
+        file->object_path(),
+        "\"v1\"",
+        {});
+    } else {
+      REQUIRE(reactor.host_read(*file, 0, destination.size(), destination.data()) ==
+              destination.size());
+      CHECK(std::equal(destination.begin(), destination.end(), payload.begin()));
+    }
+    CHECK(server.head_count() == (from_footer ? 0 : 1));
+    CHECK(server.get_count() == (from_footer ? 2 : 1));
+  }

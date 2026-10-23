@@ -189,6 +189,15 @@ class rest_io_object : public io_object {
   [[nodiscard]] const std::string& object_path() const noexcept override { return _path; }
   [[nodiscard]] size_t size() const noexcept override { return _file_size; }
   [[nodiscard]] std::string_view validation_tag() const noexcept override { return _etag; }
+  [[nodiscard]] object_identity identity() const override
+  {
+    auto result = io_object::identity();
+    if (!is_strong_tag(_etag)) {
+      result.kind    = identity_kind::opened_handle;
+      result.version = std::to_string(open_generation());
+    }
+    return result;
+  }
 
   [[nodiscard]] const std::string& bucket() const noexcept { return _bucket; }
   [[nodiscard]] const std::string& key() const noexcept { return _key; }

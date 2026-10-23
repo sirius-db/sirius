@@ -28,7 +28,11 @@ namespace sirius::planner {
 [[nodiscard]] bool build_subtree_is_filtering(duckdb::LogicalOperator const& op);
 
 /**
- * @brief Tests for a DELIM_GET or CTE_REF root behind valid single-child projections
+ * @brief Tests for a DELIM_GET or CTE_REF behind projections or ordinary deduplication.
+ *
+ * Deduplication has nonempty groups, no aggregate outputs or grouping functions, and one
+ * complete grouping set (explicit or implicit). Each wrapper has exactly one non-null child.
+ * This admits build evidence only; it does not resolve CTE producers or move filter targets.
  */
 [[nodiscard]] bool build_relation_is_opaque(duckdb::LogicalOperator const& op);
 

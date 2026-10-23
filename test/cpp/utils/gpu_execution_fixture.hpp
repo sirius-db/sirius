@@ -46,6 +46,7 @@
 #include <memory>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace sirius::test {
@@ -184,6 +185,21 @@ class GpuExecutionFixture {
     }
   }
 
+  //! Maps a result cell to the spelling the comparator matches on.
+  using cell_canonicalizer = std::string (*)(std::string);
+
+  /// Spells NaN and -NaN as `nan`, and a signed zero without its sign. Both engines group each
+  /// pair as one value, and either member may represent the group.
+  static std::string canonical_float_key(std::string cell)
+  {
+    if (cell == "-nan") { return "nan"; }
+    if (cell.size() > 1 && cell.front() == '-' &&
+        cell.find_first_not_of("0.", 1) == std::string::npos) {
+      cell.erase(0, 1);
+    }
+    return cell;
+  }
+
   /// GPU-vs-CPU comparison that ignores row order (rows are sorted first). Use
   /// for filters, joins, aggregates, and any query without an ORDER BY.
   void compare_gpu_vs_cpu(const std::string& query) { compare_gpu_vs_cpu_impl(query, false); }
@@ -213,6 +229,14 @@ class GpuExecutionFixture {
                                  double rel_tol = 1e-6)
   {
     compare_gpu_vs_cpu_impl(query, false, approx_cols, rel_tol);
+  }
+
+  /// GPU-vs-CPU comparison, order-insensitive, that canonicalizes every cell first. Use for
+  /// DISTINCT or GROUP BY over floating-point keys.
+  void compare_gpu_vs_cpu_canonical(const std::string& query,
+                                    cell_canonicalizer canonicalize = canonical_float_key)
+  {
+    compare_gpu_vs_cpu_impl(query, false, {}, 0.0, canonicalize);
   }
 
   /// Asserts the query does NOT run purely on the GPU: it triggers a runtime
@@ -253,26 +277,51 @@ class GpuExecutionFixture {
     }
     REQUIRE(after.fallbacks == before.fallbacks + 1);
     REQUIRE(after.executions == before.executions);
+    require_matches_cpu(query, *gpu_result);
+  }
 
+  /// Asserts the query starts on the GPU, falls back to DuckDB's CPU execution at runtime, and
+  /// returns exactly the CPU rows and column types. Distinct from expect_gpu_fallback, which does
+  /// not compare the results.
+  void expect_runtime_fallback_matches_cpu(const std::string& query)
+  {
+    run_ok("SET gpu_execution = true;");
+    auto const before = sirius::test::get_transparent_execution_stats(*con);
+    auto gpu_result   = con->Query(query);
+    auto const after  = sirius::test::get_transparent_execution_stats(*con);
+    REQUIRE(gpu_result);
+    if (gpu_result->HasError()) { UNSCOPED_INFO("query error: " << gpu_result->GetError()); }
+    REQUIRE_FALSE(gpu_result->HasError());
+    if (after.runtime_fallbacks == before.runtime_fallbacks) {
+      UNSCOPED_INFO("expected a runtime fallback to CPU, but none occurred");
+    }
+    REQUIRE(after.runtime_fallbacks == before.runtime_fallbacks + 1);
+    require_matches_cpu(query, *gpu_result);
+  }
+
+ private:
+  /// Reruns @p query on DuckDB's CPU execution and requires exactly @p gpu_result's column types
+  /// and rows, ignoring row order.
+  void require_matches_cpu(const std::string& query, duckdb::QueryResult& gpu_result)
+  {
     run_ok("SET gpu_execution = false;");
     auto cpu_result = con->Query(query);
     run_ok("SET gpu_execution = true;");
     REQUIRE(cpu_result);
     REQUIRE_FALSE(cpu_result->HasError());
 
-    REQUIRE(gpu_result->ColumnCount() == cpu_result->ColumnCount());
-    REQUIRE(gpu_result->RowCount() == cpu_result->RowCount());
-    auto gpu_rows = collect_rows(*gpu_result, true);
-    auto cpu_rows = collect_rows(*cpu_result, true);
-    REQUIRE(gpu_rows == cpu_rows);
+    REQUIRE(gpu_result.GetTypes() == cpu_result->GetTypes());
+    REQUIRE(gpu_result.RowCount() == cpu_result->RowCount());
+    REQUIRE(collect_rows(gpu_result, true) == collect_rows(*cpu_result, true));
   }
 
- private:
   void compare_gpu_vs_cpu_impl(const std::string& query,
                                bool ordered,
                                const std::set<size_t>& approx_cols = {},
-                               double rel_tol                      = 0.0)
+                               double rel_tol                      = 0.0,
+                               cell_canonicalizer canonicalize     = nullptr)
   {
+    INFO(query);
     // Run on GPU (transparent, plain SQL goes through the Sirius optimizer hook).
     con->Query("SET gpu_execution = true;");
     auto before_gpu_stats = sirius::test::get_transparent_execution_stats(*con);
@@ -295,6 +344,7 @@ class GpuExecutionFixture {
     REQUIRE(cpu_result);
     REQUIRE_FALSE(cpu_result->HasError());
 
+    REQUIRE(gpu_result->GetTypes() == cpu_result->GetTypes());
     REQUIRE(gpu_result->ColumnCount() == cpu_result->ColumnCount());
     REQUIRE(gpu_result->RowCount() == cpu_result->RowCount());
 
@@ -302,8 +352,19 @@ class GpuExecutionFixture {
     auto& cpu_mat = *cpu_result;
     // For ordered queries, keep emitted order so NULLS FIRST|LAST is verified;
     // otherwise sort both sides for an order-insensitive multiset comparison.
-    auto gpu_rows = collect_rows(gpu_mat, !ordered);
-    auto cpu_rows = collect_rows(cpu_mat, !ordered);
+    auto gpu_rows = collect_rows(gpu_mat, false);
+    auto cpu_rows = collect_rows(cpu_mat, false);
+    // Canonicalize before sorting: two members of one class can sort apart.
+    for (auto* rows : {&gpu_rows, &cpu_rows}) {
+      if (canonicalize != nullptr) {
+        for (auto& row : *rows) {
+          for (auto& cell : row) {
+            cell = canonicalize(std::move(cell));
+          }
+        }
+      }
+      if (!ordered) { std::sort(rows->begin(), rows->end()); }
+    }
 
     // Order-insensitive approx matching pairs rows by their sorted stringified
     // values, so an approximate *leading* key (col 0) could misalign rows. Guard

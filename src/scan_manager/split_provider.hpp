@@ -102,7 +102,7 @@ class split_provider {
    * path, but the null fallback keeps the contract simple under concurrent
    * observers.
    */
-  virtual std::function<std::unique_ptr<op::scan::scan_info>()> next_split_provider();
+  virtual op::scan::gpu_ingestible::metadata_scan_task_t next_split_provider();
 
   /// Accessor for the borrowed ingestible. Callers that need a
   /// @c shared_ptr<gpu_ingestible> can promote via
