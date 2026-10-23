@@ -1084,8 +1084,9 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
     *sirius_ctx, context, "pin_table", sirius::exec::query_admission::access::maintenance);
   try {
     // The read is driven by sirius::materialize_all_batches (pin_table.cpp), which
-    // round-robins the materialized batches across all GPU memory spaces so a pin
-    // distributes its chunks evenly. For tier='host' each materialized GPU table is
+    // round-robins the materialized batches across GPU memory spaces. Host pins continue
+    // the scan manager's cursor across tables and interleave destination host spaces.
+    // For tier='host' each materialized GPU table is
     // then converted to a host_data_representation (via the GPU<->HOST converter) so
     // the pinned data lives in pinned host memory.
     auto& memory_manager = sirius_ctx->get_memory_manager();
@@ -1351,6 +1352,7 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
         sirius::materialize_pin_to_host(*ingestible,
                                         gpu_spaces_mut,
                                         host_space_by_gpu,
+                                        scan_mgr.get_host_pin_placement(),
                                         *scan_mgr.io_ctx(),
                                         pinned_column_types,
                                         pin_comp,
