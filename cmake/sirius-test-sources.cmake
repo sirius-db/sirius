@@ -12,6 +12,7 @@ set(TEST_SOURCES
     test/cpp/scan_manager/test_preparation_config.cpp
     test/cpp/scan/test_native_physical_matrix.cpp
     test/cpp/scan/test_parquet_physical_profile.cpp
+    test/cpp/memory/test_numa_small_pinned_mr.cpp
     test/cpp/scan/test_native_checkpoint_lease.cpp
     test/cpp/transparent/test_read_view_comparison.cpp
     test/cpp/transparent/test_read_view_scaling.cpp
@@ -47,9 +48,10 @@ set(TEST_SOURCES
     test/cpp/exec/test_arrow_result_stream.cpp
     test/cpp/exec/test_batch_stream.cpp
     test/cpp/exec/test_bounded_thread_pool.cpp
-    test/cpp/exec/test_query_lifecycle_registry.cpp
-    test/cpp/exec/test_scoped_dispatcher.cpp
     test/cpp/exec/test_inspectable_mpsc.cpp
+    test/cpp/exec/test_query_lifecycle_registry.cpp
+  test/cpp/exec/test_query_admission.cpp
+  test/cpp/exec/test_scoped_dispatcher.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
     test/cpp/exec/test_multi_index_priority_queue.cpp
     test/cpp/event/test_query_event_publisher.cpp
@@ -113,6 +115,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_semantic_cast_fallback.cpp
     test/cpp/integration/test_gpu_execution_setting_scope.cpp
     test/cpp/integration/test_gpu_execution_abs.cpp
+    test/cpp/integration/test_gpu_execution_negate.cpp
     test/cpp/integration/test_gpu_execution_round.cpp
     test/cpp/integration/test_gpu_execution_substring.cpp
     test/cpp/integration/test_parquet_bloom_filter_pushdown.cpp
@@ -122,9 +125,11 @@ set(TEST_SOURCES
     test/cpp/integration/test_reset_sirius_cache.cpp
     test/cpp/integration/test_gpu_execution_tpcds_nulls.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
+    test/cpp/integration/test_gpu_execution_tpch_havoc.cpp
     test/cpp/integration/test_gpu_execution_tpch_mgpu_audit.cpp
     test/cpp/integration/test_gpu_execution_unique_join.cpp
     test/cpp/integration/test_gpu_execution_union_all.cpp
+    test/cpp/integration/test_gpu_execution_unfolded_constants.cpp
     test/cpp/integration/test_gpu_execution_vector_search.cpp
     test/cpp/integration/test_pin_registry_epoch.cpp
     test/cpp/integration/test_pin_table_host_streaming.cpp
@@ -176,6 +181,7 @@ set(TEST_SOURCES
     test/cpp/scan_manager/test_s3_config_scopes.cpp
     test/cpp/scan_manager/test_prefetching_scheduler.cpp
     test/cpp/scan_manager/test_readahead_lifecycle.cpp
+  test/cpp/scan_manager/test_shared_scan_budget.cpp
     test/cpp/scan_manager/test_scan_manager_query_state.cpp
     test/cpp/scan_manager/test_reset_caches.cpp
     test/cpp/scan_manager/test_pin_table_multi_gpu.cpp

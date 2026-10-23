@@ -16,6 +16,7 @@
 
 #include "exec/stream_plan_bindings.hpp"
 #include "helper/type_conversions.hpp"
+#include "log/sink.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
 #include "sirius_sql_rewrite.hpp"
@@ -868,3 +869,87 @@ TEST_CASE("Transparent execution preserves GPU errors before non-S3 replay vetoe
     }
   }
 }
+
+#if SIRIUS_ACTIVE_LOG_LEVEL <= SIRIUS_LOG_LEVEL_INFO
+static void check_runtime_failure_fallback(std::string_view failure_point)
+{
+  if (sirius::test::run_isolated()) return;
+  sirius::test::GpuExecutionFixture fixture;
+  fixture.run_ok("SET gpu_execution = false");
+  fixture.run_ok("CREATE TABLE health_race AS SELECT i FROM range(10) t(i)");
+  fixture.run_ok("CHECKPOINT");
+  fixture.run_ok("SET gpu_execution = true");
+  fixture.run_ok("SET enable_duckdb_fallback = true");
+  auto& con    = *fixture.con;
+  auto runtime = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(runtime);
+  auto prepared = con.Prepare("SELECT sum(i) FROM health_race");
+  REQUIRE_FALSE(prepared->HasError());
+
+  // Exercise both sides of the health check: window begin is before it, while
+  // QueryBegin is after it and before lifecycle registration.
+  // Use the existing log-sink interface to force the race without a production test hook.
+  struct failure_at_begin_sink final : sirius::log::sink {
+    duckdb::SiriusContext& runtime;
+    std::shared_ptr<sirius::log::sink> previous = sirius::log::get_sink();
+    std::atomic<bool> injected{false};
+    std::string_view failure_point;
+    failure_at_begin_sink(duckdb::SiriusContext& runtime, std::string_view failure_point)
+      : runtime(runtime), failure_point(failure_point)
+    {
+    }
+    void set_level(sirius::log::level level) override { previous->set_level(level); }
+    bool should_log(sirius::log::level) const override { return true; }
+    bool flush() override { return previous->flush(); }
+    void log(sirius::log::level level,
+             std::source_location const& location,
+             std::string_view message) override
+    {
+      if (message.starts_with(failure_point) && !injected.exchange(true)) {
+        runtime.get_query_lifecycle_registry().report_failure(
+          std::make_exception_ptr(cudf::cuda_error(
+            "synthetic fatal failure during window admission", cudaErrorIllegalAddress)));
+      }
+      previous->log(level, location, message);
+    }
+  };
+  auto sink = std::make_shared<failure_at_begin_sink>(*runtime, failure_point);
+  struct restore_sink {
+    std::shared_ptr<sirius::log::sink> previous;
+    ~restore_sink() { sirius::log::set_sink(std::move(previous)); }
+  } restore{sink->previous};
+  sirius::log::set_sink(sink);
+  auto before = runtime->get_transparent_execution_stats();
+  auto result = prepared->Execute();
+  REQUIRE(sink->injected.load());
+  try {
+    runtime->throw_runtime_unavailable();
+  } catch (duckdb::SiriusRuntimeUnavailableException const& error) {
+    CHECK(std::string(error.what()).find("cudaErrorIllegalAddress") != std::string::npos);
+    CHECK(std::string(error.what()).find("synthetic fatal failure during window admission") !=
+          std::string::npos);
+  }
+  REQUIRE(result);
+  INFO((result->HasError() ? result->GetError() : ""));
+  REQUIRE_FALSE(result->HasError());
+  auto chunk = result->Fetch();
+  REQUIRE(chunk);
+  CHECK(chunk->GetValue(0, 0).GetValue<int64_t>() == 45);
+  CHECK(runtime->get_transparent_execution_stats().runtime_fallbacks ==
+        before.runtime_fallbacks + 1);
+  CHECK_FALSE(runtime->is_query_lifecycle_active());
+  CHECK(runtime->get_query_lifecycle_registry().size() == 0);
+  CHECK_FALSE(runtime->get_scan_manager().holds_any_checkpoint_key());
+}
+TEST_CASE("Runtime failure after slot acquisition preserves CPU fallback",
+          "[integration][policy][device_health]")
+{
+  check_runtime_failure_fallback("[window] begin ");
+}
+
+TEST_CASE("Runtime failure during lifecycle registration preserves CPU fallback",
+          "[integration][policy][device_health]")
+{
+  check_runtime_failure_fallback("QueryBegin: transparent_execution");
+}
+#endif

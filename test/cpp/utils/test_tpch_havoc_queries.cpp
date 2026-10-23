@@ -77,6 +77,33 @@ TEST_CASE("tpch_havoc: Q11's threshold is rendered for the scale factor", "[tpch
   }
 }
 
+TEST_CASE("tpch_havoc: every expected outcome names a distinct query once", "[tpch_havoc]")
+{
+  auto const queries = sirius::test::load_tpch_havoc_queries(havoc_dir_or_skip(), kScaleFactor);
+  auto const expectations =
+    sirius::test::load_tpch_havoc_expectations(sirius::test::tpch_havoc_expectations_path());
+
+  std::set<std::string> labels;
+  for (auto const& query : queries) {
+    labels.insert(query.label);
+  }
+  for (auto const& expectation : expectations) {
+    for (auto const& label : expectation.queries) {
+      INFO(label << " in the entry for #" << expectation.issue
+                 << ": duplicates run under their first label");
+      CHECK(labels.count(label) == 1);
+    }
+  }
+  for (auto const* scan : {"native", "parquet"}) {
+    for (auto const* evaluator : {"ast_interpret", "ast_jit"}) {
+      for (auto const& label : labels) {
+        CHECK_NOTHROW(
+          sirius::test::find_tpch_havoc_expectation(expectations, label, scan, evaluator));
+      }
+    }
+  }
+}
+
 TEST_CASE("tpch_havoc: every query runs on DuckDB at SF 0.1", "[tpch_havoc]")
 {
   auto const queries = sirius::test::load_tpch_havoc_queries(havoc_dir_or_skip(), kScaleFactor);

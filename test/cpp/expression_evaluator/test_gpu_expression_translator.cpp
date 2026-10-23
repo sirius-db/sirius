@@ -711,12 +711,12 @@ TEST_CASE("translator: col(0) + col(1)", "[expression_translator]")
 
 TEST_CASE("translator: unsupported function returns nullopt", "[expression_translator]")
 {
-  // A non-arithmetic function (substring) has no cuDF-AST binary-op lowering;
+  // A non-arithmetic function (strlen) has no cuDF-AST binary-op lowering;
   // the translator must report untranslatable.
   std::vector<std::unique_ptr<ast_node>> args;
   args.push_back(make_ref(0));
-  auto expr = make_func(
-    sirius::function_id::substring, std::move(args), logical_type::make(type_id::INTEGER));
+  auto expr =
+    make_func(sirius::function_id::strlen, std::move(args), logical_type::make(type_id::BIGINT));
 
   auto translator = make_translator();
   auto ast_tree   = translate(translator, *expr);
@@ -731,9 +731,8 @@ TEST_CASE("translator: conjunction with unsupported first child returns nullopt"
 {
   std::vector<std::unique_ptr<ast_node>> unsupported_args;
   unsupported_args.push_back(make_ref(0));
-  auto unsupported = make_func(sirius::function_id::substring,
-                               std::move(unsupported_args),
-                               logical_type::make(type_id::INTEGER));
+  auto unsupported = make_func(
+    sirius::function_id::strlen, std::move(unsupported_args), logical_type::make(type_id::BIGINT));
 
   auto supported = make_cmp(sirius::comparison_type::gt, make_ref(0), make_int_const(0));
 
@@ -983,17 +982,24 @@ TEST_CASE("translator: IN operator", "[expression_translator]")
   REQUIRE(host_vals == expected);
 }
 
-TEST_CASE("translator: NOT IN operator", "[expression_translator]")
+TEST_CASE("translator: IN list negation forms", "[expression_translator]")
 {
+  auto const list_negated   = GENERATE(false, true);
+  auto const enclosing_nots = GENERATE(0, 1, 2);
+  CAPTURE(list_negated, enclosing_nots);
   std::vector<int32_t> values = {1, 2, 3, 4, 5};
   auto table                  = make_int32_table(values);
   auto tv                     = table->view();
 
-  // Build: col(0) NOT IN (2, 4)
+  // Frontends can represent NOT IN with the list flag or an enclosing NOT.
+  // Nested NOTs must preserve polarity, including NOT over a negated list.
   std::vector<std::unique_ptr<ast_node>> in_values;
   in_values.push_back(make_int_const(2));
   in_values.push_back(make_int_const(4));
-  auto in_expr = make_in(make_ref(0), std::move(in_values), /*negated=*/true);
+  auto in_expr = make_in(make_ref(0), std::move(in_values), list_negated);
+  for (int i = 0; i < enclosing_nots; ++i) {
+    in_expr = make_unary(sirius::ast::unary_op::kind::op_not, std::move(in_expr));
+  }
 
   auto translator = make_translator();
   auto ast_tree   = translate(translator, *in_expr);
@@ -1003,8 +1009,9 @@ TEST_CASE("translator: NOT IN operator", "[expression_translator]")
   auto host_vals = copy_bool_column_to_host(result->view());
 
   std::vector<uint8_t> expected;
+  auto const negated = list_negated != (enclosing_nots % 2 != 0);
   for (auto v : values) {
-    expected.push_back((v != 2 && v != 4) ? 1U : 0U);
+    expected.push_back(((v == 2 || v == 4) != negated) ? 1U : 0U);
   }
   REQUIRE(host_vals == expected);
 }

@@ -317,7 +317,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::unary_op const& alt,
     return materialize_as_ast_column(result.release_column());
   }
 
-  auto child = evaluate(*alt.child, evaluation_mode::MATERIALIZE);
+  auto child = evaluate_as_column(*alt.child);
   switch (alt.op) {
     case sirius::ast::unary_op::kind::op_not:
       return evaluate_result(
@@ -405,8 +405,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::in_list const& alt,
   }
 
   D_ASSERT(!alt.values.empty());
-  auto test = evaluate(*alt.probe, evaluation_mode::MATERIALIZE);
-  D_ASSERT(!test.is_scalar());  // IN with scalar LHS should have been already resolved
+  auto test = evaluate_as_column(*alt.probe);
 
   auto const output_type      = cudf::data_type{cudf::type_id::BOOL8};
   auto const negate_if_needed = [&](std::unique_ptr<cudf::column> in_result) {
@@ -596,6 +595,12 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::coalesce const& alt,
   }
 
   if (mode == evaluation_mode::AST) {
+    // A null-free reference short-circuits as a borrowed view; copy it so the temp column owns it.
+    // TODO: Avoid this copy: https://github.com/sirius-db/sirius/issues/2305.
+    if (current_result.is_column_view()) {
+      current_result = evaluate_result(
+        std::make_unique<cudf::column>(current_result.get_column_view(), _stream, _mr));
+    }
     if (!current_result.is_owned_column()) {
       throw internal_exception(
         "[expression_evaluator:operator]: Expected an owned column after executing COALESCE "

@@ -24,6 +24,44 @@ struct tpch_havoc_query {
   std::vector<std::string> duplicates;  ///< Labels of later variants with byte-identical SQL.
 };
 
+/// What happens when a query runs with `enable_duckdb_fallback = false`.
+enum class tpch_havoc_outcome {
+  gpu,             ///< Ran on the GPU and matched DuckDB on the CPU.
+  mismatch,        ///< Ran on the GPU and differed from DuckDB on the CPU.
+  plan_rejected,   ///< "GPU plan generation failed: ...".
+  runtime_failed,  ///< "Sirius GPU execution failed: ...".
+  skip,            ///< Not run: it crashes, hangs or is flaky.
+};
+
+std::string to_string(tpch_havoc_outcome outcome);
+
+/// One entry of test/tpch_havoc/expectations.yaml: queries that share a root cause and an issue.
+struct tpch_havoc_expectation {
+  tpch_havoc_outcome outcome = tpch_havoc_outcome::gpu;
+  std::string reason;  ///< Regex the error must contain; for `mismatch` and `skip`, a description.
+  int issue = 0;       ///< Open sirius-db/sirius issue that tracks the fix.
+  std::string scan;    ///< "native" or "parquet"; empty applies to both.
+  std::string evaluator;             ///< "ast_interpret" or "ast_jit"; empty applies to both.
+  std::vector<std::string> queries;  ///< Labels, such as "Q05_V03".
+
+  bool applies_to(std::string const& scan_name, std::string const& evaluator_name) const;
+};
+
+/// test/tpch_havoc/expectations.yaml in the source tree.
+std::filesystem::path tpch_havoc_expectations_path();
+
+/// Loads the expected outcomes. Throws on a malformed entry: an unknown outcome, scan or
+/// evaluator, a `gpu` outcome, a missing issue, or a reason that isn't a valid regex.
+std::vector<tpch_havoc_expectation> load_tpch_havoc_expectations(std::filesystem::path const& path);
+
+/// The entry that lists `label` for this scan and evaluator, or nullptr when the query is expected
+/// to run on the GPU. Throws when more than one entry lists it.
+tpch_havoc_expectation const* find_tpch_havoc_expectation(
+  std::vector<tpch_havoc_expectation> const& expectations,
+  std::string const& label,
+  std::string const& scan,
+  std::string const& evaluator);
+
 /// Run on each connection before the queries. Q01_V07 uses the `x -> ...` lambda syntax, which
 /// DuckDB accepts only with this (deprecated) setting.
 inline constexpr char kTpchHavocSessionSetup[] = "SET lambda_syntax = 'ENABLE_SINGLE_ARROW'";

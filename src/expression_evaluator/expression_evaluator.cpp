@@ -249,6 +249,14 @@ evaluate_result expression_evaluator::materialize_as_ast_column(
   return evaluate_result(ast_result(col_ref, std::vector<std::size_t>{}, {temp_column_idx}));
 }
 
+evaluate_result expression_evaluator::evaluate_as_column(sirius::ast::node const& expr)
+{
+  auto result = evaluate(expr, evaluation_mode::MATERIALIZE);
+  if (!result.is_scalar()) { return result; }
+  return evaluate_result(
+    cudf::make_column_from_scalar(result.get_scalar(), _input_table.num_rows(), _stream, _mr));
+}
+
 void expression_evaluator::release_temporaries(
   std::initializer_list<evaluate_result const*> children)
 {

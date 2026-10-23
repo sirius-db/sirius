@@ -195,6 +195,34 @@ class sirius_mask_applicable {
     ::cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) const = 0;
 
+  /**
+   * @brief Probes with a BOOL8 hint using the same key and result semantics as compute_mask
+   *
+   * The default ignores the hint without validating it; the membership filters skip rejected rows
+   * without packing. Callers must AND the result with the running conjunction even when the hint is
+   * honored.
+   *
+   * @pre `prior_keep` is nonnullable BOOL8 with `probe.size()` rows in probe order. Both views may
+   * be slices; their storage and this filter must outlive work submitted on `stream`.
+   * @throw std::invalid_argument if an implementation that honors the hint finds `prior_keep`
+   * violating the precondition
+   * @param probe Keys to probe
+   * @param prior_keep Running conjunction; false permits skipping a lookup
+   * @param device_id Device holding the filter replica
+   * @param stream Stream ordering the probe
+   * @param mr Resource for the result
+   * @return Nonnullable keep mask, or null when the probe or device cannot be served
+   */
+  [[nodiscard]] virtual std::unique_ptr<cudf::column> compute_mask_if(
+    cudf::column_view const& probe,
+    cudf::column_view const& prior_keep,
+    int device_id,
+    ::cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) const
+  {
+    return compute_mask(probe, nullptr, device_id, stream, mr);
+  }
+
   /// The prior-free form: every implementation is the overload above with no prior mask, so the
   /// forwarder is defined once here. Implementations re-expose it with a using-declaration.
   [[nodiscard]] std::unique_ptr<cudf::column> compute_mask(cudf::column_view const& probe,
@@ -255,6 +283,13 @@ class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
     ::cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) const override;
 
+  [[nodiscard]] std::unique_ptr<cudf::column> compute_mask_if(
+    cudf::column_view const& probe,
+    cudf::column_view const& prior_keep,
+    int device_id,
+    ::cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) const override;
+
   void replicate_to_devices(std::span<dynamic_filter_replica_space const> spaces) override;
   [[nodiscard]] bool is_available_on_device(int device_id) const noexcept override;
 
@@ -268,6 +303,14 @@ class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
                                                        cudf::data_type key_type) noexcept;
 
  private:
+  [[nodiscard]] std::unique_ptr<cudf::column> compute_mask_impl(
+    cudf::column_view const& probe,
+    std::uint32_t const* prior_mask_words,
+    bool const* prior_keep,
+    int device_id,
+    ::cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) const;
+
   membership_key_domain _domain{};
   std::size_t _num_keys = 0;
 
@@ -321,6 +364,13 @@ class sirius_dynamic_small_in_list_filter final : public sirius_dynamic_filter,
     ::cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) const override;
 
+  [[nodiscard]] std::unique_ptr<cudf::column> compute_mask_if(
+    cudf::column_view const& probe,
+    cudf::column_view const& prior_keep,
+    int device_id,
+    ::cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) const override;
+
   void replicate_to_devices(std::span<dynamic_filter_replica_space const> spaces) override;
   [[nodiscard]] bool is_available_on_device(int device_id) const noexcept override;
 
@@ -330,6 +380,14 @@ class sirius_dynamic_small_in_list_filter final : public sirius_dynamic_filter,
   [[nodiscard]] static bool supports(cudf::column_view const& keys) noexcept;
 
  private:
+  [[nodiscard]] std::unique_ptr<cudf::column> compute_mask_impl(
+    cudf::column_view const& probe,
+    std::uint32_t const* prior_mask_words,
+    bool const* prior_keep,
+    int device_id,
+    ::cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) const;
+
   membership_key_domain _domain{};
   std::size_t _num_keys = 0;
 
@@ -376,6 +434,13 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
     ::cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) const override;
 
+  [[nodiscard]] std::unique_ptr<cudf::column> compute_mask_if(
+    cudf::column_view const& probe,
+    cudf::column_view const& prior_keep,
+    int device_id,
+    ::cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) const override;
+
   void replicate_to_devices(std::span<dynamic_filter_replica_space const> spaces) override;
   [[nodiscard]] bool is_available_on_device(int device_id) const noexcept override;
 
@@ -385,6 +450,14 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
   [[nodiscard]] static std::size_t estimated_bytes(std::size_t num_keys) noexcept;
 
  private:
+  [[nodiscard]] std::unique_ptr<cudf::column> compute_mask_impl(
+    cudf::column_view const& probe,
+    std::uint32_t const* prior_mask_words,
+    bool const* prior_keep,
+    int device_id,
+    ::cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) const;
+
   friend class detail::accumulated_bloom_builder;
   membership_key_domain _domain{};
   struct impl;
