@@ -5985,3 +5985,534 @@ TEST_CASE("nvrtc_jit - temporal extraction and date_trunc match MATERIALIZE and 
     check_tables_match(jit_out->view(), mat_out->view());
   }
 }
+
+// ============================================================================
+// Ticket #10: String operations & TQP++ Overlapped-Segment Cache
+// (LIKE, NOT LIKE, CONTAINS, PREFIX, SUFFIX, strlen, length, substring,
+// comparisons, BETWEEN, IN, CASE/COALESCE over strings)
+// ============================================================================
+
+TEST_CASE(
+  "nvrtc_jit - string comparisons, functions, substring, and Overlapped-Segment Cache match "
+  "MATERIALIZE",
+  "[expression_evaluator][nvrtc_jit][ticket10]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = get_resource_ref(*space);
+
+  auto const varchar_t = logical_type::make(type_id::VARCHAR);
+  auto const bigint_t  = logical_type::make(type_id::BIGINT);
+  auto const int_t     = logical_type::make(type_id::INTEGER);
+  auto const bool_t    = logical_type::make(type_id::BOOLEAN);
+
+  auto make_str_col = [&](std::vector<std::string> const& rows,
+                          std::vector<bool> const& valids = {},
+                          bool int64_offsets              = false) {
+    auto const n = static_cast<cudf::size_type>(rows.size());
+    std::string chars;
+    std::vector<std::int64_t> offsets(rows.size() + 1, 0);
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+      if (valids.empty() || valids[i]) { chars += rows[i]; }
+      offsets[i + 1] = static_cast<std::int64_t>(chars.size());
+    }
+
+    rmm::device_buffer chars_buf(chars.data(), chars.size(), stream, mr);
+    std::unique_ptr<cudf::column> offsets_col;
+    if (int64_offsets) {
+      offsets_col = cudf::make_numeric_column(
+        cudf::data_type{cudf::type_id::INT64}, n + 1, cudf::mask_state::UNALLOCATED, stream, mr);
+      REQUIRE(cudaMemcpy(offsets_col->mutable_view().data<std::int64_t>(),
+                         offsets.data(),
+                         offsets.size() * sizeof(std::int64_t),
+                         cudaMemcpyHostToDevice) == cudaSuccess);
+    } else {
+      std::vector<std::int32_t> offsets32(offsets.begin(), offsets.end());
+      offsets_col = cudf::make_numeric_column(
+        cudf::data_type{cudf::type_id::INT32}, n + 1, cudf::mask_state::UNALLOCATED, stream, mr);
+      REQUIRE(cudaMemcpy(offsets_col->mutable_view().data<std::int32_t>(),
+                         offsets32.data(),
+                         offsets32.size() * sizeof(std::int32_t),
+                         cudaMemcpyHostToDevice) == cudaSuccess);
+    }
+
+    auto mask_buf = cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr);
+    cudf::size_type null_count = 0;
+    if (!valids.empty()) {
+      mask_buf   = cudf::create_null_mask(n, cudf::mask_state::ALL_VALID, stream, mr);
+      auto* mptr = static_cast<cudf::bitmask_type*>(mask_buf.data());
+      for (cudf::size_type i = 0; i < n; ++i) {
+        if (!valids[i]) {
+          cudf::set_null_mask(mptr, i, i + 1, false, stream);
+          ++null_count;
+        }
+      }
+    }
+    return cudf::make_strings_column(
+      n, std::move(offsets_col), std::move(chars_buf), null_count, std::move(mask_buf));
+  };
+
+  auto check_tables_match = [&](cudf::table_view jit_tv, cudf::table_view mat_tv) {
+    REQUIRE(jit_tv.num_columns() == mat_tv.num_columns());
+    REQUIRE(jit_tv.num_rows() == mat_tv.num_rows());
+    auto const n_rows = jit_tv.num_rows();
+    for (cudf::size_type c = 0; c < jit_tv.num_columns(); ++c) {
+      CAPTURE(c);
+      auto const jcol = jit_tv.column(c);
+      auto const mcol = mat_tv.column(c);
+      REQUIRE(jcol.type() == mcol.type());
+      CHECK(jcol.null_count() == mcol.null_count());
+      auto const jvalids = copy_valids_to_host(jcol);
+      auto const mvalids = copy_valids_to_host(mcol);
+      REQUIRE(jvalids == mvalids);
+      auto const elem_size = cudf::size_of(jcol.type());
+      std::vector<std::uint8_t> jbytes(n_rows * elem_size);
+      std::vector<std::uint8_t> mbytes(n_rows * elem_size);
+      REQUIRE(cudaMemcpy(jbytes.data(),
+                         jcol.head<std::uint8_t>() + jcol.offset() * elem_size,
+                         jbytes.size(),
+                         cudaMemcpyDeviceToHost) == cudaSuccess);
+      REQUIRE(cudaMemcpy(mbytes.data(),
+                         mcol.head<std::uint8_t>() + mcol.offset() * elem_size,
+                         mbytes.size(),
+                         cudaMemcpyDeviceToHost) == cudaSuccess);
+      for (cudf::size_type r = 0; r < n_rows; ++r) {
+        if (jvalids[r]) {
+          CAPTURE(r);
+          CHECK(std::memcmp(
+                  jbytes.data() + r * elem_size, mbytes.data() + r * elem_size, elem_size) == 0);
+        }
+      }
+    }
+  };
+
+  SECTION(
+    "string comparisons, BETWEEN, IN, strlen, length (UTF-8), PREFIX, SUFFIX, CONTAINS, LIKE, "
+    "NOT LIKE, and CASE/COALESCE over nullable, non-nullable, INT64-offset, and sliced columns")
+  {
+    std::vector<std::string> rows_a = {
+      "",
+      "13-456-7890",
+      "31-999-0000",
+      "http://sirius.db/query",
+      "https://nvidia.com/cudf",
+      "special requests: handle with care",
+      "express packages pending delivery",
+      "a\xC3\xA9\xE2\x82\xAC\xF0\x9F\x98\x8A"
+      "z",  // "aé€😊z": 5 UTF-8 chars, 11 bytes (1 + 2 + 3 + 4 + 1)
+      "\xC3\xB1"
+      "and\xC3\xBA",  // "ñandú": 5 UTF-8 chars, 7 bytes
+      "ababa",
+      "BUILDING",
+      "AUTOMOBILE",
+    };
+    std::vector<bool> valids_a = {
+      true, true, true, true, true, true, true, true, true, true, false, true};
+
+    std::vector<std::string> rows_b = {
+      "",
+      "13-456-7890",
+      "31-000-0000",
+      "http://sirius.db/other",
+      "https://nvidia.com/cudf",
+      "special requests: urgent",
+      "regular packages",
+      "a\xC3\xA9\xE2\x82\xAC\xF0\x9F\x98\x8A"
+      "z",
+      "nand",
+      "ababa",
+      "BUILDING",
+      "MACHINERY",
+    };
+    std::vector<bool> valids_b = {
+      true, true, false, true, true, true, true, true, true, false, false, true};
+
+    auto col_a_nullable = make_str_col(rows_a, valids_a, /*int64_offsets=*/false);
+    auto col_b_int64    = make_str_col(rows_b, valids_b, /*int64_offsets=*/true);
+    auto col_c_nonnull  = make_str_col(rows_a, {}, /*int64_offsets=*/false);
+
+    // Narrowed INT16 column (to verify zero full-column restoration casts in fused kernel)
+    std::vector<std::int16_t> narrow_vals = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+    auto col_narrow                       = cudf::make_numeric_column(
+      cudf::data_type{cudf::type_id::INT16}, 12, cudf::mask_state::UNALLOCATED, stream, mr);
+    REQUIRE(cudaMemcpy(col_narrow->mutable_view().data<std::int16_t>(),
+                       narrow_vals.data(),
+                       12 * sizeof(std::int16_t),
+                       cudaMemcpyHostToDevice) == cudaSuccess);
+
+    auto build_exprs = [&]() {
+      duckdb::vector<std::unique_ptr<ast_node>> exprs;
+
+      // 1. All 8 comparison operators (col vs constant and col vs col)
+      for (auto const op : {sirius::comparison_type::equal,
+                            sirius::comparison_type::not_equal,
+                            sirius::comparison_type::lt,
+                            sirius::comparison_type::le,
+                            sirius::comparison_type::gt,
+                            sirius::comparison_type::ge,
+                            sirius::comparison_type::distinct_from,
+                            sirius::comparison_type::not_distinct_from}) {
+        exprs.push_back(make_cmp(op, make_ref_typed(0, varchar_t), make_str_const("AUTOMOBILE")));
+        exprs.push_back(make_cmp(op, make_ref_typed(0, varchar_t), make_ref_typed(1, varchar_t)));
+      }
+
+      // 2. BETWEEN (inclusive and exclusive)
+      exprs.push_back(make_between(make_ref_typed(0, varchar_t),
+                                   make_str_const("13-000"),
+                                   make_str_const("http://z"),
+                                   true,
+                                   true));
+      exprs.push_back(make_between(make_ref_typed(2, varchar_t),
+                                   make_str_const("13-456-7890"),
+                                   make_str_const("ababa"),
+                                   false,
+                                   false));
+
+      // 3. IN and NOT IN (constant list, nullable list, and column operands)
+      {
+        std::vector<std::unique_ptr<ast_node>> vals;
+        vals.push_back(make_str_const("BUILDING"));
+        vals.push_back(make_str_const("AUTOMOBILE"));
+        vals.push_back(make_str_const("ababa"));
+        exprs.push_back(make_in(make_ref_typed(0, varchar_t), std::move(vals), false));
+      }
+      {
+        std::vector<std::unique_ptr<ast_node>> vals;
+        vals.push_back(make_str_const("BUILDING"));
+        vals.push_back(make_null_const(varchar_t));
+        vals.push_back(make_ref_typed(1, varchar_t));
+        exprs.push_back(make_in(make_ref_typed(0, varchar_t), std::move(vals), true));
+      }
+
+      // 4. strlen and length (UTF-8 character count vs byte count)
+      for (std::uint32_t col_idx : {0U, 1U, 2U}) {
+        std::vector<std::unique_ptr<ast_node>> s_args;
+        s_args.push_back(make_ref_typed(col_idx, varchar_t));
+        exprs.push_back(make_func(sirius::function_id::strlen, std::move(s_args), bigint_t));
+
+        std::vector<std::unique_ptr<ast_node>> l_args;
+        l_args.push_back(make_ref_typed(col_idx, varchar_t));
+        exprs.push_back(make_func(sirius::function_id::length, std::move(l_args), bigint_t));
+      }
+
+      // 5. PREFIX, SUFFIX, CONTAINS
+      for (std::string const& needle :
+           {"", "http", "https://", "cudf", "requests", "z", "\xE2\x82\xAC"}) {
+        {
+          std::vector<std::unique_ptr<ast_node>> args;
+          args.push_back(make_ref_typed(0, varchar_t));
+          args.push_back(make_str_const(needle));
+          exprs.push_back(make_func(sirius::function_id::prefix, std::move(args), bool_t));
+        }
+        {
+          std::vector<std::unique_ptr<ast_node>> args;
+          args.push_back(make_ref_typed(0, varchar_t));
+          args.push_back(make_str_const(needle));
+          exprs.push_back(make_func(sirius::function_id::suffix, std::move(args), bool_t));
+        }
+        {
+          std::vector<std::unique_ptr<ast_node>> args;
+          args.push_back(make_ref_typed(0, varchar_t));
+          args.push_back(make_str_const(needle));
+          exprs.push_back(make_func(sirius::function_id::contains, std::move(args), bool_t));
+        }
+      }
+
+      // 6. LIKE and NOT LIKE (exact, prefix%, %suffix, %lit%, %lit1%lit2%, '_' single-char ASCII &
+      // UTF-8)
+      for (std::string const& pat : {"",
+                                     "%",
+                                     "%%%",
+                                     "AUTOMOBILE",
+                                     "http%",
+                                     "%cudf",
+                                     "%requests%",
+                                     "%special%requests%",
+                                     "%express%packages%delivery%",
+                                     "%aba",
+                                     "13-___-7890",
+                                     "a___z",
+                                     "_and_",
+                                     "%_\xF0\x9F\x98\x8A_%"}) {
+        {
+          std::vector<std::unique_ptr<ast_node>> args;
+          args.push_back(make_ref_typed(0, varchar_t));
+          args.push_back(make_str_const(pat));
+          exprs.push_back(make_func(sirius::function_id::like, std::move(args), bool_t));
+        }
+        {
+          std::vector<std::unique_ptr<ast_node>> args;
+          args.push_back(make_ref_typed(2, varchar_t));
+          args.push_back(make_str_const(pat));
+          exprs.push_back(make_func(sirius::function_id::not_like, std::move(args), bool_t));
+        }
+      }
+
+      // 7. CASE / COALESCE over strings consumed in registers + narrowed carrier column
+      {
+        std::vector<std::unique_ptr<ast_node>> coal_args;
+        coal_args.push_back(make_ref_typed(0, varchar_t));
+        coal_args.push_back(make_ref_typed(1, varchar_t));
+        coal_args.push_back(make_str_const("FALLBACK"));
+        auto coal =
+          std::make_unique<ast_node>(sirius::ast::coalesce{std::move(coal_args), varchar_t});
+
+        std::vector<std::unique_ptr<ast_node>> len_args;
+        len_args.push_back(std::move(coal));
+        auto coal_len = make_func(sirius::function_id::length, std::move(len_args), bigint_t);
+
+        std::vector<std::unique_ptr<ast_node>> add_args;
+        add_args.push_back(std::move(coal_len));
+        add_args.push_back(make_ref_typed(3, bigint_t));
+        exprs.push_back(make_func(sirius::function_id::add, std::move(add_args), bigint_t));
+      }
+      {
+        std::vector<sirius::ast::case_expr::when_then> cases;
+        std::vector<std::unique_ptr<ast_node>> like_args;
+        like_args.push_back(make_ref_typed(0, varchar_t));
+        like_args.push_back(make_str_const("%http%"));
+        cases.push_back({make_func(sirius::function_id::like, std::move(like_args), bool_t),
+                         make_ref_typed(0, varchar_t)});
+        auto case_str = std::make_unique<ast_node>(
+          sirius::ast::case_expr{std::move(cases), make_str_const("non_url"), varchar_t});
+
+        std::vector<std::unique_ptr<ast_node>> pref_args;
+        pref_args.push_back(std::move(case_str));
+        pref_args.push_back(make_str_const("https"));
+        exprs.push_back(make_func(sirius::function_id::prefix, std::move(pref_args), bool_t));
+      }
+
+      return exprs;
+    };
+
+    // Full table evaluation
+    {
+      cudf::table_view tv{
+        {col_a_nullable->view(), col_b_int64->view(), col_c_nonnull->view(), col_narrow->view()}};
+      auto exprs = build_exprs();
+      exp_executor mat_exec(
+        exprs, mr, stream, sirius::expression_query_policy{exp_strategy_enum::MATERIALIZE});
+      exp_executor jit_exec(
+        exprs, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+
+      auto mat_out = mat_exec.evaluate(tv);
+      auto jit_out = jit_exec.evaluate(tv);
+      REQUIRE(mat_out != nullptr);
+      REQUIRE(jit_out != nullptr);
+      CHECK(jit_exec.restored_reference_cast_count_for_testing() == 0);
+      check_tables_match(jit_out->view(), mat_out->view());
+    }
+
+    // Sliced table evaluation (offset = 2, length = 8)
+    {
+      auto const sliced_a = cudf::slice(col_a_nullable->view(), {2, 10}, stream)[0];
+      auto const sliced_b = cudf::slice(col_b_int64->view(), {2, 10}, stream)[0];
+      auto const sliced_c = cudf::slice(col_c_nonnull->view(), {2, 10}, stream)[0];
+      auto const sliced_n = cudf::slice(col_narrow->view(), {2, 10}, stream)[0];
+      cudf::table_view sliced_tv{{sliced_a, sliced_b, sliced_c, sliced_n}};
+
+      auto exprs = build_exprs();
+      exp_executor mat_exec(
+        exprs, mr, stream, sirius::expression_query_policy{exp_strategy_enum::MATERIALIZE});
+      exp_executor jit_exec(
+        exprs, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+
+      auto mat_out = mat_exec.evaluate(sliced_tv);
+      auto jit_out = jit_exec.evaluate(sliced_tv);
+      REQUIRE(mat_out != nullptr);
+      REQUIRE(jit_out != nullptr);
+      CHECK(jit_exec.restored_reference_cast_count_for_testing() == 0);
+      check_tables_match(jit_out->view(), mat_out->view());
+    }
+  }
+
+  SECTION("in-kernel substring consumed by downstream IN, comparison, LIKE, strlen, and length")
+  {
+    std::vector<std::string> phones = {
+      "13-456-7890",
+      "31-999-0000",
+      "23-111-2222",
+      "19-888-7777",
+      "http://sirius.db/path",
+      "https://nvidia.com",
+      "a\xC3\xA9\xE2\x82\xAC\xF0\x9F\x98\x8A"
+      "z",
+      "short",
+      "",
+    };
+    std::vector<bool> valids = {true, true, false, true, true, true, true, true, true};
+    auto col_phone           = make_str_col(phones, valids, false);
+
+    // Narrowed INT16 column to confirm fused single-kernel execution
+    std::vector<std::int16_t> narrow_vals = {10, 20, 30, 40, 50, 60, 70, 80, 90};
+    auto col_narrow                       = cudf::make_numeric_column(
+      cudf::data_type{cudf::type_id::INT16}, 9, cudf::mask_state::UNALLOCATED, stream, mr);
+    REQUIRE(cudaMemcpy(col_narrow->mutable_view().data<std::int16_t>(),
+                       narrow_vals.data(),
+                       9 * sizeof(std::int16_t),
+                       cudaMemcpyHostToDevice) == cudaSuccess);
+
+    cudf::table_view tv{{col_phone->view(), col_narrow->view()}};
+
+    auto make_substr = [&](std::int64_t offset, std::optional<std::int64_t> len = std::nullopt) {
+      std::vector<std::unique_ptr<ast_node>> args;
+      args.push_back(make_ref_typed(0, varchar_t));
+      args.push_back(make_bigint_const(offset));
+      if (len.has_value()) { args.push_back(make_bigint_const(*len)); }
+      return make_func(sirius::function_id::substring, std::move(args), varchar_t);
+    };
+
+    duckdb::vector<std::unique_ptr<ast_node>> exprs;
+
+    // 1. TPC-H Q22 shape: substring(c_phone, 1, 2) IN ('13', '31', '23')
+    {
+      std::vector<std::unique_ptr<ast_node>> in_vals;
+      in_vals.push_back(make_str_const("13"));
+      in_vals.push_back(make_str_const("31"));
+      in_vals.push_back(make_str_const("23"));
+      exprs.push_back(make_in(make_substr(1, 2), std::move(in_vals), false));
+    }
+
+    // 2. substring(s, 1, 4) = 'http'
+    exprs.push_back(
+      make_cmp(sirius::comparison_type::equal, make_substr(1, 4), make_str_const("http")));
+
+    // 3. UTF-8 character slicing: substring("aé€😊z", 2, 3) = "é€😊", strlen = 9, length = 3
+    {
+      std::vector<std::unique_ptr<ast_node>> sl_args;
+      sl_args.push_back(make_substr(2, 3));
+      exprs.push_back(make_func(sirius::function_id::strlen, std::move(sl_args), bigint_t));
+
+      std::vector<std::unique_ptr<ast_node>> ln_args;
+      ln_args.push_back(make_substr(2, 3));
+      exprs.push_back(make_func(sirius::function_id::length, std::move(ln_args), bigint_t));
+
+      exprs.push_back(make_cmp(sirius::comparison_type::equal,
+                               make_substr(2, 3),
+                               make_str_const("\xC3\xA9\xE2\x82\xAC\xF0\x9F\x98\x8A")));
+    }
+
+    // 4. Two-argument substring(s, 8) and negative offset substring(s, -4, 4)
+    {
+      std::vector<std::unique_ptr<ast_node>> like_args;
+      like_args.push_back(make_substr(8));
+      like_args.push_back(make_str_const("%sirius%"));
+      exprs.push_back(make_func(sirius::function_id::like, std::move(like_args), bool_t));
+
+      exprs.push_back(
+        make_cmp(sirius::comparison_type::equal, make_substr(-4, 4), make_str_const("7890")));
+    }
+
+    // 5. Fused with narrowed carrier column
+    {
+      std::vector<std::unique_ptr<ast_node>> len_args;
+      len_args.push_back(make_substr(1, 5));
+      auto sub_len = make_func(sirius::function_id::length, std::move(len_args), bigint_t);
+      std::vector<std::unique_ptr<ast_node>> add_args;
+      add_args.push_back(std::move(sub_len));
+      add_args.push_back(make_ref_typed(1, bigint_t));
+      exprs.push_back(make_func(sirius::function_id::add, std::move(add_args), bigint_t));
+    }
+
+    exp_executor mat_exec(
+      exprs, mr, stream, sirius::expression_query_policy{exp_strategy_enum::MATERIALIZE});
+    exp_executor jit_exec(
+      exprs, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+
+    auto mat_out = mat_exec.evaluate(tv);
+    auto jit_out = jit_exec.evaluate(tv);
+    REQUIRE(mat_out != nullptr);
+    REQUIRE(jit_out != nullptr);
+    CHECK(jit_exec.restored_reference_cast_count_for_testing() == 0);
+    check_tables_match(jit_out->view(), mat_out->view());
+  }
+
+  SECTION(
+    "Overlapped-Segment Cache BSM fast path and large-string HBM fallback path match MATERIALIZE "
+    "and reuse cached kernel")
+  {
+    // Block 0 (rows 0..255): normal-length strings (~25 bytes each -> ~6.4 KB <= 16 KB BSM budget)
+    // Block 1 (rows 256..511): long strings (~100 bytes each -> ~25.6 KB > 16 KB BSM budget,
+    // exercising the in-kernel HBM fallback path!)
+    std::vector<std::string> rows(520);
+    std::vector<bool> valids(520, true);
+    for (std::size_t i = 0; i < 256; ++i) {
+      if (i % 17 == 0) {
+        valids[i] = false;
+        rows[i]   = "";
+      } else if (i % 3 == 0) {
+        rows[i] = "hdr_" + std::to_string(i) + "_special_requests_end";
+      } else if (i % 3 == 1) {
+        rows[i] = "hdr_" + std::to_string(i) + "_express_packages_end";
+      } else {
+        rows[i] = "hdr_" + std::to_string(i) + "_ordinary_comment_end";
+      }
+    }
+    std::string const long_pad(80, 'x');
+    for (std::size_t i = 256; i < rows.size(); ++i) {
+      if (i % 19 == 0) {
+        valids[i] = false;
+        rows[i]   = "";
+      } else if (i % 3 == 0) {
+        rows[i] = long_pad + "_special_table_" + std::to_string(i) + "_requests_tail";
+      } else if (i % 3 == 1) {
+        rows[i] = long_pad + "_express_pkg_" + std::to_string(i) + "_packages_tail";
+      } else {
+        rows[i] = long_pad + "_normal_row_" + std::to_string(i) + "_nothing_tail";
+      }
+    }
+
+    auto col_str = make_str_col(rows, valids, false);
+    cudf::table_view tv{{col_str->view()}};
+
+    auto make_query = [&](std::string const& like_pat, std::string const& contains_needle) {
+      duckdb::vector<std::unique_ptr<ast_node>> exprs;
+      {
+        std::vector<std::unique_ptr<ast_node>> args;
+        args.push_back(make_ref_typed(0, varchar_t));
+        args.push_back(make_str_const(like_pat));
+        exprs.push_back(make_func(sirius::function_id::like, std::move(args), bool_t));
+      }
+      {
+        std::vector<std::unique_ptr<ast_node>> args;
+        args.push_back(make_ref_typed(0, varchar_t));
+        args.push_back(make_str_const(like_pat));
+        exprs.push_back(make_func(sirius::function_id::not_like, std::move(args), bool_t));
+      }
+      {
+        std::vector<std::unique_ptr<ast_node>> args;
+        args.push_back(make_ref_typed(0, varchar_t));
+        args.push_back(make_str_const(contains_needle));
+        exprs.push_back(make_func(sirius::function_id::contains, std::move(args), bool_t));
+      }
+      return exprs;
+    };
+
+    codegen::jit::KernelCache::instance().clear();
+    REQUIRE(codegen::jit::KernelCache::instance().size() == 0);
+
+    auto exprs1 = make_query("%special%requests%", "express");
+    exp_executor mat1(
+      exprs1, mr, stream, sirius::expression_query_policy{exp_strategy_enum::MATERIALIZE});
+    exp_executor jit1(
+      exprs1, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+
+    auto mat_out1 = mat1.evaluate(tv);
+    auto jit_out1 = jit1.evaluate(tv);
+    CHECK(codegen::jit::KernelCache::instance().size() == 1);
+    check_tables_match(jit_out1->view(), mat_out1->view());
+
+    // Changing runtime string constants reuses the compiled kernel without recompiling!
+    auto exprs2 = make_query("%express%packages%", "special");
+    exp_executor mat2(
+      exprs2, mr, stream, sirius::expression_query_policy{exp_strategy_enum::MATERIALIZE});
+    exp_executor jit2(
+      exprs2, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+
+    auto mat_out2 = mat2.evaluate(tv);
+    auto jit_out2 = jit2.evaluate(tv);
+    CHECK(codegen::jit::KernelCache::instance().size() == 1);
+    check_tables_match(jit_out2->view(), mat_out2->view());
+  }
+}

@@ -34,13 +34,15 @@
 namespace sirius::nvrtc {
 
 /**
- * @brief Descriptor for a referenced fixed-width input column bound to the compiled kernel.
+ * @brief Descriptor for a referenced input column bound to the compiled kernel.
  */
 struct input_column_binding {
   std::uint32_t column_index{0};    ///< Index of the column in the input `cudf::table_view`
   cudf::data_type physical_type{};  ///< Physical carrier type in the input `cudf::column_view`
-  bool is_nullable{false};          ///< True if the input column has nulls in the current batch
-  std::size_t binding_id{0};        ///< Ordinal index among bound input columns (`in_{id}_...`)
+  cudf::data_type offset_type{};  ///< Offset column type (`INT32` or `INT64`) for `STRING` columns
+  bool is_nullable{false};        ///< True if the input column has nulls in the current batch
+  bool use_bsm_cache{false};      ///< True if the `STRING` column uses Overlapped-Segment Cache
+  std::size_t binding_id{0};      ///< Ordinal index among bound input columns (`in_{id}_...`)
 };
 
 /**
@@ -140,6 +142,7 @@ class translation_context {
                                                            cudf::data_type carrier);
 
   [[nodiscard]] std::size_t get_or_bind_input_column(std::uint32_t column_index);
+  void mark_string_columns_for_bsm(sirius::ast::node const& expr);
 
   cudf::table_view _input;
   std::vector<input_column_binding> _input_columns;

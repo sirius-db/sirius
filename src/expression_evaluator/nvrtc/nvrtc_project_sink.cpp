@@ -21,6 +21,7 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/cudf_utils.hpp>
 #include <cudf/null_mask.hpp>
+#include <cudf/strings/strings_column_view.hpp>
 #include <cudf/utilities/bit.hpp>
 
 #include <rmm/device_uvector.hpp>
@@ -31,6 +32,7 @@
 #include <expression/date_trunc_unit.hpp>
 #include <expression/function_id.hpp>
 #include <expression/join_condition.hpp>
+#include <expression/substring_slice.hpp>
 #include <expression_evaluator/nvrtc/nvrtc_project_sink.hpp>
 #include <expression_evaluator/nvrtc/translation_context.hpp>
 #include <helper/numeric_narrowing.hpp>
@@ -172,6 +174,18 @@ namespace {
   return opt_cudf.value_or(cudf::data_type{cudf::type_id::EMPTY});
 }
 
+[[nodiscard]] std::optional<std::int64_t> extract_constant_int64(
+  sirius::ast::node const& node) noexcept
+{
+  if (!node.holds<sirius::ast::constant>()) { return std::nullopt; }
+  auto const& payload = node.get<sirius::ast::constant>().payload;
+  if (std::holds_alternative<std::int64_t>(payload)) { return std::get<std::int64_t>(payload); }
+  if (std::holds_alternative<std::int32_t>(payload)) {
+    return static_cast<std::int64_t>(std::get<std::int32_t>(payload));
+  }
+  return std::nullopt;
+}
+
 [[nodiscard]] bool is_node_supported(sirius::ast::node const& expr,
                                      cudf::table_view const& input) noexcept
 {
@@ -179,8 +193,15 @@ namespace {
     auto const& ref = expr.get<sirius::ast::reference>();
     if (ref.column_index >= static_cast<std::uint32_t>(input.num_columns())) { return false; }
     auto const col_view = input.column(ref.column_index);
-    if (!is_supported_fixed_width(col_view.type())) { return false; }
     auto const& logical = ref.return_type();
+    if (col_view.type().id() == cudf::type_id::STRING) {
+      if (col_view.num_children() > 0) {
+        auto const off_id = cudf::strings_column_view(col_view).offsets().type().id();
+        if (off_id != cudf::type_id::INT32 && off_id != cudf::type_id::INT64) { return false; }
+      }
+      return is_untyped_reference_type(logical) || logical.id() == sirius::type_id::VARCHAR;
+    }
+    if (!is_supported_fixed_width(col_view.type())) { return false; }
     if (!is_untyped_reference_type(logical)) {
       auto const opt_cudf = sirius::get_cudf_type(logical);
       if (!opt_cudf || !is_supported_fixed_width(*opt_cudf)) { return false; }
@@ -196,7 +217,7 @@ namespace {
   if (expr.holds<sirius::ast::constant>()) {
     auto const& cst     = expr.get<sirius::ast::constant>();
     auto const opt_cudf = sirius::get_cudf_type(cst.return_type());
-    return opt_cudf.has_value() && is_supported_fixed_width(*opt_cudf);
+    return opt_cudf.has_value() && is_supported_register_type(*opt_cudf);
   }
 
   if (expr.holds<sirius::ast::comparison>()) {
@@ -207,6 +228,9 @@ namespace {
     }
     auto const lt = effective_node_cudf_type(*cmp.left, input);
     auto const rt = effective_node_cudf_type(*cmp.right, input);
+    if (lt.id() == cudf::type_id::STRING || rt.id() == cudf::type_id::STRING) {
+      return lt.id() == cudf::type_id::STRING && rt.id() == cudf::type_id::STRING;
+    }
     if (!is_supported_fixed_width(lt) || !is_supported_fixed_width(rt)) { return false; }
     if (cudf::is_fixed_point(lt) || cudf::is_fixed_point(rt)) {
       return cudf::is_fixed_point(lt) && cudf::is_fixed_point(rt);
@@ -224,6 +248,11 @@ namespace {
     auto const it = effective_node_cudf_type(*btw.input, input);
     auto const lt = effective_node_cudf_type(*btw.lower, input);
     auto const ut = effective_node_cudf_type(*btw.upper, input);
+    if (it.id() == cudf::type_id::STRING || lt.id() == cudf::type_id::STRING ||
+        ut.id() == cudf::type_id::STRING) {
+      return it.id() == cudf::type_id::STRING && lt.id() == cudf::type_id::STRING &&
+             ut.id() == cudf::type_id::STRING;
+    }
     if (!is_supported_fixed_width(it) || !is_supported_fixed_width(lt) ||
         !is_supported_fixed_width(ut)) {
       return false;
@@ -252,7 +281,7 @@ namespace {
     auto const& ce = expr.get<sirius::ast::case_expr>();
     if (ce.cases.empty() || !ce.else_) { return false; }
     auto const opt_ret = sirius::get_cudf_type(ce.return_type());
-    if (!opt_ret || !is_supported_fixed_width(*opt_ret)) { return false; }
+    if (!opt_ret || !is_supported_register_type(*opt_ret)) { return false; }
     auto const ret_type = *opt_ret;
     for (auto const& c : ce.cases) {
       if (!c.when_ || !c.then_) { return false; }
@@ -264,7 +293,12 @@ namespace {
       }
       if (!is_node_supported(*c.then_, input)) { return false; }
       auto const tt = effective_node_cudf_type(*c.then_, input);
-      if (!is_supported_fixed_width(tt)) { return false; }
+      if (!is_supported_register_type(tt)) { return false; }
+      if (ret_type.id() == cudf::type_id::STRING || tt.id() == cudf::type_id::STRING) {
+        if (ret_type.id() != cudf::type_id::STRING || tt.id() != cudf::type_id::STRING) {
+          return false;
+        }
+      }
       if (cudf::is_fixed_point(ret_type) || cudf::is_fixed_point(tt)) {
         if (!cudf::is_fixed_point(ret_type) || !cudf::is_fixed_point(tt) ||
             ret_type.scale() != tt.scale()) {
@@ -274,7 +308,12 @@ namespace {
     }
     if (!is_node_supported(*ce.else_, input)) { return false; }
     auto const et = effective_node_cudf_type(*ce.else_, input);
-    if (!is_supported_fixed_width(et)) { return false; }
+    if (!is_supported_register_type(et)) { return false; }
+    if (ret_type.id() == cudf::type_id::STRING || et.id() == cudf::type_id::STRING) {
+      if (ret_type.id() != cudf::type_id::STRING || et.id() != cudf::type_id::STRING) {
+        return false;
+      }
+    }
     if (cudf::is_fixed_point(ret_type) || cudf::is_fixed_point(et)) {
       if (!cudf::is_fixed_point(ret_type) || !cudf::is_fixed_point(et) ||
           ret_type.scale() != et.scale()) {
@@ -288,12 +327,17 @@ namespace {
     auto const& coal = expr.get<sirius::ast::coalesce>();
     if (coal.children.empty()) { return false; }
     auto const opt_ret = sirius::get_cudf_type(coal.return_type());
-    if (!opt_ret || !is_supported_fixed_width(*opt_ret)) { return false; }
+    if (!opt_ret || !is_supported_register_type(*opt_ret)) { return false; }
     auto const ret_type = *opt_ret;
     for (auto const& ch : coal.children) {
       if (!ch || !is_node_supported(*ch, input)) { return false; }
       auto const ct = effective_node_cudf_type(*ch, input);
-      if (!is_supported_fixed_width(ct)) { return false; }
+      if (!is_supported_register_type(ct)) { return false; }
+      if (ret_type.id() == cudf::type_id::STRING || ct.id() == cudf::type_id::STRING) {
+        if (ret_type.id() != cudf::type_id::STRING || ct.id() != cudf::type_id::STRING) {
+          return false;
+        }
+      }
       if (cudf::is_fixed_point(ret_type) || cudf::is_fixed_point(ct)) {
         if (!cudf::is_fixed_point(ret_type) || !cudf::is_fixed_point(ct) ||
             ret_type.scale() != ct.scale()) {
@@ -309,11 +353,14 @@ namespace {
     if (!inl.probe || inl.values.empty()) { return false; }
     if (!is_node_supported(*inl.probe, input)) { return false; }
     auto const pt = effective_node_cudf_type(*inl.probe, input);
-    if (!is_supported_fixed_width(pt)) { return false; }
+    if (!is_supported_register_type(pt)) { return false; }
     for (auto const& v : inl.values) {
       if (!v || !is_node_supported(*v, input)) { return false; }
       auto const vt = effective_node_cudf_type(*v, input);
-      if (!is_supported_fixed_width(vt)) { return false; }
+      if (!is_supported_register_type(vt)) { return false; }
+      if (pt.id() == cudf::type_id::STRING || vt.id() == cudf::type_id::STRING) {
+        if (pt.id() != cudf::type_id::STRING || vt.id() != cudf::type_id::STRING) { return false; }
+      }
       if (cudf::is_fixed_point(pt) || cudf::is_fixed_point(vt)) {
         if (!cudf::is_fixed_point(pt) || !cudf::is_fixed_point(vt)) { return false; }
       }
@@ -347,7 +394,7 @@ namespace {
       case sirius::ast::unary_op::kind::op_is_not_null: return true;
       case sirius::ast::unary_op::kind::op_try: {
         auto const rt = effective_node_cudf_type(*uo.child, input);
-        return is_supported_fixed_width(rt);
+        return is_supported_register_type(rt);
       }
       default: return false;
     }
@@ -357,7 +404,7 @@ namespace {
     auto const& fc     = expr.get<sirius::ast::function_call>();
     auto const& args   = fc.arguments();
     auto const opt_ret = sirius::get_cudf_type(fc.return_type());
-    if (!opt_ret || !is_supported_fixed_width(*opt_ret)) { return false; }
+    if (!opt_ret || !is_supported_register_type(*opt_ret)) { return false; }
     auto const ret_type = *opt_ret;
 
     if (fc.function() == sirius::function_id::date_trunc) {
@@ -370,6 +417,23 @@ namespace {
       if (!args[1] || !is_node_supported(*args[1], input)) { return false; }
       auto const ct = effective_node_cudf_type(*args[1], input);
       return cudf::is_timestamp(ct) && cudf::is_timestamp(ret_type);
+    }
+
+    if (fc.function() == sirius::function_id::substring) {
+      if ((args.size() != 2 && args.size() != 3) || ret_type.id() != cudf::type_id::STRING) {
+        return false;
+      }
+      if (!args[0] || !is_node_supported(*args[0], input)) { return false; }
+      if (effective_node_cudf_type(*args[0], input).id() != cudf::type_id::STRING) { return false; }
+      auto const opt_offset = args[1] ? extract_constant_int64(*args[1]) : std::nullopt;
+      if (!opt_offset) { return false; }
+      std::int64_t length = sirius::substring_default_length;
+      if (args.size() == 3) {
+        auto const opt_len = args[2] ? extract_constant_int64(*args[2]) : std::nullopt;
+        if (!opt_len) { return false; }
+        length = *opt_len;
+      }
+      return sirius::gpu_substring_slice(*opt_offset, length).has_value();
     }
 
     for (auto const& arg : args) {
@@ -412,7 +476,12 @@ namespace {
         return true;
       }
       case sirius::function_id::constant_or_null: {
-        return args.size() >= 2 && is_supported_fixed_width(ret_type);
+        if (args.size() < 2 || !is_supported_register_type(ret_type)) { return false; }
+        auto const v0_t = effective_node_cudf_type(*args[0], input);
+        if (ret_type.id() == cudf::type_id::STRING || v0_t.id() == cudf::type_id::STRING) {
+          return ret_type.id() == cudf::type_id::STRING && v0_t.id() == cudf::type_id::STRING;
+        }
+        return is_supported_fixed_width(v0_t);
       }
       case sirius::function_id::year:
       case sirius::function_id::month:
@@ -425,6 +494,22 @@ namespace {
         if (args.size() != 1) { return false; }
         auto const ct = effective_node_cudf_type(*args[0], input);
         return cudf::is_timestamp(ct) && cudf::is_integral(ret_type);
+      }
+      case sirius::function_id::strlen:
+      case sirius::function_id::length: {
+        if (args.size() != 1) { return false; }
+        auto const ct = effective_node_cudf_type(*args[0], input);
+        return ct.id() == cudf::type_id::STRING && cudf::is_integral(ret_type);
+      }
+      case sirius::function_id::prefix:
+      case sirius::function_id::suffix:
+      case sirius::function_id::contains:
+      case sirius::function_id::like:
+      case sirius::function_id::not_like: {
+        if (args.size() != 2 || ret_type.id() != cudf::type_id::BOOL8) { return false; }
+        auto const lt = effective_node_cudf_type(*args[0], input);
+        auto const rt = effective_node_cudf_type(*args[1], input);
+        return lt.id() == cudf::type_id::STRING && rt.id() == cudf::type_id::STRING;
       }
       default: return false;
     }
@@ -680,9 +765,51 @@ std::size_t translation_context::get_or_bind_input_column(std::uint32_t column_i
   auto const col_view    = _input.column(column_index);
   auto const binding_id  = _input_columns.size();
   bool const is_nullable = col_view.nullable() && col_view.null_count() != 0;
-  _input_columns.push_back(
-    input_column_binding{column_index, col_view.type(), is_nullable, binding_id});
+  cudf::data_type offset_type{cudf::type_id::INT32};
+  if (col_view.type().id() == cudf::type_id::STRING && col_view.num_children() > 0) {
+    offset_type = cudf::strings_column_view(col_view).offsets().type();
+  }
+  _input_columns.push_back(input_column_binding{
+    column_index, col_view.type(), offset_type, is_nullable, /*use_bsm_cache=*/false, binding_id});
   return binding_id;
+}
+
+void translation_context::mark_string_columns_for_bsm(sirius::ast::node const& expr)
+{
+  if (expr.holds<sirius::ast::reference>()) {
+    auto const& ref = expr.get<sirius::ast::reference>();
+    if (ref.column_index < static_cast<std::uint32_t>(_input.num_columns()) &&
+        _input.column(ref.column_index).type().id() == cudf::type_id::STRING) {
+      auto const bid                    = get_or_bind_input_column(ref.column_index);
+      _input_columns[bid].use_bsm_cache = true;
+    }
+    return;
+  }
+  if (expr.holds<sirius::ast::function_call>()) {
+    for (auto const& arg : expr.get<sirius::ast::function_call>().arguments()) {
+      if (arg) { mark_string_columns_for_bsm(*arg); }
+    }
+    return;
+  }
+  if (expr.holds<sirius::ast::case_expr>()) {
+    auto const& ce = expr.get<sirius::ast::case_expr>();
+    for (auto const& c : ce.cases) {
+      if (c.then_) { mark_string_columns_for_bsm(*c.then_); }
+    }
+    if (ce.else_) { mark_string_columns_for_bsm(*ce.else_); }
+    return;
+  }
+  if (expr.holds<sirius::ast::coalesce>()) {
+    for (auto const& ch : expr.get<sirius::ast::coalesce>().children) {
+      if (ch) { mark_string_columns_for_bsm(*ch); }
+    }
+    return;
+  }
+  if (expr.holds<sirius::ast::unary_op>()) {
+    auto const& uo = expr.get<sirius::ast::unary_op>();
+    if (uo.child) { mark_string_columns_for_bsm(*uo.child); }
+    return;
+  }
 }
 
 register_value translation_context::produce_reference(sirius::ast::reference const& expr)
@@ -709,18 +836,36 @@ register_value translation_context::produce_reference(sirius::ast::reference con
   auto const& col_binding = _input_columns.at(binding_id);
   auto const var_name     = next_var_name();
   auto const dst_type_str = cuda_type_name(restored_type);
+  auto const id_str       = std::to_string(binding_id);
 
-  if (!col_binding.is_nullable) {
+  if (restored_type.id() == cudf::type_id::STRING) {
+    if (!col_binding.is_nullable) {
+      emit_prelude_line(
+        "reg_val<str_view> " + var_name + "{(in_" + id_str + "_offsets != nullptr) ? str_view{in_" +
+        id_str + "_active_chars + (static_cast<int64_t>(in_" + id_str + "_offsets[row]) - in_" +
+        id_str + "_base_off), static_cast<int32_t>(in_" + id_str + "_offsets[row + 1] - in_" +
+        id_str + "_offsets[row])} : str_view{nullptr, 0}, true, false};");
+    } else {
+      emit_prelude_line("bool const " + var_name + "_valid = (in_" + id_str +
+                        "_mask == nullptr) || is_bit_set(in_" + id_str + "_mask, in_" + id_str +
+                        "_bit_offset + row);");
+      emit_prelude_line("reg_val<str_view> " + var_name + "{(" + var_name + "_valid && in_" +
+                        id_str + "_offsets != nullptr) ? str_view{in_" + id_str +
+                        "_active_chars + (static_cast<int64_t>(in_" + id_str +
+                        "_offsets[row]) - in_" + id_str + "_base_off), static_cast<int32_t>(in_" +
+                        id_str + "_offsets[row + 1] - in_" + id_str +
+                        "_offsets[row])} : str_view{nullptr, 0}, " + var_name + "_valid, false};");
+    }
+  } else if (!col_binding.is_nullable) {
     emit_prelude_line("reg_val<" + dst_type_str + "> " + var_name + "{static_cast<" + dst_type_str +
-                      ">(in_" + std::to_string(binding_id) + "_data[row]), true, false};");
+                      ">(in_" + id_str + "_data[row]), true, false};");
   } else {
-    emit_prelude_line("bool const " + var_name + "_valid = (in_" + std::to_string(binding_id) +
-                      "_mask == nullptr) || is_bit_set(in_" + std::to_string(binding_id) +
-                      "_mask, in_" + std::to_string(binding_id) + "_bit_offset + row);");
+    emit_prelude_line("bool const " + var_name + "_valid = (in_" + id_str +
+                      "_mask == nullptr) || is_bit_set(in_" + id_str + "_mask, in_" + id_str +
+                      "_bit_offset + row);");
     emit_prelude_line("reg_val<" + dst_type_str + "> " + var_name + "{" + var_name +
-                      "_valid ? static_cast<" + dst_type_str + ">(in_" +
-                      std::to_string(binding_id) + "_data[row]) : " + dst_type_str + "{}, " +
-                      var_name + "_valid, false};");
+                      "_valid ? static_cast<" + dst_type_str + ">(in_" + id_str +
+                      "_data[row]) : " + dst_type_str + "{}, " + var_name + "_valid, false};");
   }
 
   register_value reg{
@@ -736,9 +881,15 @@ register_value translation_context::produce_constant(sirius::ast::constant const
   auto const binding_id  = _constants.size();
   auto const var_name    = next_var_name();
   auto const type_str    = cuda_type_name(device_type);
+  auto const id_str      = std::to_string(binding_id);
 
-  emit_prelude_line("reg_val<" + type_str + "> " + var_name + "{c_" + std::to_string(binding_id) +
-                    "_val, c_" + std::to_string(binding_id) + "_valid != 0, false};");
+  if (device_type.id() == cudf::type_id::STRING) {
+    emit_prelude_line("reg_val<str_view> " + var_name + "{str_view{c_" + id_str + "_ptr, c_" +
+                      id_str + "_len}, c_" + id_str + "_valid != 0, false};");
+  } else {
+    emit_prelude_line("reg_val<" + type_str + "> " + var_name + "{c_" + id_str + "_val, c_" +
+                      id_str + "_valid != 0, false};");
+  }
 
   register_value reg{var_name,
                      expr.return_type(),
@@ -1644,6 +1795,71 @@ register_value translation_context::produce_function_call(sirius::ast::function_
       var_name, expr.return_type(), ret_type, child.is_statically_non_null, can_ovf};
   }
 
+  if (fid == sirius::function_id::strlen || fid == sirius::function_id::length) {
+    auto const child = produce(*args[0]);
+    std::string const fn =
+      (fid == sirius::function_id::strlen) ? "eval_strlen" : "eval_utf8_length";
+    emit_line("reg_val<" + type_str + "> " + var_name + " = " + fn + "<" + type_str + ">(" +
+              child.var_name + ");");
+    return register_value{
+      var_name, expr.return_type(), ret_type, child.is_statically_non_null, child.can_overflow};
+  }
+
+  if (fid == sirius::function_id::prefix || fid == sirius::function_id::suffix ||
+      fid == sirius::function_id::contains || fid == sirius::function_id::like ||
+      fid == sirius::function_id::not_like) {
+    if (fid == sirius::function_id::contains || fid == sirius::function_id::like ||
+        fid == sirius::function_id::not_like) {
+      mark_string_columns_for_bsm(*args[0]);
+    }
+    auto const lhs = produce(*args[0]);
+    auto const rhs = produce(*args[1]);
+    std::string fn;
+    switch (fid) {
+      case sirius::function_id::prefix: fn = "eval_prefix"; break;
+      case sirius::function_id::suffix: fn = "eval_suffix"; break;
+      case sirius::function_id::contains: fn = "eval_contains"; break;
+      case sirius::function_id::like: fn = "eval_like<false>"; break;
+      case sirius::function_id::not_like: fn = "eval_like<true>"; break;
+      default: break;
+    }
+    emit_line("reg_val<bool> " + var_name + " = " + fn + "(" + lhs.var_name + ", " + rhs.var_name +
+              ");");
+    return register_value{var_name,
+                          expr.return_type(),
+                          ret_type,
+                          lhs.is_statically_non_null && rhs.is_statically_non_null,
+                          lhs.can_overflow || rhs.can_overflow};
+  }
+
+  if (fid == sirius::function_id::substring) {
+    auto const opt_offset     = extract_constant_int64(*args[1]);
+    std::int64_t const offset = opt_offset.value_or(0);
+    std::int64_t const length =
+      (args.size() == 3)
+        ? extract_constant_int64(*args[2]).value_or(sirius::substring_default_length)
+        : sirius::substring_default_length;
+    auto const slice = sirius::gpu_substring_slice(offset, length);
+    if (!slice) {
+      throw invalid_input_exception(
+        "[expression_evaluator:function] unsupported substring bounds (offset {}, length {})",
+        offset,
+        length);
+    }
+    auto const child          = produce(*args[0]);
+    std::int32_t const start  = slice->start.value_or(0);
+    std::int32_t const stop   = slice->stop.value_or(std::numeric_limits<std::int32_t>::max());
+    auto const int32_sql_type = sirius::logical_type::make(sirius::type_id::INTEGER);
+    auto const start_reg =
+      produce_constant(sirius::ast::constant{sirius::value{start}, int32_sql_type});
+    auto const stop_reg =
+      produce_constant(sirius::ast::constant{sirius::value{stop}, int32_sql_type});
+    emit_line("reg_val<str_view> " + var_name + " = eval_substring(" + child.var_name + ", " +
+              start_reg.var_name + ".val, " + stop_reg.var_name + ".val);");
+    return register_value{
+      var_name, expr.return_type(), ret_type, child.is_statically_non_null, child.can_overflow};
+  }
+
   throw not_implemented_exception("[nvrtc] Unsupported function_id in translation_context: {}",
                                   static_cast<int>(fid));
 }
@@ -1690,6 +1906,7 @@ bool can_compile_project_sink(std::span<sirius::ast::node const* const> expressi
   if (expressions.empty()) { return false; }
   for (auto const* expr : expressions) {
     if (expr == nullptr || !is_node_supported(*expr, input)) { return false; }
+    if (!is_supported_fixed_width(effective_node_cudf_type(*expr, input))) { return false; }
   }
   return true;
 }
@@ -1754,6 +1971,212 @@ std::unique_ptr<cudf::table> evaluate_project_sink(
     << "  bool valid;\n"
     << "  bool overflow;\n"
     << "};\n\n"
+    << "struct str_view {\n"
+    << "  char const* ptr;\n"
+    << "  int32_t len;\n"
+    << "};\n\n"
+    << "__device__ __forceinline__ int str_view_cmp(str_view a, str_view b) {\n"
+    << "  int32_t const min_len = a.len < b.len ? a.len : b.len;\n"
+    << "  for (int32_t i = 0; i < min_len; ++i) {\n"
+    << "    uint8_t const ca = static_cast<uint8_t>(a.ptr[i]);\n"
+    << "    uint8_t const cb = static_cast<uint8_t>(b.ptr[i]);\n"
+    << "    if (ca != cb) { return (ca < cb) ? -1 : 1; }\n"
+    << "  }\n"
+    << "  return (a.len < b.len) ? -1 : ((a.len > b.len) ? 1 : 0);\n"
+    << "}\n\n"
+    << "__device__ __forceinline__ bool operator==(str_view a, str_view b) {\n"
+    << "  if (a.len != b.len) { return false; }\n"
+    << "  for (int32_t i = 0; i < a.len; ++i) {\n"
+    << "    if (a.ptr[i] != b.ptr[i]) { return false; }\n"
+    << "  }\n"
+    << "  return true;\n"
+    << "}\n"
+    << "__device__ __forceinline__ bool operator!=(str_view a, str_view b) { return !(a == b); }\n"
+    << "__device__ __forceinline__ bool operator<(str_view a, str_view b) { return "
+       "str_view_cmp(a, b) < 0; }\n"
+    << "__device__ __forceinline__ bool operator<=(str_view a, str_view b) { return "
+       "str_view_cmp(a, b) <= 0; }\n"
+    << "__device__ __forceinline__ bool operator>(str_view a, str_view b) { return "
+       "str_view_cmp(a, b) > 0; }\n"
+    << "__device__ __forceinline__ bool operator>=(str_view a, str_view b) { return "
+       "str_view_cmp(a, b) >= 0; }\n\n"
+    << "__device__ __forceinline__ void coop_load_bsm(char* dst, char const* src, int32_t nbytes) "
+       "{\n"
+    << "  int32_t const tid = static_cast<int32_t>(threadIdx.x);\n"
+    << "  int32_t const align_off = static_cast<int32_t>(reinterpret_cast<uintptr_t>(src) & 7u);\n"
+    << "  int32_t const head = (align_off == 0) ? 0 : ((8 - align_off) < nbytes ? (8 - align_off) "
+       ": nbytes);\n"
+    << "  for (int32_t b = tid; b < head; b += 256) {\n"
+    << "    dst[b] = src[b];\n"
+    << "  }\n"
+    << "  int32_t const rem = nbytes - head;\n"
+    << "  int32_t const nwords = rem >> 3;\n"
+    << "  uint64_t* const dst_w = reinterpret_cast<uint64_t*>(dst + head);\n"
+    << "  uint64_t const* const src_w = reinterpret_cast<uint64_t const*>(src + head);\n"
+    << "  for (int32_t w = tid; w < nwords; w += 256) {\n"
+    << "    dst_w[w] = src_w[w];\n"
+    << "  }\n"
+    << "  int32_t const tail_start = head + (nwords << 3);\n"
+    << "  for (int32_t b = tail_start + tid; b < nbytes; b += 256) {\n"
+    << "    dst[b] = src[b];\n"
+    << "  }\n"
+    << "}\n\n"
+    << "template <typename OutT>\n"
+    << "__device__ __forceinline__ reg_val<OutT> eval_strlen(reg_val<str_view> in) {\n"
+    << "  if (!in.valid || in.overflow) { return reg_val<OutT>{OutT{}, in.valid, in.overflow}; }\n"
+    << "  return reg_val<OutT>{static_cast<OutT>(in.val.len), true, false};\n"
+    << "}\n\n"
+    << "template <typename OutT>\n"
+    << "__device__ __forceinline__ reg_val<OutT> eval_utf8_length(reg_val<str_view> in) {\n"
+    << "  if (!in.valid || in.overflow) { return reg_val<OutT>{OutT{}, in.valid, in.overflow}; }\n"
+    << "  int32_t count = 0;\n"
+    << "  for (int32_t i = 0; i < in.val.len; ++i) {\n"
+    << "    if ((static_cast<uint8_t>(in.val.ptr[i]) & 0xC0u) != 0x80u) { ++count; }\n"
+    << "  }\n"
+    << "  return reg_val<OutT>{static_cast<OutT>(count), true, false};\n"
+    << "}\n\n"
+    << "__device__ __forceinline__ reg_val<bool> eval_prefix(reg_val<str_view> s, "
+       "reg_val<str_view> pat) {\n"
+    << "  bool const ovf = s.overflow || pat.overflow;\n"
+    << "  bool const valid = s.valid && pat.valid;\n"
+    << "  if (!valid || ovf) { return reg_val<bool>{false, valid, ovf}; }\n"
+    << "  if (pat.val.len > s.val.len) { return reg_val<bool>{false, true, false}; }\n"
+    << "  for (int32_t i = 0; i < pat.val.len; ++i) {\n"
+    << "    if (s.val.ptr[i] != pat.val.ptr[i]) { return reg_val<bool>{false, true, false}; }\n"
+    << "  }\n"
+    << "  return reg_val<bool>{true, true, false};\n"
+    << "}\n\n"
+    << "__device__ __forceinline__ reg_val<bool> eval_suffix(reg_val<str_view> s, "
+       "reg_val<str_view> pat) {\n"
+    << "  bool const ovf = s.overflow || pat.overflow;\n"
+    << "  bool const valid = s.valid && pat.valid;\n"
+    << "  if (!valid || ovf) { return reg_val<bool>{false, valid, ovf}; }\n"
+    << "  if (pat.val.len > s.val.len) { return reg_val<bool>{false, true, false}; }\n"
+    << "  int32_t const start = s.val.len - pat.val.len;\n"
+    << "  for (int32_t i = 0; i < pat.val.len; ++i) {\n"
+    << "    if (s.val.ptr[start + i] != pat.val.ptr[i]) {\n"
+    << "      return reg_val<bool>{false, true, false};\n"
+    << "    }\n"
+    << "  }\n"
+    << "  return reg_val<bool>{true, true, false};\n"
+    << "}\n\n"
+    << "__device__ __forceinline__ reg_val<bool> eval_contains(reg_val<str_view> s, "
+       "reg_val<str_view> pat) {\n"
+    << "  bool const ovf = s.overflow || pat.overflow;\n"
+    << "  bool const valid = s.valid && pat.valid;\n"
+    << "  if (!valid || ovf) { return reg_val<bool>{false, valid, ovf}; }\n"
+    << "  if (pat.val.len <= 0) { return reg_val<bool>{true, true, false}; }\n"
+    << "  if (s.val.len < pat.val.len) { return reg_val<bool>{false, true, false}; }\n"
+    << "  char const first = pat.val.ptr[0];\n"
+    << "  char const last = pat.val.ptr[pat.val.len - 1];\n"
+    << "  int32_t const limit = s.val.len - pat.val.len;\n"
+    << "  for (int32_t i = 0; i <= limit; ++i) {\n"
+    << "    if (s.val.ptr[i] == first && s.val.ptr[i + pat.val.len - 1] == last) {\n"
+    << "      bool ok = true;\n"
+    << "      for (int32_t j = 1; j < pat.val.len - 1; ++j) {\n"
+    << "        if (s.val.ptr[i + j] != pat.val.ptr[j]) { ok = false; break; }\n"
+    << "      }\n"
+    << "      if (ok) { return reg_val<bool>{true, true, false}; }\n"
+    << "    }\n"
+    << "  }\n"
+    << "  return reg_val<bool>{false, true, false};\n"
+    << "}\n\n"
+    << "__device__ __forceinline__ int32_t next_utf8_char(char const* s, int32_t slen, int32_t "
+       "pos) {\n"
+    << "  int32_t next = pos + 1;\n"
+    << "  while (next < slen && (static_cast<uint8_t>(s[next]) & 0xC0u) == 0x80u) {\n"
+    << "    ++next;\n"
+    << "  }\n"
+    << "  return next;\n"
+    << "}\n\n"
+    << "__device__ __forceinline__ bool raw_like(str_view s, str_view pat) {\n"
+    << "  int32_t si = 0;\n"
+    << "  int32_t pi = 0;\n"
+    << "  int32_t star_pi = -1;\n"
+    << "  int32_t star_si = -1;\n"
+    << "  while (si < s.len) {\n"
+    << "    if (pi < pat.len && pat.ptr[pi] == '%') {\n"
+    << "      while (pi < pat.len && pat.ptr[pi] == '%') { ++pi; }\n"
+    << "      if (pi == pat.len) { return true; }\n"
+    << "      star_pi = pi;\n"
+    << "      if (pat.ptr[star_pi] != '_') {\n"
+    << "        char const target = pat.ptr[star_pi];\n"
+    << "        while (si < s.len && s.ptr[si] != target) { ++si; }\n"
+    << "      }\n"
+    << "      star_si = si;\n"
+    << "    } else if (pi < pat.len && pat.ptr[pi] == '_') {\n"
+    << "      si = next_utf8_char(s.ptr, s.len, si);\n"
+    << "      ++pi;\n"
+    << "    } else if (pi < pat.len && s.ptr[si] == pat.ptr[pi]) {\n"
+    << "      ++si;\n"
+    << "      ++pi;\n"
+    << "    } else if (star_pi != -1) {\n"
+    << "      pi = star_pi;\n"
+    << "      if (pat.ptr[star_pi] != '_') {\n"
+    << "        char const target = pat.ptr[star_pi];\n"
+    << "        int32_t next_s = star_si + 1;\n"
+    << "        while (next_s < s.len && s.ptr[next_s] != target) { ++next_s; }\n"
+    << "        star_si = next_s;\n"
+    << "      } else {\n"
+    << "        star_si = next_utf8_char(s.ptr, s.len, star_si);\n"
+    << "      }\n"
+    << "      si = star_si;\n"
+    << "    } else {\n"
+    << "      return false;\n"
+    << "    }\n"
+    << "  }\n"
+    << "  while (pi < pat.len && pat.ptr[pi] == '%') { ++pi; }\n"
+    << "  return pi == pat.len;\n"
+    << "}\n\n"
+    << "template <bool Invert>\n"
+    << "__device__ __forceinline__ reg_val<bool> eval_like(reg_val<str_view> s, reg_val<str_view> "
+       "pat) {\n"
+    << "  bool const ovf = s.overflow || pat.overflow;\n"
+    << "  bool const valid = s.valid && pat.valid;\n"
+    << "  if (!valid || ovf) { return reg_val<bool>{false, valid, ovf}; }\n"
+    << "  bool const m = raw_like(s.val, pat.val);\n"
+    << "  return reg_val<bool>{Invert ? !m : m, true, false};\n"
+    << "}\n\n"
+    << "__device__ __forceinline__ str_view slice_utf8_forward(str_view s, int32_t start_char, "
+       "int32_t stop_char) {\n"
+    << "  if (stop_char <= start_char || s.len <= 0) { return str_view{s.ptr, 0}; }\n"
+    << "  int32_t char_idx = 0;\n"
+    << "  int32_t byte_start = s.len;\n"
+    << "  int32_t byte_stop = s.len;\n"
+    << "  for (int32_t b = 0; b < s.len; ++b) {\n"
+    << "    if ((static_cast<uint8_t>(s.ptr[b]) & 0xC0u) != 0x80u) {\n"
+    << "      if (char_idx == start_char) { byte_start = b; }\n"
+    << "      if (char_idx == stop_char) {\n"
+    << "        byte_stop = b;\n"
+    << "        break;\n"
+    << "      }\n"
+    << "      ++char_idx;\n"
+    << "    }\n"
+    << "  }\n"
+    << "  if (byte_start >= byte_stop) { return str_view{s.ptr, 0}; }\n"
+    << "  return str_view{s.ptr + byte_start, byte_stop - byte_start};\n"
+    << "}\n\n"
+    << "__device__ __forceinline__ reg_val<str_view> eval_substring(\n"
+    << "    reg_val<str_view> in, int32_t start_char, int32_t stop_char) {\n"
+    << "  if (!in.valid || in.overflow) {\n"
+    << "    return reg_val<str_view>{str_view{nullptr, 0}, in.valid, in.overflow};\n"
+    << "  }\n"
+    << "  if (start_char >= 0 && stop_char >= 0) {\n"
+    << "    return reg_val<str_view>{slice_utf8_forward(in.val, start_char, stop_char), true, "
+       "false};\n"
+    << "  }\n"
+    << "  int32_t char_len = 0;\n"
+    << "  for (int32_t b = 0; b < in.val.len; ++b) {\n"
+    << "    if ((static_cast<uint8_t>(in.val.ptr[b]) & 0xC0u) != 0x80u) { ++char_len; }\n"
+    << "  }\n"
+    << "  int32_t r_start = (start_char < 0) ? (char_len + start_char) : start_char;\n"
+    << "  if (r_start < 0) { r_start = 0; }\n"
+    << "  if (r_start > char_len) { r_start = char_len; }\n"
+    << "  int32_t r_stop = (stop_char < 0) ? (char_len + stop_char) : stop_char;\n"
+    << "  if (r_stop < 0) { r_stop = 0; }\n"
+    << "  if (r_stop > char_len) { r_stop = char_len; }\n"
+    << "  return reg_val<str_view>{slice_utf8_forward(in.val, r_start, r_stop), true, false};\n"
+    << "}\n\n"
     << "__device__ __forceinline__ bool is_bit_set(uint32_t const* mask, int32_t bit_idx) {\n"
     << "  return ((mask[bit_idx >> 5] >> (bit_idx & 31)) & 1u) != 0u;\n"
     << "}\n\n"
@@ -2301,19 +2724,45 @@ std::unique_ptr<cudf::table> evaluate_project_sink(
     << "}\n\n"
     << "extern \"C\" __global__ void sirius_nvrtc_project_kernel(\n";
 
+  std::size_t num_bsm_cols = 0;
   for (auto const& in_col : ctx.input_columns()) {
-    auto const id_str   = std::to_string(in_col.binding_id);
-    auto const type_str = cuda_type_name(in_col.physical_type);
-    src << "    " << type_str << " const* __restrict__ in_" << id_str << "_data,\n"
-        << "    uint32_t const* __restrict__ in_" << id_str << "_mask,\n"
-        << "    int32_t in_" << id_str << "_bit_offset,\n";
+    if (in_col.physical_type.id() == cudf::type_id::STRING && in_col.use_bsm_cache) {
+      ++num_bsm_cols;
+    }
+  }
+  int32_t const bsm_budget_per_col =
+    (num_bsm_cols == 0)
+      ? 0
+      : static_cast<int32_t>(std::max<std::size_t>(1024, (16384 / num_bsm_cols) & ~7ULL));
+
+  for (auto const& in_col : ctx.input_columns()) {
+    auto const id_str = std::to_string(in_col.binding_id);
+    if (in_col.physical_type.id() == cudf::type_id::STRING) {
+      auto const off_type_str = cuda_type_name(in_col.offset_type);
+      src << "    " << off_type_str << " const* __restrict__ in_" << id_str << "_offsets,\n"
+          << "    char const* __restrict__ in_" << id_str << "_chars,\n"
+          << "    int64_t in_" << id_str << "_chars_size,\n"
+          << "    uint32_t const* __restrict__ in_" << id_str << "_mask,\n"
+          << "    int32_t in_" << id_str << "_bit_offset,\n";
+    } else {
+      auto const type_str = cuda_type_name(in_col.physical_type);
+      src << "    " << type_str << " const* __restrict__ in_" << id_str << "_data,\n"
+          << "    uint32_t const* __restrict__ in_" << id_str << "_mask,\n"
+          << "    int32_t in_" << id_str << "_bit_offset,\n";
+    }
   }
 
   for (auto const& cst : ctx.constants()) {
-    auto const id_str   = std::to_string(cst.binding_id);
-    auto const type_str = cuda_type_name(cst.device_type);
-    src << "    " << type_str << " c_" << id_str << "_val,\n"
-        << "    uint8_t c_" << id_str << "_valid,\n";
+    auto const id_str = std::to_string(cst.binding_id);
+    if (cst.device_type.id() == cudf::type_id::STRING) {
+      src << "    char const* __restrict__ c_" << id_str << "_ptr,\n"
+          << "    int32_t c_" << id_str << "_len,\n"
+          << "    uint8_t c_" << id_str << "_valid,\n";
+    } else {
+      auto const type_str = cuda_type_name(cst.device_type);
+      src << "    " << type_str << " c_" << id_str << "_val,\n"
+          << "    uint8_t c_" << id_str << "_valid,\n";
+    }
   }
 
   for (std::size_t k = 0; k < out_regs.size(); ++k) {
@@ -2334,6 +2783,45 @@ std::unique_ptr<cudf::table> evaluate_project_sink(
       << " + static_cast<int32_t>(threadIdx.x)) >> 5;\n"
       << "  int32_t const warp_base_row = global_warp << 5;\n"
       << "  bool const active = (row < num_rows);\n";
+
+  for (auto const& in_col : ctx.input_columns()) {
+    if (in_col.physical_type.id() != cudf::type_id::STRING) { continue; }
+    auto const id_str = std::to_string(in_col.binding_id);
+    src << "  (void)in_" << id_str << "_chars_size;\n";
+    if (in_col.use_bsm_cache && bsm_budget_per_col > 0) {
+      src << "  __shared__ __align__(8) char bsm_buf_" << id_str << "[" << (bsm_budget_per_col + 8)
+          << "];\n"
+          << "  int32_t const bsm_row_begin_" << id_str << " = static_cast<int32_t>(blockIdx.x) * "
+          << block_threads << ";\n"
+          << "  int32_t const bsm_row_end_" << id_str << " = (bsm_row_begin_" << id_str << " + "
+          << block_threads << " < num_rows) ? (bsm_row_begin_" << id_str << " + " << block_threads
+          << ") : num_rows;\n"
+          << "  int64_t in_" << id_str << "_base_off = 0LL;\n"
+          << "  char const* in_" << id_str << "_active_chars = in_" << id_str << "_chars;\n"
+          << "  if (in_" << id_str << "_offsets != nullptr && in_" << id_str
+          << "_chars != nullptr && bsm_row_begin_" << id_str << " < bsm_row_end_" << id_str
+          << ") {\n"
+          << "    int64_t const raw_base = static_cast<int64_t>(in_" << id_str
+          << "_offsets[bsm_row_begin_" << id_str << "]);\n"
+          << "    int64_t const raw_end = static_cast<int64_t>(in_" << id_str
+          << "_offsets[bsm_row_end_" << id_str << "]);\n"
+          << "    int64_t const span = raw_end - raw_base;\n"
+          << "    if (span >= 0 && span <= " << bsm_budget_per_col << ") {\n"
+          << "      int32_t const align_off = static_cast<int32_t>(reinterpret_cast<uintptr_t>(in_"
+          << id_str << "_chars + raw_base) & 7u);\n"
+          << "      char* const bsm_dst = bsm_buf_" << id_str << " + align_off;\n"
+          << "      coop_load_bsm(bsm_dst, in_" << id_str
+          << "_chars + raw_base, static_cast<int32_t>(span));\n"
+          << "      in_" << id_str << "_base_off = raw_base;\n"
+          << "      in_" << id_str << "_active_chars = bsm_dst;\n"
+          << "    }\n"
+          << "  }\n";
+    } else {
+      src << "  int64_t const in_" << id_str << "_base_off = 0LL;\n"
+          << "  char const* const in_" << id_str << "_active_chars = in_" << id_str << "_chars;\n";
+    }
+  }
+  if (num_bsm_cols > 0) { src << "  __syncthreads();\n"; }
 
   for (std::size_t k = 0; k < out_regs.size(); ++k) {
     if (!out_regs[k].is_statically_non_null) { src << "  bool out_" << k << "_valid = false;\n"; }
@@ -2468,35 +2956,104 @@ std::unique_ptr<cudf::table> evaluate_project_sink(
   // Prepare kernel argument storage.
   struct input_arg_storage {
     void const* data_ptr{nullptr};
+    void const* offsets_ptr{nullptr};
+    char const* chars_ptr{nullptr};
+    std::int64_t chars_size{0};
     std::uint32_t const* mask_ptr{nullptr};
     std::int32_t bit_offset{0};
   };
   std::vector<input_arg_storage> in_args(ctx.input_columns().size());
   for (std::size_t i = 0; i < ctx.input_columns().size(); ++i) {
-    auto const& binding   = ctx.input_columns()[i];
-    auto const col_view   = input.column(binding.column_index);
-    in_args[i].data_ptr   = get_input_data_ptr(col_view);
+    auto const& binding = ctx.input_columns()[i];
+    auto const col_view = input.column(binding.column_index);
+    if (binding.physical_type.id() == cudf::type_id::STRING) {
+      if (col_view.size() > 0 && col_view.num_children() > 0) {
+        cudf::strings_column_view const scv(col_view);
+        auto const offsets_col = scv.offsets();
+        if (offsets_col.size() > col_view.offset() + col_view.size()) {
+          if (offsets_col.type().id() == cudf::type_id::INT64) {
+            in_args[i].offsets_ptr = offsets_col.data<std::int64_t>() + col_view.offset();
+          } else {
+            in_args[i].offsets_ptr = offsets_col.data<std::int32_t>() + col_view.offset();
+          }
+          in_args[i].chars_ptr  = scv.chars_begin(stream);
+          in_args[i].chars_size = scv.chars_size(stream);
+        }
+      }
+    } else {
+      in_args[i].data_ptr = get_input_data_ptr(col_view);
+    }
     in_args[i].mask_ptr   = binding.is_nullable ? col_view.null_mask() : nullptr;
     in_args[i].bit_offset = static_cast<std::int32_t>(col_view.offset());
   }
 
-  std::vector<constant_param_storage> const_args(ctx.constants().size());
+  struct string_constant_arg_storage {
+    char const* ptr{nullptr};
+    std::int32_t len{0};
+    std::uint8_t valid{0};
+  };
+  std::string h_const_chars;
+  std::vector<std::size_t> str_const_offsets(ctx.constants().size(), 0);
   for (std::size_t i = 0; i < ctx.constants().size(); ++i) {
-    populate_constant_param(ctx.constants()[i], const_args[i]);
+    auto const& cst = ctx.constants()[i];
+    if (cst.device_type.id() == cudf::type_id::STRING && cst.is_valid) {
+      auto const& s        = std::get<std::string>(cst.payload);
+      str_const_offsets[i] = h_const_chars.size();
+      h_const_chars.append(s);
+    }
+  }
+  rmm::device_uvector<char> d_const_chars(h_const_chars.size(), stream, mr);
+  if (!h_const_chars.empty()) {
+    simpatico::throw_if_cuda_error(cudaMemcpyAsync(d_const_chars.data(),
+                                                   h_const_chars.data(),
+                                                   h_const_chars.size(),
+                                                   cudaMemcpyHostToDevice,
+                                                   stream.get()),
+                                   "cudaMemcpyAsync(d_const_chars)");
+  }
+
+  std::vector<constant_param_storage> const_args(ctx.constants().size());
+  std::vector<string_constant_arg_storage> str_const_args(ctx.constants().size());
+  for (std::size_t i = 0; i < ctx.constants().size(); ++i) {
+    auto const& cst = ctx.constants()[i];
+    if (cst.device_type.id() == cudf::type_id::STRING) {
+      str_const_args[i].valid = cst.is_valid ? 1U : 0U;
+      if (cst.is_valid) {
+        auto const& s         = std::get<std::string>(cst.payload);
+        str_const_args[i].ptr = d_const_chars.data() + str_const_offsets[i];
+        str_const_args[i].len = static_cast<std::int32_t>(s.size());
+      }
+    } else {
+      populate_constant_param(cst, const_args[i]);
+    }
   }
 
   std::int32_t num_rows_arg = static_cast<std::int32_t>(num_rows);
 
   std::vector<void*> kernel_args;
-  kernel_args.reserve(in_args.size() * 3 + const_args.size() * 2 + outputs.size() * 2 + 2);
-  for (auto& in_arg : in_args) {
-    kernel_args.push_back(&in_arg.data_ptr);
-    kernel_args.push_back(&in_arg.mask_ptr);
-    kernel_args.push_back(&in_arg.bit_offset);
+  kernel_args.reserve(in_args.size() * 5 + const_args.size() * 3 + outputs.size() * 2 + 2);
+  for (std::size_t i = 0; i < in_args.size(); ++i) {
+    if (ctx.input_columns()[i].physical_type.id() == cudf::type_id::STRING) {
+      kernel_args.push_back(&in_args[i].offsets_ptr);
+      kernel_args.push_back(&in_args[i].chars_ptr);
+      kernel_args.push_back(&in_args[i].chars_size);
+      kernel_args.push_back(&in_args[i].mask_ptr);
+      kernel_args.push_back(&in_args[i].bit_offset);
+    } else {
+      kernel_args.push_back(&in_args[i].data_ptr);
+      kernel_args.push_back(&in_args[i].mask_ptr);
+      kernel_args.push_back(&in_args[i].bit_offset);
+    }
   }
-  for (auto& cst_arg : const_args) {
-    kernel_args.push_back(&cst_arg.val_bytes[0]);
-    kernel_args.push_back(&cst_arg.valid);
+  for (std::size_t i = 0; i < ctx.constants().size(); ++i) {
+    if (ctx.constants()[i].device_type.id() == cudf::type_id::STRING) {
+      kernel_args.push_back(&str_const_args[i].ptr);
+      kernel_args.push_back(&str_const_args[i].len);
+      kernel_args.push_back(&str_const_args[i].valid);
+    } else {
+      kernel_args.push_back(&const_args[i].val_bytes[0]);
+      kernel_args.push_back(&const_args[i].valid);
+    }
   }
   for (auto& out_arg : outputs) {
     kernel_args.push_back(&out_arg.data_ptr);

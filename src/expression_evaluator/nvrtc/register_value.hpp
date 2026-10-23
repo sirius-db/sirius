@@ -55,7 +55,16 @@ namespace sirius::nvrtc {
 }
 
 /**
- * @brief Returns the CUDA C++ storage type name for a fixed-width cuDF data type.
+ * @brief Returns whether a cuDF data type can be held as a Register Value in GPU registers
+ * (fixed-width types plus non-owning `str_view` slices for `STRING`).
+ */
+[[nodiscard]] inline bool is_supported_register_type(cudf::data_type type) noexcept
+{
+  return is_supported_fixed_width(type) || type.id() == cudf::type_id::STRING;
+}
+
+/**
+ * @brief Returns the CUDA C++ storage type name for a register-supported cuDF data type.
  */
 [[nodiscard]] inline std::string cuda_type_name(cudf::data_type type)
 {
@@ -79,6 +88,7 @@ namespace sirius::nvrtc {
     case cudf::type_id::DECIMAL32: return "int32_t";
     case cudf::type_id::DECIMAL64: return "int64_t";
     case cudf::type_id::DECIMAL128: return "__int128_t";
+    case cudf::type_id::STRING: return "str_view";
     default:
       throw not_implemented_exception("[nvrtc] Unsupported cuDF type for CUDA codegen: {}",
                                       cudf::type_to_name(type));
