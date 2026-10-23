@@ -28,6 +28,7 @@
 #include <cuda.h>
 
 #include <expression/ast/constant_range.hpp>
+#include <expression/date_trunc_unit.hpp>
 #include <expression/function_id.hpp>
 #include <expression/join_condition.hpp>
 #include <expression_evaluator/nvrtc/nvrtc_project_sink.hpp>
@@ -110,6 +111,23 @@ namespace {
     case cudf::type_id::TIMESTAMP_NANOSECONDS: return 1'000'000'000LL;
     default: return 0LL;
   }
+}
+
+[[nodiscard]] std::int64_t date_trunc_divisor(cudf::type_id id,
+                                              sirius::date_trunc_unit unit) noexcept
+{
+  std::int64_t const tps = timestamp_ticks_per_second(id);
+  if (tps <= 0) { return 1LL; }
+  switch (unit) {
+    case sirius::date_trunc_unit::day: return 86'400LL * tps;
+    case sirius::date_trunc_unit::hour: return 3'600LL * tps;
+    case sirius::date_trunc_unit::minute: return 60LL * tps;
+    case sirius::date_trunc_unit::second: return tps;
+    case sirius::date_trunc_unit::millisecond: return (tps >= 1'000LL) ? (tps / 1'000LL) : 1LL;
+    case sirius::date_trunc_unit::microsecond:
+      return (tps >= 1'000'000LL) ? (tps / 1'000'000LL) : 1LL;
+  }
+  return 1LL;
 }
 
 [[nodiscard]] bool is_semantic_cast_supported(cudf::data_type src, cudf::data_type dst) noexcept
@@ -336,14 +354,27 @@ namespace {
   }
 
   if (expr.holds<sirius::ast::function_call>()) {
-    auto const& fc   = expr.get<sirius::ast::function_call>();
-    auto const& args = fc.arguments();
-    for (auto const& arg : args) {
-      if (!arg || !is_node_supported(*arg, input)) { return false; }
-    }
+    auto const& fc     = expr.get<sirius::ast::function_call>();
+    auto const& args   = fc.arguments();
     auto const opt_ret = sirius::get_cudf_type(fc.return_type());
     if (!opt_ret || !is_supported_fixed_width(*opt_ret)) { return false; }
     auto const ret_type = *opt_ret;
+
+    if (fc.function() == sirius::function_id::date_trunc) {
+      if (args.size() != 2) { return false; }
+      if (!args[0] || !args[0]->holds<sirius::ast::constant>()) { return false; }
+      auto const& freq_cst = args[0]->get<sirius::ast::constant>();
+      if (!std::holds_alternative<std::string>(freq_cst.payload)) { return false; }
+      auto const unit = sirius::parse_gpu_date_trunc_unit(std::get<std::string>(freq_cst.payload));
+      if (!unit) { return false; }
+      if (!args[1] || !is_node_supported(*args[1], input)) { return false; }
+      auto const ct = effective_node_cudf_type(*args[1], input);
+      return cudf::is_timestamp(ct) && cudf::is_timestamp(ret_type);
+    }
+
+    for (auto const& arg : args) {
+      if (!arg || !is_node_supported(*arg, input)) { return false; }
+    }
 
     switch (fc.function()) {
       case sirius::function_id::add:
@@ -382,6 +413,18 @@ namespace {
       }
       case sirius::function_id::constant_or_null: {
         return args.size() >= 2 && is_supported_fixed_width(ret_type);
+      }
+      case sirius::function_id::year:
+      case sirius::function_id::month:
+      case sirius::function_id::day:
+      case sirius::function_id::hour:
+      case sirius::function_id::minute:
+      case sirius::function_id::second:
+      case sirius::function_id::millisecond:
+      case sirius::function_id::microsecond: {
+        if (args.size() != 1) { return false; }
+        auto const ct = effective_node_cudf_type(*args[0], input);
+        return cudf::is_timestamp(ct) && cudf::is_integral(ret_type);
       }
       default: return false;
     }
@@ -1518,6 +1561,89 @@ register_value translation_context::produce_function_call(sirius::ast::function_
       var_name, expr.return_type(), ret_type, /*is_statically_non_null=*/false, any_ovf};
   }
 
+  if (fid == sirius::function_id::year || fid == sirius::function_id::month ||
+      fid == sirius::function_id::day || fid == sirius::function_id::hour ||
+      fid == sirius::function_id::minute || fid == sirius::function_id::second ||
+      fid == sirius::function_id::millisecond || fid == sirius::function_id::microsecond) {
+    auto const child = produce(*args[0]);
+    auto const ct_id = child.device_type.id();
+    int comp_id      = 0;
+    switch (fid) {
+      case sirius::function_id::year: comp_id = 0; break;
+      case sirius::function_id::month: comp_id = 1; break;
+      case sirius::function_id::day: comp_id = 2; break;
+      case sirius::function_id::hour: comp_id = 3; break;
+      case sirius::function_id::minute: comp_id = 4; break;
+      case sirius::function_id::second: comp_id = 5; break;
+      case sirius::function_id::millisecond: comp_id = 6; break;
+      case sirius::function_id::microsecond: comp_id = 7; break;
+      default: break;
+    }
+    bool const is_subsec =
+      (fid == sirius::function_id::millisecond || fid == sirius::function_id::microsecond);
+    if (ct_id == cudf::type_id::TIMESTAMP_DAYS) {
+      emit_line("reg_val<" + type_str + "> " + var_name + " = eval_extract_date<" + type_str +
+                ", " + std::to_string(comp_id) + ">(" + child.var_name + ");");
+    } else {
+      std::int64_t const tps = timestamp_ticks_per_second(ct_id);
+      emit_line("reg_val<" + type_str + "> " + var_name + " = eval_extract_timestamp<" + type_str +
+                ", " + std::to_string(tps) + "LL, " + std::to_string(comp_id) + ">(" +
+                child.var_name + ");");
+    }
+    bool const non_null = child.is_statically_non_null && !is_subsec;
+    return register_value{var_name, expr.return_type(), ret_type, non_null, child.can_overflow};
+  }
+
+  if (fid == sirius::function_id::date_trunc) {
+    auto const& freq_str = std::get<std::string>(args[0]->get<sirius::ast::constant>().payload);
+    auto const unit      = sirius::parse_gpu_date_trunc_unit(freq_str);
+    if (!unit) {
+      throw invalid_input_exception(
+        "[expression_evaluator:function] unrecognized/unsupported date_trunc frequency: {}",
+        freq_str);
+    }
+    auto const child      = produce(*args[1]);
+    auto const src_type   = child.device_type;
+    std::string trunc_var = child.var_name;
+    if (src_type.id() != cudf::type_id::TIMESTAMP_DAYS) {
+      std::int64_t const div = date_trunc_divisor(src_type.id(), *unit);
+      if (div > 1LL) {
+        trunc_var = next_var_name();
+        emit_line("reg_val<int64_t> " + trunc_var + " = eval_date_trunc<" + std::to_string(div) +
+                  "LL>(" + child.var_name + ");");
+      }
+    }
+    bool can_ovf = child.can_overflow;
+    if (ret_type == src_type) {
+      emit_line("reg_val<" + type_str + "> " + var_name + " = " + trunc_var + ";");
+    } else if (src_type.id() == cudf::type_id::TIMESTAMP_DAYS) {
+      // Reconcile TIMESTAMP_DAYS to wider timestamp return type via cast_through_rep semantics
+      emit_line("reg_val<" + type_str + "> " + var_name + " = eval_cast_ts_scale_up<" +
+                std::to_string(timestamp_ticks_per_second(ret_type.id()) * 86'400LL) +
+                "LL>(reg_val<int64_t>{static_cast<int64_t>(" + trunc_var + ".val), " + trunc_var +
+                ".valid, " + trunc_var + ".overflow});");
+      can_ovf = true;
+    } else if (ret_type.id() == cudf::type_id::TIMESTAMP_DAYS) {
+      std::int64_t const scale = timestamp_ticks_per_second(src_type.id()) * 86'400LL;
+      emit_line("reg_val<int32_t> " + var_name + " = eval_cast_timestamp_to_date<" +
+                std::to_string(scale) + "LL>(" + trunc_var + ");");
+      can_ovf = true;
+    } else {
+      std::int64_t const src_tps = timestamp_ticks_per_second(src_type.id());
+      std::int64_t const dst_tps = timestamp_ticks_per_second(ret_type.id());
+      if (dst_tps > src_tps) {
+        emit_line("reg_val<int64_t> " + var_name + " = eval_cast_ts_scale_up<" +
+                  std::to_string(dst_tps / src_tps) + "LL>(" + trunc_var + ");");
+        can_ovf = true;
+      } else {
+        emit_line("reg_val<int64_t> " + var_name + " = eval_cast_ts_scale_down<" +
+                  std::to_string(src_tps / dst_tps) + "LL>(" + trunc_var + ");");
+      }
+    }
+    return register_value{
+      var_name, expr.return_type(), ret_type, child.is_statically_non_null, can_ovf};
+  }
+
   throw not_implemented_exception("[nvrtc] Unsupported function_id in translation_context: {}",
                                   static_cast<int>(fid));
 }
@@ -1618,6 +1744,7 @@ std::unique_ptr<cudf::table> evaluate_project_sink(
   src
     << "#include \"codegen/stdint_shim.hpp\"\n"
     << "#include <cuda/numeric>\n"
+    << "#include <cuda/std/chrono>\n"
     << "#include <cuda/std/limits>\n"
     << "#include <cuda/std/type_traits>\n"
     << "#include <cuda/std/utility>\n\n"
@@ -2059,6 +2186,118 @@ std::unique_ptr<cudf::table> evaluate_project_sink(
     << "    return reg_val<int32_t>{0, true, true};\n"
     << "  }\n"
     << "  return reg_val<int32_t>{static_cast<int32_t>(days), true, false};\n"
+    << "}\n\n"
+    << "__device__ __forceinline__ void civil_from_days(int64_t z, int16_t& y, int16_t& m, "
+       "int16_t& d) {\n"
+    << "  cuda::std::chrono::year_month_day const ymd{\n"
+    << "      cuda::std::chrono::sys_days{cuda::std::chrono::days{static_cast<int32_t>(z)}}};\n"
+    << "  y = static_cast<int16_t>(static_cast<int>(ymd.year()));\n"
+    << "  m = static_cast<int16_t>(static_cast<unsigned>(ymd.month()));\n"
+    << "  d = static_cast<int16_t>(static_cast<unsigned>(ymd.day()));\n"
+    << "}\n\n"
+    << "template <typename OutT, int Comp>\n"
+    << "__device__ __forceinline__ reg_val<OutT> eval_extract_date(reg_val<int32_t> in) {\n"
+    << "  if (!in.valid || in.overflow) { return reg_val<OutT>{OutT{}, in.valid, in.overflow}; }\n"
+    << "  int32_t const days = in.val;\n"
+    << "  if constexpr (Comp == 6 || Comp == 7) {\n"
+    << "    constexpr int32_t date_inf = cuda::std::numeric_limits<int32_t>::max();\n"
+    << "    if (days == date_inf || days == -date_inf) {\n"
+    << "      return reg_val<OutT>{OutT{}, false, false};\n"
+    << "    }\n"
+    << "    return reg_val<OutT>{OutT{0}, true, false};\n"
+    << "  } else if constexpr (Comp == 3 || Comp == 4 || Comp == 5) {\n"
+    << "    return reg_val<OutT>{OutT{0}, true, false};\n"
+    << "  } else {\n"
+    << "    int16_t y = 0, m = 0, d = 0;\n"
+    << "    civil_from_days(static_cast<int64_t>(days), y, m, d);\n"
+    << "    int16_t const res = (Comp == 0) ? y : ((Comp == 1) ? m : d);\n"
+    << "    return reg_val<OutT>{static_cast<OutT>(res), true, false};\n"
+    << "  }\n"
+    << "}\n\n"
+    << "template <typename OutT, int64_t TicksPerSec, int Comp>\n"
+    << "__device__ __forceinline__ reg_val<OutT> eval_extract_timestamp(reg_val<int64_t> in) {\n"
+    << "  if (!in.valid || in.overflow) { return reg_val<OutT>{OutT{}, in.valid, in.overflow}; }\n"
+    << "  int64_t const ticks = in.val;\n"
+    << "  if constexpr (Comp == 6 || Comp == 7) {\n"
+    << "    constexpr int64_t ts_inf = cuda::std::numeric_limits<int64_t>::max();\n"
+    << "    if (ticks == ts_inf || ticks == -ts_inf) {\n"
+    << "      return reg_val<OutT>{OutT{}, false, false};\n"
+    << "    }\n"
+    << "  }\n"
+    << "  using Dur = cuda::std::chrono::duration<int64_t, cuda::std::ratio<1, TicksPerSec>>;\n"
+    << "  cuda::std::chrono::sys_time<Dur> const tp{Dur{ticks}};\n"
+    << "  auto const dp = cuda::std::chrono::floor<cuda::std::chrono::days>(tp);\n"
+    << "  if constexpr (Comp == 0 || Comp == 1 || Comp == 2) {\n"
+    << "    cuda::std::chrono::year_month_day const ymd{dp};\n"
+    << "    int16_t const res = (Comp == 0) ? static_cast<int16_t>(static_cast<int>(ymd.year()))\n"
+    << "                      : (Comp == 1) ? "
+       "static_cast<int16_t>(static_cast<unsigned>(ymd.month()))\n"
+    << "                                    : "
+       "static_cast<int16_t>(static_cast<unsigned>(ymd.day()));\n"
+    << "    return reg_val<OutT>{static_cast<OutT>(res), true, false};\n"
+    << "  } else {\n"
+    << "    constexpr int64_t ticks_per_day = 86400LL * TicksPerSec;\n"
+    << "    int64_t rem = ticks % ticks_per_day;\n"
+    << "    if (rem < 0) { rem += ticks_per_day; }\n"
+    << "    int64_t const sec_of_day = rem / TicksPerSec;\n"
+    << "    int64_t const subsec     = rem % TicksPerSec;\n"
+    << "    if constexpr (Comp == 3 || Comp == 4 || Comp == 5) {\n"
+    << "      auto const time_since_midnight = tp - dp;\n"
+    << "      if constexpr (Comp == 3) {\n"
+    << "        auto const hrs = "
+       "cuda::std::chrono::duration_cast<cuda::std::chrono::hours>(time_since_midnight);\n"
+    << "        return reg_val<OutT>{static_cast<OutT>(static_cast<int16_t>(hrs.count())), true, "
+       "false};\n"
+    << "      } else if constexpr (Comp == 4) {\n"
+    << "        auto const mins = cuda::std::chrono::duration_cast<cuda::std::chrono::minutes>(\n"
+    << "            time_since_midnight % cuda::std::chrono::hours{1});\n"
+    << "        return reg_val<OutT>{static_cast<OutT>(static_cast<int16_t>(mins.count())), true, "
+       "false};\n"
+    << "      } else {\n"
+    << "        auto const secs = cuda::std::chrono::duration_cast<cuda::std::chrono::seconds>(\n"
+    << "            time_since_midnight % cuda::std::chrono::minutes{1});\n"
+    << "        return reg_val<OutT>{static_cast<OutT>(static_cast<int16_t>(secs.count())), true, "
+       "false};\n"
+    << "      }\n"
+    << "    } else {\n"
+    << "      int64_t const sec = static_cast<int64_t>(static_cast<int16_t>(sec_of_day % 60LL));\n"
+    << "      int64_t ms_part = 0LL;\n"
+    << "      if constexpr (TicksPerSec == 1000LL) {\n"
+    << "        ms_part = static_cast<int64_t>(static_cast<int16_t>(subsec));\n"
+    << "      } else if constexpr (TicksPerSec == 1000000LL) {\n"
+    << "        ms_part = static_cast<int64_t>(static_cast<int16_t>(subsec / 1000LL));\n"
+    << "      } else if constexpr (TicksPerSec == 1000000000LL) {\n"
+    << "        ms_part = static_cast<int64_t>(static_cast<int16_t>(subsec / 1000000LL));\n"
+    << "      }\n"
+    << "      int64_t const ms_total = sec * 1000LL + ms_part;\n"
+    << "      if constexpr (Comp == 6) {\n"
+    << "        return reg_val<OutT>{static_cast<OutT>(ms_total), true, false};\n"
+    << "      } else {\n"
+    << "        int64_t us_part = 0LL;\n"
+    << "        if constexpr (TicksPerSec == 1000000LL) {\n"
+    << "          us_part = static_cast<int64_t>(static_cast<int16_t>(subsec % 1000LL));\n"
+    << "        } else if constexpr (TicksPerSec == 1000000000LL) {\n"
+    << "          us_part = static_cast<int64_t>(static_cast<int16_t>((subsec / 1000LL) % "
+       "1000LL));\n"
+    << "        }\n"
+    << "        return reg_val<OutT>{static_cast<OutT>(ms_total * 1000LL + us_part), true, "
+       "false};\n"
+    << "      }\n"
+    << "    }\n"
+    << "  }\n"
+    << "}\n\n"
+    << "template <int64_t Divisor>\n"
+    << "__device__ __forceinline__ reg_val<int64_t> eval_date_trunc(reg_val<int64_t> in) {\n"
+    << "  if (!in.valid || in.overflow) { return reg_val<int64_t>{0, in.valid, in.overflow}; }\n"
+    << "  if constexpr (Divisor <= 1LL) {\n"
+    << "    return in;\n"
+    << "  } else {\n"
+    << "    int64_t const t = in.val;\n"
+    << "    int64_t q = t / Divisor;\n"
+    << "    int64_t const r = t % Divisor;\n"
+    << "    if (r < 0) { q -= 1LL; }\n"
+    << "    return reg_val<int64_t>{q * Divisor, true, false};\n"
+    << "  }\n"
     << "}\n\n"
     << "extern \"C\" __global__ void sirius_nvrtc_project_kernel(\n";
 

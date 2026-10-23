@@ -58,7 +58,7 @@ TEST_CASE_METHOD(TimestampExtractionFixture,
                  "[integration][gpu_execution][timestamp_extraction]")
 {
   auto const type     = GENERATE("TIMESTAMP_S", "TIMESTAMP_MS", "TIMESTAMP", "TIMESTAMP_NS");
-  auto const strategy = GENERATE("materialize", "ast_interpret", "ast_jit");
+  auto const strategy = GENERATE("materialize", "ast_interpret", "ast_jit", "nvrtc_jit");
   CAPTURE(type, strategy);
   run_ok("SET gpu_execution = false");
   run_ok(std::string("SET expression_evaluator_strategy = '") + strategy + "'");

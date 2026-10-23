@@ -3338,7 +3338,10 @@ TEST_CASE("subsecond extraction preserves minimum finite ticks",
           "[expression_evaluator][timestamp_bounds]")
 {
   auto* space         = get_default_gpu_space();
-  auto const strategy = GENERATE(MAT, exp_strategy_enum::AST_INTERPRET, exp_strategy_enum::AST_JIT);
+  auto const strategy = GENERATE(MAT,
+                                 exp_strategy_enum::AST_INTERPRET,
+                                 exp_strategy_enum::AST_JIT,
+                                 exp_strategy_enum::NVRTC_JIT);
   auto const days     = GENERATE(true, false);
   auto const function =
     GENERATE(sirius::function_id::millisecond, sirius::function_id::microsecond);
@@ -5596,5 +5599,389 @@ TEST_CASE(
       CHECK(out_vals[1] == 100'000'000LL);
       CHECK(out_vals[3] == ts_inf);
     }
+  }
+}
+
+// ============================================================================
+// Ticket #9: In-kernel temporal extraction (year..microsecond) and date_trunc
+// ============================================================================
+
+TEST_CASE("nvrtc_jit - temporal extraction and date_trunc match MATERIALIZE and fuse in one kernel",
+          "[expression_evaluator][nvrtc_jit][ticket9]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = get_resource_ref(*space);
+
+  auto const date_t   = logical_type::make(type_id::DATE);
+  auto const ts_s_t   = logical_type::make(type_id::TIMESTAMP_SEC);
+  auto const ts_ms_t  = logical_type::make(type_id::TIMESTAMP_MS);
+  auto const ts_us_t  = logical_type::make(type_id::TIMESTAMP);
+  auto const ts_ns_t  = logical_type::make(type_id::TIMESTAMP_NS);
+  auto const bigint_t = logical_type::make(type_id::BIGINT);
+  auto const int_t    = logical_type::make(type_id::INTEGER);
+  auto const bool_t   = logical_type::make(type_id::BOOLEAN);
+
+  auto const date_inf = std::numeric_limits<std::int32_t>::max();
+  auto const date_min = std::numeric_limits<std::int32_t>::lowest();
+  auto const ts_inf   = std::numeric_limits<std::int64_t>::max();
+  auto const ts_min   = std::numeric_limits<std::int64_t>::lowest();
+
+  auto make_ts_col = [&]<typename Rep>(cudf::data_type dt,
+                                       std::vector<Rep> const& vals,
+                                       std::vector<bool> const& valids) {
+    auto const n          = static_cast<cudf::size_type>(vals.size());
+    auto mask             = cudf::create_null_mask(n, cudf::mask_state::ALL_VALID, stream, mr);
+    auto* mptr            = static_cast<cudf::bitmask_type*>(mask.data());
+    cudf::size_type nulls = 0;
+    for (cudf::size_type i = 0; i < n; ++i) {
+      if (!valids[i]) {
+        cudf::set_null_mask(mptr, i, i + 1, false, stream);
+        ++nulls;
+      }
+    }
+    auto col = cudf::make_timestamp_column(dt, n, std::move(mask), nulls, stream, mr);
+    REQUIRE(cudaMemcpy(col->mutable_view().data<Rep>(),
+                       vals.data(),
+                       n * sizeof(Rep),
+                       cudaMemcpyHostToDevice) == cudaSuccess);
+    return col;
+  };
+
+  auto check_tables_match = [&](cudf::table_view jit_tv, cudf::table_view mat_tv) {
+    REQUIRE(jit_tv.num_columns() == mat_tv.num_columns());
+    REQUIRE(jit_tv.num_rows() == mat_tv.num_rows());
+    auto const n_rows = jit_tv.num_rows();
+    for (cudf::size_type c = 0; c < jit_tv.num_columns(); ++c) {
+      CAPTURE(c);
+      auto const jcol = jit_tv.column(c);
+      auto const mcol = mat_tv.column(c);
+      REQUIRE(jcol.type() == mcol.type());
+      CHECK(jcol.null_count() == mcol.null_count());
+      auto const jvalids = copy_valids_to_host(jcol);
+      auto const mvalids = copy_valids_to_host(mcol);
+      REQUIRE(jvalids == mvalids);
+      auto const elem_size = cudf::size_of(jcol.type());
+      std::vector<std::uint8_t> jbytes(n_rows * elem_size);
+      std::vector<std::uint8_t> mbytes(n_rows * elem_size);
+      REQUIRE(cudaMemcpy(jbytes.data(),
+                         jcol.head<std::uint8_t>() + jcol.offset() * elem_size,
+                         jbytes.size(),
+                         cudaMemcpyDeviceToHost) == cudaSuccess);
+      REQUIRE(cudaMemcpy(mbytes.data(),
+                         mcol.head<std::uint8_t>() + mcol.offset() * elem_size,
+                         mbytes.size(),
+                         cudaMemcpyDeviceToHost) == cudaSuccess);
+      for (cudf::size_type r = 0; r < n_rows; ++r) {
+        if (jvalids[r]) {
+          CAPTURE(r);
+          CHECK(std::memcmp(
+                  jbytes.data() + r * elem_size, mbytes.data() + r * elem_size, elem_size) == 0);
+        }
+      }
+    }
+  };
+
+  SECTION("datetime extraction (year..microsecond) across DATE and all TIMESTAMP precisions")
+  {
+    // DATE test values:
+    // -25509: 1900-02-28 (non-leap century year)
+    // -1:     1969-12-31
+    // 0:      1970-01-01
+    // 11016:  2000-02-29 (leap century year)
+    // 19782:  2024-02-29 (leap year)
+    // -365:   1969-01-01
+    // plus NULL, ±infinity, and narrowed INT16 DATE carrier
+    std::vector<std::int32_t> date_vals = {
+      -25509, -365, -1, 0, 11016, 19782, -date_inf, date_inf, 100};
+    std::vector<bool> valids = {true, true, true, true, true, true, true, true, false};
+
+    // Sub-day timestamps (9 rows matching valids):
+    // Row 0: pre-epoch exact day boundary (-25509 * 86400s = 1900-02-28 00:00:00)
+    // Row 1: pre-epoch mid-day (-1 tick before epoch: 1969-12-31 23:59:59...)
+    // Row 2: pre-epoch with subseconds (-86400 - 3723.040523s = 1969-12-30 22:57:56.959477)
+    // Row 3: epoch (0 = 1970-01-01 00:00:00)
+    // Row 4: leap day 2000-02-29 12:34:56.789123456
+    // Row 5: leap day 2024-02-29 23:59:59.999999999
+    // Row 6: ts_min (minimum finite int64)
+    // Row 7: ts_inf (+infinity)
+    // Row 8: NULL (-ts_inf payload)
+    std::vector<std::int64_t> ts_s_vals  = {-25509LL * 86400LL,
+                                            -1LL,
+                                            -86400LL - 3723LL,
+                                            0LL,
+                                            11016LL * 86400LL + 45296LL,
+                                            19782LL * 86400LL + 86399LL,
+                                            -2000LL * 365LL * 86400LL - 12345LL,
+                                            ts_inf,
+                                            -ts_inf};
+    std::vector<std::int64_t> ts_ms_vals = {-25509LL * 86400'000LL,
+                                            -1LL,
+                                            -86400'000LL - 3723'040LL,
+                                            0LL,
+                                            11016LL * 86400'000LL + 45296'789LL,
+                                            19782LL * 86400'000LL + 86399'999LL,
+                                            -2000LL * 365LL * 86400'000LL - 12345'678LL,
+                                            -ts_inf,
+                                            ts_inf};
+    std::vector<std::int64_t> ts_us_vals = {-25509LL * 86400'000'000LL,
+                                            -1LL,
+                                            -86400'000'000LL - 3723'040'523LL,
+                                            0LL,
+                                            11016LL * 86400'000'000LL + 45296'789'123LL,
+                                            19782LL * 86400'000'000LL + 86399'999'999LL,
+                                            -2000LL * 365LL * 86400'000'000LL - 12345'678'901LL,
+                                            ts_inf,
+                                            0LL};
+    std::vector<std::int64_t> ts_ns_vals = {-25509LL * 86400'000'000'000LL,
+                                            -1LL,
+                                            -86400'000'000'000LL - 3723'040'523'789LL,
+                                            0LL,
+                                            11016LL * 86400'000'000'000LL + 45296'789'123'456LL,
+                                            19782LL * 86400'000'000'000LL + 86399'999'999'999LL,
+                                            ts_min,
+                                            -ts_inf,
+                                            0LL};
+
+    // Narrowed INT16 DATE carrier (column 5)
+    std::vector<std::int16_t> narrow_date_vals = {
+      -25509, -365, -1, 0, 11016, 19782, 1000, -1000, 0};
+    auto col_narrow_date = cudf::make_numeric_column(
+      cudf::data_type{cudf::type_id::INT16}, 9, cudf::mask_state::UNALLOCATED, stream, mr);
+    REQUIRE(cudaMemcpy(col_narrow_date->mutable_view().data<std::int16_t>(),
+                       narrow_date_vals.data(),
+                       9 * sizeof(std::int16_t),
+                       cudaMemcpyHostToDevice) == cudaSuccess);
+
+    auto col_d = make_ts_col(cudf::data_type{cudf::type_id::TIMESTAMP_DAYS}, date_vals, valids);
+    auto col_s = make_ts_col(cudf::data_type{cudf::type_id::TIMESTAMP_SECONDS}, ts_s_vals, valids);
+    auto col_ms =
+      make_ts_col(cudf::data_type{cudf::type_id::TIMESTAMP_MILLISECONDS}, ts_ms_vals, valids);
+    auto col_us =
+      make_ts_col(cudf::data_type{cudf::type_id::TIMESTAMP_MICROSECONDS}, ts_us_vals, valids);
+    auto col_ns =
+      make_ts_col(cudf::data_type{cudf::type_id::TIMESTAMP_NANOSECONDS}, ts_ns_vals, valids);
+
+    cudf::table_view tv{{col_d->view(),
+                         col_s->view(),
+                         col_ms->view(),
+                         col_us->view(),
+                         col_ns->view(),
+                         col_narrow_date->view()}};
+
+    std::vector<sirius::function_id> const extract_fids = {sirius::function_id::year,
+                                                           sirius::function_id::month,
+                                                           sirius::function_id::day,
+                                                           sirius::function_id::hour,
+                                                           sirius::function_id::minute,
+                                                           sirius::function_id::second,
+                                                           sirius::function_id::millisecond,
+                                                           sirius::function_id::microsecond};
+
+    std::vector<std::pair<std::uint32_t, logical_type>> const col_specs = {
+      {0, date_t}, {1, ts_s_t}, {2, ts_ms_t}, {3, ts_us_t}, {4, ts_ns_t}, {5, date_t}};
+
+    duckdb::vector<std::unique_ptr<ast_node>> exprs;
+    for (auto const& [col_idx, ltype] : col_specs) {
+      for (auto const fid : extract_fids) {
+        std::vector<std::unique_ptr<ast_node>> args;
+        args.push_back(make_ref_typed(col_idx, ltype));
+        exprs.push_back(make_func(fid, std::move(args), bigint_t));
+      }
+    }
+
+    exp_executor mat_exec(
+      exprs, mr, stream, sirius::expression_query_policy{exp_strategy_enum::MATERIALIZE});
+    exp_executor jit_exec(
+      exprs, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+
+    auto mat_out = mat_exec.evaluate(tv);
+    auto jit_out = jit_exec.evaluate(tv);
+    REQUIRE(mat_out != nullptr);
+    REQUIRE(jit_out != nullptr);
+    CHECK(jit_exec.restored_reference_cast_count_for_testing() == 0);
+    check_tables_match(jit_out->view(), mat_out->view());
+  }
+
+  SECTION("date_trunc across all supported units and temporal types matches MATERIALIZE")
+  {
+    std::vector<std::int32_t> date_vals = {-25509, -1, 0, 11016, 19782, 42};
+    std::vector<bool> valids            = {true, true, true, true, true, false};
+    std::vector<std::int64_t> ts_s_vals = {
+      -86400LL - 3723LL, -1LL, 0LL, 11016LL * 86400LL + 45296LL, 86400LL, 0LL};
+    std::vector<std::int64_t> ts_ms_vals = {
+      -86400'000LL - 3723'040LL, -1LL, 0LL, 11016LL * 86400'000LL + 45296'789LL, 1234LL, 0LL};
+    std::vector<std::int64_t> ts_us_vals = {-86400'000'000LL - 3723'040'523LL,
+                                            -1LL,
+                                            0LL,
+                                            11016LL * 86400'000'000LL + 45296'789'123LL,
+                                            -365LL * 86400'000'000LL - 1LL,
+                                            0LL};
+    std::vector<std::int64_t> ts_ns_vals = {-86400'000'000'000LL - 3723'040'523'789LL,
+                                            -1LL,
+                                            0LL,
+                                            11016LL * 86400'000'000'000LL + 45296'789'123'456LL,
+                                            -365LL * 86400'000'000'000LL - 1LL,
+                                            0LL};
+
+    auto col_d = make_ts_col(cudf::data_type{cudf::type_id::TIMESTAMP_DAYS}, date_vals, valids);
+    auto col_s = make_ts_col(cudf::data_type{cudf::type_id::TIMESTAMP_SECONDS}, ts_s_vals, valids);
+    auto col_ms =
+      make_ts_col(cudf::data_type{cudf::type_id::TIMESTAMP_MILLISECONDS}, ts_ms_vals, valids);
+    auto col_us =
+      make_ts_col(cudf::data_type{cudf::type_id::TIMESTAMP_MICROSECONDS}, ts_us_vals, valids);
+    auto col_ns =
+      make_ts_col(cudf::data_type{cudf::type_id::TIMESTAMP_NANOSECONDS}, ts_ns_vals, valids);
+
+    cudf::table_view tv{
+      {col_d->view(), col_s->view(), col_ms->view(), col_us->view(), col_ns->view()}};
+
+    std::vector<std::string> const units = {
+      "day", "hour", "minute", "second", "millisecond", "microsecond"};
+    std::vector<std::pair<std::uint32_t, logical_type>> const col_specs = {
+      {0, date_t}, {1, ts_s_t}, {2, ts_ms_t}, {3, ts_us_t}, {4, ts_ns_t}};
+
+    duckdb::vector<std::unique_ptr<ast_node>> exprs;
+    for (auto const& [col_idx, ltype] : col_specs) {
+      for (auto const& unit : units) {
+        std::vector<std::unique_ptr<ast_node>> args;
+        args.push_back(make_str_const(unit));
+        args.push_back(make_ref_typed(col_idx, ltype));
+        exprs.push_back(make_func(sirius::function_id::date_trunc, std::move(args), ltype));
+      }
+    }
+    // Also test DuckDB's DATE -> TIMESTAMP return type on date_trunc('day', date_col)
+    for (auto const& unit : units) {
+      std::vector<std::unique_ptr<ast_node>> args;
+      args.push_back(make_str_const(unit));
+      args.push_back(make_ref_typed(0, date_t));
+      exprs.push_back(make_func(sirius::function_id::date_trunc, std::move(args), ts_us_t));
+    }
+
+    exp_executor mat_exec(
+      exprs, mr, stream, sirius::expression_query_policy{exp_strategy_enum::MATERIALIZE});
+    exp_executor jit_exec(
+      exprs, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+
+    auto mat_out = mat_exec.evaluate(tv);
+    auto jit_out = jit_exec.evaluate(tv);
+    REQUIRE(mat_out != nullptr);
+    REQUIRE(jit_out != nullptr);
+    check_tables_match(jit_out->view(), mat_out->view());
+  }
+
+  SECTION(
+    "compound expressions combining temporal extraction and date_trunc with arithmetic, "
+    "comparisons, and CASE")
+  {
+    std::vector<std::int64_t> ts_us_vals = {
+      -86400'000'000LL - 3723'040'523LL,            // 1969-12-30 22:57:56.959477
+      0LL,                                          // 1970-01-01 00:00:00.000000
+      11016LL * 86400'000'000LL + 45296'789'123LL,  // 2000-02-29 12:34:56.789123
+      19782LL * 86400'000'000LL + 86399'999'999LL,  // 2024-02-29 23:59:59.999999
+      ts_inf,
+      0LL};
+    std::vector<bool> valids = {true, true, true, true, true, false};
+    auto col_us =
+      make_ts_col(cudf::data_type{cudf::type_id::TIMESTAMP_MICROSECONDS}, ts_us_vals, valids);
+    cudf::table_view tv{{col_us->view()}};
+
+    auto make_extract = [&](sirius::function_id fid) {
+      std::vector<std::unique_ptr<ast_node>> args;
+      args.push_back(make_ref_typed(0, ts_us_t));
+      return make_func(fid, std::move(args), bigint_t);
+    };
+    auto make_trunc = [&](std::string const& unit) {
+      std::vector<std::unique_ptr<ast_node>> args;
+      args.push_back(make_str_const(unit));
+      args.push_back(make_ref_typed(0, ts_us_t));
+      return make_func(sirius::function_id::date_trunc, std::move(args), ts_us_t);
+    };
+    auto make_bin_func = [&](sirius::function_id fid,
+                             std::unique_ptr<ast_node> lhs,
+                             std::unique_ptr<ast_node> rhs,
+                             logical_type ret) {
+      std::vector<std::unique_ptr<ast_node>> args;
+      args.push_back(std::move(lhs));
+      args.push_back(std::move(rhs));
+      return make_func(fid, std::move(args), ret);
+    };
+
+    duckdb::vector<std::unique_ptr<ast_node>> exprs;
+    // 1. year(t) * 10000 + month(t) * 100 + day(t)
+    auto y_scaled = make_bin_func(sirius::function_id::mul,
+                                  make_extract(sirius::function_id::year),
+                                  make_bigint_const(10000),
+                                  bigint_t);
+    auto m_scaled = make_bin_func(sirius::function_id::mul,
+                                  make_extract(sirius::function_id::month),
+                                  make_bigint_const(100),
+                                  bigint_t);
+    auto ym =
+      make_bin_func(sirius::function_id::add, std::move(y_scaled), std::move(m_scaled), bigint_t);
+    exprs.push_back(make_bin_func(
+      sirius::function_id::add, std::move(ym), make_extract(sirius::function_id::day), bigint_t));
+
+    // 2. CASE WHEN year(t) >= 2000 THEN millisecond(t) + microsecond(t) ELSE hour(t) * 60 +
+    // minute(t) END
+    std::vector<sirius::ast::case_expr::when_then> cases;
+    cases.push_back({make_cmp(sirius::comparison_type::ge,
+                              make_extract(sirius::function_id::year),
+                              make_bigint_const(2000)),
+                     make_bin_func(sirius::function_id::add,
+                                   make_extract(sirius::function_id::millisecond),
+                                   make_extract(sirius::function_id::microsecond),
+                                   bigint_t)});
+    auto hm = make_bin_func(sirius::function_id::add,
+                            make_bin_func(sirius::function_id::mul,
+                                          make_extract(sirius::function_id::hour),
+                                          make_bigint_const(60),
+                                          bigint_t),
+                            make_extract(sirius::function_id::minute),
+                            bigint_t);
+    exprs.push_back(std::make_unique<ast_node>(
+      sirius::ast::case_expr{std::move(cases), std::move(hm), bigint_t}));
+
+    // 3. date_trunc('hour', t) == date_trunc('day', t)
+    exprs.push_back(
+      make_cmp(sirius::comparison_type::equal, make_trunc("hour"), make_trunc("day")));
+
+    // 4. hour(date_trunc('day', t)) + minute(date_trunc('hour', t))
+    std::vector<std::unique_ptr<ast_node>> h_args;
+    h_args.push_back(make_trunc("day"));
+    std::vector<std::unique_ptr<ast_node>> min_args;
+    min_args.push_back(make_trunc("hour"));
+    exprs.push_back(
+      make_bin_func(sirius::function_id::add,
+                    make_func(sirius::function_id::hour, std::move(h_args), bigint_t),
+                    make_func(sirius::function_id::minute, std::move(min_args), bigint_t),
+                    bigint_t));
+
+    // Verify NVRTC_JIT compiles and fuses the compound expressions
+    std::vector<cudf::column_view> extra_views = {col_us->view()};
+    auto narrow_date_col                       = cudf::make_numeric_column(
+      cudf::data_type{cudf::type_id::INT16}, 6, cudf::mask_state::UNALLOCATED, stream, mr);
+    std::vector<std::int16_t> nd_vals = {-1, 0, 11016, 19782, 100, 0};
+    REQUIRE(cudaMemcpy(narrow_date_col->mutable_view().data<std::int16_t>(),
+                       nd_vals.data(),
+                       6 * sizeof(std::int16_t),
+                       cudaMemcpyHostToDevice) == cudaSuccess);
+    cudf::table_view tv_with_narrow{{col_us->view(), narrow_date_col->view()}};
+    std::vector<std::unique_ptr<ast_node>> y_narrow_args;
+    y_narrow_args.push_back(make_ref_typed(1, date_t));
+    exprs.push_back(make_func(sirius::function_id::year, std::move(y_narrow_args), bigint_t));
+
+    exp_executor mat_exec(
+      exprs, mr, stream, sirius::expression_query_policy{exp_strategy_enum::MATERIALIZE});
+    exp_executor jit_exec(
+      exprs, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+
+    auto mat_out = mat_exec.evaluate(tv_with_narrow);
+    auto jit_out = jit_exec.evaluate(tv_with_narrow);
+    REQUIRE(mat_out != nullptr);
+    REQUIRE(jit_out != nullptr);
+    CHECK(jit_exec.restored_reference_cast_count_for_testing() == 0);
+    check_tables_match(jit_out->view(), mat_out->view());
   }
 }
