@@ -119,6 +119,7 @@ struct rewriter {
     auto source = duckdb::make_uniq<op::sirius_physical_exchange_source>(
       types, rows, service, id, std::move(senders), ordered);
     source->set_query_lifecycle(*lifecycle);
+    source->set_memory_space(*gpu);
     if (child->has_physical_overrides()) {
       sink->set_physical_types(child->get_physical_types());
       source->set_physical_types(child->get_physical_types());
