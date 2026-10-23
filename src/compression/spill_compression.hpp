@@ -75,8 +75,9 @@ void apply_spill_compression_config(compression_config const& config);
  *
  * Fixed-width columns (including decimals and chrono types) up to 8 GiB are bitpacked;
  * larger ones exceed bitpack's encode scratch and are stored as is. A string
- * column is dictionary-encoded, with bitpacked indices, when a sample of it has few
- * distinct values; otherwise it is stored as is. Every other type is stored as is.
+ * column of at least 4096 rows is dictionary-encoded, with bitpacked indices, when a
+ * sample of it has few distinct values; otherwise it is split into ans-coded chars and
+ * delta-bitpacked offsets. Shorter string columns and every other type are stored as is.
  */
 [[nodiscard]] std::string default_spill_plan(cudf::column_view const& column,
                                              rmm::cuda_stream_view stream);

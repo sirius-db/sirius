@@ -95,6 +95,11 @@ constexpr char const* kBitpackPlan =
 constexpr char const* kDictionaryPlan =
   "input -> dictionary -> keys_offsets, keys_chars, indices\n"
   "dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n";
+constexpr char const* kStringSplitPlan =
+  "input -> str_split -> offsets, chars\n"
+  "str_split.chars -> ans\n"
+  "str_split.offsets -> delta -> differences\n"
+  "str_split.offsets.differences -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n";
 constexpr char const* kStoredPlan = "input -> identity\n";
 
 /// Rows a string column needs before a dictionary can pay for its key table.
@@ -121,7 +126,7 @@ std::string default_spill_plan(cudf::column_view const& column, rmm::cuda_stream
       sample, cudf::null_policy::INCLUDE, cudf::nan_policy::NAN_IS_VALID, stream);
     return static_cast<double>(distinct) <= kMaxDictionaryDistinctFraction * sample_rows
              ? kDictionaryPlan
-             : kStoredPlan;
+             : kStringSplitPlan;
   }
   if (!cudf::is_fixed_width(column.type())) { return kStoredPlan; }
   auto const bytes = static_cast<std::size_t>(column.size()) * cudf::size_of(column.type());

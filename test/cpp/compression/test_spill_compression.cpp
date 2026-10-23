@@ -163,8 +163,9 @@ std::shared_ptr<cucascade::data_batch> gpu_batch(std::unique_ptr<cudf::table> ta
   return batch;
 }
 
-/// One million rows: a run of INT64s, nullable small INT32s, DECIMAL(38,2) values and a
-/// low-cardinality string column -- one column per default plan.
+/// One million rows: a run of INT64s, nullable small INT32s, DECIMAL(38,2) values, a
+/// low-cardinality string column (dictionary) and a nullable high-cardinality string column
+/// with empty values (str_split) -- one column per default plan.
 std::unique_ptr<cudf::table> compressible_table()
 {
   constexpr std::size_t rows = 1'000'000;
@@ -175,10 +176,12 @@ std::unique_ptr<cudf::table> compressible_table()
   std::vector<std::int32_t> small(rows);
   std::vector<__int128> amounts(rows);
   std::vector<std::string> flags(rows);
+  std::vector<std::string> names(rows);
   for (std::size_t i = 0; i < rows; ++i) {
     small[i]   = static_cast<std::int32_t>(i % 1000);
     amounts[i] = static_cast<__int128>(i % 50'000) * 100 + 25;
     flags[i]   = (i % 3 == 0) ? "RETURNED" : (i % 3 == 1 ? "NONE" : "DELIVER IN PERSON");
+    names[i]   = (i % 11 == 0) ? "" : "Customer#" + std::to_string(i * 7919 % rows);
   }
 
   std::vector<std::unique_ptr<cudf::column>> columns;
@@ -188,6 +191,8 @@ std::unique_ptr<cudf::table> compressible_table()
   columns.push_back(
     numeric_column(cudf::data_type{cudf::type_id::DECIMAL128, -2}, amounts, stream));
   columns.push_back(utils::make_string_column(flags, stream, utils::get_resource_ref(*env().gpu)));
+  columns.push_back(utils::make_string_column(names, stream, utils::get_resource_ref(*env().gpu)));
+  null_every_seventh(*columns.back(), stream);
   return std::make_unique<cudf::table>(std::move(columns));
 }
 
@@ -258,7 +263,7 @@ TEST_CASE("spill compression: default plans follow the column type", "[compressi
   }
   CHECK(plan(utils::make_string_column(repeated, stream, mr)->view()).find("dictionary") !=
         std::string::npos);
-  CHECK(plan(utils::make_string_column(unique, stream, mr)->view()).find("identity") !=
+  CHECK(plan(utils::make_string_column(unique, stream, mr)->view()).find("str_split") !=
         std::string::npos);
   // Too short for a dictionary to pay for its keys.
   std::vector<std::string> few(100, "x");
@@ -369,7 +374,8 @@ TEST_CASE("spill compression: batches spill uncompressed when it does not apply"
   {
     scoped_settings settings(enabled_settings());
     auto stream = utils::default_stream();
-    std::vector<std::string> unique(1 << 16);
+    // Too few rows for any string plan.
+    std::vector<std::string> unique(1000);
     for (std::size_t i = 0; i < unique.size(); ++i) {
       unique[i] = "value_" + std::to_string(i);
     }
