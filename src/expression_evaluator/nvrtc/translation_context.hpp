@@ -122,6 +122,7 @@ class translation_context {
   [[nodiscard]] register_value produce_case_expr(sirius::ast::case_expr const& expr);
   [[nodiscard]] register_value produce_coalesce(sirius::ast::coalesce const& expr);
   [[nodiscard]] register_value produce_in_list(sirius::ast::in_list const& expr);
+  [[nodiscard]] register_value produce_cast(sirius::ast::cast const& expr);
   [[nodiscard]] register_value produce_unary_op(sirius::ast::unary_op const& expr);
   [[nodiscard]] register_value produce_function_call(sirius::ast::function_call const& expr);
 

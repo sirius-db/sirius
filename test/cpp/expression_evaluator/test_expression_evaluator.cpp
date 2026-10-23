@@ -4983,3 +4983,618 @@ TEST_CASE("nvrtc_jit - lazy branching and poison-safe control flow for CASE, COA
     }
   }
 }
+
+// ============================================================================
+// Ticket #8: DECIMAL(32/64/128) arithmetic, comparisons, and checked
+// CAST / TRY_CAST (numeric, decimal, and temporal)
+// ============================================================================
+
+TEST_CASE("nvrtc_jit - DECIMAL(32/64/128) arithmetic, scale alignment, and comparisons",
+          "[expression_evaluator][nvrtc_jit][ticket8][decimal]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = get_resource_ref(*space);
+
+  SECTION("DECIMAL32, DECIMAL64, DECIMAL128 arithmetic (+, -, *, /, %, abs) and TPC-H Q1 shape")
+  {
+    // Col 0: DECIMAL32(8, 2) narrowed carrier inside a DECIMAL(15, 2) (DECIMAL64) logical column!
+    // Col 1: DECIMAL64(18, 2)
+    // Col 2: DECIMAL128(38, 2)
+    std::vector<std::int32_t> col0_vals = {10000, -2500, 0, 50000};
+    std::vector<std::int64_t> col1_vals = {5, 10, 15, 20};
+    std::vector<__int128_t> col2_vals   = {100, -200, 300, 400};
+    auto const n_rows                   = static_cast<cudf::size_type>(col0_vals.size());
+
+    auto col0 = cudf::make_fixed_point_column(cudf::data_type{cudf::type_id::DECIMAL32, -2},
+                                              n_rows,
+                                              cudf::mask_state::UNALLOCATED,
+                                              stream,
+                                              mr);
+    REQUIRE(cudaMemcpy(col0->mutable_view().data<std::int32_t>(),
+                       col0_vals.data(),
+                       n_rows * sizeof(std::int32_t),
+                       cudaMemcpyHostToDevice) == cudaSuccess);
+
+    auto col1 = cudf::make_fixed_point_column(cudf::data_type{cudf::type_id::DECIMAL64, -2},
+                                              n_rows,
+                                              cudf::mask_state::UNALLOCATED,
+                                              stream,
+                                              mr);
+    REQUIRE(cudaMemcpy(col1->mutable_view().data<std::int64_t>(),
+                       col1_vals.data(),
+                       n_rows * sizeof(std::int64_t),
+                       cudaMemcpyHostToDevice) == cudaSuccess);
+
+    auto col2 = cudf::make_fixed_point_column(cudf::data_type{cudf::type_id::DECIMAL128, -2},
+                                              n_rows,
+                                              cudf::mask_state::UNALLOCATED,
+                                              stream,
+                                              mr);
+    REQUIRE(cudaMemcpy(col2->mutable_view().data<__int128_t>(),
+                       col2_vals.data(),
+                       n_rows * sizeof(__int128_t),
+                       cudaMemcpyHostToDevice) == cudaSuccess);
+
+    cudf::table_view tv{{col0->view(), col1->view(), col2->view()}};
+
+    auto const dec32_t  = logical_type::make_decimal(8, 2);
+    auto const dec64_2  = logical_type::make_decimal(18, 2);
+    auto const dec64_4  = logical_type::make_decimal(18, 4);
+    auto const dec128_2 = logical_type::make_decimal(38, 2);
+
+    auto make_bin = [&](sirius::function_id fid,
+                        std::unique_ptr<ast_node> l,
+                        std::unique_ptr<ast_node> r,
+                        logical_type ret) {
+      std::vector<std::unique_ptr<ast_node>> args;
+      args.push_back(std::move(l));
+      args.push_back(std::move(r));
+      return make_func(fid, std::move(args), ret);
+    };
+
+    duckdb::vector<std::unique_ptr<ast_node>> exprs;
+    // 0: DECIMAL32 add: col0 (as dec32) + 0.50
+    exprs.push_back(make_bin(
+      sirius::function_id::add, make_ref_typed(0, dec32_t), make_dec32_const(50, 8, 2), dec32_t));
+    // 1: DECIMAL64 TPC-H Q1 shape: col0 (restored from dec32 to dec64) * (1.00 - col1) ->
+    // DECIMAL(18, 4)
+    exprs.push_back(make_bin(sirius::function_id::mul,
+                             make_ref_typed(0, dec64_2),
+                             make_bin(sirius::function_id::sub,
+                                      make_dec64_const(100, 18, 2),
+                                      make_ref_typed(1, dec64_2),
+                                      dec64_2),
+                             dec64_4));
+    // 2: DECIMAL64 div: col0 (as dec64_2) / 2 (scale 0) -> dec64_2
+    exprs.push_back(make_bin(
+      sirius::function_id::div, make_ref_typed(0, dec64_2), make_dec64_const(2, 18, 0), dec64_2));
+    // 3: DECIMAL64 mod: col0 (as dec64_2) % 0.07 -> dec64_2
+    exprs.push_back(make_bin(
+      sirius::function_id::mod, make_ref_typed(0, dec64_2), make_dec64_const(7, 18, 2), dec64_2));
+    // 4: DECIMAL64 abs: abs(col0)
+    {
+      std::vector<std::unique_ptr<ast_node>> args;
+      args.push_back(make_ref_typed(0, dec64_2));
+      exprs.push_back(make_func(sirius::function_id::abs, std::move(args), dec64_2));
+    }
+    // 5: DECIMAL128 add: col2 + 1.25
+    exprs.push_back(make_bin(sirius::function_id::add,
+                             make_ref_typed(2, dec128_2),
+                             make_dec128_const(125, 38, 2),
+                             dec128_2));
+    // 6: DECIMAL128 abs: abs(col2)
+    {
+      std::vector<std::unique_ptr<ast_node>> args;
+      args.push_back(make_ref_typed(2, dec128_2));
+      exprs.push_back(make_func(sirius::function_id::abs, std::move(args), dec128_2));
+    }
+    // 7: Cross-scale DECIMAL64 comparison: col0 (scale 2) > 50.000 (scale 3)
+    exprs.push_back(make_cmp(
+      sirius::comparison_type::gt, make_ref_typed(0, dec64_2), make_dec64_const(50000, 18, 3)));
+
+    exp_executor mat_exec(
+      exprs, mr, stream, sirius::expression_query_policy{exp_strategy_enum::MATERIALIZE});
+    auto mat_out = mat_exec.evaluate(tv);
+    REQUIRE(mat_out != nullptr);
+    // MATERIALIZE allocates a temporary column to restore col0 from DECIMAL32 to DECIMAL64
+    CHECK(mat_exec.restored_reference_cast_count_for_testing() == 1);
+
+    exp_executor jit_exec(
+      exprs, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+    auto jit_out = jit_exec.evaluate(tv);
+    REQUIRE(jit_out != nullptr);
+    // NVRTC_JIT restores col0 inline in registers and compiles all 8 expressions in one kernel!
+    CHECK(jit_exec.restored_reference_cast_count_for_testing() == 0);
+
+    REQUIRE(jit_out->num_columns() == mat_out->num_columns());
+    for (cudf::size_type c = 0; c < jit_out->num_columns(); ++c) {
+      CAPTURE(c);
+      auto const jcol = jit_out->view().column(c);
+      auto const mcol = mat_out->view().column(c);
+      REQUIRE(jcol.type() == mcol.type());
+      CHECK(jcol.null_count() == mcol.null_count());
+      auto const elem_size = cudf::size_of(jcol.type());
+      std::vector<std::uint8_t> jbytes(n_rows * elem_size);
+      std::vector<std::uint8_t> mbytes(n_rows * elem_size);
+      REQUIRE(cudaMemcpy(
+                jbytes.data(), jcol.head<std::uint8_t>(), jbytes.size(), cudaMemcpyDeviceToHost) ==
+              cudaSuccess);
+      REQUIRE(cudaMemcpy(
+                mbytes.data(), mcol.head<std::uint8_t>(), mbytes.size(), cudaMemcpyDeviceToHost) ==
+              cudaSuccess);
+      CHECK(jbytes == mbytes);
+    }
+  }
+
+  SECTION("DECIMAL arithmetic overflow throws out_of_range_exception and TRY suppresses it")
+  {
+    auto const dec32_t = logical_type::make_decimal(9, 2);
+    // Carrier max for DECIMAL32 (int32_t) is INT32_MAX (2,147,483,647)
+    auto input = make_decimal32_batch(*space, 2, {100, std::numeric_limits<std::int32_t>::max()});
+    auto input_ro = input->to_read_only();
+    auto tv       = input_ro.get_data()->cast<gpu_table_representation>().get_table_view();
+
+    std::vector<std::unique_ptr<ast_node>> add_args;
+    add_args.push_back(make_ref_typed(0, dec32_t));
+    add_args.push_back(make_dec32_const(1, 9, 2));
+    auto add_expr = make_func(sirius::function_id::add, std::move(add_args), dec32_t);
+
+    exp_executor exec(
+      *add_expr, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+    REQUIRE_THROWS_AS(exec.evaluate(tv), sirius::out_of_range_exception);
+
+    auto try_add = make_unary(sirius::ast::unary_op::kind::op_try, std::move(add_expr));
+    exp_executor try_exec(
+      *try_add, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+    auto try_out = try_exec.evaluate(tv);
+    CHECK(try_out->view().column(0).null_count() == 1);
+    CHECK(copy_valids_to_host(try_out->view().column(0)) == std::vector<bool>{true, false});
+    CHECK(copy_column_to_host<std::int32_t>(try_out->view().column(0))[0] == 101);
+
+    // 128-bit multiplication overflow on DECIMAL128 throws and TRY suppresses it!
+    auto const dec128_t = logical_type::make_decimal(38, 2);
+    __int128_t const max128 =
+      (static_cast<__int128_t>(std::numeric_limits<std::int64_t>::max()) << 64) |
+      static_cast<__int128_t>(~0ULL);
+    auto input128    = make_decimal128_batch(*space, 2, {100, max128});
+    auto input128_ro = input128->to_read_only();
+    auto tv128       = input128_ro.get_data()->cast<gpu_table_representation>().get_table_view();
+
+    std::vector<std::unique_ptr<ast_node>> mul128_args;
+    mul128_args.push_back(make_ref_typed(0, dec128_t));
+    mul128_args.push_back(make_dec128_const(2, 38, 0));
+    auto mul128_expr = make_func(sirius::function_id::mul, std::move(mul128_args), dec128_t);
+
+    exp_executor exec128(
+      *mul128_expr, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+    REQUIRE_THROWS_AS(exec128.evaluate(tv128), sirius::out_of_range_exception);
+
+    auto try_mul128 = make_unary(sirius::ast::unary_op::kind::op_try, std::move(mul128_expr));
+    exp_executor try_exec128(
+      *try_mul128, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+    auto try_out128 = try_exec128.evaluate(tv128);
+    CHECK(try_out128->view().column(0).null_count() == 1);
+    CHECK(copy_valids_to_host(try_out128->view().column(0)) == std::vector<bool>{true, false});
+    CHECK(static_cast<std::int64_t>(
+            copy_column_to_host<__int128_t>(try_out128->view().column(0))[0]) == 200);
+  }
+}
+
+TEST_CASE(
+  "nvrtc_jit - checked CAST and TRY_CAST across numeric, boolean, decimal, and temporal types",
+  "[expression_evaluator][nvrtc_jit][ticket8][cast]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = get_resource_ref(*space);
+
+  SECTION("carrier_restore and valid semantic casts match MATERIALIZE")
+  {
+    // Col 0: INT16 carrier for DATE
+    // Col 1: INT32
+    // Col 2: DOUBLE
+    // Col 3: DECIMAL64(18, 2)
+    std::vector<std::int16_t> c0 = {0, 18000, -100};
+    std::vector<std::int32_t> c1 = {0, 42, -7};
+    std::vector<double> c2       = {0.0, 12.5, -3.25};
+    std::vector<std::int64_t> c3 = {0, 1250, -375};
+
+    auto col0 = make_carrier_column(*space, cudf::data_type{cudf::type_id::INT16}, c0);
+    auto col1 = make_carrier_column(*space, cudf::data_type{cudf::type_id::INT32}, c1);
+    auto col2 = make_carrier_column(*space, cudf::data_type{cudf::type_id::FLOAT64}, c2);
+    auto col3 = cudf::make_fixed_point_column(
+      cudf::data_type{cudf::type_id::DECIMAL64, -2}, 3, cudf::mask_state::UNALLOCATED, stream, mr);
+    REQUIRE(cudaMemcpy(col3->mutable_view().data<std::int64_t>(),
+                       c3.data(),
+                       3 * sizeof(std::int64_t),
+                       cudaMemcpyHostToDevice) == cudaSuccess);
+
+    cudf::table_view tv{{col0->view(), col1->view(), col2->view(), col3->view()}};
+
+    duckdb::vector<std::unique_ptr<ast_node>> exprs;
+    // 0: carrier_restore INT16 -> DATE
+    exprs.push_back(
+      std::make_unique<ast_node>(sirius::ast::cast{make_ref(0),
+                                                   logical_type::make(type_id::DATE),
+                                                   /*try_cast=*/false,
+                                                   sirius::ast::cast_kind::carrier_restore}));
+    // 1: semantic INT32 -> BIGINT
+    exprs.push_back(make_cast(make_ref_typed(1, logical_type::make(type_id::INTEGER)),
+                              logical_type::make(type_id::BIGINT),
+                              false));
+    // 2: semantic INT32 -> DOUBLE
+    exprs.push_back(make_cast(make_ref_typed(1, logical_type::make(type_id::INTEGER)),
+                              logical_type::make(type_id::DOUBLE),
+                              false));
+    // 3: semantic INT32 -> BOOLEAN
+    exprs.push_back(make_cast(make_ref_typed(1, logical_type::make(type_id::INTEGER)),
+                              logical_type::make(type_id::BOOLEAN),
+                              false));
+    // 4: semantic INT32 -> DECIMAL(9, 2)
+    exprs.push_back(make_cast(make_ref_typed(1, logical_type::make(type_id::INTEGER)),
+                              logical_type::make_decimal(9, 2),
+                              false));
+    // 5: semantic DECIMAL(18, 2) -> DECIMAL(18, 4) (scale up)
+    exprs.push_back(make_cast(make_ref_typed(3, logical_type::make_decimal(18, 2)),
+                              logical_type::make_decimal(18, 4),
+                              false));
+    // 6: semantic DECIMAL(18, 2) -> DOUBLE
+    exprs.push_back(make_cast(make_ref_typed(3, logical_type::make_decimal(18, 2)),
+                              logical_type::make(type_id::DOUBLE),
+                              false));
+    // 7: semantic DOUBLE -> DECIMAL(18, 2)
+    exprs.push_back(make_cast(make_ref_typed(2, logical_type::make(type_id::DOUBLE)),
+                              logical_type::make_decimal(18, 2),
+                              false));
+
+    exp_executor mat_exec(
+      exprs, mr, stream, sirius::expression_query_policy{exp_strategy_enum::MATERIALIZE});
+    exp_executor jit_exec(
+      exprs, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+
+    auto mat_out = mat_exec.evaluate(tv);
+    auto jit_out = jit_exec.evaluate(tv);
+    REQUIRE(jit_out->num_columns() == mat_out->num_columns());
+    for (cudf::size_type c = 0; c < jit_out->num_columns(); ++c) {
+      CAPTURE(c);
+      auto const jcol = jit_out->view().column(c);
+      auto const mcol = mat_out->view().column(c);
+      REQUIRE(jcol.type() == mcol.type());
+      CHECK(jcol.null_count() == mcol.null_count());
+      auto const elem_size = cudf::size_of(jcol.type());
+      std::vector<std::uint8_t> jbytes(3 * elem_size);
+      std::vector<std::uint8_t> mbytes(3 * elem_size);
+      REQUIRE(cudaMemcpy(
+                jbytes.data(), jcol.head<std::uint8_t>(), jbytes.size(), cudaMemcpyDeviceToHost) ==
+              cudaSuccess);
+      REQUIRE(cudaMemcpy(
+                mbytes.data(), mcol.head<std::uint8_t>(), mbytes.size(), cudaMemcpyDeviceToHost) ==
+              cudaSuccess);
+      CHECK(jbytes == mbytes);
+    }
+  }
+
+  SECTION("checked integer, float, and decimal CAST overflow throws and TRY_CAST returns NULL")
+  {
+    auto const int_t     = logical_type::make(type_id::INTEGER);
+    auto const tinyint_t = logical_type::make(type_id::TINYINT);
+    auto const uint_t    = logical_type::make(type_id::UINTEGER);
+    auto const dec4_2    = logical_type::make_decimal(5, 2);  // max 999.99
+
+    // Input INT32: {42, 200, -5}
+    //   - CAST to TINYINT: 200 overflows!
+    //   - CAST to UINTEGER: -5 overflows!
+    //   - CAST to DECIMAL(5, 2): 42 -> 4200, 200 -> 20000, -5 -> -500 (all fit), but 1000
+    //   overflows!
+    auto batch = make_int32_batch_with_nulls(*space, {42, 200, -5, 1000}, {true, true, true, true});
+    auto ro    = batch->to_read_only();
+    auto tv    = ro.get_data()->cast<gpu_table_representation>().get_table_view();
+
+    // 1. Strict CAST to TINYINT throws
+    {
+      auto expr = make_cast(make_ref_typed(0, int_t), tinyint_t, /*try_cast=*/false);
+      exp_executor exec(
+        *expr, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+      REQUIRE_THROWS_AS(exec.evaluate(tv), sirius::out_of_range_exception);
+    }
+
+    // 2. Strict CAST to UINTEGER throws on -5
+    {
+      auto expr = make_cast(make_ref_typed(0, int_t), uint_t, /*try_cast=*/false);
+      exp_executor exec(
+        *expr, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+      REQUIRE_THROWS_AS(exec.evaluate(tv), sirius::out_of_range_exception);
+    }
+
+    // 3. Strict CAST to DECIMAL(5, 2) throws on 1000
+    {
+      auto expr = make_cast(make_ref_typed(0, int_t), dec4_2, /*try_cast=*/false);
+      exp_executor exec(
+        *expr, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+      REQUIRE_THROWS_AS(exec.evaluate(tv), sirius::out_of_range_exception);
+    }
+
+    // 4. TRY_CAST converts out-of-range rows to NULL without throwing!
+    {
+      duckdb::vector<std::unique_ptr<ast_node>> try_exprs;
+      try_exprs.push_back(make_cast(make_ref_typed(0, int_t), tinyint_t, /*try_cast=*/true));
+      try_exprs.push_back(make_cast(make_ref_typed(0, int_t), uint_t, /*try_cast=*/true));
+      try_exprs.push_back(make_cast(make_ref_typed(0, int_t), dec4_2, /*try_cast=*/true));
+
+      exp_executor exec(
+        try_exprs, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+      auto out = exec.evaluate(tv);
+      REQUIRE(out != nullptr);
+      REQUIRE(out->num_columns() == 3);
+
+      // Col 0 (TINYINT): {42, NULL, -5, NULL}
+      CHECK(out->view().column(0).null_count() == 2);
+      CHECK(copy_valids_to_host(out->view().column(0)) ==
+            std::vector<bool>{true, false, true, false});
+      auto const c0_vals = copy_column_to_host<std::int8_t>(out->view().column(0));
+      CHECK(c0_vals[0] == 42);
+      CHECK(c0_vals[2] == -5);
+
+      // Col 1 (UINTEGER): {42, 200, NULL, 1000}
+      CHECK(out->view().column(1).null_count() == 1);
+      CHECK(copy_valids_to_host(out->view().column(1)) ==
+            std::vector<bool>{true, true, false, true});
+      auto const c1_vals = copy_column_to_host<std::uint32_t>(out->view().column(1));
+      CHECK(c1_vals[0] == 42U);
+      CHECK(c1_vals[1] == 200U);
+      CHECK(c1_vals[3] == 1000U);
+
+      // Col 2 (DECIMAL(5, 2)): {4200, 20000, -500, NULL}
+      CHECK(out->view().column(2).null_count() == 1);
+      CHECK(copy_valids_to_host(out->view().column(2)) ==
+            std::vector<bool>{true, true, true, false});
+      auto const c2_vals = copy_column_to_host<std::int32_t>(out->view().column(2));
+      CHECK(c2_vals[0] == 4200);
+      CHECK(c2_vals[1] == 20000);
+      CHECK(c2_vals[2] == -500);
+    }
+
+    // 5. Float/Double -> Integer, Float, and Decimal overflow checks and TRY_CAST
+    {
+      auto const dbl_t           = logical_type::make(type_id::DOUBLE);
+      auto const flt_t           = logical_type::make(type_id::FLOAT);
+      auto const i64_t           = logical_type::make(type_id::BIGINT);
+      auto const u64_t           = logical_type::make(type_id::UBIGINT);
+      std::vector<double> d_vals = {
+        12.5,
+        1e300,                            // overflows FLOAT, BIGINT, DECIMAL(5,2)
+        static_cast<double>(1ULL << 63),  // 2^63: exact power of two just above INT64_MAX!
+        -1.0                              // negative: overflows UBIGINT!
+      };
+      auto col_dbl = make_carrier_column(*space, cudf::data_type{cudf::type_id::FLOAT64}, d_vals);
+      cudf::table_view d_tv{{col_dbl->view()}};
+
+      // Strict casts throw out_of_range_exception
+      {
+        auto c_flt = make_cast(make_ref_typed(0, dbl_t), flt_t, false);
+        exp_executor ex(
+          *c_flt, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+        REQUIRE_THROWS_AS(ex.evaluate(d_tv), sirius::out_of_range_exception);
+      }
+      {
+        auto c_i64 = make_cast(make_ref_typed(0, dbl_t), i64_t, false);
+        exp_executor ex(
+          *c_i64, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+        REQUIRE_THROWS_AS(ex.evaluate(d_tv), sirius::out_of_range_exception);
+      }
+      {
+        auto c_u64 = make_cast(make_ref_typed(0, dbl_t), u64_t, false);
+        exp_executor ex(
+          *c_u64, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+        REQUIRE_THROWS_AS(ex.evaluate(d_tv), sirius::out_of_range_exception);
+      }
+
+      // TRY_CAST succeeds and turns overflowing elements into NULL
+      duckdb::vector<std::unique_ptr<ast_node>> d_try;
+      d_try.push_back(make_cast(make_ref_typed(0, dbl_t), flt_t, true));
+      d_try.push_back(make_cast(make_ref_typed(0, dbl_t), i64_t, true));
+      d_try.push_back(make_cast(make_ref_typed(0, dbl_t), u64_t, true));
+      d_try.push_back(make_cast(make_ref_typed(0, dbl_t), dec4_2, true));
+
+      exp_executor d_exec(
+        d_try, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+      auto d_out = d_exec.evaluate(d_tv);
+      // Col 0 (FLOAT): row 1 (1e300) is NULL
+      CHECK(copy_valids_to_host(d_out->view().column(0)) ==
+            std::vector<bool>{true, false, true, true});
+      // Col 1 (BIGINT): row 1 (1e300) and row 2 (2^63) are NULL
+      CHECK(copy_valids_to_host(d_out->view().column(1)) ==
+            std::vector<bool>{true, false, false, true});
+      CHECK(copy_column_to_host<std::int64_t>(d_out->view().column(1))[0] == 12);
+      CHECK(copy_column_to_host<std::int64_t>(d_out->view().column(1))[3] == -1);
+      // Col 2 (UBIGINT): row 1 (1e300) and row 3 (-1.0) are NULL; row 2 (2^63) fits UBIGINT!
+      CHECK(copy_valids_to_host(d_out->view().column(2)) ==
+            std::vector<bool>{true, false, true, false});
+      CHECK(copy_column_to_host<std::uint64_t>(d_out->view().column(2))[0] == 12ULL);
+      CHECK(copy_column_to_host<std::uint64_t>(d_out->view().column(2))[2] == (1ULL << 63));
+      // Col 3 (DECIMAL(5,2)): rows 1 and 2 are NULL
+      CHECK(copy_valids_to_host(d_out->view().column(3)) ==
+            std::vector<bool>{true, false, false, true});
+      CHECK(copy_column_to_host<std::int32_t>(d_out->view().column(3))[0] == 1250);
+      CHECK(copy_column_to_host<std::int32_t>(d_out->view().column(3))[3] == -100);
+    }
+
+    // 6. DECIMAL -> DECIMAL scale down and DECIMAL -> INT / BOOL casts
+    {
+      auto const dec18_3 = logical_type::make_decimal(18, 3);
+      auto const dec5_1  = logical_type::make_decimal(5, 1);  // max 9999.9 (unscaled 99999)
+      auto const bool_t  = logical_type::make(type_id::BOOLEAN);
+      // Values at scale 3: 12.345 (12345), -99.900 (-99900), 0.000 (0), 50000.000 (50000000 ->
+      // overflows dec5_1)
+      auto dec_in    = make_decimal64_batch(*space, 3, {12345, -99900, 0, 50000000});
+      auto dec_in_ro = dec_in->to_read_only();
+      auto dec_tv    = dec_in_ro.get_data()->cast<gpu_table_representation>().get_table_view();
+
+      auto strict_dec = make_cast(make_ref_typed(0, dec18_3), dec5_1, false);
+      exp_executor ex_strict(
+        *strict_dec, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+      REQUIRE_THROWS_AS(ex_strict.evaluate(dec_tv), sirius::out_of_range_exception);
+
+      duckdb::vector<std::unique_ptr<ast_node>> dec_exprs;
+      dec_exprs.push_back(make_cast(make_ref_typed(0, dec18_3), dec5_1, true));
+      dec_exprs.push_back(make_cast(make_ref_typed(0, dec18_3), tinyint_t, true));
+      dec_exprs.push_back(make_cast(make_ref_typed(0, dec18_3), bool_t, false));
+
+      exp_executor ex_dec(
+        dec_exprs, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+      auto dec_out = ex_dec.evaluate(dec_tv);
+      // Col 0 (DECIMAL(5,1)): {123, -999, 0, NULL}
+      CHECK(copy_valids_to_host(dec_out->view().column(0)) ==
+            std::vector<bool>{true, true, true, false});
+      auto const d5_vals = copy_column_to_host<std::int32_t>(dec_out->view().column(0));
+      CHECK(d5_vals[0] == 123);
+      CHECK(d5_vals[1] == -999);
+      CHECK(d5_vals[2] == 0);
+      // Col 1 (TINYINT): {12, -99, 0, NULL}
+      CHECK(copy_valids_to_host(dec_out->view().column(1)) ==
+            std::vector<bool>{true, true, true, false});
+      auto const ti_vals = copy_column_to_host<std::int8_t>(dec_out->view().column(1));
+      CHECK(ti_vals[0] == 12);
+      CHECK(ti_vals[1] == -99);
+      CHECK(ti_vals[2] == 0);
+      // Col 2 (BOOLEAN): {1, 1, 0, 1}
+      CHECK(copy_bool_column_to_host(dec_out->view().column(2)) ==
+            std::vector<std::uint8_t>{1, 1, 0, 1});
+    }
+  }
+
+  SECTION(
+    "temporal CASTs (DATE -> TIMESTAMP and TIMESTAMP_S/MS/NS -> TIMESTAMP_US) under NVRTC_JIT")
+  {
+    auto const date_t  = logical_type::make(type_id::DATE);
+    auto const ts_s_t  = logical_type::make(type_id::TIMESTAMP_SEC);
+    auto const ts_ms_t = logical_type::make(type_id::TIMESTAMP_MS);
+    auto const ts_us_t = logical_type::make(type_id::TIMESTAMP);
+    auto const ts_ns_t = logical_type::make(type_id::TIMESTAMP_NS);
+
+    auto const date_inf = std::numeric_limits<std::int32_t>::max();
+    auto const ts_inf   = std::numeric_limits<std::int64_t>::max();
+
+    // 1. DATE -> TIMESTAMP_{S, MS, US, NS} with ±infinity and finite values
+    {
+      std::vector<std::int32_t> days = {-date_inf, -1, 0, 18000, date_inf};
+      auto col_d = cudf::make_timestamp_column(cudf::data_type{cudf::type_id::TIMESTAMP_DAYS},
+                                               5,
+                                               cudf::mask_state::UNALLOCATED,
+                                               stream,
+                                               mr);
+      REQUIRE(cudaMemcpy(col_d->mutable_view().data<std::int32_t>(),
+                         days.data(),
+                         5 * sizeof(std::int32_t),
+                         cudaMemcpyHostToDevice) == cudaSuccess);
+      cudf::table_view tv{{col_d->view()}};
+
+      duckdb::vector<std::unique_ptr<ast_node>> exprs;
+      exprs.push_back(make_cast(make_ref_typed(0, date_t), ts_s_t, false));
+      exprs.push_back(make_cast(make_ref_typed(0, date_t), ts_ms_t, false));
+      exprs.push_back(make_cast(make_ref_typed(0, date_t), ts_us_t, false));
+      exprs.push_back(make_cast(make_ref_typed(0, date_t), ts_ns_t, false));
+
+      exp_executor mat_exec(
+        exprs, mr, stream, sirius::expression_query_policy{exp_strategy_enum::MATERIALIZE});
+      exp_executor jit_exec(
+        exprs, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+      auto mat_out = mat_exec.evaluate(tv);
+      auto jit_out = jit_exec.evaluate(tv);
+      for (cudf::size_type c = 0; c < 4; ++c) {
+        CHECK(copy_column_to_host<std::int64_t>(jit_out->view().column(c)) ==
+              copy_column_to_host<std::int64_t>(mat_out->view().column(c)));
+      }
+    }
+
+    // 2. DATE -> TIMESTAMP out-of-range throws on CAST and returns NULL on TRY_CAST
+    {
+      std::vector<std::int32_t> days = {0, 110'000'000};
+      auto col_d = cudf::make_timestamp_column(cudf::data_type{cudf::type_id::TIMESTAMP_DAYS},
+                                               2,
+                                               cudf::mask_state::UNALLOCATED,
+                                               stream,
+                                               mr);
+      REQUIRE(cudaMemcpy(col_d->mutable_view().data<std::int32_t>(),
+                         days.data(),
+                         2 * sizeof(std::int32_t),
+                         cudaMemcpyHostToDevice) == cudaSuccess);
+      cudf::table_view tv{{col_d->view()}};
+
+      auto strict_cast = make_cast(make_ref_typed(0, date_t), ts_us_t, /*try_cast=*/false);
+      exp_executor strict_exec(
+        *strict_cast, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+      REQUIRE_THROWS_AS(strict_exec.evaluate(tv), sirius::out_of_range_exception);
+
+      auto try_cast = make_cast(make_ref_typed(0, date_t), ts_us_t, /*try_cast=*/true);
+      exp_executor try_exec(
+        *try_cast, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+      auto try_out = try_exec.evaluate(tv);
+      CHECK(try_out->view().column(0).null_count() == 1);
+      CHECK(copy_valids_to_host(try_out->view().column(0)) == std::vector<bool>{true, false});
+    }
+
+    // 3. TIMESTAMP_NS -> TIMESTAMP_US rounds ties away from epoch and preserves ±infinity
+    {
+      std::vector<std::int64_t> ns_vals = {
+        -ts_inf, -1500, -1499, -500, -499, 0, 499, 500, 1499, 1500, ts_inf};
+      auto const n_ns = static_cast<cudf::size_type>(ns_vals.size());
+      auto col_ns =
+        cudf::make_timestamp_column(cudf::data_type{cudf::type_id::TIMESTAMP_NANOSECONDS},
+                                    n_ns,
+                                    cudf::mask_state::UNALLOCATED,
+                                    stream,
+                                    mr);
+      REQUIRE(cudaMemcpy(col_ns->mutable_view().data<std::int64_t>(),
+                         ns_vals.data(),
+                         n_ns * sizeof(std::int64_t),
+                         cudaMemcpyHostToDevice) == cudaSuccess);
+      cudf::table_view tv{{col_ns->view()}};
+
+      auto expr = make_cast(make_ref_typed(0, ts_ns_t), ts_us_t, false);
+      exp_executor mat_exec(
+        *expr, mr, stream, sirius::expression_query_policy{exp_strategy_enum::MATERIALIZE});
+      exp_executor jit_exec(
+        *expr, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+      auto mat_out = mat_exec.evaluate(tv);
+      auto jit_out = jit_exec.evaluate(tv);
+      CHECK(copy_column_to_host<std::int64_t>(jit_out->view().column(0)) ==
+            copy_column_to_host<std::int64_t>(mat_out->view().column(0)));
+    }
+
+    // 4. TIMESTAMP_S -> TIMESTAMP_US overflow throws on CAST and returns NULL on TRY_CAST
+    {
+      std::vector<std::int64_t> s_vals = {-ts_inf, 100, ts_inf / 1000000 + 1, ts_inf};
+      auto col_s = cudf::make_timestamp_column(cudf::data_type{cudf::type_id::TIMESTAMP_SECONDS},
+                                               4,
+                                               cudf::mask_state::UNALLOCATED,
+                                               stream,
+                                               mr);
+      REQUIRE(cudaMemcpy(col_s->mutable_view().data<std::int64_t>(),
+                         s_vals.data(),
+                         4 * sizeof(std::int64_t),
+                         cudaMemcpyHostToDevice) == cudaSuccess);
+      cudf::table_view tv{{col_s->view()}};
+
+      auto strict_cast = make_cast(make_ref_typed(0, ts_s_t), ts_us_t, /*try_cast=*/false);
+      exp_executor strict_exec(
+        *strict_cast, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+      REQUIRE_THROWS_AS(strict_exec.evaluate(tv), sirius::out_of_range_exception);
+
+      auto try_cast = make_cast(make_ref_typed(0, ts_s_t), ts_us_t, /*try_cast=*/true);
+      exp_executor try_exec(
+        *try_cast, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+      auto try_out = try_exec.evaluate(tv);
+      CHECK(try_out->view().column(0).null_count() == 1);
+      CHECK(copy_valids_to_host(try_out->view().column(0)) ==
+            std::vector<bool>{true, true, false, true});
+      auto const out_vals = copy_column_to_host<std::int64_t>(try_out->view().column(0));
+      CHECK(out_vals[0] == -ts_inf);
+      CHECK(out_vals[1] == 100'000'000LL);
+      CHECK(out_vals[3] == ts_inf);
+    }
+  }
+}

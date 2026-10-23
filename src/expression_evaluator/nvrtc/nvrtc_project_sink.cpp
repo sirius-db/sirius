@@ -69,6 +69,69 @@ namespace {
   return t.id() == sirius::type_id::INVALID || t.id() == sirius::type_id::SQLNULL;
 }
 
+[[nodiscard]] std::int32_t sql_decimal_scale(cudf::data_type type) noexcept
+{
+  return -type.scale();
+}
+
+[[nodiscard]] std::string format_int128_pow10(int exp)
+{
+  if (exp <= 0) { return "static_cast<__int128_t>(1)"; }
+  __int128_t val = 1;
+  for (int i = 0; i < exp; ++i) {
+    val *= 10;
+  }
+  auto const uval = static_cast<unsigned __int128>(val);
+  auto const hi   = static_cast<std::uint64_t>(uval >> 64);
+  auto const lo   = static_cast<std::uint64_t>(uval);
+  if (hi == 0) { return "static_cast<__int128_t>(" + std::to_string(lo) + "ULL)"; }
+  return "((static_cast<__int128_t>(" + std::to_string(hi) +
+         "ULL) << 64) | static_cast<__int128_t>(" + std::to_string(lo) + "ULL))";
+}
+
+[[nodiscard]] std::string format_double_pow10(int exp)
+{
+  double val = 1.0;
+  for (int i = 0; i < exp; ++i) {
+    val *= 10.0;
+  }
+  std::ostringstream oss;
+  oss.precision(17);
+  oss << std::scientific << val;
+  return oss.str();
+}
+
+[[nodiscard]] std::int64_t timestamp_ticks_per_second(cudf::type_id id) noexcept
+{
+  switch (id) {
+    case cudf::type_id::TIMESTAMP_SECONDS: return 1LL;
+    case cudf::type_id::TIMESTAMP_MILLISECONDS: return 1'000LL;
+    case cudf::type_id::TIMESTAMP_MICROSECONDS: return 1'000'000LL;
+    case cudf::type_id::TIMESTAMP_NANOSECONDS: return 1'000'000'000LL;
+    default: return 0LL;
+  }
+}
+
+[[nodiscard]] bool is_semantic_cast_supported(cudf::data_type src, cudf::data_type dst) noexcept
+{
+  if (!is_supported_fixed_width(src) || !is_supported_fixed_width(dst)) { return false; }
+  bool const src_temp = cudf::is_timestamp(src);
+  bool const dst_temp = cudf::is_timestamp(dst);
+  if (src_temp != dst_temp) { return false; }
+  if (src_temp) {
+    if (src.id() == dst.id()) { return true; }
+    if (src.id() == cudf::type_id::TIMESTAMP_DAYS) {
+      return dst.id() == cudf::type_id::TIMESTAMP_SECONDS ||
+             dst.id() == cudf::type_id::TIMESTAMP_MILLISECONDS ||
+             dst.id() == cudf::type_id::TIMESTAMP_MICROSECONDS ||
+             dst.id() == cudf::type_id::TIMESTAMP_NANOSECONDS;
+    }
+    return timestamp_ticks_per_second(src.id()) > 0 &&
+           (dst.id() == cudf::type_id::TIMESTAMP_DAYS || timestamp_ticks_per_second(dst.id()) > 0);
+  }
+  return true;
+}
+
 [[nodiscard]] cudf::data_type effective_node_cudf_type(sirius::ast::node const& expr,
                                                        cudf::table_view const& input) noexcept
 {
@@ -128,7 +191,7 @@ namespace {
     auto const rt = effective_node_cudf_type(*cmp.right, input);
     if (!is_supported_fixed_width(lt) || !is_supported_fixed_width(rt)) { return false; }
     if (cudf::is_fixed_point(lt) || cudf::is_fixed_point(rt)) {
-      return cudf::is_fixed_point(lt) && cudf::is_fixed_point(rt) && lt.scale() == rt.scale();
+      return cudf::is_fixed_point(lt) && cudf::is_fixed_point(rt);
     }
     return true;
   }
@@ -148,8 +211,7 @@ namespace {
       return false;
     }
     if (cudf::is_fixed_point(it) || cudf::is_fixed_point(lt) || cudf::is_fixed_point(ut)) {
-      return cudf::is_fixed_point(it) && cudf::is_fixed_point(lt) && cudf::is_fixed_point(ut) &&
-             it.scale() == lt.scale() && it.scale() == ut.scale();
+      return cudf::is_fixed_point(it) && cudf::is_fixed_point(lt) && cudf::is_fixed_point(ut);
     }
     return true;
   }
@@ -235,12 +297,24 @@ namespace {
       auto const vt = effective_node_cudf_type(*v, input);
       if (!is_supported_fixed_width(vt)) { return false; }
       if (cudf::is_fixed_point(pt) || cudf::is_fixed_point(vt)) {
-        if (!cudf::is_fixed_point(pt) || !cudf::is_fixed_point(vt) || pt.scale() != vt.scale()) {
-          return false;
-        }
+        if (!cudf::is_fixed_point(pt) || !cudf::is_fixed_point(vt)) { return false; }
       }
     }
     return true;
+  }
+
+  if (expr.holds<sirius::ast::cast>()) {
+    auto const& cst = expr.get<sirius::ast::cast>();
+    if (!cst.child || !is_node_supported(*cst.child, input)) { return false; }
+    auto const opt_dst = sirius::get_cudf_type(cst.target_type);
+    if (!opt_dst || !is_supported_fixed_width(*opt_dst)) { return false; }
+    auto const dst_type = *opt_dst;
+    auto const src_type = effective_node_cudf_type(*cst.child, input);
+    if (!is_supported_fixed_width(src_type)) { return false; }
+    if (cst.kind == sirius::ast::cast_kind::carrier_restore) {
+      return src_type == dst_type || can_restore_to(src_type, dst_type);
+    }
+    return is_semantic_cast_supported(src_type, dst_type);
   }
 
   if (expr.holds<sirius::ast::unary_op>()) {
@@ -279,14 +353,17 @@ namespace {
       case sirius::function_id::int_div:
       case sirius::function_id::mod: {
         if (args.size() != 2) { return false; }
-        if (!is_integer_or_float(ret_type)) { return false; }
         auto const lt = effective_node_cudf_type(*args[0], input);
         auto const rt = effective_node_cudf_type(*args[1], input);
-        return is_integer_or_float(lt) && is_integer_or_float(rt);
+        if (cudf::is_fixed_point(ret_type)) {
+          return cudf::is_fixed_point(lt) && cudf::is_fixed_point(rt);
+        }
+        return is_integer_or_float(ret_type) && is_integer_or_float(lt) && is_integer_or_float(rt);
       }
       case sirius::function_id::abs: {
         if (args.size() != 1) { return false; }
         auto const ct = effective_node_cudf_type(*args[0], input);
+        if (cudf::is_fixed_point(ret_type)) { return cudf::is_fixed_point(ct) && ct == ret_type; }
         return is_integer_or_float(ret_type) && ct == ret_type;
       }
       case sirius::function_id::round: {
@@ -744,7 +821,13 @@ register_value translation_context::produce_comparison(sirius::ast::comparison c
   auto const rhs      = produce_narrow_domain_operand(*expr.right, narrow_carrier);
   auto const var_name = next_var_name();
 
+  bool const is_dec =
+    cudf::is_fixed_point(lhs.device_type) || cudf::is_fixed_point(rhs.device_type);
+  std::int32_t const s_l = is_dec ? sql_decimal_scale(lhs.device_type) : 0;
+  std::int32_t const s_r = is_dec ? sql_decimal_scale(rhs.device_type) : 0;
+
   auto const cmp_type_str = [&]() -> std::string {
+    if (is_dec && s_l != s_r) { return "__int128_t"; }
     if (lhs.device_type == rhs.device_type) { return cuda_type_name(lhs.device_type); }
     if (lhs.device_type.id() == cudf::type_id::FLOAT64 ||
         rhs.device_type.id() == cudf::type_id::FLOAT64) {
@@ -757,14 +840,19 @@ register_value translation_context::produce_comparison(sirius::ast::comparison c
     if (cudf::is_unsigned(lhs.device_type) && cudf::is_unsigned(rhs.device_type)) {
       return "uint64_t";
     }
-    if (!cudf::is_unsigned(lhs.device_type) && !cudf::is_unsigned(rhs.device_type)) {
+    if (!cudf::is_unsigned(lhs.device_type) && !cudf::is_unsigned(rhs.device_type) && !is_dec) {
       return "int64_t";
     }
     return "__int128_t";
   }();
 
-  auto const lhs_val = "static_cast<" + cmp_type_str + ">(" + lhs.var_name + ".val)";
-  auto const rhs_val = "static_cast<" + cmp_type_str + ">(" + rhs.var_name + ".val)";
+  std::string lhs_val = "static_cast<" + cmp_type_str + ">(" + lhs.var_name + ".val)";
+  std::string rhs_val = "static_cast<" + cmp_type_str + ">(" + rhs.var_name + ".val)";
+  if (is_dec && s_l != s_r) {
+    auto const s_max = std::max(s_l, s_r);
+    if (s_max > s_l) { lhs_val = "(" + lhs_val + " * " + format_int128_pow10(s_max - s_l) + ")"; }
+    if (s_max > s_r) { rhs_val = "(" + rhs_val + " * " + format_int128_pow10(s_max - s_r) + ")"; }
+  }
   bool const can_ovf = lhs.can_overflow || rhs.can_overflow;
   std::string const ovf_e =
     can_ovf ? (lhs.var_name + ".overflow || " + rhs.var_name + ".overflow") : "false";
@@ -833,10 +921,26 @@ register_value translation_context::produce_between(sirius::ast::between const& 
   auto const hi_reg   = produce_narrow_domain_operand(*expr.upper, narrow_carrier);
   auto const var_name = next_var_name();
 
-  auto const cmp_type_str = cuda_type_name(in_reg.device_type);
-  auto const in_val       = "static_cast<" + cmp_type_str + ">(" + in_reg.var_name + ".val)";
-  auto const lo_val       = "static_cast<" + cmp_type_str + ">(" + lo_reg.var_name + ".val)";
-  auto const hi_val       = "static_cast<" + cmp_type_str + ">(" + hi_reg.var_name + ".val)";
+  bool const is_dec      = cudf::is_fixed_point(in_reg.device_type);
+  std::int32_t const s_i = is_dec ? sql_decimal_scale(in_reg.device_type) : 0;
+  std::int32_t const s_l = is_dec ? sql_decimal_scale(lo_reg.device_type) : 0;
+  std::int32_t const s_h = is_dec ? sql_decimal_scale(hi_reg.device_type) : 0;
+
+  auto const cmp_type_str =
+    (is_dec && (s_i != s_l || s_i != s_h || in_reg.device_type != lo_reg.device_type ||
+                in_reg.device_type != hi_reg.device_type))
+      ? std::string("__int128_t")
+      : cuda_type_name(in_reg.device_type);
+
+  std::string in_val = "static_cast<" + cmp_type_str + ">(" + in_reg.var_name + ".val)";
+  std::string lo_val = "static_cast<" + cmp_type_str + ">(" + lo_reg.var_name + ".val)";
+  std::string hi_val = "static_cast<" + cmp_type_str + ">(" + hi_reg.var_name + ".val)";
+  if (is_dec && (s_i != s_l || s_i != s_h)) {
+    auto const s_max = std::max({s_i, s_l, s_h});
+    if (s_max > s_i) { in_val = "(" + in_val + " * " + format_int128_pow10(s_max - s_i) + ")"; }
+    if (s_max > s_l) { lo_val = "(" + lo_val + " * " + format_int128_pow10(s_max - s_l) + ")"; }
+    if (s_max > s_h) { hi_val = "(" + hi_val + " * " + format_int128_pow10(s_max - s_h) + ")"; }
+  }
 
   std::string const lo_op = expr.lower_inclusive ? ">=" : ">";
   std::string const hi_op = expr.upper_inclusive ? "<=" : "<";
@@ -980,6 +1084,10 @@ register_value translation_context::produce_in_list(sirius::ast::in_list const& 
   auto const var_name  = next_var_name();
 
   auto const resolve_cmp_type = [](cudf::data_type lt, cudf::data_type rt) -> std::string {
+    if (cudf::is_fixed_point(lt) || cudf::is_fixed_point(rt)) {
+      if (lt == rt) { return cuda_type_name(lt); }
+      return "__int128_t";
+    }
     if (lt == rt) { return cuda_type_name(lt); }
     if (lt.id() == cudf::type_id::FLOAT64 || rt.id() == cudf::type_id::FLOAT64) { return "double"; }
     if (lt.id() == cudf::type_id::FLOAT32 || rt.id() == cudf::type_id::FLOAT32) { return "float"; }
@@ -997,14 +1105,27 @@ register_value translation_context::produce_in_list(sirius::ast::in_list const& 
       emit_line("if (!(" + var_name + ".valid && !" + var_name + ".overflow && " + var_name +
                 ".val)) {");
     }
-    auto const val_reg   = produce(*expr.values[i]);
-    can_ovf              = can_ovf || val_reg.can_overflow;
-    all_non_null         = all_non_null && val_reg.is_statically_non_null;
-    auto const cmp_type  = resolve_cmp_type(probe_reg.device_type, val_reg.device_type);
-    auto const probe_val = "static_cast<" + cmp_type + ">(" + probe_reg.var_name + ".val)";
-    auto const rhs_val   = "static_cast<" + cmp_type + ">(" + val_reg.var_name + ".val)";
-    auto const eq_var    = next_var_name();
-    bool const eq_ovf    = probe_reg.can_overflow || val_reg.can_overflow;
+    auto const val_reg    = produce(*expr.values[i]);
+    can_ovf               = can_ovf || val_reg.can_overflow;
+    all_non_null          = all_non_null && val_reg.is_statically_non_null;
+    auto const cmp_type   = resolve_cmp_type(probe_reg.device_type, val_reg.device_type);
+    std::string probe_val = "static_cast<" + cmp_type + ">(" + probe_reg.var_name + ".val)";
+    std::string rhs_val   = "static_cast<" + cmp_type + ">(" + val_reg.var_name + ".val)";
+    if (cudf::is_fixed_point(probe_reg.device_type) || cudf::is_fixed_point(val_reg.device_type)) {
+      auto const s_l = sql_decimal_scale(probe_reg.device_type);
+      auto const s_r = sql_decimal_scale(val_reg.device_type);
+      if (s_l != s_r) {
+        auto const s_max = std::max(s_l, s_r);
+        if (s_max > s_l) {
+          probe_val = "(" + probe_val + " * " + format_int128_pow10(s_max - s_l) + ")";
+        }
+        if (s_max > s_r) {
+          rhs_val = "(" + rhs_val + " * " + format_int128_pow10(s_max - s_r) + ")";
+        }
+      }
+    }
+    auto const eq_var = next_var_name();
+    bool const eq_ovf = probe_reg.can_overflow || val_reg.can_overflow;
     std::string const ovf_e =
       eq_ovf ? (probe_reg.var_name + ".overflow || " + val_reg.var_name + ".overflow") : "false";
 
@@ -1027,6 +1148,191 @@ register_value translation_context::produce_in_list(sirius::ast::in_list const& 
                         cudf::data_type{cudf::type_id::BOOL8},
                         all_non_null,
                         can_ovf};
+}
+
+register_value translation_context::produce_cast(sirius::ast::cast const& expr)
+{
+  auto const dst_type = sirius::require_cudf_type(expr.target_type);
+  auto const dst_str  = cuda_type_name(dst_type);
+  auto const var_name = next_var_name();
+
+  // Carrier restoration: if the child is a reference, load it as raw carrier and widen inline.
+  register_value child = [&]() {
+    if (expr.kind == sirius::ast::cast_kind::carrier_restore &&
+        expr.child->holds<sirius::ast::reference>()) {
+      auto const& ref = expr.child->get<sirius::ast::reference>();
+      sirius::ast::reference raw_ref{ref.column_index, sirius::logical_type{}};
+      return produce_reference(raw_ref);
+    }
+    return produce(*expr.child);
+  }();
+
+  if (expr.kind == sirius::ast::cast_kind::carrier_restore) {
+    emit_line("reg_val<" + dst_str + "> " + var_name + "{static_cast<" + dst_str + ">(" +
+              child.var_name + ".val), " + child.var_name + ".valid, " + child.var_name +
+              ".overflow};");
+    return register_value{
+      var_name, expr.target_type, dst_type, child.is_statically_non_null, child.can_overflow};
+  }
+
+  auto const src_type = child.device_type;
+  bool can_ovf        = child.can_overflow;
+
+  // 1. Temporal casts
+  if (cudf::is_timestamp(src_type) && cudf::is_timestamp(dst_type)) {
+    if (src_type.id() == dst_type.id()) {
+      emit_line("reg_val<" + dst_str + "> " + var_name + " = " + child.var_name + ";");
+    } else if (src_type.id() == cudf::type_id::TIMESTAMP_DAYS) {
+      std::int64_t const scale = timestamp_ticks_per_second(dst_type.id()) * 86'400LL;
+      emit_line("reg_val<int64_t> " + var_name + " = eval_cast_date_to_timestamp<" +
+                std::to_string(scale) + "LL>(" + child.var_name + ");");
+      can_ovf = true;
+    } else if (dst_type.id() == cudf::type_id::TIMESTAMP_DAYS) {
+      std::int64_t const scale = timestamp_ticks_per_second(src_type.id()) * 86'400LL;
+      emit_line("reg_val<int32_t> " + var_name + " = eval_cast_timestamp_to_date<" +
+                std::to_string(scale) + "LL>(" + child.var_name + ");");
+      can_ovf = true;
+    } else if (dst_type.id() == cudf::type_id::TIMESTAMP_MICROSECONDS) {
+      if (src_type.id() == cudf::type_id::TIMESTAMP_NANOSECONDS) {
+        emit_line("reg_val<int64_t> " + var_name + " = eval_cast_ts_ns_to_us(" + child.var_name +
+                  ");");
+      } else {
+        std::int64_t const scale =
+          (src_type.id() == cudf::type_id::TIMESTAMP_SECONDS) ? 1'000'000LL : 1'000LL;
+        emit_line("reg_val<int64_t> " + var_name + " = eval_cast_ts_scale_up<" +
+                  std::to_string(scale) + "LL>(" + child.var_name + ");");
+        can_ovf = true;
+      }
+    } else {
+      std::int64_t const src_tps = timestamp_ticks_per_second(src_type.id());
+      std::int64_t const dst_tps = timestamp_ticks_per_second(dst_type.id());
+      if (dst_tps > src_tps) {
+        std::int64_t const scale = dst_tps / src_tps;
+        emit_line("reg_val<int64_t> " + var_name + " = eval_cast_ts_scale_up<" +
+                  std::to_string(scale) + "LL>(" + child.var_name + ");");
+        can_ovf = true;
+      } else {
+        std::int64_t const scale = src_tps / dst_tps;
+        emit_line("reg_val<int64_t> " + var_name + " = eval_cast_ts_scale_down<" +
+                  std::to_string(scale) + "LL>(" + child.var_name + ");");
+      }
+    }
+  }
+  // 2. Any -> BOOL8
+  else if (dst_type.id() == cudf::type_id::BOOL8) {
+    emit_line("reg_val<bool> " + var_name + " = eval_cast_to_bool(" + child.var_name + ");");
+  }
+  // 3. BOOL8 -> Any
+  else if (src_type.id() == cudf::type_id::BOOL8) {
+    if (cudf::is_fixed_point(dst_type)) {
+      int const prec       = static_cast<int>(expr.target_type.decimal_precision());
+      int const scale      = sql_decimal_scale(dst_type);
+      auto const pow10_s   = format_int128_pow10(scale);
+      bool const can_fit_1 = (prec > scale);
+      emit_line("reg_val<" + dst_str + "> " + var_name + " = eval_cast_bool_to_dec<" + dst_str +
+                ", " + (can_fit_1 ? "true" : "false") + ">(" + child.var_name + ", static_cast<" +
+                dst_str + ">(" + pow10_s + "));");
+      if (!can_fit_1) { can_ovf = true; }
+    } else {
+      emit_line("reg_val<" + dst_str + "> " + var_name + "{" + child.var_name +
+                ".val ? static_cast<" + dst_str + ">(1) : static_cast<" + dst_str + ">(0), " +
+                child.var_name + ".valid, " + child.var_name + ".overflow};");
+    }
+  }
+  // 4. DECIMAL -> DECIMAL
+  else if (cudf::is_fixed_point(src_type) && cudf::is_fixed_point(dst_type)) {
+    int const s_in       = sql_decimal_scale(src_type);
+    int const s_out      = sql_decimal_scale(dst_type);
+    int const p_out      = static_cast<int>(expr.target_type.decimal_precision());
+    auto const limit_str = format_int128_pow10(p_out);
+    if (s_out >= s_in) {
+      auto const factor_str = format_int128_pow10(s_out - s_in);
+      emit_line("reg_val<" + dst_str + "> " + var_name + " = eval_cast_dec_scale_up<" + dst_str +
+                ">(" + child.var_name + ", " + factor_str + ", " + limit_str + ");");
+    } else {
+      auto const factor_str = format_int128_pow10(s_in - s_out);
+      emit_line("reg_val<" + dst_str + "> " + var_name + " = eval_cast_dec_scale_down<" + dst_str +
+                ">(" + child.var_name + ", " + factor_str + ", " + limit_str + ");");
+    }
+    can_ovf = true;
+  }
+  // 5. DECIMAL -> Integer
+  else if (cudf::is_fixed_point(src_type) && cudf::is_integral(dst_type)) {
+    int const s_in        = sql_decimal_scale(src_type);
+    auto const factor_str = format_int128_pow10(s_in);
+    emit_line("reg_val<" + dst_str + "> " + var_name + " = eval_cast_dec_to_int<" + dst_str + ">(" +
+              child.var_name + ", " + factor_str + ");");
+    can_ovf = true;
+  }
+  // 6. DECIMAL -> Float/Double
+  else if (cudf::is_fixed_point(src_type) && cudf::is_floating_point(dst_type)) {
+    int const s_in       = sql_decimal_scale(src_type);
+    auto const scale_dbl = format_double_pow10(s_in);
+    emit_line("reg_val<" + dst_str + "> " + var_name + " = eval_cast_dec_to_float<" + dst_str +
+              ">(" + child.var_name + ", " + scale_dbl + ");");
+  }
+  // 7. Integer -> DECIMAL
+  else if (cudf::is_integral(src_type) && cudf::is_fixed_point(dst_type)) {
+    int const p_out          = static_cast<int>(expr.target_type.decimal_precision());
+    int const s_out          = sql_decimal_scale(dst_type);
+    auto const int_limit_str = format_int128_pow10(p_out - s_out);
+    auto const factor_str    = format_int128_pow10(s_out);
+    emit_line("reg_val<" + dst_str + "> " + var_name + " = eval_cast_int_to_dec<" + dst_str + ">(" +
+              child.var_name + ", " + int_limit_str + ", " + factor_str + ");");
+    can_ovf = true;
+  }
+  // 8. Float/Double -> DECIMAL
+  else if (cudf::is_floating_point(src_type) && cudf::is_fixed_point(dst_type)) {
+    int const p_out          = static_cast<int>(expr.target_type.decimal_precision());
+    int const s_out          = sql_decimal_scale(dst_type);
+    auto const scale_dbl_str = format_double_pow10(s_out);
+    auto const limit_dbl_str = format_double_pow10(p_out);
+    auto const limit_128_str = format_int128_pow10(p_out);
+    emit_line("reg_val<" + dst_str + "> " + var_name + " = eval_cast_float_to_dec<" + dst_str +
+              ">(" + child.var_name + ", " + scale_dbl_str + ", " + limit_dbl_str + ", " +
+              limit_128_str + ");");
+    can_ovf = true;
+  }
+  // 9. Float/Double -> Integer
+  else if (cudf::is_floating_point(src_type) && cudf::is_integral(dst_type)) {
+    emit_line("reg_val<" + dst_str + "> " + var_name + " = eval_cast_float_to_int<" + dst_str +
+              ">(" + child.var_name + ");");
+    can_ovf = true;
+  }
+  // 10. Integer -> Float/Double
+  else if (cudf::is_integral(src_type) && cudf::is_floating_point(dst_type)) {
+    emit_line("reg_val<" + dst_str + "> " + var_name + "{static_cast<" + dst_str + ">(" +
+              child.var_name + ".val), " + child.var_name + ".valid, " + child.var_name +
+              ".overflow};");
+  }
+  // 11. Float/Double -> Float/Double
+  else if (cudf::is_floating_point(src_type) && cudf::is_floating_point(dst_type)) {
+    emit_line("reg_val<" + dst_str + "> " + var_name + " = eval_cast_float_to_float<" + dst_str +
+              ">(" + child.var_name + ");");
+    if (src_type.id() == cudf::type_id::FLOAT64 && dst_type.id() == cudf::type_id::FLOAT32) {
+      can_ovf = true;
+    }
+  }
+  // 12. Integer -> Integer
+  else if (cudf::is_integral(src_type) && cudf::is_integral(dst_type)) {
+    emit_line("reg_val<" + dst_str + "> " + var_name + " = eval_cast_int_to_int<" + dst_str + ">(" +
+              child.var_name + ");");
+    can_ovf = true;
+  } else {
+    throw not_implemented_exception("[nvrtc] Unsupported cast from {} to {}",
+                                    cudf::type_to_name(src_type),
+                                    cudf::type_to_name(dst_type));
+  }
+
+  bool non_null = child.is_statically_non_null;
+  if (expr.try_cast && can_ovf) {
+    emit_line("if (" + var_name + ".overflow) { " + var_name + " = reg_val<" + dst_str + ">{" +
+              dst_str + "{}, false, false}; }");
+    can_ovf  = false;
+    non_null = false;
+  }
+
+  return register_value{var_name, expr.target_type, dst_type, non_null, can_ovf};
 }
 
 register_value translation_context::produce_unary_op(sirius::ast::unary_op const& expr)
@@ -1093,6 +1399,38 @@ register_value translation_context::produce_function_call(sirius::ast::function_
     auto const lhs = produce(*args[0]);
     auto const rhs = produce(*args[1]);
 
+    if (cudf::is_fixed_point(ret_type)) {
+      int const s_l = sql_decimal_scale(lhs.device_type);
+      int const s_r = sql_decimal_scale(rhs.device_type);
+      if (fid == sirius::function_id::add || fid == sirius::function_id::sub) {
+        int const s_max      = std::max(s_l, s_r);
+        auto const f_l       = format_int128_pow10(s_max - s_l);
+        auto const f_r       = format_int128_pow10(s_max - s_r);
+        std::string const fn = (fid == sirius::function_id::add) ? "eval_dec_add" : "eval_dec_sub";
+        emit_line("reg_val<" + type_str + "> " + var_name + " = " + fn + "<" + type_str + ">(" +
+                  lhs.var_name + ", " + rhs.var_name + ", " + f_l + ", " + f_r + ");");
+      } else if (fid == sirius::function_id::mul) {
+        emit_line("reg_val<" + type_str + "> " + var_name + " = eval_dec_mul<" + type_str + ">(" +
+                  lhs.var_name + ", " + rhs.var_name + ");");
+      } else if (fid == sirius::function_id::div || fid == sirius::function_id::int_div) {
+        emit_line("reg_val<" + type_str + "> " + var_name + " = eval_dec_div<" + type_str + ">(" +
+                  lhs.var_name + ", " + rhs.var_name + ");");
+      } else {
+        int const s_max = std::max(s_l, s_r);
+        auto const f_l  = format_int128_pow10(s_max - s_l);
+        auto const f_r  = format_int128_pow10(s_max - s_r);
+        emit_line("reg_val<" + type_str + "> " + var_name + " = eval_dec_mod<" + type_str + ">(" +
+                  lhs.var_name + ", " + rhs.var_name + ", " + f_l + ", " + f_r + ");");
+      }
+      bool const is_div_or_mod =
+        (fid == sirius::function_id::div || fid == sirius::function_id::int_div ||
+         fid == sirius::function_id::mod);
+      bool const non_null =
+        lhs.is_statically_non_null && rhs.is_statically_non_null && !is_div_or_mod;
+      bool const can_ovf = lhs.can_overflow || rhs.can_overflow || true;
+      return register_value{var_name, expr.return_type(), ret_type, non_null, can_ovf};
+    }
+
     std::string fn_name;
     switch (fid) {
       case sirius::function_id::add: fn_name = "eval_add"; break;
@@ -1127,8 +1465,8 @@ register_value translation_context::produce_function_call(sirius::ast::function_
     auto const child = produce(*args[0]);
     emit_line("reg_val<" + type_str + "> " + var_name + " = eval_abs<" + type_str + ">(" +
               child.var_name + ");");
-    bool const can_ovf =
-      child.can_overflow || (cudf::is_integral(ret_type) && !cudf::is_unsigned(ret_type));
+    bool const can_ovf = child.can_overflow || cudf::is_fixed_point(ret_type) ||
+                         (cudf::is_integral(ret_type) && !cudf::is_unsigned(ret_type));
     return register_value{
       var_name, expr.return_type(), ret_type, child.is_statically_non_null, can_ovf};
   }
@@ -1210,6 +1548,7 @@ register_value translation_context::produce(sirius::ast::node const& expr)
   if (expr.holds<sirius::ast::in_list>()) {
     return produce_in_list(expr.get<sirius::ast::in_list>());
   }
+  if (expr.holds<sirius::ast::cast>()) { return produce_cast(expr.get<sirius::ast::cast>()); }
   if (expr.holds<sirius::ast::unary_op>()) {
     return produce_unary_op(expr.get<sirius::ast::unary_op>());
   }
@@ -1278,8 +1617,10 @@ std::unique_ptr<cudf::table> evaluate_project_sink(
   std::ostringstream src;
   src
     << "#include \"codegen/stdint_shim.hpp\"\n"
+    << "#include <cuda/numeric>\n"
     << "#include <cuda/std/limits>\n"
-    << "#include <cuda/std/type_traits>\n\n"
+    << "#include <cuda/std/type_traits>\n"
+    << "#include <cuda/std/utility>\n\n"
     << "template <typename T>\n"
     << "struct reg_val {\n"
     << "  T val;\n"
@@ -1449,6 +1790,275 @@ std::unique_ptr<cudf::table> evaluate_project_sink(
     << "    if (!is_finite_double(rounded)) { rounded = x; }\n"
     << "  }\n"
     << "  return reg_val<T>{static_cast<T>(rounded), true, false};\n"
+    << "}\n\n"
+    << "template <typename OutRep, typename L, typename R>\n"
+    << "__device__ __forceinline__ reg_val<OutRep> eval_dec_add(\n"
+    << "    reg_val<L> l, reg_val<R> r, __int128_t f_l, __int128_t f_r) {\n"
+    << "  bool const ovf_in = l.overflow || r.overflow;\n"
+    << "  bool const valid = l.valid && r.valid;\n"
+    << "  if (!valid || ovf_in) { return reg_val<OutRep>{OutRep{}, valid, ovf_in}; }\n"
+    << "  auto const sl = cuda::mul_overflow<__int128_t>(static_cast<__int128_t>(l.val), f_l);\n"
+    << "  auto const sr = cuda::mul_overflow<__int128_t>(static_cast<__int128_t>(r.val), f_r);\n"
+    << "  if (sl.overflow || sr.overflow) { return reg_val<OutRep>{OutRep{}, true, true}; }\n"
+    << "  auto const sum = cuda::add_overflow<__int128_t>(sl.value, sr.value);\n"
+    << "  if (sum.overflow) { return reg_val<OutRep>{OutRep{}, true, true}; }\n"
+    << "  auto const out = cuda::overflow_cast<OutRep>(sum.value);\n"
+    << "  return reg_val<OutRep>{out.overflow ? OutRep{} : out.value, true, out.overflow};\n"
+    << "}\n\n"
+    << "template <typename OutRep, typename L, typename R>\n"
+    << "__device__ __forceinline__ reg_val<OutRep> eval_dec_sub(\n"
+    << "    reg_val<L> l, reg_val<R> r, __int128_t f_l, __int128_t f_r) {\n"
+    << "  bool const ovf_in = l.overflow || r.overflow;\n"
+    << "  bool const valid = l.valid && r.valid;\n"
+    << "  if (!valid || ovf_in) { return reg_val<OutRep>{OutRep{}, valid, ovf_in}; }\n"
+    << "  auto const sl = cuda::mul_overflow<__int128_t>(static_cast<__int128_t>(l.val), f_l);\n"
+    << "  auto const sr = cuda::mul_overflow<__int128_t>(static_cast<__int128_t>(r.val), f_r);\n"
+    << "  if (sl.overflow || sr.overflow) { return reg_val<OutRep>{OutRep{}, true, true}; }\n"
+    << "  auto const diff = cuda::sub_overflow<__int128_t>(sl.value, sr.value);\n"
+    << "  if (diff.overflow) { return reg_val<OutRep>{OutRep{}, true, true}; }\n"
+    << "  auto const out = cuda::overflow_cast<OutRep>(diff.value);\n"
+    << "  return reg_val<OutRep>{out.overflow ? OutRep{} : out.value, true, out.overflow};\n"
+    << "}\n\n"
+    << "template <typename OutRep, typename L, typename R>\n"
+    << "__device__ __forceinline__ reg_val<OutRep> eval_dec_mul(reg_val<L> l, reg_val<R> r) {\n"
+    << "  bool const ovf_in = l.overflow || r.overflow;\n"
+    << "  bool const valid = l.valid && r.valid;\n"
+    << "  if (!valid || ovf_in) { return reg_val<OutRep>{OutRep{}, valid, ovf_in}; }\n"
+    << "  auto const prod = cuda::mul_overflow<OutRep>(static_cast<OutRep>(l.val), "
+       "static_cast<OutRep>(r.val));\n"
+    << "  return reg_val<OutRep>{prod.overflow ? OutRep{} : prod.value, true, prod.overflow};\n"
+    << "}\n\n"
+    << "template <typename OutRep, typename L, typename R>\n"
+    << "__device__ __forceinline__ reg_val<OutRep> eval_dec_div(reg_val<L> l, reg_val<R> r) {\n"
+    << "  bool const ovf_in = l.overflow || r.overflow;\n"
+    << "  bool const valid = l.valid && r.valid;\n"
+    << "  if (!valid || ovf_in) { return reg_val<OutRep>{OutRep{}, valid, ovf_in}; }\n"
+    << "  __int128_t const lv = static_cast<__int128_t>(l.val);\n"
+    << "  __int128_t const rv = static_cast<__int128_t>(r.val);\n"
+    << "  if (rv == 0) { return reg_val<OutRep>{OutRep{}, false, false}; }\n"
+    << "  if (lv == cuda::std::numeric_limits<__int128_t>::lowest() && rv == -1) {\n"
+    << "    return reg_val<OutRep>{OutRep{}, true, true};\n"
+    << "  }\n"
+    << "  __int128_t const q = lv / rv;\n"
+    << "  auto const out = cuda::overflow_cast<OutRep>(q);\n"
+    << "  return reg_val<OutRep>{out.overflow ? OutRep{} : out.value, true, out.overflow};\n"
+    << "}\n\n"
+    << "template <typename OutRep, typename L, typename R>\n"
+    << "__device__ __forceinline__ reg_val<OutRep> eval_dec_mod(\n"
+    << "    reg_val<L> l, reg_val<R> r, __int128_t f_l, __int128_t f_r) {\n"
+    << "  bool const ovf_in = l.overflow || r.overflow;\n"
+    << "  bool const valid = l.valid && r.valid;\n"
+    << "  if (!valid || ovf_in) { return reg_val<OutRep>{OutRep{}, valid, ovf_in}; }\n"
+    << "  auto const sl = cuda::mul_overflow<__int128_t>(static_cast<__int128_t>(l.val), f_l);\n"
+    << "  auto const sr = cuda::mul_overflow<__int128_t>(static_cast<__int128_t>(r.val), f_r);\n"
+    << "  if (sl.overflow || sr.overflow) { return reg_val<OutRep>{OutRep{}, true, true}; }\n"
+    << "  if (sr.value == 0) { return reg_val<OutRep>{OutRep{}, false, false}; }\n"
+    << "  if (sl.value == cuda::std::numeric_limits<__int128_t>::lowest() && sr.value == -1) {\n"
+    << "    return reg_val<OutRep>{OutRep{0}, true, false};\n"
+    << "  }\n"
+    << "  __int128_t const rem = sl.value % sr.value;\n"
+    << "  auto const out = cuda::overflow_cast<OutRep>(rem);\n"
+    << "  return reg_val<OutRep>{out.overflow ? OutRep{} : out.value, true, out.overflow};\n"
+    << "}\n\n"
+    << "template <typename DstT, typename SrcT>\n"
+    << "__device__ __forceinline__ reg_val<DstT> eval_cast_int_to_int(reg_val<SrcT> in) {\n"
+    << "  if (!in.valid || in.overflow) { return reg_val<DstT>{DstT{}, in.valid, in.overflow}; }\n"
+    << "  bool const fits = cuda::std::in_range<DstT>(in.val);\n"
+    << "  return reg_val<DstT>{fits ? static_cast<DstT>(in.val) : DstT{}, true, !fits};\n"
+    << "}\n\n"
+    << "template <typename SrcT>\n"
+    << "__device__ __forceinline__ reg_val<bool> eval_cast_to_bool(reg_val<SrcT> in) {\n"
+    << "  if (!in.valid || in.overflow) { return reg_val<bool>{false, in.valid, in.overflow}; }\n"
+    << "  return reg_val<bool>{in.val != SrcT{0}, true, false};\n"
+    << "}\n\n"
+    << "template <typename DstRep, bool CanFitOne>\n"
+    << "__device__ __forceinline__ reg_val<DstRep> eval_cast_bool_to_dec(reg_val<bool> in, DstRep "
+       "one_scaled) {\n"
+    << "  if (!in.valid || in.overflow) { return reg_val<DstRep>{DstRep{}, in.valid, in.overflow}; "
+       "}\n"
+    << "  if (!in.val) { return reg_val<DstRep>{DstRep{0}, true, false}; }\n"
+    << "  if constexpr (CanFitOne) {\n"
+    << "    return reg_val<DstRep>{one_scaled, true, false};\n"
+    << "  } else {\n"
+    << "    return reg_val<DstRep>{DstRep{}, true, true};\n"
+    << "  }\n"
+    << "}\n\n"
+    << "template <typename DstFloat, typename SrcFloat>\n"
+    << "__device__ __forceinline__ reg_val<DstFloat> eval_cast_float_to_float(reg_val<SrcFloat> "
+       "in) {\n"
+    << "  if (!in.valid || in.overflow) { return reg_val<DstFloat>{DstFloat{}, in.valid, "
+       "in.overflow}; }\n"
+    << "  if constexpr (sizeof(DstFloat) < sizeof(SrcFloat)) {\n"
+    << "    double const d = static_cast<double>(in.val);\n"
+    << "    if (!is_finite_double(d)) { return reg_val<DstFloat>{static_cast<DstFloat>(d), true, "
+       "false}; }\n"
+    << "    float const f = static_cast<float>(d);\n"
+    << "    bool const f_finite = (f - f) == 0.0f;\n"
+    << "    return reg_val<DstFloat>{f_finite ? f : DstFloat{}, true, !f_finite};\n"
+    << "  } else {\n"
+    << "    return reg_val<DstFloat>{static_cast<DstFloat>(in.val), true, false};\n"
+    << "  }\n"
+    << "}\n\n"
+    << "template <typename DstInt, typename SrcFloat>\n"
+    << "__device__ __forceinline__ reg_val<DstInt> eval_cast_float_to_int(reg_val<SrcFloat> in) {\n"
+    << "  if (!in.valid || in.overflow) { return reg_val<DstInt>{DstInt{}, in.valid, in.overflow}; "
+       "}\n"
+    << "  double const d = static_cast<double>(in.val);\n"
+    << "  if (!is_finite_double(d)) { return reg_val<DstInt>{DstInt{}, true, true}; }\n"
+    << "  if constexpr (sizeof(DstInt) < 8) {\n"
+    << "    double const lo = static_cast<double>(cuda::std::numeric_limits<DstInt>::lowest());\n"
+    << "    double const hi = static_cast<double>(cuda::std::numeric_limits<DstInt>::max());\n"
+    << "    if (d < lo || d > hi) { return reg_val<DstInt>{DstInt{}, true, true}; }\n"
+    << "    return reg_val<DstInt>{static_cast<DstInt>(in.val), true, false};\n"
+    << "  } else if constexpr (cuda::std::is_signed_v<DstInt>) {\n"
+    << "    if (d < -9223372036854775808.0 || d >= 9223372036854775808.0) {\n"
+    << "      return reg_val<DstInt>{DstInt{}, true, true};\n"
+    << "    }\n"
+    << "    return reg_val<DstInt>{static_cast<DstInt>(in.val), true, false};\n"
+    << "  } else {\n"
+    << "    if (d < 0.0 || d >= 18446744073709551616.0) {\n"
+    << "      return reg_val<DstInt>{DstInt{}, true, true};\n"
+    << "    }\n"
+    << "    return reg_val<DstInt>{static_cast<DstInt>(in.val), true, false};\n"
+    << "  }\n"
+    << "}\n\n"
+    << "template <typename DstRep, typename SrcInt>\n"
+    << "__device__ __forceinline__ reg_val<DstRep> eval_cast_int_to_dec(\n"
+    << "    reg_val<SrcInt> in, __int128_t int_limit, __int128_t factor) {\n"
+    << "  if (!in.valid || in.overflow) { return reg_val<DstRep>{DstRep{}, in.valid, in.overflow}; "
+       "}\n"
+    << "  __int128_t const v = static_cast<__int128_t>(in.val);\n"
+    << "  if (v <= -int_limit || v >= int_limit) { return reg_val<DstRep>{DstRep{}, true, true}; "
+       "}\n"
+    << "  auto const scaled = cuda::mul_overflow<__int128_t>(v, factor);\n"
+    << "  if (scaled.overflow) { return reg_val<DstRep>{DstRep{}, true, true}; }\n"
+    << "  auto const out = cuda::overflow_cast<DstRep>(scaled.value);\n"
+    << "  return reg_val<DstRep>{out.overflow ? DstRep{} : out.value, true, out.overflow};\n"
+    << "}\n\n"
+    << "template <typename DstInt, typename SrcRep>\n"
+    << "__device__ __forceinline__ reg_val<DstInt> eval_cast_dec_to_int(\n"
+    << "    reg_val<SrcRep> in, __int128_t factor) {\n"
+    << "  if (!in.valid || in.overflow) { return reg_val<DstInt>{DstInt{}, in.valid, in.overflow}; "
+       "}\n"
+    << "  __int128_t const q = static_cast<__int128_t>(in.val) / factor;\n"
+    << "  bool const fits = cuda::std::in_range<DstInt>(q);\n"
+    << "  return reg_val<DstInt>{fits ? static_cast<DstInt>(q) : DstInt{}, true, !fits};\n"
+    << "}\n\n"
+    << "template <typename DstRep, typename SrcRep>\n"
+    << "__device__ __forceinline__ reg_val<DstRep> eval_cast_dec_scale_up(\n"
+    << "    reg_val<SrcRep> in, __int128_t factor, __int128_t limit) {\n"
+    << "  if (!in.valid || in.overflow) { return reg_val<DstRep>{DstRep{}, in.valid, in.overflow}; "
+       "}\n"
+    << "  auto const scaled = cuda::mul_overflow<__int128_t>(static_cast<__int128_t>(in.val), "
+       "factor);\n"
+    << "  if (scaled.overflow || scaled.value <= -limit || scaled.value >= limit) {\n"
+    << "    return reg_val<DstRep>{DstRep{}, true, true};\n"
+    << "  }\n"
+    << "  auto const out = cuda::overflow_cast<DstRep>(scaled.value);\n"
+    << "  return reg_val<DstRep>{out.overflow ? DstRep{} : out.value, true, out.overflow};\n"
+    << "}\n\n"
+    << "template <typename DstRep, typename SrcRep>\n"
+    << "__device__ __forceinline__ reg_val<DstRep> eval_cast_dec_scale_down(\n"
+    << "    reg_val<SrcRep> in, __int128_t factor, __int128_t limit) {\n"
+    << "  if (!in.valid || in.overflow) { return reg_val<DstRep>{DstRep{}, in.valid, in.overflow}; "
+       "}\n"
+    << "  __int128_t const q = static_cast<__int128_t>(in.val) / factor;\n"
+    << "  if (q <= -limit || q >= limit) { return reg_val<DstRep>{DstRep{}, true, true}; }\n"
+    << "  auto const out = cuda::overflow_cast<DstRep>(q);\n"
+    << "  return reg_val<DstRep>{out.overflow ? DstRep{} : out.value, true, out.overflow};\n"
+    << "}\n\n"
+    << "template <typename DstFloat, typename SrcRep>\n"
+    << "__device__ __forceinline__ reg_val<DstFloat> eval_cast_dec_to_float(\n"
+    << "    reg_val<SrcRep> in, double scale_pow10) {\n"
+    << "  if (!in.valid || in.overflow) { return reg_val<DstFloat>{DstFloat{}, in.valid, "
+       "in.overflow}; }\n"
+    << "  if constexpr (sizeof(DstFloat) == 4) {\n"
+    << "    return reg_val<float>{static_cast<float>(in.val) / static_cast<float>(scale_pow10), "
+       "true, false};\n"
+    << "  } else {\n"
+    << "    return reg_val<double>{static_cast<double>(in.val) / scale_pow10, true, false};\n"
+    << "  }\n"
+    << "}\n\n"
+    << "template <typename DstRep, typename SrcFloat>\n"
+    << "__device__ __forceinline__ reg_val<DstRep> eval_cast_float_to_dec(\n"
+    << "    reg_val<SrcFloat> in, double scale_pow10, double limit_pow10, __int128_t limit_128) {\n"
+    << "  if (!in.valid || in.overflow) { return reg_val<DstRep>{DstRep{}, in.valid, in.overflow}; "
+       "}\n"
+    << "  double const d = static_cast<double>(in.val);\n"
+    << "  if (!is_finite_double(d)) { return reg_val<DstRep>{DstRep{}, true, true}; }\n"
+    << "  double const scaled = d * scale_pow10;\n"
+    << "  if (!is_finite_double(scaled) || scaled <= -limit_pow10 || scaled >= limit_pow10) {\n"
+    << "    return reg_val<DstRep>{DstRep{}, true, true};\n"
+    << "  }\n"
+    << "  __int128_t const iv = static_cast<__int128_t>(scaled);\n"
+    << "  if (iv <= -limit_128 || iv >= limit_128) { return reg_val<DstRep>{DstRep{}, true, true}; "
+       "}\n"
+    << "  auto const out = cuda::overflow_cast<DstRep>(iv);\n"
+    << "  return reg_val<DstRep>{out.overflow ? DstRep{} : out.value, true, out.overflow};\n"
+    << "}\n\n"
+    << "template <int64_t Scale>\n"
+    << "__device__ __forceinline__ reg_val<int64_t> eval_cast_date_to_timestamp(reg_val<int32_t> "
+       "in) {\n"
+    << "  if (!in.valid || in.overflow) { return reg_val<int64_t>{0, in.valid, in.overflow}; }\n"
+    << "  constexpr int32_t date_inf = cuda::std::numeric_limits<int32_t>::max();\n"
+    << "  constexpr int64_t ts_inf = cuda::std::numeric_limits<int64_t>::max();\n"
+    << "  constexpr int64_t micros_per_day = 86400000000LL;\n"
+    << "  constexpr int64_t max_days = ts_inf / (Scale > micros_per_day ? Scale : "
+       "micros_per_day);\n"
+    << "  int32_t const day = in.val;\n"
+    << "  if (day == date_inf) { return reg_val<int64_t>{ts_inf, true, false}; }\n"
+    << "  if (day == -date_inf) { return reg_val<int64_t>{-ts_inf, true, false}; }\n"
+    << "  if (day < -max_days || day > max_days) {\n"
+    << "    return reg_val<int64_t>{0, true, true};\n"
+    << "  }\n"
+    << "  return reg_val<int64_t>{static_cast<int64_t>(day) * Scale, true, false};\n"
+    << "}\n\n"
+    << "template <int64_t Scale>\n"
+    << "__device__ __forceinline__ reg_val<int64_t> eval_cast_ts_scale_up(reg_val<int64_t> in) {\n"
+    << "  if (!in.valid || in.overflow) { return reg_val<int64_t>{0, in.valid, in.overflow}; }\n"
+    << "  constexpr int64_t ts_inf = cuda::std::numeric_limits<int64_t>::max();\n"
+    << "  constexpr int64_t ts_min = cuda::std::numeric_limits<int64_t>::lowest();\n"
+    << "  int64_t const t = in.val;\n"
+    << "  if (t == ts_inf || t == -ts_inf) { return reg_val<int64_t>{t, true, false}; }\n"
+    << "  if (t < (ts_min / Scale) || t > (ts_inf / Scale)) {\n"
+    << "    return reg_val<int64_t>{0, true, true};\n"
+    << "  }\n"
+    << "  return reg_val<int64_t>{t * Scale, true, false};\n"
+    << "}\n\n"
+    << "__device__ __forceinline__ reg_val<int64_t> eval_cast_ts_ns_to_us(reg_val<int64_t> in) {\n"
+    << "  if (!in.valid || in.overflow) { return reg_val<int64_t>{0, in.valid, in.overflow}; }\n"
+    << "  constexpr int64_t ts_inf = cuda::std::numeric_limits<int64_t>::max();\n"
+    << "  int64_t const t = in.val;\n"
+    << "  if (t == ts_inf || t == -ts_inf) { return reg_val<int64_t>{t, true, false}; }\n"
+    << "  int64_t const half = t / 500LL;\n"
+    << "  int64_t const rounded = half + (half < 0 ? -1LL : 1LL);\n"
+    << "  return reg_val<int64_t>{rounded / 2LL, true, false};\n"
+    << "}\n\n"
+    << "template <int64_t Scale>\n"
+    << "__device__ __forceinline__ reg_val<int64_t> eval_cast_ts_scale_down(reg_val<int64_t> in) "
+       "{\n"
+    << "  if (!in.valid || in.overflow) { return reg_val<int64_t>{0, in.valid, in.overflow}; }\n"
+    << "  constexpr int64_t ts_inf = cuda::std::numeric_limits<int64_t>::max();\n"
+    << "  int64_t const t = in.val;\n"
+    << "  if (t == ts_inf || t == -ts_inf) { return reg_val<int64_t>{t, true, false}; }\n"
+    << "  int64_t const q = (t >= 0) ? (t / Scale) : ((t - Scale + 1LL) / Scale);\n"
+    << "  return reg_val<int64_t>{q, true, false};\n"
+    << "}\n\n"
+    << "template <int64_t Scale>\n"
+    << "__device__ __forceinline__ reg_val<int32_t> eval_cast_timestamp_to_date(reg_val<int64_t> "
+       "in) {\n"
+    << "  if (!in.valid || in.overflow) { return reg_val<int32_t>{0, in.valid, in.overflow}; }\n"
+    << "  constexpr int32_t date_inf = cuda::std::numeric_limits<int32_t>::max();\n"
+    << "  constexpr int64_t ts_inf = cuda::std::numeric_limits<int64_t>::max();\n"
+    << "  int64_t const t = in.val;\n"
+    << "  if (t == ts_inf) { return reg_val<int32_t>{date_inf, true, false}; }\n"
+    << "  if (t == -ts_inf) { return reg_val<int32_t>{-date_inf, true, false}; }\n"
+    << "  int64_t const days = (t >= 0) ? (t / Scale) : ((t - Scale + 1LL) / Scale);\n"
+    << "  if (days < static_cast<int64_t>(cuda::std::numeric_limits<int32_t>::lowest()) ||\n"
+    << "      days >= static_cast<int64_t>(date_inf)) {\n"
+    << "    return reg_val<int32_t>{0, true, true};\n"
+    << "  }\n"
+    << "  return reg_val<int32_t>{static_cast<int32_t>(days), true, false};\n"
     << "}\n\n"
     << "extern \"C\" __global__ void sirius_nvrtc_project_kernel(\n";
 
