@@ -576,12 +576,15 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     // positional keep mask), membership probes run sequentially on s0 after the combine, so dead
     // rows skip the set/Bloom lookup. Otherwise they run concurrently here, prior-free.
     bool const sequential_membership = k_member > 0 && (k_range + k_bool8 > 0 || has_keep_mask);
+    // Which membership probes ran, by request position, for the measurement.
+    std::vector<bool> member_ran(k_member, false);
     for (size_t m = 0; !sequential_membership && m < k_member; ++m) {
       auto const& directive = request.membership_filters[m];
       auto const& column    = table.columns[selected[directive.column]];
       auto const status     = wave1.append(mask_decode_request{
         *column.plan_tree, membership_source{directive.probe, column.dtype}, next_destination()});
       declined_members += status == mask_source_status::DECLINED;
+      member_ran[m] = status != mask_source_status::DECLINED;
     }
 
     // Order the combine on s0 after every other lane that produced a source.
@@ -617,6 +620,32 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
       mask_ptrs.push_back(keep_dst);
     }
 
+    // ── Membership measurement counters on s0, copied back by the CNT wave's host sync. Counter m
+    // holds the rows that pass every probe up to m (concurrent probes; their masks are counted
+    // before the combine overwrites source 0), or, for the cascade, counter 0 holds its input and
+    // counter m + 1 the rows that pass every probe up to m.
+    bool const measure_members = request.measure_membership && k_member > 0;
+    rmm::device_buffer member_counters;
+    std::vector<std::uint32_t> member_counts;
+    auto member_counter = [&](std::size_t index) {
+      return static_cast<std::uint32_t*>(member_counters.data()) + index;
+    };
+    if (measure_members) {
+      member_counts.resize(k_member + 1);
+      member_counters = rmm::device_buffer(member_counts.size() * sizeof(std::uint32_t), s0, mr);
+      if (cudaMemsetAsync(member_counters.data(), 0, member_counters.size(), s0.get()) !=
+          cudaSuccess) {
+        throw plan_error("filtered decode: membership counter reset failed");
+      }
+      std::vector<std::uint32_t const*> ran_masks;
+      for (size_t m = 0; !sequential_membership && m < k_member; ++m) {
+        if (!member_ran[m]) continue;
+        ran_masks.push_back(mask_ptrs[m]);
+        sc::count_masked_rows(
+          ran_masks.data(), static_cast<int>(ran_masks.size()), alloc_words, member_counter(m), s0);
+      }
+    }
+
     // ── Combine on stream 0.
     if (mask_ptrs.size() > 1) {
       sc::combine_masks_and(
@@ -629,6 +658,10 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     // strip is written and read only on s0, so its stream-ordered free cannot race a reader.
     std::optional<decode_session> cascade;
     if (sequential_membership) {
+      std::array<std::uint32_t const*, 1> const cascade_input{combined};
+      if (measure_members) {
+        sc::count_masked_rows(cascade_input.data(), 1, alloc_words, member_counter(0), s0);
+      }
       cascade.emplace(std::span{&s0, 1}, mr);
       rmm::device_buffer membership_scratch(mask_bytes, s0, mr);
       auto* member_words = static_cast<std::uint32_t*>(membership_scratch.data());
@@ -643,7 +676,11 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
           ++declined_members;
           continue;
         }
+        member_ran[m] = true;
         sc::combine_masks_and(combined, and_sources.data(), 2, alloc_words, s0);
+        if (measure_members) {
+          sc::count_masked_rows(cascade_input.data(), 1, alloc_words, member_counter(m + 1), s0);
+        }
       }
     }
 
@@ -676,12 +713,26 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     // the combine and the cascade have completed, so per_filter teardown is safe.
     sc::selection_mask sel{
       combined, num_rows, -1, static_cast<std::uint32_t*>(result.chunk_offsets.data())};
-    sc::run_selection_cnt(sel, s0, mr);
+    sc::run_selection_cnt(sel, s0, mr, {member_counter(0), member_counts});
     // CNT is the genuine host observation. finish also checks external phase work after request
     // submission before publishing the dual-delivery BOOL8 owners.
     bool8_full = wave1.finish();
     if (cascade) (void)cascade->finish();
-    result.survivor_count = sel.survivor_count;
+    result.survivor_count            = sel.survivor_count;
+    result.membership_probes_applied = k_member - declined_members;
+    if (measure_members && declined_members < k_member) {
+      // Each probe saw the rows every earlier probe that ran kept.
+      int64_t rows_in           = sequential_membership ? member_counts[0] : num_rows;
+      result.membership_rows_in = rows_in;
+      result.membership_probe_rows.resize(request.membership_filters.size());
+      for (size_t m = 0; m < k_member; ++m) {
+        if (!member_ran[m]) continue;
+        int64_t const rows_out          = member_counts[sequential_membership ? m + 1 : m];
+        result.membership_probe_rows[m] = {rows_in, rows_out};
+        rows_in                         = rows_out;
+      }
+      result.membership_rows_out = sel.survivor_count;
+    }
     per_filter.clear();
     keep_mask_dev = rmm::device_buffer{};  // combine consumed it; CNT synced s0
 
@@ -726,7 +777,14 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
                      static_cast<long long>(sel.survivor_count),
                      static_cast<long long>(num_rows));
       }
+      // The membership measurement stays valid: the probes ran on every row before the decode gave
+      // compaction up.
+      auto measured = std::move(result);
       reset_result(sc::scan_filter_status::declined_unselective);
+      result.membership_probes_applied = measured.membership_probes_applied;
+      result.membership_rows_in        = measured.membership_rows_in;
+      result.membership_rows_out       = measured.membership_rows_out;
+      result.membership_probe_rows     = std::move(measured.membership_probe_rows);
       return std::nullopt;
     }
 
