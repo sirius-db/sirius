@@ -29,9 +29,12 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace sirius::nvrtc {
+
+using boundary_column_map = std::unordered_map<sirius::ast::node const*, std::uint32_t>;
 
 /**
  * @brief Descriptor for a referenced input column bound to the compiled kernel.
@@ -72,7 +75,11 @@ struct scalar_constant_binding {
  */
 class translation_context {
  public:
-  explicit translation_context(cudf::table_view input) : _input(input) {}
+  explicit translation_context(cudf::table_view input,
+                               boundary_column_map const* boundary_map = nullptr)
+    : _input(input), _boundary_map(boundary_map)
+  {
+  }
 
   /**
    * @brief Emits the `produce` code for an Expression Tree node and returns its Register Value.
@@ -145,6 +152,7 @@ class translation_context {
   void mark_string_columns_for_bsm(sirius::ast::node const& expr);
 
   cudf::table_view _input;
+  boundary_column_map const* _boundary_map{nullptr};
   std::vector<input_column_binding> _input_columns;
   std::vector<loaded_reference_entry> _loaded_references;
   std::vector<scalar_constant_binding> _constants;

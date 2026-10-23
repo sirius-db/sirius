@@ -449,6 +449,16 @@ class expression_evaluator {
   // mask column (the sole column of evaluate()'s output). Shared by both select() overloads.
   std::unique_ptr<cudf::column> compute_mask(cudf::table_view input);
 
+  // Materialize a single evaluate_result into an owned cudf::column matching @p expr's declared
+  // return type.
+  std::unique_ptr<cudf::column> materialize_result_column(sirius::ast::node const& expr,
+                                                          evaluate_result result);
+
+  // Attempt to evaluate a batch of fixed-width expressions via a single fused NVRTC_JIT kernel,
+  // pre-evaluating any in-tree Materialization Boundaries into synthetic input columns.
+  std::optional<std::unique_ptr<cudf::table>> try_evaluate_nvrtc_with_boundaries(
+    std::span<sirius::ast::node const* const> expressions);
+
   // Execute the AST tree rooted at the given expression reference and return the result as a
   // column.
   std::unique_ptr<cudf::column> evaluate_ast(expr_ref root_expr);

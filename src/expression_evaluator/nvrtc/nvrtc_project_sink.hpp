@@ -26,18 +26,24 @@
 
 #include <expression/ast/node.hpp>
 
+#include <cstdint>
 #include <memory>
 #include <span>
+#include <unordered_map>
 #include <vector>
 
 namespace sirius::nvrtc {
+
+using boundary_column_map = std::unordered_map<sirius::ast::node const*, std::uint32_t>;
 
 /**
  * @brief Returns whether all expressions in @p expressions can be compiled and fused by the
  * `NVRTC_JIT` `ProjectSink` compiler for the given @p input table.
  */
-[[nodiscard]] bool can_compile_project_sink(std::span<sirius::ast::node const* const> expressions,
-                                            cudf::table_view const& input) noexcept;
+[[nodiscard]] bool can_compile_project_sink(
+  std::span<sirius::ast::node const* const> expressions,
+  cudf::table_view const& input,
+  boundary_column_map const* boundary_map = nullptr) noexcept;
 
 /**
  * @brief Compiles (or fetches from `codegen::jit::KernelCache`) and executes a single fused
@@ -54,6 +60,16 @@ namespace sirius::nvrtc {
   cudf::table_view const& input,
   ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr,
-  std::size_t* narrow_domain_comparison_count = nullptr);
+  std::size_t* narrow_domain_comparison_count = nullptr,
+  boundary_column_map const* boundary_map     = nullptr);
+
+/**
+ * @brief Collects maximal in-tree `Materialization Boundary` sub-trees inside @p expressions that
+ * produce register-supported types (`STRING` or fixed-width) so they can be pre-evaluated into
+ * synthetic input columns before compiling @p expressions.
+ */
+void collect_materialization_boundaries(std::span<sirius::ast::node const* const> expressions,
+                                        cudf::table_view const& input,
+                                        std::vector<sirius::ast::node const*>& out_boundaries);
 
 }  // namespace sirius::nvrtc

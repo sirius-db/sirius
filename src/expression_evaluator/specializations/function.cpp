@@ -106,7 +106,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
 
   auto const ast_op_count = alt.cudf_ast_op_count();
 
-  if (ast_supported && _policy.strategy != expression_evaluator_strategy::MATERIALIZE &&
+  if (ast_supported && is_cudf_ast_strategy(_policy.strategy) &&
       (mode == evaluation_mode::AST || ast_op_count >= _min_ast_size)) {
     // Only numeric binary functions are supported in AST currently.
     D_ASSERT(args.size() == 2);

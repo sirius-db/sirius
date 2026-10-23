@@ -41,6 +41,12 @@ enum class expression_evaluator_strategy {
   NVRTC_JIT,
 };
 
+[[nodiscard]] constexpr bool is_cudf_ast_strategy(expression_evaluator_strategy strategy) noexcept
+{
+  return strategy == expression_evaluator_strategy::AST_INTERPRET ||
+         strategy == expression_evaluator_strategy::AST_JIT;
+}
+
 /**
  * @brief Parse a string into an expression_evaluator_strategy.
  * Accepts "materialize", "ast_interpret", "ast_jit", "nvrtc_jit".

@@ -272,7 +272,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::unary_op const& alt,
 
   auto const ast_op_count = alt.cudf_ast_op_count();
 
-  if (_policy.strategy != expression_evaluator_strategy::MATERIALIZE &&
+  if (is_cudf_ast_strategy(_policy.strategy) &&
       (mode == evaluation_mode::AST || ast_op_count >= _min_ast_size)) {
     auto child        = evaluate(*alt.child, evaluation_mode::AST);
     auto build_output = [&](expr_ref const& produced) -> evaluate_result {
@@ -360,7 +360,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::in_list const& alt,
   }
   auto const ast_op_count = alt.cudf_ast_op_count();
 
-  if (_policy.strategy != expression_evaluator_strategy::MATERIALIZE &&
+  if (is_cudf_ast_strategy(_policy.strategy) &&
       (mode == evaluation_mode::AST || ast_op_count >= _min_ast_size)) {
     D_ASSERT(!alt.values.empty());
 

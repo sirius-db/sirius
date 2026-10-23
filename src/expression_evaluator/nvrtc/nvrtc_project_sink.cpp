@@ -152,9 +152,20 @@ namespace {
   return true;
 }
 
-[[nodiscard]] cudf::data_type effective_node_cudf_type(sirius::ast::node const& expr,
-                                                       cudf::table_view const& input) noexcept
+[[nodiscard]] cudf::data_type effective_node_cudf_type(
+  sirius::ast::node const& expr,
+  cudf::table_view const& input,
+  boundary_column_map const* boundary_map = nullptr) noexcept
 {
+  if (boundary_map != nullptr) {
+    if (auto const it = boundary_map->find(&expr); it != boundary_map->end()) {
+      if (it->second < static_cast<std::uint32_t>(input.num_columns())) {
+        return input.column(it->second).type();
+      }
+      auto const opt_cudf = sirius::get_cudf_type(expr.return_type());
+      return opt_cudf.value_or(cudf::data_type{cudf::type_id::EMPTY});
+    }
+  }
   if (expr.holds<sirius::ast::reference>()) {
     auto const& ref = expr.get<sirius::ast::reference>();
     if (ref.column_index >= static_cast<std::uint32_t>(input.num_columns())) {
@@ -187,8 +198,27 @@ namespace {
 }
 
 [[nodiscard]] bool is_node_supported(sirius::ast::node const& expr,
-                                     cudf::table_view const& input) noexcept
+                                     cudf::table_view const& input,
+                                     boundary_column_map const* boundary_map = nullptr) noexcept
 {
+  if (boundary_map != nullptr) {
+    if (auto const it = boundary_map->find(&expr); it != boundary_map->end()) {
+      if (it->second < static_cast<std::uint32_t>(input.num_columns())) {
+        auto const col_view = input.column(it->second);
+        if (col_view.type().id() == cudf::type_id::STRING) {
+          if (col_view.num_children() > 0) {
+            auto const off_id = cudf::strings_column_view(col_view).offsets().type().id();
+            if (off_id != cudf::type_id::INT32 && off_id != cudf::type_id::INT64) { return false; }
+          }
+          return true;
+        }
+        return is_supported_fixed_width(col_view.type());
+      }
+      auto const opt_cudf = sirius::get_cudf_type(expr.return_type());
+      return opt_cudf.has_value() && is_supported_register_type(*opt_cudf);
+    }
+  }
+
   if (expr.holds<sirius::ast::reference>()) {
     auto const& ref = expr.get<sirius::ast::reference>();
     if (ref.column_index >= static_cast<std::uint32_t>(input.num_columns())) { return false; }
@@ -223,11 +253,12 @@ namespace {
   if (expr.holds<sirius::ast::comparison>()) {
     auto const& cmp = expr.get<sirius::ast::comparison>();
     if (!cmp.left || !cmp.right) { return false; }
-    if (!is_node_supported(*cmp.left, input) || !is_node_supported(*cmp.right, input)) {
+    if (!is_node_supported(*cmp.left, input, boundary_map) ||
+        !is_node_supported(*cmp.right, input, boundary_map)) {
       return false;
     }
-    auto const lt = effective_node_cudf_type(*cmp.left, input);
-    auto const rt = effective_node_cudf_type(*cmp.right, input);
+    auto const lt = effective_node_cudf_type(*cmp.left, input, boundary_map);
+    auto const rt = effective_node_cudf_type(*cmp.right, input, boundary_map);
     if (lt.id() == cudf::type_id::STRING || rt.id() == cudf::type_id::STRING) {
       return lt.id() == cudf::type_id::STRING && rt.id() == cudf::type_id::STRING;
     }
@@ -241,13 +272,14 @@ namespace {
   if (expr.holds<sirius::ast::between>()) {
     auto const& btw = expr.get<sirius::ast::between>();
     if (!btw.input || !btw.lower || !btw.upper) { return false; }
-    if (!is_node_supported(*btw.input, input) || !is_node_supported(*btw.lower, input) ||
-        !is_node_supported(*btw.upper, input)) {
+    if (!is_node_supported(*btw.input, input, boundary_map) ||
+        !is_node_supported(*btw.lower, input, boundary_map) ||
+        !is_node_supported(*btw.upper, input, boundary_map)) {
       return false;
     }
-    auto const it = effective_node_cudf_type(*btw.input, input);
-    auto const lt = effective_node_cudf_type(*btw.lower, input);
-    auto const ut = effective_node_cudf_type(*btw.upper, input);
+    auto const it = effective_node_cudf_type(*btw.input, input, boundary_map);
+    auto const lt = effective_node_cudf_type(*btw.lower, input, boundary_map);
+    auto const ut = effective_node_cudf_type(*btw.upper, input, boundary_map);
     if (it.id() == cudf::type_id::STRING || lt.id() == cudf::type_id::STRING ||
         ut.id() == cudf::type_id::STRING) {
       return it.id() == cudf::type_id::STRING && lt.id() == cudf::type_id::STRING &&
@@ -271,8 +303,10 @@ namespace {
       return false;
     }
     for (auto const& ch : conj.children) {
-      if (!ch || !is_node_supported(*ch, input)) { return false; }
-      if (effective_node_cudf_type(*ch, input).id() != cudf::type_id::BOOL8) { return false; }
+      if (!ch || !is_node_supported(*ch, input, boundary_map)) { return false; }
+      if (effective_node_cudf_type(*ch, input, boundary_map).id() != cudf::type_id::BOOL8) {
+        return false;
+      }
     }
     return true;
   }
@@ -285,14 +319,16 @@ namespace {
     auto const ret_type = *opt_ret;
     for (auto const& c : ce.cases) {
       if (!c.when_ || !c.then_) { return false; }
-      if (!is_node_supported(*c.when_, input)) { return false; }
-      if (effective_node_cudf_type(*c.when_, input).id() != cudf::type_id::BOOL8) { return false; }
+      if (!is_node_supported(*c.when_, input, boundary_map)) { return false; }
+      if (effective_node_cudf_type(*c.when_, input, boundary_map).id() != cudf::type_id::BOOL8) {
+        return false;
+      }
       if (c.then_->holds<sirius::ast::function_call>() &&
           c.then_->get<sirius::ast::function_call>().function() == sirius::function_id::error) {
         continue;
       }
-      if (!is_node_supported(*c.then_, input)) { return false; }
-      auto const tt = effective_node_cudf_type(*c.then_, input);
+      if (!is_node_supported(*c.then_, input, boundary_map)) { return false; }
+      auto const tt = effective_node_cudf_type(*c.then_, input, boundary_map);
       if (!is_supported_register_type(tt)) { return false; }
       if (ret_type.id() == cudf::type_id::STRING || tt.id() == cudf::type_id::STRING) {
         if (ret_type.id() != cudf::type_id::STRING || tt.id() != cudf::type_id::STRING) {
@@ -306,8 +342,8 @@ namespace {
         }
       }
     }
-    if (!is_node_supported(*ce.else_, input)) { return false; }
-    auto const et = effective_node_cudf_type(*ce.else_, input);
+    if (!is_node_supported(*ce.else_, input, boundary_map)) { return false; }
+    auto const et = effective_node_cudf_type(*ce.else_, input, boundary_map);
     if (!is_supported_register_type(et)) { return false; }
     if (ret_type.id() == cudf::type_id::STRING || et.id() == cudf::type_id::STRING) {
       if (ret_type.id() != cudf::type_id::STRING || et.id() != cudf::type_id::STRING) {
@@ -330,8 +366,8 @@ namespace {
     if (!opt_ret || !is_supported_register_type(*opt_ret)) { return false; }
     auto const ret_type = *opt_ret;
     for (auto const& ch : coal.children) {
-      if (!ch || !is_node_supported(*ch, input)) { return false; }
-      auto const ct = effective_node_cudf_type(*ch, input);
+      if (!ch || !is_node_supported(*ch, input, boundary_map)) { return false; }
+      auto const ct = effective_node_cudf_type(*ch, input, boundary_map);
       if (!is_supported_register_type(ct)) { return false; }
       if (ret_type.id() == cudf::type_id::STRING || ct.id() == cudf::type_id::STRING) {
         if (ret_type.id() != cudf::type_id::STRING || ct.id() != cudf::type_id::STRING) {
@@ -351,12 +387,12 @@ namespace {
   if (expr.holds<sirius::ast::in_list>()) {
     auto const& inl = expr.get<sirius::ast::in_list>();
     if (!inl.probe || inl.values.empty()) { return false; }
-    if (!is_node_supported(*inl.probe, input)) { return false; }
-    auto const pt = effective_node_cudf_type(*inl.probe, input);
+    if (!is_node_supported(*inl.probe, input, boundary_map)) { return false; }
+    auto const pt = effective_node_cudf_type(*inl.probe, input, boundary_map);
     if (!is_supported_register_type(pt)) { return false; }
     for (auto const& v : inl.values) {
-      if (!v || !is_node_supported(*v, input)) { return false; }
-      auto const vt = effective_node_cudf_type(*v, input);
+      if (!v || !is_node_supported(*v, input, boundary_map)) { return false; }
+      auto const vt = effective_node_cudf_type(*v, input, boundary_map);
       if (!is_supported_register_type(vt)) { return false; }
       if (pt.id() == cudf::type_id::STRING || vt.id() == cudf::type_id::STRING) {
         if (pt.id() != cudf::type_id::STRING || vt.id() != cudf::type_id::STRING) { return false; }
@@ -370,11 +406,11 @@ namespace {
 
   if (expr.holds<sirius::ast::cast>()) {
     auto const& cst = expr.get<sirius::ast::cast>();
-    if (!cst.child || !is_node_supported(*cst.child, input)) { return false; }
+    if (!cst.child || !is_node_supported(*cst.child, input, boundary_map)) { return false; }
     auto const opt_dst = sirius::get_cudf_type(cst.target_type);
     if (!opt_dst || !is_supported_fixed_width(*opt_dst)) { return false; }
     auto const dst_type = *opt_dst;
-    auto const src_type = effective_node_cudf_type(*cst.child, input);
+    auto const src_type = effective_node_cudf_type(*cst.child, input, boundary_map);
     if (!is_supported_fixed_width(src_type)) { return false; }
     if (cst.kind == sirius::ast::cast_kind::carrier_restore) {
       return src_type == dst_type || can_restore_to(src_type, dst_type);
@@ -384,16 +420,16 @@ namespace {
 
   if (expr.holds<sirius::ast::unary_op>()) {
     auto const& uo = expr.get<sirius::ast::unary_op>();
-    if (!uo.child || !is_node_supported(*uo.child, input)) { return false; }
+    if (!uo.child || !is_node_supported(*uo.child, input, boundary_map)) { return false; }
     switch (uo.op) {
       case sirius::ast::unary_op::kind::op_not: {
-        auto const ct = effective_node_cudf_type(*uo.child, input);
+        auto const ct = effective_node_cudf_type(*uo.child, input, boundary_map);
         return ct.id() == cudf::type_id::BOOL8;
       }
       case sirius::ast::unary_op::kind::op_is_null:
       case sirius::ast::unary_op::kind::op_is_not_null: return true;
       case sirius::ast::unary_op::kind::op_try: {
-        auto const rt = effective_node_cudf_type(*uo.child, input);
+        auto const rt = effective_node_cudf_type(*uo.child, input, boundary_map);
         return is_supported_register_type(rt);
       }
       default: return false;
@@ -414,8 +450,8 @@ namespace {
       if (!std::holds_alternative<std::string>(freq_cst.payload)) { return false; }
       auto const unit = sirius::parse_gpu_date_trunc_unit(std::get<std::string>(freq_cst.payload));
       if (!unit) { return false; }
-      if (!args[1] || !is_node_supported(*args[1], input)) { return false; }
-      auto const ct = effective_node_cudf_type(*args[1], input);
+      if (!args[1] || !is_node_supported(*args[1], input, boundary_map)) { return false; }
+      auto const ct = effective_node_cudf_type(*args[1], input, boundary_map);
       return cudf::is_timestamp(ct) && cudf::is_timestamp(ret_type);
     }
 
@@ -423,8 +459,10 @@ namespace {
       if ((args.size() != 2 && args.size() != 3) || ret_type.id() != cudf::type_id::STRING) {
         return false;
       }
-      if (!args[0] || !is_node_supported(*args[0], input)) { return false; }
-      if (effective_node_cudf_type(*args[0], input).id() != cudf::type_id::STRING) { return false; }
+      if (!args[0] || !is_node_supported(*args[0], input, boundary_map)) { return false; }
+      if (effective_node_cudf_type(*args[0], input, boundary_map).id() != cudf::type_id::STRING) {
+        return false;
+      }
       auto const opt_offset = args[1] ? extract_constant_int64(*args[1]) : std::nullopt;
       if (!opt_offset) { return false; }
       std::int64_t length = sirius::substring_default_length;
@@ -437,7 +475,7 @@ namespace {
     }
 
     for (auto const& arg : args) {
-      if (!arg || !is_node_supported(*arg, input)) { return false; }
+      if (!arg || !is_node_supported(*arg, input, boundary_map)) { return false; }
     }
 
     switch (fc.function()) {
@@ -448,8 +486,8 @@ namespace {
       case sirius::function_id::int_div:
       case sirius::function_id::mod: {
         if (args.size() != 2) { return false; }
-        auto const lt = effective_node_cudf_type(*args[0], input);
-        auto const rt = effective_node_cudf_type(*args[1], input);
+        auto const lt = effective_node_cudf_type(*args[0], input, boundary_map);
+        auto const rt = effective_node_cudf_type(*args[1], input, boundary_map);
         if (cudf::is_fixed_point(ret_type)) {
           return cudf::is_fixed_point(lt) && cudf::is_fixed_point(rt);
         }
@@ -457,13 +495,13 @@ namespace {
       }
       case sirius::function_id::abs: {
         if (args.size() != 1) { return false; }
-        auto const ct = effective_node_cudf_type(*args[0], input);
+        auto const ct = effective_node_cudf_type(*args[0], input, boundary_map);
         if (cudf::is_fixed_point(ret_type)) { return cudf::is_fixed_point(ct) && ct == ret_type; }
         return is_integer_or_float(ret_type) && ct == ret_type;
       }
       case sirius::function_id::round: {
         if (args.size() != 1 && args.size() != 2) { return false; }
-        auto const ct = effective_node_cudf_type(*args[0], input);
+        auto const ct = effective_node_cudf_type(*args[0], input, boundary_map);
         if ((ct.id() != cudf::type_id::FLOAT32 && ct.id() != cudf::type_id::FLOAT64) ||
             ret_type != ct) {
           return false;
@@ -477,7 +515,7 @@ namespace {
       }
       case sirius::function_id::constant_or_null: {
         if (args.size() < 2 || !is_supported_register_type(ret_type)) { return false; }
-        auto const v0_t = effective_node_cudf_type(*args[0], input);
+        auto const v0_t = effective_node_cudf_type(*args[0], input, boundary_map);
         if (ret_type.id() == cudf::type_id::STRING || v0_t.id() == cudf::type_id::STRING) {
           return ret_type.id() == cudf::type_id::STRING && v0_t.id() == cudf::type_id::STRING;
         }
@@ -492,13 +530,13 @@ namespace {
       case sirius::function_id::millisecond:
       case sirius::function_id::microsecond: {
         if (args.size() != 1) { return false; }
-        auto const ct = effective_node_cudf_type(*args[0], input);
+        auto const ct = effective_node_cudf_type(*args[0], input, boundary_map);
         return cudf::is_timestamp(ct) && cudf::is_integral(ret_type);
       }
       case sirius::function_id::strlen:
       case sirius::function_id::length: {
         if (args.size() != 1) { return false; }
-        auto const ct = effective_node_cudf_type(*args[0], input);
+        auto const ct = effective_node_cudf_type(*args[0], input, boundary_map);
         return ct.id() == cudf::type_id::STRING && cudf::is_integral(ret_type);
       }
       case sirius::function_id::prefix:
@@ -507,8 +545,8 @@ namespace {
       case sirius::function_id::like:
       case sirius::function_id::not_like: {
         if (args.size() != 2 || ret_type.id() != cudf::type_id::BOOL8) { return false; }
-        auto const lt = effective_node_cudf_type(*args[0], input);
-        auto const rt = effective_node_cudf_type(*args[1], input);
+        auto const lt = effective_node_cudf_type(*args[0], input, boundary_map);
+        auto const rt = effective_node_cudf_type(*args[1], input, boundary_map);
         return lt.id() == cudf::type_id::STRING && rt.id() == cudf::type_id::STRING;
       }
       default: return false;
@@ -516,6 +554,104 @@ namespace {
   }
 
   return false;
+}
+
+[[nodiscard]] bool is_in_tree_materialization_boundary(sirius::ast::node const& expr,
+                                                       cudf::table_view const& input) noexcept
+{
+  if (expr.holds<sirius::ast::reference>() || expr.holds<sirius::ast::constant>() ||
+      expr.holds<sirius::ast::aggregate>()) {
+    return false;
+  }
+  if (expr.holds<sirius::ast::function_call>()) {
+    auto const fid = expr.get<sirius::ast::function_call>().function();
+    return fid == sirius::function_id::concat || fid == sirius::function_id::concat_operator ||
+           fid == sirius::function_id::upper || fid == sirius::function_id::lower ||
+           fid == sirius::function_id::regexp_replace;
+  }
+  if (expr.holds<sirius::ast::cast>()) {
+    auto const& cst    = expr.get<sirius::ast::cast>();
+    auto const opt_dst = sirius::get_cudf_type(cst.target_type);
+    if (!opt_dst || !is_supported_register_type(*opt_dst)) { return false; }
+    if (!cst.child) { return false; }
+    auto const src_type = effective_node_cudf_type(*cst.child, input, nullptr);
+    if (cst.kind == sirius::ast::cast_kind::carrier_restore) {
+      return !(src_type == *opt_dst || can_restore_to(src_type, *opt_dst));
+    }
+    return !is_semantic_cast_supported(src_type, *opt_dst);
+  }
+  return false;
+}
+
+void collect_boundaries_from_node(sirius::ast::node const& expr,
+                                  cudf::table_view const& input,
+                                  std::vector<sirius::ast::node const*>& out_boundaries)
+{
+  if (is_in_tree_materialization_boundary(expr, input)) {
+    if (std::find(out_boundaries.begin(), out_boundaries.end(), &expr) == out_boundaries.end()) {
+      out_boundaries.push_back(&expr);
+    }
+    return;
+  }
+
+  if (expr.holds<sirius::ast::comparison>()) {
+    auto const& cmp = expr.get<sirius::ast::comparison>();
+    if (cmp.left) { collect_boundaries_from_node(*cmp.left, input, out_boundaries); }
+    if (cmp.right) { collect_boundaries_from_node(*cmp.right, input, out_boundaries); }
+    return;
+  }
+  if (expr.holds<sirius::ast::between>()) {
+    auto const& btw = expr.get<sirius::ast::between>();
+    if (btw.input) { collect_boundaries_from_node(*btw.input, input, out_boundaries); }
+    if (btw.lower) { collect_boundaries_from_node(*btw.lower, input, out_boundaries); }
+    if (btw.upper) { collect_boundaries_from_node(*btw.upper, input, out_boundaries); }
+    return;
+  }
+  if (expr.holds<sirius::ast::conjunction>()) {
+    for (auto const& ch : expr.get<sirius::ast::conjunction>().children) {
+      if (ch) { collect_boundaries_from_node(*ch, input, out_boundaries); }
+    }
+    return;
+  }
+  if (expr.holds<sirius::ast::case_expr>()) {
+    auto const& ce = expr.get<sirius::ast::case_expr>();
+    for (auto const& c : ce.cases) {
+      if (c.when_) { collect_boundaries_from_node(*c.when_, input, out_boundaries); }
+      if (c.then_) { collect_boundaries_from_node(*c.then_, input, out_boundaries); }
+    }
+    if (ce.else_) { collect_boundaries_from_node(*ce.else_, input, out_boundaries); }
+    return;
+  }
+  if (expr.holds<sirius::ast::coalesce>()) {
+    for (auto const& ch : expr.get<sirius::ast::coalesce>().children) {
+      if (ch) { collect_boundaries_from_node(*ch, input, out_boundaries); }
+    }
+    return;
+  }
+  if (expr.holds<sirius::ast::in_list>()) {
+    auto const& inl = expr.get<sirius::ast::in_list>();
+    if (inl.probe) { collect_boundaries_from_node(*inl.probe, input, out_boundaries); }
+    for (auto const& v : inl.values) {
+      if (v) { collect_boundaries_from_node(*v, input, out_boundaries); }
+    }
+    return;
+  }
+  if (expr.holds<sirius::ast::cast>()) {
+    auto const& cst = expr.get<sirius::ast::cast>();
+    if (cst.child) { collect_boundaries_from_node(*cst.child, input, out_boundaries); }
+    return;
+  }
+  if (expr.holds<sirius::ast::unary_op>()) {
+    auto const& uo = expr.get<sirius::ast::unary_op>();
+    if (uo.child) { collect_boundaries_from_node(*uo.child, input, out_boundaries); }
+    return;
+  }
+  if (expr.holds<sirius::ast::function_call>()) {
+    for (auto const& arg : expr.get<sirius::ast::function_call>().arguments()) {
+      if (arg) { collect_boundaries_from_node(*arg, input, out_boundaries); }
+    }
+    return;
+  }
 }
 
 [[nodiscard]] cudf::data_type resolve_output_cudf_type(sirius::ast::node const& expr,
@@ -776,6 +912,16 @@ std::size_t translation_context::get_or_bind_input_column(std::uint32_t column_i
 
 void translation_context::mark_string_columns_for_bsm(sirius::ast::node const& expr)
 {
+  if (_boundary_map != nullptr) {
+    if (auto const it = _boundary_map->find(&expr); it != _boundary_map->end()) {
+      if (it->second < static_cast<std::uint32_t>(_input.num_columns()) &&
+          _input.column(it->second).type().id() == cudf::type_id::STRING) {
+        auto const bid                    = get_or_bind_input_column(it->second);
+        _input_columns[bid].use_bsm_cache = true;
+      }
+      return;
+    }
+  }
   if (expr.holds<sirius::ast::reference>()) {
     auto const& ref = expr.get<sirius::ast::reference>();
     if (ref.column_index < static_cast<std::uint32_t>(_input.num_columns()) &&
@@ -1866,6 +2012,12 @@ register_value translation_context::produce_function_call(sirius::ast::function_
 
 register_value translation_context::produce(sirius::ast::node const& expr)
 {
+  if (_boundary_map != nullptr) {
+    if (auto const it = _boundary_map->find(&expr); it != _boundary_map->end()) {
+      sirius::ast::reference syn_ref{it->second, expr.return_type()};
+      return produce_reference(syn_ref);
+    }
+  }
   if (expr.holds<sirius::ast::reference>()) {
     return produce_reference(expr.get<sirius::ast::reference>());
   }
@@ -1900,13 +2052,29 @@ register_value translation_context::produce(sirius::ast::node const& expr)
   throw not_implemented_exception("[nvrtc] Unsupported AST node in translation_context::produce");
 }
 
+void collect_materialization_boundaries(std::span<sirius::ast::node const* const> expressions,
+                                        cudf::table_view const& input,
+                                        std::vector<sirius::ast::node const*>& out_boundaries)
+{
+  for (auto const* expr : expressions) {
+    if (expr == nullptr) { continue; }
+    // Only descend into root expressions whose children we might compile around a boundary; do not
+    // treat a top-level Materialization Boundary itself as an in-tree synthetic input column.
+    if (is_in_tree_materialization_boundary(*expr, input)) { continue; }
+    collect_boundaries_from_node(*expr, input, out_boundaries);
+  }
+}
+
 bool can_compile_project_sink(std::span<sirius::ast::node const* const> expressions,
-                              cudf::table_view const& input) noexcept
+                              cudf::table_view const& input,
+                              boundary_column_map const* boundary_map) noexcept
 {
   if (expressions.empty()) { return false; }
   for (auto const* expr : expressions) {
-    if (expr == nullptr || !is_node_supported(*expr, input)) { return false; }
-    if (!is_supported_fixed_width(effective_node_cudf_type(*expr, input))) { return false; }
+    if (expr == nullptr || !is_node_supported(*expr, input, boundary_map)) { return false; }
+    if (!is_supported_fixed_width(effective_node_cudf_type(*expr, input, boundary_map))) {
+      return false;
+    }
   }
   return true;
 }
@@ -1916,12 +2084,13 @@ std::unique_ptr<cudf::table> evaluate_project_sink(
   cudf::table_view const& input,
   ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr,
-  std::size_t* narrow_domain_comparison_count)
+  std::size_t* narrow_domain_comparison_count,
+  boundary_column_map const* boundary_map)
 {
   auto const num_rows = input.num_rows();
   if (num_rows == 0) {
     if (narrow_domain_comparison_count != nullptr) {
-      translation_context count_ctx(input);
+      translation_context count_ctx(input, boundary_map);
       for (auto const* expr : expressions) {
         (void)count_ctx.produce(*expr);
       }
@@ -1936,7 +2105,7 @@ std::unique_ptr<cudf::table> evaluate_project_sink(
     return std::make_unique<cudf::table>(std::move(empty_cols));
   }
 
-  translation_context ctx(input);
+  translation_context ctx(input, boundary_map);
   std::vector<register_value> out_regs;
   out_regs.reserve(expressions.size());
   for (auto const* expr : expressions) {

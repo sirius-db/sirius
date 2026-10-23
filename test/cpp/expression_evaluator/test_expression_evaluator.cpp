@@ -6516,3 +6516,522 @@ TEST_CASE(
     check_tables_match(jit_out2->view(), mat_out2->view());
   }
 }
+
+// ============================================================================
+// Ticket #11: Materialization Boundaries ('C++ cogwheels') for allocating
+// string and struct sub-trees
+// ============================================================================
+
+TEST_CASE(
+  "nvrtc_jit - Materialization Boundaries ('C++ cogwheels') for string and struct sub-trees match "
+  "MATERIALIZE",
+  "[expression_evaluator][nvrtc_jit][ticket11]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = get_resource_ref(*space);
+
+  auto const varchar_t = logical_type::make(type_id::VARCHAR);
+  auto const bigint_t  = logical_type::make(type_id::BIGINT);
+  auto const int_t     = logical_type::make(type_id::INTEGER);
+  auto const bool_t    = logical_type::make(type_id::BOOLEAN);
+  auto const struct_t  = logical_type::make(type_id::STRUCT);
+
+  auto make_str_col = [&](std::vector<std::string> const& rows,
+                          std::vector<bool> const& valids = {},
+                          bool int64_offsets              = false) {
+    auto const n = static_cast<cudf::size_type>(rows.size());
+    std::string chars;
+    std::vector<std::int64_t> offsets(rows.size() + 1, 0);
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+      if (valids.empty() || valids[i]) { chars += rows[i]; }
+      offsets[i + 1] = static_cast<std::int64_t>(chars.size());
+    }
+
+    rmm::device_buffer chars_buf(chars.data(), chars.size(), stream, mr);
+    std::unique_ptr<cudf::column> offsets_col;
+    if (int64_offsets) {
+      offsets_col = cudf::make_numeric_column(
+        cudf::data_type{cudf::type_id::INT64}, n + 1, cudf::mask_state::UNALLOCATED, stream, mr);
+      REQUIRE(cudaMemcpy(offsets_col->mutable_view().data<std::int64_t>(),
+                         offsets.data(),
+                         offsets.size() * sizeof(std::int64_t),
+                         cudaMemcpyHostToDevice) == cudaSuccess);
+    } else {
+      std::vector<std::int32_t> offsets32(offsets.begin(), offsets.end());
+      offsets_col = cudf::make_numeric_column(
+        cudf::data_type{cudf::type_id::INT32}, n + 1, cudf::mask_state::UNALLOCATED, stream, mr);
+      REQUIRE(cudaMemcpy(offsets_col->mutable_view().data<std::int32_t>(),
+                         offsets32.data(),
+                         offsets32.size() * sizeof(std::int32_t),
+                         cudaMemcpyHostToDevice) == cudaSuccess);
+    }
+
+    auto mask_buf = cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr);
+    cudf::size_type null_count = 0;
+    if (!valids.empty()) {
+      mask_buf   = cudf::create_null_mask(n, cudf::mask_state::ALL_VALID, stream, mr);
+      auto* mptr = static_cast<cudf::bitmask_type*>(mask_buf.data());
+      for (cudf::size_type i = 0; i < n; ++i) {
+        if (!valids[i]) {
+          cudf::set_null_mask(mptr, i, i + 1, false, stream);
+          ++null_count;
+        }
+      }
+    }
+    return cudf::make_strings_column(
+      n, std::move(offsets_col), std::move(chars_buf), null_count, std::move(mask_buf));
+  };
+
+  auto check_column_match =
+    [&](auto const& self, cudf::column_view jcol, cudf::column_view mcol) -> void {
+    REQUIRE(jcol.type() == mcol.type());
+    REQUIRE(jcol.size() == mcol.size());
+    CHECK(jcol.null_count() == mcol.null_count());
+    auto const n_rows  = jcol.size();
+    auto const jvalids = copy_valids_to_host(jcol);
+    auto const mvalids = copy_valids_to_host(mcol);
+    REQUIRE(jvalids == mvalids);
+
+    if (jcol.type().id() == cudf::type_id::STRING) {
+      auto const jstrs = copy_string_column_to_host(jcol);
+      auto const mstrs = copy_string_column_to_host(mcol);
+      for (cudf::size_type r = 0; r < n_rows; ++r) {
+        if (jvalids[r]) {
+          CAPTURE(r);
+          CHECK(jstrs[r] == mstrs[r]);
+        }
+      }
+      return;
+    }
+
+    if (jcol.type().id() == cudf::type_id::STRUCT) {
+      REQUIRE(jcol.num_children() == mcol.num_children());
+      for (cudf::size_type ch = 0; ch < jcol.num_children(); ++ch) {
+        CAPTURE(ch);
+        self(self, jcol.child(ch), mcol.child(ch));
+      }
+      return;
+    }
+
+    auto const elem_size = cudf::size_of(jcol.type());
+    std::vector<std::uint8_t> jbytes(n_rows * elem_size);
+    std::vector<std::uint8_t> mbytes(n_rows * elem_size);
+    if (n_rows > 0) {
+      REQUIRE(cudaMemcpy(jbytes.data(),
+                         jcol.head<std::uint8_t>() + jcol.offset() * elem_size,
+                         jbytes.size(),
+                         cudaMemcpyDeviceToHost) == cudaSuccess);
+      REQUIRE(cudaMemcpy(mbytes.data(),
+                         mcol.head<std::uint8_t>() + mcol.offset() * elem_size,
+                         mbytes.size(),
+                         cudaMemcpyDeviceToHost) == cudaSuccess);
+    }
+    for (cudf::size_type r = 0; r < n_rows; ++r) {
+      if (jvalids[r]) {
+        CAPTURE(r);
+        CHECK(std::memcmp(
+                jbytes.data() + r * elem_size, mbytes.data() + r * elem_size, elem_size) == 0);
+      }
+    }
+  };
+
+  auto check_tables_match = [&](cudf::table_view jit_tv, cudf::table_view mat_tv) {
+    REQUIRE(jit_tv.num_columns() == mat_tv.num_columns());
+    REQUIRE(jit_tv.num_rows() == mat_tv.num_rows());
+    for (cudf::size_type c = 0; c < jit_tv.num_columns(); ++c) {
+      CAPTURE(c);
+      check_column_match(check_column_match, jit_tv.column(c), mat_tv.column(c));
+    }
+  };
+
+  SECTION(
+    "in-tree Materialization Boundaries (concat, ||, upper, lower, regexp_replace) fused with "
+    "surrounding arithmetic, comparisons, CASE, COALESCE, strlen, and LIKE / CONTAINS")
+  {
+    std::vector<std::string> rows_s1 = {
+      "http://www.sirius.db/path/to/q1",
+      "https://nvidia.com/cudf/docs",
+      "Special Requests: Handle With Care",
+      "EXPRESS PACKAGES PENDING",
+      "hello_world",
+      "test_null_row",
+      "foo_bar_baz",
+      "",
+    };
+    std::vector<bool> valids_s1 = {true, true, true, true, true, false, true, true};
+
+    std::vector<std::string> rows_s2 = {
+      "_v1",
+      "_v2",
+      "_urgent",
+      "_fast",
+      "_suffix",
+      "_kept_by_concat",
+      "",
+      "_nonempty",
+    };
+    std::vector<bool> valids_s2 = {true, false, true, true, true, true, true, true};
+
+    auto col_s1 = make_str_col(rows_s1, valids_s1);
+    auto col_s2 = make_str_col(rows_s2, valids_s2);
+
+    // Narrowed INT16 column representing a BIGINT column (verifies in-register Carrier Restoration
+    // still occurs inside the fused NVRTC kernel even when Materialization Boundaries are present!)
+    std::vector<std::int16_t> narrow_vals = {10, 20, 30, 40, 50, 60, 70, 80};
+    auto col_narrow                       = cudf::make_numeric_column(
+      cudf::data_type{cudf::type_id::INT16}, 8, cudf::mask_state::UNALLOCATED, stream, mr);
+    REQUIRE(cudaMemcpy(col_narrow->mutable_view().data<std::int16_t>(),
+                       narrow_vals.data(),
+                       8 * sizeof(std::int16_t),
+                       cudaMemcpyHostToDevice) == cudaSuccess);
+
+    cudf::table_view tv{{col_s1->view(), col_s2->view(), col_narrow->view()}};
+
+    duckdb::vector<std::unique_ptr<ast_node>> exprs;
+
+    // 1. LIKE(upper(s1), '%SPECIAL%REQUESTS%') AND (narrow_col + 5 > 20)
+    {
+      std::vector<std::unique_ptr<ast_node>> up_args;
+      up_args.push_back(make_ref_typed(0, varchar_t));
+      auto up_node = make_func(sirius::function_id::upper, std::move(up_args), varchar_t);
+
+      std::vector<std::unique_ptr<ast_node>> like_args;
+      like_args.push_back(std::move(up_node));
+      like_args.push_back(make_str_const("%SPECIAL%REQUESTS%"));
+      auto like_node = make_func(sirius::function_id::like, std::move(like_args), bool_t);
+
+      std::vector<std::unique_ptr<ast_node>> add_args;
+      add_args.push_back(make_ref_typed(2, bigint_t));
+      add_args.push_back(make_bigint_const(5));
+      auto add_node = make_func(sirius::function_id::add, std::move(add_args), bigint_t);
+      auto cmp_node =
+        make_cmp(sirius::comparison_type::gt, std::move(add_node), make_bigint_const(20));
+
+      std::vector<std::unique_ptr<ast_node>> conj_args;
+      conj_args.push_back(std::move(like_node));
+      conj_args.push_back(std::move(cmp_node));
+      exprs.push_back(make_conj(sirius::ast::conjunction::kind::op_and, std::move(conj_args)));
+    }
+
+    // 2. CONTAINS(lower(s1), 'express packages') OR (narrow_col == 10)
+    {
+      std::vector<std::unique_ptr<ast_node>> lo_args;
+      lo_args.push_back(make_ref_typed(0, varchar_t));
+      auto lo_node = make_func(sirius::function_id::lower, std::move(lo_args), varchar_t);
+
+      std::vector<std::unique_ptr<ast_node>> cont_args;
+      cont_args.push_back(std::move(lo_node));
+      cont_args.push_back(make_str_const("express packages"));
+      auto cont_node = make_func(sirius::function_id::contains, std::move(cont_args), bool_t);
+
+      auto cmp_node = make_cmp(
+        sirius::comparison_type::equal, make_ref_typed(2, bigint_t), make_bigint_const(10));
+
+      std::vector<std::unique_ptr<ast_node>> conj_args;
+      conj_args.push_back(std::move(cont_node));
+      conj_args.push_back(std::move(cmp_node));
+      exprs.push_back(make_conj(sirius::ast::conjunction::kind::op_or, std::move(conj_args)));
+    }
+
+    // 3. strlen(concat(s1, s2, '_end')) * 2 + narrow_col
+    {
+      std::vector<std::unique_ptr<ast_node>> cat_args;
+      cat_args.push_back(make_ref_typed(0, varchar_t));
+      cat_args.push_back(make_ref_typed(1, varchar_t));
+      cat_args.push_back(make_str_const("_end"));
+      auto cat_node = make_func(sirius::function_id::concat, std::move(cat_args), varchar_t);
+
+      std::vector<std::unique_ptr<ast_node>> len_args;
+      len_args.push_back(std::move(cat_node));
+      auto len_node = make_func(sirius::function_id::strlen, std::move(len_args), bigint_t);
+
+      std::vector<std::unique_ptr<ast_node>> mul_args;
+      mul_args.push_back(std::move(len_node));
+      mul_args.push_back(make_bigint_const(2));
+      auto mul_node = make_func(sirius::function_id::mul, std::move(mul_args), bigint_t);
+
+      std::vector<std::unique_ptr<ast_node>> add_args;
+      add_args.push_back(std::move(mul_node));
+      add_args.push_back(make_ref_typed(2, bigint_t));
+      exprs.push_back(make_func(sirius::function_id::add, std::move(add_args), bigint_t));
+    }
+
+    // 4. COALESCE(strlen(s1 || s2), -1) + narrow_col (tests || NULL propagation inside COALESCE)
+    {
+      std::vector<std::unique_ptr<ast_node>> cat_op_args;
+      cat_op_args.push_back(make_ref_typed(0, varchar_t));
+      cat_op_args.push_back(make_ref_typed(1, varchar_t));
+      auto cat_op_node =
+        make_func(sirius::function_id::concat_operator, std::move(cat_op_args), varchar_t);
+
+      std::vector<std::unique_ptr<ast_node>> len_args;
+      len_args.push_back(std::move(cat_op_node));
+      auto len_node = make_func(sirius::function_id::strlen, std::move(len_args), int_t);
+
+      std::vector<std::unique_ptr<ast_node>> coal_args;
+      coal_args.push_back(std::move(len_node));
+      coal_args.push_back(make_int_const(-1));
+      auto coal_node = make_coalesce(std::move(coal_args), int_t);
+
+      std::vector<std::unique_ptr<ast_node>> add_args;
+      add_args.push_back(std::move(coal_node));
+      add_args.push_back(make_ref_typed(2, bigint_t));
+      exprs.push_back(make_func(sirius::function_id::add, std::move(add_args), bigint_t));
+    }
+
+    // 5. regexp_replace(s1, '^https?://(?:www\.)?([^/]+)/.*$', '\1') = 'sirius.db'
+    {
+      std::vector<std::unique_ptr<ast_node>> re_args;
+      re_args.push_back(make_ref_typed(0, varchar_t));
+      re_args.push_back(make_str_const(R"(^https?://(?:www\.)?([^/]+)/.*$)"));
+      re_args.push_back(make_str_const(R"(\1)"));
+      auto re_node = make_func(sirius::function_id::regexp_replace, std::move(re_args), varchar_t);
+
+      exprs.push_back(
+        make_cmp(sirius::comparison_type::equal, std::move(re_node), make_str_const("sirius.db")));
+    }
+
+    // 6. CASE WHEN regexp_replace(s1, '_.*', '') = 'foo' THEN narrow_col * 3 ELSE narrow_col END
+    {
+      std::vector<std::unique_ptr<ast_node>> re_args;
+      re_args.push_back(make_ref_typed(0, varchar_t));
+      re_args.push_back(make_str_const("_.*"));
+      re_args.push_back(make_str_const(""));
+      auto re_node = make_func(sirius::function_id::regexp_replace, std::move(re_args), varchar_t);
+
+      auto cond =
+        make_cmp(sirius::comparison_type::equal, std::move(re_node), make_str_const("foo"));
+
+      std::vector<std::unique_ptr<ast_node>> mul_args;
+      mul_args.push_back(make_ref_typed(2, bigint_t));
+      mul_args.push_back(make_bigint_const(3));
+      auto then_node = make_func(sirius::function_id::mul, std::move(mul_args), bigint_t);
+
+      std::vector<sirius::ast::case_expr::when_then> cases;
+      cases.push_back({std::move(cond), std::move(then_node)});
+      exprs.push_back(std::make_unique<ast_node>(
+        sirius::ast::case_expr{std::move(cases), make_ref_typed(2, bigint_t), bigint_t}));
+    }
+
+    exp_executor mat_exec(
+      exprs, mr, stream, sirius::expression_query_policy{exp_strategy_enum::MATERIALIZE});
+    exp_executor jit_exec(
+      exprs, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+
+    auto mat_out = mat_exec.evaluate(tv);
+    auto jit_out = jit_exec.evaluate(tv);
+    REQUIRE(mat_out != nullptr);
+    REQUIRE(jit_out != nullptr);
+    // Proves the outer fixed-width expressions ran in the fused NVRTC kernel with in-register
+    // Carrier Restoration (not falling back to full-column cast_through_rep):
+    CHECK(jit_exec.restored_reference_cast_count_for_testing() == 0);
+    check_tables_match(jit_out->view(), mat_out->view());
+  }
+
+  SECTION(
+    "top-level VARCHAR-producing expressions (substring, concat, ||, upper, lower, "
+    "regexp_replace, CASE/COALESCE) and row/struct_pack alongside fixed-width expressions match "
+    "MATERIALIZE")
+  {
+    std::vector<std::string> rows_s1 = {
+      "alpha_123_beta",
+      "GAMMA_456_DELTA",
+      "epsilon_789",
+      "null_s1",
+      "short",
+      "http://example.com/page",
+    };
+    std::vector<bool> valids_s1 = {true, true, true, false, true, true};
+
+    std::vector<std::string> rows_s2 = {
+      "_tailA",
+      "_tailB",
+      "_tailC",
+      "_fallback",
+      "_tailE",
+      "_tailF",
+    };
+    std::vector<bool> valids_s2 = {true, false, true, true, true, false};
+
+    auto col_s1 = make_str_col(rows_s1, valids_s1);
+    auto col_s2 = make_str_col(rows_s2, valids_s2);
+
+    // Narrowed INT16 column representing a BIGINT column
+    std::vector<std::int16_t> narrow_a = {5, 15, 25, 35, 45, 55};
+    std::vector<std::int16_t> narrow_b = {2, 3, 4, 5, 6, 7};
+    auto col_na                        = cudf::make_numeric_column(
+      cudf::data_type{cudf::type_id::INT16}, 6, cudf::mask_state::UNALLOCATED, stream, mr);
+    auto col_nb = cudf::make_numeric_column(
+      cudf::data_type{cudf::type_id::INT16}, 6, cudf::mask_state::UNALLOCATED, stream, mr);
+    REQUIRE(cudaMemcpy(col_na->mutable_view().data<std::int16_t>(),
+                       narrow_a.data(),
+                       6 * sizeof(std::int16_t),
+                       cudaMemcpyHostToDevice) == cudaSuccess);
+    REQUIRE(cudaMemcpy(col_nb->mutable_view().data<std::int16_t>(),
+                       narrow_b.data(),
+                       6 * sizeof(std::int16_t),
+                       cudaMemcpyHostToDevice) == cudaSuccess);
+
+    cudf::table_view tv{{col_s1->view(), col_s2->view(), col_na->view(), col_nb->view()}};
+
+    duckdb::vector<std::unique_ptr<ast_node>> exprs;
+
+    // 0. Fixed-width compilable: (na + nb) * 10
+    {
+      std::vector<std::unique_ptr<ast_node>> add_args;
+      add_args.push_back(make_ref_typed(2, bigint_t));
+      add_args.push_back(make_ref_typed(3, bigint_t));
+      auto sum_node = make_func(sirius::function_id::add, std::move(add_args), bigint_t);
+
+      std::vector<std::unique_ptr<ast_node>> mul_args;
+      mul_args.push_back(std::move(sum_node));
+      mul_args.push_back(make_bigint_const(10));
+      exprs.push_back(make_func(sirius::function_id::mul, std::move(mul_args), bigint_t));
+    }
+
+    // 1. Top-level substring(s1, 1, 5) -> VARCHAR
+    {
+      std::vector<std::unique_ptr<ast_node>> sub_args;
+      sub_args.push_back(make_ref_typed(0, varchar_t));
+      sub_args.push_back(make_bigint_const(1));
+      sub_args.push_back(make_bigint_const(5));
+      exprs.push_back(make_func(sirius::function_id::substring, std::move(sub_args), varchar_t));
+    }
+
+    // 2. Top-level concat(upper(s1), s2, '!') -> VARCHAR
+    {
+      std::vector<std::unique_ptr<ast_node>> up_args;
+      up_args.push_back(make_ref_typed(0, varchar_t));
+      auto up_node = make_func(sirius::function_id::upper, std::move(up_args), varchar_t);
+
+      std::vector<std::unique_ptr<ast_node>> cat_args;
+      cat_args.push_back(std::move(up_node));
+      cat_args.push_back(make_ref_typed(1, varchar_t));
+      cat_args.push_back(make_str_const("!"));
+      exprs.push_back(make_func(sirius::function_id::concat, std::move(cat_args), varchar_t));
+    }
+
+    // 3. Top-level lower(s1) || s2 -> VARCHAR
+    {
+      std::vector<std::unique_ptr<ast_node>> lo_args;
+      lo_args.push_back(make_ref_typed(0, varchar_t));
+      auto lo_node = make_func(sirius::function_id::lower, std::move(lo_args), varchar_t);
+
+      std::vector<std::unique_ptr<ast_node>> op_args;
+      op_args.push_back(std::move(lo_node));
+      op_args.push_back(make_ref_typed(1, varchar_t));
+      exprs.push_back(
+        make_func(sirius::function_id::concat_operator, std::move(op_args), varchar_t));
+    }
+
+    // 4. Top-level regexp_replace(s1, '[0-9]+', 'NUM') -> VARCHAR
+    {
+      std::vector<std::unique_ptr<ast_node>> re_args;
+      re_args.push_back(make_ref_typed(0, varchar_t));
+      re_args.push_back(make_str_const("[0-9]+"));
+      re_args.push_back(make_str_const("NUM"));
+      exprs.push_back(
+        make_func(sirius::function_id::regexp_replace, std::move(re_args), varchar_t));
+    }
+
+    // 5. Top-level CASE WHEN (na * nb > 50) THEN upper(s1) ELSE COALESCE(s2, 'NONE') END -> VARCHAR
+    {
+      std::vector<std::unique_ptr<ast_node>> mul_args;
+      mul_args.push_back(make_ref_typed(2, bigint_t));
+      mul_args.push_back(make_ref_typed(3, bigint_t));
+      auto prod_node = make_func(sirius::function_id::mul, std::move(mul_args), bigint_t);
+      auto when_cond =
+        make_cmp(sirius::comparison_type::gt, std::move(prod_node), make_bigint_const(50));
+
+      std::vector<std::unique_ptr<ast_node>> up_args;
+      up_args.push_back(make_ref_typed(0, varchar_t));
+      auto then_node = make_func(sirius::function_id::upper, std::move(up_args), varchar_t);
+
+      std::vector<std::unique_ptr<ast_node>> coal_args;
+      coal_args.push_back(make_ref_typed(1, varchar_t));
+      coal_args.push_back(make_str_const("NONE"));
+      auto else_node = make_coalesce(std::move(coal_args), varchar_t);
+
+      std::vector<sirius::ast::case_expr::when_then> cases;
+      cases.push_back({std::move(when_cond), std::move(then_node)});
+      exprs.push_back(std::make_unique<ast_node>(
+        sirius::ast::case_expr{std::move(cases), std::move(else_node), varchar_t}));
+    }
+
+    // 6. Top-level struct_pack(na + nb, na * 2, upper(s1)) -> STRUCT
+    {
+      std::vector<std::unique_ptr<ast_node>> add_args;
+      add_args.push_back(make_ref_typed(2, bigint_t));
+      add_args.push_back(make_ref_typed(3, bigint_t));
+      auto f0 = make_func(sirius::function_id::add, std::move(add_args), bigint_t);
+
+      std::vector<std::unique_ptr<ast_node>> mul_args;
+      mul_args.push_back(make_ref_typed(2, bigint_t));
+      mul_args.push_back(make_bigint_const(2));
+      auto f1 = make_func(sirius::function_id::mul, std::move(mul_args), bigint_t);
+
+      std::vector<std::unique_ptr<ast_node>> up_args;
+      up_args.push_back(make_ref_typed(0, varchar_t));
+      auto f2 = make_func(sirius::function_id::upper, std::move(up_args), varchar_t);
+
+      std::vector<std::unique_ptr<ast_node>> sp_args;
+      sp_args.push_back(std::move(f0));
+      sp_args.push_back(std::move(f1));
+      sp_args.push_back(std::move(f2));
+      exprs.push_back(make_func(sirius::function_id::struct_pack, std::move(sp_args), struct_t));
+    }
+
+    // 7. Top-level row(na - nb, lower(s2)) -> STRUCT
+    {
+      std::vector<std::unique_ptr<ast_node>> sub_args;
+      sub_args.push_back(make_ref_typed(2, bigint_t));
+      sub_args.push_back(make_ref_typed(3, bigint_t));
+      auto r0 = make_func(sirius::function_id::sub, std::move(sub_args), bigint_t);
+
+      std::vector<std::unique_ptr<ast_node>> lo_args;
+      lo_args.push_back(make_ref_typed(1, varchar_t));
+      auto r1 = make_func(sirius::function_id::lower, std::move(lo_args), varchar_t);
+
+      std::vector<std::unique_ptr<ast_node>> row_args;
+      row_args.push_back(std::move(r0));
+      row_args.push_back(std::move(r1));
+      exprs.push_back(make_func(sirius::function_id::row, std::move(row_args), struct_t));
+    }
+
+    // 8. Second fixed-width compilable with in-tree boundary: strlen(upper(s1)) + na
+    {
+      std::vector<std::unique_ptr<ast_node>> up_args;
+      up_args.push_back(make_ref_typed(0, varchar_t));
+      auto up_node = make_func(sirius::function_id::upper, std::move(up_args), varchar_t);
+
+      std::vector<std::unique_ptr<ast_node>> len_args;
+      len_args.push_back(std::move(up_node));
+      auto len_node = make_func(sirius::function_id::strlen, std::move(len_args), bigint_t);
+
+      std::vector<std::unique_ptr<ast_node>> add_args;
+      add_args.push_back(std::move(len_node));
+      add_args.push_back(make_ref_typed(2, bigint_t));
+      exprs.push_back(make_func(sirius::function_id::add, std::move(add_args), bigint_t));
+    }
+
+    exp_executor mat_exec(
+      exprs, mr, stream, sirius::expression_query_policy{exp_strategy_enum::MATERIALIZE});
+    exp_executor jit_exec(
+      exprs, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+
+    // Run twice to also verify temporary columns are released cleanly between evaluations!
+    for (int iter = 0; iter < 2; ++iter) {
+      CAPTURE(iter);
+      auto mat_out = mat_exec.evaluate(tv);
+      auto jit_out = jit_exec.evaluate(tv);
+      REQUIRE(mat_out != nullptr);
+      REQUIRE(jit_out != nullptr);
+      // Both fixed-width root expressions AND the fixed-width child expressions of CASE /
+      // struct_pack / row evaluated via NVRTC_JIT with in-register Carrier Restoration:
+      CHECK(jit_exec.restored_reference_cast_count_for_testing() == 0);
+      check_tables_match(jit_out->view(), mat_out->view());
+    }
+  }
+}
