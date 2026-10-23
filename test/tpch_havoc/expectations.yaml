@@ -26,7 +26,7 @@ expectations:
               Q10_V09, Q11_V09, Q12_V09, Q13_V09, Q14_V09, Q15_V09, Q18_V09]
 
   - outcome: plan_rejected
-    reason: UNION ALL with fewer than two inputs not supported
+    reason: UNION with fewer than two inputs is not supported
     issue: 2286
     queries: [Q01_V04, Q02_V04, Q03_V04, Q15_V04, Q16_V04, Q17_V04, Q18_V04]
 
