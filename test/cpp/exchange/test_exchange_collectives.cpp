@@ -14,8 +14,9 @@
  * limitations under the License.
  */
 
-// Collectives over the exchange, every rank in one process on a loopback fabric: all-gather, and
-// SORT_SAMPLE computing the same range boundaries on every rank for a distributed sort.
+// Collectives over the exchange, every rank in one process on a loopback fabric: all-gather,
+// SORT_SAMPLE computing the same range boundaries on every rank for a distributed sort, and Bloom
+// filters accumulated from multi-partition builds merged across ranks.
 
 #include "catch.hpp"
 #include "exchange/all_gather.hpp"
@@ -23,6 +24,9 @@
 #include "exchange/exchange_test_utils.hpp"
 #include "exchange/loopback_fabric.hpp"
 #include "helper/type_conversions.hpp"
+#include "op/dynamic_filter/complete_build_inventory.hpp"
+#include "op/dynamic_filter/dynamic_filter_publisher.hpp"
+#include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/sirius_physical_exchange_sink.hpp"
 #include "op/sirius_physical_exchange_source.hpp"
 #include "op/sirius_physical_sort_sample.hpp"
@@ -146,7 +150,127 @@ std::unique_ptr<sirius_physical_sort_sample> make_sample()
                                                        /*max_partition_bytes=*/64 * KiB);
 }
 
+/// One rank's join publishing a Bloom on INT64 key column 0, merged with the other ranks' Blooms.
+struct accumulating_join {
+  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> channel =
+    std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  std::unique_ptr<sirius::op::dynamic_filter_publication_session> session;
+
+  accumulating_join(std::shared_ptr<exchange_service> service,
+                    std::size_t bloom_keys,
+                    std::uint64_t cap)
+  {
+    using plan_type = sirius::op::dynamic_filter_publish_plan;
+    cudf::data_type const int64{cudf::type_id::INT64};
+    plan_type plan{
+      {{.build_key_ordinal = 0, .storage_type = int64}},
+      {{channel, sirius::op::dynamic_filter_route_class::scan, false, {{0, 0, int64}}}},
+      {sirius::op::dynamic_filter_replica_space{*env().gpu, *env().host}},
+      {.enable_multi_partition = true, .max_bloom_bytes_per_gpu = cap}};
+    plan.set_distributed({.service      = std::move(service),
+                          .first_stream = 41,
+                          .gpu          = env().gpu,
+                          .bloom_keys   = bloom_keys,
+                          .timeout      = std::chrono::seconds{30}});
+    session =
+      std::make_unique<sirius::op::dynamic_filter_publication_session>(std::move(plan), nullptr);
+  }
+
+  /// Accumulates @p batch as the build's only batch; publishes unless @p close_first ends the
+  /// input before the batch is added.
+  void build(std::shared_ptr<cucascade::data_batch> const& batch, bool close_first = false)
+  {
+    sirius::op::build_arrival_ledger ledger;
+    ledger.record(*batch);
+    REQUIRE(session->try_begin_accumulation(ledger.certify({.repository_batches = 1})));
+    if (close_first) {
+      session->finalize_input();
+      return;
+    }
+    auto const stream = utils::default_stream();
+    session->contribute(batch->get_batch_id(), batch->to_read_only(), stream);
+    stream.sync();
+    session->publish_if_final(batch->get_batch_id(), *env().gpu, stream);
+  }
+
+  [[nodiscard]] sirius::op::sirius_dynamic_bloom_filter const* bloom() const
+  {
+    auto const snapshot = channel->snapshot();
+    if (snapshot.entries().empty()) { return nullptr; }
+    // The channel keeps the filter alive after the snapshot goes.
+    return dynamic_cast<sirius::op::sirius_dynamic_bloom_filter const*>(
+      snapshot.entries().front().filter.get());
+  }
+};
+
+/// How many of @p keys @p bloom may hold.
+std::size_t members(sirius::op::sirius_dynamic_bloom_filter const& bloom,
+                    std::vector<std::int64_t> const& keys)
+{
+  auto const stream = utils::default_stream();
+  auto const probe  = numeric_column(cudf::data_type{cudf::type_id::INT64}, keys);
+  auto const mask   = bloom.compute_mask(
+    probe->view(), env().gpu->get_device_id(), stream, env().gpu->get_default_allocator());
+  REQUIRE(mask != nullptr);
+  std::vector<std::uint8_t> kept(keys.size());
+  REQUIRE(
+    cudaMemcpyAsync(
+      kept.data(), mask->view().data<bool>(), kept.size(), cudaMemcpyDeviceToHost, stream.get()) ==
+    cudaSuccess);
+  stream.sync();
+  return static_cast<std::size_t>(std::count(kept.begin(), kept.end(), std::uint8_t{1}));
+}
+
+std::vector<std::int64_t> sequence(std::int64_t first, std::int64_t step, int count)
+{
+  std::vector<std::int64_t> keys(count);
+  for (int i = 0; i < count; ++i) {
+    keys[i] = first + step * i;
+  }
+  return keys;
+}
+
 }  // namespace
+
+TEST_CASE("ranks merge the Blooms they accumulate from multi-partition builds",
+          "[exchange][collectives][dynamic_filter]")
+{
+  // Planned for 2^30 keys; the 64 KiB cap cuts every rank's Bloom to the same 32Ki keys.
+  ranks c(2);
+  std::vector<std::unique_ptr<accumulating_join>> joins;
+  for (rank_t r = 0; r < 2; ++r) {
+    joins.push_back(
+      std::make_unique<accumulating_join>(c.all[r].service, std::size_t{1} << 30, 64 * KiB));
+  }
+  // Rank 0 holds the even keys, rank 1 the odd ones.
+  on_every_rank(2, [&](rank_t r) { joins[r]->build(keys_batch(r, 2, 2000)); });
+
+  for (rank_t r = 0; r < 2; ++r) {
+    auto const* bloom = joins[r]->bloom();
+    REQUIRE(bloom != nullptr);
+    CHECK(bloom->storage_bytes() == 64 * KiB);
+    CHECK(members(*bloom, sequence(0, 1, 4000)) == 4000);
+    // Keys no rank holds are mostly absent.
+    CHECK(members(*bloom, sequence(1'000'000, 1, 4000)) < 100);
+  }
+}
+
+TEST_CASE("a rank whose accumulation ends without a filter does not hold up the others",
+          "[exchange][collectives][dynamic_filter]")
+{
+  ranks c(2);
+  std::vector<std::unique_ptr<accumulating_join>> joins;
+  for (rank_t r = 0; r < 2; ++r) {
+    joins.push_back(std::make_unique<accumulating_join>(c.all[r].service, 4096, 64 * KiB));
+  }
+  auto const start = std::chrono::steady_clock::now();
+  // Rank 1's input closes before its batch is added: it publishes nothing, and so does rank 0,
+  // whose Bloom would miss rank 1's keys.
+  on_every_rank(2, [&](rank_t r) { joins[r]->build(keys_batch(r, 2, 2000), r == 1); });
+  CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds{10});
+  CHECK(joins[0]->bloom() == nullptr);
+  CHECK(joins[1]->bloom() == nullptr);
+}
 
 TEST_CASE("an aborted query wakes an all-gather waiting on its peer", "[exchange][collectives]")
 {
