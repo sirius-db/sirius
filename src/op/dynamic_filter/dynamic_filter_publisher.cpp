@@ -22,6 +22,7 @@
 #include "helper/numeric_narrowing.hpp"
 #include "log/logging.hpp"
 #include "memory/runtime_stream_pool.hpp"
+#include "op/dynamic_filter/bloom_sizing.hpp"
 #include "op/dynamic_filter/detail/accumulated_bloom_builder.hpp"
 #include "op/dynamic_filter/detail/accumulation_failure.hpp"
 #include "op/dynamic_filter/dynamic_filter_key_domain.hpp"
@@ -40,6 +41,7 @@
 #include <cudf/types.hpp>
 #include <cudf/utilities/error.hpp>
 
+#include <rmm/aligned.hpp>
 #include <rmm/cuda_device.hpp>
 #include <rmm/error.hpp>
 
@@ -199,7 +201,23 @@ fanout_counts fan_out(dynamic_filter_publish_plan const& plan,
   return counts;
 }
 
+void merge_across_ranks(dynamic_filter_publish_plan::distributed_merge const& d,
+                        std::vector<key_filters>& per_key,
+                        ::cuda::stream_ref stream);
 void merge_without_filters(dynamic_filter_publish_plan const& plan) noexcept;
+
+/**
+ * @brief Distributed: the keys an accumulated Bloom is sized for, the same on every rank so the
+ * ranks' filters merge. The planned size, cut so that every admitted key fits the per-GPU cap.
+ */
+std::size_t distributed_bloom_keys(dynamic_filter_publish_plan const& plan) noexcept
+{
+  auto constexpr alignment = rmm::CUDA_ALLOCATION_ALIGNMENT;
+  auto const per_key       = plan.max_bloom_bytes_per_gpu() / plan.admitted_keys().size();
+  auto const blocks        = per_key / alignment * alignment / bloom_bytes_per_block;
+  auto const fitting       = blocks * (bloom_bits_per_block / bloom_target_bits_per_key);
+  return std::min(plan.distributed()->bloom_keys, fitting);
+}
 
 }  // namespace
 
@@ -335,6 +353,7 @@ struct dynamic_filter_publication_session::state {
   void settle() noexcept
   {
     std::optional<completion> settled;
+    bool leave_merge = false;
     {
       std::scoped_lock lock(mutex);
       if (inventory && current != phase::TERMINAL && active_operations == 0 &&
@@ -342,8 +361,11 @@ struct dynamic_filter_publication_session::state {
         settled = accumulation_result;
         record(outcome);
         complete(*settled, true);
+        leave_merge = plan.distributed() != nullptr && !std::exchange(merged, true);
       }
     }
+    // The other ranks wait on this rank's share of each key's merge, which it ended without.
+    if (leave_merge) { merge_without_filters(plan); }
     if (settled) {
       sirius::log::log_noexcept([&] {
         SIRIUS_LOG_DEBUG("[dynamic_filter_publication_session] accumulation settled: outcome={}",
@@ -412,6 +434,13 @@ struct dynamic_filter_publication_session::state {
         auto& key             = per_key[active_keys[index]];
         key.membership        = filter;
         key.membership_domain = filter->domain();
+      }
+      if (auto const* distributed = plan.distributed()) {
+        {
+          std::scoped_lock lock(mutex);
+          merged = true;
+        }
+        merge_across_ranks(*distributed, per_key, stream);
       }
       std::optional<std::chrono::steady_clock::duration> latency;
       auto const counts = fan_out(plan, producers, per_key, [&] {
@@ -484,7 +513,9 @@ struct dynamic_filter_publication_session::state {
   // The ID of the batch whose contribution completed the inventory, while its task's publication is
   // owed and has not run.
   std::optional<std::uint64_t> pending_publication;
-  phase current       = phase::OPEN;
+  phase current = phase::OPEN;
+  /// Distributed: this rank has taken its part in every key's merge, with filters or without.
+  bool merged         = false;
   bool sealed         = false;
   bool input_closed   = false;
   bool cancelled      = false;
@@ -643,12 +674,13 @@ bool dynamic_filter_publication_session::try_begin_accumulation(
       keys.push_back({key.build_key_ordinal, key.storage_type});
     }
     if (keys.empty()) { return false; }
-    auto const geometry = detail::accumulated_bloom_geometry::try_create(
-      rows, keys.size(), plan.max_bloom_bytes_per_gpu());
+    auto const sized_for = plan.distributed() ? distributed_bloom_keys(plan) : rows;
+    auto const geometry  = detail::accumulated_bloom_geometry::try_create(
+      sized_for, keys.size(), plan.max_bloom_bytes_per_gpu());
     if (!geometry) {
       selection.keys_skipped_bloom_size_gate = keys.size();
       auto const required                    = detail::accumulated_bloom_geometry::try_create(
-        rows, keys.size(), std::numeric_limits<std::uint64_t>::max());
+        sized_for, keys.size(), std::numeric_limits<std::uint64_t>::max());
       SIRIUS_LOG_INFO(
         "[dynamic_filter_publication_session] accumulated Bloom refused: per-GPU cap, rows={}, "
         "active_keys={}, required_bytes={}, cap={}",

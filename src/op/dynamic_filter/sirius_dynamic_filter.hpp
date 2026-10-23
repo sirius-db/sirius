@@ -464,7 +464,8 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
 
   /**
    * @brief ORs another filter's bit storage into the source replica, which then also holds that
-   * filter's keys. Call before replicate_to_devices().
+   * filter's keys. Call before replicate_to_devices(); an accumulated filter's replicas are
+   * updated too.
    *
    * @param words Device storage of a filter of this size and domain, as storage() gives it.
    * @throw std::invalid_argument when @p bytes is not this filter's storage_bytes()

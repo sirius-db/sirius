@@ -495,13 +495,12 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   bool is_supported_by_hash_join =
     sirius::op::sirius_physical_hash_join::are_conditions_supported(conditions, op.join_type);
   if (is_supported_by_hash_join && !prefer_range_joins) {
-    auto options          = duckdb::query_operator_options(context);
-    const auto& op_params = *options;
-    auto* const stats     = &sirius_context->get_dynamic_filter_stats();
-    // Distributed: Blooms merge across ranks on whole-build publication only, so no build
-    // accumulates one across its partitions (and no BUILD_FILTER is planned for it).
-    bool const multi_partition =
-      op_params.enable_dynamic_filter_multi_partition && op_params.exchange_peers.empty();
+    auto options               = duckdb::query_operator_options(context);
+    const auto& op_params      = *options;
+    auto* const stats          = &sirius_context->get_dynamic_filter_stats();
+    bool const multi_partition = op_params.enable_dynamic_filter_multi_partition;
+    // Distributed: no BUILD_FILTER is planned, so right semi and anti joins publish nothing.
+    bool const early_publication = multi_partition && op_params.exchange_peers.empty();
 
     // Resolve placements before registering any producer channel.
     auto& memory_manager  = sirius_context->get_memory_manager();
@@ -526,7 +525,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       build_evidence && op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
       !gpu_spaces.empty() && !host_spaces.empty() &&
       (!needs_early_publication ||
-       (multi_partition && op_params.max_dynamic_filter_bloom_bytes_per_gpu > 0));
+       (early_publication && op_params.max_dynamic_filter_bloom_bytes_per_gpu > 0));
     if (discovery_runs) {
       bool const scan_bind_armed = scan_route_join_type_admissible(op.join_type);
       descent_policy const policy{.descend_build_blocks = true};

@@ -418,12 +418,18 @@ __global__ void or_words(std::uint32_t* into, std::uint32_t const* from, std::si
 
 void const* sirius_dynamic_bloom_filter::storage() const
 {
+  if (auto const* accumulated = _impl->find_accumulated(_impl->source_device)) {
+    return accumulated->bits->data();
+  }
   auto const* source = _impl->find(_impl->source_device);
   return std::visit([](auto const& bloom) -> void const* { return bloom->data(); }, source->bloom);
 }
 
 std::size_t sirius_dynamic_bloom_filter::storage_bytes() const
 {
+  if (auto const* accumulated = _impl->find_accumulated(_impl->source_device)) {
+    return accumulated->blocks * bloom_bytes_per_block;
+  }
   auto const* source = _impl->find(_impl->source_device);
   return std::visit(
     [](auto const& bloom) {
@@ -447,6 +453,12 @@ void sirius_dynamic_bloom_filter::merge_from(void const* words,
   auto const blocks  = static_cast<unsigned>((count + per - 1) / per);
   or_words<<<blocks, per, 0, stream.get()>>>(into, static_cast<std::uint32_t const*>(words), count);
   CUDF_CUDA_TRY(cudaGetLastError());
+  // An accumulated filter is already replicated: every other GPU's copy takes the merged bits.
+  for (auto const& replica : _impl->accumulated_replicas) {
+    if (replica->device_id == _impl->source_device) { continue; }
+    CUDF_CUDA_TRY(cudaMemcpyPeerAsync(
+      replica->bits->data(), replica->device_id, into, _impl->source_device, bytes, stream.get()));
+  }
 }
 
 void sirius_dynamic_bloom_filter::replicate_to_devices(

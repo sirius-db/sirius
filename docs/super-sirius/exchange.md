@@ -188,14 +188,21 @@ alone would drop rows another rank's build matches. In distributed mode a publis
 carries a `distributed_merge`. Every rank then:
 
 1. builds a Bloom of one size for each key, from the plan's build estimate clamped to
-   [2^16, 2^26] keys;
+   [2^16, 2^30] keys;
 2. all-gathers it with a header (key rep, family, scale, size);
 3. ORs the others into its own, and publishes it.
 
 A key whose filters cannot all be merged publishes nothing: a rank sent none, a header differs,
-or a rank missed the 2-minute wait. IN-lists and zone maps are not published in distributed mode,
-nor are Blooms accumulated across a multi-partition build: the merge runs on whole-build
-publication only. A rank with an empty build still merges, contributing an empty Bloom. A rank
+or a rank missed the 2-minute wait. IN-lists and zone maps are not published in distributed mode.
+
+A build split into several partitions accumulates its Bloom from every batch instead, and merges
+it the same way. Its size is the plan's estimate, cut so that the join's admitted keys fit
+`max_dynamic_filter_bloom_bytes_per_gpu` together: a key with more build rows gets more false
+positives rather than no filter. Ranks merge only Blooms of one size, so a rank that builds one
+partition while another builds several drops the filter. Right semi and anti joins plan no
+BUILD_FILTER stage in distributed mode, so they publish nothing.
+
+A rank with an empty build still merges, contributing an empty Bloom. A rank
 that never saw a whole build joins each key's all-gather without a filter, so the others drop
 that key at once instead of waiting out the timeout.
 Filters stay optional and the join authoritative, so a missing filter costs speed, never
