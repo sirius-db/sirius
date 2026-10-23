@@ -72,7 +72,9 @@ void bind_partition_inputs(sirius_physical_hash_join& join,
                                 !probe_drives,
                                 build_concat != nullptr,
                                 sirius::memory::saturating_add(stats[0].bytes, stats[1].bytes),
-                                sizing.rows};
+                                sizing.rows,
+                                sizing.measured_rows,
+                                sizing.resident_bytes};
       auto strategy = empty ? partition_strategy{1, false, false, partition_placement::unpinned(1)}
                             : join.get_partition_strategy(in);
       bool build_arrives_whole = false;
@@ -82,7 +84,10 @@ void bind_partition_inputs(sirius_physical_hash_join& join,
         build_arrives_whole = strategy.num_partitions == 1 || strategy.broadcast;
       } else if (!empty && in.is_build_side && strategy.num_partitions == 1 &&
                  join.publishes_dynamic_filters() &&
-                 in.total_bytes < join.max_build_hash_table_bytes()) {
+                 in.resident_bytes.value_or(in.total_bytes) < join.max_build_probe_resident_bytes &&
+                 in.measured_rows &&
+                 *in.measured_rows <=
+                   static_cast<uint64_t>(std::numeric_limits<cudf::size_type>::max())) {
         if (build_concat) { build_concat->set_concat_all(true); }
         build_arrives_whole = build_concat != nullptr;
       }

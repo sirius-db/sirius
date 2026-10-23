@@ -53,12 +53,21 @@ constexpr uint64_t DEFAULT_BATCH_SIZE = 800ULL * 1024 * 1024;  // 800 MiB
 /// memory-space configs before applying explicit operator_params overrides.
 uint64_t derived_default_batch_size();
 
-constexpr uint64_t DEFAULT_SCAN_TASK_BATCH_SIZE       = DEFAULT_BATCH_SIZE;
-constexpr uint64_t DEFAULT_HASH_PARTITION_BYTES       = DEFAULT_BATCH_SIZE;
-constexpr uint64_t DEFAULT_CONCAT_BATCH_BYTES         = DEFAULT_BATCH_SIZE;
-constexpr uint64_t DEFAULT_SORT_SAMPLE_BYTES          = DEFAULT_BATCH_SIZE;
-constexpr uint64_t DEFAULT_MAX_BUILD_HASH_TABLE_BYTES = 2 * DEFAULT_BATCH_SIZE;
-constexpr uint64_t DEFAULT_MAX_BROADCAST_JOIN_SIZE    = 256ULL * 1024 * 1024;  // 256 MiB
+constexpr uint64_t DEFAULT_SCAN_TASK_BATCH_SIZE = DEFAULT_BATCH_SIZE;
+constexpr uint64_t DEFAULT_HASH_PARTITION_BYTES = DEFAULT_BATCH_SIZE;
+constexpr uint64_t DEFAULT_CONCAT_BATCH_BYTES   = DEFAULT_BATCH_SIZE;
+constexpr uint64_t DEFAULT_SORT_SAMPLE_BYTES    = DEFAULT_BATCH_SIZE;
+
+/// Both BUILD_PROBE budgets default to 8x batch size. With measured rows and average row widths
+/// of at least 4 bytes, this retains the capacity headroom of the former 2x-batch payload rule,
+/// subject to the cuDF row limit. Narrower builds may need a larger hash table than their payload.
+constexpr uint64_t DEFAULT_MAX_BUILD_HASH_TABLE_BYTES     = 8 * DEFAULT_BATCH_SIZE;
+constexpr uint64_t DEFAULT_MAX_BUILD_PROBE_RESIDENT_BYTES = 8 * DEFAULT_BATCH_SIZE;
+constexpr uint64_t DEFAULT_MAX_BROADCAST_JOIN_SIZE        = 256ULL * 1024 * 1024;  // 256 MiB
+
+/// Approximate cuco hash-table bytes per build row: 8-byte hash/index slots at 0.5 occupancy.
+/// Capacity rounding and auxiliary allocations are excluded; this is an admission estimate.
+constexpr uint64_t BUILD_PROBE_HASH_TABLE_BYTES_PER_ROW = 16;
 
 /// Multi-GPU small-table threshold, charged per GPU. A partition-sizing consumer (hash join,
 /// merge_group_by) keeps inputs below `num_gpus * this` on a single GPU (one partition) to avoid
@@ -128,7 +137,7 @@ constexpr uint64_t DENSE_COUNT_JOIN_FALLBACK_MAX_BYTES = 2ULL * 1024 * 1024 * 10
 /// `SIRIUS_ENABLE_TEST_OPTIONS=1`.
 /// Hardware-independent defaults; resolution supplies capacity-derived batch sizes.
 struct operator_params {
-  /// Construct defaults with a shared batch size and twice that size for hash builds.
+  /// Construct defaults with a shared batch size and 8x that size for BUILD_PROBE budgets.
   static operator_params with_batch_size(uint64_t batch_size);
 
   /// Engine-owned query policy. The user-facing setting defaults to enabled, but an unwired
@@ -164,10 +173,16 @@ struct operator_params {
   /// Target size (bytes) of data to sample before computing sort partition boundaries.
   uint64_t sort_sample_bytes = config::DEFAULT_SORT_SAMPLE_BYTES;
 
-  /// Maximum build-side bytes for switching to BUILD_PROBE join mode: 2x the shared
-  /// batch default. May be larger than concat_batch_bytes; build-side batches will be
-  /// concatenated if needed.
+  /// Estimated per-GPU cuco hash-table byte budget for BUILD_PROBE, computed from measured rows.
+  /// Defaults to 8x batch size; 0 disables BUILD_PROBE except for correctness-forced MARK joins.
   uint64_t max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES;
+
+  /// Per-GPU decoded build payload budget for BUILD_PROBE. The folded batch stays read-locked
+  /// for the probe stream, and folding may temporarily hold both inputs and output. Admission
+  /// uses a per-partition average for hash partitioning, so skew and concurrent joins can exceed
+  /// available memory. Defaults to 8x batch size; 0 disables BUILD_PROBE except MARK.
+  // SET/RESET overrides are connection-local and captured in the query options snapshot.
+  uint64_t max_build_probe_resident_bytes = config::DEFAULT_MAX_BUILD_PROBE_RESIDENT_BYTES;
 
   /// Maximum build-side bytes for a broadcast join. A build below this size is eligible to be
   /// replicated to every GPU (instead of hash-partitioning across GPUs) when the probe side is
