@@ -78,6 +78,12 @@ class exchange_service {
   /// @throws the exchange's error once it has failed.
   void close(stream_id stream, rank_t to) { _transport->close(stream, to); }
 
+  /// See transport::wait_sent.
+  [[nodiscard]] bool wait_sent(std::uint64_t query, std::chrono::milliseconds timeout)
+  {
+    return _transport->wait_sent(query, timeout);
+  }
+
   /// Routes @p stream to @p receiver, replaying what arrived for it before.
   /// @throws sirius::invalid_input_exception when the stream already has a receiver.
   void attach(stream_id stream, std::shared_ptr<inbound> receiver);
