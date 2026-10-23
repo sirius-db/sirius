@@ -32,7 +32,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--workloads",
         nargs="+",
-        choices=run_bench.WORKLOADS,
+        choices=run_bench.WORKLOADS + run_bench.AGGREGATE_WORKLOADS,
         default=list(run_bench.WORKLOADS[:3]),
     )
     parser.add_argument("--sizes", nargs="+", type=int, default=[100_000, 1_000_000])
@@ -70,7 +70,7 @@ def parse_args(argv=None):
     ]
     if options.q1_data is not None:
         shared.extend(["--q1-data", str(options.q1_data)])
-    args = run_bench.parse_args(shared)
+    args = run_bench.parse_args(shared, allow_aggregate=True)
     for name in ("batch_mib", "gpu_budget_mib", "host_budget_mib"):
         setattr(args, name, getattr(options, name))
     if args.threads > 1:
@@ -138,14 +138,20 @@ def validate_manifest(manifest, args, workload, rows):
         or manifest.get("correctness_verified") is not True
     ):
         raise ValueError("host did not confirm correctness comparisons")
-    if manifest.get("input_rows", manifest.get("rows")) != rows:
+    input_rows = manifest.get("input_rows", manifest.get("rows"))
+    if type(input_rows) is not int or input_rows != rows:
         raise ValueError("host supplied the wrong input row count")
     validation = manifest.get("validation_records")
-    expected_samples = {"prefix", "dispersed"}
+    expected_samples = (
+        set(run_bench.AGGREGATE_KINDS)
+        if workload in run_bench.AGGREGATE_WORKLOADS
+        else {"prefix", "dispersed"}
+    )
     if workload == "udfbench_q1":
         expected_samples.add("q1_original_python_oracle")
     if not isinstance(validation, list) or any(
-        not isinstance(v, dict) for v in validation
+        not isinstance(v, dict) or not isinstance(v.get("sample"), str)
+        for v in validation
     ):
         raise ValueError("host did not supply per-query correctness evidence")
     if (
@@ -156,9 +162,14 @@ def validate_manifest(manifest, args, workload, rows):
     for proof in validation:
         if (
             proof.get("cache_mode") != "warm_storage"
-            or proof.get("gpu_executions") != 1
-            or proof.get("plan_fallbacks") != 0
-            or proof.get("runtime_fallbacks") != 0
+            or any(
+                type(proof.get(name)) is not int or proof[name] != count
+                for name, count in (
+                    ("gpu_executions", 1),
+                    ("plan_fallbacks", 0),
+                    ("runtime_fallbacks", 0),
+                )
+            )
             or type(proof.get("rows_compared")) is not int
             or proof["rows_compared"] <= 0
         ):
@@ -168,16 +179,22 @@ def validate_manifest(manifest, args, workload, rows):
             and proof["rows_compared"] != 50_000
         ):
             raise ValueError("Q1 correctness gate must compare all public oracle rows")
-    if manifest.get("gpu_validation_queries") != len(validation):
+    if type(manifest.get("gpu_validation_queries")) is not int or manifest[
+        "gpu_validation_queries"
+    ] != len(validation):
         raise ValueError("GPU validation total disagrees with correctness gates")
 
-    modes = run_bench.definitions(workload, rows, args)[1]
+    modes = (
+        [("native", "Equivalent DuckDB CPU SQL")]
+        if workload in run_bench.AGGREGATE_WORKLOADS
+        else run_bench.definitions(workload, rows, args)[1]
+    )
     labels = dict(modes)
     labels["gpu"] = "GPU"
     expected = {
         ("gpu" if mode == "gpu" else "cpu", mode, kind, iteration)
         for mode in labels
-        for kind in ("aggregate", "projection")
+        for kind in run_bench.query_kinds(workload)
         for iteration in range(args.warmups + args.repetitions)
     }
     profiles = manifest.get("profiles")
@@ -186,7 +203,10 @@ def validate_manifest(manifest, args, workload, rows):
     actual = set()
     sample_ids = set()
     for profile in profiles:
-        if type(profile.get("iteration")) is not int:
+        if type(profile.get("iteration")) is not int or any(
+            not isinstance(profile.get(name), str)
+            for name in ("engine", "cpu_mode", "query_kind")
+        ):
             raise ValueError("profile has an invalid iteration")
         key = tuple(
             profile.get(k) for k in ("engine", "cpu_mode", "query_kind", "iteration")
@@ -225,11 +245,10 @@ def validate_manifest(manifest, args, workload, rows):
                 )
     if actual != expected:
         raise ValueError("host supplied incomplete profile variants")
-    if manifest.get("gpu_counters") != {
-        "executions": 2 * (args.warmups + args.repetitions),
-        "plan_fallbacks": 0,
-        "runtime_fallbacks": 0,
-    }:
+    if not run_bench.valid_gpu_counters(
+        manifest.get("gpu_counters"),
+        len(run_bench.query_kinds(workload)) * (args.warmups + args.repetitions),
+    ):
         raise ValueError(
             "profiled GPU total does not cover every warmup and repetition"
         )
@@ -413,6 +432,8 @@ def main(argv=None):
             "timing_scope": "Actual query operator wall durations, summed across calls/workers; query wall is retained separately. GPU execute durations synchronize their task stream. No device-only kernel timing.",
             "cache_modes": "Checkpointed native DuckDB storage with warm CPU/OS caches; input is not pinned to GPU.",
             "timing_model": "cumulative_worker_wall",
+            "correctness": "Scalar workloads compare typed CPU/GPU prefix and dispersed samples; aggregate rewrites compare executable original-source results for every full input before a separate profiling process and recheck full CPU/GPU aggregate outputs.",
+            "cpu_baselines": "Scalar workloads use the labeled CPU alternatives; sum_squares and weighted_mean use equivalent DuckDB CPU SQL, not original Python/JVM UDAF timing.",
             "cpu_operator_threads": args.threads,
             "gpu_executor_threads": 1,
             "batch_target_bytes": args.batch_mib * MIB,
@@ -464,6 +485,34 @@ def main(argv=None):
             )
             started = time.perf_counter()
             try:
+                source_reference = None
+                if workload in run_bench.AGGREGATE_WORKLOADS:
+                    from aggregate_reference import verify
+
+                    preflight_environment = {
+                        **environment,
+                        "SIRIUS_LOG_LEVEL": "info",
+                        "SIRIUS_LOG_DIR": str(job / "preflight-engine-log"),
+                    }
+                    with (job / "preflight.log").open("w") as log:
+                        preflight = subprocess.run(
+                            [
+                                str(args.build_dir / "bench_host"),
+                                "--aggregate-preflight",
+                                str(job),
+                            ],
+                            cwd=job,
+                            env=preflight_environment,
+                            stdout=log,
+                            stderr=subprocess.STDOUT,
+                            timeout=1800,
+                            check=False,
+                        )
+                    if preflight.returncode:
+                        raise RuntimeError(
+                            "aggregate preflight host failed; inspect preflight.log"
+                        )
+                    source_reference = verify(job, workload, rows)
                 with (job / "run.log").open("w") as log:
                     process = subprocess.run(
                         [str(args.build_dir / "bench_host"), str(job)],
@@ -497,6 +546,11 @@ def main(argv=None):
                         "gpu_validation_queries": manifest["gpu_validation_queries"],
                         "gpu_counters": manifest["gpu_counters"],
                         "validation_records": manifest["validation_records"],
+                        **(
+                            {"source_reference": source_reference}
+                            if source_reference
+                            else {}
+                        ),
                         "wall_seconds": time.perf_counter() - started,
                     }
                 )

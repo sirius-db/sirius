@@ -8,6 +8,7 @@ from pathlib import Path
 
 
 TARGETS = ("sql", "cudf", "cuda")
+KINDS = ("scalar", "aggregate")
 SKILL_ROOT = Path(__file__).resolve().parents[1]
 PROJECT_ROOT = (
     SKILL_ROOT.parent.parent.parent
@@ -33,12 +34,21 @@ def external_output(path, repository_root=PROJECT_ROOT):
     return resolved
 
 
-def scaffold(target, output, assets=None, repository_root=PROJECT_ROOT):
+def scaffold(target, output, assets=None, repository_root=PROJECT_ROOT, kind="scalar"):
     if target not in TARGETS:
         raise ValueError(f"unknown target: {target}")
+    if kind not in KINDS:
+        raise ValueError(f"unknown kind: {kind}")
+    if kind == "aggregate" and target != "sql":
+        raise ValueError(
+            "aggregate conversion requires --target sql; native callbacks are scalar-only"
+        )
     destination = external_output(output, repository_root)
     assets = Path(assets) if assets is not None else SKILL_ROOT / "assets"
-    trees = [assets / "common", assets / target]
+    trees = [
+        assets / "common",
+        assets / ("aggregate" if kind == "aggregate" else target),
+    ]
     if target != "sql":
         trees.insert(1, assets / "native")
     # Read and validate everything before creating the destination.
@@ -63,7 +73,16 @@ def scaffold(target, output, assets=None, repository_root=PROJECT_ROOT):
         result.write_text(content, encoding="utf-8")
     (destination / "project.json").write_text(
         json.dumps(
-            {"target": target, "synthetic": True, "reference": "example contract"},
+            {
+                "target": target,
+                "kind": kind,
+                "synthetic": True,
+                "reference": (
+                    "executable synthetic original.py"
+                    if kind == "aggregate"
+                    else "example contract"
+                ),
+            },
             indent=2,
         )
         + "\n",
@@ -75,13 +94,14 @@ def scaffold(target, output, assets=None, repository_root=PROJECT_ROOT):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target", choices=TARGETS, required=True)
+    parser.add_argument("--kind", choices=KINDS, default="scalar")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
     try:
-        destination = scaffold(args.target, args.output)
+        destination = scaffold(args.target, args.output, kind=args.kind)
     except (ValueError, OSError) as error:
         parser.exit(1, f"scaffold: {error}\n")
-    print(f"Created synthetic {args.target} project: {destination}")
+    print(f"Created synthetic {args.kind} {args.target} project: {destination}")
     print(f"Build and validation instructions: {destination / 'USAGE.md'}")
 
 

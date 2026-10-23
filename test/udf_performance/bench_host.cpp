@@ -27,6 +27,7 @@
 #include <sirius/duckdb.hpp>
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -152,6 +153,7 @@ struct mode {
   std::string dispersed_sql;
   std::string aggregate_sql;
   std::string projection_sql;
+  std::map<std::string, std::string> aggregate_queries;
   std::vector<double> times;
   std::vector<double> timestamps;
   counters counts;
@@ -205,12 +207,23 @@ std::string disperse(std::string sql, uint64_t rows)
   return sql;
 }
 
-mode load_mode(fs::path const& job, uint64_t rows, std::string id, std::string label, bool gpu)
+mode load_mode(fs::path const& job,
+               uint64_t rows,
+               std::string id,
+               std::string label,
+               bool gpu,
+               bool aggregate_rewrite = false)
 {
   mode output;
-  output.id             = std::move(id);
-  output.label          = std::move(label);
-  output.gpu            = gpu;
+  output.id    = std::move(id);
+  output.label = std::move(label);
+  output.gpu   = gpu;
+  if (aggregate_rewrite) {
+    for (std::string const kind : {"global", "grouped_uniform", "grouped_skewed"}) {
+      output.aggregate_queries.emplace(kind, read_file(job / (kind + "_" + output.id + ".sql")));
+    }
+    return output;
+  }
   output.sample_sql     = read_file(job / ("sample_" + output.id + ".sql"));
   output.dispersed_sql  = disperse(output.sample_sql, rows);
   output.aggregate_sql  = read_file(job / ("aggregate_" + output.id + ".sql"));
@@ -373,6 +386,102 @@ void validate_q1_oracle(duckdb::Connection& connection,
     "\"rows_compared\":50000,\"gpu_executions\":1,\"plan_fallbacks\":0,\"runtime_fallbacks\":0}");
 }
 
+void print_typed_result(std::ostream& output, duckdb::QueryResult& result)
+{
+  output << "{\"types\":[";
+  auto const& types = result.GetTypes();
+  for (duckdb::idx_t column = 0; column < result.ColumnCount(); ++column) {
+    if (column) { output << ','; }
+    output << json_quote(types[column].ToString());
+  }
+  output << "],\"rows\":[";
+  auto values = result.Collection().GetRows();
+  for (duckdb::idx_t row = 0; row < result.RowCount(); ++row) {
+    if (row) { output << ','; }
+    output << '[';
+    for (duckdb::idx_t column = 0; column < result.ColumnCount(); ++column) {
+      if (column) { output << ','; }
+      auto const value = values.GetValue(column, row);
+      if (value.IsNull()) {
+        output << "null";
+      } else if (types[column].id() == duckdb::LogicalTypeId::DOUBLE) {
+        std::ostringstream bits;
+        bits << std::hex << std::setw(16) << std::setfill('0')
+             << std::bit_cast<uint64_t>(value.GetValue<double>());
+        output << "{\"ieee_bits\":" << json_quote(bits.str()) << '}';
+      } else {
+        output << json_quote(value.ToString());
+      }
+    }
+    output << ']';
+  }
+  output << "]}";
+}
+
+void validate_aggregate_queries(duckdb::Connection& connection,
+                                duckdb::Connection& observer,
+                                mode const& cpu,
+                                mode const& gpu,
+                                validation_evidence& evidence)
+{
+  for (auto const& [kind, sql] : gpu.aggregate_queries) {
+    query(connection, "SET gpu_execution=false");
+    auto reference = query(connection, cpu.aggregate_queries.at(kind));
+    query(connection, "SET gpu_execution=true");
+    auto const before = snapshot(observer);
+    auto actual       = query(connection, sql);
+    auto const delta  = checked_delta(before, snapshot(observer));
+    compare(*reference, *actual);
+    query(connection, "SET gpu_execution=false");
+    evidence.gpu_queries += delta.executions;
+    evidence.records.emplace_back(
+      "{\"cache_mode\":\"warm_storage\",\"sample\":" + json_quote(kind) +
+      ",\"rows_compared\":" + std::to_string(reference->RowCount()) +
+      ",\"gpu_executions\":1,\"plan_fallbacks\":0,\"runtime_fallbacks\":0}");
+  }
+}
+
+int export_aggregate_preflight(fs::path const& job,
+                               duckdb::Connection& connection,
+                               duckdb::Connection& observer,
+                               mode const& cpu,
+                               mode const& gpu)
+{
+  // This untimed process exports all source rows. The Python driver must run
+  // the unchanged executable source oracle before starting a profile process.
+  query(connection, "SET gpu_execution=false");
+  auto input           = query(connection, read_file(job / "source_input.sql"));
+  auto const temporary = job / "aggregate-preflight.json.tmp";
+  std::ofstream saved{temporary};
+  saved.exceptions(std::ios::failbit | std::ios::badbit);
+  saved << "{\"version\":1,\"input\":";
+  print_typed_result(saved, *input);
+  input.reset();
+  saved << ",\"cases\":[";
+  bool first = true;
+  for (auto const& [kind, sql] : gpu.aggregate_queries) {
+    query(connection, "SET gpu_execution=false");
+    auto expected = query(connection, cpu.aggregate_queries.at(kind));
+    query(connection, "SET gpu_execution=true");
+    auto const before = snapshot(observer);
+    auto actual       = query(connection, sql);
+    auto const delta  = checked_delta(before, snapshot(observer));
+    compare(*expected, *actual);
+    if (!first) { saved << ','; }
+    first = false;
+    saved << "{\"query_kind\":" << json_quote(kind) << ",\"candidate_cpu\":";
+    print_typed_result(saved, *expected);
+    saved << ",\"candidate_gpu\":";
+    print_typed_result(saved, *actual);
+    saved << ",\"gpu_counters\":{\"executions\":" << delta.executions
+          << ",\"plan_fallbacks\":0,\"runtime_fallbacks\":0}}";
+  }
+  saved << "]}\n";
+  saved.close();
+  fs::rename(temporary, job / "aggregate-preflight.json");
+  return 0;
+}
+
 int run_stage_profiles(fs::path const& job,
                        duckdb::Connection& connection,
                        duckdb::Connection& observer,
@@ -386,24 +495,33 @@ int run_stage_profiles(fs::path const& job,
                        validation_evidence& evidence)
 {
   bool const aggregate = config.contains("stage_aggregate") && flag(config, "stage_aggregate");
+  bool const rewritten = config.contains("aggregate_rewrite") && flag(config, "aggregate_rewrite");
   if ((!aggregate && !projection) || flag(config, "pin") || flag(config, "validate_only")) {
     throw std::runtime_error("Stage profiles require a query kind, no pinning and timed execution");
   }
-  validate_samples(connection, observer, cpus, gpu, "warm_storage", rows, evidence);
+  if (rewritten) {
+    validate_aggregate_queries(connection, observer, cpus.front(), gpu, evidence);
+  } else {
+    validate_samples(connection, observer, cpus, gpu, "warm_storage", rows, evidence);
+  }
   query(connection, "PRAGMA disable_profiling");
   std::ostringstream profiles;
   profiles << std::setprecision(17);
   bool first           = true;
   uint64_t gpu_queries = 0;
-  for (std::string const kind : {std::string{"projection"}, std::string{"aggregate"}}) {
+  std::vector<std::string> kinds =
+    rewritten ? std::vector<std::string>{"global", "grouped_uniform", "grouped_skewed"}
+              : std::vector<std::string>{"projection", "aggregate"};
+  for (std::string const& kind : kinds) {
     if ((kind == "projection" && !projection) || (kind == "aggregate" && !aggregate)) { continue; }
-    auto const sql_for = [&kind](mode const& candidate) -> std::string const& {
+    auto const sql_for = [&kind, rewritten](mode const& candidate) -> std::string const& {
+      if (rewritten) { return candidate.aggregate_queries.at(kind); }
       return kind == "aggregate" ? candidate.aggregate_sql : candidate.projection_sql;
     };
     query(connection, "SET gpu_execution=false");
     auto reference           = query(connection, sql_for(cpus.front()));
     auto const logical_types = reference->GetTypes();
-    auto const expected_rows = kind == "aggregate" ? 1 : rows;
+    auto const expected_rows = rewritten ? reference->RowCount() : (kind == "aggregate" ? 1 : rows);
     if (reference->RowCount() != expected_rows) {
       throw std::runtime_error("Stage reference query result row count mismatch");
     }
@@ -450,7 +568,7 @@ int run_stage_profiles(fs::path const& job,
         if (output->RowCount() != expected_rows || output->GetTypes() != logical_types) {
           throw std::runtime_error("Profiled query result logical types or row count mismatch");
         }
-        if (kind == "aggregate") { compare(*reference, *output); }
+        if (rewritten || kind == "aggregate") { compare(*reference, *output); }
         if (!first) { profiles << ','; }
         first = false;
         profiles << "{\"sample_id\":" << json_quote(sample_id)
@@ -472,8 +590,9 @@ int run_stage_profiles(fs::path const& job,
     std::cout << config.at("workload") << ' ' << rows << " stage " << kind << " passed\n"
               << std::flush;
   }
-  auto const kinds = static_cast<uint64_t>(aggregate) + static_cast<uint64_t>(projection);
-  if (gpu_queries != kinds * static_cast<uint64_t>(warmups + repetitions)) {
+  auto const kind_count =
+    rewritten ? 3 : static_cast<uint64_t>(aggregate) + static_cast<uint64_t>(projection);
+  if (gpu_queries != kind_count * static_cast<uint64_t>(warmups + repetitions)) {
     throw std::runtime_error("GPU stage evidence does not cover every warmup and measured query");
   }
   std::ostringstream report;
@@ -496,7 +615,7 @@ int run_stage_profiles(fs::path const& job,
   return 0;
 }
 
-int run(fs::path const& job)
+int run(fs::path const& job, bool preflight = false)
 {
   auto const config        = read_config(job);
   auto const rows          = std::stoull(config.at("rows"));
@@ -505,6 +624,8 @@ int run(fs::path const& job)
   auto const validate_only = flag(config, "validate_only");
   auto const pin           = flag(config, "pin");
   auto const projection    = flag(config, "projection");
+  auto const aggregate_rewrite =
+    config.contains("aggregate_rewrite") && flag(config, "aggregate_rewrite");
   if (rows == 0 || warmups < 1 || repetitions < 5 || std::stoi(config.at("threads")) < 1) {
     throw std::runtime_error("Require positive rows/threads, >=1 warmup and >=5 repetitions");
   }
@@ -519,7 +640,7 @@ int run(fs::path const& job)
     entry = dlsym(library, "register_sirius_udf");
     if (!entry) { throw std::runtime_error("Missing UDF registration hook"); }
   }
-  duckdb::DuckDB database{(job / "data.duckdb").c_str()};
+  duckdb::DuckDB database{(job / (preflight ? "oracle.duckdb" : "data.duckdb")).c_str()};
   duckdb::Connection connection{database};
   {
     duckdb::ExtensionLoader loader{duckdb::DatabaseInstance::GetDatabase(*connection.context),
@@ -567,12 +688,18 @@ int run(fs::path const& job)
   while (std::getline(cpu_list, line)) {
     auto const position = line.find('\t');
     if (position != std::string::npos) {
-      cpus.push_back(
-        load_mode(job, rows, line.substr(0, position), line.substr(position + 1), false));
+      cpus.push_back(load_mode(
+        job, rows, line.substr(0, position), line.substr(position + 1), false, aggregate_rewrite));
     }
   }
   if (cpus.empty()) { throw std::runtime_error("No CPU baseline modes supplied"); }
-  auto const gpu_mode = load_mode(job, rows, "gpu", "GPU", true);
+  auto const gpu_mode = load_mode(job, rows, "gpu", "GPU", true, aggregate_rewrite);
+  if (preflight) {
+    if (!aggregate_rewrite) {
+      throw std::runtime_error("Preflight requires an aggregate rewrite workload");
+    }
+    return export_aggregate_preflight(job, connection, observer, cpus.front(), gpu_mode);
+  }
 
   validation_evidence evidence;
   std::ostringstream records;
@@ -714,7 +841,13 @@ int main(int argc, char** argv)
                 << ",\"total_bytes\":" << total << ",\"free_bytes\":" << free << "}\n";
       return 0;
     }
-    if (argc != 2) { throw std::runtime_error("Usage: bench_host job-directory"); }
+    if (argc == 3 && std::string{argv[1]} == "--aggregate-preflight") {
+      require_compatible_duckdb(SIRIUS_UDF_DUCKDB_REVISION, duckdb::DuckDB::SourceID());
+      return run(std::filesystem::absolute(argv[2]), true);
+    }
+    if (argc != 2) {
+      throw std::runtime_error("Usage: bench_host [--aggregate-preflight] job-directory");
+    }
     require_compatible_duckdb(SIRIUS_UDF_DUCKDB_REVISION, duckdb::DuckDB::SourceID());
     return run(std::filesystem::absolute(argv[1]));
   } catch (std::exception const& error) {

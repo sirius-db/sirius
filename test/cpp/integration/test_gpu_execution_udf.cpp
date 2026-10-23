@@ -197,6 +197,28 @@ class GpuUdfFixture : public sirius::test::GpuExecutionFixture {
     run_ok("CHECKPOINT");
   }
 };
+
+class GpuAggregateSqlFixture : public sirius::test::GpuExecutionFixture {
+ public:
+  void initialize(char const* strategy)
+  {
+    run_ok("SET gpu_execution = false");
+    run_ok("SET enable_duckdb_fallback = false");
+    run_ok(std::string("SET expression_evaluator_strategy = '") + strategy + "'");
+    run_ok("CREATE TABLE aggregate_inputs(g INTEGER, h INTEGER, x DOUBLE, w DOUBLE)");
+    run_ok(
+      "INSERT INTO aggregate_inputs VALUES (1, 0, 3, 2), (1, 0, -4, 1),"
+      " (1, 0, NULL, 9), (1, 0, 7, NULL), (1, 0, 3, 2),"
+      " (2, 0, NULL, 1), (2, 0, NULL, NULL), (3, 1, 2, 1), (3, 1, 4, -1),"
+      " (NULL, 1, 8, 2), (4, NULL, 0, 0), (5, 2, 1048576, 2)");
+    run_ok("CREATE MACRO synthetic_sum_squares(x) AS SUM(x * x)::DOUBLE");
+    run_ok(
+      "CREATE MACRO synthetic_weighted_mean(x, w) AS "
+      "(SUM(CASE WHEN x IS NOT NULL AND w IS NOT NULL THEN x * w ELSE NULL END) / "
+      "NULLIF(SUM(CASE WHEN x IS NOT NULL AND w IS NOT NULL THEN w ELSE NULL END), 0))::DOUBLE");
+    run_ok("CHECKPOINT");
+  }
+};
 }  // namespace
 
 TEST_CASE_METHOD(GpuUdfFixture,
@@ -266,6 +288,82 @@ TEST_CASE_METHOD(GpuUdfFixture,
   CHECK(failed->GetError().find("synthetic GPU binder failure") != std::string::npos);
   compare_gpu_candidate_to_cpu("SELECT id, a + b FROM udf_inputs",
                                "SELECT id, " + name("add") + "(a, b) FROM udf_inputs");
+}
+
+TEST_CASE_METHOD(GpuAggregateSqlFixture,
+                 "aggregate SQL UDF rewrites compose in global and grouped aggregation",
+                 "[integration][gpu_execution][gpu_udf][aggregate_sql_udf]")
+{
+  initialize(GENERATE("materialize", "ast_interpret", "ast_jit"));
+  // The CPU reference deliberately uses FILTER and POW rather than the CASE
+  // and multiply expressions produced by the rewrite. Source-runtime oracles
+  // are exercised by the external skill runner, separately from this test.
+  std::string const reference =
+    "SUM(POW(x, 2))::DOUBLE, (SUM(x * w) FILTER (WHERE x IS NOT NULL AND w IS NOT NULL) / "
+    "NULLIF(SUM(w) FILTER (WHERE x IS NOT NULL AND w IS NOT NULL), 0))::DOUBLE";
+  std::string const candidate = "synthetic_sum_squares(x), synthetic_weighted_mean(x, w)";
+  compare_gpu_candidate_to_cpu("SELECT " + reference + " FROM aggregate_inputs",
+                               "SELECT " + candidate + " FROM aggregate_inputs");
+  compare_gpu_candidate_to_cpu(
+    "SELECT g, h, " + reference + " FROM aggregate_inputs GROUP BY g, h",
+    "SELECT g, h, " + candidate + " FROM aggregate_inputs GROUP BY g, h");
+  // All-NULL values, a zero denominator, and a single non-NULL value are kept
+  // in nonempty scans so every comparison proves actual GPU execution.
+  for (std::string const predicate : {"g = 2", "g = 3", "g IS NULL"}) {
+    compare_gpu_candidate_to_cpu(
+      "SELECT " + reference + " FROM aggregate_inputs WHERE " + predicate,
+      "SELECT " + candidate + " FROM aggregate_inputs WHERE " + predicate);
+  }
+}
+
+TEST_CASE_METHOD(GpuAggregateSqlFixture,
+                 "aggregate SQL UDF rewrites retain empty input semantics",
+                 "[integration][gpu_execution][gpu_udf][aggregate_sql_udf]")
+{
+  initialize(GENERATE("materialize", "ast_interpret", "ast_jit"));
+  // The optimizer may replace this scan with EMPTY_RESULT; that verifies the
+  // aggregate contract but does not establish positive GPU execution evidence.
+  for (bool const gpu : {false, true}) {
+    run_ok(gpu ? "SET gpu_execution = true" : "SET gpu_execution = false");
+    auto global = con->Query(
+      "SELECT synthetic_sum_squares(x), synthetic_weighted_mean(x, w) "
+      "FROM aggregate_inputs WHERE g = 999");
+    REQUIRE(global);
+    if (global->HasError()) { UNSCOPED_INFO(global->GetError()); }
+    REQUIRE_FALSE(global->HasError());
+    REQUIRE(global->RowCount() == 1);
+    REQUIRE(global->GetTypes() == duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::DOUBLE,
+                                                                      duckdb::LogicalType::DOUBLE});
+    auto rows = global->Collection().GetRows();
+    CHECK(rows.GetValue(0, 0).IsNull());
+    CHECK(rows.GetValue(1, 0).IsNull());
+    auto grouped = con->Query(
+      "SELECT g, synthetic_sum_squares(x), synthetic_weighted_mean(x, w) "
+      "FROM aggregate_inputs WHERE g = 999 GROUP BY g");
+    REQUIRE(grouped);
+    if (grouped->HasError()) { UNSCOPED_INFO(grouped->GetError()); }
+    REQUIRE_FALSE(grouped->HasError());
+    CHECK(grouped->RowCount() == 0);
+  }
+}
+
+TEST_CASE_METHOD(GpuAggregateSqlFixture,
+                 "aggregate SQL UDF unsupported operators follow fallback policy",
+                 "[integration][gpu_execution][gpu_udf][aggregate_sql_udf]")
+{
+  initialize("ast_interpret");
+  run_ok("CREATE MACRO synthetic_filtered_sum(x, w) AS SUM(x) FILTER (WHERE w > 0)");
+  std::string const sql = "SELECT synthetic_filtered_sum(x, w) FROM aggregate_inputs";
+  run_ok("SET gpu_execution = true");
+  auto failed = con->Query(sql);
+  REQUIRE(failed);
+  REQUIRE(failed->HasError());
+  CHECK(failed->GetError().find("FILTER") != std::string::npos);
+  run_ok("SET enable_duckdb_fallback = true");
+  expect_plan_fallback_matches_cpu(sql);
+  run_ok("SET enable_duckdb_fallback = false");
+  compare_gpu_candidate_to_cpu("SELECT SUM(x)::DOUBLE FROM aggregate_inputs",
+                               "SELECT SUM(x)::DOUBLE FROM aggregate_inputs");
 }
 
 TEST_CASE_METHOD(GpuUdfFixture,

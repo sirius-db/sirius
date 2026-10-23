@@ -4,6 +4,7 @@
 
 import argparse
 from contextlib import contextmanager
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -41,6 +42,8 @@ def compare(reference, actual, label):
 def encode_cell(value, logical_type):
     if value is None:
         return None
+    if isinstance(value, bool):
+        return "true" if value else "false"
     if isinstance(value, float):
         width = "f" if logical_type == "FLOAT" else "d"
         return {"ieee_bits": struct.pack("!" + width, value).hex()}
@@ -90,6 +93,9 @@ class PythonDuckDB:
         self.connection.execute(query)
 
     def query(self, query):
+        statements = self.connection.extract_statements(query)
+        if len(statements) != 1 or statements[0].type.name != "SELECT":
+            raise ValueError("validation queries require exactly one SELECT statement")
         cursor = self.connection.execute(query)
         # Preserve NULLs and IEEE bits, including signed zero and NaN payloads.
         types = [str(description[1]) for description in cursor.description]
@@ -156,15 +162,21 @@ def _run_python_queries(args, database, setup, registration, reference, candidat
         before = adapter.snapshot()
         compare(expected, adapter.query(candidate), "GPU candidate")
         evidence = require_gpu(before, adapter.snapshot())
-        return {
+        result = {
             "validation": "passed",
             "rows": len(expected["rows"]),
             "gpu_counters": evidence,
             "timing": "query wall time including result fetch",
             "cpu_baseline": "reference.sql",
-            "cpu": benchmark(adapter, reference, args.warmups, args.iterations, False),
-            "gpu": benchmark(adapter, candidate, args.warmups, args.iterations, True),
         }
+        if not getattr(args, "validate_only", False):
+            result["cpu"] = benchmark(
+                adapter, reference, args.warmups, args.iterations, False
+            )
+            result["gpu"] = benchmark(
+                adapter, candidate, args.warmups, args.iterations, True
+            )
+        return result
     finally:
         adapter.close()
 
@@ -172,10 +184,15 @@ def _run_python_queries(args, database, setup, registration, reference, candidat
 def validate_native_report(result, benchmark_queries):
     if not isinstance(result, dict) or result.get("validation") != "passed":
         raise RuntimeError("native host did not report passing validation")
-    benchmark = result.get("gpu")
-    if not isinstance(benchmark, dict):
-        raise RuntimeError("native host omitted benchmark GPU execution evidence")
-    for report, minimum in ((result, 1), (benchmark, benchmark_queries)):
+    reports = [(result, 1)]
+    if benchmark_queries:
+        benchmark = result.get("gpu")
+        if not isinstance(benchmark, dict):
+            raise RuntimeError("native host omitted benchmark GPU execution evidence")
+        reports.append((benchmark, benchmark_queries))
+    elif "cpu" in result or "gpu" in result:
+        raise RuntimeError("validation-only host unexpectedly supplied timing records")
+    for report, minimum in reports:
         counters = report.get("gpu_counters")
         names = ("executions", "plan_fallbacks", "runtime_fallbacks")
         if not isinstance(counters, dict) or any(
@@ -204,6 +221,7 @@ def run_native(args, database, setup, registration, reference, candidate):
     completed = subprocess.run(
         [
             str(args.host.resolve()),
+            *(["--validate-only"] if getattr(args, "validate_only", False) else []),
             str(database),
             str(args.plugin.resolve()) if args.plugin else "-",
             *sql_paths,
@@ -214,15 +232,23 @@ def run_native(args, database, setup, registration, reference, candidate):
         capture_output=True,
         check=False,
         env=environment,
+        timeout=300,
     )
     if completed.returncode:
         raise RuntimeError(
             f"native validation failed ({completed.returncode}):\n{completed.stderr}"
         )
-    for line in reversed(completed.stdout.splitlines()):
+    for line in reversed(completed.stdout.split("\n")):
         if line.startswith("SIRIUS_UDF_RESULT="):
             result = json.loads(line.removeprefix("SIRIUS_UDF_RESULT="))
-            return validate_native_report(result, args.warmups + args.iterations)
+            return validate_native_report(
+                result,
+                (
+                    0
+                    if getattr(args, "validate_only", False)
+                    else args.warmups + args.iterations
+                ),
+            )
     raise RuntimeError("native host did not emit a validation result")
 
 
@@ -241,10 +267,19 @@ def main(argv=None):
     parser.add_argument("--warmups", type=int, default=3)
     parser.add_argument("--iterations", type=int, default=5)
     parser.add_argument("--report", type=Path)
+    parser.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="Run correctness checks without timing",
+    )
     args = parser.parse_args(argv)
     if args.rows < 1 or args.warmups < 0 or args.iterations < 1:
         parser.error("rows/iterations must be positive and warmups nonnegative")
-    target = json.loads((ROOT / "project.json").read_text())["target"]
+    project = json.loads((ROOT / "project.json").read_text())
+    target = project["target"]
+    kind = project.get("kind", "scalar")
+    if kind not in ("scalar", "aggregate") or (kind == "aggregate" and target != "sql"):
+        parser.error("aggregate functions require the SQL target")
     if target == "sql" and not args.extension and not args.host:
         parser.error("SQL target requires --extension or --host")
     if target != "sql" and (not args.host or not args.plugin):
@@ -252,6 +287,24 @@ def main(argv=None):
     for path in (args.extension, args.host, args.plugin):
         if path is not None and not path.is_file():
             parser.error(f"missing file: {path}")
+    if kind == "aggregate":
+        if args.plugin:
+            parser.error("aggregate SQL projects do not load a native UDF plugin")
+        spec = importlib.util.spec_from_file_location(
+            "sirius_aggregate_runner", ROOT / "aggregate.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        measure = (
+            module.measure_native
+            if args.host
+            else lambda *parameters: module.measure_python(
+                *parameters, adapter_factory=PythonDuckDB, benchmark=benchmark
+            )
+        )
+        result = module.run_project(ROOT, args, project, PythonDuckDB, measure)
+        print(json.dumps(result, indent=2))
+        return
     setup = (ROOT / "setup.sql").read_text().replace("@ROWS@", str(args.rows))
     registration = (ROOT / "registration.sql").read_text()
     reference = (ROOT / "reference.sql").read_text()

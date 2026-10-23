@@ -22,6 +22,8 @@ import time
 ROOT = Path(__file__).resolve().parent
 REPO = ROOT.parent.parent
 WORKLOADS = ("sql", "cudf", "cuda", "udfbench_q1")
+AGGREGATE_WORKLOADS = ("sum_squares", "weighted_mean")
+AGGREGATE_KINDS = ("global", "grouped_uniform", "grouped_skewed")
 DEFAULT_SIZES = [100_000, 1_000_000, 10_000_000]
 LABEL_EXPR = """CASE WHEN i%20=0 THEN NULL WHEN i%100=1 THEN ''
  WHEN i%100=2 THEN chr(9)||'  '||chr(9)
@@ -37,12 +39,15 @@ MIX_VECTOR = """WITH words AS (SELECT id,
  15111065706836454659::UBIGINT) AS result FROM words"""
 
 
-def parse_args(argv=None):
+def parse_args(argv=None, *, allow_aggregate=False):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
-        "--workloads", nargs="+", choices=WORKLOADS, default=list(WORKLOADS[:3])
+        "--workloads",
+        nargs="+",
+        choices=WORKLOADS + (AGGREGATE_WORKLOADS if allow_aggregate else ()),
+        default=list(WORKLOADS[:3]),
     )
     parser.add_argument("--sizes", nargs="+", type=int, default=DEFAULT_SIZES)
     parser.add_argument("--warmups", type=int, default=3)
@@ -75,7 +80,7 @@ def parse_args(argv=None):
     if not host.is_file() or not os.access(host, os.X_OK):
         parser.error(f"missing executable {host}; build the benchmark CMake project")
     for workload in args.workloads:
-        if workload != "sql":
+        if workload not in ("sql", *AGGREGATE_WORKLOADS):
             suffix = "q1" if workload == "udfbench_q1" else workload
             module = args.build_dir / f"benchmark_{suffix}.so"
             if not module.is_file():
@@ -172,7 +177,92 @@ def definitions(workload, rows, args):
     return setup, modes, bodies, projection, aggregate
 
 
+def valid_gpu_counters(value, executions):
+    expected = {"executions": executions, "plan_fallbacks": 0, "runtime_fallbacks": 0}
+    return (
+        isinstance(value, dict)
+        and set(value) == set(expected)
+        and all(
+            type(value[name]) is int and value[name] == count
+            for name, count in expected.items()
+        )
+    )
+
+
+def query_kinds(workload):
+    return (
+        AGGREGATE_KINDS
+        if workload in AGGREGATE_WORKLOADS
+        else ("aggregate", "projection")
+    )
+
+
+def make_aggregate_job(workload, rows, args):
+    """Generate SQL-only aggregate rewrites and equivalent CPU SQL baselines."""
+    job = args.output_dir / "jobs" / workload / str(rows)
+    job.mkdir(parents=True)
+    value = "(CASE WHEN i%29=0 THEN NULL ELSE (i%127)::INTEGER-63 END)::DOUBLE"
+    if workload == "weighted_mean":
+        value = f"({value})::DOUBLE/8.0"
+    setup = (
+        f"CREATE TABLE bench_input AS SELECT i::BIGINT AS id, {value} AS value,"
+        "CASE WHEN i%31=0 THEN NULL ELSE (i%7+1)::DOUBLE END AS weight,"
+        "(i%1024)::INTEGER AS g_uniform,"
+        "(CASE WHEN i%8<>0 THEN 0 ELSE (i//8)%1024 END)::INTEGER AS g_skewed "
+        f"FROM range({rows}) input(i);\n"
+    )
+    expression = (
+        "sum(value*value)"
+        if workload == "sum_squares"
+        else "sum(CASE WHEN value IS NOT NULL AND weight IS NOT NULL THEN value*weight END)"
+        "/nullif(sum(CASE WHEN value IS NOT NULL AND weight IS NOT NULL THEN weight END),0.0)"
+    )
+    signature = "value" if workload == "sum_squares" else "value,weight"
+    registration = f"CREATE MACRO bench_{workload}({signature}) AS {expression};\n"
+    (job / "setup.sql").write_text(setup)
+    (job / "registration.sql").write_text(registration)
+    (job / "source_input.sql").write_text(
+        "SELECT id,value,weight,g_uniform,g_skewed FROM bench_input ORDER BY id;\n"
+    )
+    (job / "cpu_modes.tsv").write_text("native\tEquivalent DuckDB CPU SQL\n")
+    (job / "query_kinds.tsv").write_text(
+        "".join(f"{kind}\n" for kind in AGGREGATE_KINDS)
+    )
+    for kind, column in (
+        ("global", None),
+        ("grouped_uniform", "g_uniform"),
+        ("grouped_skewed", "g_skewed"),
+    ):
+        prefix = f"{column} AS group_key," if column else ""
+        suffix = f" GROUP BY {column} ORDER BY {column}" if column else ""
+        for mode, expr in (
+            ("native", expression),
+            ("gpu", f"bench_{workload}({signature})"),
+        ):
+            (job / f"{kind}_{mode}.sql").write_text(
+                f"SELECT {prefix}{expr} AS result FROM bench_input{suffix};\n"
+            )
+    config = {
+        "workload": workload,
+        "rows": rows,
+        "warmups": args.warmups,
+        "repetitions": args.repetitions,
+        "threads": args.threads,
+        "plugin": "-",
+        "pin": 0,
+        "projection": 0,
+        "validate_only": 0,
+        "aggregate_rewrite": 1,
+    }
+    (job / "config.txt").write_text(
+        "".join(f"{key}={value}\n" for key, value in config.items())
+    )
+    return job
+
+
 def make_job(workload, rows, args):
+    if workload in AGGREGATE_WORKLOADS:
+        return make_aggregate_job(workload, rows, args)
     job = args.output_dir / "jobs" / workload / str(rows)
     job.mkdir(parents=True)
     setup, modes, bodies, projection, aggregate = definitions(workload, rows, args)

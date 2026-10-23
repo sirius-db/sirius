@@ -4,7 +4,9 @@ This directory contains the benchmark host, independently authored UDF modules,
 deterministic dataset generators, exact query variants, and result collection.
 It exercises SQL macro, cuDF, and CUDA rewrites without an AI service or any
 previously generated packages. The optional public UDFBench Q1 adaptation is
-separate from the three synthetic workloads. No confidential examples are used.
+separate from the three synthetic scalar workloads. Two additional synthetic
+aggregate-to-SQL workloads use executable source aggregates as correctness
+references. No confidential examples are used.
 
 ## Check out and build
 
@@ -267,6 +269,64 @@ Run the stage driver/parser checks without a GPU:
 pixi run --locked -e cuda12 python -m unittest discover \
   -s test/udf_performance -p 'test_*.py'
 ```
+
+## Aggregate-to-SQL stage workloads
+
+The same external build supports `sum_squares` and `weighted_mean` without a
+native UDF module. GPU queries invoke SQL macros; the CPU baseline is equivalent
+DuckDB SQL with GPU execution disabled. The CPU timing does **not** measure the
+original Python aggregate or a Python/JVM UDAF runtime.
+
+```bash
+pixi run --locked -e cuda12 cmake --build "$BENCH_BUILD" -j2
+pixi run --locked -e cuda12 python test/udf_performance/run_stages.py \
+  --build-dir "$BENCH_BUILD" --output-dir "$BENCH_WORK/aggregate-stage-results" \
+  --workloads sum_squares weighted_mean --sizes 100000 1000000 \
+  --batch-mib 8 --gpu-budget-mib 512 --host-budget-mib 1024 \
+  --threads 1 --warmups 3 --repetitions 7
+```
+
+Each workload profiles three accurately named query shapes: `global`,
+`grouped_uniform` with 1,024 evenly distributed groups, and `grouped_skewed`
+with 1,024 groups and approximately seven-eighths of rows assigned to group 0.
+The generated input includes NULL values and NULL weights. Values are bounded
+integers or binary fractions stored as `DOUBLE`, and weights are small integers
+stored as `DOUBLE`, keeping partial sums exact over the tested input sizes.
+
+The sum-of-squares macro expands to `SUM(value * value)`. The weighted-mean macro
+expands to:
+
+```sql
+SUM(CASE WHEN value IS NOT NULL AND weight IS NOT NULL THEN value * weight END)
+/ NULLIF(
+    SUM(CASE WHEN value IS NOT NULL AND weight IS NOT NULL THEN weight END),
+    0.0
+  )
+```
+
+Before launching any profiling process for a workload and input size, a separate
+untimed host exports **every input row** and all ordered CPU/GPU aggregate results.
+The driver executes the unmodified synthetic source adapter in
+`.agents/skills/sirius-udf/assets/aggregate/oracle.py`, which invokes the original
+update, merge, and finalization implementations from `original.py` with seven
+partial-state partitions. It requires exact logical types, NULLs, and IEEE bits
+for every output cell against both CPU SQL and GPU SQL, plus one GPU execution
+and zero fallbacks for each query. A source failure or mismatch prevents all
+profiling for that job. These source checks supplement the broader aggregate
+conversion tests; they do not claim equivalence for arbitrary UDAFs or inputs.
+
+Each job retains `aggregate-preflight.json`, all three complete typed source
+requests/responses, a source hash and verdict in `source-reference-verdict.json`,
+and the separately captured operator evidence described above. These full-input
+reference artifacts can be large. The preflight uses its own `oracle.duckdb` and
+log directory, so its queries cannot enter the timed TRACE windows. The profiled
+host independently rechecks all aggregate outputs against CPU SQL before and
+after profiling queries. Global/grouped aggregation and its surrounding projection,
+scan, and result stages remain accumulated operator work rather than kernel-only
+time or a query-latency speedup. Pressure and timer-resolution rules are unchanged.
+
+The aggregate workloads are available through `run_stages.py`; the older
+`run_bench.py` command retains its original scalar workloads and timing behavior.
 
 ## Outputs and harness tests
 

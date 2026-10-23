@@ -1,0 +1,241 @@
+{
+  "benchmark_case": "weighted_mean_partitioned_grouped",
+  "cases": [
+    {
+      "candidate": "cases/sum_squares_edge_global/candidate.sql",
+      "gpu_required": true,
+      "id": "sum_squares_edge_global",
+      "input": "cases/sum_squares_edge_global/input.sql",
+      "parameters": {
+        "aggregate": "sum_squares",
+        "group_columns": [],
+        "merge_partitions": 7,
+        "value_columns": [
+          2
+        ]
+      },
+      "setup": "cases/sum_squares_edge_global/setup.sql"
+    },
+    {
+      "candidate": "cases/sum_squares_edge_grouped/candidate.sql",
+      "gpu_required": true,
+      "id": "sum_squares_edge_grouped",
+      "input": "cases/sum_squares_edge_grouped/input.sql",
+      "parameters": {
+        "aggregate": "sum_squares",
+        "group_columns": [
+          0,
+          1
+        ],
+        "merge_partitions": 7,
+        "value_columns": [
+          2
+        ]
+      },
+      "setup": "cases/sum_squares_edge_grouped/setup.sql"
+    },
+    {
+      "candidate": "cases/sum_squares_empty_global/candidate.sql",
+      "gpu_required": false,
+      "id": "sum_squares_empty_global",
+      "input": "cases/sum_squares_empty_global/input.sql",
+      "parameters": {
+        "aggregate": "sum_squares",
+        "group_columns": [],
+        "merge_partitions": 7,
+        "value_columns": [
+          2
+        ]
+      },
+      "setup": "cases/sum_squares_empty_global/setup.sql"
+    },
+    {
+      "candidate": "cases/sum_squares_empty_grouped/candidate.sql",
+      "gpu_required": false,
+      "id": "sum_squares_empty_grouped",
+      "input": "cases/sum_squares_empty_grouped/input.sql",
+      "parameters": {
+        "aggregate": "sum_squares",
+        "group_columns": [
+          0,
+          1
+        ],
+        "merge_partitions": 7,
+        "value_columns": [
+          2
+        ]
+      },
+      "setup": "cases/sum_squares_empty_grouped/setup.sql"
+    },
+    {
+      "candidate": "cases/sum_squares_partitioned_global/candidate.sql",
+      "gpu_required": true,
+      "id": "sum_squares_partitioned_global",
+      "input": "cases/sum_squares_partitioned_global/input.sql",
+      "parameters": {
+        "aggregate": "sum_squares",
+        "group_columns": [],
+        "merge_partitions": 7,
+        "value_columns": [
+          2
+        ]
+      },
+      "setup": "cases/sum_squares_partitioned_global/setup.sql"
+    },
+    {
+      "candidate": "cases/sum_squares_partitioned_grouped/candidate.sql",
+      "gpu_required": true,
+      "id": "sum_squares_partitioned_grouped",
+      "input": "cases/sum_squares_partitioned_grouped/input.sql",
+      "parameters": {
+        "aggregate": "sum_squares",
+        "group_columns": [
+          0,
+          1
+        ],
+        "merge_partitions": 7,
+        "value_columns": [
+          2
+        ]
+      },
+      "setup": "cases/sum_squares_partitioned_grouped/setup.sql"
+    },
+    {
+      "candidate": "cases/weighted_mean_edge_global/candidate.sql",
+      "gpu_required": true,
+      "id": "weighted_mean_edge_global",
+      "input": "cases/weighted_mean_edge_global/input.sql",
+      "parameters": {
+        "aggregate": "weighted_mean",
+        "group_columns": [],
+        "merge_partitions": 7,
+        "value_columns": [
+          2,
+          3
+        ]
+      },
+      "setup": "cases/weighted_mean_edge_global/setup.sql"
+    },
+    {
+      "candidate": "cases/weighted_mean_edge_grouped/candidate.sql",
+      "gpu_required": true,
+      "id": "weighted_mean_edge_grouped",
+      "input": "cases/weighted_mean_edge_grouped/input.sql",
+      "parameters": {
+        "aggregate": "weighted_mean",
+        "group_columns": [
+          0,
+          1
+        ],
+        "merge_partitions": 7,
+        "value_columns": [
+          2,
+          3
+        ]
+      },
+      "setup": "cases/weighted_mean_edge_grouped/setup.sql"
+    },
+    {
+      "candidate": "cases/weighted_mean_empty_global/candidate.sql",
+      "gpu_required": false,
+      "id": "weighted_mean_empty_global",
+      "input": "cases/weighted_mean_empty_global/input.sql",
+      "parameters": {
+        "aggregate": "weighted_mean",
+        "group_columns": [],
+        "merge_partitions": 7,
+        "value_columns": [
+          2,
+          3
+        ]
+      },
+      "setup": "cases/weighted_mean_empty_global/setup.sql"
+    },
+    {
+      "candidate": "cases/weighted_mean_empty_grouped/candidate.sql",
+      "gpu_required": false,
+      "id": "weighted_mean_empty_grouped",
+      "input": "cases/weighted_mean_empty_grouped/input.sql",
+      "parameters": {
+        "aggregate": "weighted_mean",
+        "group_columns": [
+          0,
+          1
+        ],
+        "merge_partitions": 7,
+        "value_columns": [
+          2,
+          3
+        ]
+      },
+      "setup": "cases/weighted_mean_empty_grouped/setup.sql"
+    },
+    {
+      "candidate": "cases/weighted_mean_partitioned_global/candidate.sql",
+      "gpu_required": true,
+      "id": "weighted_mean_partitioned_global",
+      "input": "cases/weighted_mean_partitioned_global/input.sql",
+      "parameters": {
+        "aggregate": "weighted_mean",
+        "group_columns": [],
+        "merge_partitions": 7,
+        "value_columns": [
+          2,
+          3
+        ]
+      },
+      "setup": "cases/weighted_mean_partitioned_global/setup.sql"
+    },
+    {
+      "candidate": "cases/weighted_mean_partitioned_grouped/candidate.sql",
+      "gpu_required": true,
+      "id": "weighted_mean_partitioned_grouped",
+      "input": "cases/weighted_mean_partitioned_grouped/input.sql",
+      "parameters": {
+        "aggregate": "weighted_mean",
+        "group_columns": [
+          0,
+          1
+        ],
+        "merge_partitions": 7,
+        "value_columns": [
+          2,
+          3
+        ]
+      },
+      "setup": "cases/weighted_mean_partitioned_grouped/setup.sql"
+    },
+    {
+      "candidate": "cases/weighted_mean_fractional_global/candidate.sql",
+      "comparison": {
+        "float_tolerances": {
+          "0": {
+            "atol": 1e-12,
+            "rtol": 1e-12
+          }
+        }
+      },
+      "gpu_required": true,
+      "id": "weighted_mean_fractional_global",
+      "input": "cases/weighted_mean_fractional_global/input.sql",
+      "parameters": {
+        "aggregate": "weighted_mean",
+        "group_columns": [],
+        "merge_partitions": 3,
+        "value_columns": [
+          2,
+          3
+        ]
+      },
+      "setup": "cases/weighted_mean_fractional_global/setup.sql"
+    }
+  ],
+  "oracle": {
+    "argv": [
+      "{python}",
+      "oracle.py"
+    ],
+    "timeout_seconds": 60
+  },
+  "version": 1
+}

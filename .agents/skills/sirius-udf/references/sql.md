@@ -1,5 +1,8 @@
 # SQL target
 
+For aggregate UDFs, read [aggregate conversion](aggregate.md); the aggregate
+scaffold includes an original-runtime adapter and complete grouped-result tests.
+
 Use a DuckDB scalar macro when expansion into existing expressions preserves the
 reference behavior. The macro is bound by DuckDB before Sirius translates the
 logical plan. A legal DuckDB expression can still be unsupported by Sirius:
