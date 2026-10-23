@@ -21,6 +21,7 @@
 #include "exchange/exchange_service.hpp"
 #include "op/cudf_sort_order.hpp"
 #include "op/sirius_physical_cte.hpp"
+#include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_exchange_sink.hpp"
 #include "op/sirius_physical_exchange_source.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
@@ -169,6 +170,27 @@ struct rewriter {
     return placement::spread;
   }
 
+  /// After hash exchanges a rank's build holds only its share of the keys: a filter from it
+  /// alone would drop rows other ranks' builds match, so every rank's Bloom is merged.
+  void merge_filters_across_ranks(op::sirius_physical_hash_join& join)
+  {
+    if (!join.publishes_dynamic_filters()) { return; }
+    auto const build_rows = join.children[1]->estimated_cardinality;
+    if (build_rows < min_merged_build_rows) {
+      join.cancel_dynamic_filter_publication();
+      shape += "f";
+      return;
+    }
+    auto const first = stream();
+    next_stream += max_filter_keys;
+    join.set_distributed_dynamic_filters(
+      {.service      = service,
+       .first_stream = first,
+       .gpu          = gpu,
+       .bloom_keys   = std::clamp(build_rows, min_bloom_keys, max_bloom_keys)});
+    shape += "F";
+  }
+
   placement visit(duckdb::unique_ptr<op::sirius_physical_operator>& slot)
   {
     auto& node = *slot;
@@ -205,27 +227,50 @@ struct rewriter {
             build.children[0], exchange_spec{.routing = exchange_spec::mode::broadcast}, false);
           return done(probe_rows == placement::rank0 ? placement::rank0 : placement::spread);
         }
-        // After the exchanges a rank's build holds only its share of the keys: a filter from it
-        // alone would drop rows other ranks' builds match, so every rank's Bloom is merged.
-        auto const build_rows = node.children[1]->estimated_cardinality;
-        if (join.publishes_dynamic_filters() && build_rows < min_merged_build_rows) {
-          join.cancel_dynamic_filter_publication();
-          shape += "f";
-        } else if (join.publishes_dynamic_filters()) {
-          auto const first = stream();
-          next_stream += max_filter_keys;
-          join.set_distributed_dynamic_filters(
-            {.service      = service,
-             .first_stream = first,
-             .gpu          = gpu,
-             .bloom_keys   = std::clamp(build_rows, min_bloom_keys, max_bloom_keys)});
-          shape += "F";
-        }
+        merge_filters_across_ranks(join);
         // Each side's rows meet their matches once both are exchanged on the join keys.
         hash_below(probe);
         hash_below(build);
         return done(placement::spread);
       }
+
+      case T::LEFT_DELIM_JOIN:
+      case T::RIGHT_DELIM_JOIN: {
+        // A delim join fans one input out to a side of its inner join (LEFT: the probe, RIGHT:
+        // the build) and to the DISTINCT that the DELIM_SCANs replay. That input is hashed on the
+        // delim columns before the fan-out, exactly as its join side would be: each rank's
+        // DISTINCT then holds keys no other rank holds, and that join side needs no exchange.
+        auto& delim = node.Cast<op::sirius_physical_delim_join>();
+        if (!delim.join || delim.join->type != T::HASH_JOIN || delim.distinct == nullptr) {
+          throw sirius::not_implemented_exception(
+            "distributed execution: a delim join without a hash join");
+        }
+        auto& join  = delim.join->Cast<op::sirius_physical_hash_join>();
+        auto& probe = expect(*expect(*join.children[0], T::CONCAT).children[0], T::PARTITION)
+                        .Cast<op::sirius_physical_partition>();
+        auto& build = expect(*expect(*join.children[1], T::CONCAT).children[0], T::PARTITION)
+                        .Cast<op::sirius_physical_partition>();
+        bool const left  = node.type == T::LEFT_DELIM_JOIN;
+        auto& fanned     = left ? probe : build;
+        auto& other      = left ? build : probe;
+        auto const& keys = fanned.partition_keys();
+        if (std::set<int>(keys.begin(), keys.end()) !=
+            std::set<int>(delim.distinct->group_idx.begin(), delim.distinct->group_idx.end())) {
+          throw sirius::not_implemented_exception(
+            "distributed execution: a delim join whose join keys are not its delim columns");
+        }
+        visit(node.children[0]);
+        exchange_spec spec;
+        spec.key_columns    = keys;
+        spec.key_cast_types = fanned.specification().key_cast_types;
+        insert(node.children[0], std::move(spec), false);
+        merge_filters_across_ranks(join);
+        hash_below(other);
+        return done(placement::spread);
+      }
+
+      // A rank's share of its delim join's DISTINCT (see LEFT_DELIM_JOIN).
+      case T::DELIM_SCAN: return done(placement::spread);
 
       case T::NESTED_LOOP_JOIN: {
         // NESTED_LOOP_JOIN → CONCAT → PARTITION → input, probe then build. Every rank keeps its
