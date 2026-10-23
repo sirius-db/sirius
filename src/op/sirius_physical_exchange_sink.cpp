@@ -96,7 +96,13 @@ std::unique_ptr<operator_data> sirius_physical_exchange_sink::execute(
   auto const batches  = input.get_read_only_batches();
   std::vector<std::shared_ptr<cucascade::data_batch>> slices;
   std::vector<std::size_t> ranks;
+  if (!batches.empty()) {
+    std::lock_guard lock{_input_schema_mutex};
+    if (!_input_schema) { _input_schema = cudf::empty_like(get_cudf_table_view(batches.front())); }
+  }
   for (std::size_t b = 0; b < handles.size(); ++b) {
+    // Nothing to send, and a range exchange's boundaries may not exist when no rank has rows.
+    if (get_cudf_table_view(batches[b]).num_rows() == 0) { continue; }
     auto routed = route(batches[b], handles[b], stream);
     for (exchange::rank_t r = 0; r < routed.size(); ++r) {
       if (!routed[r] || get_cudf_table_view(*routed[r]).num_rows() == 0) { continue; }
@@ -105,6 +111,13 @@ std::unique_ptr<operator_data> sirius_physical_exchange_sink::execute(
     }
   }
   return std::make_unique<routed_operator_data>(std::move(slices), std::move(ranks));
+}
+
+std::unique_ptr<cudf::table> sirius_physical_exchange_sink::empty_like_input() const
+{
+  std::lock_guard lock{_input_schema_mutex};
+  if (!_input_schema) { return nullptr; }
+  return cudf::empty_like(_input_schema->view());
 }
 
 std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_exchange_sink::route(
