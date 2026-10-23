@@ -417,6 +417,7 @@ TEST_CASE_METHOD(UnionFixture,
   run_ok("INSERT INTO udec4 VALUES (1.5000), (2.0001), (NULL);");
   run_ok("INSERT INTO udate VALUES ('2024-01-01'), ('2024-02-29'), (NULL);");
   run_ok("INSERT INTO uts VALUES ('2024-01-01 00:00:00'), ('2024-01-01 12:30:00'), (NULL);");
+  run_ok("CHECKPOINT;");
 
   compare_gpu_vs_cpu("SELECT d FROM udec2 UNION ALL SELECT d FROM udec4");
   compare_gpu_vs_cpu("SELECT d FROM udec2 UNION SELECT d FROM udec4");
