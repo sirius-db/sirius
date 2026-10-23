@@ -50,15 +50,27 @@ double duckdb_power_of_ten(int scale)
   return static_cast<double>(lower) + static_cast<double>(upper) * 0x1p64;
 }
 
+/// @p value minus @p high, where @p high is DOUBLE(@p value), as a DOUBLE. @p high can round to
+/// +-2^(bits - 1); +2^(bits - 1) has no Int value, so either limit is subtracted in two halves
+/// instead of being converted back.
+template <typename Int>
+__device__ double low_part(Int value, double high)
+{
+  constexpr int bits = static_cast<int>(sizeof(Int) * 8);
+  constexpr Int half = Int{1} << (bits - 2);
+  double const limit = static_cast<double>(half) * 2.0;
+  if (high >= limit) { return static_cast<double>((value - half) - half); }
+  if (high <= -limit) { return static_cast<double>((value + half) + half); }
+  return static_cast<double>(value - static_cast<Int>(high));
+}
+
 /// @p sum / (@p divisor_hi + @p divisor_lo) rounded once to DOUBLE. The sum is split into two
 /// DOUBLEs and the quotient corrected by its remainder, so it carries about 106 bits until the
 /// final rounding.
 __device__ double divide_double_double(__int128_t sum, double divisor_hi, double divisor_lo)
 {
-  double const sum_hi = static_cast<double>(sum);
-  // sum_hi rounds to 2^127 only for |sum| near 2^127, above any DECIMAL(38) total.
-  double const sum_lo =
-    fabs(sum_hi) < 0x1p127 ? static_cast<double>(sum - static_cast<__int128_t>(sum_hi)) : 0.0;
+  double const sum_hi        = static_cast<double>(sum);
+  double const sum_lo        = low_part(sum, sum_hi);
   double const quotient      = sum_hi / divisor_hi;
   double const product       = quotient * divisor_hi;
   double const product_error = fma(quotient, divisor_hi, -product);
@@ -76,10 +88,15 @@ struct unscaled_average {
 
   __device__ double operator()(cudf::size_type i) const
   {
-    // count * power_of_ten as an exact two-DOUBLE product; counts stay below 2^53.
-    double const count_value = static_cast<double>(count.element<int64_t>(i));
-    double const divisor_hi  = count_value * power_of_ten;
-    double const divisor_lo  = fma(count_value, power_of_ten, -divisor_hi);
+    // count * power_of_ten as two DOUBLEs. The count is split too, since an INT64 count above
+    // 2^53 does not fit one DOUBLE.
+    auto const count_value  = count.element<int64_t>(i);
+    double const count_hi   = static_cast<double>(count_value);
+    double const count_lo   = low_part(count_value, count_hi);
+    double const product    = count_hi * power_of_ten;
+    double const error      = fma(count_hi, power_of_ten, -product) + count_lo * power_of_ten;
+    double const divisor_hi = product + error;
+    double const divisor_lo = error - (divisor_hi - product);
     return divide_double_double(
       static_cast<__int128_t>(sum.data<Rep>()[i]), divisor_hi, divisor_lo);
   }

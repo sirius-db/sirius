@@ -79,6 +79,28 @@ TEST_CASE_METHOD(DecimalAvgFixture,
 }
 
 TEST_CASE_METHOD(DecimalAvgFixture,
+                 "decimal avg - equal grouped averages with sums near +-2^127 are one value",
+                 "[integration][gpu_execution][aggregate][decimal_avg]")
+{
+  // Five copies sum to just below 2^127 in magnitude, which rounds to 2^127 as a DOUBLE.
+  // Filter each group before aggregation: the DECIMAL128 overflow guard bounds the entire
+  // aggregate input, so combining these groups in one input would conservatively fall back.
+  run_ok(
+    "CREATE TABLE eqb AS SELECT g::INTEGER g FROM range(1, 6) a(g), range(5) b(i) WHERE i < g;");
+  run_ok("CHECKPOINT;");
+  compare_gpu_vs_cpu(
+    "SELECT a FROM (SELECT avg(CAST(34028236692093845401864164169247778406 AS "
+    "DECIMAL(38,0))) a FROM eqb WHERE g = 1 GROUP BY g UNION ALL SELECT "
+    "avg(CAST(34028236692093845401864164169247778406 AS DECIMAL(38,0))) a "
+    "FROM eqb WHERE g = 5 GROUP BY g) GROUP BY a;");
+  compare_gpu_vs_cpu(
+    "SELECT a FROM (SELECT avg(CAST(-34028236692093845401864164169247778406 AS "
+    "DECIMAL(38,0))) a FROM eqb WHERE g = 1 GROUP BY g UNION ALL SELECT "
+    "avg(CAST(-34028236692093845401864164169247778406 AS DECIMAL(38,0))) a "
+    "FROM eqb WHERE g = 5 GROUP BY g) GROUP BY a;");
+}
+
+TEST_CASE_METHOD(DecimalAvgFixture,
                  "decimal avg - grouped AVG over DECIMAL keeps NULLs and NULL-only groups",
                  "[integration][gpu_execution][aggregate][decimal_avg]")
 {

@@ -234,6 +234,7 @@ set(TEST_SOURCES
     test/cpp/operator/window/test_cumulative.cpp
     test/cpp/operator/window/test_ranking.cpp
     test/cpp/operator/window/test_whole_partition.cpp
+    test/cpp/operator/aggregate/test_average_as_double.cpp
     test/cpp/operator/aggregate/test_decimal_sum_widening.cpp
     test/cpp/operator/aggregate/test_gpu_merge_impl.cpp
     test/cpp/operator/aggregate/test_sorted_keys.cpp
