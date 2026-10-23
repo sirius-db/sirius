@@ -1312,7 +1312,7 @@ prefetching_cache::object_residency prefetching_cache::residency(std::string_vie
   std::vector<std::shared_ptr<cache_generation>> family;
   {
     std::shared_lock lk(_map_mtx);
-    auto const it = _generations_by_path.find(object_path);
+    auto const it = _generations_by_path.find(std::string(object_path));
     if (it == _generations_by_path.end()) { return {}; }
     for (auto const& weak : it->second) {
       family.push_back(weak.lock());

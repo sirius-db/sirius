@@ -962,198 +962,198 @@ TEST_CASE("an empty cache admits one request larger than its cap", "[cache][cach
   fadvise_chunks(*other, 0, 1);
   CHECK(other->prepare_prefetch(false) == sirius::io::prepare_result::allocation_failed);
   CHECK(cache->claimed_bytes() == 4 * chunk_size);
-  TEST_CASE("raw cache validates identities across opens", "[cache][object_identity]")
-  {
-    cache_fixture fixture;
-    int const mode            = GENERATE(0, 1, 2);  // same version, changed version, no validator
-    std::string const version = mode == 2 ? "" : "v1";
-    auto open                 = [&](std::string tag) {
-      return std::make_unique<sirius::io::sirius_datasource>(
-        fixture.context,
-        std::make_shared<controlled_object>("controlled://versioned", std::move(tag)));
-    };
-    fixture.datasource = open(version);
-    fixture.advise(0);
-    REQUIRE(fixture.datasource->prefetch_async([](sirius::io::cache::prefetch_result) noexcept {
-    }) == sirius::io::prefetch_refusal::issued);
-    auto fill = fixture.context->reactor().take_next();
-    REQUIRE(fill);
-    complete_success(*fill, 0x5a);
-    auto reopened = open(mode == 1 ? "v2" : version);
-    std::array<std::uint8_t, read_size> bytes{};
-    auto read = reopened->host_read_async(0, bytes.size(), bytes.data());
-    if (mode != 0) {
-      auto request = fixture.context->reactor().take_next();
-      REQUIRE(request);
-      complete_success(*request, 0x7b);
-    }
-    REQUIRE(read.wait_for(2s) == std::future_status::ready);
-    CHECK(read.get() == bytes.size());
-    CHECK(std::ranges::all_of(bytes, [&](auto b) { return b == (mode == 0 ? 0x5a : 0x7b); }));
-    CHECK(fixture.context->reactor().pending() == 0);
-  }
+}
 
-  TEST_CASE("a late old raw-cache fill cannot overwrite the new version",
-            "[cache][object_identity]")
-  {
-    cache_fixture fixture;
-    auto open = [&](std::string tag) {
-      return std::make_unique<sirius::io::sirius_datasource>(
-        fixture.context,
-        std::make_shared<controlled_object>("controlled://versioned", std::move(tag)));
-    };
-    fixture.datasource = open("v1");
-    fixture.advise(0);
-    REQUIRE(fixture.datasource->prefetch_async([](sirius::io::cache::prefetch_result) noexcept {
-    }) == sirius::io::prefetch_refusal::issued);
-    auto old_fill = fixture.context->reactor().take_next();
-    REQUIRE(old_fill);
-    auto old_source    = std::move(fixture.datasource);
-    fixture.datasource = open("v2");
-    fixture.advise(0);
-    REQUIRE(fixture.datasource->prefetch_async([](sirius::io::cache::prefetch_result) noexcept {
-    }) == sirius::io::prefetch_refusal::issued);
-    auto new_fill = fixture.context->reactor().take_next();
-    REQUIRE(new_fill);
-    complete_success(*new_fill, 0x7b);
-    complete_success(*old_fill, 0x5a);
-    auto reopened = open("v2");
-    std::array<std::uint8_t, read_size> bytes{};
-    auto read = reopened->host_read_async(0, bytes.size(), bytes.data());
-    REQUIRE(read.wait_for(2s) == std::future_status::ready);
-    CHECK(read.get() == bytes.size());
-    CHECK(std::ranges::all_of(bytes, [](auto b) { return b == 0x7b; }));
-    read = old_source->host_read_async(0, bytes.size(), bytes.data());
-    REQUIRE(read.wait_for(2s) == std::future_status::ready);
-    CHECK(read.get() == bytes.size());
-    CHECK(std::ranges::all_of(bytes, [](auto b) { return b == 0x5a; }));
-    CHECK(fixture.context->reactor().pending() == 0);
+TEST_CASE("raw cache validates identities across opens", "[cache][object_identity]")
+{
+  cache_fixture fixture;
+  int const mode            = GENERATE(0, 1, 2);  // same version, changed version, no validator
+  std::string const version = mode == 2 ? "" : "v1";
+  auto open                 = [&](std::string tag) {
+    return std::make_unique<sirius::io::sirius_datasource>(
+      fixture.context,
+      std::make_shared<controlled_object>("controlled://versioned", std::move(tag)));
+  };
+  fixture.datasource = open(version);
+  fixture.advise(0);
+  REQUIRE(fixture.datasource->prefetch_async([](sirius::io::cache::prefetch_result) noexcept {}) ==
+          sirius::io::prefetch_refusal::issued);
+  auto fill = fixture.context->reactor().take_next();
+  REQUIRE(fill);
+  complete_success(*fill, 0x5a);
+  auto reopened = open(mode == 1 ? "v2" : version);
+  std::array<std::uint8_t, read_size> bytes{};
+  auto read = reopened->host_read_async(0, bytes.size(), bytes.data());
+  if (mode != 0) {
+    auto request = fixture.context->reactor().take_next();
+    REQUIRE(request);
+    complete_success(*request, 0x7b);
   }
+  REQUIRE(read.wait_for(2s) == std::future_status::ready);
+  CHECK(read.get() == bytes.size());
+  CHECK(std::ranges::all_of(bytes, [&](auto b) { return b == (mode == 0 ? 0x5a : 0x7b); }));
+  CHECK(fixture.context->reactor().pending() == 0);
+}
 
-  TEST_CASE("superseded raw cache entries release their arenas and handles without pressure",
-            "[cache][object_identity][raw_retirement]")
-  {
-    cache_fixture fixture;
-    bool const validated = GENERATE(true, false);
-    std::vector<std::weak_ptr<controlled_object>> versions;
-    for (int i = 0; i < 24; ++i) {
-      auto object = std::make_shared<controlled_object>("controlled://retirement",
-                                                        validated ? std::to_string(i) : "");
-      versions.emplace_back(object);
-      fixture.datasource = std::make_unique<sirius::io::sirius_datasource>(fixture.context, object);
-      fixture.advise(0);
-      REQUIRE(fixture.datasource->prefetch_async([](sirius::io::cache::prefetch_result) noexcept {
-      }) == sirius::io::prefetch_refusal::issued);
-      auto fill = fixture.context->reactor().take_next();
-      REQUIRE(fill);
-      complete_success(*fill);
-      CHECK(fixture.context->cache()->file_entry_count_for_testing() == 1);
-    }
-    fixture.datasource.reset();
-    // No query, allocation pressure or explicit evict call is needed to retire old versions.
-    auto const deadline = std::chrono::steady_clock::now() + 3s;
-    auto old_released   = [&] {
-      return std::all_of(
-        versions.begin(), versions.end() - 1, [](auto const& v) { return v.expired(); });
-    };
-    while (!old_released() && std::chrono::steady_clock::now() < deadline) {
-      std::this_thread::sleep_for(10ms);
-    }
-    CHECK(old_released());
-    CHECK_FALSE(versions.back().expired());
-    CHECK(fixture.context->cache()->claimed_bytes() == chunk_size);
-    fixture.context->shutdown_cache();
-    CHECK(versions.back().expired());
-  }
+TEST_CASE("a late old raw-cache fill cannot overwrite the new version", "[cache][object_identity]")
+{
+  cache_fixture fixture;
+  auto open = [&](std::string tag) {
+    return std::make_unique<sirius::io::sirius_datasource>(
+      fixture.context,
+      std::make_shared<controlled_object>("controlled://versioned", std::move(tag)));
+  };
+  fixture.datasource = open("v1");
+  fixture.advise(0);
+  REQUIRE(fixture.datasource->prefetch_async([](sirius::io::cache::prefetch_result) noexcept {}) ==
+          sirius::io::prefetch_refusal::issued);
+  auto old_fill = fixture.context->reactor().take_next();
+  REQUIRE(old_fill);
+  auto old_source    = std::move(fixture.datasource);
+  fixture.datasource = open("v2");
+  fixture.advise(0);
+  REQUIRE(fixture.datasource->prefetch_async([](sirius::io::cache::prefetch_result) noexcept {}) ==
+          sirius::io::prefetch_refusal::issued);
+  auto new_fill = fixture.context->reactor().take_next();
+  REQUIRE(new_fill);
+  complete_success(*new_fill, 0x7b);
+  complete_success(*old_fill, 0x5a);
+  auto reopened = open("v2");
+  std::array<std::uint8_t, read_size> bytes{};
+  auto read = reopened->host_read_async(0, bytes.size(), bytes.data());
+  REQUIRE(read.wait_for(2s) == std::future_status::ready);
+  CHECK(read.get() == bytes.size());
+  CHECK(std::ranges::all_of(bytes, [](auto b) { return b == 0x7b; }));
+  read = old_source->host_read_async(0, bytes.size(), bytes.data());
+  REQUIRE(read.wait_for(2s) == std::future_status::ready);
+  CHECK(read.get() == bytes.size());
+  CHECK(std::ranges::all_of(bytes, [](auto b) { return b == 0x5a; }));
+  CHECK(fixture.context->reactor().pending() == 0);
+}
 
-  TEST_CASE("retired raw arena survives an abandoned in-flight fill until physical completion",
-            "[cache][object_identity][raw_retirement]")
-  {
-    cache_fixture fixture;
-    auto object = std::make_shared<controlled_object>("controlled://retirement", "v1");
-    std::weak_ptr<controlled_object> old = object;
+TEST_CASE("superseded raw cache entries release their arenas and handles without pressure",
+          "[cache][object_identity][raw_retirement]")
+{
+  cache_fixture fixture;
+  bool const validated = GENERATE(true, false);
+  std::vector<std::weak_ptr<controlled_object>> versions;
+  for (int i = 0; i < 24; ++i) {
+    auto object = std::make_shared<controlled_object>("controlled://retirement",
+                                                      validated ? std::to_string(i) : "");
+    versions.emplace_back(object);
     fixture.datasource = std::make_unique<sirius::io::sirius_datasource>(fixture.context, object);
-    object.reset();
     fixture.advise(0);
     REQUIRE(fixture.datasource->prefetch_async([](sirius::io::cache::prefetch_result) noexcept {
     }) == sirius::io::prefetch_refusal::issued);
     auto fill = fixture.context->reactor().take_next();
     REQUIRE(fill);
-    fixture.datasource = std::make_unique<sirius::io::sirius_datasource>(
-      fixture.context, std::make_shared<controlled_object>("controlled://retirement", "v2"));
-    fixture.advise(0);
-    std::this_thread::sleep_for(250ms);  // let the evictor release the disposed v1 request
-    CHECK_FALSE(old.expired());
-    CHECK(fixture.context->cache()->claimed_bytes() == 2 * chunk_size);
     complete_success(*fill);
-    fill.reset();
-    auto const deadline = std::chrono::steady_clock::now() + 3s;
-    while (!old.expired() && std::chrono::steady_clock::now() < deadline) {
-      std::this_thread::sleep_for(10ms);
-    }
-    CHECK(old.expired());
-    CHECK(fixture.context->cache()->claimed_bytes() == chunk_size);
+    CHECK(fixture.context->cache()->file_entry_count_for_testing() == 1);
   }
+  fixture.datasource.reset();
+  // No query, allocation pressure or explicit evict call is needed to retire old versions.
+  auto const deadline = std::chrono::steady_clock::now() + 3s;
+  auto old_released   = [&] {
+    return std::all_of(
+      versions.begin(), versions.end() - 1, [](auto const& v) { return v.expired(); });
+  };
+  while (!old_released() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(10ms);
+  }
+  CHECK(old_released());
+  CHECK_FALSE(versions.back().expired());
+  CHECK(fixture.context->cache()->claimed_bytes() == chunk_size);
+  fixture.context->shutdown_cache();
+  CHECK(versions.back().expired());
+}
 
-  TEST_CASE("retired raw arena survives a cache-hit CUDA copy without a prefetch handle",
-            "[cache][object_identity][raw_retirement][gpu_execution]")
-  {
-    cache_fixture fixture;
-    auto object = std::make_shared<controlled_object>("controlled://retirement", "v1");
-    std::weak_ptr<controlled_object> old = object;
-    fixture.datasource = std::make_unique<sirius::io::sirius_datasource>(fixture.context, object);
-    object.reset();
-    fixture.advise(0);
-    REQUIRE(fixture.datasource->prefetch_async([](sirius::io::cache::prefetch_result) noexcept {
-    }) == sirius::io::prefetch_refusal::issued);
-    auto fill = fixture.context->reactor().take_next();
-    REQUIRE(fill);
-    complete_success(*fill, 0x6c);
-    fill.reset();
-    auto reader = std::make_unique<sirius::io::sirius_datasource>(
-      fixture.context, std::make_shared<controlled_object>("controlled://retirement", "v1"));
-    rmm::cuda_stream stream;
-    rmm::device_buffer destination{read_size, stream};
-    struct gate {
-      cudaStream_t stream;
-      std::atomic<bool> released{false};
-      ~gate()
-      {
-        released.store(true);
-        std::ignore = cudaStreamSynchronize(stream);
-      }
-    } blocked{stream.value()};
-    REQUIRE(cudaLaunchHostFunc(
-              stream.value(),
-              [](void* ptr) {
-                auto& ready = static_cast<gate*>(ptr)->released;
-                while (!ready.load()) {
-                  std::this_thread::sleep_for(1ms);
-                }
-              },
-              &blocked) == cudaSuccess);
-    auto read = reader->device_read_async(
-      0, read_size, static_cast<std::uint8_t*>(destination.data()), stream);
-    reader.reset();
-    fixture.datasource = std::make_unique<sirius::io::sirius_datasource>(
-      fixture.context, std::make_shared<controlled_object>("controlled://retirement", "v2"));
-    fixture.advise(0);
-    std::this_thread::sleep_for(250ms);
-    CHECK(read.wait_for(0ms) != std::future_status::ready);
-    CHECK_FALSE(old.expired());
-    blocked.released.store(true);
-    REQUIRE(read.wait_for(2s) == std::future_status::ready);
-    CHECK(read.get() == read_size);
-    std::array<std::uint8_t, read_size> host{};
-    REQUIRE(
-      cudaMemcpyAsync(
-        host.data(), destination.data(), host.size(), cudaMemcpyDeviceToHost, stream.value()) ==
-      cudaSuccess);
-    stream.synchronize();
-    CHECK(std::ranges::all_of(host, [](auto byte) { return byte == 0x6c; }));
-    auto const deadline = std::chrono::steady_clock::now() + 3s;
-    while (!old.expired() && std::chrono::steady_clock::now() < deadline) {
-      std::this_thread::sleep_for(10ms);
-    }
-    CHECK(old.expired());
+TEST_CASE("retired raw arena survives an abandoned in-flight fill until physical completion",
+          "[cache][object_identity][raw_retirement]")
+{
+  cache_fixture fixture;
+  auto object = std::make_shared<controlled_object>("controlled://retirement", "v1");
+  std::weak_ptr<controlled_object> old = object;
+  fixture.datasource = std::make_unique<sirius::io::sirius_datasource>(fixture.context, object);
+  object.reset();
+  fixture.advise(0);
+  REQUIRE(fixture.datasource->prefetch_async([](sirius::io::cache::prefetch_result) noexcept {}) ==
+          sirius::io::prefetch_refusal::issued);
+  auto fill = fixture.context->reactor().take_next();
+  REQUIRE(fill);
+  fixture.datasource = std::make_unique<sirius::io::sirius_datasource>(
+    fixture.context, std::make_shared<controlled_object>("controlled://retirement", "v2"));
+  fixture.advise(0);
+  std::this_thread::sleep_for(250ms);  // let the evictor release the disposed v1 request
+  CHECK_FALSE(old.expired());
+  CHECK(fixture.context->cache()->claimed_bytes() == 2 * chunk_size);
+  complete_success(*fill);
+  fill.reset();
+  auto const deadline = std::chrono::steady_clock::now() + 3s;
+  while (!old.expired() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(10ms);
   }
+  CHECK(old.expired());
+  CHECK(fixture.context->cache()->claimed_bytes() == chunk_size);
+}
+
+TEST_CASE("retired raw arena survives a cache-hit CUDA copy without a prefetch handle",
+          "[cache][object_identity][raw_retirement][gpu_execution]")
+{
+  cache_fixture fixture;
+  auto object = std::make_shared<controlled_object>("controlled://retirement", "v1");
+  std::weak_ptr<controlled_object> old = object;
+  fixture.datasource = std::make_unique<sirius::io::sirius_datasource>(fixture.context, object);
+  object.reset();
+  fixture.advise(0);
+  REQUIRE(fixture.datasource->prefetch_async([](sirius::io::cache::prefetch_result) noexcept {}) ==
+          sirius::io::prefetch_refusal::issued);
+  auto fill = fixture.context->reactor().take_next();
+  REQUIRE(fill);
+  complete_success(*fill, 0x6c);
+  fill.reset();
+  auto reader = std::make_unique<sirius::io::sirius_datasource>(
+    fixture.context, std::make_shared<controlled_object>("controlled://retirement", "v1"));
+  rmm::cuda_stream stream;
+  rmm::device_buffer destination{read_size, stream};
+  struct gate {
+    cudaStream_t stream;
+    std::atomic<bool> released{false};
+    ~gate()
+    {
+      released.store(true);
+      std::ignore = cudaStreamSynchronize(stream);
+    }
+  } blocked{stream.value()};
+  REQUIRE(cudaLaunchHostFunc(
+            stream.value(),
+            [](void* ptr) {
+              auto& ready = static_cast<gate*>(ptr)->released;
+              while (!ready.load()) {
+                std::this_thread::sleep_for(1ms);
+              }
+            },
+            &blocked) == cudaSuccess);
+  auto read =
+    reader->device_read_async(0, read_size, static_cast<std::uint8_t*>(destination.data()), stream);
+  reader.reset();
+  fixture.datasource = std::make_unique<sirius::io::sirius_datasource>(
+    fixture.context, std::make_shared<controlled_object>("controlled://retirement", "v2"));
+  fixture.advise(0);
+  std::this_thread::sleep_for(250ms);
+  CHECK(read.wait_for(0ms) != std::future_status::ready);
+  CHECK_FALSE(old.expired());
+  blocked.released.store(true);
+  REQUIRE(read.wait_for(2s) == std::future_status::ready);
+  CHECK(read.get() == read_size);
+  std::array<std::uint8_t, read_size> host{};
+  REQUIRE(cudaMemcpyAsync(
+            host.data(), destination.data(), host.size(), cudaMemcpyDeviceToHost, stream.value()) ==
+          cudaSuccess);
+  stream.synchronize();
+  CHECK(std::ranges::all_of(host, [](auto byte) { return byte == 0x6c; }));
+  auto const deadline = std::chrono::steady_clock::now() + 3s;
+  while (!old.expired() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(10ms);
+  }
+  CHECK(old.expired());
+}

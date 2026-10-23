@@ -339,7 +339,8 @@ TEST_CASE("cache refresh reports each increment once across overlapping refreshe
   cfg.apply_cache_mode();
   sirius::exec::query_lifecycle_registry lifecycle;
   sirius_scan_manager manager{lifecycle, cfg, *memory, single_gpu_index_for_dispose()};
-  auto* cache = manager.io_ctx()->cache();
+  // The default cache is built on first use.
+  auto* cache = manager.ensure_default_cache();
   REQUIRE(cache);
   REQUIRE(cache->is_armed());
   auto ds = manager.create_datasource(file.path.string());

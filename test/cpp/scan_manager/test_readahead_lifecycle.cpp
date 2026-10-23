@@ -881,9 +881,12 @@ struct resident_fixture {
   }
 };
 
-bool prefetched(sirius::op::scan::scan_info const& info)
+/// Prefetches of @p readahead that landed, early or while their consumer waited.
+std::uint64_t landed(readahead_scan_manager const& readahead)
 {
-  return info.get_prefetch_state() == sirius::op::scan::scan_info::prefetch_state::prefetched;
+  using kind = sirius::scan_manager::prefetch_outcome_kind;
+  return readahead.counters().outcome(kind::prefetched) +
+         readahead.counters().outcome(kind::wait_for_prefetch);
 }
 }  // namespace
 
@@ -893,7 +896,8 @@ TEST_CASE("the readahead does not issue past its resident budget until a split i
   resident_fixture fx;
   auto const split = static_cast<std::size_t>(fx.split_bytes);
   // Room for one split and a half: the second must wait for the first to go.
-  auto readahead = std::make_shared<readahead_scan_manager>(*fx.publisher, 4, split + split / 2);
+  auto readahead = std::make_shared<readahead_scan_manager>(
+    *fx.publisher, 4, nullptr, std::nullopt, split + split / 2);
   readahead->prepare_for_query(fx.query.get());
   readahead->start(sirius::scan_manager::prefetch_strategy::eager);
 
@@ -901,23 +905,22 @@ TEST_CASE("the readahead does not issue past its resident budget until a split i
   auto second = fx.make_split(readahead, 2);
   auto third  = fx.make_split(readahead, 4);
 
-  REQUIRE(eventually([&] { return prefetched(*first.info); }));
+  REQUIRE(eventually([&] { return landed(*readahead) == 1; }));
   REQUIRE(eventually([&] { return readahead->counters().resident_waits.load() > 0; }));
   // Give a worker that ignored the budget every chance to issue the rest.
   std::this_thread::sleep_for(std::chrono::milliseconds{100});
-  CHECK_FALSE(prefetched(*second.info));
-  CHECK_FALSE(prefetched(*third.info));
+  CHECK(landed(*readahead) == 1);
   CHECK(readahead->resident_bytes() == split);
 
   // Disposing the first frees its bytes, which admits exactly one more.
   first.input.reset();
-  REQUIRE(eventually([&] { return prefetched(*second.info); }));
+  REQUIRE(eventually([&] { return landed(*readahead) == 2; }));
   std::this_thread::sleep_for(std::chrono::milliseconds{100});
-  CHECK_FALSE(prefetched(*third.info));
+  CHECK(landed(*readahead) == 2);
   CHECK(readahead->resident_bytes() == split);
 
   second.input.reset();
-  REQUIRE(eventually([&] { return prefetched(*third.info); }));
+  REQUIRE(eventually([&] { return landed(*readahead) == 3; }));
   third.input.reset();
   CHECK(eventually([&] { return readahead->resident_bytes() == 0; }));
   INFO(readahead->summary());
@@ -931,7 +934,7 @@ TEST_CASE("host pressure holds the readahead back while anything is resident",
   std::atomic<bool> pressure{true};
   // No byte bound: only the probe stands in the way.
   auto readahead = std::make_shared<readahead_scan_manager>(
-    *fx.publisher, 4, 0, [&pressure] { return pressure.load(); });
+    *fx.publisher, 4, nullptr, std::nullopt, 0, [&pressure] { return pressure.load(); });
   readahead->prepare_for_query(fx.query.get());
   readahead->start(sirius::scan_manager::prefetch_strategy::eager);
 
@@ -939,12 +942,12 @@ TEST_CASE("host pressure holds the readahead back while anything is resident",
   auto second = fx.make_split(readahead, 2);
 
   // Nothing resident, so pressure alone does not stop the first.
-  REQUIRE(eventually([&] { return prefetched(*first.info); }));
+  REQUIRE(eventually([&] { return landed(*readahead) == 1; }));
   REQUIRE(eventually([&] { return readahead->counters().host_pressure_waits.load() > 0; }));
-  CHECK_FALSE(prefetched(*second.info));
+  CHECK(landed(*readahead) == 1);
 
   pressure = false;
-  CHECK(eventually([&] { return prefetched(*second.info); }));
+  CHECK(eventually([&] { return landed(*readahead) == 2; }));
   first.input.reset();
   second.input.reset();
   readahead->stop();
