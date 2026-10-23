@@ -167,6 +167,7 @@ std::vector<descent_step> descent_steps(sirius::op::sirius_physical_operator con
     case SiriusPhysicalOperatorType::INVALID:
     case SiriusPhysicalOperatorType::ORDER_BY:
     case SiriusPhysicalOperatorType::LIMIT:
+    case SiriusPhysicalOperatorType::UNORDERED_STREAMING_LIMIT:
     case SiriusPhysicalOperatorType::STREAMING_LIMIT:
     case SiriusPhysicalOperatorType::LIMIT_PERCENT:
     case SiriusPhysicalOperatorType::TOP_N:

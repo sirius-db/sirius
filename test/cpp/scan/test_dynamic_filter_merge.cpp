@@ -3348,10 +3348,15 @@ TEST_CASE("consumer passes mismatched device inputs through without filtering or
   {
     // The program is prepared for the current device, so only the batch's memory space differs.
     auto const space = make_space_naming_device(other_device);
-    // This synthetic space cannot own the current device's writer stream. Keep the real table
-    // alive through a view with an unknown writer; the consumer must decline before GPU access.
+    // This is a metadata-only device mismatch: apply must decline before reading the table.
+    // Keep the real table alive through a view owner, without copying it or claiming that a
+    // current-device stream wrote data on the synthetic device. A null writer means unknown.
     auto representation = std::make_unique<cucascade::gpu_table_representation>(
-      input->view(), input, input->alloc_size(), *space, ::cuda::stream_ref{cudaStream_t{nullptr}});
+      input->view(),
+      std::shared_ptr<cudf::table const>{input},
+      input->alloc_size(),
+      *space,
+      ::cuda::stream_ref{cudaStream_t{nullptr}});
     auto batch =
       cucascade::data_batch::make(sirius::get_next_batch_id(), std::move(representation));
     auto program = prepare_identity(consumer, input->view());

@@ -67,6 +67,11 @@ class cross_join_slice_data : public pipelineable_operator_data {
 //! sirius_physical_nested_loop_join represents a nested loop join between two tables
 class sirius_physical_nested_loop_join : public sirius_physical_partition_consumer_operator {
  public:
+  [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
+
   static constexpr const SiriusPhysicalOperatorType TYPE =
     SiriusPhysicalOperatorType::NESTED_LOOP_JOIN;
 

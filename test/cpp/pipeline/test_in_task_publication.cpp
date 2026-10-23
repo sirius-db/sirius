@@ -227,7 +227,7 @@ struct harness {
     receiver->operator_id  = 3;
     partition->set_fixed_layout(sirius::test::operator_utils::fixed_hash_layout(2));
 
-    pipeline = std::make_shared<pl::sirius_pipeline>(pl::pipeline_build_context{nullptr, true});
+    pipeline = std::make_shared<pl::sirius_pipeline>(pl::pipeline_build_context{nullptr});
     pipeline->set_pipeline_id(7);
     pl::sirius_pipeline_build_state state;
     state.set_pipeline_source(*pipeline, *partition);
@@ -340,6 +340,10 @@ struct harness {
 
 class reuse_operator final : public op::sirius_physical_operator {
  public:
+  sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::INSERTION_ORDER;
+  }
   reuse_operator() : sirius_physical_operator{op::SiriusPhysicalOperatorType::FILTER, {}, 0} {}
   operator_ptr execute(op::operator_data const& input, ::cuda::stream_ref) override
   {
@@ -380,7 +384,7 @@ void require_worker_reuse(harness& test)
 {
   reuse_operator next;
   next.operator_id = 10;
-  auto pipeline = std::make_shared<pl::sirius_pipeline>(pl::pipeline_build_context{nullptr, true});
+  auto pipeline    = std::make_shared<pl::sirius_pipeline>(pl::pipeline_build_context{nullptr});
   pipeline->set_pipeline_id(8);
   pipeline->set_query_id(sirius::make_query_id(1));
   test.lifecycle.open_query(pipeline->get_query_id());

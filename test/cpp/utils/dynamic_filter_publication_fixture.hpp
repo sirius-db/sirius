@@ -23,6 +23,7 @@
 #include "op/sirius_physical_hash_join.hpp"
 #include "operator/operator_test_utils.hpp"
 #include "utils/sirius_test_env.hpp"
+#include "utils/test_physical_operator.hpp"
 
 #include <cudf/types.hpp>
 #include <cudf/utilities/error.hpp>
@@ -120,9 +121,9 @@ struct claim_fixture {
     logical_join        = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(join_type);
     logical_join->types = output_types;
 
-    auto left_child = duckdb::make_uniq<sirius::op::sirius_physical_operator>(
+    auto left_child = duckdb::make_uniq<sirius::op::test_physical_operator>(
       sirius::op::SiriusPhysicalOperatorType::PROJECTION, sirius::from_duckdb_vec(output_types), 0);
-    auto right_child = duckdb::make_uniq<sirius::op::sirius_physical_operator>(
+    auto right_child = duckdb::make_uniq<sirius::op::test_physical_operator>(
       sirius::op::SiriusPhysicalOperatorType::PROJECTION, sirius::from_duckdb_vec(output_types), 0);
 
     duckdb::vector<duckdb::JoinCondition> conditions;

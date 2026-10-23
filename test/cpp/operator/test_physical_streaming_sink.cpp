@@ -835,3 +835,50 @@ TEST_CASE("streaming_sink PART-9: broadcast clones are independent batches", "[s
   std::sort(ids.begin(), ids.end());
   REQUIRE(std::adjacent_find(ids.begin(), ids.end()) == ids.end());
 }
+
+TEST_CASE("streaming boundaries discard repeated sender-local positions before EOS",
+          "[streaming_sink][ordering]")
+{
+  auto mem_mgr    = sirius::test::operator_utils::initialize_memory_manager();
+  auto* gpu_space = mem_mgr->get_memory_space(Tier::GPU, 0);
+  REQUIRE(gpu_space != nullptr);
+  auto first  = std::make_shared<cucascade::shared_data_repository>();
+  auto second = std::make_shared<cucascade::shared_data_repository>();
+  std::vector<std::shared_ptr<cucascade::shared_data_repository>> repos{first};
+  partition_spec spec;
+  SECTION("single destination") {}
+  SECTION("broadcast")
+  {
+    repos.push_back(second);
+    spec.mode = partition_mode::broadcast;
+  }
+  auto types =
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER});
+  sirius_physical_streaming_sink sink(types, 0, repos, spec);
+  auto input_repo = std::make_shared<cucascade::shared_data_repository>();
+  sirius_physical_streaming_source source(types, 0, input_repo, {0, 1});
+  for (int i = 0; i < 2; ++i) {
+    auto batch = make_numeric_batch<int32_t>(*gpu_space, {i}, cudf::type_id::INT32);
+    pipelineable_operator_data input(std::vector{batch}, 0);
+    auto output = sink.execute(input, cudf::get_default_stream());
+    REQUIRE_FALSE(dynamic_cast<pipelineable_operator_data&>(*output).get_position());
+    // Exercise direct publication as well as execute(): the sink must drop metadata itself.
+    sink.sink(input, cudf::get_default_stream());
+  }
+  for (std::size_t destination = 0; destination < repos.size(); ++destination) {
+    REQUIRE(repos[destination]->get_ordering() == cucascade::data_repository_ordering::UNORDERED);
+    for (int i = 0; i < 2; ++i) {
+      auto batch = sink.pull(destination);
+      REQUIRE(batch.has_value());
+      if (destination == 0) {
+        REQUIRE(source.push(*batch));
+        auto task = source.get_next_task_input_data();
+        REQUIRE(task != nullptr);
+        REQUIRE_FALSE(dynamic_cast<pipelineable_operator_data&>(*task).get_position());
+        auto output = source.execute(*task, cudf::get_default_stream());
+        REQUIRE_FALSE(dynamic_cast<pipelineable_operator_data&>(*output).get_position());
+      }
+    }
+  }
+  REQUIRE_FALSE(source.all_ports_empty());
+}

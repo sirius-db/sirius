@@ -36,6 +36,11 @@ namespace sirius::op {
 /// No on_data — consumer blocks in wait(); no channel-level backpressure.
 class sirius_physical_streaming_sink : public sirius_physical_operator {
  public:
+  [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
+
   static constexpr SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::STREAMING_SINK;
 
   /// The pipeline feeding this sink is its only sender.

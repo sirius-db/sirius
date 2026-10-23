@@ -373,11 +373,9 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
   }
 
   // Create the plan-time context with one immutable snapshot of query policy.
-  const pipeline::pipeline_build_context build_ctx{
-    sirius_ctx_ptr->get_telemetry_context(),
-    duckdb::Settings::Get<duckdb::PreserveInsertionOrderSetting>(context),
-    std::move(active_gpu_ids),
-    std::move(query_operator_params)};
+  const pipeline::pipeline_build_context build_ctx{sirius_ctx_ptr->get_telemetry_context(),
+                                                   std::move(active_gpu_ids),
+                                                   std::move(query_operator_params)};
 
   sirius::planner::sirius_physical_plan_generator::set_parent_ops(*sirius_physical_plan,
                                                                   /*parent=*/nullptr);

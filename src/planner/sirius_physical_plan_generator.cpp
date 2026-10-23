@@ -60,6 +60,7 @@
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"
 #include "op/sirius_physical_hash_join.hpp"
+#include "op/sirius_physical_limit.hpp"
 #include "op/sirius_physical_merge_sort.hpp"
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "op/sirius_physical_order.hpp"
@@ -1016,6 +1017,7 @@ plan_lineage collect_semantic_lineage(
     // Sort and TOP_N carry their payload through cuDF before host export.
     mark_semantic_columns(result.columns);
   } else if ((node.type == type::LIMIT || node.type == type::STREAMING_LIMIT ||
+              node.type == type::UNORDERED_STREAMING_LIMIT ||
               node.type == type::RESULT_COLLECTOR) &&
              children.size() == 1) {
     result.columns = children[0].columns;
@@ -1799,6 +1801,35 @@ void insert_gpu_pipeline_operators_recursive(
     case sirius::op::SiriusPhysicalOperatorType::DENSE_COUNT_JOIN:
       wrap_dense_count_join(*slot, compressed_materialization_observer);
       break;
+    case sirius::op::SiriusPhysicalOperatorType::STREAMING_LIMIT:
+      // Children are fully expanded: global ORDER BY/TOP N now end in their merge operators.
+      // An unresolved INSERTION_ORDER leaf is not proof of unordered input.
+      if (slot->children.at(0)->output_order() == sirius::OrderPreservationType::NO_ORDER) {
+        auto& limit      = slot->Cast<sirius::op::sirius_physical_streaming_limit>();
+        auto replacement = duckdb::make_uniq<sirius::op::sirius_physical_unordered_streaming_limit>(
+          limit.types,
+          std::move(limit.limit_val),
+          std::move(limit.offset_val),
+          limit.estimated_cardinality,
+          limit.parallel);
+        if (limit.has_physical_overrides()) {
+          replacement->set_physical_types(limit.get_physical_types());
+        }
+        replacement->children = std::move(limit.children);
+        slot                  = std::move(replacement);
+        break;
+      }
+      // Claims require complete, position-addressable input before any limit task executes.
+      wrap_child(*slot, 0, [](duckdb::unique_ptr<sirius::op::sirius_physical_operator> child) {
+        auto sink = duckdb::make_uniq<sirius::op::sirius_physical_passthrough_sink>(
+          child->types, child->estimated_cardinality, "default");
+        if (child->has_physical_overrides()) {
+          sink->set_physical_types(child->get_physical_types());
+        }
+        sink->children.push_back(std::move(child));
+        return sink;
+      });
+      break;
     case sirius::op::SiriusPhysicalOperatorType::UNION: wrap_union(*slot); break;
     case sirius::op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN:
     case sirius::op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN:
@@ -2161,53 +2192,6 @@ void sirius_physical_plan_generator::insert_gpu_pipeline_operators(
   prepare_iceberg_statement(*plan, op_params, context);
   insert_gpu_pipeline_operators_recursive(
     plan, op_params, context, sirius_ctx.get(), contract_provenance);
-}
-
-sirius::OrderPreservationType sirius_physical_plan_generator::order_preservation_recursive(
-  sirius::op::sirius_physical_operator& op)
-{
-  if (op.is_source()) { return op.source_order(); }
-
-  std::size_t child_idx = 0;
-  for (auto& child : op.children) {
-    // Do not take the materialization phase of physical CTEs into account
-    if (op.type == sirius::op::SiriusPhysicalOperatorType::CTE && child_idx == 0) {
-      child_idx++;
-      continue;
-    }
-    auto child_preservation = order_preservation_recursive(*child);
-    if (child_preservation != sirius::OrderPreservationType::INSERTION_ORDER) {
-      return child_preservation;
-    }
-    child_idx++;
-  }
-  return sirius::OrderPreservationType::INSERTION_ORDER;
-}
-
-bool sirius_physical_plan_generator::preserve_insertion_order(
-  duckdb::ClientContext& context, sirius::op::sirius_physical_operator& plan)
-{
-  auto preservation_type = order_preservation_recursive(plan);
-  if (preservation_type == sirius::OrderPreservationType::FIXED_ORDER) {
-    // always need to maintain preservation order
-    return true;
-  }
-  if (preservation_type == sirius::OrderPreservationType::NO_ORDER) {
-    // never need to preserve order
-    return false;
-  }
-  // preserve insertion order - check flags
-  if (!duckdb::Settings::Get<duckdb::PreserveInsertionOrderSetting>(context)) {
-    // preserving insertion order is disabled by config
-    return false;
-  }
-  return true;
-}
-
-bool sirius_physical_plan_generator::preserve_insertion_order(
-  sirius::op::sirius_physical_operator& plan)
-{
-  return preserve_insertion_order(context, plan);
 }
 
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>

@@ -2068,7 +2068,7 @@ TEST_CASE("scan forwards its pipeline expression policy to residual filtering",
     options.expression_strategy = strategy;
     options.enable_regex_jit    = strategy != sirius::expression_evaluator_strategy::MATERIALIZE;
     sirius::pipeline::pipeline_build_context ctx{
-      nullptr, true, 1, std::make_shared<const sirius::operator_params>(options)};
+      nullptr, 1, std::make_shared<const sirius::operator_params>(options)};
     scan.set_pipeline(std::make_shared<sirius::pipeline::sirius_pipeline>(ctx));
     sirius::op::scan::scan_operator_input input(batch);
     input.gpu_memory_space = e.gpu_space;

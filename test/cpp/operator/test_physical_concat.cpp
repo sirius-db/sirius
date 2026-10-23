@@ -20,6 +20,7 @@
 #include "operator_test_utils.hpp"
 #include "operator_type_traits.hpp"
 #include "utils/sirius_test_env.hpp"
+#include "utils/test_physical_operator.hpp"
 
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
@@ -112,11 +113,11 @@ hash_join_test_fixture create_test_hash_join(
   fixture.logical_join->types = output_types;
 
   // Create minimal child operators (need at least one type each for the hash join constructor)
-  auto left_child = duckdb::make_uniq<sirius_physical_operator>(
+  auto left_child = duckdb::make_uniq<sirius::op::test_physical_operator>(
     SiriusPhysicalOperatorType::PROJECTION,
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
     0);
-  auto right_child = duckdb::make_uniq<sirius_physical_operator>(
+  auto right_child = duckdb::make_uniq<sirius::op::test_physical_operator>(
     SiriusPhysicalOperatorType::PROJECTION,
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
     0);
@@ -215,9 +216,9 @@ struct source_pipeline_fixture {
 source_pipeline_fixture create_unfinished_source_pipeline()
 {
   source_pipeline_fixture fixture;
-  const sirius::pipeline::pipeline_build_context build_ctx{nullptr, true};
+  const sirius::pipeline::pipeline_build_context build_ctx{nullptr};
   fixture.pipeline          = std::make_shared<mock_gpu_pipeline>(build_ctx);
-  fixture.upstream_producer = duckdb::make_uniq<sirius_physical_operator>(
+  fixture.upstream_producer = duckdb::make_uniq<sirius::op::test_physical_operator>(
     SiriusPhysicalOperatorType::PROJECTION,
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
     1000);
@@ -1393,7 +1394,7 @@ TEST_CASE(
   cucascade::shared_data_repository output_repo;
   input_repo.set_num_partitions(6);
   output_repo.set_num_partitions(6);
-  sirius_physical_operator producer(SiriusPhysicalOperatorType::PROJECTION, types, 0);
+  sirius::op::test_physical_operator producer(SiriusPhysicalOperatorType::PROJECTION, types, 0);
   auto source = std::make_shared<sirius::pipeline::sirius_pipeline>(
     sirius::pipeline::pipeline_build_context{nullptr});
   sirius::pipeline::sirius_pipeline_build_state build_state;

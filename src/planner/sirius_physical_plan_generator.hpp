@@ -133,14 +133,6 @@ class sirius_physical_plan_generator {
   //! sink
   static bool use_batch_index(duckdb::ClientContext& context,
                               sirius::op::sirius_physical_operator& plan);
-  //! Whether or not we should preserve insertion order for executing the given sink
-  static bool preserve_insertion_order(duckdb::ClientContext& context,
-                                       sirius::op::sirius_physical_operator& plan);
-  //! The order preservation type of the given operator decided by recursively looking at its
-  //! children
-  static sirius::OrderPreservationType order_preservation_recursive(
-    sirius::op::sirius_physical_operator& op);
-
   //! The type an aggregate result declared as @p type is planned as; HUGEINT narrows to BIGINT.
   [[nodiscard]] static duckdb::LogicalType planned_aggregate_type(duckdb::LogicalType const& type);
 
@@ -248,7 +240,6 @@ class sirius_physical_plan_generator {
                                         std::string_view operation);
 
   // private:
-  bool preserve_insertion_order(sirius::op::sirius_physical_operator& plan);
   // bool use_batch_index(sirius::op::sirius_physical_operator &plan);
  public:
   std::size_t delim_index = 0;
