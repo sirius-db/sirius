@@ -193,7 +193,8 @@ fsms:
           peak_estimate: u64
           bytes_to_materialize: u64
           manager_thread: { uses: TaskManagerLoopThread }
-        to: [ downgrading, preparing, finalizing ]
+        # A reservation shortfall requeues the task without occupying a worker.
+        to: [ queued, downgrading, preparing, finalizing ]
       downgrading:
         attributes:
           shortfall_bytes: u64
