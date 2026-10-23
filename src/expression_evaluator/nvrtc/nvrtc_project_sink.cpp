@@ -154,6 +154,95 @@ namespace {
     return true;
   }
 
+  if (expr.holds<sirius::ast::conjunction>()) {
+    auto const& conj = expr.get<sirius::ast::conjunction>();
+    if (conj.children.empty()) { return false; }
+    if (conj.op != sirius::ast::conjunction::kind::op_and &&
+        conj.op != sirius::ast::conjunction::kind::op_or) {
+      return false;
+    }
+    for (auto const& ch : conj.children) {
+      if (!ch || !is_node_supported(*ch, input)) { return false; }
+      if (effective_node_cudf_type(*ch, input).id() != cudf::type_id::BOOL8) { return false; }
+    }
+    return true;
+  }
+
+  if (expr.holds<sirius::ast::case_expr>()) {
+    auto const& ce = expr.get<sirius::ast::case_expr>();
+    if (ce.cases.empty() || !ce.else_) { return false; }
+    auto const opt_ret = sirius::get_cudf_type(ce.return_type());
+    if (!opt_ret || !is_supported_fixed_width(*opt_ret)) { return false; }
+    auto const ret_type = *opt_ret;
+    for (auto const& c : ce.cases) {
+      if (!c.when_ || !c.then_) { return false; }
+      if (!is_node_supported(*c.when_, input)) { return false; }
+      if (effective_node_cudf_type(*c.when_, input).id() != cudf::type_id::BOOL8) { return false; }
+      if (c.then_->holds<sirius::ast::function_call>() &&
+          c.then_->get<sirius::ast::function_call>().function() == sirius::function_id::error) {
+        continue;
+      }
+      if (!is_node_supported(*c.then_, input)) { return false; }
+      auto const tt = effective_node_cudf_type(*c.then_, input);
+      if (!is_supported_fixed_width(tt)) { return false; }
+      if (cudf::is_fixed_point(ret_type) || cudf::is_fixed_point(tt)) {
+        if (!cudf::is_fixed_point(ret_type) || !cudf::is_fixed_point(tt) ||
+            ret_type.scale() != tt.scale()) {
+          return false;
+        }
+      }
+    }
+    if (!is_node_supported(*ce.else_, input)) { return false; }
+    auto const et = effective_node_cudf_type(*ce.else_, input);
+    if (!is_supported_fixed_width(et)) { return false; }
+    if (cudf::is_fixed_point(ret_type) || cudf::is_fixed_point(et)) {
+      if (!cudf::is_fixed_point(ret_type) || !cudf::is_fixed_point(et) ||
+          ret_type.scale() != et.scale()) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  if (expr.holds<sirius::ast::coalesce>()) {
+    auto const& coal = expr.get<sirius::ast::coalesce>();
+    if (coal.children.empty()) { return false; }
+    auto const opt_ret = sirius::get_cudf_type(coal.return_type());
+    if (!opt_ret || !is_supported_fixed_width(*opt_ret)) { return false; }
+    auto const ret_type = *opt_ret;
+    for (auto const& ch : coal.children) {
+      if (!ch || !is_node_supported(*ch, input)) { return false; }
+      auto const ct = effective_node_cudf_type(*ch, input);
+      if (!is_supported_fixed_width(ct)) { return false; }
+      if (cudf::is_fixed_point(ret_type) || cudf::is_fixed_point(ct)) {
+        if (!cudf::is_fixed_point(ret_type) || !cudf::is_fixed_point(ct) ||
+            ret_type.scale() != ct.scale()) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  if (expr.holds<sirius::ast::in_list>()) {
+    auto const& inl = expr.get<sirius::ast::in_list>();
+    if (!inl.probe || inl.values.empty()) { return false; }
+    if (!is_node_supported(*inl.probe, input)) { return false; }
+    auto const pt = effective_node_cudf_type(*inl.probe, input);
+    if (!is_supported_fixed_width(pt)) { return false; }
+    for (auto const& v : inl.values) {
+      if (!v || !is_node_supported(*v, input)) { return false; }
+      auto const vt = effective_node_cudf_type(*v, input);
+      if (!is_supported_fixed_width(vt)) { return false; }
+      if (cudf::is_fixed_point(pt) || cudf::is_fixed_point(vt)) {
+        if (!cudf::is_fixed_point(pt) || !cudf::is_fixed_point(vt) || pt.scale() != vt.scale()) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
   if (expr.holds<sirius::ast::unary_op>()) {
     auto const& uo = expr.get<sirius::ast::unary_op>();
     if (!uo.child || !is_node_supported(*uo.child, input)) { return false; }
@@ -502,15 +591,16 @@ register_value translation_context::produce_reference(sirius::ast::reference con
   auto const dst_type_str = cuda_type_name(restored_type);
 
   if (!col_binding.is_nullable) {
-    emit_line("reg_val<" + dst_type_str + "> " + var_name + "{static_cast<" + dst_type_str +
-              ">(in_" + std::to_string(binding_id) + "_data[row]), true, false};");
+    emit_prelude_line("reg_val<" + dst_type_str + "> " + var_name + "{static_cast<" + dst_type_str +
+                      ">(in_" + std::to_string(binding_id) + "_data[row]), true, false};");
   } else {
-    emit_line("bool const " + var_name + "_valid = (in_" + std::to_string(binding_id) +
-              "_mask == nullptr) || is_bit_set(in_" + std::to_string(binding_id) + "_mask, in_" +
-              std::to_string(binding_id) + "_bit_offset + row);");
-    emit_line("reg_val<" + dst_type_str + "> " + var_name + "{" + var_name +
-              "_valid ? static_cast<" + dst_type_str + ">(in_" + std::to_string(binding_id) +
-              "_data[row]) : " + dst_type_str + "{}, " + var_name + "_valid, false};");
+    emit_prelude_line("bool const " + var_name + "_valid = (in_" + std::to_string(binding_id) +
+                      "_mask == nullptr) || is_bit_set(in_" + std::to_string(binding_id) +
+                      "_mask, in_" + std::to_string(binding_id) + "_bit_offset + row);");
+    emit_prelude_line("reg_val<" + dst_type_str + "> " + var_name + "{" + var_name +
+                      "_valid ? static_cast<" + dst_type_str + ">(in_" +
+                      std::to_string(binding_id) + "_data[row]) : " + dst_type_str + "{}, " +
+                      var_name + "_valid, false};");
   }
 
   register_value reg{
@@ -527,8 +617,8 @@ register_value translation_context::produce_constant(sirius::ast::constant const
   auto const var_name    = next_var_name();
   auto const type_str    = cuda_type_name(device_type);
 
-  emit_line("reg_val<" + type_str + "> " + var_name + "{c_" + std::to_string(binding_id) +
-            "_val, c_" + std::to_string(binding_id) + "_valid != 0, false};");
+  emit_prelude_line("reg_val<" + type_str + "> " + var_name + "{c_" + std::to_string(binding_id) +
+                    "_val, c_" + std::to_string(binding_id) + "_valid != 0, false};");
 
   register_value reg{var_name,
                      expr.return_type(),
@@ -615,8 +705,8 @@ register_value translation_context::produce_constant_in_carrier(sirius::ast::con
   auto const var_name   = next_var_name();
   auto const type_str   = cuda_type_name(carrier);
 
-  emit_line("reg_val<" + type_str + "> " + var_name + "{c_" + std::to_string(binding_id) +
-            "_val, c_" + std::to_string(binding_id) + "_valid != 0, false};");
+  emit_prelude_line("reg_val<" + type_str + "> " + var_name + "{c_" + std::to_string(binding_id) +
+                    "_val, c_" + std::to_string(binding_id) + "_valid != 0, false};");
 
   register_value reg{var_name,
                      expr.return_type(),
@@ -773,6 +863,169 @@ register_value translation_context::produce_between(sirius::ast::between const& 
                         sirius::logical_type::make(sirius::type_id::BOOLEAN),
                         cudf::data_type{cudf::type_id::BOOL8},
                         non_null,
+                        can_ovf};
+}
+
+register_value translation_context::produce_conjunction(sirius::ast::conjunction const& expr)
+{
+  auto const var_name = next_var_name();
+  auto const first    = produce(*expr.children[0]);
+  emit_line("reg_val<bool> " + var_name + " = " + first.var_name + ";");
+
+  bool non_null             = first.is_statically_non_null;
+  bool can_ovf              = first.can_overflow;
+  bool const is_and         = (expr.op == sirius::ast::conjunction::kind::op_and);
+  std::string const fn_name = is_and ? "eval_kleene_and" : "eval_kleene_or";
+  std::string const dom_cond =
+    is_and ? ("!(" + var_name + ".valid && !" + var_name + ".overflow && !" + var_name + ".val)")
+           : ("!(" + var_name + ".valid && !" + var_name + ".overflow && " + var_name + ".val)");
+
+  for (std::size_t i = 1; i < expr.children.size(); ++i) {
+    emit_line("if (" + dom_cond + ") {");
+    auto const rhs = produce(*expr.children[i]);
+    emit_line(var_name + " = " + fn_name + "(" + var_name + ", " + rhs.var_name + ");");
+    emit_line("}");
+    non_null = non_null && rhs.is_statically_non_null;
+    can_ovf  = can_ovf || rhs.can_overflow;
+  }
+
+  return register_value{var_name,
+                        sirius::logical_type::make(sirius::type_id::BOOLEAN),
+                        cudf::data_type{cudf::type_id::BOOL8},
+                        non_null,
+                        can_ovf};
+}
+
+register_value translation_context::produce_case_expr(sirius::ast::case_expr const& expr)
+{
+  auto const ret_type = sirius::require_cudf_type(expr.return_type());
+  auto const type_str = cuda_type_name(ret_type);
+  auto const var_name = next_var_name();
+
+  emit_line("reg_val<" + type_str + "> " + var_name + "{" + type_str + "{}, false, false};");
+
+  bool can_ovf      = false;
+  bool all_non_null = true;
+
+  for (std::size_t i = 0; i < expr.cases.size(); ++i) {
+    auto const& c      = expr.cases[i];
+    auto const when_rv = produce(*c.when_);
+    can_ovf            = can_ovf || when_rv.can_overflow;
+
+    emit_line("if (" + when_rv.var_name + ".overflow) {");
+    emit_line(var_name + " = reg_val<" + type_str + ">{" + type_str + "{}, true, true};");
+    emit_line("} else if (" + when_rv.var_name + ".valid && " + when_rv.var_name + ".val) {");
+
+    if (c.then_->holds<sirius::ast::function_call>() &&
+        c.then_->get<sirius::ast::function_call>().function() == sirius::function_id::error) {
+      _has_subquery_error = true;
+      all_non_null        = false;
+      emit_line("row_subquery_error = true;");
+    } else {
+      auto const then_rv = produce(*c.then_);
+      can_ovf            = can_ovf || then_rv.can_overflow;
+      all_non_null       = all_non_null && then_rv.is_statically_non_null;
+      emit_line(var_name + " = reg_val<" + type_str + ">{static_cast<" + type_str + ">(" +
+                then_rv.var_name + ".val), " + then_rv.var_name + ".valid, " + then_rv.var_name +
+                ".overflow};");
+    }
+    emit_line("} else {");
+  }
+
+  auto const else_rv = produce(*expr.else_);
+  can_ovf            = can_ovf || else_rv.can_overflow;
+  all_non_null       = all_non_null && else_rv.is_statically_non_null;
+  emit_line(var_name + " = reg_val<" + type_str + ">{static_cast<" + type_str + ">(" +
+            else_rv.var_name + ".val), " + else_rv.var_name + ".valid, " + else_rv.var_name +
+            ".overflow};");
+
+  for (std::size_t i = 0; i < expr.cases.size(); ++i) {
+    emit_line("}");
+  }
+
+  return register_value{var_name, expr.return_type(), ret_type, all_non_null, can_ovf};
+}
+
+register_value translation_context::produce_coalesce(sirius::ast::coalesce const& expr)
+{
+  auto const ret_type = sirius::require_cudf_type(expr.return_type());
+  auto const type_str = cuda_type_name(ret_type);
+  auto const var_name = next_var_name();
+
+  auto const first = produce(*expr.children[0]);
+  emit_line("reg_val<" + type_str + "> " + var_name + "{static_cast<" + type_str + ">(" +
+            first.var_name + ".val), " + first.var_name + ".valid, " + first.var_name +
+            ".overflow};");
+
+  bool any_non_null = first.is_statically_non_null;
+  bool can_ovf      = first.can_overflow;
+
+  for (std::size_t i = 1; i < expr.children.size(); ++i) {
+    emit_line("if (!" + var_name + ".valid && !" + var_name + ".overflow) {");
+    auto const child = produce(*expr.children[i]);
+    emit_line(var_name + " = reg_val<" + type_str + ">{static_cast<" + type_str + ">(" +
+              child.var_name + ".val), " + child.var_name + ".valid, " + child.var_name +
+              ".overflow};");
+    emit_line("}");
+    any_non_null = any_non_null || child.is_statically_non_null;
+    can_ovf      = can_ovf || child.can_overflow;
+  }
+
+  return register_value{var_name, expr.return_type(), ret_type, any_non_null, can_ovf};
+}
+
+register_value translation_context::produce_in_list(sirius::ast::in_list const& expr)
+{
+  auto const probe_reg = produce(*expr.probe);
+  auto const var_name  = next_var_name();
+
+  auto const resolve_cmp_type = [](cudf::data_type lt, cudf::data_type rt) -> std::string {
+    if (lt == rt) { return cuda_type_name(lt); }
+    if (lt.id() == cudf::type_id::FLOAT64 || rt.id() == cudf::type_id::FLOAT64) { return "double"; }
+    if (lt.id() == cudf::type_id::FLOAT32 || rt.id() == cudf::type_id::FLOAT32) { return "float"; }
+    if (cudf::is_unsigned(lt) && cudf::is_unsigned(rt)) { return "uint64_t"; }
+    if (!cudf::is_unsigned(lt) && !cudf::is_unsigned(rt)) { return "int64_t"; }
+    return "__int128_t";
+  };
+
+  emit_line("reg_val<bool> " + var_name + "{false, false, false};");
+  bool can_ovf      = probe_reg.can_overflow;
+  bool all_non_null = probe_reg.is_statically_non_null;
+
+  for (std::size_t i = 0; i < expr.values.size(); ++i) {
+    if (i > 0) {
+      emit_line("if (!(" + var_name + ".valid && !" + var_name + ".overflow && " + var_name +
+                ".val)) {");
+    }
+    auto const val_reg   = produce(*expr.values[i]);
+    can_ovf              = can_ovf || val_reg.can_overflow;
+    all_non_null         = all_non_null && val_reg.is_statically_non_null;
+    auto const cmp_type  = resolve_cmp_type(probe_reg.device_type, val_reg.device_type);
+    auto const probe_val = "static_cast<" + cmp_type + ">(" + probe_reg.var_name + ".val)";
+    auto const rhs_val   = "static_cast<" + cmp_type + ">(" + val_reg.var_name + ".val)";
+    auto const eq_var    = next_var_name();
+    bool const eq_ovf    = probe_reg.can_overflow || val_reg.can_overflow;
+    std::string const ovf_e =
+      eq_ovf ? (probe_reg.var_name + ".overflow || " + val_reg.var_name + ".overflow") : "false";
+
+    emit_line("bool const " + eq_var + "_valid = " + probe_reg.var_name + ".valid && " +
+              val_reg.var_name + ".valid;");
+    emit_line("reg_val<bool> const " + eq_var + "{" + eq_var + "_valid ? (" + probe_val +
+              " == " + rhs_val + ") : false, " + eq_var + "_valid, " + ovf_e + "};");
+    if (i == 0) {
+      emit_line(var_name + " = " + eq_var + ";");
+    } else {
+      emit_line(var_name + " = eval_kleene_or(" + var_name + ", " + eq_var + ");");
+      emit_line("}");
+    }
+  }
+
+  if (expr.negated) { emit_line(var_name + ".val = !" + var_name + ".val;"); }
+
+  return register_value{var_name,
+                        sirius::logical_type::make(sirius::type_id::BOOLEAN),
+                        cudf::data_type{cudf::type_id::BOOL8},
+                        all_non_null,
                         can_ovf};
 }
 
@@ -942,8 +1195,20 @@ register_value translation_context::produce(sirius::ast::node const& expr)
   if (expr.holds<sirius::ast::comparison>()) {
     return produce_comparison(expr.get<sirius::ast::comparison>());
   }
+  if (expr.holds<sirius::ast::conjunction>()) {
+    return produce_conjunction(expr.get<sirius::ast::conjunction>());
+  }
   if (expr.holds<sirius::ast::between>()) {
     return produce_between(expr.get<sirius::ast::between>());
+  }
+  if (expr.holds<sirius::ast::case_expr>()) {
+    return produce_case_expr(expr.get<sirius::ast::case_expr>());
+  }
+  if (expr.holds<sirius::ast::coalesce>()) {
+    return produce_coalesce(expr.get<sirius::ast::coalesce>());
+  }
+  if (expr.holds<sirius::ast::in_list>()) {
+    return produce_in_list(expr.get<sirius::ast::in_list>());
   }
   if (expr.holds<sirius::ast::unary_op>()) {
     return produce_unary_op(expr.get<sirius::ast::unary_op>());
@@ -1003,6 +1268,7 @@ std::unique_ptr<cudf::table> evaluate_project_sink(
   constexpr int num_warps     = block_threads / 32;
   bool any_nullable_output    = false;
   bool any_can_overflow       = false;
+  bool const any_subquery_err = ctx.has_subquery_error();
   for (auto const& reg : out_regs) {
     if (!reg.is_statically_non_null) { any_nullable_output = true; }
     if (reg.can_overflow) { any_can_overflow = true; }
@@ -1022,6 +1288,24 @@ std::unique_ptr<cudf::table> evaluate_project_sink(
     << "};\n\n"
     << "__device__ __forceinline__ bool is_bit_set(uint32_t const* mask, int32_t bit_idx) {\n"
     << "  return ((mask[bit_idx >> 5] >> (bit_idx & 31)) & 1u) != 0u;\n"
+    << "}\n\n"
+    << "__device__ __forceinline__ reg_val<bool> eval_kleene_and(reg_val<bool> acc, reg_val<bool> "
+       "rhs) {\n"
+    << "  bool const acc_false = acc.valid && !acc.overflow && !acc.val;\n"
+    << "  bool const rhs_false = rhs.valid && !rhs.overflow && !rhs.val;\n"
+    << "  if (acc_false || rhs_false) { return reg_val<bool>{false, true, false}; }\n"
+    << "  if (acc.overflow || rhs.overflow) { return reg_val<bool>{false, true, true}; }\n"
+    << "  if (acc.valid && rhs.valid) { return reg_val<bool>{true, true, false}; }\n"
+    << "  return reg_val<bool>{false, false, false};\n"
+    << "}\n\n"
+    << "__device__ __forceinline__ reg_val<bool> eval_kleene_or(reg_val<bool> acc, reg_val<bool> "
+       "rhs) {\n"
+    << "  bool const acc_true = acc.valid && !acc.overflow && acc.val;\n"
+    << "  bool const rhs_true = rhs.valid && !rhs.overflow && rhs.val;\n"
+    << "  if (acc_true || rhs_true) { return reg_val<bool>{true, true, false}; }\n"
+    << "  if (acc.overflow || rhs.overflow) { return reg_val<bool>{false, true, true}; }\n"
+    << "  if (acc.valid && rhs.valid) { return reg_val<bool>{false, true, false}; }\n"
+    << "  return reg_val<bool>{false, false, false};\n"
     << "}\n\n"
     << "template <typename T, typename L, typename R>\n"
     << "__device__ __forceinline__ reg_val<T> eval_add(reg_val<L> l, reg_val<R> r) {\n"
@@ -1206,6 +1490,7 @@ std::unique_ptr<cudf::table> evaluate_project_sink(
     if (!out_regs[k].is_statically_non_null) { src << "  bool out_" << k << "_valid = false;\n"; }
   }
   if (any_can_overflow) { src << "  bool row_overflow = false;\n"; }
+  if (any_subquery_err) { src << "  bool row_subquery_error = false;\n"; }
 
   src << "  if (active) {\n" << ctx.body_code();
   for (std::size_t k = 0; k < out_regs.size(); ++k) {
@@ -1228,7 +1513,14 @@ std::unique_ptr<cudf::table> evaluate_project_sink(
   if (any_can_overflow) {
     src << "  uint32_t const ovf_ballot = __ballot_sync(0xFFFFFFFFu, active && row_overflow);\n"
         << "  if (ovf_ballot != 0u && lane == 0) {\n"
-        << "    atomicExch(&status_and_null_counts[0], 1u);\n"
+        << "    atomicOr(&status_and_null_counts[0], 1u);\n"
+        << "  }\n";
+  }
+  if (any_subquery_err) {
+    src << "  uint32_t const subq_ballot = __ballot_sync(0xFFFFFFFFu, active && "
+           "row_subquery_error);\n"
+        << "  if (subq_ballot != 0u && lane == 0) {\n"
+        << "    atomicOr(&status_and_null_counts[0], 2u);\n"
         << "  }\n";
   }
 
@@ -1313,8 +1605,8 @@ std::unique_ptr<cudf::table> evaluate_project_sink(
     outputs.push_back(std::move(stg));
   }
 
-  // Allocate status and null counts buffer if needed: [0] = overflow status, [1..K] = null counts.
-  bool const need_status_buffer  = any_nullable_output || any_can_overflow;
+  // Allocate status and null counts buffer if needed: [0] = status bitmask, [1..K] = null counts.
+  bool const need_status_buffer  = any_nullable_output || any_can_overflow || any_subquery_err;
   std::size_t const status_words = 1 + out_regs.size();
   rmm::device_uvector<std::uint32_t> d_status(need_status_buffer ? status_words : 0, stream, mr);
   std::uint32_t* status_ptr = need_status_buffer ? d_status.data() : nullptr;
@@ -1389,7 +1681,12 @@ std::unique_ptr<cudf::table> evaluate_project_sink(
                                    "cudaMemcpyAsync(status_and_null_counts)");
     simpatico::throw_if_cuda_error(cudaStreamSynchronize(stream.get()),
                                    "cudaStreamSynchronize(sirius_nvrtc_project_kernel)");
-    if (h_status[0] != 0U) {
+    if ((h_status[0] & 2U) != 0U) {
+      throw internal_exception(
+        "[expression_evaluator:case]: More than one row returned by a subquery used as an "
+        "expression.");
+    }
+    if ((h_status[0] & 1U) != 0U) {
       throw out_of_range_exception("Overflow in NVRTC expression evaluation");
     }
   }

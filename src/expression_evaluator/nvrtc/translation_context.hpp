@@ -83,6 +83,11 @@ class translation_context {
   [[nodiscard]] std::string next_var_name() { return "v_" + std::to_string(_next_var_id++); }
 
   /**
+   * @brief Appends a statement line to the top-level per-row prelude (before any branching).
+   */
+  void emit_prelude_line(std::string const& line) { _prelude << "    " << line << "\n"; }
+
+  /**
    * @brief Appends a statement line to the per-row evaluation body.
    */
   void emit_line(std::string const& line) { _body << "    " << line << "\n"; }
@@ -104,13 +109,19 @@ class translation_context {
     return _narrow_domain_comparison_count;
   }
 
-  [[nodiscard]] std::string body_code() const { return _body.str(); }
+  [[nodiscard]] bool has_subquery_error() const noexcept { return _has_subquery_error; }
+
+  [[nodiscard]] std::string body_code() const { return _prelude.str() + _body.str(); }
 
  private:
   [[nodiscard]] register_value produce_reference(sirius::ast::reference const& expr);
   [[nodiscard]] register_value produce_constant(sirius::ast::constant const& expr);
   [[nodiscard]] register_value produce_comparison(sirius::ast::comparison const& expr);
+  [[nodiscard]] register_value produce_conjunction(sirius::ast::conjunction const& expr);
   [[nodiscard]] register_value produce_between(sirius::ast::between const& expr);
+  [[nodiscard]] register_value produce_case_expr(sirius::ast::case_expr const& expr);
+  [[nodiscard]] register_value produce_coalesce(sirius::ast::coalesce const& expr);
+  [[nodiscard]] register_value produce_in_list(sirius::ast::in_list const& expr);
   [[nodiscard]] register_value produce_unary_op(sirius::ast::unary_op const& expr);
   [[nodiscard]] register_value produce_function_call(sirius::ast::function_call const& expr);
 
@@ -134,6 +145,8 @@ class translation_context {
   std::vector<loaded_reference_entry> _loaded_references;
   std::vector<scalar_constant_binding> _constants;
   std::size_t _narrow_domain_comparison_count{0};
+  bool _has_subquery_error{false};
+  std::ostringstream _prelude;
   std::ostringstream _body;
   std::size_t _next_var_id{0};
 };
