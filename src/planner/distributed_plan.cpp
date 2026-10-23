@@ -28,6 +28,7 @@
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "op/sirius_physical_partition.hpp"
 #include "op/sirius_physical_sort_sample.hpp"
+#include "planner/gpu_admission.hpp"
 #include "sirius/exception.hpp"
 
 #include <cudf/column/column_factories.hpp>
@@ -40,6 +41,7 @@
 
 #include <algorithm>
 #include <functional>
+#include <limits>
 #include <map>
 #include <set>
 #include <string>
@@ -70,6 +72,29 @@ constexpr std::uint32_t max_filter_keys = 64;
 /// rank, and an empty build only takes part in the merge once its probe has finished, while the
 /// ranks with build rows hold their probe until the merge completes.
 constexpr std::size_t min_merged_build_rows = std::size_t{1} << 14;
+/// A join's build side is broadcast, and its probe side stays where it is, when the whole build
+/// fits this budget on every GPU and sending it to every rank moves fewer bytes than hashing both
+/// sides would.
+constexpr std::uint64_t max_broadcast_build_bytes = std::uint64_t{1} << 30;
+/// Width assumed for a variable-width column when estimating bytes.
+constexpr std::uint64_t estimated_var_bytes = 32;
+
+std::uint64_t estimated_bytes(op::sirius_physical_operator const& node)
+{
+  auto const width = estimate_bytes_per_row(node.types, estimated_var_bytes);
+  auto const rows  = static_cast<std::uint64_t>(node.estimated_cardinality);
+  return rows != 0 && width > std::numeric_limits<std::uint64_t>::max() / rows
+           ? std::numeric_limits<std::uint64_t>::max()
+           : rows * width;
+}
+
+/// Join types that never emit a build row without a probe match, so a build seen by every rank
+/// yields each output row on one rank only.
+bool emits_build_rows_only_with_probe(duckdb::JoinType type)
+{
+  return type != duckdb::JoinType::RIGHT && type != duckdb::JoinType::OUTER &&
+         type != duckdb::JoinType::RIGHT_SEMI && type != duckdb::JoinType::RIGHT_ANTI;
+}
 
 struct rewriter {
   std::shared_ptr<exchange::exchange_service> service;
@@ -162,11 +187,27 @@ struct rewriter {
       case T::HASH_GROUP_BY: return done(visit(node.children[0]));
 
       case T::HASH_JOIN: {
+        // Both sides are CONCAT → PARTITION → input.
+        auto& join        = node.Cast<op::sirius_physical_hash_join>();
+        auto& probe       = expect(*expect(*node.children[0], T::CONCAT).children[0], T::PARTITION);
+        auto& build       = expect(*expect(*node.children[1], T::CONCAT).children[0], T::PARTITION);
+        auto const world  = static_cast<std::uint64_t>(service->world_size());
+        auto const bbytes = estimated_bytes(*build.children[0]);
+        if (emits_build_rows_only_with_probe(join.join_type) &&
+            bbytes <= max_broadcast_build_bytes &&
+            bbytes <= estimated_bytes(*probe.children[0]) / std::max<std::uint64_t>(world - 1, 1)) {
+          // Every rank gets the whole build and keeps its probe rows. Its build being whole, its
+          // Bloom filters hold every key, as on one GPU: nothing to merge.
+          shape += "B";
+          auto const probe_rows = visit(probe.children[0]);
+          visit(build.children[0]);
+          insert(
+            build.children[0], exchange_spec{.routing = exchange_spec::mode::broadcast}, false);
+          return done(probe_rows == placement::rank0 ? placement::rank0 : placement::spread);
+        }
         // After the exchanges a rank's build holds only its share of the keys: a filter from it
         // alone would drop rows other ranks' builds match, so every rank's Bloom is merged.
-        auto& join = node.Cast<op::sirius_physical_hash_join>();
-        auto const build_rows =
-          node.children.size() > 1 ? node.children[1]->estimated_cardinality : std::size_t{0};
+        auto const build_rows = node.children[1]->estimated_cardinality;
         if (join.publishes_dynamic_filters() && build_rows < min_merged_build_rows) {
           join.cancel_dynamic_filter_publication();
           shape += "f";
@@ -180,11 +221,9 @@ struct rewriter {
              .bloom_keys   = std::clamp(build_rows, min_bloom_keys, max_bloom_keys)});
           shape += "F";
         }
-        // Both sides are CONCAT → PARTITION → input; each side's rows meet their matches once
-        // both are exchanged on the join keys.
-        for (auto& side : node.children) {
-          hash_below(*expect(*side, T::CONCAT).children[0]);
-        }
+        // Each side's rows meet their matches once both are exchanged on the join keys.
+        hash_below(probe);
+        hash_below(build);
         return done(placement::spread);
       }
 
