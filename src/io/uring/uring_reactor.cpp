@@ -493,8 +493,14 @@ void uring_reactor::start()
   std::lock_guard lock(_enqueue_mutex);
   try {
     _accepting.store(true, std::memory_order_release);
-    _worker = std::jthread([this](std::stop_token stop_token) { worker_loop(stop_token); },
-                           _stop_source.get_token());
+    _worker = std::jthread(
+      [this](std::stop_token stop_token) {
+        // Before the first submission: io_uring's own workers inherit this thread's mask.
+        std::ignore = sirius::exec::thread_util::set_current_thread_affinity(
+          sirius::exec::thread_util::get_process_affinity());
+        worker_loop(stop_token);
+      },
+      _stop_source.get_token());
   } catch (...) {
     _accepting.store(false, std::memory_order_release);
     _bounce_storage.reset();

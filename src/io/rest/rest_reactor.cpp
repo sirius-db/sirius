@@ -607,8 +607,13 @@ void rest_reactor::start()
   _running   = true;
   _accepting = true;
   try {
-    _worker = std::jthread([this](std::stop_token const& st) { worker_loop(st); },
-                           _stop_source.get_token());
+    _worker = std::jthread(
+      [this](std::stop_token const& st) {
+        std::ignore = sirius::exec::thread_util::set_current_thread_affinity(
+          sirius::exec::thread_util::get_process_affinity());
+        worker_loop(st);
+      },
+      _stop_source.get_token());
   } catch (...) {
     _running   = false;
     _accepting = false;
