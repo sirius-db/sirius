@@ -199,7 +199,8 @@ TEST_CASE("stateless single-partition consumers leave task placement to locality
   };
   sirius_physical_nested_loop_join nlj(
     logical_join, child(), child(), {}, duckdb::JoinType::INNER, 0);
-  sirius_physical_grouped_aggregate_merge merge(types(), {}, {}, {}, {}, {}, false, false, 0);
+  sirius_physical_grouped_aggregate_merge merge(
+    types(), {}, {}, {}, {}, {}, false, false, false, 0);
   sirius_physical_dense_count_join dense(types(), 0, 0, 0, std::nullopt, 1024);
   nlj.set_active_gpu_ids({3, 7});
   merge.set_active_gpu_ids({3, 7});

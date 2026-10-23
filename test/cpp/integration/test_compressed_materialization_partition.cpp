@@ -143,6 +143,11 @@ constexpr char const* kGroupByQuery =
   "SELECT k, COUNT(*) AS c, SUM(v) AS sv FROM t GROUP BY k ORDER BY k LIMIT 10;";
 constexpr char const* kCountValidGroupByQuery =
   "SELECT k, COUNT(k) AS c FROM t GROUP BY k ORDER BY k LIMIT 10;";
+constexpr char const* kFirstGroupByQuery =
+  "SELECT k, first(k) AS fk, SUM(v) AS sv FROM t GROUP BY k ORDER BY k LIMIT 10;";
+constexpr char const* kFirstBracketQuery =
+  "SELECT count(*) AS c FROM (SELECT k, first(v) AS fv, min(v) AS lo, max(v) AS hi FROM t "
+  "GROUP BY k) WHERE fv < lo OR fv > hi;";
 
 // Small exchange sizes force multi-way hash partitioning on the fixture's data volumes.
 constexpr config_values kConfigValues{.scan_batch_bytes           = kScanBatchBytes,
@@ -568,6 +573,15 @@ TEST_CASE("gpu_execution - narrow group keys cross the aggregate exchange",
     REQUIRE(count_after.partition_narrow_columns > count_before.partition_narrow_columns);
     REQUIRE(count_after.scan_narrow_targets_retracted ==
             count_before.scan_narrow_targets_retracted);
+
+    // A FIRST keeps the native boundary below the aggregate, so its input reaches the gather native
+    // and no narrow column crosses the aggregate-side exchange. The second query's min/max bracket
+    // catches a carried value read at the wrong width.
+    auto const first_before = sirius::test::get_compressed_materialization_stats(con);
+    compare_gpu_vs_cpu(con, kFirstGroupByQuery);
+    compare_gpu_vs_cpu(con, kFirstBracketQuery);
+    auto const first_after = sirius::test::get_compressed_materialization_stats(con);
+    REQUIRE(first_after.partition_narrow_columns == first_before.partition_narrow_columns);
 
     // Flag-off contrast: everything restores at the scan; the exchange sees native batches.
     require_ok(con.Query("SET enable_compressed_materialization = false;"), "disable flag");

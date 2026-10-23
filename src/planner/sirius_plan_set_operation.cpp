@@ -84,7 +84,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_ge
   // Group on every column with no aggregates, as DuckDB's own planner does for `!setop_all`.
   duckdb::vector<duckdb::idx_t> key_columns(declared_types.size());
   std::iota(key_columns.begin(), key_columns.end(), duckdb::idx_t{0});
-  return plan_dedup(std::move(union_op), key_columns, op.estimated_cardinality);
+  return plan_dedup(std::move(union_op), key_columns, {}, op.estimated_cardinality);
 }
 
 }  // namespace sirius::planner

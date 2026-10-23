@@ -79,6 +79,7 @@
 #include <span>
 #include <sstream>
 #include <string>
+#include <variant>
 #include <vector>
 
 using namespace duckdb;
@@ -337,9 +338,9 @@ void require_delim_join_common(sirius::op::sirius_physical_delim_join& delim)
   require_join_child_wrap(delim.join->children[1].get(), delim.join.get(), /*is_build=*/true);
 }
 
-/// The chain every supported DISTINCT shape shares: one HASH_GROUP_BY with an empty aggregate
-/// list, wrapped as insert_gpu_pipeline_operators wraps a GROUP BY. Returns the HASH_GROUP_BY so
-/// each caller can assert its own key layout.
+/// The chain every DISTINCT shape without a carried column shares: one HASH_GROUP_BY with an empty
+/// aggregate list, wrapped as insert_gpu_pipeline_operators wraps a GROUP BY. Returns the
+/// HASH_GROUP_BY so each caller can assert its own key layout.
 sirius::op::sirius_physical_grouped_aggregate* require_distinct_wrap_chain(
   sirius_physical_operator* plan)
 {
@@ -1345,6 +1346,35 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     }
   }
 
+  SECTION("a wide integer SUM beside a FIRST keeps its alternate ahead of the carried block")
+  {
+    REQUIRE_FALSE(
+      con->Query("CREATE TABLE wide_sum_first (k INTEGER, x BIGINT, y INTEGER)")->HasError());
+    REQUIRE_FALSE(con
+                    ->Query("INSERT INTO wide_sum_first VALUES (1, 4000000000000000000, 7), "
+                            "(1, 4000000000000000000, 8)")
+                    ->HasError());
+    auto const decimal128 = cudf::data_type{cudf::type_id::DECIMAL128, 0};
+    // The partial layout is [k, sum, y] whether the FIRST follows the SUM or precedes it.
+    for (auto const* query : {"SELECT k, sum(x), first(y) FROM wide_sum_first GROUP BY k",
+                              "SELECT k, first(y), sum(x) FROM wide_sum_first GROUP BY k"}) {
+      auto plan = generate_sirius_plan(*con, query);
+      INFO(query << "\n" << tree_to_string(plan.get()));
+
+      auto* merge = find_first(plan.get(), SiriusPhysicalOperatorType::MERGE_GROUP_BY);
+      REQUIRE(merge != nullptr);
+      auto* partition = merge->children[0].get();
+      REQUIRE(partition->type == SiriusPhysicalOperatorType::PARTITION);
+      auto* local = partition->children[0].get();
+      REQUIRE(local->type == SiriusPhysicalOperatorType::HASH_GROUP_BY);
+      for (auto const* op : {local, partition}) {
+        REQUIRE(op->get_types().size() == 3);
+        CHECK(op->is_alternate_physical_type(1, decimal128));
+        CHECK_FALSE(op->is_alternate_physical_type(2, decimal128));
+      }
+    }
+  }
+
   SECTION("a decimal SUM has no alternate partial carrier")
   {
     auto plan =
@@ -1434,6 +1464,18 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     // reaches the builder with order_by == nullptr and its ORDER BY becomes a separate
     // LOGICAL_ORDER above the distinct, so the DISTINCT ON + ORDER BY guard must not fire.
     auto plan = generate_sirius_plan(*con, "SELECT DISTINCT id, val FROM big_left ORDER BY id");
+    INFO(tree_to_string(plan.get()));
+
+    auto* aggregate = require_distinct_wrap_chain(plan.get());
+    CHECK(aggregate->group_idx == std::vector<int>{0, 1});
+    CHECK(find_first(plan.get(), SiriusPhysicalOperatorType::MERGE_SORT) != nullptr);
+  }
+
+  SECTION("an all-key DISTINCT ON under an ORDER BY lowers to the GPU")
+  {
+    // Nothing is carried, so the order only sorts the result above the distinct.
+    auto plan =
+      generate_sirius_plan(*con, "SELECT DISTINCT ON (id, val) id, val FROM big_left ORDER BY val");
     INFO(tree_to_string(plan.get()));
 
     auto* aggregate = require_distinct_wrap_chain(plan.get());
@@ -1544,6 +1586,228 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   }
 }
 
+TEST_CASE_METHOD(
+  plan_tree_shape_fixture,
+  "plan tree shape - carried DISTINCT columns lower to an all-FIRST grouped aggregate",
+  "[plan_tree_shape][isolated_context][distinct]")
+{
+  // The chain the carried shapes share: one HASH_GROUP_BY whose aggregate list is all FIRST and
+  // emits no cuDF aggregation, with the merge inheriting the FIRST flag. `first_inputs` is each
+  // slot's child column in slot order.
+  auto require_all_first_chain = [](sirius_physical_operator* plan,
+                                    std::vector<int> const& first_inputs) {
+    auto* merge = find_first(plan, SiriusPhysicalOperatorType::MERGE_GROUP_BY);
+    REQUIRE(merge != nullptr);
+    auto& merge_op = merge->Cast<sirius::op::sirius_physical_grouped_aggregate_merge>();
+    CHECK(merge_op.has_first);
+    CHECK(merge_op.cudf_aggregates.empty());
+    CHECK(merge_op.partials_are_output());
+    REQUIRE(merge->children.size() == 1);
+
+    auto* partition = merge->children[0].get();
+    REQUIRE(partition->type == SiriusPhysicalOperatorType::PARTITION);
+    CHECK(partition->Cast<sirius::op::sirius_physical_partition>().exchange() != nullptr);
+    REQUIRE(partition->children.size() == 1);
+
+    auto* hgb = partition->children[0].get();
+    REQUIRE(hgb->type == SiriusPhysicalOperatorType::HASH_GROUP_BY);
+    auto& aggregate = hgb->Cast<sirius::op::sirius_physical_grouped_aggregate>();
+    CHECK(aggregate.cudf_aggregates.empty());
+    CHECK(aggregate.cudf_aggregate_idx.empty());
+    CHECK_FALSE(aggregate.has_avg);
+    CHECK_FALSE(aggregate.has_count_distinct);
+    CHECK(aggregate.has_first);
+    // DISTINCT builds no grouping set and a plain GROUP BY builds one.
+    CHECK(aggregate.grouping_sets.size() <= 1);
+    CHECK(aggregate.get_types().size() == aggregate.group_idx.size() + first_inputs.size());
+
+    std::vector<int> actual_inputs;
+    for (auto const& slot : aggregate.aggregate_slots) {
+      auto const* first = std::get_if<sirius::op::first_slot>(&slot);
+      REQUIRE(first != nullptr);
+      CHECK(first->carried_idx == actual_inputs.size());
+      actual_inputs.push_back(first->input_idx);
+    }
+    CHECK(actual_inputs == first_inputs);
+    CHECK(sirius::op::carried_inputs(aggregate.aggregate_slots) == first_inputs);
+    return &aggregate;
+  };
+
+  // The projection the builder leaves above the merge, if any: the one whose child is the merge.
+  auto projections_over_merge = [](sirius_physical_operator* plan) {
+    std::vector<sirius_physical_operator*> out;
+    for (auto* projection : collect(plan, SiriusPhysicalOperatorType::PROJECTION)) {
+      if (projection->children.size() == 1 &&
+          projection->children[0]->type == SiriusPhysicalOperatorType::MERGE_GROUP_BY) {
+        out.push_back(projection);
+      }
+    }
+    return out;
+  };
+
+  SECTION("DISTINCT ON carries a column after its key and needs no projection")
+  {
+    auto plan = generate_sirius_plan(*con, "SELECT DISTINCT ON (id) id, val FROM big_left");
+    INFO(tree_to_string(plan.get()));
+
+    auto* aggregate = require_all_first_chain(plan.get(), {1});
+    CHECK(aggregate->group_idx == std::vector<int>{0});
+    // The select list the builder writes is [#0, #1] over an operator already in that order, so
+    // push_projection drops it.
+    CHECK(collect(plan.get(), SiriusPhysicalOperatorType::PROJECTION).empty());
+  }
+
+  SECTION("DISTINCT ON ordered by its key carries an unordered FIRST")
+  {
+    // An ORDER BY term that is a distinct target is dropped, as DuckDB's own builder drops it.
+    auto plan =
+      generate_sirius_plan(*con, "SELECT DISTINCT ON (id) id, val FROM big_left ORDER BY id");
+    INFO(tree_to_string(plan.get()));
+
+    auto* aggregate = require_all_first_chain(plan.get(), {1});
+    CHECK(aggregate->group_idx == std::vector<int>{0});
+    CHECK(find_first(plan.get(), SiriusPhysicalOperatorType::MERGE_SORT) != nullptr);
+  }
+
+  SECTION("plain DISTINCT ordered by a column outside the select list carries that column")
+  {
+    // `val` is added to the select list after the targets were synthesized from it, so the node is
+    // two columns wide with one target, and `val` is carried.
+    auto plan = generate_sirius_plan(*con, "SELECT DISTINCT id FROM big_left ORDER BY val");
+    INFO(tree_to_string(plan.get()));
+
+    auto* aggregate = require_all_first_chain(plan.get(), {1});
+    CHECK(aggregate->group_idx == std::vector<int>{0});
+    CHECK(find_first(plan.get(), SiriusPhysicalOperatorType::MERGE_SORT) != nullptr);
+  }
+
+  SECTION("an expression DISTINCT ON target carries both of its own columns")
+  {
+    // `id + val` is appended to the select list, so the one target is a bare reference to child
+    // column 2 and `id` and `val` are carried. The builder's [#1, #2, #0] folds with the binder's
+    // two-column prune projection into one projection over the merge.
+    auto plan = generate_sirius_plan(*con, "SELECT DISTINCT ON (id + val) id, val FROM big_left");
+    INFO(tree_to_string(plan.get()));
+
+    auto* aggregate = require_all_first_chain(plan.get(), {0, 1});
+    CHECK(aggregate->group_idx == std::vector<int>{2});
+    CHECK(aggregate->get_types().size() == 3);
+
+    auto projections = projections_over_merge(plan.get());
+    REQUIRE(projections.size() == 1);
+    auto const& select_list =
+      projections[0]->Cast<sirius::op::sirius_physical_projection>().select_list;
+    REQUIRE(select_list.size() == 2);
+    REQUIRE(select_list[0]->holds<sirius::ast::reference>());
+    REQUIRE(select_list[1]->holds<sirius::ast::reference>());
+    CHECK(select_list[0]->get<sirius::ast::reference>().column_index == 1);
+    CHECK(select_list[1]->get<sirius::ast::reference>().column_index == 2);
+  }
+
+  SECTION("a carried column over a narrowed aggregate keeps the child's planned type")
+  {
+    // The DISTINCT node declares sum()'s HUGEINT for `s`; the aggregate below is planned as BIGINT.
+    auto plan = generate_sirius_plan(
+      *con,
+      "SELECT DISTINCT ON (k) k, s FROM (SELECT val AS k, sum(id) AS s FROM big_left GROUP BY "
+      "val)");
+    INFO(tree_to_string(plan.get()));
+
+    duckdb::vector<sirius::logical_type> const planned{
+      sirius::logical_type::make(sirius::type_id::INTEGER),
+      sirius::logical_type::make(sirius::type_id::BIGINT)};
+    auto* aggregate = require_all_first_chain(plan.get(), {1});
+    CHECK(aggregate->group_idx == std::vector<int>{0});
+    CHECK(aggregate->get_types() == planned);
+    CHECK(find_first(plan.get(), SiriusPhysicalOperatorType::MERGE_GROUP_BY)->get_types() ==
+          planned);
+    CHECK(projections_over_merge(plan.get()).empty());
+  }
+
+  SECTION("a FIRST beside another aggregate carries its column after the partials")
+  {
+    auto plan =
+      generate_sirius_plan(*con, "SELECT id, first(val), sum(val) FROM big_left GROUP BY id");
+    INFO(tree_to_string(plan.get()));
+
+    auto* hgb = find_first(plan.get(), SiriusPhysicalOperatorType::HASH_GROUP_BY);
+    REQUIRE(hgb != nullptr);
+    auto const& aggregate = hgb->Cast<sirius::op::sirius_physical_grouped_aggregate>();
+    CHECK(aggregate.has_first);
+    CHECK(aggregate.cudf_aggregates ==
+          std::vector<cudf::aggregation::Kind>{cudf::aggregation::Kind::SUM});
+    REQUIRE(aggregate.aggregate_slots.size() == 2);
+    auto const* first = std::get_if<sirius::op::first_slot>(&aggregate.aggregate_slots[0]);
+    REQUIRE(first != nullptr);
+    CHECK(first->input_idx == 1);
+    CHECK(first->carried_idx == 0);
+    auto const* sum = std::get_if<sirius::op::plain_slot>(&aggregate.aggregate_slots[1]);
+    REQUIRE(sum != nullptr);
+    CHECK(sum->partial_idx == 0);
+    CHECK(sirius::op::carried_inputs(aggregate.aggregate_slots) == std::vector<int>{1});
+    // The local and PARTITION schemas are the partial layout, not the declared one.
+    CHECK(hgb->get_types() == aggregate.local_types);
+    auto* partition = find_first(plan.get(), SiriusPhysicalOperatorType::PARTITION);
+    REQUIRE(partition != nullptr);
+    CHECK(partition->get_types() == aggregate.local_types);
+
+    auto* merge = find_first(plan.get(), SiriusPhysicalOperatorType::MERGE_GROUP_BY);
+    REQUIRE(merge != nullptr);
+    CHECK_FALSE(
+      merge->Cast<sirius::op::sirius_physical_grouped_aggregate_merge>().partials_are_output());
+  }
+
+  SECTION("a FIRST after a plain aggregate leaves the partials in output order")
+  {
+    auto plan =
+      generate_sirius_plan(*con, "SELECT id, sum(val), first(val) FROM big_left GROUP BY id");
+    INFO(tree_to_string(plan.get()));
+
+    auto* merge = find_first(plan.get(), SiriusPhysicalOperatorType::MERGE_GROUP_BY);
+    REQUIRE(merge != nullptr);
+    CHECK(merge->Cast<sirius::op::sirius_physical_grouped_aggregate_merge>().partials_are_output());
+  }
+
+  SECTION("a FIRST after AVG's two partials is carried after both")
+  {
+    auto plan =
+      generate_sirius_plan(*con, "SELECT id, avg(val), first(val) FROM big_left GROUP BY id");
+    INFO(tree_to_string(plan.get()));
+
+    auto* hgb = find_first(plan.get(), SiriusPhysicalOperatorType::HASH_GROUP_BY);
+    REQUIRE(hgb != nullptr);
+    auto const& aggregate = hgb->Cast<sirius::op::sirius_physical_grouped_aggregate>();
+    CHECK(aggregate.cudf_aggregates.size() == 2);
+    REQUIRE(aggregate.aggregate_slots.size() == 2);
+    auto const* avg = std::get_if<sirius::op::avg_slot>(&aggregate.aggregate_slots[0]);
+    REQUIRE(avg != nullptr);
+    CHECK(avg->sum_idx == 0);
+    auto const* first = std::get_if<sirius::op::first_slot>(&aggregate.aggregate_slots[1]);
+    REQUIRE(first != nullptr);
+    CHECK(first->carried_idx == 0);
+  }
+
+  SECTION("a FIRST of a group key builds")
+  {
+    // The hoist gives the FIRST's argument its own child column, so the key is carried as a copy.
+    auto plan = generate_sirius_plan(*con, "SELECT id, first(id) FROM big_left GROUP BY id");
+    INFO(tree_to_string(plan.get()));
+
+    auto* aggregate = require_all_first_chain(plan.get(), {1});
+    CHECK(aggregate->group_idx == std::vector<int>{0});
+  }
+
+  SECTION("a GROUP BY whose only aggregates are FIRST takes the same route")
+  {
+    // An all-FIRST GROUP BY builds the same operator.
+    auto plan = generate_sirius_plan(*con, "SELECT id, first(val) FROM big_left GROUP BY id");
+    INFO(tree_to_string(plan.get()));
+
+    auto* aggregate = require_all_first_chain(plan.get(), {1});
+    CHECK(aggregate->group_idx == std::vector<int>{0});
+  }
+}
+
 TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "plan tree shape - unsupported DISTINCT shapes are rejected at plan time",
                  "[plan_tree_shape][isolated_context]")
@@ -1551,10 +1815,12 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   // The builder's own guards throw duckdb::NotImplementedException specifically: SiriusContext
   // reports that type as an unsupported shape and logs the message, where a plain std::exception
   // would still fall back but be reported as a plan failure.
-  auto require_rejected = [&](std::string const& query, std::string const& message_fragment) {
+  auto require_rejected = [&](std::string const& query,
+                              std::string const& message_fragment,
+                              std::vector<OptimizerType> const& also_disabled = {}) {
     INFO(query);
     try {
-      generate_sirius_plan(*con, query);
+      generate_sirius_plan(*con, query, also_disabled);
     } catch (NotImplementedException const& e) {
       REQUIRE_THAT(std::string(e.what()), Catch::Matchers::ContainsSubstring(message_fragment));
       return;
@@ -1578,25 +1844,16 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     FAIL("expected an exception containing: " << message_fragment);
   };
 
-  SECTION("DISTINCT ON with carried columns needs a grouped FIRST")
-  {
-    require_rejected("SELECT DISTINCT ON (id) id, val FROM big_left",
-                     "DISTINCT ON with carried (non-key) columns");
-  }
-
   SECTION("DISTINCT ON under an ORDER BY names a specific row per group")
   {
     require_rejected("SELECT DISTINCT ON (id) id, val FROM big_left ORDER BY val",
                      "DISTINCT ON with ORDER BY");
   }
 
-  SECTION("plain DISTINCT ordered by a column outside the select list has an uncovered output")
+  SECTION("a key term ahead of a carried column's term does not lift the ORDER BY refusal")
   {
-    // `val` is added to the select list after the targets were synthesized from it, so the node
-    // is two columns wide with one target. Output column 1 has no target: a different cause, and
-    // a different message, from a target that is not a column reference.
-    require_rejected("SELECT DISTINCT id FROM big_left ORDER BY val",
-                     "output column 1 has no distinct target");
+    require_rejected("SELECT DISTINCT ON (id) id, val FROM big_left ORDER BY id, val",
+                     "DISTINCT ON with ORDER BY");
   }
 
   SECTION("a collated distinct target is not a plain reference to any output column")
@@ -1604,8 +1861,8 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     // Binder::BindModifiers pushes the default collation over every distinct target, so a VARCHAR
     // key under a non-binary default_collation arrives as a call rather than as a bare reference:
     // the only route ordinary SQL has into the not-a-bare-reference arm. The integration suite's
-    // collation case runs the same shape but can only watch the fallback counter, which both
-    // uncovered-output arms move, so this is where that arm's message is pinned.
+    // collation case runs the same shape but can only watch the fallback counter, which every guard
+    // moves, so this is where that arm's message is pinned.
     //
     // default_collation is GLOBAL_DEFAULT-scoped, but Catch2 rebuilds the fixture -- and with it
     // the DuckDB instance -- for every leaf section, so the setting dies with this section.
@@ -1640,13 +1897,52 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     require_rejected_any("SELECT DISTINCT * FROM nested_keys", "is unsupported in DISTINCT");
   }
 
-  SECTION("an expression DISTINCT ON target still leaves its own columns carried")
+  SECTION("an all-FIRST list over several grouping sets is refused")
   {
-    // `id + val` is appended to the select list, so the target arrives as a bare reference to that
-    // appended column. Unsupported for the same reason as above: `id` and `val` are output columns
-    // no target covers.
-    require_rejected("SELECT DISTINCT ON (id + val) id, val FROM big_left",
-                     "DISTINCT ON with carried (non-key) columns");
+    // The set expansion copies no carried columns.
+    require_rejected("SELECT id, first(val) FROM big_left GROUP BY ROLLUP (id)",
+                     "grouped FIRST is not supported over several grouping sets");
+  }
+
+  SECTION("an all-FIRST list beside a grouping function is refused")
+  {
+    // The set expansion copies no carried columns.
+    require_rejected(
+      "SELECT id, first(val), GROUPING(id) FROM big_left GROUP BY GROUPING SETS ((id))",
+      "grouped FIRST is not supported over several grouping sets");
+  }
+
+  SECTION("a FIRST with a FILTER hits main's refusal of every aggregate FILTER")
+  {
+    // Kept for when that refusal lifts: no FIRST route reads a FILTER.
+    require_rejected("SELECT id, first(val) FILTER (WHERE val > 0) FROM big_left GROUP BY id",
+                     "Aggregates with a FILTER clause not supported");
+  }
+
+  SECTION("a FILTER beside a grouped FIRST hits main's refusal of every aggregate FILTER")
+  {
+    // Kept for when that refusal lifts: the grouped operator drops every FILTER, so the SUM would
+    // count rows the filter excludes.
+    require_rejected(
+      "SELECT id, first(val), sum(val) FILTER (WHERE val > 0) FROM big_left GROUP BY id",
+      "Aggregates with a FILTER clause not supported");
+  }
+
+  SECTION("a FIRST beside another aggregate over several grouping sets is refused")
+  {
+    require_rejected("SELECT id, first(val), sum(val) FROM big_left GROUP BY ROLLUP (id)",
+                     "grouped FIRST is not supported over several grouping sets");
+  }
+
+  SECTION("an ordered FIRST is refused when both aggregate rewriters leave it in place")
+  {
+    // EXPRESSION_REWRITER and AGGREGATE_FUNCTION_REWRITER each turn this into arg_min_null, which
+    // Sirius does not translate. With both off, the aggregate stays `first` with one bare-reference
+    // child.
+    require_rejected(
+      "SELECT id, first(val ORDER BY val DESC) FROM big_left GROUP BY id",
+      "first() with an ORDER BY clause",
+      {OptimizerType::EXPRESSION_REWRITER, OptimizerType::AGGREGATE_FUNCTION_REWRITER});
   }
 }
 

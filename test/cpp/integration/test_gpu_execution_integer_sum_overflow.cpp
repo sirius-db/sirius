@@ -118,6 +118,8 @@ TEST_CASE_METHOD(IntegerSumFixture,
   expect_runtime_fallback_matches_cpu("SELECT g, SUM(x) FROM past_max GROUP BY g;");
   expect_runtime_fallback_matches_cpu("SELECT SUM(x) FROM past_min;");
   expect_runtime_fallback_matches_cpu("SELECT g, SUM(x) FROM past_min GROUP BY g;");
+  // A FIRST ahead of the SUM sends the merge through its reordering projection, which still checks.
+  expect_runtime_fallback_matches_cpu("SELECT g, first(g), SUM(x) FROM past_max GROUP BY g;");
   // The grouped average of the same rows stays on the GPU; the ungrouped one is rewritten to a SUM.
   expect_runtime_fallback_matches_cpu("SELECT AVG(x) FROM past_max;");
   compare_gpu_vs_cpu_approx("SELECT g, AVG(x) FROM past_min GROUP BY g;", {1}, 1e-12);
@@ -248,6 +250,10 @@ TEST_CASE_METHOD(IntegerSumFixture,
   REQUIRE_FALSE(cpu_plan_contains(*this, "SELECT SUM(y) FROM wide_merge", "sum_no_overflow"));
   compare_gpu_vs_cpu("SELECT g, SUM(x) s FROM wide_merge GROUP BY g;");
   compare_gpu_vs_cpu("SELECT SUM(x) s FROM wide_merge;");
+  // A FIRST of the key carries the same row in both engines. After the SUM the partials are
+  // already in output order, before it they are reordered; either way the SUM is narrowed.
+  compare_gpu_vs_cpu("SELECT g, SUM(x) s, first(g) f FROM wide_merge GROUP BY g;");
+  compare_gpu_vs_cpu("SELECT g, first(g) f, SUM(x) s FROM wide_merge GROUP BY g;");
   compare_gpu_vs_cpu_approx("SELECT g, AVG(y) a FROM wide_merge GROUP BY g;", {1}, 1e-12);
   // y sums to 2.4e18 per group, which fits, but 1.2e19 in total, which falls back.
   compare_gpu_vs_cpu("SELECT g, SUM(y) s FROM wide_merge GROUP BY g;");
