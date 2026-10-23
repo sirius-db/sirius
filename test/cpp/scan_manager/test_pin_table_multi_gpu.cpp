@@ -54,6 +54,7 @@
 
 #include "operator/mgpu_test_utils.hpp"
 #include "sirius_context.hpp"
+#include "utils/log_test_utils.hpp"
 
 #include <cuda_runtime.h>
 
@@ -805,6 +806,77 @@ TEST_CASE("pin_table - same-row-count merge appends every chunk for new columns"
   REQUIRE(entry.cache_info.column_names().size() == 3u);
 
   auto unpin = con.Query("CALL unpin_table('merge_pin');");
+  REQUIRE(unpin);
+  REQUIRE_FALSE(unpin->HasError());
+
+  fs::remove_all(tmp, ec);
+}
+
+//===----------------------------------------------------------------------===//
+// Host-tier pin served with the memory prefetcher on a 2-GPU topology.
+//
+// The prefetcher used to disable itself on more than one GPU space. With it
+// enabled, pin a host-tier surface spread over both GPUs and run a query
+// through the cached provider: the prefetcher must come up for the query (its
+// start line names both GPUs and the old "disabled" warning never fires) and
+// the result must match the CPU reference whether or not a given batch was
+// uploaded ahead of its task. Per-batch placement is covered by the
+// [memory_prefetcher][multi_gpu] unit tests.
+//===----------------------------------------------------------------------===//
+TEST_CASE("pin_table - host-tier pin serves through the memory prefetcher on 2 GPUs",
+          "[pin_mgpu][scan_manager][host_tier][memory_prefetcher][multi_gpu]")
+{
+  if (!require_two_gpus()) return;
+
+  auto tmp = make_tmp("host-prefetch");
+  std::error_code ec;
+  fs::remove_all(tmp, ec);
+  fs::create_directories(tmp);
+
+  // 8 files at a 1 MB batch size: one host chunk per file, round-robined over both GPUs, and
+  // enough of them that the prefetcher has a tail to work on behind the scan's head margin.
+  generate_parquet_surface(
+    tmp, "SELECT range AS k, range * 2 AS v FROM range(100000)", /*num_files=*/8);
+
+  mgpu_env_params params;
+  params.scan_task_batch_size = 1'000'000;  // 1 MB
+  params.memory_prefetcher    = true;
+  auto yaml_path              = tmp / "pin_mgpu_prefetch.yaml";
+  write_mgpu_yaml(yaml_path, params);
+
+  scoped_mgpu_env env(yaml_path);
+  auto con = env.make_connection();
+
+  auto glob = parquet_glob(tmp);
+  auto pin  = con.Query("CALL pin_table('" + glob + "', tier='host', name='host_prefetch');");
+  REQUIRE(pin);
+  if (pin->HasError()) { UNSCOPED_INFO("pin_table error: " << pin->GetError()); }
+  REQUIRE_FALSE(pin->HasError());
+
+  {
+    sirius::test::scoped_recording_log_sink log{"info"};
+    sirius::test::mgpu::require_gpu_matches_cpu(
+      con,
+      "SELECT count(*), max(k), sum(v) FROM read_parquet('" + glob + "')",
+      /*force_cpu_reference=*/true);
+
+    bool started  = false;
+    bool disabled = false;
+    for (auto const& rec : log.records()) {
+      if (rec.message.find("[memory_prefetcher] started") != std::string::npos &&
+          (rec.message.find("GPUs [0,1]") != std::string::npos ||
+           rec.message.find("GPUs [1,0]") != std::string::npos)) {
+        started = true;
+      }
+      if (rec.message.find("[memory_prefetcher] disabled") != std::string::npos) {
+        disabled = true;
+      }
+    }
+    REQUIRE(started);
+    REQUIRE_FALSE(disabled);
+  }
+
+  auto unpin = con.Query("CALL unpin_table('host_prefetch');");
   REQUIRE(unpin);
   REQUIRE_FALSE(unpin->HasError());
 
