@@ -551,6 +551,8 @@ class expression_evaluator {
   evaluate_result evaluate(sirius::ast::comparison const& expr, evaluation_mode mode);
   evaluate_result evaluate(sirius::ast::conjunction const& expr, evaluation_mode mode);
   evaluate_result evaluate(sirius::ast::function_call const& expr, evaluation_mode mode);
+  // Runs the function's libcudf kernel, whose result may be narrower than the declared type.
+  evaluate_result evaluate_function_kernel(sirius::ast::function_call const& expr);
   evaluate_result evaluate(sirius::ast::unary_op const& expr, evaluation_mode mode);
   evaluate_result evaluate(sirius::ast::coalesce const& expr, evaluation_mode mode);
   evaluate_result evaluate(sirius::ast::in_list const& expr, evaluation_mode mode);

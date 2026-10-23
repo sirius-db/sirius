@@ -3298,6 +3298,92 @@ TEMPLATE_TEST_CASE("evaluate string case conversion",
     REQUIRE(result->view().column(0).type().id() == cudf::type_id::STRING);
   }
 }
+
+TEMPLATE_TEST_CASE("function results narrower than their SQL type compose inside an AST predicate",
+                   "[expression_evaluator][ast_operand_type]",
+                   mat_strategy,
+                   ast_interpret_strategy,
+                   ast_jit_strategy)
+{
+  constexpr auto strategy = TestType::value;
+  auto* space             = get_default_gpu_space();
+  auto mr                 = get_resource_ref(*space);
+  auto stream             = cudf::get_default_stream();
+  auto const bigint       = logical_type::make(type_id::BIGINT);
+  auto const varchar      = logical_type::make(type_id::VARCHAR);
+  auto const date         = logical_type::make(type_id::DATE);
+
+  // Columns: TINYINT, VARCHAR, DATE. libcudf returns INT32 for length/strlen and INT16 for month,
+  // while DuckDB declares BIGINT.
+  std::vector<int8_t> const tiny{5, 4, 2, 0};
+  std::vector<std::string> const strings{"apple", "kiwi", "fig", ""};
+  std::vector<int32_t> const days{0, 59, 365, 0};  // 1970-01, 1970-03, 1971-01, NULL
+  auto tiny_column = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT8}, tiny.size(), cudf::mask_state::UNALLOCATED, stream, mr);
+  REQUIRE(cudaMemcpy(tiny_column->mutable_view().data<int8_t>(),
+                     tiny.data(),
+                     tiny.size() * sizeof(int8_t),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  std::vector<std::unique_ptr<cudf::column>> rows;
+  std::vector<cudf::column_view> row_views;
+  for (auto const& s : strings) {
+    cudf::string_scalar scalar(s, true, stream, mr);
+    rows.push_back(cudf::make_column_from_scalar(scalar, 1, stream, mr));
+    row_views.push_back(rows.back()->view());
+  }
+  auto string_column = cudf::concatenate(row_views, stream, mr);
+  auto date_column   = cudf::make_fixed_width_column(cudf::data_type{cudf::type_id::TIMESTAMP_DAYS},
+                                                   days.size(),
+                                                   cudf::mask_state::ALL_VALID,
+                                                   stream,
+                                                   mr);
+  REQUIRE(cudaMemcpy(date_column->mutable_view().head<int32_t>(),
+                     days.data(),
+                     days.size() * sizeof(int32_t),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  cudf::set_null_mask(date_column->mutable_view().null_mask(), 3, 4, false, stream);
+  date_column->set_null_count(1);
+  cudf::table_view input({tiny_column->view(), string_column->view(), date_column->view()});
+
+  auto unary_func = [](sirius::function_id id, std::unique_ptr<ast_node> arg) {
+    std::vector<std::unique_ptr<ast_node>> args;
+    args.push_back(std::move(arg));
+    return make_func(id, std::move(args), logical_type::make(type_id::BIGINT));
+  };
+  auto select_first_column = [&](ast_node const& expr) {
+    sirius::expression_evaluator evaluator(
+      expr, mr, stream, sirius::expression_query_policy{strategy}, /*min_ast_size=*/1);
+    return copy_column_to_host<int8_t>(evaluator.select(input)->view().column(0));
+  };
+
+  SECTION("CAST(tinyint AS BIGINT) IS NOT DISTINCT FROM length(varchar)")
+  {
+    auto expr =
+      make_cmp(sirius::comparison_type::not_distinct_from,
+               make_cast(make_ref_typed(0, logical_type::make(type_id::TINYINT)), bigint, false),
+               unary_func(sirius::function_id::length, make_ref_typed(1, varchar)));
+    REQUIRE(select_first_column(*expr) == std::vector<int8_t>{5, 4, 0});
+  }
+  SECTION("BIGINT constant IS DISTINCT FROM strlen(varchar)")
+  {
+    auto expr = make_cmp(sirius::comparison_type::distinct_from,
+                         make_bigint_const(4),
+                         unary_func(sirius::function_id::strlen, make_ref_typed(1, varchar)));
+    REQUIRE(select_first_column(*expr) == std::vector<int8_t>{5, 2, 0});
+  }
+  SECTION("month(date) NOT IN BIGINT constants")
+  {
+    std::vector<std::unique_ptr<ast_node>> values;
+    values.push_back(make_bigint_const(3));
+    values.push_back(make_bigint_const(-380));
+    auto expr = make_in(unary_func(sirius::function_id::month, make_ref_typed(2, date)),
+                        std::move(values),
+                        /*negated=*/true);
+    // NOT IN over NULL is NULL, so the NULL date row is filtered.
+    REQUIRE(select_first_column(*expr) == std::vector<int8_t>{5, 2});
+  }
+}
+
 TEST_CASE("timestamp casts check microsecond overflow", "[expression_evaluator][timestamp_bounds]")
 {
   auto* space         = get_default_gpu_space();

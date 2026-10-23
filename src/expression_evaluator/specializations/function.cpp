@@ -179,9 +179,29 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
     }
     return materialize_as_ast_column(result.release_column());
   }
+
+  // libcudf may return a narrower numeric type than the SQL result (e.g. INT32 for length, INT16
+  // for month where DuckDB declares BIGINT). cuDF AST operators and constant IN-lists require the
+  // declared type.
+  auto result = evaluate_function_kernel(alt);
+  if (result.is_scalar()) { return result; }
+  auto const declared_type = sirius::require_cudf_type(alt.return_type());
+  auto const result_type   = result.get_column_view().type();
+  if (result_type == declared_type || !cudf::is_numeric(result_type) ||
+      !cudf::is_numeric(declared_type)) {
+    return result;
+  }
+  return evaluate_result(cudf::cast(result.get_column_view(), declared_type, _stream, _mr));
+}
+
+evaluate_result expression_evaluator::evaluate_function_kernel(
+  sirius::ast::function_call const& alt)
+{
+  auto const resolved_id = alt.function();
+  auto const& args       = alt.arguments();
   auto const output_type = sirius::require_cudf_type(alt.return_type());
 
-  if (date_operation.has_value()) {
+  if (auto const date_operation = alt.date_operation(); date_operation.has_value()) {
     auto left               = evaluate(*args[0], evaluation_mode::MATERIALIZE);
     auto right              = evaluate(*args[1], evaluation_mode::MATERIALIZE);
     auto as_transform_input = [&](evaluate_result& value) -> cudf::transform_input {
