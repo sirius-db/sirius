@@ -2621,8 +2621,14 @@ static void SetExchangePeers(ClientContext& context, SetScope scope, Value& para
 
 static void SetExchangeRank(ClientContext& context, SetScope scope, Value& parameter)
 {
-  get_operator_params(context, scope)->exchange_rank =
-    static_cast<uint32_t>(UBigIntValue::Get(parameter));
+  auto* params          = get_operator_params(context, scope);
+  params->exchange_rank = static_cast<uint32_t>(UBigIntValue::Get(parameter));
+  // Peers set first: connect now, during session setup, rather than inside the first
+  // distributed query, which would otherwise wait for every peer's process to reach it.
+  if (params->exchange_peers.empty()) { return; }
+  if (auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")) {
+    static_cast<void>(sirius_ctx->get_exchange_service(*params));
+  }
 }
 
 static void SetHashPartitionBytes(ClientContext& context, SetScope scope, Value& parameter)
