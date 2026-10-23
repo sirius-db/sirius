@@ -609,6 +609,19 @@ void SiriusContext::retire_query_work(sirius::query_id_t query_id, query_retirem
   }
   // The sole query-wide work barrier: includes manager-held tasks, callbacks and spill victims.
   query_lifecycle_.wait_for_work(query_id);
+  // The exchange may still hold batches this rank sent, until their last frame is staged; they
+  // must be freed before the query's memory is released.
+  if (auto const distributed = window_distributed_query_.load(); distributed != 0) {
+    std::shared_ptr<sirius::exchange::exchange_service> service;
+    {
+      std::lock_guard lock{exchange_mutex_};
+      service = exchange_service_;
+    }
+    if (service && !service->wait_sent(distributed, std::chrono::minutes{1})) {
+      SIRIUS_LOG_WARN("Distributed query {}: sent batches still held by the exchange after 1 min",
+                      distributed);
+    }
+  }
 }
 
 std::size_t SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id,

@@ -126,6 +126,25 @@ TEST_CASE("a receiver with no room holds the frames until room appears", "[excha
   CHECK_FALSE(got.error);
 }
 
+TEST_CASE("a sender holds a batch of a query until its last frame is staged",
+          "[exchange][transport]")
+{
+  // About 1 MiB: 16 frames of 64 KiB, against 4 receive frames a receiver with no room keeps.
+  cluster c(2, 4, 4, loopback_hub::options{}, /*host=*/nullptr);
+  auto& sender           = *c.ranks[0].t;
+  auto& got              = *c.ranks[1].got;
+  stream_id const stream = (stream_id{5} << sirius::exchange::query_stream_bits) | 1;
+  {
+    auto const hold = hold_gpu();
+    sender.send(stream, 1, gpu_batch(sample_table(30'000)));
+    sender.close(stream, 1);
+    CHECK_FALSE(sender.wait_sent(5, std::chrono::milliseconds{500}));
+    CHECK(sender.wait_sent(6, std::chrono::milliseconds{0}));
+  }
+  CHECK(sender.wait_sent(5, std::chrono::seconds{30}));
+  REQUIRE(got.wait_for([&] { return got.ended.size() == 1; }));
+}
+
 TEST_CASE("a failed write fails the sender and its peer", "[exchange][transport]")
 {
   cluster c(2, 4, 4, {.fail_after_writes = 0}, env().host);
