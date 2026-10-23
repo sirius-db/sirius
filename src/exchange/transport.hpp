@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <exception>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -145,14 +146,24 @@ class transport {
   /// transport has failed: its peers have heard of that.
   void abort(std::uint64_t query, std::string what);
 
+  /// Waits until this rank holds no batch it sent on a stream of @p query: the transport keeps a
+  /// sent batch until its last frame is staged, and its memory may belong to the query.
+  /// @return false after @p timeout, or once the transport has failed with batches still held.
+  [[nodiscard]] bool wait_sent(std::uint64_t query, std::chrono::milliseconds timeout);
+
  private:
   struct engine;
 
   void run();
+  /// A batch of @p query sent to a peer was freed.
+  void released(std::uint64_t query);
 
   std::unique_ptr<engine> _engine;
   std::mutex _mutex;
   std::condition_variable _room;
+  /// Sent batches not yet freed, by query; _released is notified as they are.
+  std::map<std::uint64_t, std::size_t> _held;
+  std::condition_variable _released;
   std::exception_ptr _error;
   /// abort() notices for the engine thread to send to every peer.
   std::vector<abort_message> _aborts;

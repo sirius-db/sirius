@@ -437,6 +437,8 @@ transport::~transport()
   }
   _room.notify_all();
   _thread.join();
+  // The engine still holds unsent batches, whose deleters use the members declared after it.
+  _engine.reset();
 }
 
 rank_t transport::rank() const noexcept { return _engine->fab.rank(); }
@@ -464,6 +466,17 @@ void transport::send(stream_id stream, rank_t to, std::shared_ptr<cucascade::dat
   auto out = outgoing_batch::make(std::move(batch), e.send_stream.view());
   if (!out) { return; }
   auto const bytes = out->stream_bytes();
+  // Counted before the deleter can run, on any path that drops the batch.
+  auto const query = query_of(stream);
+  {
+    std::lock_guard lock{_mutex};
+    ++_held[query];
+  }
+  std::shared_ptr<outgoing_batch> held(new outgoing_batch(std::move(*out)),
+                                       [this, query](outgoing_batch* b) {
+                                         delete b;
+                                         released(query);
+                                       });
   std::unique_lock lock{_mutex};
   _room.wait(lock, [&] {
     return _error || _stop || e.queued_bytes == 0 ||
@@ -471,8 +484,23 @@ void transport::send(stream_id stream, rank_t to, std::shared_ptr<cucascade::dat
   });
   if (_error) { std::rethrow_exception(_error); }
   e.queued_bytes += bytes;
-  e.queues[to].push_back(
-    {stream, e.sent[to][stream]++, std::make_shared<outgoing_batch>(std::move(*out))});
+  e.queues[to].push_back({stream, e.sent[to][stream]++, std::move(held)});
+}
+
+void transport::released(std::uint64_t query)
+{
+  {
+    std::lock_guard lock{_mutex};
+    if (auto it = _held.find(query); it != _held.end() && --it->second == 0) { _held.erase(it); }
+  }
+  _released.notify_all();
+}
+
+bool transport::wait_sent(std::uint64_t query, std::chrono::milliseconds timeout)
+{
+  std::unique_lock lock{_mutex};
+  _released.wait_for(lock, timeout, [&] { return _error || !_held.contains(query); });
+  return !_held.contains(query);
 }
 
 void transport::close(stream_id stream, rank_t to)
@@ -570,6 +598,7 @@ void transport::run()
       _error = error;
     }
     _room.notify_all();
+    _released.notify_all();
     e.cb.on_error(error);
   }
 }
