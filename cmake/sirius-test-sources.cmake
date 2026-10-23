@@ -124,6 +124,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_reset_sirius_cache.cpp
     test/cpp/integration/test_gpu_execution_tpcds_nulls.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
+    test/cpp/integration/test_gpu_execution_tpch_havoc.cpp
     test/cpp/integration/test_gpu_execution_tpch_mgpu_audit.cpp
     test/cpp/integration/test_gpu_execution_unique_join.cpp
     test/cpp/integration/test_gpu_execution_union_all.cpp
