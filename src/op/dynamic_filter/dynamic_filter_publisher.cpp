@@ -207,16 +207,13 @@ void merge_across_ranks(dynamic_filter_publish_plan::distributed_merge const& d,
 void merge_without_filters(dynamic_filter_publish_plan const& plan) noexcept;
 
 /**
- * @brief Distributed: the keys an accumulated Bloom is sized for, the same on every rank so the
- * ranks' filters merge. The planned size, cut so that every admitted key fits the per-GPU cap.
+ * @brief The most keys a Bloom of each of @p key_count keys can be sized for under @p cap.
  */
-std::size_t distributed_bloom_keys(dynamic_filter_publish_plan const& plan) noexcept
+std::size_t bloom_keys_within_cap(std::uint64_t cap, std::size_t key_count) noexcept
 {
   auto constexpr alignment = rmm::CUDA_ALLOCATION_ALIGNMENT;
-  auto const per_key       = plan.max_bloom_bytes_per_gpu() / plan.admitted_keys().size();
-  auto const blocks        = per_key / alignment * alignment / bloom_bytes_per_block;
-  auto const fitting       = blocks * (bloom_bits_per_block / bloom_target_bits_per_key);
-  return std::min(plan.distributed()->bloom_keys, fitting);
+  auto const blocks        = cap / key_count / alignment * alignment / bloom_bytes_per_block;
+  return blocks * (bloom_bits_per_block / bloom_target_bits_per_key);
 }
 
 }  // namespace
@@ -674,8 +671,15 @@ bool dynamic_filter_publication_session::try_begin_accumulation(
       keys.push_back({key.build_key_ordinal, key.storage_type});
     }
     if (keys.empty()) { return false; }
-    auto const sized_for = plan.distributed() ? distributed_bloom_keys(plan) : rows;
-    auto const geometry  = detail::accumulated_bloom_geometry::try_create(
+    // A build too large for the cap gets a Bloom cut to it: more false positives, still a filter.
+    // Distributed, every rank sizes it alike from the plan, so the ranks' filters merge.
+    auto const* distributed = plan.distributed();
+    auto const wanted       = distributed ? distributed->bloom_keys : rows;
+    auto const sized_for =
+      std::min(wanted,
+               bloom_keys_within_cap(plan.max_bloom_bytes_per_gpu(),
+                                     distributed ? plan.admitted_keys().size() : keys.size()));
+    auto const geometry = detail::accumulated_bloom_geometry::try_create(
       sized_for, keys.size(), plan.max_bloom_bytes_per_gpu());
     if (!geometry) {
       selection.keys_skipped_bloom_size_gate = keys.size();
@@ -689,6 +693,14 @@ bool dynamic_filter_publication_session::try_begin_accumulation(
         required ? std::to_string(required->arrays_bytes) : "overflow",
         plan.max_bloom_bytes_per_gpu());
       return false;
+    }
+    if (sized_for < wanted) {
+      SIRIUS_LOG_INFO(
+        "[dynamic_filter_publication_session] accumulated Bloom cut to the per-GPU cap: sized for "
+        "{} keys instead of {}, cap={}",
+        sized_for,
+        wanted,
+        plan.max_bloom_bytes_per_gpu());
     }
 
     auto const& replicas = plan.replica_spaces();
