@@ -1,0 +1,162 @@
+NIXL 1.5.0: build the host C++ SDK without unused bindings and components.
+
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -21,6 +21,7 @@
+ option('disable_mooncake_backend', type : 'boolean', value : false, description : 'disable mooncake backend')
+ option('disable_infinia_backend', type : 'boolean', value : false, description : 'disable infinia backend')
+ option('infinia_path', type: 'string', value: '/opt/ddn/red/', description: 'Path to Infinia client install')
++option('native_only', type: 'boolean', value: false, description: 'Build only the host C++ library and selected transport backends')
+ option('install_headers', type : 'boolean', value : true, description : 'install headers')
+ option('gds_path', type: 'string', value: '/usr/local/cuda/', description: 'Path to GDS CuFile install')
+ option('cudapath_inc', type: 'string', value: '', description: 'Include path for CUDA')
+--- a/meson.build
++++ b/meson.build
+@@ -20,6 +20,8 @@
+                 'prefix=/opt/nvidia/nvda_nixl'],
+     meson_version: '>= 0.64.0'
+ )
++
++native_only = get_option('native_only')
+ 
+ enable_plugins_opt = get_option('enable_plugins')
+ disable_plugins_opt = get_option('disable_plugins')
+@@ -123,9 +125,12 @@
+ 
+ # Check for liburing
+ has_io_uring = false
+-io_uring_dep = dependency('liburing', required: false,
+-                          fallback: ['liburing'],
+-                          default_options: ['default_library=shared'])
++io_uring_dep = dependency('', required: false)
++if not native_only or enabled_plugins.get('POSIX')
++  io_uring_dep = dependency('liburing', required: false,
++                            fallback: ['liburing'],
++                            default_options: ['default_library=shared'])
++endif
+ if io_uring_dep.found()
+   if io_uring_dep.type_name() == 'internal'
+     # Internal (subproject) deps cannot be passed to compiler checks in meson
+@@ -230,7 +235,10 @@
+   message('Using system Abseil dependencies')
+   summary({'Abseil source': 'system'}, section: 'Dependencies')
+ endif
+-taskflow_proj = dependency('taskflow', fallback: ['taskflow', 'taskflow_dep'])
++taskflow_proj = dependency('', required: false)
++if not native_only or enabled_plugins.get('GDS') or enabled_plugins.get('GDS_MT')
++  taskflow_proj = dependency('taskflow', fallback: ['taskflow', 'taskflow_dep'])
++endif
+ 
+ cuda_inc_path = get_option('cudapath_inc')
+ cuda_lib_path = get_option('cudapath_lib')
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -22,6 +22,10 @@
+ subdir('plugins')
+ subdir('core')
+ 
++if native_only
++    subdir_done()
++endif
++
+ # Test utilities library - created after nixl_dep is available to avoid circular dependencies
+ nixl_test_utils_lib = library('nixl_test_utils',
+                              'infra/test_utils.cpp',
+--- a/src/api/meson.build
++++ b/src/api/meson.build
+@@ -14,5 +14,7 @@
+ # limitations under the License.
+ 
+ subdir('cpp')
+-subdir('python')
+-subdir('device')
++if not native_only
++    subdir('python')
++    subdir('device')
++endif
+--- a/src/plugins/meson.build
++++ b/src/plugins/meson.build
+@@ -131,7 +131,9 @@
+     endif
+ endif
+ 
+-subdir('telemetry')
++if not native_only
++    subdir('telemetry')
++endif
+ 
+ if nixl_trace_enabled
+     subdir('tracing')
+--- a/src/utils/meson.build
++++ b/src/utils/meson.build
+@@ -16,9 +16,15 @@
+ subdir('common')
+ subdir('serdes')
+ subdir('stream')
+-subdir('file')
+-subdir('object')
+-subdir('device')
++if not native_only or enabled_plugins.get('POSIX') or enabled_plugins.get('HF3FS') or enabled_plugins.get('GDS') or enabled_plugins.get('GDS_MT')
++    subdir('file')
++endif
++if not native_only or enabled_plugins.get('OBJ')
++    subdir('object')
++endif
++if not native_only
++    subdir('device')
++endif
+ 
+ if enabled_plugins.get('LIBFABRIC') and libfabric_dep.found()
+     subdir('libfabric')
+--- a/meson.build
++++ b/meson.build
+@@ -414,26 +414,29 @@
+     rocm_dep = disabler()
+ endif
+ 
+-# Check for etcd-cpp-api - use multiple methods for discovery
+-etcd_dep = dependency('etcd-cpp-api', required : false)
+-etcd_inc_path = get_option('etcd_inc_path')
+-etcd_lib_path = get_option('etcd_lib_path')
+-if not etcd_dep.found() and etcd_lib_path != ''
+-    etcd_lib = cpp.find_library('etcd-cpp-api', dirs: etcd_lib_path)
+-    if etcd_lib.found()
+-        if cpp.has_header('etcd/Client.hpp', args : '-I' + etcd_inc_path)
+-            etcd_inc = include_directories(etcd_inc_path, is_system: true)
+-            etcd_dep = declare_dependency(
+-                        include_directories : etcd_inc,
+-                        dependencies : etcd_lib)
+-        endif
+-    endif
+-endif
+-
+-if etcd_dep.found()
+-    add_project_arguments('-DHAVE_ETCD', language: 'cpp')
+-else
+-    message('ETCD CPP API library not found, will disable etcd support')
++etcd_dep = dependency('', required: false)
++if not native_only
++  # Check for etcd-cpp-api - use multiple methods for discovery
++  etcd_dep = dependency('etcd-cpp-api', required : false)
++  etcd_inc_path = get_option('etcd_inc_path')
++  etcd_lib_path = get_option('etcd_lib_path')
++  if not etcd_dep.found() and etcd_lib_path != ''
++      etcd_lib = cpp.find_library('etcd-cpp-api', dirs: etcd_lib_path)
++      if etcd_lib.found()
++          if cpp.has_header('etcd/Client.hpp', args : '-I' + etcd_inc_path)
++              etcd_inc = include_directories(etcd_inc_path, is_system: true)
++              etcd_dep = declare_dependency(
++                          include_directories : etcd_inc,
++                          dependencies : etcd_lib)
++          endif
++      endif
++  endif
++
++  if etcd_dep.found()
++      add_project_arguments('-DHAVE_ETCD', language: 'cpp')
++  else
++      message('ETCD CPP API library not found, will disable etcd support')
++  endif
+ endif
+ 
+ prefix_path = get_option('prefix')
