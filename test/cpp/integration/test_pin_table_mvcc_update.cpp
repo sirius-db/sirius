@@ -24,10 +24,12 @@
 #include <duckdb/transaction/duck_transaction_manager.hpp>
 #include <sirius_context.hpp>
 #include <utils/gpu_execution_fixture.hpp>
+#include <utils/scoped_sirius_setting.hpp>
 
 #include <chrono>
 #include <future>
 #include <string>
+#include <thread>
 
 using PinMvccUpdateFixture = sirius::test::GpuExecutionFixture;
 
@@ -46,6 +48,112 @@ void require_pinned_update_error(duckdb::QueryResult& result,
 }
 
 }  // namespace
+
+TEST_CASE_METHOD(PinMvccUpdateFixture,
+                 "mvcc update guard: GPU source finishes while maintenance waits for its writer",
+                 "[integration][gpu_execution][pin_table_mvcc_update]")
+{
+  using namespace std::chrono_literals;
+  // With no background workers, Submit() retains the writer until Complete() drives it.
+  sirius::test::scoped_sirius_setting threads(*con, "threads", std::uint64_t{1});
+  run_ok("CREATE TABLE writer_target(k INTEGER, v INTEGER);");
+  run_ok("INSERT INTO writer_target VALUES (1, 10);");
+  run_ok("CREATE TABLE writer_source AS SELECT 1::INTEGER AS k, 20::INTEGER AS v;");
+  run_ok("CHECKPOINT;");
+  duckdb::Connection maintenance_connection(*con->context->db);
+  auto use_result = maintenance_connection.Query("USE " + attach_alias + ";");
+  REQUIRE_FALSE(use_result->HasError());
+
+  auto prepared = con->Prepare(
+    "UPDATE writer_target SET v = s.v "
+    "FROM gpu_execution('SELECT k, v FROM writer_source') s WHERE writer_target.k = s.k;");
+  REQUIRE_FALSE(prepared->HasError());
+  auto pending = prepared->Submit();
+  REQUIRE_FALSE(pending->HasError());
+  auto state   = duckdb::get_sirius_connection_state(*con->context);
+  auto runtime = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(state);
+  REQUIRE(runtime);
+  REQUIRE(state->has_pinned_update_guard());
+  REQUIRE(runtime->admission_counts().writers == 1);
+
+  std::promise<void> finished;
+  auto done        = finished.get_future();
+  auto watchdog    = std::async(std::launch::async, [&] {
+    if (done.wait_for(30s) == std::future_status::ready) return false;
+    con->Interrupt();
+    maintenance_connection.Interrupt();
+    return true;
+  });
+  auto maintenance = std::async(std::launch::async, [&] {
+    return maintenance_connection.Query("CALL unpin_table('missing_writer_test_pin');");
+  });
+  auto deadline    = std::chrono::steady_clock::now() + 2s;
+  while (runtime->admission_counts().maintenance_waiters != 1 &&
+         std::chrono::steady_clock::now() < deadline)
+    std::this_thread::yield();
+  auto waiting = runtime->admission_counts();
+
+  bool cancel_maintenance = false;
+  SECTION("writer GPU execution passes pending maintenance") {}
+  SECTION("waiting maintenance can be interrupted before the writer finishes")
+  {
+    cancel_maintenance = true;
+    maintenance_connection.Interrupt();
+    // Record failure, but still execute the writer to release maintenance during cleanup.
+    CHECK(maintenance.wait_for(2s) == std::future_status::ready);
+    CHECK(state->has_pinned_update_guard());
+  }
+  pending->Complete();
+  auto result             = std::move(pending);
+  auto maintenance_result = maintenance.get();
+  finished.set_value();
+  CHECK_FALSE(watchdog.get());
+  CHECK(waiting.maintenance_waiters == 1);
+  CHECK_FALSE(waiting.maintenance_active);
+  INFO((result->HasError() ? result->GetError() : "UPDATE succeeded"));
+  REQUIRE_FALSE(result->HasError());
+  CHECK(maintenance_result->HasError() == cancel_maintenance);
+  CHECK_FALSE(state->has_pinned_update_guard());
+  CHECK(runtime->admission_counts().writers == 0);
+  CHECK(runtime->admission_counts().maintenance_waiters == 0);
+  CHECK_FALSE(runtime->admission_counts().maintenance_active);
+  run_ok("SET gpu_execution = false;");
+  auto values = con->Query("SELECT v FROM writer_target;");
+  REQUIRE_FALSE(values->HasError());
+  CHECK(values->Collection().GetValue(0, 0) == duckdb::Value::INTEGER(20));
+}
+
+TEST_CASE_METHOD(PinMvccUpdateFixture,
+                 "mvcc update guard: abandoned statements release writers before the next query",
+                 "[integration][gpu_execution][pin_table_mvcc_update]")
+{
+  sirius::test::scoped_sirius_setting threads(*con, "threads", std::uint64_t{1});
+  run_ok("CREATE TABLE t AS SELECT 1::INTEGER AS k, 10::INTEGER AS v;");
+  auto prepared = con->Prepare("UPDATE t SET v = v WHERE false;");
+  REQUIRE_FALSE(prepared->HasError());
+  auto pending = prepared->Submit();
+  REQUIRE_FALSE(pending->HasError());
+  auto state = duckdb::get_sirius_connection_state(*con->context);
+  REQUIRE(state);
+  REQUIRE(state->has_pinned_update_guard());
+  {
+    duckdb::SiriusContext::InternalQueryGuard internal(*con->context);
+    state->QueryBegin(*con->context);
+    state->QueryEnd();
+    CHECK(state->has_pinned_update_guard());
+  }
+  // Upgrading a writer to exclusive maintenance on the same connection must fail promptly.
+  auto runtime = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(runtime);
+  CHECK_THROWS_WITH(duckdb::SiriusContext::SlotGuard(
+                      *runtime, *con->context, sirius::exec::query_admission::access::maintenance),
+                    Catch::Matchers::ContainsSubstring("maintenance cannot run inside"));
+  pending.reset();
+  run_ok("SELECT 1;");
+  CHECK_FALSE(state->has_pinned_update_guard());
+  CHECK(runtime->admission_counts().writers == 0);
+}
 
 TEST_CASE_METHOD(PinMvccUpdateFixture,
                  "mvcc update guard: UPDATE fails before modifying a pinned table",
