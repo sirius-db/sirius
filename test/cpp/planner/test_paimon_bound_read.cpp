@@ -183,7 +183,8 @@ TEST_CASE("Shared callback verification includes semantic settings", "[paimon_bi
   }
   SECTION("return mode")
   {
-    candidate.return_type = duckdb::TableFunctionReturnType::SET_RETURNING_FUNCTION;
+    static_cast<duckdb::BaseTableFunction&>(candidate).return_type =
+      duckdb::TableFunctionReturnType::SET_RETURNING_FUNCTION;
   }
   SECTION("statement result") { candidate.call_return_type = duckdb::StatementReturnType::NOTHING; }
   SECTION("serialization verification")
@@ -334,8 +335,9 @@ TEST_CASE("Paimon descriptor consumer authenticates real loaded bindings",
       return duckdb::TableFunctionToSQLResult{};
     };
     CHECK_THROWS(provider.retain(forged, bound.data.get()));
-    forged             = bound.function;
-    forged.return_type = duckdb::TableFunctionReturnType::SET_RETURNING_FUNCTION;
+    forged = bound.function;
+    static_cast<duckdb::BaseTableFunction&>(forged).return_type =
+      duckdb::TableFunctionReturnType::SET_RETURNING_FUNCTION;
     CHECK_THROWS(provider.retain(forged, bound.data.get()));
     forged                  = bound.function;
     forged.call_return_type = duckdb::StatementReturnType::NOTHING;
