@@ -41,9 +41,12 @@
 #include <sirius/exception.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <sstream>
 #include <variant>
 #include <vector>
@@ -2892,6 +2895,22 @@ void emit_nvrtc_device_runtime_preamble(std::ostringstream& src)
     << "}\n\n";
 }
 
+// Debug aid: when `SIRIUS_NVRTC_DUMP_DIR` names a directory, every generated kernel source is
+// written there as `<seq>_<entry>.cu` so it can be inspected or compiled offline (e.g. with
+// `nvcc --resource-usage`). Resolved once per process; unset disables the dump.
+void maybe_dump_kernel_source(std::string const& entry, std::string const& source)
+{
+  static std::string const dir = []() -> std::string {
+    char const* env = std::getenv("SIRIUS_NVRTC_DUMP_DIR");
+    return (env != nullptr && *env != '\0') ? std::string(env) : std::string{};
+  }();
+  if (dir.empty()) { return; }
+  static std::atomic<unsigned> seq{0};
+  auto const path = dir + "/" + std::to_string(seq.fetch_add(1)) + "_" + entry + ".cu";
+  std::ofstream out(path, std::ios::binary);
+  out << source;
+}
+
 // Thread-local pinned host staging slab for reading back device status and count words without
 // synchronous pageable-memory staging overhead.
 class pinned_status_slab {
@@ -3308,8 +3327,10 @@ std::unique_ptr<cudf::table> evaluate_project_sink(
   opts.device_int128 = true;
   std::shared_ptr<const codegen::jit::CompiledKernel> compiled;
   try {
+    auto const source = src.str();
+    maybe_dump_kernel_source("sirius_nvrtc_project_kernel", source);
     compiled = codegen::jit::KernelCache::instance().get_or_compile_plain(
-      src.str(), "sirius_nvrtc_project_kernel", opts);
+      source, "sirius_nvrtc_project_kernel", opts);
   } catch (codegen::jit::CompileError const& err) {
     throw internal_exception("[nvrtc] {}\nLog:\n{}\nSource:\n{}", err.what(), err.log, err.source);
   }
@@ -3625,8 +3646,10 @@ std::unique_ptr<cudf::table> evaluate_filter_sink(sirius::ast::node const& predi
   opts.device_int128 = true;
   std::shared_ptr<const codegen::jit::CompiledKernel> compiled;
   try {
+    auto const source = src.str();
+    maybe_dump_kernel_source("sirius_nvrtc_filter_kernel", source);
     compiled = codegen::jit::KernelCache::instance().get_or_compile_plain(
-      src.str(), "sirius_nvrtc_filter_kernel", opts);
+      source, "sirius_nvrtc_filter_kernel", opts);
   } catch (codegen::jit::CompileError const& err) {
     throw internal_exception("[nvrtc] {}\nLog:\n{}\nSource:\n{}", err.what(), err.log, err.source);
   }
