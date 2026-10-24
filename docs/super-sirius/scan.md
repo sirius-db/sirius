@@ -13,7 +13,7 @@ The GPU scan path is a single unified source operator, `sirius_gpu_scan_operator
 
 The pipeline converter rewrites a DuckDB table scan into a `GPU_SCAN` source: it lowers the bind data into the appropriate `ingestible_table_info`, calls the free `make_ingestible(...)` factory to build the `gpu_ingestible`, constructs the operator carrying it, and inserts it at `operators[0]` of the pipeline. When a dynamic-filter channel is wired to the scan, a `DYNAMIC_FILTER` operator sits directly above it (see [Dynamic Filters](dynamic-filters.md)). No separate metadata pipeline is created.
 
-Before a query runs, `sirius_scan_manager::prepare_for_query` walks the plan's `GPU_SCAN` operators. For each it either (a) matches a pinned-table cache entry and serves the scan from cached batches, or (b) builds a `split_provider` over the operator's ingestible. Scan workers prepare metadata while the query-thread `preparation_coordinator` coalesces ready inputs, balances each batch onto a GPU, and publishes splits to each operator's `split_connector`.
+Before a query runs, `sirius_scan_manager::prepare_for_query` walks the plan's `GPU_SCAN` operators. For each it either (a) matches a pinned-table cache entry and serves the scan from cached batches, or (b) builds a `split_provider` over the operator's ingestible. Scan workers prepare metadata while the independent `preparation_coordinator` coalesces ready inputs, balances each batch onto a GPU, and publishes splits to each operator's `split_connector`.
 
 Data reaches the GPU through the Sirius IO subsystem (`io::ioctx` / `io::sirius_datasource`, with a pinned-memory prefetching cache) — see the IO sections later in this document. The scan path consumes that layer: each split carries prefetch hints, and the read for a split goes through the `ioctx` its backend resolves to. The target device travels with the request.
 
@@ -61,6 +61,8 @@ Before execution, a resident split is converted or decompressed to a plain GPU t
 | Method | Role |
 |--------|------|
 | `has_processed_all_metadata()` | Thread-safe snapshot: is all metadata enumerated? Typically an atomic cursor vs. a precomputed total. |
+| `make_preparation_sources(resolve)` | Register one or more lanes with independent coalescers and a shared scan output. The default wraps `make_preparation_source(resolve)`; see [preparation contracts](scan-contracts-design.md#execution-and-ownership). |
+| `try_claim_split(resolve)` | Return an owning metadata job, pending, or exhausted. Pending leaves the cursor unchanged. |
 | `next_split_provider(resolve)` | Atomically claim the next metadata unit and return a callable that produces its `scan_info`(s); `resolve` maps each file path to its ioctx. Null when nothing left to claim. |
 | `create_batch_coalescer()` | Build the format's `batch_coalescer`, which bundles per-unit metadata into right-sized data-batch splits. |
 | `materialize_table(split, stream)` | Produce the `filtered_table` for one split (dispatches to `materialize_metadata_to_table` for a fresh read, or wraps the resident batch for a cache hit). |
@@ -231,9 +233,9 @@ For nested types (`STRUCT`, `LIST`, `MAP`), one DuckDB column maps to multiple p
 | Component | File | Role |
 |-----------|------|------|
 | `sirius_scan_manager` | `scan_manager/sirius_scan_manager.{hpp,cpp}` | Owns the shared thread pool, ioctx, cache, and pinned-table registry; `prepare_for_query` registers per-query providers; `start_metadata_processing` arms preparation |
-| `split_provider` | `scan_manager/split_provider.{hpp,cpp}` | Concrete driver that composes a `gpu_ingestible`; `run()` dispatches one metadata task per claimed unit onto the dispatcher |
-| `load_balancing_scan_batch_coalescer` | `scan_manager/load_balancing_scan_batch_coalescer.{hpp,cpp}` | Per-query sequencer: drains each provider's metadata output through the format's `batch_coalescer`, balances each batch onto a GPU, fires prefetch hints, pushes splits onto the connector |
-| `preparation_coordinator` | `scan_manager/preparation_coordinator.{hpp,cpp}` | Runs preparation on the query thread, bounds pending work, and validates publication |
+| `split_provider` | `scan_manager/split_provider.{hpp,cpp}` | Binds a `gpu_ingestible` to its I/O resolver and returns its preparation sources |
+| `load_balancing_scan_batch_coalescer` | `scan_manager/load_balancing_scan_batch_coalescer.{hpp,cpp}` | Registers per-scan coalescing, placement and publication with the coordinator; drains cached providers on workers |
+| `preparation_coordinator` | `scan_manager/preparation_coordinator.{hpp,cpp}` | Owns the preparation thread, bounds pending work, and validates publication |
 | `batch_coalescer` | `op/scan/batch_coalescer.hpp` (impls in the ingestibles) | Bundles per-unit `scan_info`s into right-sized data-batch splits |
 | `balancing_strategy` / `round_robin_strategy` | `scan_manager/balancing_strategy.hpp`, `round_robin_strategy.{hpp,cpp}` | Picks the target GPU for each split and stamps `preferred_device_id` on it |
 | `split_connector` | `scan_manager/split_connector.{hpp,cpp}` | Lock-protected blocking queue between the producer (sequencer) and the operator |
@@ -245,16 +247,16 @@ For nested types (`STRUCT`, `LIST`, `MAP`), one DuckDB column maps to multiple p
 2. **Per-query preparation.** `prepare_for_query(query, pruning, allocated_gpu_ids)` creates state keyed by the query id, builds a `round_robin_strategy` over the query's admitted GPU ids and a fresh `load_balancing_scan_batch_coalescer`, then walks the query's `GPU_SCAN` operators in order. The admitted set is passed in by `SiriusContext::create_query`, which reads it back off `task_creator` after `sirius_engine::initialize_internal` installed it — so scan placement, partition pins and `pipeline_build_context` all draw on one list (see [configuration.md](configuration.md) for `topology.gpus_per_query`). For each it `register_pipeline`s a sequencer slot (which builds the ingestible's `batch_coalescer` and captures the operator's connector). Then either:
    - **Cache hit** — `try_assign_cached_entries` finds a pinned entry whose identity and columns can serve the scan; it attaches a `databatch_provider` to the slot and skips disk reading entirely; or
    - **Cache miss** — a `split_provider` is built over the operator's ingestible and stored with that query's scan entry.
-3. **Execution.** `start_metadata_processing` arms the coordinator; `run_preparation_on_query_thread` drives it while scan workers prepare metadata. Through `load_balancing_scan_batch_coalescer`, it coalesces ready inputs, balances each batch onto a GPU, and validates publication before initializing prefetch and pushing a `scan_operator_input` onto the operator's connector. Later scans can progress before earlier scans close. Consumers (the scan operators) block in `split_connector::get_next_split` until splits arrive.
-4. **Teardown.** The coordinator closes each connector when its source is drained (forwarding any worker-captured exception, first-writer-wins). Once closed and drained, the operator's `all_ports_empty()` returns true and `get_next_task_hint()` returns `nullopt`. Success requires both preparation and GPU work to drain. Failure or interruption stops new preparation and publication and drains workers and consumers before resources are released. `quiesce(query_id)` stops and joins that query's preparation while retaining its providers; after execution work retires, `reset(query_id)` releases that query's state without stopping the shared pool.
+3. **Execution.** Preparation starts after GPU consumers are ready. The coordinator runs independently of metadata workers and provider readers. It coalesces and validates ready inputs, selects a GPU, and publishes batches to each operator's connector. Later scans can progress before earlier scans close. See [execution domains and ownership](scan-contracts-design.md#execution-and-ownership).
+4. **Teardown.** The coordinator closes each connector after all of its preparation lanes settle. Preparation errors are reported through the query completion handler, which preserves the first error. Once closed and drained, the operator's `all_ports_empty()` returns true and `get_next_task_hint()` returns `nullopt`. Success requires both preparation and GPU work to drain. Failure or interruption stops new preparation and publication and drains workers and consumers before resources are released. `quiesce(query_id)` stops and joins that query's preparation while retaining its providers; after execution work retires, `reset(query_id)` releases that query's state without stopping the shared pool.
 
 ### split_provider
 
-`split_provider` is concrete and composes a `gpu_ingestible` non-owningly (the operator owns the lifetime; the provider is always torn down first by `reset(query_id)`). Its `has_more_splits` / `next_split_provider` delegate to the ingestible. The standalone `run(scheduler, on_split)` path enqueues one task per claimed metadata unit; the connector is closed (with any captured exception) when the last enqueued task drops its reference to the shared completion state.
+`split_provider` borrows the operator-owned `gpu_ingestible` and supplies its I/O resolver to `make_preparation_sources()`. The coordinator claims owning jobs and runs them in their assigned execution domains. Synchronous pinning calls the ingestible task directly; it does not start a coordinator. Both paths use `preparation_stop_token`.
 
 ### load_balancing_scan_batch_coalescer
 
-This supplies coalescing, balancing, and publication for the query-thread coordinator. Its standalone sequencer path works as follows. Each `GPU_SCAN` operator gets a `metadata_processing_state` slot holding a blocking queue (fed by the provider's metadata tasks), the ingestible's `batch_coalescer`, the shared `balancing_strategy`, and the operator's `split_connector`. A single worker walks the slots in registration order. For a live scan it dequeues per-unit `scan_info`s, pushes them through the coalescer, and for each coalesced batch: picks a GPU via the balancer (stamping `preferred_device_id`), fires `fadvise` and an `opportunistic` prefetch for the batch's byte ranges, and pushes a `scan_operator_input` onto the connector. For a cached pipeline it replays the attached `databatch_provider`, pushing one resident `scan_operator_input` per cached chunk. Serialising the opportunistic prefetch tier across pipelines in execution order gives the prefetching cache its longest lead time for the head-of-line pipeline.
+Each `GPU_SCAN` has a slot holding its coalescer, placement strategy, readahead state and connector. `register_coordinator_source()` supplies these to the coordinator, which prepares live inputs and publishes validated batches. Cached scans use `prepare_cached_workers()` to drain their `databatch_provider` on workers under the same publication gate.
 
 ### Device balancing
 
@@ -671,17 +673,23 @@ five counters are individually sampled rather than an atomic snapshot of an enti
 
 ```mermaid
 graph TD
-    CONV[pipeline converter] -->|make_ingestible| ING["gpu_ingestible<br/>(parquet / duckdb-native)"]
+    CONV[pipeline converter] -->|make_ingestible| ING["gpu_ingestible<br/>(Parquet / Iceberg / native tables)"]
     ING -->|carried by| OP[sirius_gpu_scan_operator GPU_SCAN]
 
     SM[sirius_scan_manager.prepare_for_query] -->|cache miss| SP["split_provider<br/>(composes ingestible)"]
     SM -->|pinned-cache hit| DBP[cached_databatch_provider]
 
-    SP -->|one task per file/range| DISP[dispatcher thread pool]
-    DISP -->|metadata scan_info| SEQ["preparation_coordinator<br/>(query thread)"]
-    DBP -->|resident batches| SEQ
+    SP -->|make_preparation_sources| SEQ["preparation_coordinator<br/>(owned thread)"]
+    SEQ -->|metadata jobs| DISP[dispatcher thread pool]
+    SEQ -->|provider jobs| Q["query owner<br/>await_query_completion / pump_provider"]
+    SEQ -->|native reader jobs| N[native_reader_executor]
+    DISP -->|scan_info| SEQ
+    Q -->|detached scan_info| SEQ
+    N -->|detached scan_info| SEQ
 
     SEQ -->|coalesce + balance + validate + prefetch| SC["split_connector<br/>(per operator)"]
+    DBP -->|resident batches| CACHE["load_balancing_scan_batch_coalescer<br/>cached worker"]
+    CACHE -->|shared publication gate| SC
     SC -->|get_next_split| OP
 
     OP -->|get_next_task_input_data| TC[task_creator]
@@ -690,7 +698,7 @@ graph TD
     EX -->|pipelineable_operator_data| NEXT[downstream pipeline]
 ```
 
-The converter builds a `gpu_ingestible` and parks it on the `GPU_SCAN` operator. At query prep the scan manager either serves the operator from a pinned cache (`cached_databatch_provider`) or builds a `split_provider` over the ingestible. The provider dispatches one metadata task per file (parquet) or row-group range (duckdb-native); the query-thread coordinator coalesces and balances each batch, validates publication before prefetch, then pushes splits onto the operator's connector. The task creator turns each pulled split into a `gpu_pipeline_task` on the split's preferred GPU; `execute()` materializes, optionally post-filters/projects, and emits a `data_batch` to the downstream pipeline.
+The converter builds a `gpu_ingestible` and parks it on the `GPU_SCAN` operator. At query prep the scan manager either serves the operator from a pinned cache (`cached_databatch_provider`) or builds a `split_provider` over the ingestible. The coordinator claims jobs from the provider and dispatches them to the declared execution domain. It coalesces returned inputs, selects a GPU and validates publication before pushing splits onto the operator's connector. Cached batches bypass preparation and use the same publication gate. The task creator turns each pulled split into a `gpu_pipeline_task` on the split's preferred GPU; `execute()` materializes, optionally post-filters/projects, and emits a `data_batch` to the downstream pipeline.
 
 ## Shared materialization components
 

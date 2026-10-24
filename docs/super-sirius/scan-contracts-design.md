@@ -16,9 +16,9 @@ Scan contracts validate GPU scan inputs, split ownership, checkpoint protection,
 
 1. Verify sources and capture the original logical bindings before copying the plan.
 2. Compare GPU inputs with the original logical and physical bindings.
-3. During physical tree construction, acquire native checkpoint leases before preparing storage metadata and retain any early scan refusal.
+3. During physical tree construction, retain early scan refusals; defer native storage metadata walks until execution preparation.
 4. Once the tree completes, record one verdict for each registered scan in the planning attempt before lowering any scan.
-5. Produce physical evidence for each input unit as its metadata becomes available, then validate it before GPU consumption.
+5. At execution preparation, preflight all bound providers on the query thread before acquiring native checkpoint leases and walking storage metadata. Produce physical evidence for each input unit as its metadata becomes available, then validate it before GPU consumption.
 6. Publish only ready, validated inputs; drain preparation and GPU work and release leases before any CPU replay.
 
 ## Verdict at planning
@@ -71,15 +71,13 @@ Native ranges carry their actual storage version and data and validity codec evi
 
 Cached batches use pin identity, layout, structure, and applicable iteration and visibility checks. The query token and all applicable results are validated before publication to the split connector, so the prefetcher cannot consume an unadmitted batch. Streaming inputs do not produce storage splits.
 
-In tests, the scan statistics retain each query's readahead registrations by file and its successful memory-prefetch conversions after the query state is drained. These observations do not change scan admission or publication.
-
 ## Preparation and publication
 
-Each execution attempt owns its preparation units. A unit identifies one scan input and stays pending until all required evidence is ready: footer approval, native segment checks, a delete set, or checkpoint state. Readiness alone does not authorize publication. The gate rechecks cancellation and validates the split before prefetch initialization or connector insertion.
+Each execution attempt owns its preparation units. A unit identifies one scan input and stays pending until all required evidence is ready: footer approval, native segment checks, row visibility, or checkpoint state. Readiness alone does not authorize publication. The coordinator checks cancellation before preparing prefetch buffers outside the gate. The gate checks again before readahead registration and connector insertion.
 
-The coordinator obtains admission, ledger attachment, claim readiness, work/key/required-input claims, and cleanup through `gpu_ingestible` capabilities. It does not identify Iceberg by type. All deferred scans in a statement must supply the same admission object. Cache matching similarly asks the adapter whether cached rows can satisfy its visibility requirements.
+Providers declare bounded temporary allocations and retained storage through `preparation_request`. `prepare_statement_resources()` aggregates them into one statement reservation, prepares each provider's descriptors, then binds the shared admission. Failed preparation or binding rolls back all requests; runtime keeps the backing owner, not planning callbacks. Format-specific sizing stays in the adapter.
 
-Eligible Iceberg deletion-vector scans share one host-memory admission for the statement. The reservation covers retained descriptors and delete positions plus bounded temporary decode work, including allocation granularity. Buffers use the reserved backing, and immutable per-file delete sets retain it until their last consumer releases it. A prepared execution consumes its admission once; a later execution needs a fresh admission.
+Eligible Iceberg deletion-vector scans use this admission. The reservation covers retained descriptors and delete positions plus bounded temporary decode work, including allocation granularity. Buffers use the reserved backing, and immutable per-file delete sets retain it until their last consumer releases it. A prepared execution consumes its admission once; a later execution needs a fresh admission.
 
 Temporary capacity is requested for multiple DV jobs, bounded by the DV unit count, scan workers, and preparation job, active-unit, and result-slot limits. If a request fails, admission halves the target concurrency down to one job. A valid partial grant is used only when it covers all retained results and at least one job's temporary bound; its size limits the admitted concurrency. Only one successful reservation is retained.
 
@@ -89,20 +87,92 @@ Cancellation closes admission and publication and wakes blocked work. Completion
 
 ### Host Arrow batch source contract
 
-The shared host Arrow path has two explicit boundaries. `import_arrow_host()` consumes one
-owned `ArrowSchema` plus `ArrowArray` record batch and retains its input capacity through
-the retirement lane. `materialize_arrow_stream()` consumes a sequential internal
-`arrow_batch_source`: each item carries an independently owned batch, a contiguous
-sequence number, and declared row and byte bounds; `nullopt` is the only EOS marker.
-The verifier compares the declared row count with the imported batch, sends results
-directly to a bounded sink, and calls `cancel()` on source, validation, import, or sink
-failure. Producers acquire preparation/output capacity and split oversized input before
-returning an item. An adapter may bridge an `ArrowArrayStream` one batch at a time, but
-R4 does not add a public Fragment Arrow-input API or a native Paimon/DuckLake adapter.
+The shared host Arrow path has two explicit boundaries. `import_arrow_host()` consumes one owned `ArrowSchema` plus `ArrowArray` record batch and retains its input capacity through the retirement lane. `materialize_arrow_stream()` consumes a sequential internal `arrow_batch_source`: each item carries an independently owned batch, a contiguous sequence number, and declared row and byte bounds; `nullopt` is the only EOS marker. The verifier compares the declared row count with the imported batch, sends results directly to a bounded sink, and calls `cancel()` on source, validation, import, or sink failure. Producers acquire preparation/output capacity and split oversized input before returning an item. An adapter may bridge an `ArrowArrayStream` one batch at a time, but this does not add a public Fragment Arrow-input API or a native Paimon/DuckLake adapter.
 
-### Preparation limits
+### Execution and ownership
 
-Preparation limits default to values derived from the scan worker count. They bound active jobs, units, pending results, and coalescing work. By default, coordinator waits check interruption every 10 ms; draining an active read can take longer. An underfilled batch becomes due 10 ms after its first retained input, without waiting for later metadata. New arrivals do not reset that deadline. Publication still requires output capacity and can be delayed by scheduling. The limits and timing values accept startup YAML overrides under [`sirius.executor.scan_manager.preparation`](configuration.md#siriusexecutorscan_managerpreparation); a zero residence disables timed publication.
+Each active attempt has a coordinator thread that claims work, coalesces results and publishes batches. Preparation work starts after GPU consumers are ready. Sources choose where it runs:
+
+| Execution domain | Work and cleanup | Use |
+|---|---|---|
+| Metadata | Work runs in the metadata pool; source close runs during coordinator retirement. | Independent file and metadata preparation. |
+| Query owner | Provider operations, accepted-job disposal and close run on the statement thread. | Readers that require execution on the query's owning thread. |
+| Native reader | Operations, accepted-job disposal and close run on one assigned native worker. | Readers with thread affinity. |
+
+`gpu_ingestible::make_preparation_sources()` returns one or more preparation lanes for a scan. The default wraps `make_preparation_source()` for existing adapters. Each lane has its own execution domain, cursor and coalescer; all lanes publish to the scan's connector. Multi-lane factories supply an independent coalescer for every lane. Register the complete group before arming; an empty scan still supplies a source that reports exhausted.
+
+Registration creates control state only. Readers initialize in their execution domain. Register and arm query-owner lanes on the statement thread. Control state must be safe to destroy without reader close if registration or native admission fails. The ingestible must outlive drain.
+
+| Boundary | Contract |
+|---|---|
+| Cross-lane dependency | The adapter owns dependency state. Claim returns pending while inputs are unavailable; the adapter wakes the coordinator when they become ready. Never block a worker waiting for another lane. |
+| Backpressure | Each lane has bounded lookahead and completion credits; the scan window is the sum of its lane windows. Consumption returns credit to the producing lane. Shared backing is charged once. |
+| End of input | Close the scan output only after every lane has published or discarded its tail. Queued batches may still be consumed afterwards. |
+| Reader close | Release only that lane's thread-affine resources. Other lanes may still be using shared adapter state. |
+| Failure or cancellation | Stop all lanes, drain accepted work and close the output even when native admission failed before readers opened. |
+
+The manager consumes the shared statement admission once; each ingestible installs its own execution state. Cleanup has two boundaries, separate from reader close:
+
+| Hook | When it runs | What it releases |
+|---|---|---|
+| `stop_preparation()` | After preparation jobs and source close drain. | Producer state; retain resources still used by GPU consumers. |
+| `finish_preparation()` | After GPU consumers retire. | Remaining scan-owned results and descriptors. |
+
+Both hooks must be safe to repeat and to call after failed startup. Thread-affine reader cleanup stays in the source's `close` callback.
+
+`try_claim` runs on the coordinator and must not enter SQL or a reader. It returns:
+
+| Result | Meaning |
+|---|---|
+| Owning job | Resources are acquired; the job executes at most once. |
+| Pending | No cursor advances and no permit is consumed. Other sources can progress until this source signals readiness. |
+| Exhausted | No more jobs will be produced. An empty result batch alone does not mean exhaustion. |
+
+Jobs that use a preparation unit carry its key and required inputs, derived by the provider from the bound scan. The shared registration path does not inspect format-specific bindings. Required evidence must be present before the result can enter coalescing; missing evidence fails the job.
+
+A claimed job is owned by its execution domain before unit admission can fail or observe cancellation. Accepted jobs retain their descriptors and resources through execution or disposal. Dropping a job outside cancellation is an error, not a successful empty read. Resource release and provider callbacks run outside the publication lock.
+
+Query-owner and native sources allow one outstanding operation or unprocessed result per reader. They share the existing coalescing and publication path and do not consume metadata-worker permits. The query owner services provider requests while waiting for query completion and drain; an external reset may request stop and wait, but cannot run provider operations itself.
+
+Native reader slots are shared across queries in a scan manager. An attempt reserves all its slots before any reader starts; insufficient capacity fails without holding a partial group. Several readers may share a worker. A blocked native call can delay those readers, but not the coordinator or metadata pool. Worker and slot limits are documented in [configuration](configuration.md#siriusexecutorscan_managerpreparation).
+
+### Publication and cancellation
+
+Publication uses typed `scan_operator_input` objects. Input construction and prefetch preparation run outside the publication lock. Only cancellation validation, readahead registration and connector insertion run inside it; adapters cannot add arbitrary callbacks there.
+
+| Situation | Required behavior |
+|---|---|
+| Stop before publication | Discard the input without exposing it to consumers. |
+| Queued provider work | Dispose of it in its assigned execution domain without invoking the reader. |
+| Active provider work | Use a supported interrupt or wait for return; discard late results before closing. The framework cannot forcibly interrupt SQL or native calls. |
+| Between provider operations | Check the attempt's stop state before re-entering the reader. A DuckDB connection interrupt flag may be reset by a later query. |
+| Reader close | Close without waiting for output capacity, and release thread-affine resources even when close reports an error. Remaining state must be safe to destroy on other threads. |
+
+`preparation_stop_token` reaches the adapter task unchanged and distinguishes normal completion, execution failure and user cancellation. Normal completion or failure cleanup must not blindly interrupt the original transaction or replace the first query error. Logical completion does not finish cleanup: the query owner remains available through provider close. See [query retirement](query-lifecycle.md#retirement) for shutdown and close-failure handling.
+
+### Provider read view
+
+| Boundary | Requirement |
+|---|---|
+| Reader creation | Preserve the original binding, snapshot, schema and transaction; use a separate mutable cursor from the CPU reader. |
+| Repeated execution | Create fresh reader state from that execution's binding. Never reuse a cursor across transaction generations. |
+| Provider SQL | Use the provider's internal SQL path on CPU; never re-enter the active outer `ClientContext::Query`. Ordinary user SQL keeps its normal GPU eligibility. |
+| Session lifetime | Retain context, transaction and plan owners through reader close and their last dependent use. A weak prepared handle is insufficient. |
+| Provider failure | Preserve the error and close safely. Do not reopen an invalid transaction to continue the read. |
+
+### Output ownership and limits
+
+Published batches must own their storage independently of the reader and transaction. Detach reusable reader buffers before publication. Multiple descriptors or GPU consumers sharing an allocation share its owner and charge it once.
+
+| Resource | Lifetime or limit |
+|---|---|
+| Preparation jobs and results | Bounded slots limit outstanding work, not total memory. |
+| Output lookahead | Counts results, coalescer input and queued batches. Taking a batch returns lookahead capacity, not storage; submitted work may overshoot the target. |
+| Reserved backing | The last physical owner releases the allocation and its reservation. Provider SQL, SDK allocations and decoder working memory are not automatically covered. |
+| Arrow input | Use the shared importer. Retain host backing and capacity through the last asynchronous read, including cancellation and failure; keep the completion lane and stream alive through drain. Release callbacks must be safe outside the statement thread. |
+| GPU output | Has its own consumer lifetime and may outlive the source and imported host batch. |
+
+Partial publication follows the configured fill and residence limits. Residence starts at the first retained input; later arrivals do not reset it. Backpressure may delay publication. See [preparation settings](configuration.md#siriusexecutorscan_managerpreparation) for defaults.
 
 ## Native checkpoint lease
 
@@ -111,6 +181,18 @@ Native scans and pinning acquire a shared checkpoint lease before inspecting sto
 An active lease makes `CHECKPOINT` fail and `FORCE CHECKPOINT` wait. A waiting forced checkpoint blocks new transactions except read-only ones until it is interrupted or the checkpoint keys are released. Sirius starts internal metadata transactions read-only and rejects an internal read-write start while its execution window holds checkpoint leases, avoiding a wait on its own protection.
 
 Failed cleanup retains checkpoint keys until the Sirius runtime is destroyed and prevents CPU fallback. Interrupting `FORCE CHECKPOINT` ends its wait but does not release Sirius's keys.
+
+Provider metadata connections need the same ordering. Starting a non-read-only DuckDB backend transaction while holding a checkpoint lease can deadlock with a waiting forced checkpoint. `BEGIN` or an existing connection alone does not prove that the backend transaction has started.
+
+The scan manager calls `gpu_ingestible::preflight_for_query()` on the query thread for all bound providers, including cache hits, before scan preparation or checkpoint-lease acquisition. Each adapter is responsible for discovering its metadata targets and validating the original transaction.
+
+| Boundary | Requirement |
+|---|---|
+| Preflight | Establish or validate the bound backend transaction. Do not rebind, acquire checkpoint leases, start readers or launch background work. Repeat for every execution attempt. |
+| Preflight failure or cancellation | Stop before scan preparation starts. Release temporary resources without replacing the original error or rolling back another provider's bound transaction. |
+| Reader initialization and pulls | Validate owner thread, target, transaction generation and validity before using the retained backend witness. Use lookup that cannot start or reopen a backend while checkpoint leases are held; never dereference a stale witness. |
+| Unknown or replaced backend | Refuse provider work. Preflight does not authorize reconnecting under a checkpoint lease. |
+| Metadata writes | Require their own lock-order policy during checkpoint contention. |
 
 ## CPU replay policy
 

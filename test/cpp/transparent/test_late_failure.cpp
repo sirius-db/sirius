@@ -17,9 +17,11 @@
 #include "catch.hpp"
 #include "io/io_errors.hpp"
 #include "pipeline/completion_handler.hpp"
+#include "scan_manager/preparation_coordinator.hpp"
 #include "sirius_context.hpp"
 #include "transparent/replay_admission.hpp"
 #include "utils/gpu_execution_fixture.hpp"
+#include "utils/isolated_checkpoint_test.hpp"
 #include "utils/log_test_utils.hpp"
 #include "utils/parquet_fixture_utils.hpp"
 #include "utils/transparent_execution_test_utils.hpp"
@@ -29,6 +31,7 @@
 #include <duckdb/main/prepared_statement_data.hpp>
 #include <duckdb/transaction/meta_transaction.hpp>
 
+#include <array>
 #include <barrier>
 #include <future>
 #include <thread>
@@ -36,29 +39,45 @@
 using namespace sirius::transparent;
 
 TEST_CASE("late failure keeps the terminal winner across racing reporters",
-          "[transparent][late_failure]")
+          "[transparent][late_failure][preparation_cleanup]")
 {
+  bool const cleanup_reporter = GENERATE(false, true);
+  CAPTURE(cleanup_reporter);
   for (int attempt = 0; attempt < 32; ++attempt) {
     sirius::pipeline::completion_handler completion;
     auto future = completion.get_awaitable();
     std::barrier start(3);
-    auto report = [&](late_failure_cause cause, const char* message) {
+    auto report = [&](late_failure_cause cause, const char* message, bool cleanup) {
       start.arrive_and_wait();
-      completion.report_error(std::make_exception_ptr(classified_execution_error(cause, message)));
+      auto error = std::make_exception_ptr(classified_execution_error(cause, message));
+      if (cleanup)
+        completion.report_preparation_cleanup_error(error);
+      else
+        completion.report_error(error);
     };
-    std::jthread first(report, late_failure_cause::physical_input, "physical");
-    std::jthread second(report, late_failure_cause::oom_exhausted, "oom");
+    std::jthread first(report, late_failure_cause::physical_input, "physical", false);
+    std::jthread second(report, late_failure_cause::oom_exhausted, "oom", cleanup_reporter);
     start.arrive_and_wait();
+    std::exception_ptr terminal_error;
     try {
       future.get();
       FAIL("expected terminal error");
     } catch (classified_execution_error const& error) {
-      auto failure = completion.failure();
+      terminal_error = std::current_exception();
+      auto failure   = completion.failure();
       CHECK(failure.cause == error.cause);
       CHECK(failure.detail == error.what());
     }
     first.join();
     second.join();
+    if (cleanup_reporter) {
+      try {
+        completion.throw_if_preparation_cleanup_failed();
+        FAIL("cleanup latch was lost");
+      } catch (classified_execution_error const&) {
+        CHECK(std::current_exception() == terminal_error);
+      }
+    }
     auto winner = completion.failure();
     completion.report_error("later reporter");
     CHECK(completion.failure().cause == winner.cause);
@@ -425,4 +444,107 @@ TEST_CASE("late failure classification uses exception types rather than message 
   CHECK(classify_failure(text_only).cause == late_failure_cause::other);
   CHECK(classify_failure(text_only, late_failure_cause::gpu_error).cause ==
         late_failure_cause::gpu_error);
+}
+
+namespace {
+struct empty_cleanup_coalescer final : sirius::op::scan::batch_coalescer {
+  size_t target_batch_bytes() const noexcept override { return 1; }
+  std::vector<std::unique_ptr<sirius::op::scan::scan_info>> push(
+    std::unique_ptr<sirius::op::scan::scan_info>) override
+  {
+    return {};
+  }
+  std::vector<std::unique_ptr<sirius::op::scan::scan_info>> flush() override { return {}; }
+};
+
+void retire_test_reader(sirius::pipeline::completion_handler& completion,
+                        sirius::scan_manager::preparation_coordinator::execution_domain domain,
+                        bool initial_error,
+                        bool close_error)
+{
+  using namespace sirius::scan_manager;
+  sirius::exec::static_thread_pool pool(1);
+  sirius::exec::scoped_dispatcher dispatcher(pool);
+  native_reader_executor native(1, 1);
+  preparation_coordinator coordinator(
+    completion, dispatcher, preparation_options{1, 1, 1, 1}, &native);
+  size_t closed = 0;
+  preparation_coordinator::source source;
+  source.execution   = domain;
+  source.coalescer   = std::make_shared<empty_cleanup_coalescer>();
+  source.destination = std::make_shared<split_connector>();
+  source.try_claim = [] { return preparation_coordinator::claim_result{preparation_exhausted{}}; };
+  source.construct = [](auto) { return preparation_coordinator::publication{}; };
+  source.close     = [&] {
+    ++closed;
+    if (close_error) throw std::runtime_error("reader close failed");
+  };
+  coordinator.add_source(std::move(source));
+  coordinator.arm();
+  if (initial_error)
+    completion.report_error(std::make_exception_ptr(
+      classified_execution_error(late_failure_cause::gpu_error, "original query failure")));
+  coordinator.request_stop(stop_reason::normal_eos);
+  coordinator.drain();
+  CHECK(closed == 1);
+  CHECK(coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
+}
+}  // namespace
+
+TEST_CASE("Reader cleanup outcome controls window replay and runtime reuse",
+          "[integration][transparent][preparation_cleanup]")
+{
+  // Each combination gets a fresh process because failed cleanup poisons the runtime.
+  auto const* child = std::getenv("SIRIUS_NATIVE_LEASE_UNAVAILABLE_VARIANT");
+  auto variant =
+    child && *child ? std::stoi(child) : GENERATE(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11);
+  if (sirius::test::run_isolated(std::to_string(variant))) return;
+  using domain = sirius::scan_manager::preparation_coordinator::execution_domain;
+  enum class outcome { clean_after_error, close_error_only, error_then_finish, error_then_unwind };
+  auto execution =
+    std::array{domain::metadata_worker, domain::query_owner, domain::native_reader}[variant / 4];
+  auto mode = static_cast<outcome>(variant % 4);
+  CAPTURE(execution, mode);
+  bool const close_error   = mode != outcome::clean_after_error;
+  bool const initial_error = mode != outcome::close_error_only;
+  sirius::test::GpuExecutionFixture fixture;
+  auto& con   = fixture.con;
+  auto state  = sirius::test::get_registered_sirius_context(*con);
+  auto before = state->get_transparent_execution_stats();
+  bool failed = false;
+  try {
+    duckdb::SiriusContext::StandaloneQueryScope window(*state, *con->context, "reader_cleanup");
+    auto completion = state->window_completion(window.query_id());
+    REQUIRE(completion);
+    auto future = completion->get_awaitable();
+    retire_test_reader(*completion, execution, initial_error, close_error);
+    if (initial_error) CHECK(completion->failure().detail == "original query failure");
+    CHECK_THROWS_WITH(future.get(),
+                      initial_error ? "original query failure" : "reader close failed");
+    if (mode == outcome::error_then_unwind)
+      throw classified_execution_error(late_failure_cause::gpu_error, "original query failure");
+    window.finish();
+  } catch (classified_execution_error const& error) {
+    failed = true;
+    CHECK(initial_error);
+    CHECK(error.cause == late_failure_cause::gpu_error);
+    CHECK(std::string(error.what()) == "original query failure");
+  } catch (std::runtime_error const& error) {
+    failed = true;
+    CHECK(mode == outcome::close_error_only);
+    CHECK(std::string(error.what()) == "reader close failed");
+  }
+  CHECK(failed == close_error);
+  CHECK(state->get_runtime_health() == (close_error
+                                          ? duckdb::SiriusContext::runtime_health::UNAVAILABLE
+                                          : duckdb::SiriusContext::runtime_health::OK));
+  CHECK(state->get_transparent_execution_stats().runtime_fallbacks == before.runtime_fallbacks);
+  if (close_error) {
+    CHECK_THROWS_AS(
+      duckdb::SiriusContext::StandaloneQueryScope(*state, *con->context, "after_cleanup"),
+      duckdb::SiriusRuntimeUnavailableException);
+  } else {
+    duckdb::SiriusContext::StandaloneQueryScope next(*state, *con->context, "after_read_error");
+    CHECK_NOTHROW(next.finish());
+  }
 }

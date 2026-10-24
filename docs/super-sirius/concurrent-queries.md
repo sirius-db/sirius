@@ -102,11 +102,7 @@ facts, uniqueness proofs and late-materialization handle. Re-pin builds privatel
 the previous entry usable. Readers hold entry snapshots and query-local visibility masks. SQL pin
 replacement and cache reset remain exclusive maintenance operations.
 
-Metadata producers use the shared worker pool; each query owner drives preparation and
-coalescing without occupying the workers needed to produce its inputs. I/O readahead shares runtime backend budgets across
-queries. Demand reads borrow immediately and block further speculation until their debt is repaid.
-Canceling one subscriber releases its interest without invalidating another subscriber's bytes.
-Cache pressure permits a bounded eviction attempt before abandoning speculative work.
+Metadata producers use the shared worker pool. Each query has an independent preparation coordinator for coalescing and publication; its owner thread services statement-bound providers. Native readers use a separate shared executor. Coalescing does not occupy metadata workers or wait for a blocked provider call. I/O readahead shares runtime backend budgets across queries. Demand reads borrow immediately and block further speculation until their debt is repaid. Canceling one subscriber releases its interest without invalidating another subscriber's bytes. Cache pressure permits a bounded eviction attempt before abandoning speculative work.
 
 GPU memory prefetch selects from the query's admitted GPU set, checks each device's headroom and
 uses real reservations. Runtime-owned exclusive stream leases cover prefetch, pin materialization

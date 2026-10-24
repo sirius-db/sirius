@@ -3827,7 +3827,6 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
       if (info.deferred) {
         if (!admission) admission = info.deferred->admission();
         CHECK(info.deferred->admission() == admission);
-        CHECK(info.deferred->files().front().result.expired());
       } else {
         REQUIRE(info.delete_data);
         CHECK_FALSE(info.delete_data->positional_deletes.empty());
@@ -3894,15 +3893,14 @@ TEST_CASE_METHOD(
         REQUIRE(observed.provider->seen->requests == 1);
         REQUIRE(observed.provider->outstanding() == 1);
         auto installed_ledger = std::make_shared<preparation_ledger>(installed_provider);
-        auto envelope         = scan_envelope{{{8, 8, 16, 20}}, 0, 0, true};
+        auto envelope         = scan_envelope{{{{8, 8, 16}, 20}}, {}, true};
         REQUIRE(installed_ledger
                   ->admit(std::array{envelope}, memory_space_id(cucascade::memory::Tier::HOST, 0))
                   .deferred);
-        auto installed = std::make_shared<iceberg_dv_attempt>(second_plan, installed_ledger);
-        REQUIRE_NOTHROW(scans.back()->begin_preparation(installed));
+        REQUIRE_NOTHROW(scans.back()->attach_preparation_ledger(installed_ledger));
         CHECK_THROWS_WITH(engine.execute(), "DV preparation attempt already started");
         CHECK_THROWS_AS(admission->consume(), std::logic_error);
-        CHECK_FALSE(installed->ledger());
+        CHECK(installed_ledger.use_count() == 1);
         CHECK(observed.reads_started.empty());
         CHECK(first_plan->files().empty());
         CHECK(second_plan->files().empty());
@@ -4413,9 +4411,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   size_t injected = 0;
   counters->preparation_envelope_for_testing = [&](auto& envelope) {
     for (auto& unit : envelope.units) {
-      unit.blob          = 1;
-      unit.footer_parser = 1;
-      unit.roaring       = 0;
+      unit.temporary = {1, 1};
       ++injected;
     }
   };

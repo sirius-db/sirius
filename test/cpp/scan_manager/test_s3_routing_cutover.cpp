@@ -825,10 +825,13 @@ TEST_CASE("split_provider resolver routes mixed parquet files independently", "[
                                                 make_datasource_resolver(manager));
 
   routing_observations routed;
-  while (provider.has_more_splits()) {
-    auto task = provider.next_split_provider();
-    if (!task) { continue; }
-    auto scan = task({});
+  auto sources = provider.make_preparation_sources();
+  REQUIRE(sources.size() == 1);
+  for (;;) {
+    auto claim = sources.front().try_claim();
+    if (std::holds_alternative<sirius::scan_manager::preparation_exhausted>(claim)) break;
+    REQUIRE(std::holds_alternative<sirius::op::scan::gpu_ingestible::metadata_job>(claim));
+    auto scan = std::get<sirius::op::scan::gpu_ingestible::metadata_job>(std::move(claim)).run({});
     REQUIRE(scan != nullptr);
     auto* file_scan = dynamic_cast<sirius::op::scan::parquet_file_scan_info*>(scan.get());
     REQUIRE(file_scan != nullptr);

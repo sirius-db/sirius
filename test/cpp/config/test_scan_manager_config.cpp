@@ -189,18 +189,21 @@ TEST_CASE("Partial batch YAML rejects invalid policies and unknown keys",
 }
 
 TEST_CASE("Preparation limit YAML overrides preserve omitted defaults",
-          "[scan_manager][config][preparation_config]")
+          "[scan_manager][config][preparation_config][native_runtime]")
 {
-  auto selected = GENERATE(0, 1, 2, 3, 4, 5);
+  auto selected = GENERATE(0, 1, 2, 3, 4, 5, 6, 7);
   std::array keys{"max_inflight_metadata_jobs",
                   "max_inflight_dv_jobs",
                   "lookahead_batches",
                   "max_control_work",
-                  "drain_quantum"};
-  std::array<size_t, 5> values{1, 2, 7, 4, 5};
-  std::string body = "      num_threads: 3\n      preparation:\n";
+                  "drain_quantum",
+                  "native_reader_workers",
+                  "max_native_readers"};
+  std::array<size_t, 7> values{1, 2, 7, 4, 5, 5, 8};
+  auto const workers = GENERATE(1, 3);
+  std::string body   = "      num_threads: " + std::to_string(workers) + "\n      preparation:\n";
   for (size_t i = 0; i < keys.size(); ++i)
-    if (selected == 5 || selected == static_cast<int>(i))
+    if (selected == 7 || selected == static_cast<int>(i))
       body += std::string("        ") + keys[i] + ": " + std::to_string(values[i]) + "\n";
   INFO(body);
   scoped_yaml yaml("sirius_preparation_limits.yaml", scan_manager_yaml(body));
@@ -211,18 +214,20 @@ TEST_CASE("Preparation limit YAML overrides preserve omitted defaults",
   topology.numa_nodes     = {{.id = 0, .memory_capacity = 1ULL << 30, .has_cpus = true}};
   auto resolved           = sirius::parsed_sirius_config::from_file(yaml.path()).resolve(topology);
   auto const& config      = resolved.get_scan_manager_config();
-  REQUIRE(config.thread_pool.num_threads == 3);
+  REQUIRE(config.thread_pool.num_threads == workers);
   auto options = config.preparation.resolve(config.thread_pool.num_threads);
   std::array actual{options.max_inflight_metadata_jobs,
                     options.max_inflight_dv_jobs,
                     options.lookahead_batches,
                     options.max_control_work,
-                    options.drain_quantum};
-  std::array<size_t, 5> defaults{4096, 0, 2, 3, 3};
+                    options.drain_quantum,
+                    config.preparation.resolved_native_workers(),
+                    config.preparation.resolved_native_readers()};
+  std::array<size_t, 7> defaults{4096, 0, 2, size_t(workers), size_t(workers), 2, 64};
   for (size_t i = 0; i < keys.size(); ++i) {
     INFO(keys[i]);
     CHECK(actual[i] ==
-          ((selected == 5 || selected == static_cast<int>(i)) ? values[i] : defaults[i]));
+          ((selected == 7 || selected == static_cast<int>(i)) ? values[i] : defaults[i]));
   }
   CHECK(options.partial_batch);
   CHECK(options.interrupt_check_interval == std::chrono::milliseconds{10});
@@ -235,7 +240,9 @@ TEST_CASE("Preparation limit YAML rejects invalid values",
                       "max_inflight_dv_jobs",
                       "lookahead_batches",
                       "max_control_work",
-                      "drain_quantum");
+                      "drain_quantum",
+                      "native_reader_workers",
+                      "max_native_readers");
   auto value = GENERATE("0", "-1", "1.5", "many", "[]", "18446744073709551616");
   if ((std::string_view(key) == "max_inflight_metadata_jobs" ||
        std::string_view(key) == "max_inflight_dv_jobs") &&
@@ -749,4 +756,16 @@ TEST_CASE("sirius_config forces the sirius backend for multi-GPU",
                                      "      backend: kvikio\n");
 
   CHECK(cfg.backend == io_backend::sirius);
+}
+
+TEST_CASE("Native runtime YAML rejects insufficient reader capacity",
+          "[scan_manager][config][preparation_config][native_runtime]")
+{
+  auto fields = GENERATE("native_reader_workers: 3\n        max_native_readers: 2",
+                         "native_reader_workers: 65",
+                         "max_native_readers: 1");
+  scoped_yaml yaml("sirius_native_runtime_invalid.yaml",
+                   scan_manager_yaml(std::string("      preparation:\n        ") + fields + "\n"));
+  CHECK_THROWS_AS(sirius::parsed_sirius_config::from_file(yaml.path()),
+                  sirius::configuration_input_error);
 }
