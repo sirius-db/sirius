@@ -290,7 +290,7 @@ partition_input_stats sirius_physical_partition::compute_input_totals()
     if (batch) {
       auto ro = batch->to_read_only();
       if (ro.get_data()) {
-        auto const bytes = ro.get_data()->get_size_in_bytes();
+        auto const bytes = ro.get_data()->get_uncompressed_data_size_in_bytes();
         totals.bytes += bytes;
         if (auto const rows = representation_num_rows(ro.get_data())) {
           totals.rows += *rows;

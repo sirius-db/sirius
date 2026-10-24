@@ -311,6 +311,20 @@ struct compression_config {
   /// exists for a table, that table is pinned uncompressed regardless of the
   /// enable flag.  Empty string = feature disabled.
   std::string input_plan_dir{};
+
+  /// Store batches the downgrade executor spills to the host or disk tier
+  /// Simpatico-compressed, with per-type default plans, and decode them on their way
+  /// back to the GPU. A batch whose compressed form saves too little (see
+  /// max_compressed_fraction) or fails to encode spills uncompressed.
+  bool enable_spill_compression{false};
+
+  /// Batches smaller than this spill uncompressed.
+  std::size_t spill_min_batch_bytes{64ULL * 1024 * 1024};  // 64 MiB
+
+  /// Encode a spilled batch only when this fraction of its size could be reserved in
+  /// its GPU memory space (the encoder's headroom); otherwise it spills uncompressed.
+  /// In [0, 1]; 0 skips the check.
+  double spill_encode_reserve_fraction{0.5};
 };
 
 class configuration_input_error : public std::runtime_error {
