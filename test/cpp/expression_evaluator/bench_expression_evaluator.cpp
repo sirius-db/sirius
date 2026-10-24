@@ -25,7 +25,8 @@
 //   SIRIUS_EXPR_BENCH_STRATEGIES  comma list of strategies (default all four)
 //   SIRIUS_EXPR_BENCH_CASES       comma list of case-name substrings to run (default all)
 //   SIRIUS_EXPR_BENCH_ITERS       timed iterations per case (default 20)
-//   SIRIUS_EXPR_BENCH_WARMUP      warmup iterations after the cold call (default 3)
+//   SIRIUS_EXPR_BENCH_WARMUP      minimum warmup iterations after the cold call (default 3)
+//   SIRIUS_EXPR_BENCH_WARMUP_MS   minimum warmup wall time in ms (default 300)
 //   SIRIUS_EXPR_BENCH_VERIFY      1 (default) compares every strategy's result checksum against
 //                                 MATERIALIZE; 0 disables the host readback
 //   SIRIUS_EXPR_BENCH_CSV         append one CSV row per measurement to this file
@@ -36,14 +37,6 @@
 //===----------------------------------------------------------------------===//
 
 #include "expression_evaluator/ast_test_support.hpp"
-
-#include <expression/ast/node.hpp>
-#include <expression/ast/utils.hpp>
-#include <expression/join_condition.hpp>
-#include <expression/value.hpp>
-#include <expression_evaluator/expression_evaluator.hpp>
-#include <expression_evaluator/expression_evaluator_strategy.hpp>
-#include <helper/logical_type.hpp>
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -58,11 +51,18 @@
 #include <rmm/device_buffer.hpp>
 #include <rmm/mr/cuda_async_memory_resource.hpp>
 
-#include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
 #include <nvtx3/nvtx3.hpp>
 
 #include <catch.hpp>
+#include <cuda_profiler_api.h>
+#include <expression/ast/node.hpp>
+#include <expression/ast/utils.hpp>
+#include <expression/join_condition.hpp>
+#include <expression/value.hpp>
+#include <expression_evaluator/expression_evaluator.hpp>
+#include <expression_evaluator/expression_evaluator_strategy.hpp>
+#include <helper/logical_type.hpp>
 
 #include <algorithm>
 #include <array>
@@ -222,18 +222,18 @@ bench_input make_bench_input(cudf::size_type rows,
   std::vector<bool> v1(rows), v9(rows);
 
   for (cudf::size_type i = 0; i < rows; ++i) {
-    c0[i]  = d_int(rng);
-    c1[i]  = d_big(rng);
-    v1[i]  = d_pct(rng) >= 10;
-    c2[i]  = d_dbl(rng);
-    c3[i]  = d_price(rng);
-    c4[i]  = d_disc(rng);
-    c5[i]  = d_tax(rng);
-    c6[i]  = d_date(rng);
-    c7[i]  = modes[static_cast<std::size_t>(d_mode(rng))];
-    c9[i]  = d_int(rng);
-    v9[i]  = d_pct(rng) >= 50;
-    c10[i] = d_qty(rng);
+    c0[i]         = d_int(rng);
+    c1[i]         = d_big(rng);
+    v1[i]         = d_pct(rng) >= 10;
+    c2[i]         = d_dbl(rng);
+    c3[i]         = d_price(rng);
+    c4[i]         = d_disc(rng);
+    c5[i]         = d_tax(rng);
+    c6[i]         = d_date(rng);
+    c7[i]         = modes[static_cast<std::size_t>(d_mode(rng))];
+    c9[i]         = d_int(rng);
+    v9[i]         = d_pct(rng) >= 50;
+    c10[i]        = d_qty(rng);
     int const len = d_len(rng);
     std::string s;
     s.reserve(static_cast<std::size_t>(len));
@@ -246,7 +246,8 @@ bench_input make_bench_input(cudf::size_type rows,
 
   bench_input in;
   auto const dec_type = cudf::data_type{cudf::type_id::DECIMAL64, -2};
-  in.columns.push_back(upload_fixed(cudf::data_type{cudf::type_id::INT32}, c0, nullptr, stream, mr));
+  in.columns.push_back(
+    upload_fixed(cudf::data_type{cudf::type_id::INT32}, c0, nullptr, stream, mr));
   in.columns.push_back(upload_fixed(cudf::data_type{cudf::type_id::INT64}, c1, &v1, stream, mr));
   in.columns.push_back(
     upload_fixed(cudf::data_type{cudf::type_id::FLOAT64}, c2, nullptr, stream, mr));
@@ -395,11 +396,10 @@ std::vector<bench_case> all_cases()
   });
   project("P04_dec_disc_price", [] { return list(disc_price()); });
   project("P05_dec_charge", [] {
-    return list(
-      bin(fid::mul,
-          disc_price(),
-          bin(fid::add, make_dec64_const(100, 15, 2), ref_tax(), t_dec162),
-          t_dec386));
+    return list(bin(fid::mul,
+                    disc_price(),
+                    bin(fid::add, make_dec64_const(100, 15, 2), ref_tax(), t_dec162),
+                    t_dec386));
   });
   project("P06_case_when", [] {
     std::vector<sirius::ast::case_expr::when_then> whens;
@@ -410,10 +410,10 @@ std::vector<bench_case> all_cases()
   project("P07_cast_div_double", [] {
     return list(bin(fid::div, make_cast(ref_int32(), t_dbl, false), ref_double(), t_dbl));
   });
-  project("P08_str_eq_const", [] { return list(cmp(ct::equal, ref_mode(), make_str_const("MAIL"))); });
-  project("P09_str_like_contains", [] {
-    return list(bin(fid::like, ref_comment(), make_str_const("%special%"), t_bool));
-  });
+  project("P08_str_eq_const",
+          [] { return list(cmp(ct::equal, ref_mode(), make_str_const("MAIL"))); });
+  project("P09_str_like_contains",
+          [] { return list(bin(fid::like, ref_comment(), make_str_const("%special%"), t_bool)); });
   project("P10_str_in_list", [] {
     return list(make_in(ref_mode(), list(make_str_const("MAIL"), make_str_const("SHIP")), false));
   });
@@ -442,39 +442,37 @@ std::vector<bench_case> all_cases()
     return list(std::move(e));
   });
   project("P15_coalesce", [] {
-    return list(make_coalesce(list(make_cast(ref_int32_nullable(), t_big, false),
-                                   ref_int64_nullable(),
-                                   make_bigint_const(0)),
-                              t_big));
+    return list(make_coalesce(
+      list(
+        make_cast(ref_int32_nullable(), t_big, false), ref_int64_nullable(), make_bigint_const(0)),
+      t_big));
   });
   project("P16_try_cast_narrow",
           [] { return list(make_cast(ref_int64_nullable(), t_int, /*try_cast=*/true)); });
-  project("P17_nullable_add", [] {
-    return list(bin(fid::add, ref_int32_nullable(), make_int_const(1), t_int));
-  });
+  project("P17_nullable_add",
+          [] { return list(bin(fid::add, ref_int32_nullable(), make_int_const(1), t_int)); });
   project("P18_int_mul_int64", [] {
     return list(bin(fid::mul, make_cast(ref_int32(), t_big, false), ref_qty(), t_big));
   });
 
   auto q6_pred = [] {
-    return conj_and(list(
-      cmp(ct::ge, ref_date(), make_date_const(8766)),  // 1994-01-01
-      cmp(ct::lt, ref_date(), make_date_const(9131)),  // 1995-01-01
-      make_between(ref_discount(), make_dec64_const(5, 15, 2), make_dec64_const(7, 15, 2), true, true),
-      cmp(ct::lt, ref_qty(), make_bigint_const(24))));
+    return conj_and(
+      list(cmp(ct::ge, ref_date(), make_date_const(8766)),  // 1994-01-01
+           cmp(ct::lt, ref_date(), make_date_const(9131)),  // 1995-01-01
+           make_between(
+             ref_discount(), make_dec64_const(5, 15, 2), make_dec64_const(7, 15, 2), true, true),
+           cmp(ct::lt, ref_qty(), make_bigint_const(24))));
   };
   filter("F01_q6_pred", q6_pred);
   filter("F02_half", [] { return cmp(ct::lt, ref_int32(), make_int_const(500'000)); });
   filter("F03_rare_1pct", [] { return cmp(ct::lt, ref_int32(), make_int_const(10'000)); });
   filter("F04_most_99pct", [] { return cmp(ct::ge, ref_int32(), make_int_const(10'000)); });
   filter("F05_str_eq", [] { return cmp(ct::equal, ref_mode(), make_str_const("MAIL")); });
-  filter("F06_str_like", [] {
-    return bin(fid::like, ref_comment(), make_str_const("%special%"), t_bool);
-  });
+  filter("F06_str_like",
+         [] { return bin(fid::like, ref_comment(), make_str_const("%special%"), t_bool); });
   filter("F07_q6_pred_wide", q6_pred, /*all_cols=*/true);
-  filter("F08_nullable_pred", [] {
-    return cmp(ct::lt, ref_int32_nullable(), make_int_const(500'000));
-  });
+  filter("F08_nullable_pred",
+         [] { return cmp(ct::lt, ref_int32_nullable(), make_int_const(500'000)); });
   return cases;
 }
 
@@ -496,12 +494,12 @@ std::uint64_t checksum_table(cudf::table_view const& tv, rmm::cuda_stream_view s
     if (col.type().id() == cudf::type_id::STRING || col.size() == 0) { continue; }
     auto const width = cudf::size_of(col.type());
     std::vector<std::uint8_t> host(static_cast<std::size_t>(col.size()) * width);
-    cudaMemcpyAsync(host.data(),
-                    static_cast<std::uint8_t const*>(col.head()) +
-                      static_cast<std::size_t>(col.offset()) * width,
-                    host.size(),
-                    cudaMemcpyDeviceToHost,
-                    stream.value());
+    cudaMemcpyAsync(
+      host.data(),
+      static_cast<std::uint8_t const*>(col.head()) + static_cast<std::size_t>(col.offset()) * width,
+      host.size(),
+      cudaMemcpyDeviceToHost,
+      stream.value());
     auto const valids = copy_valids_to_host(col);
     stream.synchronize();
     for (cudf::size_type i = 0; i < col.size(); ++i) {
@@ -510,7 +508,8 @@ std::uint64_t checksum_table(cudf::table_view const& tv, rmm::cuda_stream_view s
         continue;
       }
       std::uint64_t v = 0;
-      std::memcpy(&v, host.data() + static_cast<std::size_t>(i) * width, std::min<std::size_t>(width, 8));
+      std::memcpy(
+        &v, host.data() + static_cast<std::size_t>(i) * width, std::min<std::size_t>(width, 8));
       mix(v);
       if (width == 16) {
         std::memcpy(&v, host.data() + static_cast<std::size_t>(i) * width + 8, 8);
@@ -542,6 +541,7 @@ measurement run_case(bench_case const& bc,
                      rmm::device_async_resource_ref mr,
                      int iters,
                      int warmup,
+                     double warmup_min_ms,
                      bool verify)
 {
   auto exprs = bc.build();
@@ -578,8 +578,13 @@ measurement run_case(bench_case const& bc,
     m.rows_out      = out->num_rows();
     if (verify) { m.checksum = checksum_table(out->view(), stream); }
   }
-  for (int i = 0; i < warmup; ++i) {
-    (void)run_once();
+  // The GPU idles at a low clock between cases (cold compiles leave it idle for most of a
+  // second), so warm up for a minimum wall time as well as a minimum number of calls.
+  {
+    double const warm_start = now_ms();
+    for (int i = 0; i < warmup || now_ms() - warm_start < warmup_min_ms; ++i) {
+      (void)run_once();
+    }
   }
   std::vector<double> times;
   times.reserve(static_cast<std::size_t>(iters));
@@ -595,10 +600,7 @@ measurement run_case(bench_case const& bc,
   return m;
 }
 
-char const* strategy_name(strategy_t s)
-{
-  return sirius::strategy_to_string(s).data();
-}
+char const* strategy_name(strategy_t s) { return sirius::strategy_to_string(s).data(); }
 
 }  // namespace
 
@@ -613,6 +615,7 @@ TEST_CASE("bench expression evaluator strategies", "[!benchmark][expr_bench]")
   auto const case_filters = split_csv(env_or("SIRIUS_EXPR_BENCH_CASES", ""));
   int const iters         = std::stoi(env_or("SIRIUS_EXPR_BENCH_ITERS", "20"));
   int const warmup        = std::stoi(env_or("SIRIUS_EXPR_BENCH_WARMUP", "3"));
+  double const warmup_ms  = std::stod(env_or("SIRIUS_EXPR_BENCH_WARMUP_MS", "300"));
   bool const verify       = env_or("SIRIUS_EXPR_BENCH_VERIFY", "1") != "0";
   auto const csv_path     = env_or("SIRIUS_EXPR_BENCH_CSV", "");
 
@@ -680,10 +683,10 @@ TEST_CASE("bench expression evaluator strategies", "[!benchmark][expr_bench]")
         measurement m;
         std::string status = "ok";
         try {
-          m = run_case(bc, input, strategy, stream, mr_ref, iters, warmup, verify);
+          m = run_case(bc, input, strategy, stream, mr_ref, iters, warmup, warmup_ms, verify);
         } catch (std::exception const& e) {
           status = std::string("error: ") + e.what();
-          std::printf("[expr_bench] case=%s rows=%d strat=%s %s\n",
+          std::printf("[expr_bench] case=%s rows=%d strategy=%s %s\n",
                       bc.name.c_str(),
                       rows,
                       strategy_name(strategy),
@@ -701,7 +704,7 @@ TEST_CASE("bench expression evaluator strategies", "[!benchmark][expr_bench]")
         }
         double const gbps = (bytes_in / 1e9) / (m.median_ms / 1e3);
         std::printf(
-          "[expr_bench] case=%-24s rows=%9d strat=%-13s cold_ms=%9.3f med_ms=%8.3f min_ms=%8.3f "
+          "[expr_bench] case=%-24s rows=%9d strategy=%-13s cold_ms=%9.3f med_ms=%8.3f min_ms=%8.3f "
           "gbps=%7.1f rows_out=%9d chk=%016llx %s\n",
           bc.name.c_str(),
           rows,
