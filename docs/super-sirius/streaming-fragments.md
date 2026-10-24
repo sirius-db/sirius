@@ -161,8 +161,9 @@ physical plan, and roots it in a `sirius_physical_streaming_sink` or
   HUGEINT, the planner narrows it to BIGINT, and the collector casts it back.
 - **Hash-key cast types.** cuDF `murmur3` hashes raw bytes, so an `INT32` and an `INT64` sender
   would split matching keys. When `partitioning.key_cast_types` is empty, `build()` fills one per
-  key: `TINYINT`, `SMALLINT`, `INTEGER` → `INT64`; `BIGINT`, `BOOLEAN`, `VARCHAR` → `EMPTY` (as-is);
-  `DECIMAL` → `FLOAT64`; any other type throws. An out-of-range key column throws first.
+  key: `TINYINT`, `SMALLINT`, `INTEGER` → `INT64`; `BIGINT`, `BOOLEAN`, `VARCHAR`, `DATE`,
+  `TIMESTAMP` (microseconds) → `EMPTY` (as-is); `DECIMAL` → `FLOAT64`; any other type throws,
+  including the other `TIMESTAMP` units. An out-of-range key column throws first.
 
 **`run()`**
 
