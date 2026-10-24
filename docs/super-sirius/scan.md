@@ -61,7 +61,7 @@ Before execution, a resident split is converted or decompressed to a plain GPU t
 | Method | Role |
 |--------|------|
 | `has_processed_all_metadata()` | Thread-safe snapshot: is all metadata enumerated? Typically an atomic cursor vs. a precomputed total. |
-| `make_preparation_source(resolve)` | Register the execution domain, claim, wakeup and close callbacks; see [preparation contracts](scan-contracts-design.md#execution-and-ownership). |
+| `make_preparation_sources(resolve)` | Register one or more lanes with independent coalescers and a shared scan output. The default wraps `make_preparation_source(resolve)`; see [preparation contracts](scan-contracts-design.md#execution-and-ownership). |
 | `try_claim_split(resolve)` | Return an owning metadata job, pending, or exhausted. Pending leaves the cursor unchanged. |
 | `next_split_provider(resolve)` | Atomically claim the next metadata unit and return a callable that produces its `scan_info`(s); `resolve` maps each file path to its ioctx. Null when nothing left to claim. |
 | `create_batch_coalescer()` | Build the format's `batch_coalescer`, which bundles per-unit metadata into right-sized data-batch splits. |
@@ -248,7 +248,7 @@ For nested types (`STRUCT`, `LIST`, `MAP`), one DuckDB column maps to multiple p
    - **Cache hit** — `try_assign_cached_entries` finds a pinned entry whose identity and columns can serve the scan; it attaches a `databatch_provider` to the slot and skips disk reading entirely; or
    - **Cache miss** — a `split_provider` is built over the operator's ingestible and stored with that query's scan entry.
 3. **Execution.** Preparation starts after GPU consumers are ready. The coordinator runs independently of metadata workers and provider readers. It coalesces and validates ready inputs, selects a GPU, and publishes batches to each operator's connector. Later scans can progress before earlier scans close. See [execution domains and ownership](scan-contracts-design.md#execution-and-ownership).
-4. **Teardown.** The coordinator closes each connector when its source is drained (forwarding any worker-captured exception, first-writer-wins). Once closed and drained, the operator's `all_ports_empty()` returns true and `get_next_task_hint()` returns `nullopt`. Success requires both preparation and GPU work to drain. Failure or interruption stops new preparation and publication and drains workers and consumers before resources are released. `quiesce(query_id)` stops and joins that query's preparation while retaining its providers; after execution work retires, `reset(query_id)` releases that query's state without stopping the shared pool.
+4. **Teardown.** The coordinator closes each connector after all of its preparation lanes settle. Preparation errors are reported through the query completion handler, which preserves the first error. Once closed and drained, the operator's `all_ports_empty()` returns true and `get_next_task_hint()` returns `nullopt`. Success requires both preparation and GPU work to drain. Failure or interruption stops new preparation and publication and drains workers and consumers before resources are released. `quiesce(query_id)` stops and joins that query's preparation while retaining its providers; after execution work retires, `reset(query_id)` releases that query's state without stopping the shared pool.
 
 ### split_provider
 
@@ -673,17 +673,23 @@ five counters are individually sampled rather than an atomic snapshot of an enti
 
 ```mermaid
 graph TD
-    CONV[pipeline converter] -->|make_ingestible| ING["gpu_ingestible<br/>(parquet / duckdb-native)"]
+    CONV[pipeline converter] -->|make_ingestible| ING["gpu_ingestible<br/>(Parquet / Iceberg / native tables)"]
     ING -->|carried by| OP[sirius_gpu_scan_operator GPU_SCAN]
 
     SM[sirius_scan_manager.prepare_for_query] -->|cache miss| SP["split_provider<br/>(composes ingestible)"]
     SM -->|pinned-cache hit| DBP[cached_databatch_provider]
 
-    SP -->|one task per file/range| DISP[dispatcher thread pool]
-    DISP -->|metadata scan_info| SEQ["preparation_coordinator<br/>(owned thread)"]
-    DBP -->|resident batches| SEQ
+    SP -->|make_preparation_sources| SEQ["preparation_coordinator<br/>(owned thread)"]
+    SEQ -->|metadata jobs| DISP[dispatcher thread pool]
+    SEQ -->|provider jobs| Q["query owner<br/>await_query_completion / pump_provider"]
+    SEQ -->|native reader jobs| N[native_reader_executor]
+    DISP -->|scan_info| SEQ
+    Q -->|detached scan_info| SEQ
+    N -->|detached scan_info| SEQ
 
     SEQ -->|coalesce + balance + validate + prefetch| SC["split_connector<br/>(per operator)"]
+    DBP -->|resident batches| CACHE["load_balancing_scan_batch_coalescer<br/>cached worker"]
+    CACHE -->|shared publication gate| SC
     SC -->|get_next_split| OP
 
     OP -->|get_next_task_input_data| TC[task_creator]
@@ -692,7 +698,7 @@ graph TD
     EX -->|pipelineable_operator_data| NEXT[downstream pipeline]
 ```
 
-The converter builds a `gpu_ingestible` and parks it on the `GPU_SCAN` operator. At query prep the scan manager either serves the operator from a pinned cache (`cached_databatch_provider`) or builds a `split_provider` over the ingestible. The provider dispatches one metadata task per file (parquet) or row-group range (duckdb-native); the independent coordinator coalesces and balances each batch, validates publication before prefetch, then pushes splits onto the operator's connector. The task creator turns each pulled split into a `gpu_pipeline_task` on the split's preferred GPU; `execute()` materializes, optionally post-filters/projects, and emits a `data_batch` to the downstream pipeline.
+The converter builds a `gpu_ingestible` and parks it on the `GPU_SCAN` operator. At query prep the scan manager either serves the operator from a pinned cache (`cached_databatch_provider`) or builds a `split_provider` over the ingestible. The coordinator claims jobs from the provider and dispatches them to the declared execution domain. It coalesces returned inputs, selects a GPU and validates publication before pushing splits onto the operator's connector. Cached batches bypass preparation and use the same publication gate. The task creator turns each pulled split into a `gpu_pipeline_task` on the split's preferred GPU; `execute()` materializes, optionally post-filters/projects, and emits a `data_batch` to the downstream pipeline.
 
 ## Shared materialization components
 
