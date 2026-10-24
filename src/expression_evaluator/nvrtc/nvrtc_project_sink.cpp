@@ -35,6 +35,7 @@
 #include <expression/function_id.hpp>
 #include <expression/join_condition.hpp>
 #include <expression/substring_slice.hpp>
+#include <expression_evaluator/like_multiliteral.hpp>
 #include <expression_evaluator/nvrtc/nvrtc_project_sink.hpp>
 #include <expression_evaluator/nvrtc/translation_context.hpp>
 #include <helper/numeric_narrowing.hpp>
@@ -47,7 +48,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <mutex>
 #include <sstream>
+#include <unordered_map>
 #include <variant>
 #include <vector>
 
@@ -880,57 +883,9 @@ std::size_t translation_context::get_or_bind_input_column(std::uint32_t column_i
   if (col_view.type().id() == cudf::type_id::STRING && col_view.num_children() > 0) {
     offset_type = cudf::strings_column_view(col_view).offsets().type();
   }
-  _input_columns.push_back(input_column_binding{
-    column_index, col_view.type(), offset_type, is_nullable, /*use_bsm_cache=*/false, binding_id});
+  _input_columns.push_back(
+    input_column_binding{column_index, col_view.type(), offset_type, is_nullable, binding_id});
   return binding_id;
-}
-
-void translation_context::mark_string_columns_for_bsm(sirius::ast::node const& expr)
-{
-  if (_boundary_map != nullptr) {
-    if (auto const it = _boundary_map->find(&expr); it != _boundary_map->end()) {
-      if (it->second < static_cast<std::uint32_t>(_input.num_columns()) &&
-          _input.column(it->second).type().id() == cudf::type_id::STRING) {
-        auto const bid                    = get_or_bind_input_column(it->second);
-        _input_columns[bid].use_bsm_cache = true;
-      }
-      return;
-    }
-  }
-  if (expr.holds<sirius::ast::reference>()) {
-    auto const& ref = expr.get<sirius::ast::reference>();
-    if (ref.column_index < static_cast<std::uint32_t>(_input.num_columns()) &&
-        _input.column(ref.column_index).type().id() == cudf::type_id::STRING) {
-      auto const bid                    = get_or_bind_input_column(ref.column_index);
-      _input_columns[bid].use_bsm_cache = true;
-    }
-    return;
-  }
-  if (expr.holds<sirius::ast::function_call>()) {
-    for (auto const& arg : expr.get<sirius::ast::function_call>().arguments()) {
-      if (arg) { mark_string_columns_for_bsm(*arg); }
-    }
-    return;
-  }
-  if (expr.holds<sirius::ast::case_expr>()) {
-    auto const& ce = expr.get<sirius::ast::case_expr>();
-    for (auto const& c : ce.cases) {
-      if (c.then_) { mark_string_columns_for_bsm(*c.then_); }
-    }
-    if (ce.else_) { mark_string_columns_for_bsm(*ce.else_); }
-    return;
-  }
-  if (expr.holds<sirius::ast::coalesce>()) {
-    for (auto const& ch : expr.get<sirius::ast::coalesce>().children) {
-      if (ch) { mark_string_columns_for_bsm(*ch); }
-    }
-    return;
-  }
-  if (expr.holds<sirius::ast::unary_op>()) {
-    auto const& uo = expr.get<sirius::ast::unary_op>();
-    if (uo.child) { mark_string_columns_for_bsm(*uo.child); }
-    return;
-  }
 }
 
 register_value translation_context::produce_reference(sirius::ast::reference const& expr)
@@ -961,21 +916,21 @@ register_value translation_context::produce_reference(sirius::ast::reference con
 
   if (restored_type.id() == cudf::type_id::STRING) {
     if (!col_binding.is_nullable) {
-      emit_prelude_line(
-        "reg_val<str_view> " + var_name + "{(in_" + id_str + "_offsets != nullptr) ? str_view{in_" +
-        id_str + "_active_chars + (static_cast<int64_t>(in_" + id_str + "_offsets[row]) - in_" +
-        id_str + "_base_off), static_cast<int32_t>(in_" + id_str + "_offsets[row + 1] - in_" +
-        id_str + "_offsets[row])} : str_view{nullptr, 0}, true, false};");
+      emit_prelude_line("reg_val<str_view> " + var_name + "{(in_" + id_str +
+                        "_offsets != nullptr) ? str_view{in_" + id_str + "_chars + in_" + id_str +
+                        "_offsets[row], static_cast<int32_t>(in_" + id_str +
+                        "_offsets[row + 1] - in_" + id_str + "_offsets[row]), in_" + id_str +
+                        "_chars_end} : str_view{nullptr, 0, nullptr}, true, false};");
     } else {
       emit_prelude_line("bool const " + var_name + "_valid = (in_" + id_str +
                         "_mask == nullptr) || is_bit_set(in_" + id_str + "_mask, in_" + id_str +
                         "_bit_offset + row);");
       emit_prelude_line("reg_val<str_view> " + var_name + "{(" + var_name + "_valid && in_" +
-                        id_str + "_offsets != nullptr) ? str_view{in_" + id_str +
-                        "_active_chars + (static_cast<int64_t>(in_" + id_str +
-                        "_offsets[row]) - in_" + id_str + "_base_off), static_cast<int32_t>(in_" +
-                        id_str + "_offsets[row + 1] - in_" + id_str +
-                        "_offsets[row])} : str_view{nullptr, 0}, " + var_name + "_valid, false};");
+                        id_str + "_offsets != nullptr) ? str_view{in_" + id_str + "_chars + in_" +
+                        id_str + "_offsets[row], static_cast<int32_t>(in_" + id_str +
+                        "_offsets[row + 1] - in_" + id_str + "_offsets[row]), in_" + id_str +
+                        "_chars_end} : str_view{nullptr, 0, nullptr}, " + var_name +
+                        "_valid, false};");
     }
   } else if (!col_binding.is_nullable) {
     emit_prelude_line("reg_val<" + dst_type_str + "> " + var_name + "{static_cast<" + dst_type_str +
@@ -1004,18 +959,24 @@ register_value translation_context::produce_constant(sirius::ast::constant const
   auto const type_str    = cuda_type_name(device_type);
   auto const id_str      = std::to_string(binding_id);
 
-  if (device_type.id() == cudf::type_id::STRING) {
-    emit_prelude_line("reg_val<str_view> " + var_name + "{str_view{c_" + id_str + "_ptr, c_" +
-                      id_str + "_len}, c_" + id_str + "_valid != 0, false};");
+  // A constant's validity is a property of the expression, not of the batch, so it is baked
+  // into the kernel source: valid constants are statically non-null (so consumers elide their
+  // validity chains and the Sink skips the null mask) and a NULL constant needs no parameter.
+  if (!is_valid) {
+    emit_prelude_line("reg_val<" + type_str + "> const " + var_name + "{" + type_str +
+                      "{}, false, false};");
+  } else if (device_type.id() == cudf::type_id::STRING) {
+    emit_prelude_line("reg_val<str_view> const " + var_name + "{str_view{c_" + id_str + "_ptr, c_" +
+                      id_str + "_len, c_" + id_str + "_ptr + c_" + id_str + "_len}, true, false};");
   } else {
-    emit_prelude_line("reg_val<" + type_str + "> " + var_name + "{c_" + id_str + "_val, c_" +
-                      id_str + "_valid != 0, false};");
+    emit_prelude_line("reg_val<" + type_str + "> const " + var_name + "{c_" + id_str +
+                      "_val, true, false};");
   }
 
   register_value reg{var_name,
                      expr.return_type(),
                      device_type,
-                     /*is_statically_non_null=*/false,
+                     /*is_statically_non_null=*/is_valid,
                      /*can_overflow=*/false};
   _constants.push_back(scalar_constant_binding{
     binding_id, expr.return_type(), device_type, expr.payload, is_valid, reg});
@@ -1097,13 +1058,18 @@ register_value translation_context::produce_constant_in_carrier(sirius::ast::con
   auto const var_name   = next_var_name();
   auto const type_str   = cuda_type_name(carrier);
 
-  emit_prelude_line("reg_val<" + type_str + "> " + var_name + "{c_" + std::to_string(binding_id) +
-                    "_val, c_" + std::to_string(binding_id) + "_valid != 0, false};");
+  if (is_valid) {
+    emit_prelude_line("reg_val<" + type_str + "> const " + var_name + "{c_" +
+                      std::to_string(binding_id) + "_val, true, false};");
+  } else {
+    emit_prelude_line("reg_val<" + type_str + "> const " + var_name + "{" + type_str +
+                      "{}, false, false};");
+  }
 
   register_value reg{var_name,
                      expr.return_type(),
                      carrier,
-                     /*is_statically_non_null=*/false,
+                     /*is_statically_non_null=*/is_valid,
                      /*can_overflow=*/false};
   _constants.push_back(scalar_constant_binding{
     binding_id, expr.return_type(), carrier, std::move(narrowed_payload), is_valid, reg});
@@ -1934,11 +1900,17 @@ register_value translation_context::produce_function_call(sirius::ast::function_
   if (fid == sirius::function_id::prefix || fid == sirius::function_id::suffix ||
       fid == sirius::function_id::contains || fid == sirius::function_id::like ||
       fid == sirius::function_id::not_like) {
-    if (fid == sirius::function_id::contains || fid == sirius::function_id::like ||
-        fid == sirius::function_id::not_like) {
-      mark_string_columns_for_bsm(*args[0]);
-    }
     auto const lhs = produce(*args[0]);
+    if (fid != sirius::function_id::prefix && fid != sirius::function_id::suffix) {
+      if (auto const pattern_id = try_bind_like_pattern(*args[1], fid)) {
+        bool const invert = (fid == sirius::function_id::not_like);
+        emit_line("reg_val<bool> " + var_name + " = eval_like_multiliteral<" +
+                  (invert ? "true" : "false") + ">(" + lhs.var_name + ", lp_" +
+                  std::to_string(*pattern_id) + ");");
+        return register_value{
+          var_name, expr.return_type(), ret_type, lhs.is_statically_non_null, lhs.can_overflow};
+      }
+    }
     auto const rhs = produce(*args[1]);
     std::string fn;
     switch (fid) {
@@ -1988,6 +1960,27 @@ register_value translation_context::produce_function_call(sirius::ast::function_
 
   throw not_implemented_exception("[nvrtc] Unsupported function_id in translation_context: {}",
                                   static_cast<int>(fid));
+}
+
+std::optional<std::size_t> translation_context::try_bind_like_pattern(
+  sirius::ast::node const& pattern, sirius::function_id fid)
+{
+  if (!pattern.holds<sirius::ast::constant>()) { return std::nullopt; }
+  auto const& cst = pattern.get<sirius::ast::constant>();
+  if (!std::holds_alternative<std::string>(cst.payload)) { return std::nullopt; }
+  auto const& text = std::get<std::string>(cst.payload);
+  // `contains(s, lit)` is the one-literal `%lit%` pattern; `%` and `_` are plain bytes there.
+  std::optional<sirius::like_multiliteral_pattern> parsed;
+  if (fid == sirius::function_id::contains) {
+    if (text.empty() || text.find_first_of("%_") != std::string::npos) { return std::nullopt; }
+    parsed = sirius::classify_like_multiliteral("%" + text + "%", std::string_view{});
+  } else {
+    parsed = sirius::classify_like_multiliteral(text, std::string_view{});
+  }
+  if (!parsed) { return std::nullopt; }
+  auto const binding_id = _like_patterns.size();
+  _like_patterns.push_back(like_pattern_binding{binding_id, parsed->descriptor()});
+  return binding_id;
 }
 
 register_value translation_context::produce(sirius::ast::node const& expr)
@@ -2060,7 +2053,7 @@ bool can_compile_project_sink(std::span<sirius::ast::node const* const> expressi
 
 namespace {
 
-void emit_nvrtc_device_runtime_preamble(std::ostringstream& src)
+void emit_nvrtc_device_runtime_preamble_impl(std::ostringstream& src)
 {
   src
     << "#include \"codegen/stdint_shim.hpp\"\n"
@@ -2078,7 +2071,125 @@ void emit_nvrtc_device_runtime_preamble(std::ostringstream& src)
     << "struct str_view {\n"
     << "  char const* ptr;\n"
     << "  int32_t len;\n"
+    // End of the readable allocation the string lives in; word-at-a-time matchers may read the
+    // aligned words that overlap [ptr, ptr + len) only up to this bound.
+    << "  char const* limit;\n"
     << "};\n\n"
+    // Mirrors sirius::detail::like_multiliteral_{literal,pattern}_desc (host layout asserted).
+    << "struct like_literal_desc {\n"
+    << "  uint64_t chunk_val[4];\n"
+    << "  uint64_t chunk_mask[4];\n"
+    << "  uint64_t b0_bcast;\n"
+    << "  uint64_t b1_bcast;\n"
+    << "  int32_t len;\n"
+    << "  int32_t nchunks;\n"
+    << "};\n"
+    << "struct like_pattern_desc {\n"
+    << "  like_literal_desc literals[4];\n"
+    << "  int32_t n;\n"
+    << "  int32_t total_len;\n"
+    << "};\n\n"
+    << "__device__ __forceinline__ uint64_t swar_byte_eq_mask(uint64_t x, uint64_t bcast) {\n"
+    << "  uint64_t const v = x ^ bcast;\n"
+    << "  return (v - 0x0101010101010101ULL) & ~v & 0x8080808080808080ULL;\n"
+    << "}\n\n"
+    // Load the 8-byte aligned word at `addr` without reading at or past `limit`.
+    << "__device__ __forceinline__ uint64_t load_bounded_word(uintptr_t addr, uintptr_t limit) {\n"
+    << "  if (addr + 8u <= limit) { return *reinterpret_cast<uint64_t const*>(addr); }\n"
+    << "  uint64_t value = 0ULL;\n"
+    << "  for (uintptr_t b = addr; b < limit; ++b) {\n"
+    << "    value |= static_cast<uint64_t>(*reinterpret_cast<uint8_t const*>(b)) << ((b - addr) "
+       "<< 3);\n"
+    << "  }\n"
+    << "  return value;\n"
+    << "}\n\n"
+    // Unaligned 8-byte window at byte address `p` assembled from two bounded aligned words.
+    << "__device__ __forceinline__ uint64_t read_window(uintptr_t p, uintptr_t limit) {\n"
+    << "  uintptr_t const a = p & ~static_cast<uintptr_t>(7u);\n"
+    << "  int const bit_off = static_cast<int>(p & 7u) << 3;\n"
+    << "  uint64_t const lo = load_bounded_word(a, limit);\n"
+    << "  if (bit_off == 0) { return lo; }\n"
+    << "  uint64_t const hi = load_bounded_word(a + 8u, limit);\n"
+    << "  return (lo >> bit_off) | (hi << (64 - bit_off));\n"
+    << "}\n\n"
+    // Superset of the byte lanes where the literal's first byte sits at lane k and (len >= 2)
+    // its second byte follows; bit 7 of each byte marks a candidate (SWAR false positives are
+    // filtered by verification).
+    << "__device__ __forceinline__ uint64_t like_candidates(uint64_t cur, uint64_t next, uint64_t "
+       "b0, uint64_t b1, int32_t len) {\n"
+    << "  uint64_t const c1 = swar_byte_eq_mask(cur, b0);\n"
+    << "  if (len == 1) { return c1; }\n"
+    << "  uint64_t const c2 = swar_byte_eq_mask(cur, b1);\n"
+    << "  uint64_t const c2n = swar_byte_eq_mask(next, b1);\n"
+    << "  return c1 & ((c2 >> 8) | (c2n << 56));\n"
+    << "}\n\n"
+    // Literal fields are selected with a switch so the kernel parameter is never indexed
+    // dynamically (which would force a local-memory copy of the whole descriptor).
+    << "__device__ __forceinline__ like_literal_desc const& like_literal_at(like_pattern_desc "
+       "const& pat, int32_t li) {\n"
+    << "  switch (li) {\n"
+    << "    case 0: return pat.literals[0];\n"
+    << "    case 1: return pat.literals[1];\n"
+    << "    case 2: return pat.literals[2];\n"
+    << "    default: return pat.literals[3];\n"
+    << "  }\n"
+    << "}\n\n"
+    << "__device__ __forceinline__ bool like_verify(uintptr_t p, uintptr_t limit, "
+       "like_literal_desc "
+       "const& lit) {\n"
+    << "  #pragma unroll\n"
+    << "  for (int c = 0; c < 4; ++c) {\n"
+    << "    if (c == lit.nchunks) { break; }\n"
+    << "    uint64_t const win = read_window(p + static_cast<uintptr_t>(8 * c), limit);\n"
+    << "    if ((win & lit.chunk_mask[c]) != lit.chunk_val[c]) { return false; }\n"
+    << "  }\n"
+    << "  return true;\n"
+    << "}\n\n"
+    // `%lit1%lit2%...%` (and contains = one literal): scan the string one aligned 8-byte word at
+    // a time, locating candidate starts of the current literal with SWAR digram masks and
+    // verifying them in order. Each literal must start at or after the previous match's end.
+    << "template <bool Invert>\n"
+    << "__device__ __forceinline__ reg_val<bool> eval_like_multiliteral(reg_val<str_view> s, "
+       "like_pattern_desc const& pat) {\n"
+    << "  if (!s.valid || s.overflow) { return reg_val<bool>{false, s.valid, s.overflow}; }\n"
+    << "  bool match = false;\n"
+    << "  if (s.val.len >= pat.total_len) {\n"
+    << "    uintptr_t const start = reinterpret_cast<uintptr_t>(s.val.ptr);\n"
+    << "    uintptr_t const end = start + static_cast<uintptr_t>(s.val.len);\n"
+    << "    uintptr_t const limit = reinterpret_cast<uintptr_t>(s.val.limit);\n"
+    << "    int32_t li = 0;\n"
+    << "    uintptr_t min_pos = start;\n"
+    << "    uint64_t b0 = pat.literals[0].b0_bcast;\n"
+    << "    uint64_t b1 = pat.literals[0].b1_bcast;\n"
+    << "    int32_t len = pat.literals[0].len;\n"
+    << "    uintptr_t w = start & ~static_cast<uintptr_t>(7u);\n"
+    << "    uint64_t cur = load_bounded_word(w, limit);\n"
+    << "    for (; w < end && !match; w += 8u) {\n"
+    << "      uint64_t const next = load_bounded_word(w + 8u, limit);\n"
+    << "      uint64_t cand = like_candidates(cur, next, b0, b1, len);\n"
+    << "      while (cand != 0ULL) {\n"
+    << "        int const k = __ffsll(static_cast<long long>(cand)) - 1;\n"
+    << "        cand &= cand - 1ULL;\n"
+    << "        uintptr_t const p = w + static_cast<uintptr_t>(k >> 3);\n"
+    << "        if (p < min_pos || p + static_cast<uintptr_t>(len) > end) { continue; }\n"
+    << "        if (!like_verify(p, limit, like_literal_at(pat, li))) { continue; }\n"
+    << "        min_pos = p + static_cast<uintptr_t>(len);\n"
+    << "        ++li;\n"
+    << "        if (li == pat.n) {\n"
+    << "          match = true;\n"
+    << "          break;\n"
+    << "        }\n"
+    << "        like_literal_desc const& nl = like_literal_at(pat, li);\n"
+    << "        b0 = nl.b0_bcast;\n"
+    << "        b1 = nl.b1_bcast;\n"
+    << "        len = nl.len;\n"
+    << "        cand = like_candidates(cur, next, b0, b1, len);\n"
+    << "      }\n"
+    << "      cur = next;\n"
+    << "    }\n"
+    << "  }\n"
+    << "  return reg_val<bool>{match != Invert, true, false};\n"
+    << "}\n\n"
     << "__device__ __forceinline__ int str_view_cmp(str_view a, str_view b) {\n"
     << "  int32_t const min_len = a.len < b.len ? a.len : b.len;\n"
     << "  for (int32_t i = 0; i < min_len; ++i) {\n"
@@ -2104,27 +2215,6 @@ void emit_nvrtc_device_runtime_preamble(std::ostringstream& src)
        "str_view_cmp(a, b) > 0; }\n"
     << "__device__ __forceinline__ bool operator>=(str_view a, str_view b) { return "
        "str_view_cmp(a, b) >= 0; }\n\n"
-    << "__device__ __forceinline__ void coop_load_bsm(char* dst, char const* src, int32_t nbytes) "
-       "{\n"
-    << "  int32_t const tid = static_cast<int32_t>(threadIdx.x);\n"
-    << "  int32_t const align_off = static_cast<int32_t>(reinterpret_cast<uintptr_t>(src) & 7u);\n"
-    << "  int32_t const head = (align_off == 0) ? 0 : ((8 - align_off) < nbytes ? (8 - align_off) "
-       ": nbytes);\n"
-    << "  for (int32_t b = tid; b < head; b += 256) {\n"
-    << "    dst[b] = src[b];\n"
-    << "  }\n"
-    << "  int32_t const rem = nbytes - head;\n"
-    << "  int32_t const nwords = rem >> 3;\n"
-    << "  uint64_t* const dst_w = reinterpret_cast<uint64_t*>(dst + head);\n"
-    << "  uint64_t const* const src_w = reinterpret_cast<uint64_t const*>(src + head);\n"
-    << "  for (int32_t w = tid; w < nwords; w += 256) {\n"
-    << "    dst_w[w] = src_w[w];\n"
-    << "  }\n"
-    << "  int32_t const tail_start = head + (nwords << 3);\n"
-    << "  for (int32_t b = tail_start + tid; b < nbytes; b += 256) {\n"
-    << "    dst[b] = src[b];\n"
-    << "  }\n"
-    << "}\n\n"
     << "template <typename OutT>\n"
     << "__device__ __forceinline__ reg_val<OutT> eval_strlen(reg_val<str_view> in) {\n"
     << "  if (!in.valid || in.overflow) { return reg_val<OutT>{OutT{}, in.valid, in.overflow}; }\n"
@@ -2163,10 +2253,6 @@ void emit_nvrtc_device_runtime_preamble(std::ostringstream& src)
     << "    }\n"
     << "  }\n"
     << "  return reg_val<bool>{true, true, false};\n"
-    << "}\n\n"
-    << "__device__ __forceinline__ uint64_t swar_byte_eq_mask(uint64_t x, uint64_t bcast) {\n"
-    << "  uint64_t const v = x ^ bcast;\n"
-    << "  return (v - 0x0101010101010101ULL) & ~v & 0x8080808080808080ULL;\n"
     << "}\n\n"
     << "__device__ __forceinline__ uint64_t load_aligned_str_word(\n"
     << "    char const* base_ptr, int32_t total_len, int32_t byte_pos) {\n"
@@ -2254,30 +2340,37 @@ void emit_nvrtc_device_runtime_preamble(std::ostringstream& src)
     << "  }\n"
     << "  return next;\n"
     << "}\n\n"
+    << "__device__ __forceinline__ int32_t find_byte_plain(\n"
+    << "    char const* s, int32_t slen, int32_t start, char target) {\n"
+    << "  int32_t pos = start;\n"
+    << "  while (pos < slen && s[pos] != target) { ++pos; }\n"
+    << "  return pos;\n"
+    << "}\n\n"
     << "__device__ __forceinline__ bool raw_like(str_view s, str_view pat) {\n"
     << "  int32_t si = 0;\n"
     << "  int32_t pi = 0;\n"
     << "  int32_t star_pi = -1;\n"
     << "  int32_t star_si = -1;\n"
     << "  while (si < s.len) {\n"
-    << "    if (pi < pat.len && pat.ptr[pi] == '%') {\n"
+    << "    char const pc = (pi < pat.len) ? pat.ptr[pi] : '\\0';\n"
+    << "    if (pi < pat.len && pc == '%') {\n"
     << "      while (pi < pat.len && pat.ptr[pi] == '%') { ++pi; }\n"
     << "      if (pi == pat.len) { return true; }\n"
     << "      star_pi = pi;\n"
     << "      if (pat.ptr[star_pi] != '_') {\n"
-    << "        si = find_byte_swar(s.ptr, s.len, si, pat.ptr[star_pi]);\n"
+    << "        si = find_byte_plain(s.ptr, s.len, si, pat.ptr[star_pi]);\n"
     << "      }\n"
     << "      star_si = si;\n"
-    << "    } else if (pi < pat.len && pat.ptr[pi] == '_') {\n"
+    << "    } else if (pi < pat.len && pc == '_') {\n"
     << "      si = next_utf8_char(s.ptr, s.len, si);\n"
     << "      ++pi;\n"
-    << "    } else if (pi < pat.len && s.ptr[si] == pat.ptr[pi]) {\n"
+    << "    } else if (pi < pat.len && s.ptr[si] == pc) {\n"
     << "      ++si;\n"
     << "      ++pi;\n"
     << "    } else if (star_pi != -1) {\n"
     << "      pi = star_pi;\n"
     << "      if (pat.ptr[star_pi] != '_') {\n"
-    << "        star_si = find_byte_swar(s.ptr, s.len, star_si + 1, pat.ptr[star_pi]);\n"
+    << "        star_si = find_byte_plain(s.ptr, s.len, star_si + 1, pat.ptr[star_pi]);\n"
     << "      } else {\n"
     << "        star_si = next_utf8_char(s.ptr, s.len, star_si);\n"
     << "      }\n"
@@ -2300,7 +2393,7 @@ void emit_nvrtc_device_runtime_preamble(std::ostringstream& src)
     << "}\n\n"
     << "__device__ __forceinline__ str_view slice_utf8_forward(str_view s, int32_t start_char, "
        "int32_t stop_char) {\n"
-    << "  if (stop_char <= start_char || s.len <= 0) { return str_view{s.ptr, 0}; }\n"
+    << "  if (stop_char <= start_char || s.len <= 0) { return str_view{s.ptr, 0, s.limit}; }\n"
     << "  int32_t char_idx = 0;\n"
     << "  int32_t byte_start = s.len;\n"
     << "  int32_t byte_stop = s.len;\n"
@@ -2314,13 +2407,13 @@ void emit_nvrtc_device_runtime_preamble(std::ostringstream& src)
     << "      ++char_idx;\n"
     << "    }\n"
     << "  }\n"
-    << "  if (byte_start >= byte_stop) { return str_view{s.ptr, 0}; }\n"
-    << "  return str_view{s.ptr + byte_start, byte_stop - byte_start};\n"
+    << "  if (byte_start >= byte_stop) { return str_view{s.ptr, 0, s.limit}; }\n"
+    << "  return str_view{s.ptr + byte_start, byte_stop - byte_start, s.limit};\n"
     << "}\n\n"
     << "__device__ __forceinline__ reg_val<str_view> eval_substring(\n"
     << "    reg_val<str_view> in, int32_t start_char, int32_t stop_char) {\n"
     << "  if (!in.valid || in.overflow) {\n"
-    << "    return reg_val<str_view>{str_view{nullptr, 0}, in.valid, in.overflow};\n"
+    << "    return reg_val<str_view>{str_view{nullptr, 0, nullptr}, in.valid, in.overflow};\n"
     << "  }\n"
     << "  if (start_char >= 0 && stop_char >= 0) {\n"
     << "    return reg_val<str_view>{slice_utf8_forward(in.val, start_char, stop_char), true, "
@@ -2409,18 +2502,30 @@ void emit_nvrtc_device_runtime_preamble(std::ostringstream& src)
     << "  if (!valid || ovf_in) { return reg_val<T>{T{}, valid, ovf_in}; }\n"
     << "  if constexpr (cuda::std::is_floating_point_v<T>) {\n"
     << "    return reg_val<T>{static_cast<T>(l.val) * static_cast<T>(r.val), true, false};\n"
+    << "  } else if constexpr (sizeof(T) == 8) {\n"
+    // 64-bit products: the high half of the 128-bit product is one instruction, and the product
+    // fits iff that half is the sign extension of the low half (signed) or zero (unsigned).
+    << "    T const lv = static_cast<T>(l.val);\n"
+    << "    T const rv = static_cast<T>(r.val);\n"
+    << "    T const lo = static_cast<T>(static_cast<uint64_t>(lv) * static_cast<uint64_t>(rv));\n"
+    << "    bool ovf;\n"
+    << "    if constexpr (cuda::std::is_signed_v<T>) {\n"
+    << "      ovf = __mul64hi(lv, rv) != (lo >> 63);\n"
+    << "    } else {\n"
+    << "      ovf = __umul64hi(lv, rv) != 0ULL;\n"
+    << "    }\n"
+    << "    return reg_val<T>{ovf ? T{} : lo, true, ovf};\n"
     << "  } else if constexpr (cuda::std::is_signed_v<T>) {\n"
-    << "    using Wide = cuda::std::conditional_t<(sizeof(T) < 8), int64_t, __int128_t>;\n"
-    << "    Wide const res = static_cast<Wide>(static_cast<T>(l.val)) * "
-       "static_cast<Wide>(static_cast<T>(r.val));\n"
-    << "    bool const ovf = (res < static_cast<Wide>(cuda::std::numeric_limits<T>::lowest())) ||\n"
-    << "                     (res > static_cast<Wide>(cuda::std::numeric_limits<T>::max()));\n"
+    << "    int64_t const res = static_cast<int64_t>(static_cast<T>(l.val)) * "
+       "static_cast<int64_t>(static_cast<T>(r.val));\n"
+    << "    bool const ovf = (res < static_cast<int64_t>(cuda::std::numeric_limits<T>::lowest())) "
+       "||\n"
+    << "                     (res > static_cast<int64_t>(cuda::std::numeric_limits<T>::max()));\n"
     << "    return reg_val<T>{ovf ? T{} : static_cast<T>(res), true, ovf};\n"
     << "  } else {\n"
-    << "    using Wide = cuda::std::conditional_t<(sizeof(T) < 8), uint64_t, unsigned __int128>;\n"
-    << "    Wide const res = static_cast<Wide>(static_cast<T>(l.val)) * "
-       "static_cast<Wide>(static_cast<T>(r.val));\n"
-    << "    bool const ovf = res > static_cast<Wide>(cuda::std::numeric_limits<T>::max());\n"
+    << "    uint64_t const res = static_cast<uint64_t>(static_cast<T>(l.val)) * "
+       "static_cast<uint64_t>(static_cast<T>(r.val));\n"
+    << "    bool const ovf = res > static_cast<uint64_t>(cuda::std::numeric_limits<T>::max());\n"
     << "    return reg_val<T>{ovf ? T{} : static_cast<T>(res), true, ovf};\n"
     << "  }\n"
     << "}\n\n"
@@ -2535,9 +2640,16 @@ void emit_nvrtc_device_runtime_preamble(std::ostringstream& src)
     << "  bool const ovf_in = l.overflow || r.overflow;\n"
     << "  bool const valid = l.valid && r.valid;\n"
     << "  if (!valid || ovf_in) { return reg_val<OutRep>{OutRep{}, valid, ovf_in}; }\n"
-    << "  auto const prod = cuda::mul_overflow<OutRep>(static_cast<OutRep>(l.val), "
+    // Two operands narrower than the result can never overflow it (the product of two 64-bit
+    // values always fits in 128 bits); only a same-width product needs the checked multiply.
+    << "  if constexpr (sizeof(L) < sizeof(OutRep) && sizeof(R) < sizeof(OutRep)) {\n"
+    << "    return reg_val<OutRep>{static_cast<OutRep>(l.val) * static_cast<OutRep>(r.val), true, "
+       "false};\n"
+    << "  } else {\n"
+    << "    auto const prod = cuda::mul_overflow<OutRep>(static_cast<OutRep>(l.val), "
        "static_cast<OutRep>(r.val));\n"
-    << "  return reg_val<OutRep>{prod.overflow ? OutRep{} : prod.value, true, prod.overflow};\n"
+    << "    return reg_val<OutRep>{prod.overflow ? OutRep{} : prod.value, true, prod.overflow};\n"
+    << "  }\n"
     << "}\n\n"
     << "template <typename OutRep, bool ScaleUp = true, typename L, typename R>\n"
     << "__device__ __forceinline__ reg_val<OutRep> eval_dec_div(\n"
@@ -2895,6 +3007,34 @@ void emit_nvrtc_device_runtime_preamble(std::ostringstream& src)
     << "}\n\n";
 }
 
+// The device runtime preamble is identical for every kernel; render it once per process instead of
+// streaming its several hundred fragments on every evaluation.
+std::string const& nvrtc_device_runtime_preamble()
+{
+  static std::string const preamble = [] {
+    std::ostringstream src;
+    emit_nvrtc_device_runtime_preamble_impl(src);
+    return src.str();
+  }();
+  return preamble;
+}
+
+// `cudaGetDeviceProperties` is slow enough to dominate small-batch evaluations; the compute
+// capability of a device never changes, so resolve it once per device.
+int cached_arch_cc_for_current_device()
+{
+  int device = 0;
+  simpatico::throw_if_cuda_error(cudaGetDevice(&device), "cudaGetDevice(arch_cc)");
+  static std::mutex mutex;
+  static std::unordered_map<int, int> arch_by_device;
+  std::lock_guard<std::mutex> const lock(mutex);
+  auto const it = arch_by_device.find(device);
+  if (it != arch_by_device.end()) { return it->second; }
+  int const arch = codegen::jit::arch_cc_for_current_device();
+  arch_by_device.emplace(device, arch);
+  return arch;
+}
+
 // Debug aid: when `SIRIUS_NVRTC_DUMP_DIR` names a directory, every generated kernel source is
 // written there as `<seq>_<entry>.cu` so it can be inspected or compiled offline (e.g. with
 // `nvcc --resource-usage`). Resolved once per process; unset disables the dump.
@@ -2973,7 +3113,7 @@ void emit_input_and_constant_kernel_params(std::ostringstream& src, translation_
       auto const off_type_str = cuda_type_name(in_col.offset_type);
       src << "    " << off_type_str << " const* __restrict__ in_" << id_str << "_offsets,\n"
           << "    char const* __restrict__ in_" << id_str << "_chars,\n"
-          << "    int64_t in_" << id_str << "_chars_size,\n"
+          << "    char const* in_" << id_str << "_chars_end,\n"
           << "    uint32_t const* __restrict__ in_" << id_str << "_mask,\n"
           << "    int32_t in_" << id_str << "_bit_offset,\n";
     } else {
@@ -2984,80 +3124,28 @@ void emit_input_and_constant_kernel_params(std::ostringstream& src, translation_
     }
   }
 
+  for (auto const& pat : ctx.like_patterns()) {
+    src << "    like_pattern_desc lp_" << pat.binding_id << ",\n";
+  }
+
   for (auto const& cst : ctx.constants()) {
+    if (!cst.is_valid) { continue; }  // NULL constants are baked into the source
     auto const id_str = std::to_string(cst.binding_id);
     if (cst.device_type.id() == cudf::type_id::STRING) {
       src << "    char const* __restrict__ c_" << id_str << "_ptr,\n"
-          << "    int32_t c_" << id_str << "_len,\n"
-          << "    uint8_t c_" << id_str << "_valid,\n";
+          << "    int32_t c_" << id_str << "_len,\n";
     } else {
       auto const type_str = cuda_type_name(cst.device_type);
-      src << "    " << type_str << " c_" << id_str << "_val,\n"
-          << "    uint8_t c_" << id_str << "_valid,\n";
+      src << "    " << type_str << " c_" << id_str << "_val,\n";
     }
   }
-}
-
-void emit_bsm_string_staging(std::ostringstream& src,
-                             translation_context const& ctx,
-                             int block_threads)
-{
-  std::size_t num_bsm_cols = 0;
-  for (auto const& in_col : ctx.input_columns()) {
-    if (in_col.physical_type.id() == cudf::type_id::STRING && in_col.use_bsm_cache) {
-      ++num_bsm_cols;
-    }
-  }
-  int32_t const bsm_budget_per_col =
-    (num_bsm_cols == 0)
-      ? 0
-      : static_cast<int32_t>(std::max<std::size_t>(1024, (16384 / num_bsm_cols) & ~7ULL));
-
-  for (auto const& in_col : ctx.input_columns()) {
-    if (in_col.physical_type.id() != cudf::type_id::STRING) { continue; }
-    auto const id_str = std::to_string(in_col.binding_id);
-    src << "  (void)in_" << id_str << "_chars_size;\n";
-    if (in_col.use_bsm_cache && bsm_budget_per_col > 0) {
-      src << "  __shared__ __align__(8) char bsm_buf_" << id_str << "[" << (bsm_budget_per_col + 8)
-          << "];\n"
-          << "  int32_t const bsm_row_begin_" << id_str << " = static_cast<int32_t>(blockIdx.x) * "
-          << block_threads << ";\n"
-          << "  int32_t const bsm_row_end_" << id_str << " = (bsm_row_begin_" << id_str << " + "
-          << block_threads << " < num_rows) ? (bsm_row_begin_" << id_str << " + " << block_threads
-          << ") : num_rows;\n"
-          << "  int64_t in_" << id_str << "_base_off = 0LL;\n"
-          << "  char const* in_" << id_str << "_active_chars = in_" << id_str << "_chars;\n"
-          << "  if (in_" << id_str << "_offsets != nullptr && in_" << id_str
-          << "_chars != nullptr && bsm_row_begin_" << id_str << " < bsm_row_end_" << id_str
-          << ") {\n"
-          << "    int64_t const raw_base = static_cast<int64_t>(in_" << id_str
-          << "_offsets[bsm_row_begin_" << id_str << "]);\n"
-          << "    int64_t const raw_end = static_cast<int64_t>(in_" << id_str
-          << "_offsets[bsm_row_end_" << id_str << "]);\n"
-          << "    int64_t const span = raw_end - raw_base;\n"
-          << "    if (span >= 0 && span <= " << bsm_budget_per_col << ") {\n"
-          << "      int32_t const align_off = static_cast<int32_t>(reinterpret_cast<uintptr_t>(in_"
-          << id_str << "_chars + raw_base) & 7u);\n"
-          << "      char* const bsm_dst = bsm_buf_" << id_str << " + align_off;\n"
-          << "      coop_load_bsm(bsm_dst, in_" << id_str
-          << "_chars + raw_base, static_cast<int32_t>(span));\n"
-          << "      in_" << id_str << "_base_off = raw_base;\n"
-          << "      in_" << id_str << "_active_chars = bsm_dst;\n"
-          << "    }\n"
-          << "  }\n";
-    } else {
-      src << "  int64_t const in_" << id_str << "_base_off = 0LL;\n"
-          << "  char const* const in_" << id_str << "_active_chars = in_" << id_str << "_chars;\n";
-    }
-  }
-  if (num_bsm_cols > 0) { src << "  __syncthreads();\n"; }
 }
 
 struct input_arg_storage {
   void const* data_ptr{nullptr};
   void const* offsets_ptr{nullptr};
   char const* chars_ptr{nullptr};
-  std::int64_t chars_size{0};
+  char const* chars_end{nullptr};
   std::uint32_t const* mask_ptr{nullptr};
   std::int32_t bit_offset{0};
 };
@@ -3096,8 +3184,8 @@ struct bound_kernel_input_and_constant_args {
             } else {
               in_args[i].offsets_ptr = offsets_col.data<std::int32_t>() + col_view.offset();
             }
-            in_args[i].chars_ptr  = scv.chars_begin(stream);
-            in_args[i].chars_size = scv.chars_size(stream);
+            in_args[i].chars_ptr = scv.chars_begin(stream);
+            in_args[i].chars_end = in_args[i].chars_ptr + scv.chars_size(stream);
           }
         }
       } else {
@@ -3144,11 +3232,14 @@ struct bound_kernel_input_and_constant_args {
 
   void append_to_kernel_args(translation_context const& ctx, std::vector<void*>& kernel_args)
   {
+    static_assert(sizeof(sirius::detail::like_multiliteral_literal_desc) == 88 &&
+                    sizeof(sirius::detail::like_multiliteral_pattern_desc) == 360,
+                  "like_pattern_desc in the device runtime mirrors this layout");
     for (std::size_t i = 0; i < in_args.size(); ++i) {
       if (ctx.input_columns()[i].physical_type.id() == cudf::type_id::STRING) {
         kernel_args.push_back(&in_args[i].offsets_ptr);
         kernel_args.push_back(&in_args[i].chars_ptr);
-        kernel_args.push_back(&in_args[i].chars_size);
+        kernel_args.push_back(&in_args[i].chars_end);
         kernel_args.push_back(&in_args[i].mask_ptr);
         kernel_args.push_back(&in_args[i].bit_offset);
       } else {
@@ -3157,14 +3248,16 @@ struct bound_kernel_input_and_constant_args {
         kernel_args.push_back(&in_args[i].bit_offset);
       }
     }
+    for (auto const& pat : ctx.like_patterns()) {
+      kernel_args.push_back(const_cast<void*>(static_cast<void const*>(&pat.descriptor)));
+    }
     for (std::size_t i = 0; i < ctx.constants().size(); ++i) {
+      if (!ctx.constants()[i].is_valid) { continue; }
       if (ctx.constants()[i].device_type.id() == cudf::type_id::STRING) {
         kernel_args.push_back(&str_const_args[i].ptr);
         kernel_args.push_back(&str_const_args[i].len);
-        kernel_args.push_back(&str_const_args[i].valid);
       } else {
         kernel_args.push_back(&const_args[i].val_bytes[0]);
-        kernel_args.push_back(&const_args[i].valid);
       }
     }
   }
@@ -3208,11 +3301,13 @@ std::unique_ptr<cudf::table> evaluate_project_sink(
     *narrow_domain_comparison_count += ctx.narrow_domain_comparison_count();
   }
 
-  constexpr int block_threads = 256;
-  constexpr int num_warps     = block_threads / 32;
-  bool any_nullable_output    = false;
-  bool any_can_overflow       = false;
-  bool const any_subquery_err = ctx.has_subquery_error();
+  constexpr int block_threads    = 256;
+  constexpr int num_warps        = block_threads / 32;
+  constexpr int items_per_thread = 4;
+  constexpr int tile_rows        = block_threads * items_per_thread;
+  bool any_nullable_output       = false;
+  bool any_can_overflow          = false;
+  bool const any_subquery_err    = ctx.has_subquery_error();
   for (auto const& reg : out_regs) {
     if (!reg.is_statically_non_null) { any_nullable_output = true; }
     if (reg.can_overflow) { any_can_overflow = true; }
@@ -3220,7 +3315,7 @@ std::unique_ptr<cudf::table> evaluate_project_sink(
 
   // Assemble the CUDA kernel source string.
   std::ostringstream src;
-  emit_nvrtc_device_runtime_preamble(src);
+  src << nvrtc_device_runtime_preamble();
   src << "extern \"C\" __global__ void sirius_nvrtc_project_kernel(\n";
   emit_input_and_constant_kernel_params(src, ctx);
 
@@ -3234,23 +3329,30 @@ std::unique_ptr<cudf::table> evaluate_project_sink(
   src << "    int32_t num_rows,\n"
       << "    uint32_t* __restrict__ status_and_null_counts)\n"
       << "{\n"
-      << "  int32_t const row = static_cast<int32_t>(blockIdx.x) * " << block_threads
-      << " + static_cast<int32_t>(threadIdx.x);\n"
+      << "  int32_t const tile_row0 = static_cast<int32_t>(blockIdx.x) * " << tile_rows << ";\n"
       << "  int32_t const lane = static_cast<int32_t>(threadIdx.x) & 31;\n"
-      << "  int32_t const warp_in_block = static_cast<int32_t>(threadIdx.x) >> 5;\n"
-      << "  int32_t const global_warp = (static_cast<int32_t>(blockIdx.x) * " << block_threads
-      << " + static_cast<int32_t>(threadIdx.x)) >> 5;\n"
-      << "  int32_t const warp_base_row = global_warp << 5;\n"
-      << "  bool const active = (row < num_rows);\n";
-  emit_bsm_string_staging(src, ctx, block_threads);
+      << "  int32_t const warp_in_block = static_cast<int32_t>(threadIdx.x) >> 5;\n";
 
+  // Per-warp null counters live in lane 0's registers across the tile's items and are reduced
+  // once per block, so the block issues at most one atomic per nullable output.
   for (std::size_t k = 0; k < out_regs.size(); ++k) {
-    if (!out_regs[k].is_statically_non_null) { src << "  bool out_" << k << "_valid = false;\n"; }
+    if (!out_regs[k].is_statically_non_null) { src << "  uint32_t warp_nulls_" << k << " = 0u;\n"; }
   }
   if (any_can_overflow) { src << "  bool row_overflow = false;\n"; }
   if (any_subquery_err) { src << "  bool row_subquery_error = false;\n"; }
 
-  src << "  if (active) {\n" << ctx.body_code();
+  // Each thread evaluates `items_per_thread` rows, strided by the block width so that every
+  // item's loads and stores stay coalesced across the warp and the unrolled items give the
+  // memory system several independent requests per thread.
+  src << "  #pragma unroll\n"
+      << "  for (int item = 0; item < " << items_per_thread << "; ++item) {\n"
+      << "    int32_t const row = tile_row0 + item * " << block_threads
+      << " + static_cast<int32_t>(threadIdx.x);\n"
+      << "    bool const active = (row < num_rows);\n";
+  for (std::size_t k = 0; k < out_regs.size(); ++k) {
+    if (!out_regs[k].is_statically_non_null) { src << "    bool out_" << k << "_valid = false;\n"; }
+  }
+  src << "    if (active) {\n" << ctx.body_code();
   for (std::size_t k = 0; k < out_regs.size(); ++k) {
     auto const& reg = out_regs[k];
     if (reg.is_statically_non_null) {
@@ -3266,43 +3368,48 @@ std::unique_ptr<cudf::table> evaluate_project_sink(
           << ".overflow);\n";
     }
   }
+  src << "    }\n";
+
+  if (any_nullable_output) {
+    // The warp's 32 rows map to one validity bitmask word; a partial last warp masks off the
+    // lanes past `num_rows` and counts only its live rows.
+    src << "    int32_t const warp_base_row = row - lane;\n"
+        << "    int32_t const rem = num_rows - warp_base_row;\n"
+        << "    int32_t const active_in_warp = rem <= 0 ? 0 : (rem < 32 ? rem : 32);\n"
+        << "    uint32_t const valid_row_mask = (active_in_warp == 32) ? 0xFFFFFFFFu : "
+           "((active_in_warp <= 0) ? 0u : ((1u << active_in_warp) - 1u));\n";
+    for (std::size_t k = 0; k < out_regs.size(); ++k) {
+      if (out_regs[k].is_statically_non_null) { continue; }
+      src << "    uint32_t const ballot_" << k << " = __ballot_sync(0xFFFFFFFFu, out_" << k
+          << "_valid) & valid_row_mask;\n"
+          << "    if (lane == 0 && active_in_warp > 0) {\n"
+          << "      out_" << k << "_mask[warp_base_row >> 5] = ballot_" << k << ";\n"
+          << "      warp_nulls_" << k << " += static_cast<uint32_t>(active_in_warp - __popc(ballot_"
+          << k << "));\n"
+          << "    }\n";
+    }
+  }
   src << "  }\n";
 
   if (any_can_overflow) {
-    src << "  uint32_t const ovf_ballot = __ballot_sync(0xFFFFFFFFu, active && row_overflow);\n"
+    src << "  uint32_t const ovf_ballot = __ballot_sync(0xFFFFFFFFu, row_overflow);\n"
         << "  if (ovf_ballot != 0u && lane == 0) {\n"
         << "    atomicOr(&status_and_null_counts[0], 1u);\n"
         << "  }\n";
   }
   if (any_subquery_err) {
-    src << "  uint32_t const subq_ballot = __ballot_sync(0xFFFFFFFFu, active && "
-           "row_subquery_error);\n"
+    src << "  uint32_t const subq_ballot = __ballot_sync(0xFFFFFFFFu, row_subquery_error);\n"
         << "  if (subq_ballot != 0u && lane == 0) {\n"
         << "    atomicOr(&status_and_null_counts[0], 2u);\n"
         << "  }\n";
   }
 
   if (any_nullable_output) {
-    src << "  int32_t const rem = num_rows - warp_base_row;\n"
-        << "  int32_t const active_in_warp = rem <= 0 ? 0 : (rem < 32 ? rem : 32);\n"
-        << "  uint32_t const valid_row_mask = (active_in_warp == 32) ? 0xFFFFFFFFu : "
-           "((active_in_warp <= 0) ? 0u : ((1u << active_in_warp) - 1u));\n";
-
     for (std::size_t k = 0; k < out_regs.size(); ++k) {
       if (out_regs[k].is_statically_non_null) { continue; }
       src << "  __shared__ uint32_t s_nulls_" << k << "[" << num_warps << "];\n"
-          << "  uint32_t const ballot_" << k << " = __ballot_sync(0xFFFFFFFFu, active && out_" << k
-          << "_valid) & valid_row_mask;\n"
-          << "  if (lane == 0) {\n"
-          << "    if (active_in_warp > 0 && out_" << k << "_mask != nullptr) {\n"
-          << "      out_" << k << "_mask[global_warp] = ballot_" << k << ";\n"
-          << "    }\n"
-          << "    s_nulls_" << k
-          << "[warp_in_block] = static_cast<uint32_t>(active_in_warp - __popc(ballot_" << k
-          << "));\n"
-          << "  }\n";
+          << "  if (lane == 0) { s_nulls_" << k << "[warp_in_block] = warp_nulls_" << k << "; }\n";
     }
-
     src << "  __syncthreads();\n"
         << "  if (threadIdx.x == 0) {\n";
     for (std::size_t k = 0; k < out_regs.size(); ++k) {
@@ -3323,7 +3430,7 @@ std::unique_ptr<cudf::table> evaluate_project_sink(
   src << "}\n";
 
   codegen::jit::CompileOptions opts;
-  opts.arch_cc       = codegen::jit::arch_cc_for_current_device();
+  opts.arch_cc       = cached_arch_cc_for_current_device();
   opts.device_int128 = true;
   std::shared_ptr<const codegen::jit::CompiledKernel> compiled;
   try {
@@ -3390,7 +3497,7 @@ std::unique_ptr<cudf::table> evaluate_project_sink(
   kernel_args.push_back(&num_rows_arg);
   kernel_args.push_back(&status_ptr);
 
-  auto const grid_dim_x = static_cast<unsigned int>((num_rows + block_threads - 1) / block_threads);
+  auto const grid_dim_x = static_cast<unsigned int>((num_rows + tile_rows - 1) / tile_rows);
   simpatico::throw_if_cu_error(cuLaunchKernel(fn,
                                               grid_dim_x,
                                               1,
@@ -3431,74 +3538,46 @@ bool can_compile_filter_sink(sirius::ast::node const& predicate,
 
 namespace {
 
-constexpr char const* kFilterCompactMultiBlockSource = R"(
-#include "codegen/stdint_shim.hpp"
-
-extern "C" __global__ void sirius_nvrtc_filter_compact_kernel(
-    uint32_t const* __restrict__ warp_ballots,
-    uint32_t const* __restrict__ block_counts,
-    int32_t num_rows,
-    int32_t* __restrict__ out_survivors)
-{
-  constexpr int32_t kBlockThreads = 256;
-  constexpr int32_t kWarpsPerBlock = 8;
-
-  int32_t const row = static_cast<int32_t>(blockIdx.x) * kBlockThreads + static_cast<int32_t>(threadIdx.x);
-  int32_t const lane = static_cast<int32_t>(threadIdx.x) & 31;
-  int32_t const warp_in_block = static_cast<int32_t>(threadIdx.x) >> 5;
-  int32_t const global_warp = (static_cast<int32_t>(blockIdx.x) * kBlockThreads + static_cast<int32_t>(threadIdx.x)) >> 5;
-  bool const active = (row < num_rows);
-
-  uint32_t const my_ballot = active ? warp_ballots[global_warp] : 0u;
-  bool const survives = active && (((my_ballot >> lane) & 1u) != 0u);
-  uint32_t const lane_rank = static_cast<uint32_t>(__popc(my_ballot & ((1u << lane) - 1u)));
-
-  __shared__ uint32_t s_warp_offsets[kWarpsPerBlock];
-  __shared__ uint32_t s_block_base;
-
-  if (lane == 0) {
-    s_warp_offsets[warp_in_block] = static_cast<uint32_t>(__popc(my_ballot));
-  }
-  __syncthreads();
-
-  // Compute exclusive prefix sum of prior blocks in parallel across all 256 threads in the block.
-  uint32_t partial_block_sum = 0u;
-  for (uint32_t b = threadIdx.x; b < blockIdx.x; b += kBlockThreads) {
-    partial_block_sum += block_counts[b];
-  }
-  #pragma unroll
-  for (int offset = 16; offset > 0; offset >>= 1) {
-    partial_block_sum += __shfl_down_sync(0xFFFFFFFFu, partial_block_sum, offset);
-  }
-
-  __shared__ uint32_t s_prefix_partials[kWarpsPerBlock];
-  if (lane == 0) {
-    s_prefix_partials[warp_in_block] = partial_block_sum;
-  }
-  __syncthreads();
-
-  if (threadIdx.x == 0) {
-    uint32_t bbase = 0u;
-    #pragma unroll
-    for (int w = 0; w < kWarpsPerBlock; ++w) {
-      bbase += s_prefix_partials[w];
+// Device helpers for the single-pass `FilterSink` compaction: each block (tile) publishes its
+// survivor count, then resolves its exclusive prefix with a warp-parallel decoupled look-back over
+// its predecessors (Merrill & Garland, "Single-pass Parallel Prefix Scan with Decoupled
+// Look-back"). Tile ids are claimed dynamically so a block never waits on a tile that has not been
+// scheduled. A tile state packs the 32-bit count with a status in one 64-bit word, so a single
+// volatile access publishes or observes both atomically and no fence is required.
+constexpr char const* kFilterLookbackRuntime = R"(
+__device__ __forceinline__ unsigned long long pack_tile_state(uint32_t count, unsigned long long status) {
+  return (status << 32) | static_cast<unsigned long long>(count);
+}
+__device__ __forceinline__ unsigned long long load_tile_state(unsigned long long* states, int32_t tile) {
+  return *reinterpret_cast<volatile unsigned long long*>(states + tile);
+}
+__device__ __forceinline__ void store_tile_state(unsigned long long* states, int32_t tile, unsigned long long v) {
+  *reinterpret_cast<volatile unsigned long long*>(states + tile) = v;
+}
+// Executed by one full warp. Returns the exclusive prefix (survivors in all tiles before `tile`).
+__device__ __forceinline__ uint32_t lookback_exclusive_prefix(unsigned long long* states, int32_t tile, int32_t lane) {
+  constexpr unsigned long long kEmpty = 0ULL;
+  constexpr unsigned long long kInclusive = 2ULL;
+  uint32_t exclusive = 0u;
+  int32_t window_end = tile - 1;
+  while (true) {
+    int32_t const my_tile = window_end - lane;
+    unsigned long long st = (my_tile >= 0) ? load_tile_state(states, my_tile) : pack_tile_state(0u, kInclusive);
+    while (__any_sync(0xFFFFFFFFu, (st >> 32) == kEmpty)) {
+      if ((st >> 32) == kEmpty) { st = load_tile_state(states, my_tile); }
     }
-    s_block_base = bbase;
-
-    uint32_t wacc = 0u;
+    uint32_t const inclusive_lanes = __ballot_sync(0xFFFFFFFFu, (st >> 32) == kInclusive);
+    int32_t const stop_lane = (inclusive_lanes != 0u) ? (__ffs(inclusive_lanes) - 1) : 32;
+    uint32_t contrib = (lane <= stop_lane) ? static_cast<uint32_t>(st) : 0u;
     #pragma unroll
-    for (int w = 0; w < kWarpsPerBlock; ++w) {
-      uint32_t const cnt = s_warp_offsets[w];
-      s_warp_offsets[w] = wacc;
-      wacc += cnt;
+    for (int off = 16; off > 0; off >>= 1) {
+      contrib += __shfl_xor_sync(0xFFFFFFFFu, contrib, off);
     }
+    exclusive += contrib;
+    if (inclusive_lanes != 0u) { break; }
+    window_end -= 32;
   }
-  __syncthreads();
-
-  if (survives) {
-    uint32_t const dst_idx = s_block_base + s_warp_offsets[warp_in_block] + lane_rank;
-    out_survivors[dst_idx] = row;
-  }
+  return exclusive;
 }
 )";
 
@@ -3545,104 +3624,146 @@ std::unique_ptr<cudf::table> evaluate_filter_sink(sirius::ast::node const& predi
     *narrow_domain_comparison_count += ctx.narrow_domain_comparison_count();
   }
 
-  constexpr int block_threads = 256;
-  constexpr int num_warps     = block_threads / 32;
-  bool const any_can_overflow = pred_reg.can_overflow;
-  bool const any_subquery_err = ctx.has_subquery_error();
+  constexpr int block_threads    = 256;
+  constexpr int num_warps        = block_threads / 32;
+  constexpr int items_per_thread = 8;
+  constexpr int tile_rows        = block_threads * items_per_thread;
+  bool const any_can_overflow    = pred_reg.can_overflow;
+  bool const any_subquery_err    = ctx.has_subquery_error();
 
   std::ostringstream src;
-  emit_nvrtc_device_runtime_preamble(src);
+  src << nvrtc_device_runtime_preamble();
+  src << kFilterLookbackRuntime;
   src << "extern \"C\" __global__ void sirius_nvrtc_filter_kernel(\n";
   emit_input_and_constant_kernel_params(src, ctx);
 
+  // status_and_counts: [0] = status flags, [1] = total survivors, [2] = next tile id.
   src << "    int32_t num_rows,\n"
       << "    uint32_t* __restrict__ status_and_counts,\n"
-      << "    uint32_t* __restrict__ warp_ballots,\n"
-      << "    uint32_t* __restrict__ block_counts,\n"
-      << "    int32_t* __restrict__ single_block_survivors)\n"
+      << "    unsigned long long* __restrict__ tile_states,\n"
+      << "    int32_t* __restrict__ survivors)\n"
       << "{\n"
-      << "  int32_t const row = static_cast<int32_t>(blockIdx.x) * " << block_threads
-      << " + static_cast<int32_t>(threadIdx.x);\n"
+      << "  __shared__ int32_t s_tile;\n"
+      << "  if (threadIdx.x == 0) { s_tile = static_cast<int32_t>(atomicAdd(&status_and_counts[2], "
+         "1u)); }\n"
+      << "  __syncthreads();\n"
+      << "  int32_t const tile = s_tile;\n"
+      << "  int32_t const num_tiles = (num_rows + " << (tile_rows - 1) << ") / " << tile_rows
+      << ";\n"
+      << "  int32_t const tile_row0 = tile * " << tile_rows << ";\n"
       << "  int32_t const lane = static_cast<int32_t>(threadIdx.x) & 31;\n"
       << "  int32_t const warp_in_block = static_cast<int32_t>(threadIdx.x) >> 5;\n"
-      << "  int32_t const global_warp = (static_cast<int32_t>(blockIdx.x) * " << block_threads
-      << " + static_cast<int32_t>(threadIdx.x)) >> 5;\n"
-      << "  bool const active = (row < num_rows);\n";
-  emit_bsm_string_staging(src, ctx, block_threads);
+      << "  __shared__ uint32_t s_counts[" << items_per_thread * num_warps << "];\n"
+      << "  __shared__ uint32_t s_block_count;\n"
+      << "  __shared__ uint32_t s_block_base;\n"
+      << "  uint32_t survive_bits = 0u;\n";
 
-  src << "  bool survives = false;\n";
   if (any_can_overflow) { src << "  bool row_overflow = false;\n"; }
   if (any_subquery_err) { src << "  bool row_subquery_error = false;\n"; }
 
-  src << "  if (active) {\n" << ctx.body_code();
+  // Phase 1: evaluate the predicate for every row of the tile; each thread keeps one survive
+  // bit per item and lane 0 of each warp records the per-item warp count.
+  src << "  #pragma unroll\n"
+      << "  for (int item = 0; item < " << items_per_thread << "; ++item) {\n"
+      << "    int32_t const row = tile_row0 + item * " << block_threads
+      << " + static_cast<int32_t>(threadIdx.x);\n"
+      << "    bool const active = (row < num_rows);\n"
+      << "    bool survives = false;\n"
+      << "    if (active) {\n"
+      << ctx.body_code();
   if (pred_reg.can_overflow) {
-    src << "    row_overflow = (" << pred_reg.var_name << ".valid && " << pred_reg.var_name
-        << ".overflow);\n"
-        << "    survives = (" << pred_reg.var_name << ".valid && !" << pred_reg.var_name
+    src << "      row_overflow = row_overflow || (" << pred_reg.var_name << ".valid && "
+        << pred_reg.var_name << ".overflow);\n"
+        << "      survives = (" << pred_reg.var_name << ".valid && !" << pred_reg.var_name
         << ".overflow && " << pred_reg.var_name << ".val);\n";
   } else if (pred_reg.is_statically_non_null) {
-    src << "    survives = " << pred_reg.var_name << ".val;\n";
+    src << "      survives = " << pred_reg.var_name << ".val;\n";
   } else {
-    src << "    survives = (" << pred_reg.var_name << ".valid && " << pred_reg.var_name
+    src << "      survives = (" << pred_reg.var_name << ".valid && " << pred_reg.var_name
         << ".val);\n";
   }
-  src << "  }\n";
+  src << "    }\n"
+      << "    uint32_t const warp_ballot = __ballot_sync(0xFFFFFFFFu, survives);\n"
+      << "    survive_bits |= (survives ? 1u : 0u) << item;\n"
+      << "    if (lane == 0) {\n"
+      << "      s_counts[item * " << num_warps
+      << " + warp_in_block] = "
+         "static_cast<uint32_t>(__popc(warp_ballot));\n"
+      << "    }\n"
+      << "  }\n";
 
   if (any_can_overflow) {
-    src << "  uint32_t const ovf_ballot = __ballot_sync(0xFFFFFFFFu, active && row_overflow);\n"
+    src << "  uint32_t const ovf_ballot = __ballot_sync(0xFFFFFFFFu, row_overflow);\n"
         << "  if (ovf_ballot != 0u && lane == 0) {\n"
         << "    atomicOr(&status_and_counts[0], 1u);\n"
         << "  }\n";
   }
   if (any_subquery_err) {
-    src << "  uint32_t const subq_ballot = __ballot_sync(0xFFFFFFFFu, active && "
-           "row_subquery_error);\n"
+    src << "  uint32_t const subq_ballot = __ballot_sync(0xFFFFFFFFu, row_subquery_error);\n"
         << "  if (subq_ballot != 0u && lane == 0) {\n"
         << "    atomicOr(&status_and_counts[0], 2u);\n"
         << "  }\n";
   }
 
-  // TQP++ Section 5.3 3-Tier Sparse-to-Dense Compaction:
-  // Tier 1: Warp-level ballot & intra-warp rank in Thread-Private Registers (TPR).
-  // Tier 2: Block-Shared Memory (BSM) prefix sum across warps in the block.
-  // Tier 3: Global total count accumulation + single-block fastpath or multi-block ballot/count
-  //         staging for deterministic ascending row compaction.
-  src << "  uint32_t const warp_ballot = __ballot_sync(0xFFFFFFFFu, active && survives);\n"
-      << "  uint32_t const lane_rank = static_cast<uint32_t>(__popc(warp_ballot & ((1u << lane) - "
-         "1u)));\n"
-      << "  __shared__ uint32_t s_warp_offsets[" << num_warps << "];\n"
-      << "  if (lane == 0) {\n"
-      << "    uint32_t const wc = static_cast<uint32_t>(__popc(warp_ballot));\n"
-      << "    s_warp_offsets[warp_in_block] = wc;\n"
-      << "    if (warp_ballots != nullptr) {\n"
-      << "      warp_ballots[global_warp] = warp_ballot;\n"
-      << "    }\n"
-      << "  }\n"
-      << "  __syncthreads();\n"
-      << "  if (threadIdx.x == 0) {\n"
-      << "    uint32_t acc = 0u;\n"
-      << "    #pragma unroll\n"
-      << "    for (int w = 0; w < " << num_warps << "; ++w) {\n"
-      << "      uint32_t const c = s_warp_offsets[w];\n"
-      << "      s_warp_offsets[w] = acc;\n"
-      << "      acc += c;\n"
-      << "    }\n"
-      << "    if (block_counts != nullptr) {\n"
-      << "      block_counts[blockIdx.x] = acc;\n"
-      << "    }\n"
-      << "    if (acc > 0u) {\n"
-      << "      atomicAdd(&status_and_counts[1], acc);\n"
-      << "    }\n"
-      << "  }\n"
-      << "  __syncthreads();\n"
-      << "  if (single_block_survivors != nullptr && active && survives) {\n"
-      << "    uint32_t const in_block_idx = s_warp_offsets[warp_in_block] + lane_rank;\n"
-      << "    single_block_survivors[in_block_idx] = row;\n"
-      << "  }\n"
-      << "}\n";
+  // Single-pass Sparse-to-Dense Compaction: warp ballot and intra-warp rank in registers, a
+  // block-wide exclusive scan over the warp counts in shared memory, then a decoupled look-back
+  // over the preceding tiles for the block's global offset. Survivors are scattered directly in
+  // ascending row order; the last tile publishes the total survivor count.
+  constexpr int scan_entries = items_per_thread * num_warps;
+  static_assert(scan_entries % 32 == 0, "the warp scan below consumes whole 32-entry chunks");
+  src
+    << "  __syncthreads();\n"
+    // Phase 2: warp 0 turns the (item, warp) counts into exclusive offsets within the tile,
+    // publishes the tile aggregate, resolves the tile's global base with the look-back, and
+    // publishes the inclusive prefix.
+    << "  if (warp_in_block == 0) {\n"
+    << "    uint32_t carry = 0u;\n"
+    << "    #pragma unroll\n"
+    << "    for (int chunk = 0; chunk < " << (scan_entries / 32) << "; ++chunk) {\n"
+    << "      uint32_t const c = s_counts[chunk * 32 + lane];\n"
+    << "      uint32_t incl = c;\n"
+    << "      #pragma unroll\n"
+    << "      for (int off = 1; off < 32; off <<= 1) {\n"
+    << "        uint32_t const n = __shfl_up_sync(0xFFFFFFFFu, incl, off);\n"
+    << "        if (lane >= off) { incl += n; }\n"
+    << "      }\n"
+    << "      s_counts[chunk * 32 + lane] = carry + incl - c;\n"
+    << "      carry += __shfl_sync(0xFFFFFFFFu, incl, 31);\n"
+    << "    }\n"
+    << "    uint32_t const block_count = carry;\n"
+    << "    if (lane == 0 && tile > 0) {\n"
+    << "      store_tile_state(tile_states, tile, pack_tile_state(block_count, 1ULL));\n"
+    << "    }\n"
+    << "    __syncwarp();\n"
+    << "    uint32_t const exclusive = (tile > 0) ? lookback_exclusive_prefix(tile_states, tile, "
+       "lane) : 0u;\n"
+    << "    if (lane == 0) {\n"
+    << "      s_block_base = exclusive;\n"
+    << "      store_tile_state(tile_states, tile, pack_tile_state(exclusive + block_count, "
+       "2ULL));\n"
+    << "      if (tile == num_tiles - 1) { status_and_counts[1] = exclusive + block_count; }\n"
+    << "    }\n"
+    << "  }\n"
+    << "  __syncthreads();\n"
+    // Phase 3: scatter the surviving row indices in ascending order.
+    << "  uint32_t const block_base = s_block_base;\n"
+    << "  #pragma unroll\n"
+    << "  for (int item = 0; item < " << items_per_thread << "; ++item) {\n"
+    << "    bool const survives = ((survive_bits >> item) & 1u) != 0u;\n"
+    << "    uint32_t const warp_ballot = __ballot_sync(0xFFFFFFFFu, survives);\n"
+    << "    if (survives) {\n"
+    << "      uint32_t const lane_rank = static_cast<uint32_t>(__popc(warp_ballot & ((1u << lane) "
+       "- 1u)));\n"
+    << "      survivors[block_base + s_counts[item * " << num_warps
+    << " + warp_in_block] + "
+       "lane_rank] = tile_row0 + item * "
+    << block_threads << " + static_cast<int32_t>(threadIdx.x);\n"
+    << "    }\n"
+    << "  }\n"
+    << "}\n";
 
   codegen::jit::CompileOptions opts;
-  opts.arch_cc       = codegen::jit::arch_cc_for_current_device();
+  opts.arch_cc       = cached_arch_cc_for_current_device();
   opts.device_int128 = true;
   std::shared_ptr<const codegen::jit::CompiledKernel> compiled;
   try {
@@ -3655,38 +3776,32 @@ std::unique_ptr<cudf::table> evaluate_filter_sink(sirius::ast::node const& predi
   }
   CUfunction const fn = compiled->func_for_current_device();
 
-  auto const grid_dim_x = static_cast<unsigned int>((num_rows + block_threads - 1) / block_threads);
-  bool const single_block = (grid_dim_x == 1U);
+  auto const grid_dim_x = static_cast<unsigned int>((num_rows + tile_rows - 1) / tile_rows);
 
-  // For single_block: d_workspace holds [0]=status, [1]=total_survivors,
-  // [2..257]=single_block_survivors (256 int32s). For multi_block: d_workspace holds [0]=status,
-  // [1]=total_survivors, [2..2+num_blocks-1]=block_counts,
-  //                  followed by num_global_warps warp_ballots.
-  std::size_t const num_global_warps = static_cast<std::size_t>(grid_dim_x) * num_warps;
-  std::size_t const workspace_words =
-    single_block ? (2U + block_threads) : (2U + grid_dim_x + num_global_warps);
+  // Workspace: [0] = status flags, [1] = total survivors, [2] = tile counter, [3] = padding, then
+  // one 64-bit state per tile; all zero-initialized. Survivor row indices are scattered into a
+  // scratch buffer with room for every row and copied into an exact-size column afterwards.
+  constexpr std::size_t status_words = 4;
+  std::size_t const workspace_words  = status_words + static_cast<std::size_t>(grid_dim_x) * 2U;
   rmm::device_uvector<std::uint32_t> d_workspace(workspace_words, stream, mr);
+  rmm::device_uvector<std::int32_t> d_survivors(static_cast<std::size_t>(num_rows), stream, mr);
   std::uint32_t* status_ptr = d_workspace.data();
   simpatico::throw_if_cuda_error(
-    cudaMemsetAsync(status_ptr, 0, 2U * sizeof(std::uint32_t), stream.get()),
-    "cudaMemsetAsync(filter_status_and_counts)");
-
-  std::uint32_t* block_counts_ptr = single_block ? nullptr : (d_workspace.data() + 2U);
-  std::uint32_t* warp_ballots_ptr = single_block ? nullptr : (d_workspace.data() + 2U + grid_dim_x);
-  std::int32_t* single_block_survivors_ptr =
-    single_block ? reinterpret_cast<std::int32_t*>(d_workspace.data() + 2U) : nullptr;
+    cudaMemsetAsync(status_ptr, 0, workspace_words * sizeof(std::uint32_t), stream.get()),
+    "cudaMemsetAsync(filter_workspace)");
+  auto* tile_states_ptr = reinterpret_cast<unsigned long long*>(d_workspace.data() + status_words);
+  std::int32_t* survivors_scratch = d_survivors.data();
 
   bound_kernel_input_and_constant_args bound_args(ctx, input, stream, mr);
   std::int32_t num_rows_arg = static_cast<std::int32_t>(num_rows);
 
   std::vector<void*> kernel_args;
-  kernel_args.reserve(bound_args.in_args.size() * 5 + bound_args.const_args.size() * 3 + 5);
+  kernel_args.reserve(bound_args.in_args.size() * 5 + bound_args.const_args.size() * 3 + 4);
   bound_args.append_to_kernel_args(ctx, kernel_args);
   kernel_args.push_back(&num_rows_arg);
   kernel_args.push_back(&status_ptr);
-  kernel_args.push_back(&warp_ballots_ptr);
-  kernel_args.push_back(&block_counts_ptr);
-  kernel_args.push_back(&single_block_survivors_ptr);
+  kernel_args.push_back(&tile_states_ptr);
+  kernel_args.push_back(&survivors_scratch);
 
   simpatico::throw_if_cu_error(cuLaunchKernel(fn,
                                               grid_dim_x,
@@ -3716,40 +3831,20 @@ std::unique_ptr<cudf::table> evaluate_filter_sink(sirius::ast::node const& predi
     return std::make_unique<cudf::table>(projected_input, stream, mr);
   }
 
-  // Materialize exact M-row ascending `INT32` survivors column.
+  // Materialize the exact M-row ascending `INT32` survivors column.
   auto survivors_col   = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
                                                  survivor_count,
                                                  cudf::mask_state::UNALLOCATED,
                                                  stream,
                                                  mr);
   auto* survivors_data = survivors_col->mutable_view().data<std::int32_t>();
-
-  if (single_block) {
-    simpatico::throw_if_cuda_error(
-      cudaMemcpyAsync(survivors_data,
-                      single_block_survivors_ptr,
-                      static_cast<std::size_t>(survivor_count) * sizeof(std::int32_t),
-                      cudaMemcpyDeviceToDevice,
-                      stream.get()),
-      "cudaMemcpyAsync(single_block_survivors)");
-  } else {
-    auto const compact_compiled = codegen::jit::KernelCache::instance().get_or_compile_plain(
-      kFilterCompactMultiBlockSource, "sirius_nvrtc_filter_compact_kernel", opts);
-    CUfunction const compact_fn = compact_compiled->func_for_current_device();
-    void* compact_args[] = {&warp_ballots_ptr, &block_counts_ptr, &num_rows_arg, &survivors_data};
-    simpatico::throw_if_cu_error(cuLaunchKernel(compact_fn,
-                                                grid_dim_x,
-                                                1,
-                                                1,
-                                                block_threads,
-                                                1,
-                                                1,
-                                                0,
-                                                reinterpret_cast<CUstream>(stream.get()),
-                                                compact_args,
-                                                nullptr),
-                                 "cuLaunchKernel(sirius_nvrtc_filter_compact_kernel)");
-  }
+  simpatico::throw_if_cuda_error(
+    cudaMemcpyAsync(survivors_data,
+                    survivors_scratch,
+                    static_cast<std::size_t>(survivor_count) * sizeof(std::int32_t),
+                    cudaMemcpyDeviceToDevice,
+                    stream.get()),
+    "cudaMemcpyAsync(survivors)");
 
   std::unique_ptr<cudf::table> result_table;
   if (projected_input.num_columns() == 0) {

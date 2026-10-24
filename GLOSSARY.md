@@ -40,10 +40,6 @@ _Avoid_: Schema cast, type widening, temporary cast column
 A mapping of an operator's working state across GPU Thread-Private Registers (TPR), Block-Shared Memory (BSM), and Global High-Bandwidth Memory (HBM) to minimize off-chip memory traffic and atomic contention.
 _Avoid_: Cache hierarchy, memory placement
 
-**Overlapped-Segment Cache**:
-A cooperative block-level read schedule for substring matching that stages a contiguous byte range of a string column from HBM into Block-Shared Memory once, serving overlapping per-thread substring checks from shared memory.
-_Avoid_: Shared string buffer, sliding window cache
-
 **Sparse-to-Dense Compaction**:
-An intra-kernel three-tier write schedule (warp-level ballot/ranking, block-level shared-memory prefix sum, and a single block-leader HBM atomic add) that writes variable-cardinality surviving tuples contiguously into HBM without a separate compaction pass.
+An intra-kernel write schedule (warp-level ballot/ranking, block-level shared-memory prefix sum over a multi-row tile, and a decoupled look-back over preceding tiles for the global offset) that writes variable-cardinality surviving tuples contiguously into HBM in ascending row order, in a single pass and without a separate compaction kernel.
 _Avoid_: Stream compaction, two-pass filter, densification pass

@@ -5,7 +5,7 @@ We compile Sirius Expression Trees (and future relational pipelines) directly in
 ## Considered Options
 
 - **`cudf::ast` (`compute_column` / `compute_column_jit`)**: Lacks support for conditionals (`CASE`, `COALESCE`), `IN` lists, `TRY`/`TRY_CAST`, arbitrary `CAST` targets, string matching (`LIKE`/`CONTAINS`), and checked overflow, forcing frequent Materialization Boundaries across multiple kernel launches.
-- **`cudf::multi_transform` (`__device__` UDF callback)**: Exposes only a per-thread scalar callback (`cuda::std::optional<T>`), which hides block/warp coordination and prevents cooperative Block-Shared Memory staging (`Overlapped-Segment Cache` for `LIKE`/`CONTAINS`), intra-kernel `Sparse-to-Dense Compaction` for filters, and future fused `Map-Reduce` aggregation pipelines.
+- **`cudf::multi_transform` (`__device__` UDF callback)**: Exposes only a per-thread scalar callback (`cuda::std::optional<T>`), which hides block/warp coordination and prevents intra-kernel `Sparse-to-Dense Compaction` for filters (single-pass, with a decoupled look-back over row tiles), block-cooperative schedules in general, and future fused `Map-Reduce` aggregation pipelines.
 - **Direct NVRTC `__global__` compilation with `produce`/`consume` and pluggable Sink Consumers**: Emits full `__global__` kernels compiled and cached via Sirius's embedded-CCCL NVRTC pipeline, giving full control over registers, shared memory, warp intrinsics, and pipeline fusion.
 
 ## Consequences

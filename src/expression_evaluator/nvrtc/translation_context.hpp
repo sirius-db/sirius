@@ -20,7 +20,9 @@
 #include <cudf/types.hpp>
 
 #include <expression/ast/node.hpp>
+#include <expression/function_id.hpp>
 #include <expression/value.hpp>
+#include <expression_evaluator/like_multiliteral.hpp>
 #include <expression_evaluator/nvrtc/register_value.hpp>
 #include <helper/logical_type.hpp>
 
@@ -48,8 +50,6 @@ struct input_column_binding {
   cudf::data_type offset_type{};
   /** @brief True if the input column has nulls in the current batch. */
   bool is_nullable{false};
-  /** @brief True if the `STRING` column uses Overlapped-Segment Cache. */
-  bool use_bsm_cache{false};
   /** @brief Ordinal index among bound input columns (`in_{id}_...`). */
   std::size_t binding_id{0};
 };
@@ -82,6 +82,17 @@ struct scalar_constant_binding {
   bool is_valid{false};
   /** @brief Register Value initialized from the kernel parameter. */
   register_value reg{};
+};
+
+/**
+ * @brief Descriptor for a `%lit1%...%litN%` LIKE (or `contains`) pattern matched by the
+ * word-at-a-time multi-literal matcher; passed by value as a kernel parameter (`lp_{id}`).
+ */
+struct like_pattern_binding {
+  /** @brief Ordinal index among bound patterns. */
+  std::size_t binding_id{0};
+  /** @brief Kernel-side literal descriptors (same layout as the device `like_pattern_desc`). */
+  sirius::detail::like_multiliteral_pattern_desc descriptor{};
 };
 
 /**
@@ -128,6 +139,11 @@ class translation_context {
     return _constants;
   }
 
+  [[nodiscard]] std::vector<like_pattern_binding> const& like_patterns() const noexcept
+  {
+    return _like_patterns;
+  }
+
   [[nodiscard]] std::size_t narrow_domain_comparison_count() const noexcept
   {
     return _narrow_domain_comparison_count;
@@ -164,13 +180,20 @@ class translation_context {
                                                            cudf::data_type carrier);
 
   [[nodiscard]] std::size_t get_or_bind_input_column(std::uint32_t column_index);
-  void mark_string_columns_for_bsm(sirius::ast::node const& expr);
+
+  /**
+   * @brief Binds @p pattern as a multi-literal LIKE descriptor if it is a constant the
+   * word-at-a-time matcher supports; returns its binding id, or nullopt for the generic matcher.
+   */
+  [[nodiscard]] std::optional<std::size_t> try_bind_like_pattern(sirius::ast::node const& pattern,
+                                                                 sirius::function_id fid);
 
   cudf::table_view _input;
   boundary_column_map const* _boundary_map{nullptr};
   std::vector<input_column_binding> _input_columns;
   std::vector<loaded_reference_entry> _loaded_references;
   std::vector<scalar_constant_binding> _constants;
+  std::vector<like_pattern_binding> _like_patterns;
   std::size_t _narrow_domain_comparison_count{0};
   bool _has_subquery_error{false};
   std::ostringstream _prelude;

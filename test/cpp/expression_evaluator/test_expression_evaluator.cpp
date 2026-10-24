@@ -3829,9 +3829,14 @@ TEST_CASE("nvrtc_jit - changing scalar constant values reuses cached compiled ke
   REQUIRE(out2 != nullptr);
   CHECK(codegen::jit::KernelCache::instance().size() == cache_size_after_first);
 
+  // A constant's NULL-ness is baked into the kernel source (it decides the output's static
+  // nullability), so switching a constant to NULL compiles one more variant; its value does not.
   auto out3 = eval_with_constants(-42, 0LL, true);
   REQUIRE(out3 != nullptr);
-  CHECK(codegen::jit::KernelCache::instance().size() == cache_size_after_first);
+  CHECK(codegen::jit::KernelCache::instance().size() == cache_size_after_first + 1);
+  auto out4 = eval_with_constants(7, 0LL, true);
+  REQUIRE(out4 != nullptr);
+  CHECK(codegen::jit::KernelCache::instance().size() == cache_size_after_first + 1);
 
   CHECK(copy_column_to_host<std::int32_t>(out1->view().column(1))[0] == 10);
   CHECK(copy_column_to_host<std::int32_t>(out2->view().column(1))[0] == 999);
@@ -5993,13 +5998,13 @@ TEST_CASE("nvrtc_jit - temporal extraction and date_trunc match MATERIALIZE and 
 }
 
 // ============================================================================
-// Ticket #10: String operations & TQP++ Overlapped-Segment Cache
+// Ticket #10: String operations
 // (LIKE, NOT LIKE, CONTAINS, PREFIX, SUFFIX, strlen, length, substring,
 // comparisons, BETWEEN, IN, CASE/COALESCE over strings)
 // ============================================================================
 
 TEST_CASE(
-  "nvrtc_jit - string comparisons, functions, substring, and Overlapped-Segment Cache match "
+  "nvrtc_jit - string comparisons, functions, substring, and mixed-length strings match "
   "MATERIALIZE",
   "[expression_evaluator][nvrtc_jit][ticket10]")
 {
@@ -6433,12 +6438,11 @@ TEST_CASE(
   }
 
   SECTION(
-    "Overlapped-Segment Cache BSM fast path and large-string HBM fallback path match MATERIALIZE "
-    "and reuse cached kernel")
+    "short and long strings across block boundaries match MATERIALIZE and reuse cached kernel")
   {
-    // Block 0 (rows 0..255): normal-length strings (~25 bytes each -> ~6.4 KB <= 16 KB BSM budget)
-    // Block 1 (rows 256..511): long strings (~100 bytes each -> ~25.6 KB > 16 KB BSM budget,
-    // exercising the in-kernel HBM fallback path!)
+    // Rows 0..255: normal-length strings (~25 bytes each).
+    // Rows 256..511: long strings (~100 bytes each), so one block's rows span far more chars
+    // than another's and the kernel's string accesses cross block boundaries.
     std::vector<std::string> rows(520);
     std::vector<bool> valids(520, true);
     for (std::size_t i = 0; i < 256; ++i) {
