@@ -226,7 +226,8 @@ std::unique_ptr<cudf::column> sirius_dynamic_small_in_list_filter::compute_mask_
                                                   stream,
                                                   mr,
                                                   needle_lookup<key_type>{needles, m},
-                                                  prior_keep);
+                                                  prior_keep,
+                                                  preserves_nulls());
   });
 }
 

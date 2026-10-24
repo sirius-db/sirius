@@ -57,12 +57,20 @@ class sirius_dynamic_filter {
  public:
   virtual ~sirius_dynamic_filter() = default;
 
+  // Set only before publication; consumers see an immutable flag. Keeping all NULLs is safe
+  // even when the build contains none: the exact join still evaluates the original condition.
+  void set_preserve_nulls(bool value) noexcept { _preserve_nulls = value; }
+  [[nodiscard]] bool preserves_nulls() const noexcept { return _preserve_nulls; }
+
   [[nodiscard]] virtual sirius_dynamic_filter_kind kind() const = 0;
 
   [[nodiscard]] virtual bool is_available_on_device(int /*device_id*/) const noexcept
   {
     return true;
   }
+
+ private:
+  bool _preserve_nulls = false;
 };
 
 /**
@@ -184,9 +192,8 @@ class sirius_mask_applicable {
    * skip the probe. A pruning hint only; ignoring it is sound because every caller ANDs the
    * result with that same mask.
    *
-   * The result is never nullable. A null probe row is written as `false`: admission never routes
-   * a null-safe comparison to a dynamic filter and the authoritative join runs with
-   * `null_equality::UNEQUAL`, so a null key is a definite non-member on either side.
+   * The result is never nullable. NULL probe rows are rejected for ordinary equality and
+   * retained for explicitly NULL-preserving membership, unless the prior mask rejected them.
    */
   [[nodiscard]] virtual std::unique_ptr<cudf::column> compute_mask(
     cudf::column_view const& probe,
@@ -241,8 +248,8 @@ class sirius_mask_applicable {
  * distinct strings sharing a fingerprint pass a probe the authoritative join then drops. The
  * backing set reserves one sentinel value it cannot store (`numeric_limits::min()` for signed
  * reps, `::max()` for unsigned and string fingerprints); probes equal to it are kept to avoid
- * false negatives. Null build keys are compacted out (they match nothing under the join's
- * `null_equality::UNEQUAL`).
+ * false negatives. Null build keys are compacted out; NULL-safe admission instead preserves
+ * NULL probe rows independently of membership.
  */
 class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
                                             public sirius_mask_applicable,

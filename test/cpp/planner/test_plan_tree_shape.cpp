@@ -1105,7 +1105,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
 TEST_CASE_METHOD(
   plan_tree_shape_fixture,
-  "plan tree shape - null-safe right-family filters require a nonnull key and early publication",
+  "plan tree shape - null-safe right-family filters preserve NULLs and require early publication",
   "[plan_tree_shape][isolated_context][dynamic_filter][right_family][join_key_nullability]")
 {
   std::string const join_type    = GENERATE("SEMI", "ANTI");
@@ -1141,7 +1141,9 @@ TEST_CASE_METHOD(
   auto const& targets = join.dynamic_filter_plan().probe_targets();
   REQUIRE(join.children.size() == 2);
   auto* build_root = require_join_child_wrap(join.children[1].get(), &join, /*is_build=*/true);
-  if (enable_accumulation && probe_not_null) {
+  if (enable_accumulation) {
+    REQUIRE(join.dynamic_filter_plan().admitted_keys().size() == 1);
+    CHECK(join.dynamic_filter_plan().admitted_keys()[0].preserve_nulls == !probe_not_null);
     REQUIRE(targets.size() == 1);
     CHECK(targets[0].route_class == sirius::op::dynamic_filter_route_class::scan);
     CHECK(find_first(join.children[0].get(), SiriusPhysicalOperatorType::DYNAMIC_FILTER) !=
@@ -2449,4 +2451,56 @@ TEST_CASE("plan tree shape - an explicit global delim_join_as_cte survives loadi
   DuckDB db(db_path.path().c_str(), &db_config);
   Connection con(db);
   CHECK(delim_join_as_cte(con));
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - null-safe RF stops only at a NULL-generating join side",
+                 "[plan_tree_shape][isolated_context][dynamic_filter][null_safe_rf]")
+{
+  std::string const nested_join = GENERATE("INNER", "LEFT", "RIGHT", "FULL OUTER");
+  bool const key_from_left      = GENERATE(false, true);
+  CAPTURE(nested_join, key_from_left);
+  REQUIRE_FALSE(con->Query("CREATE TABLE rf_a(id INTEGER, k INTEGER)")->HasError());
+  REQUIRE_FALSE(con->Query("INSERT INTO rf_a VALUES (1,7),(2,NULL)")->HasError());
+  REQUIRE_FALSE(con->Query("CREATE TABLE rf_b(id INTEGER, k INTEGER)")->HasError());
+  REQUIRE_FALSE(con->Query("INSERT INTO rf_b VALUES (1,7),(3,NULL)")->HasError());
+  REQUIRE_FALSE(con->Query("CREATE TABLE rf_keys(k INTEGER, keep INTEGER)")->HasError());
+  REQUIRE_FALSE(con->Query("INSERT INTO rf_keys VALUES (NULL,1),(10,1),(7,0)")->HasError());
+  dynamic_filter_switch_guard switch_on(*con, true);
+  auto plan =
+    generate_sirius_plan(*con,
+                         "SELECT p.k FROM (SELECT " + std::string(key_from_left ? "a.k" : "b.k") +
+                           " AS k FROM rf_a a " + nested_join +
+                           " JOIN rf_b b ON a.id=b.id) p "
+                           "INNER JOIN (SELECT k FROM rf_keys WHERE keep=1) c "
+                           "ON p.k IS NOT DISTINCT FROM c.k",
+                         {OptimizerType::JOIN_ORDER, OptimizerType::BUILD_SIDE_PROBE_SIDE});
+  INFO(tree_to_string(plan.get()));
+  auto joins = collect(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN);
+  REQUIRE(joins.size() == 2);
+  auto& producer = joins.front()->Cast<sirius::op::sirius_physical_hash_join>();
+  REQUIRE(producer.conditions.size() == 1);
+  REQUIRE(producer.conditions[0].comparison == sirius::comparison_type::not_distinct_from);
+  auto const& keys = producer.dynamic_filter_plan().admitted_keys();
+  REQUIRE(keys.size() == 1);
+  CHECK(keys[0].preserve_nulls);
+  auto const& targets = producer.dynamic_filter_plan().probe_targets();
+  REQUIRE(targets.size() == 1);
+  bool const generates_nulls = nested_join == "FULL OUTER" ||
+                               (nested_join == "LEFT" && !key_from_left) ||
+                               (nested_join == "RIGHT" && key_from_left);
+  CHECK(targets[0].route_class == (generates_nulls ? sirius::op::dynamic_filter_route_class::direct
+                                                   : sirius::op::dynamic_filter_route_class::scan));
+  if (generates_nulls) {
+    CHECK_FALSE(targets[0].accepts_zone_map_filters);
+    auto* probe = require_join_child_wrap(producer.children[0].get(), &producer, false);
+    while (probe->type == SiriusPhysicalOperatorType::PROJECTION) {
+      REQUIRE(probe->children.size() == 1);
+      probe = probe->children[0].get();
+    }
+    REQUIRE(probe->type == SiriusPhysicalOperatorType::DYNAMIC_FILTER);
+    REQUIRE(probe->children.size() == 1);
+    CHECK(probe->children[0]->type == SiriusPhysicalOperatorType::HASH_JOIN);
+  }
+  require_parent_links(plan.get(), nullptr);
 }
