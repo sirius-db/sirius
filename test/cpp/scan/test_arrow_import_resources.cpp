@@ -5,6 +5,7 @@
 #include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/cuda_stream.hpp>
+#include <rmm/device_buffer.hpp>
 #include <rmm/error.hpp>
 #include <rmm/mr/cuda_async_memory_resource.hpp>
 
@@ -111,7 +112,10 @@ struct host_resource_lifetime {
 
 class bounded_host_resource final : public std::pmr::memory_resource {
  public:
-  explicit bounded_host_resource(host_resource_lifetime* lifetime = nullptr) : lifetime_(lifetime)
+  explicit bounded_host_resource(
+    host_resource_lifetime* lifetime    = nullptr,
+    std::pmr::memory_resource* upstream = std::pmr::new_delete_resource())
+    : lifetime_(lifetime), upstream_(upstream)
   {
   }
   ~bounded_host_resource() override
@@ -129,24 +133,63 @@ class bounded_host_resource final : public std::pmr::memory_resource {
 
  private:
   host_resource_lifetime* lifetime_;
+  std::pmr::memory_resource* upstream_;
   void* do_allocate(std::size_t bytes, std::size_t alignment) override
   {
     auto attempt = attempts++;
     if (attempt == fail_at || bytes > limit - used) throw std::bad_alloc();
-    auto* result = std::pmr::new_delete_resource()->allocate(bytes, alignment);
+    auto* result = upstream_->allocate(bytes, alignment);
     used += bytes;
     peak = std::max(peak, used);
     return result;
   }
   void do_deallocate(void* pointer, std::size_t bytes, std::size_t alignment) override
   {
-    std::pmr::new_delete_resource()->deallocate(pointer, bytes, alignment);
+    upstream_->deallocate(pointer, bytes, alignment);
     used -= bytes;
   }
   bool do_is_equal(std::pmr::memory_resource const& other) const noexcept override
   {
     return this == &other;
   }
+};
+
+// Device storage is allocated before the stream gate. This facade only divides
+// that bounded storage, so allocation cannot grow or synchronize behind the gate.
+class fixed_device_resource {
+ public:
+  fixed_device_resource(void* storage, std::size_t bytes)
+    : arena_(std::make_shared<std::pmr::monotonic_buffer_resource>(
+        storage, bytes, std::pmr::null_memory_resource()))
+  {
+  }
+  void* allocate(::cuda::stream_ref, std::size_t bytes, std::size_t alignment)
+  {
+    return arena_->allocate(bytes, alignment);
+  }
+  void deallocate(::cuda::stream_ref,
+                  void* pointer,
+                  std::size_t bytes,
+                  std::size_t alignment) noexcept
+  {
+    arena_->deallocate(pointer, bytes, alignment);
+  }
+  void* allocate_sync(std::size_t bytes, std::size_t alignment)
+  {
+    return arena_->allocate(bytes, alignment);
+  }
+  void deallocate_sync(void* pointer, std::size_t bytes, std::size_t alignment) noexcept
+  {
+    arena_->deallocate(pointer, bytes, alignment);
+  }
+  bool operator==(fixed_device_resource const& other) const noexcept
+  {
+    return arena_ == other.arena_;
+  }
+  friend void get_property(fixed_device_resource const&, ::cuda::mr::device_accessible) noexcept {}
+
+ private:
+  std::shared_ptr<std::pmr::monotonic_buffer_resource> arena_;
 };
 
 struct release_counts {
@@ -386,6 +429,99 @@ TEST_CASE("Arrow import retains the capacity-owned host resource through host-th
   CHECK(released.schemas == 1);
   CHECK(lifetime.destructions == 1);
   CHECK(lifetime.outstanding_at_destruction == 0);
+}
+
+TEST_CASE("Arrow import retains pinned inputs and staging while H2D copies are pending",
+          "[r4][scan][arrow_migration]")
+{
+  release_counts released;
+  void* pinned_storage = nullptr;
+  REQUIRE(cudaMallocHost(&pinned_storage, 65536) == cudaSuccess);
+  std::unique_ptr<void, decltype(&cudaFreeHost)> pinned(pinned_storage, cudaFreeHost);
+  std::pmr::monotonic_buffer_resource arena(pinned.get(), 65536, std::pmr::null_memory_resource());
+  bounded_host_resource host(nullptr, &arena);
+  struct gate_state {
+    std::atomic<bool> entered{false}, release{false}, timed_out{false};
+  } gate;
+  rmm::cuda_stream stream;
+  rmm::mr::cuda_async_memory_resource upstream;
+  rmm::device_buffer backing(1 << 20, stream.view(), rmm::device_async_resource_ref{upstream});
+  stream.synchronize();
+  fixed_device_resource device_arena(backing.data(), backing.size());
+  observed_device_resource device(rmm::device_async_resource_ref{device_arena});
+  device.state->expected_stream = stream.value();
+  sirius::exec::retire_lane lane(stream.value());
+  // This state outlives the lane. Every exit releases the gate before the lane
+  // quiesces, and the watchdog bounds any unexpected host-blocking CUDA call.
+  std::jthread watchdog([&] {
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!gate.release.load() && std::chrono::steady_clock::now() < deadline)
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    if (!gate.release.load()) {
+      gate.timed_out = true;
+      gate.release   = true;
+    }
+  });
+  struct release_gate {
+    gate_state& gate;
+    ~release_gate() { gate.release = true; }
+  } release{gate};
+  auto producer = std::allocate_shared<producer_batch>(
+    std::pmr::polymorphic_allocator<producer_batch>{&host}, released);
+  auto producer_bytes = host.used;
+  auto input =
+    std::make_shared<owned_arrow_batch>(producer->schema, producer->array, producer, host);
+  REQUIRE(cudaLaunchHostFunc(
+            stream.value(),
+            [](void* state) {
+              auto& gate   = *static_cast<gate_state*>(state);
+              gate.entered = true;
+              while (!gate.release.load())
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+            },
+            &gate) == cudaSuccess);
+  while (!gate.entered.load() && !gate.timed_out.load())
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  REQUIRE(gate.entered.load());
+  std::optional<materialized_batch> batch;
+  SECTION("successful submission returns before pending copies complete")
+  {
+    batch.emplace(
+      import_arrow_host(input, program_for_batch(), lane, rmm::device_async_resource_ref{device}));
+  }
+  SECTION("allocation failure after the first H2D enqueue retains its inputs")
+  {
+    device.state->fail_at = 1;
+    REQUIRE_THROWS_AS(
+      import_arrow_host(input, program_for_batch(), lane, rmm::device_async_resource_ref{device}),
+      rmm::out_of_memory);
+    CHECK(device.state->attempts == 2);
+  }
+  CHECK_FALSE(gate.release.load());
+  CHECK_FALSE(gate.timed_out.load());
+  CHECK(cudaStreamQuery(stream.value()) == cudaErrorNotReady);
+  input.reset();
+  producer.reset();
+  CHECK(released.arrays == 0);
+  CHECK(host.used > producer_bytes);
+  gate.release = true;
+  REQUIRE(lane.quiesce() == cudaSuccess);
+  CHECK(released.arrays == 1);
+  CHECK(released.schemas == 1);
+  CHECK(host.used == 0);
+  if (batch) {
+    std::array<int32_t, 12> values{};
+    REQUIRE(cudaMemcpy(values.data(),
+                       batch->table.view().column(0).head(),
+                       sizeof(values),
+                       cudaMemcpyDeviceToHost) == cudaSuccess);
+    CHECK(values.front() == 0);
+    CHECK(values.back() == 11);
+  }
+  batch.reset();
+  REQUIRE(lane.quiesce() == cudaSuccess);
+  CHECK(device.state->live_bytes == 0);
+  CHECK_FALSE(device.state->wrong_stream);
 }
 
 TEST_CASE("Arrow import validates only the selected UTF8 window including empty inputs",
