@@ -420,9 +420,32 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   right->estimated_cardinality = rhs_cardinality;
 
   if (op.conditions.empty()) {
-    throw duckdb::NotImplementedException("Cross product not supported in GPU");
-    // no conditions: insert a cross product
-    // return Make<PhysicalCrossProduct>(op.types, left, right, op.estimated_cardinality);
+    // No conditions: a cross product, as LogicalCrossProduct lowers to. DuckDB emits this for a
+    // correlated scalar count(*): a LEFT join against a one-row default. On two non-empty inputs
+    // INNER/LEFT/RIGHT/OUTER all equal the cross product and the nested loop join pads a 0-row
+    // side per join type; SEMI/ANTI/MARK/SINGLE would need rows filtered or marked, which the
+    // condition-less path does not do.
+    switch (op.join_type) {
+      case duckdb::JoinType::INNER:
+      case duckdb::JoinType::LEFT:
+      case duckdb::JoinType::RIGHT:
+      case duckdb::JoinType::OUTER:
+        return make_cross_product_join(
+          op,
+          std::move(left),
+          std::move(right),
+          op.join_type,
+          lhs_cardinality,
+          rhs_cardinality,
+          duckdb::vector<std::size_t>(op.left_projection_map.begin(),
+                                      op.left_projection_map.end()),
+          duckdb::vector<std::size_t>(op.right_projection_map.begin(),
+                                      op.right_projection_map.end()));
+      default:
+        throw duckdb::NotImplementedException("Cross product with join type " +
+                                              duckdb::JoinTypeToString(op.join_type) +
+                                              " not supported in GPU");
+    }
   }
 
   // Preserve key shape before materialization makes computed keys look like direct references.
@@ -453,8 +476,9 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     duckdb::PhysicalNestedLoopJoin::IsSupported(op.conditions, op.join_type);
   // DuckDB's check accepts join types the Sirius NLJ execute switch has no arm for
   // (RIGHT_SEMI / RIGHT_ANTI / SINGLE), which would throw mid-query instead of falling back.
-  // The hash join screens the same way via are_conditions_supported, so SINGLE -- which no GPU
-  // join implements -- is rejected on both routes.
+  // The hash join screens the same way via are_conditions_supported. SINGLE is implemented by
+  // the hash join only, so a SINGLE join whose conditions need the NLJ (no hashable equality)
+  // still falls back.
   const bool nlj_join_type_supported =
     sirius::op::sirius_physical_nested_loop_join::is_join_type_supported(op.join_type);
   const bool nlj_is_supported = nlj_conditions_supported && nlj_join_type_supported;

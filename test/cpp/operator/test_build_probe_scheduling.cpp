@@ -929,3 +929,39 @@ TEST_CASE("BUILD_PROBE byte accounting - accumulation, dedup, and the build-fini
   j->note_probe_bytes_counted(7, 999999);
   CHECK(j->consumed_primary_input_bytes() == std::size_t{1500});
 }
+
+TEST_CASE("compute_hash_join_partition_strategy - SINGLE schedules like LEFT, not MARK",
+          "[hash_join][build_probe][unit]")
+{
+  // SINGLE needs no whole-build mode of its own: its build is concat-folded per partition like
+  // LEFT's, so it is BUILD_PROBE-eligible by size only and never forced the way MARK is.
+  for (auto const bytes : {k100MB, 8 * k100MB}) {
+    INFO("build bytes: " << bytes);
+    auto const left = strategy(bytes,
+                               /*is_build_side=*/true,
+                               /*build_foldable=*/true,
+                               /*num_gpus=*/1,
+                               duckdb::JoinType::LEFT,
+                               HASH_JOIN_MODE::STANDARD,
+                               /*hash_partition_bytes=*/k100MB);
+    auto const single = strategy(bytes,
+                                 /*is_build_side=*/true,
+                                 /*build_foldable=*/true,
+                                 /*num_gpus=*/1,
+                                 duckdb::JoinType::SINGLE,
+                                 HASH_JOIN_MODE::STANDARD,
+                                 /*hash_partition_bytes=*/k100MB);
+    REQUIRE(single.build_probe == left.build_probe);
+    REQUIRE(single.broadcast == left.broadcast);
+    REQUIRE(single.num_partitions == left.num_partitions);
+  }
+  REQUIRE(strategy(k100MB, true, true, /*num_gpus=*/1, duckdb::JoinType::SINGLE).build_probe);
+  REQUIRE_FALSE(strategy(8 * k100MB,
+                         true,
+                         true,
+                         /*num_gpus=*/1,
+                         duckdb::JoinType::SINGLE,
+                         HASH_JOIN_MODE::STANDARD,
+                         /*hash_partition_bytes=*/k100MB)
+                  .build_probe);
+}
