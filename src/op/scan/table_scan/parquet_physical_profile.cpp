@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <limits>
 #include <map>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <tuple>
@@ -238,7 +239,7 @@ parquet_metadata_resolution resolve_parquet_metadata_with_identity(
     std::string arrow_schema;
     for (auto const& entry : parsed->key_value_metadata) {
       if (entry.key == "ARROW:schema") {
-        arrow_schema = entry.value;
+        arrow_schema = std::optional<std::string>{entry.value}.value_or("");
         break;
       }
     }
