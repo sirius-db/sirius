@@ -104,8 +104,23 @@ class observed_device_resource {
   rmm::device_async_resource_ref upstream_;
 };
 
+struct host_resource_lifetime {
+  int destructions                       = 0;
+  std::size_t outstanding_at_destruction = 0;
+};
+
 class bounded_host_resource final : public std::pmr::memory_resource {
  public:
+  explicit bounded_host_resource(host_resource_lifetime* lifetime = nullptr) : lifetime_(lifetime)
+  {
+  }
+  ~bounded_host_resource() override
+  {
+    if (lifetime_) {
+      ++lifetime_->destructions;
+      lifetime_->outstanding_at_destruction = used;
+    }
+  }
   std::size_t limit = std::numeric_limits<std::size_t>::max();
   std::size_t used  = 0;
   std::size_t peak  = 0;
@@ -113,6 +128,7 @@ class bounded_host_resource final : public std::pmr::memory_resource {
   long fail_at      = -1;
 
  private:
+  host_resource_lifetime* lifetime_;
   void* do_allocate(std::size_t bytes, std::size_t alignment) override
   {
     auto attempt = attempts++;
@@ -332,6 +348,89 @@ TEST_CASE("Arrow migration refuses invalid final columns and host exhaustion bef
   producer.reset();
   CHECK(released.arrays == 1);
   CHECK(released.schemas == 1);
+}
+
+TEST_CASE("Arrow import retains the capacity-owned host resource through host-thread retirement",
+          "[r4][scan][arrow_migration]")
+{
+  release_counts released;
+  host_resource_lifetime lifetime;
+  rmm::cuda_stream stream;
+  sirius::exec::retire_lane lane(stream.value());
+  struct admitted_producer {
+    bounded_host_resource host;
+    producer_batch roots;
+    admitted_producer(release_counts& released, host_resource_lifetime& lifetime)
+      : host(&lifetime), roots(released)
+    {
+    }
+  };
+  auto producer                         = std::make_shared<admitted_producer>(released, lifetime);
+  std::weak_ptr<admitted_producer> weak = producer;
+  auto input                            = std::make_shared<owned_arrow_batch>(
+    producer->roots.schema, producer->roots.array, producer, producer->host);
+  {
+    auto batch =
+      import_arrow_host(input, program_for_batch(), lane, cudf::get_current_device_resource_ref());
+  }
+  input.reset();
+  producer.reset();
+  CHECK_FALSE(weak.expired());
+  CHECK(lifetime.destructions == 0);
+  cudaError_t status = cudaErrorUnknown;
+  std::thread drainer([&] { status = lane.quiesce(); });
+  drainer.join();
+  REQUIRE(status == cudaSuccess);
+  CHECK(weak.expired());
+  CHECK(released.arrays == 1);
+  CHECK(released.schemas == 1);
+  CHECK(lifetime.destructions == 1);
+  CHECK(lifetime.outstanding_at_destruction == 0);
+}
+
+TEST_CASE("Arrow import validates only the selected UTF8 window including empty inputs",
+          "[r4][scan][arrow_migration]")
+{
+  release_counts released;
+  bounded_host_resource host;
+  rmm::cuda_stream stream;
+  sirius::exec::retire_lane lane(stream.value());
+  auto producer               = std::make_shared<producer_batch>(released);
+  producer->schema.n_children = producer->array.n_children = 1;
+  producer->field_ptrs[0]                                  = &producer->fields[2];
+  producer->column_ptrs[0]                                 = &producer->columns[2];
+  SECTION("an empty string column need not supply offsets or characters")
+  {
+    producer->array.length = producer->columns[2].length = 0;
+    producer->columns[2].null_count                      = 0;
+    for (auto& buffer : producer->buffers[2])
+      buffer = nullptr;
+  }
+  SECTION("invalid offsets outside the selected window are not imported")
+  {
+    producer->array.offset = 2;
+    producer->array.length = 7;
+    producer->offsets[0] = producer->offsets[12] = -1;
+  }
+  auto rows = producer->array.length;
+  auto input =
+    std::make_shared<owned_arrow_batch>(producer->schema, producer->array, producer, host);
+  materialization_program program{603, 1, {cudf::data_type{cudf::type_id::STRING}}, 0, false};
+  program.input_types = program.output_types;
+  auto batch = import_arrow_host(input, program, lane, cudf::get_current_device_resource_ref());
+  REQUIRE(lane.quiesce() == cudaSuccess);
+  CHECK(batch.rows == rows);
+  CHECK(batch.table.view().column(0).size() == rows);
+  if (rows) {
+    std::array<char, 7> characters{};
+    cudf::strings_column_view strings(batch.table.view().column(0));
+    REQUIRE(cudaMemcpy(characters.data(),
+                       strings.chars_begin(stream.view()),
+                       characters.size(),
+                       cudaMemcpyDeviceToHost) == cudaSuccess);
+    for (int row = 0; row < 7; ++row)
+      CHECK(characters[row] == 'c' + row);
+  }
 }
 
 TEST_CASE("Arrow migration Boolean slices cover shifted word and mask boundaries",
