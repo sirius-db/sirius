@@ -464,8 +464,15 @@ TEST_CASE("Arrow import retains pinned inputs and staging while H2D copies are p
   });
   struct release_gate {
     gate_state& gate;
-    ~release_gate() { gate.release = true; }
-  } release{gate};
+    sirius::exec::retire_lane& lane;
+    ~release_gate()
+    {
+      gate.release = true;
+      // The gate callback precedes lane submissions, including failures before
+      // begin(). An idle retirement queue is not a callback-completion barrier.
+      (void)lane.quiesce();
+    }
+  } release{gate, lane};
   auto producer = std::allocate_shared<producer_batch>(
     std::pmr::polymorphic_allocator<producer_batch>{&host}, released);
   auto producer_bytes = host.used;
