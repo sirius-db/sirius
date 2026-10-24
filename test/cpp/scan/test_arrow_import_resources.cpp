@@ -441,7 +441,7 @@ TEST_CASE("Arrow import retains pinned inputs and staging while H2D copies are p
   std::pmr::monotonic_buffer_resource arena(pinned.get(), 65536, std::pmr::null_memory_resource());
   bounded_host_resource host(nullptr, &arena);
   struct gate_state {
-    std::atomic<bool> entered{false}, release{false}, timed_out{false};
+    std::atomic<bool> entered{false}, release{false}, timed_out{false}, finished{false};
   } gate;
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource upstream;
@@ -462,73 +462,93 @@ TEST_CASE("Arrow import retains pinned inputs and staging while H2D copies are p
       gate.release   = true;
     }
   });
-  struct release_gate {
-    gate_state& gate;
-    sirius::exec::retire_lane& lane;
-    ~release_gate()
+  auto attempt = [&] {
+    struct release_gate {
+      gate_state& gate;
+      sirius::exec::retire_lane& lane;
+      ~release_gate()
+      {
+        gate.release = true;
+        // The gate callback precedes lane submissions, including failures before
+        // begin(). An idle retirement queue is not a callback-completion barrier.
+        (void)lane.quiesce();
+      }
+    } release{gate, lane};
+    auto producer = std::allocate_shared<producer_batch>(
+      std::pmr::polymorphic_allocator<producer_batch>{&host}, released);
+    auto producer_bytes = host.used;
+    auto input =
+      std::make_shared<owned_arrow_batch>(producer->schema, producer->array, producer, host);
+    REQUIRE(cudaLaunchHostFunc(
+              stream.value(),
+              [](void* state) {
+                auto& gate   = *static_cast<gate_state*>(state);
+                gate.entered = true;
+                while (!gate.release.load())
+                  std::this_thread::sleep_for(std::chrono::microseconds(100));
+                // Distinguish releasing the gate from completing its callback.
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                gate.finished = true;
+              },
+              &gate) == cudaSuccess);
+    while (!gate.entered.load() && !gate.timed_out.load())
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    REQUIRE(gate.entered.load());
+    std::optional<materialized_batch> batch;
+    SECTION("host allocation fails before any lane submission")
     {
-      gate.release = true;
-      // The gate callback precedes lane submissions, including failures before
-      // begin(). An idle retirement queue is not a callback-completion barrier.
-      (void)lane.quiesce();
+      host.fail_at = host.attempts;
+      REQUIRE_THROWS_AS(
+        import_arrow_host(input, program_for_batch(), lane, rmm::device_async_resource_ref{device}),
+        std::bad_alloc);
+      CHECK(device.state->attempts == 0);
+      CHECK(lane.idle());
+      return;
     }
-  } release{gate, lane};
-  auto producer = std::allocate_shared<producer_batch>(
-    std::pmr::polymorphic_allocator<producer_batch>{&host}, released);
-  auto producer_bytes = host.used;
-  auto input =
-    std::make_shared<owned_arrow_batch>(producer->schema, producer->array, producer, host);
-  REQUIRE(cudaLaunchHostFunc(
-            stream.value(),
-            [](void* state) {
-              auto& gate   = *static_cast<gate_state*>(state);
-              gate.entered = true;
-              while (!gate.release.load())
-                std::this_thread::sleep_for(std::chrono::microseconds(100));
-            },
-            &gate) == cudaSuccess);
-  while (!gate.entered.load() && !gate.timed_out.load())
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-  REQUIRE(gate.entered.load());
-  std::optional<materialized_batch> batch;
-  SECTION("successful submission returns before pending copies complete")
-  {
-    batch.emplace(
-      import_arrow_host(input, program_for_batch(), lane, rmm::device_async_resource_ref{device}));
-  }
-  SECTION("allocation failure after the first H2D enqueue retains its inputs")
-  {
-    device.state->fail_at = 1;
-    REQUIRE_THROWS_AS(
-      import_arrow_host(input, program_for_batch(), lane, rmm::device_async_resource_ref{device}),
-      rmm::out_of_memory);
-    CHECK(device.state->attempts == 2);
-  }
-  CHECK_FALSE(gate.release.load());
-  CHECK_FALSE(gate.timed_out.load());
-  CHECK(cudaStreamQuery(stream.value()) == cudaErrorNotReady);
-  input.reset();
-  producer.reset();
-  CHECK(released.arrays == 0);
-  CHECK(host.used > producer_bytes);
-  gate.release = true;
+    SECTION("successful submission returns before pending copies complete")
+    {
+      batch.emplace(import_arrow_host(
+        input, program_for_batch(), lane, rmm::device_async_resource_ref{device}));
+    }
+    SECTION("allocation failure after the first H2D enqueue retains its inputs")
+    {
+      device.state->fail_at = 1;
+      REQUIRE_THROWS_AS(
+        import_arrow_host(input, program_for_batch(), lane, rmm::device_async_resource_ref{device}),
+        rmm::out_of_memory);
+      CHECK(device.state->attempts == 2);
+    }
+    CHECK_FALSE(gate.release.load());
+    CHECK_FALSE(gate.timed_out.load());
+    CHECK(cudaStreamQuery(stream.value()) == cudaErrorNotReady);
+    input.reset();
+    producer.reset();
+    CHECK(released.arrays == 0);
+    CHECK(host.used > producer_bytes);
+    gate.release = true;
+    REQUIRE(lane.quiesce() == cudaSuccess);
+    CHECK(released.arrays == 1);
+    CHECK(released.schemas == 1);
+    CHECK(host.used == 0);
+    if (batch) {
+      std::array<int32_t, 12> values{};
+      REQUIRE(cudaMemcpy(values.data(),
+                         batch->table.view().column(0).head(),
+                         sizeof(values),
+                         cudaMemcpyDeviceToHost) == cudaSuccess);
+      CHECK(values.front() == 0);
+      CHECK(values.back() == 11);
+    }
+    batch.reset();
+    REQUIRE(lane.quiesce() == cudaSuccess);
+    CHECK(device.state->live_bytes == 0);
+    CHECK_FALSE(device.state->wrong_stream);
+  };
+  attempt();
+  CHECK(gate.finished.load());
+  // Backstop even a broken cleanup guard, so its negative control can fail
+  // without letting callback state or backing storage die while CUDA uses it.
   REQUIRE(lane.quiesce() == cudaSuccess);
-  CHECK(released.arrays == 1);
-  CHECK(released.schemas == 1);
-  CHECK(host.used == 0);
-  if (batch) {
-    std::array<int32_t, 12> values{};
-    REQUIRE(cudaMemcpy(values.data(),
-                       batch->table.view().column(0).head(),
-                       sizeof(values),
-                       cudaMemcpyDeviceToHost) == cudaSuccess);
-    CHECK(values.front() == 0);
-    CHECK(values.back() == 11);
-  }
-  batch.reset();
-  REQUIRE(lane.quiesce() == cudaSuccess);
-  CHECK(device.state->live_bytes == 0);
-  CHECK_FALSE(device.state->wrong_stream);
 }
 
 TEST_CASE("Arrow import validates only the selected UTF8 window including empty inputs",
