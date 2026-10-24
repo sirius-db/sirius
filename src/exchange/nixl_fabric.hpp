@@ -29,6 +29,8 @@
 class nixlAgent;
 class nixlBackendH;
 class nixlXferReqH;
+struct CUstream_st;
+struct CUevent_st;
 
 namespace sirius::exchange {
 
@@ -41,14 +43,30 @@ namespace sirius::exchange {
  * It returns once every peer has answered, so the transport starts with every peer reachable.
  *
  * There is no other control channel: everything after the hello is a NIXL write or notification.
+ *
+ * **Host staging.** UCX moves GPU memory between processes with `cuda_ipc`, which needs peer
+ * access between the two GPUs. Without it (GPUs under different PCIe switches on many hosts) UCX
+ * falls back to a far slower path. Every rank therefore also keeps a pinned host mirror of its
+ * receive ring in POSIX shared memory. A write to a peer whose GPU this GPU cannot reach directly
+ * is a device-to-host copy into that peer's mirror, followed by a notification naming the bytes;
+ * the peer copies them host-to-device into its receive ring and only then hands the write's own
+ * notification on. One PCIe crossing each way, no copy through the CPU.
  */
 class nixl_fabric : public fabric {
  public:
+  enum class host_staging { automatic, always, never };
+
+  /// SIRIUS_EXCHANGE_HOST_STAGING: auto (or unset), always or never.
+  /// @throws sirius::invalid_input_exception on any other value.
+  [[nodiscard]] static host_staging staging_from_env();
+
   struct config {
     rank_t rank{0};
     /// "host:port" of every rank's listener, indexed by rank; its size is the world size.
     std::vector<std::string> peers;
     std::chrono::milliseconds connect_timeout{std::chrono::minutes{2}};
+    /// automatic: host-stage writes to peers whose GPU lacks peer access to this one (NVML).
+    host_staging staging{host_staging::automatic};
   };
 
   /// @throws sirius::invalid_input_exception on a bad config.
@@ -74,6 +92,9 @@ class nixl_fabric : public fabric {
   void notify(rank_t peer, std::string notification) override;
   void poll(std::vector<fabric_notification>& out) override;
 
+  /// Whether writes to @p peer go through its host mirror rather than NIXL.
+  [[nodiscard]] bool host_staged(rank_t peer) const { return _peers.at(peer).staged; }
+
  private:
   struct peer {
     std::string host;
@@ -82,8 +103,31 @@ class nixl_fabric : public fabric {
     std::uintptr_t recv_base{0};
     std::size_t recv_bytes{0};
     std::uint32_t device{0};
+    std::uint32_t pid{0};
+    std::string pci_bus_id;
     bool hello{false};
+    /// Writes go through the peer's receive mirror, mapped here at mirror.
+    bool staged{false};
+    std::byte* mirror{nullptr};
   };
+
+  /// A host-staged write: its device-to-host copy, then the notification that says it landed.
+  struct staged_write {
+    CUevent_st* copied;
+    rank_t peer;
+    std::string notification;
+  };
+
+  /// A peer's host-staged write being copied into the receive ring; its notification waits.
+  struct landing {
+    CUevent_st* copied;
+    rank_t from;
+    std::string notification;
+  };
+
+  /// Maps rank @p r's receive mirror and registers it with CUDA.
+  void map_mirror(rank_t r);
+  CUevent_st* take_event();
 
   /// Receives notifications into _backlog, taking hellos out.
   void receive();
@@ -99,6 +143,15 @@ class nixl_fabric : public fabric {
   std::map<std::uint64_t, nixlXferReqH*> _writes;
   std::uint64_t _next_write{1};
   std::vector<fabric_notification> _backlog;
+
+  /// This rank's receive mirror (null with host_staging::never) and its shared-memory name.
+  std::byte* _mirror{nullptr};
+  std::string _mirror_name;
+  CUstream_st* _d2h{nullptr};
+  CUstream_st* _h2d{nullptr};
+  std::vector<CUevent_st*> _free_events;
+  std::map<std::uint64_t, staged_write> _staged;
+  std::vector<landing> _landings;
 };
 
 }  // namespace sirius::exchange

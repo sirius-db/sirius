@@ -50,8 +50,9 @@ std::shared_ptr<exchange_service> make_nixl_exchange(rank_t rank,
   auto b                = std::make_shared<bundle>();
   b->send               = std::make_unique<frame_ring>(opts.send_frames, opts.frame_bytes);
   b->recv = std::make_unique<frame_ring>(opts.recv_frames_per_peer * peer_count, opts.frame_bytes);
-  b->fabric =
-    std::make_unique<nixl_fabric>(nixl_fabric::config{rank, std::move(peers)}, *b->send, *b->recv);
+  nixl_fabric::config cfg{rank, std::move(peers)};
+  cfg.staging = nixl_fabric::staging_from_env();
+  b->fabric   = std::make_unique<nixl_fabric>(std::move(cfg), *b->send, *b->recv);
   b->service = std::make_unique<exchange_service>(*b->fabric, *b->send, *b->recv, gpu, host);
   return std::shared_ptr<exchange_service>(b, b->service.get());
 #else
