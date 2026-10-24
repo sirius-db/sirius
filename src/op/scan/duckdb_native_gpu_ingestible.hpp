@@ -203,6 +203,7 @@ class duckdb_native_gpu_ingestible : public op::scan::gpu_ingestible {
   [[nodiscard]] bool has_processed_all_metadata() const override;
 
   metadata_scan_task_t next_split_provider(io::ioctx_resolver resolve) override;
+  stoppable_metadata_scan_task_t next_split_provider_with_stop(io::ioctx_resolver resolve) override;
 
   op::scan::filtered_table materialize_metadata_to_table(
     scan_info const& info,

@@ -103,7 +103,7 @@ outputs remain in the output layout. A count-style scan with a filter uses its f
 carry the row count; a column-less scan may add a dedicated carrier. The native scan uses the
 same recorded boundary for its materialized order and output projection.
 
-Parquet (and its Iceberg subclass) also retains NULL predicates in the residual. Null-count
+Parquet (and the Iceberg adapter) also retains NULL predicates in the residual. Null-count
 statistics can prune whole row groups, but mixed groups still need row filtering. NULL tests
 never enter cuDF's min/max statistics expression; a partial reader pushdown cannot claim the
 whole predicate was applied. Numeric decode-range analysis likewise retains the residual when
@@ -124,7 +124,7 @@ There is no factory class. Each implementation provides a free `make_ingestible(
 
 ### Iceberg ingestible
 
-`iceberg_gpu_ingestible` (`iceberg_gpu_ingestible.{hpp,cpp}`) **extends** `parquet_gpu_ingestible` rather than reimplementing it: an Iceberg table's data files are parquet, and `iceberg_scan` resolves its manifests into the same `MultiFileBindData` file list `read_parquet` produces, so the parquet ingestible reads them unchanged. Only two behaviours differ. `create_batch_coalescer` wraps the parquet coalescer and stamps `disable_filter_pushdown` on every emitted split — but **only when the table has deletes** (per-split stamping is required; `reader_options` is one shared object handed to every split). `materialize_metadata_to_table` decodes through the base, then applies the delete pipeline to each decoded batch.
+`iceberg_gpu_ingestible` composes `parquet_scan_core`, as does the plain Parquet facade. The adapter supplies Iceberg schema mapping and delete preparation. Files whose schema already matches retain the existing reader route and pruning. Eligible evolved files use the `iceberg_flat_v1` mapping profile before visibility and residual filtering. Files with deletes disable reader-side row filtering so that original row positions remain available.
 
 Suppressing pushdown is load-bearing, not conservative. Positional deletes and deletion vectors are keyed on a row's position **within its data file**; if cuDF drops rows during decode, decoded positions no longer identify file positions and the mapping is unrecoverable. Materialize therefore returns `UNFILTERED` and `post_filter_and_project` applies the predicate *after* deletes — which is also Iceberg's required order. A non-`UNFILTERED` state from the base throws. Row-group pruning stays on and is safe: it only removes rows the predicate could not have matched, and offsets come from the footer, which lists pruned groups.
 
@@ -164,12 +164,16 @@ Currently declined:
 - **Equality deletes.** The filter, the GPU anti-join mask and the group build all exist, but key projection is not wired, and two pieces do not implement the spec: the applicability test compares the *manifest's* sequence number rather than the entry's inherited data sequence number, and keys are taken from every column of the delete file rather than the entry's declared `equality_ids`. `read_iceberg_delete_data` refuses live equality entries behind `kEqualityDeleteRouteImplementedToSpec`, which is the single switch that turns the route on; the components are covered directly by `test/cpp/scan/test_iceberg_equality_delete.cpp`, because no SQL test can reach them.
 - **`snapshot_from_timestamp` and `version`.** The delete path resolves only by `snapshot_from_id`, so these would read one snapshot's data against another's deletes.
 - **`allow_moved_paths = true`.** It rewrites every data-file path to `<table_path>/data/<name>`, while delete discovery calls `iceberg_metadata()` without the flag and keeps the manifests' original paths; the two would not match and the deletes would be dropped.
-- **Any data file whose schema differs from the table's current one** — a dropped field id (gap test, bind data only), a rename or an addition (name+id pair comparison against every data file's footer), a promoted type (`int` -> `long` keeps the name and id while the old file stays INT32), or a file carrying **no** field ids at all (a name-mapped `add_files` migration, which the probe must decline rather than skip).
+- **Schema changes outside `iceberg_flat_v1`**, including nested transformations, date/timestamp or decimal evolution, files lacking complete field IDs, and missing columns whose partition-constant semantics cannot be proved. Existing matching-schema support for these types is unchanged.
 - **A deletion vector whose Puffin footer descriptor contradicts its manifest entry**, or whose decoded position count contradicts the entry's `record_count`.
 
 Any code opening its own `Connection` on this path must bracket it with `SiriusContext::InternalQueryGuard` on **that connection's** context — the bracket is per-connection, so a caller's guard does not cover a connection it opens.
 
-**Known limitation.** Projected columns are resolved by **name** (`parquet_gpu_ingestible.cpp`), while Iceberg's data model is field-ID keyed. A column dropped and re-added under the same name is a *new* field ID absent from older data files and must read NULL; name resolution would find the old column and return stale data. The plan-time gates above close that off by declining every evolved table, so the limitation costs performance rather than correctness — but it is why the gates are as broad as they are. Resolving by field ID is the real fix and removes all of them: DuckDB's `MultiFileColumnDefinition` already carries the field ID (`identifier`, `GetIdentifierFieldId()`, `GetDefaultValue()`) and `MultiFileColumnMapper` implements the spec rule, including the name-mapping fallback for files without field IDs.
+**Flat schema evolution.** The adapter exports field IDs, types and typed initial defaults from the trusted DuckDB binding. Boolean, integer, floating-point and string fields support renaming, reordering, deletion, addition, and same-name drop/re-add; permitted promotions are INT32 to INT64 and FLOAT32 to FLOAT64. A per-file immutable mapper selects physical columns by ID and normalizes to the bound schema before deletes, filters and output projection. Absent columns use the bound initial default, including typed NULL, never a retired same-name column or the write default.
+
+Missing-column defaults require proof that partition metadata cannot override them. During lowering, one `LIMIT 0` Avro schema query per distinct data manifest checks for an empty partition record; nonempty or unavailable schemas do not grant this proof. No data-file footer sweep is added. Files with present fields can still map without this proof. This deliberately leaves identity-partition reconstruction outside the profile.
+
+Mapped files disable reader/statistics/null-count pruning and apply residual predicates after normalization. They use per-file reader options, so coalescing ends at their file boundary; row groups within a file still batch normally. Conversion/default buffers are included in the working-set estimate. If every requested field is absent, one physical column carries row count. Unsupported mappings fail before decoding and follow the existing late-failure policy. These choices preserve correctness but add manifest-header work and may reduce pruning/coalescing efficiency; performance acceptance is separate.
 
 ## owning_table_view
 
@@ -688,6 +692,79 @@ graph TD
 
 The converter builds a `gpu_ingestible` and parks it on the `GPU_SCAN` operator. At query prep the scan manager either serves the operator from a pinned cache (`cached_databatch_provider`) or builds a `split_provider` over the ingestible. The provider dispatches one metadata task per file (parquet) or row-group range (duckdb-native); the query-thread coordinator coalesces and balances each batch, validates publication before prefetch, then pushes splits onto the operator's connector. The task creator turns each pulled split into a `gpu_pipeline_task` on the split's preferred GPU; `execute()` materializes, optionally post-filters/projects, and emits a `data_batch` to the downstream pipeline.
 
+## Shared materialization components
+
+`parquet_gpu_ingestible` and `iceberg_gpu_ingestible` compose `parquet_scan_core`.
+The core retains file enumeration, footer preparation, coalescing, reader options,
+and the existing bulk/general decoder selection. Iceberg owns snapshot and delete
+applicability, suppresses row filtering during decode when positions are needed,
+and delegates the mask operation to `positional_visibility`.
+
+`finish_materialization()` orders mapping, visibility, residual evaluation, and
+projection. A batch carries its contract and execution generation, cardinality,
+completion flags, and per-conjunct predicate progress. Pruning is not enforcement;
+an answer is a bound BOOL8 slot. `residual_filter::against_progress()` refuses
+unknown conjuncts and attempts to reconstruct values overwritten by answers.
+The legacy Parquet bridge retains its existing AST, survivor rowid, and scan-plan
+assembly. Its one expression-completion flag is derived from legacy state at the
+bridge; it does not introduce a second mutable conjunct map.
+
+Source lineage is either original-file runs, explicit original positions, or
+unavailable. Runs retain offsets across pruned row groups. Visibility requires
+lineage until it has completed; it must not use pinned-input survivor rowids as
+file positions. An internal INT8 carrier preserves positive cardinality for a
+zero-column batch. A zero-row batch does not mean end-of-stream.
+
+Two reusable entry points additionally exercise this finish contract:
+
+- `materialize_mapped_parquet()` takes an immutable `field_id_mapping`, the opened
+  datasource, retained footer, physical contract, and exact row groups. The mapper
+  binds physical names by field ID, reorders fields, fills explicitly typed defaults,
+  and permits INT32-to-INT64 or FLOAT32-to-FLOAT64 conversion only when approved at compilation. It checks
+  the decoded dtype before conversion and preserves original file row positions.
+  The current core profile accepts flat boolean, integer, float, and string fields.
+  `materialize_mapped_parquet_runs()` coalesces compatible admitted units and flushes
+  at mapping/default/original-schema boundaries. Different object identities can
+  coalesce; repeated files retain repeated rows and separate lineage. The caller
+  reserves decoded memory plus `additional_bytes()` for each admitted run, including
+  all results retained in the returned vector. The production Iceberg adapter uses
+  the same mapper under its qualified `iceberg_flat_v1` rules.
+- `import_arrow_host()` accepts an owned Arrow C Data tree, its bound input schema,
+  task memory resource, and retirement lane. The flat host profile accepts booleans,
+  signed/unsigned integers, FLOAT32/64, UTF8, DATE32, microsecond timestamps without
+  timezone, and DECIMAL128 (precision 1–38, nonnegative scale no larger than precision).
+  It refuses nested, dictionary, extension, binary, large-string, and device arrays.
+  Decimal imports normalize to the approved DECIMAL128 carrier. Input buffers and
+  metadata must be readable producer-owned C Data memory. For every non-null metadata
+  buffer on the root or a child schema, the producer supplies a trusted readable byte
+  length in `arrow_metadata_lengths` and keeps that memory alive through import.
+  Arrow C Data carries no allocation extents: a raw pointer, lengths encoded inside
+  metadata, or `strnlen` cannot establish its readable range, and copying from an
+  unknown range cannot establish one either. The consumer rejects non-null metadata
+  without a trusted length and parses it only within that buffer's supplied bound.
+  The consumer owns extension/profile and bound-schema checks, admission, publication,
+  cancellation, and ownership/retirement. The producer must detach statement-affine
+  callbacks before ownership transfer. Input/staging capacity remains owned through
+  retirement, even if import throws. The caller reserves output/temporary memory and
+  drains the lane.
+  The current importer calls cuDF directly after validation. Future integration with
+  the shared host-Arrow conversion in [#2216](https://github.com/sirius-db/sirius/pull/2216)
+  can reuse a conversion leaf that does not inspect metadata; bounded metadata checks
+  and the other consumer responsibilities above remain with this scan consumer.
+  `materialize_arrow_stream()` is the internal sequential verifier above this
+  single-batch importer. Its source returns independently owned batches with a
+  contiguous sequence, declared row/byte envelope, and explicit `nullopt` EOS;
+  zero-row batches remain data. It validates the envelope against the imported
+  batch, sends each result directly to a sink without an unbounded queue, and
+  calls source cancellation on source, import, validation, or sink failure.
+  An adapter may translate an `ArrowArrayStream` one batch at a time, but no
+  public Fragment Arrow-input API or Paimon/DuckLake reader is introduced here.
+
+A direct GPU reader can supply an owning batch to the same validator and finish
+without an Arrow or CPU-vector round trip. These helpers do not register a new SQL
+source adapter or relax the existing Iceberg equality-delete, snapshot or
+remote-DV gates. Schema evolution is limited to the qualified flat profile described above.
+
 ## Key Files
 
 | File | Purpose |
@@ -696,7 +773,11 @@ The converter builds a `gpu_ingestible` and parks it on the `GPU_SCAN` operator.
 | `src/op/scan/sirius_gpu_scan_operator_data.hpp` | `scan_operator_input` (fresh-read or resident-batch split) |
 | `src/op/scan/gpu_ingestible.hpp` / `src/op/scan/gpu_ingestible.cpp` | `gpu_ingestible` abstraction + `materialize_table` dispatch |
 | `src/op/scan/gpu_ingestible_types.hpp` | `ingestible_table_info`, `scan_info`, `filtered_table` / `filter_state` |
-| `src/op/scan/parquet_gpu_ingestible.hpp` / `src/op/scan/parquet_gpu_ingestible.cpp` | Parquet ingestible + `parquet_batch_coalescer` + `make_ingestible` |
+| `src/op/scan/parquet_gpu_ingestible.hpp` / `src/op/scan/parquet_gpu_ingestible.cpp` | Parquet facade + `make_ingestible` |
+| `src/op/scan/parquet_scan_core.hpp` / `.cpp` | Shared Parquet preparation, coalescing, decode, and legacy finish bridge |
+| `src/op/scan/materialization_contract.hpp` / `.cpp` | Program/batch validation and shared finish ordering |
+| `src/op/scan/field_id_mapping.hpp` / `.cpp` | Per-file immutable field-ID mapping and conversion approval |
+| `src/op/scan/arrow_materializer.hpp` / `.cpp` | Owned host Arrow import with stream retirement |
 | `src/op/scan/duckdb_native_gpu_ingestible.cpp` / `src/op/scan/duckdb_native_gpu_ingestible.hpp` | DuckDB-native ingestible + `duckdb_native_batch_coalescer` |
 | `src/op/scan/batch_coalescer.hpp` | Coalescer interface |
 | `src/op/scan/owning_table_view.hpp` | View-or-table handle with no-alloc reorder/drop/select |

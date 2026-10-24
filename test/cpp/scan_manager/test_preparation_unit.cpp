@@ -28,6 +28,8 @@
 
 using namespace sirius::scan_manager;
 namespace {
+struct test_visibility final : sirius::op::scan::prepared_visibility {};
+
 required_input_set needs(required_input input)
 {
   required_input_set set;
@@ -38,19 +40,30 @@ required_input_set needs(required_input input)
 TEST_CASE("A pending delete set must not be interpreted as no deletes",
           "[scan_preparation][preparation_unit]")
 {
-  preparation_unit unit({3, 4}, needs(required_input::delete_set));
+  preparation_unit unit({3, 4}, needs(required_input::visibility));
   CHECK(unit.record().state == unit_state::pending);
   CHECK_FALSE(unit.record().deps);
-  CHECK_THROWS_AS(unit.complete_input(delete_set_input{}), std::invalid_argument);
+  CHECK_THROWS_AS(unit.complete_input(visibility_input{}), std::invalid_argument);
   REQUIRE(unit.complete_input(
-    delete_set_input{std::make_shared<sirius::op::scan::iceberg_delete_set const>("file")}));
+    visibility_input{std::make_shared<sirius::op::scan::iceberg_delete_set const>("file")}));
   auto ready = unit.record();
   CHECK(ready.state == unit_state::ready);
-  REQUIRE(ready.deps->delete_set);
-  CHECK(ready.deps->delete_set->positions.empty());
+  REQUIRE(ready.deps->visibility);
+  CHECK(
+    std::dynamic_pointer_cast<sirius::op::scan::iceberg_delete_set const>(ready.deps->visibility)
+      ->positions.empty());
   CHECK_FALSE(unit.cancel());
-  CHECK_FALSE(unit.complete_input(delete_set_input{}));  // late/duplicate ignored
+  CHECK_FALSE(unit.complete_input(visibility_input{}));  // late/duplicate ignored
   CHECK(unit.record().deps == ready.deps);
+}
+
+TEST_CASE("Shared preparation accepts connector-owned semantic visibility artifacts",
+          "[scan_preparation][preparation_unit]")
+{
+  preparation_unit unit({9, 9}, needs(required_input::visibility));
+  auto artifact = std::make_shared<test_visibility const>();
+  REQUIRE(unit.complete_input(visibility_input{artifact}));
+  CHECK(unit.record().deps->visibility == artifact);
 }
 TEST_CASE("Required inputs are derived from actual scan checks and arrive in any order",
           "[scan_preparation][preparation_unit]")
@@ -64,7 +77,7 @@ TEST_CASE("Required inputs are derived from actual scan checks and arrive in any
   REQUIRE(unit.complete_input(checkpoint_input{7}));
   CHECK(unit.record().state == unit_state::pending);
   REQUIRE(unit.complete_input(
-    delete_set_input{std::make_shared<sirius::op::scan::iceberg_delete_set const>("file")}));
+    visibility_input{std::make_shared<sirius::op::scan::iceberg_delete_set const>("file")}));
   CHECK(unit.record().state == unit_state::pending);
   REQUIRE(unit.complete_input(
     segments_input{std::make_shared<sirius::op::scan::physical_profile_table>()}));
@@ -76,13 +89,13 @@ TEST_CASE("Required inputs are derived from actual scan checks and arrive in any
 TEST_CASE("Preparation terminal races commit exactly once", "[scan_preparation][preparation_unit]")
 {
   for (int iteration = 0; iteration < 50; ++iteration) {
-    preparation_unit unit({1, 1}, needs(required_input::delete_set));
+    preparation_unit unit({1, 1}, needs(required_input::visibility));
     std::barrier rendezvous(3);
     bool completed = false, cancelled = false;
     std::jthread first([&] {
       rendezvous.arrive_and_wait();
       completed = unit.complete_input(
-        delete_set_input{std::make_shared<sirius::op::scan::iceberg_delete_set const>("file")});
+        visibility_input{std::make_shared<sirius::op::scan::iceberg_delete_set const>("file")});
     });
     std::jthread second([&] {
       rendezvous.arrive_and_wait();
@@ -203,11 +216,11 @@ TEST_CASE("Footer completion retains its independent metadata and approval owner
 TEST_CASE("Late preparation payloads are released and cannot replace a terminal result",
           "[scan_preparation][preparation_unit]")
 {
-  preparation_unit unit({4, 5}, needs(required_input::delete_set));
+  preparation_unit unit({4, 5}, needs(required_input::visibility));
   REQUIRE(unit.cancel());
   auto value = std::make_shared<sirius::op::scan::iceberg_delete_set const>("late file");
   std::weak_ptr<sirius::op::scan::iceberg_delete_set const> weak = value;
-  CHECK_FALSE(unit.complete_input(delete_set_input{std::move(value)}));
+  CHECK_FALSE(unit.complete_input(visibility_input{std::move(value)}));
   CHECK(weak.expired());
   CHECK(unit.record().state == unit_state::cancelled);
   CHECK_FALSE(unit.record().deps);

@@ -5,6 +5,7 @@
 #include "io/cache/metadata_store.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <catch2/matchers/catch_matchers.hpp>
 
 #include <atomic>
@@ -179,6 +180,34 @@ TEST_CASE("Metadata flights do not join a different identity", "[metadata_store]
   CHECK(store.statistics().builds == 2);
 }
 
+TEST_CASE("Metadata profiles are independent cache identities", "[metadata_store]")
+{
+  cache::metadata_store store;
+  fake_object object("file", "file:v1", tag());
+  auto first  = std::make_shared<value>(32);
+  auto second = std::make_shared<value>(64);
+  CHECK(store.get_or_load(object, [&] { return first; }, nullptr, {}, "profile-a") == first);
+  CHECK(store.get_or_load(object, [&] { return second; }, nullptr, {}, "profile-b") == second);
+  CHECK(store.get_metadata(object, "profile-a") == first);
+  CHECK(store.get_metadata(object, "profile-b") == second);
+  CHECK(store.statistics().builds == 2);
+}
+
+TEST_CASE("Targeted metadata invalidation preserves other profiles", "[metadata_store]")
+{
+  cache::metadata_store store;
+  fake_object object("file", "file:v1", tag());
+  auto canonical = std::make_shared<value>(32);
+  auto profile   = std::make_shared<value>(64);
+  store.register_metadata(object, canonical, "");
+  store.register_metadata(object, profile, "iceberg_flat_v1");
+
+  CHECK(store.invalidate("file", "iceberg_flat_v1"));
+  CHECK(store.get_metadata(object, "") == canonical);
+  CHECK_FALSE(store.get_metadata(object, "iceberg_flat_v1"));
+  CHECK_FALSE(store.invalidate("file", "iceberg_flat_v1"));
+}
+
 TEST_CASE("Same-key opens preserve warm metadata and advance the observation fence",
           "[metadata_store]")
 {
@@ -230,6 +259,27 @@ TEST_CASE("Identity replacement invalidates entries for a path", "[metadata_stor
   store.open_observed(replacement);
   CHECK_FALSE(store.get_metadata(first));
   CHECK_FALSE(store.has_path("file"));
+  CHECK(store.statistics().entries == 0);
+}
+
+TEST_CASE("Identity replacement retires every metadata profile for a path", "[metadata_store]")
+{
+  cache::metadata_store store;
+  fake_object first("file", "file:v1", tag("v1"));
+  auto canonical = std::make_shared<value>(100);
+  auto iceberg   = std::make_shared<value>(200);
+  auto extra     = std::make_shared<value>(300);
+  store.register_metadata(first, canonical, "");
+  store.register_metadata(first, iceberg, "iceberg_flat_v1");
+  store.register_metadata(first, extra, "other");
+  CHECK(store.statistics().entries == 3);
+
+  fake_object replacement("file", "file:v2", tag("v2"));
+  store.open_observed(replacement);
+
+  CHECK_FALSE(store.get_metadata(first, ""));
+  CHECK_FALSE(store.get_metadata(first, "iceberg_flat_v1"));
+  CHECK_FALSE(store.get_metadata(first, "other"));
   CHECK(store.statistics().entries == 0);
 }
 
@@ -328,4 +378,126 @@ TEST_CASE("Metadata replacement releases payloads outside the store lock", "[met
   fake_object second("file", "file:v2", tag("v2"));
   store.register_metadata(second, std::make_shared<value>(128));
   CHECK(released);
+}
+
+TEST_CASE("Metadata path and profile delimiters cannot alias another tuple",
+          "[metadata_store][r4_review]")
+{
+  auto const reverse = GENERATE(false, true);
+  cache::metadata_store store;
+  fake_object first("p", "same-key", tag());
+  fake_object second("p\nprofile=q", "same-key", tag());
+  auto a = std::make_shared<value>(32);
+  auto b = std::make_shared<value>(64);
+  CHECK(store.get_or_load(first, [&] { return a; }, nullptr, {}, "q") == a);
+  CHECK(store.get_or_load(second, [&] { return b; }) == b);
+  CHECK(store.get_metadata(first, "q") == a);
+  CHECK(store.get_metadata(second) == b);
+  CHECK(store.statistics().entries == 2);
+  CHECK(store.statistics().builds == 2);
+  CHECK(store.has_path(second.object_path()));
+  // has_path is a hint for the canonical profile only.
+  CHECK_FALSE(store.has_path(first.object_path()));
+  if (reverse) {
+    CHECK(store.invalidate(second.object_path()));
+    CHECK_FALSE(store.get_metadata(second));
+    CHECK(store.get_metadata(first, "q") == a);
+  } else {
+    CHECK(store.invalidate(first.object_path(), "q"));
+    CHECK_FALSE(store.get_metadata(first, "q"));
+    CHECK(store.get_metadata(second) == b);
+  }
+  CHECK(store.statistics().entries == 1);
+  CHECK_FALSE(
+    store.invalidate(reverse ? second.object_path() : first.object_path(), reverse ? "" : "q"));
+  CHECK(store.statistics().entries == 1);
+}
+
+TEST_CASE("Metadata identity retirement follows the raw path across encoded profiles",
+          "[metadata_store][r4_review]")
+{
+  cache::metadata_store store;
+  fake_object first("p", "same-key", tag());
+  fake_object second("p\nprofile=q", "same-key", tag());
+  auto a = std::make_shared<value>(32);
+  auto b = std::make_shared<value>(64);
+  for (auto const& profile :
+       std::vector<std::string>{"", "q", "\nprofile=q", "1:p:q", std::string("a\0b", 3)})
+    store.register_metadata(first, a, profile);
+  store.register_metadata(second, b);
+  CHECK(store.statistics().entries == 6);
+  fake_object newer(first.object_path(), "new", tag("v2"));
+  store.open_observed(newer);
+  CHECK(store.statistics().entries == 1);
+  CHECK(store.statistics().replacements == 5);
+  CHECK_FALSE(store.has_path(first.object_path()));
+  CHECK(store.has_path(second.object_path()));
+  CHECK(store.get_metadata(second) == b);
+  store.register_metadata(newer, a, "q");
+  CHECK(store.get_metadata(newer, "q") == a);
+  CHECK(store.get_metadata(second) == b);
+}
+
+TEST_CASE("Metadata colliding path profile spellings keep independent flights",
+          "[metadata_store][r4_review]")
+{
+  cache::metadata_store store;
+  fake_object first("p", "same-key", tag());
+  fake_object second("p\nprofile=q", "same-key", tag());
+  auto a = std::make_shared<value>(32);
+  auto b = std::make_shared<value>(64);
+  std::promise<void> started, release;
+  auto gate     = release.get_future().share();
+  auto producer = std::async(std::launch::async, [&] {
+    return store.get_or_load(
+      first,
+      [&] {
+        started.set_value();
+        gate.wait();
+        return a;
+      },
+      nullptr,
+      {},
+      "q");
+  });
+  started.get_future().wait();
+  auto independent =
+    std::async(std::launch::async, [&] { return store.get_or_load(second, [&] { return b; }); });
+  auto status = independent.wait_for(std::chrono::seconds(2));
+  release.set_value();
+  CHECK(status == std::future_status::ready);
+  CHECK(independent.get() == b);
+  CHECK(producer.get() == a);
+  CHECK(store.statistics().joined == 0);
+  CHECK(store.statistics().builds == 2);
+  CHECK(store.get_metadata(first, "q") == a);
+  CHECK(store.get_metadata(second) == b);
+}
+
+TEST_CASE("Metadata tuple encoding accepts empty paths and embedded delimiters",
+          "[metadata_store][r4_review]")
+{
+  cache::metadata_store store;
+  std::vector<std::pair<std::string, std::string>> tuples{{"", ""},
+                                                          {"", "1:p"},
+                                                          {"1:", "p"},
+                                                          {"p:", "q"},
+                                                          {"p", ":q"},
+                                                          {"p\nprofile=", "q"},
+                                                          {"p", "\nprofile=q"},
+                                                          {std::string("p\0q", 3), ""},
+                                                          {"p", std::string("\0q", 2)}};
+  std::vector<std::unique_ptr<fake_object>> objects;
+  std::vector<std::shared_ptr<value>> payloads;
+  for (auto const& [path, profile] : tuples) {
+    objects.push_back(std::make_unique<fake_object>(path, "same-key", tag()));
+    payloads.push_back(std::make_shared<value>(payloads.size()));
+    store.register_metadata(*objects.back(), payloads.back(), profile);
+  }
+  CHECK(store.statistics().entries == tuples.size());
+  for (size_t i = 0; i < tuples.size(); ++i) {
+    CHECK(store.get_metadata(*objects[i], tuples[i].second) == payloads[i]);
+    CHECK(store.invalidate(tuples[i].first, tuples[i].second));
+    CHECK(store.statistics().entries == tuples.size() - i - 1);
+  }
 }
