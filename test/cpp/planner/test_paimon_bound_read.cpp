@@ -195,6 +195,20 @@ TEST_CASE("Paimon acquisition rejects malformed and foreign descriptor APIs", "[
                              : "Paimon descriptor refused: foreign or missing bridge callback");
 }
 
+TEST_CASE("Paimon acquisition rejects an initializer supplied by a dependency", "[paimon_binding]")
+{
+  fixture_mode selected(valid);
+  duckdb::DBConfig config;
+  dynamic_config(config);
+  duckdb::DuckDB db(nullptr, &config);
+  duckdb::Connection con(db);
+  auto proxy =
+    fixture_path().parent_path().parent_path() / "paimon_binding_proxy/paimon.duckdb_extension";
+  sql(con, "LOAD " + quote(proxy.string()));
+  CHECK_THROWS_WITH(paimon_read_provider::from_loaded(*db.instance),
+                    "Paimon descriptor refused: provider initializer is unavailable or foreign");
+}
+
 TEST_CASE("Paimon retain refuses incomplete evidence and releases failed outputs",
           "[paimon_binding]")
 {

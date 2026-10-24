@@ -21,7 +21,7 @@ set_target_properties(
              RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/cpp")
 
 # Small hidden DSO for routine ABI and failed-output cleanup counterexamples.
-add_library(sirius_paimon_binding_fixture MODULE
+add_library(sirius_paimon_binding_fixture SHARED
             test/cpp/utils/paimon_binding_fixture.cpp)
 target_include_directories(
   sirius_paimon_binding_fixture
@@ -40,27 +40,47 @@ set_target_properties(
              VISIBILITY_INLINES_HIDDEN ON
              LIBRARY_OUTPUT_DIRECTORY
              "${CMAKE_CURRENT_BINARY_DIR}/test/cpp/paimon_binding_fixture")
+set_target_properties(sirius_paimon_binding_fixture PROPERTIES NO_SONAME ON)
+add_library(sirius_paimon_binding_proxy SHARED
+            test/cpp/utils/paimon_binding_proxy.cpp)
+target_link_libraries(sirius_paimon_binding_proxy
+                      PRIVATE sirius_paimon_binding_fixture)
+set_target_properties(
+  sirius_paimon_binding_proxy
+  PROPERTIES PREFIX ""
+             OUTPUT_NAME "paimon"
+             SUFFIX ".duckdb_extension"
+             CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON
+             CXX_SCAN_FOR_MODULES OFF
+             CXX_VISIBILITY_PRESET hidden
+             VISIBILITY_INLINES_HIDDEN ON
+             NO_SONAME ON
+             LIBRARY_OUTPUT_DIRECTORY
+             "${CMAKE_CURRENT_BINARY_DIR}/test/cpp/paimon_binding_proxy")
 get_directory_property(
   _paimon_fixture_version DIRECTORY "${SIRIUS_DUCKDB_SOURCE_DIR}" DEFINITION
                                     DUCKDB_NORMALIZED_VERSION)
 get_directory_property(_paimon_duckdb_binary
                        DIRECTORY "${SIRIUS_DUCKDB_SOURCE_DIR}" BINARY_DIR)
-add_custom_command(
-  TARGET sirius_paimon_binding_fixture
-  POST_BUILD
-  COMMAND
-    ${CMAKE_COMMAND} -DABI_TYPE=CPP
-    -DEXTENSION=$<TARGET_FILE:sirius_paimon_binding_fixture>
-    -DPLATFORM_FILE=${_paimon_duckdb_binary}/duckdb_platform_out
-    -DVERSION_FIELD=${_paimon_fixture_version} -DEXTENSION_VERSION=fixture
-    -DNULL_FILE=${SIRIUS_DUCKDB_SOURCE_DIR}/scripts/null.txt -P
-    ${SIRIUS_DUCKDB_SOURCE_DIR}/scripts/append_metadata.cmake)
-add_dependencies(sirius_paimon_binding_fixture duckdb_platform)
-add_dependencies(sirius_paimon_binding_test sirius_paimon_binding_fixture)
+foreach(_fixture IN ITEMS sirius_paimon_binding_fixture
+                          sirius_paimon_binding_proxy)
+  add_custom_command(
+    TARGET ${_fixture}
+    POST_BUILD
+    COMMAND
+      ${CMAKE_COMMAND} -DABI_TYPE=CPP -DEXTENSION=$<TARGET_FILE:${_fixture}>
+      -DPLATFORM_FILE=${_paimon_duckdb_binary}/duckdb_platform_out
+      -DVERSION_FIELD=${_paimon_fixture_version} -DEXTENSION_VERSION=fixture
+      -DNULL_FILE=${SIRIUS_DUCKDB_SOURCE_DIR}/scripts/null.txt -P
+      ${SIRIUS_DUCKDB_SOURCE_DIR}/scripts/append_metadata.cmake)
+  add_dependencies(${_fixture} duckdb_platform)
+endforeach()
+add_dependencies(sirius_paimon_binding_test sirius_paimon_binding_proxy)
 
 add_executable(sirius_unittest ${TEST_SOURCES} src/sirius_extension_entry.cpp
                                test/cpp/utils/sirius_extension_loader.cpp)
-add_dependencies(sirius_unittest sirius_paimon_binding_fixture)
+add_dependencies(sirius_unittest sirius_paimon_binding_proxy)
 # Export DuckDB's host API for third-party extensions such as Iceberg.
 set_target_properties(sirius_unittest PROPERTIES ENABLE_EXPORTS ON)
 # Load Sirius in a DuckDB-only host to avoid a second embedded engine copy.
