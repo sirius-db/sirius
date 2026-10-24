@@ -495,16 +495,6 @@ TEST_CASE("Arrow import retains pinned inputs and staging while H2D copies are p
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     REQUIRE(gate.entered.load());
     std::optional<materialized_batch> batch;
-    SECTION("host allocation fails before any lane submission")
-    {
-      host.fail_at = host.attempts;
-      REQUIRE_THROWS_AS(
-        import_arrow_host(input, program_for_batch(), lane, rmm::device_async_resource_ref{device}),
-        std::bad_alloc);
-      CHECK(device.state->attempts == 0);
-      CHECK(lane.idle());
-      return;
-    }
     SECTION("successful submission returns before pending copies complete")
     {
       batch.emplace(import_arrow_host(
@@ -517,6 +507,17 @@ TEST_CASE("Arrow import retains pinned inputs and staging while H2D copies are p
         import_arrow_host(input, program_for_batch(), lane, rmm::device_async_resource_ref{device}),
         rmm::out_of_memory);
       CHECK(device.state->attempts == 2);
+    }
+    // Keep this early return last so Catch registers both earlier sibling sections.
+    SECTION("host allocation fails before any lane submission")
+    {
+      host.fail_at = host.attempts;
+      REQUIRE_THROWS_AS(
+        import_arrow_host(input, program_for_batch(), lane, rmm::device_async_resource_ref{device}),
+        std::bad_alloc);
+      CHECK(device.state->attempts == 0);
+      CHECK(lane.idle());
+      return;
     }
     CHECK_FALSE(gate.release.load());
     CHECK_FALSE(gate.timed_out.load());
