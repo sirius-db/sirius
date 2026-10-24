@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Runs the exchange's one-rank-per-process NIXL test: N ranks on this host, rank i on GPU i.
+# Runs the exchange's one-rank-per-process NIXL test: N ranks on this host, rank i on GPU i, or on
+# the i-th GPU of GPUS (e.g. GPUS=0,2). TEST picks the Catch2 tag (default [nixl_multiprocess]).
 #   scripts/exchange_nixl_ranks.sh [ranks=2] [base port=27000]
 # Needs a build configured with -DSIRIUS_WITH_NIXL=ON; sources scripts/nixl_env.sh.
 set -euo pipefail
@@ -12,10 +13,11 @@ test_bin="$here/../build/release/test/cpp/sirius_unittest"
 peers=""
 for ((i = 0; i < ranks; i++)); do peers+="${peers:+,}127.0.0.1:$((port + i))"; done
 
+IFS=, read -r -a gpus <<< "${GPUS:-$(seq -s, 0 $((ranks - 1)))}"
 pids=()
 for ((i = 0; i < ranks; i++)); do
-  CUDA_VISIBLE_DEVICES=$i SIRIUS_EXCHANGE_RANK=$i SIRIUS_EXCHANGE_PEERS=$peers \
-    timeout -s KILL 300 "$test_bin" "[nixl_multiprocess]" > "/tmp/exchange_nixl_rank_$i.log" 2>&1 &
+  CUDA_VISIBLE_DEVICES=${gpus[$i]} SIRIUS_EXCHANGE_RANK=$i SIRIUS_EXCHANGE_PEERS=$peers \
+    timeout -s KILL 300 "$test_bin" "${TEST:-[nixl_multiprocess]}" > "/tmp/exchange_nixl_rank_$i.log" 2>&1 &
   pids+=($!)
 done
 status=0

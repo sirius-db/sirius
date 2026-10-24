@@ -111,6 +111,18 @@ rings are registered, so a peer fetched too early is fetched again. After the he
 is a NIXL write or a notification. There is no TCP or RPC channel of our own. Between GPUs on one
 host, UCX picks `cuda_ipc` zero-copy.
 
+**Host staging.** `cuda_ipc` needs peer access between the two GPUs. Where there is none (GPUs
+under different PCIe switches, which `nvidia-smi topo -p2p r` shows as `NS`), UCX falls back to
+staging through the host over TCP, at about 1 GB/s. So each rank also keeps a pinned mirror of its
+receive ring in POSIX shared memory (`/dev/shm/sirius-exchange-<pid>-<rank>`), and its hello
+carries its PID and its GPU's PCI bus id. For a peer whose GPU NVML reports without peer read and
+write access, a write is one device-to-host copy into that peer's mirror, then a notification
+naming the offset and size; the peer copies the bytes host-to-device into its receive ring and
+only then passes the write's own notification to the transport. Credits are unchanged: a mirror
+frame is reused only after the transport has copied its receive frame out.
+`SIRIUS_EXCHANGE_HOST_STAGING=always|never` overrides the choice (default `auto`). Each rank logs
+its path to every peer at start.
+
 ### Operators (`src/op/sirius_physical_exchange_{sink,source}.*`)
 
 `EXCHANGE_SINK` routes by an `exchange_spec`:

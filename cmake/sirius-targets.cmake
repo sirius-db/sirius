@@ -68,7 +68,8 @@ if(BUILD_WITH_CTRACK)
   list(APPEND SIRIUS_LINK_LIBRARIES $<BUILD_INTERFACE:ctrack::ctrack>)
 endif()
 if(SIRIUS_WITH_NIXL)
-  list(APPEND SIRIUS_LINK_LIBRARIES ${NIXL_LIBRARY} ${NIXL_BUILD_LIBRARY})
+  # NVML: the NIXL fabric checks peer access between GPUs other processes own.
+  list(APPEND SIRIUS_LINK_LIBRARIES ${NIXL_LIBRARY} ${NIXL_BUILD_LIBRARY} CUDA::nvml)
 endif()
 
 foreach(_target sirius_objects sirius_context_config sirius_core sirius_shared)
