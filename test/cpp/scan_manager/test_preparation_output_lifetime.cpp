@@ -15,6 +15,7 @@
  */
 
 #include "catch.hpp"
+#include "op/scan/arrow_materializer.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/repository_wiring.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -22,6 +23,7 @@
 #include "utils/telemetry_utils.hpp"
 
 #include <rmm/cuda_device.hpp>
+#include <rmm/cuda_stream.hpp>
 
 #include <cuda_runtime_api.h>
 
@@ -33,7 +35,38 @@ using namespace sirius::test::preparation;
 using namespace std::chrono_literals;
 
 namespace {
-// These are detached host owners, not an Arrow importer or a production provider budget.
+void require_cuda(cudaError_t status)
+{
+  if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+}
+
+// The callback touches host synchronization only, never CUDA or Catch.
+struct gpu_read_hold {
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool entered = false, released = false, timed_out = false;
+  static void CUDART_CB wait(void* pointer) noexcept
+  {
+    auto& self = *static_cast<gpu_read_hold*>(pointer);
+    std::unique_lock lock(self.mutex);
+    self.entered = true;
+    self.cv.notify_all();
+    self.timed_out = !self.cv.wait_for(lock, 5s, [&] { return self.released; });
+  }
+  bool await()
+  {
+    std::unique_lock lock(mutex);
+    return cv.wait_for(lock, 5s, [&] { return entered; });
+  }
+  void release()
+  {
+    std::lock_guard lock(mutex);
+    released = true;
+    cv.notify_all();
+  }
+};
+
+// The reader detaches storage before publishing; the same fixture feeds Arrow and raw GPU reads.
 struct detached_input : tagged {
   std::shared_ptr<charged_block const> storage;
   detached_input(int id, size_t bytes, std::shared_ptr<charged_block const> root)
@@ -101,26 +134,128 @@ std::shared_ptr<detached_input> detached_metadata(sirius::op::operator_data& val
   return std::dynamic_pointer_cast<detached_input>(
     std::get<std::shared_ptr<sirius::op::scan::scan_info>>(input.materialization_info));
 }
+struct arrow_releases {
+  std::atomic<unsigned> arrays{0}, schemas{0};
+};
+
+// The capacity owner holds the complete C Data tree and its charged value buffer.
+// Release callbacks own no reader or statement state and may run after source close.
+struct arrow_storage {
+  std::shared_ptr<charged_block const> backing;
+  std::shared_ptr<arrow_releases> released;
+  ArrowSchema schema{}, child_schema{};
+  ArrowArray array{}, child{};
+  ArrowSchema* schemas[1]{&child_schema};
+  ArrowArray* children[1]{&child};
+  void const* buffers[2]{};
+  void const* root_buffers[1]{};
+  std::array<char, 4> root_metadata{}, child_metadata{};  // zero metadata entries
+
+  arrow_storage(std::shared_ptr<charged_block const> block,
+                size_t offset,
+                std::shared_ptr<arrow_releases> observation)
+    : backing(std::move(block)), released(std::move(observation))
+  {
+    child_schema.format   = "i";
+    child_schema.metadata = child_metadata.data();
+    child_schema.release  = [](ArrowSchema* value) { value->release = nullptr; };
+    schema.format         = "+s";
+    schema.metadata       = root_metadata.data();
+    schema.n_children     = 1;
+    schema.children       = schemas;
+    schema.private_data   = released.get();
+    schema.release        = [](ArrowSchema* value) {
+      value->children[0]->release(value->children[0]);
+      ++static_cast<arrow_releases*>(value->private_data)->schemas;
+      value->release = nullptr;
+    };
+    buffers[1]         = backing->data() + offset;
+    child.length       = 4;
+    child.n_buffers    = 2;
+    child.buffers      = buffers;
+    child.release      = [](ArrowArray* value) { value->release = nullptr; };
+    array.length       = 4;
+    array.n_buffers    = 1;
+    array.buffers      = root_buffers;
+    array.n_children   = 1;
+    array.children     = children;
+    array.private_data = released.get();
+    array.release      = [](ArrowArray* value) {
+      value->children[0]->release(value->children[0]);
+      ++static_cast<arrow_releases*>(value->private_data)->arrays;
+      value->release = nullptr;
+    };
+  }
+};
+struct arrow_input : tagged {
+  std::shared_ptr<sirius::op::scan::owned_arrow_batch> batch;
+  arrow_input(int id, std::shared_ptr<sirius::op::scan::owned_arrow_batch> value)
+    : tagged(id, 16), batch(std::move(value))
+  {
+  }
+};
+auto arrow_constructor(std::shared_ptr<arrow_releases> releases, bool invalid_second = false)
+{
+  return [releases = std::move(releases),
+          invalid_second](std::unique_ptr<sirius::op::scan::scan_info> input) {
+    auto& data = dynamic_cast<detached_input&>(*input);
+    auto owner = std::make_shared<arrow_storage>(data.storage, (data.id - 1) * 16, releases);
+    sirius::op::scan::arrow_metadata_lengths lengths{
+      {owner->schema.metadata, owner->root_metadata.size()},
+      {owner->child_schema.metadata, owner->child_metadata.size()}};
+    if (invalid_second && data.id == 2) lengths.erase(owner->child_schema.metadata);
+    auto batch = std::make_shared<sirius::op::scan::owned_arrow_batch>(
+      owner->schema, owner->array, owner, std::move(lengths));
+    return make_publication(std::make_unique<arrow_input>(data.id, std::move(batch)), 16);
+  };
+}
+std::shared_ptr<arrow_input> arrow_metadata(sirius::op::operator_data& value)
+{
+  auto& input = dynamic_cast<sirius::op::scan::scan_operator_input&>(value);
+  return std::dynamic_pointer_cast<arrow_input>(
+    std::get<std::shared_ptr<sirius::op::scan::scan_info>>(input.materialization_info));
+}
+
+// Delay the import's real CUDA completion callback, without replacing the importer
+// or its retirement state. cuDF may synchronize internally before committing it.
+thread_local gpu_read_hold* import_gate = nullptr;
+cudaError_t gated_import_callback(cudaStream_t stream,
+                                  cudaStreamCallback_t callback,
+                                  void* data,
+                                  unsigned flags)
+{
+  auto status = cudaLaunchHostFunc(stream, gpu_read_hold::wait, import_gate);
+  return status == cudaSuccess ? cudaStreamAddCallback(stream, callback, data, flags) : status;
+}
+struct import_gate_scope {
+  explicit import_gate_scope(gpu_read_hold& gate) { import_gate = &gate; }
+  ~import_gate_scope() { import_gate = nullptr; }
+};
 }  // namespace
 
-TEST_CASE("Detached reader outputs keep one backing across pop retirement and multiple consumers",
-          "[scan_preparation][coordinator][output_lifetime]")
+TEST_CASE("Arrow reader outputs retain one backing through publication and import retirement",
+          "[scan_preparation][coordinator][output_lifetime][arrow_output_lifetime]")
 {
-  using domain   = preparation_coordinator::execution_domain;
+  using namespace sirius::op::scan;
+  using domain = preparation_coordinator::execution_domain;
+  enum class outcome { success, cancel_queued, cancel_import, invalid_metadata };
   auto execution = GENERATE(domain::query_owner, domain::native_reader);
-  auto cancel    = GENERATE(false, true);
+  auto result    = GENERATE(
+    outcome::success, outcome::cancel_queued, outcome::cancel_import, outcome::invalid_metadata);
+  CAPTURE(execution, result);
   native_reader_executor native(1, 1);
   fixture f(1, 1, 5s, std::nullopt, &native);
   test::test_reservation_provider provider;
   auto storage         = std::make_shared<detached_source_state>(provider);
+  auto releases        = std::make_shared<arrow_releases>();
   auto out             = std::make_shared<sink>();
   auto full_window     = std::make_shared<std::promise<size_t>>();
   auto observed_window = full_window->get_future();
   auto guard           = f.shutdown_guard();
-  f.start([&, full_window] {
-    f.register_source(detached_source(storage, out, execution), out);
-    // With one control action per iteration, this probe runs only after C has tried to
-    // advance the next result. Observe the full window without sleeping or blocking C.
+  f.start([&] {
+    auto source      = detached_source(storage, out, execution);
+    source.construct = arrow_constructor(releases, result == outcome::invalid_metadata);
+    f.register_source(std::move(source), out);
     preparation_coordinator::source probe;
     probe.coalescer = std::make_shared<detached_coalescer>();
     probe.try_claim = [out, full_window]() -> preparation_coordinator::claim_result {
@@ -137,14 +272,10 @@ TEST_CASE("Detached reader outputs keep one backing across pop retirement and mu
   });
   REQUIRE(observed_window.wait_for(1s) == std::future_status::ready);
   REQUIRE(observed_window.get() == 1);
-  // Popping returns lookahead capacity, but the first consumer still owns the input.
   auto first = out->connector->get_next_split();
   REQUIRE(first);
   REQUIRE(out->await(2));
-  CHECK(provider.seen->allocations == 1);
-  CHECK(provider.seen->allocated_bytes == 32);
-  if (cancel) {
-    // Leave the second output queued while retiring the producer and its ledger owner.
+  if (result == outcome::cancel_queued) {
     f.coordinator.request_stop(stop_reason::user_cancel);
     f.finish();
   }
@@ -152,39 +283,101 @@ TEST_CASE("Detached reader outputs keep one backing across pop retirement and mu
   REQUIRE(second);
   REQUIRE(out->await_closed());
   f.finish();
-  CHECK_FALSE(f.owner_error);
-  CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
+  REQUIRE_FALSE(f.owner_error);
   CHECK(out->close_calls == 1);
   CHECK(storage->ledger == nullptr);
   CHECK(storage->charge_at_close == 32);
-  CHECK(provider.outstanding() == 1);
+  CHECK(storage->reader_buffer[0] == std::byte{0xee});
+  CHECK(provider.seen->allocations == 1);
   CHECK(provider.seen->requests == 1);
-  CHECK(f.completion.has_error() == cancel);
 
-  // Separate descriptors may feed separate consumers; neither duplicates the host charge.
-  auto a = detached_metadata(**first);
-  auto b = detached_metadata(**second);
+  auto a = arrow_metadata(**first);
+  auto b = arrow_metadata(**second);
   REQUIRE(a);
   REQUIRE(b);
-  CHECK(a != b);
-  CHECK(a->storage == b->storage);
   first.reset();
   second.reset();
-  CHECK(provider.seen->allocated_bytes == 32);
-  CHECK(a->storage->data()[0] == std::byte{0x2a});
-  CHECK(b->storage->data()[31] == std::byte{0x2a});
-  CHECK(storage->reader_buffer[0] == std::byte{0xee});
-  a.reset();
-  CHECK_FALSE(storage->output.expired());
-  CHECK(provider.seen->allocated_bytes == 32);
-  b.reset();
+  CHECK(provider.seen->allocated_bytes == 32);  // Pop returned lookahead, not the backing.
+  if (result == outcome::cancel_queued) {
+    a.reset();
+    CHECK(provider.seen->allocated_bytes == 32);
+    b.reset();
+  } else {
+    rmm::cuda_stream first_stream, second_stream;
+    std::array<materialized_batch, 2> outputs;
+    std::array<gpu_read_hold, 2> holds;
+    sirius::exec::detail::completion_cuda_api api;
+    api.add_callback = &gated_import_callback;
+    sirius::exec::retire_lane first_lane(first_stream.value(), api);
+    sirius::exec::retire_lane second_lane(second_stream.value(), api);
+    // The release guard must run before either lane waits during assertion unwinding.
+    auto release_on_exit = std::shared_ptr<void>(nullptr, [&](void*) {
+      for (auto& hold : holds)
+        hold.release();
+    });
+    materialization_program program{77, 1, {cudf::data_type{cudf::type_id::INT32}}, 0, false};
+    program.input_types = program.output_types;
+    auto import         = [&](size_t i, auto const& input, auto& lane) {
+      import_gate_scope scope(holds[i]);
+      return import_arrow_host(
+        input->batch, program, lane, cudf::get_current_device_resource_ref());
+    };
+    outputs[0] = import(0, a, first_lane);
+    REQUIRE(holds[0].await());
+    a.reset();
+    CHECK(first_lane.drain() == 0);
+    CHECK(releases->arrays == 0);
+    CHECK(provider.seen->allocated_bytes == 32);
+    holds[0].release();
+    REQUIRE(first_lane.quiesce() == cudaSuccess);
+    CHECK(releases->arrays == 1);
+    CHECK(provider.seen->allocated_bytes == 32);  // The second published slice still owns it.
+
+    if (result == outcome::invalid_metadata) {
+      CHECK_THROWS_AS(import(1, b, second_lane), std::invalid_argument);
+      CHECK(second_lane.idle());
+      b.reset();
+    } else {
+      outputs[1] = import(1, b, second_lane);
+      REQUIRE(holds[1].await());
+      b.reset();  // Only the importer now retains the last published input.
+      if (result == outcome::cancel_import) f.coordinator.request_stop(stop_reason::user_cancel);
+      CHECK(second_lane.drain() == 0);
+      CHECK(releases->arrays == 1);
+      CHECK(provider.seen->allocated_bytes == 32);
+      holds[1].release();
+      REQUIRE(second_lane.quiesce() == cudaSuccess);
+    }
+    // GPU output remains usable after reader, descriptors and host capacity are gone.
+    CHECK(storage->output.expired());
+    CHECK(provider.seen->allocated_bytes == 0);
+    for (auto& output : outputs) {
+      if (!output.rows) continue;
+      materialization_steps steps;
+      steps.projection = [](materialized_batch&) {};  // The only column is the bound output.
+      auto finished    = finish_materialization(std::move(output), program, steps);
+      std::array<int32_t, 4> values{};
+      require_cuda(cudaMemcpy(values.data(),
+                              finished.table.view().column(0).head<int32_t>(),
+                              sizeof(values),
+                              cudaMemcpyDeviceToHost));
+      CHECK(std::all_of(values.begin(), values.end(), [](auto v) { return v == 0x2a2a2a2a; }));
+    }
+    for (auto& hold : holds)
+      CHECK_FALSE(hold.timed_out);
+  }
+  CHECK(releases->arrays == 2);
+  CHECK(releases->schemas == 2);
   CHECK(storage->output.expired());
   CHECK(provider.seen->allocated_bytes == 0);
   CHECK(provider.outstanding() == 0);
+  CHECK(f.completion.has_error() ==
+        (result == outcome::cancel_queued || result == outcome::cancel_import));
+  CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
 }
 
-TEST_CASE("Unpublished reader outputs release backing on cancellation and construction failure",
-          "[scan_preparation][coordinator][output_lifetime]")
+TEST_CASE("Unpublished Arrow outputs release backing on cancellation and construction failure",
+          "[scan_preparation][coordinator][output_lifetime][arrow_output_lifetime]")
 {
   using domain              = preparation_coordinator::execution_domain;
   auto execution            = GENERATE(domain::query_owner, domain::native_reader);
@@ -192,20 +385,21 @@ TEST_CASE("Unpublished reader outputs release backing on cancellation and constr
   native_reader_executor native(1, 1);
   fixture f(1, 1, 5s, std::nullopt, &native);
   test::test_reservation_provider provider;
-  auto storage = std::make_shared<detached_source_state>(provider);
-  auto out     = std::make_shared<sink>();
+  auto storage  = std::make_shared<detached_source_state>(provider);
+  auto out      = std::make_shared<sink>();
+  auto releases = std::make_shared<arrow_releases>();
   if (!construction_failure) {
     f.coordinator.before_publication_for_testing(
       [&] { f.coordinator.request_stop(stop_reason::user_cancel); });
   }
   auto guard = f.shutdown_guard();
   f.start([&] {
-    auto source = detached_source(storage, out, execution);
-    if (construction_failure) {
-      source.construct = [](auto) -> preparation_coordinator::publication {
-        throw std::runtime_error("output construction failed");
-      };
-    }
+    auto source      = detached_source(storage, out, execution);
+    source.construct = [construct = arrow_constructor(releases), construction_failure](auto input) {
+      auto output = construct(std::move(input));
+      if (construction_failure) throw std::runtime_error("output construction failed");
+      return output;
+    };
     f.register_source(std::move(source), out);
   });
   REQUIRE(out->await_closed());
@@ -213,6 +407,8 @@ TEST_CASE("Unpublished reader outputs release backing on cancellation and constr
   CHECK(f.completion.has_error());
   if (construction_failure) CHECK(f.completion.failure().detail == "output construction failed");
   CHECK(out->count() == 0);
+  CHECK(releases->arrays == 1);
+  CHECK(releases->schemas == 1);
   CHECK(out->close_calls == 1);
   CHECK(storage->ledger == nullptr);
   CHECK(storage->output.expired());
@@ -223,37 +419,6 @@ TEST_CASE("Unpublished reader outputs release backing on cancellation and constr
 }
 
 namespace {
-void require_cuda(cudaError_t status)
-{
-  if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
-}
-
-// The callback touches host synchronization only, never CUDA or Catch.
-struct gpu_read_hold {
-  std::mutex mutex;
-  std::condition_variable cv;
-  bool entered = false, released = false, timed_out = false;
-  static void CUDART_CB wait(void* pointer) noexcept
-  {
-    auto& self = *static_cast<gpu_read_hold*>(pointer);
-    std::unique_lock lock(self.mutex);
-    self.entered = true;
-    self.cv.notify_all();
-    self.timed_out = !self.cv.wait_for(lock, 5s, [&] { return self.released; });
-  }
-  bool await()
-  {
-    std::unique_lock lock(mutex);
-    return cv.wait_for(lock, 5s, [&] { return entered; });
-  }
-  void release()
-  {
-    std::lock_guard lock(mutex);
-    released = true;
-    cv.notify_all();
-  }
-};
-
 struct gpu_read_observation {
   cudaEvent_t finished = nullptr;
   std::promise<void> submitted;
