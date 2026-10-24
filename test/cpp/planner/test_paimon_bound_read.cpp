@@ -271,6 +271,25 @@ TEST_CASE("Paimon descriptor move assignment releases each owner once", "[paimon
   CHECK(fixture_releases() - before == 2);
 }
 
+TEST_CASE("Paimon retain refuses default and moved-from function definitions", "[paimon_binding]")
+{
+  fixture_mode selected(valid);
+  duckdb::DBConfig config;
+  dynamic_config(config);
+  duckdb::DuckDB db(nullptr, &config);
+  duckdb::Connection con(db);
+  sql(con, "LOAD " + quote(fixture_path().string()));
+  auto provider = paimon_read_provider::from_loaded(*db.instance);
+  auto bound    = bind_paimon(con, "/ignored", 0);
+  duckdb::BoundTableFunction missing;
+  CHECK_THROWS_WITH(provider.retain(missing, bound.data.get()),
+                    "Paimon descriptor refused: unverified callbacks or function-info");
+  auto moved = std::move(bound.function);
+  CHECK_THROWS_WITH(provider.retain(bound.function, bound.data.get()),
+                    "Paimon descriptor refused: unverified callbacks or function-info");
+  CHECK(provider.retain(moved, bound.data.get()).view().snapshot_id == 5);
+}
+
 TEST_CASE("Paimon descriptor consumer authenticates real loaded bindings",
           "[.][paimon_binding_dynamic]")
 {

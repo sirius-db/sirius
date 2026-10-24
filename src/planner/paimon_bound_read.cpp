@@ -66,6 +66,10 @@ struct paimon_read_provider::state {
 
   PaimonReadBridgeV1 const& authenticate(duckdb::BoundTableFunction const& candidate) const
   {
+    // GetSignature() dereferences GetDefinition(); default and moved-from calls
+    // must be refused before the eager callback tuple evaluates it.
+    if (!candidate.GetDefinition() || !candidate.function_info)
+      refuse("unverified callbacks or function-info");
     for (auto const& reference : references) {
       if (!detail::same_scan_callbacks(reference, candidate) || !reference.function_info ||
           candidate.function_info != reference.function_info)
