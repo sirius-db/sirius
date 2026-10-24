@@ -1219,7 +1219,14 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
   task_creator_->set_task_scheduler(*task_scheduler_);
   task_scheduler_->set_task_creator(*task_creator_);
 
-  query_event_publisher_ = std::make_shared<sirius::event::query_event_publisher>();
+  // Runtime task events and planning observations share the public event source. A separate
+  // private publisher made actual task deployment invisible to get_event_publisher() subscribers.
+  // terminate() closes it. A re-initialize needs a fresh publisher, while first initialization
+  // retains subscriptions installed before runtime startup.
+  if (query_event_publisher_) {
+    event_publisher_ = std::make_shared<sirius::event::query_event_publisher>();
+  }
+  query_event_publisher_ = event_publisher_;
   task_creator_->set_query_event_publisher(*query_event_publisher_);
   task_scheduler_->set_query_event_publisher(*query_event_publisher_);
   scan_manager_ =

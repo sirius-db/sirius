@@ -83,6 +83,7 @@ set(TEST_SOURCES
     test/cpp/helper/test_transaction_utils.cpp
     test/cpp/integration/test_compressed_materialization_gate.cpp
     test/cpp/integration/test_compressed_materialization_partition.cpp
+    test/cpp/integration/test_gpu_execution_window.cpp
     test/cpp/integration/test_gpu_execution_aggregate_nulls.cpp
     test/cpp/integration/test_gpu_execution_allnull_scan.cpp
     test/cpp/integration/test_gpu_execution_array.cpp
@@ -207,6 +208,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_partition_exchange.cpp
     test/cpp/operator/test_cross_schedule.cpp
     test/cpp/operator/test_cross_join_slicing.cpp
+    test/cpp/operator/window/test_whole_partition.cpp
     test/cpp/operator/aggregate/test_decimal_sum_widening.cpp
     test/cpp/operator/aggregate/test_gpu_merge_impl.cpp
     test/cpp/operator/aggregate/test_group_key_labels.cpp
@@ -262,6 +264,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_join_expression_key.cpp
     test/cpp/planner/test_plan_tree_shape.cpp
     test/cpp/planner/test_projection_fold.cpp
+    test/cpp/planner/test_window_plan.cpp
     test/cpp/planner/test_sirius_read_parquet_scan.cpp
     test/cpp/planner/test_substrait_scan_ranges.cpp
     test/cpp/planner/test_query_id.cpp
