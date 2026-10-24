@@ -1,31 +1,43 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use crate::fragment_executor::FragmentExecutor;
+use crate::ComputeNodeConfig;
 #[cfg(test)]
 use crate::fragment_executor::StubExecutor;
+use crate::fragment_executor::{FragmentExecutor, FragmentRun, SenderSlot};
+use crate::local_exchange::{
+    ExchangeKey, LocalExchange, ReadyExchangeInput, ReadyFragment, SenderSource,
+};
 use crate::proto::starrocks::{
-    PExecBatchPlanFragmentsRequest, PExecBatchPlanFragmentsResult, PExecPlanFragmentRequest,
-    PExecPlanFragmentResult, PFetchDataRequest, PFetchDataResult, PGetFileSchemaRequest,
-    PGetFileSchemaResult, PSlotDescriptor, StatusPb, p_internal_service_brpc::PInternalService,
+    PCancelPlanFragmentRequest, PCancelPlanFragmentResult, PExecBatchPlanFragmentsRequest,
+    PExecBatchPlanFragmentsResult, PExecPlanFragmentRequest, PExecPlanFragmentResult,
+    PFetchDataRequest, PFetchDataResult, PGetFileSchemaRequest, PGetFileSchemaResult,
+    PSlotDescriptor, StatusPb, p_internal_service_brpc::PInternalService,
 };
 use crate::result_encoder::{self, ThriftBinary};
 use crate::result_store::{FragmentInstanceId, ResultStore};
-use starrocks_plan_translator::{PlanTranslator, TranslatedPlan};
+use starrocks_plan_translator::{ExchangeInput, PlanTranslator, TranslatedPlan};
 use starrocks_thrift::{
-    data_sinks::{TDataSinkType, TResultSinkType},
+    data_sinks::{TDataSinkType, TPlanFragmentDestination, TResultSinkType},
     descriptors::TDescriptorTable,
     internal_service::{
         TExecBatchPlanFragmentsParams, TExecPlanFragmentParams, TGetFileSchemaRequest,
     },
-    plan_nodes::TFileFormatType,
+    partitions::TPartitionType,
+    plan_nodes::{TFileFormatType, TPlanNodeType},
     status_code::TStatusCode,
+    types::TNetworkAddress,
 };
 use thrift::{
     protocol::{TBinaryInputProtocol, TSerializable},
     transport::TBufferChannel,
 };
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
+
+/// Bounds a `fetch_data` wait on a result fragment whose exchange senders never finish. Short
+/// under test, so a readiness regression fails a test instead of hanging it for ten minutes.
+const RESULT_WAIT: Duration = Duration::from_secs(if cfg!(test) { 5 } else { 600 });
 
 /// Sirius compute-node implementation of StarRocks PInternalService.
 ///
@@ -35,14 +47,21 @@ use tracing::{info, instrument};
 pub(crate) struct SiriusComputeNodeService {
     /// Reusable StarRocks thrift-to-Substrait fragment translator.
     translator: PlanTranslator,
-    /// Executes a translated fragment into Arrow result batches. Production injects the GPU-backed
-    /// `SiriusEngine` (via [`with_executor`](Self::with_executor)); tests use a stub.
+    /// Runs translated fragments, returning a result fragment's Arrow batches or parking a sender
+    /// fragment's output. Production injects the GPU-backed `SiriusEngine` (via
+    /// [`with_executor`](Self::with_executor)); tests use a stub.
     executor: Arc<dyn FragmentExecutor>,
     /// Buffers executed-fragment results for FE `fetch_data` collection. Shared across BRPC
     /// connections so a `fetch_data` poll sees what an `exec_plan_fragment` buffered.
     results: Arc<ResultStore>,
     /// Descriptor tables retained for StarRocks's per-query cache protocol.
     descriptor_tables: Arc<Mutex<HashMap<FragmentInstanceId, TDescriptorTable>>>,
+    /// Exchange rendezvous: receivers wait here until every sender has parked its output.
+    exchanges: Arc<LocalExchange>,
+    /// This CN's advertised brpc endpoint, with the host resolved to an IP because the FE
+    /// addresses sink destinations by IP (`ComputeNode.getBrpcIpAddress`). A destination is local
+    /// only when IP and port both match, so two CNs on one host see each other as remote.
+    brpc_address: TNetworkAddress,
 }
 
 impl SiriusComputeNodeService {
@@ -50,25 +69,49 @@ impl SiriusComputeNodeService {
     /// executor via [`with_executor`](Self::with_executor).
     #[cfg(test)]
     pub(crate) fn new() -> Self {
-        Self::with_executor(Arc::new(StubExecutor))
+        Self::with_executor(Arc::new(StubExecutor), &ComputeNodeConfig::default())
     }
 
-    /// Builds the service with a caller-provided fragment executor (e.g. the GPU-backed
-    /// `SiriusEngine`), shared across BRPC connections via the `Arc`.
-    pub(crate) fn with_executor(executor: Arc<dyn FragmentExecutor>) -> Self {
+    /// Builds the service for the CN `compute_node` advertises, with a caller-provided fragment
+    /// executor (e.g. the GPU-backed `SiriusEngine`) shared across BRPC connections via the `Arc`.
+    pub(crate) fn with_executor(
+        executor: Arc<dyn FragmentExecutor>,
+        compute_node: &ComputeNodeConfig,
+    ) -> Self {
         Self {
             translator: PlanTranslator::new(),
             executor,
             results: Arc::new(ResultStore::default()),
             descriptor_tables: Arc::new(Mutex::new(HashMap::new())),
+            exchanges: Arc::new(LocalExchange::default()),
+            brpc_address: TNetworkAddress::new(
+                resolve_ip(compute_node.advertise_host.as_str()),
+                i32::from(compute_node.brpc_port),
+            ),
         }
     }
 }
 
+/// Resolves `host` the way the FE does (Java prefers IPv4), or returns it unchanged if it doesn't
+/// resolve; an IP literal comes back as is.
+fn resolve_ip(host: &str) -> String {
+    use std::net::ToSocketAddrs;
+    let Ok(addrs) = (host, 0).to_socket_addrs() else {
+        return host.to_string();
+    };
+    let addrs: Vec<_> = addrs.map(|addr| addr.ip()).collect();
+    addrs
+        .iter()
+        .find(|ip| ip.is_ipv4())
+        .or(addrs.first())
+        .map_or_else(|| host.to_string(), ToString::to_string)
+}
+
 impl PInternalService for SiriusComputeNodeService {
-    /// Handles a single FE-dispatched plan fragment thrift attachment: translate it, and for a
-    /// root RESULT_SINK fragment execute it and buffer the rows for `fetch_data`. An OK status
-    /// means the fragment was accepted (and, for a result fragment, executed and buffered).
+    /// Handles a single FE-dispatched plan fragment thrift attachment. A fragment fed by an
+    /// exchange returns OK once registered and runs when its senders have parked. Any other
+    /// fragment runs now: a RESULT_SINK buffers its rows for `fetch_data`, a DATA_STREAM_SINK
+    /// parks its output for its receivers.
     #[instrument(skip_all)]
     async fn exec_plan_fragment(
         &self,
@@ -94,16 +137,16 @@ impl PInternalService for SiriusComputeNodeService {
         Ok(Self::exec_plan_result(status).into())
     }
 
-    /// Handles FE batch fragment dispatch: translate every per-instance fragment and execute the
-    /// RESULT_SINK roots among them.
+    /// Handles FE batch fragment dispatch: processes every per-instance fragment as
+    /// `exec_plan_fragment` does.
     #[instrument(skip_all)]
     async fn exec_batch_plan_fragments(
         &self,
         request: PExecBatchPlanFragmentsRequest,
         attachment: Vec<u8>,
     ) -> Result<crate::prpc::Reply<PExecBatchPlanFragmentsResult>, crate::prpc::Error> {
-        // Like `exec_plan_fragment`, an instance can run a RESULT_SINK fragment on the GPU, so
-        // offload to a blocking worker rather than blocking the BRPC current-thread runtime.
+        // Like `exec_plan_fragment`, an instance can run a fragment on the GPU, so offload to a
+        // blocking worker rather than blocking the BRPC current-thread runtime.
         let protocol = request.attachment_protocol;
         let service = self.clone();
         let outcome = tokio::task::spawn_blocking(move || {
@@ -135,13 +178,16 @@ impl PInternalService for SiriusComputeNodeService {
         // An unknown id is an error, not EOS: it means this CN never buffered a result for the
         // fragment the FE is polling (wrong id, or a dispatch/result-sink path that did not run),
         // and StarRocks treats a missing result buffer as a failure rather than an empty result.
-        let Some(outcome) = self.results.take_next(id) else {
-            return Ok(Self::fetch_data_result(
-                Self::internal_error(format!("no buffered result for fragment instance {id}")),
-                0,
-                true,
-            )
-            .into());
+        // A result fragment still waiting on its exchange inputs blocks, so wait off the runtime.
+        let results = self.results.clone();
+        let outcome = tokio::task::spawn_blocking(move || results.take_next(id, RESULT_WAIT))
+            .await
+            .unwrap_or_else(|join_err| Err(format!("fetch_data wait task panicked: {join_err}")));
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                return Ok(Self::fetch_data_result(Self::internal_error(err), 0, true).into());
+            }
         };
         match outcome.batch {
             Some(batch) => match batch.to_binary() {
@@ -181,6 +227,33 @@ impl PInternalService for SiriusComputeNodeService {
         };
         Ok(result.into())
     }
+
+    /// Handles the FE's cancel of a failed or finished query. The FE sends one per CN with the
+    /// query id and a dummy instance id, so the whole query is purged. Answers at once: dropping
+    /// parked output waits on the engine thread, which may be running another fragment.
+    #[instrument(skip_all)]
+    async fn cancel_plan_fragment(
+        &self,
+        request: PCancelPlanFragmentRequest,
+        _attachment: Vec<u8>,
+    ) -> Result<crate::prpc::Reply<PCancelPlanFragmentResult>, crate::prpc::Error> {
+        let query = request.query_id.as_ref().map_or_else(
+            || FragmentInstanceId::from(&request.finst_id),
+            FragmentInstanceId::from,
+        );
+        let reason = request
+            .error_message
+            .unwrap_or_else(|| "the FE cancelled the query".to_string());
+        let service = self.clone();
+        tokio::task::spawn_blocking(move || {
+            service.fail_and_purge(query, &format!("query cancelled: {reason}"));
+            service.log_leak_counters("cancel");
+        });
+        Ok(PCancelPlanFragmentResult {
+            status: Self::ok_status(),
+        }
+        .into())
+    }
 }
 
 impl SiriusComputeNodeService {
@@ -196,25 +269,55 @@ impl SiriusComputeNodeService {
         self.process_fragment(&params)
     }
 
-    /// Translates one fragment and, when it is a supported RESULT_SINK root, executes it and
-    /// buffers the rows for later `fetch_data`. Shared by single and batch dispatch so both paths
-    /// produce fetchable results for a RESULT_SINK instance.
+    /// Runs one fragment, or registers it as a receiver that runs once all its exchange senders
+    /// have parked their output. A RESULT_SINK buffers its rows for later `fetch_data`. Shared by
+    /// single and batch dispatch so both paths produce fetchable results for a RESULT_SINK
+    /// instance.
     fn process_fragment(
         &self,
         params: &TExecPlanFragmentParams,
     ) -> std::result::Result<(), String> {
+        let result = self.run_or_register(params);
+        if let Err(err) = &result
+            && let Some(query) = Self::query_id(params)
+        {
+            self.fail_and_purge(query, err);
+        }
+        self.log_leak_counters("fragment");
+        result
+    }
+
+    /// Runs a leaf fragment now, or registers a receiver to run once its senders finish.
+    fn run_or_register(&self, params: &TExecPlanFragmentParams) -> std::result::Result<(), String> {
         let params = self.resolve_descriptor_table(params)?;
         let dump_seq = Self::dump_fragment(&params);
         // Survey mode: accept every fragment so the FE dispatches (and we dump) the whole
         // plan even when translation fails. Queries still fail at fetch_data.
         if std::env::var_os("SIRIUS_CN_TRANSLATE_ONLY").is_some() {
-            if let Err(err) = self.translate_fragment_logged(&params, dump_seq) {
+            if let Err(err) = self.translate_fragment_logged(&params, &[], dump_seq) {
                 tracing::warn!(error = %err, "translate-only mode: accepting untranslatable fragment");
             }
             return Ok(());
         }
-        let translated = self.translate_fragment_logged(&params, dump_seq)?;
-        self.execute_and_buffer(&params, &translated)
+        let expected_senders = Self::receiver_exchanges(&params)?;
+        if !expected_senders.is_empty() {
+            let exec = params
+                .params
+                .as_ref()
+                .ok_or_else(|| "exchange receiver is missing execution params".to_string())?;
+            let id = FragmentInstanceId::from(&exec.fragment_instance_id);
+            let query = FragmentInstanceId::from(&exec.query_id);
+            if Self::is_mysql_result_sink(&params)? {
+                self.results.reserve(id, query);
+            }
+            let ready = self
+                .exchanges
+                .register_receiver(id, expected_senders, params)?;
+            return self.drain_ready(ready.into_iter().collect());
+        }
+        let translated = self.translate_fragment_logged(&params, &[], dump_seq)?;
+        let ready = self.execute_fragment(&params, &translated, Vec::new())?;
+        self.drain_ready(ready)
     }
 
     /// Restores descriptor tables omitted by StarRocks's per-query cache protocol.
@@ -270,24 +373,327 @@ impl SiriusComputeNodeService {
         Some(seq)
     }
 
-    /// Executes a RESULT_SINK fragment and buffers its rows. Non-result-sink fragments (e.g. a
-    /// DATA_STREAM_SINK feeding another fragment) are translate-only. An unsupported result-sink
-    /// format or a missing fragment instance id fails loudly so integration gaps surface as an
-    /// error rather than as a silent empty result at `fetch_data`.
-    fn execute_and_buffer(
+    /// Runs one fragment on `inputs`, its senders' parked output keyed by exchange node id. A
+    /// RESULT_SINK buffers its rows for `fetch_data`; a DATA_STREAM_SINK parks its output for its
+    /// receivers and returns the receivers its output completes. An unsupported sink or a missing
+    /// fragment instance id fails loudly so integration gaps surface as an error rather than as a
+    /// silent empty result at `fetch_data`.
+    fn execute_fragment(
         &self,
         params: &TExecPlanFragmentParams,
         translated: &TranslatedPlan,
-    ) -> std::result::Result<(), String> {
-        if !Self::is_mysql_result_sink(params)? {
-            return Ok(());
+        inputs: Vec<(i32, Vec<SenderSlot>)>,
+    ) -> std::result::Result<Vec<ReadyFragment>, String> {
+        Self::injected_failure()?;
+        if Self::is_mysql_result_sink(params)? {
+            let id = Self::fragment_instance_id(params).ok_or_else(|| {
+                "RESULT_SINK fragment is missing a fragment_instance_id".to_string()
+            })?;
+            let result = self
+                .executor
+                .run_fragment(FragmentRun {
+                    plan: translated,
+                    inputs,
+                    outputs: Vec::new(),
+                    broadcast: false,
+                    hash_keys: Vec::new(),
+                })?
+                .ok_or_else(|| "result fragment returned no rows".to_string())?;
+            let batch = result_encoder::MysqlResultEncoder::encode(&result.batches, 0)?;
+            self.results.insert(id, batch);
+            return Ok(Vec::new());
         }
-        let id = Self::fragment_instance_id(params)
-            .ok_or_else(|| "RESULT_SINK fragment is missing a fragment_instance_id".to_string())?;
-        let result = self.executor.execute(translated)?;
-        let batch = result_encoder::MysqlResultEncoder::encode(&result.batches, 0)?;
-        self.results.insert(id, batch);
-        Ok(())
+
+        // Fail closed: without a sink nothing parks for its receiver, which would wait forever.
+        let sink = params
+            .fragment
+            .as_ref()
+            .and_then(|fragment| fragment.output_sink.as_ref())
+            .ok_or_else(|| "fragment carries no output sink".to_string())?;
+        if sink.type_ != TDataSinkType::DATA_STREAM_SINK {
+            return Err(format!("output sink {:?} is not supported", sink.type_));
+        }
+        let stream_sink = sink.stream_sink.as_ref().ok_or_else(|| {
+            "DATA_STREAM_SINK fragment carries no stream_sink payload".to_string()
+        })?;
+        if stream_sink.limit.is_some_and(|limit| limit >= 0) {
+            return Err("data stream sink limits are not supported".to_string());
+        }
+        let exec = params
+            .params
+            .as_ref()
+            .ok_or_else(|| "DATA_STREAM_SINK fragment is missing execution params".to_string())?;
+        let destinations = exec
+            .destinations
+            .as_deref()
+            .filter(|destinations| !destinations.is_empty())
+            .ok_or_else(|| "DATA_STREAM_SINK fragment has no destinations".to_string())?;
+        let (broadcast, hash_keys) = Self::sink_mode(
+            stream_sink.output_partition.type_,
+            destinations.len(),
+            translated.output_partition_columns.as_ref(),
+        )?;
+
+        // Every sender of an exchange must be told apart; defaulting would collide at push time,
+        // after the fragment already ran and parked.
+        let sender_id = exec
+            .sender_id
+            .ok_or_else(|| "DATA_STREAM_SINK fragment is missing sender_id".to_string())?;
+        let mut outputs = Vec::with_capacity(destinations.len());
+        for destination in destinations {
+            // Checked before running so a remote destination leaves no output parked.
+            self.ensure_local(destination)?;
+            outputs.push(SenderSlot {
+                fragment_instance_id: FragmentInstanceId::from(&destination.fragment_instance_id),
+                node_id: stream_sink.dest_node_id,
+                sender_id,
+            });
+        }
+        self.executor.run_fragment(FragmentRun {
+            plan: translated,
+            inputs,
+            outputs: outputs.clone(),
+            broadcast,
+            hash_keys,
+        })?;
+
+        let mut ready = Vec::new();
+        for (index, &slot) in outputs.iter().enumerate() {
+            let key = ExchangeKey {
+                fragment_instance_id: slot.fragment_instance_id,
+                node_id: slot.node_id,
+            };
+            let source = SenderSource::LocalParked {
+                names: translated.output_names.clone(),
+                slot,
+            };
+            // A refused source is not kept (its query was purged, say), so this slot and the
+            // ones not yet handed over are dropped here or they stay parked.
+            match self.exchanges.push_sender(key, sender_id, source) {
+                Ok(completed) => ready.extend(completed),
+                Err(err) => {
+                    for &unpushed in &outputs[index..] {
+                        let _ = self.executor.drop_parked(unpushed);
+                    }
+                    // Receivers this sender already completed were handed over, so a purge no
+                    // longer reaches them: free their inputs here, since they will not run.
+                    for completed in &ready {
+                        drop(self.ready_inputs_guard(completed));
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        Ok(ready)
+    }
+
+    /// How a sink to `destinations` fans out: whether it broadcasts, and its hash key columns
+    /// (empty unless hash-partitioned). One destination is a gather whatever the partition type.
+    /// The translator has already refused hash keys that are not bare slot refs.
+    fn sink_mode(
+        partition: TPartitionType,
+        destinations: usize,
+        partition_columns: Option<&Vec<usize>>,
+    ) -> std::result::Result<(bool, Vec<usize>), String> {
+        let hash_keys = match partition {
+            _ if destinations == 1 => Vec::new(),
+            TPartitionType::UNPARTITIONED => Vec::new(),
+            TPartitionType::HASH_PARTITIONED => partition_columns.cloned().ok_or_else(|| {
+                "a hash-partitioned data stream sink translated without partition key columns"
+                    .to_string()
+            })?,
+            other => {
+                return Err(format!(
+                    "a data stream sink with {destinations} destinations carries partition type \
+                     {other:?}, which this CN does not support"
+                ));
+            }
+        };
+        Ok((destinations > 1 && hash_keys.is_empty(), hash_keys))
+    }
+
+    /// Errors unless `destination` is this CN: this build has no cross-node transport.
+    fn ensure_local(
+        &self,
+        destination: &TPlanFragmentDestination,
+    ) -> std::result::Result<(), String> {
+        let id = FragmentInstanceId::from(&destination.fragment_instance_id);
+        match &destination.brpc_server {
+            Some(address) if *address == self.brpc_address => Ok(()),
+            Some(address) => Err(format!(
+                "DATA_STREAM_SINK destination {}:{} for fragment instance {id} is remote; no \
+                 cross-node transport in this build",
+                address.hostname, address.port
+            )),
+            None => Err(format!(
+                "DATA_STREAM_SINK destination for fragment instance {id} has no brpc_server address"
+            )),
+        }
+    }
+
+    /// Runs receivers whose sender sets completed, then the receivers their outputs complete. A
+    /// failure also fails the query's waiting result slot, so `fetch_data` reports it at once.
+    /// One failed receiver does not stop the rest, whose parked inputs would otherwise never be
+    /// released; the first error is returned.
+    fn drain_ready(&self, mut queue: Vec<ReadyFragment>) -> std::result::Result<(), String> {
+        let mut first_error = None;
+        while let Some(ready) = queue.pop() {
+            let query = ready
+                .params
+                .params
+                .as_ref()
+                .map(|exec| FragmentInstanceId::from(&exec.query_id));
+            match self.execute_ready_fragment(ready) {
+                Ok(next) => queue.extend(next),
+                Err(err) => {
+                    if let Some(query) = query {
+                        self.fail_and_purge(query, &err);
+                    }
+                    first_error.get_or_insert(err);
+                }
+            }
+        }
+        self.log_leak_counters("receivers");
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// Fails `query` on this CN: its waiting result slots report `error`, and everything the
+    /// exchange still holds for it is freed. Without this a failed query's receivers wait forever
+    /// on senders that never finish, pinning their parked output in GPU memory for the life of
+    /// the process. Idempotent; a late fragment or frame of the query is refused.
+    fn fail_and_purge(&self, query: FragmentInstanceId, error: &str) {
+        self.results.fail_query(query, error);
+        let purged = self.exchanges.purge_query(query, error);
+        for &slot in &purged.slots {
+            if let Err(err) = self.executor.drop_parked(slot) {
+                warn!(?slot, error = %err, "failed to drop a purged query's parked output");
+            }
+        }
+        info!(
+            %query,
+            remote_batches = purged.tokens.len(),
+            dropped_parked = purged.slots.len(),
+            error,
+            "purged a failed query's exchange state"
+        );
+    }
+
+    /// Logs what this CN still holds across queries. Every count is zero on an idle CN; one that
+    /// stays non-zero between queries is leaked GPU memory.
+    fn log_leak_counters(&self, event: &str) {
+        let exchange = self.exchanges.counts();
+        info!(
+            event,
+            receivers = exchange.receivers,
+            parked_senders = exchange.parked_senders,
+            remote_batches = exchange.remote_batches,
+            parked_fragments = self.executor.parked_fragments(),
+            "leak counters"
+        );
+    }
+
+    /// Translates a ready receiver against its senders' output names and runs it on their
+    /// parked output.
+    fn execute_ready_fragment(
+        &self,
+        ready: ReadyFragment,
+    ) -> std::result::Result<Vec<ReadyFragment>, String> {
+        let mut guard = self.ready_inputs_guard(&ready);
+        let exchange_inputs = Self::exchange_inputs(&ready.inputs)?;
+        let inputs = ready
+            .inputs
+            .into_iter()
+            .map(|input| {
+                let slots = input
+                    .sources
+                    .into_iter()
+                    .map(|source| match source {
+                        SenderSource::LocalParked { slot, .. } => Ok(slot),
+                        SenderSource::Remote { sender_id, .. } => Err(format!(
+                            "exchange node {} has remote sender {sender_id}; no cross-node \
+                             transport in this build",
+                            input.node_id
+                        )),
+                    })
+                    .collect::<std::result::Result<Vec<_>, String>>()?;
+                Ok((input.node_id, slots))
+            })
+            .collect::<std::result::Result<Vec<_>, String>>()?;
+        let dump_seq = Self::dump_fragment(&ready.params);
+        let translated =
+            self.translate_fragment_logged(&ready.params, &exchange_inputs, dump_seq)?;
+        let next = self.execute_fragment(&ready.params, &translated, inputs)?;
+        // The engine relayed every parked input and released it.
+        guard.slots.clear();
+        Ok(next)
+    }
+
+    /// Binds each exchange to its senders' output names, which must agree across senders.
+    fn exchange_inputs(
+        inputs: &[ReadyExchangeInput],
+    ) -> std::result::Result<Vec<ExchangeInput>, String> {
+        inputs
+            .iter()
+            .map(|input| {
+                let names = input
+                    .sources
+                    .first()
+                    .map(|source| source.names().to_vec())
+                    .ok_or_else(|| {
+                        format!("exchange node {} has no sender source", input.node_id)
+                    })?;
+                if input
+                    .sources
+                    .iter()
+                    .any(|source| source.names() != names.as_slice())
+                {
+                    return Err(format!(
+                        "exchange node {} senders produced different output names",
+                        input.node_id
+                    ));
+                }
+                Ok(ExchangeInput {
+                    node_id: input.node_id,
+                    stream_view: format!("sirius_stream_{}", input.node_id),
+                    names,
+                })
+            })
+            .collect()
+    }
+
+    /// The sender count of every `EXCHANGE_NODE` in the fragment; empty for a leaf fragment.
+    fn receiver_exchanges(
+        params: &TExecPlanFragmentParams,
+    ) -> std::result::Result<Vec<(i32, usize)>, String> {
+        let exchange_nodes = params
+            .fragment
+            .as_ref()
+            .and_then(|fragment| fragment.plan.as_ref())
+            .map(|plan| {
+                plan.nodes
+                    .iter()
+                    .filter(|node| node.node_type == TPlanNodeType::EXCHANGE_NODE)
+                    .map(|node| node.node_id)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        exchange_nodes
+            .into_iter()
+            .map(|node_id| {
+                let expected = params
+                    .params
+                    .as_ref()
+                    .and_then(|exec| exec.per_exch_num_senders.get(&node_id))
+                    .copied()
+                    .ok_or_else(|| {
+                        format!("EXCHANGE_NODE {node_id} is missing per_exch_num_senders")
+                    })?;
+                let expected = usize::try_from(expected).map_err(|_| {
+                    format!("EXCHANGE_NODE {node_id} has negative sender count {expected}")
+                })?;
+                Ok((node_id, expected))
+            })
+            .collect()
     }
 
     /// Deserializes a FE batch attachment and merges common params into each instance.
@@ -335,17 +741,18 @@ impl SiriusComputeNodeService {
         Ok(())
     }
 
-    /// Converts a StarRocks thrift plan fragment to Substrait, logs its protobuf debug output, and
-    /// returns the translated plan for execution.
+    /// Converts a StarRocks thrift plan fragment to Substrait, with each exchange in `inputs` read
+    /// as a stream, logs its protobuf debug output, and returns the translated plan for execution.
     #[instrument(skip_all)]
     fn translate_fragment_logged(
         &self,
         params: &TExecPlanFragmentParams,
+        inputs: &[ExchangeInput],
         dump_seq: Option<u64>,
     ) -> std::result::Result<TranslatedPlan, String> {
         let translated = self
             .translator
-            .translate_fragment(params)
+            .translate_fragment_with_exchange_inputs(params, inputs)
             .map_err(|err| err.to_string())?;
         info!(
             output_names = ?translated.output_names,
@@ -372,8 +779,8 @@ impl SiriusComputeNodeService {
     }
 
     /// Classifies the fragment output sink: `Ok(true)` for a MySQL text-protocol RESULT_SINK this
-    /// CN can encode, `Ok(false)` for a non-result sink (translate-only), and `Err` for a
-    /// RESULT_SINK whose format is not supported yet (binary rows, HTTP/FILE/Arrow Flight, etc.).
+    /// CN can encode, `Ok(false)` for a non-result sink, and `Err` for a RESULT_SINK whose format
+    /// is not supported yet (binary rows, HTTP/FILE/Arrow Flight, etc.).
     /// The encoder only emits MySQL text rows, so other result-sink formats must be rejected
     /// rather than returned in the wrong wire format.
     fn is_mysql_result_sink(params: &TExecPlanFragmentParams) -> std::result::Result<bool, String> {
@@ -398,6 +805,27 @@ impl SiriusComputeNodeService {
             None | Some(TResultSinkType::MYSQL_PROTOCAL) => Ok(true),
             Some(other) => Err(format!("result sink type {other:?} is not supported yet")),
         }
+    }
+
+    /// Test hook: once the file `SIRIUS_CN_FAIL_ONCE_FILE` names appears, the next fragment any
+    /// CN sharing that path runs fails, before the engine sees it. Removing the file claims the
+    /// failure, so exactly one fragment fails per `touch`: an e2e script can fail one query
+    /// partway through and check that nothing it held outlives it.
+    fn injected_failure() -> std::result::Result<(), String> {
+        match std::env::var_os("SIRIUS_CN_FAIL_ONCE_FILE") {
+            Some(path) if std::fs::remove_file(&path).is_ok() => {
+                Err("injected fragment failure (SIRIUS_CN_FAIL_ONCE_FILE)".to_string())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// The query a fragment belongs to.
+    fn query_id(params: &TExecPlanFragmentParams) -> Option<FragmentInstanceId> {
+        params
+            .params
+            .as_ref()
+            .map(|exec| FragmentInstanceId::from(&exec.query_id))
     }
 
     /// Extracts the fragment instance id the FE later passes to `fetch_data`.
@@ -481,8 +909,7 @@ impl SiriusComputeNodeService {
         }
     }
 
-    /// StarRocks OK status. For these RPCs OK means "fragment accepted and translated", not
-    /// "fragment executed" — execution and result delivery are not implemented yet.
+    /// StarRocks OK status.
     fn ok_status() -> StatusPb {
         StatusPb {
             status_code: TStatusCode::OK.0,
@@ -499,6 +926,40 @@ impl SiriusComputeNodeService {
     }
 }
 
+impl SiriusComputeNodeService {
+    /// A guard over `ready`'s parked inputs, which it frees unless disarmed.
+    fn ready_inputs_guard(&self, ready: &ReadyFragment) -> ReadyInputsGuard {
+        ReadyInputsGuard {
+            executor: Arc::clone(&self.executor),
+            slots: ready
+                .inputs
+                .iter()
+                .flat_map(|input| &input.sources)
+                .filter_map(|source| match source {
+                    SenderSource::LocalParked { slot, .. } => Some(*slot),
+                    SenderSource::Remote { .. } => None,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Frees a ready receiver's parked inputs when dropped, whichever step failed: translation, a
+/// pre-run check, or the engine run itself. They are released unless the run succeeded (and so
+/// relayed them); one the engine already released just errors.
+struct ReadyInputsGuard {
+    executor: Arc<dyn FragmentExecutor>,
+    slots: Vec<SenderSlot>,
+}
+
+impl Drop for ReadyInputsGuard {
+    fn drop(&mut self) {
+        for &slot in &self.slots {
+            let _ = self.executor.drop_parked(slot);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -506,11 +967,11 @@ mod tests {
     use prost::Message;
     use starrocks_thrift::{
         data::TResultBatch,
-        data_sinks::{TDataSink, TResultSink},
+        data_sinks::{TDataSink, TDataStreamSink, TResultSink},
         descriptors::{TDescriptorTable, TSlotDescriptor, TTableDescriptor, TTupleDescriptor},
         internal_service::{InternalServiceVersion, TPlanFragmentExecParams},
         partitions::{TDataPartition, TPartitionType},
-        plan_nodes::{TFileScanNode, TPlan, TPlanNode, TPlanNodeType},
+        plan_nodes::{TExchangeNode, TFileScanNode, TPlan, TPlanNode, TPlanNodeType},
         planner::TPlanFragment,
         types::{
             TPrimitiveType, TScalarType, TTableType, TTypeDesc, TTypeNode, TTypeNodeType, TUniqueId,
@@ -521,12 +982,31 @@ mod tests {
 
     use super::*;
     use crate::{
+        fragment_executor::FragmentResult,
+        local_exchange::{ExchangeCounts, RemoteBatch, RemoteFrame},
         proto::starrocks::{
             PFetchDataRequest, PUniqueId,
             p_internal_service_brpc::{PInternalServiceRouter, SERVICE_NAME, methods},
         },
         prpc,
     };
+
+    /// Runs leaf fragments like the stub but fails every fragment fed by an exchange.
+    #[derive(Debug)]
+    struct FailingReceivers;
+
+    impl FragmentExecutor for FailingReceivers {
+        fn execute(&self, translated: &TranslatedPlan) -> Result<FragmentResult, String> {
+            StubExecutor.execute(translated)
+        }
+
+        fn run_fragment(&self, run: FragmentRun<'_>) -> Result<Option<FragmentResult>, String> {
+            if run.inputs.is_empty() {
+                return StubExecutor.run_fragment(run);
+            }
+            Err("receiver exploded".to_string())
+        }
+    }
 
     #[test]
     fn exec_plan_fragment_translates_supported_scan() {
@@ -584,10 +1064,20 @@ mod tests {
         // with per-instance fragments carrying only their scan plan.
         let batch = TExecBatchPlanFragmentsParams::new(
             Some(fragment_params(None, Some(tpch_desc_table()))),
-            Some(vec![
-                fragment_params(Some(scan_plan(0, 0)), None),
-                fragment_params(Some(scan_plan(1, 1)), None),
-            ]),
+            Some(
+                [(0, 0, 3), (1, 1, 4)]
+                    .map(|(scan_node_id, tuple_id, instance)| {
+                        let mut root =
+                            fragment_params(Some(scan_plan(scan_node_id, tuple_id)), None);
+                        root.fragment.as_mut().unwrap().output_sink = Some(result_sink());
+                        root.params = Some(exec_params(
+                            TUniqueId::new(0, 1),
+                            TUniqueId::new(0, instance),
+                        ));
+                        root
+                    })
+                    .to_vec(),
+            ),
         );
         let result = call_exec_batch_plan_fragments(
             PExecBatchPlanFragmentsRequest {
@@ -796,6 +1286,574 @@ mod tests {
         );
     }
 
+    #[test]
+    fn receiver_runs_once_its_local_sender_parks() {
+        // Receiver-first, as the FE dispatches: the RESULT_SINK receiver waits, then a leaf
+        // DATA_STREAM_SINK completes its sender set and the result becomes fetchable.
+        let service = SiriusComputeNodeService::new();
+        let mut receiver = query_fragment(8, 10, exchange_plan_node(2, 0), result_sink());
+        expect_senders(&mut receiver, 2, 1);
+        exec_ok(&service, &receiver);
+        let mut sender = query_fragment(8, 11, scan_node(0, 0), stream_sink(2));
+        send_to(&mut sender, 10, 8060);
+        exec_ok(&service, &sender);
+
+        let fetched = route(
+            &service,
+            methods::FETCH_DATA,
+            fetch_request(8, 10),
+            Vec::new(),
+        );
+        let fetched_result = PFetchDataResult::decode(fetched.body.as_slice()).unwrap();
+        assert_eq!(fetched_result.status.status_code, TStatusCode::OK.0);
+        assert_eq!(fetched_result.eos, Some(false));
+        let batch =
+            SiriusComputeNodeService::deserialize_binary::<TResultBatch>(&fetched.attachment)
+                .unwrap();
+        assert_eq!(batch.rows.len(), 1);
+    }
+
+    #[test]
+    fn remote_stream_sink_destination_is_an_error() {
+        let service = SiriusComputeNodeService::new();
+        let mut sender = query_fragment(9, 11, scan_node(0, 0), stream_sink(2));
+        send_to(&mut sender, 10, 18060);
+        let status = exec(&service, &sender);
+        assert_eq!(status.status_code, TStatusCode::INTERNAL_ERROR.0);
+        assert!(
+            status.error_msgs[0].contains("no cross-node transport"),
+            "{:?}",
+            status.error_msgs
+        );
+    }
+
+    #[test]
+    fn failed_intermediate_fragment_fails_the_waiting_result() {
+        // leaf -> merge -> result on one CN. The merge fails once its sender completes it, and the
+        // result's fetch_data reports that error instead of waiting for rows.
+        let service = SiriusComputeNodeService::with_executor(
+            Arc::new(FailingReceivers),
+            &ComputeNodeConfig::default(),
+        );
+        let mut result = query_fragment(10, 10, exchange_plan_node(2, 0), result_sink());
+        expect_senders(&mut result, 2, 1);
+        exec_ok(&service, &result);
+        let mut merge = query_fragment(10, 11, exchange_plan_node(3, 0), stream_sink(2));
+        expect_senders(&mut merge, 3, 1);
+        send_to(&mut merge, 10, 8060);
+        exec_ok(&service, &merge);
+        let mut leaf = query_fragment(10, 12, scan_node(0, 0), stream_sink(3));
+        send_to(&mut leaf, 11, 8060);
+        assert_eq!(
+            exec(&service, &leaf).status_code,
+            TStatusCode::INTERNAL_ERROR.0
+        );
+
+        let fetched = route(
+            &service,
+            methods::FETCH_DATA,
+            fetch_request(10, 10),
+            Vec::new(),
+        );
+        let fetched = PFetchDataResult::decode(fetched.body.as_slice()).unwrap();
+        assert_eq!(fetched.status.status_code, TStatusCode::INTERNAL_ERROR.0);
+        assert!(
+            fetched.status.error_msgs[0].contains("receiver exploded"),
+            "{:?}",
+            fetched.status.error_msgs
+        );
+    }
+
+    #[test]
+    fn failed_receiver_registration_fails_the_waiting_result() {
+        // A repeated dispatch of a waiting result fragment is refused, and fetch_data reports that
+        // at once instead of waiting out RESULT_WAIT.
+        let service = SiriusComputeNodeService::new();
+        let mut result = query_fragment(11, 10, exchange_plan_node(2, 0), result_sink());
+        expect_senders(&mut result, 2, 1);
+        exec_ok(&service, &result);
+        assert_eq!(
+            exec(&service, &result).status_code,
+            TStatusCode::INTERNAL_ERROR.0
+        );
+
+        let fetched = route(
+            &service,
+            methods::FETCH_DATA,
+            fetch_request(11, 10),
+            Vec::new(),
+        );
+        let fetched = PFetchDataResult::decode(fetched.body.as_slice()).unwrap();
+        assert!(
+            fetched.status.error_msgs[0].contains("duplicate receiver registration"),
+            "{:?}",
+            fetched.status.error_msgs
+        );
+    }
+
+    /// Runs fragments like the stub and records the parked output the service drops.
+    #[derive(Debug, Default)]
+    struct RecordingExecutor {
+        dropped: Mutex<Vec<SenderSlot>>,
+    }
+
+    impl FragmentExecutor for RecordingExecutor {
+        fn execute(&self, translated: &TranslatedPlan) -> Result<FragmentResult, String> {
+            StubExecutor.execute(translated)
+        }
+
+        fn drop_parked(&self, slot: SenderSlot) -> Result<(), String> {
+            self.dropped.lock().unwrap().push(slot);
+            Ok(())
+        }
+    }
+
+    fn recording_service() -> (SiriusComputeNodeService, Arc<RecordingExecutor>) {
+        let executor = Arc::new(RecordingExecutor::default());
+        let service = SiriusComputeNodeService::with_executor(
+            executor.clone(),
+            &ComputeNodeConfig::default(),
+        );
+        (service, executor)
+    }
+
+    fn cancel(service: &SiriusComputeNodeService, query: i64) -> StatusPb {
+        // As the FE sends it: the query id, and a dummy instance id.
+        let request = PCancelPlanFragmentRequest {
+            finst_id: PUniqueId { hi: 0, lo: 0 },
+            cancel_reason: None,
+            is_pipeline: Some(true),
+            query_id: Some(PUniqueId { hi: query, lo: 0 }),
+            error_message: Some("injected".to_string()),
+        };
+        let response = route(
+            service,
+            methods::CANCEL_PLAN_FRAGMENT,
+            request.encode_to_vec(),
+            Vec::new(),
+        );
+        PCancelPlanFragmentResult::decode(response.body.as_slice())
+            .unwrap()
+            .status
+    }
+
+    fn fetch_error(service: &SiriusComputeNodeService, query: i64, instance: i64) -> String {
+        let fetched = route(
+            service,
+            methods::FETCH_DATA,
+            fetch_request(query, instance),
+            Vec::new(),
+        );
+        let fetched = PFetchDataResult::decode(fetched.body.as_slice()).unwrap();
+        assert_eq!(fetched.status.status_code, TStatusCode::INTERNAL_ERROR.0);
+        fetched.status.error_msgs.join("; ")
+    }
+
+    /// Waits for `cancel_plan_fragment`'s purge, which runs off the BRPC task.
+    fn wait_until_purged(service: &SiriusComputeNodeService) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while service.exchanges.counts() != ExchangeCounts::default() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cancel never purged the query"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn cancel_purges_the_query_and_frees_what_it_held() {
+        // A receiver waiting on two senders has one sender's output parked when the FE cancels.
+        let (service, executor) = recording_service();
+        let mut result = query_fragment(15, 10, exchange_plan_node(2, 0), result_sink());
+        expect_senders(&mut result, 2, 2);
+        exec_ok(&service, &result);
+        let mut parked = query_fragment(15, 11, scan_node(0, 0), stream_sink(2));
+        send_to(&mut parked, 10, 8060);
+        exec_ok(&service, &parked);
+        assert_eq!(service.exchanges.counts().parked_senders, 1);
+
+        assert_eq!(cancel(&service, 15).status_code, TStatusCode::OK.0);
+        wait_until_purged(&service);
+        let slot = SenderSlot {
+            fragment_instance_id: FragmentInstanceId::from_halves(15, 10),
+            node_id: 2,
+            sender_id: 0,
+        };
+        assert_eq!(*executor.dropped.lock().unwrap(), [slot]);
+        assert!(fetch_error(&service, 15, 10).contains("injected"));
+
+        // A sender that arrives after the cancel is refused and its output dropped.
+        let mut late = query_fragment(15, 12, scan_node(0, 0), stream_sink(2));
+        send_to(&mut late, 10, 8060);
+        let status = exec(&service, &late);
+        assert!(
+            status.error_msgs[0].contains("already failed: query cancelled: injected"),
+            "{status:?}"
+        );
+        assert_eq!(*executor.dropped.lock().unwrap(), [slot, slot]);
+        // A repeated cancel, one per CN instance, is harmless.
+        assert_eq!(cancel(&service, 15).status_code, TStatusCode::OK.0);
+    }
+
+    #[test]
+    fn a_failed_fragment_purges_its_query_on_this_cn() {
+        // One sender has parked its output for the waiting result when another fragment of the
+        // same query fails: the parked output is dropped, not left waiting forever.
+        let (service, executor) = recording_service();
+        let mut result = query_fragment(16, 10, exchange_plan_node(2, 0), result_sink());
+        expect_senders(&mut result, 2, 2);
+        exec_ok(&service, &result);
+        let mut parked = query_fragment(16, 11, scan_node(0, 0), stream_sink(2));
+        send_to(&mut parked, 10, 8060);
+        exec_ok(&service, &parked);
+        assert_eq!(service.exchanges.counts().parked_senders, 1);
+
+        let mut failing = query_fragment(16, 12, scan_node(0, 0), stream_sink(2));
+        send_to(&mut failing, 10, 18060);
+        assert_eq!(
+            exec(&service, &failing).status_code,
+            TStatusCode::INTERNAL_ERROR.0
+        );
+        let slot = SenderSlot {
+            fragment_instance_id: FragmentInstanceId::from_halves(16, 10),
+            node_id: 2,
+            sender_id: 0,
+        };
+        assert_eq!(*executor.dropped.lock().unwrap(), [slot]);
+        assert_eq!(service.exchanges.counts(), ExchangeCounts::default());
+        assert!(fetch_error(&service, 16, 10).contains("is remote"));
+    }
+
+    #[test]
+    fn a_receiver_that_fails_before_running_frees_its_parked_inputs() {
+        // One sender is remote, which this build cannot read, so the ready receiver fails before
+        // the engine ever takes its local sender's parked output.
+        let (service, executor) = recording_service();
+        let mut result = query_fragment(17, 10, exchange_plan_node(2, 0), result_sink());
+        expect_senders(&mut result, 2, 2);
+        exec_ok(&service, &result);
+        let key = ExchangeKey {
+            fragment_instance_id: FragmentInstanceId::from_halves(17, 10),
+            node_id: 2,
+        };
+        let batch = RemoteBatch { token: 5, rows: 1 };
+        let frame = service
+            .exchanges
+            .push_remote_frame(key, 1, 0, true, vec!["c0".to_string()], Some(batch))
+            .unwrap();
+        assert!(matches!(frame, RemoteFrame::Accepted(None)));
+
+        let mut local = query_fragment(17, 11, scan_node(0, 0), stream_sink(2));
+        send_to(&mut local, 10, 8060);
+        assert_eq!(
+            exec(&service, &local).status_code,
+            TStatusCode::INTERNAL_ERROR.0
+        );
+        let parked = SenderSlot {
+            fragment_instance_id: key.fragment_instance_id,
+            node_id: 2,
+            sender_id: 0,
+        };
+        assert_eq!(*executor.dropped.lock().unwrap(), [parked]);
+        assert_eq!(service.exchanges.counts(), ExchangeCounts::default());
+    }
+
+    #[test]
+    fn sink_mode_follows_destinations_and_partition_type() {
+        let keys = vec![1];
+        let mode = |partition, destinations| {
+            SiriusComputeNodeService::sink_mode(partition, destinations, Some(&keys))
+        };
+        assert_eq!(
+            mode(TPartitionType::HASH_PARTITIONED, 1),
+            Ok((false, Vec::new())),
+            "one destination is a gather"
+        );
+        assert_eq!(
+            mode(TPartitionType::UNPARTITIONED, 2),
+            Ok((true, Vec::new()))
+        );
+        assert_eq!(
+            mode(TPartitionType::HASH_PARTITIONED, 2),
+            Ok((false, vec![1]))
+        );
+        let err = mode(TPartitionType::RANDOM, 2).unwrap_err();
+        assert!(err.contains("does not support"), "{err}");
+        let err = SiriusComputeNodeService::sink_mode(TPartitionType::HASH_PARTITIONED, 2, None)
+            .unwrap_err();
+        assert!(err.contains("without partition key columns"), "{err}");
+    }
+
+    /// Fails receivers fed by instance `failing`'s exchange, and records every receiver it runs.
+    #[derive(Debug)]
+    struct FailingInstance {
+        failing: FragmentInstanceId,
+        ran: Mutex<Vec<FragmentInstanceId>>,
+    }
+
+    impl FragmentExecutor for FailingInstance {
+        fn execute(&self, translated: &TranslatedPlan) -> Result<FragmentResult, String> {
+            StubExecutor.execute(translated)
+        }
+
+        fn run_fragment(&self, run: FragmentRun<'_>) -> Result<Option<FragmentResult>, String> {
+            let Some(receiver) = run
+                .inputs
+                .iter()
+                .flat_map(|(_, slots)| slots)
+                .map(|slot| slot.fragment_instance_id)
+                .next()
+            else {
+                return StubExecutor.run_fragment(run);
+            };
+            self.ran.lock().unwrap().push(receiver);
+            if receiver == self.failing {
+                return Err("receiver exploded".to_string());
+            }
+            StubExecutor.run_fragment(run)
+        }
+    }
+
+    /// Makes `params` sender 0 of the given fragment instances of its query, all on this CN.
+    fn send_to_all(params: &mut TExecPlanFragmentParams, instances: &[i64]) {
+        let exec = params.params.as_mut().unwrap();
+        exec.sender_id = Some(0);
+        exec.destinations = Some(
+            instances
+                .iter()
+                .map(|&instance| {
+                    TPlanFragmentDestination::new(
+                        TUniqueId::new(exec.query_id.hi, instance),
+                        None,
+                        Some(TNetworkAddress::new("127.0.0.1".to_string(), 8060)),
+                        None,
+                    )
+                })
+                .collect(),
+        );
+    }
+
+    /// One sender completes two receivers and the first to run fails: the other still runs.
+    #[test]
+    fn drain_ready_runs_every_receiver_past_a_failed_one() {
+        let executor = Arc::new(FailingInstance {
+            failing: FragmentInstanceId::from_halves(19, 11),
+            ran: Mutex::default(),
+        });
+        let service = SiriusComputeNodeService::with_executor(
+            executor.clone(),
+            &ComputeNodeConfig::default(),
+        );
+        for instance in [10, 11] {
+            let mut receiver =
+                query_fragment(19, instance, exchange_plan_node(2, 0), result_sink());
+            expect_senders(&mut receiver, 2, 1);
+            exec_ok(&service, &receiver);
+        }
+        let mut sender = query_fragment(19, 12, scan_node(0, 0), stream_sink(2));
+        send_to_all(&mut sender, &[10, 11]);
+        assert_eq!(
+            exec(&service, &sender).status_code,
+            TStatusCode::INTERNAL_ERROR.0
+        );
+        let ran = executor.ran.lock().unwrap();
+        assert_eq!(
+            *ran,
+            [
+                FragmentInstanceId::from_halves(19, 11),
+                FragmentInstanceId::from_halves(19, 10)
+            ]
+        );
+    }
+
+    /// A sender that completes one receiver and is then refused by another frees the completed
+    /// receiver's inputs: it was handed over, so the query's purge cannot reach it.
+    #[test]
+    fn a_refused_push_frees_receivers_it_already_completed() {
+        let (service, executor) = recording_service();
+        let mut completed = query_fragment(18, 10, exchange_plan_node(2, 0), result_sink());
+        expect_senders(&mut completed, 2, 1);
+        exec_ok(&service, &completed);
+        let mut waiting = query_fragment(18, 11, exchange_plan_node(2, 0), result_sink());
+        expect_senders(&mut waiting, 2, 2);
+        exec_ok(&service, &waiting);
+        let mut first = query_fragment(18, 12, scan_node(0, 0), stream_sink(2));
+        send_to(&mut first, 11, 8060);
+        exec_ok(&service, &first);
+
+        // Sender 0 again: it completes instance 10, then collides at instance 11.
+        let mut second = query_fragment(18, 13, scan_node(0, 0), stream_sink(2));
+        send_to_all(&mut second, &[10, 11]);
+        let status = exec(&service, &second);
+        assert!(
+            status.error_msgs[0].contains("duplicate sender 0"),
+            "{status:?}"
+        );
+        let completed = SenderSlot {
+            fragment_instance_id: FragmentInstanceId::from_halves(18, 10),
+            node_id: 2,
+            sender_id: 0,
+        };
+        assert!(
+            executor.dropped.lock().unwrap().contains(&completed),
+            "{:?}",
+            executor.dropped.lock().unwrap()
+        );
+        assert_eq!(service.exchanges.counts(), ExchangeCounts::default());
+    }
+
+    /// A data stream sink without `sender_id` is refused before it runs, and a fragment without
+    /// any output sink is refused rather than accepted with nothing reading its output.
+    #[test]
+    fn a_sender_without_sender_id_or_sink_is_refused() {
+        let service = SiriusComputeNodeService::new();
+        let mut sender = query_fragment(20, 11, scan_node(0, 0), stream_sink(2));
+        send_to(&mut sender, 10, 8060);
+        sender.params.as_mut().unwrap().sender_id = None;
+        let status = exec(&service, &sender);
+        assert!(
+            status.error_msgs[0].contains("missing sender_id"),
+            "{status:?}"
+        );
+
+        let mut sinkless = query_fragment(20, 12, scan_node(0, 0), stream_sink(2));
+        sinkless.fragment.as_mut().unwrap().output_sink = None;
+        let status = exec(&service, &sinkless);
+        assert!(
+            status.error_msgs[0].contains("no output sink"),
+            "{status:?}"
+        );
+    }
+
+    /// Fragment instance `instance` of query `query`: one plan node feeding `sink`.
+    fn query_fragment(
+        query: i64,
+        instance: i64,
+        node: TPlanNode,
+        sink: TDataSink,
+    ) -> TExecPlanFragmentParams {
+        let mut params = fragment_params(Some(TPlan::new(vec![node])), Some(desc_table()));
+        params.fragment.as_mut().unwrap().output_sink = Some(sink);
+        params.params = Some(exec_params(
+            TUniqueId::new(query, 0),
+            TUniqueId::new(query, instance),
+        ));
+        params
+    }
+
+    fn expect_senders(params: &mut TExecPlanFragmentParams, node_id: i32, senders: i32) {
+        params
+            .params
+            .as_mut()
+            .unwrap()
+            .per_exch_num_senders
+            .insert(node_id, senders);
+    }
+
+    /// The FE sends sink destinations by IP, so a CN advertised by hostname must still see a
+    /// destination at its own resolved IP as local.
+    #[test]
+    fn hostname_advertised_cn_matches_its_ip_destination() {
+        assert_eq!(resolve_ip("127.0.0.1"), "127.0.0.1");
+        let config = ComputeNodeConfig {
+            advertise_host: crate::Host::new("localhost").unwrap(),
+            ..ComputeNodeConfig::default()
+        };
+        let service = SiriusComputeNodeService::with_executor(Arc::new(StubExecutor), &config);
+        let destination = TPlanFragmentDestination::new(
+            TUniqueId::new(1, 2),
+            None,
+            Some(TNetworkAddress::new(
+                "127.0.0.1".to_string(),
+                i32::from(config.brpc_port),
+            )),
+            None,
+        );
+        assert_eq!(service.ensure_local(&destination), Ok(()));
+    }
+
+    /// Makes `params` sender 0 of fragment instance `instance` of its query, served on `port`.
+    fn send_to(params: &mut TExecPlanFragmentParams, instance: i64, port: i32) {
+        let exec = params.params.as_mut().unwrap();
+        exec.sender_id = Some(0);
+        exec.destinations = Some(vec![TPlanFragmentDestination::new(
+            TUniqueId::new(exec.query_id.hi, instance),
+            None,
+            Some(TNetworkAddress::new("127.0.0.1".to_string(), port)),
+            None,
+        )]);
+    }
+
+    fn exec(service: &SiriusComputeNodeService, params: &TExecPlanFragmentParams) -> StatusPb {
+        let response = route(
+            service,
+            methods::EXEC_PLAN_FRAGMENT,
+            PExecPlanFragmentRequest {
+                attachment_protocol: Some("binary".to_string()),
+            }
+            .encode_to_vec(),
+            serialize_binary(params),
+        );
+        PExecPlanFragmentResult::decode(response.body.as_slice())
+            .unwrap()
+            .status
+    }
+
+    fn exec_ok(service: &SiriusComputeNodeService, params: &TExecPlanFragmentParams) {
+        let status = exec(service, params);
+        assert_eq!(
+            status.status_code,
+            TStatusCode::OK.0,
+            "{:?}",
+            status.error_msgs
+        );
+    }
+
+    fn stream_sink(dest_node_id: i32) -> TDataSink {
+        TDataSink::new(
+            TDataSinkType::DATA_STREAM_SINK,
+            Some(TDataStreamSink::new(
+                dest_node_id,
+                TDataPartition::new(TPartitionType::UNPARTITIONED, None, None, None),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn exchange_plan_node(node_id: i32, tuple_id: i32) -> TPlanNode {
+        let mut node = scan_node(node_id, tuple_id);
+        node.node_type = TPlanNodeType::EXCHANGE_NODE;
+        node.file_scan_node = None;
+        node.exchange_node = Some(TExchangeNode::new(
+            vec![tuple_id],
+            None,
+            None,
+            Some(TPartitionType::UNPARTITIONED),
+            Some(true),
+            None,
+        ));
+        node
+    }
+
     fn fetch_request(hi: i64, lo: i64) -> Vec<u8> {
         PFetchDataRequest {
             finst_id: PUniqueId { hi, lo },
@@ -937,8 +1995,11 @@ mod tests {
     }
 
     fn supported_fragment() -> TExecPlanFragmentParams {
-        // Minimal single-node fragment with a descriptor table for direct translation.
-        fragment_params(Some(scan_plan(0, 0)), Some(desc_table()))
+        // Minimal single-node result fragment with a descriptor table for direct translation.
+        let mut params = fragment_params(Some(scan_plan(0, 0)), Some(desc_table()));
+        params.fragment.as_mut().unwrap().output_sink = Some(result_sink());
+        params.params = Some(exec_params(TUniqueId::new(0, 1), TUniqueId::new(0, 2)));
+        params
     }
 
     fn fragment_params(
