@@ -19,7 +19,7 @@
 namespace sirius::op::scan {
 class parquet_scan_core {
  public:
-  using metadata_scan_task_t           = gpu_ingestible::metadata_scan_task_t;
+  using metadata_scan_task_t = gpu_ingestible::metadata_scan_task_t;
   void set_execution_completion(std::shared_ptr<pipeline::completion_handler> c)
   {
     _execution_completion = std::move(c);

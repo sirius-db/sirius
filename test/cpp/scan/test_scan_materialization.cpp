@@ -1198,7 +1198,7 @@ TEST_CASE("Iceberg Puffin wrapper retains failure diagnostics", "[materializatio
     *views, {}, 0, 1, nullptr, {}, {}, {materializer_kind::iceberg, "iceberg.v1"});
   auto plan =
     std::make_shared<iceberg_dv_preparation>(contract, "table", paths, discovery, *ledger);
-  auto info = std::make_unique<iceberg_ingestible_table_info>();
+  auto info                    = std::make_unique<iceberg_ingestible_table_info>();
   info->contract_id            = contract;
   info->read_views             = views;
   info->table_path             = "table";
