@@ -31,7 +31,7 @@ target_include_directories(
 set_target_properties(
   sirius_paimon_binding_fixture
   PROPERTIES PREFIX ""
-             OUTPUT_NAME "paimon"
+             OUTPUT_NAME "sirius_paimon_binding_fixture"
              SUFFIX ".duckdb_extension"
              CXX_STANDARD 20
              CXX_STANDARD_REQUIRED ON
@@ -40,7 +40,13 @@ set_target_properties(
              VISIBILITY_INLINES_HIDDEN ON
              LIBRARY_OUTPUT_DIRECTORY
              "${CMAKE_CURRENT_BINARY_DIR}/test/cpp/paimon_binding_fixture")
-set_target_properties(sirius_paimon_binding_fixture PROPERTIES NO_SONAME ON)
+add_custom_command(
+  TARGET sirius_paimon_binding_fixture
+  POST_BUILD
+  COMMAND
+    ${CMAKE_COMMAND} -E create_symlink
+    $<TARGET_FILE_NAME:sirius_paimon_binding_fixture>
+    $<TARGET_FILE_DIR:sirius_paimon_binding_fixture>/paimon.duckdb_extension)
 add_library(sirius_paimon_binding_proxy SHARED
             test/cpp/utils/paimon_binding_proxy.cpp)
 target_link_libraries(sirius_paimon_binding_proxy
@@ -55,7 +61,8 @@ set_target_properties(
              CXX_SCAN_FOR_MODULES OFF
              CXX_VISIBILITY_PRESET hidden
              VISIBILITY_INLINES_HIDDEN ON
-             NO_SONAME ON
+             BUILD_RPATH_USE_ORIGIN ON
+             BUILD_RPATH "$ORIGIN/../paimon_binding_fixture"
              LIBRARY_OUTPUT_DIRECTORY
              "${CMAKE_CURRENT_BINARY_DIR}/test/cpp/paimon_binding_proxy")
 get_directory_property(
