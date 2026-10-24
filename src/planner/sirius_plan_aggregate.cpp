@@ -832,6 +832,28 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
     }
   }
 
+  // The Sirius aggregate node cannot carry an ORDER BY, so a FIRST refuses its own. FILTER is
+  // refused above for every aggregate.
+  for (auto const& expression : op.expressions) {
+    auto const& aggregate = expression->Cast<duckdb::BoundAggregateExpression>();
+    if (sirius::from_duckdb_aggregate_name(aggregate.Function().GetName().GetIdentifierName()) !=
+        sirius::aggregate_id::first) {
+      continue;
+    }
+    if (aggregate.GetOrderBys()) {
+      throw duckdb::NotImplementedException(
+        "first() with an ORDER BY clause is not supported on the GPU (falling back to CPU): " +
+        aggregate.ToString());
+    }
+    // One carried row per key answers one grouping set, and the set expansion copies no carried
+    // columns.
+    if (has_grouping_sets) {
+      throw duckdb::NotImplementedException(
+        "grouped FIRST is not supported over several grouping sets or beside a grouping function "
+        "(falling back to CPU)");
+    }
+  }
+
   if (auto fused = try_plan_dense_count_join(op)) { return fused; }
 
   // Resolved before the child is planned: planning moves expressions out of the logical subtree.

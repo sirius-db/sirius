@@ -23,6 +23,9 @@
  * The proof widens a column when rows * max|value| exceeds the storage width's maximum
  * (2^31 - 1 or 2^63 - 1). The extremes below sit exactly on that boundary, including the most
  * negative values (-2^31, -2^63), whose magnitude is one more than the maximum.
+ *
+ * The "aggregate slots" cases test all_slots_plain and has_slot over every AggregateSlot
+ * alternative.
  */
 
 #include "op/aggregate/aggregate_op_util.hpp"
@@ -42,12 +45,16 @@
 #include <catch.hpp>
 
 #include <bit>
+#include <cstddef>
 #include <cstdint>
 #include <initializer_list>
 #include <limits>
 #include <memory>
 #include <optional>
+#include <type_traits>
 #include <unordered_set>
+#include <utility>
+#include <variant>
 #include <vector>
 
 namespace {
@@ -538,4 +545,72 @@ TEST_CASE("wide integer sum - one-pass 128-bit reduction of INT64 and INT32",
   CHECK(sum128(sliced) == 6);
 
   CHECK_THROWS_AS(sum128(d64({1})->view()), sirius::internal_exception);
+}
+
+namespace {
+
+using sirius::op::AggregateSlot;
+using sirius::op::all_slots_plain;
+using sirius::op::has_slot;
+using sirius::op::plain_slot;
+
+/// Checks the slot queries on lists holding alternative @p I of AggregateSlot, alone and beside a
+/// plain slot.
+template <std::size_t I>
+void check_slot_kind()
+{
+  using Kind           = std::variant_alternative_t<I, AggregateSlot>;
+  constexpr bool plain = std::is_same_v<Kind, plain_slot>;
+  INFO("AggregateSlot alternative " << I);
+  std::vector<AggregateSlot> const alone{Kind{}};
+  CHECK(all_slots_plain(alone) == plain);
+  CHECK(has_slot<Kind>(alone));
+  CHECK(has_slot<plain_slot>(alone) == plain);
+  std::vector<AggregateSlot> const beside_plain{plain_slot{}, Kind{}};
+  CHECK(all_slots_plain(beside_plain) == plain);
+  CHECK(has_slot<Kind>(beside_plain));
+}
+
+}  // namespace
+
+TEST_CASE("aggregate slots - an empty list is all plain and holds no kind", "[aggregate][distinct]")
+{
+  std::vector<AggregateSlot> const none;
+  CHECK(all_slots_plain(none));
+  CHECK_FALSE(has_slot<plain_slot>(none));
+  CHECK_FALSE(has_slot<sirius::op::first_slot>(none));
+}
+
+TEST_CASE("aggregate slots - a list of plain slots is all plain", "[aggregate][distinct]")
+{
+  std::vector<AggregateSlot> const plain{plain_slot{.partial_idx = 0},
+                                         plain_slot{.partial_idx = 1}};
+  CHECK(all_slots_plain(plain));
+  CHECK(has_slot<plain_slot>(plain));
+  CHECK_FALSE(has_slot<sirius::op::avg_slot>(plain));
+  CHECK_FALSE(has_slot<sirius::op::count_distinct_slot>(plain));
+  CHECK_FALSE(has_slot<sirius::op::stddev_samp_slot>(plain));
+  CHECK_FALSE(has_slot<sirius::op::first_slot>(plain));
+}
+
+TEST_CASE("aggregate slots - every kind but plain_slot makes a list non-plain",
+          "[aggregate][distinct]")
+{
+  // Covers every alternative, so a kind added to AggregateSlot later is checked here too.
+  []<std::size_t... I>(std::index_sequence<I...>) {
+    (check_slot_kind<I>(), ...);
+  }(std::make_index_sequence<std::variant_size_v<AggregateSlot>>{});
+}
+
+TEST_CASE("aggregate slots - the wide integer SUM mask marks plain and AVG SUM entries",
+          "[aggregate][wide_integer_sum]")
+{
+  std::vector<AggregateSlot> const slots{
+    plain_slot{.partial_idx = 0},
+    plain_slot{.partial_idx = 1, .is_wide_integer_sum = true},
+    sirius::op::first_slot{.input_idx = 3, .carried_idx = 0},
+    sirius::op::avg_slot{.sum_idx = 2, .is_wide_integer_sum = true},
+    sirius::op::avg_slot{.sum_idx = 4}};
+  CHECK(sirius::op::wide_integer_sum_mask(slots, 6) ==
+        std::vector<bool>{false, true, true, false, false, false});
 }

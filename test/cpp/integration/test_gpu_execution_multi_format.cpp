@@ -380,6 +380,11 @@ class ParquetCountCarrierFixture : public MultiFormatFixtureBase {
           "SELECT CASE WHEN i % 4 = 0 THEN NULL::BIGINT ELSE i END AS id, "
           "NULL::BOOLEAN AS flag FROM range(257) t(i)");
     write("empty.parquet", rows + " WHERE false");
+    // `v` is INTEGER in one file and BIGINT in the other, and equal to `k` in both.
+    write("drift/a.parquet",
+          "SELECT (i % 7)::INTEGER AS k, (i % 7)::INTEGER AS v FROM range(129) t(i)");
+    write("drift/b.parquet",
+          "SELECT (i % 7)::INTEGER AS k, (i % 7)::BIGINT AS v FROM range(128) t(i)");
     // Keep COUNT(*) in the scan instead of answering it from parquet statistics.
     optimizer_guard =
       std::make_unique<sirius::test::disabled_optimizers_guard>(*con, "statistics_propagation");
@@ -443,6 +448,28 @@ TEST_CASE_METHOD(ParquetCountCarrierFixture,
   compare_gpu_vs_cpu("SELECT part, count(*) FROM read_parquet(" +
                      scratch.file_literal("evolved/part=*/*.parquet") +
                      ", hive_partitioning=true, union_by_name=true) GROUP BY part ORDER BY part");
+}
+
+TEST_CASE_METHOD(ParquetCountCarrierFixture,
+                 "parquet type drift under a FIRST input is refused by the scan",
+                 "[integration][scan][parquet][gpu][schema_evolution][distinct]")
+{
+  std::string const drift = "read_parquet(" + scratch.file_literal("drift/*.parquet") +
+                            ", union_by_name=true, hive_partitioning=false)";
+  // A FIRST's input is semantic, so the scan refuses the drift before cuDF concatenates both
+  // widths; the CPU answers.
+  for (auto const& query : {"SELECT k, first(v) FROM " + drift + " GROUP BY k",
+                            "SELECT DISTINCT ON (k) k, v FROM " + drift}) {
+    INFO(query);
+    sirius::test::scoped_recording_log_sink logs;
+    compare_gpu_vs_cpu(query, std::nullopt, gpu_route::runtime_fallback);
+    bool refused = false;
+    for (auto const& record : logs.records())
+      if (record.message.find("Parquet column 'v' has unqualified type drift from INTEGER to "
+                              "BIGINT") != std::string::npos)
+        refused = true;
+    CHECK(refused);
+  }
 }
 
 TEST_CASE_METHOD(ParquetCountCarrierFixture,

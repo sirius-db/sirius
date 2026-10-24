@@ -24,6 +24,10 @@
  * results match whenever the query is answered at all, and a query that silently fell back to CPU
  * would still compare equal.
  *
+ * A carried `DISTINCT ON` column may come from any row of its group on either engine, so a full row
+ * comparison is valid only where the key fixes the carried value, as in `dist_fd`. Elsewhere
+ * `compare_gpu_vs_cpu_on_columns` compares the row count and the columns the query determines.
+ *
  * The floating-point cases use `compare_gpu_vs_cpu_canonical` instead: a group holding both 0.0 and
  * -0.0, or NaN and -NaN, prints as whichever member each engine keeps.
  *
@@ -38,6 +42,7 @@
 #include <utils/scoped_sirius_setting.hpp>
 
 #include <cstdint>
+#include <string>
 
 namespace {
 
@@ -71,8 +76,8 @@ class DistinctFixture : public sirius::test::GpuExecutionFixture {
     run_ok("INSERT INTO dist_r VALUES (1, 10), (2, 20), (2, 21), (3, 30), (NULL, 40);");
     run_ok("CREATE TABLE dist_empty (a INTEGER, b INTEGER);");
     // `v` is a function of `k`, so a DISTINCT ON over `k` has one correct answer whichever row
-    // represents a group. The guarded shapes need that: they compare a fallback run against a
-    // second CPU run, and DISTINCT ON without ORDER BY may pick a different row each time.
+    // represents a group. The carried and guarded shapes need that: DISTINCT ON without ORDER BY
+    // may pick a different row on each run and on each engine.
     run_ok("CREATE TABLE dist_fd (k INTEGER, v INTEGER);");
     run_ok("INSERT INTO dist_fd VALUES (1, 10), (1, 10), (2, 20), (2, 20), (3, 30), (NULL, NULL);");
     // Per-`k` sums reach both ends of BIGINT exactly, plus a negative, a zero and a NULL group.
@@ -82,6 +87,11 @@ class DistinctFixture : public sirius::test::GpuExecutionFixture {
       "(1, -4611686018427387904), (1, -4611686018427387904),"
       "(2, 4611686018427387904), (2, 4611686018427387903),"
       "(3, -5), (3, 2), (4, 0), (NULL, 7);");
+    // Several `(a, b)` groups per `a`, so a DISTINCT ON (a) over a GROUP BY a, b has a choice.
+    run_ok("CREATE TABLE dist_agg (a INTEGER, b VARCHAR, c INTEGER);");
+    run_ok(
+      "INSERT INTO dist_agg VALUES (1, 'x', 10), (1, 'x', 5), (1, 'y', 7), "
+      "(2, 'z', 3), (2, 'z', 4), (3, 'p', 1), (3, 'q', 1), (3, 'r', 2);");
     run_ok("CHECKPOINT;");
   }
 };
@@ -202,6 +212,161 @@ TEST_CASE_METHOD(DistinctFixture,
 }
 
 //===----------------------------------------------------------------------===//
+// Carried columns: an output column no distinct target covers
+//===----------------------------------------------------------------------===//
+
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution DISTINCT ON with a carried column runs on the GPU",
+                 "[integration][gpu_execution][distinct]")
+{
+  compare_gpu_vs_cpu("SELECT DISTINCT ON (k) k, v FROM dist_fd");
+}
+
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution DISTINCT with an ORDER BY outside the select list runs on the GPU",
+                 "[integration][gpu_execution][distinct]")
+{
+  // `v` is added to the select list after the targets were synthesized from it, so the node is
+  // two columns wide with a single target and `v` is carried.
+  compare_gpu_vs_cpu_ordered("SELECT DISTINCT k FROM dist_fd ORDER BY v NULLS LAST");
+}
+
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution DISTINCT ON an expression key runs on the GPU",
+                 "[integration][gpu_execution][distinct]")
+{
+  // The binder appends `k + v` to the select list, so the one key is a bare reference and both
+  // `k` and `v` are carried.
+  compare_gpu_vs_cpu("SELECT DISTINCT ON (k + v) k, v FROM dist_fd");
+}
+
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution DISTINCT ON with permuted keys and a carried column",
+                 "[integration][gpu_execution][distinct]")
+{
+  // group_idx is {1, 0}: the local stage has to emit the keys first for PARTITION, and the
+  // builder's projection has to restore the select order. The two `(NULL, 1)` rows differ in
+  // `s_short`, so only the keys are compared.
+  compare_gpu_vs_cpu_on_columns("SELECT DISTINCT ON (b, a) a, b, s_short FROM dist_t", {0, 1});
+}
+
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution DISTINCT ON ordered only by its keys runs on the GPU",
+                 "[integration][gpu_execution][distinct]")
+{
+  // A key is constant within its group, so an ORDER BY on keys alone cannot choose a carried row.
+  SECTION("a carried column")
+  {
+    compare_gpu_vs_cpu_ordered("SELECT DISTINCT ON (k) k, v FROM dist_fd ORDER BY k NULLS LAST");
+  }
+
+  // Every group of `a` holds rows whose carried values differ, so only the key is compared.
+  SECTION("a carried column that varies within its group")
+  {
+    compare_gpu_vs_cpu_on_columns(
+      "SELECT DISTINCT ON (a) a, b, s_short FROM dist_t ORDER BY a NULLS LAST", {0});
+  }
+
+  // Every column is a key, so nothing is carried and the ORDER BY only sorts the result.
+  SECTION("every column a key")
+  {
+    compare_gpu_vs_cpu_ordered("SELECT DISTINCT ON (k, v) k, v FROM dist_fd ORDER BY v NULLS LAST");
+  }
+}
+
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution carried DECIMAL, DATE and all-NULL columns",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  // Without NULL in `a`, every (a, b) group's rows are identical, so each carried value is fixed.
+  compare_gpu_vs_cpu(
+    "SELECT DISTINCT ON (a, b) a, b, s_short, d, dt, allnull FROM dist_t WHERE a IS NOT NULL");
+  compare_gpu_vs_cpu(
+    "SELECT a, b, first(d), first(dt), first(allnull), count(*) FROM dist_t WHERE a IS NOT NULL "
+    "GROUP BY a, b");
+}
+
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution carried columns over a filter that keeps no row",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  // 15 lies inside v's min/max, so the scan and its filter survive planning and every carried path
+  // runs on an empty batch.
+  compare_gpu_vs_cpu("SELECT DISTINCT ON (k) k, v FROM dist_fd WHERE v = 15");
+  compare_gpu_vs_cpu("SELECT k, first(v), sum(v), avg(v) FROM dist_fd WHERE v = 15 GROUP BY k");
+  compare_gpu_vs_cpu("SELECT k, first(v), stddev_samp(v) FROM dist_fd WHERE v = 15 GROUP BY k");
+}
+
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution GROUP BY with only FIRST aggregates runs on the GPU",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  // The operator cannot tell this from a lowered DISTINCT ON, so it takes the same route.
+  compare_gpu_vs_cpu("SELECT k, first(v) FROM dist_fd GROUP BY k");
+}
+
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution FIRST beside another aggregate runs on the GPU",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  compare_gpu_vs_cpu("SELECT k, first(v), sum(v) FROM dist_fd GROUP BY k");
+}
+
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution FIRST beside other aggregates keeps the declared column order",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  // The partial layout is [k, partials..., carried...], so each result must be moved into the
+  // declared order. With both value columns BIGINT, a swap passes every type check and only the
+  // row comparison catches it.
+  SECTION("count")
+  {
+    compare_gpu_vs_cpu("SELECT k, first(v::BIGINT), count(*) FROM dist_fd GROUP BY k");
+  }
+
+  SECTION("avg before the FIRST")
+  {
+    compare_gpu_vs_cpu("SELECT k, avg(v), first(v) FROM dist_fd GROUP BY k");
+  }
+
+  // COLLECT_SET puts the groupby, and its row selector, on cuDF's sort path.
+  SECTION("COUNT(DISTINCT)")
+  {
+    compare_gpu_vs_cpu("SELECT k, first(v), count(DISTINCT v) FROM dist_fd GROUP BY k");
+  }
+
+  // `0 - v`, not `-v`: the expression evaluator reads a second argument for unary minus.
+  SECTION("two FIRSTs and a min")
+  {
+    compare_gpu_vs_cpu("SELECT k, first(v), first(0 - v), min(v) FROM dist_fd GROUP BY k");
+  }
+
+  SECTION("a carried key beside a sum, with a NULL-key group")
+  {
+    compare_gpu_vs_cpu("SELECT k, first(k), sum(v) FROM dist_fd GROUP BY k");
+  }
+
+  // M2 sorts the local input by key before the groupby.
+  SECTION("stddev_samp")
+  {
+    compare_gpu_vs_cpu("SELECT k, first(v), first(0 - v), stddev_samp(v) FROM dist_fd GROUP BY k");
+  }
+}
+
+TEST_CASE_METHOD(
+  DistinctFixture,
+  "gpu_execution an all-FIRST list with an expression or key argument runs on the GPU",
+  "[integration][gpu_execution][distinct][aggregate]")
+{
+  SECTION("two arguments, one an expression")
+  {
+    compare_gpu_vs_cpu("SELECT k, first(v), first(0 - v) FROM dist_fd GROUP BY k");
+  }
+
+  SECTION("key argument") { compare_gpu_vs_cpu("SELECT k, first(k) FROM dist_fd GROUP BY k"); }
+}
+
+//===----------------------------------------------------------------------===//
 // Composition with the operators either side of the DISTINCT
 //===----------------------------------------------------------------------===//
 
@@ -235,6 +400,54 @@ TEST_CASE_METHOD(DistinctFixture,
   // Reorder projection above the narrowed aggregate, over keys of different types.
   compare_gpu_vs_cpu(
     "SELECT DISTINCT ON (s, k) k, s FROM (SELECT k, sum(x) AS s FROM dist_sum GROUP BY k)");
+}
+
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution DISTINCT ON carrying a grouped sum",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  // The carried sum is planned as BIGINT under a HUGEINT declaration. Each `k` is one row, so the
+  // carried value is determined, and sums at both ends of BIGINT catch a read at the wrong width.
+  compare_gpu_vs_cpu(
+    "SELECT DISTINCT ON (k) k, s FROM (SELECT k, sum(x) AS s FROM dist_sum GROUP BY k)");
+}
+
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution DISTINCT ON over a GROUP BY carries the aggregate results",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  // The GROUP BY's results reach the DISTINCT ON as carried columns, and sum() is planned BIGINT
+  // under a HUGEINT declaration.
+  SECTION("one group per key")
+  {
+    compare_gpu_vs_cpu("SELECT DISTINCT ON (k) k, v, sum(v) FROM dist_fd GROUP BY k, v");
+  }
+
+  SECTION("a mixed aggregate list below")
+  {
+    compare_gpu_vs_cpu(
+      "SELECT DISTINCT ON (k) k, v, first(v), sum(v), count(DISTINCT v) "
+      "FROM dist_fd GROUP BY k, v");
+  }
+
+  // Any group of a key may survive, so each output row is joined back to the groups: a `b` and a
+  // sum taken from different groups match none.
+  SECTION("several groups per key")
+  {
+    compare_gpu_vs_cpu(
+      "SELECT count(*) FROM "
+      "(SELECT DISTINCT ON (a) a, b, sum(c) AS s FROM dist_agg GROUP BY a, b) d "
+      "JOIN (SELECT a, b, sum(c) AS s FROM dist_agg GROUP BY a, b) g "
+      "ON d.a = g.a AND d.b = g.b AND d.s = g.s");
+    compare_gpu_vs_cpu_on_columns("SELECT DISTINCT ON (a) a, b, sum(c) FROM dist_agg GROUP BY a, b",
+                                  {0});
+  }
+
+  SECTION("an aggregate result as the key")
+  {
+    compare_gpu_vs_cpu(
+      "SELECT DISTINCT ON (s) s, a FROM (SELECT a, sum(c) AS s FROM dist_agg GROUP BY a)");
+  }
 }
 
 TEST_CASE_METHOD(DistinctFixture,
@@ -297,6 +510,28 @@ TEST_CASE_METHOD(DistinctFixture,
   }
 }
 
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution nested carried columns run on the GPU",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  // The scan refuses stored LIST and STRUCT columns, so a stored fixed-size array and a computed
+  // struct are the nested payloads that reach the DISTINCT. Each is a function of `k`.
+  SECTION("fixed-size array")
+  {
+    run_ok(
+      "CREATE TABLE dist_nest AS SELECT k, [k, k + 1, k + 2]::INTEGER[3] AS arr FROM dist_fd;");
+    run_ok("CHECKPOINT;");
+    compare_gpu_vs_cpu("SELECT DISTINCT ON (k) k, arr FROM dist_nest");
+    compare_gpu_vs_cpu("SELECT k, first(arr), count(*) FROM dist_nest GROUP BY k");
+  }
+
+  SECTION("struct")
+  {
+    compare_gpu_vs_cpu("SELECT DISTINCT ON (k) k, {'x': k, 'y': k * 10} AS st FROM dist_fd");
+    compare_gpu_vs_cpu("SELECT k, first({'x': k, 'y': k * 10}), sum(k) FROM dist_fd GROUP BY k");
+  }
+}
+
 //===----------------------------------------------------------------------===//
 // Volume: the paths a nine-row table cannot reach
 //===----------------------------------------------------------------------===//
@@ -327,6 +562,163 @@ TEST_CASE_METHOD(DistinctBulkFixture,
   }
 }
 
+TEST_CASE_METHOD(DistinctBulkFixture,
+                 "gpu_execution DISTINCT ON a heavily duplicated key with a carried column",
+                 "[integration][gpu_execution][distinct]")
+{
+  // Each of the ten groups holds 100k different payloads, so only the keys are compared.
+  SECTION("default batch size")
+  {
+    compare_gpu_vs_cpu_on_columns("SELECT DISTINCT ON (k) k, payload FROM dist_dup", {0});
+  }
+
+  // Small scan batches give a partition more than one local result, which the merge's single-batch
+  // shortcut would otherwise skip. With the key second, group_idx is {1}: a merge that keyed on
+  // group_idx rather than on its leading column would dedup on `payload` and return every row.
+  SECTION("many scan batches")
+  {
+    sirius::test::scoped_sirius_setting batch_size{
+      *con, "scan_task_batch_size", std::uint64_t{1048576}};
+    compare_gpu_vs_cpu_on_columns("SELECT DISTINCT ON (k) k, payload FROM dist_dup", {0});
+    compare_gpu_vs_cpu_on_columns("SELECT DISTINCT ON (k) payload, k FROM dist_dup", {1});
+  }
+}
+
+TEST_CASE_METHOD(DistinctBulkFixture,
+                 "gpu_execution DISTINCT ON merges NULL and NaN keys across batches",
+                 "[integration][gpu_execution][distinct]")
+{
+  // Small scan batches split each key's rows over several partials, so the merge's cudf::distinct
+  // must treat NULL keys as equal, every NaN as equal, and -0.0 as 0.0.
+  sirius::test::scoped_sirius_setting batch_size{
+    *con, "scan_task_batch_size", std::uint64_t{1048576}};
+  run_ok(
+    "CREATE TABLE dist_dup_null AS SELECT CASE WHEN i % 10 = 0 THEN NULL ELSE i % 10 END AS k, "
+    "i AS payload FROM range(1000000) t(i);");
+  // 0.0 and -0.0 are never adjacent, so RLE cannot fold the sign away at CHECKPOINT.
+  run_ok(
+    "CREATE TABLE dist_dup_fp AS SELECT CASE i % 6 WHEN 0 THEN 'NaN'::DOUBLE "
+    "WHEN 1 THEN 0.0::DOUBLE WHEN 2 THEN -('NaN'::DOUBLE) WHEN 3 THEN -(0.0::DOUBLE) "
+    "WHEN 4 THEN NULL ELSE 1.5 END AS d, i AS payload FROM range(1000000) t(i);");
+  run_ok("CHECKPOINT;");
+  compare_gpu_vs_cpu_on_columns("SELECT DISTINCT ON (k) k, payload FROM dist_dup_null", {0});
+  compare_gpu_vs_cpu_on_columns("SELECT DISTINCT ON (d) d, payload FROM dist_dup_fp", {0});
+  // The groupby route with the row selector, over the same NULL group.
+  compare_gpu_vs_cpu(
+    "SELECT count(*) FROM (SELECT k, first(payload) AS a, count(*) AS c FROM dist_dup_null "
+    "GROUP BY k) WHERE coalesce(k, 0) <> a % 10 OR c <> 100000");
+}
+
+TEST_CASE_METHOD(DistinctBulkFixture,
+                 "gpu_execution DISTINCT ON over a GROUP BY over many batches",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  // Small scan batches make both merges combine partial rows: the GROUP BY's sums and the
+  // DISTINCT ON's carried rows. Each output row must still be one real (k, m, s) group.
+  sirius::test::scoped_sirius_setting batch_size{
+    *con, "scan_task_batch_size", std::uint64_t{1048576}};
+  compare_gpu_vs_cpu(
+    "SELECT count(*) FROM (SELECT DISTINCT ON (k) k, m, s FROM (SELECT k, payload % 3 AS m, "
+    "sum(payload) AS s FROM dist_dup GROUP BY k, m)) d "
+    "JOIN (SELECT k, payload % 3 AS m, sum(payload) AS s FROM dist_dup GROUP BY k, m) g "
+    "ON d.k = g.k AND d.m = g.m AND d.s = g.s");
+}
+
+TEST_CASE_METHOD(DistinctBulkFixture,
+                 "gpu_execution FIRST beside other aggregates over many batches",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  // Small scan batches make the merge combine partial rows. `payload` varies within each group, so
+  // the check is structural rather than a row comparison: `a % 10 = k` catches a gather from the
+  // wrong group, `a + b` two FIRSTs taken from different rows, and `c` a column swap.
+  sirius::test::scoped_sirius_setting batch_size{
+    *con, "scan_task_batch_size", std::uint64_t{1048576}};
+  compare_gpu_vs_cpu(
+    "SELECT count(*) FROM ("
+    "  SELECT k, first(payload) AS a, first(1000000 - payload) AS b, count(*) AS c,"
+    "         sum(payload) AS s"
+    "  FROM dist_dup GROUP BY k) "
+    "WHERE a % 10 <> k OR a + b <> 1000000 OR c <> 100000");
+  compare_gpu_vs_cpu_on_columns(
+    "SELECT k, first(payload) AS a, first(1000000 - payload) AS b, "
+    "count(*) AS c, sum(payload) AS s FROM dist_dup GROUP BY k",
+    {0, 3, 4});
+
+  // MERGE_SETS puts the merge groupby, and its row selector, on cuDF's sort path.
+  compare_gpu_vs_cpu(
+    "SELECT count(*) FROM ("
+    "  SELECT k, first(payload) AS a, count(DISTINCT payload % 7) AS c"
+    "  FROM dist_dup GROUP BY k) "
+    "WHERE a % 10 <> k OR c <> 7");
+  compare_gpu_vs_cpu_on_columns(
+    "SELECT k, first(payload) AS a, count(DISTINCT payload % 7) AS c FROM dist_dup GROUP BY k",
+    {0, 2});
+}
+
+TEST_CASE_METHOD(DistinctBulkFixture,
+                 "gpu_execution FIRST beside stddev_samp keeps each group's row",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  // M2 sorts the local input by key, and MERGE_M2 puts the merge on cuDF's sort path. The checks
+  // match the many-batch FIRST case above; rounding keeps the stddev comparison exact.
+  auto const check = [&] {
+    compare_gpu_vs_cpu(
+      "SELECT count(*) FROM ("
+      "  SELECT k, first(payload) AS a, first(1000000 - payload) AS b,"
+      "         stddev_samp(payload) AS sd"
+      "  FROM dist_dup GROUP BY k) "
+      "WHERE a % 10 <> k OR a + b <> 1000000 OR sd IS NULL");
+    compare_gpu_vs_cpu_on_columns(
+      "SELECT k, first(payload) AS a, first(1000000 - payload) AS b, "
+      "round(stddev_samp(payload), 1) AS sd FROM dist_dup GROUP BY k",
+      {0, 3});
+  };
+
+  SECTION("default batch size") { check(); }
+
+  SECTION("many scan batches")
+  {
+    sirius::test::scoped_sirius_setting batch_size{
+      *con, "scan_task_batch_size", std::uint64_t{1048576}};
+    check();
+  }
+}
+
+TEST_CASE_METHOD(DistinctBulkFixture,
+                 "gpu_execution nested carried columns over many batches",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  sirius::test::scoped_sirius_setting batch_size{
+    *con, "scan_task_batch_size", std::uint64_t{1048576}};
+  run_ok("CREATE TABLE dist_dup_arr AS SELECT k, [k, k]::BIGINT[2] AS arr FROM dist_dup;");
+  run_ok("CHECKPOINT;");
+  compare_gpu_vs_cpu("SELECT DISTINCT ON (k) k, arr FROM dist_dup_arr");
+  compare_gpu_vs_cpu("SELECT k, first(arr), count(*) FROM dist_dup_arr GROUP BY k");
+  compare_gpu_vs_cpu("SELECT k, first({'x': k, 'y': k * 10}), count(*) FROM dist_dup GROUP BY k");
+}
+
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution FIRST beside a COUNT(DISTINCT) over a label-encoded key",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  // COLLECT_SET, a VARCHAR key and at least 2^20 rows in one batch make the local groupby
+  // label-encode its keys, so the row selector runs over the encoded groupby.
+  run_ok(
+    "CREATE TABLE dist_big AS "
+    "SELECT (i % 10)::VARCHAR AS ks, i AS payload FROM range(2000000) t(i);");
+  run_ok("CHECKPOINT;");
+  // `min(payload)` is the group's digit, which avoids a VARCHAR cast in the outer filter.
+  compare_gpu_vs_cpu(
+    "SELECT count(*) FROM ("
+    "  SELECT ks, first(payload) AS a, min(payload) AS m, count(DISTINCT payload % 7) AS c"
+    "  FROM dist_big GROUP BY ks) "
+    "WHERE a % 10 <> m OR c <> 7");
+  compare_gpu_vs_cpu_on_columns(
+    "SELECT ks, first(payload) AS a, min(payload) AS m, "
+    "count(DISTINCT payload % 7) AS c FROM dist_big GROUP BY ks",
+    {0, 2, 3});
+}
+
 //===----------------------------------------------------------------------===//
 // Guarded shapes: plan-time CPU fallback, not a result divergence
 //===----------------------------------------------------------------------===//
@@ -339,23 +731,83 @@ TEST_CASE_METHOD(DistinctFixture,
   // one: a plausible wrong answer rather than an error.
   expect_plan_fallback_matches_cpu(
     "SELECT DISTINCT ON (k) k, v FROM dist_fd ORDER BY v NULLS LAST");
+  // A key term ahead of the carried one does not lift the refusal.
+  expect_plan_fallback_matches_cpu(
+    "SELECT DISTINCT ON (k) k, v FROM dist_fd ORDER BY k NULLS LAST, v NULLS LAST");
 }
 
 TEST_CASE_METHOD(DistinctFixture,
-                 "gpu_execution DISTINCT ON with carried columns falls back at plan time",
-                 "[integration][gpu_execution][distinct]")
+                 "gpu_execution DISTINCT ON over a GROUP BY ordered by an aggregate falls back",
+                 "[integration][gpu_execution][distinct][aggregate]")
 {
-  // Carrying `v` out of each `k` group needs a grouped FIRST, which Sirius cannot lower yet.
-  expect_plan_fallback_matches_cpu("SELECT DISTINCT ON (k) k, v FROM dist_fd");
+  // The top group per key: the order names the row, so this waits for ordered DISTINCT ON. No
+  // key has tied sums, so the two CPU runs agree.
+  expect_plan_fallback_matches_cpu(
+    "SELECT DISTINCT ON (a) a, b, sum(c) FROM dist_agg GROUP BY a, b ORDER BY a, sum(c) DESC");
 }
 
 TEST_CASE_METHOD(DistinctFixture,
-                 "gpu_execution DISTINCT with an ORDER BY outside the select list falls back",
-                 "[integration][gpu_execution][distinct]")
+                 "gpu_execution FIRST over several grouping sets falls back at plan time",
+                 "[integration][gpu_execution][distinct][aggregate]")
 {
-  // `v` is added to the select list after the targets were synthesized from it, so the node is
-  // two columns wide with a single target and `v` would need a grouped FIRST.
-  expect_plan_fallback_matches_cpu("SELECT DISTINCT k FROM dist_fd ORDER BY v NULLS LAST");
+  // `k = 1` holds one v, so the grand-total row's first(v) is the same on every run.
+  SECTION("ROLLUP")
+  {
+    expect_plan_fallback_matches_cpu(
+      "SELECT k, first(v), sum(v) FROM dist_fd WHERE k = 1 GROUP BY ROLLUP (k)");
+  }
+
+  SECTION("GROUPING()")
+  {
+    expect_plan_fallback_matches_cpu(
+      "SELECT k, first(v), GROUPING(k) FROM dist_fd GROUP BY GROUPING SETS ((k))");
+  }
+
+  // The refusal is FIRST's alone.
+  SECTION("ROLLUP without FIRST still runs")
+  {
+    compare_gpu_vs_cpu("SELECT k, sum(v) FROM dist_fd GROUP BY ROLLUP (k)");
+  }
+}
+
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution FIRST beside a FILTER or a DISTINCT sum falls back at plan time",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  // Pins `main`'s refusals of every aggregate FILTER and every DISTINCT aggregate but COUNT. On
+  // this table both change the answer: the filter excludes k = 1, and k = 1 and k = 2 each hold a
+  // duplicated v.
+  SECTION("FILTER")
+  {
+    expect_plan_fallback_matches_cpu(
+      "SELECT k, first(v), sum(v) FILTER (WHERE v > 15) FROM dist_fd GROUP BY k");
+  }
+
+  SECTION("DISTINCT sum")
+  {
+    expect_plan_fallback_matches_cpu("SELECT k, first(v), sum(DISTINCT v) FROM dist_fd GROUP BY k");
+  }
+}
+
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution FIRST with a FILTER falls back at plan time",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  // The CPU answer is (1, NULL) (2, 20) (3, 30) (NULL, NULL). A route that ignored the filter would
+  // return (1, 10), so a result comparison alone would also catch the defect. Pins `main`'s refusal
+  // of every aggregate FILTER, kept for when it lifts.
+  expect_plan_fallback_matches_cpu(
+    "SELECT k, first(v) FILTER (WHERE v > 15) FROM dist_fd GROUP BY k");
+}
+
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution ungrouped FIRST with a FILTER falls back at plan time",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  // Only v = 30 passes the filter, so the CPU answer is deterministic. Ignoring the filter would
+  // return whichever row comes first. Pins `main`'s refusal of every aggregate FILTER, kept for
+  // when it lifts.
+  expect_plan_fallback_matches_cpu("SELECT first(v) FILTER (WHERE v > 25) FROM dist_fd");
 }
 
 TEST_CASE_METHOD(DistinctFixture,
@@ -377,13 +829,6 @@ TEST_CASE_METHOD(DistinctFixture,
   // A failed restore would leak nocase into every later integration case.
   REQUIRE(con->Query("SELECT current_setting('default_collation');")->Collection().GetValue(0, 0) ==
           prior);
-}
-
-TEST_CASE_METHOD(DistinctFixture,
-                 "gpu_execution DISTINCT ON an expression key falls back at plan time",
-                 "[integration][gpu_execution][distinct]")
-{
-  expect_plan_fallback_matches_cpu("SELECT DISTINCT ON (k + v) k, v FROM dist_fd");
 }
 
 /// Floating-point keys carrying every value whose equality is decided by something other than
@@ -447,4 +892,43 @@ TEST_CASE_METHOD(DistinctFloatFixture,
   {
     compare_gpu_vs_cpu("SELECT d, f FROM dist_fp WHERE d = 0");
   }
+}
+
+TEST_CASE_METHOD(DistinctFloatFixture,
+                 "gpu_execution DISTINCT ON a floating-point key groups NaN and signed zero as "
+                 "DuckDB does",
+                 "[integration][gpu_execution][distinct]")
+{
+  // cudf::distinct decides key equality separately from cudf::groupby, so the case above says
+  // nothing about this route. Within each collapsed group the carried values differ only as NaN and
+  // -NaN or 0.0 and -0.0, which the canonical comparison treats as one value, so the carried column
+  // is compared too.
+  SECTION("DOUBLE key")
+  {
+    compare_gpu_vs_cpu_canonical("SELECT DISTINCT ON (d) d, f FROM dist_fp");
+  }
+
+  SECTION("REAL key") { compare_gpu_vs_cpu_canonical("SELECT DISTINCT ON (f) f, d FROM dist_fp"); }
+}
+
+TEST_CASE_METHOD(DistinctBulkFixture,
+                 "gpu_execution FIRST beside SUM over a dictionary-encoded merge key",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  // 2M rows give the merge enough partial rows for `s` to pass both dictionary-encode gates in
+  // merge_grouped_aggregate: avg_len >= 8.0 and NDV/rows < 0.10.
+  sirius::test::scoped_sirius_setting batch_size{
+    *con, "scan_task_batch_size", std::uint64_t{1048576}};
+  run_ok(
+    "CREATE TABLE dist_str_first AS "
+    "SELECT 'a_long_string_value_' || (i % 20) AS s, i % 20 AS k, i AS v "
+    "FROM range(2000000) t(i);");
+  run_ok("CHECKPOINT;");
+  // first(v) is any row of its group, so only the key and the sum are compared.
+  compare_gpu_vs_cpu_on_columns("SELECT s, first(v), sum(v) FROM dist_str_first GROUP BY s",
+                                {0, 2});
+  // v % 20 equals its row's k, so a FIRST gathered from another group makes the count non-zero.
+  compare_gpu_vs_cpu(
+    "SELECT count(*) FROM (SELECT s, first(v) AS f, min(k) AS mk, sum(v) AS t FROM dist_str_first "
+    "GROUP BY s) WHERE f % 20 <> mk");
 }

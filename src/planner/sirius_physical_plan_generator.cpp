@@ -44,6 +44,7 @@
 #include "io/s3/duckdb_secret_config.hpp"
 #include "io/uri_parser.hpp"
 #include "log/logging.hpp"
+#include "op/aggregate/aggregate_op_util.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/dynamic_filter/sirius_physical_build_filter.hpp"
 #include "op/partition/consumer_partition_policy.hpp"
@@ -1008,6 +1009,9 @@ plan_lineage collect_semantic_lineage(
       if (index >= 0) mark_semantic(lineage_at(children[0], index));
     for (auto index : aggregate.cudf_aggregate_idx)
       if (index >= 0) mark_semantic(lineage_at(children[0], index));
+    // FIRST carries its input through cuDF gathers and concatenation before host export.
+    for (auto index : op::carried_inputs(aggregate.aggregate_slots))
+      mark_semantic(lineage_at(children[0], index));
     result.columns.resize(node.types.size());
   } else if (node.type == type::UNGROUPED_AGGREGATE && children.size() == 1) {
     for (auto const& expression : node.Cast<op::sirius_physical_ungrouped_aggregate>().aggregates)
@@ -1338,7 +1342,8 @@ void wrap_hash_group_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 
     // Construct the merge while the child still carries the final SQL schema. COUNT(DISTINCT)
     // emits LIST sets locally and only becomes BIGINT after merge post-processing;
-    // STDDEV_SAMP emits count/mean/M2 STRUCT states and only becomes DOUBLE after merge.
+    // STDDEV_SAMP emits count/mean/M2 STRUCT states and only becomes DOUBLE after merge; the local
+    // schema puts FIRST columns after the partials.
     auto merge = duckdb::make_uniq<sirius::op::sirius_physical_grouped_aggregate_merge>(
       &hgb_ptr->Cast<sirius::op::sirius_physical_grouped_aggregate>(),
       op_params.hash_partition_bytes);
@@ -1348,9 +1353,10 @@ void wrap_hash_group_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 
     auto& grouped = hgb_ptr->Cast<sirius::op::sirius_physical_grouped_aggregate>();
     bool const has_supported_count_distinct_layout =
-      grouped.has_count_distinct && !grouped.has_avg && !hgb_ptr->has_physical_overrides() &&
+      grouped.has_count_distinct && !grouped.has_avg && !grouped.has_first &&
+      !hgb_ptr->has_physical_overrides() &&
       hgb_ptr->types.size() == grouped.num_output_group_columns() + grouped.aggregate_slots.size();
-    if (grouped.has_stddev_samp()) {
+    if (grouped.has_stddev_samp() || grouped.has_first) {
       hgb_ptr->types = grouped.local_types;
     } else if (has_supported_count_distinct_layout) {
       hgb_ptr->types = grouped.get_count_distinct_local_output_types();

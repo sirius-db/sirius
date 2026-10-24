@@ -245,16 +245,17 @@ std::unique_ptr<sirius::ast::node> make_aggregate_expression(uint32_t input_idx,
     function, std::move(arguments), sirius::logical_type::make(sirius::type_id::BIGINT), distinct});
 }
 
-// A HASH_GROUP_BY over @p child grouping on @p group_columns with one @p function per entry of
-// @p aggregate_input_columns; output layout is [keys..., aggregates...].
+// A HASH_GROUP_BY over @p child grouping on @p group_columns with `functions[i]` over
+// `aggregate_input_columns[i]`; output layout is [keys..., aggregates...].
 duckdb::unique_ptr<sirius::op::sirius_physical_grouped_aggregate> make_grouped_aggregate(
   std::vector<uint32_t> group_columns,
   std::vector<uint32_t> aggregate_input_columns,
   duckdb::unique_ptr<sirius_physical_operator> child,
-  duckdb::vector<duckdb::GroupingSet> grouping_sets = {},
-  sirius::aggregate_id function                     = sirius::aggregate_id::sum,
-  bool distinct                                     = false)
+  duckdb::vector<duckdb::GroupingSet> grouping_sets,
+  std::vector<sirius::aggregate_id> const& functions,
+  bool distinct = false)
 {
+  REQUIRE(functions.size() == aggregate_input_columns.size());
   duckdb::vector<sirius::logical_type> output_types;
   duckdb::vector<std::unique_ptr<sirius::ast::node>> groups;
   for (auto const group_idx : group_columns) {
@@ -262,9 +263,10 @@ duckdb::unique_ptr<sirius::op::sirius_physical_grouped_aggregate> make_grouped_a
     groups.push_back(make_reference(group_idx));
   }
   duckdb::vector<std::unique_ptr<sirius::ast::node>> expressions;
-  for (auto const input_idx : aggregate_input_columns) {
+  for (std::size_t i = 0; i < aggregate_input_columns.size(); ++i) {
     output_types.push_back(sirius::logical_type::make(sirius::type_id::BIGINT));
-    expressions.push_back(make_aggregate_expression(input_idx, function, distinct));
+    expressions.push_back(
+      make_aggregate_expression(aggregate_input_columns[i], functions[i], distinct));
   }
   auto aggregate = duckdb::make_uniq<sirius::op::sirius_physical_grouped_aggregate>(
     std::move(output_types),
@@ -277,6 +279,24 @@ duckdb::unique_ptr<sirius::op::sirius_physical_grouped_aggregate> make_grouped_a
     duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES);
   aggregate->children.push_back(std::move(child));
   return aggregate;
+}
+
+// The same with one @p function for every input.
+duckdb::unique_ptr<sirius::op::sirius_physical_grouped_aggregate> make_grouped_aggregate(
+  std::vector<uint32_t> group_columns,
+  std::vector<uint32_t> aggregate_input_columns,
+  duckdb::unique_ptr<sirius_physical_operator> child,
+  duckdb::vector<duckdb::GroupingSet> grouping_sets = {},
+  sirius::aggregate_id function                     = sirius::aggregate_id::sum,
+  bool distinct                                     = false)
+{
+  std::vector<sirius::aggregate_id> const functions(aggregate_input_columns.size(), function);
+  return make_grouped_aggregate(std::move(group_columns),
+                                std::move(aggregate_input_columns),
+                                std::move(child),
+                                std::move(grouping_sets),
+                                functions,
+                                distinct);
 }
 
 // A two-column scan of `types` carried as `physical`, filtered by the column-versus-column
@@ -477,6 +497,31 @@ TEST_CASE("tier_narrowing_policy - grouped-aggregate keys keep narrow only when 
     REQUIRE(retracted == 0);
     REQUIRE(plan->children[0]->get_physical_types() ==
             std::vector<cudf::data_type>{k_int8, k_int8});
+  }
+
+  SECTION("FIRST makes the aggregate ineligible")
+  {
+    // The mirror of the propagation ladder's FIRST section: no transport for the key, so both
+    // columns retract.
+    auto plan = make_grouped_aggregate(
+      {0}, {1}, make_integer_scan(2, {k_int8, k_int8}), {}, sirius::aggregate_id::first);
+
+    sirius::planner::apply_tier_narrowing_policy(*plan);
+
+    REQUIRE(!plan->children[0]->has_physical_overrides());
+  }
+
+  SECTION("FIRST beside SUM makes the aggregate ineligible")
+  {
+    auto plan = make_grouped_aggregate({0},
+                                       {1, 2},
+                                       make_integer_scan(3, {k_int8, k_int8, k_int8}),
+                                       {},
+                                       {sirius::aggregate_id::first, sirius::aggregate_id::sum});
+
+    sirius::planner::apply_tier_narrowing_policy(*plan);
+
+    REQUIRE(!plan->children[0]->has_physical_overrides());
   }
 
   SECTION("COUNT_VALID does not constrain a counted group key")
