@@ -1087,6 +1087,40 @@ void test_decimal128_bitpack_named_channels()
                    "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n");
 }
 
+// Bitpack leaves behind Delta, Rle, For or Zigzag are measured and then packed straight into
+// place. Columns of several chunks with a partial last one round-trip, for every lane width.
+void test_measured_bitpack_roundtrip()
+{
+  constexpr int rows = 10 * 1024 + 500;
+  std::vector<std::unique_ptr<cudf::table>> tables;
+  tables.push_back(make_int32_table(1, rows, 3));
+  tables.push_back(make_int64_table(1, rows, 5));
+  tables.push_back(make_decimal128_table(1, rows, 7));
+  std::string const plans[] = {
+    "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n",
+    "input -> delta -> differences\n"
+    "delta.differences -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n",
+    "input -> delta -> differences\n"
+    "delta.differences -> rle -> runs, values\n"
+    "delta.differences.runs -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
+    "delta.differences.values -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n",
+    "input -> rle -> runs, values\n"
+    "rle.runs -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
+    "rle.values -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n",
+    "input -> for -> deltas, references\n"
+    "for.deltas -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n",
+    "input -> zigzag -> zigzag\n"
+    "zigzag.zigzag -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n",
+  };
+  for (auto const& table : tables) {
+    for (auto const& plan : plans) {
+      auto const label = "measured bitpack: " + plan;
+      io_roundtrip(label.c_str(), table->view(), plan);
+      memory_roundtrip(label.c_str(), table->view(), plan);
+    }
+  }
+}
+
 int main()
 {
   if (cudaSetDevice(0) != cudaSuccess) {
@@ -1129,6 +1163,7 @@ int main()
     {"decimal128_bitpack", test_decimal128_bitpack_roundtrip},
     {"decimal128_identity", test_decimal128_identity_roundtrip},
     {"decimal128_bitpack_named_channels", test_decimal128_bitpack_named_channels},
+    {"measured_bitpack_roundtrip", test_measured_bitpack_roundtrip},
   };
 
   int failures = 0;

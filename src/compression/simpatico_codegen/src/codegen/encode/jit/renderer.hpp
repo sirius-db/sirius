@@ -47,7 +47,7 @@
 //
 // Buffer layout contract
 // ----------------------
-// The encode kernel always emits the OverAllocate layout: `packed` is sized
+// In full mode (see EncodeRenderMode) the kernel emits the OverAllocate layout: `packed` is sized
 // `num_chunks * kStrideWords` per Bitpack node, and each chunk's words land at
 // the fixed arithmetic offset `chunk_id * kStrideWords` — so no `bp_offsets`
 // and no host cumsum are needed to write. `live_words[c]` reports the actual
@@ -123,6 +123,20 @@ struct EncodeKernelSpec {
 // renderer — see codegen::jit::RenderError.
 using ::codegen::jit::RenderError;
 
+// What a rendered encode kernel does with its Bitpack nodes.
+//   full    : reduce each chunk's range, write its metadata and its packed words into a
+//             full-width slot (`packed` sized num_chunks * stride), the layout above.
+//   measure : reduce and write the metadata (chunk_min/count/bits, the live-word counter)
+//             only; no packed words. `packed` is not touched.
+//   pack    : read each chunk's chunk_min and chunk_bits back from a measure pass instead
+//             of reducing, and write its packed words at word offset bp_offsets[chunk] of
+//             a dense, pre-zeroed `packed`, which the caller sizes from the measure pass.
+// measure and pack support Bitpack leaves behind Delta, For, transformer Zigzag and Rle (whose
+// children must then both be Bitpack leaves); in pack mode Rle leaves its run offsets, which
+// the caller scanned after the measure pass, untouched. Raw passthrough and a Zigzag leaf
+// throw RenderError.
+enum class EncodeRenderMode { full, measure, pack };
+
 // Render an EncodeKernelSpec for `tree` parametrised over `element_dtype`.
 //
 // `tree`           : the runtime FusedTree (caller-owned).
@@ -142,6 +156,7 @@ using ::codegen::jit::RenderError;
 // num_chunks < 1).
 EncodeKernelSpec render(const ::codegen::jit::FusedTree& tree,
                         const std::string& element_dtype,
-                        int32_t num_chunks);
+                        int32_t num_chunks,
+                        EncodeRenderMode mode = EncodeRenderMode::full);
 
 }  // namespace codegen::encode::jit
