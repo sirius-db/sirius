@@ -9,6 +9,7 @@
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/catalog/catalog_entry/table_catalog_entry.hpp>
 #include <duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp>
+#include <duckdb/common/enums/statement_type.hpp>
 #include <duckdb/function/table/table_scan.hpp>
 #include <duckdb/main/extension/extension_loader.hpp>
 #include <duckdb/parser/parsed_data/create_table_function_info.hpp>
@@ -170,6 +171,26 @@ TEST_CASE("Shared callback verification includes semantic settings", "[paimon_bi
     REQUIRE(trusted.statistics_extended != nullptr);
     candidate.statistics_extended = nullptr;
   }
+  SECTION("table entry")
+  {
+    REQUIRE(trusted.get_table_entry != nullptr);
+    candidate.get_table_entry = nullptr;
+  }
+  SECTION("SQL reconstruction")
+  {
+    REQUIRE(trusted.to_sql != nullptr);
+    candidate.to_sql = nullptr;
+  }
+  SECTION("return mode")
+  {
+    candidate.return_type = duckdb::TableFunctionReturnType::SET_RETURNING_FUNCTION;
+  }
+  SECTION("statement result") { candidate.call_return_type = duckdb::StatementReturnType::NOTHING; }
+  SECTION("serialization verification")
+  {
+    candidate.verify_serialization = !trusted.verify_serialization;
+  }
+  SECTION("name") { candidate.SetName("forged_scan"); }
   REQUIRE_FALSE(sirius::planner::detail::same_scan_callbacks(trusted, candidate));
 }
 
@@ -299,6 +320,32 @@ TEST_CASE("Paimon descriptor consumer authenticates real loaded bindings",
     forged.init_local = nullptr;
     CHECK_THROWS(provider.retain(forged, bound.data.get()));
     CHECK_THROWS(provider.retain(bound.function, nullptr));
+    duckdb::TableFunctionData foreign_bind;
+    CHECK_THROWS(provider.retain(bound.function, &foreign_bind));
+  }
+  SECTION("table, SQL, return and serialization semantics are authenticated")
+  {
+    auto forged            = bound.function;
+    forged.get_table_entry = +[](duckdb::optional_ptr<duckdb::FunctionData const>)
+      -> duckdb::optional_ptr<duckdb::TableCatalogEntry> { return nullptr; };
+    CHECK_THROWS(provider.retain(forged, bound.data.get()));
+    forged        = bound.function;
+    forged.to_sql = +[](duckdb::ClientContext&, duckdb::LogicalGet const&) {
+      return duckdb::TableFunctionToSQLResult{};
+    };
+    CHECK_THROWS(provider.retain(forged, bound.data.get()));
+    forged             = bound.function;
+    forged.return_type = duckdb::TableFunctionReturnType::SET_RETURNING_FUNCTION;
+    CHECK_THROWS(provider.retain(forged, bound.data.get()));
+    forged                  = bound.function;
+    forged.call_return_type = duckdb::StatementReturnType::NOTHING;
+    CHECK_THROWS(provider.retain(forged, bound.data.get()));
+    forged                      = bound.function;
+    forged.verify_serialization = !forged.verify_serialization;
+    CHECK_THROWS(provider.retain(forged, bound.data.get()));
+    forged = bound.function;
+    forged.SetName("forged_paimon_scan");
+    CHECK_THROWS(provider.retain(forged, bound.data.get()));
   }
   SECTION("mutable catalog cannot grant trust")
   {

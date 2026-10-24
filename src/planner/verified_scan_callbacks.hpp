@@ -22,7 +22,11 @@
 
 namespace sirius::planner::detail {
 // Compare semantic callbacks and scan settings before inspecting provider-owned info.
-// Info identity/layout is a separate, provider-specific contract.
+// Audited against DuckDB 88ecd0a BaseTableFunction: only get_metrics, to_string,
+// and table_scan_progress are excluded as presentation/profiling. Info identity
+// and layout are checked separately by the provider-specific caller.
+// The host's operator== omits semantic fields and includes presentation hooks,
+// so it cannot replace this comparison. Bound call values are read-identity input.
 template <class Function>
 bool same_scan_callbacks(duckdb::TableFunction const& reference, Function const& candidate)
 {
@@ -42,6 +46,8 @@ bool same_scan_callbacks(duckdb::TableFunction const& reference, Function const&
                   reference.pushdown_expression,
                   reference.get_partition_data,
                   reference.get_bind_info,
+                  reference.get_table_entry,
+                  reference.to_sql,
                   reference.projection_expression_pushdown,
                   reference.get_multi_file_reader,
                   reference.supports_pushdown_type,
@@ -53,14 +59,18 @@ bool same_scan_callbacks(duckdb::TableFunction const& reference, Function const&
                   reference.set_scan_order,
                   reference.serialize,
                   reference.deserialize,
+                  reference.verify_serialization,
                   reference.projection_pushdown,
                   reference.filter_pushdown,
                   reference.filter_prune,
                   reference.sampling_pushdown,
                   reference.late_materialization,
+                  reference.return_type,
+                  reference.call_return_type,
                   reference.order_preservation_type,
                   reference.global_initialization,
                   reference.GetSignature(),
+                  reference.GetName(),
                   reference.is_repeatable,
                   reference.set_partitions_to_scan,
                   reference.parallelism) == std::tie(candidate.function,
@@ -79,6 +89,8 @@ bool same_scan_callbacks(duckdb::TableFunction const& reference, Function const&
                                                      candidate.pushdown_expression,
                                                      candidate.get_partition_data,
                                                      candidate.get_bind_info,
+                                                     candidate.get_table_entry,
+                                                     candidate.to_sql,
                                                      candidate.projection_expression_pushdown,
                                                      candidate.get_multi_file_reader,
                                                      candidate.supports_pushdown_type,
@@ -90,14 +102,18 @@ bool same_scan_callbacks(duckdb::TableFunction const& reference, Function const&
                                                      candidate.set_scan_order,
                                                      candidate.serialize,
                                                      candidate.deserialize,
+                                                     candidate.verify_serialization,
                                                      candidate.projection_pushdown,
                                                      candidate.filter_pushdown,
                                                      candidate.filter_prune,
                                                      candidate.sampling_pushdown,
                                                      candidate.late_materialization,
+                                                     candidate.return_type,
+                                                     candidate.call_return_type,
                                                      candidate.order_preservation_type,
                                                      candidate.global_initialization,
                                                      candidate.GetSignature(),
+                                                     candidate.GetName(),
                                                      candidate.is_repeatable,
                                                      candidate.set_partitions_to_scan,
                                                      candidate.parallelism);
