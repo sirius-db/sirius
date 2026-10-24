@@ -133,10 +133,9 @@ inline bool const* checked_prior_keep(cudf::column_view const& probe,
   return prior_keep.is_empty() ? nullptr : prior_keep.data<bool>();
 }
 
-/// Validity of the probe rows. A null probe key can never equal a build key: admission never
-/// routes a null-safe (IS NOT DISTINCT FROM) comparison here and the authoritative join runs with
-/// null_equality::UNEQUAL, so a null row is a definite non-member and the kernels write `false`
-/// for it instead of propagating the probe's null mask onto the output. @p words is the probe
+/// Validity of the probe rows. Ordinary equality rejects NULL probe keys; explicitly null-safe
+/// membership preserves them unless a prior mask rejected the row. Both policies produce a
+/// nonnullable output mask. @p words is the probe
 /// column's own bitmask (null = the column has no nulls), read at `offset + row` because a
 /// column_view's mask pointer is not offset-adjusted.
 struct probe_validity {
@@ -291,11 +290,16 @@ struct membership_probe_functor {
   std::uint32_t const* __restrict__ prior_words;  // packed 1 bit/row, or null
   bool const* __restrict__ prior_keep;
   probe_validity valid;
+  bool preserve_nulls;
 
   __device__ __forceinline__ void operator()(cudf::size_type idx) const noexcept
   {
-    if (!prior_mask_keeps(prior_words, idx) || !prior_mask_keeps(prior_keep, idx) || !valid(idx)) {
+    if (!prior_mask_keeps(prior_words, idx) || !prior_mask_keeps(prior_keep, idx)) {
       out[idx] = false;
+      return;
+    }
+    if (!valid(idx)) {
+      out[idx] = preserve_nulls;
       return;
     }
     key_type key;
@@ -307,8 +311,8 @@ struct membership_probe_functor {
 /// returns null when the probe type is incompatible; otherwise allocates the BOOL8 result and
 /// launches `membership_probe_functor` with @p lookup on @p stream. A pinned chunk may store the
 /// key narrowed while the filter was published at the native carrier; the kernel converts per
-/// element rather than materializing a widened copy. Null probe rows are written as `false`
-/// in-kernel, so the mask is non-nullable by construction.
+/// element rather than materializing a widened copy. Null probe rows use the NULL-preservation
+/// policy in-kernel, so the mask is non-nullable by construction.
 template <class KeyT, class Lookup>
 [[nodiscard]] std::unique_ptr<cudf::column> run_membership_probe(
   membership_key_domain const& domain,
@@ -317,7 +321,8 @@ template <class KeyT, class Lookup>
   ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr,
   Lookup lookup,
-  bool const* prior_keep = nullptr)
+  bool const* prior_keep = nullptr,
+  bool preserve_nulls    = false)
 {
   std::unique_ptr<cudf::column> out;
   auto const n          = probe.size();
@@ -327,8 +332,13 @@ template <class KeyT, class Lookup>
     auto* const outp = out->mutable_view().data<bool>();
     CUCASCADE_CUDA_TRY(cub::DeviceFor::Bulk(
       n,
-      membership_probe_functor<decltype(adapter), Lookup>{
-        adapter, lookup, outp, prior_mask_words, prior_keep, probe_validity_of(probe)},
+      membership_probe_functor<decltype(adapter), Lookup>{adapter,
+                                                          lookup,
+                                                          outp,
+                                                          prior_mask_words,
+                                                          prior_keep,
+                                                          probe_validity_of(probe),
+                                                          preserve_nulls},
       stream.get()));
   });
   if (!dispatched) { return nullptr; }

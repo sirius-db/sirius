@@ -547,8 +547,14 @@ std::unique_ptr<cudf::column> sirius_dynamic_bloom_filter::compute_mask_impl(
   if (auto const* accumulated = _impl ? _impl->find_accumulated(resolved) : nullptr) {
     return detail::dispatch_key_rep(_domain.rep, [&]<class Key>(Key) {
       auto const ref = accumulated_ref<Key>(accumulated->bits->data(), accumulated->blocks);
-      return detail::run_membership_probe<Key>(
-        _domain, probe, prior_mask_words, stream, mr, bloom_lookup<decltype(ref)>{ref}, prior_keep);
+      return detail::run_membership_probe<Key>(_domain,
+                                               probe,
+                                               prior_mask_words,
+                                               stream,
+                                               mr,
+                                               bloom_lookup<decltype(ref)>{ref},
+                                               prior_keep,
+                                               preserves_nulls());
     });
   }
   auto const* replica = _impl ? _impl->find(resolved) : nullptr;
@@ -559,8 +565,14 @@ std::unique_ptr<cudf::column> sirius_dynamic_bloom_filter::compute_mask_impl(
       using owner_type = std::decay_t<decltype(bloom)>;
       using key_type   = typename owner_type::element_type::key_type;
       auto ref         = bloom->ref();
-      return detail::run_membership_probe<key_type>(
-        _domain, probe, prior_mask_words, stream, mr, bloom_lookup<decltype(ref)>{ref}, prior_keep);
+      return detail::run_membership_probe<key_type>(_domain,
+                                                    probe,
+                                                    prior_mask_words,
+                                                    stream,
+                                                    mr,
+                                                    bloom_lookup<decltype(ref)>{ref},
+                                                    prior_keep,
+                                                    preserves_nulls());
     },
     replica->bloom);
 }

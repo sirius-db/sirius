@@ -413,8 +413,14 @@ std::unique_ptr<cudf::column> sirius_dynamic_in_list_filter::compute_mask_impl(
       using owner_type = std::decay_t<decltype(set)>;
       using key_type   = typename owner_type::element_type::key_type;
       auto ref         = set->ref(cuco::contains);
-      return detail::run_membership_probe<key_type>(
-        _domain, probe, prior_mask_words, stream, mr, set_lookup<decltype(ref)>{ref}, prior_keep);
+      return detail::run_membership_probe<key_type>(_domain,
+                                                    probe,
+                                                    prior_mask_words,
+                                                    stream,
+                                                    mr,
+                                                    set_lookup<decltype(ref)>{ref},
+                                                    prior_keep,
+                                                    preserves_nulls());
     },
     replica->set);
 }

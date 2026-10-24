@@ -100,12 +100,20 @@ std::optional<descent_step> join_block_descent(
 {
   auto const probe_block_size = probe_block_output_columns.size();
   if (output_ordinal < probe_block_size) {
+    if (policy.preserve_nulls &&
+        (join_type == duckdb::JoinType::RIGHT || join_type == duckdb::JoinType::OUTER)) {
+      return std::nullopt;
+    }
     if (!probe_block_descent_admissible(join_type)) { return std::nullopt; }
     return descent_step{
       .child_index   = 0,
       .child_ordinal = static_cast<std::size_t>(probe_block_output_columns[output_ordinal])};
   }
   if (!policy.descend_build_blocks) { return std::nullopt; }
+  if (policy.preserve_nulls &&
+      (join_type == duckdb::JoinType::LEFT || join_type == duckdb::JoinType::OUTER)) {
+    return std::nullopt;
+  }
   if (!build_block_descent_admissible(join_type)) { return std::nullopt; }
   auto const build_ordinal = output_ordinal - probe_block_size;
   if (build_ordinal >= build_block_output_columns.size()) { return std::nullopt; }
