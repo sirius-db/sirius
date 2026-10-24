@@ -1,6 +1,7 @@
 target_sources(
   sirius_objects
   PRIVATE connector_registry.cpp
+          paimon_bound_read.cpp
           decimal_sum_input_bounds.cpp
           late_mat_plan_pass.cpp
           dynamic_filter/build_filter_evidence.cpp

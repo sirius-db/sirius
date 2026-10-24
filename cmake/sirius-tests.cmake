@@ -1,7 +1,66 @@
 find_package(Catch2 3 REQUIRED CONFIG)
 
+# The descriptor consumer has no GPU/native SDK dependency. This host can LOAD a
+# matching Paimon DSO without linking Paimon or another Sirius engine instance.
+add_executable(
+  sirius_paimon_binding_test src/planner/paimon_bound_read.cpp
+                             test/cpp/planner/test_paimon_bound_read.cpp)
+target_link_libraries(
+  sirius_paimon_binding_test PRIVATE Catch2::Catch2WithMain
+                                     sirius::duckdb_dependency ${CMAKE_DL_LIBS})
+sirius_link_duckdb_extensions(sirius_paimon_binding_test PRIVATE)
+target_include_directories(
+  sirius_paimon_binding_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src"
+                                     "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp")
+set_target_properties(
+  sirius_paimon_binding_test
+  PROPERTIES ENABLE_EXPORTS ON
+             CXX_SCAN_FOR_MODULES OFF
+             CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON
+             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/cpp")
+
+# Small hidden DSO for routine ABI and failed-output cleanup counterexamples.
+add_library(sirius_paimon_binding_fixture MODULE
+            test/cpp/utils/paimon_binding_fixture.cpp)
+target_include_directories(
+  sirius_paimon_binding_fixture
+  PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src"
+          "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp"
+          "${SIRIUS_DUCKDB_SOURCE_DIR}/src/include")
+set_target_properties(
+  sirius_paimon_binding_fixture
+  PROPERTIES PREFIX ""
+             OUTPUT_NAME "paimon"
+             SUFFIX ".duckdb_extension"
+             CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON
+             CXX_SCAN_FOR_MODULES OFF
+             CXX_VISIBILITY_PRESET hidden
+             VISIBILITY_INLINES_HIDDEN ON
+             LIBRARY_OUTPUT_DIRECTORY
+             "${CMAKE_CURRENT_BINARY_DIR}/test/cpp/paimon_binding_fixture")
+get_directory_property(
+  _paimon_fixture_version DIRECTORY "${SIRIUS_DUCKDB_SOURCE_DIR}" DEFINITION
+                                    DUCKDB_NORMALIZED_VERSION)
+get_directory_property(_paimon_duckdb_binary
+                       DIRECTORY "${SIRIUS_DUCKDB_SOURCE_DIR}" BINARY_DIR)
+add_custom_command(
+  TARGET sirius_paimon_binding_fixture
+  POST_BUILD
+  COMMAND
+    ${CMAKE_COMMAND} -DABI_TYPE=CPP
+    -DEXTENSION=$<TARGET_FILE:sirius_paimon_binding_fixture>
+    -DPLATFORM_FILE=${_paimon_duckdb_binary}/duckdb_platform_out
+    -DVERSION_FIELD=${_paimon_fixture_version} -DEXTENSION_VERSION=fixture
+    -DNULL_FILE=${SIRIUS_DUCKDB_SOURCE_DIR}/scripts/null.txt -P
+    ${SIRIUS_DUCKDB_SOURCE_DIR}/scripts/append_metadata.cmake)
+add_dependencies(sirius_paimon_binding_fixture duckdb_platform)
+add_dependencies(sirius_paimon_binding_test sirius_paimon_binding_fixture)
+
 add_executable(sirius_unittest ${TEST_SOURCES} src/sirius_extension_entry.cpp
                                test/cpp/utils/sirius_extension_loader.cpp)
+add_dependencies(sirius_unittest sirius_paimon_binding_fixture)
 # Export DuckDB's host API for third-party extensions such as Iceberg.
 set_target_properties(sirius_unittest PROPERTIES ENABLE_EXPORTS ON)
 # Load Sirius in a DuckDB-only host to avoid a second embedded engine copy.
