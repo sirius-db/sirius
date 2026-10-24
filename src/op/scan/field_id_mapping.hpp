@@ -66,7 +66,7 @@ class field_id_mapping {
   std::vector<operation> operations_;
 };
 
-// Prepared-unit entry point. It consumes the same source, footer and R2a physical
+// Prepared-unit entry point. It consumes the same source, footer and physical
 // checks as the legacy path, then applies the immutable mapping before semantics.
 materialized_batch materialize_mapped_parquet(parquet_source const&,
                                               field_id_mapping const&,

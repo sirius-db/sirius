@@ -8,7 +8,7 @@
   "last-partition-id": 999,
   "last-sequence-number": 1,
   "last-updated-ms": 1700000000000,
-  "location": "test/cpp/integration/data/iceberg_r4_evolution",
+  "location": "test/cpp/integration/data/iceberg_evolved_fields_with_deletes",
   "metadata-log": [],
   "next-row-id": 5,
   "partition-specs": [
@@ -67,7 +67,7 @@
     {
       "added-rows": 5,
       "first-row-id": 0,
-      "manifest-list": "test/cpp/integration/data/iceberg_r4_evolution/metadata/snap-2000000000000000001-1-b2c3d4e5-0002-0002-0002-000000000005.avro",
+      "manifest-list": "test/cpp/integration/data/iceberg_evolved_fields_with_deletes/metadata/snap-2000000000000000001-1-b2c3d4e5-0002-0002-0002-000000000005.avro",
       "schema-id": 0,
       "sequence-number": 1,
       "snapshot-id": 2000000000000000001,

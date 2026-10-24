@@ -414,8 +414,8 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
                  "Native connector certifies type before storage metadata",
                  "[scan][certificate][integration]")
 {
-  run_ok("CREATE TABLE r2a_certified_native(i INTEGER)");
-  run_ok("CREATE TEMP TABLE r2a_unqualified_native(v DECIMAL(38,2))");
+  run_ok("CREATE TABLE scan_certified_native(i INTEGER)");
+  run_ok("CREATE TEMP TABLE scan_unqualified_native(v DECIMAL(38,2))");
   run_ok("CHECKPOINT");
   run_ok("SET gpu_execution=false");
   run_ok("BEGIN TRANSACTION READ ONLY");
@@ -435,7 +435,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     return connector->certify({}, scan, *con->context, generator.contract_provenance);
   };
 
-  auto supported = certify("r2a_certified_native");
+  auto supported = certify("scan_certified_native");
   CHECK(supported.verdict == eligibility_verdict::supported);
   REQUIRE(supported.storage_version);
   CHECK(*supported.storage_version >= static_cast<uint64_t>(duckdb::StorageVersion::V0_10_2));
@@ -443,7 +443,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   CHECK(supported.later_checks.test(static_cast<std::size_t>(later_check::segments_per_range)));
   CHECK(supported.later_checks.test(static_cast<std::size_t>(later_check::matrix_per_range)));
 
-  auto rejected = certify("r2a_unqualified_native");
+  auto rejected = certify("scan_unqualified_native");
   CHECK(rejected.verdict == eligibility_verdict::unsupported);
   CHECK(rejected.reason == verdict_reason::native_type_decimal128);
   CHECK(rejected.reason_text.find("DECIMAL128") != std::string::npos);

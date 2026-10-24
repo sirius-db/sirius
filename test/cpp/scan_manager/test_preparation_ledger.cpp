@@ -267,7 +267,7 @@ TEST_CASE("Preparation claim uses the adapter capability without an admission",
   CHECK(adapter.custom_stop_seen);
 }
 TEST_CASE("Ordinary split provider cancellation drains queued and running metadata",
-          "[scan_preparation][split_provider][r4]")
+          "[scan_preparation][split_provider][cancellation]")
 {
   class cancellable_ingestible final : public contract_ingestible {
    public:

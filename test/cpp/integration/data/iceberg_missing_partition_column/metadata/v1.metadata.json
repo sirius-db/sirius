@@ -8,7 +8,7 @@
   "last-partition-id": 1000,
   "last-sequence-number": 1,
   "last-updated-ms": 1700000000000,
-  "location": "test/cpp/integration/data/iceberg_r4_partition_missing",
+  "location": "test/cpp/integration/data/iceberg_missing_partition_column",
   "metadata-log": [],
   "partition-spec": [
     {
@@ -65,7 +65,7 @@
   ],
   "snapshots": [
     {
-      "manifest-list": "test/cpp/integration/data/iceberg_r4_partition_missing/metadata/snap-1000000000000000001-1-a1b2c3d4-0001-0001-0001-000000000001.avro",
+      "manifest-list": "test/cpp/integration/data/iceberg_missing_partition_column/metadata/snap-1000000000000000001-1-a1b2c3d4-0001-0001-0001-000000000001.avro",
       "schema-id": 0,
       "sequence-number": 1,
       "snapshot-id": 1000000000000000001,

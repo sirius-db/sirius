@@ -98,7 +98,7 @@ The verifier compares the declared row count with the imported batch, sends resu
 directly to a bounded sink, and calls `cancel()` on source, validation, import, or sink
 failure. Producers acquire preparation/output capacity and split oversized input before
 returning an item. An adapter may bridge an `ArrowArrayStream` one batch at a time, but
-R4 does not add a public Fragment Arrow-input API or a native Paimon/DuckLake adapter.
+this interface does not add a public Fragment Arrow-input API or a native Paimon/DuckLake adapter.
 
 ### Preparation limits
 

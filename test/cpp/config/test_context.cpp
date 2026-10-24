@@ -2312,7 +2312,7 @@ TEST_CASE("gpu_to_gpu round-trip preserves bytes on N>=2 hosts (MGPU-04 + MGPU-0
   auto checksum_pre = compute_batch_checksum_fnv1a64(*batch, stream);
 
   // GPU0 -> GPU1 forward leg.
-  // Phase 18 / DB-03 Recipe R8 + R3: scoped mutable accessor.
+  // Scoped mutable accessor.
   {
     auto mut = batch->to_mutable();
     mut.convert_to<cucascade::gpu_table_representation>(registry, gpu1, stream);
@@ -2328,7 +2328,7 @@ TEST_CASE("gpu_to_gpu round-trip preserves bytes on N>=2 hosts (MGPU-04 + MGPU-0
   // SiriusContext::initialize() closes the Phase-4-deferred GPU1 -> GPU0
   // bug. Checksum integrity guard per RESEARCH.md Pitfall 2 (silent data
   // corruption on Ada Lovelace + Sapphire Rapids).
-  // Phase 18 / DB-03 Recipe R8 + R3: scoped mutable accessor.
+  // Scoped mutable accessor.
   {
     auto mut = batch->to_mutable();
     mut.convert_to<cucascade::gpu_table_representation>(registry, gpu0, stream);
