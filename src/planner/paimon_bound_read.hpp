@@ -21,6 +21,7 @@ class paimon_bound_read {
 
   // Borrowed until this owner is moved or destroyed. Options can contain credentials:
   // never log/serialize this view. Empty-at-bind is distinct from resolving latest.
+  // Synchronize access against moving/destroying this owner.
   PaimonBoundReadViewV1 const& view() const;
 
  private:
@@ -37,6 +38,8 @@ class paimon_read_provider {
   // Acquire once per provider; later LOADs require a new acquisition.
   static paimon_read_provider from_loaded(duckdb::DatabaseInstance&);
 
+  // Independent retains may overlap: keep the provider, function and binding alive
+  // and unchanged until each call returns. Each descriptor has its own owner.
   paimon_bound_read retain(duckdb::BoundTableFunction const&, duckdb::FunctionData const*) const;
 
  private:

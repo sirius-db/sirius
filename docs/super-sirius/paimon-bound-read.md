@@ -22,6 +22,10 @@ The descriptor owns its borrowed view and retains the provider independently of 
 original binding, provider wrapper, connection, and database. Moving an owner invalidates
 access through the moved-from wrapper. View options can contain credentials: do not
 log, serialize, or expose them. Keep the descriptor alive while using its view.
+Independent retains and separately owned descriptors may be used concurrently with
+the qualified producer. Keep their input binding/function and provider alive and
+unchanged through each retain; synchronize view access against moving or destroying
+its owner. Shared lifetime alone does not synchronize access to the same wrapper.
 
 ## Current scope
 

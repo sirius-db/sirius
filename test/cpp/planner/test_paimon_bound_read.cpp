@@ -15,10 +15,13 @@
 #include <duckdb/parser/parsed_data/create_table_function_info.hpp>
 #include <duckdb/parser/tableref/table_function_ref.hpp>
 
+#include <array>
+#include <barrier>
 #include <cstdlib>
 #include <filesystem>
 #include <optional>
 #include <string_view>
+#include <thread>
 
 namespace {
 using sirius::planner::paimon_bound_read;
@@ -452,4 +455,44 @@ TEST_CASE("Paimon descriptors authenticate both Sirius load orders", "[.][paimon
   REQUIRE(chunk != nullptr);
   REQUIRE(chunk->size() == 1);
   CHECK(chunk->GetValue(0, 0).GetValue<int64_t>() == 10);
+}
+
+TEST_CASE("Paimon independent descriptor callbacks may overlap", "[.][paimon_binding_dynamic]")
+{
+  warehouse_directory warehouse;
+  duckdb::DBConfig config;
+  dynamic_config(config);
+  duckdb::DuckDB db(nullptr, &config);
+  duckdb::Connection con(db);
+  load(con);
+  sql(con, "ATTACH " + quote(warehouse.path.string()) + " AS pm (TYPE paimon)");
+  sql(con, "CREATE SCHEMA pm.test");
+  sql(con, "CREATE TABLE pm.test.t (id INTEGER, value INTEGER)");
+  sql(con, "INSERT INTO pm.test.t VALUES (1, 10)");
+  auto bound    = bind_paimon(con, warehouse.path.string(), 0);
+  auto provider = paimon_read_provider::from_loaded(*db.instance);
+  auto retained = provider.retain(bound.function, bound.data.get());
+  auto snapshot = retained.view().snapshot_id;
+  std::barrier start(4);
+  std::array<std::exception_ptr, 4> errors{};
+  {
+    std::array<std::jthread, 4> workers;
+    for (size_t lane = 0; lane < workers.size(); ++lane) {
+      workers[lane] = std::jthread([&, lane] {
+        start.arrive_and_wait();
+        try {
+          for (unsigned iteration = 0; iteration < 32; ++iteration) {
+            auto copy = provider.retain(bound.function, bound.data.get());
+            if (copy.view().snapshot_id != snapshot || text(copy.view().table) != "t")
+              throw std::runtime_error("Concurrent descriptor identity changed");
+          }
+        } catch (...) {
+          errors[lane] = std::current_exception();
+        }
+      });
+    }
+  }
+  for (auto const& error : errors)
+    if (error) std::rethrow_exception(error);
+  CHECK(retained.view().snapshot_id == snapshot);
 }
