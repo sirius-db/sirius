@@ -58,8 +58,9 @@ TEST_CASE("rotate_rows is an in-order fmaf chain per output whatever the batch",
     sirius::vss::rotate_rows(dx.data() + off * d, part, d, dr.data(), doubt.data(), stream);
     std::vector<float> got_part(static_cast<std::size_t>(part * d));
     stream.synchronize();
-    REQUIRE(cudaMemcpy(got_part.data(), doubt.data(), got_part.size() * 4, cudaMemcpyDeviceToHost) ==
-            cudaSuccess);
+    REQUIRE(
+      cudaMemcpy(got_part.data(), doubt.data(), got_part.size() * 4, cudaMemcpyDeviceToHost) ==
+      cudaSuccess);
     std::int64_t mismatches = 0;
     for (std::int64_t i = 0; i < rows; ++i) {
       for (std::int64_t j = 0; j < d; ++j) {
