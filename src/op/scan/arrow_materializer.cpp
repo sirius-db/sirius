@@ -8,6 +8,8 @@
 
 #include <rmm/device_buffer.hpp>
 
+#include <cuda/stream_ref>
+
 #include <bit>
 #include <charconv>
 #include <cstring>
@@ -160,7 +162,7 @@ void normalize_columns(normalized_batch& batch,
 
 std::unique_ptr<cudf::table> copy_columns(normalized_batch const& batch,
                                           cudf::size_type rows,
-                                          rmm::cuda_stream_view stream,
+                                          ::cuda::stream_ref stream,
                                           rmm::device_async_resource_ref mr)
 {
   std::vector<std::unique_ptr<cudf::column>> columns;
@@ -168,10 +170,14 @@ std::unique_ptr<cudf::table> copy_columns(normalized_batch const& batch,
   auto copy = [&](void* destination, void const* source, std::size_t bytes) {
     if (bytes)
       CUDF_CUDA_TRY(
-        cudaMemcpyAsync(destination, source, bytes, cudaMemcpyHostToDevice, stream.value()));
+        cudaMemcpyAsync(destination, source, bytes, cudaMemcpyHostToDevice, stream.get()));
   };
   for (auto const& input : batch.columns) {
-    rmm::device_buffer mask(input.validity.size(), stream, mr);
+    // create_null_mask returns the mask buffer type of the linked cuDF, so the same
+    // code builds against the pinned release and the nightly API.
+    auto const mask_state =
+      input.nulls ? cudf::mask_state::UNINITIALIZED : cudf::mask_state::UNALLOCATED;
+    auto mask = cudf::create_null_mask(rows, mask_state, stream, mr);
     copy(mask.data(), input.validity.data(), input.validity.size());
     std::unique_ptr<cudf::column> column;
     if (input.type.id() == cudf::type_id::STRING) {
@@ -341,7 +347,7 @@ materialized_batch import_arrow_host(std::shared_ptr<owned_arrow_batch> input,
   auto submission = lane.begin();
   // Register roots, capacity and PMR staging before any partially failing copy.
   submission.on_retire([owner = normalized](cudaError_t) noexcept {});
-  rmm::cuda_stream_view stream{submission.stream()};
+  ::cuda::stream_ref stream{submission.stream()};
   auto table =
     copy_columns(*normalized, static_cast<cudf::size_type>(input->array.length), stream, mr);
   materialized_batch batch;

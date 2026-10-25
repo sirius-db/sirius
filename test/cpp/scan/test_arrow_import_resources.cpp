@@ -353,7 +353,7 @@ TEST_CASE("Arrow migration normalizes combined Boolean and UTF8 windows on the s
     cudaMemcpy(offsets.data(), strings.offsets().head(), sizeof(offsets), cudaMemcpyDeviceToHost) ==
     cudaSuccess);
   REQUIRE(cudaMemcpy(characters.data(),
-                     strings.chars_begin(stream.view()),
+                     strings.chars_begin(stream),
                      sizeof(characters),
                      cudaMemcpyDeviceToHost) == cudaSuccess);
   REQUIRE(cudaMemcpy(&validity, table.column(0).null_mask(), 1, cudaMemcpyDeviceToHost) ==
@@ -445,7 +445,7 @@ TEST_CASE("Arrow import retains pinned inputs and staging while H2D copies are p
   } gate;
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource upstream;
-  rmm::device_buffer backing(1 << 20, stream.view(), rmm::device_async_resource_ref{upstream});
+  rmm::device_buffer backing(1 << 20, stream, rmm::device_async_resource_ref{upstream});
   stream.synchronize();
   fixed_device_resource device_arena(backing.data(), backing.size());
   observed_device_resource device(rmm::device_async_resource_ref{device_arena});
@@ -589,7 +589,7 @@ TEST_CASE("Arrow import validates only the selected UTF8 window including empty 
     std::array<char, 7> characters{};
     cudf::strings_column_view strings(batch.table.view().column(0));
     REQUIRE(cudaMemcpy(characters.data(),
-                       strings.chars_begin(stream.view()),
+                       strings.chars_begin(stream),
                        characters.size(),
                        cudaMemcpyDeviceToHost) == cudaSuccess);
     for (int row = 0; row < 7; ++row)
