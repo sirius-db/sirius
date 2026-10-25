@@ -448,7 +448,7 @@ TEST_CASE("Paimon descriptors authenticate both Sirius load orders", "[.][paimon
   auto retained = provider.retain(bound.function, bound.data.get());
   REQUIRE(retained.view().has_snapshot == 1);
   CHECK(text(retained.view().table) == "t");
-  auto rows = con.Query("SELECT sum(value) FROM pm.test.t");
+  auto rows = con.Query("SELECT value FROM pm.test.t");
   INFO((rows->HasError() ? rows->GetError() : "success"));
   REQUIRE_FALSE(rows->HasError());
   auto chunk = rows->Fetch();
