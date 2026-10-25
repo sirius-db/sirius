@@ -288,9 +288,6 @@ iceberg_dv_attempt::file_job::~file_job()
   {
     std::lock_guard lock(attempt_->mutex_);
     if (!committed_) attempt_->claiming_ = false;
-    // Stop enumeration after an abandoned claim, without invalidating running siblings.
-    // The coordinator owns cancellation and rejects publication after normal EOS.
-    if (accepted_ && !completed_) attempt_->claims_abandoned_ = true;
   }
   permit_.release();
   if (registered_) ledger_->retire_unit(key());
@@ -316,7 +313,7 @@ scan_manager::preparation_claim<std::shared_ptr<iceberg_dv_attempt::file_job>>
 iceberg_dv_attempt::try_claim()
 {
   std::unique_lock lock(mutex_);
-  if (stopped_ || claims_abandoned_) throw std::logic_error("DV preparation attempt stopped");
+  if (stopped_) throw std::logic_error("DV preparation attempt stopped");
   if (claiming_)
     throw std::logic_error("DV claim must be committed or abandoned before next claim");
   if (next_ == plan_->files().size()) return scan_manager::preparation_exhausted{};
@@ -336,7 +333,6 @@ iceberg_dv_attempt::try_claim()
     lock.unlock();
     throw std::logic_error("DV preparation stopped during claim");
   }
-  owned->accepted_ = true;
   lock.unlock();
   return owned;
 }

@@ -55,7 +55,8 @@ struct dv_precondition_fixture {
     : read_views(std::make_shared<sirius::transparent::read_view_registry>())
   {
     using namespace sirius::op::scan;
-    if (file_count == 2) paths.push_back("b.parquet");
+    for (size_t i = 1; i < file_count; ++i)
+      paths.push_back(std::to_string(i) + ".parquet");
     provider.grant_bytes = 64 * 1024;
     auto discovery       = std::make_shared<iceberg_delete_discovery>();
     IcebergDeleteFileEntry dv;
@@ -65,11 +66,9 @@ struct dv_precondition_fixture {
     dv.content_size_in_bytes = 44;
     dv.record_count          = 2;
     dv.file_size_in_bytes    = 400;
-    dv.referenced_data_file  = paths.front();
-    discovery->deletion_vector_entries.push_back(dv);
-    if (file_count == 2) {
-      dv.file_path            = "b.puffin";
-      dv.referenced_data_file = paths.back();
+    for (auto const& path : paths) {
+      dv.file_path            = path == paths.front() ? "a.puffin" : path + ".puffin";
+      dv.referenced_data_file = path;
       discovery->deletion_vector_entries.push_back(dv);
     }
     auto ledger   = std::make_unique<preparation_ledger>(provider);
@@ -1207,7 +1206,7 @@ TEST_CASE("Discarding a committed DV job does not invalidate a running sibling",
           "[scan_preparation][ledger][claim]")
 {
   using namespace sirius::op::scan;
-  dv_precondition_fixture f(2);
+  dv_precondition_fixture f(3);
   auto ledger  = f.consume();
   auto attempt = std::make_shared<iceberg_dv_attempt>(f.prepared, ledger);
   auto queued  = std::get<std::shared_ptr<iceberg_dv_attempt::file_job>>(attempt->try_claim());
@@ -1215,13 +1214,17 @@ TEST_CASE("Discarding a committed DV job does not invalidate a running sibling",
   auto running = std::get<std::shared_ptr<iceberg_dv_attempt::file_job>>(attempt->try_claim());
   running->commit();
   CHECK(ledger->permits_in_flight() == 2);
-  auto result = std::make_shared<iceberg_delete_set const>(f.paths.back());
+  auto result = std::make_shared<iceberg_delete_set const>(f.paths[1]);
 
   // Normal EOS can dispose a queued job while another worker is just before complete().
   queued.reset();
-  CHECK_THROWS_AS(attempt->try_claim(), std::logic_error);
+  auto next = std::get<std::shared_ptr<iceberg_dv_attempt::file_job>>(attempt->try_claim());
+  CHECK(next->descriptor().path == f.paths[2]);
+  next->commit();
+  next.reset();
+  CHECK(std::holds_alternative<preparation_exhausted>(attempt->try_claim()));
   REQUIRE_NOTHROW(running->complete(result));
-  CHECK(attempt->result(1, f.paths.back()) == result);
+  CHECK(attempt->result(1, f.paths[1]) == result);
   running.reset();
   attempt->stop();
   attempt->finish();
@@ -1230,6 +1233,85 @@ TEST_CASE("Discarding a committed DV job does not invalidate a running sibling",
   ledger->close();
   ledger.reset();
   CHECK(f.provider.outstanding() == 0);
+}
+
+TEST_CASE("External retirement waits for a DV claim before discarding queued work",
+          "[scan_preparation][ledger][claim]")
+{
+  using namespace sirius::op::scan;
+  using namespace sirius::test::preparation;
+  dv_precondition_fixture dv(2);
+  auto ledger  = dv.consume();
+  auto attempt = std::make_shared<iceberg_dv_attempt>(dv.prepared, ledger);
+  fixture f(1, 4, k_interrupt_check_interval, preparation_options{2, 4, 1, 1});
+  auto worker = f.make_hold();
+  auto claim  = f.make_hold();
+  auto out    = std::make_shared<sink>();
+  std::weak_ptr<iceberg_dv_attempt::file_job> queued;
+  std::atomic<size_t> claims{0}, reads{0};
+  std::atomic<bool> closed{false};
+  std::promise<void> stop_requested;
+  auto requested = stop_requested.get_future();
+  std::future<void> retiring;
+  auto guard = f.shutdown_guard();
+
+  // Occupy the only worker so the first DV job stays in the dispatcher queue.
+  f.dispatcher.enqueue([worker] { worker->wait(); });
+  REQUIRE(worker->await());
+  auto source      = make_source(preparation_coordinator::execution_domain::metadata_worker);
+  source.try_claim = [&]() -> preparation_coordinator::claim_result {
+    auto index = claims++;
+    if (index == 1) claim->wait();
+    auto claimed = attempt->try_claim();
+    auto* ready  = std::get_if<std::shared_ptr<iceberg_dv_attempt::file_job>>(&claimed);
+    if (!ready) return preparation_exhausted{};
+    auto owned = std::move(*ready);
+    owned->commit();
+    if (index == 0) queued = owned;
+    return preparation_coordinator::job{[&, owned = std::move(owned)] {
+      ++reads;
+      owned->complete(
+        std::make_shared<iceberg_delete_set const>(std::string(owned->descriptor().path)));
+      return std::make_unique<tagged>(0);
+    }};
+  };
+  source.close = [&] {
+    attempt->stop();
+    closed = true;
+    out->close();
+  };
+  f.register_source(std::move(source), out);
+  f.start();
+  REQUIRE(claim->await());
+  retiring = std::async(std::launch::async, [&] {
+    f.coordinator.request_stop(stop_reason::normal_eos);
+    stop_requested.set_value();
+    f.coordinator.drain();
+  });
+  REQUIRE(requested.wait_for(1s) == std::future_status::ready);
+  CHECK_FALSE(queued.expired());
+  CHECK_FALSE(closed);
+  CHECK(retiring.wait_for(0ms) == std::future_status::timeout);
+  claim->release();
+  worker->release();
+  f.finish();
+  retiring.get();
+
+  CHECK_FALSE(f.completion.has_error());
+  f.completion.mark_completed();
+  CHECK_NOTHROW(f.completion.get_awaitable().get());
+  CHECK(claims == 2);
+  CHECK(reads == 0);
+  CHECK(queued.expired());
+  CHECK(out->count() == 0);
+  CHECK(out->close_calls == 1);
+  CHECK(out->closing_thread == f.coordinator.snapshot().owner);
+  CHECK(ledger->permits_in_flight() == 0);
+  attempt->finish();
+  CHECK(ledger->tracked_units() == 0);
+  ledger->close();
+  ledger.reset();
+  CHECK(dv.provider.outstanding() == 0);
 }
 
 TEST_CASE("Iceberg ledger installation rejects missing repeated and undeferred state",
@@ -1362,7 +1444,7 @@ TEST_CASE("DV claim owns descriptors and resources after execution finish",
   CHECK(f.provider.seen->allocated_bytes == 0);
 }
 
-TEST_CASE("Iceberg pending claims preserve both cursors and abandoning a job closes further claims",
+TEST_CASE("Iceberg pending claims preserve both cursors and discarded jobs release their permits",
           "[scan_preparation][ledger][claim]")
 {
   using namespace sirius::op::scan;
@@ -1393,7 +1475,7 @@ TEST_CASE("Iceberg pending claims preserve both cursors and abandoning a job clo
       required_inputs(f.read_views->entry(f.prepared->contract()).eligibility.later_checks, true));
     CHECK(ingestible->has_processed_all_metadata());
   }
-  CHECK_THROWS_AS(ingestible->try_claim_split(resolve), std::logic_error);
+  CHECK(std::holds_alternative<preparation_exhausted>(ingestible->try_claim_split(resolve)));
   CHECK(ledger->permits_in_flight() == 0);
   ingestible->finish_preparation();
   CHECK(ledger->tracked_units() == 0);

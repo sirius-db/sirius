@@ -99,7 +99,7 @@ class iceberg_dv_attempt : public std::enable_shared_from_this<iceberg_dv_attemp
     std::shared_ptr<void const> storage_;
     std::shared_ptr<scan_manager::preparation_ledger> ledger_;
     scan_manager::w_permit permit_;
-    bool accepted_ = false, registered_ = false, committed_ = false, completed_ = false;
+    bool registered_ = false, committed_ = false, completed_ = false;
   };
   scan_manager::preparation_claim<std::shared_ptr<file_job>> try_claim();
   std::shared_ptr<iceberg_delete_set const> result(size_t index,
@@ -110,7 +110,7 @@ class iceberg_dv_attempt : public std::enable_shared_from_this<iceberg_dv_attemp
  private:
   mutable std::mutex mutex_;
   size_t next_   = 0;
-  bool claiming_ = false, claims_abandoned_ = false, stopped_ = false;
+  bool claiming_ = false, stopped_ = false;
   std::shared_ptr<iceberg_dv_preparation> plan_;
   std::shared_ptr<scan_manager::preparation_ledger> ledger_;
   std::unique_ptr<iceberg_dv_results> results_;

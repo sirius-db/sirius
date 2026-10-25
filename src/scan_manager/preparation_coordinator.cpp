@@ -119,7 +119,7 @@ struct preparation_coordinator::state {
         phase_ = phase::executing;
         return next;
       }
-      if (phase_ == phase::idle && (close_requested_ || stopping)) {
+      if (phase_ == phase::idle && close_requested_) {
         phase_ = phase::closing;
         return operation{{}, true};
       }
@@ -385,7 +385,7 @@ struct preparation_coordinator::state {
                    bool size_triggered                                         = false);
   bool inputs_settled() const;
   std::optional<op::scan::batch_coalescer::clock::time_point> nearest_deadline() const;
-  void execute_job(job&, std::shared_ptr<job_ticket> const&, std::stop_token);
+  void execute_job(job&, std::shared_ptr<job_ticket> const&);
   bool pump_provider();
   void arm_native();
   bool retire_reader(size_t, lock_type&);
@@ -418,13 +418,7 @@ struct preparation_coordinator::state::native_job : native_reader_executor::oper
   {
     auto& owner = *accepted.ticket->st;
     native_call_guard call(&owner);
-    bool cancelled;
-    {
-      std::lock_guard lock(owner.gate->mutex);
-      cancelled = owner.gate->closed;
-    }
-    if (!cancelled)
-      owner.execute_job(accepted.work, accepted.ticket, owner.reader_stop.get_token());
+    owner.execute_job(accepted.work, accepted.ticket);
     accepted.dispose();  // Abandoned work settles on the assigned native thread.
   }
 };
@@ -772,7 +766,6 @@ void preparation_coordinator::request_stop(stop_reason reason) noexcept
     }
   }
   state_->stop(reason);
-  state_->dispatcher->request_stop();
 }
 void preparation_coordinator::start()
 {
@@ -846,8 +839,6 @@ void preparation_coordinator::drain()
     if (!runner_.joinable() && !owner_driven && !wait_for_owner) {
       // Failed startup or an unarmed attempt: there is no driver to wait for.
       request_stop(stop_reason::normal_eos);
-      if (owns_provider)
-        while (state_->pump_provider()) {}
       state_->advance_control(state_, std::chrono::milliseconds{0});
       return;
     }
@@ -1083,12 +1074,17 @@ bool preparation_coordinator::state::advance_result(lock_type& lock)
 }
 
 void preparation_coordinator::state::execute_job(job& work,
-                                                 std::shared_ptr<job_ticket> const& ticket,
-                                                 std::stop_token stop_token)
+                                                 std::shared_ptr<job_ticket> const& ticket)
 {
+  bool stopped;
+  {
+    std::lock_guard lock(gate->mutex);
+    stopped = gate->closed;
+  }
   std::unique_ptr<op::scan::scan_info> value;
   try {
-    value = work.run(preparation_stop_token{stop_token, reader_stop_reason});
+    if (!stopped)
+      value = work.run(preparation_stop_token{reader_stop.get_token(), reader_stop_reason});
   } catch (...) {
     auto error               = std::current_exception();
     bool expected_normal_eos = false;
@@ -1111,7 +1107,6 @@ void preparation_coordinator::state::execute_job(job& work,
 bool preparation_coordinator::state::pump_provider()
 {
   size_t selected = sources.size();
-  bool discard    = false;
   std::optional<provider_execution::operation> operation;
   {
     std::lock_guard lock(gate->mutex);
@@ -1124,7 +1119,6 @@ bool preparation_coordinator::state::pump_provider()
       if (!sources[id].on_query_owner()) continue;
       operation = sources[id].provider.take(gate->closed);
       if (!operation) continue;
-      discard              = gate->closed;
       provider_pumping     = true;
       selected             = id;
       next_provider_source = id + 1;
@@ -1134,8 +1128,8 @@ bool preparation_coordinator::state::pump_provider()
   }
   if (operation->closing)
     close_source(selected);
-  else if (!discard)
-    execute_job(operation->accepted.work, operation->accepted.ticket, reader_stop.get_token());
+  else
+    execute_job(operation->accepted.work, operation->accepted.ticket);
   operation->accepted
     .dispose();  // Captures and ticket retire on the query owner, outside the gate.
   {
@@ -1151,8 +1145,11 @@ bool preparation_coordinator::state::pump_provider()
 void preparation_coordinator::state::dispatch_job(
   source_state& source, size_t index, job work, std::shared_ptr<job_ticket> ticket, lock_type& lock)
 {
-  auto prepare = [&](job& owned) {
-    if (owned.requirement && !gate->closed) {
+  // The domain owns the captures before admission. Closing the gate rejects execution,
+  // but the domain still disposes the returned job before closing its reader.
+  auto admit = [&](job& owned) {
+    if (gate->closed) return false;
+    if (owned.requirement) {
       gate->check_interrupted();
       auto const& spec = *owned.requirement;
       auto it          = units.find(spec.key);
@@ -1163,18 +1160,22 @@ void preparation_coordinator::state::dispatch_job(
       owned.unit = it->second;
     }
     slots[index].unit = owned.unit;
+    return true;
   };
   if (source.on_native_reader()) {
     auto& owned = source.native.stage(std::move(work));
     lock.lock();
-    prepare(owned);
+    if (!admit(owned)) return;  // Retirement hands staged work to the native worker.
     lock.unlock();
     source.native.submit(before_submit);
     lock.lock();
   } else if (source.on_query_owner()) {
     lock.lock();
     auto& owned = source.provider.stage({std::move(ticket), std::move(work)});
-    prepare(owned);
+    if (!admit(owned)) {
+      gate->notify_under_lock();
+      return;
+    }
     lock.unlock();
     if (before_submit) before_submit();
     lock.lock();
@@ -1182,17 +1183,23 @@ void preparation_coordinator::state::dispatch_job(
     gate->notify_under_lock();
   } else {
     accepted_job submitted{std::move(ticket), std::move(work)};
+    bool admitted;
     {
-      std::lock_guard prepare_lock(gate->mutex);
-      prepare(submitted.work);
+      std::lock_guard admission_lock(gate->mutex);
+      admitted = admit(submitted.work);
+    }
+    if (!admitted) {
+      submitted.dispose();
+      lock.lock();
+      return;
     }
     if (before_submit) before_submit();
     {
       std::lock_guard check(gate->mutex);
       gate->check_interrupted();
     }
-    dispatcher->enqueue([submitted = std::move(submitted)](std::stop_token stop) mutable {
-      submitted.ticket->st->execute_job(submitted.work, submitted.ticket, stop);
+    dispatcher->enqueue([submitted = std::move(submitted)]() mutable {
+      submitted.ticket->st->execute_job(submitted.work, submitted.ticket);
     });
     lock.lock();
   }
@@ -1225,6 +1232,8 @@ bool preparation_coordinator::state::submit_job(lock_type& lock, std::shared_ptr
     ticket->index = index;
     reserve_slot(index, id);
     ticket->active = true;
+    // This slot reserves the claim before unlocking. Only the control driver retires
+    // sources, so stop may close admission but cannot close the reader during the claim.
     lock.unlock();
     if (source.on_native_reader()) source.native.begin_claim(std::move(ticket));
     auto claimed = source.hooks.try_claim();
@@ -1343,6 +1352,8 @@ void preparation_coordinator::state::shutdown()
   // Errors have already notified the observer. Natural exhaustion is not a failure,
   // and this final retirement request cannot downgrade an earlier error/cancellation.
   stop(stop_reason::normal_eos);
+  // Only the control driver discards queued metadata work, after any claim has returned.
+  // Running jobs already observe reader_stop; stopping the dispatcher is physical retirement.
   dispatcher->request_stop();
   dispatcher->wait_for_all();
   {
@@ -1356,6 +1367,13 @@ void preparation_coordinator::state::shutdown()
           std::ranges::all_of(sources, [](auto const& s) { return s.reader_closed(); }))
         break;
       if (progressed) continue;
+      if (provider_owner == std::this_thread::get_id()) {
+        // Failed or unarmed startup retires on Q without an independent driver.
+        lock.unlock();
+        auto pumped = pump_provider();
+        lock.lock();
+        if (pumped) continue;
+      }
       gate->cv.wait(lock, [&] { return gate->wake_generation != observed; });
     }
   }

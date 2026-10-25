@@ -90,6 +90,7 @@ class preparation_coordinator {
   // On Q: advance metadata-only control work, or run one provider operation/close.
   // If idle, wait up to idle_wait for progress. External threads only stop/wait.
   bool advance(std::chrono::milliseconds idle_wait = std::chrono::milliseconds{0});
+  // Close admission/publication and signal running jobs; the control driver retires queues.
   void request_stop(stop_reason) noexcept;
   void drain();
   std::shared_ptr<preparation_unit> admit_unit(unit_key, required_input_set);

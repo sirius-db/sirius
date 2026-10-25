@@ -268,17 +268,24 @@ TEST_CASE("Normal EOS does not report worker operation_canceled as a query error
           "[scan_preparation][coordinator]")
 {
   fixture f;
-  auto out = std::make_shared<sink>();
+  auto out      = std::make_shared<sink>();
+  auto claiming = f.make_hold();
+  std::promise<void> stopped;
+  auto notified = stopped.get_future();
   std::promise<void> started;
   auto ready   = started.get_future();
   bool claimed = false;
   f.source(std::make_shared<accumulator>(1), out, [&]() -> preparation_coordinator::claim_result {
-    if (std::exchange(claimed, true)) return {};
+    if (std::exchange(claimed, true)) {
+      claiming->wait();
+      return {};
+    }
     preparation_coordinator::job job{
-      [&started](preparation_stop_token stop) -> std::unique_ptr<sirius::op::scan::scan_info> {
+      [&](preparation_stop_token stop) -> std::unique_ptr<sirius::op::scan::scan_info> {
         started.set_value();
         while (!stop.stop_requested())
           std::this_thread::yield();
+        stopped.set_value();
         throw std::system_error(std::make_error_code(std::errc::operation_canceled));
       }};
     return job;
@@ -286,7 +293,10 @@ TEST_CASE("Normal EOS does not report worker operation_canceled as a query error
   auto guard = f.shutdown_guard();
   f.start();
   REQUIRE(ready.wait_for(1s) == std::future_status::ready);
+  REQUIRE(claiming->await());
   f.coordinator.request_stop(stop_reason::normal_eos);
+  CHECK(notified.wait_for(1s) == std::future_status::ready);
+  claiming->release();
   f.finish();
   CHECK_FALSE(f.completion.has_error());
 }
@@ -2141,6 +2151,43 @@ TEST_CASE("Unpumped provider requests stay bounded and cancellation disposes cap
   CHECK_FALSE(f.completion.has_error());
 }
 
+TEST_CASE("Reader close waits for the control driver to finish an active claim",
+          "[scan_preparation][coordinator][claim]")
+{
+  fixture f;
+  auto reader   = std::make_shared<sink>();
+  auto metadata = std::make_shared<sink>();
+  auto claiming = f.make_hold();
+  auto guard    = f.shutdown_guard();
+  f.source(
+    std::make_shared<accumulator>(1),
+    reader,
+    []() -> preparation_coordinator::claim_result { return preparation_pending{}; },
+    {},
+    {},
+    preparation_coordinator::execution_domain::query_owner);
+  f.source(std::make_shared<accumulator>(1),
+           metadata,
+           [claiming]() -> preparation_coordinator::claim_result {
+             claiming->wait();
+             return preparation_exhausted{};
+           });
+  f.coordinator.arm();
+  f.coordinator.start();
+  REQUIRE(claiming->await());
+  f.coordinator.request_stop(stop_reason::normal_eos);
+  // Pumping Q can dispose returned jobs, but cannot close a reader ahead of the driver.
+  f.coordinator.advance();
+  CHECK(reader->close_calls == 0);
+  CHECK(metadata->close_calls == 0);
+  claiming->release();
+  f.coordinator.drain();
+  CHECK(reader->close_calls == 1);
+  CHECK(reader->closing_thread == std::this_thread::get_id());
+  CHECK(metadata->close_calls == 1);
+  CHECK_FALSE(f.completion.has_error());
+}
+
 TEST_CASE("External provider retirement waits for Q close without blocking Q drain",
           "[scan_preparation][provider_lane]")
 {
@@ -2670,7 +2717,7 @@ TEST_CASE("Reader stop intent distinguishes cancellation failure and normal comp
           "[scan_preparation][reader_stop]")
 {
   using domain   = preparation_coordinator::execution_domain;
-  auto execution = GENERATE(domain::query_owner, domain::native_reader);
+  auto execution = GENERATE(domain::metadata_worker, domain::query_owner, domain::native_reader);
   // User cancellation, reported failure, explicit EOS, GPU/LIMIT, predicate, cleanup intent.
   auto trigger = GENERATE(0, 1, 2, 3, 4, 5);
   native_reader_executor native(1, 1);

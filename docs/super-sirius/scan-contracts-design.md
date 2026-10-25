@@ -130,7 +130,7 @@ Both hooks must be safe to repeat and to call after failed startup. Thread-affin
 
 Jobs that use a preparation unit carry its key and required inputs, derived by the provider from the bound scan. The shared registration path does not inspect format-specific bindings. Required evidence must be present before the result can enter coalescing; missing evidence fails the job.
 
-A claimed job is owned by its execution domain before unit admission can fail or observe cancellation. Accepted jobs retain their descriptors and resources through execution or disposal. Dropping a job outside cancellation is an error, not a successful empty read. Resource release and provider callbacks run outside the publication lock.
+The control driver reserves a claim before calling the adapter outside the gate. The returned job enters its execution domain before admission is checked. If stop wins that check, the domain disposes the job without executing it. Jobs retain their descriptors and resources through execution or disposal; their destructors do not stop source enumeration. The completion ticket reports work dropped without a stop request. Resource release and provider callbacks run outside the publication lock.
 
 Query-owner and native sources allow one outstanding operation or unprocessed result per reader. They share the existing coalescing and publication path and do not consume metadata-worker permits. The query owner calls `advance()` while waiting for query completion: it advances metadata-only coordination or services one provider request. It remains available through drain; an external reset may request stop and wait, but cannot run provider operations itself.
 
@@ -142,6 +142,8 @@ Publication uses typed `scan_operator_input` objects. Input construction and pre
 
 | Situation | Required behavior |
 |---|---|
+| External stop or drain | Close admission and publication, signal running jobs and wake the control driver. The driver retires queues after the active claim returns; drain callers wait for retirement. |
+| Stop during claim | Keep the source alive through ownership transfer. Dispose of a rejected job in its execution domain before closing the reader. |
 | Stop before publication | Discard the input without exposing it to consumers. |
 | Queued provider work | Dispose of it in its assigned execution domain without invoking the reader. |
 | Active provider work | Use a supported interrupt or wait for return; discard late results before closing. The framework cannot forcibly interrupt SQL or native calls. |
