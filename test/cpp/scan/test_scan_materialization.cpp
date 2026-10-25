@@ -106,7 +106,8 @@ struct test_arrow_source final : arrow_batch_source {
 
 std::shared_ptr<owned_arrow_batch> owned_fixture(std::shared_ptr<arrow_fixture> const& fixture)
 {
-  return std::make_shared<owned_arrow_batch>(fixture->schema, fixture->array, fixture);
+  return std::make_shared<owned_arrow_batch>(
+    fixture->schema, fixture->array, fixture, *std::pmr::new_delete_resource());
 }
 }  // namespace
 
@@ -149,11 +150,78 @@ TEST_CASE("Arrow layout rejects unsupported metadata and inconsistent buffers",
   REQUIRE_THROWS(validate_arrow_host_flat(f.schema, f.array));
   f.child_schema.format = "d:39,2";
   REQUIRE_THROWS(validate_arrow_host_flat(f.schema, f.array));
+  __int128 decimal_values[3]{10, 20, 30};
+  f.buffers[1]          = decimal_values;
   f.child_schema.format = "d:18,2";
   REQUIRE(validate_arrow_host_flat(f.schema, f.array)[0] ==
           cudf::data_type(cudf::type_id::DECIMAL128, -2));
   f.schema.metadata = "extension";
   REQUIRE_THROWS(validate_arrow_host_flat(f.schema, f.array));
+}
+
+TEST_CASE("Arrow preflight checks selected null totals and numeric bounds",
+          "[materialization][scan][arrow_migration]")
+{
+  int released = 0;
+  arrow_fixture f(released);
+  SECTION("known whole-column null total must match")
+  {
+    f.child.null_count = 2;
+    REQUIRE_THROWS(validate_arrow_host_flat(f.schema, f.array));
+  }
+  SECTION("a slice cannot hide more nulls than the remaining rows")
+  {
+    f.array.offset     = 1;
+    f.array.length     = 2;
+    f.child.null_count = 3;
+    REQUIRE_THROWS(validate_arrow_host_flat(f.schema, f.array));
+    f.child.null_count = 2;
+    REQUIRE_NOTHROW(validate_arrow_host_flat(f.schema, f.array));
+    f.child.null_count = -1;
+    REQUIRE_NOTHROW(validate_arrow_host_flat(f.schema, f.array));
+  }
+  SECTION("non-nullable fields cannot contain selected nulls")
+  {
+    f.child_schema.flags = 0;
+    REQUIRE_THROWS(validate_arrow_host_flat(f.schema, f.array));
+  }
+  SECTION("combined offsets are bounded before reading buffers")
+  {
+    f.child.offset = std::numeric_limits<cudf::size_type>::max();
+    REQUIRE_THROWS(validate_arrow_host_flat(f.schema, f.array));
+    f.child.offset = 0;
+    f.array.offset = std::numeric_limits<cudf::size_type>::max();
+    REQUIRE_THROWS(validate_arrow_host_flat(f.schema, f.array));
+  }
+  SECTION("decimal payloads must fit their declared precision")
+  {
+    __int128 values[3]{999, 0, -999};
+    f.child_schema.format = "d:3,2";
+    f.buffers[1]          = values;
+    REQUIRE_NOTHROW(validate_arrow_host_flat(f.schema, f.array));
+    values[0] = 1000;
+    REQUIRE_THROWS(validate_arrow_host_flat(f.schema, f.array));
+    values[0] = -1000;
+    REQUIRE_THROWS(validate_arrow_host_flat(f.schema, f.array));
+    values[0] = -(__int128{1} << 126);
+    REQUIRE_THROWS(validate_arrow_host_flat(f.schema, f.array));
+  }
+  SECTION("absent bitmaps normalize both known-zero and unknown null counts")
+  {
+    f.root_buffers[0] = f.buffers[0] = nullptr;
+    for (int root_nulls : {0, -1}) {
+      for (int child_nulls : {0, -1}) {
+        f.array.null_count = root_nulls;
+        f.child.null_count = child_nulls;
+        REQUIRE_NOTHROW(validate_arrow_host_flat(f.schema, f.array));
+      }
+    }
+    f.child.null_count = 1;
+    REQUIRE_THROWS(validate_arrow_host_flat(f.schema, f.array));
+    f.child.null_count = 0;
+    f.array.null_count = 1;
+    REQUIRE_THROWS(validate_arrow_host_flat(f.schema, f.array));
+  }
 }
 
 TEST_CASE("Arrow import owns its source through retirement and shared finish",
@@ -163,7 +231,7 @@ TEST_CASE("Arrow import owns its source through retirement and shared finish",
   sirius::exec::retire_lane lane(stream.value());
   int released = 0;
   auto f       = std::make_shared<arrow_fixture>(released);
-  auto owner   = std::make_shared<owned_arrow_batch>(f->schema, f->array, f);
+  auto owner   = owned_fixture(f);
   materialization_program program{11, 7, {cudf::data_type{cudf::type_id::INT32}}, 0, false};
   program.input_types = program.output_types;
   auto batch = import_arrow_host(owner, program, lane, cudf::get_current_device_resource_ref());
@@ -438,7 +506,7 @@ TEST_CASE("Arrow nullable slice retains values and rejects schema drift", "[mate
   auto f          = std::make_shared<arrow_fixture>(released);
   f->array.offset = 1;
   f->array.length = 2;
-  auto owner      = std::make_shared<owned_arrow_batch>(f->schema, f->array, f);
+  auto owner      = owned_fixture(f);
   materialization_program program{42, 1, {cudf::data_type{cudf::type_id::INT32}}, 0, false};
   program.input_types = std::vector{cudf::data_type{cudf::type_id::INT64}};
   REQUIRE_THROWS(import_arrow_host(owner, program, lane, cudf::get_current_device_resource_ref()));
@@ -526,7 +594,7 @@ TEST_CASE("Arrow decimal imports normalize the approved carrier", "[materializat
     __int128 values[3]{123, 456, 789};
     f->child_schema.format = format;
     f->buffers[1]          = values;
-    auto owner             = std::make_shared<owned_arrow_batch>(f->schema, f->array, f);
+    auto owner             = owned_fixture(f);
     materialization_program program{
       43, 1, {cudf::data_type{cudf::type_id::DECIMAL128, -2}}, 0, false};
     program.input_types        = program.output_types;
@@ -554,7 +622,7 @@ TEST_CASE("Arrow empty and zero-column batches preserve cardinality", "[material
     auto f               = std::make_shared<arrow_fixture>(released);
     f->schema.n_children = f->array.n_children = 0;
     f->array.length                            = rows;
-    auto owner = std::make_shared<owned_arrow_batch>(f->schema, f->array, f);
+    auto owner                                 = owned_fixture(f);
     materialization_program program{44, 1, {}, 0, false};
     program.input_types = std::vector<cudf::data_type>{};
     auto batch = import_arrow_host(owner, program, lane, cudf::get_current_device_resource_ref());
@@ -621,7 +689,7 @@ TEST_CASE("Arrow imports every flat primitive with nulls", "[materialization][sc
       f->child.n_buffers = 3;
     }
     auto types = validate_arrow_host_flat(f->schema, f->array);
-    auto owner = std::make_shared<owned_arrow_batch>(f->schema, f->array, f);
+    auto owner = owned_fixture(f);
     materialization_program program{46, 1, types, 0, false};
     program.input_types = types;
     auto batch = import_arrow_host(owner, program, lane, cudf::get_current_device_resource_ref());
@@ -712,7 +780,7 @@ TEST_CASE("Retiring an abandoned Arrow import releases its owner exactly once",
   {
     sirius::exec::retire_lane lane(stream.value());
     auto f     = std::make_shared<arrow_fixture>(released);
-    auto owner = std::make_shared<owned_arrow_batch>(f->schema, f->array, f);
+    auto owner = owned_fixture(f);
     materialization_program program{47, 1, {cudf::data_type{cudf::type_id::INT32}}, 0, false};
     program.input_types = program.output_types;
     auto batch = import_arrow_host(owner, program, lane, cudf::get_current_device_resource_ref());
@@ -740,9 +808,19 @@ TEST_CASE("Arrow query drain retires cancelled batches and returns their credit"
   int credits   = 0;
   auto fixture  = std::make_shared<arrow_fixture>(released);
   auto capacity = std::make_shared<credit_token>(&credits);
+  // The admission owner must retain producer storage, not just the accounting token.
+  struct admitted_input {
+    std::shared_ptr<arrow_fixture> fixture;
+    std::shared_ptr<credit_token> credit;
+  };
+  auto admitted = std::make_shared<admitted_input>(admitted_input{fixture, capacity});
   test_arrow_source source;
   source.queue.push_back(
-    {std::make_shared<owned_arrow_batch>(fixture->schema, fixture->array, capacity), 0, 3, 12});
+    {std::make_shared<owned_arrow_batch>(
+       fixture->schema, fixture->array, admitted, *std::pmr::new_delete_resource()),
+     0,
+     3,
+     12});
 
   materialization_program program{49, 1, {cudf::data_type{cudf::type_id::INT32}}, 0, false};
   program.input_types = program.output_types;
@@ -753,6 +831,7 @@ TEST_CASE("Arrow query drain retires cancelled batches and returns their credit"
   REQUIRE(source.cancel_calls == 1);
   fixture.reset();
   capacity.reset();
+  admitted.reset();
   // Cancellation stops production, but cannot release an owner submitted to the GPU lane.
   CHECK(released == 0);
   CHECK(credits == 0);
