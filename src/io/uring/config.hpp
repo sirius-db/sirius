@@ -44,6 +44,16 @@ struct config {
   /// Defaults to O_DIRECT when a physical operation satisfies its constraints.
   bool use_odirect{true};
 
+  /// Most reads smaller than @ref small_read_bytes one reactor keeps in flight; 0 = no cap.
+  ///
+  /// Many concurrent small O_DIRECT reads into neighbouring filesystem blocks contend on
+  /// storage that has not cached them, as on GPFS. Large reads are bandwidth bound and want
+  /// the opposite, so the cap leaves them to the staging slots alone.
+  std::size_t max_inflight_small_reads{0};
+
+  /// Physical read size below which @ref max_inflight_small_reads applies.
+  std::size_t small_read_bytes{1UL << 20};
+
   /// O_DIRECT transfers whole pages, so a read is widened to a page boundary
   /// either way -- naming it lets the caller align once, up front, instead of
   /// every layer rediscovering it.  Reported even when @ref use_odirect is

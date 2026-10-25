@@ -390,6 +390,13 @@ Six optional nested sub-configs tune the individual backends, the cache, and the
 There are no static chunk-size or `readv`-fusion knobs. The worker chooses physical
 operation sizes dynamically from backlog pressure, available slots, and the pinned block size.
 
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `max_inflight_small_reads` | int | 0 (no cap) | Most reads smaller than `small_read_bytes` that one reactor keeps in flight. Larger reads are bounded only by the staging slots. |
+| `small_read_bytes` | bytes | `1MiB` | Physical read size below which `max_inflight_small_reads` applies. |
+
+On a parallel filesystem such as GPFS, dozens of concurrent small `O_DIRECT` reads into neighbouring blocks contend when the storage has not cached them. At TPC-H SF10000 on 4× GB200 over GPFS (16 MiB blocks), `max_inflight_small_reads: 16` with `small_read_bytes: 4MiB` cut the 22-query cold total from 2,128 s to 807 s and the warm total from 685 s to 507 s. Local NVMe has not been measured with a cap, so it stays off by default.
+
 ### `scan_manager.rest` — REST / S3 backend (`io/rest/config.hpp`)
 
 TLS verification policy and the CA bundle are configured only under

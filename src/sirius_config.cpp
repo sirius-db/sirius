@@ -238,6 +238,8 @@ static void from_yaml(const YAML::Node& node, sirius::io::uring::config& opt)
       opt.n_max_concurrent_scans_explicit = true;
     }
   }
+  r.optional("max_inflight_small_reads", opt.max_inflight_small_reads);
+  r.optional("small_read_bytes", yaml::bytes(opt.small_read_bytes));
   r.reject_unknown();
 }
 
