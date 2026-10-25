@@ -156,6 +156,18 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> push_projection(
   duckdb::vector<std::unique_ptr<sirius::ast::node>> select_list,
   std::size_t estimated_cardinality)
 {
+  // from_duckdb leaves a null slot for a shape it cannot translate, as the signal to fall
+  // back. Nothing downstream checked it: projection::execute calls expr->holds<>() on every
+  // entry, so an unsupported expression (e.g. round(), which has no function_id) reached the
+  // GPU as a null dereference and took the process down mid-query. Refuse here instead, where
+  // NotImplementedException is still a clean CPU fallback.
+  for (auto const& expr : select_list) {
+    if (!expr) {
+      throw duckdb::NotImplementedException(
+        "Projection contains an expression Sirius cannot translate");
+    }
+  }
+
   if (is_identity_ast_projection(select_list) && child->types == types) { return child; }
 
   auto projection_op =

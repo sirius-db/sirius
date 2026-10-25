@@ -555,7 +555,16 @@ void task_creator::manager_loop()
 
     std::vector<std::shared_ptr<pipeline::sirius_pipeline>> visited_pipelines;
     auto* requested_node = node;
-    auto const next      = get_operator_for_next_task(node, visited_pipelines);
+    next_task_result next;
+    try {
+      next = get_operator_for_next_task(node, visited_pipelines);
+    } catch (const std::exception& e) {
+      // An operator's scheduling hook threw. The query fails with that error, as it does when
+      // task creation throws, rather than the exception ending this thread and the process.
+      SIRIUS_LOG_ERROR("Task Creator: Exception while finding the next task: {}", e.what());
+      report_fatal_error(query_state->completion_handler, std::current_exception());
+      continue;
+    }
 
     if (!next.is_ready) {
       // Same re-evaluation the creation path does on exit: get_next_task_hint()

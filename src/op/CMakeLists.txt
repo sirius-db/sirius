@@ -67,6 +67,10 @@ target_sources(
           sirius_physical_sort_sample.cpp
           sirius_physical_table_scan.cpp
           sirius_physical_top_n.cpp
+          sirius_physical_vector_join_materialize.cpp
+          sirius_physical_vector_join_reduce_local.cpp
+          sirius_physical_vector_join_select.cpp
+          sirius_physical_vector_join_stream.cpp
           sirius_physical_ungrouped_aggregate.cpp
           sirius_physical_union.cpp
           sirius_physical_vector_threshold_join.cpp

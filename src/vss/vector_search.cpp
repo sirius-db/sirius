@@ -69,6 +69,19 @@ void restore_native_carriers(std::vector<std::unique_ptr<cudf::column>>& cols,
   }
 }
 
+std::unique_ptr<cucascade::host_data_representation> vss_table_to_host(
+  cucascade::memory::memory_space& space,
+  const cucascade::memory::memory_space& host_space,
+  ::cuda::stream_ref stream,
+  std::unique_ptr<cudf::table> table)
+{
+  cucascade::gpu_table_representation gpu_repr(std::move(table), space, stream);
+  auto host_repr = converter_registry::get().convert<cucascade::host_data_representation>(
+    gpu_repr, &host_space, stream);
+  stream.sync();
+  return host_repr;
+}
+
 std::unique_ptr<cucascade::host_data_representation> vss_result_to_host(
   const vector_search_context& c, std::unique_ptr<cudf::table> table)
 {

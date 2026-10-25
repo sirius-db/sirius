@@ -142,7 +142,9 @@ class GpuExecutionFixture {
   {
     auto result = con->Query(sql);
     REQUIRE(result);
-    if (result->HasError()) { UNSCOPED_INFO("setup query error: " << result->GetError()); }
+    if (result->HasError()) {
+      UNSCOPED_INFO("setup query error: " << result->GetError() << " SQL: " << sql);
+    }
     REQUIRE_FALSE(result->HasError());
   }
 

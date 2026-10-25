@@ -176,6 +176,9 @@ struct pin_materialization_options {
   /// leaves the probe off, which is the default; the caller derives it from
   /// @c late_mat::pin_unique_probe_selection.
   std::vector<bool> probe_unique_columns;
+  /// Bytes the batches read and decoded ahead of the one being finished may hold, staging plus
+  /// decoded table; 0 keeps two batches ahead. SIRIUS_PIN_OVERLAP overrides the depth.
+  std::size_t in_flight_budget_bytes = 0;
 };
 
 /// Drive @p ingestible 's metadata walk + batch coalescer to completion on @p io_ctx,

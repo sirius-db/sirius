@@ -31,6 +31,7 @@
 #include <cucascade/memory/stream_pool.hpp>
 
 #include <atomic>
+#include <cstdint>
 #include <condition_variable>
 #include <functional>
 #include <future>
@@ -199,6 +200,13 @@ class downgrade_executor {
   std::thread _processing_thread;
   std::thread _monitor_thread;
   std::atomic<bool> _monitor_request_enqueued{false};
+  /// Conversions that threw since the last one that succeeded. A long run of them means the target
+  /// tier cannot be written -- a full or unwritable disk tier -- and spilling pauses for a while.
+  std::atomic<std::uint32_t> _failed_conversions{0};
+  /// steady_clock time (ns) until which requests are answered without converting anything.
+  std::atomic<std::int64_t> _spill_paused_until_ns{0};
+  /// Count a conversion that threw with @p what, pausing spilling after a long enough run.
+  void note_failed_conversion(char const* what);
   std::atomic<bool> _running{false};
   std::atomic<size_t> _monitor_requests_issued{0};
   std::unique_ptr<cucascade::memory::exclusive_stream_pool> _stream_pool;

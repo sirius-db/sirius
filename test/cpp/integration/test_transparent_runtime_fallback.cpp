@@ -20,6 +20,8 @@
 // PhysicalSiriusExecution fail *after* plan generation succeeds — i.e. a runtime
 // failure, distinct from a plan-time (create_plan) fallback.
 
+// trunc() stands in for "a scalar function Sirius cannot run": round() and the other math functions
+// now run on the GPU.
 #include <catch.hpp>
 #include <config.hpp>
 #include <duckdb.hpp>
@@ -567,38 +569,38 @@ void run_s3mix_scenario(std::string const& scenario)
   auto const parquet = fixture.parquet_scan();
 
   if (scenario == "projection_round") {
-    fixture.require_plan_fallback("SELECT round(id) FROM " + parquet + " LIMIT 3", "-100");
+    fixture.require_plan_fallback("SELECT trunc(id) FROM " + parquet + " LIMIT 3", "-100");
   } else if (scenario == "projection_struct_extract") {
     fixture.require_plan_fallback("SELECT st.a FROM " + parquet + " LIMIT 3", "0");
   } else if (scenario == "projection_list_extract") {
     fixture.require_plan_fallback("SELECT li[1] FROM " + parquet + " LIMIT 3", "0");
   } else if (scenario == "order_round") {
-    fixture.require_plan_fallback("SELECT id FROM " + parquet + " ORDER BY round(id) LIMIT 3",
+    fixture.require_plan_fallback("SELECT id FROM " + parquet + " ORDER BY trunc(id) LIMIT 3",
                                   "-100");
   } else if (scenario == "topn_round") {
-    fixture.require_plan_fallback("SELECT id FROM " + parquet + " ORDER BY round(id) DESC LIMIT 3",
+    fixture.require_plan_fallback("SELECT id FROM " + parquet + " ORDER BY trunc(id) DESC LIMIT 3",
                                   "199");
   } else if (scenario == "aggregate_child_projection") {
     fixture.require_plan_fallback(
       "SELECT r, count(*) FROM "
-      "(SELECT round(a) AS r, b FROM " +
+      "(SELECT trunc(a) AS r, b FROM " +
       parquet + ") q GROUP BY r");
   } else if (scenario == "join_round") {
     fixture.require_plan_fallback(
-      "SELECT count(*) FROM " + parquet + " a JOIN " + parquet + " b ON round(a.id) = round(b.id)",
+      "SELECT count(*) FROM " + parquet + " a JOIN " + parquet + " b ON trunc(a.id) = trunc(b.id)",
       "300");
   } else if (scenario == "regression_bundle") {
     fixture.require_gpu("SELECT st FROM " + parquet);
     fixture.require_gpu("SELECT li FROM " + parquet);
 
-    fixture.require_plan_fallback("SELECT count(*) FROM " + parquet + " WHERE round(id) > 1",
+    fixture.require_plan_fallback("SELECT count(*) FROM " + parquet + " WHERE trunc(id) > 1",
                                   "198");
-    fixture.require_plan_fallback("SELECT count(*) FROM mix_native WHERE round(id) > 1", "198");
+    fixture.require_plan_fallback("SELECT count(*) FROM mix_native WHERE trunc(id) > 1", "198");
     fixture.require_gpu("SELECT count(id) FROM " + fixture.hive_scan() + " WHERE part = 1", "300");
 
     fixture.require_gpu("SELECT count(st) FROM " + parquet, "300");
     fixture.require_gpu("SELECT count(li) FROM " + parquet, "300");
-    fixture.require_plan_fallback("SELECT count(round(x)) FROM " + parquet, "257");
+    fixture.require_plan_fallback("SELECT count(trunc(x)) FROM " + parquet, "257");
   } else if (scenario == "parquet_is_not_null") {
     fixture.require_gpu("SELECT count(*) FROM " + parquet + " WHERE x IS NOT NULL", "257");
   } else if (scenario == "native_is_not_null") {
@@ -610,11 +612,11 @@ void run_s3mix_scenario(std::string const& scenario)
     }
     fixture.require_gpu("SELECT id FROM " + parquet + " ORDER BY id LIMIT 5", "-100");
   } else if (scenario == "zero_limit") {
-    fixture.require_gpu("SELECT round(id) FROM " + parquet + " LIMIT 0");
+    fixture.require_gpu("SELECT trunc(id) FROM " + parquet + " LIMIT 0");
   } else if (scenario == "zero_empty") {
-    fixture.require_plan_fallback("SELECT round(id) FROM " + fixture.empty_scan());
+    fixture.require_plan_fallback("SELECT trunc(id) FROM " + fixture.empty_scan());
   } else if (scenario == "zero_stats_pruned") {
-    fixture.require_gpu("SELECT round(id) FROM " + parquet + " WHERE id > 10000");
+    fixture.require_gpu("SELECT trunc(id) FROM " + parquet + " WHERE id > 10000");
   } else {
     FAIL("unknown S3 mix child scenario: " << scenario);
   }
@@ -794,7 +796,7 @@ TEST_CASE("an unsupported filter above a join falls back during planning",
   auto const parquet = fixture.parquet_scan();
 
   fixture.require_plan_fallback("SELECT count(*) FROM " + parquet + " a JOIN " + parquet +
-                                  " b ON a.id = b.id WHERE round(a.a + b.b) > 1",
+                                  " b ON a.id = b.id WHERE trunc(a.a + b.b) > 1",
                                 "249");
   fixture.require_gpu("SELECT count(*) FROM " + parquet + " a JOIN " + parquet +
                         " b ON a.id = b.id WHERE a.a + b.b > 1",
