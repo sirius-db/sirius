@@ -3533,7 +3533,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
-                 "SQL multi-Iceberg replan retains the R1 correspondence refusal",
+                 "SQL multi-Iceberg replan retains the read-view correspondence refusal",
                  "[integration][iceberg][verdict]")
 {
   auto query = "SELECT a.count, b.count FROM " + pinned_scan(v1_path) + " a JOIN " +

@@ -375,7 +375,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   run_ok("COPY (SELECT i::INTEGER x FROM range(128) t(i)) TO " +
          directory.file_literal("data.parquet") + " (FORMAT PARQUET)");
   // DuckDB never binds this unused CTE. The bound policy sees only the local
-  // scan; R1's retained SQL-text veto still conservatively forbids replay.
+  // scan; the SQL-text S3 veto still conservatively forbids replay.
   auto sql =
     "WITH unused AS (SELECT * FROM read_parquet('s3://unread-source/file.parquet')) "
     "SELECT sum(x) FROM read_parquet(" +

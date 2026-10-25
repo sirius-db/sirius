@@ -97,16 +97,14 @@ bool enable_p2p_for_test(int num_gpus)
   return any_enabled;
 }
 
-// MGPU-06 data integrity guard (Phase 7 / RESEARCH.md Pitfall 2). FNV-1a
-// checksum over a packed batch payload. Duplicated here because the
+// Data integrity guard: FNV-1a checksum over a packed batch payload.
+// Duplicated here because the
 // equivalent helper in test/cpp/downgrade/test_downgrade_executor.cpp lives
 // in an anonymous namespace and is not reachable from this TU.
-// Phase 18 / DB-03: const dropped from data_batch& parameter (mirrors
-// debug_utils.hpp pattern from plan 18-04). cucascade #117's to_read_only is
-// non-const because it acquires the shared lock.
+// The batch is mutable because to_read_only acquires its shared lock.
 uint64_t compute_batch_checksum_fnv1a64(cucascade::data_batch& batch, ::cuda::stream_ref stream)
 {
-  // Phase 18 / DB-03 Recipe R1: scoped read-only accessor for the lifetime
+  // Hold a scoped read-only accessor for the lifetime
   // of gpu_rep, packed, and host_buf — released at function exit.
   auto ro             = batch.to_read_only();
   auto const& gpu_rep = ro.get_data()->cast<cucascade::gpu_table_representation>();
