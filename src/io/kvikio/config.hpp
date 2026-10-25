@@ -50,9 +50,7 @@ namespace sirius::io {
  * time, so it affects only files this ioctx opens and mutates nothing global.
  *
  * Write-side knobs are intentionally absent: @c kvikio_context opens every file
- * read-only, so they would be dead config.  So is a readahead budget: the
- * backend cannot use the prefetching cache, so there is nowhere to read ahead
- * into.
+ * read-only, so they would be dead config.
  */
 struct kvikio_config {
   /// Threads in kvikIO's task pool — the parallelism bound for a single
@@ -100,6 +98,19 @@ struct kvikio_config {
   /// falls back.  Unset leaves it to kvikIO's own default, which honours
   /// @c KVIKIO_COMPAT_MODE.
   std::optional<kvikio::CompatMode> compat_mode;
+
+  /// How many scan tasks the readahead may keep in flight against this backend
+  /// (see @c ioctx::n_max_concurrent_scans).  Unlike the fields above it is a
+  /// Sirius setting, not a kvikIO default.  Unset takes the REST backend's
+  /// budget: both serve object stores, whose reads are latency-bound.  Zero
+  /// disables the readahead for this backend.
+  std::optional<std::size_t> n_max_concurrent_scans;
+
+  /// Whether reads of remote objects take the scan's bulk route, which hands
+  /// the backend every range a reader needs in one batch (see
+  /// @c ioctx::prefers_bulk_io).  A Sirius setting, not a kvikIO default.
+  /// Unset means true.  Local files never take the bulk route.
+  std::optional<bool> prefer_bulk_io;
 };
 
 /**

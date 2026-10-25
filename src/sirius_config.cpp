@@ -251,6 +251,8 @@ static void from_yaml(const YAML::Node& node, sirius::io::kvikio_config& opt)
   r.optional("auto_direct_io_read", opt.auto_direct_io_read);
   r.optional("auto_direct_io_read_overread", opt.auto_direct_io_read_overread);
   r.optional("thread_pool_per_block_device", opt.thread_pool_per_block_device);
+  r.optional("n_max_concurrent_scans", opt.n_max_concurrent_scans);
+  r.optional("prefer_bulk_io", opt.prefer_bulk_io);
   std::string compat;
   r.optional("compat_mode", compat);
   if (!compat.empty()) {
@@ -1003,7 +1005,6 @@ void sirius_config::finalize_derived_config()
   _scan_manager_config.pipeline_width =
     static_cast<std::size_t>(std::max(1, _gpu_pipeline_executor_config.num_threads));
   derive_rest_scan_budget();
-  enforce_sirius_backend_for_multi_gpu();
 }
 
 void sirius_config::derive_rest_scan_budget()
@@ -1037,21 +1038,6 @@ void sirius_config::derive_rest_scan_budget()
     derived,
     _scan_manager_config.rest.n_max_concurrent_scans);
   _scan_manager_config.rest.n_max_concurrent_scans = derived;
-}
-
-void sirius_config::enforce_sirius_backend_for_multi_gpu()
-{
-  size_t num_gpus = std::ranges::count_if(_memory_space_configs, [](auto const& space) {
-    return std::holds_alternative<cucascade::memory::gpu_memory_space_config>(space);
-  });
-  if (num_gpus > 1 && _scan_manager_config.backend != scan_manager::io_backend::sirius) {
-    SIRIUS_LOG_WARN(
-      "sirius_config: backend was not 'sirius' but {} GPUs are configured; "
-      "the sirius backend is required for multi-GPU IO routing. Overriding "
-      "backend to 'sirius'.",
-      num_gpus);
-    _scan_manager_config.backend = scan_manager::io_backend::sirius;
-  }
 }
 
 const std::vector<cucascade::memory::memory_space_config>& sirius_config::get_memory_space_configs()

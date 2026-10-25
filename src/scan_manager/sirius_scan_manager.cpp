@@ -134,9 +134,9 @@ prefetch_strategy backend_prefetch_strategy(io::io_context_type type) noexcept
   switch (type) {
     case io::io_context_type::restful: return prefetch_strategy::eager;
     case io::io_context_type::uring: return prefetch_strategy::opportunistic;
-    // kvikio never reaches here: it cannot use the prefetching cache, so
-    // prepare_for_query excludes it before backend selection.
-    case io::io_context_type::kvikio: break;
+    // kvikio serves object stores like REST, so it takes REST's preference.
+    // Configure `readahead_strategy: opportunistic` for local files over kvikio.
+    case io::io_context_type::kvikio: return prefetch_strategy::eager;
   }
   return prefetch_strategy::eager;
 }
@@ -1367,13 +1367,8 @@ sirius_scan_manager::sirius_scan_manager(
     SIRIUS_LOG_DEBUG("[sirius_scan_manager] sirius_datasource enabled (uring_ioctx n_reactors={})",
                      _config.uring_n_reactors);
   } else {
-    if (_topology_index->gpu_ids().size() > 1) {
-      throw std::runtime_error(
-        "[sirius_scan_manager] kvikio_context fallback (backend=kvikio) "
-        "does not support multi-GPU; topology reports " +
-        std::to_string(_topology_index->gpu_ids().size()) +
-        " GPUs.  Set backend=sirius for multi-GPU runs.");
-    }
+    // kvikIO reads into a device destination through that destination's own
+    // CUDA context, so one kvikio_context serves every GPU.
     _io_ctx = _ioctx_registry.make_ioctx(sirius::io::io_context_type::kvikio);
     if (!_io_ctx) {
       throw std::runtime_error("[sirius_scan_manager] failed to create kvikio io_context");

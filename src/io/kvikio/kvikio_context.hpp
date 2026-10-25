@@ -23,9 +23,11 @@
 
 #include <kvikio/file_handle.hpp>
 #include <kvikio/remote_handle.hpp>
+#include <kvikio/threadpool_wrapper.hpp>
 
 #include <cstddef>
 #include <cstdint>
+#include <future>
 #include <memory>
 #include <optional>
 #include <span>
@@ -36,6 +38,10 @@
 
 namespace sirius::io {
 
+namespace rest {
+class rest_reactor;
+}  // namespace rest
+
 // ---------------------------------------------------------------------------
 // kvikio_object
 // ---------------------------------------------------------------------------
@@ -45,7 +51,7 @@ namespace sirius::io {
  *
  * kvikIO reaches local files through a @c kvikio::FileHandle and object-store
  * URIs through a @c kvikio::RemoteHandle; the two handle types share no base,
- * so this class carries the one operation @c kvikio_context needs from both.
+ * so this class carries the operations @c kvikio_context needs from both.
  */
 class kvikio_object : public io_object {
  public:
@@ -55,6 +61,13 @@ class kvikio_object : public io_object {
   [[nodiscard]] virtual std::size_t read_at(void* dst,
                                             std::size_t size,
                                             std::size_t offset) const = 0;
+
+  /// Start reading exactly @p size bytes at @p offset into @p dst (host OR
+  /// device memory) and return without waiting.  The caller clamps @p size to
+  /// the object's size and keeps @p dst alive until the future is ready.
+  [[nodiscard]] virtual std::future<std::size_t> read_async(void* dst,
+                                                            std::size_t size,
+                                                            std::size_t offset) const = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -93,6 +106,10 @@ class kvikio_io_object final : public kvikio_object {
 
   [[nodiscard]] std::size_t read_at(void* dst, std::size_t size, std::size_t offset) const final;
 
+  [[nodiscard]] std::future<std::size_t> read_async(void* dst,
+                                                    std::size_t size,
+                                                    std::size_t offset) const final;
+
  private:
   std::string _path;
   mutable kvikio::FileHandle _handle;
@@ -118,26 +135,59 @@ class kvikio_io_object final : public kvikio_object {
  */
 class kvikio_remote_io_object final : public kvikio_object {
  public:
+  /// Trailing bytes of the object, fetched with it by a footer probe.
+  using stash_type = std::shared_ptr<const std::span<const std::uint8_t>>;
+
   /// @param uri The original @c s3://bucket/key URI — kept verbatim so cache
   ///            keys stay stable regardless of the signed URL kvikIO builds.
-  kvikio_remote_io_object(std::string uri, kvikio::RemoteHandle handle, size_t object_size)
-    : _uri(std::move(uri)), _handle(std::move(handle)), _object_size(object_size)
+  /// @param etag The object's ETag when its open learned one, quotes preserved.
+  ///            A strong tag lets cached metadata outlive this open.
+  /// @param stash The object's bytes over [@p window_lo, @p object_size) when
+  ///            the open fetched them, so reads inside that window need no GET.
+  kvikio_remote_io_object(std::string uri,
+                          kvikio::RemoteHandle handle,
+                          size_t object_size,
+                          std::string etag   = {},
+                          size_t window_lo   = 0,
+                          stash_type stash   = nullptr)
+    : _uri(std::move(uri)),
+      _handle(std::move(handle)),
+      _object_size(object_size),
+      _etag(std::move(etag)),
+      _window_lo(window_lo),
+      _stash(std::move(stash))
   {
   }
 
   [[nodiscard]] const std::string& raw_file_cache_id() const noexcept final { return _uri; }
   [[nodiscard]] const std::string& object_path() const noexcept final { return _uri; }
   [[nodiscard]] size_t size() const noexcept final { return _object_size; }
+  [[nodiscard]] std::string_view validation_tag() const noexcept final { return _etag; }
+
+  /// Like the REST backend's objects: a strong ETag identifies the object
+  /// across opens, anything else only this open.
+  [[nodiscard]] object_identity identity() const final;
 
   /// Mutable for the same reason as @ref kvikio_io_object::handle.
   [[nodiscard]] kvikio::RemoteHandle& handle() const noexcept { return _handle; }
 
   [[nodiscard]] std::size_t read_at(void* dst, std::size_t size, std::size_t offset) const final;
 
+  [[nodiscard]] std::future<std::size_t> read_async(void* dst,
+                                                    std::size_t size,
+                                                    std::size_t offset) const final;
+
  private:
+  /// Copy [@p offset, @p offset + @p size) from the stash into @p dst (host or
+  /// device memory) when the stash covers it.  Returns whether it did.
+  [[nodiscard]] bool read_from_stash(void* dst, std::size_t size, std::size_t offset) const;
+
   std::string _uri;
   mutable kvikio::RemoteHandle _handle;
   size_t _object_size{0};
+  std::string _etag;
+  size_t _window_lo{0};
+  stash_type _stash;
 };
 
 // ---------------------------------------------------------------------------
@@ -158,13 +208,23 @@ class kvikio_remote_io_object final : public kvikio_object {
  * LIST / glob is NOT served here: it stays on the REST backend.
  *
  * It implements synchronous host I/O plus the shared `mixed_readv_async_io`
- * hook eagerly; the base scalar and vector wrappers construct prepared slices.
+ * hook; the base scalar and vector wrappers construct prepared slices.  A batch
+ * starts every slice's read at once and returns without waiting: kvikIO serves
+ * the reads concurrently (its thread pool, or its MULTI_POLL reactors for
+ * remote objects), and a small completion pool settles the batch.
  *
  * Capabilities:
  *   - @c supports_device_read: true (kvikIO reads into device memory, via GDS
  *     where the platform allows).
- *   - @c supports_vector_host_read: false — no batched dispatch path.
- *   - @c supports_host_to_device_read: false — no bounce-staging path.
+ *   - @c supports_vector_host_read: true — a batch of host reads, including
+ *     fills of prefetching-cache chunks, is served concurrently.
+ *   - @c supports_host_to_device_read: true — a slice can fill host buffers
+ *     (cache chunks) and copy its range on to the device in one request.
+ *   - @c supports_device_range_read: true — a batch of device reads is served
+ *     concurrently.
+ *
+ * Together these let the backend arm the prefetching cache, and with it the
+ * readahead, whose budget is @ref n_max_concurrent_scans.
  */
 class kvikio_context final : public ioctx {
  public:
@@ -181,9 +241,19 @@ class kvikio_context final : public ioctx {
   /// vars.  A default-constructed @p os disables the remote path (opening an
   /// @c s3:// URI then throws).
   ///
+  /// @p control_plane, when given, opens @c s3:// objects with the REST
+  /// backend's one-shot requests: a HEAD, or for a parquet footer probe a
+  /// suffix-range GET that also returns the footer bytes.  Either learns the
+  /// object's ETag, which lets its parquet metadata be cached across opens.
+  /// It is never started: only its blocking control-plane calls are used, and
+  /// every data read still goes through kvikIO.  Without it, opens use
+  /// kvikIO's own HEAD, which reports only the size.
+  ///
   /// @throw std::invalid_argument on a zero @c nthreads, @c task_size, or
   ///        @c bounce_buffer_size.
-  explicit kvikio_context(kvikio_config cfg, object_store_config os = {});
+  explicit kvikio_context(kvikio_config cfg,
+                          object_store_config os                      = {},
+                          std::shared_ptr<rest::rest_reactor> control_plane = nullptr);
 
   ~kvikio_context() override
   {
@@ -199,17 +269,36 @@ class kvikio_context final : public ioctx {
 
   [[nodiscard]] bool supports(std::string_view path) const noexcept override;
   [[nodiscard]] bool supports_device_read() const noexcept override { return true; }
-  [[nodiscard]] bool supports_vector_host_read() const noexcept override { return false; }
-  [[nodiscard]] bool supports_host_to_device_read() const noexcept override { return false; }
-  [[nodiscard]] bool supports_device_range_read() const noexcept override { return false; }
+  [[nodiscard]] bool supports_vector_host_read() const noexcept override { return true; }
+  [[nodiscard]] bool supports_host_to_device_read() const noexcept override { return true; }
+  [[nodiscard]] bool supports_device_range_read() const noexcept override { return true; }
 
-  /// Always false: kvikIO is a local-file path, and its whole point is streaming
-  /// straight to device per read rather than assembling a batch first.
-  [[nodiscard]] bool prefers_bulk_io() const noexcept override { return false; }
+  /// True unless @c kvikio_config::prefer_bulk_io turns it off: a batch's reads
+  /// run concurrently, so handing over every range a reader needs at once costs
+  /// one round trip of latency rather than one per range, which is what an
+  /// object store needs.
+  [[nodiscard]] bool prefers_bulk_io() const noexcept override
+  {
+    return _config.prefer_bulk_io.value_or(true);
+  }
 
-  /// Always zero: no prefetching cache on this backend, so nothing to read
-  /// ahead into.
-  [[nodiscard]] std::size_t n_max_concurrent_scans() const noexcept override { return 0; }
+  /// Remote objects follow @ref prefers_bulk_io(); local files never prefer the
+  /// bulk route, like the local uring backend, since a local read is a syscall
+  /// rather than a round trip.
+  [[nodiscard]] bool prefers_bulk_io(io_object const& obj) const noexcept override;
+
+  /// The largest gap between two ranges worth bridging into one request.  Same
+  /// value as the REST backend's default: for an object store a second request
+  /// costs a round trip, far more than reading a gap of this size.
+  [[nodiscard]] std::size_t merge_gap_size() const noexcept override { return 512UL << 10; }
+
+  /// How many scan tasks the readahead may keep in flight against this backend:
+  /// @c kvikio_config::n_max_concurrent_scans, which the ioctx factory defaults
+  /// to the REST backend's budget.  Zero opts out of readahead.
+  [[nodiscard]] std::size_t n_max_concurrent_scans() const noexcept override
+  {
+    return _config.n_max_concurrent_scans.value_or(0);
+  }
 
   /// kvikIO applies no physical block alignment of its own, so ranges pass
   /// through unchanged.
@@ -221,7 +310,7 @@ class kvikio_context final : public ioctx {
 
   size_t host_read_io(const io_object& obj, size_t offset, size_t size, uint8_t* dst) final;
 
-  /// KvikIO has no reactor queue, so it consumes prepared slices eagerly.
+  /// Starts every slice's read and returns without waiting for any of them.
   /// This is the backend's only asynchronous hook; the base scalar/vector
   /// wrappers all forward here.
   exec::semi_future<size_t> mixed_readv_async_io(
@@ -244,9 +333,32 @@ class kvikio_context final : public ioctx {
   /// opened.
   std::shared_ptr<io_object> create_io_object(std::string path) override;
 
+  /// Hinted open: @c open_hint::parquet_footer_probe opens an @c s3:// object
+  /// with one suffix-range GET through the control plane, which resolves the
+  /// size and ETag and stashes the footer, so its reads need no further GET.
+  std::shared_ptr<io_object> create_io_object(std::string path, open_hint hint) override;
+
+  /// Known-size open: an @c s3:// object whose size the caller already learned
+  /// (e.g. from a LIST) is opened without the HEAD request.  Other paths fall
+  /// back to @ref create_io_object(std::string).
+  std::shared_ptr<io_object> create_io_object(std::string path, std::uint64_t known_size) override;
+
  private:
+  /// Open @p path as an @c s3:// object.  A known size skips the HEAD; a footer
+  /// probe, when asked for and a control plane is present, replaces it.
+  std::shared_ptr<io_object> create_remote_io_object(std::string path,
+                                                     std::optional<std::uint64_t> known_size,
+                                                     bool footer_probe);
+
   kvikio_config _config;
   object_store_config _object_store;
+  std::shared_ptr<rest::rest_reactor> _control_plane;
+
+  /// Waits on the reads of in-flight batches and settles them.  Its threads
+  /// only block on futures, so it is sized for the number of batches in flight,
+  /// not for CPU work.  Declared last so it is destroyed first: its destructor
+  /// waits for every batch still being settled.
+  kvikio::ThreadPool _completion_pool{64};
 };
 
 }  // namespace sirius::io

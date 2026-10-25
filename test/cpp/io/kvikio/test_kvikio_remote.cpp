@@ -206,8 +206,8 @@ TEST_CASE("kvikio_context orders remote device reads behind the destination stre
   }
   REQUIRE(gate.entered.load(std::memory_order_acquire));
 
-  // mixed_readv_async_io runs eagerly on the calling thread, so the read has to
-  // be issued off-thread for "not yet complete" to be observable at all.
+  // Wait for the read off-thread so that "not yet complete" is observable while
+  // the gate holds the destination stream.
   auto read = std::async(std::launch::async, [&] {
     return std::move(ctx->device_read_async_io(ds->get_io_object(),
                                                0,

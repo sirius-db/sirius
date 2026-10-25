@@ -303,6 +303,7 @@ struct sirius_memory_limits {
   bool disk_tier{true};
   std::optional<std::string> cache_mode;
   std::optional<sirius::scan_manager::io_backend> backend;
+  std::optional<bool> kvikio_prefer_bulk_io;
   std::optional<std::string> rest_footer_probe_bytes;
   std::optional<std::size_t> rest_list_max_matches;
 };
@@ -391,6 +392,11 @@ class sirius_config_env_guard {
       std::string backend_name;
       REQUIRE(sirius::scan_manager::enum_to_string(*limits.backend, backend_name));
       out << "      backend: " << backend_name << "\n";
+    }
+    if (limits.kvikio_prefer_bulk_io.has_value()) {
+      out << "      kvikio:\n"
+             "        prefer_bulk_io: "
+          << (*limits.kvikio_prefer_bulk_io ? "true" : "false") << "\n";
     }
     out << "      rest:\n"
            "        request_timeout_s: 30\n";
@@ -3446,11 +3452,13 @@ TEST_CASE("S3 mixed Parquet schemas flush between files on first and repeated re
   auto limits = large_sirius_memory_limits("sirius");
   bool bulk   = true;
   SECTION("REST bulk") {}
+  SECTION("kvikIO bulk") { limits.backend = sirius::scan_manager::io_backend::kvikio; }
   SECTION("kvikIO general")
   {
-    limits.backend    = sirius::scan_manager::io_backend::kvikio;
-    limits.cache_mode = "none";
-    bulk              = false;
+    limits.backend               = sirius::scan_manager::io_backend::kvikio;
+    limits.kvikio_prefer_bulk_io = false;
+    limits.cache_mode            = "none";
+    bulk                         = false;
   }
   s3_sql_fixture fixture(*env, limits);
   sirius::test::scratch_dir directory("s3_d7_mixed");
@@ -3829,11 +3837,13 @@ TEST_CASE("S3 mapped Parquet normalizes IDs on bulk and general readers",
   auto limits = large_sirius_memory_limits("sirius");
   bool bulk   = true;
   SECTION("REST bulk") {}
+  SECTION("kvikIO bulk") { limits.backend = sirius::scan_manager::io_backend::kvikio; }
   SECTION("kvikIO general")
   {
-    limits.backend    = sirius::scan_manager::io_backend::kvikio;
-    limits.cache_mode = "none";
-    bulk              = false;
+    limits.backend               = sirius::scan_manager::io_backend::kvikio;
+    limits.kvikio_prefer_bulk_io = false;
+    limits.cache_mode            = "none";
+    bulk                         = false;
   }
   s3_sql_fixture fixture(*env, limits);
   sirius::test::scratch_dir directory("s3_field_id_mapping");

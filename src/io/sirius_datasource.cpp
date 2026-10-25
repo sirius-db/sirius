@@ -302,6 +302,9 @@ bool sirius_datasource::uses_prefetching_cache() const noexcept
   return _io_ctx->uses_prefetching_cache();
 }
 
-bool sirius_datasource::prefers_bulk_io() const noexcept { return _io_ctx->prefers_bulk_io(); }
+bool sirius_datasource::prefers_bulk_io() const noexcept
+{
+  return _io_ctx->prefers_bulk_io(*_io_object);
+}
 
 }  // namespace sirius::io
