@@ -171,8 +171,8 @@ Published batches must own their storage independently of the reader and transac
 | Preparation jobs and results | Bounded slots limit outstanding work, not total memory. |
 | Output lookahead | Counts results, coalescer input and queued batches. Taking a batch returns lookahead capacity, not storage; submitted work may overshoot the target. |
 | Reserved backing | The last physical owner releases the allocation and its reservation. Provider SQL, SDK allocations and decoder working memory are not automatically covered. |
-| Arrow input | Use the shared importer. Retain host backing and capacity through the last asynchronous read, including cancellation and failure; keep the completion lane and stream alive through drain. Release callbacks must be safe outside the statement thread. |
-| GPU output | Has its own consumer lifetime and may outlive the source and imported host batch. |
+| Arrow input | Use the shared importer with an explicit staging PMR kept alive by the capacity owner. Retain host backing, staging and capacity through the last asynchronous read, including cancellation and failure. Release callbacks and staging deallocation must be safe outside the statement thread. |
+| GPU output | May outlive the source and imported host batch. After destroying imported outputs, call `lane.quiesce()` even if the lane is idle; retain the stream, device allocator and backing through that barrier. |
 
 Partial publication follows the configured fill and residence limits. Residence starts at the first retained input; later arrivals do not reset it. Backpressure may delay publication. See [preparation settings](configuration.md#siriusexecutorscan_managerpreparation) for defaults.
 

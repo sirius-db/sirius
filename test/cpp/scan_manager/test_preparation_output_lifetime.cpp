@@ -24,11 +24,13 @@
 
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
+#include <rmm/mr/cuda_async_memory_resource.hpp>
 
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
 #include <array>
+#include <memory_resource>
 
 using namespace sirius::scan_manager;
 using namespace sirius::test::preparation;
@@ -143,6 +145,9 @@ struct arrow_releases {
 struct arrow_storage {
   std::shared_ptr<charged_block const> backing;
   std::shared_ptr<arrow_releases> released;
+  std::array<std::byte, 1024> staging_storage;
+  std::pmr::monotonic_buffer_resource staging{
+    staging_storage.data(), staging_storage.size(), std::pmr::null_memory_resource()};
   ArrowSchema schema{}, child_schema{};
   ArrowArray array{}, child{};
   ArrowSchema* schemas[1]{&child_schema};
@@ -205,7 +210,7 @@ auto arrow_constructor(std::shared_ptr<arrow_releases> releases, bool invalid_se
       {owner->child_schema.metadata, owner->child_metadata.size()}};
     if (invalid_second && data.id == 2) lengths.erase(owner->child_schema.metadata);
     auto batch = std::make_shared<sirius::op::scan::owned_arrow_batch>(
-      owner->schema, owner->array, owner, std::move(lengths));
+      owner->schema, owner->array, owner, owner->staging, std::move(lengths));
     return make_publication(std::make_unique<arrow_input>(data.id, std::move(batch)), 16);
   };
 }
@@ -303,6 +308,7 @@ TEST_CASE("Arrow reader outputs retain one backing through publication and impor
     CHECK(provider.seen->allocated_bytes == 32);
     b.reset();
   } else {
+    rmm::mr::cuda_async_memory_resource output_resource;
     rmm::cuda_stream first_stream, second_stream;
     std::array<materialized_batch, 2> outputs;
     std::array<gpu_read_hold, 2> holds;
@@ -310,17 +316,21 @@ TEST_CASE("Arrow reader outputs retain one backing through publication and impor
     api.add_callback = &gated_import_callback;
     sirius::exec::retire_lane first_lane(first_stream.value(), api);
     sirius::exec::retire_lane second_lane(second_stream.value(), api);
-    // The release guard must run before either lane waits during assertion unwinding.
-    auto release_on_exit = std::shared_ptr<void>(nullptr, [&](void*) {
+    // Unblock callbacks, destroy outputs, then cover queued frees before releasing the MR.
+    auto release_on_exit = std::shared_ptr<void>(nullptr, [&](void*) noexcept {
       for (auto& hold : holds)
         hold.release();
+      outputs     = {};
+      auto first  = first_lane.quiesce();
+      auto second = second_lane.quiesce();
+      if (first != cudaSuccess || second != cudaSuccess) std::terminate();
     });
     materialization_program program{77, 1, {cudf::data_type{cudf::type_id::INT32}}, 0, false};
     program.input_types = program.output_types;
     auto import         = [&](size_t i, auto const& input, auto& lane) {
       import_gate_scope scope(holds[i]);
       return import_arrow_host(
-        input->batch, program, lane, cudf::get_current_device_resource_ref());
+        input->batch, program, lane, rmm::device_async_resource_ref{output_resource});
     };
     outputs[0] = import(0, a, first_lane);
     REQUIRE(holds[0].await());
@@ -363,6 +373,7 @@ TEST_CASE("Arrow reader outputs retain one backing through publication and impor
                               cudaMemcpyDeviceToHost));
       CHECK(std::all_of(values.begin(), values.end(), [](auto v) { return v == 0x2a2a2a2a; }));
     }
+    release_on_exit.reset();
     for (auto& hold : holds)
       CHECK_FALSE(hold.timed_out);
   }
