@@ -467,6 +467,124 @@ TEST_CASE("vector top-k join: a NULL vector throws a clear error", "[operator][v
 
 namespace {
 
+//! Narrows the join to the given payload columns and rebuilds the merge to match.
+void narrow(topk_ops& ops,
+            std::vector<std::size_t> left_cols,
+            std::vector<std::size_t> right_cols,
+            uint64_t batch_bytes = 1 << 20)
+{
+  ops.join->set_payload_cols(std::move(left_cols), std::move(right_cols));
+  ops.merge = std::make_unique<sirius_physical_vector_topk_merge>(*ops.join, batch_bytes);
+  // No pipeline assigns ids here; execute() reads the operator id for batch telemetry.
+  ops.merge->operator_id = 3;
+}
+
+}  // namespace
+
+TEST_CASE("vector top-k join: narrowed payload gathers only the needed columns",
+          "[operator][vss][vector_topk]")
+{
+  auto ops = make_ops(/*k=*/3, "l2", /*is_similarity=*/false);
+  narrow(ops, /*left id*/ {1}, /*right id*/ {0});
+  REQUIRE(ops.merge->get_types().size() == 3);
+
+  auto batches = run_batches(
+    ops, {make_left_batch(LEFT_VECS, LEFT_IDS)}, {make_right_batch(RIGHT_VECS, RIGHT_IDS)});
+  std::vector<result_row> rows;
+  for (auto const& b : batches) {
+    auto view = sirius::get_cudf_table_view(*b);
+    // [left id, right id, ranking]
+    REQUIRE(view.num_columns() == 3);
+    auto lid = copy_column_to_host<int32_t>(view.column(0));
+    auto rid = copy_column_to_host<int32_t>(view.column(1));
+    auto val = copy_column_to_host<float>(view.column(2));
+    for (std::size_t i = 0; i < lid.size(); ++i) {
+      rows.emplace_back(lid[i], rid[i], val[i]);
+    }
+  }
+  REQUIRE(group_by_left(rows) ==
+          reference_topk(LEFT_VECS, LEFT_IDS, RIGHT_VECS, RIGHT_IDS, 3, false, l2));
+}
+
+TEST_CASE("vector top-k join: no left column sends a 1-byte carrier",
+          "[operator][vss][vector_topk]")
+{
+  auto ops = make_ops(/*k=*/3, "l2", /*is_similarity=*/false);
+  narrow(ops, /*left*/ {}, /*right id*/ {0});
+
+  // Several right batches, so the carrier row count drives a real merge.
+  auto batches =
+    run_batches(ops,
+                {make_left_batch(LEFT_VECS, LEFT_IDS)},
+                {make_right_batch(slice_of(RIGHT_VECS, 0, 3), slice_of(RIGHT_IDS, 0, 3)),
+                 make_right_batch(slice_of(RIGHT_VECS, 3, 6), slice_of(RIGHT_IDS, 3, 6))});
+  std::vector<int32_t> rids;
+  for (auto const& b : batches) {
+    auto view = sirius::get_cudf_table_view(*b);
+    // [carrier, right id, ranking]
+    REQUIRE(view.num_columns() == 3);
+    REQUIRE(view.column(0).type().id() == cudf::type_id::INT8);
+    auto rid = copy_column_to_host<int32_t>(view.column(1));
+    rids.insert(rids.end(), rid.begin(), rid.end());
+  }
+  // Output is each left row's k nearest, nearest first, in left row order.
+  auto const ref = reference_topk(LEFT_VECS, LEFT_IDS, RIGHT_VECS, RIGHT_IDS, 3, false, l2);
+  std::vector<int32_t> expected;
+  for (auto id : LEFT_IDS) {
+    expected.insert(expected.end(), ref.at(id).begin(), ref.at(id).end());
+  }
+  REQUIRE(rids == expected);
+}
+
+TEST_CASE("vector top-k join: no right column keeps only the distance",
+          "[operator][vss][vector_topk]")
+{
+  auto ops = make_ops(/*k=*/3, "l2", /*is_similarity=*/false);
+  narrow(ops, /*left id*/ {1}, /*right*/ {});
+
+  auto batches = run_batches(
+    ops, {make_left_batch(LEFT_VECS, LEFT_IDS)}, {make_right_batch(RIGHT_VECS, RIGHT_IDS)});
+  std::vector<int32_t> lids;
+  std::vector<float> vals;
+  for (auto const& b : batches) {
+    auto view = sirius::get_cudf_table_view(*b);
+    // [left id, ranking]
+    REQUIRE(view.num_columns() == 2);
+    auto lid = copy_column_to_host<int32_t>(view.column(0));
+    auto val = copy_column_to_host<float>(view.column(1));
+    lids.insert(lids.end(), lid.begin(), lid.end());
+    vals.insert(vals.end(), val.begin(), val.end());
+  }
+  auto const ref = reference_topk(LEFT_VECS, LEFT_IDS, RIGHT_VECS, RIGHT_IDS, 3, false, l2);
+  REQUIRE(lids.size() == LEFT_IDS.size() * 3);
+  for (std::size_t i = 0; i < LEFT_IDS.size(); ++i) {
+    for (std::size_t j = 0; j < 3; ++j) {
+      auto const row = i * 3 + j;
+      auto const ri =
+        std::find(RIGHT_IDS.begin(), RIGHT_IDS.end(), ref.at(LEFT_IDS[i])[j]) - RIGHT_IDS.begin();
+      REQUIRE(lids[row] == LEFT_IDS[i]);
+      REQUIRE(vals[row] == Approx(l2(LEFT_VECS[i], RIGHT_VECS[ri])).margin(1e-3));
+    }
+  }
+}
+
+TEST_CASE("vector top-k join: LEFT with an empty right side and no columns keeps the row count",
+          "[operator][vss][vector_topk]")
+{
+  auto ops = make_ops(/*k=*/3, "l2", /*is_similarity=*/false, 1 << 20, duckdb::JoinType::LEFT);
+  narrow(ops, /*left*/ {}, /*right*/ {});
+
+  auto batches = run_batches(ops, {make_left_batch(LEFT_VECS, LEFT_IDS)}, {});
+  REQUIRE(batches.size() == 1);
+  auto view = sirius::get_cudf_table_view(*batches[0]);
+  // [carrier, ranking]
+  REQUIRE(view.num_columns() == 2);
+  REQUIRE(view.num_rows() == static_cast<cudf::size_type>(LEFT_IDS.size()));
+  REQUIRE(view.column(1).null_count() == view.num_rows());
+}
+
+namespace {
+
 std::unique_ptr<sirius_physical_vector_topk_join> make_global_join(std::int64_t k,
                                                                    std::string metric,
                                                                    bool is_similarity)
@@ -497,27 +615,40 @@ std::unique_ptr<sirius_physical_vector_topk_join> make_global_join(std::int64_t 
   return join;
 }
 
+//! Where the left id, right id and ranking value sit in a global join output row. A negative
+//! index means the column is not output; its value is read as 0.
+struct global_layout {
+  int n_cols = 5;  // [left vec, left id, right id, right vec, ranking] by default
+  int lid    = 1;
+  int rid    = 2;
+  int val    = 4;
+};
+
 //! Runs the global select stage on every pair, then keeps the overall k best rows on the host
 //! (what TOP_N / MERGE_TOP_N do downstream). Returns (left id, right id, ranking value).
 std::vector<result_row> run_global(sirius_physical_vector_topk_join& join,
                                    batch_list const& lefts,
                                    batch_list const& rights,
                                    std::size_t k,
-                                   bool keep_largest)
+                                   bool keep_largest,
+                                   global_layout layout = {})
 {
   std::vector<result_row> rows;
   auto collect = [&](batch_list in) {
     auto out = join.execute(topk_pair_input(std::move(in), 0, false), default_stream());
     for (auto const& b : dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches()) {
       auto view = sirius::get_cudf_table_view(*b);
-      // [left vec, left id, right id, right vec, ranking]
-      REQUIRE(view.num_columns() == 5);
-      auto lid = copy_column_to_host<int32_t>(view.column(1));
-      auto rid = copy_column_to_host<int32_t>(view.column(2));
-      auto val = copy_column_to_host<float>(view.column(4));
+      REQUIRE(view.num_columns() == layout.n_cols);
+      auto const n  = static_cast<std::size_t>(view.num_rows());
+      auto read_int = [&](int c) {
+        return c >= 0 ? copy_column_to_host<int32_t>(view.column(c)) : std::vector<int32_t>(n, 0);
+      };
+      auto lid = read_int(layout.lid);
+      auto rid = read_int(layout.rid);
+      auto val = copy_column_to_host<float>(view.column(layout.val));
       // Each pair contributes at most k candidates.
-      REQUIRE(lid.size() <= k);
-      for (std::size_t i = 0; i < lid.size(); ++i) {
+      REQUIRE(n <= k);
+      for (std::size_t i = 0; i < n; ++i) {
         rows.emplace_back(lid[i], rid[i], val[i]);
       }
     }
@@ -641,4 +772,90 @@ TEST_CASE("vector global top-k join: empty right side emits one empty batch",
   auto const& batches = dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches();
   REQUIRE(batches.size() == 1);
   REQUIRE(sirius::get_cudf_table_view(*batches[0]).num_rows() == 0);
+}
+
+TEST_CASE("vector global top-k join: narrowed payload gathers only the needed columns",
+          "[operator][vss][vector_topk]")
+{
+  auto join = make_global_join(/*k=*/4, "l2", /*is_similarity=*/false);
+  join->set_payload_cols(/*left id*/ {1}, /*right id*/ {0});
+  REQUIRE(join->get_types().size() == 3);
+
+  // [left id, right id, ranking]
+  auto rows = run_global(*join,
+                         {make_left_batch(LEFT_VECS, LEFT_IDS)},
+                         {make_right_batch(RIGHT_VECS, RIGHT_IDS)},
+                         4,
+                         false,
+                         {/*n_cols=*/3, /*lid=*/0, /*rid=*/1, /*val=*/2});
+  REQUIRE(pairs_of(rows) ==
+          reference_global(LEFT_VECS, LEFT_IDS, RIGHT_VECS, RIGHT_IDS, 4, false, l2));
+}
+
+TEST_CASE("vector global top-k join: no left column", "[operator][vss][vector_topk]")
+{
+  auto join = make_global_join(/*k=*/4, "l2", /*is_similarity=*/false);
+  join->set_payload_cols(/*left*/ {}, /*right id*/ {0});
+
+  // [right id, ranking]
+  auto rows = run_global(*join,
+                         {make_left_batch(slice_of(LEFT_VECS, 0, 1), slice_of(LEFT_IDS, 0, 1)),
+                          make_left_batch(slice_of(LEFT_VECS, 1, 3), slice_of(LEFT_IDS, 1, 3))},
+                         {make_right_batch(RIGHT_VECS, RIGHT_IDS)},
+                         4,
+                         false,
+                         {/*n_cols=*/2, /*lid=*/-1, /*rid=*/0, /*val=*/1});
+  std::vector<int32_t> rids;
+  for (auto const& [l, r, v] : rows) {
+    rids.push_back(r);
+  }
+  std::vector<int32_t> expected;
+  for (auto const& [l, r] :
+       reference_global(LEFT_VECS, LEFT_IDS, RIGHT_VECS, RIGHT_IDS, 4, false, l2)) {
+    expected.push_back(r);
+  }
+  std::sort(rids.begin(), rids.end());
+  std::sort(expected.begin(), expected.end());
+  REQUIRE(rids == expected);
+}
+
+TEST_CASE("vector global top-k join: no left or right column keeps only the ranking",
+          "[operator][vss][vector_topk]")
+{
+  auto join = make_global_join(/*k=*/4, "l2", /*is_similarity=*/false);
+  join->set_payload_cols(/*left*/ {}, /*right*/ {});
+
+  // [ranking]
+  auto rows = run_global(*join,
+                         {make_left_batch(LEFT_VECS, LEFT_IDS)},
+                         {make_right_batch(slice_of(RIGHT_VECS, 0, 2), slice_of(RIGHT_IDS, 0, 2)),
+                          make_right_batch(slice_of(RIGHT_VECS, 2, 6), slice_of(RIGHT_IDS, 2, 6))},
+                         4,
+                         false,
+                         {/*n_cols=*/1, /*lid=*/-1, /*rid=*/-1, /*val=*/0});
+  std::vector<float> expected;
+  for (auto const& lv : LEFT_VECS) {
+    for (auto const& rv : RIGHT_VECS) {
+      expected.push_back(l2(lv, rv));
+    }
+  }
+  std::sort(expected.begin(), expected.end());
+  REQUIRE(rows.size() == 4);
+  for (std::size_t i = 0; i < rows.size(); ++i) {
+    REQUIRE(std::get<2>(rows[i]) == Approx(expected[i]).margin(1e-3));
+  }
+}
+
+TEST_CASE("vector global top-k join: narrowed empty right side keeps the narrowed schema",
+          "[operator][vss][vector_topk]")
+{
+  auto join = make_global_join(/*k=*/3, "l2", /*is_similarity=*/false);
+  join->set_payload_cols(/*left id*/ {1}, /*right id*/ {0});
+  auto out = join->execute(topk_pair_input({make_left_batch(LEFT_VECS, LEFT_IDS)}, 0, false),
+                           default_stream());
+  auto const& batches = dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches();
+  REQUIRE(batches.size() == 1);
+  auto view = sirius::get_cudf_table_view(*batches[0]);
+  REQUIRE(view.num_columns() == 3);
+  REQUIRE(view.num_rows() == 0);
 }

@@ -77,13 +77,14 @@ enum class topk_scope : std::uint8_t { per_row, global };
 
 //! Select stage of the exact per-row top-k vector join. For each (left batch, right batch) pair it
 //! finds every left row's k nearest rows within that right batch and emits a partial
-//! [right cols..., distance] of exactly n_left * k rows (padded with NULL rows at +inf distance
-//! when the right batch has fewer than k rows). The first pair of each left batch also forwards
-//! the left batch's columns. VECTOR_TOPK_MERGE combines the partials into the final top-k.
+//! [right payload cols..., distance] of exactly n_left * k rows (padded with NULL rows at +inf
+//! distance when the right batch has fewer than k rows). The first pair of each left batch also
+//! forwards the left payload columns. VECTOR_TOPK_MERGE combines the partials into the final top-k.
 //!
-//! In global scope it instead streams [left cols..., right cols..., ranking value] for the k best
-//! pairs of each (left batch, right batch) into TOP_N / MERGE_TOP_N. Every pair in the global top-k
-//! is in its left row's per-row top-k, so these candidates always contain the answer.
+//! In global scope it instead streams [left payload cols..., right payload cols..., ranking value]
+//! for the k best pairs of each (left batch, right batch) into TOP_N / MERGE_TOP_N. Every pair in
+//! the global top-k is in its left row's per-row top-k, so these candidates always contain the
+//! answer.
 class sirius_physical_vector_topk_join : public sirius_physical_partition_consumer_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE =
@@ -117,6 +118,20 @@ class sirius_physical_vector_topk_join : public sirius_physical_partition_consum
   //! INNER or LEFT; LEFT only differs when the right side is empty.
   duckdb::JoinType join_type;
   topk_scope scope;
+  //! Left columns the join outputs. Per-row forwards them to the merge, and empty means a 1-byte
+  //! carrier column is sent instead, only to keep the left row count. Global gathers them into
+  //! each row. Defaults to all left columns.
+  std::vector<std::size_t> left_payload_cols;
+  //! Right columns the join outputs: gathered into each partial (per-row) or row (global).
+  //! Defaults to all right columns.
+  std::vector<std::size_t> right_payload_cols;
+
+  //! Set which left and right columns are needed downstream, so the rest are never gathered.
+  void set_payload_cols(std::vector<std::size_t> left_cols, std::vector<std::size_t> right_cols);
+  //! Per-row: types of the forwarded left part (the left payload, or the carrier).
+  [[nodiscard]] duckdb::vector<sirius::logical_type> left_part_types() const;
+  //! Per-row: types of the right payload in each partial.
+  [[nodiscard]] duckdb::vector<sirius::logical_type> right_part_types() const;
 
  protected:
   void build_pipelines(pipeline::sirius_pipeline& current,

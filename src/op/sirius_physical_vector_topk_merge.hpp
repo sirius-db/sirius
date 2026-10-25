@@ -30,9 +30,9 @@ namespace op {
 class sirius_physical_vector_topk_join;
 
 //! Merge stage of the exact per-row top-k vector join. Each task takes one left batch: its
-//! forwarded left columns plus one partial per right batch from VECTOR_TOPK_JOIN, merges the
+//! forwarded left part plus one partial per right batch from VECTOR_TOPK_JOIN, merges the
 //! partials into each left row's overall top-k with cuVS knn_merge_parts, and emits
-//! [left cols..., right cols..., ranking value (FLOAT)].
+//! [left part..., right payload..., ranking value (FLOAT)].
 class sirius_physical_vector_topk_merge : public sirius_physical_partition_consumer_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE =
@@ -61,7 +61,7 @@ class sirius_physical_vector_topk_merge : public sirius_physical_partition_consu
  private:
   std::mutex drain_mutex_;
   std::size_t next_left_ordinal_ = 0;
-  //! Right child's column types, for NULL-padding when the right side is empty.
+  //! Right payload column types, for NULL-padding when the right side is empty.
   duckdb::vector<sirius::logical_type> right_types_;
 };
 

@@ -752,6 +752,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
 
   // An ungrouped count_star directly over the vector threshold join reads only the row count, so
   // let the join skip gathering the vector columns.
+  // NOTE: work on proper general column narrowing for the threshold join rather than having this
+  // count(*) shortcut.
   if (plan->type == sirius::op::SiriusPhysicalOperatorType::VECTOR_THRESHOLD_JOIN &&
       op.groups.empty() && op.grouping_sets.size() <= 1 && !op.expressions.empty()) {
     bool row_count_only = true;

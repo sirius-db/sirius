@@ -41,6 +41,12 @@ class VectorTopkJoinFixture : public sirius::test::GpuExecutionFixture {
     run_ok("CREATE TABLE lc (id INTEGER, v FLOAT[3]);");
     run_ok("INSERT INTO lc VALUES (1, [1,0,0]), (2, [0,1,1]);");
 
+    // Wider copies of l and r, so a query can leave columns on both sides unused.
+    run_ok("CREATE TABLE lw (id INTEGER, name VARCHAR, v FLOAT[3], w DOUBLE);");
+    run_ok("INSERT INTO lw SELECT id, 'l' || id, v, id * 1.5 FROM l;");
+    run_ok("CREATE TABLE rw (id INTEGER, v FLOAT[3], tag VARCHAR, w DOUBLE);");
+    run_ok("INSERT INTO rw SELECT id, v, 'r' || id, id * 2.5 FROM r;");
+
     run_ok("CREATE TABLE r_empty (id INTEGER, v FLOAT[3]);");
     run_ok("CREATE TABLE l_null (id INTEGER, v FLOAT[3]);");
     run_ok("INSERT INTO l_null VALUES (1, [0,0,0]), (2, NULL);");
@@ -134,6 +140,51 @@ TEST_CASE_METHOD(VectorTopkJoinFixture,
     "(SELECT r.id FROM r_empty r ORDER BY array_distance(l.v, r.v) LIMIT 3) rr");
 }
 
+// The join gathers only the columns the query reads; these cover the narrowed layouts.
+TEST_CASE_METHOD(VectorTopkJoinFixture,
+                 "gpu_execution top-k join with only some columns selected matches CPU",
+                 "[integration][gpu_execution][join][vss][vector_topk]")
+{
+  // A subset of each side, out of order.
+  compare_gpu_vs_cpu(
+    "SELECT rr.tag, lw.name, rr.id FROM lw, LATERAL "
+    "(SELECT rw.id, rw.tag FROM rw ORDER BY array_distance(lw.v, rw.v) LIMIT 3) rr");
+  // The same column selected twice.
+  compare_gpu_vs_cpu(
+    "SELECT rr.id, l.id, rr.id AS id2 FROM l, LATERAL "
+    "(SELECT r.id FROM r ORDER BY array_distance(l.v, r.v) LIMIT 3) rr");
+  // No left column: the merge gets the left row count from a 1-byte carrier.
+  compare_gpu_vs_cpu(
+    "SELECT rr.id FROM l, LATERAL "
+    "(SELECT r.id FROM r ORDER BY array_distance(l.v, r.v) LIMIT 3) rr");
+  // The vector column itself selected.
+  compare_gpu_vs_cpu(
+    "SELECT l.id, rr.v FROM l, LATERAL "
+    "(SELECT r.v FROM r ORDER BY array_distance(l.v, r.v) LIMIT 3) rr");
+  // LEFT with an empty right side and no left column.
+  compare_gpu_vs_cpu(
+    "SELECT rr.id FROM l LEFT JOIN LATERAL "
+    "(SELECT r.id FROM r_empty r ORDER BY array_distance(l.v, r.v) LIMIT 3) rr ON TRUE");
+}
+
+TEST_CASE_METHOD(VectorTopkJoinFixture,
+                 "gpu_execution top-k join with no right column selected matches CPU",
+                 "[integration][gpu_execution][join][vss][vector_topk]")
+{
+  compare_gpu_vs_cpu_approx(
+    "SELECT l.id, rr.d FROM l, LATERAL "
+    "(SELECT array_distance(l.v, r.v) AS d FROM r ORDER BY d LIMIT 3) rr",
+    {1},
+    1e-5);
+  // Only the distance: no left or right column. Aggregated to one row, since the approx compare
+  // needs an exact column 0 when there are several rows.
+  compare_gpu_vs_cpu_approx(
+    "SELECT count(*), sum(d) FROM (SELECT rr.d FROM l, LATERAL "
+    "(SELECT array_distance(l.v, r.v) AS d FROM r ORDER BY d LIMIT 3) rr)",
+    {1},
+    1e-5);
+}
+
 TEST_CASE_METHOD(VectorTopkJoinFixture,
                  "top-k join shapes that are not taken over stay on CPU",
                  "[integration][gpu_execution][join][vss][vector_topk]")
@@ -192,6 +243,27 @@ TEST_CASE_METHOD(VectorTopkJoinFixture,
     "SELECT l.id, r.id, array_distance(l.v, r.v) * 2 AS twice FROM l, r "
     "ORDER BY array_distance(l.v, r.v) LIMIT 5",
     {2},
+    1e-5);
+}
+
+TEST_CASE_METHOD(VectorTopkJoinFixture,
+                 "gpu_execution global top-k join with only some columns selected matches CPU",
+                 "[integration][gpu_execution][join][vss][vector_topk]")
+{
+  // A subset of each side, out of order.
+  compare_gpu_vs_cpu(
+    "SELECT r.tag, lw.name, lw.w, r.id FROM lw, rw r ORDER BY array_distance(lw.v, r.v) LIMIT 4");
+  // Only one side.
+  compare_gpu_vs_cpu("SELECT r.id FROM l, r ORDER BY array_distance(l.v, r.v) LIMIT 4");
+  compare_gpu_vs_cpu("SELECT l.id FROM l, r ORDER BY array_distance(l.v, r.v) LIMIT 4");
+  // The vector column itself selected.
+  compare_gpu_vs_cpu("SELECT l.v, r.id FROM l, r ORDER BY array_distance(l.v, r.v) LIMIT 4");
+  // Only the ranking value: no left or right column. Aggregated to one row, since the approx
+  // compare needs an exact column 0 when there are several rows.
+  compare_gpu_vs_cpu_approx(
+    "SELECT count(*), sum(d) FROM (SELECT array_distance(l.v, r.v) AS d FROM l, r "
+    "ORDER BY d LIMIT 4)",
+    {1},
     1e-5);
 }
 

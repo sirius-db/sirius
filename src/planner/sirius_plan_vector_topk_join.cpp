@@ -40,6 +40,7 @@
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "sirius_context.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -582,10 +583,26 @@ sirius_physical_plan_generator::try_plan_vector_perrow_topk_join(duckdb::Logical
     return nullptr;
   }
 
-  auto left_plan     = create_plan(*op.children[match->left_child_idx]);
-  auto right_plan    = create_plan(*sub->inner_join->children[sub->right_child_idx]);
-  auto const n_left  = left_plan->get_types().size();
-  auto const n_right = right_plan->get_types().size();
+  auto left_plan  = create_plan(*op.children[match->left_child_idx]);
+  auto right_plan = create_plan(*sub->inner_join->children[sub->right_child_idx]);
+
+  // Only the left and right columns that reach the output are gathered. pos[i] is output column
+  // i's position within its side's payload.
+  std::vector<std::size_t> left_cols, right_cols, pos;
+  auto slot = [](std::vector<std::size_t>& cols, std::size_t idx) {
+    auto it = std::find(cols.begin(), cols.end(), idx);
+    if (it != cols.end()) { return static_cast<std::size_t>(it - cols.begin()); }
+    cols.push_back(idx);
+    return cols.size() - 1;
+  };
+  for (auto const& c : *output_cols) {
+    pos.push_back(c.from == topk_output_col::source::left    ? slot(left_cols, c.idx)
+                  : c.from == topk_output_col::source::right ? slot(right_cols, c.idx)
+                                                             : 0);
+  }
+  // With no left payload the merge still carries a 1-byte column for the left row count.
+  auto const n_left_part  = std::max<std::size_t>(1, left_cols.size());
+  auto const n_right_part = right_cols.size();
 
   // Output batch byte budget, same source the other operators use.
   sirius::operator_params op_params;
@@ -605,18 +622,20 @@ sirius_physical_plan_generator::try_plan_vector_perrow_topk_join(duckdb::Logical
                                                                     match->dim,
                                                                     match->join_type,
                                                                     op.estimated_cardinality);
+  join->set_payload_cols(left_cols, right_cols);
   // The join finds each left row's top-k within every right batch; the merge combines them.
   auto merge = duckdb::make_uniq<sirius::op::sirius_physical_vector_topk_merge>(
     *join, op_params.concat_batch_bytes);
   merge->children.push_back(std::move(join));
 
-  // The merge emits [left cols, right cols, ranking]; reorder into the delim join's output layout.
+  // The merge emits [left payload, right payload, ranking]; reorder into the delim join's output
+  // layout.
   duckdb::vector<std::unique_ptr<sirius::ast::node>> select_list;
   for (std::size_t i = 0; i < output_cols->size(); ++i) {
     auto const& c        = (*output_cols)[i];
-    std::size_t const at = c.from == topk_output_col::source::left    ? c.idx
-                           : c.from == topk_output_col::source::right ? n_left + c.idx
-                                                                      : n_left + n_right;
+    std::size_t const at = c.from == topk_output_col::source::left    ? pos[i]
+                           : c.from == topk_output_col::source::right ? n_left_part + pos[i]
+                                                                      : n_left_part + n_right_part;
     duckdb::BoundReferenceExpression ref(op.types[i], at);
     select_list.push_back(sirius::ast::from_duckdb(ref));
   }
@@ -667,8 +686,8 @@ sirius_physical_plan_generator::try_plan_vector_global_topk_join(duckdb::Logical
                                                                     cross.estimated_cardinality,
                                                                     sirius::op::topk_scope::global);
 
-  // The join emits [left cols, right cols, ranking], the cross product's layout plus one column,
-  // so the projection only needs its distance calls pointed at that column.
+  // The bottom projection reads the cross product's layout [left cols, right cols]. Point its
+  // distance calls at the ranking column, which follows the cross product's columns.
   auto const& distance = *proj.expressions[match->distance_col];
   std::function<void(duckdb::unique_ptr<duckdb::Expression>&)> use_ranking_column =
     [&](duckdb::unique_ptr<duckdb::Expression>& expr) {
@@ -679,19 +698,70 @@ sirius_physical_plan_generator::try_plan_vector_global_topk_join(duckdb::Logical
       }
       duckdb::ExpressionIterator::EnumerateChildren(*expr, use_ranking_column);
     };
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> bottom_exprs;
+  for (auto const& e : proj.expressions) {
+    bottom_exprs.push_back(e->Copy());
+    use_ranking_column(bottom_exprs.back());
+  }
+
+  // Only the left and right columns the bottom projection still reads are gathered.
+  std::vector<std::size_t> left_cols, right_cols;
+  std::function<void(duckdb::Expression&)> collect = [&](duckdb::Expression& expr) {
+    if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+      auto const idx = expr.Cast<duckdb::BoundReferenceExpression>().index;
+      if (idx < n_left) {
+        left_cols.push_back(idx);
+      } else if (idx < n_left + n_right) {
+        right_cols.push_back(idx - n_left);
+      }
+      return;
+    }
+    duckdb::ExpressionIterator::EnumerateChildren(expr, collect);
+  };
+  for (auto& e : bottom_exprs) {
+    collect(*e);
+  }
+  for (auto* cols : {&left_cols, &right_cols}) {
+    std::sort(cols->begin(), cols->end());
+    cols->erase(std::unique(cols->begin(), cols->end()), cols->end());
+  }
+  join->set_payload_cols(left_cols, right_cols);
+
+  // Point the bottom projection at the narrowed join output [left payload, right payload, ranking].
+  auto pos_in = [](std::vector<std::size_t> const& cols, std::size_t idx) {
+    return static_cast<std::size_t>(std::lower_bound(cols.begin(), cols.end(), idx) - cols.begin());
+  };
+  std::function<void(duckdb::Expression&)> remap = [&](duckdb::Expression& expr) {
+    if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+      auto& ref = expr.Cast<duckdb::BoundReferenceExpression>();
+      if (ref.index < n_left) {
+        ref.index = pos_in(left_cols, ref.index);
+      } else if (ref.index < n_left + n_right) {
+        ref.index = left_cols.size() + pos_in(right_cols, ref.index - n_left);
+      } else {
+        ref.index = left_cols.size() + right_cols.size();
+      }
+      return;
+    }
+    duckdb::ExpressionIterator::EnumerateChildren(expr, remap);
+  };
+  for (auto& e : bottom_exprs) {
+    remap(*e);
+  }
+
   // Rebuild the projections bottom-up; only the bottom one computes the distance.
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan = std::move(join);
   for (auto it = match->projections.rbegin(); it != match->projections.rend(); ++it) {
     auto& p     = **it;
     bool bottom = &p == &proj;
     duckdb::vector<std::unique_ptr<sirius::ast::node>> select_list;
-    for (auto const& e : p.expressions) {
-      auto rewritten = e->Copy();
-      if (bottom) { use_ranking_column(rewritten); }
-      auto node = sirius::ast::from_duckdb(*rewritten);
+    for (std::size_t i = 0; i < p.expressions.size(); ++i) {
+      auto rewritten = bottom ? std::move(bottom_exprs[i]) : p.expressions[i]->Copy();
+      auto node      = sirius::ast::from_duckdb(*rewritten);
       if (!node) {
         throw duckdb::NotImplementedException(
-          "Unsupported expression in vector global top-k projection: " + e->ToString());
+          "Unsupported expression in vector global top-k projection: " +
+          p.expressions[i]->ToString());
       }
       select_list.push_back(std::move(node));
     }

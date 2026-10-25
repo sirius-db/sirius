@@ -54,19 +54,6 @@ namespace op {
 
 namespace {
 
-//! Per-row partials are [right types..., FLOAT distance];
-//! Global rows are [left types..., right types..., FLOAT ranking value].
-duckdb::vector<sirius::logical_type> output_types(const sirius_physical_operator& left,
-                                                  const sirius_physical_operator& right,
-                                                  topk_scope scope)
-{
-  duckdb::vector<sirius::logical_type> types;
-  if (scope == topk_scope::global) { types = left.get_types(); }
-  types.insert(types.end(), right.get_types().begin(), right.get_types().end());
-  types.push_back(sirius::from_duckdb(duckdb::LogicalType::FLOAT));
-  return types;
-}
-
 //! A right batch with fewer than k rows only yields k_eff (< k) neighbors per left row, but the
 //! merge needs exactly k per row from every part. Widen each row's k_eff results to k, filling the
 //! tail with @p filler.
@@ -97,6 +84,23 @@ std::unique_ptr<cudf::column> pad_rows_to_k(cudf::column_view const& src,
   return out;
 }
 
+//! The columns of @p table at @p cols.
+cudf::table_view select_cols(cudf::table_view const& table, std::vector<std::size_t> const& cols)
+{
+  return table.select(std::vector<cudf::size_type>(cols.begin(), cols.end()));
+}
+
+//! The types in @p all at @p cols.
+duckdb::vector<sirius::logical_type> types_at(duckdb::vector<sirius::logical_type> const& all,
+                                              std::vector<std::size_t> const& cols)
+{
+  duckdb::vector<sirius::logical_type> out;
+  for (auto i : cols) {
+    out.push_back(all[i]);
+  }
+  return out;
+}
+
 }  // namespace
 
 sirius_physical_vector_topk_join::sirius_physical_vector_topk_join(
@@ -112,7 +116,7 @@ sirius_physical_vector_topk_join::sirius_physical_vector_topk_join(
   std::size_t estimated_cardinality,
   topk_scope scope)
   : sirius_physical_partition_consumer_operator(SiriusPhysicalOperatorType::VECTOR_TOPK_JOIN,
-                                                output_types(*left, *right, scope),
+                                                duckdb::vector<sirius::logical_type>{},
                                                 estimated_cardinality),
     left_vector_col_idx(left_vector_col_idx),
     right_vector_col_idx(right_vector_col_idx),
@@ -129,8 +133,45 @@ sirius_physical_vector_topk_join::sirius_physical_vector_topk_join(
   if (join_type != duckdb::JoinType::INNER && join_type != duckdb::JoinType::LEFT) {
     throw duckdb::NotImplementedException("Vector top-k join: only INNER and LEFT are supported");
   }
+  // Default to all columns on both sides; this also sets the output types.
+  std::vector<std::size_t> left_cols, right_cols;
+  for (std::size_t i = 0; i < left->get_types().size(); ++i) {
+    left_cols.push_back(i);
+  }
+  for (std::size_t i = 0; i < right->get_types().size(); ++i) {
+    right_cols.push_back(i);
+  }
   children.push_back(std::move(left));
   children.push_back(std::move(right));
+  set_payload_cols(std::move(left_cols), std::move(right_cols));
+}
+
+void sirius_physical_vector_topk_join::set_payload_cols(std::vector<std::size_t> left_cols,
+                                                        std::vector<std::size_t> right_cols)
+{
+  left_payload_cols  = std::move(left_cols);
+  right_payload_cols = std::move(right_cols);
+  // Per-row partials are [right payload types..., FLOAT distance];
+  // Global rows are [left payload types..., right payload types..., FLOAT ranking value].
+  types.clear();
+  if (scope == topk_scope::global) {
+    types = types_at(children[0]->get_types(), left_payload_cols);
+  }
+  auto const right = right_part_types();
+  types.insert(types.end(), right.begin(), right.end());
+  types.push_back(sirius::from_duckdb(duckdb::LogicalType::FLOAT));
+}
+
+duckdb::vector<sirius::logical_type> sirius_physical_vector_topk_join::left_part_types() const
+{
+  // cuDF INT8 for DuckDB TINYINT.
+  if (left_payload_cols.empty()) { return {sirius::from_duckdb(duckdb::LogicalType::TINYINT)}; }
+  return types_at(children[0]->get_types(), left_payload_cols);
+}
+
+duckdb::vector<sirius::logical_type> sirius_physical_vector_topk_join::right_part_types() const
+{
+  return types_at(children[1]->get_types(), right_payload_cols);
 }
 
 //===--------------------------------------------------------------------===//
@@ -291,10 +332,22 @@ std::unique_ptr<operator_data> sirius_physical_vector_topk_join::execute(
 
   if (scope == topk_scope::global) { return execute_global(*input, stream); }
 
-  // Forward the left columns once per left batch; the merge repeats them per neighbor.
+  // Forward the left payload once per left batch; the merge repeats it per neighbor. With no left
+  // payload, send a 1-byte carrier so the merge still sees the left row count.
   if (input->emit_left_part) {
-    out_batches.push_back(make_data_batch(
-      std::make_unique<cudf::table>(left, stream, mr), *space, stream, batch_telemetry()));
+    std::unique_ptr<cudf::table> left_part;
+    if (left_payload_cols.empty()) {
+      std::vector<std::unique_ptr<cudf::column>> carrier;
+      carrier.push_back(cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT8},
+                                                  left.num_rows(),
+                                                  cudf::mask_state::UNALLOCATED,
+                                                  stream,
+                                                  mr));
+      left_part = std::make_unique<cudf::table>(std::move(carrier));
+    } else {
+      left_part = std::make_unique<cudf::table>(select_cols(left, left_payload_cols), stream, mr);
+    }
+    out_batches.push_back(make_data_batch(std::move(left_part), *space, stream, batch_telemetry()));
     out_partitions.push_back(topk_left_partition(input->left_ordinal));
   }
 
@@ -340,10 +393,13 @@ std::unique_ptr<operator_data> sirius_physical_vector_topk_join::execute(
     distances = pad_rows_to_k(distances->view(), n_left, k_eff, k, dist_filler, stream, mr);
   }
 
-  // Gather the right columns now, while this right batch is at hand.
-  auto cols =
-    cudf::gather(right, neighbors->view(), cudf::out_of_bounds_policy::NULLIFY, stream, mr)
-      ->release();
+  // Gather the right payload while we still have right batch at hand.
+  auto cols = cudf::gather(select_cols(right, right_payload_cols),
+                           neighbors->view(),
+                           cudf::out_of_bounds_policy::NULLIFY,
+                           stream,
+                           mr)
+                ->release();
   cols.push_back(std::move(distances));
   out_batches.push_back(make_data_batch(
     std::make_unique<cudf::table>(std::move(cols)), *space, stream, batch_telemetry()));
@@ -419,12 +475,18 @@ std::unique_ptr<operator_data> sirius_physical_vector_topk_join::execute_global(
   }
   auto kept_cols = kept->release();
 
-  auto cols =
-    cudf::gather(left, kept_cols[0]->view(), cudf::out_of_bounds_policy::DONT_CHECK, stream, mr)
-      ->release();
-  auto right_cols =
-    cudf::gather(right, kept_cols[1]->view(), cudf::out_of_bounds_policy::DONT_CHECK, stream, mr)
-      ->release();
+  auto cols = cudf::gather(select_cols(left, left_payload_cols),
+                           kept_cols[0]->view(),
+                           cudf::out_of_bounds_policy::DONT_CHECK,
+                           stream,
+                           mr)
+                ->release();
+  auto right_cols = cudf::gather(select_cols(right, right_payload_cols),
+                                 kept_cols[1]->view(),
+                                 cudf::out_of_bounds_policy::DONT_CHECK,
+                                 stream,
+                                 mr)
+                      ->release();
   for (auto& c : right_cols) {
     cols.push_back(std::move(c));
   }
