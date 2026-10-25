@@ -448,5 +448,8 @@ TEST_CASE("Paimon descriptors authenticate both Sirius load orders", "[.][paimon
   auto rows = con.Query("SELECT sum(value) FROM pm.test.t");
   INFO((rows->HasError() ? rows->GetError() : "success"));
   REQUIRE_FALSE(rows->HasError());
-  CHECK(rows->GetValue(0, 0).GetValue<int64_t>() == 10);
+  auto chunk = rows->Fetch();
+  REQUIRE(chunk != nullptr);
+  REQUIRE(chunk->size() == 1);
+  CHECK(chunk->GetValue(0, 0).GetValue<int64_t>() == 10);
 }
