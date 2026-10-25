@@ -26,7 +26,10 @@
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/utilities/bit.hpp>
 
+#include <rmm/device_buffer.hpp>
 #include <rmm/device_uvector.hpp>
+#include <rmm/mr/pinned_host_memory_resource.hpp>
+#include <rmm/mr/pool_memory_resource.hpp>
 
 #include <cuda.h>
 
@@ -922,9 +925,10 @@ register_value translation_context::produce_reference(sirius::ast::reference con
                         "_offsets[row + 1] - in_" + id_str + "_offsets[row]), in_" + id_str +
                         "_chars_end} : str_view{nullptr, 0, nullptr}, true, false};");
     } else {
-      emit_prelude_line("bool const " + var_name + "_valid = (in_" + id_str +
-                        "_mask == nullptr) || is_bit_set(in_" + id_str + "_mask, in_" + id_str +
-                        "_bit_offset + row);");
+      // The validity bit and the offsets are loaded independently (a null row still has
+      // offsets) so the two loads overlap instead of forming a dependent chain.
+      emit_prelude_line("bool const " + var_name + "_valid = is_bit_set(in_" + id_str +
+                        "_mask, in_" + id_str + "_bit_offset + row);");
       emit_prelude_line("reg_val<str_view> " + var_name + "{(" + var_name + "_valid && in_" +
                         id_str + "_offsets != nullptr) ? str_view{in_" + id_str + "_chars + in_" +
                         id_str + "_offsets[row], static_cast<int32_t>(in_" + id_str +
@@ -936,12 +940,14 @@ register_value translation_context::produce_reference(sirius::ast::reference con
     emit_prelude_line("reg_val<" + dst_type_str + "> " + var_name + "{static_cast<" + dst_type_str +
                       ">(in_" + id_str + "_data[row]), true, false};");
   } else {
-    emit_prelude_line("bool const " + var_name + "_valid = (in_" + id_str +
-                      "_mask == nullptr) || is_bit_set(in_" + id_str + "_mask, in_" + id_str +
-                      "_bit_offset + row);");
-    emit_prelude_line("reg_val<" + dst_type_str + "> " + var_name + "{" + var_name +
-                      "_valid ? static_cast<" + dst_type_str + ">(in_" + id_str +
-                      "_data[row]) : " + dst_type_str + "{}, " + var_name + "_valid, false};");
+    // A null row's payload slot exists, so the payload is loaded unconditionally alongside the
+    // validity bit (two independent loads) and zeroed afterwards for a deterministic register.
+    emit_prelude_line("bool const " + var_name + "_valid = is_bit_set(in_" + id_str + "_mask, in_" +
+                      id_str + "_bit_offset + row);");
+    emit_prelude_line(dst_type_str + " const " + var_name + "_raw = static_cast<" + dst_type_str +
+                      ">(in_" + id_str + "_data[row]);");
+    emit_prelude_line("reg_val<" + dst_type_str + "> " + var_name + "{" + var_name + "_valid ? " +
+                      var_name + "_raw : " + dst_type_str + "{}, " + var_name + "_valid, false};");
   }
 
   register_value reg{
@@ -2056,12 +2062,133 @@ namespace {
 void emit_nvrtc_device_runtime_preamble_impl(std::ostringstream& src)
 {
   src
-    << "#include \"codegen/stdint_shim.hpp\"\n"
-    << "#include <cuda/numeric>\n"
-    << "#include <cuda/std/chrono>\n"
-    << "#include <cuda/std/limits>\n"
-    << "#include <cuda/std/type_traits>\n"
-    << "#include <cuda/std/utility>\n\n"
+    << "#include \"codegen/stdint_shim.hpp\"\n\n"
+    // The preamble is deliberately self-contained (no CCCL includes): parsing <cuda/std/chrono>,
+    // <cuda/numeric> and friends dominated every kernel compile (~0.7 s) and even a precompiled
+    // header of them took ~0.25 s to load. The handful of traits, limits, checked-arithmetic and
+    // civil-calendar helpers the generated code needs are defined here instead.
+    << "template <typename T> struct limits;\n"
+    << "template <> struct limits<bool> { static constexpr bool lowest() { return false; } static "
+       "constexpr bool max() { return true; } };\n"
+    << "template <> struct limits<int8_t> { static constexpr int8_t lowest() { return -128; } "
+       "static constexpr int8_t max() { return 127; } };\n"
+    << "template <> struct limits<int16_t> { static constexpr int16_t lowest() { return -32768; } "
+       "static constexpr int16_t max() { return 32767; } };\n"
+    << "template <> struct limits<int32_t> { static constexpr int32_t lowest() { return "
+       "-2147483647 - 1; } static constexpr int32_t max() { return 2147483647; } };\n"
+    << "template <> struct limits<int64_t> { static constexpr int64_t lowest() { return "
+       "-9223372036854775807LL - 1; } static constexpr int64_t max() { return "
+       "9223372036854775807LL; } };\n"
+    << "template <> struct limits<uint8_t> { static constexpr uint8_t lowest() { return 0; } "
+       "static "
+       "constexpr uint8_t max() { return 255; } };\n"
+    << "template <> struct limits<uint16_t> { static constexpr uint16_t lowest() { return 0; } "
+       "static constexpr uint16_t max() { return 65535; } };\n"
+    << "template <> struct limits<uint32_t> { static constexpr uint32_t lowest() { return 0; } "
+       "static constexpr uint32_t max() { return 4294967295u; } };\n"
+    << "template <> struct limits<uint64_t> { static constexpr uint64_t lowest() { return 0; } "
+       "static constexpr uint64_t max() { return 18446744073709551615ULL; } };\n"
+    << "template <> struct limits<__int128_t> {\n"
+    << "  static constexpr __int128_t max() { return static_cast<__int128_t>((static_cast<unsigned "
+       "__int128>(1) << 127) - 1); }\n"
+    << "  static constexpr __int128_t lowest() { return -max() - 1; }\n"
+    << "};\n"
+    << "template <> struct limits<unsigned __int128> {\n"
+    << "  static constexpr unsigned __int128 lowest() { return 0; }\n"
+    << "  static constexpr unsigned __int128 max() { return ~static_cast<unsigned __int128>(0); }\n"
+    << "};\n"
+    << "template <> struct limits<float> { static constexpr float lowest() { return "
+       "-3.402823466e+38f; } static constexpr float max() { return 3.402823466e+38f; } };\n"
+    << "template <> struct limits<double> { static constexpr double lowest() { return "
+       "-1.7976931348623157e+308; } static constexpr double max() { return "
+       "1.7976931348623157e+308; } };\n\n"
+    << "template <typename T> inline constexpr bool is_floating_point_v = false;\n"
+    << "template <> inline constexpr bool is_floating_point_v<float> = true;\n"
+    << "template <> inline constexpr bool is_floating_point_v<double> = true;\n"
+    << "template <typename T> inline constexpr bool is_signed_v = static_cast<T>(-1) < "
+       "static_cast<T>(0);\n"
+    << "template <bool B, typename T, typename F> struct conditional { using type = T; };\n"
+    << "template <typename T, typename F> struct conditional<false, T, F> { using type = F; };\n"
+    << "template <bool B, typename T, typename F> using conditional_t = typename conditional<B, T, "
+       "F>::type;\n\n"
+    // in_range<Dst>(v): does the integer v fit Dst? Comparisons run in a 128-bit type of the
+    // operands' signedness so no implicit conversion changes a value.
+    << "template <typename Dst, typename Src>\n"
+    << "__device__ __forceinline__ constexpr bool in_range(Src v) {\n"
+    << "  if constexpr (is_signed_v<Dst> == is_signed_v<Src>) {\n"
+    << "    using W = conditional_t<is_signed_v<Dst>, __int128_t, unsigned __int128>;\n"
+    << "    return static_cast<W>(v) >= static_cast<W>(limits<Dst>::lowest()) && static_cast<W>(v) "
+       "<= static_cast<W>(limits<Dst>::max());\n"
+    << "  } else if constexpr (is_signed_v<Dst>) {\n"
+    << "    return static_cast<unsigned __int128>(v) <= static_cast<unsigned "
+       "__int128>(limits<Dst>::max());\n"
+    << "  } else {\n"
+    << "    return v >= Src{0} && static_cast<unsigned __int128>(v) <= static_cast<unsigned "
+       "__int128>(limits<Dst>::max());\n"
+    << "  }\n"
+    << "}\n\n"
+    << "template <typename T> struct ovf_result { T value; bool overflow; };\n"
+    << "template <typename Dst>\n"
+    << "__device__ __forceinline__ ovf_result<Dst> overflow_cast(__int128_t v) {\n"
+    << "  bool const fits = in_range<Dst>(v);\n"
+    << "  return ovf_result<Dst>{fits ? static_cast<Dst>(v) : Dst{}, !fits};\n"
+    << "}\n"
+    << "__device__ __forceinline__ ovf_result<__int128_t> add_overflow128(__int128_t a, __int128_t "
+       "b) {\n"
+    << "  __int128_t const r = static_cast<__int128_t>(static_cast<unsigned __int128>(a) + "
+       "static_cast<unsigned __int128>(b));\n"
+    << "  return ovf_result<__int128_t>{r, ((a ^ r) & (b ^ r)) < 0};\n"
+    << "}\n"
+    << "__device__ __forceinline__ ovf_result<__int128_t> sub_overflow128(__int128_t a, __int128_t "
+       "b) {\n"
+    << "  __int128_t const r = static_cast<__int128_t>(static_cast<unsigned __int128>(a) - "
+       "static_cast<unsigned __int128>(b));\n"
+    << "  return ovf_result<__int128_t>{r, ((a ^ b) & (a ^ r)) < 0};\n"
+    << "}\n"
+    // Signed 128 x 128 -> 128 with overflow detection via 64-bit limbs of the magnitudes: the
+    // product fits iff at most one operand has a high limb, the cross product fits 64 bits, and
+    // the assembled magnitude does not exceed 2^127 (negative) or 2^127 - 1 (positive).
+    << "__device__ __forceinline__ ovf_result<__int128_t> mul_overflow128(__int128_t a, __int128_t "
+       "b) {\n"
+    << "  using u128 = unsigned __int128;\n"
+    << "  bool const negative = (a < 0) != (b < 0);\n"
+    << "  u128 const ua = a < 0 ? u128{0} - static_cast<u128>(a) : static_cast<u128>(a);\n"
+    << "  u128 const ub = b < 0 ? u128{0} - static_cast<u128>(b) : static_cast<u128>(b);\n"
+    << "  uint64_t const a_lo = static_cast<uint64_t>(ua), a_hi = static_cast<uint64_t>(ua >> "
+       "64);\n"
+    << "  uint64_t const b_lo = static_cast<uint64_t>(ub), b_hi = static_cast<uint64_t>(ub >> "
+       "64);\n"
+    << "  if (a_hi != 0u && b_hi != 0u) { return ovf_result<__int128_t>{0, true}; }\n"
+    << "  u128 const cross = (a_hi != 0u) ? static_cast<u128>(a_hi) * b_lo : "
+       "static_cast<u128>(b_hi) "
+       "* a_lo;\n"
+    << "  if (static_cast<uint64_t>(cross >> 64) != 0u) { return ovf_result<__int128_t>{0, true}; "
+       "}\n"
+    << "  u128 const lo = static_cast<u128>(a_lo) * b_lo;\n"
+    << "  u128 const hi_sum = (lo >> 64) + cross;\n"
+    << "  if (static_cast<uint64_t>(hi_sum >> 64) != 0u) { return ovf_result<__int128_t>{0, true}; "
+       "}\n"
+    << "  u128 const mag = (hi_sum << 64) | static_cast<uint64_t>(lo);\n"
+    << "  u128 const limit = (u128{1} << 127) - (negative ? u128{0} : u128{1});\n"
+    << "  if (mag > limit) { return ovf_result<__int128_t>{0, true}; }\n"
+    << "  return ovf_result<__int128_t>{static_cast<__int128_t>(negative ? u128{0} - mag : mag), "
+       "false};\n"
+    << "}\n"
+    // Same-width checked product for the decimal representation types.
+    << "template <typename T>\n"
+    << "__device__ __forceinline__ ovf_result<T> mul_overflow(T a, T b) {\n"
+    << "  if constexpr (sizeof(T) == 16) {\n"
+    << "    return mul_overflow128(a, b);\n"
+    << "  } else if constexpr (sizeof(T) == 8) {\n"
+    << "    T const lo = static_cast<T>(static_cast<uint64_t>(a) * static_cast<uint64_t>(b));\n"
+    << "    bool const ovf = __mul64hi(a, b) != (lo >> 63);\n"
+    << "    return ovf_result<T>{ovf ? T{} : lo, ovf};\n"
+    << "  } else {\n"
+    << "    int64_t const r = static_cast<int64_t>(a) * static_cast<int64_t>(b);\n"
+    << "    bool const fits = in_range<T>(r);\n"
+    << "    return ovf_result<T>{fits ? static_cast<T>(r) : T{}, !fits};\n"
+    << "  }\n"
+    << "}\n\n"
     << "template <typename T>\n"
     << "struct reg_val {\n"
     << "  T val;\n"
@@ -2457,7 +2584,7 @@ void emit_nvrtc_device_runtime_preamble_impl(std::ostringstream& src)
     << "  bool const ovf_in = l.overflow || r.overflow;\n"
     << "  bool const valid = l.valid && r.valid;\n"
     << "  if (!valid || ovf_in) { return reg_val<T>{T{}, valid, ovf_in}; }\n"
-    << "  if constexpr (cuda::std::is_floating_point_v<T>) {\n"
+    << "  if constexpr (is_floating_point_v<T>) {\n"
     << "    return reg_val<T>{static_cast<T>(l.val) + static_cast<T>(r.val), true, false};\n"
     // 64-bit sums: wrap in the unsigned domain and read the overflow off the sign bits (signed)
     // or the carry (unsigned) instead of widening to 128 bits.
@@ -2466,24 +2593,24 @@ void emit_nvrtc_device_runtime_preamble_impl(std::ostringstream& src)
     << "    T const rv = static_cast<T>(r.val);\n"
     << "    T const res = static_cast<T>(static_cast<uint64_t>(lv) + static_cast<uint64_t>(rv));\n"
     << "    bool ovf;\n"
-    << "    if constexpr (cuda::std::is_signed_v<T>) {\n"
+    << "    if constexpr (is_signed_v<T>) {\n"
     << "      ovf = static_cast<int64_t>((lv ^ res) & (rv ^ res)) < 0;\n"
     << "    } else {\n"
     << "      ovf = res < lv;\n"
     << "    }\n"
     << "    return reg_val<T>{ovf ? T{} : res, true, ovf};\n"
-    << "  } else if constexpr (cuda::std::is_signed_v<T>) {\n"
-    << "    using Wide = cuda::std::conditional_t<(sizeof(T) < 8), int64_t, __int128_t>;\n"
+    << "  } else if constexpr (is_signed_v<T>) {\n"
+    << "    using Wide = conditional_t<(sizeof(T) < 8), int64_t, __int128_t>;\n"
     << "    Wide const res = static_cast<Wide>(static_cast<T>(l.val)) + "
        "static_cast<Wide>(static_cast<T>(r.val));\n"
-    << "    bool const ovf = (res < static_cast<Wide>(cuda::std::numeric_limits<T>::lowest())) ||\n"
-    << "                     (res > static_cast<Wide>(cuda::std::numeric_limits<T>::max()));\n"
+    << "    bool const ovf = (res < static_cast<Wide>(limits<T>::lowest())) ||\n"
+    << "                     (res > static_cast<Wide>(limits<T>::max()));\n"
     << "    return reg_val<T>{ovf ? T{} : static_cast<T>(res), true, ovf};\n"
     << "  } else {\n"
-    << "    using Wide = cuda::std::conditional_t<(sizeof(T) < 8), uint64_t, unsigned __int128>;\n"
+    << "    using Wide = conditional_t<(sizeof(T) < 8), uint64_t, unsigned __int128>;\n"
     << "    Wide const res = static_cast<Wide>(static_cast<T>(l.val)) + "
        "static_cast<Wide>(static_cast<T>(r.val));\n"
-    << "    bool const ovf = res > static_cast<Wide>(cuda::std::numeric_limits<T>::max());\n"
+    << "    bool const ovf = res > static_cast<Wide>(limits<T>::max());\n"
     << "    return reg_val<T>{ovf ? T{} : static_cast<T>(res), true, ovf};\n"
     << "  }\n"
     << "}\n\n"
@@ -2492,20 +2619,20 @@ void emit_nvrtc_device_runtime_preamble_impl(std::ostringstream& src)
     << "  bool const ovf_in = l.overflow || r.overflow;\n"
     << "  bool const valid = l.valid && r.valid;\n"
     << "  if (!valid || ovf_in) { return reg_val<T>{T{}, valid, ovf_in}; }\n"
-    << "  if constexpr (cuda::std::is_floating_point_v<T>) {\n"
+    << "  if constexpr (is_floating_point_v<T>) {\n"
     << "    return reg_val<T>{static_cast<T>(l.val) - static_cast<T>(r.val), true, false};\n"
-    << "  } else if constexpr (sizeof(T) == 8 && cuda::std::is_signed_v<T>) {\n"
+    << "  } else if constexpr (sizeof(T) == 8 && is_signed_v<T>) {\n"
     << "    T const lv = static_cast<T>(l.val);\n"
     << "    T const rv = static_cast<T>(r.val);\n"
     << "    T const res = static_cast<T>(static_cast<uint64_t>(lv) - static_cast<uint64_t>(rv));\n"
     << "    bool const ovf = static_cast<int64_t>((lv ^ rv) & (lv ^ res)) < 0;\n"
     << "    return reg_val<T>{ovf ? T{} : res, true, ovf};\n"
-    << "  } else if constexpr (cuda::std::is_signed_v<T>) {\n"
-    << "    using Wide = cuda::std::conditional_t<(sizeof(T) < 8), int64_t, __int128_t>;\n"
+    << "  } else if constexpr (is_signed_v<T>) {\n"
+    << "    using Wide = conditional_t<(sizeof(T) < 8), int64_t, __int128_t>;\n"
     << "    Wide const res = static_cast<Wide>(static_cast<T>(l.val)) - "
        "static_cast<Wide>(static_cast<T>(r.val));\n"
-    << "    bool const ovf = (res < static_cast<Wide>(cuda::std::numeric_limits<T>::lowest())) ||\n"
-    << "                     (res > static_cast<Wide>(cuda::std::numeric_limits<T>::max()));\n"
+    << "    bool const ovf = (res < static_cast<Wide>(limits<T>::lowest())) ||\n"
+    << "                     (res > static_cast<Wide>(limits<T>::max()));\n"
     << "    return reg_val<T>{ovf ? T{} : static_cast<T>(res), true, ovf};\n"
     << "  } else {\n"
     << "    T const lv = static_cast<T>(l.val);\n"
@@ -2519,7 +2646,7 @@ void emit_nvrtc_device_runtime_preamble_impl(std::ostringstream& src)
     << "  bool const ovf_in = l.overflow || r.overflow;\n"
     << "  bool const valid = l.valid && r.valid;\n"
     << "  if (!valid || ovf_in) { return reg_val<T>{T{}, valid, ovf_in}; }\n"
-    << "  if constexpr (cuda::std::is_floating_point_v<T>) {\n"
+    << "  if constexpr (is_floating_point_v<T>) {\n"
     << "    return reg_val<T>{static_cast<T>(l.val) * static_cast<T>(r.val), true, false};\n"
     << "  } else if constexpr (sizeof(T) == 8) {\n"
     // 64-bit products: the high half of the 128-bit product is one instruction, and the product
@@ -2528,23 +2655,23 @@ void emit_nvrtc_device_runtime_preamble_impl(std::ostringstream& src)
     << "    T const rv = static_cast<T>(r.val);\n"
     << "    T const lo = static_cast<T>(static_cast<uint64_t>(lv) * static_cast<uint64_t>(rv));\n"
     << "    bool ovf;\n"
-    << "    if constexpr (cuda::std::is_signed_v<T>) {\n"
+    << "    if constexpr (is_signed_v<T>) {\n"
     << "      ovf = __mul64hi(lv, rv) != (lo >> 63);\n"
     << "    } else {\n"
     << "      ovf = __umul64hi(lv, rv) != 0ULL;\n"
     << "    }\n"
     << "    return reg_val<T>{ovf ? T{} : lo, true, ovf};\n"
-    << "  } else if constexpr (cuda::std::is_signed_v<T>) {\n"
+    << "  } else if constexpr (is_signed_v<T>) {\n"
     << "    int64_t const res = static_cast<int64_t>(static_cast<T>(l.val)) * "
        "static_cast<int64_t>(static_cast<T>(r.val));\n"
-    << "    bool const ovf = (res < static_cast<int64_t>(cuda::std::numeric_limits<T>::lowest())) "
+    << "    bool const ovf = (res < static_cast<int64_t>(limits<T>::lowest())) "
        "||\n"
-    << "                     (res > static_cast<int64_t>(cuda::std::numeric_limits<T>::max()));\n"
+    << "                     (res > static_cast<int64_t>(limits<T>::max()));\n"
     << "    return reg_val<T>{ovf ? T{} : static_cast<T>(res), true, ovf};\n"
     << "  } else {\n"
     << "    uint64_t const res = static_cast<uint64_t>(static_cast<T>(l.val)) * "
        "static_cast<uint64_t>(static_cast<T>(r.val));\n"
-    << "    bool const ovf = res > static_cast<uint64_t>(cuda::std::numeric_limits<T>::max());\n"
+    << "    bool const ovf = res > static_cast<uint64_t>(limits<T>::max());\n"
     << "    return reg_val<T>{ovf ? T{} : static_cast<T>(res), true, ovf};\n"
     << "  }\n"
     << "}\n\n"
@@ -2555,12 +2682,12 @@ void emit_nvrtc_device_runtime_preamble_impl(std::ostringstream& src)
     << "  if (!valid || ovf_in) { return reg_val<T>{T{}, valid, ovf_in}; }\n"
     << "  T const lv = static_cast<T>(l.val);\n"
     << "  T const rv = static_cast<T>(r.val);\n"
-    << "  if constexpr (cuda::std::is_floating_point_v<T>) {\n"
+    << "  if constexpr (is_floating_point_v<T>) {\n"
     << "    return reg_val<T>{lv / rv, true, false};\n"
     << "  } else {\n"
     << "    if (rv == T{0}) { return reg_val<T>{T{}, false, false}; }\n"
-    << "    if constexpr (cuda::std::is_signed_v<T>) {\n"
-    << "      if (lv == cuda::std::numeric_limits<T>::lowest() && rv == T{-1}) {\n"
+    << "    if constexpr (is_signed_v<T>) {\n"
+    << "      if (lv == limits<T>::lowest() && rv == T{-1}) {\n"
     << "        return reg_val<T>{T{}, true, true};\n"
     << "      }\n"
     << "    }\n"
@@ -2574,7 +2701,7 @@ void emit_nvrtc_device_runtime_preamble_impl(std::ostringstream& src)
     << "  if (!valid || ovf_in) { return reg_val<T>{T{}, valid, ovf_in}; }\n"
     << "  T const lv = static_cast<T>(l.val);\n"
     << "  T const rv = static_cast<T>(r.val);\n"
-    << "  if constexpr (cuda::std::is_floating_point_v<T>) {\n"
+    << "  if constexpr (is_floating_point_v<T>) {\n"
     << "    if constexpr (sizeof(T) == 4) {\n"
     << "      return reg_val<T>{::fmodf(lv, rv), true, false};\n"
     << "    } else {\n"
@@ -2582,8 +2709,8 @@ void emit_nvrtc_device_runtime_preamble_impl(std::ostringstream& src)
     << "    }\n"
     << "  } else {\n"
     << "    if (rv == T{0}) { return reg_val<T>{T{}, false, false}; }\n"
-    << "    if constexpr (cuda::std::is_signed_v<T>) {\n"
-    << "      if (lv == cuda::std::numeric_limits<T>::lowest() && rv == T{-1}) {\n"
+    << "    if constexpr (is_signed_v<T>) {\n"
+    << "      if (lv == limits<T>::lowest() && rv == T{-1}) {\n"
     << "        return reg_val<T>{T{0}, true, false};\n"
     << "      }\n"
     << "    }\n"
@@ -2594,14 +2721,14 @@ void emit_nvrtc_device_runtime_preamble_impl(std::ostringstream& src)
     << "__device__ __forceinline__ reg_val<T> eval_abs(reg_val<InT> in) {\n"
     << "  if (!in.valid || in.overflow) { return reg_val<T>{T{}, in.valid, in.overflow}; }\n"
     << "  T const v = static_cast<T>(in.val);\n"
-    << "  if constexpr (cuda::std::is_floating_point_v<T>) {\n"
+    << "  if constexpr (is_floating_point_v<T>) {\n"
     << "    if constexpr (sizeof(T) == 4) {\n"
     << "      return reg_val<T>{::fabsf(v), true, false};\n"
     << "    } else {\n"
     << "      return reg_val<T>{::fabs(v), true, false};\n"
     << "    }\n"
-    << "  } else if constexpr (cuda::std::is_signed_v<T>) {\n"
-    << "    if (v == cuda::std::numeric_limits<T>::lowest()) {\n"
+    << "  } else if constexpr (is_signed_v<T>) {\n"
+    << "    if (v == limits<T>::lowest()) {\n"
     << "      return reg_val<T>{T{}, true, true};\n"
     << "    }\n"
     << "    return reg_val<T>{static_cast<T>(v < T{0} ? -v : v), true, false};\n"
@@ -2637,15 +2764,15 @@ void emit_nvrtc_device_runtime_preamble_impl(std::ostringstream& src)
     << "  if constexpr (sizeof(L) <= 8 && sizeof(R) <= 8) {\n"
     << "    __int128_t const sum = static_cast<__int128_t>(l.val) * f_l + "
        "static_cast<__int128_t>(r.val) * f_r;\n"
-    << "    auto const out = cuda::overflow_cast<OutRep>(sum);\n"
+    << "    auto const out = overflow_cast<OutRep>(sum);\n"
     << "    return reg_val<OutRep>{out.overflow ? OutRep{} : out.value, true, out.overflow};\n"
     << "  }\n"
-    << "  auto const sl = cuda::mul_overflow<__int128_t>(static_cast<__int128_t>(l.val), f_l);\n"
-    << "  auto const sr = cuda::mul_overflow<__int128_t>(static_cast<__int128_t>(r.val), f_r);\n"
+    << "  auto const sl = mul_overflow128(static_cast<__int128_t>(l.val), f_l);\n"
+    << "  auto const sr = mul_overflow128(static_cast<__int128_t>(r.val), f_r);\n"
     << "  if (sl.overflow || sr.overflow) { return reg_val<OutRep>{OutRep{}, true, true}; }\n"
-    << "  auto const sum = cuda::add_overflow<__int128_t>(sl.value, sr.value);\n"
+    << "  auto const sum = add_overflow128(sl.value, sr.value);\n"
     << "  if (sum.overflow) { return reg_val<OutRep>{OutRep{}, true, true}; }\n"
-    << "  auto const out = cuda::overflow_cast<OutRep>(sum.value);\n"
+    << "  auto const out = overflow_cast<OutRep>(sum.value);\n"
     << "  return reg_val<OutRep>{out.overflow ? OutRep{} : out.value, true, out.overflow};\n"
     << "}\n\n"
     << "template <typename OutRep, typename L, typename R>\n"
@@ -2659,15 +2786,15 @@ void emit_nvrtc_device_runtime_preamble_impl(std::ostringstream& src)
     << "  if constexpr (sizeof(L) <= 8 && sizeof(R) <= 8) {\n"
     << "    __int128_t const diff = static_cast<__int128_t>(l.val) * f_l - "
        "static_cast<__int128_t>(r.val) * f_r;\n"
-    << "    auto const out = cuda::overflow_cast<OutRep>(diff);\n"
+    << "    auto const out = overflow_cast<OutRep>(diff);\n"
     << "    return reg_val<OutRep>{out.overflow ? OutRep{} : out.value, true, out.overflow};\n"
     << "  }\n"
-    << "  auto const sl = cuda::mul_overflow<__int128_t>(static_cast<__int128_t>(l.val), f_l);\n"
-    << "  auto const sr = cuda::mul_overflow<__int128_t>(static_cast<__int128_t>(r.val), f_r);\n"
+    << "  auto const sl = mul_overflow128(static_cast<__int128_t>(l.val), f_l);\n"
+    << "  auto const sr = mul_overflow128(static_cast<__int128_t>(r.val), f_r);\n"
     << "  if (sl.overflow || sr.overflow) { return reg_val<OutRep>{OutRep{}, true, true}; }\n"
-    << "  auto const diff = cuda::sub_overflow<__int128_t>(sl.value, sr.value);\n"
+    << "  auto const diff = sub_overflow128(sl.value, sr.value);\n"
     << "  if (diff.overflow) { return reg_val<OutRep>{OutRep{}, true, true}; }\n"
-    << "  auto const out = cuda::overflow_cast<OutRep>(diff.value);\n"
+    << "  auto const out = overflow_cast<OutRep>(diff.value);\n"
     << "  return reg_val<OutRep>{out.overflow ? OutRep{} : out.value, true, out.overflow};\n"
     << "}\n\n"
     << "template <typename OutRep, typename L, typename R>\n"
@@ -2681,7 +2808,7 @@ void emit_nvrtc_device_runtime_preamble_impl(std::ostringstream& src)
     << "    return reg_val<OutRep>{static_cast<OutRep>(l.val) * static_cast<OutRep>(r.val), true, "
        "false};\n"
     << "  } else {\n"
-    << "    auto const prod = cuda::mul_overflow<OutRep>(static_cast<OutRep>(l.val), "
+    << "    auto const prod = mul_overflow<OutRep>(static_cast<OutRep>(l.val), "
        "static_cast<OutRep>(r.val));\n"
     << "    return reg_val<OutRep>{prod.overflow ? OutRep{} : prod.value, true, prod.overflow};\n"
     << "  }\n"
@@ -2695,20 +2822,20 @@ void emit_nvrtc_device_runtime_preamble_impl(std::ostringstream& src)
     << "  __int128_t const lv = static_cast<__int128_t>(l.val);\n"
     << "  __int128_t const rv = static_cast<__int128_t>(r.val);\n"
     << "  if (rv == 0) { return reg_val<OutRep>{OutRep{}, false, false}; }\n"
-    << "  if (lv == cuda::std::numeric_limits<__int128_t>::lowest() && rv == -1) {\n"
+    << "  if (lv == limits<__int128_t>::lowest() && rv == -1) {\n"
     << "    return reg_val<OutRep>{OutRep{}, true, true};\n"
     << "  }\n"
     << "  __int128_t q = lv / rv;\n"
     << "  if constexpr (ScaleUp) {\n"
     << "    if (f_out != 1) {\n"
-    << "      auto const scaled = cuda::mul_overflow<__int128_t>(q, f_out);\n"
+    << "      auto const scaled = mul_overflow128(q, f_out);\n"
     << "      if (scaled.overflow) { return reg_val<OutRep>{OutRep{}, true, true}; }\n"
     << "      q = scaled.value;\n"
     << "    }\n"
     << "  } else {\n"
     << "    q /= f_out;\n"
     << "  }\n"
-    << "  auto const out = cuda::overflow_cast<OutRep>(q);\n"
+    << "  auto const out = overflow_cast<OutRep>(q);\n"
     << "  return reg_val<OutRep>{out.overflow ? OutRep{} : out.value, true, out.overflow};\n"
     << "}\n\n"
     << "template <typename OutRep, typename L, typename R>\n"
@@ -2717,21 +2844,21 @@ void emit_nvrtc_device_runtime_preamble_impl(std::ostringstream& src)
     << "  bool const ovf_in = l.overflow || r.overflow;\n"
     << "  bool const valid = l.valid && r.valid;\n"
     << "  if (!valid || ovf_in) { return reg_val<OutRep>{OutRep{}, valid, ovf_in}; }\n"
-    << "  auto const sl = cuda::mul_overflow<__int128_t>(static_cast<__int128_t>(l.val), f_l);\n"
-    << "  auto const sr = cuda::mul_overflow<__int128_t>(static_cast<__int128_t>(r.val), f_r);\n"
+    << "  auto const sl = mul_overflow128(static_cast<__int128_t>(l.val), f_l);\n"
+    << "  auto const sr = mul_overflow128(static_cast<__int128_t>(r.val), f_r);\n"
     << "  if (sl.overflow || sr.overflow) { return reg_val<OutRep>{OutRep{}, true, true}; }\n"
     << "  if (sr.value == 0) { return reg_val<OutRep>{OutRep{}, false, false}; }\n"
-    << "  if (sl.value == cuda::std::numeric_limits<__int128_t>::lowest() && sr.value == -1) {\n"
+    << "  if (sl.value == limits<__int128_t>::lowest() && sr.value == -1) {\n"
     << "    return reg_val<OutRep>{OutRep{0}, true, false};\n"
     << "  }\n"
     << "  __int128_t const rem = sl.value % sr.value;\n"
-    << "  auto const out = cuda::overflow_cast<OutRep>(rem);\n"
+    << "  auto const out = overflow_cast<OutRep>(rem);\n"
     << "  return reg_val<OutRep>{out.overflow ? OutRep{} : out.value, true, out.overflow};\n"
     << "}\n\n"
     << "template <typename DstT, typename SrcT>\n"
     << "__device__ __forceinline__ reg_val<DstT> eval_cast_int_to_int(reg_val<SrcT> in) {\n"
     << "  if (!in.valid || in.overflow) { return reg_val<DstT>{DstT{}, in.valid, in.overflow}; }\n"
-    << "  bool const fits = cuda::std::in_range<DstT>(in.val);\n"
+    << "  bool const fits = in_range<DstT>(in.val);\n"
     << "  return reg_val<DstT>{fits ? static_cast<DstT>(in.val) : DstT{}, true, !fits};\n"
     << "}\n\n"
     << "template <typename SrcT>\n"
@@ -2774,11 +2901,11 @@ void emit_nvrtc_device_runtime_preamble_impl(std::ostringstream& src)
     << "  double const d = static_cast<double>(in.val);\n"
     << "  if (!is_finite_double(d)) { return reg_val<DstInt>{DstInt{}, true, true}; }\n"
     << "  if constexpr (sizeof(DstInt) < 8) {\n"
-    << "    double const lo = static_cast<double>(cuda::std::numeric_limits<DstInt>::lowest());\n"
-    << "    double const hi = static_cast<double>(cuda::std::numeric_limits<DstInt>::max());\n"
+    << "    double const lo = static_cast<double>(limits<DstInt>::lowest());\n"
+    << "    double const hi = static_cast<double>(limits<DstInt>::max());\n"
     << "    if (d < lo || d > hi) { return reg_val<DstInt>{DstInt{}, true, true}; }\n"
     << "    return reg_val<DstInt>{static_cast<DstInt>(in.val), true, false};\n"
-    << "  } else if constexpr (cuda::std::is_signed_v<DstInt>) {\n"
+    << "  } else if constexpr (is_signed_v<DstInt>) {\n"
     << "    if (d < -9223372036854775808.0 || d >= 9223372036854775808.0) {\n"
     << "      return reg_val<DstInt>{DstInt{}, true, true};\n"
     << "    }\n"
@@ -2798,9 +2925,9 @@ void emit_nvrtc_device_runtime_preamble_impl(std::ostringstream& src)
     << "  __int128_t const v = static_cast<__int128_t>(in.val);\n"
     << "  if (v <= -int_limit || v >= int_limit) { return reg_val<DstRep>{DstRep{}, true, true}; "
        "}\n"
-    << "  auto const scaled = cuda::mul_overflow<__int128_t>(v, factor);\n"
+    << "  auto const scaled = mul_overflow128(v, factor);\n"
     << "  if (scaled.overflow) { return reg_val<DstRep>{DstRep{}, true, true}; }\n"
-    << "  auto const out = cuda::overflow_cast<DstRep>(scaled.value);\n"
+    << "  auto const out = overflow_cast<DstRep>(scaled.value);\n"
     << "  return reg_val<DstRep>{out.overflow ? DstRep{} : out.value, true, out.overflow};\n"
     << "}\n\n"
     << "template <typename DstInt, typename SrcRep>\n"
@@ -2809,7 +2936,7 @@ void emit_nvrtc_device_runtime_preamble_impl(std::ostringstream& src)
     << "  if (!in.valid || in.overflow) { return reg_val<DstInt>{DstInt{}, in.valid, in.overflow}; "
        "}\n"
     << "  __int128_t const q = static_cast<__int128_t>(in.val) / factor;\n"
-    << "  bool const fits = cuda::std::in_range<DstInt>(q);\n"
+    << "  bool const fits = in_range<DstInt>(q);\n"
     << "  return reg_val<DstInt>{fits ? static_cast<DstInt>(q) : DstInt{}, true, !fits};\n"
     << "}\n\n"
     << "template <typename DstRep, typename SrcRep>\n"
@@ -2817,12 +2944,12 @@ void emit_nvrtc_device_runtime_preamble_impl(std::ostringstream& src)
     << "    reg_val<SrcRep> in, __int128_t factor, __int128_t limit) {\n"
     << "  if (!in.valid || in.overflow) { return reg_val<DstRep>{DstRep{}, in.valid, in.overflow}; "
        "}\n"
-    << "  auto const scaled = cuda::mul_overflow<__int128_t>(static_cast<__int128_t>(in.val), "
+    << "  auto const scaled = mul_overflow128(static_cast<__int128_t>(in.val), "
        "factor);\n"
     << "  if (scaled.overflow || scaled.value <= -limit || scaled.value >= limit) {\n"
     << "    return reg_val<DstRep>{DstRep{}, true, true};\n"
     << "  }\n"
-    << "  auto const out = cuda::overflow_cast<DstRep>(scaled.value);\n"
+    << "  auto const out = overflow_cast<DstRep>(scaled.value);\n"
     << "  return reg_val<DstRep>{out.overflow ? DstRep{} : out.value, true, out.overflow};\n"
     << "}\n\n"
     << "template <typename DstRep, typename SrcRep>\n"
@@ -2832,7 +2959,7 @@ void emit_nvrtc_device_runtime_preamble_impl(std::ostringstream& src)
        "}\n"
     << "  __int128_t const q = static_cast<__int128_t>(in.val) / factor;\n"
     << "  if (q <= -limit || q >= limit) { return reg_val<DstRep>{DstRep{}, true, true}; }\n"
-    << "  auto const out = cuda::overflow_cast<DstRep>(q);\n"
+    << "  auto const out = overflow_cast<DstRep>(q);\n"
     << "  return reg_val<DstRep>{out.overflow ? DstRep{} : out.value, true, out.overflow};\n"
     << "}\n\n"
     << "template <typename DstFloat, typename SrcRep>\n"
@@ -2861,15 +2988,15 @@ void emit_nvrtc_device_runtime_preamble_impl(std::ostringstream& src)
     << "  __int128_t const iv = static_cast<__int128_t>(scaled);\n"
     << "  if (iv <= -limit_128 || iv >= limit_128) { return reg_val<DstRep>{DstRep{}, true, true}; "
        "}\n"
-    << "  auto const out = cuda::overflow_cast<DstRep>(iv);\n"
+    << "  auto const out = overflow_cast<DstRep>(iv);\n"
     << "  return reg_val<DstRep>{out.overflow ? DstRep{} : out.value, true, out.overflow};\n"
     << "}\n\n"
     << "template <int64_t Scale>\n"
     << "__device__ __forceinline__ reg_val<int64_t> eval_cast_date_to_timestamp(reg_val<int32_t> "
        "in) {\n"
     << "  if (!in.valid || in.overflow) { return reg_val<int64_t>{0, in.valid, in.overflow}; }\n"
-    << "  constexpr int32_t date_inf = cuda::std::numeric_limits<int32_t>::max();\n"
-    << "  constexpr int64_t ts_inf = cuda::std::numeric_limits<int64_t>::max();\n"
+    << "  constexpr int32_t date_inf = limits<int32_t>::max();\n"
+    << "  constexpr int64_t ts_inf = limits<int64_t>::max();\n"
     << "  constexpr int64_t micros_per_day = 86400000000LL;\n"
     << "  constexpr int64_t max_days = ts_inf / (Scale > micros_per_day ? Scale : "
        "micros_per_day);\n"
@@ -2884,8 +3011,8 @@ void emit_nvrtc_device_runtime_preamble_impl(std::ostringstream& src)
     << "template <int64_t Scale>\n"
     << "__device__ __forceinline__ reg_val<int64_t> eval_cast_ts_scale_up(reg_val<int64_t> in) {\n"
     << "  if (!in.valid || in.overflow) { return reg_val<int64_t>{0, in.valid, in.overflow}; }\n"
-    << "  constexpr int64_t ts_inf = cuda::std::numeric_limits<int64_t>::max();\n"
-    << "  constexpr int64_t ts_min = cuda::std::numeric_limits<int64_t>::lowest();\n"
+    << "  constexpr int64_t ts_inf = limits<int64_t>::max();\n"
+    << "  constexpr int64_t ts_min = limits<int64_t>::lowest();\n"
     << "  int64_t const t = in.val;\n"
     << "  if (t == ts_inf || t == -ts_inf) { return reg_val<int64_t>{t, true, false}; }\n"
     << "  if (t < (ts_min / Scale) || t > (ts_inf / Scale)) {\n"
@@ -2895,7 +3022,7 @@ void emit_nvrtc_device_runtime_preamble_impl(std::ostringstream& src)
     << "}\n\n"
     << "__device__ __forceinline__ reg_val<int64_t> eval_cast_ts_ns_to_us(reg_val<int64_t> in) {\n"
     << "  if (!in.valid || in.overflow) { return reg_val<int64_t>{0, in.valid, in.overflow}; }\n"
-    << "  constexpr int64_t ts_inf = cuda::std::numeric_limits<int64_t>::max();\n"
+    << "  constexpr int64_t ts_inf = limits<int64_t>::max();\n"
     << "  int64_t const t = in.val;\n"
     << "  if (t == ts_inf || t == -ts_inf) { return reg_val<int64_t>{t, true, false}; }\n"
     << "  int64_t const half = t / 500LL;\n"
@@ -2906,7 +3033,7 @@ void emit_nvrtc_device_runtime_preamble_impl(std::ostringstream& src)
     << "__device__ __forceinline__ reg_val<int64_t> eval_cast_ts_scale_down(reg_val<int64_t> in) "
        "{\n"
     << "  if (!in.valid || in.overflow) { return reg_val<int64_t>{0, in.valid, in.overflow}; }\n"
-    << "  constexpr int64_t ts_inf = cuda::std::numeric_limits<int64_t>::max();\n"
+    << "  constexpr int64_t ts_inf = limits<int64_t>::max();\n"
     << "  int64_t const t = in.val;\n"
     << "  if (t == ts_inf || t == -ts_inf) { return reg_val<int64_t>{t, true, false}; }\n"
     << "  int64_t const q = (t >= 0) ? (t / Scale) : ((t - Scale + 1LL) / Scale);\n"
@@ -2916,32 +3043,47 @@ void emit_nvrtc_device_runtime_preamble_impl(std::ostringstream& src)
     << "__device__ __forceinline__ reg_val<int32_t> eval_cast_timestamp_to_date(reg_val<int64_t> "
        "in) {\n"
     << "  if (!in.valid || in.overflow) { return reg_val<int32_t>{0, in.valid, in.overflow}; }\n"
-    << "  constexpr int32_t date_inf = cuda::std::numeric_limits<int32_t>::max();\n"
-    << "  constexpr int64_t ts_inf = cuda::std::numeric_limits<int64_t>::max();\n"
+    << "  constexpr int32_t date_inf = limits<int32_t>::max();\n"
+    << "  constexpr int64_t ts_inf = limits<int64_t>::max();\n"
     << "  int64_t const t = in.val;\n"
     << "  if (t == ts_inf) { return reg_val<int32_t>{date_inf, true, false}; }\n"
     << "  if (t == -ts_inf) { return reg_val<int32_t>{-date_inf, true, false}; }\n"
     << "  int64_t const days = (t >= 0) ? (t / Scale) : ((t - Scale + 1LL) / Scale);\n"
-    << "  if (days < static_cast<int64_t>(cuda::std::numeric_limits<int32_t>::lowest()) ||\n"
+    << "  if (days < static_cast<int64_t>(limits<int32_t>::lowest()) ||\n"
     << "      days >= static_cast<int64_t>(date_inf)) {\n"
     << "    return reg_val<int32_t>{0, true, true};\n"
     << "  }\n"
     << "  return reg_val<int32_t>{static_cast<int32_t>(days), true, false};\n"
     << "}\n\n"
-    << "__device__ __forceinline__ void civil_from_days(int64_t z, int16_t& y, int16_t& m, "
+    // Proleptic Gregorian date from a 32-bit count of days since 1970-01-01. This is
+    // cuda::std::chrono::year_month_day's algorithm (H. Hinnant's civil_from_days) with the same
+    // 32-bit `int` arithmetic, so the +/-infinity sentinels wrap exactly as they do in the
+    // cuDF-based evaluators; the wrapping steps use unsigned arithmetic to stay well defined.
+    << "__device__ __forceinline__ void civil_from_days(int32_t days, int16_t& y, int16_t& m, "
        "int16_t& d) {\n"
-    << "  cuda::std::chrono::year_month_day const ymd{\n"
-    << "      cuda::std::chrono::sys_days{cuda::std::chrono::days{static_cast<int32_t>(z)}}};\n"
-    << "  y = static_cast<int16_t>(static_cast<int>(ymd.year()));\n"
-    << "  m = static_cast<int16_t>(static_cast<unsigned>(ymd.month()));\n"
-    << "  d = static_cast<int16_t>(static_cast<unsigned>(ymd.day()));\n"
+    << "  int32_t const z = static_cast<int32_t>(static_cast<uint32_t>(days) + 719468u);\n"
+    << "  int32_t const z_neg = static_cast<int32_t>(static_cast<uint32_t>(z) - 146096u);\n"
+    // `z >= 0` is tested as `days >= -719468`: that is how the optimizer folds the (formally
+    // overflowing) test in the compiled chrono code, and it is what decides the sentinel's value.
+    << "  int32_t const era = (days >= -719468 ? z : z_neg) / 146097;\n"
+    << "  uint32_t const doe = static_cast<uint32_t>(z) - static_cast<uint32_t>(era) * 146097u;\n"
+    << "  uint32_t const yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;\n"
+    << "  int32_t const yr = static_cast<int32_t>(yoe) + era * 400;\n"
+    << "  uint32_t const doy = doe - (365 * yoe + yoe / 4 - yoe / 100);\n"
+    << "  uint32_t const mp = (5 * doy + 2) / 153;\n"
+    << "  uint32_t const dd = doy - (153 * mp + 2) / 5 + 1;\n"
+    << "  uint32_t const mth = mp + (mp < 10 ? 3u : static_cast<uint32_t>(-9));\n"
+    // chrono::year holds a short and chrono::month / chrono::day an unsigned char.
+    << "  y = static_cast<int16_t>(yr + (mth <= 2 ? 1 : 0));\n"
+    << "  m = static_cast<int16_t>(static_cast<uint8_t>(mth));\n"
+    << "  d = static_cast<int16_t>(static_cast<uint8_t>(dd));\n"
     << "}\n\n"
     << "template <typename OutT, int Comp>\n"
     << "__device__ __forceinline__ reg_val<OutT> eval_extract_date(reg_val<int32_t> in) {\n"
     << "  if (!in.valid || in.overflow) { return reg_val<OutT>{OutT{}, in.valid, in.overflow}; }\n"
     << "  int32_t const days = in.val;\n"
     << "  if constexpr (Comp == 6 || Comp == 7) {\n"
-    << "    constexpr int32_t date_inf = cuda::std::numeric_limits<int32_t>::max();\n"
+    << "    constexpr int32_t date_inf = limits<int32_t>::max();\n"
     << "    if (days == date_inf || days == -date_inf) {\n"
     << "      return reg_val<OutT>{OutT{}, false, false};\n"
     << "    }\n"
@@ -2950,7 +3092,7 @@ void emit_nvrtc_device_runtime_preamble_impl(std::ostringstream& src)
     << "    return reg_val<OutT>{OutT{0}, true, false};\n"
     << "  } else {\n"
     << "    int16_t y = 0, m = 0, d = 0;\n"
-    << "    civil_from_days(static_cast<int64_t>(days), y, m, d);\n"
+    << "    civil_from_days(days, y, m, d);\n"
     << "    int16_t const res = (Comp == 0) ? y : ((Comp == 1) ? m : d);\n"
     << "    return reg_val<OutT>{static_cast<OutT>(res), true, false};\n"
     << "  }\n"
@@ -2960,47 +3102,44 @@ void emit_nvrtc_device_runtime_preamble_impl(std::ostringstream& src)
     << "  if (!in.valid || in.overflow) { return reg_val<OutT>{OutT{}, in.valid, in.overflow}; }\n"
     << "  int64_t const ticks = in.val;\n"
     << "  if constexpr (Comp == 6 || Comp == 7) {\n"
-    << "    constexpr int64_t ts_inf = cuda::std::numeric_limits<int64_t>::max();\n"
+    << "    constexpr int64_t ts_inf = limits<int64_t>::max();\n"
     << "    if (ticks == ts_inf || ticks == -ts_inf) {\n"
     << "      return reg_val<OutT>{OutT{}, false, false};\n"
     << "    }\n"
     << "  }\n"
-    << "  using Dur = cuda::std::chrono::duration<int64_t, cuda::std::ratio<1, TicksPerSec>>;\n"
-    << "  cuda::std::chrono::sys_time<Dur> const tp{Dur{ticks}};\n"
-    << "  auto const dp = cuda::std::chrono::floor<cuda::std::chrono::days>(tp);\n"
-    << "  if constexpr (Comp == 0 || Comp == 1 || Comp == 2) {\n"
-    << "    cuda::std::chrono::year_month_day const ymd{dp};\n"
-    << "    int16_t const res = (Comp == 0) ? static_cast<int16_t>(static_cast<int>(ymd.year()))\n"
-    << "                      : (Comp == 1) ? "
-       "static_cast<int16_t>(static_cast<unsigned>(ymd.month()))\n"
-    << "                                    : "
-       "static_cast<int16_t>(static_cast<unsigned>(ymd.day()));\n"
-    << "    return reg_val<OutT>{static_cast<OutT>(res), true, false};\n"
+    << "  constexpr int64_t ticks_per_day = 86400LL * TicksPerSec;\n"
+    << "  if constexpr (Comp <= 5) {\n"
+    // cuda::std::chrono::floor<days>: the day count is a 32-bit `int` (truncating division, then
+    // one step back when the result overshoots), so the sentinel timestamps wrap exactly as in
+    // the cuDF-based evaluators; finite values get the ordinary floor.
+    << "    int32_t day32 = static_cast<int32_t>(ticks / ticks_per_day);\n"
+    << "    if (static_cast<int64_t>(day32) * ticks_per_day > ticks) {\n"
+    << "      day32 = static_cast<int32_t>(static_cast<uint32_t>(day32) - 1u);\n"
+    << "    }\n"
+    << "    if constexpr (Comp <= 2) {\n"
+    << "      int16_t y = 0, m = 0, d = 0;\n"
+    << "      civil_from_days(day32, y, m, d);\n"
+    << "      int16_t const res = (Comp == 0) ? y : ((Comp == 1) ? m : d);\n"
+    << "      return reg_val<OutT>{static_cast<OutT>(res), true, false};\n"
+    << "    } else {\n"
+    << "      int64_t const tsm = ticks - static_cast<int64_t>(day32) * ticks_per_day;\n"
+    << "      if constexpr (Comp == 3) {\n"
+    << "        return reg_val<OutT>{static_cast<OutT>(static_cast<int16_t>(tsm / (3600LL * "
+       "TicksPerSec))), true, false};\n"
+    << "      } else if constexpr (Comp == 4) {\n"
+    << "        return reg_val<OutT>{static_cast<OutT>(static_cast<int16_t>((tsm % (3600LL * "
+       "TicksPerSec)) / (60LL * TicksPerSec))), true, false};\n"
+    << "      } else {\n"
+    << "        return reg_val<OutT>{static_cast<OutT>(static_cast<int16_t>((tsm % (60LL * "
+       "TicksPerSec)) / TicksPerSec)), true, false};\n"
+    << "      }\n"
+    << "    }\n"
     << "  } else {\n"
-    << "    constexpr int64_t ticks_per_day = 86400LL * TicksPerSec;\n"
     << "    int64_t rem = ticks % ticks_per_day;\n"
     << "    if (rem < 0) { rem += ticks_per_day; }\n"
     << "    int64_t const sec_of_day = rem / TicksPerSec;\n"
     << "    int64_t const subsec     = rem % TicksPerSec;\n"
-    << "    if constexpr (Comp == 3 || Comp == 4 || Comp == 5) {\n"
-    << "      auto const time_since_midnight = tp - dp;\n"
-    << "      if constexpr (Comp == 3) {\n"
-    << "        auto const hrs = "
-       "cuda::std::chrono::duration_cast<cuda::std::chrono::hours>(time_since_midnight);\n"
-    << "        return reg_val<OutT>{static_cast<OutT>(static_cast<int16_t>(hrs.count())), true, "
-       "false};\n"
-    << "      } else if constexpr (Comp == 4) {\n"
-    << "        auto const mins = cuda::std::chrono::duration_cast<cuda::std::chrono::minutes>(\n"
-    << "            time_since_midnight % cuda::std::chrono::hours{1});\n"
-    << "        return reg_val<OutT>{static_cast<OutT>(static_cast<int16_t>(mins.count())), true, "
-       "false};\n"
-    << "      } else {\n"
-    << "        auto const secs = cuda::std::chrono::duration_cast<cuda::std::chrono::seconds>(\n"
-    << "            time_since_midnight % cuda::std::chrono::minutes{1});\n"
-    << "        return reg_val<OutT>{static_cast<OutT>(static_cast<int16_t>(secs.count())), true, "
-       "false};\n"
-    << "      }\n"
-    << "    } else {\n"
+    << "    {\n"
     << "      int64_t const sec = static_cast<int64_t>(static_cast<int16_t>(sec_of_day % 60LL));\n"
     << "      int64_t ms_part = 0LL;\n"
     << "      if constexpr (TicksPerSec == 1000LL) {\n"
@@ -3176,6 +3315,14 @@ void emit_input_and_constant_kernel_params(std::ostringstream& src, translation_
   }
 }
 
+// Process-wide stream-ordered pool of pinned host memory for small host-to-device staging copies.
+rmm::device_async_resource_ref pinned_staging_pool()
+{
+  static rmm::mr::pool_memory_resource pool{rmm::mr::pinned_host_memory_resource{},
+                                            std::size_t{1} << 20};
+  return pool;
+}
+
 struct input_arg_storage {
   void const* data_ptr{nullptr};
   void const* offsets_ptr{nullptr};
@@ -3194,6 +3341,11 @@ struct string_constant_arg_storage {
 struct bound_kernel_input_and_constant_args {
   std::vector<input_arg_storage> in_args;
   rmm::device_uvector<char> d_const_chars;
+  // Pinned staging for the string constants' host-to-device copy. A copy from pageable memory
+  // blocks the host while the driver stages it; a pinned source makes it asynchronous. The block
+  // comes from a stream-ordered pinned pool, so releasing it at the end of the evaluation is
+  // safe even while the copy is still queued.
+  rmm::device_buffer h_const_staging;
   std::vector<constant_param_storage> const_args;
   std::vector<string_constant_arg_storage> str_const_args;
 
@@ -3203,6 +3355,7 @@ struct bound_kernel_input_and_constant_args {
                                        rmm::device_async_resource_ref mr)
     : in_args(ctx.input_columns().size()),
       d_const_chars(0, stream, mr),
+      h_const_staging(0, stream, pinned_staging_pool()),
       const_args(ctx.constants().size()),
       str_const_args(ctx.constants().size())
   {
@@ -3242,8 +3395,10 @@ struct bound_kernel_input_and_constant_args {
     }
     if (!h_const_chars.empty()) {
       d_const_chars.resize(h_const_chars.size(), stream);
+      h_const_staging.resize(h_const_chars.size(), stream);
+      std::memcpy(h_const_staging.data(), h_const_chars.data(), h_const_chars.size());
       simpatico::throw_if_cuda_error(cudaMemcpyAsync(d_const_chars.data(),
-                                                     h_const_chars.data(),
+                                                     h_const_staging.data(),
                                                      h_const_chars.size(),
                                                      cudaMemcpyHostToDevice,
                                                      stream.get()),
@@ -3378,52 +3533,69 @@ std::unique_ptr<cudf::table> evaluate_project_sink(
 
   // Each thread evaluates `items_per_thread` rows, strided by the block width so that every
   // item's loads and stores stay coalesced across the warp and the unrolled items give the
-  // memory system several independent requests per thread.
-  src << "  #pragma unroll\n"
-      << "  for (int item = 0; item < " << items_per_thread << "; ++item) {\n"
-      << "    int32_t const row = tile_row0 + item * " << block_threads
-      << " + static_cast<int32_t>(threadIdx.x);\n"
-      << "    bool const active = (row < num_rows);\n";
-  for (std::size_t k = 0; k < out_regs.size(); ++k) {
-    if (!out_regs[k].is_statically_non_null) { src << "    bool out_" << k << "_valid = false;\n"; }
-  }
-  src << "    if (active) {\n" << ctx.body_code();
-  for (std::size_t k = 0; k < out_regs.size(); ++k) {
-    auto const& reg = out_regs[k];
-    if (reg.is_statically_non_null) {
-      src << "    out_" << k << "_data[row] = " << reg.var_name << ".val;\n";
-    } else {
-      src << "    if (" << reg.var_name << ".valid) {\n"
-          << "      out_" << k << "_data[row] = " << reg.var_name << ".val;\n"
-          << "    }\n"
-          << "    out_" << k << "_valid = " << reg.var_name << ".valid;\n";
-    }
-    if (reg.can_overflow) {
-      src << "    row_overflow = row_overflow || (" << reg.var_name << ".valid && " << reg.var_name
-          << ".overflow);\n";
-    }
-  }
-  src << "    }\n";
-
-  if (any_nullable_output) {
-    // The warp's 32 rows map to one validity bitmask word; a partial last warp masks off the
-    // lanes past `num_rows` and counts only its live rows.
-    src << "    int32_t const warp_base_row = row - lane;\n"
-        << "    int32_t const rem = num_rows - warp_base_row;\n"
-        << "    int32_t const active_in_warp = rem <= 0 ? 0 : (rem < 32 ? rem : 32);\n"
-        << "    uint32_t const valid_row_mask = (active_in_warp == 32) ? 0xFFFFFFFFu : "
-           "((active_in_warp <= 0) ? 0u : ((1u << active_in_warp) - 1u));\n";
+  // memory system several independent requests per thread. A full tile (every block but
+  // possibly the last) runs the items without the per-row bounds guard, which lets the compiler
+  // batch the loads of all items ahead of the arithmetic.
+  auto const emit_items = [&](bool guarded) {
+    std::string const indent = guarded ? "      " : "    ";
+    src << "  #pragma unroll\n"
+        << "  for (int item = 0; item < " << items_per_thread << "; ++item) {\n"
+        << "    int32_t const row = tile_row0 + item * " << block_threads
+        << " + static_cast<int32_t>(threadIdx.x);\n";
     for (std::size_t k = 0; k < out_regs.size(); ++k) {
-      if (out_regs[k].is_statically_non_null) { continue; }
-      src << "    uint32_t const ballot_" << k << " = __ballot_sync(0xFFFFFFFFu, out_" << k
-          << "_valid) & valid_row_mask;\n"
-          << "    if (lane == 0 && active_in_warp > 0) {\n"
-          << "      out_" << k << "_mask[warp_base_row >> 5] = ballot_" << k << ";\n"
-          << "      warp_nulls_" << k << " += static_cast<uint32_t>(active_in_warp - __popc(ballot_"
-          << k << "));\n"
-          << "    }\n";
+      if (!out_regs[k].is_statically_non_null) {
+        src << "    bool out_" << k << "_valid = false;\n";
+      }
     }
-  }
+    if (guarded) { src << "    if (row < num_rows) {\n"; }
+    src << ctx.body_code();
+    for (std::size_t k = 0; k < out_regs.size(); ++k) {
+      auto const& reg = out_regs[k];
+      if (reg.is_statically_non_null) {
+        src << indent << "out_" << k << "_data[row] = " << reg.var_name << ".val;\n";
+      } else {
+        src << indent << "if (" << reg.var_name << ".valid) {\n"
+            << indent << "  out_" << k << "_data[row] = " << reg.var_name << ".val;\n"
+            << indent << "}\n"
+            << indent << "out_" << k << "_valid = " << reg.var_name << ".valid;\n";
+      }
+      if (reg.can_overflow) {
+        src << indent << "row_overflow = row_overflow || (" << reg.var_name << ".valid && "
+            << reg.var_name << ".overflow);\n";
+      }
+    }
+    if (guarded) { src << "    }\n"; }
+
+    if (any_nullable_output) {
+      // The warp's 32 rows map to one validity bitmask word; a partial last warp masks off the
+      // lanes past `num_rows` and counts only its live rows.
+      src << "    int32_t const warp_base_row = row - lane;\n";
+      if (guarded) {
+        src << "    int32_t const rem = num_rows - warp_base_row;\n"
+            << "    int32_t const active_in_warp = rem <= 0 ? 0 : (rem < 32 ? rem : 32);\n"
+            << "    uint32_t const valid_row_mask = (active_in_warp == 32) ? 0xFFFFFFFFu : "
+               "((active_in_warp <= 0) ? 0u : ((1u << active_in_warp) - 1u));\n";
+      } else {
+        src << "    constexpr int32_t active_in_warp = 32;\n"
+            << "    constexpr uint32_t valid_row_mask = 0xFFFFFFFFu;\n";
+      }
+      for (std::size_t k = 0; k < out_regs.size(); ++k) {
+        if (out_regs[k].is_statically_non_null) { continue; }
+        src << "    uint32_t const ballot_" << k << " = __ballot_sync(0xFFFFFFFFu, out_" << k
+            << "_valid) & valid_row_mask;\n"
+            << "    if (lane == 0 && active_in_warp > 0) {\n"
+            << "      out_" << k << "_mask[warp_base_row >> 5] = ballot_" << k << ";\n"
+            << "      warp_nulls_" << k
+            << " += static_cast<uint32_t>(active_in_warp - __popc(ballot_" << k << "));\n"
+            << "    }\n";
+      }
+    }
+    src << "  }\n";
+  };
+  src << "  if (tile_row0 + " << tile_rows << " <= num_rows) {\n";
+  emit_items(/*guarded=*/false);
+  src << "  } else {\n";
+  emit_items(/*guarded=*/true);
   src << "  }\n";
 
   if (any_can_overflow) {
@@ -3764,37 +3936,45 @@ std::unique_ptr<cudf::table> evaluate_filter_sink(sirius::ast::node const& predi
   if (any_subquery_err) { src << "  bool row_subquery_error = false;\n"; }
 
   // Phase 1: evaluate the predicate for every row of the tile; each thread keeps one survive
-  // bit per item and lane 0 of each warp records the per-item warp count.
-  src << "  #pragma unroll\n"
-      << "  for (int item = 0; item < " << items_per_thread << "; ++item) {\n"
-      << "    int32_t const row = tile_row0 + item * " << block_threads
-      << " + static_cast<int32_t>(threadIdx.x);\n"
-      << "    bool const active = (row < num_rows);\n"
-      << "    bool survives = false;\n"
-      << "    if (active) {\n"
-      << ctx.body_code();
-  if (pred_reg.can_overflow) {
-    src << "      row_overflow = row_overflow || (" << pred_reg.var_name << ".valid && "
-        << pred_reg.var_name << ".overflow);\n"
-        << "      survives = (" << pred_reg.var_name << ".valid && !" << pred_reg.var_name
-        << ".overflow && " << pred_reg.var_name << ".val);\n";
-  } else if (pred_reg.is_statically_non_null) {
-    src << "      survives = " << pred_reg.var_name << ".val;\n";
-  } else {
-    src << "      survives = (" << pred_reg.var_name << ".valid && " << pred_reg.var_name
-        << ".val);\n";
-  }
-  src << "    }\n"
-      << "    uint32_t const warp_ballot = __ballot_sync(0xFFFFFFFFu, survives);\n"
-      << "    survive_bits |= (survives ? 1u : 0u) << item;\n"
-      << "    if (lane == 0) {\n"
-      << "      s_counts[item * " << num_warps
-      << " + warp_in_block] = "
-         "static_cast<uint32_t>(__popc(warp_ballot));\n"
-      << "      if (!single_tile && row - lane < num_rows) { ballots[(row - lane) >> 5] = "
-         "warp_ballot; }\n"
-      << "    }\n"
-      << "  }\n";
+  // bit per item and lane 0 of each warp records the per-item warp count. Full tiles skip the
+  // per-row bounds guard so the items' loads can be issued together.
+  auto const emit_items = [&](bool guarded) {
+    std::string const indent = guarded ? "      " : "    ";
+    src << "  #pragma unroll\n"
+        << "  for (int item = 0; item < " << items_per_thread << "; ++item) {\n"
+        << "    int32_t const row = tile_row0 + item * " << block_threads
+        << " + static_cast<int32_t>(threadIdx.x);\n"
+        << "    bool survives = false;\n";
+    if (guarded) { src << "    if (row < num_rows) {\n"; }
+    src << ctx.body_code();
+    if (pred_reg.can_overflow) {
+      src << indent << "row_overflow = row_overflow || (" << pred_reg.var_name << ".valid && "
+          << pred_reg.var_name << ".overflow);\n"
+          << indent << "survives = (" << pred_reg.var_name << ".valid && !" << pred_reg.var_name
+          << ".overflow && " << pred_reg.var_name << ".val);\n";
+    } else if (pred_reg.is_statically_non_null) {
+      src << indent << "survives = " << pred_reg.var_name << ".val;\n";
+    } else {
+      src << indent << "survives = (" << pred_reg.var_name << ".valid && " << pred_reg.var_name
+          << ".val);\n";
+    }
+    if (guarded) { src << "    }\n"; }
+    src << "    uint32_t const warp_ballot = __ballot_sync(0xFFFFFFFFu, survives);\n"
+        << "    survive_bits |= (survives ? 1u : 0u) << item;\n"
+        << "    if (lane == 0) {\n"
+        << "      s_counts[item * " << num_warps
+        << " + warp_in_block] = "
+           "static_cast<uint32_t>(__popc(warp_ballot));\n"
+        << "      if (!single_tile" << (guarded ? " && row - lane < num_rows" : "")
+        << ") { ballots[(row - lane) >> 5] = warp_ballot; }\n"
+        << "    }\n"
+        << "  }\n";
+  };
+  src << "  if (tile_row0 + " << tile_rows << " <= num_rows) {\n";
+  emit_items(/*guarded=*/false);
+  src << "  } else {\n";
+  emit_items(/*guarded=*/true);
+  src << "  }\n";
 
   if (any_can_overflow) {
     src << "  uint32_t const ovf_ballot = __ballot_sync(0xFFFFFFFFu, row_overflow);\n"
