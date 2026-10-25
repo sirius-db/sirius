@@ -32,6 +32,26 @@ using namespace sirius::scan_manager;
 using namespace std::chrono_literals;
 using namespace sirius::test::preparation;
 
+namespace {
+bool gate_is_available(std::shared_ptr<preparation_gate> const& gate)
+{
+  bool available = false;
+  std::thread probe([&] {
+    auto deadline = std::chrono::steady_clock::now() + 100ms;
+    do {
+      std::unique_lock lock(gate->mutex, std::try_to_lock);
+      if (lock.owns_lock()) {
+        available = true;
+        return;
+      }
+      std::this_thread::yield();
+    } while (std::chrono::steady_clock::now() < deadline);
+  });
+  probe.join();
+  return available;
+}
+}  // namespace
+
 TEST_CASE("Non-Iceberg adapter source uses one coordinator claim path and releases the last split",
           "[scan_preparation][coordinator][adapter_contract]")
 {
@@ -720,19 +740,7 @@ TEST_CASE("Construction and publication failures drain once and preserve the fir
     auto input = std::make_unique<observed_input>(
       std::move(batch), nullptr, 0, std::nullopt, observed_input::prefetch_start::deferred);
     input->on_destroy = [destroyed_outside_gate, gate = f.coordinator.publication_gate()] {
-      // Probe from another thread so a cleanup-under-lock regression fails instead of hanging.
-      std::thread probe([&] {
-        auto deadline = std::chrono::steady_clock::now() + 100ms;
-        do {
-          std::unique_lock lock(gate->mutex, std::try_to_lock);
-          if (lock.owns_lock()) {
-            *destroyed_outside_gate = true;
-            return;
-          }
-          std::this_thread::yield();
-        } while (std::chrono::steady_clock::now() < deadline);
-      });
-      probe.join();
+      *destroyed_outside_gate = gate_is_available(gate);
     };
     if (fail_initialize) input->prepare_prefetch();
     return preparation_coordinator::publication{std::move(input), 0};
@@ -1403,9 +1411,10 @@ TEST_CASE("A dispatcher that drops accepted work cannot turn it into successful 
   CHECK(f.completion.has_error());
 }
 
-TEST_CASE("Cancelled results release their last temporary allocation outside the publication gate",
+TEST_CASE("Discarded results and failed enqueues release temporary allocations outside the gate",
           "[scan_preparation][coordinator][temporary_release]")
 {
+  bool enqueue_failure = GENERATE(false, true);
   sirius::scan_manager::test::test_reservation_provider provider;
   auto ledger = std::make_shared<preparation_ledger>(provider);
   std::array envelope{scan_envelope{{{{16, 0, 0}, 16}}, {}, true}};
@@ -1415,24 +1424,60 @@ TEST_CASE("Cancelled results release their last temporary allocation outside the
   auto blocked = f.make_hold();
   auto gate    = f.coordinator.publication_gate();
   ledger->bind_wakeup(preparation_wakeup{gate});
+  charged_block rescued;
+  bool released_outside_gate = true;
   struct temporary_input : tagged {
     charged_block storage;
-    temporary_input(charged_block bytes) : tagged(1), storage(std::move(bytes)) {}
+    std::function<void(charged_block&)> check_release;
+    temporary_input(charged_block bytes, std::function<void(charged_block&)> check)
+      : tagged(1), storage(std::move(bytes)), check_release(std::move(check))
+    {
+    }
+    temporary_input(temporary_input&& other)
+      : tagged(other.id, other.rows),
+        storage(std::move(other.storage)),
+        check_release(std::move(other.check_release))
+    {
+    }
+    ~temporary_input() override
+    {
+      if (storage) check_release(storage);
+    }
   };
-  f.source(std::make_shared<accumulator>(1), out, single_job([&] {
+  struct moving_coalescer : accumulator {
+    cursor_step advance(sirius::op::scan::scan_info& input, size_t&, size_t) override
+    {
+      produced = true;
+      return {std::make_unique<temporary_input>(std::move(dynamic_cast<temporary_input&>(input))),
+              true};
+    }
+  };
+  if (enqueue_failure) f.coordinator.fail_next_batch_enqueue_for_testing();
+  f.source(std::make_shared<moving_coalescer>(), out, single_job([&] {
              auto permit = ledger->try_acquire_unit({1, 1}, 16);
              auto bytes  = ledger->allocator(permit).allocate(8);
              ledger->retire_unit({1, 1});
              blocked->wait();
-             return std::make_unique<temporary_input>(std::move(bytes));
+             return std::make_unique<temporary_input>(
+               std::move(bytes), [&](charged_block& storage) {
+                 released_outside_gate = gate_is_available(gate);
+                 // Report a regression instead of deadlocking while trying to wake the gate.
+                 if (!released_outside_gate) rescued = std::move(storage);
+               });
            }));
   auto guard = f.shutdown_guard();
   f.start();
   REQUIRE(blocked->await());
-  f.coordinator.request_stop(stop_reason::normal_eos);
+  if (!enqueue_failure) f.coordinator.request_stop(stop_reason::normal_eos);
   blocked->release();
   REQUIRE(out->await_closed());
   f.finish();
+  CHECK(released_outside_gate);
+  rescued.release();
+  CHECK(out->count() == 0);
+  CHECK(f.completion.has_error() == enqueue_failure);
+  if (enqueue_failure)
+    CHECK_THROWS_AS(std::rethrow_exception(f.completion.terminal_error()), std::bad_alloc);
   CHECK(ledger->permits_in_flight() == 0);
   CHECK(ledger->tracked_units() == 0);
   CHECK(provider.seen->allocated_bytes == 0);
@@ -1529,20 +1574,32 @@ TEST_CASE("Prefetch preparation and visibility each execute at most once",
 TEST_CASE("Coordinator startup gate prevents work before consumers are ready",
           "[scan_preparation][coordinator]")
 {
-  fixture f;
+  using domain   = preparation_coordinator::execution_domain;
+  auto execution = GENERATE(domain::metadata_worker, domain::query_owner, domain::native_reader);
+  native_reader_executor executor(1, 1);
+  fixture f(2, 4, k_interrupt_check_interval, std::nullopt, &executor);
+  unsigned threads = 0;
+  f.coordinator.before_thread_for_testing([&] { ++threads; });
   auto done = f.completion.get_awaitable();
   CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::constructed);
   auto out = std::make_shared<sink>();
   std::atomic<size_t> claims{0};
-  f.source(std::make_shared<accumulator>(), out, [&]() -> preparation_coordinator::claim_result {
-    ++claims;
-    return preparation_exhausted{};
-  });
+  f.source(
+    std::make_shared<accumulator>(),
+    out,
+    [&]() -> preparation_coordinator::claim_result {
+      ++claims;
+      return preparation_exhausted{};
+    },
+    {},
+    {},
+    execution);
   CHECK(f.coordinator.snapshot().runner == std::thread::id{});
   f.coordinator.arm();
   CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::armed);
   CHECK(f.coordinator.snapshot().runs == 0);
   CHECK(claims == 0);
+  CHECK(threads == (execution == domain::metadata_worker ? 0 : 1));
   SECTION("open startup gate")
   {
     f.coordinator.start();
@@ -1551,9 +1608,12 @@ TEST_CASE("Coordinator startup gate prevents work before consumers are ready",
     CHECK(f.coordinator.snapshot().runs == 1);
     auto stats = f.coordinator.snapshot();
     CHECK(stats.owner == std::this_thread::get_id());
-    CHECK(stats.runner != stats.owner);
+    CHECK((stats.runner == stats.owner) == (execution == domain::metadata_worker));
     CHECK(stats.runner != std::thread::id{});
     CHECK(done.wait_for(0ms) == std::future_status::timeout);
+    auto waiting = std::chrono::steady_clock::now();
+    CHECK_FALSE(f.coordinator.advance(10ms));
+    CHECK(std::chrono::steady_clock::now() - waiting >= 10ms);
     f.completion.mark_completed();
     REQUIRE(done.wait_for(100ms) == std::future_status::ready);
     CHECK_NOTHROW(done.get());
@@ -1574,9 +1634,16 @@ TEST_CASE("Coordinator startup gate prevents work before consumers are ready",
 TEST_CASE("Coordinator thread creation failure closes the preparation barrier exactly once",
           "[scan_preparation][coordinator]")
 {
-  fixture f;
+  native_reader_executor executor(1, 1);
+  fixture f(2, 4, k_interrupt_check_interval, std::nullopt, &executor);
   auto out = std::make_shared<sink>();
-  f.source(std::make_shared<accumulator>(), out, [] { return preparation_exhausted{}; });
+  f.source(
+    std::make_shared<accumulator>(),
+    out,
+    [] { return preparation_exhausted{}; },
+    {},
+    {},
+    preparation_coordinator::execution_domain::native_reader);
   auto done = f.completion.get_awaitable();
   f.coordinator.before_thread_for_testing(
     [] { throw std::runtime_error("thread allocation failed"); });
@@ -1593,11 +1660,15 @@ TEST_CASE("Coordinator thread creation failure closes the preparation barrier ex
 TEST_CASE("Query owner can remain blocked while coordinator publishes and retires",
           "[scan_preparation][coordinator]")
 {
-  fixture f;
+  native_reader_executor executor(1, 1);
+  fixture f(2, 4, k_interrupt_check_interval, std::nullopt, &executor);
   auto out = std::make_shared<sink>();
-  f.source(std::make_shared<accumulator>(1), out, finite_jobs(1, [](int id) {
-             return std::make_unique<tagged>(id);
-           }));
+  f.source(std::make_shared<accumulator>(1),
+           out,
+           finite_jobs(1, [](int id) { return std::make_unique<tagged>(id); }),
+           {},
+           {},
+           preparation_coordinator::execution_domain::native_reader);
   f.coordinator.arm();
   f.coordinator.start();
   // The query owner waits here: neither control work nor publication may need it.
@@ -1628,18 +1699,26 @@ TEST_CASE("Consumers may finish before coordinator startup without a false start
 TEST_CASE("Concurrent retirement waits for one physical join and one source close",
           "[scan_preparation][coordinator]")
 {
-  fixture f;
+  using domain   = preparation_coordinator::execution_domain;
+  auto execution = GENERATE(domain::metadata_worker, domain::native_reader);
+  native_reader_executor executor(1, 1);
+  fixture f(2, 4, k_interrupt_check_interval, std::nullopt, &executor);
   auto blocked = f.make_hold();
   auto out     = std::make_shared<sink>();
-  f.source(std::make_shared<accumulator>(1), out, finite_jobs(1, [blocked](int id) {
-             blocked->wait();
-             return std::make_unique<tagged>(id);
-           }));
+  f.source(std::make_shared<accumulator>(1),
+           out,
+           finite_jobs(1,
+                       [blocked](int id) {
+                         blocked->wait();
+                         return std::make_unique<tagged>(id);
+                       }),
+           {},
+           {},
+           execution);
   std::promise<void> first_entered, second_entered;
   std::future<void> first, second;
   auto guard = f.shutdown_guard();
-  f.coordinator.arm();
-  f.coordinator.start();
+  f.start();
   REQUIRE(blocked->await());
   f.coordinator.request_stop(stop_reason::normal_eos);
   first  = std::async(std::launch::async, [&] {
@@ -1655,6 +1734,7 @@ TEST_CASE("Concurrent retirement waits for one physical join and one source clos
   CHECK(first.wait_for(0ms) == std::future_status::timeout);
   CHECK(second.wait_for(0ms) == std::future_status::timeout);
   blocked->release();
+  f.finish();
   first.get();
   second.get();
   CHECK(out->close_calls == 1);
@@ -2049,7 +2129,7 @@ TEST_CASE("Unpumped provider requests stay bounded and cancellation disposes cap
   CHECK_FALSE(ran);
   CHECK_FALSE(released);
   f.coordinator.request_stop(stop_reason::normal_eos);
-  CHECK(f.coordinator.pump_provider());
+  CHECK(f.coordinator.advance());
   CHECK(released);
   CHECK_FALSE(ran);
   CHECK(destroyed == std::this_thread::get_id());
@@ -2064,14 +2144,15 @@ TEST_CASE("Unpumped provider requests stay bounded and cancellation disposes cap
 TEST_CASE("External provider retirement waits for Q close without blocking Q drain",
           "[scan_preparation][provider_lane]")
 {
+  bool before_arm = GENERATE(false, true);
   fixture f;
   auto out     = std::make_shared<sink>();
   auto running = f.make_hold();
   auto closing = f.make_hold();
   std::thread::id closer;
   std::future<void> external;
-  auto guard = f.shutdown_guard();
-  f.start([&] {
+  auto guard           = f.shutdown_guard();
+  auto register_source = [&] {
     auto source      = make_source(preparation_coordinator::execution_domain::query_owner,
                               std::make_shared<accumulator>());
     source.try_claim = single_job([running] {
@@ -2084,7 +2165,17 @@ TEST_CASE("External provider retirement waits for Q close without blocking Q dra
       closing->wait();
     };
     f.register_source(std::move(source), out);
-  });
+  };
+  if (before_arm) {
+    f.owner = std::thread([&] {
+      register_source();
+      running->wait();
+      f.coordinator.drain();
+    });
+  } else {
+    f.start(register_source);
+  }
+  auto owner = f.owner.get_id();
   REQUIRE(running->await());
   f.coordinator.request_stop(stop_reason::normal_eos);
   external = std::async(std::launch::async, [&] { f.coordinator.drain(); });
@@ -2097,7 +2188,7 @@ TEST_CASE("External provider retirement waits for Q close without blocking Q dra
   REQUIRE(external.wait_for(1s) == std::future_status::ready);
   external.get();
   f.finish();
-  CHECK(closer == f.coordinator.snapshot().owner);
+  CHECK(closer == owner);
   CHECK(out->count() == 0);
   CHECK_FALSE(f.completion.has_error());
 }
@@ -2110,7 +2201,7 @@ TEST_CASE("Provider pump rejects a different owner and recursive execution or dr
   size_t rejected     = 0;
   auto reject_reentry = [&] {
     try {
-      f.coordinator.pump_provider();
+      f.coordinator.advance();
     } catch (std::logic_error const&) {
       ++rejected;
     }
@@ -2130,7 +2221,7 @@ TEST_CASE("Provider pump rejects a different owner and recursive execution or dr
   f.register_source(std::move(source), out);
   auto foreign = std::async(std::launch::async, [&] {
     try {
-      f.coordinator.pump_provider();
+      f.coordinator.advance();
     } catch (std::logic_error const&) {
       return true;
     }
@@ -2148,11 +2239,16 @@ TEST_CASE("Provider pump rejects a different owner and recursive execution or dr
 TEST_CASE("Retirement racing arm stops the startup gate before waiting for its runner",
           "[scan_preparation][coordinator]")
 {
-  fixture f;
+  native_reader_executor executor(1, 1);
+  fixture f(2, 4, k_interrupt_check_interval, std::nullopt, &executor);
   auto creating = f.make_hold();
   auto out      = std::make_shared<sink>();
-  f.source(
-    std::make_shared<accumulator>(1), out, single_job([] { return std::make_unique<tagged>(1); }));
+  f.source(std::make_shared<accumulator>(1),
+           out,
+           single_job([] { return std::make_unique<tagged>(1); }),
+           {},
+           {},
+           preparation_coordinator::execution_domain::native_reader);
   f.coordinator.before_thread_for_testing([creating] { creating->wait(); });
   std::future<void> arming, retiring;
   auto guard = f.shutdown_guard();

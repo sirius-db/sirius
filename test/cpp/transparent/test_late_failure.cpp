@@ -20,6 +20,7 @@
 #include "scan_manager/preparation_coordinator.hpp"
 #include "sirius_context.hpp"
 #include "transparent/replay_admission.hpp"
+#include "utils/duckdb_table_identity.hpp"
 #include "utils/gpu_execution_fixture.hpp"
 #include "utils/isolated_checkpoint_test.hpp"
 #include "utils/log_test_utils.hpp"
@@ -507,13 +508,22 @@ TEST_CASE("Reader cleanup outcome controls window replay and runtime reuse",
   CAPTURE(execution, mode);
   bool const close_error   = mode != outcome::clean_after_error;
   bool const initial_error = mode != outcome::close_error_only;
+  sirius::test::duckdb_identity_fixture checkpoint_storage;
   sirius::test::GpuExecutionFixture fixture;
-  auto& con   = fixture.con;
-  auto state  = sirius::test::get_registered_sirius_context(*con);
-  auto before = state->get_transparent_execution_stats();
-  bool failed = false;
+  auto& con     = fixture.con;
+  auto state    = sirius::test::get_registered_sirius_context(*con);
+  auto before   = state->get_transparent_execution_stats();
+  bool failed   = false;
+  auto query_id = sirius::make_query_id(0);
   try {
     duckdb::SiriusContext::StandaloneQueryScope window(*state, *con->context, "reader_cleanup");
+    query_id = window.query_id();
+    checkpoint_storage.con.BeginTransaction();
+    auto& table = duckdb::Catalog::GetEntry<duckdb::DuckTableEntry>(
+      *checkpoint_storage.con.context, "", "main", "identity_t");
+    state->get_scan_manager().acquire_checkpoint_key(query_id, table.GetStorage().GetAttached());
+    checkpoint_storage.con.Rollback();
+    REQUIRE(state->get_scan_manager().checkpoint_key_count(query_id) == 1);
     auto completion = state->window_completion(window.query_id());
     REQUIRE(completion);
     auto future = completion->get_awaitable();
@@ -535,6 +545,7 @@ TEST_CASE("Reader cleanup outcome controls window replay and runtime reuse",
     CHECK(std::string(error.what()) == "reader close failed");
   }
   CHECK(failed == close_error);
+  CHECK(state->get_scan_manager().checkpoint_key_count(query_id) == (close_error ? 1 : 0));
   CHECK(state->get_runtime_health() == (close_error
                                           ? duckdb::SiriusContext::runtime_health::UNAVAILABLE
                                           : duckdb::SiriusContext::runtime_health::OK));

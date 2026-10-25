@@ -110,7 +110,7 @@ class iceberg_dv_attempt : public std::enable_shared_from_this<iceberg_dv_attemp
  private:
   mutable std::mutex mutex_;
   size_t next_   = 0;
-  bool claiming_ = false, stopped_ = false;
+  bool claiming_ = false, claims_abandoned_ = false, stopped_ = false;
   std::shared_ptr<iceberg_dv_preparation> plan_;
   std::shared_ptr<scan_manager::preparation_ledger> ledger_;
   std::unique_ptr<iceberg_dv_results> results_;

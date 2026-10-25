@@ -2119,7 +2119,7 @@ void sirius_scan_manager::await_query_completion(sirius::query_id_t id,
     // One operation per turn: recheck logical completion and cancellation before
     // another pull. Logical completion still needs the owner's retirement barrier.
     if (state && state->coordinator) {
-      state->coordinator->pump_provider(std::chrono::milliseconds(25));
+      state->coordinator->advance(std::chrono::milliseconds(25));
     } else {
       future.wait_for(std::chrono::milliseconds(25));
     }

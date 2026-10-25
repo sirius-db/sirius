@@ -74,6 +74,14 @@ Before execution, a resident split is converted or decompressed to a plain GPU t
 | `materialized_column_order()` | Storage indices from the planned column layout, in the order `materialize_table` emits them. The pinned-cache path serves columns in this order so a cached batch matches a fresh read. |
 | `output_prefix_width()` | A view of the planned layout's output prefix. A compressed pin's filtered decode may omit trailing filter-only slots after applying the scan's whole filter. Nullopt makes no promise; zero-output scans have no output prefix. |
 
+Claiming a task and executing it are separate steps. Claiming returns a job that owns the resources needed for execution or disposal; reader calls and I/O belong inside that job, where they run in the assigned execution domain.
+
+- Asynchronous preparation calls `try_claim_split()`. Its default implementation wraps `next_split_provider()` when the next metadata task is immediately available.
+- Override `try_claim_split()` if claiming may need to wait or must transfer a resource permit into the job. Return pending when work is temporarily unavailable, and exhausted only when no more work remains.
+- Synchronous pinning calls `next_split_provider()` directly and drives the task without the asynchronous coordinator.
+
+Both paths pass `preparation_stop_token` to the task so it can distinguish normal completion, execution failure and user cancellation.
+
 ### Bind data vs. split descriptors
 
 Two polymorphic carriers separate per-table from per-split state (`gpu_ingestible_types.hpp`):
@@ -679,9 +687,9 @@ graph TD
     SM[sirius_scan_manager.prepare_for_query] -->|cache miss| SP["split_provider<br/>(composes ingestible)"]
     SM -->|pinned-cache hit| DBP[cached_databatch_provider]
 
-    SP -->|make_preparation_sources| SEQ["preparation_coordinator<br/>(owned thread)"]
+    SP -->|make_preparation_sources| SEQ["preparation_coordinator<br/>metadata only: query owner<br/>reader sources: owned thread"]
     SEQ -->|metadata jobs| DISP[dispatcher thread pool]
-    SEQ -->|provider jobs| Q["query owner<br/>await_query_completion / pump_provider"]
+    SEQ -->|provider jobs| Q["query owner<br/>await_query_completion / advance"]
     SEQ -->|native reader jobs| N[native_reader_executor]
     DISP -->|scan_info| SEQ
     Q -->|detached scan_info| SEQ

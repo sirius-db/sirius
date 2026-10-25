@@ -51,11 +51,11 @@ struct dv_precondition_fixture {
   std::shared_ptr<sirius::op::scan::iceberg_dv_preparation> prepared;
   std::shared_ptr<preparation_admission> admission;
 
-  explicit dv_precondition_fixture(std::shared_ptr<sirius::transparent::read_view_registry> views =
-                                     std::make_shared<sirius::transparent::read_view_registry>())
-    : read_views(std::move(views))
+  explicit dv_precondition_fixture(size_t file_count = 1)
+    : read_views(std::make_shared<sirius::transparent::read_view_registry>())
   {
     using namespace sirius::op::scan;
+    if (file_count == 2) paths.push_back("b.parquet");
     provider.grant_bytes = 64 * 1024;
     auto discovery       = std::make_shared<iceberg_delete_discovery>();
     IcebergDeleteFileEntry dv;
@@ -67,9 +67,14 @@ struct dv_precondition_fixture {
     dv.file_size_in_bytes    = 400;
     dv.referenced_data_file  = paths.front();
     discovery->deletion_vector_entries.push_back(dv);
+    if (file_count == 2) {
+      dv.file_path            = "b.puffin";
+      dv.referenced_data_file = paths.back();
+      discovery->deletion_vector_entries.push_back(dv);
+    }
     auto ledger   = std::make_unique<preparation_ledger>(provider);
     auto envelope = iceberg_dv_preparation::envelope(*discovery, paths);
-    auto decision = ledger->admit(std::array{envelope}, host);
+    auto decision = ledger->admit(std::array{envelope}, host, file_count);
     REQUIRE(decision.deferred);
     auto contract =
       read_views->entries().empty()
@@ -1198,6 +1203,35 @@ TEST_CASE("DV jobs validate completion and retain result identity until retireme
   CHECK(f.provider.outstanding() == 0);
 }
 
+TEST_CASE("Discarding a committed DV job does not invalidate a running sibling",
+          "[scan_preparation][ledger][claim]")
+{
+  using namespace sirius::op::scan;
+  dv_precondition_fixture f(2);
+  auto ledger  = f.consume();
+  auto attempt = std::make_shared<iceberg_dv_attempt>(f.prepared, ledger);
+  auto queued  = std::get<std::shared_ptr<iceberg_dv_attempt::file_job>>(attempt->try_claim());
+  queued->commit();
+  auto running = std::get<std::shared_ptr<iceberg_dv_attempt::file_job>>(attempt->try_claim());
+  running->commit();
+  CHECK(ledger->permits_in_flight() == 2);
+  auto result = std::make_shared<iceberg_delete_set const>(f.paths.back());
+
+  // Normal EOS can dispose a queued job while another worker is just before complete().
+  queued.reset();
+  CHECK_THROWS_AS(attempt->try_claim(), std::logic_error);
+  REQUIRE_NOTHROW(running->complete(result));
+  CHECK(attempt->result(1, f.paths.back()) == result);
+  running.reset();
+  attempt->stop();
+  attempt->finish();
+  CHECK(ledger->permits_in_flight() == 0);
+  CHECK(ledger->tracked_units() == 0);
+  ledger->close();
+  ledger.reset();
+  CHECK(f.provider.outstanding() == 0);
+}
+
 TEST_CASE("Iceberg ledger installation rejects missing repeated and undeferred state",
           "[scan_preparation][ledger]")
 {
@@ -1328,7 +1362,7 @@ TEST_CASE("DV claim owns descriptors and resources after execution finish",
   CHECK(f.provider.seen->allocated_bytes == 0);
 }
 
-TEST_CASE("Iceberg pending claims preserve both cursors and dropping a ready job stops the attempt",
+TEST_CASE("Iceberg pending claims preserve both cursors and abandoning a job closes further claims",
           "[scan_preparation][ledger][claim]")
 {
   using namespace sirius::op::scan;

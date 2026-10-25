@@ -91,7 +91,7 @@ The shared host Arrow path has two explicit boundaries. `import_arrow_host()` co
 
 ### Execution and ownership
 
-Each active attempt has a coordinator thread that claims work, coalesces results and publishes batches. Preparation work starts after GPU consumers are ready. Sources choose where it runs:
+The coordinator claims work, coalesces results and publishes batches after GPU consumers are ready. Metadata-only attempts advance on the query owner without another thread. An attempt with query-owner or native-reader sources uses one independent coordinator so blocking reader calls cannot stall other ready work. Both drivers use the same bounded control loop, publication gate and retirement path. Sources choose where their jobs run:
 
 | Execution domain | Work and cleanup | Use |
 |---|---|---|
@@ -132,7 +132,7 @@ Jobs that use a preparation unit carry its key and required inputs, derived by t
 
 A claimed job is owned by its execution domain before unit admission can fail or observe cancellation. Accepted jobs retain their descriptors and resources through execution or disposal. Dropping a job outside cancellation is an error, not a successful empty read. Resource release and provider callbacks run outside the publication lock.
 
-Query-owner and native sources allow one outstanding operation or unprocessed result per reader. They share the existing coalescing and publication path and do not consume metadata-worker permits. The query owner services provider requests while waiting for query completion and drain; an external reset may request stop and wait, but cannot run provider operations itself.
+Query-owner and native sources allow one outstanding operation or unprocessed result per reader. They share the existing coalescing and publication path and do not consume metadata-worker permits. The query owner calls `advance()` while waiting for query completion: it advances metadata-only coordination or services one provider request. It remains available through drain; an external reset may request stop and wait, but cannot run provider operations itself.
 
 Native reader slots are shared across queries in a scan manager. An attempt reserves all its slots before any reader starts; insufficient capacity fails without holding a partial group. Several readers may share a worker. A blocked native call can delay those readers, but not the coordinator or metadata pool. Worker and slot limits are documented in [configuration](configuration.md#siriusexecutorscan_managerpreparation).
 
@@ -148,7 +148,7 @@ Publication uses typed `scan_operator_input` objects. Input construction and pre
 | Between provider operations | Check the attempt's stop state before re-entering the reader. A DuckDB connection interrupt flag may be reset by a later query. |
 | Reader close | Close without waiting for output capacity, and release thread-affine resources even when close reports an error. Remaining state must be safe to destroy on other threads. |
 
-`preparation_stop_token` reaches the adapter task unchanged and distinguishes normal completion, execution failure and user cancellation. Normal completion or failure cleanup must not blindly interrupt the original transaction or replace the first query error. Logical completion does not finish cleanup: the query owner remains available through provider close. See [query retirement](query-lifecycle.md#retirement) for shutdown and close-failure handling.
+`preparation_stop_token` reaches the adapter task unchanged and distinguishes normal completion, execution failure and user cancellation. Normal completion or failure cleanup must not blindly interrupt the original transaction or replace the first query error. Logical completion does not finish cleanup: the query owner remains available through provider close. After physical work drains, a close failure retains checkpoint keys and query resources until runtime shutdown and prevents CPU replay. See [query retirement](query-lifecycle.md#retirement) for shutdown and close-failure handling.
 
 ### Provider read view
 

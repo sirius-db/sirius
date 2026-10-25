@@ -69,6 +69,11 @@
 // production registration bypass. All execution and retirement use the manager.
 namespace sirius::scan_manager {
 struct scan_manager_query_test {
+  static void advance(sirius_scan_manager& manager, sirius::query_id_t id)
+  {
+    if (auto state = manager.get_query_state(id); state && state->coordinator)
+      state->coordinator->advance(std::chrono::milliseconds(1));
+  }
   static void before_native_thread(sirius_scan_manager& manager, std::function<void(size_t)> hook)
   {
     manager._native_readers.before_thread_for_testing(std::move(hook));
@@ -204,6 +209,20 @@ struct manager_fixture : fixture {
     : manager(lifecycle, config, *memory, topology)
   {
   }
+  template <typename T>
+  T collect(std::future<T>& consumer, std::initializer_list<sirius::query_id_t> owners)
+  {
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (consumer.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        manager.reset_all();
+        FAIL("query owners did not finish scan preparation");
+      }
+      for (auto id : owners)
+        sirius::scan_manager::scan_manager_query_test::advance(manager, id);
+    }
+    return consumer.get();
+  }
 };
 
 }  // namespace
@@ -242,7 +261,7 @@ TEST_CASE("two queries register independently and reset drops only one",
     manager.reset(b.query->query_id());
     throw;
   }
-  auto b_splits = consumer.get();
+  auto b_splits = f.collect(consumer, {b.query->query_id()});
   REQUIRE(b_splits > 0);
 
   manager.reset(b.query->query_id());
@@ -293,8 +312,8 @@ TEST_CASE("concurrent queries do not collide on operator id", "[scan_manager][qu
     manager.reset_all();
     throw;
   }
-  auto a_paths = a_consumer.get();
-  auto b_paths = b_consumer.get();
+  auto a_paths = f.collect(a_consumer, {a.query->query_id(), b.query->query_id()});
+  auto b_paths = f.collect(b_consumer, {b.query->query_id()});
 
   REQUIRE_FALSE(a_paths.empty());
   REQUIRE_FALSE(b_paths.empty());
@@ -783,8 +802,8 @@ TEST_CASE("window retirement observes a provider close failure that arrives duri
   }
   CHECK(observed->closes == 1);
   CHECK(observed->closer == std::this_thread::get_id());
-  CHECK_FALSE(sm::scan_manager_query_test::contains(manager, id));
-  CHECK(state->get_query_lifecycle_registry().size() == 0);
+  CHECK(sm::scan_manager_query_test::contains(manager, id));
+  CHECK(state->get_query_lifecycle_registry().size() == 1);
   CHECK(state->get_runtime_health() == duckdb::SiriusContext::runtime_health::UNAVAILABLE);
 }
 
@@ -1078,7 +1097,7 @@ TEST_CASE("registered reader claims retain domain ownership when unit admission 
   CHECK(observed.closes == 1);
   CHECK(observed.disposer == observed.closer);
   CHECK((observed.closer == std::this_thread::get_id()) ==
-        (domain == sm::preparation_execution_domain::query_owner));
+        (domain != sm::preparation_execution_domain::native_reader));
 }
 
 TEST_CASE("scan manager registers independent provider execution and close",

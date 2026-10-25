@@ -85,13 +85,11 @@ class preparation_coordinator {
   // Called on the coordinator: must be nonblocking and safe across threads.
   void set_interrupt_check(std::function<bool()>);
   void arm();
-  // Arm creates the owned thread; start opens its gate after consumers are ready.
+  // Arm selects the driver; start opens its gate after consumers are ready.
   void start();
-  // Run at most one provider operation or close on Q. Never holds the gate during the call.
-  // The owner must keep pumping during execution and retirement; external threads only stop/wait.
-  // If idle, optionally wait for a progress notification before returning false.
-  // The generation check also catches notifications racing the empty mailbox check.
-  bool pump_provider(std::chrono::milliseconds idle_wait = std::chrono::milliseconds{0});
+  // On Q: advance metadata-only control work, or run one provider operation/close.
+  // If idle, wait up to idle_wait for progress. External threads only stop/wait.
+  bool advance(std::chrono::milliseconds idle_wait = std::chrono::milliseconds{0});
   void request_stop(stop_reason) noexcept;
   void drain();
   std::shared_ptr<preparation_unit> admit_unit(unit_key, required_input_set);
@@ -101,6 +99,7 @@ class preparation_coordinator {
   void before_thread_for_testing(std::function<void()>);
   void before_submission_for_testing(std::function<void()>);
   void before_publication_for_testing(std::function<void()>);
+  void fail_next_batch_enqueue_for_testing();
   void after_publication_for_testing(
     std::function<void(size_t, std::shared_ptr<op::scan::scan_info> const&, size_t)>);
   void clock_for_testing(std::function<op::scan::batch_coalescer::clock::time_point()>);

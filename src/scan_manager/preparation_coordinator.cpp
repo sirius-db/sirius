@@ -212,7 +212,7 @@ struct preparation_coordinator::state {
   size_t jobs = 0, results = 0, output = 0, external = 0;
   size_t reader_jobs = 0, next_provider_source = 0;
   std::thread::id provider_owner;
-  bool provider_pumping = false;
+  bool provider_pumping = false, independent_driver = false, control_active = false;
   std::stop_source reader_stop;
   std::shared_ptr<preparation_stop_token::reason_state> reader_stop_reason =
     std::make_shared<preparation_stop_token::reason_state>();
@@ -222,7 +222,7 @@ struct preparation_coordinator::state {
   std::function<void(size_t, std::shared_ptr<op::scan::scan_info> const&, size_t)> after_publish;
   std::function<op::scan::batch_coalescer::clock::time_point()> now =
     op::scan::batch_coalescer::clock::now;
-  bool manual_clock = false, start_called = false;
+  bool manual_clock = false, start_called = false, fail_batch_enqueue = false;
   state(preparation_options o,
         pipeline::completion_handler& c,
         exec::scoped_dispatcher& d,
@@ -378,7 +378,8 @@ struct preparation_coordinator::state {
   bool submit_job(lock_type&, std::shared_ptr<state> const&);
   bool close_finished_source(lock_type&);
   bool emit_full_window(lock_type&);
-  void queue_batch(size_t,
+  void queue_batch(lock_type&,
+                   size_t,
                    std::unique_ptr<op::scan::scan_info>,
                    std::optional<op::scan::batch_coalescer::clock::time_point> = {},
                    bool size_triggered                                         = false);
@@ -391,6 +392,7 @@ struct preparation_coordinator::state {
   void close_source(size_t) noexcept;
   void close_source_output(size_t) noexcept;
   void dispatch_job(source_state&, size_t, job, std::shared_ptr<job_ticket>, lock_type&);
+  bool advance_control(std::shared_ptr<state> const&, std::optional<std::chrono::milliseconds>);
   void run(std::shared_ptr<state> const&);
   void shutdown();
   void finish();
@@ -672,7 +674,10 @@ void preparation_coordinator::arm()
     if (state_->provider_owner != std::thread::id{} &&
         state_->provider_owner != std::this_thread::get_id())
       throw std::logic_error("provider preparation must arm on its registering owner");
-    state_->stats.owner = std::this_thread::get_id();
+    state_->stats.owner        = std::this_thread::get_id();
+    state_->independent_driver = std::ranges::any_of(state_->sources, [](auto const& source) {
+      return source.hooks.execution != execution_domain::metadata_worker;
+    });
   }
   try {
     state_->completion->begin_preparation();
@@ -716,9 +721,11 @@ void preparation_coordinator::arm()
     }
     if (existing) state_->completion->report_error(*existing);
     state_->arm_native();
-    if (state_->before_thread) state_->before_thread();
-    // The thread waits for start or stop. No source can run before consumers are ready.
-    runner_ = std::thread([st = state_] { st->run(st); });
+    if (state_->independent_driver) {
+      if (state_->before_thread) state_->before_thread();
+      // Readers may block Q or their native worker; control work must remain independent.
+      runner_ = std::thread([st = state_] { st->run(st); });
+    }
   } catch (...) {
     execution_lock.unlock();
     state_->completion->report_error(std::current_exception());
@@ -781,8 +788,23 @@ void preparation_coordinator::start()
   state_->gate->notify_under_lock();
 }
 
-bool preparation_coordinator::pump_provider(std::chrono::milliseconds idle_wait)
+bool preparation_coordinator::advance(std::chrono::milliseconds idle_wait)
 {
+  bool owner_driven;
+  {
+    std::unique_lock lock(state_->gate->mutex);
+    if (state_->phase == lifecycle::quiescent) {
+      auto observed = state_->gate->wake_generation;
+      state_->gate->cv.wait_for(
+        lock, idle_wait, [&] { return state_->gate->wake_generation != observed; });
+      return false;
+    }
+    if (state_->stats.owner != std::this_thread::get_id())
+      throw std::logic_error("preparation advance requires its query owner");
+    if (state_->phase != lifecycle::running && !state_->gate->closed) return false;
+    owner_driven = !state_->independent_driver;
+  }
+  if (owner_driven) return state_->advance_control(state_, idle_wait);
   if (idle_wait.count() <= 0) return state_->pump_provider();
   uint64_t observed;
   {
@@ -800,57 +822,56 @@ void preparation_coordinator::drain()
 {
   if (state::native_caller == state_.get())
     throw std::logic_error("native reader operation cannot drain its own preparation");
-  bool owns_provider, has_provider;
+  bool owns_provider, owner_driven, owns_control, wait_for_owner, stop_needed;
   {
     std::lock_guard lock(state_->gate->mutex);
-    if (state_->phase != lifecycle::quiescent && state_->stats.runner == std::this_thread::get_id())
+    if (state_->control_active && state_->stats.runner == std::this_thread::get_id())
       throw std::logic_error("preparation runner cannot join itself");
-    has_provider  = state_->provider_owner != std::thread::id{};
-    owns_provider = has_provider && state_->provider_owner == std::this_thread::get_id();
+    owns_provider = state_->provider_owner == std::this_thread::get_id();
     if (owns_provider && state_->provider_pumping)
       throw std::logic_error("provider operation cannot recursively drain preparation");
   }
-  bool has_runner, stop_needed;
   {
-    // Serialize with thread creation, but never hold this lock while waiting for Q to pump.
-    std::lock_guard execution_lock(execution_mutex_);
-    has_runner = runner_.joinable();
-    std::lock_guard lock(state_->gate->mutex);
-    stop_needed =
-      !has_runner || state_->phase == lifecycle::armed || (has_provider && !owns_provider);
-  }
-  // A constructed attempt can race arm after the handle snapshot. Closing its gate also
-  // lets a subsequently created runner retire without waiting for start().
-  if (stop_needed) request_stop(stop_reason::normal_eos);
-  if (!has_runner && owns_provider) {
-    while (pump_provider()) {}
-  }
-  if (has_runner || (has_provider && !owns_provider)) {
-    for (;;) {
-      uint64_t observed;
-      {
-        std::lock_guard lock(state_->gate->mutex);
-        if (state_->phase == lifecycle::quiescent) break;
-        observed = state_->gate->wake_generation;
-      }
-      if (owns_provider && pump_provider()) continue;
-      std::unique_lock lock(state_->gate->mutex);
-      state_->gate->cv.wait(lock, [&] {
-        return state_->phase == lifecycle::quiescent || state_->gate->wake_generation != observed;
-      });
+    // Serialize with arm, but never hold this lock while another thread must advance.
+    std::unique_lock execution_lock(execution_mutex_);
+    {
+      std::lock_guard lock(state_->gate->mutex);
+      owner_driven = !state_->independent_driver && state_->stats.owner != std::thread::id{} &&
+                     state_->phase != lifecycle::constructed;
+      owns_control   = owner_driven && state_->stats.owner == std::this_thread::get_id();
+      wait_for_owner = (owner_driven && !owns_control) ||
+                       (state_->provider_owner != std::thread::id{} && !owns_provider);
+      stop_needed = state_->phase == lifecycle::armed || wait_for_owner;
+    }
+    if (!runner_.joinable() && !owner_driven && !wait_for_owner) {
+      // Failed startup or an unarmed attempt: there is no driver to wait for.
+      request_stop(stop_reason::normal_eos);
+      if (owns_provider)
+        while (state_->pump_provider()) {}
+      state_->advance_control(state_, std::chrono::milliseconds{0});
+      return;
     }
   }
+  if (stop_needed) request_stop(stop_reason::normal_eos);
+  for (;;) {
+    uint64_t observed;
+    {
+      std::lock_guard lock(state_->gate->mutex);
+      if (state_->phase == lifecycle::quiescent) break;
+      observed = state_->gate->wake_generation;
+    }
+    if (owns_control) {
+      state_->advance_control(state_, std::nullopt);
+      continue;
+    }
+    if (owns_provider && state_->pump_provider()) continue;
+    std::unique_lock lock(state_->gate->mutex);
+    state_->gate->cv.wait(lock, [&] {
+      return state_->phase == lifecycle::quiescent || state_->gate->wake_generation != observed;
+    });
+  }
   std::lock_guard execution_lock(execution_mutex_);
-  if (runner_.joinable()) {
-    runner_.join();
-    return;
-  }
-  {
-    std::lock_guard lock(state_->gate->mutex);
-    if (state_->phase == lifecycle::quiescent) return;
-  }
-  // No runner was created. Q has already retired provider work and close controls.
-  state_->shutdown();
+  if (runner_.joinable()) runner_.join();
 }
 preparation_coordinator::statistics preparation_coordinator::snapshot() const
 {
@@ -903,7 +924,14 @@ void preparation_coordinator::wake_for_testing()
   state_->gate->notify_under_lock();
 }
 
+void preparation_coordinator::fail_next_batch_enqueue_for_testing()
+{
+  std::lock_guard lock(state_->gate->mutex);
+  state_->fail_batch_enqueue = true;
+}
+
 void preparation_coordinator::state::queue_batch(
+  lock_type& lock,
   size_t source_id,
   std::unique_ptr<op::scan::scan_info> batch,
   std::optional<op::scan::batch_coalescer::clock::time_point> first,
@@ -911,7 +939,14 @@ void preparation_coordinator::state::queue_batch(
 {
   if (!batch) return;
   auto const bytes = batch->preparation_bytes();
-  batches.push_back({source_id, std::move(batch), bytes, first, size_triggered});
+  try {
+    if (std::exchange(fail_batch_enqueue, false)) throw std::bad_alloc();
+    batches.emplace_back();  // Allocate before transferring batch ownership.
+  } catch (...) {
+    lock.unlock();  // Releasing the last allocation can wake this same gate.
+    throw;
+  }
+  batches.back() = {source_id, std::move(batch), bytes, first, size_triggered};
   ++sources[source_id].pending_batches;
   sources[source_id].output_bytes += bytes;
   ++output;
@@ -933,7 +968,7 @@ bool preparation_coordinator::state::emit_partial_batch(lock_type& lock, bool si
     lock.unlock();
     auto batch = coalescer.partial_emit();
     lock.lock();
-    queue_batch(id, std::move(batch), first, size_triggered);
+    queue_batch(lock, id, std::move(batch), first, size_triggered);
     next_deadline_source = id + 1;
     return true;
   }
@@ -1032,7 +1067,7 @@ bool preparation_coordinator::state::advance_result(lock_type& lock)
                   : op::scan::batch_coalescer::cursor_step{nullptr, true};
     lock.lock();
     bool const emitted = static_cast<bool>(step.batch);
-    queue_batch(slot.source_id, std::move(step.batch));
+    queue_batch(lock, slot.source_id, std::move(step.batch));
     if (step.finished) {
       auto retired = release_slot(index);
       lock.unlock();
@@ -1229,7 +1264,7 @@ bool preparation_coordinator::state::emit_full_window(lock_type& lock)
     auto batch = source.hooks.coalescer->partial_emit();
     lock.lock();
     if (batch) {
-      queue_batch(id, std::move(batch));
+      queue_batch(lock, id, std::move(batch));
       return true;
     }
   }
@@ -1250,9 +1285,12 @@ bool preparation_coordinator::state::close_finished_source(lock_type& lock)
       auto final = source.hooks.coalescer->flush();
       lock.lock();
       source.status = source_state::phase::tail_flushed;
-      if (final.size() > 1) throw std::logic_error("final flush exceeded its reserved output slot");
+      if (final.size() > 1) {
+        lock.unlock();
+        throw std::logic_error("final flush exceeded its reserved output slot");
+      }
       if (!final.empty()) {
-        queue_batch(id, std::move(final.front()));
+        queue_batch(lock, id, std::move(final.front()));
         return true;  // Publish the final batch before closing its connector.
       }
     }
@@ -1364,53 +1402,77 @@ void preparation_coordinator::state::finish()
   }
 }
 
-void preparation_coordinator::state::run(std::shared_ptr<state> const& st)
+bool preparation_coordinator::state::advance_control(
+  std::shared_ptr<state> const& st, std::optional<std::chrono::milliseconds> idle_wait)
 {
-  auto& g = *st->gate;
   {
-    std::unique_lock lock(g.mutex);
-    st->stats.runner = std::this_thread::get_id();
-    g.cv.wait(lock, [&] { return g.closed || st->phase == lifecycle::running; });
-    if (!g.closed) ++st->stats.runs;
+    std::lock_guard lock(gate->mutex);
+    if (phase == lifecycle::quiescent) return false;
+    if (control_active) throw std::logic_error("preparation control cannot reenter");
+    control_active = true;
+    stats.runner   = std::this_thread::get_id();
+    if (!gate->closed && !stats.runs) ++stats.runs;
   }
-
+  struct control_guard {
+    state& st;
+    ~control_guard()
+    {
+      std::lock_guard lock(st.gate->mutex);
+      st.control_active = false;
+    }
+  } active{*this};
   try {
-    for (;;) {
-      std::unique_lock lock(g.mutex);
-      ++st->stats.wakes;
-      if (g.closed) break;
-      g.check_interrupted();
-      auto const observed_wake = g.wake_generation;
-      // Deadlines run first. Every step is bounded and leaves the gate locked on return.
-      size_t actions = st->emit_partial_batch(lock) ? 1 : 0;
+    std::unique_lock lock(gate->mutex);
+    ++stats.wakes;
+    if (!gate->closed) {
+      gate->check_interrupted();
+      auto const observed_wake = gate->wake_generation;
+      // Both drivers use the same bounded turn, deadlines and wake generation.
+      size_t actions = emit_partial_batch(lock) ? 1 : 0;
       auto available = [&] {
-        if (g.closed || actions >= st->options.max_control_work) return false;
-        g.check_interrupted();
+        if (gate->closed || actions >= options.max_control_work) return false;
+        gate->check_interrupted();
         return true;
       };
-      if (available() && st->publish_batch(lock)) ++actions;
-      if (available() &&
-          (st->advance_result(lock) || st->emit_partial_batch(lock, /*size_triggered=*/true)))
-        ++actions;
-      if (available() && st->submit_job(lock, st)) ++actions;
-      if (available() && st->close_finished_source(lock)) ++actions;
-      if (available() && st->emit_full_window(lock)) ++actions;
-      if (st->inputs_settled()) break;
-      if (actions || g.wake_generation != observed_wake) continue;
-      auto deadline = st->nearest_deadline();
-      if (st->manual_clock) deadline.reset();
-      if (g.interrupted) {
-        auto poll = op::scan::batch_coalescer::clock::now() + st->options.interrupt_check_interval;
-        deadline  = deadline ? std::min(*deadline, poll) : poll;
+      if (available() && publish_batch(lock)) ++actions;
+      if (available() && (advance_result(lock) || emit_partial_batch(lock, true))) ++actions;
+      if (available() && submit_job(lock, st)) ++actions;
+      if (available() && close_finished_source(lock)) ++actions;
+      if (available() && emit_full_window(lock)) ++actions;
+      if (!gate->closed && !inputs_settled()) {
+        if (actions || gate->wake_generation != observed_wake) return true;
+        auto deadline = nearest_deadline();
+        if (manual_clock) deadline.reset();
+        auto bound_wait = [&](std::chrono::milliseconds interval) {
+          auto end = op::scan::batch_coalescer::clock::now() + interval;
+          deadline = deadline ? std::min(*deadline, end) : end;
+        };
+        if (gate->interrupted) bound_wait(options.interrupt_check_interval);
+        if (idle_wait) bound_wait(*idle_wait);
+        if (deadline)
+          gate->cv.wait_until(lock, *deadline);
+        else
+          gate->cv.wait(lock);
+        return false;
       }
-      if (deadline)
-        g.cv.wait_until(lock, *deadline);
-      else
-        g.cv.wait(lock);
     }
   } catch (...) {
-    st->completion->report_error(std::current_exception());
+    completion->report_error(std::current_exception());
   }
-  st->shutdown();
+  shutdown();
+  return false;
+}
+
+void preparation_coordinator::state::run(std::shared_ptr<state> const& st)
+{
+  {
+    std::unique_lock lock(gate->mutex);
+    gate->cv.wait(lock, [&] { return gate->closed || phase == lifecycle::running; });
+  }
+  for (;;) {
+    advance_control(st, std::nullopt);
+    std::lock_guard lock(gate->mutex);
+    if (phase == lifecycle::quiescent) return;
+  }
 }
 }  // namespace sirius::scan_manager
