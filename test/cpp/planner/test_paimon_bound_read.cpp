@@ -411,3 +411,42 @@ TEST_CASE("Paimon descriptors keep module ownership after database teardown",
   CHECK(text(retained->view().table) == "t");
   retained.reset();
 }
+
+TEST_CASE("Paimon descriptors authenticate both Sirius load orders", "[.][paimon_binding_coload]")
+{
+  bool const sirius_first = GENERATE(true, false);
+  int const entry         = GENERATE(0, 1, 2);
+  INFO(sirius_first);
+  INFO(entry);
+  auto const* extension = std::getenv("SIRIUS_EXTENSION_PATH");
+  auto const* settings  = std::getenv("SIRIUS_CONFIG_FILE");
+  REQUIRE(extension != nullptr);
+  REQUIRE(settings != nullptr);
+  REQUIRE(std::filesystem::is_regular_file(extension));
+  REQUIRE(std::filesystem::is_regular_file(settings));
+  warehouse_directory warehouse;
+  duckdb::DBConfig config;
+  dynamic_config(config);
+  duckdb::DuckDB db(nullptr, &config);
+  duckdb::Connection con(db);
+  auto load_sirius = [&] {
+    sql(con, "LOAD " + quote(extension));
+    sql(con, "SET gpu_execution=false");
+  };
+  if (sirius_first) load_sirius();
+  load(con);
+  if (!sirius_first) load_sirius();
+  sql(con, "ATTACH " + quote(warehouse.path.string()) + " AS pm (TYPE paimon)");
+  sql(con, "CREATE SCHEMA pm.test");
+  sql(con, "CREATE TABLE pm.test.t (id INTEGER, value INTEGER)");
+  sql(con, "INSERT INTO pm.test.t VALUES (1, 10)");
+  auto bound    = bind_paimon(con, warehouse.path.string(), entry);
+  auto provider = paimon_read_provider::from_loaded(*db.instance);
+  auto retained = provider.retain(bound.function, bound.data.get());
+  REQUIRE(retained.view().has_snapshot == 1);
+  CHECK(text(retained.view().table) == "t");
+  auto rows = con.Query("SELECT sum(value) FROM pm.test.t");
+  INFO((rows->HasError() ? rows->GetError() : "success"));
+  REQUIRE_FALSE(rows->HasError());
+  CHECK(rows->GetValue(0, 0).GetValue<int64_t>() == 10);
+}

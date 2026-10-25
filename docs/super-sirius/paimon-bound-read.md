@@ -83,3 +83,17 @@ snapshots after later writes, empty-at-bind, foreign info/callbacks, catalog rep
 acquisition before/after provider load, and ownership after database teardown. They are
 CPU descriptor tests, including when run on a GPU host. A passing default fixture suite
 does not substitute for this real DSO qualification or establish GPU support.
+
+The separate hidden `[paimon_binding_coload]` case requires the matching real Paimon
+DSO plus a Sirius extension built from the same source revision as the test host.
+It exercises both extension load orders and all three binding entry points with
+the Sirius context active, while Paimon queries use CPU execution. It requires a
+GPU for Sirius context initialization; it does not qualify native Paimon GPU reads:
+
+```sh
+SIRIUS_PAIMON_TEST_EXTENSION=/absolute/path/paimon.duckdb_extension \
+SIRIUS_EXTENSION_PATH=/absolute/path/sirius.duckdb_extension \
+SIRIUS_CONFIG_FILE="$PWD/test/cpp/config/data/configurator.yaml" \
+  pixi run build/release/test/cpp/sirius_paimon_binding_test \
+  '[paimon_binding_coload]' --reporter xml --out /absolute/path/paimon-coload.xml
+```
