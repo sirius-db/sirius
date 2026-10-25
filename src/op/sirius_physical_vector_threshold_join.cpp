@@ -396,49 +396,60 @@ std::unique_ptr<operator_data> sirius_physical_vector_threshold_join::execute(
   }
 
   if (!right_empty) {
-    auto const dataset = vss::list_column_as_dataset_view(right.column(right_vector_col_idx), dim);
     raft::device_resources res{stream};
     auto const metric_type =
       vss::join_selection_distance_type_from_metric(metric, /*exact_unexpanded=*/false);
 
+    // DuckDB puts the smaller table on the build (right) side. The kernel wants the smaller side as
+    // its queries (outer loop) and the larger as its dataset (inner loop), so swap them back here.
+    auto const n_left_sz  = static_cast<std::size_t>(n_left);
+    auto const n_right    = static_cast<std::size_t>(right.num_rows());
+    bool const swap_sides = n_right < n_left_sz;
+    auto const n_queries  = swap_sides ? n_right : n_left_sz;
+    auto const n_dataset  = swap_sides ? n_left_sz : n_right;
+    auto const dataset    = vss::list_column_as_dataset_view(
+      swap_sides ? left.column(left_vector_col_idx) : right.column(right_vector_col_idx), dim);
+    // The queries are a window into the full query-side column.
+    auto const queries_full = vss::list_column_as_dataset_view(
+      swap_sides ? right.column(right_vector_col_idx) : left.column(left_vector_col_idx), dim);
+
     // Bound each threshold call so its edge list can never exceed a cudf column's int32 length.
-    // A single query row produces at most n_right edges, so keeping query_tile * n_right under the
-    // cap keeps every call's edge columns representable.
-    auto const n_left_sz = static_cast<std::size_t>(n_left);
-    auto const n_right   = static_cast<std::size_t>(right.num_rows());
-    auto const edge_cap  = static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max());
-    auto query_tile      = std::max<std::size_t>(1, edge_cap / std::max<std::size_t>(1, n_right));
+    // A single query row produces at most n_dataset edges, so keeping query_tile * n_dataset under
+    // the cap keeps every call's edge columns representable.
+    auto const edge_cap = static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max());
+    auto query_tile     = std::max<std::size_t>(1, edge_cap / std::max<std::size_t>(1, n_dataset));
     // Test hook
     if (const char* env = std::getenv("SIRIUS_VSS_QUERY_TILE_ROWS")) {
       auto const forced = std::strtoull(env, nullptr, 10);
       if (forced > 0) { query_tile = std::min<std::size_t>(query_tile, forced); }
     }
 
-    // The queries are a window into the full left column.
-    auto const queries_full =
-      vss::list_column_as_dataset_view(left.column(left_vector_col_idx), dim);
-
-    for (std::size_t s = 0; s < n_left_sz; s += query_tile) {
-      auto const qs      = std::min(query_tile, n_left_sz - s);
+    for (std::size_t s = 0; s < n_queries; s += query_tile) {
+      auto const qs      = std::min(query_tile, n_queries - s);
       auto const queries = raft::make_device_matrix_view<const float, int64_t, raft::row_major>(
         queries_full.data_handle() + static_cast<int64_t>(s) * dim, static_cast<int64_t>(qs), dim);
       auto tj = vss::brute_force_threshold(res, dataset, queries, cutoff, metric_type, mr);
       if (tj.query_rows->size() == 0) { continue; }
 
-      // The kernel numbers query rows within the tile (0..qs); shift them to global left indices so
-      // the left gather map addresses the whole left batch.
-      std::unique_ptr<cudf::column> left_map_global;
+      // The kernel numbers query rows within the tile (0..qs); shift them to global query-side
+      // indices so the gather map addresses the whole batch.
+      std::unique_ptr<cudf::column> query_map_global;
       if (s == 0) {
-        left_map_global = std::move(tj.query_rows);
+        query_map_global = std::move(tj.query_rows);
       } else {
         cudf::numeric_scalar<int64_t> off(static_cast<int64_t>(s), true, stream);
-        left_map_global = cudf::binary_operation(tj.query_rows->view(),
-                                                 off,
-                                                 cudf::binary_operator::ADD,
-                                                 cudf::data_type{cudf::type_id::INT64},
-                                                 stream,
-                                                 mr);
+        query_map_global = cudf::binary_operation(tj.query_rows->view(),
+                                                  off,
+                                                  cudf::binary_operator::ADD,
+                                                  cudf::data_type{cudf::type_id::INT64},
+                                                  stream,
+                                                  mr);
       }
+      // Edges come out as (query, dataset); put them back as (left, right).
+      auto const query_map              = query_map_global->view();
+      auto const dataset_map            = tj.neighbors->view();
+      cudf::column_view const left_map  = swap_sides ? dataset_map : query_map;
+      cudf::column_view const right_map = swap_sides ? query_map : dataset_map;
 
       std::unique_ptr<cudf::column> distance_col;
       if (emit_distance_) {
@@ -455,15 +466,12 @@ std::unique_ptr<operator_data> sirius_physical_vector_threshold_join::execute(
         }
       }
 
-      emit(left_map_global->view(),
-           tj.neighbors->view(),
-           cudf::out_of_bounds_policy::DONT_CHECK,
-           std::move(distance_col));
+      emit(left_map, right_map, cudf::out_of_bounds_policy::DONT_CHECK, std::move(distance_col));
 
       if (is_left) {
         cudf::numeric_scalar<bool> true_scalar(true, true, stream);
         auto scattered = cudf::scatter({std::ref(static_cast<cudf::scalar const&>(true_scalar))},
-                                       left_map_global->view(),
+                                       left_map,
                                        cudf::table_view({matched_flag->view()}),
                                        stream);
         matched_flag   = std::move(scattered->release()[0]);

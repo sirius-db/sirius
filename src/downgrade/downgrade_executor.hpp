@@ -31,8 +31,8 @@
 #include <cucascade/memory/stream_pool.hpp>
 
 #include <atomic>
-#include <cstdint>
 #include <condition_variable>
+#include <cstdint>
 #include <functional>
 #include <future>
 #include <memory>

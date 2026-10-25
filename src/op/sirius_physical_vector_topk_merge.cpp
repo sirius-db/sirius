@@ -48,11 +48,11 @@ namespace op {
 
 namespace {
 
-//! [left types..., right types..., FLOAT ranking value].
+//! [left part types..., right payload types..., FLOAT ranking value].
 duckdb::vector<sirius::logical_type> merged_types(const sirius_physical_vector_topk_join& join)
 {
-  auto types        = join.children[0]->get_types();
-  auto const& right = join.children[1]->get_types();
+  auto types       = join.left_part_types();
+  auto const right = join.right_part_types();
   types.insert(types.end(), right.begin(), right.end());
   types.push_back(sirius::from_duckdb(duckdb::LogicalType::FLOAT));
   return types;
@@ -69,7 +69,7 @@ sirius_physical_vector_topk_merge::sirius_physical_vector_topk_merge(
     is_similarity(join.is_similarity),
     join_type(join.join_type),
     batch_bytes(batch_bytes),
-    right_types_(join.children[1]->get_types())
+    right_types_(join.right_part_types())
 {
 }
 
@@ -151,7 +151,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_topk_merge::execute(
     return finish();
   }
 
-  // Stack the partials part-major; each is [right cols..., distance] with n_left * k rows.
+  // Stack the partials part-major; each is [right payload..., distance] with n_left * k rows.
   auto const part_rows = n_left * k;
   std::vector<cudf::table_view> payload_views;
   std::vector<cudf::column_view> distance_views;
