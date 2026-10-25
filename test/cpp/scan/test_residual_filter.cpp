@@ -150,7 +150,7 @@ TEST_CASE("residual_filter leaves unanswerable columns alone", "[scan]")
   REQUIRE(predicate->holds<sirius::ast::comparison>());
 }
 
-TEST_CASE("R4 residual combines exact coverage with an unevaluated answer", "[scan][r4]")
+TEST_CASE("Residual combines exact coverage with an unevaluated answer", "[scan][residual_filter]")
 {
   residual_filter const residual{two_conjuncts(), {1, 2}};
   std::vector<predicate_progress> progress{{0, predicate_stage::enforced, {}},
@@ -168,7 +168,7 @@ TEST_CASE("R4 residual combines exact coverage with an unevaluated answer", "[sc
   REQUIRE_THROWS(residual.against_progress(progress));
 }
 
-TEST_CASE("R4 residual refuses a lost value needed by another conjunct", "[scan][r4]")
+TEST_CASE("Residual refuses a lost value needed by another conjunct", "[scan][residual_filter]")
 {
   auto conjuncts = two_conjuncts();
   conjuncts.push_back(string_equality(7, 1));
@@ -177,7 +177,8 @@ TEST_CASE("R4 residual refuses a lost value needed by another conjunct", "[scan]
   REQUIRE_THROWS(residual.against_progress(progress));
 }
 
-TEST_CASE("R4 residual keeps a multi-column conjunct when another slot is answered", "[scan][r4]")
+TEST_CASE("Residual keeps a multi-column conjunct when another slot is answered",
+          "[scan][residual_filter]")
 {
   std::vector<table_filter_conjunct> conjuncts;
   conjuncts.push_back(string_equality(/*primary_index=*/7, /*batch_position=*/0));
@@ -190,8 +191,8 @@ TEST_CASE("R4 residual keeps a multi-column conjunct when another slot is answer
   REQUIRE(predicate->get<sirius::ast::conjunction>().children.size() == 2);
 }
 
-TEST_CASE("R4 residual rejects a multi-column conjunct when a referenced slot is answered",
-          "[scan][r4]")
+TEST_CASE("Residual rejects a multi-column conjunct when a referenced slot is answered",
+          "[scan][residual_filter]")
 {
   auto conjuncts = two_conjuncts();
   conjuncts.push_back(numeric_multi_column(1, 2));

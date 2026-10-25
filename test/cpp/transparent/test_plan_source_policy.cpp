@@ -116,9 +116,9 @@ TEST_CASE("Source policy permits complete empty local and native plans",
   REQUIRE(policy.scans.at(0).source == byte_source_class::local_file);
   duckdb::LogicalDummyScan empty(duckdb::TableIndex(0));
   REQUIRE(derive_plan_source_policy(empty, *con.context).cpu_replay_permitted());
-  REQUIRE_FALSE(con.Query("CREATE TEMP TABLE r1_policy_native(id INTEGER)")->HasError());
+  REQUIRE_FALSE(con.Query("CREATE TEMP TABLE policy_native(id INTEGER)")->HasError());
   REQUIRE_FALSE(con.Query("BEGIN")->HasError());
-  auto native        = con.ExtractPlan("SELECT * FROM r1_policy_native");
+  auto native        = con.ExtractPlan("SELECT * FROM policy_native");
   auto native_policy = derive_plan_source_policy(*native, *con.context);
   REQUIRE(native_policy.discovery_complete);
   REQUIRE(native_policy.cpu_replay_permitted());

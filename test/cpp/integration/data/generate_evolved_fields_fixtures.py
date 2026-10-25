@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""R4: evolved flat fields alongside live positional deletes.
+"""Evolved flat fields alongside live positional deletes.
 
-Run with pixi run python test/cpp/integration/data/generate_r4_evolution_fixture.py.
+Run with pixi run python test/cpp/integration/data/generate_evolved_fields_fixtures.py.
 The snapshot retains old physical names/IDs, a retired same-name field, an INT32
 and a FLOAT32. The bound schema reorders/renames/promotes them and adds a default.
 """
@@ -15,7 +15,7 @@ import pyarrow.parquet as pq
 from generate_schema_gate_fixtures import DATA, repoint, write_metadata
 
 SOURCE = "iceberg_v2_delete"
-DEST = "iceberg_r4_evolution"
+DEST = "iceberg_evolved_fields_with_deletes"
 target = DATA / DEST
 if target.exists():
     shutil.rmtree(target)
@@ -61,7 +61,8 @@ doc["last-column-id"] = 5
 doc["schemas"][0]["fields"] = [
     {"id": 4, "name": "score", "required": False, "type": "double"},
     {"id": 2, "name": "count", "required": False, "type": "long"},
-    # Old fruit #1 was dropped; the reused name must NOT recover its values.
+    # Old fruit #1 was dropped. Reusing its name with ID #3 must yield NULL,
+    # rather than recovering the retired field's values by name.
     {"id": 3, "name": "fruit", "required": False, "type": "string"},
     {
         "id": 5,
@@ -107,13 +108,15 @@ for path in (target / "metadata").glob("*.avro"):
             records,
             metadata=avro_metadata,
             codec="null",
-            sync_marker=b"r4-evolution-001",
+            sync_marker=b"evolution-000001",
         )
 
 # A valid migration whose absent field comes from identity-partition metadata.
 # It must remain refused until the adapter exports per-file partition constants.
+# The missing count#2 is 42 from the partition; substituting its NULL default
+# would silently change the query result.
 source_name = "iceberg_v1"
-dest_name = "iceberg_r4_partition_missing"
+dest_name = "iceberg_missing_partition_column"
 target = DATA / dest_name
 if target.exists():
     shutil.rmtree(target)
@@ -146,7 +149,7 @@ for path in (target / "metadata").glob("*.avro"):
                 }
             ]
         with path.open("wb") as handle:
-            fastavro.writer(handle, schema, records, sync_marker=b"r4-partition-001")
+            fastavro.writer(handle, schema, records, sync_marker=b"partition-000001")
         continue
     data_schema = next(
         field["type"] for field in schema["fields"] if field["name"] == "data_file"
@@ -183,5 +186,32 @@ for path in (target / "metadata").glob("*.avro"):
             schema,
             records,
             metadata=avro_metadata,
-            sync_marker=b"r4-partition-001",
+            sync_marker=b"partition-000001",
         )
+
+# Repointing paths changes manifest sizes; manifest lists must describe the rewritten files.
+for name, marker in (
+    (DEST, b"evolution-000001"),
+    (dest_name, b"partition-000001"),
+):
+    for path in (DATA / name / "metadata").glob("*.avro"):
+        with path.open("rb") as handle:
+            reader = fastavro.reader(handle)
+            schema = reader.writer_schema
+            records = list(reader)
+            metadata = dict(reader.metadata)
+        if not records or "manifest_path" not in records[0]:
+            continue
+        for record in records:
+            record["manifest_length"] = (
+                (DATA.parents[3] / record["manifest_path"]).stat().st_size
+            )
+        with path.open("wb") as handle:
+            fastavro.writer(
+                handle,
+                schema,
+                records,
+                metadata=metadata,
+                codec="null",
+                sync_marker=marker,
+            )

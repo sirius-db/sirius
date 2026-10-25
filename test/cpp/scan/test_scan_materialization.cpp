@@ -110,7 +110,7 @@ std::shared_ptr<owned_arrow_batch> owned_fixture(std::shared_ptr<arrow_fixture> 
 }
 }  // namespace
 
-TEST_CASE("R4 row domain preserves file offsets and refuses holes", "[r4][scan]")
+TEST_CASE("Row domain preserves file offsets and refuses holes", "[materialization][scan]")
 {
   row_domain domain;
   domain.files = {{"generation-A", 180}, {"generation-B", 100}};
@@ -125,7 +125,8 @@ TEST_CASE("R4 row domain preserves file offsets and refuses holes", "[r4][scan]"
   REQUIRE_THROWS(domain.validate(2));
 }
 
-TEST_CASE("R4 Arrow layout rejects unsupported metadata and inconsistent buffers", "[r4][scan]")
+TEST_CASE("Arrow layout rejects unsupported metadata and inconsistent buffers",
+          "[materialization][scan]")
 {
   int released = 0;
   arrow_fixture f(released);
@@ -155,7 +156,8 @@ TEST_CASE("R4 Arrow layout rejects unsupported metadata and inconsistent buffers
   REQUIRE_THROWS(validate_arrow_host_flat(f.schema, f.array));
 }
 
-TEST_CASE("R4 Arrow import owns its source through retirement and shared finish", "[r4][scan]")
+TEST_CASE("Arrow import owns its source through retirement and shared finish",
+          "[materialization][scan]")
 {
   rmm::cuda_stream stream;
   sirius::exec::retire_lane lane(stream.value());
@@ -180,7 +182,7 @@ TEST_CASE("R4 Arrow import owns its source through retirement and shared finish"
   REQUIRE(released == 1);
 }
 
-TEST_CASE("R4 Arrow stream keeps empty batches separate from EOS", "[r4][scan]")
+TEST_CASE("Arrow stream keeps empty batches separate from EOS", "[materialization][scan]")
 {
   rmm::cuda_stream stream;
   sirius::exec::retire_lane lane(stream.value());
@@ -212,8 +214,8 @@ TEST_CASE("R4 Arrow stream keeps empty batches separate from EOS", "[r4][scan]")
   REQUIRE(released == 2);
 }
 
-TEST_CASE("R4 Arrow stream validates envelopes and cancels on import or source failure",
-          "[r4][scan]")
+TEST_CASE("Arrow stream validates envelopes and cancels on import or source failure",
+          "[materialization][scan]")
 {
   rmm::cuda_stream stream;
   auto mr = cudf::get_current_device_resource_ref();
@@ -297,8 +299,8 @@ TEST_CASE("R4 Arrow stream validates envelopes and cancels on import or source f
   }
 }
 
-TEST_CASE("R4 direct GPU reader skips completed steps and retains zero column cardinality",
-          "[r4][scan]")
+TEST_CASE("Direct GPU reader skips completed steps and retains zero column cardinality",
+          "[materialization][scan]")
 {
   rmm::cuda_stream stream;
   materialized_batch batch;
@@ -308,7 +310,7 @@ TEST_CASE("R4 direct GPU reader skips completed steps and retains zero column ca
   batch.logical_schema_complete = true;
   batch.visibility_complete     = true;
   batch.predicates              = {{0, sirius::op::predicate_stage::enforced, {}}};
-  ensure_row_count_carrier(batch, stream.view(), cudf::get_current_device_resource_ref());
+  ensure_row_count_carrier(batch, stream, cudf::get_current_device_resource_ref());
   materialization_program program{31, 2, {}, 1, true};
   program.input_types = std::vector<cudf::data_type>{};
   materialization_steps steps;
@@ -323,24 +325,24 @@ TEST_CASE("R4 direct GPU reader skips completed steps and retains zero column ca
 }
 
 TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
-                 "R4 real Parquet ID mapping widens reorders and fills explicit null",
-                 "[r4][scan][integration]")
+                 "Real Parquet ID mapping widens reorders and fills explicit null",
+                 "[materialization][scan][integration]")
 {
   rmm::cuda_stream stream;
   auto mr = cudf::get_current_device_resource_ref();
   std::vector<std::unique_ptr<cudf::column>> columns;
-  columns.push_back(constant(11, 3, stream.view()));
-  columns.push_back(constant(22, 3, stream.view()));
+  columns.push_back(constant(11, 3, stream));
+  columns.push_back(constant(22, 3, stream));
   cudf::table table(std::move(columns));
   cudf::io::table_input_metadata metadata(table.view());
   metadata.column_metadata[0].set_name("old.dot").set_parquet_field_id(4);
   metadata.column_metadata[1].set_name("right").set_parquet_field_id(9);
-  sirius::test::scratch_dir dir("r4_field_ids");
+  sirius::test::scratch_dir dir("materialization_field_ids");
   auto path   = (dir.path() / "data.parquet").string();
   auto writer = cudf::io::parquet_writer_options::builder(cudf::io::sink_info(path), table.view())
                   .metadata(std::move(metadata))
                   .build();
-  cudf::io::write_parquet(writer, stream.view());
+  cudf::io::write_parquet(writer, stream);
   stream.synchronize();
   auto state    = sirius::test::get_registered_sirius_context(*con);
   auto source   = state->get_scan_manager().create_datasource(path);
@@ -365,7 +367,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   contract.contract_id = 77;
   contract.profiles    = std::make_shared<physical_profile_table>();
   std::vector<std::size_t> groups{0};
-  auto batch = materialize_mapped_parquet(input, mapping, contract, groups, stream.view(), mr);
+  auto batch = materialize_mapped_parquet(input, mapping, contract, groups, stream, mr);
   REQUIRE(first_int64(batch.table.view().column(0)) == 22);
   REQUIRE(batch.table.view().column(2).null_count() == 3);
   materialization_steps steps;
@@ -383,7 +385,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   std::vector<mapped_parquet_unit> units{
     {input, &mapping},
     {{second_source, second_resolved.artifact->file_metadata(), {0}}, &second_mapping}};
-  auto coalesced = materialize_mapped_parquet_runs(units, contract, stream.view(), mr);
+  auto coalesced = materialize_mapped_parquet_runs(units, contract, stream, mr);
   REQUIRE(coalesced.size() == 1);
   REQUIRE(coalesced[0].rows == 6);
   REQUIRE(coalesced[0].lineage.files.size() == 2);
@@ -395,7 +397,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     second_resolved.artifact, second_resolved.identity, program, defaults);
   REQUIRE_FALSE(mapping.compatible_with(different));
   units[1].mapping = &different;
-  auto flushed     = materialize_mapped_parquet_runs(units, contract, stream.view(), mr);
+  auto flushed     = materialize_mapped_parquet_runs(units, contract, stream, mr);
   REQUIRE(flushed.size() == 2);
   REQUIRE(flushed[0].table.view().column(2).null_count() == 3);
   REQUIRE(flushed[1].table.view().column(2).null_count() == 0);
@@ -406,7 +408,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
                      cudaMemcpyDeviceToHost) == cudaSuccess);
   REQUIRE(default_value == 99);
   units[1]      = units[0];  // repeated files represent repeated rows, not deduplication
-  auto repeated = materialize_mapped_parquet_runs(units, contract, stream.view(), mr);
+  auto repeated = materialize_mapped_parquet_runs(units, contract, stream, mr);
   REQUIRE(repeated.size() == 1);
   REQUIRE(repeated[0].rows == 6);
   auto floating_fields             = fields;
@@ -425,10 +427,10 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   REQUIRE_THROWS(field_id_mapping::compile(resolved.artifact, resolved.identity, program, fields));
   REQUIRE_THROWS(field_id_mapping::compile(resolved.artifact, "other-version", program, fields));
   contract.contract_id = 78;
-  REQUIRE_THROWS(materialize_mapped_parquet(input, mapping, contract, groups, stream.view(), mr));
+  REQUIRE_THROWS(materialize_mapped_parquet(input, mapping, contract, groups, stream, mr));
 }
 
-TEST_CASE("R4 Arrow nullable slice retains values and rejects schema drift", "[r4][scan]")
+TEST_CASE("Arrow nullable slice retains values and rejects schema drift", "[materialization][scan]")
 {
   rmm::cuda_stream stream;
   sirius::exec::retire_lane lane(stream.value());
@@ -453,7 +455,7 @@ TEST_CASE("R4 Arrow nullable slice retains values and rejects schema drift", "[r
   REQUIRE(values[1] == 30);
 }
 
-TEST_CASE("R4 Arrow all-valid slices ignore absent or unused bitmaps", "[r4][scan]")
+TEST_CASE("Arrow all-valid slices ignore absent or unused bitmaps", "[materialization][scan]")
 {
   rmm::cuda_stream stream;
   sirius::exec::retire_lane lane(stream.value());
@@ -484,7 +486,8 @@ TEST_CASE("R4 Arrow all-valid slices ignore absent or unused bitmaps", "[r4][sca
   }
 }
 
-TEST_CASE("R4 Arrow metadata uses separate bounds and rejects every truncated prefix", "[r4][scan]")
+TEST_CASE("Arrow metadata uses separate bounds and rejects every truncated prefix",
+          "[materialization][scan]")
 {
   int released = 0;
   arrow_fixture f(released);
@@ -513,7 +516,7 @@ TEST_CASE("R4 Arrow metadata uses separate bounds and rejects every truncated pr
   REQUIRE_THROWS_AS(validate_arrow_host_flat(f.schema, f.array), std::invalid_argument);
 }
 
-TEST_CASE("R4 Arrow decimal imports normalize the approved carrier", "[r4][scan]")
+TEST_CASE("Arrow decimal imports normalize the approved carrier", "[materialization][scan]")
 {
   rmm::cuda_stream stream;
   sirius::exec::retire_lane lane(stream.value());
@@ -542,7 +545,7 @@ TEST_CASE("R4 Arrow decimal imports normalize the approved carrier", "[r4][scan]
   }
 }
 
-TEST_CASE("R4 Arrow empty and zero-column batches preserve cardinality", "[r4][scan]")
+TEST_CASE("Arrow empty and zero-column batches preserve cardinality", "[materialization][scan]")
 {
   rmm::cuda_stream stream;
   sirius::exec::retire_lane lane(stream.value());
@@ -561,12 +564,13 @@ TEST_CASE("R4 Arrow empty and zero-column batches preserve cardinality", "[r4][s
   }
 }
 
-TEST_CASE("R4 explicit GPU positions feed shared visibility before residual", "[r4][scan]")
+TEST_CASE("Explicit GPU positions feed shared visibility before residual",
+          "[materialization][scan]")
 {
   rmm::cuda_stream stream;
   auto mr = cudf::get_current_device_resource_ref();
   std::vector<std::unique_ptr<cudf::column>> cols;
-  cols.push_back(constant(7, 3, stream.view()));
+  cols.push_back(constant(7, 3, stream));
   materialized_batch batch;
   batch.table                   = owning_table_view(std::make_unique<cudf::table>(std::move(cols)));
   batch.contract                = 45;
@@ -586,7 +590,7 @@ TEST_CASE("R4 explicit GPU positions feed shared visibility before residual", "[
         REQUIRE(identity == "file-v1");
         return deleted;
       },
-      stream.view(),
+      stream,
       mr);
   };
   steps.residual   = [&](materialized_batch& b) { REQUIRE(b.rows == 1); };
@@ -598,7 +602,7 @@ TEST_CASE("R4 explicit GPU positions feed shared visibility before residual", "[
   stream.synchronize();
 }
 
-TEST_CASE("R4 Arrow imports every flat primitive with nulls", "[r4][scan]")
+TEST_CASE("Arrow imports every flat primitive with nulls", "[materialization][scan]")
 {
   rmm::cuda_stream stream;
   sirius::exec::retire_lane lane(stream.value());
@@ -628,7 +632,8 @@ TEST_CASE("R4 Arrow imports every flat primitive with nulls", "[r4][scan]")
   }
 }
 
-TEST_CASE("R4 Arrow rejects nested dictionary extensions and invalid string offsets", "[r4][scan]")
+TEST_CASE("Arrow rejects nested dictionary extensions and invalid string offsets",
+          "[materialization][scan]")
 {
   int released = 0;
   arrow_fixture f(released);
@@ -643,7 +648,7 @@ TEST_CASE("R4 Arrow rejects nested dictionary extensions and invalid string offs
   REQUIRE_THROWS(validate_arrow_host_flat(f.schema, f.array));
 }
 
-TEST_CASE("R4 Arrow metadata and UTF8 offsets are qualified before import", "[r4][scan]")
+TEST_CASE("Arrow metadata and UTF8 offsets are qualified before import", "[materialization][scan]")
 {
   int released = 0;
   arrow_fixture f(released);
@@ -699,7 +704,8 @@ TEST_CASE("R4 Arrow metadata and UTF8 offsets are qualified before import", "[r4
   REQUIRE_THROWS(validate_arrow_host_flat(f.schema, f.array));
 }
 
-TEST_CASE("R4 retiring an abandoned Arrow import releases its owner exactly once", "[r4][scan]")
+TEST_CASE("Retiring an abandoned Arrow import releases its owner exactly once",
+          "[materialization][scan]")
 {
   rmm::cuda_stream stream;
   int released = 0;
@@ -719,7 +725,8 @@ TEST_CASE("R4 retiring an abandoned Arrow import releases its owner exactly once
   REQUIRE(released == 1);
 }
 
-TEST_CASE("R4 Arrow query drain retires cancelled batches and returns their credit", "[r4][scan]")
+TEST_CASE("Arrow query drain retires cancelled batches and returns their credit",
+          "[materialization][scan]")
 {
   struct credit_token {
     int* returns;
@@ -757,12 +764,12 @@ TEST_CASE("R4 Arrow query drain retires cancelled batches and returns their cred
   CHECK(credits == 1);
 }
 
-TEST_CASE("R4 finish refuses unproved visibility and predicate reports", "[r4][scan]")
+TEST_CASE("Finish refuses unproved visibility and predicate reports", "[materialization][scan]")
 {
   rmm::cuda_stream stream;
   auto mr = cudf::get_current_device_resource_ref();
   std::vector<std::unique_ptr<cudf::column>> cols;
-  cols.push_back(constant(9, 2, stream.view()));
+  cols.push_back(constant(9, 2, stream));
   materialized_batch batch;
   batch.table                   = owning_table_view(std::make_unique<cudf::table>(std::move(cols)));
   batch.rows                    = 2;
@@ -802,10 +809,10 @@ TEST_CASE("R4 finish refuses unproved visibility and predicate reports", "[r4][s
 }
 
 TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
-                 "R4 empty evolved file preserves its schema and completion split",
-                 "[r4][scan][integration]")
+                 "Empty evolved file preserves its schema and completion split",
+                 "[materialization][scan][integration]")
 {
-  sirius::test::scratch_dir directory("r4_empty_evolved");
+  sirius::test::scratch_dir directory("materialization_empty_evolved");
   auto path    = directory.file("empty.parquet");
   auto written = con->Query("COPY (SELECT 1::INTEGER old_id WHERE false) TO " +
                             directory.file_literal("empty.parquet") +
@@ -846,7 +853,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
                                           *split.field_mapping,
                                           contract,
                                           {},
-                                          stream.view(),
+                                          stream,
                                           cudf::get_current_device_resource_ref());
   REQUIRE(batch.rows == 0);
   REQUIRE(batch.table.view().num_columns() == 1);
@@ -854,10 +861,10 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
 }
 
 TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
-                 "R4 adapter mapping hook runs without an Iceberg physical schema",
-                 "[r4][scan][mapping][adapter]")
+                 "Adapter mapping hook runs without an Iceberg physical schema",
+                 "[materialization][scan][mapping][adapter]")
 {
-  sirius::test::scratch_dir directory("r4_adapter_mapping");
+  sirius::test::scratch_dir directory("materialization_adapter_mapping");
   auto path = directory.file("input.parquet");
   auto written =
     con->Query("COPY (SELECT 7::INTEGER old_id) TO " + directory.file_literal("input.parquet") +
@@ -892,12 +899,12 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
 }
 
 TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
-                 "R4 directly bound virtual multi-column predicates stay out of footer AST",
-                 "[r4][scan][virtual_columns][r4_review][integration]")
+                 "Directly bound virtual multi-column predicates stay out of footer AST",
+                 "[materialization][scan][virtual_columns][integration]")
 {
   auto const sibling = GENERATE(0, 1, 2);
   CAPTURE(sibling);
-  sirius::test::scratch_dir directory("r4_virtual_filter");
+  sirius::test::scratch_dir directory("materialization_virtual_filter");
   auto path = directory.file("input.parquet");
   {
     sirius::test::scoped_setting cpu(*con, "gpu_execution", false);
@@ -966,10 +973,10 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     cucascade::memory::Tier::GPU, rmm::get_current_cuda_device().value());
   REQUIRE(space);
   rmm::cuda_stream stream;
-  auto batch = ingestible->materialize_metadata_to_table(
-    *splits.front(), *space, stream.view(), false, nullptr);
+  auto batch =
+    ingestible->materialize_metadata_to_table(*splits.front(), *space, stream, false, nullptr);
   REQUIRE(batch.state != filter_state::ROW_FILTERED_AND_PROJECTED);
-  auto output        = ingestible->post_filter_and_project(std::move(batch), *space, stream.view());
+  auto output        = ingestible->post_filter_and_project(std::move(batch), *space, stream);
   auto expected_rows = sibling == 1 ? 1144 : sibling == 2 ? 1002 : 1146;
   REQUIRE(output->num_rows() == expected_rows);
   REQUIRE(output->num_columns() == 2);
@@ -1074,7 +1081,7 @@ class failing_dv_context final : public sirius::io::ioctx {
 };
 }  // namespace
 
-TEST_CASE("R4 Iceberg Puffin wrapper retains failure diagnostics", "[r4][scan][iceberg][r4_review]")
+TEST_CASE("Iceberg Puffin wrapper retains failure diagnostics", "[materialization][scan][iceberg]")
 {
   using namespace sirius::scan_manager;
   using failure = failing_dv_context::failure;

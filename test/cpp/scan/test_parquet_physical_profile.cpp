@@ -18,7 +18,6 @@
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/parquet_io_utils.hpp>
 
-// R2a T5: RED_FEATURE after commit (b).
 #include <catch.hpp>
 #include <io/parquet_helpers.hpp>
 #include <op/scan/parquet_metadata.hpp>
@@ -751,8 +750,9 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   CHECK(after.runtime_fallbacks == before.runtime_fallbacks + 1);
   CHECK(after.split_physical_rejections[reason] == before.split_physical_rejections[reason] + 1);
   CHECK(after.parquet_reader_calls == before.parquet_reader_calls);
-  for (auto const& sql : {"SELECT * FROM sirius_read_parquet(" + file + ")",
-                          "CALL pin_table(" + file + ", name='r2a_encrypted_pin', tier='gpu')"}) {
+  for (auto const& sql :
+       {"SELECT * FROM sirius_read_parquet(" + file + ")",
+        "CALL pin_table(" + file + ", name='encrypted_native_pin', tier='gpu')"}) {
     before     = sirius::test::get_transparent_execution_stats(*con);
     auto error = con->Query(sql);
     REQUIRE(error->HasError());
@@ -875,7 +875,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
                  "Parquet footer cache is shared across query projections and reader options",
                  "[scan][parquet][integration][metadata_retention]")
 {
-  sirius::test::scratch_dir directory("parquet_r3_projection");
+  sirius::test::scratch_dir directory("parquet_projection_cache");
   run_ok("SET gpu_execution=false");
   auto path = directory.file("columns.parquet");
   run_ok("COPY (SELECT 1::INTEGER x, 2::BIGINT y) TO " + sirius::test::sql_literal(path) +
@@ -904,7 +904,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
                  "Parquet cache rebuilds a foreign artifact before serving",
                  "[scan][parquet][integration][metadata_retention]")
 {
-  sirius::test::scratch_dir directory("parquet_r3_provenance");
+  sirius::test::scratch_dir directory("parquet_metadata_identity");
   run_ok("SET gpu_execution=false");
   auto path = directory.file("columns.parquet");
   run_ok("COPY (SELECT 1::INTEGER x) TO " + sirius::test::sql_literal(path) + " (FORMAT PARQUET)");

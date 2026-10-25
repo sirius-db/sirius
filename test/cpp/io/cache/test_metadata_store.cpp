@@ -381,7 +381,7 @@ TEST_CASE("Metadata replacement releases payloads outside the store lock", "[met
 }
 
 TEST_CASE("Metadata path and profile delimiters cannot alias another tuple",
-          "[metadata_store][r4_review]")
+          "[metadata_store][key_encoding]")
 {
   auto const reverse = GENERATE(false, true);
   cache::metadata_store store;
@@ -414,7 +414,7 @@ TEST_CASE("Metadata path and profile delimiters cannot alias another tuple",
 }
 
 TEST_CASE("Metadata identity retirement follows the raw path across encoded profiles",
-          "[metadata_store][r4_review]")
+          "[metadata_store][key_encoding]")
 {
   cache::metadata_store store;
   fake_object first("p", "same-key", tag());
@@ -439,7 +439,7 @@ TEST_CASE("Metadata identity retirement follows the raw path across encoded prof
 }
 
 TEST_CASE("Metadata colliding path profile spellings keep independent flights",
-          "[metadata_store][r4_review]")
+          "[metadata_store][key_encoding]")
 {
   cache::metadata_store store;
   fake_object first("p", "same-key", tag());
@@ -475,7 +475,7 @@ TEST_CASE("Metadata colliding path profile spellings keep independent flights",
 }
 
 TEST_CASE("Metadata tuple encoding accepts empty paths and embedded delimiters",
-          "[metadata_store][r4_review]")
+          "[metadata_store][key_encoding]")
 {
   cache::metadata_store store;
   std::vector<std::pair<std::string, std::string>> tuples{{"", ""},

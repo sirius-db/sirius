@@ -286,7 +286,7 @@ std::unique_ptr<operator_data> sirius_physical_top_n_merge::execute(const operat
   }
   auto* space = input_batches.front().get_memory_space();
 
-  // R1 — read-only accessors held in a vector for the duration of cudf::concatenate
+  // Read-only accessors held in a vector for the duration of cudf::concatenate
   // so the underlying table_views remain valid.
   std::vector<cucascade::read_only_data_batch> ro_views;
   ro_views.reserve(input_batches.size());
