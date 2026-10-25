@@ -16,9 +16,9 @@
 #include <duckdb/parser/tableref/table_function_ref.hpp>
 
 #include <array>
-#include <barrier>
 #include <cstdlib>
 #include <filesystem>
+#include <latch>
 #include <optional>
 #include <string_view>
 #include <thread>
@@ -473,24 +473,30 @@ TEST_CASE("Paimon independent descriptor callbacks may overlap", "[.][paimon_bin
   auto provider = paimon_read_provider::from_loaded(*db.instance);
   auto retained = provider.retain(bound.function, bound.data.get());
   auto snapshot = retained.view().snapshot_id;
-  std::barrier start(4);
+  std::latch start(1);
   std::array<std::exception_ptr, 4> errors{};
   {
     std::array<std::jthread, 4> workers;
-    for (size_t lane = 0; lane < workers.size(); ++lane) {
-      workers[lane] = std::jthread([&, lane] {
-        start.arrive_and_wait();
-        try {
-          for (unsigned iteration = 0; iteration < 32; ++iteration) {
-            auto copy = provider.retain(bound.function, bound.data.get());
-            if (copy.view().snapshot_id != snapshot || text(copy.view().table) != "t")
-              throw std::runtime_error("Concurrent descriptor identity changed");
+    try {
+      for (size_t lane = 0; lane < workers.size(); ++lane) {
+        workers[lane] = std::jthread([&, lane] {
+          start.wait();
+          try {
+            for (unsigned iteration = 0; iteration < 32; ++iteration) {
+              auto copy = provider.retain(bound.function, bound.data.get());
+              if (copy.view().snapshot_id != snapshot || text(copy.view().table) != "t")
+                throw std::runtime_error("Concurrent descriptor identity changed");
+            }
+          } catch (...) {
+            errors[lane] = std::current_exception();
           }
-        } catch (...) {
-          errors[lane] = std::current_exception();
-        }
-      });
+        });
+      }
+    } catch (...) {
+      start.count_down();
+      throw;
     }
+    start.count_down();
   }
   for (auto const& error : errors)
     if (error) std::rethrow_exception(error);
