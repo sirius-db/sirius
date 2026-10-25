@@ -463,6 +463,16 @@ class expression_evaluator {
    */
   evaluate_result materialize_as_ast_column(std::unique_ptr<cudf::column> column);
 
+  /**
+   * @brief Evaluates @p expr in MATERIALIZE mode and broadcasts a scalar result to a column with
+   * one row per input row.
+   *
+   * Use it for operands that a handler reads as a column. DuckDB can leave a constant operand
+   * unfolded: statistics propagation reduces `coalesce(<non-null constant>, x)` to the constant
+   * after constant folding has run, leaving e.g. `month(DATE '2020-02-01')`.
+   */
+  evaluate_result evaluate_as_column(sirius::ast::node const& expr);
+
   // Return a cached strict numeric restoration for one input reference. MATERIALIZE mode receives
   // a non-owning view; AST mode receives a reference to the cache-owned _temp_columns entry.
   evaluate_result get_or_create_restored_reference(std::uint32_t column_index,
@@ -541,6 +551,8 @@ class expression_evaluator {
   evaluate_result evaluate(sirius::ast::comparison const& expr, evaluation_mode mode);
   evaluate_result evaluate(sirius::ast::conjunction const& expr, evaluation_mode mode);
   evaluate_result evaluate(sirius::ast::function_call const& expr, evaluation_mode mode);
+  // Runs the function's libcudf kernel, whose result may be narrower than the declared type.
+  evaluate_result evaluate_function_kernel(sirius::ast::function_call const& expr);
   evaluate_result evaluate(sirius::ast::unary_op const& expr, evaluation_mode mode);
   evaluate_result evaluate(sirius::ast::coalesce const& expr, evaluation_mode mode);
   evaluate_result evaluate(sirius::ast::in_list const& expr, evaluation_mode mode);

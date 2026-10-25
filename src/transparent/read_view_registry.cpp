@@ -691,7 +691,7 @@ void validate_split_for_gpu(scan_contract_id expected,
                             std::optional<key_held_witness> const& expected_key,
                             scan_info const& split)
 {
-  // Preserve R1's handle mismatch and its precedence.
+  // Reject a mismatched scan contract before checking its certificates.
   if (split.contract_id() != expected) {
     throw transparent::classified_execution_error(transparent::late_failure_cause::certificate,
                                                   "scan split contract mismatch: expected " +

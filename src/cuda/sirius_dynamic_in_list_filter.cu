@@ -15,6 +15,8 @@
  */
 
 // sirius
+#include "memory/runtime_stream_pool.hpp"
+
 #include <log/logging.hpp>
 #include <op/dynamic_filter/dynamic_filter_device.hpp>
 #include <op/dynamic_filter/dynamic_filter_replica_reservation.hpp>
@@ -271,7 +273,8 @@ void sirius_dynamic_in_list_filter::replicate_to_devices(
 
   // Retain every destination and pooled stream while direct peer copies are submitted. Waiting
   // only after this loop lets different destination GPUs transfer concurrently.
-  std::vector<std::pair<std::unique_ptr<set_replica>, ::cuda::stream_ref>> pending;
+  std::vector<std::pair<std::unique_ptr<set_replica>, sirius::memory::runtime_stream_pool::lease>>
+    pending;
   pending.reserve(spaces.size());
   _set->replicas.reserve(_set->replicas.size() + spaces.size());
   for (auto const& target : spaces) {
@@ -281,7 +284,8 @@ void sirius_dynamic_in_list_filter::replicate_to_devices(
     std::size_t bytes = 0;
     try {
       rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
-      auto const stream = target_space.acquire_stream();
+      auto stream_lease = sirius::memory::runtime_stream_pool::acquire(target_space);
+      auto const stream = stream_lease.get();
 
       auto replica = std::visit(
         [&](auto const& source_set) {
@@ -327,7 +331,7 @@ void sirius_dynamic_in_list_filter::replicate_to_devices(
           bytes);
         continue;
       }
-      pending.emplace_back(std::move(replica), stream);
+      pending.emplace_back(std::move(replica), std::move(stream_lease));
     } catch (std::exception const& e) {
       SIRIUS_LOG_WARN(
         "[sirius_dynamic_in_list_filter] replica GPU {} -> GPU {} unavailable: {}. "
@@ -343,7 +347,8 @@ void sirius_dynamic_in_list_filter::replicate_to_devices(
                      device_id);
   }
 
-  for (auto& [replica, stream] : pending) {
+  for (auto& [replica, stream_lease] : pending) {
+    auto const stream    = stream_lease.get();
     auto const device_id = replica->device_id;
     try {
       rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
@@ -377,6 +382,28 @@ std::unique_ptr<cudf::column> sirius_dynamic_in_list_filter::compute_mask(
   ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr) const
 {
+  return compute_mask_impl(probe, prior_mask_words, nullptr, device_id, stream, mr);
+}
+
+std::unique_ptr<cudf::column> sirius_dynamic_in_list_filter::compute_mask_if(
+  cudf::column_view const& probe,
+  cudf::column_view const& prior_keep,
+  int device_id,
+  ::cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr) const
+{
+  return compute_mask_impl(
+    probe, nullptr, detail::checked_prior_keep(probe, prior_keep), device_id, stream, mr);
+}
+
+std::unique_ptr<cudf::column> sirius_dynamic_in_list_filter::compute_mask_impl(
+  cudf::column_view const& probe,
+  std::uint32_t const* prior_mask_words,
+  bool const* prior_keep,
+  int device_id,
+  ::cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr) const
+{
   auto const* replica =
     _set ? _set->find(detail::resolve_dynamic_filter_device_id(device_id)) : nullptr;
   if (!replica) { return nullptr; }
@@ -387,7 +414,7 @@ std::unique_ptr<cudf::column> sirius_dynamic_in_list_filter::compute_mask(
       using key_type   = typename owner_type::element_type::key_type;
       auto ref         = set->ref(cuco::contains);
       return detail::run_membership_probe<key_type>(
-        _domain, probe, prior_mask_words, stream, mr, set_lookup<decltype(ref)>{ref});
+        _domain, probe, prior_mask_words, stream, mr, set_lookup<decltype(ref)>{ref}, prior_keep);
     },
     replica->set);
 }

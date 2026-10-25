@@ -186,7 +186,9 @@ void run_prefetch(std::vector<file_info>& files,
   auto t0 = clock_type::now();
   for (std::size_t k = 0; k < files.size(); ++k) {
     auto const refusal = files[k].ds->prefetch_async(
-      [k, &files, &streams, &total_rows, &done, &disp, &io_ok, &io_not_ok](bool ok) noexcept {
+      [k, &files, &streams, &total_rows, &done, &disp, &io_ok, &io_not_ok](
+        sirius::io::cache::prefetch_result result) noexcept {
+        bool const ok = result.ok;
         if (ok) {
           io_ok.fetch_add(1, std::memory_order_relaxed);
         } else {

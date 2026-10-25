@@ -45,6 +45,8 @@
 #include "expression/function_id.hpp"
 #include "expression/join_condition.hpp"  // sirius::comparison_type
 #include "expression/substring_slice.hpp"
+#include "helper/type_conversions.hpp"  // sirius::from_duckdb(LogicalType const&)
+#include "sirius/exception.hpp"
 
 // duckdb — direct-ctor construction surface
 #include <duckdb/common/exception.hpp>
@@ -560,6 +562,138 @@ TEST_CASE("ast_from_duckdb - BOUND_FUNCTION '+' resolves to function_id::add", "
   REQUIRE(fc.function() == sirius::function_id::add);
   REQUIRE(fc.arguments().size() == 2);
   REQUIRE(fc.return_type().id() == sirius::type_id::INTEGER);
+}
+
+namespace {
+
+// DuckDB binds unary minus and unary plus as one-argument "-" and "+" on the operand's type.
+duckdb::unique_ptr<BoundFunctionExpression> make_unary_arithmetic(std::string const& name,
+                                                                  LogicalType const& type,
+                                                                  LogicalType const& return_type)
+{
+  auto expr = duckdb::make_uniq<BoundFunctionExpression>(
+    duckdb::BoundScalarFunction(
+      ScalarFunction(duckdb::Identifier(name), {type}, return_type, nullptr)),
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{},
+    nullptr);
+  expr->GetChildrenMutable().push_back(duckdb::make_uniq<BoundReferenceExpression>(type, 0));
+  return expr;
+}
+
+duckdb::unique_ptr<BoundFunctionExpression> make_unary_arithmetic(std::string const& name,
+                                                                  LogicalType const& type)
+{
+  return make_unary_arithmetic(name, type, type);
+}
+
+}  // namespace
+
+TEST_CASE("ast_from_duckdb - one-argument '-' translates to function_id::negate",
+          "[ast_from_duckdb][negate]")
+{
+  auto const type = GENERATE(LogicalType(LogicalType::TINYINT),
+                             LogicalType(LogicalType::SMALLINT),
+                             LogicalType(LogicalType::INTEGER),
+                             LogicalType(LogicalType::BIGINT),
+                             LogicalType(LogicalType::FLOAT),
+                             LogicalType(LogicalType::DOUBLE),
+                             LogicalType::DECIMAL(4, 1),
+                             LogicalType::DECIMAL(15, 2),
+                             LogicalType::DECIMAL(38, 9));
+  CAPTURE(type.ToString());
+  for (auto const* name : {"-", "subtract"}) {
+    CAPTURE(name);
+    auto out = sirius::ast::from_duckdb(*make_unary_arithmetic(name, type));
+    REQUIRE(out);
+    REQUIRE(out->holds<function_call>());
+    auto const& fc = out->get<function_call>();
+    REQUIRE(fc.function() == sirius::function_id::negate);
+    REQUIRE(fc.arguments().size() == 1);
+    REQUIRE(fc.arguments()[0]->holds<reference>());
+    REQUIRE(fc.return_type() == sirius::from_duckdb(type));
+    REQUIRE(out->cudf_ast_op_count() == 0);
+  }
+}
+
+TEST_CASE("ast_from_duckdb - one-argument '-' on a type the GPU cannot negate returns nullptr",
+          "[ast_from_duckdb][negate]")
+{
+  // DuckDB rejects negating a nonzero unsigned value, HUGEINT rides an INT64 carrier on the GPU,
+  // and INTERVAL has no GPU representation.
+  auto const type = GENERATE(LogicalType(LogicalType::UTINYINT),
+                             LogicalType(LogicalType::UINTEGER),
+                             LogicalType(LogicalType::UBIGINT),
+                             LogicalType(LogicalType::HUGEINT),
+                             LogicalType(LogicalType::INTERVAL));
+  CAPTURE(type.ToString());
+  REQUIRE_FALSE(sirius::ast::from_duckdb(*make_unary_arithmetic("-", type)));
+}
+
+TEST_CASE(
+  "ast_from_duckdb - one-argument '-' with a result type wider than its operand returns "
+  "nullptr",
+  "[ast_from_duckdb][negate]")
+{
+  // cuDF's negation keeps the operand type, so it cannot produce a wider result.
+  REQUIRE_FALSE(sirius::ast::from_duckdb(
+    *make_unary_arithmetic("-", LogicalType::TINYINT, LogicalType::SMALLINT)));
+}
+
+TEST_CASE("ast_from_duckdb - one-argument '+' translates to its operand",
+          "[ast_from_duckdb][negate]")
+{
+  auto const type = GENERATE(LogicalType(LogicalType::INTEGER), LogicalType::DECIMAL(15, 2));
+  CAPTURE(type.ToString());
+  auto out = sirius::ast::from_duckdb(*make_unary_arithmetic("+", type));
+  REQUIRE(out);
+  REQUIRE(out->holds<reference>());
+  REQUIRE(out->get<reference>().return_type() == sirius::from_duckdb(type));
+}
+
+TEST_CASE(
+  "ast_from_duckdb - BOUND_FUNCTION with an arity its GPU handler does not take returns "
+  "nullptr",
+  "[ast_from_duckdb][negate]")
+{
+  // DuckDB's regexp_replace takes an optional options string the GPU handler does not apply.
+  auto expr = duckdb::make_uniq<BoundFunctionExpression>(
+    duckdb::BoundScalarFunction(ScalarFunction(
+      "regexp_replace",
+      {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+      LogicalType::VARCHAR,
+      nullptr)),
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{},
+    nullptr);
+  expr->GetChildrenMutable().push_back(make_bound_ref(0, LogicalTypeId::VARCHAR));
+  for (auto const* argument : {"a", "b", "g"}) {
+    expr->GetChildrenMutable().push_back(
+      duckdb::make_uniq<BoundConstantExpression>(Value(argument)));
+  }
+  REQUIRE_FALSE(sirius::ast::from_duckdb(*expr));
+
+  // A three-argument "*" has no GPU handler either.
+  auto mul = duckdb::make_uniq<BoundFunctionExpression>(
+    duckdb::BoundScalarFunction(
+      ScalarFunction("*",
+                     {LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::INTEGER},
+                     LogicalType::INTEGER,
+                     nullptr)),
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{},
+    nullptr);
+  for (uint32_t i = 0; i < 3; ++i) {
+    mul->GetChildrenMutable().push_back(make_bound_ref(i));
+  }
+  REQUIRE_FALSE(sirius::ast::from_duckdb(*mul));
+}
+
+TEST_CASE("ast_from_duckdb - function_call rejects an arity its GPU handler does not take",
+          "[ast_from_duckdb][negate]")
+{
+  auto const integer = sirius::logical_type::make(sirius::type_id::INTEGER);
+  std::vector<std::unique_ptr<node>> one_argument;
+  one_argument.push_back(std::make_unique<node>(reference{0, integer}));
+  REQUIRE_THROWS_AS(function_call(sirius::function_id::sub, std::move(one_argument), integer),
+                    sirius::internal_exception);
 }
 
 namespace {

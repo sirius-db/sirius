@@ -26,6 +26,7 @@
 #include "duckdb/planner/operator/logical_join.hpp"
 #include "expression/ast/node.hpp"  // complete sirius::ast::node for join_condition's destructor
 #include "expression/join_condition.hpp"
+#include "op/partition/partition_sizing.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "sirius_config.hpp"
 
@@ -162,7 +163,7 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
 
   //! A nested-loop join always runs on a single partition (its build side is not hash-partitioned),
   //! so it never broadcasts or enters build-probe.
-  partition_strategy get_partition_strategy(const partition_sizing_input& in) override;
+  partition_strategy get_partition_strategy(const partition_sizing_input& in);
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          ::cuda::stream_ref stream) override;

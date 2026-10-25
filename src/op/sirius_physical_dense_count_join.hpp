@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "op/partition/partition_sizing.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 
@@ -229,8 +230,7 @@ class sirius_physical_dense_count_join : public sirius_physical_partition_consum
    * @param in What the sizing partition measured, including both siblings' byte totals
    * @return The partition count to apply to both input PARTITIONs
    */
-  [[nodiscard]] partition_strategy get_partition_strategy(
-    const partition_sizing_input& in) override;
+  [[nodiscard]] partition_strategy get_partition_strategy(const partition_sizing_input& in);
 
   /**
    * @brief Estimate a conservative first-run peak across all execution strategies
@@ -270,6 +270,9 @@ class sirius_physical_dense_count_join : public sirius_physical_partition_consum
   }
 
  private:
+  /// Consumer-owned sizing target; batch-only receivers have no sizing configuration.
+  uint64_t _hash_partition_bytes = config::DEFAULT_HASH_PARTITION_BYTES;
+
   /// Number of partitions decided by get_partition_strategy, mirrored from the input repositories.
   /// One until sizing runs.
   [[nodiscard]] std::size_t partition_count() const;

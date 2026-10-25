@@ -104,6 +104,8 @@ Two things then decide whether the ride is taken:
 
 One bundle installs per scan (one rowid rides), and arbitration is widest-wins.
 
+A consumer carries one ride as well. When two scans' bundles land at the same consumer, the scan that installs first owns it and the other can only join as a rider (below). The scan manager therefore visits scans in order of what their own bundle would save, net bytes per row times port crossings, largest first, instead of the order the plan lists them. A scan that finds its consumer already taken is offered to the rider pass rather than refused. DuckDB v2 lists q10's `nation` scan before `customer`, because it joins nation to customer first; without the ordering, nation's one-column ride claimed the consumer and customer's five wide columns were materialized early.
+
 ## Riding through a group-by, and riders
 
 If the deferred columns are the GROUP BY keys, the sound stop is the aggregate's input — which
@@ -157,6 +159,8 @@ are decided somewhere this path cannot see them — a compressed pin filters ins
 decode (see [Compressed Pinning](compressed-pinning.md)).
 
 Dynamic membership filters cannot meet a deferral during decode today: the decode attaches them only to compressed pins, and install refuses every compressed origin (see Known limits). A guard keeps it that way should compressed origins become deferrable: `sirius_gpu_scan_operator::decode_consumer` is null once a deferral is installed, and `prepare_for_query` installs every deferral, riders included, before it builds any provider, so the scan's dynamic-filter endpoint would apply those filters after substitution instead. Should a deferring scan's decode remove rows anyway, `execute` fails with a named internal error, before any filtering or projection, rather than addressing rows the batch no longer holds.
+
+With the internal resident Parquet checkpoint enabled, the scan can apply membership masks before substitution. It checks the original materialized row count against the chunk origin before any mask, then selects original positions with the same conjunction used for the payload. Substitution forms each rowid from the origin offset plus that selected position, including when all deferred output columns were elided. The scan keeps the ordinary owned output representation. The placement flag is true by default.
 
 Port restoration changes values, not rows, so it keeps the payload it restores: its dynamic type, original batch IDs, preferred device, partition index and scan receipt (see [Dynamic Filters](dynamic-filters.md#scan-receipts-and-decode-history)).
 

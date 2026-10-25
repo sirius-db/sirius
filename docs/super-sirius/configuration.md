@@ -24,6 +24,15 @@ Sirius searches for a config file in this order:
 
 If no config file is found, Sirius initializes with built-in defaults (95% GPU memory, 90% of each NUMA node's RAM as pinned host memory).
 
+### Concurrent query admission
+
+`sirius.max_concurrent_queries` is a positive startup integer, default **1**, shared by
+connections to one DatabaseInstance. It bounds initialization through retirement. Additional
+queries wait in a cancellable FIFO queue. The former
+`sirius.executor.scan_manager.max_concurrent_queries` key is a deprecated alias; conflicting
+values fail configuration loading. See [Concurrent queries](concurrent-queries.md) for the
+maintenance, error and multi-GPU contracts.
+
 ### `SIRIUS_DISABLE`
 
 Set `SIRIUS_DISABLE=1` to prevent Super Sirius from initializing. Useful for CPU-only benchmarks, since Super Sirius claims most GPU and pinned host memory on startup.
@@ -80,6 +89,7 @@ config.load_from_file("/path/to/config.yaml");  // Optional
 
 ```yaml
 sirius:
+  max_concurrent_queries: 1
   topology: { num_gpus: 1 }
   memory:
     gpu:
@@ -113,7 +123,7 @@ sirius:
     dynamic_filter_keep_threshold: 0.9  # disable a scan's filtering when a split keeps > this fraction
     enable_pinned_zone_map_pruning: true  # capture and use per-chunk stats for pinned tables
     enable_runtime_size_estimation: false  # project total port input from upstream ratios
-    enable_decimal_sum_stats_bound: true  # decide decimal SUM widening from statistics at plan time
+    enable_decimal_sum_stats_bound: true  # decide decimal and BIGINT SUM width from statistics at plan time
   telemetry:
     enable_quent: true
     output_directory: telemetry_data
@@ -321,7 +331,7 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `num_threads` | int (**> 2**) | remaining cores (min 4) | Threads in the scan-manager pool that run metadata tasks. Defaults to every core left after the other default pools (1 downgrade + 1 task_creator + 4 pipeline + 1 uring reactor), with a floor of 4. Rejected unless strictly greater than 2 (i.e. minimum 3). |
+| `num_threads` | int (**> 0**) | remaining cores (min 4) | Metadata-producer threads. Preparation and coalescing run on each query owner thread, so they cannot occupy producer capacity. |
 | `cpu_affinity` | list of int | — | Cores to pin scan-manager threads to. |
 | `backend` | enum: `sirius`, `kvikio` | `sirius` | IO backend for reads. `sirius` uses the Sirius IO stack (`io_uring` for local paths, REST for `s3://`); `kvikio` serves both local files and `s3://` objects through kvikIO (local files through its file handle, objects through its remote handle); listing and glob expansion of `s3://` still go through the REST backend. Single-GPU only: a multi-GPU configuration is forced back to `sirius`. Values are lowercase. |
 | `uring_n_reactors` | int (**> 0**) | 1 | Number of io_uring reactor threads for local-disk reads. |
@@ -353,8 +363,10 @@ against the pipeline pool's width rather than the backend's depth — one prefet
 deployment is only useful while a pipeline thread could still pick up another scan. An explicit
 `max_readahead_scans` wins over that substitution.
 
-Both are resolved against a single backend: the live one publishing the widest
-`n_max_concurrent_scans`, so the budget and the strategy always describe the same reactor.
+A query's local policy is selected from the serving backend publishing the widest budget.
+A runtime budget additionally accounts for every backend touched by each split across all
+queries. Demand reads borrow immediately; their debt pauses speculative prefetch. Events are
+routed by query ID. A failed cache allocation gets one eviction retry before speculation yields.
 
 Six optional nested sub-configs tune the individual backends, the cache, and the memory prefetcher:
 
@@ -525,17 +537,20 @@ sirius:
 
 Overlaps the host→GPU upload of queued pinned-cache scan splits with compute:
 worker threads walk the pending splits in scan execution order and convert
-resident batches to GPU tier ahead of task creation, gated on GPU memory
-headroom (see `scan_manager/memory_prefetcher.hpp`). Disabled by default;
-single-GPU configurations only (logs a warning and disables itself otherwise).
+resident batches to GPU tier ahead of task execution, gated on GPU memory
+headroom (see `scan_manager/memory_prefetcher.hpp`). Disabled by default. Background memory
+prefetch runs only when the query has exactly one eligible GPU after admission filtering.
+Workers use that device's reservations and exclusive stream leases, releasing leases before
+parking. With multiple eligible GPUs, scan tasks perform their own uploads on their assigned
+devices; independent background placement could conflict with a task's already selected device.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enable` | bool | false | Master switch for the prefetcher. |
-| `num_threads` | int (**> 0**) | 2 | Prefetch worker threads; each drives one in-flight batch conversion on its own stream. |
+| `num_threads` | int (**> 0**) | 2 | Prefetch worker threads; each acquires an exclusive stream lease for a sweep and returns it before parking. |
 | `min_free_fraction` | double [0,1] | 0.4 | Keep at least this fraction of the GPU space free after each prefetch; conversions (and their reservations) are only attempted above this floor. |
 | `poll_interval_ms` | int (**> 0**) | 2 | Worker sweep interval while waiting for headroom / new splits. |
-| `drain_quiet_ms` | int (ms) | 100 | A connector counts as actively draining (and is skipped) until this long passes since its last pop. Must exceed the scan's inter-pop interval. |
+| `drain_quiet_ms` | int (ms) | 100 | A connector counts as actively draining until this long passes since its last pop. One worker may prefetch it tail-first, leaving four batches at the head for scan tasks; other workers skip it. Must exceed the scan's inter-pop interval. |
 
 ### Programmatic S3 credentials
 
@@ -581,7 +596,7 @@ individually.
 | `admission_bytes_per_gpu` | 0 (off) | Target projected scan-output bytes per GPU. At admission the engine estimates a query's total scan output and takes the smallest GPU subset that keeps each GPU under this figure, bounded by `topology.gpus_per_query`. `0` disables the estimate, leaving the allocation to `topology.gpus_per_query` alone. |
 | `avg_variable_column_bytes` | 32 | Per-row width assumed for variable-width columns (VARCHAR, LIST, STRUCT, ARRAY) when estimating scan output. Fixed-width columns use their real carrier width. Only consulted when `admission_bytes_per_gpu` is non-zero. |
 | `enable_runtime_size_estimation` | false | Size grouped-aggregation partitions from projected input, allowing a partial ingress barrier. |
-| `enable_decimal_sum_stats_bound` | true | Decide at plan time, from base-table statistics, whether a DECIMAL32/DECIMAL64 SUM or AVG input must be widened before aggregation. An input whose magnitude bound the planner can prove skips the per-batch min/max scan and its stream synchronization; unproven inputs are still measured per batch. |
+| `enable_decimal_sum_stats_bound` | true | Decide at plan time, from base-table statistics, whether a DECIMAL32/DECIMAL64 SUM or AVG input, or the BIGINT input of a SUM or AVG that DuckDB accumulates in HUGEINT, must be widened before aggregation, or whether a DECIMAL128 SUM input can be summed as DECIMAL64. An input whose magnitude bound the planner can prove skips the per-batch min/max scan and its stream synchronization; unproven inputs are still measured per batch. |
 
 **Note:** `admission_bytes_per_gpu` is a parallelism dial, not a memory budget. Peak GPU residency is bounded by partition sizing (`hash_partition_bytes` and the batch settings), not by the admitted GPU count — a query on fewer GPUs processes more partitions sequentially at roughly unchanged peak memory, trading wall-clock for freed devices. Tune it against how much of the fleet a query should occupy, not against VRAM.
 
@@ -696,8 +711,21 @@ per-pool extras.
 
 The task-creator, downgrade, and scan-manager pools support optional CPU affinity lists
 (`cpu_affinity`) for core pinning. GPU pipeline affinity is derived per executor from the selected
-GPU's CPU topology. `num_threads` must be `> 0` for every pool except `scan_manager`, which requires
-`> 2`.
+GPU's CPU topology. `num_threads` must be `> 0` for every pool.
+
+## DuckDB Settings Changed by Sirius
+
+Loading Sirius changes the database-wide default of one DuckDB setting. A session `SET` still wins, and a value the database already carries explicitly (from the connection config or a `SET GLOBAL` before `LOAD`) is left alone.
+
+| Setting | DuckDB default | Default with Sirius | Description |
+|---------|----------------|---------------------|-------------|
+| `delim_join_as_cte` | `true` | `false` | Whether DuckDB rewrites the delim joins it creates while decorrelating subqueries into materialized CTEs |
+
+DuckDB v2 rewrites decorrelated subqueries (correlated `EXISTS`, `NOT EXISTS`, `IN` and scalar subqueries) into materialized CTEs by default. Sirius does not yet plan those shapes well: at TPC-H SF1000, Q20, Q21 and Q22 ran 1.2-3.5x slower than with explicit delim joins, because Q21's `NOT EXISTS` became an anti join that hashes every late `lineitem` row and Q20/Q22 lost their dynamic filters behind mark joins. Sirius therefore keeps the explicit `LEFT_DELIM_JOIN` / `RIGHT_DELIM_JOIN` plans. This is a stopgap until Sirius handles the CTE plan shapes, and DuckDB already marks the setting as deprecated, so it must be revisited when DuckDB removes it. To get DuckDB's CTE plans in one session:
+
+```sql
+SET delim_join_as_cte = true;
+```
 
 ## DuckDB SET Variables
 

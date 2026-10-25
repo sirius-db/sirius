@@ -17,7 +17,6 @@
 #include "scan_manager/preparation.hpp"
 
 #include "duckdb/common/exception.hpp"
-#include "op/scan/iceberg_delete_set.hpp"
 
 namespace sirius::scan_manager {
 void preparation_gate::callback_use::activate_under_gate() noexcept
@@ -120,7 +119,7 @@ bool preparation_unit::complete_input(segments_input input)
   finish_input(required_input::segments);
   return true;
 }
-bool preparation_unit::complete_input(delete_set_input input)
+bool preparation_unit::complete_input(visibility_input input)
 {
   preparation_gate::callback_use use(gate_);
   op::scan::split_dependencies retired;
@@ -130,12 +129,12 @@ bool preparation_unit::complete_input(delete_set_input input)
     if (gate_->closed) return false;
   }
   std::lock_guard lock(mutex_);
-  if (!accept(required_input::delete_set)) return false;
-  if (!input.value) throw std::invalid_argument("pending delete set is not an empty result");
+  if (!accept(required_input::visibility)) return false;
+  if (!input.value) throw std::invalid_argument("pending visibility is not an empty result");
   use.activate_under_gate();
-  retired.delete_set = std::move(deps_.delete_set);
-  deps_.delete_set   = std::move(input.value);
-  finish_input(required_input::delete_set);
+  retired.visibility = std::move(deps_.visibility);
+  deps_.visibility   = std::move(input.value);
+  finish_input(required_input::visibility);
   return true;
 }
 bool preparation_unit::complete_input(checkpoint_input input)
@@ -199,7 +198,7 @@ unit_record preparation_unit::record() const
   std::lock_guard lock(mutex_);
   return record_;
 }
-required_input_set required_inputs(op::scan::later_check_set const& checks, bool needs_delete_set)
+required_input_set required_inputs(op::scan::later_check_set const& checks, bool needs_visibility)
 {
   using op::scan::later_check;
   auto has = [&](later_check check) { return checks[static_cast<size_t>(check)]; };
@@ -209,7 +208,7 @@ required_input_set required_inputs(op::scan::later_check_set const& checks, bool
                has(later_check::schema_per_file));
   result.set(static_cast<size_t>(required_input::segments),
              has(later_check::segments_per_range) || has(later_check::matrix_per_range));
-  result.set(static_cast<size_t>(required_input::delete_set), needs_delete_set);
+  result.set(static_cast<size_t>(required_input::visibility), needs_visibility);
   result.set(static_cast<size_t>(required_input::checkpoint_iteration), has(later_check::key_held));
   return result;
 }

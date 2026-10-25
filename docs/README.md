@@ -16,6 +16,12 @@ Sirius is a GPU-Native Composable Analytics Engine. It plugs into existing datab
   <img src="super-sirius-arch.png" alt="Sirius architecture: a GPU-Native Composable Analytics Engine" width="700"/>
 </p>
 
+## Concurrent queries
+
+Use separate connections to one DuckDB DatabaseInstance and set startup
+`sirius.max_concurrent_queries` (default 1). See the [concurrent-query guide](super-sirius/concurrent-queries.md)
+for admission, maintenance, cancellation, memory pressure and qualification scope.
+
 ## Performance
 
 TPC-H hot runs on AWS, 22 queries · best Sirius g7e size vs DuckDB on m9g.16xlarge · cost per run, log scales · lower left is better.
