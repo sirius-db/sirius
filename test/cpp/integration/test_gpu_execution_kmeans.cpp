@@ -2597,9 +2597,10 @@ TEST_CASE_METHOD(KMeansFixture,
   CHECK(distance_mismatches(scanned, oracle) == 0);
 }
 
-TEST_CASE_METHOD(KMeansFixture,
-                 "a self-join over one scanned table reads it once and answers as two scans do",
-                 "[integration][gpu_execution][array][vss][kmeans][approx][scan_bounded][self_join]")
+TEST_CASE_METHOD(
+  KMeansFixture,
+  "a self-join over one scanned table reads it once and answers as two scans do",
+  "[integration][gpu_execution][array][vss][kmeans][approx][scan_bounded][self_join]")
 {
   // Both sides scan the same table's vector column, so the probe reads the corpus scan's batches
   // instead of a second scan and copy of its own (SIRIUS_VSS_SELF_JOIN_SHARE=0 scans twice). The
@@ -2629,9 +2630,10 @@ TEST_CASE_METHOD(KMeansFixture,
            "probe_source => 'scan', build_source => 'scan');";
   };
   auto const approx = [&](int n_probes) {
-    return join("search_mode => 'approx', clustering => 'sjs_c', cluster_column => 'cluster_id', "
-                "n_probes => " +
-                std::to_string(n_probes));
+    return join(
+      "search_mode => 'approx', clustering => 'sjs_c', cluster_column => 'cluster_id', "
+      "n_probes => " +
+      std::to_string(n_probes));
   };
   std::map<std::string, std::string> cluster_of;
   for (auto const& r : ok_rows(*con, "SELECT id, cluster_id FROM sjs_t;")) {

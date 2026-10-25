@@ -45,20 +45,20 @@ TEST_CASE("rotate_rows is an in-order fmaf chain per output whatever the batch",
     for (auto& v : x) {
       v = normal(gen);
     }
-    rmm::device_uvector<float> dx(x.size(), stream), dr(r.size(), stream), dout(x.size(), stream);
+    rmm::device_uvector<float> dx(x.size(), stream), dr(r.size(), stream), doubt(x.size(), stream);
     REQUIRE(cudaMemcpy(dx.data(), x.data(), x.size() * 4, cudaMemcpyHostToDevice) == cudaSuccess);
     REQUIRE(cudaMemcpy(dr.data(), r.data(), r.size() * 4, cudaMemcpyHostToDevice) == cudaSuccess);
     // The whole batch, and the same rows as a 37-row batch from an odd offset.
-    sirius::vss::rotate_rows(dx.data(), rows, d, dr.data(), dout.data(), stream);
+    sirius::vss::rotate_rows(dx.data(), rows, d, dr.data(), doubt.data(), stream);
     std::vector<float> got(x.size());
     stream.synchronize();
-    REQUIRE(cudaMemcpy(got.data(), dout.data(), got.size() * 4, cudaMemcpyDeviceToHost) ==
+    REQUIRE(cudaMemcpy(got.data(), doubt.data(), got.size() * 4, cudaMemcpyDeviceToHost) ==
             cudaSuccess);
     std::int64_t const off = 101, part = 37;
-    sirius::vss::rotate_rows(dx.data() + off * d, part, d, dr.data(), dout.data(), stream);
+    sirius::vss::rotate_rows(dx.data() + off * d, part, d, dr.data(), doubt.data(), stream);
     std::vector<float> got_part(static_cast<std::size_t>(part * d));
     stream.synchronize();
-    REQUIRE(cudaMemcpy(got_part.data(), dout.data(), got_part.size() * 4, cudaMemcpyDeviceToHost) ==
+    REQUIRE(cudaMemcpy(got_part.data(), doubt.data(), got_part.size() * 4, cudaMemcpyDeviceToHost) ==
             cudaSuccess);
     std::int64_t mismatches = 0;
     for (std::int64_t i = 0; i < rows; ++i) {
@@ -83,8 +83,8 @@ TEST_CASE("rotate_rows is an in-order fmaf chain per output whatever the batch",
     for (auto* v : {&hi, &hi2}) {
       REQUIRE(cudaMemsetAsync(v->data(), 0, d * 4, stream.value()) == cudaSuccess);
     }
-    sirius::vss::rotate_rows(dx.data(), rows, d, dr.data(), dout.data(), stream);
-    sirius::vss::column_min_max(dout.data(), rows, d, lo.data(), hi.data(), stream);
+    sirius::vss::rotate_rows(dx.data(), rows, d, dr.data(), doubt.data(), stream);
+    sirius::vss::column_min_max(doubt.data(), rows, d, lo.data(), hi.data(), stream);
     if (sirius::vss::rotate_rows_min_max(
           dx.data(), rows, d, dr.data(), lo2.data(), hi2.data(), stream)) {
       std::vector<unsigned int> a(d), b(d), c(d), e(d);
