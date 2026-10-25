@@ -305,7 +305,7 @@ class current_resource_guard {
 }  // namespace
 
 TEST_CASE("Arrow migration normalizes combined Boolean and UTF8 windows on the selected stream",
-          "[r4][scan][arrow_migration]")
+          "[materialization][scan][arrow_migration]")
 {
   release_counts released;
   bounded_host_resource host;
@@ -369,7 +369,7 @@ TEST_CASE("Arrow migration normalizes combined Boolean and UTF8 windows on the s
 }
 
 TEST_CASE("Arrow migration refuses invalid final columns and host exhaustion before GPU allocation",
-          "[r4][scan][arrow_migration]")
+          "[materialization][scan][arrow_migration]")
 {
   release_counts released;
   bounded_host_resource host;
@@ -394,7 +394,7 @@ TEST_CASE("Arrow migration refuses invalid final columns and host exhaustion bef
 }
 
 TEST_CASE("Arrow import retains the capacity-owned host resource through host-thread retirement",
-          "[r4][scan][arrow_migration]")
+          "[materialization][scan][arrow_migration]")
 {
   release_counts released;
   host_resource_lifetime lifetime;
@@ -432,7 +432,7 @@ TEST_CASE("Arrow import retains the capacity-owned host resource through host-th
 }
 
 TEST_CASE("Arrow import retains pinned inputs and staging while H2D copies are pending",
-          "[r4][scan][arrow_migration]")
+          "[materialization][scan][arrow_migration]")
 {
   release_counts released;
   void* pinned_storage = nullptr;
@@ -553,7 +553,7 @@ TEST_CASE("Arrow import retains pinned inputs and staging while H2D copies are p
 }
 
 TEST_CASE("Arrow import validates only the selected UTF8 window including empty inputs",
-          "[r4][scan][arrow_migration]")
+          "[materialization][scan][arrow_migration]")
 {
   release_counts released;
   bounded_host_resource host;
@@ -598,7 +598,7 @@ TEST_CASE("Arrow import validates only the selected UTF8 window including empty 
 }
 
 TEST_CASE("Arrow migration Boolean slices cover shifted word and mask boundaries",
-          "[r4][scan][arrow_migration]")
+          "[materialization][scan][arrow_migration]")
 {
   for (int rows : {1, 7, 8, 31, 32, 33, 511, 512, 513}) {
     for (int child_offset : {0, 1, 7}) {
@@ -656,7 +656,7 @@ TEST_CASE("Arrow migration Boolean slices cover shifted word and mask boundaries
 }
 
 TEST_CASE("Arrow migration host and device allocation refusals preserve ownership",
-          "[r4][scan][arrow_migration]")
+          "[materialization][scan][arrow_migration]")
 {
   long allocations      = 0;
   long host_allocations = 0;
@@ -735,7 +735,7 @@ TEST_CASE("Arrow migration host and device allocation refusals preserve ownershi
 }
 
 TEST_CASE("Arrow migration does not route allocations through the process default resource",
-          "[r4][scan][arrow_migration]")
+          "[materialization][scan][arrow_migration]")
 {
   release_counts released;
   bounded_host_resource host;
@@ -778,7 +778,7 @@ TEST_CASE("Arrow migration does not route allocations through the process defaul
 }
 
 TEST_CASE("Arrow migration failed completion retains roots and staging until verified recovery",
-          "[r4][scan][arrow_migration]")
+          "[materialization][scan][arrow_migration]")
 {
   release_counts released;
   bounded_host_resource host;
@@ -830,7 +830,7 @@ TEST_CASE("Arrow migration failed completion retains roots and staging until ver
 }
 
 TEST_CASE("Arrow migration final quiesce covers frees queued after failed commit",
-          "[r4][scan][arrow_migration]")
+          "[materialization][scan][arrow_migration]")
 {
   release_counts released;
   bounded_host_resource host;
