@@ -2459,6 +2459,19 @@ void emit_nvrtc_device_runtime_preamble_impl(std::ostringstream& src)
     << "  if (!valid || ovf_in) { return reg_val<T>{T{}, valid, ovf_in}; }\n"
     << "  if constexpr (cuda::std::is_floating_point_v<T>) {\n"
     << "    return reg_val<T>{static_cast<T>(l.val) + static_cast<T>(r.val), true, false};\n"
+    // 64-bit sums: wrap in the unsigned domain and read the overflow off the sign bits (signed)
+    // or the carry (unsigned) instead of widening to 128 bits.
+    << "  } else if constexpr (sizeof(T) == 8) {\n"
+    << "    T const lv = static_cast<T>(l.val);\n"
+    << "    T const rv = static_cast<T>(r.val);\n"
+    << "    T const res = static_cast<T>(static_cast<uint64_t>(lv) + static_cast<uint64_t>(rv));\n"
+    << "    bool ovf;\n"
+    << "    if constexpr (cuda::std::is_signed_v<T>) {\n"
+    << "      ovf = static_cast<int64_t>((lv ^ res) & (rv ^ res)) < 0;\n"
+    << "    } else {\n"
+    << "      ovf = res < lv;\n"
+    << "    }\n"
+    << "    return reg_val<T>{ovf ? T{} : res, true, ovf};\n"
     << "  } else if constexpr (cuda::std::is_signed_v<T>) {\n"
     << "    using Wide = cuda::std::conditional_t<(sizeof(T) < 8), int64_t, __int128_t>;\n"
     << "    Wide const res = static_cast<Wide>(static_cast<T>(l.val)) + "
@@ -2481,6 +2494,12 @@ void emit_nvrtc_device_runtime_preamble_impl(std::ostringstream& src)
     << "  if (!valid || ovf_in) { return reg_val<T>{T{}, valid, ovf_in}; }\n"
     << "  if constexpr (cuda::std::is_floating_point_v<T>) {\n"
     << "    return reg_val<T>{static_cast<T>(l.val) - static_cast<T>(r.val), true, false};\n"
+    << "  } else if constexpr (sizeof(T) == 8 && cuda::std::is_signed_v<T>) {\n"
+    << "    T const lv = static_cast<T>(l.val);\n"
+    << "    T const rv = static_cast<T>(r.val);\n"
+    << "    T const res = static_cast<T>(static_cast<uint64_t>(lv) - static_cast<uint64_t>(rv));\n"
+    << "    bool const ovf = static_cast<int64_t>((lv ^ rv) & (lv ^ res)) < 0;\n"
+    << "    return reg_val<T>{ovf ? T{} : res, true, ovf};\n"
     << "  } else if constexpr (cuda::std::is_signed_v<T>) {\n"
     << "    using Wide = cuda::std::conditional_t<(sizeof(T) < 8), int64_t, __int128_t>;\n"
     << "    Wide const res = static_cast<Wide>(static_cast<T>(l.val)) - "
@@ -2613,6 +2632,14 @@ void emit_nvrtc_device_runtime_preamble_impl(std::ostringstream& src)
     << "  bool const ovf_in = l.overflow || r.overflow;\n"
     << "  bool const valid = l.valid && r.valid;\n"
     << "  if (!valid || ovf_in) { return reg_val<OutRep>{OutRep{}, valid, ovf_in}; }\n"
+    // Operands of at most 64 bits rescaled by at most 10^18 (the widest DECIMAL64 scale) stay
+    // far inside 128 bits, so only the final narrowing can overflow.
+    << "  if constexpr (sizeof(L) <= 8 && sizeof(R) <= 8) {\n"
+    << "    __int128_t const sum = static_cast<__int128_t>(l.val) * f_l + "
+       "static_cast<__int128_t>(r.val) * f_r;\n"
+    << "    auto const out = cuda::overflow_cast<OutRep>(sum);\n"
+    << "    return reg_val<OutRep>{out.overflow ? OutRep{} : out.value, true, out.overflow};\n"
+    << "  }\n"
     << "  auto const sl = cuda::mul_overflow<__int128_t>(static_cast<__int128_t>(l.val), f_l);\n"
     << "  auto const sr = cuda::mul_overflow<__int128_t>(static_cast<__int128_t>(r.val), f_r);\n"
     << "  if (sl.overflow || sr.overflow) { return reg_val<OutRep>{OutRep{}, true, true}; }\n"
@@ -2627,6 +2654,14 @@ void emit_nvrtc_device_runtime_preamble_impl(std::ostringstream& src)
     << "  bool const ovf_in = l.overflow || r.overflow;\n"
     << "  bool const valid = l.valid && r.valid;\n"
     << "  if (!valid || ovf_in) { return reg_val<OutRep>{OutRep{}, valid, ovf_in}; }\n"
+    // Operands of at most 64 bits rescaled by at most 10^18 (the widest DECIMAL64 scale) stay
+    // far inside 128 bits, so only the final narrowing can overflow.
+    << "  if constexpr (sizeof(L) <= 8 && sizeof(R) <= 8) {\n"
+    << "    __int128_t const diff = static_cast<__int128_t>(l.val) * f_l - "
+       "static_cast<__int128_t>(r.val) * f_r;\n"
+    << "    auto const out = cuda::overflow_cast<OutRep>(diff);\n"
+    << "    return reg_val<OutRep>{out.overflow ? OutRep{} : out.value, true, out.overflow};\n"
+    << "  }\n"
     << "  auto const sl = cuda::mul_overflow<__int128_t>(static_cast<__int128_t>(l.val), f_l);\n"
     << "  auto const sr = cuda::mul_overflow<__int128_t>(static_cast<__int128_t>(r.val), f_r);\n"
     << "  if (sl.overflow || sr.overflow) { return reg_val<OutRep>{OutRep{}, true, true}; }\n"
@@ -3538,46 +3573,117 @@ bool can_compile_filter_sink(sirius::ast::node const& predicate,
 
 namespace {
 
-// Device helpers for the single-pass `FilterSink` compaction: each block (tile) publishes its
-// survivor count, then resolves its exclusive prefix with a warp-parallel decoupled look-back over
-// its predecessors (Merrill & Garland, "Single-pass Parallel Prefix Scan with Decoupled
-// Look-back"). Tile ids are claimed dynamically so a block never waits on a tile that has not been
-// scheduled. A tile state packs the 32-bit count with a status in one 64-bit word, so a single
-// volatile access publishes or observes both atomically and no fence is required.
-constexpr char const* kFilterLookbackRuntime = R"(
-__device__ __forceinline__ unsigned long long pack_tile_state(uint32_t count, unsigned long long status) {
-  return (status << 32) | static_cast<unsigned long long>(count);
-}
-__device__ __forceinline__ unsigned long long load_tile_state(unsigned long long* states, int32_t tile) {
-  return *reinterpret_cast<volatile unsigned long long*>(states + tile);
-}
-__device__ __forceinline__ void store_tile_state(unsigned long long* states, int32_t tile, unsigned long long v) {
-  *reinterpret_cast<volatile unsigned long long*>(states + tile) = v;
-}
-// Executed by one full warp. Returns the exclusive prefix (survivors in all tiles before `tile`).
-__device__ __forceinline__ uint32_t lookback_exclusive_prefix(unsigned long long* states, int32_t tile, int32_t lane) {
-  constexpr unsigned long long kEmpty = 0ULL;
-  constexpr unsigned long long kInclusive = 2ULL;
-  uint32_t exclusive = 0u;
-  int32_t window_end = tile - 1;
-  while (true) {
-    int32_t const my_tile = window_end - lane;
-    unsigned long long st = (my_tile >= 0) ? load_tile_state(states, my_tile) : pack_tile_state(0u, kInclusive);
-    while (__any_sync(0xFFFFFFFFu, (st >> 32) == kEmpty)) {
-      if ((st >> 32) == kEmpty) { st = load_tile_state(states, my_tile); }
-    }
-    uint32_t const inclusive_lanes = __ballot_sync(0xFFFFFFFFu, (st >> 32) == kInclusive);
-    int32_t const stop_lane = (inclusive_lanes != 0u) ? (__ffs(inclusive_lanes) - 1) : 32;
-    uint32_t contrib = (lane <= stop_lane) ? static_cast<uint32_t>(st) : 0u;
+// Fixed (expression-independent) kernels completing the `FilterSink` compaction for multi-tile
+// batches: an exclusive scan over the per-tile survivor counts, and a warp-cooperative scatter of
+// the surviving row indices from the per-warp ballot words. Compiled once per process.
+constexpr int kFilterBlockThreads   = 256;
+constexpr int kFilterItemsPerThread = 16;
+constexpr int kFilterTileRows       = kFilterBlockThreads * kFilterItemsPerThread;
+constexpr int kFilterScanThreads    = 1024;
+
+constexpr char const* kFilterCompactionSource = R"(
+#include "codegen/stdint_shim.hpp"
+
+// One block: exclusive prefix sum of tile_counts in place; status_and_counts[1] = total.
+extern "C" __global__ void sirius_nvrtc_filter_scan_kernel(
+    uint32_t* __restrict__ tile_counts,
+    int32_t num_tiles,
+    uint32_t* __restrict__ status_and_counts)
+{
+  constexpr int kThreads = 1024;
+  __shared__ uint32_t s_warp_sums[kThreads / 32];
+  int32_t const lane = static_cast<int32_t>(threadIdx.x) & 31;
+  int32_t const warp = static_cast<int32_t>(threadIdx.x) >> 5;
+  uint32_t carry = 0u;
+  for (int32_t base = 0; base < num_tiles; base += kThreads) {
+    int32_t const idx = base + static_cast<int32_t>(threadIdx.x);
+    uint32_t const v = (idx < num_tiles) ? tile_counts[idx] : 0u;
+    uint32_t incl = v;
     #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-      contrib += __shfl_xor_sync(0xFFFFFFFFu, contrib, off);
+    for (int off = 1; off < 32; off <<= 1) {
+      uint32_t const n = __shfl_up_sync(0xFFFFFFFFu, incl, off);
+      if (lane >= off) { incl += n; }
     }
-    exclusive += contrib;
-    if (inclusive_lanes != 0u) { break; }
-    window_end -= 32;
+    if (lane == 31) { s_warp_sums[warp] = incl; }
+    __syncthreads();
+    uint32_t warp_prefix = 0u;
+    #pragma unroll
+    for (int w = 0; w < kThreads / 32; ++w) {
+      if (w < warp) { warp_prefix += s_warp_sums[w]; }
+    }
+    uint32_t chunk_total = 0u;
+    #pragma unroll
+    for (int w = 0; w < kThreads / 32; ++w) {
+      chunk_total += s_warp_sums[w];
+    }
+    if (idx < num_tiles) { tile_counts[idx] = carry + warp_prefix + incl - v; }
+    carry += chunk_total;
+    __syncthreads();
   }
-  return exclusive;
+  if (threadIdx.x == 0) { status_and_counts[1] = carry; }
+}
+
+// One block per tile: each warp walks its share of the tile's 32-row ballot words and writes the
+// surviving row indices contiguously (lane rank within the word, word rank within the tile,
+// tile prefix from the scan), so the output is ascending and every store instruction is coalesced.
+extern "C" __global__ void sirius_nvrtc_filter_scatter_kernel(
+    uint32_t const* __restrict__ ballots,
+    uint32_t const* __restrict__ tile_prefix,
+    int32_t num_rows,
+    int32_t* __restrict__ survivors)
+{
+  constexpr int kThreads = 256;
+  constexpr int kWarps = kThreads / 32;
+  constexpr int kWordsPerTile = kThreads * 16 / 32;
+  constexpr int kWordsPerWarp = kWordsPerTile / kWarps;
+  __shared__ uint32_t s_word_prefix[kWordsPerTile];
+  __shared__ uint32_t s_warp_sums[kWarps];
+  int32_t const tile = static_cast<int32_t>(blockIdx.x);
+  int32_t const lane = static_cast<int32_t>(threadIdx.x) & 31;
+  int32_t const warp = static_cast<int32_t>(threadIdx.x) >> 5;
+  int32_t const num_words = (num_rows + 31) >> 5;
+  int32_t const word0 = tile * kWordsPerTile;
+
+  // Popcount of every ballot word of the tile (kWordsPerTile <= kThreads: one word per thread).
+  static_assert(kWordsPerTile <= kThreads, "one ballot word per thread");
+  if (threadIdx.x < kWordsPerTile) {
+    int32_t const gw = word0 + static_cast<int32_t>(threadIdx.x);
+    s_word_prefix[threadIdx.x] = (gw < num_words) ? static_cast<uint32_t>(__popc(ballots[gw])) : 0u;
+  }
+  __syncthreads();
+  // Each warp turns its contiguous run of kWordsPerWarp counts into exclusive offsets. Every lane
+  // takes part in each shuffle round (idle lanes contribute zero) so the warp never diverges.
+  uint32_t run_total = 0u;
+  for (int k = 0; k < kWordsPerWarp; k += 32) {
+    bool const in_run = (k + lane) < kWordsPerWarp;
+    int32_t const wi = warp * kWordsPerWarp + k + lane;
+    uint32_t const c = in_run ? s_word_prefix[wi] : 0u;
+    uint32_t incl = c;
+    #pragma unroll
+    for (int off = 1; off < 32; off <<= 1) {
+      uint32_t const n = __shfl_up_sync(0xFFFFFFFFu, incl, off);
+      if (lane >= off) { incl += n; }
+    }
+    if (in_run) { s_word_prefix[wi] = run_total + incl - c; }
+    run_total += __shfl_sync(0xFFFFFFFFu, incl, 31);
+  }
+  if (lane == 0) { s_warp_sums[warp] = run_total; }
+  __syncthreads();
+  uint32_t warp_base = tile_prefix[tile];
+  for (int w = 0; w < warp; ++w) {
+    warp_base += s_warp_sums[w];
+  }
+  for (int32_t wi = warp * kWordsPerWarp; wi < (warp + 1) * kWordsPerWarp; ++wi) {
+    int32_t const gw = word0 + wi;
+    if (gw >= num_words) { break; }
+    uint32_t const ballot = ballots[gw];
+    if (ballot == 0u) { continue; }
+    uint32_t const base = warp_base + s_word_prefix[wi];
+    if ((ballot >> lane) & 1u) {
+      uint32_t const rank = static_cast<uint32_t>(__popc(ballot & ((1u << lane) - 1u)));
+      survivors[base + rank] = (gw << 5) + lane;
+    }
+  }
 }
 )";
 
@@ -3624,38 +3730,34 @@ std::unique_ptr<cudf::table> evaluate_filter_sink(sirius::ast::node const& predi
     *narrow_domain_comparison_count += ctx.narrow_domain_comparison_count();
   }
 
-  constexpr int block_threads    = 256;
+  constexpr int block_threads    = kFilterBlockThreads;
   constexpr int num_warps        = block_threads / 32;
-  constexpr int items_per_thread = 8;
-  constexpr int tile_rows        = block_threads * items_per_thread;
+  constexpr int items_per_thread = kFilterItemsPerThread;
+  constexpr int tile_rows        = kFilterTileRows;
   bool const any_can_overflow    = pred_reg.can_overflow;
   bool const any_subquery_err    = ctx.has_subquery_error();
 
   std::ostringstream src;
   src << nvrtc_device_runtime_preamble();
-  src << kFilterLookbackRuntime;
   src << "extern \"C\" __global__ void sirius_nvrtc_filter_kernel(\n";
   emit_input_and_constant_kernel_params(src, ctx);
 
-  // status_and_counts: [0] = status flags, [1] = total survivors, [2] = next tile id.
+  // status_and_counts: [0] = status flags, [1] = total survivors (written here only when the
+  // batch is a single tile). `survivors` is written directly for a single tile; otherwise the
+  // per-tile count and per-warp ballot words feed the scan and scatter kernels.
   src << "    int32_t num_rows,\n"
       << "    uint32_t* __restrict__ status_and_counts,\n"
-      << "    unsigned long long* __restrict__ tile_states,\n"
+      << "    uint32_t* __restrict__ tile_counts,\n"
+      << "    uint32_t* __restrict__ ballots,\n"
       << "    int32_t* __restrict__ survivors)\n"
       << "{\n"
-      << "  __shared__ int32_t s_tile;\n"
-      << "  if (threadIdx.x == 0) { s_tile = static_cast<int32_t>(atomicAdd(&status_and_counts[2], "
-         "1u)); }\n"
-      << "  __syncthreads();\n"
-      << "  int32_t const tile = s_tile;\n"
-      << "  int32_t const num_tiles = (num_rows + " << (tile_rows - 1) << ") / " << tile_rows
-      << ";\n"
+      << "  int32_t const tile = static_cast<int32_t>(blockIdx.x);\n"
+      << "  bool const single_tile = (gridDim.x == 1u);\n"
       << "  int32_t const tile_row0 = tile * " << tile_rows << ";\n"
       << "  int32_t const lane = static_cast<int32_t>(threadIdx.x) & 31;\n"
       << "  int32_t const warp_in_block = static_cast<int32_t>(threadIdx.x) >> 5;\n"
       << "  __shared__ uint32_t s_counts[" << items_per_thread * num_warps << "];\n"
       << "  __shared__ uint32_t s_block_count;\n"
-      << "  __shared__ uint32_t s_block_base;\n"
       << "  uint32_t survive_bits = 0u;\n";
 
   if (any_can_overflow) { src << "  bool row_overflow = false;\n"; }
@@ -3689,6 +3791,8 @@ std::unique_ptr<cudf::table> evaluate_filter_sink(sirius::ast::node const& predi
       << "      s_counts[item * " << num_warps
       << " + warp_in_block] = "
          "static_cast<uint32_t>(__popc(warp_ballot));\n"
+      << "      if (!single_tile && row - lane < num_rows) { ballots[(row - lane) >> 5] = "
+         "warp_ballot; }\n"
       << "    }\n"
       << "  }\n";
 
@@ -3705,17 +3809,14 @@ std::unique_ptr<cudf::table> evaluate_filter_sink(sirius::ast::node const& predi
         << "  }\n";
   }
 
-  // Single-pass Sparse-to-Dense Compaction: warp ballot and intra-warp rank in registers, a
-  // block-wide exclusive scan over the warp counts in shared memory, then a decoupled look-back
-  // over the preceding tiles for the block's global offset. Survivors are scattered directly in
-  // ascending row order; the last tile publishes the total survivor count.
+  // Sparse-to-Dense Compaction, pass 1: warp ballot and intra-warp rank in registers and a
+  // block-wide scan of the (item, warp) counts in shared memory. A single-tile batch scatters its
+  // survivors here; a multi-tile batch publishes the tile count and ballot words for the scan
+  // and scatter kernels, which avoids serializing tiles on a prefix chain.
   constexpr int scan_entries = items_per_thread * num_warps;
   static_assert(scan_entries % 32 == 0, "the warp scan below consumes whole 32-entry chunks");
   src
     << "  __syncthreads();\n"
-    // Phase 2: warp 0 turns the (item, warp) counts into exclusive offsets within the tile,
-    // publishes the tile aggregate, resolves the tile's global base with the look-back, and
-    // publishes the inclusive prefix.
     << "  if (warp_in_block == 0) {\n"
     << "    uint32_t carry = 0u;\n"
     << "    #pragma unroll\n"
@@ -3730,23 +3831,14 @@ std::unique_ptr<cudf::table> evaluate_filter_sink(sirius::ast::node const& predi
     << "      s_counts[chunk * 32 + lane] = carry + incl - c;\n"
     << "      carry += __shfl_sync(0xFFFFFFFFu, incl, 31);\n"
     << "    }\n"
-    << "    uint32_t const block_count = carry;\n"
-    << "    if (lane == 0 && tile > 0) {\n"
-    << "      store_tile_state(tile_states, tile, pack_tile_state(block_count, 1ULL));\n"
-    << "    }\n"
-    << "    __syncwarp();\n"
-    << "    uint32_t const exclusive = (tile > 0) ? lookback_exclusive_prefix(tile_states, tile, "
-       "lane) : 0u;\n"
     << "    if (lane == 0) {\n"
-    << "      s_block_base = exclusive;\n"
-    << "      store_tile_state(tile_states, tile, pack_tile_state(exclusive + block_count, "
-       "2ULL));\n"
-    << "      if (tile == num_tiles - 1) { status_and_counts[1] = exclusive + block_count; }\n"
+    << "      s_block_count = carry;\n"
+    << "      if (single_tile) { status_and_counts[1] = carry; } else { tile_counts[tile] = carry; "
+       "}\n"
     << "    }\n"
     << "  }\n"
+    << "  if (!single_tile) { return; }\n"
     << "  __syncthreads();\n"
-    // Phase 3: scatter the surviving row indices in ascending order.
-    << "  uint32_t const block_base = s_block_base;\n"
     << "  #pragma unroll\n"
     << "  for (int item = 0; item < " << items_per_thread << "; ++item) {\n"
     << "    bool const survives = ((survive_bits >> item) & 1u) != 0u;\n"
@@ -3754,9 +3846,9 @@ std::unique_ptr<cudf::table> evaluate_filter_sink(sirius::ast::node const& predi
     << "    if (survives) {\n"
     << "      uint32_t const lane_rank = static_cast<uint32_t>(__popc(warp_ballot & ((1u << lane) "
        "- 1u)));\n"
-    << "      survivors[block_base + s_counts[item * " << num_warps
-    << " + warp_in_block] + "
-       "lane_rank] = tile_row0 + item * "
+    << "      survivors[s_counts[item * " << num_warps
+    << " + warp_in_block] + lane_rank] = "
+       "tile_row0 + item * "
     << block_threads << " + static_cast<int32_t>(threadIdx.x);\n"
     << "    }\n"
     << "  }\n"
@@ -3776,31 +3868,37 @@ std::unique_ptr<cudf::table> evaluate_filter_sink(sirius::ast::node const& predi
   }
   CUfunction const fn = compiled->func_for_current_device();
 
-  auto const grid_dim_x = static_cast<unsigned int>((num_rows + tile_rows - 1) / tile_rows);
+  auto const grid_dim_x  = static_cast<unsigned int>((num_rows + tile_rows - 1) / tile_rows);
+  bool const single_tile = (grid_dim_x == 1U);
 
-  // Workspace: [0] = status flags, [1] = total survivors, [2] = tile counter, [3] = padding, then
-  // one 64-bit state per tile; all zero-initialized. Survivor row indices are scattered into a
-  // scratch buffer with room for every row and copied into an exact-size column afterwards.
-  constexpr std::size_t status_words = 4;
-  std::size_t const workspace_words  = status_words + static_cast<std::size_t>(grid_dim_x) * 2U;
+  // Workspace: [0] = status flags, [1] = total survivors, then (multi-tile only) one count per
+  // tile and one ballot word per 32 rows, both fully written by the kernels. Survivor row indices
+  // are scattered into a scratch buffer with room for every row and copied into an exact-size
+  // column afterwards.
+  constexpr std::size_t status_words = 2;
+  std::size_t const num_words        = (static_cast<std::size_t>(num_rows) + 31U) / 32U;
+  std::size_t const workspace_words =
+    status_words + (single_tile ? 0U : (static_cast<std::size_t>(grid_dim_x) + num_words));
   rmm::device_uvector<std::uint32_t> d_workspace(workspace_words, stream, mr);
   rmm::device_uvector<std::int32_t> d_survivors(static_cast<std::size_t>(num_rows), stream, mr);
   std::uint32_t* status_ptr = d_workspace.data();
   simpatico::throw_if_cuda_error(
-    cudaMemsetAsync(status_ptr, 0, workspace_words * sizeof(std::uint32_t), stream.get()),
-    "cudaMemsetAsync(filter_workspace)");
-  auto* tile_states_ptr = reinterpret_cast<unsigned long long*>(d_workspace.data() + status_words);
+    cudaMemsetAsync(status_ptr, 0, status_words * sizeof(std::uint32_t), stream.get()),
+    "cudaMemsetAsync(filter_status)");
+  std::uint32_t* tile_counts_ptr  = single_tile ? nullptr : (d_workspace.data() + status_words);
+  std::uint32_t* ballots_ptr      = single_tile ? nullptr : (tile_counts_ptr + grid_dim_x);
   std::int32_t* survivors_scratch = d_survivors.data();
 
   bound_kernel_input_and_constant_args bound_args(ctx, input, stream, mr);
   std::int32_t num_rows_arg = static_cast<std::int32_t>(num_rows);
 
   std::vector<void*> kernel_args;
-  kernel_args.reserve(bound_args.in_args.size() * 5 + bound_args.const_args.size() * 3 + 4);
+  kernel_args.reserve(bound_args.in_args.size() * 5 + bound_args.const_args.size() * 3 + 5);
   bound_args.append_to_kernel_args(ctx, kernel_args);
   kernel_args.push_back(&num_rows_arg);
   kernel_args.push_back(&status_ptr);
-  kernel_args.push_back(&tile_states_ptr);
+  kernel_args.push_back(&tile_counts_ptr);
+  kernel_args.push_back(&ballots_ptr);
   kernel_args.push_back(&survivors_scratch);
 
   simpatico::throw_if_cu_error(cuLaunchKernel(fn,
@@ -3815,6 +3913,40 @@ std::unique_ptr<cudf::table> evaluate_filter_sink(sirius::ast::node const& predi
                                               kernel_args.data(),
                                               nullptr),
                                "cuLaunchKernel(sirius_nvrtc_filter_kernel)");
+
+  if (!single_tile) {
+    auto const compaction = codegen::jit::KernelCache::instance().get_or_compile_plain(
+      kFilterCompactionSource, "sirius_nvrtc_filter_scan_kernel", opts);
+    auto const scatter = codegen::jit::KernelCache::instance().get_or_compile_plain(
+      kFilterCompactionSource, "sirius_nvrtc_filter_scatter_kernel", opts);
+    std::int32_t num_tiles_arg = static_cast<std::int32_t>(grid_dim_x);
+    void* scan_args[]          = {&tile_counts_ptr, &num_tiles_arg, &status_ptr};
+    simpatico::throw_if_cu_error(cuLaunchKernel(compaction->func_for_current_device(),
+                                                1,
+                                                1,
+                                                1,
+                                                kFilterScanThreads,
+                                                1,
+                                                1,
+                                                0,
+                                                reinterpret_cast<CUstream>(stream.get()),
+                                                scan_args,
+                                                nullptr),
+                                 "cuLaunchKernel(sirius_nvrtc_filter_scan_kernel)");
+    void* scatter_args[] = {&ballots_ptr, &tile_counts_ptr, &num_rows_arg, &survivors_scratch};
+    simpatico::throw_if_cu_error(cuLaunchKernel(scatter->func_for_current_device(),
+                                                grid_dim_x,
+                                                1,
+                                                1,
+                                                block_threads,
+                                                1,
+                                                1,
+                                                0,
+                                                reinterpret_cast<CUstream>(stream.get()),
+                                                scatter_args,
+                                                nullptr),
+                                 "cuLaunchKernel(sirius_nvrtc_filter_scatter_kernel)");
+  }
 
   std::uint32_t const* const h_status = copy_status_words_from_device(status_ptr, 2U, stream);
   auto const survivor_count           = static_cast<cudf::size_type>(h_status[1]);
