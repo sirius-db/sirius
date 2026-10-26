@@ -19,13 +19,13 @@
 #include "exec/try.hpp"
 #include "log/logging.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
-#include "op/scan/iceberg_gpu_ingestible.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "scan_manager/readahead_scan_manager.hpp"
 #include "sirius_context.hpp"
 #include "transparent/read_view_registry.hpp"
 
+#include <stdexcept>
 #include <stop_token>
 #include <utility>
 
@@ -58,16 +58,26 @@ load_balancing_scan_batch_coalescer::register_pipeline(
 
 namespace {
 preparation_coordinator::job bind_preparation_unit(
-  op::scan::gpu_ingestible::metadata_scan_task_t work,
+  std::function<std::unique_ptr<op::scan::scan_info>()> work,
+  std::function<std::unique_ptr<op::scan::scan_info>(std::stop_token)> stop_work,
   std::shared_ptr<preparation_unit> unit,
   required_input_set required)
 {
-  auto stop_work = [work = std::move(work), unit, required](std::stop_token stop) {
+  auto run = [work = std::move(work), stop_work = std::move(stop_work), unit, required](
+               std::stop_token stop) mutable {
+    auto input_work = [&] {
+      if (stop_work) return stop_work(stop);
+      return work();
+    };
     try {
-      auto input       = work(stop);
+      auto input       = input_work();
       auto const& deps = input->dependencies().front();
       unit->complete_input(footer_input{deps.footer, deps.parquet_approval, deps.datasource});
-      unit->complete_input(delete_set_input{deps.delete_set});
+      if (required.test(static_cast<size_t>(required_input::visibility))) {
+        if (!deps.visibility)
+          throw std::invalid_argument("preparation worker returned no visibility artifact");
+        unit->complete_input(visibility_input{deps.visibility});
+      }
       if (required.test(static_cast<size_t>(required_input::segments)))
         unit->complete_input(segments_input{deps.profiles});
       if (required.test(static_cast<size_t>(required_input::checkpoint_iteration)))
@@ -87,7 +97,9 @@ preparation_coordinator::job bind_preparation_unit(
       throw;
     }
   };
-  return {[stop_work] { return stop_work({}); }, unit, std::move(stop_work)};
+  return {[run]() mutable { return run({}); },
+          unit,
+          [run](std::stop_token stop) mutable { return run(stop); }};
 }
 }  // namespace
 
@@ -104,31 +116,20 @@ void load_balancing_scan_batch_coalescer::register_coordinator_source(
   if (native && native->metadata_walk_pending())
     throw std::logic_error("native metadata must be prepared on the statement path before start");
 
-  auto* iceberg    = dynamic_cast<op::scan::iceberg_gpu_ingestible*>(&provider.get_ingestible());
-  auto const* bind = dynamic_cast<op::scan::iceberg_ingestible_table_info const*>(
-    &provider.get_ingestible().table_info());
-  auto deferred = iceberg && bind && bind->deferred;
-
   preparation_coordinator::source source;
   source.coalescer = slot->coalescer;
-  source.claim     = [&provider, &coordinator, iceberg, bind, deferred]()
-    -> std::optional<preparation_coordinator::job> {
+  source.claim     = [&provider, &coordinator]() -> std::optional<preparation_coordinator::job> {
     if (!provider.has_more_splits()) return {};
-    std::optional<unit_key> key;
-    if (deferred) key = iceberg->next_preparation_unit();
-    auto work = provider.next_split_provider();
-    if (!work) return {};
-    if (!key) {
-      auto stop_work = std::move(work);
-      return preparation_coordinator::job{
-        [stop_work] { return stop_work({}); }, {}, std::move(stop_work)};
-    }
-
-    auto required =
-      required_inputs(bind->read_views->entry(bind->contract_id).eligibility.later_checks, true);
-    auto unit = coordinator.admit_unit(*key, required);
+    auto claim = provider.claim_preparation();
+    if (!claim.work) return {};
+    auto work        = std::move(claim.work);
+    auto legacy_work = [work = std::move(work)] { return work({}); };
+    if (!claim.key)
+      return preparation_coordinator::job{std::move(legacy_work), {}, std::move(claim.stop_work)};
+    auto unit = coordinator.admit_unit(*claim.key, claim.required);
     if (!unit) return {};
-    return bind_preparation_unit(std::move(work), std::move(unit), required);
+    return bind_preparation_unit(
+      std::move(legacy_work), std::move(claim.stop_work), std::move(unit), claim.required);
   };
   source.construct = [slot](std::unique_ptr<op::scan::scan_info> batch) {
     auto device = slot->balancer->get_next_gpu(slot->pipeline_id);
@@ -138,10 +139,16 @@ void load_balancing_scan_batch_coalescer::register_coordinator_source(
       slot->op_id,
       device,
       op::scan::scan_operator_input::prefetch_start::deferred);
-    auto bytes   = input->get_estimated_size_in_bytes();
-    auto prepare = [raw = input.get()] { raw->initialize_prefetch(); };
-    return preparation_coordinator::publication{std::move(input), bytes, std::move(prepare)};
+    auto bytes      = input->get_estimated_size_in_bytes();
+    auto* input_ptr = input.get();
+    preparation_coordinator::publication publication{std::move(input), bytes};
+    publication.prepare = [input_ptr] {
+      static_cast<op::scan::scan_operator_input&>(*input_ptr).initialize_prefetch();
+    };
+    return publication;
   };
+  // The publication's prepare callback is installed by construct while the concrete input is
+  // still available.
   source.publish = [slot](preparation_coordinator::publication& publication) {
     slot->connector->push_split_sized(
       std::move(publication.input), publication.bytes, publication.preparation_bytes);
@@ -153,7 +160,7 @@ void load_balancing_scan_batch_coalescer::register_coordinator_source(
   source.bind_consumption = [slot](std::function<void(size_t)> callback) {
     slot->connector->set_consumption_callback(std::move(callback));
   };
-  source.can_claim = [iceberg] { return !iceberg || iceberg->can_claim_preparation(); };
+  source.can_claim = [&provider] { return provider.get_ingestible().can_claim_preparation(); };
   coordinator.add_source(std::move(source));
   slot->publication = coordinator.publication_gate();
 }
@@ -349,17 +356,16 @@ void load_balancing_scan_batch_coalescer::drain_cached_provider(
   std::size_t operator_id,
   std::shared_ptr<preparation_gate> publication)
 {
-  auto publish = [&](std::unique_ptr<op::scan::scan_operator_input> input) {
-    auto bytes                               = input->get_estimated_size_in_bytes();
-    auto* typed                              = input.get();
-    std::unique_ptr<op::operator_data> split = std::move(input);
+  auto publish = [&](std::unique_ptr<op::operator_data> split) {
+    auto bytes = split->get_estimated_size_in_bytes();
     std::unique_lock<std::mutex> gate;
     if (publication) {
       gate = std::unique_lock(publication->mutex);
       if (publication->closed) return false;
       publication->check_interrupted();
     }
-    if (typed->has_scan_metadata()) typed->initialize_prefetch();
+    auto& input = static_cast<op::scan::scan_operator_input&>(*split);
+    if (input.has_scan_metadata()) input.initialize_prefetch();
     connector.push_split_sized(std::move(split), bytes);
     return true;
   };

@@ -414,8 +414,8 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
                  "Native connector certifies type before storage metadata",
                  "[scan][certificate][integration]")
 {
-  run_ok("CREATE TABLE r2a_certified_native(i INTEGER)");
-  run_ok("CREATE TEMP TABLE r2a_unqualified_native(v DECIMAL(38,2))");
+  run_ok("CREATE TABLE scan_certified_native(i INTEGER)");
+  run_ok("CREATE TEMP TABLE scan_unqualified_native(v DECIMAL(38,2))");
   run_ok("CHECKPOINT");
   run_ok("SET gpu_execution=false");
   run_ok("BEGIN TRANSACTION READ ONLY");
@@ -435,7 +435,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     return connector->certify({}, scan, *con->context, generator.contract_provenance);
   };
 
-  auto supported = certify("r2a_certified_native");
+  auto supported = certify("scan_certified_native");
   CHECK(supported.verdict == eligibility_verdict::supported);
   REQUIRE(supported.storage_version);
   CHECK(*supported.storage_version >= static_cast<uint64_t>(duckdb::StorageVersion::V0_10_2));
@@ -443,7 +443,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   CHECK(supported.later_checks.test(static_cast<std::size_t>(later_check::segments_per_range)));
   CHECK(supported.later_checks.test(static_cast<std::size_t>(later_check::matrix_per_range)));
 
-  auto rejected = certify("r2a_unqualified_native");
+  auto rejected = certify("scan_unqualified_native");
   CHECK(rejected.verdict == eligibility_verdict::unsupported);
   CHECK(rejected.reason == verdict_reason::native_type_decimal128);
   CHECK(rejected.reason_text.find("DECIMAL128") != std::string::npos);
@@ -456,9 +456,9 @@ TEST_CASE("Scan registry verifies all six catalog functions", "[scan][contracts]
   auto con = sirius::test::g_shared_env->make_connection();
   REQUIRE_FALSE(con.Query("SET gpu_execution=false")->HasError());
   REQUIRE_FALSE(con.Query("LOAD iceberg")->HasError());
-  REQUIRE_FALSE(con.Query("CREATE TEMP TABLE r1_registry_native(id INTEGER)")->HasError());
+  REQUIRE_FALSE(con.Query("CREATE TEMP TABLE registry_native(id INTEGER)")->HasError());
   REQUIRE_FALSE(con.Query("BEGIN")->HasError());
-  auto native      = con.ExtractPlan("SELECT * FROM r1_registry_native");
+  auto native      = con.ExtractPlan("SELECT * FROM registry_native");
   auto& native_get = first_get(*native);
   REQUIRE(sirius::planner::lookup_connector(native_get, *con.context));
 
@@ -514,12 +514,12 @@ TEST_CASE("Scan registry verifies all six catalog functions", "[scan][contracts]
       REQUIRE_FALSE(sirius::planner::lookup_connector(get, *con.context));
     }
   }
-  native_get.function.SetName("r1_unknown_scan");
+  native_get.function.SetName("unregistered_test_scan");
   REQUIRE_FALSE(sirius::planner::lookup_connector(native_get, *con.context));
   registry_test_generator generator(*con.context);
   REQUIRE_THROWS_WITH(generator.create_plan(native_get),
                       Catch::Matchers::ContainsSubstring(
-                        "Table function 'r1_unknown_scan' is not supported in Sirius"));
+                        "Table function 'unregistered_test_scan' is not supported in Sirius"));
 
   REQUIRE_FALSE(con.Query("ROLLBACK")->HasError());
 }
@@ -686,10 +686,10 @@ TEST_CASE("Logical scan copy retains table index and verified source",
   auto con = sirius::test::g_shared_env->make_connection();
   REQUIRE_FALSE(con.Query("SET gpu_execution=false")->HasError());
   REQUIRE_FALSE(
-    con.Query("CREATE TEMP TABLE r1_copy_native(id INTEGER, value BIGINT)")->HasError());
-  REQUIRE_FALSE(con.Query("INSERT INTO r1_copy_native VALUES (0, 1), (10, 2)")->HasError());
+    con.Query("CREATE TEMP TABLE scan_copy_native(id INTEGER, value BIGINT)")->HasError());
+  REQUIRE_FALSE(con.Query("INSERT INTO scan_copy_native VALUES (0, 1), (10, 2)")->HasError());
   REQUIRE_FALSE(con.Query("BEGIN")->HasError());
-  auto plan        = con.ExtractPlan("SELECT value FROM r1_copy_native WHERE id > 5");
+  auto plan        = con.ExtractPlan("SELECT value FROM scan_copy_native WHERE id > 5");
   auto& get        = first_get(*plan);
   auto copy        = get.Copy(*con.context);
   auto& copied_get = copy->Cast<duckdb::LogicalGet>();
@@ -796,15 +796,15 @@ TEST_CASE("Dropping and recreating a native table changes read identity",
   REQUIRE_FALSE(con.Query("SET gpu_execution=false")->HasError());
   auto identity = [&] {
     REQUIRE_FALSE(con.Query("BEGIN")->HasError());
-    auto plan = con.ExtractPlan("SELECT * FROM r1_recreated_native");
+    auto plan = con.ExtractPlan("SELECT * FROM recreated_native");
     auto view = capture_bound_read_view(first_get(*plan), *con.context);
     REQUIRE_FALSE(con.Query("COMMIT")->HasError());
     return view;
   };
-  REQUIRE_FALSE(con.Query("CREATE TEMP TABLE r1_recreated_native(id INTEGER)")->HasError());
+  REQUIRE_FALSE(con.Query("CREATE TEMP TABLE recreated_native(id INTEGER)")->HasError());
   auto before = identity();
-  REQUIRE_FALSE(con.Query("DROP TABLE r1_recreated_native")->HasError());
-  REQUIRE_FALSE(con.Query("CREATE TEMP TABLE r1_recreated_native(id INTEGER)")->HasError());
+  REQUIRE_FALSE(con.Query("DROP TABLE recreated_native")->HasError());
+  REQUIRE_FALSE(con.Query("CREATE TEMP TABLE recreated_native(id INTEGER)")->HasError());
   auto after = identity();
   CHECK(std::get<native_table_identity>(before.identity->data_view).table_oid !=
         std::get<native_table_identity>(after.identity->data_view).table_oid);
@@ -1009,7 +1009,7 @@ TEST_CASE("Iceberg trust bootstrap load order child", "[.][registry_trust_child]
   bool const trace          = std::getenv("SIRIUS_REGISTRY_IO_TRACE") != nullptr;
   auto marker               = [&](std::string const& value) {
     if (!trace) return;
-    auto line = "R1_BOOTSTRAP " + value + "\n";
+    auto line = "REGISTRY_TRUST_BOOTSTRAP " + value + "\n";
     REQUIRE(::write(STDERR_FILENO, line.data(), line.size()) == static_cast<ssize_t>(line.size()));
   };
 
@@ -1221,10 +1221,10 @@ TEST_CASE("Scan registry first lookup child", "[.][registry_trust_child][shared_
   auto con = sirius::test::g_shared_env->make_connection();
   REQUIRE_FALSE(con.Query("SET gpu_execution=false")->HasError());
   REQUIRE_FALSE(con.Query("LOAD iceberg")->HasError());
-  REQUIRE_FALSE(con.Query("CREATE TEMP TABLE r1_replacement_native(id INTEGER)")->HasError());
-  REQUIRE_FALSE(con.Query("INSERT INTO r1_replacement_native VALUES (1)")->HasError());
+  REQUIRE_FALSE(con.Query("CREATE TEMP TABLE replacement_native(id INTEGER)")->HasError());
+  REQUIRE_FALSE(con.Query("INSERT INTO replacement_native VALUES (1)")->HasError());
   REQUIRE_FALSE(con.Query("BEGIN")->HasError());
-  auto native       = con.ExtractPlan("SELECT * FROM r1_replacement_native");
+  auto native       = con.ExtractPlan("SELECT * FROM replacement_native");
   replacement_table = &first_get(*native).bind_data->Cast<duckdb::TableScanBindData>().table;
   duckdb::ExtensionLoader loader(*con.context->db, "registry_replacement_test");
   for (auto const& source : sirius::planner::registered_connectors()) {

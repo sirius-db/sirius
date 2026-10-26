@@ -32,6 +32,7 @@
 #include "expression/ast/node.hpp"
 #include "expression/ast/reference.hpp"
 #include "expression/join_condition.hpp"
+#include "helper/type_conversions.hpp"
 #include "op/dynamic_filter/dynamic_filter_publish_plan.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/scan/sirius_physical_dynamic_filter.hpp"
@@ -67,6 +68,7 @@
 #include <duckdb/planner/filter/expression_filter.hpp>
 #include <duckdb/planner/operator/logical_dummy_scan.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
+#include <duckdb/planner/operator/logical_set_operation.hpp>
 #include <duckdb/planner/planner.hpp>
 #include <unistd.h>
 
@@ -74,6 +76,7 @@
 #include <cstdio>
 #include <exception>
 #include <filesystem>
+#include <span>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -332,6 +335,33 @@ void require_delim_join_common(sirius::op::sirius_physical_delim_join& delim)
   REQUIRE(delim.join->children.size() == 2);
   require_join_child_wrap(delim.join->children[0].get(), delim.join.get(), /*is_build=*/false);
   require_join_child_wrap(delim.join->children[1].get(), delim.join.get(), /*is_build=*/true);
+}
+
+/// The chain every supported DISTINCT shape shares: one HASH_GROUP_BY with an empty aggregate
+/// list, wrapped as insert_gpu_pipeline_operators wraps a GROUP BY. Returns the HASH_GROUP_BY so
+/// each caller can assert its own key layout.
+sirius::op::sirius_physical_grouped_aggregate* require_distinct_wrap_chain(
+  sirius_physical_operator* plan)
+{
+  auto* merge = find_first(plan, SiriusPhysicalOperatorType::MERGE_GROUP_BY);
+  REQUIRE(merge != nullptr);
+  REQUIRE(merge->children.size() == 1);
+
+  auto* partition = merge->children[0].get();
+  REQUIRE(partition->type == SiriusPhysicalOperatorType::PARTITION);
+  CHECK(partition->Cast<sirius::op::sirius_physical_partition>().exchange() != nullptr);
+  REQUIRE(partition->children.size() == 1);
+
+  auto* hgb = partition->children[0].get();
+  REQUIRE(hgb->type == SiriusPhysicalOperatorType::HASH_GROUP_BY);
+  auto& aggregate = hgb->Cast<sirius::op::sirius_physical_grouped_aggregate>();
+  CHECK(aggregate.aggregate_slots.empty());
+  CHECK(aggregate.cudf_aggregates.empty());
+  CHECK(aggregate.cudf_aggregate_idx.empty());
+  CHECK_FALSE(aggregate.has_avg);
+  CHECK_FALSE(aggregate.has_count_distinct);
+  CHECK(aggregate.grouping_sets.empty());
+  return &aggregate;
 }
 
 class dynamic_filter_switch_guard {
@@ -1384,31 +1414,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "plan tree shape - DISTINCT lowers to a zero-aggregate grouped aggregate",
                  "[plan_tree_shape][isolated_context]")
 {
-  // The chain every supported DISTINCT shape shares: one HASH_GROUP_BY with an empty aggregate
-  // list, wrapped as insert_gpu_pipeline_operators wraps a GROUP BY. Returns the HASH_GROUP_BY so
-  // each section can assert its own key layout.
-  auto require_distinct_wrap_chain = [](sirius_physical_operator* plan) {
-    auto* merge = find_first(plan, SiriusPhysicalOperatorType::MERGE_GROUP_BY);
-    REQUIRE(merge != nullptr);
-    REQUIRE(merge->children.size() == 1);
-
-    auto* partition = merge->children[0].get();
-    REQUIRE(partition->type == SiriusPhysicalOperatorType::PARTITION);
-    CHECK(partition->Cast<sirius::op::sirius_physical_partition>().exchange() != nullptr);
-    REQUIRE(partition->children.size() == 1);
-
-    auto* hgb = partition->children[0].get();
-    REQUIRE(hgb->type == SiriusPhysicalOperatorType::HASH_GROUP_BY);
-    auto& aggregate = hgb->Cast<sirius::op::sirius_physical_grouped_aggregate>();
-    CHECK(aggregate.aggregate_slots.empty());
-    CHECK(aggregate.cudf_aggregates.empty());
-    CHECK(aggregate.cudf_aggregate_idx.empty());
-    CHECK_FALSE(aggregate.has_avg);
-    CHECK_FALSE(aggregate.has_count_distinct);
-    CHECK(aggregate.grouping_sets.empty());
-    return &aggregate;
-  };
-
   SECTION("plain DISTINCT keys the whole row in order and needs no projection")
   {
     auto plan = generate_sirius_plan(*con, "SELECT DISTINCT id, val FROM big_left");
@@ -1847,6 +1852,26 @@ TEST_CASE("planned_aggregate_type narrows HUGEINT only", "[plan_tree_shape]")
         LogicalType::DECIMAL(38, 0));
 }
 
+TEST_CASE("require_planned_schema accepts the declared type or its aggregate narrowing",
+          "[plan_tree_shape]")
+{
+  using generator    = sirius::planner::sirius_physical_plan_generator;
+  auto const bigint  = sirius::from_duckdb(LogicalType::BIGINT);
+  auto const hugeint = sirius::from_duckdb(LogicalType::HUGEINT);
+  auto const integer = sirius::from_duckdb(LogicalType::INTEGER);
+  auto require       = [](sirius::logical_type const& planned, LogicalType const& declared) {
+    generator::require_planned_schema(std::span{&planned, 1}, {declared}, "probe");
+  };
+  CHECK_NOTHROW(require(hugeint, LogicalType::HUGEINT));
+  CHECK_NOTHROW(require(bigint, LogicalType::HUGEINT));
+  CHECK_NOTHROW(require(bigint, LogicalType::BIGINT));
+  CHECK_THROWS_WITH(require(hugeint, LogicalType::BIGINT),
+                    Catch::Matchers::ContainsSubstring("probe: the planned input has"));
+  CHECK_THROWS_AS(require(integer, LogicalType::BIGINT), duckdb::NotImplementedException);
+  CHECK_THROWS_WITH(generator::require_planned_schema(std::span{&bigint, 1}, {}, "probe"),
+                    Catch::Matchers::ContainsSubstring("has 1 column but the node declares 0"));
+}
+
 //===----------------------------------------------------------------------===//
 // Wrap-time physical-sidecar copies (compressed materialization)
 //===----------------------------------------------------------------------===//
@@ -2226,7 +2251,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
 TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "plan tree shape - UNION arm sinks declare the union's schema, not the arm's",
-                 "[plan_tree_shape][union_all][isolated_context]")
+                 "[plan_tree_shape][union][union_all][isolated_context]")
 {
   // CTE results and UNION arm sinks use the consumer schema, even when materialization
   // stores a different number of columns.
@@ -2267,6 +2292,83 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   require_sinks_match_union(
     "(WITH m AS MATERIALIZED (SELECT rid FROM small_right) SELECT rid, rid * 2 FROM m) "
     "UNION ALL SELECT id, id * 2 FROM big_left");
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - distinct UNION deduplicates directly over the native UNION",
+                 "[plan_tree_shape][union][isolated_context]")
+{
+  auto plan =
+    generate_sirius_plan(*con, "SELECT id FROM big_left UNION SELECT rid FROM small_right");
+  INFO(tree_to_string(plan.get()));
+
+  auto* aggregate = require_distinct_wrap_chain(plan.get());
+  CHECK(aggregate->group_idx == std::vector<int>{0});
+  // DuckDB v2 plans an identity projection between the DISTINCT and the union, but
+  // create_plan(LogicalProjection&) elides it, so nothing sits between the dedup and the union.
+  REQUIRE(aggregate->children.size() == 1);
+  auto* union_op = aggregate->children[0].get();
+  REQUIRE(union_op->type == SiriusPhysicalOperatorType::UNION);
+  REQUIRE(union_op->children.size() == 2);
+  for (auto& arm : union_op->children) {
+    CHECK(arm->type == SiriusPhysicalOperatorType::PASSTHROUGH_SINK);
+  }
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - a non-recursive WITH RECURSIVE UNION dedups over the union",
+                 "[plan_tree_shape][union][isolated_context]")
+{
+  auto plan = generate_sirius_plan(
+    *con,
+    "WITH RECURSIVE c AS (SELECT id FROM big_left UNION SELECT rid FROM small_right) "
+    "SELECT * FROM c");
+  INFO(tree_to_string(plan.get()));
+
+  auto* aggregate = require_distinct_wrap_chain(plan.get());
+  CHECK(aggregate->group_idx == std::vector<int>{0});
+  REQUIRE(aggregate->children.size() == 1);
+  CHECK(aggregate->children[0]->type == SiriusPhysicalOperatorType::UNION);
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - a UNION arm planning another type than the union declares is "
+                 "rejected",
+                 "[plan_tree_shape][union][isolated_context]")
+{
+  // An aggregate arm plans BIGINT under the union's declared HUGEINT; that narrowing is allowed.
+  REQUIRE_NOTHROW(generate_sirius_plan(
+    *con, "SELECT sum(id) FROM big_left UNION ALL SELECT sum(rid) FROM small_right"));
+
+  // No SQL yields any other mismatch, so declare a type both INTEGER arms disagree with.
+  auto begin = con->Query("BEGIN TRANSACTION");
+  REQUIRE(begin);
+  REQUIRE_FALSE(begin->HasError());
+  auto logical = con->ExtractPlan("SELECT id FROM big_left UNION ALL SELECT rid FROM small_right");
+  REQUIRE(logical);
+  logical->ResolveOperatorTypes();
+  ColumnBindingResolver resolver;
+  resolver.VisitOperator(*logical);
+  auto* set_operation = logical.get();
+  while (set_operation->type != duckdb::LogicalOperatorType::LOGICAL_UNION) {
+    REQUIRE(set_operation->children.size() == 1);
+    set_operation = set_operation->children.front().get();
+  }
+  REQUIRE(set_operation->types.size() == 1);
+  REQUIRE(set_operation->types[0] == duckdb::LogicalType::INTEGER);
+  set_operation->types[0] = duckdb::LogicalType::DOUBLE;
+
+  // The public entry point re-resolves types, which would undo the edit; plan the union itself.
+  struct probe_generator : sirius::planner::sirius_physical_plan_generator {
+    using sirius_physical_plan_generator::create_plan;
+    using sirius_physical_plan_generator::sirius_physical_plan_generator;
+  } generator(*con->context);
+  CHECK_THROWS_WITH(generator.create_plan(set_operation->Cast<duckdb::LogicalSetOperation>()),
+                    Catch::Matchers::ContainsSubstring("UNION arm 0: the planned input has") &&
+                      Catch::Matchers::ContainsSubstring("for column 0 but the node declares"));
+  auto rollback = con->Query("ROLLBACK");
+  REQUIRE(rollback);
+  REQUIRE_FALSE(rollback->HasError());
 }
 
 namespace {

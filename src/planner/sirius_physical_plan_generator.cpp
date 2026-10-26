@@ -30,6 +30,9 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/query_profiler.hpp"
 #include "duckdb/main/settings.hpp"
+#include "duckdb/parser/expression/cast_expression.hpp"
+#include "duckdb/parser/expression/constant_expression.hpp"
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/list.hpp"
@@ -390,6 +393,49 @@ std::unique_ptr<sirius::op::scan::iceberg_ingestible_table_info> build_iceberg_t
       info->physical_schema = std::move(schema);
   }
 
+  // Preserve the bound Iceberg field-ID/default contract for files whose physical
+  // schema is an older or newer snapshot.  Only constant defaults are admitted to
+  // the GPU mapper; expression defaults remain on the ordinary fallback path.
+  if (iceberg_flat_mapping_supported(scan_op.bind_data.get())) {
+    auto const& bind    = scan_op.bind_data->Cast<duckdb::MultiFileBindData>();
+    auto const& columns = bind.reader_bind.schema.empty() ? bind.columns : bind.reader_bind.schema;
+    std::vector<sirius::op::scan::field_requirement> requirements;
+    requirements.reserve(info->names.size());
+    for (std::size_t p = 0; p < info->names.size(); ++p) {
+      auto found = std::find_if(columns.begin(), columns.end(), [&](auto const& column) {
+        return column.name == info->names[p] &&
+               (!column.children.empty() ||
+                column.type == sirius::to_duckdb(info->returned_types.at(p)));
+      });
+      if (found == columns.end()) {
+        requirements.clear();
+        break;
+      }
+      if (!found->children.empty()) {
+        // Keep the bound slot and exact type: Sirius nested types cannot round-trip
+        // through to_duckdb. The mapper rejects this field if the scan needs it.
+        requirements.push_back({found->GetIdentifierFieldId(), found->type, std::nullopt});
+        continue;
+      }
+      std::optional<duckdb::Value> missing;
+      if (found->default_expression) {
+        auto const* expression = found->default_expression.get();
+        while (auto const* cast = dynamic_cast<duckdb::CastExpression const*>(expression))
+          expression = &cast->Child();
+        auto const* constant = dynamic_cast<duckdb::ConstantExpression const*>(expression);
+        if (!constant) {
+          requirements.clear();
+          break;
+        }
+        missing = constant->GetLiteral().ToValue().DefaultCastAs(found->type, true);
+      }
+      requirements.push_back(
+        {found->GetIdentifierFieldId(), found->type, std::move(missing), true, true});
+    }
+    if (requirements.size() == info->names.size())
+      info->field_mapping_requirements = std::move(requirements);
+  }
+
   if (scan_op.parameters.empty() || scan_op.parameters.front().IsNull()) {
     throw duckdb::NotImplementedException("iceberg_scan has no table path parameter");
   }
@@ -425,6 +471,9 @@ std::unique_ptr<sirius::op::scan::iceberg_ingestible_table_info> build_iceberg_t
   }
   auto inventory = std::move(*scan_op.delete_inventory);
   scan_op.delete_inventory.reset();
+  if (info->field_mapping_requirements)
+    info->files_without_partition_values =
+      sirius::op::scan::iceberg_files_without_partition_values(context, inventory);
   auto discovery =
     sirius::op::scan::discover_from_manifests(context, info->table_path, std::move(inventory));
   if (supplied_discovery)
@@ -1613,7 +1662,7 @@ void wrap_join(sirius::op::sirius_physical_operator& join_op,
 }
 
 //! Terminate one UNION arm with a `PASSTHROUGH_SINK`. Where a join arm needs `PARTITION -> CONCAT`
-//! (a shuffle plus a coalesce), a bag union needs neither, so one operator does the whole job: it
+//! (a shuffle plus a coalesce), a union needs neither, so one operator does the whole job: it
 //! forwards each batch unchanged and unpartitioned into UNION's `"union_{child_idx}"` port, which
 //! keeps every batch on the GPU its scan produced it on. The sink owns that port name — the wiring
 //! descriptor and the upstream `next_port_info` both retain a `string_view` into it.
@@ -2393,12 +2442,9 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalOperator& op)
       // plan = create_plan(op.Cast<duckdb::LogicalPositionalJoin>());
       break;
     case duckdb::LogicalOperatorType::LOGICAL_UNION:
-      // UNION ALL only; the builder rejects distinct UNION and ordered arms.
-      plan = create_plan(op.Cast<duckdb::LogicalSetOperation>());
-      break;
     case duckdb::LogicalOperatorType::LOGICAL_EXCEPT:
     case duckdb::LogicalOperatorType::LOGICAL_INTERSECT:
-      throw duckdb::NotImplementedException("Set operation (EXCEPT/INTERSECT) not supported");
+      plan = create_plan(op.Cast<duckdb::LogicalSetOperation>());
       break;
     case duckdb::LogicalOperatorType::LOGICAL_INSERT:
       throw duckdb::NotImplementedException("Insert not supported");

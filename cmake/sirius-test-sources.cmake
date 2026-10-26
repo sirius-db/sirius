@@ -127,7 +127,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_tpch_havoc.cpp
     test/cpp/integration/test_gpu_execution_tpch_mgpu_audit.cpp
     test/cpp/integration/test_gpu_execution_unique_join.cpp
-    test/cpp/integration/test_gpu_execution_union_all.cpp
+    test/cpp/integration/test_gpu_execution_union.cpp
     test/cpp/integration/test_gpu_execution_unfolded_constants.cpp
     test/cpp/integration/test_gpu_execution_vector_search.cpp
     test/cpp/integration/test_pin_registry_epoch.cpp
@@ -319,6 +319,8 @@ set(TEST_SOURCES
     test/cpp/scan/test_parquet_schema_mapping.cpp
     test/cpp/scan/test_parquet_null_count_pruning.cpp
     test/cpp/scan/test_residual_filter.cpp
+    test/cpp/scan/test_scan_materialization.cpp
+    test/cpp/scan/test_arrow_import_resources.cpp
     test/cpp/scan/test_scan_filter_cast_ranges.cpp
     test/cpp/scan/test_scan_filter_ranges.cpp
     test/cpp/scan/test_parquet_scan_sizing.cpp

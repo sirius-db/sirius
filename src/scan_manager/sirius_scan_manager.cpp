@@ -1822,8 +1822,6 @@ void sirius_scan_manager::prepare_for_query(
   // The rides that DID install, so a rider can be argued against the scan that
   // owns the port it would join.
   std::vector<installed_ride> installed_rides;
-  auto const gpu_space_count =
-    _reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU).size();
   // A port carries one ride, and the scan that installs there first owns it: a later scan whose
   // bundle lands at the same port can only ride along. Visit the scans whose own bundle would save
   // the most (bytes per row times port crossings) first, so the plan's value decides who owns the
@@ -1864,6 +1862,8 @@ void sirius_scan_manager::prepare_for_query(
   };
   std::vector<provider_inputs> provider_inputs_by_assignment;
   provider_inputs_by_assignment.reserve(cached_assignments.size());
+  auto const gpu_space_count =
+    _reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU).size();
   for (auto& assignment : cached_assignments) {
     mvcc_chunk_mask_set masks;  // stays empty for parquet pins
     std::vector<insert_delta_split> delta_splits;
@@ -2050,19 +2050,15 @@ void sirius_scan_manager::start_metadata_processing(query_scan_manager_state& st
   std::shared_ptr<preparation_admission> admission;
   for (auto const& entry : state.scans) {
     auto& ingestible = entry.op->get_ingestible();
-    auto const* info =
-      dynamic_cast<op::scan::iceberg_ingestible_table_info const*>(&ingestible.table_info());
-    if (!info || !info->deferred) continue;
+    auto candidate   = ingestible.preparation_admission();
+    if (!candidate) continue;
     if (!admission) {
-      admission    = info->deferred->admission();
+      admission    = std::move(candidate);
       state.ledger = admission->consume();
-    } else if (admission != info->deferred->admission()) {
-      throw std::logic_error("Iceberg scans must share the statement admission");
+    } else if (admission != candidate) {
+      throw std::logic_error("deferred scans must share the statement admission");
     }
-    auto* iceberg = dynamic_cast<op::scan::iceberg_gpu_ingestible*>(&ingestible);
-    if (!iceberg) throw std::logic_error("deferred DV preparation requires an Iceberg ingestible");
-    iceberg->begin_preparation(
-      std::make_shared<op::scan::iceberg_dv_attempt>(info->deferred, state.ledger));
+    ingestible.attach_preparation_ledger(state.ledger);
   }
   state.coordinator = std::make_unique<preparation_coordinator>(
     *state.completion, *state.dispatcher, state.preparation);
@@ -2370,9 +2366,11 @@ void sirius_scan_manager::query_scan_manager_state::drain() noexcept
   if (readahead) { readahead->stop(); }
   readahead.reset();
   if (ledger) ledger->close();
-  for (auto const& entry : scans)
-    if (auto* ice = dynamic_cast<op::scan::iceberg_gpu_ingestible*>(&entry.op->get_ingestible()))
-      ice->stop_preparation();
+  // Stop while asynchronous work is drained. Final adapter cleanup runs after
+  // the query-wide work barrier, since it may release plan-backed descriptors.
+  for (auto const& entry : scans) {
+    entry.op->get_ingestible().stop_preparation();
+  }
   ledger.reset();
 }
 
@@ -2387,6 +2385,15 @@ std::shared_ptr<sirius_scan_manager::query_scan_manager_state> sirius_scan_manag
 void sirius_scan_manager::quiesce(sirius::query_id_t query_id)
 {
   if (auto state = get_query_state(query_id)) { state->drain(); }
+}
+
+void sirius_scan_manager::finish_preparation(sirius::query_id_t query_id) noexcept
+{
+  if (auto state = get_query_state(query_id)) {
+    for (auto const& entry : state->scans) {
+      entry.op->get_ingestible().finish_preparation();
+    }
+  }
 }
 
 void sirius_scan_manager::reset(sirius::query_id_t query_id)
@@ -2711,19 +2718,9 @@ std::vector<std::size_t> cache_entry_info::can_serve_with_columns(
   // serves a duckdb scan over the same catalog.schema.table. A cache of one format
   // never serves a scan of the other — the identity check below falls through (a
   // duckdb cache has empty resolved_file_paths; a parquet cache has an empty table_name).
-  // An iceberg scan carrying deletes is NOT a parquet scan over the same files, even though its
-  // bind data derives from parquet's and its file set matches exactly. A pinned entry holds the
-  // data files' rows as written; the deletes live in manifests the pin never saw. Serving that
-  // cache would return rows the table logically deleted, and would look like a cache hit rather
-  // than a correctness bug — so an iceberg scan with deletes always reads from disk.
-  if (auto const* ice = dynamic_cast<op::scan::iceberg_ingestible_table_info const*>(&other)) {
-    if (ice->deferred || (ice->delete_data && !ice->delete_data->empty()) ||
-        (ice->delete_sets && std::ranges::any_of(*ice->delete_sets, [](auto const& e) {
-           return !e.second || !e.second->positions.empty();
-         }))) {
-      return {};
-    }
-  }
+  // The adapter owns visibility semantics.  A source with deletes, overlays,
+  // or other row-level state absent from the pinned entry vetoes reuse here.
+  if (!other.allows_cached_rows()) return {};
   if (auto const* p = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(&other)) {
     // Cached parquet batches have no per-row file provenance.
     if (p->has_requested_user_virtual_columns()) { return {}; }
@@ -3366,9 +3363,8 @@ std::size_t sirius_scan_manager::pin_parquet_ranges(
 
   std::size_t total_bytes = 0;
   for (auto const& path : file_paths) {
-    auto const cache_key     = normalize_path(path);
     auto const io_ctx        = ioctx_for_path(path);
-    bool const footer_cached = io_ctx && io_ctx->metadata_store().has_path(cache_key);
+    auto const footer_cached = io_ctx && io_ctx->metadata_store().has_path(path);
     auto datasource          = create_datasource(
       path,
       footer_cached ? sirius::io::open_hint::generic : sirius::io::open_hint::parquet_footer_probe);
@@ -3380,8 +3376,15 @@ std::size_t sirius_scan_manager::pin_parquet_ranges(
     // file is parsed at most once per process however it is first touched.
     auto const probe_options     = cudf::io::parquet_reader_options::builder().build();
     auto const expected_identity = datasource->get_io_object().identity_cache_key();
-    auto const resolution =
+    auto resolution =
       op::scan::resolve_parquet_metadata_with_identity(*datasource, 0, path, probe_options);
+    if (resolution.identity != expected_identity) {
+      // A stale local footer from a previous open must never poison a pin. Clear the
+      // backend's metadata generation and retry once after observing the new object.
+      if (io_ctx) io_ctx->metadata_store().invalidate(datasource->get_io_object().object_path());
+      resolution =
+        op::scan::resolve_parquet_metadata_with_identity(*datasource, 0, path, probe_options);
+    }
     if (resolution.identity != expected_identity) {
       if (_physical_counters)
         _physical_counters->metadata_provenance_mismatches.fetch_add(1, std::memory_order_relaxed);

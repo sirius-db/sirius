@@ -571,6 +571,7 @@ class sirius_scan_manager {
   /// mutex, so another connection's prepare_for_query is never parked behind it.
   // Stop producers while retaining providers/buffers until downstream retirement.
   void quiesce(sirius::query_id_t query_id);
+  void finish_preparation(sirius::query_id_t query_id) noexcept;
   void reset(sirius::query_id_t query_id);
 
   /// Drain and drop this query's scan work while retaining checkpoint protection.
