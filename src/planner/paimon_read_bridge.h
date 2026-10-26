@@ -55,6 +55,9 @@ struct PaimonBoundReadViewV1 {
   const struct PaimonReadOption* options;
 };
 
+/* Callbacks with error/error_capacity accept (NULL, 0) to omit diagnostics.
+ * Status and output-ownership rules still apply when diagnostics are omitted. */
+
 /* Descriptor-only interface. Exact V1 does not authorize planning, reading or replay. */
 struct PaimonReadBridgeV1 {
   uint64_t magic;

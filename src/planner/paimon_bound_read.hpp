@@ -35,6 +35,8 @@ class paimon_read_provider {
  public:
   // Uses only an already-loaded, ABI-checked dynamic Paimon extension. Trust comes
   // from independent registration in a private CPU catalog, not the caller's catalog.
+  // The provider must support repeated initialization into fresh database instances
+  // without invalidating existing registrations, bindings or retained descriptors.
   // Acquire once per provider; later LOADs require a new acquisition.
   static paimon_read_provider from_loaded(duckdb::DatabaseInstance&);
 

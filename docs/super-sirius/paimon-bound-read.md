@@ -11,12 +11,18 @@ loaded module; a symbol resolved from a dependency is refused. The acquired modu
 reference stays alive until all trusted function definitions and retained descriptors
 are released. Function-info destructors run before module release.
 
+Each acquisition invokes the initializer again in a fresh database instance. A supported
+provider must allow repeated initialization without invalidating existing registrations,
+bindings or retained descriptors, and must preserve its module-local bridge-info singleton.
+
 `retain()` compares the complete semantic callback/signature/settings surface, using the
 same comparison as the existing scan registry, and the exact shared function-info
 singleton **before** interpreting the public wrapper. It then checks descriptor ABI and
 required callback provenance, asks the producer to accept the live binding, and retains
 and validates its description. Failed and partial outputs are released using the
-producer's allocator. Provider diagnostic buffers are not copied into errors.
+producer's allocator. The consumer passes a null diagnostic buffer with zero capacity;
+the provider must accept that pair and preserve the status and output-ownership contract.
+Provider diagnostic buffers are not copied into errors.
 
 The descriptor owns its borrowed view and retains the provider independently of the
 original binding, provider wrapper, connection, and database. Moving an owner invalidates
