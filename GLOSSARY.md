@@ -41,5 +41,5 @@ A mapping of an operator's working state across GPU Thread-Private Registers (TP
 _Avoid_: Cache hierarchy, memory placement
 
 **Sparse-to-Dense Compaction**:
-An intra-kernel write schedule (warp-level ballot/ranking, block-level shared-memory prefix sum over a multi-row tile, and a decoupled look-back over preceding tiles for the global offset) that writes variable-cardinality surviving tuples contiguously into HBM in ascending row order, in a single pass and without a separate compaction kernel.
+The filter write schedule that writes variable-cardinality surviving tuples contiguously into HBM in ascending row order: warp-level ballot/ranking and a block-level shared-memory prefix sum within a multi-row tile. A one-tile batch scatters directly from the predicate kernel; a larger batch publishes per-tile survivor counts and per-warp ballot words, scans the counts in one block, and scatters with a third kernel.
 _Avoid_: Stream compaction, two-pass filter, densification pass

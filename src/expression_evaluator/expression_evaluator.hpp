@@ -478,8 +478,8 @@ class expression_evaluator {
     std::span<sirius::ast::node const* const> expressions);
 
   // Attempt to evaluate a single boolean filter predicate via the NVRTC_JIT FilterSink kernel
-  // (using TQP++ 3-tier Sparse-to-Dense Compaction), pre-evaluating any in-tree Materialization
-  // Boundaries into synthetic input columns.
+  // (using Sparse-to-Dense Compaction), pre-evaluating any in-tree Materialization Boundaries
+  // into synthetic input columns.
   std::optional<std::unique_ptr<cudf::table>> try_select_nvrtc_with_boundaries(
     cudf::table_view input,
     cudf::table_view projected_input,

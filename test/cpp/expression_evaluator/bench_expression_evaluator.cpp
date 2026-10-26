@@ -28,14 +28,19 @@
 //   SIRIUS_EXPR_BENCH_WARMUP      minimum warmup iterations after the cold call (default 3)
 //   SIRIUS_EXPR_BENCH_WARMUP_MS   minimum warmup wall time in ms (default 300)
 //   SIRIUS_EXPR_BENCH_VERIFY      1 (default) compares every strategy's result checksum against
-//                                 MATERIALIZE; 0 disables the host readback
+//                                 the first listed strategy (`ref`; `noref` when it failed);
+//                                 0 disables the host readback
 //   SIRIUS_EXPR_BENCH_CSV         append one CSV row per measurement to this file
 //
-// Each measurement reports the cold first call (includes JIT compilation for the JIT
-// strategies), then the median and minimum wall time of a steady-state call. Wall time includes
-// the host-side synchronizations the evaluators perform internally plus one stream sync.
+// Each measurement reports the cold first call, then the median and minimum wall time of a
+// steady-state call. For NVRTC_JIT the cold call is a full compile: the in-memory kernel cache
+// is cleared before it and the disk cache is disabled. For AST_JIT only the first use of each
+// distinct cuDF kernel in the process compiles (cuDF's in-memory cache cannot be cleared; its
+// disk cache is pointed at a fresh temporary directory). Wall time includes the host-side
+// synchronizations the evaluators perform internally plus one stream sync.
 //===----------------------------------------------------------------------===//
 
+#include "codegen/jit/kernel_cache.hpp"
 #include "expression_evaluator/ast_test_support.hpp"
 
 #include <cudf/column/column.hpp>
@@ -71,6 +76,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <memory>
@@ -135,9 +141,10 @@ rmm::device_buffer upload_mask(std::vector<bool> const& valids,
                                rmm::device_async_resource_ref mr,
                                cudf::size_type& null_count)
 {
-  auto const n     = static_cast<cudf::size_type>(valids.size());
-  auto const words = cudf::num_bitmask_words(n);
-  std::vector<cudf::bitmask_type> host(words, 0);
+  auto const n = static_cast<cudf::size_type>(valids.size());
+  // cuDF requires null masks padded to a 64-byte multiple, not just to whole words.
+  auto const bytes = cudf::bitmask_allocation_size_bytes(n);
+  std::vector<cudf::bitmask_type> host(bytes / sizeof(cudf::bitmask_type), 0);
   null_count = 0;
   for (cudf::size_type i = 0; i < n; ++i) {
     if (valids[i]) {
@@ -146,7 +153,7 @@ rmm::device_buffer upload_mask(std::vector<bool> const& valids,
       ++null_count;
     }
   }
-  return rmm::device_buffer(host.data(), words * sizeof(cudf::bitmask_type), stream, mr);
+  return rmm::device_buffer(host.data(), bytes, stream, mr);
 }
 
 template <typename T>
@@ -572,6 +579,9 @@ measurement run_case(bench_case const& bc,
   nvtx3::scoped_range case_range{bc.name + "/" + std::string(sirius::strategy_to_string(strategy))};
   {
     nvtx3::scoped_range cold_range{"cold"};
+    // The process-wide kernel cache would otherwise serve a kernel compiled for an earlier case
+    // or row count with the same generated source.
+    if (strategy == strategy_t::NVRTC_JIT) { codegen::jit::KernelCache::instance().clear(); }
     double const t0 = now_ms();
     auto out        = run_once();
     m.cold_ms       = now_ms() - t0;
@@ -606,8 +616,26 @@ char const* strategy_name(strategy_t s) { return sirius::strategy_to_string(s).d
 
 TEST_CASE("bench expression evaluator strategies", "[!benchmark][expr_bench]")
 {
-  // The on-disk JIT cache would hide compile time in the cold measurement.
+  // The on-disk JIT caches would hide compile time in the cold measurement.
   setenv("SIMPATICO_JIT_CACHE_DIR", "off", /*overwrite=*/0);
+  std::filesystem::path cudf_cache_dir;
+  if (std::getenv("LIBCUDF_KERNEL_CACHE_PATH") == nullptr) {
+    std::string tmpl = (std::filesystem::temp_directory_path() / "expr_bench_cudf_XXXXXX").string();
+    char* const made = mkdtemp(tmpl.data());
+    REQUIRE(made != nullptr);
+    cudf_cache_dir = made;
+    setenv("LIBCUDF_KERNEL_CACHE_PATH", made, /*overwrite=*/1);
+  }
+  struct cache_dir_cleanup {
+    std::filesystem::path dir;
+    ~cache_dir_cleanup()
+    {
+      if (!dir.empty()) {
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+      }
+    }
+  } const remove_cudf_cache_dir{cudf_cache_dir};
 
   auto const row_list      = split_csv(env_or("SIRIUS_EXPR_BENCH_ROWS", "1048576,16777216"));
   auto const strategy_list = split_csv(
@@ -678,6 +706,7 @@ TEST_CASE("bench expression evaluator strategies", "[!benchmark][expr_bench]")
         }
       }
 
+      // The first listed strategy is the reference.
       std::optional<std::uint64_t> reference_checksum;
       for (auto const strategy : strategies) {
         measurement m;
@@ -695,9 +724,11 @@ TEST_CASE("bench expression evaluator strategies", "[!benchmark][expr_bench]")
         }
         std::string match = "-";
         if (verify) {
-          if (!reference_checksum) {
+          if (strategy == strategies.front()) {
             reference_checksum = m.checksum;
             match              = "ref";
+          } else if (!reference_checksum) {
+            match = "noref";
           } else {
             match = (*reference_checksum == m.checksum) ? "match" : "MISMATCH";
           }

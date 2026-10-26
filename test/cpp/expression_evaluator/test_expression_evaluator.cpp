@@ -5705,10 +5705,10 @@ TEST_CASE("nvrtc_jit - temporal extraction and date_trunc match MATERIALIZE and 
     // -365:   1969-01-01
     // plus NULL, +/-infinity, and narrowed INT16 DATE carrier
     std::vector<std::int32_t> date_vals = {
-      -25509, -365, -1, 0, 11016, 19782, -date_inf, date_inf, 100};
-    std::vector<bool> valids = {true, true, true, true, true, true, true, true, false};
+      -25509, -365, -1, 0, 11016, 19782, -date_inf, date_inf, 100, 42};
+    std::vector<bool> valids = {true, true, true, true, true, true, true, true, false, true};
 
-    // Sub-day timestamps (9 rows matching valids):
+    // Sub-day timestamps (10 rows matching valids):
     // Row 0: pre-epoch exact day boundary (-25509 * 86400s = 1900-02-28 00:00:00)
     // Row 1: pre-epoch mid-day (-1 tick before epoch: 1969-12-31 23:59:59...)
     // Row 2: pre-epoch with subseconds (-86400 - 3723.040523s = 1969-12-30 22:57:56.959477)
@@ -5718,6 +5718,8 @@ TEST_CASE("nvrtc_jit - temporal extraction and date_trunc match MATERIALIZE and 
     // Row 6: ts_min (minimum finite int64)
     // Row 7: ts_inf (+infinity)
     // Row 8: NULL (-ts_inf payload)
+    // Row 9: the other infinity for the s/ms columns, whose day count wraps the 32-bit day
+    //        count and leaves the time since midnight negative
     std::vector<std::int64_t> ts_s_vals  = {-25509LL * 86400LL,
                                             -1LL,
                                             -86400LL - 3723LL,
@@ -5726,6 +5728,7 @@ TEST_CASE("nvrtc_jit - temporal extraction and date_trunc match MATERIALIZE and 
                                             19782LL * 86400LL + 86399LL,
                                             -2000LL * 365LL * 86400LL - 12345LL,
                                             ts_inf,
+                                            -ts_inf,
                                             -ts_inf};
     std::vector<std::int64_t> ts_ms_vals = {-25509LL * 86400'000LL,
                                             -1LL,
@@ -5735,6 +5738,7 @@ TEST_CASE("nvrtc_jit - temporal extraction and date_trunc match MATERIALIZE and 
                                             19782LL * 86400'000LL + 86399'999LL,
                                             -2000LL * 365LL * 86400'000LL - 12345'678LL,
                                             -ts_inf,
+                                            ts_inf,
                                             ts_inf};
     std::vector<std::int64_t> ts_us_vals = {-25509LL * 86400'000'000LL,
                                             -1LL,
@@ -5744,7 +5748,8 @@ TEST_CASE("nvrtc_jit - temporal extraction and date_trunc match MATERIALIZE and 
                                             19782LL * 86400'000'000LL + 86399'999'999LL,
                                             -2000LL * 365LL * 86400'000'000LL - 12345'678'901LL,
                                             ts_inf,
-                                            0LL};
+                                            0LL,
+                                            86400'000'000LL + 1LL};
     std::vector<std::int64_t> ts_ns_vals = {-25509LL * 86400'000'000'000LL,
                                             -1LL,
                                             -86400'000'000'000LL - 3723'040'523'789LL,
@@ -5753,16 +5758,17 @@ TEST_CASE("nvrtc_jit - temporal extraction and date_trunc match MATERIALIZE and 
                                             19782LL * 86400'000'000'000LL + 86399'999'999'999LL,
                                             ts_min,
                                             -ts_inf,
-                                            0LL};
+                                            0LL,
+                                            -1LL};
 
     // Narrowed INT16 DATE carrier (column 5)
     std::vector<std::int16_t> narrow_date_vals = {
-      -25509, -365, -1, 0, 11016, 19782, 1000, -1000, 0};
+      -25509, -365, -1, 0, 11016, 19782, 1000, -1000, 0, 7};
     auto col_narrow_date = cudf::make_numeric_column(
-      cudf::data_type{cudf::type_id::INT16}, 9, cudf::mask_state::UNALLOCATED, stream, mr);
+      cudf::data_type{cudf::type_id::INT16}, 10, cudf::mask_state::UNALLOCATED, stream, mr);
     REQUIRE(cudaMemcpy(col_narrow_date->mutable_view().data<std::int16_t>(),
                        narrow_date_vals.data(),
-                       9 * sizeof(std::int16_t),
+                       10 * sizeof(std::int16_t),
                        cudaMemcpyHostToDevice) == cudaSuccess);
 
     auto col_d = make_ts_col(cudf::data_type{cudf::type_id::TIMESTAMP_DAYS}, date_vals, valids);

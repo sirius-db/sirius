@@ -83,8 +83,7 @@ void collect_materialization_boundaries(std::span<sirius::ast::node const* const
 
 /**
  * @brief Compiles (or fetches from `codegen::jit::KernelCache`) and executes a `FilterSink` CUDA
- * `__global__` kernel for @p predicate over @p input using TQP++ Section 5.3's 3-tier
- * `Sparse-to-Dense Compaction`.
+ * `__global__` kernel for @p predicate over @p input using `Sparse-to-Dense Compaction`.
  *
  * @param predicate The boolean filter expression tree to evaluate.
  * @param input The input table view (possibly augmented with synthetic boundary columns).

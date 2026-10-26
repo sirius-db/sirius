@@ -28,8 +28,6 @@
 
 #include <rmm/device_buffer.hpp>
 #include <rmm/device_uvector.hpp>
-#include <rmm/mr/pinned_host_memory_resource.hpp>
-#include <rmm/mr/pool_memory_resource.hpp>
 
 #include <cuda.h>
 
@@ -3122,16 +3120,20 @@ void emit_nvrtc_device_runtime_preamble_impl(std::ostringstream& src)
     << "      int16_t const res = (Comp == 0) ? y : ((Comp == 1) ? m : d);\n"
     << "      return reg_val<OutT>{static_cast<OutT>(res), true, false};\n"
     << "    } else {\n"
-    << "      int64_t const tsm = ticks - static_cast<int64_t>(day32) * ticks_per_day;\n"
+    // cuDF's extract_component_operator: the time since midnight is moved forward by one day
+    // when the wrapped day count leaves it negative, then split with truncating duration_casts.
+    << "      int64_t tsm = ticks - static_cast<int64_t>(day32) * ticks_per_day;\n"
+    << "      if (tsm < 0) { tsm += ticks_per_day; }\n"
+    << "      int64_t const hrs = tsm / (3600LL * TicksPerSec);\n"
     << "      if constexpr (Comp == 3) {\n"
-    << "        return reg_val<OutT>{static_cast<OutT>(static_cast<int16_t>(tsm / (3600LL * "
-       "TicksPerSec))), true, false};\n"
+    << "        return reg_val<OutT>{static_cast<OutT>(static_cast<int16_t>(hrs)), true, false};\n"
     << "      } else if constexpr (Comp == 4) {\n"
-    << "        return reg_val<OutT>{static_cast<OutT>(static_cast<int16_t>((tsm % (3600LL * "
-       "TicksPerSec)) / (60LL * TicksPerSec))), true, false};\n"
+    << "        return reg_val<OutT>{static_cast<OutT>(static_cast<int16_t>(tsm / (60LL * "
+       "TicksPerSec) - hrs * 60LL)), true, false};\n"
     << "      } else {\n"
-    << "        return reg_val<OutT>{static_cast<OutT>(static_cast<int16_t>((tsm % (60LL * "
-       "TicksPerSec)) / TicksPerSec)), true, false};\n"
+    << "        int64_t const mins = tsm / (60LL * TicksPerSec) - hrs * 60LL;\n"
+    << "        return reg_val<OutT>{static_cast<OutT>(static_cast<int16_t>(tsm / TicksPerSec - "
+       "hrs * 3600LL - mins * 60LL)), true, false};\n"
     << "      }\n"
     << "    }\n"
     << "  } else {\n"
@@ -3225,43 +3227,68 @@ void maybe_dump_kernel_source(std::string const& entry, std::string const& sourc
   out << source;
 }
 
-// Thread-local pinned host staging slab for reading back device status and count words without
-// synchronous pageable-memory staging overhead.
-class pinned_status_slab {
+// Thread-local pinned host slab for an evaluation's small staging copies: status and null-count
+// words read back from the device, and string constants copied to it. A pinned buffer keeps
+// both copies asynchronous. A queued host-to-device copy is tracked with an event, so the slab
+// is never rewritten by the host before the copy has read it.
+class pinned_host_slab {
  public:
-  pinned_status_slab() = default;
-  ~pinned_status_slab()
+  pinned_host_slab() = default;
+  ~pinned_host_slab()
   {
+    if (_event != nullptr) {
+      if (_pending) { (void)cudaEventSynchronize(_event); }
+      (void)cudaEventDestroy(_event);
+    }
     if (_data != nullptr) { (void)cudaFreeHost(_data); }
   }
-  pinned_status_slab(pinned_status_slab const&)            = delete;
-  pinned_status_slab& operator=(pinned_status_slab const&) = delete;
+  pinned_host_slab(pinned_host_slab const&)            = delete;
+  pinned_host_slab& operator=(pinned_host_slab const&) = delete;
 
-  [[nodiscard]] std::uint32_t* reserve(std::size_t words)
+  // Returns at least `bytes` of pinned memory that no queued copy still reads.
+  [[nodiscard]] void* reserve(std::size_t bytes)
   {
-    if (_data != nullptr && words <= _capacity_words) { return _data; }
-    std::size_t const grown = std::max({words, _capacity_words * 2U, std::size_t{64}});
+    if (_pending) {
+      simpatico::throw_if_cuda_error(cudaEventSynchronize(_event),
+                                     "cudaEventSynchronize(pinned_host_slab)");
+      _pending = false;
+    }
+    if (_data != nullptr && bytes <= _capacity_bytes) { return _data; }
+    std::size_t const grown = std::max({bytes, _capacity_bytes * 2U, std::size_t{256}});
     void* fresh             = nullptr;
-    simpatico::throw_if_cuda_error(
-      cudaHostAlloc(&fresh, grown * sizeof(std::uint32_t), cudaHostAllocPortable),
-      "cudaHostAlloc(pinned_status_slab)");
+    simpatico::throw_if_cuda_error(cudaHostAlloc(&fresh, grown, cudaHostAllocPortable),
+                                   "cudaHostAlloc(pinned_host_slab)");
     if (_data != nullptr) { (void)cudaFreeHost(_data); }
-    _data           = static_cast<std::uint32_t*>(fresh);
-    _capacity_words = grown;
+    _data           = fresh;
+    _capacity_bytes = grown;
     return _data;
   }
 
+  // Records that a copy reading the slab was queued on `stream`; the next reserve() waits for it.
+  void mark_pending(::cuda::stream_ref stream)
+  {
+    if (_event == nullptr) {
+      simpatico::throw_if_cuda_error(cudaEventCreateWithFlags(&_event, cudaEventDisableTiming),
+                                     "cudaEventCreate(pinned_host_slab)");
+    }
+    simpatico::throw_if_cuda_error(cudaEventRecord(_event, stream.get()),
+                                   "cudaEventRecord(pinned_host_slab)");
+    _pending = true;
+  }
+
  private:
-  std::uint32_t* _data{nullptr};
-  std::size_t _capacity_words{0};
+  void* _data{nullptr};
+  std::size_t _capacity_bytes{0};
+  cudaEvent_t _event{nullptr};
+  bool _pending{false};
 };
 
 [[nodiscard]] std::uint32_t const* copy_status_words_from_device(std::uint32_t const* d_status,
                                                                  std::size_t words,
                                                                  ::cuda::stream_ref stream)
 {
-  thread_local pinned_status_slab slab;
-  std::uint32_t* const h_pinned = slab.reserve(words);
+  thread_local pinned_host_slab slab;
+  auto* const h_pinned = static_cast<std::uint32_t*>(slab.reserve(words * sizeof(std::uint32_t)));
   simpatico::throw_if_cuda_error(
     cudaMemcpyAsync(
       h_pinned, d_status, words * sizeof(std::uint32_t), cudaMemcpyDeviceToHost, stream.get()),
@@ -3315,14 +3342,6 @@ void emit_input_and_constant_kernel_params(std::ostringstream& src, translation_
   }
 }
 
-// Process-wide stream-ordered pool of pinned host memory for small host-to-device staging copies.
-rmm::device_async_resource_ref pinned_staging_pool()
-{
-  static rmm::mr::pool_memory_resource pool{rmm::mr::pinned_host_memory_resource{},
-                                            std::size_t{1} << 20};
-  return pool;
-}
-
 struct input_arg_storage {
   void const* data_ptr{nullptr};
   void const* offsets_ptr{nullptr};
@@ -3341,11 +3360,6 @@ struct string_constant_arg_storage {
 struct bound_kernel_input_and_constant_args {
   std::vector<input_arg_storage> in_args;
   rmm::device_uvector<char> d_const_chars;
-  // Pinned staging for the string constants' host-to-device copy. A copy from pageable memory
-  // blocks the host while the driver stages it; a pinned source makes it asynchronous. The block
-  // comes from a stream-ordered pinned pool, so releasing it at the end of the evaluation is
-  // safe even while the copy is still queued.
-  rmm::device_buffer h_const_staging;
   std::vector<constant_param_storage> const_args;
   std::vector<string_constant_arg_storage> str_const_args;
 
@@ -3355,7 +3369,6 @@ struct bound_kernel_input_and_constant_args {
                                        rmm::device_async_resource_ref mr)
     : in_args(ctx.input_columns().size()),
       d_const_chars(0, stream, mr),
-      h_const_staging(0, stream, pinned_staging_pool()),
       const_args(ctx.constants().size()),
       str_const_args(ctx.constants().size())
   {
@@ -3395,14 +3408,18 @@ struct bound_kernel_input_and_constant_args {
     }
     if (!h_const_chars.empty()) {
       d_const_chars.resize(h_const_chars.size(), stream);
-      h_const_staging.resize(h_const_chars.size(), stream);
-      std::memcpy(h_const_staging.data(), h_const_chars.data(), h_const_chars.size());
+      // A copy from pageable memory blocks the host while the driver stages it; the pinned slab
+      // keeps it asynchronous and waits for its previous copy before being rewritten.
+      thread_local pinned_host_slab staging;
+      void* const h_staging = staging.reserve(h_const_chars.size());
+      std::memcpy(h_staging, h_const_chars.data(), h_const_chars.size());
       simpatico::throw_if_cuda_error(cudaMemcpyAsync(d_const_chars.data(),
-                                                     h_const_staging.data(),
+                                                     h_staging,
                                                      h_const_chars.size(),
                                                      cudaMemcpyHostToDevice,
                                                      stream.get()),
                                      "cudaMemcpyAsync(d_const_chars)");
+      staging.mark_pending(stream);
     }
 
     for (std::size_t i = 0; i < ctx.constants().size(); ++i) {
@@ -3592,7 +3609,9 @@ std::unique_ptr<cudf::table> evaluate_project_sink(
     }
     src << "  }\n";
   };
-  src << "  if (tile_row0 + " << tile_rows << " <= num_rows) {\n";
+  // Written as a difference: `tile_row0 + tile_rows` overflows int32 for a batch within one
+  // tile of INT32_MAX rows, `num_rows - tile_row0` never does (tile_row0 < num_rows).
+  src << "  if (num_rows - tile_row0 >= " << tile_rows << ") {\n";
   emit_items(/*guarded=*/false);
   src << "  } else {\n";
   emit_items(/*guarded=*/true);
@@ -3704,7 +3723,8 @@ std::unique_ptr<cudf::table> evaluate_project_sink(
   kernel_args.push_back(&num_rows_arg);
   kernel_args.push_back(&status_ptr);
 
-  auto const grid_dim_x = static_cast<unsigned int>((num_rows + tile_rows - 1) / tile_rows);
+  auto const grid_dim_x =
+    static_cast<unsigned int>(num_rows / tile_rows + (num_rows % tile_rows != 0 ? 1 : 0));
   simpatico::throw_if_cu_error(cuLaunchKernel(fn,
                                               grid_dim_x,
                                               1,
@@ -3813,7 +3833,7 @@ extern "C" __global__ void sirius_nvrtc_filter_scatter_kernel(
   int32_t const tile = static_cast<int32_t>(blockIdx.x);
   int32_t const lane = static_cast<int32_t>(threadIdx.x) & 31;
   int32_t const warp = static_cast<int32_t>(threadIdx.x) >> 5;
-  int32_t const num_words = (num_rows + 31) >> 5;
+  int32_t const num_words = (num_rows >> 5) + ((num_rows & 31) != 0 ? 1 : 0);
   int32_t const word0 = tile * kWordsPerTile;
 
   // Popcount of every ballot word of the tile (kWordsPerTile <= kThreads: one word per thread).
@@ -3970,7 +3990,9 @@ std::unique_ptr<cudf::table> evaluate_filter_sink(sirius::ast::node const& predi
         << "    }\n"
         << "  }\n";
   };
-  src << "  if (tile_row0 + " << tile_rows << " <= num_rows) {\n";
+  // Written as a difference: `tile_row0 + tile_rows` overflows int32 for a batch within one
+  // tile of INT32_MAX rows, `num_rows - tile_row0` never does (tile_row0 < num_rows).
+  src << "  if (num_rows - tile_row0 >= " << tile_rows << ") {\n";
   emit_items(/*guarded=*/false);
   src << "  } else {\n";
   emit_items(/*guarded=*/true);
@@ -4048,7 +4070,8 @@ std::unique_ptr<cudf::table> evaluate_filter_sink(sirius::ast::node const& predi
   }
   CUfunction const fn = compiled->func_for_current_device();
 
-  auto const grid_dim_x  = static_cast<unsigned int>((num_rows + tile_rows - 1) / tile_rows);
+  auto const grid_dim_x =
+    static_cast<unsigned int>(num_rows / tile_rows + (num_rows % tile_rows != 0 ? 1 : 0));
   bool const single_tile = (grid_dim_x == 1U);
 
   // Workspace: [0] = status flags, [1] = total survivors, then (multi-tile only) one count per
