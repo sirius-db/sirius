@@ -449,10 +449,9 @@ class parquet_batch_coalescer : public batch_coalescer {
       throw std::invalid_argument("parquet file requires one certificate and dependency");
     }
 
-    // Remember the first fully-pruned file. If the WHOLE source coalesces to
-    // nothing, flush() emits one empty split built from it — zero splits mean
-    // zero tasks, and the pipeline-completion accounting only fires from task
-    // completion, hanging sirius_engine::execute().
+    // Remember the first stats-pruned file. If every file has no surviving row
+    // groups, flush() preserves its schema in a typed empty input for downstream
+    // operators, including ungrouped aggregates that must emit their identities.
     if (file->row_groups.empty() && !_empty_split_fallback) {
       _empty_split_fallback = fallback_file{
         file->file_metadata,
@@ -604,8 +603,8 @@ class parquet_batch_coalescer : public batch_coalescer {
     // with a single zero-row-group slice so the scan still creates one task
     // (materialize_metadata_to_table short-circuits it to a schema-correct
     // empty table). Partial prunes never reach here — any surviving slice sets
-    // _produced_any. Zero splits would mean zero tasks, and pipeline-completion
-    // accounting only fires from task completion, hanging the query.
+    // _produced_any. File-level source pruning takes a separate path: it never
+    // supplies a file here and the planner lowers it to a typed empty GPU_VALUES.
     if (!_produced_any && _empty_split_fallback) {
       _slices.emplace_back(_empty_split_fallback->file_metadata,
                            _empty_split_fallback->file_path,
@@ -825,6 +824,9 @@ parquet_scan_core::parquet_scan_core(std::unique_ptr<parquet_ingestible_table_in
       "require column names to be provided.");
   }
 
+  // The SQL planner removes channels without registered producers before creating us.
+  // A direct caller may still register on a non-null channel later, so pointer presence
+  // (not the current producer/filter count) must keep this reader conservative.
   bool const allow_metadata_only = _source_kind == parquet_source_kind::PLAIN_PARQUET &&
                                    bind.has_requested_user_virtual_columns() &&
                                    !bind.sirius_dynamic_filters && !bind.physical_schema &&
@@ -1042,10 +1044,10 @@ parquet_scan_core::parquet_scan_core(std::unique_ptr<parquet_ingestible_table_in
     }
     if (keep) { _selected_file_indices.push_back(i); }
   }
-  // One footer-only schema anchor still produces a completion task when every source
-  // is eliminated. It never requests data pages; numbering always uses the original list.
+  // The bound output schema is sufficient for an empty source. Never reintroduce
+  // a pruned file just to obtain its footer; SQL lowering supplies a typed empty
+  // GPU_VALUES input so downstream aggregates and joins retain their semantics.
   _source_selection_empty = _selected_file_indices.empty() && !_file_paths.empty();
-  if (_source_selection_empty) { _selected_file_indices.push_back(0); }
 }
 
 parquet_scan_core::~parquet_scan_core() = default;
@@ -1662,7 +1664,6 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
                      owned.size());
     row_group_indices = std::move(owned);
   }
-  if (_source_selection_empty) { row_group_indices.clear(); }
   // Virtual columns are not available to the reader, but physical footer pruning is.
   if (ast_expression && !row_group_indices.empty()) {
     auto const rgs_before = row_group_indices.size();

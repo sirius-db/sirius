@@ -325,8 +325,9 @@ void create_virtual_column_fixtures(fs::path const& fixture_dir)
           "SELECT range AS marker, (range % 3)::INTEGER AS keep FROM range(8193)"},
          {"virtual_nested_only", "SELECT [range, range + 1] AS items FROM range(19)"},
          {"virtual_physical_names",
-          "SELECT range AS marker, CASE WHEN range = 0 THEN NULL ELSE 'physical' END AS filename, "
-          "77::BIGINT AS file_index, 88::INTEGER AS file_row_number FROM range(2)"}}) {
+          "SELECT range AS marker, CASE WHEN range = 0 THEN NULL WHEN range = 1 THEN 'NULL' "
+          "ELSE 'physical' END AS filename, "
+          "77::BIGINT AS file_index, 88::INTEGER AS file_row_number FROM range(3)"}}) {
     auto const path = fixture_dir / "parquet" / (name + ".parquet");
     auto result     = con.Query("COPY (" + query + ") TO " + sql_literal(path.string()) +
                             " (FORMAT PARQUET, ROW_GROUP_SIZE 2048)");

@@ -1360,6 +1360,60 @@ TEST_CASE("S3 virtual columns preserve file identity and row positions through b
     compare(prefix + s3_parquet_scan(*env, "virtual_physical_names") + suffix,
             prefix + local_parquet_scan(*env, "virtual_physical_names") + suffix);
   }
+
+  // Value::ToString() cannot distinguish a SQL NULL from the VARCHAR "NULL" and
+  // also loses the logical types. Check the actual remote result at both SQL entries.
+  auto query = [&](std::string const& sql) {
+    return require_query_ok(fixture.con, transparent ? sql : gpu_execution_sql(sql));
+  };
+  duckdb::vector<duckdb::LogicalType> const virtual_types{
+    duckdb::LogicalType::VARCHAR, duckdb::LogicalType::UBIGINT, duckdb::LogicalType::BIGINT};
+  for (bool empty : {false, true}) {
+    auto result = query("SELECT filename, file_index, file_row_number FROM " + remote +
+                        (empty ? " WHERE file_index = 99" : "") + " ORDER BY file_row_number");
+    CHECK(result->GetTypes() == virtual_types);
+    REQUIRE(result->RowCount() == (empty ? 0 : 25));
+    for (duckdb::idx_t row = 0; row < result->RowCount(); ++row) {
+      for (duckdb::idx_t col = 0; col < 3; ++col) {
+        CHECK_FALSE(result->Collection().GetValue(col, row).IsNull());
+      }
+      CHECK(result->Collection().GetValue(0, row).GetValue<std::string>() == uri);
+      CHECK(result->Collection().GetValue(1, row).GetValue<uint64_t>() == 0);
+      CHECK(result->Collection().GetValue(2, row).GetValue<int64_t>() == row);
+    }
+  }
+  auto star = query("SELECT * FROM " + remote + " LIMIT 1");
+  REQUIRE(star->ColumnCount() == 4);
+  CHECK(star->GetTypes() == duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER,
+                                                                duckdb::LogicalType::VARCHAR,
+                                                                duckdb::LogicalType::INTEGER,
+                                                                duckdb::LogicalType::VARCHAR});
+  for (duckdb::idx_t col = 0; col < 4; ++col) {
+    CHECK(star->ColumnName(col).GetIdentifierName() ==
+          std::vector<std::string>{"n_nationkey", "n_name", "n_regionkey", "n_comment"}[col]);
+  }
+  auto const physical_remote = s3_parquet_scan(*env, "virtual_physical_names");
+  auto physical              = query("SELECT * FROM " + physical_remote + " ORDER BY marker");
+  REQUIRE(physical->ColumnCount() == 4);
+  CHECK(physical->GetTypes() == duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::BIGINT,
+                                                                    duckdb::LogicalType::VARCHAR,
+                                                                    duckdb::LogicalType::BIGINT,
+                                                                    duckdb::LogicalType::INTEGER});
+  REQUIRE(physical->RowCount() == 3);
+  CHECK(physical->Collection().GetValue(1, 0).IsNull());
+  CHECK_FALSE(physical->Collection().GetValue(1, 1).IsNull());
+  CHECK(physical->Collection().GetValue(1, 1).GetValue<std::string>() == "NULL");
+  CHECK(physical->Collection().GetValue(1, 2).GetValue<std::string>() == "physical");
+  for (duckdb::idx_t row = 0; row < physical->RowCount(); ++row) {
+    CHECK(physical->Collection().GetValue(2, row).GetValue<int64_t>() == 77);
+    CHECK(physical->Collection().GetValue(3, row).GetValue<int32_t>() == 88);
+  }
+  auto only_null = query("SELECT marker FROM " + physical_remote + " WHERE filename IS NULL");
+  REQUIRE(only_null->RowCount() == 1);
+  CHECK(only_null->Collection().GetValue(0, 0).GetValue<int64_t>() == 0);
+  auto text_null = query("SELECT marker FROM " + physical_remote + " WHERE filename = 'NULL'");
+  REQUIRE(text_null->RowCount() == 1);
+  CHECK(text_null->Collection().GetValue(0, 0).GetValue<int64_t>() == 1);
 }
 
 TEST_CASE("SIRIUS_S3 CREATE SECRET credentials are scoped and refreshed for Sirius scans",

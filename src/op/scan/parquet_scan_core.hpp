@@ -41,6 +41,9 @@ class parquet_scan_core {
 
   [[nodiscard]] bool has_processed_all_metadata() const;
 
+  /// Bind-time file predicates eliminated every file; no physical input is consumed.
+  [[nodiscard]] bool source_selection_empty() const noexcept { return _source_selection_empty; }
+
   metadata_scan_task_t next_split_provider(io::ioctx_resolver resolve);
   metadata_scan_task_t next_split_provider(io::ioctx_resolver resolve, std::stop_token stop);
   stoppable_metadata_scan_task_t next_split_provider_with_stop(io::ioctx_resolver resolve);

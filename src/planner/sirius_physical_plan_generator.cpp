@@ -788,6 +788,10 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_gpu_scan_leaf(
   duckdb::SiriusContext* sirius_ctx)
 {
   auto dynamic_filters = scan.sirius_dynamic_filters;
+  // Join construction registered every producer before collect_semantic_lineage(). Its
+  // no-producer check and this normalization therefore agree. An unpublished producer still
+  // blocks metadata-only reads; has_filters() cannot be used here. Direct ingestible callers
+  // may register later and must retain their non-null channel instead of normalizing it there.
   if (dynamic_filters && !dynamic_filters->has_producers()) { dynamic_filters.reset(); }
   // Parquet also prunes with its own snapshot of the channel.
   if constexpr (requires { info->sirius_dynamic_filters; }) {
@@ -805,6 +809,24 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_gpu_scan_leaf(
   }
 
   auto ingestible = sirius::op::scan::make_ingestible(std::move(info));
+  if constexpr (std::is_same_v<InfoT, op::scan::parquet_ingestible_table_info>) {
+    if (ingestible->source_selection_empty()) {
+      // Reuse EMPTY_RESULT's typed empty input. A zero-split scan can complete,
+      // but does not run its in-pipeline ungrouped aggregate (COUNT must emit 0).
+      // No execution-time resolver, datasource or footer is needed, and no
+      // physical-input certificate is fabricated for an eliminated file.
+      // The exact DuckDB schema retains LIST/STRUCT child metadata that the
+      // flat Sirius types omit. An owned empty collection carries it without IO.
+      auto schema = duckdb::make_uniq<duckdb::ColumnDataCollection>(
+        duckdb::Allocator::DefaultAllocator(), scan.duckdb_types);
+      auto empty = duckdb::make_uniq<op::sirius_physical_gpu_values>(
+        scan.types,
+        0,
+        duckdb::optionally_owned_ptr<duckdb::ColumnDataCollection>(std::move(schema)));
+      if (scan.has_physical_overrides()) { empty->set_physical_types(scan.get_physical_types()); }
+      return empty;
+    }
+  }
   auto consumer =
     dynamic_filters
       ? sirius::op::scan::make_dynamic_filter_consumer(

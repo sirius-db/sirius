@@ -2387,14 +2387,15 @@ class HivePartitionDataset {
     return result;
   }
 
-  watchdog_result run_gpu_query_with_watchdog(std::string const& query,
-                                              std::chrono::seconds timeout)
+  watchdog_result run_gpu_query_with_watchdog(
+    std::string const& query,
+    std::chrono::seconds timeout,
+    std::string child_case = "gpu_execution hive partition watchdog child runner")
   {
     static std::atomic<std::uint64_t> next_child_id{0};
     auto const output_path =
       hive_dir / ("watchdog_result_" + std::to_string(next_child_id.fetch_add(1)) + ".txt");
-    std::vector<std::string> child_arguments{"sirius_unittest",
-                                             "gpu_execution hive partition watchdog child runner"};
+    std::vector<std::string> child_arguments{"sirius_unittest", std::move(child_case)};
     std::vector<char*> child_argv;
     child_argv.reserve(child_arguments.size() + 1);
     for (auto& argument : child_arguments) {
@@ -2819,6 +2820,118 @@ class ParquetVirtualColumnFixture : public MultiFormatFixtureBase {
   }
 };
 
+TEST_CASE_METHOD(HivePartitionDataset,
+                 "parquet all-pruned SQL completes under watchdog",
+                 "[scan][parquet][source_pruning][watchdog]")
+{
+  auto result = run_gpu_query_with_watchdog(
+    "", std::chrono::seconds{60}, "parquet all-pruned SQL watchdog child");
+  INFO(result.error);
+  REQUIRE_FALSE(result.timed_out);
+  REQUIRE(result.error.empty());
+}
+
+TEST_CASE_METHOD(ParquetVirtualColumnFixture,
+                 "parquet all-pruned SQL watchdog child",
+                 "[.][integration][scan][parquet][source_pruning][watchdog_child]")
+{
+  auto const* output = std::getenv("SIRIUS_HIVE_WATCHDOG_OUTPUT");
+  if (!output) { return; }
+  REQUIRE_FALSE(con->Query("SET enable_duckdb_fallback=false")->HasError());
+  {
+    sirius::test::scoped_sirius_disable disable;
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection writer(db);
+    auto result = writer.Query(
+      "COPY (SELECT {'items': [1,2]::INTEGER[], 'label': 'nested'} AS record, "
+      "map(['k'], [[1,2]::INTEGER[]]) AS mapping, "
+      "[[1,2]::BIGINT[]] AS lists, [1,2]::INTEGER[2] AS fixed) TO " +
+      scratch.file_literal("nested_schema.parquet") + " (FORMAT PARQUET)");
+    REQUIRE(result);
+    REQUIRE_FALSE(result->HasError());
+  }
+  auto state    = sirius::test::get_registered_sirius_context(*con);
+  auto counters = state->physical_counters();
+  auto reset =
+    reset_after_test(counters->parquet_phase_for_testing, counters->parquet_metadata_for_testing);
+  std::atomic<size_t> footers{0}, metadata{0}, control_footers{0};
+  counters->parquet_phase_for_testing = [&](auto const& path, bool footer) {
+    if (footer && path == scratch.file("keys.parquet")) { ++control_footers; }
+    if (footer && path != scratch.file("keys.parquet")) {
+      ++footers;
+      throw std::runtime_error("execution accessed a file eliminated by source pruning");
+    }
+  };
+  counters->parquet_metadata_for_testing = [&](auto const& path, bool) {
+    if (path != scratch.file("keys.parquet")) { ++metadata; }
+  };
+  auto compare = [&](std::string const& query) {
+    INFO(query);
+    auto before = sirius::test::get_transparent_execution_stats(*con);
+    auto gpu    = con->Query(query);
+    REQUIRE(gpu);
+    INFO((gpu->HasError() ? gpu->GetError() : ""));
+    REQUIRE_FALSE(gpu->HasError());
+    require_route(before, sirius::test::get_transparent_execution_stats(*con), gpu_route::gpu);
+    REQUIRE_FALSE(con->Query("SET gpu_execution=false")->HasError());
+    auto cpu =
+      con->Query(duckdb::StringUtil::Replace(query, "sirius_read_parquet", "read_parquet"));
+    REQUIRE_FALSE(con->Query("SET gpu_execution=true")->HasError());
+    REQUIRE(cpu);
+    REQUIRE_FALSE(cpu->HasError());
+    CHECK(gpu->GetTypes() == cpu->GetTypes());
+    CHECK(gpu->GetNames() == cpu->GetNames());
+    CHECK(collect_rows(*gpu) == collect_rows(*cpu));
+    CHECK(gpu->RowCount() == cpu->RowCount());
+    for (duckdb::idx_t row = 0; row < gpu->RowCount(); ++row) {
+      for (duckdb::idx_t col = 0; col < gpu->ColumnCount(); ++col) {
+        CHECK(gpu->Collection().GetValue(col, row).IsNull() ==
+              cpu->Collection().GetValue(col, row).IsNull());
+      }
+    }
+    CHECK(footers == 0);
+    CHECK(metadata == 0);
+  };
+  for (auto const* function : {"read_parquet", "sirius_read_parquet"}) {
+    auto const input = std::string{function} + "(" + scratch.file_literal("a.parquet") + ")";
+    auto const empty = "(SELECT x FROM " + input + " WHERE file_index = 99)";
+    for (auto const* projection : {"filename, file_index, file_row_number",
+                                   "x, filename, file_index, file_row_number, x",
+                                   "x",
+                                   "42"}) {
+      compare("SELECT " + std::string{projection} + " FROM " + input + " WHERE file_index = 99");
+    }
+    compare(
+      "SELECT count(*), count(x), sum(x), min(x), max(x), avg(x), first(x), "
+      "count(DISTINCT x) FROM " +
+      input + " WHERE file_index = 99");
+    compare("SELECT x, count(*) FROM " + input + " WHERE file_index = 99 GROUP BY x");
+    compare("SELECT sentinel, filename, file_index FROM " + input + " WHERE filename = 'absent'");
+    auto const nested =
+      std::string{function} + "(" + scratch.file_literal("nested_only.parquet") + ")";
+    compare("SELECT payload, filename, file_index, file_row_number FROM " + nested +
+            " WHERE file_index = 99");
+    auto const nested_schema =
+      std::string{function} + "(" + scratch.file_literal("nested_schema.parquet") + ")";
+    compare("SELECT record, mapping, lists, fixed, filename, file_index, file_row_number FROM " +
+            nested_schema + " WHERE file_index = 99");
+    // Explicit joins keep an empty scan on either side and exercise null-extension.
+    for (auto const* join : {"INNER", "LEFT", "RIGHT", "FULL OUTER", "SEMI", "ANTI"}) {
+      for (bool empty_left : {false, true}) {
+        auto const keys = "(SELECT x FROM " + file("keys.parquet") + ")";
+        compare("SELECT l.x FROM " + (empty_left ? empty : keys) + " l " + join + " JOIN " +
+                (empty_left ? keys : empty) + " r ON l.x = r.x ORDER BY l.x");
+      }
+    }
+    compare("SELECT count(*) FROM " + empty + " l FULL OUTER JOIN " + empty + " r ON l.x=r.x");
+  }
+  // A successful ordinary scan after empty sources proves their completion did not
+  // poison the connection or leave source work in flight.
+  compare("SELECT count(*) FROM " + file("keys.parquet"));
+  CHECK(control_footers > 0);
+  HivePartitionDataset::write_watchdog_result(output, {});
+}
+
 TEST_CASE_METHOD(ParquetVirtualColumnFixture,
                  "parquet virtual columns preserve bound file and row provenance",
                  "[integration][gpu_execution][scan][virtual_columns][acceptance]")
@@ -3147,6 +3260,56 @@ TEST_CASE_METHOD(ParquetVirtualMultiRowGroupFixture,
                      " WHERE x IN (0, 2048, 4096, 6143) ORDER BY x");
   compare_gpu_vs_cpu("SELECT x, sentinel, file_row_number FROM " + scan() +
                      " WHERE x >= 4096 ORDER BY x");
+}
+
+TEST_CASE_METHOD(ParquetVirtualMultiRowGroupFixture,
+                 "parquet file pruning and mixed predicates preserve multi-file row identity",
+                 "[integration][gpu_execution][scan][virtual_columns][source_pruning]")
+{
+  auto const small_splits = GENERATE(false, true);
+  {
+    sirius::test::scoped_sirius_disable disable;
+    duckdb::DuckDB writer_db(nullptr);
+    duckdb::Connection writer(writer_db);
+    for (auto const* name : {"B", "C"}) {
+      auto result =
+        writer.Query("COPY (SELECT i::INTEGER AS x, ('" + std::string{name} +
+                     "' || i)::VARCHAR AS sentinel FROM range(6144) t(i) ORDER BY i) TO " +
+                     scratch.file_literal(std::string{name} + ".parquet") +
+                     " (FORMAT PARQUET, ROW_GROUP_SIZE 2048)");
+      REQUIRE(result);
+      REQUIRE_FALSE(result->HasError());
+    }
+  }
+  con->Query("SET gpu_execution=false");
+  sirius::test::scoped_setting cap(*con, "scan_task_batch_size", small_splits ? 1024 : 100000000);
+  con->Query("SET gpu_execution=true");
+  auto const input = "read_parquet([" + scratch.file_literal("multi.parquet") + ", " +
+                     scratch.file_literal("B.parquet") + ", " + scratch.file_literal("C.parquet") +
+                     "], hive_partitioning=false)";
+  auto const physical = " AND (x < 2048 OR x >= 4096) AND x % 3 = 1 AND file_row_number >= 1000";
+  for (auto const& predicate :
+       {"file_index IN (0, 2)" + std::string{physical},
+        "filename IN (" + scratch.file_literal("multi.parquet") + ", " +
+          scratch.file_literal("C.parquet") + ")" + physical,
+        std::string{"file_index = 99 AND x >= 4096"},
+        "file_index IN (0, 2) AND sentinel LIKE 'R%'" + std::string{physical},
+        std::string{"file_index IN (0, 2) AND (x % 3 = 1 OR file_row_number = 0)"},
+        std::string{"file_index NOT IN (1, NULL)"},
+        std::string{"file_index NOT IN (1) AND file_row_number = 0"},
+        std::string{"1::UBIGINT < file_index AND file_row_number = 0"},
+        "filename = " + scratch.file_literal("c.parquet")}) {
+    CAPTURE(small_splits, predicate);
+    compare_gpu_vs_cpu("SELECT sentinel, file_row_number, filename, file_index FROM " + input +
+                       " WHERE " + predicate + " ORDER BY file_index, file_row_number");
+  }
+  // The planner deliberately declines this unsigned-to-signed predicate. A conservative
+  // source evaluator must not turn its unsupported cast into a file-pruning decision.
+  compare_gpu_vs_cpu("SELECT sentinel, file_row_number, filename, file_index FROM " + input +
+                       " WHERE CAST(file_index AS BIGINT) = 2 AND file_row_number = 0 "
+                       "ORDER BY file_index, file_row_number",
+                     std::nullopt,
+                     gpu_route::plan_fallback);
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,

@@ -20,9 +20,14 @@
 #include <duckdb.hpp>
 #include <duckdb/common/constants.hpp>
 #include <duckdb/common/multi_file/multi_file_reader.hpp>
+#include <duckdb/execution/column_binding_resolver.hpp>
+#include <duckdb/parser/parser.hpp>
+#include <duckdb/planner/expression/bound_cast_expression.hpp>
 #include <duckdb/planner/filter/conjunction_filter.hpp>
 #include <duckdb/planner/filter/constant_filter.hpp>
 #include <duckdb/planner/filter/in_filter.hpp>
+#include <duckdb/planner/logical_operator.hpp>
+#include <duckdb/planner/planner.hpp>
 #include <io/kvikio/kvikio_context.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/parquet_gpu_ingestible.hpp>
@@ -35,6 +40,7 @@
 #include <utils/table_filter_test_utils.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <filesystem>
 #include <limits>
@@ -1397,6 +1403,134 @@ TEST_CASE("parquet source pruning evaluates current expression filters conservat
         result::NO_MATCH);
 }
 
+TEST_CASE("parquet source conjunctions preserve SQL NULL and unsupported branches",
+          "[scan][parquet][source_pruning]")
+{
+  using result     = scan::source_filter_result;
+  using type       = duckdb::ExpressionType;
+  constexpr auto m = result::MATCH, n = result::NO_MATCH, s = result::SQL_NULL, u = result::UNKNOWN;
+  // Rows/columns are TRUE, FALSE, SQL NULL, unsupported. UNKNOWN must keep all
+  // possible TRUE outcomes; a known FALSE conjunct can still rule a file out.
+  constexpr std::array<std::array<result, 4>, 4> and_results{
+    {{{m, n, s, u}}, {{n, n, n, n}}, {{s, n, s, u}}, {{u, n, u, u}}}};
+  constexpr std::array<std::array<result, 4>, 4> or_results{
+    {{{m, m, m, m}}, {{m, n, s, u}}, {{m, s, s, u}}, {{m, u, u, u}}}};
+  auto const legacy = GENERATE(false, true);
+  auto const is_and = GENERATE(false, true);
+  auto const left   = GENERATE(0, 1, 2, 3);
+  auto const right  = GENERATE(0, 1, 2, 3);
+  CAPTURE(legacy, is_and, left, right);
+  auto operand = [&](int state) -> duckdb::unique_ptr<duckdb::TableFilter> {
+    auto value = state == 0   ? duckdb::Value::UBIGINT(7)
+                 : state == 1 ? duckdb::Value::UBIGINT(9)
+                 : state == 2 ? duckdb::Value(duckdb::LogicalType::UBIGINT)
+                              : duckdb::Value("7");
+    if (legacy) {
+      if (state == 2) {
+        // Legacy constant/IN constructors forbid NULL constants. The evaluator still
+        // accepts ExpressionFilter children inside a legacy conjunction.
+        return sirius::test::constant_filter(type::COMPARE_EQUAL, value);
+      }
+      return duckdb::make_uniq<duckdb::LegacyConstantFilter>(type::COMPARE_EQUAL, value);
+    }
+    if (state == 3) { return sirius::test::dynamic_filter(duckdb::LogicalType::UBIGINT); }
+    return sirius::test::constant_filter(type::COMPARE_EQUAL, value);
+  };
+  duckdb::unique_ptr<duckdb::TableFilter> filter;
+  if (legacy) {
+    if (is_and) {
+      auto conjunction = duckdb::make_uniq<duckdb::LegacyConjunctionAndFilter>();
+      conjunction->child_filters.push_back(operand(left));
+      conjunction->child_filters.push_back(operand(right));
+      filter = std::move(conjunction);
+    } else {
+      auto conjunction = duckdb::make_uniq<duckdb::LegacyConjunctionOrFilter>();
+      conjunction->child_filters.push_back(operand(left));
+      conjunction->child_filters.push_back(operand(right));
+      filter = std::move(conjunction);
+    }
+  } else {
+    filter = sirius::test::conjunction_filter(
+      is_and ? type::CONJUNCTION_AND : type::CONJUNCTION_OR, operand(left), operand(right));
+  }
+  CHECK(scan::evaluate_parquet_source_filter(*filter, duckdb::Value::UBIGINT(7)) ==
+        (is_and ? and_results : or_results)[left][right]);
+}
+
+TEST_CASE("parquet source pruning keeps unsupported expression shapes",
+          "[scan][parquet][source_pruning]")
+{
+  using result = scan::source_filter_result;
+  using type   = duckdb::ExpressionType;
+  auto ref     = [] {
+    return duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::UBIGINT, 0);
+  };
+  auto constant = [](duckdb::Value value) {
+    return duckdb::make_uniq<duckdb::BoundConstantExpression>(std::move(value));
+  };
+  auto evaluate = [&](duckdb::unique_ptr<duckdb::Expression> expression) {
+    duckdb::ExpressionFilter filter(std::move(expression));
+    return scan::evaluate_parquet_source_filter(filter, duckdb::Value::UBIGINT(7));
+  };
+  CHECK(evaluate(duckdb::BoundComparisonExpression::Create(
+          type::COMPARE_LESSTHAN, constant(duckdb::Value::UBIGINT(9)), ref())) == result::UNKNOWN);
+  for (bool with_null : {false, true}) {
+    auto not_in = duckdb::make_uniq<duckdb::BoundOperatorExpression>(type::COMPARE_NOT_IN,
+                                                                     duckdb::LogicalType::BOOLEAN);
+    not_in->GetChildrenMutable().push_back(ref());
+    not_in->GetChildrenMutable().push_back(constant(duckdb::Value::UBIGINT(9)));
+    if (with_null) {
+      not_in->GetChildrenMutable().push_back(constant(duckdb::Value(duckdb::LogicalType::UBIGINT)));
+    }
+    CHECK(evaluate(std::move(not_in)) == result::UNKNOWN);
+  }
+  auto cast =
+    duckdb::BoundCastExpression::AddDefaultCastToType(ref(), duckdb::LogicalType::VARCHAR);
+  CHECK(evaluate(duckdb::BoundComparisonExpression::Create(
+          type::COMPARE_EQUAL, std::move(cast), constant(duckdb::Value("7")))) == result::UNKNOWN);
+  auto filename = sirius::test::constant_filter(type::COMPARE_EQUAL, duckdb::Value("A.parquet"));
+  CHECK(scan::evaluate_parquet_source_filter(*filename, duckdb::Value("a.parquet")) ==
+        result::NO_MATCH);
+  CHECK(scan::evaluate_parquet_source_filter(*filename, duckdb::Value("A.parquet")) ==
+        result::MATCH);
+}
+
+TEST_CASE("parquet source pruning retains DuckDB bound collation expressions",
+          "[scan][parquet][source_pruning]")
+{
+  sirius::test::scoped_sirius_disable disable;
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  REQUIRE_FALSE(con.Query("BEGIN TRANSACTION")->HasError());
+  for (auto const* predicate :
+       {"filename COLLATE nocase = 'a.parquet'",
+        "filename COLLATE nocase = 'a.parquet' OR filename = 'B.parquet'"}) {
+    CAPTURE(predicate);
+    // Bind real SQL without optimization so constant folding cannot remove the filter.
+    duckdb::Parser parser(*con.context);
+    parser.ParseQuery("SELECT filename FROM (VALUES ('A.parquet')) input(filename) WHERE " +
+                      std::string{predicate});
+    duckdb::Planner planner(*con.context);
+    planner.CreatePlan(std::move(parser.statements[0]));
+    planner.plan->ResolveOperatorTypes();
+    duckdb::ColumnBindingResolver resolver;
+    resolver.VisitOperator(*planner.plan);
+    auto* node = planner.plan.get();
+    while (node->type != duckdb::LogicalOperatorType::LOGICAL_FILTER &&
+           node->children.size() == 1) {
+      node = node->children[0].get();
+    }
+    REQUIRE(node->type == duckdb::LogicalOperatorType::LOGICAL_FILTER);
+    REQUIRE(node->expressions.size() == 1);
+    duckdb::ExpressionFilter filter(node->expressions[0]->Copy());
+    auto const value = duckdb::Value("A.parquet");
+    CHECK(filter.EvaluateWithConstant(*con.context, value));
+    CHECK(scan::evaluate_parquet_source_filter(filter, value) ==
+          scan::source_filter_result::UNKNOWN);
+  }
+  REQUIRE_FALSE(con.Query("ROLLBACK")->HasError());
+}
+
 TEST_CASE_METHOD(carrier_file_fixture,
                  "parquet virtual scans coalesce equivalent replacement carrier projections",
                  "[scan][parquet][carrier][provenance_mechanism]")
@@ -1528,11 +1662,54 @@ TEST_CASE_METHOD(carrier_file_fixture,
                  "parquet source pruning resolves only surviving original file identities",
                  "[scan][parquet][source_pruning]")
 {
-  auto const select_none       = GENERATE(false, true);
-  auto info                    = make_info({"a", "missing", "b"});
-  auto const id                = duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILE_INDEX;
-  info->column_ids             = {duckdb::ColumnIndex(id)};
-  info->projected_output_count = 1;
+  struct counted_ioctx : sirius::io::ioctx {
+    size_t opens = 0;
+    ~counted_ioctx() override { pre_destroy(); }
+    sirius::io::io_context_type type() const noexcept override
+    {
+      return sirius::io::io_context_type::kvikio;
+    }
+    void shutdown() noexcept override {}
+    bool supports(std::string_view) const noexcept override { return true; }
+    bool supports_device_read() const noexcept override { return false; }
+    bool supports_host_to_device_read() const noexcept override { return false; }
+    bool supports_vector_host_read() const noexcept override { return false; }
+    bool supports_device_range_read() const noexcept override { return false; }
+    std::vector<cudf::io::text::byte_range_info> align_and_coalesce(
+      std::span<cudf::io::text::byte_range_info const> ranges,
+      std::optional<size_t>) const noexcept override
+    {
+      return {ranges.begin(), ranges.end()};
+    }
+    size_t host_read_io(sirius::io::io_object const&, size_t, size_t, uint8_t*) override
+    {
+      throw std::runtime_error("pruned file must not be read");
+    }
+    sirius::exec::semi_future<size_t> mixed_readv_async_io(
+      sirius::io::io_object const&, std::vector<sirius::io::prepared_io_slice>&&) noexcept override
+    {
+      return sirius::exec::make_semi_future<size_t>(
+        std::make_exception_ptr(std::runtime_error("pruned file must not be read")));
+    }
+    std::shared_ptr<sirius::io::io_object> create_io_object(std::string) override
+    {
+      ++opens;
+      throw std::runtime_error("pruned file must not be opened");
+    }
+  };
+  auto observed_io           = std::make_shared<counted_ioctx>();
+  auto const select_none     = GENERATE(false, true);
+  auto const resolver_throws = GENERATE(false, true);
+  auto info                  = make_info({"a", "missing", "b"});
+  auto counters              = std::make_shared<scan::physical_check_counters>();
+  counters->track_units      = true;
+  size_t footers = 0, parsed = 0;
+  counters->parquet_phase_for_testing    = [&](auto const&, bool footer) { footers += footer; };
+  counters->parquet_metadata_for_testing = [&](auto const&, bool) { ++parsed; };
+  info->profiles->counters               = counters;
+  auto const id                          = duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILE_INDEX;
+  info->column_ids                       = {duckdb::ColumnIndex(id)};
+  info->projected_output_count           = 1;
   // Native IDs have no explicit kind: the canonical plan resolves their identity.
   info->virtual_columns = {
     {id, "file_index", sirius::logical_type::make(sirius::type_id::UBIGINT), std::nullopt}};
@@ -1543,29 +1720,39 @@ TEST_CASE_METHOD(carrier_file_fixture,
                                   duckdb::Value::UBIGINT(select_none ? 99 : 2)));
   auto reader = scan::make_ingestible(std::move(info));
   std::vector<std::string> resolved;
-  auto task = reader->next_split_provider([&](std::string_view name) {
-    resolved.emplace_back(name);
-    return ioctx;
-  });
+  auto task =
+    reader->next_split_provider([&](std::string_view name) -> std::shared_ptr<sirius::io::ioctx> {
+      resolved.emplace_back(name);
+      if (select_none && resolver_throws) {
+        throw std::runtime_error("pruned file must not be resolved");
+      }
+      if (select_none) { return observed_io; }
+      return ioctx;
+    });
+  if (select_none) {
+    CHECK(reader->source_selection_empty());
+    CHECK(reader->has_processed_all_metadata());
+    CHECK_FALSE(task);
+    CHECK(resolved.empty());
+    CHECK(observed_io->opens == 0);
+    CHECK(footers == 0);
+    CHECK(parsed == 0);
+    CHECK(reader->create_batch_coalescer()->flush().empty());
+    CHECK(reader->reader_calls() == 0);
+    return;
+  }
   REQUIRE(task);
   auto metadata    = task({});
   auto const* file = dynamic_cast<scan::parquet_file_scan_info*>(metadata.get());
   REQUIRE(file);
-  CHECK(file->file_index == (select_none ? 0 : 2));
+  CHECK(file->file_index == 2);
   REQUIRE(resolved.size() == 1);
-  CHECK(resolved.front() == path(select_none ? "a" : "b"));
+  CHECK(resolved.front() == path("b"));
+  CHECK(footers == 1);
+  CHECK(parsed == 1);
   CHECK(reader->has_processed_all_metadata());
   CHECK_FALSE(reader->next_split_provider([&](std::string_view) { return ioctx; }));
-  if (select_none) {
-    CHECK(file->row_groups.empty());
-    auto coalescer = reader->create_batch_coalescer();
-    CHECK(coalescer->push(std::move(metadata)).empty());
-    auto splits = coalescer->flush();
-    REQUIRE(splits.size() == 1);
-    CHECK(splits.front()->fadvise_hints().empty());
-  } else {
-    CHECK_FALSE(file->row_groups.empty());
-  }
+  CHECK_FALSE(file->row_groups.empty());
 }
 
 TEST_CASE_METHOD(carrier_file_fixture,
@@ -1715,12 +1902,16 @@ TEST_CASE_METHOD(carrier_file_fixture,
     info->table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
     info->table_filters->PushFilter(
       duckdb::ProjectionIndex(2),
-      sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO,
-                                    duckdb::Value::BIGINT(2048)));
+      sirius::test::conjunction_filter(
+        duckdb::ExpressionType::CONJUNCTION_AND,
+        sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO,
+                                      duckdb::Value::BIGINT(2048)),
+        sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_NOTEQUAL,
+                                      duckdb::Value::BIGINT(3000))));
     info->table_filters->PushFilter(
       duckdb::ProjectionIndex(0),
       sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO,
-                                    duckdb::Value::BIGINT(3001)));
+                                    duckdb::Value::BIGINT(3002)));
   }
   auto reader = scan::make_ingestible(std::move(info));
   std::vector<std::unique_ptr<scan::parquet_file_scan_info>> files;
@@ -1744,13 +1935,13 @@ TEST_CASE_METHOD(carrier_file_fixture,
     2, std::make_shared<sirius::op::sirius_dynamic_zone_map_filter>(std::move(zones))));
   auto decoded = reader->materialize_metadata_to_table(
     *splits.front(), *space, cudf::get_default_stream(), false, nullptr);
-  CHECK(decoded.table.view().num_rows() == 6);
+  CHECK(decoded.table.view().num_rows() == (partial_static ? 4 : 6));
   CHECK(decoded.state == scan::filter_state::UNFILTERED);
   CHECK(reader->reader_calls() == 1);
   auto output = reader->post_filter_and_project(
     std::move(decoded), *space, cudf::get_default_stream(), false, nullptr, nullptr, {});
   REQUIRE(output->num_columns() == 3);
-  REQUIRE(output->num_rows() == (partial_static ? 4 : 6));
+  REQUIRE(output->num_rows() == (partial_static ? 2 : 6));
   std::vector<int64_t> rows(output->num_rows());
   std::vector<int64_t> ids(output->num_rows());
   std::vector<uint64_t> sources(output->num_rows());
@@ -1768,13 +1959,160 @@ TEST_CASE_METHOD(carrier_file_fixture,
                      cudaMemcpyDeviceToHost) == cudaSuccess);
   for (std::size_t i = 0; i < rows.size(); ++i) {
     CHECK(rows[i] == ids[i]);
-    CHECK(rows[i] >= (partial_static ? 3001 : 3000));
+    CHECK(rows[i] >= (partial_static ? 3002 : 3000));
     CHECK(rows[i] <= 3002);
-    CHECK(sources[i] == i / (partial_static ? 2 : 3));
+    CHECK(sources[i] == i / (partial_static ? 1 : 3));
   }
   // Release published scalar owners before their memory manager.
   filters.reset();
   reader.reset();
+}
+
+TEST_CASE_METHOD(carrier_file_fixture,
+                 "parquet source pruning composes with reader and residual row filters",
+                 "[scan][parquet][source_pruning][provenance_mechanism]")
+{
+  using type           = duckdb::ExpressionType;
+  auto const selection = GENERATE(0, 1, 2, 3);  // file_index, filename, no files, empty last file
+  auto const small_splits = GENERATE(false, true);
+  CAPTURE(selection, small_splits);
+  auto const last = selection == 3 ? "high" : "b";
+  if (selection == 3) {
+    sirius::test::scoped_sirius_disable disable;
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection writer(db);
+    auto result = writer.Query(
+      "COPY (SELECT id + 100000 AS id, amount, label, small, day, flag FROM read_parquet(" +
+      sirius::test::sql_literal(path("b")) + ")) TO " + sirius::test::sql_literal(path(last)) +
+      " (FORMAT PARQUET, ROW_GROUP_SIZE 2048)");
+    REQUIRE(result);
+    REQUIRE_FALSE(result->HasError());
+  }
+  auto info                    = make_info({"a", "missing", last},
+                        small_splits ? 1024 : std::numeric_limits<std::size_t>::max());
+  auto const row_id            = duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER;
+  auto const file_id           = duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILE_INDEX;
+  auto const name_id           = duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILENAME;
+  info->column_ids             = {duckdb::ColumnIndex(row_id),
+                                  duckdb::ColumnIndex(file_id),
+                                  duckdb::ColumnIndex(0),
+                                  duckdb::ColumnIndex(name_id)};
+  info->projection_ids         = {duckdb::ProjectionIndex(0),
+                                  duckdb::ProjectionIndex(1),
+                                  duckdb::ProjectionIndex(2),
+                                  duckdb::ProjectionIndex(3)};
+  info->projected_output_count = 3;
+  info->virtual_columns        = {
+    {row_id, "file_row_number", sirius::logical_type::make(sirius::type_id::BIGINT), std::nullopt},
+    {file_id, "file_index", sirius::logical_type::make(sirius::type_id::UBIGINT), std::nullopt},
+    {name_id, "filename", sirius::logical_type::make(sirius::type_id::VARCHAR), std::nullopt}};
+  info->table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
+  if (selection == 1) {
+    info->table_filters->PushFilter(
+      duckdb::ProjectionIndex(3),
+      sirius::test::in_filter({duckdb::Value(path("a")), duckdb::Value(path(last))}));
+  } else {
+    info->table_filters->PushFilter(
+      duckdb::ProjectionIndex(1),
+      sirius::test::in_filter(
+        selection == 2
+          ? duckdb::vector<duckdb::Value>{duckdb::Value::UBIGINT(99)}
+          : duckdb::vector<duckdb::Value>{duckdb::Value::UBIGINT(0), duckdb::Value::UBIGINT(2)}));
+  }
+  auto groups = sirius::test::conjunction_filter(
+    type::CONJUNCTION_OR,
+    sirius::test::constant_filter(type::COMPARE_LESSTHAN, duckdb::Value::BIGINT(2048)),
+    sirius::test::constant_filter(type::COMPARE_GREATERTHANOREQUALTO, duckdb::Value::BIGINT(4096)));
+  info->table_filters->PushFilter(
+    duckdb::ProjectionIndex(2),
+    sirius::test::conjunction_filter(
+      type::CONJUNCTION_AND,
+      std::move(groups),
+      sirius::test::constant_filter(type::COMPARE_LESSTHAN, duckdb::Value::BIGINT(6143))));
+  info->table_filters->PushFilter(
+    duckdb::ProjectionIndex(0),
+    sirius::test::constant_filter(type::COMPARE_GREATERTHANOREQUALTO, duckdb::Value::BIGINT(1000)));
+  auto reader = scan::make_ingestible(std::move(info));
+  std::vector<std::string> opened;
+  auto coalescer = reader->create_batch_coalescer();
+  std::vector<std::unique_ptr<scan::scan_info>> splits;
+  while (auto task = reader->next_split_provider([&](std::string_view name) {
+    opened.emplace_back(name);
+    if (selection == 2) { throw std::runtime_error("all files were eliminated"); }
+    return ioctx;
+  })) {
+    auto file            = task({});
+    auto const& metadata = dynamic_cast<scan::parquet_file_scan_info const&>(*file);
+    CHECK(metadata.file_index != 1);
+    if (!metadata.row_groups.empty()) {
+      REQUIRE(metadata.row_groups.size() == 2);
+      CHECK(metadata.row_groups[0].index == 0);
+      CHECK(metadata.row_groups[1].index == 2);
+    }
+    for (auto& split : coalescer->push(std::move(file))) {
+      splits.push_back(std::move(split));
+    }
+  }
+  for (auto& split : coalescer->flush()) {
+    splits.push_back(std::move(split));
+  }
+  CHECK(opened == (selection == 2 ? std::vector<std::string>{}
+                                  : std::vector<std::string>{path("a"), path(last)}));
+  if (selection == 2) {
+    CHECK(splits.empty());
+    CHECK(reader->has_processed_all_metadata());
+    CHECK(reader->reader_calls() == 0);
+    return;
+  }
+  REQUIRE_FALSE(splits.empty());
+  if (selection != 2) { CHECK(splits.size() == (small_splits ? (selection == 3 ? 2 : 4) : 1)); }
+  auto manager      = sirius::test::operator_utils::initialize_memory_manager();
+  auto const* space = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space);
+  std::vector<bool> seen(3 * 6144, false);
+  std::size_t decoded_rows = 0, output_rows = 0;
+  for (auto const& split : splits) {
+    auto decoded = reader->materialize_metadata_to_table(
+      *split, *space, cudf::get_default_stream(), false, nullptr);
+    decoded_rows += decoded.table.num_rows();
+    if (decoded.table.num_rows()) { CHECK(decoded.state == scan::filter_state::UNFILTERED); }
+    auto output = reader->post_filter_and_project(
+      std::move(decoded), *space, cudf::get_default_stream(), false, nullptr, nullptr, {});
+    REQUIRE(output->num_columns() == 3);
+    auto const count = output->num_rows();
+    std::vector<int64_t> rows(count), ids(count);
+    std::vector<uint64_t> sources(count);
+    if (count) {
+      REQUIRE(cudaMemcpy(rows.data(),
+                         output->view().column(0).data<int64_t>(),
+                         count * sizeof(int64_t),
+                         cudaMemcpyDeviceToHost) == cudaSuccess);
+      REQUIRE(cudaMemcpy(sources.data(),
+                         output->view().column(1).data<uint64_t>(),
+                         count * sizeof(uint64_t),
+                         cudaMemcpyDeviceToHost) == cudaSuccess);
+      REQUIRE(cudaMemcpy(ids.data(),
+                         output->view().column(2).data<int64_t>(),
+                         count * sizeof(int64_t),
+                         cudaMemcpyDeviceToHost) == cudaSuccess);
+    }
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+      REQUIRE((sources[i] == 0 || sources[i] == 2));
+      REQUIRE(rows[i] >= 1000);
+      REQUIRE(rows[i] < 6143);
+      CHECK(rows[i] == ids[i]);
+      CHECK((rows[i] < 2048 || rows[i] >= 4096));
+      auto const key = sources[i] * 6144 + rows[i];
+      CHECK_FALSE(seen[key]);
+      seen[key] = true;
+    }
+    output_rows += count;
+  }
+  auto const surviving_sources = selection == 2 ? 0 : selection == 3 ? 1 : 2;
+  // The reader drops the final row inside the selected groups. The virtual row-number
+  // predicate remains residual and removes further rows after provenance assembly.
+  CHECK(decoded_rows == surviving_sources * 4095);
+  CHECK(output_rows == surviving_sources * 3095);
 }
 
 TEST_CASE_METHOD(carrier_file_fixture,

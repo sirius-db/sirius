@@ -38,6 +38,10 @@ class parquet_gpu_ingestible : public gpu_ingestible {
     return _core.create_batch_coalescer();
   }
   bool has_processed_all_metadata() const override { return _core.has_processed_all_metadata(); }
+  [[nodiscard]] bool source_selection_empty() const noexcept
+  {
+    return _core.source_selection_empty();
+  }
   const ingestible_table_info& table_info() const noexcept override { return _core.table_info(); }
   std::vector<std::size_t> materialized_column_order() const override
   {
