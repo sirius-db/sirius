@@ -18,11 +18,24 @@ as follows:
 
 ## Verify
 
-Reproduce `check.yml`'s DuckDB consistency gates locally before pushing:
+Test `check.yml`'s DuckDB consistency gates locally before pushing:
 
 ```bash
 engine=$(git rev-parse HEAD:duckdb)
 wrapper=$(git rev-parse HEAD:sirius-duckdb/duckdb)
-[[ "$engine" == "$wrapper" ]] && echo "pass: engine == wrapper" || echo "FAIL: mismatch"
-grep "duckdb_version: $engine" .github/workflows/distribution.yml
+[[ "$engine" == "$wrapper" ]] && echo "PASS: engine == wrapper" || echo "FAIL: mismatch"
+
+declared=$(grep -m1 'duckdb_version:' .github/workflows/distribution.yml | sed -E 's/.*duckdb_version:[[:space:]]*//' | tr -d '"[:space:]')
+if [[ "$declared" == v* ]]; then
+  git -C duckdb fetch --depth=1 origin "refs/tags/${declared}:refs/tags/${declared}"
+  declared=$(git -C duckdb rev-parse "${declared}^{commit}")
+fi
+[[ "$declared" == "$engine" ]] && echo "PASS: distribution.yml matches" || echo "FAIL: distribution.yml mismatch (declared=$declared, engine=$engine)"
+```
+
+**NOTE:** This can fail locally if your `./duckdb` submodule's `origin` remote points somewhere
+other than `.gitmodules`'s declared URL (e.g. a personal fork that doesn't mirror every upstream
+tag) — `fatal: couldn't find remote ref refs/tags/vX.Y.Z`. Fix with:
+```
+git -C duckdb remote set-url origin https://github.com/duckdb/duckdb.git
 ```
