@@ -51,7 +51,7 @@ jobs:
           locked: true
           pixi-version: v0.81.0
           global-environments: |
-            pre-commit
+            pre-commit --with "python<3.15"
 
       - run: |
           set -o pipefail
