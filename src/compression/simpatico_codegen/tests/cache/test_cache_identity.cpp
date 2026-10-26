@@ -41,7 +41,7 @@ int main(int argc, char** argv)
     auto request        = prepared.identity_view();
     const auto expected = request_identity(request);
     // Golden v2 records: review kCacheFormatVersion before updating either digest.
-    require(hex_digest(expected) == "3af63c078a713e6b594f52722f83d6c1",
+    require(hex_digest(expected) == "38ae0456c7a3d5e98687ff67480d5246",
             "request inputs or encoding changed: review kCacheFormatVersion and golden vectors");
     auto options    = prepared.option_views;
     request.options = options;

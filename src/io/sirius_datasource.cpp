@@ -67,6 +67,7 @@ sirius_datasource::sirius_datasource(std::shared_ptr<ioctx> io_ctx,
                                      std::shared_ptr<io_object> io_obj)
   : _io_ctx(std::move(io_ctx)), _io_object(std::move(io_obj))
 {
+  if (_io_ctx && _io_object) _io_ctx->metadata_store().open_observed(*_io_object);
 }
 
 sirius_datasource::~sirius_datasource() {}
@@ -74,8 +75,7 @@ sirius_datasource::~sirius_datasource() {}
 std::shared_ptr<io_object_metadata> sirius_datasource::metadata() const
 {
   if (!_io_ctx || !_io_object) { return nullptr; }
-  auto& cache = _io_ctx->metadata_store();
-  return cache.get_metadata(*_io_object);
+  return _io_ctx->metadata_store().get_metadata(*_io_object);
 }
 
 [[nodiscard]] bool sirius_datasource::store_metadata(std::shared_ptr<io_object_metadata> metadata)
@@ -256,28 +256,29 @@ prepare_result sirius_datasource::prepare_prefetch(bool wait_for_eviction)
   return prepare_result::nothing_to_prepare;
 }
 
-prefetch_refusal sirius_datasource::prefetch_async(exec::invocable<void(bool) noexcept> on_done)
+prefetch_refusal sirius_datasource::prefetch_async(
+  exec::invocable<void(cache::prefetch_result) noexcept> on_done)
 {
   if (!_cache_handle || !uses_prefetching_cache()) {
-    on_done(false);
+    on_done({});
     return prefetch_refusal::no_cache;
   }
 
   if (_cache_handle.has_started_reading()) {
-    on_done(false);
+    on_done({});
     return prefetch_refusal::consumer_ahead;
   }
 
   auto const producer = _cache_handle.producer_state();
   if (producer == cache::producer_stage::abandoned) {
-    on_done(false);
+    on_done({});
     // Allocation pressure no longer abandons a request: prepare() leaves it
     // queued so readahead can evict and retry.  An abandoned request therefore
     // lost the race with its consumer (or was cancelled), not its buffers.
     return prefetch_refusal::other;
   }
   if (producer < cache::producer_stage::prepared) {
-    on_done(false);
+    on_done({});
     return prefetch_refusal::other;
   }
   if (_io_ctx->cache()->prefetch(_cache_handle, std::move(on_done))) {

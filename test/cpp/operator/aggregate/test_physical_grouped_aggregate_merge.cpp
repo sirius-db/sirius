@@ -474,7 +474,7 @@ TEST_CASE("mixed stddev grouping states merge across batches including empty par
     auto view = ro.get_data()->cast<gpu_table_representation>().get_table_view();
     REQUIRE(view.num_columns() == prefix + 5);
     for (std::size_t i = 0; i < local->local_types.size(); ++i) {
-      REQUIRE(view.column(i).type() == sirius::get_cudf_type(local->local_types[i]));
+      REQUIRE(view.column(i).type() == sirius::require_cudf_type(local->local_types[i]));
     }
     cudf::structs_column_view state(view.column(prefix));
     REQUIRE(state.num_children() == 3);

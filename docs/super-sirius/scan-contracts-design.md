@@ -63,7 +63,7 @@ Missing correspondence or changed inputs prevent GPU admission. Rebuilds and rep
 
 Each fresh split must belong to its consuming scan, even when another scan reads the same files. Parquet checks ownership before coalescing and validates each slice's certificate and footer before materialization.
 
-Physical checks run per input unit. A Parquet file is checked from its retained footer for codec, encryption, and type compatibility before cuDF reads it. The codec table follows the pinned libcudf 26.10.00 support set: UNCOMPRESSED, SNAPPY, GZIP, ZSTD, LZ4_RAW, and BROTLI; level encodings and an empty encoding list do not cause a refusal. Iceberg checks its file schema in the metadata worker before the profile check; its former planning-time full-table footer sweep is gone. A pruned row group does not require a profile check. Type drift is allowed only for an export-only leaf when the actual export path performs the conversion; other semantic uses are refused before decode.
+Physical checks run per input unit. A Parquet file is checked from its retained footer for codec, encryption, and type compatibility before cuDF reads it. The codec table follows the pinned libcudf 26.10.00 support set: UNCOMPRESSED, SNAPPY, GZIP, ZSTD, LZ4_RAW, and BROTLI; level encodings and an empty encoding list do not cause a refusal. Iceberg checks its file schema in the metadata worker before the profile check; qualified flat evolution compiles an immutable field-ID mapping and validates its physical read types before logical normalization; its former planning-time full-table footer sweep is gone. A pruned row group does not require a profile check. Type drift is allowed only for an export-only leaf when the actual export path performs the conversion; other semantic uses are refused before decode.
 
 Each Parquet footer producer stores the original schema record and encryption evidence before reader normalization. Coalescing ends a run when the next file's original schema differs, including its `ARROW:schema` entry. This keeps an admitted export-only type drift out of a mixed-schema multi-file reader.
 
@@ -77,6 +77,8 @@ In tests, the scan statistics retain each query's readahead registrations by fil
 
 Each execution attempt owns its preparation units. A unit identifies one scan input and stays pending until all required evidence is ready: footer approval, native segment checks, a delete set, or checkpoint state. Readiness alone does not authorize publication. The gate rechecks cancellation and validates the split before prefetch initialization or connector insertion.
 
+The coordinator obtains admission, ledger attachment, claim readiness, work/key/required-input claims, and cleanup through `gpu_ingestible` capabilities. It does not identify Iceberg by type. All deferred scans in a statement must supply the same admission object. Cache matching similarly asks the adapter whether cached rows can satisfy its visibility requirements.
+
 Eligible Iceberg deletion-vector scans share one host-memory admission for the statement. The reservation covers retained descriptors and delete positions plus bounded temporary decode work, including allocation granularity. Buffers use the reserved backing, and immutable per-file delete sets retain it until their last consumer releases it. A prepared execution consumes its admission once; a later execution needs a fresh admission.
 
 Temporary capacity is requested for multiple DV jobs, bounded by the DV unit count, scan workers, and preparation job, active-unit, and result-slot limits. If a request fails, admission halves the target concurrency down to one job. A valid partial grant is used only when it covers all retained results and at least one job's temporary bound; its size limits the admitted concurrency. Only one successful reservation is retained.
@@ -84,6 +86,19 @@ Temporary capacity is requested for multiple DV jobs, bounded by the DV unit cou
 Unbounded inputs, the statement deletion-vector limit, or insufficient host capacity select eager delete loading before deferred execution starts. Positional-delete files keep their existing loading path. This route decision does not itself select CPU fallback. Once deferred work starts, read, validation, and allocation failures use the normal failure and replay rules; they never become an empty delete set.
 
 Cancellation closes admission and publication and wakes blocked work. Completion waits for workers, queued results, callbacks, and published consumers to drain. GPU completion alone cannot report success while preparation is still open.
+
+### Host Arrow batch source contract
+
+The shared host Arrow path has two explicit boundaries. `import_arrow_host()` consumes one
+owned `ArrowSchema` plus `ArrowArray` record batch and retains its input capacity through
+the retirement lane. `materialize_arrow_stream()` consumes a sequential internal
+`arrow_batch_source`: each item carries an independently owned batch, a contiguous
+sequence number, and declared row and byte bounds; `nullopt` is the only EOS marker.
+The verifier compares the declared row count with the imported batch, sends results
+directly to a bounded sink, and calls `cancel()` on source, validation, import, or sink
+failure. Producers acquire preparation/output capacity and split oversized input before
+returning an item. An adapter may bridge an `ArrowArrayStream` one batch at a time, but
+this interface does not add a public Fragment Arrow-input API or a native Paimon/DuckLake adapter.
 
 ### Preparation limits
 

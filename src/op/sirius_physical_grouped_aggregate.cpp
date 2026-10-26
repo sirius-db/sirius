@@ -20,9 +20,11 @@
 #include "data/data_batch_utils.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/aggregate/gpu_aggregate_impl.hpp"
+#include "op/aggregate/wide_integer_sum.hpp"
 #include "telemetry/nvtx.hpp"
 
 #include <algorithm>
+#include <functional>
 
 namespace sirius {
 namespace op {
@@ -97,6 +99,8 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
       cudf_aggregate_input_max_abs[aggregate_slots[i].cudf_idx] = aggregate_input_max_abs[i];
     }
   }
+  cudf_aggregate_is_wide_integer_sum =
+    wide_integer_sum_mask(aggregate_slots, cudf_aggregates.size());
 }
 
 duckdb::vector<sirius::logical_type>
@@ -122,6 +126,23 @@ bool sirius_physical_grouped_aggregate::has_stddev_samp() const
   return std::ranges::any_of(aggregate_slots, [](auto const& slot) { return slot.is_stddev_samp; });
 }
 
+std::vector<std::optional<cudf::data_type>>
+sirius_physical_grouped_aggregate::wide_integer_sum_partial_types() const
+{
+  auto const aggregate_offset = num_output_group_columns();
+  if (std::ranges::none_of(cudf_aggregate_is_wide_integer_sum, std::identity{}) ||
+      types.size() != aggregate_offset + cudf_aggregates.size()) {
+    return {};
+  }
+  std::vector<std::optional<cudf::data_type>> alternates(types.size());
+  for (size_t i = 0; i < cudf_aggregate_is_wide_integer_sum.size(); ++i) {
+    if (cudf_aggregate_is_wide_integer_sum[i]) {
+      alternates[aggregate_offset + i] = wide_integer_sum_type();
+    }
+  }
+  return alternates;
+}
+
 std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
   const operator_data& input_data, ::cuda::stream_ref stream)
 {
@@ -144,7 +165,8 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
                                                           stream,
                                                           *space,
                                                           batch_telemetry(),
-                                                          cudf_aggregate_input_max_abs));
+                                                          cudf_aggregate_input_max_abs,
+                                                          cudf_aggregate_is_wide_integer_sum));
       continue;
     }
     auto result = gpu_aggregate_impl::local_grouped_aggregate(input_batch,
@@ -155,7 +177,8 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
                                                               stream,
                                                               *space,
                                                               batch_telemetry(),
-                                                              cudf_aggregate_input_max_abs);
+                                                              cudf_aggregate_input_max_abs,
+                                                              cudf_aggregate_is_wide_integer_sum);
     results.push_back(std::move(result));
   }
   return std::make_unique<pipelineable_operator_data>(results);

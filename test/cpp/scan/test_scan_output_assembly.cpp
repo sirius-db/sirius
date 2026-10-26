@@ -19,6 +19,7 @@
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <cuda_runtime_api.h>
 
@@ -111,7 +112,8 @@ TEST_CASE("scan output assembly projects and reorders data columns without copyi
   auto const original_pointers = data_pointers(input->view());
   scan::owning_table_view view{std::move(input)};
 
-  auto output = scan::assemble_scan_output(plan, std::move(view), {}, test_stream());
+  auto output = scan::assemble_scan_output(
+    plan, std::move(view), {}, test_stream(), cudf::get_current_device_resource_ref());
 
   REQUIRE(output.num_rows() == 2);
   REQUIRE(output.n_columns() == 2);
@@ -135,7 +137,8 @@ TEST_CASE("scan output assembly copies repeated data columns",
   auto const original_pointers = data_pointers(input->view());
   scan::owning_table_view view{std::move(input)};
 
-  auto output = scan::assemble_scan_output(plan, std::move(view), {}, test_stream());
+  auto output = scan::assemble_scan_output(
+    plan, std::move(view), {}, test_stream(), cudf::get_current_device_resource_ref());
 
   REQUIRE(output.num_rows() == 2);
   REQUIRE(output.n_columns() == 3);
@@ -165,7 +168,8 @@ TEST_CASE("scan output assembly interleaves partition and repeated data columns"
   auto const original_pointers = data_pointers(input->view());
   scan::owning_table_view view{std::move(input)};
 
-  auto output = scan::assemble_scan_output(plan, std::move(view), {"2024"}, test_stream());
+  auto output = scan::assemble_scan_output(
+    plan, std::move(view), {"2024"}, test_stream(), cudf::get_current_device_resource_ref());
 
   REQUIRE(output.num_rows() == 2);
   REQUIRE(output.n_columns() == 4);
@@ -190,7 +194,8 @@ TEST_CASE("scan output assembly preserves the row-count carrier for an empty lay
   auto const original_pointers = data_pointers(input->view());
   scan::owning_table_view view{std::move(input)};
 
-  auto output = scan::assemble_scan_output(plan, std::move(view), {}, test_stream());
+  auto output = scan::assemble_scan_output(
+    plan, std::move(view), {}, test_stream(), cudf::get_current_device_resource_ref());
 
   REQUIRE(output.num_rows() == 3);
   REQUIRE(output.n_columns() == 1);

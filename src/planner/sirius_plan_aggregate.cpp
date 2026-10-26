@@ -412,7 +412,8 @@ sirius_physical_plan_generator::try_plan_dense_count_join(duckdb::LogicalAggrega
                       ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
                       : nullptr;
   if (!sirius_ctx) { return nullptr; }
-  auto const& op_params = sirius_ctx->get_config().get_operator_params();
+  auto options          = duckdb::query_operator_options(context);
+  auto const& op_params = *options;
   if (!op_params.enable_dense_count_join) { return nullptr; }
 
   auto const detection = detect_dense_count_join(context, op);
@@ -673,7 +674,9 @@ static bool can_use_perfect_hash_aggregate(duckdb::ClientContext& context,
 
 /// cuDF does not support HUGEINT (int128). DuckDB widens aggregates like sum(int32) to HUGEINT
 /// to avoid overflow. We downcast to BIGINT at the plan level so all downstream operators
-/// (including the result collector) use the correct type.
+/// (including the result collector) use the correct type. The aggregate operators still sum
+/// such inputs without wrapping (op::is_wide_integer_sum): over DECIMAL128 where INT64 could
+/// overflow, and a SUM whose total does not fit BIGINT falls back to DuckDB at runtime.
 static void downcast_hugeint_types(duckdb::vector<duckdb::LogicalType>& types,
                                    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>& exprs)
 {
@@ -744,15 +747,14 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_grouping_sets_aggr
                          op.estimated_cardinality);
 }
 
-/// Whether plan-time statistics may decide decimal SUM widening
+/// Whether plan-time statistics may decide decimal and wide integer SUM widening
 /// (sirius.operator_params.enable_decimal_sum_stats_bound); on without a Sirius context.
 bool decimal_sum_stats_bound_enabled(duckdb::ClientContext& context)
 {
   auto sirius_ctx = context.registered_state
                       ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
                       : nullptr;
-  return !sirius_ctx ||
-         sirius_ctx->get_config().get_operator_params().enable_decimal_sum_stats_bound;
+  return !sirius_ctx || duckdb::query_operator_options(context)->enable_decimal_sum_stats_bound;
 }
 
 }  // namespace
@@ -761,6 +763,31 @@ duckdb::LogicalType sirius_physical_plan_generator::planned_aggregate_type(
   duckdb::LogicalType const& type)
 {
   return type == duckdb::LogicalType::HUGEINT ? duckdb::LogicalType::BIGINT : type;
+}
+
+void sirius_physical_plan_generator::require_planned_schema(
+  std::span<sirius::logical_type const> planned,
+  duckdb::vector<duckdb::LogicalType> const& declared,
+  std::string_view subject)
+{
+  if (planned.size() != declared.size()) {
+    throw duckdb::NotImplementedException(
+      std::string(subject) + ": the planned input has " + std::to_string(planned.size()) +
+      (planned.size() == 1 ? " column" : " columns") + " but the node declares " +
+      std::to_string(declared.size()) + " (falling back to CPU)");
+  }
+  for (duckdb::idx_t i = 0; i < declared.size(); i++) {
+    // BIGINT may stand for a declared HUGEINT: the aggregate builder narrows its own output types
+    // and its parents keep DuckDB's.
+    if (planned[i] == sirius::from_duckdb(declared[i]) ||
+        planned[i] == sirius::from_duckdb(planned_aggregate_type(declared[i]))) {
+      continue;
+    }
+    throw duckdb::NotImplementedException(
+      std::string(subject) + ": the planned input has " + planned[i].to_string() + " for column " +
+      std::to_string(i) + " but the node declares " + sirius::from_duckdb(declared[i]).to_string() +
+      " (falling back to CPU)");
+  }
 }
 
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
@@ -809,7 +836,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
 
   // Resolved before the child is planned: planning moves expressions out of the logical subtree.
   auto const decimal_sum_bounds = decimal_sum_stats_bound_enabled(context)
-                                    ? resolve_decimal_sum_input_bounds(context, op)
+                                    ? resolve_sum_input_bounds(context, op)
                                     : std::vector<std::optional<std::uint64_t>>{};
 
   auto plan = create_plan(*op.children[0]);

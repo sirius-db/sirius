@@ -346,7 +346,8 @@ void pin_columns(sirius_scan_manager& manager,
                  cucascade::memory::memory_space& space,
                  std::string const& table,
                  std::vector<std::string> const& names,
-                 ::cuda::stream_ref stream)
+                 ::cuda::stream_ref stream,
+                 sirius::scan_manager::pinned_entry_metadata metadata = {})
 {
   sirius::scan_manager::cache_entry_info info;
   info.table_name     = table;
@@ -361,17 +362,19 @@ void pin_columns(sirius_scan_manager& manager,
     names.size(),
     sirius::pinned_column_storage_meta{cudf::data_type{cudf::type_id::INT32}, false})};
   manager.insert_pinned_entry_device(
-    table, std::move(info), std::move(chunks), space, std::move(storage));
+    table, std::move(info), std::move(chunks), space, std::move(storage), std::move(metadata));
 }
 
 /// Pin `names` under `table` through the merge-capable GPU path (one INT32
 /// column each, one chunk of 8 rows), and report which columns the insert
 /// actually stored.
-std::vector<std::string> pin_columns_mergeable(sirius_scan_manager& manager,
-                                               cucascade::memory::memory_space& space,
-                                               std::string const& table,
-                                               std::vector<std::string> const& names,
-                                               ::cuda::stream_ref stream)
+std::vector<std::string> pin_columns_mergeable(
+  sirius_scan_manager& manager,
+  cucascade::memory::memory_space& space,
+  std::string const& table,
+  std::vector<std::string> const& names,
+  ::cuda::stream_ref stream,
+  sirius::scan_manager::pinned_entry_metadata metadata = {})
 {
   sirius::scan_manager::cache_entry_info info;
   info.table_name     = table;
@@ -402,7 +405,8 @@ std::vector<std::string> pin_columns_mergeable(sirius_scan_manager& manager,
                                      {&space},
                                      duckdb::vector<duckdb::LogicalType>{},
                                      {},
-                                     std::move(storage));
+                                     std::move(storage),
+                                     std::move(metadata));
 }
 
 std::vector<bool> proven_of(sirius_scan_manager const& manager, std::string_view table)
@@ -426,17 +430,14 @@ TEST_CASE("the pinned entry records the proof by name", "[late_mat][pin_uniquene
   sirius::exec::query_lifecycle_registry scan_lifecycle;
   sirius_scan_manager manager{scan_lifecycle, scan_manager_config{}, *memory, topology};
 
-  pin_columns(manager, *space, "customer", {"c_name", "c_custkey"}, stream);
-  REQUIRE(proven_of(manager, "customer").empty());  // no fact yet = unknown
-
-  std::vector<std::string> const proven{"c_custkey"};
-  manager.attach_proven_unique_columns("customer", proven);
-  // By NAME: the proof lands on position 1, not on the first column.
-  REQUIRE(proven_of(manager, "customer") == std::vector<bool>{false, true});
-
-  // A name that matches no pinned column is ignored rather than mispositioned.
-  std::vector<std::string> const stranger{"o_orderkey"};
-  manager.attach_proven_unique_columns("customer", stranger);
+  pin_columns(manager,
+              *space,
+              "customer",
+              {"c_name", "c_custkey"},
+              stream,
+              {.proven_unique_columns = {"c_custkey", "o_orderkey"}});
+  // The first visible generation includes the proof by name, at position 1.
+  // Unknown names are ignored rather than mispositioned.
   REQUIRE(proven_of(manager, "customer") == std::vector<bool>{false, true});
 }
 
@@ -449,9 +450,8 @@ TEST_CASE("a replacing re-pin starts with no facts", "[late_mat][pin_uniqueness]
   sirius::exec::query_lifecycle_registry scan_lifecycle;
   sirius_scan_manager manager{scan_lifecycle, scan_manager_config{}, *memory, topology};
 
-  pin_columns(manager, *space, "customer", {"c_custkey"}, stream);
-  std::vector<std::string> const proven{"c_custkey"};
-  manager.attach_proven_unique_columns("customer", proven);
+  pin_columns(
+    manager, *space, "customer", {"c_custkey"}, stream, {.proven_unique_columns = {"c_custkey"}});
   REQUIRE(proven_of(manager, "customer") == std::vector<bool>{true});
 
   // Re-pinning the name with a different column set replaces the entry. The
@@ -461,13 +461,14 @@ TEST_CASE("a replacing re-pin starts with no facts", "[late_mat][pin_uniqueness]
   REQUIRE(std::count(after.begin(), after.end(), true) == 0);
 }
 
-TEST_CASE("a merge reports only the columns it actually stored", "[late_mat][pin_uniqueness]")
+TEST_CASE("a merge publishes proofs only for columns it actually stored",
+          "[late_mat][pin_uniqueness]")
 {
   // The merge path keeps an already-cached column's chunks and DROPS the
   // incoming ones. A uniqueness verdict describes the values the pin driver just
   // read, so attaching it to a retained column would assert distinctness about
   // bytes that never entered the cache — and this flag admits a group key. The
-  // insert therefore reports what it stored, and the caller filters by it.
+  // insertion must filter the supplied proofs before publishing the new generation.
   ::cuda::stream_ref const stream{cudaStream_t{}};
   auto memory   = sirius::test::operator_utils::initialize_memory_manager();
   auto topology = single_gpu_index();
@@ -476,23 +477,29 @@ TEST_CASE("a merge reports only the columns it actually stored", "[late_mat][pin
   sirius_scan_manager manager{scan_lifecycle, scan_manager_config{}, *memory, topology};
 
   // First pin stores both of its columns.
-  auto const first =
-    pin_columns_mergeable(manager, *space, "customer", {"c_custkey", "c_name"}, stream);
+  auto const first = pin_columns_mergeable(manager,
+                                           *space,
+                                           "customer",
+                                           {"c_custkey", "c_name"},
+                                           stream,
+                                           {.proven_unique_columns = {"c_name"}});
   REQUIRE(first == std::vector<std::string>{"c_custkey", "c_name"});
 
   // Same row count, one column already cached: only c_nationkey is stored, and
   // c_custkey keeps the chunks it was pinned with.
   auto const merged =
-    pin_columns_mergeable(manager, *space, "customer", {"c_custkey", "c_nationkey"}, stream);
+    pin_columns_mergeable(manager,
+                          *space,
+                          "customer",
+                          {"c_custkey", "c_nationkey"},
+                          stream,
+                          {.proven_unique_columns = {"c_custkey", "c_nationkey"}});
   REQUIRE(merged == std::vector<std::string>{"c_nationkey"});
 
-  // What the caller does with that: a verdict for the retained column is not
-  // attached, so the entry claims nothing about data this pin never stored.
-  std::vector<std::string> const attachable{"c_nationkey"};
-  manager.attach_proven_unique_columns("customer", attachable);
+  // A proof for discarded incoming c_custkey bytes cannot change the retained column.
   auto const proven = proven_of(manager, "customer");
   REQUIRE(proven.size() == 3u);
   REQUIRE(proven[0] == false);  // c_custkey — retained, and unclaimed
-  REQUIRE(proven[1] == false);  // c_name
+  REQUIRE(proven[1] == true);   // c_name keeps its existing proof
   REQUIRE(proven[2] == true);   // c_nationkey — newly stored
 }

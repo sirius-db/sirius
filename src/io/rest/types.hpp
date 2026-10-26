@@ -75,6 +75,7 @@ struct header_capture {
 /// so its iovecs remain stable across retries and until a CUDA event drains.
 struct rest_io_op_request {
   object_ref object;
+  std::string validation_tag;
   std::unique_ptr<io_op_request> op;
   std::size_t attempt{0};
   std::size_t auth_attempt{0};

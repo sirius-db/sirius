@@ -16,6 +16,7 @@
 
 #include "transparent/physical_sirius_execution.hpp"
 
+#include "cuda/device_health.hpp"
 #include "log/logging.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius_context.hpp"
@@ -65,6 +66,7 @@ struct SiriusGlobalSourceState : public duckdb::GlobalSourceState {
 // result; throws if the CPU plan itself fails.
 // DuckDB v2 shares cancellation state between executors, but not their errors:
 // the outer query can report Interrupted before receiving the nested error (#2145).
+// The nested error is recorded on the connection, whose QueryEnd reports it instead.
 duckdb::unique_ptr<duckdb::QueryResult> run_cpu_fallback_plan(
   duckdb::ClientContext& client,
   duckdb::PreparedStatementData& cpu_prepared,
@@ -111,6 +113,16 @@ duckdb::unique_ptr<duckdb::QueryResult> run_cpu_fallback_plan(
     client_config.enable_profiler = saved_enable_profiler;
     return result;
   } catch (...) {
+    // Record the error before this task ends: DuckDB drains it before QueryEnd reads it.
+    if (executor.HasError()) {
+      try {
+        if (auto state = duckdb::get_sirius_connection_state(client)) {
+          state->record_cpu_replay_error(executor.GetError(), client.GetCurrentQuery());
+        }
+      } catch (...) {
+        // Recording is best effort; the replay's error still propagates below.
+      }
+    }
     // Drain any still-registered tasks before the executor is destroyed
     // (~Executor asserts executor_tasks == 0), then restore profiling.
     executor.CancelTasks();
@@ -370,7 +382,11 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
         context.client, "transparent_execution", std::move(gpu_prepared), window->query_id());
 
       if (state.result->HasError()) {
-        gpu_error = state.result->GetErrorObject();
+        gpu_error  = state.result->GetErrorObject();
+        auto error = std::make_exception_ptr(std::runtime_error(gpu_error.RawMessage()));
+        state.sirius_context->get_query_lifecycle_registry().record_error(window->query_id(),
+                                                                          error);
+        // The interface reports typed CUDA failures before converting them to ErrorData.
         state.result.reset();
         gpu_failed = true;
       }
@@ -387,6 +403,7 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
       runtime_unavailable_error = true;
     } catch (std::exception& e) {
       if (window) window->report_failure(std::current_exception());
+      state.sirius_context->get_query_lifecycle_registry().report_failure(std::current_exception());
       gpu_error  = duckdb::ErrorData(e);
       gpu_failed = true;
     }

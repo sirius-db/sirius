@@ -19,6 +19,7 @@
 #include "config.hpp"
 #include "creator/config.hpp"
 #include "exec/config.hpp"
+#include "expression_evaluator/query_policy.hpp"
 #include "op/dynamic_filter/config.hpp"
 #include "scan_manager/config.hpp"
 
@@ -132,7 +133,14 @@ struct operator_params {
 
   /// Engine-owned query policy. The user-facing setting defaults to enabled, but an unwired
   /// execution context stays fail-closed until the engine snapshots the connection value.
-  bool like_swar_fastpath = false;
+  bool like_swar_fastpath                           = false;
+  expression_evaluator_strategy expression_strategy = expression_query_policy{}.strategy;
+  bool enable_regex_jit                             = expression_query_policy{}.regex_jit;
+
+  [[nodiscard]] expression_query_policy expression_policy() const noexcept
+  {
+    return {expression_strategy, enable_regex_jit};
+  }
 
   /// Target batch size (bytes) for DuckDB scan tasks.
   uint64_t scan_task_batch_size = config::DEFAULT_SCAN_TASK_BATCH_SIZE;
@@ -210,9 +218,9 @@ struct operator_params {
   /// Let grouped-aggregation partitions size from projected input.
   bool enable_runtime_size_estimation = false;
 
-  /// Decide decimal SUM widening from base-table statistics at plan time: an aggregate input with
-  /// a proven magnitude bound skips the per-batch min/max scan and its stream synchronization
-  /// (planner::resolve_decimal_sum_input_bounds). Off: every batch is measured.
+  /// Decide decimal and wide integer SUM widening from base-table statistics at plan time: an
+  /// aggregate input with a proven magnitude bound skips the per-batch min/max scan and its stream
+  /// synchronization (planner::resolve_sum_input_bounds). Off: every batch is measured.
   bool enable_decimal_sum_stats_bound = true;
 
   /// Zone-map pruning of pinned-table chunks at cache-serve time: skip cached chunks whose pin-time
@@ -322,6 +330,10 @@ struct sirius_config {
   /// Replace all settings with hardware-resolved defaults. Apply programmatic
   /// overrides afterwards; use parsed_sirius_config::resolve for a supplied topology.
   void apply_defaults();
+  [[nodiscard]] int max_concurrent_queries() const noexcept
+  {
+    return _scan_manager_config.max_concurrent_queries;
+  }
 
   [[nodiscard]] const cucascade::memory::system_topology_info& get_hw_topology() const noexcept
   {
