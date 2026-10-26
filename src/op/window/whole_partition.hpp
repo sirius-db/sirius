@@ -68,8 +68,8 @@ struct whole_partition_aggregate {
  * Result types:
  * - `sum` over signed integers is DECIMAL128 with scale 0, the exact carrier of DuckDB's HUGEINT.
  *   Over decimals it is DECIMAL128 at the input scale and over floating point it is FLOAT64.
- *   8 to 32 bit integers are summed in INT64. 64 bit integers and decimals are widened before
- *   the sum.
+ *   8 to 32 bit integers are summed in INT64. 64 bit integers, DECIMAL32 and DECIMAL64 are
+ *   widened before the sum only when their values could overflow the column's own type.
  * - `avg` is FLOAT64.
  * - `count` and `count_star` are INT64. `count` counts non-NULL arguments and is 0 for a partition
  *   of NULLs. `count_star` counts rows including NULLs.

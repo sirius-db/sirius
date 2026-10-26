@@ -16,6 +16,7 @@
 
 #include "op/window/whole_partition.hpp"
 
+#include "op/aggregate/aggregate_op_util.hpp"
 #include "op/aggregate/wide_integer_sum.hpp"
 
 #include <cudf/aggregation.hpp>
@@ -35,6 +36,7 @@
 #include <limits>
 #include <optional>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace sirius::op {
 namespace {
@@ -204,6 +206,25 @@ struct argument_state {
   std::unique_ptr<cudf::column> avg;      // The per group average, when `needs_avg`.
 };
 
+// The argument columns whose sum cannot overflow the column's own type in `input`, and so is
+// computed in that type.
+std::unordered_set<int> sums_in_place(cudf::table_view input,
+                                      std::vector<argument_state> const& arguments,
+                                      ::cuda::stream_ref stream,
+                                      rmm::device_async_resource_ref mr)
+{
+  std::vector<int> candidates;
+  for (auto const& arg : arguments) {
+    if (widened_sum_type(input.column(arg.column).type())) { candidates.push_back(arg.column); }
+  }
+  auto const needs_widening = sums_needing_widening(input, candidates, stream, mr);
+  std::unordered_set<int> ret;
+  for (auto const column : candidates) {
+    if (!needs_widening.contains(column)) { ret.insert(column); }
+  }
+  return ret;
+}
+
 // sum_no_overflow is a SUM, and any id the evaluator does not compute is rejected.
 std::vector<whole_partition_aggregate> normalize(std::vector<whole_partition_aggregate> aggregates)
 {
@@ -285,10 +306,15 @@ std::unique_ptr<cudf::table> evaluate_whole_partition_window(
   // 2. Build the group by requests. The shared sums come first, each with a count when an `avg`
   // needs one.
   std::vector<cudf::groupby::aggregation_request> requests;
+  auto const in_place = sums_in_place(input, arguments, stream, mr);
   for (auto& arg : arguments) {
     auto values = input.column(arg.column);
-    auto type   = is_narrow_integer(values.type()) ? cudf::data_type{cudf::type_id::INT64}
-                                                   : accumulator_type(values.type());
+    auto type   = accumulator_type(values.type());
+    if (is_narrow_integer(values.type())) {
+      type = cudf::data_type{cudf::type_id::INT64};
+    } else if (in_place.contains(arg.column)) {
+      type = values.type();
+    }
     if (values.type() != type && !is_narrow_integer(values.type())) {
       arg.widened = cudf::cast(values, type, stream, mr);
       values      = arg.widened->view();

@@ -684,3 +684,62 @@ TEST_CASE("whole-partition evaluator rejects invalid requests", "[window_evaluat
     CHECK_THROWS_AS(evaluate({0}, {{function::avg, 3}}), std::invalid_argument);
   }
 }
+
+TEST_CASE("whole-partition evaluator widens only the sum columns that could overflow",
+          "[window_evaluator][gpu]")
+{
+  rmm::cuda_stream owning_stream;
+  auto stream      = owning_stream.view();
+  auto mr          = cudf::get_current_device_resource_ref();
+  auto const keyed = GENERATE(false, true);
+  auto const max64 = std::numeric_limits<int64_t>::max();
+  auto const max32 = std::numeric_limits<int32_t>::max();
+  auto const dec64 = cudf::data_type{cudf::type_id::DECIMAL64, -2};
+  auto const dec32 = cudf::data_type{cudf::type_id::DECIMAL32, -2};
+  std::vector<int64_t> const small64{1, 2, 3, -4};
+  std::vector<int64_t> const large64{max64, max64, 5, 6};
+  std::vector<int64_t> const small_dec64{100, 250, -5, 7};
+  std::vector<int64_t> const large_dec64{max64, max64, 5, 6};
+  std::vector<int32_t> const small_dec32{100, 200, 300, -50};
+  std::vector<int32_t> const large_dec32{max32, max32, 1, 2};
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(
+    column<int32_t>({0, 0, 1, 1}, cudf::data_type{cudf::type_id::INT32}, stream, mr));
+  columns.push_back(column<int64_t>(small64, cudf::data_type{cudf::type_id::INT64}, stream, mr));
+  columns.push_back(column<int64_t>(large64, cudf::data_type{cudf::type_id::INT64}, stream, mr));
+  columns.push_back(column<int64_t>(small_dec64, dec64, stream, mr));
+  columns.push_back(column<int64_t>(large_dec64, dec64, stream, mr));
+  columns.push_back(column<int32_t>(small_dec32, dec32, stream, mr));
+  columns.push_back(column<int32_t>(large_dec32, dec32, stream, mr));
+  cudf::table input(std::move(columns));
+  std::vector<whole_partition_aggregate> aggregates;
+  for (cudf::size_type c = 1; c <= 6; ++c) {
+    aggregates.push_back({function::sum, c});
+  }
+  auto result = evaluate_whole_partition_window(
+    input.view(),
+    keyed ? std::vector<cudf::size_type>{0} : std::vector<cudf::size_type>{},
+    aggregates,
+    stream,
+    mr);
+  REQUIRE(result->num_columns() == 6);
+  auto const group = [&](std::size_t row) { return keyed ? row / 2 : 0; };
+  auto const check = [&](cudf::size_type c, auto const& values, int scale) {
+    auto const column = result->view().column(c);
+    CHECK(column.type() == cudf::data_type{cudf::type_id::DECIMAL128, scale});
+    auto const sums = host<__int128_t>(column, stream);
+    for (std::size_t row = 0; row < values.size(); ++row) {
+      __int128_t expected = 0;
+      for (std::size_t other = 0; other < values.size(); ++other) {
+        if (group(other) == group(row)) { expected += values[other]; }
+      }
+      CHECK(sums[row] == expected);
+    }
+  };
+  check(0, small64, 0);
+  check(1, large64, 0);
+  check(2, small_dec64, -2);
+  check(3, large_dec64, -2);
+  check(4, small_dec32, -2);
+  check(5, large_dec32, -2);
+}
