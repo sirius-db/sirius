@@ -39,7 +39,8 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
     duckdb::vector<sirius::logical_type> types,
     std::size_t estimated_cardinality,
     bool concat_all,
-    uint64_t concat_batch_bytes = sirius::config::DEFAULT_CONCAT_BATCH_BYTES);
+    uint64_t concat_batch_bytes   = sirius::config::DEFAULT_CONCAT_BATCH_BYTES,
+    uint64_t build_chunk_max_rows = sirius::config::DEFAULT_BUILD_CHUNK_MAX_ROWS);
 
   std::string get_name() const override;
 
@@ -66,6 +67,11 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
   //! Whether each partition is released as one group once the source pipeline finishes.
   [[nodiscard]] bool concat_all() const { return _concat_all; }
 
+  //! Let a complete partition above `build_chunk_max_rows` rows leave as several row-bounded
+  //! batches instead of failing. Only a consumer that combines several build chunks per partition
+  //! (a BUILD_PROBE MARK/SEMI/ANTI/INNER join) may allow this; every other consumer expects one.
+  void set_build_split_allowed(bool allowed);
+
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
     const op::input_stats& stats) const override;
 
@@ -83,7 +89,9 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
    * pipeline finishes. Finishing the pipeline also releases an under-threshold tail. When
    * `_concat_all` is set, the complete partition becomes one group after the pipeline finishes.
    * Known row counts also bound each group by the cuDF row-count limit; a complete partition
-   * above that limit is rejected before any batches are claimed or transferred.
+   * above that limit is rejected before any batches are claimed or transferred, unless the
+   * consumer allows a split build (`set_build_split_allowed`), in which case `execute` packs it
+   * into row-bounded batches.
    *
    * The caller must hold the operator mutex `lock`. The plan remains valid while the lock is held
    * because consumers remove batches under the same lock and producers only append batches.
@@ -101,6 +109,8 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
   bool _input_claimed = false;
   bool _concat_all;
   uint64_t _concat_batch_bytes;
+  uint64_t _build_chunk_max_rows;
+  bool _build_split_allowed = false;
 };
 
 }  // namespace op

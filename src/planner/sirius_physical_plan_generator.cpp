@@ -1635,8 +1635,12 @@ void wrap_join_child(sirius::op::sirius_physical_operator& join_op,
         }
       }
 
-      auto concat = duckdb::make_uniq<sirius::op::sirius_physical_concat>(
-        child_types, est_card, join_concat_all(join_op, is_build), op_params.concat_batch_bytes);
+      auto concat =
+        duckdb::make_uniq<sirius::op::sirius_physical_concat>(child_types,
+                                                              est_card,
+                                                              join_concat_all(join_op, is_build),
+                                                              op_params.concat_batch_bytes,
+                                                              op_params.build_chunk_max_rows);
       auto partition = duckdb::make_uniq<sirius::op::sirius_physical_partition>(
         std::move(child_types),
         est_card,
