@@ -611,7 +611,7 @@ void SiriusContext::retire_query_work(sirius::query_id_t query_id, query_retirem
   query_lifecycle_.wait_for_work(query_id);
   // The exchange may still hold batches this rank sent, until their last frame is staged; they
   // must be freed before the query's memory is released.
-  if (auto const distributed = window_distributed_query_.load(); distributed != 0) {
+  if (auto const distributed = distributed_query_of(query_id); distributed != 0) {
     std::shared_ptr<sirius::exchange::exchange_service> service;
     {
       std::lock_guard lock{exchange_mutex_};
@@ -749,6 +749,7 @@ void SiriusContext::StandaloneQueryScope::release() noexcept
   }
   if (connection_state_) {
     connection_state_->execution_window_active = false;
+    connection_state_->active_window           = 0;
     connection_state_->execution_options.reset();
   }
   permit_.reset();
@@ -802,14 +803,21 @@ SiriusContext::StandaloneQueryScope::StandaloneQueryScope(
     ctx.window_task_counter(),
     [registry = &ctx_.query_lifecycle_, id = window_id_, owner = &ctx_](std::exception_ptr error) {
       registry->report_failure(error, id);
-      owner->abort_distributed_query(error);
+      owner->abort_distributed_query(id, error);
     });
   completion_->injections = sirius::transparent::latch_replay_injections(context);
   if (completion_->injections) ctx.record_certification_budget(false, false, 10);
   completion_->non_rollbackable_state =
     completion_->injections && completion_->injections->non_rollbackable_state;
   connection_state_ = get_sirius_connection_state(context);
-  if (connection_state_) connection_state_->execution_window_active = true;
+  if (connection_state_) {
+    connection_state_->execution_window_active = true;
+    connection_state_->active_window           = sirius::value_of(window_id_);
+    if (auto const planned = std::exchange(connection_state_->planned_distributed_query, 0)) {
+      std::lock_guard lock{ctx_.exchange_mutex_};
+      ctx_.distributed_by_window_[sirius::value_of(window_id_)] = planned;
+    }
+  }
   std::snprintf(begin_tag_,
                 sizeof(begin_tag_),
                 "QueryBegin instance=%p connection=%llu window=%llu query=%llu",
@@ -923,7 +931,10 @@ SiriusContext::StandaloneQueryScope::~StandaloneQueryScope() noexcept
     release();
     state_ = scope_state::FAILED;
   }
-  ctx_.window_distributed_query_.store(0);
+  {
+    std::lock_guard lock{ctx_.exchange_mutex_};
+    ctx_.distributed_by_window_.erase(sirius::value_of(window_id_));
+  }
   std::lock_guard lock(ctx_.window_completions_mutex_);
   ctx_.window_completions_.erase(sirius::value_of(window_id_));
 }
@@ -1275,10 +1286,41 @@ void SiriusContext::terminate()
   is_initialized_ = false;
 }
 
-void SiriusContext::abort_distributed_query(std::exception_ptr const& error) noexcept
+uint64_t SiriusContext::next_distributed_query(ClientContext& context)
+{
+  std::lock_guard lock{exchange_mutex_};
+  auto const connection = context.GetConnectionId();
+  if (!distributed_connection_) { distributed_connection_ = connection; }
+  if (*distributed_connection_ != connection) {
+    throw sirius::invalid_input_exception(
+      "distributed execution runs on one connection per process: connection {} runs it, so "
+      "connection {} cannot",
+      *distributed_connection_,
+      connection);
+  }
+  auto const query = ++distributed_queries_;
+  if (auto state = get_sirius_connection_state(context)) {
+    if (state->active_window != 0) {
+      distributed_by_window_[state->active_window] = query;
+    } else {
+      state->planned_distributed_query = query;
+    }
+  }
+  return query;
+}
+
+uint64_t SiriusContext::distributed_query_of(sirius::query_id_t window)
+{
+  std::lock_guard lock{exchange_mutex_};
+  auto const it = distributed_by_window_.find(sirius::value_of(window));
+  return it == distributed_by_window_.end() ? 0 : it->second;
+}
+
+void SiriusContext::abort_distributed_query(sirius::query_id_t window,
+                                            std::exception_ptr const& error) noexcept
 {
   try {
-    auto const query = window_distributed_query_.load();
+    auto const query = distributed_query_of(window);
     if (query == 0) { return; }
     std::shared_ptr<sirius::exchange::exchange_service> service;
     {

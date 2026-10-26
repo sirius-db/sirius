@@ -115,6 +115,7 @@ class SiriusConnectionState : public ClientContextState {
     if (is_internal_query_active()) return;
     captured_plan_.reset();
     captured_original_views_.reset();
+    planned_distributed_query = 0;
     // DuckDB has finished/abandoned the previous statement before starting another.
     // Backstop a missing QueryEnd without releasing an outer writer during internal SQL.
     pinned_update_guard_.reset();
@@ -134,6 +135,11 @@ class SiriusConnectionState : public ClientContextState {
   std::optional<sirius::compression_config> compression_overrides;
   std::shared_ptr<const sirius::operator_params> execution_options;
   bool execution_window_active{false};
+  /// The execution window open on this connection, 0 when none.
+  uint64_t active_window{0};
+  /// The distributed query this connection planned before its execution window opened; the
+  /// window adopts it. Cleared at each statement's start, so a plan that never ran leaves nothing.
+  uint64_t planned_distributed_query{0};
 
   /// \brief Report @p error, not the interrupt it raised, when the CPU replay failed.
   ///
@@ -802,19 +808,19 @@ class SiriusContext : public ClientContextState {
   [[nodiscard]] std::shared_ptr<sirius::exchange::exchange_service> get_exchange_service(
     sirius::operator_params const& params);
 
-  /// \brief Numbers this connection's distributed queries, from 1; every rank runs the same
-  /// statements, so the same query gets the same number, and its exchanges the same stream ids.
-  /// The current execution window runs it: abort_distributed_query() names it to the peers.
-  [[nodiscard]] uint64_t next_distributed_query() noexcept
-  {
-    auto const query = ++distributed_queries_;
-    window_distributed_query_.store(query);
-    return query;
-  }
+  /// \brief Numbers a distributed query planned on @p context, from 1, and ties it to the
+  /// connection's execution window. Every rank runs the same statements, so the same query gets
+  /// the same number, and its exchanges the same stream ids. That holds for one statement stream
+  /// only, so one connection per process runs distributed queries.
+  /// @throws sirius::invalid_input_exception when another connection already runs them.
+  [[nodiscard]] uint64_t next_distributed_query(ClientContext& context);
 
-  /// \brief The current window's query failed with @p error: if it is a distributed query, every
+  /// \brief The distributed query execution window @p window runs, or 0.
+  [[nodiscard]] uint64_t distributed_query_of(sirius::query_id_t window);
+
+  /// \brief Window @p window's query failed with @p error: if it is a distributed query, every
   /// peer's run of it fails too, rather than waiting for this rank's batches.
-  void abort_distributed_query(std::exception_ptr const& error) noexcept;
+  void abort_distributed_query(sirius::query_id_t window, std::exception_ptr const& error) noexcept;
 
   /// \brief Whether the Sirius context has been initialized (config loaded, GPU ready).
   [[nodiscard]] bool is_initialized() const noexcept { return is_initialized_; }
@@ -1036,9 +1042,11 @@ class SiriusContext : public ClientContextState {
   uint32_t exchange_rank_{0};
   std::shared_ptr<sirius::exchange::exchange_service> exchange_service_;
   uint64_t distributed_queries_{0};
-  /// The distributed query last planned, which the execution window runs (the plan may be built
-  /// before the window opens); 0 once the window ends.
-  std::atomic<uint64_t> window_distributed_query_{0};
+  /// The connection that runs this process's distributed queries.
+  std::optional<connection_t> distributed_connection_;
+  /// Each open execution window's distributed query. A window may retire while another
+  /// connection's window runs, so it names its own.
+  std::unordered_map<uint64_t, uint64_t> distributed_by_window_;
 };
 
 /// Installs the sink selected by `Config::LOG_BACKEND` (with `Config::LOG_*`).
