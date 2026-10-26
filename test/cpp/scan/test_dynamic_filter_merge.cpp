@@ -52,6 +52,7 @@
 #include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/null_device_memory_resource.hpp>
 #include <data/data_batch_utils.hpp>
+#include <duckdb/common/multi_file/multi_file_reader.hpp>
 #include <duckdb/planner/filter/constant_filter.hpp>
 #include <op/dynamic_filter/detail/accumulated_bloom_builder.hpp>
 #include <op/dynamic_filter/detail/accumulation_failure.hpp>
@@ -252,6 +253,33 @@ TEST_CASE("merge_dynamic_filters_into_ast skips filters lacking the AST capabili
 
   REQUIRE(root == nullptr);
   REQUIRE(tree.size() == 0);
+}
+
+TEST_CASE("merge_dynamic_filters_into_ast resolves reordered physical output beside virtuals",
+          "[dynamic_filter][scan_merge][virtual_columns]")
+{
+  scan_plan plan;
+  plan.data_columns  = {{0, "id"}, {1, "value"}};
+  plan.output_layout = {{scan_plan::output_entry::DATA, 2}, {scan_plan::output_entry::DATA, 1}};
+  plan.virtual_columns.push_back({duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILE_INDEX,
+                                  "file_index",
+                                  sirius::logical_type::make(sirius::type_id::UBIGINT),
+                                  scan_plan::parquet_virtual_column_kind::FILE_INDEX,
+                                  2});
+
+  sirius_dynamic_filter_set filters;
+  auto producer = filters.register_producer({0, 1});
+  producer.push_filter(0, make_zone_map(0, 1));
+  cudf::ast::tree virtual_tree;
+  CHECK(merge_dynamic_filters_into_ast(virtual_tree, nullptr, filters.snapshot(), plan) == nullptr);
+  CHECK(virtual_tree.size() == 0);
+
+  producer.push_filter(1, make_zone_map(10, 20));
+  cudf::ast::tree tree;
+  REQUIRE(merge_dynamic_filters_into_ast(tree, nullptr, filters.snapshot(), plan) != nullptr);
+  REQUIRE(tree.size() == 6);
+  auto const& column = dynamic_cast<cudf::ast::column_name_reference const&>(tree[0]);
+  CHECK(column.get_column_name() == "value");
 }
 
 TEST_CASE("merge_dynamic_filters_into_ast AND-conjoins multiple filters across columns",

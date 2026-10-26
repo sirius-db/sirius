@@ -105,6 +105,18 @@ TEST_CASE("tree pipeline build plans sirius_read_parquet scans",
 
   auto parquet_path = tmp / "kv.parquet";
   generate_parquet(parquet_path);
+  auto collision_path = tmp / "physical_names.parquet";
+  {
+    sirius::test::scoped_sirius_disable disable;
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection gen(db);
+    auto result = gen.Query(
+      "COPY (SELECT range AS k, CASE WHEN range = 0 THEN NULL ELSE 'physical' END AS filename, "
+      "77::BIGINT AS file_index, 88::INTEGER AS file_row_number FROM range(2)) TO " +
+      sirius::test::sql_literal(collision_path.string()) + " (FORMAT PARQUET)");
+    REQUIRE(result);
+    REQUIRE_FALSE(result->HasError());
+  }
 
   auto yaml_path = tmp / "srp_tree.yaml";
   write_config(yaml_path);
@@ -127,5 +139,80 @@ TEST_CASE("tree pipeline build plans sirius_read_parquet scans",
     REQUIRE_FALSE(res->HasError());  // pre-fix: "Unsupported scan function: sirius_read_parquet"
     REQUIRE(res->Collection().GetValue(0, 0).GetValue<int64_t>() == kRows - 1);
     REQUIRE(res->Collection().GetValue(1, 0).GetValue<int64_t>() == kRows);
+
+    auto const scan =
+      "sirius_read_parquet(" + sirius::test::sql_literal(parquet_path.string()) + ")";
+    auto virtuals = con.Query("SELECT filename, file_index, file_row_number, k FROM " + scan +
+                              " WHERE k IN (1, 8193, 99999) ORDER BY k");
+    REQUIRE(virtuals);
+    INFO((virtuals->HasError() ? virtuals->GetError() : ""));
+    REQUIRE_FALSE(virtuals->HasError());
+    REQUIRE(virtuals->RowCount() == 3);
+    CHECK(virtuals->GetTypes()[0] == duckdb::LogicalType::VARCHAR);
+    CHECK(virtuals->GetTypes()[1] == duckdb::LogicalType::UBIGINT);
+    CHECK(virtuals->GetTypes()[2] == duckdb::LogicalType::BIGINT);
+    for (duckdb::idx_t row = 0; row < virtuals->RowCount(); ++row) {
+      CHECK(virtuals->Collection().GetValue(0, row).ToString() == parquet_path.string());
+      CHECK(virtuals->Collection().GetValue(1, row).GetValue<uint64_t>() == 0);
+      CHECK(virtuals->Collection().GetValue(2, row).GetValue<int64_t>() ==
+            virtuals->Collection().GetValue(3, row).GetValue<int64_t>());
+    }
+
+    auto filtered = con.Query("SELECT k FROM " + scan + " WHERE file_row_number = 8193");
+    REQUIRE(filtered);
+    REQUIRE_FALSE(filtered->HasError());
+    REQUIRE(filtered->RowCount() == 1);
+    CHECK(filtered->Collection().GetValue(0, 0).GetValue<int64_t>() == 8193);
+
+    // Virtual columns are non-null, including when they are only referenced by
+    // a predicate. Exercise the residual path rather than assuming the
+    // planner's IS_NOT_NULL exemption also handles virtual bindings.
+    for (auto const* name : {"filename", "file_index", "file_row_number"}) {
+      CAPTURE(name);
+      auto non_null = con.Query("SELECT count(*) FROM " + scan + " WHERE " + name + " IS NOT NULL");
+      REQUIRE(non_null);
+      INFO((non_null->HasError() ? non_null->GetError() : ""));
+      REQUIRE_FALSE(non_null->HasError());
+      CHECK(non_null->Collection().GetValue(0, 0).GetValue<int64_t>() == kRows);
+      auto only_null = con.Query("SELECT k FROM " + scan + " WHERE " + name + " IS NULL");
+      REQUIRE(only_null);
+      REQUIRE_FALSE(only_null->HasError());
+      CHECK(only_null->RowCount() == 0);
+    }
+
+    auto empty = con.Query("SELECT filename, file_index, file_row_number FROM " + scan +
+                           " WHERE file_index = 1");
+    REQUIRE(empty);
+    REQUIRE_FALSE(empty->HasError());
+    CHECK(empty->RowCount() == 0);
+
+    auto star = con.Query("SELECT * FROM " + scan + " LIMIT 1");
+    REQUIRE(star);
+    REQUIRE_FALSE(star->HasError());
+    CHECK(star->ColumnCount() == 2);
+
+    // Names alone do not establish virtual identity: real columns win binding,
+    // retain their physical types, and may contain nulls.
+    auto const collision_scan =
+      "sirius_read_parquet(" + sirius::test::sql_literal(collision_path.string()) + ")";
+    auto physical = con.Query("SELECT filename, file_index, file_row_number FROM " +
+                              collision_scan + " ORDER BY k");
+    REQUIRE(physical);
+    INFO((physical->HasError() ? physical->GetError() : ""));
+    REQUIRE_FALSE(physical->HasError());
+    REQUIRE(physical->RowCount() == 2);
+    CHECK(physical->GetTypes()[1] == duckdb::LogicalType::BIGINT);
+    CHECK(physical->GetTypes()[2] == duckdb::LogicalType::INTEGER);
+    CHECK(physical->Collection().GetValue(0, 0).IsNull());
+    CHECK(physical->Collection().GetValue(0, 1).ToString() == "physical");
+    for (duckdb::idx_t row = 0; row < physical->RowCount(); ++row) {
+      CHECK(physical->Collection().GetValue(1, row).GetValue<int64_t>() == 77);
+      CHECK(physical->Collection().GetValue(2, row).GetValue<int32_t>() == 88);
+    }
+    auto physical_nulls = con.Query("SELECT k FROM " + collision_scan + " WHERE filename IS NULL");
+    REQUIRE(physical_nulls);
+    REQUIRE_FALSE(physical_nulls->HasError());
+    REQUIRE(physical_nulls->RowCount() == 1);
+    CHECK(physical_nulls->Collection().GetValue(0, 0).GetValue<int64_t>() == 0);
   }
 }

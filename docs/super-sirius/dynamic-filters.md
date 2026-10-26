@@ -169,6 +169,8 @@ Each batch of `sirius_physical_dynamic_filter` gets a fresh prepared program and
 
 Late-materialization planning treats registered dynamic-filter targets as value readers at their endpoint, even before any filter publishes. An unscoped producer makes every input column a value read there; untargeted payload can continue to defer. Existing port materialization restores any deferred target values before endpoint execution and keeps the scan payload and its receipt. Decode membership probes attach only to compressed pins, and late materialization refuses compressed origins today, so a deferring scan never carries them. Should compressed origins become deferrable, a scan with an installed deferral still attaches none (`sirius_gpu_scan_operator::decode_consumer` is null), because a deferral addresses whole pinned chunks; its endpoint filters the restored rows instead.
 
+Plain Parquet virtual-column scans admit reader filters only on physical columns, resolved through `output_layout`. Virtual and Hive columns remain outside the reader filter. Partial or dynamic-only pushdown keeps the static residual. A potential dynamic-filter set prevents metadata-only scans even before publication. Iceberg keeps its existing delete-related gates.
+
 ## Filter selection
 
 The publisher emits at most one membership representation per admitted key and may additionally emit a zone map:

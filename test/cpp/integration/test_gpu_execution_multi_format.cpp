@@ -2859,6 +2859,10 @@ TEST_CASE_METHOD(ParquetVirtualColumnFixture,
                      " WHERE file_row_number BETWEEN 1 AND 2 ORDER BY sentinel");
   compare_gpu_vs_cpu("SELECT sentinel, file_index FROM " + files() +
                      " WHERE file_index = 1 ORDER BY sentinel");
+  compare_gpu_vs_cpu("SELECT sentinel, file_index, file_row_number FROM " + files() +
+                     " WHERE file_index IN (1, NULL) ORDER BY sentinel");
+  compare_gpu_vs_cpu("SELECT sentinel, file_index, file_row_number FROM " + files() +
+                     " WHERE file_index IN (1, NULL) OR x = 10 ORDER BY sentinel");
   compare_gpu_vs_cpu("SELECT sentinel, filename FROM " + files() +
                      " WHERE filename LIKE '%b.parquet' ORDER BY sentinel");
   compare_gpu_vs_cpu("SELECT sentinel, file_row_number FROM " + files() +
@@ -2958,13 +2962,13 @@ TEST_CASE_METHOD(ParquetVirtualColumnFixture,
 }
 
 TEST_CASE_METHOD(ParquetVirtualColumnFixture,
-                 "parquet nested-only virtual scans decline before GPU execution",
+                 "parquet nested-only virtual scans synthesize metadata on GPU",
                  "[integration][gpu_execution][scan][virtual_columns][virtual_review]")
 {
-  sirius::test::scoped_setting fallback(*con, "enable_duckdb_fallback", true);
-  compare_gpu_vs_cpu("SELECT file_row_number FROM " + file("nested_only.parquet"),
-                     std::nullopt,
-                     gpu_route::plan_fallback);
+  sirius::test::scoped_setting fallback(*con, "enable_duckdb_fallback", false);
+  compare_gpu_vs_cpu("SELECT file_row_number FROM " + file("nested_only.parquet"));
+  compare_gpu_vs_cpu("SELECT filename, file_index, file_row_number FROM " +
+                     file("nested_only.parquet"));
 }
 
 TEST_CASE_METHOD(ParquetVirtualColumnFixture,

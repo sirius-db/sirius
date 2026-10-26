@@ -141,6 +141,16 @@ std::unique_ptr<cudf::table> append_parquet_virtual_columns(std::unique_ptr<cudf
   std::vector<std::unique_ptr<cudf::column>> columns = table->release();
   columns.reserve(columns.size() + plan.virtual_columns.size());
   for (auto const& virtual_column : plan.virtual_columns) {
+    if (rows == 0) {
+      auto const type =
+        virtual_column.kind == scan_plan::parquet_virtual_column_kind::FILENAME
+          ? cudf::type_id::STRING
+        : virtual_column.kind == scan_plan::parquet_virtual_column_kind::FILE_ROW_NUMBER
+          ? cudf::type_id::INT64
+          : cudf::type_id::UINT64;
+      columns.push_back(cudf::make_empty_column(type));
+      continue;
+    }
     switch (virtual_column.kind) {
       case scan_plan::parquet_virtual_column_kind::FILENAME: {
         cudf::string_scalar value(file_path, true, stream, mr);
@@ -303,7 +313,8 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
                           duckdb::vector<sirius::logical_type> const& returned_types,
                           std::size_t projected_output_count,
                           duckdb::vector<duckdb::HivePartitioningIndex> const& partition_indices,
-                          std::vector<bound_virtual_column> const& virtual_columns)
+                          std::vector<bound_virtual_column> const& virtual_columns,
+                          bool allow_metadata_only)
 {
   scan_plan plan;
 
@@ -475,7 +486,7 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
     }
   }
 
-  if (plan.has_user_virtual_columns() && plan.data_columns.empty()) {
+  if (plan.has_user_virtual_columns() && plan.data_columns.empty() && !allow_metadata_only) {
     throw duckdb::NotImplementedException(
       "parquet virtual scan: no supported physical row-count carrier");
   }

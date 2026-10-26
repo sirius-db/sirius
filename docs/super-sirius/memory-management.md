@@ -68,6 +68,12 @@ mount_paths;                    // directories for spill files
 memory_capacity = 1TB;          // total spill capacity
 ```
 
+## Parquet scan working sets
+
+Virtual-column reader scans budget selected rows before filtering, including cuDF source/row indexes, output columns and filter/cast scratch. Plain Parquet no longer needs the old per-row-group concatenation allowance; Iceberg still does. Filename estimates include characters, offsets and construction buffers, with saturating arithmetic.
+
+Metadata-only scans reserve synthesized columns and temporary buffers, but no compressed data or data prefetch. Typed empty virtual columns allocate no scalar buffers. The coalescer and execution task use the same read mode for their estimates.
+
 ## Memory Reservations
 
 Pipeline tasks acquire memory reservations before execution to prevent GPU OOM:

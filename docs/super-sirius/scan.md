@@ -116,7 +116,9 @@ There is no factory class. Each implementation provides a free `make_ingestible(
 
 ### Parquet ingestible
 
-`parquet_gpu_ingestible` (`parquet_gpu_ingestible.{hpp,cpp}`) builds the canonical `scan_plan` and shared `parquet_reader_options` (column projection only) once in its constructor, and pre-coalesces the DuckDB filter into a stored expression (partition-column filters dropped — DuckDB already prunes the file list by hive value). `next_split_provider` hands out **one file at a time**: each metadata task opens the file's `sirius_datasource`, reuses or parses+caches the footer, runs the FLBA-decimal pushdown-safety probe, translates the filter to a cuDF AST and prunes row groups by statistics, estimates each surviving row group's projected data columns and all decoded column buffers (plus the partition columns the split will synthesize, which count toward both estimates), and emits one `parquet_file_scan_info`. A column-less scan's row-count carrier (see `scan_plan` below) is resolved per file: a file that lacks the carrier column, or has no row groups to resolve it against, keeps natural-batch reader options and is sized as the full-width read it is. The coalescer caps batches on decoded column-buffer bytes, while preserving projected-column bytes separately for memory history, and never puts files with different reader options in one split. `materialize_metadata_to_table` reads the bundled row-group slices via `cudf::io::read_parquet` (re-translating the filter on the task-local stream for reader-side pushdown unless the per-file probe disabled it), and assembles hive-partition output inline. Reader-side filter pushdown is a per-split decision.
+`parquet_gpu_ingestible` prunes files using supported `filename`/`file_index` predicates, then uses footer statistics to select row groups and batch compatible files. Plain Parquet virtual-column scans use one cuDF read per split. cuDF preserves original row positions through filtering; Sirius maps reader-local source indexes back to bound file identities. Partial pushdown keeps the full residual predicate.
+
+Virtual-only queries with no physical value dependency or potential dynamic filter can synthesize rows from footer counts without a data read. Iceberg retains its existing per-row-group layout and delete handling. See [scan_plan](#scan_plan) for column layout and carrier selection.
 
 ### DuckDB-native ingestible
 
@@ -196,27 +198,30 @@ struct scan_plan {
   std::vector<data_column>           data_columns;       // columns read from parquet, in batch order (D)
   std::vector<partition_column>      partition_columns;  // hive-injected columns (name, type, primary index)
   std::vector<output_entry>          output_layout;      // one entry per output column, in DuckDB order
-  std::vector<std::optional<size_t>> batch_position_by_column_id;  // C -> D map
+  std::vector<std::optional<size_t>> batch_position_by_column_id;  // C -> M map
   std::unordered_set<size_t>         partition_primary_indices;    // for filter-skip
   std::optional<size_t>              carrier_batch_index;          // D index of a column-less scan's row-count carrier
 };
 ```
 
-Three index spaces appear in the parquet path:
+The scan plan distinguishes four column positions:
 
-- **P (primary index)** — DuckDB schema position
-- **C (column-ids position)** — index into the scan's `column_ids` list
-- **D (batch position)** — column position in the cuDF reader output (post-hive-removal)
+- **P** — position in DuckDB's full schema.
+- **C** — position in `column_ids`.
+- **D** — physical data position, after removing cuDF's optional source/row index columns.
+- **M** — D followed by synthesized virtual columns.
 
-`output_layout` is walked once during materialization to produce the final table: `DATA(k)` entries `std::move` from the read batch at position k, `PARTITION(k)` entries synthesize a scalar-backed column from the hive partition value. Pure-filter data columns (read but not output) fall out of scope and free.
+`batch_position_by_column_id` maps C to M. In `output_layout`, `DATA(k)` selects M[k] and `PARTITION(k)` selects a Hive partition value. Reader filters may reference only the physical D prefix. Output assembly moves unique columns, copies repeated selections, and drops filter-only columns.
 
-For `SELECT *` with no partitions and no pure-filter columns, the plan is a trivial identity and the reader output is forwarded unchanged — no permute, no copy. `SELECT count(*)` also has an empty `output_layout`; that short circuit leaves the read batch unchanged rather than synthesizing a 0-column table (a zero-column cudf table carries no row count), and the downstream count aggregation uses the batch row count. So that this batch does not decode every file column, `build_scan_plan` gives a column-less scan (count(*), virtual-only, or partition-only) a **row-count carrier**: the narrowest fixed-width non-partition column, read as a data column with no output entry — the same shape as a pure-filter column — and recorded in `carrier_batch_index`, so the reader projects to that one column. Schemas with no fixed-width column keep the natural batch; `set_column_names({})` is never passed to cuDF. Partition columns synthesized for the output count toward both size estimates, so a partition-only scan is not sized by its carrier alone.
+A query without physical output may read an unused **row-count carrier**, since a zero-column cuDF table cannot preserve cardinality. Ordinary count/partition-only scans and Iceberg keep their existing carrier selection. Plain Parquet virtual-column scans choose a narrow carrier from each file and normalize this unused column to INT8; when no better candidate is known, the existing fallback remains.
+
+Eligible metadata-only scans synthesize the carrier and virtual columns, including nested-only files that need no physical carrier. Their empty physical projection still validates footer identity and encryption evidence. Potential dynamic filters prevent this mode even before publication. `set_column_names({})` is never passed to cuDF.
 
 Sirius keeps `file_index` as the zero-based index in the original bound file list. When `file_index` is projected, DuckDB may instead renumber files after a runtime join filter on a Hive partition column or the legacy `filename=true` column; this known difference is tracked in [duckdb/duckdb#26044](https://github.com/duckdb/duckdb/issues/26044).
 
 ## Column Mapping
 
-Parquet column-chunk order is not guaranteed to match DuckDB's logical column order. `parquet_gpu_ingestible` builds a name-based DuckDB->parquet mapping via `parquet_schema_mapping::leaf_indices_for_column(schema, column_name)`, which walks the parquet schema's `path_in_schema` (case-insensitive, mirroring DuckDB).
+Parquet column-chunk order is not guaranteed to match DuckDB's logical column order. `parquet_gpu_ingestible` builds a name-based DuckDB->parquet mapping via `parquet_schema_mapping::leaf_indices_for_column(schema, column_name)`, which walks the parquet schema's `path_in_schema` using the exact bound column name.
 
 For nested types (`STRUCT`, `LIST`, `MAP`), one DuckDB column maps to multiple parquet leaf chunks; the mapping returns all leaves under the top-level column name. The cuDF parquet reader, given a top-level column name, materializes the nested `cudf::column` natively without post-read reassembly. MAP-annotated groups are recognized in the schema walk (`parquet_helpers.cpp`), consuming the `key_value` repeated group and mapping to `duckdb::LogicalType::MAP`. Nested columns can be scanned and projected through to the result, but not *operated on* — a nested column in WHERE, GROUP BY, or JOIN ON is rejected during plan generation (see [Physical Plan Generation](physical-plan-generation.md)).
 
@@ -424,7 +429,7 @@ the direct column-merge API also rejects a merge while readers retain the existi
 
 When many small files (or row-group ranges) each yield a tiny GPU batch, per-task scheduling and kernel-launch overhead dominates. Coalescing is a responsibility of each `gpu_ingestible`, exposed through the `batch_coalescer` interface (`op/scan/batch_coalescer.hpp`): as the metadata side emits per-unit `scan_info`s, the sequencer feeds each one to the coalescer via `push()` (which may buffer and return zero or more ready batches) and `flush()` (remaining buffered batches at end of input).
 
-- **`parquet_batch_coalescer`** (in `parquet_gpu_ingestible.cpp`): accumulates each file's pruned row groups into `parquet_split_info` batches sized to `approximate_batch_size` decoded column-buffer bytes, including filter-only columns. A single large file fills multiple batches; several small files bundle into one batch — but only when they share identical hive-partition values and the same pushdown decision (a mismatch on either forces a flush). It also seals a batch before it would exceed `cudf::size_type` rows. The downstream `cudf::io::read_parquet` reads all bundled slices in one invocation. Virtual-column scans are currently an exception: they read selected row groups separately and concatenate the results to preserve file and file-row provenance.
+- **`parquet_batch_coalescer`** (in `parquet_scan_core.cpp`): accumulates each file's pruned row groups into `parquet_split_info` batches sized to `approximate_batch_size` decoded column-buffer bytes, including filter-only columns. A single large file fills multiple batches; several small files bundle into one batch — but only when they share identical hive-partition values and the same pushdown decision (a mismatch on either forces a flush). It also seals a batch before it would exceed `cudf::size_type` rows. The downstream `cudf::io::read_parquet` reads all bundled slices in one invocation. Iceberg virtual-column scans retain per-row-group reads and concatenation for their delete layout.
 - **`duckdb_native_batch_coalescer`** (in `duckdb_native_gpu_ingestible.cpp`): accumulates row-group ranges up to `approximate_batch_size` decoded bytes, and additionally seals a batch before any VARCHAR column's accumulated bytes would cross the cuDF int32 string-offset threshold.
 
 The coalescer runs inside the per-query sequencer (`load_balancing_scan_batch_coalescer`), so coalescing, device balancing, and prefetch hinting happen at one place per emitted batch.
@@ -505,9 +510,7 @@ When filter pushdown is enabled and the `gpu_expression_translator` successfully
 
 Reader-side pushdown is a per-split decision: an FLBA-decimal safety probe can disable it for a file, in which case the cached DuckDB filter expression is evaluated through `expression_evaluator` on the decoded batch in `post_filter_and_project`.
 
-Virtual-column scans currently disable reader-side row filtering, including dynamic-filter AST merging. Row-group statistics pruning remains enabled, but all rows in selected row groups are decoded before residual predicates and membership filters run—even for a selective `WHERE filename = ...`.
-
-Follow-up work can use cuDF's `enable_prepend_source_index_column()` and `enable_prepend_row_index_column()` APIs to preserve file and row identity during whole-split reads with filtering. Source selection for `filename`/`file_index` predicates and Iceberg positional-delete handling need separate integration.
+Ordinary Parquet virtual-column scans can use cuDF's source and row index columns to preserve file and row identity during reader filtering. Static `filename`/`file_index` filters can discard whole sources before footer work; row-group statistics pruning remains a separate step. Iceberg retains its existing row layout and positional-delete handling.
 
 **Filter translation path:** `TableFilterSet` -> `convert_table_filters_to_expression()` (skips `OPTIONAL_FILTER` and partition-column filters) -> `gpu_expression_translator` -> cuDF AST tree. Ordinary scans also skip top-level `IS_NOT_NULL`; virtual-column scans retain it in the residual predicate evaluated after decoding. Null-count pruning collects null-test predicates directly from the original `TableFilterSet`, independently of expression translation.
 
@@ -572,6 +575,8 @@ The scan manager builds a local ioctx (`uring_ioctx` for `backend: sirius`, othe
 **Files:** `src/io/rest/`, `src/io/rest/`, `src/io/s3/`, `src/io/s3/`, `src/io/datasource_factory.cpp`, `src/op/scan/parquet_gpu_ingestible.cpp`
 
 `rest_ioctx = templated_ioctx<rest_reactor>` handles `s3://` paths for AWS S3 and compatible stores such as MinIO. The `gs://` and `azure://` schemes parsed by `uri_parser` have no registered backend. DuckDB uses the read-only `sirius_httpfs` to bind transparent `read_parquet('s3://...')` queries, while scan-manager callers can open the same path directly through the datasource registry. S3 scans require GPU execution and have no DuckDB CPU fallback.
+
+For an explicit `gpu_execution` call, the S3 SQL rewrite uses the internal single-URI `sirius_read_parquet` function. Its virtual-column callback exposes the same IDs and types as native Parquet: `filename` (VARCHAR), `file_index` (UBIGINT), and `file_row_number` (BIGINT). Explicit references can project or filter these columns; `SELECT *` excludes them, and same-named physical columns retain their physical identity. The filename is the bound S3 URI. Transparent SQL continues to use the native binder, including its glob expansion. The strict `pixi run make s3-test` gate exercises both entries with fallback disabled; the default test suite covers registration and the internal binder with local fixtures but does not start the managed SeaweedFS backend.
 
 **Key semantics.** The key portion of an `s3://` URI is literal text. `uri_parser` does not percent-decode it or split it at `?` or `#`; SigV4 applies RFC 3986 encoding when it builds the request, matching AWS CLI behavior. So `s3://bucket/my%20file.parquet` addresses the key `my%20file.parquet`; use an actual space to address `my file.parquet`.
 
@@ -800,7 +805,7 @@ remote-DV gates. Schema evolution is limited to the qualified flat profile descr
 | `src/op/scan/duckdb_native_gpu_ingestible.cpp` / `src/op/scan/duckdb_native_gpu_ingestible.hpp` | DuckDB-native ingestible + `duckdb_native_batch_coalescer` |
 | `src/op/scan/batch_coalescer.hpp` | Coalescer interface |
 | `src/op/scan/owning_table_view.hpp` | View-or-table handle with no-alloc reorder/drop/select |
-| `src/op/scan/scan_plan.hpp` / `src/op/scan/scan_plan.cpp` | Index-space mapping (P/C/D), output layout, partition injection |
+| `src/op/scan/scan_plan.hpp` / `src/op/scan/scan_plan.cpp` | Index-space mapping (P/C/D/M/O), output layout, partition injection |
 | `src/op/scan/parquet_schema_mapping.hpp` | Name-based DuckDB->parquet column resolution |
 | `src/op/scan/row_group_metadata.hpp` | `row_group_slice` + `hybrid_scan_reader` |
 | `src/op/scan/duckdb_native_metadata.hpp` / `duckdb_native_decoder.hpp` | DuckDB-native row-group walk + GPU decode |
