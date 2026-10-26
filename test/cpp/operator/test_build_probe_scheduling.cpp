@@ -102,8 +102,7 @@ partition_strategy strategy(uint64_t total_bytes,
                             uint64_t hash_partition_bytes         = kBigPartitionBytes,
                             uint64_t max_build_hash_table_bytes   = kMaxBuildBytes,
                             uint64_t max_broadcast_join_size      = kMaxBroadcastBytes,
-                            double estimated_probe_to_build_ratio = 0.0,
-                            bool mark_null_safe                   = false)
+                            double estimated_probe_to_build_ratio = 0.0)
 {
   auto result = compute_hash_join_partition_strategy(total_bytes,
                                                      is_build_side,
@@ -115,8 +114,7 @@ partition_strategy strategy(uint64_t total_bytes,
                                                      max_broadcast_join_size,
                                                      join_type,
                                                      join_mode,
-                                                     estimated_probe_to_build_ratio,
-                                                     mark_null_safe);
+                                                     estimated_probe_to_build_ratio);
   // Every strategy places exactly the partitions it asks for.
   REQUIRE(result.placement.num_partitions() == static_cast<std::size_t>(result.num_partitions));
   return result;
@@ -372,60 +370,11 @@ TEST_CASE("compute_hash_join_partition_strategy - right-family joins never broad
   REQUIRE_FALSE(build_driven.build_probe);
 }
 
-TEST_CASE("compute_hash_join_partition_strategy - MARK single-GPU clamps to one partition",
-          "[hash_join][build_probe][unit]")
-{
-  // Small foldable MARK build: clamped to a single partition, still BUILD_PROBE by size.
-  auto const small = strategy(k100MB, true, true, /*num_gpus=*/1, duckdb::JoinType::MARK);
-  REQUIRE(small.num_partitions == 1);
-  REQUIRE_FALSE(small.broadcast);
-  REQUIRE(small.build_probe);
-
-  // A large MARK build stays clamped to one partition and is still forced into BUILD_PROBE even
-  // though it is over the per-GPU hash-table cap: MARK must never fall back to a hash-partitioned
-  // STANDARD join (that would split build rows and corrupt build_has_null). Capacity pressure is
-  // handled by the downgrade/spill path, not by a mode switch.
-  auto const large = strategy(8 * k100MB,
-                              true,
-                              true,
-                              /*num_gpus=*/1,
-                              duckdb::JoinType::MARK,
-                              HASH_JOIN_MODE::STANDARD,
-                              /*hash_partition_bytes=*/k100MB);
-  REQUIRE(large.num_partitions == 1);
-  REQUIRE_FALSE(large.broadcast);
-  REQUIRE(large.build_probe);
-}
-
-TEST_CASE("compute_hash_join_partition_strategy - MARK multi-GPU forces broadcast",
-          "[hash_join][build_probe][unit][broadcast]")
-{
-  // MARK cannot be hash-partitioned across batches, so multi-GPU forces broadcast when it fits.
-  auto const s = strategy(k100MB, true, true, /*num_gpus=*/4, duckdb::JoinType::MARK);
-  REQUIRE(s.num_partitions == 4);
-  REQUIRE(s.broadcast);
-  REQUIRE(s.build_probe);
-
-  // A MARK build that is over the per-GPU / broadcast cap still forces broadcast BUILD_PROBE on
-  // multi-GPU: MARK must never hash-partition its build (that would corrupt build_has_null), so it
-  // broadcasts the full build to every GPU regardless of size and relies on downgrade for capacity.
-  auto const big = strategy(6 * k100MB,
-                            true,
-                            true,
-                            /*num_gpus=*/4,
-                            duckdb::JoinType::MARK,
-                            HASH_JOIN_MODE::STANDARD,
-                            /*hash_partition_bytes=*/k100MB);
-  REQUIRE(big.num_partitions == 4);
-  REQUIRE(big.broadcast);
-  REQUIRE(big.build_probe);
-}
-
-TEST_CASE("compute_hash_join_partition_strategy - all-null-safe MARK partitions like SEMI",
+TEST_CASE("compute_hash_join_partition_strategy - MARK partitions like SEMI",
           "[hash_join][build_probe][unit][mark]")
 {
-  // An all-null-safe MARK has definite marks that depend only on the probe row's own key, so it is
-  // not pinned to one whole-build partition: it takes exactly SEMI's strategy for every shape.
+  // A MARK's global build facts are observed while the build is partitioned, so MARK takes
+  // SEMI's strategy for every shape (no forced BUILD_PROBE, clamp, or broadcast).
   struct shape {
     uint64_t total_bytes;
     int num_gpus;
@@ -451,11 +400,7 @@ TEST_CASE("compute_hash_join_partition_strategy - all-null-safe MARK partitions 
                                c.num_gpus,
                                duckdb::JoinType::MARK,
                                HASH_JOIN_MODE::STANDARD,
-                               c.hash_partition_bytes,
-                               kMaxBuildBytes,
-                               kMaxBroadcastBytes,
-                               /*estimated_probe_to_build_ratio=*/0.0,
-                               /*mark_null_safe=*/true);
+                               c.hash_partition_bytes);
     REQUIRE(mark.num_partitions == semi.num_partitions);
     REQUIRE(mark.broadcast == semi.broadcast);
     REQUIRE(mark.build_probe == semi.build_probe);
@@ -469,27 +414,13 @@ TEST_CASE("compute_hash_join_partition_strategy - all-null-safe MARK partitions 
                               /*num_gpus=*/1,
                               duckdb::JoinType::MARK,
                               HASH_JOIN_MODE::STANDARD,
-                              /*hash_partition_bytes=*/k100MB,
-                              kMaxBuildBytes,
-                              kMaxBroadcastBytes,
-                              /*estimated_probe_to_build_ratio=*/0.0,
-                              /*mark_null_safe=*/true);
+                              /*hash_partition_bytes=*/k100MB);
   REQUIRE(large.num_partitions > 1);
   REQUIRE_FALSE(large.broadcast);
   REQUIRE_FALSE(large.build_probe);
 
-  // A small null-safe MARK build still folds into one BUILD_PROBE hash table.
-  auto const small = strategy(k100MB,
-                              true,
-                              true,
-                              /*num_gpus=*/1,
-                              duckdb::JoinType::MARK,
-                              HASH_JOIN_MODE::STANDARD,
-                              kBigPartitionBytes,
-                              kMaxBuildBytes,
-                              kMaxBroadcastBytes,
-                              /*estimated_probe_to_build_ratio=*/0.0,
-                              /*mark_null_safe=*/true);
+  // A small MARK build still folds into one BUILD_PROBE hash table.
+  auto const small = strategy(k100MB, true, true, /*num_gpus=*/1, duckdb::JoinType::MARK);
   REQUIRE(small.num_partitions == 1);
   REQUIRE(small.build_probe);
 }

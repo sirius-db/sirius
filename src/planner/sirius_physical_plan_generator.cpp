@@ -1502,8 +1502,8 @@ bool join_concat_all(sirius::op::sirius_physical_operator const& join, bool is_b
     case duckdb::JoinType::LEFT:
     case duckdb::JoinType::SEMI:
     case duckdb::JoinType::ANTI:
-    // Every probe row must see its partition's whole build to get one mark. BUILD_PROBE also sets
-    // this at sizing time; an all-null-safe MARK may run hash-partitioned STANDARD instead.
+    // Every probe row must see its partition's whole build to get one mark; MARK may run
+    // hash-partitioned STANDARD, like SEMI.
     case duckdb::JoinType::MARK: return is_build;
     case duckdb::JoinType::RIGHT:
     case duckdb::JoinType::RIGHT_SEMI:

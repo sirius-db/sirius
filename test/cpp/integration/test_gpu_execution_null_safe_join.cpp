@@ -26,6 +26,8 @@
 #include <utils/dynamic_filter_test_utils.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 
+#include <string>
+
 namespace {
 
 // RAII: disable a DuckDB optimizer for the current scope and restore it on exit
@@ -361,8 +363,57 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   compare_gpu_vs_cpu(
     "SELECT has_match, count(*), sum(id) FROM (SELECT pml.id, EXISTS (SELECT 1 FROM pmr WHERE "
     "pmr.k IS NOT DISTINCT FROM pml.k) AS has_match FROM pml) GROUP BY has_match");
-  // Uncorrelated IN with NULLs on both sides: a plain '=' MARK whose misses are NULL.
-  compare_gpu_vs_cpu(
-    "SELECT in_k, count(*), sum(id) FROM (SELECT pml.id, pml.k IN (SELECT pmr.k FROM pmr) AS in_k "
-    "FROM pml) GROUP BY in_k");
+}
+
+// Null-propagating ('=') MARK joins (IN / NOT IN, = ANY / <> ALL) over a build larger than both
+// hash_partition_bytes and max_build_hash_table_bytes are hash-partitioned too. SQL's NULL rule is
+// global, so a single NULL build key -- which lands in one partition -- must still turn every
+// unmatched probe row in every other partition into NULL.
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "gpu_execution hash-partitioned null-propagating MARK join matches the CPU",
+                 "[integration][gpu_execution][join][nulls][mark][partition]")
+{
+  // Probe keys span every partition; 1 in 97 probe keys is NULL.
+  run_ok(
+    "CREATE TABLE ppl AS SELECT i AS id, CASE WHEN i % 97 = 0 THEN NULL ELSE (i * 7) % 400000 END "
+    "AS k, i % 13 AS g FROM range(300000) AS t(i);");
+  // Build sides: no NULL; exactly one NULL; NULLs throughout.
+  run_ok(
+    "CREATE TABLE ppr_clean AS SELECT i AS id, (i * 3) % 500000 AS k, i % 13 AS g "
+    "FROM range(600000) AS t(i);");
+  run_ok(
+    "CREATE TABLE ppr_one_null AS SELECT i AS id, CASE WHEN i = 12345 THEN NULL ELSE (i * 3) % "
+    "500000 END AS k, i % 13 AS g FROM range(600000) AS t(i);");
+  run_ok(
+    "CREATE TABLE ppr_nulls AS SELECT i AS id, CASE WHEN i % 89 = 0 THEN NULL ELSE (i * 3) % "
+    "500000 END AS k, i % 13 AS g FROM range(600000) AS t(i);");
+  run_ok("CHECKPOINT;");
+
+  sirius::test::scoped_setting small_partitions(*con, "hash_partition_bytes", 1024 * 1024);
+  sirius::test::scoped_setting small_build(*con, "max_build_hash_table_bytes", 512 * 1024);
+  sirius::test::scoped_setting small_batches(*con, "scan_task_batch_size", 256 * 1024);
+
+  for (std::string const build : {"ppr_clean", "ppr_one_null", "ppr_nulls"}) {
+    CAPTURE(build);
+    // Projected IN / NOT IN marks, including NULL probe keys: true / false / NULL per row.
+    compare_gpu_vs_cpu("SELECT in_k, count(*), sum(id) FROM (SELECT id, k IN (SELECT k FROM " +
+                       build + ") AS in_k FROM ppl) GROUP BY in_k");
+    compare_gpu_vs_cpu(
+      "SELECT not_in_k, count(*), sum(id) FROM (SELECT id, k NOT IN (SELECT k FROM " + build +
+      ") AS not_in_k FROM ppl) GROUP BY not_in_k");
+    // NOT IN as a filter: any NULL build key filters every row out.
+    compare_gpu_vs_cpu("SELECT count(*), sum(id) FROM ppl WHERE k NOT IN (SELECT k FROM " + build +
+                       ")");
+    // = ANY / <> ALL spellings.
+    compare_gpu_vs_cpu("SELECT m, count(*) FROM (SELECT k = ANY (SELECT k FROM " + build +
+                       ") AS m FROM ppl) GROUP BY m");
+    compare_gpu_vs_cpu("SELECT m, count(*) FROM (SELECT k <> ALL (SELECT k FROM " + build +
+                       ") AS m FROM ppl) GROUP BY m");
+  }
+
+  // Correlated IN mixes a null-safe correlation key with the plain IN key; that MARK shape is
+  // rejected at plan time and runs on the CPU (unchanged by partitioning).
+  expect_plan_fallback_matches_cpu(
+    "SELECT in_k, count(*) FROM (SELECT ppl.k IN (SELECT ppr_nulls.k FROM ppr_nulls WHERE "
+    "ppr_nulls.g = ppl.g) AS in_k FROM ppl) GROUP BY in_k");
 }
