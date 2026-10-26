@@ -16,6 +16,8 @@
 
 #include "scan_manager/native_reader_executor.hpp"
 
+#include "transparent/replay_admission.hpp"
+
 #include <algorithm>
 #include <cassert>
 #include <condition_variable>
@@ -154,7 +156,9 @@ std::vector<std::unique_ptr<native_reader_executor::lease>> native_reader_execut
     std::lock_guard lock(state_->mutex);
     if (state_->stopping) throw std::runtime_error("native executor is stopped");
     if (std::ranges::count_if(state_->slots, [](auto const& s) { return !s.leased; }) < count)
-      throw std::runtime_error("native reader capacity unavailable for complete attempt");
+      throw transparent::classified_execution_error(
+        transparent::late_failure_cause::resource,
+        "native reader capacity unavailable for complete attempt");
     result.reserve(count);
     // Construct every inactive handle before starting workers or committing any slot.
     for (size_t i = 0; i < state_->slots.size() && result.size() < count; ++i)

@@ -82,7 +82,14 @@ TEST_CASE("native runtime starts lazily and closes admission on stop",
   executor.before_thread_for_testing([&](size_t) { ++created; });
   CHECK(executor.reserve(0).empty());
   CHECK(created == 0);
-  CHECK_THROWS_WITH(executor.reserve(5), "native reader capacity unavailable for complete attempt");
+  try {
+    (void)executor.reserve(5);
+    FAIL("oversized native admission succeeded");
+  } catch (std::runtime_error const& error) {
+    CHECK(std::string(error.what()) == "native reader capacity unavailable for complete attempt");
+    CHECK(sirius::transparent::classify_failure(std::current_exception()).cause ==
+          sirius::transparent::late_failure_cause::resource);
+  }
   CHECK(created == 0);
   auto leases = executor.reserve(1);
   CHECK(created == 2);

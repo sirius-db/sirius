@@ -83,7 +83,7 @@ Temporary capacity is requested for multiple DV jobs, bounded by the DV unit cou
 
 Unbounded inputs, the statement deletion-vector limit, or insufficient host capacity select eager delete loading before deferred execution starts. Positional-delete files keep their existing loading path. This route decision does not itself select CPU fallback. Once deferred work starts, read, validation, and allocation failures use the normal failure and replay rules; they never become an empty delete set.
 
-Cancellation closes admission and publication and wakes blocked work. Completion waits for workers, queued results, callbacks, and published consumers to drain. GPU completion alone cannot report success while preparation is still open.
+Cancellation closes admission and publication and wakes blocked work. Completion waits for workers, queued results, query-owned callbacks, and published consumers to drain. GPU completion alone cannot report success while preparation is still open.
 
 ### Host Arrow batch source contract
 
@@ -134,17 +134,20 @@ The control driver reserves a claim before calling the adapter outside the gate.
 
 Query-owner and native sources allow one outstanding operation or unprocessed result per reader. They share the existing coalescing and publication path and do not consume metadata-worker permits. The query owner calls `advance()` while waiting for query completion: it advances metadata-only coordination or services one provider request. It remains available through drain; an external reset may request stop and wait, but cannot run provider operations itself.
 
-Native reader slots are shared across queries in a scan manager. An attempt reserves all its slots before any reader starts; insufficient capacity fails without holding a partial group. Several readers may share a worker. A blocked native call can delay those readers, but not the coordinator or metadata pool. Worker and slot limits are documented in [configuration](configuration.md#siriusexecutorscan_managerpreparation).
+Native reader slots are shared across queries in a scan manager. An attempt reserves all its slots before any reader starts; insufficient capacity fails immediately as `late_failure_cause::resource`, without holding a partial group. CPU replay still requires the existing fallback, source-policy, transaction and cleanup checks; this classification grants no replay permission. Several readers may share a worker. A blocked native call can delay those readers, but not the coordinator or metadata pool. Worker and slot limits are documented in [configuration](configuration.md#siriusexecutorscan_managerpreparation).
 
 ### Publication and cancellation
 
-Publication uses typed `scan_operator_input` objects. Input construction and prefetch preparation run outside the publication lock. Only cancellation validation, readahead registration and connector insertion run inside it; adapters cannot add arbitrary callbacks there.
+Publication uses typed `scan_operator_input` objects. Input construction and prefetch preparation run outside the publication lock. Only cancellation validation, readahead registration and connector insertion run inside it; adapters cannot add arbitrary callbacks there. Cache preparation may create requests, attach buffers and queue eviction before the final check. These buffers belong to the bounded cache pool, not the preparation job budget; rejecting publication does not immediately free them.
 
 | Situation | Required behavior |
 |---|---|
 | External stop or drain | Close admission and publication, signal running jobs and wake the control driver. The driver retires queues after the active claim returns; drain callers wait for retirement. |
 | Stop during claim | Keep the source alive through ownership transfer. Dispose of a rejected job in its execution domain before closing the reader. |
-| Stop before publication | Discard the input without exposing it to consumers. |
+| Final gate rejects publication | Do not register readahead or insert into the connector. Destroy the input outside the gate and return its output credit once. |
+| Cache preparation is abandoned | Input disposal marks its requests disposed; repeated disposal is harmless. The cache evictor drops each request's subscriptions once and reclaims buffers according to policy, respecting active reads. |
+| Cache maintenance after drain | Preparation drain finishes input disposal, not cache eviction. Cache-owned generations, buffers and eviction requests may outlive the query; they must not depend on its reader or transaction. |
+| Failure during preparation or commit | Dispose the surviving input. Any readahead work already registered follows normal query teardown; cache maintenance retains its own ownership. |
 | Queued provider work | Dispose of it in its assigned execution domain without invoking the reader. |
 | Active provider work | Use a supported interrupt or wait for return; discard late results before closing. The framework cannot forcibly interrupt SQL or native calls. |
 | Between provider operations | Check the attempt's stop state before re-entering the reader. A DuckDB connection interrupt flag may be reset by a later query. |

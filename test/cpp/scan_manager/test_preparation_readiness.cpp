@@ -2545,6 +2545,9 @@ TEST_CASE("Native reader group admission fails without partial leases or neighbo
   REQUIRE(blocked->await());
   CHECK_THROWS_WITH(second.coordinator.arm(),
                     "native reader capacity unavailable for complete attempt");
+  CHECK(second.completion.failure().cause == sirius::transparent::late_failure_cause::resource);
+  CHECK(sirius::transparent::classify_failure(second.completion.terminal_error()).cause ==
+        sirius::transparent::late_failure_cause::resource);
   CHECK(a->close_calls == 0);
   CHECK(b->close_calls == 0);
   CHECK(a->count() == 0);
