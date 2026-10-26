@@ -235,7 +235,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/pyarrow-25.0.0-py314hdafbbf9_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/pyarrow-core-25.0.0-py314h969be7f_0_cpu.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/python-3.14.8-hcd007b5_101_cp314.conda
-      - conda: https://conda.anaconda.org/conda-forge/linux-64/python-duckdb-1.5.6-py314hc75f4c6_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/python-duckdb-2.0.0-py314h0782867_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/pyyaml-6.0.3-py314h67df5f8_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/rdma-core-65.0-h7b4f2e6_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/re2-2025.11.05-h94463f1_2.conda
@@ -276,7 +276,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/cuda-pathfinder-1.8.1-pyhc364b38_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/cuda-version-12.9-h4f385c5_3.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/distlib-0.4.3-pyhcf101f3_0.conda
-      - conda: https://conda.anaconda.org/conda-forge/noarch/duckdb-1.5.6-hff2d567_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/duckdb-2.0.0-hca7485f_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/filelock-3.32.5-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/identify-2.6.19-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/kernel-headers_linux-64-4.18.0-he073ed8_9.conda
@@ -487,7 +487,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/pyarrow-25.0.0-py314ha42fa4b_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/pyarrow-core-25.0.0-py314hd18eac9_0_cpu.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/python-3.14.8-hbec3b18_101_cp314.conda
-      - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/python-duckdb-1.5.6-py314h0b174d3_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/python-duckdb-2.0.0-py314h4ac0071_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/pyyaml-6.0.3-py314h807365f_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/rdma-core-65.0-h807d763_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/re2-2025.11.05-hfb2350b_2.conda
@@ -529,7 +529,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/cuda-pathfinder-1.8.1-pyhc364b38_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/cuda-version-12.9-h4f385c5_3.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/distlib-0.4.3-pyhcf101f3_0.conda
-      - conda: https://conda.anaconda.org/conda-forge/noarch/duckdb-1.5.6-hff2d567_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/duckdb-2.0.0-hca7485f_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/filelock-3.32.5-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/identify-2.6.19-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/kernel-headers_linux-aarch64-4.18.0-h05a177a_9.conda
@@ -747,7 +747,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/pyarrow-25.0.0-py314hdafbbf9_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/pyarrow-core-25.0.0-py314h969be7f_0_cpu.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/python-3.14.8-hcd007b5_101_cp314.conda
-      - conda: https://conda.anaconda.org/conda-forge/linux-64/python-duckdb-1.5.6-py314hc75f4c6_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/python-duckdb-2.0.0-py314h0782867_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/pyyaml-6.0.3-py314h67df5f8_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/rdma-core-65.0-h7b4f2e6_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/re2-2025.11.05-h94463f1_2.conda
@@ -788,7 +788,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/cuda-pathfinder-1.8.1-pyhc364b38_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/cuda-version-13.4-hfacf21a_3.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/distlib-0.4.3-pyhcf101f3_0.conda
-      - conda: https://conda.anaconda.org/conda-forge/noarch/duckdb-1.5.6-hff2d567_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/duckdb-2.0.0-hca7485f_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/filelock-3.32.5-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/identify-2.6.19-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/kernel-headers_linux-64-4.18.0-he073ed8_9.conda
@@ -1000,7 +1000,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/pyarrow-25.0.0-py314ha42fa4b_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/pyarrow-core-25.0.0-py314hd18eac9_0_cpu.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/python-3.14.8-hbec3b18_101_cp314.conda
-      - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/python-duckdb-1.5.6-py314h0b174d3_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/python-duckdb-2.0.0-py314h4ac0071_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/pyyaml-6.0.3-py314h807365f_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/rdma-core-65.0-h807d763_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/re2-2025.11.05-hfb2350b_2.conda
@@ -1042,7 +1042,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/cuda-pathfinder-1.8.1-pyhc364b38_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/cuda-version-13.4-hfacf21a_3.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/distlib-0.4.3-pyhcf101f3_0.conda
-      - conda: https://conda.anaconda.org/conda-forge/noarch/duckdb-1.5.6-hff2d567_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/duckdb-2.0.0-hca7485f_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/filelock-3.32.5-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/identify-2.6.19-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/kernel-headers_linux-aarch64-4.18.0-h05a177a_9.conda
@@ -2866,7 +2866,7 @@ packages:
   license: MIT
   license_family: MIT
   purls:
-  - pkg:pypi/cffi?source=hash-mapping
+  - pkg:pypi/cffi?source=compressed-mapping
   run_exports: {}
   size: 307262
   timestamp: 1788485305536
@@ -6418,22 +6418,23 @@ packages:
   size: 26633451
   timestamp: 1791333464567
   python_site_packages_path: lib/python3.14/site-packages
-- conda: https://conda.anaconda.org/conda-forge/linux-64/python-duckdb-1.5.6-py314hc75f4c6_0.conda
-  sha256: 5448ced8e6022214793f970fdeaf1c3e7d30ccd62c7acec059b7af84b7c9c720
-  md5: 8aacf0eb7ec96f13ea6c1cb00f696b2f
+- conda: https://conda.anaconda.org/conda-forge/linux-64/python-duckdb-2.0.0-py314h0782867_0.conda
+  sha256: d1ee0fafa63af201cce09a65bd8ccfa46de2eb2ab45a5ca3bb8455c6d51e88a6
+  md5: 167593cefaa30f977f881ab94ef7e46c
   depends:
   - __glibc >=2.17,<3.0.a0
   - libgcc >=15
   - libstdcxx >=15
+  - numpy >=1.25,<3
   - python >=3.14,<3.15.0a0
   - python_abi 3.14.* *_cp314
   license: MIT
   license_family: MIT
   purls:
-  - pkg:pypi/duckdb?source=compressed-mapping
+  - pkg:pypi/duckdb?source=hash-mapping
   run_exports: {}
-  size: 17362159
-  timestamp: 1790611264364
+  size: 17242798
+  timestamp: 1793032335556
 - conda: https://conda.anaconda.org/conda-forge/linux-64/pyyaml-6.0.3-py314h67df5f8_1.conda
   sha256: b318fb070c7a1f89980ef124b80a0b5ccf3928143708a85e0053cde0169c699d
   md5: 2035f68f96be30dc60a5dfd7452c7941
@@ -7531,7 +7532,7 @@ packages:
   license: MIT
   license_family: MIT
   purls:
-  - pkg:pypi/cffi?source=hash-mapping
+  - pkg:pypi/cffi?source=compressed-mapping
   run_exports: {}
   size: 329121
   timestamp: 1788485263944
@@ -11043,21 +11044,22 @@ packages:
   size: 25603222
   timestamp: 1791333177032
   python_site_packages_path: lib/python3.14/site-packages
-- conda: https://conda.anaconda.org/conda-forge/linux-aarch64/python-duckdb-1.5.6-py314h0b174d3_0.conda
-  sha256: 6da28f481da262cdcfebc1fe7e874ffba3b1d7ee55a394479ae06a1d4afb3531
-  md5: 97ac870c6cf7d6cfa5e817fc1b6b5a6c
+- conda: https://conda.anaconda.org/conda-forge/linux-aarch64/python-duckdb-2.0.0-py314h4ac0071_0.conda
+  sha256: 268c88d672f05ae2f24d5cac094d1968204642f68b9ec2bc785a90e15afd39f2
+  md5: ff1c08ca7345a7da22c1df5873aad748
   depends:
   - libgcc >=15
   - libstdcxx >=15
+  - numpy >=1.25,<3
   - python >=3.14,<3.15.0a0
   - python_abi 3.14.* *_cp314
   license: MIT
   license_family: MIT
   purls:
-  - pkg:pypi/duckdb?source=compressed-mapping
+  - pkg:pypi/duckdb?source=hash-mapping
   run_exports: {}
-  size: 16264780
-  timestamp: 1790610758528
+  size: 15391638
+  timestamp: 1793032316097
 - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/pyyaml-6.0.3-py314h807365f_1.conda
   sha256: 496b5e65dfdd0aaaaa5de0dcaaf3bceea00fcb4398acf152f89e567c82ec1046
   md5: 9ae2c92975118058bd720e9ba2bb7c58
@@ -12071,18 +12073,17 @@ packages:
   run_exports: {}
   size: 40854
   timestamp: 1675116355989
-- conda: https://conda.anaconda.org/conda-forge/noarch/duckdb-1.5.6-hff2d567_0.conda
-  sha256: ef9a9920f0d187242f73df9401ff83d870f896477974661e8c6feb292e1af241
-  md5: 891f457dad96ff4d788d4bf946183c2b
+- conda: https://conda.anaconda.org/conda-forge/noarch/duckdb-2.0.0-hca7485f_0.conda
+  sha256: eaf8225ca17af73c2091904111b4218b3ad67e7a4f6a0e7061b5d9d94fa3bbf3
+  md5: 564f69c62a78f6a21146e9c3b6dc6c3a
   depends:
-  - python-duckdb >=1.5.6,<1.5.7.0a0
+  - python-duckdb >=2.0.0,<2.0.1.0a0
   license: MIT
   license_family: MIT
-  purls:
-  - pkg:pypi/duckdb?source=compressed-mapping
+  purls: []
   run_exports: {}
-  size: 7732
-  timestamp: 1790611321187
+  size: 7857
+  timestamp: 1793032931072
 - conda: https://conda.anaconda.org/conda-forge/noarch/filelock-3.32.5-pyhd8ed1ab_0.conda
   sha256: a52faa011a8176bbbf30c77f76707788be9a9e1a7e30c3753083719c093a15dc
   md5: 9b091d04be6b722d4ed7dfee34295dea
