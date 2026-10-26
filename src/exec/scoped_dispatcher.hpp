@@ -23,6 +23,7 @@
 #include <concepts>
 #include <condition_variable>
 #include <functional>
+#include <limits>
 #include <mutex>
 #include <source_location>
 #include <stdexcept>
@@ -111,7 +112,10 @@ class scoped_dispatcher {
     stop_drained_ = std::move(notify);
   }
 
-  void request_stop()
+  // Signal stop and dispose at most max_discard queued captures on this caller.
+  // False means the caller must continue cleanup; running work drains independently.
+  // The default preserves synchronous queue disposal for non-coordinator callers.
+  bool request_stop(std::size_t max_discard = std::numeric_limits<std::size_t>::max())
   {
     {
       std::lock_guard lk(mu_);
@@ -121,13 +125,14 @@ class scoped_dispatcher {
     }
     // Stop callbacks may reenter the dispatcher, so request cancellation outside mu_.
     stop_.request_stop();
-    for (;;) {
+    for (std::size_t count = 0;; ++count) {
       task_t discarded;
       {
         std::unique_lock lk(mu_);
-        if (pending_.empty()) {
+        if (pending_.empty() || count == max_discard) {
+          bool const empty = pending_.empty();
           release_slot(lk);
-          return;
+          return empty;
         }
         discarded = std::move(pending_.front());
         pending_.pop_front();

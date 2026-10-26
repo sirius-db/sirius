@@ -764,7 +764,7 @@ TEST_CASE("non-native preparation leaves the native runtime dormant",
     source.execution = sm::preparation_coordinator::execution_domain::query_owner;
   }
   auto expected_coordinators =
-    source.execution == sm::preparation_coordinator::execution_domain::metadata_worker ? 0u : 2u;
+    source.execution == sm::preparation_coordinator::execution_domain::metadata_worker ? 0u : 1u;
   sm::scan_manager_query_test::install(manager, id, std::move(source), completion);
   manager.start_preparation(id);
   {

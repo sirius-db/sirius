@@ -33,6 +33,7 @@
 #include "scan_manager/preparation_fixture.hpp"
 #include "scan_manager/readahead_scan_manager.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
+#include "utils/host_allocation_fault.hpp"
 #include "utils/log_test_utils.hpp"
 #include "utils/telemetry_utils.hpp"
 
@@ -590,4 +591,65 @@ TEST_CASE("Deferred scan inputs dispose cache requests when publication is rejec
   } else {
     CHECK(ds->prepare_prefetch(false) == sirius::io::prepare_result::fallen_behind);
   }
+}
+
+namespace sirius::io::cache {
+struct prefetching_cache_test_access {
+  static cache_handle request(prefetching_cache& cache,
+                              io_object const& obj,
+                              std::span<const cudf::io::text::byte_range_info> ranges)
+  {
+    return cache.initiate_prefetching_request(obj, ranges, 0);
+  }
+};
+}  // namespace sirius::io::cache
+
+TEST_CASE("Cache request allocation failures roll back only their own subscriptions",
+          "[.][host_allocation_fault][cache_subscription_fault]")
+{
+  using fault  = sirius::test::scoped_host_allocation_fault;
+  using access = sirius::io::cache::prefetching_cache_test_access;
+  REQUIRE(fault::available());
+  auto memory = initialize_memory_manager(1);
+  sirius::exec::query_lifecycle_registry lifecycle;
+  sirius_scan_manager manager{
+    lifecycle, dispose_on_idle_config(), *memory, single_gpu_index_for_dispose()};
+  auto* cache = manager.io_ctx()->cache();
+  REQUIRE(cache != nullptr);
+  auto chunk_bytes = cache->chunk_size();
+  std::vector<std::unique_ptr<temp_data_file>> files;
+  bool completed = false;
+  for (size_t ordinal = 1; ordinal <= 64 && !completed; ++ordinal) {
+    INFO("allocation " << ordinal);
+    files.push_back(std::make_unique<temp_data_file>(3 * chunk_bytes));
+    auto ds = manager.create_datasource(files.back()->path.string());
+    std::vector<cudf::io::text::byte_range_info> first{{0, 1}};
+    std::vector<cudf::io::text::byte_range_info> all{{0, static_cast<int64_t>(3 * chunk_bytes)}};
+    auto survivor = access::request(*cache, ds->get_io_object(), first);
+    sirius::io::cache::cache_handle request;
+    bool failed = false, fired = false;
+    {
+      fault injected(fault::every_allocation_scope, ordinal);
+      try {
+        request = access::request(*cache, ds->get_io_object(), all);
+      } catch (std::bad_alloc const&) {
+        failed = true;
+      }
+      fired = injected.fired();
+    }
+    CHECK(failed == fired);
+    CHECK(survivor.chunks()->front()->state.get_subscribers() == (failed ? 1 : 2));
+    if (failed) request = access::request(*cache, ds->get_io_object(), all);
+    auto chunks = request.chunks();
+    REQUIRE(chunks->size() == 3);
+    for (size_t i = 0; i < chunks->size(); ++i)
+      CHECK((*chunks)[i]->state.get_subscribers() == (i == 0 ? 2 : 1));
+    request = {};
+    // Drive the real evictor after disposal; the survivor keeps the generation alive.
+    cache->evict_sync(1);
+    for (size_t i = 0; i < chunks->size(); ++i)
+      CHECK((*chunks)[i]->state.get_subscribers() == (i == 0 ? 1 : 0));
+    completed = !fired;
+  }
+  CHECK(completed);
 }

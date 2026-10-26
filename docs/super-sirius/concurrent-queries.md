@@ -107,7 +107,7 @@ Metadata producers use the shared metadata worker pool. Coordination and prepara
 | Attempt | Coordination | Preparation retirement |
 |---|---|---|
 | Metadata-only | Query owner; no additional coordinator thread. | The owner drains preparation. |
-| Provider or native-reader sources, `coordinator_workers > 0` (default `2`) | Workers shared by the scan manager, started lazily. | Wait for the registration's final step and any in-flight stop notification to return. |
+| Provider or native-reader sources, `coordinator_workers > 0` (default `1`) | Workers shared by the scan manager, started lazily. | Wait for the registration's final step and any in-flight stop notification to return. |
 | Provider or native-reader sources, `coordinator_workers: 0` | One dedicated coordinator thread per attempt. | Join that attempt's coordinator thread. |
 
 Preparation retirement completes before the query slot is released. Shared coordinator workers are joined when the scan manager stops. The query owner remains available for statement-bound provider work through drain; native readers use a separate shared executor. Coalescing does not occupy metadata workers or wait for a blocked provider call.

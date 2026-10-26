@@ -209,9 +209,12 @@ struct preparation_coordinator::state {
   std::map<unit_key, std::shared_ptr<preparation_unit>> units;
   std::deque<pending_batch> batches;
   lifecycle phase = lifecycle::constructed;
-  enum class retirement_phase { active, metadata, readers, finished };
+  enum class retirement_phase { active, metadata, readers, cleanup, finished };
   retirement_phase retirement = retirement_phase::active;
   bool dispatcher_drained     = false;
+  size_t retirement_cursor = 0, cleanup_source = 0, cleanup_slot = 0;
+  uint64_t retirement_wake = 0;
+  bool readers_closed = true, retirement_progress = false;
   size_t jobs = 0, results = 0, output = 0, external = 0;
   size_t reader_jobs = 0, next_provider_source = 0;
   std::thread::id provider_owner;
@@ -409,7 +412,7 @@ struct preparation_coordinator::state {
   bool advance_control(std::shared_ptr<state> const&, std::optional<std::chrono::milliseconds>);
   void run(std::shared_ptr<state> const&);
   control_step_result retire_step();
-  void finish();
+  bool finish_step();
 
   // Destroyed without the gate held; unpublished construction returns its output credit.
   struct publication_ticket {
@@ -1403,61 +1406,82 @@ preparation_coordinator::state::control_step_result preparation_coordinator::sta
   using next = control_step_result::status;
   if (retirement == retirement_phase::active) {
     retirement = retirement_phase::metadata;
-    // Only the control driver discards queued work, after the active claim returned.
     stop(stop_reason::normal_eos);
-    dispatcher->request_stop();
   }
-  std::unique_lock lock(gate->mutex);
-  auto observed = gate->wake_generation;
-  if (!dispatcher_drained) return {next::parked, observed};
-  retirement      = retirement_phase::readers;
-  bool progressed = false;
-  for (size_t id = 0; id < sources.size(); ++id)
-    progressed |= retire_reader(id, lock);
-  if (!jobs && !external && !gate->callbacks &&
-      std::ranges::all_of(sources, [](auto const& s) { return s.reader_closed(); })) {
-    lock.unlock();
-    finish();
-    return {next::finished};
+  if (retirement == retirement_phase::metadata) {
+    // Only the control driver discards queued work, after the active claim returned.
+    if (!dispatcher->request_stop(options.max_control_work)) return {next::runnable};
+    std::lock_guard lock(gate->mutex);
+    if (!dispatcher_drained) return {next::parked, gate->wake_generation};
+    retirement = retirement_phase::readers;
+    return {next::runnable};
   }
-  if (progressed || gate->wake_generation != observed) return {next::runnable};
-  return {next::parked, observed};
+  if (retirement == retirement_phase::readers) {
+    std::unique_lock lock(gate->mutex);
+    if (!retirement_cursor) {
+      retirement_wake     = gate->wake_generation;
+      readers_closed      = true;
+      retirement_progress = false;
+    }
+    size_t actions = 0;
+    while (retirement_cursor < sources.size() && actions++ < options.max_control_work) {
+      auto id = retirement_cursor;
+      retirement_progress |= retire_reader(id, lock);
+      readers_closed &= sources[id].reader_closed();
+      ++retirement_cursor;
+    }
+    if (retirement_cursor < sources.size()) return {next::runnable};
+    retirement_cursor = 0;
+    if (!jobs && !external && !gate->callbacks && readers_closed) {
+      retirement = retirement_phase::cleanup;
+      return {next::runnable};
+    }
+    if (retirement_progress || gate->wake_generation != retirement_wake) return {next::runnable};
+    return {next::parked, retirement_wake};
+  }
+  return {finish_step() ? next::finished : next::runnable};
 }
 
-void preparation_coordinator::state::finish()
+bool preparation_coordinator::state::finish_step()
 {
-  // Only the execution runner closes sources after their workers and callbacks have settled.
-  for (size_t id = 0; id < sources.size(); ++id) {
-    auto& source = sources[id];
-    if (source.status == source_state::phase::closed) continue;
-    if (!source.on_query_owner() && !source.on_native_reader())
-      close_source(id);
-    else
-      close_source_output(id);  // Also settles readers rejected before native lease admission.
-    source.status = source_state::phase::closed;
-  }
-  std::deque<pending_batch> discarded_batches;
-  decltype(units) discarded_units;
-  {
-    std::unique_lock lock(gate->mutex);
-    discarded_batches.swap(batches);
-    ready_results.clear();
-    for (size_t index = 0; index < slots.size(); ++index) {
-      auto retired = release_slot(index);
-      lock.unlock();
-      retired = {};
-      lock.lock();
+  // Keep final destruction on the control driver, but let other attempts run between slices.
+  for (size_t actions = 0; actions < options.max_control_work; ++actions) {
+    if (cleanup_source < sources.size()) {
+      auto id      = cleanup_source++;
+      auto& source = sources[id];
+      if (source.status != source_state::phase::closed) {
+        if (!source.on_query_owner() && !source.on_native_reader())
+          close_source(id);
+        else
+          close_source_output(id);
+        source.status = source_state::phase::closed;
+      }
+      continue;
     }
-    discarded_units.swap(units);
-    gate->closed = true;
+    std::unique_lock lock(gate->mutex);
+    if (cleanup_slot < slots.size()) {
+      auto retired = release_slot(cleanup_slot++);
+      lock.unlock();
+    } else if (!ready_results.empty()) {
+      ready_results.pop_front();
+    } else if (!batches.empty()) {
+      auto retired = std::move(batches.front());
+      batches.pop_front();
+      lock.unlock();
+    } else if (!units.empty()) {
+      auto retired = units.extract(units.begin());
+      lock.unlock();
+    } else {
+      lock.unlock();
+      if (stats.runs || stats.owner != std::thread::id{}) {
+        completion->close_preparation_inputs();
+        completion->preparation_quiescent();
+      }
+      retirement = retirement_phase::finished;
+      return true;
+    }
   }
-  discarded_batches.clear();
-  discarded_units.clear();
-  if (stats.runs || stats.owner != std::thread::id{}) {
-    completion->close_preparation_inputs();
-    completion->preparation_quiescent();
-  }
-  retirement = retirement_phase::finished;
+  return false;
 }
 
 preparation_coordinator::state::control_step_result preparation_coordinator::state::control_step(

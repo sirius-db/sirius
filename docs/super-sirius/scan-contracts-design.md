@@ -134,7 +134,9 @@ The control driver reserves a claim before calling the adapter outside the gate.
 
 Query-owner and native sources allow one outstanding operation or unprocessed result per reader. They share the existing coalescing and publication path and do not consume metadata-worker permits. The query owner calls `advance()` while waiting for query completion: it advances metadata-only coordination or services one provider request. It remains available through drain; an external reset may request stop and wait, but cannot run provider operations itself.
 
-The coordinator pool executes at most one step per attempt at a time. Steps return runnable, parked with an optional deadline, or finished. Wakes racing with a step are retained; pool workers service deadlines without owner ticks or extra timer threads. Control hooks must not wait for I/O, capacity or dependencies. Stop requests keep retirement runnable, and drain waits for the final step to return after completion notifications. Provider work and disposal remain on the query owner; native work and disposal remain on the assigned native worker.
+The coordinator pool selects runnable or expired registrations by rotating through registration slots, advancing its cursor after each selection. This is round-robin slot selection, not FIFO wake order or earliest-deadline-first scheduling. Each attempt executes at most one step at a time; consecutive steps may run on different workers.
+
+Steps return runnable, parked with an optional deadline, or finished. Racing wakes are retained, and workers service deadlines without owner ticks or extra timer threads. Control hooks must not retain thread-local state, require a fixed worker, or wait for I/O, capacity or dependencies. Provider work and disposal remain on the query owner; native work and disposal remain on the assigned native worker.
 
 Native reader slots are shared across queries in a scan manager. An attempt reserves all its slots before any reader starts; insufficient capacity fails immediately as `late_failure_cause::resource`, without holding a partial group. CPU replay still requires the existing fallback, source-policy, transaction and cleanup checks; this classification grants no replay permission. Several readers may share a worker. A blocked native call can delay those readers, but not the coordinator or metadata pool. Worker and slot limits are documented in [configuration](configuration.md#siriusexecutorscan_managerpreparation).
 
@@ -143,6 +145,8 @@ Native reader slots are shared across queries in a scan manager. An attempt rese
 `state::control_step()` performs one bounded turn and returns `runnable`, `parked` with a wake generation and optional deadline, or `retire`. `retire_step()` advances cleanup without waiting for workers: stop and drain metadata, close readers in their execution domains, then release remaining state. Pending stages park until a completion notification arrives. Query-owner, dedicated-thread and pooled drivers use these steps; the driver owns waits and serializes advancement.
 
 Before sleeping, the query-owner and dedicated-thread drivers recheck the returned wake generation under the gate; stop also advances that generation. A wake between the step and the wait therefore cannot be lost. A timeout requests another step, which rechecks eligibility; it does not publish directly. Partial-batch deadlines use the coalescer clock; the driver also bounds waits for interrupt checks and the caller's idle limit.
+
+Lock order is publication gate before pool or executor bookkeeping. Pool callbacks run without the pool mutex; executor completion must release executor bookkeeping locks before waking the gate. Adapter claims, input construction, capture destruction and completion notifications run outside the gate. Interruption checks, metadata inspection and the explicitly gated publication operations below may run under it; they must not reenter the gate. They must not wait for another attempt or synchronously drain their own execution domain.
 
 The action limit bounds work count, not hook duration. Adapters used with the shared pool must preserve these control-path boundaries:
 
@@ -154,9 +158,9 @@ The action limit bounds work count, not hook duration. Adapters used with the sh
 | `prepare_prefetch` | Does not wait for eviction or device progress. It takes cache locks, allocates buffers and invokes ready completion callbacks inline. |
 | Final publication | Readahead registration and connector insertion run under the gate; no arbitrary adapter hooks are allowed there. Their locks and allocations remain part of the step. |
 | Source/output close and released captures | Metadata close and output notifications can run inline. Query-owner/native reader close and accepted-job disposal stay in their assigned execution domain. |
-| Error reporting and retirement | Error observers, stop callbacks, discarded captures and final cleanup still run synchronously. Waiting for dispatcher drain or reader close happens in the outer driver, never inside the retirement step. |
+| Error reporting and retirement | Error observers and stop callbacks run inline. Queue disposal and final cleanup yield between bounded steps; waiting for dispatcher drain or reader close parks the attempt. |
 
-Retirement keeps one control owner. The dispatcher sends one notification after stopped work and its captures drain; reader completion wakes the same driver. The query owner keeps servicing provider operations. `drain()` returns only after final cleanup and completion notifications have returned and control ownership has ended.
+Retirement keeps one control owner. Each step disposes at most `max_control_work` queued tasks or remaining sources, slots, batches and units before yielding. Waiting for worker completion parks the attempt; unfinished cleanup keeps it runnable. The dispatcher sends one notification after stopped work and its captures drain; reader completion wakes the same driver. The query owner keeps servicing provider operations. `drain()` returns only after final cleanup and completion notifications have returned and control ownership has ended.
 
 ### Publication and cancellation
 

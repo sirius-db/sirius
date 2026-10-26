@@ -506,7 +506,7 @@ These settings are loaded at initialization. Metadata jobs default to a limit of
 | `lookahead_batches` | 2 | Per-scan preparation target in multiples of `scan_task_batch_size`, using decoded read-column bytes, including predicate-only columns. Results, retained coalescer input, and published batches stay charged until downstream takes the batch. Already submitted jobs may overshoot the target. |
 | `native_reader_workers` | 2 | Native-reader worker threads per scan manager, started lazily at the first native reservation. Positive and independent of metadata workers and GPU count. |
 | `max_native_readers` | 64 | Reader slots shared by all attempts within that manager. Must be at least `native_reader_workers`; an attempt reserves its full group before any reader starts. |
-| `coordinator_workers` | 2 | Shared coordinator workers per scan manager, started lazily. `0` uses one dedicated coordinator per reader attempt. Metadata-only attempts still run coordination on the query owner. |
+| `coordinator_workers` | 1 | Shared coordinator workers per scan manager, started lazily. `0` uses one dedicated coordinator per reader attempt. Metadata-only attempts still run coordination on the query owner. |
 | `max_control_work` | N | Maximum coordinator actions per iteration. |
 | `drain_quantum` | N | Maximum coalescing work per result advancement. |
 | `partial_batch` | enabled | Partial-publication policy. An omitted or empty block uses the defaults below. |
@@ -526,7 +526,7 @@ sirius:
       preparation:
         max_inflight_metadata_jobs: 4096
         max_inflight_dv_jobs: 0
-        coordinator_workers: 2
+        coordinator_workers: 1
         native_reader_workers: 2
         max_native_readers: 64
         lookahead_batches: 2

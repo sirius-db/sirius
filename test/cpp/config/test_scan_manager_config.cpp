@@ -226,7 +226,7 @@ TEST_CASE("Preparation limit YAML overrides preserve omitted defaults",
                     config.preparation.resolved_native_workers(),
                     config.preparation.resolved_native_readers(),
                     config.preparation.resolved_coordinator_workers()};
-  std::array<size_t, 8> defaults{4096, 0, 2, size_t(workers), size_t(workers), 2, 64, 2};
+  std::array<size_t, 8> defaults{4096, 0, 2, size_t(workers), size_t(workers), 2, 64, 1};
   for (size_t i = 0; i < keys.size(); ++i) {
     INFO(keys[i]);
     auto expected = (selected == 8 || selected == static_cast<int>(i)) ? values[i] : defaults[i];

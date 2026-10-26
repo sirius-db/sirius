@@ -20,6 +20,7 @@
 #include <atomic>
 #include <future>
 #include <stdexcept>
+#include <utility>
 using namespace std::chrono_literals;
 using sirius::scan_manager::coordinator_pool;
 using progress = coordinator_pool::progress;
@@ -78,18 +79,45 @@ TEST_CASE("Coordinator pool serializes steps and retains racing wakes", "[coordi
 TEST_CASE("Coordinator pool handles deadlines failures and parked retirement independently",
           "[coordinator_pool]")
 {
+  auto earlier = GENERATE(false, true);
   coordinator_pool pool(1);
   std::atomic<bool> stopped{false};
   std::atomic<unsigned> failures{0};
-  std::promise<void> timed, recovered;
+  std::promise<void> timed, recovered, initial_park;
+  auto initially_parked = initial_park.get_future();
+  std::atomic<unsigned> timer_calls{0}, neighbor_steps{0};
+  std::atomic<bool> expired{false}, premature{false};
   auto deadline_done = timed.get_future();
   auto failure_done  = recovered.get_future();
-  auto due           = coordinator_pool::clock::now() + 30ms;
+  auto due           = coordinator_pool::clock::time_point{};
   auto timer         = pool.add(
     [&]() -> result {
-      if (!stopped && coordinator_pool::clock::now() < due) return {progress::parked, due};
+      if (stopped) return {progress::finished};
+      auto call = ++timer_calls;
+      if (call == 1) {
+        due = coordinator_pool::clock::now() + (earlier ? 5s : 100ms);
+        return {progress::parked, due};
+      }
+      if (call == 2) {
+        due = earlier ? coordinator_pool::clock::now() + 30ms : due + 200ms;
+        return {progress::parked, due};
+      }
+      premature = coordinator_pool::clock::now() < due;
+      expired   = true;
       timed.set_value();
       return {progress::finished};
+    },
+    [&] { stopped = true; },
+    [&](auto) { ++failures; });
+  auto busy = pool.add(
+    [&, announced = false]() mutable -> result {
+      ++neighbor_steps;
+      // One worker: observing the first call here proves its parked result is installed.
+      if (timer_calls && !std::exchange(announced, true)) {
+        timer->wake();  // Replace the installed deadline while this neighbor stays runnable.
+        initial_park.set_value();
+      }
+      return {expired || stopped ? progress::finished : progress::runnable};
     },
     [&] { stopped = true; },
     [&](auto) { ++failures; });
@@ -107,11 +135,15 @@ TEST_CASE("Coordinator pool handles deadlines failures and parked retirement ind
              [&](auto) { ++failures; });
   auto cleanup = std::shared_ptr<void>(nullptr, [&](void*) { pool.stop(); });
   timer->wake();
+  busy->wake();
   failure->wake();
   parked->wake();
+  REQUIRE(initially_parked.wait_for(2s) == std::future_status::ready);
   REQUIRE(failure_done.wait_for(2s) == std::future_status::ready);
   REQUIRE(deadline_done.wait_for(2s) == std::future_status::ready);
-  CHECK(coordinator_pool::clock::now() >= due);
+  CHECK_FALSE(premature);
+  CHECK(timer_calls == 3);
+  CHECK(neighbor_steps > 2);
   pool.stop();
   timer->wait();
   failure->wait();

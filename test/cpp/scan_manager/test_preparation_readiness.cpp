@@ -679,7 +679,10 @@ TEST_CASE("Expired partial batch parks at a full output window and resumes on co
       return step;
     }
   };
-  fixture f(2, 1);
+  auto pooled = GENERATE(false, true);
+  coordinator_pool pool(1);
+  native_reader_executor native(1, 1);
+  fixture f(2, 1, k_interrupt_check_interval, std::nullopt, &native, pooled ? &pool : nullptr);
   auto out   = std::make_shared<sink>();
   auto later = f.make_hold();
 
@@ -688,7 +691,20 @@ TEST_CASE("Expired partial batch parks at a full output window and resumes on co
              return std::make_unique<tagged>(id, id == 0 ? 2 : 0);
            }));
   auto guard = f.shutdown_guard();
-  f.start();
+  if (pooled) {
+    f.source(
+      std::make_shared<accumulator>(),
+      std::make_shared<sink>(),
+      []() -> preparation_coordinator::claim_result { return preparation_pending{}; },
+      {},
+      {},
+      preparation_coordinator::execution_domain::native_reader);
+    // No owner advance/drain until teardown and no interrupt callback/timer is installed.
+    f.coordinator.arm();
+    f.coordinator.start();
+  } else {
+    f.start();
+  }
   REQUIRE(out->await(1));
   std::this_thread::sleep_for(30ms);
   auto before = f.coordinator.snapshot().wakes;
@@ -3123,4 +3139,50 @@ TEST_CASE("Rejected native group admission closes output without opening readers
   CHECK(out->connector->is_closed());
   auto reused = native.reserve(1);
   CHECK(reused.size() == 1);
+}
+
+TEST_CASE("Pooled retirement yields between source cleanup actions",
+          "[scan_preparation][coordinator_pool]")
+{
+  coordinator_pool pool(1);
+  preparation_options options{1, 4, 1, 1};
+  fixture f(1, 4, k_interrupt_check_interval, options, nullptr, &pool);
+  std::atomic<unsigned> closed{0}, observed{0};
+  std::promise<void> neighbor_done;
+  auto done     = neighbor_done.get_future();
+  auto neighbor = pool.add(
+    [&] {
+      observed = closed.load();
+      neighbor_done.set_value();
+      return coordinator_pool::step_result{coordinator_pool::progress::finished};
+    },
+    [] {},
+    [](auto) {});
+  auto guard = f.shutdown_guard();
+  f.start([&] {
+    f.source(
+      std::make_shared<accumulator>(),
+      std::make_shared<sink>(),
+      []() -> preparation_coordinator::claim_result { return preparation_exhausted{}; },
+      {},
+      {},
+      preparation_coordinator::execution_domain::query_owner);
+    for (unsigned i = 0; i < 8; ++i) {
+      auto source      = make_source(preparation_coordinator::execution_domain::metadata_worker);
+      source.try_claim = []() -> preparation_coordinator::claim_result {
+        return preparation_exhausted{};
+      };
+      source.close = [&] {
+        if (++closed == 1) neighbor->wake();
+      };
+      f.register_source(std::move(source), std::make_shared<sink>());
+    }
+    f.coordinator.request_stop(stop_reason::normal_eos);
+  });
+  REQUIRE(done.wait_for(2s) == std::future_status::ready);
+  neighbor->wait();
+  f.finish();
+  CHECK(observed == 1);
+  CHECK(closed == 8);
+  CHECK_FALSE(f.completion.has_error());
 }

@@ -44,6 +44,11 @@ class preparation_coordinator {
     size_t preparation_bytes = 0;
   };
   using execution_domain = preparation_execution_domain;
+  // Control hooks are serialized but may migrate between pool workers. They must not
+  // retain thread-local state, wait for I/O/capacity/dependencies, or synchronously drain.
+  // Claim, construction and close run outside the gate; metadata inspection may run under
+  // it and must not reenter. Gate -> pool/executor is the lock order; wake callbacks from
+  // those executors must release their own bookkeeping locks before acquiring the gate.
   struct source {
     std::shared_ptr<op::scan::batch_coalescer> coalescer;
     // Always called by C. Must only claim independent control state, never enter a provider.

@@ -265,3 +265,58 @@ TEST_CASE("refused dispatcher handoff drains pending work on the current worker"
   CHECK(same_worker);
   CHECK(worker != std::this_thread::get_id());
 }
+
+TEST_CASE("dispatcher bounded stop retains cleanup ownership until the last capture",
+          "[scoped_dispatcher]")
+{
+  sirius::exec::static_thread_pool pool(1);
+  sirius::exec::scoped_dispatcher dispatcher(pool);
+  std::promise<void> entered, release, drained;
+  auto done     = drained.get_future();
+  auto released = release.get_future();
+  std::atomic<unsigned> disposed{0}, executed{0}, notified{0}, disposed_at_notification{0};
+  dispatcher.set_stop_drain_callback([&] {
+    disposed_at_notification = disposed.load();
+    ++notified;
+    drained.set_value();
+  });
+  dispatcher.enqueue([&] {
+    entered.set_value();
+    released.wait();
+  });
+  entered.get_future().wait();
+  bool released_running = false;
+  auto cleanup          = std::shared_ptr<void>(nullptr, [&](void*) {
+    if (!released_running) release.set_value();
+    dispatcher.request_stop();
+    dispatcher.wait_for_all();
+  });
+  for (unsigned i = 0; i < 5; ++i) {
+    auto capture = std::shared_ptr<int>(new int{}, [&](int* value) {
+      delete value;
+      ++disposed;
+      dispatcher.enqueue([&] { ++executed; });  // Destruction remains outside the mutex.
+    });
+    dispatcher.enqueue([capture] {});
+  }
+  CHECK_FALSE(dispatcher.request_stop(2));
+  CHECK(disposed == 2);
+  release.set_value();
+  released_running = true;
+  std::promise<void> worker_idle;
+  auto idle = worker_idle.get_future();
+  pool.schedule([&] { worker_idle.set_value(); });
+  idle.wait();  // The running slot is gone; queued captures alone must prevent drain.
+  CHECK(notified == 0);
+  CHECK_FALSE(dispatcher.request_stop(2));
+  CHECK(disposed == 4);
+  CHECK(notified == 0);
+  CHECK(dispatcher.request_stop(2));
+  CHECK(disposed == 5);
+  CHECK(notified == 1);
+  cleanup.reset();
+  REQUIRE(done.wait_for(std::chrono::seconds{2}) == std::future_status::ready);
+  CHECK(notified == 1);
+  CHECK(disposed_at_notification == 5);
+  CHECK(executed == 0);
+}
