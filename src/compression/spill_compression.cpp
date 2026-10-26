@@ -25,25 +25,29 @@
 #include <cudf/reduction/distinct_count.hpp>
 #include <cudf/utilities/traits.hpp>
 
-#include <rmm/mr/per_device_resource.hpp>
+#include <rmm/resource_ref.hpp>
 
+#include <absl/cleanup/cleanup.h>
 #include <api/compressed_table_io.hpp>
 #include <api/simpatico_codegen.hpp>
 #include <codegen/util/stream_pool.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
+#include <cucascade/data/disk_io_backend.hpp>
 #include <cucascade/memory/disk_table.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <log/logging.hpp>
+#include <memory/sirius_memory_reservation_manager.hpp>
 
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
-#include <fstream>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -179,19 +183,37 @@ encoded_batch encode_for_spill(const cucascade::gpu_table_representation& source
   out.uncompressed_bytes = source.get_size_in_bytes();
   out.num_rows           = view.num_rows();
 
+  auto& space        = source.get_memory_space();
+  auto* const gpu_mr = space.get_memory_resource_of<cucascade::memory::Tier::GPU>();
+  if (gpu_mr == nullptr) { throw std::logic_error("spill encode: GPU space has no allocator"); }
+  // A reservation covers the allocations of the stream it is attached to, or of the
+  // calling thread under per-thread tracking. Only in the latter case does it also
+  // cover the stream pool the column-parallel encode runs on, so per-stream tracking
+  // encodes on `stream` alone.
+  auto const per_thread =
+    memory::sirius_memory_reservation_manager::gpu_allocation_tracking_scope(space) ==
+    cucascade::memory::reservation_aware_resource_adaptor::AllocationTrackingScope::PER_THREAD;
+
   // The encoder allocates from the same GPU pool the batch is being evicted from, so
-  // only encode when that headroom exists. The reservation is an admission check and
-  // is released before the encode: the encode allocates on the stream pool's
-  // streams, which a reservation (tracked per stream) would not cover, so holding it
-  // would take the headroom away from the encoder rather than keep it for it.
+  // it runs only under a reservation of its headroom, which keeps it from taking
+  // memory that other tasks are about to reserve.
+  bool reserved = false;
   if (settings.encode_reserve_fraction > 0.0) {
     auto const bytes = static_cast<std::size_t>(settings.encode_reserve_fraction *
                                                 static_cast<double>(out.uncompressed_bytes));
-    if (!source.get_memory_space().make_reservation_or_null(bytes)) {
+    auto reservation = space.make_reservation_or_null(bytes);
+    if (!reservation) {
       throw spill_compression_declined("no GPU headroom for a " + std::to_string(bytes) +
                                        " byte encode");
     }
+    if (!gpu_mr->attach_reservation_to_tracker(stream, std::move(reservation))) {
+      throw spill_compression_declined("the allocation tracker already holds a reservation");
+    }
+    reserved = true;
   }
+  absl::Cleanup detach = [&] {
+    if (reserved) { gpu_mr->reset_stream_reservation(stream); }
+  };
 
   std::string plan;
   bool all_stored = true;
@@ -204,14 +226,16 @@ encoded_batch encode_for_spill(const cucascade::gpu_table_representation& source
   // Storing every column as is saves nothing, and the encode would still copy the batch.
   if (all_stored) { throw spill_compression_declined("no column of the batch compresses"); }
 
-  // The pool streams are not ordered after `stream`, which the batch and the plan
-  // sampling ran on.
-  stream.sync();
-  out.table = simpatico::compress_with_plan(view,
-                                            plan,
-                                            simpatico::thread_device_stream_pool(kEncodeStreams),
-                                            rmm::mr::get_current_device_resource_ref(),
-                                            {});
+  auto const mr = rmm::device_async_resource_ref{*gpu_mr};
+  if (per_thread) {
+    // The pool streams are not ordered after `stream`, which the batch and the plan
+    // sampling ran on.
+    stream.sync();
+    out.table = simpatico::compress_with_plan(
+      view, plan, simpatico::thread_device_stream_pool(kEncodeStreams), mr, {});
+  } else {
+    out.table = simpatico::compress_with_plan(view, plan, stream, mr, {});
+  }
 
   auto const error = simpatico::build_compressed_table_header(
     out.table, out.header, out.buffers, out.payload_bytes, stream);
@@ -298,7 +322,8 @@ std::unique_ptr<cucascade::idata_representation> compress_gpu_to_host(
     encoded.num_rows);
 }
 
-/// gpu_table to compressed_disk: encode on the device, write the .hpln file.
+/// gpu_table to compressed_disk: encode on the device, write the .hpln file through the
+/// disk space's I/O backend.
 std::unique_ptr<cucascade::idata_representation> compress_gpu_to_disk(
   const cucascade::idata_representation& source,
   const cucascade::memory::memory_space* target_memory_space,
@@ -306,22 +331,37 @@ std::unique_ptr<cucascade::idata_representation> compress_gpu_to_disk(
   [[maybe_unused]] cucascade::memory::reservation* reservation)
 {
   nvtx_scoped_range nvtx_range{"sirius::compression::gpu_to_compressed_disk"};
-  auto const& gpu = source.cast<cucascade::gpu_table_representation>();
-  auto encoded    = encode_for_spill(gpu, stream);
+  auto const& gpu   = source.cast<cucascade::gpu_table_representation>();
+  auto encoded      = encode_for_spill(gpu, stream);
+  auto& backend     = target_memory_space->get_io_backend();
+  auto const header = encoded.header.size();
   spill_file file(*target_memory_space);
-  auto const error = simpatico::write_compressed_table(encoded.table, file.path(), stream);
-  if (!error.empty()) { throw std::runtime_error("write_compressed_table: " + error); }
+
+  backend.write(file.path(), encoded.header.data(), header, 0);
+  std::vector<cucascade::io_batch_entry> entries;
+  entries.reserve(encoded.buffers.size());
+  for (auto const& buffer : encoded.buffers) {
+    if (buffer.size_bytes > 0 && buffer.device_ptr != nullptr) {
+      entries.push_back({.ptr         = buffer.device_ptr,
+                         .size        = static_cast<std::size_t>(buffer.size_bytes),
+                         .file_offset = header + static_cast<std::size_t>(buffer.offset)});
+    }
+  }
+  backend.write_batch(file.path(), entries, stream);
+  // The device buffers go with `encoded` at return.
+  stream.sync();
 
   return std::make_unique<compressed_disk_representation>(
     *const_cast<cucascade::memory::memory_space*>(target_memory_space),
     file.release(),
-    encoded.header.size() + static_cast<std::size_t>(encoded.payload_bytes),
+    header,
+    header + static_cast<std::size_t>(encoded.payload_bytes),
     encoded.uncompressed_bytes,
     encoded.num_rows);
 }
 
 /// compressed_host to compressed_disk: write the pinned header and payload as an .hpln
-/// file, with no decode and no device work.
+/// file through the disk space's I/O backend, with no decode and no device work.
 std::unique_ptr<cucascade::idata_representation> flush_host_to_disk(
   const cucascade::idata_representation& source,
   const cucascade::memory::memory_space* target_memory_space,
@@ -339,25 +379,21 @@ std::unique_ptr<cucascade::idata_representation> flush_host_to_disk(
   auto const& payload      = host.payload();
   auto const payload_bytes = host.get_size_in_bytes();
   auto const block_size    = payload.block_size();
+  auto& backend            = target_memory_space->get_io_backend();
 
   spill_file file(*target_memory_space);
-  {
-    std::ofstream out(file.path(), std::ios::binary | std::ios::trunc);
-    out.write(reinterpret_cast<char const*>(header.data()),
-              static_cast<std::streamsize>(header.size()));
-    std::size_t written = 0;
-    for (std::size_t block = 0; written < payload_bytes; ++block) {
-      auto const n = std::min(block_size, payload_bytes - written);
-      out.write(reinterpret_cast<char const*>(payload.at(block).data()),
-                static_cast<std::streamsize>(n));
-      written += n;
-    }
-    if (!out) { throw std::runtime_error("write error on '" + file.path() + "'"); }
+  backend.write(file.path(), header.data(), header.size(), 0);
+  std::size_t written = 0;
+  for (std::size_t block = 0; written < payload_bytes; ++block) {
+    auto const n = std::min(block_size, payload_bytes - written);
+    backend.write(file.path(), payload.at(block).data(), n, header.size() + written);
+    written += n;
   }
 
   return std::make_unique<compressed_disk_representation>(
     *const_cast<cucascade::memory::memory_space*>(target_memory_space),
     file.release(),
+    header.size(),
     header.size() + payload_bytes,
     host.get_uncompressed_data_size_in_bytes(),
     host.num_rows());

@@ -37,11 +37,13 @@ compressed_disk_representation::owned_file::~owned_file() noexcept
 compressed_disk_representation::compressed_disk_representation(
   cucascade::memory::memory_space& memory_space,
   std::string path,
+  std::size_t header_bytes,
   std::size_t compressed_bytes,
   std::size_t uncompressed_bytes,
   std::int64_t num_rows)
   : compressed_disk_representation(memory_space,
                                    std::make_shared<owned_file>(std::move(path)),
+                                   header_bytes,
                                    compressed_bytes,
                                    uncompressed_bytes,
                                    num_rows)
@@ -51,11 +53,13 @@ compressed_disk_representation::compressed_disk_representation(
 compressed_disk_representation::compressed_disk_representation(
   cucascade::memory::memory_space& memory_space,
   std::shared_ptr<owned_file> file,
+  std::size_t header_bytes,
   std::size_t compressed_bytes,
   std::size_t uncompressed_bytes,
   std::int64_t num_rows)
   : simpatico_compressed_representation(memory_space),
     _file(std::move(file)),
+    _header_bytes(header_bytes),
     _compressed_bytes(compressed_bytes),
     _uncompressed_bytes(uncompressed_bytes),
     _num_rows(num_rows)
@@ -66,7 +70,7 @@ std::unique_ptr<cucascade::idata_representation> compressed_disk_representation:
   [[maybe_unused]] ::cuda::stream_ref stream) const
 {
   return std::unique_ptr<cucascade::idata_representation>(new compressed_disk_representation(
-    get_memory_space(), _file, _compressed_bytes, _uncompressed_bytes, _num_rows));
+    get_memory_space(), _file, _header_bytes, _compressed_bytes, _uncompressed_bytes, _num_rows));
 }
 
 }  // namespace sirius

@@ -40,6 +40,7 @@
 #include <cucascade/data/disk_data_representation.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <data/convertible_data_batch.hpp>
+#include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
 
 #include <cstdint>
@@ -77,7 +78,9 @@ struct spill_env {
     fs::create_directories(dir);
     sirius::converter_registry::reset_for_testing();
     cucascade::memory::reservation_manager_configurator builder;
+    // Per-thread tracking, as Sirius configures it, so the encode runs column-parallel.
     builder.set_number_of_gpus(1)
+      .track_reservation_per_stream(false)
       .set_gpu_usage_limit(1ull << 30)
       .set_reservation_fraction_per_gpu(0.75)
       .set_per_numa_region_capacity(1ull << 30)
@@ -278,6 +281,8 @@ TEST_CASE("spill compression: GPU -> compressed host -> GPU", "[compression][spi
   auto batch                     = gpu_batch(compressible_table());
   auto const expected            = digest(*batch);
   std::size_t const device_bytes = batch->to_read_only().get_data()->get_size_in_bytes();
+  auto* gpu_mr               = env().gpu->get_memory_resource_of<cucascade::memory::Tier::GPU>();
+  auto const reserved_before = gpu_mr->get_total_reserved_bytes();
 
   move_to(batch, env().host);
   REQUIRE(holds<sirius::compressed_host_representation>(*batch));
@@ -286,6 +291,9 @@ TEST_CASE("spill compression: GPU -> compressed host -> GPU", "[compression][spi
     CHECK(ro.get_data()->get_size_in_bytes() < device_bytes);
     CHECK(ro.get_data()->get_uncompressed_data_size_in_bytes() == device_bytes);
   }
+  // The encode's reservation is detached and released once the batch is encoded.
+  CHECK_FALSE(gpu_mr->is_stream_tracked(env().stream.view()));
+  CHECK(gpu_mr->get_total_reserved_bytes() == reserved_before);
 
   move_to(batch, env().gpu);
   REQUIRE(holds<cucascade::gpu_table_representation>(*batch));
@@ -300,6 +308,8 @@ TEST_CASE("spill compression: GPU -> compressed disk -> GPU, and the file goes w
   auto batch          = gpu_batch(compressible_table());
   auto const expected = digest(*batch);
 
+  auto const rows = static_cast<std::size_t>(expected.row_hashes.size());
+
   move_to(batch, env().disk);
   REQUIRE(holds<sirius::compressed_disk_representation>(*batch));
   std::string const path = [&] {
@@ -307,6 +317,11 @@ TEST_CASE("spill compression: GPU -> compressed disk -> GPU, and the file goes w
     return ro.get_data()->cast<sirius::compressed_disk_representation>().path();
   }();
   CHECK(fs::exists(path));
+  {
+    auto ro = batch->to_read_only();
+    CHECK(sirius::representation_num_rows(*ro.get_data()) == rows);
+    CHECK(sirius::representation_num_rows(ro.get_data()) == rows);
+  }
 
   move_to(batch, env().gpu);
   CHECK(digest(*batch) == expected);
