@@ -31,10 +31,12 @@
 #include "helper/type_conversions.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_partition.hpp"
+#include "operator_test_utils.hpp"
 #include "pipeline/pipeline_build_context.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 
 #include <catch.hpp>
+#include <cucascade/data/data_repository.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/operator/logical_comparison_join.hpp>
 
@@ -843,6 +845,43 @@ TEST_CASE("primary_input_port - build-streaming joins nominate nothing",
     INFO("join type: " << duckdb::JoinTypeToString(jt));
     REQUIRE_FALSE(f.hash_join->primary_input_port().has_value());
   }
+}
+
+TEST_CASE("refresh_cross_schedule rejects a SEMI build partition that is not concat-folded",
+          "[hash_join][cross_schedule][build_probe]")
+{
+  static auto manager      = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space              = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  auto f                   = make_join(duckdb::JoinType::SEMI);
+  f.hash_join->operator_id = 1;
+  cucascade::shared_data_repository build_repo;
+  cucascade::shared_data_repository probe_repo;
+  sirius::pipeline::pipeline_build_context ctx{nullptr, true};
+  auto build_pipeline = std::make_shared<finishable_pipeline>(ctx);
+  for (auto [name, repo] : {std::pair{"build", &build_repo}, std::pair{"default", &probe_repo}}) {
+    auto port          = std::make_unique<sirius::op::sirius_physical_operator::port>();
+    port->repo         = repo;
+    port->src_pipeline = name == std::string_view{"build"}
+                           ? build_pipeline
+                           : std::make_shared<finishable_pipeline>(ctx);
+    f.hash_join->add_port(name, std::move(port));
+  }
+  auto batch = [&] {
+    return sirius::test::operator_utils::make_numeric_batch<int32_t>(
+      *space, {1}, cudf::type_id::INT32);
+  };
+  probe_repo.add_data_batch(batch());
+  build_repo.add_data_batch(batch());
+  build_pipeline->finished = true;
+
+  // One folded build batch per partition is the invariant.
+  REQUIRE_NOTHROW(f.hash_join->refresh_cross_schedule());
+
+  // A second build batch in the same partition after the build finished would let SEMI emit a
+  // probe row once per build batch.
+  build_repo.add_data_batch(batch());
+  REQUIRE_THROWS_WITH(f.hash_join->refresh_cross_schedule(),
+                      Catch::Matchers::ContainsSubstring("single concat-folded build batch"));
 }
 
 TEST_CASE("probe bytes are only unweighted in BUILD_PROBE mode",
