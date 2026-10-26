@@ -23,6 +23,7 @@
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <duckdb/optimizer/optimizer.hpp>
+#include <utils/dynamic_filter_test_utils.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 
 namespace {
@@ -330,4 +331,38 @@ TEST_CASE_METHOD(MixedKeyNullSafeJoinFixture,
   // '=', keeps running on the GPU.
   compare_gpu_vs_cpu("SELECT mnl.id, mnl.b IN (SELECT mnr.b FROM mnr) AS in_b FROM mnl");
   compare_gpu_vs_cpu("SELECT mnl.id, mnl.a IN (SELECT mnr.a FROM mnr) AS in_a FROM mnl");
+}
+
+// An all-null-safe MARK over a build larger than both hash_partition_bytes and
+// max_build_hash_table_bytes runs hash-partitioned (STANDARD, natural partition count) instead of
+// one forced whole-build BUILD_PROBE partition. Both sides carry NULL keys, so NULL-to-NULL
+// matches and definite FALSE misses are exercised across partitions. The null-propagating IN
+// MARK over the same data keeps its single whole-build partition and its NULL marks.
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "gpu_execution hash-partitioned null-safe MARK join matches the CPU",
+                 "[integration][gpu_execution][join][nulls][mark][partition]")
+{
+  run_ok(
+    "CREATE TABLE pml AS SELECT i AS id, CASE WHEN i % 97 = 0 THEN NULL ELSE (i * 7) % 400000 END "
+    "AS k FROM range(300000) AS t(i);");
+  run_ok(
+    "CREATE TABLE pmr AS SELECT i AS id, CASE WHEN i % 89 = 0 THEN NULL ELSE (i * 3) % 500000 END "
+    "AS k FROM range(600000) AS t(i);");
+  run_ok("CHECKPOINT;");
+
+  sirius::test::scoped_setting small_partitions(*con, "hash_partition_bytes", 1024 * 1024);
+  sirius::test::scoped_setting small_build(*con, "max_build_hash_table_bytes", 512 * 1024);
+  sirius::test::scoped_setting small_batches(*con, "scan_task_batch_size", 256 * 1024);
+
+  // Correlated projected EXISTS: decorrelates to an all-null-safe MARK.
+  compare_gpu_vs_cpu(
+    "SELECT has_match, count(*), sum(id) FROM (SELECT pml.id, EXISTS (SELECT 1 FROM pmr WHERE "
+    "pmr.k = pml.k) AS has_match FROM pml) GROUP BY has_match");
+  compare_gpu_vs_cpu(
+    "SELECT has_match, count(*), sum(id) FROM (SELECT pml.id, EXISTS (SELECT 1 FROM pmr WHERE "
+    "pmr.k IS NOT DISTINCT FROM pml.k) AS has_match FROM pml) GROUP BY has_match");
+  // Uncorrelated IN with NULLs on both sides: a plain '=' MARK whose misses are NULL.
+  compare_gpu_vs_cpu(
+    "SELECT in_k, count(*), sum(id) FROM (SELECT pml.id, pml.k IN (SELECT pmr.k FROM pmr) AS in_k "
+    "FROM pml) GROUP BY in_k");
 }

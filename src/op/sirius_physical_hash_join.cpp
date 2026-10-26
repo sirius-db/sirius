@@ -855,7 +855,8 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
                                                         uint64_t max_broadcast_join_size,
                                                         duckdb::JoinType join_type,
                                                         HASH_JOIN_MODE join_mode,
-                                                        double estimated_probe_to_build_ratio)
+                                                        double estimated_probe_to_build_ratio,
+                                                        bool mark_null_safe)
 {
   // Without a GPU list (engine-free tests) plan as a single GPU and leave partitions unpinned.
   int const num_gpus = std::max(1, static_cast<int>(active_gpu_ids.size()));
@@ -873,23 +874,26 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
                                                static_cast<std::size_t>(natural), active_gpu_ids)};
   }
 
-  bool const is_mark         = join_type == duckdb::JoinType::MARK;
-  bool const is_right_family = join_type == duckdb::JoinType::RIGHT ||
+  // Only a MARK join with a null-propagating key needs its whole build in one place (for the
+  // global build_has_null sentinel). An all-null-safe MARK partitions like SEMI.
+  bool const mark_needs_whole_build = join_type == duckdb::JoinType::MARK && !mark_null_safe;
+  bool const is_right_family        = join_type == duckdb::JoinType::RIGHT ||
                                join_type == duckdb::JoinType::RIGHT_SEMI ||
                                join_type == duckdb::JoinType::RIGHT_ANTI;
   bool const is_mixed      = join_mode == HASH_JOIN_MODE::MIXED_JOIN;
   bool const is_full_outer = join_type == duckdb::JoinType::OUTER;
   uint64_t const small     = partition_small_table_bytes(num_gpus);
 
-  // Broadcast candidacy. MARK multi-GPU is forced broadcast (build_has_null must be globally
-  // consistent); otherwise a build is a candidate when it is below the small-table threshold, OR
-  // below max_broadcast_join_size while the probe side is large relative to the build (replicating
-  // the build avoids shuffling a much larger probe across GPUs).
+  // Broadcast candidacy. A null-propagating MARK on multi-GPU is forced broadcast (build_has_null
+  // must be globally consistent); otherwise a build is a candidate when it is below the small-table
+  // threshold, OR below max_broadcast_join_size while the probe side is large relative to the build
+  // (replicating the build avoids shuffling a much larger probe across GPUs).
   bool const broadcast_candidate =
-    is_mark ? num_gpus > 1
-            : (total_bytes < small ||
-               (total_bytes < max_broadcast_join_size &&
-                estimated_probe_to_build_ratio >= static_cast<double>(num_gpus) * 1.25));
+    mark_needs_whole_build
+      ? num_gpus > 1
+      : (total_bytes < small ||
+         (total_bytes < max_broadcast_join_size &&
+          estimated_probe_to_build_ratio >= static_cast<double>(num_gpus) * 1.25));
 
   // BUILD_PROBE eligibility. MARK/SEMI/ANTI are eligible (persistent filtered_join built on the
   // right, reused across streamed left probe batches); RIGHT_SEMI/RIGHT_ANTI/RIGHT and full OUTER
@@ -906,25 +910,28 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
   bool build_probe = per_gpu_build_bytes < max_build_hash_table_bytes && build_foldable &&
                      !is_right_family && !is_mixed && !is_full_outer;
 
-  // A MARK join must always run in BUILD_PROBE mode. It needs the entire build side resident to
-  // compute the global build_has_null sentinel and the per-probe-row marks, and on multi-GPU it is
-  // always broadcast (build replicated to every GPU). Force BUILD_PROBE on even when the build
+  // A MARK join with a null-propagating key must always run in BUILD_PROBE mode. It needs the
+  // entire build side resident to compute the global build_has_null sentinel, and on multi-GPU it
+  // is always broadcast (build replicated to every GPU). Force BUILD_PROBE on even when the build
   // exceeds the hash-table budget. MARK is never right-family/full-outer, and MARK + MIXED is
-  // rejected at construction.
-  if (is_mark) { build_probe = true; }
+  // rejected at construction. An all-null-safe MARK has definite marks that depend only on the
+  // probe row's own key partition, so it takes the normal rule and, over budget, runs STANDARD
+  // with the natural partition count (each partition's build concat-folded, like SEMI).
+  if (mark_needs_whole_build) { build_probe = true; }
 
   bool const broadcast = broadcast_candidate && build_probe;
 
-  // BUILD_PROBE runs at the count its eligibility was measured at; MARK single-GPU is clamped to
-  // one partition; broadcast takes one partition per GPU; everything else the natural count.
+  // BUILD_PROBE runs at the count its eligibility was measured at; a null-propagating MARK
+  // single-GPU is clamped to one partition; broadcast takes one partition per GPU; everything else
+  // the natural count.
   if (broadcast) {
     auto placement = partition_placement::one_per_device(active_gpu_ids);
     return partition_strategy{
       static_cast<int>(placement.num_partitions()), broadcast, build_probe, std::move(placement)};
   }
-  int const num_partitions = build_probe                  ? build_probe_partitions
-                             : (is_mark && num_gpus <= 1) ? 1
-                                                          : natural;
+  int const num_partitions = build_probe                                 ? build_probe_partitions
+                             : (mark_needs_whole_build && num_gpus <= 1) ? 1
+                                                                         : natural;
   // A lone BUILD_PROBE partition picks its GPU by rotation so several small joins in one query
   // spread across GPUs instead of all landing on the first. STANDARD builds its hash table
   // within each task, so a lone partition can follow input locality.
@@ -978,10 +985,11 @@ partition_strategy sirius_physical_hash_join::get_partition_strategy(
                                                              _max_broadcast_join_size,
                                                              join_type,
                                                              _join_mode,
-                                                             estimated_probe_to_build_ratio);
+                                                             estimated_probe_to_build_ratio,
+                                                             mark_is_null_safe());
 
-  if (join_type == duckdb::JoinType::MARK && num_gpus() > 1 && in.is_build_side &&
-      in.total_bytes >= partition_small_table_bytes(num_gpus())) {
+  if (join_type == duckdb::JoinType::MARK && !mark_is_null_safe() && num_gpus() > 1 &&
+      in.is_build_side && in.total_bytes >= partition_small_table_bytes(num_gpus())) {
     SIRIUS_LOG_WARN(
       "sirius_physical_hash_join id {}: forcing broadcast for MARK join with build side {} bytes "
       "(exceeds standard broadcast limit of {} bytes)",
@@ -1134,14 +1142,19 @@ std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint(
   // leaves no batch for a BUILD_PROBE hash table if the probe partition sized the join first.
   // Only take this path before any build task has been claimed: a consumed nonempty build batch
   // also leaves the repository empty while its hash table is being built.
+  // A STANDARD-mode (all-null-safe) MARK frees consumed build batches, so it also requires that no
+  // build batch was ever seen by the cross schedule.
   if (join_type == duckdb::JoinType::MARK && !_mark_build_empty.load(std::memory_order_acquire) &&
       build_port->src_pipeline && build_port->src_pipeline->is_pipeline_finished() &&
       build_port->repo->total_size() == 0 &&
+      std::all_of(_partition_build_states.begin(),
+                  _partition_build_states.end(),
+                  [](auto const& slot) {
+                    return slot.build_state.load(std::memory_order_acquire) ==
+                           BUILD_HASH_TABLE_STATE::NOT_BUILT;
+                  }) &&
       std::all_of(
-        _partition_build_states.begin(), _partition_build_states.end(), [](auto const& slot) {
-          return slot.build_state.load(std::memory_order_acquire) ==
-                 BUILD_HASH_TABLE_STATE::NOT_BUILT;
-        })) {
+        _cross.begin(), _cross.end(), [](auto const& c) { return c.build_ids.empty(); })) {
     _mark_build_empty.store(true, std::memory_order_release);
   }
   if (_mark_build_empty.load(std::memory_order_acquire)) {
@@ -1188,10 +1201,11 @@ std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint(
         return std::nullopt;
     }
   } else {
-    // The first PARTITION task selects BUILD_PROBE for MARK. Until then, a downstream join may
-    // poll this join in STANDARD mode. Run the build producer so it can size the join; an empty
-    // build is handled above.
-    if (join_type == duckdb::JoinType::MARK) {
+    // The first PARTITION task selects BUILD_PROBE for a null-propagating MARK. Until then, a
+    // downstream join may poll this join in STANDARD mode. Run the build producer so it can size
+    // the join; an empty build is handled above. An all-null-safe MARK may legitimately run
+    // STANDARD (hash-partitioned, like SEMI) and takes the cross schedule below.
+    if (join_type == duckdb::JoinType::MARK && !mark_is_null_safe()) {
       auto* producer = &build_port->src_pipeline->get_operators()[0].get();
       return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
     }
@@ -1326,17 +1340,18 @@ std::pair<bool, bool> sirius_physical_hash_join::refresh_cross_schedule()
   // Non-INNER whole-side invariant: whichever side must be seen whole for this join type must stay
   // a single concat-folded batch once its producer is finished. A regression in
   // sirius_physical_concat that stopped folding would otherwise silently corrupt results, so fail
-  // loudly instead. MARK must never reach this path (it is forced to BUILD_PROBE mode).
-  if (join_type == duckdb::JoinType::MARK) {
+  // loudly instead. A null-propagating MARK must never reach this path (it is forced to
+  // BUILD_PROBE mode); an all-null-safe MARK needs each partition's build whole, like SEMI.
+  if (join_type == duckdb::JoinType::MARK && !mark_is_null_safe()) {
     throw std::runtime_error(
-      "In sirius_physical_hash_join:refresh_cross_schedule: MARK join must run in BUILD_PROBE "
-      "mode, "
-      "not STANDARD/MIXED, in operator " +
+      "In sirius_physical_hash_join:refresh_cross_schedule: MARK join with a null-propagating key "
+      "must run in BUILD_PROBE mode, not STANDARD/MIXED, in operator " +
       std::to_string(this->get_operator_id()));
   }
   bool const check_build_whole =
     build_finished && (join_type == duckdb::JoinType::LEFT || join_type == duckdb::JoinType::SEMI ||
-                       join_type == duckdb::JoinType::ANTI || join_type == duckdb::JoinType::OUTER);
+                       join_type == duckdb::JoinType::ANTI ||
+                       join_type == duckdb::JoinType::OUTER || join_type == duckdb::JoinType::MARK);
   bool const check_probe_whole =
     probe_finished && is_right_family();  // RIGHT/RIGHT_SEMI/RIGHT_ANTI
   bool const check_probe_whole_outer = probe_finished && join_type == duckdb::JoinType::OUTER;
@@ -1687,7 +1702,8 @@ static bool build_keys_are_distinct(cudf::table_view const& build_keys,
 /// On first call: CAS from -1 to the new value.
 /// On subsequent calls: verify the existing value matches; throw if it does not (indicates
 /// inconsistent build batches, which should never happen for MARK joins that are forced to a
-/// single partition or broadcast).
+/// single partition or broadcast). All-null-safe MARK joins never record it: their marks are
+/// definite, and they may be hash-partitioned so per-partition values legitimately differ.
 static void set_build_has_null(std::atomic<int>& atomic_flag, bool has_null)
 {
   int const new_val = has_null ? 1 : 0;
@@ -1919,7 +1935,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
           slot.filtered_table = make_right_filtered_join_ptr(build_keys, compare_nulls(), stream);
           // Record whether the build keys contain a NULL; MARK three-valued logic needs it at probe
           // time, but the build keys are not retained beyond this scope.
-          if (join_type == duckdb::JoinType::MARK) {
+          if (join_type == duckdb::JoinType::MARK && !mark_is_null_safe()) {
             set_build_has_null(_build_has_null, table_has_any_null(build_keys));
           }
           SIRIUS_LOG_DEBUG("sirius_physical_hash_join id {}: using filtered_join (BUILD_PROBE {})",
@@ -2059,7 +2075,9 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
     if (join_type == duckdb::JoinType::MARK) {
       auto semi_indices = cudf::mixed_left_semi_join(
         left_eq, right_eq, left_full, right_full, pred->back(), compare_nulls(), stream);
-      set_build_has_null(_build_has_null, table_has_any_null(right_eq));
+      if (!mark_is_null_safe()) {
+        set_build_has_null(_build_has_null, table_has_any_null(right_eq));
+      }
       return resolve_mark_join_result(*semi_indices,
                                       left_full,
                                       lhs_output_columns.col_idxs,
@@ -2236,7 +2254,9 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
           right_full.num_rows());
         auto mark_join_object = make_left_mark_join(left_keys, compare_nulls(), stream);
         auto semi_indices     = mark_join_object.semi_join(right_keys, stream);
-        set_build_has_null(_build_has_null, table_has_any_null(right_keys));
+        if (!mark_is_null_safe()) {
+          set_build_has_null(_build_has_null, table_has_any_null(right_keys));
+        }
         return resolve_mark_join_result(*semi_indices,
                                         left_full,
                                         lhs_output_columns.col_idxs,
@@ -2249,7 +2269,9 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
       }
       auto filtered_join_object = make_right_filtered_join(right_keys, compare_nulls(), stream);
       auto semi_indices         = filtered_join_object.semi_join(left_keys, stream);
-      set_build_has_null(_build_has_null, table_has_any_null(right_keys));
+      if (!mark_is_null_safe()) {
+        set_build_has_null(_build_has_null, table_has_any_null(right_keys));
+      }
       return resolve_mark_join_result(*semi_indices,
                                       left_full,
                                       lhs_output_columns.col_idxs,

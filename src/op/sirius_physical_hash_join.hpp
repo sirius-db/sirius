@@ -112,9 +112,11 @@ struct build_probe_decision {
 /// Only the build side drives broadcast / build-probe, so when `is_build_side` is false (right-
 /// family joins are probe-driven) the result is the plain STANDARD-mode natural count.
 ///
-/// MARK joins cannot be hash-partitioned across batches (build_has_null must be globally
-/// consistent), so they are clamped to one partition on a single GPU and forced to broadcast on
-/// multi-GPU.
+/// A MARK join with any null-propagating (`=`) key cannot be hash-partitioned across batches
+/// (build_has_null must be globally consistent), so it is clamped to one partition on a single GPU
+/// and forced to broadcast on multi-GPU. An all-null-safe MARK (`mark_null_safe`) emits definite
+/// marks that depend only on the probe row's own key, and NULL keys hash to the same partition on
+/// both sides, so it partitions like a SEMI join.
 ///
 /// BUILD_PROBE eligibility requires: the build folds to one hash table per GPU within
 /// `max_build_hash_table_bytes` (a broadcast join charges the FULL build to every GPU; a
@@ -144,7 +146,8 @@ struct build_probe_decision {
   uint64_t max_broadcast_join_size,
   duckdb::JoinType join_type,
   HASH_JOIN_MODE join_mode,
-  double estimated_probe_to_build_ratio);
+  double estimated_probe_to_build_ratio,
+  bool mark_null_safe = false);
 
 /// Which broadcast slots to discard. In a broadcast join the build table is replicated to every
 /// slot but the probe side is unpartitioned, so a slot may hold build data yet never receive probe

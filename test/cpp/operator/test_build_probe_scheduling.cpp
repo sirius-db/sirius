@@ -102,7 +102,8 @@ partition_strategy strategy(uint64_t total_bytes,
                             uint64_t hash_partition_bytes         = kBigPartitionBytes,
                             uint64_t max_build_hash_table_bytes   = kMaxBuildBytes,
                             uint64_t max_broadcast_join_size      = kMaxBroadcastBytes,
-                            double estimated_probe_to_build_ratio = 0.0)
+                            double estimated_probe_to_build_ratio = 0.0,
+                            bool mark_null_safe                   = false)
 {
   auto result = compute_hash_join_partition_strategy(total_bytes,
                                                      is_build_side,
@@ -114,7 +115,8 @@ partition_strategy strategy(uint64_t total_bytes,
                                                      max_broadcast_join_size,
                                                      join_type,
                                                      join_mode,
-                                                     estimated_probe_to_build_ratio);
+                                                     estimated_probe_to_build_ratio,
+                                                     mark_null_safe);
   // Every strategy places exactly the partitions it asks for.
   REQUIRE(result.placement.num_partitions() == static_cast<std::size_t>(result.num_partitions));
   return result;
@@ -417,6 +419,79 @@ TEST_CASE("compute_hash_join_partition_strategy - MARK multi-GPU forces broadcas
   REQUIRE(big.num_partitions == 4);
   REQUIRE(big.broadcast);
   REQUIRE(big.build_probe);
+}
+
+TEST_CASE("compute_hash_join_partition_strategy - all-null-safe MARK partitions like SEMI",
+          "[hash_join][build_probe][unit][mark]")
+{
+  // An all-null-safe MARK has definite marks that depend only on the probe row's own key, so it is
+  // not pinned to one whole-build partition: it takes exactly SEMI's strategy for every shape.
+  struct shape {
+    uint64_t total_bytes;
+    int num_gpus;
+    uint64_t hash_partition_bytes;
+  };
+  for (auto const& c : {shape{k100MB, 1, kBigPartitionBytes},
+                        shape{8 * k100MB, 1, k100MB},
+                        shape{6 * k100MB, 1, 1024ull * 1024 * 1024},
+                        shape{k100MB, 4, kBigPartitionBytes},
+                        shape{6 * k100MB, 4, k100MB},
+                        shape{40 * k100MB, 4, k100MB}}) {
+    CAPTURE(c.total_bytes, c.num_gpus, c.hash_partition_bytes);
+    auto const semi = strategy(c.total_bytes,
+                               true,
+                               true,
+                               c.num_gpus,
+                               duckdb::JoinType::SEMI,
+                               HASH_JOIN_MODE::STANDARD,
+                               c.hash_partition_bytes);
+    auto const mark = strategy(c.total_bytes,
+                               true,
+                               true,
+                               c.num_gpus,
+                               duckdb::JoinType::MARK,
+                               HASH_JOIN_MODE::STANDARD,
+                               c.hash_partition_bytes,
+                               kMaxBuildBytes,
+                               kMaxBroadcastBytes,
+                               /*estimated_probe_to_build_ratio=*/0.0,
+                               /*mark_null_safe=*/true);
+    REQUIRE(mark.num_partitions == semi.num_partitions);
+    REQUIRE(mark.broadcast == semi.broadcast);
+    REQUIRE(mark.build_probe == semi.build_probe);
+  }
+
+  // The q21 shape: a single-GPU build over the hash-table cap and over hash_partition_bytes runs
+  // STANDARD at the natural count instead of one forced whole-build BUILD_PROBE partition.
+  auto const large = strategy(8 * k100MB,
+                              true,
+                              true,
+                              /*num_gpus=*/1,
+                              duckdb::JoinType::MARK,
+                              HASH_JOIN_MODE::STANDARD,
+                              /*hash_partition_bytes=*/k100MB,
+                              kMaxBuildBytes,
+                              kMaxBroadcastBytes,
+                              /*estimated_probe_to_build_ratio=*/0.0,
+                              /*mark_null_safe=*/true);
+  REQUIRE(large.num_partitions > 1);
+  REQUIRE_FALSE(large.broadcast);
+  REQUIRE_FALSE(large.build_probe);
+
+  // A small null-safe MARK build still folds into one BUILD_PROBE hash table.
+  auto const small = strategy(k100MB,
+                              true,
+                              true,
+                              /*num_gpus=*/1,
+                              duckdb::JoinType::MARK,
+                              HASH_JOIN_MODE::STANDARD,
+                              kBigPartitionBytes,
+                              kMaxBuildBytes,
+                              kMaxBroadcastBytes,
+                              /*estimated_probe_to_build_ratio=*/0.0,
+                              /*mark_null_safe=*/true);
+  REQUIRE(small.num_partitions == 1);
+  REQUIRE(small.build_probe);
 }
 
 TEST_CASE("compute_hash_join_partition_strategy - mixed / full-outer / unfoldable stay STANDARD",

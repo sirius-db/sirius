@@ -1120,6 +1120,87 @@ TEST_CASE("sirius_physical_hash_join MARK with all null-safe keys emits definite
   REQUIRE(copy_column_to_host<bool>(mark) == std::vector<bool>{true, true, false});
 }
 
+// A hash-partitioned all-null-safe MARK runs one STANDARD task per partition on the same operator.
+// Partition builds legitimately differ in whether they hold a NULL key; with null-safe keys that
+// is irrelevant (NULL only matches NULL, which hashes to the same partition on both sides), so
+// each probe row's mark depends only on its own partition and is always definite.
+TEST_CASE("sirius_physical_hash_join null-safe MARK is correct across hash partitions",
+          "[physical_hash_join][mark][nulls][partition]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space);
+  auto f = create_mark_join(duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM);
+
+  auto run_partition = [&](std::shared_ptr<cucascade::data_batch> left,
+                           std::shared_ptr<cucascade::data_batch> right) {
+    std::vector<std::shared_ptr<cucascade::data_batch>> inputs{std::move(left), std::move(right)};
+    auto outputs =
+      f.hash_join->execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
+    auto const& output_data = dynamic_cast<const pipelineable_operator_data&>(*outputs);
+    REQUIRE(output_data.get_data_batches().size() == 1);
+    auto view = sirius::get_cudf_table_view(*output_data.get_data_batches()[0]);
+    auto mark = view.column(view.num_columns() - 1);
+    REQUIRE(mark.null_count() == 0);
+    return copy_column_to_host<bool>(mark);
+  };
+
+  // Partition 0: build {NULL, 5}; probe {NULL, 5, 7} -> NULL and 5 match, 7 is a definite miss.
+  auto p0_key = make_numeric_batch_with_nulls<int32_t>(
+    *space, {0, 5, 7}, {false, true, true}, cudf::type_id::INT32);
+  auto p0_left = concatenate_batches_horizontal(
+    {p0_key, make_numeric_batch<int32_t>(*space, {10, 20, 30}, cudf::type_id::INT32)}, *space);
+  auto p0_right =
+    make_numeric_batch_with_nulls<int32_t>(*space, {0, 5}, {false, true}, cudf::type_id::INT32);
+  REQUIRE(run_partition(p0_left, p0_right) == std::vector<bool>{true, true, false});
+
+  // Partition 1: build {8} has no NULL key, unlike partition 0. This used to trip the global
+  // build_has_null consistency check; for null-safe keys it must not, and 9 is FALSE, not NULL.
+  auto p1_left = make_two_column_batch<int32_t, int32_t>(
+    *space, {8, 9}, {40, 50}, cudf::type_id::INT32, std::nullopt, cudf::type_id::INT32);
+  auto p1_right = make_numeric_batch<int32_t>(*space, {8}, cudf::type_id::INT32);
+  REQUIRE(run_partition(p1_left, p1_right) == std::vector<bool>{true, false});
+
+  // Partition 2 received no build rows: every probe row is a definite miss.
+  auto p2_left = make_two_column_batch<int32_t, int32_t>(
+    *space, {11, 12}, {60, 70}, cudf::type_id::INT32, std::nullopt, cudf::type_id::INT32);
+  auto p2_right = make_numeric_batch<int32_t>(*space, {}, cudf::type_id::INT32);
+  REQUIRE(run_partition(p2_left, p2_right) == std::vector<bool>{false, false});
+}
+
+// A null-propagating MARK keeps its global build_has_null sentinel, so it still refuses build
+// batches that disagree about NULL keys: it is never hash-partitioned (see
+// compute_hash_join_partition_strategy), and this guard catches a regression that splits it.
+TEST_CASE("sirius_physical_hash_join null-propagating MARK rejects inconsistent build NULLs",
+          "[physical_hash_join][mark][nulls][partition]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space);
+  auto f = create_mark_join();
+
+  auto execute = [&](std::shared_ptr<cucascade::data_batch> left,
+                     std::shared_ptr<cucascade::data_batch> right) {
+    std::vector<std::shared_ptr<cucascade::data_batch>> inputs{std::move(left), std::move(right)};
+    return f.hash_join->execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
+  };
+
+  // First batch: build {2, NULL} -> unmatched rows are NULL under three-valued logic.
+  auto left0 = make_two_column_batch<int32_t, int32_t>(
+    *space, {1, 2}, {10, 20}, cudf::type_id::INT32, std::nullopt, cudf::type_id::INT32);
+  auto right0 =
+    make_numeric_batch_with_nulls<int32_t>(*space, {2, 0}, {true, false}, cudf::type_id::INT32);
+  auto out0  = execute(left0, right0);
+  auto view0 = sirius::get_cudf_table_view(
+    *dynamic_cast<const pipelineable_operator_data&>(*out0).get_data_batches()[0]);
+  REQUIRE(copy_validity_to_host(view0.column(2)) == std::vector<bool>{false, true});
+
+  // A second build batch without NULL keys would make the same probe key FALSE here and NULL above.
+  auto left1 = make_two_column_batch<int32_t, int32_t>(
+    *space, {3}, {30}, cudf::type_id::INT32, std::nullopt, cudf::type_id::INT32);
+  auto right1 = make_numeric_batch<int32_t>(*space, {4}, cudf::type_id::INT32);
+  REQUIRE_THROWS_WITH(execute(left1, right1),
+                      Catch::Matchers::ContainsSubstring("build_has_null inconsistency"));
+}
+
 TEST_CASE("sirius_physical_nested_loop_join SEMI and ANTI honor the left projection map",
           "[physical_nested_loop_join][projection][semi][anti]")
 {
