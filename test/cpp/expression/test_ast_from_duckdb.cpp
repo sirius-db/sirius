@@ -1079,11 +1079,8 @@ TEST_CASE("ast_from_duckdb - BOUND_PARAMETER returns nullptr", "[ast_from_duckdb
 }
 
 // ============================================================================
-// BOUND_AGGREGATE with a FILTER clause — the planner's mask rewrite consumes
-// aggregate filters before translation; the only filtered shape the translator
-// lowers itself is count_star carrying a bound reference to the materialized
-// mask column. Every other surviving filter declines to nullptr (CPU fallback)
-// so it can never be silently dropped.
+// BOUND_AGGREGATE: generic translation accepts only filter-free aggregates.
+// The planner consumes all supported FILTER clauses before this boundary.
 // ============================================================================
 
 namespace {
@@ -1109,7 +1106,7 @@ AggregateFunction make_dummy_aggregate(std::string const& name,
 
 }  // namespace
 
-TEST_CASE("ast_from_duckdb - count_star with a mask-reference filter lowers to count(mask)",
+TEST_CASE("ast_from_duckdb - count_star with a raw reference filter declines",
           "[ast_from_duckdb][aggregate_filter]")
 {
   auto fn   = make_dummy_aggregate("count_star", {}, LogicalType{LogicalTypeId::BIGINT});
@@ -1120,16 +1117,7 @@ TEST_CASE("ast_from_duckdb - count_star with a mask-reference filter lowers to c
     nullptr,
     AggregateType::NON_DISTINCT);
 
-  auto out = sirius::ast::from_duckdb(*expr);
-  REQUIRE(out);
-  REQUIRE(out->holds<sirius::ast::aggregate>());
-  auto const& agg = out->get<sirius::ast::aggregate>();
-  REQUIRE(agg.function() == sirius::aggregate_id::count);
-  REQUIRE(agg.distinct() == false);
-  REQUIRE(agg.return_type().id() == sirius::type_id::BIGINT);
-  REQUIRE(agg.arguments().size() == 1);
-  REQUIRE(agg.arguments()[0]->holds<reference>());
-  REQUIRE(agg.arguments()[0]->get<reference>().column_index == 7);
+  REQUIRE(sirius::ast::from_duckdb(*expr) == nullptr);
 }
 
 TEST_CASE("ast_from_duckdb - child-bearing aggregate with an unconsumed filter declines",
@@ -1159,6 +1147,42 @@ TEST_CASE("ast_from_duckdb - count_star with a non-reference filter declines",
     nullptr,
     AggregateType::NON_DISTINCT);
 
+  REQUIRE(sirius::ast::from_duckdb(*expr) == nullptr);
+}
+
+TEST_CASE("ast_from_duckdb - filter-free unary count translates normally",
+          "[ast_from_duckdb][aggregate_filter]")
+{
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> children;
+  children.push_back(make_bound_ref(7, LogicalTypeId::BOOLEAN));
+  auto fn   = make_dummy_aggregate("count", {LogicalType::BOOLEAN}, LogicalType::BIGINT);
+  auto expr = duckdb::make_uniq<BoundAggregateExpression>(duckdb::BoundAggregateFunction(fn),
+                                                          std::move(children),
+                                                          nullptr,
+                                                          nullptr,
+                                                          AggregateType::NON_DISTINCT);
+  auto out  = sirius::ast::from_duckdb(*expr);
+  REQUIRE(out);
+  auto const& agg = out->get<sirius::ast::aggregate>();
+  CHECK(agg.function() == sirius::aggregate_id::count);
+  CHECK_FALSE(agg.distinct());
+  CHECK(agg.return_type().id() == sirius::type_id::BIGINT);
+  REQUIRE(agg.arguments().size() == 1);
+  CHECK(agg.arguments()[0]->get<reference>().column_index == 7);
+}
+
+TEST_CASE("ast_from_duckdb - count_star with a compound filter declines",
+          "[ast_from_duckdb][aggregate_filter]")
+{
+  auto fn     = make_dummy_aggregate("count_star", {}, LogicalType::BIGINT);
+  auto filter = BoundComparisonExpression::Create(
+    ExpressionType::COMPARE_GREATERTHAN, make_bound_ref(0), make_bound_int_const(0));
+  auto expr = duckdb::make_uniq<BoundAggregateExpression>(
+    duckdb::BoundAggregateFunction(fn),
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{},
+    std::move(filter),
+    nullptr,
+    AggregateType::NON_DISTINCT);
   REQUIRE(sirius::ast::from_duckdb(*expr) == nullptr);
 }
 

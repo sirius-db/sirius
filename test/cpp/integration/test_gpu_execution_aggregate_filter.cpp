@@ -30,7 +30,7 @@
 
 namespace {
 
-// `x` is dense (each residue 0-99 appears 10 times), `xn` adds NULLs among passing rows,
+// `x` is dense (each residue 0-99 appears 10 times), `xn` is NULL exactly where x = 50,
 // `g` is the group key and contains a NULL group, `d`/`s` cover the DECIMAL and VARCHAR
 // aggregate paths.
 class AggFilterFixture : public sirius::test::GpuExecutionFixture {
@@ -47,6 +47,12 @@ class AggFilterFixture : public sirius::test::GpuExecutionFixture {
       "FROM range(1000);");
     run_ok("CREATE TABLE marks(y INTEGER);");
     run_ok("INSERT INTO marks VALUES (1),(2),(NULL);");
+    run_ok("CREATE TABLE agg_nulls(g INTEGER, v INTEGER, keep BOOLEAN);");
+    run_ok(
+      "INSERT INTO agg_nulls VALUES (1,1,true),(1,NULL,true),(1,2,true),"
+      "(1,100,false),(1,200,NULL),(2,NULL,true),(2,300,false),"
+      "(3,400,false),(3,500,NULL);");
+    run_ok("CREATE TABLE agg_empty(g INTEGER, v INTEGER, keep BOOLEAN);");
     run_ok("CHECKPOINT;");
   }
 
@@ -173,4 +179,47 @@ TEST_CASE_METHOD(AggFilterFixture,
 {
   expect_plan_fallback_and_compare("SELECT count(DISTINCT x) FILTER (WHERE x < 50) FROM agg_f");
   expect_plan_fallback_and_compare("SELECT first(x) FILTER (WHERE x = 42) FROM agg_f");
+}
+
+TEST_CASE_METHOD(AggFilterFixture,
+                 "gpu_execution shared FILTER inputs preserve passing NULLs and empty groups",
+                 "[integration][gpu_execution][aggregate][aggregate_filter]")
+{
+  for (bool grouped : {false, true}) {
+    compare_gpu_vs_cpu(std::string("SELECT ") + (grouped ? "g, " : "") +
+                       "sum(v) FILTER (WHERE keep), min(v) FILTER (WHERE keep), "
+                       "max(v) FILTER (WHERE keep), avg(v) FILTER (WHERE keep), "
+                       "count(v) FILTER (WHERE keep), count(*) FILTER (WHERE keep), "
+                       "count(v) FILTER (WHERE NOT keep), sum(v) FILTER (WHERE NOT keep) "
+                       "FROM agg_nulls" +
+                       (grouped ? " GROUP BY g" : ""));
+  }
+}
+
+TEST_CASE_METHOD(AggFilterFixture,
+                 "gpu_execution FILTER over a truly empty on-disk table",
+                 "[integration][gpu_execution][aggregate][aggregate_filter]")
+{
+  for (bool grouped : {false, true}) {
+    compare_gpu_vs_cpu(std::string("SELECT ") + (grouped ? "g, " : "") +
+                       "sum(v) FILTER (WHERE keep), min(v) FILTER (WHERE keep), "
+                       "max(v) FILTER (WHERE keep), avg(v) FILTER (WHERE keep), "
+                       "count(v) FILTER (WHERE keep), count(*) FILTER (WHERE keep) "
+                       "FROM agg_empty" +
+                       (grouped ? " GROUP BY g" : ""));
+  }
+}
+
+TEST_CASE_METHOD(AggFilterFixture,
+                 "gpu_execution shared FILTER reductions with all-NULL or all-failing inputs",
+                 "[integration][gpu_execution][aggregate][aggregate_filter]")
+{
+  for (auto group : {2, 3}) {
+    compare_gpu_vs_cpu(
+      "SELECT sum(v) FILTER (WHERE keep), min(v) FILTER (WHERE keep), "
+      "max(v) FILTER (WHERE keep), avg(v) FILTER (WHERE keep), "
+      "count(v) FILTER (WHERE keep), count(*) FILTER (WHERE keep) "
+      "FROM agg_nulls WHERE g = " +
+      std::to_string(group));
+  }
 }

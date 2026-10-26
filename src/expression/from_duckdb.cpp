@@ -399,6 +399,7 @@ std::unique_ptr<node> translate_function(duckdb::BoundFunctionExpression const& 
 
 std::unique_ptr<node> translate_aggregate(duckdb::BoundAggregateExpression const& aggr)
 {
+  if (aggr.GetFilter()) { return nullptr; }
   auto agg_id_opt =
     sirius::from_duckdb_aggregate_name(aggr.Function().GetName().GetIdentifierName());
   if (!agg_id_opt.has_value()) { return nullptr; }
@@ -407,26 +408,6 @@ std::unique_ptr<node> translate_aggregate(duckdb::BoundAggregateExpression const
     // It counts rows, including NULLs, just like count_star.
     if (aggr.IsDistinct()) { return nullptr; }
     agg_id_opt = aggregate_id::count_star;
-  }
-  if (aggr.GetFilter()) {
-    // The planner's mask rewrite consumes aggregate filters; the one shape that legitimately
-    // arrives here with a filter is count_star carrying a bound reference to the materialized
-    // `CASE WHEN <filter> THEN true ELSE NULL END` mask column. COUNT(*) FILTER equals the count
-    // of non-null mask entries, so lower it to count(mask). Any other surviving filter is
-    // unhandled -- decline so the caller falls back to CPU instead of silently dropping it.
-    if (*agg_id_opt == sirius::aggregate_id::count_star && !aggr.IsDistinct() &&
-        aggr.GetChildren().empty() &&
-        aggr.GetFilter()->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
-      auto const& mask_ref = aggr.GetFilter()->Cast<duckdb::BoundReferenceExpression>();
-      std::vector<std::unique_ptr<node>> args;
-      args.push_back(std::make_unique<node>(reference{
-        static_cast<uint32_t>(mask_ref.Index()), sirius::from_duckdb(mask_ref.GetReturnType())}));
-      return std::make_unique<node>(aggregate{sirius::aggregate_id::count,
-                                              std::move(args),
-                                              sirius::from_duckdb(aggr.GetReturnType()),
-                                              /*distinct=*/false});
-    }
-    return nullptr;
   }
   auto arguments = translate_children(aggr.GetChildren());
   if (!arguments) { return nullptr; }

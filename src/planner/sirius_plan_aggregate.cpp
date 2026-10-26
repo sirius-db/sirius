@@ -22,10 +22,13 @@
 #include "duckdb/function/function_binder.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/settings.hpp"
+#include "duckdb/parser/expression_map.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_case_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "expression/aggregate_id.hpp"
@@ -116,14 +119,23 @@ duckdb::unique_ptr<duckdb::Expression> make_filter_mask(
     std::move(filter), std::move(value), std::move(null_else));
 }
 
-// Pulls aggregate child sub-expressions out of the aggregate list and groups into a projection
-// fed upstream of the aggregate. An aggregate FILTER clause is absorbed into that projection:
-// each child of a filtered aggregate is hoisted as CASE WHEN <filter> THEN <child> ELSE NULL END
-// (exact for the NULL-skipping aggregate set the gate admits), and a filtered count_star hoists
-// a boolean mask column whose reference is parked on the filter slot for translate_aggregate
-// to lower to count(mask). Operates on raw DuckDB expressions so the hoist is straightforward;
-// the caller translates the resulting groups/aggregates into Sirius AST nodes when constructing
-// the aggregate operator.
+bool has_ordered_function(duckdb::Expression const& expression)
+{
+  if (expression.GetExpressionClass() == duckdb::ExpressionClass::BOUND_FUNCTION &&
+      expression.Cast<duckdb::BoundFunctionExpression>().Function().RequiresOrderedExecution()) {
+    return true;
+  }
+  bool ordered = false;
+  duckdb::ExpressionIterator::EnumerateChildren(expression, [&](duckdb::Expression const& child) {
+    ordered = ordered || has_ordered_function(child);
+  });
+  return ordered;
+}
+
+// Hoist groups and aggregate inputs, consuming every supported FILTER into a nullable CASE input.
+// Structurally equal generated masks share one projected column only when the whole expression is
+// consistent, nonvolatile, and does not require ordered execution. Filtered COUNT(*) is rebound to
+// COUNT over its boolean mask before generic expression translation.
 duckdb::unique_ptr<sirius::op::sirius_physical_operator> extract_aggregate_expressions(
   duckdb::ClientContext& context,
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> child,
@@ -133,6 +145,22 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> extract_aggregate_expre
 {
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions;
   duckdb::vector<duckdb::LogicalType> types;
+  // Keys borrow immutable heap nodes owned by expressions; moving their unique_ptrs does not move
+  // the nodes. Clear the map before translation drains those owners.
+  duckdb::expression_map_t<duckdb::idx_t> masked_inputs;
+  auto project_input = [&](duckdb::unique_ptr<duckdb::Expression> expression, bool masked) {
+    bool const shareable = masked && expression->IsConsistent() && !expression->IsVolatile() &&
+                           !has_ordered_function(*expression);
+    if (shareable) {
+      auto const found = masked_inputs.find(*expression);
+      if (found != masked_inputs.end()) { return found->second; }
+    }
+    auto const index = expressions.size();
+    types.push_back(expression->GetReturnType());
+    expressions.push_back(std::move(expression));
+    if (shareable) { masked_inputs.emplace(*expressions.back(), index); }
+    return index;
+  };
 
   // bind sorted aggregates
   for (auto& aggr : aggregates) {
@@ -154,27 +182,31 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> extract_aggregate_expre
     auto filter = std::move(bound_aggr.GetFilterMutable());  // consumes the filter
     for (auto& child_expr : bound_aggr.GetChildrenMutable()) {
       if (filter) { child_expr = make_filter_mask(filter->Copy(), std::move(child_expr)); }
-      auto ref = duckdb::make_uniq<duckdb::BoundReferenceExpression>(child_expr->GetReturnType(),
-                                                                     expressions.size());
-      types.push_back(child_expr->GetReturnType());
-      expressions.push_back(std::move(child_expr));
-      child_expr = std::move(ref);
+      auto const type  = child_expr->GetReturnType();
+      auto const index = project_input(std::move(child_expr), filter != nullptr);
+      child_expr       = duckdb::make_uniq<duckdb::BoundReferenceExpression>(type, index);
     }
     if (filter && bound_aggr.GetChildren().empty()) {
-      // count_star is the only zero-child aggregate the gate admits. Materialize the boolean
-      // mask column and park its reference on the filter slot: translate_aggregate lowers
-      // count_star-with-filter-reference to count(mask), i.e. COUNT_VALID of a column that is
-      // non-null exactly where the filter passes.
       auto mask = make_filter_mask(
         std::move(filter),
         duckdb::make_uniq<duckdb::BoundConstantExpression>(duckdb::Value::BOOLEAN(true)));
-      auto ref = duckdb::make_uniq<duckdb::BoundReferenceExpression>(mask->GetReturnType(),
-                                                                     expressions.size());
-      types.push_back(mask->GetReturnType());
-      expressions.push_back(std::move(mask));
-      bound_aggr.GetFilterMutable() = std::move(ref);
+      auto const index = project_input(std::move(mask), true);
+      duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> arguments;
+      arguments.push_back(
+        duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::BOOLEAN, index));
+      auto& count =
+        duckdb::Catalog::GetSystemCatalog(context).GetEntry<duckdb::AggregateFunctionCatalogEntry>(
+          context, duckdb::QualifiedName("", DEFAULT_SCHEMA, "count"));
+      auto function =
+        count.functions.GetFunctionByArguments(context, {duckdb::LogicalType::BOOLEAN});
+      duckdb::FunctionBinder binder(context);
+      auto normalized = binder.BindAggregateFunction(std::move(function), std::move(arguments));
+      normalized->SetAlias(bound_aggr.GetAlias());
+      normalized->SetQueryLocation(bound_aggr.GetQueryLocation());
+      aggr = std::move(normalized);
     }
   }
+  masked_inputs.clear();
   if (expressions.empty()) { return child; }
   auto const estimated_cardinality = child->estimated_cardinality;
   return push_projection(std::move(child),
