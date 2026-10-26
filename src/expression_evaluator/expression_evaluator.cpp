@@ -24,6 +24,7 @@
 #include <expression_evaluator/nvrtc/register_value.hpp>
 #include <helper/numeric_narrowing.hpp>
 #include <sirius/exception.hpp>
+#include <telemetry/nvtx.hpp>
 
 // cudf
 #include <cudf/column/column_factories.hpp>
@@ -363,6 +364,7 @@ expression_evaluator::try_evaluate_nvrtc_with_boundaries(
 
 std::unique_ptr<cudf::table> expression_evaluator::evaluate(cudf::table_view input)
 {
+  nvtx_scoped_range nvtx_range{"expression_evaluator::evaluate"};
   _output_columns.clear();
   _output_columns.reserve(_ast_expressions.size());
 
@@ -512,6 +514,7 @@ std::unique_ptr<cudf::column> expression_evaluator::compute_mask(cudf::table_vie
 std::unique_ptr<cudf::table> expression_evaluator::select(
   cudf::table_view input, std::span<cudf::size_type const> output_indices)
 {
+  nvtx_scoped_range nvtx_range{"expression_evaluator::select"};
   // A cuDF table with zero columns cannot carry a row count, so a pure-filter result with no
   // output columns (e.g. count(*) over a filtered scan) is unrepresentable here. Such callers
   // must use the all-columns select() overload so the surviving row count is preserved.
@@ -564,6 +567,7 @@ std::unique_ptr<cudf::table> expression_evaluator::select_with_survivors(
 
 std::unique_ptr<cudf::table> expression_evaluator::select(cudf::table_view input)
 {
+  nvtx_scoped_range nvtx_range{"expression_evaluator::select"};
   if (_policy.strategy == expression_evaluator_strategy::NVRTC_JIT) {
     if (auto out = try_select_nvrtc_with_boundaries(input, input, nullptr)) {
       return std::move(*out);
