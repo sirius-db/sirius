@@ -7,14 +7,21 @@ as follows:
 
 1. Bump submodules
     - `./duckdb` and `./sirius-duckdb/duckdb` should be set to latest tagged release and match (see verify below)
-    - Keep related submodules such as `./substrait` and `./sirius-duckdb/vcpkg` aligned when the release requires it
-2. Update the DuckDB package in `pixi.toml` to the matching release for Python users
+    - `./substrait` only needs bumping on a *major* DuckDB API break (e.g. v1->v2), not a routine
+      patch/minor release -- there's no static rule, the real test is whether `substrait/`'s
+      sources still compile against the new `./duckdb`
+    - `./sirius-duckdb/vcpkg` almost never needs bumping for a DuckDB version change -- it pins
+      Sirius's own CUDA/GPU dependency ports, and DuckDB has no `vcpkg.json` anywhere in its own
+      tree
+2. Update the DuckDB package in `pixi.toml` to the matching release for Python users, then
+   regenerate the lock (`pixi update duckdb`) -- never hand-edit `pixi.lock`
     - Check [conda-forge channel](https://anaconda.org/channels/conda-forge/packages/python-duckdb/overview) for packages first
     - Open PRs if needed for missing/new versions [conda-forge/python-duckdb-feedstock](https://github.com/conda-forge/python-duckdb-feedstock/pulls)
 3. Bump versions in `.github/workflows`
-    - `duckdb_version` input in `distribution.yml` should be set to latest tagged release (e.g. `v2.0.0`)
+    - `duckdb_version` input in `distribution.yml` should be set to latest tagged release (e.g. `v2.0.0`) or matching SHA with submodules in 1
     - The reusable `sirius-db/extension-ci-tools` workflow ref and `ci_tools_version` input should be updated only when the remote CI tooling branch changes
-4. Check for use of the current DuckDB version in the repo to determine if they should be updated with the current PR or documented as a gap in an issue for follow up later
+4. Check for use of the current DuckDB version in the repo to determine if they should be updated
+   with the current PR or documented as a gap in an issue for follow up later.
 
 ## Verify
 
