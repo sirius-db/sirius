@@ -70,6 +70,10 @@ constexpr uint64_t DEFAULT_MAX_BROADCAST_JOIN_SIZE        = 256ULL * 1024 * 1024
 /// Capacity rounding and auxiliary allocations are excluded; this is an admission estimate.
 constexpr uint64_t BUILD_PROBE_HASH_TABLE_BYTES_PER_ROW = 16;
 
+/// cuDF's row-count limit (`std::numeric_limits<cudf::size_type>::max()`): the most rows one
+/// BUILD_PROBE build chunk may hold.
+constexpr uint64_t DEFAULT_BUILD_CHUNK_MAX_ROWS = 2147483647ULL;
+
 /// Multi-GPU small-table threshold, charged per GPU. A partition-sizing consumer (hash join,
 /// merge_group_by) keeps inputs below `num_gpus * this` on a single GPU (one partition) to avoid
 /// cross-device overhead; above it, the multi-GPU floor of `num_gpus` partitions kicks in.
@@ -175,6 +179,12 @@ struct operator_params {
   /// Target output batch size (bytes) for CONCAT and REPLICATE. REPLICATE may exceed the target by
   /// one row.
   uint64_t concat_batch_bytes = config::DEFAULT_CONCAT_BATCH_BYTES;
+
+  /// Most rows in one build chunk of a BUILD_PROBE MARK/SEMI/ANTI/INNER join. A partition whose
+  /// build side has more rows is split into several chunks, one hash table each, instead of
+  /// failing on cuDF's row-count limit. At most (and by default) that limit; lower values exist
+  /// to exercise the split in tests.
+  uint64_t build_chunk_max_rows = config::DEFAULT_BUILD_CHUNK_MAX_ROWS;
 
   /// Target output size (bytes) of each cross product task. A pair of input batches whose cross
   /// join is larger is split into tasks over row ranges of the left batch.
