@@ -36,8 +36,8 @@
 #include <charconv>
 #include <cstdlib>
 #include <cstring>
-#include <string_view>
 #include <mutex>
+#include <string_view>
 #include <thread>
 
 namespace sirius::exchange {
@@ -287,10 +287,10 @@ nixl_fabric::nixl_fabric(config cfg, frame_ring& send, frame_ring& recv)
   // Every peer's hello is in: choose each peer's path.
   for (rank_t r = 0; r < _peers.size(); ++r) {
     if (r == _rank) { continue; }
-    auto& p  = _peers[r];
-    p.staged = cfg.staging == host_staging::always ||
-               (cfg.staging == host_staging::automatic &&
-                !peer_access(_peers[_rank].pci_bus_id, p.pci_bus_id));
+    auto& p = _peers[r];
+    p.staged =
+      cfg.staging == host_staging::always || (cfg.staging == host_staging::automatic &&
+                                              !peer_access(_peers[_rank].pci_bus_id, p.pci_bus_id));
     if (p.staged) { map_mirror(r); }
     SIRIUS_LOG_INFO("exchange: rank {} (GPU {}) -> rank {} (GPU {}): {}",
                     _rank,
@@ -394,7 +394,7 @@ void nixl_fabric::receive()
         p.device     = h.device;
         p.pid        = h.pid;
         p.pci_bus_id.assign(h.pci_bus_id, strnlen(h.pci_bus_id, sizeof(h.pci_bus_id)));
-        p.hello      = true;
+        p.hello = true;
         continue;
       }
       if (!body.empty() && body.front() == staged_kind) {
@@ -413,8 +413,8 @@ void nixl_fabric::receive()
             at,
             agent);
         }
-        RMM_CUDA_TRY(cudaMemcpyAsync(
-          _recv.base() + at, _mirror + at, bytes, cudaMemcpyHostToDevice, _h2d));
+        RMM_CUDA_TRY(
+          cudaMemcpyAsync(_recv.base() + at, _mirror + at, bytes, cudaMemcpyHostToDevice, _h2d));
         auto* copied = take_event();
         RMM_CUDA_TRY(cudaEventRecord(copied, _h2d));
         _landings.push_back({copied, it->second, body.substr(1 + 2 * sizeof(std::uint64_t))});
@@ -434,8 +434,8 @@ std::uint64_t nixl_fabric::write(
       "exchange NIXL: a {}-byte write from {} to {} is outside the rings", bytes, src, dst);
   }
   if (p.staged) {
-    RMM_CUDA_TRY(cudaMemcpyAsync(
-      p.mirror + dst, _send.base() + src, bytes, cudaMemcpyDeviceToHost, _d2h));
+    RMM_CUDA_TRY(
+      cudaMemcpyAsync(p.mirror + dst, _send.base() + src, bytes, cudaMemcpyDeviceToHost, _d2h));
     auto* copied = take_event();
     RMM_CUDA_TRY(cudaEventRecord(copied, _d2h));
     std::string landed(1, staged_kind);
@@ -509,9 +509,10 @@ void nixl_fabric::poll(std::vector<fabric_notification>& out)
     auto const copied = cudaEventQuery(l.copied);
     if (copied == cudaErrorNotReady) { return false; }
     if (copied != cudaSuccess) {
-      throw sirius::internal_exception("exchange: copying a host-staged write from rank {} failed: {}",
-                                       l.from,
-                                       cudaGetErrorString(copied));
+      throw sirius::internal_exception(
+        "exchange: copying a host-staged write from rank {} failed: {}",
+        l.from,
+        cudaGetErrorString(copied));
     }
     _free_events.push_back(l.copied);
     out.push_back({l.from, std::move(l.notification)});
