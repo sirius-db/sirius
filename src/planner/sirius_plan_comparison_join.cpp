@@ -705,6 +705,8 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     auto& hj                        = join->Cast<sirius::op::sirius_physical_hash_join>();
     hj.mark_join_build_switch_ratio = op_params.mark_join_build_switch_ratio;
     hj.runtime_distinct_build_probe = op_params.enable_runtime_distinct_build_probe;
+    hj.set_single_join_error_on_multiple_rows(
+      duckdb::Settings::Get<duckdb::ScalarSubqueryErrorOnMultipleRowsSetting>(context));
 
     // --- Detect build-side key uniqueness ---
     // Gate: only for pure equal conditions (not_distinct_from needs null_equality::EQUAL).

@@ -27,6 +27,8 @@
 #include <duckdb.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 
+#include <string>
+
 using SingleJoinFixture = sirius::test::GpuExecutionFixture;
 
 namespace {
@@ -84,5 +86,41 @@ TEST_CASE_METHOD(SingleJoinFixture,
   {
     compare_gpu_vs_cpu(
       "SELECT a.id, (SELECT b.v FROM sj_bn b WHERE b.k IS NOT DISTINCT FROM a.k) v FROM sj_an a;");
+  }
+}
+
+TEST_CASE_METHOD(SingleJoinFixture,
+                 "single join - a probe row with several matches",
+                 "[integration][gpu_execution][single_join]")
+{
+  create_single_join_tables(*this);
+  // k = 0 matches two build rows (v = 5 and 25); k = 1 matches one.
+  run_ok("CREATE TABLE sj_dup AS SELECT (i % 2)::INTEGER k, (i * 10 + 5)::INTEGER v "
+         "FROM range(3) r(i);");
+  run_ok("CHECKPOINT;");
+  std::string const query =
+    "SELECT a.id, (SELECT b.v FROM sj_dup b WHERE b.k = a.k) v FROM sj_a a;";
+  auto const error_text = "More than one row returned by a subquery";
+
+  SECTION("is an error on the GPU as on the CPU")
+  {
+    con->Query("SET gpu_execution = true;");
+    auto gpu_result = con->Query(query);
+    REQUIRE(gpu_result->HasError());
+    CHECK(gpu_result->GetError().find(error_text) != std::string::npos);
+
+    con->Query("SET gpu_execution = false;");
+    auto cpu_result = con->Query(query);
+    con->Query("SET gpu_execution = true;");
+    REQUIRE(cpu_result->HasError());
+    CHECK(cpu_result->GetError().find(error_text) != std::string::npos);
+  }
+  SECTION("keeps one match when scalar_subquery_error_on_multiple_rows is off")
+  {
+    run_ok("SET scalar_subquery_error_on_multiple_rows = false;");
+    // Which match is kept is unspecified on either engine; compare only what is determined.
+    compare_gpu_vs_cpu(
+      "SELECT a.id, (SELECT b.v FROM sj_dup b WHERE b.k = a.k) IS NOT NULL m FROM sj_a a;");
+    run_ok("SET scalar_subquery_error_on_multiple_rows = true;");
   }
 }

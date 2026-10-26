@@ -21,8 +21,9 @@
  * a production path for SINGLE (the build is concat-folded per partition, so the per-task dedupe
  * is complete).
  *
- * Duplicate build keys can only be exercised here: DuckDB wraps a scalar subquery in a first()
- * aggregate, so a SINGLE join planned from SQL always sees unique build keys.
+ * A probe row with several build matches is an error under DuckDB's
+ * scalar_subquery_error_on_multiple_rows (the default), as in DuckDB's own hash join; with the
+ * setting off, one match is kept.
  */
 
 #include "helper/type_conversions.hpp"
@@ -36,6 +37,7 @@
 
 #include <algorithm>
 #include <optional>
+#include <string>
 #include <tuple>
 #include <vector>
 
@@ -65,7 +67,8 @@ void number_operator_tree(sirius::op::sirius_physical_operator& op, size_t& next
 /// Output: left key, left payload, right key, right payload (empty projection maps keep every
 /// column of both sides).
 single_join_fixture create_single_join(
-  duckdb::ExpressionType comparison = duckdb::ExpressionType::COMPARE_EQUAL)
+  duckdb::ExpressionType comparison = duckdb::ExpressionType::COMPARE_EQUAL,
+  bool error_on_multiple_rows       = true)
 {
   single_join_fixture f;
 
@@ -98,6 +101,8 @@ single_join_fixture create_single_join(
     duckdb::vector<duckdb::idx_t>{},
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{}),
     1000);
+
+  f.hash_join->set_single_join_error_on_multiple_rows(error_on_multiple_rows);
 
   size_t next_id = 0;
   number_operator_tree(*f.hash_join, next_id);
@@ -165,7 +170,29 @@ std::unique_ptr<operator_data> run(single_join_fixture& f,
 
 }  // namespace
 
-TEST_CASE("sirius_physical_hash_join single join - duplicate build keys yield one row per probe row",
+TEST_CASE("sirius_physical_hash_join single join - multiple matches per probe row are an error",
+          "[physical_single_join]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space);
+
+  auto left  = make_key_payload_batch(*space, {10, 20, 30}, {1, 2, 3});
+  auto right = make_key_payload_batch(*space, {20, 20, 20}, {100, 200, 300});
+
+  auto f     = create_single_join();
+  bool threw = false;
+  try {
+    run(f, left, right);
+  } catch (duckdb::InvalidInputException const& e) {
+    threw = true;
+    CHECK(std::string(e.what()).find("More than one row returned by a subquery") !=
+          std::string::npos);
+  }
+  REQUIRE(threw);
+}
+
+TEST_CASE("sirius_physical_hash_join single join - duplicate build keys yield one row per probe row "
+          "when multiple rows are allowed",
           "[physical_single_join]")
 {
   auto* space = get_shared_mem_space();
@@ -175,7 +202,7 @@ TEST_CASE("sirius_physical_hash_join single join - duplicate build keys yield on
   // Key 20 matches three build rows; SINGLE keeps exactly one of them.
   auto right = make_key_payload_batch(*space, {20, 20, 20}, {100, 200, 300});
 
-  auto f    = create_single_join();
+  auto f    = create_single_join(duckdb::ExpressionType::COMPARE_EQUAL, false);
   auto rows = rows_sorted_by_left_key(*run(f, left, right));
 
   REQUIRE(rows.size() == 3);
@@ -225,12 +252,13 @@ TEST_CASE("sirius_physical_hash_join single join - IS NOT DISTINCT FROM matches 
   auto* space = get_shared_mem_space();
   REQUIRE(space);
 
-  // Left key 0 is NULL; the build has a NULL key and a duplicate 30.
+  // Left key 0 is NULL; the build has a NULL key and a duplicate 30 (allowed, to show the
+  // dedupe keys on the null-safe comparison).
   auto left  = make_nullable_key_payload_batch(*space, {0, 10, 30}, {false, true, true}, {1, 2, 3});
   auto right = make_nullable_key_payload_batch(
     *space, {0, 30, 30}, {false, true, true}, {7, 8, 9});
 
-  auto f    = create_single_join(duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM);
+  auto f    = create_single_join(duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM, false);
   auto rows = rows_sorted_by_left_key(*run(f, left, right));
 
   REQUIRE(rows.size() == 3);

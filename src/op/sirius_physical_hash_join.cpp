@@ -1580,8 +1580,8 @@ static std::unique_ptr<operator_data> gather_join_output(
 // A SINGLE join emits at most one right match per probe row. A left join's pair lists hold one
 // (row, JoinNoneValue) pair for an unmatched probe row and one pair per match otherwise, so
 // keeping any one pair per left index leaves exactly one row per probe row. The build side is
-// concat-folded per partition (join_concat_all), so every match for a probe row is in this task
-// and the per-task dedupe is complete.
+// concat-folded per partition (join_concat_all), so every match for a probe row is in this task:
+// the per-task dedupe is complete and so is the duplicate-match check built on it.
 static std::unique_ptr<cudf::table> keep_one_match_per_probe_row(
   rmm::device_uvector<cudf::size_type> const& left_indices,
   rmm::device_uvector<cudf::size_type> const& right_indices,
@@ -2295,7 +2295,16 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
   }
 
   if (join_type == duckdb::JoinType::SINGLE && left_indices && right_indices) {
-    auto pairs           = keep_one_match_per_probe_row(*left_indices, *right_indices, stream);
+    auto pairs = keep_one_match_per_probe_row(*left_indices, *right_indices, stream);
+    // Every probe row has at least one pair, so fewer distinct left indices than pairs means
+    // some probe row matched more than one build row.
+    if (single_join_error_on_multiple_rows_ &&
+        pairs->num_rows() != static_cast<cudf::size_type>(left_indices->size())) {
+      throw duckdb::InvalidInputException(
+        "More than one row returned by a subquery used as an expression - scalar subqueries can "
+        "only return a single row.\n\nUse \"SET scalar_subquery_error_on_multiple_rows=false\" to "
+        "revert to previous behavior of returning a random row.");
+    }
     auto const left_map  = pairs->get_column(0).view();
     auto const right_map = pairs->get_column(1).view();
     return gather_join_output_from_maps(join_type,
