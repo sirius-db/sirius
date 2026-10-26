@@ -72,7 +72,8 @@ class preparation_coordinator {
   preparation_coordinator(pipeline::completion_handler&,
                           exec::scoped_dispatcher&,
                           preparation_options,
-                          native_reader_executor* native = nullptr);
+                          native_reader_executor* native = nullptr,
+                          coordinator_pool* pool         = nullptr);
   ~preparation_coordinator();
   preparation_coordinator(preparation_coordinator const&)            = delete;
   preparation_coordinator& operator=(preparation_coordinator const&) = delete;
@@ -100,6 +101,7 @@ class preparation_coordinator {
   void before_thread_for_testing(std::function<void()>);
   void before_submission_for_testing(std::function<void()>);
   void before_publication_for_testing(std::function<void()>);
+  void before_control_wait_for_testing(std::function<void()>);
   void fail_next_batch_enqueue_for_testing();
   void after_publication_for_testing(
     std::function<void(size_t, std::shared_ptr<op::scan::scan_info> const&, size_t)>);
@@ -112,5 +114,7 @@ class preparation_coordinator {
   // Serializes handle creation and joining. The runner never takes this mutex.
   std::mutex execution_mutex_;
   std::thread runner_;
+  coordinator_pool* pool_;
+  std::shared_ptr<coordinator_pool::registration> pooled_;
 };
 }  // namespace sirius::scan_manager

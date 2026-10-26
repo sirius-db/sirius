@@ -78,6 +78,10 @@ struct scan_manager_query_test {
   {
     manager._native_readers.before_thread_for_testing(std::move(hook));
   }
+  static size_t coordinator_workers(sirius_scan_manager const& manager)
+  {
+    return manager._coordinators.started_workers();
+  }
   static bool contains(sirius_scan_manager& manager, sirius::query_id_t id)
   {
     return manager.get_query_state(id) != nullptr;
@@ -491,7 +495,10 @@ struct completion_watchdog {
 TEST_CASE("external scan retirement keeps the owner reachable until close",
           "[scan_manager][query_state][owner_pump]")
 {
-  manager_fixture f;
+  auto config = make_local_config();
+  config.preparation.coordinator_workers =
+    GENERATE(std::optional<size_t>{0}, std::optional<size_t>{});
+  manager_fixture f(config);
   auto& manager                       = f.manager;
   auto id                             = sirius::make_query_id(42);
   auto [completion, future, observed] = owner_attempt{};
@@ -742,6 +749,7 @@ TEST_CASE("non-native preparation leaves the native runtime dormant",
 {
   manager_fixture f;
   auto& manager = f.manager;
+  CHECK(sm::scan_manager_query_test::coordinator_workers(manager) == 0);
   auto id       = sirius::make_query_id(55);
   size_t starts = 0;
   sm::scan_manager_query_test::before_native_thread(manager, [&](size_t) { ++starts; });
@@ -755,12 +763,15 @@ TEST_CASE("non-native preparation leaves the native runtime dormant",
   {
     source.execution = sm::preparation_coordinator::execution_domain::query_owner;
   }
+  auto expected_coordinators =
+    source.execution == sm::preparation_coordinator::execution_domain::metadata_worker ? 0u : 2u;
   sm::scan_manager_query_test::install(manager, id, std::move(source), completion);
   manager.start_preparation(id);
   {
     completion_watchdog watchdog(completion);
     manager.await_query_completion(id, future);
   }
+  CHECK(sm::scan_manager_query_test::coordinator_workers(manager) == expected_coordinators);
   manager.stop();
   REQUIRE(starts == 0);
   REQUIRE(observed->calls == 1);
@@ -1111,7 +1122,10 @@ TEST_CASE("scan manager registers independent provider execution and close",
                              ending::close_failure,
                              ending::unit_ready,
                              ending::unit_missing_input);
-  manager_fixture f;
+  auto config     = make_local_config();
+  config.preparation.coordinator_workers =
+    GENERATE(std::optional<size_t>{0}, std::optional<size_t>{});
+  manager_fixture f(config);
   auto& manager         = f.manager;
   auto const id         = sirius::make_query_id(51);
   auto source           = std::make_shared<domain_source>();
@@ -1127,6 +1141,8 @@ TEST_CASE("scan manager registers independent provider execution and close",
   auto const registrations = source->observations.size();
   if (registrations != 2) manager.reset(id);
   REQUIRE(registrations == 2);
+  CHECK(sm::scan_manager_query_test::coordinator_workers(manager) ==
+        config.preparation.resolved_coordinator_workers());
 
   if (mode != ending::cancelled) {
     manager.start_preparation(id);
@@ -1369,24 +1385,6 @@ TEST_CASE("failed or interrupted provider preflight never starts scan preparatio
   manager.reset(id);
 }
 
-TEST_CASE("a shared ingestible is preflighted once on each execution attempt",
-          "[scan_manager][query_state][provider_preflight]")
-{
-  manager_fixture f;
-  auto& manager = f.manager;
-  auto const id = sirius::make_query_id(602);
-  auto a        = std::make_shared<preflight_source>();
-  int calls     = 0;
-  a->preflight  = [&] { ++calls; };
-  scan_query query{id, {a, a}};
-  for (int attempt = 1; attempt <= 2; ++attempt) {
-    manager.prepare_for_query(*query.query, true, {});
-    REQUIRE(calls == attempt);
-    manager.reset(id);
-    REQUIRE_FALSE(sirius::scan_manager::scan_manager_query_test::contains(manager, id));
-  }
-}
-
 TEST_CASE("provider preflight requires only its own attempt to be free of checkpoint keys",
           "[scan_manager][query_state][provider_preflight]")
 {
@@ -1411,35 +1409,41 @@ TEST_CASE("provider preflight requires only its own attempt to be free of checkp
   manager.reset(key_owner);
 }
 
-TEST_CASE("pinned cache hits still preflight their bound provider",
+TEST_CASE("shared providers preflight once per attempt with or without cached rows",
           "[scan_manager][query_state][provider_preflight]")
 {
+  bool cached = GENERATE(false, true);
   manager_fixture f;
   auto& manager     = f.manager;
   auto const id     = sirius::make_query_id(605);
   auto source       = std::make_shared<preflight_source>();
   int calls         = 0;
   source->preflight = [&] { ++calls; };
-  source->metadata  = [] { throw std::runtime_error("cache hit entered disk metadata"); };
-  auto* space       = sirius::scan_test_utils::get_space(*f.memory, cucascade::memory::Tier::GPU);
-  cudf::data_type const type{cudf::type_id::INT32};
-  std::vector<std::unique_ptr<cudf::column>> columns;
-  columns.push_back(cudf::make_fixed_width_column(type, 1));
-  std::vector<std::unique_ptr<cudf::table>> tables;
-  tables.push_back(std::make_unique<cudf::table>(std::move(columns)));
-  auto stored =
-    manager.insert_pinned_entry("preflight_pin",
-                                sirius::scan_manager::cache_entry_info::from(source->table_info()),
-                                std::move(tables),
-                                {space},
-                                {},
-                                {},
-                                {{{type, false}}});
-  REQUIRE(stored.size() == 1);
-  scan_query query{id, {source}};
-  REQUIRE_NOTHROW(manager.prepare_for_query(*query.query, true, {}));
-  REQUIRE(calls == 1);
-  REQUIRE(manager.checkpoint_key_count(id) == 0);
-  manager.reset(id);
-  manager.remove_pinned_entry("preflight_pin");
+  if (cached) {
+    source->metadata = [] { throw std::runtime_error("cache hit entered disk metadata"); };
+    auto* space      = sirius::scan_test_utils::get_space(*f.memory, cucascade::memory::Tier::GPU);
+    cudf::data_type const type{cudf::type_id::INT32};
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(cudf::make_fixed_width_column(type, 1));
+    std::vector<std::unique_ptr<cudf::table>> tables;
+    tables.push_back(std::make_unique<cudf::table>(std::move(columns)));
+    auto stored = manager.insert_pinned_entry(
+      "preflight_pin",
+      sirius::scan_manager::cache_entry_info::from(source->table_info()),
+      std::move(tables),
+      {space},
+      {},
+      {},
+      {{{type, false}}});
+    REQUIRE(stored.size() == 1);
+  }
+  scan_query query{id, {source, source}};
+  for (int attempt = 1; attempt <= 2; ++attempt) {
+    REQUIRE_NOTHROW(manager.prepare_for_query(*query.query, true, {}));
+    REQUIRE(calls == attempt);
+    REQUIRE(manager.checkpoint_key_count(id) == 0);
+    manager.reset(id);
+    REQUIRE_FALSE(sm::scan_manager_query_test::contains(manager, id));
+  }
+  if (cached) manager.remove_pinned_entry("preflight_pin");
 }

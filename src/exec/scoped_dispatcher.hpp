@@ -22,8 +22,10 @@
 
 #include <concepts>
 #include <condition_variable>
+#include <functional>
 #include <mutex>
 #include <source_location>
+#include <stdexcept>
 #include <type_traits>
 #include <utility>
 
@@ -98,6 +100,17 @@ class scoped_dispatcher {
     return true;
   }
 
+  // Bind once before stopping. Called once, outside mu_, after stopped work and its
+  // captures drain. The callback must not throw and must own its captured state;
+  // wait_for_all() may return while the notification is still being delivered.
+  void set_stop_drain_callback(std::function<void()> notify)
+  {
+    std::lock_guard lock(mu_);
+    if (!notify || stop_.stop_requested() || stop_drained_)
+      throw std::logic_error("dispatcher drain notification must bind once before stop");
+    stop_drained_ = std::move(notify);
+  }
+
   void request_stop()
   {
     {
@@ -111,9 +124,9 @@ class scoped_dispatcher {
     for (;;) {
       task_t discarded;
       {
-        std::lock_guard lk(mu_);
+        std::unique_lock lk(mu_);
         if (pending_.empty()) {
-          release_slot_locked();
+          release_slot(lk);
           return;
         }
         discarded = std::move(pending_.front());
@@ -178,9 +191,9 @@ class scoped_dispatcher {
     bool can_yield = true;
     for (;;) {
       if (!task) {
-        std::lock_guard lk(mu_);
+        std::unique_lock lk(mu_);
         if (stop_.stop_requested() || pending_.empty()) {
-          release_slot_locked();
+          release_slot(lk);
           return;
         }
         task = std::move(pending_.front());
@@ -196,9 +209,9 @@ class scoped_dispatcher {
       }
       task = nullptr;  // Captures may reenter the dispatcher; destroy outside mu_.
       {
-        std::lock_guard lk(mu_);
+        std::unique_lock lk(mu_);
         if (stop_.stop_requested() || pending_.empty()) {
-          release_slot_locked();
+          release_slot(lk);
           return;
         }
       }
@@ -217,12 +230,19 @@ class scoped_dispatcher {
     }
   }
 
-  // Caller holds mu_. Used by workers, cancellation cleanup and failed submissions.
-  void release_slot_locked()
+  // Terminal handoff: unlock before notification and do not touch the dispatcher
+  // afterwards. Its waiter may release the last owner as soon as work drains.
+  void release_slot(std::unique_lock<std::mutex>& lock) noexcept
   {
+    std::function<void()> notify;
     --inflight_;
     cv_slot_.notify_one();
-    if (inflight_ == 0 && pending_.empty()) { cv_done_.notify_all(); }
+    if (inflight_ == 0 && pending_.empty()) {
+      cv_done_.notify_all();
+      if (stop_.stop_requested()) notify = std::move(stop_drained_);
+    }
+    lock.unlock();
+    if (notify) notify();
   }
 
   void submit(task_t task)
@@ -233,8 +253,8 @@ class scoped_dispatcher {
       // No worker owns this slot. Cancel pending work without executing user tasks on the
       // producer thread, then release the failed slot and propagate the original exception.
       request_stop();
-      std::lock_guard lk(mu_);
-      release_slot_locked();
+      std::unique_lock lk(mu_);
+      release_slot(lk);
       throw;
     }
   }
@@ -249,6 +269,7 @@ class scoped_dispatcher {
   std::deque<task_t> pending_;
   std::size_t inflight_ = 0;  // Worker slots plus active cancellation cleanup calls.
   std::stop_source stop_;
+  std::function<void()> stop_drained_;
 };
 
 }  // namespace sirius::exec

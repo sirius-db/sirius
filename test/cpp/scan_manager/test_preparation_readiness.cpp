@@ -33,6 +33,16 @@ using namespace std::chrono_literals;
 using namespace sirius::test::preparation;
 
 namespace {
+// Metadata-only coordination is owner-driven regardless of pool size.
+auto control_drivers()
+{
+  using domain = preparation_coordinator::execution_domain;
+  return Catch::Generators::table<domain, unsigned>({{domain::metadata_worker, 2},
+                                                     {domain::query_owner, 0},
+                                                     {domain::query_owner, 2},
+                                                     {domain::native_reader, 0},
+                                                     {domain::native_reader, 2}});
+}
 bool gate_is_available(std::shared_ptr<preparation_gate> const& gate)
 {
   bool available = false;
@@ -1272,16 +1282,28 @@ TEST_CASE("Size-based partial emission waits for consumption but timeout can use
 TEST_CASE("Partial batch deadlines wake while all preparation workers are held",
           "[scan_preparation][coordinator][partial_batch]")
 {
+  auto pool_workers = GENERATE(0u, 1u);
+  coordinator_pool coordinators(pool_workers);
+  native_reader_executor executor(1, 1);
   auto bytes            = GENERATE(1, 50);
   auto options          = preparation_config{}.resolve(1);
   options.partial_batch = partial_batch_options{50, 10ms, 40ms};
-  fixture f(1, 2, k_interrupt_check_interval, options);
+  fixture f(
+    1, 2, k_interrupt_check_interval, options, &executor, pool_workers ? &coordinators : nullptr);
   auto out     = std::make_shared<sink>();
   auto blocked = f.make_hold();
   f.source(std::make_shared<accumulator>(100), out, finite_jobs(2, [=](int id) {
              if (id == 1) blocked->wait();
              return std::make_unique<tagged>(id, id ? 0 : bytes);
            }));
+  if (pool_workers)
+    f.source(
+      std::make_shared<accumulator>(1),
+      std::make_shared<sink>(),
+      []() -> preparation_coordinator::claim_result { return preparation_pending{}; },
+      {},
+      {},
+      preparation_coordinator::execution_domain::native_reader);
   auto guard = f.shutdown_guard();
   f.start();
   REQUIRE(blocked->await());
@@ -1372,33 +1394,104 @@ TEST_CASE("Pending claims do not block ready sources or become exhaustion",
   CHECK_FALSE(f.completion.has_error());
 }
 
-TEST_CASE("A readiness wake during an unlocked claim is not lost before sleep",
+TEST_CASE("Readiness and stop wakes cannot be lost between control work and waiting",
           "[scan_preparation][coordinator][claim]")
 {
-  fixture f(1, 1, 5s);
+  using domain                   = preparation_coordinator::execution_domain;
+  auto [execution, pool_workers] = GENERATE(control_drivers());
+  coordinator_pool coordinators(pool_workers);
+  auto after_step = GENERATE(false, true);
+  auto stopping   = GENERATE(false, true);
+  CAPTURE(execution, after_step, stopping);
+  native_reader_executor native(1, 1);
+  fixture f(1, 1, 5s, std::nullopt, &native, pool_workers ? &coordinators : nullptr);
   auto out = std::make_shared<sink>();
   std::function<void()> wake;
   unsigned calls = 0;
-  f.source(
-    std::make_shared<accumulator>(1),
-    out,
-    [&]() -> preparation_coordinator::claim_result {
-      if (++calls == 1) {
-        wake();  // Arrives before try_claim returns pending.
-        return preparation_pending{};
-      }
-      if (calls > 2) return preparation_exhausted{};
-      return preparation_coordinator::job{[] { return std::make_unique<tagged>(3); }};
-    },
-    {},
-    [&](auto callback) { wake = std::move(callback); });
+  bool signalled = false;
+  auto signal    = [&] {
+    if (std::exchange(signalled, true)) return;
+    if (stopping)
+      f.coordinator.request_stop(stop_reason::normal_eos);
+    else
+      wake();
+  };
+  if (after_step) f.coordinator.before_control_wait_for_testing(signal);
   auto guard = f.shutdown_guard();
-  f.start();
-  REQUIRE(out->await(1));  // Must not wait for the five-second interrupt poll.
-  out->consume();
+  f.start([&] {
+    f.source(
+      std::make_shared<accumulator>(1),
+      out,
+      [&]() -> preparation_coordinator::claim_result {
+        if (++calls == 1) {
+          if (!after_step) signal();
+          return preparation_pending{};
+        }
+        if (calls > 2) return preparation_exhausted{};
+        return preparation_coordinator::job{[] { return std::make_unique<tagged>(3); }};
+      },
+      {},
+      [&](auto callback) { wake = std::move(callback); },
+      execution);
+  });
+  if (!stopping) {
+    REQUIRE(out->await(1));  // No interrupt poll or unrelated event is needed.
+    out->consume();
+  }
   REQUIRE(out->await_closed());
   f.finish();
-  CHECK(calls == 3);
+  CHECK(coordinators.started_workers() ==
+        (execution == domain::metadata_worker ? 0 : pool_workers));
+  CHECK(signalled);
+  CHECK(calls == (stopping ? 1 : 3));
+  CHECK(out->count() == (stopping ? 0 : 1));
+  CHECK(out->close_calls == 1);
+  CHECK_FALSE(f.completion.has_error());
+}
+
+TEST_CASE("Retirement parks the driver until metadata work drains",
+          "[scan_preparation][coordinator][retirement]")
+{
+  using domain                   = preparation_coordinator::execution_domain;
+  auto [execution, pool_workers] = GENERATE(control_drivers());
+  coordinator_pool coordinators(pool_workers);
+  native_reader_executor native(1, 1);
+  fixture f(1, 1, 5s, std::nullopt, &native, pool_workers ? &coordinators : nullptr);
+  auto out     = std::make_shared<sink>();
+  auto reading = f.make_hold();
+  std::promise<void> parked;
+  auto waiting  = parked.get_future();
+  bool notified = false;
+  f.coordinator.before_control_wait_for_testing([&] {
+    std::lock_guard lock(f.coordinator.publication_gate()->mutex);
+    if (f.coordinator.publication_gate()->closed && !std::exchange(notified, true))
+      parked.set_value();
+  });
+  auto cleanup = f.shutdown_guard();
+  f.start([&] {
+    f.source(std::make_shared<accumulator>(1), out, single_job([reading] {
+               reading->wait();
+               return std::make_unique<tagged>(1);
+             }));
+    if (execution != domain::metadata_worker)
+      f.source(
+        std::make_shared<accumulator>(1),
+        std::make_shared<sink>(),
+        []() -> preparation_coordinator::claim_result { return preparation_pending{}; },
+        {},
+        {},
+        execution);
+  });
+  REQUIRE(reading->await());
+  f.coordinator.request_stop(stop_reason::normal_eos);
+  REQUIRE(waiting.wait_for(1s) == std::future_status::ready);
+  CHECK_FALSE(out->closed.load());
+  reading->release();
+  REQUIRE(out->await_closed());
+  f.finish();
+  CHECK(out->count() == 0);
+  CHECK(out->close_calls == 1);
+  CHECK_FALSE(f.completion.has_error());
 }
 
 TEST_CASE("A dispatcher that drops accepted work cannot turn it into successful empty input",
@@ -1584,12 +1677,18 @@ TEST_CASE("Prefetch preparation and visibility each execute at most once",
 TEST_CASE("Coordinator startup gate prevents work before consumers are ready",
           "[scan_preparation][coordinator]")
 {
-  using domain   = preparation_coordinator::execution_domain;
-  auto execution = GENERATE(domain::metadata_worker, domain::query_owner, domain::native_reader);
+  using domain                   = preparation_coordinator::execution_domain;
+  auto [execution, pool_workers] = GENERATE(control_drivers());
+  coordinator_pool coordinators(pool_workers);
   native_reader_executor executor(1, 1);
-  fixture f(2, 4, k_interrupt_check_interval, std::nullopt, &executor);
-  unsigned threads = 0;
-  f.coordinator.before_thread_for_testing([&] { ++threads; });
+  fixture f(2,
+            4,
+            k_interrupt_check_interval,
+            std::nullopt,
+            &executor,
+            pool_workers ? &coordinators : nullptr);
+  unsigned driver_starts = 0;
+  f.coordinator.before_thread_for_testing([&] { ++driver_starts; });
   auto done = f.completion.get_awaitable();
   CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::constructed);
   auto out = std::make_shared<sink>();
@@ -1609,7 +1708,7 @@ TEST_CASE("Coordinator startup gate prevents work before consumers are ready",
   CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::armed);
   CHECK(f.coordinator.snapshot().runs == 0);
   CHECK(claims == 0);
-  CHECK(threads == (execution == domain::metadata_worker ? 0 : 1));
+  CHECK(driver_starts == (execution == domain::metadata_worker ? 0 : 1));
   SECTION("open startup gate")
   {
     f.coordinator.start();
@@ -1644,8 +1743,15 @@ TEST_CASE("Coordinator startup gate prevents work before consumers are ready",
 TEST_CASE("Coordinator thread creation failure closes the preparation barrier exactly once",
           "[scan_preparation][coordinator]")
 {
+  auto pool_workers = GENERATE(0u, 1u, 2u);
+  coordinator_pool coordinators(pool_workers);
   native_reader_executor executor(1, 1);
-  fixture f(2, 4, k_interrupt_check_interval, std::nullopt, &executor);
+  fixture f(2,
+            4,
+            k_interrupt_check_interval,
+            std::nullopt,
+            &executor,
+            pool_workers ? &coordinators : nullptr);
   auto out = std::make_shared<sink>();
   f.source(
     std::make_shared<accumulator>(),
@@ -1655,8 +1761,13 @@ TEST_CASE("Coordinator thread creation failure closes the preparation barrier ex
     {},
     preparation_coordinator::execution_domain::native_reader);
   auto done = f.completion.get_awaitable();
-  f.coordinator.before_thread_for_testing(
-    [] { throw std::runtime_error("thread allocation failed"); });
+  if (pool_workers)
+    coordinators.before_thread_for_testing([&](size_t i) {
+      if (i + 1 == pool_workers) throw std::runtime_error("thread allocation failed");
+    });
+  else
+    f.coordinator.before_thread_for_testing(
+      [] { throw std::runtime_error("thread allocation failed"); });
   CHECK_THROWS_WITH(f.coordinator.arm(), "thread allocation failed");
   CHECK(f.coordinator.snapshot().runs == 0);
   CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
@@ -1665,30 +1776,6 @@ TEST_CASE("Coordinator thread creation failure closes the preparation barrier ex
   CHECK_THROWS_WITH(done.get(), "thread allocation failed");
   f.coordinator.drain();
   CHECK(out->close_calls == 1);
-}
-
-TEST_CASE("Query owner can remain blocked while coordinator publishes and retires",
-          "[scan_preparation][coordinator]")
-{
-  native_reader_executor executor(1, 1);
-  fixture f(2, 4, k_interrupt_check_interval, std::nullopt, &executor);
-  auto out = std::make_shared<sink>();
-  f.source(std::make_shared<accumulator>(1),
-           out,
-           finite_jobs(1, [](int id) { return std::make_unique<tagged>(id); }),
-           {},
-           {},
-           preparation_coordinator::execution_domain::native_reader);
-  f.coordinator.arm();
-  f.coordinator.start();
-  // The query owner waits here: neither control work nor publication may need it.
-  REQUIRE(out->await_closed());
-  CHECK(out->count() == 1);
-  f.coordinator.drain();
-  auto stats = f.coordinator.snapshot();
-  CHECK(stats.owner == std::this_thread::get_id());
-  CHECK(stats.runner != stats.owner);
-  CHECK(stats.publisher == stats.runner);
 }
 
 TEST_CASE("Consumers may finish before coordinator startup without a false startup error",
@@ -1706,13 +1793,20 @@ TEST_CASE("Consumers may finish before coordinator startup without a false start
   CHECK(f.coordinator.snapshot().runs == 0);
 }
 
-TEST_CASE("Concurrent retirement waits for one physical join and one source close",
+TEST_CASE("Concurrent retirement waits for final cleanup and one source close",
           "[scan_preparation][coordinator]")
 {
-  using domain   = preparation_coordinator::execution_domain;
-  auto execution = GENERATE(domain::metadata_worker, domain::native_reader);
+  using domain                   = preparation_coordinator::execution_domain;
+  auto [execution, pool_workers] = GENERATE(Catch::Generators::table<domain, unsigned>(
+    {{domain::metadata_worker, 2}, {domain::native_reader, 0}, {domain::native_reader, 2}}));
+  coordinator_pool coordinators(pool_workers);
   native_reader_executor executor(1, 1);
-  fixture f(2, 4, k_interrupt_check_interval, std::nullopt, &executor);
+  fixture f(2,
+            4,
+            k_interrupt_check_interval,
+            std::nullopt,
+            &executor,
+            pool_workers ? &coordinators : nullptr);
   auto blocked = f.make_hold();
   auto out     = std::make_shared<sink>();
   f.source(std::make_shared<accumulator>(1),
@@ -1846,36 +1940,6 @@ TEST_CASE("Reader work captures and close stay on the assigned thread across pul
   CHECK_FALSE(f.completion.has_error());
 }
 
-TEST_CASE("Blocked provider operation does not occupy metadata capacity or coordinator",
-          "[scan_preparation][provider_lane]")
-{
-  fixture f(1, 2);
-  auto blocked  = f.make_hold();
-  auto provider = std::make_shared<sink>();
-  auto metadata = std::make_shared<sink>();
-  auto guard    = f.shutdown_guard();
-  f.start([&] {
-    f.source(std::make_shared<accumulator>(1),
-             provider,
-             single_job([blocked] {
-               blocked->wait();
-               return std::make_unique<tagged>(1);
-             }),
-             {},
-             {},
-             preparation_coordinator::execution_domain::query_owner);
-    f.source(std::make_shared<accumulator>(1), metadata, single_job([] {
-               return std::make_unique<tagged>(2);
-             }));
-  });
-  REQUIRE(blocked->await());
-  REQUIRE(metadata->await(1));
-  CHECK(provider->count() == 0);
-  blocked->release();
-  f.finish();
-  CHECK(provider->count() == 1);
-}
-
 TEST_CASE("Provider zero row result is not exhaustion and lookahead blocks further pulls",
           "[scan_preparation][provider_lane]")
 {
@@ -1904,42 +1968,6 @@ TEST_CASE("Provider zero row result is not exhaustion and lookahead blocks furth
   f.coordinator.request_stop(stop_reason::normal_eos);
   f.finish();
   CHECK(out->close_calls == 1);
-}
-
-TEST_CASE("Cancelling an active provider waits for its return and suppresses late output",
-          "[scan_preparation][provider_lane]")
-{
-  fixture f;
-  auto blocked = f.make_hold();
-  auto out     = std::make_shared<sink>();
-  std::atomic<bool> saw_stop{false};
-  auto guard = f.shutdown_guard();
-  f.start([&] {
-    f.source(
-      std::make_shared<accumulator>(1),
-      out,
-      [&, claimed = false]() mutable -> preparation_coordinator::claim_result {
-        if (std::exchange(claimed, true)) return preparation_exhausted{};
-        return preparation_coordinator::job{[&](preparation_stop_token stop) {
-          blocked->wait();
-          saw_stop = stop.stop_requested();
-          return std::make_unique<tagged>(1);
-        }};
-      },
-      {},
-      {},
-      preparation_coordinator::execution_domain::query_owner);
-  });
-  REQUIRE(blocked->await());
-  f.coordinator.request_stop(stop_reason::user_cancel);
-  CHECK(f.coordinator.snapshot().phase != preparation_coordinator::lifecycle::quiescent);
-  CHECK(out->close_calls == 0);
-  blocked->release();
-  f.finish();
-  CHECK(saw_stop);
-  CHECK(out->count() == 0);
-  CHECK(out->close_calls == 1);
-  CHECK(f.completion.has_error());
 }
 
 TEST_CASE("Retired provider results and wakeups cannot affect another attempt",
@@ -2313,69 +2341,96 @@ TEST_CASE("Retirement racing arm stops the startup gate before waiting for its r
   CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
 }
 
-TEST_CASE("Blocked native reader leaves metadata provider and coordinator capacity available",
-          "[scan_preparation][native_lane]")
+TEST_CASE("Blocked readers leave other execution domains and coordination available",
+          "[scan_preparation][native_lane][provider_lane]")
 {
+  using domain      = preparation_coordinator::execution_domain;
+  auto execution    = GENERATE(domain::query_owner, domain::native_reader);
+  auto pool_workers = GENERATE(0u, 1u);
+  coordinator_pool coordinators(pool_workers);
   native_reader_executor executor(1, 4);
-  fixture f(1, 4, k_interrupt_check_interval, std::nullopt, &executor);
+  fixture f(1,
+            4,
+            k_interrupt_check_interval,
+            std::nullopt,
+            &executor,
+            pool_workers ? &coordinators : nullptr);
   auto blocked  = f.make_hold();
-  auto native   = std::make_shared<sink>();
+  auto reader   = std::make_shared<sink>();
   auto waiting  = std::make_shared<sink>();
   auto metadata = std::make_shared<sink>();
-  auto provider = std::make_shared<sink>();
+  auto neighbor = std::make_shared<sink>();
   std::atomic<size_t> waiting_claims{0};
   auto guard = f.shutdown_guard();
   f.start([&] {
     f.source(std::make_shared<accumulator>(1),
-             native,
+             reader,
              single_job([blocked] {
                blocked->wait();
                return std::make_unique<tagged>(1);
              }),
              {},
              {},
-             preparation_coordinator::execution_domain::native_reader);
-    f.source(
-      std::make_shared<accumulator>(1),
-      waiting,
-      [&, claimed = false]() mutable -> preparation_coordinator::claim_result {
-        ++waiting_claims;
-        if (std::exchange(claimed, true)) return preparation_exhausted{};
-        return preparation_coordinator::job{[] { return std::make_unique<tagged>(2); }};
-      },
-      {},
-      {},
-      preparation_coordinator::execution_domain::native_reader);
+             execution);
+    if (execution == domain::native_reader)
+      f.source(
+        std::make_shared<accumulator>(1),
+        waiting,
+        [&, claimed = false]() mutable -> preparation_coordinator::claim_result {
+          ++waiting_claims;
+          if (std::exchange(claimed, true)) return preparation_exhausted{};
+          return preparation_coordinator::job{[] { return std::make_unique<tagged>(2); }};
+        },
+        {},
+        {},
+        domain::native_reader);
     f.source(std::make_shared<accumulator>(1), metadata, single_job([] {
                return std::make_unique<tagged>(3);
              }));
     f.source(std::make_shared<accumulator>(1),
-             provider,
+             neighbor,
              single_job([] { return std::make_unique<tagged>(4); }),
              {},
              {},
-             preparation_coordinator::execution_domain::query_owner);
+             execution == domain::native_reader ? domain::query_owner : domain::native_reader);
   });
   REQUIRE(blocked->await());
   REQUIRE(metadata->await(1));
-  REQUIRE(provider->await(1));
-  CHECK_THROWS_WITH(executor.stop(), "cannot stop native executor with active readers");
-  CHECK(waiting_claims <= 1);
-  CHECK(native->count() == 0);
+  REQUIRE(neighbor->await(1));
+  if (execution == domain::native_reader) {
+    CHECK_THROWS_WITH(executor.stop(), "cannot stop native executor with active readers");
+    CHECK(waiting_claims <= 1);
+  }
+  CHECK(reader->count() == 0);
   blocked->release();
-  REQUIRE(waiting->await_closed());
   f.finish();
-  CHECK(native->count() == 1);
-  CHECK(waiting->count() == 1);
+  CHECK(reader->count() == 1);
+  if (execution == domain::native_reader) {
+    CHECK(waiting->count() == 1);
+    CHECK(waiting->close_calls == 1);
+  }
   CHECK_FALSE(f.completion.has_error());
 }
 
 TEST_CASE("Native executor is shared and stopping one attempt does not stop its neighbor",
           "[scan_preparation][native_lane]")
 {
+  auto pool_workers = GENERATE(0u, 1u, 2u);
+  auto stop_blocked = GENERATE(false, true);
+  coordinator_pool coordinators(pool_workers);
   native_reader_executor executor(2, 4);
-  fixture first(1, 4, k_interrupt_check_interval, std::nullopt, &executor);
-  fixture second(1, 4, k_interrupt_check_interval, std::nullopt, &executor);
+  fixture first(1,
+                4,
+                k_interrupt_check_interval,
+                std::nullopt,
+                &executor,
+                pool_workers ? &coordinators : nullptr);
+  fixture second(1,
+                 4,
+                 k_interrupt_check_interval,
+                 std::nullopt,
+                 &executor,
+                 pool_workers ? &coordinators : nullptr);
   auto blocked  = first.make_hold();
   auto native   = std::make_shared<sink>();
   auto waiting  = std::make_shared<sink>();
@@ -2407,6 +2462,7 @@ TEST_CASE("Native executor is shared and stopping one attempt does not stop its 
   auto second_guard = second.shutdown_guard();
   first.start();
   REQUIRE(blocked->await());
+  if (stop_blocked) first.coordinator.request_stop(stop_reason::normal_eos);
   second.start();
   REQUIRE(metadata->await(1));
   second.coordinator.request_stop(stop_reason::normal_eos);
@@ -2416,50 +2472,69 @@ TEST_CASE("Native executor is shared and stopping one attempt does not stop its 
   CHECK(native->close_calls == 0);
   blocked->release();
   first.finish();
-  CHECK(native->count() == 1);
+  CHECK(native->count() == (stop_blocked ? 0 : 1));
   CHECK(native->close_calls == 1);
+  auto stats = first.coordinator.snapshot();
+  CHECK(stats.owner != std::thread::id{});
+  CHECK(stats.runner != stats.owner);
+  if (!stop_blocked) {
+    CHECK(stats.publisher != stats.owner);
+    CHECK(stats.publisher != std::thread::id{});
+    if (pool_workers < 2) CHECK(stats.publisher == stats.runner);
+  }
   CHECK_FALSE(first.completion.has_error());
 }
 
-TEST_CASE("Native stop waits for noninterruptible next and closes on its thread",
-          "[scan_preparation][native_lane]")
+TEST_CASE("Reader cancellation waits for work disposal and thread-affine close",
+          "[scan_preparation][native_lane][provider_lane]")
 {
+  using domain      = preparation_coordinator::execution_domain;
+  auto execution    = GENERATE(domain::query_owner, domain::native_reader);
+  auto pool_workers = GENERATE(0u, 2u);
+  coordinator_pool coordinators(pool_workers);
   native_reader_executor executor(1, 4);
-  fixture f(1, 1, k_interrupt_check_interval, std::nullopt, &executor);
+  fixture f(1,
+            1,
+            k_interrupt_check_interval,
+            std::nullopt,
+            &executor,
+            pool_workers ? &coordinators : nullptr);
   auto out     = std::make_shared<sink>();
   auto blocked = f.make_hold();
   auto closing = f.make_hold();
   std::thread::id next_thread, close_thread, destroy_thread;
-  std::atomic<bool> released{false};
+  std::atomic<bool> released{false}, saw_stop{false};
   auto capture     = std::shared_ptr<int>(new int, [&](int* p) {
     f.coordinator.snapshot();
     destroy_thread = std::this_thread::get_id();
     released       = true;
     delete p;
   });
-  auto source      = make_source(preparation_coordinator::execution_domain::native_reader,
-                            std::make_shared<accumulator>(1));
+  auto source      = make_source(execution, std::make_shared<accumulator>(1));
   source.try_claim = [&,
                       capture = std::move(capture),
                       claimed = false]() mutable -> preparation_coordinator::claim_result {
     if (std::exchange(claimed, true)) return preparation_exhausted{};
-    return preparation_coordinator::job{[&, capture = std::move(capture)] {
-      next_thread = std::this_thread::get_id();
-      blocked->wait();
-      return std::make_unique<tagged>(1);
-    }};
+    return preparation_coordinator::job{
+      [&, capture = std::move(capture)](preparation_stop_token stop) {
+        next_thread = std::this_thread::get_id();
+        blocked->wait();
+        saw_stop = stop.stop_requested();
+        return std::make_unique<tagged>(1);
+      }};
   };
   source.construct = [](auto) { return preparation_coordinator::publication{}; };
   source.close     = [&] {
     close_thread = std::this_thread::get_id();
     closing->wait();
+    out->close();
   };
-  f.register_source(std::move(source), out);
   auto guard = f.shutdown_guard();
-  f.start();
+  f.start([&] { f.register_source(std::move(source), out); });
   REQUIRE(blocked->await());
   f.coordinator.request_stop(stop_reason::user_cancel);
   CHECK_FALSE(released);
+  CHECK(out->close_calls == 0);
   CHECK(f.coordinator.snapshot().phase != preparation_coordinator::lifecycle::quiescent);
   blocked->release();
   REQUIRE(closing->await());
@@ -2470,6 +2545,8 @@ TEST_CASE("Native stop waits for noninterruptible next and closes on its thread"
   closing->release();
   f.finish();
   CHECK(out->count() == 0);
+  CHECK(out->close_calls == 1);
+  CHECK(saw_stop);
   CHECK(f.completion.has_error());
 }
 

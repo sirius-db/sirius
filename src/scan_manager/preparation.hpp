@@ -16,6 +16,7 @@
 
 #pragma once
 #include "op/scan/table_scan/scan_contract.hpp"
+#include "scan_manager/coordinator_pool.hpp"
 #include "transparent/replay_admission.hpp"
 
 #include <bitset>
@@ -72,10 +73,13 @@ struct preparation_gate {
   std::condition_variable cv;
   // Protected by mutex; captures notifications that arrive during unlocked callbacks.
   uint64_t wake_generation = 0;
+  // Lock order is gate -> pool. This only schedules a step, never executes it inline.
+  coordinator_pool::wakeup pool_wakeup;
   void notify_under_lock() noexcept
   {
     ++wake_generation;
     cv.notify_all();
+    pool_wakeup();
   }
   // Bound before arm; callers hold mutex while checking admission or publication.
   std::function<bool()> interrupted;

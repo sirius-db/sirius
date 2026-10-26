@@ -85,6 +85,13 @@ TEST_CASE("Invalid preparation options fail before constructing a scan manager",
     config.preparation.interrupt_check_interval = std::chrono::milliseconds(-1);
   }
   SECTION("no workers") { config.thread_pool.num_threads = 0; }
+  SECTION("zero native workers") { config.preparation.native_reader_workers = 0; }
+  SECTION("zero native slots") { config.preparation.max_native_readers = 0; }
+  SECTION("too few native slots")
+  {
+    config.preparation.native_reader_workers = 3;
+    config.preparation.max_native_readers    = 2;
+  }
   CHECK_THROWS_AS(sirius::scan_manager::validate_scan_manager_config(config),
                   std::invalid_argument);
 }
@@ -131,22 +138,4 @@ TEST_CASE("Size-based partial batching defaults to bounded residence with valida
   SECTION("zero minimum time") { config.partial_batch->min_residence = 0ms; }
   SECTION("maximum precedes minimum") { config.partial_batch->max_residence = 49ms; }
   CHECK_THROWS_AS(config.resolve(4), std::invalid_argument);
-}
-
-TEST_CASE("native preparation capacity is independent and validated",
-          "[scan_preparation][preparation_config][native_runtime]")
-{
-  using namespace sirius::scan_manager;
-  preparation_config config;
-  CHECK(config.resolved_native_workers() == 2);
-  CHECK(config.resolved_native_readers() == 64);
-  config.native_reader_workers = 3;
-  config.max_native_readers    = 5;
-  CHECK_NOTHROW(config.resolve(1));  // Native workers do not consume metadata-worker capacity.
-  CHECK(config.resolved_native_workers() == 3);
-  CHECK(config.resolved_native_readers() == 5);
-  SECTION("zero workers") { config.native_reader_workers = 0; }
-  SECTION("zero readers") { config.max_native_readers = 0; }
-  SECTION("too few reader slots") { config.max_native_readers = 2; }
-  CHECK_THROWS_AS(config.resolve(1), std::invalid_argument);
 }

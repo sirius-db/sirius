@@ -209,6 +209,9 @@ struct preparation_coordinator::state {
   std::map<unit_key, std::shared_ptr<preparation_unit>> units;
   std::deque<pending_batch> batches;
   lifecycle phase = lifecycle::constructed;
+  enum class retirement_phase { active, metadata, readers, finished };
+  retirement_phase retirement = retirement_phase::active;
+  bool dispatcher_drained     = false;
   size_t jobs = 0, results = 0, output = 0, external = 0;
   size_t reader_jobs = 0, next_provider_source = 0;
   std::thread::id provider_owner;
@@ -218,7 +221,7 @@ struct preparation_coordinator::state {
     std::make_shared<preparation_stop_token::reason_state>();
   size_t next_deadline_source = 0, next_claim_source = 0;
   statistics stats;
-  std::function<void()> before_thread, before_submit, before_publish;
+  std::function<void()> before_thread, before_submit, before_publish, before_control_wait;
   std::function<void(size_t, std::shared_ptr<op::scan::scan_info> const&, size_t)> after_publish;
   std::function<op::scan::batch_coalescer::clock::time_point()> now =
     op::scan::batch_coalescer::clock::now;
@@ -392,9 +395,20 @@ struct preparation_coordinator::state {
   void close_source(size_t) noexcept;
   void close_source_output(size_t) noexcept;
   void dispatch_job(source_state&, size_t, job, std::shared_ptr<job_ticket>, lock_type&);
+  struct control_step_result {
+    enum class status { runnable, parked, retire, finished };
+    status next;
+    uint64_t observed_wake = 0;
+    std::optional<op::scan::batch_coalescer::clock::time_point> deadline;
+  };
+  control_step_result control_step(std::shared_ptr<state> const&);
+  void wait_for_control(control_step_result const&, std::optional<std::chrono::milliseconds>);
+  control_step_result drive_control(std::shared_ptr<state> const&,
+                                    std::optional<std::chrono::milliseconds>,
+                                    bool wait);
   bool advance_control(std::shared_ptr<state> const&, std::optional<std::chrono::milliseconds>);
   void run(std::shared_ptr<state> const&);
-  void shutdown();
+  control_step_result retire_step();
   void finish();
 
   // Destroyed without the gate held; unpublished construction returns its output credit.
@@ -545,13 +559,21 @@ void preparation_coordinator::state::close_source_output(size_t id) noexcept
 preparation_coordinator::preparation_coordinator(pipeline::completion_handler& completion,
                                                  exec::scoped_dispatcher& dispatcher,
                                                  preparation_options options,
-                                                 native_reader_executor* native)
-  : state_(std::make_shared<state>(options, completion, dispatcher, native))
+                                                 native_reader_executor* native,
+                                                 coordinator_pool* pool)
+  : state_(std::make_shared<state>(options, completion, dispatcher, native)), pool_(pool)
 {
   if (options.partial_batch) options.partial_batch->validate();
   if (!options.lookahead_batches || !options.max_control_work || !options.drain_quantum ||
       options.interrupt_check_interval.count() <= 0)
     throw std::invalid_argument("query driver needs positive limits");
+  dispatcher.set_stop_drain_callback([weak = std::weak_ptr<state>{state_}] {
+    if (auto st = weak.lock()) {
+      std::lock_guard lock(st->gate->mutex);
+      st->dispatcher_drained = true;
+      st->gate->notify_under_lock();
+    }
+  });
 }
 preparation_coordinator::~preparation_coordinator()
 {
@@ -718,7 +740,28 @@ void preparation_coordinator::arm()
     if (state_->independent_driver) {
       if (state_->before_thread) state_->before_thread();
       // Readers may block Q or their native worker; control work must remain independent.
-      runner_ = std::thread([st = state_] { st->run(st); });
+      if (pool_) {
+        pooled_ = pool_->add(
+          [st = state_] {
+            auto step      = st->drive_control(st, std::nullopt, false);
+            using progress = coordinator_pool::progress;
+            auto next =
+              step.next == state::control_step_result::status::finished   ? progress::finished
+              : step.next == state::control_step_result::status::runnable ? progress::runnable
+                                                                          : progress::parked;
+            return coordinator_pool::step_result{next, step.deadline};
+          },
+          [st = state_] { st->stop(stop_reason::normal_eos); },
+          [st = state_](std::exception_ptr error) {
+            st->completion->report_error(error);
+            st->stop();
+          });
+        std::lock_guard lock(state_->gate->mutex);
+        state_->gate->pool_wakeup = pooled_->notifier();
+        state_->gate->notify_under_lock();
+      } else {
+        runner_ = std::thread([st = state_] { st->run(st); });
+      }
     }
   } catch (...) {
     execution_lock.unlock();
@@ -836,10 +879,10 @@ void preparation_coordinator::drain()
                        (state_->provider_owner != std::thread::id{} && !owns_provider);
       stop_needed = state_->phase == lifecycle::armed || wait_for_owner;
     }
-    if (!runner_.joinable() && !owner_driven && !wait_for_owner) {
+    if (!runner_.joinable() && !pooled_ && !owner_driven && !wait_for_owner) {
       // Failed startup or an unarmed attempt: there is no driver to wait for.
       request_stop(stop_reason::normal_eos);
-      state_->advance_control(state_, std::chrono::milliseconds{0});
+      state_->run(state_);
       return;
     }
   }
@@ -863,6 +906,7 @@ void preparation_coordinator::drain()
   }
   std::lock_guard execution_lock(execution_mutex_);
   if (runner_.joinable()) runner_.join();
+  if (pooled_) pooled_->wait();
 }
 preparation_coordinator::statistics preparation_coordinator::snapshot() const
 {
@@ -892,6 +936,13 @@ void preparation_coordinator::before_publication_for_testing(std::function<void(
     throw std::logic_error("publication seam already frozen");
   state_->before_publish = std::move(hook);
 }
+void preparation_coordinator::before_control_wait_for_testing(std::function<void()> hook)
+{
+  if (state_->phase != lifecycle::constructed)
+    throw std::logic_error("control wait seam already frozen");
+  state_->before_control_wait = std::move(hook);
+}
+
 void preparation_coordinator::after_publication_for_testing(
   std::function<void(size_t, std::shared_ptr<op::scan::scan_info> const&, size_t)> hook)
 {
@@ -1347,37 +1398,30 @@ preparation_coordinator::state::nearest_deadline() const
   return deadline;
 }
 
-void preparation_coordinator::state::shutdown()
+preparation_coordinator::state::control_step_result preparation_coordinator::state::retire_step()
 {
-  // Errors have already notified the observer. Natural exhaustion is not a failure,
-  // and this final retirement request cannot downgrade an earlier error/cancellation.
-  stop(stop_reason::normal_eos);
-  // Only the control driver discards queued metadata work, after any claim has returned.
-  // Running jobs already observe reader_stop; stopping the dispatcher is physical retirement.
-  dispatcher->request_stop();
-  dispatcher->wait_for_all();
-  {
-    std::unique_lock lock(gate->mutex);
-    for (;;) {
-      auto observed   = gate->wake_generation;
-      bool progressed = false;
-      for (size_t id = 0; id < sources.size(); ++id)
-        progressed |= retire_reader(id, lock);
-      if (!jobs && !external && !gate->callbacks &&
-          std::ranges::all_of(sources, [](auto const& s) { return s.reader_closed(); }))
-        break;
-      if (progressed) continue;
-      if (provider_owner == std::this_thread::get_id()) {
-        // Failed or unarmed startup retires on Q without an independent driver.
-        lock.unlock();
-        auto pumped = pump_provider();
-        lock.lock();
-        if (pumped) continue;
-      }
-      gate->cv.wait(lock, [&] { return gate->wake_generation != observed; });
-    }
+  using next = control_step_result::status;
+  if (retirement == retirement_phase::active) {
+    retirement = retirement_phase::metadata;
+    // Only the control driver discards queued work, after the active claim returned.
+    stop(stop_reason::normal_eos);
+    dispatcher->request_stop();
   }
-  finish();
+  std::unique_lock lock(gate->mutex);
+  auto observed = gate->wake_generation;
+  if (!dispatcher_drained) return {next::parked, observed};
+  retirement      = retirement_phase::readers;
+  bool progressed = false;
+  for (size_t id = 0; id < sources.size(); ++id)
+    progressed |= retire_reader(id, lock);
+  if (!jobs && !external && !gate->callbacks &&
+      std::ranges::all_of(sources, [](auto const& s) { return s.reader_closed(); })) {
+    lock.unlock();
+    finish();
+    return {next::finished};
+  }
+  if (progressed || gate->wake_generation != observed) return {next::runnable};
+  return {next::parked, observed};
 }
 
 void preparation_coordinator::state::finish()
@@ -1409,23 +1453,71 @@ void preparation_coordinator::state::finish()
   }
   discarded_batches.clear();
   discarded_units.clear();
-  {
-    std::lock_guard lock(gate->mutex);
-    phase = lifecycle::quiescent;
-    gate->notify_under_lock();
-  }
   if (stats.runs || stats.owner != std::thread::id{}) {
     completion->close_preparation_inputs();
     completion->preparation_quiescent();
   }
+  retirement = retirement_phase::finished;
 }
 
-bool preparation_coordinator::state::advance_control(
-  std::shared_ptr<state> const& st, std::optional<std::chrono::milliseconds> idle_wait)
+preparation_coordinator::state::control_step_result preparation_coordinator::state::control_step(
+  std::shared_ptr<state> const& st)
+{
+  // The driver owns control_active. This turn bounds actions, not hook duration.
+  using next = control_step_result::status;
+  std::unique_lock lock(gate->mutex);
+  ++stats.wakes;
+  if (gate->closed) return {next::retire};
+  gate->check_interrupted();
+  auto const observed_wake = gate->wake_generation;
+  size_t actions           = emit_partial_batch(lock) ? 1 : 0;
+  auto available           = [&] {
+    if (gate->closed || actions >= options.max_control_work) return false;
+    gate->check_interrupted();
+    return true;
+  };
+  if (available() && publish_batch(lock)) ++actions;
+  if (available() && (advance_result(lock) || emit_partial_batch(lock, true))) ++actions;
+  if (available() && submit_job(lock, st)) ++actions;
+  if (available() && close_finished_source(lock)) ++actions;
+  if (available() && emit_full_window(lock)) ++actions;
+  if (gate->closed || inputs_settled()) return {next::retire};
+  if (actions || gate->wake_generation != observed_wake) return {next::runnable};
+  auto deadline = nearest_deadline();
+  if (manual_clock) deadline.reset();
+  if (gate->interrupted) {
+    auto end = op::scan::batch_coalescer::clock::now() + options.interrupt_check_interval;
+    deadline = deadline ? std::min(*deadline, end) : end;
+  }
+  return {next::parked, observed_wake, deadline};
+}
+
+void preparation_coordinator::state::wait_for_control(
+  control_step_result const& step, std::optional<std::chrono::milliseconds> idle_wait)
+{
+  auto deadline = step.deadline;
+  if (idle_wait) {
+    auto end = op::scan::batch_coalescer::clock::now() + *idle_wait;
+    deadline = deadline ? std::min(*deadline, end) : end;
+  }
+  if (before_control_wait) before_control_wait();
+  std::unique_lock lock(gate->mutex);
+  // A wake after the step returned must prevent sleeping, even if its notification passed.
+  auto ready = [&] { return gate->wake_generation != step.observed_wake; };
+  if (deadline)
+    gate->cv.wait_until(lock, *deadline, ready);
+  else
+    gate->cv.wait(lock, ready);
+}
+
+preparation_coordinator::state::control_step_result preparation_coordinator::state::drive_control(
+  std::shared_ptr<state> const& st, std::optional<std::chrono::milliseconds> idle_wait, bool wait)
 {
   {
     std::lock_guard lock(gate->mutex);
-    if (phase == lifecycle::quiescent) return false;
+    if (phase == lifecycle::quiescent) return {control_step_result::status::finished};
+    if (!gate->closed && phase != lifecycle::running)
+      return {control_step_result::status::parked, gate->wake_generation};
     if (control_active) throw std::logic_error("preparation control cannot reenter");
     control_active = true;
     stats.runner   = std::this_thread::get_id();
@@ -1437,48 +1529,46 @@ bool preparation_coordinator::state::advance_control(
     {
       std::lock_guard lock(st.gate->mutex);
       st.control_active = false;
-    }
-  } active{*this};
-  try {
-    std::unique_lock lock(gate->mutex);
-    ++stats.wakes;
-    if (!gate->closed) {
-      gate->check_interrupted();
-      auto const observed_wake = gate->wake_generation;
-      // Both drivers use the same bounded turn, deadlines and wake generation.
-      size_t actions = emit_partial_batch(lock) ? 1 : 0;
-      auto available = [&] {
-        if (gate->closed || actions >= options.max_control_work) return false;
-        gate->check_interrupted();
-        return true;
-      };
-      if (available() && publish_batch(lock)) ++actions;
-      if (available() && (advance_result(lock) || emit_partial_batch(lock, true))) ++actions;
-      if (available() && submit_job(lock, st)) ++actions;
-      if (available() && close_finished_source(lock)) ++actions;
-      if (available() && emit_full_window(lock)) ++actions;
-      if (!gate->closed && !inputs_settled()) {
-        if (actions || gate->wake_generation != observed_wake) return true;
-        auto deadline = nearest_deadline();
-        if (manual_clock) deadline.reset();
-        auto bound_wait = [&](std::chrono::milliseconds interval) {
-          auto end = op::scan::batch_coalescer::clock::now() + interval;
-          deadline = deadline ? std::min(*deadline, end) : end;
-        };
-        if (gate->interrupted) bound_wait(options.interrupt_check_interval);
-        if (idle_wait) bound_wait(*idle_wait);
-        if (deadline)
-          gate->cv.wait_until(lock, *deadline);
-        else
-          gate->cv.wait(lock);
-        return false;
+      if (st.retirement == retirement_phase::finished) {
+        // Drain cannot return before cleanup, final notifications and control ownership end.
+        st.phase = lifecycle::quiescent;
+        st.gate->notify_under_lock();
       }
     }
+  } active{*this};
+  control_step_result step;
+  try {
+    step = retirement == retirement_phase::active ? control_step(st) : retire_step();
+    if (step.next == control_step_result::status::retire) step = retire_step();
   } catch (...) {
     completion->report_error(std::current_exception());
+    step = retire_step();
   }
-  shutdown();
-  return false;
+  if (step.next == control_step_result::status::runnable) return step;
+  if (step.next == control_step_result::status::parked) {
+    if (!wait) {
+      if (before_control_wait) before_control_wait();
+      return step;
+    }
+    // Failed/unarmed startup has no independent driver. Its owner must still service close.
+    if (retirement != retirement_phase::active && provider_owner == std::this_thread::get_id() &&
+        pump_provider())
+      return {control_step_result::status::runnable};
+    try {
+      wait_for_control(step, idle_wait);
+    } catch (...) {
+      completion->report_error(std::current_exception());
+      stop();
+      return {control_step_result::status::runnable};
+    }
+  }
+  return step;
+}
+
+bool preparation_coordinator::state::advance_control(
+  std::shared_ptr<state> const& st, std::optional<std::chrono::milliseconds> idle_wait)
+{
+  return drive_control(st, idle_wait, true).next == control_step_result::status::runnable;
 }
 
 void preparation_coordinator::state::run(std::shared_ptr<state> const& st)

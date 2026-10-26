@@ -248,8 +248,10 @@ TEST_CASE("Arrow reader outputs retain one backing through publication and impor
   auto result    = GENERATE(
     outcome::success, outcome::cancel_queued, outcome::cancel_import, outcome::invalid_metadata);
   CAPTURE(execution, result);
+  auto pool_workers = GENERATE(0u, 2u);
+  coordinator_pool coordinators(pool_workers);
   native_reader_executor native(1, 1);
-  fixture f(1, 1, 5s, std::nullopt, &native);
+  fixture f(1, 1, 5s, std::nullopt, &native, pool_workers ? &coordinators : nullptr);
   test::test_reservation_provider provider;
   auto storage         = std::make_shared<detached_source_state>(provider);
   auto releases        = std::make_shared<arrow_releases>();

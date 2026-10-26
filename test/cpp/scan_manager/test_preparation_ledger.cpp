@@ -560,19 +560,23 @@ TEST_CASE("Results keep backing after plan and attempt owners finish", "[scan_pr
   CHECK(provider.outstanding() == 0);
   CHECK(provider.seen->allocated_bytes == 0);
 }
-TEST_CASE("An unexecuted plan releases its grant and cannot be reused after finish",
+TEST_CASE("Unexecuted admission releases its grant on finish or destruction",
           "[scan_preparation][ledger]")
 {
+  bool explicit_finish = GENERATE(false, true);
   test_reservation_provider provider;
   {
     auto ledger = std::make_unique<preparation_ledger>(provider);
     auto d      = ledger->admit(sample(), host);
+    REQUIRE(d.deferred);
     preparation_admission owner(std::move(ledger), d);
     CHECK(provider.outstanding() == 1);
-    owner.finish();
-    owner.finish();
-    CHECK(provider.outstanding() == 0);
-    CHECK_THROWS_AS(owner.consume(), std::logic_error);
+    if (explicit_finish) {
+      owner.finish();
+      owner.finish();
+      CHECK(provider.outstanding() == 0);
+      CHECK_THROWS_AS(owner.consume(), std::logic_error);
+    }
   }
   CHECK(provider.outstanding() == 0);
 }
@@ -881,20 +885,6 @@ TEST_CASE("Retained-only preparation jobs acquire permits without temporary stor
   CHECK_THROWS_AS(ledger.allocator(next).allocate(1), preparation_resource_error);
   CHECK_THROWS_AS(ledger.allocator(next).allocate_retained(1), preparation_resource_error);
   CHECK(ledger.bound_exceeded() == 2);
-}
-
-TEST_CASE("Destroying an unexecuted admission releases its reservation without explicit finish",
-          "[scan_preparation][ledger]")
-{
-  test_reservation_provider provider;
-  {
-    auto ledger   = std::make_unique<preparation_ledger>(provider);
-    auto decision = ledger->admit(sample(), host);
-    REQUIRE(decision.deferred);
-    preparation_admission plan(std::move(ledger), decision);
-    CHECK(provider.outstanding() == 1);
-  }
-  CHECK(provider.outstanding() == 0);
 }
 
 TEST_CASE("HOST reservation failure does not retry or leave a partial grant",

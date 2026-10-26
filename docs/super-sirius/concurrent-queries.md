@@ -102,7 +102,17 @@ facts, uniqueness proofs and late-materialization handle. Re-pin builds privatel
 the previous entry usable. Readers hold entry snapshots and query-local visibility masks. SQL pin
 replacement and cache reset remain exclusive maintenance operations.
 
-Metadata producers use the shared worker pool. Metadata-only coordination runs on the query owner. Queries with provider or native-reader sources use an independent coordinator for coalescing and publication; their owner thread services statement-bound providers. Each admitted attempt owns at most one coordinator thread, joined before its query slot is released. Native readers use a separate shared executor. Coalescing does not occupy metadata workers or wait for a blocked provider call. I/O readahead shares runtime backend budgets across queries. Demand reads borrow immediately and block further speculation until their debt is repaid. Canceling one subscriber releases its interest without invalidating another subscriber's bytes. Cache pressure permits a bounded eviction attempt before abandoning speculative work.
+Metadata producers use the shared metadata worker pool. Coordination and preparation retirement depend on the attempt's sources and [preparation configuration](configuration.md#siriusexecutorscan_managerpreparation):
+
+| Attempt | Coordination | Preparation retirement |
+|---|---|---|
+| Metadata-only | Query owner; no additional coordinator thread. | The owner drains preparation. |
+| Provider or native-reader sources, `coordinator_workers > 0` (default `2`) | Workers shared by the scan manager, started lazily. | Wait for the registration's final step and any in-flight stop notification to return. |
+| Provider or native-reader sources, `coordinator_workers: 0` | One dedicated coordinator thread per attempt. | Join that attempt's coordinator thread. |
+
+Preparation retirement completes before the query slot is released. Shared coordinator workers are joined when the scan manager stops. The query owner remains available for statement-bound provider work through drain; native readers use a separate shared executor. Coalescing does not occupy metadata workers or wait for a blocked provider call.
+
+I/O readahead shares runtime backend budgets across queries. Demand reads borrow immediately and block further speculation until their debt is repaid. Canceling one subscriber releases its interest without invalidating another subscriber's bytes. Cache pressure permits a bounded eviction attempt before abandoning speculative work.
 
 GPU memory prefetch selects from the query's admitted GPU set, checks each device's headroom and
 uses real reservations. Runtime-owned exclusive stream leases cover prefetch, pin materialization

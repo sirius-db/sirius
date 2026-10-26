@@ -31,7 +31,13 @@ TEST_CASE("dispatcher settles a refused pool submission", "[scoped_dispatcher]")
 {
   sirius::exec::static_thread_pool pool(1);
   sirius::exec::scoped_dispatcher dispatcher(pool);
+  unsigned notifications = 0;
+  dispatcher.set_stop_drain_callback([&] {
+    dispatcher.wait_for_all();  // Notification runs outside the dispatcher mutex.
+    ++notifications;
+  });
   pool.stop();
+  SECTION("empty") { dispatcher.request_stop(); }
   SECTION("enqueue")
   {
     CHECK_THROWS_WITH(dispatcher.enqueue([] {}), "thread pool is stopped");
@@ -46,6 +52,8 @@ TEST_CASE("dispatcher settles a refused pool submission", "[scoped_dispatcher]")
   CHECK_NOTHROW(dispatcher.enqueue([&] { executed = true; }));
   dispatcher.wait_for_all();
   CHECK_FALSE(executed);
+  dispatcher.request_stop();
+  CHECK(notifications == 1);
 }
 
 TEST_CASE("failed dispatcher submission discards pending work without executing it inline",
@@ -181,6 +189,14 @@ TEST_CASE("cancellation keeps a queued continuation outstanding", "[scoped_dispa
   auto released        = release.get_future();
   auto blocker_release = release_blocker.get_future();
   unsigned executed = 0, destroyed = 0;
+  std::promise<void> notification;
+  auto notified                      = notification.get_future();
+  unsigned destroyed_at_notification = 0;
+  dispatcher.set_stop_drain_callback([&] {
+    dispatcher.wait_for_all();
+    destroyed_at_notification = destroyed;
+    notification.set_value();
+  });
   dispatcher.enqueue([&] {
     entered.set_value();
     released.wait();
@@ -203,9 +219,13 @@ TEST_CASE("cancellation keeps a queued continuation outstanding", "[scoped_dispa
   dispatcher.request_stop();
   auto drained      = std::async(std::launch::async, [&] { dispatcher.wait_for_all(); });
   auto const status = drained.wait_for(std::chrono::milliseconds(50));
+  auto const notification_status = notified.wait_for(std::chrono::milliseconds(0));
   release_blocker.set_value();
   drained.get();
   CHECK(status == std::future_status::timeout);
+  CHECK(notification_status == std::future_status::timeout);
+  REQUIRE(notified.wait_for(std::chrono::seconds(1)) == std::future_status::ready);
+  CHECK(destroyed_at_notification == 1);
   CHECK(executed == 0);
   CHECK(destroyed == 1);
 }

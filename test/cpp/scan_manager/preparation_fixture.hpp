@@ -205,7 +205,8 @@ struct fixture {
                    size_t lookahead                             = 4,
                    std::chrono::milliseconds interrupt_interval = k_interrupt_check_interval,
                    std::optional<preparation_options> options   = std::nullopt,
-                   native_reader_executor* native               = nullptr)
+                   native_reader_executor* native               = nullptr,
+                   coordinator_pool* coordinators               = nullptr)
     : pool(static_cast<int>(workers)),
       dispatcher(pool),
       coordinator(completion,
@@ -217,7 +218,8 @@ struct fixture {
                                                        interrupt_interval,
                                                        0,
                                                        partial_batch_options{50, 20ms, 20ms}}),
-                  native)
+                  native,
+                  coordinators)
   {
     coordinator.after_publication_for_testing(
       [this](size_t id, auto const& metadata, size_t bytes) {

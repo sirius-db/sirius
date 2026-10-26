@@ -1452,7 +1452,6 @@ TEST_CASE("Metadata-only production scans publish on the query owner",
         CHECK(observation.execute_owner != std::thread::id{});
         CHECK(observation.preparation_owner == observation.execute_owner);
         CHECK(observation.preparation_runner == observation.execute_owner);
-        CHECK(observation.preparation_runner != std::thread::id{});
         CHECK(observation.preparation_publisher == observation.preparation_runner);
       }
     }

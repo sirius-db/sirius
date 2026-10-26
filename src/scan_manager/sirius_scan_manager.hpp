@@ -1087,6 +1087,7 @@ class sirius_scan_manager {
   // Runtime-wide native capacity; declared before query states so it outlives their leases.
   // Threads start only when an attempt first admits native readers.
   native_reader_executor _native_readers;
+  coordinator_pool _coordinators;
   std::shared_ptr<sirius::io::ioctx> _io_ctx;
   /// Lazily-built per-backend ioctxs for path-routed datasources (e.g. an s3://
   /// REST or kvikIO context alongside the local `_io_ctx`). Contexts are keyed

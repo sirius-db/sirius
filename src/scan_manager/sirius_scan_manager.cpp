@@ -1348,6 +1348,7 @@ sirius_scan_manager::sirius_scan_manager(
                  _config.thread_pool.cpu_affinity_list),
     _native_readers(_config.preparation.resolved_native_workers(),
                     _config.preparation.resolved_native_readers()),
+    _coordinators(_config.preparation.resolved_coordinator_workers()),
     _ioctx_registry(_config, reservation_manager)
 {
   if (!_topology_index) {
@@ -2054,7 +2055,11 @@ std::unique_ptr<preparation_coordinator> sirius_scan_manager::make_preparation_c
   query_scan_manager_state& state)
 {
   return std::make_unique<preparation_coordinator>(
-    *state.completion, *state.dispatcher, state.preparation, &_native_readers);
+    *state.completion,
+    *state.dispatcher,
+    state.preparation,
+    &_native_readers,
+    _config.preparation.resolved_coordinator_workers() ? &_coordinators : nullptr);
 }
 
 void sirius_scan_manager::start_metadata_processing(query_scan_manager_state& state,
@@ -2644,6 +2649,7 @@ void sirius_scan_manager::stop()
   // Requires the runtime owner to prevent new queries and finish preparation construction.
   // Concurrent prepare/stop is outside this manager shutdown contract.
   reset_all();
+  _coordinators.stop();
   _native_readers.stop();  // Every accepted reader has closed and returned its lease.
   _thread_pool.stop();
 }

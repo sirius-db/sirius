@@ -91,11 +91,11 @@ The shared host Arrow path has two explicit boundaries. `import_arrow_host()` co
 
 ### Execution and ownership
 
-The coordinator claims work, coalesces results and publishes batches after GPU consumers are ready. Metadata-only attempts advance on the query owner without another thread. An attempt with query-owner or native-reader sources uses one independent coordinator so blocking reader calls cannot stall other ready work. Both drivers use the same bounded control loop, publication gate and retirement path. Sources choose where their jobs run:
+The coordinator claims work, coalesces results and publishes batches after GPU consumers are ready. Metadata-only attempts advance on the query owner without another thread. An attempt with query-owner or native-reader sources runs coordination independently of reader calls: on the manager's shared pool by default, or on a dedicated thread when `coordinator_workers` is `0`. All drivers use the same bounded control steps, publication gate and retirement path. Sources choose where their jobs run:
 
 | Execution domain | Work and cleanup | Use |
 |---|---|---|
-| Metadata | Work runs in the metadata pool; source close runs during coordinator retirement. | Independent file and metadata preparation. |
+| Metadata | Work runs in the metadata pool; source close runs on the control driver. | Independent file and metadata preparation. |
 | Query owner | Provider operations, accepted-job disposal and close run on the statement thread. | Readers that require execution on the query's owning thread. |
 | Native reader | Operations, accepted-job disposal and close run on one assigned native worker. | Readers with thread affinity. |
 
@@ -134,7 +134,29 @@ The control driver reserves a claim before calling the adapter outside the gate.
 
 Query-owner and native sources allow one outstanding operation or unprocessed result per reader. They share the existing coalescing and publication path and do not consume metadata-worker permits. The query owner calls `advance()` while waiting for query completion: it advances metadata-only coordination or services one provider request. It remains available through drain; an external reset may request stop and wait, but cannot run provider operations itself.
 
+The coordinator pool executes at most one step per attempt at a time. Steps return runnable, parked with an optional deadline, or finished. Wakes racing with a step are retained; pool workers service deadlines without owner ticks or extra timer threads. Control hooks must not wait for I/O, capacity or dependencies. Stop requests keep retirement runnable, and drain waits for the final step to return after completion notifications. Provider work and disposal remain on the query owner; native work and disposal remain on the assigned native worker.
+
 Native reader slots are shared across queries in a scan manager. An attempt reserves all its slots before any reader starts; insufficient capacity fails immediately as `late_failure_cause::resource`, without holding a partial group. CPU replay still requires the existing fallback, source-policy, transaction and cleanup checks; this classification grants no replay permission. Several readers may share a worker. A blocked native call can delay those readers, but not the coordinator or metadata pool. Worker and slot limits are documented in [configuration](configuration.md#siriusexecutorscan_managerpreparation).
+
+### Control steps and driver waits
+
+`state::control_step()` performs one bounded turn and returns `runnable`, `parked` with a wake generation and optional deadline, or `retire`. `retire_step()` advances cleanup without waiting for workers: stop and drain metadata, close readers in their execution domains, then release remaining state. Pending stages park until a completion notification arrives. Query-owner, dedicated-thread and pooled drivers use these steps; the driver owns waits and serializes advancement.
+
+Before sleeping, the query-owner and dedicated-thread drivers recheck the returned wake generation under the gate; stop also advances that generation. A wake between the step and the wait therefore cannot be lost. A timeout requests another step, which rechecks eligibility; it does not publish directly. Partial-batch deadlines use the coalescer clock; the driver also bounds waits for interrupt checks and the caller's idle limit.
+
+The action limit bounds work count, not hook duration. Adapters used with the shared pool must preserve these control-path boundaries:
+
+| Call on the control path | Current boundary |
+|---|---|
+| `try_claim` | Returns work, pending or exhausted without entering a reader. Parquet/Iceberg resolve and read inside the job. DuckDB-native storage walks must finish during manager setup; its legacy claim fallback can still perform the walk if setup is bypassed. |
+| Job submission | Metadata enqueue does not wait for a worker slot; query-owner/native handoff uses the admitted mailbox or lease. Submission may allocate and take locks. |
+| Coalescer `advance`, `partial_emit`, `flush`; input construction | Manipulate prepared metadata and allocate descriptors. Datasource duplication shares existing handles. Allocation, locks and capture destruction still run inline. |
+| `prepare_prefetch` | Does not wait for eviction or device progress. It takes cache locks, allocates buffers and invokes ready completion callbacks inline. |
+| Final publication | Readahead registration and connector insertion run under the gate; no arbitrary adapter hooks are allowed there. Their locks and allocations remain part of the step. |
+| Source/output close and released captures | Metadata close and output notifications can run inline. Query-owner/native reader close and accepted-job disposal stay in their assigned execution domain. |
+| Error reporting and retirement | Error observers, stop callbacks, discarded captures and final cleanup still run synchronously. Waiting for dispatcher drain or reader close happens in the outer driver, never inside the retirement step. |
+
+Retirement keeps one control owner. The dispatcher sends one notification after stopped work and its captures drain; reader completion wakes the same driver. The query owner keeps servicing provider operations. `drain()` returns only after final cleanup and completion notifications have returned and control ownership has ended.
 
 ### Publication and cancellation
 

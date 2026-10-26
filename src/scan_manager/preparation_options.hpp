@@ -44,7 +44,8 @@ struct preparation_config {
   std::optional<size_t> max_inflight_metadata_jobs, max_inflight_dv_jobs, lookahead_batches,
     max_control_work, drain_quantum;
   // Runtime-wide limits, independent of per-attempt metadata credits and GPU count.
-  std::optional<size_t> native_reader_workers, max_native_readers;
+  std::optional<size_t> native_reader_workers, max_native_readers, coordinator_workers;
+  size_t resolved_coordinator_workers() const { return coordinator_workers.value_or(2); }
   size_t resolved_native_workers() const { return native_reader_workers.value_or(2); }
   size_t resolved_native_readers() const { return max_native_readers.value_or(64); }
   std::chrono::milliseconds interrupt_check_interval = k_interrupt_check_interval;
