@@ -21,6 +21,8 @@
 #include "exchange/nixl_fabric.hpp"
 #include "exchange/transport_test_utils.hpp"
 
+#include <cudf/copying.hpp>
+
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -29,7 +31,6 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
-#include <cudf/copying.hpp>
 #include <exception>
 #include <map>
 #include <memory>
@@ -213,7 +214,8 @@ TEST_CASE("one rank per process measures exchange bandwidth", "[.][nixl_bandwidt
   std::mutex mutex;
   std::condition_variable changed;
   std::size_t batches = 0;
-  // Ends per stream: a fast peer's barrier end (stream 99) can arrive before a slow peer's data end.
+  // Ends per stream: a fast peer's barrier end (stream 99) can arrive before a slow peer's data
+  // end.
   std::map<stream_id, std::size_t> ended;
   std::exception_ptr error;
   transport t(fab,
@@ -258,9 +260,8 @@ TEST_CASE("one rank per process measures exchange bandwidth", "[.][nixl_bandwidt
   }
   {
     std::unique_lock lock{mutex};
-    REQUIRE(changed.wait_for(lock, std::chrono::minutes{10}, [&] {
-      return error != nullptr || ended[1] == world - 1;
-    }));
+    REQUIRE(changed.wait_for(
+      lock, std::chrono::minutes{10}, [&] { return error != nullptr || ended[1] == world - 1; }));
     REQUIRE_FALSE(error);
     REQUIRE(batches == static_cast<std::size_t>(per_peer) * (world - 1));
   }
