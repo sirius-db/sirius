@@ -358,6 +358,8 @@ bound_read_view capture(capture_input input, duckdb::ClientContext& context)
   auto const* source = planner::lookup_connector(input.function, input.bind_data, context);
   if (!source) { throw std::runtime_error("cannot capture an unverified scan source"); }
 
+  if (source->capture) return source->capture(input.function, input.bind_data, context);
+
   bound_read_identity identity;
   identity.source = {source->function_name, source->kind, source->registry_profile};
   bound_read_view view;
@@ -642,9 +644,14 @@ std::shared_ptr<bound_read_identity const> make_bound_read_identity_preanalyzed(
       for (auto index : order)
         encode_path(paths[index]);
     }
-  } else {
+  } else if (auto stream = std::get_if<stream_identity>(&identity.data_view)) {
     if (!paths.empty()) throw std::invalid_argument("Stream read view has file inventory");
-    number(text, std::get<stream_identity>(identity.data_view).stream_id);
+    number(text, stream->stream_id);
+  } else {
+    auto const& provider = std::get<provider_read_identity>(identity.data_view);
+    if (!paths.empty() || provider.key.empty())
+      throw std::invalid_argument("Invalid provider read identity");
+    append(text, 'b', provider.key);
   }
   text += tail;
   identity.fingerprint.hash = duckdb::Hash(text.data(), text.size());

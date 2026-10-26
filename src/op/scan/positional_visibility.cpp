@@ -39,7 +39,8 @@ std::unique_ptr<cudf::table> apply_positional_visibility(std::unique_ptr<cudf::t
                                                          std::span<batch_row_run const> layout,
                                                          position_lookup const& positions_for,
                                                          ::cuda::stream_ref stream,
-                                                         rmm::device_async_resource_ref mr)
+                                                         rmm::device_async_resource_ref mr,
+                                                         row_limit_lookup const& limit_for)
 {
   int64_t offset = 0;
   for (auto const& run : layout) {
@@ -52,7 +53,9 @@ std::unique_ptr<cudf::table> apply_positional_visibility(std::unique_ptr<cudf::t
   if (offset != tbl->num_rows()) throw std::invalid_argument("incomplete visibility row layout");
   auto const num_rows = static_cast<int64_t>(tbl->num_rows());
   if (num_rows == 0 || !std::any_of(layout.begin(), layout.end(), [&](auto const& run) {
-        return !positions_for(run.data_file_path).empty();
+        auto limit = limit_for ? limit_for(run.data_file_path) : std::nullopt;
+        return !positions_for(run.data_file_path).empty() ||
+               (limit && *limit < static_cast<uint64_t>(run.file_row_offset + run.num_rows));
       })) {
     return tbl;
   }
@@ -64,6 +67,16 @@ std::unique_ptr<cudf::table> apply_positional_visibility(std::unique_ptr<cudf::t
 
   for (auto const& run : layout) {
     auto const delete_positions = positions_for(run.data_file_path);
+    if (auto limit = limit_for ? limit_for(run.data_file_path) : std::nullopt) {
+      auto start = static_cast<uint64_t>(run.file_row_offset);
+      auto kept  = *limit > start ? std::min<uint64_t>(*limit - start, run.num_rows) : 0;
+      if (kept < static_cast<uint64_t>(run.num_rows)) {
+        std::fill(keep.begin() + run.batch_row_offset + kept,
+                  keep.begin() + run.batch_row_offset + run.num_rows,
+                  0u);
+        any_deleted = true;
+      }
+    }
     if (delete_positions.empty()) { continue; }
     auto const run_end = run.file_row_offset + run.num_rows;
     auto lo =

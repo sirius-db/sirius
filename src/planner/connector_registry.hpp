@@ -18,6 +18,7 @@
 
 #include "op/scan/table_scan/bound_read_view.hpp"
 #include "op/scan/table_scan/scan_contract.hpp"
+#include "scan_manager/preparation_ledger.hpp"
 #include "transparent/plan_source_policy.hpp"
 
 #include <duckdb/function/table_function.hpp>
@@ -37,7 +38,8 @@ class sirius_physical_operator;
 class sirius_physical_table_scan;
 namespace scan {
 enum class dynamic_filter_apply_mode;
-}
+class gpu_ingestible;
+}  // namespace scan
 }  // namespace op
 }  // namespace sirius
 namespace sirius::planner {
@@ -72,6 +74,19 @@ struct connector {
                                             op::sirius_physical_table_scan const&,
                                             duckdb::ClientContext&,
                                             scan_contract_provenance&) = nullptr;
+  // A private bridge validates provider-owned function_info and binding together.
+  bool (*verify_binding)(duckdb::BaseTableFunction const&,
+                         duckdb::FunctionData const*,
+                         duckdb::ClientContext&) = nullptr;
+  // Original semantic binding only: no SQL rebind, inventory discovery or reader
+  // state consumption. May also run for a pre-declined scan to retain correspondence.
+  op::scan::bound_read_view (*capture)(duckdb::BoundTableFunction const&,
+                                       duckdb::FunctionData const*,
+                                       duckdb::ClientContext&) = nullptr;
+  // Contribute to the single statement admission before lowering any scan.
+  std::optional<scan_manager::preparation_request> (*prepare)(op::sirius_physical_table_scan&,
+                                                              operator_params const&,
+                                                              duckdb::ClientContext&) = nullptr;
 };
 
 enum class lookup_decline : uint8_t {
@@ -103,6 +118,14 @@ std::span<connector const> registered_connectors();
 // Register at Sirius load; bootstrap Iceberg trust during extension loading, never in lookup.
 void register_scan_source_callbacks(duckdb::DatabaseInstance&);
 
+// Assemble an already prepared materializer using the shared dynamic-filter path.
+duckdb::unique_ptr<op::sirius_physical_operator> lower_prepared_scan(
+  std::shared_ptr<op::scan::gpu_ingestible>,
+  op::sirius_physical_table_scan const&,
+  operator_params const&,
+  duckdb::ClientContext&,
+  op::scan::dynamic_filter_apply_mode);
+
 // These wrappers keep the existing format builders and admission gates at their original sites.
 duckdb::unique_ptr<op::sirius_physical_operator> lower_native_scan(
   op::sirius_physical_table_scan&,
@@ -122,4 +145,7 @@ duckdb::unique_ptr<op::sirius_physical_operator> lower_iceberg_scan(
 op::scan::pre_capture_result registered_iceberg_decline_reason(duckdb::LogicalGet&,
                                                                duckdb::ClientContext&,
                                                                scan_contract_provenance&);
+/// Verify the bound multi-file wrapper against this host's Parquet implementation.
+bool verified_parquet_interface(duckdb::FunctionData const*, duckdb::ClientContext&);
+
 }  // namespace sirius::planner

@@ -450,7 +450,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   run_ok("ROLLBACK");
 }
 
-TEST_CASE("Scan registry verifies all six catalog functions", "[scan][contracts][shared_context]")
+TEST_CASE("Scan registry verifies core catalog functions", "[scan][contracts][shared_context]")
 {
   REQUIRE(sirius::test::g_shared_env);
   auto con = sirius::test::g_shared_env->make_connection();
@@ -464,6 +464,13 @@ TEST_CASE("Scan registry verifies all six catalog functions", "[scan][contracts]
 
   std::set<std::string> names;
   for (auto const& entry : sirius::planner::registered_connectors()) {
+    if (entry.function_name == "ducklake_scan") {
+      CHECK(entry.lower != nullptr);
+      CHECK(entry.verify_binding != nullptr);
+      CHECK(entry.capture != nullptr);
+      CHECK(entry.certify != nullptr);
+      continue;  // Its optional provider/qualification tests own the private ABI.
+    }
     names.insert(entry.function_name);
     if (entry.function_name == "sirius_stream_source") {
       CHECK(entry.certify == nullptr);
@@ -1228,6 +1235,7 @@ TEST_CASE("Scan registry first lookup child", "[.][registry_trust_child][shared_
   replacement_table = &first_get(*native).bind_data->Cast<duckdb::TableScanBindData>().table;
   duckdb::ExtensionLoader loader(*con.context->db, "registry_replacement_test");
   for (auto const& source : sirius::planner::registered_connectors()) {
+    if (source.function_name == "ducklake_scan") continue;
     INFO(source.function_name);
     auto& catalog = duckdb::Catalog::GetSystemCatalog(*con.context);
     auto original = *catalog
@@ -1353,4 +1361,45 @@ TEST_CASE("Generic temporal mapping does not widen Iceberg admission", "[scan][c
     bind.columns.back().type = type;
     CHECK_FALSE(sirius::planner::iceberg_flat_mapping_supported(&bind));
   }
+}
+
+TEST_CASE("Parquet binding verification rejects altered nested readers",
+          "[scan][parquet_interface][shared_context]")
+{
+  REQUIRE(sirius::test::g_shared_env);
+  auto con = sirius::test::g_shared_env->make_connection();
+  REQUIRE_FALSE(con.Query("SET gpu_execution=false")->HasError());
+  sirius::test::scratch_dir files("reader_verification");
+  auto const path = sirius::test::sql_literal((files.path() / "data.parquet").string());
+  REQUIRE_FALSE(con.Query("COPY (SELECT 1 AS id) TO " + path + " (FORMAT PARQUET)")->HasError());
+  REQUIRE_FALSE(con.Query("BEGIN")->HasError());
+  auto plan     = con.ExtractPlan("SELECT * FROM read_parquet(" + path + ")");
+  auto& get     = first_get(*plan);
+  auto& bind    = get.bind_data->Cast<duckdb::MultiFileBindData>();
+  auto* wrapper = dynamic_cast<duckdb::TableFunctionMultiFileWrapper*>(bind.interface.get());
+  REQUIRE(wrapper);
+  auto verify = [&] {
+    return sirius::planner::verified_parquet_interface(get.bind_data.get(), *con.context);
+  };
+  REQUIRE(verify());
+  auto const function        = wrapper->function;
+  auto const settings        = wrapper->settings;
+  wrapper->function.function = fake_scan;
+  CHECK_FALSE(verify());
+  wrapper->function      = function;
+  wrapper->function.bind = fake_bind;
+  CHECK_FALSE(verify());
+  wrapper->function             = function;
+  wrapper->settings.claim_batch = nullptr;
+  CHECK_FALSE(verify());
+  wrapper->settings                    = settings;
+  wrapper->settings.reuses_local_state = !settings.reuses_local_state;
+  CHECK_FALSE(verify());
+  wrapper->settings                        = settings;
+  wrapper->settings.glob_input.allow_empty = !settings.glob_input.allow_empty;
+  CHECK_FALSE(verify());
+  wrapper->settings = settings;
+  CHECK(verify());
+  CHECK_FALSE(sirius::planner::verified_parquet_interface(nullptr, *con.context));
+  REQUIRE_FALSE(con.Query("ROLLBACK")->HasError());
 }

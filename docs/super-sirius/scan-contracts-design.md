@@ -39,6 +39,28 @@ Loadable builds require ABI-compatible exports of `duckdb::TableScanFunction::Ge
 
 If a trusted definition is unavailable, Sirius warns once per source and declines its GPU scans. CPU fallback still depends on fallback settings and source policy. Iceberg definitions are established when its extension loads and also require the host Parquet descriptor.
 
+### DuckLake private binding boundary
+
+`SIRIUS_BUILD_DUCKLAKE_BRIDGE` enables the optional connector and is off by default. It requires the pinned, host-patched DuckLake source and matching library. Private provider headers stay inside `binding_bridge.cpp`; installed packages include the matching provider library.
+
+The connector verifies the provider callbacks and reads the original binding's snapshot, schema and transaction-local state. Each execution owns its readers and cursors; the saved CPU reader remains available for replay. Parquet and inline units share the existing preparation coordinator, split validation and query recovery. Discovery is lazy and must cover every unit in the binding.
+
+| Input or condition | Behavior |
+|---|---|
+| Local Parquet, inline or mixed data | GPU scan through existing SQL and bound-plan entrypoints. |
+| Selected columns | Up to 32 flat Boolean, integer, FLOAT/DOUBLE, VARCHAR, DATE or microsecond TIMESTAMP columns, including NULLs. |
+| Schema evolution | Match stable field IDs; use typed `initial_default` for missing fields. INTEGER-to-BIGINT and FLOAT-to-DOUBLE widening are supported. |
+| Ordinary Parquet deletes, local DVs and inline deletes | Combine visibility in the original file-row domain before residual filtering and projection. |
+| Nested selections, external name/Hive mappings or other conversions | Reject GPU execution. Unselected nested columns do not prevent scalar reads. |
+| Remote or encrypted inputs; snapshot-bearing deletes or per-row snapshot-filtered data | Reject GPU execution. |
+| Missing statistics, defaults or conversions without usable statistics | Keep affected row groups and evaluate residual filters. |
+| Malformed delete payload or invalid positions | Fail the scan; never treat invalid data as an empty delete set. |
+| Insufficient preparation capacity or an oversized row | Return a resource error without truncation or unbounded allocation. |
+| Cancellation or failure to drain GPU work | Do not replay on CPU. Retain owners needed by unfinished work. |
+| Scan result caching | Disabled. |
+
+Preparation reservations cover detached Arrow storage and retained delete data until their last consumer releases them. Native provider metadata, reader and chunk allocations remain outside that bound. The existing fallback settings and source policy govern SQL recovery; fragment errors propagate without CPU replay.
+
 ## Matching the bound input
 
 Transparent execution compares source, bound schema, reader options, and input:
@@ -71,11 +93,33 @@ Native ranges carry their actual storage version and data and validity codec evi
 
 Cached batches use pin identity, layout, structure, and applicable iteration and visibility checks. The query token and all applicable results are validated before publication to the split connector, so the prefetcher cannot consume an unadmitted batch. Streaming inputs do not produce storage splits.
 
+### Bound split validators
+
+Trusted planning binds a validator before publishing the scan contract. Execution uses that registered validator; an input split cannot supply its own validator. Adding a reader does not require type dispatch in the shared executor.
+
+| Layer | Checks |
+|---|---|
+| `validate_split_for_gpu` | Contract, generation, certificate coverage, dependencies and registry ownership. |
+| Bound materializer validator | Format-specific input identity, layout, visibility and retained owners. |
+| Composite validator | Each input belongs to exactly one child materializer. |
+
+Providers supplying `owned_arrow_scan_info` reuse the shared Arrow validator and retain batch storage through GPU completion. Coalescing must preserve certificates and dependencies.
+
 ## Preparation and publication
 
 Each execution attempt owns its preparation units. A unit identifies one scan input and stays pending until all required evidence is ready: footer approval, native segment checks, row visibility, or checkpoint state. Readiness alone does not authorize publication. The coordinator checks cancellation before preparing prefetch buffers outside the gate. The gate checks again before readahead registration and connector insertion.
 
 Providers declare bounded temporary allocations and retained storage through `preparation_request`. `prepare_statement_resources()` aggregates them into one statement reservation, prepares each provider's descriptors, then binds the shared admission. Failed preparation or binding rolls back all requests; runtime keeps the backing owner, not planning callbacks. Format-specific sizing stays in the adapter.
+
+Shared DV helpers separate container parsing from provider visibility rules:
+
+| Helper | Responsibility |
+|---|---|
+| `read_puffin_metadata` | Validate container framing and metadata; retain blob descriptors and properties without reading payloads. |
+| `decode_deletion_vector_payload` | Validate one immutable deletion-vector-v1 payload and return owned positions within caller limits. |
+| Provider adapter | Check file association, cardinality, snapshot applicability and complete delete coverage before certifying visibility. |
+
+Metadata and decoded positions retain their charged backing. Neither helper grants scan eligibility; Iceberg and DuckLake apply their own provider checks.
 
 Eligible Iceberg deletion-vector scans use this admission. The reservation covers retained descriptors and delete positions plus bounded temporary decode work, including allocation granularity. Buffers use the reserved backing, and immutable per-file delete sets retain it until their last consumer releases it. A prepared execution consumes its admission once; a later execution needs a fresh admission.
 

@@ -1641,3 +1641,147 @@ TEST_CASE("Planning binds validators before publishing correspondence",
     certificate_evidence_scope::binding_correspondence, "test", originals);
   CHECK_THROWS_AS(registry.bind_split_validator(id, parquet_split_validator()), std::logic_error);
 }
+
+TEST_CASE("Original row limits compose with deletes across pruned file runs",
+          "[materialization][scan]")
+{
+  auto cutoff = GENERATE(uint64_t{0}, uint64_t{12}, uint64_t{31}, UINT64_MAX);
+  rmm::cuda_stream stream;
+  auto mr = cudf::get_current_device_resource_ref();
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(constant(7, 6, stream));
+  std::array<batch_row_run, 2> runs{{{"a", 10, 0, 3, 0}, {"a", 30, 3, 3, 0}}};
+  std::array<int64_t, 2> deleted{11, 30};
+  auto result = apply_positional_visibility(
+    std::make_unique<cudf::table>(std::move(columns)),
+    runs,
+    [&](std::string const& path) -> std::span<int64_t const> {
+      REQUIRE(path == "a");
+      return deleted;
+    },
+    stream,
+    mr,
+    [&](std::string const&) -> std::optional<uint64_t> { return cutoff; });
+  size_t expected = 0;
+  for (uint64_t pos : {10, 11, 12, 30, 31, 32})
+    if (pos < cutoff && pos != 11 && pos != 30) ++expected;
+  CHECK(result->num_rows() == expected);
+  stream.synchronize();
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "Mapped footer pruning preserves physical groups and optional statistics",
+                 "[materialization][scan][mapping]")
+{
+  auto const mode = GENERATE(std::string("exact"),
+                             std::string("widen"),
+                             std::string("default"),
+                             std::string("no_stats"),
+                             std::string("all_pruned"),
+                             std::string("null"));
+  CAPTURE(mode);
+  rmm::cuda_stream stream;
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(constant(0, 6144, stream));
+  std::vector<int32_t> values(6144);
+  for (size_t i = 0; i < values.size(); ++i)
+    values[i] = (i / 2048) * 10;
+  REQUIRE(cudaMemcpyAsync(columns[0]->mutable_view().data<int32_t>(),
+                          values.data(),
+                          values.size() * sizeof(int32_t),
+                          cudaMemcpyHostToDevice,
+                          stream.value()) == cudaSuccess);
+  cudf::table table(std::move(columns));
+  cudf::io::table_input_metadata metadata(table.view());
+  metadata.column_metadata[0].set_name("physical").set_parquet_field_id(4);
+  sirius::test::scratch_dir directory("mapped_footer_pruning");
+  auto path   = directory.file("input.parquet");
+  auto writer = cudf::io::parquet_writer_options::builder(cudf::io::sink_info(path), table.view())
+                  .metadata(std::move(metadata))
+                  .row_group_size_rows(2048)
+                  .max_page_fragment_size(2048)
+                  .stats_level(mode == "no_stats" ? cudf::io::statistics_freq::STATISTICS_NONE
+                                                  : cudf::io::statistics_freq::STATISTICS_ROWGROUP)
+                  .build();
+  cudf::io::write_parquet(writer, stream);
+  stream.synchronize();
+  auto info                 = std::make_unique<parquet_ingestible_table_info>();
+  info->contract_id         = 93;
+  info->resolved_file_paths = {path};
+  info->names               = {"logical"};
+  auto type = mode == "widen" ? duckdb::LogicalType::BIGINT : duckdb::LogicalType::INTEGER;
+  info->returned_types = {mode == "widen" ? sirius::logical_type::make(sirius::type_id::BIGINT)
+                                          : sirius::logical_type::make(sirius::type_id::INTEGER)};
+  info->column_ids     = {duckdb::ColumnIndex(0)};
+  info->projected_output_count     = 1;
+  info->field_mapping_requirements = std::vector<field_requirement>{
+    {mode == "default" ? 8 : 4,
+     type,
+     mode == "default" ? std::optional<duckdb::Value>{duckdb::Value::INTEGER(10)} : std::nullopt,
+     mode == "widen"}};
+  info->prepare_field_mapping = [](std::shared_ptr<parquet_metadata const> metadata,
+                                   std::string const& identity,
+                                   materialization_program program,
+                                   std::vector<field_requirement> fields) {
+    return std::make_shared<field_id_mapping const>(field_id_mapping::compile(
+      std::move(metadata), identity, std::move(program), std::move(fields)));
+  };
+  auto filters = duckdb::make_uniq<duckdb::TableFilterSet>();
+  if (mode == "null") {
+    filters->PushFilter(duckdb::ProjectionIndex(0), sirius::test::null_filter(type));
+  } else {
+    auto value = [&](int x) {
+      return mode == "widen" ? duckdb::Value::BIGINT(x) : duckdb::Value::INTEGER(x);
+    };
+    filters->PushFilter(
+      duckdb::ProjectionIndex(0),
+      sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO,
+                                    value(mode == "all_pruned" ? 30 : 5)));
+    if (mode != "all_pruned")
+      filters->PushFilter(
+        duckdb::ProjectionIndex(0),
+        sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_LESSTHAN, value(15)));
+  }
+  info->table_filters = std::move(filters);
+  auto ingestible     = make_ingestible(std::move(info));
+  auto ioctx          = std::make_shared<sirius::io::kvikio_context>();
+  auto prepare        = ingestible->next_split_provider(
+    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+  auto prepared    = prepare({});
+  auto const& file = dynamic_cast<parquet_file_scan_info const&>(*prepared);
+  REQUIRE(file.field_mapping);
+  REQUIRE(file.file_metadata->row_groups.size() == 3);
+  CHECK(file.disable_filter_pushdown);
+  CHECK_FALSE(file.reader_options->get_filter().has_value());
+  auto all_pruned      = mode == "all_pruned" || mode == "null";
+  auto expected_groups = all_pruned ? 0 : mode == "exact" ? 1 : 3;
+  REQUIRE(file.row_groups.size() == expected_groups);
+  if (mode == "exact") CHECK(file.row_groups.front().index == 1);
+  auto coalescer = ingestible->create_batch_coalescer();
+  auto splits    = coalescer->push(std::move(prepared));
+  auto tail      = coalescer->flush();
+  for (auto& split : tail)
+    splits.push_back(std::move(split));
+  REQUIRE(splits.size() == 1);
+  auto const& split = dynamic_cast<parquet_split_info const&>(*splits.front());
+  REQUIRE(split.rg_slices.size() == 1);
+  auto const& slice = split.rg_slices.front();
+  bound_table_scan contract;
+  contract.contract_id = 93;
+  contract.profiles    = std::make_shared<physical_profile_table>();
+  std::vector<size_t> groups(slice.row_group_indices.begin(), slice.row_group_indices.end());
+  auto batch =
+    materialize_mapped_parquet({slice.datasource, slice.file_metadata, slice.row_group_indices},
+                               *split.field_mapping,
+                               contract,
+                               groups,
+                               stream,
+                               cudf::get_current_device_resource_ref());
+  CHECK(batch.rows == expected_groups * 2048);
+  if (mode == "exact") {
+    REQUIRE(batch.lineage.runs.size() == 1);
+    CHECK(batch.lineage.runs.front().file_row_offset == 2048);
+  }
+  CHECK(batch.table.view().num_columns() == 1);
+  stream.synchronize();
+}
