@@ -209,9 +209,10 @@ struct preparation_coordinator::state {
   std::map<unit_key, std::shared_ptr<preparation_unit>> units;
   std::deque<pending_batch> batches;
   lifecycle phase = lifecycle::constructed;
-  enum class retirement_phase { active, metadata, readers, cleanup, finished };
+  enum class retirement_phase { active, cancelling, metadata, readers, cleanup, finished };
   retirement_phase retirement = retirement_phase::active;
-  bool dispatcher_drained     = false;
+  std::optional<unit_key> cancelled_through;
+  bool dispatcher_drained  = false;
   size_t retirement_cursor = 0, cleanup_source = 0, cleanup_slot = 0;
   uint64_t retirement_wake = 0;
   bool readers_closed = true, retirement_progress = false;
@@ -277,8 +278,6 @@ struct preparation_coordinator::state {
       // of that gate and never downgrade it during later cleanup.
       reader_stop_reason->request(reason);
       gate->closed = true;
-      for (auto& [key, u] : units)
-        u->cancel_under_gate();
       gate->notify_under_lock();
     }
     // Stop callbacks can reenter; invoke them outside the publication gate.
@@ -320,7 +319,11 @@ struct preparation_coordinator::state {
     --source.outstanding;
     if (source.active_result == index) source.active_result.reset();
     retired_slot retired{std::move(s.input), s.unit};
-    if (s.unit) units.erase(s.unit->key());
+    if (s.unit) {
+      // A worker may settle before the control driver reaches this unit during cancellation.
+      if (gate->closed) s.unit->cancel_under_gate();
+      units.erase(s.unit->key());
+    }
     s.unit.reset();
     s.status    = slot::phase::free;
     s.next_free = free_slot;
@@ -791,6 +794,7 @@ void preparation_coordinator::retire_unit(unit_key k)
   {
     std::lock_guard lock(state_->gate->mutex);
     retired = state_->units.extract(k);
+    if (retired && state_->gate->closed) retired.mapped()->cancel_under_gate();
     state_->gate->notify_under_lock();
   }
 }
@@ -1405,8 +1409,20 @@ preparation_coordinator::state::control_step_result preparation_coordinator::sta
 {
   using next = control_step_result::status;
   if (retirement == retirement_phase::active) {
-    retirement = retirement_phase::metadata;
+    retirement = retirement_phase::cancelling;
     stop(stop_reason::normal_eos);
+  }
+  if (retirement == retirement_phase::cancelling) {
+    std::lock_guard lock(gate->mutex);
+    // Admission is closed. Resume by key because worker settlement can erase units between steps.
+    auto it = cancelled_through ? units.upper_bound(*cancelled_through) : units.begin();
+    for (size_t actions = 0; it != units.end() && actions < options.max_control_work; ++actions) {
+      it->second->cancel_under_gate();
+      cancelled_through = it->first;
+      ++it;
+    }
+    if (it == units.end()) retirement = retirement_phase::metadata;
+    return {next::runnable};
   }
   if (retirement == retirement_phase::metadata) {
     // Only the control driver discards queued work, after the active claim returned.

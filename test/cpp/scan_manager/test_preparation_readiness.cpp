@@ -2202,7 +2202,25 @@ TEST_CASE("Reader close waits for the control driver to finish an active claim",
   auto reader   = std::make_shared<sink>();
   auto metadata = std::make_shared<sink>();
   auto claiming = f.make_hold();
-  auto guard    = f.shutdown_guard();
+  auto unit     = f.coordinator.admit_unit(
+    {124, 1}, required_input_set{}.set(static_cast<size_t>(required_input::visibility)));
+  std::promise<void> stopped, started;
+  auto stop_notified = stopped.get_future().share();
+  auto job_started   = started.get_future();
+  auto guard         = f.shutdown_guard();
+  f.source(std::make_shared<accumulator>(1),
+           std::make_shared<sink>(),
+           [&, claimed = false]() mutable -> preparation_coordinator::claim_result {
+             if (std::exchange(claimed, true)) return preparation_exhausted{};
+             return preparation_coordinator::job{[&](preparation_stop_token stop) {
+                                                   std::stop_callback observer(
+                                                     stop.token(), [&] { stopped.set_value(); });
+                                                   started.set_value();
+                                                   stop_notified.wait();
+                                                   return std::make_unique<tagged>(1);
+                                                 },
+                                                 unit};
+           });
   f.source(
     std::make_shared<accumulator>(1),
     reader,
@@ -2219,7 +2237,14 @@ TEST_CASE("Reader close waits for the control driver to finish an active claim",
   f.coordinator.arm();
   f.coordinator.start();
   REQUIRE(claiming->await());
+  REQUIRE(job_started.wait_for(1s) == std::future_status::ready);
   f.coordinator.request_stop(stop_reason::normal_eos);
+  CHECK(stop_notified.wait_for(0s) == std::future_status::ready);
+  // The driver is still inside claim: worker settlement must cancel the removed unit itself.
+  auto deadline = std::chrono::steady_clock::now() + 1s;
+  while (unit->record().state == unit_state::pending && std::chrono::steady_clock::now() < deadline)
+    std::this_thread::yield();
+  CHECK(unit->record().state == unit_state::cancelled);
   // Pumping Q can dispose returned jobs, but cannot close a reader ahead of the driver.
   f.coordinator.advance();
   CHECK(reader->close_calls == 0);
@@ -3068,6 +3093,8 @@ TEST_CASE("Grouped lanes close their shared output after cancellation and failur
   std::promise<void> provider_closed;
   auto closed = provider_closed.get_future();
   std::atomic<size_t> metadata_closes{0};
+  std::atomic<bool> finish_provider{false};
+  preparation_wakeup wake;
   auto guard = f.shutdown_guard();
   f.start([&] {
     auto metadata        = make_source(preparation_coordinator::execution_domain::metadata_worker);
@@ -3082,8 +3109,10 @@ TEST_CASE("Grouped lanes close their shared output after cancellation and failur
     coalescer->produced  = true;  // This lane supplies no rows.
     auto provider = make_source(preparation_coordinator::execution_domain::query_owner, coalescer);
     provider.destination = out->connector;
-    provider.try_claim   = [] {
-      return preparation_coordinator::claim_result{preparation_exhausted{}};
+    provider.bind_wakeup = [&](preparation_wakeup value) { wake = std::move(value); };
+    provider.try_claim   = [&]() -> preparation_coordinator::claim_result {
+      if (!finish_provider) return preparation_pending{};
+      return preparation_exhausted{};
     };
     provider.close = [&] {
       provider_closed.set_value();
@@ -3096,6 +3125,8 @@ TEST_CASE("Grouped lanes close their shared output after cancellation and failur
     f.coordinator.add_sources(std::move(lanes), [out] { out->close(); });
   });
   REQUIRE(blocked->await());
+  finish_provider = true;
+  wake();
   REQUIRE(closed.wait_for(1s) == std::future_status::ready);
   CHECK_FALSE(out->connector->is_discovery_complete());
   if (mode == ending::cancel) f.coordinator.request_stop(stop_reason::user_cancel);
@@ -3141,18 +3172,36 @@ TEST_CASE("Rejected native group admission closes output without opening readers
   CHECK(reused.size() == 1);
 }
 
-TEST_CASE("Pooled retirement yields between source cleanup actions",
+TEST_CASE("Pooled retirement yields between unit cancellation and source cleanup actions",
           "[scan_preparation][coordinator_pool]")
 {
   coordinator_pool pool(1);
   preparation_options options{1, 4, 1, 1};
   fixture f(1, 4, k_interrupt_check_interval, options, nullptr, &pool);
-  std::atomic<unsigned> closed{0}, observed{0};
+  required_input_set required;
+  required.set(static_cast<size_t>(required_input::checkpoint_iteration));
+  std::vector<std::shared_ptr<preparation_unit>> units;
+  for (unsigned i = 0; i < 8; ++i)
+    units.push_back(f.coordinator.admit_unit({123, i}, required));
+  bool admission_closed = false, input_rejected = false, cancellation_deferred = false;
+  std::atomic<unsigned> closed{0};
+  unsigned observed_closed = 0, observed_cancelled = 0;
   std::promise<void> neighbor_done;
   auto done     = neighbor_done.get_future();
   auto neighbor = pool.add(
     [&] {
-      observed = closed.load();
+      auto cancelled = std::ranges::count_if(
+        units, [](auto const& unit) { return unit->record().state == unit_state::cancelled; });
+      if (cancelled && !observed_cancelled) {
+        observed_cancelled = cancelled;
+        // Retire keys on both sides of the cancellation cursor between control steps.
+        f.coordinator.retire_unit(units.front()->key());
+        f.coordinator.retire_unit(units.back()->key());
+        f.coordinator.request_stop(stop_reason::normal_eos);
+      }
+      auto count = closed.load();
+      if (count && !observed_closed) observed_closed = count;
+      if (count != 8) return coordinator_pool::step_result{coordinator_pool::progress::runnable};
       neighbor_done.set_value();
       return coordinator_pool::step_result{coordinator_pool::progress::finished};
     },
@@ -3172,17 +3221,26 @@ TEST_CASE("Pooled retirement yields between source cleanup actions",
       source.try_claim = []() -> preparation_coordinator::claim_result {
         return preparation_exhausted{};
       };
-      source.close = [&] {
-        if (++closed == 1) neighbor->wake();
-      };
+      source.close = [&] { ++closed; };
       f.register_source(std::move(source), std::make_shared<sink>());
     }
     f.coordinator.request_stop(stop_reason::normal_eos);
+    // Admission and input completion stop immediately, without walking every unit.
+    admission_closed      = !f.coordinator.admit_unit({123, 8}, required);
+    input_rejected        = !units.back()->complete_input(checkpoint_input{1});
+    cancellation_deferred = units.back()->record().state == unit_state::pending;
+    neighbor->wake();
   });
   REQUIRE(done.wait_for(2s) == std::future_status::ready);
   neighbor->wait();
   f.finish();
-  CHECK(observed == 1);
+  CHECK(admission_closed);
+  CHECK(input_rejected);
+  CHECK(cancellation_deferred);
+  CHECK(observed_cancelled == 1);
+  CHECK(observed_closed == 1);
+  for (auto const& unit : units)
+    CHECK(unit->record().state == unit_state::cancelled);
   CHECK(closed == 8);
   CHECK_FALSE(f.completion.has_error());
 }

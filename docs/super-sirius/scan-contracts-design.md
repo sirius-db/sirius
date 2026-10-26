@@ -142,7 +142,7 @@ Native reader slots are shared across queries in a scan manager. An attempt rese
 
 ### Control steps and driver waits
 
-`state::control_step()` performs one bounded turn and returns `runnable`, `parked` with a wake generation and optional deadline, or `retire`. `retire_step()` advances cleanup without waiting for workers: stop and drain metadata, close readers in their execution domains, then release remaining state. Pending stages park until a completion notification arrives. Query-owner, dedicated-thread and pooled drivers use these steps; the driver owns waits and serializes advancement.
+`state::control_step()` performs one bounded turn and returns `runnable`, `parked` with a wake generation and optional deadline, or `retire`. `retire_step()` advances cleanup without waiting for workers: cancel units, stop and drain metadata, close readers in their execution domains, then release remaining state. Pending stages park until a completion notification arrives. Query-owner, dedicated-thread and pooled drivers use these steps; the driver owns waits and serializes advancement.
 
 Before sleeping, the query-owner and dedicated-thread drivers recheck the returned wake generation under the gate; stop also advances that generation. A wake between the step and the wait therefore cannot be lost. A timeout requests another step, which rechecks eligibility; it does not publish directly. Partial-batch deadlines use the coalescer clock; the driver also bounds waits for interrupt checks and the caller's idle limit.
 
@@ -158,9 +158,9 @@ The action limit bounds work count, not hook duration. Adapters used with the sh
 | `prepare_prefetch` | Does not wait for eviction or device progress. It takes cache locks, allocates buffers and invokes ready completion callbacks inline. |
 | Final publication | Readahead registration and connector insertion run under the gate; no arbitrary adapter hooks are allowed there. Their locks and allocations remain part of the step. |
 | Source/output close and released captures | Metadata close and output notifications can run inline. Query-owner/native reader close and accepted-job disposal stay in their assigned execution domain. |
-| Error reporting and retirement | Error observers and stop callbacks run inline. Queue disposal and final cleanup yield between bounded steps; waiting for dispatcher drain or reader close parks the attempt. |
+| Error reporting and retirement | Error observers and stop callbacks run inline. Unit cancellation, queue disposal and final cleanup yield between bounded steps; waiting for dispatcher drain or reader close parks the attempt. |
 
-Retirement keeps one control owner. Each step disposes at most `max_control_work` queued tasks or remaining sources, slots, batches and units before yielding. Waiting for worker completion parks the attempt; unfinished cleanup keeps it runnable. The dispatcher sends one notification after stopped work and its captures drain; reader completion wakes the same driver. The query owner keeps servicing provider operations. `drain()` returns only after final cleanup and completion notifications have returned and control ownership has ended.
+Stop requests immediately close admission and publication and signal running jobs; they do not walk the unit registry. Retirement keeps one control owner and cancels at most `max_control_work` units per step before proceeding to queue disposal and final cleanup, which use the same action limit. A pending unit removed during cancellation is cancelled by its retiring owner before release. Pending unit records may remain pending until their cancellation step, but cannot accept new inputs after the gate closes. Waiting for worker completion parks the attempt; unfinished cleanup keeps it runnable. The dispatcher sends one notification after stopped work and its captures drain; reader completion wakes the same driver. The query owner keeps servicing provider operations. `drain()` returns only after final cleanup and completion notifications have returned and control ownership has ended.
 
 ### Publication and cancellation
 
