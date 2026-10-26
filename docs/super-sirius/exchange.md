@@ -134,7 +134,8 @@ its path to every peer at start.
 | `broadcast` | every row to every rank | |
 | `gather` | every row to one rank | |
 
-Finalizing the sink ends the stream to every rank that may receive it.
+Finalizing the sink ends the stream to every rank that may receive it. A batch with no rows is
+neither routed nor sent, so a range exchange needs no boundaries when no rank has rows.
 
 `EXCHANGE_SOURCE` starts a pipeline with what every expected sender sent:
 
@@ -144,6 +145,12 @@ Finalizing the sink ends the stream to every rank that may receive it.
 - **Unordered,** each batch is a task on arrival.
 - **Ordered,** nothing is released until every sender has ended. Then everything goes out as one
   task, by rank and then send order.
+- **Under `MERGE_AGGREGATE` or `MERGE_TOP_N`** the source ends its own pipeline, as a partial
+  aggregate would, so the merge runs once over every rank's partials.
+- **A stream that brings nothing** still hands on one empty batch, shaped like the stream's
+  batches, as a local producer would: a hash join, for one, waits for a batch on each side. A rank
+  that a gather does not target hands on none, since an aggregate there would make a row of
+  nothing.
 - A failed exchange is the exception of the source's next task.
 
 `exchange_service` is one process's end of every exchange. It holds what arrives for a stream
@@ -162,6 +169,10 @@ arrived. It is used three ways:
 - **The plan-shape check** (below).
 - **The Bloom merge** (below).
 
+`leave_all_gather()` takes part in an all-gather with nothing and returns at once, dropping what
+the others send. A rank that would ignore the gathered tables uses it, so it never waits on a peer
+that may be waiting on it.
+
 ## The plan rewrite
 
 `distribute_plan()` (`src/planner/distributed_plan.cpp`) runs after
@@ -172,15 +183,30 @@ single-process plan already partitions:
 | Plan shape | Exchange |
 |---|---|
 | `HASH_JOIN`, each side `CONCAT → PARTITION → input` | `hash` on that `PARTITION`'s join keys and casts, below it |
+| the same, with a small build side | `broadcast` of the build side; the probe side stays where it is |
+| `NESTED_LOOP_JOIN`, each side `CONCAT → PARTITION → input` | `broadcast` of the build side; the probe side stays where it is |
+| `DENSE_COUNT_JOIN`, each side `PARTITION → input` | `hash` on the join key, both sides |
+| `LEFT/RIGHT_DELIM_JOIN` | `hash` on the delim columns, before the input fans out to the inner join and the `DISTINCT`; `hash` on the inner join's other side |
 | `MERGE_GROUP_BY → PARTITION → HASH_GROUP_BY` | `hash` on the group keys, between `PARTITION` and `HASH_GROUP_BY` |
+| the same, with `COUNT(DISTINCT)` | `hash` on the group keys, below `HASH_GROUP_BY`: partial distinct sets are LIST columns, which the wire does not carry |
 | `MERGE_AGGREGATE → UNGROUPED_AGGREGATE` | `gather` to rank 0, between them |
+| `MERGE_TOP_N → TOP_N` | `gather` to rank 0, between them; a row outside its rank's top N is outside the overall top N |
 | `MERGE_SORT → SORT_PARTITION → SORT_SAMPLE → ORDER_BY` | `range` between `SORT_PARTITION` and a distributed `SORT_SAMPLE` |
 | the result | `gather` to rank 0, ordered after a distributed sort |
 
-`GPU_SCAN`, `FILTER`, `PROJECTION` and `DYNAMIC_FILTER` keep their input's placement. Anything else
-is refused with `not_implemented_exception`: a nested-loop join, `TOP_N`, a CTE, a delim join,
-`COUNT(DISTINCT)` partials, or a join over a gathered input. Running such an operator on each
-rank's share would return a wrong answer.
+`GPU_SCAN`, `FILTER`, `PROJECTION` and `DYNAMIC_FILTER` keep their input's placement. A `CTE`
+places nothing itself: each rank materializes its share, and the `CTE_SCAN`s under the consumer side
+take the materialization's placement. A hash exchange may start from an input on rank 0 alone (a
+gathered scalar): rank 0 sends its rows by key, and the other ranks' copies of it hold none.
+
+A hash join's build side is broadcast when its estimated size is at most 1 GiB and at most the
+probe side's divided by ranks − 1, and when its join type emits build rows only with a probe match.
+A nested-loop join refuses the types that emit unmatched build rows (`RIGHT`, `OUTER`,
+`RIGHT_SEMI`, `RIGHT_ANTI`), since every rank holds the whole build.
+
+Refused with `not_implemented_exception`: a delim join whose join keys are not its delim columns,
+`COUNT(DISTINCT)` with grouping sets, `ORDER BY` on an expression, and any other operator.
+Running such an operator on each rank's share would return a wrong answer.
 
 - **Scan shares.** A table's local parquet files are laid end to end and cut into equal byte
   spans, one per rank (`byte_ranges_for_rank`). A rank reads the row groups whose start offset
@@ -215,7 +241,14 @@ BUILD_FILTER stage in distributed mode, so they publish nothing.
 
 A rank with an empty build still merges, contributing an empty Bloom. A rank
 that never saw a whole build joins each key's all-gather without a filter, so the others drop
-that key at once instead of waiting out the timeout.
+that key at once instead of waiting out the timeout. It does so as soon as its build side ends
+(the build `CONCAT` closes the join's publication), before its probe side runs, and without
+waiting (`leave_all_gather`): a rank holding build rows holds its probe side until the merge
+completes, and that probe side may be what the other rank's probe waits on.
+
+A join whose build is broadcast publishes from its whole build, as on one GPU, with nothing to
+merge. A join that hashes both sides and whose estimated build is under 2^14 rows publishes no
+filters.
 Filters stay optional and the join authoritative, so a missing filter costs speed, never
 correctness.
 
@@ -281,8 +314,8 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
 
 ## Limits
 
-- **Joins:** equality hash joins only. Nested-loop joins, delim joins, CTEs and `TOP_N` are
-  refused rather than run per rank.
+- **Joins:** a nested-loop join that emits unmatched build rows, and a delim join whose join
+  keys are not its delim columns, are refused rather than run per rank.
 - **Remote files:** an S3 table needs at least as many files as there are ranks; local files
   split by byte range have no such limit.
 - **Query start:** every rank must run the same statements in the same order, which is what
