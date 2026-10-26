@@ -125,7 +125,8 @@ duckdb::unique_ptr<sirius_physical_operator> generate_sirius_plan(Connection& co
     plan->ResolveOperatorTypes();
 
     ColumnBindingResolver resolver;
-    ColumnBindingResolver::Verify(*plan);
+    ColumnBindingResolver verifier(true);
+    verifier.VisitOperator(*plan);
     resolver.VisitOperator(*plan);
 
     sirius::planner::sirius_physical_plan_generator gen(context);

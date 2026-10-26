@@ -69,8 +69,8 @@ class AggFilterFixture : public sirius::test::GpuExecutionFixture {
     REQUIRE(cpu_result);
     REQUIRE_FALSE(cpu_result->HasError());
 
-    auto rows     = collect_rows(result->Cast<duckdb::MaterializedQueryResult>());
-    auto cpu_rows = collect_rows(cpu_result->Cast<duckdb::MaterializedQueryResult>());
+    auto rows     = collect_rows(*result);
+    auto cpu_rows = collect_rows(*cpu_result);
     REQUIRE(rows == cpu_rows);
   }
 };
