@@ -356,6 +356,14 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     return join_type == duckdb::JoinType::RIGHT || join_type == duckdb::JoinType::RIGHT_SEMI ||
            join_type == duckdb::JoinType::RIGHT_ANTI;
   }
+
+  /// SINGLE is a LEFT join that keeps one right match per probe row (DuckDB's join for
+  /// correlated scalar subqueries). It shares every LEFT path and adds a dedupe at the output
+  /// tail. Static so the free gather helpers can use it.
+  [[nodiscard]] static bool is_left_like(duckdb::JoinType join_type)
+  {
+    return join_type == duckdb::JoinType::LEFT || join_type == duckdb::JoinType::SINGLE;
+  }
   [[nodiscard]] std::string_view input_port_for(
     sirius_physical_operator const& producer) const override;
   [[nodiscard]] MemoryBarrierType input_barrier_for(

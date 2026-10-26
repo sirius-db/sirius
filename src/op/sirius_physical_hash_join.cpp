@@ -81,13 +81,6 @@ static void collect_reference_indices(sirius::ast::node const& expr,
   sirius::ast::visit_references(expr, [&](auto const& ref) { indices.insert(ref.column_index); });
 }
 
-// SINGLE is a LEFT join that keeps one right match per probe row (DuckDB's join for correlated
-// scalar subqueries). It shares every LEFT path and adds a dedupe at the output tail.
-static bool is_left_like(duckdb::JoinType join_type)
-{
-  return join_type == duckdb::JoinType::LEFT || join_type == duckdb::JoinType::SINGLE;
-}
-
 // Mixed plain/null-safe keys require different null policies, so route the null-safe keys
 // to the conditional predicate. MARK joins cannot use MIXED_JOIN.
 static bool wants_null_safe_routing(duckdb::vector<sirius::join_condition> const& conditions,
@@ -1514,7 +1507,7 @@ static std::unique_ptr<operator_data> gather_join_output_from_maps(
 
   cudf::out_of_bounds_policy left_oob  = cudf::out_of_bounds_policy::DONT_CHECK;
   cudf::out_of_bounds_policy right_oob = cudf::out_of_bounds_policy::DONT_CHECK;
-  if (is_left_like(join_type) || join_type == duckdb::JoinType::OUTER ||
+  if (sirius_physical_hash_join::is_left_like(join_type) || join_type == duckdb::JoinType::OUTER ||
       join_type == duckdb::JoinType::SEMI) {
     right_oob = cudf::out_of_bounds_policy::NULLIFY;
   }
