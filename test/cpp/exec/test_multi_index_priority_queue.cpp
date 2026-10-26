@@ -224,6 +224,26 @@ TEST_CASE("multi_index query index spans its levels", "[multi_index_priority_que
 }
 
 // =============================================================================
+// Per-query drain
+// =============================================================================
+
+TEST_CASE("multi_index drain(query_index) leaves the queue open for later pushes",
+          "[multi_index_priority_queue]")
+{
+  multi_index_priority_queue<payload> q(by_keys());
+  q.push(task(1, keys_of(5, SiriusPhysicalOperatorType::FILTER, /*query=*/7)));
+
+  q.drain(query_index{7});
+
+  // Unlike interrupt(), a per-query drain must not close the queue: other queries keep
+  // producing through it, and the drained query id may even be reused by a later push.
+  REQUIRE(q.is_open());
+  q.push(task(2, keys_of(5, SiriusPhysicalOperatorType::FILTER, /*query=*/8)));
+  REQUIRE(q.size() == 1);
+  REQUIRE(q.pop()->id == 2);
+}
+
+// =============================================================================
 // Cross-index consistency
 // =============================================================================
 
@@ -582,4 +602,29 @@ TEST_CASE("multi_index survives concurrent producers and consumers", "[multi_ind
 
   REQUIRE(consumed.load() == kTotal);
   REQUIRE(q.empty());
+}
+
+TEST_CASE("multi_index drain runs destructors outside its lock", "[multi_index_priority_queue]")
+{
+  struct callback_task {
+    index_keys keys;
+    std::function<void()> on_destroy;
+    ~callback_task()
+    {
+      if (on_destroy) { on_destroy(); }
+    }
+  };
+  multi_index_priority_queue<callback_task> queue([](auto const& task) { return task.keys; });
+  bool destroyed   = false;
+  auto item        = std::make_unique<callback_task>();
+  item->keys       = keys_of(1, SiriusPhysicalOperatorType::FILTER, 7);
+  item->on_destroy = [&] {
+    // Reenter the queue: this deadlocks if disposal still holds its mutex.
+    CHECK(queue.size() == 0);
+    destroyed = true;
+  };
+  queue.push(std::move(item));
+  SECTION("all queries") { queue.drain(); }
+  SECTION("one query") { queue.drain(query_index{7}); }
+  CHECK(destroyed);
 }

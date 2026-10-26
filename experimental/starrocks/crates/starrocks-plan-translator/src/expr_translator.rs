@@ -6,8 +6,9 @@ use substrait::proto::expression::reference_segment;
 use substrait::proto::expression::{self, FieldReference, ReferenceSegment};
 use substrait::proto::{Expression, FunctionArgument, Type, function_argument};
 
-use crate::descriptor_table::DescriptorTable;
+use crate::descriptor_table::SlotKey;
 use crate::error::{Result, TranslateError};
+use crate::row_layout::RowLayout;
 use crate::type_mapper;
 use crate::{
     ExtensionRegistry, URN_ARITHMETIC, URN_BOOLEAN, URN_COMPARISON, URN_DATETIME, URN_STRING,
@@ -15,26 +16,14 @@ use crate::{
 
 /// Mutable state needed while translating one StarRocks expression tree.
 pub(crate) struct ExprContext<'a> {
-    /// Descriptor lookups for slot references and row layouts.
-    desc: &'a DescriptorTable,
     /// Substrait extension registry shared with the enclosing plan translation.
     registry: &'a mut ExtensionRegistry,
-    /// Tuple ids that describe the input row visible to this expression.
-    row_tuples: &'a [i32],
+    layout: &'a RowLayout,
 }
 
 impl<'a> ExprContext<'a> {
-    /// Creates an expression context for a specific input row layout.
-    pub(crate) fn new(
-        desc: &'a DescriptorTable,
-        registry: &'a mut ExtensionRegistry,
-        row_tuples: &'a [i32],
-    ) -> Self {
-        Self {
-            desc,
-            registry,
-            row_tuples,
-        }
+    pub(crate) fn new(registry: &'a mut ExtensionRegistry, layout: &'a RowLayout) -> Self {
+        Self { registry, layout }
     }
 }
 
@@ -129,6 +118,7 @@ fn translate_expr_node(
         TExprNodeType::IN_PRED => translate_in_pred(node, children, ctx),
         TExprNodeType::CASE_EXPR => translate_case(node, children),
         TExprNodeType::FUNCTION_CALL => translate_function_call(node, children, ctx),
+        TExprNodeType::CLONE_EXPR => translate_clone(node, children),
         _ => Err(TranslateError::UnsupportedExpression {
             node_type: node.node_type,
             reason: "expression node is outside the v1 StarRocks slice",
@@ -147,9 +137,9 @@ fn translate_slot_ref(
         context: "SLOT_REF",
         field: "slot_ref",
     })?;
-    let field =
-        ctx.desc
-            .slot_global_index(slot_ref.tuple_id, slot_ref.slot_id, ctx.row_tuples)? as i32;
+    let field = ctx
+        .layout
+        .resolve(SlotKey::new(slot_ref.tuple_id, slot_ref.slot_id))? as i32;
     Ok(Expression {
         rex_type: Some(expression::RexType::Selection(Box::new(FieldReference {
             reference_type: Some(field_reference::ReferenceType::DirectReference(
@@ -255,19 +245,27 @@ fn translate_decimal_literal(node: &TExprNode, children: Vec<Expression>) -> Res
             field: "decimal_literal",
         })?;
     let decimal_type = type_mapper::map_type_desc(&node.type_, true)?;
-    let Some(substrait::proto::r#type::Kind::Decimal(decimal)) = decimal_type.kind else {
-        return Err(TranslateError::malformed(
-            "DECIMAL_LITERAL has non-decimal type",
-        ));
-    };
-    let value = encode_decimal(&lit.value, decimal.scale)?;
-    Ok(literal(expression::literal::LiteralType::Decimal(
-        expression::literal::Decimal {
-            value: value.to_vec(),
-            precision: decimal.precision,
-            scale: decimal.scale,
-        },
-    )))
+    match decimal_type.kind {
+        Some(substrait::proto::r#type::Kind::Decimal(decimal)) => {
+            let value = encode_decimal(&lit.value, decimal.scale)?;
+            Ok(literal(expression::literal::LiteralType::Decimal(
+                expression::literal::Decimal {
+                    value: value.to_vec(),
+                    precision: decimal.precision,
+                    scale: decimal.scale,
+                },
+            )))
+        }
+        Some(substrait::proto::r#type::Kind::Fp64(_)) => {
+            let value = lit.value.parse::<f64>().map_err(|_| {
+                TranslateError::malformed(format!("invalid decimal literal {:?}", lit.value))
+            })?;
+            Ok(literal(expression::literal::LiteralType::Fp64(value)))
+        }
+        _ => Err(TranslateError::malformed(
+            "DECIMAL_LITERAL has non-numeric type",
+        )),
+    }
 }
 
 /// Converts a StarRocks `DATE_LITERAL` into a Substrait date literal.
@@ -346,16 +344,35 @@ fn translate_arithmetic(
         }
     };
     expect_child_count(node, &children, 2)?;
-    // Decimal-typed arithmetic is rejected for now: the StarRocks-shaped cast/width combination
-    // reliably segfaults the engine's GPU projection (see the starrocks tpch crash repro);
-    // fail with a structured error instead of taking down the compute node.
-    if is_decimal(&node.type_)? {
-        return Err(TranslateError::UnsupportedExpression {
-            node_type: node.node_type,
-            reason: "decimal arithmetic is not supported yet (crashes the engine projection)",
-        });
-    }
-    let output_type = type_mapper::map_type_desc(&node.type_, node.is_nullable.unwrap_or(true))?;
+    // Decimal arithmetic is evaluated in FP64: the Sirius GPU expression path cannot consume
+    // decimal arithmetic, and refusing it instead -- which is what this replaced -- rejects every
+    // TPC-H revenue query. The result is approximate and is NOT cast back: a project's output slot
+    // may be declared DECIMAL while the expression yields FP64. The emitted `Cast` and
+    // `ScalarFunction` nodes do carry the FP64 type; the mismatch is with anything that derives a
+    // row's schema from the frontend's slot types instead (a stream receiver, the result
+    // encoding), which still expects DECIMAL -- tracked in #1687. Sums of money columns therefore
+    // differ from StarRocks in the last few digits (~1e-14 relative) and render as a double. A
+    // decimal-native GPU path is the real fix.
+    let decimal = is_decimal(&node.type_)?;
+    let children = if decimal {
+        children
+            .into_iter()
+            .map(|input| Expression {
+                rex_type: Some(expression::RexType::Cast(Box::new(expression::Cast {
+                    r#type: Some(type_mapper::fp64_type(true)),
+                    input: Some(Box::new(input)),
+                    failure_behavior: expression::cast::FailureBehavior::ThrowException as i32,
+                }))),
+            })
+            .collect()
+    } else {
+        children
+    };
+    let output_type = if decimal {
+        type_mapper::fp64_type(node.is_nullable.unwrap_or(true))
+    } else {
+        type_mapper::map_type_desc(&node.type_, node.is_nullable.unwrap_or(true))?
+    };
     let anchor = ctx.registry.register_function(URN_ARITHMETIC, name);
     Ok(scalar_function(anchor, children, output_type))
 }
@@ -441,10 +458,7 @@ fn translate_case(node: &TExprNode, children: Vec<Expression>) -> Result<Express
         None
     };
     let mut ifs = Vec::new();
-    loop {
-        let Some(condition) = children.next() else {
-            break;
-        };
+    while let Some(condition) = children.next() {
         let then = children
             .next()
             .ok_or_else(|| TranslateError::malformed("CASE_EXPR when without then"))?;
@@ -470,6 +484,12 @@ fn translate_case(node: &TExprNode, children: Vec<Expression>) -> Result<Express
     })
 }
 
+/// Unwraps a StarRocks `CLONE_EXPR`, which the FE inserts when two slots share one column.
+fn translate_clone(node: &TExprNode, children: Vec<Expression>) -> Result<Expression> {
+    expect_child_count(node, &children, 1)?;
+    Ok(children.into_iter().next().unwrap())
+}
+
 /// Converts a StarRocks `FUNCTION_CALL` into a Substrait expression.
 ///
 /// Functions are allowlisted so an unknown StarRocks builtin fails loudly instead of silently
@@ -487,14 +507,16 @@ fn translate_function_call(
     let output_type = type_mapper::map_type_desc(&node.type_, node.is_nullable.unwrap_or(true))?;
 
     // Null checks the frontend planned as builtin calls rather than IS_NULL_PRED nodes.
-    let (urn, mapped) = match name {
+    // `widens_to_bigint`: DuckDB returns BIGINT where the FE slot is narrower (year SMALLINT,
+    // month/day TINYINT, length INT), so the result is cast back for the next hop's schema.
+    let (urn, mapped, widens_to_bigint) = match name {
         "is_null_pred" => {
             expect_child_count(node, &children, 1)?;
-            (URN_COMPARISON, "is_null")
+            (URN_COMPARISON, "is_null", false)
         }
         "is_not_null_pred" => {
             expect_child_count(node, &children, 1)?;
-            (URN_COMPARISON, "is_not_null")
+            (URN_COMPARISON, "is_not_null", false)
         }
         "if" => {
             expect_child_count(node, &children, 3)?;
@@ -525,7 +547,7 @@ fn translate_function_call(
                     });
                 }
             }
-            (URN_STRING, "like")
+            (URN_STRING, "like", false)
         }
         "substring" | "substr" => {
             // The GPU evaluator supports exactly `substring(col, start, length)` with constant,
@@ -543,17 +565,17 @@ fn translate_function_call(
                     reason: "substring requires constant positive start and length",
                 });
             }
-            (URN_STRING, "substring")
+            (URN_STRING, "substring", false)
         }
         // StarRocks `length` counts bytes; `octet_length` remaps to DuckDB's byte-length
         // (`strlen`), while `char_length` keeps codepoint semantics on both sides.
-        "length" => (URN_STRING, "octet_length"),
-        "char_length" => (URN_STRING, "char_length"),
+        "length" => (URN_STRING, "octet_length", true),
+        "char_length" => (URN_STRING, "char_length", true),
         // `concat` is intentionally absent: StarRocks concat is NULL-strict while DuckDB's
         // ignores NULL arguments, so a name-level mapping would change results. Other string
         // and math builtins (upper/lower/trim/abs/floor/...) are absent because the GPU
         // expression evaluator has no implementations for them yet.
-        "year" | "month" | "day" => (URN_DATETIME, name),
+        "year" | "month" | "day" => (URN_DATETIME, name, true),
         _ => {
             return Err(TranslateError::malformed(format!(
                 "unsupported StarRocks function call {name:?}"
@@ -561,6 +583,16 @@ fn translate_function_call(
         }
     };
     let anchor = ctx.registry.register_function(urn, mapped);
+    if widens_to_bigint {
+        let produced = type_mapper::i64_type(node.is_nullable.unwrap_or(true));
+        return Ok(Expression {
+            rex_type: Some(expression::RexType::Cast(Box::new(expression::Cast {
+                r#type: Some(output_type),
+                input: Some(Box::new(scalar_function(anchor, children, produced))),
+                failure_behavior: expression::cast::FailureBehavior::ThrowException as i32,
+            }))),
+        });
+    }
     Ok(scalar_function(anchor, children, output_type))
 }
 
@@ -589,6 +621,95 @@ fn integer_literal_value(expr: &Expression) -> Option<i64> {
         },
         _ => None,
     }
+}
+
+/// A StarRocks aggregate call decomposed for Substrait `AggregateRel` measures.
+pub(crate) struct AggregateCall {
+    /// Substrait/DuckDB aggregate function name.
+    pub name: String,
+    /// Translated argument expressions over the aggregation input row.
+    pub arguments: Vec<Expression>,
+    /// Whether the aggregate applies to distinct inputs.
+    pub distinct: bool,
+}
+
+/// Decomposes a StarRocks aggregate-function expression (the root of a
+/// `TAggregationNode::aggregate_functions` entry) into name, arguments, and distinct-ness.
+pub(crate) fn aggregate_call(expr: &TExpr, ctx: &mut ExprContext<'_>) -> Result<AggregateCall> {
+    let root = expr
+        .nodes
+        .first()
+        .ok_or_else(|| TranslateError::malformed("aggregate function TExpr is empty"))?;
+    let is_aggregate_root = matches!(
+        root.node_type,
+        TExprNodeType::AGG_EXPR | TExprNodeType::FUNCTION_CALL
+    ) && root.agg_expr.is_some();
+    if !is_aggregate_root {
+        return Err(TranslateError::UnsupportedExpression {
+            node_type: root.node_type,
+            reason: "aggregate function root is not an aggregate expression",
+        });
+    }
+    let function = root.fn_.as_ref().ok_or(TranslateError::MissingField {
+        context: "aggregate expression",
+        field: "fn",
+    })?;
+    // `multi_distinct_sum` is intentionally absent: the GPU grouped-aggregate path only
+    // honors DISTINCT for count and would silently overcount a distinct sum.
+    let (name, distinct) = match function.name.function_name.as_str() {
+        name @ ("sum" | "count" | "min" | "max" | "avg") => (name, false),
+        "multi_distinct_count" => ("count", true),
+        name => {
+            return Err(TranslateError::malformed(format!(
+                "unsupported StarRocks aggregate function {name:?}"
+            )));
+        }
+    };
+    // Multi-column COUNT(DISTINCT a, b) needs key packing the executor does not do here.
+    if distinct && root.num_children != 1 {
+        return Err(TranslateError::UnsupportedExpression {
+            node_type: root.node_type,
+            reason: "distinct aggregates over multiple columns are not supported",
+        });
+    }
+    let return_primitive = type_mapper::scalar_primitive(&function.ret_type)?;
+    let decimal_result = is_decimal(&function.ret_type)?;
+    // Decimal SUM/AVG are lowered to FP64 below because the Sirius GPU expression/aggregate
+    // path cannot consume decimal arithmetic; every other avg return type (temporal avg's
+    // StarRocks-specific rounding, in particular) has no GPU lowering.
+    if name == "avg" && return_primitive != TPrimitiveType::DOUBLE && !decimal_result {
+        return Err(TranslateError::UnsupportedExpression {
+            node_type: root.node_type,
+            reason: "avg is only supported where it lowers to the GPU's FP64 avg \
+                     (DOUBLE and DECIMAL inputs)",
+        });
+    }
+
+    let mut cursor = ExprNodeCursor::new(&expr.nodes);
+    // Consume the root marker; its children are the aggregate arguments.
+    cursor.idx = 1;
+    let mut arguments = (0..root.num_children)
+        .map(|_| cursor.translate_next(ctx))
+        .collect::<Result<Vec<_>>>()?;
+    cursor.ensure_consumed()?;
+    if decimal_result && matches!(name, "sum" | "avg") {
+        arguments = arguments
+            .into_iter()
+            .map(|input| Expression {
+                rex_type: Some(expression::RexType::Cast(Box::new(expression::Cast {
+                    r#type: Some(type_mapper::fp64_type(true)),
+                    input: Some(Box::new(input)),
+                    failure_behavior: expression::cast::FailureBehavior::ThrowException as i32,
+                }))),
+            })
+            .collect();
+    }
+
+    Ok(AggregateCall {
+        name: name.to_string(),
+        arguments,
+        distinct,
+    })
 }
 
 /// Converts supported comparison opcodes into Substrait comparison functions.

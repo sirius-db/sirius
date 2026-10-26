@@ -20,8 +20,11 @@
 #include "data/data_batch_utils.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/aggregate/gpu_aggregate_impl.hpp"
+#include "op/aggregate/wide_integer_sum.hpp"
+#include "telemetry/nvtx.hpp"
 
-#include <nvtx3/nvtx3.hpp>
+#include <algorithm>
+#include <functional>
 
 namespace sirius {
 namespace op {
@@ -42,40 +45,68 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
 {
 }
 
-// expressions is the list of aggregates to be computed. Each aggregates has a bound_ref expression
-// to a column groups_p is the list of group by columns. Each group by column is a bound_ref
-// expression to a column grouping_sets_p is the list of grouping set. Each grouping set is a set of
-// indexes to the group by columns. Seems like DuckDB group the groupby columns into several sets
-// and for every grouping set there is one radix_table grouping_functions_p is a list of indexes to
-// the groupby expressions (groups_p) for each grouping_sets. The first level of the vector is the
-// grouping set and the second level is the indexes to the groupby expression for that set.
+// The parameters for `SELECT a, b, sum(v), GROUPING(a) ... GROUP BY ROLLUP(a, b)`:
+// - expressions: the aggregates, each over bound_ref expressions to its input columns.
+//   Here `sum(v)`
+// - groups_p: the group by keys, each a bound_ref expression. Here `a` and `b`
+// - grouping_sets_p: the grouping sets, each a set of positions in groups_p.
+//   Here `{0, 1}`, `{0}` and `{}`. A plain GROUP BY has one set with all keys
+// - grouping_functions_p: the GROUPING() functions, each the list of its arguments as
+//   positions in groups_p. Here `[0]`. Empty when the query has no GROUPING()
 sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
   duckdb::vector<sirius::logical_type> types,
   duckdb::vector<std::unique_ptr<sirius::ast::node>> expressions,
   duckdb::vector<std::unique_ptr<sirius::ast::node>> groups_p,
   duckdb::vector<duckdb::GroupingSet> grouping_sets_p,
-  duckdb::vector<duckdb::unsafe_vector<std::size_t>> grouping_functions_p,
+  duckdb::vector<duckdb::unsafe_vector<duckdb::ProjectionIndex>> grouping_functions_p,
   std::size_t estimated_cardinality,
   duckdb::TupleDataValidityType /*group_validity*/,
-  duckdb::TupleDataValidityType /*distinct_validity*/)
+  duckdb::TupleDataValidityType /*distinct_validity*/,
+  std::vector<std::optional<std::uint64_t>> aggregate_input_max_abs)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::HASH_GROUP_BY, std::move(types), estimated_cardinality),
     grouping_sets(std::move(grouping_sets_p))
 {
+  for (auto const& set : grouping_sets) {
+    grouping_set_keys.emplace_back(set.begin(), set.end());
+  }
+  for (auto const& function : grouping_functions_p) {
+    grouping_functions.emplace_back(function.begin(), function.end());
+  }
   auto cudf_defs                    = convert_duckdb_aggregates_to_cudf(groups_p, expressions);
   group_idx                         = std::move(cudf_defs.group_idx);
   cudf_aggregates                   = std::move(cudf_defs.cudf_aggregates);
   cudf_aggregate_idx                = std::move(cudf_defs.cudf_aggregate_idx);
   cudf_aggregate_struct_col_indices = std::move(cudf_defs.cudf_aggregate_struct_col_indices);
   aggregate_slots                   = std::move(cudf_defs.aggregate_slots);
+  local_types                       = std::move(cudf_defs.local_types);
   has_avg                           = cudf_defs.has_avg;
   has_count_distinct                = cudf_defs.has_count_distinct;
+  // Grouping-set expansion inserts the set id and GROUPING() values before the partial
+  // aggregate carriers. Keep their types from the planner's final schema; AVG may expand
+  // the aggregate suffix, and STDDEV_SAMP / COUNT(DISTINCT) replace its scalar carriers.
+  if (has_grouping_sets()) {
+    auto const keys_end   = static_cast<std::ptrdiff_t>(group_idx.size());
+    auto const groups_end = static_cast<std::ptrdiff_t>(num_output_group_columns());
+    local_types.insert(local_types.begin() + keys_end,
+                       this->types.begin() + keys_end,
+                       this->types.begin() + groups_end);
+  }
+  // A bound belongs to the aggregate's SUM slot; AVG's COUNT_VALID slot (cudf_idx + 1) needs none.
+  cudf_aggregate_input_max_abs.assign(cudf_aggregates.size(), std::nullopt);
+  for (size_t i = 0; i < aggregate_slots.size() && i < aggregate_input_max_abs.size(); ++i) {
+    if (aggregate_input_max_abs[i] && !aggregate_slots[i].is_count_distinct) {
+      cudf_aggregate_input_max_abs[aggregate_slots[i].cudf_idx] = aggregate_input_max_abs[i];
+    }
+  }
+  cudf_aggregate_is_wide_integer_sum =
+    wide_integer_sum_mask(aggregate_slots, cudf_aggregates.size());
 }
 
 duckdb::vector<sirius::logical_type>
 sirius_physical_grouped_aggregate::get_count_distinct_local_output_types() const
 {
-  auto const aggregate_offset = group_idx.size();
+  auto const aggregate_offset = num_output_group_columns();
   if (!has_count_distinct || has_avg || types.size() != aggregate_offset + aggregate_slots.size()) {
     throw std::runtime_error(
       "COUNT(DISTINCT) local schema requires a non-AVG one-slot-per-aggregate layout");
@@ -90,16 +121,54 @@ sirius_physical_grouped_aggregate::get_count_distinct_local_output_types() const
   return local_types;
 }
 
-std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
-  const operator_data& input_data, rmm::cuda_stream_view stream)
+bool sirius_physical_grouped_aggregate::has_stddev_samp() const
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_grouped_aggregate::execute"};
+  return std::ranges::any_of(aggregate_slots, [](auto const& slot) { return slot.is_stddev_samp; });
+}
+
+std::vector<std::optional<cudf::data_type>>
+sirius_physical_grouped_aggregate::wide_integer_sum_partial_types() const
+{
+  auto const aggregate_offset = num_output_group_columns();
+  if (std::ranges::none_of(cudf_aggregate_is_wide_integer_sum, std::identity{}) ||
+      types.size() != aggregate_offset + cudf_aggregates.size()) {
+    return {};
+  }
+  std::vector<std::optional<cudf::data_type>> alternates(types.size());
+  for (size_t i = 0; i < cudf_aggregate_is_wide_integer_sum.size(); ++i) {
+    if (cudf_aggregate_is_wide_integer_sum[i]) {
+      alternates[aggregate_offset + i] = wide_integer_sum_type();
+    }
+  }
+  return alternates;
+}
+
+std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
+  const operator_data& input_data, ::cuda::stream_ref stream)
+{
+  nvtx_scoped_range nvtx_range{"sirius_physical_grouped_aggregate::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
   std::vector<std::shared_ptr<::cucascade::data_batch>> results;
   for (auto const& input_batch : input_batches) {
     auto* space = input_batch.get_memory_space();
     if (!space) { continue; }
+    if (has_grouping_sets()) {
+      results.push_back(
+        gpu_aggregate_impl::local_grouping_sets_aggregate(input_batch,
+                                                          group_idx,
+                                                          cudf_aggregates,
+                                                          cudf_aggregate_idx,
+                                                          cudf_aggregate_struct_col_indices,
+                                                          grouping_set_keys,
+                                                          grouping_functions,
+                                                          stream,
+                                                          *space,
+                                                          batch_telemetry(),
+                                                          cudf_aggregate_input_max_abs,
+                                                          cudf_aggregate_is_wide_integer_sum));
+      continue;
+    }
     auto result = gpu_aggregate_impl::local_grouped_aggregate(input_batch,
                                                               group_idx,
                                                               cudf_aggregates,
@@ -107,7 +176,9 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
                                                               cudf_aggregate_struct_col_indices,
                                                               stream,
                                                               *space,
-                                                              batch_telemetry());
+                                                              batch_telemetry(),
+                                                              cudf_aggregate_input_max_abs,
+                                                              cudf_aggregate_is_wide_integer_sum);
     results.push_back(std::move(result));
   }
   return std::make_unique<pipelineable_operator_data>(results);

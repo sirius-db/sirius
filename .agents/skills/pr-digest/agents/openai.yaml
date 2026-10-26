@@ -1,0 +1,4 @@
+interface:
+  display_name: "PR Digest"
+  short_description: "Create a navigable learning digest for a GitHub PR"
+  default_prompt: "Use $pr-digest to explain this GitHub pull request in a navigable learning digest."

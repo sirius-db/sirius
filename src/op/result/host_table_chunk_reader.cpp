@@ -25,9 +25,15 @@
 
 // duckdb
 #include <duckdb/common/types/decimal.hpp>
+#include <duckdb/common/vector/array_vector.hpp>
+#include <duckdb/common/vector/flat_vector.hpp>
+#include <duckdb/common/vector/list_vector.hpp>
+#include <duckdb/common/vector/string_vector.hpp>
+#include <duckdb/common/vector/struct_vector.hpp>
 #include <duckdb/common/vector_operations/vector_operations.hpp>
 #include <duckdb/common/vector_size.hpp>
 #include <duckdb/main/client_context.hpp>
+#include <duckdb/storage/arena_allocator.hpp>
 
 // standard library
 #include <algorithm>
@@ -152,12 +158,12 @@ void host_table_chunk_reader::column_reader::copy_fixed_width(
   // by copying into a temp vector and using DuckDB's cast.
   auto const type_size =
     static_cast<size_t>(duckdb::GetTypeIdSize(vector.GetType().InternalType()));
-  auto* dest_ptr = duckdb::FlatVector::GetData(vector);
+  auto* dest_ptr = duckdb::FlatVector::GetDataMutable(vector);
   data_accessor.memcpy_to(allocation, dest_ptr, count * type_size);
 
   // Do the validity mask copy, if necessary
   if (null_count != 0) {
-    auto& validity = duckdb::FlatVector::Validity(vector);
+    auto& validity = duckdb::FlatVector::ValidityMutable(vector);
     copy_validity_range(validity, row_offset, count, allocation);
   }
 }
@@ -173,7 +179,7 @@ void make_duckdb_strings(memory::multiple_blocks_allocation_accessor<OffsetType>
                          size_t end_offset,
                          duckdb::data_ptr_t str_buffer_ptr)
 {
-  auto* strings = duckdb::FlatVector::GetData<duckdb::string_t>(vector);
+  auto* strings = duckdb::FlatVector::GetDataMutable<duckdb::string_t>(vector);
   size_t start  = start_offset;
   offset_accessor.advance();
   size_t offset_counter = 0;
@@ -230,40 +236,36 @@ void host_table_chunk_reader::column_reader::copy_string(
     auto start_offset           = offset_accessor_64.get_current(allocation);
     auto end_offset             = offset_accessor_64.get(row_offset + count, allocation);
     auto const total_data_bytes = end_offset - start_offset;
-    auto str_buffer             = duckdb::make_buffer<duckdb::VectorBuffer>(total_data_bytes);
-    auto str_buffer_ptr         = str_buffer->GetData();
+    auto str_buffer_ptr =
+      duckdb::StringVector::GetStringAllocator(vector).Allocate(total_data_bytes);
     data_accessor.memcpy_to(allocation, str_buffer_ptr, total_data_bytes);
 
     if (null_count != 0) {
-      auto& validity = duckdb::FlatVector::Validity(vector);
+      auto& validity = duckdb::FlatVector::ValidityMutable(vector);
       copy_validity_range(validity, row_offset, count, allocation);
       detail::make_duckdb_strings<true, int64_t>(
         offset_accessor_64, allocation, vector, count, start_offset, end_offset, str_buffer_ptr);
-      duckdb::StringVector::AddBuffer(vector, str_buffer);
     } else {
       detail::make_duckdb_strings<false, int64_t>(
         offset_accessor_64, allocation, vector, count, start_offset, end_offset, str_buffer_ptr);
-      duckdb::StringVector::AddBuffer(vector, str_buffer);
     }
   } else {
     // INT32 offsets (from scan task)
     auto start_offset = static_cast<size_t>(offset_accessor_32.get_current(allocation));
     auto end_offset   = static_cast<size_t>(offset_accessor_32.get(row_offset + count, allocation));
     auto const total_data_bytes = end_offset - start_offset;
-    auto str_buffer             = duckdb::make_buffer<duckdb::VectorBuffer>(total_data_bytes);
-    auto str_buffer_ptr         = str_buffer->GetData();
+    auto str_buffer_ptr =
+      duckdb::StringVector::GetStringAllocator(vector).Allocate(total_data_bytes);
     data_accessor.memcpy_to(allocation, str_buffer_ptr, total_data_bytes);
 
     if (null_count != 0) {
-      auto& validity = duckdb::FlatVector::Validity(vector);
+      auto& validity = duckdb::FlatVector::ValidityMutable(vector);
       copy_validity_range(validity, row_offset, count, allocation);
       detail::make_duckdb_strings<true, int32_t>(
         offset_accessor_32, allocation, vector, count, start_offset, end_offset, str_buffer_ptr);
-      duckdb::StringVector::AddBuffer(vector, str_buffer);
     } else {
       detail::make_duckdb_strings<false, int32_t>(
         offset_accessor_32, allocation, vector, count, start_offset, end_offset, str_buffer_ptr);
-      duckdb::StringVector::AddBuffer(vector, str_buffer);
     }
   }
 }
@@ -283,25 +285,86 @@ void host_table_chunk_reader::column_reader::copy_array(
   child_vec.SetVectorType(duckdb::VectorType::FLAT_VECTOR);
   auto const child_width =
     static_cast<size_t>(duckdb::GetTypeIdSize(child_vec.GetType().InternalType()));
-  auto* child_dest = duckdb::FlatVector::GetData(child_vec);
-  data_accessor.memcpy_to(allocation, child_dest, count * array_size * child_width);
+  auto* child_dest = duckdb::FlatVector::GetDataMutable(child_vec);
+
+  // The values child is normally fixed-stride, but a gather/sort of a column that holds
+  // NULL arrays (e.g. ORDER BY) compacts the NULL rows' children out, leaving a
+  // shorter, offset-addressed child. Read the LIST offsets to tell the two apart.
+  auto const offset_at = [this, &allocation](size_t idx) -> int64_t {
+    return use_int64_offsets ? offset_accessor_64.get(idx, allocation)
+                             : static_cast<int64_t>(offset_accessor_32.get(idx, allocation));
+  };
+  int64_t const base     = offset_at(row_offset);
+  auto const total_child = static_cast<size_t>(offset_at(row_offset + count) - base);
+
+  if (total_child == count * array_size) {
+    // Fast path: no compaction, every row still owns array_size children in
+    // order, so a single bulk copy reproduces the row-major layout.
+    data_accessor.memcpy_to(allocation, child_dest, count * array_size * child_width);
+
+    // Element-level validity maps straight onto the child vector validity. The
+    // source bits start at absolute child index's base (earlier windows may have
+    // dropped NULL rows' children, so the base is not row_offset*array_size), so
+    // seek there rather than trusting a running cursor the slow path never
+    // advances. Bulk-copy when byte-aligned, else read the shifted bits directly.
+    if (child_null_count != 0) {
+      auto const child_count = count * array_size;
+      auto& child_validity   = duckdb::FlatVector::ValidityMutable(child_vec);
+      child_validity.Initialize(child_count);
+      if (static_cast<size_t>(base) % 8 == 0) {
+        auto* child_validity_ptr = reinterpret_cast<uint8_t*>(child_validity.GetData());
+        child_mask_accessor.set_cursor(child_mask_accessor.initial_byte_offset +
+                                       static_cast<size_t>(base) / 8);
+        child_mask_accessor.memcpy_to(
+          allocation, child_validity_ptr, utils::ceil_div_8(child_count));
+      } else {
+        for (size_t e = 0; e < child_count; ++e) {
+          size_t const abs_bit   = static_cast<size_t>(base) + e;
+          uint8_t const src_byte = child_mask_accessor.get(abs_bit / 8, allocation);
+          if (((static_cast<unsigned>(src_byte) >> (abs_bit % 8)) & 1U) == 0U) {
+            child_validity.SetInvalid(e);
+          }
+        }
+      }
+    }
+  } else {
+    // Slow path: the child is compacted. Scatter each row's children (length
+    // offsets[i+1]-offsets[i], i.e. array_size for a present array or 0 for a
+    // NULL array) from the sequential child cursor into its fixed-stride slot.
+    // NULL rows leave their child slots untouched, masked by the list-level
+    // validity below.
+    auto& child_validity = duckdb::FlatVector::ValidityMutable(child_vec);
+    if (child_null_count != 0) { child_validity.Initialize(count * array_size); }
+    for (size_t i = 0; i < count; ++i) {
+      int64_t const lo = offset_at(row_offset + i);
+      int64_t const hi = offset_at(row_offset + i + 1);
+      auto const len   = static_cast<size_t>(hi - lo);
+      if (len == 0) { continue; }  // NULL array row: nothing to place
+      data_accessor.memcpy_to(
+        allocation, child_dest + i * array_size * child_width, len * child_width);
+      // Element-level validity: source bits are laid out over the compacted
+      // child (absolute index = offset), so read them bit-by-bit (arbitrary
+      // alignment) and map onto the fixed-stride destination slot. Fetch each
+      // mask byte once and reuse it across the 8 bits it covers.
+      if (child_null_count != 0) {
+        uint8_t src_byte = 0;
+        for (size_t j = 0; j < len; ++j) {
+          size_t const abs_bit = static_cast<size_t>(lo) + j;
+          if (j == 0 || abs_bit % 8 == 0) {
+            src_byte = child_mask_accessor.get(abs_bit / 8, allocation);
+          }
+          if (((static_cast<unsigned>(src_byte) >> (abs_bit % 8)) & 1U) == 0U) {
+            child_validity.SetInvalid(i * array_size + j);
+          }
+        }
+      }
+    }
+  }
 
   // List-level validity
   if (null_count != 0) {
-    auto& validity = duckdb::FlatVector::Validity(vector);
+    auto& validity = duckdb::FlatVector::ValidityMutable(vector);
     copy_validity_range(validity, row_offset, count, allocation);
-  }
-
-  // Element-level validity: the values child has count*array_size elements
-  // laid out row-major, so its null mask maps straight onto the array's
-  // child vector validity.
-  if (child_null_count != 0) {
-    auto const child_count = count * array_size;
-    assert(utils::mod_8(row_offset * array_size) == 0);  // byte-aligned start
-    auto& child_validity = duckdb::FlatVector::Validity(child_vec);
-    child_validity.Initialize(child_count);
-    auto* child_validity_ptr = reinterpret_cast<uint8_t*>(child_validity.GetData());
-    child_mask_accessor.memcpy_to(allocation, child_validity_ptr, utils::ceil_div_8(child_count));
   }
 }
 
@@ -362,8 +425,8 @@ host_table_chunk_reader::host_table_chunk_reader(
   }
 }
 
-/// Map a cudf data_type to the DuckDB LogicalType with the same physical storage size.
-/// Used to create temp vectors for type-widening casts.
+/// Map a cudf data_type to the DuckDB LogicalType with the same physical storage.
+/// Used to create temp vectors for type-widening / unit-converting casts.
 static duckdb::LogicalType cudf_type_to_duckdb(cudf::data_type type)
 {
   switch (type.id()) {
@@ -377,6 +440,12 @@ static duckdb::LogicalType cudf_type_to_duckdb(cudf::data_type type)
     case cudf::type_id::UINT64: return duckdb::LogicalType::UBIGINT;
     case cudf::type_id::FLOAT32: return duckdb::LogicalType::FLOAT;
     case cudf::type_id::FLOAT64: return duckdb::LogicalType::DOUBLE;
+    case cudf::type_id::BOOL8: return duckdb::LogicalType::BOOLEAN;
+    case cudf::type_id::TIMESTAMP_DAYS: return duckdb::LogicalType::DATE;
+    case cudf::type_id::TIMESTAMP_SECONDS: return duckdb::LogicalType::TIMESTAMP_S;
+    case cudf::type_id::TIMESTAMP_MILLISECONDS: return duckdb::LogicalType::TIMESTAMP_MS;
+    case cudf::type_id::TIMESTAMP_MICROSECONDS: return duckdb::LogicalType::TIMESTAMP;
+    case cudf::type_id::TIMESTAMP_NANOSECONDS: return duckdb::LogicalType::TIMESTAMP_NS;
     case cudf::type_id::DECIMAL32:
       return duckdb::LogicalType::DECIMAL(duckdb::Decimal::MAX_WIDTH_INT32,
                                           static_cast<uint8_t>(-type.scale()));
@@ -405,9 +474,10 @@ void host_table_chunk_reader::column_reader::read_into(
       auto& entries = duckdb::StructVector::GetEntries(vector);
       assert(entries.size() == children.size());
       for (size_t f = 0; f < children.size(); ++f) {
-        children[f].read_into(client_ctx, *entries[f], row_offset, count, allocation);
+        children[f].read_into(client_ctx, entries[f], row_offset, count, allocation);
       }
-      copy_validity_range(duckdb::FlatVector::Validity(vector), row_offset, count, allocation);
+      copy_validity_range(
+        duckdb::FlatVector::ValidityMutable(vector), row_offset, count, allocation);
       break;
     }
     case cudf::type_id::LIST: {
@@ -421,14 +491,15 @@ void host_table_chunk_reader::column_reader::read_into(
                                  : static_cast<int64_t>(offset_accessor_32.get(idx, allocation));
       };
       int64_t const base = offset_at(row_offset);
-      auto* list_entries = duckdb::ListVector::GetData(vector);
+      auto* list_entries = duckdb::FlatVector::GetDataMutable<duckdb::list_entry_t>(vector);
       for (size_t i = 0; i < count; ++i) {
         int64_t const lo       = offset_at(row_offset + i);
         int64_t const hi       = offset_at(row_offset + i + 1);
         list_entries[i].offset = static_cast<uint64_t>(lo - base);
         list_entries[i].length = static_cast<uint64_t>(hi - lo);
       }
-      copy_validity_range(duckdb::FlatVector::Validity(vector), row_offset, count, allocation);
+      copy_validity_range(
+        duckdb::FlatVector::ValidityMutable(vector), row_offset, count, allocation);
 
       auto const child_count = static_cast<size_t>(offset_at(row_offset + count) - base);
       duckdb::ListVector::Reserve(vector, child_count);
@@ -449,8 +520,9 @@ void host_table_chunk_reader::column_reader::read_into(
     default: {
       // Fixed-width leaf, possibly type-widened — mirrors get_next_chunk().
       auto const src_type = cudf_type_to_duckdb(cudf_col_type);
-      if (src_type.id() == duckdb::LogicalTypeId::SQLNULL ||
-          src_type.InternalType() == vector.GetType().InternalType()) {
+      // Compare logical types, not physical width: TIMESTAMP_MS and TIMESTAMP are both INT64
+      // but differ by 1000x (Parquet TIMESTAMP_MILLIS vs DuckDB TIMESTAMP microseconds).
+      if (src_type.id() == duckdb::LogicalTypeId::SQLNULL || src_type == vector.GetType()) {
         copy_fixed_width(vector, row_offset, count, allocation);
       } else {
         duckdb::Vector temp_vec(src_type);
@@ -502,9 +574,11 @@ bool host_table_chunk_reader::get_next_chunk(duckdb::DataChunk& chunk)
       }
     } else {
       // Stored data is fixed-width: read with copy_fixed_width, then cast if needed.
+      // Compare logical types, not just physical width: TIMESTAMP_MS and TIMESTAMP are both
+      // INT64 but differ by 1000x (Parquet TIMESTAMP_MILLIS vs DuckDB TIMESTAMP microseconds).
       auto src_duckdb_type = cudf_type_to_duckdb(_column_readers[col_idx].cudf_col_type);
       if (src_duckdb_type.id() == duckdb::LogicalTypeId::SQLNULL ||
-          src_duckdb_type.InternalType() == vec.GetType().InternalType()) {
+          src_duckdb_type == vec.GetType()) {
         _column_readers[col_idx].copy_fixed_width(vec, _row_offset, count, _allocation);
       } else {
         duckdb::Vector temp_vec(src_duckdb_type);

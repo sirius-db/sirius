@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include "operator/partition_test_utils.hpp"
+
 #include <catch.hpp>
 #include <cucascade/data/data_repository_manager.hpp>
 #include <duckdb.hpp>
@@ -49,9 +51,9 @@ class wiring_test_env {
  public:
   wiring_test_env() = default;
 
-  duckdb::shared_ptr<sirius_pipeline> make_pipeline()
+  std::shared_ptr<sirius_pipeline> make_pipeline()
   {
-    auto pipeline = duckdb::make_shared_ptr<sirius_pipeline>(build_ctx);
+    auto pipeline = std::make_shared<sirius_pipeline>(build_ctx);
     pipelines.push_back(pipeline);
     return pipeline;
   }
@@ -62,12 +64,12 @@ class wiring_test_env {
   void assign_ids() { sirius::pipeline::assign_operator_ids(pipelines); }
 
   sirius::pipeline::pipeline_build_context build_ctx{nullptr};
-  duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> pipelines;
+  std::vector<std::shared_ptr<sirius_pipeline>> pipelines;
 };
 
 // Build a pipeline with the given sink and operator list. `operators` may be
 // empty to test the "next_op = sink" code path.
-duckdb::shared_ptr<sirius_pipeline> build_pipeline(
+std::shared_ptr<sirius_pipeline> build_pipeline(
   wiring_test_env& env,
   sirius_physical_operator* sink,
   const std::vector<sirius_physical_operator*>& operators,
@@ -271,12 +273,9 @@ TEST_CASE("materialize: delim join destinations use the generic path with no sib
     /*estimated_cardinality=*/0,
     duckdb::optional_idx());
 
-  // partition_join target — its `type` field is read by sirius_physical_partition's
-  // ctor; NESTED_LOOP_JOIN takes a no-op branch.
-  auto fake_parent = duckdb::make_uniq<sirius_physical_operator>(
-    SiriusPhysicalOperatorType::NESTED_LOOP_JOIN, empty_types, 0);
-  auto partition_join =
-    duckdb::make_uniq<sirius_physical_partition>(empty_types, 0, fake_parent.get());
+  // The fanout target needs only a single-destination routing specification.
+  auto partition_join = duckdb::make_uniq<sirius_physical_partition>(
+    empty_types, 0, sirius::test::operator_utils::single_partition_spec());
   right_delim->partition_join = partition_join.get();
 
   sirius_physical_operator unused_sink;

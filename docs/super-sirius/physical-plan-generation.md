@@ -21,7 +21,9 @@ The `sirius_physical_plan_generator::create_plan()` method is the entry point. I
 | `LOGICAL_PROJECTION` | `PROJECTION` | `src/planner/sirius_plan_projection.cpp` |
 | `LOGICAL_FILTER` | `FILTER` | `src/planner/sirius_plan_filter.cpp` |
 | `LOGICAL_AGGREGATE_AND_GROUP_BY` | `HASH_GROUP_BY` / `UNGROUPED_AGGREGATE` | `src/planner/sirius_plan_aggregate.cpp` |
+| `LOGICAL_DISTINCT` | `HASH_GROUP_BY` (zero aggregates) | `src/planner/sirius_plan_distinct.cpp` (some shapes fall back to CPU) |
 | `LOGICAL_COMPARISON_JOIN` | `HASH_JOIN` / `NESTED_LOOP_JOIN` | `src/planner/sirius_plan_comparison_join.cpp` |
+| `LOGICAL_CROSS_PRODUCT` | `NESTED_LOOP_JOIN` (no conditions) | `src/planner/sirius_plan_cross_product.cpp` |
 | `LOGICAL_DELIM_JOIN` | `LEFT_DELIM_JOIN` / `RIGHT_DELIM_JOIN` | `src/planner/sirius_plan_comparison_join.cpp` |
 | `LOGICAL_ORDER_BY` | `ORDER_BY` | `src/planner/sirius_plan_order.cpp` |
 | `LOGICAL_TOP_N` | `TOP_N` | `src/planner/sirius_plan_top_n.cpp` |
@@ -30,12 +32,16 @@ The `sirius_physical_plan_generator::create_plan()` method is the entry point. I
 | `LOGICAL_DELIM_GET` | `DELIM_SCAN` | `src/planner/sirius_plan_delim_get.cpp` |
 | `LOGICAL_EXPRESSION_GET` | `COLUMN_DATA_SCAN` | `src/planner/sirius_plan_expression_get.cpp` |
 | `LOGICAL_MATERIALIZED_CTE` | `CTE` | `src/planner/sirius_plan_cte.cpp` |
-| `LOGICAL_CTE_REF` | `CTE_SCAN` | `src/planner/sirius_plan_recursive_cte.cpp` |
+| `LOGICAL_CTE_REF` | `CTE_SCAN` | `src/planner/sirius_plan_recursive_cte.cpp` (materialized CTE refs only — recursive CTEs are unsupported) |
 | `LOGICAL_DUMMY_SCAN` | `DUMMY_SCAN` | `src/planner/sirius_plan_dummy_scan.cpp` |
 | `LOGICAL_EMPTY_RESULT` | `EMPTY_RESULT` | `src/planner/sirius_plan_empty_result.cpp` |
 
+`LOGICAL_DELIM_JOIN` reaches Sirius because Sirius loads with DuckDB's `delim_join_as_cte` defaulting to `false`. With the setting at DuckDB v2's own default (`true`), the same subqueries arrive as `LOGICAL_MATERIALIZED_CTE` plus `LOGICAL_CTE_REF` and ordinary semi, anti and mark joins; see [DuckDB Settings Changed by Sirius](configuration.md#duckdb-settings-changed-by-sirius).
+
 **Unsupported operators** (throw `NotImplementedException`, triggering CPU fallback):
-`LOGICAL_WINDOW`, `LOGICAL_UNNEST`, `LOGICAL_SAMPLE`, `LOGICAL_ANY_JOIN`, `LOGICAL_ASOF_JOIN`, `LOGICAL_CROSS_PRODUCT`, `LOGICAL_RECURSIVE_CTE`
+`LOGICAL_WINDOW`, `LOGICAL_UNNEST`, `LOGICAL_SAMPLE`, `LOGICAL_ANY_JOIN`, `LOGICAL_ASOF_JOIN`, `LOGICAL_RECURSIVE_CTE`
+
+**Unsupported expressions** are rejected the same way, during plan construction rather than at execution time. Wherever a plan builder translates a DuckDB expression via `sirius::ast::from_duckdb()`, a `nullptr` result (untranslatable expression) throws `NotImplementedException` so the query falls back to CPU instead of reaching the GPU evaluator with a hole in its expression list. Rejection sites: projections (`sirius_plan_projection.cpp`), filter predicates (`sirius_plan_filter.cpp`), pushed-down scan filters (`sirius_plan_get.cpp`, `src/op/scan/parquet_gpu_ingestible.cpp`, `sirius_physical_table_scan.cpp` — where a *skipped* pushdown translation is distinguished from a *failed* one so a predicate is never silently dropped), and join conditions (`src/expression/join_condition.cpp`). Nested-typed (STRUCT/LIST/MAP) columns are accepted for scan and projection passthrough but rejected as *operands* — in WHERE, GROUP BY, DISTINCT, JOIN ON, and sort keys (`sirius_plan_order.cpp`, `sirius_plan_top_n.cpp`) — via `reject_nested_column_operation()` in `sirius_physical_plan_generator.cpp`. Two further non-operator reject conditions: any plan node whose output types contain `SQLNULL` (e.g. an uncast `NULL` in `VALUES`), and any aggregate expression the translator declines (e.g. ORDER BY aggregates lowered to `arg_min_null`/`create_sort_key`) — both throw in `sirius_physical_plan_generator.cpp` / `sirius_plan_aggregate.cpp`. Because rejection is a plan-capability decision, an unsupported expression falls back even when the input is empty.
 
 ### Join Planning
 
@@ -50,16 +56,30 @@ Left side = probe (streamed), right side = build (materialized).
 
 Before either is chosen, `materialize_expression_join_keys()` pushes a projection below the join that turns complex equality-key expressions into real columns, rewriting the condition side to a plain reference so `PARTITION` (which hashes by column index) can consume it. It also materializes the *cast* on a null-safe key that will be routed to the mixed join's cuDF AST predicate: a routed key skips the hash-key path's `cudf::cast`, and a cuDF AST can only cast to INT64 / UINT64 / FLOAT64, so e.g. the INTEGER cast DuckDB inserts for a SMALLINT/INTEGER `IS NOT DISTINCT FROM` has to become a column. `are_conditions_supported()` rejects any routed null-safe key still carrying an untranslatable expression, so the join lands on the nested loop join (or CPU) instead of throwing mid-query.
 
+A `LOGICAL_CROSS_PRODUCT` (`CROSS JOIN`, a comma join without a join predicate, `JOIN ... ON true`) becomes a `NESTED_LOOP_JOIN` without conditions (`src/planner/sirius_plan_cross_product.cpp`).
+
 ### Aggregate Planning
 
 **File:** `src/planner/sirius_plan_aggregate.cpp`
 
 - **Ungrouped aggregate** — when no GROUP BY columns exist
 - **Grouped aggregate** — hash-based GROUP BY using cuDF's `groupby()` API
+- **SUM input bounds** — before the child is planned, `resolve_sum_input_bounds()` (`src/planner/decimal_sum_input_bounds.cpp`) traces each decimal SUM or AVG input, and each BIGINT input of a wide integer SUM or AVG (one DuckDB did not prove with `sum_no_overflow`; only the grouped aggregate gates on it, the ungrouped one sums in 128 bits directly), to its base scan with `resolve_scan_column_origin()` (`src/planner/scan_column_origin.cpp`, the tracer the dynamic-filter key-domain estimate also uses) under its value-preserving policy, which accepts bare-reference projections, filters, sorts, limits, DISTINCT, group keys and either side of any join or cross product, then reads the table function's column statistics. The resulting magnitude bound lets the aggregate operators decide from the batch row count instead of scanning the batch whether a DECIMAL32/DECIMAL64 or BIGINT SUM must be widened or a DECIMAL128 SUM can run over DECIMAL64; unproven inputs keep the per-batch scan, and a bound beyond 64 bits counts as unproven. Gated by `sirius.operator_params.enable_decimal_sum_stats_bound`.
 - **AVG decomposition** — AVG is split into SUM + COUNT_VALID (cuDF doesn't support AVG directly)
 - **COUNT(DISTINCT)** — implemented via `COLLECT_SET` aggregation, then counting unique rows
 - **HUGEINT downcast** — HUGEINT types are downcast to BIGINT (cuDF doesn't support int128)
 - **FILTER clause** — supported for `count(*)`, `count(col)`, `sum` (incl. `sum_no_overflow`, DuckDB's lowering of plain integer `sum`), `min`, `max`, and `avg`: `extract_aggregate_expressions` rewrites each filtered aggregate input to `CASE WHEN filter THEN input ELSE NULL END` in the projection hoisted below the aggregate, which is exact because every aggregate in that set lowers to a NULL-skipping cuDF aggregation. `count(*) FILTER` hoists a boolean mask column (`CASE WHEN filter THEN true ELSE NULL END`) instead and is lowered to `count(mask)` by `translate_aggregate`. DISTINCT aggregates, `first`, and any aggregate name outside the supported set throw `NotImplementedException` when filtered (transparent CPU fallback), and `translate_aggregate` declines any aggregate that still carries an unconsumed filter so no filtered aggregate can ever run unfiltered.
+- **Unsupported aggregate expressions** — `translate_expressions()` rejects any aggregate expression `from_duckdb` cannot translate (see *Unsupported expressions* above), and `can_use_partitioned_aggregate()` declines on a failed translation
+
+### Distinct Planning
+
+**File:** `src/planner/sirius_plan_distinct.cpp`
+
+`LOGICAL_DISTINCT` becomes a single `sirius_physical_grouped_aggregate` with an empty aggregate list. The distinct targets are the group keys, so deduplication is grouping with nothing to compute per group, and `insert_gpu_pipeline_operators` wraps the result exactly as it wraps a GROUP BY.
+
+- **Reorder projection** — pushed above the aggregate only when a key sits at an output position other than its own (`SELECT DISTINCT ON (b, a) a, b`). Plain `SELECT DISTINCT a, b` never needs one: the binder synthesizes one target per select-list entry, so every output column is already a key at its own position
+- **Unsupported shapes** — refused during `create_plan`, so each is a plan-time CPU fallback: an output column that no distinct target covers (it would need a grouped `FIRST`, which Sirius cannot lower yet), `DISTINCT ON` under an `ORDER BY`, a node with no distinct targets, a VARCHAR key under a non-binary `default_collation`, a nested key (`reject_nested_column_operation()`), and a child whose output schema disagrees with the types the node declares other than by the aggregate builder's HUGEINT→BIGINT narrowing (`planned_aggregate_type()`)
+- **The ordered guard tests `LogicalDistinct::order_by`, not `distinct_type`** — the binder sets `order_by` only for a `DISTINCT ON` under an `ORDER BY`, so a plain `SELECT DISTINCT a, b FROM t ORDER BY a` runs on the GPU with its `ORDER BY` as a separate `LOGICAL_ORDER` above the node. A `distinct_type == DISTINCT_ON` check would also send every unordered `DISTINCT ON` (e.g. `SELECT DISTINCT ON (a) a`) to the CPU
 
 ### Filter Pushdown
 
@@ -80,13 +100,13 @@ Projections are omitted when columns are already in the correct order (passthrou
 
 After the operator tree is built, `create_plan()` runs `fold_adjacent_projections()` over the whole plan as a final pass. Sirius routes every planner-created projection through `push_projection()`, which both elides identity passthrough projections and, when its child is already a projection, composes the two select lists into one. The standalone `fold_adjacent_projections()` post-pass then collapses any remaining `PROJECTION → PROJECTION` stacks anywhere in the tree — including projection pairs that arise from separate plan-builder steps (filter `projection_map` reordering, aggregate child hoisting including the FILTER mask CASE rewrites, table-scan unsupported-filter projections, and the user's `SELECT` list) and projections sitting under other operators such as joins.
 
-Composition substitutes each outer select-list reference (`#i`) with a clone of the inner projection's `select_list[i]`. Folding is refused when either select list has a null slot (an unsupported-expression fallback) or when a non-trivial inner expression would be duplicated across multiple outer reference sites; only immediate parent/child projection pairs are candidates, never folds across non-projection operators. The result is a single GPU expression-evaluation stage where multiple stacked projections would otherwise each run `expression_evaluator` over every batch.
+Composition substitutes each outer select-list reference (`#i`) with a clone of the inner projection's `select_list[i]`. Folding is refused when either select list has a null slot (a defensive backstop — plan construction rejects untranslatable expressions up front, so a null slot should not occur) or when a non-trivial inner expression would be duplicated across multiple outer reference sites; only immediate parent/child projection pairs are candidates, never folds across non-projection operators. The result is a single GPU expression-evaluation stage where multiple stacked projections would otherwise each run `expression_evaluator` over every batch.
 
 ## Part 2: Pipeline Structure
 
 ### `sirius_pipeline`
 
-**File:** `src/include/pipeline/sirius_pipeline.hpp`
+**File:** `src/pipeline/sirius_pipeline.hpp`
 
 A pipeline is an ordered list of operators:
 
@@ -112,7 +132,7 @@ Key methods:
 
 ### `sirius_meta_pipeline`
 
-**File:** `src/include/pipeline/sirius_meta_pipeline.hpp`
+**File:** `src/pipeline/sirius_meta_pipeline.hpp`
 
 Groups pipelines that share the same sink operator. Manages inter-pipeline dependencies and build order.
 
@@ -130,7 +150,7 @@ Build order rules:
 
 ### `sirius_pipeline_build_state`
 
-**File:** `src/include/pipeline/sirius_pipeline_build_state.hpp`
+**File:** `src/pipeline/sirius_pipeline_build_state.hpp`
 
 Provides controlled write access to pipeline internals during construction:
 - `set_pipeline_source()` / `set_pipeline_sink()` — assign source/sink operators
@@ -163,6 +183,13 @@ children[0]->build_pipelines(current, meta_pipeline);  // Probe in current
 state.set_pipeline_source(current, *this);
 ```
 
+**Sink parents** (PARTITION, RIGHT_DELIM_JOIN, DENSE_COUNT_JOIN): the base `is_sink()` returns true for any operator whose tree parent is one of these, because the parent consumes each child's output through a repository. The parent therefore only creates its own meta-pipeline and lets each child's `build_pipelines()` terminate the child's pipeline (PARTITION shown; DENSE_COUNT_JOIN applies the same call to its counted and then preserved child):
+```
+D_ASSERT(children[0]->is_sink());
+auto& partition_meta = meta_pipeline.create_child_meta_pipeline(current, *this);
+children[0]->build_pipelines(*partition_meta.get_base_pipeline(), partition_meta);
+```
+
 **CTE operator**:
 ```
 auto& child = meta_pipeline.create_child_meta_pipeline(current, *this);
@@ -184,19 +211,18 @@ After `is_ready()`:
 - `sink` points to `operators.back()`
 - `get_operators()` returns this full list
 
-`finalize_pipeline_structure()` in `sirius_pipeline_converter` then populates each pipeline's `dependencies` from the wiring-derived parents, inserting a join's build-side CONCAT producer at slot 0 — `link_join_partition_siblings()` and `reorder_pipelines_topologically()` read the slots positionally.
+`finalize_pipeline_structure()` in `sirius_pipeline_converter` then populates each pipeline's `dependencies` from the wiring-derived parents, inserting a join's build-side CONCAT producer first for dependency traversal. Exchange inputs and their sizing roles are already bound by physical planning; conversion does not recover them from dependency positions.
 
 ## Part 3: Pipeline Shapes
 
 The plan generator inserts every GPU pipeline operator into the plan tree (Part 1), so `sirius_pipeline_converter::convert()` (`src/pipeline/sirius_pipeline_converter.cpp`) is a pure topology pass over the meta-pipeline tree:
 
 1. `schedule_pipelines()` — walk the meta-pipeline tree and schedule pipelines in dependency order
-2. `compute_repository_wiring()` — emit sink→consumer wiring descriptors via tree-parent lookup; `resolve_port_id()` / `resolve_barrier()` pick each edge's port and barrier semantics
+2. `compute_repository_wiring()` — emit sink→consumer wiring descriptors via tree-parent lookup; the logical consumer's `input_port_for(producer)` and `input_barrier_for(producer)` hooks pick each edge's port and barrier semantics
 3. `setup_pipeline_parents()` — derive parent pipeline edges from the wiring descriptors
 4. `finalize_pipeline_structure()` — populate `dependencies`, build-side-first for joins (see [Pipeline Finalization](#pipeline-finalization))
-5. `link_join_partition_siblings()` — link PARTITION/JOIN/CONCAT sibling chains
-6. `configure_partition_min_partitions()` — apply the multi-GPU partition floor
-7. `reorder_pipelines_topologically()` — permute the schedule into a strict leaf-first topological order (every pipeline after its producers) and renumber pipeline IDs to match; join dependencies stay build-side-first so a join publishes its dynamic filters before the probe-side scans they prune are launched
+5. `configure_partition_consumers()` — hand the admitted GPU ids to every partition consumer, which derives its partition count, multi-GPU floor, and partition placement from them
+6. `reorder_pipelines_topologically()` — permute the schedule into a strict leaf-first topological order (every pipeline after its producers) and renumber pipeline IDs to match; join dependencies stay build-side-first so a join publishes its dynamic filters before the probe-side scans they prune are launched
 
 `sirius_engine::initialize_internal()` is a thin orchestrator calling `sirius_pipeline_converter(build_ctx, op_params).convert(*root_pipeline)` and materializing the wiring descriptors into runtime repositories and ports.
 
@@ -270,18 +296,9 @@ graph LR
 - Pipeline 1's sink is the last intermediate operator before HASH_JOIN (pipeline breaker); it connects to the Partition Pipeline with `FULL` barrier (default)
 - PARTITION → CONCAT uses `PARTIAL` barrier (downstream is CONCAT — line 1014)
 - Build-side CONCAT pushes to the HASH_JOIN's `"build"` port with `FULL` barrier (default)
-- The probe and build PARTITION operators are linked as siblings for partition count coordination
+- The plan binds probe/build inputs to one exchange decision; routers receive compatible layouts before either claims input
 
-For a dynamic-filter-producing `BUILD_PROBE` join, the build CONCAT switches to `concat_all` and
-its synchronous `"build"`-port push completes filter construction, multi-GPU replication, and
-channel publication before downstream task creation follows that join into its **immediate** probe
-producer. In a **broadcast** join there are `num_gpus` build CONCATs (one per replicated slot), each
-doing a `concat_all` push of the full build; the first to arrive publishes (exactly-once via the
-`OPEN -> PUBLISHING` compare-exchange). This edge ordering does not gate a base scan reached
-transitively through an intervening join; such a scan samples the channel opportunistically under
-normal scheduler order. See
-[Immediate-probe ordering](dynamic-filters.md#immediate-probe-ordering) and
-[Transitive scan targets and publication timing](dynamic-filters.md#transitive-scan-targets-and-publication-timing).
+For a dynamic-filter-producing `BUILD_PROBE` join, the build CONCAT switches to `concat_all` and its synchronous `"build"`-port push completes filter construction, multi-GPU replication, and channel publication before downstream task creation follows that join into its **immediate** probe producer. In a **broadcast** join there are `num_gpus` build CONCATs (one per replicated slot), each doing a `concat_all` push of the full build. `dynamic_filter_publication_session` elects and pins one delivery, invokes the hash join's repository deposit, then checks source usability/readiness and publishes inline before the push returns. An unusable delivery can release the claim only while input remains open. This edge ordering does not gate a base scan reached transitively through an intervening join; such a scan samples the channel opportunistically under normal scheduler order. See [Immediate-probe ordering](dynamic-filters.md#immediate-probe-ordering) and [Transitive scan targets and publication timing](dynamic-filters.md#transitive-scan-targets-and-publication-timing).
 
 ### ORDER_BY → 3-Phase Sort
 
@@ -309,7 +326,21 @@ graph LR
 2. **Pipeline 2**: PARTITION. Repository to MERGE_GROUP_BY uses `FULL` barrier (downstream is not CONCAT — `PARTIAL` is only used when PARTITION feeds directly into CONCAT)
 3. **Pipeline 3**: MERGE_GROUP_BY. Downstream pipelines updated to use MERGE_GROUP_BY as source
 
-> With `fuse_merge_pipelines` (default on), Pipeline 3 is usually not a standalone pipeline: MERGE_GROUP_BY folds into the downstream sink's pipeline as an intermediate. See [Merge fusion](#merge-fusion) below.
+> Pipeline 3 is usually not standalone: Sirius automatically folds MERGE_GROUP_BY into the
+> downstream sink's pipeline as an intermediate. See [Merge fusion](#merge-fusion) below.
+
+### DENSE_COUNT_JOIN
+
+```mermaid
+graph LR
+    P1["Pipeline 1<br/>[..., preserved root]"] -->|"FULL (preserved)"| P3["Pipeline 3<br/>[DENSE_COUNT_JOIN]"]
+    P2["Pipeline 2<br/>[..., counted root]"] -->|"FULL (counted)"| P3
+    P3 -->|"FULL"| DS["downstream"]
+```
+
+DENSE_COUNT_JOIN is a sink parent (see [`build_pipelines()` Patterns](#build_pipelines-patterns)), so each direct child terminates its own producer pipeline and feeds one input port through a `FULL` barrier; the counted producer is built first. Each root may itself be a scan, a streaming chain over a scan, `[HASH_JOIN]` (fed by its own CONCAT/PARTITION chains), `[MERGE_GROUP_BY, FILTER]` (a fused merge under a HAVING filter), `[MERGE_SORT]`, or another `[DENSE_COUNT_JOIN]`. Delim-join, materialized-CTE and delim/CTE scan roots are declined at plan time because their output does not arrive through a child-owned pipeline, and a delim join is declined at any depth of an input because the DENSE_COUNT_JOIN task hint can poll a MARK hash join inside the delim subtree before its sizing partitions have run.
+
+The repository to downstream uses `FULL` barrier (`PARTIAL` is only used when DENSE_COUNT_JOIN feeds the probe-side PARTITION of a HASH_JOIN outside the right family, see `sirius_physical_partition::input_barrier_for`).
 
 ### UNGROUPED_AGGREGATE
 
@@ -331,11 +362,12 @@ graph LR
 
 MERGE_TOP_N merges local top-N results.
 
-> With `fuse_merge_pipelines` (default on), Pipeline 2 usually folds MERGE_TOP_N into the downstream sink's pipeline rather than forming its own. See [Merge fusion](#merge-fusion) below.
+> Pipeline 2 usually folds MERGE_TOP_N into the downstream sink's pipeline rather than forming its
+> own. See [Merge fusion](#merge-fusion) below.
 
 ### Merge fusion
 
-By default (`fuse_merge_pipelines = true`) an eligible `MERGE_GROUP_BY` or `MERGE_TOP_N` does **not** open its own terminal pipeline. Instead it joins its downstream sink's pipeline as an intermediate operator, removing one task launch and one repository round-trip (typically `merge → RESULT_COLLECTOR` at the query tail):
+An eligible `MERGE_GROUP_BY` or `MERGE_TOP_N` does **not** open its own terminal pipeline. Instead it joins its downstream sink's pipeline as an intermediate operator, removing one task launch and one repository round-trip (typically `merge → RESULT_COLLECTOR` at the query tail):
 
 ```mermaid
 graph LR
@@ -345,7 +377,7 @@ graph LR
 
 Eligibility is decided at plan time by `mark_fusable_merge_pipelines` (`sirius_physical_plan_generator.cpp`), which walks parent pointers from each merge to the first downstream sink. Fusion applies when that path is unary and streaming and the sink accepts a fused input; the merge's own `build_pipelines` override then adds itself to the current pipeline and recurses into its child (which still cuts the upstream boundary). The following are **excluded** and keep the standalone merge boundary:
 
-- **Join / CTE / delim terminals** (`HASH_JOIN`, `NESTED_LOOP_JOIN`, `CTE`, `LEFT/RIGHT_DELIM_JOIN`) — multiple inputs or bespoke sink wiring.
+- **Join / CTE / delim terminals** (`HASH_JOIN`, `NESTED_LOOP_JOIN`, `CTE`, `LEFT/RIGHT_DELIM_JOIN`, `DENSE_COUNT_JOIN`) — multiple inputs or bespoke sink wiring. A streaming operator directly under a sink parent is itself the fusion terminal (e.g. `[MERGE_GROUP_BY, FILTER]` feeding a PARTITION or DENSE_COUNT_JOIN port).
 - **Partition sinks** (`PARTITION`, `SORT_PARTITION`) — require complete upstream input in one task.
 - **Delim-owned merges** — the distinct-root merge inside a delim join needs its dedicated sink wiring.
 - **`MERGE_AGGREGATE`** (ungrouped aggregate) — uses a different partial-result handoff.
@@ -377,7 +409,7 @@ graph LR
 With no intermediate operators, no breaker is needed — RIGHT_DELIM_JOIN is the current pipeline's sink directly.
 
 - `partition_join` (PARTITION_build) is a single-op pipeline fed by the fan-out; its build CONCAT feeds the HASH_JOIN `"build"` port.
-- Probe and build partitions are linked as siblings; the inner join is identified via its tree parent (`link_join_partition_siblings`) so the build (distinct) side drives the partition count.
+- Delim wrapping explicitly binds the internal join's inputs so its build (distinct) side drives the partition count; conversion does not infer the role from tree ancestry.
 
 #### LEFT_DELIM_JOIN
 

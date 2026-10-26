@@ -27,8 +27,10 @@ detail::batched_codec_ops const& lz4_ops()
 
     detail::batched_codec_ops o;
     o.chunk_size             = kLz4ChunkSize;
-    o.compress_get_temp_size = [copts](size_t nc, size_t mc, size_t* tb, size_t mt) {
-      return nvcompBatchedLZ4CompressGetTempSizeAsync(nc, mc, copts, tb, mt);
+    o.compress_get_temp_size = [copts](
+                                 size_t nc, size_t mc, size_t* tb, size_t mt, cudaStream_t stream) {
+      return SIMPATICO_NVCOMP_GET_TEMP_SIZE(
+        nvcompBatchedLZ4CompressGetTempSize, stream, nc, mc, copts, tb, mt);
     };
     o.compress_get_max_output = [copts](size_t mc, size_t* mo) {
       return nvcompBatchedLZ4CompressGetMaxOutputChunkSize(mc, copts, mo);
@@ -45,9 +47,11 @@ detail::batched_codec_ops const& lz4_ops()
                                cudaStream_t s) {
       return nvcompBatchedLZ4CompressAsync(up, ub, mc, nc, t, tb, cp, cb, copts, st, s);
     };
-    o.decompress_get_temp_size = [dopts](size_t nc, size_t mc, size_t* tb, size_t mt) {
-      return nvcompBatchedLZ4DecompressGetTempSizeAsync(nc, mc, dopts, tb, mt);
-    };
+    o.decompress_get_temp_size =
+      [dopts](size_t nc, size_t mc, size_t* tb, size_t mt, cudaStream_t stream) {
+        return SIMPATICO_NVCOMP_GET_TEMP_SIZE(
+          nvcompBatchedLZ4DecompressGetTempSize, stream, nc, mc, dopts, tb, mt);
+      };
     o.decompress_async = [dopts](void const* const* cp,
                                  size_t const* cb,
                                  size_t const* ubuf,
@@ -67,15 +71,14 @@ detail::batched_codec_ops const& lz4_ops()
 
 }  // namespace
 
-std::unique_ptr<cudf::column> lz4_compressed_representation::decompress(
-  rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr) const
+std::unique_ptr<cudf::column> lz4_compressed_representation::decompress(decode_frame& frame) const
 {
   return detail::nvcomp_decompress_impl(
-    lz4_ops(), payload_data(), payload_size(), original_type, num_rows, stream, mr);
+    lz4_ops(), payload_data(), payload_size(), original_type, num_rows, frame);
 }
 
 std::unique_ptr<compressed_representation> lz4_compressor::compress(
-  cudf::column_view col, rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr)
+  cudf::column_view col, ::cuda::stream_ref stream, rmm::device_async_resource_ref mr)
 {
   auto const dt = col.type();
   auto const n  = col.size();

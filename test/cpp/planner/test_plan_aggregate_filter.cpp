@@ -31,6 +31,7 @@
 #include "op/sirius_physical_projection.hpp"
 #include "op/sirius_physical_ungrouped_aggregate.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "utils/sirius_test_env.hpp"
 
 #include <cudf/aggregation.hpp>
 
@@ -38,6 +39,7 @@
 #include <duckdb.hpp>
 #include <duckdb/execution/column_binding_resolver.hpp>
 #include <duckdb/main/config.hpp>
+#include <duckdb/main/settings.hpp>
 #include <duckdb/optimizer/optimizer.hpp>
 #include <duckdb/parser/parser.hpp>
 #include <duckdb/planner/planner.hpp>
@@ -105,7 +107,7 @@ duckdb::unique_ptr<sirius_physical_operator> generate_sirius_plan(Connection& co
 
   duckdb::unique_ptr<sirius_physical_operator> result;
   try {
-    Parser parser(context.GetParserOptions());
+    Parser parser(context);
     parser.ParseQuery(query);
     REQUIRE(!parser.statements.empty());
 
@@ -115,7 +117,7 @@ duckdb::unique_ptr<sirius_physical_operator> generate_sirius_plan(Connection& co
 
     auto plan = std::move(planner.plan);
 
-    if (context.config.enable_optimizer) {
+    if (duckdb::Settings::Get<duckdb::EnableOptimizerSetting>(context)) {
       Optimizer optimizer(*planner.binder, context);
       plan = optimizer.Optimize(std::move(plan));
     }
@@ -164,17 +166,12 @@ struct plan_aggregate_filter_fixture {
   {
     auto cfg = std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" / "config" / "data" /
                "minimal.yaml";
-    setenv("SIRIUS_CONFIG_FILE", cfg.string().c_str(), 1);
-    unsetenv("SIRIUS_DISABLE");
-    db = std::make_unique<DuckDB>(_db_path.path());
-    setenv("SIRIUS_DISABLE", "1", 1);
+    db  = sirius::test::open_sirius_db(_db_path.path().c_str(), cfg);
     con = std::make_unique<Connection>(*db);
 
     con->Query("CREATE TABLE events (id INTEGER, val INTEGER)");
     con->Query("INSERT INTO events SELECT range, range * 3 % 7 FROM range(100)");
   }
-
-  ~plan_aggregate_filter_fixture() { unsetenv("SIRIUS_CONFIG_FILE"); }
 
   // Declared before db/con so the backing file outlives the database.
   scoped_temp_db_path _db_path;

@@ -278,14 +278,56 @@ TEST_CASE_METHOD(MixedTypeNullSafeJoinFixture,
     "SELECT * FROM mtl LEFT JOIN mtr ON mtl.a = mtr.a AND mtl.b IS NOT DISTINCT FROM mtr.b");
 }
 
-// MARK cannot use MIXED_JOIN, so null-safe keys remain a known [!mayfail] limitation.
-// Replace with a hard comparison or fallback assertion once supported.
+// A correlated IN is the one MARK shape that genuinely mixes key policies: decorrelation makes
+// the correlated predicate null-safe while the IN operand stays a plain `=`, giving conditions
+// `(a IS NOT DISTINCT FROM a)` AND `(b = #0)`. That mixture is rejected at plan time.
 TEST_CASE_METHOD(MixedKeyNullSafeJoinFixture,
-                 "gpu_execution null-safe MARK join (projected EXISTS) is a known limitation",
-                 "[integration][gpu_execution][join][nulls][!mayfail]")
+                 "gpu_execution mixed plain + null-safe MARK join falls back at plan time",
+                 "[integration][gpu_execution][join][nulls]")
 {
+  expect_plan_fallback_matches_cpu(
+    "SELECT mnl.id, mnl.b IN (SELECT mnr.b FROM mnr WHERE mnr.a = mnl.a) AS in_b FROM mnl");
+}
+
+TEST_CASE_METHOD(MixedKeyNullSafeJoinFixture,
+                 "gpu_execution all-null-safe MARK join runs on GPU with definite marks",
+                 "[integration][gpu_execution][join][nulls]")
+{
+  // Every key null-safe => EQUAL matching and definite marks. mnl rows 2, 3 and 5 have a NULL
+  // `b` that must match mnr's NULL `b`.
+  compare_gpu_vs_cpu(
+    "SELECT mnl.id, EXISTS (SELECT 1 FROM mnr "
+    "WHERE mnr.b IS NOT DISTINCT FROM mnl.b) AS has_match "
+    "FROM mnl");
+  // Both correlated predicates decorrelate to null-safe delim keys, so this is all-null-safe
+  // too -- it is the query that was [!mayfail] before.
   compare_gpu_vs_cpu(
     "SELECT mnl.id, EXISTS (SELECT 1 FROM mnr "
     "WHERE mnr.a = mnl.a AND mnr.b IS NOT DISTINCT FROM mnl.b) AS has_match "
     "FROM mnl");
+}
+
+TEST_CASE_METHOD(MixedKeyNullSafeJoinFixture,
+                 "gpu_execution correlated projected EXISTS keeps definite marks on GPU",
+                 "[integration][gpu_execution][join][nulls]")
+{
+  // The common shape this path exists for: DuckDB decorrelates a projected correlated EXISTS
+  // into an all-null-safe MARK over a build side pre-filtered to `a IS NOT NULL`. The null-safe
+  // key is what makes an unmatched row a definite FALSE, so under the old UNEQUAL pin mnl row 6
+  // (a IS NULL, unmatched) came back NULL instead of false.
+  compare_gpu_vs_cpu(
+    "SELECT mnl.id, EXISTS (SELECT 1 FROM mnr WHERE mnr.a = mnl.a) AS has_match FROM mnl");
+  // NOT EXISTS negates the same mark; a stray NULL would surface here as a missing row.
+  compare_gpu_vs_cpu(
+    "SELECT mnl.id, NOT EXISTS (SELECT 1 FROM mnr WHERE mnr.a = mnl.a) AS no_match FROM mnl");
+}
+
+TEST_CASE_METHOD(MixedKeyNullSafeJoinFixture,
+                 "gpu_execution null-safe MARK rejection does not spill onto plain IN/EXISTS",
+                 "[integration][gpu_execution][join][nulls]")
+{
+  // Regression guard on the plan-time screen: an uncorrelated MARK, whose only key is a plain
+  // '=', keeps running on the GPU.
+  compare_gpu_vs_cpu("SELECT mnl.id, mnl.b IN (SELECT mnr.b FROM mnr) AS in_b FROM mnl");
+  compare_gpu_vs_cpu("SELECT mnl.id, mnl.a IN (SELECT mnr.a FROM mnr) AS in_a FROM mnl");
 }

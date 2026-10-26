@@ -21,13 +21,14 @@
 
 #pragma once
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/resource_ref.hpp>
 
+#include <cuda/stream>
 #include <cuda_runtime.h>
 
 #include <nvcomp/shared_types.h>
+#include <nvcomp/version.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -36,7 +37,14 @@
 #include <utility>
 
 namespace simpatico {
+class decode_frame;
 namespace detail {
+
+#if NVCOMP_VER_MAJOR >= 6
+#define SIMPATICO_NVCOMP_GET_TEMP_SIZE(name, stream, ...) name(__VA_ARGS__, stream)
+#else
+#define SIMPATICO_NVCOMP_GET_TEMP_SIZE(name, stream, ...) name##Async(__VA_ARGS__)
+#endif
 
 // Chunk offsets within a frame (and per-chunk output slots) are aligned to this.
 inline constexpr std::size_t kFrameAlign = 256;
@@ -50,7 +58,8 @@ struct batched_codec_ops {
   std::function<nvcompStatus_t(std::size_t num_chunks,
                                std::size_t max_uncomp_chunk,
                                std::size_t* temp_bytes,
-                               std::size_t max_total_uncomp)>
+                               std::size_t max_total_uncomp,
+                               cudaStream_t stream)>
     compress_get_temp_size;
 
   std::function<nvcompStatus_t(std::size_t max_uncomp_chunk, std::size_t* max_out)>
@@ -71,7 +80,8 @@ struct batched_codec_ops {
   std::function<nvcompStatus_t(std::size_t num_chunks,
                                std::size_t max_uncomp_chunk,
                                std::size_t* temp_bytes,
-                               std::size_t max_total_uncomp)>
+                               std::size_t max_total_uncomp,
+                               cudaStream_t stream)>
     decompress_get_temp_size;
 
   std::function<nvcompStatus_t(void const* const* comp_ptrs,
@@ -95,19 +105,19 @@ std::pair<std::unique_ptr<rmm::device_buffer>, std::size_t> batched_compress_byt
   batched_codec_ops const& ops,
   void const* src,
   std::size_t n_bytes,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr);
 
 // Decompress a frame produced by batched_compress_bytes into device `dst`, which
 // must hold exactly `out_bytes` (the original uncompressed size). No-op when
-// `out_bytes == 0`. Synchronizes internally.
+// `out_bytes == 0`. Enqueued on `owner.stream()`; the chunk tables uploaded from
+// the host live in `owner` until session completion.
 void batched_decompress_bytes(batched_codec_ops const& ops,
                               void const* frame,
                               std::size_t frame_size,
                               void* dst,
                               std::size_t out_bytes,
-                              rmm::cuda_stream_view stream,
-                              rmm::device_async_resource_ref mr);
+                              decode_frame& owner);
 
 }  // namespace detail
 }  // namespace simpatico

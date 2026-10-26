@@ -19,6 +19,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -66,10 +67,9 @@ inline std::vector<Element> jit_decode_tree(const jit::FusedTree& tree,
   }
 
   jit::CompileOptions opts;
-  opts.arch_cc        = arch_cc;
-  opts.default_device = true;
+  opts.arch_cc = arch_cc;
 
-  const jit::CompiledKernel* kernel = nullptr;
+  std::shared_ptr<const jit::CompiledKernel> kernel;
   try {
     kernel =
       jit::KernelCache::instance().get_or_compile_plain(spec.source, spec.entry_symbol, opts);

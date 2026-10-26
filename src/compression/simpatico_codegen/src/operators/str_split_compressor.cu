@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// str_split: decompose STRING into {offsets, chars, null_mask}; reassemble via
-// make_strings_column on decode. Structural operator.
+// str_split: decompose STRING into {offsets, chars}; reassemble via
+// make_strings_column on decode. Structural operator. Validity never reaches
+// here: compress_column strips it into the plan tree's sidecar beforehand.
 
 #include "codegen/plan/bitjoin_layout.hpp"  // copy_column_view
 #include "codegen/plan/representation.hpp"
+#include "decode/decode_session.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -20,11 +22,12 @@
 namespace simpatico {
 
 std::unique_ptr<cudf::column> str_split_compressed_representation::decompress(
-  rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr) const
+  decode_frame& frame) const
 {
-  auto& offsets   = channels_[0];
-  auto& chars     = channels_[1];
-  auto* null_mask = channels_.size() > 2 ? channels_[2].get() : nullptr;
+  auto const stream = frame.stream();
+  auto const mr     = frame.mr();
+  auto& offsets     = channels_[0];
+  auto& chars       = channels_[1];
   if (num_rows == 0 || !offsets) {
     return cudf::make_empty_column(cudf::data_type(cudf::type_id::STRING));
   }
@@ -33,25 +36,18 @@ std::unique_ptr<cudf::column> str_split_compressed_representation::decompress(
                            static_cast<std::size_t>(cudf::size_of(chars->type()));
   rmm::device_buffer chars_buf(chars->view().head<void>(), chars_bytes, stream, mr);
 
-  cudf::size_type nc = 0;
-  rmm::device_buffer mask_buf(0, stream, mr);
-  if (null_mask) {
-    auto const* bits =
-      reinterpret_cast<cudf::bitmask_type const*>(null_mask->view().data<std::uint8_t>());
-    nc = cudf::null_count(bits, 0, num_rows, stream);
-    if (nc > 0) {
-      mask_buf = rmm::device_buffer(
-        null_mask->view().head<void>(), static_cast<std::size_t>(null_mask->size()), stream, mr);
-    }
-  }
   auto offsets_copy = std::make_unique<cudf::column>(*offsets, stream, mr);
   return cudf::make_strings_column(
-    num_rows, std::move(offsets_copy), std::move(chars_buf), nc, std::move(mask_buf));
+    num_rows,
+    std::move(offsets_copy),
+    std::move(chars_buf),
+    /*null_count=*/0,
+    cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr));
 }
 
 std::unique_ptr<compressed_representation> str_split_compressor::compress(
   cudf::column_view column_to_compress,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
   if (column_to_compress.type().id() != cudf::type_id::STRING) {
@@ -65,12 +61,12 @@ std::unique_ptr<compressed_representation> str_split_compressor::compress(
     // cudf::make_empty_column(STRING), has no offsets child to copy from.
     auto offsets = cudf::make_fixed_width_column(
       cudf::data_type{cudf::type_id::INT32}, 1, cudf::mask_state::UNALLOCATED, stream, mr);
-    cudaMemsetAsync(offsets->mutable_view().head<void>(), 0, sizeof(std::int32_t), stream.value());
+    cudaMemsetAsync(offsets->mutable_view().head<void>(), 0, sizeof(std::int32_t), stream.get());
     auto chars = cudf::make_fixed_width_column(
       cudf::data_type{cudf::type_id::UINT8}, 0, cudf::mask_state::UNALLOCATED, stream, mr);
-    cudaStreamSynchronize(stream.value());
+    cudaStreamSynchronize(stream.get());
     return std::make_unique<str_split_compressed_representation>(
-      0, std::move(offsets), std::move(chars), nullptr);
+      0, std::move(offsets), std::move(chars));
   }
 
   std::unique_ptr<cudf::column>
@@ -78,8 +74,8 @@ std::unique_ptr<compressed_representation> str_split_compressor::compress(
   cudf::column_view src = column_to_compress;
   // Normalize any sliced view to an owned compact copy: a non-zero offset
   // needs rebasing, and a head-slice (offset 0, size < parent) still views the
-  // parent's full offsets child, so the emitted channels would be mutually
-  // inconsistent (offsets/chars parent-sized, null_mask slice-sized).
+  // parent's full offsets child, so the emitted channels would be sized off the
+  // parent rather than the slice.
   if (column_to_compress.offset() != 0 ||
       cudf::strings_column_view(column_to_compress).offsets().size() !=
         column_to_compress.size() + 1) {
@@ -115,27 +111,18 @@ std::unique_ptr<compressed_representation> str_split_compressor::compress(
                     scv.chars_begin(stream),
                     static_cast<size_t>(chars_bytes),
                     cudaMemcpyDeviceToDevice,
-                    stream.value());
+                    stream.get());
     std::int64_t const padded = static_cast<std::int64_t>(nelem) * bpe;
     if (padded > chars_bytes) {
       cudaMemsetAsync(
-        dst + chars_bytes, 0, static_cast<size_t>(padded - chars_bytes), stream.value());
+        dst + chars_bytes, 0, static_cast<size_t>(padded - chars_bytes), stream.get());
     }
   }
 
-  // null_mask: owned UINT8 bitmask bytes, copied only if the column has nulls.
-  // A non-null column gets NO mask channel (2-channel str_split).
-  std::unique_ptr<cudf::column> null_mask;
-  if (src.null_count() > 0) {
-    rmm::device_buffer mbuf = cudf::copy_bitmask(src, stream, mr);
-    auto const mbytes       = static_cast<cudf::size_type>(cudf::bitmask_allocation_size_bytes(n));
-    null_mask               = std::make_unique<cudf::column>(
-      cudf::data_type{cudf::type_id::UINT8}, mbytes, std::move(mbuf), rmm::device_buffer{}, 0);
-  }
-  cudaStreamSynchronize(stream.value());
+  cudaStreamSynchronize(stream.get());
 
   return std::make_unique<str_split_compressed_representation>(
-    n, std::move(offsets), std::move(chars), std::move(null_mask));
+    n, std::move(offsets), std::move(chars));
 }
 
 }  // namespace simpatico

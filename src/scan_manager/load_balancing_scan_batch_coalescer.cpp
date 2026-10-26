@@ -18,16 +18,24 @@
 
 #include "exec/try.hpp"
 #include "log/logging.hpp"
+#include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
+#include "pipeline/sirius_pipeline.hpp"
+#include "scan_manager/readahead_scan_manager.hpp"
+#include "sirius_context.hpp"
+#include "transparent/read_view_registry.hpp"
 
+#include <stdexcept>
 #include <stop_token>
 #include <utility>
 
 namespace sirius::scan_manager {
 
 load_balancing_scan_batch_coalescer::metadata_processing_state*
-load_balancing_scan_batch_coalescer::register_pipeline(op::scan::sirius_gpu_scan_operator* scan_op,
-                                                       std::shared_ptr<balancing_strategy> balancer)
+load_balancing_scan_batch_coalescer::register_pipeline(
+  op::scan::sirius_gpu_scan_operator* scan_op,
+  std::shared_ptr<balancing_strategy> balancer,
+  std::shared_ptr<readahead_scan_manager> readahead)
 {
   if (!scan_op) return nullptr;
 
@@ -36,12 +44,125 @@ load_balancing_scan_batch_coalescer::register_pipeline(op::scan::sirius_gpu_scan
   auto coalescer   = ingestible->create_batch_coalescer();
   auto uid         = scan_op->get_operator_id();
   auto pipeline_id = scan_op->get_pipeline()->get_pipeline_id();
-  auto state       = std::make_unique<metadata_processing_state>(
-    uid, pipeline_id, std::move(coalescer), std::move(connector), std::move(balancer));
+  auto state       = std::make_unique<metadata_processing_state>(uid,
+                                                           pipeline_id,
+                                                           std::move(coalescer),
+                                                           std::move(connector),
+                                                           std::move(balancer),
+                                                           std::move(readahead));
   _pipeline_order.push_back(uid);
   auto state_ptr = state.get();
   _slots[uid]    = std::move(state);
   return state_ptr;
+}
+
+namespace {
+preparation_coordinator::job bind_preparation_unit(
+  std::function<std::unique_ptr<op::scan::scan_info>()> work,
+  std::function<std::unique_ptr<op::scan::scan_info>(std::stop_token)> stop_work,
+  std::shared_ptr<preparation_unit> unit,
+  required_input_set required)
+{
+  auto run = [work = std::move(work), stop_work = std::move(stop_work), unit, required](
+               std::stop_token stop) mutable {
+    auto input_work = [&] {
+      if (stop_work) return stop_work(stop);
+      return work();
+    };
+    try {
+      auto input       = input_work();
+      auto const& deps = input->dependencies().front();
+      unit->complete_input(footer_input{deps.footer, deps.parquet_approval, deps.datasource});
+      if (required.test(static_cast<size_t>(required_input::visibility))) {
+        if (!deps.visibility)
+          throw std::invalid_argument("preparation worker returned no visibility artifact");
+        unit->complete_input(visibility_input{deps.visibility});
+      }
+      if (required.test(static_cast<size_t>(required_input::segments)))
+        unit->complete_input(segments_input{deps.profiles});
+      if (required.test(static_cast<size_t>(required_input::checkpoint_iteration)))
+        unit->complete_input(checkpoint_input{deps.checkpoint_iteration.value()});
+      return input;
+    } catch (...) {
+      auto error = std::current_exception();
+      auto cause = transparent::classify_failure(error);
+      std::optional<op::scan::verdict_reason> reason;
+      try {
+        std::rethrow_exception(error);
+      } catch (op::scan::unsupported_physical_input const& e) {
+        reason = e.reason;
+      } catch (...) {
+      }
+      unit->fail(preparation_failure{cause.cause, reason, cause.detail, error});
+      throw;
+    }
+  };
+  return {[run]() mutable { return run({}); },
+          unit,
+          [run](std::stop_token stop) mutable { return run(stop); }};
+}
+}  // namespace
+
+void load_balancing_scan_batch_coalescer::register_coordinator_source(
+  op::scan::sirius_gpu_scan_operator* scan,
+  split_provider& provider,
+  preparation_coordinator& coordinator)
+{
+  auto slot = _slots.at(scan->get_operator_id());
+  if (slot->batch_provider) throw std::logic_error("cached slot cannot have a disk consumer");
+  if (slot->publication) throw std::logic_error("scan slot already has a coordinator consumer");
+  auto const* native =
+    dynamic_cast<op::scan::duckdb_native_gpu_ingestible const*>(&scan->get_ingestible());
+  if (native && native->metadata_walk_pending())
+    throw std::logic_error("native metadata must be prepared on the statement path before start");
+
+  preparation_coordinator::source source;
+  source.coalescer = slot->coalescer;
+  source.claim     = [&provider, &coordinator]() -> std::optional<preparation_coordinator::job> {
+    if (!provider.has_more_splits()) return {};
+    auto claim = provider.claim_preparation();
+    if (!claim.work) return {};
+    auto work        = std::move(claim.work);
+    auto legacy_work = [work = std::move(work)] { return work({}); };
+    if (!claim.key)
+      return preparation_coordinator::job{std::move(legacy_work), {}, std::move(claim.stop_work)};
+    auto unit = coordinator.admit_unit(*claim.key, claim.required);
+    if (!unit) return {};
+    return bind_preparation_unit(
+      std::move(legacy_work), std::move(claim.stop_work), std::move(unit), claim.required);
+  };
+  source.construct = [slot](std::unique_ptr<op::scan::scan_info> batch) {
+    auto device = slot->balancer->get_next_gpu(slot->pipeline_id);
+    auto input  = std::make_unique<op::scan::scan_operator_input>(
+      std::move(batch),
+      slot->readahead,
+      slot->op_id,
+      device,
+      op::scan::scan_operator_input::prefetch_start::deferred);
+    auto bytes      = input->get_estimated_size_in_bytes();
+    auto* input_ptr = input.get();
+    preparation_coordinator::publication publication{std::move(input), bytes};
+    publication.prepare = [input_ptr] {
+      static_cast<op::scan::scan_operator_input&>(*input_ptr).initialize_prefetch();
+    };
+    return publication;
+  };
+  // The publication's prepare callback is installed by construct while the concrete input is
+  // still available.
+  source.publish = [slot](preparation_coordinator::publication& publication) {
+    slot->connector->push_split_sized(
+      std::move(publication.input), publication.bytes, publication.preparation_bytes);
+  };
+  source.close = [slot] {
+    if (slot->readahead) slot->readahead->mark_operator_closed(slot->op_id);
+    slot->connector->close();
+  };
+  source.bind_consumption = [slot](std::function<void(size_t)> callback) {
+    slot->connector->set_consumption_callback(std::move(callback));
+  };
+  source.can_claim = [&provider] { return provider.get_ingestible().can_claim_preparation(); };
+  coordinator.add_source(std::move(source));
+  slot->publication = coordinator.publication_gate();
 }
 
 void load_balancing_scan_batch_coalescer::use_cached_entries_for_pipeline(
@@ -56,6 +177,7 @@ void load_balancing_scan_batch_coalescer::use_cached_entries_for_pipeline(
   // op's row filter (when present) runs against every drained split — record
   // that so each split's working-set estimate covers the filter-by-copy peak.
   state.row_filter_pending = scan_op->get_ingestible().has_row_filter();
+  state.scan_op            = scan_op;
   state.attach_batch_provider(std::move(provider));
 }
 
@@ -67,21 +189,24 @@ load_balancing_scan_batch_coalescer::get_split_provider_bridge(
   auto uid = scan_op->get_operator_id();
   auto it  = _slots.find(uid);
   if (it == _slots.end()) { return {}; }
+  if (it->second->publication)
+    throw std::logic_error("coordinator slot cannot use the legacy metadata bridge");
   return [state_ptr = it->second](exec::try_t<std::unique_ptr<op::scan::scan_info>>&& entry) {
     state_ptr->queue.enqueue(std::move(entry));
   };
 }
 
-void load_balancing_scan_batch_coalescer::worker_loop([[maybe_unused]] std::stop_token const& stop)
+void load_balancing_scan_batch_coalescer::slot_loop(std::size_t pipeline_id,
+                                                    std::stop_token const& stop)
 {
-  for (auto pipeline_id : _pipeline_order) {
-    if (stop.stop_requested()) { break; }
-    auto& state = *_slots.at(pipeline_id);
-    if (state.batch_provider) {
-      process_cached_entries(state, stop);
-    } else {
-      process_provider_inputs(state, stop);
-    }
+  if (stop.stop_requested()) { return; }
+  auto it = _slots.find(pipeline_id);
+  if (it == _slots.end()) { return; }
+  auto& state = *it->second;
+  if (state.batch_provider) {
+    process_cached_entries(state, stop);
+  } else {
+    process_provider_inputs(state, stop);
   }
 }
 
@@ -93,22 +218,23 @@ void load_balancing_scan_batch_coalescer::process_provider_inputs(metadata_proce
   });
   auto& batch_queue = state.queue;
 
-  // Balance one coalesced batch onto a GPU and hand it to the connector.
-  auto emit = [&state](std::unique_ptr<op::scan::scan_info> batch) {
-    auto op_data = std::make_unique<op::scan::scan_operator_input>(std::move(batch));
-    auto dev_id  = state.balancer->get_next_gpu(state.pipeline_id, op_data.get());
-    if (dev_id.has_value() && *dev_id >= 0) { op_data->set_preferred_device_id(dev_id.value()); }
+  // Every exit from this function closes the slot through here.  The readahead
+  // cannot retire an operator until it knows no further split will be emitted,
+  // and that includes the failure paths: a slot that closed with an exception
+  // produces nothing more either.  Registration happens inside emit() on this
+  // same thread, so the close always follows the last register in program order.
+  auto close_slot = [&state](std::exception_ptr const& ex = nullptr) {
+    if (state.readahead) { state.readahead->mark_operator_closed(state.op_id); }
+    state.connector->close(ex);
+  };
 
-    auto fadvise_hints = op_data->get_fadvise_hints();
-    if (!fadvise_hints.empty()) {
-      for (auto& hint : fadvise_hints) {
-        if (hint.datasource && !hint.ranges.empty()) {
-          hint.datasource->fadvise(hint.ranges, dev_id);
-        }
-      }
-    }
-    op_data->prefetch(io::cache::prefetching_stage::opportunistic);
-    state.connector->push_split(std::move(op_data));
+  // Balance one coalesced batch onto a GPU and hand it to the connector.  The
+  // device is chosen before the split exists because the constructor fadvises
+  // and publishes in one step, leaving no window afterwards to stamp one in.
+  auto emit = [&state](std::unique_ptr<op::scan::scan_info> batch) {
+    auto dev_id = state.balancer->get_next_gpu(state.pipeline_id);
+    state.connector->push_split(std::make_unique<op::scan::scan_operator_input>(
+      std::move(batch), state.readahead, state.op_id, dev_id));
   };
 
   while (!stop.stop_requested()) {
@@ -116,7 +242,7 @@ void load_balancing_scan_batch_coalescer::process_provider_inputs(metadata_proce
       metadata_processing_state::provider_value_t entry;
       batch_queue.wait_dequeue(entry);
       if (entry.has_exception()) {
-        state.connector->close(entry.exception());
+        close_slot(entry.exception());
         return;
       }
 
@@ -138,7 +264,7 @@ void load_balancing_scan_batch_coalescer::process_provider_inputs(metadata_proce
       metadata_processing_state::provider_value_t leftover;
       while (batch_queue.try_dequeue(leftover)) {
         if (leftover.has_exception()) {
-          state.connector->close(leftover.exception());
+          close_slot(leftover.exception());
           return;
         }
         if (leftover.is_empty()) { continue; }  // extra (e.g. stop) sentinel — ignore
@@ -151,21 +277,39 @@ void load_balancing_scan_batch_coalescer::process_provider_inputs(metadata_proce
       for (auto& batch : final_batches) {
         emit(std::move(batch));
       }
-      state.connector->close();
+      close_slot();
     } catch (...) {
-      state.connector->close(std::current_exception());
+      close_slot(std::current_exception());
     }
     return;
   }
 
   // Stop requested between iterations — close so downstream consumers unblock.
-  state.connector->close();
+  close_slot();
 }
 
 void load_balancing_scan_batch_coalescer::process_cached_entries(metadata_processing_state& state,
                                                                  std::stop_token const& stop)
 {
-  drain_cached_provider(*state.batch_provider, *state.connector, stop, state.row_filter_pending);
+  auto* scan = state.scan_op;
+  if (!scan) {
+    state.connector->close(
+      std::make_exception_ptr(std::logic_error("cached scan slot is missing its scan operator")));
+    return;
+  }
+  drain_cached_provider(*state.batch_provider,
+                        *state.connector,
+                        stop,
+                        state.row_filter_pending,
+                        scan->contract_id(),
+                        scan->query_token(),
+                        scan->certificate_observer(),
+                        scan->read_views() && scan->read_views()->injections.invalidate_pin_witness,
+                        dynamic_cast<op::scan::duckdb_native_ingestible_table_info const*>(
+                          &scan->get_ingestible().table_info()) != nullptr,
+                        state.readahead,
+                        state.op_id,
+                        state.publication);
 }
 
 void load_balancing_scan_batch_coalescer::drain_cached_provider(databatch_provider& provider,
@@ -173,48 +317,142 @@ void load_balancing_scan_batch_coalescer::drain_cached_provider(databatch_provid
                                                                 std::stop_token const& stop,
                                                                 bool row_filter_pending)
 {
+  drain_cached_provider(
+    provider, connector, stop, row_filter_pending, op::scan::scan_contract_id{0}, uint64_t{0});
+}
+
+void load_balancing_scan_batch_coalescer::drain_cached_provider(
+  databatch_provider& provider,
+  split_connector& connector,
+  std::stop_token const& stop,
+  bool row_filter_pending,
+  std::shared_ptr<readahead_scan_manager> readahead,
+  std::size_t operator_id)
+{
+  drain_cached_provider(provider,
+                        connector,
+                        stop,
+                        row_filter_pending,
+                        op::scan::scan_contract_id{0},
+                        uint64_t{0},
+                        nullptr,
+                        false,
+                        false,
+                        std::move(readahead),
+                        operator_id);
+}
+
+void load_balancing_scan_batch_coalescer::drain_cached_provider(
+  databatch_provider& provider,
+  split_connector& connector,
+  std::stop_token const& stop,
+  bool row_filter_pending,
+  op::scan::scan_contract_id expected,
+  uint64_t query_token,
+  duckdb::SiriusContext* observer,
+  bool invalidate_witness,
+  bool native_pin,
+  std::shared_ptr<readahead_scan_manager> readahead,
+  std::size_t operator_id,
+  std::shared_ptr<preparation_gate> publication)
+{
+  auto publish = [&](std::unique_ptr<op::operator_data> split) {
+    auto bytes = split->get_estimated_size_in_bytes();
+    std::unique_lock<std::mutex> gate;
+    if (publication) {
+      gate = std::unique_lock(publication->mutex);
+      if (publication->closed) return false;
+      publication->check_interrupted();
+    }
+    auto& input = static_cast<op::scan::scan_operator_input&>(*split);
+    if (input.has_scan_metadata()) input.initialize_prefetch();
+    connector.push_split_sized(std::move(split), bytes);
+    return true;
+  };
+  // See process_provider_inputs: the readahead needs "no more splits" on every
+  // exit, success or failure, or the operator can never be retired.
+  auto close_slot = [&connector, &readahead, operator_id](std::exception_ptr const& ex = nullptr) {
+    if (readahead) { readahead->mark_operator_closed(operator_id); }
+    connector.close(ex);
+  };
+
   try {
     while (!stop.stop_requested()) {
+      if (publication) {
+        std::lock_guard gate(publication->mutex);
+        if (publication->closed) break;
+        publication->check_interrupted();
+      }
       auto next = provider.get_next_batch();
+      // The external-use guard was acquired before this worker could touch the query.
+      if (publication) {
+        std::lock_guard gate(publication->mutex);
+        if (publication->closed) break;
+        publication->check_interrupted();
+      }
       if (next.data) {
-        auto split = std::make_unique<op::scan::scan_operator_input>(std::move(next.data));
+        auto validation = provider.validation;
+        if (expected != 0) {
+          // Nothing has published this batch yet: even the memory prefetcher
+          // must only see batches that passed admission for this operator/query.
+          if (invalidate_witness) validation.query_token ^= 1;
+          try {
+            if (provider.contract_id != expected)
+              throw std::runtime_error("resident scan contract mismatch");
+            if (native_pin && (!validation.iteration.applies || !validation.visibility.applies))
+              throw op::scan::certificate_incomplete(
+                expected, {}, "resident native applicability missing");
+            op::scan::admit_resident_batch(expected, validation, query_token);
+          } catch (op::scan::certificate_incomplete const&) {
+            if (observer) observer->record_transparent_certificate_incomplete();
+            throw;
+          } catch (...) {
+            if (observer) observer->record_transparent_certificate_mismatch();
+            throw;
+          }
+        }
+        auto split = std::make_unique<op::scan::scan_operator_input>(
+          std::move(next.data), readahead, operator_id);
+        if (expected != 0) {
+          split->resident_contract_id = expected;
+          split->resident_validation  = validation;
+        }
         split->mvcc_keep_mask               = std::move(next.mvcc_keep_mask);
         split->needs_carrier_conversion     = next.needs_carrier_conversion;
         split->conversion_destination_bytes = next.conversion_destination_bytes;
         split->row_filter_pending           = row_filter_pending;
-        connector.push_split(std::move(split));
+        split->origin                       = std::move(next.origin);
+        split->decode_attached              = std::move(next.decode_attached);
+        if (!publish(std::move(split))) break;
         continue;
       }
       if (next.scan_info) {
         // Insert-delta split. row_filter_pending stays false: scan_info
-        // splits fold filter costs into their own estimates. Same fadvise +
-        // opportunistic prefetch as the walk path; host-backed splits have
-        // no file ranges, so the hints no-op.
-        auto split = std::make_unique<op::scan::scan_operator_input>(std::move(next.scan_info));
-        split->mvcc_keep_mask = std::move(next.mvcc_keep_mask);
+        // splits fold filter costs into their own estimates. Prefetch initialization
+        // follows publication admission; host-backed splits have no file ranges,
+        // so the hints no-op.
         std::optional<int> device;
-        if (next.preferred_device >= 0) {
-          device = next.preferred_device;
-          split->set_preferred_device_id(next.preferred_device);
-        }
-        auto fadvise_hints = split->get_fadvise_hints();
-        for (auto& hint : fadvise_hints) {
-          if (hint.datasource && !hint.ranges.empty()) {
-            hint.datasource->fadvise(hint.ranges, device);
-          }
-        }
-        split->prefetch(io::cache::prefetching_stage::opportunistic);
-        connector.push_split(std::move(split));
+        if (next.preferred_device >= 0) { device = next.preferred_device; }
+        auto split = std::make_unique<op::scan::scan_operator_input>(
+          std::move(next.scan_info),
+          readahead,
+          operator_id,
+          device,
+          op::scan::scan_operator_input::prefetch_start::deferred);
+        split->mvcc_keep_mask = std::move(next.mvcc_keep_mask);
+        if (!publish(std::move(split))) break;
         continue;
       }
       break;  // end-of-stream
     }
-    connector.close();
+    close_slot();
   } catch (...) {
     // Surface the provider failure to the consumer: get_next_split() rethrows
     // once the queue drains. Without this close the connector never closes —
     // the dispatcher swallows task exceptions — and the query hangs silently.
-    connector.close(std::current_exception());
+    auto error = std::current_exception();
+    if (publication && publication->report_error) publication->report_error(error);
+    close_slot(error);
   }
 }
 

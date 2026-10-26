@@ -99,9 +99,11 @@ inline std::vector<uint8_t> make_dict_segment(std::vector<std::string> const& di
   uint32_t const width     = bitpack_width_for_count(dict_count);
   auto sel_packed          = pack_uint32(selections, width);
 
-  uint32_t const header_size  = 20;
-  uint32_t const sel_buf_off  = header_size;
-  uint32_t const sel_buf_size = static_cast<uint32_t>(sel_packed.size() * sizeof(uint32_t));
+  uint32_t const header_size   = 20;
+  uint32_t const sel_buf_off   = header_size;
+  size_t const sel_group_bytes = ((selections.size() + 31u) / 32u * 32u) * width / 8u;
+  uint32_t const sel_buf_size =
+    static_cast<uint32_t>(std::max(sel_group_bytes, sel_packed.size() * sizeof(uint32_t)));
   uint32_t const idx_buf_off  = sel_buf_off + sel_buf_size;
   uint32_t const idx_buf_size = dict_count * sizeof(uint32_t);
   uint32_t const dict_off     = idx_buf_off + idx_buf_size;
@@ -112,7 +114,8 @@ inline std::vector<uint8_t> make_dict_segment(std::vector<std::string> const& di
   uint32_t hdr[5] = {dict_size, dict_end, idx_buf_off, dict_count, width};
   std::memcpy(bytes.data(), hdr, sizeof(hdr));
   if (sel_buf_size > 0) {
-    std::memcpy(bytes.data() + sel_buf_off, sel_packed.data(), sel_buf_size);
+    std::memcpy(
+      bytes.data() + sel_buf_off, sel_packed.data(), sel_packed.size() * sizeof(uint32_t));
   }
   std::memcpy(bytes.data() + idx_buf_off, idx_buf.data(), idx_buf_size);
   // Dict bytes packed in REVERSE: entry K starts at dict_end - idx_buf[K].
@@ -348,9 +351,12 @@ inline std::vector<uint8_t> make_fsst_segment(std::vector<std::string> const& st
   uint32_t const lengths_off = header_size;
   size_t lengths_total_bits  = size_t{row_count} * bitpacking_width;
   uint32_t lengths_bytes_raw = static_cast<uint32_t>((lengths_total_bits + 31u) / 32u * 4u);
-  uint32_t lengths_padded    = lengths_bytes_raw + 4u;  // +1 word: unpack_value reads 8B
-  uint32_t symtab_off        = synth_align_up8(lengths_off + lengths_padded);
-  uint32_t comp_bytes_off    = synth_align_up8(symtab_off + symtab_size);
+  uint32_t lengths_group_bytes =
+    static_cast<uint32_t>(((size_t{row_count} + 31u) / 32u * 32u) * bitpacking_width / 8u);
+  // The packer appends a guard word; reserve space for its entire output.
+  uint32_t lengths_padded = std::max(lengths_group_bytes, lengths_bytes_raw + 4u);
+  uint32_t symtab_off     = synth_align_up8(lengths_off + lengths_padded);
+  uint32_t comp_bytes_off = synth_align_up8(symtab_off + symtab_size);
 
   size_t total_comp_bytes = 0;
   for (size_t l : lenOut)
@@ -497,23 +503,25 @@ inline std::vector<uint8_t> make_dict_fsst_segment(std::vector<std::string> cons
   for (uint32_t k = 0; k < dict_count; ++k) {
     max_entry_len = std::max(max_entry_len, static_cast<uint32_t>(entry_lens[k]));
   }
-  uint32_t string_lengths_width = std::max(1u, bitpack_width_for_value(max_entry_len));
-  uint32_t dict_indices_width   = std::max(1u, bitpack_width_for_value(dict_count - 1));
+  uint32_t string_lengths_width = bitpack_width_for_value(max_entry_len);
+  uint32_t dict_indices_width   = mode == 2 ? 0 : bitpack_width_for_value(dict_count - 1);
 
   uint32_t dict_size = 0;
   for (size_t l : entry_lens)
     dict_size += static_cast<uint32_t>(l);
 
-  // Region offsets mirror prepare_dict_fsst in gpu_decode_strings.cu.
+  // DuckDB pads each bitpacked region to groups of 32 values.
   uint32_t const header_size = 16;
   uint32_t off_dict          = synth_align_up8(header_size);
   uint32_t off_symtab        = (mode == 0) ? 0 : synth_align_up8(off_dict + dict_size);
   uint32_t off_slens =
     (mode == 0) ? off_dict + synth_align_up8(dict_size) : synth_align_up8(off_symtab + symtab_size);
-  uint32_t slens_bits = dict_count * string_lengths_width;
+  uint32_t slens_bits = ((dict_count + 31u) / 32u * 32u) * string_lengths_width;
   uint32_t off_didx   = synth_align_up8(off_slens + (slens_bits + 7u) / 8u);
   uint32_t total =
-    (mode == 2) ? off_didx : synth_align_up8(off_didx + (row_count * dict_indices_width + 7u) / 8u);
+    (mode == 2)
+      ? off_didx
+      : synth_align_up8(off_didx + ((row_count + 31u) / 32u * 32u) * dict_indices_width / 8u);
 
   std::vector<uint8_t> bytes(total, 0);
   // Header (matches dict_fsst_header_t in gpu_decode_strings.cu).

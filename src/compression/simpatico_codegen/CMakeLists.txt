@@ -1,86 +1,19 @@
 cmake_minimum_required(VERSION 3.24)
 
-set(CMAKE_CUDA_ARCHITECTURES
-    native
-    CACHE STRING "CUDA architectures (native = detect host GPU)")
-
 project(simpatico_codegen LANGUAGES C CXX CUDA)
 
-set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CUDA_STANDARD 20)
-set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-
-if(DEFINED ENV{CONDA_PREFIX})
-  set(CONDA_PREFIX
-      "$ENV{CONDA_PREFIX}"
-      CACHE PATH "Conda/pixi prefix")
+# libcudf exports its CCCL dependency, including include directories and
+# namespace/feature definitions. Use the same targets in every build layout.
+if(NOT TARGET cudf::cudf)
+  find_package(cudf REQUIRED CONFIG)
+endif()
+find_package(CUDAToolkit REQUIRED)
+if(NOT TARGET nvcomp::nvcomp)
+  find_package(nvcomp REQUIRED CONFIG)
 endif()
 
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
-  set(CUDA_TARGET_TRIPLE "sbsa-linux")
-else()
-  set(CUDA_TARGET_TRIPLE "x86_64-linux")
-endif()
-
-if(VCPKG_BUILD)
-  # vcpkg ships CCCL 3.4 next to rmm/cudf; the CUDA toolkit (and any active
-  # conda env) ship older ones, so vcpkg's include dir has to be searched first
-  # or RMM's "requires CCCL 3.3 or newer" guard fires. Checked before
-  # CONDA_PREFIX so a vcpkg build started from a pixi shell still picks vcpkg.
-  find_package(CUDAToolkit REQUIRED)
-  list(GET CUDAToolkit_INCLUDE_DIRS 0 _cuda_inc0)
-  set(CUDA_TOOLKIT_INCLUDE "${_cuda_inc0}")
-  set(_SIMPATICO_VCPKG_INC
-      "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/include")
-  # cccl installs cub/, thrust/ and libcudacxx straight into <prefix>/include.
-  set(CUDA_CCCL_INCLUDE "${_SIMPATICO_VCPKG_INC}")
-  set(_SIMPATICO_INCLUDE_DIRS "${_SIMPATICO_VCPKG_INC}"
-                              "${CUDA_TOOLKIT_INCLUDE}")
-  set(_SIMPATICO_LIB_DIR "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/lib")
-elseif(CONDA_PREFIX)
-  set(CMAKE_CUDA_COMPILER
-      "${CONDA_PREFIX}/bin/nvcc"
-      CACHE FILEPATH "nvcc from prefix")
-  set(CUDA_TOOLKIT_INCLUDE
-      "${CONDA_PREFIX}/targets/${CUDA_TARGET_TRIPLE}/include")
-  if(EXISTS "${CUDA_TOOLKIT_INCLUDE}/cccl")
-    set(CUDA_CCCL_INCLUDE "${CUDA_TOOLKIT_INCLUDE}/cccl")
-  else()
-    set(CUDA_CCCL_INCLUDE "${CUDA_TOOLKIT_INCLUDE}")
-  endif()
-  set(_SIMPATICO_INCLUDE_DIRS
-      "${CONDA_PREFIX}/include" "${CONDA_PREFIX}/include/rapids"
-      "${CUDA_TOOLKIT_INCLUDE}")
-  set(_SIMPATICO_LIB_DIR "${CONDA_PREFIX}/lib")
-else()
-  # Docker / system install: discover the CUDA toolkit via CMake and fall back
-  # to standard system paths for cudf/rmm/rapids headers.
-  find_package(CUDAToolkit REQUIRED)
-  list(GET CUDAToolkit_INCLUDE_DIRS 0 _cuda_inc0)
-  set(CUDA_TOOLKIT_INCLUDE "${_cuda_inc0}")
-  if(EXISTS "${_cuda_inc0}/cccl")
-    set(CUDA_CCCL_INCLUDE "${_cuda_inc0}/cccl")
-  else()
-    set(CUDA_CCCL_INCLUDE "${_cuda_inc0}")
-  endif()
-  set(_SIMPATICO_INCLUDE_DIRS "/usr/include" "/usr/include/rapids"
-                              "${CUDA_TOOLKIT_INCLUDE}")
-  set(_SIMPATICO_LIB_DIR "/usr/lib")
-  message(
-    STATUS
-      "CONDA_PREFIX not set — using system CUDA toolkit and /usr for rapids headers"
-  )
-endif()
-
-include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include
-                    ${_SIMPATICO_INCLUDE_DIRS})
-
-add_compile_definitions(LIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE)
-add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>)
-add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
-add_link_options(-Wl,--enable-new-dtags)
-link_directories("${_SIMPATICO_LIB_DIR}")
+include(cmake/jit_header_manifest.cmake)
+include(cmake/cache_identity.cmake)
 
 # Embed the project headers the runtime NVRTC JIT #includes as raw-string
 # literals, so a binary distribution needs no simpatico source tree on disk.
@@ -91,42 +24,62 @@ add_custom_command(
   OUTPUT "${EMBED_JIT_HEADERS_OUT}"
   COMMAND
     ${CMAKE_COMMAND}
-    "-DIN_STDINT=${CMAKE_CURRENT_SOURCE_DIR}/include/codegen/stdint_shim.hpp"
-    "-DIN_RLE=${CMAKE_CURRENT_SOURCE_DIR}/include/codegen/decode/rle_block.cuh"
-    "-DOUT=${EMBED_JIT_HEADERS_OUT}" -P
-    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_jit_headers.cmake"
-  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/include/codegen/stdint_shim.hpp"
-          "${CMAKE_CURRENT_SOURCE_DIR}/include/codegen/decode/rle_block.cuh"
+    "-DIN_STDINT=${CMAKE_CURRENT_SOURCE_DIR}/src/codegen/stdint_shim.hpp"
+    "-DIN_RLE=${CMAKE_CURRENT_SOURCE_DIR}/src/codegen/decode/rle_block.cuh"
+    "-DOUT=${EMBED_JIT_HEADERS_OUT}" "-DXXHSUM_EXECUTABLE=${XXHSUM_EXECUTABLE}"
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_jit_headers.cmake"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/codegen/stdint_shim.hpp"
+          "${CMAKE_CURRENT_SOURCE_DIR}/src/codegen/decode/rle_block.cuh"
           "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_jit_headers.cmake"
+          "${CMAKE_CURRENT_SOURCE_DIR}/cmake/jit_header_manifest.cmake"
+          "${XXHSUM_EXECUTABLE}"
   COMMENT "Embedding JIT project headers into ${EMBED_JIT_HEADERS_OUT}"
   VERBATIM)
 add_custom_target(simpatico_embedded_headers DEPENDS "${EMBED_JIT_HEADERS_OUT}")
 
-# Embed the CCCL (<cuda/std/...>, <cub/...>) header closure the runtime NVRTC
-# JIT compiles against. Scanned transitively at build time from the kernel
-# prelude roots (so it tracks the CCCL version), and fed to NVRTC as in-memory
-# headers -- the JIT then needs no CCCL tree on disk, only the driver + the
-# nvrtc runtime the extension already links.
+# Embed the complete CCCL library bundle as named in-memory headers. Runtime
+# compilation needs neither an installed header tree nor include-closure rules.
 set(EMBED_CCCL_HEADERS_OUT
     "${CMAKE_CURRENT_BINARY_DIR}/generated/codegen/jit/cccl_embedded_headers.cpp"
+)
+set(EMBED_CCCL_HEADERS_DEPFILE "${EMBED_CCCL_HEADERS_OUT}.d")
+# CCCL::CCCL's transitive include directories are resolved at generate time; the
+# cmake -P embedder cannot evaluate their generator expressions itself. Pass the
+# ordered list to support both installed packages and source checkouts with
+# separate cub/, thrust/, and libcudacxx/ roots.
+set(EMBED_CCCL_INCLUDE_DIRS
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/cccl_include_dirs-$<CONFIG>.txt")
+file(
+  GENERATE
+  OUTPUT "${EMBED_CCCL_INCLUDE_DIRS}"
+  CONTENT
+    "$<JOIN:$<REMOVE_DUPLICATES:$<TARGET_PROPERTY:CCCL::CCCL,INTERFACE_INCLUDE_DIRECTORIES>>,\n>\n"
 )
 add_custom_command(
   OUTPUT "${EMBED_CCCL_HEADERS_OUT}"
   COMMAND
-    ${CMAKE_COMMAND} "-DCCCL_DIR=${CUDA_CCCL_INCLUDE}"
-    "-DOUT=${EMBED_CCCL_HEADERS_OUT}" -P
+    ${CMAKE_COMMAND} "-DINCLUDE_DIRS_FILE=${EMBED_CCCL_INCLUDE_DIRS}"
+    "-DOUT=${EMBED_CCCL_HEADERS_OUT}" "-DDEPFILE=${EMBED_CCCL_HEADERS_DEPFILE}"
+    "-DXXHSUM_EXECUTABLE=${XXHSUM_EXECUTABLE}" -P
     "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_cccl_headers.cmake"
   DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_cccl_headers.cmake"
-  COMMENT
-    "Scanning + embedding CCCL JIT header closure into ${EMBED_CCCL_HEADERS_OUT}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/cmake/jit_header_manifest.cmake"
+          "${EMBED_CCCL_INCLUDE_DIRS}" "${XXHSUM_EXECUTABLE}"
+  DEPFILE "${EMBED_CCCL_HEADERS_DEPFILE}"
+  COMMENT "Embedding CCCL JIT header bundle into ${EMBED_CCCL_HEADERS_OUT}"
   VERBATIM)
 
 add_library(
   simpatico STATIC
-  # Generated: CCCL header closure embedded for the runtime JIT.
+  src/decode/decode_session.cpp
+  # Generated: complete CCCL header bundle embedded for the runtime JIT.
   "${EMBED_CCCL_HEADERS_OUT}"
   # CUDA kernels: operators + offsets
   src/bridge/offsets_cumsum.cu
+  src/selection/selection_wave.cu
+  src/selection/chunk_row_set_build.cu
+  src/selection/row_id_space.cu
+  src/selection/chunk_row_set_convert.cu
   src/operators/alp_compressor.cu
   src/operators/alp_rd_compressor.cu
   src/operators/ans_compressor.cu
@@ -141,80 +94,109 @@ add_library(
   src/operators/nvcomp_batched_codec.cu
   # Plain-CUDA JIT host
   src/jit/nvrtc_compiler.cpp
+  src/jit/disk_cache.cpp
   src/jit/kernel_cache.cpp
   src/encode/jit/renderer.cpp
   src/decode/jit/renderer.cpp
   # Runtime: plan executor + bridge + API + rep glue
+  src/selection/decompression_pushdown_policy.cpp
   src/plan/bit_spec.cpp
   src/plan/plan_dsl.cpp
   src/plan/plan_tree.cpp
   src/plan/operator_registry.cpp
   src/plan/representation_factory.cpp
   src/plan/bitjoin_layout.cpp
+  src/plan/validity.cpp
   src/plan/compress.cpp
   src/plan/decompress.cpp
   src/util/stream_pool.cpp
+  src/util/host_observation.cpp
   src/util/isoc23_compat.c
   src/bridge/fused_tree_build.cpp
   src/bridge/codegen_runtime.cpp
   src/simpatico_codegen.cpp
   src/api/compressed_table_io.cpp
   src/explore/compression_explorer.cpp)
-set_target_properties(simpatico PROPERTIES POSITION_INDEPENDENT_CODE ON)
+# Keep libcudf's CCCL includes ahead of the toolkit's implicit headers. Imported
+# -isystem paths would otherwise be searched after ordinary -I paths.
+set_target_properties(
+  simpatico
+  PROPERTIES POSITION_INDEPENDENT_CODE ON
+             NO_SYSTEM_FROM_IMPORTED ON
+             CXX_SCAN_FOR_MODULES OFF
+             CUDA_STANDARD 20
+             CUDA_STANDARD_REQUIRED ON)
+if(VCPKG_BUILD)
+  set_target_properties(simpatico PROPERTIES CUDA_RUNTIME_LIBRARY Static)
+endif()
+target_compile_options(
+  simpatico
+  PRIVATE $<$<COMPILE_LANG_AND_ID:CUDA,NVIDIA>:--expt-extended-lambda>
+          $<$<COMPILE_LANG_AND_ID:CUDA,NVIDIA>:--expt-relaxed-constexpr>)
 target_compile_features(simpatico PUBLIC cxx_std_20)
+# Name of the NVTX domain simpatico's (and Sirius's) ranges are published into.
+# The parent project sets this from its own project name; the fallback only
+# applies to the standalone simpatico_codegen build, whose PROJECT_NAME is not
+# "sirius". PUBLIC so consumers — sirius_extension and, transitively,
+# sirius_unittest and parquet_benchmark — compile their copy of the tag type
+# against the same name.
+if(NOT DEFINED SIRIUS_NVTX_DOMAIN_NAME)
+  set(SIRIUS_NVTX_DOMAIN_NAME "sirius")
+endif()
+target_compile_definitions(
+  simpatico
+  PUBLIC LIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE
+         CCCL_DISABLE_WARPSPEED_SCAN CCCL_IGNORE_DEPRECATED_STREAM_REF_HEADER
+         SIRIUS_NVTX_DOMAIN_NAME="${SIRIUS_NVTX_DOMAIN_NAME}")
 # nvrtc_compiler.cpp #includes the generated embedded_headers.h from here.
 add_dependencies(simpatico simpatico_embedded_headers)
 target_include_directories(
-  simpatico
-  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include
-          "${CMAKE_CURRENT_BINARY_DIR}/generated" "${CUDA_TOOLKIT_INCLUDE}"
-          "${CUDA_CCCL_INCLUDE}")
+  simpatico PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+                    "${CMAKE_CURRENT_BINARY_DIR}/generated")
 # In the Sirius vcpkg build the overlay nvrtc port provides a static NVRTC
 # (nvrtc::nvrtc_static) so the extension carries no libnvrtc.so runtime dep.
-# Standalone / pixi builds fall back to the conda shared 'nvrtc'.
+# Standalone / pixi builds use the toolkit's shared NVRTC target.
+if(VCPKG_BUILD AND NOT TARGET nvrtc::nvrtc_static)
+  # A standalone vcpkg configure has no parent to discover this target.
+  find_package(nvrtc REQUIRED CONFIG)
+endif()
 if(TARGET nvrtc::nvrtc_static)
   set(SIMPATICO_NVRTC_LIB nvrtc::nvrtc_static)
 else()
-  set(SIMPATICO_NVRTC_LIB nvrtc)
+  set(SIMPATICO_NVRTC_LIB CUDA::nvrtc)
 endif()
 
 if(VCPKG_BUILD)
-  # In the vcpkg build, use CMake imported targets (link by full path) — no
-  # shared .so files exist for cudf/rmm/cudart/cuda, and link_directories() is
-  # directory-scoped so -lcudf etc. don't resolve in consuming targets. nvcomp
-  # comes in transitively from cudf::cudf; cuda_driver is the driver stub.
-  target_link_libraries(
-    simpatico PUBLIC cudf::cudf rmm::rmm CUDA::cudart_static
-                     ${SIMPATICO_NVRTC_LIB} CUDA::cuda_driver dl)
+  set(SIMPATICO_CUDART_LIB CUDA::cudart_static)
 else()
-  target_link_libraries(
-    simpatico
-    PUBLIC cudf
-           rmm
-           cudart
-           nvcomp
-           ${SIMPATICO_NVRTC_LIB}
-           cuda
-           dl)
+  set(SIMPATICO_CUDART_LIB CUDA::cudart)
+endif()
+target_link_libraries(
+  simpatico
+  PUBLIC cudf::cudf rmm::rmm nvcomp::nvcomp ${SIMPATICO_CUDART_LIB}
+         ${SIMPATICO_NVRTC_LIB} CUDA::cuda_driver
+  PRIVATE simpatico_cache_identity)
+
+# Sirius already provides cuCascade. Standalone Simpatico keeps its CUDA-only
+# backend and does not acquire a dependency on the rest of the engine.
+if(TARGET cuCascade::cucascade_static)
+  target_link_libraries(simpatico PRIVATE cuCascade::cucascade_static)
+  target_compile_definitions(simpatico
+                             PRIVATE SIMPATICO_USE_CUCASCADE_STREAM_POOL)
 endif()
 
 function(add_codegen_host_test name)
   add_executable(${name} tests/${name}.cpp)
+  set_target_properties(${name} PROPERTIES CXX_SCAN_FOR_MODULES OFF)
   target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-  target_link_libraries(
-    ${name}
-    PRIVATE simpatico
-            cudf
-            rmm
-            cudart
-            nvcomp
-            ${SIMPATICO_NVRTC_LIB}
-            cuda
-            dl)
-  target_link_options(${name} PRIVATE "-Wl,-rpath,${_SIMPATICO_LIB_DIR}")
+  target_link_libraries(${name} PRIVATE simpatico)
 endfunction()
 
 add_codegen_host_test(test_compress_with_plan_roundtrip)
+add_codegen_host_test(test_async_decode)
+target_link_options(test_async_decode PRIVATE "-Wl,--wrap=cudaStreamQuery"
+                    "-Wl,--wrap=cudaStreamSynchronize")
+add_codegen_host_test(test_scan_filter_session)
 add_codegen_host_test(test_compressed_table_io)
 add_codegen_host_test(test_leaf_describe)
 add_codegen_host_test(test_plan_tree)
@@ -226,28 +208,33 @@ add_codegen_host_test(test_operator_sweep)
 add_codegen_host_test(test_representation_contract)
 add_codegen_host_test(test_bitpack_layout_contract)
 add_codegen_host_test(test_multi_gpu_stream_affinity)
+if(TARGET cuCascade::cucascade_static)
+  target_compile_definitions(test_multi_gpu_stream_affinity
+                             PRIVATE SIMPATICO_USE_CUCASCADE_STREAM_POOL)
+endif()
+add_codegen_host_test(test_masked_decode_variants)
+add_codegen_host_test(test_selection_wave)
+add_codegen_host_test(test_chunk_row_set_build)
+add_codegen_host_test(test_row_id_space)
+add_codegen_host_test(test_chunk_row_set_convert)
+add_codegen_host_test(test_decompress_column_rows)
+add_codegen_host_test(test_render_signature_contract)
 
 # Multi-mode CLI. Target is simpatico_cli to avoid clashing with the lib target;
 # the installed binary is named 'simpatico'.
 add_executable(simpatico_cli cli/simpatico_main.cpp)
-set_target_properties(simpatico_cli PROPERTIES OUTPUT_NAME simpatico)
+set_target_properties(simpatico_cli PROPERTIES OUTPUT_NAME simpatico
+                                               CXX_SCAN_FOR_MODULES OFF)
 target_include_directories(simpatico_cli
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(
-  simpatico_cli
-  PRIVATE simpatico
-          cudf
-          rmm
-          cudart
-          nvcomp
-          ${SIMPATICO_NVRTC_LIB}
-          cuda
-          dl)
-target_link_options(simpatico_cli PRIVATE "-Wl,-rpath,${_SIMPATICO_LIB_DIR}")
+target_link_libraries(simpatico_cli PRIVATE simpatico)
 
 enable_testing()
+add_subdirectory(tests/cache)
 add_test(NAME compress_with_plan_roundtrip
          COMMAND test_compress_with_plan_roundtrip)
+add_test(NAME async_decode COMMAND test_async_decode)
+add_test(NAME scan_filter_session COMMAND test_scan_filter_session)
 add_test(NAME compressed_table_io COMMAND test_compressed_table_io)
 add_test(NAME leaf_describe COMMAND test_leaf_describe)
 add_test(NAME plan_tree COMMAND test_plan_tree)
@@ -259,3 +246,10 @@ add_test(NAME operator_sweep COMMAND test_operator_sweep)
 add_test(NAME representation_contract COMMAND test_representation_contract)
 add_test(NAME bitpack_layout_contract COMMAND test_bitpack_layout_contract)
 add_test(NAME multi_gpu_stream_affinity COMMAND test_multi_gpu_stream_affinity)
+add_test(NAME masked_decode_variants COMMAND test_masked_decode_variants)
+add_test(NAME selection_wave COMMAND test_selection_wave)
+add_test(NAME chunk_row_set_build COMMAND test_chunk_row_set_build)
+add_test(NAME row_id_space COMMAND test_row_id_space)
+add_test(NAME chunk_row_set_convert COMMAND test_chunk_row_set_convert)
+add_test(NAME decompress_column_rows COMMAND test_decompress_column_rows)
+add_test(NAME render_signature_contract COMMAND test_render_signature_contract)

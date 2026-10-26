@@ -1,0 +1,4 @@
+sirius:
+  executor:
+    scan_manager:
+      thread_name_prefix: custom_scan_manager

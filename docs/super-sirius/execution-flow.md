@@ -18,7 +18,7 @@ The explicit `CALL gpu_execution('...')` function is also still supported.
 
 DuckDB's optimizer calls one Sirius hook registered via `OptimizerExtension`:
 
-1. **Optimizer mask (at extension load, not per query)**: `IN_CLAUSE`, `COMPRESSED_MATERIALIZATION` and `LATE_MATERIALIZATION` are unioned into `disabled_optimizers` once when the extension loads, because those can produce DuckDB-internal plan shapes the transparent rebind path cannot yet execute. `STATISTICS_PROPAGATION` remains enabled; its folded `EXPRESSION_GET`/`COLUMN_DATA_SCAN` and `DUMMY_SCAN` sources are translated to `GPU_VALUES`.
+1. **Optimizer mask (at extension load, not per query)**: `IN_CLAUSE`, `COMPRESSED_MATERIALIZATION`, `LATE_MATERIALIZATION`, and the [shared aggregate and scan exclusions](../../src/planner/unsupported_optimizers.hpp) are unioned into `disabled_optimizers` once when the extension loads, because those can produce DuckDB-internal plan shapes the transparent rebind path cannot yet execute. `STATISTICS_PROPAGATION` remains enabled; its folded `EXPRESSION_GET`/`COLUMN_DATA_SCAN` and `DUMMY_SCAN` sources are translated to `GPU_VALUES`.
 
 2. **Post-optimization** (`sirius_optimizer_hook`): Copies the optimized logical plan via `LogicalOperator::Copy()` and stores it on the connection's per-connection state, stamped with the connection's current planning generation.
 
@@ -30,7 +30,7 @@ DuckDB's optimizer calls one Sirius hook registered via `OptimizerExtension`:
 
 4. DuckDB's executor runs `PhysicalSiriusExecution::GetData()`, which delegates to the Sirius GPU engine (Step 3 below).
 
-## Step 1b: Explicit Table Function Path (Legacy)
+## Step 1b: Explicit Table Function Path
 
 **File:** `src/sirius_extension.cpp`
 
@@ -59,7 +59,7 @@ If GPU execution fails at runtime (and `enable_duckdb_fallback` is true), the op
 1. `sirius_pending_statement_or_prepared_statement()`:
    - Calls `begin_query_internal()` to set up the active query context
    - Calls `sirius_pending_statement_internal()` which:
-     - Creates a `sirius_engine(context, sirius_iface)`
+     - Creates a `sirius_engine(context, query_id, query_label, session_label)` (the labels are optional telemetry names)
      - Creates a `sirius_physical_materialized_collector` as the result sink
      - Calls `engine.initialize(collector)` to build pipelines (see Step 4)
      - Returns a `PendingQueryResult`
@@ -111,29 +111,24 @@ After meta-pipeline construction, `initialize_internal()` applies Sirius-specifi
 - Sinks are pushed into operator arrays
 - Source references are set
 - Parent-child dependencies are established
-- Sibling partition operators are linked for hash joins
 - The finalized pipeline list is stored in `new_scheduled`
 
 ## Step 5: Execution
 
 **File:** `src/sirius_engine.cpp` — `execute()`
 
-1. Creates a `query` object from `new_scheduled` pipelines with a pipeline hashmap
-2. Calls `task_scheduler.start_query(query)` which:
-   - Creates a `completion_handler` with promise/future
-   - Distributes the handler to all sub-executors
-   - Schedules the initial GPU scan tasks
-   - Returns the future
-
-3. The main thread blocks on `future.get()` until the query completes
+1. Creates this query's `completion_handler` and obtains its future
+2. Calls `SiriusContext::create_query()` with the finalized pipelines and handler; query preparation makes the handler available to its pipeline tasks
+3. Calls `task_scheduler::start_query(query)`, which schedules the initial scan operator
+4. The main thread blocks on its future and validates completion before returning; an error drains in-flight work
 
 ## Step 6: Scan Execution
 
-**Files:** `src/include/scan_manager/sirius_scan_manager.hpp`, `src/op/scan/sirius_gpu_scan_operator.cpp`, `src/io/io_context.cpp`
+**Files:** `src/scan_manager/sirius_scan_manager.hpp`, `src/op/scan/sirius_gpu_scan_operator.cpp`, `src/io/io_context.cpp`
 
 Scans run as a normal pipeline source on the GPU executor — there is no separate scan executor. Two cooperating pieces drive them:
 
-1. **Scan manager (per-query setup + I/O).** During `prepare_for_query()`, `sirius_scan_manager` walks the query's scan operators in order. For each scan it selects a provider: `split_provider` on a cache miss, `cached_databatch_provider` on a cache hit. Providers push splits into the connector the operator created at plan time. The operator retains the ingestible the plan generator created. A driver thread then runs the providers sequentially, populating each connector with splits.
+1. **Scan manager (per-query setup + I/O).** During `prepare_for_query()`, `sirius_scan_manager` walks the query's scan operators in order. A cache miss gets a disk-reading `split_provider`; a pinned-cache hit is served by a cached batch provider in that query's coalescer slot. The per-query sequencer coalesces metadata, balances each split, and pushes it into the connector the operator created at plan time. The operator retains the ingestible the plan generator created.
 2. **I/O layer.** The split providers read bytes through the scan manager's `io_context`: io_uring for local disk, with REST and kvikio backends resolved by per-backend path checkers via the datasource factory. The prefetching cache fronts the uring and REST backends.
 3. **GPU scan source (materialization).** The unified `sirius_gpu_scan_operator` pulls splits from its `split_connector` (`get_next_task_input_data`) and, in `execute()`, delegates each split to the installed `gpu_ingestible`'s `materialize_table` (and conditional `post_filter_and_project`). This runs as a `gpu_pipeline_task` on a GPU executor worker thread and publishes GPU-ready batches to the data repository, scheduling downstream consumers via `task_creator->schedule()`.
 
@@ -155,6 +150,9 @@ The GPU executor's manager loop:
    - On success: check if query is complete (RESULT_COLLECTOR sink + pipeline finished)
    - If not complete: schedule downstream consumers via `task_creator->schedule()`
    - If complete: `completion_handler->mark_completed()`
+
+The GPU epilogue usually signals completion. A query-terminal pipeline also signals from
+`sirius_pipeline::update_pipeline_status()`, covering finish transitions driven by other threads.
 
 ## Step 8: Task Creation Cycle
 
@@ -186,12 +184,14 @@ After the future resolves:
 If any task throws an exception during execution:
 
 1. The GPU executor catches it and calls `completion_handler->report_error(exception)`
-2. `drain_after_error()` is called on the pipeline executor which:
-   - Stops the task creator threads
-   - Drains the task queue
-   - Calls `drain_and_wait()` on the GPU executors
-   - Restarts the task creator for the next query
-3. The error propagates through the future to the main thread, surfacing as an error-carrying result at `PhysicalSiriusExecution::GetData()`
+2. The query owner observes the error through its future and calls `SiriusContext::retire_query_work()`:
+   - Closes the query's submission gate and waits for admitted publishers
+   - Stops and joins that query's scan producers while retaining buffers
+   - Discards that query's creator/scheduler queues and queued pool work
+   - Leaves accepted GPU staging tasks for their managers to consume, preserving readiness
+   - Waits for work leases before releasing query resources
+3. The error surfaces as an error-carrying result at `PhysicalSiriusExecution::GetData()`.
+   Shared pools and managers remain available for other queries.
 
 On the transparent path, that error triggers the runtime CPU fallback described in Step 2 (unless `enable_duckdb_fallback` is false, the error is a user interrupt, or the query reads S3). The fallback runs the stashed DuckDB CPU plan in the same transaction, so a runtime GPU failure completes on CPU rather than failing the query.
 
@@ -203,6 +203,7 @@ sequenceDiagram
     participant Ext as sirius_extension
     participant Iface as sirius_interface
     participant Engine as sirius_engine
+    participant Context as SiriusContext
     participant PE as task_scheduler
     participant SM as sirius_scan_manager
     participant GPE as gpu_pipeline_executor
@@ -215,11 +216,14 @@ sequenceDiagram
     Iface->>Engine: initialize(result_collector)
     Engine->>Engine: Build pipelines, rewrite scans to GPU scan source, wire repos
     Iface->>Engine: execute()
-    Engine->>PE: start_query(pipelines)
-    PE->>CH: create completion_handler
-    PE->>SM: prepare_for_query (split providers + connectors)
+    Engine->>CH: create completion_handler and future
+    Engine->>Context: create_query(pipelines, handler)
+    Context->>TC: prepare_for_query(query, handler)
+    Context->>SM: prepare_for_query(query, GPUs)
     SM->>SM: drive splits through io_context + prefetch cache
-    PE->>GPE: schedule initial GPU scan tasks
+    Engine->>PE: start_query(query)
+    PE->>TC: schedule initial scan operator
+    TC->>GPE: schedule initial GPU scan tasks
     GPE->>SM: pull splits via split_connector
     GPE->>GPE: materialize via gpu_ingestible, publish to repos
     GPE->>TC: schedule(downstream_op)

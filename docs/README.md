@@ -10,20 +10,26 @@
   </a>
 </p>
 
-Sirius is a GPU-native SQL engine. It plugs into existing databases such as DuckDB via the standard Substrait query format, requiring no query rewrites or major system changes. Sirius currently supports DuckDB and Starrocks (coming soon), other systems marked with * are on our roadmap. Built on NVIDIA CUDA-X libraries including cuDF and RAPIDS Memory Manager (RMM), Sirius delivers high-performance GPU-accelerated analytics.
+Sirius is a GPU-Native Composable Analytics Engine. It plugs into existing databases via the standard Substrait query format, requiring no query rewrites or major system changes. Sirius currently supports DuckDB and Starrocks (coming soon), other systems marked with \* are on our roadmap. Built on NVIDIA CUDA-X libraries including cuDF, cuVS, and cuCascade, Sirius delivers high-performance GPU-accelerated analytics.
 
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="super-sirius-arch-dark.png">
-    <source media="(prefers-color-scheme: light)" srcset="super-sirius-arch.png">
-    <img src="super-sirius-arch.png" alt="Sirius architecture" width="700"/>
-  </picture>
+  <img src="super-sirius-arch.png" alt="Sirius architecture: a GPU-Native Composable Analytics Engine" width="700"/>
 </p>
 
-## Performance
-Running TPC-H on 1TB data, Sirius accelerates DuckDB by 5x on DGX Station (GB300).
+## Concurrent queries
 
-![Performance](super-sirius-perf.png)
+Use separate connections to one DuckDB DatabaseInstance and set startup
+`sirius.max_concurrent_queries` (default 1). See the [concurrent-query guide](super-sirius/concurrent-queries.md)
+for admission, maintenance, cancellation, memory pressure and qualification scope.
+
+## Performance
+
+TPC-H hot runs on AWS, 22 queries · best Sirius g7e size vs DuckDB on m9g.16xlarge · cost per run, log scales · lower left is better.
+
+![TPC-H hot-run query time and cost per run on AWS: Sirius versus DuckDB](super-sirius-perf.png)
+
+For the legacy Sirius implementation used for the ClickBench results, see the
+[`legacy-dev` archive (pinned at `f79a6f42`)](https://github.com/sirius-db/sirius/tree/f79a6f423fe69ef892ca0af03bef9c352d88cc79).
 
 ## Requirements
 - Linux on amd64/x86_64 or arm64/aarch64 with `glibc >= 2.28`.
@@ -37,6 +43,16 @@ Running TPC-H on 1TB data, Sirius accelerates DuckDB by 5x on DGX Station (GB300
 - Git (to clone the repo)
 - Pixi (install instructions [here](https://pixi.sh/latest/installation/))
 
+## Installing a Prebuilt Sirius Release
+
+Getting started? Download one of our prebuilt extensions instead of building from source:
+
+- [`stable`](https://github.com/sirius-db/sirius/releases/tag/stable): a maintainer-selected build, promoted manually
+- [`latest`](https://github.com/sirius-db/sirius/releases/tag/latest): tracks the newest successful build on `main` automatically, possible to encounter breaking changes
+
+Both include full install instructions in the release notes: installing a matching DuckDB
+version, downloading the right binary for your platform, and a sample query to try it with.
+
 ## Building and Running Sirius
 
 For full build instructions, alternate build types, pre-commit setup, and testing, see [DEVELOPMENT.md](DEVELOPMENT.md).
@@ -46,31 +62,88 @@ Quick start:
 ```bash
 git clone --no-recurse-submodules https://github.com/sirius-db/sirius.git
 cd sirius
-git submodule update --init --depth=1 --jobs 3 duckdb substrait cucascade
+git submodule update --init --depth=1 --jobs 5 duckdb substrait cucascade sirius-duckdb/duckdb sirius-duckdb/extension-ci-tools
 pixi run make TEST_BUILD_TARGET=
-./build/release/duckdb
+pixi run duckdb
 ```
 
 Alternatively, load the extension into an existing DuckDB shell:
 
 ```sql
-LOAD 'build/release/extension/sirius/sirius.duckdb_extension';
+LOAD 'sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension';
 ```
 
 Either way, all DuckDB queries are automatically intercepted by the optimizer hook and run on GPU — no query rewrites required. Queries with unsupported operators fall back silently to CPU.
 
 ```sql
+-- Load the TPC-H extension and generate data (scale factor 10 = ~10 GB)
+INSTALL tpch;
+LOAD tpch;
+CALL dbgen(sf=10);
+
 -- Plain SQL runs on GPU automatically
 SELECT l_returnflag, sum(l_quantity)
 FROM lineitem
 GROUP BY l_returnflag
 ORDER BY l_returnflag;
 
+-- TPC-H data is exported as Parquet for use in later examples
+COPY lineitem TO '/path/to/lineitem.parquet' (FORMAT PARQUET);
+
 -- Disable transparent GPU execution for this connection
 SET gpu_execution = false;
+-- ... or for every connection of this database instance without a session value
+SET GLOBAL gpu_execution = false;
 ```
 
 Execution is out-of-core with tiered memory management (GPU/host/disk), automatic data partitioning, and spilling, and works with both **Parquet** and **DuckDB-native** storage. See [`gpu_execution`](gpu_execution.md) for build, configuration, and testing details.
+
+## Python API
+
+Use Sirius through DuckDB's Python API: load the extension, execute SQL, and fetch results.
+Supported queries run on the GPU automatically, just as they do in the DuckDB shell.
+
+The v2 extension requires the exact DuckDB revision pinned in this repository.
+Use the built CLI above. The default environment's DuckDB 1.5 Python package cannot
+load this extension; Python use requires a package built from the matching revision.
+
+Save this example as `example.py` in the repository root and replace `/path/to/lineitem.parquet`
+with your TPC-H Parquet file. `allow_unsigned_extensions` allows loading the locally built
+extension.
+
+```python
+import duckdb
+
+con = duckdb.connect(":memory:", config={"allow_unsigned_extensions": "true"})
+con.execute("""
+    CREATE VIEW lineitem AS
+    SELECT * FROM read_parquet('/path/to/lineitem.parquet')
+""")
+
+con.execute("LOAD 'sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension'")
+rows = con.execute("""
+    SELECT l_returnflag, SUM(l_quantity) AS total_quantity
+    FROM lineitem
+    GROUP BY l_returnflag
+    ORDER BY l_returnflag
+""").fetchall()
+
+print(rows)
+con.close()
+```
+
+Run it from the repository root:
+
+```bash
+pixi run python example.py
+```
+
+For an example using TPC-H data from Parquet files or a DuckDB database, see the
+[Python benchmark script](../test/tpch_performance/performance_test.py).
+
+The Python benchmark and power/throughput runners require a Python DuckDB client
+built from the pinned v2 revision; the default environment's 1.5 client cannot
+load this extension. The CLI-based scripts use the built v2 host.
 
 ## Pinning Tables for Hot Runs
 
@@ -104,6 +177,39 @@ Deletes and committed inserts on pinned DuckDB tables are reconciled per query. 
 pinned; run `CALL unpin_table(...)` before updating it. An explicit `CHECKPOINT` while a pin is
 live makes that pin ineligible to serve: subsequent queries fall back or error until the table is
 unpinned and pinned again.
+
+### Compression with Simpatico
+
+Sirius can use Simpatico to compress pinned data in GPU or host memory. After loading Sirius,
+set both compression options **before** calling `pin_table`. This example runs from the
+repository root and uses the bundled TPC-H SF1000 compression plans:
+
+```sql
+SET pin_table_compression = true;
+SET pin_table_input_compression_plan_dir = 'src/compression/simpatico_codegen/plans/tpch_sf1000';
+
+CALL pin_table('/path/to/lineitem.parquet', name = 'lineitem', tier = 'gpu',
+               cols = ['l_returnflag', 'l_quantity']);
+
+-- Normal SQL reads the compressed pinned data automatically
+SELECT l_returnflag, SUM(l_quantity) AS total_quantity
+FROM read_parquet('/path/to/lineitem.parquet')
+GROUP BY l_returnflag
+ORDER BY l_returnflag;
+
+CALL unpin_table('lineitem');
+```
+
+Use `tier = 'host'` to pin compressed data in host memory. For other datasets, point the plan
+directory at plans matching your table schemas. A plan file must match the pinned table's
+`name` (for example, `lineitem.txt`) and contain one column plan per full-table column in schema
+order. Tables without a matching plan, small batches, and batches with insufficient compression
+savings remain uncompressed. To change whether an existing pin is compressed, unpin and pin it
+again. Restart the process when changing a previously loaded compression plan.
+
+From Python, execute the same SQL with `con.execute(...)` after loading the extension and before
+querying. See the [compressed pinning guide](super-sirius/compressed-pinning.md) for plan selection
+and tuning.
 
 ## Configuration
 
@@ -159,23 +265,25 @@ exporter, per-query labeling, generating telemetry (using a TPC-H helper), and v
 Sirius is under active development. Notable current limitations include:
 
 - **Data Type Coverage:** Sirius currently supports commonly used data types including `INTEGER`, `BIGINT`, `FLOAT`, `DOUBLE`, `VARCHAR`, `DATE`, `TIMESTAMP`, and `DECIMAL`. We are actively working on supporting additional data types—such as nested types.
-- **Operator Coverage:** At present, Sirius supports `FILTER`, `PROJECTION`, `JOIN` (Hash/Nested Loop/Delim), `GROUP-BY`, `ORDER-BY`, `AGGREGATION`, `TOP-N`, `LIMIT`, and `CTE`. We are working on adding more advanced operators such as `WINDOW` functions and `ASOF JOIN`, etc.
+- **Operator Coverage:** At present, Sirius supports `FILTER`, `PROJECTION`, `JOIN` (Hash/Nested Loop/Delim), `GROUP-BY`, `ORDER-BY`, `AGGREGATION`, `TOP-N`, `LIMIT`, and `CTE`. We are working on adding more advanced operators such as `WINDOW` functions and `ASOF JOIN`.
 
-For a full list of current limitations and ongoing work, please refer to our [GitHub issues page](https://github.com/sirius-db/sirius/issues). **If these issues are encountered when running Sirius, Sirius will gracefully fallback to DuckDB query execution on CPUs.**
+- **DuckDB v2 regex rewrites:** Whole-input backreference replacements, including the ClickBench Q28 URL pattern, are rewritten to `regexp_extract(..., 'k')` and currently require CPU fallback instead of using the GPU regex implementation. Tracked in [#2146](https://github.com/sirius-db/sirius/issues/2146).
+
+For a full list of current limitations and ongoing work, please refer to our [GitHub issues page](https://github.com/sirius-db/sirius/issues). Unsupported types and operators fall back to DuckDB CPU execution when fallback is enabled.
 
 ## Contributors and Partners
 
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="logo/combined-logos.png">
-    <source media="(prefers-color-scheme: light)" srcset="logo/combined-logos-light.png">
-    <img src="logo/combined-logos-light.png" alt="Contributors and partners: NVIDIA, University of Wisconsin-Madison, DuckDB, and VAST Data" width="700"/>
+    <source media="(prefers-color-scheme: light)" srcset="logo/combined-logos-light-transparent.png">
+    <img src="logo/combined-logos-light-transparent.png" alt="Contributors and partners: NVIDIA, University of Wisconsin-Madison, DuckDB, and VAST Data" width="700"/>
   </picture>
 </p>
 
 ## Future Roadmap
 Sirius is still under major development and we are working on adding more features to Sirius, such as multi-node, more operators, data types, accelerating more engines, and many more.
 
-Sirius always welcomes new contributors! If you are interested, check our [website](https://www.sirius-db.com/), reach out to our [email](siriusdb@cs.wisc.edu), or join our [slack channel](https://join.slack.com/t/sirius-db/shared_invite/zt-33tuwt1sk-aa2dk0EU_dNjklSjIGW3vg).
+Sirius always welcomes new contributors! If you are interested, check our [website](https://www.sirius-db.com/), reach out to our [email](mailto:siriusdb@cs.wisc.edu), or join our [slack channel](https://join.slack.com/t/sirius-db/shared_invite/zt-33tuwt1sk-aa2dk0EU_dNjklSjIGW3vg).
 
 **Let's kickstart the GPU eras for Data Analytics!**

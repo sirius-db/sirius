@@ -18,6 +18,7 @@
 
 #include "data/data_batch_utils.hpp"
 
+#include <cudf/sorting.hpp>
 namespace sirius {
 namespace op {
 
@@ -27,7 +28,7 @@ std::shared_ptr<cucascade::data_batch> gpu_order_impl::local_order_by(
   std::vector<cudf::order> const& column_order,
   std::vector<cudf::null_order> const& null_precedence,
   const std::vector<int>& projections,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   cucascade::memory::memory_space& memory_space,
   const telemetry::batch_telemetry_info& telemetry_info)
 {

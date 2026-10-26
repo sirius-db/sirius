@@ -9,26 +9,42 @@ nvcomp-Cascaded, bitcomp, ANS, bitextract/bitjoin — specified via a human-read
 ## Requirements
 
 - NVIDIA GPU (Turing or newer)
-- [pixi](https://prefix.dev/) (or conda)
+- [pixi](https://prefix.dev/)
 - CUDA 12.9 or CUDA 13.x
 
 ## Quick start
 
+Simpatico is built and tested as part of Sirius. From the Sirius repository root:
+
 ```bash
-# From the simpatico_codegen/ directory:
-pixi install          # install all C++ deps (libcudf, nvcomp, CUDA toolkit, cmake)
-pixi run build        # cmake configure + build
-pixi run test         # ctest
-pixi run simpatico -- --help   # show CLI help
+git submodule update --init --recursive
+pixi run make
+pixi run build/release/test/cpp/sirius_unittest "[compression]"
 ```
 
-## Building manually (inside pixi shell)
+On CUDA 12 systems, add `-e cuda12` to each `pixi run` command and use `pixi shell -e cuda12` instead of `pixi shell`.
+
+## Standalone CLI and tests
+
+The standalone build produces the `simpatico` CLI and the dedicated Simpatico CTest suite.
+It uses the Sirius repository's default CUDA 13 Pixi environment.
 
 ```bash
+# From the Sirius repository root:
+cd src/compression/simpatico_codegen
+pixi run cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+pixi run cmake --build build --parallel
+pixi run ctest --test-dir build --output-on-failure
+pixi run ./build/simpatico --help
+```
+
+To invoke `simpatico` directly for an interactive session, activate the environment once:
+
+```bash
+# From the Sirius repository root:
 pixi shell
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j$(nproc)
-cd build && ctest --output-on-failure
+cd src/compression/simpatico_codegen
+./build/simpatico --help
 ```
 
 ## CLI: `simpatico`
@@ -39,8 +55,9 @@ simpatico <mode> [options]
 Modes:
   benchmark   Timed compress+decompress (Parquet/binary/CSV input, plan file)
   explore     BFS cascade search for the best plan for a single column
-  compress    Compress input to a .hpln file
-  decompress  Decompress a .hpln file to Parquet
+  compress    Compress input to a .hpln file (--verify round-trips it)
+  decompress  Decompress a .hpln file to Parquet (--verify checks vs source)
+  plan        Print each column's compression plan (DSL) from a .hpln file
 ```
 
 Run `simpatico <mode> --help` for per-mode options.
@@ -49,13 +66,14 @@ Run `simpatico <mode> --help` for per-mode options.
 
 ```bash
 # Find the best plan for column 0 of a Parquet file
-simpatico explore --input data.parquet --col 0
+pixi run ./build/simpatico explore --input data.parquet --col 0
 
-# All columns of a TPC-H .tbl file (pipe-separated, no header)
-simpatico explore --input lineitem.tbl --beam-width 200 --max-depth 8
+# All columns of a Parquet file
+pixi run ./build/simpatico explore --input data.parquet \
+    --beam-width 200 --max-depth 8 > data.plan
 
 # Binary i64 column
-simpatico explore --input prices.bin --dtype i64
+pixi run ./build/simpatico explore --input prices.bin --dtype i64
 ```
 
 Output is a plan DSL block per column, separated by `---`.
@@ -63,27 +81,35 @@ Output is a plan DSL block per column, separated by `---`.
 ### Compress
 
 ```bash
-simpatico compress --input data.parquet --plan plans/example_plans.txt --out data.hpln
 # --verify decompresses in-memory and checks the round-trip matches the input
-simpatico compress --input data.parquet --plan plans/example_plans.txt --out data.hpln --verify
+pixi run ./build/simpatico compress \
+    --input data.parquet --plan data.plan --out data.hpln --verify
 ```
 
 ### Decompress
 
 ```bash
-simpatico decompress --input data.hpln --out data_out.parquet
-# --verify checks the decompressed output byte-for-byte against a source file
-simpatico decompress --input data.hpln --verify data.parquet
+pixi run ./build/simpatico decompress --input data.hpln --out data_out.parquet
+
+# --verify checks the decompressed table against a source file
+pixi run ./build/simpatico decompress --input data.hpln --verify data.parquet
+```
+
+### Plan
+
+```bash
+# Print the plans reconstructed from the serialized file
+pixi run ./build/simpatico plan --input data.hpln
 ```
 
 ### Benchmark
 
 ```bash
-simpatico benchmark --input data.parquet --plan plans/intraday_balanced.txt \
+pixi run ./build/simpatico benchmark --input data.parquet --plan data.plan \
     --warmup 5 --iters 20
 
 # Full-table parallel mode (8 threads)
-simpatico benchmark --input data.parquet --plan plans/intraday_balanced.txt \
+pixi run ./build/simpatico benchmark --input data.parquet --plan data.plan \
     --mode full-table --threads 8 --csv-out results.csv
 ```
 
@@ -162,25 +188,62 @@ auto result = simpatico::explore_column_compression(col_view, cfg, stream, mr);
 ## JIT kernel cache
 
 The fused compress/decompress kernels are generated as CUDA-C++ source at runtime — one
-kernel per compression-tree *shape* — then compiled with NVRTC and cached so a given shape
-is compiled only once. The beam-search explorer alone enumerates hundreds of thousands of
-candidate shapes, so this cache is what makes runtime codegen practical.
+kernel per compression-tree *shape* — then compiled with NVRTC and cached for reuse. The
+beam-search explorer enumerates hundreds of thousands of candidate shapes, so this cache is
+what makes runtime codegen practical.
 
-There are two levels, both keyed by the same tuple: a 64-bit FNV-1a digest of the rendered
-source (plus the kernel entry symbol), the GPU architecture (`sm_XX`), the CUDA runtime
-version, and the driver version. Keying on all four means a renderer change, a different
-GPU, or a toolchain upgrade can never produce a false hit.
+Both cache levels use one compilation identity, specified in [CACHE_FORMAT.md](CACHE_FORMAT.md).
+The request identifies the rendered source, entry symbol, program name, architecture, and
+actual ordered NVRTC options. The environment identifies both project JIT headers and the
+complete CCCL bundle, plus the reported NVRTC major/minor version. XXH3-128 makes
+accidental collisions unlikely, not impossible.
 
-1. **In-memory** (per process, thread-safe): `shape → compiled kernel`. A shape compiled
-   during `compress` is reused by `decompress` in the same process.
+1. **In-memory** (per process, thread-safe): request digest → compiled kernel. The embedded
+   environment is fixed within the binary, so it is not copied or rehashed on warm lookups.
 2. **On-disk** (persistent, shared across processes and runs): each cubin is stored as
-   `<dir>/<digest>_a<arch>_c<cudart>_d<driver>.cubin`, published atomically (write to a
-   pid-unique temp, then `rename`) so concurrent processes never observe a half-written
-   file. On a hit the cubin is loaded directly, skipping NVRTC. A corrupt or
-   toolchain-incompatible file simply fails to load and falls through to a fresh compile.
+   `<dir>/v2/<environment-id>/<request-id>.cubin`. On a hit the cubin is loaded directly,
+   skipping compilation of the requested kernel. The reader validates the record's length,
+   size limit and payload checksum before CUDA loading. Invalid storage records and
+   reported CUDA load errors fall through to a fresh compile.
 
 Lookup order per shape: in-memory → on-disk → NVRTC compile (a fresh compile then populates
-both levels).
+both levels). Concurrent cold requests may compile redundantly.
+
+Shared and static builds use `nvrtcVersion` major/minor; same-version compiler patches
+intentionally retain disk reuse. Compiler/builtins files and static archives are not hashed,
+and no loader/procfs scan or builtins-loading probe is needed. CUDA runtime/driver tags,
+provider/linkage labels, and host-object epochs are not identity inputs. The target SM is
+already keyed through the effective compiler options; a compatible CUDA driver is still
+required. A version-query failure reports the NVRTC error, rather than identifying the
+compiler as version zero. Disk-disabled compilation and memory hits do not query the version.
+Storage errors remain best-effort cache misses; they do not suppress a version-query error.
+Replacing the compiler or runtime while a process is running is not supported.
+
+First disk use in each process touches the current environment, removes recognized legacy
+flat entries, and prunes old environments. Keep the current environment plus the three newest
+others, with a one-hour grace period for additional environments. Only recognized v2 records
+and cache temporaries are removed; unrelated files, nested content, unknown versions, and
+symlinks are preserved. Pruning is best effort, not a strict directory/byte cap or live-process
+lease: a long-running older process can lose disk reuse or a pending publication and recompile.
+Memory hits and later disk hits neither refresh timestamps nor rerun pruning.
+
+`codegen::jit::clear_jit_disk_cache()` remains explicit maintenance with writers stopped.
+It removes recognized legacy/v2 records and abandoned temporaries across all environments,
+including the current one, regardless of age. Already-loaded kernels are unaffected.
+
+Disk records carry a length and payload checksum, validated before CUDA loading.
+Publication uses an exclusively created, unique temporary file followed by rename.
+Failed writes/close/rename remove only that writer's temporary file. Missing, unreadable,
+truncated, corrupt, or incompatible entries are misses; successful compilation repairs
+the entry without first deleting another writer's destination. No power-loss durability
+is promised. Cubins larger than 256 MiB skip persistence but remain usable in memory.
+Use a trusted cache directory: checksums detect corruption, not malicious tampering.
+A complete valid record copied under the wrong request filename still passes the payload
+checksum; the record does not embed or verify the requested compilation identity.
+
+The format and cleanup details are in [CACHE_FORMAT.md](CACHE_FORMAT.md). Header providers
+remain embedded and libcudf-aligned on CUDA 12 and 13; NVRTC bundled-header adoption is
+separate work.
 
 ### Self-contained JIT (no header tree at runtime)
 
@@ -191,10 +254,25 @@ headers (`nvrtcCreateProgram`):
 
 - the two project headers (`codegen/decode/rle_block.cuh`, `codegen/stdint_shim.hpp`), embedded
   by `cmake/embed_jit_headers.cmake`;
-- the CCCL closure (`<cuda/std/...>`, `<cub/...>`, and `<thrust/...>`) — the transitive
-  `#include` set reachable from the kernel preludes, scanned at build time and embedded by
-  `cmake/embed_cccl_headers.cmake` (so it tracks the CCCL version the extension is built
-  against).
+- the complete installed CCCL library trees (`cuda/`, `cub/`, `thrust/`, and `nv/`),
+  embedded by `cmake/embed_cccl_headers.cmake`, including internal and extensionless headers.
+
+Simpatico links to `cudf::cudf`, inheriting libcudf's CCCL headers and namespace/feature
+definitions through its exported CMake targets. CMake also supplies the embedding script
+with the evaluated include directories from `CCCL::CCCL`. This supports both installed
+packages and source checkouts with separate CUB, Thrust, and libcudacxx include directories.
+For nonstandard installations, use the usual CMake package discovery settings such as
+`CMAKE_PREFIX_PATH` or `cudf_DIR`.
+
+Each bundle has one XXH3-128 identity over sorted logical names and normalized
+header contents (CRLF/CR become LF). CMake invokes the package-provided `xxhsum -H128`
+at build time; runtime identity code uses xxHash header-only, with no xxHash shared
+library dependency. Pixi supplies `xxhash`; vcpkg supplies the headers and a host
+`xxhash[xxhsum]` tool. Header edits, additions, removals, and renames rebuild the bundle.
+
+The embedded libraries are the approved runtime header inventory. No runtime include
+directory override is supported, and source-directory include lookup is disabled.
+To change the library headers, rebuild Sirius. This is not a compiler security sandbox.
 
 As a result the runtime JIT needs **no CCCL/CUDA headers on disk** — only the driver and the
 `libnvrtc` runtime (which the Sirius vcpkg build links statically via the `nvrtc` overlay port).
@@ -203,9 +281,8 @@ As a result the runtime JIT needs **no CCCL/CUDA headers on disk** — only the 
 
 | Variable | Effect |
 | --- | --- |
-| `SIMPATICO_JIT_CCCL_INCLUDE` | Optional escape hatch. The CCCL headers are embedded in the binary, so this is normally unset. If a future renderer change needs a header the embedded closure lacks, set this to a CCCL dir (containing `cuda/std/cstdint`) and it is passed to NVRTC as an extra `-I`. |
 | `SIMPATICO_JIT_CACHE_DIR` | On-disk cache location. Default: `${XDG_CACHE_HOME:-$HOME/.cache}/simpatico/jit`. Set to `off`, `0`, or empty to disable the on-disk cache (in-memory only). |
-| `SIMPATICO_JIT_STATS` | If set, prints `compiles / mem_hits / disk_hits / compile_ms` per process at exit. |
+| `SIMPATICO_JIT_STATS` | If set, prints `compiles / mem_hits / disk_hits / compile_ms` for requested kernels at exit. |
 | `CODEGEN_JIT_DUMP_CUBIN` | Debug: if set to a path, writes the compiled cubin there. |
 | `CODEGEN_JIT_DUMP_ENCODE_SOURCE` / `CODEGEN_JIT_DUMP_DECODE_SOURCE` | Debug: if set to a path, writes the rendered encode/decode CUDA source there. |
 
@@ -215,6 +292,6 @@ the on-disk cache is disabled automatically (the in-memory cache still applies).
 ## Running tests
 
 ```bash
-pixi run test          # full ctest
-cd build && ctest -R roundtrip   # run a specific test by name regex
+pixi run ctest --test-dir build --output-on-failure
+pixi run ctest --test-dir build -R roundtrip --output-on-failure
 ```

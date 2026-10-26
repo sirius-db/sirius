@@ -20,6 +20,7 @@
 #include "expression/ast/utils.hpp"
 #include "helper/numeric_narrowing.hpp"
 #include "op/sirius_physical_delim_join.hpp"
+#include "op/sirius_physical_dense_count_join.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_hash_join.hpp"
@@ -435,13 +436,35 @@ carried_columns analyze_subtree(sirius::op::sirius_physical_operator& op, policy
       return map;
     }
 
+    case sirius::op::SiriusPhysicalOperatorType::DENSE_COUNT_JOIN: {
+      if (op.children.size() != 2) { break; }
+      auto const& join             = op.Cast<sirius::op::sirius_physical_dense_count_join>();
+      auto const preserved_key_idx = join.preserved_key_idx();
+      auto const counted_key_idx   = join.counted_key_idx();
+      if (preserved_key_idx >= child_maps[0].size() || counted_key_idx >= child_maps[1].size() ||
+          (join.counted_value_idx() && *join.counted_value_idx() >= child_maps[1].size())) {
+        break;
+      }
+
+      // Keys require native values; COUNT(col) uses only its validity mask. Output is native
+      // [key, BIGINT] with no forwarded carrier.
+      auto mark_key = [&state](carried_columns const& side, std::size_t key_idx) {
+        if (side[key_idx]) { state.candidates[*side[key_idx]].boundary_restore = true; }
+      };
+      mark_key(child_maps[0], preserved_key_idx);
+      mark_key(child_maps[1], counted_key_idx);
+      return carried_columns(op.types.size());
+    }
+
     case sirius::op::SiriusPhysicalOperatorType::HASH_GROUP_BY: {
       // The exact eligibility ladder of the propagation case; any failing precondition falls
       // through to the native boundary below.
       if (op.children.size() != 1) { break; }
       auto const& aggregate = op.Cast<sirius::op::sirius_physical_grouped_aggregate>();
-      if (aggregate.grouping_sets.size() > 1) { break; }
-      if (aggregate.has_avg || aggregate.has_count_distinct) { break; }
+      if (aggregate.has_grouping_sets()) { break; }
+      if (aggregate.has_avg || aggregate.has_count_distinct || aggregate.has_stddev_samp()) {
+        break;
+      }
       if (op.types.size() != aggregate.group_idx.size() + aggregate.aggregate_slots.size()) {
         break;
       }

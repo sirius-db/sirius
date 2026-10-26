@@ -1,0 +1,30 @@
+html {
+  --primary-color: #2563a6;
+  --primary-dark-color: #194779;
+  --primary-light-color: #e8f1fb;
+  --border-radius-small: 6px;
+  --border-radius-medium: 10px;
+  --border-radius-large: 14px;
+}
+
+#projectlogo img {
+  width: 190px;
+  height: auto;
+  padding: 12px 20px;
+}
+
+#projectbrief {
+  font-size: 0.9rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  html {
+    --primary-color: #8cbfff;
+    --primary-dark-color: #bfdcff;
+    --primary-light-color: #23364d;
+  }
+
+  #projectlogo img {
+    content: url("sirius_dark_full.svg");
+  }
+}

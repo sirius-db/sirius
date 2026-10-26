@@ -58,9 +58,22 @@ std::string operator_chain(const sirius_pipeline& pipeline)
     sirius::pipeline::sirius_plan_printer::build_operator_chain(pipeline), kIdToken, "");
 }
 
+std::string normalize_contract_runtime_ids(std::string dump)
+{
+  // Contract handles are process-wide monotonic and finalize generations advance per planning
+  // attempt. Both are required in the diagnostic dump, but neither is schedule structure.
+  static const std::regex kHandle{"(handle=)\\d+"};
+  static const std::regex kFinalizeGeneration{"(finalize_generation=)\\d+"};
+  dump = std::regex_replace(dump, kHandle, "$1<volatile>");
+  dump = std::regex_replace(dump, kFinalizeGeneration, "$1<volatile>");
+  // Measured certification durations vary between attempts; keep byte counts,
+  // verdicts, required checks and the entire schedule in the comparison.
+  static const std::regex kDurations{"((?:added_time_us|delete_preparation_time_us)=)\\d+"};
+  return std::regex_replace(dump, kDurations, "$1<volatile>");
+}
+
 //! Every pipeline must appear after all of its `dependencies` (producers).
-void require_strictly_topological(
-  const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& scheduled)
+void require_strictly_topological(const std::vector<std::shared_ptr<sirius_pipeline>>& scheduled)
 {
   std::unordered_map<const sirius_pipeline*, size_t> position;
   for (size_t i = 0; i < scheduled.size(); i++) {
@@ -91,17 +104,16 @@ void require_canonical_schedule(duckdb::Connection& con, const std::string& quer
     // pipeline_id equals the vector position; `dependencies` sorted by it (printer order).
     for (size_t i = 0; i < scheduled.size(); i++) {
       REQUIRE(scheduled[i]->get_pipeline_id() == i);
-      REQUIRE(std::is_sorted(scheduled[i]->dependencies.begin(),
-                             scheduled[i]->dependencies.end(),
-                             [](const duckdb::shared_ptr<sirius_pipeline>& a,
-                                const duckdb::shared_ptr<sirius_pipeline>& b) {
-                               return a->get_pipeline_id() < b->get_pipeline_id();
-                             }));
+      REQUIRE(std::is_sorted(
+        scheduled[i]->dependencies.begin(),
+        scheduled[i]->dependencies.end(),
+        [](const std::shared_ptr<sirius_pipeline>& a, const std::shared_ptr<sirius_pipeline>& b) {
+          return a->get_pipeline_id() < b->get_pipeline_id();
+        }));
     }
 
     // Join dependencies are build-side-first: dependencies[0] is the build CONCAT
-    // (finalize_pipeline_structure front-inserts it; link_join_partition_siblings and
-    // dynamic-filter scheduling read the slots positionally).
+    // (finalize_pipeline_structure front-inserts it for dynamic-filter scheduling).
     for (const auto& pipeline : scheduled) {
       auto source = pipeline->get_source();
       if (!source || (source->type != sirius::op::SiriusPhysicalOperatorType::HASH_JOIN &&
@@ -113,7 +125,7 @@ void require_canonical_schedule(duckdb::Connection& con, const std::string& quer
       auto build_sink = pipeline->dependencies[0]->get_sink();
       REQUIRE(build_sink);
       REQUIRE(build_sink->type == sirius::op::SiriusPhysicalOperatorType::CONCAT);
-      CHECK(build_sink->Cast<sirius::op::sirius_physical_concat>().is_build_concat());
+      CHECK(source->input_port_for(*build_sink) == "build");
     }
 
     // Reordering an already-canonical schedule is a no-op.
@@ -132,7 +144,7 @@ void require_canonical_schedule(duckdb::Connection& con, const std::string& quer
   // Convert-twice raw-schedule determinism (see the battery doc above).
   auto first_raw  = sirius::test::convert_query_to_raw_schedule(con, query);
   auto second_raw = sirius::test::convert_query_to_raw_schedule(con, query);
-  REQUIRE(first_raw == second_raw);
+  REQUIRE(normalize_contract_runtime_ids(first_raw) == normalize_contract_runtime_ids(second_raw));
 }
 
 //! The 8 TPC-H tables as views over the committed parquet fixtures.

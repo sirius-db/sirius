@@ -15,10 +15,10 @@
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
+#include <cuda/stream>
 #include <cuda_runtime.h>
 
 #include <nvcomp/ans.h>
@@ -43,8 +43,10 @@ detail::batched_codec_ops const& ans_ops()
 
     detail::batched_codec_ops o;
     o.chunk_size             = kAnsManagerChunkSize;
-    o.compress_get_temp_size = [copts](size_t nc, size_t mc, size_t* tb, size_t mt) {
-      return nvcompBatchedANSCompressGetTempSizeAsync(nc, mc, copts, tb, mt);
+    o.compress_get_temp_size = [copts](
+                                 size_t nc, size_t mc, size_t* tb, size_t mt, cudaStream_t stream) {
+      return SIMPATICO_NVCOMP_GET_TEMP_SIZE(
+        nvcompBatchedANSCompressGetTempSize, stream, nc, mc, copts, tb, mt);
     };
     o.compress_get_max_output = [copts](size_t mc, size_t* mo) {
       return nvcompBatchedANSCompressGetMaxOutputChunkSize(mc, copts, mo);
@@ -61,9 +63,11 @@ detail::batched_codec_ops const& ans_ops()
                                cudaStream_t s) {
       return nvcompBatchedANSCompressAsync(up, ub, mc, nc, t, tb, cp, cb, copts, st, s);
     };
-    o.decompress_get_temp_size = [dopts](size_t nc, size_t mc, size_t* tb, size_t mt) {
-      return nvcompBatchedANSDecompressGetTempSizeAsync(nc, mc, dopts, tb, mt);
-    };
+    o.decompress_get_temp_size =
+      [dopts](size_t nc, size_t mc, size_t* tb, size_t mt, cudaStream_t stream) {
+        return SIMPATICO_NVCOMP_GET_TEMP_SIZE(
+          nvcompBatchedANSDecompressGetTempSize, stream, nc, mc, dopts, tb, mt);
+      };
     o.decompress_async = [dopts](void const* const* cp,
                                  size_t const* cb,
                                  size_t const* ubuf,
@@ -82,16 +86,16 @@ detail::batched_codec_ops const& ans_ops()
 }
 }  // namespace
 
-std::unique_ptr<cudf::column> ans_compressed_representation::decompress(
-  rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr) const
+std::unique_ptr<cudf::column> ans_compressed_representation::decompress(decode_frame& frame) const
 {
+  detail::require_nvcomp_payload_format("ans", payload_format);
   return detail::nvcomp_decompress_impl(
-    ans_ops(), payload_data(), payload_size(), original_type, num_rows, stream, mr);
+    ans_ops(), payload_data(), payload_size(), original_type, num_rows, frame);
 }
 
 std::unique_ptr<compressed_representation> ans_compressor::compress(
   cudf::column_view column_to_compress,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
   auto const dt = column_to_compress.type();

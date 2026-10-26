@@ -11,6 +11,9 @@
 #include "codegen/plan/plan_interpreter.hpp"
 #include "codegen/plan/representation.hpp"
 
+#include <nvcomp/version.h>
+
+#include <stdexcept>
 #include <string_view>
 
 namespace simpatico {
@@ -56,9 +59,7 @@ std::vector<OperatorInfo> const& operator_registry()
     {OpId::Bitextract,     "bitextract",      {},                                                                     true,  false, true,  false},
     {OpId::Identity,       "identity",        {"data"},                                                               false, false, false, false},
     {OpId::NvcompCascaded, "nvcomp_cascaded", {"output"},                                                             false, false, false, false},
-    // 2 or 3 channels: offsets, chars[, null_mask]. null_mask is optional (present only when
-    // nullable); the generic named_channels() skips nullptr slots so arity is correct at runtime.
-    {OpId::StrSplit,       "str_split",       {"offsets", "chars", "null_mask"},                                     true,  false, true,  false},
+    {OpId::StrSplit,       "str_split",       {"offsets", "chars"},                                                   true,  false, true,  false},
   };
   // clang-format on
   return kTable;
@@ -152,6 +153,7 @@ std::unique_ptr<compressor> make_compressor(std::string const& name)
   auto id = op_id_from_name(name);
   if (!id) return nullptr;
   switch (*id) {
+    case OpId::Unknown: return nullptr;
     case OpId::Identity: return std::make_unique<identity_compressor>();
     case OpId::Dictionary: return std::make_unique<dictionary_compressor>();
     case OpId::StrSplit: return std::make_unique<str_split_compressor>();
@@ -181,6 +183,9 @@ std::unique_ptr<compressor> make_compressor(std::string const& name)
       return nullptr;
     }
     case OpId::NvcompCascaded: {
+#if NVCOMP_VER_MAJOR >= 6
+      throw std::runtime_error("nvcomp_cascaded: unavailable with nvCOMP 6");
+#else
       // `nvcomp_cascaded` — nvcomp default opts; `nvcomp_cascaded_<N>D<M>R<K>B` — explicit opts.
       if (name == "nvcomp_cascaded") return std::make_unique<cascaded_compressor>();
       int deltas = 0, rles = 0, bp = 0;
@@ -189,6 +194,7 @@ std::unique_ptr<compressor> make_compressor(std::string const& name)
         return std::make_unique<cascaded_compressor>(deltas, rles, bp);
       }
       return nullptr;
+#endif
     }
     // Codegen-fused ops are built by the JIT encoder, not this factory.
     case OpId::Delta:

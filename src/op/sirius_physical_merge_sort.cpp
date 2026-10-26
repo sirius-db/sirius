@@ -22,8 +22,7 @@
 #include "op/cudf_sort_order.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
 #include "sirius/exception.hpp"
-
-#include <nvtx3/nvtx3.hpp>
+#include "telemetry/nvtx.hpp"
 
 namespace sirius {
 namespace op {
@@ -78,9 +77,9 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::get_next_task_input_d
 }
 
 std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operator_data& input_data,
-                                                                   rmm::cuda_stream_view stream)
+                                                                   ::cuda::stream_ref stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_merge_sort::execute"};
+  nvtx_scoped_range nvtx_range{"sirius_physical_merge_sort::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
 
@@ -113,8 +112,8 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operato
   if (input_batches.size() == 1) {
     std::vector<std::shared_ptr<cucascade::data_batch>> outputs;
     if (_final_projections.empty()) {
-      auto ro_vec = input.get_read_only_batches();
-      outputs.push_back(cucascade::data_batch::to_idle(std::move(ro_vec[0])));
+      // Forward the owned input batch (idle at park); no read lock carried.
+      outputs.push_back(input.get_data_batches()[0]);
     } else {
       outputs.push_back(apply_final_projection(input_batches[0]));
     }
@@ -130,10 +129,10 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operato
   null_precedence.reserve(orders.size());
 
   for (auto const& ord : orders) {
-    if (ord.expression->expression_class != duckdb::ExpressionClass::BOUND_REF) {
+    if (ord.expression->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
       throw not_implemented_exception("Merge sort only supports bound reference expressions");
     }
-    auto idx = static_cast<int>(ord.expression->Cast<duckdb::BoundReferenceExpression>().index);
+    auto idx = static_cast<int>(ord.expression->Cast<duckdb::BoundReferenceExpression>().Index());
     order_key_idx.push_back(idx);
     column_order.push_back(to_cudf_order(ord.type));
     null_precedence.push_back(to_cudf_null_order(ord.type, ord.null_order));

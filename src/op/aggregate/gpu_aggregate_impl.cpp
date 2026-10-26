@@ -18,19 +18,34 @@
 
 #include "data/data_batch_utils.hpp"
 #include "log/logging.hpp"
+#include "op/aggregate/aggregate_op_util.hpp"
+#include "op/aggregate/group_key_labels.hpp"
+#include "op/aggregate/stddev.hpp"
 
 #include <cudf/column/column_factories.hpp>
+#include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/dictionary/dictionary_column_view.hpp>
 #include <cudf/dictionary/encode.hpp>
+#include <cudf/groupby.hpp>
+#include <cudf/lists/lists_column_view.hpp>
+#include <cudf/null_mask.hpp>
+#include <cudf/reduction.hpp>
 #include <cudf/reduction/approx_distinct_count.hpp>
+#include <cudf/sorting.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/transform.hpp>
+#include <cudf/unary.hpp>
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/traits.hpp>
 
+#include <rmm/error.hpp>
+
 #include <algorithm>
 #include <new>
+#include <numeric>
+#include <optional>
+#include <unordered_set>
 
 namespace sirius {
 namespace op {
@@ -56,7 +71,7 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_ungrouped_aggre
   const cucascade::read_only_data_batch& input,
   const std::vector<cudf::aggregation::Kind>& aggregates,
   const std::vector<int>& aggregate_idx,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   cucascade::memory::memory_space& memory_space,
   const telemetry::batch_telemetry_info& telemetry_info)
 {
@@ -117,15 +132,21 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_ungrouped_aggre
   return make_data_batch(std::move(output_table), memory_space, stream, telemetry_info);
 }
 
-std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggregate(
-  const cucascade::read_only_data_batch& input,
+namespace {
+
+/// Aggregate @p input_table grouped by the `group_idx` columns. Returns the table
+/// `[keys..., aggregates...]`. See `gpu_aggregate_impl::local_grouped_aggregate()` for the
+/// parameters.
+std::unique_ptr<cudf::table> grouped_aggregate_table(
+  cudf::table_view input_table,
   const std::vector<int>& group_idx,
   const std::vector<cudf::aggregation::Kind>& aggregates,
   const std::vector<int>& aggregate_idx,
   const std::vector<std::vector<int>>& aggregate_struct_col_indices,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   cucascade::memory::memory_space& memory_space,
-  const telemetry::batch_telemetry_info& telemetry_info)
+  const std::vector<std::optional<std::uint64_t>>& aggregate_input_max_abs = {},
+  const std::vector<bool>& aggregate_is_wide_integer_sum                   = {})
 {
   // Sanity check
   if (aggregates.size() != aggregate_idx.size()) {
@@ -136,44 +157,12 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
 
   const bool has_struct_col_indices = !aggregate_struct_col_indices.empty();
 
-  auto input_table = get_cudf_table_view(input);
-  auto mr          = memory_space.get_default_allocator();
+  auto mr = memory_space.get_default_allocator();
 
-  // ---------------------------------------------------------------------------------------
-  // Single-label group keys for the sorted-groupby path.
-  //
-  // COLLECT_SET (our COUNT(DISTINCT ...) lowering) is not a hash aggregation in cudf, so
-  // `cudf::groupby::aggregate` routes the whole request through the *sorted* groupby helper.
-  // That helper's first step is `key_sort_order()`, which calls
-  // `cudf::detail::stable_sorted_order(keys)` over the full input. For a multi-column key
-  // table that is a `cub::DeviceMergeSort` driven by a lexicographic row comparator:
-  // O(N log N) passes of random access over every key column.
-  //
-  // `cudf::detail::stable_sorted_order` has a fast path though: a *single*, non-nested,
-  // fixed-width, null-free column is dispatched to `sorted_order_radix`
-  // (`cub::DeviceRadixSort`), which is a handful of fully coalesced passes.
-  //
-  // So we collapse the whole key table into one dense INT32 label with `cudf::encode` and
-  // group by that instead. `cudf::encode` returns the distinct key rows in sorted order plus
-  // the per-row index into them, so the label ordering is exactly the lexicographic ordering
-  // of the original key tuples -- group identity and group ordering are both preserved. The
-  // original key columns are recovered after the aggregate with a gather at group cardinality.
-  //
-  // NULL semantics are preserved: `cudf::encode` builds the distinct set with
-  // `null_equality::EQUAL` / `nan_equality::ALL_EQUAL` and searches it with
-  // `null_order::AFTER`, which is precisely what the sorted groupby helper does for
-  // `null_policy::INCLUDE`. A key tuple containing NULL therefore gets its own label and
-  // becomes its own group, exactly as before.
-  //
-  // Only worth it when the sort actually dominates, so gate on a large input; and pointless
-  // when the key table is already a single radix-sortable column.
-  //
-  // The gate on group cardinality matters most: `cudf::encode` is distinct + a sort of the
-  // *distinct* rows + a binary search per input row. That is a large win when the groups are
-  // few, but for a high-cardinality key (say COUNT(DISTINCT ...) grouped by an order key) the
-  // distinct-key sort is as big as the sort we are trying to avoid, and we would come out
-  // behind. An HLL estimate over the key rows is ~O(1) memory and one cheap pass, so use it to
-  // decline the rewrite rather than guessing.
+  // COLLECT_SET uses cuDF's sorted groupby. Dense INT32 labels let that sort take its
+  // single-column radix path while preserving the original keys' lexicographic order. A
+  // single null-free fixed-width key is already radix-sortable; single nullable or
+  // variable-width keys and non-nested multi-column keys may benefit from labels.
   constexpr cudf::size_type label_encode_min_rows = 1 << 20;
   constexpr double label_encode_max_group_ratio   = 0.01;
 
@@ -215,9 +204,9 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
           input_table.num_rows(),
           ratio);
       } else {
-        auto encoded     = cudf::encode(keys_view, stream, mr);
-        label_key_values = std::move(encoded.first);
-        label_col        = std::move(encoded.second);
+        auto key_labels  = detail::make_group_key_labels(keys_view, stream, mr);
+        label_key_values = std::move(key_labels.sorted_unique_keys);
+        label_col        = std::move(key_labels.labels);
         SIRIUS_LOG_DEBUG(
           "local_grouped_agg: label-encoded {} group key column(s) into a single radix-sortable "
           "key for the COLLECT_SET sort path (rows={}, ndv={}, groups={})",
@@ -227,15 +216,15 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
           label_key_values->num_rows());
       }
     } catch (const std::bad_alloc&) {
-      // Out-of-memory (incl. rmm::out_of_memory) must reach the task retry /
-      // downgrade machinery.
+      // Preserve the task's reservation retry and downgrade path.
       throw;
     } catch (const cudf::cuda_error&) {
-      // CUDA errors are sticky; falling back would compute on a broken context.
+      // Do not continue on a potentially invalid CUDA context.
+      throw;
+    } catch (const rmm::cuda_error&) {
+      // RMM CUDA errors carry the same invalid-context risk as cuDF CUDA errors.
       throw;
     } catch (const std::exception& e) {
-      // Non-fatal (e.g. an unsupported key shape): fall back to grouping on
-      // the original key columns.
       label_key_values.reset();
       label_col.reset();
       SIRIUS_LOG_DEBUG(
@@ -306,11 +295,63 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
     }
   }
   if (use_label_keys) { group_cols.push_back(label_col->view()); }
-  cudf::groupby::groupby grpby_obj(cudf::table_view(group_cols), cudf::null_policy::INCLUDE);
 
   // Make aggregation requests, group aggregations on the same column in the single request.
   // For multi-column COLLECT_SET, a synthetic negative key -(i+1) is used so that each such
   // aggregate gets its own request with a freshly synthesized struct column.
+  // A SUM over a DECIMAL32 or DECIMAL64 column that could overflow the input width in this batch
+  // (see sums_to_widen) is computed over the column widened to the next decimal type. It uses the
+  // key column index + widened_sum_key_offset, which keeps it in a request of its own. Every other
+  // decimal SUM runs at the input width and its result is widened below. A wide integer SUM over
+  // INT64 is gated the same way and widened to DECIMAL128; one proven safe stays INT64 end to
+  // end, so its per-group result is not widened and the merge decides for itself (see
+  // gpu_merge_impl::merge_grouped_aggregate). A wide SUM over INT32 cannot overflow INT64 within
+  // one batch (fewer than 2^31 rows of magnitude at most 2^31) and is never a candidate.
+  auto const widened_sum_key_offset = input_table.num_columns();
+  std::unordered_set<int> widened_sum_cols;
+  {
+    std::vector<sum_candidate> candidates;
+    for (size_t i = 0; i < aggregates.size(); ++i) {
+      bool const is_struct = has_struct_col_indices && !aggregate_struct_col_indices[i].empty();
+      // Only SUM is gated: MIN, MAX and COUNT cannot overflow, and PRODUCT / SUM_OF_SQUARES are
+      // not reachable (get_local_aggregation rejects them).
+      if (is_struct || aggregates[i] != cudf::aggregation::Kind::SUM) { continue; }
+      auto const col_id   = aggregate_idx[i];
+      auto const col_type = input_table.column(col_id).type();
+      bool const is_wide_integer_sum =
+        i < aggregate_is_wide_integer_sum.size() && aggregate_is_wide_integer_sum[i];
+      if (!widened_decimal_sum_type(col_type) &&
+          !(is_wide_integer_sum && col_type.id() == cudf::type_id::INT64)) {
+        continue;
+      }
+      candidates.push_back(
+        {col_id, i < aggregate_input_max_abs.size() ? aggregate_input_max_abs[i] : std::nullopt});
+    }
+    if (!candidates.empty()) {
+      widened_sum_cols = sums_to_widen(input_table, candidates, stream, mr);
+    }
+  }
+  // A SUM over a DECIMAL128 column whose values in this batch provably keep every partial sum
+  // within 64 bits (see decimal_sums_to_narrow) is computed over the column narrowed to DECIMAL64,
+  // which cuDF aggregates much faster, and its result is widened back below. It uses the key column
+  // index + narrowed_sum_key_offset, which keeps it in a request of its own.
+  auto const narrowed_sum_key_offset = 2 * input_table.num_columns();
+  std::unordered_set<int> narrowed_sum_cols;
+  {
+    std::vector<sum_candidate> candidates;
+    for (size_t i = 0; i < aggregates.size(); ++i) {
+      bool const is_struct = has_struct_col_indices && !aggregate_struct_col_indices[i].empty();
+      if (is_struct || aggregates[i] != cudf::aggregation::Kind::SUM) { continue; }
+      auto const col_id = aggregate_idx[i];
+      if (!narrowed_decimal_sum_type(input_table.column(col_id).type())) { continue; }
+      candidates.push_back(
+        {col_id, i < aggregate_input_max_abs.size() ? aggregate_input_max_abs[i] : std::nullopt});
+    }
+    if (!candidates.empty()) {
+      narrowed_sum_cols = decimal_sums_to_narrow(input_table, candidates, stream, mr);
+    }
+  }
+  // TODO: Deduplicate aggregation requests for compound aggregations.
   std::unordered_map<int, std::vector<std::unique_ptr<cudf::groupby_aggregation>>> input_col_to_agg;
   std::unordered_map<int, std::vector<size_t>> input_col_to_output_idx;
   std::vector<int> input_col_order;
@@ -322,9 +363,24 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
       aggregate_col_id = -(static_cast<int>(i) + 1);
     } else {
       aggregate_col_id = aggregate_idx[i];
+      if (aggregate_kind == cudf::aggregation::Kind::SUM &&
+          widened_sum_cols.contains(aggregate_col_id)) {
+        aggregate_col_id += widened_sum_key_offset;
+      } else if (aggregate_kind == cudf::aggregation::Kind::SUM &&
+                 narrowed_sum_cols.contains(aggregate_col_id)) {
+        aggregate_col_id += narrowed_sum_key_offset;
+      }
     }
     if (!input_col_to_agg.contains(aggregate_col_id)) {
       input_col_order.push_back(aggregate_col_id);
+    }
+    if (aggregate_kind == cudf::aggregation::Kind::M2) {
+      auto& aggs = input_col_to_agg[aggregate_col_id];
+      aggs.push_back(cudf::make_count_aggregation<cudf::groupby_aggregation>());
+      aggs.push_back(cudf::make_mean_aggregation<cudf::groupby_aggregation>());
+      aggs.push_back(cudf::make_m2_aggregation<cudf::groupby_aggregation>());
+      input_col_to_output_idx[aggregate_col_id].push_back(i);
+      continue;
     }
     std::unique_ptr<cudf::groupby_aggregation> groupby_aggregation;
     if (aggregate_kind == cudf::aggregation::Kind::COLLECT_SET) {
@@ -337,7 +393,8 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
     input_col_to_output_idx[aggregate_col_id].push_back(i);
   }
 
-  // Temp struct columns for multi-col COLLECT_SET; must outlive the groupby call.
+  // Temp struct columns for multi-col COLLECT_SET and widened SUM inputs. They back
+  // `requests[i].values` and are released right after the groupby call.
   std::vector<std::unique_ptr<cudf::column>> temp_struct_cols;
 
   std::vector<cudf::groupby::aggregation_request> requests;
@@ -353,14 +410,27 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
         struct_children.push_back(std::make_unique<cudf::column>(
           input_table.column(col_idx), stream, memory_space.get_default_allocator()));
       }
-      auto struct_col = cudf::make_structs_column(input_table.num_rows(),
-                                                  std::move(struct_children),
-                                                  0,
-                                                  rmm::device_buffer{},
-                                                  stream,
-                                                  memory_space.get_default_allocator());
-      request.values  = struct_col->view();
+      auto struct_col =
+        cudf::make_structs_column(input_table.num_rows(),
+                                  std::move(struct_children),
+                                  0,
+                                  cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED),
+                                  stream,
+                                  memory_space.get_default_allocator());
+      request.values = struct_col->view();
       temp_struct_cols.push_back(std::move(struct_col));
+    } else if (aggregate_col_id >= narrowed_sum_key_offset) {
+      auto const& col = input_table.column(aggregate_col_id - narrowed_sum_key_offset);
+      auto narrow_col = cudf::cast(
+        col, *narrowed_decimal_sum_type(col.type()), stream, memory_space.get_default_allocator());
+      request.values = narrow_col->view();
+      temp_struct_cols.push_back(std::move(narrow_col));
+    } else if (aggregate_col_id >= widened_sum_key_offset) {
+      auto const& col  = input_table.column(aggregate_col_id - widened_sum_key_offset);
+      auto widened_col = cudf::cast(
+        col, *widened_sum_type(col.type()), stream, memory_space.get_default_allocator());
+      request.values = widened_col->view();
+      temp_struct_cols.push_back(std::move(widened_col));
     } else {
       request.values = input_table.column(aggregate_col_id);
     }
@@ -368,9 +438,44 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
     requests.push_back(std::move(request));
   }
 
+  // cuDF's hash M2 computes sum(x*x) - sum(x)*sum(x)/n, which can catastrophically
+  // cancel for large offsets. Sort the keys and associated values explicitly so sorted::YES
+  // selects the centered M2 implementation. Other aggregates retain the ordinary path.
+  bool const stable_m2 =
+    std::ranges::find(aggregates, cudf::aggregation::Kind::M2) != aggregates.end();
+  std::unique_ptr<cudf::table> sorted_input;
+  std::vector<cudf::order> key_order(group_cols.size(), cudf::order::ASCENDING);
+  std::vector<cudf::null_order> key_null_order(group_cols.size(), cudf::null_order::AFTER);
+  if (stable_m2) {
+    auto columns = group_cols;
+    for (auto const& request : requests) {
+      columns.push_back(request.values);
+    }
+    sorted_input = cudf::sort_by_key(cudf::table_view(columns),
+                                     cudf::table_view(group_cols),
+                                     key_order,
+                                     key_null_order,
+                                     stream,
+                                     mr);
+    for (size_t i = 0; i < group_cols.size(); ++i) {
+      group_cols[i] = sorted_input->get_column(i).view();
+    }
+    for (size_t i = 0; i < requests.size(); ++i) {
+      requests[i].values = sorted_input->get_column(group_cols.size() + i).view();
+    }
+  }
+  cudf::groupby::groupby grpby_obj(cudf::table_view(group_cols),
+                                   cudf::null_policy::INCLUDE,
+                                   stable_m2 ? cudf::sorted::YES : cudf::sorted::NO,
+                                   key_order,
+                                   key_null_order);
+
   // Call cudf groupby and populate output columns
   auto groupby_result = grpby_obj.aggregate(requests, stream, mr);
-  auto output_cols    = groupby_result.first->release();
+  // Nothing reads the temporary input buffers after the groupby, so release them before the
+  // allocations below. The result loop only reads type metadata from `requests[i].values`.
+  temp_struct_cols.clear();
+  auto output_cols = groupby_result.first->release();
 
   // Expand the single label key back into the original group key columns. The groupby emits
   // one row per distinct label, so this gather runs at group cardinality, not input rows.
@@ -396,50 +501,287 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
     int aggregate_col_id     = input_col_order[i];
     auto& aggregation_result = groupby_result.second[i];
 
-    // need to cast count aggregation result to int64 (not applicable for COLLECT_SET)
-    if (requests[i].aggregations.size() == 1 &&
-        requests[i].aggregations[0]->kind != cudf::aggregation::Kind::COLLECT_SET &&
-        (requests[i].aggregations[0]->kind == cudf::aggregation::Kind::COUNT_VALID ||
-         requests[i].aggregations[0]->kind == cudf::aggregation::Kind::COUNT_ALL)) {
-      if (aggregation_result.results.size() != 1) {
-        throw std::runtime_error("Expected 1 result for count aggregation, got " +
-                                 std::to_string(aggregation_result.results.size()));
-      }
-      auto result_view = aggregation_result.results[0]->view();
-      if (result_view.type().id() != cudf::type_id::INT64) {
-        aggregation_result.results[0] = cudf::cast(result_view,
-                                                   cudf::data_type(cudf::type_id::INT64),
-                                                   stream,
-                                                   memory_space.get_default_allocator());
-      }
-    }
-
     const auto& output_idx = input_col_to_output_idx[aggregate_col_id];
+    size_t result_idx      = 0;
     for (size_t j = 0; j < output_idx.size(); ++j) {
-      auto result_view = aggregation_result.results[j]->view();
-      // Widen decimal result for SUM (expected by duckdb)
-      if (requests[i].aggregations[j]->kind == cudf::aggregation::Kind::SUM) {
-        if (requests[i].values.type().id() == cudf::type_id::DECIMAL64) {
-          aggregation_result.results[j] =
-            cudf::cast(result_view,
-                       cudf::data_type(cudf::type_id::DECIMAL128, result_view.type().scale()),
-                       stream,
-                       memory_space.get_default_allocator());
-        } else if (requests[i].values.type().id() == cudf::type_id::DECIMAL32) {
-          aggregation_result.results[j] =
-            cudf::cast(result_view,
-                       cudf::data_type(cudf::type_id::DECIMAL64, result_view.type().scale()),
-                       stream,
-                       memory_space.get_default_allocator());
+      if (aggregates[output_idx[j]] == cudf::aggregation::Kind::M2) {
+        auto count = std::move(aggregation_result.results[result_idx++]);
+        auto mean  = std::move(aggregation_result.results[result_idx++]);
+        auto m2    = std::move(aggregation_result.results[result_idx++]);
+        output_cols[group_idx.size() + output_idx[j]] =
+          make_stddev_state(std::move(count), std::move(mean), std::move(m2), stream, mr);
+        continue;
+      }
+      auto const k = result_idx++;
+      if (requests[i].aggregations[k]->kind == cudf::aggregation::Kind::COUNT_VALID ||
+          requests[i].aggregations[k]->kind == cudf::aggregation::Kind::COUNT_ALL) {
+        aggregation_result.results[k] = cudf::cast(
+          aggregation_result.results[k]->view(), cudf::data_type{cudf::type_id::INT64}, stream, mr);
+      }
+      // Widen SUM results only when aggregation ran at the original input width. Requests
+      // with synthetic widened-SUM keys already produce the required wider decimal type.
+      if (requests[i].aggregations[k]->kind == cudf::aggregation::Kind::SUM &&
+          aggregate_col_id >= 0 && aggregate_col_id < widened_sum_key_offset) {
+        if (auto widened_type = widened_decimal_sum_type(requests[i].values.type())) {
+          aggregation_result.results[k] =
+            cudf::cast(aggregation_result.results[k]->view(), *widened_type, stream, mr);
         }
       }
+      // A narrowed SUM returns to the DECIMAL128 type of its input column.
+      if (requests[i].aggregations[k]->kind == cudf::aggregation::Kind::SUM &&
+          aggregate_col_id >= narrowed_sum_key_offset) {
+        auto const original_type =
+          input_table.column(aggregate_col_id - narrowed_sum_key_offset).type();
+        aggregation_result.results[k] =
+          cudf::cast(aggregation_result.results[k]->view(), original_type, stream, mr);
+      }
       size_t output_col_id       = group_idx.size() + output_idx[j];
-      output_cols[output_col_id] = std::move(aggregation_result.results[j]);
+      output_cols[output_col_id] = std::move(aggregation_result.results[k]);
     }
   }
 
-  // Create the output data batch
-  auto output_table = std::make_unique<cudf::table>(std::move(output_cols));
+  return std::make_unique<cudf::table>(std::move(output_cols));
+}
+
+/// The aggregation that combines partial results of a local aggregation of kind @p kind.
+std::unique_ptr<cudf::groupby_aggregation> make_reaggregation(cudf::aggregation::Kind kind)
+{
+  switch (kind) {
+    case cudf::aggregation::Kind::MIN:
+      return cudf::make_min_aggregation<cudf::groupby_aggregation>();
+    case cudf::aggregation::Kind::MAX:
+      return cudf::make_max_aggregation<cudf::groupby_aggregation>();
+    case cudf::aggregation::Kind::SUM:
+    case cudf::aggregation::Kind::COUNT_ALL:
+    case cudf::aggregation::Kind::COUNT_VALID:
+      return cudf::make_sum_aggregation<cudf::groupby_aggregation>();
+    case cudf::aggregation::Kind::COLLECT_SET:
+      return cudf::make_merge_sets_aggregation<cudf::groupby_aggregation>();
+    case cudf::aggregation::Kind::M2:
+      return cudf::make_merge_m2_aggregation<cudf::groupby_aggregation>();
+    default:
+      throw std::runtime_error("Unsupported cudf aggregate kind for grouping sets: " +
+                               std::to_string(static_cast<int>(kind)));
+  }
+}
+
+/// The empty grouping set over an empty input: one row with zero counts and NULL for every
+/// other finalized aggregate. Compound aggregates retain neutral partial states.
+std::vector<std::unique_ptr<cudf::column>> make_empty_input_row(
+  cudf::table_view aggregate_cols,
+  const std::vector<cudf::aggregation::Kind>& aggregates,
+  ::cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr)
+{
+  std::vector<std::unique_ptr<cudf::column>> row;
+  row.reserve(aggregates.size());
+  for (std::size_t i = 0; i < aggregates.size(); ++i) {
+    auto const kind = aggregates[i];
+    if (kind == cudf::aggregation::Kind::COUNT_ALL ||
+        kind == cudf::aggregation::Kind::COUNT_VALID) {
+      row.push_back(cast_if_needed(make_constant_column<int64_t>(0, 1, stream, mr),
+                                   aggregate_cols.column(i).type(),
+                                   stream,
+                                   mr));
+    } else if (kind == cudf::aggregation::Kind::COLLECT_SET) {
+      // An empty set, so that COUNT(DISTINCT) of the empty input is 0.
+      auto offsets = make_constant_column<cudf::size_type>(0, 2, stream, mr);
+      auto child   = cudf::empty_like(cudf::lists_column_view(aggregate_cols.column(i)).child());
+      row.push_back(cudf::make_lists_column(
+        1,
+        std::move(offsets),
+        std::move(child),
+        0,
+        cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr)));
+    } else if (kind == cudf::aggregation::Kind::M2) {
+      // MERGE_M2 ignores zero-count states. Valid children also let finalization read
+      // count directly and produce NULL, without depending on the STRUCT's parent mask.
+      row.push_back(make_stddev_state(make_constant_column<int64_t>(0, 1, stream, mr),
+                                      make_constant_column<double>(0, 1, stream, mr),
+                                      make_constant_column<double>(0, 1, stream, mr),
+                                      stream,
+                                      mr));
+    } else {
+      row.push_back(make_null_column(aggregate_cols.column(i), 1, stream, mr));
+    }
+  }
+  return row;
+}
+
+/// Expand the partial aggregate @p partial, grouped by all @p num_keys keys, into one block of
+/// rows per grouping set. See `gpu_aggregate_impl::local_grouping_sets_aggregate()`.
+std::unique_ptr<cudf::table> expand_grouping_sets(
+  cudf::table_view partial,
+  std::size_t num_keys,
+  const std::vector<cudf::aggregation::Kind>& aggregates,
+  const std::vector<std::set<std::size_t>>& grouping_sets,
+  const std::vector<std::vector<std::size_t>>& grouping_functions,
+  ::cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr)
+{
+  std::vector<cudf::size_type> aggregate_col_ids(aggregates.size());
+  std::iota(aggregate_col_ids.begin(), aggregate_col_ids.end(), static_cast<int>(num_keys));
+  auto const partial_aggregates = partial.select(aggregate_col_ids);
+
+  // Owners of the columns that the per-set views below reference.
+  std::vector<std::vector<std::unique_ptr<cudf::column>>> owned(grouping_sets.size());
+  std::vector<cudf::table_view> set_views;
+  set_views.reserve(grouping_sets.size());
+
+  for (std::size_t set_idx = 0; set_idx < grouping_sets.size(); ++set_idx) {
+    auto const& set = grouping_sets[set_idx];
+    auto& owner     = owned[set_idx];
+    owner.reserve(num_keys + aggregates.size() + 1 + grouping_functions.size());
+    std::vector<cudf::column_view> keys(num_keys);
+    std::vector<cudf::column_view> values;
+    values.reserve(aggregates.size());
+    cudf::size_type num_rows = 0;
+
+    if (set.size() == num_keys) {
+      // The partial aggregate is already grouped by this set.
+      for (std::size_t k = 0; k < num_keys; ++k) {
+        keys[k] = partial.column(static_cast<cudf::size_type>(k));
+      }
+      for (auto const& col : partial_aggregates) {
+        values.push_back(col);
+      }
+      num_rows = partial.num_rows();
+    } else {
+      std::vector<cudf::column_view> set_keys;
+      set_keys.reserve(set.empty() ? 1 : set.size());
+      std::unique_ptr<cudf::column> constant_key;
+      if (set.empty()) {
+        constant_key = make_constant_column<int8_t>(0, partial.num_rows(), stream, mr);
+        set_keys.push_back(constant_key->view());
+      }
+      for (auto const k : set) {
+        set_keys.push_back(partial.column(static_cast<cudf::size_type>(k)));
+      }
+      cudf::groupby::groupby grouper(cudf::table_view(set_keys), cudf::null_policy::INCLUDE);
+      std::vector<cudf::groupby::aggregation_request> requests(aggregates.size());
+      for (std::size_t i = 0; i < aggregates.size(); ++i) {
+        requests[i].values = partial_aggregates.column(static_cast<cudf::size_type>(i));
+        requests[i].aggregations.push_back(make_reaggregation(aggregates[i]));
+      }
+      auto [grouped_keys, results] = grouper.aggregate(requests, stream, mr);
+      constant_key.reset();
+      num_rows = grouped_keys->num_rows();
+
+      if (set.empty() && num_rows == 0) {
+        for (auto& col : make_empty_input_row(partial_aggregates, aggregates, stream, mr)) {
+          values.push_back(col->view());
+          owner.push_back(std::move(col));
+        }
+        num_rows = 1;
+      } else {
+        // Re-aggregating a COUNT with SUM widens it, so match the partial column types.
+        for (std::size_t i = 0; i < results.size(); ++i) {
+          auto col =
+            cast_if_needed(std::move(results[i].results[0]),
+                           partial_aggregates.column(static_cast<cudf::size_type>(i)).type(),
+                           stream,
+                           mr);
+          values.push_back(col->view());
+          owner.push_back(std::move(col));
+        }
+      }
+
+      auto key_cols       = grouped_keys->release();
+      std::size_t key_pos = set.empty() ? 1 : 0;
+      for (std::size_t k = 0; k < num_keys; ++k) {
+        if (set.contains(k)) {
+          keys[k] = key_cols[key_pos]->view();
+          owner.push_back(std::move(key_cols[key_pos++]));
+        } else {
+          auto nulls =
+            make_null_column(partial.column(static_cast<cudf::size_type>(k)), num_rows, stream, mr);
+          keys[k] = nulls->view();
+          owner.push_back(std::move(nulls));
+        }
+      }
+    }
+
+    std::vector<cudf::column_view> cols;
+    cols.reserve(num_keys + 1 + grouping_functions.size() + aggregates.size());
+    cols.assign(keys.begin(), keys.end());
+    auto set_id =
+      make_constant_column<int32_t>(static_cast<int32_t>(set_idx), num_rows, stream, mr);
+    cols.push_back(set_id->view());
+    owner.push_back(std::move(set_id));
+    for (auto const& function : grouping_functions) {
+      // GROUPING(a, b, ...) has one bit per argument, the first argument most significant, set
+      // when the argument is not in the grouping set.
+      int64_t value = 0;
+      for (auto const k : function) {
+        value = (value << 1) | (set.contains(k) ? 0 : 1);
+      }
+      auto col = make_constant_column<int64_t>(value, num_rows, stream, mr);
+      cols.push_back(col->view());
+      owner.push_back(std::move(col));
+    }
+    cols.insert(cols.end(), values.begin(), values.end());
+    set_views.emplace_back(cols);
+  }
+
+  return cudf::concatenate(set_views, stream, mr);
+}
+
+}  // namespace
+
+std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggregate(
+  const cucascade::read_only_data_batch& input,
+  const std::vector<int>& group_idx,
+  const std::vector<cudf::aggregation::Kind>& aggregates,
+  const std::vector<int>& aggregate_idx,
+  const std::vector<std::vector<int>>& aggregate_struct_col_indices,
+  ::cuda::stream_ref stream,
+  cucascade::memory::memory_space& memory_space,
+  const telemetry::batch_telemetry_info& telemetry_info,
+  const std::vector<std::optional<std::uint64_t>>& aggregate_input_max_abs,
+  const std::vector<bool>& aggregate_is_wide_integer_sum)
+{
+  auto output_table = grouped_aggregate_table(get_cudf_table_view(input),
+                                              group_idx,
+                                              aggregates,
+                                              aggregate_idx,
+                                              aggregate_struct_col_indices,
+                                              stream,
+                                              memory_space,
+                                              aggregate_input_max_abs,
+                                              aggregate_is_wide_integer_sum);
+  return make_data_batch(std::move(output_table), memory_space, stream, telemetry_info);
+}
+
+std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouping_sets_aggregate(
+  const cucascade::read_only_data_batch& input,
+  const std::vector<int>& group_idx,
+  const std::vector<cudf::aggregation::Kind>& aggregates,
+  const std::vector<int>& aggregate_idx,
+  const std::vector<std::vector<int>>& aggregate_struct_col_indices,
+  const std::vector<std::set<std::size_t>>& grouping_sets,
+  const std::vector<std::vector<std::size_t>>& grouping_functions,
+  ::cuda::stream_ref stream,
+  cucascade::memory::memory_space& memory_space,
+  const telemetry::batch_telemetry_info& telemetry_info,
+  const std::vector<std::optional<std::uint64_t>>& aggregate_input_max_abs,
+  const std::vector<bool>& aggregate_is_wide_integer_sum)
+{
+  auto partial      = grouped_aggregate_table(get_cudf_table_view(input),
+                                         group_idx,
+                                         aggregates,
+                                         aggregate_idx,
+                                         aggregate_struct_col_indices,
+                                         stream,
+                                         memory_space,
+                                         aggregate_input_max_abs,
+                                         aggregate_is_wide_integer_sum);
+  auto output_table = expand_grouping_sets(partial->view(),
+                                           group_idx.size(),
+                                           aggregates,
+                                           grouping_sets,
+                                           grouping_functions,
+                                           stream,
+                                           memory_space.get_default_allocator());
   return make_data_batch(std::move(output_table), memory_space, stream, telemetry_info);
 }
 

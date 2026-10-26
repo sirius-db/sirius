@@ -10,13 +10,8 @@ git clone --recurse-submodules https://github.com/sirius-db/sirius.git
 cd sirius
 ```
 
-Set up the environment with [Pixi](https://pixi.sh/) and build:
-```
-pixi shell
-CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) make
-```
-
-Note that if building consumes too much memory, try reducing the `CMAKE_BUILD_PARALLEL_LEVEL` value.
+Follow the [build instructions](building.md) to build Sirius and the separate
+DuckDB wrapper using Pixi.
 
 ## Configuration
 
@@ -26,7 +21,7 @@ Note that if building consumes too much memory, try reducing the `CMAKE_BUILD_PA
 
 ```bash
 export SIRIUS_CONFIG_FILE=/path/to/sirius.yaml
-./build/release/duckdb
+pixi run sirius-duckdb/build/release/duckdb -unsigned -cmd "LOAD 'sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension';"
 ```
 
 From the DuckDB shell, create views pointing to your Parquet files and run queries with `gpu_execution`:
@@ -68,11 +63,14 @@ GROUP BY l_returnflag, l_linestatus
 ORDER BY l_returnflag, l_linestatus;
 ```
 
-Queries with unsupported operators fall back silently to DuckDB CPU execution. To disable transparent execution for a connection:
+Queries with unsupported operators fall back silently to DuckDB CPU execution. `gpu_execution` is a session-scoped setting: an unqualified `SET` changes it for the current connection only. To change it for every connection of the database instance, including connections that other extensions open for their own SQL, use `SET GLOBAL`; a connection with its own `SET SESSION` value keeps that value.
 
 ```sql
-SET gpu_execution = false;
+SET gpu_execution = false;          -- this connection only
+SET GLOBAL gpu_execution = false;   -- every connection of this database instance without a session value
 ```
+
+Sirius does not intercept the SQL that the DuckLake extension runs on the connections it opens for its own catalog. DuckLake marks the metadata connections it creates through `DuckLakeTransaction::GetConnection()` in DuckDB's per-connection state under the key `ducklake_internal_connection`; Sirius reads the marker at the connection's first statement and leaves the connection alone for its lifetime. Connections without the marker (every connection of a DuckLake build older than the marker, such as the qualified `d8a1881e`) are recognised by the combination they set before their first statement, a hidden attached database as the default catalog and `catalog_error_max_schemas` at 0. A statement that reads a table of a hidden attached database is not intercepted either. Both hold whatever `gpu_execution` says; other extensions that open connections for themselves are intercepted like user connections unless they carry the same marker or fingerprint.
 
 To re-enable:
 
@@ -111,18 +109,18 @@ CREATE VIEW my_table AS SELECT * FROM read_parquet('/path/to/my_data/*.parquet')
 Run all unit tests:
 ```
 CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) make
-build/release/extension/sirius/test/cpp/sirius_unittest
+build/release/test/cpp/sirius_unittest
 ```
 
 Run tests associated with a specific tag or a specific test:
 ```
-build/release/extension/sirius/test/cpp/sirius_unittest "[cpu_cache]"
-build/release/extension/sirius/test/cpp/sirius_unittest "test_cpu_cache_basic_string_single_col"
+build/release/test/cpp/sirius_unittest "[uri_parser]"
+build/release/test/cpp/sirius_unittest "uri_parser parses object-store URIs"
 ```
 
 Test logs are saved in:
 ```
-build/release/extension/sirius/test/cpp/log
+build/release/test/cpp/log
 ```
 
 ## Developer Documentation

@@ -31,8 +31,9 @@
 #include "expression/join_condition.hpp"
 #include "expression/value.hpp"
 #include "helper/logical_type.hpp"
-#include "op/sirius_dynamic_filter.hpp"
+#include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/sirius_physical_delim_join.hpp"
+#include "op/sirius_physical_dense_count_join.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_hash_join.hpp"
@@ -45,10 +46,12 @@
 
 #include <catch.hpp>
 #include <duckdb/planner/operator/logical_dummy_scan.hpp>
+#include <utils/dense_count_join_test_builder.hpp>
 
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -57,6 +60,7 @@ using sirius::op::sirius_physical_operator;
 using sirius::op::SiriusPhysicalOperatorType;
 
 namespace {
+using sirius::test::make_dense_count_join;
 
 constexpr cudf::data_type k_int8{cudf::type_id::INT8};
 constexpr cudf::data_type k_int16{cudf::type_id::INT16};
@@ -161,7 +165,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_table_scan> make_scan(
   auto returned_types = types;
   auto scan           = duckdb::make_uniq<sirius::op::sirius_physical_table_scan>(
     std::move(types),
-    std::move(function),
+    duckdb::BoundTableFunction(std::move(function)),
     /*bind_data=*/nullptr,
     std::move(returned_types),
     std::move(column_ids),
@@ -171,7 +175,8 @@ duckdb::unique_ptr<sirius::op::sirius_physical_table_scan> make_scan(
     /*estimated_cardinality=*/1,
     duckdb::ExtraOperatorInfo(),
     duckdb::vector<duckdb::Value>{},
-    duckdb::virtual_column_map_t{});
+    duckdb::virtual_column_map_t{},
+    /*projected_output_count=*/column_count);
   scan->set_physical_types(std::move(physical));
   scan->sidecar_from_gpu_tier_pin = gpu_tier_pin;
   return scan;
@@ -211,19 +216,23 @@ duckdb::unique_ptr<sirius::op::sirius_physical_hash_join> make_hash_join(
   duckdb::unique_ptr<sirius_physical_operator> right,
   duckdb::vector<duckdb::LogicalType> output_types)
 {
-  duckdb::LogicalDummyScan stub(0);
+  duckdb::LogicalDummyScan stub(duckdb::TableIndex(0));
   stub.types = std::move(output_types);
   duckdb::vector<sirius::join_condition> conditions;
   sirius::join_condition condition;
   condition.left  = make_reference(0);
   condition.right = make_reference(0);
   conditions.push_back(std::move(condition));
-  return duckdb::make_uniq<sirius::op::sirius_physical_hash_join>(stub,
-                                                                  std::move(left),
-                                                                  std::move(right),
-                                                                  std::move(conditions),
-                                                                  join_type,
-                                                                  /*estimated_cardinality=*/1);
+  return duckdb::make_uniq<sirius::op::sirius_physical_hash_join>(
+    stub,
+    std::move(left),
+    std::move(right),
+    std::move(conditions),
+    join_type,
+    /*left_projection_map=*/duckdb::vector<std::size_t>{},
+    /*right_projection_map=*/duckdb::vector<std::size_t>{},
+    /*delim_types=*/duckdb::vector<sirius::logical_type>{},
+    /*estimated_cardinality=*/1);
 }
 
 std::unique_ptr<sirius::ast::node> make_aggregate_expression(uint32_t input_idx,
@@ -262,7 +271,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_grouped_aggregate> make_grouped_a
     std::move(expressions),
     std::move(groups),
     std::move(grouping_sets),
-    duckdb::vector<duckdb::unsafe_vector<std::size_t>>{},
+    duckdb::vector<duckdb::unsafe_vector<duckdb::ProjectionIndex>>{},
     /*estimated_cardinality=*/1,
     duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES,
     duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES);
@@ -409,7 +418,7 @@ TEST_CASE("tier_narrowing_policy - join payloads keep narrow, join keys retract"
                      duckdb_integer_types(4));
     auto& probe = plan->children[0]->Cast<sirius::op::sirius_physical_table_scan>();
     probe.sirius_dynamic_filters = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
-    probe.sirius_dynamic_filters->register_producer({1});
+    auto producer                = probe.sirius_dynamic_filters->register_producer({1});
 
     auto const retracted = sirius::planner::apply_tier_narrowing_policy(*plan);
 
@@ -420,6 +429,26 @@ TEST_CASE("tier_narrowing_policy - join payloads keep narrow, join keys retract"
 
     REQUIRE(!probe.has_physical_overrides());
   }
+}
+
+TEST_CASE("tier_narrowing_policy - dense count restores only the two join keys",
+          "[tier_narrowing_policy]")
+{
+  auto plan = make_dense_count_join(
+    /*preserved_key_idx=*/1,
+    /*counted_key_idx=*/0,
+    /*counted_value_idx=*/1,
+    make_integer_scan(3, {k_int8, k_int16, k_int8}),
+    make_integer_scan(3, {k_int8, k_int16, k_int8}));
+
+  auto const retracted = sirius::planner::apply_tier_narrowing_policy(*plan);
+
+  REQUIRE(retracted == 2);
+  REQUIRE(plan->children[0]->get_physical_types() ==
+          std::vector<cudf::data_type>{k_int8, k_int32, k_int8});
+  REQUIRE(plan->children[1]->get_physical_types() ==
+          std::vector<cudf::data_type>{k_int32, k_int16, k_int8});
+  REQUIRE(!plan->has_physical_overrides());
 }
 
 TEST_CASE("tier_narrowing_policy - grouped-aggregate keys keep narrow only when eligible",
@@ -433,6 +462,21 @@ TEST_CASE("tier_narrowing_policy - grouped-aggregate keys keep narrow only when 
 
     REQUIRE(plan->children[0]->get_physical_types() ==
             std::vector<cudf::data_type>{k_int8, k_int32});
+  }
+
+  SECTION("a zero-aggregate DISTINCT gives every key transport")
+  {
+    // The propagation ladder's DISTINCT section over an identity group_idx: the aggregate is the
+    // plan root, so this policy's group_idx mapping is unobservable here. Group keys earn
+    // `transport` and the keep rule short-circuits on it, so the plan root's boundary_restore mark
+    // cannot retract them, and under DISTINCT the keys are the whole payload.
+    auto plan = make_grouped_aggregate({0, 1}, {}, make_integer_scan(2, {k_int8, k_int8}));
+
+    auto const retracted = sirius::planner::apply_tier_narrowing_policy(*plan);
+
+    REQUIRE(retracted == 0);
+    REQUIRE(plan->children[0]->get_physical_types() ==
+            std::vector<cudf::data_type>{k_int8, k_int8});
   }
 
   SECTION("COUNT_VALID does not constrain a counted group key")
@@ -472,7 +516,7 @@ TEST_CASE("tier_narrowing_policy - grouped-aggregate keys keep narrow only when 
   SECTION("multiple grouping sets make the aggregate ineligible")
   {
     duckdb::vector<duckdb::GroupingSet> grouping_sets;
-    grouping_sets.push_back(duckdb::GroupingSet{0});
+    grouping_sets.push_back(duckdb::GroupingSet{duckdb::ProjectionIndex(0)});
     grouping_sets.push_back(duckdb::GroupingSet{});
     auto plan = make_grouped_aggregate(
       {0}, {1}, make_integer_scan(2, {k_int8, k_int8}), std::move(grouping_sets));

@@ -29,7 +29,6 @@ public:
 
 **Our usage**:
 - `src/sirius_extension.cpp` — Optimize logical plan before GPU physical plan generation. Certain optimizer passes are disabled via `DBConfig::GetSetting<OptimizerType>()`.
-- `test/cpp/pipeline/test_modified_pipeline.cpp` — Optimize test plans
 - `test/cpp/integration/test_tpcds_plan_translation.cpp` — Optimize TPC-DS plans
 
 ### OptimizerType (enum)

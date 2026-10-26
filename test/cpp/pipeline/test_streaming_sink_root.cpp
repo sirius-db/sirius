@@ -82,7 +82,7 @@ std::vector<std::shared_ptr<cucascade::shared_data_repository>> make_repos(std::
 
 //! The pipeline whose `operators` contain `op`, or nullptr.
 const sirius_pipeline* pipeline_with_operator(
-  const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines,
+  const std::vector<std::shared_ptr<sirius_pipeline>>& pipelines,
   const sirius::op::sirius_physical_operator& target)
 {
   for (const auto& pipeline : pipelines) {
@@ -103,6 +103,10 @@ TEST_CASE_METHOD(streaming_sink_root_fixture,
                  "SINKROOT-1: a streaming-sink-rooted plan initializes",
                  "[integration][pipeline][streaming_sink_root]")
 {
+  auto setting = con->Query("SET like_swar_fastpath = false");
+  REQUIRE(setting != nullptr);
+  REQUIRE_FALSE(setting->HasError());
+
   auto repos = make_repos(1);
 
   sirius::test::with_initialized_streaming_fragment(
@@ -120,6 +124,8 @@ TEST_CASE_METHOD(streaming_sink_root_fixture,
       REQUIRE(sink.type == SiriusPhysicalOperatorType::STREAMING_SINK);
       REQUIRE(sink.children.size() == 1);        // one producer child
       REQUIRE(sink.get_parent_op() == nullptr);  // no consumer above -> plan-tree root
+      REQUIRE_FALSE(sink.children.front()->like_swar_fastpath_enabled());
+      REQUIRE_FALSE(sink.like_swar_fastpath_enabled());
 
       // A streaming fragment never produces a QueryResult.
       REQUIRE_FALSE(engine.has_result_collector());

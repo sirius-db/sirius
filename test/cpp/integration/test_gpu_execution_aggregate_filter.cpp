@@ -133,7 +133,7 @@ TEST_CASE_METHOD(AggFilterFixture,
 {
   // The predicates below are false on every row but not provably false from column statistics,
   // so the mask column really evaluates on the GPU (a stats-foldable predicate like x < 0 takes
-  // the scalar-mask runtime fallback instead -- covered by the next case).
+  // scalar-mask path instead -- covered by the next case).
   // Ungrouped: xn is NULL exactly where x = 50, so no row passes -> count 0, sum NULL.
   compare_gpu_vs_cpu(
     "SELECT count(*) FILTER (WHERE xn IS NULL AND x < 50),"
@@ -146,14 +146,11 @@ TEST_CASE_METHOD(AggFilterFixture,
 }
 
 TEST_CASE_METHOD(AggFilterFixture,
-                 "gpu_execution constant-folded FILTER takes the runtime CPU fallback",
+                 "gpu_execution constant-folded FILTER runs on GPU",
                  "[integration][gpu_execution][aggregate][aggregate_filter]")
 {
-  // Statistics propagation folds x < 0 to a constant FALSE, so the mask CASE evaluates to a
-  // scalar the GPU CASE lowering cannot consume; execution throws and the retained CPU plan
-  // runs (fail-safe, never silent). Pin that behavior so a future change to either side (mask
-  // lowering or scalar CASE support) surfaces here.
-  expect_gpu_fallback(
+  // Statistics propagation folds x < 0 to FALSE; CASE broadcasts scalar masks on GPU.
+  compare_gpu_vs_cpu(
     "SELECT count(*) FILTER (WHERE x < 0), sum(x) FILTER (WHERE x < 0) FROM agg_f");
 }
 

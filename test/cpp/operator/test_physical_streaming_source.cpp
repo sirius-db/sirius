@@ -87,11 +87,11 @@ static auto make_source(std::set<sender_id_t> expected = {SOLE_SENDER})
 /// is_pipeline_finished()) instead of only inspecting the operator in isolation.
 /// Mirrors the minimal wiring pattern used by
 /// test/cpp/pipeline/test_gpu_pipeline_task_history.cpp's create_pipeline_context().
-static duckdb::shared_ptr<sirius::pipeline::sirius_pipeline> make_single_op_pipeline(
+static std::shared_ptr<sirius::pipeline::sirius_pipeline> make_single_op_pipeline(
   sirius_physical_streaming_source& op)
 {
   sirius::pipeline::pipeline_build_context build_ctx{nullptr, true};
-  auto pipeline = duckdb::make_shared_ptr<sirius::pipeline::sirius_pipeline>(build_ctx);
+  auto pipeline = std::make_shared<sirius::pipeline::sirius_pipeline>(build_ctx);
   sirius::pipeline::sirius_pipeline_build_state build_state;
   build_state.set_pipeline_source(*pipeline, op);
   build_state.set_pipeline_sink(*pipeline, &op, 1);
@@ -102,8 +102,9 @@ static duckdb::shared_ptr<sirius::pipeline::sirius_pipeline> make_single_op_pipe
 /// task_creator that only records what would have been scheduled.
 class recording_task_creator : public sirius::creator::task_creator {
  public:
-  explicit recording_task_creator(sirius::memory::sirius_memory_reservation_manager& mem_mgr)
-    : task_creator(sirius::creator::task_creator_config{}, mem_mgr)
+  explicit recording_task_creator(sirius::exec::query_lifecycle_registry& lifecycle,
+                                  sirius::memory::sirius_memory_reservation_manager& mem_mgr)
+    : task_creator(lifecycle, sirius::creator::task_creator_config{}, mem_mgr)
   {
   }
 
@@ -561,7 +562,7 @@ TEST_CASE("streaming_source SRC-17: execute output feeds into real sirius_physic
   auto source_out   = op->execute(*source_input, stream);
 
   // Build filter: col0 > 3 (BIGINT).
-  auto filter_expr_duck = duckdb::make_uniq<duckdb::BoundComparisonExpression>(
+  auto filter_expr_duck = duckdb::BoundComparisonExpression::Create(
     duckdb::ExpressionType::COMPARE_GREATERTHAN,
     duckdb::make_uniq<duckdb::BoundReferenceExpression>(
       duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT), 0),
@@ -919,7 +920,8 @@ TEST_CASE("streaming_source BUG-3: closing an empty stream schedules downstream 
           "[streaming_source][pipeline_completion]")
 {
   auto mem_mgr = sirius::test::operator_utils::initialize_memory_manager();
-  recording_task_creator creator(*mem_mgr);
+  sirius::exec::query_lifecycle_registry lifecycle;
+  recording_task_creator creator(lifecycle, *mem_mgr);
 
   auto [op, repo] = make_source();
   auto pipeline   = make_single_op_pipeline(*op);
@@ -943,7 +945,8 @@ TEST_CASE("streaming_source BUG-4: late close after last task schedules downstre
   auto mem_mgr    = sirius::test::operator_utils::initialize_memory_manager();
   auto* gpu_space = mem_mgr->get_memory_space(Tier::GPU, 0);
   REQUIRE(gpu_space != nullptr);
-  recording_task_creator creator(*mem_mgr);
+  sirius::exec::query_lifecycle_registry lifecycle;
+  recording_task_creator creator(lifecycle, *mem_mgr);
 
   auto [op, repo] = make_source();
   auto pipeline   = make_single_op_pipeline(*op);
@@ -980,7 +983,8 @@ TEST_CASE("streaming_source REARM-1: a push after a WAITING hint re-schedules th
   auto mem_mgr    = sirius::test::operator_utils::initialize_memory_manager();
   auto* gpu_space = mem_mgr->get_memory_space(Tier::GPU, 0);
   REQUIRE(gpu_space != nullptr);
-  recording_task_creator creator(*mem_mgr);
+  sirius::exec::query_lifecycle_registry lifecycle;
+  recording_task_creator creator(lifecycle, *mem_mgr);
 
   auto [op, repo] = make_source();
   auto pipeline   = make_single_op_pipeline(*op);
@@ -1018,7 +1022,8 @@ TEST_CASE("streaming_source REARM-2: a push after a drained drain loop re-schedu
   auto mem_mgr    = sirius::test::operator_utils::initialize_memory_manager();
   auto* gpu_space = mem_mgr->get_memory_space(Tier::GPU, 0);
   REQUIRE(gpu_space != nullptr);
-  recording_task_creator creator(*mem_mgr);
+  sirius::exec::query_lifecycle_registry lifecycle;
+  recording_task_creator creator(lifecycle, *mem_mgr);
 
   auto [op, repo] = make_source();
   auto pipeline   = make_single_op_pipeline(*op);
@@ -1056,7 +1061,8 @@ TEST_CASE("streaming_source REARM-3: a batch already queued turns the hint into 
   auto mem_mgr    = sirius::test::operator_utils::initialize_memory_manager();
   auto* gpu_space = mem_mgr->get_memory_space(Tier::GPU, 0);
   REQUIRE(gpu_space != nullptr);
-  recording_task_creator creator(*mem_mgr);
+  sirius::exec::query_lifecycle_registry lifecycle;
+  recording_task_creator creator(lifecycle, *mem_mgr);
 
   auto [op, repo] = make_source();
   auto pipeline   = make_single_op_pipeline(*op);
@@ -1097,7 +1103,8 @@ TEST_CASE("streaming_source SRC-26: a producer error is rethrown to the puller",
           "[streaming_source][pipeline_completion]")
 {
   auto mem_mgr = sirius::test::operator_utils::initialize_memory_manager();
-  recording_task_creator creator(*mem_mgr);
+  sirius::exec::query_lifecycle_registry lifecycle;
+  recording_task_creator creator(lifecycle, *mem_mgr);
 
   auto [op, repo] = make_source();
   auto pipeline   = make_single_op_pipeline(*op);

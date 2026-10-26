@@ -1,0 +1,371 @@
+/*
+ * Copyright 2026, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+#include "expression_evaluator/query_policy.hpp"
+
+// cudf
+#include <cudf/table/table.hpp>
+#include <cudf/table/table_view.hpp>
+
+#include <cucascade/cudf/gpu_data_representation.hpp>
+#include <op/scan/batch_coalescer.hpp>
+#include <op/scan/gpu_ingestible_types.hpp>
+#include <op/scan/scan_filter_analysis.hpp>
+
+// rmm
+#include "io/io_context.hpp"
+#include "scan_manager/preparation.hpp"
+
+#include <cuda/stream>
+
+// standard library
+#include <concepts>
+#include <cstddef>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <span>
+#include <stop_token>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <vector>
+
+// cucascade (forward-declare to keep this header light; full include in .cpp)
+namespace cucascade::memory {
+class memory_space;
+}  // namespace cucascade::memory
+
+namespace sirius {
+class like_multiliteral_cache;
+}  // namespace sirius
+
+namespace sirius::pipeline {
+class completion_handler;
+}
+namespace sirius::scan_manager {
+class sirius_scan_manager;
+class preparation_admission;
+class preparation_ledger;
+}  // namespace sirius::scan_manager
+
+namespace sirius::op {
+class operator_data;
+
+namespace scan {
+
+class gpu_ingestible;
+// Forward-declared to break the gpu_ingestible.hpp <-> sirius_gpu_scan_operator_data.hpp
+// include cycle; only used by const-reference below. Full definition pulled in by .cpp.
+class scan_operator_input;
+
+//===----------------------------------------------------------------------===//
+// gpu_ingestible
+//===----------------------------------------------------------------------===//
+/**
+ * @brief Abstract source of cudf tables. One implementation per data format.
+ *
+ * Composed by @c scan_manager::split_provider, which drives the metadata
+ * worker pool via @ref has_more_splits and @ref next_split_provider, and by
+ * @c sirius::op::scan::sirius_gpu_scan_operator, which calls
+ * @ref materialize_table (and conditionally @ref post_filter_and_project)
+ * on each split it pulls off its connector.
+ *
+ * Implementations today: @c parquet_gpu_ingestible,
+ * @c duckdb_native_gpu_ingestible.
+ */
+class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
+ public:
+  virtual void set_execution_completion(std::shared_ptr<pipeline::completion_handler> completion)
+  {
+    _execution_completion = std::move(completion);
+  }
+
+  using metadata_scan_task_t           = std::function<std::unique_ptr<scan_info>(std::stop_token)>;
+  using stoppable_metadata_scan_task_t = metadata_scan_task_t;
+
+  struct preparation_claim {
+    metadata_scan_task_t work;
+    // Optional stop-aware wrapper used by the preparation coordinator before blocking reads.
+    std::function<std::unique_ptr<scan_info>(std::stop_token)> stop_work;
+    std::optional<scan_manager::unit_key> key;
+    scan_manager::required_input_set required;
+  };
+  virtual std::shared_ptr<scan_manager::preparation_admission> preparation_admission() const
+  {
+    return {};
+  }
+  virtual void attach_preparation_ledger(std::shared_ptr<scan_manager::preparation_ledger>) {}
+  virtual bool can_claim_preparation() { return true; }
+  virtual void stop_preparation() noexcept {}
+  /// Complete adapter-owned preparation cleanup after query work has drained.
+  virtual void finish_preparation() noexcept { stop_preparation(); }
+  virtual preparation_claim claim_preparation(io::ioctx_resolver resolve)
+  {
+    auto stop_work = next_split_provider_with_stop(resolve);
+    if (!stop_work) return {};
+    auto work = stop_work;
+    return {[work = std::move(work)](std::stop_token stop) { return work(stop); },
+            std::move(stop_work),
+            {},
+            {}};
+  }
+
+  virtual stoppable_metadata_scan_task_t next_split_provider_with_stop(io::ioctx_resolver resolve)
+  {
+    auto work = next_split_provider(std::move(resolve));
+    if (!work) return {};
+    return [work = std::move(work)](std::stop_token stop) mutable {
+      if (stop.stop_requested())
+        throw std::system_error(std::make_error_code(std::errc::operation_canceled));
+      return work(stop);
+    };
+  }
+
+  virtual ~gpu_ingestible() = default;
+
+  gpu_ingestible(gpu_ingestible const&)            = delete;
+  gpu_ingestible& operator=(gpu_ingestible const&) = delete;
+  gpu_ingestible(gpu_ingestible&&)                 = delete;
+  gpu_ingestible& operator=(gpu_ingestible&&)      = delete;
+
+  /**
+   * @brief Materialize one scan split using query-local expression policy
+   *
+   * @param split Scan split to materialize
+   * @param stream Task-local CUDA stream
+   * @param like_swar_fastpath Whether eligible LIKE expressions use the SWAR kernel. Defaults
+   *        fail closed for non-query callers.
+   * @param like_cache Query-owned immutable LIKE classifications. A null value gives any
+   *        evaluator a private cache.
+   * @param policy Immutable expression settings from the query or pin invocation.
+   * @return Materialized table and filtering state
+   */
+  filtered_table materialize_table(
+    const op::scan::scan_operator_input& split,
+    ::cuda::stream_ref stream,
+    bool like_swar_fastpath                                           = false,
+    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache = nullptr,
+    expression_query_policy policy                                    = {});
+
+  virtual std::unique_ptr<batch_coalescer> create_batch_coalescer() const = 0;
+
+  /// Complete any metadata preparation deferred out of the constructor. Idempotent; throws on
+  /// failure. Called by the scan manager before it builds a disk-reading split_provider.
+  virtual void ensure_metadata_prepared() {}
+
+  /**
+   * @brief Snapshot check for remaining work. Thread-safe.
+   *
+   * Called by @c split_provider::run on the driver thread before claiming
+   * the next batch. Implementations typically compare an atomic batch
+   * index against a precomputed total.
+   */
+  [[nodiscard]] virtual bool has_processed_all_metadata() const = 0;
+
+  /**
+   * @brief Atomically claim the next batch and return a callable that
+   *        produces its operator_data splits. Thread-safe.
+   *
+   * Splitting the claim from the work lets @c split_provider::run enqueue
+   * one task per batch onto the scan_manager's worker pool. The callable
+   * returns the splits as a vector of operator_data; an empty vector or a
+   * null callable indicates no work was claimed (the driver loop skips
+   * empty handoffs).
+   */
+  virtual metadata_scan_task_t next_split_provider(io::ioctx_resolver resolve) = 0;
+
+  /**
+   * @brief Materialize the cudf table for one split. Called by
+   *        @c sirius_gpu_scan_operator::execute on the task-local stream.
+   *
+   * @param info Metadata for the split
+   * @param mem_space Destination memory space for decoded columns.
+   * @param stream Task-local CUDA stream
+   * @param like_swar_fastpath Whether eligible LIKE expressions use the SWAR kernel. Defaults
+   *        fail closed for non-query callers.
+   * @param like_cache Query-owned immutable LIKE classifications. A null value gives any
+   *        evaluator a private cache.
+   * @param policy Immutable expression settings from the query or pin invocation.
+   *
+   * Implementations allocate through this space's allocator. The caller must
+   * make its device current before calling this method. I/O uses the datasource
+   * attached to the scan metadata.
+   */
+  virtual filtered_table materialize_metadata_to_table(
+    const scan_info& info,
+    const cucascade::memory::memory_space& mem_space,
+    ::cuda::stream_ref stream,
+    bool like_swar_fastpath                                           = false,
+    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache = nullptr,
+    expression_query_policy policy                                    = {}) = 0;
+
+  /**
+   * @brief Whether `view_layout` can describe any resident batch of this scan
+   *
+   * A plan-static fact that `sirius_gpu_scan_operator::cached_view_possible` reads before any
+   * batch is materialized. When false, view_layout declines every batch.
+   *
+   * @return True if this ingestible can serve a cached view, false if it cannot.
+   */
+  [[nodiscard]] virtual bool can_serve_cached_view() const noexcept { return false; }
+
+  /**
+   * @brief Prepares an owned host layout without reading device data or surrendering source
+   *        columns.
+   *
+   * @param table Materialized table/batch to describe
+   * @param elided Endpoint output positions the caller is going to overwrite (a late
+   *               materialization's deferral's rowid and placeholders).
+   * @return A cached_view_layout if the ingestible can serve a cached view, std::nullopt otherwise.
+   */
+  [[nodiscard]] virtual std::optional<cached_view_layout> view_layout(
+    filtered_table const&, std::span<std::size_t const> elided) const
+  {
+    return std::nullopt;
+  }
+
+  /**
+   * @brief Apply post-decode filter and/or projection to the materialized
+   *        table. Called by @c sirius_gpu_scan_operator::execute whenever
+   *        @ref materialize_metadata_to_table did not return
+   *        @c filter_state::ROW_FILTERED_AND_PROJECTED.
+   *
+   * Takes the input by owning unique_ptr so implementations that call
+   * @c assemble_scan_output (which consumes its input by rvalue) can
+   * move-forward without an extra view→owning copy on the dominant
+   * fresh-read + assembly path.
+   *
+   * @param input Materialized table and filtering state
+   * @param mem_space Destination memory space
+   * @param stream Task-local CUDA stream
+   * @param like_swar_fastpath Whether eligible LIKE expressions use the SWAR kernel. Defaults
+   *        fail closed for non-query callers.
+   * @param like_cache Query-owned immutable LIKE classifications. A null value gives any
+   *        evaluator a private cache.
+   * @param policy Immutable expression settings from the query or pin invocation.
+   * @param survivors When non-null AND this call applies a row filter here,
+   *        receives an INT32 column of the input row positions that survived,
+   *        ascending. Late materialization needs it: a filtered batch is no
+   *        longer the chunk's rows in order, so the pin-order rowid can only be
+   *        rebuilt from where the survivors were. Left untouched when the rows
+   *        were filtered somewhere this call cannot see (the decoder), which is
+   *        exactly the case a deferral must refuse rather than guess at. An
+   *        implementation that ignores it must leave @ref can_report_survivors
+   *        false.
+   * @param elided Output positions the caller is going to overwrite regardless
+   *        (a deferral's rowid and placeholders). Dropped from the selection
+   *        before it is realized, so the copy never reads them; the caller puts
+   *        columns back at those positions and restores the arity. Ignored when
+   *        it would leave nothing to size the batch by.
+   * @return Filtered and projected table
+   */
+  virtual std::unique_ptr<cudf::table> post_filter_and_project(
+    filtered_table&& input,
+    const cucascade::memory::memory_space& mem_space,
+    ::cuda::stream_ref stream,
+    bool like_swar_fastpath                                           = false,
+    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache = nullptr,
+    std::unique_ptr<cudf::column>* survivors                          = nullptr,
+    std::span<std::size_t const> elided                               = {},
+    expression_query_policy policy                                    = {}) = 0;
+
+  /**
+   * @brief Whether this ingestible holds a row-filter expression that
+   *        @ref post_filter_and_project applies to splits not already
+   *        row-filtered. Drives the working-set estimate of resident
+   *        (pinned-cache) splits, which always reach post-filter unfiltered.
+   */
+  [[nodiscard]] virtual bool has_row_filter() const noexcept { return false; }
+
+  /**
+   * @brief Whether @ref post_filter_and_project actually POPULATES its
+   *        @c survivors out-parameter when one is passed.
+   *
+   * Accepting the parameter is not the same as answering it: an implementation
+   * that filters with a plain select ignores it and hands back a compacted
+   * table with no record of which rows survived. A late-materialization rowid
+   * over a filtered scan is built from exactly those positions, so a scan whose
+   * ingestible cannot report them must be refused at install rather than
+   * discovered at runtime, when the only signal left is a row count that no
+   * longer matches the pinned chunk.
+   *
+   * Defaults to FALSE so a new ingestible is refused until it opts in.
+   */
+  [[nodiscard]] virtual bool can_report_survivors() const noexcept { return false; }
+
+  /// Whether @ref post_filter_and_project's assembly is a leading-identity projection: output
+  /// column k is materialized column k, and no partition or other synthesized column joins the
+  /// output. When true, a decode-row-filtered batch whose width already matches the output arity
+  /// needs no assembly at all, so the scan's transactional carrier-cast steal may bypass
+  /// post_filter_and_project for it. A width match alone cannot prove this: trailing pure-filter
+  /// columns can offset missing synthesized columns. Conservative default: false (the steal then
+  /// falls back to the generic materialize/project path, which is always correct). Implementations
+  /// must derive this from their assembly configuration (parquet: `output_is_leading_prefix`) or
+  /// return a structural constant only while the invariant is type-level (duckdb-native synthesizes
+  /// no partition/virtual output columns and projects via `std::iota` — see its
+  /// `post_filter_and_project`). An override returning a stale `true` silently corrupts
+  /// decode-row-filtered steals.
+  [[nodiscard]] virtual bool output_assembly_is_leading_identity() const noexcept { return false; }
+
+  /// How many leading columns of @ref materialized_column_order the output reads; every
+  /// materialized column at or past it is a pure-filter column the output never reads. Nullopt
+  /// makes no promise: the fail-closed default, and also the answer for a scan with no output data
+  /// column, whose row count rides on its materialized columns.
+  [[nodiscard]] virtual std::optional<std::size_t> output_prefix_width() const noexcept
+  {
+    return std::nullopt;
+  }
+
+  [[nodiscard]] virtual const ingestible_table_info& table_info() const noexcept = 0;
+
+  /// Column identifiers in the exact order @ref materialize_table emits them — physical output
+  /// columns first (in output order), then pure-filter columns, then any synthesized virtual
+  /// columns; partition columns are excluded. This is the layout @ref post_filter_and_project
+  /// assumes (its index-based filter refs and projection are expressed in this order).
+  ///
+  /// The pinned-cache scan path serves cached columns in this order — instead of raw
+  /// column_ids order — so a cached batch is laid out identically to a fresh disk read and
+  /// @ref post_filter_and_project resolves the same columns on both paths.
+  [[nodiscard]] virtual std::vector<std::size_t> materialized_column_order() const = 0;
+
+  /// This scan's pushed-down filter, digested into the work a decompressor can
+  /// do for it: which columns can be answered off a dictionary instead of
+  /// decoded, and which rows can be dropped while decoding.
+  ///
+  /// A source that can exploit this (a Simpatico-compressed pin, whose
+  /// dictionary answers an equality off its key set without gathering the
+  /// decoded chars) hands it to the decoder as a
+  /// @c sirius::pushdown_request; every other source supplies the columns
+  /// normally. @ref post_filter_and_project copes with either by reading what
+  /// the batch it is handed reports, so the two need not agree.
+  ///
+  /// Empty by default: an ingestible whose filter path does not implement this
+  /// must not advertise work it cannot honour.
+  [[nodiscard]] virtual scan_filter_analysis const& filter_analysis() const
+  {
+    static scan_filter_analysis const none;
+    return none;
+  }
+
+ protected:
+  std::shared_ptr<pipeline::completion_handler> _execution_completion;
+  gpu_ingestible() noexcept = default;
+};
+
+}  // namespace scan
+}  // namespace sirius::op

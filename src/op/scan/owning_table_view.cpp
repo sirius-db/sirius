@@ -16,6 +16,8 @@
 
 #include "op/scan/owning_table_view.hpp"
 
+#include "op/scan/detail/read_retirement.hpp"
+
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -107,14 +109,43 @@ void owning_table_view::select_columns(std::span<const std::size_t> positions) c
   std::get<std::unique_ptr<detail::my_view>>(_state)->select_columns(positions);
 }
 
-void owning_table_view::materialize(rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr)
+void owning_table_view::record_reader_event(::cuda::stream_ref stream) const
 {
   if (auto* view = std::get_if<std::unique_ptr<detail::my_view>>(&_state)) {
-    _state = (*view)->materialize(stream, mr);
+    (*view)->record_reader_event(stream);
   }
 }
 
-std::unique_ptr<cudf::table> owning_table_view::release(rmm::cuda_stream_view stream,
+void owning_table_view::materialize(::cuda::stream_ref stream, rmm::device_async_resource_ref mr)
+{
+  if (auto* view = std::get_if<std::unique_ptr<detail::my_view>>(&_state)) {
+    if (auto output = (*view)->try_materialize_without_copy()) {
+      _state = std::move(output);
+      return;
+    }
+
+    auto selected       = (*view)->view();
+    auto const unjoined = detail::prepare_unjoined_failure();
+    auto state          = std::make_unique<detail::table_copy_state>();
+    state->source       = std::move(*view);
+    _state              = std::monostate{};
+    detail::no_retirement_faults faults;
+    try {
+      state->output = std::make_unique<cudf::table>(selected, stream, mr);
+      detail::check_read_checkpoint(detail::read_checkpoint::COPY);
+    } catch (...) {
+      // The erased owner must survive even if the table constructor submitted only part of its
+      // copy.
+      detail::retire_reads(state, stream, unjoined, faults, true);
+      _state = std::move(state->source);
+      throw;
+    }
+    detail::retire_reads(state, stream, unjoined, faults, false);
+    _state = std::move(state->output);
+  }
+}
+
+std::unique_ptr<cudf::table> owning_table_view::release(::cuda::stream_ref stream,
                                                         rmm::device_async_resource_ref mr)
 {
   materialize(stream, mr);

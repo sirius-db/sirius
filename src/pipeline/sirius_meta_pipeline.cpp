@@ -18,6 +18,8 @@
 
 #include "config.hpp"
 
+#include <algorithm>
+
 namespace sirius {
 namespace pipeline {
 
@@ -41,13 +43,10 @@ sirius::optional_ptr<op::sirius_physical_operator> sirius_meta_pipeline::get_sin
 
 sirius::optional_ptr<sirius_pipeline> sirius_meta_pipeline::get_parent() const { return parent; }
 
-duckdb::shared_ptr<sirius_pipeline>& sirius_meta_pipeline::get_base_pipeline()
-{
-  return pipelines[0];
-}
+std::shared_ptr<sirius_pipeline>& sirius_meta_pipeline::get_base_pipeline() { return pipelines[0]; }
 
-void sirius_meta_pipeline::get_pipelines(
-  duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& result, bool recursive)
+void sirius_meta_pipeline::get_pipelines(std::vector<std::shared_ptr<sirius_pipeline>>& result,
+                                         bool recursive)
 {
   result.insert(result.end(), pipelines.begin(), pipelines.end());
   if (recursive) {
@@ -58,11 +57,9 @@ void sirius_meta_pipeline::get_pipelines(
 }
 
 void sirius_meta_pipeline::get_meta_pipelines(
-  duckdb::vector<duckdb::shared_ptr<sirius_meta_pipeline>>& result, bool recursive, bool skip)
+  std::vector<std::shared_ptr<sirius_meta_pipeline>>& result, bool recursive, bool skip)
 {
-  if (!skip) {
-    result.push_back(duckdb::enable_shared_from_this<sirius_meta_pipeline>::shared_from_this());
-  }
+  if (!skip) { result.push_back(shared_from_this()); }
   if (recursive) {
     for (auto& child : children) {
       child->get_meta_pipelines(result, true, false);
@@ -73,7 +70,7 @@ void sirius_meta_pipeline::get_meta_pipelines(
 sirius_meta_pipeline& sirius_meta_pipeline::get_last_child()
 {
   if (children.empty()) { return *this; }
-  std::reference_wrapper<const duckdb::vector<duckdb::shared_ptr<sirius_meta_pipeline>>>
+  std::reference_wrapper<const std::vector<std::shared_ptr<sirius_meta_pipeline>>>
     current_children = children;
   while (!current_children.get().back()->children.empty()) {
     current_children = current_children.get().back()->children;
@@ -81,8 +78,8 @@ sirius_meta_pipeline& sirius_meta_pipeline::get_last_child()
   return *current_children.get().back();
 }
 
-const duckdb::vector<std::reference_wrapper<sirius_pipeline>>*
-sirius_meta_pipeline::get_dependencies(sirius_pipeline& dependent) const
+const std::vector<std::reference_wrapper<sirius_pipeline>>* sirius_meta_pipeline::get_dependencies(
+  sirius_pipeline& dependent) const
 {
   auto it = dependencies.find(dependent);
   if (it == dependencies.end()) {
@@ -122,7 +119,7 @@ void sirius_meta_pipeline::ready()
 sirius_meta_pipeline& sirius_meta_pipeline::create_child_meta_pipeline(
   sirius_pipeline& current, op::sirius_physical_operator& op)
 {
-  children.push_back(duckdb::make_shared_ptr<sirius_meta_pipeline>(build_ctx, state, &op));
+  children.push_back(std::make_shared<sirius_meta_pipeline>(build_ctx, state, &op));
   auto child_meta_pipeline = children.back().get();
   // store the parent
   child_meta_pipeline->parent = &current;
@@ -135,7 +132,7 @@ sirius_meta_pipeline& sirius_meta_pipeline::create_child_meta_pipeline(
 
 sirius_pipeline& sirius_meta_pipeline::create_pipeline()
 {
-  pipelines.emplace_back(duckdb::make_shared_ptr<sirius_pipeline>(build_ctx));
+  pipelines.emplace_back(std::make_shared<sirius_pipeline>(build_ctx));
   state.set_pipeline_sink(*pipelines.back(), sink, next_batch_index++);
   if (sink) {
     // Pre-populate operators with [sink] so it lands at operators.back() after `is_ready`
@@ -150,15 +147,17 @@ void sirius_meta_pipeline::add_dependencies_from(sirius_pipeline& dependent,
                                                  bool including)
 {
   // find 'start'
-  auto it = pipelines.begin();
-  for (; !duckdb::RefersToSameObject(**it, start); it++) {}
+  auto it = std::find_if(pipelines.begin(), pipelines.end(), [&start](const auto& pipeline) {
+    return pipeline.get() == &start;
+  });
+  D_ASSERT(it != pipelines.end());
 
   if (!including) { it++; }
 
   // collect pipelines that were created from then
-  duckdb::vector<std::reference_wrapper<pipeline::sirius_pipeline>> created_pipelines;
+  std::vector<std::reference_wrapper<pipeline::sirius_pipeline>> created_pipelines;
   for (; it != pipelines.end(); it++) {
-    if (duckdb::RefersToSameObject(**it, dependent)) {
+    if (&**it == &dependent) {
       // cannot depend on itself
       continue;
     }
@@ -171,19 +170,19 @@ void sirius_meta_pipeline::add_dependencies_from(sirius_pipeline& dependent,
 }
 
 void sirius_meta_pipeline::add_recursive_dependencies(
-  const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& new_dependencies,
+  const std::vector<std::shared_ptr<sirius_pipeline>>& new_dependencies,
   const sirius_meta_pipeline& last_child)
 {
   if (recursive_cte) {
     return;  // let's not burn our fingers on this for now
   }
 
-  duckdb::vector<duckdb::shared_ptr<sirius_meta_pipeline>> child_meta_pipelines;
+  std::vector<std::shared_ptr<sirius_meta_pipeline>> child_meta_pipelines;
   this->get_meta_pipelines(child_meta_pipelines, true, false);
 
   // find the meta pipeline that has the same sink as 'pipeline'
   auto it = child_meta_pipelines.begin();
-  for (; !duckdb::RefersToSameObject(last_child, **it); it++) {}
+  for (; &last_child != it->get(); it++) {}
   D_ASSERT(it != child_meta_pipelines.end());
 
   // skip over it
@@ -217,7 +216,7 @@ void sirius_meta_pipeline::add_finish_event(sirius_pipeline& pipeline)
   // add all pipelines that were added since 'pipeline' was added (including 'pipeline') to the
   // finish group
   auto it = pipelines.begin();
-  for (; !duckdb::RefersToSameObject(**it, pipeline); it++) {}
+  for (; &**it != &pipeline; it++) {}
   it++;
   for (; it != pipelines.end(); it++) {
     finish_map.emplace(**it, pipeline);

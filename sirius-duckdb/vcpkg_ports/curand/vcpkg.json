@@ -1,0 +1,11 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "dependencies": [
+    "culibos"
+  ],
+  "description": "NVIDIA cuRAND static redistributables for CUDA 12 and 13.",
+  "license": "LicenseRef-Proprietary",
+  "name": "curand",
+  "supports": "linux & (x64 | arm64)",
+  "version": "10.4.3.29"
+}

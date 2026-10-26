@@ -1,0 +1,330 @@
+/*
+ * Copyright 2026, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/**
+ * @file test_pin_registry_epoch_mutations.cpp
+ * @brief Every exit from a registry-mutating member moves the pin-registry epoch.
+ *
+ * A finalize-validated plan is reused only while the epoch it was built against still
+ * matches. The two exits that a per-site bump misses are pinned down here: the same-row-count
+ * merge's early return, and a throw that lands after the stale entry was erased but before its
+ * replacement was inserted. Either would let a stale plan run against a registry it was not
+ * built for.
+ */
+
+#include "memory/topology_index.hpp"
+#include "scan/test_utils.hpp"
+#include "scan_manager/sirius_scan_manager.hpp"
+
+#include <cudf/column/column_factories.hpp>
+
+#include <catch.hpp>
+#include <cucascade/memory/topology_discovery.hpp>
+#include <duckdb/common/types.hpp>
+#include <utils/duckdb_table_identity.hpp>
+
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace {
+
+using sirius::pinned_column_storage_matrix;
+using sirius::pinned_column_storage_meta;
+using sirius::scan_manager::cache_entry_info;
+using sirius::scan_manager::pinned_entry;
+using sirius::scan_manager::scan_manager_config;
+using sirius::scan_manager::sirius_scan_manager;
+
+constexpr char const* kTable = "epoch_t";
+constexpr cudf::data_type kInt64{cudf::type_id::INT64};
+
+std::shared_ptr<const sirius::memory::topology_index> single_gpu_index()
+{
+  cucascade::memory::system_topology_info topology;
+  topology.num_gpus = 1;
+  cucascade::memory::gpu_topology_info gpu;
+  gpu.id        = 0;
+  gpu.numa_node = 0;
+  topology.gpus.push_back(std::move(gpu));
+  return std::make_shared<sirius::memory::topology_index>(std::move(topology), std::vector<int>{0});
+}
+
+cache_entry_info make_cache_info(std::vector<std::size_t> const& primary_indices)
+{
+  cache_entry_info info;
+  info.catalog_name   = "memory";
+  info.schema_name    = "main";
+  info.table_name     = kTable;
+  info.table_identity = sirius::test::test_table_identity(42);
+  for (auto const idx : primary_indices) {
+    info.column_ids.emplace_back(idx);
+    info.names.push_back("c" + std::to_string(idx));
+  }
+  return info;
+}
+
+/// One chunk of @p n_columns INT64 columns with @p n_rows rows.
+std::vector<std::unique_ptr<cudf::table>> one_chunk(std::size_t n_columns, cudf::size_type n_rows)
+{
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  for (std::size_t i = 0; i < n_columns; ++i) {
+    columns.push_back(cudf::make_fixed_width_column(kInt64, n_rows));
+  }
+  std::vector<std::unique_ptr<cudf::table>> tables;
+  tables.push_back(std::make_unique<cudf::table>(std::move(columns)));
+  return tables;
+}
+
+pinned_column_storage_matrix storage_for(std::size_t n_columns)
+{
+  return pinned_column_storage_matrix{
+    std::vector<pinned_column_storage_meta>(n_columns, pinned_column_storage_meta{kInt64, false})};
+}
+
+struct epoch_fixture {
+  std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory =
+    initialize_memory_manager(1);
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, scan_manager_config{}, *memory, single_gpu_index()};
+  cucascade::memory::memory_space* space =
+    sirius::scan_test_utils::get_space(*memory, cucascade::memory::Tier::GPU);
+
+  /// GPU-tier insert of @p primary_indices over one chunk of @p n_rows rows; this is the path
+  /// with the merge branch and the erase-then-rebuild branch.
+  void insert(std::vector<std::size_t> const& primary_indices,
+              cudf::size_type n_rows,
+              std::size_t n_table_columns,
+              sirius::scan_manager::pinned_entry_metadata metadata = {})
+  {
+    static_cast<void>(
+      manager.insert_pinned_entry(kTable,
+                                  make_cache_info(primary_indices),
+                                  one_chunk(n_table_columns, n_rows),
+                                  std::vector<cucascade::memory::memory_space*>{space},
+                                  {},
+                                  {},
+                                  storage_for(primary_indices.size()),
+                                  std::move(metadata)));
+  }
+
+  [[nodiscard]] std::uint64_t epoch() const { return manager.pin_registry_epoch(); }
+
+  [[nodiscard]] std::shared_ptr<const sirius::pin_snapshot_identity> snapshot() const
+  {
+    std::shared_ptr<const sirius::pin_snapshot_identity> result;
+    manager.visit_pinned_entries([&](std::string_view name, pinned_entry const& entry) {
+      if (name == kTable) { result = entry.snapshot_identity; }
+      return true;
+    });
+    return result;
+  }
+
+  [[nodiscard]] bool has_entry() const
+  {
+    bool found = false;
+    manager.visit_pinned_entries([&](std::string_view name, pinned_entry const&) {
+      if (name == kTable) { found = true; }
+      return true;
+    });
+    return found;
+  }
+
+  [[nodiscard]] std::size_t entry_column_count() const
+  {
+    std::size_t count = 0;
+    manager.visit_pinned_entries([&](std::string_view name, pinned_entry const& entry) {
+      if (name == kTable) { count = entry.cache_info.column_ids.size(); }
+      return true;
+    });
+    return count;
+  }
+};
+
+}  // namespace
+
+TEST_CASE("the same-row-count merge path moves the pin-registry epoch",
+          "[scan_manager][pin_registry_epoch]")
+{
+  epoch_fixture f;
+  f.insert({0}, 8, 1);
+  REQUIRE(f.entry_column_count() == 1);
+
+  auto const before_merge = f.epoch();
+  auto const old_snapshot = f.snapshot();
+  REQUIRE(old_snapshot);
+  // Same name, same row count, same chunk boundaries: takes the merge branch's early return.
+  f.insert({1}, 8, 1);
+  REQUIRE(f.entry_column_count() == 2);
+  CHECK(f.epoch() > before_merge);
+  CHECK(f.snapshot() != old_snapshot);
+}
+
+TEST_CASE("failed and successful replacement preserve old pin metadata for readers",
+          "[scan_manager][pin_registry_epoch]")
+{
+  epoch_fixture f;
+  f.insert({0},
+           8,
+           1,
+           {.mvcc                  = sirius::scan_manager::duckdb_mvcc_metadata{42, {}, 7},
+            .proven_unique_columns = {"c0"}});
+  auto lookup = [&] {
+    return f.manager.find_pinned_entry_for_duckdb_table(
+      "memory", "main", kTable, sirius::test::test_table_identity(42));
+  };
+  auto previous = lookup();
+  REQUIRE(previous);
+  REQUIRE(previous->mvcc);
+  auto const before_failed_repin = f.epoch();
+  // Invalid data must not publish either the replacement or its newer metadata.
+  REQUIRE_THROWS_AS(
+    f.insert({0, 1}, 4, 1, {.mvcc = sirius::scan_manager::duckdb_mvcc_metadata{99, {}, 8}}),
+    std::runtime_error);
+  CHECK(lookup() == previous);
+  CHECK(previous->mvcc->v_base == 42);
+  CHECK(previous->proven_unique_columns == std::vector<bool>{true});
+  CHECK(f.epoch() > before_failed_repin);
+
+  // A successful replacement changes the visible generation; a reader of the old
+  // generation keeps its original data and metadata together.
+  f.insert({0}, 9, 1, {.mvcc = sirius::scan_manager::duckdb_mvcc_metadata{99, {}, 8}});
+  auto current = lookup();
+  REQUIRE(current);
+  CHECK(current != previous);
+  REQUIRE(current->mvcc);
+  CHECK(current->mvcc->v_base == 99);
+  CHECK(current->proven_unique_columns.empty());
+  CHECK(previous->num_rows == 8);
+  CHECK(previous->mvcc->v_base == 42);
+  CHECK(previous->proven_unique_columns == std::vector<bool>{true});
+}
+
+TEST_CASE("empty host and device-chunked pins reject column merges without replacing metadata",
+          "[scan_manager][pin_registry_epoch]")
+{
+  epoch_fixture f;
+  auto const tier = GENERATE(cucascade::memory::Tier::HOST, cucascade::memory::Tier::GPU);
+  CAPTURE(tier);
+  auto* space = sirius::scan_test_utils::get_space(*f.memory, tier);
+  REQUIRE(space);
+  sirius::scan_manager::pinned_entry_metadata metadata{
+    .mvcc = sirius::scan_manager::duckdb_mvcc_metadata{42, {}, 7}, .proven_unique_columns = {"c0"}};
+  if (tier == cucascade::memory::Tier::HOST) {
+    f.manager.insert_pinned_entry_host(
+      kTable, make_cache_info({0}), {}, *space, {}, {}, {}, std::move(metadata));
+  } else {
+    f.manager.insert_pinned_entry_device(
+      kTable, make_cache_info({0}), {}, *space, {}, std::move(metadata));
+  }
+  auto lookup = [&] {
+    return f.manager.find_pinned_entry_for_duckdb_table(
+      "memory", "main", kTable, sirius::test::test_table_identity(42));
+  };
+  // Do not retain a reader: that would trigger the existing entry-in-use guard instead.
+  std::weak_ptr<const pinned_entry> previous = lookup();
+  REQUIRE_FALSE(previous.expired());
+  auto const old_snapshot = f.snapshot();
+  auto const before       = f.epoch();
+  REQUIRE_THROWS_WITH(
+    f.manager.insert_pinned_entry(kTable,
+                                  make_cache_info({1}),
+                                  {},
+                                  {},
+                                  {},
+                                  {},
+                                  {},
+                                  {.mvcc = sirius::scan_manager::duckdb_mvcc_metadata{99, {}, 8},
+                                   .proven_unique_columns = {"c1"}}),
+    Catch::Matchers::ContainsSubstring("existing pin does not use column-major GPU storage"));
+
+  auto current = lookup();
+  REQUIRE(current);
+  CHECK(current == previous.lock());
+  CHECK(current->snapshot_identity == old_snapshot);
+  CHECK(current->tier == tier);
+  CHECK(current->memory_space == space);
+  CHECK(current->num_rows == 0);
+  CHECK(current->cache_info.names == std::vector<std::string>{"c0"});
+  CHECK(current->proven_unique_columns == std::vector<bool>{true});
+  REQUIRE(current->mvcc);
+  CHECK(current->mvcc->v_base == 42);
+  CHECK(current->mvcc->checkpoint_iteration == 7);
+  CHECK(f.epoch() > before);
+}
+
+TEST_CASE("empty column-major GPU pins still accept compatible merges",
+          "[scan_manager][pin_registry_epoch]")
+{
+  epoch_fixture f;
+  auto insert_empty = [&] {
+    return f.manager.insert_pinned_entry(kTable, make_cache_info({0}), {}, {}, {}, {}, {});
+  };
+  CHECK(insert_empty() == std::vector<std::string>{"c0"});
+  auto const old_snapshot = f.snapshot();
+  CHECK(insert_empty().empty());
+  CHECK(f.snapshot() != old_snapshot);
+  CHECK(f.entry_column_count() == 1);
+}
+
+TEST_CASE("pin publication includes metadata and advances the epoch",
+          "[scan_manager][pin_registry_epoch]")
+{
+  epoch_fixture f;
+  auto const before = f.epoch();
+  f.insert({0, 1},
+           8,
+           2,
+           {.mvcc                  = sirius::scan_manager::duckdb_mvcc_metadata{42, {}, 7},
+            .proven_unique_columns = {"c0"}});
+  auto entry = f.manager.find_pinned_entry_for_duckdb_table(
+    "memory", "main", kTable, sirius::test::test_table_identity(42));
+  REQUIRE(entry);
+  REQUIRE(entry->mvcc);
+  CHECK(entry->mvcc->v_base == 42);
+  CHECK(entry->mvcc->checkpoint_iteration == 7);
+  CHECK(entry->proven_unique_columns == std::vector<bool>{true, false});
+  CHECK(f.epoch() > before);
+}
+
+TEST_CASE("removing a pinned entry moves the pin-registry epoch",
+          "[scan_manager][pin_registry_epoch]")
+{
+  epoch_fixture f;
+  f.insert({0}, 8, 1);
+  auto const before_remove                                        = f.epoch();
+  std::weak_ptr<const sirius::pin_snapshot_identity> old_snapshot = f.snapshot();
+  f.manager.remove_pinned_entry(kTable);
+  CHECK_FALSE(f.has_entry());
+  CHECK(f.epoch() > before_remove);
+  CHECK(old_snapshot.expired());
+}
+
+TEST_CASE("replacing a pin renews its snapshot without unpinning",
+          "[scan_manager][pin_registry_epoch]")
+{
+  epoch_fixture f;
+  f.insert({0}, 8, 1);
+  auto const old_snapshot = f.snapshot();
+  REQUIRE(old_snapshot);
+  f.insert({0}, 9, 1);
+  REQUIRE(f.snapshot());
+  CHECK(f.snapshot() != old_snapshot);
+}

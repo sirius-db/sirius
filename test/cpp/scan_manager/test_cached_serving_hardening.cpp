@@ -37,39 +37,63 @@
 // entry's recorded column_storage matrix: compressed and uncompressed chunks, both tiers, answer
 // through the same metadata, so several fixtures here carry no storage at all.
 
+#include "api/simpatico_codegen.hpp"
 #include "operator/operator_test_utils.hpp"
+#include "scan/fused_scan_filter_test_utils.hpp"
+#include "sirius_context.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
+#include <cudf/unary.hpp>
 #include <cudf/utilities/traits.hpp>
 
 #include <rmm/cuda_stream.hpp>
+#include <rmm/error.hpp>
+#include <rmm/mr/per_device_resource.hpp>
 
 #include <cuda_runtime.h>
 
 #include <catch.hpp>
 #include <compression/compressed_representation.hpp>
+#include <compression/compressed_scan.hpp>
+#include <compression/decompression_pushdown_policy.hpp>
+#include <compression/device_compressed_blob.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
+#include <helper/type_conversions.hpp>
+#include <late_mat/column_origin.hpp>
+#include <late_mat/defer_directive.hpp>
+#include <op/dynamic_filter/dynamic_filter_stats.hpp>
+#include <op/dynamic_filter/sirius_dynamic_filter.hpp>
+#include <op/scan/decoded_batch_representation.hpp>
+#include <op/scan/dynamic_filter_merge.hpp>
 #include <op/scan/gpu_ingestible.hpp>
+#include <op/scan/iceberg_gpu_ingestible.hpp>
+#include <op/scan/parquet_gpu_ingestible.hpp>
+#include <op/scan/sirius_gpu_scan_operator.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
+#include <op/sirius_physical_operator.hpp>
+#include <planner/late_mat_plan_pass.hpp>
 #include <scan_manager/load_balancing_scan_batch_coalescer.hpp>
 #include <scan_manager/mvcc_chunk_mask.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
 #include <scan_manager/split_connector.hpp>
 #include <telemetry/data_batch_probe.hpp>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <stop_token>
 #include <string>
@@ -101,12 +125,13 @@ struct test_env {
   {
   }
 
-  rmm::cuda_stream_view stream() { return conv_stream.view(); }
+  ::cuda::stream_ref stream() { return conv_stream; }
 };
 
 test_env& env()
 {
   static test_env e;
+  if (!sirius::converter_registry::is_initialized()) { sirius::converter_registry::initialize(); }
   return e;
 }
 
@@ -281,7 +306,7 @@ pinned_entry make_host_entry(test_env& e, std::size_t n_chunks, std::size_t rows
       std::make_unique<cudf::table>(std::move(cols)), *e.gpu_space, e.stream());
     auto host_repr =
       registry.convert<cucascade::host_data_representation>(gpu_repr, e.host_space, e.stream());
-    e.stream().synchronize();
+    e.stream().sync();
     entry.host_chunks.emplace_back(std::move(host_repr));
   }
   entry.num_rows = n_chunks * rows;
@@ -295,27 +320,39 @@ std::shared_ptr<cucascade::data_batch> make_test_batch(test_env& e, std::size_t 
   std::vector<std::shared_ptr<cudf::column>> columns{col};
   std::vector<cudf::column_view> views{col->view()};
   auto const alloc_size = col->alloc_size();
-  auto repr             = std::make_unique<cucascade::gpu_table_representation>(
-    cudf::table_view(views), std::move(columns), alloc_size, *e.gpu_space, rmm::cuda_stream_view{});
+  auto repr =
+    std::make_unique<cucascade::gpu_table_representation>(cudf::table_view(views),
+                                                          std::move(columns),
+                                                          alloc_size,
+                                                          *e.gpu_space,
+                                                          ::cuda::stream_ref{cudaStream_t{}});
   return cucascade::data_batch::make(sirius::get_next_batch_id(), std::move(repr));
 }
 
-/// HOST-resident wrapper batch (single INT32 column) — the shape a host-pinned
-/// chunk's per-query slice arrives in, which prepare_for_processing converts
-/// to a fresh owned GPU table.
-std::shared_ptr<cucascade::data_batch> make_host_batch(test_env& e,
-                                                       std::vector<int32_t> const& values)
+/// HOST-resident wrapper batch — the shape a host-pinned chunk's per-query slice arrives in, which
+/// prepare_for_processing converts to a fresh owned GPU table.
+std::shared_ptr<cucascade::data_batch> make_host_batch(
+  test_env& e, const std::vector<std::vector<int32_t>>& data)
 {
-  auto shared = make_gpu_column(*e.gpu_space, values);
   std::vector<std::unique_ptr<cudf::column>> cols;
-  cols.push_back(std::make_unique<cudf::column>(
-    shared->view(), e.stream(), e.gpu_space->get_default_allocator()));
+  cols.reserve(data.size());
+  for (auto const& values : data) {
+    auto shared = make_gpu_column(*e.gpu_space, values);
+    cols.push_back(std::make_unique<cudf::column>(
+      shared->view(), e.stream(), e.gpu_space->get_default_allocator()));
+  }
   cucascade::gpu_table_representation gpu_repr(
     std::make_unique<cudf::table>(std::move(cols)), *e.gpu_space, e.stream());
   auto host_repr = sirius::converter_registry::get().convert<cucascade::host_data_representation>(
     gpu_repr, e.host_space, e.stream());
-  e.stream().synchronize();
+  e.stream().sync();
   return cucascade::data_batch::make(sirius::get_next_batch_id(), std::move(host_repr));
+}
+
+std::shared_ptr<cucascade::data_batch> make_host_batch(test_env& e,
+                                                       std::vector<int32_t> const& values)
+{
+  return make_host_batch(e, std::vector<std::vector<int32_t>>{values});
 }
 
 /// Minimal concrete gpu_ingestible: materialize_table's resident branch calls
@@ -323,6 +360,7 @@ std::shared_ptr<cucascade::data_batch> make_host_batch(test_env& e,
 struct stub_table_info final : sirius::op::scan::ingestible_table_info {
   [[nodiscard]] std::span<std::string const> column_names() const override { return {}; }
   [[nodiscard]] std::span<std::string const> file_paths() const override { return {}; }
+  [[nodiscard]] std::string display_name() const override { return "<stub>"; }
 };
 
 struct stub_ingestible final : sirius::op::scan::gpu_ingestible {
@@ -339,14 +377,22 @@ struct stub_ingestible final : sirius::op::scan::gpu_ingestible {
   sirius::op::scan::filtered_table materialize_metadata_to_table(
     const sirius::op::scan::scan_info& /*info*/,
     const cucascade::memory::memory_space& /*mem_space*/,
-    rmm::cuda_stream_view /*stream*/) override
+    ::cuda::stream_ref /*stream*/,
+    bool /*like_swar_fastpath*/,
+    std::shared_ptr<const sirius::like_multiliteral_cache> /*like_cache*/,
+    sirius::expression_query_policy /*policy*/) override
   {
     throw std::logic_error("stub_ingestible::materialize_metadata_to_table is unreachable");
   }
   std::unique_ptr<cudf::table> post_filter_and_project(
     sirius::op::scan::filtered_table&& /*input*/,
     const cucascade::memory::memory_space& /*mem_space*/,
-    rmm::cuda_stream_view /*stream*/) override
+    ::cuda::stream_ref /*stream*/,
+    bool /*like_swar_fastpath*/,
+    std::shared_ptr<const sirius::like_multiliteral_cache> /*like_cache*/,
+    std::unique_ptr<cudf::column>* /*survivors*/,
+    std::span<std::size_t const> /*elided*/,
+    sirius::expression_query_policy /*policy*/) override
   {
     throw std::logic_error("stub_ingestible::post_filter_and_project is unreachable");
   }
@@ -355,19 +401,32 @@ struct stub_ingestible final : sirius::op::scan::gpu_ingestible {
     return _info;
   }
   [[nodiscard]] std::vector<std::size_t> materialized_column_order() const override { return {}; }
+  [[nodiscard]] std::optional<std::size_t> output_prefix_width() const noexcept override
+  {
+    return prefix_width;
+  }
 
   stub_table_info _info;
+  /// What output_prefix_width reports; a decode that dropped filter-only columns is served only at
+  /// this width.
+  std::optional<std::size_t> prefix_width;
 };
 
-/// Copy the single INT32 column of @p table back to host for content checks.
-std::vector<int32_t> to_host(cudf::table_view const& view)
+template <typename T>
+std::vector<T> to_host_column(cudf::table_view const& view, std::size_t column_idx)
 {
-  std::vector<int32_t> out(static_cast<std::size_t>(view.num_rows()));
+  std::vector<T> out(static_cast<std::size_t>(view.num_rows()));
   cudaMemcpy(out.data(),
-             view.column(0).data<int32_t>(),
-             sizeof(int32_t) * out.size(),
+             view.column(static_cast<cudf::size_type>(column_idx)).data<T>(),
+             sizeof(T) * out.size(),
              cudaMemcpyDeviceToHost);
   return out;
+}
+
+/// Copy the first INT32 column of @p table back to host for content checks.
+std::vector<int32_t> to_host(cudf::table_view const& view)
+{
+  return to_host_column<int32_t>(view, 0);
 }
 
 /// All-ones keep-mask over @p rows rows, its words aliasing a plain vector —
@@ -383,6 +442,10 @@ sirius::scan_manager::mvcc_chunk_mask make_test_mask(std::size_t rows)
 /// order, then either ends the stream or throws — the provider behaviors the
 /// drain must handle.
 struct scripted_provider final : databatch_provider {
+  scripted_provider()
+  {
+    validation.identity = validation.layout = validation.structure = {true, true};
+  }
   std::vector<std::shared_ptr<cucascade::data_batch>> batches;
   std::vector<sirius::scan_manager::mvcc_chunk_mask> masks;
   std::vector<bool> converting;
@@ -401,6 +464,14 @@ struct scripted_provider final : databatch_provider {
     return {};
   }
 };
+
+// make_provider_for_pinned_entry takes shared ownership (the provider co-owns the entry it
+// serves). These provider-only tests keep entries on the stack and outlive their providers,
+// so a non-owning alias is safe and avoids restructuring every entry construction.
+std::shared_ptr<pinned_entry const> borrow(pinned_entry const& entry)
+{
+  return {std::shared_ptr<void>{}, &entry};
+}
 
 }  // namespace
 
@@ -491,8 +562,11 @@ TEST_CASE("drain_cached_provider forwards the mvcc keep-mask and filter flag ont
 
 TEST_CASE("cached provider pairs chunk i with mask-set slot i", "[cached_serving][scan_manager]")
 {
-  auto& e    = env();
-  auto entry = make_gpu_entry(*e.gpu_space, 3, 4);
+  auto& e = env();
+  // shared_ptr because the provider co-owns the entry it serves — see
+  // make_provider_for_pinned_entry.
+  auto entry =
+    std::make_shared<sirius::scan_manager::pinned_entry>(make_gpu_entry(*e.gpu_space, 3, 4));
   std::vector<std::size_t> cols{0, 1, 2};
 
   SECTION("with a mask set")
@@ -536,6 +610,208 @@ TEST_CASE("cached provider pairs chunk i with mask-set slot i", "[cached_serving
   }
 }
 
+// The mask set is slot-sized whenever the entry has any MVCC state, so the attach must
+// read the SLOT, not set emptiness. A masked slot gets the pushdown and its visibility
+// mask; a default slot gets the pushdown alone.
+TEST_CASE("cached provider composes the decode-side pushdown with the mvcc mask slot",
+          "[cached_serving][scan_manager]")
+{
+  auto& e = env();
+  constexpr std::size_t rows{64};
+
+  // Empty cached table: a range-only request narrows through for_chunk without probing
+  // any column plan.
+  pinned_entry entry;
+  set_cached_columns(entry, {"k", "v"});
+  entry.tier         = cucascade::memory::Tier::GPU;
+  entry.memory_space = e.gpu_space;
+  for (std::size_t c = 0; c < 2; ++c) {
+    sirius::device_pin_chunk chunk;
+    chunk.memory_space = e.gpu_space;
+    chunk.compressed   = std::make_shared<sirius::compressed_device_representation>(
+      *e.gpu_space,
+      std::make_shared<sirius::compressed_device_blob>(),
+      std::vector<std::string>{"k", "v"},
+      /*compressed_bytes=*/64,
+      /*uncompressed_bytes=*/256,
+      /*num_rows=*/static_cast<std::int64_t>(rows));
+    entry.device_chunks.push_back(std::move(chunk));
+  }
+  entry.num_rows = 2 * rows;
+
+  // After deletes commit, only chunks holding deleted rows are masked.
+  sirius::scan_manager::mvcc_chunk_mask_set masks;
+  masks.push_back(make_test_mask(rows));
+  masks.push_back({});
+
+  // Range-only: both chunks attach the same scan, and only the masked one also
+  // carries a visibility mask.
+  sirius::pushdown_request request;
+  request.columns.resize(2);
+  request.columns[0].range          = sirius::decode_range{.lo = 5, .hi = 90};
+  request.ranges_cover_whole_filter = true;
+
+  std::vector<std::size_t> cols{0, 1};
+  sirius::scan_manager::cached_scan_plan plan{.survivor_chunk_indices = {0, 1}};
+  auto provider = sirius::scan_manager::make_provider_for_pinned_entry(
+    std::make_shared<pinned_entry const>(std::move(entry)),
+    cols,
+    std::move(plan),
+    sirius::telemetry::batch_telemetry_info{},
+    masks,
+    /*delta_splits=*/{},
+    /*normalization_targets=*/{},
+    /*has_physical_overrides=*/false,
+    request);
+
+  struct served_attachments {
+    std::shared_ptr<const sirius::decompression_pushdown_scan> scan;
+    sirius::decode_visibility_mask visibility;
+  };
+  auto const served_rep = [](databatch_provider::batch const& b) -> served_attachments {
+    auto ro         = b.data->to_read_only();
+    auto const* rep = dynamic_cast<sirius::compressed_device_representation const*>(ro.get_data());
+    REQUIRE(rep != nullptr);
+    return {rep->pushdown_scan(), rep->visibility_mask()};
+  };
+
+  auto const check_request = [](sirius::pushdown_request const& r) {
+    REQUIRE_FALSE(r.row_selection_disabled);
+    REQUIRE(r.selects_rows());
+    REQUIRE(r.columns.size() == 2);
+    REQUIRE(r.columns[0].range.has_value());
+    REQUIRE(r.columns[0].range->lo == 5);
+    REQUIRE(r.columns[0].range->hi == 90);
+    REQUIRE_FALSE(r.columns[1].range.has_value());
+    REQUIRE(r.ranges_cover_whole_filter);
+  };
+
+  auto a = provider->get_next_batch();
+  REQUIRE(a.data);
+  REQUIRE(a.mvcc_keep_mask.has_mask());
+  auto const a_served = served_rep(a);
+  REQUIRE(a_served.scan != nullptr);
+  check_request(a_served.scan->request());
+  REQUIRE(a_served.visibility.has_mask());
+  REQUIRE(a_served.visibility.row_count == rows);
+  REQUIRE(a_served.visibility.words.get() == masks[0].words.get());
+
+  auto b = provider->get_next_batch();
+  REQUIRE(b.data);
+  REQUIRE_FALSE(b.mvcc_keep_mask.has_mask());
+  auto const b_served = served_rep(b);
+  REQUIRE(b_served.scan != nullptr);
+  check_request(b_served.scan->request());
+  REQUIRE_FALSE(b_served.visibility.has_mask());
+
+  REQUIRE_FALSE(provider->get_next_batch().data);  // end of stream
+}
+
+TEST_CASE("host cached provider keeps pushdown requests query local across projection and clone",
+          "[cached_serving][scan_manager][compression]")
+{
+  auto& e = env();
+  constexpr std::size_t rows{64};
+  auto entry = std::make_shared<pinned_entry>();
+  set_cached_columns(*entry, {"k", "v"});
+  entry->tier         = cucascade::memory::Tier::HOST;
+  entry->memory_space = e.host_space;
+  entry->num_rows     = rows;
+  auto original       = std::make_shared<sirius::compressed_host_representation>(
+    *e.host_space,
+    std::make_shared<sirius::pinned_compressed_blob>(),
+    std::vector<std::string>{"k", "v"},
+    /*compressed_bytes=*/64,
+    /*uncompressed_bytes=*/256,
+    /*num_rows=*/static_cast<std::int64_t>(rows));
+  entry->host_chunks.push_back(original);
+
+  // Requests are indexed by output slot, even when projection reverses pin columns.
+  std::vector<std::size_t> columns{1, 0};
+  sirius::pushdown_request request;
+  request.columns.resize(2);
+  request.columns[0].equals_any  = {"AIR", "AIR REG"};
+  request.row_selection_disabled = true;
+  auto mask                      = make_test_mask(rows);
+  auto make_provider             = [&](sirius::pushdown_request wanted) {
+    return sirius::scan_manager::make_provider_for_pinned_entry(
+      entry,
+      columns,
+      sirius::scan_manager::cached_scan_plan{.survivor_chunk_indices = {0}},
+      sirius::telemetry::batch_telemetry_info{},
+      sirius::scan_manager::mvcc_chunk_mask_set{mask},
+      /*delta_splits=*/{},
+      /*normalization_targets=*/{},
+      /*has_physical_overrides=*/false,
+      std::move(wanted));
+  };
+  auto first_provider = make_provider(request);
+  auto first          = first_provider->get_next_batch();
+  REQUIRE(first.data);
+  auto const first_scan = [&] {
+    auto first_ro = first.data->to_read_only();
+    auto const* first_rep =
+      dynamic_cast<sirius::compressed_host_representation const*>(first_ro.get_data());
+    REQUIRE(first_rep != nullptr);
+    REQUIRE(first_rep->selected_indices() == std::optional<std::vector<std::size_t>>{columns});
+    REQUIRE(first_rep->pushdown_scan() != nullptr);
+    REQUIRE(first_rep->pushdown_scan()->request().columns[0].equals_any ==
+            request.columns[0].equals_any);
+    REQUIRE(first_rep->pushdown_scan()->request().row_selection_disabled);
+    REQUIRE(first_rep->visibility_mask().words == mask.words);
+    return first_rep->pushdown_scan();
+  }();
+
+  // A clone used by conversion/prefetch must retain the query's immutable request.
+  auto cloned = [&] {
+    auto first_mut = first.data->to_mutable();
+    return first_mut.get_data()->clone(e.stream());
+  }();
+  auto const* cloned_rep =
+    dynamic_cast<sirius::compressed_host_representation const*>(cloned.get());
+  REQUIRE(cloned_rep != nullptr);
+  REQUIRE(cloned_rep->pushdown_scan() == first_scan);
+  REQUIRE(cloned_rep->visibility_mask().words == mask.words);
+  REQUIRE(cloned_rep->visibility_mask().row_count == rows);
+
+  // Both tier wrappers share their backing storage and must preserve the same row mask.
+  sirius::compressed_device_representation device(
+    *e.gpu_space,
+    std::make_shared<sirius::compressed_device_blob>(),
+    std::vector<std::string>{"k", "v"},
+    /*compressed_bytes=*/64,
+    /*uncompressed_bytes=*/256,
+    /*num_rows=*/static_cast<std::int64_t>(rows));
+  auto device_projected = device.select_columns(columns);
+  device_projected->set_pushdown_scan(first_scan);
+  device_projected->set_visibility_mask(sirius::decode_visibility_mask{mask.words, mask.row_count});
+  auto device_clone = device_projected->clone(e.stream());
+  auto const* device_cloned_rep =
+    dynamic_cast<sirius::compressed_device_representation const*>(device_clone.get());
+  REQUIRE(device_cloned_rep != nullptr);
+  REQUIRE(device_cloned_rep->pushdown_scan() == first_scan);
+  REQUIRE(device_cloned_rep->visibility_mask().words == mask.words);
+  REQUIRE(device_cloned_rep->visibility_mask().row_count == rows);
+  REQUIRE(device_cloned_rep->selected_indices() ==
+          std::optional<std::vector<std::size_t>>{columns});
+
+  request.columns[0].equals_any = {"MAIL"};
+  auto second_provider          = make_provider(request);
+  auto second                   = second_provider->get_next_batch();
+  auto second_ro                = second.data->to_read_only();
+  auto const* second_rep =
+    dynamic_cast<sirius::compressed_host_representation const*>(second_ro.get_data());
+  REQUIRE(second_rep != nullptr);
+  REQUIRE(second_rep->pushdown_scan()->request().columns[0].equals_any ==
+          request.columns[0].equals_any);
+  REQUIRE(first_scan->request().columns[0].equals_any ==
+          std::vector<std::string>{"AIR", "AIR REG"});
+  REQUIRE(original->pushdown_scan() == nullptr);
+  REQUIRE_FALSE(original->visibility_mask().has_mask());
+  REQUIRE_FALSE(first_provider->get_next_batch().data);
+  REQUIRE_FALSE(second_provider->get_next_batch().data);
+}
+
 TEST_CASE("cached provider marks only selected converting columns",
           "[cached_serving][scan_manager]")
 {
@@ -553,7 +829,7 @@ TEST_CASE("cached provider marks only selected converting columns",
     std::vector<std::size_t> selected{1};
     sirius::scan_manager::cached_scan_plan plan{.survivor_chunk_indices = {0, 1, 2}};
     auto provider = sirius::scan_manager::make_provider_for_pinned_entry(
-      entry,
+      borrow(entry),
       selected,
       std::move(plan),
       sirius::telemetry::batch_telemetry_info{},
@@ -571,7 +847,7 @@ TEST_CASE("cached provider marks only selected converting columns",
     std::vector<std::size_t> selected{2};
     sirius::scan_manager::cached_scan_plan plan{.survivor_chunk_indices = {0, 1, 2}};
     auto provider = sirius::scan_manager::make_provider_for_pinned_entry(
-      entry,
+      borrow(entry),
       selected,
       std::move(plan),
       sirius::telemetry::batch_telemetry_info{},
@@ -621,7 +897,7 @@ TEST_CASE("cached provider computes exact conversion-destination bytes per chunk
                       bool has_overrides = false) {
     sirius::scan_manager::cached_scan_plan plan{.survivor_chunk_indices = {0}};
     auto provider = sirius::scan_manager::make_provider_for_pinned_entry(
-      entry,
+      borrow(entry),
       selected,
       std::move(plan),
       sirius::telemetry::batch_telemetry_info{},
@@ -765,7 +1041,7 @@ TEST_CASE("cached provider computes exact conversion-destination bytes per chunk
     std::vector<std::size_t> selected{0, 1};
     sirius::scan_manager::cached_scan_plan plan{.survivor_chunk_indices = {0, 1}};
     auto provider = sirius::scan_manager::make_provider_for_pinned_entry(
-      entry,
+      borrow(entry),
       selected,
       std::move(plan),
       sirius::telemetry::batch_telemetry_info{},
@@ -1230,7 +1506,7 @@ TEST_CASE("prepare_for_processing steals the converted table from a per-query wr
   REQUIRE(result.state == sirius::op::scan::filter_state::UNFILTERED);
   auto out = result.table.release(e.stream(), e.gpu_space->get_default_allocator());
   REQUIRE(out != nullptr);
-  e.stream().synchronize();
+  e.stream().sync();
   REQUIRE(to_host(out->view()) == values);
   REQUIRE(split.stolen_table == nullptr);
   REQUIRE(split.stolen_table_consumed);
@@ -1258,16 +1534,18 @@ TEST_CASE("prepare_for_processing never steals from a GPU-resident (pin-shaped) 
   REQUIRE(size_before > 0);
 
   sirius::op::scan::scan_operator_input split{batch};
+  split.needs_carrier_conversion = true;
   split.prepare_for_processing(e.gpu_space, e.stream());
   REQUIRE(split.stolen_table == nullptr);
   REQUIRE(split.stolen_table_bytes == 0);
+  REQUIRE_FALSE(split.converted_table_steal_pending);
 
   stub_ingestible ingestible;
   auto result = ingestible.materialize_table(split, e.stream());
   REQUIRE(result.state == sirius::op::scan::filter_state::UNFILTERED);
   auto out = result.table.release(e.stream(), e.gpu_space->get_default_allocator());
   REQUIRE(out != nullptr);
-  e.stream().synchronize();
+  e.stream().sync();
   REQUIRE(to_host(out->view()) == std::vector<int32_t>(4, 7));
 
   // Pin-shaped storage untouched: same representation, same bytes.
@@ -1276,11 +1554,82 @@ TEST_CASE("prepare_for_processing never steals from a GPU-resident (pin-shaped) 
   REQUIRE(ro.get_data()->get_size_in_bytes() == size_before);
 }
 
-TEST_CASE("prepare_for_processing skips the steal for masked or row-filtered splits",
+TEST_CASE("prepare_for_processing reads the outcome of a prefetched GPU decode",
+          "[cached_serving][scan_manager][compression]")
+{
+  auto& e                 = env();
+  auto make_decoded_batch = [&](sirius::pushdown_outcome outcome) {
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(cudf::make_numeric_column(
+      cudf::data_type{cudf::type_id::BOOL8}, 4, cudf::mask_state::UNALLOCATED, e.stream()));
+    auto rep = std::make_unique<sirius::decompression_pushdown_batch_representation>(
+      std::make_unique<cudf::table>(std::move(columns)),
+      *e.gpu_space,
+      e.stream(),
+      std::move(outcome));
+    return cucascade::data_batch::make(10001, std::move(rep));
+  };
+
+  SECTION("predicate-substituted prefetched columns retain their interpretation")
+  {
+    sirius::pushdown_outcome outcome;
+    outcome.predicate_columns      = {0};
+    outcome.predicates_enforced    = true;
+    outcome.selection_unprofitable = true;
+    auto batch                     = make_decoded_batch(outcome);
+    sirius::op::scan::scan_operator_input split{batch};
+    split.row_filter_pending              = true;
+    split.pushdown_selection_unprofitable = std::make_shared<std::atomic<bool>>(false);
+    split.prepare_for_processing(e.gpu_space, e.stream());
+    REQUIRE(split.pushdown_predicate_columns == outcome.predicate_columns);
+    REQUIRE(split.pushdown_predicates_enforced);
+    REQUIRE_FALSE(split.pushdown_row_filtered);
+    REQUIRE(split.pushdown_selection_unprofitable->load());
+    // An already-resident GPU wrapper must not gain prepare's conversion-only steal.
+    REQUIRE(split.stolen_table == nullptr);
+    REQUIRE_FALSE(split.converted_table_steal_pending);
+    auto ro = batch->to_read_only();
+    REQUIRE(dynamic_cast<sirius::decompression_pushdown_batch_representation const*>(
+              ro.get_data()) != nullptr);
+  }
+
+  SECTION("prefetched compaction consumes its already-applied visibility mask")
+  {
+    sirius::pushdown_outcome outcome;
+    outcome.row_filtered            = true;
+    outcome.visibility_mask_applied = true;
+    auto batch                      = make_decoded_batch(outcome);
+    sirius::op::scan::scan_operator_input split{batch};
+    split.mvcc_keep_mask     = make_test_mask(8);
+    split.row_filter_pending = true;
+    split.prepare_for_processing(e.gpu_space, e.stream());
+    REQUIRE(split.pushdown_row_filtered);
+    REQUIRE_FALSE(split.mvcc_keep_mask.has_mask());
+    REQUIRE(split.stolen_table == nullptr);
+  }
+
+  SECTION("prefetched row filtering still rejects an unconsumed positional mask")
+  {
+    sirius::pushdown_outcome outcome;
+    outcome.row_filtered = true;
+    auto batch           = make_decoded_batch(outcome);
+    sirius::op::scan::scan_operator_input split{batch};
+    split.mvcc_keep_mask = make_test_mask(8);
+    REQUIRE_THROWS_WITH(split.prepare_for_processing(e.gpu_space, e.stream()),
+                        Catch::Matchers::ContainsSubstring("unconsumed mvcc keep-mask"));
+  }
+}
+
+TEST_CASE("prepare_for_processing gates immediate and transactional converted-table steals",
           "[cached_serving][scan_manager]")
 {
   auto& e = env();
   std::vector<int32_t> const values{20, 21, 22, 23};
+
+  // Each section cross-checks converted_table_transferable() against the observed arming outcome:
+  // the shared predicate is the eligibility policy both steal forms consult, so its answer and the
+  // arming decision must agree row by row (mask -> false, pending row filter -> false,
+  // decode-applied row filter -> true, unflagged -> true).
 
   SECTION("mvcc keep-mask pending")
   {
@@ -1289,6 +1638,8 @@ TEST_CASE("prepare_for_processing skips the steal for masked or row-filtered spl
     split.mvcc_keep_mask = make_test_mask(values.size());
     split.prepare_for_processing(e.gpu_space, e.stream());
     REQUIRE(split.stolen_table == nullptr);
+    REQUIRE_FALSE(split.converted_table_steal_pending);
+    REQUIRE_FALSE(split.converted_table_transferable());
     // Converted in place but not stolen: the masked materialize path filters
     // by copy from the batch's view.
     auto ro = batch->to_read_only();
@@ -1303,6 +1654,8 @@ TEST_CASE("prepare_for_processing skips the steal for masked or row-filtered spl
     split.row_filter_pending = true;
     split.prepare_for_processing(e.gpu_space, e.stream());
     REQUIRE(split.stolen_table == nullptr);
+    REQUIRE_FALSE(split.converted_table_steal_pending);
+    REQUIRE_FALSE(split.converted_table_transferable());
     auto ro = batch->to_read_only();
     REQUIRE(ro.get_current_tier() == cucascade::memory::Tier::GPU);
     REQUIRE(ro.get_data()->get_size_in_bytes() > 0);
@@ -1310,19 +1663,377 @@ TEST_CASE("prepare_for_processing skips the steal for masked or row-filtered spl
 
   SECTION("carrier conversion pending")
   {
-    // normalize_physical_schema allocates the cast output after materialize
-    // consumes a stolen table, so a conversion-pending split must keep the
-    // view path or an OOM in the cast could never re-enter materialize.
     auto batch = make_host_batch(e, values);
     sirius::op::scan::scan_operator_input split{batch};
     split.needs_carrier_conversion = true;
     split.prepare_for_processing(e.gpu_space, e.stream());
     REQUIRE(split.stolen_table == nullptr);
-    // Converted in place but not stolen: materialize serves the batch's view,
-    // so a post-cast OOM retry finds the wrapper still populated.
+    REQUIRE(split.converted_table_steal_pending);
+    REQUIRE(split.converted_table_transferable());
+    REQUIRE(split.stolen_table_bytes > 0);
+    // Converted in place and retained transactionally: scan normalization will allocate every
+    // replacement before committing the source columns.
     auto ro = batch->to_read_only();
     REQUIRE(ro.get_current_tier() == cucascade::memory::Tier::GPU);
     REQUIRE(ro.get_data()->get_size_in_bytes() > 0);
+  }
+
+  SECTION("row filter pending with carrier conversion")
+  {
+    // Filtering is still ahead of this split, so neither steal form may take the source.
+    auto batch = make_host_batch(e, values);
+    sirius::op::scan::scan_operator_input split{batch};
+    split.row_filter_pending       = true;
+    split.needs_carrier_conversion = true;
+    split.prepare_for_processing(e.gpu_space, e.stream());
+    REQUIRE(split.stolen_table == nullptr);
+    REQUIRE_FALSE(split.converted_table_steal_pending);
+    REQUIRE_FALSE(split.converted_table_transferable());
+  }
+
+  SECTION("decode-row-filtered carrier conversion regains the transactional path")
+  {
+    // The decode already applied the whole filter conjunction (pre-stamped here; a plain host
+    // conversion leaves the outcome untouched), so only the carrier cast remains and prepare
+    // arms the transactional steal.
+    auto batch = make_host_batch(e, values);
+    sirius::op::scan::scan_operator_input split{batch};
+    split.row_filter_pending       = true;
+    split.pushdown_row_filtered    = true;
+    split.needs_carrier_conversion = true;
+    split.prepare_for_processing(e.gpu_space, e.stream());
+    REQUIRE(split.stolen_table == nullptr);
+    REQUIRE(split.converted_table_steal_pending);
+    REQUIRE(split.converted_table_transferable());
+    REQUIRE(split.stolen_table_bytes > 0);
+    auto ro = batch->to_read_only();
+    REQUIRE(ro.get_current_tier() == cucascade::memory::Tier::GPU);
+    REQUIRE(ro.get_data()->get_size_in_bytes() > 0);
+  }
+}
+
+TEST_CASE("transactional converted-table steal rolls back and commits on retry",
+          "[cached_serving][scan_manager]")
+{
+  auto& e = env();
+  std::vector<int32_t> const first_values{30, 31, 32, 33};
+  std::vector<int32_t> const second_values{130, 131, 132, 133};
+  auto batch = make_host_batch(e, std::vector<std::vector<int32_t>>{first_values, second_values});
+  using replacements = sirius::op::scan::scan_operator_input::converted_column_replacements;
+
+  sirius::op::scan::scan_operator_input split{batch};
+  split.needs_carrier_conversion = true;
+  split.prepare_for_processing(e.gpu_space, e.stream());
+  REQUIRE(split.stolen_table == nullptr);
+  REQUIRE(split.converted_table_steal_pending);
+  REQUIRE(split.stolen_table_bytes > 0);
+  REQUIRE(split.get_estimated_size_in_bytes() == split.stolen_table_bytes);
+
+  const int32_t* first_source_data;
+  const int32_t* second_source_data;
+  {
+    auto ro            = batch->to_read_only();
+    auto source_view   = sirius::get_cudf_table_view(ro);
+    first_source_data  = source_view.column(0).data<int32_t>();
+    second_source_data = source_view.column(1).data<int32_t>();
+  }
+  auto const source_bytes = split.stolen_table_bytes;
+
+  // An output-width mismatch is a non-mutating fallback; the caller may use the generic
+  // materialize/filter/project path for a trailing filter-only column.
+  bool mismatch_builder_called = false;
+  auto mismatch                = split.transactionally_steal_converted_table(
+    /*output_width=*/3,
+    [&](cudf::table_view) {
+      mismatch_builder_called = true;
+      return replacements(3);
+    },
+    e.stream());
+  REQUIRE(mismatch == nullptr);
+  REQUIRE_FALSE(mismatch_builder_called);
+  REQUIRE(split.converted_table_steal_pending);
+  REQUIRE_FALSE(split.stolen_table_consumed);
+
+  // Build a real first replacement, then inject failure before the second. Unwinding must destroy
+  // that D allocation and release the lock while leaving both columns of S exactly intact.
+  bool first_replacement_built = false;
+  REQUIRE_THROWS_AS(split.transactionally_steal_converted_table(
+                      /*output_width=*/2,
+                      [&](cudf::table_view source) -> replacements {
+                        replacements built(2);
+                        built[0]                = cudf::cast(source.column(0),
+                                              cudf::data_type{cudf::type_id::INT64},
+                                              e.stream(),
+                                              e.gpu_space->get_default_allocator());
+                        first_replacement_built = true;
+                        throw rmm::out_of_memory("injected second cast OOM");
+                      },
+                      e.stream()),
+                    rmm::out_of_memory);
+  e.stream().sync();
+  REQUIRE(first_replacement_built);
+  REQUIRE(split.converted_table_steal_pending);
+  REQUIRE_FALSE(split.stolen_table_consumed);
+  REQUIRE(split.stolen_table_bytes == source_bytes);
+  {
+    auto ro          = batch->to_read_only();
+    auto source_view = sirius::get_cudf_table_view(ro);
+    REQUIRE(source_view.column(0).data<int32_t>() == first_source_data);
+    REQUIRE(source_view.column(1).data<int32_t>() == second_source_data);
+    REQUIRE(ro.get_data()->get_size_in_bytes() == source_bytes);
+    REQUIRE(to_host_column<int32_t>(source_view, 0) == first_values);
+    REQUIRE(to_host_column<int32_t>(source_view, 1) == second_values);
+  }
+
+  // The scheduler may retry on another stream. Re-prepare preserves the pending transaction; the
+  // transaction rebinds the already-plain wrapper before casting only the first column.
+  rmm::cuda_stream retry_stream;
+  ::cuda::stream_ref const retry = retry_stream;
+  split.prepare_for_processing(e.gpu_space, retry);
+  REQUIRE(split.stolen_table == nullptr);
+  REQUIRE(split.converted_table_steal_pending);
+
+  // A successful retry commits once. The null second replacement moves its source column verbatim.
+  auto out = split.transactionally_steal_converted_table(
+    /*output_width=*/2,
+    [&](cudf::table_view source) {
+      replacements built(2);
+      built[0] = cudf::cast(source.column(0),
+                            cudf::data_type{cudf::type_id::INT64},
+                            retry,
+                            e.gpu_space->get_default_allocator());
+      return built;
+    },
+    retry);
+  REQUIRE(out != nullptr);
+  retry.sync();
+  auto const output_view = out->view();
+  REQUIRE(output_view.column(0).type().id() == cudf::type_id::INT64);
+  REQUIRE(output_view.column(1).type().id() == cudf::type_id::INT32);
+  REQUIRE(static_cast<const void*>(output_view.column(0).data<int64_t>()) != first_source_data);
+  REQUIRE(output_view.column(1).data<int32_t>() == second_source_data);
+  REQUIRE(to_host_column<int64_t>(output_view, 0) ==
+          std::vector<int64_t>(first_values.begin(), first_values.end()));
+  REQUIRE(to_host_column<int32_t>(output_view, 1) == second_values);
+  REQUIRE_FALSE(split.converted_table_steal_pending);
+  REQUIRE(split.stolen_table_consumed);
+  {
+    auto ro = batch->to_read_only();
+    REQUIRE(ro.get_data()->get_size_in_bytes() == 0);
+  }
+
+  bool consumed_builder_called = false;
+  auto consumed                = split.transactionally_steal_converted_table(
+    /*output_width=*/2,
+    [&](cudf::table_view) {
+      consumed_builder_called = true;
+      return replacements(2);
+    },
+    retry);
+  REQUIRE(consumed == nullptr);
+  REQUIRE_FALSE(consumed_builder_called);
+}
+
+TEST_CASE("transactional steal refuses a downgraded wrapper without mutating it",
+          "[cached_serving][scan_manager]")
+{
+  auto& e = env();
+  std::vector<int32_t> const values{50, 51, 52, 53};
+  using replacements = sirius::op::scan::scan_operator_input::converted_column_replacements;
+
+  auto batch = make_host_batch(e, values);
+  sirius::op::scan::scan_operator_input split{batch};
+  split.needs_carrier_conversion = true;
+  split.prepare_for_processing(e.gpu_space, e.stream());
+  REQUIRE(split.converted_table_steal_pending);
+
+  // A mid-query tier downgrade moves the armed wrapper's data off the GPU; the steal must refuse
+  // it before any mutation (the refusal precedes the dealloc-stream rebind).
+  {
+    auto mut = batch->to_mutable();
+    mut.convert_to<cucascade::host_data_representation>(
+      sirius::converter_registry::get(), e.host_space, e.stream());
+  }
+  e.stream().sync();
+
+  bool builder_called = false;
+  auto refused        = split.transactionally_steal_converted_table(
+    /*output_width=*/1,
+    [&](cudf::table_view) {
+      builder_called = true;
+      return replacements(1);
+    },
+    e.stream());
+  REQUIRE(refused == nullptr);
+  REQUIRE_FALSE(builder_called);
+  REQUIRE(split.converted_table_steal_pending);
+  REQUIRE_FALSE(split.stolen_table_consumed);
+}
+
+TEST_CASE("transactional steal serves decode-row-filtered splits but refuses predicate columns",
+          "[cached_serving][scan_manager]")
+{
+  auto& e = env();
+  std::vector<int32_t> const values{40, 41, 42, 43};
+  using replacements = sirius::op::scan::scan_operator_input::converted_column_replacements;
+
+  auto batch = make_host_batch(e, values);
+  sirius::op::scan::scan_operator_input split{batch};
+  split.row_filter_pending       = true;
+  split.pushdown_row_filtered    = true;
+  split.needs_carrier_conversion = true;
+  split.prepare_for_processing(e.gpu_space, e.stream());
+  REQUIRE(split.converted_table_steal_pending);
+
+  // A predicate-substituted column means the source is not values-only; the gate must refuse
+  // without invoking the builder.
+  split.pushdown_predicate_columns = {0};
+  bool builder_called              = false;
+  auto refused                     = split.transactionally_steal_converted_table(
+    /*output_width=*/1,
+    [&](cudf::table_view) {
+      builder_called = true;
+      return replacements(1);
+    },
+    e.stream());
+  REQUIRE(refused == nullptr);
+  REQUIRE_FALSE(builder_called);
+  REQUIRE(split.converted_table_steal_pending);
+
+  // A values-only decode-filtered split commits like the unfiltered case.
+  split.pushdown_predicate_columns.clear();
+  auto out = split.transactionally_steal_converted_table(
+    /*output_width=*/1,
+    [&](cudf::table_view source) {
+      replacements built(1);
+      built[0] = cudf::cast(source.column(0),
+                            cudf::data_type{cudf::type_id::INT64},
+                            e.stream(),
+                            e.gpu_space->get_default_allocator());
+      return built;
+    },
+    e.stream());
+  REQUIRE(out != nullptr);
+  e.stream().sync();
+  REQUIRE(out->view().column(0).type().id() == cudf::type_id::INT64);
+  REQUIRE(to_host_column<int64_t>(out->view(), 0) ==
+          std::vector<int64_t>(values.begin(), values.end()));
+  REQUIRE(split.stolen_table_consumed);
+  REQUIRE_FALSE(split.converted_table_steal_pending);
+}
+
+// The TPC-H q3 lineitem shape on a GPU-tier compressed pin: the scan's own filter is a range on a
+// column only that filter reads, and a hash join has published a membership filter on an output
+// column by the time the split decodes. prepare_for_processing attaches the join filter to the
+// decode, which still applies the scan's whole filter, so the filter-only column is dropped and the
+// decoded batch leaves the wrapper without a copy.
+TEST_CASE("a compressed split decoded with a join filter keeps the drop and the steal",
+          "[cached_serving][transactional_steal]")
+{
+  namespace fsf = sirius::test::fused_scan_filter;
+  if (!sirius::decompression_pushdown_enabled()) {
+    WARN("filtered-decode env gate off in this process; skipping");
+    return;
+  }
+  auto& e                         = env();
+  ::cuda::stream_ref const stream = e.stream();
+  using replacements = sirius::op::scan::scan_operator_input::converted_column_replacements;
+
+  // One resident split of fsf::compress_range_source, with the scan's covering request attached the
+  // way the cached provider attaches it and `filter` published on output column "v".
+  auto const make_split = [&](std::shared_ptr<sirius::op::sirius_dynamic_filter const> filter) {
+    auto blob   = std::make_shared<sirius::compressed_device_blob>();
+    blob->table = fsf::compress_range_source(stream);
+    stream.sync();
+    auto rep = std::make_unique<sirius::compressed_device_representation>(
+      *e.gpu_space,
+      std::move(blob),
+      std::vector<std::string>{"v", "k", "f"},
+      /*compressed_bytes=*/64,
+      /*uncompressed_bytes=*/fsf::kSelected.size() * static_cast<std::size_t>(fsf::kRows) *
+        sizeof(std::int32_t),
+      /*num_rows=*/fsf::kRows);
+    rep->set_pushdown_scan(std::make_shared<const sirius::decompression_pushdown_scan>(
+      fsf::covered_request(fsf::kOutputWidth)));
+    auto split = std::make_unique<sirius::op::scan::scan_operator_input>(
+      cucascade::data_batch::make(sirius::get_next_batch_id(), std::move(rep)));
+    split->row_filter_pending = true;
+    auto channel              = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+    auto producer             = channel->register_producer({0});
+    channel->freeze_registration();
+    auto const* published = filter.get();
+    REQUIRE(producer.push_filter(0, std::move(filter)));
+    // A decode attaches only filters with a measured keep ratio worth probing.
+    auto consumer = std::make_shared<sirius::op::scan::dynamic_filter_consumer>(
+      channel, sirius::op::scan::consumer_config{}, sirius::op::scan::identity_bindings(1));
+    auto& gate = sirius::op::scan::detail::consumer_test_access::gate(*consumer);
+    gate.record_keep_ratio(8, 2, 1);
+    gate.record_filter_keep_ratio({published, 0}, 0.25, 1);
+    split->consumer = std::move(consumer);
+    return split;
+  };
+  auto const require_rows = [&](cudf::table_view out, fsf::source_rows const& expected) {
+    REQUIRE(static_cast<std::size_t>(out.num_columns()) == fsf::kOutputWidth);
+    CHECK(fsf::column_to_host(out.column(0), stream) == expected.v);
+    CHECK(fsf::column_to_host(out.column(1), stream) == expected.k);
+  };
+  auto const range_and_keys = fsf::rows_where(
+    [](cudf::size_type i) { return fsf::in_filter_range(i) && fsf::in_key_set(i % 100); });
+
+  stub_ingestible ingestible;
+  ingestible.prefix_width = fsf::kOutputWidth;
+
+  SECTION("an accepting join filter, no carrier conversion")
+  {
+    auto split = make_split(fsf::make_key_set(stream));
+    split->prepare_for_processing(e.gpu_space, stream);
+    CHECK(split->pushdown_row_filtered);
+    CHECK(split->pushdown_filter_only_columns_dropped);
+    REQUIRE(split->stolen_table != nullptr);
+    CHECK(static_cast<std::size_t>(split->stolen_table->num_columns()) == fsf::kOutputWidth);
+
+    auto result = ingestible.materialize_table(*split, stream);
+    CHECK(result.state == sirius::op::scan::filter_state::ROW_FILTERED);
+    auto out = result.table.release(stream, e.gpu_space->get_default_allocator());
+    REQUIRE(out != nullptr);
+    require_rows(out->view(), range_and_keys);
+  }
+
+  SECTION("an accepting join filter with a carrier conversion")
+  {
+    auto split                      = make_split(fsf::make_key_set(stream));
+    split->needs_carrier_conversion = true;
+    split->prepare_for_processing(e.gpu_space, stream);
+    CHECK(split->pushdown_row_filtered);
+    CHECK(split->pushdown_filter_only_columns_dropped);
+    REQUIRE(split->stolen_table == nullptr);
+    REQUIRE(split->converted_table_steal_pending);
+
+    // The decode is exactly the output width, so the transactional steal takes it; null
+    // replacements transfer the source columns as they are.
+    auto out = split->transactionally_steal_converted_table(
+      fsf::kOutputWidth, [](cudf::table_view) { return replacements(fsf::kOutputWidth); }, stream);
+    REQUIRE(out != nullptr);
+    require_rows(out->view(), range_and_keys);
+  }
+
+  SECTION("a join filter that declines")
+  {
+    // A STRING key set cannot probe the INT32 "v", so the decode applies the range alone.
+    std::vector<std::string> const keys{"a", "b"};
+    auto const key_column = fsf::upload_strings(keys, stream);
+    auto split            = make_split(std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(
+      key_column->view(), stream, cudf::get_current_device_resource_ref()));
+    split->prepare_for_processing(e.gpu_space, stream);
+    CHECK(split->pushdown_row_filtered);
+    CHECK(split->pushdown_filter_only_columns_dropped);
+    REQUIRE(split->stolen_table != nullptr);
+
+    auto result = ingestible.materialize_table(*split, stream);
+    CHECK(result.state == sirius::op::scan::filter_state::ROW_FILTERED);
+    auto out = result.table.release(stream, e.gpu_space->get_default_allocator());
+    REQUIRE(out != nullptr);
+    require_rows(out->view(), fsf::rows_where(fsf::in_filter_range));
   }
 }
 
@@ -1484,4 +2195,528 @@ TEST_CASE("validate_recorded_column_storage cross-checks recorded carriers again
     REQUIRE_NOTHROW(sirius::scan_manager::validate_recorded_column_storage(
       sirius::pinned_column_storage_matrix{}, 0, 2, kContext, stored));
   }
+}
+
+// Reject non-GPU targets before compressed converters fetch payloads or launch decoding.
+TEST_CASE("compressed decode rejects a memory space that is not a GPU space",
+          "[cached_serving][scan_manager][compression]")
+{
+  auto& e         = env();
+  auto& registry  = sirius::converter_registry::get();
+  auto host_chunk = std::make_shared<sirius::compressed_host_representation>(
+    *e.host_space,
+    std::make_shared<sirius::pinned_compressed_blob>(),
+    std::vector<std::string>{"k"},
+    /*compressed_bytes=*/64,
+    /*uncompressed_bytes=*/256,
+    /*num_rows=*/64);
+  auto device_chunk = std::make_shared<sirius::compressed_device_representation>(
+    *e.gpu_space,
+    std::make_shared<sirius::compressed_device_blob>(),
+    std::vector<std::string>{"k"},
+    /*compressed_bytes=*/64,
+    /*uncompressed_bytes=*/256,
+    /*num_rows=*/64);
+  auto const rejected = Catch::Matchers::ContainsSubstring("needs a GPU target memory space");
+
+  SECTION("host-to-GPU needs a GPU target")
+  {
+    REQUIRE_THROWS_AS(
+      registry.convert<cucascade::gpu_table_representation>(*host_chunk, e.host_space, e.stream()),
+      std::invalid_argument);
+    REQUIRE_THROWS_WITH(
+      registry.convert<cucascade::gpu_table_representation>(*host_chunk, e.host_space, e.stream()),
+      rejected);
+    REQUIRE_THROWS_AS(
+      registry.convert<cucascade::gpu_table_representation>(*host_chunk, nullptr, e.stream()),
+      std::invalid_argument);
+  }
+
+  SECTION("device-to-GPU rejects a non-GPU target")
+  {
+    REQUIRE_THROWS_AS(registry.convert<cucascade::gpu_table_representation>(
+                        *device_chunk, e.host_space, e.stream()),
+                      std::invalid_argument);
+    REQUIRE_THROWS_WITH(registry.convert<cucascade::gpu_table_representation>(
+                          *device_chunk, e.host_space, e.stream()),
+                        rejected);
+  }
+
+  // A GPU space on another device cannot be built on a single-GPU host, so only the tier half of
+  // decompress_chunk's precondition is exercised here.
+  SECTION("decompress_chunk needs a GPU space on the current device")
+  {
+    simpatico::compressed_table const empty;
+    REQUIRE_THROWS_WITH(
+      sirius::decompress_chunk(
+        empty,
+        {},
+        nullptr,
+        sirius::decode_visibility_mask{},
+        *e.host_space,
+        cucascade::memory::reservation_aware_resource_adaptor::AllocationTrackingScope::PER_THREAD,
+        e.stream(),
+        rmm::mr::get_current_device_resource_ref()),
+      Catch::Matchers::ContainsSubstring("not a GPU space on the current device"));
+  }
+}
+
+TEST_CASE("Resident refusal closes the connector and separates certificate counters",
+          "[cached_serving][scan_manager][certificate][consumption]")
+{
+  using namespace sirius::op::scan;
+  auto& e = env();
+  scripted_provider provider;
+  provider.contract_id            = 81;
+  provider.validation.query_token = 17;
+  provider.batches                = {make_test_batch(e, 4)};
+  split_connector connector;
+  std::stop_source stop;
+  duckdb::SiriusContext observer;
+  bool native_pin = false;
+  bool mismatch   = false;
+  SECTION("stale token") { provider.validation.query_token++; }
+  SECTION("identity absent") { provider.validation.identity.applies = false; }
+  SECTION("native checks absent") { native_pin = true; }
+  SECTION("different contract")
+  {
+    provider.contract_id++;
+    mismatch = true;
+  }
+  load_balancing_scan_batch_coalescer::drain_cached_provider(
+    provider, connector, stop.get_token(), false, 81, 17, &observer, false, native_pin);
+  CHECK(connector.peek_resident_batches().empty());
+  CHECK_FALSE(connector.is_closed());  // terminal exception remains schedulable
+  if (mismatch) {
+    REQUIRE_THROWS_WITH(connector.get_next_split(), "resident scan contract mismatch");
+  } else {
+    REQUIRE_THROWS_AS(connector.get_next_split(), certificate_incomplete);
+  }
+  auto stats = observer.get_transparent_execution_stats();
+  CHECK(stats.certificate_mismatches == (mismatch ? 1 : 0));
+  CHECK(stats.certificate_incompletes == (mismatch ? 0 : 1));
+}
+
+TEST_CASE("Resident dequeue backstop rejects a stale query before processing",
+          "[cached_serving][scan_manager][certificate][consumption]")
+{
+  using namespace sirius::op::scan;
+  auto& e = env();
+  duckdb::SiriusContext observer;
+  sirius_gpu_scan_operator scan({}, 4, nullptr, 81, &observer, nullptr);
+  scan.set_query_validation(17, {});
+  scripted_provider provider;
+  provider.contract_id            = 81;
+  provider.validation.query_token = 18;
+  provider.batches                = {make_test_batch(e, 4)};
+  std::stop_source stop;
+  load_balancing_scan_batch_coalescer::drain_cached_provider(
+    provider, scan.get_split_connector(), stop.get_token(), false, 81, 18);
+  REQUIRE_THROWS_AS(scan.get_next_task_input_data(), certificate_incomplete);
+  CHECK(observer.get_transparent_execution_stats().certificate_incompletes == 1);
+  CHECK(observer.get_transparent_execution_stats().certificate_mismatches == 0);
+}
+
+TEST_CASE("a dynamic-filter consumer reserves decode headroom only when it can attach probes",
+          "[cached_serving][scan_manager][dynamic_filter]")
+{
+  auto& e    = env();
+  auto batch = make_test_batch(e, 64);
+  sirius::op::scan::scan_operator_input split(batch);
+  auto const channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  split.consumer     = std::make_shared<sirius::op::scan::dynamic_filter_consumer>(
+    channel, sirius::op::scan::consumer_config{}, std::vector<sirius::op::scan::binding>{});
+  auto const batch_bytes = split.get_estimated_size_in_bytes();
+  REQUIRE(batch_bytes > 0);
+  // Without decode bindings the consumer never attaches a probe, so the view estimate stands.
+  REQUIRE(split.get_estimated_working_set_size_in_bytes() == batch_bytes);
+  split.consumer = std::make_shared<sirius::op::scan::dynamic_filter_consumer>(
+    channel, sirius::op::scan::consumer_config{}, sirius::op::scan::identity_bindings(1));
+  auto const expected =
+    sirius::decompression_pushdown_enabled() ? batch_bytes + batch_bytes / 4 : batch_bytes;
+  REQUIRE(split.get_estimated_working_set_size_in_bytes() == expected);
+}
+
+namespace {
+
+/// A resident Parquet scan's ingestible, reading BIGINT `key` and `payload` into @p columns
+std::shared_ptr<sirius::op::scan::gpu_ingestible> resident_parquet(
+  std::vector<std::size_t> const& columns)
+{
+  auto info   = std::make_unique<sirius::op::scan::parquet_ingestible_table_info>();
+  info->names = {"key", "payload"};
+  info->returned_types.assign(2, sirius::logical_type::make(sirius::type_id::BIGINT));
+  for (auto column : columns) {
+    info->column_ids.emplace_back(column);
+    info->projection_ids.push_back(info->projection_ids.size());
+  }
+  info->projected_output_count = columns.size();
+  return sirius::op::scan::make_ingestible(std::move(info));
+}
+
+/// An Iceberg ingestible over the same columns, which never describes a cached view
+std::shared_ptr<sirius::op::scan::gpu_ingestible> resident_iceberg()
+{
+  auto info            = std::make_unique<sirius::op::scan::iceberg_ingestible_table_info>();
+  info->names          = {"key"};
+  info->returned_types = {sirius::logical_type::make(sirius::type_id::BIGINT)};
+  info->column_ids     = {duckdb::ColumnIndex(0)};
+  info->projected_output_count = 1;
+  info->delete_data            = std::make_shared<sirius::op::scan::IcebergDeleteData>();
+  return std::make_shared<sirius::op::scan::iceberg_gpu_ingestible>(std::move(info));
+}
+
+/// Serves @p batch to @p scan and hands it out, stamped as every served split is
+std::unique_ptr<sirius::op::operator_data> hand_out(
+  sirius::op::scan::sirius_gpu_scan_operator& scan, std::shared_ptr<cucascade::data_batch> batch)
+{
+  scripted_provider provider;
+  provider.contract_id = 1;
+  provider.batches     = {std::move(batch)};
+  std::stop_source stop;
+  load_balancing_scan_batch_coalescer::drain_cached_provider(
+    provider, scan.get_split_connector(), stop.get_token(), false, 1, 0);
+  return scan.get_next_task_input_data();
+}
+
+}  // namespace
+
+TEST_CASE("a resident split reserves the cached gather only when it can reach the checkpoint",
+          "[cached_serving][scan_manager][dynamic_filter]")
+{
+  using namespace sirius::op::scan;
+  auto& e            = env();
+  auto const channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  std::vector<std::size_t> columns{0, 1};
+  std::shared_ptr<gpu_ingestible> ingestible;
+  bool with_consumer      = true;
+  bool placement          = true;
+  bool deferring          = false;
+  bool reaches_checkpoint = true;
+  SECTION("leading identity layout") {}
+  SECTION("permuted duplicate layout without decode bindings") { columns = {1, 0, 1}; }
+  SECTION("deferring scan without a decode consumer") { deferring = true; }
+  SECTION("non-Parquet pin")
+  {
+    ingestible         = resident_iceberg();
+    reaches_checkpoint = false;
+  }
+  SECTION("no consumer")
+  {
+    with_consumer      = false;
+    reaches_checkpoint = false;
+  }
+  SECTION("placement disabled")
+  {
+    placement          = false;
+    reaches_checkpoint = false;
+  }
+  auto const width = ingestible ? std::size_t{1} : columns.size();
+  if (!ingestible) { ingestible = resident_parquet(columns); }
+  std::shared_ptr<dynamic_filter_consumer> consumer;
+  if (with_consumer) {
+    consumer =
+      std::make_shared<dynamic_filter_consumer>(channel,
+                                                consumer_config{.cached_placement = placement},
+                                                scan_decode_bindings(*ingestible, width));
+  }
+  sirius_gpu_scan_operator scan(sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>(
+                                  width, duckdb::LogicalType::BIGINT)),
+                                0,
+                                ingestible,
+                                1,
+                                nullptr,
+                                nullptr,
+                                consumer);
+  if (columns.size() == 3) { REQUIRE(consumer->decode_bindings().empty()); }
+  if (deferring) {
+    REQUIRE(
+      sirius::planner::install_count_deferral(scan, sirius::late_mat::deferred_scan_output{{1}}));
+  }
+  auto handed = hand_out(scan, make_test_batch(e, 64));
+  auto& split = dynamic_cast<scan_operator_input&>(*handed);
+  REQUIRE(split.cached_view_possible == reaches_checkpoint);
+  if (deferring) { REQUIRE(split.consumer == nullptr); }
+  auto const batch_bytes = split.get_estimated_size_in_bytes();
+  REQUIRE(batch_bytes > 0);
+  // Without the checkpoint, the decode envelope applies when pushdown can attach probes; otherwise
+  // the zero-copy view estimate stands.
+  auto const decode_probes = sirius::decompression_pushdown_enabled() && split.consumer &&
+                             !split.consumer->decode_bindings().empty();
+  auto const ordinary = decode_probes ? batch_bytes + batch_bytes / 4 : batch_bytes;
+  CHECK(split.get_estimated_working_set_size_in_bytes() ==
+        (reaches_checkpoint ? 2 * batch_bytes : ordinary));
+  // A split whose table prepare_for_processing took bypasses the checkpoint.
+  split.stolen_table_consumed = true;
+  CHECK(split.get_estimated_working_set_size_in_bytes() == ordinary);
+}
+
+namespace {
+
+/// A GPU-tier pinned entry holding one Simpatico-compressed chunk of INT32 `key` and `payload`
+std::shared_ptr<pinned_entry const> make_compressed_entry(test_env& e, cudf::size_type rows)
+{
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  for (int column = 0; column < 2; ++column) {
+    std::vector<int32_t> values(static_cast<std::size_t>(rows));
+    for (std::size_t row = 0; row < values.size(); ++row) {
+      values[row] = cell(0, static_cast<std::size_t>(column), row);
+    }
+    auto shared = make_gpu_column(*e.gpu_space, values);
+    columns.push_back(std::make_unique<cudf::column>(
+      shared->view(), e.stream(), e.gpu_space->get_default_allocator()));
+  }
+  cudf::table const source(std::move(columns));
+  auto blob   = std::make_shared<sirius::compressed_device_blob>();
+  blob->table = simpatico::compress_with_plan(source.view(),
+                                              "input -> bitpack -> chunk_min, chunk_count, "
+                                              "chunk_bits, packed\n---\ninput -> bitpack -> "
+                                              "chunk_min, chunk_count, chunk_bits, packed\n",
+                                              e.stream(),
+                                              e.gpu_space->get_default_allocator());
+  e.stream().sync();
+  auto entry = std::make_shared<pinned_entry>();
+  set_cached_columns(*entry, {"key", "payload"});
+  entry->tier         = cucascade::memory::Tier::GPU;
+  entry->memory_space = e.gpu_space;
+  entry->num_rows     = static_cast<std::size_t>(rows);
+  sirius::device_pin_chunk chunk;
+  chunk.memory_space = e.gpu_space;
+  chunk.compressed   = std::make_shared<sirius::compressed_device_representation>(
+    *e.gpu_space,
+    blob,
+    std::vector<std::string>{"key", "payload"},
+    source.alloc_size(),
+    source.alloc_size(),
+    rows);
+  entry->device_chunks.push_back(std::move(chunk));
+  return entry;
+}
+
+/// Serves the first chunk of @p entry to @p scan through the cached provider and hands it out
+std::unique_ptr<sirius::op::operator_data> serve_pinned(
+  sirius::op::scan::sirius_gpu_scan_operator& scan,
+  std::shared_ptr<pinned_entry const> entry,
+  bool row_filter_pending,
+  sirius::pushdown_request request = {})
+{
+  std::vector<std::size_t> const columns{0, 1};
+  auto provider = sirius::scan_manager::make_provider_for_pinned_entry(
+    std::move(entry),
+    columns,
+    sirius::scan_manager::cached_scan_plan{.survivor_chunk_indices = {0}},
+    sirius::telemetry::batch_telemetry_info{},
+    {},
+    {},
+    {},
+    false,
+    std::move(request));
+  provider->contract_id            = 1;
+  provider->validation.identity    = provider->validation.layout =
+    provider->validation.structure = {true, true};
+  std::stop_source stop;
+  load_balancing_scan_batch_coalescer::drain_cached_provider(
+    *provider, scan.get_split_connector(), stop.get_token(), row_filter_pending, 1, 0);
+  return scan.get_next_task_input_data();
+}
+
+}  // namespace
+
+TEST_CASE(
+  "a resident split whose table a transfer will take reserves the cached gather until it "
+  "leaves",
+  "[cached_serving][scan_manager][dynamic_filter]")
+{
+  using namespace sirius::op::scan;
+  auto& e            = env();
+  auto const channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  // Where the split's table leaves the cached batch.
+  enum class table_exit { prepare, execute, never };
+  std::vector<std::size_t> columns{0, 1};
+  bool converting = false;
+  bool deferring  = false;
+  auto exit       = table_exit::prepare;
+  std::shared_ptr<pinned_entry const> entry;
+  SECTION("compressed chunk that prepare_for_processing steals once decoded")
+  {
+    entry = make_compressed_entry(e, 64);
+  }
+  SECTION("HOST-tier chunk that prepare_for_processing steals once uploaded")
+  {
+    entry = std::make_shared<pinned_entry const>(make_host_entry(e, 1, 64));
+  }
+  SECTION("carrier-converting compressed chunk that execute transfers")
+  {
+    entry      = make_compressed_entry(e, 64);
+    converting = true;
+    exit       = table_exit::execute;
+  }
+  SECTION("carrier-converting compressed chunk whose duplicate layout execute cannot transfer")
+  {
+    entry      = make_compressed_entry(e, 64);
+    columns    = {1, 0, 1};
+    converting = true;
+    exit       = table_exit::never;
+  }
+  SECTION("carrier-converting compressed chunk that a deferral keeps for the checkpoint")
+  {
+    entry      = make_compressed_entry(e, 64);
+    converting = true;
+    deferring  = true;
+    exit       = table_exit::never;
+  }
+  SECTION("uncompressed GPU chunk that the checkpoint borrows")
+  {
+    entry = std::make_shared<pinned_entry const>(make_device_chunks_entry(*e.gpu_space, 1, 64));
+    exit  = table_exit::never;
+  }
+  auto ingestible = resident_parquet(columns);
+  sirius::op::dynamic_filter_stats stats;
+  auto consumer = std::make_shared<dynamic_filter_consumer>(
+    channel, consumer_config{.stats = &stats}, scan_decode_bindings(*ingestible, columns.size()));
+  sirius_gpu_scan_operator scan(sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>(
+                                  columns.size(), duckdb::LogicalType::BIGINT)),
+                                0,
+                                ingestible,
+                                1,
+                                nullptr,
+                                nullptr,
+                                consumer);
+  if (deferring) {
+    REQUIRE(
+      sirius::planner::install_count_deferral(scan, sirius::late_mat::deferred_scan_output{{1}}));
+  }
+  auto handed = serve_pinned(scan, entry, false);
+  auto& split = dynamic_cast<scan_operator_input&>(*handed);
+  REQUIRE(split.cached_view_possible);
+  split.needs_carrier_conversion = converting;
+  auto const decode_probes       = sirius::decompression_pushdown_enabled() && split.consumer &&
+                             !split.consumer->decode_bindings().empty();
+  auto const ordinary = [&] {
+    auto const batch_bytes = split.get_estimated_size_in_bytes();
+    return decode_probes ? batch_bytes + batch_bytes / 4 : batch_bytes;
+  };
+  auto const envelope = [&] { return 2 * split.get_estimated_size_in_bytes(); };
+  REQUIRE(split.get_estimated_size_in_bytes() > 0);
+
+  // Before preparation every split the checkpoint could borrow reserves its gather.
+  CHECK(split.cached_checkpoint_possible());
+  CHECK(split.get_estimated_working_set_size_in_bytes() == envelope());
+
+  split.prepare_for_processing(e.gpu_space, e.stream());
+  CHECK((split.stolen_table != nullptr) == (exit == table_exit::prepare));
+  CHECK(split.get_estimated_working_set_size_in_bytes() ==
+        (exit == table_exit::prepare ? ordinary() : envelope()));
+
+  if (deferring) {
+    auto origin   = std::make_shared<sirius::late_mat::scan_batch_origin>();
+    origin->range = {0, 64};
+    split.origin  = std::move(origin);
+  }
+  auto const output = scan.execute(split, e.stream());
+  REQUIRE(output);
+  CHECK(split.cached_checkpoint_possible() == (exit == table_exit::never));
+  CHECK(split.get_estimated_working_set_size_in_bytes() ==
+        (exit == table_exit::never ? envelope() : ordinary()));
+  auto const counts = stats.snapshot();
+  CHECK(counts.cached_bypassed_transfer == (exit == table_exit::never ? 0 : 1));
+  CHECK(counts.cached_declined_no_membership == (exit == table_exit::never ? 1 : 0));
+}
+
+TEST_CASE("a statically filtered compressed split keeps its compaction forecast envelope",
+          "[cached_serving][scan_manager][dynamic_filter]")
+{
+  using namespace sirius::op::scan;
+  auto& e            = env();
+  auto const channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  // A permuted duplicate layout has no decode bindings, so only the cached checkpoint's eligibility
+  // could raise this split above its decode forecast.
+  auto ingestible = resident_parquet({1, 0, 1});
+  auto consumer   = std::make_shared<dynamic_filter_consumer>(
+    channel, consumer_config{}, scan_decode_bindings(*ingestible, 3));
+  REQUIRE(consumer->decode_bindings().empty());
+  sirius_gpu_scan_operator scan(
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>(3, duckdb::LogicalType::BIGINT)),
+    0,
+    ingestible,
+    1,
+    nullptr,
+    nullptr,
+    consumer);
+  sirius::pushdown_request request;
+  request.columns.resize(2);
+  request.columns[0].range          = sirius::decode_range{.lo = 0, .hi = 8};
+  request.ranges_cover_whole_filter = true;
+  auto handed = serve_pinned(scan, make_compressed_entry(e, 1024), true, std::move(request));
+  auto& split = dynamic_cast<scan_operator_input&>(*handed);
+  // The pending static filter keeps a full-width decode in the batch for the checkpoint.
+  REQUIRE(split.cached_checkpoint_possible());
+  auto const batch_bytes = split.get_estimated_size_in_bytes();
+  REQUIRE(batch_bytes > 0);
+  // With decompression pushdown, the decode is forecast to compact and steal its table; the
+  // checkpoint could see only that compacted table.
+  auto const forecast =
+    batch_bytes / 4 + static_cast<std::size_t>(static_cast<double>(batch_bytes) *
+                                               sirius::decompression_pushdown_max_selectivity());
+  CHECK(split.get_estimated_working_set_size_in_bytes() ==
+        (sirius::decompression_pushdown_enabled() ? forecast : 2 * batch_bytes));
+}
+
+TEST_CASE("Cached workers reject a returned batch when connection interruption is observed",
+          "[cached_serving][scan_preparation][interrupt]")
+{
+  enum class cancel_at { before_read, after_read, size_estimate };
+  auto point = GENERATE(cancel_at::before_read, cancel_at::after_read, cancel_at::size_estimate);
+  auto& e    = env();
+  bool interrupted = point == cancel_at::before_read;
+  struct interrupting_representation : cucascade::gpu_table_representation {
+    using gpu_table_representation::gpu_table_representation;
+    bool* interrupted = nullptr;
+    std::size_t get_size_in_bytes() const override
+    {
+      if (interrupted) { *interrupted = true; }
+      return gpu_table_representation::get_size_in_bytes();
+    }
+  };
+  struct interrupting_provider : databatch_provider {
+    scripted_provider scripted;
+    std::function<void()> on_return;
+    databatch_provider::batch get_next_batch() override
+    {
+      auto next = scripted.get_next_batch();
+      on_return();
+      return next;
+    }
+  } provider;
+  if (point == cancel_at::size_estimate) {
+    auto column = make_gpu_column(*e.gpu_space, {7, 7, 7, 7});
+    auto repr   = std::make_unique<interrupting_representation>(
+      cudf::table_view(std::vector<cudf::column_view>{column->view()}),
+      column,
+      column->alloc_size(),
+      *e.gpu_space,
+      ::cuda::stream_ref{cudaStream_t{}});
+    provider.on_return = [&, representation = repr.get()] {
+      representation->interrupted = &interrupted;
+    };
+    provider.scripted.batches = {
+      cucascade::data_batch::make(sirius::get_next_batch_id(), std::move(repr))};
+  } else {
+    provider.scripted.batches = {make_test_batch(e, 4)};
+    provider.on_return        = [&] { interrupted = true; };
+  }
+  auto gate         = std::make_shared<sirius::scan_manager::preparation_gate>();
+  gate->interrupted = [&] { return interrupted; };
+  std::exception_ptr failure;
+  gate->report_error = [&](auto error) { failure = error; };
+  split_connector connector;
+  std::stop_source stop;
+  load_balancing_scan_batch_coalescer::drain_cached_provider(
+    provider, connector, stop.get_token(), false, 0, 0, nullptr, false, false, nullptr, 0, gate);
+  REQUIRE(failure);
+  CHECK_THROWS_AS(std::rethrow_exception(failure), duckdb::InterruptException);
+  CHECK_THROWS_AS(connector.get_next_split(), duckdb::InterruptException);
+  CHECK(connector.peek_resident_batches().empty());
+  CHECK(provider.scripted.served == (point == cancel_at::before_read ? 0 : 1));
+  CHECK(gate->closed);
 }

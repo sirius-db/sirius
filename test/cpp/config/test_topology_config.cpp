@@ -46,6 +46,38 @@ struct scoped_yaml {
 
 }  // namespace
 
+TEST_CASE("parsed hardware configuration resolves independently after copying",
+          "[topology_config][config]")
+{
+  scoped_yaml yaml("sirius_deferred_topology.yaml",
+                   "sirius:\n"
+                   "  topology: { num_gpus: 1 }\n"
+                   "  memory:\n"
+                   "    gpu: { usage_limit_bytes: 1Gi }\n"
+                   "    host: { capacity_bytes: 2Gi }\n"
+                   "  operator_params: { concat_batch_bytes: 123456789 }\n"
+                   "  telemetry: { exporter: ndjson, output_directory: deferred_telemetry }\n");
+  auto parsed = sirius::parsed_sirius_config::from_file(yaml.path);
+  CHECK(parsed.get_telemetry_config().exporter == sirius::QUENT_NDJSON_EXPORTER);
+  CHECK(parsed.get_operator_params().concat_batch_bytes == 123456789);
+
+  auto copy = parsed;
+  cucascade::memory::topology_discovery discovery;
+  REQUIRE(discovery.discover(cucascade::memory::NetworkDeviceVerification::EXISTS_ACTIVE_IP,
+                             /*with_runtime_attributes=*/true));
+  auto resolved = copy.resolve(discovery.get_topology());
+  REQUIRE_FALSE(resolved.get_memory_space_configs().empty());
+  CHECK(resolved.get_operator_params().scan_task_batch_size == (1ULL << 30) / 40);
+  CHECK(resolved.get_operator_params().concat_batch_bytes == 123456789);
+  CHECK(parsed.get_operator_params().concat_batch_bytes == 123456789);
+
+  // A new resolution leaves existing runtime overrides and the specification unchanged.
+  resolved.get_operator_params().concat_batch_bytes = 987654321;
+  auto another                                      = parsed.resolve(discovery.get_topology());
+  CHECK(resolved.get_operator_params().concat_batch_bytes == 987654321);
+  CHECK(another.get_operator_params().concat_batch_bytes == 123456789);
+}
+
 TEST_CASE("sirius_config parses topology.gpus_per_query", "[topology_config][config]")
 {
   scoped_yaml yaml("sirius_gpus_per_query.yaml",
@@ -94,4 +126,32 @@ TEST_CASE("sirius_config rejects a negative gpus_per_query", "[topology_config][
 
   sirius::sirius_config cfg;
   CHECK_THROWS(cfg.load_from_file(yaml.path));
+}
+
+TEST_CASE("sirius_config rejects a zero avg_variable_column_bytes", "[topology_config][config]")
+{
+  // Zero would make variable-width columns contribute nothing to the per-row width, so a
+  // mixed schema is under-estimated and the query admitted onto too few GPUs. Unlike
+  // admission_bytes_per_gpu, where 0 is the documented off switch, there is no reading of
+  // zero here that means anything.
+  scoped_yaml yaml("sirius_avg_var_zero.yaml",
+                   "sirius:\n"
+                   "  operator_params:\n"
+                   "    avg_variable_column_bytes: 0\n");
+
+  sirius::sirius_config cfg;
+  CHECK_THROWS(cfg.load_from_file(yaml.path));
+}
+
+TEST_CASE("sirius_config accepts a zero admission_bytes_per_gpu", "[topology_config][config]")
+{
+  // 0 is the off switch: it disables the estimate and leaves sizing to gpus_per_query.
+  scoped_yaml yaml("sirius_admission_bytes_zero.yaml",
+                   "sirius:\n"
+                   "  operator_params:\n"
+                   "    admission_bytes_per_gpu: 0\n");
+
+  sirius::sirius_config cfg;
+  REQUIRE_NOTHROW(cfg.load_from_file(yaml.path));
+  CHECK(cfg.get_operator_params().admission_bytes_per_gpu == 0);
 }

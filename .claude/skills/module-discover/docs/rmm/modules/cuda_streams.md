@@ -81,12 +81,6 @@ static constexpr cuda_stream_view cuda_stream_default{};
 
 **Description**: Pre-defined view of the default CUDA stream (stream 0).
 
-**Our usage**:
-- `src/operator/gpu_physical_ungrouped_aggregate.cpp:109` — Default stream for legacy operator execution
-- `src/operator/gpu_physical_result_collector.cpp:338` — Default stream for result collection
-- `src/operator/gpu_physical_nested_loop_join.cpp:389` — Default stream for legacy NLJ
-- `test/cpp/data/test_host_parquet_representation.cpp:309` — Default stream for cloning in tests
-
 ## APIs Available but Not Used
 
 | API | Header | Brief Description |

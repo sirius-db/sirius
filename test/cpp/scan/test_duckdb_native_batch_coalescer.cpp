@@ -44,7 +44,7 @@ duckdb_row_group_metadata make_rg(std::size_t index,
 
 /// Push every row group and drain ready batches, then the tail. Returns batch
 /// sizes in emission order.
-std::vector<std::size_t> coalesce_sizes(batch_coalescer& c,
+std::vector<std::size_t> coalesce_sizes(duckdb_native_row_group_batch_coalescer& c,
                                         std::vector<duckdb_row_group_metadata> rgs)
 {
   std::vector<std::size_t> sizes;
@@ -63,7 +63,7 @@ std::vector<std::size_t> coalesce_sizes(batch_coalescer& c,
 
 TEST_CASE("batch_coalescer with no caps yields a single batch", "[scan][batch_coalescer]")
 {
-  batch_coalescer c(/*approximate_batch_size=*/0, {int_type()});
+  duckdb_native_row_group_batch_coalescer c(/*approximate_batch_size=*/0, {int_type()});
   std::vector<duckdb_row_group_metadata> rgs;
   for (std::size_t i = 0; i < 5; ++i) {
     rgs.push_back(make_rg(i, /*rows=*/100, /*bytes=*/1000));
@@ -77,7 +77,7 @@ TEST_CASE("batch_coalescer splits on the total decoded-byte cap with one tail",
 {
   // cap=1000, each row group 400 bytes: a batch closes at 2 row groups (800),
   // since a third (1200) exceeds the cap. Five row groups -> [2, 2, 1].
-  batch_coalescer c(/*approximate_batch_size=*/1000, {int_type()});
+  duckdb_native_row_group_batch_coalescer c(/*approximate_batch_size=*/1000, {int_type()});
   std::vector<duckdb_row_group_metadata> rgs;
   for (std::size_t i = 0; i < 5; ++i) {
     rgs.push_back(make_rg(i, /*rows=*/100, /*bytes=*/400));
@@ -93,7 +93,7 @@ TEST_CASE("batch_coalescer keeps an over-cap row group as its own singleton batc
 {
   // Every row group (400 bytes) exceeds the cap (100) on its own, so each lands
   // alone: three row groups -> [1, 1, 1].
-  batch_coalescer c(/*approximate_batch_size=*/100, {int_type()});
+  duckdb_native_row_group_batch_coalescer c(/*approximate_batch_size=*/100, {int_type()});
   std::vector<duckdb_row_group_metadata> rgs;
   for (std::size_t i = 0; i < 3; ++i) {
     rgs.push_back(make_rg(i, /*rows=*/100, /*bytes=*/400));
@@ -108,7 +108,7 @@ TEST_CASE("batch_coalescer splits on the per-varchar-column cudf int32 cap",
   // No total cap; one varchar column. Two row groups at 1.5e9 chars each sum to
   // 3e9 >= kCudfInt32StringsThreshold (2^31-1), so they cannot share a batch.
   // Three row groups -> [1, 1, 1].
-  batch_coalescer c(/*approximate_batch_size=*/0, {varchar_type()});
+  duckdb_native_row_group_batch_coalescer c(/*approximate_batch_size=*/0, {varchar_type()});
   constexpr std::size_t kBig = 1'500'000'000ULL;
   REQUIRE(kBig < kCudfInt32StringsThreshold);
   REQUIRE(2 * kBig >= kCudfInt32StringsThreshold);
@@ -123,7 +123,7 @@ TEST_CASE("batch_coalescer splits on the per-varchar-column cudf int32 cap",
 
 TEST_CASE("batch_coalescer drops empty row groups", "[scan][batch_coalescer]")
 {
-  batch_coalescer c(/*approximate_batch_size=*/0, {int_type()});
+  duckdb_native_row_group_batch_coalescer c(/*approximate_batch_size=*/0, {int_type()});
   std::vector<duckdb_row_group_metadata> rgs;
   rgs.push_back(make_rg(0, /*rows=*/100, /*bytes=*/1000));
   rgs.push_back(make_rg(1, /*rows=*/0, /*bytes=*/0));  // empty: dropped
@@ -134,7 +134,7 @@ TEST_CASE("batch_coalescer drops empty row groups", "[scan][batch_coalescer]")
 
 TEST_CASE("batch_coalescer with only empty row groups yields no batches", "[scan][batch_coalescer]")
 {
-  batch_coalescer c(/*approximate_batch_size=*/0, {int_type()});
+  duckdb_native_row_group_batch_coalescer c(/*approximate_batch_size=*/0, {int_type()});
   std::vector<duckdb_row_group_metadata> rgs;
   rgs.push_back(make_rg(0, /*rows=*/0, /*bytes=*/0));
   rgs.push_back(make_rg(1, /*rows=*/0, /*bytes=*/0));
@@ -145,7 +145,7 @@ TEST_CASE("batch_coalescer with only empty row groups yields no batches", "[scan
 TEST_CASE("batch_coalescer preserves total row-group count across the split",
           "[scan][batch_coalescer]")
 {
-  batch_coalescer c(/*approximate_batch_size=*/1000, {int_type()});
+  duckdb_native_row_group_batch_coalescer c(/*approximate_batch_size=*/1000, {int_type()});
   std::vector<duckdb_row_group_metadata> rgs;
   for (std::size_t i = 0; i < 17; ++i) {
     rgs.push_back(make_rg(i, /*rows=*/100, /*bytes=*/300));

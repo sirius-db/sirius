@@ -1,0 +1,8 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "description": "NVIDIA static OS abstraction library for CUDA math libraries.",
+  "license": "LicenseRef-Proprietary",
+  "name": "culibos",
+  "supports": "linux & (x64 | arm64)",
+  "version": "13.3.33"
+}

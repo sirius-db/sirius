@@ -277,6 +277,11 @@ std::optional<expr_ref> gpu_expression_translator::add_join_condition(
     case ge:
       return _ast_tree.emplace<cudf::ast::operation>(
         cudf::ast::ast_operator::GREATER_EQUAL, *left_expr, *right_expr);
+    case distinct_from: {
+      auto& equal = _ast_tree.emplace<cudf::ast::operation>(
+        cudf::ast::ast_operator::NULL_EQUAL, *left_expr, *right_expr);
+      return _ast_tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::NOT, equal);
+    }
     case not_distinct_from:
       return _ast_tree.emplace<cudf::ast::operation>(
         cudf::ast::ast_operator::NULL_EQUAL, *left_expr, *right_expr);
@@ -408,7 +413,7 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
     return std::nullopt;
   }
 
-  auto const cudf_type = sirius::get_cudf_type(alt.return_type());
+  auto const cudf_type = sirius::require_cudf_type(alt.return_type());
   // TODO: Expand type support as needed. See constant.cpp.
   switch (cudf_type.id()) {
     case cudf::type_id::INT8: {
@@ -655,7 +660,7 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
 
   // Construct the CAST expression, if possible
   // CuDF AST only supports casts to INT64, UINT64, FLOAT64
-  auto const cudf_return_type = sirius::get_cudf_type(alt.target_type);
+  auto const cudf_return_type = sirius::require_cudf_type(alt.target_type);
   switch (cudf_return_type.id()) {
     case cudf::type_id::INT64:
       return _ast_tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::CAST_TO_INT64,
@@ -678,6 +683,21 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
 std::optional<expr_ref> gpu_expression_translator::add_expression(
   sirius::ast::unary_op const& alt, cudf::ast::table_reference const table_src)
 {
+  // DuckDB can represent SQL NOT IN as NOT(IN(...)). Fold enclosing NOTs into
+  // the list's polarity before translation so neither form negates Bloom probes.
+  if (alt.op == sirius::ast::unary_op::kind::op_not) {
+    auto const* child = alt.child.get();
+    bool negated      = true;
+    while (auto const* unary = std::get_if<sirius::ast::unary_op>(&child->v)) {
+      if (unary->op != sirius::ast::unary_op::kind::op_not) { break; }
+      negated = !negated;
+      child   = unary->child.get();
+    }
+    if (auto const* list = std::get_if<sirius::ast::in_list>(&child->v)) {
+      return add_in_list(*list, table_src, list->negated != negated);
+    }
+  }
+
   auto child_expr = add_expression(*alt.child, table_src);
   if (!child_expr) { return std::nullopt; }
 
@@ -715,39 +735,48 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
 std::optional<expr_ref> gpu_expression_translator::add_expression(
   sirius::ast::in_list const& alt, cudf::ast::table_reference const table_src)
 {
-  // IN expressions must have at least one comparator value.
-  if (alt.values.empty()) { return std::nullopt; }
+  return add_in_list(alt, table_src, alt.negated);
+}
 
-  // Translate the first comparison expression
-  auto test_expr = add_expression(*alt.probe, table_src);
-  if (!test_expr) { return std::nullopt; }
-  auto comparator_expr = add_expression(*alt.values[0], table_src);
-  if (!comparator_expr) { return std::nullopt; }
-  expr_ref comparison_expr = _ast_tree.emplace<cudf::ast::operation>(
-    cudf::ast::ast_operator::EQUAL, *test_expr, *comparator_expr);
+std::optional<expr_ref> gpu_expression_translator::add_in_list(
+  sirius::ast::in_list const& alt, cudf::ast::table_reference const table_src, bool negated)
+{
+  // Lower NOT IN as a conjunction of inequalities. Parquet Bloom filters answer
+  // whether a row group may contain a value; negating an OR of those answers can
+  // discard a mixed group that also contains values satisfying NOT IN (#2295).
+  // Kleene AND preserves SQL NULL semantics when a probe or list value is NULL.
+  using enum cudf::ast::ast_operator;
+  auto const comparison_op  = negated ? NOT_EQUAL : EQUAL;
+  auto const conjunction_op = negated ? NULL_LOGICAL_AND : NULL_LOGICAL_OR;
+  std::optional<expr_ref> result;
 
-  // Loop over values, building an OR tree of comparisons.
-  // Re-translate the probe expression each time to avoid shared AST subgraphs.
-  for (size_t i = 1; i < alt.values.size(); ++i) {
+  // Re-translate the probe each time to avoid shared AST subgraphs.
+  for (auto const& value : alt.values) {
     auto probe_expr = add_expression(*alt.probe, table_src);
     if (!probe_expr) { return std::nullopt; }
-    auto value_expr = add_expression(*alt.values[i], table_src);
+    auto value_expr = add_expression(*value, table_src);
     if (!value_expr) { return std::nullopt; }
 
-    expr_ref next_comparison_expr = _ast_tree.emplace<cudf::ast::operation>(
-      cudf::ast::ast_operator::EQUAL, *probe_expr, *value_expr);
-    comparison_expr = _ast_tree.emplace<cudf::ast::operation>(
-      cudf::ast::ast_operator::LOGICAL_OR, comparison_expr, next_comparison_expr);
+    expr_ref comparison_expr =
+      _ast_tree.emplace<cudf::ast::operation>(comparison_op, *probe_expr, *value_expr);
+    if (result) {
+      result = _ast_tree.emplace<cudf::ast::operation>(conjunction_op, *result, comparison_expr);
+    } else {
+      result = comparison_expr;
+    }
   }
 
-  if (!alt.negated) { return comparison_expr; }
-  return _ast_tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::NOT, comparison_expr);
+  // An empty list has no comparison to translate.
+  return result;
 }
 
 //===----------FUNCTION----------===//
 std::optional<expr_ref> gpu_expression_translator::add_expression(
   sirius::ast::function_call const& alt, cudf::ast::table_reference const table_src)
 {
+  // Standalone ASTs cannot implement DATE infinity and overflow checks.
+  if (alt.date_operation().has_value()) { return std::nullopt; }
+
   // cuDF AST only supports numeric binary functions. We must also disable any
   // operation that propagates decimal types up the expression tree, pending the
   // cuDF fix: https://github.com/rapidsai/cudf/pull/21996. Unsupported functions

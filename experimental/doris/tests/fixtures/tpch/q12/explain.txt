@@ -1,0 +1,130 @@
+Explain String(Nereids Planner)
+PLAN FRAGMENT 0
+  OUTPUT EXPRS:
+    l_shipmode[#45]
+    high_line_count[#46]
+    low_line_count[#47]
+  PARTITION: UNPARTITIONED
+
+  HAS_COLO_PLAN_NODE: false
+
+  VRESULT SINK
+     MYSQL_PROTOCOL
+
+  9:VMERGING-EXCHANGE
+     offset: 0
+     distribute expr lists: l_shipmode[#45]
+
+PLAN FRAGMENT 1
+
+  PARTITION: HASH_PARTITIONED: l_shipmode[#39]
+
+  HAS_COLO_PLAN_NODE: true
+
+  STREAM DATA SINK
+    EXCHANGE ID: 09
+    UNPARTITIONED
+IS_MERGE: true
+
+  8:VSORT(517)
+  |  order by: l_shipmode[#45] ASC
+  |  algorithm: full sort
+  |  local merge sort
+  |  merge by exchange
+  |  offset: 0
+  |  distribute expr lists: 
+  |  
+  7:VAGGREGATE (merge finalize)(514)
+  |  output: sum(partial_sum(if(o_orderpriority IN ('1-URGENT', '2-HIGH'), 1, 0))[#40])[#43], sum(partial_sum(if(( not o_orderpriority IN ('1-URGENT', '2-HIGH')), 1, 0))[#41])[#44]
+  |  group by: l_shipmode[#39]
+  |  sortByGroupKey:false
+  |  cardinality=1
+  |  distribute expr lists: l_shipmode[#39]
+  |  
+  6:VEXCHANGE
+     offset: 0
+     distribute expr lists: 
+
+PLAN FRAGMENT 2
+
+  PARTITION: HASH_PARTITIONED: o_orderkey[#27]
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 06
+    HASH_PARTITIONED: l_shipmode[#39]
+
+  5:VAGGREGATE (update serialize)(508)
+  |  STREAMING
+  |  output: partial_sum(if(o_orderpriority IN ('1-URGENT', '2-HIGH'), 1, 0)[#38])[#40], partial_sum(if(( not o_orderpriority IN ('1-URGENT', '2-HIGH')), 1, 0)[#37])[#41]
+  |  group by: l_shipmode[#36]
+  |  sortByGroupKey:false
+  |  cardinality=1
+  |  distribute expr lists: 
+  |  
+  4:VHASH JOIN(472)
+  |  join op: INNER JOIN(PARTITIONED)[]
+  |  equal join conjunct: (o_orderkey[#27] = l_orderkey[#16])
+  |  cardinality=1
+  |  vec output tuple id: 6
+  |  output tuple id: 6
+  |  vIntermediate tuple ids: 4 
+  |  hash output slot ids: 17 28 
+  |  final projections: l_shipmode[#33], if((NOT o_orderpriority IN ('1-URGENT', '2-HIGH')[#35]), 1, 0), if(o_orderpriority IN ('1-URGENT', '2-HIGH')[#35], 1, 0)
+  |  final project output tuple id: 6
+  |  intermediate projections: l_shipmode[#32], o_orderpriority[#30], o_orderpriority[#30] IN ('1-URGENT', '2-HIGH')
+  |  intermediate tuple id: 5
+  |  distribute expr lists: o_orderkey[#27]
+  |  distribute expr lists: l_orderkey[#16]
+  |  
+  |----1:VEXCHANGE
+  |       offset: 0
+  |       distribute expr lists: 
+  |    
+  3:VEXCHANGE
+     offset: 0
+     distribute expr lists: 
+
+PLAN FRAGMENT 3
+
+  PARTITION: RANDOM
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 03
+    HASH_PARTITIONED: o_orderkey[#27]
+
+  2:VTVF_SCAN_NODE(447)
+     table: null.null.LocalTableValuedFunction
+     inputSplitNum=1, totalFileSize=41097446, scanRanges=1
+     partition=0/0
+     numNodes=2
+     pushdown agg=NONE
+     final projections: _tvf_local.o_orderkey[#18], _tvf_local.o_orderpriority[#23]
+     final project output tuple id: 3
+
+PLAN FRAGMENT 4
+
+  PARTITION: RANDOM
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 01
+    HASH_PARTITIONED: l_orderkey[#16]
+
+  0:VTVF_SCAN_NODE(456)
+     table: null.null.LocalTableValuedFunction
+     predicates: _tvf_local.l_shipmode[#14] IN ('MAIL', 'SHIP'), (_tvf_local.l_commitdate[#11] < _tvf_local.l_receiptdate[#12]), (_tvf_local.l_shipdate[#10] < _tvf_local.l_commitdate[#11]), (_tvf_local.l_receiptdate[#12] >= '1994-01-01'), (_tvf_local.l_receiptdate[#12] < '1995-01-01')
+     inputSplitNum=1, totalFileSize=162140518, scanRanges=1
+     partition=0/0
+     numNodes=2
+     pushdown agg=NONE
+     final projections: _tvf_local.l_orderkey[#0], _tvf_local.l_shipmode[#14]
+     final project output tuple id: 1
+
+
+
+========== STATISTICS ==========
