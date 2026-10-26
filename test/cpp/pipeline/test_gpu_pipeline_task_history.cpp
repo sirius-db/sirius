@@ -162,6 +162,7 @@ class fake_compressed_representation : public sirius::simpatico_compressed_repre
   {
     return uncompressed_;
   }
+  [[nodiscard]] std::int64_t num_rows() const noexcept override { return 0; }
   [[nodiscard]] std::unique_ptr<cucascade::idata_representation> clone(
     ::cuda::stream_ref) const override
   {

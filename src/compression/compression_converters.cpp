@@ -36,6 +36,7 @@
 #include <api/compressed_table_io.hpp>
 #include <api/simpatico_codegen.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
+#include <cucascade/data/disk_io_backend.hpp>
 #include <cucascade/data/representation_converter.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
@@ -267,34 +268,20 @@ std::unique_ptr<cucascade::idata_representation> decompress_disk_to_gpu(
   [[maybe_unused]] cucascade::memory::reservation* reservation)
 {
   nvtx_scoped_range nvtx_range{"sirius::compression::disk_to_gpu"};
-  auto const& rep    = source.cast<compressed_disk_representation>();
-  auto const& space  = gpu_decode_space(target_memory_space, "disk-to-GPU decompression");
-  auto* const gpu_mr = space.get_memory_resource_of<cucascade::memory::Tier::GPU>();
-  if (!gpu_mr) { throw std::logic_error("decompress_disk_to_gpu: missing GPU allocator"); }
-  auto const mr = rmm::device_async_resource_ref{*gpu_mr};
+  auto const& rep   = source.cast<compressed_disk_representation>();
+  auto const& space = gpu_decode_space(target_memory_space, "disk-to-GPU decompression");
+  auto& backend     = rep.get_memory_space().get_io_backend();
 
-  std::string read_error;
-  auto const ct = simpatico::read_compressed_table(
-    rep.path(), stream, rmm::mr::get_current_device_resource_ref(), &read_error);
-  if (!read_error.empty()) {
-    throw std::runtime_error("[compression_converters] reading '" + rep.path() +
-                             "' failed: " + read_error);
-  }
-  // The file was read onto `stream`; the decode's pool streams are not ordered after it.
-  stream.sync();
+  std::vector<std::uint8_t> header(rep.header_bytes());
+  backend.read(rep.path(), header.data(), header.size(), 0);
+  // Read each compressed leaf buffer from the file straight into device memory.
+  simpatico::payload_fetch_fn fetch =
+    [&backend, &rep](std::uint64_t off, std::size_t sz, void* dst, ::cuda::stream_ref s) {
+      backend.read(rep.path(), dst, sz, rep.header_bytes() + off, s);
+    };
 
-  std::vector<std::size_t> selected(ct.num_columns());
-  std::iota(selected.begin(), selected.end(), std::size_t{0});
-  return to_gpu_representation(decompress_chunk(ct,
-                                                selected,
-                                                nullptr,
-                                                decode_visibility_mask{},
-                                                space,
-                                                decode_tracking_scope(space),
-                                                stream,
-                                                mr),
-                               space,
-                               stream);
+  return reconstruct_and_decompress_to_gpu(
+    header, fetch, std::nullopt, nullptr, decode_visibility_mask{}, space, stream);
 }
 
 // Whether a decode failure is the device running out of memory or streams, which

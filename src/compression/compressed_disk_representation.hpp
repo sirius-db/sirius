@@ -32,9 +32,10 @@ namespace sirius {
 /**
  * @brief DISK-tier idata_representation backed by a Simpatico-compressed .hpln file.
  *
- * The file is a complete .hpln image (header followed by payload), so
- * simpatico::read_compressed_table reads it back as is. Clones share the file, which
- * is deleted when the last representation referring to it is destroyed.
+ * The file is a complete .hpln image: the header produced by
+ * simpatico::build_compressed_table_header, followed by the payload at
+ * header_bytes(). Clones share the file, which is deleted when the last
+ * representation referring to it is destroyed.
  *
  * Produced by the spill converters (gpu_table and compressed_host to this) and
  * decoded by the compressed_disk to gpu_table converter; see
@@ -45,12 +46,14 @@ class compressed_disk_representation : public simpatico_compressed_representatio
   /**
    * @param memory_space        Disk memory space the file lives in.
    * @param path                The .hpln file. Ownership passes to this representation.
+   * @param header_bytes        Size of the file's header; the payload starts here.
    * @param compressed_bytes    Size of the file in bytes.
    * @param uncompressed_bytes  Device footprint of the table the file decodes to.
    * @param num_rows            Row count.
    */
   compressed_disk_representation(cucascade::memory::memory_space& memory_space,
                                  std::string path,
+                                 std::size_t header_bytes,
                                  std::size_t compressed_bytes,
                                  std::size_t uncompressed_bytes,
                                  std::int64_t num_rows);
@@ -75,7 +78,9 @@ class compressed_disk_representation : public simpatico_compressed_representatio
 
   [[nodiscard]] std::string const& path() const noexcept { return _file->path; }
 
-  [[nodiscard]] std::int64_t num_rows() const noexcept { return _num_rows; }
+  [[nodiscard]] std::size_t header_bytes() const noexcept { return _header_bytes; }
+
+  [[nodiscard]] std::int64_t num_rows() const noexcept override { return _num_rows; }
 
  private:
   /// Deletes the file when the last owner goes away.
@@ -89,11 +94,13 @@ class compressed_disk_representation : public simpatico_compressed_representatio
 
   compressed_disk_representation(cucascade::memory::memory_space& memory_space,
                                  std::shared_ptr<owned_file> file,
+                                 std::size_t header_bytes,
                                  std::size_t compressed_bytes,
                                  std::size_t uncompressed_bytes,
                                  std::int64_t num_rows);
 
   std::shared_ptr<owned_file> _file;
+  std::size_t _header_bytes;
   std::size_t _compressed_bytes;
   std::size_t _uncompressed_bytes;
   std::int64_t _num_rows;
