@@ -601,3 +601,86 @@ TEMPLATE_TEST_CASE("whole-partition evaluator sums narrow integers exactly",
   CHECK(avgs[6] ==
         Catch::Approx(keyed ? static_cast<double>(max) : static_cast<double>(total) / 7));
 }
+
+TEST_CASE("whole-partition evaluator treats sum_no_overflow as sum", "[window_evaluator][gpu]")
+{
+  rmm::cuda_stream owning_stream;
+  auto stream      = owning_stream.view();
+  auto mr          = cudf::get_current_device_resource_ref();
+  auto const keyed = GENERATE(false, true);
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(
+    column<int32_t>({0, 0, 1, 1, 1}, cudf::data_type{cudf::type_id::INT32}, stream, mr));
+  columns.push_back(column<int64_t>({4, -1, 7, 2, 9},
+                                    cudf::data_type{cudf::type_id::INT64},
+                                    stream,
+                                    mr,
+                                    {true, true, true, false, true}));
+  columns.push_back(column<int64_t>(
+    {150, 25, -10, 0, 5}, cudf::data_type{cudf::type_id::DECIMAL64, -2}, stream, mr));
+  cudf::table input(std::move(columns));
+  auto const partition_columns =
+    keyed ? std::vector<cudf::size_type>{0} : std::vector<cudf::size_type>{};
+  auto result = evaluate_whole_partition_window(input.view(),
+                                                partition_columns,
+                                                {{function::sum_no_overflow, 1},
+                                                 {function::sum, 1},
+                                                 {function::sum_no_overflow, 2},
+                                                 {function::sum, 2}},
+                                                stream,
+                                                mr);
+  REQUIRE(result->num_columns() == 4);
+  CHECK(result->get_column(0).type() == result->get_column(1).type());
+  CHECK(result->get_column(2).type() == result->get_column(3).type());
+  CHECK(host<__int128_t>(result->view().column(0), stream) ==
+        host<__int128_t>(result->view().column(1), stream));
+  CHECK(host<__int128_t>(result->view().column(2), stream) ==
+        host<__int128_t>(result->view().column(3), stream));
+  auto const sums = host<__int128_t>(result->view().column(0), stream);
+  CHECK(sums[0] == (keyed ? 3 : 19));
+  CHECK(sums[2] == (keyed ? 16 : 19));
+}
+
+TEST_CASE("whole-partition evaluator rejects invalid requests", "[window_evaluator][gpu]")
+{
+  rmm::cuda_stream owning_stream;
+  auto stream = owning_stream.view();
+  auto mr     = cudf::get_current_device_resource_ref();
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(column<int32_t>({0, 0, 1}, cudf::data_type{cudf::type_id::INT32}, stream, mr));
+  columns.push_back(column<int64_t>({1, 2, 3}, cudf::data_type{cudf::type_id::INT64}, stream, mr));
+  columns.push_back(
+    column<double>({1.5, 2.5, 3.5}, cudf::data_type{cudf::type_id::FLOAT64}, stream, mr));
+  columns.push_back(sirius::test::operator_utils::make_string_column({"a", "b", "c"}, stream, mr));
+  cudf::table input(std::move(columns));
+  auto const evaluate = [&](std::vector<cudf::size_type> const& partition_columns,
+                            std::vector<whole_partition_aggregate> const& aggregates) {
+    return evaluate_whole_partition_window(input.view(), partition_columns, aggregates, stream, mr);
+  };
+
+  SECTION("no aggregates") { CHECK_THROWS_AS(evaluate({0}, {}), std::invalid_argument); }
+  SECTION("partition column outside the input")
+  {
+    CHECK_THROWS_AS(evaluate({4}, {{function::sum, 1}}), std::invalid_argument);
+    CHECK_THROWS_AS(evaluate({-1}, {{function::sum, 1}}), std::invalid_argument);
+  }
+  SECTION("argument column outside the input")
+  {
+    CHECK_THROWS_AS(evaluate({0}, {{function::sum, 4}}), std::invalid_argument);
+    CHECK_THROWS_AS(evaluate({0}, {{function::count, -1}}), std::invalid_argument);
+  }
+  SECTION("unsupported aggregate")
+  {
+    CHECK_THROWS_AS(evaluate({0}, {{function::first, 1}}), std::invalid_argument);
+    CHECK_THROWS_AS(evaluate({0}, {{function::stddev_samp, 1}}), std::invalid_argument);
+  }
+  SECTION("unsupported partition column type")
+  {
+    CHECK_THROWS_AS(evaluate({2}, {{function::sum, 1}}), std::invalid_argument);
+  }
+  SECTION("unsupported argument type")
+  {
+    CHECK_THROWS_AS(evaluate({0}, {{function::sum, 3}}), std::invalid_argument);
+    CHECK_THROWS_AS(evaluate({0}, {{function::avg, 3}}), std::invalid_argument);
+  }
+}

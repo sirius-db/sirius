@@ -16,6 +16,8 @@
 
 #include "op/window/whole_partition.hpp"
 
+#include "op/aggregate/wide_integer_sum.hpp"
+
 #include <cudf/aggregation.hpp>
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -45,7 +47,7 @@ cudf::data_type accumulator_type(cudf::data_type input)
     case type_id::INT8:
     case type_id::INT16:
     case type_id::INT32:
-    case type_id::INT64: return cudf::data_type{type_id::DECIMAL128, 0};
+    case type_id::INT64: return wide_integer_sum_type();
     case type_id::DECIMAL32:
     case type_id::DECIMAL64:
     case type_id::DECIMAL128: return cudf::data_type{type_id::DECIMAL128, input.scale()};
@@ -302,6 +304,7 @@ std::unique_ptr<cudf::table> evaluate_whole_partition_window(
 
   std::vector<whole_partition_aggregate> simple_aggregates;
   std::vector<std::unique_ptr<cudf::column>> finite_arguments;
+  std::vector<cudf::size_type> finite_argument_columns;
   std::vector<std::optional<std::size_t>> nan_count_indices(aggregates.size());
   for (std::size_t i = 0; i < aggregates.size(); ++i) {
     auto const& agg = aggregates[i];
@@ -315,9 +318,17 @@ std::unique_ptr<cudf::table> evaluate_whole_partition_window(
       cudf::is_floating_point(request.values.type());
     if (float_extrema) {
       // NaN orders above every other value. Floating point extrema ignore NaN, and the NaN
-      // results are restored afterwards from the counts.
-      finite_arguments.push_back(cudf::column_nans_to_nulls(request.values, stream, mr));
-      request.values = finite_arguments.back()->view();
+      // results are restored afterwards from the counts. Aggregates over one column share
+      // one NaN free copy.
+      auto const existing = std::find(
+        finite_argument_columns.begin(), finite_argument_columns.end(), agg.argument_column);
+      if (existing == finite_argument_columns.end()) {
+        finite_arguments.push_back(cudf::column_nans_to_nulls(request.values, stream, mr));
+        finite_argument_columns.push_back(agg.argument_column);
+        request.values = finite_arguments.back()->view();
+      } else {
+        request.values = finite_arguments[existing - finite_argument_columns.begin()]->view();
+      }
     }
     request.aggregations.push_back(simple_aggregation<cudf::groupby_aggregation>(agg.function));
     if (float_extrema) {
