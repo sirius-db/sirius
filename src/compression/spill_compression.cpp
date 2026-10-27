@@ -118,7 +118,7 @@ constexpr std::size_t kMaxBitpackColumnBytes = std::size_t{1} << 33;  // 8 GiB
 
 }  // namespace
 
-std::string default_spill_plan(cudf::column_view const& column, rmm::cuda_stream_view stream)
+std::string default_spill_plan(cudf::column_view const& column, ::cuda::stream_ref stream)
 {
   if (column.type().id() == cudf::type_id::STRING) {
     if (column.size() < kMinDictionaryRows) { return kStoredPlan; }
