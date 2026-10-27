@@ -27,6 +27,7 @@ int main(void)
 
 Zero means success; treat unknown nonzero status codes as failures. Error diagnostics
 are optional, so a failure remains a failure even if no message is available.
+Status values 1–3 are reserved for configuration errors.
 
 Borrow diagnostic text with sirius_error_message() and obtain its byte length with
 sirius_error_message_size(). Both accept NULL: they return an empty string and zero,
@@ -37,14 +38,15 @@ with its use. No C++ exception crosses these functions.
 ### Diagnostic output convention
 
 Status-returning functions use an optional `sirius_error **out_error` parameter.
-Pass `NULL` to omit diagnostics, or the address of a pointer initialized to `NULL`.
+Pass `NULL` to omit diagnostics, or the address of a `sirius_error *` output slot.
 Functions clear the slot before doing work. It remains `NULL` on success; on failure,
 it receives an owned diagnostic if one can be allocated, otherwise `NULL`.
 The status code determines success or failure independently of the diagnostic.
 
 Destroy any previous diagnostic before reusing its output slot. Functions overwrite
-slots without releasing previous contents. Output slots require exclusive access
-for the duration of the call.
+slots without reading or releasing previous contents; an unreleased diagnostic
+would be leaked, not reported as an argument error. Output slots require exclusive
+access for the duration of the call.
 
 Messages may contain embedded NUL bytes. Use sirius_error_message_size() as the
 complete byte length rather than `strlen()`. The borrowed bytes remain valid until
