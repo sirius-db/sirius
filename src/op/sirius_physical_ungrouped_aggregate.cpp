@@ -138,6 +138,7 @@ struct aggregate_layout {
   std::vector<cudf::aggregation::Kind> merge_kinds;
   std::vector<std::optional<cudf::size_type>>
     merge_nth_index;  // when merge_kinds[i] == NTH_ELEMENT
+  bool has_first            = false;
   bool has_avg              = false;
   bool has_count_distinct   = false;
   bool has_stddev           = false;
@@ -298,6 +299,12 @@ aggregate_layout build_aggregate_layout(
         layout.local_types.push_back(agg_return_type);
         layout.merge_kinds.push_back(cudf::aggregation::Kind::NTH_ELEMENT);
         layout.merge_nth_index.push_back(0);  // first element
+        // A NULL first row is a value; an empty partial has no first row.
+        spec.local_count_idx = local_idx++;
+        layout.local_types.push_back(duckdb::LogicalType::BIGINT);
+        layout.merge_kinds.push_back(cudf::aggregation::Kind::SUM);
+        layout.merge_nth_index.push_back(std::nullopt);
+        layout.has_first = true;
         break;
       default:
         throw not_implemented_exception(
@@ -500,6 +507,9 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
               cudf::get_element(col, 0, stream, cudf::get_current_device_resource_ref());
           }
           cols.push_back(cudf::make_column_from_scalar(*first_scalar, 1, stream));
+          auto count = make_numeric_scalar_with_value<int64_t>(
+            cudf::data_type{cudf::type_id::INT64}, static_cast<int64_t>(view.num_rows()), stream);
+          cols.push_back(cudf::make_column_from_scalar(*count, 1, stream));
           break;
         }
         case aggregate_kind::SUM:
@@ -709,11 +719,21 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
   if (input_batches.size() == 1) {
     merged_batch = input.get_data_batches()[0];  // forward the owned input batch (idle at park)
   } else {
-    merged_batch = gpu_merge_impl::merge_ungrouped_aggregate(
-      input_batches, layout.merge_kinds, layout.merge_nth_index, stream, *space, batch_telemetry());
+    std::vector<std::optional<cudf::size_type>> first_row_counts(layout.local_types.size());
+    for (auto const& spec : layout.aggregates) {
+      if (spec.kind == aggregate_kind::FIRST)
+        first_row_counts[spec.local_sum_idx] = spec.local_count_idx;
+    }
+    merged_batch = gpu_merge_impl::merge_ungrouped_aggregate(input_batches,
+                                                             layout.merge_kinds,
+                                                             layout.merge_nth_index,
+                                                             stream,
+                                                             *space,
+                                                             batch_telemetry(),
+                                                             first_row_counts);
   }
 
-  if (!layout.has_avg && !layout.has_stddev && !layout.has_count_distinct &&
+  if (!layout.has_first && !layout.has_avg && !layout.has_stddev && !layout.has_count_distinct &&
       !layout.has_wide_integer_sum) {
     return std::make_unique<pipelineable_operator_data>(
       std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(merged_batch)});

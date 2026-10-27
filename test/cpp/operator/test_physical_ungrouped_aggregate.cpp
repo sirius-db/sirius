@@ -454,3 +454,42 @@ TEST_CASE("stddev_samp rejects non-finite results after checking sample size", "
     }
   }
 }
+
+TEST_CASE("FIRST skips empty partials and preserves a real NULL",
+          "[ungrouped_aggregate][first_empty]")
+{
+  auto manager  = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space   = manager->get_memory_space(Tier::GPU, 0);
+  auto scenario = GENERATE(0, 1, 2, 3, 4, 5, 6, 7);
+  auto defs     = sirius::test::create_aggregate_expressions<gpu_type_traits<int64_t>>(
+    {}, {"first", "count"}, {0, 0});
+  sirius_physical_ungrouped_aggregate local(std::move(defs.output_types),
+                                            std::move(defs.aggregates),
+                                            1,
+                                            duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES);
+  sirius_physical_ungrouped_aggregate_merge merge(&local);
+  auto empty = make_numeric_batch_with_nulls<int64_t>(*space, {}, {}, cudf::type_id::INT64);
+  auto value = make_numeric_batch_with_nulls<int64_t>(*space, {42}, {true}, cudf::type_id::INT64);
+  auto null  = make_numeric_batch_with_nulls<int64_t>(*space, {0}, {false}, cudf::type_id::INT64);
+  std::vector<std::shared_ptr<data_batch>> batches;
+  switch (scenario) {
+    case 0: batches = {empty, value}; break;
+    case 1: batches = {value, empty}; break;
+    case 2: batches = {empty, empty}; break;
+    case 3: batches = {empty}; break;
+    case 4: batches = {null, value}; break;
+    case 5: batches = {empty, null, value}; break;
+    case 6: batches = {value}; break;
+    case 7: batches = {null}; break;
+  }
+  auto partial = local.execute(pipelineable_operator_data(batches), default_stream());
+  auto result  = merge.execute(*partial, default_stream());
+  auto view    = sirius::get_cudf_table_view(
+    *dynamic_cast<pipelineable_operator_data&>(*result).get_data_batches()[0]);
+  REQUIRE(view.num_columns() == 2);
+  REQUIRE(view.num_rows() == 1);
+  REQUIRE(copy_validity_to_host(view.column(0))[0] == (scenario < 2 || scenario == 6));
+  if (scenario < 2 || scenario == 6) REQUIRE(copy_column_to_host<int64_t>(view.column(0))[0] == 42);
+  REQUIRE(copy_column_to_host<int64_t>(view.column(1))[0] ==
+          ((scenario == 2 || scenario == 3 || scenario == 7) ? 0 : 1));
+}
