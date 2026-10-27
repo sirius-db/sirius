@@ -15,6 +15,8 @@
  */
 
 // sirius
+#include "expression_evaluator/comparison_expression.hpp"
+
 #include <expression/ast/node.hpp>
 #include <expression/value.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
@@ -350,22 +352,23 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::in_list const& alt,
   }
   auto const ast_op_count = alt.cudf_ast_op_count();
 
-  if (_policy.strategy != expression_evaluator_strategy::MATERIALIZE &&
-      (mode == evaluation_mode::AST || ast_op_count >= _min_ast_size)) {
+  auto const floating = floating_comparison(alt.probe->return_type(), alt.probe->return_type());
+  if (floating || (_policy.strategy != expression_evaluator_strategy::MATERIALIZE &&
+                   (mode == evaluation_mode::AST || ast_op_count >= _min_ast_size))) {
     D_ASSERT(!alt.values.empty());
 
     // `x IN (a, b)` is `x = a OR x = b` under Kleene logic, so a match stays TRUE when another
     // comparison is NULL (e.g. a NULL list entry). NOT IN negates that result.
     auto test                = evaluate(*alt.probe, evaluation_mode::AST);
     auto comparator          = evaluate(*alt.values[0], evaluation_mode::AST);
-    expr_ref comparison_expr = _ast_tree.emplace<cudf::ast::operation>(
-      cudf::ast::ast_operator::EQUAL, test.get_expr(), comparator.get_expr());
+    expr_ref comparison_expr = comparison_expression(
+      _ast_tree, comparison_type::equal, test.get_expr(), comparator.get_expr(), floating);
     auto output = evaluate_result(compose(comparison_expr, {&test, &comparator}));
 
     for (std::size_t value_idx = 1; value_idx < alt.values.size(); ++value_idx) {
       auto next_comparator          = evaluate(*alt.values[value_idx], evaluation_mode::AST);
-      expr_ref next_comparison_expr = _ast_tree.emplace<cudf::ast::operation>(
-        cudf::ast::ast_operator::EQUAL, test.get_expr(), next_comparator.get_expr());
+      expr_ref next_comparison_expr = comparison_expression(
+        _ast_tree, comparison_type::equal, test.get_expr(), next_comparator.get_expr(), floating);
       comparison_expr = _ast_tree.emplace<cudf::ast::operation>(
         cudf::ast::ast_operator::NULL_LOGICAL_OR, comparison_expr, next_comparison_expr);
       output = evaluate_result(compose(comparison_expr, {&output, &next_comparator}));

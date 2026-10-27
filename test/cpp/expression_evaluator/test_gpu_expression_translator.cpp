@@ -58,6 +58,7 @@
 // standard library
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -1686,4 +1687,25 @@ TEST_CASE("translator: checked DATE arithmetic is an AST boundary",
              make_ref_typed(2, difference ? logical_type::make(type_id::BIGINT) : date));
   auto parent_translator = make_translator();
   REQUIRE_FALSE(translate(parent_translator, *parent).has_value());
+}
+
+TEST_CASE("translator: floating IN and NOT IN include NaN",
+          "[expression_translator][nan_comparison]")
+{
+  auto const nan = std::numeric_limits<double>::quiet_NaN();
+  auto const inf = std::numeric_limits<double>::infinity();
+  auto table     = make_float64_table({-inf, 0, 1, inf, nan});
+  auto negated   = GENERATE(false, true);
+  std::vector<std::unique_ptr<ast_node>> values;
+  values.push_back(make_double_const(nan));
+  values.push_back(make_double_const(1));
+  auto expr =
+    make_in(make_ref_typed(0, logical_type::make(type_id::DOUBLE)), std::move(values), negated);
+  auto translator = make_translator();
+  auto ast_tree   = translate(translator, *expr);
+  REQUIRE(ast_tree.has_value());
+  auto result   = cudf::compute_column(table->view(), ast_tree->back(), stream, mr);
+  auto actual   = copy_column_to_host<int8_t>(result->view());
+  auto expected = negated ? std::vector<int8_t>{1, 1, 0, 1, 0} : std::vector<int8_t>{0, 0, 1, 0, 1};
+  REQUIRE(actual == expected);
 }

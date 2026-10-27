@@ -15,6 +15,8 @@
  */
 
 // sirius
+#include "expression_evaluator/comparison_expression.hpp"
+
 #include <expression/ast/aggregate.hpp>
 #include <expression_evaluator/ast_supported_types.hpp>
 #include <expression_evaluator/gpu_expression_translator_internal.hpp>
@@ -258,39 +260,12 @@ std::optional<expr_ref> gpu_expression_translator::add_join_condition(
   auto right_expr = add_expression(*right_node, right_table_ref);
   if (!right_expr) { return std::nullopt; }
 
-  switch (condition.comparison) {
-    using enum sirius::comparison_type;
-    case equal:
-      return _ast_tree.emplace<cudf::ast::operation>(
-        cudf::ast::ast_operator::EQUAL, *left_expr, *right_expr);
-    case not_equal:
-      return _ast_tree.emplace<cudf::ast::operation>(
-        cudf::ast::ast_operator::NOT_EQUAL, *left_expr, *right_expr);
-    case lt:
-      return _ast_tree.emplace<cudf::ast::operation>(
-        cudf::ast::ast_operator::LESS, *left_expr, *right_expr);
-    case gt:
-      return _ast_tree.emplace<cudf::ast::operation>(
-        cudf::ast::ast_operator::GREATER, *left_expr, *right_expr);
-    case le:
-      return _ast_tree.emplace<cudf::ast::operation>(
-        cudf::ast::ast_operator::LESS_EQUAL, *left_expr, *right_expr);
-    case ge:
-      return _ast_tree.emplace<cudf::ast::operation>(
-        cudf::ast::ast_operator::GREATER_EQUAL, *left_expr, *right_expr);
-    case distinct_from: {
-      auto& equal = _ast_tree.emplace<cudf::ast::operation>(
-        cudf::ast::ast_operator::NULL_EQUAL, *left_expr, *right_expr);
-      return _ast_tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::NOT, equal);
-    }
-    case not_distinct_from:
-      return _ast_tree.emplace<cudf::ast::operation>(
-        cudf::ast::ast_operator::NULL_EQUAL, *left_expr, *right_expr);
-    default:
-      SIRIUS_LOG_DEBUG("[expression_translator] Unsupported join condition comparison type: {}",
-                       static_cast<int>(condition.comparison));
-      return std::nullopt;
-  }
+  return comparison_expression(
+    _ast_tree,
+    condition.comparison,
+    *left_expr,
+    *right_expr,
+    floating_comparison(left_node->return_type(), right_node->return_type()));
 }
 
 std::optional<gpu_expression_translator::translated_expression>
@@ -512,38 +487,14 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
   // Check for failure in translating children
   if (!left_expr || !right_expr) { return std::nullopt; }
 
-  // Construct the comparison expression
-  switch (alt.op) {
-    using enum sirius::comparison_type;
-    case equal:
-      return _ast_tree.emplace<cudf::ast::operation>(
-        cudf::ast::ast_operator::EQUAL, *left_expr, *right_expr);
-    case not_equal:
-      return _ast_tree.emplace<cudf::ast::operation>(
-        cudf::ast::ast_operator::NOT_EQUAL, *left_expr, *right_expr);
-    case lt:
-      return _ast_tree.emplace<cudf::ast::operation>(
-        cudf::ast::ast_operator::LESS, *left_expr, *right_expr);
-    case gt:
-      return _ast_tree.emplace<cudf::ast::operation>(
-        cudf::ast::ast_operator::GREATER, *left_expr, *right_expr);
-    case le:
-      return _ast_tree.emplace<cudf::ast::operation>(
-        cudf::ast::ast_operator::LESS_EQUAL, *left_expr, *right_expr);
-    case ge:
-      return _ast_tree.emplace<cudf::ast::operation>(
-        cudf::ast::ast_operator::GREATER_EQUAL, *left_expr, *right_expr);
-    case distinct_from:
-    case not_distinct_from: {
-      SIRIUS_LOG_DEBUG(
-        "[expression_translator] DISTINCT comparisons not supported in expression translator");
-      return std::nullopt;
-    }
-    default:
-      SIRIUS_LOG_DEBUG("[expression_translator] Unsupported comparison type: {}",
-                       static_cast<int>(alt.op));
-      return std::nullopt;
-  }
+  if (alt.op == comparison_type::distinct_from || alt.op == comparison_type::not_distinct_from)
+    return std::nullopt;
+  return comparison_expression(
+    _ast_tree,
+    alt.op,
+    *left_expr,
+    *right_expr,
+    floating_comparison(alt.left->return_type(), alt.right->return_type()));
 }
 
 //===----------CONJUNCTION----------===//
@@ -600,11 +551,20 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
   // Check for failure in translating children
   if (!input_expr || !lower_expr || !upper_expr) { return std::nullopt; }
 
-  // Construct the BETWEEN expression
-  auto const& lower_cmp_op = _ast_tree.emplace<cudf::ast::operation>(
-    cudf::ast::ast_operator::GREATER_EQUAL, *input_expr, *lower_expr);
-  auto const& upper_cmp_op = _ast_tree.emplace<cudf::ast::operation>(
-    cudf::ast::ast_operator::LESS_EQUAL, *input_expr, *upper_expr);
+  auto const floating = floating_comparison(alt.input->return_type(), alt.lower->return_type()) ||
+                        floating_comparison(alt.input->return_type(), alt.upper->return_type());
+  auto const& lower_cmp_op =
+    comparison_expression(_ast_tree,
+                          alt.lower_inclusive ? comparison_type::ge : comparison_type::gt,
+                          *input_expr,
+                          *lower_expr,
+                          floating);
+  auto const& upper_cmp_op =
+    comparison_expression(_ast_tree,
+                          alt.upper_inclusive ? comparison_type::le : comparison_type::lt,
+                          *input_expr,
+                          *upper_expr,
+                          floating);
   return _ast_tree.emplace<cudf::ast::operation>(
     cudf::ast::ast_operator::LOGICAL_AND, lower_cmp_op, upper_cmp_op);
 }
@@ -715,7 +675,7 @@ std::optional<expr_ref> gpu_expression_translator::add_in_list(
   // discard a mixed group that also contains values satisfying NOT IN (#2295).
   // Kleene AND preserves SQL NULL semantics when a probe or list value is NULL.
   using enum cudf::ast::ast_operator;
-  auto const comparison_op  = negated ? NOT_EQUAL : EQUAL;
+  auto const comparison_op  = negated ? comparison_type::not_equal : comparison_type::equal;
   auto const conjunction_op = negated ? NULL_LOGICAL_AND : NULL_LOGICAL_OR;
   std::optional<expr_ref> result;
 
@@ -727,7 +687,11 @@ std::optional<expr_ref> gpu_expression_translator::add_in_list(
     if (!value_expr) { return std::nullopt; }
 
     expr_ref comparison_expr =
-      _ast_tree.emplace<cudf::ast::operation>(comparison_op, *probe_expr, *value_expr);
+      comparison_expression(_ast_tree,
+                            comparison_op,
+                            *probe_expr,
+                            *value_expr,
+                            floating_comparison(alt.probe->return_type(), value->return_type()));
     if (result) {
       result = _ast_tree.emplace<cudf::ast::operation>(conjunction_op, *result, comparison_expr);
     } else {
