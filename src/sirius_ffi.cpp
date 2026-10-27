@@ -116,19 +116,22 @@ double elapsed_ms(std::chrono::steady_clock::time_point since)
 
 // --- Test-only capture pause seam --------------------------------------------------------------
 
+// The installed callable is held through an owning handle so that the mutex only ever guards
+// a pointer copy/swap: constructing, copying, invoking and destroying the callable (all of which
+// may run user code that installs or clears hooks) happen outside the lock.
 std::mutex capture_pause_mutex;
-std::function<void()> capture_pause_hook;
+std::shared_ptr<const std::function<void()>> capture_pause_hook;
 
 // Runs the installed hook (if any) outside the hook mutex, so the hook may itself install or
 // clear hooks or touch the Context's thread-safe members.
 void run_capture_pause_hook()
 {
-  std::function<void()> hook;
+  std::shared_ptr<const std::function<void()>> hook;
   {
     std::lock_guard lock(capture_pause_mutex);
     hook = capture_pause_hook;
   }
-  if (hook) { hook(); }
+  if (hook) { (*hook)(); }
 }
 
 // --- ObjectStoreConfig checks ------------------------------------------------------------------
@@ -837,8 +840,13 @@ namespace testing {
 
 void set_capture_pause_hook(std::function<void()> hook)
 {
-  std::lock_guard lock(capture_pause_mutex);
-  capture_pause_hook = std::move(hook);
+  std::shared_ptr<const std::function<void()>> replacement;
+  if (hook) { replacement = std::make_shared<const std::function<void()>>(std::move(hook)); }
+  {
+    std::lock_guard lock(capture_pause_mutex);
+    capture_pause_hook.swap(replacement);
+  }
+  // `replacement` now owns the retired callable and releases it here, after the lock.
 }
 
 }  // namespace testing
