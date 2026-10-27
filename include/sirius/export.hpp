@@ -16,4 +16,4 @@
 
 #pragma once
 
-#include <sirius/c/export.h>
+#include <sirius-c/export.h>

@@ -2,8 +2,8 @@
 #include "c_api/error_internal.hpp"
 #include "catch.hpp"
 
-#include <sirius/c/context/config_builder.h>
-#include <sirius/c/version.h>
+#include <sirius-c/context/config_builder.h>
+#include <sirius-c/version.h>
 #include <unistd.h>
 
 #include <atomic>

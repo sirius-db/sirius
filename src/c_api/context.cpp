@@ -3,7 +3,7 @@
 #include "c_api/error_internal.hpp"
 #include "sirius_context.hpp"
 
-#include <sirius/c/context/context.h>
+#include <sirius-c/context/context.h>
 
 struct sirius_context {
   duckdb::SiriusContext engine;

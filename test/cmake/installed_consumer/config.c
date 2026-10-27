@@ -1,8 +1,8 @@
 // Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0
 #define _POSIX_C_SOURCE 200809L
-#include <sirius/c/context/config_builder.h>
-#include <sirius/c/context/context.h>
-#include <sirius/c/version.h>
+#include <sirius-c/context/config_builder.h>
+#include <sirius-c/context/context.h>
+#include <sirius-c/version.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

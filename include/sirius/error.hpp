@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include <sirius/c/error.h>
+#include <sirius-c/error.h>
 
 #include <memory>
 #include <new>

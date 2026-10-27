@@ -1,14 +1,14 @@
 # Sirius C API
 
 The public C API provides a C ABI for embedding Sirius. Include the headers under
-`sirius/c/` and link the Sirius library. No C++ types cross this interface.
+`sirius-c/` and link the Sirius library. No C++ types cross this interface.
 
 ## Configuration
 
 Create immutable configuration snapshots without accessing GPUs:
 
 ```c
-#include <sirius/c/context/config_builder.h>
+#include <sirius-c/context/config_builder.h>
 #include <stdio.h>
 
 int main(void)

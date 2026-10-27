@@ -6,7 +6,7 @@
  */
 #pragma once
 
-#include <sirius/c/context/context.h>
+#include <sirius-c/context/context.h>
 #include <sirius/context/config.hpp>
 #include <sirius/error.hpp>
 

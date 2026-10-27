@@ -3,8 +3,8 @@
  * @brief Create and own an initialized engine through the C ABI.
  */
 #pragma once
-#include <sirius/c/context/config.h>
-#include <sirius/c/error.h>
+#include <sirius-c/context/config.h>
+#include <sirius-c/error.h>
 #ifdef __cplusplus
 extern "C" {
 #endif

@@ -3,8 +3,8 @@
 #include "c_api/error_internal.hpp"
 #include "config_loading.hpp"
 
-#include <sirius/c/context/config_builder.h>
-#include <sirius/c/version.h>
+#include <sirius-c/context/config_builder.h>
+#include <sirius-c/version.h>
 
 #include <string_view>
 

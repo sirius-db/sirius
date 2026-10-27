@@ -2,8 +2,8 @@
 /** @file
  * @brief Build immutable configurations from defaults or YAML. */
 #pragma once
-#include <sirius/c/context/config.h>
-#include <sirius/c/error.h>
+#include <sirius-c/context/config.h>
+#include <sirius-c/error.h>
 #include <stddef.h>
 #ifdef __cplusplus
 extern "C" {

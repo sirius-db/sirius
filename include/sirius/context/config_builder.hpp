@@ -25,7 +25,7 @@
 
 #pragma once
 
-#include <sirius/c/context/config_builder.h>
+#include <sirius-c/context/config_builder.h>
 #include <sirius/context/config.hpp>
 #include <sirius/error.hpp>
 
