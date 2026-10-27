@@ -31,10 +31,12 @@
 #include "op/dynamic_filter/dynamic_filter_publish_plan.hpp"
 #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
 #include "op/dynamic_filter/dynamic_filter_stats.hpp"
+#include "op/partition/partition_sizing.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "sirius_config.hpp"
 #include "utils.hpp"
 
+#include <cudf/join/hash_join.hpp>
 #include <cudf/types.hpp>
 
 #include <atomic>
@@ -309,7 +311,6 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   double mark_join_build_switch_ratio = config::DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO;
 
   //! Join Keys statistics (optional)
-  duckdb::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> join_stats;
 
   void restrict_dynamic_filter_replicas(std::vector<int> const& admitted_gpu_ids)
   {
@@ -369,7 +370,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// under op_state_mutex: switching to BUILD_PROBE mode (allocating the per-partition build
   /// states), marking broadcast, and pre-sizing the build/probe input repositories. Returns the
   /// decision so the partition can finish its own wiring (e.g. enabling build-side concat_all).
-  partition_strategy get_partition_strategy(const partition_sizing_input& in) override;
+  partition_strategy get_partition_strategy(const partition_sizing_input& in);
 
   [[nodiscard]] bool publishes_dynamic_filters() const;
 
@@ -432,6 +433,9 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   [[nodiscard]] std::optional<std::size_t> consumed_primary_input_bytes() const override;
 
  protected:
+  /// Consumer-owned sizing target; batch-only receivers have no sizing configuration.
+  uint64_t _hash_partition_bytes = config::DEFAULT_HASH_PARTITION_BYTES;
+
   /// Count @p bytes once for a popped probe batch. Takes @ref _probe_bytes_mutex but no batch
   /// lock, so callers may hold a batch lock.
   void note_probe_bytes_counted(uint64_t batch_id, std::size_t bytes);

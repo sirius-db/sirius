@@ -29,6 +29,7 @@
 #include "scan/test_utils.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "scan_manager/split_provider.hpp"
+#include "telemetry-bridge/gen/quent.hpp"
 #include "utils/s3_test_env.hpp"
 #include "utils/telemetry_utils.hpp"
 
@@ -113,41 +114,13 @@ std::vector<std::uint8_t> read_binary_file(std::filesystem::path const& path)
   return std::vector<std::uint8_t>(chars.begin(), chars.end());
 }
 
-std::unique_ptr<cudf::io::datasource::buffer> read_local_parquet_footer(
-  cudf::io::datasource& source)
+void prime_parquet_metadata(sirius::io::sirius_datasource& source, std::string const& path)
 {
-  auto constexpr footer_tail_size = sizeof(cudf::io::parquet::file_ender_s);
-  auto const file_size            = source.size();
-  REQUIRE(file_size >= footer_tail_size);
-
-  auto tail = source.host_read(file_size - footer_tail_size, footer_tail_size);
-
-  std::uint32_t footer_size = 0;
-  std::memcpy(&footer_size, tail->data(), sizeof(footer_size));
-  REQUIRE(file_size >= footer_tail_size + footer_size);
-
-  return source.host_read(file_size - footer_tail_size - footer_size, footer_size);
-}
-
-std::shared_ptr<cudf::io::parquet::FileMetaData const> read_local_parquet_metadata(
-  std::filesystem::path const& path)
-{
-  auto source = cudf::io::datasource::create(path.string());
-  auto footer = read_local_parquet_footer(*source);
-  auto opts   = cudf::io::parquet_reader_options::builder().build();
-  cudf::io::parquet::experimental::hybrid_scan_reader reader{
-    cudf::host_span<std::uint8_t const>(footer->data(), footer->size()), opts};
-  return std::make_shared<cudf::io::parquet::FileMetaData const>(reader.parquet_metadata());
-}
-
-sirius::op::scan::parquet_encryption_evidence read_local_parquet_encryption(
-  std::filesystem::path const& path)
-{
-  auto source   = cudf::io::datasource::create(path.string());
-  auto footer   = read_local_parquet_footer(*source);
-  auto evidence = sirius::op::scan::inspect_parquet_encryption({footer->data(), footer->size()});
-  REQUIRE(evidence.complete);
-  return evidence;
+  auto const options = cudf::io::parquet_reader_options::builder().build();
+  auto metadata      = sirius::op::scan::resolve_parquet_metadata(source, 0, path, options);
+  REQUIRE(metadata != nullptr);
+  REQUIRE(metadata->built_for_identity == source.get_io_object().identity_cache_key());
+  REQUIRE(source.metadata() == metadata);
 }
 
 std::string strip_file_scheme_for_registry(std::string const& path)
@@ -211,7 +184,7 @@ std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> make_nation_tab
   for (duckdb::idx_t i = 0; i < info->returned_types.size(); ++i) {
     info->column_ids.push_back(duckdb::ColumnIndex(i));
   }
-  info->scan_output_arity = info->returned_types.size();
+  info->projected_output_count = info->returned_types.size();
   return info;
 }
 
@@ -232,7 +205,7 @@ routing_observations collect_routing_observations(
   while (ingestible.has_processed_all_metadata() == false) {
     auto task = ingestible.next_split_provider(resolver);
     if (!task) { continue; }
-    auto scan = task();
+    auto scan = task({});
     REQUIRE(scan != nullptr);
     auto* file_scan = dynamic_cast<sirius::op::scan::parquet_file_scan_info*>(scan.get());
     REQUIRE(file_scan != nullptr);
@@ -258,7 +231,7 @@ sirius::io::ioctx_resolver make_datasource_resolver(sirius_scan_manager& manager
 sirius::planner::query make_empty_query(sirius::query_id_t query_id = sirius::make_query_id(1))
 {
   auto tctx = sirius::test::make_test_telemetry_context();
-  sirius::telemetry::query_telemetry_info tinfo{tctx->engine_id(), tctx->worker_id(), query_id};
+  sirius::telemetry::query_telemetry_info tinfo{quent::now_v7(), tctx->worker_id().raw(), query_id};
   return sirius::planner::query(std::vector<std::shared_ptr<sirius::pipeline::sirius_pipeline>>{},
                                 tctx->context(),
                                 query_id,
@@ -505,7 +478,9 @@ TEST_CASE("scan_manager concurrent first-touch reuses one routed S3 ioctx", "[s3
 {
   range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{0}));
   scan_manager_fixture fixture;
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
   sirius_scan_manager manager{
+    scan_lifecycle,
     make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::sirius),
     *fixture.memory,
     fixture.topology};
@@ -568,12 +543,31 @@ TEST_CASE("scan_manager concurrent first-touch reuses one routed S3 ioctx", "[s3
   CHECK(datasource->io_ctx().get() == expected);
 }
 
+TEST_CASE("scan_manager planning backend lookup does not open remote objects", "[s3][routing]")
+{
+  scan_manager_fixture fixture;
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{
+    scan_lifecycle,
+    make_s3_scan_config("http://127.0.0.1:1", sirius::scan_manager::io_backend::sirius),
+    *fixture.memory,
+    fixture.topology};
+
+  // Port 1 has no test server. A successful lookup proves the planner only
+  // consulted URI/backend capability and did not construct an ioctx or issue
+  // a HEAD/credential probe.
+  CHECK(manager.planning_io_backend("s3://planning-bucket/data/a.puffin") ==
+        io_context_type::restful);
+}
+
 TEST_CASE("scan_manager create_datasource normalizes file URI paths before routing",
           "[s3][routing]")
 {
   range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{0}));
   scan_manager_fixture fixture;
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
   sirius_scan_manager manager{
+    scan_lifecycle,
     make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::sirius),
     *fixture.memory,
     fixture.topology};
@@ -590,7 +584,9 @@ TEST_CASE("scan_manager serves S3 reads from kvikio when backend=kvikio", "[s3][
 {
   range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{0}));
   scan_manager_fixture fixture;
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
   sirius_scan_manager manager{
+    scan_lifecycle,
     make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::kvikio),
     *fixture.memory,
     fixture.topology};
@@ -612,7 +608,8 @@ TEST_CASE("scan_manager re-primes routed S3 cache on every query", "[s3][routing
   scan_manager_fixture fixture;
   auto cfg       = make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::sirius);
   cfg.cache.mode = sirius::io::cache::cache_mode::sirius;
-  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, cfg, *fixture.memory, fixture.topology};
 
   auto datasource = manager.create_datasource("s3://routing-bucket/data.parquet");
   REQUIRE(datasource != nullptr);
@@ -647,7 +644,8 @@ TEST_CASE("scan_manager tolerates a routed S3 ioctx when cache.mode is none", "[
   scan_manager_fixture fixture;
   auto cfg = make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::sirius);
   REQUIRE_FALSE(cfg.cache.use_prefetching_cache());
-  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, cfg, *fixture.memory, fixture.topology};
 
   auto datasource = manager.create_datasource("s3://routing-bucket/data.parquet");
   REQUIRE(datasource != nullptr);
@@ -668,7 +666,8 @@ TEST_CASE("warmup opens every reactor's connection pool, and only once per bucke
   // test server to serve the burst, but still per-reactor rather than global.
   cfg.rest.max_connections = 1;
   cfg.rest_n_reactors      = 2;
-  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, cfg, *fixture.memory, fixture.topology};
 
   // Routes s3:// to the REST ioctx and starts its reactors; the size HEAD it
   // costs is the baseline the warm-up requests are counted on top of.
@@ -710,7 +709,8 @@ TEST_CASE("warmup is a no-op for backends with nothing to connect", "[s3][routin
   range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{7}));
   scan_manager_fixture fixture;
   auto cfg = make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::sirius);
-  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, cfg, *fixture.memory, fixture.topology};
 
   // The default ioctx is the local uring one: a file it can open is already
   // "connected", so the base class no-op is the whole implementation.
@@ -726,7 +726,8 @@ TEST_CASE("rest dispatch spreads a request over two reactors and rotates when id
   scan_manager_fixture fixture;
   auto cfg = make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::sirius);
   cfg.rest_n_reactors = 4;
-  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, cfg, *fixture.memory, fixture.topology};
 
   auto datasource = manager.create_datasource("s3://routing-bucket/pool.parquet");
   auto* rest_ctx  = require_rest_ioctx(datasource);
@@ -761,29 +762,27 @@ TEST_CASE("parquet_gpu_ingestible resolver routes each parquet file independentl
   auto parquet_bytes      = read_binary_file(fixture_path);
   range_s3_server server(std::move(parquet_bytes));
   scan_manager_fixture fixture;
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
   sirius_scan_manager manager{
+    scan_lifecycle,
     make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::sirius),
     *fixture.memory,
     fixture.topology};
 
   std::string const s3_uri     = "s3://routing-bucket/nation.parquet";
   std::string const local_path = fixture_path.string();
-  auto const metadata          = read_local_parquet_metadata(fixture_path);
-  auto const encryption        = read_local_parquet_encryption(fixture_path);
 
   auto s3_ds = manager.create_datasource(s3_uri);
   REQUIRE(s3_ds != nullptr);
   REQUIRE(s3_ds->io_ctx() != nullptr);
   REQUIRE(s3_ds->io_ctx()->type() == io_context_type::restful);
-  REQUIRE(s3_ds->store_metadata(std::make_shared<sirius::op::scan::parquet_metadata>(
-    metadata, /*footer_byte_len=*/0, encryption)));
+  prime_parquet_metadata(*s3_ds, s3_uri);
 
   auto local_ds = manager.create_datasource(local_path);
   REQUIRE(local_ds != nullptr);
   REQUIRE(local_ds->io_ctx() != nullptr);
   REQUIRE(is_local_backend(local_ds->io_ctx()->type()));
-  REQUIRE(local_ds->store_metadata(std::make_shared<sirius::op::scan::parquet_metadata>(
-    metadata, /*footer_byte_len=*/0, encryption)));
+  prime_parquet_metadata(*local_ds, local_path);
 
   auto ingestible = sirius::op::scan::make_ingestible(
     make_nation_table_info(std::vector<std::string>{s3_uri, local_path}));
@@ -802,25 +801,23 @@ TEST_CASE("split_provider resolver routes mixed parquet files independently", "[
   auto parquet_bytes      = read_binary_file(fixture_path);
   range_s3_server server(std::move(parquet_bytes));
   scan_manager_fixture fixture;
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
   sirius_scan_manager manager{
+    scan_lifecycle,
     make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::sirius),
     *fixture.memory,
     fixture.topology};
 
   std::string const s3_uri     = "s3://routing-bucket/nation.parquet";
   std::string const local_path = fixture_path.string();
-  auto const metadata          = read_local_parquet_metadata(fixture_path);
-  auto const encryption        = read_local_parquet_encryption(fixture_path);
 
   auto s3_ds = manager.create_datasource(s3_uri);
   REQUIRE(s3_ds != nullptr);
-  REQUIRE(s3_ds->store_metadata(std::make_shared<sirius::op::scan::parquet_metadata>(
-    metadata, /*footer_byte_len=*/0, encryption)));
+  prime_parquet_metadata(*s3_ds, s3_uri);
 
   auto local_ds = manager.create_datasource(local_path);
   REQUIRE(local_ds != nullptr);
-  REQUIRE(local_ds->store_metadata(std::make_shared<sirius::op::scan::parquet_metadata>(
-    metadata, /*footer_byte_len=*/0, encryption)));
+  prime_parquet_metadata(*local_ds, local_path);
 
   auto provider_ingestible = sirius::op::scan::make_ingestible(
     make_nation_table_info(std::vector<std::string>{s3_uri, local_path}));
@@ -831,7 +828,7 @@ TEST_CASE("split_provider resolver routes mixed parquet files independently", "[
   while (provider.has_more_splits()) {
     auto task = provider.next_split_provider();
     if (!task) { continue; }
-    auto scan = task();
+    auto scan = task({});
     REQUIRE(scan != nullptr);
     auto* file_scan = dynamic_cast<sirius::op::scan::parquet_file_scan_info*>(scan.get());
     REQUIRE(file_scan != nullptr);

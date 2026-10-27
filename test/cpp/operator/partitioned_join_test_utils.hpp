@@ -22,6 +22,7 @@
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_partition.hpp"
+#include "operator/partition_test_utils.hpp"
 #include "pipeline/pipeline_build_context.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
@@ -100,10 +101,10 @@ struct partitioned_join_options {
       op::SiriusPhysicalOperatorType::PROJECTION, types, 1);
   };
 
-  duckdb::JoinCondition condition;
-  condition.left  = duckdb::make_uniq<duckdb::BoundReferenceExpression>(options.side_types[0], 0);
-  condition.right = duckdb::make_uniq<duckdb::BoundReferenceExpression>(options.side_types[0], 0);
-  condition.comparison = duckdb::ExpressionType::COMPARE_EQUAL;
+  duckdb::JoinCondition condition(
+    duckdb::make_uniq<duckdb::BoundReferenceExpression>(options.side_types[0], 0),
+    duckdb::make_uniq<duckdb::BoundReferenceExpression>(options.side_types[0], 0),
+    duckdb::ExpressionType::COMPARE_EQUAL);
   duckdb::vector<duckdb::JoinCondition> conditions;
   conditions.push_back(std::move(condition));
   tree.join = duckdb::make_uniq<op::sirius_physical_hash_join>(
@@ -126,17 +127,33 @@ struct partitioned_join_options {
     auto partition =
       is_build && options.make_build_partition
         ? options.make_build_partition(types, *tree.join)
-        : duckdb::make_uniq<op::sirius_physical_partition>(types, 1, tree.join.get(), is_build);
+        : duckdb::make_uniq<op::sirius_physical_partition>(
+            types, 1, sirius::test::operator_utils::hash_partition_spec(*tree.join, is_build));
     auto* const result = partition.get();
     partition->children.push_back(std::move(tree.join->children[child_index]));
-    auto concat =
-      duckdb::make_uniq<op::sirius_physical_concat>(types, 1, tree.join.get(), is_build);
+    auto concat = duckdb::make_uniq<op::sirius_physical_concat>(
+      types,
+      1,
+      options.join_type == duckdb::JoinType::OUTER ||
+        ((options.join_type == duckdb::JoinType::LEFT ||
+          options.join_type == duckdb::JoinType::SEMI ||
+          options.join_type == duckdb::JoinType::ANTI) &&
+         is_build) ||
+        ((options.join_type == duckdb::JoinType::RIGHT ||
+          options.join_type == duckdb::JoinType::RIGHT_SEMI ||
+          options.join_type == duckdb::JoinType::RIGHT_ANTI) &&
+         !is_build));
     concat->children.push_back(std::move(partition));
     tree.join->children[child_index] = std::move(concat);
     return result;
   };
   tree.probe_partition = wrap_side(0, false);
   tree.build_partition = wrap_side(1, true);
+  op::bind_partition_inputs(*tree.join,
+                            *tree.build_partition,
+                            *tree.probe_partition,
+                            &tree.join->children[1]->Cast<op::sirius_physical_concat>(),
+                            tree.join->is_right_family());
   sirius::planner::sirius_physical_plan_generator::set_parent_ops(*tree.join, nullptr);
   return tree;
 }

@@ -91,7 +91,7 @@ class SiriusRegistration {
   static unique_ptr<FunctionData> GPUExecutionBind(ClientContext& context,
                                                    TableFunctionBindInput& input,
                                                    vector<LogicalType>& return_types,
-                                                   vector<string>& names);
+                                                   vector<Identifier>& names);
   /// Per-execution state factory for gpu_execution(): a reusable prepared
   /// statement gets fresh execution state (result/connection/interface) on
   /// every execute instead of reusing bind-held state.
@@ -104,7 +104,7 @@ class SiriusRegistration {
   static unique_ptr<FunctionData> PinTableBind(ClientContext& context,
                                                TableFunctionBindInput& input,
                                                vector<LogicalType>& return_types,
-                                               vector<string>& names);
+                                               vector<Identifier>& names);
 
   static void UnpinTableFunction(ClientContext& context,
                                  TableFunctionInput& data_p,
@@ -112,7 +112,7 @@ class SiriusRegistration {
   static unique_ptr<FunctionData> UnpinTableBind(ClientContext& context,
                                                  TableFunctionBindInput& input,
                                                  vector<LogicalType>& return_types,
-                                                 vector<string>& names);
+                                                 vector<Identifier>& names);
 
   /// reset_sirius_cache(): drop every ioctx's prefetching cache and rebuild it
   /// empty, so the next query pays its own IO instead of reading what the last
@@ -124,7 +124,7 @@ class SiriusRegistration {
   static unique_ptr<FunctionData> ResetSiriusCacheBind(ClientContext& context,
                                                        TableFunctionBindInput& input,
                                                        vector<LogicalType>& return_types,
-                                                       vector<string>& names);
+                                                       vector<Identifier>& names);
 
 #ifdef SIRIUS_ENABLE_LEGACY
   static bool buffer_is_initialized;

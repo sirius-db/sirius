@@ -51,6 +51,10 @@ namespace sirius {
 class compressed_device_representation;
 }
 
+namespace cucascade::memory {
+class memory_space;
+}
+
 namespace sirius::late_mat {
 
 /// One pinned batch of one origin column. Exactly one form is populated, which
@@ -61,6 +65,9 @@ struct batch_source {
   std::size_t column_index                                   = 0;  ///< within the compressed chunk
   cudf::column_view uncompressed{};  ///< valid iff compressed == nullptr
   std::int64_t num_rows = 0;
+  /// The GPU space holding this batch; pins are spread over every GPU, so it
+  /// need not be the consumer's. Null means the consumer's own GPU.
+  cucascade::memory::memory_space const* memory_space = nullptr;
 
   [[nodiscard]] bool is_compressed() const noexcept { return compressed != nullptr; }
 };
@@ -73,10 +80,14 @@ struct pinned_column_view {
   pin_generation_t pin_generation = 0;
 };
 
-/// Materialize `column` for `selection`.
+/// Materialize `column` for `selection`, on the CURRENT device.
 ///
 /// The result has selection.original_count rows — the caller's own count, not
 /// the deduplicated one — and is in the caller's order.
+///
+/// A batch whose memory_space is another GPU is gathered there and only the
+/// surviving rows are peer-copied back; such a batch takes the canonical path,
+/// and a COMPRESSED one is refused (its decode runs only where it lives).
 ///
 /// Throws if the column's batches disagree with the layout the selection was
 /// prepared against, since a positional mismatch would read the right number of
@@ -102,5 +113,10 @@ std::unique_ptr<cudf::column> materialize(pinned_column_view const& column,
                                           prepared_selection const& selection,
                                           ::cuda::stream_ref stream,
                                           rmm::device_async_resource_ref mr);
+
+/// Batches materialized from a GPU other than the consumer's, process-wide. A
+/// query that lands every port task on the pin's own GPU takes no remote path,
+/// so a multi-GPU test reads this to know the path it means to test ran.
+[[nodiscard]] std::uint64_t remote_batches_materialized() noexcept;
 
 }  // namespace sirius::late_mat

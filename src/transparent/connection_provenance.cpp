@@ -31,10 +31,10 @@
 #include <duckdb/main/attached_database.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/client_data.hpp>
-#include <duckdb/main/database_manager.hpp>
 #include <duckdb/planner/logical_operator.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
 #include <duckdb/transaction/meta_transaction.hpp>
+#include <helper/transaction_utils.hpp>
 #include <log/logging.hpp>
 #include <util/duckdb_error_message.hpp>
 
@@ -93,10 +93,11 @@ resolved_database resolve_attached_database(duckdb::ClientContext& context, std:
     return {temp.get(), temp};
   }
   if (context.transaction.HasActiveTransaction()) {
-    auto referenced = duckdb::MetaTransaction::Get(context).GetReferencedDatabase(name);
+    auto referenced =
+      duckdb::MetaTransaction::Get(context).GetReferencedDatabase(duckdb::Identifier(name));
     if (referenced) { return {referenced, nullptr}; }
   }
-  auto global = duckdb::DatabaseManager::Get(context).GetDatabase(name);
+  auto global = sirius::helper::find_global_database(context, duckdb::Identifier(name));
   return {global.get(), global};
 }
 
@@ -122,7 +123,7 @@ bool registered_catalog_is_hidden(duckdb::ClientContext& context,
 bool default_catalog_is_hidden(duckdb::ClientContext& context, std::string& catalog_name)
 {
   auto const& entry = duckdb::ClientData::Get(context).catalog_search_path->GetDefault();
-  catalog_name      = entry.catalog;
+  catalog_name      = entry.GetCatalog().GetIdentifierName();
   return attached_database_is_hidden(context, catalog_name);
 }
 
@@ -216,10 +217,10 @@ decline_reason inspect_statement_for_hidden_catalog(
   };
   try {
     for (auto const& entry : properties.read_databases) {
-      inspect(entry.first, entry.second);
+      inspect(entry.first.GetIdentifierName(), entry.second);
     }
     for (auto const& entry : properties.modified_databases) {
-      inspect(entry.first, entry.second.identity);
+      inspect(entry.first.GetIdentifierName(), entry.second.identity);
     }
   } catch (...) {
     failed = true;

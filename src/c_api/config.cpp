@@ -4,7 +4,6 @@
 #include "config_loading.hpp"
 
 #include <sirius/c/context/config_builder.h>
-#include <sirius/c/version.h>
 
 #include <string_view>
 
@@ -21,7 +20,6 @@ void release(T* value) noexcept
 }
 }  // namespace
 
-uint32_t sirius_abi_version() noexcept { return SIRIUS_ABI_VERSION; }
 void sirius_context_config_retain(sirius_context_config* config) noexcept { retain(config); }
 void sirius_context_config_release(sirius_context_config* config) noexcept { release(config); }
 void sirius_context_config_builder_retain(sirius_context_config_builder* builder) noexcept

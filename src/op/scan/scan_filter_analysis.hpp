@@ -27,7 +27,7 @@
 // duckdb
 #include <duckdb/common/types.hpp>
 #include <duckdb/planner/expression.hpp>
-#include <duckdb/planner/table_filter.hpp>
+#include <duckdb/planner/table_filter_set.hpp>
 
 // standard library
 #include <cstddef>
@@ -120,9 +120,13 @@ scan_filter_analysis analyze_scan_filters(
  * scan's column primary index, so the request comes out parallel to that
  * column list. Analysis entries that map to no slot are dropped — a partition
  * filter, say, which is enforced elsewhere.
+ *
+ * @p output_prefix_width is the scan's @c gpu_ingestible::output_prefix_width, recorded as @c
+ * sirius::pushdown_request::output_prefix_width wherever that field admits it.
  */
 sirius::pushdown_request build_pushdown_request(scan_filter_analysis const& analysis,
-                                                std::span<const std::size_t> primary_index_by_slot);
+                                                std::span<const std::size_t> primary_index_by_slot,
+                                                std::optional<std::size_t> output_prefix_width);
 
 /**
  * @brief The part of a scan's filter that still has to be evaluated after the
@@ -138,6 +142,15 @@ sirius::pushdown_request build_pushdown_request(scan_filter_analysis const& anal
  * that happened to is a per-batch fact the decoder reports
  * (@c sirius::pushdown_outcome::predicate_columns).
  */
+enum class predicate_stage { untouched, pruning_only, answer, enforced };
+
+// IDs are indices in the immutable residual program, never column IDs.
+struct predicate_progress {
+  std::size_t conjunct;
+  predicate_stage stage;
+  std::optional<std::size_t> answer_slot;
+};
+
 class residual_filter {
  public:
   residual_filter() = default;
@@ -166,12 +179,17 @@ class residual_filter {
   [[nodiscard]] std::unique_ptr<sirius::ast::node> against(
     std::vector<std::size_t> const& answered_positions, bool answers_enforced = false) const;
 
+  [[nodiscard]] std::unique_ptr<sirius::ast::node> against_progress(
+    std::span<predicate_progress const> progress) const;
+  [[nodiscard]] std::size_t size() const noexcept { return _conjuncts.size(); }
+
  private:
   struct conjunct {
     std::unique_ptr<sirius::ast::node> comparison;
     /// Set when this conjunct's column can arrive as the answer; the batch
     /// position that answer occupies.
     std::optional<std::size_t> answered_at;
+    std::vector<std::size_t> value_slots;
   };
   std::vector<conjunct> _conjuncts;
 };

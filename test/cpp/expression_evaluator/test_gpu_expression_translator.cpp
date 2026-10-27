@@ -43,7 +43,8 @@
 #include <duckdb/common/enums/expression_type.hpp>
 
 // cudf
-#include <cudf/ast/expressions.hpp>
+#include "cudf/ast_compat.hpp"
+
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
 #include <cudf/null_mask.hpp>
@@ -512,14 +513,13 @@ TEST_CASE("translator: join condition uses requested comparison operator",
   }
 }
 
-TEST_CASE("translator: join condition unsupported comparison returns nullopt",
-          "[expression_translator]")
+TEST_CASE("translator: DISTINCT FROM join condition is supported", "[expression_translator]")
 {
   auto condition  = make_reference_join_condition(duckdb::ExpressionType::COMPARE_DISTINCT_FROM);
   auto translator = make_translator();
   auto translated = translator.translate_join_condition(condition);
 
-  REQUIRE_FALSE(translated.has_value());
+  REQUIRE(translated.has_value());
 }
 
 //===----------------------------------------------------------------------===//
@@ -712,12 +712,12 @@ TEST_CASE("translator: col(0) + col(1)", "[expression_translator]")
 
 TEST_CASE("translator: unsupported function returns nullopt", "[expression_translator]")
 {
-  // A non-arithmetic function (substring) has no cuDF-AST binary-op lowering;
+  // A non-arithmetic function (strlen) has no cuDF-AST binary-op lowering;
   // the translator must report untranslatable.
   std::vector<std::unique_ptr<ast_node>> args;
   args.push_back(make_ref(0));
-  auto expr = make_func(
-    sirius::function_id::substring, std::move(args), logical_type::make(type_id::INTEGER));
+  auto expr =
+    make_func(sirius::function_id::strlen, std::move(args), logical_type::make(type_id::BIGINT));
 
   auto translator = make_translator();
   auto ast_tree   = translate(translator, *expr);
@@ -732,9 +732,8 @@ TEST_CASE("translator: conjunction with unsupported first child returns nullopt"
 {
   std::vector<std::unique_ptr<ast_node>> unsupported_args;
   unsupported_args.push_back(make_ref(0));
-  auto unsupported = make_func(sirius::function_id::substring,
-                               std::move(unsupported_args),
-                               logical_type::make(type_id::INTEGER));
+  auto unsupported = make_func(
+    sirius::function_id::strlen, std::move(unsupported_args), logical_type::make(type_id::BIGINT));
 
   auto supported = make_cmp(sirius::comparison_type::gt, make_ref(0), make_int_const(0));
 
@@ -984,17 +983,24 @@ TEST_CASE("translator: IN operator", "[expression_translator]")
   REQUIRE(host_vals == expected);
 }
 
-TEST_CASE("translator: NOT IN operator", "[expression_translator]")
+TEST_CASE("translator: IN list negation forms", "[expression_translator]")
 {
+  auto const list_negated   = GENERATE(false, true);
+  auto const enclosing_nots = GENERATE(0, 1, 2);
+  CAPTURE(list_negated, enclosing_nots);
   std::vector<int32_t> values = {1, 2, 3, 4, 5};
   auto table                  = make_int32_table(values);
   auto tv                     = table->view();
 
-  // Build: col(0) NOT IN (2, 4)
+  // Frontends can represent NOT IN with the list flag or an enclosing NOT.
+  // Nested NOTs must preserve polarity, including NOT over a negated list.
   std::vector<std::unique_ptr<ast_node>> in_values;
   in_values.push_back(make_int_const(2));
   in_values.push_back(make_int_const(4));
-  auto in_expr = make_in(make_ref(0), std::move(in_values), /*negated=*/true);
+  auto in_expr = make_in(make_ref(0), std::move(in_values), list_negated);
+  for (int i = 0; i < enclosing_nots; ++i) {
+    in_expr = make_unary(sirius::ast::unary_op::kind::op_not, std::move(in_expr));
+  }
 
   auto translator = make_translator();
   auto ast_tree   = translate(translator, *in_expr);
@@ -1004,8 +1010,9 @@ TEST_CASE("translator: NOT IN operator", "[expression_translator]")
   auto host_vals = copy_bool_column_to_host(result->view());
 
   std::vector<uint8_t> expected;
+  auto const negated = list_negated != (enclosing_nots % 2 != 0);
   for (auto v : values) {
-    expected.push_back((v != 2 && v != 4) ? 1U : 0U);
+    expected.push_back(((v == 2 || v == 4) != negated) ? 1U : 0U);
   }
   REQUIRE(host_vals == expected);
 }
@@ -1483,11 +1490,8 @@ TEST_CASE("translator: 100-row table with complex expression", "[expression_tran
 //===----------------------------------------------------------------------===//
 // Test: Decimal column vs. decimal literal comparisons
 //
-// NOTE: decimal column-vs-literal comparisons work once rapidsai/cudf#21447 is
-// included. Decimal arithmetic (function_call children returning DECIMAL) is
-// currently blocked by the translator pending rapidsai/cudf#21996, so the
-// positive tests here stay inside the comparison pattern and a negative test
-// below pins the blocking behavior.
+// Decimal column comparisons use cuDF AST. Functions with decimal arguments or
+// results materialize at every width to preserve DuckDB result width and scale.
 //===----------------------------------------------------------------------===//
 
 TEST_CASE("translator: decimal32 column EQUAL decimal literal", "[expression_translator]")
@@ -1567,12 +1571,9 @@ TEST_CASE("translator: nested decimal comparison col(0) >= 2.00 AND col(0) <= 4.
   REQUIRE(host_vals == std::vector<uint8_t>{0, 1, 1, 1, 0});
 }
 
-TEST_CASE("translator: nested decimal arithmetic returns nullopt", "[expression_translator]")
+TEST_CASE("translator: nested decimal32 arithmetic returns nullopt", "[expression_translator]")
 {
-  // Any function_call whose children have DECIMAL return_type must be blocked by
-  // the translator (pending rapidsai/cudf#21996). Build a nested expression
-  // (col(0) + col(0)) * 2.00 over a DECIMAL(5,2) column and confirm the
-  // translator refuses both the inner and outer functions.
+  // Build (col(0) + col(0)) * 2.00 over a DECIMAL(5,2) column.
   auto const dec52 = logical_type::make_decimal(5, 2);
 
   // col(0) + col(0)
@@ -1592,19 +1593,32 @@ TEST_CASE("translator: nested decimal arithmetic returns nullopt", "[expression_
   REQUIRE_FALSE(ast_tree.has_value());
 }
 
-TEST_CASE("translator: direct decimal column arithmetic returns nullopt", "[expression_translator]")
+TEST_CASE("translator: decimal32 multiplication widening to decimal64 returns nullopt",
+          "[expression_translator]")
 {
-  // Direct column-vs-column decimal arithmetic (col(0) + col(0)) must also be
-  // blocked (pending rapidsai/cudf#21996), not just arithmetic whose children
-  // are decimal constants or nested functions. The function's arguments are
-  // bare references here, so the guard depends on reference nodes carrying their
-  // DECIMAL return_type.
-  auto const dec52 = logical_type::make_decimal(5, 2);
+  auto const dec32 = logical_type::make_decimal(9, 2);
+  auto const dec64 = logical_type::make_decimal(18, 4);
+
+  std::vector<std::unique_ptr<ast_node>> args;
+  args.push_back(make_ref_typed(0, dec32));
+  args.push_back(make_ref_typed(1, dec32));
+  auto mul = make_func(sirius::function_id::mul, std::move(args), dec64);
+
+  auto translator = make_translator();
+  REQUIRE_FALSE(translate(translator, *mul).has_value());
+}
+
+TEST_CASE("translator: decimal column arithmetic returns nullopt at every width",
+          "[expression_translator]")
+{
+  auto const width   = GENERATE(5, 18, 38);
+  auto const decimal = logical_type::make_decimal(width, 2);
 
   std::vector<std::unique_ptr<ast_node>> add_args;
-  add_args.push_back(make_ref_typed(0, dec52));
-  add_args.push_back(make_ref_typed(0, dec52));
-  auto add = make_func(sirius::function_id::add, std::move(add_args), dec52);
+  add_args.push_back(make_ref_typed(0, decimal));
+  add_args.push_back(make_ref_typed(0, decimal));
+  auto add = make_func(sirius::function_id::add, std::move(add_args), decimal);
+  REQUIRE(add->cudf_ast_op_count() == 0);
 
   auto translator = make_translator();
   auto ast_tree   = translate(translator, *add);
@@ -1647,4 +1661,29 @@ TEST_CASE("translator: string column NOT EQUAL string literal", "[expression_tra
   auto result    = cudf::compute_column(tv, ast_tree->back(), stream, mr);
   auto host_vals = copy_bool_column_to_host(result->view());
   REQUIRE(host_vals == std::vector<uint8_t>{0, 1, 0, 1});
+}
+
+TEST_CASE("translator: checked DATE arithmetic is an AST boundary",
+          "[expression_translator][date_arithmetic]")
+{
+  auto const signature  = GENERATE(0, 1, 2, 3);
+  auto const date       = logical_type::make(type_id::DATE);
+  auto const integer    = logical_type::make(type_id::INTEGER);
+  auto const difference = signature == 3;
+  std::vector<std::unique_ptr<ast_node>> args;
+  args.push_back(make_ref_typed(0, signature == 1 ? integer : date));
+  args.push_back(make_ref_typed(1, signature == 1 || difference ? date : integer));
+  auto expr = make_func(signature < 2 ? sirius::function_id::add : sirius::function_id::sub,
+                        std::move(args),
+                        difference ? logical_type::make(type_id::BIGINT) : date);
+  REQUIRE(expr->cudf_ast_op_count() == 0);
+  auto translator = make_translator();
+  REQUIRE_FALSE(translate(translator, *expr).has_value());
+  // An enclosing comparison must decline too, not bypass the checked child.
+  auto parent =
+    make_cmp(sirius::comparison_type::equal,
+             std::move(expr),
+             make_ref_typed(2, difference ? logical_type::make(type_id::BIGINT) : date));
+  auto parent_translator = make_translator();
+  REQUIRE_FALSE(translate(parent_translator, *parent).has_value());
 }

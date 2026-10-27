@@ -55,7 +55,7 @@ hash table uses the descriptors marked as hash keys. Predicate routing retains t
 distinction between ordinary equality and `IS NOT DISTINCT FROM`.
 
 Both partitioning and hash joining use
-[`restore_prepared_join_key`](../../src/op/join_key_preparation.hpp) to restore
+[`restore_prepared_key`](../../src/op/key_preparation.hpp) to restore
 narrowed carriers to the prepared type before hashing. This shared representation
 is a correctness requirement: equal numeric values in different physical types can
 hash differently, sending matching rows to different partitions. Carrier restoration
@@ -116,10 +116,10 @@ The alternative order is part of the ABI: `std::variant` indexes by position and
 | `between` | `sirius::ast::between` | `BETWEEN … AND …` |
 | `case_expr` | `sirius::ast::case_expr` | `CASE WHEN … THEN … ELSE … END` |
 | `cast` | `sirius::ast::cast` | `CAST(x AS T)` |
-| `unary_op` | `sirius::ast::unary_op` | `NOT x`, `-x`, arithmetic binary ops (`+`, `-`, `*`, `/`) |
+| `unary_op` | `sirius::ast::unary_op` | `NOT x`, `x IS NULL`, `x IS NOT NULL` |
 | `coalesce` | `sirius::ast::coalesce` | `COALESCE(a, b, 0)` |
 | `in_list` | `sirius::ast::in_list` | `x IN (1, 2, 3)` |
-| `function_call` | `sirius::ast::function_call` | Named function (`YEAR`, `UPPER`, `concat`, etc.) — `sirius::function_id` enum |
+| `function_call` | `sirius::ast::function_call` | Named function (`YEAR`, `UPPER`, `concat`, etc.) and arithmetic (`a + b`, `-x`) — `sirius::function_id` enum |
 | `aggregate` | `sirius::ast::aggregate` | Aggregate function (`SUM`, `COUNT`, etc.) — `sirius::aggregate_id` enum |
 
 **Translation boundary:** `sirius::ast::from_duckdb(expr)` produces a `sirius::ast::node` from a `duckdb::Expression`. This happens once at plan time in the plan builders (and at the scan boundary for pushdown filters); the resulting node is owned by the operator and never re-translated.
@@ -140,7 +140,7 @@ The alternative order is part of the ABI: `std::variant` indexes by position and
 
 **File:** `src/expression_evaluator/expression_evaluator_strategy.hpp`
 
-The evaluator supports three strategies, selected via the `strategy` constructor parameter (default from `duckdb::Config::EXPRESSION_EVALUATOR_STRATEGY`):
+The evaluator supports three strategies, selected via `policy.strategy` in the `expression_query_policy` constructor argument:
 
 | Strategy | How it executes | cuDF API |
 |----------|-----------------|----------|
@@ -172,6 +172,19 @@ The strategy is a DuckDB SET variable registered in `src/sirius_extension.cpp`:
 SET expression_evaluator_strategy = 'ast_jit';   -- or 'ast_interpret', 'materialize'
 ```
 
+### Policy ownership
+
+At query initialization, Sirius snapshots the connection's settings into immutable
+`operator_params`. Operators derive an `expression_query_policy` from that snapshot and
+pass it to their evaluators. Scan materialization and residual filtering forward the
+same policy explicitly; pin operations supply their own settings snapshot.
+
+Each evaluator owns a constant copy of both the execution strategy and the regex JIT
+flag. Evaluation therefore uses the settings captured at construction, including when
+it runs on a different worker thread. It does not consult thread-local settings or
+mutable process globals. Standalone callers may omit the policy to use fixed defaults
+(`AST_INTERPRET`, regex JIT enabled), or pass an explicit policy.
+
 ## Supported Expression Types
 
 | Expression Type | Sirius AST alternative | Example |
@@ -180,7 +193,8 @@ SET expression_evaluator_strategy = 'ast_jit';   -- or 'ast_interpret', 'materia
 | Constant | `sirius::ast::constant` | `42`, `'hello'` |
 | Comparison | `sirius::ast::comparison` | `a > b`, `x = 10`, `a IS NOT DISTINCT FROM b` |
 | Conjunction | `sirius::ast::conjunction` | `a AND b`, `x OR y` |
-| Arithmetic / unary | `sirius::ast::unary_op` | `a + b`, `NOT x`, `-x` |
+| Arithmetic | `sirius::ast::function_call` | `a + b`, `-x` |
+| Unary predicate | `sirius::ast::unary_op` | `NOT x`, `x IS NULL` |
 | COALESCE | `sirius::ast::coalesce` | `COALESCE(a, b, 0)` |
 | IN-list | `sirius::ast::in_list` | `x IN (1, 2, 3)` |
 | Function call | `sirius::ast::function_call` | `UPPER(name)`, `YEAR(date)`, `a \|\| b` |
@@ -191,7 +205,18 @@ SET expression_evaluator_strategy = 'ast_jit';   -- or 'ast_interpret', 'materia
 
 `coalesce` is materialized via `cudf::replace_nulls` iteratively across children: the first child is materialized (scalars are lifted to a column); each subsequent child replaces the residual nulls in the running result. Children are only evaluated when the running result still has nulls. The result is wrapped via `materialize_as_ast_column` so COALESCE composes inside AST-capable parents. `cudf_ast_op_count` returns 0 — `coalesce` always takes the materialize-only path.
 
-`in_list` covers the full numeric set (INT8–INT64, UINT8–UINT64, BOOL8, FLOAT, DOUBLE, DECIMAL32/64/128, all TIMESTAMP precisions, DATE) plus VARCHAR. BOOL8 dispatches via `uint8_t` because `std::vector<bool>::data()` is deleted.
+Handlers that read an operand as a column evaluate it with `evaluate_as_column`, which broadcasts
+a scalar result to the input's row count. These are the date parts (including `millisecond` and
+`microsecond`), `date_trunc`, `round`, the string functions `strlen`, `length`, `upper`, `lower`,
+`substring`, `contains`, `prefix`, `suffix`, `LIKE` and `regexp_replace`, the `IN` probe, `NOT`,
+`IS [NOT] NULL`, and one side of constant-only arithmetic. Comparisons and the `BETWEEN` input
+broadcast a constant the same way on the materialize path. DuckDB does not always fold
+all-constant calls: statistics propagation reduces `coalesce(<non-null constant>, x)` to the
+constant after constant folding has run, so `month(coalesce(DATE '2020-02-01', d))` reaches the
+GPU as `month(DATE '2020-02-01')`.
+Parameters that must be constants, such as a `LIKE` pattern or `substring` bounds, stay scalars.
+
+`in_list` covers the full numeric set (INT8–INT64, UINT8–UINT64, BOOL8, FLOAT, DOUBLE, DECIMAL32/64/128, all TIMESTAMP precisions, DATE) plus VARCHAR. BOOL8 dispatches via `uint8_t` because `std::vector<bool>::data()` is deleted. `x IN (a, b)` follows SQL semantics: TRUE on any match, otherwise NULL if `x` or any list entry is NULL, otherwise FALSE; NOT IN negates that. The AST lowerings for IN chain the per-entry `EQUAL`s with `NULL_LOGICAL_OR`. The standalone translator lowers NOT IN to `NOT_EQUAL` comparisons joined by `NULL_LOGICAL_AND`, so parquet pruning never negates Bloom membership answers (see [Row Group Pruning](scan.md#row-group-pruning)). The row evaluator can negate its IN result because it operates on actual row values. The all-constant materialize path runs `cudf::contains` over the non-NULL entries and, when the list also has a NULL, ORs the result with a NULL scalar.
 
 ### String concatenation
 
@@ -200,11 +225,9 @@ String concatenation covers the `concat(a, b, …)` function and the `||` operat
 ### String case conversion
 
 `upper()` and `lower()` materialize their input and call `cudf::strings::to_upper` and
-`cudf::strings::to_lower`, respectively. Like `strlen()` and `length()`, these handlers
-require column inputs and rely on DuckDB to constant-fold scalar calls before GPU evaluation.
-Scalar inputs that survive constant folding are not yet supported.
-NULLs propagate and empty strings remain empty. These functions are AST breakers and can
-compose inside projections, filters, and materialized join-condition operands.
+`cudf::strings::to_lower`, respectively. NULLs propagate and empty strings remain empty.
+These functions are AST breakers and can compose inside projections, filters, and materialized
+join-condition operands.
 
 Case conversion follows cuDF's Unicode semantics, which differ from DuckDB
 for some inputs. For example `upper('ß')` produces `SS`, and `lower('İ')`
@@ -234,6 +257,51 @@ precision. Both checked conversion and millisecond/microsecond extraction use it
 so sentinel handling has one implementation. The evaluator boundary regressions
 are tagged `[timestamp_bounds]`; SQL extraction comparisons against DuckDB are
 tagged `[timestamp_extraction]`.
+
+`DATE + INTEGER`, `INTEGER + DATE`, `DATE - INTEGER`, and `DATE - DATE`
+match their already-bound signatures and execute through `date_arithmetic_checked()`.
+The helper uses a libcudf JIT transform with public CCCL overflow helpers and error
+collection; DATE inputs are bitcast to day counts without copying. Scalar operands
+use one-row columns broadcast by `cudf::scalar_column_view`, with the output row
+count passed explicitly so scalar-only and empty inputs retain the input shape.
+Offsets preserve NULLs and infinity and reject finite overflow or infinity-sentinel
+collisions. Date differences widen both day counts before subtraction and return
+BIGINT. These operations materialize under every evaluator strategy; standalone
+cuDF AST translation declines them because it cannot implement the checks.
+The existing reference evaluator restores compressed operands before execution.
+
+### Arity and negation
+
+`from_duckdb_function_name` resolves a (name, argument count) pair against one signature table
+in `function_id.cpp`: a one-argument `-` is `function_id::negate`, a two-argument `-` is
+`function_id::sub`, and an arity no GPU handler takes stays on the CPU. A one-argument `+`
+translates to its operand. The `function_call` constructor throws on a mismatched arity.
+
+`negate` runs `cudf::unary_operation(NEGATE)` on signed integers, FLOAT, DOUBLE and DECIMAL,
+keeping the input type (`-0.0` matches DuckDB). Negating a signed integer's minimum raises
+DuckDB's `Overflow in negation of numeric value!`; the check is a `cudf::contains` shared with
+`abs` (one stream sync). Unsigned, HUGEINT and INTERVAL negation, and a result type that differs
+from the operand's, stay on the CPU. `negate` is an AST breaker. Tests are tagged `[negate]`.
+
+### Rounding
+
+`round(x)` and `round(x, n)` on FLOAT and DOUBLE map to `function_id::round` and run in
+`round_floating_point` (`src/cuda/sirius_round_floating_point.cu`), one elementwise kernel that
+reproduces DuckDB's `RoundOperatorPrecision`: the value is rounded in double precision as
+`round(x * 10^n) / 10^n`, or `round(x / 10^-n) * 10^-n` for negative `n`, with ties away from
+zero. A non-finite result yields the input for `n >= 0` and 0 for `n < 0`. The output is bit
+identical to DuckDB. The precision must be a constant INTEGER.
+DECIMAL and integer inputs and a column precision fall back to the CPU at plan time.
+
+### Absolute value
+
+`abs(x)` on FLOAT, DOUBLE, DECIMAL and the integer types other than HUGEINT maps to
+`function_id::abs` and runs `cudf::unary_operation` with `ABS`. NaN and infinities are preserved and
+`abs(-0.0)` is `0.0`. The result has the input's type. The absolute value of the smallest value of a
+signed integer type wraps in cuDF, where DuckDB raises an overflow error, so the evaluator checks
+with `cudf::contains` whether the input holds that value and throws. The query then falls back to the
+CPU, which raises DuckDB's error. Unsigned integers have no such value and are returned as they are.
+HUGEINT falls back at plan time.
 
 ### Logical AND/OR NULL semantics
 

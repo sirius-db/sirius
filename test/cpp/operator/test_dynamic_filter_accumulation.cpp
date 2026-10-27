@@ -18,6 +18,7 @@
 #include "op/dynamic_filter/detail/accumulated_bloom_builder.hpp"
 #include "op/dynamic_filter/detail/accumulation_failure.hpp"
 #include "op/dynamic_filter/dynamic_filter_replica_reservation.hpp"
+#include "sirius/exception.hpp"
 #include "utils/host_allocation_fault.hpp"
 #include "utils/sirius_test_env.hpp"
 
@@ -64,8 +65,8 @@ static_assert(std::is_nothrow_constructible_v<op::detail::accumulation_cuda_erro
 static_assert(std::is_nothrow_copy_constructible_v<op::detail::accumulation_cuda_error>);
 static_assert(
   std::is_nothrow_constructible_v<op::detail::accumulation_invariant_error, char const*>);
-static_assert(std::is_nothrow_default_constructible_v<op::detail::unjoined_gpu_work>);
-static_assert(std::is_nothrow_copy_constructible_v<op::detail::unjoined_gpu_work>);
+static_assert(std::is_nothrow_default_constructible_v<sirius::unjoined_gpu_work>);
+static_assert(std::is_nothrow_copy_constructible_v<sirius::unjoined_gpu_work>);
 
 /**
  * @brief Bytes one GPU's partials occupy for @p keys keys over @p rows total rows.
@@ -136,8 +137,13 @@ std::unique_ptr<cudf::column> make_probe(std::vector<T> const& values,
       if (valid[row]) { words[row / 32] |= cudf::bitmask_type{1} << (row % 32); }
     }
     auto const nulls = static_cast<cudf::size_type>(std::ranges::count(valid, false));
-    column->set_null_mask(
-      rmm::device_buffer{words.data(), words.size() * sizeof(cudf::bitmask_type), stream}, nulls);
+    auto mask = cudf::create_null_mask(column->size(), cudf::mask_state::UNINITIALIZED, stream);
+    REQUIRE(cudaMemcpyAsync(mask.data(),
+                            words.data(),
+                            words.size() * sizeof(cudf::bitmask_type),
+                            cudaMemcpyHostToDevice,
+                            stream.get()) == cudaSuccess);
+    column->set_null_mask(std::move(mask), nulls);
   }
   stream.sync();
   return column;
@@ -860,7 +866,7 @@ TEST_CASE("each accumulation failure kind sets exactly its counters",
       throw op::detail::accumulation_cuda_error{cudaErrorIllegalAddress, false, "body"};
     } catch (...) {
       try {
-        std::throw_with_nested(op::detail::unjoined_gpu_work{});
+        std::throw_with_nested(sirius::unjoined_gpu_work{});
       } catch (...) {
         return std::current_exception();
       }
@@ -1678,11 +1684,11 @@ TEST_CASE("fatal accumulation diagnostics do not allocate during host OOM",
       try {
         throw std::bad_alloc{};
       } catch (...) {
-        if (unjoined) { std::throw_with_nested(op::detail::unjoined_gpu_work{}); }
+        if (unjoined) { std::throw_with_nested(sirius::unjoined_gpu_work{}); }
         std::throw_with_nested(
           op::detail::accumulation_cuda_error{cudaErrorIllegalAddress, false, "failure cleanup"});
       }
-    } catch (op::detail::unjoined_gpu_work const&) {
+    } catch (sirius::unjoined_gpu_work const&) {
       preserved = unjoined;
     } catch (op::detail::accumulation_cuda_error const& error) {
       preserved =

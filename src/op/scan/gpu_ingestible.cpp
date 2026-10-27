@@ -20,24 +20,54 @@
 #include <op/scan/gpu_ingestible.hpp>
 #include <op/scan/host_keep_mask.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
+#include <sirius/exception.hpp>
 
+#include <cstddef>
 #include <stdexcept>
 #include <string>
 #include <utility>
 
 namespace sirius::op::scan {
 
+namespace {
+
+// A decode that omitted its trailing pure-filter columns is only servable when it also applied the
+// scan's whole filter and kept exactly the columns the output reads; anything else would hand
+// post_filter_and_project a layout it does not index.
+void require_dropped_layout(gpu_ingestible const& ingestible,
+                            scan_operator_input const& split,
+                            cudf::size_type served_width)
+{
+  if (!split.pushdown_filter_only_columns_dropped) { return; }
+  if (!split.pushdown_row_filtered) {
+    throw sirius::internal_exception(
+      "[gpu_ingestible::materialize_table] the decode dropped filter-only columns without applying "
+      "the scan's whole filter");
+  }
+  auto const prefix = ingestible.output_prefix_width();
+  if (!prefix || static_cast<std::size_t>(served_width) != *prefix) {
+    throw sirius::internal_exception(
+      "[gpu_ingestible::materialize_table] a batch without its filter-only columns has {} "
+      "column(s), but the output reads {}",
+      served_width,
+      prefix ? std::to_string(*prefix) : std::string{"an unknown number"});
+  }
+}
+
+}  // namespace
+
 filtered_table gpu_ingestible::materialize_table(
   const op::scan::scan_operator_input& split,
   ::cuda::stream_ref stream,
   bool like_swar_fastpath,
-  std::shared_ptr<const like_multiliteral_cache> like_cache)
+  std::shared_ptr<const like_multiliteral_cache> like_cache,
+  expression_query_policy policy)
 {
   auto* mem_space = split.gpu_memory_space;
   if (split.has_scan_metadata()) [[likely]] {
     split.update(io::cache::scan_stage::reading);
     auto materialized = materialize_metadata_to_table(
-      split.get_scan_info(), *mem_space, stream, like_swar_fastpath, std::move(like_cache));
+      split.get_scan_info(), *mem_space, stream, like_swar_fastpath, std::move(like_cache), policy);
     if (split.mvcc_keep_mask.has_mask()) {
       // Only insert-delta splits carry a visibility mask here; disk-walk
       // splits never do. Sync before returning for the same reason as the
@@ -65,6 +95,7 @@ filtered_table gpu_ingestible::materialize_table(
     auto const decoded_state =
       split.pushdown_row_filtered ? filter_state::ROW_FILTERED : filter_state::UNFILTERED;
     if (split.stolen_table) {
+      require_dropped_layout(*this, split, split.stolen_table->num_columns());
       // prepare_for_processing took ownership of the wrapper batch's per-query
       // table; move it straight into the scan output — the owned-table
       // owning_table_view releases by moving columns, so no copy is made.
@@ -82,6 +113,7 @@ filtered_table gpu_ingestible::materialize_table(
     auto batch  = split.get_cached_batch();
     auto rbatch = batch->to_read_only();
     auto view   = get_cudf_table_view(rbatch);
+    require_dropped_layout(*this, split, view.num_columns());
     if (split.mvcc_keep_mask.has_mask()) {
       // prepare_for_processing already refuses the decode-filtered + keep-mask
       // combination, and the row-count check below catches any slip: a
@@ -104,10 +136,12 @@ filtered_table gpu_ingestible::materialize_table(
       stream.sync();
       return {.table = owning_table_view{std::move(masked)}, .state = filter_state::UNFILTERED};
     }
+    auto const stored_bytes = rbatch.get_data()->get_size_in_bytes();
     return {.table               = owning_table_view{std::move(rbatch), view},
             .state               = decoded_state,
             .predicate_columns   = split.pushdown_predicate_columns,
-            .predicates_enforced = split.pushdown_predicates_enforced};
+            .predicates_enforced = split.pushdown_predicates_enforced,
+            .stored_bytes        = stored_bytes};
   }
 }
 

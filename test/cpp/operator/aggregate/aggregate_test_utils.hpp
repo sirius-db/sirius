@@ -60,8 +60,15 @@ inline duckdb::AggregateFunction MakeDummyAggregate(const std::string& name,
                                                     const duckdb::vector<duckdb::LogicalType>& args,
                                                     const duckdb::LogicalType& ret_type)
 {
-  return duckdb::AggregateFunction(
-    name, args, ret_type, 0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+  return duckdb::AggregateFunction(duckdb::Identifier(name),
+                                   args,
+                                   ret_type,
+                                   nullptr,
+                                   nullptr,
+                                   nullptr,
+                                   nullptr,
+                                   nullptr,
+                                   duckdb::FunctionNullHandling::DEFAULT_NULL_HANDLING);
 }
 
 /**
@@ -90,7 +97,11 @@ AggregateExpressionResult create_aggregate_expressions(
     result.output_types.push_back(sirius::from_duckdb(Traits::logical_type()));
   }
   for (std::size_t i = 0; i < aggregations.size(); ++i) {
-    if (aggregations[i] == "avg") {
+    if (aggregations[i] == "count") {
+      result.output_types.push_back(sirius::from_duckdb(duckdb::LogicalType::BIGINT));
+    } else if (aggregations[i] == "stddev_samp") {
+      result.output_types.push_back(sirius::from_duckdb(duckdb::LogicalType::DOUBLE));
+    } else if (aggregations[i] == "avg") {
       // DECIMAL AVG preserves the DECIMAL type; non-DECIMAL AVG returns DOUBLE
       if constexpr (Traits::is_decimal) {
         result.output_types.push_back(sirius::from_duckdb(Traits::logical_type()));
@@ -116,7 +127,11 @@ AggregateExpressionResult create_aggregate_expressions(
 
     // AVG on DECIMAL preserves the DECIMAL type; on other types returns DOUBLE
     duckdb::LogicalType ret_type;
-    if (agg_name == "avg") {
+    if (agg_name == "count") {
+      ret_type = duckdb::LogicalType::BIGINT;
+    } else if (agg_name == "stddev_samp") {
+      ret_type = duckdb::LogicalType::DOUBLE;
+    } else if (agg_name == "avg") {
       if constexpr (Traits::is_decimal) {
         ret_type = Traits::logical_type();
       } else {
@@ -136,12 +151,14 @@ AggregateExpressionResult create_aggregate_expressions(
       MakeDummyAggregate(agg_name, {Traits::logical_type()}, ret_type);
 
     // Create the BoundAggregateExpression
-    auto agg_expr =
-      duckdb::make_uniq<duckdb::BoundAggregateExpression>(agg_function,
-                                                          std::move(agg_children),
-                                                          nullptr,  // filter
-                                                          nullptr,  // bind_info
-                                                          duckdb::AggregateType::NON_DISTINCT);
+    auto agg_expr = duckdb::make_uniq<duckdb::BoundAggregateExpression>(
+      duckdb::BoundAggregateFunction(agg_function),
+      std::move(agg_children),
+      nullptr,
+      // filter
+      nullptr,
+      // bind_info
+      duckdb::AggregateType::NON_DISTINCT);
 
     result.aggregates.push_back(sirius::ast::from_duckdb(*agg_expr));
   }
@@ -190,7 +207,7 @@ make_test_data_for_grouped_aggregate(std::size_t num_groups,
   std::vector<std::string> expected_group_by1(num_groups);  // Used when num_group_key_columns == 2
   std::vector<typename Traits::type> expected_min(num_groups);
   std::vector<typename Traits::type> expected_max(num_groups);
-  std::vector<int32_t> expected_count(num_groups);
+  std::vector<int64_t> expected_count(num_groups);
 
   // Populate data for each group
   std::size_t offset = 0;
@@ -265,7 +282,7 @@ make_test_data_for_grouped_aggregate(std::size_t num_groups,
   expected_cols.push_back(vector_to_cudf_column<Traits>(expected_min, stream, mr));
   expected_cols.push_back(vector_to_cudf_column<Traits>(expected_max, stream, mr));
   expected_cols.push_back(
-    vector_to_cudf_column<operator_utils::gpu_type_traits<int32_t>>(expected_count, stream, mr));
+    vector_to_cudf_column<operator_utils::gpu_type_traits<int64_t>>(expected_count, stream, mr));
   auto expected_table = std::make_unique<cudf::table>(std::move(expected_cols));
 
   return {std::move(input_table), std::move(expected_table)};
@@ -307,7 +324,7 @@ make_test_data_for_grouped_aggregate_with_avg(std::size_t num_groups,
   std::vector<std::string> expected_group_by1(num_groups);
   std::vector<typename Traits::type> expected_min(num_groups);
   std::vector<typename Traits::type> expected_max(num_groups);
-  std::vector<int32_t> expected_count(num_groups);
+  std::vector<int64_t> expected_count(num_groups);
 
   // For DECIMAL, AVG preserves the DECIMAL type; otherwise FLOAT64
   std::vector<double> expected_avg_f64(num_groups);
@@ -399,7 +416,7 @@ make_test_data_for_grouped_aggregate_with_avg(std::size_t num_groups,
   expected_cols.push_back(vector_to_cudf_column<Traits>(expected_min, stream, mr));
   expected_cols.push_back(vector_to_cudf_column<Traits>(expected_max, stream, mr));
   expected_cols.push_back(
-    vector_to_cudf_column<operator_utils::gpu_type_traits<int32_t>>(expected_count, stream, mr));
+    vector_to_cudf_column<operator_utils::gpu_type_traits<int64_t>>(expected_count, stream, mr));
   if constexpr (Traits::is_decimal) {
     expected_cols.push_back(vector_to_cudf_column<Traits>(expected_avg_dec, stream, mr));
   } else {
@@ -450,12 +467,14 @@ AggregateExpressionResult create_count_distinct_expressions(
   duckdb::AggregateFunction agg_function =
     MakeDummyAggregate("count", {ValTraits::logical_type()}, duckdb::LogicalType::BIGINT);
 
-  auto agg_expr =
-    duckdb::make_uniq<duckdb::BoundAggregateExpression>(agg_function,
-                                                        std::move(agg_children),
-                                                        nullptr,  // filter
-                                                        nullptr,  // bind_info
-                                                        duckdb::AggregateType::DISTINCT);
+  auto agg_expr = duckdb::make_uniq<duckdb::BoundAggregateExpression>(
+    duckdb::BoundAggregateFunction(agg_function),
+    std::move(agg_children),
+    nullptr,
+    // filter
+    nullptr,
+    // bind_info
+    duckdb::AggregateType::DISTINCT);
 
   result.aggregates.push_back(sirius::ast::from_duckdb(*agg_expr));
   return result;
@@ -504,7 +523,7 @@ inline AggregateExpressionResult create_count_distinct_struct_col_expressions(
 
   duckdb::ScalarFunction struct_fn("struct_pack", struct_arg_types, struct_return_type, nullptr);
   auto struct_expr = duckdb::make_uniq<duckdb::BoundFunctionExpression>(
-    struct_return_type, std::move(struct_fn), std::move(struct_children), nullptr);
+    duckdb::BoundScalarFunction(std::move(struct_fn)), std::move(struct_children), nullptr);
 
   // COUNT(DISTINCT struct_expr) aggregate expression
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> agg_children;
@@ -512,10 +531,12 @@ inline AggregateExpressionResult create_count_distinct_struct_col_expressions(
 
   auto agg_fn = MakeDummyAggregate("count", {struct_return_type}, duckdb::LogicalType::BIGINT);
   auto count_distinct_expr =
-    duckdb::make_uniq<duckdb::BoundAggregateExpression>(agg_fn,
+    duckdb::make_uniq<duckdb::BoundAggregateExpression>(duckdb::BoundAggregateFunction(agg_fn),
                                                         std::move(agg_children),
-                                                        nullptr,  // filter
-                                                        nullptr,  // bind_info
+                                                        nullptr,
+                                                        // filter
+                                                        nullptr,
+                                                        // bind_info
                                                         duckdb::AggregateType::DISTINCT);
   result.aggregates.push_back(sirius::ast::from_duckdb(*count_distinct_expr));
   return result;

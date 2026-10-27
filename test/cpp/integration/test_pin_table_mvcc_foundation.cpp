@@ -174,8 +174,9 @@ TEST_CASE_METHOD(PinMvccFixture,
   // default in-memory catalog's — each AttachedDatabase counts independently).
   run_ok("BEGIN TRANSACTION;");
   run_ok("CALL pin_table(format='duckdb', name='mvcc_vbase_t', tier='gpu');");
-  auto& pinned_catalog = duckdb::Catalog::GetCatalog(*con->context, attach_alias);
-  auto const expected  = duckdb::DuckTransaction::Get(*con->context, pinned_catalog).start_time;
+  auto& pinned_catalog =
+    duckdb::Catalog::GetCatalog(*con->context, duckdb::Identifier(attach_alias));
+  auto const expected = duckdb::DuckTransaction::Get(*con->context, pinned_catalog).start_time;
   run_ok("COMMIT;");
 
   auto probe = probe_entry(*con, "mvcc_vbase_t");
@@ -317,16 +318,6 @@ TEST_CASE_METHOD(PinMvccFixture,
   REQUIRE(after.n_cache == before.n_cache);
 
   run_ok("CALL unpin_table('mvcc_dml_t');");
-}
-
-TEST_CASE_METHOD(PinMvccFixture,
-                 "pin_table mvcc - attach_mvcc_metadata without an entry throws",
-                 "[integration][pin_table_mvcc]")
-{
-  auto sirius_ctx = sirius::test::get_registered_sirius_context(*con);
-  REQUIRE(sirius_ctx != nullptr);
-  REQUIRE_THROWS_AS(sirius_ctx->get_scan_manager().attach_mvcc_metadata("mvcc_no_such_entry", {}),
-                    std::invalid_argument);
 }
 
 //===----------------------------------------------------------------------===//

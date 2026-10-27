@@ -30,9 +30,9 @@ mysql-client = "*"
 client = {cmd = "mysql --host 127.0.0.1 --port 9030 --user root",description = "Open a MySQL client against the local FE (start it with `fe-run` in another terminal first)"}
 
 [feature.be.dependencies]
-# protoc for prost/tonic codegen of the Doris proto IDL, and the thrift compiler for the
-# thrift IDL (both under the `doris/` submodule).
+# Substrait 0.63 (pinned by substrait-explain 0.9) still invokes protoc during its build.
 libprotobuf = ">=7.35,<8"
+# The thrift compiler generates bindings for the thrift IDL under the `doris/` submodule.
 rust = "*"
 thrift-compiler = "0.22.*"
 
@@ -59,14 +59,14 @@ platforms = ["linux-64-cuda13", "linux-aarch64-cuda13"]
 
 [feature.engine.dependencies]
 cxx-compiler = "*"
-cuda-version = "13.2.*"
-libcudf = "==26.08.01"
-libcuvs = "==26.08.01"
+cuda-version = "13.4.*"
+libcudf = "==26.10.00"
+libcuvs = "==26.10.00"
 librmm = "*"
 libcurand-dev = "*"
 yaml-cpp = "*"
 libabseil = "*"
-duckdb = "=1.5.5"
+duckdb = "=2.0.0"
 spdlog = "1.8.*"
 sqlite = "3.*"
 liburing = "*"
@@ -86,14 +86,14 @@ mysql-client = "*"
 # builds the substrait extension against (DUCKDB_TAG), or the extension refuses to load.
 [feature.check.dependencies]
 python = "3.12.*"
-python-duckdb = "=1.5.5"
+python-duckdb = "=2.0.0"
 # For scripts/build-duckdb-substrait.sh; the C++ compiler stays the system one (as in CI).
 cmake = ">=3.28"
 ninja = ">=1.13.2,<2"
 ccache = ">=4.14,<5"
 
 [feature.check.tasks]
-duckdb-substrait-build = {cmd = "bash scripts/build-duckdb-substrait.sh",description = "Build DuckDB v1.5.5 with the repo's substrait consumer as a loadable extension (+ shell) under .duckdb-substrait/"}
+duckdb-substrait-build = {cmd = "bash scripts/build-duckdb-substrait.sh",description = "Build DuckDB v2.0.0 with the pinned pre-v2 substrait consumer as a loadable extension (+ shell) under .duckdb-substrait/"}
 tpch-expected = {cmd = "python scripts/validate_tpch_results.py expected",description = "Generate tests/expected/tpch-sf1/ from the parquet dataset with DuckDB (pass --data DIR)"}
 tpch-cpu-diff = {cmd = "bash scripts/cpu-diff.sh",description = "CPU differential: export the corpus plans, run them through DuckDB's substrait consumer, validate against the expected results"}
 

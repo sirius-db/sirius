@@ -81,10 +81,7 @@ class iceberg_metadata_connection {
 
   duckdb::SiriusContext::internal_connection& get() { return _conn; }
 
-  duckdb::unique_ptr<duckdb::MaterializedQueryResult> Query(std::string const& sql)
-  {
-    return _conn.Query(sql);
-  }
+  duckdb::unique_ptr<duckdb::QueryResult> Query(std::string const& sql) { return _conn.Query(sql); }
 
  private:
   duckdb::SiriusContext::internal_connection _conn;

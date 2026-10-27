@@ -1,22 +1,3 @@
-if(VCPKG_BUILD AND NOT PROJECT_IS_TOP_LEVEL)
-  install(FILES "${CMAKE_CURRENT_LIST_DIR}/sirius-cuda-fatbin.ld"
-          DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/sirius")
-endif()
-
-if(NOT PROJECT_IS_TOP_LEVEL)
-  install(
-    TARGETS sirius_extension
-            sirius_core
-            cucascade_static
-            cucascade_cudf_static
-            cucascade_topology_discovery_static
-            telemetry_bridge
-            simpatico
-    EXPORT "${DUCKDB_EXPORT_SET}"
-    LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
-    ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
-endif()
-
 include(CMakePackageConfigHelpers)
 configure_package_config_file(
   cmake/sirius-config.cmake.in "${CMAKE_CURRENT_BINARY_DIR}/sirius-config.cmake"
@@ -49,12 +30,23 @@ if(SIRIUS_BUILD_SHARED)
 endif()
 
 if(SIRIUS_BUILD_STATIC)
+  # Mark the conditional dependency as a target so exports apply our namespace.
+  foreach(target core_functions_extension parquet_extension)
+    get_target_property(links ${target} INTERFACE_LINK_LIBRARIES)
+    string(REPLACE ">:duckdb_static>" ">:$<TARGET_NAME:duckdb_static>>"
+                   exported_links "${links}")
+    if(exported_links STREQUAL links)
+      message(FATAL_ERROR "${target}: expected conditional duckdb_static link")
+    endif()
+    set_property(TARGET ${target} PROPERTY INTERFACE_LINK_LIBRARIES
+                                           "${exported_links}")
+  endforeach()
   # Source-built support libraries remain separate archives in the package.
   install(
     TARGETS sirius_core
             simpatico
+            simpatico_cache_identity
             duckdb_static
-            dummy_static_extension_loader
             core_functions_extension
             parquet_extension
             cucascade_static
@@ -84,7 +76,10 @@ if(SIRIUS_BUILD_STATIC)
     COMPONENT sirius_library)
   install(
     FILES "${CMAKE_CURRENT_LIST_DIR}/sirius-static-dependencies.cmake"
-          "${CMAKE_CURRENT_LIST_DIR}/sirius-cuda-fatbin.ld"
     DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/sirius"
+    COMPONENT sirius_library)
+  install(
+    FILES "${CMAKE_CURRENT_LIST_DIR}/sirius-cuda-fatbin.ld"
+    DESTINATION "${CMAKE_INSTALL_DATADIR}/sirius"
     COMPONENT sirius_library)
 endif()

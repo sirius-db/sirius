@@ -15,77 +15,65 @@
 CMAKE ?= cmake
 DUCKDB_DIR ?= duckdb
 TEST_BUILD_TARGET ?= sirius_unittest
-MAIN_BUILD_TARGETS ?= duckdb duckdb_local_extension_repo sirius_shared
+MAIN_BUILD_TARGETS ?= sirius_library
 
 BUILD_TARGETS := $(MAIN_BUILD_TARGETS) $(TEST_BUILD_TARGET)
 
-.PHONY: all release debug reldebug relwithdebinfo debug-release \
+.PHONY: all sirius-duckdb release debug reldebug relwithdebinfo debug-release \
 	clang-release clang-debug clang-relwithdebinfo clang-asan clang-tsan \
-	ci-release configure_ci set_duckdb_version \
-	test test_release test_debug test_reldebug test_ci-release clean list-presets \
+	test test_release test_debug test_reldebug clean list-presets \
 	s3-test s3-test-large s3-tpch \
 	s3-test-aws s3-test-aws-sigv4 s3-test-aws-broker \
 	slot-gate-test
 
-PRESETS_LINK := $(DUCKDB_DIR)/CMakePresets.json
+CMAKE_INPUTS := CMakePresets.json cmake/CMakePresets.json CMakeLists.txt $(wildcard cmake/*.cmake)
 
-# Inputs that should trigger a CMake re-configure
-CMAKE_INPUTS := cmake/CMakePresets.json CMakeLists.txt extension_config.cmake $(wildcard cmake/*.cmake)
+all: sirius-duckdb
 
-all: release
+sirius-duckdb: release
+	$(CMAKE) --install build/release --prefix "$(CURDIR)/build/release/install" --component sirius_library
+	$(MAKE) -C sirius-duckdb release SIRIUS_DUCKDB_LINKAGE=shared \
+		SIRIUS_INSTALL_DIR="$(CURDIR)/build/release/install" \
+		EXT_FLAGS="$(EXT_FLAGS) -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache"
 
-$(PRESETS_LINK): cmake/CMakePresets.json
-	rm -f $(DUCKDB_DIR)/CMakeUserPresets.json
-	ln -sf ../cmake/CMakePresets.json $@
-
-# Configure step — only re-runs when cmake inputs change
-build/%/build.ninja: $(CMAKE_INPUTS) | $(PRESETS_LINK)
-	cd $(DUCKDB_DIR) && $(CMAKE) --preset $*
+build/%/build.ninja: $(CMAKE_INPUTS)
+	$(CMAKE) --preset $* -DSIRIUS_DUCKDB_SOURCE_DIR="$(abspath $(DUCKDB_DIR))"
 
 release: build/release/build.ninja
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset release --target $(BUILD_TARGETS)
+	$(CMAKE) --build --preset release --target $(BUILD_TARGETS)
 
 debug: build/debug/build.ninja
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset debug --target $(BUILD_TARGETS)
+	$(CMAKE) --build --preset debug --target $(BUILD_TARGETS)
 
 reldebug: relwithdebinfo
 
 debug-release: relwithdebinfo
 
 relwithdebinfo: build/relwithdebinfo/build.ninja
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset relwithdebinfo --target $(BUILD_TARGETS)
+	$(CMAKE) --build --preset relwithdebinfo --target $(BUILD_TARGETS)
 
 clang-release: build/clang-release/build.ninja
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-release --target $(BUILD_TARGETS)
+	$(CMAKE) --build --preset clang-release --target $(BUILD_TARGETS)
 
 clang-debug: build/clang-debug/build.ninja
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-debug --target $(BUILD_TARGETS)
+	$(CMAKE) --build --preset clang-debug --target $(BUILD_TARGETS)
 
 clang-relwithdebinfo: build/clang-relwithdebinfo/build.ninja
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-relwithdebinfo --target $(BUILD_TARGETS)
+	$(CMAKE) --build --preset clang-relwithdebinfo --target $(BUILD_TARGETS)
 
 # AddressSanitizer build (RelWithDebInfo + clang). Run inside `pixi shell` (so
 # llvm-symbolizer is auto-detected on PATH) with:
 #   ASAN_OPTIONS="protect_shadow_gap=0:detect_leaks=0:halt_on_error=0:abort_on_error=1" \
-#     ./build/clang-asan/extension/sirius/test/cpp/sirius_unittest
+#     ./build/clang-asan/test/cpp/sirius_unittest
 clang-asan: build/clang-asan/build.ninja
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-asan --target $(BUILD_TARGETS)
+	$(CMAKE) --build --preset clang-asan --target $(BUILD_TARGETS)
 
 # ThreadSanitizer build (RelWithDebInfo + clang). Run inside `pixi shell` (so
 # llvm-symbolizer is auto-detected on PATH) with:
 #   TSAN_OPTIONS="suppressions=$$PWD/tsan.supp:ignore_noninstrumented_modules=1:halt_on_error=0:history_size=7:detect_deadlocks=0" \
-#     ./build/clang-tsan/extension/sirius/test/cpp/sirius_unittest
+#     ./build/clang-tsan/test/cpp/sirius_unittest
 clang-tsan: build/clang-tsan/build.ninja
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-tsan --target $(BUILD_TARGETS)
-
-ci-release: build/ci-release/build.ninja
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset ci-release --target $(MAIN_BUILD_TARGETS)
-
-configure_ci:
-	@echo "configure_ci step is skipped for this extension build..."
-
-set_duckdb_version:
-	@echo "DuckDB version is pinned by the submodule; skipping checkout of $(DUCKDB_GIT_VERSION)."
+	$(CMAKE) --build --preset clang-tsan --target $(BUILD_TARGETS)
 
 # The C++ unit tests run through scripts/run_unit_tests.py, as in CI. Pass options through
 # UNITTEST_ARGS, e.g. `make test UNITTEST_ARGS="--steps shards -- --order rand"`.
@@ -93,7 +81,8 @@ RUN_UNIT_TESTS = python3 scripts/run_unit_tests.py
 
 test: test_release
 
-test_release: release
+test_release: export SIRIUS_EXTENSION_PATH ?= $(CURDIR)/sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension
+test_release: sirius-duckdb
 	$(RUN_UNIT_TESTS) --build-dir build/release $(UNITTEST_ARGS)
 
 test_debug: debug
@@ -102,15 +91,11 @@ test_debug: debug
 test_reldebug: relwithdebinfo
 	$(RUN_UNIT_TESTS) --build-dir build/relwithdebinfo $(UNITTEST_ARGS)
 
-test_ci-release: ci-release
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset ci-release --target $(TEST_BUILD_TARGET)
-	$(RUN_UNIT_TESTS) --build-dir build/ci-release $(UNITTEST_ARGS)
-
 clean:
-	rm -rf build
+	rm -rf build sirius-duckdb/build
 
-list-presets: $(PRESETS_LINK)
-	cd $(DUCKDB_DIR) && $(CMAKE) --list-presets
+list-presets:
+	$(CMAKE) --list-presets
 
 # -----------------------------------------------------------------------------
 # S3 integration test gates
@@ -131,7 +116,7 @@ list-presets: $(PRESETS_LINK)
 #                     and cache.mode none in the second
 #                     (SIRIUS_TEST_S3_LARGE=1 makes the harness generate and
 #                     upload lineitem_sf10.parquet; needs the DuckDB CLI from
-#                     `make release`). The first process also runs the SF1 TPC-H
+#                     the sirius-duckdb build). The first process also runs the SF1 TPC-H
 #                     suite (SIRIUS_TEST_S3_TPCH=1) and the 1001-object glob case
 #                     (SIRIUS_TEST_S3_GLOB_SCALE=1).
 # `make s3-test-aws`  MANUAL real-AWS gate: runs the live [s3][aws] tests against
@@ -152,7 +137,7 @@ list-presets: $(PRESETS_LINK)
 #
 # See test/cpp/integration/s3/README.md for details.
 
-S3_TEST_BIN ?= build/release/extension/sirius/test/cpp/sirius_unittest
+S3_TEST_BIN ?= build/release/test/cpp/sirius_unittest
 
 # Query-lifecycle concurrency gates. Runs the hidden [slot_leak_gate] cases
 # (the worker-pressure gate needs a TPC-H lineitem parquet fixture) plus the

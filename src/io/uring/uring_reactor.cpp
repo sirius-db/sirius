@@ -20,6 +20,7 @@
 #include "exec/thread_util.hpp"
 #include "io/cache/types.hpp"
 #include "io/details/slot_pool.hpp"
+#include "io/io_errors.hpp"
 #include "io/io_request.hpp"
 #include "io/types.hpp"
 #include "io/uring/types.hpp"
@@ -567,22 +568,44 @@ std::unique_ptr<local_io_object> uring_reactor::create_io_object(std::string pat
     throw std::runtime_error("uring_reactor::create_io_object: unsupported path: " + path);
   }
 
-  file_descriptor buffered{::open(path.c_str(), O_RDONLY)};
-  if (!buffered) {
-    throw std::system_error(
-      errno, std::generic_category(), "uring_reactor::create_io_object: buffered open");
-  }
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    file_descriptor buffered{::open(path.c_str(), O_RDONLY)};
+    if (!buffered) {
+      throw std::system_error(
+        errno, std::generic_category(), "uring_reactor::create_io_object: buffered open");
+    }
 
-  file_descriptor direct{::open(path.c_str(), O_RDONLY | O_DIRECT)};
-  if (!direct) {
-    SIRIUS_LOG_WARN("uring_reactor: O_DIRECT unavailable for '{}': {}; using buffered I/O",
-                    path,
-                    strerror(errno));
-  }
+    // Reopen the owned descriptor, not the pathname: a concurrent rename must
+    // not pair the old buffered footer with a different O_DIRECT data file.
+    auto const direct_path = "/proc/self/fd/" + std::to_string(buffered.get());
+    file_descriptor direct{::open(direct_path.c_str(), O_RDONLY | O_DIRECT)};
+    if (!direct) {
+      SIRIUS_LOG_WARN("uring_reactor: O_DIRECT unavailable for '{}': {}; using buffered I/O",
+                      path,
+                      strerror(errno));
+    }
 
-  auto const file_size = size(buffered.get());
-  return std::make_unique<local_io_object>(
-    std::move(path), std::move(buffered), std::move(direct), file_size);
+    object_identity captured;
+    if (!capture_local_identity(buffered.get(), captured)) {
+      throw std::system_error(
+        errno, std::generic_category(), "uring_reactor::create_io_object: fstat");
+    }
+    if (direct) {
+      object_identity direct_identity;
+      if (!capture_local_identity(direct.get(), direct_identity)) {
+        throw descriptor_mismatch_error(
+          "uring_reactor::create_io_object: identity_descriptor_mismatch");
+      }
+      if (captured.device != direct_identity.device || captured.inode != direct_identity.inode) {
+        // Destroy the entire descriptor set before retrying the open.
+        continue;
+      }
+    }
+    auto const file_size = captured.size;
+    return std::make_unique<local_io_object>(
+      std::move(path), std::move(buffered), std::move(direct), file_size, "", std::move(captured));
+  }
+  throw descriptor_mismatch_error("uring_reactor::create_io_object: identity_descriptor_mismatch");
 }
 
 std::size_t uring_reactor::size(int native_handle)
