@@ -1848,12 +1848,12 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
       duckdb::JoinTypeToString(join_type));
   }
 
-  if (_mark_build_empty.load(std::memory_order_acquire)) {
+  // The empty-build latch can flip after a STANDARD orphan task (probe + synthesized empty build)
+  // was issued but before it runs: the hint reads the build pipeline's state twice. Such a task
+  // takes the normal dispatch below, whose empty build also yields definite FALSE marks.
+  if (_mark_build_empty.load(std::memory_order_acquire) && input_batches.size() == 1) {
     // No build row can make a comparison TRUE or UNKNOWN, even for a NULL probe key. Avoid
     // preparing keys or applying the normal probe-key null mask: every mark is valid FALSE.
-    if (input_batches.size() != 1) {
-      throw std::runtime_error("MARK join with empty build expects one probe batch");
-    }
     if (auto const* probe_data = input_batches[0].get_data(); probe_data != nullptr) {
       note_probe_bytes_counted(input_batches[0].get_batch_id(),
                                probe_data->get_uncompressed_data_size_in_bytes());

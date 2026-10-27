@@ -476,6 +476,85 @@ TEST_CASE("MARK join drains probe batches when its build pipeline emits no batch
   REQUIRE_FALSE(f.hash_join->get_next_task_hint().has_value());
 }
 
+// get_next_task_hint reads the build pipeline's state twice: the empty-build latch can see it
+// unfinished, then refresh_cross_schedule sees it finished and issues a STANDARD orphan task
+// (probe + synthesized empty build). A later hint latches the empty build before that task runs;
+// the queued task must still produce definite FALSE marks rather than fail the query.
+TEST_CASE("MARK join runs an orphan task issued before the empty-build latch",
+          "[physical_mark_join][cross_schedule]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space);
+
+  auto f          = create_mark_join();
+  auto build_repo = std::make_unique<cucascade::shared_data_repository>();
+  auto probe_repo = std::make_unique<cucascade::shared_data_repository>();
+  sirius::pipeline::pipeline_build_context ctx{nullptr, true};
+  auto build_pipeline = std::make_shared<finishable_mark_pipeline>(ctx);
+  auto probe_pipeline = std::make_shared<finishable_mark_pipeline>(ctx);
+  sirius::pipeline::sirius_pipeline_build_state build_state;
+  build_state.add_pipeline_operator(*build_pipeline, *f.hash_join->children[1]);
+  build_state.add_pipeline_operator(*probe_pipeline, *f.hash_join->children[0]);
+  auto attach_port = [&](std::string_view name,
+                         cucascade::shared_data_repository& repo,
+                         std::shared_ptr<finishable_mark_pipeline> source) {
+    auto port          = std::make_unique<sirius_physical_operator::port>();
+    port->type         = MemoryBarrierType::PARTIAL;
+    port->repo         = &repo;
+    port->src_pipeline = std::move(source);
+    f.hash_join->add_port(name, std::move(port));
+  };
+  attach_port("build", *build_repo, build_pipeline);
+  attach_port("default", *probe_repo, probe_pipeline);
+  f.hash_join->set_placement(
+    std::make_shared<const partition_placement>(partition_placement::unpinned(1)));
+
+  // Two probe batches, the probe finished, the build not yet finished: no hint latches.
+  auto probe_key = make_numeric_batch_with_nulls<int32_t>(
+    *space, {1, 0, 2}, {true, false, true}, cudf::type_id::INT32);
+  probe_repo->add_data_batch(concatenate_batches_horizontal(
+    {probe_key, make_numeric_batch<int32_t>(*space, {10, 20, 30}, cudf::type_id::INT32)}, *space));
+  probe_repo->add_data_batch(make_two_column_batch<int32_t, int32_t>(
+    *space, {7}, {70}, cudf::type_id::INT32, std::nullopt, cudf::type_id::INT32));
+  probe_pipeline->finished = true;
+  auto hint                = f.hash_join->get_next_task_hint();
+  REQUIRE(hint.has_value());
+  REQUIRE(hint->hint == TaskCreationHint::WAITING_FOR_INPUT_DATA);
+  REQUIRE(hint->producer == f.hash_join->children[1].get());
+
+  // The build finishes empty between the latch check and the cross schedule: the issued task is a
+  // STANDARD orphan carrying a synthesized empty build batch.
+  build_pipeline->finished = true;
+  auto orphan              = f.hash_join->get_next_task_input_data();
+  REQUIRE(orphan != nullptr);
+  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*orphan).get_data_batches().size() == 2);
+
+  // The next hint latches the empty build while the orphan task is still queued.
+  hint = f.hash_join->get_next_task_hint();
+  REQUIRE(hint.has_value());
+  REQUIRE(hint->hint == TaskCreationHint::READY);
+
+  auto mark_of = [&](operator_data const& input) {
+    auto output = f.hash_join->execute(input, cudf::get_default_stream());
+    auto view   = sirius::get_cudf_table_view(
+      *dynamic_cast<const pipelineable_operator_data&>(*output).get_data_batches()[0]);
+    auto mark = view.column(view.num_columns() - 1);
+    REQUIRE(mark.null_count() == 0);
+    return copy_column_to_host<bool>(mark);
+  };
+  std::vector<std::vector<bool>> marks;
+  marks.push_back(mark_of(*orphan));
+  auto latched = f.hash_join->get_next_task_input_data();
+  REQUIRE(latched != nullptr);
+  marks.push_back(mark_of(*latched));
+  std::sort(
+    marks.begin(), marks.end(), [](auto const& a, auto const& b) { return a.size() < b.size(); });
+  // Every mark against an empty build is a definite FALSE, NULL probe keys included.
+  REQUIRE(marks[0] == std::vector<bool>{false});
+  REQUIRE(marks[1] == std::vector<bool>{false, false, false});
+  REQUIRE_FALSE(f.hash_join->get_next_task_hint().has_value());
+}
+
 TEST_CASE("sirius_physical_hash_join mark join - duplicate keys on right side",
           "[physical_mark_join]")
 {
