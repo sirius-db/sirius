@@ -16,6 +16,7 @@
 
 #pragma once
 #include "ducklake/preparation_identity.hpp"
+#include "sirius_config.hpp"
 
 #include <duckdb/planner/filter/expression_filter.hpp>
 #include <duckdb/planner/table_filter_set.hpp>
@@ -32,6 +33,7 @@ struct preparation_gate;
 // original table or physical file. Omitted output means all selected columns;
 // an empty output retains only a row carrier after filtering.
 struct unit_scan_options {
+  size_t scan_task_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE;
   duckdb::unique_ptr<duckdb::TableFilterSet> filters;
   std::optional<std::vector<size_t>> output_columns;
   // A whole-scan binding supplies common immutable policy and unique credit keys.

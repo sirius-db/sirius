@@ -22,6 +22,7 @@
 #include "ducklake/inline_unit_ingestible.hpp"
 #include "ducklake/parquet_unit_ingestible.hpp"
 #include "ducklake/preparation_gate.hpp"
+#include "log/logging.hpp"
 #include "op/scan/table_scan/split_validation.hpp"
 
 #include <cudf/column/column_factories.hpp>
@@ -146,19 +147,17 @@ class scan_validator final : public scan::split_validator {
 class unit_coalescer final : public scan::batch_coalescer {
   std::shared_ptr<scan_owner const> owner_;
   bool owner_lane_;
+  size_t target_batch_bytes_;
   bool produced_ = false;
   std::shared_ptr<unit_state> active_;
   scan::batch_coalescer* inner_ = nullptr;
 
  public:
-  unit_coalescer(std::shared_ptr<scan_owner const> o, bool owner_lane)
-    : owner_(std::move(o)), owner_lane_(owner_lane)
+  unit_coalescer(std::shared_ptr<scan_owner const> o, bool owner_lane, size_t target_batch_bytes)
+    : owner_(std::move(o)), owner_lane_(owner_lane), target_batch_bytes_(target_batch_bytes)
   {
   }
-  size_t target_batch_bytes() const noexcept override
-  {
-    return sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE;
-  }
+  size_t target_batch_bytes() const noexcept override { return target_batch_bytes_; }
   size_t retained_bytes() const noexcept override { return inner_ ? inner_->retained_bytes() : 0; }
   std::unique_ptr<scan::scan_info> partial_emit() override
   {
@@ -289,12 +288,19 @@ struct scan_ingestible::impl {
   std::shared_ptr<unit_state> discover(io::ioctx_resolver resolve)
   {
     auto descriptor = binding->unit_at(next_file);
+    while (descriptor && binding->can_prune_unit(next_file)) {
+      SIRIUS_LOG_DEBUG("DuckLake Top-N pruned file before open: {}", descriptor->input.path);
+      if (next_file == std::numeric_limits<uint64_t>::max())
+        throw std::overflow_error("DuckLake file index exhausted");
+      descriptor = binding->unit_at(++next_file);
+    }
     if (!descriptor) {
       done = true;
       return {};
     }
     auto state = std::make_shared<unit_state>();
     unit_scan_options opts;
+    opts.scan_task_batch_size = options.scan_task_batch_size;
     if (options.filters) opts.filters = options.filters->Copy();
     opts.output_columns = options.output_columns;
     opts.profiles       = options.profiles;
@@ -447,7 +453,12 @@ sm::unit_envelope scan_ingestible::envelope()
   return result;
 }
 
-void scan_ingestible::preflight_for_query() { impl_->binding->bind_execution_owner(); }
+void scan_ingestible::preflight_for_query()
+{
+  impl_->binding->bind_execution_owner();
+  if (impl_->options.filters)
+    impl_->binding->configure_filters(impl_->selected, *impl_->options.filters);
+}
 bool scan_ingestible::has_processed_all_metadata() const { return impl_->done; }
 scan_ingestible::metadata_scan_task_t scan_ingestible::next_split_provider(io::ioctx_resolver)
 {
@@ -471,15 +482,17 @@ std::vector<scan_ingestible::preparation_source> scan_ingestible::make_preparati
     source.close = [state = impl_, domain] {
       if (auto unit = state->current.load()) state->close_lanes(unit, domain);
     };
-    source.coalescer = std::make_unique<unit_coalescer>(
-      impl_->owner, domain == sm::preparation_execution_domain::query_owner);
+    source.coalescer =
+      std::make_unique<unit_coalescer>(impl_->owner,
+                                       domain == sm::preparation_execution_domain::query_owner,
+                                       impl_->options.scan_task_batch_size);
     result.push_back(std::move(source));
   }
   return result;
 }
 std::unique_ptr<scan::batch_coalescer> scan_ingestible::create_batch_coalescer() const
 {
-  return std::make_unique<unit_coalescer>(impl_->owner, true);
+  return std::make_unique<unit_coalescer>(impl_->owner, true, impl_->options.scan_task_batch_size);
 }
 std::shared_ptr<sm::preparation_admission> scan_ingestible::preparation_admission() const
 {

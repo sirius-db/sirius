@@ -28,12 +28,18 @@
 #include <duckdb/main/config.hpp>
 #include <duckdb/optimizer/optimizer.hpp>
 #include <duckdb/planner/binder.hpp>
+#include <duckdb/planner/expression/bound_function_expression.hpp>
+#include <duckdb/planner/expression_iterator.hpp>
+#include <duckdb/planner/filter/expression_filter.hpp>
+#include <duckdb/planner/filter/table_filter_functions.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
+#include <duckdb/planner/operator/logical_top_n.hpp>
 #include <log/logging.hpp>
 #include <util/duckdb_error_message.hpp>
 
 #include <cstddef>
 #include <exception>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -46,6 +52,94 @@ bool gpu_execution_enabled(const duckdb::ClientContext& context)
   duckdb::Value setting;
   auto lookup_result = context.TryGetCurrentSetting("gpu_execution", setting);
   return lookup_result && !setting.IsNull() && setting.GetValue<bool>();
+}
+
+using top_n_filter_copies = std::unordered_map<duckdb::DynamicFilterData const*,
+                                               duckdb::shared_ptr<duckdb::DynamicFilterData>>;
+
+void copy_top_n_states(duckdb::LogicalOperator const& from,
+                       duckdb::LogicalOperator& to,
+                       top_n_filter_copies& filters)
+{
+  if (from.type == duckdb::LogicalOperatorType::LOGICAL_TOP_N) {
+    auto const& original = from.Cast<duckdb::LogicalTopN>().dynamic_filter;
+    if (original) {
+      std::lock_guard<duckdb::mutex> guard(original->lock);
+      auto fresh = duckdb::make_shared_ptr<duckdb::DynamicFilterData>(original->comparison_type,
+                                                                      original->constant);
+      to.Cast<duckdb::LogicalTopN>().dynamic_filter = fresh;
+      filters.emplace(original.get(), std::move(fresh));
+    }
+  }
+  for (size_t i = 0; i < from.children.size(); ++i)
+    copy_top_n_states(*from.children[i], *to.children[i], filters);
+}
+
+void reconnect_top_n_expression(duckdb::Expression const& from,
+                                duckdb::Expression& to,
+                                top_n_filter_copies const& filters)
+{
+  if (from.GetExpressionClass() != to.GetExpressionClass())
+    throw duckdb::NotImplementedException("Plan copy changed the runtime filter expression");
+  if (from.GetExpressionClass() == duckdb::ExpressionClass::BOUND_FUNCTION) {
+    auto const& original = from.Cast<duckdb::BoundFunctionExpression>();
+    auto& copied         = to.Cast<duckdb::BoundFunctionExpression>();
+    if (original.Function().GetName() != copied.Function().GetName())
+      throw duckdb::NotImplementedException("Plan copy changed the runtime filter function");
+    // Optional filters keep their predicate in bind data, not in the argument list.
+    auto optional_child = duckdb::ExpressionFilter::GetOptionalFilterChild(from);
+    if (optional_child && copied.BindInfo()) {
+      duckdb::Expression* target = nullptr;
+      if (original.Function().GetName() == duckdb::OptionalFilterScalarFun::NAME)
+        target = copied.BindInfoMutable()
+                   ->Cast<duckdb::OptionalFilterFunctionData>()
+                   .child_filter_expr.get();
+      else if (original.Function().GetName() == duckdb::SelectivityOptionalFilterScalarFun::NAME)
+        target = copied.BindInfoMutable()
+                   ->Cast<duckdb::SelectivityOptionalFilterFunctionData>()
+                   .child_filter_expr.get();
+      if (target) reconnect_top_n_expression(*optional_child, *target, filters);
+    }
+
+    if (original.Function().GetName() == duckdb::DynamicFilterScalarFun::NAME &&
+        original.BindInfo()) {
+      auto const& state =
+        original.BindInfo()->Cast<duckdb::DynamicFilterFunctionData>().filter_data;
+      auto found = filters.find(state.get());
+      if (found != filters.end()) {
+        copied.BindInfoMutable() =
+          duckdb::make_uniq<duckdb::DynamicFilterFunctionData>(found->second);
+      }
+    }
+  }
+  std::vector<duckdb::Expression const*> children;
+  duckdb::ExpressionIterator::EnumerateChildren(
+    from, [&](duckdb::Expression const& child) { children.push_back(&child); });
+  size_t index = 0;
+  duckdb::ExpressionIterator::EnumerateChildren(to, [&](duckdb::Expression& child) {
+    if (index >= children.size())
+      throw duckdb::NotImplementedException("Plan copy changed the runtime filter children");
+    reconnect_top_n_expression(*children[index++], child, filters);
+  });
+  if (index != children.size())
+    throw duckdb::NotImplementedException("Plan copy changed the runtime filter children");
+}
+
+void reconnect_top_n_filters(duckdb::LogicalOperator const& from,
+                             duckdb::LogicalOperator& to,
+                             top_n_filter_copies const& filters)
+{
+  if (from.type == duckdb::LogicalOperatorType::LOGICAL_GET) {
+    auto& copied = to.Cast<duckdb::LogicalGet>().table_filters;
+    for (auto const& entry : from.Cast<duckdb::LogicalGet>().table_filters) {
+      auto& target = copied.GetFilterByColumnIndexMutable(entry.GetIndex());
+      reconnect_top_n_expression(*entry.Filter().Cast<duckdb::ExpressionFilter>().expr,
+                                 *target.Cast<duckdb::ExpressionFilter>().expr,
+                                 filters);
+    }
+  }
+  for (size_t i = 0; i < from.children.size(); ++i)
+    reconnect_top_n_filters(*from.children[i], *to.children[i], filters);
 }
 
 void preserve_parquet_bindings(duckdb::LogicalOperator const& from,
@@ -113,6 +207,11 @@ duckdb::unique_ptr<duckdb::LogicalOperator> copy_logical_plan(duckdb::LogicalOpe
 {
   auto copy = plan.Copy(context);
   preserve_parquet_bindings(plan, *copy, context);
+  // Serialization omits runtime state. Reconnect the original bindings with
+  // independent, uninitialized filters for this execution.
+  top_n_filter_copies filters;
+  copy_top_n_states(plan, *copy, filters);
+  if (!filters.empty()) reconnect_top_n_filters(plan, *copy, filters);
   if (!copy_cardinality_estimates(plan, *copy)) {
     SIRIUS_LOG_DEBUG(
       "Transparent execution: plan copy differs in shape from the original, some cardinality "

@@ -77,6 +77,9 @@ class binding_handle : public std::enable_shared_from_this<binding_handle> {
   // Planning may finish on a different thread. Before any provider discovery,
   // the statement preparation boundary transfers this private reader factory to Q.
   void bind_execution_owner();
+  // Apply provider filtering to this execution's private list before discovery.
+  void configure_filters(std::vector<size_t> const&, duckdb::TableFilterSet&);
+  bool can_prune_unit(uint64_t file_index) const;
   // Query/provider owner lane only. Lazily expand the original provider list;
   // return at most one descriptor, preserving its original index. No CPU scan.
   std::optional<unit_descriptor> unit_at(uint64_t original_file_index) const;

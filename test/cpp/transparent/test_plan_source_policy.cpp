@@ -177,6 +177,9 @@ TEST_CASE("Source policy treats failed node extraction as incomplete",
   REQUIRE_FALSE(policy.discovery_complete);
   REQUIRE_FALSE(policy.cpu_replay_permitted());
   REQUIRE(policy.reason().find("incomplete") != std::string::npos);
+  REQUIRE(policy.discovery_error);
+  REQUIRE_THROWS_WITH(require_cpu_replay(policy, "", "GPU scan unsupported"),
+                      bind.file_list ? "inventory extraction failed" : "Missing bound file list");
 }
 
 TEST_CASE("Source policy visits physical GetChildren and forbids a failed walk",
@@ -290,6 +293,12 @@ TEST_CASE("Source policy retains known S3 evidence after a sibling extraction fa
   REQUIRE_FALSE(policy.cpu_replay_permitted());
   REQUIRE(policy.reads_sirius_owned_s3());
   REQUIRE(policy.reason().find("remote_after_failure") != std::string::npos);
+  REQUIRE(policy.discovery_error);
+  REQUIRE_THROWS_WITH(require_cpu_replay(policy, "", "boom"),
+                      Catch::Matchers::ContainsSubstring("S3 CPU fallback is not supported"));
+  policy.scans = {{"stream", byte_source_class::stream, false, "stream source has no CPU body"}};
+  REQUIRE_THROWS_WITH(require_cpu_replay(policy, "", "boom"),
+                      Catch::Matchers::ContainsSubstring("stream source has no CPU body"));
 }
 
 // These cases exercise the explicit entry point. Its window-entry failure happens
@@ -343,8 +352,7 @@ TEST_CASE("Explicit replay rejects bind-time source discovery failure before win
   REQUIRE(result);
   REQUIRE(result->HasError());
   INFO((result->HasError() ? result->GetError() : ""));
-  CHECK(result->GetError().find("source discovery incomplete") != std::string::npos);
-  CHECK(result->GetError().find("Sirius GPU runtime is unavailable") != std::string::npos);
+  CHECK(result->GetError().find("inventory extraction failed") != std::string::npos);
   CHECK(result->GetError().find("unexpected CPU source execution") == std::string::npos);
   CHECK(replays == 0);
   CHECK(context->get_runtime_health() == duckdb::SiriusContext::runtime_health::UNAVAILABLE);
@@ -559,13 +567,13 @@ TEST_CASE("Explicit replay validates sources after a view is replaced",
       CHECK(result->GetError().find("direct CPU replay exception") != std::string::npos);
     } else if (fallback && std::string_view(source) == "error") {
       CHECK(result->GetError().find("CPU replay source failed") != std::string::npos);
-    } else {
+    } else if (!(fallback && std::string_view(source) == "incomplete")) {
       CHECK(result->GetError().find("Sirius GPU runtime is unavailable") != std::string::npos);
     }
     if (fallback && std::string_view(source) != "error" && std::string_view(source) != "throw") {
       CHECK(result->GetError().find(std::string_view(source) == "s3"
                                       ? "S3 CPU fallback is not supported"
-                                      : "source discovery incomplete") != std::string::npos);
+                                      : "inventory extraction failed") != std::string::npos);
     } else if (!fallback) {
       CHECK(result->GetError().find("SiriusExecuteQuery error:") != std::string::npos);
     }
@@ -642,8 +650,7 @@ TEST_CASE("Transparent finalize preserves GPU errors before incomplete-source ve
       INFO(result->GetError());
       CHECK(precedence_bind_count >= 2);
       if (fallback) {
-        CHECK(result->GetError().find(
-                "CPU fallback is not supported: source discovery incomplete") != std::string::npos);
+        CHECK(result->GetError().find("inventory extraction failed") != std::string::npos);
       } else {
         CHECK(result->GetError().find("CPU fallback is not supported") == std::string::npos);
         if (replan_error == "unavailable") {

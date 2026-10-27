@@ -17,8 +17,9 @@
 #include "op/sirius_physical_top_n.hpp"
 
 #include "data/data_batch_utils.hpp"
+#include "duckdb/common/value_operations/value_operations.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "duckdb/planner/filter/dynamic_filter.hpp"
+#include "duckdb/planner/filter/table_filter_functions.hpp"
 #include "op/cudf_sort_order.hpp"
 #include "op/sirius_physical_order.hpp"
 #include "op/sirius_physical_top_n_merge.hpp"
@@ -30,19 +31,127 @@
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/cudf_utils.hpp>
+#include <cudf/scalar/scalar.hpp>
 #include <cudf/sorting.hpp>
+#include <cudf/wrappers/timestamps.hpp>
 
 #include <rmm/resource_ref.hpp>
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
 
 #include <algorithm>
+#include <limits>
 #include <memory>
 
 namespace sirius {
 namespace op {
 
 namespace {
+
+// Unsupported boundary types leave the optional filter uninitialized.
+duckdb::Value top_n_boundary(cudf::scalar const& scalar, ::cuda::stream_ref stream)
+{
+  if (!scalar.is_valid(stream)) return duckdb::Value();
+  switch (scalar.type().id()) {
+    case cudf::type_id::INT8:
+      return duckdb::Value::TINYINT(
+        static_cast<cudf::numeric_scalar<int8_t> const&>(scalar).value(stream));
+    case cudf::type_id::INT16:
+      return duckdb::Value::SMALLINT(
+        static_cast<cudf::numeric_scalar<int16_t> const&>(scalar).value(stream));
+    case cudf::type_id::INT32:
+      return duckdb::Value::INTEGER(
+        static_cast<cudf::numeric_scalar<int32_t> const&>(scalar).value(stream));
+    case cudf::type_id::INT64:
+      return duckdb::Value::BIGINT(
+        static_cast<cudf::numeric_scalar<int64_t> const&>(scalar).value(stream));
+    case cudf::type_id::UINT8:
+      return duckdb::Value::UTINYINT(
+        static_cast<cudf::numeric_scalar<uint8_t> const&>(scalar).value(stream));
+    case cudf::type_id::UINT16:
+      return duckdb::Value::USMALLINT(
+        static_cast<cudf::numeric_scalar<uint16_t> const&>(scalar).value(stream));
+    case cudf::type_id::UINT32:
+      return duckdb::Value::UINTEGER(
+        static_cast<cudf::numeric_scalar<uint32_t> const&>(scalar).value(stream));
+    case cudf::type_id::UINT64:
+      return duckdb::Value::UBIGINT(
+        static_cast<cudf::numeric_scalar<uint64_t> const&>(scalar).value(stream));
+    case cudf::type_id::TIMESTAMP_DAYS:
+      return duckdb::Value::DATE(
+        duckdb::date_t{static_cast<cudf::timestamp_scalar<cudf::timestamp_D> const&>(scalar)
+                         .value(stream)
+                         .time_since_epoch()
+                         .count()});
+    case cudf::type_id::TIMESTAMP_SECONDS:
+      return duckdb::Value::TIMESTAMPSEC(duckdb::timestamp_sec_t{
+        static_cast<cudf::timestamp_scalar<cudf::timestamp_s> const&>(scalar)
+          .value(stream)
+          .time_since_epoch()
+          .count()});
+    case cudf::type_id::TIMESTAMP_MILLISECONDS:
+      return duckdb::Value::TIMESTAMPMS(duckdb::timestamp_ms_t{
+        static_cast<cudf::timestamp_scalar<cudf::timestamp_ms> const&>(scalar)
+          .value(stream)
+          .time_since_epoch()
+          .count()});
+    case cudf::type_id::TIMESTAMP_MICROSECONDS:
+      return duckdb::Value::TIMESTAMP(
+        duckdb::timestamp_t{static_cast<cudf::timestamp_scalar<cudf::timestamp_us> const&>(scalar)
+                              .value(stream)
+                              .time_since_epoch()
+                              .count()});
+    case cudf::type_id::TIMESTAMP_NANOSECONDS:
+      return duckdb::Value::TIMESTAMPNS(duckdb::timestamp_ns_t{
+        static_cast<cudf::timestamp_scalar<cudf::timestamp_ns> const&>(scalar)
+          .value(stream)
+          .time_since_epoch()
+          .count()});
+    case cudf::type_id::STRING:
+      return duckdb::Value(static_cast<cudf::string_scalar const&>(scalar).to_string(stream));
+    default: return duckdb::Value();
+  }
+}
+
+void publish_top_n_boundary(cudf::table_view sorted,
+                            duckdb::vector<duckdb::BoundOrderByNode> const& orders,
+                            size_t limit,
+                            size_t offset,
+                            duckdb::shared_ptr<duckdb::DynamicFilterData> const& filter,
+                            ::cuda::stream_ref stream,
+                            rmm::device_async_resource_ref mr)
+{
+  // A partial batch can establish a safe bound only after retaining LIMIT + OFFSET rows.
+  if (!filter || !limit || offset > std::numeric_limits<size_t>::max() - limit ||
+      static_cast<size_t>(sorted.num_rows()) < limit + offset || orders.empty())
+    return;
+  auto const& order = orders.front();
+  if (order.null_order != duckdb::OrderByNullType::NULLS_LAST ||
+      order.expression->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF)
+    return;
+  auto index  = order.expression->Cast<duckdb::BoundReferenceExpression>().Index();
+  auto scalar = cudf::get_element(sorted.column(index), limit + offset - 1, stream, mr);
+  auto value  = top_n_boundary(*scalar, stream);
+  if (value.IsNull() || value.type() != order.expression->GetReturnType()) return;
+  bool ascending = order.type == duckdb::OrderType::ASCENDING;
+  std::lock_guard<duckdb::mutex> guard(filter->lock);
+  // Internal key compression can change the sort value's domain.
+  if (value.type() != filter->constant.type()) return;
+  auto comparison = filter->comparison_type;
+  bool compatible = ascending
+                      ? (comparison == duckdb::ExpressionType::COMPARE_LESSTHAN ||
+                         comparison == duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO)
+                      : (comparison == duckdb::ExpressionType::COMPARE_GREATERTHAN ||
+                         comparison == duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO);
+  if (!compatible) return;
+  if (!filter->initialized ||
+      (ascending ? duckdb::ValueOperations::LessThan(value, filter->constant)
+                 : duckdb::ValueOperations::GreaterThan(value, filter->constant))) {
+    filter->constant    = std::move(value);
+    filter->initialized = true;
+    SIRIUS_LOG_DEBUG("Top-N published boundary: {}", filter->constant.ToString());
+  }
+}
 
 //! Selects the first `keep_rows` rows of `input` under the given lexicographic ordering.
 //!
@@ -175,6 +284,7 @@ sirius_physical_top_n::sirius_physical_top_n(
     offset(offset),
     dynamic_filter(std::move(dynamic_filter_p))
 {
+  if (dynamic_filter) dynamic_filter->Reset();
 }
 
 sirius_physical_top_n::~sirius_physical_top_n() {}
@@ -207,6 +317,13 @@ std::unique_ptr<operator_data> sirius_physical_top_n::execute(const operator_dat
     input_batch.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
   auto output_table = compute_top_n_table(
     input_table_view, orders, limit, offset, stream, space->get_default_allocator());
+  publish_top_n_boundary(output_table->view(),
+                         orders,
+                         limit,
+                         offset,
+                         dynamic_filter,
+                         stream,
+                         space->get_default_allocator());
   // ro released at end of function
 
   std::vector<std::shared_ptr<cucascade::data_batch>> outputs;
@@ -311,6 +428,13 @@ std::unique_ptr<operator_data> sirius_physical_top_n_merge::execute(const operat
 
   auto output_table = compute_top_n_table(
     combined->view(), orders, limit, offset, stream, space->get_default_allocator());
+  publish_top_n_boundary(output_table->view(),
+                         orders,
+                         limit,
+                         offset,
+                         dynamic_filter,
+                         stream,
+                         space->get_default_allocator());
   if (output_table->num_rows() <= static_cast<cudf::size_type>(offset)) {
     output_table = cudf::empty_like(output_table->view());
   } else if (offset > 0) {

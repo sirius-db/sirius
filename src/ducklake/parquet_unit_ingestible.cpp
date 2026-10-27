@@ -65,8 +65,9 @@ std::unique_ptr<plain_info> make_info(unit_descriptor const& unit,
       (count_only && (!fields.empty() || !required_columns.empty())) ||
       !parquet_unit_dependencies_supported(unit))
     throw std::invalid_argument("DuckLake plain Parquet unit has unqualified dependencies");
-  auto info         = std::make_unique<plain_info>();
-  info->contract_id = contract;
+  auto info                    = std::make_unique<plain_info>();
+  info->approximate_batch_size = options.scan_task_batch_size;
+  info->contract_id            = contract;
   if (options.profiles) info->profiles = std::move(options.profiles);
   info->identities          = std::move(options.identities);
   info->owns_admission      = options.owns_admission;

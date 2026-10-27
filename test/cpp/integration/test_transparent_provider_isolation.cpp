@@ -861,6 +861,53 @@ std::vector<std::string> ducklake_result_bag(duckdb::QueryResult& result)
   return rows;
 }
 }  // namespace
+TEST_CASE("DuckLake Parquet scans honor the configured batch target",
+          "[isolated_context][ducklake][ducklake_sql]")
+{
+  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
+  auto target = GENERATE(uint64_t{1}, uint64_t{64 * 1024 * 1024});
+  INFO(target);
+  sirius::test::scoped_temp_directory disk;
+  auto config = YAML::LoadFile(lake_config().string());
+  config["sirius"]["operator_params"]["scan_task_batch_size"] = target;
+  auto path = std::filesystem::path(disk.directory) / "batch.yaml";
+  {
+    std::ofstream output(path);
+    output << config;
+  }
+  sirius::test::shared_test_env env(path);
+  auto con = env.make_connection();
+  if (!load_ducklake(con)) return;
+  attach_lake(con, disk.directory);
+  query(con, "SET gpu_execution=false");
+  query(con, "CALL lake.set_option('data_inlining_row_limit', 0)");
+  query(con, "CREATE TABLE lake.q AS SELECT i::BIGINT id FROM range(524288) r(i)");
+  auto sql      = std::string("SELECT SUM(id) FROM lake.q");
+  auto expected = ducklake_result_bag(*query(con, sql));
+  auto runtime  = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(runtime);
+  auto counters         = runtime->physical_counters();
+  counters->track_units = true;
+  std::atomic<unsigned> decoded{0};
+  counters->parquet_phase_for_testing = [&](std::string const&, bool footer) {
+    if (!footer) ++decoded;
+  };
+  auto clear =
+    std::shared_ptr<void>(nullptr, [&](void*) { counters->parquet_phase_for_testing = {}; });
+  query(con, "SET gpu_execution=true");
+  query(con, "SET enable_duckdb_fallback=false");
+  for (auto const& statement :
+       {sql, "CALL gpu_execution(" + duckdb::Value(sql).ToSQLString() + ")"}) {
+    decoded = 0;
+    CHECK(ducklake_result_bag(*query(con, statement)) == expected);
+    if (target == 1) {
+      CHECK(decoded.load() > 1);
+    } else {
+      CHECK(decoded.load() == 1);
+    }
+  }
+}
+
 TEST_CASE("Production DuckLake SQL lowers complete bound scans",
           "[isolated_context][ducklake][ducklake_sql]")
 {
@@ -1952,4 +1999,213 @@ TEST_CASE("DuckLake result fragments execute original bindings without CPU repla
   auto after = runtime->get_transparent_execution_stats();
   CHECK(after.fallbacks == before.fallbacks);
   CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
+}
+
+TEST_CASE("DuckLake scalar subqueries and floating predicates match CPU results",
+          "[isolated_context][ducklake][ducklake_scalar_nan]")
+{
+  auto parquet = GENERATE(false, true);
+  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
+  sirius::test::scoped_temp_directory disk;
+  sirius::test::shared_test_env env(lake_config());
+  auto con = env.make_connection();
+  if (!load_ducklake(con)) return;
+  query(con, "SET gpu_execution=false");
+  attach_lake(con, disk.directory);
+  query(con, "CALL lake.set_option('data_inlining_row_limit',100)");
+  query(con, "CREATE TABLE lake.scalar_value AS SELECT 42::BIGINT AS x");
+  query(con, "CREATE TABLE lake.floats(f FLOAT, d DOUBLE)");
+  query(con,
+        "INSERT INTO lake.floats SELECT x::FLOAT,x FROM (VALUES "
+        "('-inf'::DOUBLE),(-1),(0),('inf'),('NaN'),(NULL)) t(x)");
+  if (parquet) query(con, "CALL ducklake_flush_inlined_data('lake')");
+  std::vector<std::string> queries{"SELECT (SELECT x FROM lake.scalar_value)",
+                                   "SELECT first(x),count(*) FROM lake.scalar_value",
+                                   "SELECT (SELECT x FROM lake.scalar_value WHERE x%2=1)",
+                                   "SELECT first(NULL::BIGINT),count(*) FROM lake.scalar_value"};
+  for (auto column : {std::string("f"), std::string("d")}) {
+    for (auto op : {"=", "<>", ">", ">=", "<", "<=", "IS DISTINCT FROM", "IS NOT DISTINCT FROM"}) {
+      queries.push_back("SELECT a." + column + " " + op + " b." + column +
+                        " FROM lake.floats a CROSS JOIN lake.floats b");
+      queries.push_back("SELECT count(*) FROM lake.floats WHERE " + column + " " + op + " 'NaN'");
+    }
+    for (auto predicate : {" BETWEEN '-inf' AND 'NaN'",
+                           " IN ('NaN', 1)",
+                           " NOT IN ('NaN', 1)",
+                           " IN ('NaN', NULL)",
+                           " NOT IN ('NaN', NULL)",
+                           " > 1e300"}) {
+      queries.push_back("SELECT " + column + predicate + " FROM lake.floats");
+      queries.push_back("SELECT count(*) FROM lake.floats WHERE " + column + predicate);
+    }
+  }
+  std::vector<std::vector<std::string>> expected;
+  for (auto const& sql : queries)
+    expected.push_back(ducklake_result_bag(*query(con, sql)));
+  query(con, "SET gpu_execution=true");
+  query(con, "SET enable_duckdb_fallback=false");
+  for (int repeat = 0; repeat < 3; ++repeat) {
+    for (size_t i = 0; i < queries.size(); ++i) {
+      INFO(queries[i]);
+      auto before = get_transparent_execution_stats(con);
+      CHECK(ducklake_result_bag(*query(con, queries[i])) == expected[i]);
+      auto after = get_transparent_execution_stats(con);
+      CHECK(after.executions == before.executions + 1);
+      CHECK(after.fallbacks == before.fallbacks);
+      CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
+    }
+  }
+}
+
+TEST_CASE("DuckLake preserves discovery errors when GPU fallback is refused",
+          "[isolated_context][ducklake][ducklake_discovery_error]")
+{
+  sirius::test::scoped_temp_directory disk;
+  sirius::test::shared_test_env env(lake_config());
+  auto con = env.make_connection();
+  if (!load_ducklake(con)) return;
+  query(con, "SET gpu_execution=false");
+  auto attach = "ATTACH 'ducklake:" + disk.directory + "/meta.db' AS lake (DATA_PATH '" +
+                disk.directory + "/data', METADATA_CATALOG 'meta', DATA_INLINING_ROW_LIMIT 0)";
+  query(con, attach);
+  query(con, "CREATE TABLE lake.t(id INTEGER)");
+  query(con, "INSERT INTO lake.t VALUES (1), (2)");
+  query(con, "DELETE FROM lake.t WHERE id=2");
+  std::vector<std::string> statements{
+    "SELECT * FROM lake.t",
+    "SELECT * FROM ducklake_table_insertions('lake','main','t',0,2)",
+    "SELECT * FROM ducklake_table_deletions('lake','main','t',2,3)"};
+  for (auto const& sql : statements) {
+    query(con, "SET gpu_execution=false");
+    auto expected = ducklake_result_bag(*query(con, sql));
+    query(con, "SET gpu_execution=true");
+    query(con, "SET enable_duckdb_fallback=true");
+    CHECK(ducklake_result_bag(*query(con, sql)) == expected);
+  }
+  query(con, "SET gpu_execution=false");
+  query(con, "UPDATE meta.ducklake_data_file SET file_format='foo'");
+  query(con, "DETACH lake");
+  query(con, attach);
+  for (auto const& sql : statements) {
+    query(con, "SET gpu_execution=false");
+    auto cpu = con.Query(sql);
+    REQUIRE(cpu->HasError());
+    REQUIRE(cpu->GetError().find("Unsupported data file format: foo") != std::string::npos);
+    query(con, "SET gpu_execution=true");
+    for (bool fallback : {true, false}) {
+      query(con, std::string("SET enable_duckdb_fallback=") + (fallback ? "true" : "false"));
+      for (auto const& statement :
+           {sql, "CALL gpu_execution(" + duckdb::Value(sql).ToSQLString() + ")"}) {
+        auto result = con.Query(statement);
+        REQUIRE(result->HasError());
+        INFO(result->GetError());
+        if (fallback) {
+          CHECK(result->GetError().find("Unsupported data file format: foo") != std::string::npos);
+          CHECK(result->GetError().find("source discovery incomplete") == std::string::npos);
+        } else {
+          CHECK((result->GetError().find("GPU") != std::string::npos ||
+                 result->GetError().find("SiriusExecuteQuery error:") != std::string::npos));
+        }
+      }
+    }
+  }
+}
+
+TEST_CASE("DuckLake Top-N prunes unopened files and resets prepared bounds",
+          "[isolated_context][ducklake][ducklake_topn]")
+{
+  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
+  sirius::test::scoped_temp_directory disk;
+  // Use multiple batches so the runtime boundary can prune later files.
+  auto config = YAML::LoadFile(lake_config().string());
+  config["sirius"]["operator_params"]["scan_task_batch_size"] = 8192;
+  auto config_path = std::filesystem::path(disk.directory) / "topn.yaml";
+  {
+    std::ofstream output(config_path);
+    output << config;
+  }
+  sirius::test::shared_test_env env(config_path);
+  auto con = env.make_connection();
+  if (!load_ducklake(con)) return;
+  query(con, "SET gpu_execution=false");
+  attach_lake(con, disk.directory);
+  query(con, "CALL lake.set_option('data_inlining_row_limit', 0)");
+  query(con, "CREATE TABLE lake.events(ts TIMESTAMP, id BIGINT)");
+  constexpr int files = 256;
+  for (int i = 0; i < files; ++i) {
+    auto start = std::to_string(i * 1000);
+    query(con,
+          "INSERT INTO lake.events SELECT TIMESTAMP '2026-01-01' + INTERVAL (i) SECOND, i "
+          "FROM range(" +
+            start + "," + std::to_string((i + 1) * 1000) + ") r(i)");
+  }
+  // Warm CUDA kernels before measuring asynchronous file pruning.
+  query(con, "SET gpu_execution=true");
+  query(con, "SET enable_duckdb_fallback=false");
+  query(con, "SELECT * FROM lake.events WHERE id < 1000 ORDER BY ts ASC LIMIT 2");
+  auto runtime = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(runtime);
+  auto counters         = runtime->physical_counters();
+  counters->track_units = true;
+  std::mutex files_lock;
+  std::set<std::string> opened, decoded;
+  counters->parquet_phase_for_testing = [&](std::string const& path, bool footer) {
+    std::lock_guard<std::mutex> guard(files_lock);
+    (footer ? opened : decoded).insert(path);
+  };
+  auto clear =
+    std::shared_ptr<void>(nullptr, [&](void*) { counters->parquet_phase_for_testing = {}; });
+  for (auto const& order : {"ASC", "DESC"}) {
+    auto sql = std::string("SELECT * FROM lake.events ORDER BY ts ") + order + " LIMIT 2";
+    query(con, "SET gpu_execution=false");
+    auto expected = ducklake_result_bag(*query(con, sql));
+    query(con, "SET gpu_execution=true");
+    query(con, "SET enable_duckdb_fallback=false");
+    opened.clear();
+    decoded.clear();
+    auto before = get_transparent_execution_stats(con);
+    CHECK(ducklake_result_bag(*query(con, sql)) == expected);
+    sirius::test::require_transparent_execution_delta(
+      before, get_transparent_execution_stats(con), 1, 0, 1);
+    INFO("Opened " << opened.size() << ", decoded " << decoded.size() << " of " << files);
+    CHECK_FALSE(decoded.empty());
+    CHECK(opened.size() < files);
+    CHECK(decoded.size() < files);
+  }
+  for (auto const& suffix :
+       {"WHERE ts > TIMESTAMP '2026-01-01 01:00:00' ORDER BY ts DESC LIMIT 5 OFFSET 3",
+        "ORDER BY ts DESC, id ASC LIMIT 2",
+        "ORDER BY ts ASC NULLS FIRST LIMIT 2"}) {
+    auto sql = std::string("SELECT * FROM lake.events ") + suffix;
+    query(con, "SET gpu_execution=false");
+    auto expected = ducklake_result_bag(*query(con, sql));
+    query(con, "SET gpu_execution=true");
+    CHECK(ducklake_result_bag(*query(con, sql)) == expected);
+  }
+  query(con, "SET gpu_execution=false");
+  query(con, "CREATE TABLE lake.ties(ts TIMESTAMP, id BIGINT)");
+  for (int i = 0; i < 5; ++i) {
+    query(con,
+          "INSERT INTO lake.ties VALUES (TIMESTAMP '2026-01-01', " + std::to_string(i) +
+            "), (NULL, " + std::to_string(i + 10) + ")");
+  }
+  for (auto const& suffix : {"ORDER BY ts ASC NULLS FIRST, id DESC LIMIT 3",
+                             "ORDER BY ts DESC NULLS LAST, id DESC LIMIT 3",
+                             "ORDER BY ts ASC NULLS LAST, id ASC LIMIT 20",
+                             "ORDER BY ts DESC NULLS LAST, id DESC LIMIT 4 OFFSET 3"}) {
+    auto sql = std::string("SELECT * FROM lake.ties ") + suffix;
+    query(con, "SET gpu_execution=false");
+    auto expected = ducklake_result_bag(*query(con, sql));
+    query(con, "SET gpu_execution=true");
+    CHECK(ducklake_result_bag(*query(con, sql)) == expected);
+  }
+  auto prepared = con.Prepare("SELECT id FROM lake.events ORDER BY ts DESC LIMIT 2");
+  REQUIRE_FALSE(prepared->HasError());
+  CHECK(ducklake_result_bag(*prepared->Execute()) ==
+        std::vector<std::string>{std::to_string(files * 1000 - 2) + "|",
+                                 std::to_string(files * 1000 - 1) + "|"});
+  query(con, "SET gpu_execution=false");
+  query(con, "DELETE FROM lake.events WHERE id >= 1000");
+  query(con, "SET gpu_execution=true");
+  CHECK(ducklake_result_bag(*prepared->Execute()) == std::vector<std::string>{"998|", "999|"});
 }

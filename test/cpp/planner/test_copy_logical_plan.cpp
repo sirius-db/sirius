@@ -19,7 +19,11 @@
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <duckdb/main/client_context.hpp>
+#include <duckdb/planner/filter/expression_filter.hpp>
+#include <duckdb/planner/filter/table_filter_functions.hpp>
 #include <duckdb/planner/logical_operator.hpp>
+#include <duckdb/planner/operator/logical_get.hpp>
+#include <duckdb/planner/operator/logical_top_n.hpp>
 
 #include <algorithm>
 #include <string>
@@ -161,4 +165,67 @@ TEST_CASE_METHOD(plan_fixture,
     CHECK_FALSE(sirius::transparent::copy_cardinality_estimates(*plan, *other));
     CHECK_FALSE(sirius::transparent::copy_cardinality_estimates(*other, *plan));
   }
+}
+
+TEST_CASE_METHOD(plan_fixture,
+                 "Plan copies reconnect Top-N filters with independent state",
+                 "[planner][topn_copy]")
+{
+  auto plan     = con.ExtractPlan("SELECT k FROM big ORDER BY k DESC LIMIT 2");
+  auto get_topn = [](duckdb::LogicalOperator& root) {
+    for (auto* node : preorder(root))
+      if (node->type == duckdb::LogicalOperatorType::LOGICAL_TOP_N)
+        return &node->Cast<duckdb::LogicalTopN>();
+    return static_cast<duckdb::LogicalTopN*>(nullptr);
+  };
+  auto original = get_topn(*plan);
+  REQUIRE(original);
+  REQUIRE(original->dynamic_filter);
+  for (auto* node : preorder(*plan)) {
+    if (node->type != duckdb::LogicalOperatorType::LOGICAL_GET) continue;
+    REQUIRE(node->Cast<duckdb::LogicalGet>().table_filters.HasFilters());
+    for (auto const& filter : node->Cast<duckdb::LogicalGet>().table_filters) {
+      auto data = duckdb::ExpressionFilter::GetOptionalDynamicFilterData(filter.Filter());
+      REQUIRE(data.get() == original->dynamic_filter.get());
+    }
+  }
+  original->dynamic_filter->SetValue(duckdb::Value::BIGINT(99998));
+  auto first  = copy(*plan);
+  auto second = copy(*first);
+  auto a      = get_topn(*first);
+  auto b      = get_topn(*second);
+  REQUIRE(a);
+  REQUIRE(b);
+  REQUIRE(a->dynamic_filter);
+  REQUIRE(b->dynamic_filter);
+  CHECK(a->dynamic_filter.get() != original->dynamic_filter.get());
+  CHECK(b->dynamic_filter.get() != a->dynamic_filter.get());
+  CHECK_FALSE(a->dynamic_filter->initialized);
+  CHECK_FALSE(b->dynamic_filter->initialized);
+  for (auto* root : {first.get(), second.get()}) {
+    auto topn      = get_topn(*root);
+    bool connected = false;
+    for (auto* node : preorder(*root)) {
+      if (node->type != duckdb::LogicalOperatorType::LOGICAL_GET) continue;
+      for (auto const& filter : node->Cast<duckdb::LogicalGet>().table_filters)
+        connected |=
+          duckdb::ExpressionFilter::GetOptionalDynamicFilterData(filter.Filter()).get() ==
+          topn->dynamic_filter.get();
+    }
+    CHECK(connected);
+  }
+  a->dynamic_filter->SetValue(duckdb::Value::BIGINT(42));
+  CHECK_FALSE(b->dynamic_filter->initialized);
+  CHECK(original->dynamic_filter->constant.GetValue<int64_t>() == 99998);
+}
+
+TEST_CASE_METHOD(plan_fixture,
+                 "Plan copies respect disabled Top-N optimization",
+                 "[planner][topn_copy]")
+{
+  REQUIRE_FALSE(con.Query("SET disabled_optimizers='top_n'")->HasError());
+  auto plan  = con.ExtractPlan("SELECT k FROM big ORDER BY k DESC LIMIT 2");
+  auto clone = copy(*plan);
+  CHECK_FALSE(contains(preorder(*plan), duckdb::LogicalOperatorType::LOGICAL_TOP_N));
+  CHECK_FALSE(contains(preorder(*clone), duckdb::LogicalOperatorType::LOGICAL_TOP_N));
 }

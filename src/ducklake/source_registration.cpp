@@ -75,7 +75,7 @@ scan_layout layout(op::sirius_physical_table_scan const& scan)
   return result;
 }
 std::optional<scan_manager::preparation_request> prepare_scan(op::sirius_physical_table_scan& scan,
-                                                              operator_params const&,
+                                                              operator_params const& params,
                                                               duckdb::ClientContext& context)
 {
   if (!bridge_available())
@@ -83,7 +83,8 @@ std::optional<scan_manager::preparation_request> prepare_scan(op::sirius_physica
   auto binding = binding_handle::capture(scan.function, scan.bind_data.get(), context);
   if (binding->view().identity->fingerprint != scan.bound_view->identity->fingerprint)
     throw std::invalid_argument("DuckLake prepared binding differs from the certified read view");
-  auto selected = std::make_shared<scan_layout>(layout(scan));
+  auto selected                          = std::make_shared<scan_layout>(layout(scan));
+  selected->options.scan_task_batch_size = params.scan_task_batch_size;
   return scan_manager::preparation_request{
     {{scan_ingestible::envelope()}, {}, true, 1},
     [](scan_manager::preparation_ledger&) {},

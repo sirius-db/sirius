@@ -30,10 +30,12 @@
 #ifdef SIRIUS_DUCKLAKE_PRIVATE_BRIDGE
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/multi_file/multi_file_function.hpp"
+#include "duckdb/planner/filter/table_filter_functions.hpp"
 #include "duckdb/storage/external_file_cache/caching_file_system.hpp"
 #include "parquet_multi_file_info.hpp"
 #include "storage/ducklake_multi_file_list.hpp"
 #include "storage/ducklake_multi_file_reader.hpp"
+#include "storage/ducklake_stats.hpp"
 #include "storage/ducklake_table_entry.hpp"
 #include "storage/ducklake_transaction.hpp"
 
@@ -279,6 +281,75 @@ void binding_handle::bind_execution_owner()
   throw std::runtime_error("DuckLake private binding bridge is not built");
 #endif
 }
+void binding_handle::configure_filters(std::vector<size_t> const& selected, TableFilterSet& filters)
+{
+  validate_statement();
+#ifdef SIRIUS_DUCKLAKE_PRIVATE_BRIDGE
+  if (impl_->discovery_started)
+    throw std::logic_error("DuckLake filters must be configured before unit discovery");
+  duckdb::vector<duckdb::ColumnIndex> columns;
+  for (auto index : selected)
+    columns.emplace_back(index);
+  auto context = impl_->context.lock();
+  auto& bind   = *impl_->reader_binding;
+  MultiFileDynamicPushdownInfo info(
+    *context, bind.file_options, bind.names, bind.types, columns, filters);
+  auto filtered = bind.multi_file_reader->DynamicFilterPushdown(*impl_->files, info);
+  if (filtered) {
+    impl_->files   = shared_ptr<MultiFileList>(std::move(filtered));
+    bind.file_list = impl_->files;
+  }
+#endif
+}
+
+bool binding_handle::can_prune_unit(uint64_t index) const
+{
+  validate_statement();
+#ifdef SIRIUS_DUCKLAKE_PRIVATE_BRIDGE
+  auto& list       = dynamic_cast<DuckLakeMultiFileList&>(*impl_->files);
+  auto const& file = list.GetFileEntry(index);
+  auto filters     = list.GetFilterInfo();
+  if (!filters || file.data_type != DuckLakeDataType::DATA_FILE) return false;
+  for (auto const& entry : filters->column_filters) {
+    auto const& column = entry.second;
+    auto dynamic       = ExpressionFilter::GetOptionalDynamicFilterData(*column.table_filter);
+    auto stats         = file.column_min_max.find(column.column_field_index);
+    if (!dynamic || stats == file.column_min_max.end()) continue;
+    // Offset-free bounds cannot establish a TIMESTAMPTZ comparison.
+    if (StatsBoundsRequireOffset(column.column_type)) continue;
+    ExpressionType comparison;
+    Value threshold;
+    {
+      lock_guard<mutex> guard(dynamic->lock);
+      if (!dynamic->initialized) continue;
+      comparison = dynamic->comparison_type;
+      threshold  = dynamic->constant;
+    }
+    auto const& bounds = stats->second;
+    string bound;
+    switch (comparison) {
+      case ExpressionType::COMPARE_GREATERTHAN:
+      case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+        if (!bounds.has_max) continue;
+        bound = bounds.max;
+        break;
+      case ExpressionType::COMPARE_LESSTHAN:
+      case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+        if (!bounds.has_min) continue;
+        bound = bounds.min;
+        break;
+      default: continue;
+    }
+    auto value    = Value(bound).DefaultTryCastAs(column.column_type);
+    auto constant = threshold.DefaultTryCastAs(column.column_type);
+    if (value && constant && !value->IsNull() && !constant->IsNull() &&
+        !DynamicFilterData::CompareValue(comparison, *constant, *value))
+      return true;
+  }
+#endif
+  return false;
+}
+
 std::optional<unit_descriptor> binding_handle::unit_at(uint64_t index) const
 {
   validate_statement();
