@@ -356,6 +356,14 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     return join_type == duckdb::JoinType::RIGHT || join_type == duckdb::JoinType::RIGHT_SEMI ||
            join_type == duckdb::JoinType::RIGHT_ANTI;
   }
+
+  /// SINGLE is a LEFT join that keeps one right match per probe row (DuckDB's join for
+  /// correlated scalar subqueries). It shares every LEFT path and adds a dedupe at the output
+  /// tail. Static so the free gather helpers can use it.
+  [[nodiscard]] static bool is_left_like(duckdb::JoinType join_type)
+  {
+    return join_type == duckdb::JoinType::LEFT || join_type == duckdb::JoinType::SINGLE;
+  }
   [[nodiscard]] std::string_view input_port_for(
     sirius_physical_operator const& producer) const override;
   [[nodiscard]] MemoryBarrierType input_barrier_for(
@@ -573,6 +581,10 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   [[nodiscard]] bool mark_is_null_safe() const { return mark_is_null_safe_; }
   bool mark_is_null_safe_ = false;
 
+  /// SINGLE join: DuckDB's `scalar_subquery_error_on_multiple_rows`. When set, a probe row with
+  /// more than one build match is an error, as in DuckDB's hash join; otherwise one match is kept.
+  bool single_join_error_on_multiple_rows_ = true;
+
  public:
   /// Materialize operands through the native evaluator before admission/partition setup.
   /// Idempotent: prepared operands are direct references. Maps hide appended key columns.
@@ -615,6 +627,15 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   //! `build_join_pipelines` skips build-side externalization.
   [[nodiscard]] bool is_delim_join_inner() const noexcept { return _is_delim_join_inner; }
   void set_delim_join_inner(bool value) noexcept { _is_delim_join_inner = value; }
+
+  [[nodiscard]] bool single_join_error_on_multiple_rows() const
+  {
+    return single_join_error_on_multiple_rows_;
+  }
+  void set_single_join_error_on_multiple_rows(bool value) noexcept
+  {
+    single_join_error_on_multiple_rows_ = value;
+  }
 
   // Sink Interface
   //! The inner join of a RIGHT_DELIM_JOIN is never a sink; otherwise the base rule

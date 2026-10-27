@@ -1500,6 +1500,7 @@ bool join_concat_all(sirius::op::sirius_physical_operator const& join, bool is_b
   auto const& hash_join = join.Cast<sirius::op::sirius_physical_hash_join>();
   switch (hash_join.join_type) {
     case duckdb::JoinType::LEFT:
+    case duckdb::JoinType::SINGLE:
     case duckdb::JoinType::SEMI:
     case duckdb::JoinType::ANTI:
     // Every probe row must see its partition's whole build to get one mark; MARK may run

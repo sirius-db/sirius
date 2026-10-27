@@ -18,6 +18,7 @@
 
 #include "duckdb/catalog/dependency_list.hpp"
 #include "duckdb/common/common.hpp"
+#include "duckdb/common/enums/join_type.hpp"
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/unordered_set.hpp"
 #include "op/scan/table_scan/scan_contract.hpp"
@@ -172,6 +173,18 @@ class sirius_physical_plan_generator {
   // create_plan(duckdb::LogicalCreateSecret &op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
     duckdb::LogicalCrossProduct& op);
+  //! Lower a join with no conditions to the nested loop join's cross product. Shared by the
+  //! LogicalCrossProduct overload and by plan_comparison_join for a LogicalComparisonJoin whose
+  //! condition list is empty, so the two entry points cannot drift.
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_cross_product_join(
+    duckdb::LogicalOperator& op,
+    duckdb::unique_ptr<sirius::op::sirius_physical_operator> left,
+    duckdb::unique_ptr<sirius::op::sirius_physical_operator> right,
+    duckdb::JoinType join_type,
+    std::size_t lhs_cardinality,
+    std::size_t rhs_cardinality,
+    duckdb::vector<std::size_t> left_projection_map,
+    duckdb::vector<std::size_t> right_projection_map);
   // duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalDelete
   // &op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalDelimGet& op);

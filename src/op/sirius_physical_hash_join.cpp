@@ -27,6 +27,7 @@
 #include "cudf/null_mask.hpp"
 #include "cudf/reduction.hpp"
 #include "cudf/reduction/distinct_count.hpp"
+#include "cudf/stream_compaction.hpp"
 #include "cudf/table/table_view.hpp"
 #include "cudf/transform.hpp"
 #include "cudf/types.hpp"
@@ -261,9 +262,8 @@ bool sirius_physical_hash_join::is_join_type_supported(duckdb::JoinType join_typ
     case duckdb::JoinType::RIGHT_SEMI:
     case duckdb::JoinType::RIGHT_ANTI:
     case duckdb::JoinType::MARK:
+    case duckdb::JoinType::SINGLE:
     case duckdb::JoinType::OUTER: return true;
-    // SINGLE (at most one build row per probe row, NULL-padded otherwise) has no arm in any
-    // dispatch.
     default: return false;
   }
 }
@@ -1284,7 +1284,7 @@ std::pair<bool, bool> sirius_physical_hash_join::refresh_cross_schedule()
   // sirius_physical_concat that stopped folding would otherwise silently corrupt results, so fail
   // loudly instead. MARK, like SEMI, needs each partition's build whole.
   bool const check_build_whole =
-    build_finished && (join_type == duckdb::JoinType::LEFT || join_type == duckdb::JoinType::SEMI ||
+    build_finished && (is_left_like(join_type) || join_type == duckdb::JoinType::SEMI ||
                        join_type == duckdb::JoinType::ANTI ||
                        join_type == duckdb::JoinType::OUTER || join_type == duckdb::JoinType::MARK);
   bool const check_probe_whole =
@@ -1482,6 +1482,61 @@ static join_side_keys_result prepare_join_keys(const ::cucascade::read_only_data
   return result;
 }
 
+static cudf::column_view as_gather_map(rmm::device_uvector<cudf::size_type> const& indices)
+{
+  return cudf::column_view(
+    cudf::data_type(cudf::type_id::INT32), indices.size(), indices.data(), nullptr, 0, 0, {});
+}
+
+// Core of gather_join_output over cuDF gather maps; a null map means that side is not gathered.
+static std::unique_ptr<operator_data> gather_join_output_from_maps(
+  duckdb::JoinType join_type,
+  const cudf::table_view& left_full,
+  const cudf::table_view& right_full,
+  std::vector<cudf::size_type> const& lhs_col_idxs,
+  std::vector<cudf::size_type> const& rhs_col_idxs,
+  cudf::column_view const* left_map,
+  cudf::column_view const* right_map,
+  cucascade::memory::memory_space& memory_space,
+  ::cuda::stream_ref stream,
+  const telemetry::batch_telemetry_info& telemetry_info)
+{
+  bool collect_left =
+    (join_type != duckdb::JoinType::RIGHT_SEMI && join_type != duckdb::JoinType::RIGHT_ANTI);
+  bool collect_right = (join_type != duckdb::JoinType::SEMI && join_type != duckdb::JoinType::ANTI);
+
+  cudf::out_of_bounds_policy left_oob  = cudf::out_of_bounds_policy::DONT_CHECK;
+  cudf::out_of_bounds_policy right_oob = cudf::out_of_bounds_policy::DONT_CHECK;
+  if (sirius_physical_hash_join::is_left_like(join_type) || join_type == duckdb::JoinType::OUTER ||
+      join_type == duckdb::JoinType::SEMI) {
+    right_oob = cudf::out_of_bounds_policy::NULLIFY;
+  }
+  if (join_type == duckdb::JoinType::RIGHT || join_type == duckdb::JoinType::OUTER ||
+      join_type == duckdb::JoinType::RIGHT_SEMI) {
+    left_oob = cudf::out_of_bounds_policy::NULLIFY;
+  }
+
+  std::vector<std::unique_ptr<cudf::column>> out_cols;
+  if (collect_left) {
+    cudf::table_view left_cols_to_gather = left_full.select(lhs_col_idxs);
+    auto left_result = cudf::gather(left_cols_to_gather, *left_map, left_oob, stream);
+    out_cols         = left_result->release();
+  }
+  if (collect_right) {
+    cudf::table_view right_cols_to_gather = right_full.select(rhs_col_idxs);
+    auto right_result   = cudf::gather(right_cols_to_gather, *right_map, right_oob, stream);
+    auto right_out_cols = right_result->release();
+    for (auto& col : right_out_cols) {
+      out_cols.push_back(std::move(col));
+    }
+  }
+
+  auto output_cudf_table = std::make_unique<cudf::table>(std::move(out_cols));
+  return std::make_unique<pipelineable_operator_data>(
+    std::vector<std::shared_ptr<::cucascade::data_batch>>{
+      make_data_batch(std::move(output_cudf_table), memory_space, stream, telemetry_info)});
+}
+
 /// Gather output columns from both sides of a join using row index vectors, then assemble the
 /// result into an operator_data. Handles collect/oob policy selection based on join type.
 /// @param left_indices   Row indices into left_full; may be null if the left side is not collected.
@@ -1500,54 +1555,38 @@ static std::unique_ptr<operator_data> gather_join_output(
   ::cuda::stream_ref stream,
   const telemetry::batch_telemetry_info& telemetry_info = {})
 {
-  bool collect_left =
-    (join_type != duckdb::JoinType::RIGHT_SEMI && join_type != duckdb::JoinType::RIGHT_ANTI);
-  bool collect_right = (join_type != duckdb::JoinType::SEMI && join_type != duckdb::JoinType::ANTI);
+  std::optional<cudf::column_view> left_map, right_map;
+  if (left_indices) { left_map = as_gather_map(*left_indices); }
+  if (right_indices) { right_map = as_gather_map(*right_indices); }
+  return gather_join_output_from_maps(join_type,
+                                      left_full,
+                                      right_full,
+                                      lhs_col_idxs,
+                                      rhs_col_idxs,
+                                      left_map ? &*left_map : nullptr,
+                                      right_map ? &*right_map : nullptr,
+                                      memory_space,
+                                      stream,
+                                      telemetry_info);
+}
 
-  cudf::out_of_bounds_policy left_oob  = cudf::out_of_bounds_policy::DONT_CHECK;
-  cudf::out_of_bounds_policy right_oob = cudf::out_of_bounds_policy::DONT_CHECK;
-  if (join_type == duckdb::JoinType::LEFT || join_type == duckdb::JoinType::OUTER ||
-      join_type == duckdb::JoinType::SEMI) {
-    right_oob = cudf::out_of_bounds_policy::NULLIFY;
-  }
-  if (join_type == duckdb::JoinType::RIGHT || join_type == duckdb::JoinType::OUTER ||
-      join_type == duckdb::JoinType::RIGHT_SEMI) {
-    left_oob = cudf::out_of_bounds_policy::NULLIFY;
-  }
-
-  std::vector<std::unique_ptr<cudf::column>> out_cols;
-  if (collect_left) {
-    cudf::table_view left_cols_to_gather = left_full.select(lhs_col_idxs);
-    cudf::column_view left_map_view(cudf::data_type(cudf::type_id::INT32),
-                                    left_indices->size(),
-                                    left_indices->data(),
-                                    nullptr,
-                                    0,
-                                    0,
-                                    {});
-    auto left_result = cudf::gather(left_cols_to_gather, left_map_view, left_oob, stream);
-    out_cols         = left_result->release();
-  }
-  if (collect_right) {
-    cudf::table_view right_cols_to_gather = right_full.select(rhs_col_idxs);
-    cudf::column_view right_map_view(cudf::data_type(cudf::type_id::INT32),
-                                     right_indices->size(),
-                                     right_indices->data(),
-                                     nullptr,
-                                     0,
-                                     0,
-                                     {});
-    auto right_result   = cudf::gather(right_cols_to_gather, right_map_view, right_oob, stream);
-    auto right_out_cols = right_result->release();
-    for (auto& col : right_out_cols) {
-      out_cols.push_back(std::move(col));
-    }
-  }
-
-  auto output_cudf_table = std::make_unique<cudf::table>(std::move(out_cols));
-  return std::make_unique<pipelineable_operator_data>(
-    std::vector<std::shared_ptr<::cucascade::data_batch>>{
-      make_data_batch(std::move(output_cudf_table), memory_space, stream, telemetry_info)});
+// A SINGLE join emits at most one right match per probe row. A left join's pair lists hold one
+// (row, JoinNoneValue) pair for an unmatched probe row and one pair per match otherwise, so
+// keeping any one pair per left index leaves exactly one row per probe row. The build side is
+// concat-folded per partition (join_concat_all), so every match for a probe row is in this task:
+// the per-task dedupe is complete and so is the duplicate-match check built on it.
+static std::unique_ptr<cudf::table> keep_one_match_per_probe_row(
+  rmm::device_uvector<cudf::size_type> const& left_indices,
+  rmm::device_uvector<cudf::size_type> const& right_indices,
+  ::cuda::stream_ref stream)
+{
+  cudf::table_view const pairs{{as_gather_map(left_indices), as_gather_map(right_indices)}};
+  return cudf::stable_distinct(pairs,
+                               {0},
+                               cudf::duplicate_keep_option::KEEP_ANY,
+                               cudf::null_equality::EQUAL,
+                               cudf::nan_equality::ALL_EQUAL,
+                               stream);
 }
 
 /// Assemble output for a distinct_hash_join left_join.
@@ -1916,7 +1955,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
           SIRIUS_LOG_DEBUG("sirius_physical_hash_join id {}: using filtered_join (BUILD_PROBE {})",
                            this->get_operator_id(),
                            duckdb::JoinTypeToString(join_type));
-        } else if ((join_type == duckdb::JoinType::INNER || join_type == duckdb::JoinType::LEFT) &&
+        } else if ((join_type == duckdb::JoinType::INNER || is_left_like(join_type)) &&
                    (unique_build_keys ||
                     (runtime_distinct_build_probe &&
                      compare_nulls() == cudf::null_equality::UNEQUAL &&
@@ -2000,7 +2039,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
             auto result   = slot.hash_table->inner_join(probe_keys, {}, stream);
             left_indices  = std::move(result.first);
             right_indices = std::move(result.second);
-          } else if (join_type == duckdb::JoinType::LEFT) {
+          } else if (is_left_like(join_type)) {
             auto result   = slot.hash_table->left_join(probe_keys, {}, stream);
             left_indices  = std::move(result.first);
             right_indices = std::move(result.second);
@@ -2068,7 +2107,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
         left_eq, right_eq, left_full, right_full, pred->back(), compare_nulls(), {}, stream);
       left_indices  = std::move(result.first);
       right_indices = std::move(result.second);
-    } else if (join_type == duckdb::JoinType::LEFT) {
+    } else if (is_left_like(join_type)) {
       auto result = cudf::mixed_left_join(
         left_eq, right_eq, left_full, right_full, pred->back(), compare_nulls(), {}, stream);
       left_indices  = std::move(result.first);
@@ -2147,8 +2186,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
     cudf::table_view left_keys  = left_keys_result.keys;
     cudf::table_view right_keys = right_keys_result.keys;
 
-    if (unique_build_keys &&
-        (join_type == duckdb::JoinType::INNER || join_type == duckdb::JoinType::LEFT)) {
+    if (unique_build_keys && (join_type == duckdb::JoinType::INNER || is_left_like(join_type))) {
       // Distinct hash join: build on right (build) keys, probe with left (probe) keys.
       // Only reached for pure-equal joins (build-uniqueness gate), so compare_nulls()
       // is UNEQUAL here.
@@ -2175,7 +2213,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
       auto join_result = cudf::inner_join(left_keys, right_keys, compare_nulls(), stream);
       left_indices     = std::move(join_result.first);
       right_indices    = std::move(join_result.second);
-    } else if (join_type == duckdb::JoinType::LEFT) {
+    } else if (is_left_like(join_type)) {
       auto join_result = cudf::left_join(left_keys, right_keys, compare_nulls(), stream);
       left_indices     = std::move(join_result.first);
       right_indices    = std::move(join_result.second);
@@ -2247,6 +2285,31 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
     } else {
       throw std::runtime_error("Unsupported join type: " + duckdb::JoinTypeToString(join_type));
     }
+  }
+
+  if (join_type == duckdb::JoinType::SINGLE && left_indices && right_indices) {
+    auto pairs = keep_one_match_per_probe_row(*left_indices, *right_indices, stream);
+    // Every probe row has at least one pair, so fewer distinct left indices than pairs means
+    // some probe row matched more than one build row.
+    if (single_join_error_on_multiple_rows_ &&
+        pairs->num_rows() != static_cast<cudf::size_type>(left_indices->size())) {
+      throw duckdb::InvalidInputException(
+        "More than one row returned by a subquery used as an expression - scalar subqueries can "
+        "only return a single row.\n\nUse \"SET scalar_subquery_error_on_multiple_rows=false\" to "
+        "revert to previous behavior of returning a random row.");
+    }
+    auto const left_map  = pairs->get_column(0).view();
+    auto const right_map = pairs->get_column(1).view();
+    return gather_join_output_from_maps(join_type,
+                                        left_full,
+                                        right_full,
+                                        lhs_output_columns.col_idxs,
+                                        rhs_output_columns.col_idxs,
+                                        &left_map,
+                                        &right_map,
+                                        *input_batches[0].get_memory_space(),
+                                        stream,
+                                        batch_telemetry());
   }
 
   return gather_join_output(join_type,
