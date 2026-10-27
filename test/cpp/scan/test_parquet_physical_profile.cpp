@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include "cudf/ast_compat.hpp"
+
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/parquet_io_utils.hpp>
