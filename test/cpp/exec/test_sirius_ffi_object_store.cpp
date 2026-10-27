@@ -14,15 +14,17 @@
  * limitations under the License.
  */
 
-// Only the public FFI surface is exercised. No query, S3 service or private engine header.
-// Construction-only tests use the same small memory configuration as the existing FFI guards.
+// Public snapshot validation and refusal of remote plans before binding. No S3 service is
+// required; isolated contexts use the same small memory configuration as the existing FFI guards.
 
 #include "sirius/ffi.hpp"
 #include "utils/ffi_object_store_fixture.hpp"
 
 #include <arpa/inet.h>
 #include <catch.hpp>
+#include <duckdb/common/arrow/arrow.hpp>
 #include <poll.h>
+#include <substrait/plan.pb.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -30,8 +32,10 @@
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <filesystem>
 #include <latch>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -58,7 +62,8 @@ static_assert(std::is_const_v<decltype(ObjectStoreConfig::endpoint)> &&
               std::is_const_v<decltype(ObjectStoreConfig::session_token)> &&
               std::is_const_v<decltype(ObjectStoreConfig::transport)> &&
               std::is_const_v<decltype(ObjectStoreConfig::signing_mode)> &&
-              std::is_const_v<decltype(ObjectStoreConfig::ca_bundle_path)>);
+              std::is_const_v<decltype(ObjectStoreConfig::ca_bundle_path)> &&
+              std::is_const_v<decltype(ObjectStoreConfig::uri_prefix)>);
 
 fs::path fixture_path(std::string const& name) { return fs::path(__FILE__).parent_path() / name; }
 
@@ -103,6 +108,7 @@ void check_fields(ObjectStoreConfig const& actual, object_store_inputs const& ex
   CHECK(actual.transport == expected.transport);
   CHECK(actual.signing_mode == expected.signing_mode);
   CHECK(actual.ca_bundle_path == expected.ca_bundle_path);
+  CHECK(actual.uri_prefix == expected.uri_prefix);
 }
 
 struct invalid_input {
@@ -153,6 +159,21 @@ std::vector<invalid_input> invalid_inputs()
      &object_store_inputs::ca_bundle_path,
      missing_ca.string(),
      "ca_bundle_path"},
+    {"non-S3 prefix", &object_store_inputs::uri_prefix, "http://b/", "uri_prefix"},
+    {"empty prefix bucket", &object_store_inputs::uri_prefix, "s3://", "uri_prefix"},
+    {"missing prefix bucket", &object_store_inputs::uri_prefix, "s3:///p/", "uri_prefix"},
+    {"bucket without separator", &object_store_inputs::uri_prefix, "s3://b", "uri_prefix"},
+    {"prefix without separator", &object_store_inputs::uri_prefix, "s3://b/p", "uri_prefix"},
+    {"prefix query", &object_store_inputs::uri_prefix, "s3://b/p/?x", "uri_prefix"},
+    {"prefix fragment", &object_store_inputs::uri_prefix, "s3://b/p/#f", "uri_prefix"},
+    {"prefix query with credential",
+     &object_store_inputs::uri_prefix,
+     "s3://b/p/?token=" + std::string(object_store_sentinels[2]),
+     "uri_prefix"},
+    {"prefix fragment with credential",
+     &object_store_inputs::uri_prefix,
+     "s3://b/p/#" + std::string(object_store_sentinels[1]),
+     "uri_prefix"},
   };
 }
 
@@ -269,6 +290,85 @@ class connection_observer {
   std::jthread worker_;
 };
 
+struct scan_item {
+  std::string path;
+  std::uint64_t start{};
+  std::uint64_t length{};
+  bool uri_path{};
+};
+
+// The same LocalFiles construction as the byte-range tests, with both supported path forms.
+std::string read_plan(std::vector<scan_item> const& items)
+{
+  substrait::Plan plan;
+  auto* root = plan.add_relations()->mutable_root();
+  root->add_names("a");
+  auto* files = root->mutable_input()->mutable_read()->mutable_local_files();
+  for (auto const& item : items) {
+    auto* file = files->add_items();
+    if (item.uri_path) {
+      file->set_uri_path(item.path);
+    } else {
+      file->set_uri_file(item.path);
+    }
+    file->mutable_parquet();
+    file->set_start(item.start);
+    file->set_length(item.length);
+  }
+  std::string bytes;
+  REQUIRE(plan.SerializeToString(&bytes));
+  return bytes;
+}
+
+enum class entry_point { execute, fragment_build };
+
+void invoke_plan(sirius::ffi::Context& context, entry_point entry, std::string const& plan)
+{
+  if (entry == entry_point::fragment_build) {
+    auto fragment = sirius::ffi::make_fragment(context);
+    fragment->build(plan);
+  } else {
+    // Also release a stream if a broken guard unexpectedly lets execution succeed.
+    struct output_stream {
+      ArrowArrayStream stream{};
+      ~output_stream()
+      {
+        if (stream.release) { stream.release(&stream); }
+      }
+    } output;
+    context.execute_substrait(plan, reinterpret_cast<std::uintptr_t>(&output.stream));
+  }
+}
+
+template <typename Operation>
+std::string check_refusal(Operation&& operation, std::string const& prefix, std::string const& item)
+{
+  bool threw = false;
+  std::string message;
+  try {
+    operation();
+  } catch (std::exception const& error) {
+    threw   = true;
+    message = error.what();
+  }
+  INFO("exception text: " << message);
+  CHECK(threw);
+  CHECK(message.starts_with(prefix));
+  CHECK(message.find(item) != std::string::npos);
+  check_no_sentinels(message);
+  CHECK(message.find('?') == std::string::npos);
+  CHECK(message.find('#') == std::string::npos);
+  CHECK(message.find("X-Amz-") == std::string::npos);
+  return message;
+}
+
+std::string authentication_suffix()
+{
+  return "?X-Amz-Security-Token=" + std::string(object_store_sentinels[2]) +
+         "&X-Amz-Signature=" + std::string(object_store_sentinels[1]) + "#" +
+         std::string(object_store_sentinels[0]);
+}
+
 }  // namespace
 
 TEST_CASE("FFI object store factory rejects invalid configuration without leaking credentials",
@@ -342,11 +442,15 @@ TEST_CASE("FFI object store factories preserve pointers without network access",
     CHECK(context->object_store_config() == nullptr);
     context->set_object_store(config);
     CHECK(context->object_store_config().get() == config.get());
+    REQUIRE(context->object_store_config());
+    check_fields(*context->object_store_config(), inputs);
   }
   {
     auto context = make_context_from_config("", config);
     REQUIRE(context);
     CHECK(context->object_store_config().get() == config.get());
+    REQUIRE(context->object_store_config());
+    check_fields(*context->object_store_config(), inputs);
     context->set_object_store(nullptr);
   }
   observer.finish();
@@ -443,6 +547,7 @@ TEST_CASE("FFI object store credentials derive an immutable snapshot",
   CHECK(defaults.signing_mode == "presigned");
   CHECK(defaults.session_token.empty());
   CHECK(defaults.ca_bundle_path.empty());
+  CHECK(defaults.uri_prefix.empty());
 
   connection_observer observer;
   observer.positive_control();
@@ -517,4 +622,155 @@ TEST_CASE("FFI object store clears without invalidating retained snapshots",
   REQUIRE(derived);
   CHECK(derived->session_token.empty());
   CHECK(retained->session_token == inputs.session_token);
+}
+
+TEST_CASE("FFI object store accepts bucket and nested URI prefixes",
+          "[isolated_context][ffi][object_store]")
+{
+  for (auto const* prefix : {"s3://b/", "s3://b/p/q/"}) {
+    CAPTURE(prefix);
+    object_store_inputs inputs;
+    inputs.uri_prefix     = prefix;
+    auto const configured = inputs.snapshot();
+    auto context          = make_context_from_config(memory_config(), configured);
+    CHECK(context->object_store_config().get() == configured.get());
+    REQUIRE(context->object_store_config());
+    check_fields(*context->object_store_config(), inputs);
+    context->set_object_store(nullptr);
+    context->set_object_store(configured);
+    CHECK(context->object_store_config().get() == configured.get());
+    REQUIRE(context->object_store_config());
+    check_fields(*context->object_store_config(), inputs);
+  }
+}
+
+TEST_CASE("FFI object store scopes remote plans before either entry point binds",
+          "[isolated_context][ffi][object_store]")
+{
+  connection_observer observer;
+  observer.positive_control();
+  {
+    object_store_inputs inputs;
+    inputs.endpoint   = observer.endpoint();
+    inputs.uri_prefix = "s3://bucket/allowed/";
+    auto context      = make_context_from_config(memory_config(), inputs.snapshot());
+    struct scope_case {
+      std::string path;
+      std::string display;
+      bool in_scope;
+    };
+    std::vector<scope_case> const cases{
+      {"s3://bucket/other/k.parquet", "s3://bucket/other/k.parquet", false},
+      {"S3://bucket/allowed/k.parquet", "S3://bucket/allowed/k.parquet", true},
+      {"s3://Bucket/allowed/k.parquet", "s3://Bucket/allowed/k.parquet", false},
+      {"s3://bucket/allowed/../other/k.parquet", "s3://bucket/allowed/../other/k.parquet", false},
+      {"s3://bucket/allowed//k.parquet", "s3://bucket/allowed//k.parquet", false},
+      {"s3://bucket/allowed/%2e%2e/k.parquet", "s3://bucket/allowed/%2e%2e/k.parquet", false},
+      {"s3://bucket/allowed/k.parquet", "s3://bucket/allowed/k.parquet", true},
+      {"s3://u:part@" + std::string(object_store_sentinels[2]) + "@bucket/allowed/k@part.parquet",
+       "s3://bucket/allowed/k@part.parquet",
+       false},
+    };
+    for (auto const& item : cases) {
+      for (auto const entry : {entry_point::execute, entry_point::fragment_build}) {
+        CAPTURE(item.path, entry == entry_point::execute);
+        auto const plan = read_plan({{item.path + authentication_suffix()}});
+        check_refusal([&] { invoke_plan(*context, entry, plan); },
+                      item.in_scope ? "object_store_route_unavailable:" : "object_store_scope:",
+                      item.display);
+      }
+    }
+  }
+  observer.finish();
+  CHECK(observer.error() == 0);
+  CHECK(observer.accepted() == 1);  // Only the positive control.
+}
+
+TEST_CASE("FFI object store refuses remote plans before range validation without network access",
+          "[isolated_context][ffi][object_store]")
+{
+  connection_observer observer;
+  observer.positive_control();
+  {
+    object_store_inputs inputs;
+    inputs.endpoint = observer.endpoint();
+    inputs.uri_prefix.clear();
+    auto const configured = inputs.snapshot();
+    auto context          = make_context_from_config(memory_config(), nullptr);
+    for (bool const has_snapshot : {false, true}) {
+      context->set_object_store(has_snapshot ? configured : nullptr);
+      std::string const token =
+        has_snapshot ? "object_store_route_unavailable:" : "object_store_unconfigured:";
+      for (auto const entry : {entry_point::execute, entry_point::fragment_build}) {
+        for (bool const uri_path : {false, true}) {
+          for (auto const& path :
+               std::vector<std::string>{"s3://bucket/k@part.parquet",
+                                        "s3://u:part@" + std::string(object_store_sentinels[2]) +
+                                          "@bucket/k@part.parquet"}) {
+            for (auto const& item :
+                 std::vector<scan_item>{{path + authentication_suffix(), 0, 0, uri_path},
+                                        {path + authentication_suffix(), 1, 1, uri_path},
+                                        {path + authentication_suffix(),
+                                         std::numeric_limits<std::uint64_t>::max(),
+                                         1,
+                                         uri_path}}) {
+              CAPTURE(has_snapshot,
+                      entry == entry_point::execute,
+                      uri_path,
+                      item.start,
+                      item.length,
+                      path);
+              auto const plan    = read_plan({item});
+              auto const message = check_refusal(
+                [&] { invoke_plan(*context, entry, plan); }, token, "s3://bucket/k@part.parquet");
+              CHECK(message.find("byte-range splits are only supported") == std::string::npos);
+              CHECK(message.find("overflows a 64-bit offset") == std::string::npos);
+              CHECK(message.find("path type other than uri_file") == std::string::npos);
+            }
+          }
+        }
+        // The invalid local read precedes the remote item in the plan. Removing the remote
+        // item must restore the original local validation error without trying to open a file.
+        std::vector<scan_item> local{{"/unopened/object_store.parquet"},
+                                     {"/unopened/object_store.parquet", 1, 1}};
+        auto mixed = local;
+        mixed.push_back({"s3://bucket/k.parquet" + authentication_suffix()});
+        auto const mixed_plan = read_plan(mixed);
+        check_refusal(
+          [&] { invoke_plan(*context, entry, mixed_plan); }, token, "s3://bucket/k.parquet");
+        auto const local_plan = read_plan(local);
+        auto const message    = check_refusal([&] { invoke_plan(*context, entry, local_plan); },
+                                           "a read names",
+                                           "/unopened/object_store.parquet");
+        CHECK(message.find("both whole and by byte range") != std::string::npos);
+      }
+    }
+  }
+  observer.finish();
+  CHECK(observer.error() == 0);
+  CHECK(observer.accepted() == 1);  // Only the positive control.
+}
+
+TEST_CASE("FFI object store failed fragment builds recapture on retry",
+          "[isolated_context][ffi][object_store]")
+{
+  connection_observer observer;
+  observer.positive_control();
+  {
+    object_store_inputs inputs;
+    inputs.endpoint = observer.endpoint();
+    inputs.uri_prefix.clear();
+    auto context    = make_context_from_config(memory_config(), nullptr);
+    auto fragment   = sirius::ffi::make_fragment(*context);
+    auto const plan = read_plan({{"s3://bucket/k.parquet" + authentication_suffix()}});
+    auto build      = [&] { fragment->build(plan); };
+    check_refusal(build, "object_store_unconfigured:", "s3://bucket/k.parquet");
+    context->set_object_store(inputs.snapshot());
+    check_refusal(build, "object_store_route_unavailable:", "s3://bucket/k.parquet");
+    context->set_object_store(nullptr);
+    check_refusal(build, "object_store_unconfigured:", "s3://bucket/k.parquet");
+  }
+  observer.finish();
+  CHECK(observer.error() == 0);
+  CHECK(observer.accepted() == 1);  // Only the positive control.
 }

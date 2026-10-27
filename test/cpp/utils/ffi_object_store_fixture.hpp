@@ -40,6 +40,7 @@ struct object_store_inputs {
   std::string transport{"auto"};
   std::string signing_mode{"presigned"};
   std::string ca_bundle_path;
+  std::string uri_prefix{"s3://bucket/prefix/"};
 
   [[nodiscard]] std::shared_ptr<sirius::ffi::ObjectStoreConfig> snapshot() const
   {
@@ -51,7 +52,8 @@ struct object_store_inputs {
                                      .session_token  = session_token,
                                      .transport      = transport,
                                      .signing_mode   = signing_mode,
-                                     .ca_bundle_path = ca_bundle_path});
+                                     .ca_bundle_path = ca_bundle_path,
+                                     .uri_prefix     = uri_prefix});
   }
 };
 
