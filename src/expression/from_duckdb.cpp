@@ -399,6 +399,7 @@ std::unique_ptr<node> translate_function(duckdb::BoundFunctionExpression const& 
 
 std::unique_ptr<node> translate_aggregate(duckdb::BoundAggregateExpression const& aggr)
 {
+  // FILTERed aggregates have already been consumed and translated
   if (aggr.GetFilter()) { return nullptr; }
   auto agg_id_opt =
     sirius::from_duckdb_aggregate_name(aggr.Function().GetName().GetIdentifierName());

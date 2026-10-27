@@ -149,8 +149,12 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> extract_aggregate_expre
   // the nodes. Clear the map before translation drains those owners.
   duckdb::expression_map_t<duckdb::idx_t> masked_inputs;
   auto project_input = [&](duckdb::unique_ptr<duckdb::Expression> expression, bool masked) {
-    bool const shareable = masked && expression->IsConsistent() && !expression->IsVolatile() &&
+    // clang-format off
+    bool const shareable = masked &&
+                           expression->IsConsistent() &&
+                           !expression->IsVolatile() &&
                            !has_ordered_function(*expression);
+    // clang-format on
     if (shareable) {
       auto const found = masked_inputs.find(*expression);
       if (found != masked_inputs.end()) { return found->second; }
@@ -180,17 +184,22 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> extract_aggregate_expre
     auto& bound_aggr = aggr->Cast<duckdb::BoundAggregateExpression>();
     if (bound_aggr.GetFilterMutable()) { throw_if_aggregate_filter_unsupported(bound_aggr); }
     auto filter = std::move(bound_aggr.GetFilterMutable());  // consumes the filter
+
+    // aggregates that have an argument
     for (auto& child_expr : bound_aggr.GetChildrenMutable()) {
       if (filter) { child_expr = make_filter_mask(filter->Copy(), std::move(child_expr)); }
       auto const type  = child_expr->GetReturnType();
       auto const index = project_input(std::move(child_expr), filter != nullptr);
       child_expr       = duckdb::make_uniq<duckdb::BoundReferenceExpression>(type, index);
     }
+
+    // FILTERed aggregates with  no argument (currently, only COUNT(*))
     if (filter && bound_aggr.GetChildren().empty()) {
       auto mask = make_filter_mask(
         std::move(filter),
         duckdb::make_uniq<duckdb::BoundConstantExpression>(duckdb::Value::BOOLEAN(true)));
       auto const index = project_input(std::move(mask), true);
+      // Convert filter expression into: CASE WHEN keep THEN TRUE ELSE NULL END
       duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> arguments;
       arguments.push_back(
         duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::BOOLEAN, index));
