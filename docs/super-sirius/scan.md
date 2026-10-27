@@ -317,6 +317,8 @@ Pinning drives the source's `gpu_ingestible` to completion (`materialize_all_bat
 - **GPU tier** (`materialize_all_batches`): each resulting batch is stored as a GPU-resident `cudf::table`, round-robining placement across the GPU memory spaces. Placement is deterministic so re-pinning the same source yields identical per-chunk placement (required by the merge path below).
 - **HOST tier** (`materialize_pin_to_host`): each resulting batch is converted on its round-robin GPU to a `host_data_representation` that preserves carrier type and decimal scale on that GPU's NUMA-local host space, then the GPU table is freed before the next batch. Peak GPU residency is therefore ~one batch, so a host pin never needs the whole table to fit in GPU memory.
 
+Pinned scans preserve these chunk boundaries. Host-affinity task placement rotates independently among the GPUs of each host NUMA domain; a shared counter across domains would repeatedly select the same local GPU for alternating host spaces. Query admission can still override a locality pick outside the admitted GPU set.
+
 ### Storage and matching
 
 Each pinned table is a `pinned_entry` keyed by name in the scan manager. It holds a
@@ -507,7 +509,7 @@ Reader-side pushdown is a per-split decision: an FLBA-decimal safety probe can d
 
 Virtual-column scans currently disable reader-side row filtering, including dynamic-filter AST merging. Row-group statistics pruning remains enabled, but all rows in selected row groups are decoded before residual predicates and membership filters run—even for a selective `WHERE filename = ...`.
 
-Follow-up work can use cuDF 26.08.01's existing `enable_prepend_source_index_column()` and `enable_prepend_row_index_column()` APIs to preserve file and row identity during whole-split reads with filtering. Source selection for `filename`/`file_index` predicates and Iceberg positional-delete handling need separate integration.
+Follow-up work can use cuDF's `enable_prepend_source_index_column()` and `enable_prepend_row_index_column()` APIs to preserve file and row identity during whole-split reads with filtering. Source selection for `filename`/`file_index` predicates and Iceberg positional-delete handling need separate integration.
 
 **Filter translation path:** `TableFilterSet` -> `convert_table_filters_to_expression()` (skips `OPTIONAL_FILTER` and partition-column filters) -> `gpu_expression_translator` -> cuDF AST tree. Ordinary scans also skip top-level `IS_NOT_NULL`; virtual-column scans retain it in the residual predicate evaluated after decoding. Null-count pruning collects null-test predicates directly from the original `TableFilterSet`, independently of expression translation.
 

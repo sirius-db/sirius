@@ -16,6 +16,7 @@
 
 #include "duckdb/planner/operator/logical_set_operation.hpp"
 #include "helper/type_conversions.hpp"
+#include "op/sirius_physical_empty_result.hpp"
 #include "op/sirius_physical_union.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 
@@ -40,6 +41,18 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalSetOperation& op)
 duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_generator::plan_union(
   duckdb::LogicalSetOperation& op)
 {
+  // Degenerate UNION ALL nodes need no concatenation. Preserve the declared
+  // schema for an empty result and validate the schema when forwarding a child.
+  if (op.setop_all && op.children.empty()) {
+    return duckdb::make_uniq<sirius::op::sirius_physical_empty_result>(
+      sirius::from_duckdb_vec(op.types), 0);
+  }
+  if (op.setop_all && op.children.size() == 1) {
+    auto child = create_plan(*op.children[0]);
+    require_planned_schema(child->get_types(), op.types, "UNION ALL child");
+    return child;
+  }
+
   // `UNION` and `UNION ALL` both arrive as this node. For `UNION`, DuckDB's binder plants a
   // DISTINCT above it and sets `setop_all`, so the node itself always concatenates. The exception
   // is a WITH RECURSIVE body that never references itself and has no USING KEY: it binds to this

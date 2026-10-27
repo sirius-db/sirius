@@ -98,6 +98,7 @@ jobs:
       - name: Test CUDA extension loader without a GPU
         run: |
           cmake -S sirius-duckdb/duckdb -B build/loader -G Ninja \
+            -DDUCKDB_EXPLICIT_VERSION=v2.0.0 \
             -DCMAKE_BUILD_TYPE=Release -DBUILD_UNITTESTS=OFF -DBUILD_SHELL=OFF \
             -DEXTENSION_STATIC_BUILD=ON -DDUCKDB_LINKER=bfd \
             -DPREBUILT_BINARY="$PWD/sirius-duckdb/build/release/src/libduckdb_static.a" \

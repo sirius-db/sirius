@@ -259,6 +259,29 @@ std::unique_ptr<operator_data> claim_concat_input(sirius_physical_concat& concat
 /**
  * @brief Create an int32 batch of @p num_rows rows (4 bytes per row).
  */
+/// A stored batch whose stored size differs from its decoded size, like a spilled
+/// compressed batch.
+class compressed_size_representation : public idata_representation {
+ public:
+  compressed_size_representation(memory_space& space, std::size_t stored, std::size_t decoded)
+    : idata_representation(space), _stored(stored), _decoded(decoded)
+  {
+  }
+  [[nodiscard]] std::size_t get_size_in_bytes() const override { return _stored; }
+  [[nodiscard]] std::size_t get_uncompressed_data_size_in_bytes() const override
+  {
+    return _decoded;
+  }
+  [[nodiscard]] std::unique_ptr<idata_representation> clone(::cuda::stream_ref) const override
+  {
+    return nullptr;
+  }
+
+ private:
+  std::size_t _stored;
+  std::size_t _decoded;
+};
+
 std::shared_ptr<data_batch> make_int32_batch(memory_space& space, std::size_t num_rows)
 {
   std::vector<int32_t> values(num_rows);
@@ -1771,4 +1794,38 @@ TEST_CASE("BUILD_PROBE rejects a missing explicit build concatenation path",
   CHECK_THROWS_WITH(
     first.get_next_task_input_data(),
     Catch::Matchers::ContainsSubstring("BUILD_PROBE requires a bound build CONCAT"));
+}
+
+TEST_CASE("sirius_physical_concat counts compressed batches at their decoded size",
+          "[physical_concat]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space != nullptr);
+
+  constexpr uint64_t threshold = 1024;
+
+  sirius_physical_concat concat_op(
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+    1000,
+    false,
+    threshold);
+  concat_op.set_placement(
+    std::make_shared<const partition_placement>(partition_placement::unpinned(1)));
+
+  auto repo   = std::make_unique<cucascade::shared_data_repository>();
+  auto source = create_unfinished_source_pipeline();
+  attach_concat_port(concat_op, *repo, source.pipeline);
+
+  // Two batches stored at 100 bytes that decode to 800 each: together they exceed the
+  // threshold once decoded, so the first forms a group even though the source still runs.
+  for (int i = 0; i < 2; ++i) {
+    repo->add_data_batch(
+      data_batch::make(sirius::get_next_batch_id(),
+                       std::make_unique<compressed_size_representation>(*space, 100, 800)),
+      0);
+  }
+
+  auto hint = concat_op.get_next_task_hint();
+  REQUIRE(hint.has_value());
+  CHECK(hint->hint == TaskCreationHint::READY);
 }

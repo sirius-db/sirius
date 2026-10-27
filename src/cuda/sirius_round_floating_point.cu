@@ -46,8 +46,12 @@ __global__ void round_floating_point_kernel(T const* input,
     auto const x = static_cast<double>(input[i]);
     double rounded;
     if constexpr (NegativePrecision) {
-      rounded = ::round(x / modifier) * modifier;
-      if (!::isfinite(rounded)) { rounded = 0; }
+      if (::isinf(modifier)) {
+        rounded = ::isfinite(input[i]) ? 0 : x;
+      } else {
+        rounded = ::round(x / modifier) * modifier;
+      }
+      if (!::isfinite(rounded)) { rounded = x; }
     } else {
       rounded = ::round(x * modifier) / modifier;
       if (!::isfinite(rounded)) { rounded = x; }
