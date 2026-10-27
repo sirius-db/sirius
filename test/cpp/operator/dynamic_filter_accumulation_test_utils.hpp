@@ -672,6 +672,9 @@ struct fixture {
 inline void load_accumulation_kernels(std::size_t devices)
 {
   fixture warm_up({.devices = devices});
+  if (!has_pool_access(warm_up.spaces)) {
+    SKIP("accumulation kernel warm-up requires access to every replica pool");
+  }
   std::vector<batch_ptr> batches;
   for (std::size_t device = 0; device < devices; ++device) {
     batches.push_back(
