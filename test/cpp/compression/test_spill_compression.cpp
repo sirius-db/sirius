@@ -137,10 +137,10 @@ void null_every_seventh(cudf::column& column, ::cuda::stream_ref stream)
   auto mask = cudf::create_null_mask(
     rows, cudf::mask_state::UNINITIALIZED, stream, utils::get_resource_ref(*env().gpu));
   REQUIRE(cudaMemcpyAsync(mask.data(),
-                         words.data(),
-                         words.size() * sizeof(std::uint32_t),
-                         cudaMemcpyHostToDevice,
-                         stream.get()) == cudaSuccess);
+                          words.data(),
+                          words.size() * sizeof(std::uint32_t),
+                          cudaMemcpyHostToDevice,
+                          stream.get()) == cudaSuccess);
   REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);
   column.set_null_mask(std::move(mask), nulls);
 }
