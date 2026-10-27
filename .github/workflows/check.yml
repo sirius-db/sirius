@@ -194,16 +194,26 @@ jobs:
           [[ "$engine" == "$wrapper" ]]
 
           declared=$(grep -m1 'duckdb_version:' .github/workflows/distribution.yml | sed -E 's/.*duckdb_version:[[:space:]]*//' | tr -d '"[:space:]')
+          tag=
           if [[ "$declared" == v* ]]; then
+            tag=$declared
             git -C duckdb fetch --depth=1 origin "refs/tags/${declared}:refs/tags/${declared}"
             declared=$(git -C duckdb rev-parse "${declared}^{commit}")
           fi
 
           [[ "$declared" == "$engine" ]]
 
-          # Builds report the release version only for the commit named here.
-          grep -q "$engine" sirius-duckdb/Makefile
-          grep -q "$engine" cmake/sirius-duckdb-provider.cmake
+          # DUCKDB_EXPLICIT_VERSION must name the declared tag everywhere, or nowhere for a SHA.
+          files=(sirius-duckdb/Makefile cmake/sirius-duckdb-provider.cmake .github/workflows/test.yml .github/workflows/distribution.yml)
+          explicit=$(grep -h 'DUCKDB_EXPLICIT_VERSION' "${files[@]}" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9.-]*' | sort -u || true)
+          if [[ -n "$tag" ]]; then
+            [[ "$explicit" == "$tag" ]]
+            for f in "${files[@]}"; do grep 'DUCKDB_EXPLICIT_VERSION' "$f" | grep -qF "$tag"; done
+            grep -qF "$engine" sirius-duckdb/Makefile
+            grep -qF "$engine" cmake/sirius-duckdb-provider.cmake
+          else
+            [[ -z "$explicit" ]]
+          fi
 
       # Rust bindings (sirius-sys + sirius) — fmt/clippy + build/link the test.
       # Run on a single representative entry. `cargo test --no-run` compiles the

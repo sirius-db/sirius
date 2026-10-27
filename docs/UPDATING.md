@@ -37,11 +37,22 @@ wrapper=$(git rev-parse HEAD:sirius-duckdb/duckdb)
 [[ "$engine" == "$wrapper" ]] && echo "PASS: engine == wrapper" || echo "FAIL: mismatch"
 
 declared=$(grep -m1 'duckdb_version:' .github/workflows/distribution.yml | sed -E 's/.*duckdb_version:[[:space:]]*//' | tr -d '"[:space:]')
+tag=
 if [[ "$declared" == v* ]]; then
+  tag=$declared
   git -C duckdb fetch --depth=1 origin "refs/tags/${declared}:refs/tags/${declared}"
   declared=$(git -C duckdb rev-parse "${declared}^{commit}")
 fi
 [[ "$declared" == "$engine" ]] && echo "PASS: distribution.yml matches" || echo "FAIL: distribution.yml mismatch (declared=$declared, engine=$engine)"
+
+files=(sirius-duckdb/Makefile cmake/sirius-duckdb-provider.cmake .github/workflows/test.yml .github/workflows/distribution.yml)
+explicit=$(grep -h 'DUCKDB_EXPLICIT_VERSION' "${files[@]}" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9.-]*' | sort -u || true)
+if [[ -n "$tag" ]]; then
+  [[ "$explicit" == "$tag" ]] && grep -qF "$engine" sirius-duckdb/Makefile && grep -qF "$engine" cmake/sirius-duckdb-provider.cmake \
+    && echo "PASS: DUCKDB_EXPLICIT_VERSION is $tag" || echo "FAIL: DUCKDB_EXPLICIT_VERSION ($explicit) or commit mapping out of sync with $tag"
+else
+  [[ -z "$explicit" ]] && echo "PASS: no DUCKDB_EXPLICIT_VERSION" || echo "FAIL: DUCKDB_EXPLICIT_VERSION ($explicit) set for a non-release SHA"
+fi
 ```
 
 **NOTE:** This can fail locally if your `./duckdb` submodule's `origin` remote points somewhere
