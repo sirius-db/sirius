@@ -20,7 +20,11 @@ as follows:
 3. Bump versions in `.github/workflows`
     - `duckdb_version` input in `distribution.yml` should be set to latest tagged release (e.g. `v2.0.0`) or matching SHA with submodules in 1
     - The reusable `sirius-db/extension-ci-tools` workflow ref and `ci_tools_version` input should be updated only when the remote CI tooling branch changes
-4. Check for use of the current DuckDB version in the repo to determine if they should be updated
+4. Map the submodule commit to its release version (`DUCKDB_EXPLICIT_VERSION`) in
+   `sirius-duckdb/Makefile` and `cmake/sirius-duckdb-provider.cmake`, and update the
+   `-DDUCKDB_EXPLICIT_VERSION` flags in `test.yml` and `distribution.yml`. DuckDB otherwise
+   reports a development version, even at a release tag.
+5. Check for use of the current DuckDB version in the repo to determine if they should be updated
    with the current PR or documented as a gap in an issue for follow up later.
 
 ## Verify
@@ -33,11 +37,22 @@ wrapper=$(git rev-parse HEAD:sirius-duckdb/duckdb)
 [[ "$engine" == "$wrapper" ]] && echo "PASS: engine == wrapper" || echo "FAIL: mismatch"
 
 declared=$(grep -m1 'duckdb_version:' .github/workflows/distribution.yml | sed -E 's/.*duckdb_version:[[:space:]]*//' | tr -d '"[:space:]')
+tag=
 if [[ "$declared" == v* ]]; then
+  tag=$declared
   git -C duckdb fetch --depth=1 origin "refs/tags/${declared}:refs/tags/${declared}"
   declared=$(git -C duckdb rev-parse "${declared}^{commit}")
 fi
 [[ "$declared" == "$engine" ]] && echo "PASS: distribution.yml matches" || echo "FAIL: distribution.yml mismatch (declared=$declared, engine=$engine)"
+
+files=(sirius-duckdb/Makefile cmake/sirius-duckdb-provider.cmake .github/workflows/test.yml .github/workflows/distribution.yml)
+explicit=$(grep -h 'DUCKDB_EXPLICIT_VERSION' "${files[@]}" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9.-]*' | sort -u || true)
+if [[ -n "$tag" ]]; then
+  [[ "$explicit" == "$tag" ]] && grep -qF "$engine" sirius-duckdb/Makefile && grep -qF "$engine" cmake/sirius-duckdb-provider.cmake \
+    && echo "PASS: DUCKDB_EXPLICIT_VERSION is $tag" || echo "FAIL: DUCKDB_EXPLICIT_VERSION ($explicit) or commit mapping out of sync with $tag"
+else
+  [[ -z "$explicit" ]] && echo "PASS: no DUCKDB_EXPLICIT_VERSION" || echo "FAIL: DUCKDB_EXPLICIT_VERSION ($explicit) set for a non-release SHA"
+fi
 ```
 
 **NOTE:** This can fail locally if your `./duckdb` submodule's `origin` remote points somewhere
