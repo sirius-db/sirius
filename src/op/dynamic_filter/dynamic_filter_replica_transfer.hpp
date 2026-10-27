@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "memory/device_transfer.hpp"
+
 #include <rmm/cuda_device.hpp>
 
 #include <cuda/stream>
@@ -31,11 +33,11 @@ class memory_space;
 namespace sirius::op::detail {
 
 /**
- * @brief Selected copy API; peer_dma means cudaMemcpyPeerAsync, not a measured physical route
+ * @brief Selected copy API; peer_copy means cudaMemcpyPeerAsync, not a measured physical route
  */
-enum class replica_transfer_route { none, local, peer_dma, host_staging };
+using replica_transfer_route = sirius::memory::device_transfer_route;
 
-enum class replica_transfer_policy { automatic, force_host_staging };
+using replica_transfer_policy = sirius::memory::device_transfer_policy;
 
 /**
  * @brief Enqueues a finalized replica copy and returns its route

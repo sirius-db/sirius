@@ -85,7 +85,7 @@ void require_copy(cucascade::memory::memory_space& source,
                                                host);
     using sirius::op::detail::replica_transfer_route;
     REQUIRE(route ==
-            (granted ? replica_transfer_route::peer_dma : replica_transfer_route::host_staging));
+            (granted ? replica_transfer_route::peer_copy : replica_transfer_route::host_staging));
     std::vector<std::byte> actual(bytes.size());
     REQUIRE(
       cudaMemcpyAsync(

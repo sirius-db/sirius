@@ -35,6 +35,7 @@ set(TEST_SOURCES
     test/cpp/creator/test_task_creator_query_state.cpp
     test/cpp/creator/test_task_creator_schedule_validation.cpp
     test/cpp/memory/test_pool_peer_access.cpp
+    test/cpp/memory/test_device_transfer.cpp
     test/cpp/downgrade/test_downgrade_acquisition_failure.cpp
     test/cpp/data/test_chunked_spill_copy.cpp
     test/cpp/data/test_convertible_data_batch.cpp

@@ -157,6 +157,8 @@ void task_creator::prepare_for_query(const sirius::planner::query& query,
   state->completion_handler = handler;
 
   auto pipeline_priorities = compute_pipeline_priorities(query);
+  auto const host_spaces   = _mem_res_mgr.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+  auto const* host_staging_space = host_spaces.empty() ? nullptr : host_spaces.front();
 
   // Filled once, here, and never mutated afterwards: task-creation workers read it without a
   // lock, holding only their shared_ptr to this state. Note the map is NOT cleared — other
@@ -170,8 +172,8 @@ void task_creator::prepare_for_query(const sirius::planner::query& query,
       continue;
     }
     size_t operator_id = source_operator->get_operator_id();
-    auto gs =
-      std::make_shared<pipeline::gpu_pipeline_task_global_state>(pipeline, telemetry_context);
+    auto gs            = std::make_shared<pipeline::gpu_pipeline_task_global_state>(
+      pipeline, telemetry_context, host_staging_space);
     gs->set_completion_handler(handler);
     if (auto it = pipeline_priorities.find(pipeline.get()); it != pipeline_priorities.end()) {
       gs->set_priority(it->second);

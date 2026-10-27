@@ -534,6 +534,10 @@ TEST_CASE("a batch pinned on another GPU is gathered there and comes back in the
   REQUIRE(space0 != nullptr);
   REQUIRE(space1 != nullptr);
 
+  auto const policy = GENERATE(sirius::memory::device_transfer_policy::automatic,
+                               sirius::memory::device_transfer_policy::force_host_staging);
+  sirius::late_mat::transfer_context const transfers{
+    space0, mgr->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST).front(), policy};
   // The consumer runs on GPU 0; the middle batch is pinned on GPU 1.
   spread_pin pin({{kChunk, space0}, {kChunk, space1}, {kChunk, space0}});
   rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{0}};
@@ -553,8 +557,8 @@ TEST_CASE("a batch pinned on another GPU is gathered there and comes back in the
                                                 false});
 
   auto const before = sirius::late_mat::remote_batches_materialized();
-  auto ints         = materialize(pin.ints, prepared, stream, mr);
-  auto strings      = materialize(pin.strings, prepared, stream, mr);
+  auto ints         = materialize(pin.ints, prepared, stream, mr, transfers);
+  auto strings      = materialize(pin.strings, prepared, stream, mr, transfers);
   cudaStreamSynchronize(stream.get());
   // One remote batch per column, or the path under test did not run.
   REQUIRE(sirius::late_mat::remote_batches_materialized() == before + 2);
@@ -578,6 +582,8 @@ TEST_CASE("a remote gather that fails mid-transfer frees nothing a queued copy s
   REQUIRE(space0 != nullptr);
   REQUIRE(space1 != nullptr);
 
+  sirius::late_mat::transfer_context const transfers{
+    space0, mgr->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST).front()};
   // A STRING column, so the transfer back has several allocations in sequence
   // (the offsets child, then the characters): the failure the test is after is
   // an allocation that throws AFTER a copy reading an owner buffer was queued.
@@ -600,8 +606,8 @@ TEST_CASE("a remote gather that fails mid-transfer frees nothing a queued copy s
   // How many allocations a clean run makes on the consumer's resource.
   failing_resource counting{space0->get_default_allocator()};
   {
-    auto strings =
-      materialize(pin.strings, prepared, stream, rmm::device_async_resource_ref{counting});
+    auto strings = materialize(
+      pin.strings, prepared, stream, rmm::device_async_resource_ref{counting}, transfers);
     cudaStreamSynchronize(stream.get());
     REQUIRE(read_back_strings(strings->view()) == expected);
   }
@@ -622,8 +628,8 @@ TEST_CASE("a remote gather that fails mid-transfer frees nothing a queued copy s
     failing_resource failing{space0->get_default_allocator(), fail_at};
     bool threw = false;
     try {
-      auto strings =
-        materialize(pin.strings, attempt, stream, rmm::device_async_resource_ref{failing});
+      auto strings = materialize(
+        pin.strings, attempt, stream, rmm::device_async_resource_ref{failing}, transfers);
       cudaStreamSynchronize(stream.get());
       REQUIRE(read_back_strings(strings->view()) == expected);
     } catch (rmm::out_of_memory const&) {
@@ -639,7 +645,39 @@ TEST_CASE("a remote gather that fails mid-transfer frees nothing a queued copy s
   }
 
   // And the pin still reads back whole afterwards.
-  auto strings = materialize(pin.strings, prepared, stream, space0->get_default_allocator());
+  auto strings =
+    materialize(pin.strings, prepared, stream, space0->get_default_allocator(), transfers);
   cudaStreamSynchronize(stream.get());
+  REQUIRE(read_back_strings(strings->view()) == expected);
+}
+
+TEST_CASE("dense remote columns use HOST staging in either direction",
+          "[late_mat][materialize][multi_gpu]")
+{
+  if (!sirius::test::has_gpus(2)) { return; }
+  auto manager              = sirius::test::operator_utils::initialize_memory_manager(2);
+  int const consumer_device = GENERATE(0, 1);
+  auto* consumer = manager->get_memory_space(cucascade::memory::Tier::GPU, consumer_device);
+  auto* owner    = manager->get_memory_space(cucascade::memory::Tier::GPU, 1 - consumer_device);
+  spread_pin pin({{kChunk, owner}});
+  rmm::cuda_set_device_raii guard{rmm::cuda_device_id{consumer_device}};
+  auto const stream = consumer->acquire_stream();
+  auto const layout = pinned_table_layout::from_batch_rows({kChunk});
+  std::vector<std::uint64_t> ids(kChunk);
+  std::iota(ids.begin(), ids.end(), std::uint64_t{0});
+  auto d_ids = upload_ids(ids, stream);
+  prepared_selection const selection{
+    layout, row_id_list{static_cast<std::uint64_t const*>(d_ids.data()), kChunk, true}};
+  sirius::late_mat::transfer_context const transfers{
+    consumer,
+    manager->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST).front(),
+    sirius::memory::device_transfer_policy::force_host_staging};
+  auto strings =
+    materialize(pin.strings, selection, stream, consumer->get_default_allocator(), transfers);
+  stream.sync();
+  std::vector<std::string> expected;
+  for (auto id : ids) {
+    expected.push_back(std::to_string(id));
+  }
   REQUIRE(read_back_strings(strings->view()) == expected);
 }

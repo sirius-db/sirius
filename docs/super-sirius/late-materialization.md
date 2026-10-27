@@ -237,10 +237,9 @@ it off `device_pin_chunk::memory_space` or `pinned_entry::chunk_memory_spaces`),
 4. The owner's temporaries are freed on the owner's stream only after an event records that the
    consumer's copies have been enqueued.
 
-Both transfers use `cudaMemcpyPeerAsync`. Manager initialization grants access to the actual managed pools where supported; cuCascade does not disable ordinary peer access. The physical driver route is not measured by this setup, and a failed grant does not promise host staging. What crosses is the size of the SELECTION, not the chunk, which is why the
-cost model is unchanged: the ride still ends at the reduced row set, and the remote gather adds
-two small transfers to it. A remote batch forces the canonical path (per-batch selections),
-because the one-pass raw gather dereferences every batch from the consumer's GPU.
+Both transfers use Sirius's shared byte-copy utility (`memory::enqueue_device_copy`). Each direction requests access to its actual source pool: the consumer's pool for indices and the owner's pool for gathered buffers. A successful grant selects `cudaMemcpyPeerAsync`; unavailable access selects explicit GPU -> pinned HOST -> GPU copies using managed HOST blocks for the entire transfer. Each leg is submitted as a batch where supported, with one completion wait per leg. The direct path stays asynchronous, while staging completes before returning. Existing selection-ready and gather-ready events order the stream that actually reads each source. Exceptions drain both participating streams while the borrowed selection and pinned source still exist; normal completion reports ordering failures instead of discarding them.
+
+What crosses is the size of the selection, not the chunk. A remote batch forces the canonical path (per-batch selections), because the one-pass raw gather dereferences every batch from the consumer's GPU. HOST staging space is borrowed from the task's configured memory resources; it is required only when a remote transfer needs staging.
 
 The `[multi_gpu]`-tagged cases in `test_materialize.cpp` and `test_late_mat_deferred_query.cpp`
 exercise this with a batch pinned on GPU 1 and a consumer on GPU 0, and the latter also pins the

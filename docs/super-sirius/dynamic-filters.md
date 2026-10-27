@@ -255,7 +255,7 @@ A scan reached through an intervening join, a non-`BUILD_PROBE` consumer, or wor
 
 Already-processed batches are not revisited. The channel never creates a scheduling dependency, and late filters improve only later work.
 
-On multiple GPUs, consumers select only a replica owned by their current device. Membership replicas prefer peer DMA and otherwise use fixed pinned HOST staging; zone-map bounds are cloned per device. A GPU with no ready local replica skips that filter rather than dereferencing remote storage.
+On multiple GPUs, consumers select only a replica owned by their current device. Membership replicas use the shared `memory::enqueue_device_copy` helper: a successful source-pool grant selects the peer-copy API, otherwise managed pinned HOST blocks stage the entire transfer. Each leg is submitted as a batch where supported, with one completion wait per leg before return; peer copies complete in the existing replica drain. Zone-map bounds are cloned per device. A GPU with no ready local replica skips that filter rather than dereferencing remote storage.
 
 ## Configuration
 
