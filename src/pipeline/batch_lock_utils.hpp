@@ -27,6 +27,8 @@
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
 
+#include <chrono>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <tuple>
@@ -47,6 +49,28 @@ struct lock_to_new_batch {
 };
 
 using lock_and_prepare_batch_result = std::variant<lock_to_existing_batch, lock_to_new_batch>;
+
+/// What @ref lock_and_prepare_batch did with one batch, for callers that measure how ready their
+/// inputs were.
+struct lock_and_prepare_trace {
+  /// Nanoseconds spent waiting for the batch's locks. An exclusive holder, such as a promotion
+  /// copying the batch to the GPU, makes the caller wait here.
+  std::uint64_t lock_wait_ns{0};
+  /// The batch was on HOST or DISK and this call converted it to the target GPU.
+  bool upgraded_to_gpu{false};
+};
+
+namespace detail {
+
+/// Nanoseconds since @p start.
+[[nodiscard]] inline std::uint64_t elapsed_ns(std::chrono::steady_clock::time_point start) noexcept
+{
+  return static_cast<std::uint64_t>(
+    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start)
+      .count());
+}
+
+}  // namespace detail
 
 /**
  * @brief Lock or prepare a single data batch for processing in the requested memory space.
@@ -74,6 +98,8 @@ using lock_and_prepare_batch_result = std::variant<lock_to_existing_batch, lock_
  * @param requested_memory_space  Target memory space; may be nullptr to use the batch's current
  *                                space.
  * @param stream                  CUDA stream used for any data-movement kernels.
+ * @param trace                   When set, receives the lock wait and whether the batch was
+ * upgraded to the GPU.
  * @return A read_only_data_batch holding the shared lock (on the clone for cross-GPU inputs),
  *         or std::nullopt on failure.
  * @throws rmm::out_of_memory  If a GPU memory allocation fails during the conversion or clone.
@@ -81,7 +107,8 @@ using lock_and_prepare_batch_result = std::variant<lock_to_existing_batch, lock_
 inline std::optional<lock_and_prepare_batch_result> lock_and_prepare_batch(
   const std::shared_ptr<cucascade::data_batch>& batch,
   const cucascade::memory::memory_space* requested_memory_space,
-  ::cuda::stream_ref stream)
+  ::cuda::stream_ref stream,
+  lock_and_prepare_trace* trace = nullptr)
 {
   if (!batch) { return std::nullopt; }
 
@@ -106,7 +133,9 @@ inline std::optional<lock_and_prepare_batch_result> lock_and_prepare_batch(
   }
 
   // Acquire a read-only lock
+  auto const wait_start                         = std::chrono::steady_clock::now();
   cucascade::read_only_data_batch read_accessor = batch->to_read_only();
+  if (trace != nullptr) { trace->lock_wait_ns += detail::elapsed_ns(wait_start); }
 
   // Determine the target memory space
   const auto* target_space =
@@ -147,7 +176,9 @@ inline std::optional<lock_and_prepare_batch_result> lock_and_prepare_batch(
       {
         std::ignore =
           cucascade::data_batch::to_idle(std::move(read_accessor));  // release the read lock
+        auto const mut_wait_start                  = std::chrono::steady_clock::now();
         cucascade::mutable_data_batch mut_accessor = batch->to_mutable();
+        if (trace != nullptr) { trace->lock_wait_ns += detail::elapsed_ns(mut_wait_start); }
 
         // this upgrade to mutable is not atomic (shared released, then exclusive acquire): a
         // concurrent consumer of a shared spilled batch may have converted it in the gap.
@@ -178,6 +209,7 @@ inline std::optional<lock_and_prepare_batch_result> lock_and_prepare_batch(
         }
         mut_accessor.convert_to<cucascade::gpu_table_representation>(
           registry, target_space, stream);
+        if (trace != nullptr) { trace->upgraded_to_gpu = true; }
 
         // exclusive mutable access dropped.
       }

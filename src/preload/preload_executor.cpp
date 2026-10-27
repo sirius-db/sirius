@@ -541,6 +541,7 @@ void preload_executor::start()
       throw;
     }
     _state = run_state::running;
+    consumption_tracker::instance().enable();
     // Under the lifecycle lock, so a concurrent stop() cannot run between the threads starting
     // and event delivery starting. Events delivered from here on find the planner and the lanes
     // running.
@@ -573,8 +574,10 @@ void preload_executor::stop() noexcept
   // Hooks never take the lifecycle lock, so stopping delivery under it cannot deadlock.
   event::query_event_subscriber::stop();
   if (_state == run_state::stopped) { return; }
-  _state = run_state::stopped;
+  bool const was_running = _state == run_state::running;
+  _state                 = run_state::stopped;
   join_threads();
+  if (was_running) { consumption_tracker::instance().disable(); }
   std::lock_guard const lk{_mu};
   clear_ready_lists();
   _store.clear();
@@ -692,13 +695,16 @@ void preload_executor::forget_query(query_id_t q) noexcept
     if (stats) { mark_dirty(dirty::memory); }
     _quiescent_cv.notify_all();
   }
+  auto const inputs = consumption_tracker::instance().take_query(q);
   if (!stats) { return; }
+  add_input_readiness(*stats, inputs);
   auto const& s = *stats;
   log::log_noexcept([&] {
     SIRIUS_LOG_INFO(
       "[preload] query {}: promoted h2g={} d2g={} d2h={} relocate_d2h={} bytes={} hit={} "
       "bounce={} mispredicted={} wasted={} no_memory={} gated={} held_off={} contended={} "
-      "stale={} oom={} gpu_banned={} failed={} dropped(lock={} cap={} overflow={})",
+      "stale={} oom={} gpu_banned={} failed={} dropped(lock={} cap={} overflow={}) "
+      "inputs(ready={} waited={}/{}us upgraded={}/{}us)",
       q,
       s[counter::promoted_h2g],
       s[counter::promoted_d2g],
@@ -720,8 +726,27 @@ void preload_executor::forget_query(query_id_t q) noexcept
       s[counter::failed],
       s[counter::dropped_lock_attempts],
       s[counter::dropped_promotion_cap],
-      s[counter::dropped_overflow]);
+      s[counter::dropped_overflow],
+      s[counter::input_ready],
+      s[counter::input_waited],
+      s[counter::input_waited_us],
+      s[counter::input_upgraded],
+      s[counter::input_upgraded_us]);
   });
+}
+
+void preload_executor::add_input_readiness(per_query_stats& stats,
+                                           input_readiness_counts const& inputs) noexcept
+{
+  auto const add = [&](counter c, std::uint64_t n) {
+    stats.add(c, n);
+    _counters.add(c, n);
+  };
+  add(counter::input_ready, inputs.ready);
+  add(counter::input_waited, inputs.waited);
+  add(counter::input_waited_us, inputs.waited_ns / 1000);
+  add(counter::input_upgraded, inputs.upgraded);
+  add(counter::input_upgraded_us, inputs.upgraded_ns / 1000);
 }
 
 preload_stats preload_executor::stats() const { return _counters.snapshot(); }
@@ -736,6 +761,7 @@ void preload_executor::on_batch_downgraded(event::event_id_t,
                                            event::downgraded_batch const& batch) noexcept
 {
   hook_scope const in_hook{this};
+  consumption_tracker::instance().note_downgraded(query_id, batch.batch_id);
   std::lock_guard const lk{_mu};
   try {
     auto const status = _store.intake(query_id, batch);
@@ -1581,9 +1607,15 @@ void preload_executor::lane_loop(lane& l, std::stop_token const& st) noexcept
 
     lane_slot slot{*this, l, *taken};
     lk.unlock();
+    bool const to_gpu = taken->job.t.tier == Tier::GPU;
+    if (to_gpu) { consumption_tracker::instance().note_promotion_started(taken->job.batch_id); }
     auto const started = std::chrono::steady_clock::now();
     auto const result  = promote_one(taken->job, _env, unreserved_of(taken->job.t));
-    auto const us      = std::chrono::duration_cast<std::chrono::microseconds>(
+    if (to_gpu) {
+      consumption_tracker::instance().note_promotion_finished(
+        taken->job.batch_id, result.outcome == promotion_outcome::promoted);
+    }
+    auto const us = std::chrono::duration_cast<std::chrono::microseconds>(
                       std::chrono::steady_clock::now() - started)
                       .count();
     // Logged before taking the lock again: event hooks wait on it.

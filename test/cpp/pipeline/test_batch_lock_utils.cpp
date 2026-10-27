@@ -448,6 +448,38 @@ TEST_CASE("lock_or_prepare_batch host to GPU keeps move semantics", "[batch_lock
   REQUIRE(upgraded_values == source_values);
 }
 
+TEST_CASE("lock_and_prepare_batch reports whether it upgraded the batch", "[batch_lock_utils]")
+{
+  batch_lock_utils_fixture f;
+  REQUIRE(f.setup(1));
+
+  rmm::cuda_stream stream;
+  auto batch = f.make_gpu_batch(kNumRows, *f.gpu0, stream);
+
+  // Already on the target GPU: no upgrade.
+  {
+    sirius::pipeline::lock_and_prepare_trace trace;
+    auto prepared = sirius::pipeline::lock_and_prepare_batch(batch, f.gpu0, stream, &trace);
+    REQUIRE(prepared.has_value());
+    CHECK_FALSE(trace.upgraded_to_gpu);
+  }
+
+  {
+    auto mut = batch->to_mutable();
+    mut.convert_to<cucascade::host_data_representation>(
+      sirius::converter_registry::get(), f.host0, stream);
+  }
+  stream.synchronize();
+
+  // On HOST: this call does the upgrade.
+  sirius::pipeline::lock_and_prepare_trace trace;
+  auto prepared = sirius::pipeline::lock_and_prepare_batch(batch, f.gpu0, stream, &trace);
+  REQUIRE(prepared.has_value());
+  CHECK(trace.upgraded_to_gpu);
+  auto lock = std::get<sirius::pipeline::lock_to_existing_batch>(*prepared);
+  CHECK(lock.ro_lock.get_current_tier() == cucascade::memory::Tier::GPU);
+}
+
 TEST_CASE("concurrent same-GPU upgrades of a shared spilled batch race safely",
           "[batch_lock_utils]")
 {

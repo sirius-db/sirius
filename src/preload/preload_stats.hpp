@@ -34,6 +34,7 @@ namespace sirius::preload {
 // - worker refusals and work: what promotion attempts ended with;
 // - accuracy: whether preloaded batches were consumed where they were put (mispredicted_device_b
 //   is the class-B part of mispredicted_device);
+// - readiness (input_*): how tasks found their downgraded inputs (see consumption_tracker);
 // - timing: microseconds spent per promotion kind, and the planner's wake-to-dispatch latency.
 // High-water marks (*_max) are raised, never added to.
 #define SIRIUS_PRELOAD_COUNTERS(X) \
@@ -89,6 +90,11 @@ namespace sirius::preload {
   X(mispredicted_device_b)         \
   X(wasted_unconsumed)             \
   X(late_outcome_after_retire)     \
+  X(input_ready)                   \
+  X(input_waited)                  \
+  X(input_waited_us)               \
+  X(input_upgraded)                \
+  X(input_upgraded_us)             \
   X(promote_us_sum_h2g)            \
   X(promote_us_sum_d2g)            \
   X(promote_us_sum_d2h)            \

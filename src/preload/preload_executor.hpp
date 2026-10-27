@@ -27,6 +27,7 @@
 #include "memory/topology_index.hpp"
 #include "preload/candidate_store.hpp"
 #include "preload/config.hpp"
+#include "preload/consumption_tracker.hpp"
 #include "preload/hw_caps.hpp"
 #include "preload/preload_policy.hpp"
 #include "preload/preload_stats.hpp"
@@ -491,6 +492,8 @@ class preload_executor final : public event::query_event_subscriber {
   void build_spaces();
   void build_lanes();
   void log_start() const noexcept;
+  /// Add @p inputs, a query's input readiness, to its @p stats and to the executor's counters.
+  void add_input_readiness(per_query_stats& stats, input_readiness_counts const& inputs) noexcept;
   void join_threads() noexcept;
 
   preload_executor_config _cfg;
