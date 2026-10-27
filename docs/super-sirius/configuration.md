@@ -352,7 +352,7 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 | `uring_n_reactors` | int (**> 0**) | 1 | Number of io_uring reactor threads for local-disk reads. |
 | `rest_n_reactors` | int (**> 0**) | 2 | Number of REST reactor threads for object-store (`s3://`) reads. |
 | `max_readahead_scans` | int | — (unset) | Scans the readahead may keep in flight, and the switch that runs it at all. See below. |
-| `max_readahead_bytes` | bytes | — (unset) | Bytes the readahead may hold in prefetched splits not yet disposed. Unset takes the smallest prefetching budget (`cache.eviction_threshold_fraction` of the host tier) among the query's armed caches; `0` means no byte bound. See below. |
+| `max_readahead_bytes` | bytes | — (unset) | Bytes the readahead may hold in prefetched splits not yet disposed. Unset takes the smallest cache cap (`cache.max_host_fraction` of the host tier) among the query's armed caches; `0` means no byte bound. See below. |
 | `readahead_strategy` | enum: `eager`, `opportunistic` | — (unset) | When the readahead issues. Unset takes the serving backend's own preference: `eager` for object-store (REST) reads, `opportunistic` for local (uring) ones. Values are lowercase. |
 
 Caching itself is configured in the [`cache`](#scan_managercache--read-path-caching-iocacheconfighpp)
@@ -483,7 +483,7 @@ sirius:
 |-----|------|---------|-------------|
 | `mode` | enum: `none`, `os`, `sirius` | `none` | Which cache the read path goes through. Values are lowercase. |
 | `eviction` | enum: `idle`, `lru` | `lru` | What retires an idle chunk from the Sirius cache. Only meaningful under `mode: sirius`. Values are lowercase. |
-| `eviction_threshold_fraction` | double [0,1] | 0.8 | Hard cap on the cache's resident bytes, as a fraction of the host tier: allocations past it are refused (those reads are served uncached) and the evictor starts at it. `0` means uncapped. |
+| `max_host_fraction` | double [0,1] | 0.8 | Hard cap on the cache's resident bytes, as a fraction of the host tier: allocations past it are refused (those reads are served uncached) and the evictor starts at it. `0` means uncapped. The former name `eviction_threshold_fraction` is still accepted as a deprecated alias (with a warning); giving both is an error. |
 | `min_prefetching_budget_fraction` | double [0,1] | 0.05 | Floor of the pool reserved for prefetching. |
 
 `mode: none` bypasses every cache (`O_DIRECT`, no prefetching cache). `mode: os` reads
@@ -491,7 +491,7 @@ through the kernel page cache instead. `mode: sirius` reads `O_DIRECT` into Siri
 pinned prefetching cache.
 
 `eviction: lru` keeps idle chunks for reuse and evicts least-recently-used ones once the
-pool reaches its `eviction_threshold_fraction` cap; `eviction: idle` drops each chunk as soon as
+pool reaches its `max_host_fraction` cap; `eviction: idle` drops each chunk as soon as
 it goes idle, making the cache a prefetch staging area sized for the reads in flight rather
 than for reuse.
 

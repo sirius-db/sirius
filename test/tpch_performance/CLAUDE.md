@@ -220,7 +220,7 @@ It forces three cache settings into the effective config, overriding both `--con
 |---|---|---|
 | `cache.mode` | `sirius` | there is no cache to pin into otherwise |
 | `cache.eviction` | `lru` | `idle` drops a chunk the moment nothing reads it |
-| `cache.eviction_threshold_fraction` | `1.0` | the evictor should not start until the pool is full |
+| `cache.max_host_fraction` | `1.0` | the cache may fill the host tier; the evictor should not start before then |
 
 Residency is held by keeping each file's datasource (and so its prefetching handle) alive until
 `unpin_table`. Passing `--pin parquet` is enough to trigger the config rewrite — `--profile` is

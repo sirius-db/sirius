@@ -72,7 +72,7 @@ sirius::io::cache::config identity_cache_config()
   cfg.mode                            = sirius::io::cache::cache_mode::sirius;
   cfg.eviction                        = sirius::io::cache::eviction_policy::lru;
   cfg.min_prefetching_budget_fraction = 0.5;
-  cfg.eviction_threshold_fraction     = 1.0;
+  cfg.max_host_fraction               = 1.0;
   cfg.apply_mode();
   return cfg;
 }

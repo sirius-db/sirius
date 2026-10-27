@@ -1563,7 +1563,7 @@ void sirius_scan_manager::prepare_for_query(
     std::vector<backend_readahead_policy> backend_policies;
     backend_policies.reserve(query_io_ctxs.size());
     // The resident-byte bound an unset `max_readahead_bytes` defers to: the
-    // tightest prefetching budget among the caches this query reads into.
+    // tightest cap (`cache.max_host_fraction`) among the caches this query reads into.
     std::size_t cache_resident_budget = 0;
     for (auto const& io_ctx : query_io_ctxs) {
       // Nowhere to read ahead into on this backend, so it has no say in the
@@ -1572,7 +1572,7 @@ void sirius_scan_manager::prepare_for_query(
       backend_policies.push_back({.budget   = io_ctx->n_max_concurrent_scans(),
                                   .strategy = backend_prefetch_strategy(io_ctx->type())});
       if (auto* cache = io_ctx->cache(); cache != nullptr && cache->is_armed()) {
-        if (auto const bytes = cache->max_prefetching_budget_bytes(); bytes > 0) {
+        if (auto const bytes = cache->max_resident_bytes(); bytes > 0) {
           cache_resident_budget =
             cache_resident_budget == 0 ? bytes : std::min(cache_resident_budget, bytes);
         }
@@ -3348,11 +3348,12 @@ std::size_t sirius_scan_manager::pin_parquet_ranges(
     SIRIUS_LOG_WARN(
       "[pin_table] cache.eviction is 'idle', so pinned parquet chunks are reclaimed as soon "
       "as nothing is reading them; set eviction to 'lru' for a durable pin");
-  } else if (_config.cache.eviction_threshold_fraction < 1.0) {
+  } else if (_config.cache.max_host_fraction > 0.0 && _config.cache.max_host_fraction < 1.0) {
     SIRIUS_LOG_WARN(
-      "[pin_table] cache.eviction_threshold_fraction is {}, so the evictor starts before the "
-      "pool is full and can reclaim pinned chunks; set it to 1.0 for a durable pin",
-      _config.cache.eviction_threshold_fraction);
+      "[pin_table] cache.max_host_fraction is {}, so the cache is capped below the host tier "
+      "and the evictor can reclaim pinned chunks once it fills; set it to 1.0 (or 0, uncapped) "
+      "for a durable pin",
+      _config.cache.max_host_fraction);
   }
 
   // Built locally and published only once every file is pinned: a throw part

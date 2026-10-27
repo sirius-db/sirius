@@ -139,7 +139,7 @@ class buffer_pool {
   [[nodiscard]] size_t reservation_size_for_prefetching() const noexcept;
 
   /// Hard cap on the bytes of chunks the pool may hand out:
-  /// @c eviction_threshold_fraction of the host tier, chunk aligned.  0 means
+  /// @c max_host_fraction of the host tier, chunk aligned.  0 means
   /// uncapped.
   [[nodiscard]] size_t max_allowed_budget_for_prefetching() const noexcept;
 

@@ -416,12 +416,44 @@ TEST_CASE("sirius_config reads the cache tunables", "[scan_manager][config][cach
   auto const cfg = load_scan_manager("sirius_cache_tunables.yaml",
                                      cache_yaml("        mode: sirius\n"
                                                 "        eviction: idle\n"
-                                                "        eviction_threshold_fraction: 0.25\n"
+                                                "        max_host_fraction: 0.25\n"
                                                 "        min_prefetching_budget_fraction: 0.5\n"));
 
-  CHECK(cfg.cache.eviction_threshold_fraction == Approx(0.25));
+  CHECK(cfg.cache.max_host_fraction == Approx(0.25));
   CHECK(cfg.cache.min_prefetching_budget_fraction == Approx(0.5));
   CHECK(cfg.cache.dispose_on_idle);
+}
+
+TEST_CASE("sirius_config defaults the cache cap to 0.8 of the host tier",
+          "[scan_manager][config][cache_mode]")
+{
+  auto const cfg =
+    load_scan_manager("sirius_cache_cap_default.yaml", cache_yaml("        mode: sirius\n"));
+
+  CHECK(cfg.cache.max_host_fraction == Approx(0.8));
+}
+
+TEST_CASE("sirius_config accepts eviction_threshold_fraction as a deprecated alias of the cap",
+          "[scan_manager][config][cache_mode]")
+{
+  auto const cfg = load_scan_manager("sirius_cache_cap_alias.yaml",
+                                     cache_yaml("        mode: sirius\n"
+                                                "        eviction_threshold_fraction: 0.4\n"));
+
+  CHECK(cfg.cache.max_host_fraction == Approx(0.4));
+}
+
+TEST_CASE("sirius_config rejects the cache cap given under both of its names",
+          "[scan_manager][config][cache_mode]")
+{
+  scoped_yaml yaml("sirius_cache_cap_both.yaml",
+                   cache_yaml("        mode: sirius\n"
+                              "        max_host_fraction: 0.4\n"
+                              "        eviction_threshold_fraction: 0.4\n"));
+
+  sirius::sirius_config cfg;
+  CHECK_THROWS_WITH(cfg.load_from_file(yaml.path()),
+                    Catch::Matchers::ContainsSubstring("deprecated alias"));
 }
 
 TEST_CASE("sirius_config rejects an unknown cache mode", "[scan_manager][config][cache_mode]")

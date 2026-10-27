@@ -162,7 +162,7 @@ void run_prefetch(std::vector<file_info>& files,
   cache_cfg.mode                            = sirius::io::cache::cache_mode::sirius;
   cache_cfg.eviction                        = sirius::io::cache::eviction_policy::lru;
   cache_cfg.min_prefetching_budget_fraction = 0.9;
-  cache_cfg.eviction_threshold_fraction     = 0.9;
+  cache_cfg.max_host_fraction               = 0.9;
   cache_cfg.apply_mode();
   io_ctx.initialize_cache(mgr, cache_cfg, nullptr);
 

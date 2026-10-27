@@ -205,16 +205,16 @@ std::shared_ptr<const sirius::memory::topology_index> single_gpu_topology()
 }
 
 struct cache_fixture {
-  /// @p eviction_threshold_fraction sizes the cache's hard cap on resident
+  /// @p max_host_fraction sizes the cache's hard cap on resident
   /// chunk bytes as a fraction of the host tier.
-  explicit cache_fixture(double eviction_threshold_fraction = 0.8)
+  explicit cache_fixture(double max_host_fraction = 0.8)
     : memory(initialize_memory_manager(1)), context(std::make_shared<controlled_context>(1, [] {
         return std::make_unique<controlled_reactor>();
       }))
   {
     sirius::io::cache::config config;
-    config.mode                        = sirius::io::cache::cache_mode::sirius;
-    config.eviction_threshold_fraction = eviction_threshold_fraction;
+    config.mode              = sirius::io::cache::cache_mode::sirius;
+    config.max_host_fraction = max_host_fraction;
     config.apply_mode();
     context->initialize_cache(*memory, config, single_gpu_topology());
     datasource = context->open_datasource("controlled://cache-read-arbitration");
@@ -866,7 +866,7 @@ TEST_CASE("a cache whose chunk size differs from the reactor staging block is re
 // The budget is a hard cap on cache-resident bytes
 // ---------------------------------------------------------------------------
 //
-// An allocation that would cross eviction_threshold_fraction of the host tier
+// An allocation that would cross max_host_fraction of the host tier
 // is refused like an exhausted pool; a read over such a chunk still succeeds,
 // uncached.  0.0007 of the test host tier (3-4 GiB) is two 1 MiB chunks.
 
@@ -887,7 +887,7 @@ TEST_CASE("a demand read over the cache cap succeeds uncached", "[cache][cache_c
 {
   cache_fixture fixture(two_chunk_cap);
   auto* cache       = fixture.context->cache();
-  auto const budget = cache->max_prefetching_budget_bytes();
+  auto const budget = cache->max_resident_bytes();
   REQUIRE(budget == 2 * chunk_size);
 
   // A live request holds the whole cap.
@@ -924,7 +924,7 @@ TEST_CASE("a prefetch allocation over the cache cap recovers after disposal",
 {
   cache_fixture fixture(two_chunk_cap);
   auto* cache       = fixture.context->cache();
-  auto const budget = cache->max_prefetching_budget_bytes();
+  auto const budget = cache->max_resident_bytes();
   REQUIRE(budget == 2 * chunk_size);
 
   {
@@ -949,7 +949,7 @@ TEST_CASE("an empty cache admits one request larger than its cap", "[cache][cach
 {
   cache_fixture fixture(two_chunk_cap);
   auto* cache = fixture.context->cache();
-  REQUIRE(cache->max_prefetching_budget_bytes() == 2 * chunk_size);
+  REQUIRE(cache->max_resident_bytes() == 2 * chunk_size);
   REQUIRE(cache->claimed_bytes() == 0);
 
   // Four chunks against a two-chunk cap: admitted, or it could never run.

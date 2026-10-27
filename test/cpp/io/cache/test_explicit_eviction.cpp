@@ -127,7 +127,7 @@ scan_manager_config constrained_lru_config()
   // fills the small host tier. Only failed preparations' explicit requests may
   // free the disposable requests below.
   cfg.cache.min_prefetching_budget_fraction = 0.25;
-  cfg.cache.eviction_threshold_fraction     = 1.0;
+  cfg.cache.max_host_fraction               = 1.0;
   return cfg;
 }
 

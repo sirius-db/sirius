@@ -389,10 +389,10 @@ class prefetching_cache {
   /// rather than a value to compute an exact target from.
   [[nodiscard]] std::size_t claimed_bytes() const noexcept;
 
-  /// Hard cap on the cache's resident chunk bytes (@c eviction_threshold_fraction
+  /// Hard cap on the cache's resident chunk bytes (@c max_host_fraction
   /// of the host tier, chunk aligned); the readahead's default resident-byte
   /// bound.  0 without a pool (or uncapped).
-  [[nodiscard]] std::size_t max_prefetching_budget_bytes() const noexcept;
+  [[nodiscard]] std::size_t max_resident_bytes() const noexcept;
 
   /// How much of one object the cache holds.
   struct object_residency {

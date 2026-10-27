@@ -935,7 +935,7 @@ struct cache_identity_rest_fixture {
     cache_config.mode                            = sirius::io::cache::cache_mode::sirius;
     cache_config.eviction                        = sirius::io::cache::eviction_policy::lru;
     cache_config.min_prefetching_budget_fraction = 0.5;
-    cache_config.eviction_threshold_fraction     = 1.0;
+    cache_config.max_host_fraction               = 1.0;
     cache_config.apply_mode();
     context->initialize_cache(*memory, cache_config, single_gpu_index(0));
     REQUIRE(context->cache() != nullptr);

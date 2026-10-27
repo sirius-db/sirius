@@ -240,9 +240,9 @@ struct scan_manager_config {
   std::optional<prefetch_strategy> readahead_strategy{};
 
   /// Bytes the readahead may hold in prefetched splits the consumer has not yet
-  /// disposed.  Unset (the default) takes the smallest prefetching budget among
-  /// the caches the query reads through (see @ref resolve_readahead); @c 0
-  /// means no byte bound.
+  /// disposed.  Unset (the default) takes the smallest cache cap
+  /// (@c cache.max_host_fraction of the host tier) among the caches the query
+  /// reads through (see @ref resolve_readahead); @c 0 means no byte bound.
   std::optional<std::size_t> max_readahead_bytes{};
 
   /// Scans the executor can have running at once — the pipeline pool's width.
@@ -291,8 +291,8 @@ struct scan_manager_config {
   /// backend serving the scans — its @c n_max_concurrent_scans and the
   /// preference implied by its reactor type — and are what an unset
   /// @ref max_readahead_scans / @ref readahead_strategy defers to.
-  /// @p cache_resident_budget is the smallest prefetching budget among the
-  /// query's caches (0 when none is armed), which an unset
+  /// @p cache_resident_budget is the smallest cache cap (@c max_host_fraction)
+  /// among the query's caches (0 when none is armed), which an unset
   /// @ref max_readahead_bytes defers to.
   [[nodiscard]] readahead_plan resolve_readahead(
     std::size_t backend_budget,

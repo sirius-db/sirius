@@ -333,7 +333,7 @@ prefetching_cache::prefetching_cache(
   std::shared_ptr<const sirius::memory::topology_index> topology_index)
   : _cfg(cfg),
     _pool(std::make_shared<buffer_pool>(
-      reservation_manager, cfg.min_prefetching_budget_fraction, cfg.eviction_threshold_fraction)),
+      reservation_manager, cfg.min_prefetching_budget_fraction, cfg.max_host_fraction)),
     _io_ctx(io_ctx),
     _topology_index(std::move(topology_index)),
     _armed(_io_ctx->can_use_prefetching_cache()),
@@ -1297,7 +1297,7 @@ std::size_t prefetching_cache::claimed_bytes() const noexcept
   return _pool ? _pool->total_allocated_bytes() : 0;
 }
 
-std::size_t prefetching_cache::max_prefetching_budget_bytes() const noexcept
+std::size_t prefetching_cache::max_resident_bytes() const noexcept
 {
   return _pool ? _pool->max_allowed_budget_for_prefetching() : 0;
 }

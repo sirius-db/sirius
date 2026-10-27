@@ -153,13 +153,13 @@ CACHE_CONFIG_PATH = ("sirius", "executor", "scan_manager", "cache")
 
 # --pin parquet pins undecoded column chunks into the prefetching cache, so it
 # needs a cache that keeps them: 'sirius' to have one at all, 'lru' because
-# 'idle' drops a chunk the moment nothing is reading it, and a threshold of 1.0
-# so the evictor only starts once the pool is genuinely full. Without these the
+# 'idle' drops a chunk the moment nothing is reading it, and a cap of 1.0 (the
+# whole host tier) so the evictor only starts once the pool is genuinely full. Without these the
 # pin populates the cache and the evictor empties it again.
 PARQUET_PIN_CACHE = {
     "mode": "sirius",
     "eviction": "lru",
-    "eviction_threshold_fraction": 1.0,
+    "max_host_fraction": 1.0,
 }
 
 ENGINE_CHOICES = ("gpu", "cpu", "both")
@@ -588,6 +588,8 @@ def check_profile_sanity(
                 existing = _dig(doc, CACHE_CONFIG_PATH) or {}
                 for key, wanted in overrides.items():
                     have = existing.get(key)
+                    if have is None and key == "max_host_fraction":
+                        have = existing.get("eviction_threshold_fraction")
                     if have is not None and have != wanted:
                         warnings.append(
                             f"config sets cache.{key}={have!r}; "
@@ -657,7 +659,10 @@ def derive_profile_config(overrides, config_path, benchmark_dir):
     if not isinstance(doc, dict):
         doc = {}
 
-    _plant(doc, CACHE_CONFIG_PATH, overrides)
+    cache = _plant(doc, CACHE_CONFIG_PATH, overrides)
+    # The cap's former name is a deprecated alias that Sirius rejects beside the new one.
+    if "max_host_fraction" in overrides:
+        cache.pop("eviction_threshold_fraction", None)
 
     effective_path = os.path.join(benchmark_dir, "effective_config.yml")
     _dump_yaml(doc, effective_path)

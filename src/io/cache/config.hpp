@@ -40,7 +40,7 @@ enum class eviction_policy {
   /// sized for the reads in flight rather than for reuse.
   idle,
   /// Keep idle chunks for reuse and evict least-recently-used ones once the pool
-  /// reaches its @c eviction_threshold_fraction cap.
+  /// reaches its @c max_host_fraction cap.
   lru,
 };
 
@@ -114,7 +114,7 @@ struct config {
   /// Hard cap on the cache's resident chunk bytes, as a fraction of the host
   /// tier: allocations past it are refused (reads over those chunks are served
   /// uncached), and the evictor starts once it is reached.  0 means uncapped.
-  double eviction_threshold_fraction{0.8};
+  double max_host_fraction{0.8};
 
   /// Derived from @ref eviction by @ref apply_mode; not settable on its own.
   bool dispose_on_idle{false};
