@@ -75,7 +75,7 @@ void apply_spill_compression_config(compression_config const& config)
   set_spill_compression_settings({
     .enabled                 = config.enable_spill_compression,
     .min_batch_bytes         = config.spill_min_batch_bytes,
-    .max_compressed_fraction = config.max_compressed_fraction,
+    .max_compressed_fraction = config.spill_max_compressed_fraction,
     .encode_reserve_fraction = config.spill_encode_reserve_fraction,
   });
 }

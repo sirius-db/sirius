@@ -2,4 +2,5 @@ sirius:
   compression:
     enable_spill_compression: true
     spill_min_batch_bytes: 32MiB
+    spill_max_compressed_fraction: 0.5
     spill_encode_reserve_fraction: 0.25

@@ -905,7 +905,15 @@ TEST_CASE("Sirius configuration loads spill compression settings", "[sirius][con
   auto const& compression = config.get_compression_config();
   REQUIRE(compression.enable_spill_compression);
   REQUIRE(compression.spill_min_batch_bytes == 32ULL * 1024 * 1024);
+  REQUIRE(compression.spill_max_compressed_fraction == Approx(0.5));
+  REQUIRE(compression.max_compressed_fraction ==
+          Approx(sirius::compression_config{}.max_compressed_fraction));
   REQUIRE(compression.spill_encode_reserve_fraction == Approx(0.25));
+
+  sirius::sirius_config negative_fraction;
+  REQUIRE_THROWS_WITH(negative_fraction.load_from_file(
+                        data_dir / "invalid_spill_max_compressed_fraction_negative.yaml"),
+                      Catch::Matchers::ContainsSubstring("spill_max_compressed_fraction"));
 
   for (auto const* fixture : {"invalid_spill_encode_reserve_fraction_above_one.yaml",
                               "invalid_spill_encode_reserve_fraction_negative.yaml",

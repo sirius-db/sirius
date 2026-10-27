@@ -32,7 +32,7 @@
  * to the GPU.
  *
  * Every column gets a plan chosen from its type alone (default_spill_plan). The
- * compressed form is kept only when it saves enough (max_compressed_fraction);
+ * compressed form is kept only when it saves enough (spill_max_compressed_fraction);
  * otherwise, and on any failure, the batch spills uncompressed exactly as it
  * would with the feature off. See convertible_data_batch::convert for the hook.
  */
@@ -49,7 +49,7 @@ struct spill_compression_settings {
   /// worth paying for them (compression.spill_min_batch_bytes).
   std::size_t min_batch_bytes{64ULL * 1024 * 1024};
   /// Keep the compressed form only when header + payload is at most this fraction of
-  /// the batch's device size (compression.max_compressed_fraction).
+  /// the batch's device size (compression.spill_max_compressed_fraction).
   double max_compressed_fraction{0.75};
   /// Encode only when this fraction of the batch's size could be reserved in its GPU
   /// memory space -- the headroom the encoder needs. Not grantable means the batch
