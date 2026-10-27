@@ -1,11 +1,18 @@
 // Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0
-#include <sirius/c/error.h>
+#include "c_api/error_internal.hpp"
 
 #include <string>
 
 struct sirius_error {
   std::string message;
 };
+
+namespace sirius::c_api {
+sirius_status fail(sirius_status status, const char* message, sirius_error** error) noexcept
+{
+  return with_diagnostic(status, error, [&] { return new sirius_error{message}; });
+}
+}  // namespace sirius::c_api
 
 const char* sirius_error_message(const sirius_error* error) noexcept
 {
