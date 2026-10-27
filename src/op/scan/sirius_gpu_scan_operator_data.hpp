@@ -262,6 +262,19 @@ class scan_operator_input : public op::operator_data {
   /// Report @p site to the readahead manager and to every hinted datasource.
   void update(io::cache::scan_stage site) const;
 
+  /// The executor is about to reserve memory for this split: claim any device-readahead prefetch
+  /// it carries.  Marks the split claimed (so no prefetch can be installed afterwards) and
+  /// releases the prefetch's speculative budget before the demand reservation, while its buffers
+  /// stay alive for the decode.  Returns the bytes the prefetch reserved on @p target_space's GPU
+  /// (pending or ready), or 0 when there is none -- including when it is on another GPU, in
+  /// which case it is flagged wrong-device and discarded.  Idempotent; never throws.
+  [[nodiscard]] std::size_t claim_device_readahead(
+    ::cucascade::memory::memory_space const& target_space) const noexcept;
+
+  /// Drop this split's device-readahead prefetch (if any) and release its device memory, so the
+  /// decode reads for itself.  Never throws.
+  void discard_device_readahead() const noexcept;
+
   /**
    * @brief Prepare this split for execution in the requested memory space.
    *

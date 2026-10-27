@@ -16,6 +16,7 @@
  */
 
 // sirius
+#include "cuda/device_health.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "op/scan/owning_table_view.hpp"
 
@@ -91,7 +92,9 @@
 // standard library
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <future>
 #include <iterator>
@@ -111,6 +114,19 @@
 namespace sirius::op::scan {
 
 namespace {
+
+/// The message of @p error for a log line.  Only building the string can throw.
+std::string describe_failure(std::exception_ptr const& error)
+{
+  if (!error) { return "no error recorded"; }
+  try {
+    std::rethrow_exception(error);
+  } catch (std::exception const& e) {
+    return e.what();
+  } catch (...) {
+    return "unknown exception";
+  }
+}
 
 /// True when @p expr contains an IS NULL / IS NOT NULL predicate anywhere.
 ///
@@ -390,13 +406,15 @@ class parquet_batch_coalescer : public batch_coalescer {
                           std::shared_ptr<cudf::io::parquet_reader_options> reader_options,
                           std::shared_ptr<scan_plan const> plan,
                           scan_contract_id contract_id,
-                          std::shared_ptr<physical_check_counters> counters)
+                          std::shared_ptr<physical_check_counters> counters,
+                          bool device_prefetch_allowed)
     : _cap(cap),
       _reader_options(std::move(reader_options)),
       _plan(std::move(plan)),
       _needs_assembly(needs_output_assembly(*_plan)),
       _contract_id(contract_id),
-      _counters(std::move(counters))
+      _counters(std::move(counters)),
+      _device_prefetch_allowed(device_prefetch_allowed)
   {
   }
 
@@ -623,6 +641,7 @@ class parquet_batch_coalescer : public batch_coalescer {
     split->disable_filter_pushdown = _disable_pushdown;
     split->needs_assembly          = _needs_assembly;
     split->partition_values        = _partition_values;
+    split->device_prefetch_allowed = _device_prefetch_allowed;
     split->set_contract_payload(_contract_id, std::move(_certificates), std::move(_dependencies));
     _slices.clear();
     _certificates.clear();
@@ -640,6 +659,7 @@ class parquet_batch_coalescer : public batch_coalescer {
   const bool _needs_assembly;
   const scan_contract_id _contract_id;
   std::shared_ptr<physical_check_counters> _counters;
+  const bool _device_prefetch_allowed;
   std::vector<uint8_t> _run_original_schema;
   std::string _run_arrow_schema;
 
@@ -747,6 +767,54 @@ filename_column_size_estimate estimate_filename_column_size(std::size_t rows,
 }
 
 //===----------------------------------------------------------------------===//
+// parquet_split_info -- device-tier prefetch
+//===----------------------------------------------------------------------===//
+bool parquet_split_info::supports_device_prefetch() const noexcept
+{
+  // A field-ID mapping rewrites the decoded columns; the device route has not been validated
+  // for it.
+  if (!device_prefetch_allowed || field_mapping || rg_slices.empty()) { return false; }
+  if (plan && plan->has_user_virtual_columns()) { return false; }
+  if (_column_chunk_ranges.size() != rg_slices.size()) { return false; }
+  for (std::size_t i = 0; i < rg_slices.size(); ++i) {
+    if (!rg_slices[i].datasource || rg_slices[i].row_group_indices.empty() ||
+        _column_chunk_ranges[i].empty()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::optional<std::vector<prefetched_chunk_spans>> parquet_split_info::prefetched_spans_per_slice(
+  std::span<prefetched_ranges::device_ranges const> entries) const
+{
+  // Mirrors parquet_fadvise_entries: an entry exists exactly for each slice with a datasource
+  // and non-empty ranges, in slice order.
+  std::vector<prefetched_chunk_spans> per_slice;
+  per_slice.reserve(rg_slices.size());
+  std::size_t k = 0;
+  for (std::size_t i = 0; i < rg_slices.size(); ++i) {
+    auto const ranges =
+      i < _column_chunk_ranges.size()
+        ? std::span<cudf::io::text::byte_range_info const>(_column_chunk_ranges[i])
+        : std::span<cudf::io::text::byte_range_info const>{};
+    if (!rg_slices[i].datasource || ranges.empty()) {
+      per_slice.emplace_back();
+      continue;
+    }
+    if (k == entries.size()) { return std::nullopt; }
+    auto const& spans = entries[k++].spans;
+    if (spans.size() != ranges.size()) { return std::nullopt; }
+    for (std::size_t j = 0; j < spans.size(); ++j) {
+      if (spans[j].size() != static_cast<std::size_t>(ranges[j].size())) { return std::nullopt; }
+    }
+    per_slice.emplace_back(spans);
+  }
+  if (k != entries.size()) { return std::nullopt; }
+  return per_slice;
+}
+
+//===----------------------------------------------------------------------===//
 // parquet_ingestible_table_info::has_requested_user_virtual_columns
 //===----------------------------------------------------------------------===//
 bool parquet_ingestible_table_info::has_requested_user_virtual_columns() const
@@ -772,8 +840,9 @@ bool parquet_ingestible_table_info::has_requested_user_virtual_columns() const
 //===----------------------------------------------------------------------===//
 // parquet_gpu_ingestible — construction
 //===----------------------------------------------------------------------===//
-parquet_scan_core::parquet_scan_core(std::unique_ptr<parquet_ingestible_table_info> info)
-  : _info(std::move(info))
+parquet_scan_core::parquet_scan_core(std::unique_ptr<parquet_ingestible_table_info> info,
+                                     bool device_prefetch_allowed)
+  : _info(std::move(info)), _device_prefetch_allowed(device_prefetch_allowed)
 {
   auto const& bind = static_cast<parquet_ingestible_table_info const&>(table_info());
 
@@ -986,7 +1055,8 @@ std::unique_ptr<batch_coalescer> parquet_scan_core::create_batch_coalescer() con
                                                    _reader_options,
                                                    _plan,
                                                    _info->contract_id,
-                                                   _info->profiles->counters);
+                                                   _info->profiles->counters,
+                                                   device_prefetch_allowed());
 }
 
 //===----------------------------------------------------------------------===//
@@ -1963,6 +2033,61 @@ filtered_table parquet_scan_core::materialize_metadata_to_table(
   if (reader_filter_root) { opts.set_filter(*reader_filter_root); }
 
   rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
+
+  // Device tier: the readahead may already have landed this split's column chunks on a GPU.
+  // Taken exactly once (an OOM retry re-enters here and reads for itself).  The buffers live in
+  // this scope until the decode has been enqueued on `stream`; take() rebound their
+  // deallocation stream to it, so their free trails the decode -- also after a failed decode.
+  std::vector<prefetched_ranges::device_ranges> device_ranges;
+  std::vector<prefetched_chunk_spans> prefetched_spans;
+  if (auto p = split.take_prefetched_ranges()) {
+    constexpr auto k_device_prefetch_wait = std::chrono::seconds{60};  // >= 2x the REST timeout
+    if (all_slices_pruned || _plan->has_user_virtual_columns() || !split.device_prefetch_allowed ||
+        split.field_mapping) {
+      // Not decodable from device spans: released unconsumed below.
+    } else if (p->device_id() != mem_space.get_device_id()) {
+      // Checked before waiting: the task was re-pinned to another GPU after the readahead
+      // placed the split, and bytes on another device are of no use here.
+      SIRIUS_LOG_DEBUG(
+        "[parquet_scan] device prefetch is on GPU {} but the task decodes on GPU {}; reading",
+        p->device_id(),
+        mem_space.get_device_id());
+      p->flag_wrong_device();
+    } else {
+      switch (p->wait_for(k_device_prefetch_wait)) {
+        case prefetched_ranges::state::ready:
+          // Checked before taking: a prefetch that cannot be used is released unconsumed.
+          if (!split.prefetched_spans_per_slice(p->peek())) {
+            SIRIUS_LOG_WARN(
+              "[parquet_scan] device prefetch does not line up with the split; reading");
+          } else if (auto taken = p->take(stream)) {
+            device_ranges = std::move(*taken);  // freed on `stream` when this scope ends
+            if (auto mapped = split.prefetched_spans_per_slice(device_ranges)) {
+              prefetched_spans = std::move(*mapped);
+            }
+          } else {
+            SIRIUS_LOG_DEBUG(
+              "[parquet_scan] device prefetch could not be taken on the current device; reading");
+          }
+          break;
+        case prefetched_ranges::state::failed:
+          if (p->abandoned()) {
+            SIRIUS_LOG_DEBUG(
+              "[parquet_scan] device prefetch abandoned (consumer overtook it); reading");
+          } else {
+            SIRIUS_LOG_WARN("[parquet_scan] device prefetch failed ({}); reading",
+                            describe_failure(p->failure()));
+          }
+          break;
+        case prefetched_ranges::state::pending:
+          SIRIUS_LOG_WARN("[parquet_scan] device prefetch still pending after {} s; reading",
+                          k_device_prefetch_wait.count());
+          break;
+      }
+    }
+    p.reset();  // untaken buffers free here (producer stream, device bound)
+  }
+
   std::unique_ptr<cudf::table> table;
   if (_plan->has_user_virtual_columns() && !all_slices_pruned) {
     // Preserve provenance without relying on multi-source output order.
@@ -2022,10 +2147,11 @@ filtered_table parquet_scan_core::materialize_metadata_to_table(
       table = cudf::concatenate(views, stream, mr_ref);
     }
   } else {
-    // materialize_parquet picks the route: a bulk hybrid scan (hybrid_scan_reader
-    // for one file, hybrid_scan_multifile for several) when every slice's backend
-    // prefers it, otherwise read_parquet.  Both routes apply `opts`' row filter
-    // identically, so `reader_applied_full_filter` below stays route-independent.
+    // Three routes: the hybrid scan reader over a device-tier prefetch taken above;
+    // else materialize_parquet's bulk hybrid scan (hybrid_scan_reader for one file,
+    // hybrid_scan_multifile for several) when every slice's backend prefers it;
+    // else read_parquet.  All apply `opts`' row filter identically, so
+    // `reader_applied_full_filter` below stays route-independent.
     // The all-pruned split is left to read_parquet: it has no row groups to
     // enumerate, and set_num_rows(0) already builds the schema-correct empty
     // table without touching a data page.
@@ -2038,10 +2164,9 @@ filtered_table parquet_scan_core::materialize_metadata_to_table(
     if (!all_slices_pruned && _info->profiles->counters)
       for (auto const& slice : split.rg_slices)
         _info->profiles->counters->reader_call(slice.file_path);
-    bool const bulk = !all_slices_pruned && prefers_bulk_materialize(sources, opts);
-    if (bulk) {
-      table = materialize_parquet(sources, opts, split.column_chunk_byte_ranges(), stream, mr_ref);
-    } else {
+    // Today's route for local files, and the device route's fallback: read_parquet reads as it
+    // decodes.
+    auto read_general = [&]() -> std::unique_ptr<cudf::table> {
       std::vector<std::unique_ptr<cudf::io::datasource>> cudf_sources;
       std::vector<cudf::io::parquet::FileMetaData> metadatas;
       std::vector<std::vector<cudf::size_type>> rg_per_src;
@@ -2058,10 +2183,56 @@ filtered_table parquet_scan_core::materialize_metadata_to_table(
       // The general route reads as it decodes, so it needs the row-group selection
       // on the options; the hybrid readers take it as a call argument instead.
       if (!all_slices_pruned) { opts.set_row_groups(std::move(rg_per_src)); }
-      table = std::move(
+      return std::move(
         cudf::io::read_parquet(std::move(cudf_sources), std::move(metadatas), opts, stream, mr_ref)
           .tbl);
+    };
+    // Before a fallback read: free the device copies first (stream-ordered behind whatever was
+    // enqueued on `stream`), so the read does not run with both resident.
+    auto drop_device_copies = [&]() noexcept {
+      prefetched_spans.clear();
+      device_ranges.clear();
+    };
+    // Several files: the device route refuses schema drift the way the bulk route does; today's
+    // route is what those splits get, so decide before choosing the route.
+    bool from_device = !prefetched_spans.empty();
+    if (from_device && sources.size() > 1) {
+      try {
+        require_same_parquet_schema(sources);
+      } catch (std::exception const& e) {
+        SIRIUS_LOG_WARN("[parquet_scan] device prefetch skipped: {}", e.what());
+        from_device = false;
+        drop_device_copies();
+      }
     }
+    if (from_device) {
+      try {
+        table = materialize_parquet(
+          sources, opts, split.column_chunk_byte_ranges(), prefetched_spans, stream, mr_ref);
+      } catch (std::bad_alloc const&) {
+        throw;  // rmm::out_of_memory among them: the scheduler's retry needs it
+      } catch (std::exception const& e) {  // prefetched_mismatch, cudf::logic_error, ...
+        // A fatal CUDA error poisons the context: the general route would only fail again and
+        // report its own error instead of this one.
+        if (sirius::fatal_device_status(std::current_exception())) { throw; }
+        SIRIUS_LOG_WARN(
+          "[parquet_scan] device-route decode failed ({}); reading through the general route",
+          e.what());
+        drop_device_copies();
+        table = read_general();
+      }
+    } else {
+      drop_device_copies();
+      if (!all_slices_pruned && prefers_bulk_materialize(sources, opts)) {
+        table =
+          materialize_parquet(sources, opts, split.column_chunk_byte_ranges(), stream, mr_ref);
+      } else {
+        table = read_general();
+      }
+    }
+    // The decode is enqueued on `stream`: free the device copies now, stream-ordered behind it,
+    // rather than holding them through assembly.
+    drop_device_copies();
     if (split.field_mapping) {
       auto rows = table->num_rows();
       table = split.field_mapping->apply(owning_table_view(std::move(table)), rows, stream, mr_ref)

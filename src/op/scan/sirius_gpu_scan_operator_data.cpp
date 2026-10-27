@@ -21,10 +21,12 @@
 
 #include <compression/decompression_pushdown_policy.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
+#include <cucascade/memory/memory_space.hpp>
 #include <data/sirius_converter_registry.hpp>
 #include <log/logging.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/decoded_batch_representation.hpp>
+#include <op/scan/prefetched_ranges.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <pipeline/batch_lock_utils.hpp>
 #include <scan_manager/readahead_scan_manager.hpp>
@@ -159,6 +161,9 @@ void scan_operator_input::initialize_prefetch()
   if (!has_scan_metadata()) return;
   auto const& stored    = std::get<std::shared_ptr<scan_info>>(materialization_info);
   auto preferred_device = get_preferred_device_id();
+  // Stamped before registration for the same reason as the hints below: the readahead worker
+  // reads it the moment the split is published.
+  stored->set_preferred_device(preferred_device);
 
   // Hint BEFORE publishing.  Registration below is what makes this split
   // eligible for prefetching, and the readahead worker can act on it the moment
@@ -207,6 +212,30 @@ scan_operator_input::scan_operator_input(
     _readahead(std::move(readahead)),
     _operator_id(operator_id)
 {
+}
+
+std::size_t scan_operator_input::claim_device_readahead(
+  ::cucascade::memory::memory_space const& target_space) const noexcept
+{
+  if (!has_scan_metadata()) { return 0; }
+  auto const& info = std::get<std::shared_ptr<scan_info>>(materialization_info);
+  info->claim_device_readahead();
+  auto const ranges = info->prefetched();
+  if (!ranges) { return 0; }
+  if (ranges->device_id() != target_space.get_device_id()) {
+    // The task was re-pinned to another GPU after the readahead placed the split: those bytes
+    // are of no use here.
+    ranges->flag_wrong_device();
+    info->discard_prefetched_ranges();
+    return 0;
+  }
+  return ranges->reserved_bytes();
+}
+
+void scan_operator_input::discard_device_readahead() const noexcept
+{
+  if (!has_scan_metadata()) { return; }
+  std::get<std::shared_ptr<scan_info>>(materialization_info)->discard_prefetched_ranges();
 }
 
 void scan_operator_input::update(io::cache::scan_stage site) const

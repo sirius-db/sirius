@@ -278,6 +278,16 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
   [[nodiscard]] pipeline::reservation_size_info get_estimated_reservation_size_info(
     const cucascade::memory::memory_space* target_space) const override;
 
+  /// @brief Claim this task's device-readahead prefetch (if its input is a scan split that has
+  /// one) before the task reserves memory.  Releases the prefetch's speculative budget while its
+  /// buffers stay alive for the decode, and returns the bytes it already holds on @p target_space
+  /// (0 when there is none, or it sat on another GPU and was discarded).  Idempotent.
+  [[nodiscard]] std::size_t claim_device_readahead(
+    const cucascade::memory::memory_space& target_space) const noexcept;
+
+  /// @brief Drop this task's device-readahead prefetch so the decode reads for itself.
+  void discard_device_readahead() const noexcept;
+
   /// @brief Get the output consumer operators for this task.
   std::vector<op::sirius_physical_operator*> get_output_consumers() override;
 

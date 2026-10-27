@@ -27,9 +27,11 @@
 #include "scan_manager/preparation_options.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -226,8 +228,9 @@ struct scan_manager_config {
   /// with a cache on, the budget is the backend reactor's own
   /// @c n_max_concurrent_scans (see @ref resolve_readahead); with
   /// @c cache.mode of @c none there is nothing to read ahead into and the
-  /// readahead does not run.  Set it to @c 0 to turn the readahead off even
-  /// with a cache on, or to a positive count to override the backend's budget.
+  /// readahead does not run, unless @ref device_prefetching_enabled (which needs
+  /// no cache).  Set it to @c 0 to turn the readahead off even with a cache on,
+  /// or to a positive count to override the backend's budget.
   std::optional<std::size_t> max_readahead_scans{};
 
   /// When the readahead issues.  Unset (the default) takes the serving
@@ -235,6 +238,20 @@ struct scan_manager_config {
   /// for a local (uring) device (see @ref prefetch_strategy).  Set it to pin one
   /// strategy whatever the backend.
   std::optional<prefetch_strategy> readahead_strategy{};
+
+  /// Fraction of each GPU memory space's capacity the readahead may fill with
+  /// speculative reads that land directly in device memory (device
+  /// prefetching).  Must be finite and in [0, 1].  The default of @c 0 disables
+  /// device prefetching, leaving the host-side readahead exactly as it was.
+  double device_prefetching_budget{0.0};
+
+  /// Ceiling on GPU memory consumption, as a fraction of the space's capacity,
+  /// for issuing a device prefetch.  Must be finite and in [0, 1].  At or above
+  /// this ceiling the readahead falls back to the existing host prefetch.  Only
+  /// meaningful when @ref device_prefetching_enabled.  Keep it below the GPU
+  /// downgrade stop fraction so speculation never pushes the space into
+  /// eviction; the runtime applies the stricter of the two.
+  double device_prefetching_threshold{0.5};
 
   /// Scans the executor can have running at once — the pipeline pool's width.
   /// The budget @c opportunistic schedules against, since one prefetch per
@@ -270,6 +287,12 @@ struct scan_manager_config {
   /// splits. Disabled by default.
   memory_prefetcher_config memory_prefetcher{};
 
+  /// Whether device prefetching is on: a positive @ref device_prefetching_budget.
+  [[nodiscard]] bool device_prefetching_enabled() const noexcept
+  {
+    return device_prefetching_budget > 0.0;
+  }
+
   /// Refresh the knobs derived from @ref cache.
   void apply_cache_mode() noexcept
   {
@@ -286,14 +309,21 @@ struct scan_manager_config {
                                                  prefetch_strategy backend_strategy) const noexcept
   {
     readahead_plan plan{.budget = 0, .strategy = readahead_strategy.value_or(backend_strategy)};
+    // Device prefetching is asynchronous GPU-bound work: unless the strategy is
+    // pinned, run it eagerly so slots stay filled.  A backend budget of zero is
+    // still an opt-out, so it keeps the backend's strategy.
+    if (device_prefetching_enabled() && !readahead_strategy.has_value() && backend_budget > 0) {
+      plan.strategy = prefetch_strategy::eager;
+    }
     // An explicit budget is the whole answer, zero (off) included.
     if (max_readahead_scans.has_value()) {
       plan.budget = *max_readahead_scans;
       return plan;
     }
     // Without a cache the readahead has nowhere to read into: a prefetched
-    // chunk would be dropped before its scan ever asked for it.
-    if (!cache.enabled()) { return plan; }
+    // chunk would be dropped before its scan ever asked for it.  Device
+    // prefetching reads into GPU memory instead, so it needs no cache.
+    if (!cache.enabled() && !device_prefetching_enabled()) { return plan; }
     // A backend budget of zero is the backend opting out of readahead entirely
     // (see io::uring::config::n_max_concurrent_scans).  Honor it even under the
     // opportunistic strategy, which would otherwise substitute the pipeline
@@ -313,6 +343,13 @@ struct scan_manager_config {
 inline scan_manager_config validate_scan_manager_config(scan_manager_config config)
 {
   (void)config.preparation.resolve(config.thread_pool.num_threads);
+  auto const require_fraction = [](double value, char const* name) {
+    if (!std::isfinite(value) || value < 0.0 || value > 1.0) {
+      throw std::invalid_argument(std::string(name) + " must be finite and between 0.0 and 1.0");
+    }
+  };
+  require_fraction(config.device_prefetching_budget, "device_prefetching_budget");
+  require_fraction(config.device_prefetching_threshold, "device_prefetching_threshold");
   return config;
 }
 }  // namespace sirius::scan_manager

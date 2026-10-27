@@ -50,7 +50,7 @@ std::shared_ptr<iceberg_gpu_ingestible> make_ingestible(
 }
 
 iceberg_gpu_ingestible::iceberg_gpu_ingestible(std::unique_ptr<iceberg_ingestible_table_info> info)
-  : _core(std::move(info))
+  : _core(std::move(info), /*device_prefetch_allowed=*/false)
 {
   auto const& bind = static_cast<iceberg_ingestible_table_info const&>(table_info());
   _table_path      = bind.table_path;

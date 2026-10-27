@@ -35,6 +35,7 @@
 #include <future>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <unordered_map>
 
 namespace sirius::parallel {
@@ -44,6 +45,10 @@ class downgrade_executor;
 namespace sirius::telemetry {
 class telemetry_context;
 }  // namespace sirius::telemetry
+
+namespace sirius::scan_manager {
+class device_readahead_registry;
+}  // namespace sirius::scan_manager
 
 namespace sirius {
 
@@ -135,6 +140,22 @@ class task_scheduler {
     // The executors report memory downgrades into the same observer.
     for (auto& [_, executor] : _gpu_executors) {
       if (executor) { executor->set_query_event_publisher(publisher); }
+    }
+  }
+
+  /**
+   * @brief Install the device-readahead registry on every GPU executor; null removes it.
+   *
+   * @pre The scheduler is not running.
+   * @throws std::logic_error if the scheduler is running.
+   */
+  void set_device_readahead(std::shared_ptr<sirius::scan_manager::device_readahead_registry> reg)
+  {
+    if (_running.load(std::memory_order_acquire)) {
+      throw std::logic_error("task_scheduler: device readahead set while running");
+    }
+    for (auto& [_, executor] : _gpu_executors) {
+      if (executor) { executor->set_device_readahead(reg); }
     }
   }
 

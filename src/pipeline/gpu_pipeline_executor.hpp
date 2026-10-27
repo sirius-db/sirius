@@ -30,6 +30,7 @@
 
 #include <atomic>
 #include <memory>
+#include <stdexcept>
 #include <thread>
 
 namespace sirius::op {
@@ -43,6 +44,10 @@ class downgrade_executor;
 namespace sirius::telemetry {
 class telemetry_context;
 }  // namespace sirius::telemetry
+
+namespace sirius::scan_manager {
+class device_readahead_registry;
+}  // namespace sirius::scan_manager
 
 namespace sirius {
 
@@ -94,6 +99,25 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
   void set_query_event_publisher(sirius::event::query_event_publisher& publisher)
   {
     _query_event_publisher = publisher.shared_from_this();
+  }
+
+  /**
+   * @brief Install the runtime's device-readahead registry.
+   *
+   * With a registry, the manager thread claims a task's device-readahead prefetch before it
+   * reserves memory, raises this GPU's demand-admission guard while it does, and sheds the
+   * unclaimed prefetches before waiting on a refused reservation.  Null (the default, and
+   * device prefetching being off) leaves the reservation path exactly as it was.
+   *
+   * @pre The executor is not running: the manager thread reads the handle unsynchronized.
+   * @throws std::logic_error if the executor is running.
+   */
+  void set_device_readahead(std::shared_ptr<sirius::scan_manager::device_readahead_registry> reg)
+  {
+    if (_running.load(std::memory_order_acquire)) {
+      throw std::logic_error("gpu_pipeline_executor: device readahead set while running");
+    }
+    _device_readahead = std::move(reg);
   }
 
   // Non-copyable but movable
@@ -173,6 +197,8 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
   /// Observer of query event transitions.  Never null; see task_creator.
   std::shared_ptr<sirius::event::query_event_publisher> _query_event_publisher{
     std::make_shared<sirius::event::query_event_publisher>()};
+  /// Runtime-wide device-readahead registry; null unless device prefetching is enabled.
+  std::shared_ptr<sirius::scan_manager::device_readahead_registry> _device_readahead;
   sirius::creator::task_creator* _task_creator{nullptr};
   std::atomic<size_t> _tasks_executed{0};
 };

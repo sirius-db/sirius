@@ -29,6 +29,7 @@
 #include "pipeline/completion_handler.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
 #include "pipeline/task_request.hpp"
+#include "scan_manager/device_prefetch.hpp"
 #include "telemetry-bridge/gen/quent.hpp"
 #include "telemetry/telemetry_context.hpp"
 
@@ -43,10 +44,39 @@
 #include <format>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <utility>
 namespace sirius {
 namespace pipeline {
+
+namespace {
+
+/**
+ * Holds one GPU's demand-admission guard up while a task secures its reservation, so the device
+ * readahead cannot refill memory the task is waiting for (or just shed for it).
+ *
+ * The guard is raised under the GPU's allocation mutex, the same one the issuer holds around
+ * admission and install, so an install in flight is either finished (and visible to the shed) or
+ * refused by the guard -- never missed.
+ */
+class demand_admission_guard {
+ public:
+  explicit demand_admission_guard(scan_manager::device_readahead_gpu& gpu) : _gpu(gpu)
+  {
+    std::lock_guard<std::mutex> lock(_gpu.allocation_mutex());
+    _gpu.enter_demand_guard();
+  }
+  ~demand_admission_guard() { _gpu.exit_demand_guard(); }
+
+  demand_admission_guard(demand_admission_guard const&)            = delete;
+  demand_admission_guard& operator=(demand_admission_guard const&) = delete;
+
+ private:
+  scan_manager::device_readahead_gpu& _gpu;
+};
+
+}  // namespace
 
 gpu_pipeline_executor::gpu_pipeline_executor(
   sirius::exec::query_lifecycle_registry& lifecycle,
@@ -180,6 +210,20 @@ void gpu_pipeline_executor::process_task(
     auto const query_id = pipe ? pipe->get_query_id() : make_query_id(0);
     iteration_query     = query_id;
     if (!_query_lifecycle.accepts_work(query_id)) { return; }
+    // Device readahead (off unless a registry is installed): claim this task's prefetch before
+    // anything is reserved.  The claim releases the prefetch's speculative budget while its
+    // buffers stay alive for the decode, so the demand reservation below is not charged against
+    // memory the task already holds.  `own_prefetched_bytes` is what the prefetch holds here.
+    auto* const readahead_gpu =
+      _device_readahead ? _device_readahead->gpu(_memory_space->get_device_id()) : nullptr;
+    std::size_t own_prefetched_bytes = 0;
+    if (_device_readahead) {
+      own_prefetched_bytes = gpu_task->claim_device_readahead(*_memory_space);
+    }
+    // Raised before the first reservation attempt and held until the task's memory is admitted,
+    // so the issuer cannot replenish capacity that is shed (or freed) for this task.
+    std::optional<demand_admission_guard> demand_guard;
+    if (readahead_gpu != nullptr) { demand_guard.emplace(*readahead_gpu); }
     // Pass this executor's memory space so cross-space inputs (host/disk tiers and GPU data on
     // another device, which prepare clones into this space) are counted in the reservation.
     auto reservation_info = gpu_task->get_estimated_reservation_size_info(_memory_space);
@@ -214,6 +258,25 @@ void gpu_pipeline_executor::process_task(
         gpu_task->get_task_id());
       bytes_needs = space_max;
     }
+    // The prefetch's buffers are already physically allocated on this GPU: the reservation need
+    // only cover the rest.  A prefetch that alone fills the space is dropped, and the task reads
+    // for itself (the request is never clamped to zero).
+    if (own_prefetched_bytes > 0) {
+      if (auto const space_max = _memory_space->get_max_memory(); space_max > 0) {
+        if (own_prefetched_bytes >= space_max) {
+          SIRIUS_LOG_DEBUG(
+            "GPU Pipeline Executor: device prefetch of {} bytes fills the space ({} bytes max); "
+            "discarding it for task {}",
+            own_prefetched_bytes,
+            space_max,
+            gpu_task->get_task_id());
+          gpu_task->discard_device_readahead();
+          own_prefetched_bytes = 0;
+        } else {
+          bytes_needs = std::min(bytes_needs, space_max - own_prefetched_bytes);
+        }
+      }
+    }
     SIRIUS_LOG_TRACE(
       "[GPU:{}] GPU Pipeline Executor: Acquiring memory reservation for pipeline {} of {} bytes "
       "for task {}. Memory available: {}, total reserved: {}, max: {}",
@@ -230,6 +293,16 @@ void gpu_pipeline_executor::process_task(
     // would have exploited is over.  A reservation that succeeds outright is the
     // common case and raises nothing.
     auto reservation = _memory_space->make_reservation_or_null(bytes_needs);
+    // First refusal (nothing, or only part of it): the device readahead's own unclaimed
+    // speculation is the cheapest memory to give back, ahead of waiting or downgrading.  Shedding
+    // releases each prefetch's memory when its in-flight IO completes, and the demand guard keeps
+    // the issuer from refilling it; the retry is non-blocking, so a miss falls through to the
+    // existing wait and downgrade path.
+    if (readahead_gpu != nullptr && (!reservation || reservation->size() < bytes_needs) &&
+        readahead_gpu->shed_unclaimed() > 0) {
+      reservation.reset();  // never hold a partial grant while asking again
+      reservation = _memory_space->make_reservation_or_null(bytes_needs);
+    }
     exec::query_lifecycle_registry::memory_wait_guard memory_wait_activity;
     if (!reservation || reservation->size() < bytes_needs) {
       memory_wait_activity =
@@ -387,6 +460,8 @@ void gpu_pipeline_executor::process_task(
         reservation->size());
     }
     memory_wait_activity.reset();
+    // Memory admitted: the readahead may speculate again.
+    demand_guard.reset();
     if (auto* local_state = dynamic_cast<sirius::pipeline::sirius_pipeline_task_local_state*>(
           gpu_task->local_state())) {
       local_state->set_reservation(std::move(reservation), reservation_info);

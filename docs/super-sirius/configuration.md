@@ -353,6 +353,8 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 | `rest_n_reactors` | int (**> 0**) | 2 | Number of REST reactor threads for object-store (`s3://`) reads. |
 | `max_readahead_scans` | int | — (unset) | Scans the readahead may keep in flight, and the switch that runs it at all. See below. |
 | `readahead_strategy` | enum: `eager`, `opportunistic` | — (unset) | When the readahead issues. Unset takes the serving backend's own preference: `eager` for object-store (REST) reads, `opportunistic` for local (uring) ones. Values are lowercase. |
+| `device_prefetching_budget` | double [0, 1] | `0.0` (off) | Fraction of GPU space capacity the readahead may fill with speculative reads that land directly in device memory. `0` disables device prefetching. See below. |
+| `device_prefetching_threshold` | double [0, 1] | `0.5` | Ceiling on GPU consumption (fraction of capacity) for issuing a device prefetch. At or above it the readahead falls back to the existing host prefetch. |
 
 Caching itself is configured in the [`cache`](#scan_managercache--read-path-caching-iocacheconfighpp)
 sub-config below.
@@ -377,6 +379,27 @@ When the readahead ends up `opportunistic` (either way), an *unset* `max_readahe
 against the pipeline pool's width rather than the backend's depth — one prefetch per non-scan
 deployment is only useful while a pipeline thread could still pick up another scan. An explicit
 `max_readahead_scans` wins over that substitution.
+
+`device_prefetching_budget` and `device_prefetching_threshold` are the only device-prefetching
+knobs. Both must be finite and within `[0, 1]`; YAML loading and `validate_scan_manager_config`
+reject NaN, infinities and out-of-range values, and unknown keys are rejected like any other
+`scan_manager` key. Device prefetching is on exactly when the budget is positive
+(`scan_manager_config::device_prefetching_enabled()`); the default `0` keeps the readahead
+behaving as before. When enabled:
+
+- The readahead runs even with `cache.mode` of `none` or `os`, because device prefetching reads
+  into GPU memory rather than the cache. An explicit `max_readahead_scans` (including `0`) and a
+  backend budget of `0` still opt out.
+- An unset `readahead_strategy` becomes `eager` (when the backend budget is positive) so GPU
+  prefetches stay asynchronous and slots stay filled; a pinned strategy is honored.
+- `device_prefetching_threshold` should sit below the GPU space's `downgrade_stop_fraction`, so
+  speculation does not push the space into eviction. The runtime applies the stricter of the
+  threshold and the downgrade stop.
+- The budget is a per-GPU byte limit shared by every query running on that GPU, not a per-query
+  allowance. A prefetch is also refused while a demand reservation is being admitted on that GPU.
+- When a task's first reservation attempt is refused, the executor sheds the GPU's unclaimed
+  prefetches (their memory returns as their in-flight reads finish) and retries before it waits or
+  downgrades; a task's own prefetch is claimed first, so its memory is never shed from under it.
 
 A query's local policy is selected from the serving backend publishing the widest budget.
 A runtime budget additionally accounts for every backend touched by each split across all
@@ -444,8 +467,8 @@ startup configuration. `compat_mode` is the exception: it rides the file-handle
 constructor, so it scopes to files this backend opens.
 
 This backend runs without the prefetching cache and therefore without the
-readahead, so `scan_manager.cache.*`, `max_readahead_scans` and
-`readahead_strategy` have no effect on it.
+readahead, so `scan_manager.cache.*`, `max_readahead_scans`,
+`readahead_strategy` and the device prefetching knobs have no effect on it.
 
 | Key | Type | Env default | Description |
 |-----|------|-------------|-------------|
@@ -495,7 +518,7 @@ Those two knobs derive the settings below, which are therefore **not** individua
 | `uring.use_odirect` | `mode` — true for everything but `os` |
 | whether the prefetching cache is armed | `mode` — only under `sirius` |
 | `dispose_on_idle` | `eviction` — true under `idle` |
-| the readahead's default budget | `mode` — the readahead does not run under `none`; see [`max_readahead_scans`](#scan-manager--io-configuration) |
+| the readahead's default budget | `mode` — the readahead does not run under `none` unless `device_prefetching_budget > 0`; see [`max_readahead_scans`](#scan-manager--io-configuration) |
 
 ### `scan_manager.object_store` — S3 credentials & endpoint (`io/object_store_config.hpp`)
 

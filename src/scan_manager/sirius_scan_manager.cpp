@@ -1337,7 +1337,8 @@ sirius_scan_manager::sirius_scan_manager(
   const scan_manager_config& config,
   cucascade::memory::memory_reservation_manager& reservation_manager,
   std::shared_ptr<const sirius::memory::topology_index> topology_index,
-  std::shared_ptr<op::scan::physical_check_counters> physical_counters)
+  std::shared_ptr<op::scan::physical_check_counters> physical_counters,
+  std::span<cucascade::memory::memory_space_config const> memory_configs)
   : _query_lifecycle(lifecycle),
     _config(validate_scan_manager_config(config)),
     _reservation_manager(reservation_manager),
@@ -1350,6 +1351,17 @@ sirius_scan_manager::sirius_scan_manager(
 {
   if (!_topology_index) {
     throw std::invalid_argument("[sirius_scan_manager] topology_index must be non-null");
+  }
+
+  // Device prefetching: one registry for the runtime, shared with every per-query readahead and
+  // with the GPU executors.  Absent unless the budget is positive.
+  if (_config.device_prefetching_enabled()) {
+    auto registry =
+      std::make_shared<device_readahead_registry>(_reservation_manager,
+                                                  _config.device_prefetching_budget,
+                                                  _config.device_prefetching_threshold,
+                                                  memory_configs);
+    if (registry->enabled()) { _device_readahead = std::move(registry); }
   }
 
   // scan_manager always owns an io_ctx: sirius_datasource (uring) on the
@@ -1576,7 +1588,8 @@ void sirius_scan_manager::prepare_for_query(
                                                                   plan.budget,
                                                                   _shared_readahead_budget,
                                                                   _config.max_readahead_scans,
-                                                                  _physical_counters);
+                                                                  _physical_counters,
+                                                                  _device_readahead);
       state->readahead->prepare_for_query(query);
       state->readahead->start(plan.strategy);
     }

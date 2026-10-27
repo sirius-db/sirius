@@ -21,6 +21,7 @@
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "planner/query_index.hpp"
 #include "scan_manager/config.hpp"
+#include "scan_manager/device_prefetch.hpp"
 #include "scan_manager/gatekeeper.hpp"
 #include "scan_manager/shared_scan_budget.hpp"
 
@@ -163,7 +164,8 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
                          std::size_t budget,
                          std::shared_ptr<shared_scan_budget> shared_budget = nullptr,
                          std::optional<std::size_t> budget_override        = std::nullopt,
-                         std::shared_ptr<op::scan::physical_check_counters> physical_counters = {})
+                         std::shared_ptr<op::scan::physical_check_counters> physical_counters = {},
+                         std::shared_ptr<device_readahead_registry> device_registry = nullptr)
     : event::query_event_subscriber(publisher,
                                     {event::event_type::task_deployed,
                                      event::event_type::task_queue_empty,
@@ -173,7 +175,8 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
       _gatekeeper(static_cast<int>(budget)),
       _physical_counters(std::move(physical_counters)),
       _shared_budget(std::move(shared_budget)),
-      _budget_override(budget_override)
+      _budget_override(budget_override),
+      _device_registry(std::move(device_registry))
   {
   }
   /// Stops and joins both workers -- the prefetch worker and the event subscriber.
@@ -408,6 +411,28 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
 
   /// Fill speculative capacity; abandon a candidate after bounded eviction attempts.
   void worker_loop(const std::stop_token& st);
+
+  /// Phase 1 (device tier) for @p candidate: read its hint ranges straight into GPU buffers on
+  /// its preferred device.  Returns true when the device reads were issued, which hands the
+  /// candidate's @p ticket to the completion (it releases it, exactly like the host tier); false
+  /// leaves the ticket with the caller to spend on the host tier.  A no-op (false) when the
+  /// device registry is off, the split cannot decode from device copies, has no preferred device,
+  /// or that GPU does not speculate.
+  bool try_issue_device(prefetch_candidate const& candidate,
+                        split_key const& split,
+                        std::shared_ptr<scan_ticket> const& ticket);
+
+  /// This manager's private non-blocking stream pool for @p device, borrowed from the registry on
+  /// first use (worker thread only).  Null when none can be had (the registry's group cap is
+  /// reached with every group busy).  A lease keeps the group busy past the manager, so an
+  /// in-flight prefetch outlives @ref stop and the group is not handed to another query.
+  op::scan::device_stream_pool* device_pool_for(int device);
+
+  /// The runtime-wide per-GPU budget/pressure registry, shared across queries; null disables the
+  /// device tier.
+  std::shared_ptr<device_readahead_registry> _device_registry;
+  /// One stream pool per GPU this manager has prefetched on (worker thread only).
+  std::unordered_map<int, std::shared_ptr<op::scan::device_stream_pool>> _device_pools;
 
   prefetch_strategy _strategy{prefetch_strategy::eager};
 };

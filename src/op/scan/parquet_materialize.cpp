@@ -173,6 +173,141 @@ std::span<cudf::io::text::byte_range_info const> ranges_for(
                            : std::span<cudf::io::text::byte_range_info const>{};
 }
 
+/// Throw @ref prefetched_mismatch unless @p spans are exactly the chunks @p expected describes:
+/// one span per range, in order, each of the range's size.
+void require_spans_match(std::span<cudf::io::text::byte_range_info const> expected,
+                         std::span<cudf::device_span<std::uint8_t const> const> spans,
+                         std::string const& what)
+{
+  if (expected.size() != spans.size()) {
+    throw prefetched_mismatch(
+      "[parquet_materialize] device spans do not match the reader's "
+      "column chunks for " +
+      what + ": expected " + std::to_string(expected.size()) + " chunks, got " +
+      std::to_string(spans.size()));
+  }
+  for (std::size_t i = 0; i < expected.size(); ++i) {
+    if (static_cast<std::size_t>(expected[i].size()) != spans[i].size()) {
+      throw prefetched_mismatch(
+        "[parquet_materialize] device spans do not match the reader's "
+        "column chunks for " +
+        what + ": chunk " + std::to_string(i) + " is " + std::to_string(spans[i].size()) +
+        " bytes, expected " + std::to_string(expected[i].size()));
+    }
+  }
+}
+
+/// Throw @ref prefetched_mismatch unless @p claimed -- the file ranges the spans were read from,
+/// when the caller knows them -- start where @p expected says.  Sizes alone let a permutation of
+/// equal-size chunks through.  An empty @p claimed is not checked.
+void require_offsets_match(std::span<cudf::io::text::byte_range_info const> expected,
+                           std::span<cudf::io::text::byte_range_info const> claimed,
+                           std::string const& what)
+{
+  if (claimed.empty()) { return; }
+  if (claimed.size() != expected.size()) {
+    throw prefetched_mismatch(
+      "[parquet_materialize] device spans do not match the reader's "
+      "column chunks for " +
+      what + ": read from " + std::to_string(claimed.size()) + " ranges, expected " +
+      std::to_string(expected.size()));
+  }
+  for (std::size_t i = 0; i < expected.size(); ++i) {
+    if (claimed[i].offset() != expected[i].offset() || claimed[i].size() != expected[i].size()) {
+      throw prefetched_mismatch(
+        "[parquet_materialize] device spans do not match the reader's "
+        "column chunks for " +
+        what + ": chunk " + std::to_string(i) + " was read from offset " +
+        std::to_string(claimed[i].offset()) + ", expected " + std::to_string(expected[i].offset()));
+    }
+  }
+}
+
+/// Decode @p sources from their column chunks already on the device (@p per_source: one span
+/// list per source, in @p sources order; @p ranges: the file ranges they were read from, per
+/// source, where known).  The spans are first checked against the column chunks the reader built
+/// for this decode enumerates under @p options, so chunks staged for other options (another
+/// projection, a filter column outside it) are refused before any decode work instead of being
+/// misread.
+std::unique_ptr<cudf::table> decode_from_device(
+  std::span<parquet_source const> sources,
+  cudf::io::parquet_reader_options const& options,
+  std::span<std::vector<cudf::io::text::byte_range_info> const> ranges,
+  std::span<prefetched_chunk_spans const> per_source,
+  ::cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr)
+{
+  if (sources.size() == 1) {
+    // Single file: the single-source reader, whose chunk data is flat.
+    auto const& src   = sources.front();
+    auto const spans  = per_source.front();
+    auto const groups = cudf::host_span<cudf::size_type const>(src.row_group_indices.data(),
+                                                               src.row_group_indices.size());
+    hybrid_scan_reader reader(*src.metadata, options);
+    auto const expected = reader.all_column_chunks_byte_ranges(groups, options);
+    auto const what     = "'" + path_of(src) + "'";
+    require_spans_match(expected, spans, what);
+    require_offsets_match(expected, ranges_for(ranges, 0), what);
+
+    auto result = reader.materialize_all_columns(
+      groups,
+      cudf::host_span<cudf::device_span<std::uint8_t const> const>(spans.data(), spans.size()),
+      options,
+      stream,
+      mr);
+    return std::move(result.tbl);
+  }
+
+  require_same_parquet_schema(sources);
+
+  // Several files in one split: the multi-file reader takes the row groups per source and wants
+  // its chunk data flattened in source order, with each source's chunks in the same row-group /
+  // column order the single-file reader produces.
+  std::vector<cudf::io::parquet::FileMetaData> metadatas;
+  std::vector<std::vector<cudf::size_type>> rg_per_src;
+  std::vector<cudf::device_span<std::uint8_t const>> spans;
+  metadatas.reserve(sources.size());
+  rg_per_src.reserve(sources.size());
+  for (std::size_t i = 0; i < sources.size(); ++i) {
+    metadatas.push_back(*sources[i].metadata);
+    rg_per_src.push_back(sources[i].row_group_indices);
+    spans.insert(spans.end(), per_source[i].begin(), per_source[i].end());
+  }
+
+  cudf::io::parquet::experimental::hybrid_scan_multifile reader(
+    cudf::host_span<cudf::io::parquet::FileMetaData const>(metadatas.data(), metadatas.size()),
+    options);
+  auto const groups =
+    cudf::host_span<std::vector<cudf::size_type> const>(rg_per_src.data(), rg_per_src.size());
+  auto const [expected, source_of] = reader.all_column_chunks_byte_ranges(groups, options);
+  require_spans_match(expected, spans, std::to_string(sources.size()) + " sources");
+  // Equal totals could still hide a chunk attributed to the wrong file.
+  std::size_t k = 0;
+  for (std::size_t i = 0; i < sources.size(); ++i) {
+    auto const first = k;
+    for (std::size_t j = 0; j < per_source[i].size(); ++j, ++k) {
+      if (static_cast<std::size_t>(source_of[k]) != i) {
+        throw prefetched_mismatch(
+          "[parquet_materialize] device spans do not match the reader's "
+          "column chunks for '" +
+          path_of(sources[i]) + "': chunk " + std::to_string(k) + " belongs to source " +
+          std::to_string(source_of[k]));
+      }
+    }
+    require_offsets_match(std::span(expected).subspan(first, per_source[i].size()),
+                          ranges_for(ranges, i),
+                          "'" + path_of(sources[i]) + "'");
+  }
+
+  auto result = reader.materialize_all_columns(
+    groups,
+    cudf::host_span<cudf::device_span<std::uint8_t const> const>(spans.data(), spans.size()),
+    options,
+    stream,
+    mr);
+  return std::move(result.tbl);
+}
+
 /// Bulk route: read every source's column chunks, then decode straight out of
 /// those device buffers.
 std::unique_ptr<cudf::table> materialize_bulk(
@@ -292,6 +427,44 @@ void require_same_parquet_schema(std::span<parquet_source const> sources)
     throw std::runtime_error(prefix + "differ at schema element " +
                              std::to_string(lhs - first.begin()) + " (" + detail + ")");
   }
+}
+
+bool can_materialize_from_prefetched(
+  std::span<parquet_source const> sources,
+  std::span<std::vector<cudf::io::text::byte_range_info> const> ranges,
+  std::span<prefetched_chunk_spans const> prefetched) noexcept
+{
+  if (sources.empty() || prefetched.size() != sources.size()) { return false; }
+  for (std::size_t i = 0; i < sources.size(); ++i) {
+    auto const& src  = sources[i];
+    auto const spans = prefetched[i];
+    if (!src.metadata || src.row_group_indices.empty() || spans.empty()) { return false; }
+    auto const expected = ranges_for(ranges, i);
+    if (expected.empty()) { continue; }
+    if (expected.size() != spans.size()) { return false; }
+    for (std::size_t j = 0; j < spans.size(); ++j) {
+      if (static_cast<std::size_t>(expected[j].size()) != spans[j].size()) { return false; }
+    }
+  }
+  return true;
+}
+
+std::unique_ptr<cudf::table> materialize_parquet(
+  std::span<parquet_source const> sources,
+  cudf::io::parquet_reader_options const& options,
+  std::span<std::vector<cudf::io::text::byte_range_info> const> ranges,
+  std::span<prefetched_chunk_spans const> prefetched,
+  ::cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr)
+{
+  if (prefetched.empty()) { return materialize_parquet(sources, options, ranges, stream, mr); }
+  if (sources.empty()) { return nullptr; }
+  if (!can_materialize_from_prefetched(sources, ranges, prefetched)) {
+    throw std::invalid_argument(
+      "[parquet_materialize] prefetched device spans need one non-empty entry per source, one "
+      "span per column-chunk range");
+  }
+  return decode_from_device(sources, options, ranges, prefetched, stream, mr);
 }
 
 std::unique_ptr<cudf::table> materialize_parquet(

@@ -26,11 +26,17 @@ class parquet_scan_core {
     _execution_completion = std::move(c);
   }
   /// Owns the Parquet bind data for the lifetime of the composing ingestible.
-  explicit parquet_scan_core(std::unique_ptr<parquet_ingestible_table_info> info);
+  /// @param device_prefetch_allowed Whether this scan's splits may be read ahead onto a GPU by the
+  ///        readahead's device tier and decoded from there; stamped on every split as
+  ///        parquet_split_info::device_prefetch_allowed.
+  explicit parquet_scan_core(std::unique_ptr<parquet_ingestible_table_info> info,
+                             bool device_prefetch_allowed = true);
 
   ~parquet_scan_core();
 
   std::unique_ptr<batch_coalescer> create_batch_coalescer() const;
+
+  [[nodiscard]] bool device_prefetch_allowed() const noexcept { return _device_prefetch_allowed; }
 
   [[nodiscard]] bool has_processed_all_metadata() const;
 
@@ -108,6 +114,7 @@ class parquet_scan_core {
   [[nodiscard]] bool can_project_during_filter() const noexcept;
 
   std::unique_ptr<parquet_ingestible_table_info> _info;
+  bool const _device_prefetch_allowed;
   // Built only when physical evidence is consumed, after finalize has published it.
   std::once_flag _evidence_index_once;
   std::vector<std::size_t> _evidence_index_by_file;

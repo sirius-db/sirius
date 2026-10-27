@@ -967,6 +967,28 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
   return info;
 }
 
+std::size_t gpu_pipeline_task::claim_device_readahead(
+  const cucascade::memory::memory_space& target_space) const noexcept
+{
+  if (_local_state == nullptr) { return 0; }
+  auto const* ls = dynamic_cast<gpu_pipeline_task_local_state const*>(_local_state.get());
+  if (ls == nullptr || !ls->_input_data) { return 0; }
+  auto const* scan_input =
+    dynamic_cast<const op::scan::scan_operator_input*>(ls->_input_data.get());
+  return scan_input != nullptr ? scan_input->claim_device_readahead(target_space) : 0;
+}
+
+void gpu_pipeline_task::discard_device_readahead() const noexcept
+{
+  if (_local_state == nullptr) { return; }
+  auto const* ls = dynamic_cast<gpu_pipeline_task_local_state const*>(_local_state.get());
+  if (ls == nullptr || !ls->_input_data) { return; }
+  if (auto const* scan_input =
+        dynamic_cast<const op::scan::scan_operator_input*>(ls->_input_data.get())) {
+    scan_input->discard_device_readahead();
+  }
+}
+
 std::vector<op::sirius_physical_operator*> gpu_pipeline_task::get_output_consumers()
 {
   std::vector<op::sirius_physical_operator*> output_consumers;
