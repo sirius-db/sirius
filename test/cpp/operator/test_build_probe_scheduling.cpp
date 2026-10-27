@@ -937,7 +937,7 @@ TEST_CASE("compute_hash_join_partition_strategy - SINGLE schedules like LEFT, no
   // LEFT's, so it is BUILD_PROBE-eligible by size only and never forced the way MARK is.
   for (auto const bytes : {k100MB, 8 * k100MB}) {
     INFO("build bytes: " << bytes);
-    auto const left = strategy(bytes,
+    auto const left   = strategy(bytes,
                                /*is_build_side=*/true,
                                /*build_foldable=*/true,
                                /*num_gpus=*/1,

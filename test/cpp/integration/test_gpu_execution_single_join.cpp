@@ -37,7 +37,8 @@ void create_single_join_tables(SingleJoinFixture& fx)
 {
   // k in {0, 1, 2}; the build only has keys 0 and 1, so a third of the probe rows have no match.
   fx.run_ok("CREATE TABLE sj_a AS SELECT i::INTEGER id, (i % 3)::INTEGER k FROM range(12) r(i);");
-  fx.run_ok("CREATE TABLE sj_b AS SELECT i::INTEGER k, (i * 10 + 5)::INTEGER v FROM range(2) r(i);");
+  fx.run_ok(
+    "CREATE TABLE sj_b AS SELECT i::INTEGER k, (i * 10 + 5)::INTEGER v FROM range(2) r(i);");
   fx.run_ok("CHECKPOINT;");
 }
 
@@ -59,7 +60,8 @@ TEST_CASE_METHOD(SingleJoinFixture,
   }
   SECTION("in a predicate")
   {
-    compare_gpu_vs_cpu("SELECT a.id FROM sj_a a WHERE (SELECT b.v FROM sj_b b WHERE b.k = a.k) > 10;");
+    compare_gpu_vs_cpu(
+      "SELECT a.id FROM sj_a a WHERE (SELECT b.v FROM sj_b b WHERE b.k = a.k) > 10;");
   }
   SECTION("in an expression with the NULL default")
   {
@@ -95,8 +97,9 @@ TEST_CASE_METHOD(SingleJoinFixture,
 {
   create_single_join_tables(*this);
   // k = 0 matches two build rows (v = 5 and 25); k = 1 matches one.
-  run_ok("CREATE TABLE sj_dup AS SELECT (i % 2)::INTEGER k, (i * 10 + 5)::INTEGER v "
-         "FROM range(3) r(i);");
+  run_ok(
+    "CREATE TABLE sj_dup AS SELECT (i % 2)::INTEGER k, (i * 10 + 5)::INTEGER v "
+    "FROM range(3) r(i);");
   run_ok("CHECKPOINT;");
   std::string const query =
     "SELECT a.id, (SELECT b.v FROM sj_dup b WHERE b.k = a.k) v FROM sj_a a;";

@@ -437,8 +437,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
           op.join_type,
           lhs_cardinality,
           rhs_cardinality,
-          duckdb::vector<std::size_t>(op.left_projection_map.begin(),
-                                      op.left_projection_map.end()),
+          duckdb::vector<std::size_t>(op.left_projection_map.begin(), op.left_projection_map.end()),
           duckdb::vector<std::size_t>(op.right_projection_map.begin(),
                                       op.right_projection_map.end()));
       default:

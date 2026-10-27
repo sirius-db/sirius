@@ -78,12 +78,12 @@ single_join_fixture create_single_join(
                            duckdb::LogicalType::INTEGER,
                            duckdb::LogicalType::INTEGER};
 
-  auto two_ints = sirius::from_duckdb_vec(
-    duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER, duckdb::LogicalType::INTEGER});
-  auto left_child =
-    duckdb::make_uniq<sirius_physical_operator>(SiriusPhysicalOperatorType::PROJECTION, two_ints, 0);
-  auto right_child =
-    duckdb::make_uniq<sirius_physical_operator>(SiriusPhysicalOperatorType::PROJECTION, two_ints, 0);
+  auto two_ints   = sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{
+    duckdb::LogicalType::INTEGER, duckdb::LogicalType::INTEGER});
+  auto left_child = duckdb::make_uniq<sirius_physical_operator>(
+    SiriusPhysicalOperatorType::PROJECTION, two_ints, 0);
+  auto right_child = duckdb::make_uniq<sirius_physical_operator>(
+    SiriusPhysicalOperatorType::PROJECTION, two_ints, 0);
 
   duckdb::vector<duckdb::JoinCondition> conditions;
   conditions.emplace_back(
@@ -191,9 +191,10 @@ TEST_CASE("sirius_physical_hash_join single join - multiple matches per probe ro
   REQUIRE(threw);
 }
 
-TEST_CASE("sirius_physical_hash_join single join - duplicate build keys yield one row per probe row "
-          "when multiple rows are allowed",
-          "[physical_single_join]")
+TEST_CASE(
+  "sirius_physical_hash_join single join - duplicate build keys yield one row per probe row "
+  "when multiple rows are allowed",
+  "[physical_single_join]")
 {
   auto* space = get_shared_mem_space();
   REQUIRE(space);
@@ -255,8 +256,7 @@ TEST_CASE("sirius_physical_hash_join single join - IS NOT DISTINCT FROM matches 
   // Left key 0 is NULL; the build has a NULL key and a duplicate 30 (allowed, to show the
   // dedupe keys on the null-safe comparison).
   auto left  = make_nullable_key_payload_batch(*space, {0, 10, 30}, {false, true, true}, {1, 2, 3});
-  auto right = make_nullable_key_payload_batch(
-    *space, {0, 30, 30}, {false, true, true}, {7, 8, 9});
+  auto right = make_nullable_key_payload_batch(*space, {0, 30, 30}, {false, true, true}, {7, 8, 9});
 
   auto f    = create_single_join(duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM, false);
   auto rows = rows_sorted_by_left_key(*run(f, left, right));
