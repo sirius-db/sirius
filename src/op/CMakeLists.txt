@@ -4,6 +4,7 @@ target_sources(
           aggregate/stddev.cpp
           aggregate/group_key_labels.cpp
           aggregate/gpu_aggregate_impl.cpp
+          window/ranking.cpp
           window/whole_partition.cpp
           merge/gpu_merge_impl.cpp
           order/gpu_order_impl.cpp
