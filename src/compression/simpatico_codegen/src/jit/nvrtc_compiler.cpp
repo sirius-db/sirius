@@ -1,5 +1,6 @@
 #include "codegen/jit/nvrtc_compiler.hpp"
 
+#include "codegen/util/cuda_check.hpp"
 #include "compilation_request.hpp"
 
 #include <cuda.h>
@@ -50,34 +51,10 @@ namespace {
   throw std::runtime_error(msg);
 }
 
-[[noreturn]] void throw_cu(const char* api, CUresult r)
-{
-  const char* name = nullptr;
-  const char* desc = nullptr;
-  cuGetErrorName(r, &name);
-  cuGetErrorString(r, &desc);
-  std::string msg = "cu";
-  msg += api;
-  msg += " failed: ";
-  msg += name ? name : "<unknown>";
-  if (desc) {
-    msg += " (";
-    msg += desc;
-    msg += ")";
-  }
-  throw std::runtime_error(msg);
-}
-
 #define NVRTC_OR_THROW(call)                         \
   do {                                               \
     nvrtcResult _r = (call);                         \
     if (_r != NVRTC_SUCCESS) throw_nvrtc(#call, _r); \
-  } while (0)
-
-#define CU_OR_THROW(call)                        \
-  do {                                           \
-    CUresult _r = (call);                        \
-    if (_r != CUDA_SUCCESS) throw_cu(#call, _r); \
   } while (0)
 
 }  // namespace
@@ -101,22 +78,31 @@ CUfunction CompiledKernel::func_for_current_device() const
 {
   if (!kern) return nullptr;
 
-  int device_id = 0;
-  cudaGetDevice(&device_id);  // runtime API — no driver context required
+  // cuKernelGetFunction binds the kernel to the calling thread's current context,
+  // and cuLaunchKernel rejects the result from any other context
+  // (CUDA_ERROR_INVALID_HANDLE). Threads on one device can hold different
+  // contexts, so a device-keyed cache would hand every thread but the first a
+  // function it cannot launch.
+  CUcontext ctx = nullptr;
+  if (cuCtxGetCurrent(&ctx) != CUDA_SUCCESS) return nullptr;
+  if (ctx == nullptr) {
+    // A thread that never touched the runtime has no context; make the current
+    // device's primary context current instead of deriving against none.
+    cudaFree(nullptr);
+    if (cuCtxGetCurrent(&ctx) != CUDA_SUCCESS || ctx == nullptr) return nullptr;
+  }
 
   {
     std::lock_guard<std::mutex> lock(func_mu_);
-    auto it = func_per_dev_.find(device_id);
-    if (it != func_per_dev_.end()) return it->second;
+    auto it = func_per_ctx_.find(ctx);
+    if (it != func_per_ctx_.end()) return it->second;
   }
 
-  // cuKernelGetFunction binds the kernel to the current device context,
-  // which RMM/cuDF sets up correctly per-thread before calling encode/decode.
   CUfunction fn = nullptr;
   if (cuKernelGetFunction(&fn, kern) != CUDA_SUCCESS) return nullptr;
 
   std::lock_guard<std::mutex> lock(func_mu_);
-  func_per_dev_[device_id] = fn;
+  func_per_ctx_[ctx] = fn;
   return fn;
 }
 
@@ -135,7 +121,7 @@ CompiledKernel::CompiledKernel(CompiledKernel&& other) noexcept
     cubin(std::move(other.cubin)),
     rendered_source(std::move(other.rendered_source))
 {
-  func_per_dev_ = std::move(other.func_per_dev_);
+  func_per_ctx_ = std::move(other.func_per_ctx_);
   other.library = nullptr;
   other.kern    = nullptr;
 }
@@ -148,7 +134,7 @@ CompiledKernel& CompiledKernel::operator=(CompiledKernel&& other) noexcept
     kern            = other.kern;
     cubin           = std::move(other.cubin);
     rendered_source = std::move(other.rendered_source);
-    func_per_dev_   = std::move(other.func_per_dev_);
+    func_per_ctx_   = std::move(other.func_per_ctx_);
     other.library   = nullptr;
     other.kern      = nullptr;
   }
@@ -251,13 +237,15 @@ CompiledKernel load_kernel_from_cubin(std::vector<char> cubin,
   // cuLibraryGetKernel returns a device-independent CUkernel handle; the
   // per-device CUfunction is derived lazily via func_for_current_device().
   CUlibrary lib = nullptr;
-  CU_OR_THROW(cuLibraryLoadData(&lib, cubin.data(), nullptr, nullptr, 0, nullptr, nullptr, 0));
+  simpatico::throw_if_cu_error(
+    cuLibraryLoadData(&lib, cubin.data(), nullptr, nullptr, 0, nullptr, nullptr, 0),
+    "cuLibraryLoadData");
 
   CUkernel kern = nullptr;
   CUresult r    = cuLibraryGetKernel(&kern, lib, entry_symbol.c_str());
   if (r != CUDA_SUCCESS) {
     cuLibraryUnload(lib);
-    throw_cu("LibraryGetKernel", r);
+    simpatico::throw_if_cu_error(r, "cuLibraryGetKernel");
   }
 
   CompiledKernel out;

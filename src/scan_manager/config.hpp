@@ -209,6 +209,8 @@ struct scan_manager_config {
   preparation_config preparation;
   exec::thread_pool_config thread_pool{.num_threads        = default_scan_manager_num_threads(),
                                        .thread_name_prefix = "scan_manager"};
+  /// Admission limit, also accepted through the legacy scan-manager configuration path.
+  int max_concurrent_queries{1};
   /// IO backend that serves managed reads.
   io_backend backend{io_backend::sirius};
 

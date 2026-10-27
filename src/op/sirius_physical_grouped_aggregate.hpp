@@ -73,9 +73,12 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   std::vector<cudf::aggregation::Kind> cudf_aggregates;
   std::vector<int> cudf_aggregate_idx;
   std::vector<std::vector<int>> cudf_aggregate_struct_col_indices;
-  /// Parallel to cudf_aggregates: the plan-time bound on |unscaled value| of a decimal SUM input
-  /// (planner::resolve_decimal_sum_input_bounds); nullopt when unproven.
+  /// Parallel to cudf_aggregates: the plan-time bound on |unscaled value| of a decimal or wide
+  /// integer SUM input (planner::resolve_sum_input_bounds); nullopt when unproven.
   std::vector<std::optional<std::uint64_t>> cudf_aggregate_input_max_abs;
+  /// Parallel to cudf_aggregates: true for the SUM of a wide integer SUM or AVG
+  /// (AggregateSlot::is_wide_integer_sum), whose partial result may be DECIMAL128.
+  std::vector<bool> cudf_aggregate_is_wide_integer_sum;
 
   // Partial aggregate layout and finalization metadata
   std::vector<AggregateSlot> aggregate_slots;
@@ -109,6 +112,12 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   [[nodiscard]] duckdb::vector<sirius::logical_type> get_count_distinct_local_output_types() const;
 
   [[nodiscard]] bool has_stddev_samp() const;
+
+  //! Alternate carriers of the local output, for set_alternate_physical_types(): DECIMAL128 for
+  //! the column of each wide integer SUM, whose partial is INT64 or, where the batch could
+  //! overflow INT64, DECIMAL128. Empty when no SUM is wide or `types` is not one column per cuDF
+  //! aggregate after the group columns.
+  [[nodiscard]] std::vector<std::optional<cudf::data_type>> wide_integer_sum_partial_types() const;
 
   // Source interface
   bool is_source() const override { return true; }

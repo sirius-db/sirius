@@ -75,7 +75,7 @@ std::unique_ptr<cudf::table> compute_enn_top_k(const vector_search_context& c,
   std::unique_ptr<cudf::table> compacted;
   if (auto const& vec = input.column(0); vec.offset() != 0 || vec.null_count() != 0) {
     auto valid_mask = cudf::is_valid(vec, stream, mr);
-    compacted       = sirius::ApplyRetentionMask(input, valid_mask->view(), stream, mr);
+    compacted       = sirius::apply_retention_mask(input, valid_mask->view(), stream, mr);
     input           = compacted->view();
     if (input.num_rows() == 0) { return make_empty_enn_output(input); }
   }
@@ -118,7 +118,7 @@ std::unique_ptr<cudf::table> merge_enn_top_k(const vector_search_context& c,
   // Distance is the trailing column of every [out0, ..., distance] candidate.
   auto const distance_index = candidates.front().num_columns() - 1;
 
-  if (limit == 0) { return duckdb::make_empty_like(candidates.front()); }
+  if (limit == 0) { return cudf::empty_like(candidates.front()); }
 
   // Each candidate is already sorted ascending by distance (cuVS select_k), so a
   // k-way merge on the distance column yields one globally sorted table without

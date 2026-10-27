@@ -255,8 +255,8 @@ task_creator::compute_pipeline_priorities(const sirius::planner::query& query) c
   // Inject the query id into the high 32 bits so tasks are ordered by query first, then by the
   // within-query pipeline rank in the low 32 bits. The priority queue picks the LOWEST value first,
   // so an earlier query (smaller id) always runs before a later one, and within a query the dense
-  // 0..N-1 rank preserves pipeline execution order. See query_priority_bits() for the masking
-  // contract that keeps the packed value non-negative.
+  // 0..N-1 rank preserves pipeline execution order. See query_priority_bits() for the
+  // range-checking contract that keeps the packed value non-negative.
   const exec::queue_priority query_bits = sirius::query_priority_bits(query.query_id());
   for (auto& [pipeline, priority] : priorities) {
     const auto rank = std::lower_bound(sorted.begin(), sorted.end(), priority) - sorted.begin();
@@ -770,11 +770,8 @@ void task_creator::manager_loop()
                                                        return a.second < b.second;
                                                      })
                                       ->first;
-                    auto gpus = _topology_index->gpus_of(top_host);
-                    if (!gpus.empty()) {
-                      auto idx            = _numa_affinity_rr.fetch_add(1) % gpus.size();
-                      preferred_device_id = gpus[idx];
-                    }
+                    preferred_device_id =
+                      _numa_affinity.next_gpu(top_host, _topology_index->gpus_of(top_host));
                   }
                   SIRIUS_LOG_DEBUG(
                     "Task Creator: locality score gpu_sources={} host_sources={} "
@@ -809,11 +806,9 @@ void task_creator::manager_loop()
                           // pick a GPU on the same NUMA. The host space's device id
                           // is the NUMA key verbatim (-1 = "unknown"), matching the
                           // pipelineable locality block above.
-                          auto gpus = _topology_index->gpus_of(space->get_device_id());
-                          if (!gpus.empty()) {
-                            auto idx            = _numa_affinity_rr.fetch_add(1) % gpus.size();
-                            preferred_device_id = gpus[idx];
-                          }
+                          auto const host = space->get_device_id();
+                          preferred_device_id =
+                            _numa_affinity.next_gpu(host, _topology_index->gpus_of(host));
                         }
                         SIRIUS_LOG_DEBUG(
                           "Task Creator: cached-scan locality tier={} device_id={} "

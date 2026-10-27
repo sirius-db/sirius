@@ -406,7 +406,7 @@ TEST_CASE("gpu_execution - outer joins over narrow carriers match the CPU",
         auto const& physical = child->get_physical_types();
         REQUIRE(physical.size() == child->get_types().size());
         for (std::size_t column_idx = 0; column_idx < physical.size(); column_idx++) {
-          auto const native = sirius::get_cudf_type(child->get_types()[column_idx]);
+          auto const native = sirius::require_cudf_type(child->get_types()[column_idx]);
           if (cudf::size_of(physical[column_idx]) < cudf::size_of(native)) { narrow_inputs++; }
         }
       }

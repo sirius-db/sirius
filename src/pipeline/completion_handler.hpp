@@ -28,6 +28,8 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <string>
+#include <string_view>
 #include <thread>
 
 namespace sirius::pipeline {
@@ -41,9 +43,13 @@ namespace sirius::pipeline {
  */
 class completion_handler {
  public:
-  completion_handler() = default;
-  explicit completion_handler(std::shared_ptr<std::atomic<uint64_t>> tasks)
-    : tasks_started_(std::move(tasks))
+  explicit completion_handler(std::function<void(std::exception_ptr)> on_error = {})
+    : on_error_(std::move(on_error))
+  {
+  }
+  explicit completion_handler(std::shared_ptr<std::atomic<uint64_t>> tasks,
+                              std::function<void(std::exception_ptr)> on_error = {})
+    : tasks_started_(std::move(tasks)), on_error_(std::move(on_error))
   {
   }
   void record_task_started() noexcept
@@ -258,12 +264,18 @@ class completion_handler {
     }
     _completed.store(true);
     published_changed_.notify_all();
+    auto stop = preparation_stop_;
+    terminal_lock.unlock();
+    if (on_error_) {
+      try {
+        on_error_(error);
+      } catch (...) {
+      }
+    }
     try {
       _promise.set_exception(error);
     } catch (...) {
     }
-    auto stop = preparation_stop_;
-    terminal_lock.unlock();
     if (stop) {
       try {
         (*stop)(true);
@@ -297,6 +309,7 @@ class completion_handler {
   transparent::failure_cause failure_;
   std::optional<op::scan::verdict_reason> failure_reason_;
   std::shared_ptr<std::atomic<uint64_t>> tasks_started_;
+  std::function<void(std::exception_ptr)> on_error_;
   std::promise<void> _promise;
   std::atomic<bool> _completed{false};
   std::atomic<bool> _has_error{false};

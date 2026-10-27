@@ -18,10 +18,15 @@
 #include "op/scan/table_scan/scan_contract.hpp"
 
 #include <cstdint>
+#include <ios>
 #include <memory>
+#include <span>
 
 namespace sirius::scan_manager {
 class charging_allocator;
+}
+namespace sirius::io {
+class sirius_datasource;
 }
 #include <string>
 #include <string_view>
@@ -29,6 +34,20 @@ class charging_allocator;
 
 namespace sirius::op::scan {
 struct iceberg_delete_set;
+
+/// Byte-level seam for Puffin containers. Implementations may read local files,
+/// ioctx datasources, or object-store ranges; the parser never depends on a
+/// filesystem stream after the source is supplied.
+class puffin_byte_source {
+ public:
+  virtual ~puffin_byte_source()                       = default;
+  virtual bool seek(std::streamoff offset)            = 0;
+  virtual bool read(std::span<std::byte> destination) = 0;
+  [[nodiscard]] virtual std::streamoff size() const   = 0;
+};
+
+std::unique_ptr<puffin_byte_source> make_puffin_byte_source(
+  std::unique_ptr<sirius::io::sirius_datasource> source);
 
 /// Hard ceiling on the positions one deletion vector may decode into, independent of anything the
 /// table says about itself.
@@ -83,6 +102,7 @@ struct DeletionVectorRef {
  *         or CRC failure.
  */
 std::vector<int64_t> read_deletion_vector(DeletionVectorRef const& ref);
+std::vector<int64_t> read_deletion_vector(DeletionVectorRef const&, puffin_byte_source&);
 std::shared_ptr<iceberg_delete_set const> read_deletion_vector_charged(
   DeletionVectorRef const&, sirius::scan_manager::charging_allocator&);
 
@@ -92,5 +112,13 @@ std::shared_ptr<iceberg_delete_set const> read_deletion_vector_charged(
   std::string_view canonical_path,
   std::shared_ptr<void const> path_owner,
   scan_contract_id contract = 0);
+
+std::shared_ptr<iceberg_delete_set const> read_deletion_vector_charged(
+  DeletionVectorRefView const&,
+  sirius::scan_manager::charging_allocator&,
+  std::string_view canonical_path,
+  std::shared_ptr<void const> path_owner,
+  scan_contract_id contract,
+  puffin_byte_source& source);
 
 }  // namespace sirius::op::scan

@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-// Plan-time magnitude bounds for decimal SUM inputs: resolve_decimal_sum_input_bounds reads
+// Plan-time magnitude bounds for decimal SUM inputs: resolve_sum_input_bounds reads
 // base-table statistics through value-preserving operators and declines everything else. The
 // operator shapes the tracer accepts are covered one by one in test_scan_column_origin.cpp.
 
@@ -55,7 +55,7 @@ bounds_t bounds_of(duckdb::Connection& con, std::string const& sql)
   auto plan       = sirius::test::extract_logical_plan_sirius_order(context, sql).logical_plan;
   auto* aggregate = find_aggregate(*plan);
   REQUIRE(aggregate != nullptr);
-  return sirius::planner::resolve_decimal_sum_input_bounds(context, *aggregate);
+  return sirius::planner::resolve_sum_input_bounds(context, *aggregate);
 }
 
 /// Resolves @p sql's bounds inside a transaction of its own.
@@ -87,7 +87,7 @@ struct decimal_bounds_fixture {
       "'partial_aggregate_pushdown,aggregate_function_rewriter,common_aggregate';");
     run("SET delim_join_as_cte = false;");
     // v in [1.00, 50.00] (unscaled 5000), w in [-6.00, 0.00] (600), x in [10.50, 31.50] (3150);
-    // wide is DECIMAL128 on the GPU and never a candidate.
+    // wide is DECIMAL128 on the GPU, in [0.00, 999.00] (99900): a narrowing candidate.
     run(
       "CREATE TABLE fact AS SELECT (i % 3)::INTEGER g, ((i % 50) + 1)::DECIMAL(15,2) v, "
       "(-(i % 7))::DECIMAL(7,2) w, (i % 1000)::DECIMAL(20,2) wide FROM range(3000) r(i);");
@@ -127,12 +127,12 @@ TEST_CASE_METHOD(decimal_bounds_fixture,
   auto const bounds = bounds_in_transaction(
     *con, "SELECT g, sum(v), avg(v), sum(w), sum(wide), count(v), min(v) FROM fact GROUP BY g");
   REQUIRE(bounds.size() == 6);
-  CHECK(bounds[0] == std::uint64_t{5000});  // sum(v)
-  CHECK(bounds[1] == std::uint64_t{5000});  // avg(v) shares v's bound
-  CHECK(bounds[2] == std::uint64_t{600});   // sum(w): the magnitude of -6.00
-  CHECK_FALSE(bounds[3].has_value());       // sum(wide) already runs as DECIMAL128
-  CHECK_FALSE(bounds[4].has_value());       // count cannot overflow
-  CHECK_FALSE(bounds[5].has_value());       // min cannot overflow
+  CHECK(bounds[0] == std::uint64_t{5000});   // sum(v)
+  CHECK(bounds[1] == std::uint64_t{5000});   // avg(v) shares v's bound
+  CHECK(bounds[2] == std::uint64_t{600});    // sum(w): the magnitude of -6.00
+  CHECK(bounds[3] == std::uint64_t{99900});  // sum(wide): DECIMAL128, bounded for narrowing
+  CHECK_FALSE(bounds[4].has_value());        // count cannot overflow
+  CHECK_FALSE(bounds[5].has_value());        // min cannot overflow
 }
 
 TEST_CASE_METHOD(decimal_bounds_fixture,
@@ -206,4 +206,37 @@ TEST_CASE_METHOD(decimal_bounds_fixture,
   auto const after = bounds_in_transaction(*con, "SELECT sum(v) FROM fact");
   REQUIRE(after.size() == 1);
   CHECK(after[0] == std::uint64_t{5000});
+}
+
+TEST_CASE_METHOD(decimal_bounds_fixture,
+                 "decimal sum bounds - a DECIMAL128 bound beyond 64 bits declines",
+                 "[planner][aggregate][decimal_sum_overflow]")
+{
+  // 10^20 does not fit 64 bits, so its bound can neither skip widening nor allow narrowing.
+  run(
+    "CREATE TABLE huge AS SELECT (i * 100000000000000000000)::DECIMAL(38,0) h, "
+    "(i - 2)::DECIMAL(38,0) s FROM range(2) r(i);");
+  auto const bounds = bounds_in_transaction(*con, "SELECT sum(h), sum(s) FROM huge");
+  REQUIRE(bounds.size() == 2);
+  CHECK_FALSE(bounds[0].has_value());
+  CHECK(bounds[1] == std::uint64_t{2});  // s in [-2, -1]: the magnitude of -2
+}
+
+TEST_CASE_METHOD(decimal_bounds_fixture,
+                 "sum bounds - wide BIGINT SUM and AVG carry a bound, proven sums do not",
+                 "[planner][aggregate][wide_integer_sum]")
+{
+  // big is up to 4e18 over 3000 rows, so DuckDB keeps sum (HUGEINT accumulation); small sums to
+  // at most 3000 * 99, which DuckDB's statistics prove fits and rewrite to sum_no_overflow.
+  run(
+    "CREATE TABLE ints AS SELECT (i % 3)::INTEGER g, (4000000000000000000 - i)::BIGINT big, "
+    "(i % 100)::BIGINT small, (-(i % 5))::INTEGER i32 FROM range(3000) r(i);");
+  auto const bounds = bounds_in_transaction(
+    *con, "SELECT g, sum(big), avg(big), sum(small), sum(i32), avg(i32) FROM ints GROUP BY g");
+  REQUIRE(bounds.size() == 5);
+  CHECK(bounds[0] == std::uint64_t{4000000000000000000});  // sum(big)
+  CHECK(bounds[1] == std::uint64_t{4000000000000000000});  // avg(big)
+  CHECK_FALSE(bounds[2].has_value());  // sum_no_overflow(small) is already proven
+  CHECK_FALSE(bounds[3].has_value());  // INTEGER cannot overflow INT64 within one batch
+  CHECK_FALSE(bounds[4].has_value());
 }

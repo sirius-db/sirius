@@ -187,7 +187,7 @@ std::unique_ptr<cudf::column> make_device_column(const column_staging& s,
   }
 
   return std::make_unique<cudf::column>(
-    sirius::get_cudf_type(type),
+    sirius::require_cudf_type(type),
     num_rows,
     to_device(s.fixed_data.data(), s.fixed_data.size(), stream, mr),
     std::move(null_mask),
@@ -399,8 +399,10 @@ void sirius_physical_gpu_values::throw_if_unsupported_types(
         "cuDF; falling back to DuckDB CPU");
     }
     if (!t.is_varchar()) {
-      // Both throw for unsupported types → CPU fallback.
-      static_cast<void>(sirius::get_cudf_type(t));
+      if (!sirius::get_cudf_type(t)) {
+        throw duckdb::NotImplementedException("GPU VALUES type %s cannot be mapped to cuDF",
+                                              t.to_string());
+      }
       static_cast<void>(t.fixed_width_byte_size());
     }
   }

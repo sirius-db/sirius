@@ -284,6 +284,73 @@ struct fixture {
   }
 };
 }  // namespace
+
+TEST_CASE("Non-Iceberg adapter source uses one coordinator claim path and releases the last split",
+          "[scan_preparation][coordinator][adapter_contract]")
+{
+  fixture f(1, 1);
+  auto out = std::make_shared<sink>();
+  std::atomic<unsigned> claims{0};
+  std::atomic<unsigned> reads{0};
+  auto source_claim = [&]() -> std::optional<preparation_coordinator::job> {
+    auto id = claims.fetch_add(1);
+    if (id >= 2) return {};
+    preparation_coordinator::job job;
+    job.work = [&, id] {
+      ++reads;
+      return std::make_unique<tagged>(static_cast<int>(id), 1);
+    };
+    // This is the same stop-aware contract used by a format adapter.  The
+    // coordinator must use it even though this source has no admission unit.
+    job.stop_work = [&, id](std::stop_token stop) {
+      if (stop.stop_requested())
+        throw std::system_error(std::make_error_code(std::errc::operation_canceled));
+      ++reads;
+      return std::make_unique<tagged>(static_cast<int>(id), 1);
+    };
+    return job;
+  };
+  f.source(std::make_shared<accumulator>(1), out, std::move(source_claim));
+  auto guard = f.shutdown_guard();
+  f.start();
+  REQUIRE(out->await(1));
+  out->consume();
+  REQUIRE(out->await(2));
+  out->consume();
+  REQUIRE(out->await_closed());
+  f.finish();
+  CHECK(claims == 3);  // two real claims plus the single exhausted probe
+  CHECK(reads == 2);
+  CHECK(out->count() == 2);
+  CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
+}
+
+TEST_CASE("Coordinator admission is shared once across adapter units",
+          "[scan_preparation][coordinator][adapter_contract]")
+{
+  fixture f(1, 2);
+  auto out  = std::make_shared<sink>();
+  auto unit = f.coordinator.admit_unit({101, 1}, {});
+  REQUIRE(unit);
+  REQUIRE(f.coordinator.admit_unit({101, 1}, {}) == unit);
+
+  auto claim = [unit, count = 0]() mutable -> std::optional<preparation_coordinator::job> {
+    if (count == 2) return {};
+    auto id = count++;
+    return preparation_coordinator::job{[id] { return std::make_unique<tagged>(id, 1); }, unit};
+  };
+  f.source(std::make_shared<accumulator>(1), out, std::move(claim));
+  auto guard = f.shutdown_guard();
+  f.start();
+  REQUIRE(out->await(1));
+  out->consume();
+  REQUIRE(out->await(2));
+  out->consume();
+  REQUIRE(out->await_closed());
+  f.finish();
+  CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
+}
+
 TEST_CASE("Default and zero job limits allow submission while the worker is blocked",
           "[scan_preparation][coordinator]")
 {
@@ -438,6 +505,64 @@ TEST_CASE("Publication is refused after cancellation wins during input construct
   CHECK(out->preparations == 0);
   CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
 }
+
+TEST_CASE("Normal EOS does not report worker operation_canceled as a query error",
+          "[scan_preparation][coordinator]")
+{
+  fixture f;
+  auto out = std::make_shared<sink>();
+  std::promise<void> started;
+  auto ready   = started.get_future();
+  bool claimed = false;
+  f.source(
+    std::make_shared<accumulator>(1), out, [&]() -> std::optional<preparation_coordinator::job> {
+      if (std::exchange(claimed, true)) return {};
+      preparation_coordinator::job job;
+      job.stop_work =
+        [&started](std::stop_token stop) -> std::unique_ptr<sirius::op::scan::scan_info> {
+        started.set_value();
+        while (!stop.stop_requested())
+          std::this_thread::yield();
+        throw std::system_error(std::make_error_code(std::errc::operation_canceled));
+      };
+      return job;
+    });
+  auto guard = f.shutdown_guard();
+  f.start();
+  REQUIRE(ready.wait_for(1s) == std::future_status::ready);
+  f.coordinator.request_stop(stop_reason::normal_eos);
+  f.finish();
+  CHECK_FALSE(f.completion.has_error());
+}
+
+TEST_CASE("Normal EOS still reports a real late worker error", "[scan_preparation][coordinator]")
+{
+  fixture f;
+  auto out = std::make_shared<sink>();
+  std::promise<void> started;
+  auto ready   = started.get_future();
+  bool claimed = false;
+  f.source(
+    std::make_shared<accumulator>(1), out, [&]() -> std::optional<preparation_coordinator::job> {
+      if (std::exchange(claimed, true)) return {};
+      preparation_coordinator::job job;
+      job.stop_work =
+        [&started](std::stop_token stop) -> std::unique_ptr<sirius::op::scan::scan_info> {
+        started.set_value();
+        while (!stop.stop_requested())
+          std::this_thread::yield();
+        throw std::runtime_error("late worker failure");
+      };
+      return job;
+    });
+  auto guard = f.shutdown_guard();
+  f.start();
+  REQUIRE(ready.wait_for(1s) == std::future_status::ready);
+  f.coordinator.request_stop(stop_reason::normal_eos);
+  f.finish();
+  CHECK(f.completion.has_error());
+}
+
 TEST_CASE("Unresolved typed input forbids scan input construction until the whole unit is ready",
           "[scan_preparation][coordinator]")
 {
@@ -465,7 +590,7 @@ TEST_CASE("Unresolved typed input forbids scan input construction until the whol
   CHECK(f.coordinator.unit_state_snapshot({3, 1})->state == unit_state::pending);
   CHECK(out->count() == 0);
   REQUIRE(unit->complete_input(
-    delete_set_input{std::make_shared<sirius::op::scan::iceberg_delete_set const>("file")}));
+    visibility_input{std::make_shared<sirius::op::scan::iceberg_delete_set const>("file")}));
   REQUIRE(out->await(1));
   CHECK(unit->record().state == unit_state::ready);
   f.coordinator.request_stop(stop_reason::normal_eos);
@@ -935,7 +1060,7 @@ TEST_CASE("An accepted failure callback drains before GPU completion can publish
   auto out      = std::make_shared<sink>();
   auto callback = f.make_hold();
   required_input_set required;
-  required.set(static_cast<size_t>(required_input::delete_set));
+  required.set(static_cast<size_t>(required_input::visibility));
   auto unit = f.coordinator.admit_unit({91, 1}, required);
   std::promise<void> metadata;
   auto ready = metadata.get_future();
@@ -1077,7 +1202,7 @@ TEST_CASE("Cancelling a pending unit synchronizes with and wakes the query owner
   fixture f(1, 1);
   auto out = std::make_shared<sink>();
   required_input_set required;
-  required.set(static_cast<size_t>(required_input::delete_set));
+  required.set(static_cast<size_t>(required_input::visibility));
   auto unit = f.coordinator.admit_unit({72, 1}, required);
   f.source(std::make_shared<accumulator>(1),
            out,
