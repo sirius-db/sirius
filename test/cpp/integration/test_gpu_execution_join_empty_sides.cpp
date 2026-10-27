@@ -15,8 +15,8 @@
  */
 
 // Empty-side SQL regressions preserve the existing MARK semantics and pre-sizing behavior.
-// A deterministic gpu_pipeline_task regression covers zero-batch probes; zero-row-group Parquet
-// currently fails upstream column discovery before reaching the join.
+// Deterministic join reclamation and aggregate-task regressions cover zero-batch probes;
+// zero-row-group Parquet currently fails upstream column discovery before reaching the join.
 
 #include <catch.hpp>
 #include <duckdb.hpp>

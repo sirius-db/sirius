@@ -26,8 +26,10 @@
 #include "expression/ast/utils.hpp"
 #include "helper/type_conversions.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
+#include "op/input_free_operator_data.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
+#include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
 #include "telemetry/nvtx.hpp"
 
@@ -561,13 +563,44 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
   const operator_data& input_data, ::cuda::stream_ref stream)
 {
   nvtx_scoped_range nvtx_range{"sirius_physical_ungrouped_aggregate_merge::execute"};
-  auto& input        = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  auto input_batches = input.get_read_only_batches();
   if (aggregates.empty()) {
     return std::make_unique<pipelineable_operator_data>(
       std::vector<std::shared_ptr<cucascade::data_batch>>{});
   }
 
+  if (auto const* empty = dynamic_cast<input_free_operator_data const*>(&input_data)) {
+    auto const layout = build_aggregate_layout(aggregates);
+    auto& space       = empty->get_gpu_memory_space();
+    auto const mr     = space.get_default_allocator();
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.reserve(layout.aggregates.size());
+    for (std::size_t i = 0; i < layout.aggregates.size(); ++i) {
+      auto const kind = layout.aggregates[i].kind;
+      auto const physical_type =
+        has_physical_overrides() ? get_physical_types()[i] : sirius::get_cudf_type(types[i]);
+      if (kind == aggregate_kind::COUNT_STAR || kind == aggregate_kind::COUNT ||
+          kind == aggregate_kind::COUNT_DISTINCT) {
+        auto zero = sirius::make_constant_column<int64_t>(0, 1, stream, mr);
+        if (zero->type() != physical_type) {
+          zero = cudf::cast(zero->view(), physical_type, stream, mr);
+        }
+        columns.push_back(std::move(zero));
+      } else if (cudf::is_fixed_width(physical_type)) {
+        columns.push_back(
+          cudf::make_fixed_width_column(physical_type, 1, cudf::mask_state::ALL_NULL, stream, mr));
+      } else {
+        auto prototype = sirius::make_empty_table(duckdb::vector<sirius::logical_type>{types[i]});
+        columns.push_back(sirius::make_null_column(prototype->view().column(0), 1, stream, mr));
+      }
+    }
+    auto table = std::make_unique<cudf::table>(std::move(columns));
+    return std::make_unique<pipelineable_operator_data>(
+      std::vector<std::shared_ptr<cucascade::data_batch>>{
+        sirius::make_data_batch(std::move(table), space, stream, batch_telemetry())});
+  }
+
+  auto const& input  = dynamic_cast<pipelineable_operator_data const&>(input_data);
+  auto input_batches = input.get_read_only_batches();
   if (input_batches.empty()) {
     return std::make_unique<pipelineable_operator_data>(
       std::vector<std::shared_ptr<cucascade::data_batch>>{});
@@ -634,23 +667,67 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
     std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(output_batch)});
 }
 
-std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::get_next_task_input_data()
+std::optional<task_creation_hint> sirius_physical_ungrouped_aggregate_merge::get_next_task_hint()
 {
-  // we need to lock, then pull all the batches from one partition and return them, and increment
-  // the partition index
-  std::lock_guard<std::mutex> lg(lock);
-  std::vector<::std::shared_ptr<::cucascade::data_batch>> input_batch;
-  bool found_batch = true;
-  while (found_batch) {
-    auto batch = ports.begin()->second->repo->pop_next_data_batch();
-    if (batch) {
-      input_batch.push_back(std::move(batch));
-    } else {
-      found_batch = false;
+  if (ports.empty() || _task_claimed.load(std::memory_order_acquire)) { return std::nullopt; }
+  for (auto const& [name, port] : ports) {
+    if (port->src_pipeline && !port->src_pipeline->is_pipeline_finished()) {
+      auto source    = port->src_pipeline->get_source();
+      auto* producer = source ? source.get() : &port->src_pipeline->get_operators().front().get();
+      return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
     }
   }
-  if (input_batch.empty()) { return nullptr; }
-  return std::make_unique<pipelineable_operator_data>(input_batch);
+  bool expected = false;
+  if (!_task_claimed.compare_exchange_strong(expected, true)) { return std::nullopt; }
+  return task_creation_hint{TaskCreationHint::READY, this};
+}
+
+bool sirius_physical_ungrouped_aggregate_merge::all_ports_empty()
+{
+  return _input_handed_out.load(std::memory_order_acquire);
+}
+
+std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::get_next_task_input_data()
+{
+  std::lock_guard<std::mutex> guard(lock);
+  if (!_task_claimed.load(std::memory_order_acquire) ||
+      _input_handed_out.load(std::memory_order_acquire) || !is_source_pipeline_finished()) {
+    return nullptr;
+  }
+  std::vector<std::shared_ptr<cucascade::data_batch>> batches;
+  for (auto const& [name, port] : ports) {
+    if (!port->repo) { continue; }
+    while (auto batch = port->repo->pop_next_data_batch()) {
+      batches.push_back(std::move(batch));
+    }
+  }
+  std::unique_ptr<operator_data> input;
+  if (batches.empty()) {
+    input = std::make_unique<input_free_operator_data>(empty_input_size_estimate());
+  } else {
+    input = std::make_unique<pipelineable_operator_data>(std::move(batches));
+  }
+  _input_handed_out.store(true, std::memory_order_release);
+  return input;
+}
+
+std::size_t sirius_physical_ungrouped_aggregate_merge::empty_input_size_estimate() const
+{
+  // Per-column allowance includes masks, nested offsets, and allocation rounding.
+  std::size_t columns = types.size();
+  for (auto const& type : types) {
+    if (type.is_array() || type.is_varchar()) { columns = memory::saturating_add(columns, 2); }
+  }
+  return std::max(memory::saturating_mul(columns, std::size_t{4096}), std::size_t{1} << 20);
+}
+
+std::size_t sirius_physical_ungrouped_aggregate_merge::no_history_peak_memory_estimate(
+  input_stats const& stats) const
+{
+  auto const ordinary = sirius_physical_operator::no_history_peak_memory_estimate(stats);
+  return stats.type == operator_data_type::INPUT_FREE
+           ? std::max(ordinary, empty_input_size_estimate())
+           : ordinary;
 }
 
 }  // namespace op

@@ -46,11 +46,11 @@
 using sirius::op::BUILD_HASH_TABLE_STATE;
 using sirius::op::build_probe_action;
 using sirius::op::build_probe_slot_view;
+using sirius::op::build_probe_slots_to_reclaim;
 using sirius::op::compute_hash_join_partition_strategy;
 using sirius::op::HASH_JOIN_MODE;
 using sirius::op::partition_placement;
 using sirius::op::partition_strategy;
-using sirius::op::plan_build_probe_reclaim;
 using sirius::op::select_build_probe_action;
 
 namespace {
@@ -698,162 +698,51 @@ TEST_CASE("select_build_probe_action - first ready build wins across many partit
 }
 
 //===----------------------------------------------------------------------===//
-// plan_build_probe_reclaim
+// build_probe_slots_to_reclaim
 //===----------------------------------------------------------------------===//
 
-TEST_CASE("plan_build_probe_reclaim - nothing is reclaimed until the probe side finishes",
+TEST_CASE("build_probe_slots_to_reclaim waits for the probe producer", "[build_probe]")
+{
+  auto const candidates =
+    build_probe_slots_to_reclaim({slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false)}, false);
+  CHECK(candidates.empty());
+}
+
+TEST_CASE("build_probe_slots_to_reclaim selects every never-probed build", "[build_probe]")
+{
+  auto const candidates =
+    build_probe_slots_to_reclaim({slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false),
+                                  slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false),
+                                  slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false)},
+                                 true);
+  CHECK(candidates == std::vector<std::size_t>{0, 1, 2});
+}
+
+TEST_CASE("build_probe_slots_to_reclaim preserves probe data and active slots", "[build_probe]")
+{
+  auto const candidates =
+    build_probe_slots_to_reclaim({slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, true),
+                                  slot(BUILD_HASH_TABLE_STATE::SCHEDULING, true, false),
+                                  slot(BUILD_HASH_TABLE_STATE::SCHEDULED, true, false),
+                                  slot(BUILD_HASH_TABLE_STATE::BUILT, true, false),
+                                  slot(BUILD_HASH_TABLE_STATE::DESTROYED, true, false),
+                                  slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, false, false),
+                                  slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false)},
+                                 true);
+  CHECK(candidates == std::vector<std::size_t>{6});
+}
+
+TEST_CASE("build_probe_slots_to_reclaim handles a build arriving after probe closure",
           "[build_probe]")
 {
-  // Build-only slots exist, but probe may still deliver data — plan nothing yet.
-  auto const plan = plan_build_probe_reclaim(
-    {
-      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false),
-      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false),
-    },
-    /*probe_finished=*/false,
-    /*task_issued=*/false);
-  REQUIRE(plan.discard.empty());
-  REQUIRE_FALSE(plan.orphan.has_value());
-}
-
-TEST_CASE("plan_build_probe_reclaim - discards only NOT_BUILT slots with build but no probe",
-          "[build_probe]")
-{
-  // Tasks were issued, so this is pure cleanup. p0: has probe -> will be built, keep.  p1:
-  // build-only -> discard.  p2: already BUILT -> keep.  p3: build-only -> discard.  p4: no build
-  // batch at all -> nothing to discard.
-  auto const plan = plan_build_probe_reclaim(
-    {
-      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, true),
-      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false),
-      slot(BUILD_HASH_TABLE_STATE::BUILT, false, false),
-      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false),
-      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, false, false),
-    },
-    /*probe_finished=*/true,
-    /*task_issued=*/true);
-  REQUIRE(plan.discard == std::vector<std::size_t>{1, 3});
-  REQUIRE_FALSE(plan.orphan.has_value());
-}
-
-TEST_CASE("plan_build_probe_reclaim - a DESTROYED slot is not rediscarded", "[build_probe]")
-{
-  auto const plan = plan_build_probe_reclaim(
-    {
-      slot(BUILD_HASH_TABLE_STATE::DESTROYED, false, false),
-      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false),
-    },
-    /*probe_finished=*/true,
-    /*task_issued=*/true);
-  REQUIRE(plan.discard == std::vector<std::size_t>{1});
-  REQUIRE_FALSE(plan.orphan.has_value());
-}
-
-TEST_CASE("plan_build_probe_reclaim - an already-issued task makes every candidate a discard",
-          "[build_probe]")
-{
-  auto const plan = plan_build_probe_reclaim(
-    {
-      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false),
-      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false),
-    },
-    /*probe_finished=*/true,
-    /*task_issued=*/true);
-  REQUIRE(plan.discard == std::vector<std::size_t>{0, 1});
-  REQUIRE_FALSE(plan.orphan.has_value());
-}
-
-TEST_CASE("plan_build_probe_reclaim - zero-task end state keeps one slot as the orphan",
-          "[build_probe]")
-{
-  // Probe finished with zero batches anywhere and no task ever issued: freeing every slot would
-  // leave downstream COUNT without an input batch, so the first candidate becomes the empty-output
-  // task and only the rest are discarded.
-  auto const plan = plan_build_probe_reclaim(
-    {
-      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false),
-      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false),
-      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false),
-    },
-    /*probe_finished=*/true,
-    /*task_issued=*/false);
-  REQUIRE(plan.orphan == 0);
-  REQUIRE(plan.discard == std::vector<std::size_t>{1, 2});
-}
-
-TEST_CASE("plan_build_probe_reclaim - probe data anywhere suppresses the orphan", "[build_probe]")
-{
-  // Slot 0 holds a probe batch, so a normal build task will be issued for it; the never-probed
-  // candidate is a plain discard.
-  auto const plan = plan_build_probe_reclaim(
-    {
-      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, true),
-      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false),
-    },
-    /*probe_finished=*/true,
-    /*task_issued=*/false);
-  REQUIRE_FALSE(plan.orphan.has_value());
-  REQUIRE(plan.discard == std::vector<std::size_t>{1});
-}
-
-TEST_CASE("plan_build_probe_reclaim - an in-flight or built slot suppresses the orphan",
-          "[build_probe]")
-{
-  // SCHEDULING / SCHEDULED / BUILT all mean a task was or will be issued, so the candidate is a
-  // plain discard.
-  for (auto const state : {BUILD_HASH_TABLE_STATE::SCHEDULING,
-                           BUILD_HASH_TABLE_STATE::SCHEDULED,
-                           BUILD_HASH_TABLE_STATE::BUILT}) {
-    auto const plan = plan_build_probe_reclaim(
-      {
-        slot(state, false, false),
-        slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false),
-      },
-      /*probe_finished=*/true,
-      /*task_issued=*/false);
-    REQUIRE_FALSE(plan.orphan.has_value());
-    REQUIRE(plan.discard == std::vector<std::size_t>{1});
-  }
-}
-
-TEST_CASE("plan_build_probe_reclaim - a slot still awaiting its build batch is left alone",
-          "[build_probe]")
-{
-  // Slot 0 has no build batch yet, so it is not a candidate (neither discarded nor the orphan);
-  // the orphan goes to the first candidate that already holds its build batch, and a later reclaim
-  // pass discards slot 0 once its build batch arrives.
-  auto const plan = plan_build_probe_reclaim(
-    {
-      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, false, false),
-      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false),
-    },
-    /*probe_finished=*/true,
-    /*task_issued=*/false);
-  REQUIRE(plan.orphan == 1);
-  REQUIRE(plan.discard.empty());
-}
-
-TEST_CASE("plan_build_probe_reclaim - a DESTROYED slot does not block the orphan", "[build_probe]")
-{
-  auto const plan = plan_build_probe_reclaim(
-    {
-      slot(BUILD_HASH_TABLE_STATE::DESTROYED, false, false),
-      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false),
-    },
-    /*probe_finished=*/true,
-    /*task_issued=*/false);
-  REQUIRE(plan.orphan == 1);
-  REQUIRE(plan.discard.empty());
-}
-
-TEST_CASE("plan_build_probe_reclaim - single-partition zero-probe join claims the orphan",
-          "[build_probe]")
-{
-  auto const plan = plan_build_probe_reclaim({slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false)},
-                                             /*probe_finished=*/true,
-                                             /*task_issued=*/false);
-  REQUIRE(plan.orphan == 0);
-  REQUIRE(plan.discard.empty());
+  std::vector<build_probe_slot_view> slots{slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, false, false),
+                                           slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false)};
+  CHECK(build_probe_slots_to_reclaim(slots, true) == std::vector<std::size_t>{1});
+  slots[1]                 = slot(BUILD_HASH_TABLE_STATE::DESTROYED, false, false);
+  slots[0].has_build_batch = true;
+  CHECK(build_probe_slots_to_reclaim(slots, true) == std::vector<std::size_t>{0});
+  slots[0] = slot(BUILD_HASH_TABLE_STATE::DESTROYED, false, false);
+  CHECK(build_probe_slots_to_reclaim(slots, true).empty());
 }
 
 //===----------------------------------------------------------------------===//

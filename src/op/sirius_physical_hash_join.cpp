@@ -78,35 +78,6 @@ namespace op {
 
 namespace {
 
-/** @brief Empty-output task that captures its reserved GPU space without owning input batches. */
-class build_probe_orphan_input final : public operator_data {
- public:
-  build_probe_orphan_input(std::size_t partition, partition_placement const& placement)
-    : _partition(partition)
-  {
-    if (auto const device = placement.device_for(partition)) { set_preferred_device_id(*device); }
-  }
-
-  void prepare_for_processing(cucascade::memory::memory_space const* requested_space,
-                              ::cuda::stream_ref) override
-  {
-    _space = const_cast<cucascade::memory::memory_space*>(requested_space);
-  }
-
-  [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override
-  {
-    // Nominal nonzero basis also leaves room for downstream COUNT/SUM over the empty output.
-    return std::size_t{1} << 20;
-  }
-
-  [[nodiscard]] std::size_t partition() const noexcept { return _partition; }
-  [[nodiscard]] cucascade::memory::memory_space* space() const noexcept { return _space; }
-
- private:
-  std::size_t _partition;
-  cucascade::memory::memory_space* _space = nullptr;
-};
-
 void discard_build_partition(cucascade::shared_data_repository& repository, std::size_t partition)
 {
   while (auto batch = repository.pop_next_data_batch(partition)) {
@@ -1117,61 +1088,32 @@ std::vector<build_probe_slot_view> sirius_physical_hash_join::snapshot_build_pro
   return slots;
 }
 
-build_probe_reclaim_plan plan_build_probe_reclaim(std::vector<build_probe_slot_view> const& slots,
-                                                  bool probe_finished,
-                                                  bool task_issued)
+std::vector<std::size_t> build_probe_slots_to_reclaim(
+  std::vector<build_probe_slot_view> const& slots, bool probe_finished)
 {
-  build_probe_reclaim_plan plan;
-  if (!probe_finished) { return plan; }
-
   std::vector<std::size_t> candidates;
+  if (!probe_finished) { return candidates; }
   for (std::size_t p = 0; p < slots.size(); ++p) {
-    auto const& s = slots[p];
-    // NOT_BUILT means the slot was never scheduled (so its build batch is still in the repo); no
-    // probe batch with the probe side finished means none is coming. A BUILT slot already consumed
-    // its build batch, and a slot with probe data will still be built — leave those.
-    if (s.state == BUILD_HASH_TABLE_STATE::NOT_BUILT && s.has_build_batch && !s.has_probe_batch) {
+    auto const& slot = slots[p];
+    if (slot.state == BUILD_HASH_TABLE_STATE::NOT_BUILT && slot.has_build_batch &&
+        !slot.has_probe_batch) {
       candidates.push_back(p);
     }
   }
-
-  // A zero-task join must emit an empty batch so a downstream aggregate can produce COUNT 0.
-  // Existing or schedulable tasks already provide that batch, so they suppress the orphan.
-  bool const orphan_eligible =
-    !task_issued && std::ranges::none_of(slots, [](build_probe_slot_view const& s) {
-      return s.has_probe_batch || (s.state != BUILD_HASH_TABLE_STATE::NOT_BUILT &&
-                                   s.state != BUILD_HASH_TABLE_STATE::DESTROYED);
-    });
-  if (orphan_eligible && !candidates.empty()) {
-    plan.orphan = candidates.front();
-    plan.discard.assign(candidates.begin() + 1, candidates.end());
-  } else {
-    plan.discard = std::move(candidates);
-  }
-  return plan;
+  return candidates;
 }
 
-bool sirius_physical_hash_join::reclaim_build_only_slots_if_probe_complete()
+void sirius_physical_hash_join::reclaim_build_only_slots_if_probe_complete(bool probe_finished)
 {
+  if (!probe_finished) { return; }
   auto* build_port = get_port("build");
   auto* probe_port = get_port("default");
-  if (!build_port || !probe_port) { return false; }
-  bool const probe_finished =
-    probe_port->src_pipeline && probe_port->src_pipeline->is_pipeline_finished();
-  auto const plan = plan_build_probe_reclaim(
-    snapshot_build_probe_slots(), probe_finished, _build_probe_task_issued);
-  for (auto const partition : plan.discard) {
+  for (auto const partition :
+       build_probe_slots_to_reclaim(snapshot_build_probe_slots(), probe_finished)) {
     discard_build_partition(*build_port->repo, partition);
     _partition_build_states[partition].build_state.store(BUILD_HASH_TABLE_STATE::DESTROYED,
                                                          std::memory_order_release);
   }
-  if (plan.orphan) {
-    _build_probe_orphan_partition = plan.orphan;
-    _partition_build_states[*plan.orphan].build_state.store(BUILD_HASH_TABLE_STATE::SCHEDULING,
-                                                            std::memory_order_release);
-    return true;
-  }
-  return false;
 }
 
 std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint()
@@ -1213,11 +1155,9 @@ std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint(
     // sequences interleave (a built partition probes on its GPU while another still builds on a
     // different GPU). Pick the next action from a per-partition snapshot.
 
-    if (reclaim_build_only_slots_if_probe_complete()) {
-      return task_creation_hint{TaskCreationHint::READY, this};
-    }
     bool const probe_finished =
       probe_port->src_pipeline && probe_port->src_pipeline->is_pipeline_finished();
+    reclaim_build_only_slots_if_probe_complete(probe_finished);
     auto const decision = select_build_probe_action(snapshot_build_probe_slots(), probe_finished);
     switch (decision.action) {
       case build_probe_action::schedule_build:
@@ -1300,19 +1240,9 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
         "(concat-folded) build batch for partition " +
         std::to_string(p) + " in operator " + std::to_string(this->get_operator_id()));
     }
-    if (_build_probe_orphan_partition == p) {
-      auto input = std::make_unique<build_probe_orphan_input>(p, *placement);
-      discard_build_partition(*build_port->repo, p);
-      _partition_build_states[p].build_state.store(BUILD_HASH_TABLE_STATE::SCHEDULED,
-                                                   std::memory_order_release);
-      _build_probe_orphan_partition.reset();
-      _build_probe_task_issued = true;
-      return input;
-    }
     std::vector<std::shared_ptr<cucascade::data_batch>> input_batch;
     input_batch.push_back(probe_port->repo->pop_next_data_batch(p));
     input_batch.push_back(build_port->repo->pop_next_data_batch(p));
-    _build_probe_task_issued = true;
     // Count in execute() with a blocking accessor because this batch is not observed after pop.
     _partition_build_states[p].build_state.store(BUILD_HASH_TABLE_STATE::SCHEDULED,
                                                  std::memory_order_release);
@@ -1339,7 +1269,6 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
         p,
         this->get_operator_id());
     }
-    _build_probe_task_issued = true;
     return std::make_unique<partitioned_operator_data>(std::move(input_batch), p, *placement);
   }
 
@@ -1882,39 +1811,6 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                                                                   ::cuda::stream_ref stream)
 {
   nvtx_scoped_range nvtx_range{"sirius_physical_hash_join::execute"};
-  if (auto const* orphan = dynamic_cast<build_probe_orphan_input const*>(&input_data)) {
-    if (_join_mode != HASH_JOIN_MODE::BUILD_PROBE ||
-        orphan->partition() >= _partition_build_states.size() || orphan->space() == nullptr ||
-        orphan->space()->get_tier() != cucascade::memory::Tier::GPU) {
-      throw std::runtime_error("BUILD_PROBE orphan requires preparation in its reserved GPU space");
-    }
-    // Only probe-preserving join kinds enter BUILD_PROBE, so a closed empty probe yields no rows.
-    auto table = sirius::make_empty_table(get_types());
-    if (has_physical_overrides()) {
-      auto columns = table->release();
-      for (std::size_t i = 0; i < columns.size(); ++i) {
-        // Logical types retain the child schema that a nested carrier type cannot describe.
-        if (!cudf::is_nested(get_physical_types()[i])) {
-          columns[i] = cudf::make_empty_column(get_physical_types()[i]);
-        }
-      }
-      table = std::make_unique<cudf::table>(std::move(columns));
-    }
-    auto output = std::make_unique<pipelineable_operator_data>(
-      std::vector<std::shared_ptr<cucascade::data_batch>>{
-        make_data_batch(std::move(table), *orphan->space(), stream, batch_telemetry())});
-    // Construction can OOM. Leave SCHEDULED until the complete output exists so the same task
-    // descriptor can retry. Pipeline task counters keep downstream compute and sink-input
-    // restoration retries in flight.
-    _partition_build_states[orphan->partition()].build_state.store(
-      BUILD_HASH_TABLE_STATE::DESTROYED, std::memory_order_release);
-    log::log_noexcept([&] {
-      SIRIUS_LOG_DEBUG("hash_join id {} emitted empty BUILD_PROBE orphan output for partition {}",
-                       get_operator_id(),
-                       orphan->partition());
-    });
-    return output;
-  }
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
 

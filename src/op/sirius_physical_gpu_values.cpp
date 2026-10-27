@@ -18,6 +18,7 @@
 
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
+#include "op/input_free_operator_data.hpp"
 #include "telemetry/nvtx.hpp"
 
 #include <cudf/column/column.hpp>
@@ -265,7 +266,7 @@ bool sirius_physical_gpu_values::all_ports_empty()
 std::unique_ptr<operator_data> sirius_physical_gpu_values::get_next_task_input_data()
 {
   if (_input_handed_out.exchange(true, std::memory_order_acq_rel)) { return nullptr; }
-  return std::make_unique<gpu_values_input>(estimated_source_bytes());
+  return std::make_unique<input_free_operator_data>(estimated_source_bytes());
 }
 
 //===----------------------------------------------------------------------===//
@@ -276,19 +277,15 @@ std::unique_ptr<operator_data> sirius_physical_gpu_values::execute(const operato
 {
   nvtx_scoped_range nvtx_range{"sirius_physical_gpu_values::execute"};
 
-  auto const* values_input = dynamic_cast<const gpu_values_input*>(&input_data);
+  auto const* values_input = dynamic_cast<const input_free_operator_data*>(&input_data);
   if (!values_input) {
     throw std::runtime_error(
-      "[sirius_physical_gpu_values::execute] expected input of type gpu_values_input; got " +
+      "[sirius_physical_gpu_values::execute] expected input of type input_free_operator_data; "
+      "got " +
       std::string(typeid(input_data).name()));
   }
-  auto* mem_space = values_input->get_gpu_memory_space();
-  if (!mem_space) {
-    throw std::runtime_error(
-      "[sirius_physical_gpu_values::execute] no memory space set on task input; "
-      "prepare_for_processing was not called");
-  }
-  auto mr = mem_space->get_default_allocator();
+  auto* mem_space = &values_input->get_gpu_memory_space();
+  auto mr         = mem_space->get_default_allocator();
 
   std::unique_ptr<cudf::table> output_table;
   if (_collection && _collection->Count() > 0) {

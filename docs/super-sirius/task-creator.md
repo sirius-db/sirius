@@ -158,6 +158,10 @@ Deadlock prevention: both this and sibling partition locks are acquired in a fix
 | `get_next_task_input_data()` | Mutex-locked: drains ALL batches from one partition, advances `_current_partition_index`. |
 | Why custom | One task per partition — must drain entire partition for multi-way merge |
 
+### MERGE_AGGREGATE
+
+The ungrouped aggregate merge waits for its upstream producer to finish and claims one task, regardless of whether partial-result batches exist. It drains all partials for a normal merge, or returns `input_free_operator_data` to construct the final empty-input row. Its `all_ports_empty()` override remains false until this descriptor is handed out, preventing a zero-batch input from finishing the pipeline before finalization. The existing pipeline task-creation lock covers handout and incrementing the task count.
+
 ### GROUPED_AGGREGATE_MERGE
 
 Same pattern as MERGE_SORT: drains all batches from one partition per call, advancing partition index.
@@ -184,6 +188,7 @@ Same pattern as MERGE_SORT: drains all batches from one partition per call.
 | SORT_SAMPLE | Wait for N batches | Base class | Two-phase sampling |
 | MERGE_SORT | Base class | Drain all from one partition | Per-partition merge |
 | GROUPED_AGGREGATE_MERGE | Base class | Drain all from one partition | Per-partition merge |
+| MERGE_AGGREGATE | Claim one task after upstream completion | Drain all partials or create input-free descriptor | Final SQL row even with zero input batches |
 | TOP_N_MERGE | Base class | Drain all from one partition | Per-partition merge |
 | DELIM_JOIN | N/A | Delegates to partition_join | Wrapper pattern |
 
