@@ -213,6 +213,7 @@ set(TEST_SOURCES
     test/cpp/preload/test_candidate_store.cpp
     test/cpp/preload/test_hw_caps.cpp
     test/cpp/preload/test_preload_policy.cpp
+    test/cpp/preload/test_preload_promotion.cpp
     test/cpp/operator/test_build_probe_scheduling.cpp
     test/cpp/operator/test_partition_placement.cpp
     test/cpp/operator/test_partition_exchange.cpp

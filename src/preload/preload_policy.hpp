@@ -102,7 +102,7 @@ enum class promotion_outcome : std::uint8_t {
   no_memory,         ///< the target space refused the reservation
   gated,             ///< the reservation would take the space above the preload ceiling
   held_off,          ///< a task on the GPU is stalled on memory or has an OOM retry pending
-  oom,               ///< the copy ran out of memory despite the reservation
+  oom,               ///< a GPU copy overran its reservation (the estimate was low)
   failed             ///< any other error
 };
 
@@ -215,7 +215,14 @@ struct promotion_job {
   return bytes >= static_cast<double>(capacity) ? capacity : static_cast<std::size_t>(bytes);
 }
 
-/// Consumed bytes of a space: `max_memory - min(max_memory, available)`.
+/**
+ * @brief Consumed bytes of a space: `max_memory - min(max_memory, available)`.
+ *
+ * Available memory is `capacity - allocated`, so this undercounts allocated bytes by
+ * `capacity - max_memory`. It is deliberately the quantity `should_downgrade_memory` compares
+ * with the downgrade thresholds, and every preload ceiling is in these units; budgets and
+ * admission checks must both use it.
+ */
 [[nodiscard]] constexpr std::size_t consumed_bytes(std::size_t max_memory,
                                                    std::size_t available) noexcept
 {
