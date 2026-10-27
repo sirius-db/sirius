@@ -46,7 +46,9 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalCrossProduct& op)
     op.estimated_cardinality);
   // The output of each task aims for cross_join_task_bytes.
   if (auto sirius_context = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")) {
-    join->set_cross_join_task_bytes(duckdb::query_operator_options(context)->cross_join_task_bytes);
+    auto const options = duckdb::query_operator_options(context);
+    join->set_cross_join_task_bytes(options->cross_join_task_bytes);
+    join->set_max_broadcast_join_size(options->max_broadcast_join_size);
   }
   return join;
 }
