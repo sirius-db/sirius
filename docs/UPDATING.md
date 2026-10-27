@@ -20,7 +20,11 @@ as follows:
 3. Bump versions in `.github/workflows`
     - `duckdb_version` input in `distribution.yml` should be set to latest tagged release (e.g. `v2.0.0`) or matching SHA with submodules in 1
     - The reusable `sirius-db/extension-ci-tools` workflow ref and `ci_tools_version` input should be updated only when the remote CI tooling branch changes
-4. Check for use of the current DuckDB version in the repo to determine if they should be updated
+4. Map the submodule commit to its release version (`DUCKDB_EXPLICIT_VERSION`) in
+   `sirius-duckdb/Makefile` and `cmake/sirius-duckdb-provider.cmake`, and update the
+   `-DDUCKDB_EXPLICIT_VERSION` flags in `test.yml` and `distribution.yml`. DuckDB otherwise
+   reports a development version, even at a release tag.
+5. Check for use of the current DuckDB version in the repo to determine if they should be updated
    with the current PR or documented as a gap in an issue for follow up later.
 
 ## Verify

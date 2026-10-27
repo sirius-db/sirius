@@ -201,6 +201,10 @@ jobs:
 
           [[ "$declared" == "$engine" ]]
 
+          # Builds report the release version only for the commit named here.
+          grep -q "$engine" sirius-duckdb/Makefile
+          grep -q "$engine" cmake/sirius-duckdb-provider.cmake
+
       # Rust bindings (sirius-sys + sirius) — fmt/clippy + build/link the test.
       # Run on a single representative entry. `cargo test --no-run` compiles the
       # cxx glue against the Sirius FFI header and links the proof-of-life test
