@@ -114,7 +114,7 @@ TEST_CASE("probe accumulate keeps MIN, MAX and COUNT per matched build row", "[p
   state.initialize(4, stream(), mr());
   state.accumulate(probe, probe_rows, build_rows, stream());
   auto out = state.emit(build_key->view(), stream(), mr());
-  stream().synchronize();
+  stream().sync();
 
   REQUIRE(out->num_columns() == 5);
   // Slots 0, 1, 2 matched; slot 3 did not.
@@ -150,7 +150,7 @@ TEST_CASE("probe accumulate emits nothing when no probe row matched", "[probe_ac
   state.initialize(3, stream(), mr());
   state.accumulate(probe, none, none, stream());
   auto out = state.emit(build_key->view(), stream(), mr());
-  stream().synchronize();
+  stream().sync();
   REQUIRE(out->num_rows() == 0);
   REQUIRE(out->num_columns() == 3);
 }
@@ -170,7 +170,7 @@ TEST_CASE("probe accumulate folds several probe batches into one set of slots",
     state.accumulate(probe, to_device({0, 1}), to_device({1, 0}), stream());
   }
   auto out = state.emit(build_key->view(), stream(), mr());
-  stream().synchronize();
+  stream().sync();
   REQUIRE(out->num_rows() == 2);
   REQUIRE(copy_column_to_host<int64_t>(out->view().column(1)) == std::vector<int64_t>{21, 20});
   REQUIRE(copy_column_to_host<int64_t>(out->view().column(2)) == std::vector<int64_t>{3, 3});
@@ -217,7 +217,7 @@ TEST_CASE("probe accumulate matches a host reference on random data", "[probe_ac
   state.initialize(num_build, stream(), mr());
   state.accumulate(probe, to_device(probe_rows), to_device(build_rows), stream());
   auto out = state.emit(build_key->view(), stream(), mr());
-  stream().synchronize();
+  stream().sync();
 
   std::vector<int> matched;
   for (int s = 0; s < num_build; ++s) {

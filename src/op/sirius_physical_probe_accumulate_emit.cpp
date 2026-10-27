@@ -123,7 +123,7 @@ std::unique_ptr<operator_data> sirius_physical_probe_accumulate_emit::execute(
         std::vector<std::unique_ptr<cudf::column>> columns;
         columns.reserve(types.size());
         for (auto const& type : types) {
-          columns.push_back(cudf::make_empty_column(sirius::get_cudf_type(type)));
+          columns.push_back(cudf::make_empty_column(sirius::require_cudf_type(type)));
         }
         _context->emitted = std::make_unique<cudf::table>(std::move(columns));
       }

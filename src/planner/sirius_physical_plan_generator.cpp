@@ -2279,7 +2279,7 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
         context.registered_state
           ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
           : nullptr;
-      sirius_ctx && sirius_ctx->get_config().get_operator_params().enable_probe_accumulate) {
+      sirius_ctx && duckdb::query_operator_options(context)->enable_probe_accumulate) {
     rewrite_correlated_inequality_exists(context, op);
   }
 

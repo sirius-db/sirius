@@ -28,6 +28,7 @@
 #include <duckdb.hpp>
 #include <duckdb/execution/column_binding_resolver.hpp>
 #include <duckdb/main/config.hpp>
+#include <duckdb/main/settings.hpp>
 #include <duckdb/optimizer/optimizer.hpp>
 #include <duckdb/parser/parser.hpp>
 #include <duckdb/planner/planner.hpp>
@@ -86,7 +87,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> generate_sirius_plan(
   con.Query("BEGIN TRANSACTION");
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> result;
   try {
-    Parser parser(context.GetParserOptions());
+    Parser parser(context);
     parser.ParseQuery(query);
     REQUIRE(!parser.statements.empty());
 
@@ -94,13 +95,14 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> generate_sirius_plan(
     planner.CreatePlan(std::move(parser.statements[0]));
     REQUIRE(planner.plan);
     auto plan = std::move(planner.plan);
-    if (context.config.enable_optimizer) {
+    if (duckdb::Settings::Get<duckdb::EnableOptimizerSetting>(context)) {
       Optimizer optimizer(*planner.binder, context);
       plan = optimizer.Optimize(std::move(plan));
     }
     plan->ResolveOperatorTypes();
     ColumnBindingResolver resolver;
-    ColumnBindingResolver::Verify(*plan);
+    duckdb::ColumnBindingResolver verifier(true);
+    verifier.VisitOperator(*plan);
     resolver.VisitOperator(*plan);
 
     sirius::planner::sirius_physical_plan_generator gen(context);
@@ -332,9 +334,8 @@ TEST_CASE_METHOD(probe_accumulate_fixture,
   CHECK(fused_count(query) == 1);
 }
 
-// DuckDB removes the delim join itself (leaving a plain SEMI/ANTI join with the inequality as a
-// residual) for the simplest shapes. A filter on the outer rows or on the subquery keeps it, which
-// is also what TPC-H q21's join tree does, so these queries all carry one.
+// DuckDB decorrelates these into a MARK delim join under a filter on the mark, as it does for TPC-H
+// q21's subqueries.
 constexpr char const* delim_exists_query =
   "SELECT f.k, f.v FROM fact f WHERE f.w > f.v AND EXISTS "
   "(SELECT 1 FROM fact g WHERE g.k = f.k AND g.v <> f.v)";
@@ -344,17 +345,24 @@ TEST_CASE_METHOD(
   "probe accumulate fuses a correlated EXISTS with <> after rewriting its decorrelation",
   "[probe_accumulate][plan][exists_rewrite]")
 {
+  auto delim_join_type = [](sirius::op::sirius_physical_operator* plan) {
+    auto const delims = collect(plan, T::LEFT_DELIM_JOIN);
+    REQUIRE(delims.size() == 1);
+    auto const& delim = delims[0]->Cast<sirius::op::sirius_physical_delim_join>();
+    return delim.join->Cast<sirius::op::sirius_physical_hash_join>().join_type;
+  };
+
   auto plan = generate_sirius_plan(*con, delim_exists_query);
   REQUIRE(plan);
-  // One fused aggregate feeding a LEFT delim join, not the pair-emitting semi join.
+  // One fused aggregate feeding a LEFT delim join, not the pair-emitting MARK join.
   CHECK(collect(plan.get(), T::PROBE_ACCUMULATE_EMIT).size() == 1);
-  CHECK(collect(plan.get(), T::LEFT_DELIM_JOIN).size() == 1);
+  CHECK(delim_join_type(plan.get()) == duckdb::JoinType::LEFT);
   CHECK(collect(plan.get(), T::RIGHT_DELIM_JOIN).empty());
 
   set_flag(false);
   auto unrewritten = generate_sirius_plan(*con, delim_exists_query);
   CHECK(collect(unrewritten.get(), T::PROBE_ACCUMULATE_EMIT).empty());
-  CHECK_FALSE(collect(unrewritten.get(), T::RIGHT_DELIM_JOIN).empty());
+  CHECK(delim_join_type(unrewritten.get()) == duckdb::JoinType::MARK);
 }
 
 TEST_CASE_METHOD(probe_accumulate_fixture,
@@ -384,6 +392,9 @@ TEST_CASE_METHOD(probe_accumulate_fixture,
                     "(SELECT 1 FROM fact g WHERE g.k = f.k AND g.x <> f.x)") == 0);
   CHECK(fused_count("SELECT f.k FROM fact f WHERE f.late AND EXISTS "
                     "(SELECT 1 FROM fact g WHERE g.s = f.s AND g.v <> f.v)") == 0);
+  // A value that can be NULL, where `<>` and `IS DISTINCT FROM` select different rows.
+  CHECK(fused_count("SELECT f.k FROM fact f WHERE f.late AND EXISTS "
+                    "(SELECT 1 FROM fact g WHERE g.k = f.k AND g.w IS DISTINCT FROM f.w)") == 0);
 }
 
 TEST_CASE_METHOD(

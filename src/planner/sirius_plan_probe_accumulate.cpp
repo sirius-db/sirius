@@ -97,16 +97,16 @@ duckdb::unique_ptr<duckdb::Expression> address_on_probe(duckdb::Expression const
   duckdb::ExpressionIterator::VisitExpressionClassMutable(
     copy, duckdb::ExpressionClass::BOUND_REF, [&](duckdb::unique_ptr<duckdb::Expression>& leaf) {
       auto& ref = leaf->Cast<duckdb::BoundReferenceExpression>();
-      if (ref.index >= layout.left_count + layout.right_count) {
+      if (ref.Index() >= layout.left_count + layout.right_count) {
         ok = false;
         return;
       }
-      auto const [child, column] = resolve_output(join, layout, ref.index);
+      auto const [child, column] = resolve_output(join, layout, ref.Index());
       if (child != 0) {
         ok = false;
         return;
       }
-      leaf = duckdb::make_uniq<duckdb::BoundReferenceExpression>(ref.return_type, column);
+      leaf = duckdb::make_uniq<duckdb::BoundReferenceExpression>(ref.GetReturnType(), column);
     });
   if (!ok || sirius::ast::from_duckdb(*copy) == nullptr) { return nullptr; }
   return copy;
@@ -155,20 +155,20 @@ std::optional<probe_accumulate_detection> detect_probe_accumulate(
   }
   if (input->type != duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN) { return std::nullopt; }
   auto const& join = input->Cast<duckdb::LogicalComparisonJoin>();
-  if (join.join_type != duckdb::JoinType::INNER || join.conditions.size() != 1 || join.predicate ||
-      join.children.size() != 2) {
+  if (join.join_type != duckdb::JoinType::INNER || join.conditions.size() != 1 ||
+      !join.conditions[0].IsComparison() || join.children.size() != 2) {
     return std::nullopt;
   }
   auto const& condition = join.conditions[0];
-  if (condition.comparison != duckdb::ExpressionType::COMPARE_EQUAL ||
-      condition.left->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF ||
-      condition.right->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
+  if (condition.GetComparisonType() != duckdb::ExpressionType::COMPARE_EQUAL ||
+      condition.GetLHS().GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF ||
+      condition.GetRHS().GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
     return std::nullopt;
   }
-  auto const& probe_ref = condition.left->Cast<duckdb::BoundReferenceExpression>();
-  auto const& build_ref = condition.right->Cast<duckdb::BoundReferenceExpression>();
-  auto const key_type   = probe_ref.return_type.id();
-  if (key_type != build_ref.return_type.id() ||
+  auto const& probe_ref = condition.GetLHS().Cast<duckdb::BoundReferenceExpression>();
+  auto const& build_ref = condition.GetRHS().Cast<duckdb::BoundReferenceExpression>();
+  auto const key_type   = probe_ref.GetReturnType().id();
+  if (key_type != build_ref.GetReturnType().id() ||
       (key_type != duckdb::LogicalTypeId::INTEGER && key_type != duckdb::LogicalTypeId::BIGINT)) {
     return std::nullopt;
   }
@@ -177,8 +177,8 @@ std::optional<probe_accumulate_detection> detect_probe_accumulate(
   auto const unique = prove_unique_columns(*join.children[1]);
   bool const build_is_delim_get =
     join.children[1]->type == duckdb::LogicalOperatorType::LOGICAL_DELIM_GET &&
-    join.children[1]->types.size() == 1 && build_ref.index == 0;
-  if (!build_is_delim_get && (unique.size() != 1 || unique.count(build_ref.index) == 0)) {
+    join.children[1]->types.size() == 1 && build_ref.Index() == 0;
+  if (!build_is_delim_get && (unique.size() != 1 || unique.count(build_ref.Index()) == 0)) {
     return std::nullopt;
   }
 
@@ -186,7 +186,7 @@ std::optional<probe_accumulate_detection> detect_probe_accumulate(
   auto const output = [&](duckdb::Expression const& expression) -> duckdb::Expression const* {
     // The expression the aggregate sees at a position of its child, in terms of the join output.
     if (expression.GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) { return nullptr; }
-    auto const index = expression.Cast<duckdb::BoundReferenceExpression>().index;
+    auto const index = expression.Cast<duckdb::BoundReferenceExpression>().Index();
     if (below == nullptr) { return &expression; }
     if (index >= below->expressions.size()) { return nullptr; }
     return below->expressions[index].get();
@@ -198,40 +198,46 @@ std::optional<probe_accumulate_detection> detect_probe_accumulate(
       key_expression->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
     return std::nullopt;
   }
-  auto const key_position = key_expression->Cast<duckdb::BoundReferenceExpression>().index;
+  auto const key_position = key_expression->Cast<duckdb::BoundReferenceExpression>().Index();
   if (key_position >= layout.left_count + layout.right_count) { return std::nullopt; }
   auto const [key_child, key_column] = resolve_output(join, layout, key_position);
-  if (!(key_child == 0 && key_column == probe_ref.index) &&
-      !(key_child == 1 && key_column == build_ref.index)) {
+  if (!(key_child == 0 && key_column == probe_ref.Index()) &&
+      !(key_child == 1 && key_column == build_ref.Index())) {
     return std::nullopt;
   }
 
-  probe_accumulate_detection detection{probe_ref.index, build_ref.index, build_is_delim_get, {}};
+  probe_accumulate_detection detection{
+    probe_ref.Index(), build_ref.Index(), build_is_delim_get, {}};
   for (auto const& expression : aggregate.expressions) {
     if (expression->GetExpressionClass() != duckdb::ExpressionClass::BOUND_AGGREGATE) {
       return decline("aggregate list holds a non-aggregate expression");
     }
     auto const& aggr = expression->Cast<duckdb::BoundAggregateExpression>();
-    if (aggr.IsDistinct() || aggr.filter || aggr.order_bys || aggr.bind_info) {
-      return decline("DISTINCT, FILTER, ORDER BY or bound state on " + aggr.function.name);
+    if (aggr.IsDistinct() || aggr.GetFilter() || aggr.GetOrderBys() || aggr.BindInfo()) {
+      return decline("DISTINCT, FILTER, ORDER BY or bound state on " +
+                     aggr.Function().GetName().GetIdentifierName());
     }
-    auto const id   = sirius::from_duckdb_aggregate_name(aggr.function.name);
+    auto const id =
+      sirius::from_duckdb_aggregate_name(aggr.Function().GetName().GetIdentifierName());
     auto const kind = id ? kind_of(*id) : std::nullopt;
-    if (!kind) { return decline("aggregate " + aggr.function.name + " is not MIN/MAX/COUNT"); }
+    if (!kind) {
+      return decline("aggregate " + aggr.Function().GetName().GetIdentifierName() +
+                     " is not MIN/MAX/COUNT");
+    }
 
     accumulate_aggregate entry{*kind, nullptr};
     if (*kind != op::accumulate_kind::COUNT_STAR) {
-      if (aggr.children.size() != 1) { return decline("aggregate arity"); }
+      if (aggr.GetChildren().size() != 1) { return decline("aggregate arity"); }
       // The argument is any expression over the aggregate's input. Re-express it over the join's
       // output, looking through the projection if there is one, then over the probe child.
-      auto source   = aggr.children[0]->Copy();
+      auto source   = aggr.GetChildren()[0]->Copy();
       bool resolved = true;
       duckdb::ExpressionIterator::VisitExpressionClassMutable(
         source,
         duckdb::ExpressionClass::BOUND_REF,
         [&](duckdb::unique_ptr<duckdb::Expression>& leaf) {
           if (below == nullptr) { return; }
-          auto const index = leaf->Cast<duckdb::BoundReferenceExpression>().index;
+          auto const index = leaf->Cast<duckdb::BoundReferenceExpression>().Index();
           if (index >= below->expressions.size()) {
             resolved = false;
             return;
@@ -248,14 +254,14 @@ std::optional<probe_accumulate_detection> detect_probe_accumulate(
       if (*kind != op::accumulate_kind::COUNT) {
         // MIN/MAX keep their input type and need a device atomic on it.
         auto const cudf_type =
-          sirius::try_get_cudf_type(sirius::from_duckdb(entry.argument->return_type));
+          sirius::get_cudf_type(sirius::from_duckdb(entry.argument->GetReturnType()));
         if (!cudf_type || !op::probe_accumulate_supports_type(*cudf_type) ||
-            aggr.return_type != entry.argument->return_type) {
-          return decline(aggr.function.name + " over " + entry.argument->return_type.ToString() +
-                         " has no device atomic");
+            aggr.GetReturnType() != entry.argument->GetReturnType()) {
+          return decline(aggr.Function().GetName().GetIdentifierName() + " over " +
+                         entry.argument->GetReturnType().ToString() + " has no device atomic");
         }
       }
-    } else if (!aggr.children.empty()) {
+    } else if (!aggr.GetChildren().empty()) {
       return decline("COUNT(*) with arguments");
     }
     detection.aggregates.push_back(std::move(entry));
@@ -289,7 +295,7 @@ sirius_physical_plan_generator::try_plan_probe_accumulate(duckdb::LogicalAggrega
                       ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
                       : nullptr;
   if (!sirius_ctx) { return nullptr; }
-  if (!sirius_ctx->get_config().get_operator_params().enable_probe_accumulate) { return nullptr; }
+  if (!duckdb::query_operator_options(context)->enable_probe_accumulate) { return nullptr; }
   // One build table, one set of accumulators, one device.
   if (sirius_ctx->get_memory_manager()
         .get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)
@@ -308,8 +314,8 @@ sirius_physical_plan_generator::try_plan_probe_accumulate(duckdb::LogicalAggrega
   auto& join =
     (below ? *below->children[0] : *op.children[0]).Cast<duckdb::LogicalComparisonJoin>();
 
-  auto const key_type          = join.conditions[0].left->return_type;
-  auto const build_key_type    = join.conditions[0].right->return_type;
+  auto const key_type          = join.conditions[0].GetLHS().GetReturnType();
+  auto const build_key_type    = join.conditions[0].GetRHS().GetReturnType();
   auto const probe_cardinality = join.children[0]->EstimateCardinality(context);
 
   // One accumulator per aggregate; the probe column of each argument is numbered below, once the
@@ -322,7 +328,7 @@ sirius_physical_plan_generator::try_plan_probe_accumulate(duckdb::LogicalAggrega
       if (aggregate.argument) {
         spec.probe_column = next_column++;
         auto const type =
-          sirius::try_get_cudf_type(sirius::from_duckdb(aggregate.argument->return_type));
+          sirius::get_cudf_type(sirius::from_duckdb(aggregate.argument->GetReturnType()));
         if (type) { spec.value_type = *type; }
       }
       specs.push_back(spec);
@@ -334,7 +340,8 @@ sirius_physical_plan_generator::try_plan_probe_accumulate(duckdb::LogicalAggrega
   // still intact; a join that cannot fit is better left on the ordinary path than failed at
   // sizing time.
   {
-    auto const& params      = sirius_ctx->get_config().get_operator_params();
+    auto const options      = duckdb::query_operator_options(context);
+    auto const& params      = *options;
     auto const build_rows   = join.children[1]->EstimateCardinality(context);
     auto const key_bytes    = sirius::memory::saturating_mul(build_rows, std::size_t{8});
     auto const record_bytes = sirius::op::probe_accumulate_state(specs).record_bytes_for(1);
@@ -369,20 +376,21 @@ sirius_physical_plan_generator::try_plan_probe_accumulate(duckdb::LogicalAggrega
   projected_types.push_back(key_type);
   for (auto& aggregate : detection->aggregates) {
     if (aggregate.argument == nullptr) { continue; }
-    projected_types.push_back(aggregate.argument->return_type);
+    projected_types.push_back(aggregate.argument->GetReturnType());
     projected.push_back(std::move(aggregate.argument));
   }
 
   auto probe_projection =
-    duckdb::make_uniq<duckdb::LogicalProjection>(duckdb::idx_t{0}, std::move(projected));
+    duckdb::make_uniq<duckdb::LogicalProjection>(duckdb::TableIndex(0), std::move(projected));
   probe_projection->types = projected_types;
   probe_projection->SetEstimatedCardinality(probe_cardinality);
   probe_projection->children.push_back(std::move(join.children[0]));
   join.children[0] = std::move(probe_projection);
 
-  join.conditions[0].left   = duckdb::make_uniq<duckdb::BoundReferenceExpression>(key_type, 0);
-  join.left_projection_map  = {0};
-  join.right_projection_map = {detection->build_key_idx};
+  join.conditions[0].LeftReference() =
+    duckdb::make_uniq<duckdb::BoundReferenceExpression>(key_type, 0);
+  join.left_projection_map  = {duckdb::ProjectionIndex(0)};
+  join.right_projection_map = {duckdb::ProjectionIndex(detection->build_key_idx)};
   join.types                = {key_type, build_key_type};
 
   auto plan = plan_comparison_join(join);
