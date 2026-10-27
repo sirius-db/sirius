@@ -70,6 +70,22 @@ Hardware availability and capacity are checked when initializing an engine.
   its use. Immutable builders and configurations support concurrent reads, builds, and ownership
   transfer between threads. Give output slots exclusive access.
 
+### Diagnostic output convention
+
+Status-returning functions use an optional `sirius_error **out_error` parameter.
+Pass `NULL` to omit diagnostics, or the address of a pointer initialized to `NULL`.
+Functions clear the slot before doing work. It remains `NULL` on success; on failure,
+it receives an owned diagnostic if one can be allocated, otherwise `NULL`.
+The status code determines success or failure independently of the diagnostic.
+
+Destroy any previous diagnostic before reusing its output slot. Functions overwrite
+slots without releasing previous contents. Output slots require exclusive access
+for the duration of the call.
+
+Messages may contain embedded NUL bytes. Use sirius_error_message_size() as the
+complete byte length rather than `strlen()`. The borrowed bytes remain valid until
+the diagnostic is destroyed.
+
 ## Compatibility
 
 The C ABI assumes a matching platform and architecture; Sirius and its dependencies
