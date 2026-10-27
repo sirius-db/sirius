@@ -132,5 +132,24 @@ registration and retained resources. Scheduler tests hold a task after removing 
 production queue and prove retirement waits for its disposal. Queue tests exercise reentrant
 destructors. SQL lifecycle tests cover cleanup and subsequent queries.
 
-SQL execution remains serialized at this layer. Bounded concurrent admission, session settings,
-memory progress and runtime diagnostics are introduced by later layers of the stack.
+Bounded admission, maintenance, settings and memory progress are described in
+[Concurrent queries](concurrent-queries.md). The implementation journal records tested scenarios
+and the remaining hardware qualification gates. Query diagnostics retain bounded metadata after
+retirement without retaining query resources. Fatal shared-device failures close publication
+and refuse later registration; ordinary query errors remain query-local.
+
+Report exceptions through `query_lifecycle_registry::report_failure()` before converting them
+to DuckDB error results. Classification uses CUDA status codes from Sirius, cuDF and CCCL
+exceptions, and Thrust system errors whose category is CUDA.
+The installed RMM version lacks a status accessor, so its typed CUDA/allocation exceptions use
+the status field emitted by RMM's CUDA-check macros. Arbitrary exception text is never evidence
+of device failure, and reporting does not probe or clear the calling thread's CUDA error state.
+Fatal-device health remains distinct from the mandatory-cleanup failure latch in `SiriusContext`.
+
+Workers report their query ID before publishing runtime failure, so the query's first error is
+recorded before a health poll can report unavailability. The registry also retains the first fatal
+CUDA status and message for failures without an owner, such as prefetch. That diagnostic is
+published before the failed-health flag and included in runtime-unavailable errors. It survives
+query retirement without retaining the original exception or its resources. Later failures do not
+replace it or overwrite a query's earlier error. Retired submission/work counts are zero because
+they describe outstanding activity, not lifetime totals.

@@ -69,7 +69,8 @@ membership_snapshot snapshot_membership_probes(decode_selection const& selection
                                                std::size_t n_slots)
 {
   membership_snapshot snap;
-  snap.generation = selection.generation;
+  snap.generation  = selection.generation;
+  snap.measurement = {.measure = selection.measure, .complete = selection.complete};
   snap.probes.resize(n_slots);
   for (std::size_t order = 0; order < selection.steps.size(); ++order) {
     auto const& step       = selection.steps[order];
@@ -83,7 +84,9 @@ membership_snapshot snapshot_membership_probes(decode_selection const& selection
     // The actual execution device is selected after attachment. The closure retains its filter
     // and resolves the local replica when the decoder invokes it on that device.
     int const use_current_device = -1;
-    // Equal ranks with ascending key counts make the decoder keep the consumer's probe order.
+    // Equal ranks with ascending key counts make the decoder keep the consumer's probe order. The
+    // tag is the position of the step's representative in `attached`, which becomes the batch's
+    // decode history.
     snap.probes[step.column_index].push_back(
       {[f = filter, applicable](cudf::column_view const& keys,
                                 std::uint32_t const* prior_mask_words,
@@ -92,7 +95,8 @@ membership_snapshot snapshot_membership_probes(decode_selection const& selection
          return applicable->compute_mask(keys, prior_mask_words, use_current_device, stream, mr);
        },
        0,
-       order + 1});
+       order + 1,
+       snap.attached.size()});
     snap.attached.insert(snap.attached.end(), step.represented.begin(), step.represented.end());
   }
   return snap;
@@ -126,8 +130,9 @@ std::optional<detail::membership_refresh> detail::refresh_membership_probes(
     current
       ? current
       : std::make_shared<const sirius::decompression_pushdown_scan>(sirius::pushdown_request{});
-  return membership_refresh{base->with_membership_probes(std::move(snap.probes), snap.generation),
-                            std::move(snap.attached)};
+  return membership_refresh{
+    base->with_membership_probes(std::move(snap.probes), snap.generation, snap.measurement),
+    std::move(snap.attached)};
 }
 
 scan_operator_input::scan_operator_input(
@@ -382,6 +387,10 @@ void scan_operator_input::record_decode_outcome(::cucascade::idata_representatio
   auto const* decoded =
     dynamic_cast<::sirius::decompression_pushdown_batch_representation const*>(data);
   if (decoded == nullptr) { return; }
+  report_membership_keep(decoded->outcome().membership_keep);
+  // Join filters the decode skipped left these rows unfiltered, so the endpoint may sample them
+  // as clean input instead of a decode the filters might have touched.
+  if (decoded->outcome().membership_skipped) { decode_attached.clear(); }
   // The converter reports what the decode did as a value on the representation. row_filtered
   // means the whole table-filter conjunction was applied and every column is compacted to the
   // surviving rows — materialize_table maps it to filter_state::ROW_FILTERED so the filter is
@@ -416,6 +425,23 @@ void scan_operator_input::record_decode_outcome(::cucascade::idata_representatio
       "incompatible with an unconsumed mvcc keep-mask; the attach must compose the "
       "visibility mask on masked chunks");
   }
+}
+
+void scan_operator_input::report_membership_keep(
+  std::optional<pushdown_outcome::membership_keep_observation> const& observation) const noexcept
+{
+  // Only a decode that carried this consumer's probes has anything to report. The consumer ignores
+  // reports once it has decided, so a decode selected after the decision reports harmlessly.
+  if (!consumer || decode_attached.empty() || !observation) { return; }
+  auto const generation = static_cast<std::size_t>(observation->generation);
+  for (auto const& probe : observation->probes) {
+    // The tag indexes the representative binding of the probe's decode step.
+    if (probe.tag >= decode_attached.size()) { continue; }
+    consumer->record_decode_filter_keep_ratio(
+      decode_attached[probe.tag], probe.rows_before, probe.rows_after, generation);
+  }
+  consumer->record_decode_keep_ratio(
+    observation->rows_before, observation->rows_after, generation, observation->complete);
 }
 
 std::unique_ptr<cudf::table> scan_operator_input::transactionally_steal_converted_table(
@@ -563,16 +589,24 @@ std::size_t scan_operator_input::get_estimated_working_set_size_in_bytes() const
   // consumer that can attach probes gets the same conservative envelope as a known static filter
   // rather than falling through to the zero-copy view estimate below. A consumer without decode
   // bindings never attaches a probe.
+  //
+  // The scan's cached checkpoint filters a borrowed resident batch whether or not decompression
+  // pushdown is enabled: it builds the membership masks over the batch, then gathers the survivors
+  // into a new table.
+  bool const cached_checkpoint = cached_checkpoint_possible();
   bool const dynamic_filter_possible =
     sirius::decompression_pushdown_enabled() && consumer != nullptr &&
     !consumer->decode_bindings().empty() && !mvcc_keep_mask.has_mask();
-  if (row_filter_pending || dynamic_filter_possible) {
+  if (row_filter_pending || dynamic_filter_possible || cached_checkpoint) {
     // Once compaction has been measured unprofitable, later batches drop the
     // row selection and decode full width — keep the full-width envelope.
     bool const unprofitable = pushdown_selection_unprofitable &&
                               pushdown_selection_unprofitable->load(std::memory_order_relaxed);
-    if (auto const forecast = pushdown_compaction_forecast(*this);
-        forecast.compacts && !unprofitable && !dynamic_filter_possible) {
+    // The forecast reads the cached batch, so it is skipped when its result cannot matter.
+    auto const forecast = row_filter_pending && !dynamic_filter_possible && !unprofitable
+                            ? pushdown_compaction_forecast(*this)
+                            : sirius::decompression_pushdown_scan::compaction_forecast{};
+    if (forecast.compacts) {
       // Reservation for a compacting decode: the selection mask (1 bit/row per
       // filtered column — <= batch/4 across the source limit at >= 4 B/row
       // columns) plus the compacted outputs, and such splits steal their table,
@@ -589,24 +623,26 @@ std::size_t scan_operator_input::get_estimated_working_set_size_in_bytes() const
       // decode + BOOL8 mask on top, which this envelope has no way to
       // size. Excluded here so that extra cost falls back to the
       // conservative branch below instead of being silently unreserved.
+      //
+      // The cached checkpoint needs no more: such a split's table leaves the cached batch once
+      // decoded, unless a refused carrier-converting transfer leaves the checkpoint the compacted
+      // table, which this envelope sizes as it does post_filter_and_project's copy.
       auto const cap =
         forecast.survivors_bounded ? sirius::decompression_pushdown_max_selectivity() : 1.0;
       return batch_bytes / 4 + static_cast<std::size_t>(static_cast<double>(batch_bytes) * cap);
     }
-    if (!row_filter_pending) {
-      // A wired dynamic filter and NO static one, so nothing here filters by
-      // copy. The decode either compacts (output far below full width) or
-      // declines and hands back full-width columns it did NOT row-filter -- see
-      // pushdown_outcome::selection_unprofitable -- and post_filter_and_project
-      // then has no predicate to apply. Either way the peak is one full-width
-      // decode plus the probe's BOOL8 mask (1 B/row, under batch/4 at the >= 4
-      // B/row a projected column carries), not two full widths.
+    if (!row_filter_pending && !cached_checkpoint) {
+      // A wired dynamic filter, NO static one and no cached checkpoint, so nothing here filters by
+      // copy. The decode either compacts (output far below full width) or declines and hands back
+      // full-width columns it did NOT row-filter -- see pushdown_outcome::selection_unprofitable --
+      // and post_filter_and_project then has no predicate to apply. Either way the peak is one
+      // full-width decode plus the probe's BOOL8 mask (1 B/row, under batch/4 at the >= 4 B/row a
+      // projected column carries), not two full widths.
       return batch_bytes + batch_bytes / 4;
     }
-    // post_filter_and_project filters by copy: the materialized input and the
-    // compacted output (up to input-sized) coexist at peak. The BOOL8
-    // predicate column (1 B/row) hides inside the 2x conservatism (any
-    // projected column is >= 4 B/row).
+    // post_filter_and_project or the cached checkpoint filters by copy: the materialized input and
+    // the compacted output (up to input-sized) coexist at peak. The BOOL8 predicate column (1
+    // B/row) hides inside the 2x conservatism (any projected column is >= 4 B/row).
     return 2 * batch_bytes;
   }
   // An unmasked, unfiltered chunk serves a zero-copy view whose output copy is

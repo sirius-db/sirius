@@ -654,7 +654,7 @@ void test_table_contracts(rmm::device_async_resource_ref mr)
       }
     }
     cudf::table input(std::move(columns));
-    cudf::get_default_stream().synchronize();
+    ::cuda::stream_ref{cudf::get_default_stream()}.sync();
     for (int streams : {1, 4}) {
       simpatico::stream_pool pool;
       expect(pool.init(streams), "pool init");
@@ -679,7 +679,7 @@ void test_table_contracts(rmm::device_async_resource_ref mr)
           compressed.columns.push_back(std::move(single.columns.front()));
         }
       }
-      cudf::get_default_stream().synchronize();
+      ::cuda::stream_ref{cudf::get_default_stream()}.sync();
       auto reference = simpatico::decompress(compressed, cudf::get_default_stream(), mr);
       verify_projection(input.view(), reference->view(), all);
       auto full = simpatico::decompress(compressed, pool, mr);
@@ -710,7 +710,7 @@ void test_table_contracts(rmm::device_async_resource_ref mr)
       auto recovered = simpatico::decompress(compressed, pool, mr);
       compressed.columns.clear();
       rmm::cuda_stream consumer(rmm::cuda_stream::flags::non_blocking);
-      cudf::table consumed(recovered->view(), consumer.view(), mr);
+      cudf::table consumed(recovered->view(), consumer, mr);
       consumer.synchronize();
       verify_projection(input.view(), consumed.view(), all);
     }
@@ -852,13 +852,13 @@ void test_identity_owned_children(rmm::device_async_resource_ref upstream)
   rmm::cuda_stream input_stream(rmm::cuda_stream::flags::non_blocking);
   std::vector<std::unique_ptr<cudf::column>> inputs;
   inputs.push_back(make_strings_column(
-    {"alpha", "ignored", "", "omega"}, {true, false, true, true}, input_stream.view()));
+    {"alpha", "ignored", "", "omega"}, {true, false, true, true}, input_stream));
   inputs.push_back(cudf::make_empty_column(cudf::data_type{cudf::type_id::STRING}));
   auto offsets = [&](std::vector<std::int32_t> const& values) {
     auto column = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
                                             static_cast<cudf::size_type>(values.size()),
                                             cudf::mask_state::UNALLOCATED,
-                                            input_stream.view(),
+                                            input_stream,
                                             upstream);
     cuda_check(cudaMemcpyAsync(column->mutable_view().head<void>(),
                                values.data(),
@@ -868,8 +868,8 @@ void test_identity_owned_children(rmm::device_async_resource_ref upstream)
     input_stream.synchronize();
     return column;
   };
-  auto strings = make_strings_column(
-    {"aa", "b", "ccc", "ignored"}, {true, true, true, false}, input_stream.view());
+  auto strings =
+    make_strings_column({"aa", "b", "ccc", "ignored"}, {true, true, true, false}, input_stream);
   auto inner = cudf::make_lists_column(2,
                                        offsets({0, 1, 4}),
                                        std::move(strings),
@@ -883,7 +883,7 @@ void test_identity_owned_children(rmm::device_async_resource_ref upstream)
                             cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED)));
 
   for (auto& input : inputs) {
-    auto expected = std::make_unique<cudf::column>(*input, input_stream.view(), upstream);
+    auto expected = std::make_unique<cudf::column>(*input, input_stream, upstream);
     input_stream.synchronize();
     auto representation =
       std::make_unique<simpatico::identity_compressed_representation>(std::move(input));
@@ -892,7 +892,7 @@ void test_identity_owned_children(rmm::device_async_resource_ref upstream)
     current_resource_guard current_guard(current);
     stream_gate gate(stream.value());
     gate.release_after_delay.store(true);
-    auto output = decode_completed(*representation, stream.view(), supplied);
+    auto output = decode_completed(*representation, stream, supplied);
     // Observe completed return before any verification readback can hide an unfinished copy.
     gate.expect_completed("owning identity copy returned before nested data completed");
     expect(cudaStreamQuery(stream.value()) == cudaSuccess,
@@ -907,7 +907,7 @@ void test_identity_owned_children(rmm::device_async_resource_ref upstream)
       if (source.null_mask())
         expect(source.null_mask() != copied.null_mask(), "identity copy aliases validity");
       if (source.type().id() == cudf::type_id::STRING) {
-        expect(strings_equal_completed(source, copied, stream.view()),
+        expect(strings_equal_completed(source, copied, stream),
                "identity copy changed nullable string values");
       } else if (source.type().id() != cudf::type_id::LIST) {
         expect(columns_equal_completed(source, copied), "identity copy changed child values");
@@ -947,9 +947,9 @@ void test_dictionary_width_metadata(rmm::device_async_resource_ref mr)
   simpatico::stream_pool pool;
   expect(pool.init(2), "dictionary width pool init");
   for (auto const& fixture : fixtures) {
-    auto input = make_strings_column(fixture.values, fixture.valid, stream.view());
+    auto input = make_strings_column(fixture.values, fixture.valid, stream);
     // Use the codec directly so the dictionary metadata is exercised without a plan.
-    auto encoded = simpatico::dictionary_compressor{}.compress(input->view(), stream.view(), mr);
+    auto encoded = simpatico::dictionary_compressor{}.compress(input->view(), stream, mr);
     auto const* original =
       dynamic_cast<simpatico::dictionary_compressed_representation const*>(encoded.get());
     expect(original != nullptr && original->dict_column != nullptr,
@@ -957,12 +957,12 @@ void test_dictionary_width_metadata(rmm::device_async_resource_ref mr)
     expect(original->constant_key_width == fixture.width,
            "original dictionary did not publish eager key width");
 
-    auto copied = std::make_unique<cudf::column>(original->dict_column->view(), stream.view(), mr);
+    auto copied = std::make_unique<cudf::column>(original->dict_column->view(), stream, mr);
     {
-      stream_gate gate(stream.view());
+      stream_gate gate(stream);
       gate.release_after_delay.store(true);
       auto published = simpatico::dictionary_compressed_representation::from_encoded_column(
-        std::move(copied), stream.view(), mr);
+        std::move(copied), stream, mr);
       gate.expect_completed("dictionary publication did not complete prior work");
       expect(published->constant_key_width == fixture.width,
              "dictionary publication did not complete its metadata");
@@ -972,17 +972,17 @@ void test_dictionary_width_metadata(rmm::device_async_resource_ref mr)
     // The direct constructor also supports frame-local reconstruction with unknown metadata.
     // Decode must measure locally without turning that representation into a mutable cache.
     simpatico::dictionary_compressed_representation reconstructed(
-      std::make_unique<cudf::column>(original->dict_column->view(), stream.view(), mr));
+      std::make_unique<cudf::column>(original->dict_column->view(), stream, mr));
     expect(reconstructed.constant_key_width == -1, "reconstructed dictionary width is not unknown");
     std::vector<std::string> channel_names;
     std::vector<std::unique_ptr<cudf::column>> channels;
-    for (auto const& channel : original->named_channels(stream.view())) {
+    for (auto const& channel : original->named_channels(stream)) {
       channel_names.push_back(channel.name);
-      channels.push_back(std::make_unique<cudf::column>(channel.view, stream.view(), mr));
+      channels.push_back(std::make_unique<cudf::column>(channel.view, stream, mr));
     }
     std::string error;
     auto imported = simpatico::reconstruct_representation(
-      "dictionary", channel_names, std::move(channels), stream.view(), mr, &error);
+      "dictionary", channel_names, std::move(channels), stream, mr, &error);
     auto const* imported_dictionary =
       dynamic_cast<simpatico::dictionary_compressed_representation const*>(imported.get());
     expect(imported_dictionary != nullptr && error.empty(), "dictionary channel import failed");
@@ -995,8 +995,8 @@ void test_dictionary_width_metadata(rmm::device_async_resource_ref mr)
       simpatico::decode_session session(streams, mr);
       auto& frame = simpatico::decode_session_test_access::frame(session);
       std::vector<std::unique_ptr<cudf::column>> decoded;
-      for (auto const& channel : original->named_channels(stream.view()))
-        decoded.push_back(std::make_unique<cudf::column>(channel.view, stream.view(), mr));
+      for (auto const& channel : original->named_channels(stream))
+        decoded.push_back(std::make_unique<cudf::column>(channel.view, stream, mr));
       auto const node    = dictionary_plan_node();
       auto const rebuilt = simpatico::reconstruct_decode_representation(
         node, channel_names, std::move(decoded), frame);
@@ -1010,7 +1010,7 @@ void test_dictionary_width_metadata(rmm::device_async_resource_ref mr)
              "dictionary reconstruction accepted missing channels");
       auto const output = simpatico::decode_standalone(*rebuilt, frame);
       stream.synchronize();
-      expect(strings_equal_completed(input->view(), output->view(), stream.view()),
+      expect(strings_equal_completed(input->view(), output->view(), stream),
              "frame-reconstructed dictionary roundtrip mismatch");
       expect(session.finish().empty(), "raw dictionary fixture published a session result");
     }
@@ -1030,23 +1030,23 @@ void test_dictionary_width_metadata(rmm::device_async_resource_ref mr)
       auto output = simpatico::decompress(compressed, pool, mr);
       expect(output->num_columns() == 1 && output->view().column(0).type() == input->type(),
              "eager-width dictionary output shape/type mismatch");
-      expect(strings_equal_completed(input->view(), output->view().column(0), stream.view()),
+      expect(strings_equal_completed(input->view(), output->view().column(0), stream),
              "eager-width dictionary output mismatch");
       expect(original->constant_key_width == fixture.width,
              "decode changed original dictionary width metadata");
 
-      auto rebuilt = decode_completed(reconstructed, stream.view(), mr);
+      auto rebuilt = decode_completed(reconstructed, stream, mr);
       expect(rebuilt != nullptr && rebuilt->type() == input->type(),
              "unknown-width dictionary output type mismatch");
-      expect(strings_equal_completed(input->view(), rebuilt->view(), stream.view()),
+      expect(strings_equal_completed(input->view(), rebuilt->view(), stream),
              "unknown-width dictionary output mismatch");
       expect(reconstructed.constant_key_width == -1,
              "decode cached reconstructed dictionary width metadata");
 
-      auto loaded = decode_completed(*imported_dictionary, stream.view(), mr);
+      auto loaded = decode_completed(*imported_dictionary, stream, mr);
       expect(loaded != nullptr && loaded->type() == input->type(),
              "imported dictionary output type mismatch");
-      expect(strings_equal_completed(input->view(), loaded->view(), stream.view()),
+      expect(strings_equal_completed(input->view(), loaded->view(), stream),
              "imported eager-width dictionary output mismatch");
       expect(imported_dictionary->constant_key_width == fixture.width,
              "decode changed imported dictionary width metadata");
@@ -1055,9 +1055,8 @@ void test_dictionary_width_metadata(rmm::device_async_resource_ref mr)
     auto duplicated = simpatico::decompress(compressed, duplicate, pool, mr);
     expect(duplicated->num_columns() == 2, "duplicate dictionary projection shape mismatch");
     for (int index = 0; index < 2; ++index)
-      expect(
-        strings_equal_completed(input->view(), duplicated->view().column(index), stream.view()),
-        "duplicate dictionary projection output mismatch");
+      expect(strings_equal_completed(input->view(), duplicated->view().column(index), stream),
+             "duplicate dictionary projection output mismatch");
     expect(original->constant_key_width == fixture.width,
            "duplicate projection changed shared dictionary width metadata");
   }
@@ -1075,17 +1074,17 @@ void test_dictionary_key_width_hint(rmm::device_async_resource_ref mr)
   std::vector<std::string> values(rows);
   for (std::size_t i = 0; i < values.size(); ++i)
     values[i] = keys[(i * 7 + i / 3) % keys.size()];
-  auto input   = make_strings_column(values, {}, stream.view());
-  auto encoded = simpatico::dictionary_compressor{}.compress(input->view(), stream.view(), mr);
+  auto input   = make_strings_column(values, {}, stream);
+  auto encoded = simpatico::dictionary_compressor{}.compress(input->view(), stream, mr);
   auto const& original =
     dynamic_cast<simpatico::dictionary_compressed_representation const&>(*encoded);
   std::vector<std::string> names;
-  for (auto const& channel : original.named_channels(stream.view()))
+  for (auto const& channel : original.named_channels(stream))
     names.push_back(channel.name);
   auto const copy_channels = [&] {
     std::vector<std::unique_ptr<cudf::column>> channels;
-    for (auto const& channel : original.named_channels(stream.view()))
-      channels.push_back(std::make_unique<cudf::column>(channel.view, stream.view(), mr));
+    for (auto const& channel : original.named_channels(stream))
+      channels.push_back(std::make_unique<cudf::column>(channel.view, stream, mr));
     return channels;
   };
   stream.synchronize();
@@ -1105,7 +1104,7 @@ void test_dictionary_key_width_hint(rmm::device_async_resource_ref mr)
     {
       // A published width leaves no host observation, so the decode returns while its lane is
       // still gated; an unknown width measures and returns only once the gate has released.
-      stream_gate gate(stream.view());
+      stream_gate gate(stream);
       if (hint < 0) gate.release_after_delay.store(true);
       output = simpatico::decode_standalone(*rebuilt, frame);
       if (hint > 0)
@@ -1120,7 +1119,7 @@ void test_dictionary_key_width_hint(rmm::device_async_resource_ref mr)
     }
     expect(dictionary.constant_key_width == hint,
            "decode changed the reconstructed dictionary width");
-    expect(strings_equal_completed(input->view(), output->view(), stream.view()),
+    expect(strings_equal_completed(input->view(), output->view(), stream),
            "hinted reconstruction roundtrip mismatch");
   }
   // A hint that does not describe the stored key chars is corrupt metadata, not a decline.
@@ -1184,16 +1183,14 @@ void test_dictionary_predicate_lookup(rmm::device_async_resource_ref mr)
     auto const bool_type = cudf::data_type{cudf::type_id::BOOL8};
     std::unique_ptr<cudf::column> mask;
     for (auto const& needle : needles) {
-      cudf::string_scalar const value(needle, true, stream.view(), mr);
-      auto hit = cudf::binary_operation(
-        strings, value, cudf::binary_operator::EQUAL, bool_type, stream.view(), mr);
-      mask = mask ? cudf::binary_operation(mask->view(),
-                                           hit->view(),
-                                           cudf::binary_operator::LOGICAL_OR,
-                                           bool_type,
-                                           stream.view(),
-                                           mr)
-                  : std::move(hit);
+      cudf::string_scalar const value(needle, true, stream, mr);
+      auto hit =
+        cudf::binary_operation(strings, value, cudf::binary_operator::EQUAL, bool_type, stream, mr);
+      mask =
+        mask
+          ? cudf::binary_operation(
+              mask->view(), hit->view(), cudf::binary_operator::LOGICAL_OR, bool_type, stream, mr)
+          : std::move(hit);
     }
     stream.synchronize();
     return mask;
@@ -1204,12 +1201,12 @@ void test_dictionary_predicate_lookup(rmm::device_async_resource_ref mr)
     std::vector<std::string> values(rows);
     for (std::size_t i = 0; i < values.size(); ++i)
       values[i] = key_pool[(i * 7 + i / 3) % key_count];
-    return make_strings_column(values, {}, stream.view());
+    return make_strings_column(values, {}, stream);
   };
 
   for (std::size_t key_count : {std::size_t{1}, std::size_t{2}, std::size_t{4}, std::size_t{5}}) {
     auto input   = make_input(key_count);
-    auto encoded = simpatico::dictionary_compressor{}.compress(input->view(), stream.view(), mr);
+    auto encoded = simpatico::dictionary_compressor{}.compress(input->view(), stream, mr);
     auto const& dictionary =
       dynamic_cast<simpatico::dictionary_compressed_representation const&>(*encoded);
     auto const& first = key_pool.front();
@@ -1238,7 +1235,7 @@ void test_dictionary_predicate_lookup(rmm::device_async_resource_ref mr)
   // frame's stream is still gated.
   {
     auto input   = make_input(4);
-    auto encoded = simpatico::dictionary_compressor{}.compress(input->view(), stream.view(), mr);
+    auto encoded = simpatico::dictionary_compressor{}.compress(input->view(), stream, mr);
     auto const& dictionary =
       dynamic_cast<simpatico::dictionary_compressed_representation const&>(*encoded);
     std::vector<std::string> const needles{key_pool[1], key_pool[3]};
@@ -1248,7 +1245,7 @@ void test_dictionary_predicate_lookup(rmm::device_async_resource_ref mr)
     predicate.equals_any = needles;
     std::unique_ptr<cudf::column> result;
     {
-      stream_gate gate(stream.view());
+      stream_gate gate(stream);
       result = dictionary.decompress_predicate(predicate, frame);
       expect(result != nullptr, "dictionary predicate declined the gated shape");
       gate.expect_not_released("dictionary predicate waited for its lane");
@@ -1263,9 +1260,9 @@ void test_dictionary_predicate_lookup(rmm::device_async_resource_ref mr)
 
   // Indices narrower than INT32 are left to the generic path.
   {
-    auto input  = make_strings_column({"a", "b", "a"}, {}, stream.view());
-    auto narrow = cudf::dictionary::encode(
-      input->view(), cudf::data_type{cudf::type_id::INT16}, stream.view(), mr);
+    auto input = make_strings_column({"a", "b", "a"}, {}, stream);
+    auto narrow =
+      cudf::dictionary::encode(input->view(), cudf::data_type{cudf::type_id::INT16}, stream, mr);
     stream.synchronize();
     simpatico::dictionary_compressed_representation const dictionary(std::move(narrow));
     expect(evaluate(dictionary, {"a"}) == nullptr,
@@ -1295,7 +1292,7 @@ void test_dictionary_offsets_validation(rmm::device_async_resource_ref mr)
       auto& frame = simpatico::decode_session_test_access::frame(session);
       std::vector<std::unique_ptr<cudf::column>> channels;
       channels.push_back(cudf::make_numeric_column(
-        cudf::data_type{type}, fixture.offsets, fixture.mask, stream.view(), mr));
+        cudf::data_type{type}, fixture.offsets, fixture.mask, stream, mr));
       if (fixture.offsets > 0) {
         cuda_check(cudaMemsetAsync(channels[0]->mutable_view().head<void>(),
                                    0,
@@ -1346,13 +1343,13 @@ void test_dictionary_rebuild_keeps_indices(rmm::device_async_resource_ref mr)
   std::vector<std::string> values;
   for (int row = 0; row < 1037; ++row)
     values.push_back(keys[(row * 7) % keys.size()]);
-  auto input   = make_strings_column(values, {}, stream.view());
-  auto encoded = simpatico::dictionary_compressor{}.compress(input->view(), stream.view(), mr);
+  auto input   = make_strings_column(values, {}, stream);
+  auto encoded = simpatico::dictionary_compressor{}.compress(input->view(), stream, mr);
   std::vector<std::string> names;
   std::vector<std::unique_ptr<cudf::column>> channels;
-  for (auto const& channel : encoded->named_channels(stream.view())) {
+  for (auto const& channel : encoded->named_channels(stream)) {
     names.push_back(channel.name);
-    channels.push_back(std::make_unique<cudf::column>(channel.view, stream.view(), mr));
+    channels.push_back(std::make_unique<cudf::column>(channel.view, stream, mr));
   }
   expect(channels[2]->type().id() == cudf::type_id::INT32, "fixture indices are not INT32");
   auto const* const decoded_indices = channels[2]->view().head<void>();
@@ -1400,7 +1397,7 @@ void test_dictionary_unsigned_indices(rmm::device_async_resource_ref mr)
     auto column = cudf::make_numeric_column(cudf::data_type{type},
                                             static_cast<cudf::size_type>(host.size()),
                                             cudf::mask_state::UNALLOCATED,
-                                            stream.view(),
+                                            stream,
                                             mr);
     cuda_check(cudaMemcpyAsync(column->mutable_view().head<void>(),
                                host.data(),
@@ -1418,7 +1415,7 @@ void test_dictionary_unsigned_indices(rmm::device_async_resource_ref mr)
     return result;
   };
   std::vector<std::string> const names{"keys_offsets", "keys_chars", "indices"};
-  auto const expected = make_strings_column(expected_values, {}, stream.view());
+  auto const expected = make_strings_column(expected_values, {}, stream);
 
   std::unique_ptr<cudf::column> decoded;
   {
@@ -1429,31 +1426,30 @@ void test_dictionary_unsigned_indices(rmm::device_async_resource_ref mr)
     decoded = simpatico::decode_standalone(*rebuilt, frame);
     expect(session.finish().empty(), "unsigned-index fixture published a session result");
   }
-  expect(strings_equal_completed(expected->view(), decoded->view(), stream.view()),
+  expect(strings_equal_completed(expected->view(), decoded->view(), stream),
          "decode reconstruction changed unsigned dictionary indices");
 
   std::string error;
-  auto const loaded = simpatico::reconstruct_representation(
-    "dictionary", names, channels(), stream.view(), mr, &error);
+  auto const loaded =
+    simpatico::reconstruct_representation("dictionary", names, channels(), stream, mr, &error);
   expect(loaded != nullptr && error.empty(), "loader rejected unsigned dictionary indices");
-  auto const loaded_output = decode_completed(*loaded, stream.view(), mr);
-  expect(strings_equal_completed(expected->view(), loaded_output->view(), stream.view()),
+  auto const loaded_output = decode_completed(*loaded, stream, mr);
+  expect(strings_equal_completed(expected->view(), loaded_output->view(), stream),
          "loader changed unsigned dictionary indices");
 }
 
 void test_dictionary_width_sliced_input(rmm::device_async_resource_ref mr)
 {
   rmm::cuda_stream stream(rmm::cuda_stream::flags::non_blocking);
-  auto input =
-    make_strings_column({"a", "long-prefix", "aa", "bb", "aa", "suffix"}, {}, stream.view());
-  auto const sliced = cudf::slice(input->view(), {2, 5}, stream.view()).front();
-  auto encoded      = simpatico::dictionary_compressor{}.compress(sliced, stream.view(), mr);
+  auto input = make_strings_column({"a", "long-prefix", "aa", "bb", "aa", "suffix"}, {}, stream);
+  auto const sliced = cudf::slice(input->view(), {2, 5}, stream).front();
+  auto encoded      = simpatico::dictionary_compressor{}.compress(sliced, stream, mr);
   auto const* dictionary =
     dynamic_cast<simpatico::dictionary_compressed_representation const*>(encoded.get());
   expect(dictionary != nullptr && dictionary->constant_key_width == 2,
          "dictionary width inspected the sliced input's prefix");
-  auto decoded = decode_completed(*dictionary, stream.view(), mr);
-  expect(strings_equal_completed(sliced, decoded->view(), stream.view()),
+  auto decoded = decode_completed(*dictionary, stream, mr);
+  expect(strings_equal_completed(sliced, decoded->view(), stream),
          "sliced dictionary roundtrip mismatch");
 }
 
@@ -1485,7 +1481,7 @@ void test_dictionary_width_large_keys(rmm::device_async_resource_ref mr)
         cudf::data_type{wide_offsets ? cudf::type_id::INT64 : cudf::type_id::INT32},
         key_count + 1,
         cudf::mask_state::UNALLOCATED,
-        stream.view(),
+        stream,
         mr);
       std::vector<int32_t> offsets32;
       if (wide_offsets) {
@@ -1502,7 +1498,7 @@ void test_dictionary_width_large_keys(rmm::device_async_resource_ref mr)
                                    cudaMemcpyHostToDevice,
                                    stream.value()));
       }
-      rmm::device_buffer keys_chars(chars.size(), stream.view(), mr);
+      rmm::device_buffer keys_chars(chars.size(), stream, mr);
       cuda_check(cudaMemcpyAsync(
         keys_chars.data(), chars.data(), chars.size(), cudaMemcpyHostToDevice, stream.value()));
       auto keys =
@@ -1514,7 +1510,7 @@ void test_dictionary_width_large_keys(rmm::device_async_resource_ref mr)
       auto indices = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
                                                codes.size(),
                                                cudf::mask_state::UNALLOCATED,
-                                               stream.view(),
+                                               stream,
                                                mr);
       cuda_check(cudaMemcpyAsync(indices->mutable_view().head<int32_t>(),
                                  codes.data(),
@@ -1527,19 +1523,19 @@ void test_dictionary_width_large_keys(rmm::device_async_resource_ref mr)
                                      cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED),
                                      0);
       auto prepared = simpatico::dictionary_compressed_representation::from_encoded_column(
-        std::move(dictionary), stream.view(), mr);
+        std::move(dictionary), stream, mr);
       auto const expected_width = shape == key_shape::fixed ? 7 : 0;
       expect(prepared->constant_key_width == expected_width,
              "dictionary width missed a key outside the first reduction block");
-      auto expected = make_strings_column(expected_values, {}, stream.view());
-      auto decoded  = decode_completed(*prepared, stream.view(), mr);
-      expect(strings_equal_completed(expected->view(), decoded->view(), stream.view()),
+      auto expected = make_strings_column(expected_values, {}, stream);
+      auto decoded  = decode_completed(*prepared, stream, mr);
+      expect(strings_equal_completed(expected->view(), decoded->view(), stream),
              "large-key dictionary roundtrip mismatch");
 
       simpatico::dictionary_compressed_representation unknown(
-        std::make_unique<cudf::column>(prepared->dict_column->view(), stream.view(), mr));
-      auto fallback = decode_completed(unknown, stream.view(), mr);
-      expect(strings_equal_completed(expected->view(), fallback->view(), stream.view()),
+        std::make_unique<cudf::column>(prepared->dict_column->view(), stream, mr));
+      auto fallback = decode_completed(unknown, stream, mr);
+      expect(strings_equal_completed(expected->view(), fallback->view(), stream),
              "large-key unknown-width dictionary roundtrip mismatch");
       expect(unknown.constant_key_width == -1, "large-key fallback mutated width metadata");
     }
@@ -2039,7 +2035,7 @@ void test_host_upload_growth(rmm::device_async_resource_ref upstream)
   rmm::cuda_stream stream(rmm::cuda_stream::flags::non_blocking);
   std::array const streams{::cuda::stream_ref{stream}};
   constexpr std::size_t uploads = 97;
-  rmm::device_buffer device(uploads * 2 * sizeof(std::uint64_t), stream.view(), upstream);
+  rmm::device_buffer device(uploads * 2 * sizeof(std::uint64_t), stream, upstream);
   {
     simpatico::decode_session session(streams, upstream);
     auto& frame = simpatico::decode_session_test_access::frame(session);
@@ -2093,13 +2089,13 @@ void test_host_uploads_survive_until_completion(rmm::device_async_resource_ref u
   // Below the default mmap threshold, so freed storage returns to the heap the churn draws from.
   constexpr std::size_t words = 4096;
   auto const pattern          = [](std::size_t i) { return 0x9e3779b97f4a7c15ULL * (i + 1); };
-  rmm::device_buffer device(words * sizeof(std::uint64_t), stream.view(), upstream);
+  rmm::device_buffer device(words * sizeof(std::uint64_t), stream, upstream);
   cuda_check(cudaMemsetAsync(device.data(), 0, device.size(), stream.value()));
   stream.synchronize();
   {
     simpatico::decode_session session(streams, upstream);
     auto& frame = simpatico::decode_session_test_access::frame(session);
-    stream_gate gate(stream.view());
+    stream_gate gate(stream);
     // A copy that waits for the stream before returning must not outlive the watchdog.
     gate.release_after_delay.store(true);
     auto upload = frame.host_array<std::uint64_t>(words);
@@ -2128,7 +2124,7 @@ void test_host_uploads_survive_until_completion(rmm::device_async_resource_ref u
   auto const input      = make_int32_table(1, 65549, 127);
   auto const compressed = simpatico::compress_with_plan(
     input->view(), "input -> ans\n", cudf::get_default_stream(), upstream);
-  cudf::get_default_stream().synchronize();
+  ::cuda::stream_ref{cudf::get_default_stream()}.sync();
   std::vector<std::unique_ptr<cudf::column>> outputs;
   {
     simpatico::decode_session session(streams, upstream);
@@ -2250,7 +2246,7 @@ void test_temporaries_released_at_submission(rmm::device_async_resource_ref upst
       input.view(), fixture.plan, cudf::get_default_stream(), upstream);
     columns.push_back(std::move(compressed.columns.front()));
   }
-  cudf::get_default_stream().synchronize();
+  ::cuda::stream_ref{cudf::get_default_stream()}.sync();
   auto const expected = [&](std::size_t i) {
     return fixtures[i].strings ? words->view().column(0) : numbers->view().column(0);
   };
@@ -2367,7 +2363,7 @@ void test_submission_never_waits_for_memory(rmm::device_async_resource_ref upstr
       std::make_unique<scratch_probe_representation>(scratch_bytes, expected.back()));
   }
   simpatico::decode_session session(streams, resource);
-  stream_gate gate(stream.view());
+  stream_gate gate(stream);
   {
     stream_observation_scope observed;
     for (auto const& representation : representations)
@@ -2754,7 +2750,7 @@ void test_scan_filter_phase_lanes(rmm::device_async_resource_ref upstream)
     "input -> dictionary -> keys_offsets, keys_chars, indices\ndictionary.indices -> bitpack\n",
     cudf::get_default_stream(),
     upstream);
-  cudf::get_default_stream().synchronize();
+  ::cuda::stream_ref{cudf::get_default_stream()}.sync();
 
   // The range source (every row) runs on lane 0 and the BOOL8 source on lane 1, where its survivor
   // gather also runs; lane 2 receives nothing.

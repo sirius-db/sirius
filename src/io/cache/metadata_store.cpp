@@ -47,10 +47,11 @@ void metadata_store::observe_locked(io_object const& obj, entries& retired)
     if (obj.open_generation() <= it->second.generation) return;
     it->second = observation{std::move(identity), obj.open_generation()};
   }
-  auto current = _index.find(cache_key(obj.object_path()));
-  if (current != _index.end()) {
+  for (auto entry = _entries.begin(); entry != _entries.end();) {
+    auto current = entry++;
+    if (current->path != obj.object_path()) continue;
     ++_stats.replacements;
-    retire(current->second, retired);
+    retire(current, retired);
   }
 }
 
@@ -58,12 +59,13 @@ std::shared_ptr<io_object_metadata> metadata_store::get_or_load(
   io_object const& obj,
   std::function<std::shared_ptr<io_object_metadata>()> const& loader,
   bool* cache_hit,
-  std::stop_token stop)
+  std::stop_token stop,
+  std::string_view profile)
 {
   if (stop.stop_requested())
     throw std::system_error(std::make_error_code(std::errc::operation_canceled));
   open_observed(obj);
-  auto const lookup   = cache_key(obj.object_path());
+  auto const lookup   = cache_key(obj.object_path(), profile);
   auto const identity = obj.identity();
   // A local stat identity is obtained from the opened descriptor and may be
   // shared by separate opens while the stat tuple is unchanged. Keep the
@@ -72,7 +74,7 @@ std::shared_ptr<io_object_metadata> metadata_store::get_or_load(
   auto const identity_key = identity.kind == identity_kind::local_stat
                               ? identity.cache_key(obj.raw_file_cache_id())
                               : obj.identity_cache_key();
-  auto const flight_key   = identity_key + ":" + lookup;
+  auto const flight_key   = cache_key(identity_key, lookup);
   std::shared_ptr<flight> work;
   {
     std::unique_lock lock{_mutex};
@@ -105,7 +107,7 @@ std::shared_ptr<io_object_metadata> metadata_store::get_or_load(
   std::exception_ptr error;
   try {
     value = loader();
-    register_metadata(obj, value);
+    register_metadata(obj, value, profile);
   } catch (...) {
     error = std::current_exception();
   }
@@ -122,7 +124,12 @@ std::shared_ptr<io_object_metadata> metadata_store::get_or_load(
   return value;
 }
 
-std::string metadata_store::cache_key(std::string const& path) { return path; }
+std::string metadata_store::cache_key(std::string const& path, std::string_view profile)
+{
+  // The decimal length frames the exact path bytes; the remainder is the profile.
+  // Frame empty profiles too, so a raw path can never impersonate an encoded tuple.
+  return std::to_string(path.size()) + ":" + path + std::string(profile);
+}
 
 void metadata_store::retire(iterator it, entries& retired)
 {
@@ -143,10 +150,22 @@ void metadata_store::clear()
   }
 }
 
+bool metadata_store::invalidate(std::string_view path, std::string_view profile)
+{
+  entries retired;
+  std::lock_guard lock{_mutex};
+  auto const lookup = cache_key(std::string(path), profile);
+  auto const found  = _index.find(lookup);
+  if (found == _index.end()) return false;
+  retire(found->second, retired);
+  return true;
+}
+
 bool metadata_store::put_identity(std::string const& path,
                                   object_identity identity,
                                   uint64_t generation,
                                   std::shared_ptr<io_object_metadata> value,
+                                  std::string_view profile,
                                   entries& retired)
 {
   if (!value) return false;
@@ -155,16 +174,16 @@ bool metadata_store::put_identity(std::string const& path,
     if (current != _observed.end() && current->second.identity != identity) {
       ++_stats.bypasses;
       ++_stats.stale;
-      retired.push_back({{}, generation, {}, std::move(value)});
+      retired.push_back({{}, {}, generation, {}, std::move(value)});
       return false;
     }
   }
-  auto lookup = cache_key(path);
+  auto lookup = cache_key(path, profile);
   // Open-local evidence cannot help the next open; keep its footer-probe fast path.
   auto defer_value = [&] {
     // Keep discarded payloads alive until the caller releases _mutex. Metadata
     // destructors are allowed to inspect their owning ioctx.
-    retired.push_back({{}, generation, {}, std::move(value)});
+    retired.push_back({{}, {}, generation, {}, std::move(value)});
   };
   auto found = _index.find(lookup);
   if (found != _index.end()) {
@@ -184,7 +203,7 @@ bool metadata_store::put_identity(std::string const& path,
     ++_stats.replacements;
     retire(it, retired);
   }
-  _entries.push_front({std::move(lookup), generation, std::move(identity), std::move(value)});
+  _entries.push_front({std::move(lookup), path, generation, std::move(identity), std::move(value)});
   try {
     _index.emplace(_entries.front().key, _entries.begin());
   } catch (...) {
@@ -196,20 +215,26 @@ bool metadata_store::put_identity(std::string const& path,
 }
 
 void metadata_store::register_metadata(io_object const& obj,
-                                       std::shared_ptr<io_object_metadata> metadata)
+                                       std::shared_ptr<io_object_metadata> metadata,
+                                       std::string_view profile)
 {
   if (!metadata) return;
   entries retired;
   std::unique_lock lock{_mutex};
   observe_locked(obj, retired);
-  if (!put_identity(
-        obj.object_path(), obj.identity(), obj.open_generation(), std::move(metadata), retired)) {
+  if (!put_identity(obj.object_path(),
+                    obj.identity(),
+                    obj.open_generation(),
+                    std::move(metadata),
+                    profile,
+                    retired)) {
     return;
   }
 }
-std::shared_ptr<io_object_metadata> metadata_store::get_metadata(io_object const& obj) const
+std::shared_ptr<io_object_metadata> metadata_store::get_metadata(io_object const& obj,
+                                                                 std::string_view profile) const
 {
-  auto lookup   = cache_key(obj.object_path());
+  auto lookup   = cache_key(obj.object_path(), profile);
   auto identity = obj.identity();
   std::lock_guard lock{_mutex};
   auto found = _index.find(lookup);

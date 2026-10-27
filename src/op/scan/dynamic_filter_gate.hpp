@@ -62,13 +62,18 @@ struct bound_filter_key_hash {
 struct gate_selection {
   bool applicable;
   bool needs_combined_sample;
+  /// The gate is still undecided and a decode that applies the filters may decide it, so decode
+  /// may attach them and report what they kept (`dynamic_filter_gate::record_decode_keep_ratio`).
+  bool decode_trains = false;
 };
 
 /**
- * @brief Per-scan gate for post-decode dynamic filters
+ * @brief Per-scan gate for dynamic filters
  *
- * An eligible clean combined sample trains it. A selective result stays active; an unselective
- * result waits for channel growth. Updates are serialized.
+ * The gate starts UNKNOWN. Either an eligible clean combined sample at the endpoint or the keep
+ * ratio a decode measured while applying the filters trains it. A selective result makes it ACTIVE
+ * for the rest of the scan; an unselective result DISABLES it until the channel grows. Updates are
+ * serialized.
  */
 class dynamic_filter_gate {
  public:
@@ -84,6 +89,20 @@ class dynamic_filter_gate {
                          std::size_t rows_after,
                          std::size_t observed_filter_count) noexcept;
 
+  /// Updates an UNKNOWN gate from the rows a decode's membership filters kept, out of the rows they
+  /// were evaluated on.
+  ///
+  /// Decoding may apply only part of the channel's filters, which keep at least as many rows as the
+  /// whole set would. So a selective ratio always activates the gate, but an unselective one
+  /// disables it only when @p complete says the decode applied every filter. Otherwise the decode
+  /// cannot decide: later decodes stop attaching filters until the endpoint has measured a clean
+  /// batch, as `capture` then reports through `gate_selection::decode_trains`. Ignored once the
+  /// gate has left UNKNOWN; empty decodes do not train.
+  void record_decode_keep_ratio(std::size_t rows_before,
+                                std::size_t rows_after,
+                                std::size_t observed_filter_count,
+                                bool complete) noexcept;
+
   // Marginal ratios measure each filter on rows surviving earlier masks.
 
   /// Updates only for a larger observed filter count; equal or older measurements are ignored.
@@ -94,8 +113,9 @@ class dynamic_filter_gate {
                                 std::size_t observed_filter_count) noexcept;
 
   /// Captures 1) applicability,
-  ///          2) whether a combined sample is needed, and
-  ///          3) the current per-binding keep ratios
+  ///          2) whether a combined sample is needed,
+  ///          3) whether a decode may train the gate instead, and
+  ///          4) the current per-binding keep ratios
   /// while holding the necessary locks.
   ///
   /// The caller allocates one estimate slot per key before calling. Applicable means filters exist
@@ -120,6 +140,11 @@ class dynamic_filter_gate {
   double _keep_threshold;
 
   std::atomic<state> _state{state::UNKNOWN};
+
+  // A decode measured an unselective ratio for only part of the filters, which cannot decide the
+  // UNKNOWN gate, so decodes stop attaching filters and leave training to a clean endpoint sample.
+  // Written under `_decision_mu`.
+  std::atomic<bool> _decode_undecided{false};
 
   // Relaxed reads may trigger redundant measurements; decision updates are serialized.
   std::atomic<std::size_t> _decided_filter_count{0};
@@ -154,6 +179,8 @@ struct gate_test_access {
                                        sirius::op::dynamic_filter_snapshot const& filters);
   [[nodiscard]] static bool needs_combined_sample(
     dynamic_filter_gate const& gate, sirius::op::dynamic_filter_snapshot const& filters);
+  [[nodiscard]] static bool decode_trains(dynamic_filter_gate const& gate,
+                                          sirius::op::dynamic_filter_snapshot const& filters);
   [[nodiscard]] static std::optional<double> filter_keep_ratio(dynamic_filter_gate const& gate,
                                                                bound_filter_key filter,
                                                                std::size_t observed_filter_count);

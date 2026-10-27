@@ -10,7 +10,7 @@
 // File layout:
 //   [Binary header]
 //     "HPLN" (4 bytes)
-//     version (uint8)
+//     version (uint8)                     [14 for all codecs and nvCOMP builds]
 //     num_cols (uint16 LE)
 //     per column:
 //       name_len (uint16 LE) + name bytes   [0 = no name]
@@ -35,6 +35,7 @@
 //         type_tag (uint8)                  [decoded element type]
 //         meta_kind (uint8)  0=none 1=alp_rd 2=ans 3=bitcomp 4=cascaded 5=snappy 6=lz4 7=deflate
 //         meta bytes (variable per meta_kind; see push_meta)
+//           ANS and Cascaded end with payload_format (uint8): 5=pre-v6, 6=v6
 //         num_bufs (uint8)
 //         per buffer:
 //           name (str16) + buf_type_tag (uint8) + size_bytes (uint64 LE) + payload_offset (uint64

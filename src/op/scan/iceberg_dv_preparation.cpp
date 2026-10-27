@@ -214,6 +214,10 @@ void iceberg_dv_preparation::release() noexcept
 {
   files_ = {};
   storage_.reset();
+  // The plan no longer needs to retain the statement admission once its
+  // descriptors have been retired.  Reset only this plan's reference: a
+  // shared admission remains alive through any other scan that still owns it.
+  admission_.reset();
 }
 
 iceberg_dv_attempt::iceberg_dv_attempt(std::shared_ptr<iceberg_dv_preparation> plan,

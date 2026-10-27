@@ -30,16 +30,19 @@
 // declared schema surfaces far from the scan that produced it.
 
 #include "operator/operator_test_utils.hpp"
+#include "utils/test_validation_utility.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/filling.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 
 #include <rmm/cuda_stream.hpp>
+#include <rmm/mr/statistics_resource_adaptor.hpp>
 
 #include <cuda_runtime.h>
 
@@ -51,14 +54,18 @@
 #include <cucascade/memory/memory_space.hpp>
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
+#include <duckdb/planner/filter/constant_filter.hpp>
 #include <helper/type_conversions.hpp>
 #include <io/io_context.hpp>
 #include <late_mat/column_origin.hpp>
 #include <late_mat/defer_directive.hpp>
 #include <late_mat/port_materialize.hpp>
 #include <op/scan/decoded_batch_representation.hpp>
+#include <op/scan/detail/read_retirement.hpp>
 #include <op/scan/gpu_ingestible.hpp>
 #include <op/scan/gpu_ingestible_types.hpp>
+#include <op/scan/iceberg_gpu_ingestible.hpp>
+#include <op/scan/parquet_gpu_ingestible.hpp>
 #include <op/scan/scan_output_operator_data.hpp>
 #include <op/scan/sirius_gpu_scan_operator.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
@@ -69,7 +76,11 @@
 #include <scan_manager/load_balancing_scan_batch_coalescer.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
 #include <scan_manager/split_connector.hpp>
+#include <sirius/exception.hpp>
+#include <utils/table_filter_test_utils.hpp>
 
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -80,6 +91,7 @@
 #include <stdexcept>
 #include <stop_token>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -301,6 +313,28 @@ class identity_only_filter final : public sirius::op::sirius_dynamic_filter {
   [[nodiscard]] sirius::op::sirius_dynamic_filter_kind kind() const override
   {
     return sirius::op::sirius_dynamic_filter_kind::IN_LIST;
+  }
+};
+
+/// Membership filter, replicated on every device, whose every probe declines as a probe of an
+/// incompatible type does
+class declining_filter final : public sirius::op::sirius_dynamic_filter,
+                               public sirius::op::sirius_mask_applicable {
+ public:
+  [[nodiscard]] sirius::op::sirius_dynamic_filter_kind kind() const override
+  {
+    return sirius::op::sirius_dynamic_filter_kind::IN_LIST;
+  }
+  [[nodiscard]] bool is_available_on_device(int) const noexcept override { return true; }
+  using sirius::op::sirius_mask_applicable::compute_mask;
+  [[nodiscard]] std::unique_ptr<cudf::column> compute_mask(
+    cudf::column_view const&,
+    std::uint32_t const*,
+    int,
+    ::cuda::stream_ref,
+    rmm::device_async_resource_ref) const override
+  {
+    return nullptr;
   }
 };
 
@@ -543,6 +577,111 @@ TEST_CASE("scan execute restores a narrowed resident carrier to its native outpu
   REQUIRE(view.num_columns() == 1);
   REQUIRE(view.column(0).type().id() == cudf::type_id::INT64);
   REQUIRE(view.num_rows() == static_cast<cudf::size_type>(kRows));
+}
+
+TEST_CASE("scan execute releases restored cast sources without waiting on the host",
+          "[scan_normalization][gpu_scan]")
+{
+  auto& e = env();
+  rmm::cuda_stream stream{rmm::cuda_stream::flags::non_blocking};
+  ::cuda::stream_ref const scan_stream{stream.value()};
+  auto batch      = make_resident_batch(e, kRows);
+  auto ingestible = std::make_shared<stub_ingestible>([&] {
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                                static_cast<cudf::size_type>(kRows),
+                                                cudf::mask_state::UNALLOCATED,
+                                                scan_stream,
+                                                e.gpu_space->get_default_allocator()));
+    return std::make_unique<cudf::table>(std::move(columns));
+  });
+  auto scan       = make_bigint_scan(ingestible);
+  sirius::op::scan::scan_operator_input input(batch);
+  input.gpu_memory_space = e.gpu_space;
+  admit_fixture_resident_input(input);
+  // Load the kernels execute launches first: loading a kernel's module on its first launch waits
+  // for the held stream.
+  {
+    sirius::op::scan::scan_operator_input warmup(make_resident_batch(e, kRows));
+    warmup.gpu_memory_space = e.gpu_space;
+    admit_fixture_resident_input(warmup);
+    (void)scan.execute(warmup, scan_stream);
+    stream.synchronize();
+  }
+
+  // Hold the stream until the host releases it. The hold is bounded so that a host wait inside
+  // execute ends with the hold expired, not with a hung test.
+  std::atomic<bool> released{false};
+  auto const hold = [](void* flag) {
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!static_cast<std::atomic<bool>*>(flag)->load() &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::yield();
+    }
+  };
+  REQUIRE(cudaLaunchHostFunc(stream.value(), hold, &released) == cudaSuccess);
+  auto output = scan.execute(input, scan_stream);
+  CHECK(cudaStreamQuery(stream.value()) == cudaErrorNotReady);
+  released = true;
+  stream.synchronize();
+
+  auto const& batches =
+    dynamic_cast<const sirius::op::pipelineable_operator_data&>(*output).get_data_batches();
+  REQUIRE(batches.size() == 1);
+  auto restored = batches[0]->to_read_only();
+  REQUIRE(sirius::get_cudf_table_view(restored).column(0).type().id() == cudf::type_id::INT64);
+}
+
+TEST_CASE("scan execute frees each restored cast source before casting the next",
+          "[scan_normalization][gpu_scan]")
+{
+  constexpr std::size_t kColumns  = 3;
+  constexpr std::size_t kCastRows = std::size_t{1} << 16;
+  auto& e                         = env();
+  rmm::mr::statistics_resource_adaptor allocations{
+    cuda::mr::any_resource<cuda::mr::device_accessible>{e.gpu_space->get_default_allocator()}};
+  cucascade::memory::memory_space counted_space(cucascade::memory::gpu_memory_space_config{
+    .device_id       = e.gpu_space->get_device_id(),
+    .memory_capacity = e.gpu_space->get_max_memory(),
+    .mr_factory_fn   = [&](int, std::size_t) {
+      return cuda::mr::any_resource<cuda::mr::device_accessible>{allocations};
+    }});
+  auto ingestible = std::make_shared<stub_ingestible>([&] {
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    for (std::size_t column = 0; column < kColumns; ++column) {
+      columns.push_back(
+        make_column(counted_space, cudf::data_type{cudf::type_id::INT32}, kCastRows));
+    }
+    return std::make_unique<cudf::table>(std::move(columns));
+  });
+  sirius::op::scan::sirius_gpu_scan_operator scan{
+    sirius::from_duckdb_vec(
+      duckdb::vector<duckdb::LogicalType>(kColumns, duckdb::LogicalType::BIGINT)),
+    /*estimated_cardinality=*/0,
+    ingestible,
+    /*contract_id=*/1};
+  sirius::op::scan::scan_operator_input input(make_resident_batch(e, kRows));
+  input.gpu_memory_space = &counted_space;
+  admit_fixture_resident_input(input);
+
+  auto output = scan.execute(input, e.stream());
+  e.stream().sync();
+  auto const restored = dynamic_cast<sirius::op::pipelineable_operator_data const&>(*output)
+                          .get_data_batches()
+                          .at(0)
+                          ->to_read_only();
+  auto const view = sirius::get_cudf_table_view(restored);
+  REQUIRE(view.num_columns() == static_cast<cudf::size_type>(kColumns));
+  for (auto const& column : view) {
+    REQUIRE(column.type().id() == cudf::type_id::INT64);
+  }
+  // Each cast replaces and frees its source before the next cast allocates, so the peak holds every
+  // cast and one source rather than every source.
+  auto const source_bytes = kCastRows * sizeof(std::int32_t);
+  auto const cast_bytes   = kColumns * kCastRows * sizeof(std::int64_t);
+  auto const peak         = static_cast<std::size_t>(allocations.get_bytes_counter().peak);
+  CHECK(peak >= cast_bytes + source_bytes);
+  CHECK(peak < cast_bytes + 2 * source_bytes);
 }
 
 TEST_CASE("scan execute transactionally restores a fresh cached conversion",
@@ -1016,6 +1155,900 @@ TEST_CASE("decode history at a deferred ordinal keeps the endpoint from sampling
   REQUIRE_FALSE(
     gate_test_access::filter_keep_ratio(gate, {filter.get(), deferring_scan_fixture::kDeferred}, 1)
       .has_value());
+}
+
+namespace {
+
+namespace scan = sirius::op::scan;
+
+std::unique_ptr<scan::parquet_ingestible_table_info> resident_parquet_info(
+  std::vector<std::size_t> const& columns,
+  std::size_t output_arity,
+  std::optional<std::size_t> positive_filter = std::nullopt)
+{
+  auto info   = std::make_unique<scan::parquet_ingestible_table_info>();
+  info->names = {"key", "payload", "keep"};
+  for (std::size_t i = 0; i < info->names.size(); ++i) {
+    info->returned_types.push_back(sirius::logical_type::make(sirius::type_id::BIGINT));
+  }
+  for (auto column : columns) {
+    info->column_ids.emplace_back(column);
+    info->projection_ids.push_back(info->projection_ids.size());
+  }
+  info->projected_output_count = output_arity;
+  if (positive_filter) {
+    info->table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
+    info->table_filters->PushFilter(
+      duckdb::ProjectionIndex(*positive_filter),
+      sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_GREATERTHAN,
+                                    duckdb::Value::BIGINT(0)));
+  }
+  return info;
+}
+
+template <typename T>
+std::unique_ptr<cudf::column> resident_column(
+  std::vector<T> const& values,
+  cudf::type_id type,
+  std::optional<cudf::size_type> null_row = std::nullopt)
+{
+  auto& e     = env();
+  auto column = cudf::make_numeric_column(
+    cudf::data_type{type},
+    static_cast<cudf::size_type>(values.size()),
+    null_row ? cudf::mask_state::ALL_VALID : cudf::mask_state::UNALLOCATED,
+    e.stream(),
+    e.gpu_space->get_default_allocator());
+  if (!values.empty()) {
+    REQUIRE(cudaMemcpyAsync(column->mutable_view().data<T>(),
+                            values.data(),
+                            values.size() * sizeof(T),
+                            cudaMemcpyHostToDevice,
+                            e.stream().get()) == cudaSuccess);
+  }
+  if (null_row) {
+    cudf::set_null_mask(
+      column->mutable_view().null_mask(), *null_row, *null_row + 1, false, e.stream());
+    column->set_null_count(1);
+  }
+  e.stream().sync();
+  return column;
+}
+
+std::shared_ptr<cucascade::data_batch> resident_columns(
+  std::vector<std::unique_ptr<cudf::column>> columns)
+{
+  auto& e = env();
+  return sirius::make_data_batch(
+    std::make_unique<cudf::table>(std::move(columns)), *e.gpu_space, e.stream(), {});
+}
+
+template <typename T>
+void require_resident_values(cudf::column_view column,
+                             cudf::type_id type,
+                             std::vector<T> const& expected,
+                             std::vector<char> validity = {})
+{
+  REQUIRE(column.type().id() == type);
+  REQUIRE(column.size() == static_cast<cudf::size_type>(expected.size()));
+  if (validity.empty()) { validity.assign(expected.size(), 1); }
+  REQUIRE(sirius::test::detail::column_row_validity(column, env().stream()) == validity);
+  auto const values =
+    sirius::test::detail::copy_device_values<T>(column.data<T>(), expected.size(), env().stream());
+  for (std::size_t row = 0; row < expected.size(); ++row) {
+    CAPTURE(row);
+    if (validity[row]) { CHECK(values[row] == expected[row]); }
+  }
+}
+
+struct resident_parquet_fixture {
+  test_env& e = env();
+  sirius::op::dynamic_filter_stats stats;
+  std::shared_ptr<scan::parquet_gpu_ingestible> ingestible;
+  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> channel =
+    std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  std::shared_ptr<scan::dynamic_filter_consumer> consumer;
+  scan::sirius_gpu_scan_operator op;
+
+  resident_parquet_fixture(std::unique_ptr<scan::parquet_ingestible_table_info> info,
+                           std::size_t output_arity,
+                           bool cached              = true,
+                           duckdb::LogicalType type = duckdb::LogicalType::BIGINT,
+                           bool force_counts        = true)
+    : resident_parquet_fixture(std::move(info),
+                               duckdb::vector<duckdb::LogicalType>(output_arity, type),
+                               cached,
+                               force_counts)
+  {
+  }
+
+  resident_parquet_fixture(std::unique_ptr<scan::parquet_ingestible_table_info> info,
+                           duckdb::vector<duckdb::LogicalType> const& output_types,
+                           bool cached       = true,
+                           bool force_counts = true)
+    : ingestible(scan::make_ingestible(std::move(info))),
+      consumer(std::make_shared<scan::dynamic_filter_consumer>(
+        channel,
+        scan::consumer_config{.mode = scan::dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY,
+                              .force_counts     = force_counts,
+                              .cached_placement = cached,
+                              .stats            = &stats},
+        scan::scan_decode_bindings(*ingestible, output_types.size()))),
+      op(sirius::from_duckdb_vec(output_types), 0, ingestible, 1, nullptr, nullptr, consumer)
+  {
+  }
+
+  auto publish(std::size_t ordinal, std::vector<std::int64_t> const& values)
+  {
+    auto keys   = resident_column(values, cudf::type_id::INT64);
+    auto filter = std::make_shared<sirius::op::sirius_dynamic_small_in_list_filter>(
+      keys->view(), e.stream(), e.gpu_space->get_default_allocator());
+    e.stream().sync();
+    auto producer = channel->register_producer({ordinal});
+    REQUIRE(producer.push_filter(ordinal, filter));
+    return filter;
+  }
+
+  auto split(std::shared_ptr<cucascade::data_batch> const& batch, bool conversion = true)
+  {
+    auto input = std::make_unique<scan::scan_operator_input>(batch);
+    admit_fixture_resident_input(*input);
+    input->row_filter_pending       = ingestible->has_row_filter();
+    input->needs_carrier_conversion = conversion;
+    input->cached_view_possible     = op.cached_view_possible();
+    input->prepare_for_processing(e.gpu_space, e.stream());
+    return input;
+  }
+};
+
+}  // namespace
+
+TEST_CASE("resident Parquet filters a shared narrow projection before restoring duplicate outputs",
+          "[scan_normalization][cached_scan][cached_projection]")
+{
+  bool cached = true;
+  SECTION("cached placement") {}
+  SECTION("placement disabled") { cached = false; }
+  resident_parquet_fixture f(resident_parquet_info({1, 0, 1, 2}, 3, 3), 3, cached);
+  f.publish(1, {41, 83, 29, 53});
+  REQUIRE(f.ingestible->materialized_column_order() == std::vector<std::size_t>{1, 0, 2});
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(resident_column<std::int32_t>(
+    {901, 302, 703, 404, 805, 106, 607, 208}, cudf::type_id::INT32, 3));
+  columns.push_back(
+    resident_column<std::int32_t>({41, 17, 83, 29, 61, 11, 97, 53}, cudf::type_id::INT32));
+  columns.push_back(resident_column<std::int32_t>({1, 1, 0, 1, 1, 0, 1, 1}, cudf::type_id::INT32));
+  auto source                                          = resident_columns(std::move(columns));
+  std::weak_ptr<cucascade::data_batch> source_lifetime = source;
+  auto input                                           = f.split(source);
+  REQUIRE_FALSE(input->stolen_table);
+  REQUIRE_FALSE(input->converted_table_steal_pending);
+  {
+    auto materialized = f.ingestible->materialize_table(*input, f.e.stream());
+    auto layout       = f.ingestible->view_layout(materialized, {});
+    REQUIRE(layout);
+    CHECK(layout->output_columns == std::vector<cudf::size_type>{0, 1, 0});
+    CHECK(layout->projected_columns == layout->output_columns);
+    REQUIRE(layout->residual);
+  }
+  auto scanned = f.op.execute(*input, f.e.stream());
+  {
+    auto source_lease = source->to_read_only();
+    auto view         = sirius::get_cudf_table_view(source_lease);
+    REQUIRE(view.num_columns() == 3);
+    require_resident_values<std::int32_t>(view.column(0),
+                                          cudf::type_id::INT32,
+                                          {901, 302, 703, 404, 805, 106, 607, 208},
+                                          {1, 1, 1, 0, 1, 1, 1, 1});
+    require_resident_values<std::int32_t>(
+      view.column(1), cudf::type_id::INT32, {41, 17, 83, 29, 61, 11, 97, 53});
+    auto leases =
+      dynamic_cast<sirius::op::pipelineable_operator_data const&>(*scanned).get_read_only_batches();
+    REQUIRE(sirius::get_cudf_table_view(leases.at(0)).num_rows() == (cached ? 3 : 6));
+  }
+  input.reset();
+  source.reset();
+  REQUIRE(source_lifetime.expired());
+  scan::sirius_physical_dynamic_filter endpoint(f.op.types, kRows, f.consumer);
+  scanned->prepare_for_processing(f.e.gpu_space, f.e.stream());
+  auto result = endpoint.execute(*scanned, f.e.stream());
+  auto leases =
+    dynamic_cast<sirius::op::pipelineable_operator_data const&>(*result).get_read_only_batches();
+  auto view = sirius::get_cudf_table_view(leases.at(0));
+  REQUIRE(view.num_columns() == 3);
+  require_resident_values<std::int64_t>(
+    view.column(0), cudf::type_id::INT64, {901, 0, 208}, {1, 0, 1});
+  require_resident_values<std::int64_t>(view.column(1), cudf::type_id::INT64, {41, 29, 53});
+  require_resident_values<std::int64_t>(
+    view.column(2), cudf::type_id::INT64, {901, 0, 208}, {1, 0, 1});
+  CHECK(view.column(0).head() != view.column(2).head());
+  auto const counts = f.stats.snapshot();
+  CHECK(counts.cached_placements == (cached ? 1 : 0));
+  CHECK((counts.cached_payload_bytes > 0) == cached);
+  CHECK(counts.cached_disabled == (cached ? 0 : 1));
+  CHECK(counts.cached_bypassed_transfer == 0);
+}
+
+TEST_CASE("resident Parquet checkpoint whose probes all decline serves the ordinary projection",
+          "[scan_normalization][cached_scan]")
+{
+  resident_parquet_fixture f(resident_parquet_info({0, 1}, 2), 2);
+  auto producer = f.channel->register_producer({0});
+  REQUIRE(producer.push_filter(0, std::make_shared<declining_filter>()));
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(resident_column<std::int64_t>({41, 29, 53}, cudf::type_id::INT64));
+  columns.push_back(resident_column<std::int64_t>({901, 404, 208}, cudf::type_id::INT64));
+  auto source         = resident_columns(std::move(columns));
+  auto input          = f.split(source, false);
+  auto output         = f.op.execute(*input, f.e.stream());
+  auto const& scanned = dynamic_cast<scan::scan_output_operator_data const&>(*output);
+  CHECK(scanned.receipt().applied.empty());
+  auto leases     = scanned.get_read_only_batches();
+  auto const view = sirius::get_cudf_table_view(leases.at(0));
+  REQUIRE(view.num_columns() == 2);
+  require_resident_values<std::int64_t>(view.column(0), cudf::type_id::INT64, {41, 29, 53});
+  require_resident_values<std::int64_t>(view.column(1), cudf::type_id::INT64, {901, 404, 208});
+  // The program ran and selected nothing, so the placement declined for want of membership.
+  auto const counts = f.stats.snapshot();
+  CHECK(counts.cached_placements == 0);
+  CHECK(counts.cached_declined_no_membership == 1);
+  CHECK(counts.cached_declined_no_layout == 0);
+  CHECK(counts.applications_skipped_other_device == 0);
+}
+
+TEST_CASE("resident Parquet residual without a probing membership filter counts no placement",
+          "[scan_normalization][cached_scan]")
+{
+  resident_parquet_fixture f(resident_parquet_info({0, 1, 2}, 2, 2), 2);
+  auto producer = f.channel->register_producer({0});
+  // Prepare selects no membership step, so the ordinary residual path filters the batch.
+  SECTION("no published filter can probe the batch")
+  {
+    REQUIRE(producer.push_filter(0, std::make_shared<identity_only_filter>()));
+  }
+  // The checkpoint runs, but only the residual selects rows.
+  SECTION("every membership probe declines")
+  {
+    REQUIRE(producer.push_filter(0, std::make_shared<declining_filter>()));
+  }
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(resident_column<std::int64_t>({41, 29, 53}, cudf::type_id::INT64));
+  columns.push_back(resident_column<std::int64_t>({901, 404, 208}, cudf::type_id::INT64));
+  columns.push_back(resident_column<std::int64_t>({1, 0, 1}, cudf::type_id::INT64));
+  auto source         = resident_columns(std::move(columns));
+  auto input          = f.split(source, false);
+  auto output         = f.op.execute(*input, f.e.stream());
+  auto const& scanned = dynamic_cast<scan::scan_output_operator_data const&>(*output);
+  CHECK(scanned.receipt().applied.empty());
+  auto leases     = scanned.get_read_only_batches();
+  auto const view = sirius::get_cudf_table_view(leases.at(0));
+  REQUIRE(view.num_columns() == 2);
+  require_resident_values<std::int64_t>(view.column(0), cudf::type_id::INT64, {41, 53});
+  require_resident_values<std::int64_t>(view.column(1), cudf::type_id::INT64, {901, 208});
+  auto const counts = f.stats.snapshot();
+  CHECK(counts.cached_declined_no_membership == 1);
+  CHECK(counts.cached_placements == 0);
+  CHECK(counts.cached_payload_bytes == 0);
+  CHECK(counts.cached_declined_no_layout == 0);
+}
+
+TEST_CASE("resident Parquet checkpoint sizes its skip policy by the projected row width",
+          "[scan_normalization][cached_scan]")
+{
+  // Eight stored BIGINT columns take 64 bytes a row, but the two the scan projects take 16, the row
+  // width the checkpoint's gather moves. At that narrow width a filter measured to keep 55% is
+  // skipped.
+  constexpr std::size_t kStored = 8;
+  auto info                     = std::make_unique<scan::parquet_ingestible_table_info>();
+  for (std::size_t column = 0; column < kStored; ++column) {
+    info->names.push_back("c" + std::to_string(column));
+    info->returned_types.push_back(sirius::logical_type::make(sirius::type_id::BIGINT));
+    info->column_ids.emplace_back(column);
+    info->projection_ids.push_back(column);
+  }
+  info->projected_output_count = 2;
+  resident_parquet_fixture f(std::move(info), 2);
+  auto filter = f.publish(0, {41, 53});
+  scan::detail::consumer_test_access::gate(*f.consumer)
+    .record_filter_keep_ratio({filter.get(), 0}, 0.55, 1);
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  for (std::size_t column = 0; column < kStored; ++column) {
+    columns.push_back(resident_column<std::int64_t>({41, 29, 53}, cudf::type_id::INT64));
+  }
+  auto source = resident_columns(std::move(columns));
+  auto input  = f.split(source, false);
+  auto output = f.op.execute(*input, f.e.stream());
+  auto leases =
+    dynamic_cast<scan::scan_output_operator_data const&>(*output).get_read_only_batches();
+  CHECK(sirius::get_cudf_table_view(leases.at(0)).num_rows() == 3);
+  auto const counts = f.stats.snapshot();
+  CHECK(counts.cached_placements == 0);
+  CHECK(counts.cached_declined_no_membership == 1);
+}
+
+TEST_CASE("resident Parquet checkpoint counts a program it cannot prepare as missing membership",
+          "[scan_normalization][cached_scan]")
+{
+  resident_parquet_fixture f(resident_parquet_info({0, 1}, 2), 2);
+  SECTION("no filter published") {}
+  SECTION("gate disabled until the channel grows")
+  {
+    (void)f.publish(0, {41, 53});
+    scan::detail::consumer_test_access::gate(*f.consumer)
+      .record_keep_ratio(10, 10, f.channel->snapshot().generation());
+  }
+  SECTION("no published filter can probe the batch")
+  {
+    auto producer = f.channel->register_producer({0});
+    REQUIRE(producer.push_filter(0, std::make_shared<identity_only_filter>()));
+  }
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(resident_column<std::int64_t>({41, 29, 53}, cudf::type_id::INT64));
+  columns.push_back(resident_column<std::int64_t>({901, 404, 208}, cudf::type_id::INT64));
+  auto source = resident_columns(std::move(columns));
+  auto input  = f.split(source, false);
+  auto output = f.op.execute(*input, f.e.stream());
+  auto leases =
+    dynamic_cast<scan::scan_output_operator_data const&>(*output).get_read_only_batches();
+  CHECK(sirius::get_cudf_table_view(leases.at(0)).num_rows() == 3);
+  auto const counts = f.stats.snapshot();
+  CHECK(counts.cached_placements == 0);
+  CHECK(counts.cached_disabled == 0);
+  CHECK(counts.cached_declined_no_membership == 1);
+}
+
+TEST_CASE("resident Parquet split on another device passes the checkpoint without a decline",
+          "[scan_normalization][cached_scan]")
+{
+  int devices = 0;
+  int current = -1;
+  REQUIRE(cudaGetDeviceCount(&devices) == cudaSuccess);
+  REQUIRE(cudaGetDevice(&current) == cudaSuccess);
+  if (devices < 2) { SKIP("naming another device needs a second visible GPU"); }
+  resident_parquet_fixture f(resident_parquet_info({0, 1}, 2), 2);
+  auto producer = f.channel->register_producer({0});
+  REQUIRE(producer.push_filter(0, std::make_shared<declining_filter>()));
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(resident_column<std::int64_t>({41, 29, 53}, cudf::type_id::INT64));
+  columns.push_back(resident_column<std::int64_t>({901, 404, 208}, cudf::type_id::INT64));
+  auto source = resident_columns(std::move(columns));
+  auto input  = f.split(source, false);
+  // Names the other GPU but allocates on this one, so only the device the program is prepared for
+  // differs.
+  cucascade::memory::memory_space elsewhere(cucascade::memory::gpu_memory_space_config{
+    .device_id       = current == 0 ? 1 : 0,
+    .memory_capacity = f.e.gpu_space->get_max_memory(),
+    .mr_factory_fn   = [&](int, std::size_t) {
+      return cuda::mr::any_resource<cuda::mr::device_accessible>{
+        f.e.gpu_space->get_default_allocator()};
+    }});
+  input->gpu_memory_space = &elsewhere;
+  auto output             = f.op.execute(*input, f.e.stream());
+  auto const& scanned     = dynamic_cast<scan::scan_output_operator_data const&>(*output);
+  CHECK(scanned.receipt().applied.empty());
+  auto leases = scanned.get_read_only_batches();
+  CHECK(sirius::get_cudf_table_view(leases.at(0)).num_rows() == 3);
+  auto const counts = f.stats.snapshot();
+  CHECK(counts.applications_skipped_other_device == 1);
+  CHECK(counts.cached_placements == 0);
+  CHECK(counts.cached_declined_no_membership == 0);
+}
+
+TEST_CASE("resident Parquet accepts proven dropped filter columns and rejects missing proof",
+          "[scan_normalization][cached_scan][cached_layout]")
+{
+  resident_parquet_fixture f(resident_parquet_info({0, 1, 2}, 2, 2), 2);
+  f.publish(0, {41, 53});
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(resident_column<std::int32_t>({41, 29, 53}, cudf::type_id::INT32));
+  columns.push_back(resident_column<std::int32_t>({901, 404, 208}, cudf::type_id::INT32));
+  auto source                                 = resident_columns(std::move(columns));
+  auto input                                  = f.split(source);
+  input->pushdown_filter_only_columns_dropped = true;
+  SECTION("missing full-filter proof fails before cached application")
+  {
+    REQUIRE_THROWS_WITH(
+      f.op.execute(*input, f.e.stream()),
+      Catch::Matchers::ContainsSubstring("without applying the scan's whole filter"));
+    CHECK(f.stats.snapshot().cached_placements == 0);
+  }
+  SECTION("full-filter proof admits the surviving output prefix")
+  {
+    input->pushdown_row_filtered = true;
+    auto output                  = f.op.execute(*input, f.e.stream());
+    auto leases =
+      dynamic_cast<sirius::op::pipelineable_operator_data const&>(*output).get_read_only_batches();
+    auto view = sirius::get_cudf_table_view(leases.at(0));
+    REQUIRE(view.num_columns() == 2);
+    require_resident_values<std::int64_t>(view.column(0), cudf::type_id::INT64, {41, 53});
+    require_resident_values<std::int64_t>(view.column(1), cudf::type_id::INT64, {901, 208});
+    CHECK(f.stats.snapshot().cached_placements == 1);
+    auto original = source->to_read_only();
+    require_resident_values<std::int32_t>(
+      sirius::get_cudf_table_view(original).column(0), cudf::type_id::INT32, {41, 29, 53});
+  }
+}
+
+TEST_CASE("resident Parquet uses a BOOL8 pure-filter answer only as a residual",
+          "[scan_normalization][cached_scan][cached_layout]")
+{
+  resident_parquet_fixture f(resident_parquet_info({0, 1}, 1, 1), 1);
+  f.publish(0, {41, 29, 53});
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(resident_column<std::int32_t>({41, 29, 53, 17}, cudf::type_id::INT32));
+  columns.push_back(resident_column<std::int8_t>({1, 0, 1, 1}, cudf::type_id::BOOL8, 2));
+  auto source                       = resident_columns(std::move(columns));
+  auto input                        = f.split(source);
+  input->pushdown_predicate_columns = {1};
+  {
+    auto materialized = f.ingestible->materialize_table(*input, f.e.stream());
+    auto layout       = f.ingestible->view_layout(materialized, {});
+    REQUIRE(layout);
+    CHECK(layout->output_columns == std::vector<cudf::size_type>{0});
+    REQUIRE(layout->residual);
+    auto projecting_predicate = scan::make_ingestible(resident_parquet_info({0, 1}, 2, 1));
+    CHECK_FALSE(projecting_predicate->view_layout(materialized, {}));
+  }
+  auto output = f.op.execute(*input, f.e.stream());
+  auto leases =
+    dynamic_cast<sirius::op::pipelineable_operator_data const&>(*output).get_read_only_batches();
+  auto view = sirius::get_cudf_table_view(leases.at(0));
+  REQUIRE(view.num_columns() == 1);
+  require_resident_values<std::int64_t>(view.column(0), cudf::type_id::INT64, {41});
+  CHECK(f.stats.snapshot().cached_placements == 1);
+  auto original = source->to_read_only();
+  require_resident_values<std::int8_t>(sirius::get_cudf_table_view(original).column(1),
+                                       cudf::type_id::BOOL8,
+                                       {1, 0, 1, 1},
+                                       {1, 1, 0, 1});
+}
+
+TEST_CASE("resident Parquet declines layouts without a borrowed DATA proof",
+          "[scan_normalization][cached_scan][cached_layout]")
+{
+  auto info        = resident_parquet_info({0}, 1);
+  bool iceberg     = false;
+  bool unknown     = false;
+  bool zero_output = false;
+  // Only a missing column is a per-batch decline; every other layout declines for the whole plan.
+  bool plan_admits = false;
+  SECTION("partition output") { info->partition_indices = {duckdb::HivePartitioningIndex("7", 0)}; }
+  SECTION("virtual filename output")
+  {
+    info->returned_types[0] = sirius::logical_type::make(sirius::type_id::VARCHAR);
+    info->virtual_columns.push_back({0,
+                                     "filename",
+                                     info->returned_types[0],
+                                     scan::scan_plan::parquet_virtual_column_kind::FILENAME});
+  }
+  SECTION("Iceberg does not inherit Parquet admission") { iceberg = true; }
+  SECTION("an unknown ingestible has no default layout") { unknown = true; }
+  SECTION("missing materialized column")
+  {
+    info        = resident_parquet_info({0, 1}, 2);
+    plan_admits = true;
+  }
+  SECTION("zero outputs retain a row-count carrier on the ordinary path")
+  {
+    info        = resident_parquet_info({0}, 0);
+    zero_output = true;
+  }
+  std::shared_ptr<scan::gpu_ingestible> ingestible;
+  if (iceberg) {
+    auto ice                    = std::make_unique<scan::iceberg_ingestible_table_info>();
+    ice->names                  = {"key"};
+    ice->returned_types         = {sirius::logical_type::make(sirius::type_id::BIGINT)};
+    ice->column_ids             = {duckdb::ColumnIndex(0)};
+    ice->projected_output_count = 1;
+    ice->delete_data            = std::make_shared<scan::IcebergDeleteData>();
+    ingestible                  = std::make_shared<scan::iceberg_gpu_ingestible>(std::move(ice));
+  } else if (unknown) {
+    ingestible = std::make_shared<stub_ingestible>([] { return std::make_unique<cudf::table>(); });
+  } else {
+    ingestible = scan::make_ingestible(std::move(info));
+  }
+  auto& e = env();
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(resident_column<std::int32_t>({41, 53}, cudf::type_id::INT32));
+  auto source = resident_columns(std::move(columns));
+  scan::scan_operator_input input(source);
+  input.gpu_memory_space = e.gpu_space;
+  auto materialized      = ingestible->materialize_table(input, e.stream());
+  CHECK(ingestible->can_serve_cached_view() == plan_admits);
+  CHECK_FALSE(ingestible->view_layout(materialized, {}));
+  REQUIRE(materialized.table.num_rows() == 2);
+  if (zero_output) {
+    auto output = ingestible->post_filter_and_project(
+      std::move(materialized), *e.gpu_space, e.stream(), false, nullptr, nullptr, {});
+    REQUIRE(output->num_columns() == 1);
+    require_resident_values<std::int32_t>(output->view().column(0), cudf::type_id::INT32, {41, 53});
+  }
+}
+
+TEST_CASE("Parquet projection moves unique owned outputs and copies only kept repeats",
+          "[scan_normalization][cached_projection]")
+{
+  auto& e         = env();
+  auto ingestible = scan::make_ingestible(resident_parquet_info({1, 0, 1}, 3));
+  REQUIRE(ingestible->materialized_column_order() == std::vector<std::size_t>{1, 0});
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(resident_column<std::int64_t>({901, 404, 208}, cudf::type_id::INT64));
+  columns.push_back(resident_column<std::int64_t>({41, 29, 53}, cudf::type_id::INT64));
+  auto const payload = columns[0]->view().head();
+  auto const key     = columns[1]->view().head();
+  scan::filtered_table input{
+    scan::owning_table_view{std::make_unique<cudf::table>(std::move(columns))},
+    scan::filter_state::UNFILTERED};
+  std::vector<std::size_t> elided;
+  SECTION("a kept repeat is a separate copy") {}
+  SECTION("an elided repeat is never copied") { elided = {2}; }
+  rmm::mr::statistics_resource_adaptor allocations{
+    cuda::mr::any_resource<cuda::mr::device_accessible>{e.gpu_space->get_default_allocator()}};
+  cucascade::memory::memory_space counted_space(cucascade::memory::gpu_memory_space_config{
+    .device_id       = e.gpu_space->get_device_id(),
+    .memory_capacity = e.gpu_space->get_max_memory(),
+    .mr_factory_fn   = [&](int, std::size_t) {
+      return cuda::mr::any_resource<cuda::mr::device_accessible>{allocations};
+    }});
+  auto output = ingestible->post_filter_and_project(
+    std::move(input), counted_space, e.stream(), false, nullptr, nullptr, elided);
+  // Unique outputs move, so the kept repeat's copy is the projection's only allocation.
+  CHECK(allocations.get_allocations_counter().total == (elided.empty() ? 1 : 0));
+  auto const view = output->view();
+  REQUIRE(view.num_columns() == (elided.empty() ? 3 : 2));
+  CHECK(view.column(0).head() == payload);
+  CHECK(view.column(1).head() == key);
+  require_resident_values<std::int64_t>(view.column(0), cudf::type_id::INT64, {901, 404, 208});
+  require_resident_values<std::int64_t>(view.column(1), cudf::type_id::INT64, {41, 29, 53});
+  if (elided.empty()) {
+    CHECK(view.column(2).head() != payload);
+    require_resident_values<std::int64_t>(view.column(2), cudf::type_id::INT64, {901, 404, 208});
+  }
+}
+
+TEST_CASE("fresh HOST conversion refused by the transfer branch uses cached Parquet placement",
+          "[scan_normalization][cached_scan][cached_transfer]")
+{
+  resident_parquet_fixture f(resident_parquet_info({0, 1, 2}, 2, 2), 2);
+  f.publish(0, {41, 53});
+  auto source = make_host_resident_batch(f.e, {{41, 29, 53}, {901, 404, 208}, {1, 1, 1}});
+  scan::scan_operator_input input(source);
+  admit_fixture_resident_input(input);
+  input.needs_carrier_conversion = true;
+  input.row_filter_pending       = true;
+  input.pushdown_row_filtered    = true;
+  input.cached_view_possible     = f.op.cached_view_possible();
+  input.prepare_for_processing(f.e.gpu_space, f.e.stream());
+  REQUIRE(input.converted_table_steal_pending);
+  REQUIRE_FALSE(input.stolen_table);
+  auto output = f.op.execute(input, f.e.stream());
+  REQUIRE_FALSE(input.stolen_table_consumed);
+  auto leases =
+    dynamic_cast<sirius::op::pipelineable_operator_data const&>(*output).get_read_only_batches();
+  auto view = sirius::get_cudf_table_view(leases.at(0));
+  REQUIRE(view.num_columns() == 2);
+  require_resident_values<std::int64_t>(view.column(0), cudf::type_id::INT64, {41, 53});
+  require_resident_values<std::int64_t>(view.column(1), cudf::type_id::INT64, {901, 208});
+  auto original      = source->to_read_only();
+  auto original_view = sirius::get_cudf_table_view(original);
+  REQUIRE(original_view.num_columns() == 3);
+  require_resident_values<std::int32_t>(
+    original_view.column(0), cudf::type_id::INT32, {41, 29, 53});
+  require_resident_values<std::int32_t>(
+    original_view.column(1), cudf::type_id::INT32, {901, 404, 208});
+  auto counts = f.stats.snapshot();
+  CHECK(counts.cached_placements == 1);
+  CHECK(counts.cached_payload_bytes > 0);
+  CHECK(counts.cached_bypassed_transfer == 0);
+}
+
+TEST_CASE("owned Parquet transfers bypass cached placement and remain filterable at the endpoint",
+          "[scan_normalization][cached_scan][cached_transfer]")
+{
+  bool transactional = false;
+  SECTION("direct owned table") {}
+  SECTION("transactional carrier restoration") { transactional = true; }
+  auto const logical = transactional ? duckdb::LogicalType::BIGINT : duckdb::LogicalType::INTEGER;
+  resident_parquet_fixture f(resident_parquet_info({0, 1}, 2), 2, true, logical);
+  f.publish(0, {41, 53});
+  auto source = make_host_resident_batch(f.e, {{41, 29, 53}, {901, 404, 208}});
+  auto input  = f.split(source, transactional);
+  REQUIRE(input->converted_table_steal_pending == transactional);
+  REQUIRE(static_cast<bool>(input->stolen_table) == !transactional);
+  auto scanned = f.op.execute(*input, f.e.stream());
+  REQUIRE(input->stolen_table_consumed);
+  REQUIRE_FALSE(input->converted_table_steal_pending);
+  {
+    auto original = source->to_read_only();
+    CHECK(original.get_data()->get_size_in_bytes() == 0);
+    auto leases =
+      dynamic_cast<sirius::op::pipelineable_operator_data const&>(*scanned).get_read_only_batches();
+    REQUIRE(sirius::get_cudf_table_view(leases.at(0)).num_rows() == 3);
+  }
+  input.reset();
+  source.reset();
+  scan::sirius_physical_dynamic_filter endpoint(f.op.types, kRows, f.consumer);
+  scanned->prepare_for_processing(f.e.gpu_space, f.e.stream());
+  auto output = endpoint.execute(*scanned, f.e.stream());
+  auto leases =
+    dynamic_cast<sirius::op::pipelineable_operator_data const&>(*output).get_read_only_batches();
+  auto view = sirius::get_cudf_table_view(leases.at(0));
+  REQUIRE(view.num_columns() == 2);
+  if (transactional) {
+    require_resident_values<std::int64_t>(view.column(0), cudf::type_id::INT64, {41, 53});
+    require_resident_values<std::int64_t>(view.column(1), cudf::type_id::INT64, {901, 208});
+  } else {
+    require_resident_values<std::int32_t>(view.column(0), cudf::type_id::INT32, {41, 53});
+    require_resident_values<std::int32_t>(view.column(1), cudf::type_id::INT32, {901, 208});
+  }
+  auto counts = f.stats.snapshot();
+  CHECK(counts.cached_bypassed_transfer == 1);
+  CHECK(counts.cached_placements == 0);
+  CHECK(counts.cached_payload_bytes == 0);
+}
+
+TEST_CASE("cached Parquet deferral validates original rows and restores source-relative survivors",
+          "[scan_normalization][cached_scan][cached_late_mat][assembly_fault][late_mat]")
+{
+  resident_parquet_fixture f(resident_parquet_info({0, 1, 2}, 2, 2), 2);
+  auto filter             = f.publish(0, {41, 83, 29, 53});
+  auto handle             = std::make_shared<sirius::late_mat::pin_entry_handle>("resident", 1);
+  auto entry              = std::make_shared<sirius::scan_manager::pinned_entry>();
+  entry->tier             = cucascade::memory::Tier::GPU;
+  entry->num_rows         = 11;
+  entry->cache_info.names = {"key", "payload"};
+  std::shared_ptr<cudf::column> pinned_keys =
+    resident_column<std::int64_t>({5, 7, 9, 41, 17, 83, 29, 61, 11, 97, 53}, cudf::type_id::INT64);
+  std::shared_ptr<cudf::column> pinned_payload = resident_column<std::int64_t>(
+    {999, 888, 777, 901, 302, 703, 404, 805, 106, 607, 208}, cudf::type_id::INT64);
+  entry->data_batches_by_column.emplace("key", std::vector{pinned_keys});
+  entry->data_batches_by_column.emplace("payload", std::vector{pinned_payload});
+  handle->set_entry(entry);
+  sirius::late_mat::column_origin origin;
+  origin.handle     = handle;
+  origin.column_pos = 1;
+  origin.generation = handle->generation();
+  scan::sirius_physical_dynamic_filter port(f.op.types, kRows, f.consumer);
+  std::vector<cudf::data_type> const schema(2, cudf::data_type{cudf::type_id::INT64});
+  REQUIRE(sirius::planner::install_deferral(
+    f.op, port, sirius::late_mat::make_defer_pair(schema, {1}, schema, {1}, {origin})));
+  REQUIRE_FALSE(f.op.decode_consumer());
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(
+    resident_column<std::int32_t>({41, 17, 83, 29, 61, 11, 97, 53}, cudf::type_id::INT32));
+  columns.push_back(
+    resident_column<std::int32_t>({901, 302, 703, 404, 805, 106, 607, 208}, cudf::type_id::INT32));
+  columns.push_back(resident_column<std::int32_t>({1, 1, 0, 1, 1, 0, 1, 1}, cudf::type_id::INT32));
+  auto source           = resident_columns(std::move(columns));
+  auto input            = f.split(source);
+  auto batch_origin     = std::make_shared<sirius::late_mat::scan_batch_origin>();
+  batch_origin->columns = std::make_shared<std::vector<sirius::late_mat::column_origin>>(2, origin);
+  batch_origin->range   = {3, static_cast<std::int64_t>(kRows)};
+  input->origin         = batch_origin;
+  SECTION("missing origin fails before residual submission")
+  {
+    input->origin.reset();
+    scan::detail::read_retirement_test_hooks fault(scan::detail::read_checkpoint::RESIDUAL);
+    REQUIRE_THROWS_WITH(f.op.execute(*input, f.e.stream()),
+                        Catch::Matchers::ContainsSubstring("this split carries no origin"));
+    CHECK(f.stats.snapshot().cached_placements == 0);
+  }
+  SECTION("wrong original row count fails before residual submission")
+  {
+    batch_origin->range.rows = kRows + 1;
+    scan::detail::read_retirement_test_hooks fault(scan::detail::read_checkpoint::RESIDUAL);
+    REQUIRE_THROWS_WITH(f.op.execute(*input, f.e.stream()),
+                        Catch::Matchers::ContainsSubstring("the decode removed rows"));
+    CHECK(f.stats.snapshot().cached_position_selections == 0);
+  }
+  SECTION("assembly failure keeps survivor and cast storage until checked retirement")
+  {
+    using scan::detail::read_checkpoint;
+    auto const point     = GENERATE(read_checkpoint::SUBSTITUTION, read_checkpoint::NORMALIZATION);
+    auto const fail_join = GENERATE(false, true);
+    CAPTURE(point, fail_join);
+    auto& gate = scan::detail::consumer_test_access::gate(*f.consumer);
+    std::unique_ptr<sirius::op::operator_data> failed_output;
+    {
+      scan::detail::read_retirement_test_hooks fault(point, fail_join);
+      if (fail_join) {
+        REQUIRE_THROWS_AS(failed_output = f.op.execute(*input, f.e.stream()),
+                          sirius::unjoined_gpu_work);
+        REQUIRE(fault.retained.has_value());
+        // The retained state answers only as the scan assembly's own type.
+        REQUIRE_FALSE(scan::detail::consumer_test_access::retained_cached_storage(fault));
+        auto const retained = scan::detail::scan_operator_test_access::retained_assembly(fault);
+        REQUIRE(retained);
+        auto const& storage = *retained;
+        REQUIRE(storage.output != nullptr);
+        REQUIRE(storage.positions != nullptr);
+        REQUIRE(storage.output->num_columns() == 2);
+        require_resident_values<std::int32_t>(
+          storage.positions->view(), cudf::type_id::INT32, {0, 3, 7});
+        auto const view = storage.output->view();
+        require_resident_values<std::uint64_t>(view.column(1), cudf::type_id::UINT64, {3, 6, 10});
+        // Normalization frees each cast source in stream order, so only the casts remain.
+        if (point == read_checkpoint::SUBSTITUTION) {
+          require_resident_values<std::int32_t>(view.column(0), cudf::type_id::INT32, {41, 29, 53});
+        } else {
+          require_resident_values<std::int64_t>(view.column(0), cudf::type_id::INT64, {41, 29, 53});
+        }
+      } else {
+        REQUIRE_THROWS_AS(failed_output = f.op.execute(*input, f.e.stream()), rmm::out_of_memory);
+        CHECK_FALSE(fault.retained.has_value());
+      }
+      REQUIRE(failed_output == nullptr);
+      REQUIRE(scan::detail::gate_test_access::needs_combined_sample(gate, f.channel->snapshot()));
+      REQUIRE_FALSE(scan::detail::gate_test_access::filter_keep_ratio(gate, {filter.get(), 0}, 1));
+      auto const counts = f.stats.snapshot();
+      CHECK(counts.cached_placements == 0);
+      CHECK(counts.cached_payload_bytes == 0);
+      CHECK(counts.cached_position_selections == 0);
+      CHECK_FALSE(f.op.total_source_output_bytes());
+      CHECK_FALSE(input->stolen_table_consumed);
+      auto original   = source->to_read_only();
+      auto const view = sirius::get_cudf_table_view(original);
+      REQUIRE(view.num_columns() == 3);
+      require_resident_values<std::int32_t>(
+        view.column(0), cudf::type_id::INT32, {41, 17, 83, 29, 61, 11, 97, 53});
+      require_resident_values<std::int32_t>(
+        view.column(1), cudf::type_id::INT32, {901, 302, 703, 404, 805, 106, 607, 208});
+    }
+    // The fault hook physically joined before retaining storage; retry after simulated failed
+    // completion is test-only.
+    input->prepare_for_processing(f.e.gpu_space, f.e.stream());
+    auto output         = f.op.execute(*input, f.e.stream());
+    auto const& scanned = dynamic_cast<scan::scan_output_operator_data const&>(*output);
+    REQUIRE(scanned.receipt().applied.size() == 1);
+    auto leases     = scanned.get_read_only_batches();
+    auto const view = sirius::get_cudf_table_view(leases.at(0));
+    REQUIRE(view.num_columns() == 2);
+    require_resident_values<std::int64_t>(view.column(0), cudf::type_id::INT64, {41, 29, 53});
+    require_resident_values<std::uint64_t>(view.column(1), cudf::type_id::UINT64, {3, 6, 10});
+    auto restored = sirius::late_mat::materialize_at_port(
+      port.port_directive(), view, f.e.stream(), f.e.gpu_space->get_default_allocator());
+    require_resident_values<std::int64_t>(
+      restored->view().column(1), cudf::type_id::INT64, {901, 404, 208});
+    auto const counts = f.stats.snapshot();
+    CHECK(counts.cached_placements == 1);
+    CHECK(counts.cached_position_selections == 1);
+  }
+  SECTION("first and last survivors restore distinct values after source destruction")
+  {
+    auto output = f.op.execute(*input, f.e.stream());
+    input.reset();
+    source.reset();
+    auto leases =
+      dynamic_cast<sirius::op::pipelineable_operator_data const&>(*output).get_read_only_batches();
+    auto view = sirius::get_cudf_table_view(leases.at(0));
+    REQUIRE(view.num_columns() == 2);
+    require_resident_values<std::int64_t>(view.column(0), cudf::type_id::INT64, {41, 29, 53});
+    require_resident_values<std::uint64_t>(view.column(1), cudf::type_id::UINT64, {3, 6, 10});
+    REQUIRE(sirius::late_mat::port_directive_matches(port.port_directive(), view));
+    auto restored = sirius::late_mat::materialize_at_port(
+      port.port_directive(), view, f.e.stream(), f.e.gpu_space->get_default_allocator());
+    REQUIRE(restored->num_columns() == 2);
+    require_resident_values<std::int64_t>(
+      restored->view().column(0), cudf::type_id::INT64, {41, 29, 53});
+    require_resident_values<std::int64_t>(
+      restored->view().column(1), cudf::type_id::INT64, {901, 404, 208});
+    auto counts = f.stats.snapshot();
+    CHECK(counts.cached_placements == 1);
+    CHECK(counts.cached_position_selections == 1);
+  }
+}
+
+TEST_CASE(
+  "cached Parquet assembly OOM preserves source and defers observations until retry succeeds",
+  "[scan_normalization][cached_scan][assembly_fault]")
+{
+  using scan::detail::read_checkpoint;
+  auto checkpoint = read_checkpoint::NORMALIZATION;
+  SECTION("normalization") {}
+  SECTION("batch construction") { checkpoint = read_checkpoint::BATCH; }
+  SECTION("payload construction") { checkpoint = read_checkpoint::PAYLOAD; }
+  resident_parquet_fixture f(resident_parquet_info({0}, 1), 1);
+  auto filter = f.publish(0, {41, 53});
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(resident_column<std::int32_t>({41, 29, 53}, cudf::type_id::INT32));
+  auto source = resident_columns(std::move(columns));
+  auto input  = f.split(source);
+  {
+    scan::detail::read_retirement_test_hooks fault(checkpoint);
+    REQUIRE_THROWS_AS(f.op.execute(*input, f.e.stream()), rmm::out_of_memory);
+  }
+  auto& gate = scan::detail::consumer_test_access::gate(*f.consumer);
+  REQUIRE(scan::detail::gate_test_access::needs_combined_sample(gate, f.channel->snapshot()));
+  REQUIRE_FALSE(scan::detail::gate_test_access::filter_keep_ratio(gate, {filter.get(), 0}, 1));
+  CHECK(f.stats.snapshot().cached_placements == 0);
+  {
+    auto lease = source->to_read_only();
+    require_resident_values<std::int32_t>(
+      sirius::get_cudf_table_view(lease).column(0), cudf::type_id::INT32, {41, 29, 53});
+  }
+  input->prepare_for_processing(f.e.gpu_space, f.e.stream());
+  auto output = f.op.execute(*input, f.e.stream());
+  auto leases =
+    dynamic_cast<sirius::op::pipelineable_operator_data const&>(*output).get_read_only_batches();
+  auto view = sirius::get_cudf_table_view(leases.at(0));
+  REQUIRE(view.num_columns() == 1);
+  require_resident_values<std::int64_t>(view.column(0), cudf::type_id::INT64, {41, 53});
+  auto const ratio = scan::detail::gate_test_access::filter_keep_ratio(gate, {filter.get(), 0}, 1);
+  REQUIRE(ratio);
+  CHECK(*ratio == Catch::Approx(2.0 / 3.0));
+  CHECK(f.stats.snapshot().cached_placements == 1);
+}
+
+TEST_CASE("cached Parquet restores narrowed DATE and decimal payload survivors with nulls",
+          "[scan_normalization][cached_scan][cached_carriers]")
+{
+  bool decimal = false;
+  SECTION("DATE restores epoch days from INT16") {}
+  SECTION("decimal restores DECIMAL32 without changing scale") { decimal = true; }
+  auto info               = resident_parquet_info({0, 1}, 2);
+  info->returned_types[1] = decimal ? sirius::logical_type::make_decimal(18, 2)
+                                    : sirius::logical_type::make(sirius::type_id::DATE);
+  auto const logical = decimal ? duckdb::LogicalType::DECIMAL(18, 2) : duckdb::LogicalType::DATE;
+  resident_parquet_fixture f(
+    std::move(info), duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::BIGINT, logical});
+  f.publish(0, {41, 53, 17});
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(resident_column<std::int32_t>({41, 29, 53, 17}, cudf::type_id::INT32));
+  if (decimal) {
+    std::vector<std::int32_t> const values{12345, -67890, 24680, -999};
+    auto payload = cudf::make_fixed_width_column(cudf::data_type{cudf::type_id::DECIMAL32, -2},
+                                                 static_cast<cudf::size_type>(values.size()),
+                                                 cudf::mask_state::ALL_VALID,
+                                                 f.e.stream(),
+                                                 f.e.gpu_space->get_default_allocator());
+    REQUIRE(cudaMemcpyAsync(payload->mutable_view().data<std::int32_t>(),
+                            values.data(),
+                            values.size() * sizeof(std::int32_t),
+                            cudaMemcpyHostToDevice,
+                            f.e.stream().get()) == cudaSuccess);
+    cudf::set_null_mask(payload->mutable_view().null_mask(), 2, 3, false, f.e.stream());
+    payload->set_null_count(1);
+    f.e.stream().sync();
+    columns.push_back(std::move(payload));
+  } else {
+    columns.push_back(
+      resident_column<std::int16_t>({-120, 730, 23000, -8000}, cudf::type_id::INT16, 2));
+  }
+  auto source = resident_columns(std::move(columns));
+  auto input  = f.split(source);
+  REQUIRE(input->needs_carrier_conversion);
+  REQUIRE_FALSE(input->stolen_table);
+  REQUIRE_FALSE(input->converted_table_steal_pending);
+  auto output = f.op.execute(*input, f.e.stream());
+  auto leases =
+    dynamic_cast<scan::scan_output_operator_data const&>(*output).get_read_only_batches();
+  auto const view = sirius::get_cudf_table_view(leases.at(0));
+  REQUIRE(view.num_columns() == 2);
+  require_resident_values<std::int64_t>(view.column(0), cudf::type_id::INT64, {41, 53, 17});
+  auto original            = source->to_read_only();
+  auto const original_view = sirius::get_cudf_table_view(original);
+  REQUIRE(original_view.num_columns() == 2);
+  require_resident_values<std::int32_t>(
+    original_view.column(0), cudf::type_id::INT32, {41, 29, 53, 17});
+  if (decimal) {
+    REQUIRE(view.column(1).type().scale() == -2);
+    require_resident_values<std::int64_t>(
+      view.column(1), cudf::type_id::DECIMAL64, {12345, 0, -999}, {1, 0, 1});
+    REQUIRE(original_view.column(1).type().scale() == -2);
+    require_resident_values<std::int32_t>(original_view.column(1),
+                                          cudf::type_id::DECIMAL32,
+                                          {12345, -67890, 24680, -999},
+                                          {1, 1, 0, 1});
+  } else {
+    require_resident_values<std::int32_t>(
+      view.column(1), cudf::type_id::TIMESTAMP_DAYS, {-120, 0, -8000}, {1, 0, 1});
+    require_resident_values<std::int16_t>(
+      original_view.column(1), cudf::type_id::INT16, {-120, 730, 23000, -8000}, {1, 1, 0, 1});
+  }
+  auto const counts = f.stats.snapshot();
+  CHECK(counts.cached_placements == 1);
+  CHECK(counts.cached_payload_bytes > 0);
+  CHECK(counts.cached_bypassed_transfer == 0);
 }
 
 TEST_CASE("scan forwards its pipeline expression policy to residual filtering",

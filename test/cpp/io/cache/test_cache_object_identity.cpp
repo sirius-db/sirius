@@ -600,12 +600,14 @@ TEST_CASE("cache identity retains a retired generation until a held fill release
   held_request old_fill;
   held_request new_fill;
   advise(*first, chunk_bytes);
-  REQUIRE(first->prefetch_async([&](bool) noexcept { first_completions.fetch_add(1); }) ==
-          sirius::io::prefetch_refusal::issued);
+  REQUIRE(first->prefetch_async([&](sirius::io::cache::prefetch_result) noexcept {
+    first_completions.fetch_add(1);
+  }) == sirius::io::prefetch_refusal::issued);
   old_fill.request = context->backend().take();
   REQUIRE(old_fill.request != nullptr);
   advise(*second, chunk_bytes);
-  REQUIRE(second->prefetch_async([&](bool ok) noexcept {
+  REQUIRE(second->prefetch_async([&](sirius::io::cache::prefetch_result result) noexcept {
+    bool const ok = result.ok;
     second_ok.store(ok);
     second_completions.fetch_add(1);
   }) == sirius::io::prefetch_refusal::issued);
@@ -867,12 +869,14 @@ TEST_CASE("cache identity publishes prefetch failure before notifying the consum
   auto observer     = std::make_shared<prefetch_observer>();
   auto completed    = observer->completed.get_future();
   auto const before = fixture.authorizer->gets.load();
-  REQUIRE(source->prefetch_async([observer, source](bool ok) noexcept {
-    std::exception_ptr failure = source->prefetch_failure();
-    if (observer->calls.fetch_add(1) == 0) {
-      observer->completed.set_value(prefetch_outcome{ok, std::move(failure)});
-    }
-  }) == sirius::io::prefetch_refusal::issued);
+  REQUIRE(
+    source->prefetch_async([observer, source](sirius::io::cache::prefetch_result result) noexcept {
+      bool const ok              = result.ok;
+      std::exception_ptr failure = source->prefetch_failure();
+      if (observer->calls.fetch_add(1) == 0) {
+        observer->completed.set_value(prefetch_outcome{ok, std::move(failure)});
+      }
+    }) == sirius::io::prefetch_refusal::issued);
   REQUIRE(completed.wait_for(5s) == std::future_status::ready);
   auto outcome = completed.get();
   CHECK_FALSE(outcome.ok);

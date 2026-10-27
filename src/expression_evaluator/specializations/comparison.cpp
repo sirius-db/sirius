@@ -23,6 +23,7 @@
 // cudf
 #include <cudf/ast/ast_operator.hpp>
 #include <cudf/binaryop.hpp>
+#include <cudf/column/column_factories.hpp>
 #include <cudf/scalar/scalar.hpp>
 
 // standard library
@@ -118,6 +119,11 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::comparison const& al
     evaluate_narrow_domain_operand(*alt.left, narrow_carrier, evaluation_mode::MATERIALIZE);
   auto right =
     evaluate_narrow_domain_operand(*alt.right, narrow_carrier, evaluation_mode::MATERIALIZE);
+  // cuDF has no scalar-scalar binary operation; broadcast one side when both are constants.
+  if (left.is_scalar() && right.is_scalar()) {
+    left = evaluate_result(
+      cudf::make_column_from_scalar(left.get_scalar(), _input_table.num_rows(), _stream, _mr));
+  }
   // Comparison ops always return BOOLEAN — no logical_type on the AST node, so use BOOL8 directly.
   auto const output_type = cudf::data_type{cudf::type_id::BOOL8};
   auto const binary_op   = comparison_op_to_binary(alt.op);

@@ -115,11 +115,19 @@ class numa_small_pinned_mr {
     if (it != pools_.end()) { it->second->deallocate(stream, ptr, bytes, alignment); }
   }
 
-  // PTDS, not the legacy default stream: the pool ignores the stream arg
-  // (free-list pop, no device work), so no synchronize is needed.
+  // Reused buffers may depend on work from another stream or device. CPU callers must
+  // not access the allocation until those dependencies have completed on PTDS.
   void* allocate_sync(std::size_t bytes, std::size_t alignment = alignof(std::max_align_t))
   {
-    return allocate(::cuda::stream_ref{cudaStreamPerThread}, bytes, alignment);
+    ::cuda::stream_ref stream{cudaStreamPerThread};
+    auto* ptr = allocate(stream, bytes, alignment);
+    try {
+      stream.sync();
+    } catch (...) {
+      deallocate(stream, ptr, bytes, alignment);
+      throw;
+    }
+    return ptr;
   }
 
   void deallocate_sync(void* ptr,

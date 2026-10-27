@@ -237,7 +237,7 @@ By execution time every equality-condition side is a plain column reference: a c
 
 Before physical lowering, catalog `NOT NULL` constraints can prove null-safe keys equivalent to ordinary equality for matching rows. Normalization changes all null-safe equality keys together only when every key has a proven non-null operand; it uses no data statistics and excludes MARK joins. This can admit ordinary equality dynamic filters without changing the join's matching behavior. See [dynamic-filter null handling](dynamic-filters.md#nulls).
 
-**Nullable mixed SEMI/ANTI residuals.** These joins, including RIGHT_SEMI/RIGHT_ANTI, retain equality-key hashing when a build residual contains NULL. `prepare_mixed_filter_build()` appends a non-null validity column for each nullable residual input to the build conditional table. This prevents cuDF 26.08 build deduplication from confusing NULL with a valid value having identical stored bytes when its conditional comparator uses the equality table's nullability. The flags preserve duplicate elimination for valid rows, do not change predicate column indices, and are excluded from the join output. Only residual conditions enter the AST; hash-key casts continue through normal key preparation.
+**Nullable mixed SEMI/ANTI residuals.** These joins, including RIGHT_SEMI/RIGHT_ANTI, retain equality-key hashing when a build residual contains NULL. cuDF 26.10 fixes mixed-join build deduplication when a conditional comparator uses the equality table's nullability. Only residual conditions enter the AST; hash-key casts continue through normal key preparation.
 
 **Broadcast small build tables.** On multi-GPU, a build side is a broadcast candidate when it is small (`< small_table_bytes`), or when it fits `max_broadcast_join_size` and the estimated probe-to-build ratio is at least `num_gpus * 1.25`; MARK joins are forced broadcast whenever `num_gpus > 1` (see [MARK joins](#mark-joins)). Instead of routing the whole build to one GPU, the join places one partition on each GPU (`partition_placement::one_per_device`, so `placement.num_partitions()` equals the GPU count) and PARTITION *replicates* the small build table to every slot (the `_broadcast` flag), so each GPU builds its own hash table and joins its local probe rows. The build sink deposits the build batch into every slot; the probe sink routes each batch to the slot placed on its current GPU (`partition_placement::first_partition_for_device`). Once the probe side finishes, any slot that received replicated build data but no probe rows is discarded (`discard_build_only_slots_if_probe_complete`). Right-family / mixed joins reject BUILD_PROBE and fall back to the normal partition count.
 
@@ -319,12 +319,24 @@ Without conditions it runs a cross product with `cudf::cross_join`. When it crea
 Conditional MARK joins produce the same three-valued mark as the hash join, via a two-semi-join scheme in its own `resolve_mark_join_result`: one `conditional_left_semi_join` on the predicate itself yields the *matched* set, and a second on `predicate IS NOT FALSE` — each comparison rewritten as `cᵢ OR IS_NULL(left) OR IS_NULL(right)` with Kleene `NULL_LOGICAL_OR` — yields the *maybe* set. A row's mark is true if matched, NULL if in the maybe set but not matched, false otherwise. Null-safe (`IS [NOT] DISTINCT FROM`) conjuncts skip the `IS_NULL` tainting since they are never NULL-valued; `distinct_from` is lowered as `NOT(NULL_EQUAL(l, r))`.
 
 ### `sirius_physical_union` — `UNION`
-**File:** `src/include/op/sirius_physical_union.hpp`
+**File:** `src/op/sirius_physical_union.hpp`
 
-`UNION ALL` only — bag concatenation, so the operator computes nothing and `execute` is the
-identity. N-ary: `a UNION ALL b UNION ALL c` binds to one `LogicalSetOperation`, so every path loops
-over `children`. Distinct `UNION`, `EXCEPT` and `INTERSECT` are rejected by the plan builder
-(`src/planner/sirius_plan_set_operation.cpp`), as is `allow_out_of_order = false`.
+Joins its arms' rows into one stream without inspecting them, so the operator computes nothing
+and `execute` is the identity. N-ary: every path loops over `children`.
+
+**How SQL reaches it.** SQL `UNION` and `UNION ALL` both plan a `LOGICAL_UNION`. They differ only
+in what DuckDB's binder puts around it. `UNION ALL` is the node alone, and
+`a UNION ALL b UNION ALL c` binds to one node with three children. `UNION` and `UNION BY NAME` are
+a `DISTINCT` over that same node, which Sirius lowers to a grouped aggregate.
+`create_plan(LogicalSetOperation&)` rejects `EXCEPT` and `INTERSECT`.
+
+The plan builder (`plan_union` in `src/planner/sirius_plan_set_operation.cpp`) sends two more
+shapes to the CPU. The first is `allow_out_of_order = false`, which requires output in arm order.
+The second is an arm that plans a column type other than the declared one, since arms are
+forwarded unconverted. The aggregate builder's HUGEINT→BIGINT narrowing
+(`planned_aggregate_type()`) is the one difference allowed. A `WITH RECURSIVE` body with no
+self-reference binds to `setop_all = false` with no `DISTINCT` above it, so `plan_union` puts the
+DISTINCT lowering's grouped aggregate over the union itself, keyed on every column.
 
 - **One port per arm.** `wrap_union` wraps each arm `child -> PASSTHROUGH_SINK`, feeding a distinct
   `"union_{i}"` port. The distinct names are required: `add_port` is last-writer-wins and the
@@ -472,10 +484,10 @@ without row-count metadata. Input preparation and allocation failures use the st
 partitioned task and executor OOM path.
 
 ### `sirius_physical_passthrough_sink` — `PASSTHROUGH_SINK`
-**File:** `src/include/op/sirius_physical_passthrough_sink.hpp`
+**File:** `src/op/sirius_physical_passthrough_sink.hpp`
 
 Terminates one arm of a `UNION`, forwarding every batch unchanged into the downstream `UNION`'s
-`"union_{i}"` port. It replaces the join arm's `PARTITION -> CONCAT` chain, which a bag union needs
+`"union_{i}"` port. It replaces the join arm's `PARTITION -> CONCAT` chain, which a union needs
 neither half of.
 
 - **Emits `pipelineable_operator_data`, not `partitioned_operator_data`.** With no partition and no
@@ -593,7 +605,7 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 | NESTED_LOOP_JOIN | Join | Fallback nested loops |
 | LEFT_DELIM_JOIN | Join | Correlated subquery wrapper |
 | RIGHT_DELIM_JOIN | Join | Correlated subquery wrapper |
-| UNION | Set op | `UNION ALL` only; N-ary identity fan-in, no data touched |
+| UNION | Set op | N-ary identity fan-in, no data touched; distinct `UNION` is a DISTINCT over it |
 | PARTITION | Pipeline | Hash/range partitioning |
 | BUILD_FILTER | Pipeline | Complete-build Bloom publication; forwards batches unchanged |
 | CONCAT | Pipeline | Partition reassembly |

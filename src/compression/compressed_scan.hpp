@@ -105,6 +105,10 @@ struct membership_probe {
   membership_probe_fn probe;
   std::uint8_t selectivity_rank = 255;
   std::uint64_t num_keys        = 0;
+  /// Echoed with this probe's own keep ratio
+  /// (@ref pushdown_outcome::membership_keep_observation::probes), so the caller can tell which
+  /// filter it measured.
+  std::size_t tag = 0;
 };
 
 /// One chunk's MVCC visibility mask: ceil(row_count / 32) packed words in cuDF bitmask
@@ -115,6 +119,18 @@ struct decode_visibility_mask {
   std::size_t row_count = 0;
 
   [[nodiscard]] bool has_mask() const noexcept { return words != nullptr; }
+};
+
+/// Whether a decode should report how many rows its join filters kept.
+///
+/// A scan asks while it is still deciding whether its join filters are worth applying, or which of
+/// them are. Measuring adds a few counting kernels to the decode, but no host synchronization.
+struct membership_measurement_request {
+  /// Report the keep ratios on @ref pushdown_outcome::membership_keep.
+  bool measure = false;
+  /// The membership probes are every dynamic filter the scan would otherwise apply after decode,
+  /// so a measurement covering every probe describes the whole set.
+  bool complete = false;
 };
 
 /// What one scan asks the decoder to do to one chunk.
@@ -150,6 +166,10 @@ struct pushdown_request {
   /// from (0 = none). Echoed back on the outcome so a scan that stopped using
   /// the request can reconsider when a tighter set arrives.
   std::uint64_t membership_generation = 0;
+
+  /// Whether the decode reports the @c membership probes' keep ratio. Replaced together with the
+  /// probes.
+  membership_measurement_request membership_measurement;
 
   /// True iff the @c range entries are the scan's WHOLE row-restricting
   /// filter. Only then can a chunk come back needing no filter at all; a
@@ -243,10 +263,44 @@ struct pushdown_outcome {
   /// residual filter is left to read them.
   bool filter_only_columns_dropped = false;
 
+  /// How many rows the join filters kept, for a request that asked
+  /// (@ref pushdown_request::membership_measurement). Empty when the decode evaluated none of
+  /// its join filters, for example because it declined the request.
+  struct membership_keep_observation {
+    /// @ref pushdown_request::membership_generation of the probes that ran.
+    std::uint64_t generation = 0;
+    /// Rows the probes were evaluated on: the chunk's rows that passed every other row source.
+    std::size_t rows_before = 0;
+    /// Rows among those that every probe that ran kept.
+    std::size_t rows_after = 0;
+    /// Every probe of a complete request ran
+    /// (@ref membership_measurement_request::complete), so the ratio covers the whole set.
+    bool complete = false;
+    /// One join filter's share of the measurement.
+    struct probe_keep {
+      /// @ref membership_probe::tag of the probe.
+      std::size_t tag = 0;
+      /// Rows the probe was evaluated on: those that passed every other row source and every
+      /// join filter that ran before it.
+      std::size_t rows_before = 0;
+      /// Rows among those that the probe kept.
+      std::size_t rows_after = 0;
+    };
+    /// Every probe that ran, in the order they ran.
+    std::vector<probe_keep> probes;
+  };
+  std::optional<membership_keep_observation> membership_keep;
+
+  /// The request carried join filters, but none of them removed rows from this batch: the decode
+  /// refused or declined them, or gave compaction up and returned every row. The batch is then
+  /// as unfiltered by them as one decoded without them.
+  bool membership_skipped = false;
+
   [[nodiscard]] bool any() const noexcept
   {
     return row_filtered || selection_unprofitable || !predicate_columns.empty() ||
-           visibility_mask_applied || filter_only_columns_dropped;
+           visibility_mask_applied || filter_only_columns_dropped || membership_keep.has_value() ||
+           membership_skipped;
   }
 };
 
@@ -278,9 +332,12 @@ class decompression_pushdown_scan {
   [[nodiscard]] std::shared_ptr<const decompression_pushdown_scan> without_row_selection() const;
 
   /// This scan with its join filters replaced by a fresher snapshot. @p probes
-  /// is parallel to the selected column list.
+  /// is parallel to the selected column list; @p measurement says whether the decode reports
+  /// their keep ratio.
   [[nodiscard]] std::shared_ptr<const decompression_pushdown_scan> with_membership_probes(
-    std::vector<std::vector<membership_probe>> probes, std::uint64_t generation) const;
+    std::vector<std::vector<membership_probe>> probes,
+    std::uint64_t generation,
+    membership_measurement_request measurement = {}) const;
 
   /// This scan narrowed to what @p chunk is worth asking: a column is only
   /// answered in place where its compression plan can resolve the predicate

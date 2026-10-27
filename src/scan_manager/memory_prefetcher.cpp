@@ -16,6 +16,7 @@
 
 #include "scan_manager/memory_prefetcher.hpp"
 
+#include "cuda/device_health.hpp"
 #include "data/data_batch_utils.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "log/logging.hpp"
@@ -108,9 +109,15 @@ void memory_prefetcher::stop()
   _workers.clear();
 }
 
+void memory_prefetcher::handle_error(std::exception_ptr error) noexcept
+{
+  if (_lifecycle.report_failure(error)) _running.store(false, std::memory_order_relaxed);
+}
+
 void memory_prefetcher::worker_loop()
 {
-  while (_running.load(std::memory_order_relaxed)) {
+  // Another query or worker can poison the shared runtime while this worker is idle.
+  while (_running.load(std::memory_order_relaxed) && !_lifecycle.runtime_failed()) {
     std::size_t converted = 0;
     try {
       auto* space = _gpu_spaces.front();
@@ -118,6 +125,7 @@ void memory_prefetcher::worker_loop()
       auto lease = sirius::memory::runtime_stream_pool::acquire(*space);
       converted  = sweep(lease.get(), space);
     } catch (const std::exception& e) {
+      handle_error(std::current_exception());
       SIRIUS_LOG_WARN("[memory_prefetcher] sweep error (backing off): {}", e.what());
     }
 
@@ -152,7 +160,9 @@ std::size_t memory_prefetcher::sweep(::cuda::stream_ref stream,
   // data lands on the GPU first.
   for (std::size_t ci = 0; ci < _connectors.size(); ++ci) {
     const auto& connector = _connectors[ci];
-    if (!_running.load(std::memory_order_relaxed)) { return converted; }
+    if (!_running.load(std::memory_order_relaxed) || _lifecycle.runtime_failed()) {
+      return converted;
+    }
 
     // Actively-draining connector: its scan tasks convert their own popped
     // batches on 1 stream per pipeline thread, so racing them near the pop
@@ -195,7 +205,9 @@ std::size_t memory_prefetcher::sweep(::cuda::stream_ref stream,
       // For a quiet connector, back off to tail-first within one batch of the
       // scan starting to drain it (the next sweep re-plans with the margin).
       if (!draining && connector->is_draining(_config.drain_quiet_ms)) { break; }
-      if (!_running.load(std::memory_order_relaxed)) { return converted; }
+      if (!_running.load(std::memory_order_relaxed) || _lifecycle.runtime_failed()) {
+        return converted;
+      }
 
       // Cheap pre-check under a shared lock; skip GPU-resident batches. Must
       // be NON-blocking: a sibling worker converting this batch holds its
@@ -260,6 +272,7 @@ std::size_t memory_prefetcher::sweep(::cuda::stream_ref stream,
                          mut->get_batch_id());
         return converted;
       } catch (const std::exception& e) {
+        handle_error(std::current_exception());
         // Conversion is more than data movement (compressed batches decode
         // here), so non-OOM failures are possible. Skip the batch: the scan
         // task converts it itself on the authoritative path and surfaces the

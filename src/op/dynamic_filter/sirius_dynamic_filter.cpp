@@ -14,9 +14,9 @@
  * limitations under the License.
  */
 
+#include "cudf/ast_compat.hpp"
 #include "memory/runtime_stream_pool.hpp"
 
-#include <cudf/ast/expressions.hpp>
 #include <cudf/fixed_point/fixed_point.hpp>
 #include <cudf/search.hpp>
 #include <cudf/utilities/traits.hpp>
