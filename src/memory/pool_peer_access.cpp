@@ -42,6 +42,7 @@ std::string request_context(int owner, int accessor)
                                    int owner,
                                    int accessor)
 {
+  (void)cudaGetLastError();
   throw cucascade::cuda_error(request_context(owner, accessor) + ": " + operation +
                               " failed with CUDA " + std::to_string(static_cast<int>(error)) +
                               " (" + cudaGetErrorName(error) + "): " + cudaGetErrorString(error));

@@ -125,6 +125,28 @@ TEST_CASE("pool permission outcomes distinguish unavailable capability from CUDA
   }
 }
 
+TEST_CASE("pool CUDA exceptions clear the last error and preserve the diagnostic",
+          "[pool_peer_access][cuda_error_state]")
+{
+  using sirius::memory::detail::interpret_pool_access_result;
+  (void)cudaGetLastError();
+  absl::Cleanup clear_error = [] { (void)cudaGetLastError(); };
+  auto const error          = cudaSetDevice(-1);
+  REQUIRE(error == cudaErrorInvalidDevice);
+  REQUIRE(cudaPeekAtLastError() == error);
+
+  try {
+    (void)interpret_pool_access_result(pool_peer_access_status::CUDA_ERROR, error, 0, 0);
+    FAIL("CUDA errors must propagate");
+  } catch (cucascade::cuda_error const& failure) {
+    std::string const message{failure.what()};
+    REQUIRE(message.find(std::to_string(static_cast<int>(error))) != std::string::npos);
+    REQUIRE(message.find(cudaGetErrorName(error)) != std::string::npos);
+    REQUIRE(message.find(cudaGetErrorString(error)) != std::string::npos);
+  }
+  REQUIRE(cudaPeekAtLastError() == cudaSuccess);
+}
+
 TEST_CASE("pool policy rejects invalid inputs and unknown allocation domains", "[pool_peer_access]")
 {
   auto manager     = sirius::test::operator_utils::initialize_memory_manager();
