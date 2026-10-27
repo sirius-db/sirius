@@ -321,25 +321,30 @@ TEST_CASE("prefetched_ranges refuses a wrong-device take", "[prefetched_ranges]"
     CHECK(log->releases.load() == 1);
     CHECK(log->reason.load() == static_cast<int>(prefetched_ranges::release_reason::wrong_device));
   }
+}
 
-  SECTION("current device differs from the buffers' device")
+TEST_CASE("prefetched_ranges refuses a take on a different current device",
+          "[prefetched_ranges][multi_gpu]")
+{
+  if (!sirius::test::has_gpus(2)) { return; }
+  // Ensure device 0 is current regardless of what a previous multi-GPU test left behind.
+  rmm::cuda_set_device_raii bind0{rmm::cuda_device_id{0}};
+  auto log   = std::make_shared<hook_log>();
+  auto pool1 = device_stream_pool::create(1, 1);
+  rmm::cuda_stream consumer;
   {
-    if (!sirius::test::has_gpus(2)) { return; }
-    auto pool1 = device_stream_pool::create(1, 1);
-    {
-      auto pr = [&] {
-        rmm::cuda_set_device_raii bind{rmm::cuda_device_id{1}};
-        return make_prefetch(1, pool1->acquire(), log);
-      }();
-      REQUIRE(pr->set_ready());
-      // This thread's current device is not 1: take() must not hand out buffers it would free on
-      // the wrong device.
-      CHECK_FALSE(pr->take(::cuda::stream_ref{consumer.value()}).has_value());
-      CHECK(pr->peek().empty());
-    }
-    CHECK(log->releases.load() == 1);
-    CHECK(log->reason.load() == static_cast<int>(prefetched_ranges::release_reason::wrong_device));
+    auto pr = [&] {
+      rmm::cuda_set_device_raii bind{rmm::cuda_device_id{1}};
+      return make_prefetch(1, pool1->acquire(), log);
+    }();
+    REQUIRE(pr->set_ready());
+    // This thread's current device is not 1: take() must not hand out buffers it would free on
+    // the wrong device.
+    CHECK_FALSE(pr->take(::cuda::stream_ref{consumer.value()}).has_value());
+    CHECK(pr->peek().empty());
   }
+  CHECK(log->releases.load() == 1);
+  CHECK(log->reason.load() == static_cast<int>(prefetched_ranges::release_reason::wrong_device));
 }
 
 // settle() is noexcept and builds the abandon error under a try/catch so an allocation failure
