@@ -416,11 +416,11 @@ void sirius_dynamic_zone_map_filter::replicate_to_devices(
         auto const target_mr     = target_space.get_default_allocator();
         replica->zones.reserve(_zones.size());
         for (auto const& zone : _zones) {
-          replica->zones.push_back(
-            {clone_scalar_to_device(
-               *zone.min, _source_device, source_stream, target_stream, target_mr),
-             clone_scalar_to_device(
-               *zone.max, _source_device, source_stream, target_stream, target_mr)});
+          auto& cloned = replica->zones.emplace_back();
+          cloned.min   = clone_scalar_to_device(
+            *zone.min, _source_device, source_stream, target_stream, target_mr);
+          cloned.max = clone_scalar_to_device(
+            *zone.max, _source_device, source_stream, target_stream, target_mr);
         }
         completing = true;
         CUCASCADE_CUDA_TRY(cudaStreamSynchronize(target_stream.get()));

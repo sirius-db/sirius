@@ -22,6 +22,7 @@
 
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/utilities/error.hpp>
+#include <cudf/utilities/pinned_memory.hpp>
 
 #include <rmm/cuda_device.hpp>
 #include <rmm/error.hpp>
@@ -113,6 +114,50 @@ class observed_replica_resource {
  private:
   ::cuda::mr::any_resource<::cuda::mr::device_accessible> upstream_;
   std::shared_ptr<replica_allocation_observer> fault_;
+};
+
+class observed_pinned_resource {
+ public:
+  explicit observed_pinned_resource(rmm::host_device_async_resource_ref upstream)
+    : upstream_{upstream}
+  {
+  }
+
+  std::function<void()> before;
+
+  void* allocate_sync(std::size_t bytes, std::size_t alignment = alignof(std::max_align_t))
+  {
+    if (before) { before(); }
+    return upstream_.allocate_sync(bytes, alignment);
+  }
+  void deallocate_sync(void* ptr,
+                       std::size_t bytes,
+                       std::size_t alignment = alignof(std::max_align_t)) noexcept
+  {
+    upstream_.deallocate_sync(ptr, bytes, alignment);
+  }
+  void* allocate(::cuda::stream_ref stream,
+                 std::size_t bytes,
+                 std::size_t alignment = alignof(std::max_align_t))
+  {
+    if (before) { before(); }
+    return upstream_.allocate(stream, bytes, alignment);
+  }
+  void deallocate(::cuda::stream_ref stream,
+                  void* ptr,
+                  std::size_t bytes,
+                  std::size_t alignment = alignof(std::max_align_t)) noexcept
+  {
+    upstream_.deallocate(stream, ptr, bytes, alignment);
+  }
+  friend void get_property(observed_pinned_resource const&, ::cuda::mr::device_accessible) noexcept
+  {
+  }
+  friend void get_property(observed_pinned_resource const&, ::cuda::mr::host_accessible) noexcept {}
+  bool operator==(observed_pinned_resource const& other) const noexcept { return this == &other; }
+
+ private:
+  rmm::host_device_async_resource_ref upstream_;
 };
 
 }  // namespace
@@ -320,6 +365,9 @@ TEST_CASE("zone-map replication skips allocation refusal but propagates CUDA fai
     }});
   auto spaces        = get_replica_spaces(*manager);
   auto const& source = spaces.front().get_gpu_space();
+  observed_pinned_resource pinned_mr{cudf::get_pinned_memory_resource()};
+  auto const previous_pinned_mr   = cudf::set_pinned_memory_resource(pinned_mr);
+  absl::Cleanup restore_pinned_mr = [&] { cudf::set_pinned_memory_resource(previous_pinned_mr); };
   rmm::cuda_set_device_raii device{rmm::cuda_device_id{0}};
   auto const stream = source.acquire_stream();
   std::vector<sirius::op::zone_map_entry> zones;
@@ -338,10 +386,15 @@ TEST_CASE("zone-map replication skips allocation refusal but propagates CUDA fai
                     cudaErrorInvalidValue,
                     0,
                     target_stream.get());
-    } else if (failure_mode != 2 && target_allocations == 3) {
-      if (failure_mode == 0) { throw rmm::out_of_memory{"later zone scalar refused"}; }
-      // libcudf constructors live in a shared library, so inject their error type through this
-      // allocator callback after an earlier scalar queued work.
+    } else if (failure_mode == 0 && target_allocations == 3) {
+      throw rmm::out_of_memory{"later zone scalar refused"};
+    }
+  };
+  pinned_mr.before = [&] {
+    if (failure_mode == 1 && target_allocations == 3) {
+      // reservation_aware_resource_adaptor converts upstream device allocator exceptions to
+      // cucascade_out_of_memory; inject cudf::cuda_error from the scalar bounce-buffer step after
+      // the third target device allocation is live and the first scalar has queued work.
       throw cudf::cuda_error{"injected target scalar constructor: cudaErrorInvalidValue",
                              cudaErrorInvalidValue};
     }
@@ -368,6 +421,7 @@ TEST_CASE("zone-map replication skips allocation refusal but propagates CUDA fai
   REQUIRE_FALSE(filter.is_available_on_device(1));
   REQUIRE(allocations->live_bytes.load() == 0);
   allocations->after = {};
+  pinned_mr.before   = {};
   fault.reset();
   filter.replicate_to_devices(spaces);
   REQUIRE(filter.is_available_on_device(1));
