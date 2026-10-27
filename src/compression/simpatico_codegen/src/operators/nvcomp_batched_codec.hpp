@@ -28,6 +28,7 @@
 #include <cuda_runtime.h>
 
 #include <nvcomp/shared_types.h>
+#include <nvcomp/version.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -38,6 +39,12 @@
 namespace simpatico {
 class decode_frame;
 namespace detail {
+
+#if NVCOMP_VER_MAJOR >= 6
+#define SIMPATICO_NVCOMP_GET_TEMP_SIZE(name, stream, ...) name(__VA_ARGS__, stream)
+#else
+#define SIMPATICO_NVCOMP_GET_TEMP_SIZE(name, stream, ...) name##Async(__VA_ARGS__)
+#endif
 
 // Chunk offsets within a frame (and per-chunk output slots) are aligned to this.
 inline constexpr std::size_t kFrameAlign = 256;
@@ -51,7 +58,8 @@ struct batched_codec_ops {
   std::function<nvcompStatus_t(std::size_t num_chunks,
                                std::size_t max_uncomp_chunk,
                                std::size_t* temp_bytes,
-                               std::size_t max_total_uncomp)>
+                               std::size_t max_total_uncomp,
+                               cudaStream_t stream)>
     compress_get_temp_size;
 
   std::function<nvcompStatus_t(std::size_t max_uncomp_chunk, std::size_t* max_out)>
@@ -72,7 +80,8 @@ struct batched_codec_ops {
   std::function<nvcompStatus_t(std::size_t num_chunks,
                                std::size_t max_uncomp_chunk,
                                std::size_t* temp_bytes,
-                               std::size_t max_total_uncomp)>
+                               std::size_t max_total_uncomp,
+                               cudaStream_t stream)>
     decompress_get_temp_size;
 
   std::function<nvcompStatus_t(void const* const* comp_ptrs,

@@ -59,12 +59,14 @@
 
 // rmm
 #include <rmm/device_buffer.hpp>
+#include <rmm/resource_ref.hpp>
 
 // standard library
 #include <algorithm>
 #include <cstddef>
 #include <limits>
 #include <optional>
+#include <ranges>
 #include <regex>
 #include <string>
 #include <tuple>
@@ -73,6 +75,31 @@
 
 namespace sirius {
 using evaluate_result = expression_evaluator::evaluate_result;
+
+namespace {
+
+// Whether a signed integer column holds its type's minimum, whose negation and abs overflow.
+// Synchronizes the stream.
+bool holds_signed_minimum(cudf::column_view const& column,
+                          ::cuda::stream_ref stream,
+                          rmm::device_async_resource_ref mr)
+{
+  if (!cudf::is_integral(column.type()) || cudf::is_unsigned(column.type()) || column.is_empty()) {
+    return false;
+  }
+  auto const lowest =
+    cudf::type_dispatcher(column.type(), [&]<typename T>() -> std::unique_ptr<cudf::scalar> {
+      if constexpr (std::is_integral_v<T> && std::is_signed_v<T>) {
+        return std::make_unique<cudf::numeric_scalar<T>>(
+          std::numeric_limits<T>::lowest(), true, stream, mr);
+      } else {
+        throw internal_exception("holds_signed_minimum needs a signed integer type");
+      }
+    });
+  return cudf::contains(column, *lowest, stream);
+}
+
+}  // namespace
 
 like_multiliteral_cache::entry_ptr const& expression_evaluator::get_or_classify_like(
   std::string_view pattern)
@@ -94,14 +121,12 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
   auto const resolved_id = alt.function();
   auto const& args       = alt.arguments();
 
-  // Disable AST mode when the output type is decimal — cuDF ASTs choke on
-  // intermediate decimal results currently.
-  // TODO: Remove this special-case once Sirius pins cuDF >= 26.10 (cuDF PR
-  // https://github.com/rapidsai/cudf/pull/21996 merged after the 26.08 cut,
-  // so the fix will ship in 26.10).
+  // Materialize every decimal function: cuDF AST does not enforce DuckDB's result width and scale.
+  // Standalone ASTs cannot implement DATE infinity and overflow checks.
   auto const date_operation = alt.date_operation();
   auto const skip_ast =
-    alt.return_type().id() == sirius::type_id::DECIMAL || date_operation.has_value();
+    alt.return_type().is_decimal() || date_operation.has_value() ||
+    std::ranges::any_of(args, [](auto const& arg) { return arg->return_type().is_decimal(); });
   auto const ast_supported = !skip_ast && std::find(supported_ast_functions.begin(),
                                                     supported_ast_functions.end(),
                                                     resolved_id) != supported_ast_functions.end();
@@ -153,9 +178,29 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
     }
     return materialize_as_ast_column(result.release_column());
   }
+
+  // libcudf may return a narrower numeric type than the SQL result (e.g. INT32 for length, INT16
+  // for month where DuckDB declares BIGINT). cuDF AST operators and constant IN-lists require the
+  // declared type.
+  auto result = evaluate_function_kernel(alt);
+  if (result.is_scalar()) { return result; }
+  auto const declared_type = sirius::require_cudf_type(alt.return_type());
+  auto const result_type   = result.get_column_view().type();
+  if (result_type == declared_type || !cudf::is_numeric(result_type) ||
+      !cudf::is_numeric(declared_type)) {
+    return result;
+  }
+  return evaluate_result(cudf::cast(result.get_column_view(), declared_type, _stream, _mr));
+}
+
+evaluate_result expression_evaluator::evaluate_function_kernel(
+  sirius::ast::function_call const& alt)
+{
+  auto const resolved_id = alt.function();
+  auto const& args       = alt.arguments();
   auto const output_type = sirius::require_cudf_type(alt.return_type());
 
-  if (date_operation.has_value()) {
+  if (auto const date_operation = alt.date_operation(); date_operation.has_value()) {
     auto left               = evaluate(*args[0], evaluation_mode::MATERIALIZE);
     auto right              = evaluate(*args[1], evaluation_mode::MATERIALIZE);
     auto as_transform_input = [&](evaluate_result& value) -> cudf::transform_input {
@@ -201,6 +246,21 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
   }
   if (resolved_id == function_id::mod) {
     return execute_numeric_binary_func(cudf::binary_operator::MOD);
+  }
+
+  //----------Negation----------//
+  if (resolved_id == function_id::negate) {
+    auto input = evaluate(*args[0], evaluation_mode::MATERIALIZE);
+    if (input.is_scalar()) {
+      input = evaluate_result(
+        cudf::make_column_from_scalar(input.get_scalar(), _input_table.num_rows(), _stream, _mr));
+    }
+    auto const column = input.get_column_view();
+    if (holds_signed_minimum(column, _stream, _mr)) {
+      throw invalid_input_exception("Overflow in negation of numeric value!");
+    }
+    return evaluate_result(
+      cudf::unary_operation(column, cudf::unary_operator::NEGATE, _stream, _mr));
   }
 
   //----------Substring Function----------//
@@ -462,26 +522,12 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
       input = evaluate_result(
         cudf::make_column_from_scalar(input.get_scalar(), _input_table.num_rows(), _stream, _mr));
     }
-    // In cuDF the absolute value of the smallest value of a signed integer type wraps to a negative
-    // value. DuckDB raises an overflow error, so we check for the smallest value of the type
-    // and throw manually here to match DuckDB.
+    // cuDF wraps abs of a signed minimum; fall back so DuckDB raises its overflow error.
     auto const column = input.get_column_view();
-    if (cudf::is_integral(column.type()) && !cudf::is_unsigned(column.type()) &&
-        column.size() > 0) {
-      auto const lowest =
-        cudf::type_dispatcher(column.type(), [&]<typename T>() -> std::unique_ptr<cudf::scalar> {
-          if constexpr (std::is_integral_v<T> && std::is_signed_v<T>) {
-            return std::make_unique<cudf::numeric_scalar<T>>(
-              std::numeric_limits<T>::lowest(), true, _stream, _mr);
-          } else {
-            throw internal_exception("abs overflow check needs a signed integer type");
-          }
-        });
-      if (cudf::contains(column, *lowest, _stream)) {
-        throw not_implemented_exception(
-          "[expression_evaluator:function] abs overflows for the smallest value of a signed "
-          "integer type, expected to fall back to CPU execution");
-      }
+    if (holds_signed_minimum(column, _stream, _mr)) {
+      throw not_implemented_exception(
+        "[expression_evaluator:function] abs overflows for the smallest value of a signed "
+        "integer type, expected to fall back to CPU execution");
     }
     return evaluate_result(cudf::unary_operation(column, cudf::unary_operator::ABS, _stream, _mr));
   }

@@ -45,6 +45,7 @@
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
 
+#include <cuda/stream>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -420,7 +421,8 @@ TEST_CASE("prefetch completing a subset retains the ticket for a demand-owned ch
 
   std::array<std::uint8_t, read_size> destination{};
   rmm::cuda_stream stream;
-  rmm::device_buffer device_destination(device_read ? read_size : 0, stream.view());
+  ::cuda::stream_ref const stream_ref{stream};
+  rmm::device_buffer device_destination(device_read ? read_size : 0, stream_ref);
   std::future<std::size_t> read;
   std::atomic<bool> first{true};
   readahead_query query(budget, 1);
@@ -441,7 +443,7 @@ TEST_CASE("prefetch completing a subset retains the ticket for a demand-owned ch
     query.update(split, readahead_query::stage::reading);
     read = device_read
              ? ds->device_read_async(
-                 0, read_size, static_cast<std::uint8_t*>(device_destination.data()), stream.view())
+                 0, read_size, static_cast<std::uint8_t*>(device_destination.data()), stream_ref)
              : ds->host_read_async(0, read_size, destination.data());
   });
   query.manager->start();

@@ -130,7 +130,7 @@ TEST_CASE("a pin that throws part way through pins nothing", "[scan_manager][cac
 }
 
 TEST_CASE("parquet tier pin caches complete footer evidence for every file",
-          "[scan_manager][cache][pin_parquet][r2a]")
+          "[scan_manager][cache][pin_parquet][metadata_retention]")
 {
   auto memory   = initialize_memory_manager(1);
   auto topology = single_gpu_index_for_pin();

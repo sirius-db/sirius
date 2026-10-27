@@ -60,10 +60,13 @@
 
 // standard library
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <memory>
 #include <numeric>
+#include <optional>
+#include <vector>
 
 using namespace cucascade;
 using namespace cucascade::memory;
@@ -1337,9 +1340,8 @@ TEMPLATE_TEST_CASE("evaluate arithmetic functions",
 }
 
 // ---------------------------------------------------------------------------
-// Decimal arithmetic (MATERIALIZE path — AST is disabled for decimal return
-// types pending cudf#21996, so all decimal function evaluation flows through
-// cudf::binary_operation on fixed_point columns/scalars).
+// Decimal functions materialize under all strategies. The AST strategies verify
+// that fallback preserves DuckDB decimal width and scale.
 // ---------------------------------------------------------------------------
 
 TEMPLATE_TEST_CASE("evaluate decimal arithmetic (DECIMAL64)",
@@ -1471,17 +1473,43 @@ TEMPLATE_TEST_CASE("evaluate decimal arithmetic (DECIMAL32)",
   REQUIRE(out0 == expected);
 }
 
+TEMPLATE_TEST_CASE(
+  "evaluate materialized decimal multiplication under all strategies after DuckDB width casts",
+  "[expression_evaluator][decimal]",
+  mat_strategy,
+  ast_interpret_strategy,
+  ast_jit_strategy)
+{
+  constexpr auto strategy = TestType::value;
+  auto* space             = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+
+  auto const input_type  = logical_type::make_decimal(9, 2);
+  auto const wider_input = logical_type::make_decimal(18, 2);
+  auto const result_type = logical_type::make_decimal(18, 4);
+  std::vector<int32_t> raw{5'000'000, 7'500'000};
+  auto input = make_decimal32_batch(*space, 2, raw);
+
+  std::vector<std::unique_ptr<ast_node>> children;
+  children.push_back(make_cast(make_ref_typed(0, input_type), wider_input, false));
+  children.push_back(make_cast(make_ref_typed(0, input_type), wider_input, false));
+  auto expr = make_func(sirius::function_id::mul, std::move(children), result_type);
+
+  auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, one(std::move(expr)), strategy);
+  REQUIRE(ov.num_columns() == 1);
+  REQUIRE(ov.column(0).type().id() == cudf::type_id::DECIMAL64);
+  REQUIRE(ov.column(0).type().scale() == -4);
+  REQUIRE(copy_column_to_host<int64_t>(ov.column(0)) ==
+          std::vector<int64_t>{25'000'000'000'000, 56'250'000'000'000});
+}
+
 TEMPLATE_TEST_CASE("evaluate nested decimal arithmetic (col + 1.00) * 2",
                    "[expression_evaluator][decimal]",
                    mat_strategy,
                    ast_interpret_strategy,
                    ast_jit_strategy)
 {
-  // Regression coverage: before disabling AST for decimal-returning functions,
-  // nested decimal arithmetic would feed intermediate fixed_point results into
-  // the cudf AST kernel and trip cudf#21996. With AST disabled for decimal
-  // return types, the inner `+` materializes via cudf::binary_operation and the
-  // outer `*` consumes the materialized column via another cudf::binary_operation.
+  // Nested DECIMAL64 functions also materialize under the AST strategies.
   constexpr auto strategy = TestType::value;
   auto* space             = get_default_gpu_space();
   REQUIRE(space != nullptr);
@@ -2219,6 +2247,39 @@ TEMPLATE_TEST_CASE("select COALESCE nested in predicate",
   auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(expr), strategy);
   REQUIRE(ov.num_rows() == 2);
   REQUIRE(copy_column_to_host<int32_t>(ov.column(0)) == std::vector<int32_t>{30, 50});
+}
+
+TEMPLATE_TEST_CASE("select COALESCE nested in predicate with a null-free first child",
+                   "[expression_evaluator]",
+                   mat_strategy,
+                   ast_interpret_strategy,
+                   ast_jit_strategy)
+{
+  constexpr auto strategy = TestType::value;
+  auto* space             = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+
+  // WHERE COALESCE(col0, 0) > 20 OR col0 < 0 with no nulls in col0. The OR lifts the tree past
+  // min_ast_size, so the comparison requests COALESCE in AST mode; COALESCE short-circuits on the
+  // reference and must still hand the AST a temp column.
+  std::vector<int32_t> values = {10, 20, 30, 40, 50};
+  std::vector<bool> valids    = {true, true, true, true, true};
+  auto input                  = make_int32_batch_with_nulls(*space, values, valids);
+
+  std::vector<std::unique_ptr<ast_node>> children;
+  children.push_back(make_ref(0));
+  children.push_back(make_int_const(0));
+  auto coalesce = make_coalesce(std::move(children), logical_type::make(type_id::INTEGER));
+
+  std::vector<std::unique_ptr<ast_node>> disjuncts;
+  disjuncts.push_back(
+    make_cmp(sirius::comparison_type::gt, std::move(coalesce), make_int_const(20)));
+  disjuncts.push_back(make_cmp(sirius::comparison_type::lt, make_ref(0), make_int_const(0)));
+  auto expr = make_conj(sirius::ast::conjunction::kind::op_or, std::move(disjuncts));
+
+  auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(expr), strategy);
+  REQUIRE(ov.num_rows() == 3);
+  REQUIRE(copy_column_to_host<int32_t>(ov.column(0)) == std::vector<int32_t>{30, 40, 50});
 }
 
 TEMPLATE_TEST_CASE("select respects null mask under plain comparison",
@@ -3295,6 +3356,92 @@ TEMPLATE_TEST_CASE("evaluate string case conversion",
     REQUIRE(result->view().column(0).type().id() == cudf::type_id::STRING);
   }
 }
+
+TEMPLATE_TEST_CASE("function results narrower than their SQL type compose inside an AST predicate",
+                   "[expression_evaluator][ast_operand_type]",
+                   mat_strategy,
+                   ast_interpret_strategy,
+                   ast_jit_strategy)
+{
+  constexpr auto strategy = TestType::value;
+  auto* space             = get_default_gpu_space();
+  auto mr                 = get_resource_ref(*space);
+  auto stream             = cudf::get_default_stream();
+  auto const bigint       = logical_type::make(type_id::BIGINT);
+  auto const varchar      = logical_type::make(type_id::VARCHAR);
+  auto const date         = logical_type::make(type_id::DATE);
+
+  // Columns: TINYINT, VARCHAR, DATE. libcudf returns INT32 for length/strlen and INT16 for month,
+  // while DuckDB declares BIGINT.
+  std::vector<int8_t> const tiny{5, 4, 2, 0};
+  std::vector<std::string> const strings{"apple", "kiwi", "fig", ""};
+  std::vector<int32_t> const days{0, 59, 365, 0};  // 1970-01, 1970-03, 1971-01, NULL
+  auto tiny_column = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT8}, tiny.size(), cudf::mask_state::UNALLOCATED, stream, mr);
+  REQUIRE(cudaMemcpy(tiny_column->mutable_view().data<int8_t>(),
+                     tiny.data(),
+                     tiny.size() * sizeof(int8_t),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  std::vector<std::unique_ptr<cudf::column>> rows;
+  std::vector<cudf::column_view> row_views;
+  for (auto const& s : strings) {
+    cudf::string_scalar scalar(s, true, stream, mr);
+    rows.push_back(cudf::make_column_from_scalar(scalar, 1, stream, mr));
+    row_views.push_back(rows.back()->view());
+  }
+  auto string_column = cudf::concatenate(row_views, stream, mr);
+  auto date_column   = cudf::make_fixed_width_column(cudf::data_type{cudf::type_id::TIMESTAMP_DAYS},
+                                                   days.size(),
+                                                   cudf::mask_state::ALL_VALID,
+                                                   stream,
+                                                   mr);
+  REQUIRE(cudaMemcpy(date_column->mutable_view().head<int32_t>(),
+                     days.data(),
+                     days.size() * sizeof(int32_t),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  cudf::set_null_mask(date_column->mutable_view().null_mask(), 3, 4, false, stream);
+  date_column->set_null_count(1);
+  cudf::table_view input({tiny_column->view(), string_column->view(), date_column->view()});
+
+  auto unary_func = [](sirius::function_id id, std::unique_ptr<ast_node> arg) {
+    std::vector<std::unique_ptr<ast_node>> args;
+    args.push_back(std::move(arg));
+    return make_func(id, std::move(args), logical_type::make(type_id::BIGINT));
+  };
+  auto select_first_column = [&](ast_node const& expr) {
+    sirius::expression_evaluator evaluator(
+      expr, mr, stream, sirius::expression_query_policy{strategy}, /*min_ast_size=*/1);
+    return copy_column_to_host<int8_t>(evaluator.select(input)->view().column(0));
+  };
+
+  SECTION("CAST(tinyint AS BIGINT) IS NOT DISTINCT FROM length(varchar)")
+  {
+    auto expr =
+      make_cmp(sirius::comparison_type::not_distinct_from,
+               make_cast(make_ref_typed(0, logical_type::make(type_id::TINYINT)), bigint, false),
+               unary_func(sirius::function_id::length, make_ref_typed(1, varchar)));
+    REQUIRE(select_first_column(*expr) == std::vector<int8_t>{5, 4, 0});
+  }
+  SECTION("BIGINT constant IS DISTINCT FROM strlen(varchar)")
+  {
+    auto expr = make_cmp(sirius::comparison_type::distinct_from,
+                         make_bigint_const(4),
+                         unary_func(sirius::function_id::strlen, make_ref_typed(1, varchar)));
+    REQUIRE(select_first_column(*expr) == std::vector<int8_t>{5, 2, 0});
+  }
+  SECTION("month(date) NOT IN BIGINT constants")
+  {
+    std::vector<std::unique_ptr<ast_node>> values;
+    values.push_back(make_bigint_const(3));
+    values.push_back(make_bigint_const(-380));
+    auto expr = make_in(unary_func(sirius::function_id::month, make_ref_typed(2, date)),
+                        std::move(values),
+                        /*negated=*/true);
+    // NOT IN over NULL is NULL, so the NULL date row is filtered.
+    REQUIRE(select_first_column(*expr) == std::vector<int8_t>{5, 2});
+  }
+}
+
 TEST_CASE("timestamp casts check microsecond overflow", "[expression_evaluator][timestamp_bounds]")
 {
   auto* space         = get_default_gpu_space();
@@ -3564,4 +3711,260 @@ TEST_CASE("DATE scalar broadcast preserves NULL and infinity semantics",
     CHECK(copy_column_to_host<int32_t>(output->view().column(0)) ==
           std::vector<int32_t>(3, infinity));
   }
+}
+
+namespace {
+
+// A fixed-width column of @p type whose rows are @p rows; std::nullopt is a NULL row whose payload
+// is @p null_payload, so a test can hide a value the evaluator must ignore beneath a NULL.
+template <typename Rep>
+std::unique_ptr<cudf::column> make_nullable_rep_column(memory_space& space,
+                                                       cudf::data_type type,
+                                                       std::vector<std::optional<Rep>> const& rows,
+                                                       Rep null_payload)
+{
+  auto stream = cudf::get_default_stream();
+  auto col    = cudf::make_fixed_width_column(type,
+                                           static_cast<cudf::size_type>(rows.size()),
+                                           cudf::mask_state::ALL_VALID,
+                                           stream,
+                                           get_resource_ref(space));
+  std::vector<Rep> payload;
+  cudf::size_type null_count = 0;
+  for (std::size_t i = 0; i < rows.size(); ++i) {
+    payload.push_back(rows[i].value_or(null_payload));
+    if (!rows[i]) {
+      auto const row = static_cast<cudf::size_type>(i);
+      cudf::set_null_mask(col->mutable_view().null_mask(), row, row + 1, false, stream);
+      ++null_count;
+    }
+  }
+  col->set_null_count(null_count);
+  REQUIRE(cudaMemcpy(col->mutable_view().head<Rep>(),
+                     payload.data(),
+                     payload.size() * sizeof(Rep),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  return col;
+}
+
+std::unique_ptr<sirius::ast::node> make_negate(std::unique_ptr<sirius::ast::node> operand,
+                                               sirius::logical_type type)
+{
+  std::vector<std::unique_ptr<sirius::ast::node>> args;
+  args.push_back(std::move(operand));
+  return make_func(sirius::function_id::negate, std::move(args), type);
+}
+
+// Negate a column of logical type @p type held in carrier rows @p rows, and check the payload and
+// validity of every row against DuckDB's -x. Each NULL row hides the carrier's minimum, which the
+// overflow check must ignore.
+template <typename Rep>
+void check_negation(memory_space& space,
+                    sirius::logical_type const& type,
+                    cudf::data_type carrier,
+                    std::vector<std::optional<Rep>> const& rows,
+                    exp_strategy_enum strategy)
+{
+  auto col  = make_nullable_rep_column<Rep>(space, carrier, rows, std::numeric_limits<Rep>::min());
+  auto expr = make_negate(make_ref_typed(0, type), type);
+  auto out  = run_native_ast(space, expr.get(), cudf::table_view{{col->view()}}, strategy);
+  auto const result = out->view().column(0);
+  REQUIRE(result.type() == sirius::get_cudf_type(type));
+  auto const valids = copy_valids_to_host(result);
+  REQUIRE(valids.size() == rows.size());
+  auto const check = [&]<typename Out>() {
+    auto const values = copy_column_to_host<Out>(result);
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+      CAPTURE(i);
+      REQUIRE(valids[i] == rows[i].has_value());
+      if (rows[i]) { REQUIRE(values[i] == -static_cast<Out>(*rows[i])); }
+    }
+  };
+  // A narrowed carrier is restored to the logical type's representation before negation.
+  if (cudf::size_of(result.type()) == sizeof(Rep)) {
+    check.template operator()<Rep>();
+  } else {
+    REQUIRE(result.type().id() == cudf::type_id::INT32);
+    check.template operator()<int32_t>();
+  }
+}
+
+}  // namespace
+
+TEST_CASE("negate matches DuckDB on signed integers and DECIMAL", "[expression_evaluator][negate]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto const strategy = GENERATE(MAT, exp_strategy_enum::AST_INTERPRET, exp_strategy_enum::AST_JIT);
+  CAPTURE(strategy);
+  SECTION("TINYINT")
+  {
+    check_negation<int8_t>(*space,
+                           logical_type::make(type_id::TINYINT),
+                           cudf::data_type{cudf::type_id::INT8},
+                           {5, -7, 127, -127, 0, std::nullopt},
+                           strategy);
+  }
+  SECTION("SMALLINT")
+  {
+    check_negation<int16_t>(*space,
+                            logical_type::make(type_id::SMALLINT),
+                            cudf::data_type{cudf::type_id::INT16},
+                            {5, -7, 32767, -32767, 0, std::nullopt},
+                            strategy);
+  }
+  SECTION("INTEGER")
+  {
+    check_negation<int32_t>(*space,
+                            logical_type::make(type_id::INTEGER),
+                            cudf::data_type{cudf::type_id::INT32},
+                            {5, -7, 2147483647, -2147483647, 0, std::nullopt},
+                            strategy);
+  }
+  SECTION("BIGINT")
+  {
+    auto const max = std::numeric_limits<int64_t>::max();
+    check_negation<int64_t>(*space,
+                            logical_type::make(type_id::BIGINT),
+                            cudf::data_type{cudf::type_id::INT64},
+                            {5, -7, max, -max, 0, std::nullopt},
+                            strategy);
+  }
+  SECTION("INTEGER on a narrowed INT8 carrier")
+  {
+    // -128 is the carrier's minimum, not the INTEGER's, so its negation fits.
+    check_negation<int8_t>(*space,
+                           logical_type::make(type_id::INTEGER),
+                           cudf::data_type{cudf::type_id::INT8},
+                           {-128, 127, 0, std::nullopt},
+                           strategy);
+  }
+  SECTION("DECIMAL32")
+  {
+    check_negation<int32_t>(*space,
+                            logical_type::make_decimal(9, 2),
+                            cudf::data_type{cudf::type_id::DECIMAL32, numeric::scale_type{-2}},
+                            {1234, -1, 999999999, -999999999, 0, std::nullopt},
+                            strategy);
+  }
+  SECTION("DECIMAL64")
+  {
+    check_negation<int64_t>(*space,
+                            logical_type::make_decimal(18, 4),
+                            cudf::data_type{cudf::type_id::DECIMAL64, numeric::scale_type{-4}},
+                            {1234, -1, 999999999999999999, -999999999999999999, 0, std::nullopt},
+                            strategy);
+  }
+  SECTION("DECIMAL128")
+  {
+    // 10^38 - 1, the largest DECIMAL(38, s) payload.
+    __int128_t const max38 =
+      static_cast<__int128_t>(10000000000000000000ULL) * 10000000000000000000ULL - 1;
+    check_negation<__int128_t>(*space,
+                               logical_type::make_decimal(38, 9),
+                               cudf::data_type{cudf::type_id::DECIMAL128, numeric::scale_type{-9}},
+                               {1234, -1, max38, -max38, 0, std::nullopt},
+                               strategy);
+  }
+}
+
+TEST_CASE("negate matches DuckDB on FLOAT and DOUBLE including signed zero",
+          "[expression_evaluator][negate]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto const strategy = GENERATE(MAT, exp_strategy_enum::AST_INTERPRET, exp_strategy_enum::AST_JIT);
+  CAPTURE(strategy);
+  auto const type                         = logical_type::make(type_id::DOUBLE);
+  std::vector<std::optional<double>> rows = {
+    2.5, -0.0, 0.0, std::numeric_limits<double>::infinity(), -1e300, std::nullopt};
+  auto col =
+    make_nullable_rep_column<double>(*space, cudf::data_type{cudf::type_id::FLOAT64}, rows, 0.0);
+  auto expr         = make_negate(make_ref_typed(0, type), type);
+  auto out          = run_native_ast(*space, expr.get(), cudf::table_view{{col->view()}}, strategy);
+  auto const values = copy_column_to_host<double>(out->view().column(0));
+  auto const valids = copy_valids_to_host(out->view().column(0));
+  for (std::size_t i = 0; i < rows.size(); ++i) {
+    CAPTURE(i);
+    REQUIRE(valids[i] == rows[i].has_value());
+    if (rows[i]) {
+      REQUIRE(values[i] == -*rows[i]);
+      REQUIRE(std::signbit(values[i]) != std::signbit(*rows[i]));
+    }
+  }
+
+  auto const float_type = logical_type::make(type_id::FLOAT);
+  auto float_col        = make_nullable_rep_column<float>(
+    *space, cudf::data_type{cudf::type_id::FLOAT32}, {1.5F, 0.0F, std::nullopt}, 0.0F);
+  auto float_expr = make_negate(make_ref_typed(0, float_type), float_type);
+  auto float_out =
+    run_native_ast(*space, float_expr.get(), cudf::table_view{{float_col->view()}}, strategy);
+  auto const float_values = copy_column_to_host<float>(float_out->view().column(0));
+  REQUIRE(float_values[0] == -1.5F);
+  REQUIRE(std::signbit(float_values[1]));
+}
+
+TEST_CASE("negate composes inside arithmetic and with itself", "[expression_evaluator][negate]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto const strategy = GENERATE(MAT, exp_strategy_enum::AST_INTERPRET, exp_strategy_enum::AST_JIT);
+  CAPTURE(strategy);
+  auto const integer = logical_type::make(type_id::INTEGER);
+  auto col           = make_nullable_rep_column<int32_t>(
+    *space, cudf::data_type{cudf::type_id::INT32}, {3, -4, 0, std::nullopt}, 0);
+  auto const input   = cudf::table_view{{col->view()}};
+  auto const leading = [](std::vector<int32_t> const& values) {
+    return std::vector<int32_t>(values.begin(), values.begin() + 3);
+  };
+
+  // -(x * 2) + 1: an AST tree with a negation breaker inside it.
+  std::vector<std::unique_ptr<sirius::ast::node>> mul_args;
+  mul_args.push_back(make_ref_typed(0, integer));
+  mul_args.push_back(make_int_const(2));
+  std::vector<std::unique_ptr<sirius::ast::node>> add_args;
+  add_args.push_back(
+    make_negate(make_func(sirius::function_id::mul, std::move(mul_args), integer), integer));
+  add_args.push_back(make_int_const(1));
+  auto shifted = make_func(sirius::function_id::add, std::move(add_args), integer);
+  auto out     = run_native_ast(*space, shifted.get(), input, strategy);
+  REQUIRE(leading(copy_column_to_host<int32_t>(out->view().column(0))) ==
+          std::vector<int32_t>{-5, 9, 1});
+  REQUIRE(copy_valids_to_host(out->view().column(0)) == std::vector<bool>{true, true, true, false});
+
+  // - -x
+  auto twice     = make_negate(make_negate(make_ref_typed(0, integer), integer), integer);
+  auto twice_out = run_native_ast(*space, twice.get(), input, strategy);
+  REQUIRE(leading(copy_column_to_host<int32_t>(twice_out->view().column(0))) ==
+          std::vector<int32_t>{3, -4, 0});
+
+  // A constant operand DuckDB did not fold broadcasts to every row.
+  auto constant     = make_negate(make_int_const(5), integer);
+  auto constant_out = run_native_ast(*space, constant.get(), input, strategy);
+  REQUIRE(copy_column_to_host<int32_t>(constant_out->view().column(0)) ==
+          std::vector<int32_t>(4, -5));
+}
+
+TEST_CASE("negate of a signed integer minimum raises like DuckDB", "[expression_evaluator][negate]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto const strategy = GENERATE(MAT, exp_strategy_enum::AST_INTERPRET, exp_strategy_enum::AST_JIT);
+  CAPTURE(strategy);
+  auto const run = [&]<typename Rep>(type_id type, cudf::type_id carrier) {
+    auto const logical = logical_type::make(type);
+    auto col =
+      make_nullable_rep_column<Rep>(*space,
+                                    cudf::data_type{carrier},
+                                    {Rep{1}, std::numeric_limits<Rep>::min(), std::nullopt},
+                                    Rep{0});
+    auto expr = make_negate(make_ref_typed(0, logical), logical);
+    REQUIRE_THROWS_WITH(
+      run_native_ast(*space, expr.get(), cudf::table_view{{col->view()}}, strategy),
+      Catch::Matchers::ContainsSubstring("Overflow in negation of numeric value!"));
+  };
+  run.template operator()<int8_t>(type_id::TINYINT, cudf::type_id::INT8);
+  run.template operator()<int16_t>(type_id::SMALLINT, cudf::type_id::INT16);
+  run.template operator()<int32_t>(type_id::INTEGER, cudf::type_id::INT32);
+  run.template operator()<int64_t>(type_id::BIGINT, cudf::type_id::INT64);
 }

@@ -109,6 +109,7 @@ class memory_prefetcher {
 
  private:
   void worker_loop();
+  void handle_error(std::exception_ptr error) noexcept;
 
   /// Attempt one sweep over all connectors; returns the number of batches converted.
   std::size_t sweep(::cuda::stream_ref stream, cucascade::memory::memory_space* gpu_space);

@@ -18,6 +18,7 @@
 #include "op/dynamic_filter/detail/accumulated_bloom_builder.hpp"
 #include "op/dynamic_filter/detail/accumulation_failure.hpp"
 #include "op/dynamic_filter/dynamic_filter_replica_reservation.hpp"
+#include "sirius/exception.hpp"
 #include "utils/host_allocation_fault.hpp"
 #include "utils/sirius_test_env.hpp"
 
@@ -64,8 +65,8 @@ static_assert(std::is_nothrow_constructible_v<op::detail::accumulation_cuda_erro
 static_assert(std::is_nothrow_copy_constructible_v<op::detail::accumulation_cuda_error>);
 static_assert(
   std::is_nothrow_constructible_v<op::detail::accumulation_invariant_error, char const*>);
-static_assert(std::is_nothrow_default_constructible_v<op::detail::unjoined_gpu_work>);
-static_assert(std::is_nothrow_copy_constructible_v<op::detail::unjoined_gpu_work>);
+static_assert(std::is_nothrow_default_constructible_v<sirius::unjoined_gpu_work>);
+static_assert(std::is_nothrow_copy_constructible_v<sirius::unjoined_gpu_work>);
 
 /**
  * @brief Bytes one GPU's partials occupy for @p keys keys over @p rows total rows.
@@ -872,7 +873,7 @@ TEST_CASE("each accumulation failure kind sets exactly its counters",
       throw op::detail::accumulation_cuda_error{cudaErrorIllegalAddress, false, "body"};
     } catch (...) {
       try {
-        std::throw_with_nested(op::detail::unjoined_gpu_work{});
+        std::throw_with_nested(sirius::unjoined_gpu_work{});
       } catch (...) {
         return std::current_exception();
       }
@@ -1694,11 +1695,11 @@ TEST_CASE("fatal accumulation diagnostics do not allocate during host OOM",
       try {
         throw std::bad_alloc{};
       } catch (...) {
-        if (unjoined) { std::throw_with_nested(op::detail::unjoined_gpu_work{}); }
+        if (unjoined) { std::throw_with_nested(sirius::unjoined_gpu_work{}); }
         std::throw_with_nested(
           op::detail::accumulation_cuda_error{cudaErrorIllegalAddress, false, "failure cleanup"});
       }
-    } catch (op::detail::unjoined_gpu_work const&) {
+    } catch (sirius::unjoined_gpu_work const&) {
       preserved = unjoined;
     } catch (op::detail::accumulation_cuda_error const& error) {
       preserved =

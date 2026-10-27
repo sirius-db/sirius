@@ -1293,7 +1293,7 @@ bool selection_validation_checks()
   auto const mr                   = rmm::mr::get_current_device_resource_ref();
   auto input                      = make_int32_table(1, 35, 91);
   // The fixture's default-stream upload must finish before the nonblocking decode stream reads it.
-  cudf::get_default_stream().synchronize();
+  ::cuda::stream_ref{cudf::get_default_stream()}.sync();
   auto compressed  = simpatico::compress_with_plan(input->view(), "input -> bitpack\n", stream, mr);
   auto const& tree = *compressed.columns[0].plan_tree;
   std::vector<std::uint32_t> words(kWordsPerChunk, 0);
@@ -1465,7 +1465,7 @@ bool decimal128_range_ballot_refused()
   ::cuda::stream_ref const stream = owned_stream;
   auto const mr                   = rmm::mr::get_current_device_resource_ref();
   auto input                      = make_decimal128_table(1, 3 * kChunk, 7);
-  cudf::get_default_stream().synchronize();
+  ::cuda::stream_ref{cudf::get_default_stream()}.sync();
   auto compressed  = simpatico::compress_with_plan(input->view(), "input -> bitpack\n", stream, mr);
   auto const& tree = *compressed.columns[0].plan_tree;
   auto const caps  = simpatico::probe_column(tree);

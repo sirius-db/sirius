@@ -26,6 +26,7 @@
 // pinned side is a cache_entry_info; the scan side is an ingestible_table_info.
 
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
+#include "op/scan/iceberg_gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 
@@ -42,6 +43,10 @@ using namespace sirius::op::scan;
 using sirius::scan_manager::cache_entry_info;
 
 namespace {
+
+struct vetoing_parquet_info final : parquet_ingestible_table_info {
+  bool allows_cached_rows() const override { return false; }
+};
 
 duckdb::vector<duckdb::ColumnIndex> make_ids(std::vector<duckdb::idx_t> const& storage_indices)
 {
@@ -165,6 +170,38 @@ TEST_CASE("cache_entry_info: parquet virtual columns always bypass a matching pi
   fill(scan, {"a.parquet"}, {0, filename});
 
   REQUIRE(scan.has_requested_user_virtual_columns());
+  REQUIRE(pinned.can_serve_with_columns(scan).empty());
+}
+
+TEST_CASE("cache_entry_info: adapter capability veto bypasses an otherwise matching pin",
+          "[scan][can_serve]")
+{
+  auto pinned = parquet_cache({"a.parquet"}, {0});
+  vetoing_parquet_info scan;
+  fill(scan, {"a.parquet"}, {0});
+  REQUIRE(pinned.can_serve_with_columns(scan).empty());
+}
+
+TEST_CASE("cache_entry_info: Iceberg field mapping bypasses a raw Parquet pin",
+          "[scan][can_serve][iceberg][field_mapping]")
+{
+  auto pinned = parquet_cache({"a.parquet"}, {0, 1});
+  iceberg_ingestible_table_info scan;
+  fill(static_cast<parquet_ingestible_table_info&>(scan), {"a.parquet"}, {0, 1});
+  scan.field_mapping_requirements =
+    std::vector<field_requirement>{{1, duckdb::LogicalType::INTEGER, {}, true}};
+
+  REQUIRE(pinned.can_serve_with_columns(scan).empty());
+}
+
+TEST_CASE("cache_entry_info: Iceberg schema semantics bypass a raw pin without a mapper",
+          "[scan][can_serve][iceberg][field_mapping]")
+{
+  auto pinned = parquet_cache({"a.parquet"}, {0});
+  iceberg_ingestible_table_info scan;
+  fill(static_cast<parquet_ingestible_table_info&>(scan), {"a.parquet"}, {0});
+  scan.physical_schema = iceberg_table_schema{{{"id", 1, "INTEGER"}}};
+
   REQUIRE(pinned.can_serve_with_columns(scan).empty());
 }
 

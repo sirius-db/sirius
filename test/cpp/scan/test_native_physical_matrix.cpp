@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-// R2a T4: RED_FEATURE after commit (d); producer subset required by commit (b).
 #include <catch.hpp>
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>

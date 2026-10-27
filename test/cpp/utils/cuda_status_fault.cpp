@@ -14,11 +14,15 @@
  * limitations under the License.
  */
 
-// Linked only into sirius_cuda_fault_test, together with --wrap for these calls.
+// Linked only into sirius_cuda_fault_test, together with the matching --wrap options.
 #include "utils/cuda_status_fault.hpp"
 
-#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <rmm/detail/error.hpp>
 
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/stream_pool.hpp>
+
+#include <atomic>
 #include <cstddef>
 #include <mutex>
 #include <optional>
@@ -26,6 +30,7 @@
 #include <utility>
 
 namespace {
+std::atomic<cudaError_t> acquisition_status{cudaSuccess};
 thread_local int armed_operation       = 0;
 thread_local cudaError_t armed_status  = cudaSuccess;
 thread_local std::size_t armed_skip    = 0;
@@ -63,7 +68,16 @@ scoped_cuda_status_fault::scoped_cuda_status_fault(operation op,
                                                    cudaError_t status,
                                                    std::size_t skip,
                                                    cudaStream_t matching_stream)
+  : operation_(op)
 {
+  REQUIRE(status != cudaSuccess);
+  if (op == acquire_stream) {
+    REQUIRE(skip == 0);
+    REQUIRE(matching_stream == nullptr);
+    auto expected = cudaSuccess;
+    REQUIRE(acquisition_status.compare_exchange_strong(expected, status));
+    return;
+  }
   if (armed_operation != 0) { throw std::logic_error("a CUDA status fault is already armed"); }
   armed_status    = status;
   armed_skip      = skip;
@@ -72,10 +86,18 @@ scoped_cuda_status_fault::scoped_cuda_status_fault(operation op,
 }
 scoped_cuda_status_fault::~scoped_cuda_status_fault()
 {
-  armed_operation = 0;
-  armed_stream    = nullptr;
+  if (operation_ == acquire_stream) {
+    acquisition_status.store(cudaSuccess);
+  } else {
+    armed_operation = 0;
+    armed_stream    = nullptr;
+  }
 }
-bool scoped_cuda_status_fault::consumed() { return armed_operation == 0; }
+bool scoped_cuda_status_fault::consumed()
+{
+  return operation_ == acquire_stream ? acquisition_status.load() == cudaSuccess
+                                      : armed_operation == 0;
+}
 
 scoped_cuda_transfer_observer::scoped_cuda_transfer_observer(
   cucascade::memory::fixed_size_host_memory_resource const& staging_resource)
@@ -277,3 +299,24 @@ extern "C" cudaError_t __wrap_cudaMemcpyBatchAsync(void** destinations,
                                      stream);
 }
 #endif
+
+// Wrap the out-of-line cuCascade acquisition boundary. RMM's constructor lives
+// in a shared library, so wrapping CUDA creation in this executable would not
+// intercept its calls. The wrapper produces the same typed RMM exception as
+// GROW failure, and never changes production code or the real CUDA context.
+using stream_pool = cucascade::memory::exclusive_stream_pool;
+extern "C" cucascade::memory::borrowed_stream
+real_stream_acquire(stream_pool*, stream_pool::stream_acquire_policy) asm(
+  "__real__ZN9cucascade6memory21exclusive_stream_pool14acquire_streamENS1_21stream_acquire_"
+  "policyE");
+extern "C" cucascade::memory::borrowed_stream
+wrap_stream_acquire(stream_pool*, stream_pool::stream_acquire_policy) asm(
+  "__wrap__ZN9cucascade6memory21exclusive_stream_pool14acquire_streamENS1_21stream_acquire_"
+  "policyE");
+extern "C" cucascade::memory::borrowed_stream wrap_stream_acquire(
+  stream_pool* pool, stream_pool::stream_acquire_policy policy)
+{
+  auto status = acquisition_status.exchange(cudaSuccess);
+  RMM_CUDA_TRY(status);
+  return real_stream_acquire(pool, policy);
+}

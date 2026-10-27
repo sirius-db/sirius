@@ -16,6 +16,7 @@
 
 // sirius
 #include <expression/ast/aggregate.hpp>
+#include <expression_evaluator/ast_supported_types.hpp>
 #include <expression_evaluator/gpu_expression_translator_internal.hpp>
 #include <log/logging.hpp>
 #include <sirius/exception.hpp>
@@ -330,38 +331,6 @@ gpu_expression_translator::translate_join_conditions(
   result.owned_literals = std::move(_literal_scalars);
   return result;
 }
-
-namespace {
-
-/// @brief Recover the SQL type identifier of an AST node, where it is carried.
-///
-/// Used by the function arm's decimal-propagation guard. Node kinds that carry
-/// a logical type (reference, constant, cast, function_call) return its id;
-/// alternatives without one return INVALID, treated as a non-DECIMAL sentinel
-/// by the caller. References must be included so that direct decimal-column
-/// arithmetic (e.g. col + col) trips the guard, matching the pre-AST translator
-/// which checked every function child's return_type.
-sirius::type_id node_logical_type_id(sirius::ast::node const& expr)
-{
-  return std::visit(
-    [](auto const& alt) -> sirius::type_id {
-      using T = std::decay_t<decltype(alt)>;
-      if constexpr (std::is_same_v<T, sirius::ast::reference>) {
-        return alt.return_type().id();
-      } else if constexpr (std::is_same_v<T, sirius::ast::constant>) {
-        return alt.return_type().id();
-      } else if constexpr (std::is_same_v<T, sirius::ast::cast>) {
-        return alt.target_type.id();
-      } else if constexpr (std::is_same_v<T, sirius::ast::function_call>) {
-        return alt.return_type().id();
-      } else {
-        return sirius::type_id::INVALID;
-      }
-    },
-    expr.v);
-}
-
-}  // namespace
 
 std::optional<expr_ref> gpu_expression_translator::add_expression(
   sirius::ast::node const& expr, cudf::ast::table_reference const table_src)
@@ -683,6 +652,21 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
 std::optional<expr_ref> gpu_expression_translator::add_expression(
   sirius::ast::unary_op const& alt, cudf::ast::table_reference const table_src)
 {
+  // DuckDB can represent SQL NOT IN as NOT(IN(...)). Fold enclosing NOTs into
+  // the list's polarity before translation so neither form negates Bloom probes.
+  if (alt.op == sirius::ast::unary_op::kind::op_not) {
+    auto const* child = alt.child.get();
+    bool negated      = true;
+    while (auto const* unary = std::get_if<sirius::ast::unary_op>(&child->v)) {
+      if (unary->op != sirius::ast::unary_op::kind::op_not) { break; }
+      negated = !negated;
+      child   = unary->child.get();
+    }
+    if (auto const* list = std::get_if<sirius::ast::in_list>(&child->v)) {
+      return add_in_list(*list, table_src, list->negated != negated);
+    }
+  }
+
   auto child_expr = add_expression(*alt.child, table_src);
   if (!child_expr) { return std::nullopt; }
 
@@ -720,33 +704,39 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
 std::optional<expr_ref> gpu_expression_translator::add_expression(
   sirius::ast::in_list const& alt, cudf::ast::table_reference const table_src)
 {
-  // IN expressions must have at least one comparator value.
-  if (alt.values.empty()) { return std::nullopt; }
+  return add_in_list(alt, table_src, alt.negated);
+}
 
-  // Translate the first comparison expression
-  auto test_expr = add_expression(*alt.probe, table_src);
-  if (!test_expr) { return std::nullopt; }
-  auto comparator_expr = add_expression(*alt.values[0], table_src);
-  if (!comparator_expr) { return std::nullopt; }
-  expr_ref comparison_expr = _ast_tree.emplace<cudf::ast::operation>(
-    cudf::ast::ast_operator::EQUAL, *test_expr, *comparator_expr);
+std::optional<expr_ref> gpu_expression_translator::add_in_list(
+  sirius::ast::in_list const& alt, cudf::ast::table_reference const table_src, bool negated)
+{
+  // Lower NOT IN as a conjunction of inequalities. Parquet Bloom filters answer
+  // whether a row group may contain a value; negating an OR of those answers can
+  // discard a mixed group that also contains values satisfying NOT IN (#2295).
+  // Kleene AND preserves SQL NULL semantics when a probe or list value is NULL.
+  using enum cudf::ast::ast_operator;
+  auto const comparison_op  = negated ? NOT_EQUAL : EQUAL;
+  auto const conjunction_op = negated ? NULL_LOGICAL_AND : NULL_LOGICAL_OR;
+  std::optional<expr_ref> result;
 
-  // Loop over values, building a Kleene OR tree of comparisons so a match is TRUE even when
-  // another comparison is NULL. Re-translate the probe each time to avoid shared AST subgraphs.
-  for (size_t i = 1; i < alt.values.size(); ++i) {
+  // Re-translate the probe each time to avoid shared AST subgraphs.
+  for (auto const& value : alt.values) {
     auto probe_expr = add_expression(*alt.probe, table_src);
     if (!probe_expr) { return std::nullopt; }
-    auto value_expr = add_expression(*alt.values[i], table_src);
+    auto value_expr = add_expression(*value, table_src);
     if (!value_expr) { return std::nullopt; }
 
-    expr_ref next_comparison_expr = _ast_tree.emplace<cudf::ast::operation>(
-      cudf::ast::ast_operator::EQUAL, *probe_expr, *value_expr);
-    comparison_expr = _ast_tree.emplace<cudf::ast::operation>(
-      cudf::ast::ast_operator::NULL_LOGICAL_OR, comparison_expr, next_comparison_expr);
+    expr_ref comparison_expr =
+      _ast_tree.emplace<cudf::ast::operation>(comparison_op, *probe_expr, *value_expr);
+    if (result) {
+      result = _ast_tree.emplace<cudf::ast::operation>(conjunction_op, *result, comparison_expr);
+    } else {
+      result = comparison_expr;
+    }
   }
 
-  if (!alt.negated) { return comparison_expr; }
-  return _ast_tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::NOT, comparison_expr);
+  // An empty list has no comparison to translate.
+  return result;
 }
 
 //===----------FUNCTION----------===//
@@ -756,16 +746,12 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
   // Standalone ASTs cannot implement DATE infinity and overflow checks.
   if (alt.date_operation().has_value()) { return std::nullopt; }
 
-  // cuDF AST only supports numeric binary functions. We must also disable any
-  // operation that propagates decimal types up the expression tree, pending the
-  // cuDF fix: https://github.com/rapidsai/cudf/pull/21996. Unsupported functions
-  // fall through to the default arm below, so checking decimal propagation once
-  // up front (rather than per supported case) is equivalent.
-  if (std::ranges::any_of(alt.arguments(), [](auto const& arg) {
-        return node_logical_type_id(*arg) == sirius::type_id::DECIMAL;
-      })) {
-    SIRIUS_LOG_DEBUG(
-      "[expression_translator] Blocking function because it propagates decimal types");
+  // Materialize every decimal function: cuDF AST does not enforce DuckDB's result width and scale.
+  // Unsupported functions fall through to the default arm below.
+  if (std::ranges::any_of(alt.arguments(),
+                          [](auto const& arg) { return arg->return_type().is_decimal(); }) ||
+      alt.return_type().is_decimal()) {
+    SIRIUS_LOG_DEBUG("[expression_translator] Blocking decimal function from AST");
     return std::nullopt;
   }
 

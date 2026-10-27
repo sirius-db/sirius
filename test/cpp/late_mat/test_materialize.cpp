@@ -35,6 +35,7 @@
 #include <cudf/null_mask.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/types.hpp>
+#include <cudf/utilities/bit.hpp>
 
 #include <rmm/cuda_device.hpp>
 #include <rmm/device_buffer.hpp>
@@ -570,6 +571,57 @@ TEST_CASE("a batch pinned on another GPU is gathered there and comes back in the
     expected_strings.push_back(std::to_string(id));
   }
   REQUIRE(read_back_strings(strings->view()) == expected_strings);
+}
+
+TEST_CASE("a remote nullable batch preserves mask words through the final partial word",
+          "[late_mat][materialize][multi_gpu]")
+{
+  if (!sirius::test::has_gpus(2)) { return; }
+  auto mgr     = sirius::test::operator_utils::initialize_memory_manager(2);
+  auto* space0 = mgr->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  auto* space1 = mgr->get_memory_space(cucascade::memory::Tier::GPU, 1);
+  REQUIRE(space0 != nullptr);
+  REQUIRE(space1 != nullptr);
+
+  constexpr cudf::size_type num_rows = 4097;
+  spread_pin pin({{num_rows, space1}});
+  {
+    rmm::cuda_set_device_raii const owner_guard{rmm::cuda_device_id{1}};
+    auto const owner_stream = space1->acquire_stream();
+    auto mask               = cudf::create_null_mask(
+      num_rows, cudf::mask_state::ALL_VALID, owner_stream, space1->get_default_allocator());
+    for (auto const row : {0, 2050, num_rows - 1}) {
+      cudf::set_null_mask(
+        reinterpret_cast<cudf::bitmask_type*>(mask.data()), row, row + 1, false, owner_stream);
+    }
+    pin.batches[0].ints->set_null_mask(std::move(mask), 3);
+    owner_stream.sync();
+    pin.ints.batches[0].uncompressed = pin.batches[0].ints->view();
+  }
+
+  rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{0}};
+  auto const stream = space0->acquire_stream();
+  std::vector<std::uint64_t> ids(num_rows);
+  std::iota(ids.begin(), ids.end(), std::uint64_t{0});
+  auto d_ids        = upload_ids(ids, stream);
+  auto const layout = pinned_table_layout::from_batch_rows({num_rows});
+  prepared_selection const prepared(
+    layout, row_id_list{static_cast<std::uint64_t const*>(d_ids.data()), num_rows, true});
+  auto const before = sirius::late_mat::remote_batches_materialized();
+  auto out          = materialize(pin.ints, prepared, stream, space0->get_default_allocator());
+  stream.sync();
+  REQUIRE(sirius::late_mat::remote_batches_materialized() == before + 1);
+  REQUIRE(out->size() == num_rows);
+  REQUIRE(out->null_count() == 3);
+
+  std::vector<cudf::bitmask_type> mask(cudf::num_bitmask_words(num_rows));
+  REQUIRE(cudaMemcpy(mask.data(),
+                     out->view().null_mask(),
+                     mask.size() * sizeof(cudf::bitmask_type),
+                     cudaMemcpyDeviceToHost) == cudaSuccess);
+  for (cudf::size_type row = 0; row < num_rows; ++row) {
+    REQUIRE(cudf::bit_is_set(mask.data(), row) == (row != 0 && row != 2050 && row != num_rows - 1));
+  }
 }
 
 TEST_CASE("a remote gather that fails mid-transfer frees nothing a queued copy still reads",

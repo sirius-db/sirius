@@ -15,16 +15,19 @@
  */
 
 #pragma once
+#include "cudf/ast_compat.hpp"
+#include "expression_evaluator/query_policy.hpp"
 
-#include <cudf/ast/expressions.hpp>
 #include <cudf/table/table.hpp>
 
 #include <cuda/stream>
 
 #include <cucascade/data/data_batch.hpp>
+#include <expression_evaluator/like_multiliteral.hpp>
 #include <op/dynamic_filter/dynamic_filter_stats.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/dynamic_filter_gate.hpp>
+#include <op/scan/gpu_ingestible_types.hpp>
 #include <op/scan/scan_plan.hpp>
 
 #include <atomic>
@@ -123,6 +126,9 @@ struct application_input {
   std::optional<std::size_t> input_bytes = std::nullopt;
   batch_receipt const* prior             = nullptr;
   int device_id                          = -1;
+  /// A selected program takes ownership of this layout's residual; a declined attempt leaves it.
+  cached_view_layout* cached_layout = nullptr;
+  bool want_row_positions           = false;
 };
 
 struct consumer_config {
@@ -130,8 +136,12 @@ struct consumer_config {
   double keep_threshold          = dynamic_filter_gate::k_default_keep_threshold;
   std::optional<detail::compaction_strategy> strategy_override = std::nullopt;
   bool force_counts                                            = false;
-  bool validate_deferred_selection                             = false;
-  /// Receives `dynamic_filter_counters::applications_skipped_other_device`; null counts nothing.
+  /// Lets `sirius_gpu_scan_operator` filter borrowed resident batches before their payload is
+  /// copied. An internal ablation for tests and measurements, not a user setting.
+  bool cached_placement            = true;
+  bool validate_deferred_selection = false;
+  /// Receives `dynamic_filter_counters::applications_skipped_other_device` and the `cached_*`
+  /// counters `dynamic_filter_consumer::record_placement` adds; null counts nothing.
   sirius::op::dynamic_filter_stats* stats = nullptr;
 };
 
@@ -156,12 +166,21 @@ struct decode_selection {
   std::shared_ptr<sirius::op::sirius_dynamic_filter_set const> endpoint;
   std::size_t generation = 0;
   std::vector<decode_step> steps;  ///< The preferred probe order for this decode request.
+  /// The consumer has not yet decided whether these filters are worth applying, or lacks a current
+  /// keep ratio for one of them, so the decode should report what they kept, together and one by
+  /// one (`dynamic_filter_consumer::record_decode_keep_ratio` and
+  /// `dynamic_filter_consumer::record_decode_filter_keep_ratio`).
+  bool measure = false;
+  /// The steps cover every filter of the snapshot, so a measurement that covers every step
+  /// describes them all.
+  bool complete = false;
 };
 
 namespace detail {
 struct application_program_state;
 struct application_result_state;
 struct consumer_test_access;
+struct read_retirement_test_hooks;
 enum class execution_fault {
   NONE,
   AFTER_COUNTS_COPY,
@@ -202,9 +221,10 @@ class application_program {
  * @brief Owns completed output of a dynamic filter application and uncommitted observations
  *
  * The result of `dynamic_filter_consumer::apply`. Destruction does not train the gate. The result
- * holds no GPU scratch or source lease: it keeps only the output, the program's decisions and the
- * facts `dynamic_filter_consumer::commit` and `dynamic_filter_consumer::finish` need. Taking output
- * leaves those facts in place. The accessors return empty values for a moved-from result.
+ * releases GPU scratch after retirement, retaining an unchanged cached source or selected output
+ * and positions, the program's decisions and the facts `dynamic_filter_consumer::commit` and
+ * `dynamic_filter_consumer::finish` need. Taking output leaves those facts in place. The accessors
+ * return empty values for a moved-from result.
  */
 class application_result {
  public:
@@ -215,9 +235,21 @@ class application_result {
   application_result& operator=(application_result const&) = delete;
 
   [[nodiscard]] std::unique_ptr<cudf::table> take_output() noexcept;
+  [[nodiscard]] std::unique_ptr<cudf::column> take_row_positions() noexcept;
+  [[nodiscard]] owning_table_view take_source() noexcept;
   [[nodiscard]] std::span<cudf::size_type const> prefix_counts() const noexcept;
   [[nodiscard]] bool counts_read_back() const noexcept;
   [[nodiscard]] std::optional<detail::compaction_strategy> strategy() const noexcept;
+  /**
+   * @brief Whether the program ran; false when the batch passed through unfiltered because it is
+   * on another device (see `dynamic_filter_consumer::apply`)
+   */
+  [[nodiscard]] bool completed() const noexcept;
+  /**
+   * @brief How many of the program's filter steps produced a mask; zero when every probe declined
+   * or the program did not run
+   */
+  [[nodiscard]] std::size_t contributing_steps() const noexcept;
 
  private:
   friend class dynamic_filter_consumer;
@@ -245,10 +277,15 @@ class dynamic_filter_consumer {
   explicit dynamic_filter_consumer(std::shared_ptr<sirius::op::sirius_dynamic_filter_set> channel,
                                    consumer_config config,
                                    std::vector<binding> decode_bindings);
+
   [[nodiscard]] std::shared_ptr<sirius::op::sirius_dynamic_filter_set> const& channel()
     const noexcept;
 
   [[nodiscard]] std::span<binding const> decode_bindings() const noexcept;
+
+  [[nodiscard]] bool cached_placement_enabled() const noexcept { return _config.cached_placement; }
+
+  void record_placement(sirius::op::dynamic_filter_stats_snapshot const& outcome) const noexcept;
 
   /**
    * @brief Selects the appropriate filter bindings for decoding.
@@ -256,8 +293,41 @@ class dynamic_filter_consumer {
    * Steps are ordered by measured keep ratio. Filters with equal or unknown ratios follow the
    * `sirius::membership_probe` static signal (small IN-list, hash IN-list, then Bloom; fewer build
    * keys first), then snapshot order.
+   *
+   * Before the consumer has measured whether its filters are selective, it optimistically selects
+   * them and asks the decode to measure them (`decode_selection::measure`). The selection is empty
+   * once the filters have proven unselective, and also while the consumer waits for a clean
+   * batch at the endpoint because a decode measured only part of them as unselective. Filters
+   * whose own measured keep ratio is too weak are left out.
    */
   [[nodiscard]] decode_selection select_for_decode(std::span<binding const> bindings) const;
+
+  /**
+   * @brief Reports what the filters of a measuring decode selection kept.
+   *
+   * @param rows_before Rows the filters were evaluated on
+   * @param rows_after Rows that every filter which ran kept
+   * @param generation `decode_selection::generation` of the selection
+   * @param complete Every filter of a complete selection (`decode_selection::complete`) ran
+   */
+  void record_decode_keep_ratio(std::size_t rows_before,
+                                std::size_t rows_after,
+                                std::size_t generation,
+                                bool complete) noexcept;
+
+  /**
+   * @brief Reports what one filter of a measuring decode selection kept, as the endpoint reports
+   * a sampled filter's marginal keep ratio.
+   *
+   * @param filter The representative binding of the filter's `decode_step`
+   * @param rows_before Rows the filter was evaluated on, those that every earlier filter kept
+   * @param rows_after Rows among those that the filter kept
+   * @param generation `decode_selection::generation` of the selection
+   */
+  void record_decode_filter_keep_ratio(applied_entry const& filter,
+                                       std::size_t rows_before,
+                                       std::size_t rows_after,
+                                       std::size_t generation) noexcept;
 
   /**
    * @brief Capture available filters and policy decisions for this attempt in an application
@@ -283,13 +353,28 @@ class dynamic_filter_consumer {
    * in @p stream order, and scratch and @p source are released before returning. If execution
    * throws after submitting work, the call first waits for that work while still holding @p source.
    *
-   * @throws sirius::op::detail::unjoined_gpu_work if that wait fails; the storage the work may
+   * @throws sirius::unjoined_gpu_work if that wait fails; the storage the work may
    * still read is then deliberately leaked
    */
   [[nodiscard]] application_result apply(application_program&& program,
                                          cucascade::read_only_data_batch source,
                                          ::cuda::stream_ref stream,
                                          rmm::device_async_resource_ref mr) const;
+
+  /**
+   * @brief Applies a cached program while retaining its source lease through submitted reads.
+   *
+   * Selected positions address the original source rows. An all-declined result without a residual
+   * returns its unchanged lease through `application_result::take_source`.
+   */
+  [[nodiscard]] application_result apply(
+    application_program&& program,
+    owning_table_view source,
+    ::cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr,
+    bool like_swar_fastpath                                           = false,
+    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache = nullptr,
+    expression_query_policy policy                                    = {}) const;
 
   /**
    * @brief Commits optional hints without producing a receipt.
@@ -304,6 +389,10 @@ class dynamic_filter_consumer {
    * Call once per application result, after all output batches and the enclosing payload for the
    * current operator invocation have been constructed. The receipt fills capacity reserved by
    * `prepare`, so this allocates nothing.
+   *
+   * The receipt extends the matching-endpoint `application_input::prior` the program was prepared
+   * with. A result that passed through unfiltered (see `apply`) adds no coverage, so its receipt
+   * keeps that prior history unchanged.
    */
   [[nodiscard]] batch_receipt finish(application_result&& result,
                                      std::uint64_t original_batch_id) noexcept;
@@ -377,13 +466,17 @@ struct retained_storage {
  * of a few seconds, so a test can observe what the returned result leaves pending;
  * `stalled_stream_timed_out` reports whether the deadline released it, which happens only when
  * something waits for the stream before the test releases it. `retained` permits inspecting owners
- * before safe destruction. The table overload accepts an optional view backed by `source`, allowing
+ * before safe destruction, as does `retained_cached_storage` for a result that
+ * `read_retirement_test_hooks` retained; it is empty when those hooks retained nothing or another
+ * kind of state. The table overload accepts an optional view backed by `source`, allowing
  * sliced-input tests without copying away column offsets. Production does not inject failures or
  * recover retained storage.
  */
 struct consumer_test_access {
   static dynamic_filter_gate& gate(dynamic_filter_consumer& consumer) noexcept;
   static retained_storage storage(application_result const& result) noexcept;
+  static std::optional<retained_storage> retained_cached_storage(
+    read_retirement_test_hooks const& hooks) noexcept;
   static void release_stalled_streams() noexcept;
   [[nodiscard]] static bool stalled_stream_timed_out() noexcept;
   static application_result apply(dynamic_filter_consumer const& consumer,
