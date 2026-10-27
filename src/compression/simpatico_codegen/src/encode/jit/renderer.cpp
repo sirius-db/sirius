@@ -253,7 +253,8 @@ class Walker {
   std::string dtype_;
   std::int32_t num_chunks_;
   EncodeRenderMode mode_;
-  // measure and pack follow one Bitpack's metadata from one launch to the next.
+  // measure and pack carry each Bitpack's metadata from one launch to the next, which
+  // only the trees listed on EncodeRenderMode support.
   void require_full_mode(char const* op) const
   {
     if (mode_ != EncodeRenderMode::full) {
@@ -326,10 +327,12 @@ class Walker {
     spec.buffers      = std::move(buffers_);
     spec.block_x      = 128;  // uniform block=128 (fused TBSize)
     spec.shared_bytes = static_cast<std::int32_t>(sm_.peak_bytes());
-    spec.note =
-      "walker-rendered, OverAllocate; "
-      "dynamic-shared workspace = " +
-      std::to_string(sm_.peak_bytes()) + " bytes";
+
+    char const* layout = mode_ == EncodeRenderMode::full      ? "OverAllocate"
+                         : mode_ == EncodeRenderMode::measure ? "measure"
+                                                              : "pack";
+    spec.note          = std::string("walker-rendered, ") + layout +
+                "; dynamic-shared workspace = " + std::to_string(sm_.peak_bytes()) + " bytes";
     return spec;
   }
 
@@ -1004,7 +1007,8 @@ void Walker::emit_zigzag(const ::codegen::jit::FusedTree& node, LaneInput in)
 // chain of transformers preceded it (Delta, FOR, ...) has rewritten
 // LaneInput.read_expr into a single C++ expression for "lane T's
 // residual-input value"; we consume it here, run the reductions, and
-// write the OverAllocate packed output.  Tail codecs (bitcomp/ANS)
+// write the packed output: OverAllocate slots in full mode, dense at
+// bp_offsets in pack mode, nothing in measure mode.  Tail codecs (bitcomp/ANS)
 // attach downstream to the `packed_<id>` channel.
 //
 // The kernel work per chunk:
@@ -1050,7 +1054,7 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
   const std::string p_cnt   = "chunk_count_" + idstr;
   const std::string p_bits  = "chunk_bits_" + idstr;
   const std::string p_pkd   = "packed_" + idstr;
-  const std::string p_lws   = "lw_shards_" + idstr;  // sharded atomicAdd (16-shard DtoH)
+  const std::string p_lws   = "lw_shards_" + idstr;  // sharded live-word counter
   const std::string v_need3 = "need3_" + idstr;      // per-chunk: bits_v+31 > 64 possible
   const std::string sh_min  = "sh_min_" + idstr;
   const std::string sh_max  = "sh_max_" + idstr;
@@ -1075,7 +1079,7 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
   add_param("int32_t*", p_cnt);
   add_param("uint8_t*", p_bits);
   add_param("uint32_t*", p_pkd);
-  add_param("uint32_t*", p_lws);  // sharded live-word counter (16-shard)
+  add_param("uint32_t*", p_lws);
   const bool measure      = mode_ == EncodeRenderMode::measure;
   const bool pack         = mode_ == EncodeRenderMode::pack;
   const std::string p_off = "bp_offsets_" + idstr;
@@ -1084,13 +1088,6 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
   const std::size_t stride_words =
     static_cast<std::size_t>(::codegen::kChunkSize) * op_dt->elem_size / sizeof(std::uint32_t);
   const std::size_t nc = static_cast<std::size_t>(num_chunks_);
-  // Sharded atomicAdd slab: kMaxBitsShards=16 shards × kStride=32 uint32s
-  // (128-byte spacing keeps each shard on its own L2 cache line to avoid
-  // serialisation).  Host post-kernel sums 16 entries.  Mirrors
-  // block_bitpack's packed_counter from fused_block_primitives.cuh.
-  constexpr std::size_t kMaxBitsShards = 16;
-  constexpr std::size_t kShardStride   = 32;
-
   add_buffer(id, "chunk_min", op_dt->elem_size, nc);
   add_buffer(id, "chunk_count", sizeof(std::int32_t), nc);
   add_buffer(id, "chunk_bits", sizeof(std::uint8_t), nc);
@@ -1102,7 +1099,10 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
              sizeof(std::uint32_t),
              nc * stride_words,
              /*no_pre_zero=*/use_smem);
-  add_buffer(id, "lw_shards", sizeof(std::uint32_t), kMaxBitsShards * kShardStride);
+  add_buffer(id,
+             "lw_shards",
+             sizeof(std::uint32_t),
+             ::codegen::kBitpackLiveWordShards * ::codegen::kBitpackLiveWordShardStride);
   // pack: the dense word offset of each chunk, an input the caller scans from the measure
   // pass's chunk_bits x chunk_count.
   if (pack) { add_buffer(id, "bp_offsets", sizeof(std::int32_t), nc + 1, /*no_pre_zero=*/true); }
@@ -1175,8 +1175,9 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
       << "            " << p_bits << "[chunk_id] = static_cast<uint8_t>(" << bits_v << ");\n"
       << "            const uint32_t _pw = static_cast<uint32_t>((static_cast<int32_t>(" << bp_len
       << ") * " << bits_v << " + 31) / 32);\n"
-      << "            atomicAdd(" << p_lws
-      << " + (static_cast<uint32_t>(chunk_id) & 15u) * 32u, _pw);\n"
+      << "            atomicAdd(" << p_lws << " + (static_cast<uint32_t>(chunk_id) & "
+      << (::codegen::kBitpackLiveWordShards - 1) << "u) * "
+      << ::codegen::kBitpackLiveWordShardStride << "u, _pw);\n"
       << "        }\n";
     // measure: the metadata and the live-word count are this mode's whole output.
     if (measure) { body_ << "        break;\n"; }

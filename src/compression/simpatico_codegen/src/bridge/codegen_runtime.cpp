@@ -338,6 +338,20 @@ namespace {
 
 constexpr int kChunkSize = cc::kChunkSize;  // 1024
 
+/// Bitpack's chunk_min dtype: the lane's integer type at @p width bytes, which is
+/// also what a float column's chunk_min uses.
+cudf::data_type bitpack_chunk_min_type(std::size_t width)
+{
+  switch (width) {
+    case 1: return cudf::data_type(cudf::type_id::UINT8);
+    case 2: return cudf::data_type(cudf::type_id::INT16);
+    case 4: return cudf::data_type(cudf::type_id::INT32);
+    case 8: return cudf::data_type(cudf::type_id::INT64);
+    case 16: return cudf::data_type(cudf::type_id::DECIMAL128, 0);
+    default: return cudf::data_type(cudf::type_id::INT32);
+  }
+}
+
 // DFS-preorder traversal with lex-sorted children — matches
 // ``jit::assign_ids`` so the node visit order assigns ids in the
 // same way ``build_root`` consumes them.
@@ -995,6 +1009,9 @@ void launch_masked_char_copy(void const* chars,
 //      ownership of the rmm::device_buffers into the cudf::columns.
 //      Bitpack reps are born sparse (OverAllocate) then eagerly
 //      compacted in place, so the writer / tail codecs see dense bytes.
+//      A measurable() region is instead rendered in measure and pack modes
+//      and launched twice (launch_encode_measure_pack), so its Bitpack
+//      outputs are dense from the start and nothing is compacted.
 //   7. Reps land in ``builder.leaves`` (path-keyed). Entropy tails / chained
 //      steps on the region's boundary outputs are scheduled by the recursive
 //      compress walk (plan/compress.cpp), not here.
@@ -1022,7 +1039,7 @@ static std::optional<simpatico::CodegenHead> extract_fusable_subtree(
 
   // Build the fused-region FusedTree with the SAME builder the decode binder
   // uses (bridge/fused_tree_build) — the two sides can never drift on structure
-  // or node-id order. The encode kernel always emits the OverAllocate layout.
+  // or node-id order.
   auto built = build_fused_tree(tree, start_node);
   if (!built) { return fail("no fusable subtree rooted at node " + std::to_string(start_node)); }
 
@@ -1120,9 +1137,7 @@ int launch_encode_measure_pack(const simpatico::CodegenHead& head,
                                ::cuda::stream_ref stream,
                                rmm::device_async_resource_ref mr)
 {
-  constexpr std::size_t kMaxBitsShards = 16;
-  constexpr std::size_t kShardStride   = 32;
-  const auto nc                        = static_cast<std::size_t>(num_chunks);
+  const auto nc = static_cast<std::size_t>(num_chunks);
 
   std::vector<rmm::device_buffer> bufs;
   bufs.reserve(measure.buffers.size());
@@ -1188,8 +1203,9 @@ int launch_encode_measure_pack(const simpatico::CodegenHead& head,
                          "cpp encode: measure lw_shards DtoH failed");
     cudaStreamSynchronize(stream.get());
     auto& out = outputs[measure.buffers[i].node_id];
-    for (std::size_t sh = 0; sh < kMaxBitsShards; ++sh)
-      out.live_bytes += static_cast<std::size_t>(shards[sh * kShardStride]) * sizeof(std::uint32_t);
+    for (std::size_t sh = 0; sh < cc::kBitpackLiveWordShards; ++sh)
+      out.live_bytes += static_cast<std::size_t>(shards[sh * cc::kBitpackLiveWordShardStride]) *
+                        sizeof(std::uint32_t);
     // packed is addressed in uint32 words through int32 offsets.
     if (out.live_bytes / sizeof(std::uint32_t) > static_cast<std::size_t>(INT32_MAX)) {
       std::fprintf(stderr,
@@ -1288,16 +1304,10 @@ int launch_encode_measure_pack(const simpatico::CodegenHead& head,
     };
     switch (origin.node->op) {
       case cc::OpKind::Bitpack: {
-        auto const i_min = find_buffer_idx(measure.buffers, node_id, "chunk_min");
-        // chunk_min is the lane's integer type even for a float column, as in the full path.
-        auto const min_width = measure.buffers[i_min].elem_size;
-        auto const min_type  = min_width == 16  ? cudf::data_type(cudf::type_id::DECIMAL128, 0)
-                               : min_width == 8 ? cudf::data_type(cudf::type_id::INT64)
-                               : min_width == 2 ? cudf::data_type(cudf::type_id::INT16)
-                               : min_width == 1 ? cudf::data_type(cudf::type_id::UINT8)
-                                                : cudf::data_type(cudf::type_id::INT32);
-        auto& out            = outputs.at(node_id);
-        auto rep             = rep_of(simpatico::OpId::Bitpack);
+        auto const i_min    = find_buffer_idx(measure.buffers, node_id, "chunk_min");
+        auto const min_type = bitpack_chunk_min_type(measure.buffers[i_min].elem_size);
+        auto& out           = outputs.at(node_id);
+        auto rep            = rep_of(simpatico::OpId::Bitpack);
         rep->buffers.emplace_back("chunk_min", meta(i_min, min_type, nc));
         rep->buffers.emplace_back("chunk_count",
                                   meta(find_buffer_idx(measure.buffers, node_id, "chunk_count"),
@@ -1379,8 +1389,9 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
       std::fprintf(stderr, "simpatico::codegen: cpp encode: render rejected shape: %s\n", e.what());
       return 0;  // walker can't emit this shape — try legacy
     }
-    // A Bitpack, optionally behind Delta, is measured first and then packed straight into
-    // an output of its exact size, instead of into full-width slots compacted afterwards.
+    // A tree of Bitpack leaves under Delta, For, Zigzag or Rle (see measurable()) is
+    // measured first and then packed straight into outputs of their exact size, instead
+    // of into full-width slots compacted afterwards.
     if (measurable(head, spec, num_chunks)) {
       auto const measure =
         cje::render(*head.tree, cxx_dtype, num_chunks, cje::EncodeRenderMode::measure);
@@ -1494,28 +1505,27 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
           const auto i_pkd  = find_buffer_idx(spec.buffers, node_id, "packed");
           const auto i_lws  = find_buffer_idx(spec.buffers, node_id, "lw_shards");
 
-          // Sharded live-word sum: 16 shards × uint32, spaced 32 words apart
-          // (128-byte stride keeps each shard on a separate L2 cache line).
-          // DtoH only 16 × 32 × 4 = 2048 bytes (vs num_chunks × 4 bytes before).
+          // Sharded live-word sum (layout: cc::kBitpackLiveWordShards). The DtoH
+          // is the 2 KB slab rather than num_chunks × 4 bytes.
           // The device buffer is NOT needed after this — live_packed_bytes is
           // all the caller requires; the compact_bitpack_packed pipeline reconstructs
           // per-chunk offsets from chunk_bits/chunk_count on demand.
-          constexpr std::size_t kMaxBitsShards = 16;
-          constexpr std::size_t kShardStride   = 32;
-          std::vector<std::uint32_t> lw_shards(kMaxBitsShards * kShardStride, 0);
-          SIMPATICO_CUDA_CHECK(
-            cudaMemcpyAsync(lw_shards.data(),
-                            reinterpret_cast<const void*>(dev_ptrs[i_lws]),
-                            kMaxBitsShards * kShardStride * sizeof(std::uint32_t),
-                            cudaMemcpyDeviceToHost,
-                            stream.get()),
-            -1,
-            "cpp encode: lw_shards DtoH failed (nid=%d)",
-            node_id);
+          constexpr std::size_t kSlabWords =
+            cc::kBitpackLiveWordShards * cc::kBitpackLiveWordShardStride;
+          std::vector<std::uint32_t> lw_shards(kSlabWords, 0);
+          SIMPATICO_CUDA_CHECK(cudaMemcpyAsync(lw_shards.data(),
+                                               reinterpret_cast<const void*>(dev_ptrs[i_lws]),
+                                               kSlabWords * sizeof(std::uint32_t),
+                                               cudaMemcpyDeviceToHost,
+                                               stream.get()),
+                               -1,
+                               "cpp encode: lw_shards DtoH failed (nid=%d)",
+                               node_id);
           cudaStreamSynchronize(stream.get());
           std::int64_t live_packed_bytes = 0;
-          for (std::size_t s = 0; s < kMaxBitsShards; ++s)
-            live_packed_bytes += static_cast<std::int64_t>(lw_shards[s * kShardStride]);
+          for (std::size_t s = 0; s < cc::kBitpackLiveWordShards; ++s)
+            live_packed_bytes +=
+              static_cast<std::int64_t>(lw_shards[s * cc::kBitpackLiveWordShardStride]);
           live_packed_bytes *= 4;  // uint32 words → bytes
 
           // ``stride_words`` from the renderer — the encode-side OverAllocate
@@ -1548,11 +1558,7 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
           // by pointer and never consults the dtype -- only a serialized roundtrip
           // (i.e. a spill) sees it.
           const cudf::data_type bp_elem_type =
-            (spec.buffers[i_min].elem_size == 16)  ? cudf::data_type(cudf::type_id::DECIMAL128, 0)
-            : (spec.buffers[i_min].elem_size == 8) ? cudf::data_type(cudf::type_id::INT64)
-            : (spec.buffers[i_min].elem_size == 2) ? cudf::data_type(cudf::type_id::INT16)
-            : (spec.buffers[i_min].elem_size == 1) ? cudf::data_type(cudf::type_id::UINT8)
-                                                   : cudf::data_type(cudf::type_id::INT32);
+            bitpack_chunk_min_type(spec.buffers[i_min].elem_size);
           auto mins_col = std::make_unique<cudf::column>(
             bp_elem_type,
             static_cast<cudf::size_type>(num_chunks),

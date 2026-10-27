@@ -4,7 +4,7 @@
 //   1. The CUDA-C++ source for a kernel that performs the GPU encode,
 //      ready to hand to `compile_plain_kernel`.
 //   2. The `EncodeBufferSpec` list the caller must allocate before launching
-//      (per-op output buffers in the OverAllocate layout).
+//      (per-op output buffers; see "Buffer layout contract" and EncodeRenderMode).
 //   3. The launch geometry (grid/block/shared) the caller must use.
 //
 // Architectural intent — read this if you are about to add a new op.
@@ -149,8 +149,9 @@ enum class EncodeRenderMode { full, measure, pack };
 //                    (no second walk needed at launch time).
 //
 // Throws `RenderError` if `tree` contains an op the renderer can't emit.
-// Supported ops: `Bitpack` (leaf, OverAllocate layout), `Raw` (leaf
-// passthrough), `Delta`, `Rle`, `For`, `Zigzag` — composed arbitrarily.
+// Supported ops: `Bitpack` (leaf), `Raw` (leaf passthrough), `Delta`, `Rle`,
+// `For`, `Zigzag` — composed arbitrarily in full mode; measure and pack modes
+// accept the subset listed on EncodeRenderMode.
 //
 // Throws `std::invalid_argument` for malformed inputs (empty dtype,
 // num_chunks < 1).
