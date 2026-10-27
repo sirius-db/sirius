@@ -461,6 +461,14 @@ static void from_yaml(const YAML::Node& node, compression_config& opt)
     return std::isfinite(value) && value >= 0.0;
   });
   r.optional("input_plan_dir", opt.input_plan_dir);
+  r.optional("enable_spill_compression", opt.enable_spill_compression);
+  r.optional("spill_min_batch_bytes", yaml::bytes(opt.spill_min_batch_bytes));
+  r.optional("spill_max_compressed_fraction", opt.spill_max_compressed_fraction, [](double value) {
+    return std::isfinite(value) && value >= 0.0;
+  });
+  r.optional("spill_encode_reserve_fraction", opt.spill_encode_reserve_fraction, [](double value) {
+    return std::isfinite(value) && value >= 0.0 && value <= 1.0;
+  });
   r.reject_unknown();
 }
 

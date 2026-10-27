@@ -560,6 +560,29 @@ std::shared_ptr<data_batch> make_int_batch(memory_space& space, std::size_t num_
   return data_batch::make(sirius::get_next_batch_id(), std::move(representation));
 }
 
+/// A stored batch whose stored size differs from its decoded size, like a spilled
+/// compressed batch.
+class compressed_size_representation : public idata_representation {
+ public:
+  compressed_size_representation(memory_space& space, std::size_t stored, std::size_t decoded)
+    : idata_representation(space), _stored(stored), _decoded(decoded)
+  {
+  }
+  [[nodiscard]] std::size_t get_size_in_bytes() const override { return _stored; }
+  [[nodiscard]] std::size_t get_uncompressed_data_size_in_bytes() const override
+  {
+    return _decoded;
+  }
+  [[nodiscard]] std::unique_ptr<idata_representation> clone(::cuda::stream_ref) const override
+  {
+    return nullptr;
+  }
+
+ private:
+  std::size_t _stored;
+  std::size_t _decoded;
+};
+
 struct partition_sizing_fixture {
   explicit partition_sizing_fixture(bool enabled = true)
     : partition({},
@@ -1101,6 +1124,25 @@ TEST_CASE("disabled partition estimation waits for completion and uses measured 
   REQUIRE(f.partition.get_next_task_input_data());
   REQUIRE(f.consumer.inputs == std::vector<uint64_t>{f.received_bytes});
   CHECK(f.consumer.count == 1);
+}
+
+TEST_CASE("partition sizing counts a compressed batch at its decoded size",
+          "[physical_partition][size_estimation]")
+{
+  partition_sizing_fixture f(false);
+  // Tasks decode their input, so a batch stored at a quarter of its size must still
+  // count in full; counting it as stored would give each partition four times the
+  // intended bytes.
+  auto* host = f.memory_manager->get_memory_space(Tier::HOST, 0);
+  REQUIRE(host != nullptr);
+  f.repo.add_data_batch(data_batch::make(sirius::get_next_batch_id(),
+                                         std::make_unique<compressed_size_representation>(
+                                           *host, f.received_bytes, 4 * f.received_bytes)));
+  f.finish(5 * f.received_bytes);
+
+  REQUIRE(f.partition.get_next_task_input_data());
+  REQUIRE(f.consumer.inputs == std::vector<uint64_t>{5 * f.received_bytes});
+  CHECK(f.consumer.count == 5);
 }
 
 TEST_CASE("partition sizing preserves integer bytes above double precision",

@@ -204,6 +204,21 @@ table is pinned uncompressed.
 The YAML loader and DuckDB `SET` surface reject negative, NaN, and infinite
 `max_compressed_fraction` values instead of silently changing retention behavior.
 
+### Spill compression (`sirius.compression`)
+
+With spill compression on, a GPU batch the downgrade executor moves to the host or disk tier is
+stored Simpatico-compressed and decoded on its way back to the GPU. Plans are chosen per column
+from its type (see [Memory Management](memory-management.md#spill-compression)); no plan files are
+involved. A batch that does not qualify, saves too little, or fails to encode spills
+uncompressed.
+
+| Key | DuckDB setting | Type | Default | Description |
+|-----|----------------|------|---------|-------------|
+| `enable_spill_compression` | `spill_compression` | bool | false | Compress spilled batches. The setting applies to the whole process. |
+| `spill_min_batch_bytes` | — | bytes | 64Mi | Spill batches smaller than this uncompressed. |
+| `spill_max_compressed_fraction` | — | finite double >= 0 | 0.75 | A spilled batch stays compressed only at or below this fraction of its device size. Independent of the input-table `max_compressed_fraction`. |
+| `spill_encode_reserve_fraction` | — | double in [0, 1] | 0.5 | Encode only when this fraction of the batch's size could be reserved in its GPU memory space; otherwise the batch spills uncompressed. `0` skips the check. |
+
 ### How Downgrade Thresholds Work
 
 Each memory tier uses a trigger/stop threshold pair to control data eviction:
@@ -910,10 +925,16 @@ retention gates.
 | `pin_table_compression` | false | Default for `pin_table` calls that omit the `compression` argument. |
 | `pin_table_input_compression_plan_dir` | (empty) | Directory of per-table Simpatico plan files (`<table_name>.<ext>`, multi-column plan DSL). Tables with no matching file are pinned uncompressed. No effect on spill compression. |
 | `pin_table_compression_min_batch_size_bytes` | 1 MiB | Minimum uncompressed batch size below which pin-table compression is skipped. |
-| `pin_table_compression_max_compressed_fraction` | 0.75 | Discard the compressed form and pin uncompressed when the compressed size exceeds this fraction of the original (compression saved too little). |
+| `pin_table_compression_max_compressed_fraction` | 0.75 | Discard the compressed form and pin uncompressed when the compressed size exceeds this fraction of the original (compression saved too little). Spill compression uses `spill_max_compressed_fraction` instead. |
 
 Both size gates are evaluated on the narrowed table when compressed materialization is active.
 See [Compressed Pinning](compressed-pinning.md) for tier selection, plan authoring, and results.
+
+### Spill Compression (Simpatico)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `spill_compression` | false | Store batches the downgrade executor spills to the host or disk tier Simpatico-compressed. Applies to the whole process, not just the session. See [Spill compression](#spill-compression-siriuscompression) for the YAML-only gates. |
 
 ### Late Materialization (experimental)
 
