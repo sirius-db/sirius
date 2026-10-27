@@ -186,7 +186,7 @@ TEST_CASE("gpu_budget is zero under a hold-off, a gate or the trigger, else the 
   in.consumed          = 10 * GiB;
   in.mem_epoch         = 4;
   in.gate_epoch        = 3;
-  in.inflight_bytes    = 5 * GiB;
+  in.unreserved_bytes  = 5 * GiB;
   in.ceilings          = {60 * GiB, 50 * GiB};
   in.lookahead_bytes   = 20 * GiB;
   in.outstanding       = 2 * GiB;
@@ -257,12 +257,12 @@ TEST_CASE("host_budget is zero while a NUMA-local GPU is pressed", "[preload_pol
   auto board = std::make_shared<memory_wait_board>(1);
   std::array<gpu_pressure, 2> local{gpu_pressure{0, false}, gpu_pressure{1, false}};
   host_budget_inputs in;
-  in.consumed       = 10 * GiB;
-  in.mem_epoch      = 1;
-  in.gate_epoch     = 0;
-  in.inflight_bytes = 2 * GiB;
-  in.ceiling        = 70 * GiB;
-  in.local_gpus     = local;
+  in.consumed         = 10 * GiB;
+  in.mem_epoch        = 1;
+  in.gate_epoch       = 0;
+  in.unreserved_bytes = 2 * GiB;
+  in.ceiling          = 70 * GiB;
+  in.local_gpus       = local;
 
   CHECK(host_budget(in, *board).bytes == 58 * GiB);
   CHECK(host_budget(in, *board).reason == refusal::ceiling);

@@ -28,6 +28,7 @@
 #include "memory/memory_wait_board.hpp"
 #include "preload/preload_policy.hpp"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -133,8 +134,16 @@ struct promotion_env {
  * only). A DISK batch is staged to HOST with @c convert_to. Any other exception gives
  * @c failed. On @c promoted, the result carries the exact need in bytes,
  * the copy's @ref promotion_kind and a conversion sequence taken under the batch lock.
+ *
+ * @param job The promotion to attempt.
+ * @param env The targets and shared state the attempt reads.
+ * @param unreserved When set, the target's count of bytes that running jobs will reserve but
+ *        have not yet, which includes this job's @c est_reserve. The call subtracts that once:
+ *        as soon as the reservation of step 3 exists, or on return when it never does. The
+ *        target's consumed bytes and this count then hold each running job exactly once.
  */
 [[nodiscard]] promotion_result promote_one(promotion_job const& job,
-                                           promotion_env const& env) noexcept;
+                                           promotion_env const& env,
+                                           std::atomic<std::size_t>* unreserved) noexcept;
 
 }  // namespace sirius::preload

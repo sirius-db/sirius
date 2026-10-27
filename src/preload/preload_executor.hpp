@@ -162,10 +162,10 @@ struct promotion_record {
  * Concurrency:
  * - One leaf mutex guards the candidate store, the epochs, the lanes' ready lists and their
  *   counters. While holding it, the executor never calls into the task queue, a repository, a
- *   batch, a memory space, the publisher or an allocator; it only reads the wait board's atomics
- *   and checks @c weak_ptr::expired.
- * - The planner copies what it needs under the mutex, scans the queue, the repositories and the
- *   memory spaces without it, then installs the plan under it again.
+ *   batch, the publisher or an allocator, nor takes a memory space's lock; it only reads the wait
+ *   board's and the memory spaces' atomic counters and checks @c weak_ptr::expired.
+ * - The planner copies what it needs under the mutex, scans the queue and the repositories
+ *   without it, then reads the memory spaces' counters and installs the plan under it again.
  * - A worker takes a job under the mutex, promotes without it, and reports under it.
  * - Every wait is a condition-variable wait without a timeout. A memory or lock refusal is
  *   stamped with the epoch seen when its job was taken, so an event during the attempt always
@@ -383,26 +383,29 @@ class preload_executor final : public event::query_event_subscriber {
     std::optional<int> placement_device;
   };
 
+  /// Live state of one GPU or HOST space, read under the executor's mutex.
+  struct space_reading {
+    std::size_t consumed{0};
+    /// Bytes running jobs into the space will reserve but have not yet (see @ref _unreserved).
+    std::size_t unreserved{0};
+    bool above_trigger{false};
+  };
+
   /// What a planner pass did, for its log line (written after the mutex is released).
   struct pass_summary {
     std::size_t class_a_tasks{0};
     std::size_t class_b_items{0};
     std::size_t planned{0};
     std::size_t assigned{0};
-    /// Each GPU's consumed bytes and its budget at the start of the assignment (kept only for
-    /// the DEBUG log).
-    std::vector<std::pair<std::size_t, gpu_budget_state>> gpus;
-    /// Each HOST's consumed bytes and its budget at the start of the assignment (likewise).
-    std::vector<std::pair<std::size_t, host_budget_state>> hosts;
+    /// Each GPU's reading and its budget at the start of the assignment (kept only for the
+    /// DEBUG log).
+    std::vector<std::pair<space_reading, gpu_budget_state>> gpus;
+    /// Each HOST's reading and its budget at the start of the assignment (likewise).
+    std::vector<std::pair<space_reading, host_budget_state>> hosts;
   };
 
-  /// Live state of one GPU or HOST space, read without the executor's mutex.
-  struct space_reading {
-    std::size_t consumed{0};
-    bool above_trigger{false};
-  };
-
-  /// What a planner pass gathered outside the executor's mutex.
+  /// What a planner pass gathered: the queue and repository scans and the DISK io contexts
+  /// outside the executor's mutex, the space readings under it.
   struct plan_input {
     bool scanned{false};
     std::vector<visited_task> class_a;
@@ -435,9 +438,11 @@ class preload_executor final : public event::query_event_subscriber {
   /// At most @c max_repository_scans repositories per pass, resuming after the last one scanned.
   /// Planner thread only: it moves @c _scan_cursor.
   void scan_repositories(pass_snapshot const& snap, plan_input& in);
-  void read_spaces(plan_input& in) const;
 
   // Planner phase 3 and lane bookkeeping. Every member below requires the executor mutex.
+  /// Under the mutex, so that no job is taken between this and the assignment. Reads only the
+  /// spaces' atomic counters.
+  void read_spaces(plan_input& in) const;
   pass_summary install_plan(plan_input const& in);
   /// @return Whether an entry was appended (false when @p c has no usable target).
   bool add_entry(std::vector<plan_entry>& entries,
@@ -475,6 +480,8 @@ class preload_executor final : public event::query_event_subscriber {
   [[nodiscard]] std::optional<std::size_t> staging_host(int gpu_device,
                                                         candidate const& c) const noexcept;
   [[nodiscard]] int numa_of(int gpu_device) const noexcept;
+  /// The @ref _unreserved count of @p t, or null for a target that is not a GPU or HOST space.
+  [[nodiscard]] std::atomic<std::size_t>* unreserved_of(target t) const noexcept;
   void log_unexpected(std::string_view where) noexcept;
 
   // Construction helpers.
@@ -503,6 +510,12 @@ class preload_executor final : public event::query_event_subscriber {
   std::vector<promotion_gpu> _promotion_gpus;
   std::vector<promotion_host> _promotion_hosts;
 
+  /// Per GPU, then per HOST: bytes running jobs will reserve in the space but have not yet. A
+  /// lane slot adds the job's estimate under `_mu`; @ref promote_one takes it back, without
+  /// `_mu`, once the reservation exists. A planner pass loads it before the space's consumed
+  /// bytes, so each running job is in exactly one of the two, or briefly in both.
+  std::unique_ptr<std::atomic<std::size_t>[]> _unreserved;
+
   mutable preload_counters _counters;
 
   /// Test hook, read by each promotion.
@@ -525,7 +538,7 @@ class preload_executor final : public event::query_event_subscriber {
   std::vector<std::unique_ptr<lane>> _lanes;
   std::uint32_t _dirty{0};
   bool _planner_busy{false};
-  /// The last pass refused an item for room (ceiling or window), which in-flight bytes count in.
+  /// The last pass refused an item for room (ceiling or window), which running jobs count in.
   bool _room_refused{true};
   /// Class-B bytes being copied into each GPU.
   std::vector<std::size_t> _inflight_b;

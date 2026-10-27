@@ -556,7 +556,7 @@ enum class refusal : std::uint8_t {
   held_off,            ///< a task on the GPU (or a NUMA-local GPU) is stalled or has an OOM retry
   epoch,               ///< a worker was refused there since the last memory event
   trigger,             ///< the space is at or above its downgrade trigger
-  ceiling,             ///< consumed plus in-flight bytes leave no room under the ceiling
+  ceiling,             ///< consumed plus unreserved bytes leave no room under the ceiling
   window,              ///< the lookahead window of preloaded-but-unconsumed bytes is full
   speculative_window,  ///< the class-B share of that window is full
   inflight,            ///< the bytes being copied into the GPU are at their cap
@@ -585,7 +585,9 @@ struct gpu_budget_inputs {
   bool above_trigger{false};  ///< should_downgrade_memory()
   std::uint64_t mem_epoch{0};
   std::uint64_t gate_epoch{~std::uint64_t{0}};
-  std::size_t inflight_bytes{0};  ///< reserved by preload's running jobs
+  /// Bytes preload's running jobs will reserve here but have not yet. A job's reservation is in
+  /// @c consumed once made, as in the worker's own ceiling check, so it is not counted twice.
+  std::size_t unreserved_bytes{0};
   gpu_ceiling_bytes ceilings{};
   std::size_t lookahead_bytes{0};    ///< gpu_lookahead_fraction x capacity
   std::size_t outstanding{0};        ///< preloaded and not yet consumed
@@ -644,7 +646,7 @@ struct gpu_budget_state {
  *
  * The GPU is closed for the pass when a task there is held off, when a worker was refused since
  * the last memory event, or when the GPU is at or above its downgrade trigger. Otherwise each
- * class gets the room under its ceiling (after preload's in-flight bytes) and the windows.
+ * class gets the room under its ceiling (after preload's unreserved bytes) and the windows.
  */
 [[nodiscard]] inline gpu_budget_state make_gpu_budget_state(
   gpu_budget_inputs const& in, memory::memory_wait_board const& board) noexcept
@@ -659,7 +661,7 @@ struct gpu_budget_state {
     s.closed_a = s.closed_b = closed;
     return s;
   }
-  auto const planned   = sat_add(in.consumed, in.inflight_bytes);
+  auto const planned   = sat_add(in.consumed, in.unreserved_bytes);
   s.room_committed     = sat_sub(in.ceilings.committed, planned);
   s.room_speculative   = sat_sub(in.ceilings.speculative, planned);
   s.window             = sat_sub(in.lookahead_bytes, in.outstanding);
@@ -687,7 +689,8 @@ struct host_budget_inputs {
   bool above_trigger{false};
   std::uint64_t mem_epoch{0};
   std::uint64_t gate_epoch{~std::uint64_t{0}};
-  std::size_t inflight_bytes{0};
+  /// As @ref gpu_budget_inputs::unreserved_bytes.
+  std::size_t unreserved_bytes{0};
   std::size_t ceiling{0};
   /// GPUs on the same NUMA node: their spills need this host's headroom first.
   std::span<gpu_pressure const> local_gpus{};
@@ -714,7 +717,7 @@ struct host_budget_inputs {
   if (any_gpu_pressed(in.local_gpus, board)) { return {0, refusal::held_off}; }
   if (in.gate_epoch == in.mem_epoch) { return {0, refusal::epoch}; }
   if (in.above_trigger) { return {0, refusal::trigger}; }
-  return {sat_sub(in.ceiling, sat_add(in.consumed, in.inflight_bytes)), refusal::ceiling};
+  return {sat_sub(in.ceiling, sat_add(in.consumed, in.unreserved_bytes)), refusal::ceiling};
 }
 
 /// Remaining room of one HOST space during head-of-line assignment.

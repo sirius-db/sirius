@@ -39,7 +39,6 @@ namespace sirius::preload {
 #define SIRIUS_PRELOAD_COUNTERS(X) \
   X(events_received)               \
   X(merged)                        \
-  X(unattributed)                  \
   X(dropped_unknown_query)         \
   X(dropped_expired)               \
   X(dropped_unsupported)           \

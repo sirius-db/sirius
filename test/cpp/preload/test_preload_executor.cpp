@@ -575,6 +575,46 @@ TEST_CASE_METHOD(executor_fixture,
 }
 
 TEST_CASE_METHOD(executor_fixture,
+                 "preload executor: a running promotion counts once against the ceiling",
+                 "[preload_executor]")
+{
+  auto cfg                    = config();
+  cfg.host_to_gpu_concurrency = 2;
+  build(cfg);
+  promotion_gate gate;
+  exec->set_promotion_hook_for_testing([&](promotion_job const&) { gate.enter(); });
+  auto const q     = open_query(1);
+  auto const state = pipeline_state(priority(q, 1));
+  auto const first = spilled(*host);
+  auto const other = spilled(*host);
+  push_task(state, {first});
+  push_task(state, {other});
+
+  // Room for both estimates plus half of one. Counting the parked job's bytes twice, once as
+  // its reservation and once as in flight, would leave room for only half of the second.
+  std::size_t const bytes = 8 * mib;
+  auto const est          = reserve_estimate(bytes, 1);
+  auto const filler       = fill_gpu_to(committed_ceiling(cfg) - 2 * est - est / 2);
+  REQUIRE_FALSE(gpu().should_downgrade_memory());
+
+  // The hook runs once the first job's reservation is made: it stays parked there.
+  downgraded(q, record(first, sirius::event::downgrade_source::task_queue, 0, 0, bytes));
+  if (!gate.wait_entered(1)) {
+    gate.release();
+    FAIL("the first promotion never started");
+  }
+  downgraded(q, record(other, sirius::event::downgrade_source::task_queue, 0, 0, bytes));
+  CHECK(gate.wait_entered(2));
+  CHECK(stat(*exec, counter::refused_ceiling) == 0);
+
+  gate.release();
+  settle();
+  CHECK(tier_of(*first) == Tier::GPU);
+  CHECK(tier_of(*other) == Tier::GPU);
+  CHECK(stat(*exec, counter::promoted_h2g) == 2);
+}
+
+TEST_CASE_METHOD(executor_fixture,
                  "preload executor: board hold-offs block until their wake-up event",
                  "[preload_executor]")
 {

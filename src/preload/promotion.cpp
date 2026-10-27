@@ -98,6 +98,34 @@ using cucascade::memory::Tier;
 
 [[nodiscard]] promotion_result outcome(promotion_outcome o) noexcept { return {o}; }
 
+/// A job's share of its target's unreserved bytes, given back exactly once.
+class unreserved_claim {
+ public:
+  unreserved_claim(std::atomic<std::size_t>* counter, std::size_t bytes) noexcept
+    : _counter(counter), _bytes(bytes)
+  {
+  }
+  ~unreserved_claim() { settle(); }
+
+  unreserved_claim(unreserved_claim const&)            = delete;
+  unreserved_claim& operator=(unreserved_claim const&) = delete;
+  unreserved_claim(unreserved_claim&&)                 = delete;
+  unreserved_claim& operator=(unreserved_claim&&)      = delete;
+
+  /// Call as soon as the target reservation exists: the space's consumed bytes count it from
+  /// then on. The release pairs with the planner's acquire load, made before it reads them.
+  void settle() noexcept
+  {
+    if (_counter == nullptr) { return; }
+    _counter->fetch_sub(_bytes, std::memory_order_release);
+    _counter = nullptr;
+  }
+
+ private:
+  std::atomic<std::size_t>* _counter;
+  std::size_t _bytes;
+};
+
 [[nodiscard]] promotion_result stale_at(cucascade::memory::memory_space const& current) noexcept
 {
   promotion_result r{promotion_outcome::stale};
@@ -137,7 +165,9 @@ void run_test_hook(promotion_env const& env, promotion_job const& job)
  * @throws rmm::out_of_memory when the copy overruns the attached reservation. The source
  *         representation is left in place on any throw.
  */
-promotion_result promote_to_gpu(promotion_job const& job, promotion_env const& env)
+promotion_result promote_to_gpu(promotion_job const& job,
+                                promotion_env const& env,
+                                unreserved_claim& claim)
 {
   if (job.t.index >= env.gpus.size()) { return outcome(promotion_outcome::failed); }
   auto const& gpu = env.gpus[job.t.index];
@@ -149,6 +179,7 @@ promotion_result promote_to_gpu(promotion_job const& job, promotion_env const& e
   // Reserve before touching the batch, so a refused space costs no batch lock.
   auto reservation = gpu.space->make_reservation_or_null(std::max<std::size_t>(job.est_reserve, 1));
   if (!reservation) { return outcome(promotion_outcome::no_memory); }
+  claim.settle();
   if (!admissible(*gpu.space, job.ceiling)) { return outcome(promotion_outcome::gated); }
   run_test_hook(env, job);
 
@@ -217,7 +248,9 @@ promotion_result promote_to_gpu(promotion_job const& job, promotion_env const& e
  * @throws rmm::out_of_memory when the host pool cannot supply the blocks. The source
  *         representation is left in place on any throw.
  */
-promotion_result stage_to_host(promotion_job const& job, promotion_env const& env)
+promotion_result stage_to_host(promotion_job const& job,
+                               promotion_env const& env,
+                               unreserved_claim& claim)
 {
   if (job.t.index >= env.hosts.size()) { return outcome(promotion_outcome::failed); }
   auto const& host = env.hosts[job.t.index];
@@ -229,6 +262,7 @@ promotion_result stage_to_host(promotion_job const& job, promotion_env const& en
   auto reservation =
     host.space->make_reservation_or_null(std::max<std::size_t>(job.est_reserve, 1));
   if (!reservation) { return outcome(promotion_outcome::no_memory); }
+  claim.settle();
   if (!admissible(*host.space, job.ceiling)) { return outcome(promotion_outcome::gated); }
   run_test_hook(env, job);
 
@@ -300,15 +334,18 @@ std::size_t promotion_peak_bytes(cucascade::idata_representation const& data)
   return base;
 }
 
-promotion_result promote_one(promotion_job const& job, promotion_env const& env) noexcept
+promotion_result promote_one(promotion_job const& job,
+                             promotion_env const& env,
+                             std::atomic<std::size_t>* unreserved) noexcept
 {
+  unreserved_claim claim{unreserved, job.est_reserve};
   try {
     // The lease keeps the query's repositories, and so the batch's consumers, alive for the
     // whole attempt. Declared first, it is released last.
     auto const lease = env.lifecycle.try_acquire_work(job.query);
     if (!lease) { return outcome(promotion_outcome::retired); }
-    return job.t.tier == Tier::GPU    ? promote_to_gpu(job, env)
-           : job.t.tier == Tier::HOST ? stage_to_host(job, env)
+    return job.t.tier == Tier::GPU    ? promote_to_gpu(job, env, claim)
+           : job.t.tier == Tier::HOST ? stage_to_host(job, env, claim)
                                       : outcome(promotion_outcome::failed);
   } catch (rmm::out_of_memory const&) {
     // On a GPU this is a low estimate, local to the candidate. A HOST pool that is out of

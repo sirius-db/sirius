@@ -264,7 +264,8 @@ std::vector<repo_info> collect_repositories(
  * Holds a lane's concurrency slot, the target GPU's HOST->GPU token when the job needs one, and
  * the job's bytes in the target's in-flight count (and the GPU's class-B count for class B).
  * Construct and release with the executor's mutex held; release is idempotent and runs before
- * any bookkeeping that can throw.
+ * any bookkeeping that can throw. Construction also adds the bytes to the target's unreserved
+ * count, which @ref promote_one takes back.
  */
 class preload_executor::lane_slot {
  public:
@@ -280,6 +281,9 @@ class preload_executor::lane_slot {
     ++_lane.active;
     if (_token) { _ex._store.acquire_h2g_token(_t.index); }
     _ex._store.add_inflight(_t, _bytes);
+    if (auto* const unreserved = _ex.unreserved_of(_t)) {
+      unreserved->fetch_add(_bytes, std::memory_order_relaxed);
+    }
     if (_speculative) { _ex._inflight_b[_t.index] = sat_add(_ex._inflight_b[_t.index], _bytes); }
     _ex._counters.raise_lane_concurrency(_lane.idx, static_cast<std::uint64_t>(_lane.active));
     if (_t.tier == Tier::GPU) {
@@ -354,6 +358,7 @@ preload_executor::preload_executor(event::query_event_publisher& publisher,
 {
   build_spaces();
   build_lanes();
+  _unreserved = std::make_unique<std::atomic<std::size_t>[]>(_gpus.size() + _hosts.size());
   _inflight_b.assign(_gpus.size(), 0);
   _env.gpus      = _promotion_gpus;
   _env.hosts     = _promotion_hosts;
@@ -891,8 +896,8 @@ void preload_executor::planner_loop(std::stop_token const& st) noexcept
     _planner_busy = true;
     lk.unlock();
 
-    // Phases 1 and 2, without the lock: the queue (under its own lock only), the repositories
-    // (under each query's lease) and the memory spaces.
+    // Phases 1 and 2, without the lock: the queue (under its own lock only) and the
+    // repositories (under each query's lease).
     plan_input in;
     try {
       sirius::nvtx_scoped_range const range{"sirius::preload::plan"};
@@ -902,7 +907,6 @@ void preload_executor::planner_loop(std::stop_token const& st) noexcept
         in.class_a = visit_queues();
       }
       scan_repositories(*snap, in);
-      read_spaces(in);
       in.log_budgets = log::get_sink()->should_log(log::level::debug);
       in.scanned     = true;
     } catch (...) {
@@ -916,6 +920,7 @@ void preload_executor::planner_loop(std::stop_token const& st) noexcept
     _planner_busy = false;
     std::optional<pass_summary> summary;
     try {
+      if (in.scanned) { read_spaces(in); }
       summary = install_plan(in);
       bool const dispatched =
         std::any_of(_lanes.begin(), _lanes.end(), [](auto const& l) { return !l->ready.empty(); });
@@ -937,20 +942,22 @@ void preload_executor::planner_loop(std::stop_token const& st) noexcept
       log::log_noexcept([&] {
         std::string budgets;
         for (std::size_t i = 0; i < summary->gpus.size(); ++i) {
-          auto const& [consumed, b] = summary->gpus[i];
-          auto const a              = b.available(klass::A);
-          auto const s              = b.available(klass::B);
-          budgets += std::format(" | GPU:{} consumed {}MiB A {} B {}",
+          auto const& [reading, b] = summary->gpus[i];
+          auto const a             = b.available(klass::A);
+          auto const s             = b.available(klass::B);
+          budgets += std::format(" | GPU:{} consumed {}MiB unreserved {}MiB A {} B {}",
                                  _gpus[i].device,
-                                 consumed >> 20,
+                                 reading.consumed >> 20,
+                                 reading.unreserved >> 20,
                                  budget_text(a.bytes, a.bytes == 0 ? a.reason : refusal::none),
                                  budget_text(s.bytes, s.bytes == 0 ? s.reason : refusal::none));
         }
         for (std::size_t j = 0; j < summary->hosts.size(); ++j) {
-          auto const& [consumed, b] = summary->hosts[j];
-          budgets += std::format(" | HOST:{} consumed {}MiB staging {}",
+          auto const& [reading, b] = summary->hosts[j];
+          budgets += std::format(" | HOST:{} consumed {}MiB unreserved {}MiB staging {}",
                                  _hosts[j].device,
-                                 consumed >> 20,
+                                 reading.consumed >> 20,
+                                 reading.unreserved >> 20,
                                  budget_text(b.room, b.room == 0 ? b.closed : refusal::none));
         }
         SIRIUS_LOG_DEBUG(
@@ -1138,17 +1145,23 @@ void preload_executor::scan_repositories(pass_snapshot const& snap, plan_input& 
 
 void preload_executor::read_spaces(plan_input& in) const
 {
-  auto const read = [](cucascade::memory::memory_space& space) {
-    return space_reading{consumed_bytes(space.get_max_memory(), space.get_available_memory()),
-                         space.should_downgrade_memory()};
+  auto const read = [](cucascade::memory::memory_space& space,
+                       std::atomic<std::size_t> const* unreserved) {
+    // Unreserved bytes first: a job no longer in them has made its reservation, which the
+    // consumed bytes read next then count. A job taken later would need `_mu`.
+    space_reading r;
+    r.unreserved    = unreserved ? unreserved->load(std::memory_order_acquire) : 0;
+    r.consumed      = consumed_bytes(space.get_max_memory(), space.get_available_memory());
+    r.above_trigger = space.should_downgrade_memory();
+    return r;
   };
   in.gpus.reserve(_gpus.size());
-  for (auto const& g : _gpus) {
-    in.gpus.push_back(read(*g.space));
+  for (std::size_t i = 0; i < _gpus.size(); ++i) {
+    in.gpus.push_back(read(*_gpus[i].space, unreserved_of({Tier::GPU, i})));
   }
   in.hosts.reserve(_hosts.size());
-  for (auto const& h : _hosts) {
-    in.hosts.push_back(read(*h.space));
+  for (std::size_t j = 0; j < _hosts.size(); ++j) {
+    in.hosts.push_back(read(*_hosts[j].space, unreserved_of({Tier::HOST, j})));
   }
 }
 
@@ -1268,14 +1281,14 @@ preload_executor::pass_summary preload_executor::install_plan(plan_input const& 
     auto const& g = _gpus[i];
     target const t{Tier::GPU, i};
     gpu_budget_inputs gin;
-    gin.device          = g.device;
-    gin.consumed        = in.gpus[i].consumed;
-    gin.above_trigger   = in.gpus[i].above_trigger;
-    gin.mem_epoch       = _store.mem_epoch(t);
-    gin.gate_epoch      = _store.gate_epoch(t);
-    gin.inflight_bytes  = _store.inflight_bytes(t);
-    gin.ceilings        = g.ceilings;
-    gin.lookahead_bytes = g.lookahead_bytes;
+    gin.device           = g.device;
+    gin.consumed         = in.gpus[i].consumed;
+    gin.above_trigger    = in.gpus[i].above_trigger;
+    gin.mem_epoch        = _store.mem_epoch(t);
+    gin.gate_epoch       = _store.gate_epoch(t);
+    gin.unreserved_bytes = in.gpus[i].unreserved;
+    gin.ceilings         = g.ceilings;
+    gin.lookahead_bytes  = g.lookahead_bytes;
     // Bytes being copied in will be outstanding once they land: the windows count them now.
     gin.outstanding       = sat_add(_store.outstanding_bytes(i), _store.inflight_bytes(t));
     gin.speculative_bytes = g.speculative_bytes;
@@ -1294,13 +1307,13 @@ preload_executor::pass_summary preload_executor::install_plan(plan_input const& 
       local.push_back(pressures[gi]);
     }
     host_budget_inputs hin;
-    hin.consumed       = in.hosts[j].consumed;
-    hin.above_trigger  = in.hosts[j].above_trigger;
-    hin.mem_epoch      = _store.mem_epoch(t);
-    hin.gate_epoch     = _store.gate_epoch(t);
-    hin.inflight_bytes = _store.inflight_bytes(t);
-    hin.ceiling        = h.ceiling;
-    hin.local_gpus     = local;
+    hin.consumed         = in.hosts[j].consumed;
+    hin.above_trigger    = in.hosts[j].above_trigger;
+    hin.mem_epoch        = _store.mem_epoch(t);
+    hin.gate_epoch       = _store.gate_epoch(t);
+    hin.unreserved_bytes = in.hosts[j].unreserved;
+    hin.ceiling          = h.ceiling;
+    hin.local_gpus       = local;
     host_budgets.push_back(make_host_budget_state(hin, *_board));
   }
 
@@ -1308,11 +1321,11 @@ preload_executor::pass_summary preload_executor::install_plan(plan_input const& 
   if (in.log_budgets) {
     summary.gpus.reserve(gpu_budgets.size());
     for (std::size_t i = 0; i < gpu_budgets.size(); ++i) {
-      summary.gpus.emplace_back(in.gpus[i].consumed, gpu_budgets[i]);
+      summary.gpus.emplace_back(in.gpus[i], gpu_budgets[i]);
     }
     summary.hosts.reserve(host_budgets.size());
     for (std::size_t j = 0; j < host_budgets.size(); ++j) {
-      summary.hosts.emplace_back(in.hosts[j].consumed, host_budgets[j]);
+      summary.hosts.emplace_back(in.hosts[j], host_budgets[j]);
     }
   }
 
@@ -1322,7 +1335,8 @@ preload_executor::pass_summary preload_executor::install_plan(plan_input const& 
     if (reason == refusal::none || result.refusals[r] == 0) { continue; }
     _counters.add(refusal_counter(reason), result.refusals[r]);
   }
-  // Room and windows count in-flight bytes: a job finishing may let a refused item fit.
+  // Room counts running jobs' unreserved bytes and the windows their in-flight bytes: a job
+  // finishing may let a refused item fit.
   auto const refused = [&](refusal r) { return result.refusals[static_cast<std::size_t>(r)] > 0; };
   _room_refused =
     refused(refusal::ceiling) || refused(refusal::window) || refused(refusal::speculative_window);
@@ -1442,6 +1456,15 @@ int preload_executor::numa_of(int gpu_device) const noexcept
   }
 }
 
+std::atomic<std::size_t>* preload_executor::unreserved_of(target t) const noexcept
+{
+  if (t.tier == Tier::GPU && t.index < _gpus.size()) { return &_unreserved[t.index]; }
+  if (t.tier == Tier::HOST && t.index < _hosts.size()) {
+    return &_unreserved[_gpus.size() + t.index];
+  }
+  return nullptr;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Lanes
 // ---------------------------------------------------------------------------------------------
@@ -1559,7 +1582,7 @@ void preload_executor::lane_loop(lane& l, std::stop_token const& st) noexcept
     lane_slot slot{*this, l, *taken};
     lk.unlock();
     auto const started = std::chrono::steady_clock::now();
-    auto const result  = promote_one(taken->job, _env);
+    auto const result  = promote_one(taken->job, _env, unreserved_of(taken->job.t));
     auto const us      = std::chrono::duration_cast<std::chrono::microseconds>(
                       std::chrono::steady_clock::now() - started)
                       .count();
@@ -1613,8 +1636,8 @@ bool preload_executor::replan_after(promotion_job const& job,
     case promotion_outcome::contended:
       return _room_refused || _store.queue_epoch() != job.queue_epoch_at_take;
     // These only dropped the candidate (or, unsupported, parked it for good). Nothing a pass
-    // reads changed but the job's released in-flight bytes, which matter only if the last pass
-    // refused an item for room.
+    // reads changed but the job's released bytes, which matter only if the last pass refused an
+    // item for room.
     case promotion_outcome::unsupported:
     case promotion_outcome::retired:
     case promotion_outcome::expired:
