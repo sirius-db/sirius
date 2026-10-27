@@ -155,6 +155,9 @@ struct promotion_job {
   /// The candidate's newest conversion sequence when the job was taken; a newer one at outcome
   /// time means the batch was downgraded again during the attempt.
   std::uint64_t seq_at_take{0};
+  /// Generation stamp of this job's device preloading budget charge (GPU targets only; 0 when
+  /// none). The ledger entry records it so a later release acts on the right generation.
+  std::uint64_t job_seq{0};
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -289,17 +292,20 @@ struct gpu_ceiling_bytes {
 // Lane caps
 // ---------------------------------------------------------------------------------------------
 
-/// Concurrent promotions into one GPU: the configured value, else 5 with C2C and 1 without.
+/// Concurrent promotions into one GPU: @c concurrent_preloads when set, else 5 with C2C and 1
+/// without.
 [[nodiscard]] constexpr int h2g_cap(preload_executor_config const& cfg, bool c2c) noexcept
 {
-  return cfg.host_to_gpu_concurrency > 0 ? cfg.host_to_gpu_concurrency : (c2c ? 5 : 1);
+  if (cfg.concurrent_preloads) { return static_cast<int>(*cfg.concurrent_preloads); }
+  return c2c ? 5 : 1;
 }
 
-/// Concurrent promotions out of one DISK space: the configured value, else 5 with GPUDirect
-/// Storage and 1 without.
+/// Concurrent promotions out of one DISK space: @c concurrent_preloads when set, else 5 with
+/// GPUDirect Storage and 1 without.
 [[nodiscard]] constexpr int disk_cap(preload_executor_config const& cfg, bool gds) noexcept
 {
-  return cfg.disk_concurrency > 0 ? cfg.disk_concurrency : (gds ? 5 : 1);
+  if (cfg.concurrent_preloads) { return static_cast<int>(*cfg.concurrent_preloads); }
+  return gds ? 5 : 1;
 }
 
 /**
@@ -589,7 +595,7 @@ struct gpu_budget_inputs {
   /// @c consumed once made, as in the worker's own ceiling check, so it is not counted twice.
   std::size_t unreserved_bytes{0};
   gpu_ceiling_bytes ceilings{};
-  std::size_t lookahead_bytes{0};    ///< gpu_lookahead_fraction x capacity
+  std::size_t lookahead_bytes{0};    ///< device_preloading_budget x capacity
   std::size_t outstanding{0};        ///< preloaded and not yet consumed
   std::size_t speculative_bytes{0};  ///< speculative_fraction x capacity
   std::size_t outstanding_b{0};      ///< class-B part of @c outstanding

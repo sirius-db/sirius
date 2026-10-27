@@ -444,14 +444,13 @@ struct sirius_config {
   /// @ref finalize_derived_config; an explicit config value is left alone.
   void derive_rest_scan_budget();
 
-  /// Check an enabled @c sirius.executor.preload block against the memory spaces. Clamps, each
-  /// with one WARN: @c gpu_speculative_headroom_fraction is raised to
-  /// @c gpu_committed_headroom_fraction, @c speculative_fraction is lowered to
-  /// @c gpu_lookahead_fraction, and @c max_batch_fraction is lowered to
-  /// @c max_inflight_fraction. Then WARNs, per space, when a GPU or HOST preload ceiling
-  /// (@c downgrade_stop_fraction minus its headroom) is at or below zero, which disables that
-  /// class of promotion there. Does nothing when preload is disabled. Called from
-  /// @ref finalize_derived_config.
+  /// Check a configured @c sirius.executor.preload block against the memory spaces. Clamps, each
+  /// with one WARN: @c speculative_fraction is lowered to @c device_preloading_budget, and
+  /// @c max_batch_fraction is lowered to @c max_inflight_fraction. Then WARNs, per GPU, when an
+  /// explicit @c device_preloading_ceiling exceeds the GPU's @c downgrade_stop_fraction (it is
+  /// clamped to it), and when a GPU or HOST preload ceiling is at or below zero, which disables
+  /// that class of promotion there. Does nothing when @c concurrent_preloads is 0 or no preload
+  /// is configured. Called from @ref finalize_derived_config.
   void warn_preload_config();
 
   cucascade::memory::system_topology_info _hw_topology{};

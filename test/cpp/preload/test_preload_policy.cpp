@@ -127,17 +127,25 @@ TEST_CASE("preload size arithmetic saturates and estimates with slack", "[preloa
 
 // ---- ceilings ----------------------------------------------------------------------------------
 
-TEST_CASE("preload ceilings follow downgrade_stop minus headroom, in consumed bytes",
+TEST_CASE("preload ceilings follow the device preloading ceiling, in consumed bytes",
           "[preload_policy]")
 {
-  preload_executor_config cfg;  // committed 0.0, speculative 0.1, host 0.1
+  preload_executor_config cfg;  // ceiling absent (= stop), speculative headroom 0.1, host 0.1
   space_limits const gpu{100 * GiB, 100 * GiB, 60 * GiB};
 
-  SECTION("defaults: committed at stop, speculative 0.1 below")
+  SECTION("defaults: committed at the stop, speculative one headroom below")
   {
     auto const c = gpu_ceilings_bytes(cfg, gpu);
-    CHECK(c.committed == 60 * GiB);
+    CHECK(c.committed == 60 * GiB);  // absent ceiling defaults to the stop fraction
     CHECK(c.speculative == fraction_of(0.5, 100 * GiB));
+  }
+
+  SECTION("an explicit ceiling below the stop is used; above it, it is clamped")
+  {
+    cfg.device_preloading_ceiling = 0.4;
+    CHECK(gpu_ceilings_bytes(cfg, gpu).committed == fraction_of(0.4, 100 * GiB));
+    cfg.device_preloading_ceiling = 0.9;  // above the 0.6 stop
+    CHECK(gpu_ceilings_bytes(cfg, gpu).committed == 60 * GiB);
   }
 
   SECTION("host ceiling is stop minus host headroom")
@@ -146,12 +154,11 @@ TEST_CASE("preload ceilings follow downgrade_stop minus headroom, in consumed by
     CHECK(host_ceiling_bytes(cfg, host) == fraction_of(0.7, 100 * GiB));
   }
 
-  SECTION("a ceiling at or below zero disables the class")
+  SECTION("a speculative ceiling at or below zero disables class B")
   {
-    cfg.gpu_speculative_headroom_fraction = 0.6;
-    cfg.gpu_committed_headroom_fraction   = 0.7;
+    cfg.gpu_speculative_headroom_fraction = 0.7;  // more than the committed ceiling
     auto const c                          = gpu_ceilings_bytes(cfg, gpu);
-    CHECK(c.committed == 0);
+    CHECK(c.committed == 60 * GiB);
     CHECK(c.speculative == 0);
 
     cfg.host_headroom_fraction = 0.8;
@@ -658,11 +665,11 @@ TEST_CASE("lane caps: C2C x GDS x overrides", "[preload_policy]")
   CHECK(disk_cap(cfg, true) == 5);
   CHECK(disk_cap(cfg, false) == 1);
 
-  cfg.host_to_gpu_concurrency = 3;
-  cfg.disk_concurrency        = 2;
+  // concurrent_preloads is one per-lane width for every GPU and DISK lane alike.
+  cfg.concurrent_preloads = 3;
   for (bool const hw : {true, false}) {
     CHECK(h2g_cap(cfg, hw) == 3);
-    CHECK(disk_cap(cfg, hw) == 2);
+    CHECK(disk_cap(cfg, hw) == 3);
   }
 
   // Every copy into a GPU over the host link takes an h2g token.

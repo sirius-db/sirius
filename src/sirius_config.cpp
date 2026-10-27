@@ -482,21 +482,29 @@ static void from_yaml(const YAML::Node& node, exec::downgrade_executor_config& o
 
 static void from_yaml(const YAML::Node& node, preload::preload_executor_config& opt)
 {
-  constexpr int max_concurrency = 64;
+  constexpr long long max_concurrency = 64;
   yaml::reader r(node, "preload");
-  r.optional("enabled", opt.enabled);
-  r.optional(
-    "host_to_gpu_concurrency", opt.host_to_gpu_concurrency, yaml::between<int>{0, max_concurrency});
-  r.optional("disk_concurrency", opt.disk_concurrency, yaml::between<int>{0, max_concurrency});
+  // Absent keeps std::nullopt (auto); explicit values are validated to [0, 64].
+  if (r.has_value("concurrent_preloads")) {
+    long long concurrent = 0;
+    r.optional("concurrent_preloads", concurrent, yaml::between<long long>{0, max_concurrency});
+    opt.concurrent_preloads = static_cast<std::size_t>(concurrent);
+  }
   r.optional("cpu_affinity", opt.cpu_affinity_list);
-  r.optional("gpu_committed_headroom_fraction",
-             opt.gpu_committed_headroom_fraction,
-             yaml::fraction<double>{});
+  r.optional("device_preloading_budget", opt.device_preloading_budget, yaml::fraction<double>{});
+  // The ceiling is in (0, 1]; absent means each GPU's own downgrade_stop_fraction.
+  if (r.has_value("device_preloading_ceiling")) {
+    double ceiling = 0.0;
+    r.optional("device_preloading_ceiling", ceiling, yaml::fraction<double>{});
+    if (!(ceiling > 0.0)) {
+      throw std::runtime_error("executor.preload.device_preloading_ceiling must be greater than 0");
+    }
+    opt.device_preloading_ceiling = ceiling;
+  }
   r.optional("gpu_speculative_headroom_fraction",
              opt.gpu_speculative_headroom_fraction,
              yaml::fraction<double>{});
   r.optional("host_headroom_fraction", opt.host_headroom_fraction, yaml::fraction<double>{});
-  r.optional("gpu_lookahead_fraction", opt.gpu_lookahead_fraction, yaml::fraction<double>{});
   r.optional("speculative_fraction", opt.speculative_fraction, yaml::fraction<double>{});
   r.optional("max_batch_fraction", opt.max_batch_fraction, yaml::fraction<double>{});
   r.optional("max_inflight_fraction", opt.max_inflight_fraction, yaml::fraction<double>{});
@@ -509,7 +517,6 @@ static void from_yaml(const YAML::Node& node, preload::preload_executor_config& 
   r.optional("stage_to_host", opt.stage_to_host);
   r.optional("max_promotions_per_batch", opt.max_promotions_per_batch, yaml::greater_than<int>{-1});
   r.optional("max_lock_attempts", opt.max_lock_attempts, yaml::greater_than<int>{0});
-  r.optional("max_oom_retries", opt.max_oom_retries, yaml::greater_than<int>{-1});
   // Read signed so a negative value is rejected instead of wrapping to a huge size_t.
   auto max_candidates = static_cast<long long>(opt.max_candidates);
   r.optional("max_candidates", max_candidates, yaml::greater_than<long long>{0});
@@ -1056,26 +1063,18 @@ void sirius_config::finalize_derived_config()
 void sirius_config::warn_preload_config()
 {
   auto& cfg = _preload_executor_config;
-  if (!cfg.enabled) { return; }
+  // 0 turns preload off entirely; a config that mentions no preload knob gets no executor.
+  if (preload::preload_disabled_by_zero(cfg)) { return; }
+  if (!cfg.concurrent_preloads.has_value() && !preload::wants_device_preloading(cfg)) { return; }
 
-  if (cfg.gpu_speculative_headroom_fraction < cfg.gpu_committed_headroom_fraction) {
-    SIRIUS_LOG_WARN(
-      "sirius_config: executor.preload.gpu_speculative_headroom_fraction ({:.3f}) is below "
-      "gpu_committed_headroom_fraction ({:.3f}); raising it to {:.3f} so speculative promotions "
-      "never get more GPU room than committed ones",
-      cfg.gpu_speculative_headroom_fraction,
-      cfg.gpu_committed_headroom_fraction,
-      cfg.gpu_committed_headroom_fraction);
-    cfg.gpu_speculative_headroom_fraction = cfg.gpu_committed_headroom_fraction;
-  }
-  if (cfg.speculative_fraction > cfg.gpu_lookahead_fraction) {
+  if (cfg.speculative_fraction > cfg.device_preloading_budget) {
     SIRIUS_LOG_WARN(
       "sirius_config: executor.preload.speculative_fraction ({:.3f}) exceeds "
-      "gpu_lookahead_fraction ({:.3f}), of which it is a share; lowering it to {:.3f}",
+      "device_preloading_budget ({:.3f}), of which it is a share; lowering it to {:.3f}",
       cfg.speculative_fraction,
-      cfg.gpu_lookahead_fraction,
-      cfg.gpu_lookahead_fraction);
-    cfg.speculative_fraction = cfg.gpu_lookahead_fraction;
+      cfg.device_preloading_budget,
+      cfg.device_preloading_budget);
+    cfg.speculative_fraction = cfg.device_preloading_budget;
   }
   if (cfg.max_batch_fraction > cfg.max_inflight_fraction) {
     SIRIUS_LOG_WARN(
@@ -1092,33 +1091,42 @@ void sirius_config::warn_preload_config()
   // is disabled at run time too.
   for (auto const& space : _memory_space_configs) {
     if (auto const* gpu = std::get_if<cucascade::memory::gpu_memory_space_config>(&space)) {
-      auto const committed   = preload::ceiling_fraction(gpu->downgrade_stop_fraction,
-                                                       cfg.gpu_committed_headroom_fraction);
-      auto const speculative = preload::ceiling_fraction(gpu->downgrade_stop_fraction,
-                                                         cfg.gpu_speculative_headroom_fraction);
+      // Device preloading alone never drives a downgrade: an explicit ceiling above the GPU's
+      // downgrade stop fraction is clamped to it (one WARN).
+      if (cfg.device_preloading_ceiling &&
+          *cfg.device_preloading_ceiling > gpu->downgrade_stop_fraction) {
+        SIRIUS_LOG_WARN(
+          "sirius_config: executor.preload.device_preloading_ceiling ({:.3f}) exceeds GPU {}'s "
+          "downgrade_stop_fraction ({:.3f}); clamping to it so preload alone never starts a "
+          "downgrade",
+          *cfg.device_preloading_ceiling,
+          gpu->device_id,
+          gpu->downgrade_stop_fraction);
+      }
+      if (!preload::wants_device_preloading(cfg)) { continue; }
+      auto const committed = preload::committed_ceiling_fraction(cfg, gpu->downgrade_stop_fraction);
+      auto const speculative =
+        preload::speculative_ceiling_fraction(cfg, gpu->downgrade_stop_fraction);
       if (committed <= 0.0) {
         SIRIUS_LOG_WARN(
-          "sirius_config: GPU {}'s downgrade_stop_fraction ({:.3f}) minus "
-          "executor.preload.gpu_committed_headroom_fraction ({:.3f}) leaves no room; all preload "
-          "onto this GPU is disabled",
-          gpu->device_id,
-          gpu->downgrade_stop_fraction,
-          cfg.gpu_committed_headroom_fraction);
-        // The speculative headroom is at least the committed one, so that class is closed too.
+          "sirius_config: GPU {}'s committed preload ceiling is 0; all device preloading onto "
+          "this GPU is disabled",
+          gpu->device_id);
         continue;
       }
       if (speculative <= 0.0) {
         SIRIUS_LOG_WARN(
-          "sirius_config: GPU {}'s downgrade_stop_fraction ({:.3f}) minus "
+          "sirius_config: GPU {}'s committed preload ceiling ({:.3f}) minus "
           "executor.preload.gpu_speculative_headroom_fraction ({:.3f}) leaves no room; "
           "speculative preload onto this GPU is disabled",
           gpu->device_id,
-          gpu->downgrade_stop_fraction,
+          committed,
           cfg.gpu_speculative_headroom_fraction);
       }
     } else if (auto const* host =
                  std::get_if<cucascade::memory::host_memory_space_config>(&space)) {
-      // Without stage_to_host preload never targets HOST, so its ceiling is irrelevant.
+      // Without stage_to_host preload never targets HOST, so its ceiling is irrelevant. With
+      // nothing to stage (device preloading off and no staging) the host ceiling is irrelevant.
       if (!cfg.stage_to_host) { continue; }
       if (preload::ceiling_fraction(host->downgrade_stop_fraction, cfg.host_headroom_fraction) <=
           0.0) {

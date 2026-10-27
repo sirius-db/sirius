@@ -3,5 +3,4 @@ sirius:
     num_gpus: 1
   executor:
     preload:
-      enabled: true
-      gpu_lookahead_fraction: 1.5
+      device_preloading_budget: 1.5

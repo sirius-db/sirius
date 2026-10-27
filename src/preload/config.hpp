@@ -17,6 +17,7 @@
 #pragma once
 
 #include <cstddef>
+#include <optional>
 #include <vector>
 
 namespace sirius::preload {
@@ -33,41 +34,45 @@ namespace sirius::preload {
  * on its own never drives a space to its downgrade trigger. A ceiling at or below zero disables
  * that class of promotion on that space.
  *
- * The defaults leave the executor disabled, so behaviour is unchanged unless @c enabled is set.
+ * The defaults leave the executor off (no @c concurrent_preloads, @c device_preloading_budget 0),
+ * so behaviour is unchanged unless preloading is configured.
  */
 struct preload_executor_config {
-  /// Create and run the preload executor. When false, no executor, thread or subscription exists.
-  bool enabled{false};
-
-  /// Concurrent HOST->GPU copies per GPU. 0 = auto: 5 when the CPU and GPU share a C2C link,
-  /// otherwise 1. Valid range [0, 64].
-  int host_to_gpu_concurrency{0};
-
-  /// Concurrent copies per DISK space. 0 = auto: 5 when GPUDirect Storage is in use, otherwise 1.
-  /// Valid range [0, 64].
-  int disk_concurrency{0};
+  /// Worker threads per lane (each GPU's HOST->GPU lane and each DISK lane) and, for a GPU lane,
+  /// the per-GPU HOST->GPU token count. A per-lane cap, not a process-wide one.
+  ///
+  /// - absent = auto: a GPU lane is 5 with a C2C link else 1; a DISK lane is 5 with GPUDirect
+  ///   Storage else 1.
+  /// - 0 = the preload executor is off entirely (no executor, threads, subscription, board,
+  ///   streams or conversion records). 0 wins over every other preload setting.
+  /// - N in [1, 64] = N workers per lane.
+  std::optional<std::size_t> concurrent_preloads{};
 
   /// Cores to pin preload threads to (`cpu_affinity` in YAML). Empty = no pinning.
   std::vector<int> cpu_affinity_list{};
 
-  /// Committed promotions (inputs of queued tasks) may fill a GPU up to
-  /// `downgrade_stop_fraction - gpu_committed_headroom_fraction`.
-  double gpu_committed_headroom_fraction{0.0};
+  /// Maximum preloaded-but-not-yet-claimed bytes per GPU, as a fraction of the GPU space's
+  /// capacity. 0 (the default) disables device preloading: no promotion ever targets a GPU and
+  /// no preload stream pool or budget board is created.
+  double device_preloading_budget{0.0};
 
-  /// Speculative promotions (repository batches without a queued consumer) may fill a GPU up to
-  /// `downgrade_stop_fraction - gpu_speculative_headroom_fraction`. Raised to
-  /// @c gpu_committed_headroom_fraction when it is smaller.
+  /// GPU promotions run only while the GPU's consumed memory (counting the promotion's own
+  /// reservation) stays at or below this fraction of capacity. Absent = that GPU's own
+  /// @c downgrade_stop_fraction; an explicit value is clamped per GPU to its
+  /// @c downgrade_stop_fraction (one WARN) so preload alone never starts a downgrade. This is the
+  /// committed (class A) GPU ceiling.
+  std::optional<double> device_preloading_ceiling{};
+
+  /// Speculative promotions (repository batches without a queued consumer) use a GPU ceiling of
+  /// `device_preloading_ceiling - gpu_speculative_headroom_fraction`, saturating at 0.
   double gpu_speculative_headroom_fraction{0.10};
 
   /// DISK->HOST staging may fill a HOST space up to
   /// `downgrade_stop_fraction - host_headroom_fraction`.
   double host_headroom_fraction{0.10};
 
-  /// Maximum preloaded-but-not-yet-consumed bytes per GPU.
-  double gpu_lookahead_fraction{0.20};
-
   /// Share of a GPU's capacity that speculative promotions may hold out of
-  /// @c gpu_lookahead_fraction. Lowered to @c gpu_lookahead_fraction when it is larger.
+  /// @c device_preloading_budget. Lowered to @c device_preloading_budget when it is larger.
   double speculative_fraction{0.05};
 
   /// Never promote a batch to a GPU whose estimated need exceeds this fraction of its capacity.
@@ -102,14 +107,24 @@ struct preload_executor_config {
   /// Attempts to take a batch lock before the candidate is dropped. Must be at least 1.
   int max_lock_attempts{3};
 
-  /// GPU out-of-memory retries per candidate, each with a doubled estimate, before the candidate
-  /// is banned from GPUs.
-  int max_oom_retries{1};
-
   /// Maximum tracked candidates. At the limit, the newest query's most recently downgraded
   /// candidate is evicted first. Must be positive.
   std::size_t max_candidates{65536};
 };
+
+/// Whether @c concurrent_preloads forces the executor off entirely (0 wins over everything).
+[[nodiscard]] constexpr bool preload_disabled_by_zero(preload_executor_config const& cfg) noexcept
+{
+  return cfg.concurrent_preloads && *cfg.concurrent_preloads == 0;
+}
+
+/// Whether the config asks for device preloading (budget > 0 and not turned off by a 0 width).
+/// Device preloading may still be disabled at run time if the GPU spaces track reservations per
+/// stream (see the executor).
+[[nodiscard]] constexpr bool wants_device_preloading(preload_executor_config const& cfg) noexcept
+{
+  return !preload_disabled_by_zero(cfg) && cfg.device_preloading_budget > 0.0;
+}
 
 /// A ceiling, as a fraction of capacity, at or below this counts as zero: it absorbs rounding in
 /// differences and products of configured fractions.
@@ -137,6 +152,32 @@ struct gpu_ceiling_fractions {
 };
 
 /**
+ * @brief The committed (class A) GPU ceiling of one GPU, as a fraction of capacity.
+ *
+ * @c device_preloading_ceiling, defaulting to the GPU's own @c downgrade_stop_fraction, clamped
+ * to that fraction so preload alone never drives a downgrade.
+ */
+[[nodiscard]] constexpr double committed_ceiling_fraction(preload_executor_config const& cfg,
+                                                          double downgrade_stop_fraction) noexcept
+{
+  auto const ceiling = cfg.device_preloading_ceiling.value_or(downgrade_stop_fraction);
+  return ceiling < downgrade_stop_fraction ? ceiling : downgrade_stop_fraction;
+}
+
+/**
+ * @brief The speculative (class B) GPU ceiling of one GPU, as a fraction of capacity.
+ *
+ * `committed_ceiling_fraction - gpu_speculative_headroom_fraction`, saturating at 0.
+ */
+[[nodiscard]] constexpr double speculative_ceiling_fraction(preload_executor_config const& cfg,
+                                                            double downgrade_stop_fraction) noexcept
+{
+  auto const speculative = committed_ceiling_fraction(cfg, downgrade_stop_fraction) -
+                           cfg.gpu_speculative_headroom_fraction;
+  return speculative > ceiling_epsilon ? speculative : 0.0;
+}
+
+/**
  * @brief Both GPU ceilings of one GPU.
  *
  * Config validation and the executor both derive the ceilings here, so a class that the config
@@ -148,8 +189,8 @@ struct gpu_ceiling_fractions {
 [[nodiscard]] constexpr gpu_ceiling_fractions gpu_ceilings(preload_executor_config const& cfg,
                                                            double downgrade_stop_fraction) noexcept
 {
-  return {ceiling_fraction(downgrade_stop_fraction, cfg.gpu_committed_headroom_fraction),
-          ceiling_fraction(downgrade_stop_fraction, cfg.gpu_speculative_headroom_fraction)};
+  return {committed_ceiling_fraction(cfg, downgrade_stop_fraction),
+          speculative_ceiling_fraction(cfg, downgrade_stop_fraction)};
 }
 
 }  // namespace sirius::preload

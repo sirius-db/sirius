@@ -56,7 +56,7 @@ SiriusContext
 ├── task_scheduler                      # Top-level executor (owns the GPU pipeline executors)
 ├── sirius_scan_manager                 # Scan-side preparation + I/O (io_context, prefetch cache, split providers)
 ├── downgrade_executor[]                # Per-memory-space monitors for GPU→Host spilling
-├── preload_executor                    # Optional (executor.preload.enabled): moves spilled batches back ahead of their consumer
+├── preload_executor                    # Optional (executor.preload): moves spilled batches back ahead of their consumer
 ├── task_creator                        # Creates GPU pipeline tasks based on data availability
 └── per-query scan/creator state         # Registered and retired by query ID
 ```
@@ -126,13 +126,13 @@ Super Sirius uses multiple dedicated thread pools, each with a specific role:
 └─────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────┐
-│  Preload Executor (only when executor.preload.enabled)          │
+│  Preload Executor (only when executor.preload is configured)    │
 │  - Event subscriber thread: O(1) hooks, sets dirty bits         │
 │  - Planner thread (preload-plan): event-driven passes, no timer │
-│  - HOST→GPU lane per GPU (preload-h2g-<gpu>-<i>): 5 threads     │
-│    with a C2C link, else 1                                      │
-│  - Lane per DISK space (preload-dsk-<disk>-<i>): 5 threads      │
-│    with GPUDirect Storage, else 1                               │
+│  - HOST→GPU lane per GPU (preload-h2g-<gpu>-<i>), device preload │
+│    only: concurrent_preloads workers; auto 5 with C2C, else 1   │
+│  - Lane per DISK space (preload-dsk-<disk>-<i>): concurrent_     │
+│    preloads workers; auto 5 with GPUDirect Storage, else 1      │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
