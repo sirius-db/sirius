@@ -1,14 +1,14 @@
 # Sirius C API
 
 The public C API provides a C ABI for embedding Sirius. Include the headers under
-`sirius/c/` and link the Sirius library. No C++ types cross this interface.
+`sirius-c/` and link the Sirius library. No C++ types cross this interface.
 
 ## Headers and linking
 
-- `<sirius/c/export.h>` defines visibility and C/C++ declaration helpers.
-- `<sirius/c/context/config_builder.h>` builds immutable context configurations.
-- `<sirius/c/error.h>` defines fixed-width status codes and owned diagnostics.
-- `<sirius/c/version.h>` declares the library's ABI revision.
+- `<sirius-c/export.h>` defines visibility and C/C++ declaration helpers.
+- `<sirius-c/context/config_builder.h>` builds immutable context configurations.
+- `<sirius-c/error.h>` defines fixed-width status codes and owned diagnostics.
+- `<sirius-c/version.h>` declares the library's ABI revision.
 
 With CMake, link `sirius::sirius`, or `sirius::sirius_static` when the static package
 is enabled. Static consumers must enable CXX in their CMake project and link with
@@ -16,7 +16,7 @@ the C++ driver to include the required C++ runtime support. The headers use
 C99-compatible declarations.
 
 ```c
-#include <sirius/c/version.h>
+#include <sirius-c/version.h>
 
 int main(void)
 {
@@ -29,7 +29,7 @@ int main(void)
 Create immutable configuration snapshots without accessing GPUs:
 
 ```c
-#include <sirius/c/context/config_builder.h>
+#include <sirius-c/context/config_builder.h>
 #include <stdio.h>
 
 int main(void)

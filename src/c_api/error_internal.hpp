@@ -1,7 +1,7 @@
 // Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <sirius/c/error.h>
+#include <sirius-c/error.h>
 
 #include <new>
 
