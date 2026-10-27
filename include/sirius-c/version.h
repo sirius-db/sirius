@@ -2,7 +2,7 @@
 /** @file
  * @brief Identify the C ABI revision of the headers and linked library. */
 #pragma once
-#include <sirius/c/export.h>
+#include <sirius-c/export.h>
 #include <stdint.h>
 /** Reserved for future ABI versioning. Zero denotes an unversioned development API;
  * matching values do not guarantee compatibility. */

@@ -24,7 +24,7 @@
 
 #pragma once
 
-#include <sirius/c/context/config.h>
+#include <sirius-c/context/config.h>
 
 namespace sirius {
 

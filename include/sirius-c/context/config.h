@@ -2,7 +2,7 @@
 /** @file
  * @brief Own immutable configuration snapshots without accessing hardware. */
 #pragma once
-#include <sirius/c/export.h>
+#include <sirius-c/export.h>
 #ifdef __cplusplus
 extern "C" {
 #endif
