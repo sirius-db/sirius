@@ -59,11 +59,13 @@ Hardware availability and capacity are checked when initializing an engine.
 
 ## Ownership and errors
 
+Status values 1–3 report configuration errors.
+
 - Each returned handle owns a reference. Retain a builder or configuration to acquire
   another reference; release each reference exactly once. Retaining does not allocate.
 - Destroy error diagnostics with sirius_error_destroy(). Never use `free()` on Sirius handles.
 - Fallible operations return a status, clear their output slots, and optionally provide
-  an owned diagnostic. Pass empty output slots; release previous results before reusing them.
+  an owned diagnostic. Release previous results before reusing their output slots.
 - Diagnostics are best effort. A nonzero status is a failure even if no message is available.
 - No C++ exception crosses the C interface. Treat unknown nonzero status codes as failures.
 - Keep every borrowed handle alive throughout each call; do not release it concurrently with
@@ -73,14 +75,15 @@ Hardware availability and capacity are checked when initializing an engine.
 ### Diagnostic output convention
 
 Status-returning functions use an optional `sirius_error **out_error` parameter.
-Pass `NULL` to omit diagnostics, or the address of a pointer initialized to `NULL`.
+Pass `NULL` to omit diagnostics, or the address of a `sirius_error *` output slot.
 Functions clear the slot before doing work. It remains `NULL` on success; on failure,
 it receives an owned diagnostic if one can be allocated, otherwise `NULL`.
 The status code determines success or failure independently of the diagnostic.
 
 Destroy any previous diagnostic before reusing its output slot. Functions overwrite
-slots without releasing previous contents. Output slots require exclusive access
-for the duration of the call.
+slots without reading or releasing previous contents; an unreleased diagnostic
+would be leaked, not reported as an argument error. Output slots require exclusive
+access for the duration of the call.
 
 Messages may contain embedded NUL bytes. Use sirius_error_message_size() as the
 complete byte length rather than `strlen()`. The borrowed bytes remain valid until
