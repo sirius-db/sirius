@@ -94,6 +94,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_cast_date_predicates.cpp
     test/cpp/integration/test_gpu_execution_constant_or_null.cpp
     test/cpp/integration/test_gpu_execution_cross_product.cpp
+    test/cpp/integration/test_gpu_execution_cte.cpp
     test/cpp/integration/test_gpu_execution_decimal_sum_overflow.cpp
     test/cpp/integration/test_gpu_execution_dense_count_join.cpp
     test/cpp/integration/test_gpu_execution_distinct.cpp
@@ -282,6 +283,7 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_data_size_estimator.cpp
     test/cpp/pipeline/test_gpu_pipeline_task_history.cpp
     test/cpp/pipeline/test_gpu_pipeline_disk_readback.cpp
+    test/cpp/pipeline/test_cte_build_pipelines.cpp
     test/cpp/pipeline/test_get_next_ports_after_sink.cpp
     test/cpp/pipeline/test_merge_pipeline_fusion.cpp
     test/cpp/pipeline/test_partition_build_pipelines.cpp

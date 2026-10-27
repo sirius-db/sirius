@@ -200,6 +200,8 @@ for (auto& scan : cte_scans) {
 children[1]->build_pipelines(current, meta_pipeline);  // Reference side
 ```
 
+The materialization pipeline's only outgoing edges are its CTE scans, and the active task creator reaches every pipeline other than the first-scheduled source by following edges. So `create_plan(LogicalMaterializedCTE&)` plans only the reference side when no `LOGICAL_CTE_REF` reads the CTE (DuckDB's statistics propagation can fold every reference into an empty result after unused-CTE removal has run).
+
 ### Pipeline Finalization
 
 Pipelines reach their final shape during construction: `create_pipeline()` pre-populates `operators` with the meta-pipeline's sink, per-operator `build_pipelines` appends intermediates and sources as it recurses, and `sirius_pipeline::is_ready()` reverses the list and derives `source`/`sink` from it.
