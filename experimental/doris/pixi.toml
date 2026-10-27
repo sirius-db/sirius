@@ -32,7 +32,7 @@ client = {cmd = "mysql --host 127.0.0.1 --port 9030 --user root",description = "
 [feature.be.dependencies]
 # protoc for prost/tonic codegen of the Doris proto IDL, and the thrift compiler for the
 # thrift IDL (both under the `doris/` submodule).
-libprotobuf = ">=7.35,<8"
+libprotobuf = "7.*"
 rust = "*"
 thrift-compiler = "0.22.*"
 
@@ -67,7 +67,7 @@ libcurand-dev = "*"
 yaml-cpp = "*"
 libabseil = "*"
 duckdb = "=2.0.0"
-spdlog = "1.8.*"
+spdlog = "1.*"
 sqlite = "3.*"
 liburing = "*"
 openssl = "*"
@@ -89,8 +89,8 @@ python = "3.12.*"
 python-duckdb = "=2.0.0"
 # For scripts/build-duckdb-substrait.sh; the C++ compiler stays the system one (as in CI).
 cmake = ">=3.28"
-ninja = ">=1.13.2,<2"
-ccache = ">=4.14,<5"
+ninja = "1.*"
+ccache = "4.*"
 
 [feature.check.tasks]
 duckdb-substrait-build = {cmd = "bash scripts/build-duckdb-substrait.sh",description = "Build DuckDB v2.0.0 with the pinned pre-v2 substrait consumer as a loadable extension (+ shell) under .duckdb-substrait/"}
