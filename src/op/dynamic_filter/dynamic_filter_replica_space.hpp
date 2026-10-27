@@ -56,12 +56,15 @@ class dynamic_filter_replica_space final {
 };
 
 /**
- * @brief Finds the first ordered pair of distinct GPUs in @p device_ids without working peer DMA,
- * as `cucascade::memory::probe_peer_dma_works` reports it.
+ * @brief Grants all ordered replica-pool accesses needed by accumulated Bloom publication
  *
- * @return The pair (source, destination), or no value when peer DMA works between every pair
+ * Applies `sirius::memory::find_pair_without_pool_access` to the replicas' GPU spaces; CUDA errors
+ * propagate. The replicas are borrowed only for this call.
+ *
+ * @return First unavailable (allocation owner, accessor) pair, or no value when every required
+ * grant succeeds
  */
-[[nodiscard]] std::optional<std::pair<int, int>> find_pair_without_peer_dma(
-  std::span<int const> device_ids);
+[[nodiscard]] std::optional<std::pair<int, int>> find_pair_without_pool_access(
+  std::span<dynamic_filter_replica_space const> replicas);
 
 }  // namespace sirius::op

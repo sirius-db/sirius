@@ -259,6 +259,7 @@ void sirius_dynamic_in_list_filter::replicate_to_devices(
     pending;
   pending.reserve(spaces.size());
   _set->replicas.reserve(_set->replicas.size() + spaces.size());
+  detail::replica_fanout_failures failures;
   for (auto const& target : spaces) {
     auto const& target_space = target.get_gpu_space();
     auto const device_id     = target_space.get_device_id();
@@ -290,7 +291,7 @@ void sirius_dynamic_in_list_filter::replicate_to_devices(
           auto destination_set =
             make_set<key_type>(capacity, reservation->allocator(), cuda::stream_ref{stream.get()});
           if (destination_set->capacity() != capacity) {
-            throw std::runtime_error("destination static_set capacity changed during replication");
+            throw std::logic_error("destination static_set capacity changed during replication");
           }
           auto result       = std::make_unique<set_replica>(device_id, std::move(destination_set));
           auto& destination = *std::get<set_owner<key_type>>(result->set);
@@ -314,14 +315,13 @@ void sirius_dynamic_in_list_filter::replicate_to_devices(
         continue;
       }
       pending.emplace_back(std::move(replica), std::move(stream_lease));
-    } catch (std::exception const& e) {
-      SIRIUS_LOG_WARN(
-        "[sirius_dynamic_in_list_filter] replica GPU {} -> GPU {} unavailable: {}. "
-        "That GPU will skip this optional filter.",
-        _set->source_device,
-        device_id,
-        e.what());
-      continue;
+    } catch (...) {
+      if (failures.skip_if_recoverable(
+            "[sirius_dynamic_in_list_filter]", _set->source_device, device_id)) {
+        continue;
+      }
+      // Earlier destinations still own asynchronous copies; drain them before propagating.
+      break;
     }
     SIRIUS_LOG_DEBUG("[sirius_dynamic_in_list_filter] queued {}-byte replica GPU {} -> GPU {}.",
                      bytes,
@@ -334,16 +334,14 @@ void sirius_dynamic_in_list_filter::replicate_to_devices(
     auto const device_id = replica->device_id;
     try {
       rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
-      stream.sync();
-      _set->replicas.push_back(std::move(replica));
-    } catch (std::exception const& e) {
-      SIRIUS_LOG_WARN(
-        "[sirius_dynamic_in_list_filter] replica GPU {} -> GPU {} unavailable: {}. "
-        "That GPU will skip this optional filter.",
-        _set->source_device,
-        device_id,
-        e.what());
+      CUCASCADE_CUDA_TRY(cudaStreamSynchronize(stream.get()));
+    } catch (...) {
+      failures.record_fatal("[sirius_dynamic_in_list_filter]", _set->source_device, device_id);
     }
+  }
+  failures.rethrow_if_fatal();
+  for (auto& [replica, stream_lease] : pending) {
+    _set->replicas.push_back(std::move(replica));
   }
 }
 

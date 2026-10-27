@@ -106,7 +106,7 @@ Normally the probe side waits until the build side finishes before doing any wor
 
 ### The cuCascade dependency (H02)
 
-CUDA peer access (the device-level "can GPU A see GPU B's memory", via `cudaDeviceEnablePeerAccess()`) is not the same as pool access (can GPU A DMA directly into the *specific RMM pool* GPU B allocated from — Sirius allocates from pools, not raw CUDA memory). Even a successful `cudaMemcpyPeerAsync` call doesn't prove real pool-to-pool DMA happened; the driver can silently stage it through host memory instead (and not the pool you want!). So the fast path needs an empirical, bidirectional probe of the actual pools involved, not just an API call that didn't error. This capability must land in cuCascade. Once merged, Sirius requests and caches grants once at startup (`SiriusContext::initialize`) for the pools filters actually use, on the active GPU set; only a pool pair that comes back "granted" uses the fast chunked-copy path. Until that PR merges, Sirius always uses the safe (slower) serial copy path. Wiring up the fast path is its own PR (#4 below), blocked on that dependency merging.
+CUDA peer access (the device-level "can GPU A see GPU B's memory", via `cudaDeviceEnablePeerAccess()`) is not the same as pool access (can GPU A read the *specific RMM pool* GPU B allocated from -- Sirius allocates from pools, not raw CUDA memory). `sirius_memory_reservation_manager` requests pool access for its ordinary RMM async pools through cuCascade's `grant_pool_peer_access` before installing cuDF resource references. cuCascade verifies bytes using private pools in both directions, then grants permission on each supplied pool; this neither probes actual Sirius allocations nor measures physical DMA. Sirius does not enable ordinary peer access or cache a device-pair capability: callers query their live source spaces through `try_grant_pool_access`. Unknown or unsupported capability stages ordinary replicas and declines accumulated publication; CUDA errors propagate. PR 4 below covers any additional allocation domains it introduces, implements bounded host-staged accumulated publication, and proves scratch, reservation, and retirement behavior. Topology and ingress performance claims require measurement.
 
 ## The PARTITION Total Row Count
 
@@ -117,8 +117,8 @@ To reduce the block between PARTITION's capture of the total row count and Bloom
 1. Session + channel core (single build, no multi-partition support yet)
 2. Multi-partition build → serial publication
 3. Shared scan consumer + fused masking kernel
-4. Fast GPU-to-GPU copy path (needs cuCascade merged first)
+4. Complete accumulated publication transport and validation, on top of the pool access grants
 5. Smarter "is this filter worth it" heuristics
 6. Optional early probe-side start, and runtime row count estimation.
 
-PRs 1–3 can merge against `dev` today. PR 4 is blocked on the separate cuCascade PR merging. PRs 5 and 6 follow. Each PR ships its own tests, docs, and config cleanup — there's no separate cleanup-only PR at the end.
+The stack targets `main`. PRs 5 and 6 follow PR 4. Each PR ships its own tests, docs, and config cleanup — there's no separate cleanup-only PR at the end.

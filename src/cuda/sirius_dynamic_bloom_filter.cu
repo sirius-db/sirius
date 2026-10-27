@@ -423,6 +423,7 @@ void sirius_dynamic_bloom_filter::replicate_to_devices(
     pending;
   pending.reserve(spaces.size());
   _impl->replicas.reserve(_impl->replicas.size() + spaces.size());
+  detail::replica_fanout_failures failures;
   for (auto const& target : spaces) {
     auto const& target_space = target.get_gpu_space();
     auto const device_id     = target_space.get_device_id();
@@ -472,14 +473,13 @@ void sirius_dynamic_bloom_filter::replicate_to_devices(
         continue;
       }
       pending.emplace_back(std::move(replica), std::move(stream_lease));
-    } catch (std::exception const& e) {
-      SIRIUS_LOG_WARN(
-        "[sirius_dynamic_bloom_filter] replica GPU {} -> GPU {} unavailable: {}. "
-        "That GPU will skip this optional filter.",
-        _impl->source_device,
-        device_id,
-        e.what());
-      continue;
+    } catch (...) {
+      if (failures.skip_if_recoverable(
+            "[sirius_dynamic_bloom_filter]", _impl->source_device, device_id)) {
+        continue;
+      }
+      // Earlier destinations still own asynchronous copies; drain them before propagating.
+      break;
     }
     SIRIUS_LOG_DEBUG("[sirius_dynamic_bloom_filter] queued {}-byte replica GPU {} -> GPU {}.",
                      bytes,
@@ -492,16 +492,14 @@ void sirius_dynamic_bloom_filter::replicate_to_devices(
     auto const device_id = replica->device_id;
     try {
       rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
-      stream.sync();
-      _impl->replicas.push_back(std::move(replica));
-    } catch (std::exception const& e) {
-      SIRIUS_LOG_WARN(
-        "[sirius_dynamic_bloom_filter] replica GPU {} -> GPU {} unavailable: {}. "
-        "That GPU will skip this optional filter.",
-        _impl->source_device,
-        device_id,
-        e.what());
+      CUCASCADE_CUDA_TRY(cudaStreamSynchronize(stream.get()));
+    } catch (...) {
+      failures.record_fatal("[sirius_dynamic_bloom_filter]", _impl->source_device, device_id);
     }
+  }
+  failures.rethrow_if_fatal();
+  for (auto& [replica, stream_lease] : pending) {
+    _impl->replicas.push_back(std::move(replica));
   }
 }
 
