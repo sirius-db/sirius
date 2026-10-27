@@ -480,6 +480,43 @@ static void from_yaml(const YAML::Node& node, exec::downgrade_executor_config& o
   r.reject_unknown();
 }
 
+static void from_yaml(const YAML::Node& node, preload::preload_executor_config& opt)
+{
+  constexpr int max_concurrency = 64;
+  yaml::reader r(node, "preload");
+  r.optional("enabled", opt.enabled);
+  r.optional(
+    "host_to_gpu_concurrency", opt.host_to_gpu_concurrency, yaml::between<int>{0, max_concurrency});
+  r.optional("disk_concurrency", opt.disk_concurrency, yaml::between<int>{0, max_concurrency});
+  r.optional("cpu_affinity", opt.cpu_affinity_list);
+  r.optional("gpu_committed_headroom_fraction",
+             opt.gpu_committed_headroom_fraction,
+             yaml::fraction<double>{});
+  r.optional("gpu_speculative_headroom_fraction",
+             opt.gpu_speculative_headroom_fraction,
+             yaml::fraction<double>{});
+  r.optional("host_headroom_fraction", opt.host_headroom_fraction, yaml::fraction<double>{});
+  r.optional("gpu_lookahead_fraction", opt.gpu_lookahead_fraction, yaml::fraction<double>{});
+  r.optional("speculative_fraction", opt.speculative_fraction, yaml::fraction<double>{});
+  r.optional("max_batch_fraction", opt.max_batch_fraction, yaml::fraction<double>{});
+  r.optional("max_inflight_fraction", opt.max_inflight_fraction, yaml::fraction<double>{});
+  r.optional("head_margin_tasks", opt.head_margin_tasks, yaml::greater_than<int>{-2});
+  r.optional("lookahead_tasks", opt.lookahead_tasks, yaml::greater_than<int>{-1});
+  r.optional("repository_window", opt.repository_window, yaml::greater_than<int>{-1});
+  r.optional("repository_partition_lookahead",
+             opt.repository_partition_lookahead,
+             yaml::greater_than<int>{-1});
+  r.optional("stage_to_host", opt.stage_to_host);
+  r.optional("max_promotions_per_batch", opt.max_promotions_per_batch, yaml::greater_than<int>{-1});
+  r.optional("max_lock_attempts", opt.max_lock_attempts, yaml::greater_than<int>{0});
+  r.optional("max_oom_retries", opt.max_oom_retries, yaml::greater_than<int>{-1});
+  // Read signed so a negative value is rejected instead of wrapping to a huge size_t.
+  auto max_candidates = static_cast<long long>(opt.max_candidates);
+  r.optional("max_candidates", max_candidates, yaml::greater_than<long long>{0});
+  opt.max_candidates = static_cast<std::size_t>(max_candidates);
+  r.reject_unknown();
+}
+
 namespace {
 
 struct topology {
@@ -872,6 +909,7 @@ try {
     if (auto n = er.optional_node("pipeline"))
       from_yaml(*n, settings._gpu_pipeline_executor_config);
     if (auto n = er.optional_node("downgrade")) from_yaml(*n, settings._downgrade_executor_config);
+    if (auto n = er.optional_node("preload")) from_yaml(*n, settings._preload_executor_config);
     er.reject_unknown();
   }
 
@@ -1012,6 +1050,88 @@ void sirius_config::finalize_derived_config()
     static_cast<std::size_t>(std::max(1, _gpu_pipeline_executor_config.num_threads));
   derive_rest_scan_budget();
   enforce_sirius_backend_for_multi_gpu();
+  warn_preload_config();
+}
+
+void sirius_config::warn_preload_config()
+{
+  auto& cfg = _preload_executor_config;
+  if (!cfg.enabled) { return; }
+
+  if (cfg.gpu_speculative_headroom_fraction < cfg.gpu_committed_headroom_fraction) {
+    SIRIUS_LOG_WARN(
+      "sirius_config: executor.preload.gpu_speculative_headroom_fraction ({:.3f}) is below "
+      "gpu_committed_headroom_fraction ({:.3f}); raising it to {:.3f} so speculative promotions "
+      "never get more GPU room than committed ones",
+      cfg.gpu_speculative_headroom_fraction,
+      cfg.gpu_committed_headroom_fraction,
+      cfg.gpu_committed_headroom_fraction);
+    cfg.gpu_speculative_headroom_fraction = cfg.gpu_committed_headroom_fraction;
+  }
+  if (cfg.speculative_fraction > cfg.gpu_lookahead_fraction) {
+    SIRIUS_LOG_WARN(
+      "sirius_config: executor.preload.speculative_fraction ({:.3f}) exceeds "
+      "gpu_lookahead_fraction ({:.3f}), of which it is a share; lowering it to {:.3f}",
+      cfg.speculative_fraction,
+      cfg.gpu_lookahead_fraction,
+      cfg.gpu_lookahead_fraction);
+    cfg.speculative_fraction = cfg.gpu_lookahead_fraction;
+  }
+  if (cfg.max_batch_fraction > cfg.max_inflight_fraction) {
+    SIRIUS_LOG_WARN(
+      "sirius_config: executor.preload.max_batch_fraction ({:.3f}) exceeds "
+      "max_inflight_fraction ({:.3f}), so a batch that large could never be copied; lowering it "
+      "to {:.3f}",
+      cfg.max_batch_fraction,
+      cfg.max_inflight_fraction,
+      cfg.max_inflight_fraction);
+    cfg.max_batch_fraction = cfg.max_inflight_fraction;
+  }
+
+  // The ceilings come from the same helpers the executor uses, so a class reported disabled here
+  // is disabled at run time too.
+  for (auto const& space : _memory_space_configs) {
+    if (auto const* gpu = std::get_if<cucascade::memory::gpu_memory_space_config>(&space)) {
+      auto const committed   = preload::ceiling_fraction(gpu->downgrade_stop_fraction,
+                                                       cfg.gpu_committed_headroom_fraction);
+      auto const speculative = preload::ceiling_fraction(gpu->downgrade_stop_fraction,
+                                                         cfg.gpu_speculative_headroom_fraction);
+      if (committed <= 0.0) {
+        SIRIUS_LOG_WARN(
+          "sirius_config: GPU {}'s downgrade_stop_fraction ({:.3f}) minus "
+          "executor.preload.gpu_committed_headroom_fraction ({:.3f}) leaves no room; all preload "
+          "onto this GPU is disabled",
+          gpu->device_id,
+          gpu->downgrade_stop_fraction,
+          cfg.gpu_committed_headroom_fraction);
+        // The speculative headroom is at least the committed one, so that class is closed too.
+        continue;
+      }
+      if (speculative <= 0.0) {
+        SIRIUS_LOG_WARN(
+          "sirius_config: GPU {}'s downgrade_stop_fraction ({:.3f}) minus "
+          "executor.preload.gpu_speculative_headroom_fraction ({:.3f}) leaves no room; "
+          "speculative preload onto this GPU is disabled",
+          gpu->device_id,
+          gpu->downgrade_stop_fraction,
+          cfg.gpu_speculative_headroom_fraction);
+      }
+    } else if (auto const* host =
+                 std::get_if<cucascade::memory::host_memory_space_config>(&space)) {
+      // Without stage_to_host preload never targets HOST, so its ceiling is irrelevant.
+      if (!cfg.stage_to_host) { continue; }
+      if (preload::ceiling_fraction(host->downgrade_stop_fraction, cfg.host_headroom_fraction) <=
+          0.0) {
+        SIRIUS_LOG_WARN(
+          "sirius_config: HOST {}'s downgrade_stop_fraction ({:.3f}) minus "
+          "executor.preload.host_headroom_fraction ({:.3f}) leaves no room; preload staging "
+          "into this HOST space is disabled",
+          host->numa_id,
+          host->downgrade_stop_fraction,
+          cfg.host_headroom_fraction);
+      }
+    }
+  }
 }
 
 void sirius_config::derive_rest_scan_budget()
@@ -1076,6 +1196,11 @@ const exec::thread_pool_config& sirius_config::get_gpu_pipeline_executor_config(
 const exec::downgrade_executor_config& sirius_config::get_downgrade_executor_config() const noexcept
 {
   return _downgrade_executor_config;
+}
+
+const preload::preload_executor_config& sirius_config::get_preload_executor_config() const noexcept
+{
+  return _preload_executor_config;
 }
 
 const creator::task_creator_config& sirius_config::get_task_creator_config() const noexcept

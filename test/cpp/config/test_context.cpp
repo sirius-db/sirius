@@ -45,6 +45,7 @@
 #include <duckdb/main/settings.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
 #include <utils/utils.hpp>
+#include <yaml-cpp/yaml.h>
 
 #include <algorithm>
 #include <array>
@@ -2563,31 +2564,300 @@ TEST_CASE("Sirius query options stay local and snapshots remain immutable",
         defaults.scan_task_batch_size);
 }
 
-TEST_CASE("Sirius admission configuration has one authoritative limit",
-          "[sirius][config][query_admission]")
+namespace {
+
+sirius::sirius_config resolve_preload_yaml(std::string const& text)
 {
-  auto path = fs::temp_directory_path() / "sirius_admission_config.yaml";
-  finally remove{[&] { fs::remove(path); }};
-  auto load = [&](const char* yaml) {
-    {
-      std::ofstream out(path);
-      out << yaml;
+  static auto const topology = [] {
+    cucascade::memory::topology_discovery discovery;
+    if (!discovery.discover(cucascade::memory::NetworkDeviceVerification::EXISTS_ACTIVE_IP,
+                            /*with_runtime_attributes=*/true)) {
+      throw std::runtime_error("topology discovery failed");
     }
-    sirius::sirius_config cfg;
-    cfg.load_from_file(path);
-    return cfg;
+    return discovery.get_topology();
+  }();
+  return sirius::parsed_sirius_config::from_node(YAML::Load(text)).resolve(topology);
+}
+
+/// A one-GPU config whose @c sirius.executor.preload block is @p preload_keys, each line already
+/// indented under it. @p extra is appended under @c sirius.executor.
+std::string preload_yaml(std::string const& preload_keys, std::string const& extra = "")
+{
+  return "sirius:\n"
+         "  topology:\n"
+         "    num_gpus: 1\n"
+         "  executor:\n"
+         "    preload:\n" +
+         preload_keys + extra;
+}
+
+std::size_t count_records(sirius::test::scoped_recording_log_sink const& logs,
+                          std::string_view needle)
+{
+  std::size_t matches = 0;
+  for (auto const& record : logs.records()) {
+    if (record.message.find(needle) != std::string::npos) {
+      ++matches;
+      CHECK(record.level == sirius::log::level::warn);
+    }
+  }
+  return matches;
+}
+
+}  // namespace
+
+TEST_CASE("Sirius preload executor is disabled by default", "[sirius][config][preload_config]")
+{
+  sirius::preload::preload_executor_config const defaults{};
+  CHECK_FALSE(defaults.enabled);
+  CHECK(defaults.host_to_gpu_concurrency == 0);
+  CHECK(defaults.disk_concurrency == 0);
+  CHECK(defaults.cpu_affinity_list.empty());
+  CHECK(defaults.gpu_committed_headroom_fraction == 0.0);
+  CHECK(defaults.gpu_speculative_headroom_fraction == 0.10);
+  CHECK(defaults.host_headroom_fraction == 0.10);
+  CHECK(defaults.gpu_lookahead_fraction == 0.20);
+  CHECK(defaults.speculative_fraction == 0.05);
+  CHECK(defaults.max_batch_fraction == 0.10);
+  CHECK(defaults.max_inflight_fraction == 0.10);
+  CHECK(defaults.head_margin_tasks == -1);
+  CHECK(defaults.lookahead_tasks == 8);
+  CHECK(defaults.repository_window == 2);
+  CHECK(defaults.repository_partition_lookahead == 1);
+  CHECK(defaults.stage_to_host);
+  CHECK(defaults.max_promotions_per_batch == 2);
+  CHECK(defaults.max_lock_attempts == 3);
+  CHECK(defaults.max_oom_retries == 1);
+  CHECK(defaults.max_candidates == 65536);
+
+  sirius::sirius_config config;
+  config.load_from_file(config_fixture("minimal.yaml"));
+  auto const& loaded = config.get_preload_executor_config();
+  CHECK_FALSE(loaded.enabled);
+  CHECK(loaded.gpu_speculative_headroom_fraction == defaults.gpu_speculative_headroom_fraction);
+  CHECK(loaded.max_candidates == defaults.max_candidates);
+
+  SECTION("enabling it with the default knobs and memory fractions warns about nothing")
+  {
+    sirius::test::scoped_recording_log_sink logs{"warn"};
+    auto const enabled = resolve_preload_yaml(preload_yaml("      enabled: true\n"));
+    CHECK(enabled.get_preload_executor_config().enabled);
+    CHECK(count_records(logs, "preload") == 0);
+  }
+}
+
+TEST_CASE("Sirius configuration reads every preload executor key",
+          "[sirius][config][preload_config]")
+{
+  sirius::test::scoped_recording_log_sink logs{"warn"};
+  sirius::sirius_config config;
+  config.load_from_file(config_fixture("valid_preload.yaml"));
+  CHECK(count_records(logs, "preload") == 0);
+
+  auto const& cfg = config.get_preload_executor_config();
+  CHECK(cfg.enabled);
+  CHECK(cfg.host_to_gpu_concurrency == 3);
+  CHECK(cfg.disk_concurrency == 2);
+  CHECK(cfg.cpu_affinity_list == std::vector<int>{0, 1});
+  CHECK(cfg.gpu_committed_headroom_fraction == 0.05);
+  CHECK(cfg.gpu_speculative_headroom_fraction == 0.15);
+  CHECK(cfg.host_headroom_fraction == 0.2);
+  CHECK(cfg.gpu_lookahead_fraction == 0.3);
+  CHECK(cfg.speculative_fraction == 0.1);
+  CHECK(cfg.max_batch_fraction == 0.05);
+  CHECK(cfg.max_inflight_fraction == 0.15);
+  CHECK(cfg.head_margin_tasks == 6);
+  CHECK(cfg.lookahead_tasks == 12);
+  CHECK(cfg.repository_window == 3);
+  CHECK(cfg.repository_partition_lookahead == 2);
+  CHECK_FALSE(cfg.stage_to_host);
+  CHECK(cfg.max_promotions_per_batch == 4);
+  CHECK(cfg.max_lock_attempts == 5);
+  CHECK(cfg.max_oom_retries == 2);
+  CHECK(cfg.max_candidates == 1024);
+}
+
+TEST_CASE("Sirius configuration rejects invalid preload executor fixtures",
+          "[sirius][config][preload_config]")
+{
+  struct invalid_config {
+    const char* fixture;
+    const char* message;
   };
-  CHECK(load("sirius: {max_concurrent_queries: 4}").max_concurrent_queries() == 4);
-  CHECK(load("sirius: {executor: {scan_manager: {max_concurrent_queries: 2}}}")
-          .max_concurrent_queries() == 2);
-  CHECK(
-    load(
-      "sirius: {max_concurrent_queries: 2, executor: {scan_manager: {max_concurrent_queries: 2}}}")
-      .max_concurrent_queries() == 2);
-  REQUIRE_THROWS_WITH(
-    load(
-      "sirius: {max_concurrent_queries: 2, executor: {scan_manager: {max_concurrent_queries: 3}}}"),
-    Catch::Matchers::ContainsSubstring("conflicting"));
-  REQUIRE_THROWS(load("sirius: {max_concurrent_queries: 0}"));
-  CHECK(load("sirius: {}").max_concurrent_queries() == 1);
+  const invalid_config cases[] = {
+    {"invalid_preload_fraction.yaml", "'preload.gpu_lookahead_fraction': value out of range"},
+    {"invalid_preload_concurrency.yaml", "'preload.host_to_gpu_concurrency': value out of range"},
+    {"invalid_preload_unknown_key.yaml", "unknown config key: 'prefetch_depth' in preload"},
+  };
+  for (auto const& invalid : cases) {
+    INFO("fixture=" << invalid.fixture);
+    auto const path = config_fixture(invalid.fixture);
+    REQUIRE(fs::is_regular_file(path));
+    sirius::sirius_config config;
+    REQUIRE_THROWS_WITH(config.load_from_file(path),
+                        Catch::Matchers::ContainsSubstring(invalid.fixture) &&
+                          Catch::Matchers::ContainsSubstring(invalid.message));
+  }
+}
+
+TEST_CASE("Sirius configuration enforces preload executor ranges",
+          "[sirius][config][preload_config]")
+{
+  struct bound {
+    const char* key;
+    std::vector<const char*> rejected;
+    std::vector<const char*> accepted;
+  };
+  const bound bounds[] = {
+    {"host_to_gpu_concurrency", {"-1", "65"}, {"0", "64"}},
+    {"disk_concurrency", {"-1", "65"}, {"0", "64"}},
+    {"gpu_committed_headroom_fraction", {"-0.1", "1.5", ".nan"}, {"0.0", "1.0"}},
+    {"gpu_speculative_headroom_fraction", {"-0.1", "1.5", ".nan"}, {"0.0", "1.0"}},
+    {"host_headroom_fraction", {"-0.1", "1.5", ".nan"}, {"0.0", "1.0"}},
+    {"gpu_lookahead_fraction", {"-0.1", "1.5", ".nan"}, {"0.0", "1.0"}},
+    {"speculative_fraction", {"-0.1", "1.5", ".nan"}, {"0.0", "1.0"}},
+    {"max_batch_fraction", {"-0.1", "1.5", ".nan"}, {"0.0", "1.0"}},
+    {"max_inflight_fraction", {"-0.1", "1.5", ".nan"}, {"0.0", "1.0"}},
+    {"head_margin_tasks", {"-2"}, {"-1", "0"}},
+    {"lookahead_tasks", {"-1"}, {"0"}},
+    {"repository_window", {"-1"}, {"0"}},
+    {"repository_partition_lookahead", {"-1"}, {"0"}},
+    {"max_promotions_per_batch", {"-1"}, {"0"}},
+    {"max_oom_retries", {"-1"}, {"0"}},
+    {"max_lock_attempts", {"0", "-1"}, {"1"}},
+    {"max_candidates", {"0", "-1"}, {"1"}},
+  };
+  for (auto const& b : bounds) {
+    for (auto const* value : b.rejected) {
+      INFO(b.key << ": " << value << " must be rejected");
+      auto const yaml = preload_yaml(std::string{"      "} + b.key + ": " + value + "\n");
+      REQUIRE_THROWS_WITH(
+        sirius::parsed_sirius_config::from_node(YAML::Load(yaml)),
+        Catch::Matchers::ContainsSubstring(std::string{"'preload."} + b.key + "'"));
+    }
+    for (auto const* value : b.accepted) {
+      INFO(b.key << ": " << value << " must be accepted");
+      auto const yaml = preload_yaml(std::string{"      "} + b.key + ": " + value + "\n");
+      REQUIRE_NOTHROW(sirius::parsed_sirius_config::from_node(YAML::Load(yaml)));
+    }
+  }
+
+  SECTION("an unknown sibling of the preload block is rejected by the executor block")
+  {
+    REQUIRE_THROWS_WITH(
+      sirius::parsed_sirius_config::from_node(
+        YAML::Load(preload_yaml("      enabled: true\n", "    preloader:\n      enabled: true\n"))),
+      Catch::Matchers::ContainsSubstring("unknown config key: 'preloader' in sirius.executor"));
+  }
+}
+
+TEST_CASE("Sirius configuration clamps inconsistent preload executor knobs with a warning",
+          "[sirius][config][preload_config]")
+{
+  SECTION("speculative GPU headroom is raised to the committed headroom")
+  {
+    sirius::test::scoped_recording_log_sink logs{"warn"};
+    auto const config =
+      resolve_preload_yaml(preload_yaml("      enabled: true\n"
+                                        "      gpu_committed_headroom_fraction: 0.2\n"
+                                        "      gpu_speculative_headroom_fraction: 0.1\n"));
+    auto const& cfg = config.get_preload_executor_config();
+    CHECK(cfg.gpu_speculative_headroom_fraction == 0.2);
+    CHECK(cfg.gpu_committed_headroom_fraction == 0.2);
+    CHECK(count_records(logs, "preload.gpu_speculative_headroom_fraction (0.100)") == 1);
+  }
+  SECTION("the speculative share is lowered to the lookahead window")
+  {
+    sirius::test::scoped_recording_log_sink logs{"warn"};
+    auto const config =
+      resolve_preload_yaml(preload_yaml("      enabled: true\n"
+                                        "      gpu_lookahead_fraction: 0.1\n"
+                                        "      speculative_fraction: 0.3\n"));
+    auto const& cfg = config.get_preload_executor_config();
+    CHECK(cfg.speculative_fraction == 0.1);
+    CHECK(cfg.gpu_lookahead_fraction == 0.1);
+    CHECK(count_records(logs, "preload.speculative_fraction (0.300)") == 1);
+  }
+  SECTION("the per-batch cap is lowered to the in-flight cap")
+  {
+    sirius::test::scoped_recording_log_sink logs{"warn"};
+    auto const config =
+      resolve_preload_yaml(preload_yaml("      enabled: true\n"
+                                        "      max_batch_fraction: 0.4\n"
+                                        "      max_inflight_fraction: 0.25\n"));
+    auto const& cfg = config.get_preload_executor_config();
+    CHECK(cfg.max_batch_fraction == 0.25);
+    CHECK(cfg.max_inflight_fraction == 0.25);
+    CHECK(count_records(logs, "preload.max_batch_fraction (0.400)") == 1);
+  }
+  SECTION("a disabled preload block is neither clamped nor checked")
+  {
+    sirius::test::scoped_recording_log_sink logs{"warn"};
+    auto const config =
+      resolve_preload_yaml(preload_yaml("      enabled: false\n"
+                                        "      gpu_committed_headroom_fraction: 0.9\n"
+                                        "      gpu_speculative_headroom_fraction: 0.1\n"
+                                        "      speculative_fraction: 0.3\n"
+                                        "      max_batch_fraction: 0.4\n"));
+    auto const& cfg = config.get_preload_executor_config();
+    CHECK(cfg.gpu_speculative_headroom_fraction == 0.1);
+    CHECK(cfg.speculative_fraction == 0.3);
+    CHECK(cfg.max_batch_fraction == 0.4);
+    CHECK(count_records(logs, "preload") == 0);
+  }
+}
+
+TEST_CASE("Sirius configuration warns when a preload ceiling leaves no room",
+          "[sirius][config][preload_config]")
+{
+  // The high-level defaults are downgrade_stop_fraction 0.6 on the GPU and 0.8 on HOST.
+  SECTION("committed headroom at the GPU stop disables all GPU preload")
+  {
+    sirius::test::scoped_recording_log_sink logs{"warn"};
+    (void)resolve_preload_yaml(
+      preload_yaml("      enabled: true\n"
+                   "      gpu_committed_headroom_fraction: 0.6\n"));
+    CHECK(count_records(logs, "all preload onto this GPU is disabled") == 1);
+    // The speculative ceiling is lower still; it is covered by the warning above.
+    CHECK(count_records(logs, "speculative preload onto this GPU is disabled") == 0);
+  }
+  SECTION("speculative headroom at the GPU stop disables speculative GPU preload only")
+  {
+    sirius::test::scoped_recording_log_sink logs{"warn"};
+    (void)resolve_preload_yaml(
+      preload_yaml("      enabled: true\n"
+                   "      gpu_speculative_headroom_fraction: 0.7\n"));
+    CHECK(count_records(logs, "speculative preload onto this GPU is disabled") == 1);
+    CHECK(count_records(logs, "all preload onto this GPU is disabled") == 0);
+  }
+  SECTION("HOST headroom at the HOST stop disables staging into every HOST space")
+  {
+    sirius::test::scoped_recording_log_sink logs{"warn"};
+    auto const config =
+      resolve_preload_yaml(preload_yaml("      enabled: true\n"
+                                        "      host_headroom_fraction: 0.8\n"));
+    auto const host_spaces = std::ranges::count_if(config.get_memory_space_configs(), [](auto& s) {
+      return std::holds_alternative<cucascade::memory::host_memory_space_config>(s);
+    });
+    REQUIRE(host_spaces > 0);
+    CHECK(count_records(logs, "preload staging into this HOST space is disabled") ==
+          static_cast<std::size_t>(host_spaces));
+  }
+  SECTION("the warnings follow the per-space downgrade_stop_fraction")
+  {
+    sirius::test::scoped_recording_log_sink logs{"warn"};
+    (void)resolve_preload_yaml(
+      "sirius:\n"
+      "  topology:\n"
+      "    num_gpus: 1\n"
+      "  memory:\n"
+      "    gpu:\n"
+      "      downgrade_trigger_fraction: 0.5\n"
+      "      downgrade_stop_fraction: 0.15\n"
+      "  executor:\n"
+      "    preload:\n"
+      "      enabled: true\n");
+    // Committed ceiling 0.15 - 0.0 stays open; speculative 0.15 - 0.1 does too.
+    CHECK(count_records(logs, "preload onto this GPU is disabled") == 0);
+  }
 }

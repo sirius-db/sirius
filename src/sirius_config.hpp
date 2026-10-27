@@ -21,6 +21,7 @@
 #include "exec/config.hpp"
 #include "expression_evaluator/query_policy.hpp"
 #include "op/dynamic_filter/config.hpp"
+#include "preload/config.hpp"
 #include "scan_manager/config.hpp"
 
 #include <cucascade/memory/config.hpp>
@@ -389,6 +390,11 @@ struct sirius_config {
   [[nodiscard]] const exec::downgrade_executor_config& get_downgrade_executor_config()
     const noexcept;
 
+  /// The @c sirius.executor.preload block, after the clamps applied by
+  /// @ref finalize_derived_config. Disabled by default.
+  [[nodiscard]] const preload::preload_executor_config& get_preload_executor_config()
+    const noexcept;
+
   [[nodiscard]] const operator_params& get_operator_params() const noexcept
   {
     return _operator_params;
@@ -419,10 +425,10 @@ struct sirius_config {
  private:
   friend class parsed_sirius_config;
 
-  /// Apply the knobs derived from the rest of the configuration: the readahead
-  /// scan budgets, the @c pipeline_width stamp and the multi-GPU backend
-  /// override, in that order. Called by parsed_sirius_config::resolve after
-  /// memory capacities and operator defaults are resolved.
+  /// scan budgets, the @c pipeline_width stamp, the multi-GPU backend
+  /// override and the preload checks, in that order. Called by
+  /// parsed_sirius_config::resolve after memory capacities and operator
+  /// defaults are resolved.
   void finalize_derived_config();
 
   /// When @c _memory_space_configs contains more than one GPU memory space,
@@ -438,6 +444,16 @@ struct sirius_config {
   /// @ref finalize_derived_config; an explicit config value is left alone.
   void derive_rest_scan_budget();
 
+  /// Check an enabled @c sirius.executor.preload block against the memory spaces. Clamps, each
+  /// with one WARN: @c gpu_speculative_headroom_fraction is raised to
+  /// @c gpu_committed_headroom_fraction, @c speculative_fraction is lowered to
+  /// @c gpu_lookahead_fraction, and @c max_batch_fraction is lowered to
+  /// @c max_inflight_fraction. Then WARNs, per space, when a GPU or HOST preload ceiling
+  /// (@c downgrade_stop_fraction minus its headroom) is at or below zero, which disables that
+  /// class of promotion there. Does nothing when preload is disabled. Called from
+  /// @ref finalize_derived_config.
+  void warn_preload_config();
+
   cucascade::memory::system_topology_info _hw_topology{};
   int _gpus_per_query = 0;
   std::vector<cucascade::memory::memory_space_config> _memory_space_configs;
@@ -446,6 +462,7 @@ struct sirius_config {
   exec::thread_pool_config _gpu_pipeline_executor_config{
     .num_threads = exec::default_gpu_pipeline_num_threads, .thread_name_prefix = "gpu_pipeline"};
   exec::downgrade_executor_config _downgrade_executor_config;
+  preload::preload_executor_config _preload_executor_config;
   operator_params _operator_params;
   telemetry_config _telemetry_config;
   compression_config _compression_config;

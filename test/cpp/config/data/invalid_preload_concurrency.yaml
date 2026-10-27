@@ -1,0 +1,7 @@
+sirius:
+  topology:
+    num_gpus: 1
+  executor:
+    preload:
+      enabled: true
+      host_to_gpu_concurrency: 65

@@ -1,0 +1,25 @@
+sirius:
+  topology:
+    num_gpus: 1
+  executor:
+    preload:
+      enabled: true
+      host_to_gpu_concurrency: 3
+      disk_concurrency: 2
+      cpu_affinity: [0, 1]
+      gpu_committed_headroom_fraction: 0.05
+      gpu_speculative_headroom_fraction: 0.15
+      host_headroom_fraction: 0.2
+      gpu_lookahead_fraction: 0.3
+      speculative_fraction: 0.1
+      max_batch_fraction: 0.05
+      max_inflight_fraction: 0.15
+      head_margin_tasks: 6
+      lookahead_tasks: 12
+      repository_window: 3
+      repository_partition_lookahead: 2
+      stage_to_host: false
+      max_promotions_per_batch: 4
+      max_lock_attempts: 5
+      max_oom_retries: 2
+      max_candidates: 1024

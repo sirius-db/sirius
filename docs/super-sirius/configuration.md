@@ -108,6 +108,7 @@ sirius:
     pipeline:     { num_threads: 4 }
     downgrade:    { num_threads: 1 }
     task_creator: { num_threads: 1 }
+    preload:      { enabled: false }   # see sirius.executor.preload for every key
   operator_params:
     scan_task_batch_size:       805306368   # 768 MiB
     max_sort_partition_bytes:   0           # 0 = auto (33% GPU memory)
@@ -305,7 +306,8 @@ sirius:
 **Files:** `src/include/exec/config.hpp`, `src/include/creator/config.hpp`
 
 The `sirius.executor` block configures the thread pools and task scheduling. It has four
-per-pool sub-blocks: `task_creator`, `pipeline`, `downgrade`, and `scan_manager`. The
+per-pool sub-blocks: `task_creator`, `pipeline`, `downgrade`, and `scan_manager`, plus the
+`preload` block, which is off by default and has its own keys (below). The
 `scan_manager` sub-block is large and is documented in
 [Scan Manager & IO Configuration](#scan-manager--io-configuration) below.
 
@@ -315,7 +317,7 @@ hardware-derived exception described below:
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `num_threads` | int (**> 0**) | per pool (below) | Worker threads in the pool. |
-| `cpu_affinity` | list of int | — | Cores to pin task-creator and downgrade threads. GPU pipeline affinity is derived from the selected GPU's CPU topology. |
+| `cpu_affinity` | list of int | — | Cores to pin task-creator and downgrade threads. GPU pipeline affinity is derived from the selected GPU's CPU topology. The preload executor has its own `cpu_affinity` key ([below](#siriusexecutorpreload)). |
 
 ### `sirius.executor.task_creator`
 
@@ -337,6 +339,60 @@ Thread pool (default `num_threads: 1`) plus:
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `monitor_period` | int (ms) | 10 | Period of the memory-pressure monitor loop. Set to `0` to disable the monitor loop entirely. |
+
+### `sirius.executor.preload`
+
+**File:** `src/preload/config.hpp`
+
+> **Not yet active.** This release parses and validates the block, including the WARNs below,
+> but does not create the preload executor yet: `enabled: true` has no effect on execution.
+
+The preload executor undoes downgrade moves ahead of the consumer: batches the downgrade executor
+spilled to HOST or DISK are copied back to the GPU (HOST→GPU, DISK→GPU) or staged on HOST
+(DISK→HOST) before the task that reads them runs. It never encodes or decodes data, and it is
+advisory: a refused or failed promotion only costs performance, because the consuming task still
+moves its inputs itself. It is **off by default**; with `enabled: false` no executor, thread or
+event subscription exists and execution is unchanged.
+
+It is not a thread pool and has no `num_threads` key: one planner thread feeds per-GPU HOST→GPU
+lanes and per-DISK-space lanes, whose thread counts come from the two concurrency keys.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `false` | Create and run the preload executor. |
+| `host_to_gpu_concurrency` | int (**0–64**) | 0 | Concurrent HOST→GPU copies per GPU. `0` = auto: 5 when the CPU and GPU share a C2C link, otherwise 1. |
+| `disk_concurrency` | int (**0–64**) | 0 | Concurrent copies per DISK space. `0` = auto: 5 when GPUDirect Storage is in use, otherwise 1. |
+| `cpu_affinity` | list of int | `[]` | Cores to pin the preload copy threads to. Empty = no pinning. |
+| `gpu_committed_headroom_fraction` | float (0.0–1.0) | 0.0 | Inputs of queued tasks may fill a GPU up to `downgrade_stop_fraction − this` of its capacity. |
+| `gpu_speculative_headroom_fraction` | float (0.0–1.0) | 0.1 | Repository batches with no queued consumer may fill a GPU up to `downgrade_stop_fraction − this`. Raised to `gpu_committed_headroom_fraction`, with a WARN, when smaller. |
+| `host_headroom_fraction` | float (0.0–1.0) | 0.1 | DISK→HOST staging may fill a HOST space up to its `downgrade_stop_fraction − this`. |
+| `gpu_lookahead_fraction` | float (0.0–1.0) | 0.2 | Maximum preloaded-but-not-yet-consumed bytes per GPU, as a fraction of its capacity. |
+| `speculative_fraction` | float (0.0–1.0) | 0.05 | Part of `gpu_lookahead_fraction` that speculative promotions may hold. Lowered to `gpu_lookahead_fraction`, with a WARN, when larger. |
+| `max_batch_fraction` | float (0.0–1.0) | 0.1 | Never promote a batch to a GPU when its estimated need exceeds this fraction of the GPU's capacity. Lowered to `max_inflight_fraction`, with a WARN, when larger. |
+| `max_inflight_fraction` | float (0.0–1.0) | 0.1 | Maximum bytes being copied into one GPU at once, as a fraction of its capacity. |
+| `head_margin_tasks` | int (**≥ −1**) | −1 | Queued tasks at the front of a GPU's queue whose inputs are left alone, because the scheduler is about to run them. `−1` = auto: `executor.pipeline.num_threads`. The queue shared by all GPUs skips this many per GPU. |
+| `lookahead_tasks` | int (**≥ 0**) | 8 | Queued tasks per queue, past the head margin, whose inputs are considered. |
+| `repository_window` | int (**≥ 0**) | 2 | Front positions considered per repository partition. |
+| `repository_partition_lookahead` | int (**≥ 0**) | 1 | For consumers that drain partitions in order: partitions past the next one that may be promoted speculatively. |
+| `stage_to_host` | bool | `true` | Stage a DISK batch on HOST when its GPU target is unknown, out of room, or banned. When `false`, preload never stages on HOST. |
+| `max_promotions_per_batch` | int (**≥ 0**) | 2 | Maximum promotions of one batch per query. |
+| `max_lock_attempts` | int (**≥ 1**) | 3 | Attempts to take a batch's lock without blocking before the batch is dropped. |
+| `max_oom_retries` | int (**≥ 0**) | 1 | GPU out-of-memory retries per batch, each with a doubled estimate, before the batch is never targeted at a GPU again. |
+| `max_candidates` | int (**> 0**) | 65536 | Maximum batches tracked at once. At the limit, the newest query's most recently downgraded batch is dropped first. |
+
+Unknown keys are rejected, like everywhere else in the config. When `enabled` is true, loading the
+config also checks the block against each memory space and logs one WARN per finding:
+
+- a GPU whose `downgrade_stop_fraction − gpu_committed_headroom_fraction` is ≤ 0 gets no preload
+  at all; one whose speculative ceiling is ≤ 0 gets no speculative preload;
+- with `stage_to_host: true`, a HOST space whose `downgrade_stop_fraction − host_headroom_fraction`
+  is ≤ 0 gets no staging.
+
+A ceiling within 1e-9 of zero counts as zero, so rounding in the subtraction never leaves a
+class enabled with no room.
+
+Every ceiling stays at or below `downgrade_stop_fraction`, so preload on its own never starts a
+downgrade. At run time the executor re-checks each ceiling after reserving memory for a copy.
 
 ## Scan Manager & IO Configuration
 
@@ -713,7 +769,7 @@ Then open `http://localhost:8080` and select the captured Sirius engine/query.
 
 ## Thread Pool Configuration
 
-Summary of the four executor thread pools. See [Executor Configuration](#executor-configuration)
+Summary of the four executor thread pools, plus the preload executor's threads. See [Executor Configuration](#executor-configuration)
 and [Scan Manager & IO Configuration](#scan-manager--io-configuration) for the full YAML keys and
 per-pool extras.
 
@@ -723,24 +779,12 @@ per-pool extras.
 | `gpu_pipeline_executor` | `executor.pipeline` | 4 | `gpu_pipeline` | GPU pipeline task execution |
 | `downgrade_executor` | `executor.downgrade` | 1 | `downgrade` | Data tier migration (GPU→Host) |
 | `scan_manager` | `executor.scan_manager` | remaining cores (min 4) | `scan_manager` | Scan metadata production + IO reactor management |
+| `preload_executor` | `executor.preload` | off; when enabled, 1 planner plus per-GPU and per-DISK lanes | `preload-*` | Moving downgraded batches back toward the GPU before their consumer runs |
 
-The task-creator, downgrade, and scan-manager pools support optional CPU affinity lists
-(`cpu_affinity`) for core pinning. GPU pipeline affinity is derived per executor from the selected
-GPU's CPU topology. `num_threads` must be `> 0` for every pool.
-
-## DuckDB Settings Changed by Sirius
-
-Loading Sirius changes the database-wide default of one DuckDB setting. A session `SET` still wins, and a value the database already carries explicitly (from the connection config or a `SET GLOBAL` before `LOAD`) is left alone.
-
-| Setting | DuckDB default | Default with Sirius | Description |
-|---------|----------------|---------------------|-------------|
-| `delim_join_as_cte` | `true` | `false` | Whether DuckDB rewrites the delim joins it creates while decorrelating subqueries into materialized CTEs |
-
-DuckDB v2 rewrites decorrelated subqueries (correlated `EXISTS`, `NOT EXISTS`, `IN` and scalar subqueries) into materialized CTEs by default. Sirius does not yet plan those shapes well: at TPC-H SF1000, Q20, Q21 and Q22 ran 1.2-3.5x slower than with explicit delim joins, because Q21's `NOT EXISTS` became an anti join that hashes every late `lineitem` row and Q20/Q22 lost their dynamic filters behind mark joins. Sirius therefore keeps the explicit `LEFT_DELIM_JOIN` / `RIGHT_DELIM_JOIN` plans. This is a stopgap until Sirius handles the CTE plan shapes, and DuckDB already marks the setting as deprecated, so it must be revisited when DuckDB removes it. To get DuckDB's CTE plans in one session:
-
-```sql
-SET delim_join_as_cte = true;
-```
+The task-creator, downgrade, and scan-manager pools and the preload executor support optional CPU
+affinity lists (`cpu_affinity`) for core pinning. GPU pipeline affinity is derived per executor from
+the selected GPU's CPU topology. `num_threads` must be `> 0` for every pool except `scan_manager`,
+which requires `> 2`; the preload executor has no `num_threads`.
 
 ## DuckDB SET Variables
 
@@ -997,6 +1041,7 @@ These are compile-time defaults. Runtime configuration via `sirius_config` and D
 | `src/scan_manager/config.hpp` | Scan manager config (thread pool, IO reactors, readahead, object store) |
 | `src/io/cache/config.hpp` | Read-path caching config (`scan_manager.cache`: mode, eviction policy, prefetching-cache tunables) |
 | `src/io/uring/config.hpp`, `io/rest/config.hpp`, `io/object_store_config.hpp` | Per-backend IO / object-store sub-configs |
+| `src/preload/config.hpp` | Preload executor config (`executor.preload`) |
 
 ## Tuned profile: GB300, TPC-H SF1000 host-pinned
 

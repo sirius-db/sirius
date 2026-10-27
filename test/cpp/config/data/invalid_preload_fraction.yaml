@@ -1,0 +1,7 @@
+sirius:
+  topology:
+    num_gpus: 1
+  executor:
+    preload:
+      enabled: true
+      gpu_lookahead_fraction: 1.5
