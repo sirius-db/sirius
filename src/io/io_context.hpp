@@ -171,6 +171,14 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   /// Conservatively false: a backend opts in.
   [[nodiscard]] virtual bool prefers_bulk_io() const noexcept { return false; }
 
+  /// @ref prefers_bulk_io for reads of @p obj.  A backend that serves both local
+  /// files and object stores answers per object; the default is the
+  /// backend-wide answer.
+  [[nodiscard]] virtual bool prefers_bulk_io(io_object const& /*obj*/) const noexcept
+  {
+    return prefers_bulk_io();
+  }
+
   /// The smallest unit this backend can address, in bytes.  A read is widened
   /// out to a multiple of it before being issued: a local file opened O_DIRECT
   /// can only transfer whole pages, while an object store addresses single

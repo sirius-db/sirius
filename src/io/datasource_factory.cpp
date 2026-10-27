@@ -215,7 +215,27 @@ factory_type make_kvikio_ioctx_factory()
 {
   return [](const scan_manager::scan_manager_config& config) -> std::shared_ptr<ioctx> {
     try {
-      return std::make_shared<kvikio_context>(config.kvikio, config.object_store);
+      auto kvikio = config.kvikio;
+      // Same readahead depth as the REST backend unless configured: both serve
+      // object stores, whose round trips only queue depth hides.
+      if (!kvikio.n_max_concurrent_scans) {
+        kvikio.n_max_concurrent_scans = config.rest.n_max_concurrent_scans;
+      }
+      // An unstarted REST reactor opens s3:// objects for kvikIO: its one-shot
+      // HEAD and footer probe learn the ETag that kvikIO does not report.  It
+      // needs no staging, and no worker thread is ever started.
+      std::shared_ptr<rest::rest_reactor> control_plane;
+      if (auto authorizer = make_s3_authorizer(config.object_store)) {
+        auto rest_cfg           = config.rest;
+        rest_cfg.ca_bundle_path = config.object_store.ca_bundle_path;
+        rest_cfg.tls_verify     = config.object_store.tls_verify;
+        control_plane           = std::make_shared<rest::rest_reactor>(
+          std::make_shared<rest::rest_reactor::reactor_context>(std::move(rest_cfg),
+                                                                std::move(authorizer)),
+          "kvikio_ctl");
+      }
+      return std::make_shared<kvikio_context>(
+        std::move(kvikio), config.object_store, std::move(control_plane));
     } catch (const std::exception& e) {
       SIRIUS_LOG_ERROR("make_kvikio_ioctx_factory: construction failed: {}", e.what());
       return nullptr;

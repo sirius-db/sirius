@@ -333,7 +333,7 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 |-----|------|---------|-------------|
 | `num_threads` | int (**> 0**) | remaining cores (min 4) | Metadata-producer threads. Preparation and coalescing run on each query owner thread, so they cannot occupy producer capacity. |
 | `cpu_affinity` | list of int | — | Cores to pin scan-manager threads to. |
-| `backend` | enum: `sirius`, `kvikio` | `sirius` | IO backend for reads. `sirius` uses the Sirius IO stack (`io_uring` for local paths, REST for `s3://`); `kvikio` serves both local files and `s3://` objects through kvikIO (local files through its file handle, objects through its remote handle); listing and glob expansion of `s3://` still go through the REST backend. Single-GPU only: a multi-GPU configuration is forced back to `sirius`. Values are lowercase. |
+| `backend` | enum: `sirius`, `kvikio` | `sirius` | IO backend for reads. `sirius` uses the Sirius IO stack (`io_uring` for local paths, REST for `s3://`); `kvikio` serves both local files and `s3://` objects through kvikIO (local files through its file handle, objects through its remote handle); listing and glob expansion of `s3://` still go through the REST backend. Values are lowercase. |
 | `uring_n_reactors` | int (**> 0**) | 1 | Number of io_uring reactor threads for local-disk reads. |
 | `rest_n_reactors` | int (**> 0**) | 2 | Number of REST reactor threads for object-store (`s3://`) reads. |
 | `max_readahead_scans` | int | — (unset) | Scans the readahead may keep in flight, and the switch that runs it at all. See below. |
@@ -428,9 +428,9 @@ setting is shared with every other kvikIO user in the process. Treat it as
 startup configuration. `compat_mode` is the exception: it rides the file-handle
 constructor, so it scopes to files this backend opens.
 
-This backend runs without the prefetching cache and therefore without the
-readahead, so `scan_manager.cache.*`, `max_readahead_scans` and
-`readahead_strategy` have no effect on it.
+This backend serves the prefetching cache and the readahead like the REST
+backend does, so `scan_manager.cache.*`, `max_readahead_scans` and
+`readahead_strategy` apply to it. Its readahead strategy defaults to `eager`.
 
 | Key | Type | Env default | Description |
 |-----|------|-------------|-------------|
@@ -442,6 +442,8 @@ readahead, so `scan_manager.cache.*`, `max_readahead_scans` and
 | `auto_direct_io_read_overread` | bool | `KVIKIO_AUTO_DIRECT_IO_READ_OVERREAD` (false) | Align device-read offsets down and sizes up to pages so the whole transfer is pure Direct I/O, at the cost of extra bytes. Requires `auto_direct_io_read`. |
 | `thread_pool_per_block_device` | bool | `KVIKIO_THREAD_POOL_PER_BLOCK_DEVICE` (false) | Give each block device its own pool instead of sharing one global pool. |
 | `compat_mode` | enum: `auto`, `on`, `off` | `KVIKIO_COMPAT_MODE` | cuFile vs POSIX selection, per file handle. `off` enforces cuFile/GDS, `on` enforces POSIX, `auto` tries cuFile and falls back. Values are lowercase. |
+| `n_max_concurrent_scans` | int | REST's budget | Scan tasks the readahead may keep in flight against this backend. A Sirius setting, not a kvikIO default. Unset takes the REST backend's `n_max_concurrent_scans`. `0` disables the readahead for this backend. |
+| `prefer_bulk_io` | bool | true | Whether reads of `s3://` objects take the scan's bulk route, one batched request per file. A Sirius setting, not a kvikIO default. Local files never take it. |
 
 ### `scan_manager.cache` — read-path caching (`io/cache/config.hpp`)
 

@@ -401,16 +401,10 @@ struct sirius_config {
   friend class parsed_sirius_config;
 
   /// Apply the knobs derived from the rest of the configuration: the readahead
-  /// scan budgets, the @c pipeline_width stamp and the multi-GPU backend
-  /// override, in that order. Called by parsed_sirius_config::resolve after
-  /// memory capacities and operator defaults are resolved.
+  /// scan budgets and the @c pipeline_width stamp, in that order. Called by
+  /// parsed_sirius_config::resolve after memory capacities and operator
+  /// defaults are resolved.
   void finalize_derived_config();
-
-  /// When @c _memory_space_configs contains more than one GPU memory space,
-  /// force @c _scan_manager_config.backend to @c io_backend::sirius (the
-  /// sirius backend is required for multi-GPU IO routing). Emits a WARNING when
-  /// the override takes effect. Called from @ref finalize_derived_config.
-  void enforce_sirius_backend_for_multi_gpu();
 
   /// Re-default @c _scan_manager_config.rest.n_max_concurrent_scans to a
   /// multiple of the configured pipeline pool size. Object-store reads are
