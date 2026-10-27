@@ -16,6 +16,15 @@ function(sirius_add_duckdb_source)
   set(BUILD_EXTENSIONS "core_functions;parquet")
   set(BUILD_SHELL OFF)
   set(BUILD_UNITTESTS OFF)
+  if(NOT DEFINED DUCKDB_EXPLICIT_VERSION)
+    execute_process(
+      COMMAND git -C "${SIRIUS_DUCKDB_SOURCE_DIR}" rev-parse HEAD
+      OUTPUT_VARIABLE sirius_duckdb_commit
+      OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    if(sirius_duckdb_commit STREQUAL "d54cbbe3df17e8e5ce68312f483b4155836112aa")
+      set(DUCKDB_EXPLICIT_VERSION "v2.0.0")
+    endif()
+  endif()
   # Root sanitizer presets supply flags to both the library and its dependency.
   set(ENABLE_SANITIZER OFF)
   set(ENABLE_UBSAN OFF)

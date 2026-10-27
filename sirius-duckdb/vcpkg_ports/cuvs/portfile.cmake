@@ -8,7 +8,7 @@ vcpkg_from_github(
   REF
   v${VERSION}
   SHA512
-  20ab7b08c47f27ccc1d43f880c350d9f20e48b2c7bb9e0b1c6c9bf2995fa49ec7b542eaaded32b32aa53bb7294f680761ef515ba4fc9e89fa6b1384eb6b4f930
+  73c98310f8f2723545eba183ef4e40f531e60f62976c0306a281a8dd4da9927262982f687ec5d2ead1bf61eb224b16a991499c32474667b4785d6b2e87f2a124
   PATCHES
   # NVCC 13.2 miscompiles kernel pointers with std::optional parameters.
   fix-pq-kernel-optional.patch
@@ -24,11 +24,14 @@ vcpkg_from_github(
   REPO
   rapidsai/rapids-cmake
   REF
-  v26.08.00
+  v26.10.00
   SHA512
-  472e3bbc0aeedce6632c339f5a383a25524df8462a58891474523cd558b7d8d8bc09b24e8f75da6f2fbfcb83b302caa911fb5a38bc6c04871a570390e7b4a5b8
+  c5c2be8672faae3990713a990b8e0d4e1082307c9dfd5857805bd543243daf0ec2c1fe41bbdb1736d5ea4e4e9fa261de44b2e8b885d812ce822814251d9f65d2
   HEAD_REF
   main)
+
+# rapids-cmake otherwise downloads the CPM release asset during configure.
+include("${CMAKE_CURRENT_LIST_DIR}/../rapids_common.cmake")
 
 vcpkg_from_github(
   OUT_SOURCE_PATH
@@ -36,9 +39,9 @@ vcpkg_from_github(
   REPO
   rapidsai/rapids-logger
   REF
-  v0.2.3
+  v0.3.0
   SHA512
-  eb7b5ebf6289d10307b8a34d9d1469ffcb63e9371e9dd5ccbda0351923b920ebae8220ceaa8d1d52c9bed57200f35921a6365a5f9a25a209a98314f75195310c
+  0952bcd7c6579b0cc613e848c1d695466942d3a09d3f98af4c8fed97d23f5e7ad86d73603bfc58b55a4f33461b4e567716d0a70957935fefb896907bdf1074d1
   HEAD_REF
   main)
 
@@ -50,9 +53,9 @@ vcpkg_from_github(
   REPO
   rapidsai/raft
   REF
-  v26.08.00
+  v26.10.00
   SHA512
-  cbfe6c618bac35b16f5b9313f1f0315c8c9e331dcb1bdc5038be772951e45798d644f4c602a4370552cd22778676f860b54ed489662d8ac2ac775ba5efe52cf5
+  337e03c28fe351bb6108cf0409b661781db6db44b40b957f86e50cdc92b2dd33ed92379ed4d3e1789bc7230b2c7112623312b90d5fdd18562fc06f279384a106
   PATCHES
   "${CMAKE_CURRENT_LIST_DIR}/../raft/static-cuda-math.patch"
   HEAD_REF
@@ -80,11 +83,19 @@ vcpkg_from_github(
   REPO
   NVIDIA/cuCollections
   REF
-  0883368d39296f3bef3a058033141bcc642c5c54
+  8ed532dc0ba3ba664d1d41027269908ddcde04c8
   SHA512
-  be8040f9ad46a2f8cc9d9c53a2bdbd0c9ff1e83c3f93788ae5508bc9f4610028e2d326e6b357a41a65a93064960db8d18963a540f25609fe2f254eb231484aee
+  dade9af000bb490b053288312ab60e24ac1e1ba07bd4bfdde84beca98d19e20538d5b3dde285bc5feb7c8d208791aff018b8428d2b3e493721c352b6b83f127b
   HEAD_REF
   dev)
+
+# cuco's bootstrap otherwise downloads RAPIDS.cmake from a moving branch.
+vcpkg_replace_string("${CUCO_PATH}/CMakeLists.txt" "file(DOWNLOAD"
+                     "file(COPY_FILE")
+vcpkg_replace_string(
+  "${CUCO_PATH}/CMakeLists.txt"
+  "https://raw.githubusercontent.com/rapidsai/rapids-cmake/\${rapids-cmake-branch}/RAPIDS.cmake"
+  "\"${RAPIDS_CMAKE_PATH}/RAPIDS.cmake\"")
 
 # Patch rapids_logger to use vcpkg's spdlog::spdlog target instead of spdlog
 vcpkg_replace_string(
@@ -93,14 +104,26 @@ vcpkg_replace_string(
   "set_target_properties(spdlog::spdlog PROPERTIES POSITION_INDEPENDENT_CODE ON)"
 )
 
-# Static link forces BUILD_TESTS/BUILD_C_LIBRARY/BUILD_CAGRA_HNSWLIB OFF (so no
-# gtest/hnswlib source is needed). BUILD_MG_ALGOS OFF drops the multi-GPU/NCCL
-# path. Sirius uses GPU brute-force and IVF-Flat; disable CPU OpenMP support.
+# Sirius uses the existing brute-force and IVF-Flat kernels. Skip cuVS's
+# optional cuTile generation so distribution builds need no cuda.tile package.
+vcpkg_replace_string(
+  "${SOURCE_PATH}/cpp/cmake/modules/generate_cutile_kernels.cmake"
+  "  find_package(CUDAToolkit REQUIRED)"
+  "  if(CUVS_DISABLE_CUTILE)\n    message(STATUS \"cuTile kernels disabled for the Sirius vcpkg port\")\n    set(_CUTILE_SETUP_OK FALSE PARENT_SCOPE)\n    return()\n  endif()\n\n  find_package(CUDAToolkit REQUIRED)"
+)
+
+# cuVS consumes RTCX, which is installed by the cuDF port and declared as a
+# direct manifest dependency below. Static link forces BUILD_TESTS/
+# BUILD_C_LIBRARY/BUILD_CAGRA_HNSWLIB OFF (so no gtest/hnswlib source is
+# needed). BUILD_MG_ALGOS OFF drops the multi-GPU/NCCL path. Sirius uses GPU
+# brute-force and IVF-Flat; disable CPU OpenMP support.
 vcpkg_cmake_configure(
   SOURCE_PATH
   "${SOURCE_PATH}/cpp"
   OPTIONS
   -DFETCHCONTENT_SOURCE_DIR_RAPIDS-CMAKE=${RAPIDS_CMAKE_PATH}
+  -DCPM_DOWNLOAD_LOCATION=${CPM_CMAKE_PATH}
+  -DCPM_LOCAL_PACKAGES_ONLY=ON
   -DCPM_rapids_logger_SOURCE=${RAPIDS_LOGGER_PATH}
   -DCPM_raft_SOURCE=${RAFT_PATH}
   -DCPM_NvidiaCutlass_SOURCE=${CUTLASS_PATH}
@@ -113,10 +136,12 @@ vcpkg_cmake_configure(
   -DBUILD_MG_ALGOS=OFF
   -DDISABLE_OPENMP=ON
   -DCUVS_NVTX=OFF
+  -DCUVS_DISABLE_CUTILE=ON
   "-DCMAKE_CUDA_ARCHITECTURES=${VCPKG_CUDA_ARCHITECTURES}"
   -DCMAKE_CUDA_RUNTIME_LIBRARY=Static
-  "-DCMAKE_CXX_FLAGS=-I${CURRENT_INSTALLED_DIR}/include -DCCCL_IGNORE_DEPRECATED_STREAM_REF_HEADER"
-  "-DCMAKE_CUDA_FLAGS=-I${CURRENT_INSTALLED_DIR}/include -DCCCL_IGNORE_DEPRECATED_STREAM_REF_HEADER"
+  # GCC 15 diagnoses RAFT's error.hpp snprintf buffer sizing under cuVS -Werror.
+  "-DCMAKE_CXX_FLAGS=-I${CURRENT_INSTALLED_DIR}/include -DCCCL_IGNORE_DEPRECATED_STREAM_REF_HEADER -Wno-error=format-truncation"
+  "-DCMAKE_CUDA_FLAGS=-I${CURRENT_INSTALLED_DIR}/include -DCCCL_IGNORE_DEPRECATED_STREAM_REF_HEADER -Xcompiler=-Wno-error=format-truncation"
 )
 
 vcpkg_cmake_install()

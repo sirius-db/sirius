@@ -95,6 +95,9 @@ class scan_info;
 namespace io {
 class ioctx;
 }  // namespace io
+namespace scan_manager {
+class host_pin_placement;
+}  // namespace scan_manager
 
 /**
  * @brief Physical-type metadata for one cached column in one pinned chunk.
@@ -285,6 +288,8 @@ struct device_pin_result {
 ///                            skips capture (statless pin).
 /// \param compression         Per-table Simpatico settings; disabled pins every chunk
 ///                            uncompressed.
+/// \param placement           Scan-manager-owned cursor, shared across host pins. GPU order
+///                            interleaves the resolved destination host spaces.
 /// \param options             Per-pin materialization behavior (zone-map capture, carrier
 ///                            narrowing). Narrowing runs before compression, so a compressed
 ///                            chunk stores narrow columns and decompresses straight back to them.
@@ -295,6 +300,7 @@ host_pin_result materialize_pin_to_host(
   op::scan::gpu_ingestible& ingestible,
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
   const std::unordered_map<int, cucascade::memory::memory_space*>& host_space_by_gpu,
+  scan_manager::host_pin_placement& placement,
   io::ioctx& io_ctx,
   duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
   compression_pin_config const& compression,
