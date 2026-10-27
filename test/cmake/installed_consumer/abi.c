@@ -10,6 +10,11 @@ uint32_t (*volatile abi_version)(void)                     = &sirius_abi_version
 
 int main(void)
 {
+  sirius_status statuses[] = {
+    SIRIUS_SUCCESS, SIRIUS_ALLOCATION_FAILURE, SIRIUS_INVALID_ARGUMENT, SIRIUS_INTERNAL_ERROR};
+  uint32_t version = SIRIUS_ABI_VERSION;
+  (void)statuses;
+  (void)version;
   return error_message == NULL || error_message_size == NULL || error_destroy == NULL ||
          abi_version == NULL;
 }
