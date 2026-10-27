@@ -317,6 +317,8 @@ Pinning drives the source's `gpu_ingestible` to completion (`materialize_all_bat
 - **GPU tier** (`materialize_all_batches`): each resulting batch is stored as a GPU-resident `cudf::table`, round-robining placement across the GPU memory spaces. Placement is deterministic so re-pinning the same source yields identical per-chunk placement (required by the merge path below).
 - **HOST tier** (`materialize_pin_to_host`): each resulting batch is converted on its round-robin GPU to a `host_data_representation` that preserves carrier type and decimal scale on that GPU's NUMA-local host space, then the GPU table is freed before the next batch. Peak GPU residency is therefore ~one batch, so a host pin never needs the whole table to fit in GPU memory.
 
+Pinned scans preserve these chunk boundaries. Host-affinity task placement rotates independently among the GPUs of each host NUMA domain; a shared counter across domains would repeatedly select the same local GPU for alternating host spaces. Query admission can still override a locality pick outside the admitted GPU set.
+
 ### Storage and matching
 
 Each pinned table is a `pinned_entry` keyed by name in the scan manager. It holds a
