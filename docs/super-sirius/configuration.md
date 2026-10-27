@@ -24,6 +24,15 @@ Sirius searches for a config file in this order:
 
 If no config file is found, Sirius initializes with built-in defaults (95% GPU memory, 90% of each NUMA node's RAM as pinned host memory).
 
+### Memory reservation retries
+
+`sirius.memory_reservation_timeout_ms` is a positive startup integer, default **30000**.
+It bounds GPU and result-collection HOST reservation retries without observed progress.
+Only requested retry backoff counts toward the budget; time waiting for scheduling beyond
+that deadline does not. Increased available memory resets the budget, as does successful
+task execution on the same GPU for GPU reservation waits. Backoff grows from 5 to 50 ms.
+This is not an overall query deadline. Query interruption remains effective while waiting.
+
 ### Concurrent query admission
 
 `sirius.max_concurrent_queries` is a positive startup integer, default **1**, shared by

@@ -24,6 +24,7 @@ flowchart LR
 
     routing -->|GPU task routed to executor queue| queued
     queued -->|GPU task popped from executor queue| reserving
+    reserving -->|reservation shortfall: requeue with backoff| queued
     reserving -->|reservation shortfall| downgrading
     downgrading -->|retry after downgrade| reserving
     computing -->|next operator event| computing
