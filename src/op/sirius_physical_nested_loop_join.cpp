@@ -17,6 +17,7 @@
 #include "op/sirius_physical_nested_loop_join.hpp"
 
 #include "config.hpp"
+#include "cudf/ast_compat.hpp"
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
 #include "duckdb/common/exception.hpp"
@@ -34,7 +35,6 @@
 #include "sirius/exception.hpp"
 #include "telemetry/nvtx.hpp"
 
-#include <cudf/ast/expressions.hpp>
 #include <cudf/column/column.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/filling.hpp>

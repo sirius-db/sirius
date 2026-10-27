@@ -15,9 +15,9 @@
  */
 
 #pragma once
+#include "cudf/ast_compat.hpp"
 #include "expression_evaluator/query_policy.hpp"
 
-#include <cudf/ast/expressions.hpp>
 #include <cudf/table/table.hpp>
 
 #include <cuda/stream>
