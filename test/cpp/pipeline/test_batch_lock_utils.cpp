@@ -26,6 +26,8 @@
 #include "data/data_batch_utils.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
+#include "op/scan/scan_output_operator_data.hpp"
+#include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/batch_lock_utils.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
@@ -279,6 +281,43 @@ TEST_CASE("operator-data provenance retains original input order through prepara
   require_ids(input);
   auto moved = std::move(input);
   require_ids(moved);
+}
+
+TEST_CASE("scan receipt identity survives real cross-GPU replacements",
+          "[batch_lock_utils][multi_gpu][consumer_integration][scan_receipt]")
+{
+  if (skip_if_not_mgpu()) { return; }
+  batch_lock_utils_fixture f;
+  REQUIRE(f.setup(2));
+  auto const source_stream = f.gpu0->acquire_stream();
+  auto source              = f.make_gpu_batch(kNumRows, *f.gpu0, source_stream);
+  auto const original_id   = source->get_batch_id();
+  auto channel             = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  class receipt_identity_filter final : public sirius::op::sirius_dynamic_filter {
+   public:
+    sirius::op::sirius_dynamic_filter_kind kind() const override
+    {
+      return sirius::op::sirius_dynamic_filter_kind::IN_LIST;
+    }
+  };
+  auto filter = std::make_shared<receipt_identity_filter>();
+  sirius::op::scan::scan_output_operator_data input(source);
+  input.install_receipt({channel, original_id, {{filter, 0}}, {{filter, 0}}});
+  std::uint64_t previous_id = original_id;
+  for (auto* target : {f.gpu1, f.gpu0}) {
+    rmm::cuda_set_device_raii device{rmm::cuda_device_id{target->get_device_id()}};
+    rmm::cuda_stream stream;
+    input.prepare_for_processing(target, stream);
+    stream.synchronize();
+    REQUIRE(input.get_data_batches().front()->get_batch_id() != previous_id);
+    previous_id = input.get_data_batches().front()->get_batch_id();
+    REQUIRE(input.original_batch_ids() == std::vector<std::uint64_t>{original_id});
+    REQUIRE(input.receipt().original_batch_id == original_id);
+    REQUIRE(input.receipt().endpoint == channel);
+    REQUIRE(input.receipt().applied == std::vector<sirius::op::scan::applied_entry>{{filter, 0}});
+    REQUIRE(input.receipt().decode_attached == input.receipt().applied);
+    REQUIRE(input.get_read_only_batches().front().get_memory_space() == target);
+  }
 }
 
 TEST_CASE("operator-data provenance survives cross-GPU preparation and OOM rescheduling",
@@ -696,4 +735,62 @@ TEST_CASE("single-consumer source is freed promptly after a cross-GPU prepare",
     auto ro = clone_sp->to_read_only();
     REQUIRE(ro.get_memory_space()->get_id() == f.gpu1->get_id());
   }
+}
+
+TEST_CASE("cached scan on its assigned GPU reuses the pin without a copy",
+          "[batch_lock_utils][cached_scan_placement]")
+{
+  batch_lock_utils_fixture f;
+  REQUIRE(f.setup(1));
+  rmm::cuda_set_device_raii device{rmm::cuda_device_id{f.gpu0->get_device_id()}};
+  rmm::cuda_stream stream;
+  auto batch = f.make_gpu_batch(kNumRows, *f.gpu0, stream);
+  auto input = std::make_unique<sirius::op::scan::scan_operator_input>(batch);
+  auto* scan = input.get();
+  sirius::pipeline::gpu_pipeline_task_local_state state(std::move(input));
+  CHECK(state.get_estimated_bytes_to_materialize_input(f.gpu0) == 0);
+  scan->prepare_for_processing(f.gpu0, stream);
+  CHECK(scan->get_cached_batch() == batch);
+  CHECK(scan->gpu_memory_space == f.gpu0);
+  CHECK_FALSE(scan->stolen_table);
+}
+
+TEST_CASE("cached scan assigned away from its pin clones and reserves on the target GPU",
+          "[batch_lock_utils][cached_scan_placement][multi_gpu]")
+{
+  if (skip_if_not_mgpu()) return;
+  batch_lock_utils_fixture f;
+  REQUIRE(f.setup(2));
+  rmm::cuda_set_device_raii source_device{rmm::cuda_device_id{f.gpu0->get_device_id()}};
+  rmm::cuda_stream source_stream;
+  auto batch = f.make_gpu_batch(kNumRows, *f.gpu0, source_stream);
+  // Model another query reading the same pin throughout preparation.
+  auto source = batch->to_read_only();
+  auto values =
+    column_values_to_host<int64_t>(sirius::get_cudf_table_view(source).column(0), source_stream);
+  auto bytes = source.get_data()->get_uncompressed_data_size_in_bytes();
+  rmm::cuda_set_device_raii target_device{rmm::cuda_device_id{f.gpu1->get_device_id()}};
+  rmm::cuda_stream target_stream;
+  auto input = std::make_unique<sirius::op::scan::scan_operator_input>(batch);
+  auto* scan = input.get();
+  sirius::pipeline::gpu_pipeline_task_local_state state(std::move(input));
+  CHECK(state.get_estimated_bytes_to_materialize_input(f.gpu0) == 0);
+  CHECK(state.get_estimated_bytes_to_materialize_input(f.gpu1) == bytes);
+  scan->prepare_for_processing(f.gpu1, target_stream);
+  auto clone = scan->get_cached_batch();
+  REQUIRE(clone != batch);
+  CHECK(scan->gpu_memory_space == f.gpu1);
+  CHECK(source.get_memory_space() == f.gpu0);
+  CHECK_FALSE(scan->stolen_table);
+  {
+    auto read = clone->to_read_only();
+    CHECK(read.get_memory_space() == f.gpu1);
+    CHECK(column_values_to_host<int64_t>(sirius::get_cudf_table_view(read).column(0),
+                                         target_stream) == values);
+  }
+  CHECK(state.get_estimated_bytes_to_materialize_input(f.gpu1) == 0);
+  // An OOM retry reuses the already transferred input rather than copying again.
+  scan->prepare_for_processing(f.gpu1, target_stream);
+  CHECK(scan->get_cached_batch() == clone);
+  target_stream.synchronize();
 }

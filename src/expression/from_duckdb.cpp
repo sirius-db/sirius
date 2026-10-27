@@ -229,7 +229,6 @@ std::optional<int64_t> bigint_constant(duckdb::Expression const& expr)
 // gpu_substring_slice can map onto DuckDB's semantics.
 bool gpu_supports_substring(duckdb::BoundFunctionExpression const& expr)
 {
-  if (expr.GetChildren().size() != 2 && expr.GetChildren().size() != 3) { return false; }
   auto const offset = bigint_constant(*expr.GetChildren()[1]);
   auto const length = expr.GetChildren().size() == 3 ? bigint_constant(*expr.GetChildren()[2])
                                                      : substring_default_length;
@@ -239,7 +238,6 @@ bool gpu_supports_substring(duckdb::BoundFunctionExpression const& expr)
 // The GPU evaluator rounds FLOAT and DOUBLE inputs to a constant number of decimal places.
 bool gpu_supports_round(duckdb::BoundFunctionExpression const& expr)
 {
-  if (expr.GetChildren().size() != 1 && expr.GetChildren().size() != 2) { return false; }
   auto const input_type = expr.GetChildren()[0]->GetReturnType().id();
   if (input_type != duckdb::LogicalTypeId::FLOAT && input_type != duckdb::LogicalTypeId::DOUBLE) {
     return false;
@@ -249,6 +247,33 @@ bool gpu_supports_round(duckdb::BoundFunctionExpression const& expr)
   if (precision.GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) { return false; }
   auto const& value = precision.Cast<duckdb::BoundConstantExpression>().GetValue();
   return !value.IsNull() && value.type().id() == duckdb::LogicalTypeId::INTEGER;
+}
+
+// The GPU evaluator takes the absolute value of numeric inputs.
+bool gpu_supports_abs(duckdb::BoundFunctionExpression const& expr)
+{
+  auto const& type = expr.GetChildren()[0]->GetReturnType();
+  // Everything numeric besides HUGEINT and UHUGEINT.
+  return type.IsNumeric() && type.id() != duckdb::LogicalTypeId::HUGEINT &&
+         type.id() != duckdb::LogicalTypeId::UHUGEINT;
+}
+
+// Unsigned (DuckDB rejects nonzero), HUGEINT (INT64 carrier) and INTERVAL negation stay on the CPU.
+// cuDF's negation keeps its input type, so the result type must match it.
+bool gpu_supports_negate(duckdb::BoundFunctionExpression const& expr)
+{
+  auto const& type = expr.GetChildren()[0]->GetReturnType();
+  if (expr.GetReturnType() != type) { return false; }
+  switch (type.id()) {
+    case duckdb::LogicalTypeId::TINYINT:
+    case duckdb::LogicalTypeId::SMALLINT:
+    case duckdb::LogicalTypeId::INTEGER:
+    case duckdb::LogicalTypeId::BIGINT:
+    case duckdb::LogicalTypeId::FLOAT:
+    case duckdb::LogicalTypeId::DOUBLE:
+    case duckdb::LogicalTypeId::DECIMAL: return true;
+    default: return false;
+  }
 }
 
 std::unique_ptr<node> translate_function(duckdb::BoundFunctionExpression const& expr)
@@ -262,14 +287,22 @@ std::unique_ptr<node> translate_function(duckdb::BoundFunctionExpression const& 
   if (expr.GetExpressionType() == duckdb::ExpressionType::COMPARE_BETWEEN) {
     return translate_between(expr);
   }
-  auto func_id_opt =
-    sirius::from_duckdb_function_name(expr.Function().GetName().GetIdentifierName());
+  auto const name      = expr.Function().GetName().GetIdentifierName();
+  auto const& children = expr.GetChildren();
+  // A one-argument "+" is the identity. DuckDB also names BIGNUM negation "+"; IsNumeric excludes
+  // it.
+  if (children.size() == 1 && from_duckdb_function_name(name, 2) == function_id::add) {
+    auto const& operand_type = children[0]->GetReturnType();
+    if (!operand_type.IsNumeric() || expr.GetReturnType() != operand_type) { return nullptr; }
+    return from_duckdb(*children[0]);
+  }
+  auto const func_id_opt = sirius::from_duckdb_function_name(name, children.size());
   if (!func_id_opt.has_value()) { return nullptr; }
+  if (*func_id_opt == function_id::negate && !gpu_supports_negate(expr)) { return nullptr; }
   if (*func_id_opt == function_id::date_trunc) {
     // Match the GPU evaluator's supported frequencies. It requires a constant string;
     // reject other forms here so neither unsupported units nor dynamic units reach execution.
-    if (expr.GetChildren().size() != 2 ||
-        expr.GetChildren()[0]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) {
+    if (expr.GetChildren()[0]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) {
       return nullptr;
     }
     auto const& frequency =
@@ -282,17 +315,16 @@ std::unique_ptr<node> translate_function(duckdb::BoundFunctionExpression const& 
   }
   if (*func_id_opt == function_id::constant_or_null) {
     // The GPU evaluator reads the result value from a constant first argument.
-    if (expr.GetChildren().size() < 2 ||
-        expr.GetChildren()[0]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) {
+    if (expr.GetChildren()[0]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) {
       return nullptr;
     }
   }
   if (*func_id_opt == function_id::substring && !gpu_supports_substring(expr)) { return nullptr; }
   if (*func_id_opt == function_id::round && !gpu_supports_round(expr)) { return nullptr; }
+  if (*func_id_opt == function_id::abs && !gpu_supports_abs(expr)) { return nullptr; }
   if (*func_id_opt == function_id::regexp_replace) {
     // The GPU implementation supports constant patterns/replacements and DuckDB's default
-    // options only. In particular, never silently discard the fourth (options) argument.
-    if (expr.GetChildren().size() != 3) { return nullptr; }
+    // options only.
     for (std::size_t i = 1; i < 3; ++i) {
       if (expr.GetChildren()[i]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) {
         return nullptr;
@@ -370,6 +402,12 @@ std::unique_ptr<node> translate_aggregate(duckdb::BoundAggregateExpression const
   auto agg_id_opt =
     sirius::from_duckdb_aggregate_name(aggr.Function().GetName().GetIdentifierName());
   if (!agg_id_opt.has_value()) { return nullptr; }
+  if (*agg_id_opt == aggregate_id::count && aggr.GetChildren().empty()) {
+    // DuckDB's window-to-aggregate rewrite keeps the nullary overload named count.
+    // It counts rows, including NULLs, just like count_star.
+    if (aggr.IsDistinct()) { return nullptr; }
+    agg_id_opt = aggregate_id::count_star;
+  }
   auto arguments = translate_children(aggr.GetChildren());
   if (!arguments) { return nullptr; }
   auto return_type = sirius::from_duckdb(aggr.GetReturnType());

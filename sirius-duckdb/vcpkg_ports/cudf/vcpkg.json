@@ -22,11 +22,12 @@
     "rmm",
     "roaring",
     "spdlog",
+    "xxhash",
     "zlib",
     "zstd"
   ],
   "license": "Apache-2.0",
   "name": "cudf",
   "supports": "linux",
-  "version-string": "26.08.01"
+  "version-string": "26.10.00"
 }

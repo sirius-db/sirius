@@ -29,11 +29,8 @@
 #include <optional>
 #include <string>
 
-namespace sirius::op::scan {
-struct iceberg_delete_set;
-}
 namespace sirius::scan_manager {
-enum class required_input : uint8_t { footer, segments, delete_set, checkpoint_iteration };
+enum class required_input : uint8_t { footer, segments, visibility, checkpoint_iteration };
 using required_input_set = std::bitset<4>;
 enum class unit_state : uint8_t { pending, ready, failed, cancelled };
 struct unit_key {
@@ -62,8 +59,8 @@ struct footer_input {
 struct segments_input {
   std::shared_ptr<op::scan::physical_profile_table> profiles;
 };
-struct delete_set_input {
-  std::shared_ptr<op::scan::iceberg_delete_set const> value;
+struct visibility_input {
+  std::shared_ptr<op::scan::prepared_visibility const> value;
 };
 struct checkpoint_input {
   uint64_t iteration;
@@ -91,7 +88,7 @@ class preparation_unit {
   required_input_set required() const noexcept { return required_; }
   bool complete_input(footer_input);
   bool complete_input(segments_input);
-  bool complete_input(delete_set_input);
+  bool complete_input(visibility_input);
   bool complete_input(checkpoint_input);
   bool fail(preparation_failure);
   bool cancel();
@@ -109,7 +106,8 @@ class preparation_unit {
   unit_record record_;
   op::scan::split_dependencies deps_;
 };
-// Map only actual dependencies; a connector explicitly contributes delete membership closure.
-required_input_set required_inputs(op::scan::later_check_set const&, bool needs_delete_set);
+// Map only actual dependencies; a connector explicitly contributes its visibility membership
+// closure.
+required_input_set required_inputs(op::scan::later_check_set const&, bool needs_visibility);
 transparent::failure_cause classify_failure(preparation_failure const&);
 }  // namespace sirius::scan_manager

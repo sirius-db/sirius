@@ -154,7 +154,7 @@ std::unique_ptr<cucascade::host_data_representation> run_vector_search_ann(
                                       cudf::data_type{cudf::type_id::BOOL8},
                                       c.stream,
                                       c.mr);
-  auto kept  = sirius::ApplyRetentionMask(
+  auto kept  = sirius::apply_retention_mask(
     cudf::table_view{{search.neighbors->view(), search.distances->view()}},
     valid->view(),
     c.stream,

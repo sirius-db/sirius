@@ -21,6 +21,7 @@
 #include "exec/try.hpp"
 #include "late_mat/column_origin.hpp"
 #include "op/scan/batch_coalescer.hpp"
+#include "op/scan/dynamic_filter_merge.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "scan_manager/balancing_strategy.hpp"
@@ -64,6 +65,9 @@ struct databatch_provider {
     /// unless the late-mat gate is on and the scan is one whose batches are a
     /// chunk each — the addressing means nothing otherwise.
     std::shared_ptr<late_mat::scan_batch_origin const> origin;
+    /// The identities of dynamic filters attached to this batch's decoder configuration.
+    /// Transferred by the coalescer into the scan_operator_input.
+    std::vector<op::scan::applied_entry> decode_attached;
   };
 
   virtual ~databatch_provider()  = default;

@@ -16,6 +16,7 @@
 
 #include "pipeline/gpu_pipeline_task.hpp"
 
+#include "cuda/device_health.hpp"
 #include "cudf/cudf_utils.hpp"
 #include "helper/cuda_launch_error.hpp"
 #include "late_mat/port_materialize.hpp"
@@ -38,12 +39,15 @@
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <data/data_batch_utils.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <format>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace sirius {
 namespace pipeline {
@@ -88,10 +92,11 @@ void validate_operator_output_types(const op::operator_data* data,
     }
     for (cudf::size_type c = 0; c < tbl.num_columns(); c++) {
       cudf::data_type expected_cudf = physical_types.empty()
-                                        ? sirius::get_cudf_type(expected_types[c])
+                                        ? sirius::require_cudf_type(expected_types[c])
                                         : physical_types[static_cast<std::size_t>(c)];
       cudf::data_type actual        = tbl.column(c).type();
-      if (actual != expected_cudf) {
+      if (actual != expected_cudf &&
+          !op.is_alternate_physical_type(static_cast<std::size_t>(c), actual)) {
         SIRIUS_LOG_WARN(
           "gpu_pipeline_task: operator '{}' (id={}) output batch {} column {} datatype "
           "mismatch: got {}, expected {}",
@@ -177,6 +182,10 @@ void log_operator_data(const op::sirius_physical_operator& op,
 /// receive batches from more than one producer, so a decline is ordinary — and
 /// declining is the only safe answer, since materializing against a stranger's
 /// batch reads arbitrary rows of the pinned table.
+///
+/// Restoration changes column values, never rows or their order, so the result is built by
+/// `with_batches_preserving_rows`: it keeps the input's dynamic type and everything that type
+/// records about its rows, such as original batch IDs, a partition index or a scan receipt.
 std::unique_ptr<op::operator_data> materialize_deferred_input(
   op::sirius_physical_operator const& op,
   op::operator_data const& input_data,
@@ -206,22 +215,38 @@ std::unique_ptr<op::operator_data> materialize_deferred_input(
       " received a mix of deferred and materialized batches for one deferral");
   }
 
+  // The read-only leases skip null batches, so pair them with the input's non-null batches and keep
+  // each null in its position.
+  auto const& originals = input->get_data_batches();
+  if (static_cast<std::size_t>(std::ranges::count_if(
+        originals, [](auto const& batch) { return batch != nullptr; })) != batches.size()) {
+    throw std::runtime_error("[gpu_pipeline_task] operator " +
+                             std::to_string(op.get_operator_id()) +
+                             " received an input whose leases do not match its batches");
+  }
   std::vector<std::shared_ptr<cucascade::data_batch>> output;
-  output.reserve(batches.size());
-  for (std::size_t i = 0; i < batches.size(); ++i) {
-    auto* space = batches[i].get_memory_space();
+  output.reserve(originals.size());
+  std::size_t next = 0;
+  for (auto const& original : originals) {
+    if (!original) {
+      output.push_back(nullptr);
+      continue;
+    }
+    auto const i = next++;
+    auto* space  = batches[i].get_memory_space();
     auto restored =
       late_mat::materialize_at_port(directive, views[i], stream, space->get_default_allocator());
     output.push_back(
       sirius::make_data_batch(std::move(restored), *space, stream, op.batch_telemetry()));
   }
-  return input->with_data_batches(std::move(output));
+  return input->with_batches_preserving_rows(std::move(output));
 }
 
 /// Quiesce work already submitted to a task stream without replacing the exception being handled.
 void synchronize_after_exception(::cuda::stream_ref stream, const sirius_pipeline* pipeline)
 {
   auto const status = cudaStreamSynchronize(stream.get());
+  check_cuda_health(status);
   if (status != cudaSuccess) {
     SIRIUS_LOG_WARN(
       "Pipeline {}: stream synchronization while handling an exception failed: "
@@ -260,6 +285,7 @@ std::unique_ptr<op::operator_data> run_one_operator(
     // stream before rethrowing lets their owners unwind only after their last GPU reader finishes.
     synchronize_after_exception(stream, pipeline);
     auto sticky_err = cudaGetLastError();
+    check_cuda_health(sticky_err);
     if (sticky_err != cudaSuccess) {
       SIRIUS_LOG_WARN("Pipeline {}: {} (id={}) threw + left sticky CUDA error: [{}] {} — clearing",
                       pipeline->get_pipeline_id(),
@@ -277,6 +303,7 @@ std::unique_ptr<op::operator_data> run_one_operator(
   } catch (...) {
     synchronize_after_exception(stream, pipeline);
     auto sticky_err = cudaGetLastError();
+    check_cuda_health(sticky_err);
     if (sticky_err != cudaSuccess) {
       SIRIUS_LOG_WARN("Pipeline {}: {} (id={}) threw + left sticky CUDA error: [{}] {} — clearing",
                       pipeline->get_pipeline_id(),
@@ -294,6 +321,7 @@ std::unique_ptr<op::operator_data> run_one_operator(
     throw;
   }
   if (auto sticky_err = cudaGetLastError(); sticky_err != cudaSuccess) {
+    check_cuda_health(sticky_err);
     SIRIUS_LOG_WARN(
       "Pipeline {}: {} (id={}) left a sticky CUDA error after execute: [{}] {} — clearing",
       pipeline->get_pipeline_id(),
@@ -301,9 +329,14 @@ std::unique_ptr<op::operator_data> run_one_operator(
       op.get_operator_id(),
       static_cast<int>(sticky_err),
       cudaGetErrorString(sticky_err));
+    throw std::runtime_error(std::string("CUDA operator failed: ") + cudaGetErrorName(sticky_err));
   }
 
-  stream.sync();
+  auto const stream_status = cudaStreamSynchronize(stream.get());
+  check_cuda_health(stream_status);
+  if (stream_status != cudaSuccess)
+    throw std::runtime_error(std::string("CUDA stream completion failed: ") +
+                             cudaGetErrorName(stream_status));
   auto end      = std::chrono::high_resolution_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
 
@@ -332,13 +365,16 @@ std::size_t gpu_pipeline_task_local_state::get_estimated_bytes_to_materialize_in
 
   if (auto* scan_input = dynamic_cast<const op::scan::scan_operator_input*>(_input_data.get());
       scan_input && scan_input->is_resident()) {
-    // Cached scan inputs can still reside in HOST and require an upload before execution.
+    // Cached scans need space for host uploads and copies from an excluded GPU.
     auto batch = scan_input->get_cached_batch();
     if (!batch) { return 0; }
 
     auto ro          = batch->to_read_only();
     auto const* data = ro.get_data();
-    if (!data || ro.get_current_tier() == cucascade::memory::Tier::GPU) { return 0; }
+    if (!data) return 0;
+    const bool cross_space = target_space && ro.get_memory_space() &&
+                             ro.get_memory_space()->get_id() != target_space->get_id();
+    if (ro.get_current_tier() == cucascade::memory::Tier::GPU && !cross_space) return 0;
     return peak_materialization_bytes(data);
   }
 

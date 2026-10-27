@@ -45,13 +45,15 @@ jobs:
           cat /tmp/harness.log >> "$GITHUB_STEP_SUMMARY" || true
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: prefix-dev/setup-pixi@9dabb60412d3d2d967a8d682f7ce01317af40514 # v0.11.0
+      - uses: prefix-dev/setup-pixi@ad1da6449d9e506fd127fd67ab2d054a769f6a94 # v0.11.2
         with:
           cache: false
           locked: true
           pixi-version: v0.81.0
+          # cmakelang (cmake-format hook) crashes on Python 3.15: its re.Scanner
+          # patterns use capturing groups, which 3.15 rejects. Match pixi.toml.
           global-environments: |
-            pre-commit
+            pre-commit --with python=3.14
 
       - run: |
           set -o pipefail
@@ -119,12 +121,11 @@ jobs:
       fail-fast: false
     name: build (${{ matrix.build.arch }}, ${{ matrix.build.compiler }}, ${{ matrix.build.build-type }}, ${{ matrix.build.environment }}, ${{ matrix.build.cudf-channel }})
     runs-on: >-
-      ${{ matrix.build.environment == 'vcpkg'
-        && fromJSON('["self-hosted", "ubuntu-24.04", "cpu-xl"]')
-        || matrix.build.arch == 'x64'
-        && fromJSON('["self-hosted", "ubuntu-24.04", "cpu-lg"]')
-        || matrix.build.arch == 'arm64'
-        && fromJSON('["self-hosted", "ubuntu-24.04", "arm-lg"]') }}
+      ${{ fromJSON(format('["self-hosted", "ubuntu-24.04", "{0}{1}"]',
+          github.event_name == 'pull_request' && 'pr-' || '',
+          matrix.build.environment == 'vcpkg' && 'cpu-xl'
+            || matrix.build.arch == 'x64' && 'cpu-lg'
+            || matrix.build.arch == 'arm64' && 'arm-lg')) }}
     timeout-minutes: ${{ case(matrix.build.environment == 'vcpkg', 240, 60) }}
     continue-on-error: ${{ matrix.build.cudf-channel == 'nightly' }}
     steps:
@@ -142,7 +143,7 @@ jobs:
             git -C sirius-duckdb/vcpkg fetch --unshallow
           fi
 
-      - uses: prefix-dev/setup-pixi@9dabb60412d3d2d967a8d682f7ce01317af40514 # v0.11.0
+      - uses: prefix-dev/setup-pixi@ad1da6449d9e506fd127fd67ab2d054a769f6a94 # v0.11.2
         with:
           cache: false
           locked: true
@@ -191,7 +192,28 @@ jobs:
           engine=$(git rev-parse HEAD:duckdb)
           wrapper=$(git rev-parse HEAD:sirius-duckdb/duckdb)
           [[ "$engine" == "$wrapper" ]]
-          grep -q "duckdb_version: $engine" .github/workflows/distribution.yml
+
+          declared=$(grep -m1 'duckdb_version:' .github/workflows/distribution.yml | sed -E 's/.*duckdb_version:[[:space:]]*//' | tr -d '"[:space:]')
+          tag=
+          if [[ "$declared" == v* ]]; then
+            tag=$declared
+            git -C duckdb fetch --depth=1 origin "refs/tags/${declared}:refs/tags/${declared}"
+            declared=$(git -C duckdb rev-parse "${declared}^{commit}")
+          fi
+
+          [[ "$declared" == "$engine" ]]
+
+          # DUCKDB_EXPLICIT_VERSION must name the declared tag everywhere, or nowhere for a SHA.
+          files=(sirius-duckdb/Makefile cmake/sirius-duckdb-provider.cmake .github/workflows/test.yml .github/workflows/distribution.yml)
+          explicit=$(grep -h 'DUCKDB_EXPLICIT_VERSION' "${files[@]}" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9.-]*' | sort -u || true)
+          if [[ -n "$tag" ]]; then
+            [[ "$explicit" == "$tag" ]]
+            for f in "${files[@]}"; do grep 'DUCKDB_EXPLICIT_VERSION' "$f" | grep -qF "$tag"; done
+            grep -qF "$engine" sirius-duckdb/Makefile
+            grep -qF "$engine" cmake/sirius-duckdb-provider.cmake
+          else
+            [[ -z "$explicit" ]]
+          fi
 
       # Rust bindings (sirius-sys + sirius) — fmt/clippy + build/link the test.
       # Run on a single representative entry. `cargo test --no-run` compiles the

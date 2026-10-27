@@ -72,7 +72,7 @@ std::optional<op::dynamic_filter_publish_plan::admitted_key> admit_scan_route_ke
   if (!condition.right->is_reference()) { return std::nullopt; }
   auto const& build_ref = condition.right->as_reference();
 
-  auto const storage_type = sirius::try_get_cudf_type(build_ref.return_type());
+  auto const storage_type = sirius::get_cudf_type(build_ref.return_type());
   if (!storage_type.has_value()) { return std::nullopt; }
 
   auto const build_key_ordinal = to_key_column_ordinal(build_ref.column_index);
@@ -81,7 +81,7 @@ std::optional<op::dynamic_filter_publish_plan::admitted_key> admit_scan_route_ke
   auto const& probe_side = *condition.left;
   if (!probe_side.is_reference()) { return std::nullopt; }
   auto const probe_key_ordinal  = to_key_column_ordinal(probe_side.as_reference().column_index);
-  auto const probe_storage_type = sirius::try_get_cudf_type(probe_side.as_reference().return_type())
+  auto const probe_storage_type = sirius::get_cudf_type(probe_side.as_reference().return_type())
                                     .value_or(cudf::data_type{cudf::type_id::EMPTY});
 
   return op::dynamic_filter_publish_plan::admitted_key{

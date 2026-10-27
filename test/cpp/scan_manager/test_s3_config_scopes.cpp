@@ -22,10 +22,13 @@ TEST_CASE("S3 config scopes isolate paths and publish immutable replacement snap
   CHECK_FALSE(scopes.install("s3://alpha-bucket/table/data.parquet", alpha).has_value());
   auto const alpha_first = scopes.resolve("s3://alpha-bucket/table/data.parquet");
   auto const alpha_again = scopes.resolve("s3://alpha-bucket/table/data.parquet");
+  auto const alpha_upper = scopes.resolve("S3://alpha-bucket/table/data.parquet");
   auto const neighbor    = scopes.resolve("s3://alpha-bucket/table/neighbor.parquet");
   REQUIRE(alpha_first.has_value());
   REQUIRE(alpha_again.has_value());
+  REQUIRE(alpha_upper.has_value());
   CHECK(alpha_first->id == alpha_again->id);
+  CHECK(alpha_upper->id == alpha_first->id);
   CHECK_FALSE(neighbor.has_value());
   CHECK_FALSE(scopes.install("s3://alpha-bucket/table/other.parquet", alpha).has_value());
   auto const alpha_other = scopes.resolve("s3://alpha-bucket/table/other.parquet");

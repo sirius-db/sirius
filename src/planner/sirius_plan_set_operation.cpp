@@ -16,54 +16,88 @@
 
 #include "duckdb/planner/operator/logical_set_operation.hpp"
 #include "helper/type_conversions.hpp"
+#include "op/sirius_physical_empty_result.hpp"
 #include "op/sirius_physical_union.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 
+#include <numeric>
+#include <string>
+
 namespace sirius::planner {
 
-// The generator switch routes only `LOGICAL_UNION` to this builder — `EXCEPT` / `INTERSECT` keep
-// their own throwing case — so the only discrimination left here is on `setop_all`.
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::LogicalSetOperation& op)
 {
-  // A distinct UNION usually lowers to a LOGICAL_DISTINCT above this node, but not always: a
-  // WITH RECURSIVE body with no self-reference degrades to a plain LogicalSetOperation carrying
-  // the CTE's `union_all`, and nothing inserts a DistinctModifier on that path (duckdb
-  // `bind_recursive_cte_node.cpp:124`-`:127`). For that shape this throw is the only thing between
-  // a distinct UNION and duplicate rows.
-  if (!op.setop_all) {
-    throw duckdb::NotImplementedException(
-      "UNION (distinct) not supported yet; only UNION ALL is on the GPU path");
+  switch (op.type) {
+    case duckdb::LogicalOperatorType::LOGICAL_UNION: return plan_union(op);
+    case duckdb::LogicalOperatorType::LOGICAL_EXCEPT:
+    case duckdb::LogicalOperatorType::LOGICAL_INTERSECT:
+      throw duckdb::NotImplementedException(
+        "EXCEPT and INTERSECT are not supported on the GPU (falling back to CPU)");
+    default: throw duckdb::InternalException("Unrecognized operator type for LogicalSetOperation");
+  }
+}
+
+duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_generator::plan_union(
+  duckdb::LogicalSetOperation& op)
+{
+  // Degenerate UNION ALL nodes need no concatenation. Preserve the declared
+  // schema for an empty result and validate the schema when forwarding a child.
+  if (op.setop_all && op.children.empty()) {
+    return duckdb::make_uniq<sirius::op::sirius_physical_empty_result>(
+      sirius::from_duckdb_vec(op.types), 0);
+  }
+  if (op.setop_all && op.children.size() == 1) {
+    auto child = create_plan(*op.children[0]);
+    require_planned_schema(child->get_types(), op.types, "UNION ALL child");
+    return child;
   }
 
-  // `allow_out_of_order == false` asks for strict left-to-right evaluation, which N independently
-  // drained arms cannot honor. EXPORT DATABASE and deserialized plans carry it alongside
-  // `setop_all == true`, so the guard above does not catch them, and the result would be silently
-  // mis-ordered rather than an error.
+  // `UNION` and `UNION ALL` both arrive as this node. For `UNION`, DuckDB's binder plants a
+  // DISTINCT above it and sets `setop_all`, so the node itself always concatenates. The exception
+  // is a WITH RECURSIVE body that never references itself and has no USING KEY: it binds to this
+  // node with `setop_all` false and nothing above it to deduplicate (duckdb
+  // `Binder::BindNode(RecursiveCTENode&)`), so this builder adds the dedup itself, at the end.
+  //
+  // The dedup groups on every column, and a group key cannot be nested; refuse before planning.
+  if (!op.setop_all) {
+    for (duckdb::idx_t i = 0; i < op.types.size(); i++) {
+      reject_nested_column_type(op.types[i], "column " + std::to_string(i), "UNION");
+    }
+  }
+
+  // `allow_out_of_order == false` requires output in arm order, which this operator does not
+  // guarantee, so the result would be silently mis-ordered rather than an error.
   if (!op.allow_out_of_order) {
     throw duckdb::NotImplementedException(
-      "UNION ALL with ordered arms (allow_out_of_order = false) not supported on the GPU path");
+      "UNION with ordered arms (allow_out_of_order = false) is not supported on the GPU (falling "
+      "back to CPU)");
   }
 
-  // N-ary: `a UNION ALL b UNION ALL c` binds to one node with three children.
+  // N-ary: a chain of one kind, `a UNION b UNION c` or all `UNION ALL`, binds to one node with
+  // three children. A mixed chain nests.
   D_ASSERT(op.children.size() >= 2);
   if (op.children.size() < 2) {
-    throw duckdb::NotImplementedException("UNION ALL with fewer than two inputs not supported");
+    throw duckdb::NotImplementedException(
+      "UNION with fewer than two inputs is not supported on the GPU (falling back to CPU)");
   }
 
-  auto union_op = duckdb::make_uniq<sirius::op::sirius_physical_union>(
-    sirius::from_duckdb_vec(op.types), op.estimated_cardinality);
+  auto declared_types = sirius::from_duckdb_vec(op.types);
+  auto union_op =
+    duckdb::make_uniq<sirius::op::sirius_physical_union>(declared_types, op.estimated_cardinality);
 
-  for (auto& child : op.children) {
-    // Check the binder's arity invariant before lowering each arm.
-    if (child->types.size() != op.types.size()) {
-      throw duckdb::NotImplementedException(
-        "UNION ALL: input column count does not match the set operation output");
-    }
-    union_op->children.push_back(create_plan(*child));
+  for (duckdb::idx_t arm_index = 0; arm_index < op.children.size(); arm_index++) {
+    auto arm = create_plan(*op.children[arm_index]);
+    // Arms are forwarded unconverted, so each must plan the declared schema.
+    require_planned_schema(arm->get_types(), op.types, "UNION arm " + std::to_string(arm_index));
+    union_op->children.push_back(std::move(arm));
   }
 
-  return union_op;
+  if (op.setop_all) { return union_op; }
+  // Group on every column with no aggregates, as DuckDB's own planner does for `!setop_all`.
+  duckdb::vector<duckdb::idx_t> key_columns(declared_types.size());
+  std::iota(key_columns.begin(), key_columns.end(), duckdb::idx_t{0});
+  return plan_dedup(std::move(union_op), key_columns, op.estimated_cardinality);
 }
 
 }  // namespace sirius::planner

@@ -25,10 +25,12 @@
 #include <duckdb/common/multi_file/multi_file_reader.hpp>
 
 // cudf
+#include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/cudf_utils.hpp>
 #include <cudf/filling.hpp>
 #include <cudf/scalar/scalar.hpp>
+#include <cudf/table/table.hpp>
 
 // standard library
 #include <algorithm>
@@ -162,10 +164,48 @@ std::unique_ptr<cudf::table> append_parquet_virtual_columns(std::unique_ptr<cudf
   return std::make_unique<cudf::table>(std::move(columns));
 }
 
+owning_table_view select_scan_columns(owning_table_view&& table,
+                                      std::span<std::size_t const> positions,
+                                      ::cuda::stream_ref stream,
+                                      rmm::device_async_resource_ref mr)
+{
+  auto const repeats_earlier = [&](std::size_t k) {
+    return std::find(positions.begin(), positions.begin() + k, positions[k]) !=
+           positions.begin() + k;
+  };
+  std::vector<std::size_t> unique;
+  unique.reserve(positions.size());
+  for (std::size_t k = 0; k < positions.size(); ++k) {
+    if (!repeats_earlier(k)) { unique.push_back(positions[k]); }
+  }
+  if (unique.size() == positions.size()) {
+    table.select_columns(positions);
+    return std::move(table);
+  }
+
+  // Copy each repeat while `table` still owns the source it reads, so a failed copy leaves the
+  // caller holding everything submitted work may read.
+  std::vector<std::unique_ptr<cudf::column>> output(positions.size());
+  auto const source = table.view();
+  for (std::size_t k = 0; k < positions.size(); ++k) {
+    if (repeats_earlier(k)) {
+      output[k] = std::make_unique<cudf::column>(source.column(positions[k]), stream, mr);
+    }
+  }
+  table.select_columns(unique);
+  auto selected = table.release(stream, mr)->release();
+  auto next     = selected.begin();
+  for (auto& column : output) {
+    if (!column) { column = std::move(*next++); }
+  }
+  return owning_table_view{std::make_unique<cudf::table>(std::move(output))};
+}
+
 owning_table_view assemble_scan_output(scan_plan const& plan,
                                        owning_table_view&& table,
                                        std::vector<std::string> const& partition_values,
-                                       ::cuda::stream_ref stream)
+                                       ::cuda::stream_ref stream,
+                                       rmm::device_async_resource_ref mr)
 {
   if (!table) { return std::move(table); }
 
@@ -173,44 +213,21 @@ owning_table_view assemble_scan_output(scan_plan const& plan,
   // 0-column table would erase the row count downstream aggregations consume.
   if (plan.output_layout.empty()) { return std::move(table); }
 
-  // No partition columns: unique outputs use a non-owning view selection, while
-  // repeated outputs need copies. Every output_entry is DATA here (including
-  // synthesized virtual columns), and entry.idx addresses the materialized
-  // M-order view. Pure-filter columns are dropped from the output and freed
-  // when the owning table is released.
+  // No partition columns: every output_entry is DATA here (including synthesized virtual columns),
+  // and entry.idx addresses the materialized M-order view. Pure-filter columns are dropped from the
+  // output and freed when the owning table is released.
   if (!plan.has_partitions()) {
     std::vector<std::size_t> positions;
     positions.reserve(plan.output_layout.size());
-    std::unordered_set<std::size_t> seen;
-    bool has_duplicates = false;
     for (auto const& entry : plan.output_layout) {
       positions.push_back(entry.idx);
-      has_duplicates = !seen.insert(entry.idx).second || has_duplicates;
     }
-    if (!has_duplicates) {
-      table.select_columns(positions);
-      return std::move(table);
-    }
-
-    auto materialized = table.release(stream);
-    auto source       = materialized->release();
-    std::vector<std::unique_ptr<cudf::column>> output;
-    output.reserve(positions.size());
-    std::unordered_map<std::size_t, std::size_t> first_output;
-    for (auto const position : positions) {
-      auto [it, inserted] = first_output.emplace(position, output.size());
-      if (inserted) {
-        output.push_back(std::move(source.at(position)));
-      } else {
-        output.push_back(std::make_unique<cudf::column>(output.at(it->second)->view(), stream));
-      }
-    }
-    return owning_table_view{std::make_unique<cudf::table>(std::move(output))};
+    return select_scan_columns(std::move(table), positions, stream, mr);
   }
 
   // Partition columns present: materialize the reader batch and rebuild, moving
   // DATA columns out and synthesizing constant PARTITION columns from the path.
-  auto reader_output  = table.release(stream);
+  auto reader_output  = table.release(stream, mr);
   auto const num_rows = reader_output->num_rows();
   auto data_cols      = reader_output->release();  // move columns out, no GPU copy
 
@@ -224,7 +241,8 @@ owning_table_view assemble_scan_output(scan_plan const& plan,
       if (inserted) {
         out_cols.push_back(std::move(data_cols.at(entry.idx)));
       } else {
-        out_cols.push_back(std::make_unique<cudf::column>(out_cols.at(it->second)->view(), stream));
+        out_cols.push_back(
+          std::make_unique<cudf::column>(out_cols.at(it->second)->view(), stream, mr));
       }
     } else {
       auto const& pcol = plan.partition_columns.at(entry.idx);
@@ -235,7 +253,7 @@ owning_table_view assemble_scan_output(scan_plan const& plan,
       auto duckdb_val = duckdb::Value(duckdb::HivePartitioning::Unescape(pval))
                           .DefaultCastAs(sirius::to_duckdb(pcol.type));
       auto scalar = sirius::value_to_cudf_scalar(duckdb_val, pcol.type, stream);
-      out_cols.push_back(cudf::make_column_from_scalar(*scalar, num_rows, stream));
+      out_cols.push_back(cudf::make_column_from_scalar(*scalar, num_rows, stream, mr));
     }
   }
 
