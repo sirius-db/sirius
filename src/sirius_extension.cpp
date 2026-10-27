@@ -44,6 +44,7 @@ extern "C" int cudaProfilerStop();
 #include "compression/compressed_representation.hpp"
 #include "compression/compression_converters.hpp"
 #include "compression/plan_utils.hpp"
+#include "compression/spill_compression.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
@@ -2735,6 +2736,16 @@ static void SetEnablePinTableCompression(ClientContext& context, SetScope scope,
   SIRIUS_LOG_DEBUG("Updated pin_table_compression to {}", BooleanValue::Get(parameter));
 }
 
+static void SetEnableSpillCompression(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) { return; }
+  auto& compression_config                    = sirius_ctx->get_config().get_compression_config();
+  compression_config.enable_spill_compression = BooleanValue::Get(parameter);
+  sirius::compression::apply_spill_compression_config(compression_config);
+  SIRIUS_LOG_DEBUG("Updated spill_compression to {}", BooleanValue::Get(parameter));
+}
+
 static void SetPinTableInputCompressionPlanDir(ClientContext& context,
                                                SetScope scope,
                                                Value& parameter)
@@ -3411,6 +3422,14 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     LogicalType::BOOLEAN,
     Value::BOOLEAN(compression_defaults.enable_pin_table_compression),
     SetEnablePinTableCompression);
+
+  config.AddExtensionOption(
+    "spill_compression",
+    "Store batches spilled to the host or disk tier Simpatico-compressed, and decode them on "
+    "their way back to the GPU. Applies to the whole process, not just this session",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(compression_defaults.enable_spill_compression),
+    SetEnableSpillCompression);
 
   config.AddExtensionOption(
     "pin_table_input_compression_plan_dir",
