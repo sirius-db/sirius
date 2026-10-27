@@ -30,6 +30,7 @@
 #include <rmm/error.hpp>
 
 #include <cuda/stream>
+#include <cuda_runtime_api.h>
 
 #include <absl/cleanup/cleanup.h>
 #include <cucascade/cuda/event.hpp>
@@ -48,6 +49,8 @@
 #include <exception>
 #include <memory>
 #include <optional>
+#include <stdexcept>
+#include <string>
 #include <tuple>
 #include <typeinfo>
 #include <vector>
@@ -238,6 +241,18 @@ promotion_result promote_to_gpu(promotion_job const& job,
   absl::Cleanup const detach = [allocator, s] { allocator->reset_stream_reservation(s); };
 
   mut->convert_to<cucascade::gpu_table_representation>(registry, gpu.space, s);
+  // Producer-side invariant (reader-side ordering): a GPU representation published WITHOUT a
+  // writer event must be complete when its batch lock is released, since a reader that finds no
+  // event assumes completion. The pinned cuCascade's HOST->GPU and DISK->GPU converters both
+  // record a writer event and host-sync, so this is a guard; if a future converter leaves none,
+  // synchronize the promotion stream here, before the mutable lock is dropped.
+  if (auto const* const produced = mut->get_data();
+      produced != nullptr && produced->get_writer_event() == nullptr) {
+    if (auto const err = cudaStreamSynchronize(s.get()); err != cudaSuccess) {
+      throw std::runtime_error(std::string{"preload: stream sync after promotion failed: "} +
+                               cudaGetErrorString(err));
+    }
+  }
   return promoted(
     from_disk ? promotion_kind::d2g : promotion_kind::h2g, need, next_conversion_seq());
 }
