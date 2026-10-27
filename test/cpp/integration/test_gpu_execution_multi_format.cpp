@@ -767,10 +767,10 @@ class GPUExecutionIcebergFixture : public MultiFormatFixtureBase {
   //
   // What the pin is really protecting is the CPU oracle for EQUALITY deletes: the 1.4.4-era
   // build ignored them silently, so an oracle on that build would agree with a GPU path that
-  // dropped them too. 5b9ff899a1 (the build INSTALL resolves for DuckDB v1.5.6) was checked
+  // dropped them too. 4c0c0874c4 (the build INSTALL resolves for DuckDB v2.0.0) was checked
   // against test/cpp/integration/data/iceberg_v2_equality_delete and returns the 3 surviving
   // rows, not all 5. Re-run that check when bumping this.
-  static constexpr const char* kVerifiedIcebergVersion = "5b9ff899a1";
+  static constexpr const char* kVerifiedIcebergVersion = "4c0c0874c4";
 
   // Which delete kinds the GPU scan path applies itself. Positional deletes and V3 deletion
   // vectors are applied by iceberg_gpu_ingestible (they share one per-file position map), so

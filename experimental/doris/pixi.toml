@@ -30,9 +30,9 @@ mysql-client = "*"
 client = {cmd = "mysql --host 127.0.0.1 --port 9030 --user root",description = "Open a MySQL client against the local FE (start it with `fe-run` in another terminal first)"}
 
 [feature.be.dependencies]
-# protoc for prost/tonic codegen of the Doris proto IDL, and the thrift compiler for the
-# thrift IDL (both under the `doris/` submodule).
+# Substrait 0.63 (pinned by substrait-explain 0.9) still invokes protoc during its build.
 libprotobuf = "7.*"
+# The thrift compiler generates bindings for the thrift IDL under the `doris/` submodule.
 rust = "*"
 thrift-compiler = "0.22.*"
 
