@@ -16,6 +16,7 @@
 
 #include "preload/promotion.hpp"
 
+#include "cuda/device_health.hpp"
 #include "data/convertible_data.hpp"
 #include "data/data_batch_utils.hpp"
 #include "data/sirius_converter_registry.hpp"
@@ -47,6 +48,7 @@
 #include <exception>
 #include <memory>
 #include <optional>
+#include <tuple>
 #include <typeinfo>
 #include <vector>
 
@@ -334,6 +336,22 @@ std::size_t promotion_peak_bytes(cucascade::idata_representation const& data)
   return base;
 }
 
+namespace {
+
+/// A fatal CUDA error invalidates the shared context: latch it through the lifecycle registry
+/// (#2007) now rather than leave the next pipeline task to be the first to hit the sticky error.
+/// Only fatal errors: an ordinary promotion failure is best-effort and is not the query's error.
+void report_if_fatal(promotion_job const& job,
+                     promotion_env const& env,
+                     std::exception_ptr error) noexcept
+{
+  if (sirius::fatal_device_status(error)) {
+    std::ignore = env.lifecycle.report_failure(std::move(error), job.query);
+  }
+}
+
+}  // namespace
+
 promotion_result promote_one(promotion_job const& job,
                              promotion_env const& env,
                              std::atomic<std::size_t>* unreserved) noexcept
@@ -356,8 +374,10 @@ promotion_result promote_one(promotion_job const& job,
     log::log_noexcept([&] {
       SIRIUS_LOG_DEBUG("[preload] promotion of batch {} failed: {}", job.batch_id, e.what());
     });
+    report_if_fatal(job, env, std::current_exception());
     return outcome(promotion_outcome::failed);
   } catch (...) {
+    report_if_fatal(job, env, std::current_exception());
     return outcome(promotion_outcome::failed);
   }
 }

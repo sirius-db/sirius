@@ -562,13 +562,13 @@ void gpu_pipeline_executor::process_task(
                 ex.get_resume_operator_index(),
                 ex.what());
               if (completion) {
-                completion->report_error(std::make_exception_ptr(std::runtime_error(
-                                           "GPU pipeline task exceeded maximum retry limit (" +
-                                           std::to_string(MAX_RETRIES) + ") for original task " +
-                                           std::to_string(orig_task_id) + ": " + ex.what())),
-                                         oom_reschedule
-                                           ? transparent::late_failure_cause::oom_exhausted
-                                           : transparent::late_failure_cause::retry_exhausted);
+                completion->report_error(
+                  std::make_exception_ptr(
+                    std::runtime_error("GPU pipeline task exceeded maximum retry limit (" +
+                                       std::to_string(MAX_RETRIES) + ") for original task " +
+                                       std::to_string(orig_task_id) + ": " + ex.what())),
+                  oom_reschedule ? transparent::late_failure_cause::oom_exhausted
+                                 : transparent::late_failure_cause::retry_exhausted);
               }
               return;
             }

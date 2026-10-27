@@ -296,15 +296,13 @@ TEST_CASE("downgrade_record_query_id prefers the pipeline's id, then the priorit
   rec.task_priority = sirius::query_priority_bits(sirius::make_query_id(9)) | 5;
   REQUIRE(downgrade_record_query_id(rec) == sirius::make_query_id(9));
 
-  // The priority holds only 31 bits of the id; the pipeline's id is exact.
-  auto const wide   = sirius::make_query_id(0x8000'0009U);
-  rec.task_priority = sirius::query_priority_bits(wide);
-  REQUIRE(downgrade_record_query_id(rec) == sirius::make_query_id(9));
-  rec.task_query_id = wide;
-  REQUIRE(downgrade_record_query_id(rec) == wide);
+  // The pipeline's id wins over the query packed into the priority.
+  auto const pipeline_query = sirius::make_query_id(12);
+  rec.task_query_id         = pipeline_query;
+  REQUIRE(downgrade_record_query_id(rec) == pipeline_query);
 
   rec.task_priority.reset();
-  REQUIRE(downgrade_record_query_id(rec) == wide);
+  REQUIRE(downgrade_record_query_id(rec) == pipeline_query);
 }
 
 TEST_CASE("publish_downgraded_batches reports the moves of a conversion that threw",

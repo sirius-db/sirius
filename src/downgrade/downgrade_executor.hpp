@@ -59,8 +59,8 @@ namespace parallel {
  * @brief The query a task-queue downgrade record is reported under.
  *
  * The id of the task's pipeline when the record carries one, otherwise the query packed into the
- * high bits of the task's scheduling priority (see query_priority_bits(), which masks it to 31
- * bits), otherwise nullopt: such a record cannot be attributed and is not published.
+ * high bits of the task's scheduling priority (see query_priority_bits()), otherwise nullopt: such
+ * a record cannot be attributed and is not published.
  */
 [[nodiscard]] std::optional<query_id_t> downgrade_record_query_id(
   event::downgraded_batch const& record) noexcept;
