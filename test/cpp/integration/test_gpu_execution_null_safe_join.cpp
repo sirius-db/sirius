@@ -355,6 +355,9 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   sirius::test::scoped_setting small_partitions(*con, "hash_partition_bytes", 1024 * 1024);
   sirius::test::scoped_setting small_build(*con, "max_build_hash_table_bytes", 512 * 1024);
   sirius::test::scoped_setting small_batches(*con, "scan_task_batch_size", 256 * 1024);
+  // Below the per-partition build size: only the planner's whole-build concat (join_concat_all)
+  // folds each partition's build into the one batch a MARK needs.
+  sirius::test::scoped_setting small_concat(*con, "concat_batch_bytes", 64 * 1024);
 
   // Correlated projected EXISTS: decorrelates to an all-null-safe MARK.
   compare_gpu_vs_cpu(
@@ -392,6 +395,9 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   sirius::test::scoped_setting small_partitions(*con, "hash_partition_bytes", 1024 * 1024);
   sirius::test::scoped_setting small_build(*con, "max_build_hash_table_bytes", 512 * 1024);
   sirius::test::scoped_setting small_batches(*con, "scan_task_batch_size", 256 * 1024);
+  // Below the per-partition build size: only the planner's whole-build concat (join_concat_all)
+  // folds each partition's build into the one batch a MARK needs.
+  sirius::test::scoped_setting small_concat(*con, "concat_batch_bytes", 64 * 1024);
 
   for (std::string const build : {"ppr_clean", "ppr_one_null", "ppr_nulls"}) {
     CAPTURE(build);

@@ -1366,6 +1366,108 @@ TEST_CASE(
   }
 }
 
+// The BUILD_PROBE counterpart: on two GPUs a build that fits one hash table per GPU, but is too
+// large to broadcast, is hash-partitioned into one BUILD_PROBE slot per GPU. Each slot's hash
+// table holds only its share of the build, so its marks must also use the join-wide build facts.
+TEST_CASE(
+  "sirius_physical_hash_join null-propagating MARK uses global build facts across BUILD_PROBE "
+  "partitions",
+  "[physical_hash_join][mark][nulls][partition][build_probe]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space);
+  bool const build_has_null = GENERATE(true, false);
+  CAPTURE(build_has_null);
+
+  auto f          = create_mark_join();
+  auto build_repo = std::make_unique<cucascade::shared_data_repository>();
+  auto probe_repo = std::make_unique<cucascade::shared_data_repository>();
+  sirius::pipeline::pipeline_build_context ctx{nullptr, true};
+  auto build_pipeline = std::make_shared<finishable_mark_pipeline>(ctx);
+  auto probe_pipeline = std::make_shared<finishable_mark_pipeline>(ctx);
+  sirius::pipeline::sirius_pipeline_build_state build_state;
+  build_state.add_pipeline_operator(*build_pipeline, *f.hash_join->children[1]);
+  build_state.add_pipeline_operator(*probe_pipeline, *f.hash_join->children[0]);
+  auto attach_port = [&](std::string_view name,
+                         cucascade::shared_data_repository& repo,
+                         std::shared_ptr<finishable_mark_pipeline> source) {
+    auto port          = std::make_unique<sirius_physical_operator::port>();
+    port->type         = MemoryBarrierType::PARTIAL;
+    port->repo         = &repo;
+    port->src_pipeline = std::move(source);
+    f.hash_join->add_port(name, std::move(port));
+  };
+  attach_port("build", *build_repo, build_pipeline);
+  attach_port("default", *probe_repo, probe_pipeline);
+
+  // Size the join on two GPUs: half the build per GPU fits the hash-table budget, the whole build
+  // is far over the broadcast limit. Tasks run on this test's device; only the sizing is 2-GPU.
+  f.hash_join->set_active_gpu_ids({0, 1});
+  constexpr uint64_t build_bytes = 2 * sirius::config::DEFAULT_HASH_PARTITION_BYTES;
+  auto const strategy =
+    f.hash_join->get_partition_strategy({build_bytes, true, true, build_bytes, 1000});
+  REQUIRE(strategy.num_partitions == 2);
+  REQUIRE(strategy.build_probe);
+  REQUIRE_FALSE(strategy.broadcast);
+  f.hash_join->set_placement(std::make_shared<const partition_placement>(strategy.placement));
+  f.hash_join->note_build_observer_attached();
+
+  // The whole build {2, X} (X = NULL or 5) as the PARTITION saw it; X lands in partition 1.
+  auto whole_build = make_numeric_batch_with_nulls<int32_t>(
+    *space, {2, 5}, {true, !build_has_null}, cudf::type_id::INT32);
+  f.hash_join->observe_partitioned_build_batch(whole_build->to_read_only());
+  build_repo->add_data_batch(make_numeric_batch<int32_t>(*space, {2}, cudf::type_id::INT32), 0);
+  build_repo->add_data_batch(
+    make_numeric_batch_with_nulls<int32_t>(*space, {5}, {!build_has_null}, cudf::type_id::INT32),
+    1);
+  // Partition 0 probes {1, 2, NULL} (1 is an unmatched non-NULL key); partition 1 probes {3}.
+  auto p0_key = make_numeric_batch_with_nulls<int32_t>(
+    *space, {1, 2, 0}, {true, true, false}, cudf::type_id::INT32);
+  probe_repo->add_data_batch(
+    concatenate_batches_horizontal(
+      {p0_key, make_numeric_batch<int32_t>(*space, {10, 20, 30}, cudf::type_id::INT32)}, *space),
+    0);
+  probe_repo->add_data_batch(
+    make_two_column_batch<int32_t, int32_t>(
+      *space, {3}, {40}, cudf::type_id::INT32, std::nullopt, cudf::type_id::INT32),
+    1);
+  build_pipeline->finished = true;
+  probe_pipeline->finished = true;
+
+  // One build-and-probe task per slot.
+  std::map<std::size_t, std::pair<std::vector<bool>, std::vector<bool>>> marks;
+  for (auto hint = f.hash_join->get_next_task_hint();
+       hint.has_value() && hint->hint == TaskCreationHint::READY;
+       hint = f.hash_join->get_next_task_hint()) {
+    auto input = f.hash_join->get_next_task_input_data();
+    REQUIRE(input != nullptr);
+    auto const& partitioned = dynamic_cast<const partitioned_operator_data&>(*input);
+    REQUIRE(partitioned.get_partition_idx().has_value());
+    REQUIRE(partitioned.get_data_batches().size() == 2);
+    auto output = f.hash_join->execute(*input, cudf::get_default_stream());
+    auto view   = sirius::get_cudf_table_view(
+      *dynamic_cast<const pipelineable_operator_data&>(*output).get_data_batches()[0]);
+    auto mark                               = view.column(2);
+    marks[*partitioned.get_partition_idx()] = {copy_validity_to_host(mark),
+                                               copy_column_to_host<bool>(mark)};
+  }
+  REQUIRE(f.hash_join->is_build_probe_mode());
+  REQUIRE(marks.size() == 2);
+
+  if (build_has_null) {
+    // The NULL build key sits in partition 1, yet partition 0's miss (1) and NULL key are NULL.
+    REQUIRE(marks[0].first == std::vector<bool>{false, true, false});
+    REQUIRE(marks[0].second[1] == true);
+    REQUIRE(marks[1].first == std::vector<bool>{false});
+  } else {
+    REQUIRE(marks[0].first == std::vector<bool>{true, true, false});
+    REQUIRE(marks[0].second[0] == false);
+    REQUIRE(marks[0].second[1] == true);
+    REQUIRE(marks[1].first == std::vector<bool>{true});
+    REQUIRE(marks[1].second[0] == false);
+  }
+}
+
 TEST_CASE("sirius_physical_nested_loop_join SEMI and ANTI honor the left projection map",
           "[physical_nested_loop_join][projection][semi][anti]")
 {

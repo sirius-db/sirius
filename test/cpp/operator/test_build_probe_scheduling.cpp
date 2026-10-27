@@ -847,12 +847,15 @@ TEST_CASE("primary_input_port - build-streaming joins nominate nothing",
   }
 }
 
-TEST_CASE("refresh_cross_schedule rejects a SEMI build partition that is not concat-folded",
-          "[hash_join][cross_schedule][build_probe]")
+TEST_CASE("refresh_cross_schedule rejects a SEMI or MARK build partition that is not concat-folded",
+          "[hash_join][cross_schedule][build_probe][mark]")
 {
-  static auto manager      = sirius::test::operator_utils::initialize_memory_manager();
-  auto* space              = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
-  auto f                   = make_join(duckdb::JoinType::SEMI);
+  static auto manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space         = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  // A hash-partitioned STANDARD MARK, like SEMI, gives each probe row one result per build batch.
+  auto const join_type = GENERATE(duckdb::JoinType::SEMI, duckdb::JoinType::MARK);
+  CAPTURE(duckdb::JoinTypeToString(join_type));
+  auto f                   = make_join(join_type);
   f.hash_join->operator_id = 1;
   cucascade::shared_data_repository build_repo;
   cucascade::shared_data_repository probe_repo;
@@ -877,8 +880,8 @@ TEST_CASE("refresh_cross_schedule rejects a SEMI build partition that is not con
   // One folded build batch per partition is the invariant.
   REQUIRE_NOTHROW(f.hash_join->refresh_cross_schedule());
 
-  // A second build batch in the same partition after the build finished would let SEMI emit a
-  // probe row once per build batch.
+  // A second build batch in the same partition after the build finished would let SEMI emit (or
+  // MARK mark) a probe row once per build batch.
   build_repo.add_data_batch(batch());
   REQUIRE_THROWS_WITH(f.hash_join->refresh_cross_schedule(),
                       Catch::Matchers::ContainsSubstring("single concat-folded build batch"));
