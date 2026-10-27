@@ -49,6 +49,7 @@
 #include "sirius/ffi.hpp"
 #include "sirius_config.hpp"   // sirius::sirius_config
 #include "sirius_context.hpp"  // duckdb::SiriusContext
+#include "sirius_ffi_testing.hpp"
 
 #include <algorithm>
 #include <array>
@@ -56,6 +57,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -110,6 +112,23 @@ double elapsed_ms(std::chrono::steady_clock::time_point since)
 {
   return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - since)
     .count();
+}
+
+// --- Test-only capture pause seam --------------------------------------------------------------
+
+std::mutex capture_pause_mutex;
+std::function<void()> capture_pause_hook;
+
+// Runs the installed hook (if any) outside the hook mutex, so the hook may itself install or
+// clear hooks or touch the Context's thread-safe members.
+void run_capture_pause_hook()
+{
+  std::function<void()> hook;
+  {
+    std::lock_guard lock(capture_pause_mutex);
+    hook = capture_pause_hook;
+  }
+  if (hook) { hook(); }
 }
 
 // --- ObjectStoreConfig checks ------------------------------------------------------------------
@@ -516,6 +535,7 @@ void Context::execute_substrait(const std::string& plan, std::uintptr_t out_stre
   // only sees the total, and the query window in the telemetry covers execution alone.
   double lower_ms = 0, plan_ms = 0, execute_ms = 0;
   auto const snapshot = impl_->capture_object_store();
+  run_capture_pause_hook();
   in_transaction(impl_->conn_mutex, *impl_->conn, [&] {
     // The same result path as a zero-output Fragment.
     sirius::exec::fragment_spec spec;
@@ -710,6 +730,7 @@ void Fragment::build(const std::string& substrait_plan)
 
   std::unique_ptr<sirius::exec::streaming_fragment> fragment;
   impl_->object_store = impl_->ctx.capture_object_store();
+  run_capture_pause_hook();
   // Type-name parsing, CREATE VIEW, and Substrait lowering all need an active transaction. A
   // failure rolls back the views, so a half-declared fragment leaves nothing behind.
   in_transaction(impl_->ctx.conn_mutex, *impl_->ctx.conn, [&] {
@@ -811,5 +832,15 @@ std::unique_ptr<std::string> stream_view_name(std::uint64_t stream_id)
 {
   return std::make_unique<std::string>(stream_view_name_of(stream_id));
 }
+
+namespace testing {
+
+void set_capture_pause_hook(std::function<void()> hook)
+{
+  std::lock_guard lock(capture_pause_mutex);
+  capture_pause_hook = std::move(hook);
+}
+
+}  // namespace testing
 
 }  // namespace sirius::ffi
