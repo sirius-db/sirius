@@ -7,7 +7,7 @@ and [Pixi](https://pixi.prefix.dev/) to manage build dependencies.
 
 ## Public API documentation
 
-Build the C reference for `include/sirius/c/`, the C++ reference for `include/sirius/`,
+Build the C reference for `include/sirius-c/`, the C++ reference for `include/sirius/`,
 and the Rust `sirius` crate reference:
 
 ```bash
@@ -31,7 +31,7 @@ Python or helper script.
 
 The landing page and C/C++ theme follow the system light/dark preference; the Rust
 reference uses Rustdoc's built-in themes. Doxygen configuration and styling live
-in `docs/api/` and `docs/c/`, and the landing page lives in `docs/site/`. Generated output stays
+in `docs/Doxyfile.common`, `docs/api/`, and `docs/c/`, and the landing page lives in `docs/site/`. Generated output stays
 under `build/docs/`. The `docs` task assembles all three references into a fresh
 `build/docs/site/` directory for publication.
 

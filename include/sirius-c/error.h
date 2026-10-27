@@ -2,7 +2,7 @@
 /** @file
  * @brief Status codes and owned diagnostics for the public C API. */
 #pragma once
-#include <sirius/c/export.h>
+#include <sirius-c/export.h>
 #include <stddef.h>
 #include <stdint.h>
 #ifdef __cplusplus
