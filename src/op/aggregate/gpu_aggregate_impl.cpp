@@ -20,6 +20,7 @@
 #include "log/logging.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/aggregate/group_key_labels.hpp"
+#include "op/aggregate/sorted_keys.hpp"
 #include "op/aggregate/stddev.hpp"
 
 #include <cudf/column/column_factories.hpp>
@@ -300,8 +301,7 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
   bool keys_sorted = false;
   if (!has_collect_set && group_cols.size() == 1 && key_is_radix_sortable(group_cols[0]) &&
       !cudf::is_dictionary(group_cols[0].type())) {
-    keys_sorted = cudf::is_sorted(
-      cudf::table_view(group_cols), {cudf::order::ASCENDING}, {cudf::null_order::AFTER}, stream);
+    keys_sorted = keys_ascending(group_cols[0], stream);
     SIRIUS_LOG_DEBUG(
       "local_grouped_agg: sorted-key check rows={} sorted={}", input_table.num_rows(), keys_sorted);
   }

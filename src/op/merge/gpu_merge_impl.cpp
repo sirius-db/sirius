@@ -18,6 +18,7 @@
 
 #include "data/data_batch_utils.hpp"
 #include "log/logging.hpp"
+#include "op/aggregate/sorted_keys.hpp"
 #include "op/aggregate/stddev.hpp"
 
 #include <cudf/aggregation.hpp>
@@ -289,10 +290,8 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
       group_cols.push_back(col);
     }
   }
-  bool const keys_sorted =
-    try_sorted_merge && group_cols.size() == 1 && !group_cols[0].has_nulls() &&
-    cudf::is_sorted(
-      cudf::table_view(group_cols), {cudf::order::ASCENDING}, {cudf::null_order::AFTER}, stream);
+  bool const keys_sorted = try_sorted_merge && group_cols.size() == 1 &&
+                           !group_cols[0].has_nulls() && keys_ascending(group_cols[0], stream);
   SIRIUS_LOG_DEBUG("merge_grouped_agg: sorted-key check tried={} rows={} batches={} sorted={}",
                    try_sorted_merge,
                    concatenated->num_rows(),
