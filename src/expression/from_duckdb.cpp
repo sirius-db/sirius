@@ -402,6 +402,12 @@ std::unique_ptr<node> translate_aggregate(duckdb::BoundAggregateExpression const
   auto agg_id_opt =
     sirius::from_duckdb_aggregate_name(aggr.Function().GetName().GetIdentifierName());
   if (!agg_id_opt.has_value()) { return nullptr; }
+  if (*agg_id_opt == aggregate_id::count && aggr.GetChildren().empty()) {
+    // DuckDB's window-to-aggregate rewrite keeps the nullary overload named count.
+    // It counts rows, including NULLs, just like count_star.
+    if (aggr.IsDistinct()) { return nullptr; }
+    agg_id_opt = aggregate_id::count_star;
+  }
   auto arguments = translate_children(aggr.GetChildren());
   if (!arguments) { return nullptr; }
   auto return_type = sirius::from_duckdb(aggr.GetReturnType());

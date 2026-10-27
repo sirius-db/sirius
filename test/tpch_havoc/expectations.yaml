@@ -26,11 +26,6 @@ expectations:
               Q10_V09, Q11_V09, Q12_V09, Q13_V09, Q14_V09, Q15_V09, Q18_V09]
 
   - outcome: plan_rejected
-    reason: UNION ALL with fewer than two inputs not supported
-    issue: 2286
-    queries: [Q01_V04, Q02_V04, Q03_V04, Q15_V04, Q16_V04, Q17_V04, Q18_V04]
-
-  - outcome: plan_rejected
     reason: Cross product not supported in GPU
     issue: 2287
     queries: [Q04_V01, Q12_V01, Q13_V01, Q13_V08, Q16_V01]
@@ -50,11 +45,6 @@ expectations:
     issue: 2290
     queries: [Q01_V07]
 
-  - outcome: plan_rejected
-    reason: "Unsupported aggregate function: count with no children"
-    issue: 2291
-    queries: [Q01_V08]
-
   # With Sirius loaded, binding fails with an INTERNAL error even on the CPU, which invalidates the
   # database for every later test.
   - outcome: skip
@@ -62,9 +52,3 @@ expectations:
     issue: 2294
     scan: native
     queries: [Q02_V08]
-
-  - outcome: mismatch
-    reason: NOT IN returns no rows on the parquet copy of orders, which has bloom filters
-    issue: 2295
-    scan: parquet
-    queries: [Q04_V04]

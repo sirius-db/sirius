@@ -49,7 +49,7 @@ fs::path integration_data_dir()
 // last-created-first, which is why `build_pipelines` creates them in reverse; this pins the
 // result, not the loop.
 TEST_CASE("physical_union - arm pipelines are scheduled in arm order, arm 0 first",
-          "[integration][pipeline][union_all]")
+          "[integration][pipeline][union][union_all]")
 {
   REQUIRE(sirius::test::g_integration_env != nullptr);
   if (!sirius::test::g_integration_env->is_active()) { sirius::test::g_integration_env->resume(); }

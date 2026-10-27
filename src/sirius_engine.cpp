@@ -23,7 +23,6 @@
 #include "duckdb/parallel/thread_context.hpp"
 #include "io/sirius_datasource.hpp"
 #include "log/logging.hpp"
-#include "op/scan/iceberg_gpu_ingestible.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_cte.hpp"
@@ -63,8 +62,7 @@ void finish_deferred_preparation(op::sirius_physical_operator const* plan) noexc
   if (!plan) return;
   planner::for_each_gpu_scan(*plan, [](op::sirius_physical_operator const& source) {
     if (auto const* scan = dynamic_cast<op::scan::sirius_gpu_scan_operator const*>(&source))
-      if (auto* ice = dynamic_cast<op::scan::iceberg_gpu_ingestible*>(&scan->get_ingestible()))
-        ice->finish_preparation();
+      scan->get_ingestible().finish_preparation();
   });
 }
 

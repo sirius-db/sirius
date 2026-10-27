@@ -12,6 +12,7 @@
 #include "io/rest/s3/sigv4_authorizer.hpp"
 #include "io/s3/sirius_httpfs.hpp"
 #include "io/sirius_datasource.hpp"
+#include "op/scan/field_id_mapping.hpp"
 #include "op/scan/table_scan/bound_read_view.hpp"
 #include "op/scan/table_scan/scan_contract.hpp"
 #include "scan_manager/config.hpp"
@@ -23,6 +24,10 @@
 #include "utils/s3_backend.hpp"
 #include "utils/s3_test_env.hpp"
 #include "utils/transparent_execution_test_utils.hpp"
+
+#include <cudf/utilities/memory_resource.hpp>
+
+#include <rmm/cuda_stream.hpp>
 
 #include <duckdb.hpp>
 #include <duckdb/catalog/catalog.hpp>
@@ -3338,7 +3343,7 @@ TEST_CASE("Explicit replay rejects S3 behind a view before CPU replay starts",
   CHECK_FALSE(context->get_scan_manager().holds_any_checkpoint_key());
 }
 
-TEST_CASE("R2a S3 semantic verdict keeps the source replay veto",
+TEST_CASE("S3 semantic verdict keeps the source replay veto",
           "[s3][integration][transparent][verdict]")
 {
   auto env = load_s3_test_env();
@@ -3375,7 +3380,7 @@ TEST_CASE("S3 late physical refusal follows a published GPU batch and never repl
                    "COPY (SELECT x::DOUBLE x FROM (VALUES (1.2),(2.0)) t(x)) TO " +
                      directory.file_literal("b.parquet") + " (FORMAT PARQUET)");
   for (auto file : {"a.parquet", "b.parquet"}) {
-    if (!sirius::test::put_s3_test_object(std::string("r2a-late/") + file,
+    if (!sirius::test::put_s3_test_object(std::string("late-scan-refusal/") + file,
                                           read_binary_file(directory.path() / file))) {
       SUCCEED("managed MinIO is required to upload the late-failure fixture");
       return;
@@ -3385,12 +3390,12 @@ TEST_CASE("S3 late physical refusal follows a published GPU batch and never repl
   require_query_ok(fixture.con, "SET scan_task_batch_size=1");
   require_query_ok(fixture.con, "SET sirius_test_hold_footer_index=2");
   auto& context = require_sirius_context(fixture);
-  auto sql      = "SELECT sum(x) FROM " + s3_parquet_glob_scan(*env, "r2a-late/*.parquet");
+  auto sql      = "SELECT sum(x) FROM " + s3_parquet_glob_scan(*env, "late-scan-refusal/*.parquet");
   // The explicit SQL rewriter accepts a single S3 URI, not a glob. The view
   // preserves this same two-file bound scan without rewriting the glob as an object key.
   require_query_ok(fixture.con,
                    "CREATE VIEW late_s3_input AS SELECT * FROM " +
-                     s3_parquet_glob_scan(*env, "r2a-late/*.parquet"));
+                     s3_parquet_glob_scan(*env, "late-scan-refusal/*.parquet"));
   for (bool explicit_entry : {false, true}) {
     auto before = context.get_transparent_execution_stats();
     std::promise<void> footer_started;
@@ -3428,8 +3433,8 @@ TEST_CASE("S3 late physical refusal follows a published GPU batch and never repl
     }
     REQUIRE(observations.size() == 1);
     auto const& registrations = observations.front().readahead_registrations;
-    CHECK(registrations.contains(s3_uri(env->bucket, "r2a-late/a.parquet")));
-    CHECK_FALSE(registrations.contains(s3_uri(env->bucket, "r2a-late/b.parquet")));
+    CHECK(registrations.contains(s3_uri(env->bucket, "late-scan-refusal/a.parquet")));
+    CHECK_FALSE(registrations.contains(s3_uri(env->bucket, "late-scan-refusal/b.parquet")));
   }
 }
 
@@ -3457,7 +3462,7 @@ TEST_CASE("S3 mixed Parquet schemas flush between files on first and repeated re
     fixture.con,
     "COPY (SELECT 20::DOUBLE x) TO " + directory.file_literal("b.parquet") + " (FORMAT PARQUET)");
   for (auto file : {"a.parquet", "b.parquet"}) {
-    REQUIRE(sirius::test::put_s3_test_object(std::string("r2a-d7/") + file,
+    REQUIRE(sirius::test::put_s3_test_object(std::string("schema-validation/") + file,
                                              read_binary_file(directory.path() / file)));
   }
   auto local = require_query_ok(
@@ -3496,9 +3501,9 @@ TEST_CASE("S3 mixed Parquet schemas flush between files on first and repeated re
     auto cold_source = manager.create_datasource(directory.file("pin-a.parquet"));
     REQUIRE(cold_source);
     CHECK(cold_source->metadata() == nullptr);
-    require_query_ok(
-      fixture.con,
-      "CALL pin_table(" + pin_glob + ", name='r2a_d7_pin', format='parquet', tier='parquet')");
+    require_query_ok(fixture.con,
+                     "CALL pin_table(" + pin_glob +
+                       ", name='schema_validation_pin', format='parquet', tier='parquet')");
     CHECK(cold_source->metadata() != nullptr);
     auto local_before = sirius::test::get_transparent_execution_stats(fixture.con);
     auto pinned = require_query_ok(fixture.con, "SELECT x FROM read_parquet(" + pin_glob + ")");
@@ -3512,7 +3517,7 @@ TEST_CASE("S3 mixed Parquet schemas flush between files on first and repeated re
     CHECK(local_after.runtime_fallbacks == local_before.runtime_fallbacks);
     CHECK(local_after.split_physical_rejections == local_before.split_physical_rejections);
   }
-  auto query    = "SELECT x FROM " + s3_parquet_glob_scan(*env, "r2a-d7/*.parquet");
+  auto query    = "SELECT x FROM " + s3_parquet_glob_scan(*env, "schema-validation/*.parquet");
   auto counters = require_sirius_context(fixture).physical_counters();
   std::mutex hits_mutex;
   std::map<std::string, int> hits;
@@ -3544,7 +3549,7 @@ TEST_CASE("S3 mixed Parquet schemas flush between files on first and repeated re
     CHECK(after.split_flushed_for_schema == before.split_flushed_for_schema + 1);
     CHECK(after.budget_exceeded == before.budget_exceeded);
     for (auto file : {"a.parquet", "b.parquet"}) {
-      auto uri    = s3_uri(env->bucket, std::string("r2a-d7/") + file);
+      auto uri    = s3_uri(env->bucket, std::string("schema-validation/") + file);
       auto source = manager.create_datasource(uri);
       REQUIRE(source);
       CHECK(source->prefers_bulk_io() == bulk);
@@ -3813,4 +3818,73 @@ TEST_CASE("S3 remote Puffin deferred route matches an independent local CPU refe
   CHECK(collect_rows(*remote_result) == expected);
   CHECK(deferred_route);
   CHECK(opened_path == remote + "/dv_bounded/data/a.puffin");
+}
+
+TEST_CASE("S3 mapped Parquet normalizes IDs on bulk and general readers",
+          "[s3][integration][field_id_mapping]")
+{
+  using namespace sirius::op::scan;
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) return;
+  auto limits = large_sirius_memory_limits("sirius");
+  bool bulk   = true;
+  SECTION("REST bulk") {}
+  SECTION("kvikIO general")
+  {
+    limits.backend    = sirius::scan_manager::io_backend::kvikio;
+    limits.cache_mode = "none";
+    bulk              = false;
+  }
+  s3_sql_fixture fixture(*env, limits);
+  sirius::test::scratch_dir directory("s3_field_id_mapping");
+  set_gpu_execution(fixture.con, false);
+  require_query_ok(fixture.con,
+                   "COPY (SELECT (range - 2)::INTEGER old_count FROM range(5)) TO " +
+                     directory.file_literal("data.parquet") +
+                     " (FORMAT PARQUET, FIELD_IDS {old_count: 2})");
+  REQUIRE(sirius::test::put_s3_test_object("field-id-mapping/data.parquet",
+                                           read_binary_file(directory.path() / "data.parquet")));
+  auto uri    = s3_uri(env->bucket, "field-id-mapping/data.parquet");
+  auto source = require_sirius_context(fixture).get_scan_manager().create_datasource(uri);
+  REQUIRE(source);
+  REQUIRE(source->prefers_bulk_io() == bulk);
+  auto options  = cudf::io::parquet_reader_options::builder().build();
+  auto resolved = resolve_parquet_metadata_with_identity(*source, 71, uri, options);
+  materialization_program program{
+    71,
+    1,
+    {cudf::data_type{cudf::type_id::INT64}, cudf::data_type{cudf::type_id::INT32}},
+    0,
+    false};
+  program.input_types = program.output_types;
+  auto mapping        = field_id_mapping::compile(
+    resolved.artifact,
+    resolved.identity,
+    program,
+    {{2, duckdb::LogicalType::BIGINT, {}, true},
+            {3, duckdb::LogicalType::INTEGER, duckdb::Value::INTEGER(42), false}});
+  bound_table_scan contract;
+  contract.contract_id = 71;
+  contract.profiles    = std::make_shared<physical_profile_table>();
+  parquet_source input{source, resolved.artifact->file_metadata(), {0}};
+  std::vector<std::size_t> groups{0};
+  rmm::cuda_stream stream;
+  auto batch = materialize_mapped_parquet(
+    input, mapping, contract, groups, stream, cudf::get_current_device_resource_ref());
+  stream.synchronize();
+  REQUIRE(batch.rows == 5);
+  std::array<int64_t, 5> values;
+  std::array<int32_t, 5> defaults;
+  REQUIRE(cudaMemcpy(values.data(),
+                     batch.table.view().column(0).head<int64_t>(),
+                     sizeof(values),
+                     cudaMemcpyDeviceToHost) == cudaSuccess);
+  REQUIRE(cudaMemcpy(defaults.data(),
+                     batch.table.view().column(1).head<int32_t>(),
+                     sizeof(defaults),
+                     cudaMemcpyDeviceToHost) == cudaSuccess);
+  CHECK(values == std::array<int64_t, 5>{-2, -1, 0, 1, 2});
+  CHECK(defaults == std::array<int32_t, 5>{42, 42, 42, 42, 42});
+  REQUIRE(batch.lineage.runs.size() == 1);
+  CHECK(batch.lineage.runs[0].file_row_offset == 0);
 }
