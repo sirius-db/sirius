@@ -4,6 +4,7 @@
 #include "codegen/decode/masked_launch.hpp"
 #include "codegen/plan/bitjoin_layout.hpp"
 #include "codegen/plan/plan_interpreter.hpp"
+#include "codegen/plan/validity.hpp"
 #include "codegen/util/cuda_check.hpp"
 #include "codegen/util/nvtx.hpp"
 #include "decode/decode_session.hpp"
@@ -73,6 +74,11 @@ const char* codegen_dtype_str_for(cudf::data_type type)
     case cudf::type_id::UINT64: return "uint64";
     case cudf::type_id::FLOAT32: return "float32";
     case cudf::type_id::FLOAT64: return "float64";
+    // The narrower decimals and the chrono types are stored as their integer
+    // storage type, so they arrive here already as INT32/INT64. DECIMAL128 is
+    // the exception: cudf has no 128-bit integer type_id, so its storage column
+    // stays DECIMAL128 and has to be named here.
+    case cudf::type_id::DECIMAL128: return "int128";
     default: return nullptr;
   }
 }
@@ -1140,6 +1146,10 @@ void validate_request(column_decode_request const& request)
     return;
   }
   validate_plan(tree->get());
+  // A selection compacts the value rows, while the stored bitmask describes every row of the
+  // chunk, so the decode cannot reattach it; a caller that wants both declines the selection.
+  if (request.selection && !tree->get().validity.empty())
+    throw unsupported_nullable_selection("decode: selection on a null-masked column unsupported");
   if (predicate && !predicate->predicate.active())
     throw std::invalid_argument("decode: empty predicate request");
   if (predicate && request.selection &&
@@ -1194,8 +1204,6 @@ std::unique_ptr<cudf::column> decode_request(column_decode_request const& reques
       auto const full = walk.run();
       if (full->size() != selection->mask->num_rows)
         throw std::invalid_argument("decode: full selection mask does not match the row domain");
-      if (full->null_count() != 0)
-        throw unsupported_nullable_selection("decode: selected nullable values unsupported");
       auto gathered = cudf::gather(cudf::table_view{{full->view()}},
                                    selection->survivor_indices,
                                    cudf::out_of_bounds_policy::DONT_CHECK,
@@ -1206,6 +1214,9 @@ std::unique_ptr<cudf::column> decode_request(column_decode_request const& reques
       output = walk.run();
     }
   }
+  // Reattach the validity the compress side detached. The walk decodes a null-free column, so this
+  // is the only place the mask re-enters; a selecting request was refused above unless all-valid.
+  attach_validity(*output, tree.validity, frame.stream(), frame.mr());
   if (selection && (output->size() != selection->survivor_count || output->null_count() != 0)) {
     throw std::runtime_error("decode: selected output has wrong size or unsupported nulls");
   }
@@ -1309,9 +1320,6 @@ std::optional<str_split_shape> locate_str_split_shape(PlanTree const& tree)
   NodeId const nid = root_value_producer(tree);
   if (nid >= tree.nodes.size() || tree.nodes[nid].op != "str_split") { return std::nullopt; }
   PlanNode const& node = tree.nodes[nid];
-  for (auto const& name : node.output_names) {
-    if (name == "null_mask") { return std::nullopt; }
-  }
   str_split_shape shape;
   shape.offsets_nid = static_cast<NodeId>(tree.nodes.size());
   bool chars_ok     = false;
@@ -1361,11 +1369,6 @@ bool dict_codes_selection_root(PlanTree const& tree)
     if (sources.empty() || !(sources.front() == ValueId{0, 0})) { continue; }
     PlanNode const& node = tree.nodes[nid];
     if (node.op != "dictionary") { return false; }
-    // Nullable dictionary plans carry a trailing `null_mask` output channel;
-    // iteration-1 selection has no null model — refuse (never corrupt).
-    for (auto const& name : node.output_names) {
-      if (name == "null_mask") { return false; }
-    }
     // The mask consumer is the codes region: the `indices` channel must be
     // routed to a bitpack child so it can decode compacted.
     for (auto const& e : node.children) {
@@ -1384,10 +1387,21 @@ column_decode_caps probe_column(PlanTree const& tree)
 {
   namespace sc = sirius::codegen;
   column_decode_caps caps;
+  // A nullable column is never compacted (decompress_column refuses a selection on it), so it
+  // reports the `full` route and a caller reserves for a full-width decode. Equality is
+  // unaffected: the predicate result is null-free and decompress_column reattaches the
+  // column's validity to it, which is the null propagation the predicate promises.
+  bool const nullable = !tree.validity.empty();
   // The shapes are mutually exclusive: a plan has exactly one (0,0)-producer,
   // so the route is a classification, not a set of overlapping flags.
-  if (bitpack_selection_root(tree)) {
+  if (nullable) {
+    // route stays `full`
+  } else if (bitpack_selection_root(tree)) {
     caps.compact_route = sc::decode_route::bitpack_mask;
+    // A root without a representation is refused later, when the ballot binds it.
+    if (auto const* rep = node_rep(root_value_producer(tree), tree)) {
+      caps.range_comparable_lane = cudf::size_of(rep->decoded_type()) <= sizeof(std::int64_t);
+    }
   } else if (delta_selection_root(tree)) {
     caps.compact_route = sc::decode_route::delta_mask;
   } else if (dict_codes_selection_root(tree)) {

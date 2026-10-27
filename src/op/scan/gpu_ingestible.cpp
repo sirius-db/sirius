@@ -136,10 +136,12 @@ filtered_table gpu_ingestible::materialize_table(
       stream.sync();
       return {.table = owning_table_view{std::move(masked)}, .state = filter_state::UNFILTERED};
     }
+    auto const stored_bytes = rbatch.get_data()->get_size_in_bytes();
     return {.table               = owning_table_view{std::move(rbatch), view},
             .state               = decoded_state,
             .predicate_columns   = split.pushdown_predicate_columns,
-            .predicates_enforced = split.pushdown_predicates_enforced};
+            .predicates_enforced = split.pushdown_predicates_enforced,
+            .stored_bytes        = stored_bytes};
   }
 }
 

@@ -15,7 +15,6 @@
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/dictionary/dictionary_factories.hpp>
-#include <cudf/null_mask.hpp>
 
 #include <rmm/device_buffer.hpp>
 #include <rmm/resource_ref.hpp>
@@ -27,6 +26,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace simpatico {
@@ -64,6 +64,11 @@ std::unique_ptr<compressed_representation> make_payload(std::string const& codec
   if (channels[0]->type().id() != cudf::type_id::UINT8) reject(codec + " 'output' must be UINT8");
   auto const* meta = std::get_if<Meta>(&metadata);
   if (!meta) reject(codec + ": missing leaf metadata (uncompressed_size, original_type_id)");
+  if constexpr (std::is_same_v<Meta, leaf_meta::ans> ||
+                std::is_same_v<Meta, leaf_meta::nvcomp_cascaded>) {
+    auto const error = detail::nvcomp_payload_compatibility_error(codec, meta->payload_format);
+    if (!error.empty()) reject(error);
+  }
   auto const type       = cudf::data_type{static_cast<cudf::type_id>(meta->original_type_id)};
   auto const bytes      = meta->uncompressed_size;
   auto const rows       = bytes > 0 && cudf::is_fixed_width(type)
@@ -86,8 +91,7 @@ std::unique_ptr<compressed_representation> make_simple_payload(
   });
 }
 
-// Assemble the dictionary by adopting its channels. An optional trailing `null_mask`
-// channel carries the validity of a nullable column. cuDF's factories retag unsigned indices (for
+// Assemble the dictionary by adopting its channels. cuDF's factories retag unsigned indices (for
 // example a narrow field a bitjoin decodes) as the signed type of the same width.
 std::unique_ptr<compressed_representation> make_dictionary(std::vector<std::string> const& names,
                                                            channel_columns& channels,
@@ -95,12 +99,7 @@ std::unique_ptr<compressed_representation> make_dictionary(std::vector<std::stri
                                                            ::cuda::stream_ref stream,
                                                            rmm::device_async_resource_ref mr)
 {
-  bool const has_mask = !names.empty() && names.back() == "null_mask";
-  if (has_mask) {
-    require_channels("dictionary", names, {"keys_offsets", "keys_chars", "indices", "null_mask"});
-  } else {
-    require_channels("dictionary", names, {"keys_offsets", "keys_chars", "indices"});
-  }
+  require_channels("dictionary", names, {"keys_offsets", "keys_chars", "indices"});
   auto const offsets_type = channels[0]->type().id();
   if ((offsets_type != cudf::type_id::INT32 && offsets_type != cudf::type_id::INT64) ||
       channels[1]->type().id() != cudf::type_id::UINT8) {
@@ -110,34 +109,12 @@ std::unique_ptr<compressed_representation> make_dictionary(std::vector<std::stri
     reject("dictionary: key offsets must be nonempty and null-free");
   }
   auto const keys = channels[0]->size() - 1;
-  auto const rows = channels[2]->size();
   // A positive width fixes the chars extent exactly; anything else is corrupt metadata, not a shape
   // to decline, because the gather addresses the chars with it.
   if (key_width &&
       (*key_width < -1 || (*key_width > 0 && static_cast<std::int64_t>(channels[1]->size()) !=
                                                std::int64_t{keys} * *key_width))) {
     reject("dictionary: key width hint does not describe the key channels");
-  }
-  auto mask                  = cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr);
-  cudf::size_type mask_nulls = 0;
-  if (has_mask) {
-    if (channels[3]->type().id() != cudf::type_id::UINT8 ||
-        static_cast<std::size_t>(channels[3]->size()) < cudf::bitmask_allocation_size_bytes(rows)) {
-      reject("dictionary: invalid null mask channel");
-    }
-    // The host null count decides whether the mask belongs on the dictionary parent.
-    auto const* bits = static_cast<cudf::bitmask_type const*>(channels[3]->view().head<void>());
-    mask_nulls       = rows > 0 ? cudf::null_count(bits, 0, rows, stream) : 0;
-    if (mask_nulls > 0) {
-      auto contents = channels[3]->release();
-#if CUDF_VERSION_MAJOR > 26 || (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 12)
-      // Keep the RMM source alive until the copy into cuDF's CUDA mask buffer completes.
-      contents.data->set_stream(stream);
-      mask = cudf::copy_bitmask(bits, 0, rows, stream, mr);
-#else
-      mask = std::move(*contents.data);
-#endif
-    }
   }
   auto key_strings =
     cudf::make_strings_column(keys,
@@ -146,10 +123,7 @@ std::unique_ptr<compressed_representation> make_dictionary(std::vector<std::stri
                               0,
                               cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr));
   auto dictionary =
-    mask_nulls > 0
-      ? cudf::make_dictionary_column(
-          std::move(key_strings), std::move(channels[2]), std::move(mask), mask_nulls)
-      : cudf::make_dictionary_column(std::move(key_strings), std::move(channels[2]), stream, mr);
+    cudf::make_dictionary_column(std::move(key_strings), std::move(channels[2]), stream, mr);
   if (!key_width) {
     return dictionary_compressed_representation::from_encoded_column(
       std::move(dictionary), stream, mr);
@@ -237,26 +211,17 @@ std::unique_ptr<compressed_representation> reconstruct(std::string const& compre
     case OpId::StrSplit: {
       // chars is UINT8, or widened (UINT32/UINT64) to hold more than 2 GB under the 2^31-element
       // column cap (see str_split_compressor).
-      bool const has_mask = channels.size() == 3;
-      if (has_mask) {
-        require_channels("str_split", names, {"offsets", "chars", "null_mask"});
-      } else {
-        require_channels("str_split", names, {"offsets", "chars"});
-      }
+      require_channels("str_split", names, {"offsets", "chars"});
       auto const offsets = channels[0]->type().id();
       auto const chars   = channels[1]->type().id();
       if ((offsets != cudf::type_id::INT32 && offsets != cudf::type_id::INT64) ||
           (chars != cudf::type_id::UINT8 && chars != cudf::type_id::UINT32 &&
-           chars != cudf::type_id::UINT64) ||
-          (has_mask && channels[2]->type().id() != cudf::type_id::UINT8)) {
+           chars != cudf::type_id::UINT64)) {
         reject("str_split: invalid channel types");
       }
       auto const rows = channels[0]->size() > 0 ? channels[0]->size() - 1 : 0;
       return std::make_unique<str_split_compressed_representation>(
-        rows,
-        std::move(channels[0]),
-        std::move(channels[1]),
-        has_mask ? std::move(channels[2]) : nullptr);
+        rows, std::move(channels[0]), std::move(channels[1]));
     }
     case OpId::Bitextract: {
       auto const suffix = strip_bitextract_prefix(compressor_name);
@@ -273,8 +238,13 @@ std::unique_ptr<compressed_representation> reconstruct(std::string const& compre
                                                                     std::move(channels));
     }
     case OpId::Ans:
-      return make_simple_payload<ans_compressed_representation, leaf_meta::ans>(
-        "ans", names, channels, meta);
+      return make_payload<leaf_meta::ans>(
+        "ans", names, channels, meta, [](auto const& ans, auto&&... args) {
+          auto rep =
+            std::make_unique<ans_compressed_representation>(std::forward<decltype(args)>(args)...);
+          rep->payload_format = ans.payload_format;
+          return rep;
+        });
     case OpId::Snappy:
       return make_simple_payload<snappy_compressed_representation, leaf_meta::snappy>(
         "snappy", names, channels, meta);
@@ -297,7 +267,8 @@ std::unique_ptr<compressed_representation> reconstruct(std::string const& compre
             std::forward<decltype(args)>(args)...,
             cascaded.num_deltas,
             cascaded.num_RLEs,
-            cascaded.use_bp);
+            cascaded.use_bp,
+            cascaded.payload_format);
         });
     // The fused ops have no standalone reconstruction; the codegen decode path inverts them.
     case OpId::Bitpack:

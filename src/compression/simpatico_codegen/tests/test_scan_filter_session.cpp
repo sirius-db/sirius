@@ -412,6 +412,115 @@ void membership_cascade(simpatico::stream_pool& pool,
   }
 }
 
+// A measuring request reports the rows each membership probe was evaluated on and kept, counted
+// on the device and read back with the survivor count, for the cascade and for concurrent probes,
+// and keeps the measurement when it gives compaction up.
+void membership_measurement(simpatico::stream_pool& pool,
+                            ::cuda::stream_ref stream,
+                            rmm::device_async_resource_ref mr)
+{
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(sequence(0, stream, mr));
+  columns.push_back(sequence(10000, stream, mr));
+  cudf::table input{std::move(columns)};
+  auto compressed = simpatico::compress_with_plan(
+    input.view(), "input -> bitpack\n---\ninput -> identity\n", stream, mr);
+  std::array<std::size_t, 2> selected{0, 1};
+  auto const expect_probe = [](sc::scan_filter_result const& result,
+                               std::size_t index,
+                               std::int64_t rows_in,
+                               std::int64_t rows_out,
+                               char const* message) {
+    expect(index < result.membership_probe_rows.size() &&
+             result.membership_probe_rows[index].rows_in == rows_in &&
+             result.membership_probe_rows[index].rows_out == rows_out,
+           message);
+  };
+
+  // The cascade after a range: each probe sees the rows the range and the earlier probes kept.
+  {
+    sc::scan_filter_request request;
+    request.routes = {sc::decode_route::bitpack_mask, sc::decode_route::full};
+    request.filters.push_back({0, {0, 199}});
+    request.measure_membership = true;
+    probe_trace trace;
+    request.membership_filters.push_back({1, traced_probe(trace, 10150, stream, mr)});
+    request.membership_filters.push_back({1, traced_probe(trace, std::nullopt, stream, mr)});
+    request.membership_filters.push_back({1, traced_probe(trace, 10050, stream, mr)});
+    sc::scan_filter_result result;
+    auto output =
+      simpatico::decompress_scan_filter(compressed, selected, request, result, pool, stream, mr);
+    expect(result.applied && result.survivor_count == 50, "measured cascade survivor count");
+    expect(result.membership_probes_applied == 2, "measured cascade counts the probes that ran");
+    expect(result.membership_rows_in == 200 && result.membership_rows_out == 50,
+           "measured cascade starts from the range's survivors");
+    expect(result.membership_probe_rows.size() == 3, "one entry per requested probe");
+    expect_probe(result, 0, 200, 150, "first cascade probe sees the range's survivors");
+    expect_probe(result, 1, -1, -1, "a declined probe reports nothing");
+    expect_probe(result, 2, 150, 50, "a later probe sees the earlier probes' survivors");
+    verify_values(output->view(), first_rows(50), stream);
+  }
+
+  // Concurrent probes without another source: the first sees every row, the next the rows the
+  // earlier ones kept, skipping a declined probe.
+  {
+    sc::scan_filter_request request;
+    request.routes             = {sc::decode_route::full, sc::decode_route::full};
+    request.measure_membership = true;
+    probe_trace trace;
+    request.membership_filters.push_back({1, traced_probe(trace, 10100, stream, mr)});
+    request.membership_filters.push_back({1, traced_probe(trace, std::nullopt, stream, mr)});
+    request.membership_filters.push_back({1, traced_probe(trace, 10030, stream, mr)});
+    sc::scan_filter_result result;
+    auto output =
+      simpatico::decompress_scan_filter(compressed, selected, request, result, pool, stream, mr);
+    expect(result.applied && result.survivor_count == 30, "measured concurrent survivor count");
+    expect(result.membership_rows_in == row_count && result.membership_rows_out == 30,
+           "measured concurrent probes start from every row");
+    expect_probe(result, 0, row_count, 100, "first concurrent probe sees every row");
+    expect_probe(result, 1, -1, -1, "a declined concurrent probe reports nothing");
+    expect_probe(result, 2, 100, 30, "a later concurrent probe sees the earlier survivors");
+    verify_values(output->view(), first_rows(30), stream);
+  }
+
+  // A probe that keeps too many rows: the decode gives compaction up and returns every row, but
+  // the measurement it took survives the decline.
+  {
+    sc::scan_filter_request request;
+    request.routes             = {sc::decode_route::full, sc::decode_route::full};
+    request.measure_membership = true;
+    probe_trace trace;
+    request.membership_filters.push_back({1, traced_probe(trace, 10600, stream, mr)});
+    sc::scan_filter_result result;
+    auto output =
+      simpatico::decompress_scan_filter(compressed, selected, request, result, pool, stream, mr);
+    expect(!result.applied && result.status == sc::scan_filter_status::declined_unselective,
+           "unselective measured probe declines compaction");
+    expect(result.membership_probes_applied == 1 && result.membership_rows_in == row_count &&
+             result.membership_rows_out == 600,
+           "an unselective decline keeps the measurement");
+    expect_probe(result, 0, row_count, 600, "an unselective decline keeps the probe's rows");
+    verify_values(output->view(), first_rows(row_count), stream);
+  }
+
+  // Without the request, nothing is counted.
+  {
+    sc::scan_filter_request request;
+    request.routes = {sc::decode_route::bitpack_mask, sc::decode_route::full};
+    request.filters.push_back({0, {0, 199}});
+    probe_trace trace;
+    request.membership_filters.push_back({1, traced_probe(trace, 10050, stream, mr)});
+    sc::scan_filter_result result;
+    auto output =
+      simpatico::decompress_scan_filter(compressed, selected, request, result, pool, stream, mr);
+    expect(result.applied && result.membership_probes_applied == 1,
+           "unmeasured decode still counts the probes that ran");
+    expect(result.membership_rows_in == -1 && result.membership_rows_out == -1 &&
+             result.membership_probe_rows.empty(),
+           "unmeasured decode reports no rows");
+  }
+}
+
 void bool8_delivery(simpatico::stream_pool& pool,
                     ::cuda::stream_ref stream,
                     rmm::device_async_resource_ref mr)
@@ -503,17 +612,12 @@ void nullable_bool8_declines(simpatico::stream_pool& pool,
     if (i % 31 == 0) valid[i] = false;
   }
   auto nullable = make_strings_column(strings, valid, stream);
-  auto tree     = simpatico::plan_tree_from_dsl("input -> dictionary\n");
-  expect(tree.has_value(), "nullable dictionary fixture plan");
-  // The table compressor rejects nulls; install the nullable dictionary through its codec.
-  tree->nodes[1].rep = simpatico::dictionary_compressor{}.compress(nullable->view(), stream, mr);
-  simpatico::compressed_column column;
-  column.dtype     = nullable->type();
-  column.num_rows  = row_count;
-  column.plan_tree = std::make_unique<simpatico::PlanTree>(std::move(*tree));
-  auto compressed  = simpatico::compress_with_plan(
+  // The validity rides the plan tree's sidecar; the dictionary itself is null-free.
+  auto dictionary = simpatico::compress_with_plan(
+    cudf::table_view{{nullable->view()}}, "input -> dictionary\n", stream, mr);
+  auto compressed = simpatico::compress_with_plan(
     cudf::table_view{{sequence(0, stream, mr)->view()}}, "input -> identity\n", stream, mr);
-  compressed.columns.push_back(std::move(column));
+  compressed.columns.push_back(std::move(dictionary.columns[0]));
   stream.sync();
 
   std::array<std::size_t, 2> selected{1, 0};
@@ -575,16 +679,10 @@ void nullable_full_route_declines(simpatico::stream_pool& pool,
   nullable->set_null_mask(cudf::create_null_mask(row_count, cudf::mask_state::ALL_VALID), 0);
   cudf::set_null_mask(nullable->mutable_view().null_mask(), 3, 4, false);
   nullable->set_null_count(1);
-  // The compressor's null-input policy is separate; an identity leaf stores the nullable column.
-  auto tree = simpatico::plan_tree_from_dsl("input -> identity\n");
-  expect(tree.has_value(), "nullable fixture plan");
-  tree->nodes[1].rep = std::make_unique<simpatico::identity_compressed_representation>(
-    std::make_unique<cudf::column>(nullable->view(), stream, mr));
-  simpatico::compressed_column column;
-  column.dtype     = nullable->type();
-  column.num_rows  = row_count;
-  column.plan_tree = std::make_unique<simpatico::PlanTree>(std::move(*tree));
-  compressed.columns.push_back(std::move(column));
+  // The validity rides the plan tree's sidecar; the identity leaf stores the null-free values.
+  auto stored = simpatico::compress_with_plan(
+    cudf::table_view{{nullable->view()}}, "input -> identity\n", stream, mr);
+  compressed.columns.push_back(std::move(stored.columns[0]));
   stream.sync();
 
   std::array<std::size_t, 2> selected{0, 1};
@@ -811,13 +909,14 @@ int main()
     rmm::cuda_stream stream;
     simpatico::stream_pool pool;
     expect(pool.init(4), "stream pool initialization");
-    numeric_sources(pool, stream.view(), resource);
-    membership_cascade(pool, stream.view(), resource);
-    bool8_delivery(pool, stream.view(), resource);
-    nullable_bool8_declines(pool, stream.view(), resource);
-    dict_codes_gather(pool, stream.view(), resource);
-    nullable_full_route_declines(pool, stream.view(), resource);
-    aliased_borrowed_lanes(pool, stream.view(), resource);
+    numeric_sources(pool, stream, resource);
+    membership_cascade(pool, stream, resource);
+    membership_measurement(pool, stream, resource);
+    bool8_delivery(pool, stream, resource);
+    nullable_bool8_declines(pool, stream, resource);
+    dict_codes_gather(pool, stream, resource);
+    nullable_full_route_declines(pool, stream, resource);
+    aliased_borrowed_lanes(pool, stream, resource);
     cuda_check(pool.sync_all());
     stream.synchronize();
     cuda_check(cudaDeviceSynchronize());

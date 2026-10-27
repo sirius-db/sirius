@@ -6,6 +6,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cstddef>
 #include <cstring>
 
 namespace simpatico {
@@ -56,17 +57,43 @@ void read_device_bytes_completed(void* destination,
                                  std::size_t bytes,
                                  ::cuda::stream_ref stream)
 {
+  device_read const read{destination, source, bytes};
+  read_device_bytes_completed(std::span{&read, 1}, stream);
+}
+
+void read_device_bytes_completed(std::span<device_read const> reads, ::cuda::stream_ref stream)
+{
+  // Each read starts at an 8-byte boundary of the staging storage.
+  auto const staged_offset = [](std::size_t offset) { return (offset + 7) & ~std::size_t{7}; };
+  std::size_t staged_bytes = 0;
+  for (auto const& read : reads) {
+    staged_bytes = staged_offset(staged_bytes) + read.bytes;
+  }
   try {
     thread_local pinned_staging_slab slab;
-    void* const staging = slab.reserve(bytes);
-    throw_if_cuda_error(
-      cudaMemcpyAsync(
-        staging ? staging : destination, source, bytes, cudaMemcpyDeviceToHost, stream.get()),
-      "host observation: device-to-host copy");
+    auto* const staging = static_cast<std::byte*>(slab.reserve(staged_bytes));
+    std::size_t offset  = 0;
+    for (auto const& read : reads) {
+      offset = staged_offset(offset);
+      throw_if_cuda_error(cudaMemcpyAsync(staging ? staging + offset : read.destination,
+                                          read.source,
+                                          read.bytes,
+                                          cudaMemcpyDeviceToHost,
+                                          stream.get()),
+                          "host observation: device-to-host copy");
+      offset += read.bytes;
+    }
     throw_if_cuda_error(cudaStreamSynchronize(stream.get()), "host observation: stream wait");
-    if (staging) std::memcpy(destination, staging, bytes);
+    if (staging) {
+      offset = 0;
+      for (auto const& read : reads) {
+        offset = staged_offset(offset);
+        std::memcpy(read.destination, staging + offset, read.bytes);
+        offset += read.bytes;
+      }
+    }
   } catch (...) {
-    // A copy may still be queued into the destination or the staging storage.
+    // A copy may still be queued into a destination or the staging storage.
     (void)cudaStreamSynchronize(stream.get());
     throw;
   }

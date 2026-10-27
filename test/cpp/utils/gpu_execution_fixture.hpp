@@ -277,27 +277,51 @@ class GpuExecutionFixture {
     }
     REQUIRE(after.fallbacks == before.fallbacks + 1);
     REQUIRE(after.executions == before.executions);
+    require_matches_cpu(query, *gpu_result);
+  }
 
+  /// Asserts the query starts on the GPU, falls back to DuckDB's CPU execution at runtime, and
+  /// returns exactly the CPU rows and column types. Distinct from expect_gpu_fallback, which does
+  /// not compare the results.
+  void expect_runtime_fallback_matches_cpu(const std::string& query)
+  {
+    run_ok("SET gpu_execution = true;");
+    auto const before = sirius::test::get_transparent_execution_stats(*con);
+    auto gpu_result   = con->Query(query);
+    auto const after  = sirius::test::get_transparent_execution_stats(*con);
+    REQUIRE(gpu_result);
+    if (gpu_result->HasError()) { UNSCOPED_INFO("query error: " << gpu_result->GetError()); }
+    REQUIRE_FALSE(gpu_result->HasError());
+    if (after.runtime_fallbacks == before.runtime_fallbacks) {
+      UNSCOPED_INFO("expected a runtime fallback to CPU, but none occurred");
+    }
+    REQUIRE(after.runtime_fallbacks == before.runtime_fallbacks + 1);
+    require_matches_cpu(query, *gpu_result);
+  }
+
+ private:
+  /// Reruns @p query on DuckDB's CPU execution and requires exactly @p gpu_result's column types
+  /// and rows, ignoring row order.
+  void require_matches_cpu(const std::string& query, duckdb::QueryResult& gpu_result)
+  {
     run_ok("SET gpu_execution = false;");
     auto cpu_result = con->Query(query);
     run_ok("SET gpu_execution = true;");
     REQUIRE(cpu_result);
     REQUIRE_FALSE(cpu_result->HasError());
 
-    REQUIRE(gpu_result->ColumnCount() == cpu_result->ColumnCount());
-    REQUIRE(gpu_result->RowCount() == cpu_result->RowCount());
-    auto gpu_rows = collect_rows(*gpu_result, true);
-    auto cpu_rows = collect_rows(*cpu_result, true);
-    REQUIRE(gpu_rows == cpu_rows);
+    REQUIRE(gpu_result.GetTypes() == cpu_result->GetTypes());
+    REQUIRE(gpu_result.RowCount() == cpu_result->RowCount());
+    REQUIRE(collect_rows(gpu_result, true) == collect_rows(*cpu_result, true));
   }
 
- private:
   void compare_gpu_vs_cpu_impl(const std::string& query,
                                bool ordered,
                                const std::set<size_t>& approx_cols = {},
                                double rel_tol                      = 0.0,
                                cell_canonicalizer canonicalize     = nullptr)
   {
+    INFO(query);
     // Run on GPU (transparent, plain SQL goes through the Sirius optimizer hook).
     con->Query("SET gpu_execution = true;");
     auto before_gpu_stats = sirius::test::get_transparent_execution_stats(*con);
@@ -320,6 +344,7 @@ class GpuExecutionFixture {
     REQUIRE(cpu_result);
     REQUIRE_FALSE(cpu_result->HasError());
 
+    REQUIRE(gpu_result->GetTypes() == cpu_result->GetTypes());
     REQUIRE(gpu_result->ColumnCount() == cpu_result->ColumnCount());
     REQUIRE(gpu_result->RowCount() == cpu_result->RowCount());
 

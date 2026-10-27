@@ -200,7 +200,7 @@ struct column_decode_caps {
   ///                  in lockstep with the renderer's masked
   ///                  offsets-reconstruction coverage,
   ///   full         — everything else: decode full width, then gather.
-  /// Nullable plans (a `null_mask` output channel) take @c full throughout:
+  /// A nullable column (non-empty PlanTree::validity) reports @c full throughout:
   /// selection has no null model yet.
   sirius::codegen::decode_route compact_route = sirius::codegen::decode_route::full;
 
@@ -210,11 +210,15 @@ struct column_decode_caps {
   /// plan is correct but pointless: it only moves the comparison.
   bool can_answer_equality = false;
 
+  /// The root decodes into a lane of at most 64 bits. The range ballot compares in int64, so a
+  /// wider lane (DECIMAL128) can decode compacted but cannot ballot a range.
+  bool range_comparable_lane = true;
+
   /// The plan can ballot its rows into selection-mask words, which the render
-  /// supports for bitpack roots only.
+  /// supports for bitpack roots of at most 64 bits only.
   [[nodiscard]] bool can_produce_mask() const noexcept
   {
-    return compact_route == sirius::codegen::decode_route::bitpack_mask;
+    return compact_route == sirius::codegen::decode_route::bitpack_mask && range_comparable_lane;
   }
 };
 

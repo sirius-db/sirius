@@ -214,6 +214,35 @@ Both feed the same `resolve_mark_join_result()`, which scatters the match indice
 - `src/planner/sirius_physical_plan_generator.cpp` — post-pass invocation of `fold_adjacent_projections()`
 - `src/expression/ast/reference_utils.cpp` — `visit_references()`, `substitute_references()`
 
+### Decimal SUM Width Selection
+
+**Motivation:** A decimal SUM must not overflow, but the widest type is also the slowest. cuDF sums
+64-bit decimals much faster than 128-bit ones, especially in a grouped aggregation with few groups,
+where 128-bit accumulation contends on the same groups. DuckDB v2 types some sums wider than their
+values need: the TPC-H Q9 profit `l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity`
+is `DECIMAL(19,4)`, held as DECIMAL128, although every value fits 64 bits. At SF1000 its group-by
+took 3.8 s instead of 28 ms.
+
+**Mechanism:** Per batch, grouped and ungrouped aggregations pick the width of each decimal SUM (and
+of AVG's SUM) from one exact
+proof: a sum of n values of magnitude at most m is at most n * m. A DECIMAL32 or DECIMAL64 input is
+widened to the next type only when rows * max|value| exceeds its storage width. A DECIMAL128 input is
+narrowed to DECIMAL64 at the same scale when rows * max|value| is at most 2^63 - 1, and the result is
+cast back to DECIMAL128, so no value and no partial sum of any group can leave the 64-bit range, and
+the merge combines the per-batch partials at the original 128-bit width. The
+bound comes from base-table statistics when the SUM input is a scan column
+(`planner::resolve_sum_input_bounds`); otherwise the batch is measured with `cudf::minmax`,
+costing one stream synchronization per batch for all measured columns together.
+
+**Code path:**
+- `src/op/aggregate/aggregate_op_util.cpp` — `sums_to_widen`, `decimal_sums_to_narrow`
+- `src/op/aggregate/gpu_aggregate_impl.cpp` — per-batch request rewriting in the grouped aggregation
+- `src/op/sirius_physical_ungrouped_aggregate.cpp` — per-batch input casts in the ungrouped reduction
+- `src/planner/decimal_sum_input_bounds.cpp` — plan-time bounds from scan statistics
+
+**Config:** `enable_decimal_sum_stats_bound` (default: `true`) lets plan-time bounds skip the
+per-batch measurement.
+
 ## Memory Optimizations
 
 ### Memory-Pressure-Driven Downgrade (PR #368)

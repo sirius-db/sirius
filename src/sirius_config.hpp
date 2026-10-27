@@ -218,9 +218,9 @@ struct operator_params {
   /// Let grouped-aggregation partitions size from projected input.
   bool enable_runtime_size_estimation = false;
 
-  /// Decide decimal SUM widening from base-table statistics at plan time: an aggregate input with
-  /// a proven magnitude bound skips the per-batch min/max scan and its stream synchronization
-  /// (planner::resolve_decimal_sum_input_bounds). Off: every batch is measured.
+  /// Decide decimal and wide integer SUM widening from base-table statistics at plan time: an
+  /// aggregate input with a proven magnitude bound skips the per-batch min/max scan and its stream
+  /// synchronization (planner::resolve_sum_input_bounds). Off: every batch is measured.
   bool enable_decimal_sum_stats_bound = true;
 
   /// Zone-map pruning of pinned-table chunks at cache-serve time: skip cached chunks whose pin-time
@@ -282,9 +282,9 @@ struct telemetry_config {
   std::string nvtx_injection_lib{};
 };
 
-/// Parameters controlling Simpatico compression for pin_table(tier=>'host').
-/// These settings apply exclusively to cached input-table pinning and have no
-/// effect on spill-path compression (Phase 3).
+/// Parameters controlling Simpatico compression. The unprefixed fields apply to
+/// pin_table(tier=>'host'); the spill_ fields apply to batches the downgrade
+/// executor spills to the host or disk tier.
 struct compression_config {
   /// When true, pin_table(tier=>'host') attempts to compress each chunk with
   /// Simpatico before storing it in host memory. Falls back to uncompressed
@@ -311,6 +311,25 @@ struct compression_config {
   /// exists for a table, that table is pinned uncompressed regardless of the
   /// enable flag.  Empty string = feature disabled.
   std::string input_plan_dir{};
+
+  /// Store batches the downgrade executor spills to the host or disk tier
+  /// Simpatico-compressed, with per-type default plans, and decode them on their way
+  /// back to the GPU. A batch whose compressed form saves too little (see
+  /// spill_max_compressed_fraction) or fails to encode spills uncompressed.
+  bool enable_spill_compression{false};
+
+  /// Batches smaller than this spill uncompressed.
+  std::size_t spill_min_batch_bytes{64ULL * 1024 * 1024};  // 64 MiB
+
+  /// Keep a spilled batch compressed only when its header + payload is at most this
+  /// fraction of the batch's device size. Finite and non-negative; values above 1
+  /// allow compressed forms that expand relative to the original batch.
+  double spill_max_compressed_fraction{0.75};
+
+  /// Encode a spilled batch only when this fraction of its size could be reserved in
+  /// its GPU memory space (the encoder's headroom); otherwise it spills uncompressed.
+  /// In [0, 1]; 0 skips the check.
+  double spill_encode_reserve_fraction{0.5};
 };
 
 class configuration_input_error : public std::runtime_error {
@@ -330,6 +349,10 @@ struct sirius_config {
   /// Replace all settings with hardware-resolved defaults. Apply programmatic
   /// overrides afterwards; use parsed_sirius_config::resolve for a supplied topology.
   void apply_defaults();
+  [[nodiscard]] int max_concurrent_queries() const noexcept
+  {
+    return _scan_manager_config.max_concurrent_queries;
+  }
 
   [[nodiscard]] const cucascade::memory::system_topology_info& get_hw_topology() const noexcept
   {

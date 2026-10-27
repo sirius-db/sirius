@@ -315,6 +315,17 @@ struct selection_source {
 /// is structurally impossible and the round-trip is skipped.
 constexpr std::size_t kMaxSelectionSources = 8;
 
+/// Every membership probe the request carries, including any on columns past the decode's
+/// selection.
+std::size_t requested_membership_probes(pushdown_request const& request) noexcept
+{
+  std::size_t count = 0;
+  for (auto const& column : request.columns) {
+    count += column.membership.size();
+  }
+  return count;
+}
+
 /// Decompress @p selected columns of @p chunk with @p request applied during
 /// the decode. Returns a null table when the attempt is declined here
 /// (nothing to configure, shape checks) or when the assembly refuses — the
@@ -385,6 +396,8 @@ std::unique_ptr<cudf::table> decompress_with_pushdown(simpatico::compressed_tabl
     wave_request.delivered_prefix = *request.output_prefix_width;
   }
   std::string order_echo;
+  // membership_probe::tag of each wave_request.membership_filters entry.
+  std::vector<std::size_t> membership_tags;
   for (auto const& source : sources) {
     switch (source.what) {
       case selection_source::kind::range: {
@@ -400,6 +413,7 @@ std::unique_ptr<cudf::table> decompress_with_pushdown(simpatico::compressed_tabl
         break;
       case selection_source::kind::membership:
         wave_request.membership_filters.push_back({source.column, source.probe->probe});
+        membership_tags.push_back(source.probe->tag);
         order_echo += " join(c" + std::to_string(source.column) + ",rank " +
                       std::to_string(source.probe->selectivity_rank) + ")";
         break;
@@ -407,7 +421,8 @@ std::unique_ptr<cudf::table> decompress_with_pushdown(simpatico::compressed_tabl
   }
   SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
     "[decompression-pushdown] wave-1 sources, ascending expected keep:{}", order_echo);
-  wave_request.source_generation = request.membership_generation;
+  wave_request.source_generation  = request.membership_generation;
+  wave_request.measure_membership = request.membership_measurement.measure;
   wave_request.output_types.assign(
     request.output_types.begin(),
     request.output_types.begin() + std::min(request.output_types.size(), selected.size()));
@@ -448,6 +463,35 @@ std::unique_ptr<cudf::table> decompress_with_pushdown(simpatico::compressed_tabl
   // predicated rerun, which drops no rows.
   outcome.predicates_enforced     = result.applied && !wave_request.bool8_filters.empty();
   outcome.visibility_mask_applied = result.keep_mask_applied;
+  // Only an applied decode returns the probes' survivors; any other outcome returns every row.
+  outcome.membership_skipped = !wave_request.membership_filters.empty() &&
+                               (!result.applied || result.membership_probes_applied == 0);
+  if (result.membership_rows_in >= 0 && result.membership_rows_out >= 0) {
+    // A probe the decoder capped or declined did not filter these rows, so the ratio describes
+    // the whole requested set only when every probe ran.
+    outcome.membership_keep = pushdown_outcome::membership_keep_observation{
+      .generation  = request.membership_generation,
+      .rows_before = static_cast<std::size_t>(result.membership_rows_in),
+      .rows_after  = static_cast<std::size_t>(result.membership_rows_out),
+      .complete    = request.membership_measurement.complete &&
+                  result.membership_probes_applied == wave_request.membership_filters.size() &&
+                  wave_request.membership_filters.size() == requested_membership_probes(request)};
+    for (std::size_t m = 0; m < result.membership_probe_rows.size(); ++m) {
+      auto const& rows = result.membership_probe_rows[m];
+      if (rows.rows_in < 0) { continue; }
+      outcome.membership_keep->probes.push_back(
+        {.tag         = membership_tags[m],
+         .rows_before = static_cast<std::size_t>(rows.rows_in),
+         .rows_after  = static_cast<std::size_t>(rows.rows_out)});
+    }
+    SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
+      "[decompression-pushdown] join filters kept {}/{} rows ({} of {} probe(s) ran, complete={})",
+      outcome.membership_keep->rows_after,
+      outcome.membership_keep->rows_before,
+      result.membership_probes_applied,
+      requested_membership_probes(request),
+      outcome.membership_keep->complete);
+  }
   SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
     "[decompression-pushdown] decode {} (status={} generation={}): ranges={} equalities={} "
     "join_filters={} survivors={}/{} column(s)={} covers_whole_filter={} row_filtered={} "
@@ -497,7 +541,9 @@ std::shared_ptr<const decompression_pushdown_scan> decompression_pushdown_scan::
 
 std::shared_ptr<const decompression_pushdown_scan>
 decompression_pushdown_scan::with_membership_probes(
-  std::vector<std::vector<membership_probe>> probes, std::uint64_t generation) const
+  std::vector<std::vector<membership_probe>> probes,
+  std::uint64_t generation,
+  membership_measurement_request measurement) const
 {
   auto refreshed = _request;
   if (refreshed.columns.size() < probes.size()) { refreshed.columns.resize(probes.size()); }
@@ -505,7 +551,8 @@ decompression_pushdown_scan::with_membership_probes(
     refreshed.columns[i].membership =
       i < probes.size() ? std::move(probes[i]) : std::vector<membership_probe>{};
   }
-  refreshed.membership_generation = generation;
+  refreshed.membership_generation  = generation;
+  refreshed.membership_measurement = measurement;
   return std::make_shared<const decompression_pushdown_scan>(std::move(refreshed));
 }
 
@@ -668,6 +715,8 @@ decompress_result decompress_chunk(
       decompress_with_pushdown(chunk, selected, request, keep_mask, lanes, stream, mr, out.outcome);
   }
   if (!out.table) {
+    // The plain decode below applies no join filter.
+    out.outcome.membership_skipped = requested_membership_probes(request) > 0;
     out.table = predicates.empty() ? simpatico::decompress(chunk, selected, lanes, mr)
                                    : simpatico::decompress(chunk, selected, predicates, lanes, mr);
   }

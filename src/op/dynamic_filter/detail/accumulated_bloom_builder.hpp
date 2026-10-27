@@ -20,6 +20,7 @@
 #include "log/logging.hpp"
 #include "op/dynamic_filter/complete_build_inventory.hpp"
 #include "op/dynamic_filter/dynamic_filter_replica_space.hpp"
+#include "sirius/exception.hpp"
 
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
@@ -97,19 +98,6 @@ class accumulation_invariant_error : public std::exception {
 
  private:
   char const* _context;
-};
-
-/**
- * @brief Reports that failure cleanup could not join all submitted GPU work.
- *
- * Storage reachable by unfinished work must remain allocated. The original exception is nested.
- */
-class unjoined_gpu_work : public std::exception {
- public:
-  [[nodiscard]] char const* what() const noexcept override
-  {
-    return "GPU work may still run after a failed host join";
-  }
 };
 
 /**

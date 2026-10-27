@@ -18,6 +18,7 @@
 #include <cudf/null_mask.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
+#include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/traits.hpp>
 
 #include <rmm/device_buffer.hpp>
@@ -43,6 +44,10 @@
 namespace simpatico {
 
 namespace {
+
+// cuDF 26.08 joins RMM stream views; 26.10+ joins CUDA stream refs.
+using cudf_pool_stream =
+  decltype(cudf::detail::fork_streams(cudf::get_default_stream(), 0))::value_type;
 
 // ── Internal helpers for the public compress/decompress API ───────────────────
 // (Formerly compress_internals.hpp; this TU is the only consumer.)
@@ -114,6 +119,7 @@ void validate_column_names(std::vector<std::string> const& column_names, size_t 
   }
 }
 
+#ifndef SIMPATICO_USE_CUCASCADE_STREAM_POOL
 // Process-lifetime cache of CUDA streams for the internal `int column_threads`
 // overloads. These overloads have no caller-owned pool, yet the objects they
 // return (a cudf::table, or a compressed_table whose leaf buffers live in cudf
@@ -167,13 +173,13 @@ stream_cache& global_stream_cache()
   return cache;
 }
 
-// RAII lease of max(1, column_threads) cache streams into a stream_pool for the
-// duration of an internal-parallel call. On destruction the streams are returned
-// to the cache (NOT destroyed), so any buffer allocated on them stays valid for
-// its eventual async free even after this pool is gone. Concurrent leases get
-// disjoint streams (checkout is mutex-guarded and pops distinct handles), so each
-// call's sync_all only touches its own streams.
-// Capture the current device once for both checkout and check-in.
+#endif
+
+// RAII lease of max(1, column_threads) streams for an internal-parallel call.
+// Both backends keep stream owners alive after the call so returned buffers
+// can safely use their recorded allocation streams for asynchronous frees.
+// Concurrent leases get disjoint streams, so sync_all only touches this call's
+// streams. Capture the device for the standalone cache's checkout/check-in.
 struct leased_pool {
   stream_pool pool;
   int device = 0;
@@ -183,19 +189,26 @@ struct leased_pool {
     if (cudaGetDevice(&device) != cudaSuccess)
       throw plan_error("failed to query the current device for the internal stream lease");
 
+#ifdef SIMPATICO_USE_CUCASCADE_STREAM_POOL
+    if (!pool.init(static_cast<size_t>(std::max(1, column_threads))))
+      throw plan_error("failed to lease internal streams");
+#else
     pool.streams =
       global_stream_cache().checkout(device, static_cast<size_t>(std::max(1, column_threads)));
 
     if (pool.streams.empty()) throw plan_error("failed to lease internal streams");
+#endif
   }
 
   ~leased_pool()
   {
     // Completed compression/decode scopes already surfaced asynchronous errors.
     // A lease destructor cannot throw.
+#ifndef SIMPATICO_USE_CUCASCADE_STREAM_POOL
     (void)pool.sync_all();
     global_stream_cache().check_in(
       device, pool.streams);  // leaves pool.streams empty; ~stream_pool is a no-op
+#endif
   }
 
   leased_pool(const leased_pool&)            = delete;
@@ -401,6 +414,11 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     auto const& col = table.columns[idx];
     if (!col.plan_tree || col.num_rows != num_rows)
       return refuse("selected column missing plan_tree or row-count mismatch");
+    // A compacted decode returns the surviving rows while the stored bitmask
+    // still spans the whole chunk, and nothing on this path compacts one against
+    // the other. Refused here, before any device work, rather than as a
+    // per-column failure that unwinds the whole batch mid-flight.
+    if (!col.plan_tree->validity.empty()) return refuse("selected column is nullable");
   }
   for (auto const& f : request.filters) {
     if (f.column >= selected.size()) return refuse("filter directive column out of range");
@@ -523,13 +541,13 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     std::vector<std::uint32_t const*> mask_ptrs;
     mask_ptrs.reserve(k_total + 1);  // +1: the optional positional keep mask
     // Lanes other than s0 that produced a source, which the combine on s0 must wait for.
-    std::vector<rmm::cuda_stream_view> producer_lanes;
+    std::vector<cudf_pool_stream> producer_lanes;
     decode_session wave1{streams, mr};
     auto next_destination = [&] {
       auto const lane = wave1.next_stream();
       if (lane.get() != s0.get() &&
           std::none_of(producer_lanes.begin(), producer_lanes.end(), [&](auto other) {
-            return other.value() == lane.get();
+            return static_cast<::cuda::stream_ref>(other).get() == lane.get();
           }))
         producer_lanes.emplace_back(lane);
       auto* words =
@@ -558,12 +576,15 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     // positional keep mask), membership probes run sequentially on s0 after the combine, so dead
     // rows skip the set/Bloom lookup. Otherwise they run concurrently here, prior-free.
     bool const sequential_membership = k_member > 0 && (k_range + k_bool8 > 0 || has_keep_mask);
+    // Which membership probes ran, by request position, for the measurement.
+    std::vector<bool> member_ran(k_member, false);
     for (size_t m = 0; !sequential_membership && m < k_member; ++m) {
       auto const& directive = request.membership_filters[m];
       auto const& column    = table.columns[selected[directive.column]];
       auto const status     = wave1.append(mask_decode_request{
         *column.plan_tree, membership_source{directive.probe, column.dtype}, next_destination()});
       declined_members += status == mask_source_status::DECLINED;
+      member_ran[m] = status != mask_source_status::DECLINED;
     }
 
     // Order the combine on s0 after every other lane that produced a source.
@@ -599,6 +620,32 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
       mask_ptrs.push_back(keep_dst);
     }
 
+    // ── Membership measurement counters on s0, copied back by the CNT wave's host sync. Counter m
+    // holds the rows that pass every probe up to m (concurrent probes; their masks are counted
+    // before the combine overwrites source 0), or, for the cascade, counter 0 holds its input and
+    // counter m + 1 the rows that pass every probe up to m.
+    bool const measure_members = request.measure_membership && k_member > 0;
+    rmm::device_buffer member_counters;
+    std::vector<std::uint32_t> member_counts;
+    auto member_counter = [&](std::size_t index) {
+      return static_cast<std::uint32_t*>(member_counters.data()) + index;
+    };
+    if (measure_members) {
+      member_counts.resize(k_member + 1);
+      member_counters = rmm::device_buffer(member_counts.size() * sizeof(std::uint32_t), s0, mr);
+      if (cudaMemsetAsync(member_counters.data(), 0, member_counters.size(), s0.get()) !=
+          cudaSuccess) {
+        throw plan_error("filtered decode: membership counter reset failed");
+      }
+      std::vector<std::uint32_t const*> ran_masks;
+      for (size_t m = 0; !sequential_membership && m < k_member; ++m) {
+        if (!member_ran[m]) continue;
+        ran_masks.push_back(mask_ptrs[m]);
+        sc::count_masked_rows(
+          ran_masks.data(), static_cast<int>(ran_masks.size()), alloc_words, member_counter(m), s0);
+      }
+    }
+
     // ── Combine on stream 0.
     if (mask_ptrs.size() > 1) {
       sc::combine_masks_and(
@@ -611,6 +658,10 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     // strip is written and read only on s0, so its stream-ordered free cannot race a reader.
     std::optional<decode_session> cascade;
     if (sequential_membership) {
+      std::array<std::uint32_t const*, 1> const cascade_input{combined};
+      if (measure_members) {
+        sc::count_masked_rows(cascade_input.data(), 1, alloc_words, member_counter(0), s0);
+      }
       cascade.emplace(std::span{&s0, 1}, mr);
       rmm::device_buffer membership_scratch(mask_bytes, s0, mr);
       auto* member_words = static_cast<std::uint32_t*>(membership_scratch.data());
@@ -625,7 +676,11 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
           ++declined_members;
           continue;
         }
+        member_ran[m] = true;
         sc::combine_masks_and(combined, and_sources.data(), 2, alloc_words, s0);
+        if (measure_members) {
+          sc::count_masked_rows(cascade_input.data(), 1, alloc_words, member_counter(m + 1), s0);
+        }
       }
     }
 
@@ -658,12 +713,26 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     // the combine and the cascade have completed, so per_filter teardown is safe.
     sc::selection_mask sel{
       combined, num_rows, -1, static_cast<std::uint32_t*>(result.chunk_offsets.data())};
-    sc::run_selection_cnt(sel, s0, mr);
+    sc::run_selection_cnt(sel, s0, mr, {member_counter(0), member_counts});
     // CNT is the genuine host observation. finish also checks external phase work after request
     // submission before publishing the dual-delivery BOOL8 owners.
     bool8_full = wave1.finish();
     if (cascade) (void)cascade->finish();
-    result.survivor_count = sel.survivor_count;
+    result.survivor_count            = sel.survivor_count;
+    result.membership_probes_applied = k_member - declined_members;
+    if (measure_members && declined_members < k_member) {
+      // Each probe saw the rows every earlier probe that ran kept.
+      int64_t rows_in           = sequential_membership ? member_counts[0] : num_rows;
+      result.membership_rows_in = rows_in;
+      result.membership_probe_rows.resize(request.membership_filters.size());
+      for (size_t m = 0; m < k_member; ++m) {
+        if (!member_ran[m]) continue;
+        int64_t const rows_out          = member_counts[sequential_membership ? m + 1 : m];
+        result.membership_probe_rows[m] = {rows_in, rows_out};
+        rows_in                         = rows_out;
+      }
+      result.membership_rows_out = sel.survivor_count;
+    }
     per_filter.clear();
     keep_mask_dev = rmm::device_buffer{};  // combine consumed it; CNT synced s0
 
@@ -708,7 +777,14 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
                      static_cast<long long>(sel.survivor_count),
                      static_cast<long long>(num_rows));
       }
+      // The membership measurement stays valid: the probes ran on every row before the decode gave
+      // compaction up.
+      auto measured = std::move(result);
       reset_result(sc::scan_filter_status::declined_unselective);
+      result.membership_probes_applied = measured.membership_probes_applied;
+      result.membership_rows_in        = measured.membership_rows_in;
+      result.membership_rows_out       = measured.membership_rows_out;
+      result.membership_probe_rows     = std::move(measured.membership_probe_rows);
       return std::nullopt;
     }
 
@@ -755,7 +831,7 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     auto const wait_for_indices = [&](::cuda::stream_ref lane) {
       if (!indices_needed || std::any_of(index_lanes.begin(), index_lanes.end(), same_stream(lane)))
         return;
-      rmm::cuda_stream_view const producer{s0};
+      cudf_pool_stream const producer{s0};
       cudf::detail::join_streams({&producer, 1}, lane);
       index_lanes.push_back(lane);
     };

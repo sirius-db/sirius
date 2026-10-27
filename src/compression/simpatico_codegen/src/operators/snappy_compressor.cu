@@ -22,8 +22,10 @@ detail::batched_codec_ops const& snappy_ops()
 
     detail::batched_codec_ops o;
     o.chunk_size             = kSnappyChunkSize;
-    o.compress_get_temp_size = [copts](size_t nc, size_t mc, size_t* tb, size_t mt) {
-      return nvcompBatchedSnappyCompressGetTempSizeAsync(nc, mc, copts, tb, mt);
+    o.compress_get_temp_size = [copts](
+                                 size_t nc, size_t mc, size_t* tb, size_t mt, cudaStream_t stream) {
+      return SIMPATICO_NVCOMP_GET_TEMP_SIZE(
+        nvcompBatchedSnappyCompressGetTempSize, stream, nc, mc, copts, tb, mt);
     };
     o.compress_get_max_output = [copts](size_t mc, size_t* mo) {
       return nvcompBatchedSnappyCompressGetMaxOutputChunkSize(mc, copts, mo);
@@ -40,9 +42,11 @@ detail::batched_codec_ops const& snappy_ops()
                                cudaStream_t s) {
       return nvcompBatchedSnappyCompressAsync(up, ub, mc, nc, t, tb, cp, cb, copts, st, s);
     };
-    o.decompress_get_temp_size = [dopts](size_t nc, size_t mc, size_t* tb, size_t mt) {
-      return nvcompBatchedSnappyDecompressGetTempSizeAsync(nc, mc, dopts, tb, mt);
-    };
+    o.decompress_get_temp_size =
+      [dopts](size_t nc, size_t mc, size_t* tb, size_t mt, cudaStream_t stream) {
+        return SIMPATICO_NVCOMP_GET_TEMP_SIZE(
+          nvcompBatchedSnappyDecompressGetTempSize, stream, nc, mc, dopts, tb, mt);
+      };
     o.decompress_async = [dopts](void const* const* cp,
                                  size_t const* cb,
                                  size_t const* ubuf,

@@ -25,6 +25,7 @@
 
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -144,6 +145,12 @@ class sirius_physical_plan_generator {
   //! The type an aggregate result declared as @p type is planned as; HUGEINT narrows to BIGINT.
   [[nodiscard]] static duckdb::LogicalType planned_aggregate_type(duckdb::LogicalType const& type);
 
+  //! Throws NotImplementedException (CPU fallback) unless each @p planned column is its @p declared
+  //! type, or `planned_aggregate_type` of it; @p subject names the input in the message.
+  static void require_planned_schema(std::span<sirius::logical_type const> planned,
+                                     duckdb::vector<duckdb::LogicalType> const& declared,
+                                     std::string_view subject);
+
  protected:
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalOperator& op);
 
@@ -198,8 +205,7 @@ class sirius_physical_plan_generator {
   // create_plan(duckdb::LogicalCopyToFile &op);
   // duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalExplain
   // &op);
-  //! `UNION ALL` only; the builder rejects distinct UNION. EXCEPT / INTERSECT share the same
-  //! DuckDB node but keep their own throwing case in the dispatch switch, so they never arrive.
+  //! Dispatches a set operation on its type; EXCEPT / INTERSECT throw, so they run on the CPU.
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
     duckdb::LogicalSetOperation& op);
   // duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalUpdate
@@ -230,6 +236,15 @@ class sirius_physical_plan_generator {
     duckdb::LogicalComparisonJoin& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_delim_join(
     duckdb::LogicalComparisonJoin& op);
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_union(
+    duckdb::LogicalSetOperation& op);
+
+  //! A zero-aggregate grouped aggregate over @p child keyed on its @p key_columns, in that order;
+  //! its output is exactly those columns.
+  static duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_dedup(
+    duckdb::unique_ptr<sirius::op::sirius_physical_operator> child,
+    std::span<duckdb::idx_t const> key_columns,
+    duckdb::idx_t estimated_cardinality);
 
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> try_plan_dense_count_join(
     duckdb::LogicalAggregate& op);
