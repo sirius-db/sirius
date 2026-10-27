@@ -302,16 +302,18 @@ On allocation failure:
 ## Stream-Ordering Discipline
 
 Device memory is freed stream-ordered (RMM async pool), and the pool may rebind the virtual
-address immediately after the free executes. Batches are handed off event-ordered, not
-host-synced, and read locks are host-scoped: a consumer can enqueue kernels and drop its lock
-with device work still in flight. The invariant that keeps this safe:
+address immediately after the free executes. A GPU batch is published either already complete
+(a producer that host-syncs first; its writer event, if any, is already signalled) or with a
+writer event that a consumer must wait on (a producer that may publish early, such as preload
+once a converter copies asynchronously). Read locks are host-scoped: a consumer can enqueue
+kernels and drop its lock with device work still in flight. The invariant that keeps this safe:
 
 > No owner of device memory may die (free, pool return, or dealloc-stream rebind) until every
 > stream that may still read or write that memory is ordered before the free.
 
-Three mechanisms carry it:
+Four mechanisms carry it:
 
-1. **Writer ordering before conversion reads.** `convertible_data_batch::convert` retains its stricter publication contract: a GPU batch without a writer event is rejected before rebinding or conversion. Owning `make_data_batch` helpers use `gpu_table_representation::make_written_on`, where a null stream means the actual default stream on the producing device; view helpers explicitly record it too. The direct chunked spill converter independently calls `wait_for_writer` before planning string offsets or copying bytes. At the cuCascade representation boundary, unknown writers synchronize the source device, while known writers order an event on the reader stream. Pinned views with unknown provenance retain that conservative behavior. View-backed `release_table(stream)` waits for its copy before releasing the backing owner; owned release only orders the writer.
+1. **Writer ordering before conversion reads.** `convertible_data_batch::convert` retains its stricter publication contract: a GPU batch without a writer event is rejected before rebinding or conversion (it throws, rather than assuming such a batch is complete — deliberately stricter than the reader-side wait in mechanism 4). Owning `make_data_batch` helpers use `gpu_table_representation::make_written_on`, where a null stream means the actual default stream on the producing device; view helpers explicitly record it too. The direct chunked spill converter independently calls `wait_for_writer` before planning string offsets or copying bytes. At the cuCascade representation boundary, unknown writers synchronize the source device, while known writers order an event on the reader stream. Pinned views with unknown provenance retain that conservative behavior. View-backed `release_table(stream)` waits for its copy before releasing the backing owner; owned release only orders the writer.
 2. **Reader events at intra-operator ownership handoffs.** The scan's `owning_table_view` records
    a reader event for zero-copy views whose owner can be replaced before control returns to the
    pipeline task (`record_reader_event`, cuCascade #184). `try_to_mutable()` then refuses, and
@@ -322,6 +324,16 @@ Three mechanisms carry it:
    the corresponding inputs and outputs are still alive, before rethrowing lets them unwind. This
    also ensures cross-task state freed by `finalize_operator` is not freed under a straggling sink
    enqueue.
+4. **Reader-side writer-event wait in `lock_and_prepare_batch`.** A GPU representation published
+   *without* a writer event must be complete when its batch lock is released (every existing
+   Sirius producer host-syncs its stream before publishing; preload enforces this on its own
+   outputs, see "Reader-side ordering invariant" above). A producer that may publish before
+   its writes complete, such as an asynchronous preload copy on its own stream, must record a
+   writer event instead. Consumers order their task stream after that event inside
+   `lock_and_prepare_batch` (`order_after_writer`, a device-side `cudaStreamWaitEvent`, never the
+   device-synchronizing `wait_for_writer`): under the mutable lock before the opportunistic
+   deallocation-stream rebind, and again under the read lock on every return path that hands out
+   a GPU batch in the target space, so nothing is rebound, freed or read ahead of the producer.
 
 Suspected violations show up as torn GPU→HOST conversions, scribbled string or selection
 geometry, or wild-pointer MMU faults, almost always under concurrency plus memory pressure.
