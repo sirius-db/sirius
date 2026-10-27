@@ -23,6 +23,7 @@
 #include "event/query_event_publisher.hpp"
 #include "exec/multi_index_priority_queue.hpp"
 #include "exec/query_lifecycle_registry.hpp"
+#include "memory/device_preload_budget.hpp"
 #include "memory/memory_wait_board.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/partition_placement.hpp"
@@ -189,6 +190,8 @@ struct executor_fixture {
   sirius::exec::query_lifecycle_registry lifecycle;
   std::shared_ptr<sirius::memory::memory_wait_board> board;
   std::shared_ptr<preload_streams> streams;
+  std::vector<int> device_ids;
+  std::shared_ptr<sirius::memory::device_preload_budget> budget;
   rmm::cuda_stream stream_owner{};
   ::cuda::stream_ref stream{stream_owner.value()};
   sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue{
@@ -223,8 +226,10 @@ struct executor_fixture {
     disk = mgr->get_memory_space(Tier::DISK, 0);
     REQUIRE(host != nullptr);
     REQUIRE(disk != nullptr);
-    board   = std::make_shared<sirius::memory::memory_wait_board>(opts.gpus - 1);
-    streams = std::make_shared<preload_streams>(devices);
+    board      = std::make_shared<sirius::memory::memory_wait_board>(opts.gpus - 1);
+    streams    = std::make_shared<preload_streams>(devices);
+    device_ids = devices;
+    budget     = std::make_shared<sirius::memory::device_preload_budget>(device_ids);
   }
 
   ~executor_fixture()
@@ -265,14 +270,13 @@ struct executor_fixture {
     return static_cast<std::size_t>(static_cast<double>(opts.gpu_capacity) * opts.trigger);
   }
 
-  /// Preload enabled, no head margin, one HOST->GPU copy and one DISK copy at a time.
+  /// Device preloading enabled, no head margin, one copy per lane.
   [[nodiscard]] static preload_executor_config config()
   {
     preload_executor_config cfg;
-    cfg.enabled                 = true;
-    cfg.head_margin_tasks       = 0;
-    cfg.host_to_gpu_concurrency = 1;
-    cfg.disk_concurrency        = 1;
+    cfg.concurrent_preloads      = 1;
+    cfg.head_margin_tasks        = 0;
+    cfg.device_preloading_budget = 0.20;
     return cfg;
   }
 
@@ -280,11 +284,21 @@ struct executor_fixture {
              hw_caps_override caps       = {false, false},
              bool start                  = true)
   {
-    exec = std::make_unique<preload_executor>(
+    // Device preloading is on when a budget is set and the GPU spaces are not per-stream.
+    bool const device_pre = cfg.device_preloading_budget > 0.0 && !opts.per_stream;
+    exec                  = std::make_unique<preload_executor>(
       *publisher,
       std::move(cfg),
-      preload_dependencies{
-        lifecycle, *mgr, nullptr, &queue, board, streams, 1, space_capacity(), caps});
+      preload_dependencies{.lifecycle                = lifecycle,
+                                            .memory                   = *mgr,
+                                            .topology                 = nullptr,
+                                            .task_queue               = &queue,
+                                            .wait_board               = board,
+                                            .streams                  = device_pre ? streams : nullptr,
+                                            .device_budget            = device_pre ? budget : nullptr,
+                                            .pipeline_threads_per_gpu = 1,
+                                            .space_capacity           = space_capacity(),
+                                            .caps                     = caps});
     exec->enable_promotion_log_for_testing();
     if (start) { exec->start(); }
   }
@@ -578,8 +592,8 @@ TEST_CASE_METHOD(executor_fixture,
                  "preload executor: a running promotion counts once against the ceiling",
                  "[preload_executor]")
 {
-  auto cfg                    = config();
-  cfg.host_to_gpu_concurrency = 2;
+  auto cfg                = config();
+  cfg.concurrent_preloads = 2;
   build(cfg);
   promotion_gate gate;
   exec->set_promotion_hook_for_testing([&](promotion_job const&) { gate.enter(); });
@@ -1003,11 +1017,11 @@ TEST_CASE_METHOD(executor_fixture,
                  "[preload_executor]")
 {
   auto const run = [&](int cap, double inflight_fraction, std::uint32_t id) {
-    auto cfg                    = config();
-    cfg.host_to_gpu_concurrency = cap;
-    cfg.lookahead_tasks         = 16;
-    cfg.max_inflight_fraction   = inflight_fraction;
-    cfg.max_batch_fraction      = inflight_fraction;
+    auto cfg                  = config();
+    cfg.concurrent_preloads   = static_cast<std::size_t>(cap);
+    cfg.lookahead_tasks       = 16;
+    cfg.max_inflight_fraction = inflight_fraction;
+    cfg.max_batch_fraction    = inflight_fraction;
     build(cfg);
     exec->set_promotion_hook_for_testing([](promotion_job const&) {
       std::this_thread::sleep_for(20ms);  // keep copies overlapping
@@ -1062,8 +1076,8 @@ TEST_CASE_METHOD(executor_fixture,
                  "preload executor: DISK lane threads follow GPUDirect Storage",
                  "[preload_executor]")
 {
-  auto cfg             = config();
-  cfg.disk_concurrency = 0;  // auto
+  auto cfg                = config();
+  cfg.concurrent_preloads = std::nullopt;  // auto: C2C sizes the GPU lane, GDS the DISK lane
   SECTION("without GDS")
   {
     build(cfg, {false, false});
@@ -1076,7 +1090,6 @@ TEST_CASE_METHOD(executor_fixture,
   }
   SECTION("C2C raises the HOST->GPU lane")
   {
-    cfg.host_to_gpu_concurrency = 0;  // auto
     build(cfg, {true, false});
     CHECK(exec->lane_threads_for_testing() == std::vector<int>{5, 1});
   }
@@ -1086,9 +1099,9 @@ TEST_CASE_METHOD(executor_fixture,
                  "preload executor: DISK->GPU without GDS shares the HOST->GPU tokens",
                  "[preload_executor]")
 {
-  bool const gds       = GENERATE(false, true);
-  auto cfg             = config();
-  cfg.disk_concurrency = 1;
+  bool const gds          = GENERATE(false, true);
+  auto cfg                = config();
+  cfg.concurrent_preloads = 1;
   build(cfg, {false, gds});
   auto const q     = open_query(1);
   auto const state = pipeline_state(priority(q, 1));
@@ -1288,8 +1301,8 @@ TEST_CASE(
   "[preload_executor]")
 {
   executor_fixture f{fixture_options{.reservation_fraction = 0.75, .trigger = 0.9, .stop = 0.8}};
-  auto cfg                            = executor_fixture::config();
-  cfg.gpu_committed_headroom_fraction = 0.5;  // a ceiling consumed bytes can actually reach
+  auto cfg                      = executor_fixture::config();
+  cfg.device_preloading_ceiling = 0.3;  // a ceiling consumed bytes can actually reach
   f.build(cfg);
   auto const q       = f.open_query(1);
   auto const state   = f.pipeline_state(executor_fixture::priority(q, 1));
@@ -1328,7 +1341,7 @@ TEST_CASE(
 // ---------------------------------------------------------------------------------------------
 
 TEST_CASE_METHOD(executor_fixture,
-                 "preload executor: repeated OOMs ban the GPU and the batch is staged instead",
+                 "preload executor: the first OOM bans the GPU and the batch is staged instead",
                  "[preload_executor]")
 {
   build();
@@ -1344,16 +1357,16 @@ TEST_CASE_METHOD(executor_fixture,
 
   downgraded(q, record(batch));
   settle();
-  // One retry with a doubled estimate (max_oom_retries = 1), then HOST staging only.
-  CHECK(gpu_attempts == 2);
-  CHECK(stat(*exec, counter::oom) == 2);
+  // The first OOM bans the GPU for the candidate's lifetime: no retry, then HOST staging only.
+  CHECK(gpu_attempts == 1);
+  CHECK(stat(*exec, counter::oom) == 1);
   CHECK(stat(*exec, counter::gpu_banned) == 1);
   CHECK(tier_of(*batch) == Tier::HOST);
   CHECK(stat(*exec, counter::promoted_d2h) == 1);
 
   completed(q);
   settle();
-  CHECK(gpu_attempts == 2);
+  CHECK(gpu_attempts == 1);
   CHECK(tier_of(*batch) == Tier::HOST);
 }
 
@@ -1427,10 +1440,10 @@ TEST_CASE_METHOD(executor_fixture,
                  "preload executor: bytes in flight count against the lookahead window",
                  "[preload_executor]")
 {
-  auto cfg                    = config();
-  cfg.host_to_gpu_concurrency = 2;
+  auto cfg                = config();
+  cfg.concurrent_preloads = 2;
   // About 1.5 MiB: one batch's reservation fits, two do not.
-  cfg.gpu_lookahead_fraction = 1.5 / 1024.0;
+  cfg.device_preloading_budget = 1.5 / 1024.0;
   build(cfg);
   auto const q     = open_query(1);
   auto const state = pipeline_state(priority(q, 1));
@@ -1632,18 +1645,19 @@ TEST_CASE("preload executor: start-up warnings", "[preload_executor]")
   {
     executor_fixture f;
     auto cfg                              = executor_fixture::config();
-    cfg.gpu_committed_headroom_fraction   = 1.0;
-    cfg.gpu_speculative_headroom_fraction = 1.0;
-    cfg.host_headroom_fraction            = 1.0;
+    cfg.gpu_speculative_headroom_fraction = 1.0;  // speculative ceiling 0
+    cfg.host_headroom_fraction            = 1.0;  // host staging ceiling 0
     f.build(cfg);
-    CHECK(logged(sink, "committed ceiling is 0"));
+    CHECK(logged(sink, "speculative ceiling is 0"));
     CHECK(logged(sink, "staging ceiling is 0"));
   }
-  SECTION("per-stream reservation tracking")
+  SECTION("per-stream reservation tracking disables device preloading")
   {
+    // The fixture's build() passes no streams or budget board when the GPU space is per-stream,
+    // so the executor runs staging only: a single DISK lane, no GPU HOST->GPU lane.
     executor_fixture f{fixture_options{.per_stream = true}};
     f.build();
-    CHECK(logged(sink, "tracks reservations per stream"));
+    CHECK(f.exec->lane_threads_for_testing().size() == 1);
   }
 }
 

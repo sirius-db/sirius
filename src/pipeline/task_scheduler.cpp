@@ -17,10 +17,12 @@
 #include "pipeline/task_scheduler.hpp"
 
 #include "creator/task_creator.hpp"
+#include "data/convertible_gpu_pipeline_task.hpp"
 #include "downgrade/downgrade_executor.hpp"
 #include "exec/config.hpp"
 #include "exec/multi_index_priority_queue.hpp"
 #include "log/logging.hpp"
+#include "memory/device_preload_budget.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
@@ -32,6 +34,7 @@
 #include "telemetry-bridge/gen/quent.hpp"
 #include "telemetry/telemetry_context.hpp"
 
+#include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
@@ -339,6 +342,22 @@ void task_scheduler::management_eventloop()
       auto failure_handler = attributed ? attributed->get_completion_handler() : nullptr;
       try {
         if (auto* gpu_task = dynamic_cast<pipeline::gpu_pipeline_task*>(task.get())) {
+          // Release this task's preloaded input charges the instant it is claimed, before
+          // task_deployed is published, so the preload planner pass that event triggers already
+          // sees the freed device preloading budget. The board releases whatever device holds a
+          // charge (R3 has no same-device exception). Skipped when the board is absent or empty.
+          if (_device_preload_budget && !_device_preload_budget->empty()) {
+            std::vector<std::uint64_t> input_ids;
+            if (auto const* data =
+                  sirius::convertible_gpu_pipeline_task::get_pipelineable_data(*task)) {
+              auto const& batches = data->get_data_batches();
+              input_ids.reserve(batches.size());
+              for (auto const& batch : batches) {
+                if (batch) { input_ids.push_back(batch->get_batch_id()); }
+              }
+            }
+            _device_preload_budget->claim(input_ids);
+          }
           {
             // Priority packs query_id in its high 32 bits (see task_creator); the
             // queue's key extractor unpacks it the same way.

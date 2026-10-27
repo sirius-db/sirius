@@ -83,6 +83,7 @@ namespace sirius::preload {
   X(oom)                           \
   X(too_big)                       \
   X(gpu_banned)                    \
+  X(claimed)                       \
   X(failed)                        \
   X(hit)                           \
   X(bounce)                        \

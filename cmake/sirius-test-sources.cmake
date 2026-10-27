@@ -209,6 +209,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_physical_union_mgpu.cpp
     test/cpp/operator/test_partition_memspace_mgpu.cpp
     test/cpp/memory/test_memory_wait_board.cpp
+    test/cpp/memory/test_device_preload_budget.cpp
     test/cpp/memory/test_multiple_blocks_allocation_accessor.cpp
     test/cpp/memory/test_topology_index.cpp
     test/cpp/preload/test_candidate_store.cpp

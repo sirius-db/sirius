@@ -16,6 +16,7 @@
 
 #include "catch.hpp"
 #include "event/downgraded_batch.hpp"
+#include "memory/device_preload_budget.hpp"
 #include "preload/candidate_store.hpp"
 #include "preload/config.hpp"
 #include "preload/preload_policy.hpp"
@@ -106,14 +107,15 @@ repo_info repo(std::uintptr_t token, sirius::exec::queue_priority dest_priority)
 }
 
 struct store_fixture {
-  preload_executor_config cfg = [] {
-    preload_executor_config c;
-    c.enabled = true;
-    return c;
-  }();
+  preload_executor_config cfg{};
   preload_counters counters{0, 2};
-  candidate_store store{cfg, {0, 1}, {0}, counters};
+  std::vector<int> gpu_devices{0, 1};
+  sirius::memory::device_preload_budget budget{gpu_devices};
+  candidate_store store{cfg, {0, 1}, {0}, counters, &budget};
   query_id_t const q1 = make_query_id(1);
+
+  /// Bytes the board charges when a GPU job of a candidate with @p est_bytes is taken.
+  static std::size_t charged(std::size_t est_bytes) { return reserve_estimate(est_bytes, 1); }
   query_id_t const q2 = make_query_id(2);
 
   store_fixture()
@@ -279,8 +281,10 @@ TEST_CASE("candidate_store promotes into the ledger and counts the promotion", "
   CHECK(e->gpu == 0);
   CHECK(e->k == klass::B);
   CHECK(e->bytes == 128);
-  CHECK(f.store.outstanding_bytes(0) == 128);
-  CHECK(f.store.outstanding_b_bytes(0) == 128);
+  // Outstanding is the budget charged when the job was taken (the candidate's est_bytes), not the
+  // ledger byte count (the copy's exact need).
+  CHECK(f.store.outstanding_bytes(0) == store_fixture::charged(100));
+  CHECK(f.store.outstanding_b_bytes(0) == store_fixture::charged(100));
   CHECK(f.counters.get(counter::promoted_h2g) == 1);
   CHECK(f.counters.get(counter::bytes_h2g) == 128);
   CHECK(f.store.find_query(f.q1)->stats[counter::promoted_h2g] == 1);
@@ -300,7 +304,7 @@ TEST_CASE("candidate_store: an outcome after retire_query only updates statistic
   REQUIRE(f.store.intake(f.q1, record(b, 7, 1, gpu0, host0, 100)) == intake_status::inserted);
   REQUIRE(f.store.intake(f.q1, record(other, 8, 2, gpu0, host0, 50)) == intake_status::inserted);
   f.promote(8, gpu_t0, klass::A, 64);
-  REQUIRE(f.store.outstanding_bytes(0) == 64);
+  REQUIRE(f.store.outstanding_bytes(0) == store_fixture::charged(50));
 
   auto const job = f.take(7, gpu_t0);
   f.store.retire_query(f.q1);
@@ -456,24 +460,19 @@ TEST_CASE("candidate_store: ledger bounce, then the promotion cap", "[preload]")
   CHECK(f.counters.get(counter::dropped_promotion_cap) == 1);
 }
 
-TEST_CASE("candidate_store: OOM doubles the estimate, then bans the GPU", "[preload]")
+TEST_CASE("candidate_store: the first OOM bans the GPU for the candidate's lifetime", "[preload]")
 {
-  store_fixture f;  // max_oom_retries = 1
+  store_fixture f;
   fake_batch b;
   REQUIRE(f.store.intake(f.q1, record(b, 7, 1, gpu0, disk0, 64 << 20)) == intake_status::inserted);
 
   auto job = f.take(7, gpu_t0);
+  // No doubled-estimate retry: the estimate uses a multiplier of 1.
   CHECK(job.oom_multiplier == 1);
   CHECK(job.est_reserve == reserve_estimate(64 << 20, 1));
   f.store.apply_outcome(job, outcome(promotion_outcome::oom));
   CHECK_FALSE(f.store.gated(gpu_t0));  // local to the candidate
-  CHECK_FALSE(f.store.find(7)->gpu_banned);
-
-  job = f.take(7, gpu_t0);
-  CHECK(job.oom_multiplier == 2);
-  CHECK(job.est_reserve == reserve_estimate(64 << 20, 2));
-  f.store.apply_outcome(job, outcome(promotion_outcome::oom));
-  CHECK(f.store.find(7)->gpu_banned);
+  CHECK(f.store.find(7)->gpu_banned);  // banned on the first OOM
   CHECK(f.counters.get(counter::gpu_banned) == 1);
 
   // Staging is not inflated by the GPU's OOM history.
@@ -558,7 +557,7 @@ TEST_CASE("candidate_store erases expired ledger entries without a lease", "[pre
   REQUIRE(f.store.intake(f.q1, record(consumed, 2, 2, gpu0, host0, 20)) == intake_status::inserted);
   f.promote(1, gpu_t0, klass::A, 10);
   f.promote(2, gpu_t0, klass::A, 20);
-  REQUIRE(f.store.outstanding_bytes(0) == 30);
+  REQUIRE(f.store.outstanding_bytes(0) == store_fixture::charged(10) + store_fixture::charged(20));
 
   consumed.destroy();
   auto const snap = f.store.snapshot_phase0();
@@ -568,7 +567,7 @@ TEST_CASE("candidate_store erases expired ledger entries without a lease", "[pre
   CHECK(f.store.sweep_expired_ledger() == 1);
   CHECK(f.store.find_ledger(2) == nullptr);
   CHECK(f.store.find_ledger(1) != nullptr);
-  CHECK(f.store.outstanding_bytes(0) == 10);
+  CHECK(f.store.outstanding_bytes(0) == store_fixture::charged(10));
   CHECK(f.counters.get(counter::hit) == 1);
 }
 
@@ -584,9 +583,9 @@ TEST_CASE("candidate_store applies the planner's ledger classification", "[prelo
   f.promote(1, gpu_t0, klass::A, 10);
   f.promote(2, gpu_t0, klass::B, 20);
   f.promote(3, gpu_t1, klass::B, 40);
-  REQUIRE(f.store.outstanding_bytes(0) == 30);
-  REQUIRE(f.store.outstanding_b_bytes(0) == 20);
-  REQUIRE(f.store.outstanding_b_bytes(1) == 40);
+  REQUIRE(f.store.outstanding_bytes(0) == store_fixture::charged(10) + store_fixture::charged(20));
+  REQUIRE(f.store.outstanding_b_bytes(0) == store_fixture::charged(20));
+  REQUIRE(f.store.outstanding_b_bytes(1) == store_fixture::charged(40));
 
   std::vector<std::pair<std::uint64_t, ledger_verdict>> const verdicts{
     {1, ledger_verdict::hit},           // class A whose task ran
@@ -599,10 +598,10 @@ TEST_CASE("candidate_store applies the planner's ledger classification", "[prelo
   CHECK(f.store.find_ledger(1) == nullptr);
   REQUIRE(f.store.find_ledger(2) != nullptr);
   CHECK(f.store.find_ledger(2)->k == klass::A);
-  CHECK(f.store.outstanding_bytes(0) == 20);
+  CHECK(f.store.outstanding_bytes(0) == store_fixture::charged(20));
   CHECK(f.store.outstanding_b_bytes(0) == 0);
-  CHECK(f.store.outstanding_bytes(1) == 40);
-  CHECK(f.store.outstanding_b_bytes(1) == 40);
+  CHECK(f.store.outstanding_bytes(1) == store_fixture::charged(40));
+  CHECK(f.store.outstanding_b_bytes(1) == store_fixture::charged(40));
   CHECK(f.counters.get(counter::hit) == 1);
 
   SECTION("a consumer on another GPU counts a misprediction")
@@ -769,7 +768,7 @@ TEST_CASE("candidate_store ignores a record older than the promotion in the ledg
     CHECK(f.store.intake(f.q1, record(b, 7, 6, host0, disk0, 100)) ==
           intake_status::dropped_stale_record);
     CHECK(f.store.find_ledger(7) != nullptr);
-    CHECK(f.store.outstanding_bytes(0) == 100);
+    CHECK(f.store.outstanding_bytes(0) == store_fixture::charged(100));
     CHECK(f.store.find(7) == nullptr);
     CHECK(f.counters.get(counter::bounce) == 0);
     CHECK(f.counters.get(counter::dropped_stale_record) == 1);
@@ -888,7 +887,7 @@ TEST_CASE("candidate_store keeps a staged candidate for its HOST->GPU hop", "[pr
     CHECK(f.store.find(7) == nullptr);
     REQUIRE(f.store.find_ledger(7) != nullptr);
     CHECK(f.store.find_ledger(7)->gpu == 0);
-    CHECK(f.store.outstanding_bytes(0) == 100);
+    CHECK(f.store.outstanding_bytes(0) == store_fixture::charged(100));
     CHECK(f.counters.get(counter::promoted_h2g) == 1);
     // Both moves count toward the cap: a bounce now drops the batch.
     CHECK(f.store.intake(f.q1, record(b, 7, 9, gpu0, host0, 100)) ==
@@ -918,7 +917,7 @@ TEST_CASE("candidate_store keeps a staged candidate for its HOST->GPU hop", "[pr
     CHECK(f.store.find_ledger(7) == nullptr);
     CHECK(f.counters.get(counter::wasted_unconsumed) == 1);
     REQUIRE(f.store.find_ledger(8) != nullptr);
-    CHECK(f.store.outstanding_bytes(0) == 50);
+    CHECK(f.store.outstanding_bytes(0) == store_fixture::charged(50));
     CHECK(f.store.find_query(f.q2)->ledger_ids.contains(8));
   }
 }

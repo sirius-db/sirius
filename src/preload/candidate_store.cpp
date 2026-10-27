@@ -16,6 +16,8 @@
 
 #include "preload/candidate_store.hpp"
 
+#include "memory/device_preload_budget.hpp"
+
 #include <algorithm>
 #include <iterator>
 #include <limits>
@@ -96,17 +98,17 @@ constexpr std::uint64_t no_epoch = ~std::uint64_t{0};
 candidate_store::candidate_store(preload_executor_config cfg,
                                  std::vector<int> gpu_devices,
                                  std::vector<int> host_devices,
-                                 preload_counters& counters)
+                                 preload_counters& counters,
+                                 memory::device_preload_budget* budget)
   : _cfg(std::move(cfg)),
     _gpu_devices(std::move(gpu_devices)),
     _host_devices(std::move(host_devices)),
     _counters(counters),
+    _budget(budget),
     _mem_epoch(_gpu_devices.size() + _host_devices.size(), 0),
     _gate_epoch(_gpu_devices.size() + _host_devices.size(), no_epoch),
     _inflight(_gpu_devices.size() + _host_devices.size(), 0),
-    _h2g_tokens(_gpu_devices.size(), 0),
-    _outstanding(_gpu_devices.size(), 0),
-    _outstanding_b(_gpu_devices.size(), 0)
+    _h2g_tokens(_gpu_devices.size(), 0)
 {
 }
 
@@ -354,6 +356,9 @@ intake_status candidate_store::intake(query_id_t q, event::downgraded_batch cons
   if (auto const cit = _by_id.find(id); cit != _by_id.end()) {
     merge(cit->second, qs, rec);
     if (bounced) { cit->second.speculative_banned = true; }
+    // Renew the budget generation: a fresh downgrade of a batch a task may have claimed makes
+    // it a candidate again (any old charge was released by the bounce/erase path above).
+    if (_budget) { _budget->watch(id); }
     count(q, counter::merged);
     return intake_status::merged;
   }
@@ -393,6 +398,7 @@ intake_status candidate_store::intake(query_id_t q, event::downgraded_batch cons
     if (rec.source == event::downgrade_source::repository) {
       qs.candidates_by_repo[rec.repository].insert(id);
     }
+    if (_budget) { _budget->watch(id); }
   } catch (...) {
     erase_candidate(it);
     throw;
@@ -491,7 +497,16 @@ void candidate_store::erase_candidate(candidate_map::iterator it) noexcept
       }
     }
   }
+  auto const id = it->second.batch_id;
   _by_id.erase(it);
+  maybe_unwatch(id);
+}
+
+void candidate_store::maybe_unwatch(std::uint64_t batch_id) noexcept
+{
+  if (_budget && !_by_id.contains(batch_id) && !_ledger.contains(batch_id)) {
+    _budget->unwatch(batch_id);
+  }
 }
 
 void candidate_store::drop_candidate_noexcept(std::uint64_t batch_id) noexcept
@@ -538,8 +553,6 @@ pass_snapshot candidate_store::snapshot_phase0()
   s.mem_epoch      = _mem_epoch;
   s.gate_epoch     = _gate_epoch;
   s.inflight_bytes = _inflight;
-  s.outstanding    = _outstanding;
-  s.outstanding_b  = _outstanding_b;
   s.queries.reserve(_queries.size());
   for (auto const& [q, qs] : _queries) {
     query_view v;
@@ -583,13 +596,31 @@ std::optional<promotion_job> candidate_store::take(ready_item const& item)
   job.expected_source     = c.location;
   job.t                   = item.t;
   job.k                   = item.k;
-  job.oom_multiplier      = item.t.tier == Tier::GPU ? oom_multiplier(c.oom_count) : 1;
+  job.oom_multiplier      = 1;  // the first OOM bans the candidate; there is no doubled retry.
   job.est_reserve         = reserve_estimate(c.est_bytes, job.oom_multiplier);
   job.ceiling             = item.ceiling;
   job.mem_epoch_at_take   = _mem_epoch[*s];
   job.queue_epoch_at_take = _queue_epoch;
   job.seq_at_take         = c.last_seq;
-  c.in_flight             = true;
+
+  // Charge the device preloading budget the moment a GPU job is taken (it already counts as
+  // in-flight for the physical copy cap). A refused charge means a task has claimed this batch:
+  // drop it from preload with the `claimed` outcome.
+  if (_budget && item.t.tier == Tier::GPU && item.t.index < _gpu_devices.size()) {
+    auto const job_seq = ++_next_job_seq;
+    if (!_budget->charge(item.batch_id,
+                         job_seq,
+                         _gpu_devices[item.t.index],
+                         item.k == klass::B,
+                         job.est_reserve)) {
+      count(c.query, counter::claimed);
+      erase_candidate(it);
+      return std::nullopt;
+    }
+    job.job_seq = job_seq;
+  }
+
+  c.in_flight = true;
   return job;
 }
 
@@ -598,6 +629,13 @@ outcome_effect candidate_store::apply_outcome(promotion_job const& job,
 {
   outcome_effect effect;
   count_outcome(job, result);
+
+  // Free the device preloading budget as soon as the attempt ends without a live GPU promotion.
+  // A successful GPU promotion keeps its charge; its ledger entry records the generation so a
+  // later erase frees it.
+  if (_budget && result.outcome != promotion_outcome::promoted) {
+    _budget->release(job.batch_id, job.job_seq);
+  }
 
   // Space-level effects hold whatever happened to the query.
   auto const o = result.outcome;
@@ -651,7 +689,9 @@ outcome_effect candidate_store::apply_outcome(promotion_job const& job,
         promotions == std::numeric_limits<std::uint32_t>::max() ? promotions : promotions + 1;
       auto const cap = static_cast<std::uint32_t>(std::max(_cfg.max_promotions_per_batch, 0));
       if (c.last_seq > job.seq_at_take) {
-        // Downgraded again while the copy ran: the merge already moved the candidate.
+        // Downgraded again while the copy ran: the merge already moved the candidate. The copy's
+        // budget charge is stale, so free it here (it is not entering the ledger).
+        if (_budget) { _budget->release(job.batch_id, job.job_seq); }
         count(job.query, counter::bounce);
         c.speculative_banned = true;
         if (promotions >= cap) {
@@ -698,9 +738,10 @@ outcome_effect candidate_store::apply_outcome(promotion_job const& job,
     case promotion_outcome::held_off: break;
     case promotion_outcome::contended: lost_race(); break;
     case promotion_outcome::oom:
+      // The first out-of-memory bans the candidate from GPUs for its lifetime: the next pass
+      // stages a DISK candidate on HOST instead, and a HOST candidate stays where it is.
       if (c.oom_count < std::numeric_limits<std::uint32_t>::max()) { ++c.oom_count; }
-      if (!c.gpu_banned &&
-          c.oom_count > static_cast<std::uint32_t>(std::max(_cfg.max_oom_retries, 0))) {
+      if (!c.gpu_banned) {
         c.gpu_banned = true;
         count(job.query, counter::gpu_banned);
       }
@@ -724,12 +765,13 @@ ledger_entry const* candidate_store::find_ledger(std::uint64_t batch_id) const n
 
 std::size_t candidate_store::outstanding_bytes(std::size_t gpu) const noexcept
 {
-  return gpu < _outstanding.size() ? _outstanding[gpu] : 0;
+  return _budget && gpu < _gpu_devices.size() ? _budget->outstanding(_gpu_devices[gpu]) : 0;
 }
 
 std::size_t candidate_store::outstanding_b_bytes(std::size_t gpu) const noexcept
 {
-  return gpu < _outstanding_b.size() ? _outstanding_b[gpu] : 0;
+  return _budget && gpu < _gpu_devices.size() ? _budget->outstanding_speculative(_gpu_devices[gpu])
+                                              : 0;
 }
 
 void candidate_store::add_ledger(candidate const& c,
@@ -742,18 +784,16 @@ void candidate_store::add_ledger(candidate const& c,
                     ? static_cast<int>(job.t.index)
                     : -1;
   if (auto const old = _ledger.find(c.batch_id); old != _ledger.end()) { erase_ledger(old); }
-  // Index first: if the ledger insert throws, the index entry is rolled back.
+  // Index first: if the ledger insert throws, the index entry is rolled back. The budget charge
+  // was made when the job was taken; the ledger only records its generation (@c job.job_seq) so
+  // a later erase releases exactly that charge.
   qs.ledger_ids.insert(c.batch_id);
   try {
-    _ledger.emplace(c.batch_id, ledger_entry{c.batch, c.query, gpu, job.k, bytes, seq, false});
+    _ledger.emplace(c.batch_id,
+                    ledger_entry{c.batch, c.query, gpu, job.k, bytes, seq, job.job_seq, false});
   } catch (...) {
     qs.ledger_ids.erase(c.batch_id);
     throw;
-  }
-  if (gpu >= 0) {
-    auto const g    = static_cast<std::size_t>(gpu);
-    _outstanding[g] = sat_add(_outstanding[g], bytes);
-    if (job.k == klass::B) { _outstanding_b[g] = sat_add(_outstanding_b[g], bytes); }
   }
 }
 
@@ -768,16 +808,15 @@ void candidate_store::reindex_seq(candidate& c, query_state& qs, std::uint64_t s
 void candidate_store::erase_ledger(
   std::unordered_map<std::uint64_t, ledger_entry>::iterator it) noexcept
 {
-  auto const& e = it->second;
+  auto const& e      = it->second;
+  auto const id      = it->first;
+  auto const job_seq = e.job_seq;
   if (auto const qit = _queries.find(e.query); qit != _queries.end()) {
-    qit->second.ledger_ids.erase(it->first);
+    qit->second.ledger_ids.erase(id);
   }
-  if (e.gpu >= 0) {
-    auto const g    = static_cast<std::size_t>(e.gpu);
-    _outstanding[g] = sat_sub(_outstanding[g], e.bytes);
-    if (e.k == klass::B) { _outstanding_b[g] = sat_sub(_outstanding_b[g], e.bytes); }
-  }
+  if (_budget) { _budget->release(id, job_seq); }
   _ledger.erase(it);
+  maybe_unwatch(id);
 }
 
 std::size_t candidate_store::sweep_expired_ledger() noexcept
@@ -812,10 +851,7 @@ void candidate_store::apply_ledger_verdicts(
         break;
       case ledger_verdict::reclassify_a:
         if (e.k == klass::B) {
-          if (e.gpu >= 0) {
-            auto const g      = static_cast<std::size_t>(e.gpu);
-            _outstanding_b[g] = sat_sub(_outstanding_b[g], e.bytes);
-          }
+          if (_budget) { _budget->reclassify_committed(id, e.job_seq); }
           e.k = klass::A;
         }
         break;
@@ -836,12 +872,18 @@ void candidate_store::note_consumer_device(std::uint64_t batch_id, std::size_t g
 
 void candidate_store::clear() noexcept
 {
+  if (_budget) {
+    for (auto const& [id, c] : _by_id) {
+      _budget->unwatch(id);
+    }
+    for (auto const& [id, e] : _ledger) {
+      _budget->unwatch(id);
+    }
+  }
   _by_id.clear();
   _queries.clear();
   _stats_by_query.clear();
   _ledger.clear();
-  std::fill(_outstanding.begin(), _outstanding.end(), 0);
-  std::fill(_outstanding_b.begin(), _outstanding_b.end(), 0);
 }
 
 }  // namespace sirius::preload

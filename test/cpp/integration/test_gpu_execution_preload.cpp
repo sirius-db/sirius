@@ -21,6 +21,7 @@
 // so a run shows what preload moved and how often the ceilings or stalled tasks held it back.
 
 #include "catch.hpp"
+#include "memory/device_preload_budget.hpp"
 #include "preload/preload_executor.hpp"
 #include "preload/preload_stats.hpp"
 #include "utils/gpu_execution_fixture.hpp"
@@ -100,10 +101,8 @@ void write_config(fs::path const& path,
          "      num_threads: 1\n"
          "      monitor_period: 10ms\n"
          "    preload:\n"
-         "      enabled: "
-      << (preload ? "true" : "false")
-      << "\n"
-         "  operator_params:\n"
+      << (preload ? "      device_preloading_budget: 0.2\n" : "      concurrent_preloads: 0\n")
+      << "  operator_params:\n"
          "    scan_task_batch_size: 33554432\n"
          "    max_sort_partition_bytes: 67108864\n"
          "    hash_partition_bytes: 33554432\n"
@@ -362,6 +361,16 @@ std::vector<preload_stats> run_off_and_on(sirius::test::scratch_dir const& dir,
     auto const after_all = sirius::test::get_transparent_execution_stats(*db.con);
     CHECK(after_all.executions - before_all.executions == queries.size());
     CHECK(after_all.runtime_fallbacks == before_all.runtime_fallbacks);
+    // Device preloading released budget when claimed tasks were popped (R3). Only assert it when
+    // something was actually promoted onto a GPU (and so charged against the budget).
+    auto const budget =
+      sirius::test::get_registered_sirius_context(*db.con)->device_preload_budget_for_testing();
+    REQUIRE_FALSE(budget.expired());
+    std::uint64_t gpu_promotions = 0;
+    for (auto const& s : stats) {
+      gpu_promotions += s[counter::promoted_h2g] + s[counter::promoted_d2g];
+    }
+    if (gpu_promotions > 0) { CHECK(budget.lock()->claimed_releases() > 0); }
   }
   check_bounce_rate(stats);
   return stats;

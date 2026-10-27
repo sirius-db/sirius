@@ -35,6 +35,7 @@
 #include "log/logging.hpp"
 #include "log/noop_sink.hpp"
 #include "log/spdlog_owning_sink.hpp"
+#include "memory/device_preload_budget.hpp"
 #include "memory/memory_wait_board.hpp"
 #include "memory/numa_small_pinned_mr.hpp"
 #include "memory/resource_ref_utils.hpp"
@@ -1182,43 +1183,85 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
     executor->set_query_event_publisher(*query_event_publisher_);
   }
 
-  if (auto const& preload_config = config_.get_preload_executor_config(); preload_config.enabled) {
-    // Before the scheduler starts, so its GPU executors never run without the board.
-    memory_wait_board_ = std::make_shared<sirius::memory::memory_wait_board>(
-      active_gpu_ids.empty() ? -1 : active_gpu_ids.back());
-    task_scheduler_->set_memory_wait_board(memory_wait_board_);
-    preload_streams_  = std::make_shared<sirius::preload::preload_streams>(active_gpu_ids);
-    preload_executor_ = std::make_unique<sirius::preload::preload_executor>(
-      *query_event_publisher_,
-      preload_config,
-      sirius::preload::preload_dependencies{
-        .lifecycle                = query_lifecycle_,
-        .memory                   = *memory_manager_,
-        .topology                 = topology_index_,
-        .task_queue               = task_scheduler_->get_pipeline_task_queue(),
-        .wait_board               = memory_wait_board_,
-        .streams                  = preload_streams_,
-        .pipeline_threads_per_gpu = config_.get_gpu_pipeline_executor_config().num_threads,
-        // The pinned cuCascade exposes no get_capacity()/get_downgrade_stop_threshold(); derive
-        // both from Sirius's own memory configuration so preload computes the same byte ceilings.
-        .space_capacity =
-          [configs = config_.get_memory_space_configs()](
-            cucascade::memory::memory_space_id id) -> sirius::preload::space_capacity_info {
-          for (auto const& space : configs) {
-            if (id.tier == cucascade::memory::Tier::GPU) {
-              if (auto const* g = std::get_if<cucascade::memory::gpu_memory_space_config>(&space);
-                  g != nullptr && g->device_id == id.device_id) {
-                return {g->memory_capacity, g->downgrade_stop_fraction};
-              }
-            } else if (id.tier == cucascade::memory::Tier::HOST) {
-              if (auto const* h = std::get_if<cucascade::memory::host_memory_space_config>(&space);
-                  h != nullptr && h->numa_id == id.device_id) {
-                return {h->memory_capacity, h->downgrade_stop_fraction};
+  if (auto const& preload_config = config_.get_preload_executor_config();
+      !sirius::preload::preload_disabled_by_zero(preload_config)) {
+    // Existence (see docs/super-sirius/configuration.md): the executor is created only when it
+    // has work. Device preloading needs a budget > 0 and GPU spaces that do not track
+    // reservations per stream; an explicit concurrent_preloads > 0 with budget 0 is the
+    // DISK->HOST staging-only mode, created only when there is something to stage.
+    bool const wants_device = sirius::preload::wants_device_preloading(preload_config);
+    bool any_per_stream     = false;
+    for (auto const& space : config_.get_memory_space_configs()) {
+      if (auto const* g = std::get_if<cucascade::memory::gpu_memory_space_config>(&space);
+          g != nullptr && g->per_stream_reservation) {
+        any_per_stream = true;
+      }
+    }
+    bool const device_preloading = wants_device && !any_per_stream;
+    bool const has_disk =
+      !memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::DISK).empty();
+    bool const explicit_width =
+      preload_config.concurrent_preloads.has_value() && *preload_config.concurrent_preloads > 0;
+    bool const staging_only_has_work =
+      !wants_device && explicit_width && preload_config.stage_to_host && has_disk;
+
+    if (wants_device && any_per_stream) {
+      SIRIUS_LOG_WARN(
+        "[preload] device_preloading_budget is set but a GPU space tracks reservations per stream "
+        "(per_stream_reservation: true); device preloading is disabled, DISK->HOST staging only");
+    }
+
+    if (!device_preloading && !staging_only_has_work) {
+      SIRIUS_LOG_INFO(
+        "[preload] not started: {}",
+        wants_device ? "device preloading unavailable (per-stream reservation) and nothing to stage"
+                     : "no device preloading budget and no DISK->HOST staging to do");
+    } else {
+      // Before the scheduler starts, so its GPU executors never run without the board.
+      memory_wait_board_ = std::make_shared<sirius::memory::memory_wait_board>(
+        active_gpu_ids.empty() ? -1 : active_gpu_ids.back());
+      task_scheduler_->set_memory_wait_board(memory_wait_board_);
+      // The exclusive streams and the budget board exist only with device preloading.
+      if (device_preloading) {
+        preload_streams_ = std::make_shared<sirius::preload::preload_streams>(active_gpu_ids);
+        device_preload_budget_ =
+          std::make_shared<sirius::memory::device_preload_budget>(active_gpu_ids);
+        task_scheduler_->set_device_preload_budget(device_preload_budget_);
+      }
+      preload_executor_ = std::make_unique<sirius::preload::preload_executor>(
+        *query_event_publisher_,
+        preload_config,
+        sirius::preload::preload_dependencies{
+          .lifecycle                = query_lifecycle_,
+          .memory                   = *memory_manager_,
+          .topology                 = topology_index_,
+          .task_queue               = task_scheduler_->get_pipeline_task_queue(),
+          .wait_board               = memory_wait_board_,
+          .streams                  = preload_streams_,
+          .device_budget            = device_preload_budget_,
+          .pipeline_threads_per_gpu = config_.get_gpu_pipeline_executor_config().num_threads,
+          // The pinned cuCascade exposes no get_capacity()/get_downgrade_stop_threshold(); derive
+          // both from Sirius's own memory configuration so preload computes the same byte ceilings.
+          .space_capacity =
+            [configs = config_.get_memory_space_configs()](
+              cucascade::memory::memory_space_id id) -> sirius::preload::space_capacity_info {
+            for (auto const& space : configs) {
+              if (id.tier == cucascade::memory::Tier::GPU) {
+                if (auto const* g = std::get_if<cucascade::memory::gpu_memory_space_config>(&space);
+                    g != nullptr && g->device_id == id.device_id) {
+                  return {g->memory_capacity, g->downgrade_stop_fraction};
+                }
+              } else if (id.tier == cucascade::memory::Tier::HOST) {
+                if (auto const* h =
+                      std::get_if<cucascade::memory::host_memory_space_config>(&space);
+                    h != nullptr && h->numa_id == id.device_id) {
+                  return {h->memory_capacity, h->downgrade_stop_fraction};
+                }
               }
             }
-          }
-          return {};
-        }});
+            return {};
+          }});
+    }
   }
 
   // Start everything -- downgrade executors deferred until now
@@ -1300,6 +1343,7 @@ void SiriusContext::terminate()
   data_repository_registry_.clear();
   // Only now: buffers in the repositories just dropped may have been freed on preload streams.
   preload_streams_.reset();
+  device_preload_budget_.reset();
   memory_wait_board_.reset();
 
   // Restore the previous cuDF pinned memory resource and threshold before destroying the
@@ -1403,6 +1447,12 @@ std::weak_ptr<sirius::memory::memory_wait_board const>
 SiriusContext::memory_wait_board_for_testing() const noexcept
 {
   return memory_wait_board_;
+}
+
+std::weak_ptr<sirius::memory::device_preload_budget const>
+SiriusContext::device_preload_budget_for_testing() const noexcept
+{
+  return device_preload_budget_;
 }
 
 sirius::creator::task_creator& SiriusContext::get_task_creator()

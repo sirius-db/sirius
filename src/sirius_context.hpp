@@ -76,6 +76,7 @@ class preload_streams;
 namespace sirius::memory {
 class numa_small_pinned_mr;
 class topology_index;
+class device_preload_budget;
 }  // namespace sirius::memory
 
 namespace sirius {
@@ -552,6 +553,9 @@ class SiriusContext : public ClientContextState {
     const noexcept;
   [[nodiscard]] std::weak_ptr<sirius::memory::memory_wait_board const>
   memory_wait_board_for_testing() const noexcept;
+  /// The device preloading budget board; empty unless device preloading is enabled.
+  [[nodiscard]] std::weak_ptr<sirius::memory::device_preload_budget const>
+  device_preload_budget_for_testing() const noexcept;
 
   /// \brief Whether the given connection is inside an internal-query bracket.
   [[nodiscard]] static bool is_internal_query_active(ClientContext& context) noexcept;
@@ -974,6 +978,9 @@ class SiriusContext : public ClientContextState {
   // data_repository_registry_ so they are destroyed after it even when terminate() throws.
   std::shared_ptr<sirius::memory::memory_wait_board> memory_wait_board_;
   std::shared_ptr<sirius::preload::preload_streams> preload_streams_;
+  /// The device preloading budget board, shared with the task scheduler. Non-null only when
+  /// device preloading is enabled. Declared with the board/streams so it outlives the scheduler.
+  std::shared_ptr<sirius::memory::device_preload_budget> device_preload_budget_;
   /// One data repository manager per in-flight query, keyed by query_id.
   sirius::data::data_repository_manager_registry data_repository_registry_;
   /// Observes where a query is in its execution.  Declared before the creator

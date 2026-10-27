@@ -42,6 +42,10 @@ class data_batch;
 class data_repository;
 }  // namespace cucascade
 
+namespace sirius::memory {
+class device_preload_budget;
+}  // namespace sirius::memory
+
 namespace sirius::op {
 class sirius_physical_partition_consumer_operator;
 }  // namespace sirius::op
@@ -135,6 +139,9 @@ struct ledger_entry {
   /// Conversion sequence of the promotion (see @c promotion_result::conversion_seq). A record at
   /// or below it describes a move from before the promotion and is ignored.
   std::uint64_t seq{0};
+  /// Generation stamp of the budget charge this entry carries (see @c promotion_job::job_seq).
+  /// Releasing the budget acts only on a charge with the same stamp.
+  std::uint64_t job_seq{0};
   /// A consumer on another GPU was already counted as a misprediction.
   bool mispredicted{false};
 };
@@ -216,9 +223,6 @@ struct pass_snapshot {
   std::vector<std::uint64_t> mem_epoch;
   std::vector<std::uint64_t> gate_epoch;
   std::vector<std::size_t> inflight_bytes;
-  /// Per GPU index.
-  std::vector<std::size_t> outstanding;
-  std::vector<std::size_t> outstanding_b;
   /// Oldest query first.
   std::vector<query_view> queries;
   /// Live ledger entries to classify under each query's lease.
@@ -248,10 +252,17 @@ class candidate_store {
    * @param host_devices Device ids of the HOST spaces; a HOST's index is its position here.
    * @param counters Executor-wide counters, updated alongside the per-query ones.
    */
+  /**
+   * @param budget The device preloading budget board, or null when device preloading is off. The
+   *        store charges a GPU take, releases on every non-promoting outcome and ledger erase,
+   *        reclassifies on B->A, and unwatches an id that leaves both the candidate set and the
+   *        ledger. Must outlive the store.
+   */
   candidate_store(preload_executor_config cfg,
                   std::vector<int> gpu_devices,
                   std::vector<int> host_devices,
-                  preload_counters& counters);
+                  preload_counters& counters,
+                  memory::device_preload_budget* budget = nullptr);
 
   // ---- spaces ---------------------------------------------------------------------------------
 
@@ -379,7 +390,8 @@ class candidate_store {
 
   [[nodiscard]] ledger_entry const* find_ledger(std::uint64_t batch_id) const noexcept;
   [[nodiscard]] std::size_t ledger_size() const noexcept { return _ledger.size(); }
-  /// Preloaded, unconsumed bytes on GPU index @p gpu (all classes, then class B).
+  /// Preloaded, unclaimed bytes on GPU index @p gpu (all classes, then class B), read from the
+  /// budget board. Zero when device preloading is off.
   [[nodiscard]] std::size_t outstanding_bytes(std::size_t gpu) const noexcept;
   [[nodiscard]] std::size_t outstanding_b_bytes(std::size_t gpu) const noexcept;
 
@@ -406,6 +418,9 @@ class candidate_store {
   void merge(candidate& c, query_state& qs, event::downgraded_batch const& rec);
   void erase_candidate(candidate_map::iterator it) noexcept;
   void erase_ledger(std::unordered_map<std::uint64_t, ledger_entry>::iterator it) noexcept;
+  /// Drop @p batch_id from the budget board once it is in neither the candidate set nor the
+  /// ledger. No-op when the board is absent.
+  void maybe_unwatch(std::uint64_t batch_id) noexcept;
   void add_ledger(candidate const& c,
                   query_state& qs,
                   promotion_job const& job,
@@ -418,6 +433,10 @@ class candidate_store {
   std::vector<int> _gpu_devices;
   std::vector<int> _host_devices;
   preload_counters& _counters;
+  /// The device preloading budget board, or null when device preloading is off.
+  memory::device_preload_budget* _budget{nullptr};
+  /// Monotonic generation stamp handed to each GPU budget charge.
+  std::uint64_t _next_job_seq{0};
 
   candidate_map _by_id;
   /// Ascending query id = oldest first. Only add_query inserts.
@@ -426,12 +445,10 @@ class candidate_store {
   std::map<query_id_t, per_query_stats> _stats_by_query;
   std::unordered_map<std::uint64_t, ledger_entry> _ledger;
 
-  std::vector<std::uint64_t> _mem_epoch;    ///< per slot
-  std::vector<std::uint64_t> _gate_epoch;   ///< per slot
-  std::vector<std::size_t> _inflight;       ///< per slot
-  std::vector<std::uint32_t> _h2g_tokens;   ///< per GPU
-  std::vector<std::size_t> _outstanding;    ///< per GPU
-  std::vector<std::size_t> _outstanding_b;  ///< per GPU
+  std::vector<std::uint64_t> _mem_epoch;   ///< per slot
+  std::vector<std::uint64_t> _gate_epoch;  ///< per slot
+  std::vector<std::size_t> _inflight;      ///< per slot
+  std::vector<std::uint32_t> _h2g_tokens;  ///< per GPU
   std::uint64_t _queue_epoch{0};
 
   query_id_t _prune_query{};

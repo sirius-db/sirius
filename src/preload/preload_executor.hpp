@@ -23,6 +23,7 @@
  */
 
 #include "event/query_event_subscriber.hpp"
+#include "memory/device_preload_budget.hpp"
 #include "memory/memory_wait_board.hpp"
 #include "memory/topology_index.hpp"
 #include "preload/candidate_store.hpp"
@@ -115,9 +116,13 @@ struct preload_dependencies {
   exec::multi_index_priority_queue<parallel::itask>* task_queue{nullptr};
   /// Hold-off state the GPU executors maintain. Required.
   std::shared_ptr<memory::memory_wait_board const> wait_board;
-  /// Preload's stream pools, one per GPU. Required; must outlive every repository that may hold
-  /// a batch preload moved to a GPU.
+  /// Preload's stream pools, one per GPU. Non-null only when device preloading is enabled; must
+  /// then outlive every repository that may hold a batch preload moved to a GPU.
   std::shared_ptr<preload_streams> streams;
+  /// The device preloading budget board. Non-null exactly when device preloading is enabled
+  /// (budget > 0 and the GPU spaces do not track reservations per stream). Shared with the task
+  /// scheduler, which releases a claimed task's charges.
+  std::shared_ptr<memory::device_preload_budget> device_budget;
   /// The pipeline executor's threads per GPU: the head margin in auto mode.
   int pipeline_threads_per_gpu{1};
   /// Capacity and downgrade stop fraction of each memory space, derived from Sirius's memory
@@ -503,6 +508,10 @@ class preload_executor final : public event::query_event_subscriber {
   exec::multi_index_priority_queue<parallel::itask>* _queue;
   std::shared_ptr<memory::memory_wait_board const> _board;
   std::shared_ptr<preload_streams> _streams;
+  std::shared_ptr<memory::device_preload_budget> _budget;
+  /// Device preloading is enabled: GPU promotions, preload streams and the budget board exist.
+  /// When false, only DISK->HOST staging runs.
+  bool _device_preloading{false};
   space_capacity_fn _space_capacity;
   hw_caps_override _caps;
   std::size_t _head_margin{0};
@@ -543,8 +552,6 @@ class preload_executor final : public event::query_event_subscriber {
   bool _planner_busy{false};
   /// The last pass refused an item for room (ceiling or window), which running jobs count in.
   bool _room_refused{true};
-  /// Class-B bytes being copied into each GPU.
-  std::vector<std::size_t> _inflight_b;
   /// An idle event already asked for a pass, and nothing else has since. Idle events change no
   /// state, so repeating one (the scheduler re-publishes them while a device waits) adds nothing.
   bool _idle_wake_pending{false};

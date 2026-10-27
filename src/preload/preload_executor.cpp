@@ -270,13 +270,7 @@ std::vector<repo_info> collect_repositories(
 class preload_executor::lane_slot {
  public:
   lane_slot(preload_executor& ex, lane& l, taken_job const& taken) noexcept
-    : _ex(ex),
-      _lane(l),
-      _t(taken.job.t),
-      _bytes(taken.job.est_reserve),
-      _token(taken.token),
-      _speculative(taken.job.k == klass::B && _t.tier == Tier::GPU &&
-                   _t.index < ex._inflight_b.size())
+    : _ex(ex), _lane(l), _t(taken.job.t), _bytes(taken.job.est_reserve), _token(taken.token)
   {
     ++_lane.active;
     if (_token) { _ex._store.acquire_h2g_token(_t.index); }
@@ -284,7 +278,6 @@ class preload_executor::lane_slot {
     if (auto* const unreserved = _ex.unreserved_of(_t)) {
       unreserved->fetch_add(_bytes, std::memory_order_relaxed);
     }
-    if (_speculative) { _ex._inflight_b[_t.index] = sat_add(_ex._inflight_b[_t.index], _bytes); }
     _ex._counters.raise_lane_concurrency(_lane.idx, static_cast<std::uint64_t>(_lane.active));
     if (_t.tier == Tier::GPU) {
       _ex._counters.raise_gpu_inflight_bytes(_t.index, _ex._store.inflight_bytes(_t));
@@ -305,7 +298,6 @@ class preload_executor::lane_slot {
     --_lane.active;
     if (_token) { _ex._store.release_h2g_token(_t.index); }
     _ex._store.remove_inflight(_t, _bytes);
-    if (_speculative) { _ex._inflight_b[_t.index] = sat_sub(_ex._inflight_b[_t.index], _bytes); }
   }
 
  private:
@@ -314,7 +306,6 @@ class preload_executor::lane_slot {
   target _t;
   std::size_t _bytes;
   bool _token;
-  bool _speculative;
   bool _held{true};
 };
 
@@ -341,7 +332,9 @@ preload_executor::preload_executor(event::query_event_publisher& publisher,
     _topology(std::move(deps.topology)),
     _queue(deps.task_queue),
     _board(required(std::move(deps.wait_board), "wait board")),
-    _streams(required(std::move(deps.streams), "stream pools")),
+    _streams(std::move(deps.streams)),
+    _budget(std::move(deps.device_budget)),
+    _device_preloading(_budget != nullptr && _cfg.device_preloading_budget > 0.0),
     _space_capacity(deps.space_capacity ? std::move(deps.space_capacity)
                                         : throw std::invalid_argument(
                                             "preload_executor: space_capacity is required")),
@@ -354,12 +347,16 @@ preload_executor::preload_executor(event::query_event_publisher& publisher,
     _store(_cfg,
            device_ids(spaces_of(_memory, Tier::GPU)),
            device_ids(spaces_of(_memory, Tier::HOST)),
-           _counters)
+           _counters,
+           _budget.get())
 {
+  // A device preloading budget board requires preload's exclusive streams: both or neither.
+  if (_device_preloading && !_streams) {
+    throw std::invalid_argument("preload_executor: device preloading needs stream pools");
+  }
   build_spaces();
   build_lanes();
-  _unreserved = std::make_unique<std::atomic<std::size_t>[]>(_gpus.size() + _hosts.size());
-  _inflight_b.assign(_gpus.size(), 0);
+  _unreserved    = std::make_unique<std::atomic<std::size_t>[]>(_gpus.size() + _hosts.size());
   _env.gpus      = _promotion_gpus;
   _env.hosts     = _promotion_hosts;
   _env.test_hook = [this](promotion_job const& job) {
@@ -394,7 +391,7 @@ void preload_executor::build_spaces()
     g.h2g_cap           = std::max(h2g_cap(_cfg, g.c2c), 1);
     g.capacity          = limits_of(*space).capacity;
     g.ceilings          = gpu_ceilings_bytes(_cfg, limits_of(*space));
-    g.lookahead_bytes   = fraction_of(_cfg.gpu_lookahead_fraction, g.capacity);
+    g.lookahead_bytes   = fraction_of(_cfg.device_preloading_budget, g.capacity);
     g.speculative_bytes = fraction_of(_cfg.speculative_fraction, g.capacity);
     g.max_inflight_bytes = fraction_of(_cfg.max_inflight_fraction, g.capacity);
     // A batch above the in-flight cap could never be dispatched.
@@ -426,15 +423,19 @@ void preload_executor::build_spaces()
   }
 
   for (auto const& g : _gpus) {
-    _promotion_gpus.push_back({g.space, g.max_batch_bytes, _streams->for_device(g.device)});
+    // A GPU promotion needs preload's exclusive stream pool, which exists only with device
+    // preloading; staging-only mode never takes a GPU job, so a null pool here is never used.
+    auto* const streams = _device_preloading ? _streams->for_device(g.device) : nullptr;
+    _promotion_gpus.push_back({g.space, g.max_batch_bytes, streams});
   }
   for (auto const& h : _hosts) {
-    // DISK->HOST copies do not run on the stream; it only orders the conversion. Borrow a local
-    // GPU's pool, else the first GPU's.
+    // DISK->HOST copies do not run on the stream; it only orders the conversion. With device
+    // preloading, borrow a local GPU's pool, else the first GPU's; otherwise use the calling
+    // thread's default stream (null).
     cucascade::memory::exclusive_stream_pool* ordering = nullptr;
-    if (!h.local_gpus.empty()) {
+    if (_device_preloading && !h.local_gpus.empty()) {
       ordering = _streams->for_device(_gpus[h.local_gpus.front()].device);
-    } else if (!_gpus.empty()) {
+    } else if (_device_preloading && !_gpus.empty()) {
       ordering = _streams->for_device(_gpus.front().device);
     }
     _promotion_hosts.push_back({h.space, h.local_gpus, ordering});
@@ -443,16 +444,19 @@ void preload_executor::build_spaces()
 
 void preload_executor::build_lanes()
 {
-  for (std::size_t i = 0; i < _gpus.size(); ++i) {
-    auto l           = std::make_unique<lane>();
-    l->idx           = _lanes.size();
-    l->kind          = lane_kind::h2g;
-    l->space_index   = i;
-    l->space         = _gpus[i].space;
-    l->threads       = _gpus[i].h2g_cap;
-    l->effective_cap = _gpus[i].h2g_cap;
-    l->refined       = true;
-    _lanes.push_back(std::move(l));
+  // GPU HOST->GPU lanes exist only with device preloading; staging-only mode has DISK lanes only.
+  if (_device_preloading) {
+    for (std::size_t i = 0; i < _gpus.size(); ++i) {
+      auto l           = std::make_unique<lane>();
+      l->idx           = _lanes.size();
+      l->kind          = lane_kind::h2g;
+      l->space_index   = i;
+      l->space         = _gpus[i].space;
+      l->threads       = _gpus[i].h2g_cap;
+      l->effective_cap = _gpus[i].h2g_cap;
+      l->refined       = true;
+      _lanes.push_back(std::move(l));
+    }
   }
   for (std::size_t k = 0; k < _disks.size(); ++k) {
     auto l         = std::make_unique<lane>();
@@ -499,7 +503,7 @@ void preload_executor::start()
         l->threads       = std::max(disk_cap(_cfg, l->gds), 1);
         l->effective_cap = l->threads;
         // Auto mode with GDS: the cap still depends on the io context the space adopts.
-        l->refined = _caps.gds.has_value() || _cfg.disk_concurrency > 0 || !l->gds;
+        l->refined = _caps.gds.has_value() || _cfg.concurrent_preloads.has_value() || !l->gds;
       }
     }
     log_start();
@@ -610,24 +614,19 @@ void preload_executor::log_start() const noexcept
         std::format("HOST:{} ceiling {:.2f} | ", h.device, static_cast<double>(h.ceiling) / cap);
     }
     if (line.size() >= 3) { line.resize(line.size() - 3); }
-    SIRIUS_LOG_INFO("[preload] {}", line);
+    SIRIUS_LOG_INFO("[preload] device preloading {}; {}",
+                    _device_preloading ? "on" : "off (DISK->HOST staging only)",
+                    line);
 
-    for (auto const& g : _gpus) {
-      if (g.ceilings.committed == 0) {
-        SIRIUS_LOG_WARN("[preload] GPU:{} committed ceiling is 0: no GPU promotion there",
-                        g.device);
-      } else if (g.ceilings.speculative == 0) {
-        SIRIUS_LOG_WARN("[preload] GPU:{} speculative ceiling is 0: class B disabled there",
-                        g.device);
-      }
-      auto const scope =
-        memory::sirius_memory_reservation_manager::gpu_allocation_tracking_scope(*g.space);
-      if (scope ==
-          memory::sirius_memory_reservation_manager::allocation_tracking_scope::PER_STREAM) {
-        SIRIUS_LOG_WARN(
-          "[preload] GPU:{} tracks reservations per stream: HOST->GPU copies are not charged to "
-          "preload's reservation, so its ceiling is held less strictly",
-          g.device);
+    if (_device_preloading) {
+      for (auto const& g : _gpus) {
+        if (g.ceilings.committed == 0) {
+          SIRIUS_LOG_WARN("[preload] GPU:{} committed ceiling is 0: no GPU promotion there",
+                          g.device);
+        } else if (g.ceilings.speculative == 0) {
+          SIRIUS_LOG_WARN("[preload] GPU:{} speculative ceiling is 0: class B disabled there",
+                          g.device);
+        }
       }
     }
     for (auto const& h : _hosts) {
@@ -1214,9 +1213,11 @@ preload_executor::pass_summary preload_executor::install_plan(plan_input const& 
       auto const* c = _store.find(id);
       if (c == nullptr || !_store.plannable(*c)) { continue; }
       target_request r;
-      r.k                  = klass::A;
-      r.location           = c->location.tier;
-      r.gpu_banned         = c->gpu_banned;
+      r.k        = klass::A;
+      r.location = c->location.tier;
+      // Without device preloading, a GPU is never a target: a DISK candidate stages on HOST and a
+      // HOST candidate is left alone, exactly as if it were banned from GPUs.
+      r.gpu_banned         = c->gpu_banned || !_device_preloading;
       r.speculative_banned = c->speculative_banned;
       std::array<int, 1> single{};
       if (task.gpu) {
@@ -1268,7 +1269,7 @@ preload_executor::pass_summary preload_executor::install_plan(plan_input const& 
     target_request r;
     r.k                  = klass::B;
     r.location           = c->location.tier;
-    r.gpu_banned         = c->gpu_banned;
+    r.gpu_banned         = c->gpu_banned || !_device_preloading;
     r.speculative_banned = c->speculative_banned;
     r.consumer_ready     = b.ready;
     r.partition_consumer = b.partition_consumer;
@@ -1315,10 +1316,12 @@ preload_executor::pass_summary preload_executor::install_plan(plan_input const& 
     gin.unreserved_bytes = in.gpus[i].unreserved;
     gin.ceilings         = g.ceilings;
     gin.lookahead_bytes  = g.lookahead_bytes;
-    // Bytes being copied in will be outstanding once they land: the windows count them now.
-    gin.outstanding       = sat_add(_store.outstanding_bytes(i), _store.inflight_bytes(t));
+    // In-flight copies are charged against the budget board when their job is taken, so
+    // outstanding already includes them: the planner window is budget - outstanding, with no
+    // separate in-flight term.
+    gin.outstanding       = _store.outstanding_bytes(i);
     gin.speculative_bytes = g.speculative_bytes;
-    gin.outstanding_b     = sat_add(_store.outstanding_b_bytes(i), _inflight_b[i]);
+    gin.outstanding_b     = _store.outstanding_b_bytes(i);
     gin.max_batch_bytes   = g.max_batch_bytes;
     gpu_budgets.push_back(make_gpu_budget_state(gin, *_board));
     pressures.push_back({g.device, in.gpus[i].above_trigger});
