@@ -9,6 +9,7 @@ set(TEST_SOURCES
     test/cpp/scan_manager/test_preparation.cpp
     test/cpp/scan_manager/test_preparation_unit.cpp
     test/cpp/scan_manager/test_preparation_ledger.cpp
+    test/cpp/scan_manager/test_host_pin_placement.cpp
     test/cpp/scan_manager/test_preparation_config.cpp
     test/cpp/scan/test_native_physical_matrix.cpp
     test/cpp/scan/test_parquet_physical_profile.cpp
