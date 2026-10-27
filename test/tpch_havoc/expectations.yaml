@@ -27,7 +27,12 @@ expectations:
   - outcome: plan_rejected
     reason: "Unsupported whole-partition window: only SUM, AVG, COUNT, MIN and MAX aggregates are planned"
     issue: 1745
-    queries: [Q02_V09, Q03_V09, Q15_V09, Q18_V09]
+    queries: [Q03_V09]
+
+  - outcome: plan_rejected
+    reason: "Unsupported whole-partition window: ranking without PARTITION BY"
+    issue: 1745
+    queries: [Q15_V09, Q18_V09]
 
   - outcome: plan_rejected
     reason: "Unsupported whole-partition window: expressions over integer SUM results require an exact HUGEINT consumer"

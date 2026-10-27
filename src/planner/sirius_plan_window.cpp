@@ -29,6 +29,7 @@
 #include "expression/ast/reference.hpp"
 #include "expression/ast/utils.hpp"
 #include "helper/type_conversions.hpp"
+#include "op/cudf_sort_order.hpp"
 #include "op/partition/partition_sizing.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_partition.hpp"
@@ -37,6 +38,7 @@
 #include "planner/sirius_plan_projection_utils.hpp"
 
 #include <limits>
+#include <optional>
 #include <stdexcept>
 
 namespace sirius::planner {
@@ -81,6 +83,59 @@ bool partition_key(duckdb::LogicalType const& type)
     case LogicalTypeId::VARCHAR: return duckdb::StringType::GetCollation(type).empty();
     default: return false;
   }
+}
+
+/**
+ * @brief Return the ranking function of @p expression, or `std::nullopt` when it is not one.
+ *
+ * Valid is `rank`, `dense_rank` or `row_number` with a `PARTITION BY` and a window `ORDER BY`, and
+ * without `DISTINCT`, `FILTER`, `EXCLUDE`, `IGNORE NULLS`, arguments or frame offsets.
+ */
+std::optional<op::ranking_function> validate_ranking(
+  duckdb::BoundWindowExpression const& expression)
+{
+  std::optional<op::ranking_function> function;
+  switch (expression.GetExpressionType()) {
+    case duckdb::ExpressionType::WINDOW_RANK: function = op::ranking_function::rank; break;
+    case duckdb::ExpressionType::WINDOW_RANK_DENSE:
+      function = op::ranking_function::dense_rank;
+      break;
+    case duckdb::ExpressionType::WINDOW_ROW_NUMBER:
+      function = op::ranking_function::row_number;
+      break;
+    default: return std::nullopt;
+  }
+  if (expression.Distinct()) { decline("DISTINCT"); }
+  if (expression.Filter()) { decline("FILTER"); }
+  if (expression.WindowExclude() != duckdb::WindowExcludeMode::NO_OTHER) { decline("EXCLUDE"); }
+  if (!expression.ArgOrders().empty()) { decline("argument ORDER BY"); }
+  if (expression.IgnoreNulls()) { decline("IGNORE NULLS"); }
+  if (!expression.GetChildren().empty() || expression.StartExpr() || expression.EndExpr()) {
+    decline("ranking arguments or frame offsets");
+  }
+  if (expression.GetReturnType() != duckdb::LogicalType::BIGINT) { decline("ranking result type"); }
+  if (expression.Partitions().empty()) { decline("ranking without PARTITION BY"); }
+  if (expression.OrderBy().empty()) { decline("ranking without ORDER BY"); }
+  return function;
+}
+
+bool order_key(duckdb::LogicalType const& type)
+{
+  return partition_key(type) || numeric_argument(type);
+}
+
+bool same_order(duckdb::BoundWindowExpression const& a, duckdb::BoundWindowExpression const& b)
+{
+  if (a.OrderBy().size() != b.OrderBy().size()) { return false; }
+  for (std::size_t i = 0; i < a.OrderBy().size(); ++i) {
+    auto const& left  = a.OrderBy()[i];
+    auto const& right = b.OrderBy()[i];
+    if (left.type != right.type || left.null_order != right.null_order ||
+        !left.expression->Equals(*right.expression)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 /**
@@ -242,14 +297,18 @@ whole_partition_window_plan plan_whole_partition_window(duckdb::LogicalWindow co
     return slot;
   };
 
-  duckdb::BoundWindowExpression const* organization = nullptr;
+  duckdb::BoundWindowExpression const* organization         = nullptr;
+  duckdb::BoundWindowExpression const* ranking_organization = nullptr;
   for (duckdb::idx_t i = 0; i < window.expressions.size(); ++i) {
     auto const& bound = *window.expressions[i];
     if (bound.GetExpressionClass() != duckdb::ExpressionClass::BOUND_WINDOW) {
       decline("expected a bound window expression");
     }
     auto const& expression = bound.Cast<duckdb::BoundWindowExpression>();
-    auto const function    = validate(expression);
+    auto const ranking     = validate_ranking(expression);
+    if (ranking && !plan.expressions.empty()) { decline("ranking mixed with aggregates"); }
+    if (!ranking && !plan.rankings.empty()) { decline("ranking mixed with aggregates"); }
+    auto const function = ranking ? aggregate_id::count_star : validate(expression);
     if (organization && (!organization->PartitionsAreEquivalent(expression) ||
                          !expression.PartitionsAreEquivalent(*organization))) {
       decline("incompatible partition specifications");
@@ -267,6 +326,31 @@ whole_partition_window_plan plan_whole_partition_window(duckdb::LogicalWindow co
     auto const output_slot = plan.input_width + i;
     if (window.types[output_slot] != expression.GetReturnType()) {
       decline("result column mapping");
+    }
+    if (ranking) {
+      if (plan.rankings.empty()) {
+        auto const& first = expression.OrderBy().front();
+        if (first.null_order == duckdb::OrderByNullType::ORDER_DEFAULT) {
+          decline("unresolved NULL order");
+        }
+        plan.ranking_order.direction = op::to_cudf_order(first.type);
+        plan.ranking_order.nulls     = op::to_cudf_null_order(first.type, first.null_order);
+        for (auto const& node : expression.OrderBy()) {
+          if (node.type != first.type || node.null_order != first.null_order) {
+            decline("ORDER BY keys with different directions");
+          }
+          if (!order_key(node.expression->GetReturnType())) {
+            decline("order key type or collation");
+          }
+          plan.ranking_order.columns.push_back(
+            static_cast<cudf::size_type>(prepare(*node.expression)));
+        }
+        ranking_organization = &expression;
+      } else if (!same_order(*ranking_organization, expression)) {
+        decline("incompatible ORDER BY specifications");
+      }
+      plan.rankings.push_back({*ranking, expression.GetReturnType(), output_slot});
+      continue;
     }
     auto const& argument = function == aggregate_id::count_star
                              ? static_cast<duckdb::Expression const&>(count_all_argument)
@@ -386,6 +470,22 @@ duckdb::unique_ptr<op::sirius_physical_operator> sirius_physical_plan_generator:
   auto prepared = sirius::from_duckdb_vec(bound_plan.prepared_types);
   std::vector<cudf::size_type> keys(bound_plan.partition_slots.begin(),
                                     bound_plan.partition_slots.end());
+  if (!bound_plan.rankings.empty()) {
+    std::vector<op::ranking_function> functions;
+    for (auto const& ranking : bound_plan.rankings) {
+      functions.push_back(ranking.function);
+    }
+    auto ranked = duckdb::make_uniq<op::sirius_physical_window>(
+      sirius::from_duckdb_vec(bound_plan.output_types),
+      std::move(prepared),
+      bound_plan.input_width,
+      std::move(keys),
+      bound_plan.ranking_order,
+      std::move(functions),
+      window.estimated_cardinality);
+    ranked->children.push_back(std::move(child));
+    return ranked;
+  }
   std::vector<op::whole_partition_aggregate> aggregates;
   for (auto const& expression : bound_plan.expressions) {
     aggregates.push_back(

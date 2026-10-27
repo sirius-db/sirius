@@ -24,6 +24,7 @@
 #include "duckdb/planner/operator/logical_window.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "helper/type_conversions.hpp"
+#include "op/cudf_sort_order.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_dummy_scan.hpp"
 #include "op/sirius_physical_partition.hpp"
@@ -266,6 +267,70 @@ TEST_CASE("whole-partition activation rejects unsafe consumers and chained stage
     "SELECT sum(s) OVER (PARTITION BY p) FROM (SELECT p,sum(d) OVER (PARTITION BY q) s FROM w) t");
   auto logical = fixture.bind(query);
   REQUIRE_THROWS_AS(sirius::planner::validate_whole_partition_window_consumers(*logical),
+                    duckdb::NotImplementedException);
+}
+
+TEST_CASE("ranking window planning records the order keys and bound types",
+          "[planner][window_plan]")
+{
+  window_fixture fixture;
+  auto logical = fixture.bind(
+    "SELECT rank() OVER (PARTITION BY p ORDER BY v DESC NULLS LAST),"
+    "dense_rank() OVER (PARTITION BY p ORDER BY v DESC NULLS LAST),"
+    "row_number() OVER (PARTITION BY p ORDER BY v DESC NULLS LAST) FROM w");
+  auto& window = find_window(*logical);
+  auto plan    = plan_whole_partition_window(window);
+  REQUIRE(plan.expressions.empty());
+  REQUIRE(plan.hidden_expressions.empty());
+  REQUIRE(plan.partition_slots.size() == 1);
+  REQUIRE(plan.rankings.size() == 3);
+  CHECK(plan.rankings[0].function == sirius::op::ranking_function::rank);
+  CHECK(plan.rankings[1].function == sirius::op::ranking_function::dense_rank);
+  CHECK(plan.rankings[2].function == sirius::op::ranking_function::row_number);
+  for (std::size_t i = 0; i < plan.rankings.size(); ++i) {
+    CHECK(plan.rankings[i].result_type == duckdb::LogicalType::BIGINT);
+    CHECK(plan.rankings[i].output_slot == plan.input_width + i);
+  }
+  REQUIRE(plan.ranking_order.columns.size() == 1);
+  CHECK(plan.ranking_order.direction == cudf::order::DESCENDING);
+  CHECK(plan.ranking_order.nulls ==
+        sirius::op::to_cudf_null_order(duckdb::OrderType::DESCENDING,
+                                       duckdb::OrderByNullType::NULLS_LAST));
+}
+
+TEST_CASE("ranking window planning evaluates order expressions once and keeps several keys",
+          "[planner][window_plan]")
+{
+  window_fixture fixture;
+  auto logical = fixture.bind(
+    "SELECT rank() OVER (PARTITION BY p ORDER BY v+1, q),"
+    "dense_rank() OVER (PARTITION BY p ORDER BY v+1, q) FROM w");
+  auto plan = plan_whole_partition_window(find_window(*logical));
+  REQUIRE(plan.hidden_expressions.size() == 1);
+  REQUIRE(plan.ranking_order.columns.size() == 2);
+  CHECK(static_cast<std::size_t>(plan.ranking_order.columns[0]) == plan.input_width);
+  CHECK(static_cast<std::size_t>(plan.ranking_order.columns[1]) < plan.input_width);
+  CHECK(plan.ranking_order.direction == cudf::order::ASCENDING);
+}
+
+TEST_CASE("ranking window planning rejects unsupported shapes", "[planner][window_plan]")
+{
+  window_fixture fixture;
+  auto const expression =
+    GENERATE("rank() OVER (ORDER BY v)",
+             "row_number() OVER (PARTITION BY p)",
+             "rank() OVER (PARTITION BY p ORDER BY v, q DESC)",
+             "rank() OVER (PARTITION BY p ORDER BY v NULLS FIRST, q NULLS LAST)",
+             "rank() OVER (PARTITION BY p ORDER BY v::DECIMAL(4,0))",
+             "rank() OVER (PARTITION BY p ORDER BY s COLLATE nocase)",
+             "rank() OVER (PARTITION BY p ORDER BY [v])",
+             "rank() OVER (PARTITION BY f ORDER BY v)",
+             "percent_rank() OVER (PARTITION BY p ORDER BY v)",
+             "ntile(2) OVER (PARTITION BY p ORDER BY v)",
+             "sum(v) OVER (PARTITION BY p ORDER BY v)");
+  INFO(expression);
+  auto logical = fixture.bind(std::string("SELECT ") + expression + " FROM w");
+  REQUIRE_THROWS_AS(plan_whole_partition_window(find_window(*logical)),
                     duckdb::NotImplementedException);
 }
 

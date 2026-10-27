@@ -56,6 +56,34 @@ sirius_physical_window::sirius_physical_window(duckdb::vector<logical_type> outp
   }
 }
 
+sirius_physical_window::sirius_physical_window(duckdb::vector<logical_type> output_types,
+                                               duckdb::vector<logical_type> prepared_types,
+                                               std::size_t input_width,
+                                               std::vector<cudf::size_type> partition_columns,
+                                               ranking_order order,
+                                               std::vector<ranking_function> ranking_functions,
+                                               std::size_t estimated_cardinality)
+  : sirius_physical_operator(TYPE, std::move(output_types), estimated_cardinality),
+    _prepared_types(std::move(prepared_types)),
+    _input_width(input_width),
+    _partition_columns(std::move(partition_columns)),
+    _ranking_order(std::move(order)),
+    _ranking_functions(std::move(ranking_functions))
+{
+  auto const valid_slot = [&](cudf::size_type slot) {
+    return slot >= 0 && static_cast<std::size_t>(slot) < _prepared_types.size();
+  };
+  if (_ranking_functions.empty() || _partition_columns.empty() || _ranking_order.columns.empty() ||
+      !std::all_of(_partition_columns.begin(), _partition_columns.end(), valid_slot) ||
+      !std::all_of(_ranking_order.columns.begin(), _ranking_order.columns.end(), valid_slot)) {
+    throw std::invalid_argument("Window key or order key is outside its prepared schema");
+  }
+  if (_input_width > _prepared_types.size() ||
+      types.size() != _input_width + _ranking_functions.size()) {
+    throw std::invalid_argument("Window output schema does not match its prepared input");
+  }
+}
+
 std::unique_ptr<operator_data> sirius_physical_window::get_next_task_input_data()
 {
   std::lock_guard<std::mutex> guard(lock);
@@ -82,8 +110,13 @@ std::size_t sirius_physical_window::workspace_bytes(std::size_t rows, std::size_
   // groupby and distinct-join hash tables, the row-to-group map, restored/widened arguments,
   // checked SUM structs, counts/AVG temporaries, and expanded output columns. Worst case: one
   // group per row. History refines this after execution, and native OOM follows ordinary retries.
-  auto per_row = memory::saturating_add(128, memory::saturating_mul(_aggregates.size(), 128));
+  // A ranking window sorts the key columns: the sort order, the gathered keys, one scan result
+  // and its INT64 copy per function, and the scattered result.
+  auto per_row = memory::saturating_add(
+    128, memory::saturating_mul(_aggregates.size() + _ranking_functions.size(), 128));
   per_row = memory::saturating_add(per_row, memory::saturating_mul(_partition_columns.size(), 32));
+  per_row =
+    memory::saturating_add(per_row, memory::saturating_mul(_ranking_order.columns.size(), 32));
   return memory::saturating_add(memory::saturating_mul(input_bytes, 2),
                                 memory::saturating_mul(rows, per_row));
 }
@@ -147,8 +180,19 @@ std::unique_ptr<operator_data> sirius_physical_window::execute(operator_data con
     for (auto const& aggregate : _aggregates) {
       restore(aggregate.argument_column);
     }
-    std::shared_ptr<cudf::table> results = evaluate_whole_partition_window(
-      cudf::table_view(columns), _partition_columns, _aggregates, stream, mr);
+    for (auto slot : _ranking_order.columns) {
+      restore(slot);
+    }
+    std::shared_ptr<cudf::table> results =
+      _ranking_functions.empty()
+        ? evaluate_whole_partition_window(
+            cudf::table_view(columns), _partition_columns, _aggregates, stream, mr)
+        : evaluate_ranking_window(cudf::table_view(columns),
+                                  _partition_columns,
+                                  _ranking_order,
+                                  _ranking_functions,
+                                  stream,
+                                  mr);
 
     // Forward payload in its original carrier and row order. Results retain DECIMAL128(scale=0)
     // for HUGEINT. The generic HUGEINT -> INT64 mapping must not run on this output.

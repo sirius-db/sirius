@@ -511,7 +511,7 @@ TEST_CASE_METHOD(RuntimeFallbackFixture,
 {
   create_table("CREATE TABLE rf_plan AS SELECT i AS id, i % 5 AS grp FROM range(100) t(i);");
   const std::string window =
-    "SELECT id, grp, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY id) AS rn FROM rf_plan;";
+    "SELECT id, grp, LAG(id) OVER (PARTITION BY grp ORDER BY id) AS prev FROM rf_plan;";
 
   // Off: unsupported operator surfaces an error instead of silently using CPU.
   con->Query("SET enable_duckdb_fallback = false;");

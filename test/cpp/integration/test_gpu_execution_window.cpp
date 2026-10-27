@@ -230,10 +230,70 @@ TEST_CASE_METHOD(WindowFixture,
 }
 
 TEST_CASE_METHOD(WindowFixture,
+                 "ranking SQL windows execute on GPU",
+                 "[integration][gpu_execution][window_sql]")
+{
+  compare_window(
+    "SELECT id,rank() OVER (PARTITION BY p ORDER BY v),"
+    "dense_rank() OVER (PARTITION BY p ORDER BY v) FROM w");
+  compare_window(
+    "SELECT id,rank() OVER (PARTITION BY p ORDER BY v DESC NULLS LAST),"
+    "dense_rank() OVER (PARTITION BY p ORDER BY v DESC NULLS LAST) FROM w");
+  compare_window(
+    "SELECT id,rank() OVER (PARTITION BY p ORDER BY v ASC NULLS LAST),"
+    "dense_rank() OVER (PARTITION BY p ORDER BY v ASC NULLS LAST) FROM w");
+  compare_window(
+    "SELECT id,rank() OVER (PARTITION BY p ORDER BY v DESC NULLS FIRST),"
+    "dense_rank() OVER (PARTITION BY p ORDER BY v DESC NULLS FIRST) FROM w");
+  // Peers are numbered in a determined order only when id breaks the ties.
+  compare_window("SELECT id,row_number() OVER (PARTITION BY p ORDER BY v,id) FROM w");
+  compare_window("SELECT id,row_number() OVER (PARTITION BY p,q ORDER BY d DESC,id DESC) FROM w");
+  compare_window(
+    "SELECT id,rank() OVER (PARTITION BY p,q ORDER BY v,d),"
+    "dense_rank() OVER (PARTITION BY p,q ORDER BY v,d) FROM w");
+  compare_window(
+    "SELECT id,rank() OVER (PARTITION BY p+1 ORDER BY v*2),"
+    "dense_rank() OVER (PARTITION BY p+1 ORDER BY v*2) FROM w");
+  compare_window("SELECT id,row_number() OVER (PARTITION BY p+1 ORDER BY v*2,id) FROM w");
+  compare_window("SELECT id,rank() OVER (PARTITION BY s ORDER BY d DESC) FROM w");
+  compare_window("SELECT id,rank() OVER (PARTITION BY p ORDER BY s,id) FROM w");
+  compare_window("SELECT id,dense_rank() OVER (PARTITION BY p ORDER BY f DESC) FROM w");
+  compare_window(
+    "SELECT id,rank() OVER (PARTITION BY p ORDER BY x),dense_rank() OVER (PARTITION BY p ORDER BY "
+    "x) "
+    "FROM (SELECT id,p,CASE WHEN id%5=0 THEN 'NaN'::DOUBLE WHEN id%7=0 THEN NULL "
+    "WHEN id%11=0 THEN '-inf'::DOUBLE WHEN id%13=0 THEN -0.0 WHEN id%17=0 THEN 0.0 ELSE f END x "
+    "FROM w) t");
+  compare_window(
+    "SELECT id,rank() OVER (PARTITION BY p ORDER BY v),"
+    "dense_rank() OVER (PARTITION BY p ORDER BY v) FROM (SELECT * FROM w UNION ALL SELECT * "
+    "FROM w) t");
+  // The filter may become a per-partition top-N, so only the result is compared.
+  compare_gpu_vs_cpu(
+    "SELECT id,p,rk FROM (SELECT id,p,rank() OVER (PARTITION BY p ORDER BY v DESC) rk FROM w) t "
+    "WHERE rk<=3");
+  compare_gpu_vs_cpu(
+    "SELECT p,q,rank() OVER (PARTITION BY p ORDER BY sum(d) DESC) FROM w GROUP BY p,q");
+  compare_gpu_vs_cpu("SELECT id,rank() OVER (PARTITION BY p ORDER BY v) FROM w WHERE id<0");
+}
+
+TEST_CASE_METHOD(WindowFixture,
                  "unsupported SQL window semantics retain CPU fallback",
                  "[integration][gpu_execution][window_sql]")
 {
   expect_plan_fallback_matches_cpu("SELECT id,sum(v) OVER (ORDER BY id) FROM w");
+  expect_plan_fallback_matches_cpu("SELECT id,rank() OVER (ORDER BY v) FROM w");
+  expect_plan_fallback_matches_cpu(
+    "SELECT p,q,rank() OVER (PARTITION BY p ORDER BY sum(v) DESC) FROM w GROUP BY p,q");
+  expect_plan_fallback_matches_cpu(
+    "SELECT id,rank() OVER (PARTITION BY p ORDER BY v,q DESC) FROM w");
+  expect_plan_fallback_matches_cpu(
+    "SELECT id,percent_rank() OVER (PARTITION BY p ORDER BY v) FROM w");
+  expect_plan_fallback_matches_cpu(
+    "SELECT id,rank() OVER (PARTITION BY p ORDER BY v),sum(v) OVER (PARTITION BY p) FROM w");
+  expect_plan_fallback_matches_cpu(
+    "SELECT id,rank() OVER (PARTITION BY p ORDER BY v),rank() OVER (PARTITION BY p ORDER BY q) "
+    "FROM w");
   expect_plan_fallback_matches_cpu("SELECT id,sum(DISTINCT v) OVER () FROM w");
   expect_plan_fallback_matches_cpu("SELECT sum(v::DECIMAL(4,0)) OVER () FROM w");
   expect_plan_fallback_matches_cpu(
@@ -247,10 +307,10 @@ TEST_CASE_METHOD(WindowFixture,
 }
 
 TEST_CASE_METHOD(WindowFixture,
-                 "original TPC-DS whole-partition query probes",
+                 "original TPC-DS window query probes",
                  "[integration][gpu_execution][window_tpcds]")
 {
-  auto const number         = GENERATE(12, 20, 53, 63, 89, 98);
+  auto const number         = GENERATE(12, 20, 53, 63, 67, 86, 89, 98);
   auto const root           = std::filesystem::path(__FILE__).parent_path();
   auto const* override_path = std::getenv("SIRIUS_TPCDS_TEST_DB_PATH");
   auto const database =
@@ -287,9 +347,10 @@ TEST_CASE_METHOD(WindowFixture,
   auto cpu_rows = collect_rows(*expected);
   REQUIRE(gpu_rows.size() == cpu_rows.size());
   // Approximate only the aggregate/ratio cells, keeping row-identifying leading keys exact.
-  auto const approximate = (number == 53 || number == 63) ? std::set<size_t>{2}
-                           : number == 89                 ? std::set<size_t>{7}
-                                                          : std::set<size_t>{6};
+  auto const approximate = (number == 53 || number == 63)   ? std::set<size_t>{2}
+                           : number == 89                   ? std::set<size_t>{7}
+                           : (number == 67 || number == 86) ? std::set<size_t>{}
+                                                            : std::set<size_t>{6};
   for (size_t row = 0; row < gpu_rows.size(); ++row) {
     for (size_t column = 0; column < gpu_rows[row].size(); ++column) {
       REQUIRE(cells_equal(
@@ -298,7 +359,7 @@ TEST_CASE_METHOD(WindowFixture,
   }
 }
 
-TEST_CASE("whole-partition SQL windows on two GPUs", "[integration][window_sql][multi_gpu]")
+TEST_CASE("SQL windows on two GPUs", "[integration][window_sql][multi_gpu]")
 {
   if (!sirius::test::has_gpus(2)) { return; }
   auto* env = sirius::test::acquire_integration_env_for(2);
@@ -332,7 +393,10 @@ TEST_CASE("whole-partition SQL windows on two GPUs", "[integration][window_sql][
        {"SELECT id,count(*) OVER (PARTITION BY p),count(v) OVER (PARTITION BY p),"
         "min(v) OVER (PARTITION BY p),max(v) OVER (PARTITION BY p),sum(v) OVER (PARTITION BY p) "
         "FROM w",
-        "SELECT id,count(v) OVER (),min(v) OVER (),max(v) OVER (),sum(v) OVER () FROM w"}) {
+        "SELECT id,count(v) OVER (),min(v) OVER (),max(v) OVER (),sum(v) OVER () FROM w",
+        "SELECT id,rank() OVER (PARTITION BY p ORDER BY v),"
+        "dense_rank() OVER (PARTITION BY p ORDER BY v) FROM w",
+        "SELECT id,row_number() OVER (PARTITION BY p ORDER BY id DESC) FROM w"}) {
     INFO(sql);
     run_ok("SET gpu_execution=false");
     auto cpu = sirius::test::collect_rows(*run_ok(sql));

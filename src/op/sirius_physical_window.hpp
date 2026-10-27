@@ -17,6 +17,7 @@
 #pragma once
 
 #include "op/sirius_physical_operator.hpp"
+#include "op/window/ranking.hpp"
 #include "op/window/whole_partition.hpp"
 
 namespace sirius::op {
@@ -24,8 +25,9 @@ namespace sirius::op {
 /**
  * @brief Pipelineable adapter that evaluates window functions over complete hash buckets.
  *
- * The child must publish exactly one complete bucket per batch. PARTITION and CONCAT do the
- * partition routing and apply the FULL barrier, not this operator.
+ * A window evaluates either aggregates over the whole partition or ranking functions over the
+ * window ORDER BY. The child must publish exactly one complete bucket per batch. PARTITION and
+ * CONCAT do the partition routing and apply the FULL barrier, not this operator.
  *
  * A task evaluates one bucket as one cuDF table on one GPU. A bucket holds every row of each
  * partition it contains, so a single partition is never split. Limits on a bucket:
@@ -47,6 +49,14 @@ class sirius_physical_window : public sirius_physical_operator {
                          std::vector<whole_partition_aggregate> aggregates,
                          std::size_t estimated_cardinality);
 
+  sirius_physical_window(duckdb::vector<logical_type> output_types,
+                         duckdb::vector<logical_type> prepared_types,
+                         std::size_t input_width,
+                         std::vector<cudf::size_type> partition_columns,
+                         ranking_order order,
+                         std::vector<ranking_function> ranking_functions,
+                         std::size_t estimated_cardinality);
+
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
   std::unique_ptr<operator_data> execute(operator_data const& input,
@@ -61,6 +71,8 @@ class sirius_physical_window : public sirius_physical_operator {
   std::size_t _input_width;
   std::vector<cudf::size_type> _partition_columns;
   std::vector<whole_partition_aggregate> _aggregates;
+  ranking_order _ranking_order;
+  std::vector<ranking_function> _ranking_functions;
 };
 
 }  // namespace sirius::op
