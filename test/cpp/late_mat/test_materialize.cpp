@@ -583,6 +583,11 @@ TEST_CASE("a remote nullable batch preserves mask words through the final partia
   REQUIRE(space0 != nullptr);
   REQUIRE(space1 != nullptr);
 
+  auto const policy = GENERATE(sirius::memory::device_transfer_policy::automatic,
+                               sirius::memory::device_transfer_policy::force_host_staging);
+  sirius::late_mat::transfer_context const transfers{
+    space0, mgr->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST).front(), policy};
+
   constexpr cudf::size_type num_rows = 4097;
   spread_pin pin({{num_rows, space1}});
   {
@@ -608,7 +613,7 @@ TEST_CASE("a remote nullable batch preserves mask words through the final partia
   prepared_selection const prepared(
     layout, row_id_list{static_cast<std::uint64_t const*>(d_ids.data()), num_rows, true});
   auto const before = sirius::late_mat::remote_batches_materialized();
-  auto out          = materialize(pin.ints, prepared, stream, space0->get_default_allocator());
+  auto out = materialize(pin.ints, prepared, stream, space0->get_default_allocator(), transfers);
   stream.sync();
   REQUIRE(sirius::late_mat::remote_batches_materialized() == before + 1);
   REQUIRE(out->size() == num_rows);

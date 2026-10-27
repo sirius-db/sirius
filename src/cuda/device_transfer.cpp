@@ -14,12 +14,15 @@
  * limitations under the License.
  */
 
-#include "log/logging.hpp"
 #include "memory/device_transfer.hpp"
+
+#include "log/logging.hpp"
 #include "memory/pool_peer_access.hpp"
 #include "memory/runtime_stream_pool.hpp"
 
 #include <rmm/cuda_stream.hpp>
+
+#include <cuda_runtime.h>
 
 #include <cucascade/error.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
