@@ -28,6 +28,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <utility>
 
 namespace sirius::scan_manager {
 enum class required_input : uint8_t { footer, segments, visibility, checkpoint_iteration };
@@ -67,12 +68,28 @@ struct checkpoint_input {
 };
 
 struct preparation_gate {
+  class callback_use {
+   public:
+    explicit callback_use(std::shared_ptr<preparation_gate> gate) noexcept : gate_(std::move(gate))
+    {
+    }
+    ~callback_use();
+    callback_use(callback_use const&)            = delete;
+    callback_use& operator=(callback_use const&) = delete;
+    // Register under the gate before unlocking. Destroy after payloads and locks.
+    void activate_under_gate() noexcept;
+
+   private:
+    std::shared_ptr<preparation_gate> gate_;
+    bool active_ = false;
+  };
   std::mutex mutex;
   std::condition_variable cv;
   // Bound before arm; callers hold mutex while checking admission or publication.
   std::function<bool()> interrupted;
   void check_interrupted();
-  bool closed      = false;
+  bool closed = false;
+  // Accepted reporting and out-of-lock physical cleanup, both covered by drain.
   size_t callbacks = 0;
   std::function<void(std::exception_ptr)> report_error;
   std::function<void(preparation_failure const&)> report_failure;
@@ -95,8 +112,6 @@ class preparation_unit {
   unit_record record() const;
 
  private:
-  friend class preparation_coordinator;
-  bool cancel_under_gate();
   bool accept(required_input);
   void finish_input(required_input);
   std::shared_ptr<preparation_gate> gate_;

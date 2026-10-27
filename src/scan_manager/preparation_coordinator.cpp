@@ -26,8 +26,9 @@
 
 namespace sirius::scan_manager {
 struct preparation_coordinator::state {
+  using lock_type = std::unique_lock<std::mutex>;
   struct slot {
-    enum class phase { free, running, complete } status = phase::free;
+    enum class phase { free, running, complete, retiring } status = phase::free;
     size_t source_id = 0, cursor = 0;
     std::optional<size_t> next_free;
     std::unique_ptr<op::scan::scan_info> input;
@@ -64,6 +65,7 @@ struct preparation_coordinator::state {
   std::map<unit_key, std::shared_ptr<preparation_unit>> units;
   std::deque<pending_batch> batches;
   lifecycle phase = lifecycle::constructed;
+  bool stopping   = false;
   size_t jobs = 0, results = 0, output = 0, external = 0;
   size_t next_deadline_source = 0;
   statistics stats;
@@ -85,20 +87,45 @@ struct preparation_coordinator::state {
 
   struct job_ticket {
     std::shared_ptr<state> st;
+    job work;
     size_t index = 0;
     bool active = false, completed = false;
     ~job_ticket()
     {
-      if (active && !completed) st->settle(index, {});
+      // Also order capture release before settlement when dispatch discards the task.
+      work = {};
+      if (active && !completed) st->abandon(index);
     }
   };
   void stop(stop_reason reason = stop_reason::failure_induced) noexcept
   {
-    std::lock_guard lock(gate->mutex);
+    preparation_gate::callback_use use(gate);
+    lock_type lock(gate->mutex);
+    // finish() drained accepted callbacks; late notifications need no dispatcher.
+    if (phase == lifecycle::quiescent) return;
     if (!gate->closed) stop_requested = reason;
     gate->closed = true;
-    for (auto& [key, u] : units)
-      u->cancel_under_gate();
+    gate->cv.notify_all();
+    // A release may notify stop again. One sweep owns cancellation and discarded
+    // dispatcher captures; nested callers must not recurse or wait for that sweep.
+    if (stopping) return;
+    stopping = true;
+    use.activate_under_gate();
+    auto next = units.begin();
+    while (next != units.end()) {
+      auto key  = next->first;
+      auto unit = next->second;
+      lock.unlock();
+      unit->cancel();
+      unit.reset();
+      lock.lock();
+      // Release callbacks may retire another unit while the gate is unlocked.
+      next = units.upper_bound(key);
+    }
+    lock.unlock();
+    dispatcher->request_stop();
+    lock.lock();
+    stopping = false;
     gate->cv.notify_all();
   }
   bool normal_eos_requested() const noexcept
@@ -116,34 +143,52 @@ struct preparation_coordinator::state {
     ++sources[source_id].outstanding;
     stats.jobs_peak = std::max(stats.jobs_peak, jobs);
   }
-  void release_slot(size_t index)
+  void release_slot(size_t index, lock_type& lock)
   {
     auto& s = slots[index];
     if (s.status == slot::phase::free) return;
-    if (s.status == slot::phase::running)
+    auto previous = s.status;
+    auto input    = std::move(s.input);
+    auto unit     = std::move(s.unit);
+    if (unit) {
+      auto registered = units.find(unit->key());
+      if (registered != units.end() && registered->second == unit) units.erase(registered);
+    }
+    s.status = slot::phase::retiring;
+    lock.unlock();
+    input.reset();
+    unit.reset();
+    lock.lock();
+    // Keep the slot and its original credit occupied through physical disposal.
+    if (previous == slot::phase::running)
       --jobs;
     else
       --results;
     auto& source = sources[s.source_id];
     --source.outstanding;
     if (source.active_result == index) source.active_result.reset();
-    s.input.reset();
-    if (s.unit) units.erase(s.unit->key());
-    s.unit.reset();
     s.status    = slot::phase::free;
     s.next_free = free_slot;
     free_slot   = index;
+  }
+  void abandon(size_t index) noexcept
+  {
+    lock_type lock(gate->mutex);
+    release_slot(index, lock);
+    gate->cv.notify_all();
   }
   // Runs only after work and its input captures have been physically released.
   void settle(size_t index, std::unique_ptr<op::scan::scan_info> value) noexcept
   {
     auto const bytes = value ? value->preparation_bytes() : 0;
     try {
-      std::lock_guard lock(gate->mutex);
+      lock_type lock(gate->mutex);
       auto& s = slots[index];
       if (gate->closed) {
+        lock.unlock();
         value.reset();
-        release_slot(index);
+        lock.lock();
+        release_slot(index, lock);
       } else {
         auto& source = sources[s.source_id];
         if (bytes > std::numeric_limits<size_t>::max() - source.work_bytes)
@@ -160,13 +205,12 @@ struct preparation_coordinator::state {
     } catch (...) {
       completion->report_error(std::current_exception());
       stop();
-      std::lock_guard lock(gate->mutex);
-      release_slot(index);
+      value.reset();
+      lock_type lock(gate->mutex);
+      release_slot(index, lock);
       gate->cv.notify_all();
     }
   }
-
-  using lock_type = std::unique_lock<std::mutex>;
   // These steps enter and return with the gate locked; callbacks run unlocked,
   // except the final visible push. On exception the lock may be released.
   std::optional<op::scan::batch_coalescer::clock::time_point> size_deadline(size_t id) const
@@ -191,7 +235,8 @@ struct preparation_coordinator::state {
   bool close_finished_source(lock_type&);
   bool emit_full_window(lock_type&);
   void queue_batch(size_t,
-                   std::unique_ptr<op::scan::scan_info>,
+                   std::unique_ptr<op::scan::scan_info>&,
+                   lock_type&,
                    std::optional<op::scan::batch_coalescer::clock::time_point> = {},
                    bool size_triggered                                         = false);
   bool inputs_settled() const;
@@ -338,8 +383,14 @@ std::shared_ptr<preparation_unit> preparation_coordinator::admit_unit(unit_key k
 }
 void preparation_coordinator::retire_unit(unit_key k)
 {
+  preparation_gate::callback_use use(state_->gate);
+  std::shared_ptr<preparation_unit> retired;
   std::lock_guard lock(state_->gate->mutex);
-  state_->units.erase(k);
+  auto found = state_->units.find(k);
+  if (found == state_->units.end()) return;
+  use.activate_under_gate();
+  retired = std::move(found->second);
+  state_->units.erase(found);
   state_->gate->cv.notify_all();
 }
 std::optional<unit_record> preparation_coordinator::unit_state_snapshot(unit_key k) const
@@ -360,7 +411,6 @@ void preparation_coordinator::request_stop(stop_reason reason) noexcept
     }
   }
   state_->stop(reason);
-  state_->dispatcher->request_stop();
 }
 void preparation_coordinator::drain()
 {
@@ -404,13 +454,29 @@ void preparation_coordinator::wake_for_testing()
 
 void preparation_coordinator::state::queue_batch(
   size_t source_id,
-  std::unique_ptr<op::scan::scan_info> batch,
+  std::unique_ptr<op::scan::scan_info>& batch,
+  lock_type& lock,
   std::optional<op::scan::batch_coalescer::clock::time_point> first,
   bool size_triggered)
 {
   if (!batch) return;
   auto const bytes = batch->preparation_bytes();
-  batches.push_back({source_id, std::move(batch), bytes, first, size_triggered});
+  // Only the coordinator takes output credits; consumers only return them.
+  // Capacity checked before producing a batch remains available until this charge.
+  // Allocate the empty queue node before transferring its owner. If allocation
+  // fails, the caller must unwind its payload without holding the gate.
+  try {
+    batches.emplace_back();
+  } catch (...) {
+    lock.unlock();
+    throw;
+  }
+  auto& pending             = batches.back();
+  pending.source_id         = source_id;
+  pending.batch             = std::move(batch);
+  pending.preparation_bytes = bytes;
+  pending.deadline_retained = first;
+  pending.size_triggered    = size_triggered;
   ++sources[source_id].pending_batches;
   sources[source_id].output_bytes += bytes;
   ++output;
@@ -430,7 +496,7 @@ bool preparation_coordinator::state::emit_due_batch(lock_type& lock)
     lock.unlock();
     auto batch = source.hooks.coalescer->partial_emit();
     lock.lock();
-    queue_batch(id, std::move(batch), first);
+    queue_batch(id, batch, lock, first);
     next_deadline_source = id + 1;
     return true;
   }
@@ -449,7 +515,7 @@ bool preparation_coordinator::state::emit_sized_batch(lock_type& lock)
     lock.unlock();
     auto batch = sources[id].hooks.coalescer->partial_emit();
     lock.lock();
-    queue_batch(id, std::move(batch), first, true);
+    queue_batch(id, batch, lock, first, true);
     next_deadline_source = id + 1;
     return true;
   }
@@ -516,9 +582,12 @@ bool preparation_coordinator::state::advance_result(lock_type& lock)
         return true;
       }
       if (record.state == unit_state::pending) continue;
-      if (record.state == unit_state::cancelled && slot.input) {
-        source.work_bytes -= slot.input->preparation_bytes();
-        slot.input.reset();
+      if (record.state == unit_state::cancelled) {
+        auto bytes = slot.input ? slot.input->preparation_bytes() : 0;
+        ready_results.pop_back();
+        release_slot(index, lock);
+        source.work_bytes -= bytes;
+        return true;
       }
     }
     ready_results.pop_back();
@@ -529,9 +598,9 @@ bool preparation_coordinator::state::advance_result(lock_type& lock)
                   : op::scan::batch_coalescer::cursor_step{nullptr, true};
     lock.lock();
     bool const emitted = static_cast<bool>(step.batch);
-    queue_batch(slot.source_id, std::move(step.batch));
+    queue_batch(slot.source_id, step.batch, lock);
     if (step.finished)
-      release_slot(index);
+      release_slot(index, lock);
     else
       ready_results.push_back(index);
     // Give ready metadata a bounded advance before considering an early partial batch.
@@ -567,42 +636,42 @@ bool preparation_coordinator::state::submit_job(lock_type& lock, std::shared_ptr
   auto claimed = source->hooks.claim();
   if (claimed) {
     // Workers cannot see this slot until enqueue; source registration is already frozen.
-    slots[index].unit = claimed->unit;
+    slots[index].unit = std::move(claimed->unit);
+    ticket->work      = std::move(*claimed);
     if (before_submit) before_submit();
     {
       std::lock_guard check(gate->mutex);
       gate->check_interrupted();
     }
-    dispatcher->enqueue(
-      [ticket = std::move(ticket), work = std::move(*claimed)](std::stop_token stop) mutable {
-        auto& owner = *ticket->st;
-        std::unique_ptr<op::scan::scan_info> value;
+    dispatcher->enqueue([ticket = std::move(ticket)](std::stop_token stop) mutable {
+      auto& owner = *ticket->st;
+      std::unique_ptr<op::scan::scan_info> value;
+      try {
+        value = ticket->work.stop_work ? ticket->work.stop_work(stop) : ticket->work.work();
+      } catch (...) {
+        auto error               = std::current_exception();
+        bool expected_normal_eos = false;
         try {
-          value = work.stop_work ? work.stop_work(stop) : work.work();
+          std::rethrow_exception(error);
+        } catch (std::system_error const& e) {
+          expected_normal_eos =
+            e.code() == std::errc::operation_canceled && owner.normal_eos_requested();
         } catch (...) {
-          auto error               = std::current_exception();
-          bool expected_normal_eos = false;
-          try {
-            std::rethrow_exception(error);
-          } catch (std::system_error const& e) {
-            expected_normal_eos =
-              e.code() == std::errc::operation_canceled && owner.normal_eos_requested();
-          } catch (...) {
-          }
-          if (!expected_normal_eos) {
-            owner.completion->report_error(error);
-            owner.stop();
-          }
         }
-        work = {};  // Release physical-input captures before the job ticket is returned.
-        ticket->completed = true;
-        owner.settle(ticket->index, std::move(value));
-      });
+        if (!expected_normal_eos) {
+          owner.completion->report_error(error);
+          owner.stop();
+        }
+      }
+      ticket->work      = {};  // Release both callbacks before returning the job credit.
+      ticket->completed = true;
+      owner.settle(ticket->index, std::move(value));
+    });
     lock.lock();
   } else {
     lock.lock();
     ticket->completed = true;
-    release_slot(index);
+    release_slot(index, lock);
     source->status = source_state::phase::enumeration_done;
   }
   return true;
@@ -620,7 +689,7 @@ bool preparation_coordinator::state::emit_full_window(lock_type& lock)
     auto batch = source.hooks.coalescer->partial_emit();
     lock.lock();
     if (batch) {
-      queue_batch(id, std::move(batch));
+      queue_batch(id, batch, lock);
       return true;
     }
   }
@@ -640,9 +709,12 @@ bool preparation_coordinator::state::close_finished_source(lock_type& lock)
       auto final = source.hooks.coalescer->flush();
       lock.lock();
       source.status = source_state::phase::tail_flushed;
-      if (final.size() > 1) throw std::logic_error("final flush exceeded its reserved output slot");
+      if (final.size() > 1) {
+        lock.unlock();
+        throw std::logic_error("final flush exceeded its reserved output slot");
+      }
       if (!final.empty()) {
-        queue_batch(id, std::move(final.front()));
+        queue_batch(id, final.front(), lock);
         return true;  // Publish the final batch before closing its connector.
       }
     }
@@ -685,7 +757,6 @@ preparation_coordinator::state::nearest_deadline() const
 void preparation_coordinator::state::shutdown()
 {
   stop();
-  dispatcher->request_stop();
   dispatcher->wait_for_all();
   {
     std::unique_lock lock(gate->mutex);
@@ -707,11 +778,19 @@ void preparation_coordinator::state::finish()
       source.status = source_state::phase::closed;
     }
   {
-    std::lock_guard lock(gate->mutex);
-    batches.clear();
+    lock_type lock(gate->mutex);
+    while (!batches.empty()) {
+      auto batch = std::move(batches.front());
+      batches.pop_front();
+      lock.unlock();
+      batch.batch.reset();
+      lock.lock();
+      --output;
+    }
     ready_results.clear();
     for (size_t index = 0; index < slots.size(); ++index)
-      release_slot(index);
+      release_slot(index, lock);
+    gate->cv.wait(lock, [&] { return !gate->callbacks; });
     gate->closed = true;
     phase        = lifecycle::quiescent;
     gate->cv.notify_all();
