@@ -24,6 +24,7 @@
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <expression_evaluator/gpu_expression_translator_internal.hpp>
 #include <helper/type_conversions.hpp>
+#include <io/cache/prefetching_cache.hpp>
 #include <io/io_context.hpp>
 #include <io/io_errors.hpp>
 #include <io/parquet_helpers.hpp>
@@ -997,6 +998,59 @@ bool parquet_scan_core::has_processed_all_metadata() const
   return _next_file_idx.load(std::memory_order_relaxed) >= _file_paths.size();
 }
 
+std::size_t parquet_scan_core::pick_file(std::size_t claim, io::ioctx_resolver const& resolve)
+{
+  auto const n = _file_paths.size();
+  if (n < 2) { return claim; }
+  std::lock_guard lock(_claim_mtx);
+  if (_claimed.empty()) {
+    _claimed.assign(n, false);
+    // A path no backend serves just goes unranked; its metadata task reports the error.
+    _file_ctxs.resize(n);
+    for (std::size_t i = 0; i < n; ++i) {
+      try {
+        _file_ctxs[i] = resolve(_file_paths[i]);
+      } catch (...) {
+      }
+    }
+  }
+  // Re-rank the unclaimed files only every few claims; between rankings the order is followed
+  // as is. Ranked by the cached share of the whole file: which columns a later split reads is
+  // not known before its footer, and the ranking needs no such precision.
+  constexpr std::size_t rerank_every = 8;
+  if (_order_pos >= _order.size() || _claims_since_rank >= rerank_every) {
+    std::vector<std::pair<std::size_t, std::size_t>> by_cached;  // (cached tenths, file)
+    by_cached.reserve(n);
+    for (std::size_t i = 0; i < n; ++i) {
+      if (_claimed[i]) { continue; }
+      std::size_t tenths = 0;
+      if (auto const& ctx = _file_ctxs[i]; ctx && ctx->uses_prefetching_cache()) {
+        auto const held = ctx->cache()->residency(_file_paths[i]);
+        if (held.object_bytes > 0) { tenths = held.resident_bytes * 10 / held.object_bytes; }
+      }
+      by_cached.emplace_back(tenths, i);
+    }
+    // Most cached first. Coarse buckets, ties in file order: files cached about equally (all or
+    // nothing, the common cases) are read in file order as before.
+    std::stable_sort(by_cached.begin(), by_cached.end(), [](auto const& a, auto const& b) {
+      return a.first > b.first;
+    });
+    _order.clear();
+    for (auto const& entry : by_cached) {
+      _order.push_back(entry.second);
+    }
+    _order_pos         = 0;
+    _claims_since_rank = 0;
+  }
+  while (_order_pos < _order.size() && _claimed[_order[_order_pos]]) {
+    ++_order_pos;
+  }
+  auto const pick = _order_pos < _order.size() ? _order[_order_pos++] : claim;
+  _claimed[pick]  = true;
+  ++_claims_since_rank;
+  return pick;
+}
+
 parquet_scan_core::metadata_scan_task_t parquet_scan_core::next_split_provider(
   io::ioctx_resolver resolve)
 {
@@ -1015,8 +1069,9 @@ parquet_scan_core::stoppable_metadata_scan_task_t parquet_scan_core::next_split_
   io::ioctx_resolver resolve)
 {
   if (!resolve) { throw std::runtime_error("parquet_gpu_ingestible: no scan_manager is wired."); }
-  auto const idx = _next_file_idx.fetch_add(1, std::memory_order_relaxed);
-  if (idx >= _file_paths.size()) { return nullptr; }  // lost the race for the final file
+  auto const claim = _next_file_idx.fetch_add(1, std::memory_order_relaxed);
+  if (claim >= _file_paths.size()) { return nullptr; }  // lost the race for the final file
+  auto const idx = pick_file(claim, resolve);
 
   // Route each file to its own backend (s3:// -> rest, local -> uring/kvikio) so a
   // mixed-scheme scan opens every file on the right ioctx.  One metadata-scan task

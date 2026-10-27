@@ -150,6 +150,15 @@ class downgrade_executor {
     sirius::exec::multi_index_priority_queue<sirius::parallel::itask>* pipeline_task_queue);
 
   /**
+   * @brief Set what this executor asks for host memory back before data goes to disk: it is
+   * handed the bytes wanted and returns the bytes it freed. A HOST source asks before moving
+   * batches to disk; a GPU source asks when a batch would otherwise skip a full host tier.
+   *
+   * Must be called before start(), and the callee must outlive stop().
+   */
+  void set_host_memory_releaser(std::function<std::size_t(std::size_t)> releaser);
+
+  /**
    * @brief Asynchronously request a predicate-driven downgrade.
    *
    * Dispatches batch downgrades until the predicate returns true or candidates
@@ -194,6 +203,12 @@ class downgrade_executor {
    */
   bool has_viable_downgrade_target() const;
 
+  /**
+   * @brief Before a GPU batch of @p bytes is converted: when no HOST space can take it, ask the
+   * host memory releaser for that much, so the batch lands on host instead of going to disk.
+   */
+  void make_host_room(std::size_t bytes) const;
+
  private:
   exec::downgrade_executor_config _config;
   std::unique_ptr<exec::bounded_thread_pool> _pool;
@@ -218,6 +233,7 @@ class downgrade_executor {
   // Non-owning pointer into task_scheduler. SiriusContext stops this executor before destroying
   // the scheduler and its queue.
   sirius::exec::multi_index_priority_queue<sirius::parallel::itask>* _pipeline_task_queue{nullptr};
+  std::function<std::size_t(std::size_t)> _host_memory_releaser;
   /// Non-owning; the runtime or test fixture must outlive this executor.
   sirius::exec::query_lifecycle_registry& _query_lifecycle;
 };

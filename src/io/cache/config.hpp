@@ -40,7 +40,7 @@ enum class eviction_policy {
   /// sized for the reads in flight rather than for reuse.
   idle,
   /// Keep idle chunks for reuse and evict least-recently-used ones once the pool
-  /// fills past @c eviction_threshold_fraction.
+  /// reaches its @c max_host_fraction cap.
   lru,
 };
 
@@ -111,8 +111,10 @@ struct config {
   /// Floor of the cache pool reserved for prefetching, as a fraction of the pool.
   double min_prefetching_budget_fraction{0.05};
 
-  /// Start evicting once the pool fills to this fraction of its capacity.
-  double eviction_threshold_fraction{0.8};
+  /// Hard cap on the cache's resident chunk bytes, as a fraction of the host
+  /// tier: allocations past it are refused (reads over those chunks are served
+  /// uncached), and the evictor starts once it is reached.  0 means uncapped.
+  double max_host_fraction{0.8};
 
   /// Derived from @ref eviction by @ref apply_mode; not settable on its own.
   bool dispose_on_idle{false};

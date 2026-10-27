@@ -115,7 +115,7 @@ TEST_CASE("a pin that throws part way through pins nothing", "[scan_manager][cac
   sirius::exec::query_lifecycle_registry scan_lifecycle;
 
   sirius_scan_manager manager{scan_lifecycle, config_with_sirius_cache(), *memory, topology};
-  auto* cache = manager.io_ctx()->cache();
+  auto* cache = manager.ensure_default_cache();
   REQUIRE(cache != nullptr);
   REQUIRE(cache->is_armed());
 
@@ -164,7 +164,7 @@ TEST_CASE("a failed re-pin leaves the previous pin intact", "[scan_manager][cach
   sirius::exec::query_lifecycle_registry scan_lifecycle;
 
   sirius_scan_manager manager{scan_lifecycle, config_with_sirius_cache(), *memory, topology};
-  auto* cache = manager.io_ctx()->cache();
+  auto* cache = manager.ensure_default_cache();
   REQUIRE(cache != nullptr);
   REQUIRE(cache->is_armed());
 
@@ -191,7 +191,7 @@ TEST_CASE("reset_caches drops parquet pins rather than leave them stale",
   sirius::exec::query_lifecycle_registry scan_lifecycle;
 
   sirius_scan_manager manager{scan_lifecycle, config_with_sirius_cache(), *memory, topology};
-  auto* cache = manager.io_ctx()->cache();
+  auto* cache = manager.ensure_default_cache();
   REQUIRE(cache != nullptr);
   REQUIRE(cache->is_armed());
 

@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <cstddef>
 #include <memory>
 #include <span>
@@ -180,6 +181,37 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
   [[nodiscard]] bool has_fallen_behind() const noexcept
   {
     return get_scan_stage() >= io::cache::scan_stage::preparing;
+  }
+
+  /// Bytes this split's prefetch asks the cache to hold: the sum of its fadvise
+  /// ranges.  An estimate (chunk rounding and resident ranges differ), but one
+  /// known before issue, which is when the readahead must decide.
+  [[nodiscard]] std::size_t prefetch_footprint_bytes() const noexcept
+  {
+    std::size_t total = 0;
+    for (auto const& entry : _hints) {
+      for (auto const& range : entry.ranges) {
+        if (range.size() > 0) { total += static_cast<std::size_t>(range.size()); }
+      }
+    }
+    return total;
+  }
+
+  /// Record / take the bytes the readahead charged against its resident budget
+  /// for this split's prefetch.  Exactly once: whichever release path (no IO
+  /// issued, split disposed) takes first gets the bytes, the other gets 0.  The
+  /// record is bookkeeping, not split state, so a const split can be released.
+  void set_readahead_resident_bytes(std::size_t bytes) const noexcept
+  {
+    [[maybe_unused]] auto const previous =
+      _readahead_resident_bytes.exchange(bytes, std::memory_order_acq_rel);
+    // A split is charged once; overwriting a live charge would leak it.
+    assert(previous == 0);
+  }
+
+  [[nodiscard]] std::size_t take_readahead_resident_bytes() const noexcept
+  {
+    return _readahead_resident_bytes.exchange(0, std::memory_order_acq_rel);
   }
 
   /// Allocate staging buffers for this split's prefetch requests.  A chunk
@@ -346,6 +378,7 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
   std::vector<fadvise_entry> _hints;
   std::vector<std::shared_ptr<sirius::io::sirius_datasource>> _datasources;
   std::atomic<io::cache::scan_stage> _scan_stage{io::cache::scan_stage::none};
+  mutable std::atomic<std::size_t> _readahead_resident_bytes{0};
 
   scan_contract_id contract_id_ = 0;
   std::vector<split_materializer_certificate> certificates_;

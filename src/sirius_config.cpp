@@ -30,6 +30,7 @@
 #include <cmath>
 #include <exception>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string_view>
@@ -222,6 +223,7 @@ static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
   r.optional("footer_probe_bytes", yaml::bytes(opt.footer_probe_bytes));
   r.optional("list_max_matches", opt.list_max_matches);
   r.optional("list_max_scanned", opt.list_max_scanned);
+  r.optional("staging_wait_timeout_ms", opt.staging_wait_timeout);
   r.reject_unknown();
 }
 
@@ -276,8 +278,24 @@ static void from_yaml(const YAML::Node& node, sirius::io::cache::config& opt)
   r.optional("min_prefetching_budget_fraction",
              opt.min_prefetching_budget_fraction,
              yaml::fraction<double>{});
-  r.optional(
-    "eviction_threshold_fraction", opt.eviction_threshold_fraction, yaml::fraction<double>{});
+  // `eviction_threshold_fraction` is the cap's former name, still accepted as a deprecated alias.
+  bool const has_cap   = r.has_value("max_host_fraction");
+  bool const has_alias = r.has_value("eviction_threshold_fraction");
+  if (has_cap && has_alias) {
+    throw std::runtime_error(
+      "'cache': max_host_fraction and its deprecated alias eviction_threshold_fraction are both "
+      "set; keep only max_host_fraction");
+  }
+  r.optional("max_host_fraction", opt.max_host_fraction, yaml::fraction<double>{});
+  r.optional("eviction_threshold_fraction", opt.max_host_fraction, yaml::fraction<double>{});
+  if (has_alias) {
+    static std::once_flag warned;
+    std::call_once(warned, [] {
+      SIRIUS_LOG_WARN(
+        "sirius_config: cache.eviction_threshold_fraction is deprecated; use "
+        "cache.max_host_fraction (the same hard cap on the cache's resident bytes)");
+    });
+  }
   r.reject_unknown();
   opt.apply_mode();
 }
@@ -347,6 +365,7 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   r.optional("rest_n_reactors", opt.rest_n_reactors, yaml::greater_than<std::size_t>{0});
   r.optional("max_readahead_scans", opt.max_readahead_scans);
   r.optional("readahead_strategy", opt.readahead_strategy);
+  r.optional("max_readahead_bytes", yaml::bytes(opt.max_readahead_bytes));
   if (auto n = r.optional_node("uring")) sirius::from_yaml(*n, opt.uring);
   if (auto n = r.optional_node("rest")) sirius::from_yaml(*n, opt.rest);
   if (auto n = r.optional_node("kvikio")) sirius::from_yaml(*n, opt.kvikio);

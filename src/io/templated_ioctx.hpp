@@ -36,6 +36,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <ranges>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -101,6 +102,11 @@ template <class R>
 concept reactor_declares_bulk_io_preference = requires {
   { R::prefers_bulk_io } -> std::convertible_to<bool>;
 };
+
+/// A reactor that serves a run of nearby slices with one request declares
+/// `static constexpr bool fuses_runs = true`; dispatch then keeps runs whole.
+template <class R>
+concept reactor_fuses_runs = requires { requires R::fuses_runs; };
 
 template <class R>
 struct reactor_traits {
@@ -351,28 +357,57 @@ class templated_ioctx : public ioctx {
         std::vector<std::vector<prepared_io_slice>> partitions(partition_count);
         std::vector<std::size_t> partition_bytes(partition_count, 0);
 
+        // A reactor that fuses runs gets each run of slices within
+        // merge_gap_size() of one another whole, balanced run by run; splitting
+        // a run across reactors would leave holes no single GET can bridge.
+        // Others are balanced slice by slice.
+        constexpr bool keep_runs = reactor_fuses_runs<Reactor>;
+        if constexpr (keep_runs) {
+          std::ranges::sort(slices, {}, [](prepared_io_slice const& s) { return s.rng.offset; });
+        }
+
         // Keep the originals until every queue entry has been allocated. If an
         // allocation fails, their callbacks can still release all claimed cache
         // chunks and every coordinator credit can be settled.
-        for (auto const& slice : slices) {
+        auto const max_gap = _config.merge_gap_size();
+        for (std::size_t begin = 0; begin < slices.size();) {
+          std::size_t end       = begin + 1;
+          std::size_t run_bytes = slices[begin].size();
+          auto run_end          = slices[begin].rng.end();
+          while (
+            keep_runs && end < slices.size() &&
+            (slices[end].rng.offset <= run_end || slices[end].rng.offset - run_end <= max_gap)) {
+            run_bytes += slices[end].size();
+            run_end = std::max(run_end, slices[end].rng.end());
+            ++end;
+          }
           auto const smallest = static_cast<std::size_t>(
             std::min_element(partition_bytes.begin(), partition_bytes.end()) -
             partition_bytes.begin());
-          partition_bytes[smallest] += slice.size();
-          partitions[smallest].push_back(slice);
+          partition_bytes[smallest] += run_bytes;
+          for (std::size_t i = begin; i < end; ++i) {
+            partitions[smallest].push_back(slices[i]);
+          }
+          begin = end;
         }
 
+        // Fewer runs than partitions leave some empty; publish only the others
+        // so no reactor is handed an empty group.
         std::vector<std::unique_ptr<grouped_io_request>> requests;
+        std::vector<std::size_t> targets;
         requests.reserve(partition_count);
+        targets.reserve(partition_count);
         for (std::size_t i = 0; i < partition_count; ++i) {
+          if (partitions[i].empty()) continue;
           requests.push_back(
             grouped_io_request::create(owner, std::move(partitions[i]), coordinator));
+          targets.push_back(i);
         }
 
         // enqueue is noexcept by reactor contract, so once publication starts
         // ownership cannot be stranded between reactors.
-        for (std::size_t i = 0; i < partition_count; ++i) {
-          reactors[i]->enqueue(std::move(requests[i]));
+        for (std::size_t i = 0; i < requests.size(); ++i) {
+          reactors[targets[i]]->enqueue(std::move(requests[i]));
         }
         return future;
       } catch (...) {

@@ -16,6 +16,8 @@
 
 #pragma once
 #include "op/scan/parquet_scan_types.hpp"
+
+#include <mutex>
 namespace sirius::op::scan {
 class parquet_scan_core {
  public:
@@ -171,6 +173,23 @@ class parquet_scan_core {
   // Per-file metadata-scan cursor. next_split_provider hands out one file index
   // per claim; the coalescer downstream batches files and chunks row groups.
   std::atomic<std::size_t> _next_file_idx{0};
+
+  // Which file a claim takes: the unclaimed one the prefetching cache holds the
+  // largest share of, ties in file order. Splits reach the coalescer roughly in
+  // claim order, so a scan that repeats an earlier one (the same query's other
+  // scan of the table -- TPC-H q17, q18 and q21 read lineitem twice -- or the
+  // previous iteration's) reads what is still cached before its own misses
+  // evict it. Plain file order when no file is cached.
+  [[nodiscard]] std::size_t pick_file(std::size_t claim, io::ioctx_resolver const& resolve);
+  std::mutex _claim_mtx;
+  std::vector<bool> _claimed;
+  // Each file's ioctx, resolved once on the first ranking.
+  std::vector<std::shared_ptr<io::ioctx>> _file_ctxs;
+  // The current ranking of unclaimed files, most cached first, and how far it
+  // has been followed.
+  std::vector<std::size_t> _order;
+  std::size_t _order_pos         = 0;
+  std::size_t _claims_since_rank = 0;
 
   // Dynamic join filters shared with the producing hash join; null when none are wired.
   // AST-capable filters are ANDed into the parquet reader filter; membership filtering happens in

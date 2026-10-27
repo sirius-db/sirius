@@ -38,6 +38,26 @@
 
 namespace sirius::scan_manager {
 
+std::size_t readahead_byte_budget::charge(op::scan::scan_info const& split, std::size_t bytes)
+{
+  // Counted before it is recorded on the split, so a release that finds the
+  // record can never take the total below zero.
+  auto const now = _resident.fetch_add(bytes, std::memory_order_acq_rel) + bytes;
+  split.set_readahead_resident_bytes(bytes);
+  // The split may have been disposed before the record above existed, in which
+  // case its dispose found nothing to release.  Take it back here instead; the
+  // exchange makes this and a concurrent dispose agree on who does.
+  if (split.get_scan_stage() == io::cache::scan_stage::disposed) { release(split); }
+  return now;
+}
+
+void readahead_byte_budget::release(op::scan::scan_info const& split) noexcept
+{
+  if (auto const bytes = split.take_readahead_resident_bytes(); bytes > 0) {
+    _resident.fetch_sub(bytes, std::memory_order_acq_rel);
+  }
+}
+
 readahead_scan_manager::~readahead_scan_manager() { stop(); }
 
 void readahead_scan_manager::prepare_for_query(const sirius::planner::query& query)
@@ -174,7 +194,8 @@ std::string readahead_scan_manager::summary() const
     "issued={}[prefetched={} wait_for_prefetch={}] "
     "skipped={}[memory_pressure={} fell_behind={} nothing_to_issue={}] "
     "candidates={}[dropped_expired={} dropped_fell_behind={}] "
-    "operators_drained={} pacing[memory_retries={} idle_polls={} gate_timeouts={}] "
+    "operators_drained={} pacing[memory_retries={} idle_polls={} gate_timeouts={} "
+    "resident_waits={} host_pressure_waits={}] "
     "executor_reads={}[borrowed={}]",
     prefetched + waited,
     prefetched,
@@ -190,6 +211,8 @@ std::string readahead_scan_manager::summary() const
     load(_counters.memory_retries),
     load(_counters.idle_polls),
     load(_counters.gate_timeouts),
+    load(_counters.resident_waits),
+    load(_counters.host_pressure_waits),
     load(_counters.cold_read_tickets),
     load(_counters.borrowed));
 }
@@ -238,6 +261,17 @@ void readahead_scan_manager::update_scan_state(std::size_t,
   // read to compete with and no budget to charge it against.
   if (task == nullptr || _budget == 0) { return; }
   if (stage != io::cache::scan_stage::reading && stage != io::cache::scan_stage::disposed) return;
+  if (stage == io::cache::scan_stage::disposed) {
+    // Whatever the split's prefetch was holding against the resident budget is
+    // the consumer's to drop now, not the readahead's. Wake a candidate held
+    // back for room.
+    _resident.release(*task);
+    {
+      std::lock_guard lock(_disposal_mutex);
+      ++_disposal_generation;
+    }
+    _disposal_cv.notify_all();
+  }
   auto key = task->weak_from_this();
   std::lock_guard lock(_tickets_mutex);
   auto it = _tickets.find(key);
@@ -353,6 +387,9 @@ void readahead_scan_manager::on_prefetch_complete(split_key const& split,
   // Only complete, successful coverage eliminates future demand IO. Merely
   // issuing one datasource says nothing about the rest of this split.
   settle_prefetch(split, ticket, out.ok && out.covered && out.declined == 0);
+  // Nothing landed, so nothing is resident on this split's account.  A split
+  // that is already gone was disposed first, and its dispose released it.
+  if (out.issued == 0 && task) { _resident.release(*task); }
   _counters.record(
     classify_prefetch(out.declined_memory_pressure > 0,
                       task != nullptr,
@@ -368,6 +405,38 @@ void readahead_scan_manager::worker_loop(const std::stop_token& st)
   // Back-off when the order has nothing to prefetch right now.
   constexpr auto k_idle_wait = std::chrono::milliseconds{10};
 
+  // How long a candidate held back for room waits for a disposal before checking again.
+  constexpr auto k_room_wait = std::chrono::milliseconds{25};
+
+  // Hold @p candidate back while issuing it would overrun the resident-byte
+  // budget or the host tier is under pressure, waiting for a disposal on the
+  // room-wait timer.  Never waits with nothing resident, so an oversize split or
+  // pressure that is not the readahead's doing cannot stall it.  Returns false
+  // when the candidate should be abandoned, having recorded why.
+  auto wait_for_room = [&](prefetch_candidate const& candidate, std::size_t bytes) {
+    while (!st.stop_requested()) {
+      if (candidate.task->has_fallen_behind()) {
+        _counters.record(prefetch_outcome_kind::skipped_fell_behind);
+        return false;
+      }
+      if (_resident.resident() == 0) { return true; }
+      bool const over_budget = !_resident.admits(bytes);
+      bool const pressure    = !over_budget && _host_under_pressure && _host_under_pressure();
+      if (!over_budget && !pressure) { return true; }
+      (over_budget ? _counters.resident_waits : _counters.host_pressure_waits)
+        .fetch_add(1, std::memory_order_relaxed);
+
+      std::unique_lock lock(_disposal_mutex);
+      auto const generation = _disposal_generation;
+      _disposal_cv.wait_for(lock, k_room_wait, [&] {
+        return st.stop_requested() || candidate.task->has_fallen_behind() ||
+               _disposal_generation != generation;
+      });
+    }
+    _counters.record(prefetch_outcome_kind::skipped_memory_pressure);
+    return false;
+  };
+
   enum class issue_result { issued, finished, memory_pressure };
   auto try_issue =
     [&](prefetch_candidate const& candidate, bool delayed_retry, bool& slot_transferred) {
@@ -375,6 +444,8 @@ void readahead_scan_manager::worker_loop(const std::stop_token& st)
         _counters.record(prefetch_outcome_kind::skipped_fell_behind);
         return issue_result::finished;
       }
+      auto const bytes = candidate.task->prefetch_footprint_bytes();
+      if (!wait_for_room(candidate, bytes)) { return issue_result::finished; }
       std::shared_ptr<scan_ticket> ticket;
       split_key split = candidate.task;
       try {
@@ -419,6 +490,9 @@ void readahead_scan_manager::worker_loop(const std::stop_token& st)
           try {
             prep = candidate.task->prepare_for_prefetching(evict_on_failure);
             if (prep.ready()) {
+              // Charged before the call, not after: the completion may fire inline
+              // and has to find the charge to refund it when no IO went out.
+              _resident.charge(*candidate.task, bytes);
               candidate.task->prefetch([ticket, weak = weak_from_this(), split](
                                          op::scan::scan_info::prefetch_outcome out) noexcept {
                 // weak, not shared: a completion firing after the query tore the
@@ -428,10 +502,14 @@ void readahead_scan_manager::worker_loop(const std::stop_token& st)
               return issue_result::issued;
             }
           } catch (std::exception const& e) {
+            // prefetch() throws only before its completion exists, so a charge made
+            // above is still ours to return.
+            _resident.release(*candidate.task);
             SIRIUS_LOG_WARN("[readahead] prefetch attempt abandoned: {}", e.what());
             _counters.record(prefetch_outcome_kind::skipped_memory_pressure);
             return issue_result::finished;
           } catch (...) {
+            _resident.release(*candidate.task);
             SIRIUS_LOG_WARN("[readahead] prefetch attempt abandoned: unknown exception");
             _counters.record(prefetch_outcome_kind::skipped_memory_pressure);
             return issue_result::finished;
