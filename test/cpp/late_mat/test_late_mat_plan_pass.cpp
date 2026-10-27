@@ -24,6 +24,7 @@
 // does not model reads everything, which can only end a ride early.
 
 #include "operator/partition_test_utils.hpp"
+#include "utils/test_physical_operator.hpp"
 
 #include <cudf/types.hpp>
 
@@ -83,6 +84,11 @@ std::unique_ptr<sirius::ast::node> ref(std::uint32_t column)
 // The plan generator links parents in production; these expose the same field
 // so a test can build a chain without one.
 struct fake_scan : sirius::op::sirius_physical_operator {
+ public:
+  sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
   explicit fake_scan(std::size_t columns)
     : sirius_physical_operator(
         sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN, make_types(columns), 0)
@@ -93,6 +99,11 @@ struct fake_scan : sirius::op::sirius_physical_operator {
 
 /// The same, with columns wide enough for a bundle to clear the value floor.
 struct wide_scan : sirius::op::sirius_physical_operator {
+ public:
+  sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
   explicit wide_scan(std::size_t columns)
     : sirius_physical_operator(
         sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN, make_string_types(columns), 0)
@@ -103,6 +114,11 @@ struct wide_scan : sirius::op::sirius_physical_operator {
 
 /// An operator shape the analysis does not model, so it must consume.
 struct opaque_op : sirius::op::sirius_physical_operator {
+ public:
+  sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
   explicit opaque_op(std::size_t columns)
     : sirius_physical_operator(
         sirius::op::SiriusPhysicalOperatorType::HASH_GROUP_BY, make_types(columns), 0)
@@ -684,7 +700,7 @@ TEST_CASE("an unknown dynamic-filter shape ends every column's ride",
           "[late_mat][lifetime][dynamic_filter]")
 {
   fake_scan scan(2);
-  sirius::op::sirius_physical_operator endpoint(
+  sirius::op::test_physical_operator endpoint(
     sirius::op::SiriusPhysicalOperatorType::DYNAMIC_FILTER, make_types(2), 0);
   scan.link(&endpoint);
   auto const lives = analyze_column_lifetimes(scan);

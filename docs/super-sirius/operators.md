@@ -34,6 +34,53 @@ An operator's position in a pipeline is determined by `sirius_engine::initialize
 
 See [Task Creator](task-creator.md) for per-operator overrides.
 
+## Output ordering
+
+Every concrete physical operator implements the pure virtual `output_order_preservation()`.
+This declaration describes its local effect on logical order, independently of its pipeline role:
+
+- `FIXED_ORDER`: establishes a global output sequence.
+- `NO_ORDER`: does not preserve a global input sequence.
+- `INSERTION_ORDER`: preserves the sequence supplied by its input; it does not establish one.
+
+`operator.output_order()` resolves this property over the physical plan subtree. Defining and
+order-destroying operators return their declaration directly. Preserving unary operators inherit
+their child's resolved order, even if they are pipeline sources. The traversal uses `get_children()`
+so collectors exposing a referenced plan participate. CTE nodes follow the consumer child, ignoring
+the materialization child. Other preserving multi-input shapes are rejected rather than combining
+unrelated sequences by child visitation order.
+
+An `INSERTION_ORDER` leaf retains that result: its input sequence is external to this tree.
+This is not proof that runtime batches carry positions. A planner must establish that external
+contract before choosing an ordered consumer; it must not silently treat this value as `NO_ORDER`.
+The analysis does not consult DuckDB's insertion-order setting or repository runtime state.
+
+Use this analysis after the child's GPU operator expansion. `ORDER_BY` and `TOP_N` execute local
+per-batch sorting; their expanded global result is established by `MERGE_SORT` and `MERGE_TOP_N`.
+The planner can query `limit.children[0]->output_order()` before choosing a LIMIT implementation
+and its pipeline boundary. The planner chooses `UNORDERED_STREAMING_LIMIT` only for a resolved `NO_ORDER`;
+`FIXED_ORDER` and unresolved `INSERTION_ORDER` retain `STREAMING_LIMIT` and its full barrier.
+
+| Operator | `output_order_preservation()` |
+|---|---|
+| MERGE_SORT, MERGE_TOP_N | `FIXED_ORDER` |
+| ORDER_BY (local sort), TOP_N (local top-N), SORT_SAMPLE, SORT_PARTITION | `NO_ORDER` |
+| PARTITION, CONCAT, UNION | `NO_ORDER` |
+| HASH_JOIN, NESTED_LOOP_JOIN, DENSE_COUNT_JOIN, LEFT_DELIM_JOIN, RIGHT_DELIM_JOIN | `NO_ORDER` |
+| HASH_GROUP_BY, UNGROUPED_AGGREGATE, MERGE_GROUP_BY, MERGE_AGGREGATE | `NO_ORDER` |
+| GPU_SCAN, UNORDERED_STREAMING_LIMIT | `NO_ORDER` |
+| PROJECTION, FILTER, DYNAMIC_FILTER, BUILD_FILTER, STREAMING_LIMIT | `INSERTION_ORDER` |
+| PASSTHROUGH_SINK, CTE, materialized RESULT_COLLECTOR | `INSERTION_ORDER` |
+| TABLE_SCAN, COLUMN_DATA_SCAN (including CTE_SCAN / DELIM_SCAN), GPU_VALUES | `INSERTION_ORDER` |
+| DUMMY_SCAN, EMPTY_RESULT | `INSERTION_ORDER` |
+| STREAMING_SOURCE, STREAMING_SINK (all routing modes) | `NO_ORDER` |
+
+Abstract intermediates (partition consumer, delim join, result collector) leave the declaration
+pure virtual so concrete implementations must choose. Test-only structural placeholders use an
+explicit `NO_ORDER` test double. A subclass of a concrete operator can inherit its declared
+behavior; C++ pure virtual methods enforce the decision at the first concrete implementation,
+not anew for every descendant. Override the declaration when a specialization changes ordering.
+
 ## Scan Operators
 
 These operators produce data for pipelines. See [Scan](scan.md) for in-depth coverage.
@@ -191,6 +238,7 @@ Applies a predicate expression to filter rows.
 
 - **GPU execution:** `expression_evaluator::select(batch)` — evaluates the boolean expression and compacts rows using cuDF filtering
 - **Key members:** `expression` (filter predicate)
+- **Batch ordering:** Tasks may execute in any order and forward the input batch position unchanged.
 
 ### `sirius_physical_projection` — `PROJECTION`
 **File:** `src/op/sirius_physical_projection.hpp`
@@ -204,15 +252,36 @@ Evaluates a list of expressions to produce output columns.
 
   Only the entries that need evaluation are passed to the expression evaluator (via its `std::vector<sirius::ast::node const*>` constructor). See [expression evaluator](expression-executor.md).
 - **Key members:** `select_list` (output expressions)
+- **Batch ordering:** Tasks may execute in any order and forward the input batch position unchanged.
+
+### `sirius_physical_unordered_streaming_limit` — `UNORDERED_STREAMING_LIMIT`
+**File:** `src/op/sirius_physical_limit.hpp`
+
+Used only when the expanded child's `output_order()` proves `NO_ORDER`. Runs inline without an
+extra pipeline boundary. Inside `execute()`, an RAII `claim_request` reserves offset/limit rows
+under a mutex using the row count after upstream filters. The mutex is released during GPU work.
+After constructing and synchronizing the output, execution approves the request. Exceptions
+before approval refund only that request's reserved offset and limit; retries make a fresh claim.
+No batch IDs or per-input claim history are needed. A retry may select different rows, which is
+valid for this unordered input.
+
+`is_limit_exhausted()` stops further task creation only when the limit is consumed, no claims
+remain pending, and at least one output has been approved. Both approval and rollback update
+this condition. The pipeline waits for all already-created tasks (including retries) before
+completing. The executor's post-return diagnostics do not perform retryable GPU allocations;
+changes to its retry boundary must preserve approval after all retryable work. LIMIT 0 permits an
+initial task to emit an empty batch for downstream aggregates. This does not cancel independent
+upstream pipelines or scan I/O. Outputs carry no positions.
 
 ### `sirius_physical_streaming_limit` — `STREAMING_LIMIT`
 **File:** `src/op/sirius_physical_limit.hpp`
 
-Implements LIMIT/OFFSET using atomic counters for parallel execution.
+Implements LIMIT/OFFSET with a FULL input barrier and serialized slice claims during task creation.
 
-- **Key members:** `_remaining_offset` (atomic), `_remaining_limit` (atomic), `_limit_exhausted` (atomic)
-- **Mechanism:** Each task atomically claims a portion of the remaining limit via `claim()`. When the limit is exhausted, the pipeline terminates early.
-- **Empty output:** A task whose input batches yield no rows emits one 0-row batch, like a scan of an empty table, so a downstream ungrouped aggregate still returns its row. DuckDB plans an uncorrelated `EXISTS` as a count over `LIMIT 1`.
+- **Key members:** `_remaining_offset` and `_remaining_limit` (`size_t` counters), guarded by `_claim_mutex`.
+- **Mechanism:** After the producer finishes, `get_next_task_input_data()` consumes ordered input by ascending existing position, or unordered input in FIFO order. It snapshots existing positions for ordered input, reads the batch row count with `get_batch_rows_and_bytes()`, and claims an immutable slice under `_claim_mutex`. Unknown row counts are errors. The resulting `limiting_operator_data` carries the slice and optional position; execution and retries apply that slice without claiming again.
+- **Completion:** Every input batch is consumed, including batches whose slice is empty after the limit is satisfied. Both ordered and unordered input wait for the complete producer output before LIMIT starts consuming it.
+- **Empty output:** Zero-row outputs retain their input position. A task whose input batches yield no rows emits one 0-row batch, like a scan of an empty table, so a downstream ungrouped aggregate still returns its row. DuckDB plans an uncorrelated `EXISTS` as a count over `LIMIT 1`.
 
 ## Blocking Operators
 
@@ -355,8 +424,7 @@ DISTINCT lowering's grouped aggregate over the union itself, keyed on every colu
 - **Arm pipelines are created in reverse child order.** The converter schedules child
   meta-pipelines last-created-first, so reversing makes arm 0 pipeline #0: the scan `start_query`
   seeds and the top execution priority. Drain order therefore matches execution order.
-- **`source_order()` is `NO_ORDER`.** `order_preservation_recursive` stops at the first `is_source()`
-  operator, so this answer decides the whole plan's.
+- **Output order:** `NO_ORDER`; independently ordered arms do not define a global union order.
 - **Arm ports are cached.** Both task-driver methods run on every task-creation walk that reaches
   the operator, so the `"union_{i}"` names are resolved to `port*` once on first use.
 - **Carriers.** The compressed-schema pass treats `UNION` as a native boundary, which prevents two
@@ -510,13 +578,16 @@ Boundary computation follows an explicit `BoundaryState` lifecycle: `NOT_DONE �
 
 Range-partitions data according to boundaries computed by SORT_SAMPLE. Links to the sample operator via `_sample_op`.
 
+Each range slice is published to its original repository partition, retaining indices even when
+intermediate ranges are empty. A FULL barrier separates SORT_PARTITION from MERGE_SORT.
+
 ### `sirius_physical_merge_sort` — `MERGE_SORT`
 **File:** `src/op/sirius_physical_merge_sort.hpp`
 
 Merges pre-sorted partitions using `gpu_merge_impl::merge_order_by()` (multi-way merge via cuDF).
 
-- Custom `get_next_task_input_data()`: drains all batches from one partition per call
-- Tracks `_current_partition_index` atomically under mutex
+- Custom `get_next_task_input_data()`: drains all batches from the next nonempty range partition per call after the SORT_PARTITION producer finishes. Empty ranges are skipped.
+- Tracks `_current_partition_index` under a mutex and uses the range index as the merged output batch position.
 
 ### `sirius_physical_grouped_aggregate_merge` — `MERGE_GROUP_BY`
 **File:** `src/op/sirius_physical_grouped_aggregate_merge.hpp`
@@ -533,7 +604,7 @@ Merges ungrouped aggregate results from multiple partitions.
 ### `sirius_physical_top_n_merge` — `MERGE_TOP_N`
 **File:** `src/op/sirius_physical_top_n_merge.hpp`
 
-Merges local top-N results from multiple partitions.
+Merges local top-N results from multiple partitions. The final output batch is assigned position zero.
 
 ## CTE / Delim Join Operators
 
@@ -568,6 +639,9 @@ and decisions belong to concrete consumers. Indexed batch publication is inherit
 
 Final sink that materializes query results into a `ColumnDataCollection`. The GPU executor checks for this operator type to determine query completion.
 
+The materialized collector builds local collections in parallel. For positioned input, it combines
+them by ascending position in `get_result()`, independently of task completion order.
+
 ### `sirius_physical_empty_result` — `EMPTY_RESULT`
 **File:** `src/op/sirius_physical_empty_result.hpp`
 
@@ -585,7 +659,8 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 | COLUMN_DATA_SCAN | Scan | Reads ColumnDataCollection |
 | FILTER | Relational | `expression_evaluator::select()` |
 | PROJECTION | Relational | `expression_evaluator::evaluate()` |
-| STREAMING_LIMIT | Relational | Atomic claim-based |
+| UNORDERED_STREAMING_LIMIT | Relational | Inline claims, retry-safe slices, early pipeline completion |
+| STREAMING_LIMIT | Relational | Serial slice claims after FULL input barrier |
 | ORDER_BY | Sort | `gpu_order_impl::local_order_by()` |
 | TOP_N | Sort | Order + limit |
 | SORT_SAMPLE | Sort | Sample + boundary computation |

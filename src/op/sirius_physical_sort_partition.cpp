@@ -62,7 +62,8 @@ std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(
     SIRIUS_LOG_DEBUG("Sort partition: passthrough ({} batches, {} partitions)",
                      input_batches.size(),
                      _sample_op ? _sample_op->get_num_partitions() : 1);
-    return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
+    return std::make_unique<sort_partition_output>(
+      input.get_data_batches(), std::vector<std::size_t>(input.get_data_batches().size(), 0));
   }
 
   auto start           = std::chrono::high_resolution_clock::now();
@@ -89,6 +90,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(
   }
 
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
+  std::vector<std::size_t> output_partitions;
 
   for (auto const& batch : input_batches) {
     auto* space = batch.get_memory_space();
@@ -145,6 +147,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(
       if (partition_views[i].num_rows() == 0) { continue; }
       auto partition_table =
         std::make_unique<cudf::table>(partition_views[i], stream, space->get_default_allocator());
+      output_partitions.push_back(i);
       output_batches.push_back(
         make_data_batch(std::move(partition_table), *space, stream, batch_telemetry()));
     }
@@ -159,7 +162,32 @@ std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(
     num_parts,
     duration.count() / 1000.0);
 
-  return std::make_unique<pipelineable_operator_data>(output_batches);
+  return std::make_unique<sort_partition_output>(std::move(output_batches),
+                                                 std::move(output_partitions));
+}
+
+void sirius_physical_sort_partition::sink(const operator_data& output, ::cuda::stream_ref)
+{
+  auto const& slices  = dynamic_cast<const sort_partition_output&>(output);
+  auto const& batches = slices.get_data_batches();
+  if (batches.size() != slices.partitions.size()) {
+    throw internal_exception("Sort partition output is missing range indices");
+  }
+  // Publish the full range count once before any slice becomes visible. Empty ranges retain
+  // their indices; merge-sort skips them after the FULL barrier.
+  std::call_once(_initialize_partitions, [&] {
+    auto count = _sample_op ? _sample_op->get_num_partitions() : std::size_t{1};
+    for (auto const& next : next_port_after_sink) {
+      auto* repo = next.next_operator->get_port(next.next_operator_port_name)->repo;
+      if (count > repo->num_partitions()) { repo->set_num_partitions(count); }
+    }
+  });
+  for (std::size_t i = 0; i < batches.size(); ++i) {
+    for (auto const& next : next_port_after_sink) {
+      next.next_operator->push_data_batch_partitioned(
+        next.next_operator_port_name, batches[i], slices.partitions[i]);
+    }
+  }
 }
 
 void sirius_physical_sort_partition::on_finalize_operator()

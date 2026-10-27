@@ -25,6 +25,7 @@
 
 #include "expression/aggregate_id.hpp"
 #include "expression/ast/aggregate.hpp"
+#include "utils/test_physical_operator.hpp"
 
 #include <duckdb/main/settings.hpp>
 // Reaching a join operator through these headers instantiates `vector<join_condition>`'s
@@ -861,7 +862,8 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     auto endpoints = collect(plan.get(), SiriusPhysicalOperatorType::DYNAMIC_FILTER);
     REQUIRE(endpoints.size() == 1);
     REQUIRE(endpoints.front()->children.size() == 1);
-    CHECK(endpoints.front()->children[0]->type == SiriusPhysicalOperatorType::STREAMING_LIMIT);
+    CHECK(endpoints.front()->children[0]->type ==
+          SiriusPhysicalOperatorType::UNORDERED_STREAMING_LIMIT);
 
     auto* scan = find_first(endpoints.front(), SiriusPhysicalOperatorType::GPU_SCAN);
     REQUIRE(scan != nullptr);
@@ -2073,7 +2075,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   {
     // The propagation delim case restores `distinct_root` in place, so the distinct chain never
     // carries a sidecar; the wrap must not invent one.
-    auto delim = duckdb::make_uniq<sirius::op::sirius_physical_delim_join>(
+    auto delim = duckdb::make_uniq<sirius::op::test_delim_join>(
       SiriusPhysicalOperatorType::LEFT_DELIM_JOIN,
       wrap_integer_types(1),
       make_projection_leaf(1),
@@ -2449,4 +2451,38 @@ TEST_CASE("plan tree shape - an explicit global delim_join_as_cte survives loadi
   DuckDB db(db_path.path().c_str(), &db_config);
   Connection con(db);
   CHECK(delim_join_as_cte(con));
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "limit has a full barrier before positional claims",
+                 "[plan_tree_shape][ordering][isolated_context]")
+{
+  auto plan = generate_sirius_plan(
+    *con, "SELECT * FROM big_left ORDER BY id LIMIT 7 OFFSET 2", {duckdb::OptimizerType::TOP_N});
+  auto* limit = find_first(plan.get(), SiriusPhysicalOperatorType::STREAMING_LIMIT);
+  REQUIRE(limit);
+  REQUIRE(limit->children.size() == 1);
+  auto* boundary = limit->children[0].get();
+  REQUIRE(boundary->type == SiriusPhysicalOperatorType::PASSTHROUGH_SINK);
+  REQUIRE(boundary->is_sink());
+  REQUIRE(limit->is_source());
+  REQUIRE(limit->input_barrier_for(*boundary) == sirius::op::MemoryBarrierType::FULL);
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "proven unordered limit stays inline after child expansion",
+                 "[plan_tree_shape][ordering][isolated_context]")
+{
+  for (auto const* sql : {"SELECT * FROM big_left LIMIT 7 OFFSET 2",
+                          "SELECT id + 1 FROM big_left WHERE id % 2 = 0 LIMIT 7",
+                          "SELECT id, count(*) FROM big_left GROUP BY id LIMIT 7"}) {
+    auto plan = generate_sirius_plan(*con, sql);
+    INFO(tree_to_string(plan.get()));
+    auto* limit = find_first(plan.get(), SiriusPhysicalOperatorType::UNORDERED_STREAMING_LIMIT);
+    REQUIRE(limit);
+    REQUIRE(limit->children.size() == 1);
+    CHECK_FALSE(limit->is_source());
+    CHECK(limit->children[0]->type != SiriusPhysicalOperatorType::PASSTHROUGH_SINK);
+    CHECK(limit->output_order() == sirius::OrderPreservationType::NO_ORDER);
+  }
 }

@@ -25,6 +25,7 @@
 #include "pipeline/task_request.hpp"
 #include "scan/test_utils.hpp"
 #include "utils/telemetry_utils.hpp"
+#include "utils/test_physical_operator.hpp"
 
 #include <absl/cleanup/cleanup.h>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
@@ -255,8 +256,7 @@ TEST_CASE("GPU cancellation preserves staged work until the manager restores rea
   REQUIRE(mem_space);
 
   // Supply a real query identity and a valid operator for task destruction callbacks.
-  sirius::op::sirius_physical_operator source(
-    sirius::op::SiriusPhysicalOperatorType::FILTER, {}, 0);
+  sirius::op::test_physical_operator source(sirius::op::SiriusPhysicalOperatorType::FILTER, {}, 0);
   auto pipe = std::make_shared<sirius::pipeline::sirius_pipeline>(
     sirius::pipeline::pipeline_build_context{sirius::test::make_test_telemetry_context()});
   sirius::pipeline::sirius_pipeline_build_state build_state;
@@ -468,7 +468,7 @@ TEST_CASE("GPU errors precede terminal task destruction even when logging throws
   REQUIRE(mem_space);
 
   // A real exhausted terminal pipeline: destroying its sole task attempts success publication.
-  sirius::op::sirius_physical_operator terminal(
+  sirius::op::test_physical_operator terminal(
     sirius::op::SiriusPhysicalOperatorType::RESULT_COLLECTOR, {}, 0);
   auto pipe = std::make_shared<sirius::pipeline::sirius_pipeline>(
     sirius::pipeline::pipeline_build_context{sirius::test::make_test_telemetry_context()});

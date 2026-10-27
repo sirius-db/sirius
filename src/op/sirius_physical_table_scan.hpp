@@ -67,6 +67,11 @@ enum compare_type {
 
 class sirius_physical_table_scan : public sirius_physical_operator {
  public:
+  [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::INSERTION_ORDER;
+  }
+
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::TABLE_SCAN;
 
  public:

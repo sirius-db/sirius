@@ -35,6 +35,11 @@ class dynamic_filter_publication_session;
  */
 class sirius_physical_build_filter final : public sirius_physical_operator {
  public:
+  [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::INSERTION_ORDER;
+  }
+
   static constexpr SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::BUILD_FILTER;
 
   sirius_physical_build_filter(duckdb::vector<sirius::logical_type> types,

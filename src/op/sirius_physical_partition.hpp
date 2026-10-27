@@ -33,6 +33,11 @@ namespace sirius::op {
 /// Consumers supply sizing/algorithm policy through a plan-bound partition_exchange.
 class sirius_physical_partition : public sirius_physical_operator {
  public:
+  [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
+
   static constexpr auto TYPE = SiriusPhysicalOperatorType::PARTITION;
   sirius_physical_partition(duckdb::vector<sirius::logical_type> types,
                             std::size_t estimated_cardinality,

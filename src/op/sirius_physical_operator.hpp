@@ -256,10 +256,14 @@ class pipelineable_operator_data : public operator_data {
     _data_batches = std::vector<std::shared_ptr<::cucascade::data_batch>>();
   }
   explicit pipelineable_operator_data(
-    std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches)
-    : _data_batches(std::move(data_batches))
+    std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches,
+    std::optional<std::size_t> position = std::nullopt)
+    : _data_batches(std::move(data_batches)), _position(position)
   {
   }
+
+  /// Logical destination position; may describe a multi-batch merge input.
+  [[nodiscard]] std::optional<std::size_t> get_position() const { return _position; }
 
   /**
    * @brief IDs of the non-null input batches in input order, as constructed.
@@ -378,6 +382,7 @@ class pipelineable_operator_data : public operator_data {
   [[nodiscard]] std::uint64_t original_batch_id_at(std::size_t position) const;
 
   std::vector<std::shared_ptr<::cucascade::data_batch>> _data_batches;
+  std::optional<std::size_t> _position;
   /// (position, original ID) of each batch that a row-preserving replacement swapped for a batch
   /// with another ID; usually empty.
   std::vector<std::pair<std::size_t, std::uint64_t>> _replaced_batch_ids;
@@ -424,8 +429,9 @@ class partitioned_operator_data : public pipelineable_operator_data {
   /// @throws std::invalid_argument if `partition_idx >= placement.num_partitions()`.
   partitioned_operator_data(std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches,
                             std::size_t partition_idx,
-                            partition_placement const& placement)
-    : pipelineable_operator_data(std::move(data_batches)), _partition_idx(partition_idx)
+                            partition_placement const& placement,
+                            std::optional<std::size_t> position = std::nullopt)
+    : pipelineable_operator_data(std::move(data_batches), position), _partition_idx(partition_idx)
   {
     if (partition_idx >= placement.num_partitions()) {
       throw std::invalid_argument("partitioned_operator_data: partition " +
@@ -441,8 +447,9 @@ class partitioned_operator_data : public pipelineable_operator_data {
   /// the GPU already holding the data. Used when a consumer produced a single partition, where no
   /// cross-task device agreement is required.
   explicit partitioned_operator_data(
-    std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches)
-    : pipelineable_operator_data(std::move(data_batches))
+    std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches,
+    std::optional<std::size_t> position = std::nullopt)
+    : pipelineable_operator_data(std::move(data_batches), position)
   {
   }
 
@@ -705,24 +712,21 @@ class sirius_physical_operator {
     return memory::saturating_mul(stats.bytes, 2);
   }
 
+  /// Local effect on logical row order: establish, discard, or preserve the input sequence.
+  /// Every concrete operator must make this decision explicitly; pipeline roles are irrelevant.
+  [[nodiscard]] virtual sirius::OrderPreservationType output_order_preservation() const = 0;
+
+  /// Resolve the output order of this plan subtree, following order-preserving operators.
+  /// INSERTION_ORDER at a leaf denotes an input sequence supplied outside this tree, not a
+  /// guarantee that batches have positions. This analysis does not consult session settings.
+  [[nodiscard]] sirius::OrderPreservationType output_order() const;
+
   virtual std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                                  ::cuda::stream_ref stream);
-
-  //! The influence the operator has on order (insertion order means no influence)
-  virtual sirius::OrderPreservationType operator_order() const
-  {
-    return sirius::OrderPreservationType::INSERTION_ORDER;
-  }
 
  public:
   // Source interface
   virtual bool is_source() const { return false; }
-
-  //! The type of order emitted by the operator (as a source)
-  virtual sirius::OrderPreservationType source_order() const
-  {
-    return sirius::OrderPreservationType::INSERTION_ORDER;
-  }
 
   // Data-size estimator hooks. nullopt means unavailable; see
   // docs/super-sirius/data-size-estimation.md.
@@ -770,10 +774,6 @@ class sirius_physical_operator {
             _parent_op->type == SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN ||
             _parent_op->type == SiriusPhysicalOperatorType::DENSE_COUNT_JOIN);
   }
-
-  //! Whether or not the sink operator depends on the order of the input chunks
-  //! If this is set to true, we cannot do things like caching intermediate vectors
-  virtual bool sink_order_dependent() const { return false; }
 
  public:
   // Pipeline construction
@@ -860,6 +860,10 @@ class sirius_physical_operator {
   virtual void push_data_batch_partitioned(std::string_view port_id,
                                            std::shared_ptr<cucascade::data_batch> batch,
                                            std::size_t partition_idx);
+
+  void push_data_batch_at_position(std::string_view port_id,
+                                   std::shared_ptr<::cucascade::data_batch> batch,
+                                   std::size_t position);
 
   /// Publish to destination zero after on_input_batch_pushed observes the batch.
   void push_data_batch(std::string_view port_id, std::shared_ptr<::cucascade::data_batch> batch);

@@ -24,6 +24,7 @@
 #include "op/sirius_physical_operator_type.hpp"
 #include "pipeline/completion_handler.hpp"
 #include "pipeline/sirius_pipeline.hpp"
+#include "utils/test_physical_operator.hpp"
 
 #include <catch.hpp>
 #include <duckdb.hpp>
@@ -64,9 +65,9 @@ std::shared_ptr<sirius_pipeline> make_finishable_pipeline(sirius_physical_operat
   return pipeline;
 }
 
-sirius_physical_operator make_sink(SiriusPhysicalOperatorType type)
+sirius::op::test_physical_operator make_sink(SiriusPhysicalOperatorType type)
 {
-  return sirius_physical_operator{type, duckdb::vector<sirius::logical_type>{}, 0};
+  return sirius::op::test_physical_operator{type, duckdb::vector<sirius::logical_type>{}, 0};
 }
 
 }  // namespace
@@ -173,4 +174,42 @@ TEST_CASE("A pipeline left over from a finished query cannot signal the next one
 
   REQUIRE_NOTHROW(pipeline->update_pipeline_status(false));
   REQUIRE(pipeline->is_pipeline_finished());
+}
+
+TEST_CASE("Exhausted LIMIT waits for in-flight tasks without draining its source",
+          "[pipeline][completion][unordered_limit_cpu]")
+{
+  class unfinished_source : public sirius::op::test_physical_operator {
+   public:
+    unfinished_source() : test_physical_operator(SiriusPhysicalOperatorType::GPU_SCAN, {}, 100) {}
+    bool all_ports_empty() override { return false; }
+  } source;
+  class inline_limit : public sirius::op::test_physical_operator {
+   public:
+    inline_limit()
+      : test_physical_operator(SiriusPhysicalOperatorType::UNORDERED_STREAMING_LIMIT, {}, 1)
+    {
+    }
+    bool is_limit_exhausted() const override { return exhausted; }
+    bool exhausted = false;
+  } limit;
+  auto sink     = make_sink(SiriusPhysicalOperatorType::RESULT_COLLECTOR);
+  auto pipeline = make_finishable_pipeline(sink);
+  sirius_pipeline_build_state state;
+  state.set_pipeline_source(*pipeline, source);
+  state.add_pipeline_operator(*pipeline, limit);
+  pipeline->mark_task_created();
+  pipeline->mark_task_created();
+  CHECK_FALSE(pipeline->is_limit_exhausted());
+  limit.exhausted = true;
+  CHECK(pipeline->is_limit_exhausted());
+  pipeline->update_pipeline_status(false);
+  CHECK_FALSE(pipeline->is_pipeline_finished());
+  pipeline->mark_task_completed();
+  pipeline->update_pipeline_status(false);
+  CHECK_FALSE(pipeline->is_pipeline_finished());
+  pipeline->mark_task_completed();
+  pipeline->update_pipeline_status(false);
+  CHECK(pipeline->is_pipeline_finished());
+  CHECK_FALSE(source.all_ports_empty());
 }

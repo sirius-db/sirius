@@ -86,6 +86,11 @@ class gpu_values_input : public operator_data {
  */
 class sirius_physical_gpu_values : public sirius_physical_operator {
  public:
+  [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::INSERTION_ORDER;
+  }
+
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::GPU_VALUES;
 
   /// Construct from a COLUMN_DATA_SCAN operator that owns a ColumnDataCollection.

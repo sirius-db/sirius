@@ -333,6 +333,7 @@ TEST_CASE("sirius_physical_materialized_collector sink converts GPU input",
 TEST_CASE("sirius_physical_materialized_collector sink supports concurrent append",
           "[operator][physical_result_collector][concurrent][shared_context]")
 {
+  bool const positioned           = GENERATE(false, true);
   constexpr int num_threads       = 4;
   constexpr size_t rows_per_batch = STANDARD_VECTOR_SIZE * 3 + 13;
   auto [db_owner, con]            = sirius::make_test_db_and_connection();
@@ -416,7 +417,9 @@ TEST_CASE("sirius_physical_materialized_collector sink supports concurrent appen
         std::this_thread::yield();
       }
       try {
-        collector.sink(pipelineable_operator_data({batches[static_cast<size_t>(thread_idx)]}),
+        collector.sink(pipelineable_operator_data(
+                         {batches[static_cast<size_t>(thread_idx)]},
+                         positioned ? std::optional<size_t>(2 + 3 * thread_idx) : std::nullopt),
                        cudf::get_default_stream());
       } catch (...) {
         exceptions[static_cast<size_t>(thread_idx)] = std::current_exception();
@@ -463,7 +466,9 @@ TEST_CASE("sirius_physical_materialized_collector sink supports concurrent appen
     }
   }
 
-  std::sort(actual_rows.begin(), actual_rows.end());
-  std::sort(expected_rows.begin(), expected_rows.end());
+  if (!positioned) {
+    std::sort(actual_rows.begin(), actual_rows.end());
+    std::sort(expected_rows.begin(), expected_rows.end());
+  }
   REQUIRE(actual_rows == expected_rows);
 }

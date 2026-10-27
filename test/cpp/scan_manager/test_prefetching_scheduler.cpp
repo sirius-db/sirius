@@ -37,6 +37,11 @@ namespace {
 
 /// Minimal concrete scan carrying only the operator id the scheduler keys on.
 struct test_scan : sirius::op::sirius_physical_operator {
+ public:
+  sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
   explicit test_scan(std::size_t id)
     : sirius::op::sirius_physical_operator(SiriusPhysicalOperatorType::GPU_SCAN, {}, 0)
   {

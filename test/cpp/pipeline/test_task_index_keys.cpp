@@ -31,6 +31,7 @@
 #include "pipeline/sirius_pipeline_task_states.hpp"
 #include "query_id.hpp"
 #include "utils/telemetry_utils.hpp"
+#include "utils/test_physical_operator.hpp"
 
 #include <limits>
 #include <memory>
@@ -55,7 +56,7 @@ struct task_fixture {
     sirius::query_id_t query_id, sirius::exec::queue_priority priority)
   {
     auto pipeline  = std::make_shared<sirius::pipeline::sirius_pipeline>(build_ctx);
-    auto& op       = *operators.emplace_back(std::make_unique<sirius::op::sirius_physical_operator>(
+    auto& op       = *operators.emplace_back(std::make_unique<sirius::op::test_physical_operator>(
       sirius::op::SiriusPhysicalOperatorType::FILTER,
       duckdb::vector<sirius::logical_type>{},
       /*estimated_cardinality=*/0));
@@ -87,7 +88,7 @@ struct task_fixture {
       std::move(global_state));
   }
 
-  sirius::pipeline::pipeline_build_context build_ctx{nullptr, true};
+  sirius::pipeline::pipeline_build_context build_ctx{nullptr};
   //! Outlive every pipeline/task built from this fixture.
   std::vector<std::unique_ptr<sirius::op::sirius_physical_operator>> operators;
 };

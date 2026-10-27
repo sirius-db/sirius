@@ -33,6 +33,11 @@ namespace op {
 //! The sirius_physical_column_data_scan scans a ColumnDataCollection
 class sirius_physical_column_data_scan : public sirius_physical_operator {
  public:
+  [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::INSERTION_ORDER;
+  }
+
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::INVALID;
 
  public:

@@ -100,7 +100,7 @@ struct query_context {
 query_context make_query(sirius::query_id_t query_id, std::string const& file)
 {
   query_context ctx;
-  const sirius::pipeline::pipeline_build_context build_ctx{nullptr, true};
+  const sirius::pipeline::pipeline_build_context build_ctx{nullptr};
   ctx.pipeline = std::make_shared<sirius::pipeline::sirius_pipeline>(build_ctx);
   ctx.pipeline->set_pipeline_id(1);
   ctx.pipeline->set_query_id(query_id);

@@ -190,7 +190,7 @@ TEST_CASE_METHOD(UnionFixture,
     "SELECT k, count(*) FROM (SELECT k FROM ua UNION ALL SELECT k FROM ub) t GROUP BY k");
   compare_gpu_vs_cpu("SELECT sum(k) FROM (SELECT k FROM ua UNION ALL SELECT k FROM ub) t");
 
-  // Ordering downstream, where UNION's NO_ORDER source_order() decides the plan's preservation.
+  // An explicit downstream ORDER BY establishes the union result's sequence.
   compare_gpu_vs_cpu_ordered(
     "SELECT k FROM (SELECT k FROM ua UNION ALL SELECT k FROM ub) t ORDER BY k NULLS LAST");
   compare_gpu_vs_cpu_ordered(

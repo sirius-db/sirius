@@ -33,6 +33,7 @@
 #include "op/sirius_physical_partition.hpp"
 #include "pipeline/pipeline_build_context.hpp"
 #include "pipeline/sirius_pipeline.hpp"
+#include "utils/test_physical_operator.hpp"
 
 #include <catch.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
@@ -782,7 +783,7 @@ nomination_fixture make_join(duckdb::JoinType join_type)
   f.logical_join->types = {duckdb::LogicalType::INTEGER, duckdb::LogicalType::INTEGER};
 
   auto make_child = [] {
-    return duckdb::make_uniq<sirius::op::sirius_physical_operator>(
+    return duckdb::make_uniq<sirius::op::test_physical_operator>(
       sirius::op::SiriusPhysicalOperatorType::PROJECTION,
       sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
       0);
@@ -861,7 +862,7 @@ TEST_CASE("BUILD_PROBE byte accounting - accumulation, dedup, and the build-fini
   // Without a build port the accessor cannot know the build side finished.
   CHECK_FALSE(j->consumed_primary_input_bytes().has_value());
 
-  sirius::pipeline::pipeline_build_context ctx{nullptr, true};
+  sirius::pipeline::pipeline_build_context ctx{nullptr};
   auto build_pipeline = std::make_shared<finishable_pipeline>(ctx);
   auto port           = std::make_unique<sirius::op::sirius_physical_operator::port>();
   port->src_pipeline  = build_pipeline;

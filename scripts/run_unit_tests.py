@@ -113,11 +113,16 @@ def visible_gpus() -> list[str]:
         ids = os.environ["CUDA_VISIBLE_DEVICES"].split(",")
     else:
         try:
-            ids = subprocess.run(
+            result = subprocess.run(
                 ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
                 capture_output=True,
                 text=True,
-            ).stdout.split()
+            )
+            # Driver failures can write diagnostics to stdout. Never interpret those
+            # words as device IDs and launch a pair of shards for each one.
+            if result.returncode != 0:
+                return []
+            ids = result.stdout.split()
         except OSError:
             ids = []
     return [i.strip() for i in ids if i.strip()]

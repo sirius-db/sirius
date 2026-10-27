@@ -22,6 +22,8 @@ enum class OrderByType { ASCENDING, DESCENDING };
 
 enum class AggregationType { SUM, MIN, MAX, COUNT, COUNT_STAR, AVERAGE, FIRST, COUNT_DISTINCT };
 
+// Local operator effect: preserve the input sequence, discard it, or establish a global one.
+// See sirius_physical_operator::output_order() for subtree resolution.
 enum class OrderPreservationType { INSERTION_ORDER, NO_ORDER, FIXED_ORDER };
 
 }  // namespace sirius
