@@ -1770,11 +1770,11 @@ TEST_CASE("cached fusion finds device-local replicas when a second GPU applies",
           "[dynamic_filter][multi_partition][fused_consumer][mgpu][multi_gpu]")
 {
   if (!sirius::test::has_gpus(2)) { return; }
-  // Replicas live in each GPU's own memory pool, which peer access does not cover. With replicas on
-  // both GPUs, a fused path that reads another GPU's replica faults with an illegal address; this
-  // is the only arm that catches a lookup on the source or root device (GPU 0). With every replica
-  // on GPU 1 alone, the source, root, and applying GPU are all GPU 1, so a GPU 0 lookup finds no
-  // replica and fusion declines.
+  // Replicas live in each GPU's own memory pool, and GPU 1 loses access to GPU 0's pool once
+  // replication completes. With replicas on both GPUs, a fused path that reads another GPU's
+  // replica then faults with an illegal address; this is the only arm that catches a lookup on the
+  // source or root device (GPU 0). With every replica on GPU 1 alone, the source, root, and
+  // applying GPU are all GPU 1, so a GPU 0 lookup finds no replica and fusion declines.
   bool const remote_only = GENERATE(false, true);
   CAPTURE(remote_only);
   int const home = remote_only ? 1 : 0;
@@ -1822,6 +1822,20 @@ TEST_CASE("cached fusion finds device-local replicas when a second GPU applies",
   REQUIRE(needles->is_available_on_device(1));
   REQUIRE(in_list->is_available_on_device(0) == !remote_only);
   REQUIRE(needles->is_available_on_device(0) == !remote_only);
+  // The memory manager grants every GPU access to every pool, under which a remote replica read
+  // would silently succeed. The fixture owns the pool, so the revocation ends with it.
+  {
+    auto const pool = fixture.allocator(0).pool_handle();
+    REQUIRE(pool != nullptr);
+    cudaMemLocation accessor{};
+    accessor.type = cudaMemLocationTypeDevice;
+    accessor.id   = 1;
+    cudaMemAccessDesc const revoke{.location = accessor, .flags = cudaMemAccessFlagsProtNone};
+    REQUIRE(cudaMemPoolSetAccess(pool, &revoke, 1) == cudaSuccess);
+    cudaMemAccessFlags flags{};
+    REQUIRE(cudaMemPoolGetAccess(&flags, pool, &accessor) == cudaSuccess);
+    REQUIRE(flags == cudaMemAccessFlagsProtNone);
+  }
 
   auto channel  = std::make_shared<op::sirius_dynamic_filter_set>();
   auto producer = channel->register_producer({0, 1, 2, 3});
