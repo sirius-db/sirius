@@ -30,6 +30,7 @@
 #include <data/convertible_data_batch.hpp>
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
+#include <event/downgraded_batch.hpp>
 
 #include <cstdint>
 #include <memory>
@@ -365,4 +366,125 @@ TEST_CASE("convertible_data_batch_provider get_bytes_in_space sums batch sizes",
   auto total = provider.get_bytes_in_space(e.gpu_space);
   REQUIRE(total == batch1_size + batch2_size);
   REQUIRE(provider.get_bytes_in_space(e.host_space) == 0);
+}
+
+TEST_CASE("convertible_data_batch records nothing unless recording is on",
+          "[convertible_data_batch]")
+{
+  auto& e = env();
+
+  auto batch = sirius::test::operator_utils::make_numeric_batch(
+    *e.gpu_space, std::vector<int32_t>{1, 2, 3}, cudf::type_id::INT32);
+
+  sirius::convertible_data_batch wrapper(batch);
+  auto result = wrapper.convert({e.host_space}, e.stream(), *e.mgr, true);
+
+  REQUIRE(result.has_value());
+  REQUIRE(batch_in_space(*batch, e.host_space));
+  REQUIRE(wrapper.converted_batches().empty());
+}
+
+TEST_CASE("convertible_data_batch records one entry per successful conversion",
+          "[convertible_data_batch]")
+{
+  auto& e = env();
+
+  auto batch = sirius::test::operator_utils::make_numeric_batch(
+    *e.gpu_space, std::vector<int32_t>{1, 2, 3, 4}, cudf::type_id::INT32);
+  auto const gpu_size = get_batch_size(*batch);
+
+  sirius::convertible_data_batch down(batch);
+  down.record_conversions(true);
+  auto const seq_before = sirius::g_conversion_seq.load();
+  REQUIRE(down.convert({e.host_space}, e.stream(), *e.mgr, true).has_value());
+
+  REQUIRE(down.converted_batches().size() == 1);
+  auto const& rec = down.converted_batches().front();
+  REQUIRE(rec.batch.lock() == batch);
+  REQUIRE(rec.batch_id == batch->get_batch_id());
+  // The record takes exactly one value from the process-wide counter.
+  REQUIRE(rec.conversion_seq == seq_before);
+  REQUIRE(sirius::g_conversion_seq.load() == seq_before + 1);
+  REQUIRE(rec.from == e.gpu_space->get_id());
+  REQUIRE(rec.to == e.host_space->get_id());
+  REQUIRE(rec.bytes == gpu_size);
+  REQUIRE(rec.source == sirius::event::downgrade_source::repository);
+  REQUIRE(rec.repository == 0);
+  REQUIRE(rec.partition == 0);
+  REQUIRE_FALSE(rec.task_priority.has_value());
+  REQUIRE_FALSE(rec.preferred_device.has_value());
+  REQUIRE_FALSE(rec.task_query_id.has_value());
+
+  SECTION("a later move of the same batch gets a larger sequence number")
+  {
+    auto const host_size = get_batch_size(*batch);
+    sirius::convertible_data_batch up(batch);
+    up.record_conversions(true);
+    REQUIRE(up.convert({e.gpu_space}, e.stream(), *e.mgr, true).has_value());
+
+    REQUIRE(up.converted_batches().size() == 1);
+    auto const& later = up.converted_batches().front();
+    REQUIRE(later.batch_id == rec.batch_id);
+    REQUIRE(later.conversion_seq > rec.conversion_seq);
+    REQUIRE(later.from == e.host_space->get_id());
+    REQUIRE(later.to == e.gpu_space->get_id());
+    REQUIRE(later.bytes == host_size);
+  }
+
+  SECTION("a conversion that does not happen records nothing")
+  {
+    // Already in the only target space.
+    REQUIRE_FALSE(down.convert({e.host_space}, e.stream(), *e.mgr, true).has_value());
+    REQUIRE(down.converted_batches().size() == 1);
+
+    // Exclusive lock unavailable to a non-blocking attempt.
+    auto exclusive_lock = batch->to_mutable();
+    sirius::convertible_data_batch blocked(batch);
+    blocked.record_conversions(true);
+    REQUIRE_FALSE(blocked.convert({e.gpu_space}, e.stream(), *e.mgr, false).has_value());
+    REQUIRE(blocked.converted_batches().empty());
+    {
+      auto discard = std::move(exclusive_lock);
+    }
+
+    // No target space to convert into.
+    sirius::convertible_data_batch no_target(batch);
+    no_target.record_conversions(true);
+    auto const seq_now = sirius::g_conversion_seq.load();
+    REQUIRE_FALSE(no_target.convert({}, e.stream(), *e.mgr, true).has_value());
+    REQUIRE(no_target.converted_batches().empty());
+    REQUIRE(sirius::g_conversion_seq.load() == seq_now);
+  }
+}
+
+TEST_CASE("convertible_data_batch_provider records the batch's repository and partition",
+          "[convertible_data_batch]")
+{
+  auto& e = env();
+
+  cucascade::shared_data_repository repo;
+
+  auto batch_p0 = sirius::test::operator_utils::make_numeric_batch(
+    *e.gpu_space, std::vector<int32_t>{1, 2}, cudf::type_id::INT32);
+  auto batch_p1 = sirius::test::operator_utils::make_numeric_batch(
+    *e.gpu_space, std::vector<int32_t>{3, 4, 5}, cudf::type_id::INT32);
+
+  repo.add_data_batch(batch_p0, 0);
+  repo.add_data_batch(batch_p1, 1);
+
+  sirius::convertible_data_batch_provider provider(&repo);
+  // Back-to-front: partition 1 is found first.
+  auto cd = provider.get_next_convertible(e.gpu_space, false);
+  REQUIRE(cd != nullptr);
+  REQUIRE(cd->converted_batches().empty());
+
+  cd->record_conversions(true);
+  REQUIRE(cd->convert({e.host_space}, e.stream(), *e.mgr, true).has_value());
+
+  REQUIRE(cd->converted_batches().size() == 1);
+  auto const& rec = cd->converted_batches().front();
+  REQUIRE(rec.batch_id == batch_p1->get_batch_id());
+  REQUIRE(rec.repository == reinterpret_cast<std::uintptr_t>(&repo));
+  REQUIRE(rec.partition == 1);
+  REQUIRE(rec.source == sirius::event::downgrade_source::repository);
 }
