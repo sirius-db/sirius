@@ -236,6 +236,26 @@ class selective_subscriber : public query_event_subscriber {
     record(event_type::compressed_materialization, "compressed_materialization");
   }
 
+  void on_batch_downgraded(event_id_t,
+                           timestamp_t,
+                           query_id_t,
+                           downgraded_batch const&) noexcept override
+  {
+    record(event_type::batch_downgraded, "batch_downgraded");
+  }
+
+  void on_task_completed(
+    event_id_t, timestamp_t, query_id_t, std::size_t, int, task_outcome) noexcept override
+  {
+    record(event_type::task_completed, "task_completed");
+  }
+
+  void on_memory_wait_ended_for_task(
+    event_id_t, timestamp_t, query_id_t, std::size_t, int, std::size_t) noexcept override
+  {
+    record(event_type::memory_wait_ended_for_task, "memory_wait_ended_for_task");
+  }
+
   [[nodiscard]] std::vector<std::string> seen() const
   {
     std::lock_guard g{_mtx};
@@ -285,6 +305,9 @@ void publish_one_of_each(query_event_publisher& publisher)
   publisher.publish_wait_for_memory_for_task(make_query_id(1), 2, 0, 4096);
   publisher.publish_compressed_materialization(
     compressed_materialization_activity::pin_columns_narrowed, 3);
+  publisher.publish_batch_downgraded(make_query_id(1), downgraded_batch{});
+  publisher.publish_task_completed(make_query_id(1), 2, 0, task_outcome::succeeded);
+  publisher.publish_memory_wait_ended_for_task(make_query_id(1), 2, 0, 4096);
 }
 
 constexpr auto some_op_type                     = op::SiriusPhysicalOperatorType::GPU_SCAN;
@@ -376,6 +399,232 @@ TEST_CASE("a started subscriber receives every event in publication order",
   CHECK(subscriber.seen() ==
         std::vector<std::string>{
           "created:7:3", "deployed:3:1", "empty", "awaiting:2", "wait:3:1:4096"});
+}
+
+namespace {
+
+/// Keeps the arguments of the three preload-facing events exactly as they were
+/// delivered, plus whether each downgraded batch was still alive at delivery.
+class payload_subscriber : public query_event_subscriber {
+ public:
+  struct downgraded {
+    query_id_t query_id;
+    downgraded_batch batch;
+    bool live_at_delivery;
+  };
+  struct completed {
+    query_id_t query_id;
+    std::size_t operator_id;
+    int gpu_id;
+    task_outcome outcome;
+  };
+  struct wait_ended {
+    query_id_t query_id;
+    std::size_t operator_id;
+    int gpu_id;
+    std::size_t granted_bytes;
+  };
+
+  explicit payload_subscriber(query_event_publisher& publisher)
+    : query_event_subscriber(publisher,
+                             {event_type::batch_downgraded,
+                              event_type::task_completed,
+                              event_type::memory_wait_ended_for_task},
+                             /*drain_on_stop=*/true)
+  {
+  }
+
+  ~payload_subscriber() override { stop(); }
+
+  [[nodiscard]] std::string_view name() const noexcept override { return "payload"; }
+
+  void on_batch_downgraded(event_id_t,
+                           timestamp_t,
+                           query_id_t query_id,
+                           downgraded_batch const& batch) noexcept override
+  {
+    // lock(), not expired(): a subscriber that acts on the batch has to take a
+    // strong reference, and that is what must fail once the batch is gone.
+    // The count rather than the pointer, since the stand-in batches are null.
+    bool const live = batch.batch.lock().use_count() > 0;
+    std::lock_guard g{_mtx};
+    _downgraded.push_back({query_id, batch, live});
+  }
+
+  void on_task_completed(event_id_t,
+                         timestamp_t,
+                         query_id_t query_id,
+                         std::size_t operator_id,
+                         int gpu_id,
+                         task_outcome outcome) noexcept override
+  {
+    std::lock_guard g{_mtx};
+    _completed.push_back({query_id, operator_id, gpu_id, outcome});
+  }
+
+  void on_memory_wait_ended_for_task(event_id_t,
+                                     timestamp_t,
+                                     query_id_t query_id,
+                                     std::size_t operator_id,
+                                     int gpu_id,
+                                     std::size_t granted_bytes) noexcept override
+  {
+    std::lock_guard g{_mtx};
+    _wait_ended.push_back({query_id, operator_id, gpu_id, granted_bytes});
+  }
+
+  [[nodiscard]] std::vector<downgraded> downgraded_batches() const
+  {
+    std::lock_guard g{_mtx};
+    return _downgraded;
+  }
+  [[nodiscard]] std::vector<completed> completions() const
+  {
+    std::lock_guard g{_mtx};
+    return _completed;
+  }
+  [[nodiscard]] std::vector<wait_ended> waits_ended() const
+  {
+    std::lock_guard g{_mtx};
+    return _wait_ended;
+  }
+
+ private:
+  mutable std::mutex _mtx;
+  std::vector<downgraded> _downgraded;
+  std::vector<completed> _completed;
+  std::vector<wait_ended> _wait_ended;
+};
+
+/// Same control block, whatever the stored pointer: what identifies a batch
+/// across a weak reference.
+template <typename A, typename B>
+bool same_owner(A const& a, B const& b)
+{
+  return !a.owner_before(b) && !b.owner_before(a);
+}
+
+}  // namespace
+
+TEST_CASE("preload events deliver their payloads unchanged", "[event][query_event_publisher]")
+{
+  using cucascade::memory::memory_space_id;
+  using cucascade::memory::Tier;
+
+  auto publisher = std::make_shared<query_event_publisher>();
+  payload_subscriber subscriber{*publisher};
+
+  // The payload only names the batch, so a test needs a control block, not a
+  // batch: an aliasing pointer onto an unrelated owner stands in for one. Its
+  // stored pointer is null even while alive, so liveness is read from the
+  // owner count and identity from the owner, never from the pointer itself.
+  auto kept_owner = std::make_shared<int>(0);
+  std::shared_ptr<cucascade::data_batch> const kept{kept_owner, nullptr};
+  auto dropped_owner = std::make_shared<int>(0);
+  std::shared_ptr<cucascade::data_batch> dropped{dropped_owner, nullptr};
+  std::weak_ptr<cucascade::data_batch> const dropped_ref = dropped;
+
+  downgraded_batch from_repository{};
+  from_repository.batch          = kept;
+  from_repository.batch_id       = 41;
+  from_repository.conversion_seq = 7;
+  from_repository.from           = memory_space_id{Tier::GPU, 1};
+  from_repository.to             = memory_space_id{Tier::HOST, 0};
+  from_repository.bytes          = 1 << 20;
+  from_repository.source         = downgrade_source::repository;
+  from_repository.repository     = 0xABCD;
+  from_repository.partition      = 3;
+
+  downgraded_batch from_task_queue{};
+  from_task_queue.batch            = dropped;
+  from_task_queue.batch_id         = 42;
+  from_task_queue.conversion_seq   = 8;
+  from_task_queue.from             = memory_space_id{Tier::HOST, 0};
+  from_task_queue.to               = memory_space_id{Tier::DISK, 0};
+  from_task_queue.bytes            = 4096;
+  from_task_queue.source           = downgrade_source::task_queue;
+  from_task_queue.task_priority    = exec::queue_priority{(std::int64_t{9} << 32) | 5};
+  from_task_queue.preferred_device = 1;
+  from_task_queue.task_query_id    = make_query_id(9);
+
+  // Published while the worker is off, so both events sit in the mailbox while
+  // the second batch dies: the mailbox must not be what keeps it alive.
+  publisher->publish_batch_downgraded(make_query_id(5), from_repository);
+  publisher->publish_batch_downgraded(make_query_id(9), from_task_queue);
+  publisher->publish_task_completed(make_query_id(5), 11, 1, task_outcome::succeeded);
+  publisher->publish_task_completed(make_query_id(5), 12, 0, task_outcome::rescheduled);
+  publisher->publish_task_completed(make_query_id(6), 13, -1, task_outcome::oom_rescheduled);
+  publisher->publish_memory_wait_ended_for_task(make_query_id(5), 11, 1, 0);
+  publisher->publish_memory_wait_ended_for_task(make_query_id(6), 14, 0, 8192);
+
+  from_task_queue.batch.reset();
+  dropped.reset();
+  dropped_owner.reset();
+  CHECK(dropped_ref.expired());
+  CHECK(kept_owner.use_count() == 2);  // kept_owner and kept; no copy lives in the mailbox
+
+  subscriber.start();
+  subscriber.stop();  // drains the mailbox before joining
+
+  auto const downgraded = subscriber.downgraded_batches();
+  REQUIRE(downgraded.size() == 2);
+
+  auto const& first = downgraded[0];
+  CHECK(first.query_id == make_query_id(5));
+  CHECK(first.live_at_delivery);
+  CHECK(same_owner(first.batch.batch, kept));
+  CHECK(first.batch.batch_id == 41);
+  CHECK(first.batch.conversion_seq == 7);
+  CHECK(first.batch.from == memory_space_id{Tier::GPU, 1});
+  CHECK(first.batch.to == memory_space_id{Tier::HOST, 0});
+  CHECK(first.batch.bytes == (1U << 20));
+  CHECK(first.batch.source == downgrade_source::repository);
+  CHECK(first.batch.repository == 0xABCD);
+  CHECK(first.batch.partition == 3);
+  CHECK_FALSE(first.batch.task_priority.has_value());
+  CHECK_FALSE(first.batch.preferred_device.has_value());
+  CHECK_FALSE(first.batch.task_query_id.has_value());
+
+  auto const& second = downgraded[1];
+  CHECK(second.query_id == make_query_id(9));
+  CHECK_FALSE(second.live_at_delivery);
+  CHECK(second.batch.batch.expired());
+  CHECK(second.batch.batch_id == 42);
+  CHECK(second.batch.conversion_seq == 8);
+  CHECK(second.batch.from == memory_space_id{Tier::HOST, 0});
+  CHECK(second.batch.to == memory_space_id{Tier::DISK, 0});
+  CHECK(second.batch.bytes == 4096);
+  CHECK(second.batch.source == downgrade_source::task_queue);
+  CHECK(second.batch.task_priority == exec::queue_priority{(std::int64_t{9} << 32) | 5});
+  CHECK(second.batch.preferred_device == 1);
+  CHECK(second.batch.task_query_id == make_query_id(9));
+
+  auto const completions = subscriber.completions();
+  REQUIRE(completions.size() == 3);
+  CHECK(completions[0].query_id == make_query_id(5));
+  CHECK(completions[0].operator_id == 11);
+  CHECK(completions[0].gpu_id == 1);
+  CHECK(completions[0].outcome == task_outcome::succeeded);
+  CHECK(completions[1].operator_id == 12);
+  CHECK(completions[1].gpu_id == 0);
+  CHECK(completions[1].outcome == task_outcome::rescheduled);
+  CHECK(completions[2].query_id == make_query_id(6));
+  CHECK(completions[2].gpu_id == -1);
+  CHECK(completions[2].outcome == task_outcome::oom_rescheduled);
+
+  auto const waits = subscriber.waits_ended();
+  REQUIRE(waits.size() == 2);
+  CHECK(waits[0].query_id == make_query_id(5));
+  CHECK(waits[0].operator_id == 11);
+  CHECK(waits[0].gpu_id == 1);
+  CHECK(waits[0].granted_bytes == 0);
+  CHECK(waits[1].query_id == make_query_id(6));
+  CHECK(waits[1].operator_id == 14);
+  CHECK(waits[1].gpu_id == 0);
+  CHECK(waits[1].granted_bytes == 8192);
+
+  // The delivered payloads are the only references left; they are weak.
+  CHECK(kept_owner.use_count() == 2);
 }
 
 TEST_CASE("every registered subscriber gets its own copy of an event",
@@ -804,7 +1053,10 @@ TEST_CASE("an unsubscribed event is never delivered", "[event][query_event_publi
                                 event_type::executor_awaiting_task,
                                 event_type::memory_downgrade_for_task,
                                 event_type::wait_for_memory_for_task,
-                                event_type::compressed_materialization}};
+                                event_type::compressed_materialization,
+                                event_type::batch_downgraded,
+                                event_type::task_completed,
+                                event_type::memory_wait_ended_for_task}};
   subscriber.start();
   witness.start();
 
@@ -850,7 +1102,10 @@ TEST_CASE("each event reaches exactly its own subscriber", "[event][query_event_
                                        "executor_awaiting_task",
                                        "memory_downgrade_for_task",
                                        "wait_for_memory_for_task",
-                                       "compressed_materialization"};
+                                       "compressed_materialization",
+                                       "batch_downgraded",
+                                       "task_completed",
+                                       "memory_wait_ended_for_task"};
   for (std::size_t i = 0; i < n_query_events; ++i) {
     subscribers.push_back(std::make_unique<selective_subscriber>(
       *publisher, std::initializer_list<event_type>{static_cast<event_type>(i)}));

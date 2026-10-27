@@ -83,10 +83,9 @@ struct stream_lineage_fixture {
 
   ~stream_lineage_fixture()
   {
-    if (manager) {
-      manager->shutdown();
-      sirius::converter_registry::shutdown();
-    }
+    // The converter registry is process-global and stateless; leave it initialized for the test
+    // cases that cache a memory manager across cases.
+    if (manager) { manager->shutdown(); }
   }
 };
 

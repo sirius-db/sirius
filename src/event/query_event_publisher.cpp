@@ -167,4 +167,26 @@ void query_event_publisher::publish_compressed_materialization(
   publish<compressed_materialization_event>(activity, count);
 }
 
+void query_event_publisher::publish_batch_downgraded(query_id_t query_id,
+                                                     downgraded_batch const& batch) noexcept
+{
+  publish<batch_downgraded_event>(query_id, batch);
+}
+
+void query_event_publisher::publish_task_completed(query_id_t query_id,
+                                                   std::size_t operator_id,
+                                                   int gpu_id,
+                                                   task_outcome outcome) noexcept
+{
+  publish<task_completed_event>(query_id, operator_id, gpu_id, outcome);
+}
+
+void query_event_publisher::publish_memory_wait_ended_for_task(query_id_t query_id,
+                                                               std::size_t operator_id,
+                                                               int gpu_id,
+                                                               std::size_t granted_bytes) noexcept
+{
+  publish<memory_wait_ended_for_task_event>(query_id, operator_id, gpu_id, granted_bytes);
+}
+
 }  // namespace sirius::event
