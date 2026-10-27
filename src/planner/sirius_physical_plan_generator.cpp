@@ -1501,13 +1501,15 @@ bool join_concat_all(sirius::op::sirius_physical_operator const& join, bool is_b
   switch (hash_join.join_type) {
     case duckdb::JoinType::LEFT:
     case duckdb::JoinType::SEMI:
-    case duckdb::JoinType::ANTI: return is_build;
+    case duckdb::JoinType::ANTI:
+    // Every probe row must see its partition's whole build to get one mark; MARK may run
+    // hash-partitioned STANDARD, like SEMI.
+    case duckdb::JoinType::MARK: return is_build;
     case duckdb::JoinType::RIGHT:
     case duckdb::JoinType::RIGHT_SEMI:
     case duckdb::JoinType::RIGHT_ANTI: return !is_build;
     case duckdb::JoinType::OUTER: return true;
-    case duckdb::JoinType::INNER:
-    case duckdb::JoinType::MARK: return false;
+    case duckdb::JoinType::INNER: return false;
     default:
       throw duckdb::NotImplementedException("sirius_physical_hash_join: unsupported join type: " +
                                             duckdb::JoinTypeToString(hash_join.join_type));
