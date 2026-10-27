@@ -1165,9 +1165,10 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
   scan_manager_->set_query_event_publisher(*query_event_publisher_);
 
   // Wire the pipeline task queue into downgrade executors now that task_scheduler_
-  // has been constructed.
+  // has been constructed, and let them report the batches they move.
   for (auto& executor : downgrade_executors_) {
     executor->set_pipeline_task_queue(task_scheduler_->get_pipeline_task_queue());
+    executor->set_query_event_publisher(*query_event_publisher_);
   }
 
   // Start everything -- downgrade executors deferred until now
