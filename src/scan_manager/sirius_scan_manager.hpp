@@ -31,18 +31,16 @@
 #include "pipeline/completion_handler.hpp"
 #include "scan_manager/config.hpp"
 #include "scan_manager/duckdb_mvcc_metadata.hpp"
+#include "scan_manager/host_pin_placement.hpp"
 #include "scan_manager/insert_delta_job.hpp"
 #include "scan_manager/load_balancing_scan_batch_coalescer.hpp"
 #include "scan_manager/memory_prefetcher.hpp"
 #include "scan_manager/mvcc_mask_cache.hpp"
 #include "scan_manager/mvcc_mask_job.hpp"
 #include "scan_manager/pinned_chunk_stats.hpp"
+#include "scan_manager/preparation_coordinator.hpp"
 #include "scan_manager/readahead_scan_manager.hpp"
 #include "scan_manager/split_provider.hpp"
-
-namespace sirius::op {
-class sirius_dynamic_filter_set;  // membership pushdown channel (op/sirius_dynamic_filter.hpp)
-}
 
 #include <cudf/column/column.hpp>
 #include <cudf/table/table.hpp>
@@ -56,6 +54,7 @@ class sirius_dynamic_filter_set;  // membership pushdown channel (op/sirius_dyna
 #include <duckdb/storage/statistics/base_statistics.hpp>
 #include <duckdb/storage/storage_lock.hpp>
 #include <io/types.hpp>
+#include <op/scan/dynamic_filter_merge.hpp>
 
 namespace cucascade::memory {
 class fixed_size_host_memory_resource;
@@ -104,6 +103,7 @@ struct physical_check_counters;
 }  // namespace sirius::op::scan
 
 namespace sirius::scan_manager {
+class preparation_ledger;
 class load_balancing_scan_batch_coalescer;
 }  // namespace sirius::scan_manager
 
@@ -184,6 +184,13 @@ class cache_entry_info {
   [[nodiscard]] const std::vector<std::string>& column_names() const { return names; }
 };
 
+/// Facts are constructed with the data and published in the same registry transaction.
+struct pinned_entry_metadata {
+  std::optional<duckdb_mvcc_metadata> mvcc;
+  // Proofs describe incoming data. Merges apply them only to columns actually stored.
+  std::vector<std::string> proven_unique_columns;
+};
+
 /**
  * @brief A single pinned-table entry, keyed by table name in the scan_manager.
  *
@@ -248,8 +255,9 @@ struct pinned_entry {
   /// Tier the pinned data resides in. Drives which storage member above is used
   /// and which fetch path the cached provider takes.
   cucascade::memory::Tier tier{cucascade::memory::Tier::GPU};
-  /// Representative memory space of a HOST-tier entry; the MVCC path expands
-  /// it into a per-chunk vector. GPU-tier entries leave it null.
+  /// Representative memory space of a HOST-tier or device-chunked GPU entry,
+  /// including zero-chunk entries. The HOST MVCC path expands it per chunk.
+  /// Column-major GPU entries leave it null and use chunk_memory_spaces instead.
   cucascade::memory::memory_space* memory_space{nullptr};
   /// Total rows across pinned chunks. Re-insertion merges only when this and the
   /// cache identity match.
@@ -264,7 +272,7 @@ struct pinned_entry {
   /// pin time (see @c late_mat::unique_probe). A false — or an empty vector —
   /// means UNKNOWN, never "known duplicated": the fact only ever unlocks an
   /// optimization, so absence must cost speed, not correctness. Attached by
-  /// @ref attach_proven_unique_columns after insert, BY NAME, because the merge
+  /// insertion metadata, BY NAME, because the merge
   /// path appends columns and a positional attach would then describe the wrong
   /// ones.
   std::vector<bool> proven_unique_columns;
@@ -274,7 +282,7 @@ struct pinned_entry {
   /// gate is on.
   std::shared_ptr<late_mat::pin_entry_handle> late_mat_handle;
   /// MVCC snapshot metadata for duckdb-native pins, attached by
-  /// @ref sirius_scan_manager::attach_mvcc_metadata right after insert. nullptr
+  /// insertion metadata before publication. nullptr
   /// for parquet pins (immutable sources need no visibility reconciliation).
   std::unique_ptr<duckdb_mvcc_metadata> mvcc;
   /// Version-keyed cache of the last keep-mask set: a query at an unchanged table version
@@ -418,10 +426,10 @@ struct cached_scan_plan {
 /// may drop rows against the ranges while decoding, handing back an
 /// already-filtered batch. See @c sirius::pushdown_request; an empty request
 /// (the default) leaves every chunk decoding unfiltered.
-/// @p dynamic_filters is the operator's dynamic-filter channel (join builds
-/// publish into it mid-scan); the provider snapshots it PER BATCH onto the
-/// attached scan, so later batches legitimately see more filters. Null (the
-/// default) disables it.
+/// @p consumer is shared with the scan and its immediate dynamic-filter endpoint.
+/// It selects memberships for each compressed chunk through its decode bindings;
+/// an empty map attaches none. Each returned batch carries its own attachment history.
+///
 /// The attaches compose with @p mvcc_masks PER CHUNK: a masked slot also gets the mask
 /// itself (set_visibility_mask), so the decode compacts to visible survivors; a default
 /// slot gets the pushdown alone.
@@ -435,12 +443,12 @@ std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
   std::span<std::size_t const> selected_columns,
   cached_scan_plan plan,
   const telemetry::batch_telemetry_info& telemetry_info,
-  mvcc_chunk_mask_set mvcc_masks                                         = {},
-  std::vector<insert_delta_split> delta_splits                           = {},
-  std::vector<cudf::data_type> normalization_targets                     = {},
-  bool has_physical_overrides                                            = false,
-  sirius::pushdown_request pushdown_req                                  = {},
-  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> dynamic_filters = nullptr);
+  mvcc_chunk_mask_set mvcc_masks                              = {},
+  std::vector<insert_delta_split> delta_splits                = {},
+  std::vector<cudf::data_type> normalization_targets          = {},
+  bool has_physical_overrides                                 = false,
+  sirius::pushdown_request pushdown_req                       = {},
+  std::shared_ptr<op::scan::dynamic_filter_consumer> consumer = nullptr);
 
 /**
  * @brief Build the survivor plan for serving @p entry to a scan into @p requiested_column_ids with
@@ -466,24 +474,6 @@ struct parquet_bind_result {
   std::size_t total_num_rows{0};
 };
 
-/// Number of concurrent queries the scan manager sizes its thread pool for.
-///
-/// Each query's coalescer runs exactly ONE sequencer task that BLOCKS in
-/// queue.wait_dequeue, and is unblocked only by that query's own split_provider tasks
-/// running on the same pool. So every concurrent query needs a parked thread on top of the
-/// working budget. With Q concurrent queries and a pool of size P, Q >= P is a hard
-/// deadlock: every thread parked in a sequencer, none left to feed them.
-///
-/// Left at 1 so the pool stays exactly the size it was before per-query state landed
-/// (num_threads + 1, the old single-sequencer allowance) — this makes the concurrency
-/// refactor behaviorally neutral for existing single-query runs.
-///
-/// TODO: promote to a real option on @ref scan_manager_config (scan_manager/config.hpp),
-/// parsed alongside thread_pool.num_threads in sirius_config.cpp's from_yaml, and RAISE IT
-/// before enabling more than a couple of concurrent queries. Nothing else should read this
-/// constant once it moves.
-inline constexpr int k_max_concurrent_queries = 1;
-
 /**
  * @brief Manages scan-side preparation for a query.
  *
@@ -504,7 +494,8 @@ class sirius_scan_manager {
    * @param topology_index Hardware GPU/NUMA topology index.  Drives round-robin
    *        GPU assignment for scans and is forwarded to the prefetching cache.
    */
-  sirius_scan_manager(const scan_manager_config& config,
+  sirius_scan_manager(sirius::exec::query_lifecycle_registry& lifecycle,
+                      const scan_manager_config& config,
                       cucascade::memory::memory_reservation_manager& reservation_manager,
                       std::shared_ptr<const sirius::memory::topology_index> topology_index,
                       std::shared_ptr<op::scan::physical_check_counters> physical_counters = {});
@@ -529,9 +520,9 @@ class sirius_scan_manager {
   /// Walks @p query 's pipelines in scan-operator order. For each GPU parquet
   /// scan source, the factory builds a split_provider from the operator's
   /// scan_info, installs a fresh split_connector on the operator, and stores
-  /// the provider in a map keyed by the operator. A driver thread then runs
-  /// the providers SEQUENTIALLY in registration order: provider[0] starts,
-  /// when its future completes provider[1] starts, and so on. Consumers (the
+  /// the provider in the per-query state. Preparation is armed here; after GPU
+  /// consumers start, execute runs it on the same query owner. Cached providers
+  /// continue to run on the existing worker executor. Consumers (the
   /// gpu scan operators) block in split_connector::get_next_split until splits
   /// arrive or the connector is closed, so no separate wake-up channel is
   /// needed.
@@ -553,11 +544,20 @@ class sirius_scan_manager {
   void prepare_for_query(const sirius::planner::query& query,
                          bool enable_pinned_zone_map_pruning,
                          const std::vector<int>& allocated_gpu_ids,
-                         std::shared_ptr<pipeline::completion_handler> completion = nullptr);
+                         std::shared_ptr<pipeline::completion_handler> completion = nullptr,
+                         std::function<bool()> interrupted                        = {});
+  // Called by execute after task_scheduler starts the GPU consumers.
+  void run_preparation_on_query_thread(sirius::query_id_t);
+  void close_preparation(sirius::query_id_t, stop_reason) noexcept;
   void release_footer_hold_for_testing(uint64_t file_number)
   {
     if (auto completion = _execution_completion.load())
       completion->release_footer_for_testing(file_number);
+  }
+  bool wait_for_preparation_error_for_testing(std::chrono::milliseconds timeout)
+  {
+    auto completion = _execution_completion.load();
+    return completion && completion->wait_for_error_for_testing(timeout);
   }
   bool wait_for_publication_for_testing(std::chrono::milliseconds timeout)
   {
@@ -570,6 +570,9 @@ class sirius_scan_manager {
   ///
   /// Blocking — waits out this query's in-flight reads. The wait happens OUTSIDE the state
   /// mutex, so another connection's prepare_for_query is never parked behind it.
+  // Stop producers while retaining providers/buffers until downstream retirement.
+  void quiesce(sirius::query_id_t query_id);
+  void finish_preparation(sirius::query_id_t query_id) noexcept;
   void reset(sirius::query_id_t query_id);
 
   /// Drain and drop this query's scan work while retaining checkpoint protection.
@@ -582,6 +585,9 @@ class sirius_scan_manager {
 
   /// \brief Number of registered queries that have GPU scan work. Observability and tests.
   [[nodiscard]] std::size_t num_active_queries() const noexcept;
+
+  /// Host-pin placement persists across maintenance calls, query resets and unpins.
+  host_pin_placement& get_host_pin_placement() noexcept { return _host_pin_placement; }
 
   /// \brief Drop every ioctx's prefetching cache and build a fresh one.
   ///
@@ -611,6 +617,9 @@ class sirius_scan_manager {
   /// keys without registering scan providers, so their lifetime is tracked separately.
   void acquire_checkpoint_key(sirius::query_id_t query_id, duckdb::AttachedDatabase& database);
   [[nodiscard]] bool holds_checkpoint_key(duckdb::AttachedDatabase const& database) const noexcept;
+  /// Query-local check for transaction-start ordering; never borrows another window's key.
+  [[nodiscard]] bool holds_checkpoint_key(sirius::query_id_t query_id,
+                                          duckdb::AttachedDatabase const& database) const noexcept;
   [[nodiscard]] bool holds_any_checkpoint_key() const noexcept;
   [[nodiscard]] std::size_t checkpoint_key_count() const noexcept;
   [[nodiscard]] std::size_t checkpoint_key_count(sirius::query_id_t query_id) const noexcept;
@@ -631,7 +640,10 @@ class sirius_scan_manager {
   /// Re-insert semantics (keyed by @p name):
   ///   - If no entry exists for @p name, a fresh one is created.
   ///   - If an entry has the same source and row count, new columns are merged and
-  ///     duplicate columns are dropped. Chunk placement must also match.
+  ///     duplicate columns are dropped. Only column-major GPU entries support this
+  ///     merge; host and device-chunked entries are rejected, even when empty.
+  ///     Chunk placement must also match. Rejection preserves the published entry;
+  ///     UNPIN first to change the storage format of a same-source, same-row-count pin.
   ///   - If the source differs, including a recreated table with the same name, the
   ///     existing entry is replaced.
   ///   - If row counts differ, the existing entry is dropped and replaced. (An
@@ -664,8 +676,8 @@ class sirius_scan_manager {
   ///         path that is every column; on the merge path it is only the newly added ones —
   ///         a column already cached keeps its previous chunks and the incoming ones are
   ///         dropped, so anything derived from this materialization (uniqueness verdicts,
-  ///         say) describes data that never entered the cache. See
-  ///         @ref attach_proven_unique_columns.
+  ///         say) describes data that never entered the cache. Insertion filters the supplied
+  ///         uniqueness proofs to this set before publishing the new generation.
   [[nodiscard]] std::vector<std::string> insert_pinned_entry(
     const std::string& name,
     cache_entry_info cache_info,
@@ -673,7 +685,8 @@ class sirius_scan_manager {
     std::vector<cucascade::memory::memory_space*> chunk_memory_spaces,
     duckdb::vector<duckdb::LogicalType> column_types,
     std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats,
-    sirius::pinned_column_storage_matrix column_storage);
+    sirius::pinned_column_storage_matrix column_storage,
+    pinned_entry_metadata metadata = {});
 
   /// \brief Pin the host-tier entry for a table.
   ///
@@ -713,7 +726,8 @@ class sirius_scan_manager {
     cucascade::memory::memory_space& memory_space,
     duckdb::vector<duckdb::LogicalType> column_types,
     std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats,
-    sirius::pinned_column_storage_matrix column_storage);
+    sirius::pinned_column_storage_matrix column_storage,
+    pinned_entry_metadata metadata = {});
 
   /// \brief Pin the entry for a table on the GPU tier from a compression-enabled pin.
   ///
@@ -737,43 +751,8 @@ class sirius_scan_manager {
                                   cache_entry_info cache_info,
                                   std::vector<sirius::device_pin_chunk> chunks,
                                   cucascade::memory::memory_space& memory_space,
-                                  sirius::pinned_column_storage_matrix column_storage);
-
-  /// \brief Attach MVCC snapshot metadata to the pinned entry for @p name.
-  ///
-  /// Called by the duckdb-format pin path immediately after insert_pinned_entry /
-  /// insert_pinned_entry_host. Overwrites any previous metadata: on a re-pin that
-  /// merged into an existing entry, the refreshed (newer) v_base is the more
-  /// conservative snapshot fence for every cached column, and the refreshed
-  /// per-chunk counts stay valid for every column because the merge path rejects
-  /// materializations whose per-chunk row counts differ from the existing
-  /// chunks'. Throws std::invalid_argument when no entry exists for @p name.
-  void attach_mvcc_metadata(const std::string& name, duckdb_mvcc_metadata metadata);
-
-  /// \brief Record which of @p name 's pinned columns were proven distinct at pin time.
-  ///
-  /// Called by every pin path right after its insert. Takes NAMES, not
-  /// positions: a re-pin that merges into an existing entry appends its new
-  /// columns to the entry's own order, which is not the incoming pin's order,
-  /// so a positional attach could mark the wrong column unique — and a false
-  /// positive here is wrong query results, not a slow query.
-  ///
-  /// Facts are OR-ed in and never cleared: a merge leaves the already-pinned
-  /// columns' data untouched, so a proof taken against THAT data still holds,
-  /// while a replacing re-pin builds a fresh entry with no facts at all. Names
-  /// absent from @p unique_column_names are left as they were — absence is
-  /// "unknown", so nothing is asserted by omission. A name that matches no
-  /// pinned column is ignored. Throws std::invalid_argument when no entry
-  /// exists for @p name.
-  ///
-  /// The caller must pass only columns whose data the accompanying insert
-  /// actually STORED (@ref insert_pinned_entry returns exactly that set). A
-  /// verdict describes the values the pin driver read; the merge path keeps an
-  /// already-cached column's earlier chunks and drops the incoming ones, so
-  /// attaching that verdict to the retained column would assert distinctness
-  /// about bytes nothing ever examined — and this flag admits a group key.
-  void attach_proven_unique_columns(const std::string& name,
-                                    std::span<std::string const> unique_column_names);
+                                  sirius::pinned_column_storage_matrix column_storage,
+                                  pinned_entry_metadata metadata = {});
 
   /// \brief Remove the pinned entry for @p name. No-op if absent.
   void remove_pinned_entry(const std::string& name);
@@ -883,6 +862,9 @@ class sirius_scan_manager {
   ///        was configured with @c backend=kvikio.
   [[nodiscard]] sirius::io::ioctx* io_ctx() const noexcept { return _io_ctx.get(); }
 
+  /// Aggregate metadata-cache diagnostics across the default and routed ioctxs.
+  [[nodiscard]] sirius::io::cache::metadata_store::counters metadata_cache_statistics() const;
+
   /// Where the readahead subscribes for execution events.  Set once at startup;
   /// the readahead itself is per-query, so it registers and unregisters around
   /// its own lifetime rather than this one.
@@ -912,6 +894,12 @@ class sirius_scan_manager {
   ///        with it. Throws a clear error for a non-object-store path.
   [[nodiscard]] std::size_t s3_list_max_matches(std::string const& s3_uri);
 
+  /// Resolve only the registered backend type for @p path. This is a planning
+  /// query: it does not construct or start an ioctx, open an object, issue a
+  /// HEAD, warm a backend, or probe credentials/network.
+  [[nodiscard]] std::optional<sirius::io::io_context_type> planning_io_backend(
+    std::string_view path) const;
+
  private:
   /**
    * @brief Everything the scan manager holds on behalf of ONE query.
@@ -928,7 +916,9 @@ class sirius_scan_manager {
   struct query_scan_manager_state {
     ~query_scan_manager_state() { drain(); }
 
-    query_scan_manager_state()                                           = default;
+    explicit query_scan_manager_state(preparation_options options) : preparation(std::move(options))
+    {
+    }
     query_scan_manager_state(const query_scan_manager_state&)            = delete;
     query_scan_manager_state& operator=(const query_scan_manager_state&) = delete;
     query_scan_manager_state(query_scan_manager_state&&)                 = delete;
@@ -936,9 +926,13 @@ class sirius_scan_manager {
 
     //! Stop and join every task this query put on the shared pool. Idempotent, and safe to
     //! call outside the state mutex — it can block for as long as an in-flight read.
+    //! Calls for this state are serialized by the query owner.
     void drain() noexcept;
 
+    bool drained{false};
+    preparation_options const preparation;  // Immutable attempt snapshot.
     uint64_t query_token = 0;
+    std::shared_ptr<preparation_ledger> ledger;
     std::shared_ptr<op::scan::physical_check_counters> physical_counters;
 
     //! A disk-backed scan owns the provider that feeds file metadata into the coalescer.
@@ -973,6 +967,7 @@ class sirius_scan_manager {
     //! Per-query snapshot of the serve-side pruning flag; the manager's _config is a
     //! construction-time copy, so SET changes arrive per query via prepare_for_query.
     bool pruning_enabled{true};
+    std::vector<int> active_gpu_ids;
 
     //! One mask computation per distinct pinned entry matched by THIS query (recorded by
     //! try_match_cached_entry, deduped by entry name); run block-in-prepare, then copied
@@ -1006,10 +1001,13 @@ class sirius_scan_manager {
     //! request_stop() here stops only this query's work; the shared pool and every other
     //! query keep running.
     std::unique_ptr<exec::scoped_dispatcher> dispatcher;
+    // Destroyed before the dispatcher; drain has already quiesced the owner loop.
+    std::unique_ptr<preparation_coordinator> coordinator;
   };
 
-  /// \brief Enqueue @p state's metadata producers before starting its coalescer consumers.
-  void start_metadata_processing(query_scan_manager_state& state);
+  /// \brief Register scan sources and arm the completion gate without submitting disk work.
+  void start_metadata_processing(query_scan_manager_state& state,
+                                 std::function<bool()> interrupted);
 
   //! Resolve a query's state, or nullptr when it has already been reset.
   [[nodiscard]] std::shared_ptr<query_scan_manager_state> get_query_state(
@@ -1068,6 +1066,7 @@ class sirius_scan_manager {
   /// credential rotation cannot retire the context while a request is in flight.
   std::shared_ptr<sirius::io::rest::rest_ioctx> rest_ioctx_for_list(std::string_view path);
 
+  exec::query_lifecycle_registry& _query_lifecycle;
   scan_manager_config _config;
   cucascade::memory::memory_reservation_manager& _reservation_manager;
   /// Hardware GPU/NUMA topology, shared with the prefetching cache.  Source of
@@ -1075,6 +1074,8 @@ class sirius_scan_manager {
   std::shared_ptr<const sirius::memory::topology_index> _topology_index;
   std::shared_ptr<op::scan::physical_check_counters> _physical_counters;
   exec::static_thread_pool _thread_pool;
+  std::shared_ptr<shared_scan_budget> _shared_readahead_budget =
+    std::make_shared<shared_scan_budget>();
   std::shared_ptr<sirius::io::ioctx> _io_ctx;
   /// Lazily-built per-backend ioctxs for path-routed datasources (e.g. an s3://
   /// REST or kvikIO context alongside the local `_io_ctx`). Contexts are keyed
@@ -1084,7 +1085,7 @@ class sirius_scan_manager {
   /// `_routed_io_ctxs_mtx` guards only map lookup/insert; drained + torn down
   /// in the dtor.
   std::mutex _routed_io_ctxs_build_mtx;
-  std::mutex _routed_io_ctxs_mtx;
+  mutable std::mutex _routed_io_ctxs_mtx;
   sirius::io::scoped_object_store_configs _s3_configs;
   struct routed_ioctx_key {
     sirius::io::io_context_type type;
@@ -1106,6 +1107,7 @@ class sirius_scan_manager {
   /// whole duration, and an unpin from another connection drops only the map slot, leaving
   /// the data alive until the last serving provider releases it.
   std::unordered_map<std::string, std::shared_ptr<pinned_entry>> _pinned_entries;
+  host_pin_placement _host_pin_placement;
   /// Guards the STRUCTURE of _pinned_entries (lookup/insert/erase) only, never the serving
   /// of an entry — shared ownership covers that. Held only for map manipulation and the
   /// snapshot in try_match_cached_entry, never across match/validate/plan work, so
@@ -1144,10 +1146,11 @@ class sirius_scan_manager {
   /// an origin holding it can never resolve.
   std::atomic<late_mat::pin_generation_t> _next_pin_generation{1};
 
-  /// Give the entry now living at @p name a fresh late-mat handle, and
-  /// invalidate whatever handle it is replacing. Called after every insert;
-  /// a no-op when the late-mat gate is off.
-  void publish_late_mat_handle(const std::string& name);
+  /// Finish building a pinned entry and make it available under @p name.
+  /// When late materialization is enabled, give the entry its own handle.
+  /// Queries already using the previous entry may continue using it until they finish.
+  /// The caller must hold @c _pinned_entries_mutex.
+  void publish_pinned_entry(const std::string& name, pinned_entry entry);
 
   //! One entry per in-flight query. Guarded by _query_states_mutex; the shared_ptr is
   //! resolved under the lock and used outside it, so an erase racing a reader cannot pull

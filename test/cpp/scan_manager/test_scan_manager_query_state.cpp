@@ -45,6 +45,7 @@
 #include <cucascade/memory/topology_discovery.hpp>
 
 #include <filesystem>
+#include <future>
 #include <memory>
 #include <string>
 #include <vector>
@@ -63,8 +64,8 @@ std::filesystem::path project_root()
 #endif
 }
 
-/// Local-file scan config: no S3 backend, no prefetch cache, one worker. The pool the manager
-/// builds is num_threads + k_max_concurrent_queries, which is what the two-query gates lean on.
+/// Local-file scan config: no S3 backend, no prefetch cache, two producer workers.
+/// Blocking coalescers use a separate pool so they cannot occupy producer capacity.
 sirius::scan_manager::scan_manager_config make_local_config()
 {
   sirius::scan_manager::scan_manager_config cfg;
@@ -126,7 +127,7 @@ query_context make_query(sirius::query_id_t query_id, std::string const& file)
 
   ctx.tctx = sirius::test::make_test_telemetry_context();
   sirius::telemetry::query_telemetry_info tinfo{
-    ctx.tctx->engine_id(), ctx.tctx->worker_id(), query_id};
+    quent::now_v7(), ctx.tctx->worker_id().raw(), query_id};
   ctx.query =
     std::make_shared<sirius::planner::query>(pipelines, ctx.tctx->context(), query_id, tinfo);
   return ctx;
@@ -156,7 +157,8 @@ TEST_CASE("two queries register independently and reset drops only one",
           "[scan_manager][query_state]")
 {
   fixture f;
-  sirius_scan_manager manager{make_local_config(), *f.memory, f.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, make_local_config(), *f.memory, f.topology};
 
   auto a = make_query(sirius::make_query_id(1), "nation.parquet");
   auto b = make_query(sirius::make_query_id(2), "supplier.parquet");
@@ -173,10 +175,19 @@ TEST_CASE("two queries register independently and reset drops only one",
 
   // B is still live and still serving: its connector yields its splits and closes normally
   // (a closed-by-A connector would have ended the stream with no splits at all).
-  std::size_t b_splits = 0;
-  while (auto split = b.scan_op->get_split_connector().get_next_split()) {
-    ++b_splits;
+  auto consumer = std::async(std::launch::async, [&] {
+    std::size_t count = 0;
+    while (auto split = b.scan_op->get_split_connector().get_next_split())
+      ++count;
+    return count;
+  });
+  try {
+    manager.run_preparation_on_query_thread(b.query->query_id());
+  } catch (...) {
+    manager.reset(b.query->query_id());
+    throw;
   }
+  auto b_splits = consumer.get();
   REQUIRE(b_splits > 0);
 
   manager.reset(b.query->query_id());
@@ -186,7 +197,8 @@ TEST_CASE("two queries register independently and reset drops only one",
 TEST_CASE("concurrent queries do not collide on operator id", "[scan_manager][query_state]")
 {
   fixture f;
-  sirius_scan_manager manager{make_local_config(), *f.memory, f.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, make_local_config(), *f.memory, f.topology};
 
   // Both scan operators are id 0 — ids restart per query. A shared coalescer keys its slot map
   // by that id, so one query's splits would land in the other's slot.
@@ -215,8 +227,18 @@ TEST_CASE("concurrent queries do not collide on operator id", "[scan_manager][qu
     return paths;
   };
 
-  auto a_paths = drain_paths(*a.scan_op);
-  auto b_paths = drain_paths(*b.scan_op);
+  std::future<std::vector<std::string>> a_consumer, b_consumer;
+  try {
+    a_consumer = std::async(std::launch::async, [&] { return drain_paths(*a.scan_op); });
+    b_consumer = std::async(std::launch::async, [&] { return drain_paths(*b.scan_op); });
+    manager.run_preparation_on_query_thread(a.query->query_id());
+    manager.run_preparation_on_query_thread(b.query->query_id());
+  } catch (...) {
+    manager.reset_all();
+    throw;
+  }
+  auto a_paths = a_consumer.get();
+  auto b_paths = b_consumer.get();
 
   REQUIRE_FALSE(a_paths.empty());
   REQUIRE_FALSE(b_paths.empty());
@@ -234,7 +256,8 @@ TEST_CASE("concurrent queries do not collide on operator id", "[scan_manager][qu
 TEST_CASE("reset is a no-op for unknown and already-reset queries", "[scan_manager][query_state]")
 {
   fixture f;
-  sirius_scan_manager manager{make_local_config(), *f.memory, f.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, make_local_config(), *f.memory, f.topology};
 
   // Never prepared: sirius_context's failure backstop calls reset(query_id) unconditionally,
   // so an unknown id has to be harmless.
@@ -255,7 +278,8 @@ TEST_CASE("reset is a no-op for unknown and already-reset queries", "[scan_manag
 TEST_CASE("reset_all drops every query and stop() still returns", "[scan_manager][query_state]")
 {
   fixture f;
-  sirius_scan_manager manager{make_local_config(), *f.memory, f.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, make_local_config(), *f.memory, f.topology};
 
   auto a = make_query(sirius::make_query_id(1), "nation.parquet");
   auto b = make_query(sirius::make_query_id(2), "supplier.parquet");
@@ -274,11 +298,12 @@ TEST_CASE("reset_all drops every query and stop() still returns", "[scan_manager
 TEST_CASE("a query with no GPU scan operators registers nothing", "[scan_manager][query_state]")
 {
   fixture f;
-  sirius_scan_manager manager{make_local_config(), *f.memory, f.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, make_local_config(), *f.memory, f.topology};
 
   auto tctx           = sirius::test::make_test_telemetry_context();
   auto const query_id = sirius::make_query_id(7);
-  sirius::telemetry::query_telemetry_info tinfo{tctx->engine_id(), tctx->worker_id(), query_id};
+  sirius::telemetry::query_telemetry_info tinfo{quent::now_v7(), tctx->worker_id().raw(), query_id};
   sirius::planner::query empty{std::vector<std::shared_ptr<sirius::pipeline::sirius_pipeline>>{},
                                tctx->context(),
                                query_id,

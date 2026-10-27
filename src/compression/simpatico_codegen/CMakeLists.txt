@@ -13,6 +13,7 @@ if(NOT TARGET nvcomp::nvcomp)
 endif()
 
 include(cmake/jit_header_manifest.cmake)
+include(cmake/cache_identity.cmake)
 
 # Embed the project headers the runtime NVRTC JIT #includes as raw-string
 # literals, so a binary distribution needs no simpatico source tree on disk.
@@ -70,6 +71,7 @@ add_custom_command(
 
 add_library(
   simpatico STATIC
+  src/decode/decode_session.cpp
   # Generated: complete CCCL header bundle embedded for the runtime JIT.
   "${EMBED_CCCL_HEADERS_OUT}"
   # CUDA kernels: operators + offsets
@@ -92,6 +94,7 @@ add_library(
   src/operators/nvcomp_batched_codec.cu
   # Plain-CUDA JIT host
   src/jit/nvrtc_compiler.cpp
+  src/jit/disk_cache.cpp
   src/jit/kernel_cache.cpp
   src/encode/jit/renderer.cpp
   src/decode/jit/renderer.cpp
@@ -103,9 +106,11 @@ add_library(
   src/plan/operator_registry.cpp
   src/plan/representation_factory.cpp
   src/plan/bitjoin_layout.cpp
+  src/plan/validity.cpp
   src/plan/compress.cpp
   src/plan/decompress.cpp
   src/util/stream_pool.cpp
+  src/util/host_observation.cpp
   src/util/isoc23_compat.c
   src/bridge/fused_tree_build.cpp
   src/bridge/codegen_runtime.cpp
@@ -168,13 +173,17 @@ else()
 endif()
 target_link_libraries(
   simpatico
-  PUBLIC cudf::cudf
-         rmm::rmm
-         nvcomp::nvcomp
-         ${SIMPATICO_CUDART_LIB}
-         ${SIMPATICO_NVRTC_LIB}
-         CUDA::cuda_driver
-         ${CMAKE_DL_LIBS})
+  PUBLIC cudf::cudf rmm::rmm nvcomp::nvcomp ${SIMPATICO_CUDART_LIB}
+         ${SIMPATICO_NVRTC_LIB} CUDA::cuda_driver
+  PRIVATE simpatico_cache_identity)
+
+# Sirius already provides cuCascade. Standalone Simpatico keeps its CUDA-only
+# backend and does not acquire a dependency on the rest of the engine.
+if(TARGET cuCascade::cucascade_static)
+  target_link_libraries(simpatico PRIVATE cuCascade::cucascade_static)
+  target_compile_definitions(simpatico
+                             PRIVATE SIMPATICO_USE_CUCASCADE_STREAM_POOL)
+endif()
 
 function(add_codegen_host_test name)
   add_executable(${name} tests/${name}.cpp)
@@ -184,6 +193,10 @@ function(add_codegen_host_test name)
 endfunction()
 
 add_codegen_host_test(test_compress_with_plan_roundtrip)
+add_codegen_host_test(test_async_decode)
+target_link_options(test_async_decode PRIVATE "-Wl,--wrap=cudaStreamQuery"
+                    "-Wl,--wrap=cudaStreamSynchronize")
+add_codegen_host_test(test_scan_filter_session)
 add_codegen_host_test(test_compressed_table_io)
 add_codegen_host_test(test_leaf_describe)
 add_codegen_host_test(test_plan_tree)
@@ -195,6 +208,10 @@ add_codegen_host_test(test_operator_sweep)
 add_codegen_host_test(test_representation_contract)
 add_codegen_host_test(test_bitpack_layout_contract)
 add_codegen_host_test(test_multi_gpu_stream_affinity)
+if(TARGET cuCascade::cucascade_static)
+  target_compile_definitions(test_multi_gpu_stream_affinity
+                             PRIVATE SIMPATICO_USE_CUCASCADE_STREAM_POOL)
+endif()
 add_codegen_host_test(test_masked_decode_variants)
 add_codegen_host_test(test_selection_wave)
 add_codegen_host_test(test_chunk_row_set_build)
@@ -216,6 +233,8 @@ enable_testing()
 add_subdirectory(tests/cache)
 add_test(NAME compress_with_plan_roundtrip
          COMMAND test_compress_with_plan_roundtrip)
+add_test(NAME async_decode COMMAND test_async_decode)
+add_test(NAME scan_filter_session COMMAND test_scan_filter_session)
 add_test(NAME compressed_table_io COMMAND test_compressed_table_io)
 add_test(NAME leaf_describe COMMAND test_leaf_describe)
 add_test(NAME plan_tree COMMAND test_plan_tree)

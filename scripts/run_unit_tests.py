@@ -5,16 +5,22 @@
 # See the LICENSE file at the repo root for the full text.
 """Run the Sirius C++ unit tests.
 
-The run has three steps:
+The run has four steps:
 
   shards     Two Catch2 shards per visible GPU, run in parallel. Each shard sees
              one GPU and uses integration-shard.yaml. [multi_gpu] and hidden
              tests are excluded.
+  cuda_fault Isolated CUDA status-injection tests (Linux only).
   multi_gpu  The [multi_gpu] tests with all GPUs visible. Skipped when fewer
              than two GPUs are visible.
   late_mat   The late-materialization tests with SIRIUS_EXP_LATE_MAT=1. The
              gate is read once per process, so these tests need a process of
-             their own.
+             their own. The hidden [.late_mat_fused] tests run alone in a
+             second process: they skip when either gate is off, and Catch2
+             fails a run in which every test skipped, so a misconfigured gate
+             fails the step instead of passing unnoticed. That process sets
+             SIRIUS_EXP_FUSED_SCAN_FILTER=1 to override an inherited value; the
+             test binary arms that gate itself only when it is unset.
 
 The run stops after a step that fails. Arguments after -- are Catch2 options
 passed to every process. Every process writes its console output (unittest.log)
@@ -39,13 +45,16 @@ from typing import NamedTuple
 REPO_ROOT = Path(__file__).resolve().parent.parent
 UNITTEST_DIR = Path("test/cpp")
 SHARD_CONFIG = REPO_ROOT / "test/cpp/integration/integration-shard.yaml"
-STEPS = ("shards", "multi_gpu", "late_mat")
+STEPS = ("shards", "cuda_fault", "multi_gpu", "late_mat")
 STEP_SPECS = {
     "shards": "~[.]~[multi_gpu]",
+    "cuda_fault": "[cuda_status_fault]",
     "multi_gpu": "[multi_gpu]~[.]",
-    "late_mat": "[late_mat],[deferred_query],[native_filter]",
+    "late_mat": "[late_mat]~[late_mat_fused],[deferred_query]~[late_mat_fused],"
+    "[native_filter]~[late_mat_fused]",
 }
-TIMEOUT_MIN = {"shards": 45, "multi_gpu": 20, "late_mat": 20}
+LATE_MAT_FUSED_SPEC = "[late_mat_fused]"
+TIMEOUT_MIN = {"shards": 45, "cuda_fault": 10, "multi_gpu": 20, "late_mat": 20}
 SUMMARY_PREFIXES = ("All tests passed", "test cases:", "No tests ran")
 
 _print_lock = threading.Lock()
@@ -204,7 +213,15 @@ def main() -> int:
         if step == "multi_gpu" and len(gpus) < 2:
             print("Skipping multi_gpu: needs at least 2 GPUs", flush=True)
             continue
-        cmd = ["timeout", f"{TIMEOUT_MIN[step]}m", str(binary)]
+        if step == "cuda_fault" and sys.platform != "linux":
+            print("Skipping cuda_fault: requires Linux linker wrapping", flush=True)
+            continue
+        step_binary = (
+            binary.with_name("sirius_cuda_fault_test")
+            if step == "cuda_fault"
+            else binary
+        )
+        cmd = ["timeout", f"{TIMEOUT_MIN[step]}m", str(step_binary)]
         cmd += [*defaults, *args.catch2_args, STEP_SPECS[step]]
         match step:
             case "shards":
@@ -224,16 +241,37 @@ def main() -> int:
                     )
                     for i in range(count)
                 ]
+            case "cuda_fault":
+                jobs = [
+                    Job(
+                        label=step,
+                        cmd=cmd,
+                        env={"CUDA_VISIBLE_DEVICES": gpus[0]},
+                        log_dir=log_root / step,
+                    )
+                ]
             case "multi_gpu":
                 jobs = [Job(label=step, cmd=cmd, env={}, log_dir=log_root / step)]
             case "late_mat":
+                fused_cmd = cmd[:-1] + [LATE_MAT_FUSED_SPEC]
                 jobs = [
                     Job(
                         label=step,
                         cmd=cmd,
                         env={"SIRIUS_EXP_LATE_MAT": "1"},
                         log_dir=log_root / step,
-                    )
+                        prefix="[late_mat] ",
+                    ),
+                    Job(
+                        label="late_mat_fused",
+                        cmd=fused_cmd,
+                        env={
+                            "SIRIUS_EXP_LATE_MAT": "1",
+                            "SIRIUS_EXP_FUSED_SCAN_FILTER": "1",
+                        },
+                        log_dir=log_root / "late_mat_fused",
+                        prefix="[late_mat_fused] ",
+                    ),
                 ]
         with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
             try:
@@ -251,7 +289,7 @@ def main() -> int:
 
     print(f"\nUnit test summary (logs in {log_root}/<process>/):")
     for r in results:
-        print(f"{r.label:<10} exit {r.status:<4} {r.seconds:5.0f}s  {r.summary}")
+        print(f"{r.label:<14} exit {r.status:<4} {r.seconds:5.0f}s  {r.summary}")
     return 0 if all(r.status == 0 for r in results) else 1
 
 

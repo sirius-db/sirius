@@ -31,10 +31,12 @@
 #include "helper/type_conversions.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_partition.hpp"
+#include "operator_test_utils.hpp"
 #include "pipeline/pipeline_build_context.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 
 #include <catch.hpp>
+#include <cucascade/data/data_repository.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/operator/logical_comparison_join.hpp>
 
@@ -370,19 +372,44 @@ TEST_CASE("compute_hash_join_partition_strategy - right-family joins never broad
   REQUIRE_FALSE(build_driven.build_probe);
 }
 
-TEST_CASE("compute_hash_join_partition_strategy - MARK single-GPU clamps to one partition",
-          "[hash_join][build_probe][unit]")
+TEST_CASE("compute_hash_join_partition_strategy - MARK partitions like SEMI",
+          "[hash_join][build_probe][unit][mark]")
 {
-  // Small foldable MARK build: clamped to a single partition, still BUILD_PROBE by size.
-  auto const small = strategy(k100MB, true, true, /*num_gpus=*/1, duckdb::JoinType::MARK);
-  REQUIRE(small.num_partitions == 1);
-  REQUIRE_FALSE(small.broadcast);
-  REQUIRE(small.build_probe);
+  // A MARK's global build facts are observed while the build is partitioned, so MARK takes
+  // SEMI's strategy for every shape (no forced BUILD_PROBE, clamp, or broadcast).
+  struct shape {
+    uint64_t total_bytes;
+    int num_gpus;
+    uint64_t hash_partition_bytes;
+  };
+  for (auto const& c : {shape{k100MB, 1, kBigPartitionBytes},
+                        shape{8 * k100MB, 1, k100MB},
+                        shape{6 * k100MB, 1, 1024ull * 1024 * 1024},
+                        shape{k100MB, 4, kBigPartitionBytes},
+                        shape{6 * k100MB, 4, k100MB},
+                        shape{40 * k100MB, 4, k100MB}}) {
+    CAPTURE(c.total_bytes, c.num_gpus, c.hash_partition_bytes);
+    auto const semi = strategy(c.total_bytes,
+                               true,
+                               true,
+                               c.num_gpus,
+                               duckdb::JoinType::SEMI,
+                               HASH_JOIN_MODE::STANDARD,
+                               c.hash_partition_bytes);
+    auto const mark = strategy(c.total_bytes,
+                               true,
+                               true,
+                               c.num_gpus,
+                               duckdb::JoinType::MARK,
+                               HASH_JOIN_MODE::STANDARD,
+                               c.hash_partition_bytes);
+    REQUIRE(mark.num_partitions == semi.num_partitions);
+    REQUIRE(mark.broadcast == semi.broadcast);
+    REQUIRE(mark.build_probe == semi.build_probe);
+  }
 
-  // A large MARK build stays clamped to one partition and is still forced into BUILD_PROBE even
-  // though it is over the per-GPU hash-table cap: MARK must never fall back to a hash-partitioned
-  // STANDARD join (that would split build rows and corrupt build_has_null). Capacity pressure is
-  // handled by the downgrade/spill path, not by a mode switch.
+  // The q21 shape: a single-GPU build over the hash-table cap and over hash_partition_bytes runs
+  // STANDARD at the natural count instead of one forced whole-build BUILD_PROBE partition.
   auto const large = strategy(8 * k100MB,
                               true,
                               true,
@@ -390,33 +417,14 @@ TEST_CASE("compute_hash_join_partition_strategy - MARK single-GPU clamps to one 
                               duckdb::JoinType::MARK,
                               HASH_JOIN_MODE::STANDARD,
                               /*hash_partition_bytes=*/k100MB);
-  REQUIRE(large.num_partitions == 1);
+  REQUIRE(large.num_partitions > 1);
   REQUIRE_FALSE(large.broadcast);
-  REQUIRE(large.build_probe);
-}
+  REQUIRE_FALSE(large.build_probe);
 
-TEST_CASE("compute_hash_join_partition_strategy - MARK multi-GPU forces broadcast",
-          "[hash_join][build_probe][unit][broadcast]")
-{
-  // MARK cannot be hash-partitioned across batches, so multi-GPU forces broadcast when it fits.
-  auto const s = strategy(k100MB, true, true, /*num_gpus=*/4, duckdb::JoinType::MARK);
-  REQUIRE(s.num_partitions == 4);
-  REQUIRE(s.broadcast);
-  REQUIRE(s.build_probe);
-
-  // A MARK build that is over the per-GPU / broadcast cap still forces broadcast BUILD_PROBE on
-  // multi-GPU: MARK must never hash-partition its build (that would corrupt build_has_null), so it
-  // broadcasts the full build to every GPU regardless of size and relies on downgrade for capacity.
-  auto const big = strategy(6 * k100MB,
-                            true,
-                            true,
-                            /*num_gpus=*/4,
-                            duckdb::JoinType::MARK,
-                            HASH_JOIN_MODE::STANDARD,
-                            /*hash_partition_bytes=*/k100MB);
-  REQUIRE(big.num_partitions == 4);
-  REQUIRE(big.broadcast);
-  REQUIRE(big.build_probe);
+  // A small MARK build still folds into one BUILD_PROBE hash table.
+  auto const small = strategy(k100MB, true, true, /*num_gpus=*/1, duckdb::JoinType::MARK);
+  REQUIRE(small.num_partitions == 1);
+  REQUIRE(small.build_probe);
 }
 
 TEST_CASE("compute_hash_join_partition_strategy - mixed / full-outer / unfoldable stay STANDARD",
@@ -792,10 +800,10 @@ nomination_fixture make_join(duckdb::JoinType join_type)
   };
 
   duckdb::vector<duckdb::JoinCondition> conditions;
-  duckdb::JoinCondition cond;
-  cond.left  = duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
-  cond.right = duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
-  cond.comparison = duckdb::ExpressionType::COMPARE_EQUAL;
+  duckdb::JoinCondition cond(
+    duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0),
+    duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0),
+    duckdb::ExpressionType::COMPARE_EQUAL);
   conditions.push_back(std::move(cond));
 
   f.hash_join = duckdb::make_uniq<exposed_hash_join>(
@@ -840,6 +848,46 @@ TEST_CASE("primary_input_port - build-streaming joins nominate nothing",
     INFO("join type: " << duckdb::JoinTypeToString(jt));
     REQUIRE_FALSE(f.hash_join->primary_input_port().has_value());
   }
+}
+
+TEST_CASE("refresh_cross_schedule rejects a SEMI or MARK build partition that is not concat-folded",
+          "[hash_join][cross_schedule][build_probe][mark]")
+{
+  static auto manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space         = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  // A hash-partitioned STANDARD MARK, like SEMI, gives each probe row one result per build batch.
+  auto const join_type = GENERATE(duckdb::JoinType::SEMI, duckdb::JoinType::MARK);
+  CAPTURE(duckdb::JoinTypeToString(join_type));
+  auto f                   = make_join(join_type);
+  f.hash_join->operator_id = 1;
+  cucascade::shared_data_repository build_repo;
+  cucascade::shared_data_repository probe_repo;
+  sirius::pipeline::pipeline_build_context ctx{nullptr, true};
+  auto build_pipeline = std::make_shared<finishable_pipeline>(ctx);
+  for (auto [name, repo] : {std::pair{"build", &build_repo}, std::pair{"default", &probe_repo}}) {
+    auto port          = std::make_unique<sirius::op::sirius_physical_operator::port>();
+    port->repo         = repo;
+    port->src_pipeline = name == std::string_view{"build"}
+                           ? build_pipeline
+                           : std::make_shared<finishable_pipeline>(ctx);
+    f.hash_join->add_port(name, std::move(port));
+  }
+  auto batch = [&] {
+    return sirius::test::operator_utils::make_numeric_batch<int32_t>(
+      *space, {1}, cudf::type_id::INT32);
+  };
+  probe_repo.add_data_batch(batch());
+  build_repo.add_data_batch(batch());
+  build_pipeline->finished = true;
+
+  // One folded build batch per partition is the invariant.
+  REQUIRE_NOTHROW(f.hash_join->refresh_cross_schedule());
+
+  // A second build batch in the same partition after the build finished would let SEMI emit (or
+  // MARK mark) a probe row once per build batch.
+  build_repo.add_data_batch(batch());
+  REQUIRE_THROWS_WITH(f.hash_join->refresh_cross_schedule(),
+                      Catch::Matchers::ContainsSubstring("single concat-folded build batch"));
 }
 
 TEST_CASE("probe bytes are only unweighted in BUILD_PROBE mode",

@@ -60,13 +60,14 @@ filtered_table gpu_ingestible::materialize_table(
   const op::scan::scan_operator_input& split,
   ::cuda::stream_ref stream,
   bool like_swar_fastpath,
-  std::shared_ptr<const like_multiliteral_cache> like_cache)
+  std::shared_ptr<const like_multiliteral_cache> like_cache,
+  expression_query_policy policy)
 {
   auto* mem_space = split.gpu_memory_space;
   if (split.has_scan_metadata()) [[likely]] {
     split.update(io::cache::scan_stage::reading);
     auto materialized = materialize_metadata_to_table(
-      split.get_scan_info(), *mem_space, stream, like_swar_fastpath, std::move(like_cache));
+      split.get_scan_info(), *mem_space, stream, like_swar_fastpath, std::move(like_cache), policy);
     if (split.mvcc_keep_mask.has_mask()) {
       // Only insert-delta splits carry a visibility mask here; disk-walk
       // splits never do. Sync before returning for the same reason as the
@@ -135,10 +136,12 @@ filtered_table gpu_ingestible::materialize_table(
       stream.sync();
       return {.table = owning_table_view{std::move(masked)}, .state = filter_state::UNFILTERED};
     }
+    auto const stored_bytes = rbatch.get_data()->get_size_in_bytes();
     return {.table               = owning_table_view{std::move(rbatch), view},
             .state               = decoded_state,
             .predicate_columns   = split.pushdown_predicate_columns,
-            .predicates_enforced = split.pushdown_predicates_enforced};
+            .predicates_enforced = split.pushdown_predicates_enforced,
+            .stored_bytes        = stored_bytes};
   }
 }
 

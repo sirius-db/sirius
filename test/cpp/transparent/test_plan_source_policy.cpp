@@ -16,6 +16,7 @@
 
 #include "exec/stream_plan_bindings.hpp"
 #include "helper/type_conversions.hpp"
+#include "log/sink.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
 #include "sirius_sql_rewrite.hpp"
@@ -37,6 +38,7 @@
 #include <duckdb/main/client_config.hpp>
 #include <duckdb/main/extension/extension_loader.hpp>
 #include <duckdb/main/prepared_statement_data.hpp>
+#include <duckdb/main/settings.hpp>
 #include <duckdb/parallel/interrupt.hpp>
 #include <duckdb/parallel/thread_context.hpp>
 #include <duckdb/planner/operator/logical_dummy_scan.hpp>
@@ -53,12 +55,12 @@ duckdb::unique_ptr<duckdb::LogicalGet> file_scan(std::string name, std::string p
   auto bind       = duckdb::make_uniq<duckdb::MultiFileBindData>();
   bind->file_list = duckdb::make_shared_ptr<duckdb::SimpleMultiFileList>(
     duckdb::vector<duckdb::OpenFileInfo>{duckdb::OpenFileInfo(std::move(path))});
-  duckdb::TableFunction function(std::move(name), {}, nullptr);
-  return duckdb::make_uniq<duckdb::LogicalGet>(1,
-                                               std::move(function),
+  duckdb::TableFunction function(duckdb::Identifier(name), {}, nullptr);
+  return duckdb::make_uniq<duckdb::LogicalGet>(duckdb::TableIndex(1),
+                                               duckdb::BoundTableFunction(function),
                                                std::move(bind),
                                                duckdb::vector<duckdb::LogicalType>{},
-                                               duckdb::vector<std::string>{});
+                                               duckdb::vector<duckdb::Identifier>{});
 }
 
 struct throwing_list final : duckdb::SimpleMultiFileList {
@@ -112,11 +114,11 @@ TEST_CASE("Source policy permits complete empty local and native plans",
   REQUIRE(policy.discovery_complete);
   REQUIRE(policy.cpu_replay_permitted());
   REQUIRE(policy.scans.at(0).source == byte_source_class::local_file);
-  duckdb::LogicalDummyScan empty(0);
+  duckdb::LogicalDummyScan empty(duckdb::TableIndex(0));
   REQUIRE(derive_plan_source_policy(empty, *con.context).cpu_replay_permitted());
-  REQUIRE_FALSE(con.Query("CREATE TEMP TABLE r1_policy_native(id INTEGER)")->HasError());
+  REQUIRE_FALSE(con.Query("CREATE TEMP TABLE policy_native(id INTEGER)")->HasError());
   REQUIRE_FALSE(con.Query("BEGIN")->HasError());
-  auto native        = con.ExtractPlan("SELECT * FROM r1_policy_native");
+  auto native        = con.ExtractPlan("SELECT * FROM policy_native");
   auto native_policy = derive_plan_source_policy(*native, *con.context);
   REQUIRE(native_policy.discovery_complete);
   REQUIRE(native_policy.cpu_replay_permitted());
@@ -142,14 +144,14 @@ TEST_CASE("Source policy preserves S3 veto beside local and unclassified nodes",
 {
   REQUIRE(sirius::test::g_shared_env);
   auto con = sirius::test::g_shared_env->make_connection();
-  duckdb::LogicalDummyScan root(0);
+  duckdb::LogicalDummyScan root(duckdb::TableIndex(0));
   root.children.push_back(file_scan("local", "local.parquet"));
-  auto unknown =
-    duckdb::make_uniq<duckdb::LogicalGet>(2,
-                                          duckdb::TableFunction("opaque_source", {}, nullptr),
-                                          nullptr,
-                                          duckdb::vector<duckdb::LogicalType>{},
-                                          duckdb::vector<std::string>{});
+  auto unknown = duckdb::make_uniq<duckdb::LogicalGet>(
+    duckdb::TableIndex(2),
+    duckdb::BoundTableFunction(duckdb::TableFunction("opaque_source", {}, nullptr)),
+    nullptr,
+    duckdb::vector<duckdb::LogicalType>{},
+    duckdb::vector<duckdb::Identifier>{});
   auto alone = derive_plan_source_policy(*unknown, *con.context);
   REQUIRE(alone.discovery_complete);
   REQUIRE(alone.cpu_replay_permitted());
@@ -216,16 +218,20 @@ TEST_CASE("Source policy forbids verified stream and Sirius S3 sources",
   REQUIRE_FALSE(con.Query("SET gpu_execution=false")->HasError());
   REQUIRE_FALSE(con.Query("BEGIN")->HasError());
   for (std::string name : {"sirius_stream_source", "sirius_read_parquet"}) {
-    auto& entry =
-      duckdb::Catalog::GetSystemCatalog(*con.context)
-        .GetEntry<duckdb::TableFunctionCatalogEntry>(*con.context, DEFAULT_SCHEMA, name);
+    auto& entry = duckdb::Catalog::GetSystemCatalog(*con.context)
+                    .GetEntry<duckdb::TableFunctionCatalogEntry>(
+                      *con.context, DEFAULT_SCHEMA, duckdb::Identifier(name));
     duckdb::unique_ptr<duckdb::FunctionData> bind;
     if (name == "sirius_stream_source") {
       bind = duckdb::make_uniq<sirius::exec::stream_source_bind_data>(42);
     } else {
       bind = duckdb::make_uniq<duckdb::SiriusReadParquetBindData>("s3://bucket/data.parquet", 1);
     }
-    duckdb::LogicalGet node(1, entry.functions.GetFunctionByOffset(0), std::move(bind), {}, {});
+    duckdb::LogicalGet node(duckdb::TableIndex(1),
+                            duckdb::BoundTableFunction(entry.functions.GetFunctionByOffset(0)),
+                            std::move(bind),
+                            {},
+                            {});
     auto policy = derive_plan_source_policy(node, *con.context);
     REQUIRE(policy.discovery_complete);
     REQUIRE_FALSE(policy.cpu_replay_permitted());
@@ -274,7 +280,7 @@ TEST_CASE("Source policy retains known S3 evidence after a sibling extraction fa
 {
   REQUIRE(sirius::test::g_shared_env);
   auto con = sirius::test::g_shared_env->make_connection();
-  duckdb::LogicalDummyScan root(0);
+  duckdb::LogicalDummyScan root(duckdb::TableIndex(0));
   auto broken = file_scan("broken", "local.parquet");
   broken->bind_data->Cast<duckdb::MultiFileBindData>().file_list.reset();
   root.children.push_back(std::move(broken));
@@ -307,7 +313,7 @@ TEST_CASE("Explicit replay rejects bind-time source discovery failure before win
     [](duckdb::ClientContext&,
        duckdb::TableFunctionBindInput&,
        duckdb::vector<duckdb::LogicalType>& types,
-       duckdb::vector<std::string>& names) -> duckdb::unique_ptr<duckdb::FunctionData> {
+       duckdb::vector<duckdb::Identifier>& names) -> duckdb::unique_ptr<duckdb::FunctionData> {
       types           = {duckdb::LogicalType::INTEGER};
       names           = {"id"};
       auto bind       = duckdb::make_uniq<duckdb::MultiFileBindData>();
@@ -416,7 +422,7 @@ struct replay_source_state : duckdb::GlobalTableFunctionState {
 duckdb::TableFunction rebound_policy_source(std::string name)
 {
   return duckdb::TableFunction(
-    std::move(name),
+    duckdb::Identifier(name),
     {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BOOLEAN},
     [](duckdb::ClientContext&, duckdb::TableFunctionInput& input, duckdb::DataChunk& output) {
       auto& state = input.global_state->Cast<replay_source_state>();
@@ -433,12 +439,12 @@ duckdb::TableFunction rebound_policy_source(std::string name)
     [](duckdb::ClientContext& context,
        duckdb::TableFunctionBindInput& input,
        duckdb::vector<duckdb::LogicalType>& types,
-       duckdb::vector<std::string>& names) -> duckdb::unique_ptr<duckdb::FunctionData> {
+       duckdb::vector<duckdb::Identifier>& names) -> duckdb::unique_ptr<duckdb::FunctionData> {
       auto state = duckdb::get_sirius_connection_state(context);
       if (state && state->is_cpu_fallback_active()) {
         ++replay_source_binds;
-        duckdb::ClientConfig::GetConfig(context).enable_optimizer =
-          input.inputs[1].GetValue<bool>();
+        duckdb::Settings::Set<duckdb::EnableOptimizerSetting>(
+          context, duckdb::SetScope::LOCAL, input.inputs[1]);
       }
       types             = {duckdb::LogicalType::INTEGER};
       names             = {"id"};
@@ -588,7 +594,7 @@ duckdb::unique_ptr<duckdb::FunctionData> bind_precedence_source(
   duckdb::ClientContext&,
   duckdb::TableFunctionBindInput&,
   duckdb::vector<duckdb::LogicalType>& types,
-  duckdb::vector<std::string>& names)
+  duckdb::vector<duckdb::Identifier>& names)
 {
   if (++precedence_bind_count > 1) {
     if (precedence_replan_error == "unsupported")
@@ -681,7 +687,7 @@ TEST_CASE("Finalize preserves runtime-unavailable errors after S3 scan eliminati
     [](duckdb::ClientContext&,
        duckdb::TableFunctionBindInput& input,
        duckdb::vector<duckdb::LogicalType>& types,
-       duckdb::vector<std::string>& names) -> duckdb::unique_ptr<duckdb::FunctionData> {
+       duckdb::vector<duckdb::Identifier>& names) -> duckdb::unique_ptr<duckdb::FunctionData> {
       types           = {duckdb::LogicalType::INTEGER};
       names           = {"id"};
       auto bind       = duckdb::make_uniq<duckdb::MultiFileBindData>();
@@ -696,10 +702,10 @@ TEST_CASE("Finalize preserves runtime-unavailable errors after S3 scan eliminati
   REQUIRE(sirius::references_sirius_owned_s3_parquet(query));
   fixture.run_ok("BEGIN");
   for (bool eliminate : {false, true}) {
-    auto prepared = con.Prepare(eliminate ? query : source);
-    REQUIRE_FALSE(prepared->HasError());
-    REQUIRE(prepared->data->physical_plan);
-    auto policy = derive_plan_source_policy(prepared->data->physical_plan->Root(), *con.context);
+    auto logical = con.ExtractPlan(eliminate ? query : source);
+    duckdb::PhysicalPlanGenerator generator(*con.context);
+    auto physical = generator.Plan(std::move(logical));
+    auto policy   = derive_plan_source_policy(physical->Root(), *con.context);
     REQUIRE(policy.discovery_complete);
     CHECK(policy.reads_sirius_owned_s3() == !eliminate);
     CHECK(policy.scans.empty() == eliminate);
@@ -736,7 +742,7 @@ TEST_CASE("Finalize preserves runtime-unavailable errors after S3 scan eliminati
   auto const before = context->get_transparent_execution_stats();
   auto local_result = con.Query("SELECT 42");
   REQUIRE_FALSE(local_result->HasError());
-  CHECK(local_result->GetValue(0, 0).GetValue<int32_t>() == 42);
+  CHECK(local_result->Collection().GetValue(0, 0).GetValue<int32_t>() == 42);
   CHECK(context->get_transparent_execution_stats().fallbacks == before.fallbacks + 1);
 }
 
@@ -863,3 +869,87 @@ TEST_CASE("Transparent execution preserves GPU errors before non-S3 replay vetoe
     }
   }
 }
+
+#if SIRIUS_ACTIVE_LOG_LEVEL <= SIRIUS_LOG_LEVEL_INFO
+static void check_runtime_failure_fallback(std::string_view failure_point)
+{
+  if (sirius::test::run_isolated()) return;
+  sirius::test::GpuExecutionFixture fixture;
+  fixture.run_ok("SET gpu_execution = false");
+  fixture.run_ok("CREATE TABLE health_race AS SELECT i FROM range(10) t(i)");
+  fixture.run_ok("CHECKPOINT");
+  fixture.run_ok("SET gpu_execution = true");
+  fixture.run_ok("SET enable_duckdb_fallback = true");
+  auto& con    = *fixture.con;
+  auto runtime = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(runtime);
+  auto prepared = con.Prepare("SELECT sum(i) FROM health_race");
+  REQUIRE_FALSE(prepared->HasError());
+
+  // Exercise both sides of the health check: window begin is before it, while
+  // QueryBegin is after it and before lifecycle registration.
+  // Use the existing log-sink interface to force the race without a production test hook.
+  struct failure_at_begin_sink final : sirius::log::sink {
+    duckdb::SiriusContext& runtime;
+    std::shared_ptr<sirius::log::sink> previous = sirius::log::get_sink();
+    std::atomic<bool> injected{false};
+    std::string_view failure_point;
+    failure_at_begin_sink(duckdb::SiriusContext& runtime, std::string_view failure_point)
+      : runtime(runtime), failure_point(failure_point)
+    {
+    }
+    void set_level(sirius::log::level level) override { previous->set_level(level); }
+    bool should_log(sirius::log::level) const override { return true; }
+    bool flush() override { return previous->flush(); }
+    void log(sirius::log::level level,
+             std::source_location const& location,
+             std::string_view message) override
+    {
+      if (message.starts_with(failure_point) && !injected.exchange(true)) {
+        runtime.get_query_lifecycle_registry().report_failure(
+          std::make_exception_ptr(cudf::cuda_error(
+            "synthetic fatal failure during window admission", cudaErrorIllegalAddress)));
+      }
+      previous->log(level, location, message);
+    }
+  };
+  auto sink = std::make_shared<failure_at_begin_sink>(*runtime, failure_point);
+  struct restore_sink {
+    std::shared_ptr<sirius::log::sink> previous;
+    ~restore_sink() { sirius::log::set_sink(std::move(previous)); }
+  } restore{sink->previous};
+  sirius::log::set_sink(sink);
+  auto before = runtime->get_transparent_execution_stats();
+  auto result = prepared->Execute();
+  REQUIRE(sink->injected.load());
+  try {
+    runtime->throw_runtime_unavailable();
+  } catch (duckdb::SiriusRuntimeUnavailableException const& error) {
+    CHECK(std::string(error.what()).find("cudaErrorIllegalAddress") != std::string::npos);
+    CHECK(std::string(error.what()).find("synthetic fatal failure during window admission") !=
+          std::string::npos);
+  }
+  REQUIRE(result);
+  INFO((result->HasError() ? result->GetError() : ""));
+  REQUIRE_FALSE(result->HasError());
+  auto chunk = result->Fetch();
+  REQUIRE(chunk);
+  CHECK(chunk->GetValue(0, 0).GetValue<int64_t>() == 45);
+  CHECK(runtime->get_transparent_execution_stats().runtime_fallbacks ==
+        before.runtime_fallbacks + 1);
+  CHECK_FALSE(runtime->is_query_lifecycle_active());
+  CHECK(runtime->get_query_lifecycle_registry().size() == 0);
+  CHECK_FALSE(runtime->get_scan_manager().holds_any_checkpoint_key());
+}
+TEST_CASE("Runtime failure after slot acquisition preserves CPU fallback",
+          "[integration][policy][device_health]")
+{
+  check_runtime_failure_fallback("[window] begin ");
+}
+
+TEST_CASE("Runtime failure during lifecycle registration preserves CPU fallback",
+          "[integration][policy][device_health]")
+{
+  check_runtime_failure_fallback("QueryBegin: transparent_execution");
+}
+#endif

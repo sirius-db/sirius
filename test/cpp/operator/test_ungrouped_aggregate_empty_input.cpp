@@ -16,6 +16,7 @@
 
 #include "creator/task_creator.hpp"
 #include "cudf/cudf_utils.hpp"
+#include "exec/query_lifecycle_registry.hpp"
 #include "expression/ast/node.hpp"
 #include "op/input_free_operator_data.hpp"
 #include "op/scan/table_scan/scan_contract.hpp"
@@ -233,6 +234,7 @@ TEST_CASE("ungrouped merge gives equivalent SQL results for zero batches and zer
           "[ungrouped_empty_input][physical_ungrouped_aggregate]")
 {
   auto const zero_batches = GENERATE(true, false);
+  auto const input_type   = logical_type::make(GENERATE(type_id::INTEGER, type_id::BIGINT));
   auto manager            = sirius::test::operator_utils::initialize_memory_manager();
   auto* space             = manager->get_memory_space(Tier::GPU, 0);
   REQUIRE(space != nullptr);
@@ -240,31 +242,41 @@ TEST_CASE("ungrouped merge gives equivalent SQL results for zero batches and zer
                bigint,
                bigint,
                bigint,
-               integer,
-               integer,
-               integer,
+               input_type,
+               input_type,
+               input_type,
                logical_type::make(type_id::DOUBLE),
-               bigint};
-  auto make_aggregates = [] {
+               bigint,
+               logical_type::make(type_id::DOUBLE)};
+  auto make_aggregates = [input_type] {
     expressions result;
     result.push_back(aggregate(aggregate_id::count_star, bigint));
-    result.push_back(aggregate(aggregate_id::count, bigint));
-    result.push_back(aggregate(aggregate_id::count, bigint, integer, true));
-    result.push_back(aggregate(aggregate_id::sum, bigint));
-    result.push_back(aggregate(aggregate_id::min, integer));
-    result.push_back(aggregate(aggregate_id::max, integer));
-    result.push_back(aggregate(aggregate_id::first, integer));
-    result.push_back(aggregate(aggregate_id::avg, logical_type::make(type_id::DOUBLE)));
-    result.push_back(aggregate(aggregate_id::sum_no_overflow, bigint));
+    result.push_back(aggregate(aggregate_id::count, bigint, input_type));
+    result.push_back(aggregate(aggregate_id::count, bigint, input_type, true));
+    result.push_back(aggregate(aggregate_id::sum, bigint, input_type));
+    result.push_back(aggregate(aggregate_id::min, input_type, input_type));
+    result.push_back(aggregate(aggregate_id::max, input_type, input_type));
+    result.push_back(aggregate(aggregate_id::first, input_type, input_type));
+    result.push_back(aggregate(aggregate_id::avg, logical_type::make(type_id::DOUBLE), input_type));
+    result.push_back(aggregate(aggregate_id::sum_no_overflow, bigint, input_type));
+    result.push_back(
+      aggregate(aggregate_id::stddev_samp, logical_type::make(type_id::DOUBLE), input_type));
     return result;
   };
   merge_fixture fixture(types, make_aggregates());
   if (!zero_batches) {
     sirius_physical_ungrouped_aggregate local(
       types, make_aggregates(), 1, duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES);
-    auto input   = make_numeric_batch<int32_t>(*space, {}, cudf::type_id::INT32);
+    auto input   = input_type.id() == type_id::INTEGER
+                     ? make_numeric_batch<int32_t>(*space, {}, cudf::type_id::INT32)
+                     : make_numeric_batch<int64_t>(*space, {}, cudf::type_id::INT64);
     auto partial = local.execute(pipelineable_operator_data({input}), default_stream());
-    fixture.merge.push_data_batch("default", only_batch(*partial));
+    auto batch   = only_batch(*partial);
+    auto view    = sirius::get_cudf_table_view(*batch);
+    CHECK(view.column(3).type() == cudf::data_type{cudf::type_id::DECIMAL128, 0});
+    CHECK(view.column(7).type() == cudf::data_type{cudf::type_id::DECIMAL128, 0});
+    CHECK(view.column(10).type() == cudf::data_type{cudf::type_id::STRUCT});
+    fixture.merge.push_data_batch("default", std::move(batch));
   }
   fixture.close_input();
   REQUIRE(fixture.merge.get_next_task_hint()->hint == TaskCreationHint::READY);
@@ -275,9 +287,9 @@ TEST_CASE("ungrouped merge gives equivalent SQL results for zero batches and zer
   auto batch  = only_batch(*result);
   auto view   = sirius::get_cudf_table_view(*batch);
   REQUIRE(view.num_rows() == 1);
-  REQUIRE(view.num_columns() == 9);
+  REQUIRE(view.num_columns() == static_cast<cudf::size_type>(types.size()));
   for (cudf::size_type i = 0; i < view.num_columns(); ++i) {
-    CHECK(view.column(i).type() == sirius::get_cudf_type(types[i]));
+    CHECK(view.column(i).type() == sirius::require_cudf_type(types[i]));
     if (i < 3) {
       CHECK(view.column(i).null_count() == 0);
       CHECK(copy_column_to_host<int64_t>(view.column(i)) == std::vector<int64_t>{0});
@@ -418,7 +430,8 @@ TEST_CASE("ungrouped merge empty task retries OOM and publishes once before comp
   auto global = std::make_shared<sirius::pipeline::gpu_pipeline_task_global_state>(
     fixture.pipeline, sirius::test::make_test_telemetry_context());
   global->set_completion_handler(completion);
-  hint_walker creator(sirius::creator::task_creator_config{}, *manager);
+  sirius::exec::query_lifecycle_registry lifecycle;
+  hint_walker creator(lifecycle, sirius::creator::task_creator_config{}, *manager);
   std::vector<std::shared_ptr<sirius_pipeline>> visited;
   auto before_close = creator.get_operator_for_next_task(&fixture.merge, visited);
   CHECK_FALSE(before_close.is_ready);
@@ -440,12 +453,32 @@ TEST_CASE("ungrouped merge empty task retries OOM and publishes once before comp
       id, std::vector<cucascade::shared_data_repository*>{}, std::move(local), global);
     auto estimate = task->get_estimated_reservation_size_info(space);
     CHECK(estimate.bytes_to_materialize_input == 0);
+    // Match task_scheduler::schedule and gpu_pipeline_executor::manager_loop before execution.
+    auto& fsm = task->telemetry_fsm();
+    fsm.queued({.queue = {.target = quent::task_queue::TaskQueueId{quent::nil_uuid()},
+                          .data   = {.entries = 1}}});
+    fsm.reserving({
+      .requested_bytes      = estimate.reservation_size,
+      .input_basis          = estimate.input_basis,
+      .peak_estimate        = estimate.peak_memory_estimate,
+      .bytes_to_materialize = estimate.bytes_to_materialize_input,
+      .manager_thread =
+        {
+          .target = quent::task_manager_loop_thread::TaskManagerLoopThreadId{quent::nil_uuid()},
+          .data   = {},
+        },
+    });
     auto reservation = manager->request_reservation(
       cucascade::memory::any_memory_space_in_tier{Tier::GPU}, estimate.reservation_size);
     REQUIRE(reservation != nullptr);
     dynamic_cast<sirius::pipeline::gpu_pipeline_task_local_state*>(task->local_state())
       ->set_reservation(std::move(reservation), estimate);
     return task;
+  };
+  auto retire_task = [](std::unique_ptr<sirius::pipeline::gpu_pipeline_task>& task, bool success) {
+    task->set_telemetry_finalized();
+    task->telemetry_fsm().finalizing({.success = success});
+    task.reset();
   };
   std::unique_ptr<sirius::pipeline::gpu_pipeline_task> task;
   {
@@ -472,12 +505,12 @@ TEST_CASE("ungrouped merge empty task retries OOM and publishes once before comp
     CHECK_FALSE(fixture.pipeline->is_pipeline_finished());
     CHECK(fixture.merge.get_next_task_input_data() == nullptr);
     auto retry = make_task(2, std::move(retry_input), resume);
-    task.reset();
+    retire_task(task, false);
     retry->execute(stream);
-    retry.reset();
+    retire_task(retry, true);
   } else {
     task->execute(stream);
-    task.reset();
+    retire_task(task, true);
   }
   CHECK(fixture.collector.publications == 1);
   REQUIRE(fixture.collector.batches.size() == 1);

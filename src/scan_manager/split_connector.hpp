@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <deque>
 #include <exception>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -74,6 +75,8 @@ class split_connector : public std::enable_shared_from_this<split_connector> {
   ///                  has been drained. Subsequent close() calls do not
   ///                  overwrite an already-stored exception.
   void close(std::exception_ptr const& exception = nullptr);
+  // Internal construction seam: consumer callbacks run after releasing the queue mutex.
+  void set_consumption_callback(std::function<void(size_t)> callback);
 
   /// \brief Pull the next split, blocking until one is available or the connector
   ///        is closed and drained.
@@ -125,10 +128,19 @@ class split_connector : public std::enable_shared_from_this<split_connector> {
   ///        Reachable only via @ref split_provider::push_to_connector so all
   ///        producers route through the provider's friendship channel.
   void push_split(std::unique_ptr<op::operator_data> split);
+  /// On insertion failure, leave ownership with the caller for cleanup outside its publish lock.
+  void push_split_sized(std::unique_ptr<op::operator_data>&& split,
+                        size_t bytes,
+                        size_t preparation_bytes = 0);
+  std::shared_ptr<std::function<void(size_t)> const> _on_consumption;
 
   mutable std::mutex _mutex;
   std::condition_variable _cv;
-  std::deque<std::unique_ptr<op::operator_data>> _splits;
+  struct queued_split {
+    std::unique_ptr<op::operator_data> input;
+    size_t preparation_bytes;
+  };
+  std::deque<queued_split> _splits;
   bool _closed{false};
   std::exception_ptr _exception;
   /// steady_clock ms timestamp of the last get_next_split() pop (0 = never).

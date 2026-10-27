@@ -19,6 +19,7 @@
 #include "config.hpp"
 #include "creator/config.hpp"
 #include "exec/config.hpp"
+#include "expression_evaluator/query_policy.hpp"
 #include "op/dynamic_filter/config.hpp"
 #include "scan_manager/config.hpp"
 
@@ -132,7 +133,14 @@ struct operator_params {
 
   /// Engine-owned query policy. The user-facing setting defaults to enabled, but an unwired
   /// execution context stays fail-closed until the engine snapshots the connection value.
-  bool like_swar_fastpath = false;
+  bool like_swar_fastpath                           = false;
+  expression_evaluator_strategy expression_strategy = expression_query_policy{}.strategy;
+  bool enable_regex_jit                             = expression_query_policy{}.regex_jit;
+
+  [[nodiscard]] expression_query_policy expression_policy() const noexcept
+  {
+    return {expression_strategy, enable_regex_jit};
+  }
 
   /// Target batch size (bytes) for DuckDB scan tasks.
   uint64_t scan_task_batch_size = config::DEFAULT_SCAN_TASK_BATCH_SIZE;
@@ -210,9 +218,9 @@ struct operator_params {
   /// Let grouped-aggregation partitions size from projected input.
   bool enable_runtime_size_estimation = false;
 
-  /// Decide decimal SUM widening from base-table statistics at plan time: an aggregate input with
-  /// a proven magnitude bound skips the per-batch min/max scan and its stream synchronization
-  /// (planner::resolve_decimal_sum_input_bounds). Off: every batch is measured.
+  /// Decide decimal and wide integer SUM widening from base-table statistics at plan time: an
+  /// aggregate input with a proven magnitude bound skips the per-batch min/max scan and its stream
+  /// synchronization (planner::resolve_sum_input_bounds). Off: every batch is measured.
   bool enable_decimal_sum_stats_bound = true;
 
   /// Zone-map pruning of pinned-table chunks at cache-serve time: skip cached chunks whose pin-time
@@ -257,15 +265,15 @@ struct operator_params {
   uint64_t avg_variable_column_bytes = 32;
 };
 
+constexpr std::string QUENT_NDJSON_EXPORTER = "ndjson";
+
 struct telemetry_config {
   bool enable_quent{true};
-  /// Emit per-batch placement telemetry (Batch FSM + MemoryTier usages).
-  /// Roughly doubles telemetry volume; no-op when enable_quent is false.
-  bool enable_batch_events{true};
   /// Capture NVTX ranges (Sirius and libcudf) into Quent; no-op when
   /// enable_quent is false.
   bool enable_nvtx{false};
-  std::string exporter{"ndjson"};
+
+  std::string exporter{QUENT_NDJSON_EXPORTER};
   std::string output_directory{"telemetry_data"};
   std::string engine_name{"siriusDB"};
   /// Optional override naming an NVTX injection library. Normally Sirius uses
@@ -274,9 +282,9 @@ struct telemetry_config {
   std::string nvtx_injection_lib{};
 };
 
-/// Parameters controlling Simpatico compression for pin_table(tier=>'host').
-/// These settings apply exclusively to cached input-table pinning and have no
-/// effect on spill-path compression (Phase 3).
+/// Parameters controlling Simpatico compression. The unprefixed fields apply to
+/// pin_table(tier=>'host'); the spill_ fields apply to batches the downgrade
+/// executor spills to the host or disk tier.
 struct compression_config {
   /// When true, pin_table(tier=>'host') attempts to compress each chunk with
   /// Simpatico before storing it in host memory. Falls back to uncompressed
@@ -303,6 +311,25 @@ struct compression_config {
   /// exists for a table, that table is pinned uncompressed regardless of the
   /// enable flag.  Empty string = feature disabled.
   std::string input_plan_dir{};
+
+  /// Store batches the downgrade executor spills to the host or disk tier
+  /// Simpatico-compressed, with per-type default plans, and decode them on their way
+  /// back to the GPU. A batch whose compressed form saves too little (see
+  /// spill_max_compressed_fraction) or fails to encode spills uncompressed.
+  bool enable_spill_compression{false};
+
+  /// Batches smaller than this spill uncompressed.
+  std::size_t spill_min_batch_bytes{64ULL * 1024 * 1024};  // 64 MiB
+
+  /// Keep a spilled batch compressed only when its header + payload is at most this
+  /// fraction of the batch's device size. Finite and non-negative; values above 1
+  /// allow compressed forms that expand relative to the original batch.
+  double spill_max_compressed_fraction{0.75};
+
+  /// Encode a spilled batch only when this fraction of its size could be reserved in
+  /// its GPU memory space (the encoder's headroom); otherwise it spills uncompressed.
+  /// In [0, 1]; 0 skips the check.
+  double spill_encode_reserve_fraction{0.5};
 };
 
 class configuration_input_error : public std::runtime_error {
@@ -319,7 +346,13 @@ struct sirius_config {
   // Explicit hardware-resolving helpers for internal configuration consumers.
   // Runtime startup takes parsed_sirius_config instead.
   void load_from_file(const std::filesystem::path& config_path);
+  /// Replace all settings with hardware-resolved defaults. Apply programmatic
+  /// overrides afterwards; use parsed_sirius_config::resolve for a supplied topology.
   void apply_defaults();
+  [[nodiscard]] int max_concurrent_queries() const noexcept
+  {
+    return _scan_manager_config.max_concurrent_queries;
+  }
 
   [[nodiscard]] const cucascade::memory::system_topology_info& get_hw_topology() const noexcept
   {

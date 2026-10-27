@@ -63,6 +63,10 @@ class optimizer_disable_guard {
     auto disabled  = dbconfig.options.disabled_optimizers;
     disabled.insert(duckdb::OptimizerType::IN_CLAUSE);
     disabled.insert(duckdb::OptimizerType::COMPRESSED_MATERIALIZATION);
+    disabled.insert(duckdb::OptimizerType::PARTIAL_AGGREGATE_PUSHDOWN);
+    disabled.insert(duckdb::OptimizerType::GROUPING_SETS);
+    disabled.insert(duckdb::OptimizerType::AGGREGATE_REUSE);
+    disabled.insert(duckdb::OptimizerType::DISTINCT_AGGREGATE_REWRITE);
 #ifdef DEBUG
     disabled.insert(duckdb::OptimizerType::COLUMN_LIFETIME);
 #endif
@@ -90,7 +94,7 @@ class optimizer_disable_guard {
 extracted_plan extract_logical_plan_sirius_order(duckdb::ClientContext& context,
                                                  const std::string& query)
 {
-  duckdb::Parser parser(context.GetParserOptions());
+  duckdb::Parser parser(context);
   parser.ParseQuery(query);
   auto statement_type = parser.statements[0]->type;
 
@@ -104,13 +108,14 @@ extracted_plan extract_logical_plan_sirius_order(duckdb::ClientContext& context,
   prepared->value_map = std::move(planner.value_map);
 
   duckdb::unique_ptr<duckdb::LogicalOperator> plan = std::move(planner.plan);
-  if (context.config.enable_optimizer) {
+  if (duckdb::Settings::Get<duckdb::EnableOptimizerSetting>(context)) {
     duckdb::Optimizer optimizer(*planner.binder, context);
     plan = optimizer.Optimize(std::move(plan));
   }
   plan->ResolveOperatorTypes();
   duckdb::ColumnBindingResolver resolver;
-  duckdb::ColumnBindingResolver::Verify(*plan);
+  duckdb::ColumnBindingResolver verifier(true);
+  verifier.VisitOperator(*plan);
   resolver.VisitOperator(*plan);
   return {std::move(plan), std::move(prepared)};
 }
@@ -131,14 +136,28 @@ scoped_test_query::scoped_test_query(duckdb::ClientContext& context)
   : ctx_(context.registered_state->Get<duckdb::SiriusContext>("sirius_state")),
     query_id_(next_test_query_id())
 {
-  if (usable()) { ctx_->get_data_repository_registry().create_for_query(query_id_); }
+  if (usable()) {
+    auto& lifecycle = ctx_->get_query_lifecycle_registry();
+    lifecycle.open_query(query_id_);
+    try {
+      ctx_->get_data_repository_registry().create_for_query(query_id_);
+    } catch (...) {
+      lifecycle.close(query_id_);
+      throw;
+    }
+  }
 }
 
 scoped_test_query::~scoped_test_query()
 {
   if (!usable()) { return; }
   try {
+    auto& lifecycle = ctx_->get_query_lifecycle_registry();
+    lifecycle.quiesce_and_wait_for_submissions(query_id_);
+    lifecycle.wait_for_work(query_id_);
+    lifecycle.release_resources(query_id_);
     ctx_->get_data_repository_registry().erase(query_id_);
+    lifecycle.close(query_id_);
   } catch (...) {  // best-effort: never throw out of a test-scaffolding destructor
   }
 }

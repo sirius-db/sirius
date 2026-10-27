@@ -111,11 +111,10 @@ std::unique_ptr<reclaim_join_harness> make_reclaim_join_harness(duckdb::JoinType
     0);
 
   duckdb::vector<duckdb::JoinCondition> conditions;
-  duckdb::JoinCondition cond;
-  cond.left  = duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
-  cond.right = duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
-  cond.comparison = duckdb::ExpressionType::COMPARE_EQUAL;
-  conditions.push_back(std::move(cond));
+  conditions.emplace_back(
+    duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0),
+    duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0),
+    duckdb::ExpressionType::COMPARE_EQUAL);
 
   h->hash_join = duckdb::make_uniq<sirius_physical_hash_join>(
     *h->logical_join,
@@ -273,7 +272,7 @@ TEST_CASE("hash_join BUILD_PROBE reclaim - MARK join with a zero-batch probe sid
   REQUIRE(space);
   auto h = make_reclaim_join_harness(duckdb::JoinType::MARK);
 
-  // MARK is forced into BUILD_PROBE at sizing; single GPU clamps it to one partition.
+  // A small foldable MARK build uses one BUILD_PROBE partition on a single GPU.
   auto const strategy = h->hash_join->get_partition_strategy(
     {/*total_bytes=*/1024, /*is_build_side=*/true, /*build_foldable=*/true});
   REQUIRE(strategy.build_probe);

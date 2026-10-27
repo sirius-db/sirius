@@ -18,7 +18,7 @@
 
 // sirius
 #include "expression/function_id.hpp"
-#include "helper/logical_type.hpp"  // sirius::type_id
+#include "helper/logical_type.hpp"
 
 // duckdb
 #include <duckdb/common/types.hpp>

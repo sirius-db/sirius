@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "exec/query_lifecycle_registry.hpp"
+
 #include <cuda/stream>
 
 #include <cstddef>
@@ -50,7 +52,15 @@ namespace sirius {
  * - RAII automatic state restoration on all exit paths (success, failure, exception)
  */
 class convertible_data {
+  // Base member destruction follows derived destruction (which can return a batch to a repo).
+  exec::query_lifecycle_registry::work_lease _work;
+
  public:
+  void retain_work(exec::query_lifecycle_registry::work_lease work) noexcept
+  {
+    _work = std::move(work);
+  }
+
   virtual ~convertible_data() = default;
 
   /**

@@ -477,13 +477,13 @@ struct fixture {
    * @brief Certifies @p batches through a ledger, as the build PARTITION does.
    */
   [[nodiscard]] static std::optional<sirius::op::complete_build_inventory> certify(
-    std::vector<batch_ptr> const& batches, std::size_t partitions = 2)
+    std::vector<batch_ptr> const& batches)
   {
     sirius::op::build_arrival_ledger ledger;
     for (auto const& batch : batches) {
       ledger.record(*batch);
     }
-    return ledger.certify({.repository_batches = batches.size(), .partition_count = partitions});
+    return ledger.certify({.repository_batches = batches.size()});
   }
 
   /**

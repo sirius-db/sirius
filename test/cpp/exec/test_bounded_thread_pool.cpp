@@ -16,12 +16,14 @@
 
 #include "catch.hpp"
 #include "exec/bounded_thread_pool.hpp"
+#include "exec/leased_callable.hpp"
 #include "query_id.hpp"
 
 #include <absl/cleanup/cleanup.h>
 
 #include <atomic>
 #include <chrono>
+#include <future>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -350,117 +352,233 @@ TEST_CASE("bounded_thread_pool concurrent producers all tasks execute", "[bounde
 }
 
 //===----------------------------------------------------------------------===//
-// Per-query accounting: wait_for_query / drain_and_wait
+// Query retirement uses leases; pool tags identify queued work only.
 //===----------------------------------------------------------------------===//
 
 namespace {
-//! Releases a blocking task on every exit path, so a failed REQUIRE cannot leave a worker spinning
-//! and hang the pool destructor's join().
 struct release_on_exit {
   std::atomic<bool>& flag;
   ~release_on_exit() { flag.store(true, std::memory_order_release); }
 };
 }  // namespace
 
-TEST_CASE("wait_for_query runs the query's work and ignores other queries",
-          "[bounded_thread_pool][concurrency]")
+TEST_CASE("query retirement ignores other queries and idle pool reservations",
+          "[bounded_thread_pool][query_lifecycle_gate][concurrency]")
 {
-  bounded_thread_pool pool(4, "test");
+  query_lifecycle_registry lifecycle;
   const auto qa = sirius::make_query_id(1);
   const auto qb = sirius::make_query_id(2);
-
+  lifecycle.open_query(qa);
+  lifecycle.open_query(qb);
+  bounded_thread_pool pool(5, "test");
+  auto parked = pool.reserve();  // An idle manager is capacity, not query work.
   std::atomic<bool> release_b{false};
   release_on_exit guard{release_b};
   std::atomic<int> a_done{0};
-
-  // B blocks until told otherwise. If wait_for_query(A) waited on the whole pool it would hang
-  // here -- tracking per query is exactly what makes it return.
-  {
-    auto sb = pool.reserve();
-    sb.attach(qb);
-    pool.dispatch(std::move(sb), [&] {
+  auto work_b = lifecycle.try_acquire_work(qb);
+  dispatch_with_work(
+    pool,
+    pool.reserve(),
+    qb,
+    std::move(work_b),
+    [](std::exception_ptr) noexcept {},
+    [&] {
       while (!release_b.load(std::memory_order_acquire)) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        std::this_thread::yield();
       }
     });
-  }
-
   for (int i = 0; i < 3; ++i) {
-    auto sa = pool.reserve();
-    sa.attach(qa);
-    pool.dispatch(std::move(sa), [&] { a_done.fetch_add(1, std::memory_order_relaxed); });
+    auto work = lifecycle.try_acquire_work(qa);
+    dispatch_with_work(
+      pool,
+      pool.reserve(),
+      qa,
+      std::move(work),
+      [](std::exception_ptr) noexcept {},
+      [&] { ++a_done; });
   }
-
-  pool.wait_for_query(qa);
-  // RUN, not dropped: the success path must never discard work the query scheduled.
-  REQUIRE(a_done.load() == 3);
-  REQUIRE(pool.active_for_query(qa) == 0);
-  REQUIRE(pool.active_for_query(qb) == 1);  // B untouched
-
+  lifecycle.quiesce_and_wait_for_submissions(qa);
+  lifecycle.wait_for_work(qa);
+  CHECK(a_done == 3);  // Successful retirement ran, rather than discarded, the accepted work.
+  CHECK(lifecycle.activity(qa).work == 0);
+  CHECK(lifecycle.activity(qb).work == 1);
+  CHECK(lifecycle.accepts_work(qb));
+  CHECK(parked.is_valid());
   release_b.store(true, std::memory_order_release);
-  pool.wait_all();
+  lifecycle.quiesce_and_wait_for_submissions(qb);
+  lifecycle.wait_for_work(qb);
+  lifecycle.close(qa);
+  lifecycle.close(qb);
 }
 
-TEST_CASE("an untagged reservation does not block a per-query wait",
-          "[bounded_thread_pool][concurrency]")
+TEST_CASE("a manager-held lease covers dispatch after the pool cancellation sweep",
+          "[bounded_thread_pool][query_lifecycle_gate][concurrency]")
 {
-  // The load-bearing case. Every manager loop in Sirius reserves a slot and THEN blocks waiting
-  // for a task, so a slot with no query is permanently held whenever a manager is idle. wait_all()
-  // can never return in that state; the per-query waits must, or query teardown deadlocks -- which
-  // is exactly how removing the manager-quiesce bracket broke the suite.
-  bounded_thread_pool pool(4, "test");
+  query_lifecycle_registry lifecycle;
   const auto q = sirius::make_query_id(7);
-
-  auto parked = pool.reserve();  // untagged, held for the whole test
-  REQUIRE(parked.is_valid());
-
-  std::atomic<int> ran{0};
-  {
-    auto s = pool.reserve();
-    s.attach(q);
-    pool.dispatch(std::move(s), [&] { ran.fetch_add(1, std::memory_order_relaxed); });
-  }
-
-  pool.wait_for_query(q);  // must not hang despite `parked` still being held
-  REQUIRE(ran.load() == 1);
-  REQUIRE(pool.active_for_query(q) == 0);
+  lifecycle.open_query(q);
+  bounded_thread_pool pool(1, "test");
+  auto slot      = pool.reserve();
+  auto held_work = lifecycle.try_acquire_work(q);
+  lifecycle.quiesce_and_wait_for_submissions(q);
+  pool.discard_queued(q);  // The manager has popped the task but has not dispatched it yet.
+  auto retired = std::async(std::launch::async, [&] { lifecycle.wait_for_work(q); });
+  CHECK(retired.wait_for(20ms) == std::future_status::timeout);
+  std::atomic<bool> ran{false};
+  dispatch_with_work(
+    pool,
+    std::move(slot),
+    q,
+    std::move(held_work),
+    [](std::exception_ptr) noexcept {},
+    [&] { ran = true; });
+  retired.get();
+  CHECK(ran);
+  CHECK(lifecycle.activity(q).work == 0);
+  pool.wait_all();
+  lifecycle.close(q);
 }
 
-TEST_CASE("drain_and_wait discards the query's queued work", "[bounded_thread_pool][concurrency]")
+TEST_CASE("pool cancellation discards only matching queued work outside its mutex",
+          "[bounded_thread_pool][query_lifecycle_gate][concurrency]")
 {
-  bounded_thread_pool pool(3, "test");
+  query_lifecycle_registry lifecycle;
   const auto qa = sirius::make_query_id(3);
   const auto qb = sirius::make_query_id(4);
-
+  lifecycle.open_query(qa);
+  lifecycle.open_query(qb);
+  bounded_thread_pool pool(3, "test");
   auto first  = pool.reserve();
   auto second = pool.reserve();
   auto other  = pool.reserve();
-  first.attach(qa);
-  second.attach(qa);
-  other.attach(qb);
-
-  // Stop idle workers after reserving: existing slots remain owned, and dispatching them
-  // now leaves real queued work with no race against worker execution. No extra pool API
-  // is needed to prove that cancellation actually discards tasks.
+  // Stop idle workers after reserving so queued work cannot race with worker execution.
   pool.stop();
   std::atomic<int> ran{0};
-  pool.dispatch(std::move(first), [&] { ++ran; });
-  pool.dispatch(std::move(second), [&] { ++ran; });
-  pool.dispatch(std::move(other), [&] { ++ran; });
-  absl::Cleanup cleanup = [&] {
-    pool.drain_and_wait(qa);
-    pool.drain_and_wait(qb);
+  bool destroyed = false;
+  struct reentrant_capture {
+    bounded_thread_pool& pool;
+    bool& destroyed;
+    ~reentrant_capture()
+    {
+      pool.discard_queued(sirius::make_query_id(99));
+      destroyed = true;
+    }
   };
-  REQUIRE(pool.active_for_query(qa) == 2);
-  REQUIRE(pool.active_for_query(qb) == 1);
-
-  pool.drain_and_wait(qa);
-  REQUIRE(ran.load() == 0);
-  REQUIRE(pool.active_for_query(qa) == 0);
-  REQUIRE(pool.active_for_query(qb) == 1);  // The other query's queued task is still owned.
-
-  pool.drain_and_wait(qb);
-  REQUIRE(ran.load() == 0);
-  REQUIRE(pool.active_for_query(qb) == 0);
+  auto owned      = std::unique_ptr<reentrant_capture>(new reentrant_capture{pool, destroyed});
+  auto first_work = lifecycle.try_acquire_work(qa);
+  dispatch_with_work(
+    pool,
+    std::move(first),
+    qa,
+    std::move(first_work),
+    [](std::exception_ptr) noexcept {},
+    [&, owned = std::move(owned)] { ++ran; });
+  auto second_work = lifecycle.try_acquire_work(qa);
+  dispatch_with_work(
+    pool,
+    std::move(second),
+    qa,
+    std::move(second_work),
+    [](std::exception_ptr) noexcept {},
+    [&] { ++ran; });
+  auto other_work = lifecycle.try_acquire_work(qb);
+  dispatch_with_work(
+    pool,
+    std::move(other),
+    qb,
+    std::move(other_work),
+    [](std::exception_ptr) noexcept {},
+    [&] { ++ran; });
+  absl::Cleanup cleanup = [&] {
+    pool.discard_queued(qa);
+    pool.discard_queued(qb);
+  };
+  lifecycle.quiesce_and_wait_for_submissions(qa);
+  lifecycle.quiesce_and_wait_for_submissions(qb);
+  CHECK(lifecycle.activity(qa).work == 2);
+  CHECK(lifecycle.activity(qb).work == 1);
+  pool.discard_queued(qa);
+  CHECK(destroyed);
+  CHECK(ran == 0);
+  CHECK(lifecycle.activity(qa).work == 0);
+  CHECK(lifecycle.activity(qb).work == 1);
+  pool.discard_queued(qb);
+  CHECK(ran == 0);
+  CHECK(lifecycle.activity(qb).work == 0);
+  lifecycle.wait_for_work(qa);
+  lifecycle.wait_for_work(qb);
+  lifecycle.close(qa);
+  lifecycle.close(qb);
   pool.wait_all();
+}
+
+TEST_CASE("a worker lease outlives its callback and captured destructors",
+          "[bounded_thread_pool][query_lifecycle_gate][concurrency]")
+{
+  query_lifecycle_registry lifecycle;
+  const auto q = sirius::make_query_id(1);
+  lifecycle.open_query(q);
+  std::promise<void> destroying_capture;
+  std::promise<void> release_capture;
+  auto release = release_capture.get_future().share();
+  std::atomic<std::size_t> work_at_destruction{0};
+  struct capture {
+    query_lifecycle_registry& lifecycle;
+    sirius::query_id_t query;
+    std::promise<void>& destroying;
+    std::shared_future<void> release;
+    std::atomic<std::size_t>& observed;
+    ~capture()
+    {
+      observed = lifecycle.activity(query).work;
+      destroying.set_value();
+      release.wait();
+    }
+  };
+  bounded_thread_pool pool(1, "lease-test");
+  absl::Cleanup unblock = [&] { release_capture.set_value(); };
+  auto owned            = std::unique_ptr<capture>(
+    new capture{lifecycle, q, destroying_capture, release, work_at_destruction});
+  auto work = lifecycle.try_acquire_work(q);
+  pool.dispatch(pool.reserve(), leased_callable{std::move(work), [owned = std::move(owned)] {}});
+  destroying_capture.get_future().wait();
+  lifecycle.quiesce_and_wait_for_submissions(q);
+  // The body has returned, but resource-using capture destruction has not finished.
+  CHECK(work_at_destruction == 1);
+  CHECK(lifecycle.activity(q).work == 1);
+  auto retired = std::async(std::launch::async, [&] { lifecycle.wait_for_work(q); });
+  CHECK(retired.wait_for(20ms) == std::future_status::timeout);
+  release_capture.set_value();
+  std::move(unblock).Cancel();
+  retired.get();
+  pool.wait_all();
+  CHECK(lifecycle.activity(q).work == 0);
+  lifecycle.close(q);
+}
+
+TEST_CASE("leased callables retain captures on exception and discard",
+          "[bounded_thread_pool][query_lifecycle_gate]")
+{
+  query_lifecycle_registry lifecycle;
+  const auto q = sirius::make_query_id(1);
+  lifecycle.open_query(q);
+  std::size_t observed = 0;
+  struct capture {
+    query_lifecycle_registry& lifecycle;
+    sirius::query_id_t query;
+    std::size_t& observed;
+    ~capture() { observed = lifecycle.activity(query).work; }
+  };
+  auto owned                 = std::unique_ptr<capture>(new capture{lifecycle, q, observed});
+  auto work                  = lifecycle.try_acquire_work(q);
+  invocable<void()> callable = leased_callable{
+    std::move(work), [owned = std::move(owned)] { throw std::runtime_error("worker failure"); }};
+  SECTION("exception") { CHECK_THROWS_AS(callable(), std::runtime_error); }
+  SECTION("discard without invocation") {}
+  lifecycle.quiesce_and_wait_for_submissions(q);
+  CHECK(lifecycle.activity(q).work == 1);
+  callable = nullptr;
+  CHECK(observed == 1);
+  lifecycle.wait_for_work(q);
+  lifecycle.close(q);
 }
