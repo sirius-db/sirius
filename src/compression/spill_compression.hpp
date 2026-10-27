@@ -18,7 +18,7 @@
 
 #include <cudf/column/column_view.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
+#include <cuda/stream>
 
 #include <cucascade/data/representation_converter.hpp>
 
@@ -80,7 +80,7 @@ void apply_spill_compression_config(compression_config const& config);
  * delta-bitpacked offsets. Shorter string columns and every other type are stored as is.
  */
 [[nodiscard]] std::string default_spill_plan(cudf::column_view const& column,
-                                             rmm::cuda_stream_view stream);
+                                             ::cuda::stream_ref stream);
 
 /// Thrown by a spill converter that chose not to compress (too small a saving, no
 /// encode headroom). The caller spills the batch uncompressed instead.
