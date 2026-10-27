@@ -1084,46 +1084,43 @@ std::size_t find_buffer_idx(const std::vector<cje::EncodeBufferSpec>& bufs,
   std::abort();
 }
 
-// A fused region the measure and pack modes support: Bitpack leaves behind Delta, For,
-// transformer Zigzag and Rle with two Bitpack children. Every output besides `packed` and
-// `lw_shards` is one element per chunk, or Rle's run offsets (one more).
+// A fused region worth encoding in measure and pack modes: one whose full-mode encode
+// compacts afterwards, i.e. that has a Bitpack or an Rle. Every output besides the
+// variable-length `packed`, `lw_shards` and Raw `data` is one element per chunk, or one
+// more for the per-chunk offsets of an Rle or a Raw leaf.
 bool measurable(const simpatico::CodegenHead& head,
                 const cje::EncodeKernelSpec& spec,
                 std::int32_t num_chunks)
 {
-  int bitpacks = 0;
+  bool compacts = false;
   for (auto const& origin : head.preorder) {
-    if (origin.is_raw_passthrough) return false;
     switch (origin.node->op) {
-      case cc::OpKind::Bitpack: ++bitpacks; break;
+      case cc::OpKind::Bitpack:
+      case cc::OpKind::Rle: compacts = true; break;
       case cc::OpKind::Delta:
-      case cc::OpKind::For: break;
+      case cc::OpKind::For:
       case cc::OpKind::Zigzag:
-        if (origin.node->children.empty()) return false;
-        break;
-      case cc::OpKind::Rle:
-        for (auto const& [name, child] : origin.node->children) {
-          if (child->op != cc::OpKind::Bitpack || !child->children.empty()) return false;
-        }
-        break;
+      case cc::OpKind::Raw: break;
       default: return false;
     }
   }
-  if (bitpacks == 0) return false;
+  if (!compacts) return false;
   auto const nc = static_cast<std::size_t>(num_chunks);
   for (auto const& buffer : spec.buffers) {
-    if (buffer.field == "packed" || buffer.field == "lw_shards") continue;
-    if (buffer.length != (buffer.field == "rle_runs_offsets" ? nc + 1 : nc)) return false;
+    if (buffer.field == "packed" || buffer.field == "lw_shards" || buffer.field == "data") continue;
+    bool const offsets = buffer.field == "rle_runs_offsets" || buffer.field == "offsets";
+    if (buffer.length != (offsets ? nc + 1 : nc)) return false;
   }
   return true;
 }
 
 // Encode a measurable region in two launches and no scratch. The measure launch writes every
-// per-chunk output and, for each Bitpack, its chunks' ranges and live-word count; each
-// Bitpack's output is allocated at its exact size and its chunk offsets scanned, Rle's run
-// counts are scanned into offsets, and the pack launch reads the ranges back and writes each
-// chunk's words in place. Both specs come from the same tree; the pack spec reads the measure
-// spec's buffers under the same (node, field).
+// per-chunk output and, for each Bitpack, its chunks' ranges and live-word count; for each
+// Raw leaf, its chunks' lengths. Each Bitpack's output is allocated at its exact size and its
+// chunk offsets scanned, Rle's run counts and each Raw leaf's lengths are scanned into
+// offsets in place, each Raw leaf's `data` is allocated at its scanned total, and the pack
+// launch reads the ranges back and writes each chunk in place. Both specs come from the same
+// tree; the pack spec reads the measure spec's buffers under the same (node, field).
 int launch_encode_measure_pack(const simpatico::CodegenHead& head,
                                const cje::EncodeKernelSpec& measure,
                                CUfunction measure_fn,
@@ -1142,7 +1139,7 @@ int launch_encode_measure_pack(const simpatico::CodegenHead& head,
   std::vector<rmm::device_buffer> bufs;
   bufs.reserve(measure.buffers.size());
   for (auto const& buffer : measure.buffers) {
-    if (buffer.field == "packed") {
+    if (buffer.field == "packed" || buffer.field == "data") {
       bufs.emplace_back();
       continue;
     }
@@ -1238,10 +1235,11 @@ int launch_encode_measure_pack(const simpatico::CodegenHead& head,
       rmm::device_buffer(out.live_bytes + kBitpackGuardWords * sizeof(std::uint32_t), stream, mr);
     cudaMemsetAsync(out.dense.data(), 0, out.dense.size(), stream.get());
   }
-  // Rle's run counts become the exclusive-prefix offsets the decoder reads, in place; the
-  // pack launch leaves them alone.
+  // Rle's run counts and each Raw leaf's chunk lengths become the exclusive-prefix offsets
+  // the decoder reads, in place; the pack launch leaves them alone.
   for (std::size_t i = 0; i < measure.buffers.size(); ++i) {
-    if (measure.buffers[i].field != "rle_runs_offsets") continue;
+    if (measure.buffers[i].field != "rle_runs_offsets" && measure.buffers[i].field != "offsets")
+      continue;
     std::size_t tmp_bytes = 0;
     simpatico_compute_rle_offsets_inclusive_scan(
       bufs[i].data(), static_cast<std::int32_t>(nc + 1), nullptr, &tmp_bytes, stream.get());
@@ -1253,13 +1251,40 @@ int launch_encode_measure_pack(const simpatico::CodegenHead& head,
                                                        &tmp_bytes,
                                                        stream.get());
         rc != 0) {
-      std::fprintf(
-        stderr, "simpatico::codegen: cpp encode: rle_runs_offsets scan failed (%d)\n", rc);
+      std::fprintf(stderr,
+                   "simpatico::codegen: cpp encode: %s scan failed (%d)\n",
+                   measure.buffers[i].field.c_str(),
+                   rc);
       return -1;
     }
   }
+  // Per Raw leaf: its dense output, sized from the total its scanned offsets end in.
+  struct raw_output {
+    std::size_t rows{0};
+    rmm::device_buffer data;
+  };
+  std::map<std::int32_t, raw_output> raw_outputs;
+  for (std::size_t i = 0; i < measure.buffers.size(); ++i) {
+    if (measure.buffers[i].field != "offsets") continue;
+    std::int32_t total = 0;
+    SIMPATICO_CUDA_CHECK(cudaMemcpyAsync(&total,
+                                         static_cast<std::int32_t const*>(bufs[i].data()) + nc,
+                                         sizeof(std::int32_t),
+                                         cudaMemcpyDeviceToHost,
+                                         stream.get()),
+                         -1,
+                         "cpp encode: raw offsets total DtoH failed");
+    cudaStreamSynchronize(stream.get());
+    auto const node_id = measure.buffers[i].node_id;
+    auto& out          = raw_outputs[node_id];
+    out.rows           = static_cast<std::size_t>(total);
+    out.data           = rmm::device_buffer(
+      out.rows * measure.buffers[find_buffer_idx(measure.buffers, node_id, "data")].elem_size,
+      stream,
+      mr);
+  }
 
-  // Pack: every chunk straight into its Bitpack's output.
+  // Pack: every chunk straight into its Bitpack's and Raw leaf's output.
   std::vector<CUdeviceptr> pack_ptrs(pack.buffers.size(), 0);
   for (std::size_t i = 0; i < pack.buffers.size(); ++i) {
     auto const& buffer = pack.buffers[i];
@@ -1267,6 +1292,8 @@ int launch_encode_measure_pack(const simpatico::CodegenHead& head,
       pack_ptrs[i] = reinterpret_cast<CUdeviceptr>(outputs.at(buffer.node_id).dense.data());
     } else if (buffer.field == "bp_offsets") {
       pack_ptrs[i] = reinterpret_cast<CUdeviceptr>(outputs.at(buffer.node_id).offsets.data());
+    } else if (buffer.field == "data") {
+      pack_ptrs[i] = reinterpret_cast<CUdeviceptr>(raw_outputs.at(buffer.node_id).data.data());
     } else {
       auto const j = find_buffer_idx(measure.buffers, buffer.node_id, buffer.field);
       if (buffer.field == "lw_shards") {
@@ -1353,7 +1380,27 @@ int launch_encode_measure_pack(const simpatico::CodegenHead& head,
         builder->leaves.emplace(origin.plan_node, std::move(rep));
         break;
       }
-      default: break;  // transformer Zigzag: rewrites lanes inline, owns no buffers
+      case cc::OpKind::Raw: {
+        auto const i_data = find_buffer_idx(measure.buffers, node_id, "data");
+        auto& out         = raw_outputs.at(node_id);
+        auto rep          = rep_of(simpatico::OpId::Identity);
+        rep->buffers.emplace_back(
+          "data",
+          std::make_unique<cudf::column>(
+            column_width_type(measure.buffers[i_data].elem_size),
+            static_cast<cudf::size_type>(out.rows),
+            std::move(out.data),
+            cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream),
+            0));
+        rep->buffers.emplace_back("offsets",
+                                  meta(find_buffer_idx(measure.buffers, node_id, "offsets"),
+                                       cudf::data_type(cudf::type_id::INT32),
+                                       nc + 1));
+        builder->raw_passthrough_leaves.push_back(
+          {origin.parent_node, origin.parent_channel, std::move(rep)});
+        break;
+      }
+      default: break;  // Zigzag: rewrites lanes inline, owns no buffers
     }
   }
   return 1;
@@ -1389,9 +1436,9 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
       std::fprintf(stderr, "simpatico::codegen: cpp encode: render rejected shape: %s\n", e.what());
       return 0;  // walker can't emit this shape — try legacy
     }
-    // A tree of Bitpack leaves under Delta, For, Zigzag or Rle (see measurable()) is
-    // measured first and then packed straight into outputs of their exact size, instead
-    // of into full-width slots compacted afterwards.
+    // A tree with a Bitpack or an Rle (see measurable()) is measured first and then packed
+    // straight into outputs of their exact size, instead of into full-width slots compacted
+    // afterwards.
     if (measurable(head, spec, num_chunks)) {
       auto const measure =
         cje::render(*head.tree, cxx_dtype, num_chunks, cje::EncodeRenderMode::measure);
@@ -1724,44 +1771,10 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
           break;
         }
 
-        case cc::OpKind::Zigzag: {
-          // Transformer mode (fused child on the `zigzag` channel): ZigZag
-          // rewrote the lane value inline and stored NOTHING — the child owns
-          // all buffers, so there is no rep to build for this node.
-          if (!node.children.empty()) break;
-          // Leaf mode: `zigzag` holds the transformed stream in fixed-stride
-          // OverAllocate layout: num_chunks * kChunkSize elements, element i of
-          // chunk c at [c*kChunkSize + i].  Decode is layout-aware (reads
-          // chunk_id*CHUNK + i), so no compaction is needed — the channel is
-          // published as-is and routed to a downstream codec (or stored) like
-          // any other rep channel.
-          const auto i_zz = find_buffer_idx(spec.buffers, node_id, "zigzag");
-          const std::size_t zz_rows =
-            static_cast<std::size_t>(num_chunks) * static_cast<std::size_t>(kChunkSize);
-          // Use the renderer's actual buffer elem_size to determine the column type.
-          // When Zigzag sits on an RLE "runs" channel the kernel processes int32_t
-          // run counts, so elem_size == 4 regardless of the column's element type.
-          // Using original_type for INT16 columns would make ANS compress only the
-          // low 2 bytes of each int32_t code, corrupting the run counts on decode.
-          const std::int32_t zz_elem_size = static_cast<std::int32_t>(spec.buffers[i_zz].elem_size);
-          const cudf::data_type zz_type =
-            (zz_elem_size == static_cast<std::int32_t>(cudf::size_of(original_type)))
-              ? original_type
-            : (zz_elem_size == 8) ? cudf::data_type(cudf::type_id::INT64)
-            : (zz_elem_size == 1) ? cudf::data_type(cudf::type_id::UINT8)
-                                  : cudf::data_type(cudf::type_id::INT32);
-          auto zz_col = std::make_unique<cudf::column>(
-            zz_type,
-            static_cast<cudf::size_type>(zz_rows),
-            std::move(bufs[i_zz]),
-            cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream),
-            0);
-          auto rep = std::make_unique<simpatico::codegen_fused_representation>(
-            simpatico::OpId::Zigzag, zz_type, static_cast<cudf::size_type>(num_rows));
-          rep->buffers.emplace_back("zigzag", std::move(zz_col));
-          builder->leaves.emplace(origin.plan_node, std::move(rep));
+        case cc::OpKind::Zigzag:
+          // ZigZag rewrote the lane value inline and stored nothing; its child
+          // (a fused op or a Raw passthrough) owns the buffers.
           break;
-        }
 
         case cc::OpKind::Raw: {
           // Synthesized Raw passthrough leaf (is_raw_passthrough == true).
@@ -1772,7 +1785,7 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
           //
           // Two layout families, selected by parent_op:
           //
-          //   Fixed-stride ("for" and "delta"): the kernel wrote
+          //   Fixed-stride ("for", "delta" and "zigzag"): the kernel wrote
           //     data[c*CHUNK + t] for each element t of chunk c.
           //     The offsets buffer holds c*CHUNK for chunk c — a simple stride.
           //     No compaction needed; data and offsets are copied as-is.
@@ -1793,7 +1806,7 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
           // width from a "is this channel literally named 'runs'" special
           // case plus original_type.
 
-          const bool is_fixed_stride = (origin.parent_op == "for" || origin.parent_op == "delta");
+          const bool is_fixed_stride = origin.parent_op != "rle";
 
           const auto i_data            = find_buffer_idx(spec.buffers, node_id, "data");
           const std::int32_t elem_size = static_cast<std::int32_t>(spec.buffers[i_data].elem_size);
@@ -1804,7 +1817,7 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
                                : cudf::data_type(cudf::type_id::INT32);
 
           if (is_fixed_stride) {
-            // ─── Fixed-stride Raw (FOR deltas / Delta differences) ─────────
+            // ─── Fixed-stride Raw (FOR deltas / Delta differences / ZigZag codes) ───
             // The kernel wrote data[c*CHUNK + t] and offsets[c] = c*CHUNK.
             const auto i_offs = find_buffer_idx(spec.buffers, node_id, "offsets");
 

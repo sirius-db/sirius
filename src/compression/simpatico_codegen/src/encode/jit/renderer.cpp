@@ -64,7 +64,7 @@
 // Failure handling
 // ----------------
 // Bitpack / Delta / Rle / For / Zigzag / Raw all render; Raw is a verbatim
-// passthrough leaf synthesized for a delta/rle/for channel that isn't further
+// passthrough leaf synthesized for a delta/rle/for/zigzag channel that isn't further
 // fused.  An op the renderer can't emit throws RenderError with a clear
 // diagnostic.
 
@@ -253,14 +253,6 @@ class Walker {
   std::string dtype_;
   std::int32_t num_chunks_;
   EncodeRenderMode mode_;
-  // measure and pack carry each Bitpack's metadata from one launch to the next, which
-  // only the trees listed on EncodeRenderMode support.
-  void require_full_mode(char const* op) const
-  {
-    if (mode_ != EncodeRenderMode::full) {
-      throw RenderError(std::string("render: measure/pack modes do not support ") + op);
-    }
-  }
   std::int32_t next_node_id_ = 0;
   std::ostringstream params_;  // post-(flat,n) params, joined with ",\n"
   std::ostringstream body_;    // kernel body lines
@@ -672,12 +664,6 @@ void Walker::emit_rle(const ::codegen::jit::FusedTree& node, LaneInput in)
   if (rit == node.children.end() || vit == node.children.end()) {
     throw RenderError("render: Rle missing 'runs' or 'values' child");
   }
-  // measure and pack follow each child Bitpack's metadata from one launch to the next, so
-  // both children must be Bitpack leaves (no Raw passthrough slots).
-  auto const bitpack_leaf = [](::codegen::jit::FusedTree const& child) {
-    return child.op == ::codegen::OpKind::Bitpack && child.children.empty();
-  };
-  if (!bitpack_leaf(*rit->second) || !bitpack_leaf(*vit->second)) { require_full_mode("Rle"); }
   // pack: the launcher has already scanned the measure pass's run counts in place.
   const bool write_offsets = mode_ != EncodeRenderMode::pack;
   const DtypeInfo* op_dt   = lookup_dtype(in.elem_type);
@@ -829,28 +815,27 @@ void Walker::emit_rle(const ::codegen::jit::FusedTree& node, LaneInput in)
 // =====================================================================
 // emit_raw — LEAF (passthrough).
 //
-// Raw stores its input verbatim — no compression.  Today it only
-// appears as a child of Rle (`RawRleLeaf` on the decode side), so the
-// LaneInput it receives is the parent Rle's per-run shared slab
-// (`sh_values`/`sh_counts`) with `length_expr == nruns`.
+// Raw stores its input verbatim — no compression.  It is the synthesized
+// sink of a Delta/For/Rle/Zigzag channel that no fused op consumes, so
+// its LaneInput is whatever that parent produced: a per-row expression
+// under Delta/For/Zigzag, or the parent Rle's per-run shared slab with
+// `length_expr == nruns`.
 //
-// Buffer layout — OverAllocate, mirroring Bitpack
-// -----------------------------------------------
-// The decode-side `RawRleLeaf::decode_at` reads
-// `data[offsets[chunk_id] + run]`.  A compact `data` (indexed by the
-// parent's exclusive run-prefix) would need each chunk's global run
-// base, but that prefix is only known AFTER the launcher's post-kernel
-// `rle_runs_offsets` cumsum — not at kernel time.  So we use the same
-// trick Bitpack's `packed` uses: a fixed per-chunk stride of CHUNK
-// elements.  Chunk c writes run r at `data[c*CHUNK + r]` and publishes
-// `offsets[c] = c*CHUNK`.  nruns ≤ CHUNK always, so the slot never
-// overflows; trailing slots are never read (decode masks to nruns).
-// This makes `offsets` an independent fixed-stride array rather than a
-// copy of `rle_runs_offsets`, but decode is layout-agnostic.
+// Decode reads `data[offsets[chunk_id] + i]`, so the layout is the
+// encoder's choice:
+//   full:    OverAllocate, mirroring Bitpack.  A chunk's dense base is
+//            only known after every chunk's length is, so chunk c writes
+//            element i at `data[c*CHUNK + i]` and publishes
+//            `offsets[c] = c*CHUNK`.  A length never exceeds CHUNK, so
+//            the slot never overflows; trailing slots are never read.
+//   measure: writes this chunk's length to `offsets[c+1]` (and chunk 0
+//            writes `offsets[0] = 0`); `data` is not touched.  The
+//            launcher inclusive-scans `offsets` in place.
+//   pack:    writes element i at `data[offsets[c] + i]` into a dense
+//            `data` sized from the scanned total; `offsets` is an input.
 // =====================================================================
 void Walker::emit_raw(const ::codegen::jit::FusedTree& node, LaneInput in)
 {
-  require_full_mode("Raw");
   if (!node.children.empty()) {
     throw RenderError(
       "render: Raw must be a leaf (no children) — it is a "
@@ -873,26 +858,37 @@ void Walker::emit_raw(const ::codegen::jit::FusedTree& node, LaneInput in)
   add_param("int32_t*", p_offs);
 
   const std::size_t nc = static_cast<std::size_t>(num_chunks_);
+  // pack: the launcher sizes `data` from the scanned offsets, so this length is an upper bound.
   add_buffer(id, "data", op_dt->elem_size, nc * static_cast<std::size_t>(::codegen::kChunkSize));
   add_buffer(id, "offsets", sizeof(std::int32_t), nc + 1);
 
   body_ << "    // --- node " << id << ": Raw (leaf passthrough, " << in.elem_type << ") ---\n"
         << "    {\n"
-        << "        // OverAllocate: chunk c's runs occupy the fixed slot\n"
-        << "        // [c*CHUNK, (c+1)*CHUNK); offsets[c] = c*CHUNK so the\n"
-        << "        // decode-side RawRleLeaf reads data[offsets[c] + r].\n"
-        << "        const int64_t " << dbase << " = static_cast<int64_t>(chunk_id) *\n"
-        << "                             static_cast<int64_t>(CHUNK);\n"
-        << "        if (tid == 0) {\n"
-        << "            " << p_offs << "[chunk_id] = static_cast<int32_t>(" << dbase << ");\n"
-        << "            if (chunk_id == static_cast<int32_t>(gridDim.x) - 1) {\n"
-        << "                " << p_offs << "[chunk_id + 1] =\n"
-        << "                    static_cast<int32_t>(" << dbase << " + CHUNK);\n"
-        << "            }\n"
-        << "        }\n"
         << "        const int32_t " << rlen << " = static_cast<int32_t>(" << in.length_expr
-        << ");\n"
-        << "        for (int32_t i = tid; i < " << rlen << "; i += 128) {\n"
+        << ");\n";
+  if (mode_ == EncodeRenderMode::measure) {
+    body_ << "        if (tid == 0) {\n"
+          << "            " << p_offs << "[chunk_id + 1] = " << rlen << ";\n"
+          << "            if (chunk_id == 0) " << p_offs << "[0] = 0;\n"
+          << "        }\n"
+          << "    }\n";
+    return;
+  }
+  if (mode_ == EncodeRenderMode::pack) {
+    body_ << "        const int64_t " << dbase << " = static_cast<int64_t>(" << p_offs
+          << "[chunk_id]);\n";
+  } else {
+    body_ << "        const int64_t " << dbase << " = static_cast<int64_t>(chunk_id) *\n"
+          << "                             static_cast<int64_t>(CHUNK);\n"
+          << "        if (tid == 0) {\n"
+          << "            " << p_offs << "[chunk_id] = static_cast<int32_t>(" << dbase << ");\n"
+          << "            if (chunk_id == static_cast<int32_t>(gridDim.x) - 1) {\n"
+          << "                " << p_offs << "[chunk_id + 1] =\n"
+          << "                    static_cast<int32_t>(" << dbase << " + CHUNK);\n"
+          << "            }\n"
+          << "        }\n";
+  }
+  body_ << "        for (int32_t i = tid; i < " << rlen << "; i += 128) {\n"
         << "            " << p_data << "[" << dbase << " + i] = (" << at_lane(in.read_expr, "i")
         << ");\n"
         << "        }\n"
@@ -900,31 +896,18 @@ void Walker::emit_raw(const ::codegen::jit::FusedTree& node, LaneInput in)
 }
 
 // =====================================================================
-// emit_zigzag — DUAL-MODE (inline transformer OR storing leaf).
+// emit_zigzag — INLINE TRANSFORMER.
 //
 // ZigZag is the closed-form per-lane bijection
 //   z = (uv << 1) ^ (uv >> (W-1))   (arithmetic shift supplies the sign mask)
 // which the decode side inverts with  n = (z >> 1) ^ -(z & 1).
 //
-// Transformer mode (a FUSABLE op consumes the `zigzag` channel, e.g.
-// `zigzag.zigzag -> bitpack`):  ZigZag rewrites LaneInput.read_expr to the
-// closed-form map and recurses into the child WITHOUT storing anything — a
-// pure inline transform exactly like Delta/FOR splice their residual into the
-// child's read expression.  The child stores its own buffers; ZigZag carries
-// no per-chunk metadata.
-//
-// Leaf mode (no outgoing edge, or the edge feeds a NON-fused entropy coder
-// such as `…zigzag -> ans`):  ZigZag STORES the transformed stream into the
-// single output channel "zigzag" so a downstream non-fused op can entropy-code
-// it.  Layout — fixed-stride OverAllocate, identical to FOR's Raw passthrough.
-// Element i of chunk c lands at zigzag[c*CHUNK + i]; decode reads
-// zigzag[chunk_id*CHUNK + i] with the chunk_id known at kernel entry, so no
-// per-chunk offsets buffer is needed (the stride is the constant CHUNK).  The
-// buffer is num_chunks*CHUNK elements; trailing slots of the final short chunk
-// are pre-zeroed (default) and never read — keeping the entropy tail
-// deterministic.  The channel is exposed via the rep's named_channels() and
-// routed by the compress boundary loop exactly like FOR's `references` or
-// Bitpack's `packed`.
+// ZigZag rewrites LaneInput.read_expr to the closed-form map and recurses
+// into its `zigzag` child WITHOUT storing anything — exactly like Delta/FOR
+// splice their residual into the child's read expression.  The child is a
+// fused op (e.g. `zigzag.zigzag -> bitpack`) or, when nothing fused consumes
+// the channel, a synthesized Raw passthrough leaf that stores the mapped
+// stream.  ZigZag carries no per-chunk metadata of its own.
 // =====================================================================
 void Walker::emit_zigzag(const ::codegen::jit::FusedTree& node, LaneInput in)
 {
@@ -938,66 +921,30 @@ void Walker::emit_zigzag(const ::codegen::jit::FusedTree& node, LaneInput in)
   const std::string utype = unsigned_counterpart(op_dt->elem_size);
   const int shift         = static_cast<int>(op_dt->elem_size) * 8 - 1;
 
-  // ---- Transformer mode: rewrite read_expr inline, recurse, store nothing.
-  if (!node.children.empty()) {
-    if (node.children.size() != 1) {
-      throw RenderError(
-        "render: Zigzag transformer must have exactly one child named "
-        "'zigzag' (got " +
-        std::to_string(node.children.size()) + " children)");
-    }
-    auto zit = node.children.find("zigzag");
-    if (zit == node.children.end()) {
-      throw RenderError("render: Zigzag missing 'zigzag' child (got '" +
-                        node.children.begin()->first + "' instead)");
-    }
-    // Consume a node id to keep the encode counter aligned with the
-    // decode-side DFS-preorder ids (the child must be id+1), even though
-    // ZigZag emits no params/buffers of its own.
-    const std::int32_t id = take_id();
-    const std::string v   = at_lane(in.read_expr, "(__LANE__)");
-    body_ << "    // --- node " << id << ": Zigzag (inline transform, " << in.elem_type
-          << ") ---\n";
-
-    LaneInput out;
-    out.kind      = LaneInput::Expr;
-    out.elem_type = in.elem_type;
-    out.read_expr = "(static_cast<" + in.elem_type + ">(" + "(static_cast<" + utype + ">(" + v +
-                    ") << 1) ^ " + "static_cast<" + utype + ">((" + v + ") >> " +
-                    std::to_string(shift) + ")))";
-    out.length_expr = in.length_expr;
-    emit_node(*zit->second, std::move(out));
-    return;
+  if (node.children.size() != 1) {
+    throw RenderError("render: Zigzag must have exactly one child named 'zigzag' (got " +
+                      std::to_string(node.children.size()) + " children)");
   }
+  auto zit = node.children.find("zigzag");
+  if (zit == node.children.end()) {
+    throw RenderError("render: Zigzag missing 'zigzag' child (got '" +
+                      node.children.begin()->first + "' instead)");
+  }
+  // Consume a node id to keep the encode counter aligned with the
+  // decode-side DFS-preorder ids (the child must be id+1), even though
+  // ZigZag emits no params/buffers of its own.
+  const std::int32_t id = take_id();
+  const std::string v   = at_lane(in.read_expr, "(__LANE__)");
+  body_ << "    // --- node " << id << ": Zigzag (inline transform, " << in.elem_type << ") ---\n";
 
-  // ---- Leaf mode: store the ZigZag-mapped stream to the `zigzag` channel.
-  require_full_mode("a Zigzag leaf");
-  const std::int32_t id    = take_id();
-  const std::string idstr  = std::to_string(id);
-  const std::string p_data = "zigzag_" + idstr;
-  const std::string zbase  = "zz_base_" + idstr;
-  const std::string zlen   = "zz_len_" + idstr;
-
-  add_param(in.elem_type + "*", p_data);
-  const std::size_t nc = static_cast<std::size_t>(num_chunks_);
-  add_buffer(id, "zigzag", op_dt->elem_size, nc * static_cast<std::size_t>(::codegen::kChunkSize));
-
-  body_ << "    // --- node " << id << ": Zigzag (leaf store, " << in.elem_type << ") ---\n"
-        << "    {\n"
-        << "        const int64_t " << zbase << " = static_cast<int64_t>(chunk_id) *\n"
-        << "                             static_cast<int64_t>(CHUNK);\n"
-        << "        const int32_t " << zlen << " = static_cast<int32_t>(" << in.length_expr
-        << ");\n"
-        << "        for (int32_t i = tid; i < " << zlen << "; i += 128) {\n"
-        << "            const " << in.elem_type << " _zv = (" << at_lane(in.read_expr, "i")
-        << ");\n"
-        << "            const " << utype << " _zu =\n"
-        << "                (static_cast<" << utype << ">(_zv) << 1) ^\n"
-        << "                static_cast<" << utype << ">(_zv >> " << shift << ");\n"
-        << "            " << p_data << "[" << zbase << " + i] = static_cast<" << in.elem_type
-        << ">(_zu);\n"
-        << "        }\n"
-        << "    }\n";
+  LaneInput out;
+  out.kind      = LaneInput::Expr;
+  out.elem_type = in.elem_type;
+  out.read_expr = "(static_cast<" + in.elem_type + ">(" + "(static_cast<" + utype + ">(" + v +
+                  ") << 1) ^ " + "static_cast<" + utype + ">((" + v + ") >> " +
+                  std::to_string(shift) + ")))";
+  out.length_expr = in.length_expr;
+  emit_node(*zit->second, std::move(out));
 }
 
 // =====================================================================

@@ -106,7 +106,7 @@ void io_roundtrip(char const* label,
     file.seekg(4);
     char version = 0;
     file.read(&version, 1);
-    expect(version == 14, "file version is independent of codec and nvCOMP build");
+    expect(version == 15, "file version is independent of codec and nvCOMP build");
   }
 
   // Metadata survives.
@@ -299,9 +299,8 @@ void test_for_only()
   io_roundtrip("for_only", t->view(), "input -> for -> deltas, references\n");
 }
 
-// 3b. ZigZag leaf: exercises the codegen_fused_representation("zigzag") channel
-//     write/read (OpId::Zigzag -> make_fused_rep), terminal and with an
-//     entropy tail on the stored channel.
+// 3b. ZigZag over a Raw passthrough: the stored `zigzag` channel round-trips
+//     terminal and with an entropy tail on it.
 void test_zigzag()
 {
   auto t = make_int32_table(1, 4096, 113);
@@ -729,7 +728,7 @@ void test_nvcomp_payload_compatibility()
       bool const matches     = format == (NVCOMP_VER_MAJOR >= 6 ? 6 : 5);
       bool const unavailable = cascaded && NVCOMP_VER_MAJOR >= 6;
       if (matches && !unavailable) continue;
-      std::vector<std::uint8_t> header{'H', 'P', 'L', 'N', 14};
+      std::vector<std::uint8_t> header{'H', 'P', 'L', 'N', 15};
       auto append = [&](std::uint64_t value, int bytes) {
         for (int i = 0; i < bytes; ++i)
           header.push_back(static_cast<std::uint8_t>(value >> (8 * i)));
@@ -1087,9 +1086,10 @@ void test_decimal128_bitpack_named_channels()
                    "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n");
 }
 
-// Bitpack leaves behind Delta, Rle, For or Zigzag are measured and then packed straight into
-// place. Columns of several chunks with a partial last one round-trip, for every lane width.
-void test_measured_bitpack_roundtrip()
+// Trees with a Bitpack or an Rle are measured and then packed straight into place, Raw
+// passthrough leaves included. Columns of several chunks with a partial last one round-trip,
+// for every lane width.
+void test_measured_encode_roundtrip()
 {
   constexpr int rows = 10 * 1024 + 500;
   std::vector<std::unique_ptr<cudf::table>> tables;
@@ -1111,10 +1111,26 @@ void test_measured_bitpack_roundtrip()
     "for.deltas -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n",
     "input -> zigzag -> zigzag\n"
     "zigzag.zigzag -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n",
+    "input -> rle -> runs, values\n",
+    "input -> rle -> runs, values\n"
+    "rle.runs -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n",
+    "input -> rle -> runs, values\n"
+    "rle.values -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
+    "rle.runs -> ans\n",
+    "input -> rle -> runs, values\n"
+    "rle.runs -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
+    "rle.values -> delta -> differences\n",
+    "input -> rle -> runs, values\n"
+    "rle.runs -> zigzag -> zigzag\n"
+    "rle.values -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n",
+    "input -> rle -> runs, values\n"
+    "rle.runs -> zigzag -> zigzag\n"
+    "rle.runs.zigzag -> ans\n"
+    "rle.values -> for -> deltas, references\n",
   };
   for (auto const& table : tables) {
     for (auto const& plan : plans) {
-      auto const label = "measured bitpack: " + plan;
+      auto const label = "measured encode: " + plan;
       io_roundtrip(label.c_str(), table->view(), plan);
       memory_roundtrip(label.c_str(), table->view(), plan);
     }
@@ -1163,7 +1179,7 @@ int main()
     {"decimal128_bitpack", test_decimal128_bitpack_roundtrip},
     {"decimal128_identity", test_decimal128_identity_roundtrip},
     {"decimal128_bitpack_named_channels", test_decimal128_bitpack_named_channels},
-    {"measured_bitpack_roundtrip", test_measured_bitpack_roundtrip},
+    {"measured_encode_roundtrip", test_measured_encode_roundtrip},
   };
 
   int failures = 0;

@@ -40,7 +40,7 @@
 // Supported ops
 // -------------
 // Bitpack (leaf); Raw (verbatim-passthrough leaf, synthesized for a
-// delta/rle/for channel that isn't further fused); Delta, Rle, For, and
+// delta/rle/for/zigzag channel that isn't further fused); Delta, Rle, For, and
 // Zigzag, composed arbitrarily — the staged-materialisation walker handles
 // nested Rle/Delta/For/Zigzag and Raw children.  An op the renderer can't
 // emit throws a `RenderError` with a clear diagnostic.
@@ -123,18 +123,20 @@ struct EncodeKernelSpec {
 // renderer — see codegen::jit::RenderError.
 using ::codegen::jit::RenderError;
 
-// What a rendered encode kernel does with its Bitpack nodes.
+// What a rendered encode kernel does with its Bitpack and Raw leaves.
 //   full    : reduce each chunk's range, write its metadata and its packed words into a
-//             full-width slot (`packed` sized num_chunks * stride), the layout above.
+//             full-width slot (`packed` sized num_chunks * stride), the layout above. A Raw
+//             leaf writes chunk c at data[c * CHUNK].
 //   measure : reduce and write the metadata (chunk_min/count/bits, the live-word counter)
-//             only; no packed words. `packed` is not touched.
+//             only; no packed words. `packed` is not touched. A Raw leaf writes each
+//             chunk's length to offsets[chunk + 1] and leaves `data` untouched.
 //   pack    : read each chunk's chunk_min and chunk_bits back from a measure pass instead
 //             of reducing, and write its packed words at word offset bp_offsets[chunk] of
-//             a dense, pre-zeroed `packed`, which the caller sizes from the measure pass.
-// measure and pack support Bitpack leaves behind Delta, For, transformer Zigzag and Rle (whose
-// children must then both be Bitpack leaves); in pack mode Rle leaves its run offsets, which
-// the caller scanned after the measure pass, untouched. Raw passthrough and a Zigzag leaf
-// throw RenderError.
+//             a dense, pre-zeroed `packed`, which the caller sizes from the measure pass. A
+//             Raw leaf writes chunk c at data[offsets[c]] of a dense `data`.
+// Every op renders in every mode. Between the two launches the caller inclusive-scans Rle's
+// run offsets and each Raw leaf's offsets in place; pack mode reads them and leaves them as
+// they are.
 enum class EncodeRenderMode { full, measure, pack };
 
 // Render an EncodeKernelSpec for `tree` parametrised over `element_dtype`.
@@ -150,8 +152,7 @@ enum class EncodeRenderMode { full, measure, pack };
 //
 // Throws `RenderError` if `tree` contains an op the renderer can't emit.
 // Supported ops: `Bitpack` (leaf), `Raw` (leaf passthrough), `Delta`, `Rle`,
-// `For`, `Zigzag` — composed arbitrarily in full mode; measure and pack modes
-// accept the subset listed on EncodeRenderMode.
+// `For`, `Zigzag` — composed arbitrarily, in every EncodeRenderMode.
 //
 // Throws `std::invalid_argument` for malformed inputs (empty dtype,
 // num_chunks < 1).
