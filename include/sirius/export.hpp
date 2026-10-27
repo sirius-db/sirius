@@ -16,6 +16,4 @@
 
 #pragma once
 
-#ifndef SIRIUS_EXPORT
-#define SIRIUS_EXPORT __attribute__((visibility("default")))
-#endif
+#include <sirius/c/export.h>
