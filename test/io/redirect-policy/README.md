@@ -69,12 +69,12 @@ connection/worker, four reads, footer-first false and request-log true. Only
 loopback HTTP origin and a single loopback target authority are supported.
 
 The fixture is 64 bytes to 4 MiB. Reads are at most 64 KiB; the first can be a
-footer read and later offsets are deterministic. Each returned byte is checked
+tail-range read after the ordinary HEAD; this is not cold suffix metadata discovery. Later offsets are deterministic. Each returned byte is checked
 against the fixture. The engine uses a five-second request timeout and two-second stall limit,
 retry budget 2, auth refresh budget 1, 1 ms backoff, no jitter and no Retry-After.
 See `probe.cpp` for the complete effective configuration.
 
-JSONL schema 1 has one config record (`client=sirius-rest-probe-v1`), a begin/end
+JSONL schema 2 has one config record (`client=sirius-rest-probe-v2`), a begin/end
 pair for HEAD (op 0) and each read (op 1..N), native log records with the current
 serial op, and exactly one final complete record after shutdown. A PASS requires
 all operations and bytes to match. Operation IDs are wrapper metadata, not a new
@@ -117,7 +117,7 @@ python3 "$TOOLS/qualify_local.py" --run-root "$RUN/step-r" \
   --weed-sha256 VERIFIED_WEED_SHA256
 ```
 
-The controller uses local ports 19630..19635 and 19730..19735 and creates a new
+The controller uses local ports 19630..19637 and 19730..19735 and creates a new
 private run directory. Existing listeners are not killed. A disposable 3 MiB+31
 byte object exercises first, second and last MiB ranges against the same GET
 Location, fresh captures as references, and suffix-capture-to-bounded replay.
@@ -147,3 +147,11 @@ run. Keep raw failures and successful evidence separate. `location.secret`,
 capture files and generated service configs are local evidence, not reusable
 permission or public review attachments. No production auth, performance,
 multi-target stress or general cross-open reuse qualification is claimed.
+
+## Review repairs R1/R2
+
+Schema2 binds all invocation options (including defaults), bucket/key, fixture/output paths and actual fixture size. The comparator rejects duplicate/unknown arguments and checks the origin object path against the declared bucket/key. Only fixture/output paths, declared ephemeral authorities, native elapsed time and normalized connection IDs are volatile across runs; contents remain hash-bound. Schema1 artifacts must be regenerated, not silently accepted.
+
+Expected faults require exit1, one complete failure, a matching failing operation/end record, exact wire status/body hash and native transfer sequence. The probe reports stable test-only categories: object_changed uses the actual engine exception type; HTTP307/403 categories match exact current engine runtime_error text and object; fixture_mismatch is a dedicated probe exception. Unknown errors remain unexpected_error. The validators reject crashes, missing/duplicate records, unrelated failures and undelivered injections. Engine wording changes must be reviewed, not broadened into arbitrary failures.
+
+Run `python3 test_review_controls.py --qualification RUN/qualification --manifest RUN/build/build-manifest.json --output RUN/review-controls.json` after generating fresh receipts. This exercises the independently reported cases plus operation/transfer/body and parser controls.

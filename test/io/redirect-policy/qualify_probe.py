@@ -10,6 +10,8 @@ from pathlib import Path
 import re
 import subprocess
 import threading
+import shlex
+from probe_contract import bind_invocation
 
 
 def digest(path):
@@ -72,7 +74,12 @@ def fixture(payload, fault="none"):
                     content_range = f"bytes {low}-{high}/{len(payload)}"
                     if fault == "wrong-bytes":
                         data = bytes([data[0] ^ 1]) + data[1:]
-            entry.update(status=status, location=location, bytes=len(data))
+            entry.update(
+                status=status,
+                location=location,
+                bytes=len(data),
+                body_sha256=hashlib.sha256(data).hexdigest(),
+            )
             with lock:
                 trace.append(entry)
             self.send_response(status)
@@ -113,10 +120,10 @@ def fixture(payload, fault="none"):
 
 def read_records(path):
     records = [json.loads(x) for x in Path(path).read_text().splitlines()]
-    if not records or any(r.get("schema") != 1 for r in records):
+    if not records or any(r.get("schema") != 2 for r in records):
         raise ValueError("empty or wrong-schema records")
     configs = [r for r in records if r["kind"] == "config"]
-    if len(configs) != 1 or configs[0].get("client") != "sirius-rest-probe-v1":
+    if len(configs) != 1 or configs[0].get("client") != "sirius-rest-probe-v2":
         raise ValueError("wrong client/config")
     config = configs[0]
     if records[-1]["kind"] != "complete" or records[-1]["status"] != "PASS":
@@ -167,6 +174,8 @@ def normalize(records):
         if row["kind"] == "config":
             row["endpoint"] = "ORIGIN"
             row["target"] = "TARGET"
+            row["fixture"] = "FIXTURE_PATH"  # Contents are bound by receipt digest.
+            row["out"] = "OUTPUT_PATH"  # Invocation/config equality checked first.
         if row["kind"] == "log":
             message = row["message"]
             if not message.startswith("rest_reactor: "):
@@ -185,6 +194,151 @@ def compare(left, right):
     a, b = read_records(left), read_records(right)
     if normalize(a) != normalize(b):
         raise ValueError("semantic delta")
+
+
+def validate_fault(run, receipt, fault, payload):
+    """Accept only the intended, delivered fault at the first delegated read."""
+    if receipt["exit"] != 1 or receipt["fault"] != fault:
+        raise ValueError("crash/non-contract exit or wrong fault")
+    if (
+        digest(run / "fixture.bin") != receipt["fixture_sha256"]
+        or (run / "fixture.bin").read_bytes() != payload
+    ):
+        raise ValueError("fault fixture changed")
+    records = [
+        json.loads(line) for line in (run / "probe.jsonl").read_text().splitlines()
+    ]
+    configs = [r for r in records if r.get("kind") == "config"]
+    if (
+        not records
+        or any(r.get("schema") != 2 for r in records)
+        or len(configs) != 1
+        or records[0] != configs[0]
+        or configs[0].get("client") != "sirius-rest-probe-v2"
+    ):
+        raise ValueError("missing/wrong fault records")
+    cfg = configs[0]
+    bind_invocation(receipt, cfg, len(payload))
+    begins = [r for r in records if r["kind"] == "begin"]
+    ends = [r for r in records if r["kind"] == "end"]
+    terminals = [r for r in records if r["kind"] == "complete"]
+    if (
+        [r.get("op") for r in begins] != [0, 1]
+        or [r.get("op") for r in ends] != [0, 1]
+        or len(terminals) != 1
+        or records[-1] != terminals[0]
+    ):
+        raise ValueError("missing/duplicate/incorrect fault operation")
+    code, stage, status = {
+        "second-hop": ("second_redirect", "read", 307),
+        "refuse": ("delegated_forbidden", "read", 403),
+        "changed": ("object_changed", "read", 412),
+        "wrong-bytes": ("fixture_mismatch", "verify_bytes", 206),
+    }[fault]
+    if (
+        begins[0].get("action") != "open"
+        or begins[1].get("action") != "read"
+        or ends[0].get("status") != "PASS"
+    ):
+        raise ValueError("wrong operation phase")
+    if (
+        not records.index(begins[0])
+        < records.index(ends[0])
+        < records.index(begins[1])
+        < records.index(ends[1])
+        < len(records) - 1
+    ):
+        raise ValueError("fault operation order")
+    for terminal in (ends[1], terminals[0]):
+        if any(
+            terminal.get(k) != v
+            for k, v in dict(op=1, status="FAIL", stage=stage, error_code=code).items()
+        ) or not terminal.get("error"):
+            raise ValueError("unexpected terminal semantics")
+    if {k: v for k, v in ends[1].items() if k != "kind"} != {
+        k: v for k, v in terminals[0].items() if k != "kind"
+    }:
+        raise ValueError("inconsistent failure completion")
+    if any(
+        r["kind"] not in ("config", "begin", "end", "log", "complete")
+        or ("op" in r and r["op"] not in (-1, 0, 1))
+        for r in records
+    ):
+        raise ValueError("unexpected record/operation")
+    size = min(65536, len(payload))
+    offset = len(payload) - size if cfg["footer_first"] else 0
+    if begins[1].get("offset") != offset or begins[1].get("length") != size:
+        raise ValueError("wrong fault range")
+    expected_range = f"bytes={offset}-{offset+size-1}"
+    wire = receipt["trace"]
+    if [(r["role"], r["method"], r["status"]) for r in wire] != [
+        ("origin", "HEAD", 200),
+        ("origin", "GET", 307),
+        ("target", "GET", status),
+    ]:
+        raise ValueError("fault not delivered or unexpected retry/hop")
+    origin, target = wire[1:]
+    if (
+        origin["range"] != expected_range
+        or target["range"] != expected_range
+        or target["validator"] != '"fixture-v1"'
+        or target["provider_credentials"]
+        or origin["location"] != "http://" + cfg["target"] + target["path"]
+    ):
+        raise ValueError("fault delegation/range/validator mismatch")
+    expected_body = b""
+    if fault == "wrong-bytes":
+        expected_body = (
+            bytes([payload[offset] ^ 1]) + payload[offset + 1 : offset + size]
+        )
+    if (
+        target["bytes"] != len(expected_body)
+        or target["body_sha256"] != hashlib.sha256(expected_body).hexdigest()
+    ):
+        raise ValueError("fault payload not injected")
+    if (
+        fault == "second-hop"
+        and target["location"] != "http://" + cfg["target"] + "/forbidden"
+    ):
+        raise ValueError("second-hop response missing")
+    transfers = []
+    for r in records:
+        if r["kind"] == "log" and r["message"].startswith("rest_reactor: transfer "):
+            fields = dict(word.split("=", 1) for word in shlex.split(r["message"])[2:])
+            transfers.append((r, fields))
+    if len(transfers) != 3:
+        raise ValueError("missing/extra native transfers")
+    for (r, fields), expected, op in zip(transfers, wire, (0, 1, 1)):
+        want = dict(
+            method=expected["method"],
+            authority=(
+                cfg["target"]
+                if op == 1 and expected["role"] == "target"
+                else cfg["endpoint"][7:]
+            ),
+            range=expected["range"] or "-",
+            status=str(expected["status"]),
+            curl="ok",
+            bytes=str(expected["bytes"]),
+            attempt="0",
+            delegated=str(expected["role"] == "target").lower(),
+        )
+        if (
+            r["op"] != op
+            or any(fields.get(k) != v for k, v in want.items())
+            or not records.index(begins[op])
+            < records.index(r)
+            < records.index(ends[op])
+        ):
+            raise ValueError("fault native transfer mismatch")
+    if fault == "second-hop" and not any(
+        r["kind"] == "log"
+        and r.get("op") == 1
+        and 'redirect decision=refuse reason="the storage node redirected again"'
+        in r["message"]
+        for r in records
+    ):
+        raise ValueError("missing second-hop refusal")
 
 
 def run_probe(
@@ -318,10 +472,7 @@ def main():
             raise AssertionError("accepted " + name)
     for fault in ("second-hop", "refuse", "changed", "wrong-bytes"):
         receipt = run_probe(a.binary, a.run_root / fault, payload, fault=fault)
-        if receipt["exit"] == 0 or not any(
-            r["role"] == "target" for r in receipt["trace"]
-        ):
-            raise AssertionError("fault did not reach actual library path: " + fault)
+        validate_fault(a.run_root / fault, receipt, fault, payload)
         passed("actual-" + fault + "-rejected")
     print(json.dumps(checks))
 

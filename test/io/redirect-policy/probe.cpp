@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Test-only serial REST workload. Never use production credentials with this probe.
+#include "io/io_errors.hpp"
 #include "io/rest/rest_ioctx.hpp"
 #include "io/rest/s3/sigv4_authorizer.hpp"
 #include "io/sirius_datasource.hpp"
@@ -7,6 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <fstream>
 #include <iostream>
 #include <iterator>
@@ -16,6 +18,9 @@
 #include <vector>
 
 namespace {
+struct fixture_mismatch : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
 std::string quote(std::string_view s)
 {
   std::string out = "\"";
@@ -61,7 +66,7 @@ class recorder final : public sirius::log::sink {
   void emit(std::string const& fields)
   {
     std::lock_guard lock(mutex);
-    stream << "{\"schema\":1," << fields << "}\n";
+    stream << "{\"schema\":2," << fields << "}\n";
     stream.flush();
   }
   std::atomic<int> op{-1};
@@ -75,6 +80,8 @@ int main(int argc, char** argv)
 {
   std::shared_ptr<recorder> records;
   std::shared_ptr<sirius::io::rest::rest_ioctx> ctx;
+  std::string stage = "setup";
+  std::string object;
   try {
     std::map<std::string, std::string> args;
     for (int i = 1; i < argc; i += 2) {
@@ -101,9 +108,19 @@ int main(int argc, char** argv)
         (retention != "legacy" && retention != "expanded")) {
       throw std::runtime_error("invalid policy mode");
     }
-    auto connections = args.contains("--connections") ? std::stoul(args.at("--connections")) : 1;
-    auto workers     = args.contains("--workers") ? std::stoul(args.at("--workers")) : 1;
-    auto reads       = args.contains("--reads") ? std::stoul(args.at("--reads")) : 4;
+    auto number = [&](char const* key, unsigned fallback) {
+      if (!args.contains(key)) { return fallback; }
+      auto const& value = args.at(key);
+      unsigned result{};
+      auto const parsed = std::from_chars(value.data(), value.data() + value.size(), result);
+      if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size()) {
+        throw std::runtime_error("invalid unsigned option");
+      }
+      return result;
+    };
+    auto connections = number("--connections", 1);
+    auto workers     = number("--workers", 1);
+    auto reads       = number("--reads", 4);
     if (connections < 1 || connections > 64 || workers != 1 || reads < 1 || reads > 256) {
       throw std::runtime_error("serial probe requires worker=1, C=1..64, reads=1..256");
     }
@@ -149,7 +166,10 @@ int main(int argc, char** argv)
                                          ? sirius::io::rest::redirect_route_reuse::off
                                          : sirius::io::rest::redirect_route_reuse::same_open;
     records->emit(
-      "\"kind\":\"config\",\"client\":\"sirius-rest-probe-v1\",\"endpoint\":" + quote(endpoint) +
+      "\"kind\":\"config\",\"client\":\"sirius-rest-probe-v2\",\"endpoint\":" + quote(endpoint) +
+      ",\"bucket\":" + quote(args.at("--bucket")) + ",\"key\":" + quote(args.at("--key")) +
+      ",\"fixture\":" + quote(args.at("--fixture")) + ",\"out\":" + quote(args.at("--out")) +
+      ",\"fixture_size\":" + std::to_string(expected.size()) +
       ",\"target\":" + quote(args.contains("--target") ? args.at("--target") : "") +
       ",\"reuse\":" + quote(reuse) + ",\"retention\":" + quote(retention) +
       ",\"workers\":1,\"connections\":" + std::to_string(connections) +
@@ -163,6 +183,8 @@ int main(int argc, char** argv)
       std::make_shared<sirius::io::rest::rest_reactor::reactor_context>(cfg, auth, nullptr);
     ctx = std::make_shared<sirius::io::rest::rest_ioctx>(workers, context);
     ctx->start();
+    object      = args.at("--bucket") + "/" + args.at("--key");
+    stage       = "open";
     records->op = 0;
     records->emit("\"kind\":\"begin\",\"op\":0,\"action\":\"open\"");
     auto path   = "s3://" + args.at("--bucket") + "/" + args.at("--key");
@@ -178,22 +200,42 @@ int main(int argc, char** argv)
                     ",\"action\":\"read\",\"offset\":" + std::to_string(offset) +
                     ",\"length\":" + std::to_string(length));
       std::vector<std::uint8_t> got(length);
+      stage      = "read";
       auto count = source->host_read(offset, length, got.data());
+      stage      = "verify_bytes";
       if (count != length || !std::equal(got.begin(), got.end(), expected.begin() + offset)) {
-        throw std::runtime_error("fixture bytes mismatch");
+        throw fixture_mismatch("fixture bytes mismatch");
       }
       records->emit("\"kind\":\"end\",\"op\":" + std::to_string(i + 1) +
                     ",\"status\":\"PASS\",\"bytes\":" + std::to_string(count));
     }
+    stage = "shutdown";
     ctx->shutdown();
     records->emit("\"kind\":\"complete\",\"status\":\"PASS\",\"operations\":" +
                   std::to_string(reads + 1));
     sirius::log::set_sink(nullptr);
     return 0;
   } catch (std::exception const& error) {
+    // The engine currently uses runtime_error for HTTP refusals. Match its
+    // exact message plus object; unknown errors never become expected faults.
+    std::string code = "unexpected_error";
+    if (dynamic_cast<sirius::io::object_changed_error const*>(&error)) {
+      code = "object_changed";
+    } else if (dynamic_cast<fixture_mismatch const*>(&error)) {
+      code = "fixture_mismatch";
+    } else if (error.what() ==
+               "rest_reactor: HTTP 307 (the storage node redirected again) for " + object) {
+      code = "second_redirect";
+    } else if (error.what() == "rest_reactor: HTTP 403 from the storage node for " + object) {
+      code = "delegated_forbidden";
+    }
     if (ctx) { ctx->shutdown(); }
     if (records) {
-      records->emit("\"kind\":\"complete\",\"status\":\"FAIL\",\"error\":" + quote(error.what()));
+      auto fields = "\"op\":" + std::to_string(records->op.load()) +
+                    ",\"status\":\"FAIL\",\"stage\":" + quote(stage) +
+                    ",\"error_code\":" + quote(code) + ",\"error\":" + quote(error.what());
+      records->emit("\"kind\":\"end\"," + fields);
+      records->emit("\"kind\":\"complete\"," + fields);
     }
     std::cerr << "probe: " << error.what() << '\n';
     sirius::log::set_sink(nullptr);

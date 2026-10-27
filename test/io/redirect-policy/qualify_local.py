@@ -109,7 +109,12 @@ def main():
                 },
                 controller={
                     name: digest(Path(__file__).with_name(name))
-                    for name in ("step_r.py", "qualify_local.py", "qualify_probe.py")
+                    for name in (
+                        "step_r.py",
+                        "qualify_local.py",
+                        "qualify_probe.py",
+                        "probe_contract.py",
+                    )
                 },
                 harness={
                     name: digest(a.harness_dir / name)

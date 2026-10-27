@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from urllib.parse import urlsplit
 from qualify_probe import compare, digest, read_records
+from probe_contract import bind_invocation
 
 
 def validate(run, manifest):
@@ -17,15 +18,7 @@ def validate(run, manifest):
         raise ValueError("fixture changed")
     records = read_records(run / "probe.jsonl")
     cfg = next(r for r in records if r["kind"] == "config")
-    cmd = receipt["command"]
-    for option, key in [
-        ("--endpoint", "endpoint"),
-        ("--target", "target"),
-        ("--reuse", "reuse"),
-        ("--retention", "retention"),
-    ]:
-        if cfg[key] != cmd[cmd.index(option) + 1]:
-            raise ValueError("effective config does not match invocation")
+    bind_invocation(receipt, cfg, (run / "fixture.bin").stat().st_size)
     trace = receipt["trace"]
     if not trace or not any(t["method"] == "GET" for t in trace):
         raise ValueError("missing wire capture")
