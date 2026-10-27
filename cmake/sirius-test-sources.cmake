@@ -227,6 +227,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_physical_dense_count_join.cpp
     test/cpp/operator/test_physical_sort_sample.cpp
     test/cpp/operator/test_physical_filter.cpp
+    test/cpp/operator/test_physical_gpu_values.cpp
     test/cpp/operator/test_physical_limit.cpp
     test/cpp/operator/test_physical_mark_join.cpp
     test/cpp/operator/test_physical_single_join.cpp
@@ -333,6 +334,7 @@ set(TEST_SOURCES
     test/cpp/scan/test_scan_filter_ranges.cpp
     test/cpp/scan/test_parquet_scan_sizing.cpp
     test/cpp/scan/test_parquet_virtual_column_plan.cpp
+    test/cpp/scan/test_parquet_provenance_contract.cpp
     test/cpp/scan/test_scan_output_assembly.cpp
     test/cpp/scan/test_scan_schema_normalization.cpp
     test/cpp/scan/test_stream_lineage_item5.cpp

@@ -337,7 +337,11 @@ cudf::ast::expression const* merge_dynamic_filters_into_ast(
   for (auto const& [col_idx, filter] : filters.entries()) {
     if (col_idx >= plan.output_layout.size()) { continue; }
     auto const& entry = plan.output_layout[col_idx];
-    if (entry.source != scan_plan::output_entry::DATA) { continue; }  // hive — skip
+    // DATA addresses M-space, which includes synthesized virtual columns after D.
+    // Only the physical prefix has a parquet name that the reader can filter on.
+    if (entry.source != scan_plan::output_entry::DATA || entry.idx >= plan.data_columns.size()) {
+      continue;
+    }
     auto const& parquet_col_name = plan.data_columns[entry.idx].name;
 
     if (!filter->is_available_on_device(device_id)) { continue; }
