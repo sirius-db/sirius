@@ -38,6 +38,7 @@
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/disk_io_backend.hpp>
 #include <cucascade/data/representation_converter.hpp>
+#include <cucascade/error.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <log/logging.hpp>
@@ -84,11 +85,16 @@ std::unique_ptr<cudf::column> rebind_column_stream(std::unique_ptr<cudf::column>
 }
 
 const cucascade::memory::memory_space& gpu_decode_space(
-  const cucascade::memory::memory_space* space, char const* conversion)
+  const cucascade::memory::memory_space* space, char const* conversion, ::cuda::stream_ref stream)
 {
   if (space == nullptr || space->get_tier() != cucascade::memory::Tier::GPU) {
     throw std::invalid_argument(std::string{"[compression_converters] "} + conversion +
                                 " needs a GPU target memory space");
+  }
+  int stream_device = -1;
+  CUCASCADE_CUDA_TRY(cudaStreamGetDevice(stream.get(), &stream_device));
+  if (stream_device != space->get_device_id()) {
+    CUCASCADE_FAIL("decompression stream belongs to a different GPU than the target space");
   }
   return *space;
 }
@@ -125,7 +131,7 @@ std::unique_ptr<cucascade::idata_representation> to_gpu_representation(
     return std::make_unique<decompression_pushdown_batch_representation>(
       std::move(decompressed), target, stream, decoded.outcome);
   }
-  return std::make_unique<cucascade::gpu_table_representation>(
+  return cucascade::gpu_table_representation::make_written_on(
     std::move(decompressed), target, stream);
 }
 
@@ -195,7 +201,7 @@ std::unique_ptr<cucascade::idata_representation> decompress_host_to_gpu(
 {
   nvtx_scoped_range nvtx_range{"sirius::compression::host_to_gpu"};
   auto& rep         = source.cast<compressed_host_representation>();
-  auto const& space = gpu_decode_space(target_memory_space, "host-to-GPU decompression");
+  auto const& space = gpu_decode_space(target_memory_space, "host-to-GPU decompression", stream);
 
   // Pull each compressed leaf buffer straight from the pinned host payload into
   // device memory (block-aware, since the payload is a multi-block allocation).
@@ -227,7 +233,8 @@ std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
   auto& rep         = source.cast<compressed_device_representation>();
   auto const& space = gpu_decode_space(
     target_memory_space != nullptr ? target_memory_space : &source.get_memory_space(),
-    "device-to-GPU decompression");
+    "device-to-GPU decompression",
+    stream);
   auto const& indices = rep.selected_indices();
   auto const& ct      = rep.table();
   auto* const gpu_mr  = space.get_memory_resource_of<cucascade::memory::Tier::GPU>();
@@ -269,7 +276,7 @@ std::unique_ptr<cucascade::idata_representation> decompress_disk_to_gpu(
 {
   nvtx_scoped_range nvtx_range{"sirius::compression::disk_to_gpu"};
   auto const& rep   = source.cast<compressed_disk_representation>();
-  auto const& space = gpu_decode_space(target_memory_space, "disk-to-GPU decompression");
+  auto const& space = gpu_decode_space(target_memory_space, "disk-to-GPU decompression", stream);
   auto& backend     = rep.get_memory_space().get_io_backend();
 
   std::vector<std::uint8_t> header(rep.header_bytes());

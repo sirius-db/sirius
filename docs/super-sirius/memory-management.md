@@ -220,12 +220,7 @@ with device work still in flight. The invariant that keeps this safe:
 
 Three mechanisms carry it:
 
-1. **Writer-event wait before the downgrade reads.** `convertible_data_batch::convert` waits the
-   batch's writer event on its conversion stream before `convert_to` reads a byte. Holding the
-   exclusive lock does not imply the producer's writes have landed. Sirius's GPU batch helpers
-   record missing writer events before publication, including for default-stream producers, on
-   the producing thread/device. A GPU batch without a writer event is rejected before rebinding
-   or converting; there is no device-wide synchronization fallback.
+1. **Writer ordering before conversion reads.** `convertible_data_batch::convert` retains its stricter publication contract: a GPU batch without a writer event is rejected before rebinding or conversion. Owning `make_data_batch` helpers use `gpu_table_representation::make_written_on`, where a null stream means the actual default stream on the producing device; view helpers explicitly record it too. The direct chunked spill converter independently calls `wait_for_writer` before planning string offsets or copying bytes. At the cuCascade representation boundary, unknown writers synchronize the source device, while known writers order an event on the reader stream. Pinned views with unknown provenance retain that conservative behavior. View-backed `release_table(stream)` waits for its copy before releasing the backing owner; owned release only orders the writer.
 2. **Reader events at intra-operator ownership handoffs.** The scan's `owning_table_view` records
    a reader event for zero-copy views whose owner can be replaced before control returns to the
    pipeline task (`record_reader_event`, cuCascade #184). `try_to_mutable()` then refuses, and
