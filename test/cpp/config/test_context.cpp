@@ -18,11 +18,20 @@
 #include "compression/spill_compression.hpp"
 #include "log/level.hpp"
 #include "log/sink.hpp"
+#include "op/partition_placement.hpp"
+#include "op/sirius_physical_partition_consumer_operator.hpp"
+#include "preload/candidate_store.hpp"
+#include "preload/preload_executor.hpp"
+#include "preload/preload_streams.hpp"
+#include "query_id.hpp"
 #include "sirius/ffi.hpp"
 #include "sirius_context.hpp"
 #include "util/env_guard.hpp"
+#include "utils/gpu_execution_fixture.hpp"
 #include "utils/log_test_utils.hpp"
+#include "utils/parquet_fixture_utils.hpp"
 #include "utils/sirius_test_env.hpp"
+#include "utils/transparent_execution_test_utils.hpp"
 
 #include <cudf/contiguous_split.hpp>
 #include <cudf/utilities/default_stream.hpp>
@@ -34,6 +43,7 @@
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
+#include <cucascade/data/data_repository.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
@@ -50,20 +60,24 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>  // for setenv/putenv
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <future>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <source_location>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -2860,4 +2874,441 @@ TEST_CASE("Sirius configuration warns when a preload ceiling leaves no room",
     // Committed ceiling 0.15 - 0.0 stays open; speculative 0.15 - 0.1 does too.
     CHECK(count_records(logs, "preload onto this GPU is disabled") == 0);
   }
+}
+
+TEST_CASE("Preload ceiling helpers", "[sirius][config][preload_config]")
+{
+  using sirius::preload::ceiling_fraction;
+  using sirius::preload::gpu_ceilings;
+
+  SECTION("a ceiling within rounding of zero is zero")
+  {
+    CHECK(ceiling_fraction(0.6, 0.1) == Catch::Approx(0.5));
+    CHECK(ceiling_fraction(0.6, 0.6) == 0.0);
+    CHECK(ceiling_fraction(0.6, 0.6 - 1e-12) == 0.0);
+    CHECK(ceiling_fraction(0.6, 0.7) == 0.0);
+    CHECK(ceiling_fraction(0.6, 0.6 - 1e-6) > 0.0);
+  }
+  SECTION("gpu ceilings are downgrade_stop minus the headroom per class")
+  {
+    sirius::preload::preload_executor_config cfg{};
+    cfg.gpu_committed_headroom_fraction   = 0.0;
+    cfg.gpu_speculative_headroom_fraction = 0.15;
+
+    auto const c = gpu_ceilings(cfg, 0.6);
+    CHECK(c.committed == Catch::Approx(0.6));
+    CHECK(c.speculative == Catch::Approx(0.45));
+    cfg.gpu_committed_headroom_fraction = 0.6;
+    CHECK(gpu_ceilings(cfg, 0.6).committed == 0.0);
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The preload executor inside SiriusContext
+// ---------------------------------------------------------------------------------------------
+
+namespace {
+
+/// A one-GPU context config with a DISK space under @p disk_dir and preload @p enabled.
+std::string preload_context_yaml(bool enabled, fs::path const& disk_dir)
+{
+  return std::string{R"(sirius:
+  topology:
+    num_gpus: 1
+  memory:
+    gpu:
+      usage_limit_fraction: 0.1
+      reservation_limit_fraction: 1.0
+    host:
+      capacity_bytes: 1000000000
+    disk:
+      disk_id: 0
+      capacity_bytes: 1000000000
+      downgrade_root_dirs: ")"} +
+         disk_dir.string() + R"("
+  executor:
+    pipeline:
+      num_threads: 2
+    downgrade:
+      num_threads: 1
+      monitor_period: 10ms
+    scan_manager:
+      uring_n_reactors: 1
+    preload:
+      enabled: )" +
+         (enabled ? "true" : "false") + R"(
+  telemetry:
+    enable_quent: false
+)";
+}
+
+sirius::parsed_sirius_config preload_context_config(bool enabled, fs::path const& disk_dir)
+{
+  return sirius::parsed_sirius_config::from_node(
+    YAML::Load(preload_context_yaml(enabled, disk_dir)));
+}
+
+std::unique_ptr<duckdb::SiriusContext> initialized_context(bool preload_enabled,
+                                                           fs::path const& disk_dir)
+{
+  auto ctx = std::make_unique<duckdb::SiriusContext>();
+  ctx->initialize(preload_context_config(preload_enabled, disk_dir));
+  return ctx;
+}
+
+/// Live threads of this process whose name starts with "preload-": the planner and the lanes.
+std::size_t preload_threads()
+{
+  std::size_t n = 0;
+  std::error_code ec;
+  fs::directory_iterator it{"/proc/self/task", ec};
+  for (; !ec && it != fs::directory_iterator{}; it.increment(ec)) {
+    std::ifstream comm{it->path() / "comm"};
+    std::string name;
+    if (std::getline(comm, name) && name.starts_with("preload-")) { ++n; }
+  }
+  return n;
+}
+
+cucascade::memory::memory_space& first_gpu(duckdb::SiriusContext& ctx)
+{
+  auto& manager     = ctx.get_memory_manager();
+  auto const spaces = manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+  REQUIRE_FALSE(spaces.empty());
+  auto* gpu =
+    manager.get_memory_space(cucascade::memory::Tier::GPU, spaces.front()->get_device_id());
+  REQUIRE(gpu != nullptr);
+  return *gpu;
+}
+
+std::shared_ptr<cucascade::data_batch> make_gpu_batch(cucascade::memory::memory_space& gpu,
+                                                      ::cuda::stream_ref stream)
+{
+  std::vector<cudf::data_type> types{cudf::data_type{cudf::type_id::INT32}};
+  std::vector<std::optional<std::pair<int, int>>> ranges{std::make_pair(0, 100000)};
+  auto table = sirius::create_cudf_table_with_random_data(
+    4096, types, ranges, stream, gpu.get_default_allocator());
+  stream.sync();
+  return sirius::make_data_batch(
+    std::move(table), gpu, stream, sirius::telemetry::batch_telemetry_info{});
+}
+
+/// A consumer that drains one partition per task.
+class preload_partition_consumer : public sirius::op::sirius_physical_partition_consumer_operator {
+ public:
+  preload_partition_consumer()
+    : sirius_physical_partition_consumer_operator(
+        sirius::op::SiriusPhysicalOperatorType::HASH_JOIN, {}, 0)
+  {
+  }
+};
+
+/// Holds promotions inside promote_one until released.
+struct preload_promotion_gate {
+  std::mutex mu;
+  std::condition_variable cv;
+  bool open{false};
+  int entered{0};
+
+  void enter()
+  {
+    std::unique_lock lk{mu};
+    ++entered;
+    cv.notify_all();
+    cv.wait(lk, [&] { return open; });
+  }
+
+  bool wait_entered(int n, std::chrono::milliseconds limit)
+  {
+    std::unique_lock lk{mu};
+    return cv.wait_for(lk, limit, [&] { return entered >= n; });
+  }
+
+  void release()
+  {
+    std::lock_guard lk{mu};
+    open = true;
+    cv.notify_all();
+  }
+};
+
+/// A representation that reports its destruction.
+class lifetime_probe_representation final : public cucascade::idata_representation {
+ public:
+  lifetime_probe_representation(cucascade::memory::memory_space& space,
+                                std::function<void()> on_destroy)
+    : idata_representation(space), _on_destroy(std::move(on_destroy))
+  {
+  }
+  ~lifetime_probe_representation() override
+  {
+    if (_on_destroy) { _on_destroy(); }
+  }
+
+  [[nodiscard]] std::size_t get_size_in_bytes() const override { return 64; }
+  [[nodiscard]] std::size_t get_uncompressed_data_size_in_bytes() const override { return 64; }
+  std::unique_ptr<cucascade::idata_representation> clone(::cuda::stream_ref) const override
+  {
+    return std::make_unique<lifetime_probe_representation>(get_memory_space(), nullptr);
+  }
+
+ private:
+  std::function<void()> _on_destroy;
+};
+
+}  // namespace
+
+TEST_CASE("SiriusContext creates the preload executor, its streams and its board only when enabled",
+          "[sirius][context][isolated_context][preload_context]")
+{
+  sirius::test::scratch_dir dir{"preload_context"};
+  for (bool const enabled : {true, false}) {
+    INFO("preload enabled: " << enabled);
+    auto ctx           = initialized_context(enabled, dir.path());
+    auto const streams = ctx->preload_streams_for_testing();
+    auto const board   = ctx->memory_wait_board_for_testing();
+    if (enabled) {
+      REQUIRE(ctx->get_preload_executor() != nullptr);
+      REQUIRE_FALSE(streams.expired());
+      REQUIRE_FALSE(board.expired());
+      CHECK(
+        streams.lock()->size() ==
+        ctx->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::GPU).size());
+      // The context, the preload executor and the GPU executor share it.
+      CHECK(board.use_count() >= 3);
+      CHECK(preload_threads() > 0);
+    } else {
+      CHECK(ctx->get_preload_executor() == nullptr);
+      CHECK(streams.expired());
+      CHECK(board.expired());
+      CHECK(preload_threads() == 0);
+    }
+    ctx->terminate();
+    CHECK(streams.expired());
+    CHECK(board.expired());
+    CHECK(preload_threads() == 0);
+    CHECK_THROWS(ctx->get_preload_executor());
+  }
+}
+
+TEST_CASE("SiriusContext re-initializes with preload after terminate",
+          "[sirius][context][isolated_context][preload_context]")
+{
+  sirius::test::scratch_dir dir{"preload_context"};
+  auto ctx = std::make_unique<duckdb::SiriusContext>();
+  for (int round = 0; round < 3; ++round) {
+    INFO("round " << round);
+    ctx->initialize(preload_context_config(true, dir.path()));
+    REQUIRE(ctx->get_preload_executor() != nullptr);
+    CHECK(preload_threads() > 0);
+    ctx->terminate();
+    CHECK(preload_threads() == 0);
+    CHECK(ctx->preload_streams_for_testing().expired());
+    CHECK(ctx->memory_wait_board_for_testing().expired());
+  }
+}
+
+TEST_CASE("SiriusContext terminate joins a preload promotion in flight",
+          "[sirius][context][isolated_context][preload_context]")
+{
+  using namespace std::chrono_literals;
+  sirius::test::scratch_dir dir{"preload_context"};
+  // Outlive the context: the batches' buffers, the preload hook and its repository's consumer.
+  rmm::cuda_stream stream;
+  preload_partition_consumer consumer;
+  preload_promotion_gate gate;
+  auto ctx = initialized_context(true, dir.path());
+  finally open_gate{[&] { gate.release(); }};
+  auto* preload = ctx->get_preload_executor();
+  REQUIRE(preload != nullptr);
+  auto& gpu = first_gpu(*ctx);
+
+  // A query whose consumer drains one partition per task, all pinned to this GPU.
+  auto const q = sirius::make_query_id(424242);
+  ctx->get_query_lifecycle_registry().open_query(q);
+  auto manager = ctx->get_data_repository_registry().create_for_query(q);
+  auto owned   = std::make_unique<cucascade::shared_data_repository>();
+  auto* repo   = owned.get();
+  std::vector<std::weak_ptr<cucascade::data_batch>> parts;
+  for (std::size_t p = 0; p < 2; ++p) {
+    auto batch = make_gpu_batch(gpu, ::cuda::stream_ref{stream.value()});
+    parts.push_back(batch);
+    repo->add_data_batch(std::move(batch), p);
+  }
+  manager->add_new_repository(1, "out", std::move(owned));
+  manager.reset();  // the registry owns the repositories
+  consumer.set_placement(std::make_shared<sirius::op::partition_placement const>(
+    sirius::op::partition_placement::round_robin(2, {gpu.get_device_id()})));
+  sirius::preload::repo_info info;
+  info.token              = reinterpret_cast<std::uintptr_t>(repo);
+  info.repo               = repo;
+  info.dest_priority      = sirius::query_priority_bits(q) | 1;
+  info.partition_consumer = &consumer;
+  preload->prepare_for_query(q, {info}, {gpu.get_device_id()});
+  preload->set_promotion_hook_for_testing(
+    [&gate](sirius::preload::promotion_job const&) { gate.enter(); });
+
+  // The context's own downgrade executor spills both partitions and reports them; preload brings
+  // back the partition after the one the creator drains next, and is held inside that copy.
+  auto const freed =
+    ctx->get_downgrade_executor(gpu.get_id()).request_downgrade([] { return false; }).get();
+  REQUIRE(freed > 0);
+  REQUIRE(gate.wait_entered(1, 30s));
+
+  auto terminating = std::async(std::launch::async, [&] { ctx->terminate(); });
+  CHECK(terminating.wait_for(200ms) == std::future_status::timeout);  // joins the running copy
+  gate.release();
+  REQUIRE(terminating.wait_for(60s) == std::future_status::ready);
+  REQUIRE_NOTHROW(terminating.get());
+  CHECK_FALSE(ctx->is_initialized());
+  CHECK(preload_threads() == 0);
+  CHECK(parts[0].expired());
+  CHECK(parts[1].expired());
+}
+
+TEST_CASE("SiriusContext keeps the preload streams past the repositories when terminate throws",
+          "[sirius][context][isolated_context][preload_context]")
+{
+  sirius::test::scratch_dir dir{"preload_context"};
+  // Declared before the context, whose destruction drops the probe and outlives the registry
+  // this lease belongs to (its control block survives the registry).
+  sirius::exec::query_lifecycle_registry::work_lease leaked;
+  std::weak_ptr<sirius::preload::preload_streams const> streams;
+  int probes_destroyed  = 0;
+  bool streams_at_probe = false;
+  auto ctx              = initialized_context(true, dir.path());
+  streams               = ctx->preload_streams_for_testing();
+  REQUIRE_FALSE(streams.expired());
+
+  auto const q    = sirius::make_query_id(424243);
+  auto& lifecycle = ctx->get_query_lifecycle_registry();
+  lifecycle.open_query(q);
+  auto* host = ctx->get_memory_manager().get_memory_space(
+    cucascade::memory::Tier::HOST,
+    ctx->get_memory_manager()
+      .get_memory_spaces_for_tier(cucascade::memory::Tier::HOST)
+      .front()
+      ->get_device_id());
+  REQUIRE(host != nullptr);
+  auto repo = std::make_unique<cucascade::shared_data_repository>();
+  repo->add_data_batch(cucascade::data_batch::make(sirius::get_next_batch_id(),
+                                                   std::make_unique<lifetime_probe_representation>(
+                                                     *host,
+                                                     [&] {
+                                                       ++probes_destroyed;
+                                                       streams_at_probe = !streams.expired();
+                                                     })),
+                       0);
+  ctx->get_data_repository_registry().create_for_query(q)->add_new_repository(
+    1, "out", std::move(repo));
+
+  // A lease nobody releases makes the lifecycle's clear() throw inside terminate().
+  leaked = lifecycle.try_acquire_work(q);
+  REQUIRE(leaked);
+  REQUIRE_THROWS(ctx->terminate());
+  // Preload was stopped before clear(); the repositories and the stream pools are untouched.
+  CHECK(preload_threads() == 0);
+  CHECK(probes_destroyed == 0);
+  CHECK_FALSE(streams.expired());
+
+  // The destructor's terminate() throws again; the members unwind in declaration order.
+  ctx.reset();
+  CHECK(probes_destroyed == 1);
+  CHECK(streams_at_probe);
+  CHECK(streams.expired());
+}
+
+TEST_CASE("SiriusContext initialize failure after preload start joins the preload threads",
+          "[sirius][context][isolated_context][preload_context]")
+{
+  sirius::test::scratch_dir dir{"preload_context"};
+  auto const prev_threshold                  = cudf::get_allocate_host_as_pinned_threshold();
+  std::size_t threads_at_failure             = 0;
+  auto ctx                                   = std::make_unique<duckdb::SiriusContext>();
+  ctx->after_executor_start_hook_for_testing = [&] {
+    threads_at_failure = preload_threads();
+    throw std::runtime_error("injected initialize failure");
+  };
+  REQUIRE_THROWS_WITH(ctx->initialize(preload_context_config(true, dir.path())),
+                      Catch::Matchers::ContainsSubstring("injected initialize failure"));
+  CHECK_FALSE(ctx->is_initialized());
+  CHECK(threads_at_failure > 0);
+  CHECK(cudf::get_allocate_host_as_pinned_threshold() == prev_threshold);
+
+  // Nothing stops them but the context's destruction, which joins them before the scheduler,
+  // the lifecycle and the publisher they borrow are destroyed.
+  CHECK(preload_threads() == threads_at_failure);
+  ctx.reset();
+  CHECK(preload_threads() == 0);
+}
+
+TEST_CASE("SiriusContext tracks and releases each query in the preload executor",
+          "[sirius][context][isolated_context][preload_context]")
+{
+  bool enabled = false;
+  SECTION("preload enabled") { enabled = true; }
+  SECTION("preload disabled") { enabled = false; }
+
+  for (auto* shared : {sirius::test::g_shared_env,
+                       sirius::test::g_integration_env,
+                       sirius::test::g_integration_env_2gpu}) {
+    if (shared != nullptr && shared->is_active()) { shared->pause(); }
+  }
+  sirius::test::scratch_dir dir{"preload_context"};
+  auto const config = dir.path() / "sirius.yaml";
+  {
+    std::ofstream out{config};
+    out << preload_context_yaml(enabled, dir.path());
+  }
+  auto env = std::make_unique<sirius::test::shared_test_env>(config);
+  auto con = std::make_unique<duckdb::Connection>(env->make_connection());
+  auto run = [&](std::string const& sql) {
+    auto result = con->Query(sql);
+    REQUIRE(result);
+    INFO(sql << " -> " << (result->HasError() ? result->GetError() : std::string{"ok"}));
+    REQUIRE_FALSE(result->HasError());
+    return sirius::test::collect_rows(*result);
+  };
+  run("SET gpu_execution = false");
+  auto const file = dir.file("preload_t.parquet");
+  run("COPY (SELECT range AS id, range % 7 AS k FROM range(200000)) TO " +
+      sirius::test::sql_literal(file) + " (FORMAT PARQUET)");
+  run("CREATE VIEW preload_t AS SELECT * FROM read_parquet(" + sirius::test::sql_literal(file) +
+      ")");
+  CHECK((sirius::test::get_registered_sirius_context(*con)->get_preload_executor() != nullptr) ==
+        enabled);
+
+  sirius::test::scoped_recording_log_sink log("info");
+  auto const count_lines = [&](std::string_view prefix) {
+    return std::ranges::count_if(log.sink().records(),
+                                 [&](auto const& r) { return r.message.starts_with(prefix); });
+  };
+  std::string const sql = "SELECT k, count(*), sum(id) FROM preload_t GROUP BY k ORDER BY k";
+  auto const before     = sirius::test::get_transparent_execution_stats(*con);
+  std::vector<std::vector<std::string>> gpu_rows;
+  for (int i = 0; i < 2; ++i) {
+    run("SET gpu_execution = true");
+    gpu_rows = run(sql);
+  }
+  auto const after = sirius::test::get_transparent_execution_stats(*con);
+  run("SET gpu_execution = false");
+  CHECK(gpu_rows == run(sql));
+  auto const gpu_queries = static_cast<std::ptrdiff_t>(after.executions - before.executions);
+  REQUIRE(gpu_queries == 2);
+
+  // Every query's cleanup forgets it in preload, which logs its summary then.
+  if (enabled) {
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (count_lines("[preload] query ") < gpu_queries &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    CHECK(count_lines("[preload] query ") == gpu_queries);
+  }
+
+  // With nothing left behind, terminate()'s lifecycle clear() succeeds.
+  con.reset();
+  env.reset();
+  CHECK(count_lines("SiriusContext teardown failed") == 0);
+  if (!enabled) { CHECK(count_lines("[preload]") == 0); }
 }

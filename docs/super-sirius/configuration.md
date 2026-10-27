@@ -344,9 +344,6 @@ Thread pool (default `num_threads: 1`) plus:
 
 **File:** `src/preload/config.hpp`
 
-> **Not yet active.** This release parses and validates the block, including the WARNs below,
-> but does not create the preload executor yet: `enabled: true` has no effect on execution.
-
 The preload executor undoes downgrade moves ahead of the consumer: batches the downgrade executor
 spilled to HOST or DISK are copied back to the GPU (HOST→GPU, DISK→GPU) or staged on HOST
 (DISK→HOST) before the task that reads them runs. It never encodes or decodes data, and it is
@@ -361,7 +358,7 @@ lanes and per-DISK-space lanes, whose thread counts come from the two concurrenc
 |-----|------|---------|-------------|
 | `enabled` | bool | `false` | Create and run the preload executor. |
 | `host_to_gpu_concurrency` | int (**0–64**) | 0 | Concurrent HOST→GPU copies per GPU. `0` = auto: 5 when the CPU and GPU share a C2C link, otherwise 1. |
-| `disk_concurrency` | int (**0–64**) | 0 | Concurrent copies per DISK space. `0` = auto: 5 when GPUDirect Storage is in use, otherwise 1. |
+| `disk_concurrency` | int (**0–64**) | 0 | Concurrent copies per DISK space. `0` = auto: 5 when GPUDirect Storage is in use, otherwise 1. To find out, the executor probes each DISK space once when it starts, unless the space already has a non-cuFile io context; the probe opens the cuFile driver, which may write `cufile.log` to the working directory. |
 | `cpu_affinity` | list of int | `[]` | Cores to pin the preload copy threads to. Empty = no pinning. |
 | `gpu_committed_headroom_fraction` | float (0.0–1.0) | 0.0 | Inputs of queued tasks may fill a GPU up to `downgrade_stop_fraction − this` of its capacity. |
 | `gpu_speculative_headroom_fraction` | float (0.0–1.0) | 0.1 | Repository batches with no queued consumer may fill a GPU up to `downgrade_stop_fraction − this`. Raised to `gpu_committed_headroom_fraction`, with a WARN, when smaller. |
