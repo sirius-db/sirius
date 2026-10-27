@@ -157,10 +157,83 @@ The compressed host representation decodes with the converter `pin_table` alread
 
 Candidates are fetched lazily via `convertible_data_provider` implementations:
 
-1. **Data repositories** are iterated in repository manager order. Within each repository, `convertible_data_batch_provider` iterates partitions back-to-front, then batches back-to-front, filtering for idle batches in the source memory space.
-2. **Pipeline task queue** is inspected via `convertible_gpu_pipeline_task_provider`, which uses `mutable_pop_if` to temporarily extract tasks with matching data batches. Tasks are returned to the queue via RAII on all code paths.
+1. **Data repositories** of every in-flight query, **newest query first** (descending query id: the newest query has made the least progress, so spilling it costs the least, and the oldest keeps its working set so it can finish and release memory). Within a query, repositories go in `get_repositories()` order, ascending `{operator id, port}`. Within each repository, `convertible_data_batch_provider` iterates partitions back-to-front, then batches back-to-front, filtering for idle batches in the source memory space. Batches a queued task has subscribed are skipped.
+2. **Pipeline task queue** is inspected via `convertible_gpu_pipeline_task_provider`, which uses `mutable_pop_if` to temporarily extract tasks with matching data batches, starting at the **back** of the queue. Tasks are returned to the queue via RAII on all code paths.
 
 Candidates are converted individually via `convertible_data::convert()`, which handles state locking, memory reservation, tier conversion, and failure rollback atomically.
+
+When the preload executor is enabled, each successful conversion is recorded and published as a `batch_downgraded` event after the batch's lock is released. With no subscriber, nothing is recorded and the check costs one atomic load per request.
+
+## Preload Executor
+
+**Files:** `src/preload/` (`preload_executor.{hpp,cpp}`, `promotion.{hpp,cpp}`, `candidate_store.{hpp,cpp}`, `preload_policy.hpp`, `hw_caps.{hpp,cpp}`, `preload_streams.hpp`, `preload_stats.hpp`, `config.hpp`), `src/memory/memory_wait_board.hpp`
+
+The preload executor undoes downgrade moves before the consumer asks for the data: batches spilled GPU→HOST or GPU→DISK are copied back to the GPU, and batches spilled HOST→DISK are staged on HOST. It is **off by default** (`sirius.executor.preload.enabled`, see [configuration](configuration.md#siriusexecutorpreload)); when off, no executor, board, stream pool, subscription or conversion record exists. It is advisory: a refused, failed or missed promotion costs performance only, because `lock_and_prepare_batch` still moves every input the consuming task needs.
+
+**What it moves, and how.** HOST→GPU and DISK→GPU are `convert_to<gpu_table_representation>`, and DISK→HOST is `convert_to<host_data_representation>`: raw buffer copies, never an encode. An `encoded_data_representation` is staged DISK→HOST byte for byte through `relocate_to`, and goes to a GPU only through a registered decoding converter to `gpu_table_representation` (none is registered today); GPUs only ever receive `gpu_table_representation`.
+
+**Where candidates come from.** Only from `batch_downgraded` events. A candidate holds a `weak_ptr` to its batch plus where it was moved from and to; a batch whose last owner dropped it is forgotten.
+
+**Threads.** One planner thread (`preload-plan`) and pull-based lanes: one HOST→GPU lane per GPU (`preload-h2g-<gpu>-<i>`; 5 threads when the CPU and GPU share a C2C link, else 1) and one lane per DISK space (`preload-dsk-<disk>-<i>`; 5 threads with GPUDirect Storage, else 1). A DISK→GPU copy without GDS also takes one of its GPU's HOST→GPU slots, since it crosses the same link. There is no timer: the planner waits on a condition variable and runs a pass only when an event (`batch_downgraded`, `task_completed`, `memory_wait_ended_for_task`, `task_created`, `task_deployed`, `pipeline_closed`, or an idle event) or a finished promotion marks it dirty. A task that succeeds, a stalled reserve phase that ends, a pipeline that closes and a query whose repositories are erased advance the memory epochs that refusals are stamped against. Repeated idle events (`task_queue_empty`, `executor_awaiting_task`), which the scheduler re-publishes while a device waits, ask for one pass until some other event arrives.
+
+### What gets promoted, in which order
+
+Preload reverses the downgrade victim order (above), sharpened by the scheduler's own priorities:
+
+- **Class A (committed): inputs of queued tasks.** Each pass visits every GPU's queue bucket in pop order (`multi_index_priority_queue::visit_in_pop_order`, which removes nothing), skips the first `H` tasks (`head_margin_tasks`, default `executor.pipeline.num_threads`), and takes the inputs of the next `lookahead_tasks` (8). The scheduler is about to run the head tasks, whose executor sizes and uploads them itself. The bucket shared by all GPUs skips `H × number of GPUs`, since every ready GPU pops it.
+- **Class B (speculative): repository batches nobody has subscribed yet**, in two narrow cases only. For a consumer behind an unfinished FULL barrier, the front batches of its lowest partitions are staged DISK→HOST. For a ready consumer that drains one partition per task in ascending order, the partition after the one the task creator drains next (`repository_partition_lookahead`, default 1) moves to the GPU its placement names, front positions only (`repository_window`, default 2). Any other ready repository is left to the task creator, which wraps it in a task within one pass (it then becomes class A).
+- **Order.** Oldest query first, then destination-pipeline priority, class A before B at equal priority, then partition and FIFO position. GPU targets come before HOST staging.
+
+### Judiciousness: ceilings, windows and hold-offs
+
+Ceilings are fractions of each space's capacity, measured as `consumed = max_memory − available`, the same measure `should_downgrade_memory()` uses:
+
+| Ceiling | Default | Why |
+|---|---|---|
+| Class A on a GPU | `downgrade_stop_fraction − gpu_committed_headroom_fraction` (0.6) | The consuming task's reservation estimate excludes inputs already on its GPU, so these bytes are pre-paid |
+| Class B on a GPU | `downgrade_stop_fraction − gpu_speculative_headroom_fraction` (0.5) | Extra demand: kept a step lower |
+| HOST staging | `downgrade_stop_fraction − host_headroom_fraction` (0.7) | Leaves room for GPU spills, which land on HOST first |
+
+Every ceiling is at or below `downgrade_stop`, so **preload alone never starts a downgrade**, and the hysteresis band `[stop, trigger]` stays the running tasks' working room. Each GPU also bounds the bytes preloaded but not yet consumed (`gpu_lookahead_fraction`, 0.2; class B at most `speculative_fraction`, 0.05) and the bytes being copied in at once (`max_inflight_fraction`, 0.1); a batch whose need exceeds `max_batch_fraction` (0.1) never targets a GPU.
+
+**Hold-offs are synchronous.** The `memory_wait_board` (`src/memory/memory_wait_board.hpp`, shared by `SiriusContext` and the GPU pipeline executors only when preload is on) counts, per GPU, the tasks in a stalled reserve phase (a `waiter` the executor enters before it blocks and releases when the whole phase ends, across a partial grant and the downgrade path) and the tasks rescheduled after an OOM (an `oom_token` the rescheduled task owns until it is destroyed). While either count is non-zero, preload starts no copy into that GPU and stages nothing on its NUMA-local HOST. The planner, the lane, and the worker (before it reserves and again right before the copy) all read the board with atomic loads; event delivery lag never matters.
+
+**Gates are stamped at dispatch.** A worker refused for memory stamps the target with the memory epoch it saw when the job was taken, so any memory event that arrives during the attempt, or later, re-enables exactly one retry. A contended batch lock waits for the next queue event and is dropped after `max_lock_attempts`. Planner refusals stamp nothing: budgets are recomputed from live state on every pass.
+
+**Per-promotion order (`promote_one`).** Board check → `make_reservation_or_null` on the target → re-check the ceiling with the reservation counted (concurrent workers can only over-refuse) → `try_to_mutable` on the batch (never blocking; failure = contended) → validate where the batch is → exact need, including the INT32→INT64 string-offset widening of the HOST/DISK→GPU converters → `grow_by` if short → board and ceiling re-check → copy. An OOM is local to the candidate: one retry with a doubled estimate, then the candidate never targets a GPU again.
+
+**Ping-pong protection.** Preload takes queue positions past the head margin, the oldest query and the FIFO front; downgrade takes the queue back, the newest query and the FIFO back. A batch is promoted at most `max_promotions_per_batch` (2) times per query; after one bounce (a downgrade record newer than its promotion) it is never promoted speculatively again. Under sustained pressure that drives a GPU back to its trigger, a queued task's preloaded inputs can still be the GPU-resident batches nearest the queue's back, which tier 2 takes first; the `bounce` counter reports how often.
+
+### Invariants
+
+| # | Invariant |
+|---|---|
+| I1 | Preload never takes a space's consumed bytes above its preload ceiling, checked after its own reservation and after any growth of it. |
+| I2 | It never blocks under a batch lock: only `try_to_read_only` / `try_to_mutable`, `make_reservation_or_null` and `grow_by`; the reservation is made before the lock. |
+| I3 | The executor's mutex is a leaf: under it, preload never calls into the task queue, repositories, batch locks, memory spaces, the publisher or the allocators. |
+| I4 | Candidates hold `weak_ptr`s. A strong batch reference, a repository pointer or an operator pointer is used only while holding the query's `try_acquire_work` lease. |
+| I5 | No GPU→GPU moves: a GPU target is used only when the consumer's device is deterministic. |
+| I6 | GPUs only receive `gpu_table_representation`. |
+| I7 | Re-promotion is bounded (see ping-pong protection). |
+| I8 | Advisory only: `lock_and_prepare_batch` stays authoritative. |
+| I9 | Off means absent. |
+| I10 | No timer and no lost wake-up: every wait is an untimed condition-variable wait, and refusals stamp the epoch seen at dispatch. |
+| I11 | No resurrection: only `prepare_for_query` creates per-query state; outcomes and events for a query preload does not know update counters only. |
+| I12 | Hold-offs are read from the board, never derived from event delivery. |
+
+### Accounting handoff
+
+A promotion reserves on the target space, attaches the reservation to the copy, and then calls `reset_stream_reservation`: the preloaded bytes stay counted on the space as plain allocations, and the consuming task's reservation estimate no longer includes them, because they are already on its GPU. Their eventual free is charged to the consuming task's reservation. A promotion that lands after the consumer sized its reservation over-counts for that task's lifetime; it never under-counts. HOST→GPU copies run on the target space's shared stream pool (the converter's choice); DISK→GPU copies use preload's own per-GPU `exclusive_stream_pool`s (`preload_streams`), which `SiriusContext` destroys only after the data repositories, since a preloaded batch's buffers are freed on that stream until a consumer rebinds them. With `per_stream_reservation: true`, HOST→GPU allocations bypass the attached reservation, so the ceiling is held less strictly (a WARN at start).
+
+### Query lifecycle and teardown
+
+`SiriusContext::create_query` registers the query's repositories (`prepare_for_query`); `retire_query_work` purges its candidates just before waiting for its work (`retire_query`), and every running promotion holds a lease, so that wait covers it; `release_query_state` and the best-effort failure path call `forget_query`, which logs the query's one-line `[preload] query <id>:` summary. `terminate()` stops preload after the task creator and before `query_lifecycle_.clear()`.
+
+### Observability
+
+`preload_executor::stats()` returns every counter (`src/preload/preload_stats.hpp`): intake, planner passes and refusals by reason, worker outcomes, promotions and bytes per kind, accuracy (`hit`, `bounce`, `mispredicted_device` and its class-B part, `wasted_unconsumed`), lane high-water marks and timings. Logs use the `[preload]` prefix: an INFO line at start with each GPU's lane cap and ceilings, an INFO summary per query, a DEBUG line per planner pass with each space's consumed bytes and budget (or the refusal that closed it), and a TRACE line per promotion.
+
+**Measured** (one RTX 6000 Ada over PCIe, no C2C, no GDS; `test/cpp/integration/test_gpu_execution_preload.cpp` and TPC-H SF100 with a 3–4 GiB GPU limit): results are identical with preload on and off; wall time and GPU kernel time are unchanged within noise, including while about 800 HOST→GPU promotions (1.4 GB) run under a spilling aggregate. Most promotions are class A inputs of tasks that drain spilled data after a FULL barrier; under saturation the planner is mostly refused by the ceilings or held off by stalled tasks, which is the intended behavior. SF100 Q9 at a 3 GiB limit bounces about one promotion per query (17–35% of a handful); at 4 GiB nothing bounces.
 
 ## Memory Consumption History
 

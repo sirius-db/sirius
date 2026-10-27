@@ -399,6 +399,18 @@ struct executor_fixture {
     publisher->publish_pipeline_closed(q, 0, 0);
   }
 
+  void awaiting(int gpu_id = 0)
+  {
+    ++expected_events;
+    publisher->publish_executor_awaiting_task(gpu_id);
+  }
+
+  void queue_empty()
+  {
+    ++expected_events;
+    publisher->publish_task_queue_empty();
+  }
+
   void settle() { REQUIRE(exec->wait_until_quiescent_for_testing(30s, expected_events)); }
 
   /// Wait until every published event has been handled, without waiting for quiescence.
@@ -1436,6 +1448,35 @@ TEST_CASE_METHOD(executor_fixture,
     CHECK(tier_of(*b) == Tier::HOST);
   }
   CHECK(stat(*exec, counter::promoted_d2h) == n_repos);
+}
+
+TEST_CASE_METHOD(executor_fixture,
+                 "preload executor: repeated idle events ask for one pass",
+                 "[preload_executor]")
+{
+  build();
+  auto const q     = open_query(1);
+  auto const batch = spilled(*host);
+  // A candidate with no queued consumer: passes plan nothing, and it stays a candidate.
+  downgraded(q, record(batch));
+  settle();
+  auto const passes = stat(*exec, counter::passes);
+
+  // The scheduler publishes these on every turn of its loop while a device cannot take a task.
+  for (int i = 0; i < 50; ++i) {
+    awaiting(0);
+    queue_empty();
+  }
+  settle();
+  CHECK(stat(*exec, counter::passes) == passes + 1);
+
+  // Any other event re-arms the idle wake-up.
+  task_created(q);
+  settle();
+  awaiting(0);
+  settle();
+  CHECK(stat(*exec, counter::passes) == passes + 3);
+  CHECK(tier_of(*batch) == Tier::HOST);
 }
 
 TEST_CASE_METHOD(executor_fixture,

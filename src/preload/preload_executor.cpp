@@ -143,6 +143,13 @@ counter refusal_counter(refusal r) noexcept
   return counter::refused_no_target;
 }
 
+/// A budget for the per-pass log: the bytes it allows, or the refusal that closed it.
+std::string budget_text(std::size_t bytes, refusal closed)
+{
+  if (closed != refusal::none) { return std::string{counter_name(refusal_counter(closed))}; }
+  return std::format("{}MiB", bytes >> 20);
+}
+
 [[maybe_unused]] std::string_view outcome_name(promotion_outcome o) noexcept
 {
   switch (o) {
@@ -826,7 +833,7 @@ void preload_executor::on_task_queue_empty(event::event_id_t, event::timestamp_t
 {
   hook_scope const in_hook{this};
   std::lock_guard const lk{_mu};
-  if (_store.has_candidates()) { mark_dirty(dirty::idle); }
+  mark_idle();
   ++_events_handled;
   _quiescent_cv.notify_all();
 }
@@ -837,15 +844,25 @@ void preload_executor::on_executor_awaiting_task(event::event_id_t,
 {
   hook_scope const in_hook{this};
   std::lock_guard const lk{_mu};
-  if (_store.has_candidates()) { mark_dirty(dirty::idle); }
+  mark_idle();
   ++_events_handled;
   _quiescent_cv.notify_all();
+}
+
+void preload_executor::mark_idle() noexcept
+{
+  // While a device waits for a task it cannot take, the scheduler publishes these on every turn
+  // of its loop: only the first one after another event can change a plan.
+  if (_idle_wake_pending || !_store.has_candidates()) { return; }
+  mark_dirty(dirty::idle);
+  _idle_wake_pending = true;
 }
 
 void preload_executor::mark_dirty(std::uint32_t reasons) noexcept
 {
   if (_dirty == 0) { _dirty_since = std::chrono::steady_clock::now(); }
   _dirty |= reasons;
+  _idle_wake_pending = false;
   _planner_cv.notify_one();
 }
 
@@ -886,7 +903,8 @@ void preload_executor::planner_loop(std::stop_token const& st) noexcept
       }
       scan_repositories(*snap, in);
       read_spaces(in);
-      in.scanned = true;
+      in.log_budgets = log::get_sink()->should_log(log::level::debug);
+      in.scanned     = true;
     } catch (...) {
       in = plan_input{};
       log_unexpected("scan");
@@ -917,12 +935,31 @@ void preload_executor::planner_loop(std::stop_token const& st) noexcept
       // Formatted outside the lock: event hooks wait on it.
       lk.unlock();
       log::log_noexcept([&] {
+        std::string budgets;
+        for (std::size_t i = 0; i < summary->gpus.size(); ++i) {
+          auto const& [consumed, b] = summary->gpus[i];
+          auto const a              = b.available(klass::A);
+          auto const s              = b.available(klass::B);
+          budgets += std::format(" | GPU:{} consumed {}MiB A {} B {}",
+                                 _gpus[i].device,
+                                 consumed >> 20,
+                                 budget_text(a.bytes, a.bytes == 0 ? a.reason : refusal::none),
+                                 budget_text(s.bytes, s.bytes == 0 ? s.reason : refusal::none));
+        }
+        for (std::size_t j = 0; j < summary->hosts.size(); ++j) {
+          auto const& [consumed, b] = summary->hosts[j];
+          budgets += std::format(" | HOST:{} consumed {}MiB staging {}",
+                                 _hosts[j].device,
+                                 consumed >> 20,
+                                 budget_text(b.room, b.room == 0 ? b.closed : refusal::none));
+        }
         SIRIUS_LOG_DEBUG(
-          "[preload] pass: {} class A task(s), {} class B item(s), {} planned, {} assigned",
+          "[preload] pass: {} class A task(s), {} class B item(s), {} planned, {} assigned{}",
           summary->class_a_tasks,
           summary->class_b_items,
           summary->planned,
-          summary->assigned);
+          summary->assigned,
+          budgets);
       });
       lk.lock();
     }
@@ -1267,6 +1304,18 @@ preload_executor::pass_summary preload_executor::install_plan(plan_input const& 
     host_budgets.push_back(make_host_budget_state(hin, *_board));
   }
 
+  pass_summary summary{in.class_a.size(), in.class_b.size(), entries.size(), 0, {}, {}};
+  if (in.log_budgets) {
+    summary.gpus.reserve(gpu_budgets.size());
+    for (std::size_t i = 0; i < gpu_budgets.size(); ++i) {
+      summary.gpus.emplace_back(in.gpus[i].consumed, gpu_budgets[i]);
+    }
+    summary.hosts.reserve(host_budgets.size());
+    for (std::size_t j = 0; j < host_budgets.size(); ++j) {
+      summary.hosts.emplace_back(in.hosts[j].consumed, host_budgets[j]);
+    }
+  }
+
   auto const result = assign_head_of_line(items, gpu_budgets, host_budgets);
   for (std::size_t r = 0; r < result.refusals.size(); ++r) {
     auto const reason = static_cast<refusal>(r);
@@ -1278,7 +1327,8 @@ preload_executor::pass_summary preload_executor::install_plan(plan_input const& 
   _room_refused =
     refused(refusal::ceiling) || refused(refusal::window) || refused(refusal::speculative_window);
   rebuild_ready_lists(entries, result);
-  return {in.class_a.size(), in.class_b.size(), entries.size(), result.assigned.size()};
+  summary.assigned = result.assigned.size();
+  return summary;
 }
 
 bool preload_executor::add_entry(std::vector<plan_entry>& entries,

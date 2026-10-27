@@ -610,8 +610,17 @@ TEST_CASE("candidate_store applies the planner's ledger classification", "[prelo
     f.store.note_consumer_device(3, 0);
     f.store.note_consumer_device(3, 1);
     CHECK(f.counters.get(counter::mispredicted_device) == 1);
+    CHECK(f.counters.get(counter::mispredicted_device_b) == 1);
     f.store.note_consumer_device(3, 0);  // the same entry, seen again: counted once
     CHECK(f.counters.get(counter::mispredicted_device) == 1);
+    CHECK(f.counters.get(counter::mispredicted_device_b) == 1);
+  }
+
+  SECTION("a class-A misprediction is not counted as class B")
+  {
+    f.store.note_consumer_device(2, 1);  // reclassified to A above
+    CHECK(f.counters.get(counter::mispredicted_device) == 1);
+    CHECK(f.counters.get(counter::mispredicted_device_b) == 0);
   }
 }
 

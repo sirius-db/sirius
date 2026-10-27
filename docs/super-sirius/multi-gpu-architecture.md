@@ -229,6 +229,26 @@ On OOM the engine triggers a **downgrade**:
 
 After a downgrade frees enough space, the rescheduled task retries. The reservation tracking ensures the same task doesn't try to allocate more bytes than its reservation; if the reservation itself can't grow, the task fails out of the pipeline.
 
+### Preload targets across GPUs
+
+The optional preload executor ([Memory Management](memory-management.md#preload-executor)) copies spilled batches back to a GPU before their consumer runs. It never moves a batch between GPUs (cross-GPU stays the consumer's `clone_to`, above), so it targets a GPU only when the consumer's device is already decided:
+
+| Batch | Target |
+|---|---|
+| Input of a task queued in GPU `d`'s bucket (preference is binding) | GPU `d` |
+| Input of a task in the no-preference bucket, one GPU | That GPU |
+| Input of a task in the no-preference bucket, several GPUs | DISK→HOST staging only; HOST-resident batches stay put |
+| Repository batch of a partition-draining consumer, in a partition after the one the creator drains next | The partition's placement device (`partition_placement::device_for`), else the query's single admitted GPU; otherwise not planned |
+| Repository batch of a consumer behind an unfinished FULL barrier | DISK→HOST staging only |
+
+**Head margins.** Each GPU's own bucket skips its first `head_margin_tasks` tasks (default: `executor.pipeline.num_threads`), which that GPU's executor is about to size and upload itself. Every ready GPU pops the no-preference bucket after its own (see the scheduler matcher above), so that bucket drains up to once per GPU and its margin is `head_margin_tasks × number of GPUs`.
+
+**Staging HOST.** DISK→HOST staging goes to the NUMA-local HOST of the GPU the batch is headed for; else the HOST it was spilled from, else the NUMA node of the GPU it was first evicted from. HOST 0 is used only when none of these is known; a node known to have no HOST space leaves the batch on DISK. Staging toward a HOST is held off while any of its NUMA-local GPUs has a stalled task, a pending OOM retry, or is above its downgrade trigger, since GPU spills need that HOST headroom first.
+
+**Per-GPU lanes and caps.** Each GPU has its own HOST→GPU lane: 5 concurrent copies when cuCascade's topology reports a C2C link between that GPU and the CPU (`gpu_runtime_attributes::c2c`, from NVML or the driver attributes), otherwise 1; a DISK→GPU copy without GDS takes one of the same slots. Hold-offs, ceilings, lookahead windows and the in-flight byte cap are all per GPU.
+
+**Accuracy.** `mispredicted_device` counts preloaded batches later seen queued for a different GPU (`mispredicted_device_b` is its speculative part); such a batch is cloned by its consumer like any other cross-GPU input. Committed (queued-task) targets are exact, and `test_gpu_execution_preload.cpp`'s `[multi_gpu]` case asserts they never mispredict.
+
 ## Concurrency Invariants (Quick Reference)
 
 | Invariant | Where enforced | Why |

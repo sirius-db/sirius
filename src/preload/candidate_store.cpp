@@ -830,6 +830,7 @@ void candidate_store::note_consumer_device(std::uint64_t batch_id, std::size_t g
   if (static_cast<std::size_t>(it->second.gpu) != gpu) {
     it->second.mispredicted = true;
     count(it->second.query, counter::mispredicted_device);
+    if (it->second.k == klass::B) { count(it->second.query, counter::mispredicted_device_b); }
   }
 }
 

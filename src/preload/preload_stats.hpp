@@ -32,7 +32,8 @@ namespace sirius::preload {
 // - planning: planner passes and the items they produce;
 // - planner refusals (refused_*): why the planner did not assign an item to a target;
 // - worker refusals and work: what promotion attempts ended with;
-// - accuracy: whether preloaded batches were consumed where they were put;
+// - accuracy: whether preloaded batches were consumed where they were put (mispredicted_device_b
+//   is the class-B part of mispredicted_device);
 // - timing: microseconds spent per promotion kind, and the planner's wake-to-dispatch latency.
 // High-water marks (*_max) are raised, never added to.
 #define SIRIUS_PRELOAD_COUNTERS(X) \
@@ -86,6 +87,7 @@ namespace sirius::preload {
   X(hit)                           \
   X(bounce)                        \
   X(mispredicted_device)           \
+  X(mispredicted_device_b)         \
   X(wasted_unconsumed)             \
   X(late_outcome_after_retire)     \
   X(promote_us_sum_h2g)            \
