@@ -493,7 +493,8 @@ struct consumer_test_access {
   /**
    * @brief Compares captured execution decisions except the fusion switch
    *
-   * The caller supplies the same residual expression when preparing both programs.
+   * Preparing a program takes its layout's residual, so the caller prepares each program from its
+   * own layout holding an equivalent residual.
    */
   static bool same_selection(application_program const& left,
                              application_program const& right) noexcept;

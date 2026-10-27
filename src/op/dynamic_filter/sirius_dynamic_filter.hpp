@@ -171,19 +171,23 @@ class sirius_mask_applicable {
   /**
    * @brief Describes a device-local probe for try_fused_membership_mask
    *
-   * Unlike compute_mask[_if](),his host-only operation submits no GPU work and allocates no device
-   * storage. It simply describes how a fused kernel should perform a given membership test. A
-   * successful descriptor borrows this filter's replica and the probe column until GPU completion.
-   * False leaves `out` unchanged and does not imply that compute_mask must decline.
+   * Unlike compute_mask[_if](), this host-only operation submits no GPU work and allocates no
+   * device storage. It simply describes how a fused kernel should perform a given membership test.
+   * A successful descriptor borrows this filter's replica and the probe column until GPU
+   * completion. False leaves `out` unchanged and does not imply that compute_mask must decline.
+   *
+   * A true result replaces compute_mask[_if]() for this probe: the descriptor must keep exactly the
+   * rows compute_mask_if() would keep for the same probe and prior, and implies compute_mask[_if]()
+   * would not decline. An override of compute_mask[_if]() must therefore also override this.
    *
    * @param probe Keys to probe
    * @param device_id Device holding the filter replica
    * @param out Destination for a supported descriptor
    * @return Whether the descriptor is ready
    */
-  [[nodiscard]] virtual bool prepare_fused_probe(cudf::column_view const& probe,
-                                                 int device_id,
-                                                 detail::fused_probe& out) const
+  [[nodiscard]] virtual bool prepare_fused_probe(cudf::column_view const& /*probe*/,
+                                                 int /*device_id*/,
+                                                 detail::fused_probe& /*out*/) const
   {
     return false;
   }

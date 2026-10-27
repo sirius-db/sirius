@@ -3537,15 +3537,30 @@ using sirius::op::scan::detail::read_checkpoint;
 using sirius::op::scan::detail::read_retirement_test_hooks;
 using sirius::op::scan::detail::scan_operator_test_access;
 
-std::shared_ptr<cudf::table const> make_cached_residual_input(cudf::size_type rows,
-                                                              cudf::size_type residual_rows,
-                                                              ::cuda::stream_ref stream)
+void set_single_null(cudf::column& column, cudf::size_type row, ::cuda::stream_ref stream)
+{
+  auto mask = cudf::create_null_mask(column.size(), cudf::mask_state::ALL_VALID, stream);
+  cudf::set_null_mask(static_cast<cudf::bitmask_type*>(mask.data()), row, row + 1, false, stream);
+  column.set_null_mask(std::move(mask), 1);
+}
+
+/// INT64 key column 0 holds the row index; BOOL8 residual column 1 is true on its first @p
+/// residual_rows rows. @p residual_null and @p key_null each null one row of their column without
+/// changing its value, so a null residual row still stores true.
+std::shared_ptr<cudf::table const> make_cached_residual_input(
+  cudf::size_type rows,
+  cudf::size_type residual_rows,
+  ::cuda::stream_ref stream,
+  std::optional<cudf::size_type> residual_null = std::nullopt,
+  std::optional<cudf::size_type> key_null      = std::nullopt)
 {
   std::vector<uint8_t> keep(static_cast<std::size_t>(rows), 0);
   std::fill_n(keep.begin(), residual_rows, uint8_t{1});
   auto mask    = make_values_table(keep, cudf::data_type{cudf::type_id::BOOL8}, stream);
   auto columns = mask->release();
   columns.insert(columns.begin(), make_sequence_column<int64_t>(rows, stream));
+  if (residual_null) { set_single_null(*columns[1], *residual_null, stream); }
+  if (key_null) { set_single_null(*columns[0], *key_null, stream); }
   return std::make_shared<cudf::table>(std::move(columns));
 }
 
@@ -4233,11 +4248,14 @@ struct allocation_tally {
   rmm::device_async_resource_ref upstream;
   std::size_t calls   = 0;
   std::size_t live    = 0;
-  std::size_t fail_at = 0;  ///< The call to refuse with rmm::out_of_memory; zero refuses none
+  std::size_t fail_at = 0;      ///< The call to refuse with rmm::out_of_memory; zero refuses none
+  bool poison_freed   = false;  ///< Zero-fill each buffer on its stream before freeing it
+  std::size_t poison_failures = 0;  ///< Zero-fills `poison_freed` could not submit
 };
 
-/// Device resource that counts its allocations and refuses the one `allocation_tally::fail_at`
-/// names
+/// Device resource that counts its allocations, refuses the one `allocation_tally::fail_at` names,
+/// and with `allocation_tally::poison_freed` zero-fills each buffer it frees in stream order, so a
+/// read submitted after the free sees zeros rather than the stale contents a pool keeps
 struct counting_resource {
   std::shared_ptr<allocation_tally> tally;
 
@@ -4264,6 +4282,12 @@ struct counting_resource {
                   std::size_t alignment) noexcept
   {
     --tally->live;
+    if (tally->poison_freed && bytes != 0) {
+      if (cudaMemsetAsync(pointer, 0, bytes, stream.get()) != cudaSuccess) {
+        (void)cudaGetLastError();
+        ++tally->poison_failures;
+      }
+    }
     tally->upstream.deallocate(stream, pointer, bytes, alignment);
   }
   friend void get_property(counting_resource const&, ::cuda::mr::device_accessible) noexcept {}
@@ -4518,13 +4542,6 @@ std::vector<std::uint8_t> lone_mask(sirius::op::sirius_mask_applicable const& fi
     mask->view().data<std::uint8_t>(), static_cast<std::size_t>(mask->size()), stream);
 }
 
-void set_single_null(cudf::column& column, cudf::size_type row, ::cuda::stream_ref stream)
-{
-  auto mask = cudf::create_null_mask(column.size(), cudf::mask_state::ALL_VALID, stream);
-  cudf::set_null_mask(static_cast<cudf::bitmask_type*>(mask.data()), row, row + 1, false, stream);
-  column.set_null_mask(std::move(mask), 1);
-}
-
 struct membership_result {
   std::vector<uint8_t> mask;
   std::vector<cudf::size_type> counts;
@@ -4542,7 +4559,7 @@ membership_result run_membership(std::span<fused_membership_input const> steps,
                                            cudf::mask_state::UNALLOCATED,
                                            stream);
   rmm::device_uvector<cudf::size_type> counters(
-    count ? steps.size() + static_cast<std::size_t>(bool(residual)) : 0, stream);
+    count ? steps.size() + static_cast<std::size_t>(residual.has_value()) : 0, stream);
   if (!counters.is_empty()) {
     RMM_CUDA_TRY(
       cudaMemsetAsync(counters.data(), 0, counters.size() * sizeof(cudf::size_type), stream.get()));
@@ -4851,15 +4868,17 @@ struct cached_pair_result {
   cudf::size_type rows;
 };
 
-cached_pair_result require_cached_pair(std::shared_ptr<cudf::table const> const& input,
-                                       cudf::table_view view,
-                                       std::shared_ptr<sirius_dynamic_filter_set> const& channel,
-                                       std::span<binding const> bindings,
-                                       cached_view_layout const& layout,
-                                       bool counts,
-                                       std::size_t expected_rounds,
-                                       ::cuda::stream_ref stream,
-                                       batch_receipt const* prior = nullptr)
+cached_pair_result require_cached_pair(
+  std::shared_ptr<cudf::table const> const& input,
+  cudf::table_view view,
+  std::shared_ptr<sirius_dynamic_filter_set> const& channel,
+  std::span<binding const> bindings,
+  cached_view_layout const& layout,
+  bool counts,
+  std::size_t expected_rounds,
+  ::cuda::stream_ref stream,
+  batch_receipt const* prior        = nullptr,
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref())
 {
   // Unknown decode history suppresses sampling in the counts-off pair without changing selection.
   std::vector<binding> decode =
@@ -4883,9 +4902,8 @@ cached_pair_result require_cached_pair(std::shared_ptr<cudf::table const> const&
   REQUIRE(left);
   REQUIRE(right);
   REQUIRE(consumer_test_access::same_selection(*left, *right));
-  auto const mr = cudf::get_current_device_resource_ref();
-  auto a        = ordinary.apply(std::move(*left), owning_table_view{input, view}, stream, mr);
-  auto b        = fused.apply(std::move(*right), owning_table_view{input, view}, stream, mr);
+  auto a = ordinary.apply(std::move(*left), owning_table_view{input, view}, stream, mr);
+  auto b = fused.apply(std::move(*right), owning_table_view{input, view}, stream, mr);
   REQUIRE(consumer_test_access::storage(a).fused_rounds == 0);
   REQUIRE(consumer_test_access::storage(b).fused_rounds == expected_rounds);
   REQUIRE(counts_of(a) == counts_of(b));
@@ -4957,6 +4975,53 @@ TEST_CASE("cached fusion pairs fixed programs across rounds and dead suffixes",
     REQUIRE(result.counts.empty());
     REQUIRE(result.receipt.applied.size() == (count == 9 ? 0 : static_cast<std::size_t>(count)));
   }
+}
+
+TEST_CASE("cached fusion pairs a nullable residual and a nullable sliced key with counts",
+          "[dynamic_filter][cached_checkpoint][fused_consumer]")
+{
+  auto const count = GENERATE(2, 5);
+  CAPTURE(count);
+  ::cuda::stream_ref stream = cudf::get_default_stream();
+  // Residual true on full rows 0..59 with row 12 null but storing true; key row 20 null.
+  auto input      = make_cached_residual_input(100, 60, stream, 12, 20);
+  auto const view = cudf::slice(input->view(), std::vector<cudf::size_type>{5, 95}).front();
+  auto channel    = std::make_shared<sirius_dynamic_filter_set>();
+  auto producer   = channel->register_producer({0}, count);
+  // Every prefix keeps keys 12 and 20, so only their nulls reject them.
+  std::array<int, 5> const limits{40, 30, 25, 23, 21};
+  for (int i = 0; i < count; ++i) {
+    REQUIRE(producer.push_filter(
+      0, std::make_shared<counting_in_list_filter>(make_in_list_prefix(limits[i], stream), true)));
+  }
+  std::array bindings{binding{0, 0}};
+  auto layout = cached_layout(true);
+  // Poisoning freed buffers makes a residual validity freed before its last read reject every row.
+  auto tally =
+    std::make_shared<allocation_tally>(allocation_tally{cudf::get_current_device_resource_ref()});
+  tally->poison_freed = true;
+  counting_resource poisoning{tally};
+  auto const result = require_cached_pair(input,
+                                          view,
+                                          channel,
+                                          bindings,
+                                          layout,
+                                          true,
+                                          count == 5 ? 2 : 1,
+                                          stream,
+                                          nullptr,
+                                          rmm::device_async_resource_ref{poisoning});
+  // The view holds full rows 5..94. The residual keeps rows 5..59 minus the null row 12; a prefix
+  // with limit L keeps rows 5..L-1 minus the null residual row 12 and the null key row 20.
+  std::vector<cudf::size_type> expected{54};
+  for (int i = 0; i < count; ++i) {
+    expected.push_back(limits[i] - 7);
+  }
+  REQUIRE(result.counts == expected);
+  REQUIRE(result.rows == limits[count - 1] - 7);
+  REQUIRE(result.receipt.applied.size() == static_cast<std::size_t>(count));
+  REQUIRE(tally->calls > 0);
+  REQUIRE(tally->poison_failures == 0);
 }
 
 TEST_CASE("cached fusion keeps alias identities and decode history across distinct columns",

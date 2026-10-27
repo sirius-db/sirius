@@ -45,11 +45,17 @@
 
 namespace sirius::op::detail {
 
-/// @brief The number of threads per key in a fused probe.
+// kCgSize and kBucketSize define set_type, the hash IN-list set that every hash IN-list filter
+// builds, replicates and probes on both the ordinary and the fused path. Changing them changes
+// that set's layout and memory size, not just fusion.
+
+/// @brief Threads per key in a hash IN-list set probe.
 constexpr std::size_t kCgSize = 1;
 static_assert(kCgSize == 1, "cuco::static_set requires kCgSize==1 for device_for bulk iteration");
 
-/// @brief The CuCo bucket size for the static_set used in fused probes.
+/// @brief Keys per bucket of the hash IN-list set. Sized for a double-hashed probe, where each step
+/// is a random fetch and a wider bucket retires several dependent fetches in one; the right value
+/// depends on the probing scheme, not on the key type.
 constexpr std::int32_t kBucketSize = 4;
 
 template <class KeyT>
@@ -98,6 +104,9 @@ struct set_lookup {
 /**
  * @brief Tests whether a converted key may be present in a Bloom filter
  *
+ * An inserted key always fits the key domain, so the adapter's rejection of a non-representable
+ * value preserves the no-false-negative contract.
+ *
  * @tparam FilterRef Device reference to a cuco::bloom_filter
  */
 template <class FilterRef>
@@ -113,8 +122,10 @@ struct bloom_lookup {
 /**
  * @brief Tests a converted key against the small IN-list's stored keys (needles)
  *
- * Compares against all m keys without reserving a sentinel value. Integer comparisons are exact;
- * strings are represented by 64-bit fingerprints, so collisions can retain nonmatching strings.
+ * Compares against all m keys without reserving a sentinel value. For the small m the filter gates
+ * on (at most `k_max_keys`), this compare-all scan beats a hash probe. Integer comparisons are
+ * exact; strings are represented by 64-bit fingerprints, so collisions can retain nonmatching
+ * strings.
  *
  * @tparam KeyT Integer type of the stored keys or string fingerprints
  */

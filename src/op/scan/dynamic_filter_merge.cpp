@@ -137,7 +137,7 @@ struct application_program_decisions {
 struct application_program_state : application_program_decisions {
   sirius::op::dynamic_filter_snapshot snapshot;  ///< Compared by generation.
   bool fused_membership = false;                 ///< The ablation paired programs differ in.
-  std::unique_ptr<sirius::ast::node> residual;  ///< Each program owns a copy; compared by presence.
+  std::unique_ptr<sirius::ast::node> residual;   ///< Taken from its layout; compared by presence.
 };
 
 /// @brief A key column compacted alongside the survivor row IDs.
@@ -909,9 +909,9 @@ void apply_gather_once(application_result_state& result,
 ///
 /// The residual's own column becomes the conjunction. When the program allows fusion and every
 /// selected filter can describe its probe, `try_fused_membership_mask` writes the conjunction in
-/// rounds of up to `fused_round_capacity` filters with no intermediate masks. Otherwise the
-/// ordinary chain folds the residual and then each filter's mask, freeing each mask right after its
-/// fold; the probe API returns a new row-sized mask, so that one mask (1 byte per row) is the
+/// rounds of up to `fused_membership_round_capacity` filters with no intermediate masks. Otherwise
+/// the ordinary chain folds the residual and then each filter's mask, freeing each mask right after
+/// its fold; the probe API returns a new row-sized mask, so that one mask (1 byte per row) is the
 /// chain's only buffer beyond what the ordinary residual selection holds. Either way the residual's
 /// validity is freed once its nulls are resolved into the values. A lone filter without a residual
 /// skips the conjunction and gathers through its own mask.
@@ -992,6 +992,7 @@ void apply_cached(application_result_state& result,
       result.conjunction->set_null_mask(rmm::device_buffer{}, 0);
     }
     if (result.fused_rounds != 0) {
+      // std::ranges::fill does not accept std::vector<bool>.
       std::fill(result.contributed.begin(), result.contributed.end(), true);
       submit_prefix_counts(result, input, residual, stream);
     } else {
@@ -1395,10 +1396,10 @@ batch_receipt dynamic_filter_consumer::finish(application_result&& result,
   state->program->receipt.original_batch_id = original_batch_id;
   return std::move(state->program->receipt);
 }
-
 //===--------------------------------------------------------------------===//
 // TEST SEAMS
 //===--------------------------------------------------------------------===//
+
 dynamic_filter_gate& detail::consumer_test_access::gate(dynamic_filter_consumer& consumer) noexcept
 {
   return consumer._gate;
@@ -1410,7 +1411,8 @@ bool detail::consumer_test_access::same_selection(application_program const& lef
   auto const& a = *left._state;
   auto const& b = *right._state;
   return static_cast<application_program_decisions const&>(a) == b &&
-         a.snapshot.generation() == b.snapshot.generation() && bool(a.residual) == bool(b.residual);
+         a.snapshot.generation() == b.snapshot.generation() &&
+         (a.residual != nullptr) == (b.residual != nullptr);
 }
 
 namespace {
