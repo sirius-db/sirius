@@ -163,7 +163,7 @@ class NullCountFixture {
     auto task       = ingestible->next_split_provider(
       [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
     REQUIRE(task);
-    auto info = task();
+    auto info = task({});
     REQUIRE(info);
     auto* file = dynamic_cast<scan::parquet_file_scan_info*>(info.get());
     REQUIRE(file);
@@ -231,7 +231,7 @@ TEST_CASE_METHOD(NullCountFixture,
   auto task       = ingestible->next_split_provider(
     [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
   REQUIRE(task);
-  auto file_info = task();
+  auto file_info = task({});
   auto* file     = dynamic_cast<scan::parquet_file_scan_info*>(file_info.get());
   REQUIRE(file);
   REQUIRE(file->row_groups.size() == 1);

@@ -95,7 +95,7 @@ scan_estimates read_estimates(std::unique_ptr<scan::parquet_ingestible_table_inf
     [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
   REQUIRE(task);
 
-  auto file = task();
+  auto file = task({});
   REQUIRE(file);
   auto const file_output  = file->estimated_bytes();
   auto const file_working = file->estimated_working_set_bytes();
@@ -286,7 +286,7 @@ struct carrier_file_fixture {
     auto task = reader.next_split_provider(
       [ctx = ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ctx; });
     REQUIRE(task);
-    auto info  = task();
+    auto info  = task({});
     auto* file = dynamic_cast<scan::parquet_file_scan_info*>(info.get());
     REQUIRE(file);
     REQUIRE(file->row_groups.size() >= 3);
@@ -348,7 +348,7 @@ TEST_CASE("parquet scans without a prefetch cache retain advisory ranges",
   REQUIRE(task);
 
   auto coalescer = ingestible->create_batch_coalescer();
-  auto batches   = coalescer->push(task());
+  auto batches   = coalescer->push(task({}));
   auto tail      = coalescer->flush();
   for (auto& batch : tail) {
     batches.push_back(std::move(batch));

@@ -5,6 +5,7 @@ target_sources(
           stable_hash_partition.cu
           sorted_keys.cu
           device_copy_batch.cpp
+          dynamic_filter_mask_ops.cu
           dynamic_filter_replica_transfer.cu
           sirius_dynamic_bloom_filter.cu
           sirius_dynamic_in_list_filter.cu

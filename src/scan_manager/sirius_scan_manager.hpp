@@ -19,7 +19,6 @@
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb_table_identity.hpp"
 #include "event/query_event_publisher.hpp"
-#include "exec/query_lifecycle_registry.hpp"
 #include "exec/scoped_dispatcher.hpp"
 #include "exec/thread_pool.hpp"
 #include "io/datasource_factory.hpp"
@@ -32,6 +31,7 @@
 #include "pipeline/completion_handler.hpp"
 #include "scan_manager/config.hpp"
 #include "scan_manager/duckdb_mvcc_metadata.hpp"
+#include "scan_manager/host_pin_placement.hpp"
 #include "scan_manager/insert_delta_job.hpp"
 #include "scan_manager/load_balancing_scan_batch_coalescer.hpp"
 #include "scan_manager/memory_prefetcher.hpp"
@@ -41,10 +41,6 @@
 #include "scan_manager/preparation_coordinator.hpp"
 #include "scan_manager/readahead_scan_manager.hpp"
 #include "scan_manager/split_provider.hpp"
-
-namespace sirius::op {
-class sirius_dynamic_filter_set;  // membership pushdown channel (op/sirius_dynamic_filter.hpp)
-}
 
 #include <cudf/column/column.hpp>
 #include <cudf/table/table.hpp>
@@ -58,6 +54,7 @@ class sirius_dynamic_filter_set;  // membership pushdown channel (op/sirius_dyna
 #include <duckdb/storage/statistics/base_statistics.hpp>
 #include <duckdb/storage/storage_lock.hpp>
 #include <io/types.hpp>
+#include <op/scan/dynamic_filter_merge.hpp>
 
 namespace cucascade::memory {
 class fixed_size_host_memory_resource;
@@ -429,10 +426,10 @@ struct cached_scan_plan {
 /// may drop rows against the ranges while decoding, handing back an
 /// already-filtered batch. See @c sirius::pushdown_request; an empty request
 /// (the default) leaves every chunk decoding unfiltered.
-/// @p dynamic_filters is the operator's dynamic-filter channel (join builds
-/// publish into it mid-scan); the provider snapshots it PER BATCH onto the
-/// attached scan, so later batches legitimately see more filters. Null (the
-/// default) disables it.
+/// @p consumer is shared with the scan and its immediate dynamic-filter endpoint.
+/// It selects memberships for each compressed chunk through its decode bindings;
+/// an empty map attaches none. Each returned batch carries its own attachment history.
+///
 /// The attaches compose with @p mvcc_masks PER CHUNK: a masked slot also gets the mask
 /// itself (set_visibility_mask), so the decode compacts to visible survivors; a default
 /// slot gets the pushdown alone.
@@ -446,12 +443,12 @@ std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
   std::span<std::size_t const> selected_columns,
   cached_scan_plan plan,
   const telemetry::batch_telemetry_info& telemetry_info,
-  mvcc_chunk_mask_set mvcc_masks                                         = {},
-  std::vector<insert_delta_split> delta_splits                           = {},
-  std::vector<cudf::data_type> normalization_targets                     = {},
-  bool has_physical_overrides                                            = false,
-  sirius::pushdown_request pushdown_req                                  = {},
-  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> dynamic_filters = nullptr);
+  mvcc_chunk_mask_set mvcc_masks                              = {},
+  std::vector<insert_delta_split> delta_splits                = {},
+  std::vector<cudf::data_type> normalization_targets          = {},
+  bool has_physical_overrides                                 = false,
+  sirius::pushdown_request pushdown_req                       = {},
+  std::shared_ptr<op::scan::dynamic_filter_consumer> consumer = nullptr);
 
 /**
  * @brief Build the survivor plan for serving @p entry to a scan into @p requiested_column_ids with
@@ -575,6 +572,7 @@ class sirius_scan_manager {
   /// mutex, so another connection's prepare_for_query is never parked behind it.
   // Stop producers while retaining providers/buffers until downstream retirement.
   void quiesce(sirius::query_id_t query_id);
+  void finish_preparation(sirius::query_id_t query_id) noexcept;
   void reset(sirius::query_id_t query_id);
 
   /// Drain and drop this query's scan work while retaining checkpoint protection.
@@ -587,6 +585,9 @@ class sirius_scan_manager {
 
   /// \brief Number of registered queries that have GPU scan work. Observability and tests.
   [[nodiscard]] std::size_t num_active_queries() const noexcept;
+
+  /// Host-pin placement persists across maintenance calls, query resets and unpins.
+  host_pin_placement& get_host_pin_placement() noexcept { return _host_pin_placement; }
 
   /// \brief Drop every ioctx's prefetching cache and build a fresh one.
   ///
@@ -861,6 +862,9 @@ class sirius_scan_manager {
   ///        was configured with @c backend=kvikio.
   [[nodiscard]] sirius::io::ioctx* io_ctx() const noexcept { return _io_ctx.get(); }
 
+  /// Aggregate metadata-cache diagnostics across the default and routed ioctxs.
+  [[nodiscard]] sirius::io::cache::metadata_store::counters metadata_cache_statistics() const;
+
   /// Where the readahead subscribes for execution events.  Set once at startup;
   /// the readahead itself is per-query, so it registers and unregisters around
   /// its own lifetime rather than this one.
@@ -889,6 +893,12 @@ class sirius_scan_manager {
   ///        backend @p s3_uri routes to — the glob layer bounds its match set
   ///        with it. Throws a clear error for a non-object-store path.
   [[nodiscard]] std::size_t s3_list_max_matches(std::string const& s3_uri);
+
+  /// Resolve only the registered backend type for @p path. This is a planning
+  /// query: it does not construct or start an ioctx, open an object, issue a
+  /// HEAD, warm a backend, or probe credentials/network.
+  [[nodiscard]] std::optional<sirius::io::io_context_type> planning_io_backend(
+    std::string_view path) const;
 
  private:
   /**
@@ -957,6 +967,7 @@ class sirius_scan_manager {
     //! Per-query snapshot of the serve-side pruning flag; the manager's _config is a
     //! construction-time copy, so SET changes arrive per query via prepare_for_query.
     bool pruning_enabled{true};
+    std::vector<int> active_gpu_ids;
 
     //! One mask computation per distinct pinned entry matched by THIS query (recorded by
     //! try_match_cached_entry, deduped by entry name); run block-in-prepare, then copied
@@ -1063,6 +1074,8 @@ class sirius_scan_manager {
   std::shared_ptr<const sirius::memory::topology_index> _topology_index;
   std::shared_ptr<op::scan::physical_check_counters> _physical_counters;
   exec::static_thread_pool _thread_pool;
+  std::shared_ptr<shared_scan_budget> _shared_readahead_budget =
+    std::make_shared<shared_scan_budget>();
   std::shared_ptr<sirius::io::ioctx> _io_ctx;
   /// Lazily-built per-backend ioctxs for path-routed datasources (e.g. an s3://
   /// REST or kvikIO context alongside the local `_io_ctx`). Contexts are keyed
@@ -1072,7 +1085,7 @@ class sirius_scan_manager {
   /// `_routed_io_ctxs_mtx` guards only map lookup/insert; drained + torn down
   /// in the dtor.
   std::mutex _routed_io_ctxs_build_mtx;
-  std::mutex _routed_io_ctxs_mtx;
+  mutable std::mutex _routed_io_ctxs_mtx;
   sirius::io::scoped_object_store_configs _s3_configs;
   struct routed_ioctx_key {
     sirius::io::io_context_type type;
@@ -1094,6 +1107,7 @@ class sirius_scan_manager {
   /// whole duration, and an unpin from another connection drops only the map slot, leaving
   /// the data alive until the last serving provider releases it.
   std::unordered_map<std::string, std::shared_ptr<pinned_entry>> _pinned_entries;
+  host_pin_placement _host_pin_placement;
   /// Guards the STRUCTURE of _pinned_entries (lookup/insert/erase) only, never the serving
   /// of an entry — shared ownership covers that. Held only for map manipulation and the
   /// snapshot in try_match_cached_entry, never across match/validate/plan work, so

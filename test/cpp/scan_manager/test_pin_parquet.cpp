@@ -86,6 +86,27 @@ std::size_t bytes_after_full_eviction(sirius::io::cache::prefetching_cache& cach
 
 }  // namespace
 
+TEST_CASE("pin does not reuse foreign local footer across opens",
+          "[scan_manager][cache][pin_parquet][metadata_retention]")
+{
+  auto memory   = initialize_memory_manager(1);
+  auto topology = single_gpu_index_for_pin();
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, config_with_sirius_cache(), *memory, topology};
+  auto source = manager.create_datasource(good_parquet());
+  REQUIRE(source);
+  auto foreign = std::make_shared<sirius::op::scan::parquet_metadata>(
+    nullptr,
+    64,
+    sirius::op::scan::parquet_encryption_evidence{},
+    std::vector<uint8_t>{},
+    std::string{},
+    std::vector<uint8_t>{},
+    "foreign-open");
+  REQUIRE(source->store_metadata(foreign));
+  CHECK_NOTHROW(manager.pin_parquet_ranges("foreign", {good_parquet()}, std::nullopt));
+}
+
 TEST_CASE("a pin that throws part way through pins nothing", "[scan_manager][cache][pin_parquet]")
 {
   auto memory   = initialize_memory_manager(1);
@@ -109,7 +130,7 @@ TEST_CASE("a pin that throws part way through pins nothing", "[scan_manager][cac
 }
 
 TEST_CASE("parquet tier pin caches complete footer evidence for every file",
-          "[scan_manager][cache][pin_parquet][r2a]")
+          "[scan_manager][cache][pin_parquet][metadata_retention]")
 {
   auto memory   = initialize_memory_manager(1);
   auto topology = single_gpu_index_for_pin();

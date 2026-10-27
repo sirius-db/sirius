@@ -14,11 +14,12 @@
  * limitations under the License.
  */
 
+#include "cudf/ast_compat.hpp"
+
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/parquet_io_utils.hpp>
 
-// R2a T5: RED_FEATURE after commit (b).
 #include <catch.hpp>
 #include <io/parquet_helpers.hpp>
 #include <op/scan/parquet_metadata.hpp>
@@ -350,6 +351,28 @@ TEST_CASE("Iceberg per-file schema comparison preserves field ids and reasons",
   f.metadata.schema.clear();
   table.fields.push_back({"x", 1, "INTEGER"});
   CHECK(check().reason == verdict_reason::iceberg_schema_no_rows);
+}
+
+TEST_CASE("Iceberg schema comparison rejects invalid field ids",
+          "[scan][parquet][profile][iceberg_schema]")
+{
+  footer_fixture f;
+  f.metadata.schema[1].field_id = 1;
+  iceberg_table_schema table{{{"x", 1, "INTEGER"}}};
+  auto check = [&] { return check_iceberg_file_schema(f.metadata, table, "fixture.parquet"); };
+
+  table.fields[0].id = 0;
+  CHECK(check().reason == verdict_reason::iceberg_schema_invalid_field_id);
+  table.fields[0].id = 1;
+  table.fields.push_back({"y", 1, "INTEGER"});
+  CHECK(check().reason == verdict_reason::iceberg_schema_invalid_field_id);
+  table.fields.pop_back();
+  f.metadata.schema[1].field_id = -1;
+  CHECK(check().reason == verdict_reason::iceberg_schema_invalid_field_id);
+  f.metadata.schema[1].field_id = 1;
+  f.metadata.schema.push_back(f.metadata.schema[1]);
+  f.metadata.schema.back().name = "y";
+  CHECK(check().reason == verdict_reason::iceberg_schema_invalid_field_id);
 }
 
 TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
@@ -729,8 +752,9 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   CHECK(after.runtime_fallbacks == before.runtime_fallbacks + 1);
   CHECK(after.split_physical_rejections[reason] == before.split_physical_rejections[reason] + 1);
   CHECK(after.parquet_reader_calls == before.parquet_reader_calls);
-  for (auto const& sql : {"SELECT * FROM sirius_read_parquet(" + file + ")",
-                          "CALL pin_table(" + file + ", name='r2a_encrypted_pin', tier='gpu')"}) {
+  for (auto const& sql :
+       {"SELECT * FROM sirius_read_parquet(" + file + ")",
+        "CALL pin_table(" + file + ", name='encrypted_native_pin', tier='gpu')"}) {
     before     = sirius::test::get_transparent_execution_stats(*con);
     auto error = con->Query(sql);
     REQUIRE(error->HasError());
@@ -847,4 +871,62 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   CHECK(after.split_physical_rejections == before.split_physical_rejections);
   CHECK(after.parquet_reader_calls[directory.file("two_groups.parquet")] ==
         before.parquet_reader_calls[directory.file("two_groups.parquet")] + 1);
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "Parquet footer cache is shared across query projections and reader options",
+                 "[scan][parquet][integration][metadata_retention]")
+{
+  sirius::test::scratch_dir directory("parquet_projection_cache");
+  run_ok("SET gpu_execution=false");
+  auto path = directory.file("columns.parquet");
+  run_ok("COPY (SELECT 1::INTEGER x, 2::BIGINT y) TO " + sirius::test::sql_literal(path) +
+         " (FORMAT PARQUET)");
+  auto& manager = sirius::test::get_registered_sirius_context(*con)->get_scan_manager();
+  auto source   = manager.create_datasource(path);
+  REQUIRE(source);
+  auto options = cudf::io::parquet_reader_options::builder().build();
+  bool hit     = true;
+  auto all     = resolve_parquet_metadata(*source, 0, path, options, &hit);
+  CHECK_FALSE(hit);
+  CHECK(all->built_for_identity == source->get_io_object().identity_cache_key());
+  options.set_column_names({"y"});
+  auto projected = resolve_parquet_metadata(*source, 0, path, options, &hit);
+  CHECK(hit);
+  CHECK(projected == all);
+  CHECK(projected->file_metadata()->schema.size() == 3);
+  CHECK(source->metadata() == all);
+  options.enable_use_arrow_schema(!options.is_enabled_use_arrow_schema());
+  auto different_profile = resolve_parquet_metadata(*source, 0, path, options, &hit);
+  CHECK(hit);
+  CHECK(different_profile == all);
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "Parquet cache rebuilds a foreign artifact before serving",
+                 "[scan][parquet][integration][metadata_retention]")
+{
+  sirius::test::scratch_dir directory("parquet_metadata_identity");
+  run_ok("SET gpu_execution=false");
+  auto path = directory.file("columns.parquet");
+  run_ok("COPY (SELECT 1::INTEGER x) TO " + sirius::test::sql_literal(path) + " (FORMAT PARQUET)");
+  auto& manager = sirius::test::get_registered_sirius_context(*con)->get_scan_manager();
+  auto source   = manager.create_datasource(path);
+  REQUIRE(source);
+  // A foreign artifact can be left by another open or caller. The resolver owns
+  // the mismatch policy and rebuilds before any caller consumes the footer.
+  auto foreign = std::make_shared<parquet_metadata>(nullptr,
+                                                    64,
+                                                    parquet_encryption_evidence{},
+                                                    std::vector<uint8_t>{},
+                                                    std::string{},
+                                                    std::vector<uint8_t>{},
+                                                    "foreign-open");
+  REQUIRE(source->store_metadata(foreign));
+  auto options = cudf::io::parquet_reader_options::builder().build();
+  bool hit     = false;
+  auto result  = resolve_parquet_metadata_with_identity(*source, 0, path, options, &hit);
+  CHECK_FALSE(hit);
+  CHECK(result.artifact != foreign);
+  CHECK(result.identity == source->get_io_object().identity_cache_key());
 }

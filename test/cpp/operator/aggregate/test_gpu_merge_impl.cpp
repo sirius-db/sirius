@@ -1128,8 +1128,8 @@ std::unique_ptr<cudf::column> make_int64_column(std::vector<int64_t> const& valu
                   values.data(),
                   values.size() * sizeof(int64_t),
                   cudaMemcpyHostToDevice,
-                  stream.value());
-  stream.synchronize();
+                  stream.get());
+  stream.sync();
   return column;
 }
 

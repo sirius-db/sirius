@@ -23,6 +23,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <vector>
 
 namespace sirius::op::scan {
 
@@ -33,17 +34,19 @@ class sirius_physical_dynamic_filter : public sirius_physical_operator {
  public:
   static constexpr SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::DYNAMIC_FILTER;
 
-  sirius_physical_dynamic_filter(
-    duckdb::vector<sirius::logical_type> types,
-    std::size_t estimated_cardinality,
-    std::shared_ptr<sirius::op::sirius_dynamic_filter_set> filters,
-    double gate_keep_threshold     = dynamic_filter_gate::k_default_keep_threshold,
-    dynamic_filter_apply_mode mode = dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY);
+  sirius_physical_dynamic_filter(duckdb::vector<sirius::logical_type> types,
+                                 std::size_t estimated_cardinality,
+                                 std::shared_ptr<dynamic_filter_consumer> consumer);
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          ::cuda::stream_ref stream) override;
 
   void on_finalize_operator() override;
+
+  [[nodiscard]] std::shared_ptr<dynamic_filter_consumer> const& consumer() const noexcept
+  {
+    return _consumer;
+  }
 
   /// Filtering never expands its input, so the peak estimate is the input footprint.
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(const input_stats& stats) const override
@@ -52,9 +55,9 @@ class sirius_physical_dynamic_filter : public sirius_physical_operator {
   }
 
  private:
-  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> _filters;
-  dynamic_filter_gate _gate;
-  dynamic_filter_apply_mode _mode;
+  std::shared_ptr<dynamic_filter_consumer> _consumer;
+  std::vector<binding>
+    _bindings;  ///< Each output ordinal reads the input column of the same index.
 };
 
 }  // namespace sirius::op::scan

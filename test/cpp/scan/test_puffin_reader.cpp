@@ -24,6 +24,7 @@
 //
 // No GPU: file IO and parsing only.
 
+#include "io/io_errors.hpp"
 #include "op/scan/iceberg_delete_set.hpp"
 #include "op/scan/puffin_reader.hpp"
 #include "scan_manager/preparation_test_support.hpp"
@@ -37,6 +38,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -80,6 +82,146 @@ std::string require_fixture(std::string path)
   return path;
 }
 
+class vector_puffin_source final : public puffin_byte_source {
+ public:
+  explicit vector_puffin_source(std::vector<std::byte> bytes) : bytes_(std::move(bytes)) {}
+  bool seek(std::streamoff offset) override
+  {
+    if (offset < 0 || static_cast<std::uint64_t>(offset) > bytes_.size()) return false;
+    offset_ = offset;
+    return true;
+  }
+  bool read(std::span<std::byte> destination) override
+  {
+    if (offset_ < 0 || static_cast<std::uint64_t>(offset_) > bytes_.size() ||
+        destination.size() > bytes_.size() - static_cast<std::uint64_t>(offset_))
+      return false;
+    std::copy_n(bytes_.data() + offset_, destination.size(), destination.data());
+    offset_ += static_cast<std::streamoff>(destination.size());
+    return true;
+  }
+  [[nodiscard]] std::streamoff size() const override
+  {
+    return static_cast<std::streamoff>(bytes_.size());
+  }
+
+ private:
+  std::vector<std::byte> bytes_;
+  std::streamoff offset_ = 0;
+};
+
+class identity_changing_puffin_source final : public puffin_byte_source {
+ public:
+  identity_changing_puffin_source(std::streamoff size, std::string path)
+    : size_(size), path_(std::move(path))
+  {
+  }
+  bool seek(std::streamoff offset) override
+  {
+    if (offset < 0 || offset > size_) return false;
+    offset_ = offset;
+    return true;
+  }
+  bool read(std::span<std::byte>) override
+  {
+    throw sirius::io::object_changed_error(path_, "\"v1\"", "\"v2\"");
+  }
+  [[nodiscard]] std::streamoff size() const override { return size_; }
+
+ private:
+  std::streamoff size_;
+  std::string path_;
+  std::streamoff offset_ = 0;
+};
+
+class cancelling_puffin_source final : public puffin_byte_source {
+ public:
+  explicit cancelling_puffin_source(std::streamoff size) : size_(size) {}
+  bool seek(std::streamoff offset) override
+  {
+    if (offset < 0 || offset > size_) return false;
+    offset_ = offset;
+    return true;
+  }
+  bool read(std::span<std::byte>) override
+  {
+    throw std::system_error(std::make_error_code(std::errc::operation_canceled));
+  }
+  [[nodiscard]] std::streamoff size() const override { return size_; }
+
+ private:
+  std::streamoff size_;
+  std::streamoff offset_ = 0;
+};
+
+class throwing_puffin_source final : public puffin_byte_source {
+ public:
+  explicit throwing_puffin_source(std::streamoff size) : size_(size) {}
+  bool seek(std::streamoff offset) override
+  {
+    if (offset < 0 || offset > size_) return false;
+    offset_ = offset;
+    return true;
+  }
+  bool read(std::span<std::byte>) override
+  {
+    throw std::runtime_error("injected footer read failure");
+  }
+  [[nodiscard]] std::streamoff size() const override { return size_; }
+
+ private:
+  std::streamoff size_;
+  std::streamoff offset_ = 0;
+};
+
+class bad_alloc_puffin_source final : public puffin_byte_source {
+ public:
+  explicit bad_alloc_puffin_source(std::streamoff size) : size_(size) {}
+  bool seek(std::streamoff offset) override
+  {
+    if (offset < 0 || offset > size_) return false;
+    offset_ = offset;
+    return true;
+  }
+  bool read(std::span<std::byte>) override { throw std::bad_alloc{}; }
+  [[nodiscard]] std::streamoff size() const override { return size_; }
+
+ private:
+  std::streamoff size_;
+  std::streamoff offset_ = 0;
+};
+
+class footer_magic_short_source final : public puffin_byte_source {
+ public:
+  explicit footer_magic_short_source(std::vector<std::byte> bytes) : bytes_(std::move(bytes)) {}
+  bool seek(std::streamoff offset) override
+  {
+    if (offset < 0 || static_cast<std::uint64_t>(offset) > bytes_.size()) return false;
+    offset_ = offset;
+    return true;
+  }
+  bool read(std::span<std::byte> destination) override
+  {
+    ++read_count_;
+    if (read_count_ == 4) return false;
+    if (offset_ < 0 || static_cast<std::uint64_t>(offset_) > bytes_.size() ||
+        destination.size() > bytes_.size() - static_cast<std::uint64_t>(offset_))
+      return false;
+    std::copy_n(bytes_.data() + offset_, destination.size(), destination.data());
+    offset_ += static_cast<std::streamoff>(destination.size());
+    return true;
+  }
+  [[nodiscard]] std::streamoff size() const override
+  {
+    return static_cast<std::streamoff>(bytes_.size());
+  }
+
+ private:
+  std::vector<std::byte> bytes_;
+  std::streamoff offset_ = 0;
+  int read_count_        = 0;
+};
+
 /// The manifest entry as the fixture actually writes it. Each test below changes exactly one
 /// field, so a failure names the check that fired rather than "something threw".
 DeletionVectorRef fixture_ref()
@@ -91,9 +233,13 @@ DeletionVectorRef fixture_ref()
           .record_count          = kCardinality};
 }
 
-std::vector<int64_t> read_for_test(DeletionVectorRef ref, bool charged)
+std::vector<int64_t> read_for_test(DeletionVectorRef ref,
+                                   bool charged,
+                                   puffin_byte_source* supplied_source = nullptr)
 {
-  if (!charged) return read_deletion_vector(ref);
+  if (!charged)
+    return supplied_source ? read_deletion_vector(ref, *supplied_source)
+                           : read_deletion_vector(ref);
   using namespace sirius::scan_manager;
   test::test_reservation_provider provider;
   auto path = ref.puffin_path;
@@ -114,7 +260,19 @@ std::vector<int64_t> read_for_test(DeletionVectorRef ref, bool charged)
   auto permit = ledger.acquire_permit({1, 1});
   REQUIRE(permit);
   auto allocator = ledger.allocator(permit);
-  auto result    = read_deletion_vector_charged(ref, allocator);
+  auto result    = supplied_source
+                     ? read_deletion_vector_charged(DeletionVectorRefView{ref.puffin_path,
+                                                                       ref.content_offset,
+                                                                       ref.content_size_in_bytes,
+                                                                       ref.referenced_data_file,
+                                                                       ref.file_size_in_bytes,
+                                                                       ref.record_count},
+                                                 allocator,
+                                                 ref.referenced_data_file,
+                                                 std::make_shared<int>(0),
+                                                 1,
+                                                 *supplied_source)
+                     : read_deletion_vector_charged(ref, allocator);
   return {result->positions.begin(), result->positions.end()};
 }
 
@@ -291,6 +449,23 @@ TEST_CASE("puffin reader reads the fixture deletion vector", "[scan][iceberg]")
   // The fixture deletes 2 of its 5 rows — the same 3 survivors the integration case asserts.
   REQUIRE(positions.size() == 2);
   REQUIRE(std::is_sorted(positions.begin(), positions.end()));
+}
+
+TEST_CASE("charged Puffin reader accepts an injected byte source",
+          "[scan][iceberg][charged_reader]")
+{
+  auto ref = fixture_ref();
+  std::ifstream input(ref.puffin_path, std::ios::binary | std::ios::ate);
+  REQUIRE(input);
+  auto const size = input.tellg();
+  REQUIRE(size >= 0);
+  std::vector<std::byte> bytes(static_cast<std::size_t>(size));
+  input.seekg(0);
+  input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+  REQUIRE(input);
+
+  vector_puffin_source source(std::move(bytes));
+  CHECK(read_for_test(ref, true, &source) == read_deletion_vector(ref));
 }
 
 TEST_CASE("puffin reader accepts a file:// URI", "[scan][iceberg]")
@@ -584,6 +759,91 @@ TEST_CASE("Charged Puffin failures distinguish corrupt input from missing files"
       CHECK(std::string(error.what()).find("referenced-data-file") != std::string::npos);
     } else
       CHECK(std::string(error.what()).find("Cannot open file") != std::string::npos);
+  }
+}
+
+TEST_CASE("Charged Puffin preserves an opened-object identity failure",
+          "[scan_preparation][iceberg][charged_reader][failure]")
+{
+  auto const ref = fixture_ref();
+  std::error_code error;
+  auto const size = fs::file_size(ref.puffin_path, error);
+  REQUIRE_FALSE(error);
+  identity_changing_puffin_source source(static_cast<std::streamoff>(size), ref.puffin_path);
+  try {
+    read_for_test(ref, true, &source);
+    FAIL("identity change was not reported");
+  } catch (sirius::io::object_changed_error const& failure) {
+    CHECK(failure.object_path() == ref.puffin_path);
+    CHECK(failure.expected_tag() == "\"v1\"");
+    CHECK(failure.observed_tag() == "\"v2\"");
+    auto classified = sirius::transparent::classify_failure(std::current_exception());
+    CHECK(classified.cause == sirius::transparent::late_failure_cause::object_changed);
+  }
+}
+
+TEST_CASE("Charged Puffin preserves cancellation instead of classifying it as corrupt input",
+          "[scan_preparation][iceberg][charged_reader][failure]")
+{
+  auto const ref = fixture_ref();
+  std::error_code error;
+  auto const size = fs::file_size(ref.puffin_path, error);
+  REQUIRE_FALSE(error);
+  cancelling_puffin_source source(static_cast<std::streamoff>(size));
+  CHECK_THROWS_AS(read_for_test(ref, true, &source), std::system_error);
+  try {
+    read_for_test(ref, true, &source);
+  } catch (...) {
+    CHECK(std::current_exception() != nullptr);
+    CHECK(sirius::transparent::classify_failure(std::current_exception()).cause ==
+          sirius::transparent::late_failure_cause::other);
+  }
+}
+
+TEST_CASE("Charged Puffin classifies thrown magic reads as reader I/O",
+          "[scan_preparation][iceberg][charged_reader][failure]")
+{
+  auto const ref = fixture_ref();
+  std::error_code error;
+  auto const size = fs::file_size(ref.puffin_path, error);
+  REQUIRE_FALSE(error);
+  throwing_puffin_source source(static_cast<std::streamoff>(size));
+  try {
+    read_for_test(ref, true, &source);
+    FAIL("injected footer read failure was not reported");
+  } catch (sirius::transparent::classified_execution_error const& failure) {
+    CHECK(failure.cause == sirius::transparent::late_failure_cause::reader_io);
+    CHECK(std::string(failure.what()).find("injected footer read failure") != std::string::npos);
+  }
+}
+
+TEST_CASE("Charged Puffin preserves allocation failures from magic reads",
+          "[scan_preparation][iceberg][charged_reader][failure]")
+{
+  auto const ref = fixture_ref();
+  std::error_code error;
+  auto const size = fs::file_size(ref.puffin_path, error);
+  REQUIRE_FALSE(error);
+  bad_alloc_puffin_source source(static_cast<std::streamoff>(size));
+  CHECK_THROWS_AS(read_for_test(ref, true, &source), std::bad_alloc);
+}
+
+TEST_CASE("Charged Puffin reports a short footer magic read as missing magic",
+          "[scan_preparation][iceberg][charged_reader][failure]")
+{
+  auto const ref = fixture_ref();
+  std::ifstream input(ref.puffin_path, std::ios::binary);
+  REQUIRE(input);
+  std::vector<char> raw((std::istreambuf_iterator<char>(input)), {});
+  std::vector<std::byte> bytes(raw.size());
+  std::memcpy(bytes.data(), raw.data(), raw.size());
+  footer_magic_short_source source(std::move(bytes));
+  try {
+    read_for_test(ref, true, &source);
+    FAIL("short footer magic read was accepted");
+  } catch (sirius::op::scan::unsupported_physical_input const& failure) {
+    CHECK(failure.reason == sirius::op::scan::verdict_reason::iceberg_delete_corrupt);
+    CHECK(std::string(failure.what()).find("Missing footer magic") != std::string::npos);
   }
 }
 
