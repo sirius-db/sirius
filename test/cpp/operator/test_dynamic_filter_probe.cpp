@@ -28,10 +28,10 @@
  *        through 64-bit XXHash_64 fingerprints (pinned against a host reference of the same hash).
  */
 
+#include "cudf/ast_compat.hpp"
 #include "operator/dynamic_filter_accumulation_test_utils.hpp"
 
 #include <cudf/aggregation.hpp>
-#include <cudf/ast/expressions.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/hashing.hpp>
@@ -156,7 +156,8 @@ void attach_validity(cudf::column& col, std::vector<bool> const& valid, ::cuda::
     static_cast<cudf::size_type>(std::count(valid.begin(), valid.end(), false));
   auto const words = upload_prior_mask(valid, stream);
   auto mask        = cudf::create_null_mask(col.size(), cudf::mask_state::UNINITIALIZED, stream);
-  REQUIRE(mask.size() >= words.size());
+  // create_null_mask allocates bytes for the rows, while typed buffer sizes count words.
+  REQUIRE(cudf::bitmask_allocation_size_bytes(col.size()) >= words.size());
   REQUIRE(cudaMemcpyAsync(
             mask.data(), words.data(), words.size(), cudaMemcpyDeviceToDevice, stream.get()) ==
           cudaSuccess);

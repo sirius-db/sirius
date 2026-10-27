@@ -96,6 +96,7 @@ connector const* lookup_connector(duckdb::BoundTableFunction const&,
                                   duckdb::FunctionData const*,
                                   duckdb::ClientContext&);
 //! Whether an Iceberg bind exposes a complete table schema with integer field IDs.
+bool iceberg_flat_mapping_supported(duckdb::FunctionData const* bind_data);
 bool iceberg_table_schema_has_field_ids(duckdb::FunctionData const* bind_data);
 std::span<connector const> registered_connectors();
 

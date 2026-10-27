@@ -282,9 +282,9 @@ struct telemetry_config {
   std::string nvtx_injection_lib{};
 };
 
-/// Parameters controlling Simpatico compression for pin_table(tier=>'host').
-/// These settings apply exclusively to cached input-table pinning and have no
-/// effect on spill-path compression (Phase 3).
+/// Parameters controlling Simpatico compression. The unprefixed fields apply to
+/// pin_table(tier=>'host'); the spill_ fields apply to batches the downgrade
+/// executor spills to the host or disk tier.
 struct compression_config {
   /// When true, pin_table(tier=>'host') attempts to compress each chunk with
   /// Simpatico before storing it in host memory. Falls back to uncompressed
@@ -315,11 +315,16 @@ struct compression_config {
   /// Store batches the downgrade executor spills to the host or disk tier
   /// Simpatico-compressed, with per-type default plans, and decode them on their way
   /// back to the GPU. A batch whose compressed form saves too little (see
-  /// max_compressed_fraction) or fails to encode spills uncompressed.
+  /// spill_max_compressed_fraction) or fails to encode spills uncompressed.
   bool enable_spill_compression{false};
 
   /// Batches smaller than this spill uncompressed.
   std::size_t spill_min_batch_bytes{64ULL * 1024 * 1024};  // 64 MiB
+
+  /// Keep a spilled batch compressed only when its header + payload is at most this
+  /// fraction of the batch's device size. Finite and non-negative; values above 1
+  /// allow compressed forms that expand relative to the original batch.
+  double spill_max_compressed_fraction{0.75};
 
   /// Encode a spilled batch only when this fraction of its size could be reserved in
   /// its GPU memory space (the encoder's headroom); otherwise it spills uncompressed.

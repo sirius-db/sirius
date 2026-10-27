@@ -792,6 +792,8 @@ class GPUExecutionIcebergFixture : public MultiFormatFixtureBase {
     auto root = get_project_root();
     v1_path   = (root / "test/cpp/integration/data/iceberg_v1").string();
     v2_path   = (root / "test/cpp/integration/data/iceberg_v2_delete").string();
+    evolved_fields_path =
+      (root / "test/cpp/integration/data/iceberg_evolved_fields_with_deletes").string();
 
     auto const conf       = root / "test/cpp/integration/data/iceberg_conformance";
     conf_append_only_path = (conf / "append_only/conf/append_only").string();
@@ -1091,6 +1093,7 @@ class GPUExecutionIcebergFixture : public MultiFormatFixtureBase {
 
   std::string v1_path;
   std::string v2_path;
+  std::string evolved_fields_path;
   std::string conf_append_only_path;
   std::string conf_drop_readd_path;
   std::string conf_rename_col_path;
@@ -1231,36 +1234,48 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 }
 
 // Pinned, unlike the case above: these schema changes arrived WITH new snapshots, so both forms
-// return the same rows and pinning is what keeps the schema gate reachable at all.
-//
-// A rename keeps the field id and changes the NAME, so the id space stays contiguous and the
-// field-id gap test cannot see it. The older data file still spells the column `val` where the
-// table now says `value`. Per-file metadata checks refuse the old file before cuDF decoding;
-// DuckDB then resolves the field id during runtime fallback.
+// return the same rows and pinning keeps the field-ID mapper on the GPU path.
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
-                 "gpu_execution iceberg - conformance renamed column declines at metadata time",
+                 "gpu_execution iceberg - conformance renamed column maps by field id",
                  "[integration][gpu_execution][iceberg][verdict]")
 {
   require_session_can_read(conf_rename_col_path);
-  expect_iceberg_schema_refusal(
+  expect_iceberg_rows(
     "SELECT id, value FROM " + pinned_scan(conf_rename_col_path) + " ORDER BY id;",
-    sirius::op::scan::verdict_reason::iceberg_schema_missing_field,
-    "does not carry the table's current schema (no match for value#2)",
+    gpu_route::gpu,
     {{"1", "old_a"}, {"2", "old_b"}, {"3", "new_c"}, {"4", "new_d"}});
 }
 
-// An ADD keeps ids contiguous too (1,2,3 over three columns), so the gap test misses it for the
-// same reason. `b` is absent from the first data file and must read NULL there. The metadata
-// check refuses that file, and DuckDB supplies the missing column during runtime fallback.
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
-                 "gpu_execution iceberg - conformance added column declines at metadata time",
+                 "gpu_execution iceberg - mapped scan bypasses raw parquet warm pin",
+                 "[integration][gpu_execution][iceberg][cache][schema_evolution]")
+{
+  require_session_can_read(conf_rename_col_path);
+  auto const raw_glob = conf_rename_col_path + "/data/*.parquet";
+  auto pin            = con->Query("CALL pin_table(" + sirius::test::sql_literal(raw_glob) +
+                        ", name='iceberg_mapping_raw_pin', tier='gpu');");
+  REQUIRE(pin);
+  REQUIRE_FALSE(pin->HasError());
+
+  expect_iceberg_rows(
+    "SELECT id, value FROM " + pinned_scan(conf_rename_col_path) + " ORDER BY id;",
+    gpu_route::gpu,
+    {{"1", "old_a"}, {"2", "old_b"}, {"3", "new_c"}, {"4", "new_d"}});
+  auto unpin = con->Query("CALL unpin_table('iceberg_mapping_raw_pin');");
+  REQUIRE(unpin);
+  REQUIRE_FALSE(unpin->HasError());
+}
+
+// An ADD keeps ids contiguous too (1,2,3 over three columns). `b` is absent from the first data
+// file and the field-ID mapper supplies its typed NULL default before the projection.
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "gpu_execution iceberg - conformance added column materializes NULL",
                  "[integration][gpu_execution][iceberg][verdict]")
 {
   require_session_can_read(conf_add_column_path);
-  expect_iceberg_schema_refusal(
+  expect_iceberg_rows(
     "SELECT id, a, b FROM " + pinned_scan(conf_add_column_path) + " ORDER BY id;",
-    sirius::op::scan::verdict_reason::iceberg_schema_missing_field,
-    "does not carry the table's current schema (no match for b#3)",
+    gpu_route::gpu,
     {{"1", "10", "NULL"}, {"2", "20", "NULL"}, {"3", "30", "300"}, {"4", "40", "400"}});
 }
 
@@ -1297,43 +1312,41 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
-                 "gpu_execution iceberg - promoted column type declines",
+                 "gpu_execution iceberg - promoted column type maps",
                  "[integration][gpu_execution][iceberg][verdict]")
 {
-  // `count` stored as INT32 while the table declares it `long`. Promotion keeps both the name and
-  // the field id, so a pair comparison reports the file as current, and nothing throws -- the scan
-  // just returns the file's narrower type. Only comparing the TYPE catches it.
+  // `count` stored as INT32 while the table declares it `long`; the mapper widens the physical
+  // field by its Iceberg field id before the projection.
   auto const path =
     (get_project_root() / "test/cpp/integration/data/iceberg_v1_promoted_type").string();
-  expect_iceberg_schema_refusal(
-    "SELECT fruit, count FROM " + pinned_scan(path) + " ORDER BY count;",
-    sirius::op::scan::verdict_reason::iceberg_schema_promoted_type,
-    "as INTEGER while the table declares BIGINT",
-    {{"apple", "1"}, {"banana", "2"}, {"cherry", "3"}});
+  expect_iceberg_rows("SELECT fruit, count FROM " + pinned_scan(path) + " ORDER BY count;",
+                      gpu_route::gpu,
+                      {{"apple", "1"}, {"banana", "2"}, {"cherry", "3"}});
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
-                 "gpu_execution iceberg - reordered data file declines",
+                 "gpu_execution iceberg - reordered data file maps",
                  "[integration][gpu_execution][iceberg][verdict]")
 {
-  // The same two fields with the same ids and types, stored in the opposite physical order. This
-  // is a VALID Iceberg table -- ids identify fields, so order carries no meaning, and DuckDB reads
-  // it BY_FIELD_ID and returns the snapshot's order.
-  //
-  // The GPU path does not: for a full `SELECT *` build_scan_plan installs no reader projection, so
-  // cuDF emits the file's order while the rest of the plan expects the bound snapshot's. `fruit`
-  // and `count` are castable to each other's declared types, so nothing throws -- the values come
-  // back swapped and converted. A (name, field id) membership comparison cannot see it; only
-  // comparing the ORDER can.
-  //
-  // Declining a valid layout is the gate's fail-closed bias, and DuckDB returns the right rows.
+  // The same two fields with the same ids and types are stored in the opposite physical order.
+  // Field-ID mapping reads them by identity and restores the bound projection order.
   auto const path =
     (get_project_root() / "test/cpp/integration/data/iceberg_v1_reordered").string();
-  expect_iceberg_schema_refusal(
-    "SELECT fruit, count FROM " + pinned_scan(path) + " ORDER BY count;",
-    sirius::op::scan::verdict_reason::iceberg_schema_physical_order,
-    "stores the table's fields in a different physical order",
-    {{"apple", "1"}, {"banana", "2"}, {"cherry", "3"}});
+  expect_iceberg_rows("SELECT fruit, count FROM " + pinned_scan(path) + " ORDER BY count;",
+                      gpu_route::gpu,
+                      {{"apple", "1"}, {"banana", "2"}, {"cherry", "3"}});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "gpu_execution iceberg - missing identity partition column stays refused",
+                 "[integration][gpu_execution][iceberg][schema_evolution]")
+{
+  auto path =
+    (get_project_root() / "test/cpp/integration/data/iceberg_missing_partition_column").string();
+  expect_iceberg_schema_refusal("SELECT * FROM " + pinned_scan(path) + ";",
+                                sirius::op::scan::verdict_reason::iceberg_schema_missing_field,
+                                "does not carry the table's current schema (no match for count#2)",
+                                {{"apple", "42"}, {"banana", "42"}, {"cherry", "42"}});
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
@@ -1466,7 +1479,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqualityDeleteFixture,
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergEqualityDeleteFixture,
-                 "R2a pre-capture marks Iceberg equality refusal on scan node",
+                 "Pre-capture marks Iceberg equality refusal on scan node",
                  "[integration][gpu_execution][iceberg][verdict]")
 {
   auto transaction = con->Query("BEGIN TRANSACTION READ ONLY");
@@ -1506,7 +1519,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqualityDeleteFixture,
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
-                 "R2a pre-capture refusal keeps first planning error",
+                 "Pre-capture refusal keeps first planning error",
                  "[integration][gpu_execution][iceberg][verdict]")
 {
   auto enabled = con->Query("SET gpu_execution=true");
@@ -1911,6 +1924,114 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                                                  {"elderberry", "5", "purple"}};
   std::sort(expected.begin(), expected.end());
   REQUIRE(collect_rows(*result) == expected);
+
+  // Evolution is intentionally executed through DuckDB while the GPU reader
+  // lacks the missing-column materialization needed for this shape. The same
+  // connection must remain usable by the next GPU query.
+  auto recovery_before = sirius::test::get_transparent_execution_stats(*con);
+  auto recovery        = con->Query("SELECT count(*) FROM " + pinned_scan(v1_path) + ";");
+  REQUIRE(recovery);
+  REQUIRE_FALSE(recovery->HasError());
+  require_route(
+    recovery_before, sirius::test::get_transparent_execution_stats(*con), gpu_route::gpu);
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "gpu_execution iceberg - field IDs materialize missing defaults",
+                 "[integration][gpu_execution][iceberg][schema_evolution]")
+{
+  REQUIRE(delete_file_count(evolved_fields_path) == 1);
+  expect_iceberg_rows(
+    "SELECT * FROM " + pinned_scan(evolved_fields_path) + " ORDER BY count;",
+    gpu_route::gpu,
+    {{"1.5", "1", "NULL", "7"}, {"NULL", "3", "NULL", "7"}, {"5.5", "5", "NULL", "7"}});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "gpu_execution iceberg - evolution preserves count and NULL predicates",
+                 "[integration][gpu_execution][iceberg][schema_evolution]")
+{
+  REQUIRE(delete_file_count(evolved_fields_path) == 1);
+  expect_iceberg_rows(
+    "SELECT count(*) FROM " + pinned_scan(evolved_fields_path) + ";", gpu_route::gpu, {{"3"}});
+  // Mapping runs before predicates, so NULL tests observe the logical field-ID layout rather
+  // than the physical projection of each evolved file.
+  expect_iceberg_rows(
+    "SELECT count(*) FROM " + pinned_scan(evolved_fields_path) + " WHERE score IS NULL;",
+    gpu_route::gpu,
+    {{"1"}});
+  expect_iceberg_rows("SELECT count(*) FROM " + pinned_scan(evolved_fields_path) +
+                        " WHERE score IS NOT NULL AND count IS NOT NULL;",
+                      gpu_route::gpu,
+                      {{"2"}});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "gpu_execution iceberg - unrequested nested fields preserve flat evolution",
+                 "[integration][gpu_execution][iceberg][schema_evolution][nested]")
+{
+  // The physical files stay flat. Add an optional nested field to the current
+  // binding, before, between or after the scalar fields that need ID mapping.
+  auto const nested_type = GENERATE(
+    std::string{
+      R"({"type":"struct","fields":[{"id":7,"name":"x","required":false,"type":"int"}]})"},
+    std::string{R"({"type":"list","element-id":7,"element-required":false,"element":"int"})"},
+    std::string{
+      R"({"type":"map","key-id":7,"key":"string","value-id":8,"value-required":false,"value":"int"})"});
+  auto const position = GENERATE(0, 2, 4);
+  CAPTURE(nested_type, position);
+  sirius::test::scratch_dir scratch{"iceberg_nested_evolution"};
+  auto const metadata_dir = scratch.path() / "metadata";
+  fs::create_directories(metadata_dir);
+  fs::copy_file(fs::path(evolved_fields_path) / "metadata/version-hint.text",
+                metadata_dir / "version-hint.text");
+
+  using namespace duckdb_yyjson;
+  std::unique_ptr<yyjson_doc, decltype(&yyjson_doc_free)> original(
+    yyjson_read_file(
+      (fs::path(evolved_fields_path) / "metadata/v1.metadata.json").c_str(), 0, nullptr, nullptr),
+    yyjson_doc_free);
+  REQUIRE(original);
+  std::unique_ptr<yyjson_mut_doc, decltype(&yyjson_mut_doc_free)> metadata(
+    yyjson_doc_mut_copy(original.get(), nullptr), yyjson_mut_doc_free);
+  REQUIRE(metadata);
+  auto const field_json = R"({"id":6,"name":"nested","required":false,"type":)" + nested_type + "}";
+  std::unique_ptr<yyjson_doc, decltype(&yyjson_doc_free)> field(
+    yyjson_read(field_json.data(), field_json.size(), 0), yyjson_doc_free);
+  REQUIRE(field);
+  auto* root   = yyjson_mut_doc_get_root(metadata.get());
+  auto* schema = yyjson_mut_arr_get(yyjson_mut_obj_get(root, "schemas"), 0);
+  auto* fields = yyjson_mut_obj_get(schema, "fields");
+  REQUIRE(yyjson_mut_arr_insert(
+    fields, yyjson_val_mut_copy(metadata.get(), yyjson_doc_get_root(field.get())), position));
+  REQUIRE(yyjson_mut_obj_put(
+    root, yyjson_mut_str(metadata.get(), "last-column-id"), yyjson_mut_int(metadata.get(), 8)));
+  REQUIRE(yyjson_mut_write_file(
+    (metadata_dir / "v1.metadata.json").c_str(), metadata.get(), 0, nullptr, nullptr));
+
+  auto const scan = pinned_scan(scratch.path().string());
+  // Reorder the output and read scalar slots after the nested field. The rows
+  // exercise promotion, renaming, missing defaults and positional deletes.
+  auto const query =
+    "SELECT added, count, score, fruit FROM " + scan + " WHERE count >= 3 ORDER BY count";
+  auto const expected =
+    std::vector<std::vector<std::string>>{{"7", "3", "NULL", "NULL"}, {"7", "5", "5.5", "NULL"}};
+  expect_iceberg_rows(query, gpu_route::gpu, expected);
+
+  // Keeping a placeholder must not admit nested materialization to the flat mapper.
+  {
+    sirius::test::scoped_recording_log_sink logs;
+    expect_iceberg_rows("SELECT nested, count FROM " + scan + " ORDER BY count",
+                        gpu_route::runtime_fallback,
+                        {{"NULL", "1"}, {"NULL", "3"}, {"NULL", "5"}});
+    bool refused = false;
+    for (auto const& record : logs.records())
+      if (record.message.find("adapter field mapping does not support a required nested field") !=
+          std::string::npos)
+        refused = true;
+    CHECK(refused);
+  }
+  expect_iceberg_rows(query, gpu_route::gpu, expected);
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
@@ -2009,11 +2130,9 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "[integration][gpu_execution][iceberg][transparent][read_view]")
 {
   auto path = (get_project_root() / "test/cpp/integration/data/iceberg_snapshot_deletes").string();
-  struct optimizer_reset {
-    duckdb::Connection& connection;
-    ~optimizer_reset() { connection.Query("RESET disabled_optimizers"); }
-  } reset{*con};
-  con->Query("SET disabled_optimizers = 'extension'");
+  // Appends to Sirius's load-time mask and restores it; a RESET would clear the mask for every
+  // later test on the shared database.
+  sirius::test::disabled_optimizers_guard no_hook{*con, "extension"};
   expect_iceberg_rows("SELECT * FROM " + pinned_scan(path) + " ORDER BY count;",
                       gpu_route::plan_fallback,
                       {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
@@ -2025,11 +2144,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 {
   auto path  = (get_project_root() / "test/cpp/integration/data/iceberg_snapshot_deletes").string();
   auto query = "SELECT * FROM " + pinned_scan(path) + " ORDER BY count";
-  struct optimizer_reset {
-    duckdb::Connection& connection;
-    ~optimizer_reset() { connection.Query("RESET disabled_optimizers"); }
-  } reset{*con};
-  REQUIRE_FALSE(con->Query("SET disabled_optimizers = 'extension'")->HasError());
+  sirius::test::disabled_optimizers_guard no_hook{*con, "extension"};
   REQUIRE_FALSE(con->Query("SET enable_duckdb_fallback = false")->HasError());
   auto const before = sirius::test::get_transparent_execution_stats(*con);
 
@@ -3031,15 +3146,16 @@ TEST_CASE_METHOD(ParquetVirtualMultiRowGroupFixture,
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
-                 "R2a pre-capture text precedes an earlier L0 refusal",
+                 "Pre-capture text precedes an earlier L0 refusal",
                  "[integration][iceberg][verdict]")
 {
-  REQUIRE_FALSE(con->Query("CREATE TEMP TABLE r2a_first_l0(i INTEGER)")->HasError());
-  REQUIRE_FALSE(con->Query("INSERT INTO r2a_first_l0 VALUES (1)")->HasError());
+  REQUIRE_FALSE(con->Query("CREATE TEMP TABLE first_planning_refusal(i INTEGER)")->HasError());
+  REQUIRE_FALSE(con->Query("INSERT INTO first_planning_refusal VALUES (1)")->HasError());
   REQUIRE_FALSE(con->Query("SET gpu_execution=false")->HasError());
   REQUIRE_FALSE(con->Query("BEGIN TRANSACTION READ ONLY")->HasError());
-  auto logical = con->ExtractPlan("SELECT i FROM r2a_first_l0 UNION ALL SELECT count FROM " +
-                                  ("iceberg_scan('" + v1_path + "')"));
+  auto logical =
+    con->ExtractPlan("SELECT i FROM first_planning_refusal UNION ALL SELECT count FROM " +
+                     ("iceberg_scan('" + v1_path + "')"));
   sirius::planner::sirius_physical_plan_generator generator(*con->context);
   bool refused = false;
   try {
@@ -3299,6 +3415,19 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   // bound GET to exercise Sirius's own ordered guards. Check 9 needs a context without Sirius.
   auto result = sirius::planner::registered_iceberg_decline_reason(
     get, which == 9 ? *no_state.context : *con->context, provenance);
+  // A non-contiguous field-id space is valid for the field-ID mapper: a dropped and
+  // re-added field is resolved by ID and materialized as a missing/default value. The old
+  // name-based path rejected this at the early guard, so keep the regression as an admission
+  // check rather than requiring a stale field-id-gap refusal.
+  if (which == 7) {
+    CHECK_FALSE(result.decline);
+    CHECK(result.inventory);
+    CHECK(sirius::test::get_transparent_execution_stats(*con).iceberg_manifest_walks ==
+          before.iceberg_manifest_walks + 1);
+    CHECK_FALSE(provenance.budget.time_exceeded());
+    CHECK_FALSE(provenance.budget.bytes_exceeded());
+    return;
+  }
   REQUIRE(result.decline);
   CHECK(result.decline->reason == expected);
   std::vector<std::string> const texts{"called without a table path",
@@ -3404,7 +3533,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
-                 "SQL multi-Iceberg replan retains the R1 correspondence refusal",
+                 "SQL multi-Iceberg replan retains the read-view correspondence refusal",
                  "[integration][iceberg][verdict]")
 {
   auto query = "SELECT a.count, b.count FROM " + pinned_scan(v1_path) + " a JOIN " +
@@ -3421,7 +3550,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
-                 "Iceberg later schema failure follows a successfully decoded file",
+                 "Iceberg later schema evolution follows a successfully decoded file",
                  "[integration][iceberg][verdict]")
 {
   auto query = "SELECT id, value FROM " + pinned_scan(inventory_fixture("schema_later"));
@@ -3447,10 +3576,11 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
       changed.notify_all();
     }
   };
-  expect_iceberg_schema_refusal(query,
-                                sirius::op::scan::verdict_reason::iceberg_schema_missing_field,
-                                "does not carry the table's current schema (no match for value#2)",
-                                {{"1", "old_a"}, {"2", "old_b"}, {"3", "new_c"}, {"4", "new_d"}});
+  // Field-ID mapping resolves the two physical schemas by field ID before
+  // visibility/filter/projection, so the later file is a supported GPU evolution case rather than a
+  // late schema refusal.
+  expect_iceberg_rows(
+    query, gpu_route::gpu, {{"1", "old_a"}, {"2", "old_b"}, {"3", "new_c"}, {"4", "new_d"}});
   CHECK(observed);
 }
 
@@ -4099,6 +4229,10 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
     REQUIRE(observed.reads_started.size() == 1);
     CHECK(observed.reads_started.front() == sidecar);
     auto after = sirius::test::get_transparent_execution_stats(*con);
+    CHECK(after.iceberg_delete_corrupt_inputs ==
+          before.iceberg_delete_corrupt_inputs + (deferred && !missing ? 1 : 0));
+    CHECK(after.iceberg_delete_reader_io_failures ==
+          before.iceberg_delete_reader_io_failures + (deferred && missing ? 1 : 0));
     auto cause =
       static_cast<size_t>(missing ? sirius::transparent::late_failure_cause::reader_io
                                   : sirius::transparent::late_failure_cause::physical_input);

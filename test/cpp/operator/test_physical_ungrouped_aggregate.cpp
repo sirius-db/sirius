@@ -90,7 +90,9 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate computes SUM/MIN/MAX/COU
                    double,
                    decimal64_tag)
 {
-  using Traits = gpu_type_traits<TestType>;
+  using Traits               = gpu_type_traits<TestType>;
+  auto const* row_count_name = GENERATE("count_star", "count");
+  CAPTURE(row_count_name);
 
   auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
@@ -186,7 +188,7 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate computes SUM/MIN/MAX/COU
     {
       aggregates.push_back(make_uniq<BoundAggregateExpression>(
         duckdb::BoundAggregateFunction(
-          MakeDummyAggregate("count_star", {}, LogicalType(duckdb::LogicalTypeId::BIGINT))),
+          MakeDummyAggregate(row_count_name, {}, LogicalType(duckdb::LogicalTypeId::BIGINT))),
         duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{},
         nullptr,
         nullptr,

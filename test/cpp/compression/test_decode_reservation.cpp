@@ -8,6 +8,8 @@
 #include <rmm/cuda_stream.hpp>
 #include <rmm/mr/cuda_async_memory_resource.hpp>
 
+#include <cuda/stream>
+
 #include <api/simpatico_codegen.hpp>
 #include <catch.hpp>
 #include <cucascade/memory/error.hpp>
@@ -52,12 +54,13 @@ TEST_CASE("Simpatico decode preserves reservation OOM and releases partial outpu
   // deliberately small engine budget. Three outputs cannot fit; two can.
   rmm::mr::cuda_async_memory_resource input_resource{8U << 20};
   rmm::cuda_stream input_stream;
+  ::cuda::stream_ref const input_stream_ref{input_stream};
   std::vector<std::unique_ptr<cudf::column>> input_columns;
   for (int column = 0; column < 3; ++column) {
     auto values = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
                                             rows,
                                             cudf::mask_state::UNALLOCATED,
-                                            input_stream.view(),
+                                            input_stream_ref,
                                             input_resource);
     REQUIRE(cudaMemsetAsync(values->mutable_view().head<std::int32_t>(),
                             column + 1,
@@ -71,7 +74,7 @@ TEST_CASE("Simpatico decode preserves reservation OOM and releases partial outpu
                                                   "input -> identity\n---\n"
                                                   "input -> identity\n---\n"
                                                   "input -> identity\n",
-                                                  input_stream.view(),
+                                                  input_stream_ref,
                                                   input_resource);
 
   int device = -1;
@@ -153,6 +156,7 @@ TEST_CASE("Simpatico decode charges one request's temporaries beyond earlier out
   // delta launch reads it, so every request has temporaries about the size of its output.
   rmm::mr::cuda_async_memory_resource input_resource{64U << 20};
   rmm::cuda_stream input_stream;
+  ::cuda::stream_ref const input_stream_ref{input_stream};
   std::vector<std::vector<std::int32_t>> expected(columns, std::vector<std::int32_t>(rows));
   std::vector<std::unique_ptr<cudf::column>> input_columns;
   std::string plan;
@@ -163,7 +167,7 @@ TEST_CASE("Simpatico decode charges one request's temporaries beyond earlier out
     auto values = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
                                             rows,
                                             cudf::mask_state::UNALLOCATED,
-                                            input_stream.view(),
+                                            input_stream_ref,
                                             input_resource);
     REQUIRE(cudaMemcpyAsync(values->mutable_view().head<std::int32_t>(),
                             expected[column].data(),
@@ -177,7 +181,7 @@ TEST_CASE("Simpatico decode charges one request's temporaries beyond earlier out
   cudf::table input{std::move(input_columns)};
   input_stream.synchronize();
   auto compressed =
-    simpatico::compress_with_plan(input.view(), plan, input_stream.view(), input_resource);
+    simpatico::compress_with_plan(input.view(), plan, input_stream_ref, input_resource);
 
   int device = -1;
   REQUIRE(cudaGetDevice(&device) == cudaSuccess);
@@ -258,12 +262,13 @@ TEST_CASE("Compressed facade spreads decode lanes only under per-thread tracking
   constexpr std::size_t column_count = 2;
   rmm::mr::cuda_async_memory_resource input_resource{8U << 20};
   rmm::cuda_stream task_stream;
+  ::cuda::stream_ref const task_stream_ref{task_stream};
   std::vector<std::unique_ptr<cudf::column>> columns;
   for (std::size_t i = 0; i < column_count; ++i) {
     auto column = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
                                             rows,
                                             cudf::mask_state::UNALLOCATED,
-                                            task_stream.view(),
+                                            task_stream_ref,
                                             input_resource);
     REQUIRE(
       cudaMemsetAsync(column->mutable_view().head<std::int32_t>(), 7, bytes, task_stream.value()) ==
@@ -272,11 +277,9 @@ TEST_CASE("Compressed facade spreads decode lanes only under per-thread tracking
   }
   cudf::table input{std::move(columns)};
   task_stream.synchronize();
-  auto compressed = simpatico::compress_with_plan(input.view(),
-                                                  "input -> identity\n---\ninput -> identity\n",
-                                                  task_stream.view(),
-                                                  input_resource);
-  int device      = -1;
+  auto compressed = simpatico::compress_with_plan(
+    input.view(), "input -> identity\n---\ninput -> identity\n", task_stream_ref, input_resource);
+  int device = -1;
   REQUIRE(cudaGetDevice(&device) == cudaSuccess);
   gpu_memory_space_config config;
   config.device_id              = device;
@@ -302,19 +305,19 @@ TEST_CASE("Compressed facade spreads decode lanes only under per-thread tracking
                                     {},
                                     space,
                                     per_stream ? tracking::PER_STREAM : tracking::PER_THREAD,
-                                    task_stream.view(),
+                                    task_stream_ref,
                                     *allocator);
   };
   if (attached) {
     REQUIRE(
-      allocator->attach_reservation_to_tracker(task_stream.view(),
+      allocator->attach_reservation_to_tracker(task_stream_ref,
                                                space.make_reservation(256),
                                                std::make_unique<fail_reservation_limit_policy>()));
     CHECK_THROWS_AS(decode(), rmm::out_of_memory);
-    CHECK(allocator->get_allocated_bytes(task_stream.view()) == 0);
-    allocator->reset_stream_reservation(task_stream.view());
+    CHECK(allocator->get_allocated_bytes(task_stream_ref) == 0);
+    allocator->reset_stream_reservation(task_stream_ref);
     REQUIRE(
-      allocator->attach_reservation_to_tracker(task_stream.view(),
+      allocator->attach_reservation_to_tracker(task_stream_ref,
                                                space.make_reservation(column_count * bytes),
                                                std::make_unique<fail_reservation_limit_policy>()));
   }
@@ -323,8 +326,8 @@ TEST_CASE("Compressed facade spreads decode lanes only under per-thread tracking
   REQUIRE(decoded.table->num_columns() == column_count);
   REQUIRE(decoded.table->num_rows() == rows);
   if (attached) {
-    CHECK(allocator->get_allocated_bytes(task_stream.view()) == column_count * bytes);
-    CHECK(allocator->get_peak_allocated_bytes(task_stream.view()) == column_count * bytes);
+    CHECK(allocator->get_allocated_bytes(task_stream_ref) == column_count * bytes);
+    CHECK(allocator->get_peak_allocated_bytes(task_stream_ref) == column_count * bytes);
   }
   if (per_stream) {
     for (auto lane : pool.streams) {
@@ -345,7 +348,7 @@ TEST_CASE("Compressed facade spreads decode lanes only under per-thread tracking
   for (auto& output : decoded.table->release()) {
     auto contents = output->release();
     REQUIRE(contents.data != nullptr);
-    auto const recorded = contents.data->stream().value();
+    auto const recorded = ::cuda::stream_ref{contents.data->stream()}.get();
     if (per_stream) {
       CHECK(recorded == task_stream.value());
     } else {
@@ -353,7 +356,7 @@ TEST_CASE("Compressed facade spreads decode lanes only under per-thread tracking
       CHECK(std::ranges::find(pool.streams, recorded) != pool.streams.end());
     }
   }
-  CHECK(allocator->get_allocated_bytes(task_stream.view()) == 0);
+  CHECK(allocator->get_allocated_bytes(task_stream_ref) == 0);
   task_stream.synchronize();
   if (per_stream) {
     for (auto lane : pool.streams) {
@@ -361,7 +364,7 @@ TEST_CASE("Compressed facade spreads decode lanes only under per-thread tracking
       allocator->reset_stream_reservation(lane);
     }
   }
-  allocator->reset_stream_reservation(task_stream.view());
+  allocator->reset_stream_reservation(task_stream_ref);
   CHECK(allocator->get_total_allocated_bytes() == 0);
   CHECK(allocator->get_total_reserved_bytes() == 0);
   CHECK(allocator->get_active_reservation_count() == 0);

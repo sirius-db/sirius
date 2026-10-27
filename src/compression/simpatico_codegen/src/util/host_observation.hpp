@@ -4,6 +4,7 @@
 #include <cuda/stream>
 
 #include <cstddef>
+#include <span>
 
 namespace simpatico {
 
@@ -28,5 +29,21 @@ void read_device_bytes_completed(void* destination,
                                  void const* source,
                                  std::size_t bytes,
                                  ::cuda::stream_ref stream);
+
+/// One device-to-host copy for the batched read_device_bytes_completed().
+struct device_read {
+  void* destination;
+  void const* source;
+  std::size_t bytes;
+};
+
+/**
+ * @brief Perform every read of @p reads and return once @p stream has completed, waiting once.
+ *
+ * Behaves like the single read, staging the reads together through the same pinned storage while
+ * they fit. A caller that has device values to observe besides one it must wait for anyway reads
+ * them all with one wait.
+ */
+void read_device_bytes_completed(std::span<device_read const> reads, ::cuda::stream_ref stream);
 
 }  // namespace simpatico

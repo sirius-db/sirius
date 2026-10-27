@@ -98,16 +98,14 @@ bool enable_p2p_for_test(int num_gpus)
   return any_enabled;
 }
 
-// MGPU-06 data integrity guard (Phase 7 / RESEARCH.md Pitfall 2). FNV-1a
-// checksum over a packed batch payload. Duplicated here because the
+// Data integrity guard: FNV-1a checksum over a packed batch payload.
+// Duplicated here because the
 // equivalent helper in test/cpp/downgrade/test_downgrade_executor.cpp lives
 // in an anonymous namespace and is not reachable from this TU.
-// Phase 18 / DB-03: const dropped from data_batch& parameter (mirrors
-// debug_utils.hpp pattern from plan 18-04). cucascade #117's to_read_only is
-// non-const because it acquires the shared lock.
+// The batch is mutable because to_read_only acquires its shared lock.
 uint64_t compute_batch_checksum_fnv1a64(cucascade::data_batch& batch, ::cuda::stream_ref stream)
 {
-  // Phase 18 / DB-03 Recipe R1: scoped read-only accessor for the lifetime
+  // Hold a scoped read-only accessor for the lifetime
   // of gpu_rep, packed, and host_buf — released at function exit.
   auto ro             = batch.to_read_only();
   auto const& gpu_rep = ro.get_data()->cast<cucascade::gpu_table_representation>();
@@ -907,7 +905,15 @@ TEST_CASE("Sirius configuration loads spill compression settings", "[sirius][con
   auto const& compression = config.get_compression_config();
   REQUIRE(compression.enable_spill_compression);
   REQUIRE(compression.spill_min_batch_bytes == 32ULL * 1024 * 1024);
+  REQUIRE(compression.spill_max_compressed_fraction == Approx(0.5));
+  REQUIRE(compression.max_compressed_fraction ==
+          Approx(sirius::compression_config{}.max_compressed_fraction));
   REQUIRE(compression.spill_encode_reserve_fraction == Approx(0.25));
+
+  sirius::sirius_config negative_fraction;
+  REQUIRE_THROWS_WITH(negative_fraction.load_from_file(
+                        data_dir / "invalid_spill_max_compressed_fraction_negative.yaml"),
+                      Catch::Matchers::ContainsSubstring("spill_max_compressed_fraction"));
 
   for (auto const* fixture : {"invalid_spill_encode_reserve_fraction_above_one.yaml",
                               "invalid_spill_encode_reserve_fraction_negative.yaml",
@@ -2340,7 +2346,7 @@ TEST_CASE("gpu_to_gpu round-trip preserves bytes on N>=2 hosts (MGPU-04 + MGPU-0
   auto checksum_pre = compute_batch_checksum_fnv1a64(*batch, stream);
 
   // GPU0 -> GPU1 forward leg.
-  // Phase 18 / DB-03 Recipe R8 + R3: scoped mutable accessor.
+  // Scoped mutable accessor.
   {
     auto mut = batch->to_mutable();
     mut.convert_to<cucascade::gpu_table_representation>(registry, gpu1, stream);
@@ -2356,7 +2362,7 @@ TEST_CASE("gpu_to_gpu round-trip preserves bytes on N>=2 hosts (MGPU-04 + MGPU-0
   // SiriusContext::initialize() closes the Phase-4-deferred GPU1 -> GPU0
   // bug. Checksum integrity guard per RESEARCH.md Pitfall 2 (silent data
   // corruption on Ada Lovelace + Sapphire Rapids).
-  // Phase 18 / DB-03 Recipe R8 + R3: scoped mutable accessor.
+  // Scoped mutable accessor.
   {
     auto mut = batch->to_mutable();
     mut.convert_to<cucascade::gpu_table_representation>(registry, gpu0, stream);
