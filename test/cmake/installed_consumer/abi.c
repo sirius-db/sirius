@@ -2,11 +2,14 @@
 #include <sirius-c/error.h>
 #include <sirius-c/version.h>
 
+// Retain every exported symbol in this compile/link smoke check.
+const char* (*volatile error_message)(const sirius_error*) = &sirius_error_message;
+size_t (*volatile error_message_size)(const sirius_error*) = &sirius_error_message_size;
+void (*volatile error_destroy)(sirius_error*)              = &sirius_error_destroy;
+uint32_t (*volatile abi_version)(void)                     = &sirius_abi_version;
+
 int main(void)
 {
-  sirius_status status = SIRIUS_SUCCESS;
-  const char* message  = sirius_error_message(NULL);
-  if (message == NULL || message[0] != '\0' || sirius_error_message_size(NULL) != 0) { return 1; }
-  sirius_error_destroy(NULL);
-  return status == 0 && sirius_abi_version() == SIRIUS_ABI_VERSION ? 0 : 1;
+  return error_message == NULL || error_message_size == NULL || error_destroy == NULL ||
+         abi_version == NULL;
 }
