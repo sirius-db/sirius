@@ -676,9 +676,6 @@ prepare_result prefetching_cache::prepare_request(prefetch_request& req, bool wa
     // itself ran dry and the whole remainder is the shortfall.
     auto const over_cap = _pool->chunks_over_cap(n_chunks_needed);
     auto const shortage = over_cap != 0 ? over_cap : n_chunks_needed - buffers.size();
-    // Refused for the host tier's sake rather than the cache's own cap: shrink by
-    // idle chunks only, keeping what the readahead fetched for other scans.
-    bool const for_host = _pool->host_under_spill_pressure() && !_pool->over_static_cap();
     if (!buffers.empty()) { _pool->deallocate_bulk(std::move(buffers), numa_allocated); }
     if (!wait_for_eviction) {
       // Get reclamation moving without stalling the scan-input constructor.
@@ -688,7 +685,7 @@ prepare_result prefetching_cache::prepare_request(prefetch_request& req, bool wa
           !_shutting_down.load(std::memory_order_acquire)) {
         auto processed = std::make_shared<std::latch>(1);
         if (_eviction_queue.enqueue(
-              cache_request{eviction_request{shortage * _chunk_size, processed, for_host}})) {
+              cache_request{eviction_request{shortage * _chunk_size, processed}})) {
           req.pending_eviction = std::move(processed);
         }
       }
@@ -706,7 +703,7 @@ prepare_result prefetching_cache::prepare_request(prefetch_request& req, bool wa
       req.pending_eviction->wait();
       req.pending_eviction.reset();
     } else {
-      evict_sync(shortage * _chunk_size, for_host);
+      evict_sync(shortage * _chunk_size);
     }
     if (req.has_fallen_behind()) {
       req.producer->mark_abandoned();
@@ -1348,12 +1345,11 @@ void prefetching_cache::evict(std::size_t bytes_to_free)
   _eviction_queue.enqueue(cache_request{eviction_request{bytes_to_free, nullptr}});
 }
 
-void prefetching_cache::evict_sync(std::size_t bytes_to_free, bool idle_only)
+void prefetching_cache::evict_sync(std::size_t bytes_to_free)
 {
   if (bytes_to_free == 0 || !_armed || _shutting_down.load(std::memory_order_acquire)) { return; }
   auto processed = std::make_shared<std::latch>(1);
-  if (!_eviction_queue.enqueue(
-        cache_request{eviction_request{bytes_to_free, processed, idle_only}})) {
+  if (!_eviction_queue.enqueue(cache_request{eviction_request{bytes_to_free, processed}})) {
     return;
   }
   processed->wait();

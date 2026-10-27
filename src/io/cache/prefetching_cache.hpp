@@ -426,7 +426,7 @@ class prefetching_cache {
   /// Ask the evictor to free at least @p bytes_to_free and wait until that
   /// request has been processed. This acknowledges an eviction pass, not that
   /// the requested number of bytes could necessarily be reclaimed.
-  void evict_sync(std::size_t bytes_to_free, bool idle_only = false);
+  void evict_sync(std::size_t bytes_to_free);
 
   /// Give the host tier back up to @p bytes of chunks nobody reads or waits for,
   /// and return how many bytes the host tier got back. Only chunks above the
