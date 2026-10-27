@@ -19,6 +19,7 @@
 #include "event/query_event_publisher.hpp"
 #include "exec/channel.hpp"
 #include "exec/config.hpp"
+#include "memory/memory_wait_board.hpp"
 #include "parallel/task_executor.hpp"
 #include "pipeline/completion_handler.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
@@ -30,6 +31,7 @@
 
 #include <atomic>
 #include <memory>
+#include <stdexcept>
 #include <thread>
 
 namespace sirius::op {
@@ -94,6 +96,24 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
   void set_query_event_publisher(sirius::event::query_event_publisher& publisher)
   {
     _query_event_publisher = publisher.shared_from_this();
+  }
+
+  /**
+   * @brief Report stalled reserve phases and OOM-rescheduled tasks on @p board, shared with every
+   *        other GPU executor and with the components that read it.
+   *
+   * Null (the default) disables the reporting; each stall path then costs one null-pointer test.
+   *
+   * @pre The executor is not running: the manager and worker threads read the handle
+   *      unsynchronized.
+   * @throws std::logic_error if the executor is running.
+   */
+  void set_memory_wait_board(std::shared_ptr<sirius::memory::memory_wait_board> board)
+  {
+    if (_running.load(std::memory_order_acquire)) {
+      throw std::logic_error("gpu_pipeline_executor: memory wait board set while running");
+    }
+    _memory_wait_board = std::move(board);
   }
 
   // Non-copyable but movable
@@ -173,6 +193,8 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
   /// Observer of query event transitions.  Never null; see task_creator.
   std::shared_ptr<sirius::event::query_event_publisher> _query_event_publisher{
     std::make_shared<sirius::event::query_event_publisher>()};
+  /// Synchronous stall and OOM-retry counts per GPU; null unless set_memory_wait_board() ran.
+  std::shared_ptr<sirius::memory::memory_wait_board> _memory_wait_board;
   sirius::creator::task_creator* _task_creator{nullptr};
   std::atomic<size_t> _tasks_executed{0};
 };

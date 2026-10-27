@@ -61,6 +61,10 @@ enum class compressed_materialization_activity : std::uint8_t {
 };
 
 /// How a task that reached the end of its run on an executor left it.
+///
+/// A task that fails terminally (an error, an exhausted retry budget, or a query that already
+/// failed) publishes no @c task_completed: its reservation is still released when it is
+/// destroyed, but subscribers learn of it only through the query's retirement.
 enum class task_outcome : std::uint8_t {
   succeeded,       ///< ran to completion; its reservation and inputs have been released
   rescheduled,     ///< handed back to the scheduler after a retryable failure

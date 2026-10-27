@@ -21,6 +21,7 @@
 #include "exec/config.hpp"
 #include "exec/multi_index_priority_queue.hpp"
 #include "exec/query_lifecycle_registry.hpp"
+#include "memory/memory_wait_board.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "parallel/task.hpp"
 #include "pipeline/completion_handler.hpp"
@@ -35,6 +36,7 @@
 #include <future>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <unordered_map>
 
 namespace sirius::parallel {
@@ -135,6 +137,25 @@ class task_scheduler {
     // The executors report memory downgrades into the same observer.
     for (auto& [_, executor] : _gpu_executors) {
       if (executor) { executor->set_query_event_publisher(publisher); }
+    }
+  }
+
+  /**
+   * @brief Install the board on which every GPU executor reports its stalled reserve phases and
+   *        its OOM-rescheduled tasks; null removes it.
+   *
+   * The executors are all created by the constructor, so every one of them receives the board.
+   *
+   * @pre The scheduler is not running.
+   * @throws std::logic_error if the scheduler is running.
+   */
+  void set_memory_wait_board(std::shared_ptr<sirius::memory::memory_wait_board> board)
+  {
+    if (_running.load(std::memory_order_acquire)) {
+      throw std::logic_error("task_scheduler: memory wait board set while running");
+    }
+    for (auto& [_, executor] : _gpu_executors) {
+      if (executor) { executor->set_memory_wait_board(board); }
     }
   }
 
