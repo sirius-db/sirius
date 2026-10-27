@@ -31,6 +31,7 @@
 #include "pipeline/completion_handler.hpp"
 #include "scan_manager/config.hpp"
 #include "scan_manager/duckdb_mvcc_metadata.hpp"
+#include "scan_manager/host_pin_placement.hpp"
 #include "scan_manager/insert_delta_job.hpp"
 #include "scan_manager/load_balancing_scan_batch_coalescer.hpp"
 #include "scan_manager/memory_prefetcher.hpp"
@@ -585,6 +586,9 @@ class sirius_scan_manager {
   /// \brief Number of registered queries that have GPU scan work. Observability and tests.
   [[nodiscard]] std::size_t num_active_queries() const noexcept;
 
+  /// Host-pin placement persists across maintenance calls, query resets and unpins.
+  host_pin_placement& get_host_pin_placement() noexcept { return _host_pin_placement; }
+
   /// \brief Drop every ioctx's prefetching cache and build a fresh one.
   ///
   /// Every cached chunk is released and the file entries go with them, so the
@@ -1103,6 +1107,7 @@ class sirius_scan_manager {
   /// whole duration, and an unpin from another connection drops only the map slot, leaving
   /// the data alive until the last serving provider releases it.
   std::unordered_map<std::string, std::shared_ptr<pinned_entry>> _pinned_entries;
+  host_pin_placement _host_pin_placement;
   /// Guards the STRUCTURE of _pinned_entries (lookup/insert/erase) only, never the serving
   /// of an entry — shared ownership covers that. Held only for map manipulation and the
   /// snapshot in try_match_cached_entry, never across match/validate/plan work, so

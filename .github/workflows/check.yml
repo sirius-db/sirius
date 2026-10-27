@@ -50,8 +50,10 @@ jobs:
           cache: false
           locked: true
           pixi-version: v0.81.0
+          # cmakelang (cmake-format hook) crashes on Python 3.15: its re.Scanner
+          # patterns use capturing groups, which 3.15 rejects. Match pixi.toml.
           global-environments: |
-            pre-commit
+            pre-commit --with python=3.14
 
       - run: |
           set -o pipefail
@@ -190,7 +192,14 @@ jobs:
           engine=$(git rev-parse HEAD:duckdb)
           wrapper=$(git rev-parse HEAD:sirius-duckdb/duckdb)
           [[ "$engine" == "$wrapper" ]]
-          grep -q "duckdb_version: $engine" .github/workflows/distribution.yml
+
+          declared=$(grep -m1 'duckdb_version:' .github/workflows/distribution.yml | sed -E 's/.*duckdb_version:[[:space:]]*//' | tr -d '"[:space:]')
+          if [[ "$declared" == v* ]]; then
+            git -C duckdb fetch --depth=1 origin "refs/tags/${declared}:refs/tags/${declared}"
+            declared=$(git -C duckdb rev-parse "${declared}^{commit}")
+          fi
+
+          [[ "$declared" == "$engine" ]]
 
       # Rust bindings (sirius-sys + sirius) — fmt/clippy + build/link the test.
       # Run on a single representative entry. `cargo test --no-run` compiles the
