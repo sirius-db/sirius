@@ -50,8 +50,10 @@ jobs:
           cache: false
           locked: true
           pixi-version: v0.81.0
+          # cmakelang (cmake-format hook) crashes on Python 3.15: its re.Scanner
+          # patterns use capturing groups, which 3.15 rejects. Match pixi.toml.
           global-environments: |
-            pre-commit
+            pre-commit --with python=3.14
 
       - run: |
           set -o pipefail
