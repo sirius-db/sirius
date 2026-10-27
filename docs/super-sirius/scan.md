@@ -118,6 +118,14 @@ There is no factory class. Each implementation provides a free `make_ingestible(
 
 `parquet_gpu_ingestible` prunes files using supported `filename`/`file_index` predicates, then uses footer statistics to select row groups and batch compatible files. Plain Parquet virtual-column scans use one cuDF read per split. cuDF preserves original row positions through filtering; Sirius maps reader-local source indexes back to bound file identities. Partial pushdown keeps the full residual predicate.
 
+The source-pruning helper evaluates these shapes on the bound `filename` (VARCHAR) or `file_index` (UBIGINT):
+
+- Same-type constant comparisons: `=`, `!=`, `<`, `<=`, `>`, `>=`.
+- Constant `IN` lists and `IS NULL` / `IS NOT NULL`.
+- `AND` / `OR` combinations of these predicates.
+
+Expression comparisons require the column reference on the left and the constant on the right; `BETWEEN` is handled only when lowered to supported comparisons. Only a definite false or SQL NULL result eliminates a file. Unsupported shapes, including `LIKE`, `NOT IN`, casts, and collation expressions, return unknown and conservatively retain files unless another conjunct rules them out. DuckDB may prune filename predicates earlier when selecting the bound file list, independently of this helper. Virtual predicates remain in the residual, and `file_row_number` is not used for source pruning.
+
 Virtual-only queries with no physical value dependency or potential dynamic filter can synthesize rows from footer counts without a data read. Iceberg retains its existing per-row-group layout and delete handling. See [scan_plan](#scan_plan) for column layout and carrier selection.
 
 ### DuckDB-native ingestible

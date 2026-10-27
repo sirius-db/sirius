@@ -2945,6 +2945,31 @@ TEST_CASE_METHOD(ParquetVirtualColumnFixture,
 }
 
 TEST_CASE_METHOD(ParquetVirtualColumnFixture,
+                 "parquet relative glob preserves filename equality and row provenance",
+                 "[integration][gpu_execution][scan][virtual_columns][source_pruning]")
+{
+  auto const relative_dir = fs::relative(scratch.path(), fs::current_path());
+  REQUIRE(relative_dir.is_relative());
+  auto const filename = (relative_dir / "b.parquet").generic_string();
+  auto const scan     = "read_parquet(" +
+                    sirius::test::sql_literal((relative_dir / "[ab].parquet").generic_string()) +
+                    ", hive_partitioning=false)";
+  auto const query = "SELECT filename, file_row_number, sentinel FROM " + scan +
+                     " WHERE filename = " + sirius::test::sql_literal(filename);
+
+  REQUIRE_FALSE(con->Query("SET gpu_execution=false")->HasError());
+  auto expected = con->Query(query + " ORDER BY file_row_number");
+  REQUIRE(expected);
+  REQUIRE_FALSE(expected->HasError());
+  std::vector<std::vector<std::string>> const expected_rows{
+    {filename, "0", "B0"}, {filename, "1", "B1"}, {filename, "2", "B2"}};
+  REQUIRE(collect_rows(*expected) == expected_rows);
+
+  compare_gpu_vs_cpu(query + " ORDER BY file_row_number");
+  compare_gpu_vs_cpu(query + " AND x >= 60 ORDER BY file_row_number");
+}
+
+TEST_CASE_METHOD(ParquetVirtualColumnFixture,
                  "parquet physical ordinal field id is not a legacy row-number option",
                  "[integration][gpu_execution][scan][virtual_columns][virtual_review]")
 {
