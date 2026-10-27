@@ -4,6 +4,7 @@ target_sources(
           preparation.cpp
           preparation_ledger.cpp
           late_mat_resolver.cpp
+          device_prefetch.cpp
           load_balancing_scan_batch_coalescer.cpp
           insert_delta_job.cpp
           mvcc_mask_job.cpp

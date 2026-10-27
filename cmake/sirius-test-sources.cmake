@@ -185,6 +185,7 @@ set(TEST_SOURCES
     test/cpp/scan_manager/test_s3_config_scopes.cpp
     test/cpp/scan_manager/test_prefetching_scheduler.cpp
     test/cpp/scan_manager/test_readahead_lifecycle.cpp
+    test/cpp/scan_manager/test_device_prefetch.cpp
   test/cpp/scan_manager/test_shared_scan_budget.cpp
     test/cpp/scan_manager/test_scan_manager_query_state.cpp
     test/cpp/scan_manager/test_reset_caches.cpp
@@ -322,6 +323,8 @@ set(TEST_SOURCES
     test/cpp/scan/test_gpu_native_decode.cpp
     test/cpp/scan/test_owning_table_view.cpp
     test/cpp/scan/test_parquet_byte_range.cpp
+    test/cpp/scan/test_parquet_device_prefetch.cpp
+    test/cpp/scan/test_prefetched_ranges.cpp
     test/cpp/scan/test_parquet_schema_mapping.cpp
     test/cpp/scan/test_parquet_null_count_pruning.cpp
     test/cpp/scan/test_residual_filter.cpp

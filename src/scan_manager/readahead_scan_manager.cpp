@@ -247,8 +247,14 @@ void readahead_scan_manager::update_scan_state(std::size_t,
     // disposal overtook this report while it was waiting for the mutex.
     if (task->get_scan_stage() == io::cache::scan_stage::disposed) return;
     if (it != _tickets.end()) {
-      it->second->demand_started = true;
-      return;
+      if (it->second->owner == scan_ticket::phase::covered && task->device_prefetch_shed()) {
+        // A shed device prefetch settled as covered, but its payload is gone: this read does real
+        // IO.  The covered entry holds no capacity, so drop it and charge this read afresh below.
+        _tickets.erase(it);
+      } else {
+        it->second->demand_started = true;
+        return;
+      }
     }
     auto ticket            = std::make_shared<scan_ticket>();
     ticket->owner          = scan_ticket::phase::demand;
@@ -330,6 +336,10 @@ void readahead_scan_manager::settle_prefetch(split_key const& split,
   auto task           = split.lock();
   bool const retained = it != _tickets.end() && it->second == ticket && task &&
                         task->get_scan_stage() != io::cache::scan_stage::disposed;
+  // Re-checked here, under the tickets mutex that update_scan_state(reading) also holds: a shed
+  // that landed after the completion callback looked still means the payload is gone, and the
+  // two orderings (shed then reading, reading then settle) serialize on this mutex.
+  covered = covered && !(task && task->device_prefetch_shed());
   if (retained && !covered && ticket->demand_started) {
     // Failure or partial coverage leaves demand IO outstanding. Transfer the
     // existing charge; disposal will release it, without a gap or double count.
@@ -398,6 +408,23 @@ void readahead_scan_manager::worker_loop(const std::stop_token& st)
         _counters.record(prefetch_outcome_kind::skipped_memory_pressure);
         return issue_result::finished;
       }
+      // PHASE 1 (device tier): read the split's hint ranges straight into GPU memory.  On success
+      // the ticket is owned by the device completion, exactly like the host tier below.  Every
+      // non-issued path leaves the split untouched and falls through to the host tier.
+      //
+      // This runs on a jthread, so an escaping exception is std::terminate.  The device phase can
+      // throw (the per-GPU pool cache allocates, so does building the completion callback) but
+      // only BEFORE the issuer submits anything -- the issuer itself is noexcept and owns the
+      // completion once it reports issued -- so a throw means "not issued": fall through to the
+      // host tier with the ticket untouched.  No logging here: it could allocate too.
+      bool device_issued = false;
+      try {
+        device_issued = try_issue_device(candidate, split, ticket);
+      } catch (...) {  // NOLINT(bugprone-empty-catch)
+        device_issued = false;
+      }
+      if (device_issued) { return issue_result::issued; }
+      // PHASE 2 (host tier): stage into the pinned host cache (unchanged).
       auto attempt = [&] {
         bool evict_on_failure = delayed_retry;
         while (!st.stop_requested()) {
@@ -506,6 +533,66 @@ void readahead_scan_manager::worker_loop(const std::stop_token& st)
     }
   }
   if (retry) _counters.record(prefetch_outcome_kind::skipped_memory_pressure);
+}
+
+op::scan::device_stream_pool* readahead_scan_manager::device_pool_for(int device)
+{
+  // Worker-thread only, so the map needs no lock.  Borrowed from the registry (private to this
+  // manager while it holds it, retained and reused across queries) and kept for the manager's
+  // lifetime; a failed borrow (cap reached, every group busy) is not cached, so a later attempt
+  // can succeed once another manager lets its group go.  Dropping the manager only releases the
+  // borrow: the group stays with the registry, busy while any prefetch buffer still leases it.
+  auto it = _device_pools.find(device);
+  if (it != _device_pools.end()) { return it->second.get(); }
+  if (!_device_registry) { return nullptr; }
+  auto pool = _device_registry->acquire_pool(device);
+  if (!pool) { return nullptr; }
+  return _device_pools.emplace(device, std::move(pool)).first->second.get();
+}
+
+bool readahead_scan_manager::try_issue_device(prefetch_candidate const& candidate,
+                                              split_key const& split,
+                                              std::shared_ptr<scan_ticket> const& ticket)
+{
+  if (!_device_registry) { return false; }
+  auto const& task = candidate.task;
+  if (!task || !task->supports_device_prefetch()) { return false; }
+  auto const dev = task->preferred_device();
+  if (!dev) { return false; }
+  auto* gpu = _device_registry->gpu(*dev);
+  if (gpu == nullptr) { return false; }
+  auto* pool = device_pool_for(*dev);
+  if (pool == nullptr) { return false; }
+
+  // Cache-first: when the split's reads go through a prefetching cache, prepare its staging so the
+  // device read populates it on the way; without a cache this is a no-op and the device read goes
+  // straight to the backend over the raw hint ranges.
+  try {
+    std::ignore = task->prepare_for_prefetching(false);
+  } catch (...) {  // best effort: the device read falls back to the backend
+  }
+
+  auto const result = issue_device_readahead(
+    *gpu,
+    pool->acquire(),
+    task,
+    [weak = weak_from_this(), split, ticket](device_readahead_result r) noexcept {
+      // weak, not shared: a completion firing after the query tore the manager down must not
+      // resurrect it.  The device tier reuses the host completion path to release the ticket.
+      auto self = weak.lock();
+      if (!self) { return; }
+      op::scan::scan_info::prefetch_outcome out;
+      out.issued = 1;
+      out.ok     = r.ok;
+      // Covered only if the prefetch's payload is still there for the consumer: a shed prefetch
+      // read real bytes and then lost them (and the split may be gone), so its ticket must not
+      // claim coverage -- demand does the IO again and must be charged for it.  Conservative with
+      // a cache too.
+      auto const alive = split.lock();
+      out.covered      = r.ok && alive && !alive->device_prefetch_shed();
+      self->on_prefetch_complete(split, ticket, out);
+    });
+  return result == device_readahead_issue::issued;
 }
 
 shared_scan_budget::token readahead_scan_manager::acquire_shared_ticket(

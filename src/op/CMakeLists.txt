@@ -38,6 +38,7 @@ target_sources(
           scan/field_id_mapping.cpp
           scan/arrow_materializer.cpp
           scan/parquet_materialize.cpp
+          scan/prefetched_ranges.cpp
           scan/duckdb_native_gpu_ingestible.cpp
           scan/table_scan/bound_read_view.cpp
           scan/table_scan/parquet_physical_profile.cpp

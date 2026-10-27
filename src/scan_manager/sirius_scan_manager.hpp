@@ -30,6 +30,7 @@
 #include "pin_table.hpp"
 #include "pipeline/completion_handler.hpp"
 #include "scan_manager/config.hpp"
+#include "scan_manager/device_prefetch.hpp"
 #include "scan_manager/duckdb_mvcc_metadata.hpp"
 #include "scan_manager/host_pin_placement.hpp"
 #include "scan_manager/insert_delta_job.hpp"
@@ -47,6 +48,7 @@
 
 #include <compression/compressed_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
+#include <cucascade/memory/config.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/common/column_index.hpp>
 #include <duckdb/common/types.hpp>
@@ -493,12 +495,16 @@ class sirius_scan_manager {
    * @param reservation_manager Memory reservation manager for GPU memory.
    * @param topology_index Hardware GPU/NUMA topology index.  Drives round-robin
    *        GPU assignment for scans and is forwarded to the prefetching cache.
+   * @param memory_configs The memory-space configs the reservation manager was built from.  Only
+   *        consulted when device prefetching is enabled (it sizes the speculative budget from the
+   *        original GPU configs); empty means no GPU limits, so no registry: host-only readahead.
    */
   sirius_scan_manager(sirius::exec::query_lifecycle_registry& lifecycle,
                       const scan_manager_config& config,
                       cucascade::memory::memory_reservation_manager& reservation_manager,
                       std::shared_ptr<const sirius::memory::topology_index> topology_index,
-                      std::shared_ptr<op::scan::physical_check_counters> physical_counters = {});
+                      std::shared_ptr<op::scan::physical_check_counters> physical_counters   = {},
+                      std::span<cucascade::memory::memory_space_config const> memory_configs = {});
 
   ~sirius_scan_manager();
 
@@ -787,6 +793,14 @@ class sirius_scan_manager {
   /// only way to observe that a zero budget left it unbuilt rather than built and idle.
   [[nodiscard]] bool has_readahead_for_testing() const noexcept;
 
+  /// The runtime-wide per-GPU device-readahead registry, or null when device prefetching is off
+  /// (the default) or no GPU has a positive speculative budget.  Shared with every per-query
+  /// readahead and, via the context, with the GPU executors.
+  [[nodiscard]] std::shared_ptr<device_readahead_registry> const& device_readahead() const noexcept
+  {
+    return _device_readahead;
+  }
+
   /// Visit every pinned entry under the pin-table lock. The visitor runs WHILE the lock is
   /// held, so it must be quick and must not call back into the scan manager. The reference
   /// it receives is only guaranteed for the duration of the call — a visitor that stashes
@@ -1073,6 +1087,9 @@ class sirius_scan_manager {
   /// the GPU id set fed to the round-robin scan-balancing strategy.
   std::shared_ptr<const sirius::memory::topology_index> _topology_index;
   std::shared_ptr<op::scan::physical_check_counters> _physical_counters;
+  /// Declared before every member that can run a per-query readahead, so the registry outlives
+  /// them; null unless device prefetching is enabled.
+  std::shared_ptr<device_readahead_registry> _device_readahead;
   exec::static_thread_pool _thread_pool;
   std::shared_ptr<shared_scan_budget> _shared_readahead_budget =
     std::make_shared<shared_scan_budget>();

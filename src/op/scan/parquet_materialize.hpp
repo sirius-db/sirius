@@ -32,13 +32,16 @@
 #include <cudf/io/text/byte_range_info.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
+#include <cudf/utilities/span.hpp>
 
 #include <rmm/resource_ref.hpp>
 
 #include <cuda/stream>
 
+#include <cstdint>
 #include <memory>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 namespace sirius::op::scan {
@@ -84,6 +87,17 @@ class column_chunk_range_cache {
   std::unique_ptr<cudf::io::parquet::experimental::hybrid_scan_reader> _reader;
 };
 
+/// One source's column chunks already resident on the device, in the order
+/// @ref column_chunk_ranges enumerates them (== the order @c materialize_all_columns wants).
+using prefetched_chunk_spans = std::span<cudf::device_span<std::uint8_t const> const>;
+
+/// Thrown by the device route when the spans do not match what the reader expects for
+/// (sources, options): count, order or sizes.  The caller falls back to reading for itself.
+class prefetched_mismatch : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
+
 /// Materialize @p sources into one table.
 ///
 /// Takes one of two routes, picked from what the backend says it wants:
@@ -115,6 +129,33 @@ class column_chunk_range_cache {
   std::span<std::vector<cudf::io::text::byte_range_info> const> ranges,
   ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr);
+
+/// As above, with @p prefetched: one entry per source, in @p sources order.  When every entry is
+/// non-empty the table is decoded straight from those spans by the hybrid scan reader, whatever
+/// the backend prefers.  The spans must outlive the call.  Each source's spans are checked against
+/// the reader's own column-chunk enumeration under @p options (one span per chunk, same sizes,
+/// and -- when @p ranges has a non-empty entry for the source -- read from the same file
+/// offsets); a mismatch throws @ref prefetched_mismatch before any decode work.  An empty
+/// @p prefetched is the behaviour of the overload above.
+///
+/// @throws std::invalid_argument when @p prefetched is non-empty but fails
+///         @ref can_materialize_from_prefetched.
+[[nodiscard]] std::unique_ptr<cudf::table> materialize_parquet(
+  std::span<parquet_source const> sources,
+  cudf::io::parquet_reader_options const& options,
+  std::span<std::vector<cudf::io::text::byte_range_info> const> ranges,
+  std::span<prefetched_chunk_spans const> prefetched,
+  ::cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr);
+
+/// Shape check only: one non-empty entry of @p prefetched per source, every source with metadata
+/// and row groups, and -- when @p ranges has a non-empty entry for the source -- one span per
+/// range with matching sizes.  The exact check against the reader runs inside
+/// @ref materialize_parquet.
+[[nodiscard]] bool can_materialize_from_prefetched(
+  std::span<parquet_source const> sources,
+  std::span<std::vector<cudf::io::text::byte_range_info> const> ranges,
+  std::span<prefetched_chunk_spans const> prefetched) noexcept;
 
 /// Whether @c materialize_parquet would take the bulk route for @p sources and
 /// @p options.  Exposed so a caller can decide *before* paying to build the

@@ -21,8 +21,11 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <limits>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 
@@ -629,6 +632,168 @@ TEST_CASE("sirius_config reads readahead_strategy", "[scan_manager][config][read
                       scan_manager_yaml("      readahead_strategy: lazy\n"));
   sirius::sirius_config cfg;
   CHECK_THROWS(cfg.load_from_file(invalid.path()));
+}
+
+TEST_CASE("device prefetching is disabled by default", "[scan_manager][config][device_prefetch]")
+{
+  scan_manager_config cfg{};
+  CHECK(cfg.device_prefetching_budget == 0.0);
+  CHECK(cfg.device_prefetching_threshold == Approx(0.5));
+  CHECK_FALSE(cfg.device_prefetching_enabled());
+
+  auto const omitted = load_scan_manager("sirius_device_prefetch_omitted.yaml",
+                                         scan_manager_yaml("      rest_n_reactors: 1\n"));
+  CHECK(omitted.device_prefetching_budget == 0.0);
+  CHECK(omitted.device_prefetching_threshold == Approx(0.5));
+  CHECK_FALSE(omitted.device_prefetching_enabled());
+
+  auto const zero = load_scan_manager("sirius_device_prefetch_zero.yaml",
+                                      scan_manager_yaml("      device_prefetching_budget: 0\n"));
+  CHECK(zero.device_prefetching_budget == 0.0);
+  CHECK_FALSE(zero.device_prefetching_enabled());
+}
+
+TEST_CASE("sirius_config reads the device prefetching knobs",
+          "[scan_manager][config][device_prefetch]")
+{
+  auto const cfg =
+    load_scan_manager("sirius_device_prefetch_set.yaml",
+                      scan_manager_yaml("      device_prefetching_budget: 0.25\n"
+                                        "      device_prefetching_threshold: 0.4\n"));
+  CHECK(cfg.device_prefetching_budget == Approx(0.25));
+  CHECK(cfg.device_prefetching_threshold == Approx(0.4));
+  CHECK(cfg.device_prefetching_enabled());
+
+  // Both fraction boundaries are valid.
+  auto const low = load_scan_manager("sirius_device_prefetch_low.yaml",
+                                     scan_manager_yaml("      device_prefetching_budget: 1\n"
+                                                       "      device_prefetching_threshold: 0\n"));
+  CHECK(low.device_prefetching_budget == Approx(1.0));
+  CHECK(low.device_prefetching_threshold == 0.0);
+  CHECK(low.device_prefetching_enabled());
+  CHECK_NOTHROW(sirius::scan_manager::validate_scan_manager_config(low));
+
+  auto const high = load_scan_manager("sirius_device_prefetch_high.yaml",
+                                      scan_manager_yaml("      device_prefetching_threshold: 1\n"));
+  CHECK(high.device_prefetching_threshold == Approx(1.0));
+  CHECK_FALSE(high.device_prefetching_enabled());
+}
+
+TEST_CASE("sirius_config rejects invalid device prefetching fractions",
+          "[scan_manager][config][device_prefetch]")
+{
+  auto key   = GENERATE("device_prefetching_budget", "device_prefetching_threshold");
+  auto value = GENERATE("-0.1", "1.1", "2", ".nan", ".inf", "-.inf", "many", "[]");
+  INFO(key << ": " << value);
+  scoped_yaml yaml("sirius_device_prefetch_invalid.yaml",
+                   scan_manager_yaml(std::string("      ") + key + ": " + value + "\n"));
+  sirius::sirius_config cfg;
+  CHECK_THROWS(cfg.load_from_file(yaml.path()));
+  CHECK_THROWS_AS(sirius::parsed_sirius_config::from_file(yaml.path()),
+                  sirius::configuration_input_error);
+}
+
+TEST_CASE("sirius_config rejects unknown device prefetching keys",
+          "[scan_manager][config][device_prefetch]")
+{
+  auto key = GENERATE("device_prefetching_fraction",
+                      "device_prefetch_budget",
+                      "device_fraction",
+                      "device_prefetching_enabled");
+  scoped_yaml yaml("sirius_device_prefetch_unknown.yaml",
+                   scan_manager_yaml(std::string("      ") + key + ": 0.5\n"));
+  sirius::sirius_config cfg;
+  CHECK_THROWS(cfg.load_from_file(yaml.path()));
+}
+
+TEST_CASE("validate_scan_manager_config checks the device prefetching fractions",
+          "[scan_manager][config][device_prefetch]")
+{
+  using sirius::scan_manager::validate_scan_manager_config;
+  constexpr double nan = std::numeric_limits<double>::quiet_NaN();
+  constexpr double inf = std::numeric_limits<double>::infinity();
+
+  CHECK_NOTHROW(validate_scan_manager_config(scan_manager_config{}));
+
+  for (double bad : {-0.01, 1.01, nan, inf, -inf}) {
+    INFO(bad);
+    scan_manager_config budget{};
+    budget.device_prefetching_budget = bad;
+    CHECK_THROWS_AS(validate_scan_manager_config(budget), std::invalid_argument);
+
+    scan_manager_config threshold{};
+    threshold.device_prefetching_threshold = bad;
+    CHECK_THROWS_AS(validate_scan_manager_config(threshold), std::invalid_argument);
+  }
+
+  for (double good : {0.0, 0.5, 1.0}) {
+    scan_manager_config cfg{};
+    cfg.device_prefetching_budget    = good;
+    cfg.device_prefetching_threshold = good;
+    CHECK_NOTHROW(validate_scan_manager_config(cfg));
+  }
+}
+
+TEST_CASE("device prefetching enables readahead without a cache",
+          "[scan_manager][config][device_prefetch][readahead]")
+{
+  using sirius::scan_manager::prefetch_strategy;
+  constexpr std::size_t backend_budget = 7;
+
+  scan_manager_config cfg{};
+  cfg.pipeline_width = 2;
+  // Disabled: cache off still means no readahead, unchanged.
+  CHECK(cfg.resolve_readahead(backend_budget, prefetch_strategy::eager).budget == 0);
+
+  cfg.device_prefetching_budget = 0.3;
+  for (auto mode : {cache_mode::none, cache_mode::os, cache_mode::sirius}) {
+    cfg.cache.mode = mode;
+    cfg.apply_cache_mode();
+    INFO(static_cast<int>(mode));
+    // Unset strategy goes eager, so the budget is the backend's, not the pipeline width.
+    auto const plan = cfg.resolve_readahead(backend_budget, prefetch_strategy::opportunistic);
+    CHECK(plan.budget == backend_budget);
+    CHECK(plan.strategy == prefetch_strategy::eager);
+  }
+
+  // A pinned strategy is honored.
+  cfg.cache.mode         = cache_mode::none;
+  cfg.readahead_strategy = prefetch_strategy::opportunistic;
+  auto const pinned      = cfg.resolve_readahead(backend_budget, prefetch_strategy::eager);
+  CHECK(pinned.strategy == prefetch_strategy::opportunistic);
+  CHECK(pinned.budget == 2);
+  cfg.readahead_strategy.reset();
+
+  // A backend budget of zero stays an opt-out and keeps the backend's strategy.
+  auto const opt_out = cfg.resolve_readahead(0, prefetch_strategy::opportunistic);
+  CHECK(opt_out.budget == 0);
+  CHECK(opt_out.strategy == prefetch_strategy::opportunistic);
+
+  // An explicit budget (zero included) still wins.
+  cfg.max_readahead_scans = 0;
+  CHECK(cfg.resolve_readahead(backend_budget, prefetch_strategy::eager).budget == 0);
+  cfg.max_readahead_scans = 3;
+  CHECK(cfg.resolve_readahead(backend_budget, prefetch_strategy::eager).budget == 3);
+}
+
+TEST_CASE("disabled device prefetching leaves readahead resolution unchanged",
+          "[scan_manager][config][device_prefetch][readahead]")
+{
+  using sirius::scan_manager::prefetch_strategy;
+  scan_manager_config cfg{};
+  cfg.cache.mode                   = cache_mode::sirius;
+  cfg.device_prefetching_threshold = 0.9;  // the threshold alone never enables it
+  CHECK_FALSE(cfg.device_prefetching_enabled());
+
+  // Unset strategy still follows the backend, and the opportunistic pipeline-width substitution
+  // holds.
+  cfg.pipeline_width = 2;
+  auto const plan    = cfg.resolve_readahead(7, prefetch_strategy::opportunistic);
+  CHECK(plan.strategy == prefetch_strategy::opportunistic);
+  CHECK(plan.budget == 2);
+
+  cfg.cache.mode = cache_mode::none;
+  CHECK(cfg.resolve_readahead(7, prefetch_strategy::eager).budget == 0);
 }
 
 TEST_CASE("backend string_to_enum accepts known backends", "[scan_manager][config][backend]")
