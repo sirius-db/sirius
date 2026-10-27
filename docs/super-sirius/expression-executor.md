@@ -144,7 +144,7 @@ The evaluator supports three strategies, selected via `policy.strategy` in the `
 
 | Strategy | How it executes | cuDF API |
 |----------|-----------------|----------|
-| `MATERIALIZE` | Every expression node becomes a single kernel. Intermediate results are materialized as `cudf::column`s. | `cudf::unary_operation`, `cudf::binary_operation`, etc. (one per node) |
+| `MATERIALIZE` | Materializes intermediate results as `cudf::column`s. Floating comparisons use small interpreted ASTs for NaN semantics; this strategy never selects AST JIT. | `cudf::unary_operation`, `cudf::binary_operation`, `cudf::compute_column` |
 | `AST_INTERPRET` (default) | Builds a `cudf::ast::tree` and interprets it with a single monolithic kernel. | `cudf::compute_column` |
 | `AST_JIT` | Builds a `cudf::ast::tree` and JIT-compiles it into a fused kernel. | `cudf::compute_column_jit` |
 

@@ -4121,13 +4121,20 @@ TEST_CASE("Floating comparisons order NaN above infinity and preserve NULL",
                                cmp::le,
                                cmp::distinct_from,
                                cmp::not_distinct_from};
-  std::vector<std::unique_ptr<ast_node>> nodes;
+  duckdb::vector<std::unique_ptr<ast_node>> nodes;
   for (auto comparison : comparisons)
     nodes.push_back(make_cmp(comparison, make_ref_typed(0, type), make_ref_typed(1, type)));
-  auto result = run_execute(space, input, std::move(nodes), strategy);
+  exp_executor executor(nodes,
+                        get_resource_ref(space),
+                        cudf::get_default_stream(),
+                        sirius::expression_query_policy{strategy});
+  auto output = executor.evaluate(sirius::get_cudf_table_view(*input));
+  REQUIRE(output != nullptr);
+  CHECK((executor.ast_jit_evaluation_count_for_testing() > 0) ==
+        (strategy == exp_strategy_enum::AST_JIT));
   for (size_t c = 0; c < comparisons.size(); ++c) {
-    auto values = copy_column_to_host<int8_t>(result.output_view.column(c));
-    auto valid  = copy_valids_to_host(result.output_view.column(c));
+    auto values = copy_column_to_host<int8_t>(output->view().column(c));
+    auto valid  = copy_valids_to_host(output->view().column(c));
     for (size_t i = 0; i < left.size(); ++i) {
       CAPTURE(strategy, single_precision, c, i);
       bool ln   = i / domain.size() == domain.size() - 1;
