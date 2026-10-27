@@ -27,7 +27,9 @@
 // cudf
 #include <cudf/column/column_factories.hpp>
 #include <cudf/cudf_utils.hpp>
+#include <cudf/strings/convert/convert_integers.hpp>
 #include <cudf/unary.hpp>
+#include <cudf/utilities/traits.hpp>
 
 // standard library
 #include <algorithm>
@@ -94,6 +96,9 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::cast const& alt, eva
   if (alt.kind == sirius::ast::cast_kind::carrier_restore) {
     // Only planner-certified carrier restoration may tunnel through the representation.
     result_column = sirius::cast_through_rep(input, return_type, _stream, _mr);
+  } else if (return_type.id() == cudf::type_id::STRING &&
+             cudf::is_integral_not_bool(input.type())) {
+    result_column = cudf::strings::from_integers(input, _stream, _mr);
   } else if (input.type().id() == cudf::type_id::TIMESTAMP_DAYS &&
              (return_type.id() == cudf::type_id::TIMESTAMP_SECONDS ||
               return_type.id() == cudf::type_id::TIMESTAMP_MILLISECONDS ||
