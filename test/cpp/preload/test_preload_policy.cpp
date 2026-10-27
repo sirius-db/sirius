@@ -596,6 +596,13 @@ TEST_CASE("choose_staging_host prefers the target GPU's NUMA node, then the orig
   STATIC_REQUIRE(choose_staging_host(-1, std::nullopt, 3) == 3);
   STATIC_REQUIRE(choose_staging_host(-1, -1, -1) == -1);
   STATIC_REQUIRE(choose_staging_host(-1, std::nullopt, -1) == -1);
+
+  // Nodes without a HOST space are skipped, down the same chain.
+  constexpr auto only_two = [](int node) { return node == 2; };
+  STATIC_REQUIRE(choose_staging_host(1, 2, 0, only_two) == 2);
+  STATIC_REQUIRE(choose_staging_host(2, 0, 0, only_two) == 2);
+  STATIC_REQUIRE(choose_staging_host(1, 0, 3, only_two) == -1);
+  STATIC_REQUIRE(choose_staging_host(-1, std::nullopt, 2, only_two) == 2);
 }
 
 // ---- margins and windows -----------------------------------------------------------------------

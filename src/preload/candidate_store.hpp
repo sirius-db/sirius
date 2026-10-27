@@ -135,6 +135,8 @@ struct ledger_entry {
   /// Conversion sequence of the promotion (see @c promotion_result::conversion_seq). A record at
   /// or below it describes a move from before the promotion and is ignored.
   std::uint64_t seq{0};
+  /// A consumer on another GPU was already counted as a misprediction.
+  bool mispredicted{false};
 };
 
 /// What @ref candidate_store::intake did with a record.
@@ -388,8 +390,8 @@ class candidate_store {
   void apply_ledger_verdicts(
     std::span<std::pair<std::uint64_t, ledger_verdict> const> verdicts) noexcept;
 
-  /// A queued task on GPU index @p gpu consumes @p batch_id: count a misprediction when preload
-  /// put it on another GPU.
+  /// A queued task on GPU index @p gpu consumes @p batch_id: count a misprediction, once per
+  /// entry, when preload put it on another GPU.
   void note_consumer_device(std::uint64_t batch_id, std::size_t gpu) noexcept;
 
   /// Drop all candidates, queries, ledger entries and retired statistics. Epochs are kept.

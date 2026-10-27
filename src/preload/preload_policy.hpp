@@ -38,6 +38,7 @@
 #include <compare>
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -529,6 +530,19 @@ struct target_choice {
   if (numa_of_target_gpu >= 0) { return numa_of_target_gpu; }
   if (origin_host && *origin_host >= 0) { return *origin_host; }
   if (numa_of_origin_gpu >= 0) { return numa_of_origin_gpu; }
+  return -1;
+}
+
+/// @ref choose_staging_host, skipping nodes for which @p has_host is false (no HOST space there).
+template <typename HasHost>
+[[nodiscard]] constexpr int choose_staging_host(int numa_of_target_gpu,
+                                                std::optional<int> origin_host,
+                                                int numa_of_origin_gpu,
+                                                HasHost&& has_host) noexcept
+{
+  for (int const node : {numa_of_target_gpu, origin_host.value_or(-1), numa_of_origin_gpu}) {
+    if (node >= 0 && has_host(node)) { return node; }
+  }
   return -1;
 }
 

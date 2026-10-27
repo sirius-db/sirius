@@ -610,6 +610,8 @@ TEST_CASE("candidate_store applies the planner's ledger classification", "[prelo
     f.store.note_consumer_device(3, 0);
     f.store.note_consumer_device(3, 1);
     CHECK(f.counters.get(counter::mispredicted_device) == 1);
+    f.store.note_consumer_device(3, 0);  // the same entry, seen again: counted once
+    CHECK(f.counters.get(counter::mispredicted_device) == 1);
   }
 }
 

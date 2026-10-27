@@ -212,6 +212,7 @@ set(TEST_SOURCES
     test/cpp/memory/test_topology_index.cpp
     test/cpp/preload/test_candidate_store.cpp
     test/cpp/preload/test_hw_caps.cpp
+    test/cpp/preload/test_preload_executor.cpp
     test/cpp/preload/test_preload_policy.cpp
     test/cpp/preload/test_preload_promotion.cpp
     test/cpp/operator/test_build_probe_scheduling.cpp

@@ -745,7 +745,7 @@ void candidate_store::add_ledger(candidate const& c,
   // Index first: if the ledger insert throws, the index entry is rolled back.
   qs.ledger_ids.insert(c.batch_id);
   try {
-    _ledger.emplace(c.batch_id, ledger_entry{c.batch, c.query, gpu, job.k, bytes, seq});
+    _ledger.emplace(c.batch_id, ledger_entry{c.batch, c.query, gpu, job.k, bytes, seq, false});
   } catch (...) {
     qs.ledger_ids.erase(c.batch_id);
     throw;
@@ -826,8 +826,9 @@ void candidate_store::apply_ledger_verdicts(
 void candidate_store::note_consumer_device(std::uint64_t batch_id, std::size_t gpu) noexcept
 {
   auto const it = _ledger.find(batch_id);
-  if (it == _ledger.end() || it->second.gpu < 0) { return; }
+  if (it == _ledger.end() || it->second.gpu < 0 || it->second.mispredicted) { return; }
   if (static_cast<std::size_t>(it->second.gpu) != gpu) {
+    it->second.mispredicted = true;
     count(it->second.query, counter::mispredicted_device);
   }
 }
