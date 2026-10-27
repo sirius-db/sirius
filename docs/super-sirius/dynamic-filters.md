@@ -75,7 +75,7 @@ For build evidence, projections and a plain deduplication aggregate over a `CTE_
 3. A filter becomes visible only after all of its usable replicas are ready. The publisher then appends it to each accepting target channel. Multi-filter fan-out is not atomic, so a racing consumer may observe any independently complete subset.
 4. Consumers take one coherent `dynamic_filter_snapshot` at their application checkpoint and retain its immutable filter owners through GPU consumption. They never wait for publication.
 
-For whole-build publication, an `rmm::out_of_memory` during source-filter construction is logged and ends the optional publication attempt without failing the query. A reservation, construction, or transfer failure for one target GPU omits that replica, and consumers on that GPU skip that filter. Unexpected failures outside target-local replication still propagate.
+For whole-build publication, an `rmm::out_of_memory` during source-filter construction is logged and ends the optional publication attempt without failing the query. Recoverable reservation, allocation, or availability refusals for one target GPU omit that replica, and consumers on that GPU skip that filter. CUDA and programming errors propagate. Every pending membership copy is drained before the first fatal error is rethrown, and no new membership replicas are installed by a failed invocation. Zone-map failure cleanup joins source and target work before releasing partial replicas. Completion failures are always fatal.
 
 ### Publication ownership and completion
 

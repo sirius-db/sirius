@@ -22,19 +22,23 @@
 #include <cstddef>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <utility>
 
 namespace {
-thread_local int armed_operation      = 0;
-thread_local cudaError_t armed_status = cudaSuccess;
-thread_local std::size_t armed_skip   = 0;
+thread_local int armed_operation       = 0;
+thread_local cudaError_t armed_status  = cudaSuccess;
+thread_local std::size_t armed_skip    = 0;
+thread_local cudaStream_t armed_stream = nullptr;
 thread_local std::optional<sirius::test::cuda_transfer_observation> observed_transfers;
 thread_local cucascade::memory::fixed_size_host_memory_resource const* observed_resource = nullptr;
 thread_local std::size_t initial_host_bytes                                              = 0;
 
-cudaError_t take_status(int operation)
+cudaError_t take_status(int operation, cudaStream_t stream = nullptr)
 {
-  if (armed_operation != operation) return cudaSuccess;
+  if (armed_operation != operation || (armed_stream != nullptr && armed_stream != stream)) {
+    return cudaSuccess;
+  }
   if (armed_skip != 0) {
     --armed_skip;
     return cudaSuccess;
@@ -57,20 +61,26 @@ bool pool_access_consumed = false;
 namespace sirius::test {
 scoped_cuda_status_fault::scoped_cuda_status_fault(operation op,
                                                    cudaError_t status,
-                                                   std::size_t skip)
+                                                   std::size_t skip,
+                                                   cudaStream_t matching_stream)
 {
-  REQUIRE(armed_operation == 0);
+  if (armed_operation != 0) { throw std::logic_error("a CUDA status fault is already armed"); }
   armed_status    = status;
   armed_skip      = skip;
+  armed_stream    = matching_stream;
   armed_operation = op;
 }
-scoped_cuda_status_fault::~scoped_cuda_status_fault() { armed_operation = 0; }
+scoped_cuda_status_fault::~scoped_cuda_status_fault()
+{
+  armed_operation = 0;
+  armed_stream    = nullptr;
+}
 bool scoped_cuda_status_fault::consumed() { return armed_operation == 0; }
 
 scoped_cuda_transfer_observer::scoped_cuda_transfer_observer(
   cucascade::memory::fixed_size_host_memory_resource const& staging_resource)
 {
-  REQUIRE_FALSE(observed_transfers.has_value());
+  if (observed_transfers) { throw std::logic_error("a CUDA transfer observer is already active"); }
   observed_transfers.emplace();
   observed_resource  = &staging_resource;
   initial_host_bytes = staging_resource.get_total_allocated_bytes();
@@ -119,7 +129,7 @@ extern "C" cudaError_t __wrap_cudaStreamWaitEvent(cudaStream_t stream,
                                                   cudaEvent_t event,
                                                   unsigned int flags)
 {
-  if (auto status = take_status(sirius::test::scoped_cuda_status_fault::wait_event);
+  if (auto status = take_status(sirius::test::scoped_cuda_status_fault::wait_event, stream);
       status != cudaSuccess)
     return status;
   return __real_cudaStreamWaitEvent(stream, event, flags);
@@ -168,7 +178,9 @@ extern "C" cudaError_t __wrap_cudaMemcpyAsync(void* destination,
     : kind == cudaMemcpyHostToDevice ? sirius::test::scoped_cuda_status_fault::copy_host_to_device
                                      : 0;
   if (operation != 0) {
-    if (auto const status = take_status(operation); status != cudaSuccess) { return status; }
+    if (auto const status = take_status(operation, stream); status != cudaSuccess) {
+      return status;
+    }
   }
   return __real_cudaMemcpyAsync(destination, source, bytes, kind, stream);
 }
@@ -185,7 +197,7 @@ extern "C" cudaError_t __wrap_cudaStreamSynchronize(cudaStream_t stream)
   }
   auto const real_status = __real_cudaStreamSynchronize(stream);
   if (real_status != cudaSuccess) { return real_status; }
-  return take_status(sirius::test::scoped_cuda_status_fault::synchronize_stream);
+  return take_status(sirius::test::scoped_cuda_status_fault::synchronize_stream, stream);
 }
 
 #if CUDART_VERSION >= 12080
@@ -230,7 +242,8 @@ extern "C" cudaError_t __wrap_cudaMemcpyBatchAsync(void** destinations,
 #endif
 {
   if (observed_transfers) { ++observed_transfers->batch_submissions; }
-  auto const injected_status = take_status(sirius::test::scoped_cuda_status_fault::copy_batch);
+  auto const injected_status =
+    take_status(sirius::test::scoped_cuda_status_fault::copy_batch, stream);
   if (injected_status != cudaSuccess) {
     // Accept a real prefix before reporting the later failure, so cleanup must join submitted work.
     if (count < 2 || attribute_count != 1 || attribute_indices[0] != 0) {

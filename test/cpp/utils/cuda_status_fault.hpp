@@ -39,7 +39,10 @@ class scoped_cuda_status_fault {
     synchronize_stream  = 5,
     copy_batch          = 6
   };
-  scoped_cuda_status_fault(operation op, cudaError_t status, std::size_t skip = 0);
+  scoped_cuda_status_fault(operation op,
+                           cudaError_t status,
+                           std::size_t skip             = 0,
+                           cudaStream_t matching_stream = nullptr);
   ~scoped_cuda_status_fault();
   scoped_cuda_status_fault(scoped_cuda_status_fault const&)            = delete;
   scoped_cuda_status_fault& operator=(scoped_cuda_status_fault const&) = delete;

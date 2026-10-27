@@ -24,12 +24,15 @@
 
 #include <rmm/cuda_device.hpp>
 
+#include <cucascade/error.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <log/logging.hpp>
 #include <op/dynamic_filter/dynamic_filter_device.hpp>
+#include <op/dynamic_filter/dynamic_filter_replica_transfer.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 
 #include <algorithm>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 
@@ -194,7 +197,7 @@ std::unique_ptr<cudf::scalar> clone_scalar_to_device(cudf::scalar const& source,
       return std::make_unique<cudf::string_scalar>(value, valid, target_stream, target_mr);
     }
     default:
-      throw std::runtime_error(
+      throw std::logic_error(
         "[sirius_dynamic_zone_map_filter] Unsupported scalar type for device replication");
   }
 }
@@ -395,18 +398,21 @@ void sirius_dynamic_zone_map_filter::replicate_to_devices(
   auto source_lease        = sirius::memory::runtime_stream_pool::acquire(source->get_gpu_space());
   auto const source_stream = source_lease.get();
 
+  detail::replica_fanout_failures failures;
   for (auto const& target : spaces) {
     auto const& target_space = target.get_gpu_space();
     auto const device_id     = target_space.get_device_id();
     if (is_available_on_device(device_id)) { continue; }
+    std::optional<sirius::memory::runtime_stream_pool::lease> target_lease;
+    std::unique_ptr<device_zones> replica;
+    bool completing = false;
     try {
-      auto replica       = std::make_unique<device_zones>();
+      replica            = std::make_unique<device_zones>();
       replica->device_id = device_id;
-
       {
         rmm::cuda_set_device_raii target_guard{rmm::cuda_device_id{device_id}};
-        auto target_lease        = sirius::memory::runtime_stream_pool::acquire(target_space);
-        auto const target_stream = target_lease.get();
+        target_lease.emplace(sirius::memory::runtime_stream_pool::acquire(target_space));
+        auto const target_stream = target_lease->get();
         auto const target_mr     = target_space.get_default_allocator();
         replica->zones.reserve(_zones.size());
         for (auto const& zone : _zones) {
@@ -416,20 +422,35 @@ void sirius_dynamic_zone_map_filter::replicate_to_devices(
              clone_scalar_to_device(
                *zone.max, _source_device, source_stream, target_stream, target_mr)});
         }
-        target_stream.sync();
+        completing = true;
+        CUCASCADE_CUDA_TRY(cudaStreamSynchronize(target_stream.get()));
+        completing = false;
       }
       SIRIUS_LOG_DEBUG("[sirius_dynamic_zone_map_filter] replicated {} zone(s) GPU {} -> GPU {}.",
                        _zones.size(),
                        _source_device,
                        device_id);
       _replicas.push_back(std::move(replica));
-    } catch (std::exception const& e) {
-      SIRIUS_LOG_WARN(
-        "[sirius_dynamic_zone_map_filter] replica GPU {} -> GPU {} unavailable: {}. "
-        "That GPU will skip this optional filter.",
-        _source_device,
-        device_id,
-        e.what());
+    } catch (...) {
+      if (completing) {
+        failures.record_fatal("[sirius_dynamic_zone_map_filter]", _source_device, device_id);
+      } else {
+        (void)failures.skip_if_recoverable(
+          "[sirius_dynamic_zone_map_filter]", _source_device, device_id);
+      }
+      // Earlier scalar constructors may have queued work. Keep their owners and stream lease alive
+      // through both joins, even if the first join fails.
+      auto join = [&](int device, ::cuda::stream_ref stream) noexcept {
+        try {
+          rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device}};
+          CUCASCADE_CUDA_TRY(cudaStreamSynchronize(stream.get()));
+        } catch (...) {
+          failures.record_fatal("[sirius_dynamic_zone_map_filter]", _source_device, device_id);
+        }
+      };
+      join(_source_device, source_stream);
+      if (target_lease) { join(device_id, target_lease->get()); }
+      failures.rethrow_if_fatal();
     }
   }
 }

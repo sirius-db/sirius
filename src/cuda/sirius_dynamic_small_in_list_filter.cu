@@ -283,18 +283,16 @@ void sirius_dynamic_small_in_list_filter::replicate_to_devices(
     auto const device_id = replica->device_id;
     try {
       rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
-      stream.sync();
-      _store->replicas.push_back(std::move(replica));
-    } catch (std::exception const& e) {
-      SIRIUS_LOG_WARN(
-        "[sirius_dynamic_small_in_list_filter] replica GPU {} -> GPU {} unavailable: {}. That GPU "
-        "will skip this optional filter.",
-        _store->source_device,
-        device_id,
-        e.what());
+      CUCASCADE_CUDA_TRY(cudaStreamSynchronize(stream.get()));
+    } catch (...) {
+      failures.record_fatal(
+        "[sirius_dynamic_small_in_list_filter]", _store->source_device, device_id);
     }
   }
   failures.rethrow_if_fatal();
+  for (auto& [replica, stream_lease] : pending) {
+    _store->replicas.push_back(std::move(replica));
+  }
 }
 
 bool sirius_dynamic_small_in_list_filter::is_available_on_device(int device_id) const noexcept

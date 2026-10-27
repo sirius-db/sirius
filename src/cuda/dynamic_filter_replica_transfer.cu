@@ -16,7 +16,10 @@
 
 #include "memory/runtime_stream_pool.hpp"
 
+#include <cudf/utilities/error.hpp>
+
 #include <rmm/cuda_device.hpp>
+#include <rmm/error.hpp>
 
 #include <cuda_runtime.h>
 
@@ -60,25 +63,60 @@ replica_transfer_route enqueue_replica_copy(
 
 bool replica_fanout_failures::skip_if_recoverable(std::string_view filter_name,
                                                   int source_device,
-                                                  int destination_device)
+                                                  int destination_device) noexcept
 {
   auto const failure = std::current_exception();
   try {
     std::rethrow_exception(failure);
   } catch (cucascade::cuda_error const&) {
+  } catch (::cuda::cuda_error const&) {
+  } catch (cudf::cuda_error const&) {
+  } catch (rmm::cuda_error const&) {
   } catch (std::logic_error const&) {
   } catch (std::exception const& e) {
-    SIRIUS_LOG_WARN(
-      "{} replica GPU {} -> GPU {} unavailable: {}. That GPU will skip this optional filter.",
-      filter_name,
-      source_device,
-      destination_device,
-      e.what());
+    sirius::log::log_noexcept([&] {
+      SIRIUS_LOG_WARN(
+        "{} replica GPU {} -> GPU {} unavailable: {}. That GPU will skip this optional filter.",
+        filter_name,
+        source_device,
+        destination_device,
+        e.what());
+    });
     return true;
   } catch (...) {
   }
-  _fatal = failure;
+  record_fatal(filter_name, source_device, destination_device);
   return false;
+}
+
+void replica_fanout_failures::record_fatal(std::string_view filter_name,
+                                           int source_device,
+                                           int destination_device) noexcept
+{
+  auto const failure = std::current_exception();
+  if (!_fatal) {
+    _fatal = failure;
+    return;
+  }
+  sirius::log::log_noexcept([&] {
+    try {
+      std::rethrow_exception(failure);
+    } catch (std::exception const& error) {
+      SIRIUS_LOG_ERROR(
+        "{} replica GPU {} -> GPU {} failed during cleanup: {}. Preserving the first fatal error.",
+        filter_name,
+        source_device,
+        destination_device,
+        error.what());
+    } catch (...) {
+      SIRIUS_LOG_ERROR(
+        "{} replica GPU {} -> GPU {} failed during cleanup with a non-standard exception. "
+        "Preserving the first fatal error.",
+        filter_name,
+        source_device,
+        destination_device);
+    }
+  });
 }
 
 void replica_fanout_failures::rethrow_if_fatal() const
