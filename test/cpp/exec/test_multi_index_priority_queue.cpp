@@ -19,7 +19,9 @@
 
 #include <atomic>
 #include <chrono>
+#include <limits>
 #include <memory>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -421,6 +423,209 @@ TEST_CASE("multi_index try_pop_if scoped to a device bucket", "[multi_index_prio
   REQUIRE(q.size(gpu_index{1}) == 1);  // device 1 untouched
 
   REQUIRE_FALSE(q.try_pop_if(gpu_index{7}, [](const payload&) { return true; }).has_value());
+}
+
+// =============================================================================
+// visit_in_pop_order -- read-only walk of one device bucket
+// =============================================================================
+
+namespace {
+
+/// Fills `q` with tasks spread over two devices and the no-preference bucket, several priority
+/// levels, and several tasks per (device, priority) so FIFO order within a level is observable.
+/// Pushes are deliberately out of priority order.
+void fill_mixed_devices(multi_index_priority_queue<payload>& q)
+{
+  constexpr auto op = SiriusPhysicalOperatorType::FILTER;
+  q.push(task(1, keys_of(5, op, 0, /*device=*/0)));
+  q.push(task(2, keys_of(2, op, 0, /*device=*/0)));
+  q.push(task(3, keys_of(5, op, 0, /*device=*/1)));
+  q.push(task(4, keys_of(5, op, 0, /*device=*/0)));
+  q.push(task(5, keys_of(2, op, 0, no_preferred_device)));
+  q.push(task(6, keys_of(-3, op, 0, /*device=*/0)));
+  q.push(task(7, keys_of(2, op, 0, /*device=*/0)));
+  q.push(task(8, keys_of(-3, op, 0, no_preferred_device)));
+  q.push(task(9, keys_of(5, op, 0, no_preferred_device)));
+  q.push(task(10, keys_of(2, op, 0, /*device=*/1)));
+}
+
+std::vector<int> visit_ids(const multi_index_priority_queue<payload>& q, device_key dev)
+{
+  std::vector<int> ids;
+  q.visit_in_pop_order(gpu_index{dev}, [&](const payload& p) {
+    ids.push_back(p.id);
+    return true;
+  });
+  return ids;
+}
+
+std::vector<int> pop_ids(multi_index_priority_queue<payload>& q, device_key dev)
+{
+  std::vector<int> ids;
+  while (auto t = q.try_pop_from(gpu_index{dev})) {
+    ids.push_back((*t)->id);
+  }
+  return ids;
+}
+
+}  // namespace
+
+TEST_CASE("multi_index visit_in_pop_order follows each bucket's pop order",
+          "[multi_index_priority_queue]")
+{
+  multi_index_priority_queue<payload> q(by_keys());
+  fill_mixed_devices(q);
+
+  const auto visited0    = visit_ids(q, 0);
+  const auto visited1    = visit_ids(q, 1);
+  const auto visited_any = visit_ids(q, no_preferred_device);
+
+  // Priority ascending (-3, 2, 5), FIFO within a priority.
+  REQUIRE(visited0 == std::vector<int>{6, 2, 7, 1, 4});
+  REQUIRE(visited1 == std::vector<int>{10, 3});
+  REQUIRE(visited_any == std::vector<int>{8, 5, 9});
+
+  // The walk is exactly the order the device pops produce.
+  REQUIRE(pop_ids(q, 0) == visited0);
+  REQUIRE(pop_ids(q, 1) == visited1);
+  REQUIRE(pop_ids(q, no_preferred_device) == visited_any);
+  REQUIRE(q.empty());
+}
+
+TEST_CASE("multi_index visit_in_pop_order removes nothing", "[multi_index_priority_queue]")
+{
+  multi_index_priority_queue<payload> q(by_keys());
+  fill_mixed_devices(q);
+  const auto device_sizes   = q.device_bucket_sizes();
+  const auto query_sizes    = q.query_bucket_sizes();
+  const auto operator_sizes = q.operator_bucket_sizes();
+
+  const auto first  = visit_ids(q, 0);
+  const auto second = visit_ids(q, 0);
+  (void)visit_ids(q, 1);
+  (void)visit_ids(q, no_preferred_device);
+
+  REQUIRE(first == second);
+  REQUIRE(q.size() == 10);
+  REQUIRE(q.size(gpu_index{0}) == 5);
+  REQUIRE(q.device_bucket_sizes() == device_sizes);
+  REQUIRE(q.query_bucket_sizes() == query_sizes);
+  REQUIRE(q.operator_bucket_sizes() == operator_sizes);
+  // The global order is untouched as well.
+  REQUIRE(drain_front(q) == std::vector<int>{6, 8, 2, 5, 7, 10, 1, 3, 4, 9});
+}
+
+TEST_CASE("multi_index visit_in_pop_order stops when the visitor returns false",
+          "[multi_index_priority_queue]")
+{
+  multi_index_priority_queue<payload> q(by_keys());
+  fill_mixed_devices(q);
+
+  std::vector<int> seen;
+  q.visit_in_pop_order(gpu_index{0}, [&](const payload& p) {
+    seen.push_back(p.id);
+    return seen.size() < 3;  // stop after the third task, in the middle of priority 2
+  });
+  REQUIRE(seen == std::vector<int>{6, 2, 7});
+
+  // Returning false on the first task visits exactly one.
+  int calls = 0;
+  q.visit_in_pop_order(gpu_index{no_preferred_device}, [&](const payload&) {
+    ++calls;
+    return false;
+  });
+  REQUIRE(calls == 1);
+  REQUIRE(q.size() == 10);
+}
+
+TEST_CASE("multi_index visit_in_pop_order on an absent or emptied bucket visits nothing",
+          "[multi_index_priority_queue]")
+{
+  multi_index_priority_queue<payload> q(by_keys());
+  int calls          = 0;
+  const auto counter = [&](const payload&) {
+    ++calls;
+    return true;
+  };
+
+  q.visit_in_pop_order(gpu_index{0}, counter);  // empty queue
+  REQUIRE(calls == 0);
+
+  q.push(task(1, keys_of(1, SiriusPhysicalOperatorType::FILTER, 0, /*device=*/0)));
+  q.visit_in_pop_order(gpu_index{7}, counter);  // device with no tasks
+  q.visit_in_pop_order(gpu_index{no_preferred_device}, counter);
+  REQUIRE(calls == 0);
+
+  REQUIRE(q.try_pop_from(gpu_index{0}).has_value());
+  q.visit_in_pop_order(gpu_index{0}, counter);  // bucket pruned after its last pop
+  REQUIRE(calls == 0);
+}
+
+TEST_CASE("multi_index visit_in_pop_order propagates a visitor exception and releases the lock",
+          "[multi_index_priority_queue]")
+{
+  multi_index_priority_queue<payload> q(by_keys());
+  fill_mixed_devices(q);
+
+  REQUIRE_THROWS_AS(q.visit_in_pop_order(gpu_index{0},
+                                         [](const payload& p) -> bool {
+                                           if (p.id == 2) { throw std::runtime_error("visitor"); }
+                                           return true;
+                                         }),
+                    std::runtime_error);
+
+  // The lock was released and nothing changed.
+  REQUIRE(q.size() == 10);
+  REQUIRE(visit_ids(q, 0) == std::vector<int>{6, 2, 7, 1, 4});
+}
+
+TEST_CASE("multi_index visit_in_pop_order runs alongside concurrent pushes and pops",
+          "[multi_index_priority_queue]")
+{
+  multi_index_priority_queue<payload> q(by_keys());
+  constexpr int kTasks = 2000;
+  std::atomic<bool> done{false};
+
+  std::thread producer([&] {
+    for (int i = 0; i < kTasks; ++i) {
+      q.push(task(i, keys_of(i % 7, SiriusPhysicalOperatorType::FILTER, 0, /*device=*/i % 2)));
+    }
+  });
+  std::thread consumer([&] {
+    int popped = 0;
+    while (popped < kTasks) {
+      bool progressed = false;
+      if (q.try_pop_from(gpu_index{popped % 2 == 0 ? 0 : 1})) {
+        ++popped;
+        progressed = true;
+      }
+      if (q.try_pop_from(gpu_index{popped % 2 == 0 ? 1 : 0})) {
+        ++popped;
+        progressed = true;
+      }
+      if (!progressed) { std::this_thread::yield(); }
+    }
+    done.store(true);
+  });
+
+  // Every walk sees each bucket in non-decreasing priority order, whatever the interleaving.
+  // Assertions wait until both threads are joined: a throwing REQUIRE while they are still
+  // joinable would call std::terminate instead of reporting a test failure.
+  bool all_ordered = true;
+  while (!done.load()) {
+    for (device_key dev : {0, 1}) {
+      queue_priority last = std::numeric_limits<queue_priority>::min();
+      q.visit_in_pop_order(gpu_index{dev}, [&](const payload& p) {
+        all_ordered = all_ordered && p.keys.device_id == dev && p.keys.priority >= last;
+        last        = p.keys.priority;
+        return true;
+      });
+    }
+  }
+  producer.join();
+  consumer.join();
+  REQUIRE(all_ordered);
+  REQUIRE(q.empty());
 }
 
 // =============================================================================

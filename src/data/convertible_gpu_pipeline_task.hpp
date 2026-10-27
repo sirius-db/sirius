@@ -217,7 +217,8 @@ class convertible_gpu_pipeline_task : public convertible_data {
    * gpu_pipeline_task, or has no pipelineable operator_data input data).
    *
    * Public and static so that both the wrapper and the provider can share this
-   * logic without duplicating the dynamic_cast chain.
+   * logic without duplicating the dynamic_cast chain. The non-const overload
+   * delegates to the const one, so the chain is defined in exactly one place.
    *
    * @param task The task to inspect.
    * @return Pointer to pipelineable_operator_data, or nullptr if unreachable.
@@ -225,16 +226,35 @@ class convertible_gpu_pipeline_task : public convertible_data {
   static sirius::op::pipelineable_operator_data* get_pipelineable_data(
     sirius::parallel::itask& task)
   {
-    auto* gpt = dynamic_cast<sirius::pipeline::gpu_pipeline_task*>(&task);
+    // Safe: every object on the chain is reached from the non-const `task`, so none is a const
+    // object; the const overload only walks it through const accessors.
+    return const_cast<sirius::op::pipelineable_operator_data*>(
+      get_pipelineable_data(static_cast<const sirius::parallel::itask&>(task)));
+  }
+
+  /**
+   * @brief Read-only form of get_pipelineable_data(itask&), and the single definition of the
+   * dynamic_cast chain both overloads use.
+   *
+   * Follows the chain through const accessors only, so it can be used where only a
+   * `const itask&` is available (e.g. a visitor running under a task queue's lock).
+   *
+   * @param task The task to inspect.
+   * @return Pointer to pipelineable_operator_data, or nullptr if unreachable.
+   */
+  static const sirius::op::pipelineable_operator_data* get_pipelineable_data(
+    const sirius::parallel::itask& task)
+  {
+    auto const* gpt = dynamic_cast<const sirius::pipeline::gpu_pipeline_task*>(&task);
     if (!gpt) { return nullptr; }
 
-    auto* ls = gpt->local_state();
+    auto const* ls = gpt->local_state();
     if (!ls) { return nullptr; }
 
-    auto* gpt_ls = dynamic_cast<sirius::pipeline::gpu_pipeline_task_local_state*>(ls);
+    auto const* gpt_ls = dynamic_cast<const sirius::pipeline::gpu_pipeline_task_local_state*>(ls);
     if (!gpt_ls) { return nullptr; }
 
-    return dynamic_cast<sirius::op::pipelineable_operator_data*>(gpt_ls->_input_data.get());
+    return dynamic_cast<const sirius::op::pipelineable_operator_data*>(gpt_ls->_input_data.get());
   }
 
  private:

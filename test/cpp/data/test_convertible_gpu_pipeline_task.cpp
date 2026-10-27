@@ -528,3 +528,87 @@ TEST_CASE("convert records a task without a pipeline with no query id",
   REQUIRE_FALSE(rec.preferred_device.has_value());
   REQUIRE_FALSE(rec.task_query_id.has_value());
 }
+
+TEST_CASE("const get_pipelineable_data follows the same chain as the mutable one",
+          "[convertible_gpu_pipeline_task]")
+{
+  using sirius::convertible_gpu_pipeline_task;
+  auto& e = env();
+
+  auto b1 = sirius::test::operator_utils::make_numeric_batch(
+    *e.gpu_space, std::vector<int32_t>{1, 2, 3}, cudf::type_id::INT32);
+  auto b2 = sirius::test::operator_utils::make_numeric_batch(
+    *e.gpu_space, std::vector<int32_t>{4, 5}, cudf::type_id::INT32);
+
+  SECTION("gpu_pipeline_task with pipelineable input")
+  {
+    auto task                              = make_test_gpu_task(1, {b1, b2});
+    sirius::parallel::itask& mutable_task  = *task;
+    const sirius::parallel::itask& ro_task = *task;
+    auto* mutable_data = convertible_gpu_pipeline_task::get_pipelineable_data(mutable_task);
+    const sirius::op::pipelineable_operator_data* const_data =
+      convertible_gpu_pipeline_task::get_pipelineable_data(ro_task);
+
+    REQUIRE(const_data != nullptr);
+    REQUIRE(const_data == mutable_data);
+    REQUIRE(ro_task.local_state() == mutable_task.local_state());
+    auto const& batches = const_data->get_data_batches();
+    REQUIRE(batches.size() == 2);
+    REQUIRE(batches[0]->get_batch_id() == b1->get_batch_id());
+    REQUIRE(batches[1]->get_batch_id() == b2->get_batch_id());
+  }
+
+  SECTION("not a gpu_pipeline_task")
+  {
+    const dummy_task task;
+    REQUIRE(convertible_gpu_pipeline_task::get_pipelineable_data(
+              static_cast<const sirius::parallel::itask&>(task)) == nullptr);
+  }
+
+  SECTION("gpu_pipeline_task without input data")
+  {
+    auto local  = std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(nullptr);
+    auto global = std::make_shared<sirius::pipeline::gpu_pipeline_task_global_state>(
+      nullptr, sirius::test::make_test_telemetry_context());
+    const sirius::pipeline::gpu_pipeline_task task(
+      1, std::vector<cucascade::shared_data_repository*>{}, std::move(local), std::move(global));
+    REQUIRE(convertible_gpu_pipeline_task::get_pipelineable_data(
+              static_cast<const sirius::parallel::itask&>(task)) == nullptr);
+  }
+}
+
+TEST_CASE("queue visitor reads task inputs through the const chain",
+          "[convertible_gpu_pipeline_task]")
+{
+  auto& e = env();
+
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(test_extractor());
+  auto b1 = sirius::test::operator_utils::make_numeric_batch(
+    *e.gpu_space, std::vector<int32_t>{1}, cudf::type_id::INT32);
+  auto b2 = sirius::test::operator_utils::make_numeric_batch(
+    *e.gpu_space, std::vector<int32_t>{2}, cudf::type_id::INT32);
+  auto b3 = sirius::test::operator_utils::make_numeric_batch(
+    *e.gpu_space, std::vector<int32_t>{3}, cudf::type_id::INT32);
+  REQUIRE(queue.push(make_test_gpu_task(1, {b1, b2})));
+  REQUIRE(queue.push(std::make_unique<dummy_task>()));
+  REQUIRE(queue.push(make_test_gpu_task(2, {b3})));
+
+  std::vector<std::uint64_t> ids;
+  std::size_t visited = 0;
+  queue.visit_in_pop_order(sirius::exec::gpu_index{sirius::exec::no_preferred_device},
+                           [&](const sirius::parallel::itask& task) {
+                             ++visited;
+                             auto const* data =
+                               sirius::convertible_gpu_pipeline_task::get_pipelineable_data(task);
+                             if (!data) { return true; }
+                             for (auto const& batch : data->get_data_batches()) {
+                               ids.push_back(batch->get_batch_id());
+                             }
+                             return true;
+                           });
+
+  REQUIRE(visited == 3);
+  REQUIRE(ids ==
+          std::vector<std::uint64_t>{b1->get_batch_id(), b2->get_batch_id(), b3->get_batch_id()});
+  REQUIRE(queue.size() == 3);
+}
