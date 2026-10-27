@@ -20,6 +20,7 @@
 #include "ducklake/inline_unit_ingestible.hpp"
 #include "ducklake/inline_varchar.hpp"
 #include "ducklake/preparation_identity.hpp"
+#include "ducklake/preparation_slot.hpp"
 #include "ducklake/unit_descriptor.hpp"
 #include "io/io_errors.hpp"
 #include "planner/connector_registry.hpp"
@@ -847,4 +848,88 @@ TEST_CASE("DuckLake inline batches use spare column capacity without expanding t
     CHECK(rows * columns <= 8192);
     CHECK(inline_unit_ingestible::batch_capacity(columns) <= ceiling);
   }
+}
+
+TEST_CASE("DuckLake retained preparation slots reuse capacity without crossing scan ownership",
+          "[ducklake_units][ducklake_delete_budget]")
+{
+  namespace sm = sirius::scan_manager;
+  sm::test::test_reservation_provider provider;
+  auto ledger = std::make_shared<sm::preparation_ledger>(provider);
+  sm::scan_envelope envelope{{{{8}, 16}}, {}, true, 1};
+  std::vector<sm::scan_envelope> scans{envelope, envelope};
+  auto decision = ledger->admit(scans, sm::memory_space_id{cucascade::memory::Tier::HOST, 0}, 2);
+  REQUIRE(decision.deferred);
+  REQUIRE(decision.n_permits == 2);
+  auto first  = std::make_shared<preparation_slot>(ledger, sm::unit_key{1, 1}, 16);
+  auto second = std::make_shared<preparation_slot>(ledger, sm::unit_key{2, 1}, 16);
+  for (int file = 0; file < 32; ++file) {
+    auto a = first->try_acquire();
+    REQUIRE(a);
+    CHECK_FALSE(first->try_acquire());
+    auto b = second->try_acquire();
+    REQUIRE(b);
+    auto bytes = ledger->allocator(a).allocate_retained(16);
+    CHECK(ledger->charged_bytes(first->key()) == 16);
+    CHECK_THROWS_AS(ledger->allocator(a).allocate_retained(1), sm::preparation_resource_error);
+    CHECK(ledger->tracked_units() == 2);
+    bytes.release();
+    CHECK(provider.seen->allocated_bytes == 0);
+  }
+  CHECK(ledger->permits_in_flight() == 0);
+  first.reset();
+  second.reset();
+  CHECK(ledger->tracked_units() == 0);
+  ledger.reset();
+  CHECK(provider.outstanding() == 0);
+}
+
+TEST_CASE("DuckLake retained slot retirement preserves outstanding backing",
+          "[ducklake_units][ducklake_delete_budget]")
+{
+  namespace sm = sirius::scan_manager;
+  sm::test::test_reservation_provider provider;
+  auto ledger = std::make_shared<sm::preparation_ledger>(provider);
+  std::vector<sm::scan_envelope> scans{{{{{8}, 16}}, {}, true, 1}};
+  REQUIRE(ledger->admit(scans, sm::memory_space_id{cucascade::memory::Tier::HOST, 0}).deferred);
+  auto slot   = std::make_shared<preparation_slot>(ledger, sm::unit_key{1, 1}, 16);
+  auto permit = slot->try_acquire();
+  REQUIRE(permit);
+  auto bytes = ledger->allocator(permit).allocate_retained(16);
+  slot.reset();
+  permit.release();
+  CHECK(ledger->tracked_units() == 1);
+  ledger->close();
+  ledger.reset();
+  CHECK(provider.seen->allocated_bytes == 16);
+  CHECK(provider.outstanding() == 1);
+  bytes.release();
+  CHECK(provider.seen->allocated_bytes == 0);
+  CHECK(provider.outstanding() == 0);
+}
+
+TEST_CASE("DuckLake Parquet dependency errors distinguish mappings and snapshot visibility",
+          "[ducklake_units]")
+{
+  auto unit = local();
+  CHECK_NOTHROW(validate_parquet_unit_dependencies(unit));
+  unit.mapping_id = 0;
+  CHECK_FALSE(parquet_unit_dependencies_supported(unit));
+  CHECK_THROWS_WITH(parquet_unit_envelope(unit),
+                    "DuckLake external field mappings are outside the supported scan profile");
+  unit.mapping_id.reset();
+  unit.snapshot_min = 0;
+  CHECK_FALSE(parquet_unit_dependencies_supported(unit));
+  CHECK_THROWS_WITH(parquet_unit_envelope(unit),
+                    "DuckLake per-row snapshot-filtered data is outside the local scan profile");
+  unit.snapshot_min.reset();
+  unit.delete_path = "/tmp/deletes";
+  for (auto format : {delete_format::parquet, delete_format::puffin}) {
+    unit.deletes = format;
+    CHECK(parquet_unit_dependencies_supported(unit));
+    CHECK_NOTHROW(validate_parquet_unit_dependencies(unit));
+  }
+  unit.delete_path = "s3://bucket/deletes";
+  CHECK_THROWS_WITH(validate_parquet_unit_dependencies(unit),
+                    "DuckLake remote deletes are outside the local scan profile");
 }

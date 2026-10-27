@@ -27,6 +27,7 @@ inline constexpr size_t dv_max_positions    = 1024 * 1024;
 inline constexpr size_t dv_max_footer_bytes = 1024 * 1024;
 inline constexpr size_t dv_max_blobs        = 64;
 bool parquet_unit_dependencies_supported(unit_descriptor const&);
+void validate_parquet_unit_dependencies(unit_descriptor const&);
 scan_manager::unit_envelope parquet_unit_envelope(unit_descriptor const&);
 struct dv_visibility final : op::scan::prepared_visibility {
   std::string data_identity, delete_identity;

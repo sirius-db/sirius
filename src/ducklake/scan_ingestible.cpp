@@ -22,6 +22,7 @@
 #include "ducklake/inline_unit_ingestible.hpp"
 #include "ducklake/parquet_unit_ingestible.hpp"
 #include "ducklake/preparation_gate.hpp"
+#include "ducklake/preparation_slot.hpp"
 #include "log/logging.hpp"
 #include "op/scan/table_scan/split_validation.hpp"
 
@@ -306,6 +307,7 @@ struct scan_ingestible::impl {
     opts.profiles       = options.profiles;
     opts.identities     = options.identities;
     opts.inline_gate    = options.inline_gate;
+    opts.parquet_slot   = options.parquet_slot;
     opts.owns_admission = false;
     if (descriptor->kind == unit_kind::parquet) {
       auto source      = binding->make_parquet_unit(next_file,
@@ -501,6 +503,10 @@ std::shared_ptr<sm::preparation_admission> scan_ingestible::preparation_admissio
 void scan_ingestible::attach_preparation_ledger(std::shared_ptr<sm::preparation_ledger> ledger)
 {
   if (!ledger || impl_->ledger) throw std::logic_error("DuckLake scan ledger attachment invalid");
+  impl_->options.parquet_slot = std::make_shared<preparation_slot>(
+    ledger,
+    sm::unit_key{impl_->owner->contract, impl_->options.identities->next()},
+    envelope().retained);
   impl_->ledger = std::move(ledger);
 }
 void scan_ingestible::stop_preparation() noexcept
@@ -513,6 +519,7 @@ void scan_ingestible::finish_preparation() noexcept
   if (auto state = impl_->current.load()) state->source->finish_preparation();
   stop_preparation();
   impl_->current.store({});
+  impl_->options.parquet_slot.reset();
   impl_->admission->finish();
 }
 scan::ingestible_table_info const& scan_ingestible::table_info() const noexcept

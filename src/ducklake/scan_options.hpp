@@ -29,6 +29,7 @@ struct physical_profile_table;
 }
 namespace sirius::ducklake {
 struct preparation_gate;
+class preparation_slot;
 // Filters and output positions index the selected required_columns, not the
 // original table or physical file. Omitted output means all selected columns;
 // an empty output retains only a row carrier after filtering.
@@ -40,6 +41,7 @@ struct unit_scan_options {
   std::shared_ptr<op::scan::physical_profile_table> profiles;
   std::shared_ptr<preparation_identity> identities;
   std::shared_ptr<preparation_gate> inline_gate;
+  std::shared_ptr<preparation_slot> parquet_slot;
   bool owns_admission = true;
 };
 

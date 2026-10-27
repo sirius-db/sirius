@@ -452,8 +452,7 @@ std::shared_ptr<dv_visibility const> binding_handle::read_parquet_deletes(
   validate_statement();
 #ifdef SIRIUS_DUCKLAKE_PRIVATE_BRIDGE
   auto unit = unit_at(index);
-  if (!unit || unit->deletes != delete_format::parquet ||
-      !parquet_unit_dependencies_supported(*unit))
+  if (!unit || unit->deletes != delete_format::parquet)
     throw std::invalid_argument("DuckLake ordinary delete reader requires a local original unit");
   (void)parquet_unit_envelope(*unit);
   auto context    = impl_->context.lock();

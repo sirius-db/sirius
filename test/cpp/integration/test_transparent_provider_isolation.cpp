@@ -2209,3 +2209,72 @@ TEST_CASE("DuckLake Top-N prunes unopened files and resets prepared bounds",
   query(con, "SET gpu_execution=true");
   CHECK(ducklake_result_bag(*prepared->Execute()) == std::vector<std::string>{"998|", "999|"});
 }
+
+TEST_CASE("DuckLake reuses delete preparation capacity across files and scans",
+          "[isolated_context][ducklake][ducklake_delete_budget]")
+{
+  auto files = GENERATE(1, 2, 8);
+  INFO(files);
+  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
+  sirius::test::scoped_temp_directory disk;
+  sirius::test::shared_test_env env(lake_config());
+  auto con = env.make_connection();
+  if (!load_ducklake(con)) return;
+  auto run = [&](std::string const& sql) { return query(con, sql); };
+  run("SET gpu_execution=false");
+  attach_lake(con, disk.directory);
+  run("CALL lake.set_option('data_inlining_row_limit',10)");
+  run("CREATE TABLE lake.q(i BIGINT)");
+  for (int file = 0; file < files; ++file) {
+    run("INSERT INTO lake.q SELECT i FROM range(" + std::to_string(file * 100) + "," +
+        std::to_string((file + 1) * 100) + ") t(i)");
+  }
+  run("DELETE FROM lake.q WHERE i%100=0");
+  run("INSERT INTO lake.q VALUES (-1),(-2)");
+  std::vector<std::string> sql{"SELECT count(*),sum(i) FROM lake.q",
+                               "SELECT count(*) FROM lake.q",
+                               "SELECT i FROM lake.q WHERE i=50 OR i::VARCHAR LIKE '%9%'",
+                               "SELECT count(*),sum(a.i) FROM lake.q a JOIN lake.q b ON a.i=b.i"};
+  std::vector<std::vector<std::string>> expected;
+  for (auto const& text : sql)
+    expected.push_back(ducklake_result_bag(*run(text)));
+  auto runtime = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(runtime);
+  auto hosts =
+    runtime->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+  REQUIRE(hosts.size() == 1);
+  auto const reserved = hosts[0]->get_total_reserved_memory();
+  run("SET gpu_execution=true");
+  run("SET enable_duckdb_fallback=false");
+  for (int repeat = 0; repeat < 3; ++repeat) {
+    for (size_t i = 0; i < sql.size(); ++i) {
+      INFO(sql[i]);
+      auto before = get_transparent_execution_stats(con);
+      CHECK(ducklake_result_bag(*run(sql[i])) == expected[i]);
+      auto after = get_transparent_execution_stats(con);
+      CHECK(after.executions == before.executions + 1);
+      CHECK(after.fallbacks == before.fallbacks);
+      CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
+      CHECK(hosts[0]->get_total_reserved_memory() == reserved);
+    }
+  }
+  if (files > 1) {
+    auto counters = runtime->physical_counters();
+    std::atomic<unsigned> decoded{0};
+    counters->parquet_phase_for_testing = [&](std::string const&, bool footer) {
+      if (!footer && ++decoded == 2) throw std::runtime_error("delete visibility decode failure");
+    };
+    auto clear =
+      std::shared_ptr<void>(nullptr, [&](void*) { counters->parquet_phase_for_testing = {}; });
+    run("SET enable_duckdb_fallback=true");
+    auto before = get_transparent_execution_stats(con);
+    CHECK(ducklake_result_bag(*run(sql[0])) == expected[0]);
+    CHECK(decoded.load() >= 2);
+    CHECK(get_transparent_execution_stats(con).runtime_fallbacks == before.runtime_fallbacks + 1);
+    CHECK(hosts[0]->get_total_reserved_memory() == reserved);
+    clear.reset();
+    run("SET enable_duckdb_fallback=false");
+    CHECK(ducklake_result_bag(*run(sql[0])) == expected[0]);
+    CHECK(hosts[0]->get_total_reserved_memory() == reserved);
+  }
+}

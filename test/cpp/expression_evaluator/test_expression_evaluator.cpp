@@ -55,6 +55,7 @@
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/unary.hpp>
+#include <cudf/utilities/type_dispatcher.hpp>
 
 #include <cuda_runtime_api.h>
 
@@ -4076,7 +4077,7 @@ TEMPLATE_TEST_CASE("integer to VARCHAR preserves values and validity",
                           values.data(),
                           values.size() * sizeof(TestType),
                           cudaMemcpyHostToDevice,
-                          stream.get()) == cudaSuccess);
+                          stream.value()) == cudaSuccess);
   cudf::set_null_mask(input->mutable_view().null_mask(), 4, 5, false, stream);
   input->set_null_count(1);
   auto expr = make_cast(make_ref(0), logical_type::make(type_id::VARCHAR), try_cast);

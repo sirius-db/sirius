@@ -28,22 +28,50 @@
 namespace sirius::ducklake {
 namespace scan = op::scan;
 namespace sm   = scan_manager;
+namespace {
+char const* parquet_dependency_error(unit_descriptor const& unit)
+{
+  if (unit.kind != unit_kind::parquet) return "DuckLake Parquet reader requires a Parquet unit";
+  auto gate = assess_local_scope(unit);
+  for (auto reason : gate.reasons) {
+    switch (reason) {
+      case unit_gate_reason::remote_data:
+        return "DuckLake remote data is outside the local scan profile";
+      case unit_gate_reason::remote_delete:
+        return "DuckLake remote deletes are outside the local scan profile";
+      case unit_gate_reason::invalid_locator: return "DuckLake data or delete locator is invalid";
+      case unit_gate_reason::encrypted_data:
+        return "DuckLake encrypted data is outside the local scan profile";
+      case unit_gate_reason::encrypted_delete:
+        return "DuckLake encrypted deletes are outside the local scan profile";
+      case unit_gate_reason::partial_data:
+        return "DuckLake per-row snapshot-filtered data is outside the local scan profile";
+      case unit_gate_reason::invalid_snapshot_range:
+        return "DuckLake data snapshot range is invalid";
+      case unit_gate_reason::unknown_delete_format:
+        return "DuckLake delete format or locator is inconsistent";
+      case unit_gate_reason::parquet_delete_semantics_required:
+      case unit_gate_reason::dv_metadata_required: break;
+      default: return "DuckLake unit scope is unsupported";
+    }
+  }
+  if (gate.outside_local_scope) return "DuckLake unit is outside the local scan profile";
+  if (unit.mapping_id)
+    return "DuckLake external field mappings are outside the supported scan profile";
+  return nullptr;
+}
+}  // namespace
 bool parquet_unit_dependencies_supported(unit_descriptor const& unit)
 {
-  auto gate = assess_local_scope(unit);
-  return unit.kind == unit_kind::parquet && !gate.outside_local_scope &&
-         std::all_of(gate.reasons.begin(),
-                     gate.reasons.end(),
-                     [](auto reason) {
-                       return reason == unit_gate_reason::dv_metadata_required ||
-                              reason == unit_gate_reason::parquet_delete_semantics_required;
-                     }) &&
-         !unit.mapping_id;
+  return !parquet_dependency_error(unit);
+}
+void validate_parquet_unit_dependencies(unit_descriptor const& unit)
+{
+  if (auto error = parquet_dependency_error(unit)) throw std::invalid_argument(error);
 }
 sm::unit_envelope parquet_unit_envelope(unit_descriptor const& unit)
 {
-  if (!parquet_unit_dependencies_supported(unit))
-    throw std::invalid_argument("DuckLake Parquet unit has unqualified dependencies");
+  validate_parquet_unit_dependencies(unit);
   if (unit.inline_delete_count > dv_max_positions)
     throw sm::preparation_resource_error("DuckLake inline delete positions exceed limit", true);
   if (unit.deletes == delete_format::none)

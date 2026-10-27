@@ -19,6 +19,8 @@
 #include "ducklake/binding_bridge.hpp"
 #include "ducklake/dv_visibility.hpp"
 #include "ducklake/field_mapping.hpp"
+#include "ducklake/preparation_gate.hpp"
+#include "ducklake/preparation_slot.hpp"
 #include "helper/type_conversions.hpp"
 #include "io/io_errors.hpp"
 #include "op/scan/parquet_batch_layout.hpp"
@@ -43,6 +45,8 @@ struct mapping_witness {
 };
 struct plain_info final : scan::parquet_ingestible_table_info {
   std::shared_ptr<preparation_identity> identities;
+  std::shared_ptr<preparation_slot> retained_slot;
+  std::shared_ptr<preparation_gate> gate;
   bool owns_admission                      = true;
   std::shared_ptr<mapping_witness> mapping = std::make_shared<mapping_witness>();
   bool allows_cached_rows() const override { return false; }
@@ -62,14 +66,19 @@ std::unique_ptr<plain_info> make_info(unit_descriptor const& unit,
                                       unit_scan_options options)
 {
   if (!contract || !generation || !unit.read_view || (fields.empty() && !count_only) ||
-      (count_only && (!fields.empty() || !required_columns.empty())) ||
-      !parquet_unit_dependencies_supported(unit))
-    throw std::invalid_argument("DuckLake plain Parquet unit has unqualified dependencies");
+      (count_only && (!fields.empty() || !required_columns.empty())))
+    throw std::invalid_argument(
+      "DuckLake Parquet unit has an invalid bound schema or scan identity");
+  validate_parquet_unit_dependencies(unit);
   auto info                    = std::make_unique<plain_info>();
   info->approximate_batch_size = options.scan_task_batch_size;
   info->contract_id            = contract;
   if (options.profiles) info->profiles = std::move(options.profiles);
-  info->identities          = std::move(options.identities);
+  info->identities = std::move(options.identities);
+  if (parquet_unit_envelope(unit).retained) {
+    info->retained_slot = std::move(options.parquet_slot);
+    info->gate          = std::move(options.inline_gate);
+  }
   info->owns_admission      = options.owns_admission;
   info->resolved_file_paths = {unit.input.path};
   for (auto column : required_columns) {
@@ -186,10 +195,46 @@ class plain_validator final : public scan::split_validator {
   std::shared_ptr<mapping_witness> mapping_;
 };
 struct claimed_unit {
+  std::shared_ptr<preparation_slot> slot;
+  std::shared_ptr<preparation_gate> gate;
   std::shared_ptr<sm::preparation_ledger> ledger;
   sm::unit_key key;
   sm::w_permit permit;
-  ~claimed_unit() { ledger->retire_unit(key); }
+  ~claimed_unit()
+  {
+    bool const acquired = bool(permit);
+    if (acquired && !slot) ledger->retire_unit(key);
+    permit.release();
+    if (gate) {
+      gate->active = false;
+      if (acquired) gate->wake();
+    }
+  }
+};
+std::shared_ptr<claimed_unit> claim_unit(plain_info const& info,
+                                         unit_descriptor const& unit,
+                                         uint64_t preparation_id,
+                                         std::shared_ptr<sm::preparation_ledger> const& ledger)
+{
+  auto owned    = std::make_shared<claimed_unit>();
+  owned->ledger = ledger;
+  owned->slot   = info.retained_slot;
+  owned->key    = owned->slot ? owned->slot->key() : sm::unit_key{info.contract_id, preparation_id};
+  if (owned->slot) {
+    if (!info.gate) throw std::logic_error("DuckLake retained slot lacks a scan progress gate");
+    bool idle = false;
+    if (!info.gate->active.compare_exchange_strong(idle, true)) return {};
+    owned->gate   = info.gate;
+    owned->permit = owned->slot->try_acquire();
+  } else {
+    owned->permit = ledger->try_acquire_unit(owned->key, parquet_unit_envelope(unit).retained);
+  }
+  return owned->permit ? std::move(owned) : nullptr;
+}
+// Destroy visibility backing before returning its permit and waking another file.
+struct visibility_owner {
+  std::shared_ptr<claimed_unit> claim;
+  std::shared_ptr<dv_visibility const> visibility;
 };
 }  // namespace
 struct inline_delete_preparation {
@@ -249,7 +294,6 @@ op::scan::gpu_ingestible::metadata_claim parquet_unit_ingestible::try_claim_spli
 {
   if (!ledger_) throw std::logic_error("DuckLake preparation ledger is not attached");
   if (has_processed_all_metadata()) return scan_manager::preparation_exhausted{};
-  scan_manager::unit_key key{table_info().contract_id, preparation_id_};
   std::shared_ptr<inline_delete_preparation::copied_positions> copied;
   std::shared_ptr<claimed_unit> owned;
   // The owner job transfers its admitted permit; a second acquisition could
@@ -259,12 +303,9 @@ op::scan::gpu_ingestible::metadata_claim parquet_unit_ingestible::try_claim_spli
     if (!copied) return scan_manager::preparation_pending{};
     owned = copied->claim;
   } else {
-    auto permit = ledger_->try_acquire_unit(key, envelope(unit_).retained);
-    if (!permit) return scan_manager::preparation_pending{};
-    owned         = std::make_shared<claimed_unit>();
-    owned->ledger = ledger_;
-    owned->key    = key;
-    owned->permit = std::move(permit);
+    owned =
+      claim_unit(static_cast<plain_info const&>(table_info()), unit_, preparation_id_, ledger_);
+    if (!owned) return scan_manager::preparation_pending{};
   }
   auto work = parquet_gpu_ingestible::next_split_provider(resolve);
   if (!work) throw std::logic_error("DuckLake unit cursor exhausted during claim");
@@ -343,6 +384,10 @@ op::scan::gpu_ingestible::metadata_claim parquet_unit_ingestible::try_claim_spli
                                                error.what());
       }
     }
+    if (owned->slot) {
+      auto retained = std::make_shared<visibility_owner>(owned, std::move(visibility));
+      visibility    = std::shared_ptr<dv_visibility const>(retained, retained->visibility.get());
+    }
     std::shared_ptr<dv_visibility const> absent;
     if (!visibility_->value.compare_exchange_strong(absent, visibility))
       throw std::logic_error("DuckLake visibility was already sealed");
@@ -363,13 +408,9 @@ parquet_unit_ingestible::make_preparation_sources(io::ioctx_resolver resolve)
     owner.coalescer = create_batch_coalescer();
     owner.try_claim = [this]() -> metadata_claim {
       if (inline_deletes_->claimed) return sm::preparation_exhausted{};
-      auto key    = sm::unit_key{table_info().contract_id, preparation_id_};
-      auto permit = ledger_->try_acquire_unit(key, envelope(unit_).retained);
-      if (!permit) return sm::preparation_pending{};
-      auto owned               = std::make_shared<claimed_unit>();
-      owned->ledger            = ledger_;
-      owned->key               = key;
-      owned->permit            = std::move(permit);
+      auto owned =
+        claim_unit(static_cast<plain_info const&>(table_info()), unit_, preparation_id_, ledger_);
+      if (!owned) return sm::preparation_pending{};
       inline_deletes_->claimed = true;
       return metadata_job{[this, owned](
                             sm::preparation_stop_token stop) -> std::unique_ptr<scan::scan_info> {

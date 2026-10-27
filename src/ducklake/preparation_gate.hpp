@@ -19,7 +19,7 @@
 
 #include <atomic>
 namespace sirius::ducklake {
-// Shared across the inline units of one scan, including their terminal batches.
+// Shared across inline batches and retained Parquet visibility in one scan.
 // A scan cannot retain another temporary permit until its previous input retires.
 struct preparation_gate {
   std::atomic<bool> active{false};
