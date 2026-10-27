@@ -1938,7 +1938,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> lower_parquet_scan(
   // resolved file later, so install the matching secret snapshot for each path before the bind
   // data moves into the GPU ingestible.
   install_parquet_s3_configs(*table_info, context, sirius_ctx.get());
-  // Remote paths never carry ranges here: extract_scan_byte_ranges refuses them.
+  // The FFI refuses remote LocalFiles inputs before binding, so its registered ranges are local.
   if (auto byte_ranges = context.registered_state->Get<sirius::planner::scan_byte_ranges_state>(
         sirius::planner::scan_byte_ranges_state::kStateKey)) {
     attach_byte_ranges(*table_info, *byte_ranges);

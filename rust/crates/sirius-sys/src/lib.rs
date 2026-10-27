@@ -22,8 +22,25 @@
 #[allow(clippy::missing_safety_doc)]
 #[cxx::bridge(namespace = "sirius::ffi")]
 mod ffi {
+    /// Named fields for building an [`ObjectStoreConfig`] snapshot; see the C++ struct for
+    /// the meaning and value sets of each field. `transport` and `signing_mode` take the C++
+    /// defaults (`"auto"`, `"presigned"`) when left empty.
+    #[derive(Clone, Debug, Default)]
+    struct ObjectStoreConfigArgs {
+        endpoint: String,
+        region: String,
+        access_key: String,
+        secret_key: String,
+        session_token: String,
+        transport: String,
+        signing_mode: String,
+        ca_bundle_path: String,
+        uri_prefix: String,
+    }
+
     unsafe extern "C++" {
         include!("sirius/ffi.hpp");
+        include!("sirius-sys/src/shim.hpp");
 
         /// RAII handle to an initialized Sirius engine context.
         type Context;
@@ -55,7 +72,48 @@ mod ffi {
             plan: &CxxString,
             out_stream_addr: usize,
         ) -> Result<()>;
+
+        /// Immutable object-store (S3 API) settings of a [`Context`]; built once from
+        /// [`ObjectStoreConfigArgs`] and shared by pointer. Field semantics are documented on
+        /// the C++ struct.
+        type ObjectStoreConfig;
+
+        /// Build a snapshot from named fields. No validation and no I/O here; the snapshot is
+        /// checked when it is given to a context.
+        fn make_object_store_config(args: &ObjectStoreConfigArgs) -> SharedPtr<ObjectStoreConfig>;
+
+        /// A new snapshot with these credentials and every other field copied from `self`,
+        /// which is left unchanged. Use an empty token for long-lived keys.
+        fn with_credentials(
+            self: &ObjectStoreConfig,
+            new_access_key: &CxxString,
+            new_secret_key: &CxxString,
+            new_session_token: &CxxString,
+        ) -> SharedPtr<ObjectStoreConfig>;
+
+        /// The context's current snapshot, or a null pointer when it has none. A returned
+        /// snapshot stays valid after a later replacement.
+        fn object_store_config(self: &Context) -> SharedPtr<ObjectStoreConfig>;
+
+        /// Atomically replace the context's snapshot; a null pointer clears it. Fails (leaving
+        /// the previous snapshot active) when a required field is empty, the endpoint is
+        /// malformed, a value is outside its set, the CA bundle is unreadable, or the
+        /// configured IO backend does not honor an option. No network access. Executions that
+        /// already captured a snapshot keep it. Thread-safe; may be called while queries run.
+        fn set_object_store(self: &Context, cfg: SharedPtr<ObjectStoreConfig>) -> Result<()>;
+
+        /// Construct an initialized [`Context`] from the YAML config file at `config_path`
+        /// (empty = built-in defaults) with `cfg` as its object-store snapshot (null = none).
+        /// `cfg` is checked before the engine is brought up; a rejected snapshot leaves no
+        /// engine state.
+        fn make_context_from_config_with_object_store(
+            config_path: &CxxString,
+            cfg: SharedPtr<ObjectStoreConfig>,
+        ) -> Result<UniquePtr<Context>>;
     }
 }
 
-pub use ffi::{Context, make_context, make_context_from_config};
+pub use ffi::{
+    Context, ObjectStoreConfig, ObjectStoreConfigArgs, make_context, make_context_from_config,
+    make_context_from_config_with_object_store, make_object_store_config,
+};

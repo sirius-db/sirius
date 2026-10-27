@@ -42,6 +42,48 @@ namespace sirius::ffi {
 
 class Fragment;
 
+/// Immutable object-store (S3 API) settings of a `Context`: the origin, region, static
+/// credentials, transport, signing form and trust anchor used by every remote read of an
+/// execution that captured this snapshot. Aggregate — construct with designated initializers,
+/// share by pointer, derive a snapshot with new credentials through `with_credentials()`.
+///
+/// Supported: path-style `s3://` URIs only (`s3a://` and other schemes are refused); static
+/// credentials (IAM roles and instance profiles are resolved by the caller); TLS peer
+/// verification is always on; no proxy, no client certificates, no virtual-hosted addressing,
+/// no automatic refresh. Members are appended only.
+struct SIRIUS_FFI_EXPORT ObjectStoreConfig {
+  /// Required. `"https://host[:port]"` or `"http://host[:port]"`; no path, query or fragment.
+  const std::string endpoint;
+  /// Required. SigV4 signing region.
+  const std::string region;
+  /// Required.
+  const std::string access_key;
+  /// Required. Never logged and never echoed in error texts.
+  const std::string secret_key;
+  /// STS temporary-credential session token; empty for long-lived keys.
+  const std::string session_token;
+  /// `"auto"` | `"http"` | `"rdma"`. `"rdma"` requires a build that registers an S3-over-RDMA
+  /// backend and is refused otherwise.
+  const std::string transport{"auto"};
+  /// `"presigned"` | `"header"`: SigV4 auth in the URL query (default; works everywhere AWS
+  /// does) or in the `Authorization` header (for gateways that prefer header auth).
+  const std::string signing_mode{"presigned"};
+  /// PEM CA bundle used to verify the endpoint's TLS certificate; empty uses the system trust
+  /// store.
+  const std::string ca_bundle_path;
+  /// Namespace this snapshot may read: empty = any `s3://` object at the endpoint;
+  /// `"s3://bucket/"` or `"s3://bucket/prefix/"` limits reads to that prefix. A plan naming an
+  /// object outside it is refused before binding (`object_store_scope`).
+  const std::string uri_prefix;
+
+  /// A new snapshot with these credentials and every other field copied from `*this`, which is
+  /// left unchanged. No validation, no I/O. Use an empty token for long-lived keys.
+  [[nodiscard]] std::shared_ptr<ObjectStoreConfig> with_credentials(
+    const std::string& new_access_key,
+    const std::string& new_secret_key,
+    const std::string& new_session_token) const;
+};
+
 /// RAII handle to a Sirius engine context.
 ///
 /// Constructing a `Context` brings up an initialized engine (a
@@ -72,12 +114,32 @@ class SIRIUS_FFI_EXPORT Context {
   /// released; its last release can tear down the engine on the releasing thread.
   void execute_substrait(const std::string& plan, std::uintptr_t out_stream_addr);
 
+  /// The current object-store snapshot, or nullptr when the context has none. Thread-safe. A
+  /// returned snapshot stays valid and unchanged after a later replacement.
+  [[nodiscard]] std::shared_ptr<ObjectStoreConfig> object_store_config() const;
+
+  /// Atomically replace the current object-store snapshot; nullptr clears it. Checks `cfg`
+  /// (required fields non-empty, endpoint shape, `transport`/`signing_mode` value sets,
+  /// `ca_bundle_path` readable, `uri_prefix` shape) and that the configured IO backend honors
+  /// every option — an option the backend would ignore is refused, nothing is silently dropped.
+  /// No network access and no IO resources are created here; access failures surface when the
+  /// snapshot is used. `execute_substrait()` and `Fragment::build()` capture the snapshot
+  /// current when their binding begins and keep it for that execution; a replacement affects
+  /// later executions only. Thread-safe; may be called while queries run (logically const: the
+  /// context identity is unchanged).
+  /// @throws std::invalid_argument naming the offending field; the message never carries a
+  ///         field value.
+  void set_object_store(std::shared_ptr<ObjectStoreConfig> cfg) const;
+
  private:
   struct Impl;
+  explicit Context(std::unique_ptr<Impl> impl);
   std::unique_ptr<Impl> impl_;
 
   friend class Fragment;
   friend SIRIUS_FFI_EXPORT std::unique_ptr<Fragment> make_fragment(Context& context);
+  friend SIRIUS_FFI_EXPORT std::unique_ptr<Context> make_context_from_config(
+    const std::string& config_path, std::shared_ptr<ObjectStoreConfig> cfg);
 };
 
 /// One plan fragment of a multi-fragment query, executed on this process's [`Context`].
@@ -204,6 +266,14 @@ SIRIUS_FFI_EXPORT std::unique_ptr<Context> make_context();
 
 /// Create a [`Context`] configured from the YAML file at `config_path`.
 SIRIUS_FFI_EXPORT std::unique_ptr<Context> make_context_from_config(const std::string& config_path);
+
+/// Create a [`Context`] configured from the YAML file at `config_path` (empty = built-in
+/// defaults) with `cfg` as its object-store snapshot (nullptr = no object store). `cfg` is
+/// checked as by `Context::set_object_store()` before the engine is brought up, so a rejected
+/// snapshot leaves no engine state. Throws like the other factories (unreadable config file,
+/// engine bring-up failure) and `std::invalid_argument` for a rejected `cfg`.
+SIRIUS_FFI_EXPORT std::unique_ptr<Context> make_context_from_config(
+  const std::string& config_path, std::shared_ptr<ObjectStoreConfig> cfg);
 
 /// Create a [`Fragment`] on `context`. The context must outlive it.
 SIRIUS_FFI_EXPORT std::unique_ptr<Fragment> make_fragment(Context& context);

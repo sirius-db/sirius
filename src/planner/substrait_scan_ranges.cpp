@@ -21,9 +21,11 @@
 
 #include <google/protobuf/message.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -148,16 +150,65 @@ void visit_reads(const pb::Message& message, std::vector<std::map<std::string, r
   }
 }
 
-}  // namespace
+/// Every remote LocalFiles item of the plan, by its own path form (`uri_file` or `uri_path`),
+/// in first-encounter order. Collected from the items directly, so a remote item is seen even
+/// when its path form is unsupported for byte-range attribution.
+void visit_remote_items(const pb::Message& message,
+                        std::vector<std::string>& remote,
+                        std::set<std::string>& seen)
+{
+  if (auto const* read = dynamic_cast<const substrait::ReadRel*>(&message);
+      read != nullptr && read->has_local_files()) {
+    for (const auto& item : read->local_files().items()) {
+      std::string raw;
+      if (item.has_uri_file()) {
+        raw = item.uri_file();
+      } else if (item.has_uri_path()) {
+        raw = item.uri_path();
+      } else {
+        continue;
+      }
+      auto path = canonical_scan_path(raw);
+      if (has_remote_scheme(path) && seen.insert(path).second) {
+        remote.push_back(std::move(path));
+      }
+    }
+  }
+  auto const* reflection = message.GetReflection();
+  std::vector<const pb::FieldDescriptor*> fields;
+  reflection->ListFields(message, &fields);
+  for (auto const* field : fields) {
+    if (field->cpp_type() != pb::FieldDescriptor::CPPTYPE_MESSAGE) { continue; }
+    if (field->is_repeated()) {
+      for (int i = 0; i < reflection->FieldSize(message, field); ++i) {
+        visit_remote_items(reflection->GetRepeatedMessage(message, field, i), remote, seen);
+      }
+    } else {
+      visit_remote_items(reflection->GetMessage(message, field), remote, seen);
+    }
+  }
+}
 
-std::map<std::string, std::vector<scan_byte_range>> extract_scan_byte_ranges(
-  const std::string& plan_bytes)
+/// Shared body of the two public entry points. `refuse_remote_ranges` keeps the historical
+/// "ranges only on local files" refusal for direct callers; the FFI pre-pass passes false so its
+/// snapshot-dependent refusal classifies every remote item first (remote ranges are dropped from
+/// the attribution map there, never attributed).
+scan_plan_inputs inspect(const std::string& plan_bytes, bool refuse_remote_ranges)
 {
   substrait::Plan plan;
   if (!plan.ParseFromString(plan_bytes)) {
     throw sirius::invalid_input_exception(
       "failed to parse the Substrait plan while extracting scan byte ranges");
   }
+  scan_plan_inputs out;
+  if (!refuse_remote_ranges) {
+    // Embedding pre-pass: the caller must refuse a non-empty remote inventory before binding or
+    // using any range, so no range-only validation (and no range error text) may run first.
+    std::set<std::string> seen;
+    visit_remote_items(plan, out.remote_paths, seen);
+    if (!out.remote_paths.empty()) { return out; }
+  }
+
   std::vector<std::map<std::string, read_items>> reads;
   visit_reads(plan, reads);
 
@@ -171,11 +222,11 @@ std::map<std::string, std::vector<scan_byte_range>> extract_scan_byte_ranges(
       ++reads_per_path[path];
     }
   }
-  std::map<std::string, std::vector<scan_byte_range>> out;
   for (const auto& files : reads) {
     for (const auto& [path, items] : files) {
       if (items.ranges.empty()) { continue; }
       if (has_remote_scheme(path)) {
+        if (!refuse_remote_ranges) { continue; }
         throw sirius::invalid_input_exception(
           "byte-range splits are only supported on local parquet files, not '{}'", path);
       }
@@ -191,10 +242,23 @@ std::map<std::string, std::vector<scan_byte_range>> extract_scan_byte_ranges(
           path,
           reads_per_path[path]);
       }
-      out[path] = items.ranges;
+      out.byte_ranges[path] = items.ranges;
     }
   }
   return out;
+}
+
+}  // namespace
+
+scan_plan_inputs inspect_scan_plan_inputs(const std::string& plan_bytes)
+{
+  return inspect(plan_bytes, /*refuse_remote_ranges=*/false);
+}
+
+std::map<std::string, std::vector<scan_byte_range>> extract_scan_byte_ranges(
+  const std::string& plan_bytes)
+{
+  return inspect(plan_bytes, /*refuse_remote_ranges=*/true).byte_ranges;
 }
 
 }  // namespace sirius::planner
