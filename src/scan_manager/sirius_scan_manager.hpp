@@ -19,7 +19,6 @@
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb_table_identity.hpp"
 #include "event/query_event_publisher.hpp"
-#include "exec/query_lifecycle_registry.hpp"
 #include "exec/scoped_dispatcher.hpp"
 #include "exec/thread_pool.hpp"
 #include "io/datasource_factory.hpp"
@@ -32,6 +31,7 @@
 #include "pipeline/completion_handler.hpp"
 #include "scan_manager/config.hpp"
 #include "scan_manager/duckdb_mvcc_metadata.hpp"
+#include "scan_manager/host_pin_placement.hpp"
 #include "scan_manager/insert_delta_job.hpp"
 #include "scan_manager/load_balancing_scan_batch_coalescer.hpp"
 #include "scan_manager/memory_prefetcher.hpp"
@@ -572,6 +572,7 @@ class sirius_scan_manager {
   /// mutex, so another connection's prepare_for_query is never parked behind it.
   // Stop producers while retaining providers/buffers until downstream retirement.
   void quiesce(sirius::query_id_t query_id);
+  void finish_preparation(sirius::query_id_t query_id) noexcept;
   void reset(sirius::query_id_t query_id);
 
   /// Drain and drop this query's scan work while retaining checkpoint protection.
@@ -584,6 +585,9 @@ class sirius_scan_manager {
 
   /// \brief Number of registered queries that have GPU scan work. Observability and tests.
   [[nodiscard]] std::size_t num_active_queries() const noexcept;
+
+  /// Host-pin placement persists across maintenance calls, query resets and unpins.
+  host_pin_placement& get_host_pin_placement() noexcept { return _host_pin_placement; }
 
   /// \brief Drop every ioctx's prefetching cache and build a fresh one.
   ///
@@ -963,6 +967,7 @@ class sirius_scan_manager {
     //! Per-query snapshot of the serve-side pruning flag; the manager's _config is a
     //! construction-time copy, so SET changes arrive per query via prepare_for_query.
     bool pruning_enabled{true};
+    std::vector<int> active_gpu_ids;
 
     //! One mask computation per distinct pinned entry matched by THIS query (recorded by
     //! try_match_cached_entry, deduped by entry name); run block-in-prepare, then copied
@@ -1069,6 +1074,8 @@ class sirius_scan_manager {
   std::shared_ptr<const sirius::memory::topology_index> _topology_index;
   std::shared_ptr<op::scan::physical_check_counters> _physical_counters;
   exec::static_thread_pool _thread_pool;
+  std::shared_ptr<shared_scan_budget> _shared_readahead_budget =
+    std::make_shared<shared_scan_budget>();
   std::shared_ptr<sirius::io::ioctx> _io_ctx;
   /// Lazily-built per-backend ioctxs for path-routed datasources (e.g. an s3://
   /// REST or kvikIO context alongside the local `_io_ctx`). Contexts are keyed
@@ -1100,6 +1107,7 @@ class sirius_scan_manager {
   /// whole duration, and an unpin from another connection drops only the map slot, leaving
   /// the data alive until the last serving provider releases it.
   std::unordered_map<std::string, std::shared_ptr<pinned_entry>> _pinned_entries;
+  host_pin_placement _host_pin_placement;
   /// Guards the STRUCTURE of _pinned_entries (lookup/insert/erase) only, never the serving
   /// of an entry — shared ownership covers that. Held only for map manipulation and the
   /// snapshot in try_match_cached_entry, never across match/validate/plan work, so

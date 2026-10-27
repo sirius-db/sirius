@@ -16,10 +16,10 @@
 
 #include "op/aggregate/stddev.hpp"
 
+#include "cudf/ast_compat.hpp"
 #include "duckdb/common/exception.hpp"
 
 #include <cudf/aggregation.hpp>
-#include <cudf/ast/expressions.hpp>
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>

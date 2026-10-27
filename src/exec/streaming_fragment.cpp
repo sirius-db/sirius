@@ -274,7 +274,8 @@ void streaming_fragment::build()
     {
       // create_plan reads the pinned-table registry, which only the slot keeps stable. run()
       // opens the window and compares this epoch to detect a stale plan.
-      duckdb::SiriusContext::SlotGuard plan_slot(sirius_ctx, _context);
+      duckdb::SiriusContext::SlotGuard plan_slot(
+        sirius_ctx, _context, sirius::exec::query_admission::access::maintenance);
       _planned_pin_epoch = sirius_ctx.get_scan_manager().pin_registry_epoch();
       sirius::planner::sirius_physical_plan_generator generator(_context);
       // A fragment publishes cuDF batches directly; it has no DuckDB host exporter.

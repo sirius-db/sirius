@@ -277,7 +277,7 @@ class inspected_converter {
   {
     sirius::converter_registry::get()
       .register_converter<representation, cucascade::gpu_table_representation>(
-        [](cucascade::idata_representation& source,
+        [](const cucascade::idata_representation& source,
            cucascade::memory::memory_space const* target,
            ::cuda::stream_ref stream,
            cucascade::memory::reservation*) -> std::unique_ptr<cucascade::idata_representation> {
@@ -589,6 +589,85 @@ TEST_CASE("prefetched predicate outcomes and decode history survive preparation 
   }
 }
 
+TEST_CASE("a decode's membership measurement trains the scan's consumer",
+          "[dynamic_filter][consumer_integration][decode_history][decode_gate]")
+{
+  auto* space = sirius::test::operator_utils::get_default_gpu_space();
+  rmm::cuda_stream stream;
+  auto channel  = std::make_shared<sirius_dynamic_filter_set>();
+  auto producer = channel->register_producer({0});
+  auto filter   = std::make_shared<counting_filter>(stream);
+  REQUIRE(producer.push_filter(0, filter));
+  auto consumer = std::make_shared<dynamic_filter_consumer>(
+    channel, consumer_config{}, std::vector<binding>{{0, 0}});
+  auto const decoded_batch =
+    [&](std::optional<sirius::pushdown_outcome::membership_keep_observation> observation,
+        bool membership_skipped = false) {
+      return cucascade::data_batch::make(
+        sirius::get_next_batch_id(),
+        std::make_unique<sirius::decompression_pushdown_batch_representation>(
+          sequence_table(8, stream),
+          *space,
+          stream,
+          sirius::pushdown_outcome{.membership_keep    = observation,
+                                   .membership_skipped = membership_skipped}));
+    };
+  // Returns the decode history the split keeps for the endpoint.
+  auto const prepare = [&](std::shared_ptr<cucascade::data_batch> batch,
+                           std::vector<applied_entry> attached) {
+    scan_operator_input split(std::move(batch));
+    split.consumer        = consumer;
+    split.decode_attached = std::move(attached);
+    split.prepare_for_processing(space, stream);
+    return split.decode_attached;
+  };
+
+  SECTION("a selective measurement activates the gate")
+  {
+    prepare(decoded_batch({{.generation = 1, .rows_before = 8, .rows_after = 2}}), {{filter, 0}});
+    REQUIRE_FALSE(gate_test_access::needs_combined_sample(gate(*consumer), channel->snapshot()));
+  }
+  SECTION("a complete unselective measurement disables the gate")
+  {
+    prepare(decoded_batch({{.generation = 1, .rows_before = 8, .rows_after = 8, .complete = true}}),
+            {{filter, 0}});
+    REQUIRE_FALSE(gate_test_access::applicable(gate(*consumer), channel->snapshot()));
+  }
+  SECTION("a decode reports each filter's own keep ratio")
+  {
+    sirius::pushdown_outcome::membership_keep_observation observation{
+      .generation = 1, .rows_before = 8, .rows_after = 6};
+    // The tag is the filter's position in the decode history; one past it is ignored.
+    observation.probes = {{.tag = 0, .rows_before = 8, .rows_after = 6},
+                          {.tag = 1, .rows_before = 6, .rows_after = 1}};
+    prepare(decoded_batch(observation), {{filter, 0}});
+    REQUIRE(gate_test_access::filter_keep_ratio(gate(*consumer), {filter.get(), 0}, 1) == 0.75);
+    // Its own ratio is too weak to keep applying it at decode.
+    REQUIRE(consumer->select_for_decode(std::vector<binding>{{0, 0}}).steps.empty());
+  }
+  SECTION("a decode that skipped its join filters leaves the batch to the endpoint as clean")
+  {
+    auto const history =
+      prepare(decoded_batch(std::nullopt, /*membership_skipped=*/true), {{filter, 0}});
+    REQUIRE(history.empty());
+    // Nothing was measured, and later decodes still attach and measure the filters.
+    REQUIRE(gate_test_access::needs_combined_sample(gate(*consumer), channel->snapshot()));
+    REQUIRE(gate_test_access::decode_trains(gate(*consumer), channel->snapshot()));
+  }
+  SECTION("a decode that applied its join filters keeps them in the history")
+  {
+    auto const history =
+      prepare(decoded_batch({{.generation = 1, .rows_before = 8, .rows_after = 2}}), {{filter, 0}});
+    REQUIRE(history.size() == 1);
+  }
+  SECTION("a decode that carried no probes reports nothing")
+  {
+    prepare(decoded_batch({{.generation = 1, .rows_before = 8, .rows_after = 2}}), {});
+    REQUIRE(gate_test_access::needs_combined_sample(gate(*consumer), channel->snapshot()));
+    REQUIRE(gate_test_access::decode_trains(gate(*consumer), channel->snapshot()));
+  }
+}
+
 TEST_CASE("prefetched row filtering rejects an unconsumed visibility mask on every preparation",
           "[dynamic_filter][consumer_integration][prefetch_outcome]")
 {
@@ -651,6 +730,9 @@ TEMPLATE_TEST_CASE(
   split.consumer                 = consumer;
   split.decode_attached          = {{filter, 0}};
   split.needs_carrier_conversion = true;
+  // An earlier decode measured part of the filters as unselective, so until the endpoint samples a
+  // clean batch, a fresh decode attaches no membership probes.
+  gate(*consumer).record_decode_keep_ratio(8, 8, 1, /*complete=*/false);
   SECTION("compaction latch survives removal of the last row selection source")
   {
     train_for_decode(*consumer, *filter);

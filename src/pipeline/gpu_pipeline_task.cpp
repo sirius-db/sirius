@@ -16,6 +16,7 @@
 
 #include "pipeline/gpu_pipeline_task.hpp"
 
+#include "cuda/device_health.hpp"
 #include "cudf/cudf_utils.hpp"
 #include "helper/cuda_launch_error.hpp"
 #include "late_mat/port_materialize.hpp"
@@ -94,7 +95,8 @@ void validate_operator_output_types(const op::operator_data* data,
                                         ? sirius::require_cudf_type(expected_types[c])
                                         : physical_types[static_cast<std::size_t>(c)];
       cudf::data_type actual        = tbl.column(c).type();
-      if (actual != expected_cudf) {
+      if (actual != expected_cudf &&
+          !op.is_alternate_physical_type(static_cast<std::size_t>(c), actual)) {
         SIRIUS_LOG_WARN(
           "gpu_pipeline_task: operator '{}' (id={}) output batch {} column {} datatype "
           "mismatch: got {}, expected {}",
@@ -244,6 +246,7 @@ std::unique_ptr<op::operator_data> materialize_deferred_input(
 void synchronize_after_exception(::cuda::stream_ref stream, const sirius_pipeline* pipeline)
 {
   auto const status = cudaStreamSynchronize(stream.get());
+  check_cuda_health(status);
   if (status != cudaSuccess) {
     SIRIUS_LOG_WARN(
       "Pipeline {}: stream synchronization while handling an exception failed: "
@@ -282,6 +285,7 @@ std::unique_ptr<op::operator_data> run_one_operator(
     // stream before rethrowing lets their owners unwind only after their last GPU reader finishes.
     synchronize_after_exception(stream, pipeline);
     auto sticky_err = cudaGetLastError();
+    check_cuda_health(sticky_err);
     if (sticky_err != cudaSuccess) {
       SIRIUS_LOG_WARN("Pipeline {}: {} (id={}) threw + left sticky CUDA error: [{}] {} — clearing",
                       pipeline->get_pipeline_id(),
@@ -299,6 +303,7 @@ std::unique_ptr<op::operator_data> run_one_operator(
   } catch (...) {
     synchronize_after_exception(stream, pipeline);
     auto sticky_err = cudaGetLastError();
+    check_cuda_health(sticky_err);
     if (sticky_err != cudaSuccess) {
       SIRIUS_LOG_WARN("Pipeline {}: {} (id={}) threw + left sticky CUDA error: [{}] {} — clearing",
                       pipeline->get_pipeline_id(),
@@ -316,6 +321,7 @@ std::unique_ptr<op::operator_data> run_one_operator(
     throw;
   }
   if (auto sticky_err = cudaGetLastError(); sticky_err != cudaSuccess) {
+    check_cuda_health(sticky_err);
     SIRIUS_LOG_WARN(
       "Pipeline {}: {} (id={}) left a sticky CUDA error after execute: [{}] {} — clearing",
       pipeline->get_pipeline_id(),
@@ -323,9 +329,14 @@ std::unique_ptr<op::operator_data> run_one_operator(
       op.get_operator_id(),
       static_cast<int>(sticky_err),
       cudaGetErrorString(sticky_err));
+    throw std::runtime_error(std::string("CUDA operator failed: ") + cudaGetErrorName(sticky_err));
   }
 
-  stream.sync();
+  auto const stream_status = cudaStreamSynchronize(stream.get());
+  check_cuda_health(stream_status);
+  if (stream_status != cudaSuccess)
+    throw std::runtime_error(std::string("CUDA stream completion failed: ") +
+                             cudaGetErrorName(stream_status));
   auto end      = std::chrono::high_resolution_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
 
@@ -354,13 +365,16 @@ std::size_t gpu_pipeline_task_local_state::get_estimated_bytes_to_materialize_in
 
   if (auto* scan_input = dynamic_cast<const op::scan::scan_operator_input*>(_input_data.get());
       scan_input && scan_input->is_resident()) {
-    // Cached scan inputs can still reside in HOST and require an upload before execution.
+    // Cached scans need space for host uploads and copies from an excluded GPU.
     auto batch = scan_input->get_cached_batch();
     if (!batch) { return 0; }
 
     auto ro          = batch->to_read_only();
     auto const* data = ro.get_data();
-    if (!data || ro.get_current_tier() == cucascade::memory::Tier::GPU) { return 0; }
+    if (!data) return 0;
+    const bool cross_space = target_space && ro.get_memory_space() &&
+                             ro.get_memory_space()->get_id() != target_space->get_id();
+    if (ro.get_current_tier() == cucascade::memory::Tier::GPU && !cross_space) return 0;
     return peak_materialization_bytes(data);
   }
 

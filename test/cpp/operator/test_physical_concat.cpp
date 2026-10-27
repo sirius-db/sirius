@@ -16,6 +16,7 @@
 
 #include "helper/type_conversions.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
+#include "operator/partition_test_utils.hpp"
 #include "operator_test_utils.hpp"
 #include "operator_type_traits.hpp"
 #include "utils/sirius_test_env.hpp"
@@ -258,6 +259,29 @@ std::unique_ptr<operator_data> claim_concat_input(sirius_physical_concat& concat
 /**
  * @brief Create an int32 batch of @p num_rows rows (4 bytes per row).
  */
+/// A stored batch whose stored size differs from its decoded size, like a spilled
+/// compressed batch.
+class compressed_size_representation : public idata_representation {
+ public:
+  compressed_size_representation(memory_space& space, std::size_t stored, std::size_t decoded)
+    : idata_representation(space), _stored(stored), _decoded(decoded)
+  {
+  }
+  [[nodiscard]] std::size_t get_size_in_bytes() const override { return _stored; }
+  [[nodiscard]] std::size_t get_uncompressed_data_size_in_bytes() const override
+  {
+    return _decoded;
+  }
+  [[nodiscard]] std::unique_ptr<idata_representation> clone(::cuda::stream_ref) const override
+  {
+    return nullptr;
+  }
+
+ private:
+  std::size_t _stored;
+  std::size_t _decoded;
+};
+
 std::shared_ptr<data_batch> make_int32_batch(memory_space& space, std::size_t num_rows)
 {
   std::vector<int32_t> values(num_rows);
@@ -1016,17 +1040,15 @@ TEST_CASE("right-family sibling partitions round up from the probe input", "[phy
     return sirius::from_duckdb_vec(
       duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER});
   };
-  sirius_physical_partition build_partition(make_types(), 4, fixture.hash_join.get(), true);
-  sirius_physical_partition probe_partition(make_types(), 9, fixture.hash_join.get(), false);
+  sirius_physical_partition build_partition(
+    make_types(), 4, sirius::test::operator_utils::hash_partition_spec(*fixture.hash_join, true));
+  sirius_physical_partition probe_partition(
+    make_types(), 9, sirius::test::operator_utils::hash_partition_spec(*fixture.hash_join, false));
   // These partitions hang off the join by pointer, not as children, so create_test_hash_join's
   // numbering does not reach them. Number them past the join tree's ids.
   size_t partition_next_id = 100;
   number_operator_tree(build_partition, partition_next_id);
   number_operator_tree(probe_partition, partition_next_id);
-  build_partition.set_sibling_partition_op(&probe_partition);
-  probe_partition.set_sibling_partition_op(&build_partition);
-  build_partition.set_drives_partition_count(false);
-  probe_partition.set_drives_partition_count(true);
 
   auto build_repo = std::make_unique<cucascade::shared_data_repository>();
   auto probe_repo = std::make_unique<cucascade::shared_data_repository>();
@@ -1055,6 +1077,7 @@ TEST_CASE("right-family sibling partitions round up from the probe input", "[phy
   attach_port(*fixture.hash_join, "default", *join_default_repo);
 
   // Enter through the non-driving build side first. It must still size both siblings from probe.
+  bind_partition_inputs(*fixture.hash_join, build_partition, probe_partition, nullptr, true);
   auto build_input = build_partition.get_next_task_input_data();
   REQUIRE(build_input != nullptr);
   auto build_output = build_partition.execute(*build_input, default_stream());
@@ -1088,8 +1111,10 @@ TEST_CASE("sibling partitions install one placement on the join and both CONCATs
     return sirius::from_duckdb_vec(
       duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER});
   };
-  sirius_physical_partition build_partition(make_types(), 4, fixture.hash_join.get(), true);
-  sirius_physical_partition probe_partition(make_types(), 9, fixture.hash_join.get(), false);
+  sirius_physical_partition build_partition(
+    make_types(), 4, sirius::test::operator_utils::hash_partition_spec(*fixture.hash_join, true));
+  sirius_physical_partition probe_partition(
+    make_types(), 9, sirius::test::operator_utils::hash_partition_spec(*fixture.hash_join, false));
   sirius_physical_concat build_concat(make_types(), 4, false);
   sirius_physical_concat probe_concat(make_types(), 9, true);
   size_t next_id = 100;
@@ -1097,13 +1122,7 @@ TEST_CASE("sibling partitions install one placement on the join and both CONCATs
   number_operator_tree(probe_partition, next_id);
   number_operator_tree(build_concat, next_id);
   number_operator_tree(probe_concat, next_id);
-  build_partition.set_sibling_partition_op(&probe_partition);
-  probe_partition.set_sibling_partition_op(&build_partition);
-  build_partition.set_drives_partition_count(false);
-  probe_partition.set_drives_partition_count(true);
-  build_partition.set_join_concat(&build_concat);
   build_partition.add_next_port_after_sink({&build_concat, "input"});
-  probe_partition.set_join_concat(&probe_concat);
   probe_partition.add_next_port_after_sink({&probe_concat, "input"});
 
   cucascade::shared_data_repository build_repo;
@@ -1127,6 +1146,7 @@ TEST_CASE("sibling partitions install one placement on the join and both CONCATs
   attach_port(*fixture.hash_join, "default", join_default_repo);
 
   REQUIRE_THROWS_AS(fixture.hash_join->placement(), sirius::internal_exception);
+  bind_partition_inputs(*fixture.hash_join, build_partition, probe_partition, &build_concat, true);
   REQUIRE(build_partition.get_next_task_input_data() != nullptr);
 
   auto const placement = fixture.hash_join->placement();
@@ -1161,16 +1181,15 @@ TEST_CASE("an empty sizing side installs a single-partition placement", "[physic
       duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER});
   };
   // The build side drives sizing; its producer finishes without delivering anything.
-  sirius_physical_partition build_partition(make_types(), 4, fixture.hash_join.get(), true);
-  sirius_physical_partition probe_partition(make_types(), 9, fixture.hash_join.get(), false);
+  sirius_physical_partition build_partition(
+    make_types(), 4, sirius::test::operator_utils::hash_partition_spec(*fixture.hash_join, true));
+  sirius_physical_partition probe_partition(
+    make_types(), 9, sirius::test::operator_utils::hash_partition_spec(*fixture.hash_join, false));
   sirius_physical_concat probe_concat(make_types(), 9, false);
   size_t next_id = 100;
   number_operator_tree(build_partition, next_id);
   number_operator_tree(probe_partition, next_id);
   number_operator_tree(probe_concat, next_id);
-  build_partition.set_sibling_partition_op(&probe_partition);
-  probe_partition.set_sibling_partition_op(&build_partition);
-  probe_partition.set_join_concat(&probe_concat);
   probe_partition.add_next_port_after_sink({&probe_concat, "input"});
 
   auto finished_build_source = create_unfinished_source_pipeline();
@@ -1190,6 +1209,7 @@ TEST_CASE("an empty sizing side installs a single-partition placement", "[physic
 
   // The waiting probe side elects one partition without asking the join (a zero-byte build would
   // otherwise pick BUILD_PROBE, which cannot run without a build batch).
+  bind_partition_inputs(*fixture.hash_join, build_partition, probe_partition, nullptr);
   CHECK_FALSE(probe_partition.get_next_task_hint().has_value());
   auto const placement = fixture.hash_join->placement();
   REQUIRE(placement != nullptr);
@@ -1498,14 +1518,12 @@ TEST_CASE("either partition sibling fixes runtime CONCAT requirements before pub
   fixture.hash_join->set_active_gpu_ids({space->get_device_id()});
   auto const types =
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER});
-  sirius_physical_partition build(types, 4, fixture.hash_join.get(), true);
-  sirius_physical_partition probe(types, 9, fixture.hash_join.get(), false);
+  sirius_physical_partition build(
+    types, 4, sirius::test::operator_utils::hash_partition_spec(*fixture.hash_join, true));
+  sirius_physical_partition probe(
+    types, 9, sirius::test::operator_utils::hash_partition_spec(*fixture.hash_join, false));
   sirius_physical_concat build_concat(types, 4, false, 1);
   sirius_physical_concat probe_concat(types, 9, false, 1);
-  build.set_join_concat(&build_concat);
-  probe.set_join_concat(&probe_concat);
-  build.set_sibling_partition_op(&probe);
-  probe.set_sibling_partition_op(&build);
   build.add_next_port_after_sink({&build_concat, "input"});
   probe.add_next_port_after_sink({&probe_concat, "input"});
   cucascade::shared_data_repository build_repo;
@@ -1523,6 +1541,7 @@ TEST_CASE("either partition sibling fixes runtime CONCAT requirements before pub
   size_t id = 100;
   number_operator_tree(build, id);
   number_operator_tree(probe, id);
+  bind_partition_inputs(*fixture.hash_join, build, probe, &build_concat);
   auto& first = probe_initiates ? probe : build;
   REQUIRE(first.get_next_task_input_data() != nullptr);
   CHECK(fixture.hash_join->is_build_probe_mode() == !mixed_filter);
@@ -1743,33 +1762,36 @@ TEST_CASE("partitioned input replacement preserves partition and device metadata
   CHECK(input->get_data_batches() == std::vector<std::shared_ptr<data_batch>>{original});
 }
 
-TEST_CASE("BUILD_PROBE rejects a missing explicit build concatenation path",
-          "[physical_partition][physical_concat]")
+TEST_CASE("sirius_physical_concat counts compressed batches at their decoded size",
+          "[physical_concat]")
 {
-  bool const probe_initiates = GENERATE(false, true);
-  // MARK requires BUILD_PROBE even when the foldable capability is absent.
-  auto fixture = create_test_hash_join(duckdb::JoinType::MARK, {duckdb::LogicalType::BOOLEAN});
-  auto const types =
-    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER});
-  sirius_physical_partition build(types, 0, fixture.hash_join.get(), true);
-  sirius_physical_partition probe(types, 0, fixture.hash_join.get(), false);
-  cucascade::shared_data_repository build_repo;
-  cucascade::shared_data_repository probe_repo;
-  auto attach = [](sirius_physical_operator& op, cucascade::shared_data_repository& repo) {
-    auto port  = std::make_unique<sirius_physical_operator::port>();
-    port->type = MemoryBarrierType::FULL;
-    port->repo = &repo;
-    op.add_port("default", std::move(port));
-  };
-  attach(build, build_repo);
-  attach(probe, probe_repo);
-  size_t id = 100;
-  number_operator_tree(build, id);
-  number_operator_tree(probe, id);
-  build.set_sibling_partition_op(&probe);
-  probe.set_sibling_partition_op(&build);
-  auto& first = probe_initiates ? probe : build;
-  CHECK_THROWS_WITH(
-    first.get_next_task_input_data(),
-    Catch::Matchers::ContainsSubstring("BUILD_PROBE was selected but no build-side CONCAT"));
+  auto* space = get_shared_mem_space();
+  REQUIRE(space != nullptr);
+
+  constexpr uint64_t threshold = 1024;
+
+  sirius_physical_concat concat_op(
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+    1000,
+    false,
+    threshold);
+  concat_op.set_placement(
+    std::make_shared<const partition_placement>(partition_placement::unpinned(1)));
+
+  auto repo   = std::make_unique<cucascade::shared_data_repository>();
+  auto source = create_unfinished_source_pipeline();
+  attach_concat_port(concat_op, *repo, source.pipeline);
+
+  // Two batches stored at 100 bytes that decode to 800 each: together they exceed the
+  // threshold once decoded, so the first forms a group even though the source still runs.
+  for (int i = 0; i < 2; ++i) {
+    repo->add_data_batch(
+      data_batch::make(sirius::get_next_batch_id(),
+                       std::make_unique<compressed_size_representation>(*space, 100, 800)),
+      0);
+  }
+
+  auto hint = concat_op.get_next_task_hint();
+  REQUIRE(hint.has_value());
+  CHECK(hint->hint == TaskCreationHint::READY);
 }

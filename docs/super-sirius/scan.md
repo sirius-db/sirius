@@ -103,7 +103,7 @@ outputs remain in the output layout. A count-style scan with a filter uses its f
 carry the row count; a column-less scan may add a dedicated carrier. The native scan uses the
 same recorded boundary for its materialized order and output projection.
 
-Parquet (and its Iceberg subclass) also retains NULL predicates in the residual. Null-count
+Parquet (and the Iceberg adapter) also retains NULL predicates in the residual. Null-count
 statistics can prune whole row groups, but mixed groups still need row filtering. NULL tests
 never enter cuDF's min/max statistics expression; a partial reader pushdown cannot claim the
 whole predicate was applied. Numeric decode-range analysis likewise retains the residual when
@@ -124,7 +124,7 @@ There is no factory class. Each implementation provides a free `make_ingestible(
 
 ### Iceberg ingestible
 
-`iceberg_gpu_ingestible` (`iceberg_gpu_ingestible.{hpp,cpp}`) **extends** `parquet_gpu_ingestible` rather than reimplementing it: an Iceberg table's data files are parquet, and `iceberg_scan` resolves its manifests into the same `MultiFileBindData` file list `read_parquet` produces, so the parquet ingestible reads them unchanged. Only two behaviours differ. `create_batch_coalescer` wraps the parquet coalescer and stamps `disable_filter_pushdown` on every emitted split — but **only when the table has deletes** (per-split stamping is required; `reader_options` is one shared object handed to every split). `materialize_metadata_to_table` decodes through the base, then applies the delete pipeline to each decoded batch.
+`iceberg_gpu_ingestible` composes `parquet_scan_core`, as does the plain Parquet facade. The adapter supplies Iceberg schema mapping and delete preparation. Files whose schema already matches retain the existing reader route and pruning. Eligible evolved files use the `iceberg_flat_v1` mapping profile before visibility and residual filtering. Files with deletes disable reader-side row filtering so that original row positions remain available.
 
 Suppressing pushdown is load-bearing, not conservative. Positional deletes and deletion vectors are keyed on a row's position **within its data file**; if cuDF drops rows during decode, decoded positions no longer identify file positions and the mapping is unrecoverable. Materialize therefore returns `UNFILTERED` and `post_filter_and_project` applies the predicate *after* deletes — which is also Iceberg's required order. A non-`UNFILTERED` state from the base throws. Row-group pruning stays on and is safe: it only removes rows the predicate could not have matched, and offsets come from the footer, which lists pruned groups.
 
@@ -164,12 +164,16 @@ Currently declined:
 - **Equality deletes.** The filter, the GPU anti-join mask and the group build all exist, but key projection is not wired, and two pieces do not implement the spec: the applicability test compares the *manifest's* sequence number rather than the entry's inherited data sequence number, and keys are taken from every column of the delete file rather than the entry's declared `equality_ids`. `read_iceberg_delete_data` refuses live equality entries behind `kEqualityDeleteRouteImplementedToSpec`, which is the single switch that turns the route on; the components are covered directly by `test/cpp/scan/test_iceberg_equality_delete.cpp`, because no SQL test can reach them.
 - **`snapshot_from_timestamp` and `version`.** The delete path resolves only by `snapshot_from_id`, so these would read one snapshot's data against another's deletes.
 - **`allow_moved_paths = true`.** It rewrites every data-file path to `<table_path>/data/<name>`, while delete discovery calls `iceberg_metadata()` without the flag and keeps the manifests' original paths; the two would not match and the deletes would be dropped.
-- **Any data file whose schema differs from the table's current one** — a dropped field id (gap test, bind data only), a rename or an addition (name+id pair comparison against every data file's footer), a promoted type (`int` -> `long` keeps the name and id while the old file stays INT32), or a file carrying **no** field ids at all (a name-mapped `add_files` migration, which the probe must decline rather than skip).
+- **Schema changes outside `iceberg_flat_v1`**, including nested transformations, date/timestamp or decimal evolution, files lacking complete field IDs, and missing columns whose partition-constant semantics cannot be proved. Existing matching-schema support for these types is unchanged.
 - **A deletion vector whose Puffin footer descriptor contradicts its manifest entry**, or whose decoded position count contradicts the entry's `record_count`.
 
 Any code opening its own `Connection` on this path must bracket it with `SiriusContext::InternalQueryGuard` on **that connection's** context — the bracket is per-connection, so a caller's guard does not cover a connection it opens.
 
-**Known limitation.** Projected columns are resolved by **name** (`parquet_gpu_ingestible.cpp`), while Iceberg's data model is field-ID keyed. A column dropped and re-added under the same name is a *new* field ID absent from older data files and must read NULL; name resolution would find the old column and return stale data. The plan-time gates above close that off by declining every evolved table, so the limitation costs performance rather than correctness — but it is why the gates are as broad as they are. Resolving by field ID is the real fix and removes all of them: DuckDB's `MultiFileColumnDefinition` already carries the field ID (`identifier`, `GetIdentifierFieldId()`, `GetDefaultValue()`) and `MultiFileColumnMapper` implements the spec rule, including the name-mapping fallback for files without field IDs.
+**Flat schema evolution.** The adapter exports field IDs, types and typed initial defaults from the trusted DuckDB binding. Boolean, integer, floating-point and string fields support renaming, reordering, deletion, addition, and same-name drop/re-add; permitted promotions are INT32 to INT64 and FLOAT32 to FLOAT64. A per-file immutable mapper selects physical columns by ID and normalizes to the bound schema before deletes, filters and output projection. Absent columns use the bound initial default, including typed NULL, never a retired same-name column or the write default.
+
+Missing-column defaults require proof that partition metadata cannot override them. During lowering, one `LIMIT 0` Avro schema query per distinct data manifest checks for an empty partition record; nonempty or unavailable schemas do not grant this proof. No data-file footer sweep is added. Files with present fields can still map without this proof. This deliberately leaves identity-partition reconstruction outside the profile.
+
+Mapped files disable reader/statistics/null-count pruning and apply residual predicates after normalization. They use per-file reader options, so coalescing ends at their file boundary; row groups within a file still batch normally. Conversion/default buffers are included in the working-set estimate. If every requested field is absent, one physical column carries row count. Unsupported mappings fail before decoding and follow the existing late-failure policy. These choices preserve correctness but add manifest-header work and may reduce pruning/coalescing efficiency; performance acceptance is separate.
 
 ## owning_table_view
 
@@ -264,6 +268,16 @@ A lock-protected queue of pre-built splits. The producer (sequencer) enqueues vi
 
 `scan_manager_config` (`config.hpp`) tunes the thread pool, the IO backend selector (`backend`), uring/REST reactor counts, the prefetching cache, and object-store credentials.
 
+### Shared scan I/O capacity
+
+`shared_scan_budget` accounts for active reads across query readahead managers. A split that uses several backends reserves them atomically. Demand reads never wait for speculative capacity: they accrue debt that prevents further speculation on those backends until the reads finish. Nonempty speculative requests retain global oldest-query priority; backend-scoped priority is deferred to the performance work following the concurrency benchmark baseline.
+
+The readahead manager coordinates the local gatekeeper credit and shared backend ticket through one per-split ownership record. It publishes speculative ownership before preparing or issuing I/O. A demand read joining that attempt reuses its credits; if demand wins first, speculation is abandoned. Successful prefetch of the entire split releases both credits at completion and remembers coverage until disposal. I/O success and coverage are reported separately: each requested chunk must either be filled by that prefetch or already resident with a sufficient extent. A chunk skipped because another read owns it leaves coverage incomplete even if every submitted prefetch read succeeds. Failed, abandoned, or partial prefetch transfers the existing credits to an overlapping demand read, which returns them at disposal. Without an overlapping reader, those credits return immediately. Disposal does not release an in-flight prefetch's credits early: its callback retains the shared ticket even if the manager is destroyed.
+
+Each backend's limit stays fixed while it has active tickets or waiting requests. Conflicting limits are rejected, and entries are removed after their last user leaves. Waiting is cancellation-aware; ticket destruction releases capacity even after the budget facade has been destroyed. Empty requests consume no capacity and do not queue.
+
+Readahead preparation makes an initial attempt, retries with synchronous eviction, and permits one further eviction-assisted attempt after a 10 ms backoff. Speculation holds no credits during backoff; if demand has joined, the credits transfer to that reader instead. A retry checks cancellation and whether demand has overtaken the split before preparing it. Persistent pressure records one `skipped_memory_pressure` outcome for the candidate; `memory_retries` counts preparations actually retried. Demand I/O remains available when speculation is abandoned.
+
 ## Pinned Tables
 
 **Files:** `src/pin_table.hpp`, `src/pin_table.cpp`; pinned-entry storage + cache matching in `src/scan_manager/sirius_scan_manager.hpp` and `src/scan_manager/sirius_scan_manager.cpp`; zone-map capture and pruning in `src/scan_manager/pinned_chunk_stats.hpp` and `src/scan_manager/pinned_chunk_stats.cpp`; MVCC reconciliation in `src/op/scan/duckdb_mvcc_visibility.cpp`, `src/scan_manager/mvcc_mask_job.cpp`, `src/op/scan/duckdb_insert_delta.cpp`, and `src/scan_manager/insert_delta_job.cpp` (with their headers).
@@ -302,6 +316,8 @@ Pinning drives the source's `gpu_ingestible` to completion (`materialize_all_bat
 - **Simpatico compression:** with `CALL pin_table(..., compression => true)`, pinned chunks can additionally be stored compressed on either tier instead of (or after) narrowing — see [Compressed Pinning](compressed-pinning.md) for tier choice, plan selection, and measured results.
 - **GPU tier** (`materialize_all_batches`): each resulting batch is stored as a GPU-resident `cudf::table`, round-robining placement across the GPU memory spaces. Placement is deterministic so re-pinning the same source yields identical per-chunk placement (required by the merge path below).
 - **HOST tier** (`materialize_pin_to_host`): each resulting batch is converted on its round-robin GPU to a `host_data_representation` that preserves carrier type and decimal scale on that GPU's NUMA-local host space, then the GPU table is freed before the next batch. Peak GPU residency is therefore ~one batch, so a host pin never needs the whole table to fit in GPU memory.
+
+Pinned scans preserve these chunk boundaries. Host-affinity task placement rotates independently among the GPUs of each host NUMA domain; a shared counter across domains would repeatedly select the same local GPU for alternating host spaces. Query admission can still override a locality pick outside the admitted GPU set.
 
 ### Storage and matching
 
@@ -487,11 +503,13 @@ When filter pushdown is enabled and the `gpu_expression_translator` successfully
 
    Before cuDF 26.12, the reader's bloom filter probe is wrong for some column types (rapidsai/cudf#24319). The reader filter (`_reader_pushdown_expression`) therefore leaves out equalities on the types listed by `has_unreliable_bloom_filter_probe()`, and they are applied post-decode. From cuDF 26.12 the list is empty.
 
+   `NOT IN` translates to inequalities joined by `NULL_LOGICAL_AND`, preserving SQL NULL semantics. It must not become `NOT` over an OR of equalities: the reader rewrites those equalities to Bloom membership probes, whose positive answers only mean a row group may contain a value. Negating those answers can discard mixed groups that also contain rows satisfying `NOT IN`.
+
 Reader-side pushdown is a per-split decision: an FLBA-decimal safety probe can disable it for a file, in which case the cached DuckDB filter expression is evaluated through `expression_evaluator` on the decoded batch in `post_filter_and_project`.
 
 Virtual-column scans currently disable reader-side row filtering, including dynamic-filter AST merging. Row-group statistics pruning remains enabled, but all rows in selected row groups are decoded before residual predicates and membership filters run—even for a selective `WHERE filename = ...`.
 
-Follow-up work can use cuDF 26.08.01's existing `enable_prepend_source_index_column()` and `enable_prepend_row_index_column()` APIs to preserve file and row identity during whole-split reads with filtering. Source selection for `filename`/`file_index` predicates and Iceberg positional-delete handling need separate integration.
+Follow-up work can use cuDF's `enable_prepend_source_index_column()` and `enable_prepend_row_index_column()` APIs to preserve file and row identity during whole-split reads with filtering. Source selection for `filename`/`file_index` predicates and Iceberg positional-delete handling need separate integration.
 
 **Filter translation path:** `TableFilterSet` -> `convert_table_filters_to_expression()` (skips `OPTIONAL_FILTER` and partition-column filters) -> `gpu_expression_translator` -> cuDF AST tree. Ordinary scans also skip top-level `IS_NOT_NULL`; virtual-column scans retain it in the residual predicate evaluated after decoding. Null-count pruning collects null-test predicates directly from the original `TableFilterSet`, independently of expression translation.
 
@@ -617,7 +635,7 @@ The cache does two things beyond classic prefetch:
 - **Partial reads.** A `device_read` over a range whose chunks are only partially cached copies the cached chunks straight to device and completes the rest from the backend in the same call, instead of treating a partial overlap as a miss.
 - **Populate-on-read.** On a backend that supports bounce-staged host-to-device reads, an uncached chunk being read for the device is loaded into a cache buffer (file → cache chunk → device) and published to the cache, so the next read of the same chunk is a hit — caching as a side effect of reading, like an OS page cache. A heavily-partial boundary chunk whose over-read would exceed ~25% of the chunk is instead read through an internal bounce slot and left uncached (zero over-read).
 
-Separately from the prefetching cache, the ioctx always exposes a `metadata_store` so parsed file metadata (e.g. a parquet footer) survives across scans of the same object generation regardless of whether prefetching is wired up. The resident store has one entry per exact path and parser profile; the entry carries the object identity and the opened object's identity must match before reuse. For local files, the reusable identity is `{device, inode, size, ctime_ns}` captured from the opened descriptor. A same-inode in-place rewrite that preserves that tuple can therefore reuse older raw bytes or a parsed footer; local inputs are required to be immutable during a scan and should be updated by atomic replacement, which produces a new descriptor identity. A normal hit performs one exact index lookup and an identity check; there is no recency update or LRU scan. `has_path()` is only an *open hint* (skip the footer probe when some generation's footer is known); a path-level reverse index is used only to invalidate profiles when that path's identity changes. There is currently no per-statement opt-out for cross-statement local footer/byte reuse; an opt-out can be revisited with the retention owner after #209/#2108. HOST/runtime residency budgets, byte accounting, eviction limits, and their diagnostics remain a follow-up owned by the finalized cuCascade IO lifecycle in #2108, after the #209/#2108 identity-header handoff. R3 keeps the existing ioctx-scoped residency behavior and does not claim those bounds are implemented here.
+Separately from the prefetching cache, the ioctx always exposes a `metadata_store` so parsed file metadata (e.g. a parquet footer) survives across scans of the same object generation regardless of whether prefetching is wired up. The resident store has one entry per exact path and parser profile; the entry carries the object identity and the opened object's identity must match before reuse. For local files, the reusable identity is `{device, inode, size, ctime_ns}` captured from the opened descriptor. A same-inode in-place rewrite that preserves that tuple can therefore reuse older raw bytes or a parsed footer; local inputs are required to be immutable during a scan and should be updated by atomic replacement, which produces a new descriptor identity. A normal hit performs one exact index lookup and an identity check; there is no recency update or LRU scan. `has_path()` is only an *open hint* (skip the footer probe when some generation's footer is known); a path-level reverse index is used only to invalidate profiles when that path's identity changes. There is currently no per-statement opt-out for cross-statement local footer/byte reuse; an opt-out can be revisited with the retention owner after #209/#2108. HOST/runtime residency budgets, byte accounting, eviction limits, and their diagnostics remain a follow-up owned by the finalized cuCascade IO lifecycle in #2108, after the #209/#2108 identity-header handoff. The metadata store keeps the existing ioctx-scoped residency behavior and does not claim those bounds are implemented here.
 
 **fadvise protocol.** `sirius_datasource::fadvise(ranges, dev_id)` registers a scan range set and stashes its `cache_handle`. The readahead manager later drives that handle through allocation and asynchronous prefetch; the consumer stage records when reading begins so stale work can be refused or awaited instead of issuing duplicate I/O.
 
@@ -676,6 +694,98 @@ graph TD
 
 The converter builds a `gpu_ingestible` and parks it on the `GPU_SCAN` operator. At query prep the scan manager either serves the operator from a pinned cache (`cached_databatch_provider`) or builds a `split_provider` over the ingestible. The provider dispatches one metadata task per file (parquet) or row-group range (duckdb-native); the query-thread coordinator coalesces and balances each batch, validates publication before prefetch, then pushes splits onto the operator's connector. The task creator turns each pulled split into a `gpu_pipeline_task` on the split's preferred GPU; `execute()` materializes, optionally post-filters/projects, and emits a `data_batch` to the downstream pipeline.
 
+## Shared materialization components
+
+`parquet_gpu_ingestible` and `iceberg_gpu_ingestible` compose `parquet_scan_core`.
+The core retains file enumeration, footer preparation, coalescing, reader options,
+and the existing bulk/general decoder selection. Iceberg owns snapshot and delete
+applicability, suppresses row filtering during decode when positions are needed,
+and delegates the mask operation to `positional_visibility`.
+
+`finish_materialization()` orders mapping, visibility, residual evaluation, and
+projection. A batch carries its contract and execution generation, cardinality,
+completion flags, and per-conjunct predicate progress. Pruning is not enforcement;
+an answer is a bound BOOL8 slot. `residual_filter::against_progress()` refuses
+unknown conjuncts and attempts to reconstruct values overwritten by answers.
+The legacy Parquet bridge retains its existing AST, survivor rowid, and scan-plan
+assembly. Its one expression-completion flag is derived from legacy state at the
+bridge; it does not introduce a second mutable conjunct map.
+
+Source lineage is either original-file runs, explicit original positions, or
+unavailable. Runs retain offsets across pruned row groups. Visibility requires
+lineage until it has completed; it must not use pinned-input survivor rowids as
+file positions. An internal INT8 carrier preserves positive cardinality for a
+zero-column batch. A zero-row batch does not mean end-of-stream.
+
+Two reusable entry points additionally exercise this finish contract:
+
+- `materialize_mapped_parquet()` takes an immutable `field_id_mapping`, the opened
+  datasource, retained footer, physical contract, and exact row groups. The mapper
+  binds physical names by field ID, reorders fields, fills explicitly typed defaults,
+  and permits INT32-to-INT64 or FLOAT32-to-FLOAT64 conversion only when approved at compilation. It checks
+  the decoded dtype before conversion and preserves original file row positions.
+  The current core profile accepts flat boolean, integer, float, and string fields.
+  `materialize_mapped_parquet_runs()` coalesces compatible admitted units and flushes
+  at mapping/default/original-schema boundaries. Different object identities can
+  coalesce; repeated files retain repeated rows and separate lineage. The caller
+  reserves decoded memory plus `additional_bytes()` for each admitted run, including
+  all results retained in the returned vector. The production Iceberg adapter uses
+  the same mapper under its qualified `iceberg_flat_v1` rules.
+- `import_arrow_host()` accepts an owned Arrow C Data tree, its bound input schema,
+  task memory resource, and retirement lane. The flat host profile accepts booleans,
+  signed/unsigned integers, FLOAT32/64, UTF8, DATE32, microsecond timestamps without
+  timezone, and DECIMAL128 (precision 1–38, nonnegative scale no larger than precision).
+  It refuses nested, dictionary, extension, binary, large-string, and device arrays.
+  Decimal imports normalize to the approved DECIMAL128 carrier. Input buffers and
+  metadata must be readable producer-owned C Data memory. For every non-null metadata
+  buffer on the root or a child schema, the producer supplies a trusted readable byte
+  length in `arrow_metadata_lengths` and keeps that memory alive through import.
+  Arrow C Data carries no allocation extents: a raw pointer, lengths encoded inside
+  metadata, or `strnlen` cannot establish its readable range, and copying from an
+  unknown range cannot establish one either. The consumer rejects non-null metadata
+  without a trusted length and parses it only within that buffer's supplied bound.
+  The consumer owns extension/profile and bound-schema checks, admission, publication,
+  cancellation, and ownership/retirement. The producer must detach statement-affine
+  callbacks before ownership transfer. Input/staging capacity remains owned through
+  retirement, even if import throws. The caller reserves output/temporary memory and
+  drains the lane.
+  The conversion leaf incorporates the checked host normalization from
+  [#2216](https://github.com/sirius-db/sirius/pull/2216), whose original helper was
+  extracted from [#1965](https://github.com/sirius-db/sirius/pull/1965). It checks the
+  entire selected batch before GPU work, then builds owning cuDF columns with the
+  supplied device resource and lane stream, without intermediate cuDF Arrow import
+  or decimal casts. Decimal payloads must fit their declared precision; the output
+  remains DECIMAL128, and zero-column batches retain their separate row count.
+  `owned_arrow_batch` requires an explicit staging PMR. Boolean bytes, rebased UTF8
+  offsets and selected validity bits use that resource; roots, capacity and staging
+  stay retained on the lane until completion, including post-enqueue failures. The
+  capacity owner must keep the PMR alive until those staging buffers are destroyed.
+  An absent bitmap with unknown null count is treated as all-valid; positive null
+  counts without a bitmap are refused. No decimal rescaling or large-string support
+  is added. Metadata semantics and the other consumer responsibilities above remain
+  unchanged. Normal import does not synchronize the stream on the host; neither a
+  returned table nor an exception permits releasing pending inputs or replaying a
+  query before a successful attempt-level drain. A failed drain retains ownership,
+  not permission to release it. After output destruction/unwinding, the caller must
+  call `lane.quiesce()` even if `lane.idle()` or input retirement already completed:
+  commit-error recovery may precede subsequently queued output frees. The output
+  allocator and its backing reservation must outlive that final barrier.
+  No CPU/GPU overlap or throughput guarantee is made;
+  pageable producer or PMR buffers may cause CUDA-internal staging/synchronization.
+  `materialize_arrow_stream()` is the internal sequential verifier above this
+  single-batch importer. Its source returns independently owned batches with a
+  contiguous sequence, declared row/byte envelope, and explicit `nullopt` EOS;
+  zero-row batches remain data. It validates the envelope against the imported
+  batch, sends each result directly to a sink without an unbounded queue, and
+  calls source cancellation on source, import, validation, or sink failure.
+  An adapter may translate an `ArrowArrayStream` one batch at a time, but no
+  public Fragment Arrow-input API or Paimon/DuckLake reader is introduced here.
+
+A direct GPU reader can supply an owning batch to the same validator and finish
+without an Arrow or CPU-vector round trip. These helpers do not register a new SQL
+source adapter or relax the existing Iceberg equality-delete, snapshot or
+remote-DV gates. Schema evolution is limited to the qualified flat profile described above.
+
 ## Key Files
 
 | File | Purpose |
@@ -684,7 +794,11 @@ The converter builds a `gpu_ingestible` and parks it on the `GPU_SCAN` operator.
 | `src/op/scan/sirius_gpu_scan_operator_data.hpp` | `scan_operator_input` (fresh-read or resident-batch split) |
 | `src/op/scan/gpu_ingestible.hpp` / `src/op/scan/gpu_ingestible.cpp` | `gpu_ingestible` abstraction + `materialize_table` dispatch |
 | `src/op/scan/gpu_ingestible_types.hpp` | `ingestible_table_info`, `scan_info`, `filtered_table` / `filter_state` |
-| `src/op/scan/parquet_gpu_ingestible.hpp` / `src/op/scan/parquet_gpu_ingestible.cpp` | Parquet ingestible + `parquet_batch_coalescer` + `make_ingestible` |
+| `src/op/scan/parquet_gpu_ingestible.hpp` / `src/op/scan/parquet_gpu_ingestible.cpp` | Parquet facade + `make_ingestible` |
+| `src/op/scan/parquet_scan_core.hpp` / `.cpp` | Shared Parquet preparation, coalescing, decode, and legacy finish bridge |
+| `src/op/scan/materialization_contract.hpp` / `.cpp` | Program/batch validation and shared finish ordering |
+| `src/op/scan/field_id_mapping.hpp` / `.cpp` | Per-file immutable field-ID mapping and conversion approval |
+| `src/op/scan/arrow_materializer.hpp` / `.cpp` | Owned host Arrow import with stream retirement |
 | `src/op/scan/duckdb_native_gpu_ingestible.cpp` / `src/op/scan/duckdb_native_gpu_ingestible.hpp` | DuckDB-native ingestible + `duckdb_native_batch_coalescer` |
 | `src/op/scan/batch_coalescer.hpp` | Coalescer interface |
 | `src/op/scan/owning_table_view.hpp` | View-or-table handle with no-alloc reorder/drop/select |

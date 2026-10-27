@@ -31,6 +31,7 @@
 #include "op/dynamic_filter/dynamic_filter_publish_plan.hpp"
 #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
 #include "op/dynamic_filter/dynamic_filter_stats.hpp"
+#include "op/partition/partition_sizing.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "sirius_config.hpp"
 #include "utils.hpp"
@@ -111,9 +112,9 @@ struct build_probe_decision {
 /// Only the build side drives broadcast / build-probe, so when `is_build_side` is false (right-
 /// family joins are probe-driven) the result is the plain STANDARD-mode natural count.
 ///
-/// MARK joins cannot be hash-partitioned across batches (build_has_null must be globally
-/// consistent), so they are clamped to one partition on a single GPU and forced to broadcast on
-/// multi-GPU.
+/// MARK joins partition like SEMI joins. A null-propagating MARK's global build facts (any NULL
+/// key, any row) are observed while the build is hash-partitioned, before any probe task runs; see
+/// sirius_physical_hash_join::observe_partitioned_build_batch.
 ///
 /// BUILD_PROBE eligibility requires: the build folds to one hash table per GPU within
 /// `max_build_hash_table_bytes` (a broadcast join charges the FULL build to every GPU; a
@@ -369,7 +370,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// under op_state_mutex: switching to BUILD_PROBE mode (allocating the per-partition build
   /// states), marking broadcast, and pre-sizing the build/probe input repositories. Returns the
   /// decision so the partition can finish its own wiring (e.g. enabling build-side concat_all).
-  partition_strategy get_partition_strategy(const partition_sizing_input& in) override;
+  partition_strategy get_partition_strategy(const partition_sizing_input& in);
 
   [[nodiscard]] bool publishes_dynamic_filters() const;
 
@@ -380,6 +381,19 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
   // Publication may claim only a delivery known to contain the whole build.
   void set_build_arrives_whole(bool arrives_whole);
+
+  /// @brief Called by the build-side PARTITION's observer for every build batch it hash-partitions
+  /// (before scattering). For a MARK join with null-propagating keys this records, join-wide,
+  /// whether the build has any row and whether any build key is NULL, so every partition's marks
+  /// follow the global three-valued rule. Idempotent, so OOM retries are harmless.
+  void observe_partitioned_build_batch(cucascade::read_only_data_batch const& batch);
+
+  /// @brief Records that the build PARTITION carries this join's observer, so a hash-partitioned
+  /// MARK build is known to be observed (see observe_partitioned_build_batch).
+  void note_build_observer_attached() noexcept
+  {
+    _build_observer_attached.store(true, std::memory_order_release);
+  }
 
   /// @brief True when this join runs in build-then-probe mode (see `get_partition_strategy`).
   [[nodiscard]] bool is_build_probe_mode();
@@ -432,6 +446,9 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   [[nodiscard]] std::optional<std::size_t> consumed_primary_input_bytes() const override;
 
  protected:
+  /// Consumer-owned sizing target; batch-only receivers have no sizing configuration.
+  uint64_t _hash_partition_bytes = config::DEFAULT_HASH_PARTITION_BYTES;
+
   /// Count @p bytes once for a popped probe batch. Takes @ref _probe_bytes_mutex but no batch
   /// lock, so callers may hold a batch lock.
   void note_probe_bytes_counted(uint64_t batch_id, std::size_t bytes);
@@ -480,9 +497,37 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   std::mutex _probe_bytes_mutex;
 
   // Whether any build-side join key column contains a NULL. Used exclusively for MARK join
-  // three-valued logic. Sentinel -1 = unset, 0 = false, 1 = true. Join-wide (not per-partition)
-  // because MARK joins are forced to a single partition / broadcast, so all build batches agree.
+  // three-valued logic in BUILD_PROBE mode when the build is NOT hash-partitioned (one slot or
+  // broadcast), so every slot holds the whole build and all slots agree. Sentinel -1 = unset,
+  // 0 = false, 1 = true.
   std::atomic<int> _build_has_null{-1};
+
+  // Set at sizing when a MARK build is hash-partitioned (more than one non-broadcast partition);
+  // its marks then use the join-wide observation below. That observation is final before any build
+  // batch reaches this join: the build CONCAT folds each partition only after the PARTITION
+  // pipeline finishes.
+  std::atomic<bool> _mark_build_partitioned{false};
+  std::atomic<bool> _partitioned_build_has_rows{false};
+  std::atomic<bool> _partitioned_build_has_null{false};
+  std::atomic<bool> _build_observer_attached{false};
+
+  /// Global build facts a MARK probe needs: whether a build key is NULL, and whether marks are
+  /// definite (all-null-safe keys, or a globally empty build).
+  struct mark_null_state {
+    bool build_has_null;
+    bool marks_are_definite;
+  };
+  /// Resolves the global MARK null state from this task's own build (@p local_build_has_null,
+  /// @p local_build_empty), which is the whole build unless the build is hash-partitioned.
+  [[nodiscard]] mark_null_state resolve_mark_null_state(bool local_build_has_null,
+                                                        bool local_build_empty) const;
+  /// A null-propagating MARK on a hash-partitioned build: no probe task may run until the whole
+  /// build has been observed.
+  [[nodiscard]] bool mark_waits_for_whole_build() const
+  {
+    return join_type == duckdb::JoinType::MARK && !mark_is_null_safe() &&
+           _mark_build_partitioned.load(std::memory_order_acquire);
+  }
 
   // Per-partition build/probe state for BUILD_PROBE mode. Each partition owns one cuco hash table
   // that lives entirely on one GPU . A partition is built once — its

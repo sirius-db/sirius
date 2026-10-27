@@ -17,6 +17,7 @@
 #include "op/sirius_physical_nested_loop_join.hpp"
 
 #include "config.hpp"
+#include "cudf/ast_compat.hpp"
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
 #include "duckdb/common/exception.hpp"
@@ -34,7 +35,6 @@
 #include "sirius/exception.hpp"
 #include "telemetry/nvtx.hpp"
 
-#include <cudf/ast/expressions.hpp>
 #include <cudf/column/column.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/filling.hpp>
@@ -236,9 +236,11 @@ bool sirius_physical_nested_loop_join::is_supported(
 partition_strategy sirius_physical_nested_loop_join::get_partition_strategy(
   const partition_sizing_input& /*in*/)
 {
-  // A nested-loop join is never hash-partitioned: it runs on a single partition and streams both
-  // sides through the cross-product, so it never broadcasts or enters build-probe. No GPU state
-  // is shared across tasks; leave the CONCATs and join tasks free to follow input locality.
+  // A nested-loop join is never hash-partitioned: it runs on a single partition and evaluates each
+  // pair of left and right batches as one task, so it never broadcasts or enters build-probe. Join
+  // wrapping folds the side rows are decided against (right for LEFT/SEMI/ANTI/MARK, left for
+  // RIGHT, both for FULL OUTER); INNER streams both. No GPU state is shared across tasks; leave the
+  // CONCATs and join tasks free to follow input locality.
   return partition_strategy{/*num_partitions=*/1,
                             /*broadcast=*/false,
                             /*build_probe=*/false,

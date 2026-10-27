@@ -15,9 +15,9 @@
  */
 
 #pragma once
+#include "cudf/ast_compat.hpp"
 #include "expression_evaluator/query_policy.hpp"
 
-#include <cudf/ast/expressions.hpp>
 #include <cudf/table/table.hpp>
 
 #include <cuda/stream>
@@ -125,11 +125,12 @@ struct binding {
 struct application_input {
   cudf::table_view source;
   std::span<binding const> bindings;
-  std::optional<std::size_t> input_bytes  = std::nullopt;
-  batch_receipt const* prior              = nullptr;
-  int device_id                           = -1;
-  cached_view_layout const* cached_layout = nullptr;
-  bool want_row_positions                 = false;
+  std::optional<std::size_t> input_bytes = std::nullopt;
+  batch_receipt const* prior             = nullptr;
+  int device_id                          = -1;
+  /// A selected program takes ownership of this layout's residual; a declined attempt leaves it.
+  cached_view_layout* cached_layout = nullptr;
+  bool want_row_positions           = false;
 };
 
 struct consumer_config {
@@ -168,6 +169,14 @@ struct decode_selection {
   std::shared_ptr<sirius::op::sirius_dynamic_filter_set const> endpoint;
   std::size_t generation = 0;
   std::vector<decode_step> steps;  ///< The preferred probe order for this decode request.
+  /// The consumer has not yet decided whether these filters are worth applying, or lacks a current
+  /// keep ratio for one of them, so the decode should report what they kept, together and one by
+  /// one (`dynamic_filter_consumer::record_decode_keep_ratio` and
+  /// `dynamic_filter_consumer::record_decode_filter_keep_ratio`).
+  bool measure = false;
+  /// The steps cover every filter of the snapshot, so a measurement that covers every step
+  /// describes them all.
+  bool complete = false;
 };
 
 namespace detail {
@@ -296,8 +305,41 @@ class dynamic_filter_consumer {
    * Steps are ordered by measured keep ratio. Filters with equal or unknown ratios follow the
    * `sirius::membership_probe` static signal (small IN-list, hash IN-list, then Bloom; fewer build
    * keys first), then snapshot order.
+   *
+   * Before the consumer has measured whether its filters are selective, it optimistically selects
+   * them and asks the decode to measure them (`decode_selection::measure`). The selection is empty
+   * once the filters have proven unselective, and also while the consumer waits for a clean
+   * batch at the endpoint because a decode measured only part of them as unselective. Filters
+   * whose own measured keep ratio is too weak are left out.
    */
   [[nodiscard]] decode_selection select_for_decode(std::span<binding const> bindings) const;
+
+  /**
+   * @brief Reports what the filters of a measuring decode selection kept.
+   *
+   * @param rows_before Rows the filters were evaluated on
+   * @param rows_after Rows that every filter which ran kept
+   * @param generation `decode_selection::generation` of the selection
+   * @param complete Every filter of a complete selection (`decode_selection::complete`) ran
+   */
+  void record_decode_keep_ratio(std::size_t rows_before,
+                                std::size_t rows_after,
+                                std::size_t generation,
+                                bool complete) noexcept;
+
+  /**
+   * @brief Reports what one filter of a measuring decode selection kept, as the endpoint reports
+   * a sampled filter's marginal keep ratio.
+   *
+   * @param filter The representative binding of the filter's `decode_step`
+   * @param rows_before Rows the filter was evaluated on, those that every earlier filter kept
+   * @param rows_after Rows among those that the filter kept
+   * @param generation `decode_selection::generation` of the selection
+   */
+  void record_decode_filter_keep_ratio(applied_entry const& filter,
+                                       std::size_t rows_before,
+                                       std::size_t rows_after,
+                                       std::size_t generation) noexcept;
 
   /**
    * @brief Capture available filters and policy decisions for this attempt in an application

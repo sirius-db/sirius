@@ -1,35 +1,61 @@
 #!/usr/bin/env python3
-"""Inventory TPC-DS plans and run Sirius with CPU fallback disabled.
+"""Classify TPC-H, TPC-Havoc and TPC-DS queries on Sirius with CPU fallback disabled.
 
 Run through pixi; GPU access must be available to the process. No data generation.
 Each query gets a fresh CLI process so a runtime failure cannot poison the next query.
 
-Uses existing Parquet data; no database import or data generation is
-needed. Run commands from the repository root. The built
-`build/release/duckdb` CLI already includes Sirius, so these scripts do not
-need an explicit `LOAD` statement.
+Uses existing Parquet data or a DuckDB database; no database import or data
+generation is needed. Run commands from the repository root. The CLI
+(`--duckdb`, by default `sirius-duckdb/build/release/duckdb`) does not include
+Sirius: GPU runs start it with `-unsigned` and `LOAD` the extension
+(`--extension`, by default `$SIRIUS_EXTENSION_PATH` or the wrapper build's
+`sirius.duckdb_extension`). Plan inventories and CPU reference runs use plain
+DuckDB. Every run passes `-no-agent`, so the CLI's errors stay the same when
+`AI_AGENT` or `CLAUDECODE` is set.
 
 For a classification run:
 
 ```bash
-pixi run python test/tpcds_performance/classify.py \
+pixi run python test/scripts/classify_queries.py \
   $PATH_TO_TPC_DS_TABLES \
-  --config test/tpcds_performance/classification.yaml \
+  --config test/scripts/classification.yaml \
   --output-dir ...
 ```
 
-The output directory must be new. Add `--queries 3 7 42` for a subset or
-`--timeout 60` to limit each process to 60 seconds. Table inputs can be named
+`--benchmark` picks the tables and the queries:
+
+- `tpcds` (the default): the canonical 99 SQL files from the local DuckDB submodule
+  (`duckdb/extension/tpcds/dsdgen/queries/01.sql` through `99.sql`).
+- `tpch`: the 22 SQL files in `duckdb/extension/tpch/dbgen/queries`.
+- `tpch-havoc`: the TPC-Havoc rewrites of the TPC-H queries, which CMake downloads
+  into `build/release/test/tpch_havoc` (see test/README.md; `--havoc-dir` reads
+  another copy). It needs `--scale-factor`, which sets Q11's threshold the way
+  BenchBox does. Identical rewrites run once, under the first label, such as
+  `Q19_V01`.
+
+Use `--query-dir` to select a different corpus for `tpch` or `tpcds`; it accepts
+`q1.sql`, `q01.sql` or `01.sql` naming, and queries keep their file numbers.
+
+To read the tables from a DuckDB database instead of Parquet, pass `--duckdb-file`
+in place of the directory; the database is attached read-only. For example, to
+classify TPC-Havoc against the C++ tests' database and validate the results:
+
+```bash
+pixi run python test/scripts/classify_queries.py --benchmark tpch-havoc \
+  --duckdb-file test/cpp/integration/data/duckdb/integration.duckdb \
+  --scale-factor 0.1 --validate \
+  --config test/scripts/classification.yaml \
+  --output-dir ...
+```
+
+The output directory must be new. Add `--queries 3 7 42` for a subset (with
+`tpch-havoc`, base query numbers or labels such as `Q05_V03`) or `--timeout 60` to
+limit each process to 60 seconds. Table inputs can be named
 `table.parquet`, `table/*.parquet`, or `table_[0-9]*.parquet` shards. The shard
 suffix must start with a digit. This avoids mistaking `store_returns` for a `store` shard or
 `customer_address` for a `customer` shard. The example config uses
 one GPU, 8 GiB of GPU memory and 4 GiB of pinned memory per host NUMA node.
 It is a small baseline for SF1, not a memory recommendation for larger scales.
-
-The classifier reads the canonical 99 SQL files from the local DuckDB submodule
-(`duckdb/extension/tpcds/dsdgen/queries/01.sql` through `99.sql`), without
-changing their identifiers or generating data. Use `--query-dir` to select a
-different corpus; it accepts either `q1.sql` or `01.sql` naming.
 
 For each query, it saves:
 
@@ -38,11 +64,14 @@ For each query, it saves:
 - `plans/`: the exact EXPLAIN input, stdout and stderr.
 - `gpu/`: the exact execution input, CSV results, stderr and Sirius logs.
 - `classification.csv`: completed GPU execution, plan rejection, runtime failure,
-  timeout, or an unconfirmed/unclassified outcome, with the first exact error.
+  crash, timeout, or an unconfirmed/unclassified outcome, with the first exact
+  error. With `tpch-havoc`, `duplicates` lists the labels of identical rewrites.
 - `features.json`: query membership for plan operators, join types and function
   names visible in the EXPLAIN trees. This is an inventory, not a support verdict.
-- `metadata.json` and `sirius.yaml`: source revision, dirty status, binary hash,
-  input location, optimizer mask, timeout and configuration.
+- `metadata.json` and `sirius.yaml`: source revision, dirty status, CLI and
+  extension hashes, input location, optimizer mask, timeout and configuration.
+- `summary.md`: counts by outcome (per base query for `tpch-havoc`) and the first
+  error of each root cause, ready to paste into an issue.
 
 GPU execution uses normal SQL with `SET enable_duckdb_fallback=false`. A fresh
 process per query isolates runtime failures. Success requires both a zero exit
@@ -85,16 +114,41 @@ import math
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
+
+import yaml
 
 
 ROOT = Path(__file__).resolve().parents[2]
-TABLES = """call_center catalog_page catalog_returns catalog_sales customer
+# The wrapper build: a DuckDB CLI without Sirius, and the Sirius extension.
+WRAPPER = ROOT / "sirius-duckdb/build/release"
+TABLES = {
+    "tpcds": """call_center catalog_page catalog_returns catalog_sales customer
 customer_address customer_demographics date_dim household_demographics income_band
 inventory item promotion reason ship_mode store store_returns store_sales time_dim
-warehouse web_page web_returns web_sales web_site""".split()
+warehouse web_page web_returns web_sales web_site""".split(),
+    "tpch": "customer lineitem nation orders part partsupp region supplier".split(),
+}
+# Default query directory and query count of the benchmarks with numbered SQL files.
+QUERY_FILES = {
+    "tpcds": (ROOT / "duckdb/extension/tpcds/dsdgen/queries", 99),
+    "tpch": (ROOT / "duckdb/extension/tpch/dbgen/queries", 22),
+}
 MASK = "in_clause,compressed_materialization,late_materialization"
 DEFAULT_FLOAT_TOLERANCE = 1e-10
+# summary.md outcomes, in column order.
+OUTCOMES = {
+    "gpu": "GPU",
+    "mismatch": "mismatch",
+    "plan_rejected": "plan rejected",
+    "runtime_failed": "runtime failed",
+    "crash": "crash",
+    "timeout": "timeout",
+    "other": "other",
+}
+# `id` is the `query` value in the CSV files; `label` names the query in output.
+Query = collections.namedtuple("Query", "id label directory base sql duplicates")
 
 
 def json_results(output):
@@ -242,12 +296,14 @@ def explain_arrays(output):
     return dict(zip(("logical", "logical_optimized", "physical"), arrays))
 
 
-def run_cli(binary, sql, env, directory, timeout):
+def run_cli(binary, sql, env, directory, timeout, extension=None):
+    if extension is not None:
+        sql = f"LOAD {quote(extension)};\n" + sql
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "input.sql").write_text(sql)
     try:
         result = subprocess.run(
-            [str(binary), "-bail"],
+            [str(binary), "-unsigned", "-bail", "-no-agent"],
             input=sql,
             text=True,
             capture_output=True,
@@ -269,14 +325,146 @@ def run_cli(binary, sql, env, directory, timeout):
     return code, stdout, stderr
 
 
+def numbered_queries(query_dir, numbers):
+    queries = []
+    for q in numbers:
+        names = (f"q{q}.sql", f"q{q:02}.sql", f"{q:02}.sql")
+        path = next((query_dir / n for n in names if (query_dir / n).exists()), None)
+        if path is None:
+            raise ValueError(f"No SQL file for query {q} in {query_dir}")
+        sql = path.read_text().strip().rstrip(";") + ";\n"
+        queries.append(Query(q, f"Q{q}", f"q{q}", q, sql, []))
+    return queries
+
+
+def havoc_queries(havoc_dir, scale_factor):
+    """Load the TPC-Havoc variants; identical later ones become duplicates."""
+    # BenchBox renders Q11's threshold as f"{0.0001 / SF:.10f}".
+    fraction = f"{0.0001 / scale_factor:.10f}"
+    queries, first = [], {}
+    for base in range(1, 23):
+        document = yaml.safe_load((havoc_dir / f"q{base:02}.yaml").read_text())
+        for variant in document["variants"]:
+            label = f"Q{base:02}_V{int(variant['id']):02}"
+            sql = variant["sql"].strip().replace("{q11_fraction}", fraction)
+            if match := re.search(r"\{[A-Za-z_]\w*\}", sql):
+                raise ValueError(
+                    f"{label} has an unknown template parameter {match[0]}"
+                )
+            sql = sql.rstrip(";") + ";\n"
+            if sql in first:
+                first[sql].duplicates.append(label)
+            else:
+                first[sql] = Query(label, label, label, base, sql, [])
+                queries.append(first[sql])
+    return queries
+
+
+def select_queries(queries, names):
+    """Queries named by base query number or label; a duplicate names its query."""
+    wanted = {str(int(name)) if name.isdigit() else name.upper() for name in names}
+    keys = {q.id: {str(q.base), q.label, *q.duplicates} for q in queries}
+    unknown = wanted.difference(*keys.values())
+    if unknown:
+        raise ValueError(f"Unknown queries: {' '.join(sorted(unknown))}")
+    return [q for q in queries if wanted & keys[q.id]]
+
+
+def sha256(path):
+    with path.open("rb") as f:
+        return hashlib.file_digest(f, "sha256").hexdigest()
+
+
+def outcome(row):
+    """Summary outcome; with validation, a completed query must also match CPU."""
+    if row["status"] == "gpu_completed":
+        validation = row.get("validation_status", "pass")
+        return {"pass": "gpu", "mismatch": "mismatch"}.get(validation, "other")
+    return row["status"] if row["status"] in OUTCOMES else "other"
+
+
+def first_error(row):
+    """A row's first error, without the prefix its whole outcome shares."""
+    failed = row["status"] != "gpu_completed"
+    text = (row["reason"] if failed else row["validation_reason"]).split(" | ")[0]
+    text = re.sub(r"^.*?(GPU plan generation|Sirius GPU execution) failed: ", "", text)
+    text = re.sub(r"CUDF failure at: \S*/", "cuDF failure at ", text)
+    return text.strip()[:200] or row["status"]
+
+
+def summary(results, context, per_base_query):
+    """Markdown counts by outcome, then the first error of each root cause."""
+    lines = [context, ""]
+    variants = len(results) + sum(len(query.duplicates) for query, _ in results)
+    if variants != len(results):
+        lines += [
+            f"Counts are distinct queries: {len(results)} queries cover "
+            f"{variants} variants.",
+            "",
+        ]
+    groups = [("all", results)]
+    if per_base_query:
+        bases = sorted({query.base for query, _ in results})
+        groups = [
+            (f"Q{base:02}", [r for r in results if r[0].base == base]) for base in bases
+        ] + [("**all**", results)]
+    lines.append("| query | " + " | ".join(OUTCOMES.values()) + " |")
+    lines.append("|---" * (len(OUTCOMES) + 1) + "|")
+    for name, members in groups:
+        counts = collections.Counter(outcome(row) for _, row in members)
+        cells = " | ".join(str(counts[kind]) for kind in OUTCOMES)
+        lines.append(f"| {name} | {cells} |")
+    # Errors that differ only in numbers, such as sizes or line numbers, share a cause.
+    causes = collections.defaultdict(list)
+    for query, row in results:
+        if (kind := outcome(row)) != "gpu":
+            error = first_error(row)
+            causes[(kind, re.sub(r"\d+", "N", error))].append((query.label, error))
+    if causes:
+        lines += ["", "| outcome | # | queries | first error |", "|---|---|---|---|"]
+        order = list(OUTCOMES)
+        for (kind, _), members in sorted(
+            causes.items(), key=lambda cause: (order.index(cause[0][0]), -len(cause[1]))
+        ):
+            labels = " ".join(label for label, _ in members)
+            error = members[0][1].replace("`", "'").replace("|", "\\|")
+            lines.append(
+                f"| {OUTCOMES[kind]} | {len(members)} | {labels} | `{error}` |"
+            )
+    return "\n".join(lines) + "\n"
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("parquet_dir", type=Path)
+    parser.add_argument("parquet_dir", type=Path, nargs="?")
+    parser.add_argument(
+        "--duckdb-file",
+        type=Path,
+        help="Read the tables from this DuckDB database instead of Parquet",
+    )
+    parser.add_argument(
+        "--benchmark", choices=["tpcds", "tpch", "tpch-havoc"], default="tpcds"
+    )
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--queries", nargs="+", type=int, default=list(range(1, 100)))
     parser.add_argument(
-        "--query-dir", type=Path, default=ROOT / "duckdb/extension/tpcds/dsdgen/queries"
+        "--queries",
+        nargs="+",
+        help="Query numbers; for tpch-havoc, also labels such as Q05_V03",
+    )
+    parser.add_argument("--query-dir", type=Path)
+    parser.add_argument(
+        "--havoc-dir", type=Path, default=ROOT / "build/release/test/tpch_havoc"
+    )
+    parser.add_argument(
+        "--scale-factor", type=float, help="Required for tpch-havoc (Q11's threshold)"
+    )
+    parser.add_argument("--duckdb", type=Path, default=WRAPPER / "duckdb")
+    parser.add_argument(
+        "--extension",
+        type=Path,
+        default=os.environ.get("SIRIUS_EXTENSION_PATH")
+        or WRAPPER / "extension/sirius/sirius.duckdb_extension",
     )
     parser.add_argument("--timeout", type=float, default=120)
     parser.add_argument(
@@ -293,48 +481,101 @@ def main():
     args = parser.parse_args()
     if not math.isfinite(args.float_tolerance) or args.float_tolerance < 0:
         parser.error("--float-tolerance must be finite and non-negative")
+    if (args.parquet_dir is None) == (args.duckdb_file is None):
+        parser.error("pass either a Parquet directory or --duckdb-file")
+    havoc = args.benchmark == "tpch-havoc"
+    if havoc and args.scale_factor is None:
+        parser.error("--benchmark tpch-havoc needs --scale-factor")
+    if args.scale_factor is not None and not args.scale_factor > 0:
+        parser.error("--scale-factor must be positive")
+    if havoc and args.query_dir:
+        parser.error("--query-dir does not apply to tpch-havoc; use --havoc-dir")
+    binary, extension = args.duckdb.resolve(), args.extension.resolve()
+    for path in (binary, extension):
+        if not path.is_file():
+            parser.error(f"Not found: {path}")
+    if havoc:
+        query_dir = args.havoc_dir.resolve()
+        if not (query_dir / "q01.yaml").is_file():
+            parser.error(
+                f"No TPC-Havoc queries in {query_dir}: configure a build with tests "
+                "enabled, which downloads them, or pass --havoc-dir"
+            )
+    else:
+        query_dir = (args.query_dir or QUERY_FILES[args.benchmark][0]).resolve()
+    try:
+        if havoc:
+            queries = havoc_queries(query_dir, args.scale_factor)
+            if args.queries:
+                queries = select_queries(queries, args.queries)
+        else:
+            if args.queries and not all(name.isdigit() for name in args.queries):
+                raise ValueError(f"--queries takes numbers for {args.benchmark}")
+            numbers = (
+                [int(name) for name in args.queries]
+                if args.queries
+                else range(1, QUERY_FILES[args.benchmark][1] + 1)
+            )
+            queries = numbered_queries(query_dir, numbers)
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        parser.error(str(exc))
+    family = "tpcds" if args.benchmark == "tpcds" else "tpch"
+    if args.duckdb_file:
+        data = args.duckdb_file.expanduser().resolve()
+        if not data.is_file():
+            parser.error(f"Database not found: {data}")
+        setup = f"ATTACH {quote(data)} AS {family} (READ_ONLY);\nUSE {family};\n"
+    else:
+        data = args.parquet_dir.expanduser().resolve()
+        views = []
+        for table in TABLES[family]:
+            files = sorted(
+                p
+                for pattern in (
+                    f"{table}.parquet",
+                    f"{table}/*.parquet",
+                    f"{table}_[0-9]*.parquet",
+                )
+                for p in data.glob(pattern)
+                if p.is_file()
+            )
+            if not files:
+                parser.error(f"No parquet files for {table} in {data}")
+            views.append(
+                f"CREATE VIEW {table} AS SELECT * FROM read_parquet(["
+                + ",".join(quote(path) for path in files)
+                + "]);\n"
+            )
+        setup = "".join(views)
+    if havoc:
+        # Q01_V07 uses `x -> ...` lambdas, which DuckDB accepts only with this setting.
+        setup += "SET lambda_syntax='ENABLE_SINGLE_ARROW';\n"
+    config = args.config.resolve()
+    if not config.is_file():
+        parser.error(f"Config not found: {config}")
     output = args.output_dir.resolve()
     if output.exists():
         parser.error("output directory already exists; choose a fresh directory")
     output.mkdir(parents=True)
-    views = []
-    for table in TABLES:
-        data = args.parquet_dir.expanduser().resolve()
-        files = sorted(
-            p
-            for pattern in (
-                f"{table}.parquet",
-                f"{table}/*.parquet",
-                f"{table}_[0-9]*.parquet",
-            )
-            for p in data.glob(pattern)
-            if p.is_file()
-        )
-        if not files:
-            parser.error(f"No parquet files for {table} in {data}")
-        views.append(
-            f"CREATE VIEW {table} AS SELECT * FROM read_parquet(["
-            + ",".join(quote(path) for path in files)
-            + "]);\n"
-        )
-    setup = "".join(views)
-    binary = ROOT / "build/release/duckdb"
-    config = args.config.resolve()
-    if not config.is_file():
-        parser.error(f"Config not found: {config}")
     (output / "sirius.yaml").write_bytes(config.read_bytes())
     metadata = {
         "utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "benchmark": args.benchmark,
+        "scale_factor": args.scale_factor,
         "data": str(data),
-        "query_dir": str(args.query_dir.resolve()),
+        "query_dir": str(query_dir),
         "revision": subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
         ).strip(),
         "git_status": subprocess.check_output(
             ["git", "status", "--short"], cwd=ROOT, text=True
         ),
+        "binary": str(binary),
         "binary_mtime": binary.stat().st_mtime,
-        "binary_sha256": hashlib.file_digest(binary.open("rb"), "sha256").hexdigest(),
+        "binary_sha256": sha256(binary),
+        "extension": str(extension),
+        "extension_mtime": extension.stat().st_mtime,
+        "extension_sha256": sha256(extension),
         "optimizer_mask": MASK,
         "timeout_seconds": args.timeout,
         "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES"),
@@ -351,12 +592,9 @@ def main():
     (output / "metadata.json").write_text(json.dumps(metadata, indent=2))
     rows = []
     inventory = collections.defaultdict(set)
-    for q in args.queries:
-        directory = output / f"q{q}"
-        path = args.query_dir / f"q{q}.sql"
-        if not path.exists():
-            path = args.query_dir / f"{q:02}.sql"
-        sql = path.read_text().strip().rstrip(";") + ";\n"
+    for query in queries:
+        directory = output / query.directory
+        sql = query.sql
         cpu_env = dict(os.environ, SIRIUS_DISABLE="1")
         code, stdout, stderr = run_cli(
             binary,
@@ -368,14 +606,17 @@ def main():
             directory / "plans",
             args.timeout,
         )
-        row = {"query": q, "status": "", "reason": "", "plan_status": str(code)}
+        row = {"query": query.id}
+        if havoc:
+            row["duplicates"] = " ".join(query.duplicates)
+        row.update(status="", reason="", plan_status=str(code))
         if code == 0:
             try:
                 plans = explain_arrays(stdout)
                 (directory / "plans.json").write_text(json.dumps(plans, indent=2))
                 for kind, tree in plans.items():
                     for node in walk(tree):
-                        inventory[(kind, "operator", node["name"])].add(q)
+                        inventory[(kind, "operator", node["name"])].add(query.id)
                         for key in (
                             "Join Type",
                             "Aggregates",
@@ -391,13 +632,15 @@ def main():
                                 continue
                             values = value if isinstance(value, list) else [value]
                             if key == "Join Type":
-                                inventory[(kind, key, str(value))].add(q)
+                                inventory[(kind, key, str(value))].add(query.id)
                             else:
                                 for expr in values:
                                     for fn in re.findall(
                                         r"\b([a-zA-Z_]\w*)\(", str(expr)
                                     ):
-                                        inventory[(kind, "function", fn.lower())].add(q)
+                                        inventory[(kind, "function", fn.lower())].add(
+                                            query.id
+                                        )
             except ValueError as exc:
                 row["plan_status"] = str(exc)
         gpu_env = dict(
@@ -417,8 +660,11 @@ def main():
             gpu_env,
             directory / "gpu",
             args.timeout,
+            extension,
         )
-        logs = "\n".join(p.read_text() for p in (directory / "gpu/log").glob("*.log"))
+        logs = "\n".join(
+            p.read_text(errors="replace") for p in (directory / "gpu/log").glob("*.log")
+        )
         errors = [line for line in stderr.splitlines() if re.search(r"\bError:", line)]
         row["reason"] = " | ".join(errors) or (stderr.strip() if code != 0 else "")
         if code == "timeout":
@@ -426,11 +672,19 @@ def main():
             row["reason"] = (
                 f"Exceeded {args.timeout:g}s; inspect GPU log for last progress"
             )
+        elif code < 0:
+            row["status"] = "crash"
+            row["reason"] = " | ".join(
+                [f"Killed by {signal.Signals(-code).name}"] + errors
+            )
         elif code == 0 and "Transparent GPU execution: query completed" in logs:
             row["status"] = "gpu_completed"
         elif "GPU plan generation failed:" in stderr:
             row["status"] = "plan_rejected"
-        elif "Sirius physical plan generated successfully" in logs:
+        elif (
+            "Sirius GPU execution failed:" in stderr
+            or "Sirius physical plan generated successfully" in logs
+        ):
             row["status"] = "runtime_failed"
         else:
             row["status"] = "unclassified_error" if code != 0 else "gpu_not_confirmed"
@@ -464,7 +718,7 @@ def main():
             writer = csv.DictWriter(f, fieldnames=list(row))
             writer.writeheader()
             writer.writerows(rows)
-        print(f"Q{q}: {row['status']} {row['reason'][:180]}", flush=True)
+        print(f"{query.label}: {row['status']} {row['reason'][:180]}", flush=True)
         if args.validate:
             with (output / "validation.csv").open("w", newline="") as f:
                 writer = csv.DictWriter(f, fieldnames=["query", "status", "detail"])
@@ -486,6 +740,14 @@ def main():
         for k, v in sorted(inventory.items())
     ]
     (output / "features.json").write_text(json.dumps(features, indent=2))
+    context = f"`{args.benchmark}`"
+    if args.scale_factor is not None:
+        context += f" at SF {args.scale_factor:g}"
+    context += f" on `{data.name}`, revision `{metadata['revision'][:8]}`, "
+    context += "validated against DuckDB on CPU." if args.validate else "not validated."
+    (output / "summary.md").write_text(
+        summary(list(zip(queries, rows)), context, per_base_query=havoc)
+    )
     print(dict(collections.Counter(row["status"] for row in rows)), flush=True)
     if args.validate:
         print(
@@ -493,6 +755,7 @@ def main():
             dict(collections.Counter(row["validation_status"] for row in rows)),
             flush=True,
         )
+    print(f"Summary: {output / 'summary.md'}", flush=True)
 
 
 if __name__ == "__main__":

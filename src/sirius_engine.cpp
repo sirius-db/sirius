@@ -16,13 +16,13 @@
 
 #include "sirius_engine.hpp"
 
+#include "cuda/device_health.hpp"
 #include "duckdb/execution/execution_context.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parallel/thread_context.hpp"
 #include "io/sirius_datasource.hpp"
 #include "log/logging.hpp"
-#include "op/scan/iceberg_gpu_ingestible.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_cte.hpp"
@@ -62,8 +62,7 @@ void finish_deferred_preparation(op::sirius_physical_operator const* plan) noexc
   if (!plan) return;
   planner::for_each_gpu_scan(*plan, [](op::sirius_physical_operator const& source) {
     if (auto const* scan = dynamic_cast<op::scan::sirius_gpu_scan_operator const*>(&source))
-      if (auto* ice = dynamic_cast<op::scan::iceberg_gpu_ingestible*>(&scan->get_ingestible()))
-        ice->finish_preparation();
+      scan->get_ingestible().finish_preparation();
   });
 }
 
@@ -266,6 +265,7 @@ void sirius_engine::execute()
   if (!completion_handler_) {
     throw std::logic_error("execution requires a live window completion handler");
   }
+  auto* registry                       = &sirius_ctx->get_query_lifecycle_registry();
   completion_handler_->execution_owner = std::this_thread::get_id();
   auto future                          = completion_handler_->get_awaitable();
 
@@ -290,19 +290,25 @@ void sirius_engine::execute()
   try {
     while (future.wait_for(std::chrono::milliseconds(25)) != std::future_status::ready) {
       if (context.IsInterrupted()) { throw duckdb::InterruptException(); }
+      if (sirius_ctx->get_runtime_health() == duckdb::SiriusContext::runtime_health::UNAVAILABLE)
+        sirius_ctx->throw_runtime_unavailable();
     }
     future.get();
+    if (sirius_ctx->get_runtime_health() == duckdb::SiriusContext::runtime_health::UNAVAILABLE)
+      sirius_ctx->throw_runtime_unavailable();
     sirius_ctx->retire_query_work(query_id_,
                                   duckdb::SiriusContext::query_retirement_mode::completed);
     finish_deferred_preparation(sirius_physical_plan.get());
     plan_users_quiescent_ = true;
   } catch (const std::exception& e) {
+    registry->report_failure(std::current_exception(), query_id_);
     SIRIUS_LOG_ERROR("Error executing query: {}", e.what());
     cancel_dynamic_filter_publications();
     // Retire asynchronous borrowers before the execution window can release repositories.
     quiesce_plan_users();
     throw;
   } catch (...) {
+    registry->report_failure(std::current_exception(), query_id_);
     SIRIUS_LOG_ERROR("Unknown error executing query");
     cancel_dynamic_filter_publications();
     quiesce_plan_users();

@@ -63,6 +63,9 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
   //! requirement is safe; changing it after any claim throws std::logic_error.
   void set_concat_all(bool concat_all);
 
+  //! Whether each partition is released as one group once the source pipeline finishes.
+  [[nodiscard]] bool concat_all() const { return _concat_all; }
+
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
     const op::input_stats& stats) const override;
 

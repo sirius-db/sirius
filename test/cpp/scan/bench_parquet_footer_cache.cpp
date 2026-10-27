@@ -20,7 +20,7 @@ TEST_CASE("Ten thousand real Parquet files reuse verified footer records",
           "[.][parquet_footer_cache_bench]")
 {
   namespace fs   = std::filesystem;
-  char pattern[] = "/tmp/sirius-r3-footers-XXXXXX";
+  char pattern[] = "/tmp/sirius-parquet-footers-XXXXXX";
   auto directory = ::mkdtemp(pattern);
   REQUIRE(directory);
   struct cleanup {

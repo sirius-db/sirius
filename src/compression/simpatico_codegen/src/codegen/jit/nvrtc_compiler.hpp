@@ -10,6 +10,7 @@
 typedef struct CUlib_st* CUlibrary;
 typedef struct CUfunc_st* CUfunction;
 typedef struct CUkern_st* CUkernel;
+typedef struct CUctx_st* CUcontext;
 
 namespace codegen::jit {
 
@@ -39,8 +40,10 @@ struct CompiledKernel {
   std::vector<char> cubin;
   std::string rendered_source;
 
-  // Returns the CUfunction for the current CUDA device, deriving and caching it
-  // on first call per device. Returns nullptr if kern is null or derivation fails.
+  // Returns the CUfunction for the CUDA context current on the calling thread,
+  // deriving and caching it on first use in that context. A CUfunction can only be
+  // launched from the context it was derived in, so the cache is keyed by context,
+  // not device. Returns nullptr if kern is null or derivation fails.
   CUfunction func_for_current_device() const;
 
   CompiledKernel() = default;
@@ -52,7 +55,7 @@ struct CompiledKernel {
 
  private:
   mutable std::mutex func_mu_;
-  mutable std::unordered_map<int, CUfunction> func_per_dev_;
+  mutable std::unordered_map<CUcontext, CUfunction> func_per_ctx_;
 };
 
 // Compile a raw CUDA-C++ source string via nvrtc and load the resulting cubin.

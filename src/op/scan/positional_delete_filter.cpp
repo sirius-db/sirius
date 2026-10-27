@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include "op/scan/positional_visibility.hpp"
+
 #include <cudf/column/column_factories.hpp>
 #include <cudf/cudf_utils.hpp>
 #include <cudf/table/table.hpp>
@@ -69,54 +71,12 @@ std::unique_ptr<cudf::table> positional_delete_filter::apply(std::unique_ptr<cud
                                                              ::cuda::stream_ref stream,
                                                              rmm::device_async_resource_ref mr)
 {
-  auto const num_rows = static_cast<int64_t>(tbl->num_rows());
-  if (num_rows == 0 || !affects(layout)) { return tbl; }
-
-  // Host keep-mask over the whole batch. Delete positions are sorted per file, so each run's
-  // in-range window is two binary searches: O(deletes in range), not O(deletes in table).
-  std::vector<uint8_t> keep(static_cast<size_t>(num_rows), 1u);
-  bool any_deleted = false;
-
-  for (auto const& run : layout) {
-    auto const delete_positions = positions_for(run.data_file_path);
-    if (delete_positions.empty()) { continue; }
-    auto const run_end = run.file_row_offset + run.num_rows;
-    auto lo =
-      std::lower_bound(delete_positions.begin(), delete_positions.end(), run.file_row_offset);
-    auto hi = std::lower_bound(lo, delete_positions.end(), run_end);
-
-    for (auto pos = lo; pos != hi; ++pos) {
-      auto const batch_row = run.batch_row_offset + (*pos - run.file_row_offset);
-      // Out of range would silently corrupt a neighbouring row, so this is a guard, not an
-      // assert.
-      if (batch_row < 0 || batch_row >= num_rows) {
-        throw std::out_of_range("[iceberg] positional_delete_filter: delete position " +
-                                std::to_string(*pos) + " in '" + run.data_file_path +
-                                "' maps outside the decoded batch — the batch row layout does not "
-                                "describe the decoded table");
-      }
-      keep[static_cast<size_t>(batch_row)] = 0u;
-      any_deleted                          = true;
-    }
-  }
-
-  if (!any_deleted) { return tbl; }
-
-  auto bool_col = cudf::make_fixed_width_column(cudf::data_type{cudf::type_id::BOOL8},
-                                                static_cast<cudf::size_type>(num_rows),
-                                                cudf::mask_state::UNALLOCATED,
-                                                stream,
-                                                mr);
-  RMM_CUDA_TRY(cudaMemcpyAsync(bool_col->mutable_view().data<uint8_t>(),
-                               keep.data(),
-                               static_cast<size_t>(num_rows) * sizeof(uint8_t),
-                               cudaMemcpyHostToDevice,
-                               stream.get()));
-  // `keep` is host memory feeding an async copy and must outlive it. A pinned staging buffer
-  // would avoid the sync; a one-byte-per-row mask does not justify it yet.
-  stream.sync();
-
-  return sirius::apply_retention_mask(tbl->view(), bool_col->view(), stream, mr);
+  return apply_positional_visibility(
+    std::move(tbl),
+    layout,
+    [this](std::string const& path) { return positions_for(path); },
+    stream,
+    mr);
 }
 
 }  // namespace sirius::op::scan

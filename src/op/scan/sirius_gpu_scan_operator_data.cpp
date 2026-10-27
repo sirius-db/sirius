@@ -26,6 +26,7 @@
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/decoded_batch_representation.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
+#include <pipeline/batch_lock_utils.hpp>
 #include <scan_manager/readahead_scan_manager.hpp>
 
 #include <algorithm>
@@ -33,6 +34,7 @@
 #include <memory>
 #include <numeric>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -67,7 +69,8 @@ membership_snapshot snapshot_membership_probes(decode_selection const& selection
                                                std::size_t n_slots)
 {
   membership_snapshot snap;
-  snap.generation = selection.generation;
+  snap.generation  = selection.generation;
+  snap.measurement = {.measure = selection.measure, .complete = selection.complete};
   snap.probes.resize(n_slots);
   for (std::size_t order = 0; order < selection.steps.size(); ++order) {
     auto const& step       = selection.steps[order];
@@ -81,7 +84,9 @@ membership_snapshot snapshot_membership_probes(decode_selection const& selection
     // The actual execution device is selected after attachment. The closure retains its filter
     // and resolves the local replica when the decoder invokes it on that device.
     int const use_current_device = -1;
-    // Equal ranks with ascending key counts make the decoder keep the consumer's probe order.
+    // Equal ranks with ascending key counts make the decoder keep the consumer's probe order. The
+    // tag is the position of the step's representative in `attached`, which becomes the batch's
+    // decode history.
     snap.probes[step.column_index].push_back(
       {[f = filter, applicable](cudf::column_view const& keys,
                                 std::uint32_t const* prior_mask_words,
@@ -90,7 +95,8 @@ membership_snapshot snapshot_membership_probes(decode_selection const& selection
          return applicable->compute_mask(keys, prior_mask_words, use_current_device, stream, mr);
        },
        0,
-       order + 1});
+       order + 1,
+       snap.attached.size()});
     snap.attached.insert(snap.attached.end(), step.represented.begin(), step.represented.end());
   }
   return snap;
@@ -124,8 +130,9 @@ std::optional<detail::membership_refresh> detail::refresh_membership_probes(
     current
       ? current
       : std::make_shared<const sirius::decompression_pushdown_scan>(sirius::pushdown_request{});
-  return membership_refresh{base->with_membership_probes(std::move(snap.probes), snap.generation),
-                            std::move(snap.attached)};
+  return membership_refresh{
+    base->with_membership_probes(std::move(snap.probes), snap.generation, snap.measurement),
+    std::move(snap.attached)};
 }
 
 scan_operator_input::scan_operator_input(
@@ -237,7 +244,8 @@ void scan_operator_input::prepare_for_processing(
   auto batch = std::get<std::shared_ptr<cucascade::data_batch>>(materialization_info);
 
   if (batch && !stolen_table && !stolen_table_consumed) {
-    bool needs_upload = false;
+    bool needs_upload      = false;
+    bool needs_device_copy = false;
     {
       auto ro          = batch->to_read_only();
       auto const* data = ro.get_data();
@@ -247,7 +255,27 @@ void scan_operator_input::prepare_for_processing(
       auto const* gpu_rep = dynamic_cast<const ::cucascade::gpu_table_representation*>(data);
       needs_upload =
         data != nullptr && (ro.get_current_tier() != ::cucascade::memory::Tier::GPU || !gpu_rep);
+      needs_device_copy = gpu_rep && requested_memory_space && ro.get_memory_space() &&
+                          ro.get_memory_space()->get_id() != requested_memory_space->get_id();
       if (!needs_upload && gpu_rep) { record_decode_outcome(data); }
+    }
+    if (needs_device_copy) {
+      // Admission may override the pinned table's locality. Reuse the pipeline
+      // clone path: keep shared pin storage on its original GPU, and bind only
+      // this input to the copy on the executor's device. The helper rechecks
+      // residency under its lock and waits for the source writer before copying.
+      auto prepared = pipeline::lock_and_prepare_batch(batch, requested_memory_space, stream);
+      if (!prepared) throw std::runtime_error("Cannot prepare cached scan on its assigned GPU");
+      std::visit(
+        [&](auto& locked) {
+          record_decode_outcome(locked.ro_lock.get_data());
+          if constexpr (std::is_same_v<std::decay_t<decltype(locked)>,
+                                       pipeline::lock_to_new_batch>) {
+            batch                = locked.new_batch;
+            materialization_info = batch;
+          }
+        },
+        *prepared);
     }
     if (needs_upload && requested_memory_space) {
       auto& registry = ::sirius::converter_registry::get();
@@ -343,6 +371,10 @@ void scan_operator_input::prepare_for_processing(
   if (batch) {
     auto ro          = batch->to_read_only();
     gpu_memory_space = ro.get_memory_space();
+    if (requested_memory_space && gpu_memory_space &&
+        gpu_memory_space->get_id() != requested_memory_space->get_id()) {
+      throw std::runtime_error("Cached scan batch is not on its assigned GPU");
+    }
   }
 }
 
@@ -355,6 +387,10 @@ void scan_operator_input::record_decode_outcome(::cucascade::idata_representatio
   auto const* decoded =
     dynamic_cast<::sirius::decompression_pushdown_batch_representation const*>(data);
   if (decoded == nullptr) { return; }
+  report_membership_keep(decoded->outcome().membership_keep);
+  // Join filters the decode skipped left these rows unfiltered, so the endpoint may sample them
+  // as clean input instead of a decode the filters might have touched.
+  if (decoded->outcome().membership_skipped) { decode_attached.clear(); }
   // The converter reports what the decode did as a value on the representation. row_filtered
   // means the whole table-filter conjunction was applied and every column is compacted to the
   // surviving rows — materialize_table maps it to filter_state::ROW_FILTERED so the filter is
@@ -389,6 +425,23 @@ void scan_operator_input::record_decode_outcome(::cucascade::idata_representatio
       "incompatible with an unconsumed mvcc keep-mask; the attach must compose the "
       "visibility mask on masked chunks");
   }
+}
+
+void scan_operator_input::report_membership_keep(
+  std::optional<pushdown_outcome::membership_keep_observation> const& observation) const noexcept
+{
+  // Only a decode that carried this consumer's probes has anything to report. The consumer ignores
+  // reports once it has decided, so a decode selected after the decision reports harmlessly.
+  if (!consumer || decode_attached.empty() || !observation) { return; }
+  auto const generation = static_cast<std::size_t>(observation->generation);
+  for (auto const& probe : observation->probes) {
+    // The tag indexes the representative binding of the probe's decode step.
+    if (probe.tag >= decode_attached.size()) { continue; }
+    consumer->record_decode_filter_keep_ratio(
+      decode_attached[probe.tag], probe.rows_before, probe.rows_after, generation);
+  }
+  consumer->record_decode_keep_ratio(
+    observation->rows_before, observation->rows_after, generation, observation->complete);
 }
 
 std::unique_ptr<cudf::table> scan_operator_input::transactionally_steal_converted_table(
