@@ -15,10 +15,14 @@
  */
 
 #include "catch.hpp"
+#include "exec/scoped_dispatcher.hpp"
+#include "op/scan/gpu_ingestible.hpp"
 #include "op/scan/iceberg_delete_set.hpp"
 #include "op/scan/iceberg_dv_preparation.hpp"
+#include "op/scan/iceberg_gpu_ingestible.hpp"
 #include "scan_manager/preparation_ledger.hpp"
 #include "scan_manager/preparation_test_support.hpp"
+#include "scan_manager/split_provider.hpp"
 
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
@@ -27,13 +31,153 @@
 #include <array>
 #include <future>
 #include <limits>
+#include <string>
 #include <thread>
+#include <type_traits>
+#include <vector>
 
 using namespace sirius::scan_manager;
 using sirius::scan_manager::test::test_reservation_provider;
 namespace {
 auto const host = memory_space_id(cucascade::memory::Tier::HOST, 0);
 std::array<scan_envelope, 1> sample() { return {scan_envelope{{{8, 8, 16, 20}}, 0, 0, true}}; }
+
+struct dv_precondition_fixture {
+  test_reservation_provider provider;
+  std::vector<std::string> paths{"a.parquet"};
+  std::shared_ptr<sirius::op::scan::iceberg_dv_preparation> prepared;
+  std::shared_ptr<preparation_admission> admission;
+
+  dv_precondition_fixture()
+  {
+    using namespace sirius::op::scan;
+    provider.grant_bytes = 64 * 1024;
+    auto discovery       = std::make_shared<iceberg_delete_discovery>();
+    IcebergDeleteFileEntry dv;
+    dv.file_format           = "puffin";
+    dv.file_path             = "a.puffin";
+    dv.content_offset        = 4;
+    dv.content_size_in_bytes = 44;
+    dv.record_count          = 2;
+    dv.file_size_in_bytes    = 400;
+    dv.referenced_data_file  = paths.front();
+    discovery->deletion_vector_entries.push_back(dv);
+    auto ledger   = std::make_unique<preparation_ledger>(provider);
+    auto envelope = iceberg_dv_preparation::envelope(*discovery, paths);
+    auto decision = ledger->admit(std::array{envelope}, host);
+    REQUIRE(decision.deferred);
+    prepared  = std::make_shared<iceberg_dv_preparation>(7, "table", paths, discovery, *ledger);
+    admission = std::make_shared<preparation_admission>(std::move(ledger), decision);
+  }
+
+  std::shared_ptr<preparation_ledger> consume()
+  {
+    prepared->bind_admission(admission);
+    return std::shared_ptr<preparation_ledger>(admission->consume());
+  }
+
+  std::unique_ptr<sirius::op::scan::iceberg_ingestible_table_info> info(bool deferred = true) const
+  {
+    using namespace sirius::op::scan;
+    auto bind                    = std::make_unique<iceberg_ingestible_table_info>();
+    bind->contract_id            = prepared->contract();
+    bind->resolved_file_paths    = paths;
+    bind->names                  = {"value"};
+    bind->returned_types         = {sirius::logical_type::make(sirius::type_id::INTEGER)};
+    bind->column_ids             = {duckdb::ColumnIndex(0)};
+    bind->projected_output_count = 1;
+    bind->table_path             = "table";
+    if (deferred)
+      bind->deferred = prepared;
+    else
+      bind->delete_data = std::make_shared<IcebergDeleteData>();
+    return bind;
+  }
+};
+
+class contract_table_info final : public sirius::op::scan::ingestible_table_info {
+ public:
+  bool cache_allowed = false;
+  std::span<std::string const> column_names() const override { return {}; }
+  std::span<std::string const> file_paths() const override { return {}; }
+  std::string display_name() const override { return "contract-adapter"; }
+  bool allows_cached_rows() const override { return cache_allowed; }
+};
+
+class contract_ingestible : public sirius::op::scan::gpu_ingestible {
+ public:
+  std::shared_ptr<sirius::scan_manager::preparation_admission> admission;
+  std::shared_ptr<sirius::scan_manager::preparation_ledger> attached;
+  unsigned stop_calls   = 0;
+  unsigned finish_calls = 0;
+  unsigned claim_calls  = 0;
+  bool custom_stop_seen = false;
+
+  std::unique_ptr<sirius::op::scan::batch_coalescer> create_batch_coalescer() const override
+  {
+    return nullptr;
+  }
+  bool has_processed_all_metadata() const override { return false; }
+  metadata_scan_task_t next_split_provider(sirius::io::ioctx_resolver) override
+  {
+    return [](std::stop_token) { return std::make_unique<sirius::op::scan::scan_info>(); };
+  }
+  sirius::op::scan::filtered_table materialize_metadata_to_table(
+    sirius::op::scan::scan_info const&,
+    cucascade::memory::memory_space const&,
+    ::cuda::stream_ref,
+    bool,
+    std::shared_ptr<const sirius::like_multiliteral_cache>,
+    sirius::expression_query_policy) override
+  {
+    return {};
+  }
+  std::unique_ptr<cudf::table> post_filter_and_project(
+    sirius::op::scan::filtered_table&&,
+    cucascade::memory::memory_space const&,
+    ::cuda::stream_ref,
+    bool,
+    std::shared_ptr<const sirius::like_multiliteral_cache>,
+    std::unique_ptr<cudf::column>*,
+    std::span<std::size_t const>,
+    sirius::expression_query_policy) override
+  {
+    return nullptr;
+  }
+  sirius::op::scan::ingestible_table_info const& table_info() const noexcept override
+  {
+    return info;
+  }
+  std::vector<std::size_t> materialized_column_order() const override { return {}; }
+  std::shared_ptr<sirius::scan_manager::preparation_admission> preparation_admission()
+    const override
+  {
+    return admission;
+  }
+  void attach_preparation_ledger(
+    std::shared_ptr<sirius::scan_manager::preparation_ledger> ledger) override
+  {
+    attached = std::move(ledger);
+  }
+  preparation_claim claim_preparation(sirius::io::ioctx_resolver) override
+  {
+    ++claim_calls;
+    auto work = [](std::stop_token) { return std::make_unique<sirius::op::scan::scan_info>(); };
+    return {work,
+            [this, work](std::stop_token stop) mutable {
+              custom_stop_seen = true;
+              if (stop.stop_requested())
+                throw std::system_error(std::make_error_code(std::errc::operation_canceled));
+              return work(stop);
+            },
+            {},
+            {}};
+  }
+  void stop_preparation() noexcept override { ++stop_calls; }
+  void finish_preparation() noexcept override { ++finish_calls; }
+
+  contract_table_info info;
+};
 }  // namespace
 TEST_CASE("Admission uses the one actual grant and releases all unsuccessful grants",
           "[scan_preparation][ledger]")
@@ -70,6 +214,134 @@ TEST_CASE("Admission uses the one actual grant and releases all unsuccessful gra
   }
   CHECK(provider.outstanding() == 0);
 }
+
+TEST_CASE("Non-Iceberg adapter consumes the shared preparation capability contract",
+          "[scan_preparation][contract]")
+{
+  test_reservation_provider provider;
+  auto ledger   = std::make_unique<preparation_ledger>(provider);
+  auto decision = ledger->admit(sample(), host);
+  REQUIRE(decision.deferred);
+  auto admission = std::make_shared<preparation_admission>(std::move(ledger), decision);
+
+  contract_ingestible adapter;
+  adapter.admission = admission;
+  CHECK(adapter.preparation_admission() == admission);
+  auto consumed = admission->consume();
+  REQUIRE(consumed);
+  adapter.attach_preparation_ledger(std::shared_ptr<preparation_ledger>(std::move(consumed)));
+  CHECK(adapter.attached);
+
+  auto claim = adapter.claim_preparation({});
+  REQUIRE(claim.work);
+  REQUIRE(claim.stop_work);
+  std::stop_source source;
+  source.request_stop();
+  CHECK_THROWS_AS(claim.stop_work(source.get_token()), std::system_error);
+  CHECK(claim.stop_work({}));
+
+  adapter.stop_preparation();
+  adapter.finish_preparation();
+  CHECK(adapter.stop_calls == 1);
+  CHECK(adapter.finish_calls == 1);
+  CHECK_FALSE(adapter.info.allows_cached_rows());
+  adapter.attached->close();
+  adapter.attached.reset();
+  CHECK(provider.outstanding() == 0);
+}
+
+TEST_CASE("Preparation claim uses the adapter capability without an admission",
+          "[scan_preparation][contract]")
+{
+  contract_ingestible adapter;
+  sirius::scan_manager::split_provider provider(adapter, {});
+
+  auto claim = provider.claim_preparation();
+  REQUIRE(claim.work);
+  REQUIRE(claim.stop_work);
+  CHECK(adapter.claim_calls == 1);
+
+  std::stop_source source;
+  source.request_stop();
+  CHECK_THROWS_AS(claim.stop_work(source.get_token()), std::system_error);
+  CHECK(adapter.custom_stop_seen);
+}
+TEST_CASE("Ordinary split provider cancellation drains queued and running metadata",
+          "[scan_preparation][split_provider][cancellation]")
+{
+  class cancellable_ingestible final : public contract_ingestible {
+   public:
+    metadata_scan_task_t work;
+    bool claimed = false;
+    bool has_processed_all_metadata() const override { return claimed; }
+    metadata_scan_task_t next_split_provider(sirius::io::ioctx_resolver) override
+    {
+      claimed = true;
+      return std::move(work);
+    }
+  } adapter;
+  bool queued = false;
+  SECTION("queued task is discarded before any IO") { queued = true; }
+  SECTION("running IO receives stop before opening the datasource") {}
+
+  std::promise<void> entered, release;
+  auto entered_future = entered.get_future();
+  auto released       = release.get_future().share();
+  unsigned work_calls = 0, datasource_opens = 0, completions = 0, results = 0;
+  std::exception_ptr error;
+  split_connector connector;
+  adapter.work = [&](std::stop_token stop) -> std::unique_ptr<sirius::op::scan::scan_info> {
+    ++work_calls;
+    entered.set_value();
+    released.wait();
+    if (stop.stop_requested())
+      throw std::system_error(std::make_error_code(std::errc::operation_canceled));
+    ++datasource_opens;
+    return std::make_unique<sirius::op::scan::scan_info>();
+  };
+  sirius::exec::static_thread_pool pool(1);
+  sirius::exec::scoped_dispatcher dispatcher(pool, 1);
+  split_provider provider(adapter, {});
+  if (queued) {
+    dispatcher.enqueue([&] {
+      entered.set_value();
+      released.wait();
+    });
+  }
+  provider.run(dispatcher, [&](split_provider::value_type&& item) {
+    if (item.is_empty()) {
+      ++completions;
+      connector.close();
+    } else if (item.has_exception()) {
+      error = item.exception();
+      connector.close(error);
+    } else {
+      ++results;
+    }
+  });
+  auto status = entered_future.wait_for(std::chrono::seconds(5));
+  dispatcher.request_stop();
+  release.set_value();
+  dispatcher.wait_for_all();
+  CHECK(status == std::future_status::ready);
+  CHECK(work_calls == (queued ? 0 : 1));
+  CHECK(datasource_opens == 0);
+  CHECK(results == 0);
+  CHECK(completions == 1);
+  if (queued) {
+    CHECK_FALSE(error);
+    CHECK_FALSE(connector.get_next_split());
+  } else {
+    REQUIRE(error);
+    try {
+      std::rethrow_exception(error);
+    } catch (std::system_error const& e) {
+      CHECK(e.code() == std::make_error_code(std::errc::operation_canceled));
+    }
+    CHECK_THROWS_AS(connector.get_next_split(), std::system_error);
+  }
+}
+
 TEST_CASE("Admission sums retained results across scans and accounts for allocation granularity",
           "[scan_preparation][ledger]")
 {
@@ -648,7 +920,7 @@ TEST_CASE("DV profile qualifies only complete bounded inputs and keeps append-on
   }
 }
 
-TEST_CASE("Charged DV descriptor names outlive the plan only while a result actually uses them",
+TEST_CASE("Charged DV descriptor names outlive the plan through the last published split consumer",
           "[scan_preparation][iceberg][ledger]")
 {
   using namespace sirius::op::scan;
@@ -669,9 +941,9 @@ TEST_CASE("Charged DV descriptor names outlive the plan only while a result actu
   auto e = iceberg_dv_preparation::envelope(*discovery, paths);
   REQUIRE(ledger->admit(std::array{e}, host).deferred);
   auto prepared = std::make_shared<iceberg_dv_preparation>(7, "table", paths, discovery, *ledger);
-  REQUIRE(prepared->files.size() == 2);
-  CHECK(prepared->files[0].dv != nullptr);
-  CHECK(prepared->files[1].dv == nullptr);
+  REQUIRE(prepared->files().size() == 2);
+  CHECK(prepared->files()[0].dv != nullptr);
+  CHECK(prepared->files()[1].dv == nullptr);
   auto arena_charge = ledger->charged_bytes({7, 0});
   CHECK(arena_charge == e.retained_descriptors);
   CHECK(ledger->tracked_units() == 1);
@@ -683,20 +955,263 @@ TEST_CASE("Charged DV descriptor names outlive the plan only while a result actu
   values[0]       = 1;
   values[1]       = 3;
   auto result     = std::make_shared<iceberg_delete_set const>(
-    prepared->files[0].path, std::move(allocation), 2, 1, prepared->path_owner());
-  prepared->files[0].result = result;
+    prepared->files()[0].path, std::move(allocation), 2, 1, prepared->path_owner());
+  iceberg_dv_attempt attempt{prepared, ledger};
+  attempt.record(0, result);
   permit.release();
   ledger->retire_unit({7, 1});
   CHECK(ledger->tracked_units() == 2);
-  prepared->finish();
-  prepared.reset();
-  ledger->close();
-  CHECK(result->data_file == "a.parquet");
-  CHECK(result->positions[1] == 3);
-  CHECK(provider.seen->allocated_bytes == arena_charge + 16);
-  result.reset();
-  CHECK(ledger->tracked_units() == 0);
+  SECTION("a retained result survives descriptor retirement")
+  {
+    // Model the published split retaining the prepared visibility artifact.  The plan and
+    // attempt may finish at the query-wide barrier, but the descriptor arena must stay alive
+    // until this last consumer releases its result.
+    attempt.finish();
+    prepared.reset();
+    ledger->close();
+    CHECK(result->data_file == "a.parquet");
+    CHECK(result->positions[1] == 3);
+    CHECK(provider.seen->allocated_bytes == arena_charge + 16);
+    result.reset();
+    CHECK(ledger->tracked_units() == 0);
+  }
+  SECTION("an attempt's weak slot does not retain the result")
+  {
+    CHECK(attempt.result(0) == result);
+    result.reset();
+    CHECK(attempt.result(0) == nullptr);
+    CHECK(provider.seen->allocated_bytes == arena_charge);
+    CHECK(ledger->tracked_units() == 1);
+    attempt.finish();
+    prepared.reset();
+    ledger->close();
+    CHECK(ledger->tracked_units() == 0);
+  }
   ledger.reset();
   CHECK(provider.seen->allocated_bytes == 0);
   CHECK(provider.outstanding() == 0);
+}
+
+TEST_CASE("DV descriptor accounting preserves the base layout and rounded admission",
+          "[scan_preparation][ledger]")
+{
+  using namespace sirius::op::scan;
+  static_assert(sizeof(iceberg_dv_preparation::file) == 40 &&
+                sizeof(iceberg_dv_preparation::file*) == 8);
+  test_reservation_provider provider;
+  provider.grant_bytes = 64 * 1024;
+  std::vector<std::string> paths{"a.parquet", "b.parquet"};
+  uint64_t expected_raw = 116, expected_charge = 116, expected_retained = 132;
+  SECTION("byte-granular storage for two short paths") {}
+  SECTION("sixteen-byte granularity for ten long paths")
+  {
+    paths.clear();
+    for (char value : std::string("abcdefghij"))
+      paths.emplace_back(200, value);
+    provider.quantum  = 16;
+    expected_raw      = 2490;
+    expected_charge   = 2496;
+    expected_retained = 2512;
+  }
+  auto discovery = std::make_shared<iceberg_delete_discovery>();
+  auto empty     = iceberg_dv_preparation::envelope(*discovery, paths);
+  CHECK(empty.qualified);
+  CHECK(empty.units.empty());
+  CHECK(empty.retained_descriptors == 0);
+  IcebergDeleteFileEntry dv;
+  dv.file_format           = "puffin";
+  dv.file_path             = "a.puffin";
+  dv.content_offset        = 4;
+  dv.content_size_in_bytes = 44;
+  dv.record_count          = 2;
+  dv.file_size_in_bytes    = 400;
+  dv.referenced_data_file  = paths.front();
+  discovery->deletion_vector_entries.push_back(dv);
+  auto envelope = iceberg_dv_preparation::envelope(*discovery, paths);
+  REQUIRE(envelope.qualified);
+  REQUIRE(envelope.units.size() == 1);
+  CHECK(envelope.retained_descriptors == expected_raw);
+  CHECK(envelope.resolver_index == 0);
+  CHECK(envelope.units.front().positions == 16);
+  {
+    preparation_ledger ledger(provider);
+    auto decision = ledger.admit(std::array{envelope}, host);
+    REQUIRE(decision.deferred);
+    CHECK(decision.n_permits == 1);
+    CHECK(decision.reason == admission_reason::admitted);
+    CHECK(decision.route_reason == scan_eligibility::eligible);
+    CHECK(decision.sigma_retained == expected_retained);
+    CHECK(decision.allocation_granularity == provider.quantum);
+    CHECK(decision.c_obtained == 65536);
+    CHECK(provider.seen->requests == 1);
+    {
+      iceberg_dv_preparation prepared(7, "table", paths, discovery, ledger);
+      CHECK(ledger.charged_bytes({7, 0}) == expected_charge);
+      CHECK(provider.seen->allocated_bytes == expected_charge);
+      CHECK(ledger.tracked_units() == 1);
+      CHECK(ledger.permits_in_flight() == 0);
+    }
+    CHECK(ledger.tracked_units() == 0);
+    CHECK(provider.seen->allocated_bytes == 0);
+    CHECK(provider.seen->allocations == 1);
+  }
+  CHECK(provider.outstanding() == 0);
+}
+
+TEST_CASE("DV admission rejects null and replacement bindings without losing the first owner",
+          "[scan_preparation][ledger]")
+{
+  dv_precondition_fixture f;
+  CHECK_THROWS_AS(f.prepared->bind_admission(nullptr), std::logic_error);
+  CHECK_FALSE(f.prepared->admission());
+  REQUIRE_NOTHROW(f.prepared->bind_admission(f.admission));
+  REQUIRE(f.prepared->admission() == f.admission);
+  SECTION("the same admission cannot be rebound")
+  {
+    CHECK_THROWS_AS(f.prepared->bind_admission(f.admission), std::logic_error);
+  }
+  SECTION("a different admission cannot replace the first")
+  {
+    dv_precondition_fixture other;
+    CHECK_THROWS_AS(f.prepared->bind_admission(other.admission), std::logic_error);
+    CHECK_FALSE(other.prepared->admission());
+  }
+  SECTION("a null binding cannot clear the first")
+  {
+    CHECK_THROWS_AS(f.prepared->bind_admission(nullptr), std::logic_error);
+  }
+  CHECK(f.prepared->admission() == f.admission);
+  CHECK(f.provider.seen->requests == 1);
+}
+
+TEST_CASE("DV attempt rejects out-of-range and retired result writes without changing live slots",
+          "[scan_preparation][ledger]")
+{
+  using namespace sirius::op::scan;
+  static_assert(!std::is_copy_constructible_v<iceberg_dv_attempt>);
+  static_assert(!std::is_copy_assignable_v<iceberg_dv_attempt>);
+  dv_precondition_fixture f;
+  auto ledger = f.consume();
+  iceberg_dv_attempt attempt{f.prepared, ledger};
+  auto result = std::make_shared<iceberg_delete_set const>(f.paths.front());
+  REQUIRE(f.prepared->files().size() == 1);
+  REQUIRE_NOTHROW(attempt.record(0, result));
+  CHECK(attempt.result(0) == result);
+  CHECK_THROWS_AS(attempt.record(f.prepared->files().size(), result), std::logic_error);
+  CHECK_THROWS_AS(attempt.record(std::numeric_limits<size_t>::max(), result), std::logic_error);
+  CHECK(attempt.result(0) == result);
+  CHECK(attempt.result(f.prepared->files().size()) == nullptr);
+  attempt.finish();
+  CHECK(f.prepared->files().empty());
+  CHECK_FALSE(attempt.ledger());
+  CHECK_THROWS_AS(attempt.record(0, result), std::logic_error);
+  CHECK(attempt.result(0) == nullptr);
+  REQUIRE_NOTHROW(attempt.finish());
+  CHECK(ledger->tracked_units() == 0);
+  ledger->close();
+  ledger.reset();
+  CHECK(f.provider.seen->allocated_bytes == 0);
+  CHECK(f.provider.outstanding() == 0);
+}
+
+TEST_CASE(
+  "Iceberg preparation rejects missing foreign repeated and undeferred attempt installation",
+  "[scan_preparation][ledger]")
+{
+  using namespace sirius::op::scan;
+  dv_precondition_fixture f;
+  auto ledger     = f.consume();
+  auto ingestible = make_ingestible(f.info());
+  auto attempt    = std::make_shared<iceberg_dv_attempt>(f.prepared, ledger);
+  bool installed  = false;
+  SECTION("null attempt")
+  {
+    CHECK_THROWS_AS(ingestible->begin_preparation(nullptr), std::logic_error);
+  }
+  SECTION("foreign preparation with the same contract and path")
+  {
+    dv_precondition_fixture other;
+    auto other_ledger = other.consume();
+    REQUIRE(other.prepared.get() != f.prepared.get());
+    REQUIRE(other.prepared->contract() == f.prepared->contract());
+    CHECK_THROWS_AS(ingestible->begin_preparation(
+                      std::make_shared<iceberg_dv_attempt>(other.prepared, other_ledger)),
+                    std::logic_error);
+  }
+  SECTION("second installation")
+  {
+    REQUIRE_NOTHROW(ingestible->begin_preparation(attempt));
+    installed = true;
+    CHECK_THROWS_AS(
+      ingestible->begin_preparation(std::make_shared<iceberg_dv_attempt>(f.prepared, ledger)),
+      std::logic_error);
+  }
+  SECTION("ingestible without deferred preparation")
+  {
+    auto legacy = make_ingestible(f.info(false));
+    CHECK_THROWS_AS(legacy->begin_preparation(attempt), std::logic_error);
+  }
+  if (!installed) REQUIRE_NOTHROW(ingestible->begin_preparation(attempt));
+  CHECK_THROWS_AS(ingestible->begin_preparation(attempt), std::logic_error);
+  ingestible->finish_preparation();
+  CHECK_FALSE(attempt->ledger());
+  CHECK(f.prepared->files().empty());
+  CHECK(ledger->tracked_units() == 0);
+  ledger->close();
+  ledger.reset();
+  CHECK(f.provider.seen->allocated_bytes == 0);
+  CHECK(f.provider.outstanding() == 0);
+}
+
+TEST_CASE("Uninstalled Iceberg preparation releases descriptors at final cleanup",
+          "[scan_preparation][ledger]")
+{
+  dv_precondition_fixture f;
+  auto ledger     = f.consume();
+  auto ingestible = make_ingestible(f.info());
+
+  REQUIRE_FALSE(f.prepared->files().empty());
+  ingestible->finish_preparation();
+  CHECK(f.prepared->files().empty());
+  CHECK(f.provider.seen->allocated_bytes == 0);
+
+  REQUIRE_NOTHROW(ingestible->finish_preparation());
+  ledger->close();
+  ledger.reset();
+  CHECK(f.provider.outstanding() == 0);
+}
+
+TEST_CASE("Rejected pre-start Iceberg claims leave the first file available",
+          "[scan_preparation][ledger]")
+{
+  using namespace sirius::op::scan;
+  dv_precondition_fixture f;
+  auto ledger     = f.consume();
+  auto ingestible = make_ingestible(f.info());
+  auto resolve    = [](std::string_view) -> std::shared_ptr<sirius::io::ioctx> {
+    throw std::runtime_error("claim-only resolver was executed");
+  };
+  REQUIRE(f.paths.size() == 1);
+  REQUIRE_FALSE(ingestible->has_processed_all_metadata());
+  CHECK_THROWS_AS(ingestible->next_split_provider(resolve), std::logic_error);
+  REQUIRE_FALSE(ingestible->has_processed_all_metadata());
+  auto attempt = std::make_shared<iceberg_dv_attempt>(f.prepared, ledger);
+  REQUIRE_NOTHROW(ingestible->begin_preparation(attempt));
+  REQUIRE(ingestible->can_claim_preparation());
+  auto work = ingestible->next_split_provider(resolve);
+  REQUIRE(work);
+  CHECK(ingestible->has_processed_all_metadata());
+  CHECK_FALSE(ingestible->next_split_provider(resolve));
+  work = {};
+  CHECK(ledger->permits_in_flight() == 0);
+  CHECK(ledger->tracked_units() == 1);
+  ingestible->stop_preparation();
+  CHECK_FALSE(attempt->ledger());
+  CHECK(f.prepared->files().size() == 1);
+  ingestible->finish_preparation();
+  CHECK(ledger->tracked_units() == 0);
+  ledger->close();
+  ledger.reset();
+  CHECK(f.provider.seen->allocated_bytes == 0);
+  CHECK(f.provider.outstanding() == 0);
 }

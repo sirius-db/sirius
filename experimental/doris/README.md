@@ -75,17 +75,18 @@ git diff tests/snapshots/
 ## CPU differential of the translator (no GPU)
 
 The plans the translator produces can be executed without the engine: DuckDB's substrait
-consumer (`SubstraitToDuckDB` in the repo's `substrait/` submodule, the reader
-`src/sirius_ffi.cpp` compiles into libsirius) turns the bytes into a DuckDB plan, and DuckDB
-runs it on the CPU. `scripts/cpu-diff.sh` stitches every captured dispatch into one plan,
+consumer turns the bytes into a DuckDB plan, and DuckDB runs it on the CPU.
+This helper pins the pre-v2 reader at `a7e045b` separately from Sirius's v2 submodule,
+matching the DuckDB 1.5.5 Python client in the `check` environment. It checks translator
+output against that consumer, not the v2 reader embedded in Sirius.
+`scripts/cpu-diff.sh` stitches every captured dispatch into one plan,
 runs it that way with the optimizer rules the FFI disables, and validates the rows against
 `tests/expected/tpch-sf1` (22/22 pass):
 
 ```bash
 pixi run -e check duckdb-substrait-build      # once, ~3 min: DuckDB v1.5.5 + substrait extension
-                                              # under .duckdb-substrait/ (upstream tag = the
-                                              # commit substrait/.gitmodules pins; python-duckdb
-                                              # in the `check` env is the same version)
+                                              # under .duckdb-substrait/; matches python-duckdb
+                                              # in the `check` environment
 pixi run -e check tpch-cpu-diff               # or: bash scripts/cpu-diff.sh [--data DIR] [--queries 1,6]
 ls log/cpu-diff/q01/                          # result.tsv, duckdb-plan.txt (the optimized logical plan)
 ```

@@ -22,9 +22,9 @@ num_partitions = max(1, ceil(total_bytes / hash_partition_bytes))
 
 **Motivation:** During pipeline executor drain (e.g., for error recovery or pipeline transitions), in-flight task creation must be safely completed before operator destruction.
 
-**Mechanism:** `drain_pending_tasks()` drains the task creation queue via `_task_creation_queue.drain()` and waits for in-flight task creation lambdas via `_kiosk.wait_all()`.
+**Current mechanism:** `discard_pending_tasks(query_id)` disposes of queued requests/callables. The runtime owner then waits for work leases before `reset(query_id)` releases creator state and lookahead hints. Other queries remain active. See [Query lifetime and retirement](query-lifecycle.md).
 
-**Code path:** `src/creator/task_creator.cpp` — `drain_pending_tasks()`
+**Code path:** `src/creator/task_creator.cpp` — `discard_pending_tasks()` and `reset()`
 
 ### 3-Phase Sort Pipeline (PR #866)
 
@@ -72,7 +72,7 @@ details.
 
 **Motivation:** With demand-driven (`active`) task creation, a drained task queue leaves GPU workers idle even when not-yet-activated scans could already be producing work.
 
-**Mechanism:** The task creator retains a `_lookahead_queue` of candidate operators (built at query start from the plan's scan operators after the first, cleared on drain/restart). When an engine-controlled policy selects the internal `request_type::lookahead` primitive and the task scheduler finds its task queue empty, `schedule_lookahead(device_hint)` emits one speculative request for the next not-yet-activated operator, warming scans up one task at a time. The manager loop creates a single task per look-ahead request rather than draining the source. See [task-creator.md](task-creator.md).
+**Mechanism:** The task creator retains a per-query `lookahead_queue` of candidate operators (built at query start from the plan's scan operators after the first, cleared on query drain/reset). When an engine-controlled policy selects the internal `request_type::lookahead` primitive and the task scheduler finds its task queue empty, `schedule_lookahead(device_hint)` emits one speculative request for the next not-yet-activated operator, warming scans up one task at a time. The manager loop creates a single task per look-ahead request rather than draining the source. See [task-creator.md](task-creator.md).
 
 **Code path:** `src/creator/task_creator.cpp` — `schedule_lookahead()`; `src/pipeline/task_scheduler.cpp` — empty-queue trigger; `src/creator/config.hpp` — `request_type`
 
@@ -229,6 +229,35 @@ Both feed the same `resolve_mark_join_result()`, which scatters the match indice
 - `src/planner/sirius_plan_projection_utils.cpp` — `push_projection()`, `fold_adjacent_projections()`
 - `src/planner/sirius_physical_plan_generator.cpp` — post-pass invocation of `fold_adjacent_projections()`
 - `src/expression/ast/reference_utils.cpp` — `visit_references()`, `substitute_references()`
+
+### Decimal SUM Width Selection
+
+**Motivation:** A decimal SUM must not overflow, but the widest type is also the slowest. cuDF sums
+64-bit decimals much faster than 128-bit ones, especially in a grouped aggregation with few groups,
+where 128-bit accumulation contends on the same groups. DuckDB v2 types some sums wider than their
+values need: the TPC-H Q9 profit `l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity`
+is `DECIMAL(19,4)`, held as DECIMAL128, although every value fits 64 bits. At SF1000 its group-by
+took 3.8 s instead of 28 ms.
+
+**Mechanism:** Per batch, grouped and ungrouped aggregations pick the width of each decimal SUM (and
+of AVG's SUM) from one exact
+proof: a sum of n values of magnitude at most m is at most n * m. A DECIMAL32 or DECIMAL64 input is
+widened to the next type only when rows * max|value| exceeds its storage width. A DECIMAL128 input is
+narrowed to DECIMAL64 at the same scale when rows * max|value| is at most 2^63 - 1, and the result is
+cast back to DECIMAL128, so no value and no partial sum of any group can leave the 64-bit range, and
+the merge combines the per-batch partials at the original 128-bit width. The
+bound comes from base-table statistics when the SUM input is a scan column
+(`planner::resolve_sum_input_bounds`); otherwise the batch is measured with `cudf::minmax`,
+costing one stream synchronization per batch for all measured columns together.
+
+**Code path:**
+- `src/op/aggregate/aggregate_op_util.cpp` — `sums_to_widen`, `decimal_sums_to_narrow`
+- `src/op/aggregate/gpu_aggregate_impl.cpp` — per-batch request rewriting in the grouped aggregation
+- `src/op/sirius_physical_ungrouped_aggregate.cpp` — per-batch input casts in the ungrouped reduction
+- `src/planner/decimal_sum_input_bounds.cpp` — plan-time bounds from scan statistics
+
+**Config:** `enable_decimal_sum_stats_bound` (default: `true`) lets plan-time bounds skip the
+per-batch measurement.
 
 ## Memory Optimizations
 
@@ -520,7 +549,7 @@ If translation fails, filtering falls back to `expression_evaluator` on the deco
 
 **Motivation:** Scan splits arrive sized by metadata-parse completion rather than by the configured batch size, so batches could come out smaller than requested, and multi-GPU runs need scan inputs spread across devices. Opportunistic prefetch hints issued in metadata-completion order also rob the head-of-line pipeline of lead time.
 
-**Mechanism:** The scan manager owns a `load_balancing_scan_batch_coalescer`. Each scan pipeline registers a per-pipeline slot holding a `batch_coalescer`, a `split_connector`, and a `balancing_strategy`. A single sequencer task drains the slots in registration (execution) order: it coalesces each pipeline's splits to the requested batch size — independent of the configured max batch count — chooses a device via the balancing strategy, issues `fadvise(opportunistic)` / prefetch hints, and pushes the placed split onto the connector, advancing to the next pipeline only after the current one closes. The `balancing_strategy` interface stamps a `preferred_device_id` on each split (which the task creator honors); `round_robin_strategy` hands out GPUs via an atomic cursor and is the default.
+**Mechanism:** The scan manager creates a `load_balancing_scan_batch_coalescer` for each query. Each scan pipeline registers a per-pipeline slot holding a `batch_coalescer`, a `split_connector`, and a `balancing_strategy`. That query's sequencer task drains the slots in registration (execution) order: it coalesces each pipeline's splits to the requested batch size — independent of the configured max batch count — chooses a device via the balancing strategy, issues `fadvise(opportunistic)` / prefetch hints, and pushes the placed split onto the connector, advancing to the next pipeline only after the current one closes. The `balancing_strategy` interface stamps a `preferred_device_id` on each split (which the task creator honors); `round_robin_strategy` hands out GPUs via an atomic cursor and is the default.
 
 **Code path:**
 - `src/scan_manager/load_balancing_scan_batch_coalescer.cpp` — per-pipeline slots, sequencer loop, coalesce + place + push

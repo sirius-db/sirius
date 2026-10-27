@@ -82,10 +82,10 @@ TEST_CASE("replay admission checks transactions cancellation and nonrollbackable
         late_failure_condition::not_read_only);
   CHECK(admit_cpu_replay(ctx, true, transaction ^ 1, false, false).refused_by ==
         late_failure_condition::transaction_invalid);
-  ctx.interrupted = true;
+  ctx.Interrupt();
   CHECK(admit_cpu_replay(ctx, true, transaction, false, false).refused_by ==
         late_failure_condition::cancelled);
-  ctx.interrupted = false;
+  ctx.ClearInterrupt();
   CHECK(admit_cpu_replay(ctx, true, transaction, true, false).refused_by ==
         late_failure_condition::non_rollbackable);
   ctx.transaction.ActiveTransaction().transaction_validity.Invalidate(
@@ -97,8 +97,8 @@ TEST_CASE("replay admission checks transactions cancellation and nonrollbackable
   REQUIRE_FALSE(con.Query("CREATE SEQUENCE late_seq")->HasError());
   auto bound = con.Prepare("SELECT nextval('late_seq')");
   REQUIRE_FALSE(bound->HasError());
-  REQUIRE(bound->data);
-  CHECK_FALSE(bound->data->properties.IsReadOnly());
+  auto properties = bound->GetStatementProperties();
+  CHECK_FALSE(properties.IsReadOnly());
 }
 
 TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
@@ -126,7 +126,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
           explicit_entry ? "CALL gpu_execution(" + sirius::test::sql_literal(sql) + ")" : sql);
         if (result->HasError()) INFO(result->GetError());
         REQUIRE_FALSE(result->HasError());
-        CHECK(result->GetValue(0, 0).ToString() == "8128");
+        CHECK(result->Collection().GetValue(0, 0).ToString() == "8128");
         CHECK(std::chrono::steady_clock::now() - started < std::chrono::seconds(1));
         auto after = sirius::test::get_transparent_execution_stats(*con);
         auto cause = static_cast<size_t>(oom ? late_failure_cause::oom_exhausted
@@ -192,7 +192,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   auto sql = "SELECT sum(x) FROM read_parquet(" + directory.file_literal("*.parquet") + ")";
   auto cpu = con->Query(sql);
   REQUIRE_FALSE(cpu->HasError());
-  auto expected = cpu->GetValue(0, 0).ToString();
+  auto expected = cpu->Collection().GetValue(0, 0).ToString();
   run_ok("SET gpu_execution=true");
   auto previous_batch = con->Query("SELECT current_setting('scan_task_batch_size')::UBIGINT");
   REQUIRE_FALSE(previous_batch->HasError());
@@ -206,7 +206,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
       } catch (...) { /* preserve the test failure */
       }
     }
-  } restore{*con, previous_batch->GetValue(0, 0).GetValue<uint64_t>()};
+  } restore{*con, previous_batch->Collection().GetValue(0, 0).GetValue<uint64_t>()};
   run_ok("SET scan_task_batch_size=1");
   run_ok("SET sirius_test_hold_footer_index=2");
   auto state = sirius::test::get_registered_sirius_context(*con);
@@ -234,7 +234,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
       REQUIRE(published);
       if (rows->HasError()) INFO(rows->GetError());
       CHECK(rows->HasError() == !fallback);
-      if (fallback) CHECK(rows->GetValue(0, 0).ToString() == expected);
+      if (fallback) CHECK(rows->Collection().GetValue(0, 0).ToString() == expected);
       auto after = state->get_transparent_execution_stats();
       auto cause = static_cast<size_t>(late_failure_cause::physical_input);
       CHECK(after.late_failures[cause] == before.late_failures[cause] + 1);
@@ -267,7 +267,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     if (result->HasError()) INFO(result->GetError());
     REQUIRE(result->HasError() == !fallback);
     if (fallback)
-      CHECK(result->GetValue(0, 0).ToString() == "9128");
+      CHECK(result->Collection().GetValue(0, 0).ToString() == "9128");
     else
       CHECK(result->GetError().find("checkpointed after pin_table") != std::string::npos);
     auto after = sirius::test::get_transparent_execution_stats(*con);
@@ -310,11 +310,11 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   auto before      = sirius::test::get_transparent_execution_stats(*con);
   auto transparent = con->Query(query);
   REQUIRE_FALSE(transparent->HasError());
-  CHECK(transparent->GetValue(0, 0).ToString() == "8128");
+  CHECK(transparent->Collection().GetValue(0, 0).ToString() == "8128");
   auto explicit_result = con->Query("CALL gpu_execution(" + sirius::test::sql_literal(query) + ")");
   if (explicit_result->HasError()) INFO(explicit_result->GetError());
   REQUIRE_FALSE(explicit_result->HasError());
-  CHECK(explicit_result->GetValue(0, 0).ToString() == "9128");
+  CHECK(explicit_result->Collection().GetValue(0, 0).ToString() == "9128");
   auto after = sirius::test::get_transparent_execution_stats(*con);
   CHECK(after.runtime_fallbacks == before.runtime_fallbacks + 2);
   CHECK(after.late_replays[static_cast<size_t>(late_failure_cause::oom_exhausted)] ==
@@ -375,9 +375,9 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   run_ok("COPY (SELECT i::INTEGER x FROM range(128) t(i)) TO " +
          directory.file_literal("data.parquet") + " (FORMAT PARQUET)");
   // DuckDB never binds this unused CTE. The bound policy sees only the local
-  // scan; R1's retained SQL-text veto still conservatively forbids replay.
+  // scan; the SQL-text S3 veto still conservatively forbids replay.
   auto sql =
-    "WITH unused AS (SELECT * FROM read_parquet('s3://r2a-unread/file.parquet')) "
+    "WITH unused AS (SELECT * FROM read_parquet('s3://unread-source/file.parquet')) "
     "SELECT sum(x) FROM read_parquet(" +
     directory.file_literal("data.parquet") + ")";
   run_ok("SET gpu_execution=true");
@@ -415,6 +415,10 @@ TEST_CASE("late failure classification uses exception types rather than message 
   CHECK(classify_failure(io, late_failure_cause::gpu_error).cause == late_failure_cause::reader_io);
   auto credentials = std::make_exception_ptr(sirius::io::credential_error("signing failed"));
   CHECK(classify_failure(credentials, late_failure_cause::gpu_error).cause ==
+        late_failure_cause::reader_io);
+  auto descriptor =
+    std::make_exception_ptr(sirius::io::descriptor_mismatch_error("descriptor mismatch"));
+  CHECK(classify_failure(descriptor, late_failure_cause::gpu_error).cause ==
         late_failure_cause::reader_io);
   auto text_only = std::make_exception_ptr(
     std::runtime_error("OOM physical input checkpoint certificate reader failed"));

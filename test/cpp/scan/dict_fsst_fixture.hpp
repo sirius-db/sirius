@@ -34,8 +34,8 @@
 
 namespace sirius::test::dict_fsst {
 
-inline duckdb::unique_ptr<duckdb::MaterializedQueryResult> query(duckdb::Connection& con,
-                                                                 std::string const& sql)
+inline duckdb::unique_ptr<duckdb::QueryResult> query(duckdb::Connection& con,
+                                                     std::string const& sql)
 {
   auto result = con.Query(sql);
   if (!result || result->HasError()) {
@@ -154,40 +154,42 @@ class fixture {
     int64_t previous_group = -1;
     uint64_t group_start   = 0;
     uint64_t next_start    = 0;
-    for (duckdb::idx_t i = 0; i < info->RowCount(); ++i) {
-      auto const codec = info->GetValue(4, i).ToString();
+    auto info_rows         = info->Collection().GetRows();
+    auto validity_rows     = validity->Collection().GetRows();
+    for (duckdb::idx_t i = 0; i < info_rows.size(); ++i) {
+      auto const codec = info_rows.GetValue(4, i).ToString();
       if (codec != "DICT_FSST") { throw std::runtime_error("fixture codec is " + codec); }
-      auto const block  = info->GetValue(2, i).GetValue<int64_t>();
-      auto const offset = info->GetValue(3, i).GetValue<uint32_t>();
+      auto const block  = info_rows.GetValue(2, i).GetValue<int64_t>();
+      auto const offset = info_rows.GetValue(3, i).GetValue<uint32_t>();
       if (block < 0 || offset + 16 > manager.GetBlockSize()) {
         throw std::runtime_error("fixture segment is not persisted");
       }
       auto handle = manager.RegisterBlock(block);
       auto pin    = buffers.Pin(handle);
       segment seg{};
-      auto group = info->GetValue(5, i).GetValue<int64_t>();
+      auto group = info_rows.GetValue(5, i).GetValue<int64_t>();
       if (group != previous_group) {
         group_start    = next_start;
         previous_group = group;
       }
-      seg.start  = group_start + info->GetValue(0, i).GetValue<uint64_t>();
-      seg.rows   = info->GetValue(1, i).GetValue<uint32_t>();
+      seg.start  = group_start + info_rows.GetValue(0, i).GetValue<uint64_t>();
+      seg.rows   = info_rows.GetValue(1, i).GetValue<uint32_t>();
       next_start = seg.start + seg.rows;
       // CONSTANT all-NULL validity is staged as zero bits by the native decoder.
       // EMPTY validity instead leaves nullness to the DICT_FSST inline indices.
-      auto local_start = info->GetValue(0, i).GetValue<uint64_t>();
-      for (duckdb::idx_t v = 0; v < validity->RowCount(); ++v) {
-        if (validity->GetValue(0, v).GetValue<int64_t>() != group) { continue; }
-        auto begin = validity->GetValue(1, v).GetValue<uint64_t>();
-        auto end   = begin + validity->GetValue(2, v).GetValue<uint64_t>();
+      auto local_start = info_rows.GetValue(0, i).GetValue<uint64_t>();
+      for (duckdb::idx_t v = 0; v < validity_rows.size(); ++v) {
+        if (validity_rows.GetValue(0, v).GetValue<int64_t>() != group) { continue; }
+        auto begin = validity_rows.GetValue(1, v).GetValue<uint64_t>();
+        auto end   = begin + validity_rows.GetValue(2, v).GetValue<uint64_t>();
         if (begin <= local_start && end >= local_start + seg.rows) {
-          auto codec = validity->GetValue(3, v).ToString();
+          auto codec = validity_rows.GetValue(3, v).ToString();
           if (codec != "Constant" && codec != "Empty Validity") {
             throw std::runtime_error("fixture validity codec is " + codec);
           }
           seg.all_null_validity =
             codec == "Constant" &&
-            validity->GetValue(4, v).ToString().find("Has No Null: false") != std::string::npos;
+            validity_rows.GetValue(4, v).ToString().find("Has No Null: false") != std::string::npos;
           break;
         }
       }
@@ -211,8 +213,8 @@ class fixture {
     query(con, "SET SESSION gpu_execution = false");
     auto rows = query(con, "SELECT s FROM t ORDER BY rowid");
     std::vector<std::optional<std::string>> result;
-    for (duckdb::idx_t i = 0; i < rows->RowCount(); ++i) {
-      auto value = rows->GetValue(0, i);
+    for (auto const& row : rows->Collection().Rows()) {
+      auto value = row.GetValue(0);
       result.push_back(value.IsNull() ? std::nullopt
                                       : std::optional<std::string>(value.ToString()));
     }

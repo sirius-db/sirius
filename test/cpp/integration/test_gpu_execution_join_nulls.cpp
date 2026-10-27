@@ -214,3 +214,22 @@ TEST_CASE_METHOD(JoinNullFixture,
   compare_gpu_vs_cpu("SELECT count(*) FROM " + lhs + " l " + join_type + " JOIN " + rhs +
                      " r ON l.k = r.k AND l.v <> r.v");
 }
+
+TEST_CASE_METHOD(JoinNullFixture,
+                 "gpu_execution inner join keeps residual columns until filtering",
+                 "[integration][gpu_execution][join][join_residual]")
+{
+  // The OR uses both inputs; its columns are absent from the projected result.
+  auto const key = GENERATE("l.k = r.k", "CAST(l.k AS SMALLINT) = CAST(r.k AS SMALLINT)");
+  compare_gpu_vs_cpu(std::string("SELECT r.k AS rk, l.k AS lk FROM l JOIN r ON ") + key +
+                     " AND (l.id < r.id OR l.id + r.id > 8)");
+}
+TEST_CASE_METHOD(JoinNullFixture,
+                 "gpu_execution tuple join keys fall back during planning",
+                 "[integration][gpu_execution][join][tuple]")
+{
+  run_ok("CREATE TABLE tuple_l AS SELECT row(id, k) AS k FROM l");
+  run_ok("CREATE TABLE tuple_r AS SELECT row(id, k) AS k FROM r");
+  run_ok("CHECKPOINT");
+  expect_plan_fallback_matches_cpu("SELECT count(*) FROM tuple_l l JOIN tuple_r r ON l.k = r.k");
+}

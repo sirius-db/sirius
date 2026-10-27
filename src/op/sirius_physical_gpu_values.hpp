@@ -142,7 +142,7 @@ class sirius_physical_gpu_values : public sirius_physical_operator {
    * is built and before the source's ColumnDataCollection is moved out. HUGEINT/UHUGEINT
    * are 16 bytes in DuckDB but map to 8-byte cuDF types (silent value
    * corruption); sub-int32 decimals and nested types have no cuDF-compatible
-   * layout (get_cudf_type would throw inside the row-copy loop, failing the
+   * layout (conversion would fail inside the row-copy loop, failing the
    * query mid-flight instead of falling back).
    */
   static void throw_if_unsupported_types(const duckdb::vector<sirius::logical_type>& types);

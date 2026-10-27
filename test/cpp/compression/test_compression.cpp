@@ -16,7 +16,7 @@
 
 // Tests for the Phase 2 cached-table compression infrastructure:
 //
-//  [compression][plan_register]  — plan_register unit tests (no GPU required)
+//  [compression][plan_utils]  — plan utility unit tests (no GPU required)
 //  [compression][pin_table]      — end-to-end SQL tests (GPU required):
 //    * compressed pin → cached scan result equality vs. uncompressed pin
 //    * column-subset projection correctness
@@ -24,88 +24,17 @@
 //    * fallback when no plan / chunk below threshold
 
 #include <catch.hpp>
-#include <compression/plan_register.hpp>
+#include <compression/plan_utils.hpp>
 #include <utils/log_test_utils.hpp>
 
 // standard library
 #include <string>
 #include <vector>
 
-// ─── plan_register unit tests (no GPU required) ─────────────────────────────
-
-TEST_CASE("plan_register - global singleton is the same object", "[compression][plan_register]")
-{
-  auto& a = sirius::compression::plan_register::global();
-  auto& b = sirius::compression::plan_register::global();
-  REQUIRE(&a == &b);
-}
-
-TEST_CASE("plan_register - table plan round-trips correctly", "[compression][plan_register]")
-{
-  auto& reg = sirius::compression::plan_register::global();
-  reg.clear_all();
-
-  REQUIRE_FALSE(reg.resolve_table_plan("lineitem").has_value());
-
-  const std::string dsl = "identity\n---\nidentity\n---\nidentity";
-  reg.set_table_plan("lineitem", dsl);
-  auto result = reg.resolve_table_plan("lineitem");
-  REQUIRE(result.has_value());
-  REQUIRE(result.value() == dsl);
-
-  reg.clear_table_plan("lineitem");
-  REQUIRE_FALSE(reg.resolve_table_plan("lineitem").has_value());
-
-  reg.clear_all();
-}
-
-TEST_CASE("plan_register - table plans are independent per table", "[compression][plan_register]")
-{
-  auto& reg = sirius::compression::plan_register::global();
-  reg.clear_all();
-
-  reg.set_table_plan("orders", "lz4");
-  reg.set_table_plan("lineitem", "zstd");
-
-  REQUIRE(reg.resolve_table_plan("orders").value() == "lz4");
-  REQUIRE(reg.resolve_table_plan("lineitem").value() == "zstd");
-  REQUIRE_FALSE(reg.resolve_table_plan("customer").has_value());
-
-  reg.clear_all();
-}
-
-TEST_CASE("plan_register - clear_all removes both table and column plans",
-          "[compression][plan_register]")
-{
-  auto& reg = sirius::compression::plan_register::global();
-  reg.clear_all();
-
-  reg.set_table_plan("t", "identity");
-  reg.set_plan("t", "col_a", "lz4");
-
-  reg.clear_all();
-
-  REQUIRE_FALSE(reg.resolve_table_plan("t").has_value());
-
-  reg.clear_all();
-}
-
-TEST_CASE("plan_register - per-column plans are independent from table plans",
-          "[compression][plan_register]")
-{
-  auto& reg = sirius::compression::plan_register::global();
-  reg.clear_all();
-
-  // Setting a per-column plan does not create a table-level entry
-  reg.set_plan("t", "col_a", "lz4");
-  REQUIRE_FALSE(reg.resolve_table_plan("t").has_value());
-
-  reg.clear_plan("t", "col_a");
-  reg.clear_all();
-}
+// ─── Plan utility unit tests (no GPU required) ─────────────────────────────
 
 TEST_CASE("select_plan_blocks - picks blocks by full-table index in pinned order",
-          "[compression][plan_register]")
+          "[compression][plan_utils]")
 {
   using sirius::compression::select_plan_blocks;
   // Four full-table columns, one block each. select_plan_blocks re-joins the
@@ -246,8 +175,7 @@ comp_env_paths make_comp_env(const std::string& tag, std::size_t scan_batch_byte
 
 // Assert that a completed query @p res succeeded, attaching the DuckDB error to
 // the failing assertion on error.
-void require_ok(const duckdb::unique_ptr<duckdb::MaterializedQueryResult>& res,
-                const std::string& what)
+void require_ok(const duckdb::unique_ptr<duckdb::QueryResult>& res, const std::string& what)
 {
   REQUIRE(res);
   if (res->HasError()) { UNSCOPED_INFO(what << " error: " << res->GetError()); }
@@ -256,9 +184,9 @@ void require_ok(const duckdb::unique_ptr<duckdb::MaterializedQueryResult>& res,
 
 // Run @p sql on @p con, assert it succeeded, and return the result for
 // inspection.
-duckdb::unique_ptr<duckdb::MaterializedQueryResult> run_ok(duckdb::Connection& con,
-                                                           const std::string& sql,
-                                                           const std::string& what)
+duckdb::unique_ptr<duckdb::QueryResult> run_ok(duckdb::Connection& con,
+                                               const std::string& sql,
+                                               const std::string& what)
 {
   auto res = con.Query(sql);
   require_ok(res, what);
@@ -332,8 +260,8 @@ TEST_CASE("pin_table compression - result equality vs uncompressed pin",
   auto sum_comp                = con.Query("CALL gpu_execution(\"" + select_sql + "\");");
   require_ok(sum_comp, "select");
   REQUIRE(sum_comp->RowCount() == 1);
-  REQUIRE(sum_comp->GetValue(0, 0) == duckdb::Value::BIGINT(49995000LL));
-  REQUIRE(sum_comp->GetValue(1, 0) == duckdb::Value::BIGINT(149985000LL));
+  REQUIRE(sum_comp->Collection().GetValue(0, 0) == duckdb::Value::BIGINT(49995000LL));
+  REQUIRE(sum_comp->Collection().GetValue(1, 0) == duckdb::Value::BIGINT(149985000LL));
 
   run_ok(con, "CALL unpin_table('t_comp');", "unpin");
 
@@ -444,8 +372,8 @@ TEST_CASE("pin_table compression - device tier result equality vs uncompressed p
   auto sum_comp                = con.Query("CALL gpu_execution(\"" + select_sql + "\");");
   require_ok(sum_comp, "select");
   REQUIRE(sum_comp->RowCount() == 1);
-  REQUIRE(sum_comp->GetValue(0, 0) == duckdb::Value::BIGINT(49995000LL));
-  REQUIRE(sum_comp->GetValue(1, 0) == duckdb::Value::BIGINT(149985000LL));
+  REQUIRE(sum_comp->Collection().GetValue(0, 0) == duckdb::Value::BIGINT(49995000LL));
+  REQUIRE(sum_comp->Collection().GetValue(1, 0) == duckdb::Value::BIGINT(149985000LL));
 
   run_ok(con, "CALL unpin_table('t_comp_dev');", "unpin");
 
@@ -486,7 +414,7 @@ TEST_CASE("pin_table compression - device tier column-subset projection correctn
   auto res                     = con.Query("CALL gpu_execution(\"" + select_sql + "\");");
   require_ok(res, "select");
   REQUIRE(res->RowCount() == 1);
-  REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(24995000LL));
+  REQUIRE(res->Collection().GetValue(0, 0) == duckdb::Value::BIGINT(24995000LL));
 
   run_ok(con, "CALL unpin_table('t_proj_dev');", "unpin");
 
@@ -550,7 +478,7 @@ TEST_CASE("pin_table compression - dictionary predicate pushdown preserves resul
                       "') WHERE s = 'DELIVER IN PERSON'\");");
   require_ok(eq, "equality pushdown");
   REQUIRE(eq->RowCount() == 1);
-  REQUIRE(eq->GetValue(0, 0) == duckdb::Value::BIGINT(6245000LL));
+  REQUIRE(eq->Collection().GetValue(0, 0) == duckdb::Value::BIGINT(6245000LL));
 
   // IN over two keys exercises the multi-value LUT: range % 4 in {0, 2} →
   // SUM(v) = 2 * ((0+4+...+4996) + (2+6+...+4998)) = 2 * (3122500 + 3125000).
@@ -558,7 +486,7 @@ TEST_CASE("pin_table compression - dictionary predicate pushdown preserves resul
                           "') WHERE s IN ('DELIVER IN PERSON', 'NONE')\");");
   require_ok(in_res, "in pushdown");
   REQUIRE(in_res->RowCount() == 1);
-  REQUIRE(in_res->GetValue(0, 0) == duckdb::Value::BIGINT(12495000LL));
+  REQUIRE(in_res->Collection().GetValue(0, 0) == duckdb::Value::BIGINT(12495000LL));
 
   // A *projected* dictionary column must not be substituted — the mask would
   // replace the very values the query selects.
@@ -566,15 +494,15 @@ TEST_CASE("pin_table compression - dictionary predicate pushdown preserves resul
                         "') WHERE s = 'DELIVER IN PERSON'\");");
   require_ok(proj, "projected dictionary column");
   REQUIRE(proj->RowCount() == 1);
-  REQUIRE(proj->GetValue(0, 0) == duckdb::Value::BIGINT(1250LL));
-  REQUIRE(proj->GetValue(1, 0).ToString() == "DELIVER IN PERSON");
+  REQUIRE(proj->Collection().GetValue(0, 0) == duckdb::Value::BIGINT(1250LL));
+  REQUIRE(proj->Collection().GetValue(1, 0).ToString() == "DELIVER IN PERSON");
 
   // A non-equality filter is not a candidate and must still evaluate normally.
   auto ne = con.Query("CALL gpu_execution(\"SELECT COUNT(*) FROM read_parquet('" + glob +
                       "') WHERE s <> 'DELIVER IN PERSON'\");");
   require_ok(ne, "inequality falls back");
   REQUIRE(ne->RowCount() == 1);
-  REQUIRE(ne->GetValue(0, 0) == duckdb::Value::BIGINT(3750LL));
+  REQUIRE(ne->Collection().GetValue(0, 0) == duckdb::Value::BIGINT(3750LL));
 
   run_ok(con, "CALL unpin_table('t_dictpred');", "unpin dictpred");
 
@@ -624,7 +552,7 @@ TEST_CASE("pin_table compression - predicate pushdown mixes substituted and deco
                        "') WHERE s = 'DELIVER IN PERSON' AND m = 'AIR'\");");
   require_ok(res, "mixed substitution");
   REQUIRE(res->RowCount() == 1);
-  REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(2081664LL));
+  REQUIRE(res->Collection().GetValue(0, 0) == duckdb::Value::BIGINT(2081664LL));
 
   run_ok(con, "CALL unpin_table('t_dictpred_mix');", "unpin mixed");
 
@@ -667,7 +595,7 @@ TEST_CASE("pin_table compression - predicate pushdown declines a non-dictionary 
                        "') WHERE s = 'AIR'\");");
   require_ok(res, "str_split fallback");
   REQUIRE(res->RowCount() == 1);
-  REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(6245000LL));
+  REQUIRE(res->Collection().GetValue(0, 0) == duckdb::Value::BIGINT(6245000LL));
 
   run_ok(con, "CALL unpin_table('t_dictpred_fb');", "unpin fallback");
 
@@ -718,14 +646,16 @@ TEST_CASE("pin_table compression - decode-time pure-filter column omission prese
   run_ok(con, "SET pin_table_compression_max_compressed_fraction = 1.5;", "set fraction");
 
   auto plan_dir = tmp / "plans";
-  write_plan_file(plan_dir,
-                  "t_dropfilter",
-                  bitpack_plan(3) +
-                    "---\ninput -> dictionary -> keys_offsets, keys_chars, indices\n"
-                    "dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
-                    "---\ninput -> dictionary -> keys_offsets, keys_chars, indices, null_mask\n"
-                    "dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
-                    "dictionary.null_mask -> identity\n");
+  write_plan_file(
+    plan_dir,
+    "t_dropfilter",
+    bitpack_plan(3) +
+      "---\ninput -> dictionary -> keys_offsets, keys_chars, indices\n"
+      "dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
+      // Validity travels beside the encoded column (plan/validity.cpp), so a
+      // nullable column's plan names no null_mask channel.
+      "---\ninput -> dictionary -> keys_offsets, keys_chars, indices\n"
+      "dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n");
   run_ok(
     con, "SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';", "set plan_dir");
 
@@ -812,7 +742,7 @@ TEST_CASE("pin_table compression - column-subset projection correctness",
   auto res                     = con.Query("CALL gpu_execution(\"" + select_sql + "\");");
   require_ok(res, "select");
   REQUIRE(res->RowCount() == 1);
-  REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(24995000LL));
+  REQUIRE(res->Collection().GetValue(0, 0) == duckdb::Value::BIGINT(24995000LL));
 
   run_ok(con, "CALL unpin_table('t_proj');", "unpin");
 
@@ -862,8 +792,8 @@ TEST_CASE("pin_table compression - pinned column subset selects matching plan bl
   auto res                     = con.Query("CALL gpu_execution(\"" + select_sql + "\");");
   require_ok(res, "select");
   REQUIRE(res->RowCount() == 1);
-  REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(37492500LL));
-  REQUIRE(res->GetValue(1, 0) == duckdb::Value::BIGINT(12497500LL));
+  REQUIRE(res->Collection().GetValue(0, 0) == duckdb::Value::BIGINT(37492500LL));
+  REQUIRE(res->Collection().GetValue(1, 0) == duckdb::Value::BIGINT(12497500LL));
 
   run_ok(con, "CALL unpin_table('t_sub');", "unpin");
 
@@ -908,9 +838,9 @@ TEST_CASE("pin_table compression - decimal columns round-trip with scale restore
   auto res                     = con.Query("CALL gpu_execution(\"" + select_sql + "\");");
   require_ok(res, "select");
   REQUIRE(res->RowCount() == 1);
-  REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(12497500LL));
+  REQUIRE(res->Collection().GetValue(0, 0) == duckdb::Value::BIGINT(12497500LL));
   // The decimal sum must come back with the correct scale (61875.00, not 6187500).
-  REQUIRE(res->GetValue(1, 0).ToString() == "61875.00");
+  REQUIRE(res->Collection().GetValue(1, 0).ToString() == "61875.00");
 
   run_ok(con, "CALL unpin_table('t_dec');", "unpin");
 
@@ -928,6 +858,22 @@ TEST_CASE("pin_table compression - fallback when no plan file for table",
   // SUM(k) = 0+1+...+999 = 999*1000/2 = 499500
   auto plan_dir = tmp / "plans";
   fs::create_directories(plan_dir);
+  SECTION("no matching plan") {}
+  SECTION("missing directory") { fs::remove(plan_dir); }
+  SECTION("plan directory is a regular file")
+  {
+    fs::remove(plan_dir);
+    std::ofstream{plan_dir} << "not a directory";
+  }
+  SECTION("empty matching file") { write_plan_file(plan_dir, "t_noplan", ""); }
+  SECTION("matching file status fails")
+  {
+    fs::create_symlink("t_noplan.txt", plan_dir / "t_noplan.txt");
+  }
+  SECTION("unrelated file status fails")
+  {
+    fs::create_symlink("other.txt", plan_dir / "other.txt");
+  }
 
   sirius::test::mgpu::generate_parquet_surface(tmp, "SELECT range AS k FROM range(1000)", 1);
 
@@ -942,15 +888,70 @@ TEST_CASE("pin_table compression - fallback when no plan file for table",
 
   auto pin = con.Query("CALL pin_table('" + glob + "', tier='host', name='t_noplan');");
   require_ok(pin, "pin");
+  REQUIRE(sirius::test::census_entry(con, "t_noplan").compressed_chunks == 0);
 
   // Must still scan correctly via fallback raw host rep
   const std::string select_sql = "SELECT SUM(k) FROM read_parquet('" + glob + "')";
   auto res                     = con.Query("CALL gpu_execution(\"" + select_sql + "\");");
   require_ok(res, "select");
-  REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(499500LL));
+  REQUIRE(res->Collection().GetValue(0, 0) == duckdb::Value::BIGINT(499500LL));
 
   run_ok(con, "CALL unpin_table('t_noplan');", "unpin");
 
+  fs::remove_all(tmp);
+}
+
+TEST_CASE("pin_table compression - skips unusable plans and tries another matching file",
+          "[compression][pin_table][isolated_context]")
+{
+  if (no_gpu()) return;
+  auto [tmp, yaml_path] = make_comp_env("retryplan");
+  auto plan_dir         = tmp / "plans";
+  fs::create_directories(plan_dir);
+  std::ofstream{plan_dir / "t_retry.first"};
+  std::ofstream{plan_dir / "t_retry.second"};
+  // Inspect this filesystem's enumeration order rather than assuming filenames are sorted.
+  // Changing file contents/permissions below leaves the directory entries in place.
+  std::vector<fs::path> candidates;
+  for (auto const& entry : fs::directory_iterator(plan_dir))
+    candidates.push_back(entry.path());
+  REQUIRE(candidates.size() == 2);
+  std::ofstream{candidates[1]} << bitpack_plan(1);
+  std::string expected_warning;
+  SECTION("empty first candidate") { expected_warning = "is empty"; }
+  SECTION("unreadable first candidate")
+  {
+    if (::geteuid() == 0) SKIP("Permission-denied fixture requires a non-root process");
+    fs::permissions(candidates[0], fs::perms::none);
+    REQUIRE_FALSE(std::ifstream{candidates[0]}.is_open());
+    expected_warning = "cannot open plan file";
+  }
+
+  sirius::test::mgpu::generate_parquet_surface(
+    tmp, "SELECT (range % 1024)::BIGINT AS k FROM range(20000)", 1);
+  sirius::test::mgpu::scoped_mgpu_env env(yaml_path);
+  auto con  = env.make_connection();
+  auto glob = sirius::test::mgpu::parquet_glob(tmp);
+  run_ok(con, "SET pin_table_compression=true", "enable compression");
+  run_ok(con, "SET pin_table_compression_min_batch_size_bytes=0", "disable size threshold");
+  run_ok(con, "SET pin_table_input_compression_plan_dir='" + plan_dir.string() + "'", "plan dir");
+  {
+    sirius::test::scoped_recording_log_sink logs{"warn"};
+    run_ok(con, "CALL pin_table('" + glob + "', tier='host', name='t_retry')", "pin");
+    bool warned = false;
+    for (auto const& record : logs.records()) {
+      if (record.message.find(candidates[0].string()) != std::string::npos &&
+          record.message.find(expected_warning) != std::string::npos)
+        warned = true;
+    }
+    REQUIRE(warned);
+  }
+  REQUIRE(sirius::test::census_entry(con, "t_retry").compressed_chunks > 0);
+  auto result = run_ok(con,
+                       "CALL gpu_execution(\"SELECT COUNT(*) FROM read_parquet('" + glob + "')\")",
+                       "scan compressed pin");
+  REQUIRE(result->Collection().GetValue(0, 0) == duckdb::Value::BIGINT(20000));
+  run_ok(con, "CALL unpin_table('t_retry')", "unpin");
   fs::remove_all(tmp);
 }
 
@@ -987,7 +988,7 @@ TEST_CASE("pin_table compression - fallback when batch is below min_batch_size_b
   const std::string select_sql = "SELECT SUM(k) FROM read_parquet('" + glob + "')";
   auto res                     = con.Query("CALL gpu_execution(\"" + select_sql + "\");");
   require_ok(res, "select");
-  REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(4950LL));
+  REQUIRE(res->Collection().GetValue(0, 0) == duckdb::Value::BIGINT(4950LL));
 
   run_ok(con, "CALL unpin_table('t_threshold');", "unpin");
 
@@ -1029,7 +1030,7 @@ TEST_CASE("pin_table compression - fallback when compression saves too little",
   const std::string select_sql = "SELECT SUM(k) FROM read_parquet('" + glob + "')";
   auto res                     = con.Query("CALL gpu_execution(\"" + select_sql + "\");");
   require_ok(res, "select");
-  REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(499500LL));
+  REQUIRE(res->Collection().GetValue(0, 0) == duckdb::Value::BIGINT(499500LL));
 
   run_ok(con, "CALL unpin_table('t_ratio');", "unpin");
 
@@ -1110,7 +1111,7 @@ TEST_CASE("pin_table compression - single-op sweep over all INT64 operators",
     auto res = con.Query("CALL gpu_execution(\"" + select_sql + "\");");
     require_ok(res, std::string("select:") + tc.tag);
     REQUIRE(res->RowCount() == 1);
-    REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(12497500LL));
+    REQUIRE(res->Collection().GetValue(0, 0) == duckdb::Value::BIGINT(12497500LL));
 
     run_ok(con, "CALL unpin_table('" + tname + "');", std::string("unpin:") + tc.tag);
   }
@@ -1211,7 +1212,7 @@ TEST_CASE("pin_table compression - single-op sweep over narrowed carriers",
         auto res = con.Query("CALL gpu_execution(\"" + select_sql + "\");");
         require_ok(res, std::string("select:") + tc.tag);
         REQUIRE(res->RowCount() == 1);
-        REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(cc.sum));
+        REQUIRE(res->Collection().GetValue(0, 0) == duckdb::Value::BIGINT(cc.sum));
 
         run_ok(con, "CALL unpin_table('" + tname + "');", std::string("unpin:") + tc.tag);
       }
@@ -1264,8 +1265,8 @@ TEST_CASE("pin_table compression - a native SMALLINT column compresses",
     con.Query("CALL gpu_execution(\"SELECT COUNT(*), SUM(k) FROM read_parquet('" + glob + "')\");");
   require_ok(res, "select smallint");
   REQUIRE(res->RowCount() == 1);
-  REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(10000LL));
-  REQUIRE(res->GetValue(1, 0) == duckdb::Value::BIGINT(4995000LL));
+  REQUIRE(res->Collection().GetValue(0, 0) == duckdb::Value::BIGINT(10000LL));
+  REQUIRE(res->Collection().GetValue(1, 0) == duckdb::Value::BIGINT(4995000LL));
 
   run_ok(con, "CALL unpin_table('t_smallint');", "unpin smallint");
   fs::remove_all(tmp);
@@ -1307,8 +1308,8 @@ TEST_CASE("pin_table compression - single-op sweep over float operators (ALP / A
   auto res                     = con.Query("CALL gpu_execution(\"" + select_sql + "\");");
   require_ok(res, "select float");
   REQUIRE(res->RowCount() == 1);
-  REQUIRE(res->GetValue(0, 0) == duckdb::Value::DOUBLE(12497500.0));
-  REQUIRE(res->GetValue(1, 0) == duckdb::Value::FLOAT(12497500.0f));
+  REQUIRE(res->Collection().GetValue(0, 0) == duckdb::Value::DOUBLE(12497500.0));
+  REQUIRE(res->Collection().GetValue(1, 0) == duckdb::Value::FLOAT(12497500.0f));
 
   run_ok(con, "CALL unpin_table('t_sw_float');", "unpin float");
 
@@ -1347,8 +1348,8 @@ TEST_CASE("pin_table compression - single-op sweep over string operators (dictio
   auto res                     = con.Query("CALL gpu_execution(\"" + select_sql + "\");");
   require_ok(res, "select dict");
   REQUIRE(res->RowCount() == 1);
-  REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(5000LL));
-  REQUIRE(res->GetValue(1, 0).ToString() == "0000004999");
+  REQUIRE(res->Collection().GetValue(0, 0) == duckdb::Value::BIGINT(5000LL));
+  REQUIRE(res->Collection().GetValue(1, 0).ToString() == "0000004999");
 
   run_ok(con, "CALL unpin_table('t_sw_dict');", "unpin dict");
 
@@ -1403,7 +1404,7 @@ TEST_CASE("pin_table compression - fused delta->rle->bitpack with bitcomp entrop
   auto res                     = con.Query("CALL gpu_execution(\"" + select_sql + "\");");
   require_ok(res, "select");
   REQUIRE(res->RowCount() == 1);
-  REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(12497500LL));
+  REQUIRE(res->Collection().GetValue(0, 0) == duckdb::Value::BIGINT(12497500LL));
 
   run_ok(con, "CALL unpin_table('t_fused_bitcomp');", "unpin");
 
@@ -1445,7 +1446,7 @@ TEST_CASE("pin_table compression - fused delta->rle->bitpack with ANS entropy ta
   auto res                     = con.Query("CALL gpu_execution(\"" + select_sql + "\");");
   require_ok(res, "select");
   REQUIRE(res->RowCount() == 1);
-  REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(12497500LL));
+  REQUIRE(res->Collection().GetValue(0, 0) == duckdb::Value::BIGINT(12497500LL));
 
   run_ok(con, "CALL unpin_table('t_fused_ans');", "unpin");
 
@@ -1502,8 +1503,8 @@ TEST_CASE("pin_table compression - str_split cascade (snappy chars, delta->rle->
   auto res                     = con.Query("CALL gpu_execution(\"" + select_sql + "\");");
   require_ok(res, "select");
   REQUIRE(res->RowCount() == 1);
-  REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(5000LL));
-  REQUIRE(res->GetValue(1, 0).ToString() == "0000004999");
+  REQUIRE(res->Collection().GetValue(0, 0) == duckdb::Value::BIGINT(5000LL));
+  REQUIRE(res->Collection().GetValue(1, 0).ToString() == "0000004999");
 
   run_ok(con, "CALL unpin_table('t_strsplit');", "unpin");
 
@@ -1582,9 +1583,9 @@ TEST_CASE("pin_table compression - narrowing stacks with compression (decompress
   auto res = con.Query("CALL gpu_execution(\"" + select_sql + "\");");
   require_ok(res, "select");
   REQUIRE(res->RowCount() == 1);
-  REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(1000LL));
-  REQUIRE(res->GetValue(1, 0) == duckdb::Value::BIGINT(10LL));
-  REQUIRE(res->GetValue(2, 0) == duckdb::Value::BIGINT(10LL));
+  REQUIRE(res->Collection().GetValue(0, 0) == duckdb::Value::BIGINT(1000LL));
+  REQUIRE(res->Collection().GetValue(1, 0) == duckdb::Value::BIGINT(10LL));
+  REQUIRE(res->Collection().GetValue(2, 0) == duckdb::Value::BIGINT(10LL));
   auto const after = sirius::test::get_compressed_materialization_stats(con);
   REQUIRE(after.scan_sidecars_installed > before.scan_sidecars_installed);
   REQUIRE(after.scan_columns_narrowed == before.scan_columns_narrowed);
@@ -1641,7 +1642,7 @@ TEST_CASE("pin_table compression - compression without narrowing stores native c
     glob + "') GROUP BY k)";
   auto res = con.Query("CALL gpu_execution(\"" + select_sql + "\");");
   require_ok(res, "select compression-only");
-  REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(1000LL));
+  REQUIRE(res->Collection().GetValue(0, 0) == duckdb::Value::BIGINT(1000LL));
   auto const after = sirius::test::get_compressed_materialization_stats(con);
   REQUIRE(after.scan_sidecars_installed == before.scan_sidecars_installed);
   REQUIRE(after.scan_columns_narrowed == before.scan_columns_narrowed);
@@ -1700,9 +1701,9 @@ TEST_CASE("pin_table compression - narrowing stacks on the GPU tier and tier pol
                "FROM read_parquet('" +
       glob + "') GROUP BY k)\");");
     require_ok(res, "narrow-kept select");
-    REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(1000LL));
-    REQUIRE(res->GetValue(1, 0) == duckdb::Value::BIGINT(10LL));
-    REQUIRE(res->GetValue(2, 0) == duckdb::Value::BIGINT(10LL));
+    REQUIRE(res->Collection().GetValue(0, 0) == duckdb::Value::BIGINT(1000LL));
+    REQUIRE(res->Collection().GetValue(1, 0) == duckdb::Value::BIGINT(10LL));
+    REQUIRE(res->Collection().GetValue(2, 0) == duckdb::Value::BIGINT(10LL));
     auto const after = sirius::test::get_compressed_materialization_stats(con);
     REQUIRE(after.scan_sidecars_installed > before.scan_sidecars_installed);
     REQUIRE(after.scan_narrow_targets_retracted == before.scan_narrow_targets_retracted);
@@ -1719,8 +1720,8 @@ TEST_CASE("pin_table compression - narrowing stacks on the GPU tier and tier pol
                          "') WHERE k < 5 ORDER BY k\");");
     require_ok(res, "retracted select");
     REQUIRE(res->RowCount() == 50);
-    REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(0LL));
-    REQUIRE(res->GetValue(0, 49) == duckdb::Value::BIGINT(4LL));
+    REQUIRE(res->Collection().GetValue(0, 0) == duckdb::Value::BIGINT(0LL));
+    REQUIRE(res->Collection().GetValue(0, 49) == duckdb::Value::BIGINT(4LL));
     auto const after = sirius::test::get_compressed_materialization_stats(con);
     REQUIRE(after.scan_sidecars_installed > before.scan_sidecars_installed);
     REQUIRE(after.scan_narrow_targets_retracted > before.scan_narrow_targets_retracted);
@@ -1738,9 +1739,9 @@ TEST_CASE("pin_table compression - narrowing stacks on the GPU tier and tier pol
                "FROM read_parquet('" +
       glob + "') GROUP BY k)\");");
     require_ok(res, "pin-on/query-off select");
-    REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(1000LL));
-    REQUIRE(res->GetValue(1, 0) == duckdb::Value::BIGINT(10LL));
-    REQUIRE(res->GetValue(2, 0) == duckdb::Value::BIGINT(10LL));
+    REQUIRE(res->Collection().GetValue(0, 0) == duckdb::Value::BIGINT(1000LL));
+    REQUIRE(res->Collection().GetValue(1, 0) == duckdb::Value::BIGINT(10LL));
+    REQUIRE(res->Collection().GetValue(2, 0) == duckdb::Value::BIGINT(10LL));
     auto const after = sirius::test::get_compressed_materialization_stats(con);
     REQUIRE(after.scan_sidecars_installed == before.scan_sidecars_installed);
     REQUIRE(after.scan_columns_narrowed == before.scan_columns_narrowed);
@@ -1834,9 +1835,9 @@ TEST_CASE("pin_table compression - heterogeneous narrow widths widen post-decode
              "FROM read_parquet('" +
     file + "') GROUP BY k)\");");
   require_ok(res, "select hetero");
-  REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(1100LL));
-  REQUIRE(res->GetValue(1, 0) == duckdb::Value::BIGINT(6LL));
-  REQUIRE(res->GetValue(2, 0) == duckdb::Value::BIGINT(21LL));
+  REQUIRE(res->Collection().GetValue(0, 0) == duckdb::Value::BIGINT(1100LL));
+  REQUIRE(res->Collection().GetValue(1, 0) == duckdb::Value::BIGINT(6LL));
+  REQUIRE(res->Collection().GetValue(2, 0) == duckdb::Value::BIGINT(21LL));
   auto const after = sirius::test::get_compressed_materialization_stats(con);
   REQUIRE(after.scan_sidecars_installed > before.scan_sidecars_installed);
   // Only the chunks stored narrower than the INT32 target widen post-decode:
@@ -1918,8 +1919,8 @@ TEST_CASE("pin_table compression - no plan file for the table pins uncompressed"
     "FROM read_parquet('" +
     glob + "') GROUP BY k)\");");
   require_ok(res, "select no-plan");
-  REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(1000LL));
-  REQUIRE(res->GetValue(1, 0) == duckdb::Value::BIGINT(10LL));
+  REQUIRE(res->Collection().GetValue(0, 0) == duckdb::Value::BIGINT(1000LL));
+  REQUIRE(res->Collection().GetValue(1, 0) == duckdb::Value::BIGINT(10LL));
 
   run_ok(con, "CALL unpin_table('t_noplan');", "unpin");
   fs::remove_all(tmp);
@@ -1973,9 +1974,9 @@ TEST_CASE("pin_table compression - width-explicit op on a narrowed column fails 
              "FROM read_parquet('" +
     glob + "') GROUP BY k)\");");
   require_ok(res, "select widthop");
-  REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(1000LL));
-  REQUIRE(res->GetValue(1, 0) == duckdb::Value::BIGINT(5LL));
-  REQUIRE(res->GetValue(2, 0) == duckdb::Value::BIGINT(5LL));
+  REQUIRE(res->Collection().GetValue(0, 0) == duckdb::Value::BIGINT(1000LL));
+  REQUIRE(res->Collection().GetValue(1, 0) == duckdb::Value::BIGINT(5LL));
+  REQUIRE(res->Collection().GetValue(2, 0) == duckdb::Value::BIGINT(5LL));
   auto const after = sirius::test::get_compressed_materialization_stats(con);
   REQUIRE(after.scan_sidecars_installed > before.scan_sidecars_installed);
   REQUIRE(after.scan_columns_restored == before.scan_columns_restored);
@@ -2057,4 +2058,76 @@ TEST_CASE("pin_table compression - device tier driver returns uniqueness verdict
 
   run_ok(con, "CALL unpin_table('t_uniqcompressed');", "unpin");
   fs::remove_all(tmp);
+}
+
+TEST_CASE("pin_table compression - nullable columns round-trip through every tier",
+          "[compression][pin_table][nullable][isolated_context]")
+{
+  if (no_gpu()) { return; }
+
+  // m: numeric with ~1/7 nulls (a real bitmask); a: all null; s: dictionary string with nulls;
+  // f: nullable DECIMAL (the stored carrier is narrowed). k has no nulls.
+  auto const surface =
+    "SELECT range::INTEGER AS k, CASE WHEN range % 7 = 0 THEN NULL ELSE range * 3 END::BIGINT AS "
+    "m, NULL::BIGINT AS a, CASE WHEN range % 5 = 0 THEN NULL ELSE CASE range % 3 WHEN 0 THEN 'x' "
+    "WHEN 1 THEN 'yy' ELSE 'zzz' END END AS s, CASE WHEN range % 11 = 0 THEN NULL ELSE (range % "
+    "997) * 1.25 END::DECIMAL(15,2) AS f FROM range(20000)";
+  auto const plan = std::string(
+    "input -> delta -> differences\n---\ninput -> delta -> differences\n---\n"
+    "input -> delta -> differences\n---\n"
+    "input -> dictionary -> keys_offsets, keys_chars, indices\n"
+    "dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
+    "---\ninput -> delta -> differences\n");
+
+  for (std::string const tier : {"host", "gpu"}) {
+    CAPTURE(tier);
+    auto const name       = "nullrt_" + tier;
+    auto [tmp, yaml_path] = make_comp_env(name);
+    sirius::test::mgpu::generate_parquet_surface(tmp, surface, 1);
+
+    sirius::test::mgpu::scoped_mgpu_env env(yaml_path);
+    auto con  = env.make_connection();
+    auto glob = sirius::test::mgpu::parquet_glob(tmp);
+
+    run_ok(con, "SET pin_table_compression = true;", "set compression");
+    run_ok(con, "SET pin_table_compression_min_batch_size_bytes = 0;", "set min_batch");
+    run_ok(con, "SET pin_table_compression_max_compressed_fraction = 1.5;", "set fraction");
+
+    auto plan_dir = tmp / "plans";
+    write_plan_file(plan_dir, "t_" + name, plan);
+    run_ok(con,
+           "SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';",
+           "set plan_dir");
+
+    require_ok(
+      con.Query("CALL pin_table('" + glob + "', tier='" + tier + "', name='t_" + name + "');"),
+      "pin nullable");
+    auto const census = sirius::test::census_entry(con, "t_" + name);
+    REQUIRE(census.chunks > 0);
+    REQUIRE(census.compressed_chunks == census.chunks);
+
+    auto const from = "FROM read_parquet('" + glob + "')";
+    for (auto const& query : std::vector<std::string>{
+           // Every value and every null position, per column.
+           "SELECT k, m, a, s, f " + from + " ORDER BY k",
+           "SELECT count(*), count(m), count(a), count(s), count(f) " + from,
+           "SELECT SUM(m), SUM(f), min(s), max(s) " + from,
+           // Null-aware predicates on the nullable columns.
+           "SELECT count(*) " + from + " WHERE m IS NULL",
+           "SELECT count(*) " + from + " WHERE a IS NOT NULL",
+           "SELECT count(*) " + from + " WHERE s = 'yy'",
+           // Null and false must stay distinct through an equality answered off the dictionary.
+           "SELECT count(*) " + from + " WHERE NOT (s = 'yy')",
+           "SELECT count(*) " + from + " WHERE s = 'yy' OR m IS NULL",
+           "SELECT count(*) " + from + " WHERE s IN ('x', 'zzz')",
+           "SELECT s, count(*) " + from + " GROUP BY s ORDER BY s",
+           // A selective filter on the clean column with nullable columns projected.
+           "SELECT m, s, f " + from + " WHERE k < 50 ORDER BY k"}) {
+      CAPTURE(query);
+      sirius::test::mgpu::require_gpu_matches_cpu(con, query, /*force_cpu_reference=*/true);
+    }
+
+    run_ok(con, "CALL unpin_table('t_" + name + "');", "unpin nullable");
+    fs::remove_all(tmp);
+  }
 }

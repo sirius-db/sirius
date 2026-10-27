@@ -54,11 +54,17 @@ struct admission_decision;
 }  // namespace sirius::scan_manager
 namespace sirius::io {
 class sirius_datasource;
-}
+class io_object_metadata;
+}  // namespace sirius::io
 
 namespace sirius::op::scan {
 class scan_info;
-struct iceberg_delete_set;
+// Adapter-owned semantic input published by the shared scan preparation path.
+// Concrete connectors extend this type; the preparation coordinator only keeps
+// the lifetime and never interprets connector-specific payloads.
+struct prepared_visibility {
+  virtual ~prepared_visibility() = default;
+};
 }  // namespace sirius::op::scan
 namespace sirius::transparent {
 class read_view_registry;
@@ -161,6 +167,7 @@ enum class verdict_reason : uint16_t {
   iceberg_schema_footers_unreadable,
   iceberg_schema_no_rows,
   iceberg_schema_no_field_ids,
+  iceberg_schema_invalid_field_id,
   iceberg_schema_missing_field,
   iceberg_schema_promoted_type,
   iceberg_schema_field_count,
@@ -193,6 +200,8 @@ enum class verdict_reason : uint16_t {
   catalog_entry_missing,
   no_trusted_reference,
   callback_mismatch,
+  iceberg_puffin_uri_unsupported,
+  iceberg_puffin_remote_eager,
   iceberg_delete_corrupt
 };
 
@@ -210,6 +219,10 @@ struct physical_check_counters {
   std::atomic<uint64_t> iceberg_manifest_walks{0};
   std::atomic<uint64_t> iceberg_dv_manifest_reads{0};
   std::atomic<uint64_t> iceberg_delete_payload_loads{0};
+  std::atomic<uint64_t> iceberg_delete_reader_io_failures{0};
+  std::atomic<uint64_t> iceberg_delete_identity_failures{0};
+  std::atomic<uint64_t> descriptor_mismatches{0};
+  std::atomic<uint64_t> iceberg_delete_corrupt_inputs{0};
   std::atomic<uint64_t> iceberg_inventory_bytes_peak{0};
 
   // Installed before a test query, cleared only after its workers have joined.
@@ -270,6 +283,7 @@ struct physical_check_counters {
     rejections{};
   std::atomic<uint64_t> type_mismatches{0};
   std::atomic<uint64_t> type_refusals{0};
+  std::atomic<uint64_t> metadata_provenance_mismatches{0};
   void record(verdict_reason reason, uint64_t mismatches = 0)
   {
     checks.fetch_add(1, std::memory_order_relaxed);
@@ -476,6 +490,8 @@ struct split_materializer_certificate {
 struct parquet_input_approval {
   std::size_t footer_bytes = 0;
   std::vector<std::size_t> row_groups;
+  std::shared_ptr<io::io_object_metadata const> metadata_owner;
+  std::string object_identity;
 };
 struct split_dependencies {
   std::shared_ptr<cudf::io::parquet::FileMetaData const> footer;
@@ -483,7 +499,7 @@ struct split_dependencies {
   std::optional<uint64_t> checkpoint_iteration;
   std::shared_ptr<physical_profile_table> profiles;
   std::shared_ptr<parquet_input_approval const> parquet_approval;
-  std::shared_ptr<iceberg_delete_set const> delete_set;
+  std::shared_ptr<prepared_visibility const> visibility;
 };
 enum class certificate_evidence_scope : uint8_t { none, binding_correspondence };
 struct eligibility_certificate {

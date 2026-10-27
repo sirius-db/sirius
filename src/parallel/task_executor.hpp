@@ -20,6 +20,7 @@
 #include "exec/config.hpp"
 #include "exec/invocable.hpp"
 #include "exec/multi_index_priority_queue.hpp"
+#include "exec/query_lifecycle_registry.hpp"
 #include "parallel/task.hpp"
 #include "query_id.hpp"
 #include "telemetry-bridge/gen/quent.hpp"
@@ -55,7 +56,8 @@ class itask_executor {
    * @param device_id GPU this executor is bound to, if any. Used to parent the
    * task-queue telemetry under that GPU's device group instead of the engine.
    */
-  explicit itask_executor(exec::thread_pool_config config,
+  explicit itask_executor(sirius::exec::query_lifecycle_registry& lifecycle,
+                          exec::thread_pool_config config,
                           std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
                           std::optional<int> device_id = std::nullopt);
 
@@ -69,8 +71,11 @@ class itask_executor {
 
   /**
    * @brief Schedule a task for execution.
+   *
+   * A no-op when the lifecycle gate reports that the task's query is tearing down: the OOM
+   * reschedule path re-enters here from a worker thread long after a drain may have passed.
    */
-  void schedule(std::unique_ptr<itask> task);
+  bool schedule(std::unique_ptr<itask> task);
 
   /**
    * @brief Start the executor: creates the thread pool and manager thread.
@@ -102,15 +107,6 @@ class itask_executor {
   void drain_leftover_tasks();
 
   /**
-   * @brief Drop the queued tasks belonging to one query.
-   *
-   * Tasks of other queries are left in place and the queue stays open, so unlike interrupt()
-   * this does not stall any other query's producers or consumers. Only queued work is affected;
-   * a task already dispatched to the thread pool runs to completion.
-   */
-  void drain_query_tasks(sirius::query_id_t query_id);
-
-  /**
    * @brief Drain in-flight tasks and restart the manager, ready for the next query.
    *
    * Stops the kiosk and interrupts the queue so the manager exits, waits for
@@ -119,20 +115,31 @@ class itask_executor {
    */
   void drain_and_wait();
 
-  /**
-   * @brief Like drain_and_wait(), but VALIDATES the queue is empty instead of
-   * draining it.
-   *
-   * Stops the kiosk and interrupts the queue so the manager exits, waits for all
-   * in-flight thread-pool tasks, then — instead of draining — checks that the
-   * task queue is empty. If it is not, logs an error and throws: a non-empty queue
-   * at query completion means tasks were still scheduled when we declared the query
-   * done. Re-enables the queue/pool and restarts the manager thread either way
-   * (the throw happens after the executor is left in a restartable state).
-   */
-  void wait_and_validate_empty();
+  /// Validate successful completion after publication settles. Never drops queued execution
+  /// tasks or waits for workers; the owner uses the lifecycle work barrier afterward.
+  void validate_query_empty(sirius::query_id_t query_id);
+
+  /// Discard this query's queued pool callables after publication settles, without waiting.
+  /// Accepted staging tasks stay queued for their manager to preserve readiness handoffs.
+  /// The owner must wait for work leases before releasing query resources.
+  void discard_query_tasks(sirius::query_id_t query_id);
 
  protected:
+  /**
+   * @brief Stop the manager thread and wait for all in-flight pool work.
+   *
+   * Releasing the manager's pool slot is a PRECONDITION for wait_all(), not an optimization:
+   * manager_loop() reserves a slot and then blocks in pop(), so an idle manager holds an active
+   * slot forever and wait_all() (which waits for active_ == 0) would never return.
+   *
+   * Used by the whole-executor drain.
+   * Production per-query retirement leaves the manager running.
+   */
+  void quiesce_manager();
+
+  /// \brief Re-arm the pool and queue and restart the manager thread after quiesce_manager().
+  void resume_manager();
+
   /**
    * @brief Main dispatch loop — must be implemented by each subclass.
    *
@@ -184,6 +191,8 @@ class itask_executor {
   /// dropped without touching another's. Keys come from pipeline::index_keys_for, the
   /// same extractor the task_scheduler's queue uses.
   exec::multi_index_priority_queue<itask> _task_queue;
+  /// Non-owning; the runtime or test fixture must outlive this executor.
+  exec::query_lifecycle_registry& _query_lifecycle;
   std::thread _manager_thread;
   std::shared_ptr<const telemetry::telemetry_context> _telemetry_context;
   quent::Handle<quent::TaskQueue> _task_queue_telemetry;

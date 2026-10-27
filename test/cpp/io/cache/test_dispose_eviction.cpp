@@ -26,15 +26,23 @@
 #include "io/sirius_datasource.hpp"
 #include "memory/topology_index.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
+#include "planner/query.hpp"
 #include "scan/test_utils.hpp"
 #include "scan_manager/config.hpp"
 #include "scan_manager/load_balancing_scan_batch_coalescer.hpp"
 #include "scan_manager/readahead_scan_manager.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
+#include "utils/log_test_utils.hpp"
+#include "utils/telemetry_utils.hpp"
 
+#include <array>
+#include <atomic>
+#include <barrier>
 #include <chrono>
+#include <exception>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <regex>
 #include <stdexcept>
 #include <string>
@@ -80,12 +88,16 @@ struct temp_data_file {
   }
 };
 
-/// Pull a counter out of `global[...]` in prefetching_cache::summary().
-std::uint64_t global_counter(std::string const& summary, std::string const& name)
+/// Pull a counter from either section of a cache report.
+std::uint64_t report_counter(std::string const& summary,
+                             std::string const& name,
+                             std::string const& section = "global")
 {
   std::smatch m;
-  auto const re = std::regex("global\\[[^\\]]*" + name + "=(\\d+)");
-  if (!std::regex_search(summary, m, re)) { return 0; }
+  auto const re = std::regex(section + "\\[[^\\]]*" + name + "=(\\d+)");
+  if (!std::regex_search(summary, m, re)) {
+    throw std::runtime_error("Missing cache counter: " + summary);
+  }
   return std::stoull(m[1].str());
 }
 
@@ -139,6 +151,33 @@ scan_manager_config dispose_on_idle_config()
   return cfg;
 }
 
+// Insert real cache activity while the scan manager emits its INFO report. This
+// exercises the old gap between that report and the baseline update, without
+// adding synchronization hooks or counter setters to the production cache.
+class read_during_summary_log final : public sirius::log::sink {
+ public:
+  read_during_summary_log(std::shared_ptr<sirius::log::sink> delegate, std::function<void()> read)
+    : delegate_(std::move(delegate)), read_(std::move(read))
+  {
+  }
+  void set_level(sirius::log::level level) override { delegate_->set_level(level); }
+  bool should_log(sirius::log::level level) const override { return delegate_->should_log(level); }
+  bool flush() override { return delegate_->flush(); }
+  void log(sirius::log::level level,
+           std::source_location const& location,
+           std::string_view message) override
+  {
+    delegate_->log(level, location, message);
+    if (message.starts_with("[sirius_scan_manager] cache summary:") && !read_done_.exchange(true))
+      read_();
+  }
+
+ private:
+  std::shared_ptr<sirius::log::sink> delegate_;
+  std::function<void()> read_;
+  std::atomic<bool> read_done_{false};
+};
+
 }  // namespace
 
 TEST_CASE("dispose_on_idle reclaims a disposed request's chunks on the next sweep",
@@ -148,7 +187,9 @@ TEST_CASE("dispose_on_idle reclaims a disposed request's chunks on the next swee
   auto memory   = initialize_memory_manager(1);
   auto topology = single_gpu_index_for_dispose();
 
-  sirius_scan_manager manager{dispose_on_idle_config(), *memory, topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+
+  sirius_scan_manager manager{scan_lifecycle, dispose_on_idle_config(), *memory, topology};
   auto* cache = manager.io_ctx()->cache();
   REQUIRE(cache != nullptr);
   REQUIRE(cache->is_armed());
@@ -190,7 +231,9 @@ TEST_CASE("dispose_on_idle keeps a chunk a live request still shares", "[cache][
   auto memory   = initialize_memory_manager(1);
   auto topology = single_gpu_index_for_dispose();
 
-  sirius_scan_manager manager{dispose_on_idle_config(), *memory, topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+
+  sirius_scan_manager manager{scan_lifecycle, dispose_on_idle_config(), *memory, topology};
   auto* cache = manager.io_ctx()->cache();
   REQUIRE(cache != nullptr);
   REQUIRE(cache->is_armed());
@@ -255,7 +298,8 @@ TEST_CASE("scan inputs populate the cache without a readahead manager",
   cfg.cache.eviction      = sirius::io::cache::eviction_policy::lru;
   cfg.max_readahead_scans = 0;
   cfg.apply_cache_mode();
-  sirius_scan_manager manager{cfg, *memory, topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, cfg, *memory, topology};
   auto* cache = manager.io_ctx()->cache();
   REQUIRE(cache != nullptr);
   REQUIRE(cache->is_armed());
@@ -275,13 +319,123 @@ TEST_CASE("scan inputs populate the cache without a readahead manager",
   REQUIRE(first_ds->host_read(0, bytes.size(), bytes.data()) == bytes.size());
   CHECK(bytes.front() == static_cast<std::uint8_t>('z'));
   INFO(cache->summary());
-  CHECK(global_counter(cache->summary(), "h2d") > 0);
+  CHECK(report_counter(cache->summary(), "h2d") > 0);
 
   first_input.reset();
   auto [second_ds, second_input] = make_input();
   REQUIRE(second_ds->host_read(0, bytes.size(), bytes.data()) == bytes.size());
   INFO(cache->summary());
-  CHECK(global_counter(cache->summary(), "hits") > 0);
+  CHECK(report_counter(cache->summary(), "hits") > 0);
+}
+
+TEST_CASE("cache refresh reports each increment once across overlapping refreshes",
+          "[cache][cache_summary]")
+{
+  temp_data_file file(8ull << 20);
+  auto memory             = initialize_memory_manager(1);
+  auto cfg                = dispose_on_idle_config();
+  cfg.cache.eviction      = sirius::io::cache::eviction_policy::lru;
+  cfg.max_readahead_scans = 0;
+  cfg.apply_cache_mode();
+  sirius::exec::query_lifecycle_registry lifecycle;
+  sirius_scan_manager manager{lifecycle, cfg, *memory, single_gpu_index_for_dispose()};
+  auto* cache = manager.io_ctx()->cache();
+  REQUIRE(cache);
+  REQUIRE(cache->is_armed());
+  auto ds = manager.create_datasource(file.path.string());
+  std::array ranges{cudf::io::text::byte_range_info{0, 4096}};
+  ds->fadvise(ranges, 0);
+  REQUIRE(ds->prepare_prefetch(false) == sirius::io::prepare_result::prepared);
+  std::vector<std::uint8_t> bytes(4096);
+  auto read = [&] {
+    if (ds->host_read(0, bytes.size(), bytes.data()) != bytes.size())
+      throw std::runtime_error("Incomplete cache read");
+  };
+  read();  // Populate the chunk; subsequent reads count as hits.
+  auto const before = cache->prepare_for_query();
+  std::vector<std::string> reports;
+  constexpr std::array names{"reads", "hits", "h2d", "miss", "evictions"};
+
+  SECTION("diagnostic observations do not consume a reporting interval")
+  {
+    read();
+    auto const observed = cache->summary();
+    CHECK(cache->summary() == observed);
+    auto const epoch = cache->query_epoch();
+    reports.push_back(cache->prepare_for_query());
+    CHECK(reports.back() == observed);
+    CHECK(cache->query_epoch() == epoch + 1);
+    reports.push_back(cache->prepare_for_query());
+    for (auto const* name : names)
+      CHECK(report_counter(reports.back(), name, "last_cycle") == 0);
+    read();
+  }
+  SECTION("two refreshers race with actual cache reads")
+  {
+    // Seed a nonzero interval even if the refreshers finish before the read loop.
+    read();
+    std::barrier start{3};
+    std::array<std::vector<std::string>, 2> concurrent_reports;
+    std::array<std::exception_ptr, 2> errors;
+    auto refresh = [&](std::size_t index) {
+      start.arrive_and_wait();
+      try {
+        for (int i = 0; i < 100; ++i)
+          concurrent_reports[index].push_back(cache->prepare_for_query());
+      } catch (...) {
+        errors[index] = std::current_exception();
+      }
+    };
+    {
+      std::jthread first(refresh, 0), second(refresh, 1);
+      start.arrive_and_wait();
+      for (int i = 0; i < 100; ++i)
+        read();
+    }
+    for (std::size_t i = 0; i < errors.size(); ++i) {
+      REQUIRE_FALSE(errors[i]);
+      reports.insert(reports.end(), concurrent_reports[i].begin(), concurrent_reports[i].end());
+    }
+  }
+  SECTION("scan manager logs the sample it closes and preserves activity during logging")
+  {
+    read();
+    auto tctx           = sirius::test::make_test_telemetry_context();
+    auto const query_id = sirius::make_query_id(7);
+    sirius::telemetry::query_telemetry_info tinfo{
+      quent::now_v7(), tctx->worker_id().raw(), query_id};
+    sirius::planner::query empty{std::vector<std::shared_ptr<sirius::pipeline::sirius_pipeline>>{},
+                                 tctx->context(),
+                                 query_id,
+                                 tinfo};
+    sirius::test::scoped_recording_log_sink logs;
+    sirius::log::set_sink(std::make_shared<read_during_summary_log>(logs.sink_ptr(), read));
+    manager.prepare_for_query(empty, true, {});
+    std::string info_report, trace_report;
+    for (auto const& record : logs.records()) {
+      auto const pos = record.message.find("prefetching_cache: global[");
+      if (pos == std::string::npos) continue;
+      if (record.level == sirius::log::level::info) info_report = record.message.substr(pos);
+      if (record.level == sirius::log::level::trace) trace_report = record.message.substr(pos);
+    }
+    REQUIRE_FALSE(info_report.empty());
+    CHECK(info_report == trace_report);
+    CHECK(report_counter(info_report, "hits", "last_cycle") == 1);
+    reports.push_back(info_report);
+    // The read injected by the INFO sink belongs to the next interval.
+    CHECK(report_counter(cache->summary(), "hits", "last_cycle") == 1);
+  }
+
+  reports.push_back(cache->prepare_for_query());
+  auto const after = cache->summary();
+  CHECK(report_counter(after, "hits") > report_counter(before, "hits"));
+  for (auto const* name : names) {
+    INFO(name);
+    std::uint64_t reported = 0;
+    for (auto const& report : reports)
+      reported += report_counter(report, name, "last_cycle");
+    CHECK(reported == report_counter(after, name) - report_counter(before, name));
+  }
 }
 
 TEST_CASE("Deferred scan inputs initialize prefetch only when admitted",
@@ -300,7 +454,9 @@ TEST_CASE("Deferred scan inputs initialize prefetch only when admitted",
   };
   temp_data_file file(8ull << 20);
   auto memory = initialize_memory_manager(1);
-  sirius_scan_manager manager{dispose_on_idle_config(), *memory, single_gpu_index_for_dispose()};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{
+    scan_lifecycle, dispose_on_idle_config(), *memory, single_gpu_index_for_dispose()};
   auto* cache = manager.io_ctx()->cache();
   REQUIRE(cache != nullptr);
   auto ds = manager.create_datasource(file.path.string());

@@ -8,10 +8,12 @@ target_sources(
           dynamic_filter/dynamic_filter_key_admission.cpp
           dynamic_filter/dynamic_filter_target_discovery.cpp
           gpu_admission.cpp
+          join_key_nullability.cpp
           query.cpp
           query_index.cpp
           scan_column_origin.cpp
           sirius_physical_plan_generator.cpp
+          substrait_scan_ranges.cpp
           sirius_plan_aggregate.cpp
           sirius_plan_column_data_get.cpp
           sirius_plan_comparison_join.cpp
@@ -20,6 +22,7 @@ target_sources(
           sirius_plan_cte.cpp
           sirius_plan_delim_get.cpp
           sirius_plan_delim_join.cpp
+          sirius_plan_distinct.cpp
           sirius_plan_dummy_scan.cpp
           sirius_plan_empty_result.cpp
           sirius_plan_exists_rewrite.cpp

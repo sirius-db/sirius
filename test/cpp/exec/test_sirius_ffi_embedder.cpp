@@ -166,11 +166,14 @@ TEST_CASE("FFI relay_from chain matches a single-fragment parquet scan",
   auto ctx    = sirius::ffi::make_context_from_config(isolated_memory_config_path().string());
   auto sender = sirius::ffi::make_fragment(*ctx);
   sender->declare_output(0);
+  REQUIRE_THROWS(sender->output_row_count(0));
   sender->build(local_files_plan(path));
   sender->run();
+  REQUIRE(sender->output_row_count(0) == 5);
 
   auto receiver = sirius::ffi::make_fragment(*ctx);
   receiver->declare_input_column(0, "a", "BIGINT");
+  receiver->declare_input_cardinality(0, sender->output_row_count(0));
   receiver->build(stream_read_plan(0));
   REQUIRE(receiver->relay_from(*sender, 0, 0, 0) > 0);
   receiver->run();

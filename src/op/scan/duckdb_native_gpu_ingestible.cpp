@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include "op/scan/duckdb_native_gpu_ingestible.hpp"
+
 #include "transparent/replay_admission.hpp"
 
 // sirius
@@ -27,13 +29,13 @@
 #include <log/logging.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/duckdb_native_decoder.hpp>
-#include <op/scan/duckdb_native_gpu_ingestible.hpp>
 #include <op/scan/scan_plan.hpp>
 #include <op/scan/scan_utils.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <sirius_context.hpp>
 
 // duckdb
+#include <duckdb/main/attached_database.hpp>
 #include <duckdb/storage/single_file_block_manager.hpp>
 #include <duckdb/storage/storage_manager.hpp>
 
@@ -52,6 +54,8 @@
 #include <memory>
 #include <numeric>
 #include <stdexcept>
+#include <stop_token>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -62,6 +66,8 @@ namespace {
 //===----------Batch Coalescer----------===//
 class duckdb_native_batch_coalescer : public batch_coalescer {
  public:
+  std::size_t target_batch_bytes() const noexcept override { return _cap; }
+  std::size_t retained_bytes() const noexcept override { return _acc_bytes; }
   duckdb_native_batch_coalescer(std::size_t approximate_batch_size, std::vector<bool> is_varchar)
     : _cap(approximate_batch_size),
       _is_varchar(std::move(is_varchar)),
@@ -283,7 +289,8 @@ duckdb_native_gpu_ingestible::duckdb_native_gpu_ingestible(
   auto const& source_ids = bind.projection_ids.empty() ? source_ids_fallback : bind.projection_ids;
 
   // Pre-build the coalesced filter expression once.
-  if (bind.table_filters && !bind.table_filters->filters.empty()) {
+  if (bind.table_filters &&
+      (bind.table_filters->HasFilters() || bind.table_filters->HasMultiColumnFilters())) {
     std::vector<std::optional<std::size_t>> emission_order_map(bind.column_ids.size());
     for (std::size_t k = 0; k < source_ids.size(); ++k) {
       emission_order_map[source_ids[k]] = k;
@@ -416,6 +423,12 @@ bool duckdb_native_gpu_ingestible::has_processed_all_metadata() const
 duckdb_native_gpu_ingestible::metadata_scan_task_t
 duckdb_native_gpu_ingestible::next_split_provider(io::ioctx_resolver resolve)
 {
+  return next_split_provider_with_stop(std::move(resolve));
+}
+
+duckdb_native_gpu_ingestible::stoppable_metadata_scan_task_t
+duckdb_native_gpu_ingestible::next_split_provider_with_stop(io::ioctx_resolver resolve)
+{
   // Backstop: the scan manager already ran the walk on the query thread, so this is a no-op.
   if (metadata_walk_pending()) {
     SIRIUS_LOG_WARN(
@@ -436,8 +449,13 @@ duckdb_native_gpu_ingestible::next_split_provider(io::ioctx_resolver resolve)
   // All ranges read the one `.duckdb` file; the resolver returns a valid ioctx or
   // throws if no backend supports the path.
   // Runs on a scan-manager dispatcher thread:
-  return [this, rg_begin, rg_end, resolve = std::move(resolve)]() -> std::unique_ptr<scan_info> {
+  return [this, rg_begin, rg_end, resolve = std::move(resolve)](
+           std::stop_token stop) -> std::unique_ptr<scan_info> {
+    if (stop.stop_requested())
+      throw std::system_error(std::make_error_code(std::errc::operation_canceled));
     auto io_ctx = resolve(_info->db_path);
+    if (stop.stop_requested())
+      throw std::system_error(std::make_error_code(std::errc::operation_canceled));
     duckdb_native_row_group_range range;
     try {
       range = walk_duckdb_native_row_group_range(_plan, rg_begin, rg_end);
@@ -459,6 +477,8 @@ duckdb_native_gpu_ingestible::next_split_provider(io::ioctx_resolver resolve)
                                          std::to_string(rg_begin) + ", " + std::to_string(rg_end) +
                                          ")): " + range.viability_failure_reason);
     }
+    if (stop.stop_requested())
+      throw std::system_error(std::make_error_code(std::errc::operation_canceled));
     auto split = std::make_unique<duckdb_native_scan_info>(
       std::move(range.row_groups), io_ctx->open_datasource(_info->db_path), _block_manager);
     std::vector<split_materializer_certificate> certificates;
@@ -475,7 +495,8 @@ duckdb_native_gpu_ingestible::next_split_provider(io::ioctx_resolver resolve)
          _info->profiles->add(native_row_group_profile(
            row_group,
            _info->projected_types,
-           _info->storage->GetAttached().GetStorageManager().GetStorageVersion())),
+           static_cast<uint64_t>(
+             _info->storage->GetAttached().GetStorageManager().GetStorageVersion()))),
          check_bit(later_check::segments_per_range) | check_bit(later_check::matrix_per_range)});
       dependencies.push_back({nullptr, split->datasource, _checkpoint_iteration, _info->profiles});
     }
@@ -493,7 +514,8 @@ filtered_table duckdb_native_gpu_ingestible::materialize_metadata_to_table(
   ::cucascade::memory::memory_space const& mem_space,
   ::cuda::stream_ref stream,
   bool /*like_swar_fastpath*/,
-  std::shared_ptr<const like_multiliteral_cache> /*like_cache*/)
+  std::shared_ptr<const like_multiliteral_cache> /*like_cache*/,
+  expression_query_policy /*policy*/)
 {
   auto const& split = static_cast<duckdb_native_scan_info const&>(info);
   if (_inject_decode_failure) {
@@ -581,7 +603,8 @@ std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_proje
   bool like_swar_fastpath,
   std::shared_ptr<const like_multiliteral_cache> like_cache,
   std::unique_ptr<cudf::column>* /*survivors*/,
-  std::span<std::size_t const> elided)
+  std::span<std::size_t const> elided,
+  expression_query_policy policy)
 {
   auto const output_arity        = _column_layout.output_data_positions.size();
   auto const decoded_cols        = _column_layout.data_roles.size();
@@ -598,7 +621,7 @@ std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_proje
     sirius::expression_evaluator exec(sirius_filter_ast.get(),
                                       mr_ref,
                                       stream,
-                                      strategy_from_config(),
+                                      policy,
                                       sirius::expression_evaluator::default_min_ast_size,
                                       like_swar_fastpath,
                                       std::move(like_cache));

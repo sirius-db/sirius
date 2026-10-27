@@ -17,6 +17,7 @@
 #include "op/sirius_physical_nested_loop_join.hpp"
 
 #include "config.hpp"
+#include "cudf/ast_compat.hpp"
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
 #include "duckdb/common/exception.hpp"
@@ -34,7 +35,6 @@
 #include "sirius/exception.hpp"
 #include "telemetry/nvtx.hpp"
 
-#include <cudf/ast/expressions.hpp>
 #include <cudf/column/column.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/filling.hpp>
@@ -51,6 +51,14 @@
 
 namespace sirius {
 namespace op {
+
+std::unique_ptr<pipelineable_operator_data> cross_join_slice_data::with_batches_preserving_rows(
+  std::vector<std::shared_ptr<::cucascade::data_batch>> batches) const
+{
+  auto replacement = std::make_unique<cross_join_slice_data>(std::move(batches), slice, num_slices);
+  replacement->adopt_row_identity(*this);
+  return replacement;
+}
 
 static bool nlj_is_equality(sirius::comparison_type c)
 {
@@ -200,7 +208,9 @@ std::string_view sirius_physical_nested_loop_join::input_port_for(
   sirius_physical_operator const& producer) const
 {
   if (producer.type == SiriusPhysicalOperatorType::CONCAT) {
-    return producer.Cast<sirius_physical_concat>().is_build_concat() ? "build" : "default";
+    if (children.size() == 2 && children[1].get() == &producer) { return "build"; }
+    if (children.size() == 2 && children[0].get() == &producer) { return "default"; }
+    throw std::logic_error("Join CONCAT producer is not a wired input child");
   }
   return sirius_physical_operator::input_port_for(producer);
 }
@@ -226,9 +236,11 @@ bool sirius_physical_nested_loop_join::is_supported(
 partition_strategy sirius_physical_nested_loop_join::get_partition_strategy(
   const partition_sizing_input& /*in*/)
 {
-  // A nested-loop join is never hash-partitioned: it runs on a single partition and streams both
-  // sides through the cross-product, so it never broadcasts or enters build-probe. No GPU state
-  // is shared across tasks; leave the CONCATs and join tasks free to follow input locality.
+  // A nested-loop join is never hash-partitioned: it runs on a single partition and evaluates each
+  // pair of left and right batches as one task, so it never broadcasts or enters build-probe. Join
+  // wrapping folds the side rows are decided against (right for LEFT/SEMI/ANTI/MARK, left for
+  // RIGHT, both for FULL OUTER); INNER streams both. No GPU state is shared across tasks; leave the
+  // CONCATs and join tasks free to follow input locality.
   return partition_strategy{/*num_partitions=*/1,
                             /*broadcast=*/false,
                             /*build_probe=*/false,
@@ -718,7 +730,7 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
       if (expr.holds<sirius::ast::reference>()) {
         auto const& ref   = expr.get<sirius::ast::reference>();
         auto const column = table.column(ref.column_index);
-        if (column.type() == sirius::get_cudf_type(ref.return_type())) {
+        if (column.type() == sirius::require_cudf_type(ref.return_type())) {
           col_views.push_back(column);
           return join_input_index;
         }
@@ -726,7 +738,7 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
       sirius::expression_evaluator evaluator(&expr,
                                              mr,
                                              stream,
-                                             strategy_from_config(),
+                                             expression_policy(),
                                              expression_evaluator::default_min_ast_size,
                                              like_swar_fastpath_enabled(),
                                              like_cache());

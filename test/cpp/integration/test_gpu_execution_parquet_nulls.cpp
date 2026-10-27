@@ -49,19 +49,12 @@
 // fallback), run on DuckDB CPU, compare.
 
 //
-// KNOWN GAPS -- both need a fixture from a non-DuckDB writer (e.g. pyarrow),
-// because DuckDB's COPY cannot produce either shape:
+// KNOWN GAP -- needs a fixture from a non-DuckDB writer (e.g. pyarrow):
 //
 //   INT96 timestamps. parquet_helpers.cpp maps the deprecated INT96 physical
 //   type to TIMESTAMP, but DuckDB only ever writes the INT64 logical form,
 //   which is what is covered here.
 //
-//   REQUIRED (non-nullable) columns. ParquetWriter defaults can_have_nulls to
-//   true for every top-level column, so a NOT NULL table constraint does not
-//   carry through and everything is written OPTIONAL. Reading a column with no
-//   definition-level stream is therefore untested; ParquetDenseColFixture
-//   covers the nearest reachable shape (OPTIONAL with zero NULLs).
-
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <utils/gpu_execution_fixture.hpp>
@@ -143,7 +136,7 @@ struct ParquetFileGuard {
       UNSCOPED_INFO("parquet_schema found no leaf column '" << col_name << "'");
       REQUIRE(r->RowCount() > 0);
     }
-    auto actual = r->GetValue(0, 0).ToString();
+    auto actual = r->Collection().GetValue(0, 0).ToString();
     if (actual != expected) {
       UNSCOPED_INFO("column '" << col_name << "' repetition_type is '" << actual << "', expected '"
                                << expected << "'");
@@ -166,7 +159,7 @@ struct ParquetFileGuard {
       UNSCOPED_INFO("parquet_metadata returned no rows for column '" << col_name << "'");
       REQUIRE(r->RowCount() > 0);
     }
-    auto encodings_str = r->GetValue(0, 0).ToString();
+    auto encodings_str = r->Collection().GetValue(0, 0).ToString();
     if (encodings_str.find(encoding_substr) == std::string::npos) {
       UNSCOPED_INFO("column '" << col_name << "' encodings '" << encodings_str
                                << "' do not contain '" << encoding_substr << "'");
@@ -194,15 +187,15 @@ struct ParquetFileGuard {
     REQUIRE(stats);
     REQUIRE_FALSE(stats->HasError());
     REQUIRE(stats->RowCount() == 1);
-    if (!stats->GetValue(0, 0).IsNull()) {
-      auto const null_count = stats->GetValue(0, 0).GetValue<std::int64_t>();
+    if (!stats->Collection().GetValue(0, 0).IsNull()) {
+      auto const null_count = stats->Collection().GetValue(0, 0).GetValue<std::int64_t>();
       if (null_count != expected_nulls) {
         UNSCOPED_INFO("column '" << col_name << "' stats null_count is " << null_count
                                  << ", expected " << expected_nulls);
         REQUIRE(null_count == expected_nulls);
       }
     }
-    auto const num_values = stats->GetValue(1, 0).GetValue<std::int64_t>();
+    auto const num_values = stats->Collection().GetValue(1, 0).GetValue<std::int64_t>();
     REQUIRE(num_values == expected_rows);
 
     // 2. The decoded contents, in case the statistics themselves are wrong.
@@ -210,8 +203,8 @@ struct ParquetFileGuard {
                             sql_literal(pq_path) + ")");
     REQUIRE(rows);
     REQUIRE_FALSE(rows->HasError());
-    auto const total    = rows->GetValue(0, 0).GetValue<std::int64_t>();
-    auto const non_null = rows->GetValue(1, 0).GetValue<std::int64_t>();
+    auto const total    = rows->Collection().GetValue(0, 0).GetValue<std::int64_t>();
+    auto const non_null = rows->Collection().GetValue(1, 0).GetValue<std::int64_t>();
     if (total != expected_rows || non_null != expected_rows - expected_nulls) {
       UNSCOPED_INFO("column '" << col_name << "': " << total << " rows, " << non_null
                                << " non-NULL; expected " << expected_rows << " and "
@@ -241,14 +234,14 @@ struct ParquetFileGuard {
     REQUIRE_FALSE(r->HasError());
     REQUIRE(r->RowCount() == 1);
 
-    auto const converted = r->GetValue(0, 0).ToString();
+    auto const converted = r->Collection().GetValue(0, 0).ToString();
     if (converted != expected_converted) {
       UNSCOPED_INFO("column '" << col_name << "' converted_type is '" << converted
                                << "', expected '" << expected_converted << "'");
       REQUIRE(converted == expected_converted);
     }
     if (precision) {
-      auto const actual = r->GetValue(1, 0).GetValue<int>();
+      auto const actual = r->Collection().GetValue(1, 0).GetValue<int>();
       if (actual != *precision) {
         UNSCOPED_INFO("column '" << col_name << "' precision " << actual << ", expected "
                                  << *precision);
@@ -256,7 +249,7 @@ struct ParquetFileGuard {
       }
     }
     if (scale) {
-      auto const actual = r->GetValue(2, 0).GetValue<int>();
+      auto const actual = r->Collection().GetValue(2, 0).GetValue<int>();
       if (actual != *scale) {
         UNSCOPED_INFO("column '" << col_name << "' scale " << actual << ", expected " << *scale);
         REQUIRE(actual == *scale);
@@ -286,13 +279,13 @@ struct ParquetFileGuard {
       // Absent statistics are legal in the parquet spec, but DuckDB always
       // writes them and this assertion exists to pin the row-to-group mapping.
       // Skipping on absence would quietly turn the whole check into a no-op.
-      if (r->GetValue(0, i).IsNull()) {
+      if (r->Collection().GetValue(0, i).IsNull()) {
         UNSCOPED_INFO("column '" << col_name << "' row group " << i
                                  << " has no null_count statistic, so the layout cannot be "
                                     "verified");
-        REQUIRE_FALSE(r->GetValue(0, i).IsNull());
+        REQUIRE_FALSE(r->Collection().GetValue(0, i).IsNull());
       }
-      auto const actual = r->GetValue(0, i).GetValue<std::int64_t>();
+      auto const actual = r->Collection().GetValue(0, i).GetValue<std::int64_t>();
       if (actual != expected[i]) {
         UNSCOPED_INFO("column '" << col_name << "' row group " << i << " has " << actual
                                  << " NULLs, expected " << expected[i]);
@@ -318,7 +311,7 @@ struct ParquetFileGuard {
       REQUIRE(r->RowCount() == expected.size());
     }
     for (duckdb::idx_t i = 0; i < r->RowCount(); i++) {
-      auto const actual = r->GetValue(0, i).GetValue<std::int64_t>();
+      auto const actual = r->Collection().GetValue(0, i).GetValue<std::int64_t>();
       if (actual != expected[i]) {
         UNSCOPED_INFO("row group " << i << " has " << actual << " rows, expected " << expected[i]);
         REQUIRE(actual == expected[i]);
@@ -342,7 +335,7 @@ struct ParquetFileGuard {
       UNSCOPED_INFO("parquet_schema returned no rows for column '" << col_name << "'");
       REQUIRE(r->RowCount() > 0);
     }
-    auto actual = r->GetValue(0, 0).ToString();
+    auto actual = r->Collection().GetValue(0, 0).ToString();
     if (actual != expected_type) {
       UNSCOPED_INFO("column '" << col_name << "' physical type is '" << actual << "', expected '"
                                << expected_type << "'");
@@ -614,9 +607,9 @@ class ParquetMultiRowGroupFixture : public sirius::test::GpuExecutionFixture {
 // inventing NULLs. This is the shape of most real data (TPC-H etc.), so it is
 // the baseline the NULL-bearing fixtures are measured against.
 //
-// This is NOT the REQUIRED (no definition-level stream) case, which DuckDB
-// cannot write -- see KNOWN GAPS above. The OPTIONAL repetition is asserted so
-// the fixture states what it actually exercises.
+// Disable statistics propagation while writing: DuckDB v2 otherwise infers
+// REQUIRED columns from the absence of NULLs. Assert OPTIONAL explicitly to
+// preserve coverage of the all-valid definition-level stream.
 // ---------------------------------------------------------------------------
 
 class ParquetDenseColFixture : public sirius::test::GpuExecutionFixture {
@@ -628,7 +621,9 @@ class ParquetDenseColFixture : public sirius::test::GpuExecutionFixture {
     pq_.write({
       "CREATE TABLE dense (id INTEGER, val INTEGER, s VARCHAR)",
       "INSERT INTO dense SELECT i, i * 2, 'str_' || CAST(i AS VARCHAR) FROM range(1, 33) AS t(i)",
+      "SET disabled_optimizers = 'statistics_propagation'",
       "COPY dense TO " + sql_literal(pq_path) + " (FORMAT PARQUET)",
+      "RESET disabled_optimizers",
     });
 
     // Pin what DuckDB actually emits: OPTIONAL, with zero nulls present.

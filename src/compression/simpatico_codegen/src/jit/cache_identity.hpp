@@ -9,6 +9,9 @@
 
 namespace codegen::jit::detail {
 
+// Request/environment domains and the disk namespace advance together.
+inline constexpr std::string_view kCacheFormatVersion = "v2";
+
 // XXH3-128 in canonical (big-endian) byte order, matching xxhsum -H128.
 using Digest = std::array<unsigned char, 16>;
 
@@ -20,19 +23,15 @@ struct RequestView {
 };
 
 struct EnvironmentView {
-  std::string_view provider;
   std::string_view project_headers;
   std::string_view cccl_headers;
-  std::string_view compiler;
-  uint32_t cuda_runtime;
-  uint32_t driver;
+  uint32_t nvrtc_major;
+  uint32_t nvrtc_minor;
 };
 
 Digest request_identity(const RequestView& request);
 Digest environment_identity(const EnvironmentView& environment);
 Digest content_identity(std::string_view content);
-// Returns false on unreadable/changed files. Used during compiler discovery only.
-bool file_identity(const std::string& path, Digest& result);
 std::string hex_digest(const Digest& digest);
 
 struct CompilationIdentity {

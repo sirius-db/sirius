@@ -54,7 +54,7 @@ observed_run run_on_gpu(duckdb::Connection& con, std::string const& query)
   REQUIRE_FALSE(result->HasError());
   sirius::test::require_transparent_execution_delta(
     before_execution, sirius::test::get_transparent_execution_stats(con), 1, 0, 1);
-  return {sirius::test::collect_rows(result->Cast<duckdb::MaterializedQueryResult>()),
+  return {sirius::test::collect_rows(*result),
           before,
           sirius::test::get_dynamic_filter_stats_snapshot(con)};
 }
@@ -110,7 +110,7 @@ result_rows run_on_cpu(duckdb::Connection& con, std::string const& query)
   auto result = con.Query(query);
   REQUIRE(result);
   REQUIRE_FALSE(result->HasError());
-  return sirius::test::collect_rows(result->Cast<duckdb::MaterializedQueryResult>());
+  return sirius::test::collect_rows(*result);
 }
 
 /**
@@ -254,8 +254,8 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     auto result = con->Query(query);
     REQUIRE(result);
     REQUIRE_FALSE(result->HasError());
-    REQUIRE(result->GetValue(0, 0).GetValue<std::int64_t>() == 209715);
-    cpu_rows = sirius::test::collect_rows(result->Cast<duckdb::MaterializedQueryResult>());
+    REQUIRE(result->Collection().GetValue(0, 0).GetValue<std::int64_t>() == 209715);
+    cpu_rows = sirius::test::collect_rows(*result);
   }
 
   SECTION("disabled accumulation retains one-shot-only behavior")
@@ -288,7 +288,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
       auto result = con->Query(limited);
       REQUIRE(result);
       REQUIRE_FALSE(result->HasError());
-      cpu_limited = sirius::test::collect_rows(result->Cast<duckdb::MaterializedQueryResult>());
+      cpu_limited = sirius::test::collect_rows(*result);
     }
     auto const run = run_on_gpu(*con, limited);
     REQUIRE(run.rows == cpu_limited);

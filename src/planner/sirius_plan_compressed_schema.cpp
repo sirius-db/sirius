@@ -50,7 +50,7 @@ std::optional<std::vector<cudf::data_type>> try_native_physical_schema(
   std::vector<cudf::data_type> schema;
   schema.reserve(op.types.size());
   for (auto const& type : op.types) {
-    auto const native = sirius::try_get_cudf_type(type);
+    auto const native = sirius::get_cudf_type(type);
     if (!native) { return std::nullopt; }
     schema.push_back(*native);
   }
@@ -60,7 +60,7 @@ std::optional<std::vector<cudf::data_type>> try_native_physical_schema(
 bool native_physical_schema_is_mappable(sirius::op::sirius_physical_operator const& op)
 {
   return std::ranges::all_of(
-    op.types, [](auto const& type) { return sirius::try_get_cudf_type(type).has_value(); });
+    op.types, [](auto const& type) { return sirius::get_cudf_type(type).has_value(); });
 }
 
 bool is_delim_join(sirius::op::sirius_physical_operator const& op) noexcept
@@ -421,9 +421,12 @@ void propagate_compressed_schema(duckdb::unique_ptr<sirius::op::sirius_physical_
       auto& aggregate = slot->Cast<sirius::op::sirius_physical_grouped_aggregate>();
       if (aggregate.has_grouping_sets()) { break; }
       // AVG decomposes into SUM + COUNT_VALID partial columns and COUNT(DISTINCT) keeps a LIST
-      // partial column, so the partial batch layout deviates from the declared `types` shape a
-      // sidecar describes; those shapes keep the native boundary.
-      if (aggregate.has_avg || aggregate.has_count_distinct) { break; }
+      // partial column; STDDEV_SAMP keeps a count/mean/M2 STRUCT, so the partial batch layout
+      // deviates from the declared `types` shape a sidecar describes; those shapes keep the native
+      // boundary.
+      if (aggregate.has_avg || aggregate.has_count_distinct || aggregate.has_stddev_samp()) {
+        break;
+      }
       // Grouping functions append output columns the operator does not compute through group_idx /
       // aggregate_slots; the arity check rejects that shape along with any other layout drift.
       if (slot->types.size() != aggregate.group_idx.size() + aggregate.aggregate_slots.size()) {

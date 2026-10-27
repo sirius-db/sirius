@@ -118,8 +118,8 @@ void check_sql(fixture& disk, std::vector<std::optional<std::string>> expected)
   auto after  = sirius::test::get_transparent_execution_stats(con);
   sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1);
   std::vector<std::optional<std::string>> actual;
-  for (duckdb::idx_t row = 0; row < result->RowCount(); ++row) {
-    auto value = result->GetValue(0, row);
+  for (auto const& row : result->Collection().Rows()) {
+    auto value = row.GetValue(0);
     actual.push_back(value.IsNull() ? std::nullopt : std::optional<std::string>(value.ToString()));
   }
   std::sort(actual.begin(), actual.end());

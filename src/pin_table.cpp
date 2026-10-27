@@ -25,8 +25,10 @@
 #include "io/io_context.hpp"
 #include "late_mat/pin_uniqueness.hpp"
 #include "log/logging.hpp"
+#include "memory/runtime_stream_pool.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/gpu_ingestible.hpp"
+#include "scan_manager/host_pin_placement.hpp"
 #include "scan_manager/pinned_chunk_stats.hpp"
 #include "scan_manager/round_robin_strategy.hpp"
 #include "telemetry/nvtx.hpp"
@@ -153,7 +155,7 @@ cudf::data_type pin_native_type(cudf::data_type decoded_type,
                                 duckdb::LogicalType const* declared_type)
 {
   if (declared_type == nullptr) { return decoded_type; }
-  auto const native = sirius::try_get_cudf_type(sirius::from_duckdb(*declared_type));
+  auto const native = sirius::get_cudf_type(sirius::from_duckdb(*declared_type));
   return native.value_or(decoded_type);
 }
 
@@ -210,10 +212,10 @@ narrowed_pin_chunk narrow_pin_chunk(std::unique_ptr<cudf::table> table,
 /// Shared driver behind @ref materialize_all_batches, @ref materialize_pin_to_host, and
 /// @ref materialize_all_batches_compressed: walk the
 /// ingestible's metadata + batch coalescer to completion, materialize each emitted batch onto a
-/// round-robin GPU, and hand it to @p on_batch. The single-threaded, deterministic round-robin
-/// placement means re-pinning the same source yields identical placement (required by
-/// insert_pinned_entry's merge path on the GPU tier) and bounds peak GPU residency to ~one batch
-/// (the host tier frees each table in @p on_batch before the next is materialized).
+/// selected GPU, and hand it to @p on_batch. GPU-tier placement is deterministic for column
+/// merges; host-tier callers supply a persistent placement selector. Peak GPU residency is
+/// bounded to ~one batch on the host tier, which frees each table in @p on_batch before
+/// the next is materialized.
 /// @return the late-mat uniqueness verdicts, positional with the pinned columns
 ///         (empty when the probe was not asked for).
 std::vector<late_mat::unique_verdict> materialize_pin_batches(
@@ -222,17 +224,16 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
   io::ioctx& io_ctx,
   duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
   pin_materialization_options options,
-  const pin_batch_sink& on_batch)
+  const pin_batch_sink& on_batch,
+  std::function<int()> select_device = {})
 {
   if (gpu_spaces.empty()) {
     throw std::invalid_argument("[materialize_pin_batches] gpu_spaces must be non-empty");
   }
 
-  // GPU placement via the same strategy the query path uses
-  // (sirius_scan_manager::prepare_for_query). A fresh strategy per call starts its
-  // cursor at 0, so re-pinning the same source yields identical placement — required
-  // by insert_pinned_entry's merge path. The strategy hands out device ids; map each
-  // back to the memory_space to materialize into.
+  // GPU-tier pins need a fresh cursor so re-pinning reproduces the placement required
+  // by insert_pinned_entry's column merge. Host pins override selection with the scan
+  // manager's persistent, host-interleaved cursor. Both return actual device ids.
   std::vector<int> device_ids;
   std::unordered_map<int, cucascade::memory::memory_space*> space_by_device;
   device_ids.reserve(gpu_spaces.size());
@@ -287,19 +288,18 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
   // the on_batch call, so the sink runs on the correct device.
   auto handle_batch = [&](std::unique_ptr<op::scan::scan_info> batch) {
     if (!batch) { return; }
-    // round_robin_strategy ignores pipeline_id/data; it returns the next device id
-    // from its cursor. gpu_spaces is non-empty (checked above), so the strategy always
-    // yields a device. space_by_device round-trips it to the materialization target.
     int const gpu_id =
-      placement.get_next_gpu(/*pipeline_id=*/0, /*data=*/nullptr, /*hint=*/{}).value();
+      select_device
+        ? select_device()
+        : placement.get_next_gpu(/*pipeline_id=*/0, /*data=*/nullptr, /*hint=*/{}).value();
     auto* target = space_by_device.at(gpu_id);
     rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{gpu_id}};
-    // Borrow a real (non-default) stream from the target memory_space's pool: the
+    // Borrow a real (non-default) stream from the target's runtime stream pool: the
     // duckdb-native decoder's cudaMemcpyBatchAsync rejects the legacy default
-    // stream. The pool owns the stream for the memory_space's lifetime (which
-    // outlives the pinned data), so the materialized buffers' deallocation stream
-    // stays valid after this call.
-    auto stream = target->acquire_stream();
+    // stream. The manager retains the pool until pinned data is retired, so the
+    // materialized buffers' deallocation stream stays valid after this call.
+    auto stream_lease = sirius::memory::runtime_stream_pool::acquire(*target);
+    auto stream       = stream_lease.get();
 
     // A pin caches the table UNFILTERED: it has no row filter (no WHERE), and the
     // ingestible's projection_ids are identity into column_ids, so the reader already
@@ -308,7 +308,8 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
     // post_filter_and_project (which would only apply a row filter or re-project to a
     // query's output layout, neither of which a pin needs). `batch` is borrowed by const
     // ref and outlives the call.
-    auto materialized     = ingestible.materialize_metadata_to_table(*batch, *target, stream);
+    auto materialized = ingestible.materialize_metadata_to_table(
+      *batch, *target, stream, false, nullptr, options.expression_policy);
     auto tbl              = materialized.table.release(stream, target->get_default_allocator());
     auto const chunk_rows = static_cast<std::size_t>(tbl->num_rows());
     validate_duckdb_pin_chunk(*batch, chunk_rows, rows_materialized);
@@ -385,7 +386,7 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
     // A pin reads its fixed ingestible on the one ioctx it was given; route every file to it.
     auto task = ingestible.next_split_provider([io_ctx_sp](std::string_view) { return io_ctx_sp; });
     if (!task) { continue; }
-    auto info = task();
+    auto info = task({});
     if (!info) { continue; }
     for (auto& b : coalescer->push(std::move(info))) {
       handle_batch(std::move(b));
@@ -435,9 +436,7 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
   return {};
 }
 
-// Streams for cross-column encode parallelism, one pool per thread and device —
-// the same accessor the decode path uses, so a thread that both pins and
-// decodes holds one pool rather than two.
+// Streams for cross-column encode parallelism, one pool per thread and device.
 simpatico::stream_pool& compress_pool() { return simpatico::thread_device_stream_pool(4); }
 
 // Diagnostic for a compression failure inside a pin sink, shared by both drivers. Reports the real
@@ -622,6 +621,7 @@ host_pin_result materialize_pin_to_host(
   op::scan::gpu_ingestible& ingestible,
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
   const std::unordered_map<int, cucascade::memory::memory_space*>& host_space_by_gpu,
+  scan_manager::host_pin_placement& placement,
   io::ioctx& io_ctx,
   duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
   compression_pin_config const& compression,
@@ -630,6 +630,16 @@ host_pin_result materialize_pin_to_host(
   auto& registry = converter_registry::get();
   host_pin_result out;
   bool compression_failed = false;
+
+  // Group by the actual destination, including the caller's fallback mapping for
+  // GPUs without a matching NUMA host space. No topology or GPU-id arithmetic here.
+  std::vector<std::pair<int, int>> gpu_hosts;
+  gpu_hosts.reserve(gpu_spaces.size());
+  for (auto const* gpu : gpu_spaces) {
+    gpu_hosts.emplace_back(gpu->get_device_id(),
+                           host_space_by_gpu.at(gpu->get_device_id())->get_device_id());
+  }
+  auto const device_order = scan_manager::host_pin_placement::interleaved_devices(gpu_hosts);
 
   out.unique_verdicts = materialize_pin_batches(
     ingestible,
@@ -723,7 +733,8 @@ host_pin_result materialize_pin_to_host(
         stream.sync();
         out.chunks.emplace_back(std::move(host_repr));
       }
-    });
+    },
+    [&placement, &device_order] { return placement.next_gpu(device_order); });
 
   {
     std::size_t compressed_count = 0;

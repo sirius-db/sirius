@@ -30,9 +30,7 @@
 #include "cudf/table/table_view.hpp"
 #include "cudf/transform.hpp"
 #include "cudf/types.hpp"
-#include "cudf/unary.hpp"
 #include "cudf/utilities/memory_resource.hpp"
-#include "cudf/version_config.hpp"
 #include "data/data_batch_utils.hpp"
 #include "duckdb/common/exception.hpp"
 #include "expression/ast/node.hpp"
@@ -44,7 +42,7 @@
 #include "log/logging.hpp"
 #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
-#include "op/join_key_preparation.hpp"
+#include "op/key_preparation.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
@@ -80,37 +78,6 @@ static void collect_reference_indices(sirius::ast::node const& expr,
                                       std::unordered_set<std::size_t>& indices)
 {
   sirius::ast::visit_references(expr, [&](auto const& ref) { indices.insert(ref.column_index); });
-}
-
-// cuDF 26.08 mixed SEMI/ANTI deduplication derives conditional-column null handling from the
-// equality table. With non-null keys it can collapse NULL and valid residual values that have
-// identical underlying bytes. Append non-null validity flags to the build conditional table so
-// those rows compare differently even when cuDF ignores their masks. Keep the original column
-// indices for the predicate and the original equality keys for hashing. Unlike a row ID, these
-// flags still allow duplicate non-null build rows to be eliminated.
-// TODO: remove once Sirius is on cuDF >= 26.10, which includes rapidsai/cudf#23861.
-static cudf::table_view prepare_mixed_filter_build(
-  duckdb::vector<sirius::join_condition> const& conditions,
-  std::size_t first_residual,
-  bool build_is_left,
-  cudf::table_view const& build,
-  std::vector<std::unique_ptr<cudf::column>>& validity_columns,
-  ::cuda::stream_ref stream)
-{
-  std::unordered_set<std::size_t> indices;
-  for (std::size_t i = first_residual; i < conditions.size(); ++i) {
-    auto const& side = build_is_left ? conditions[i].left : conditions[i].right;
-    collect_reference_indices(*side, indices);
-  }
-  std::vector<cudf::column_view> columns(build.begin(), build.end());
-  for (auto const index : indices) {
-    auto const column = build.column(static_cast<cudf::size_type>(index));
-    if (!column.has_nulls()) { continue; }
-    validity_columns.push_back(
-      cudf::is_valid(column, stream, cudf::get_current_device_resource_ref()));
-    columns.push_back(validity_columns.back()->view());
-  }
-  return cudf::table_view{columns};
 }
 
 // Mixed plain/null-safe keys require different null policies, so route the null-safe keys
@@ -267,7 +234,9 @@ std::string_view sirius_physical_hash_join::input_port_for(
   sirius_physical_operator const& producer) const
 {
   if (producer.type == SiriusPhysicalOperatorType::CONCAT) {
-    return producer.Cast<sirius_physical_concat>().is_build_concat() ? "build" : "default";
+    if (children.size() == 2 && children[1].get() == &producer) { return "build"; }
+    if (children.size() == 2 && children[0].get() == &producer) { return "default"; }
+    throw std::logic_error("Join CONCAT producer is not a wired input child");
   }
   return sirius_physical_operator::input_port_for(producer);
 }
@@ -540,8 +509,8 @@ sirius_physical_hash_join::sirius_physical_hash_join(
     }
     auto const& left_ref  = condition.left->get<sirius::ast::reference>();
     auto const& right_ref = condition.right->get<sirius::ast::reference>();
-    auto const type       = sirius::get_cudf_type(left_ref.return_type());
-    if (type != sirius::get_cudf_type(right_ref.return_type())) {
+    auto const type       = sirius::require_cudf_type(left_ref.return_type());
+    if (type != sirius::require_cudf_type(right_ref.return_type())) {
       throw duckdb::NotImplementedException("Join key operands must have matching physical types");
     }
     bool const hash_key = is_hash_equality_key(condition.comparison, route_null_safe);
@@ -1526,8 +1495,8 @@ static join_side_keys_result prepare_join_keys(const ::cucascade::read_only_data
       throw std::out_of_range("prepare_join_keys: key column is outside the input batch");
     }
     auto const column = table.column(idx);
-    auto restored     = restore_prepared_join_key(
-      column, key_types[i], stream, cudf::get_current_device_resource_ref());
+    auto restored =
+      restore_prepared_key(column, key_types[i], stream, cudf::get_current_device_resource_ref());
     result.key_views.push_back(restored ? restored->view() : column);
     if (restored) { result.owned_cast_columns.push_back(std::move(restored)); }
   }
@@ -2145,24 +2114,12 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
       left_indices  = std::move(result.first);
       right_indices = std::move(result.second);
     } else if (join_type == duckdb::JoinType::SEMI || join_type == duckdb::JoinType::ANTI) {
-      std::vector<std::unique_ptr<cudf::column>> validity_columns;
-      auto build_conditional = prepare_mixed_filter_build(
-        conditions, num_equality_conditions, false, right_full, validity_columns, stream);
-      left_indices = join_type == duckdb::JoinType::SEMI
-                       ? cudf::mixed_left_semi_join(left_eq,
-                                                    right_eq,
-                                                    left_full,
-                                                    build_conditional,
-                                                    pred->back(),
-                                                    compare_nulls(),
-                                                    stream)
-                       : cudf::mixed_left_anti_join(left_eq,
-                                                    right_eq,
-                                                    left_full,
-                                                    build_conditional,
-                                                    pred->back(),
-                                                    compare_nulls(),
-                                                    stream);
+      left_indices =
+        join_type == duckdb::JoinType::SEMI
+          ? cudf::mixed_left_semi_join(
+              left_eq, right_eq, left_full, right_full, pred->back(), compare_nulls(), stream)
+          : cudf::mixed_left_anti_join(
+              left_eq, right_eq, left_full, right_full, pred->back(), compare_nulls(), stream);
     } else if (join_type == duckdb::JoinType::RIGHT_SEMI ||
                join_type == duckdb::JoinType::RIGHT_ANTI) {
       auto swapped_pred = translator.translate_join_conditions(
@@ -2172,21 +2129,18 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
           "In sirius_physical_hash_join: failed to translate swapped predicate for RIGHT_SEMI/ANTI "
           "mixed join");
       }
-      std::vector<std::unique_ptr<cudf::column>> validity_columns;
-      auto build_conditional = prepare_mixed_filter_build(
-        conditions, num_equality_conditions, true, left_full, validity_columns, stream);
       right_indices = join_type == duckdb::JoinType::RIGHT_SEMI
                         ? cudf::mixed_left_semi_join(right_eq,
                                                      left_eq,
                                                      right_full,
-                                                     build_conditional,
+                                                     left_full,
                                                      swapped_pred->back(),
                                                      compare_nulls(),
                                                      stream)
                         : cudf::mixed_left_anti_join(right_eq,
                                                      left_eq,
                                                      right_full,
-                                                     build_conditional,
+                                                     left_full,
                                                      swapped_pred->back(),
                                                      compare_nulls(),
                                                      stream);

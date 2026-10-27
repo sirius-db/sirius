@@ -76,15 +76,9 @@ struct mvcc_visibility_plan {
  * (so the query's own uncommitted deletes are honored) and walks the row
  * groups covering the pinned prefix [0, metadata.n_cache()), clamping the
  * last row group to pin coverage (its live count grows under appends). The
- * same pass records each row group's non-loading dirty probe via
- * RowGroup::GetPartitionStats (count_type APPROXIMATE <=> version state):
- * safe because a delete visible to any active snapshot always has version
- * state present — delete markers persist until checkpoint compaction
- * (suppressed while pinned), and checkpointed tombstones show as unloaded
- * deletes. Conservative in two ways that cost a walk but never a wrong mask:
- * append-only version info probes dirty, and a RowVersionManager created by
- * this session's own writes stays attached forever — only freshly-loaded
- * (ATTACH-then-pin) tables take the zero-cost clean path.
+ * same pass compares each row group's transaction-visible count with physical
+ * coverage. An approximate count or a mismatch requires a visibility mask.
+ * Exact counts that exclude committed deletes must still take the mask path.
  *
  * Throws std::runtime_error on invariants validated at pin time
  * (validate_duckdb_pin_chunk): start_time < v_base (a re-pin raced

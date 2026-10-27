@@ -493,7 +493,7 @@ bool read_view_registry::record_declined_lookup(duckdb::LogicalGet const& get,
     case L::none: return false;
   }
   return declined_lookups_
-    .emplace(get.table_index,
+    .emplace(get.table_index.index,
              declined_lookup_record{op::scan::eligibility_verdict::unsupported, reason})
     .second;
 }
@@ -714,7 +714,7 @@ void validate_split_for_gpu(scan_contract_id expected,
                             std::optional<key_held_witness> const& expected_key,
                             scan_info const& split)
 {
-  // Preserve R1's handle mismatch and its precedence.
+  // Reject a mismatched scan contract before checking its certificates.
   if (split.contract_id() != expected) {
     throw transparent::classified_execution_error(transparent::late_failure_cause::certificate,
                                                   "scan split contract mismatch: expected " +
@@ -755,6 +755,12 @@ void validate_split_for_gpu(scan_contract_id expected,
       auto const& dependency = dependencies[i];
       if (!dependency.parquet_approval || !dependency.parquet_approval->footer_bytes)
         fail("Parquet file approval missing");
+      auto const& approval = *dependency.parquet_approval;
+      if (approval.object_identity.empty() || !approval.metadata_owner || !dependency.datasource ||
+          approval.object_identity != dependency.datasource->get_io_object().identity_cache_key() ||
+          dependency.footer.owner_before(approval.metadata_owner) ||
+          approval.metadata_owner.owner_before(dependency.footer))
+        fail("Parquet evidence belongs to another object identity");
       auto const prefix =
         slice.file_path + "|footer=" + std::to_string(dependency.parquet_approval->footer_bytes);
       auto const& identity = certificates[i].input_identity;

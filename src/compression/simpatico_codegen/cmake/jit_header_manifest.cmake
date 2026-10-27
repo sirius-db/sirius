@@ -38,19 +38,26 @@ function(jit_manifest_record name contents output)
       PARENT_SCOPE)
 endfunction()
 
-function(jit_bundle_identity manifest output)
-  # Each generated output owns its scratch file, including parallel builds.
-  set(input "${OUT}.manifest")
-  file(WRITE "${input}" "${manifest}")
-  execute_process(COMMAND "${XXHSUM_EXECUTABLE}" -H128 "${input}"
+function(jit_file_identity path output)
+  execute_process(COMMAND "${XXHSUM_EXECUTABLE}" -H128 "${path}"
                   OUTPUT_VARIABLE checksum COMMAND_ERROR_IS_FATAL ANY)
-  file(REMOVE "${input}")
   string(REGEX MATCH "^[0-9a-fA-F]+" digest "${checksum}")
   string(LENGTH "${digest}" digest_length)
   if(NOT digest_length EQUAL 32)
     message(FATAL_ERROR "xxhsum -H128 returned an invalid digest: ${checksum}")
   endif()
   string(TOLOWER "${digest}" digest)
+  set(${output}
+      "${digest}"
+      PARENT_SCOPE)
+endfunction()
+
+function(jit_bundle_identity manifest output)
+  # Each generated output owns its scratch file, including parallel builds.
+  set(input "${OUT}.manifest")
+  file(WRITE "${input}" "${manifest}")
+  jit_file_identity("${input}" digest)
+  file(REMOVE "${input}")
   set(${output}
       "${digest}"
       PARENT_SCOPE)

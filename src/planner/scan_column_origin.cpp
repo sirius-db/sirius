@@ -35,10 +35,11 @@ struct ordinal_origin {
 
 /// Maps @p ordinal through @p projection_map onto child @p child_index, or passes it through
 /// when the map is empty.
-std::optional<ordinal_origin> mapped_origin(std::size_t child_index,
-                                            duckdb::vector<duckdb::idx_t> const& projection_map,
-                                            std::size_t ordinal,
-                                            std::size_t child_width)
+std::optional<ordinal_origin> mapped_origin(
+  std::size_t child_index,
+  duckdb::vector<duckdb::ProjectionIndex> const& projection_map,
+  std::size_t ordinal,
+  std::size_t child_width)
 {
   if (projection_map.empty()) {
     if (ordinal >= child_width) { return std::nullopt; }
@@ -102,7 +103,7 @@ std::optional<ordinal_origin> step_origin(duckdb::LogicalOperator const& op,
         return std::nullopt;
       }
       return ordinal_origin{
-        0, static_cast<std::size_t>(expression.Cast<duckdb::BoundReferenceExpression>().index)};
+        0, static_cast<std::size_t>(expression.Cast<duckdb::BoundReferenceExpression>().Index())};
     }
     case duckdb::LogicalOperatorType::LOGICAL_FILTER:
       return mapped_origin(
@@ -123,7 +124,7 @@ std::optional<ordinal_origin> step_origin(duckdb::LogicalOperator const& op,
       auto const& group = *aggregate.groups[ordinal];
       if (group.GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) { return std::nullopt; }
       return ordinal_origin{
-        0, static_cast<std::size_t>(group.Cast<duckdb::BoundReferenceExpression>().index)};
+        0, static_cast<std::size_t>(group.Cast<duckdb::BoundReferenceExpression>().Index())};
     }
     case duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
       return join_origin(op.Cast<duckdb::LogicalJoin>(), ordinal, policy);

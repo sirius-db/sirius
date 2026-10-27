@@ -34,9 +34,22 @@ split_provider::split_provider(op::scan::gpu_ingestible& ingestible, io::ioctx_r
 
 bool split_provider::has_more_splits() const { return !_ingestible->has_processed_all_metadata(); }
 
-std::function<std::unique_ptr<op::scan::scan_info>()> split_provider::next_split_provider()
+op::scan::gpu_ingestible::metadata_scan_task_t split_provider::next_split_provider()
 {
   return _ingestible->next_split_provider(_resolve);
+}
+
+op::scan::gpu_ingestible::preparation_claim split_provider::claim_preparation()
+{
+  // Admission controls reservation/ledger ownership; it must not select a
+  // different claim API.  Adapters without an admission still need their
+  // stop-aware claim and any adapter-owned claim metadata.
+  auto claim = _ingestible->claim_preparation(_resolve);
+  if (claim.work && !claim.stop_work) {
+    auto work       = claim.work;
+    claim.stop_work = [work = std::move(work)](std::stop_token stop) mutable { return work(stop); };
+  }
+  return claim;
 }
 
 template <typename Scheduler>
@@ -48,16 +61,18 @@ void split_provider::run(Scheduler& scheduler, const push_callback_t& on_split)
   _completion_token =
     ctrl.on_completion([on_split] { on_split(exec::make_empty_try<split_type>()); });
   while (has_more_splits()) {
-    auto work = next_split_provider();
+    // 普通 metadata/IO task 必须接收 dispatcher 的取消信号。
+    auto work = _ingestible->next_split_provider_with_stop(_resolve);
     if (!work) { continue; }
-    scheduler.enqueue([on_split, work = std::move(work), token = ctrl.acquire()]() mutable {
-      try {
-        auto split = work();
-        on_split(std::move(split));
-      } catch (...) {
-        on_split(std::current_exception());
-      }
-    });
+    scheduler.enqueue(
+      [on_split, work = std::move(work), token = ctrl.acquire()](std::stop_token stop) mutable {
+        try {
+          auto split = work(stop);
+          on_split(std::move(split));
+        } catch (...) {
+          on_split(std::current_exception());
+        }
+      });
   }
 }
 

@@ -15,7 +15,6 @@
  */
 
 #include <catch.hpp>
-#include <config.hpp>
 #include <duckdb.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 
@@ -26,11 +25,6 @@ namespace {
 
 class TimestampExtractionFixture : public sirius::test::GpuExecutionFixture {
  public:
-  ~TimestampExtractionFixture()
-  {
-    duckdb::Config::EXPRESSION_EVALUATOR_STRATEGY = original_strategy_;
-  }
-
   void check_extraction(std::string const& query)
   {
     INFO(query);
@@ -38,8 +32,8 @@ class TimestampExtractionFixture : public sirius::test::GpuExecutionFixture {
     auto cpu = con->Query(query);
     REQUIRE(cpu);
     REQUIRE_FALSE(cpu->HasError());
-    auto expected = collect_rows(cpu->Cast<duckdb::MaterializedQueryResult>());
-    for (auto const& type : cpu->types) {
+    auto expected = collect_rows(*cpu);
+    for (auto const& type : cpu->GetTypes()) {
       REQUIRE(type == duckdb::LogicalType::BIGINT);
     }
 
@@ -52,13 +46,9 @@ class TimestampExtractionFixture : public sirius::test::GpuExecutionFixture {
     REQUIRE_FALSE(gpu->HasError());
     // A CPU fallback must not turn this regression green.
     sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1);
-    REQUIRE(gpu->types == cpu->types);
-    CHECK(collect_rows(gpu->Cast<duckdb::MaterializedQueryResult>()) == expected);
+    REQUIRE(gpu->GetTypes() == cpu->GetTypes());
+    CHECK(collect_rows(*gpu) == expected);
   }
-
- private:
-  sirius::expression_evaluator_strategy original_strategy_ =
-    duckdb::Config::EXPRESSION_EVALUATOR_STRATEGY;
 };
 
 }  // namespace
@@ -75,8 +65,8 @@ TEST_CASE_METHOD(TimestampExtractionFixture,
   run_ok(std::string("CREATE TABLE timestamps (id BIGINT, t ") + type + ")");
 
   // Materialized table columns prevent constant folding of the extraction.
-  // Keep sub-microsecond digits for NS: its implicit cast to TIMESTAMP truncates
-  // toward zero, including just before the epoch and before a minute boundary.
+  // Keep sub-microsecond digits for NS: v2 rounds its implicit cast to TIMESTAMP,
+  // including just before the epoch and before a minute boundary.
   std::vector<std::string> const values = {
     "1970-01-01 00:00:23.040000",
     "1970-01-01 00:00:07.739523",
@@ -115,4 +105,60 @@ TEST_CASE_METHOD(TimestampExtractionFixture,
   check_extraction(
     "SELECT id, millisecond(t), microsecond(t) FROM timestamps "
     "WHERE millisecond(t) >= 23000 AND microsecond(t) < 59999999");
+}
+
+TEST_CASE_METHOD(TimestampExtractionFixture,
+                 "datetime extraction composes with BETWEEN and CASE",
+                 "[integration][gpu_execution][timestamp_extraction]")
+{
+  auto const strategy = GENERATE("materialize", "ast_interpret", "ast_jit");
+  CAPTURE(strategy);
+  run_ok("SET gpu_execution = false");
+  run_ok("SET enable_duckdb_fallback = false");
+  run_ok(std::string("SET expression_evaluator_strategy = '") + strategy + "'");
+  run_ok("CREATE TABLE timestamps (id BIGINT, d DATE, t TIMESTAMP)");
+  run_ok(
+    "INSERT INTO timestamps VALUES "
+    "(0, '1994-12-31', '1994-01-01 00:00:00'), "
+    "(1, '1995-01-01', '1995-02-02 01:01:01'), "
+    "(2, '1996-12-31', '1996-03-03 02:02:02'), "
+    "(3, '1997-01-01', '1997-04-04 03:03:03'), "
+    "(4, NULL, NULL)");
+  run_ok("CHECKPOINT");
+
+  // Issue #2292: the extracted column must be BIGINT before it reaches either
+  // the BETWEEN comparisons or the CASE branch, not just at the result boundary.
+  // BETWEEN has three AST operations, exceeding the default min_ast_size of two.
+  check_extraction(
+    "SELECT id, CASE WHEN extract(year FROM d) BETWEEN 1995 AND 1996 "
+    "THEN extract(year FROM d) ELSE NULL END FROM timestamps");
+  // Keep extraction in only the condition or the result so common-subexpression
+  // elimination cannot hoist it into a separate projection that restores its type.
+  check_extraction(
+    "SELECT id, CASE WHEN extract(year FROM d) BETWEEN 1995 AND 1996 "
+    "THEN id ELSE NULL END FROM timestamps");
+  check_extraction(
+    "SELECT id, CASE WHEN id BETWEEN 1 AND 2 THEN extract(year FROM d) ELSE NULL END "
+    "FROM timestamps");
+
+  struct extraction_case {
+    std::string part;
+    int lower;
+    int upper;
+  };
+  for (auto const& [part, lower, upper] : std::vector<extraction_case>{
+         {"year", 1995, 1996},
+         {"month", 2, 3},
+         {"day", 2, 3},
+         {"hour", 1, 2},
+         {"minute", 1, 2},
+         {"second", 1, 2},
+       }) {
+    auto const extraction = "extract(" + part + " FROM t)";
+    auto const predicate =
+      extraction + " BETWEEN " + std::to_string(lower) + " AND " + std::to_string(upper);
+    check_extraction("SELECT id, CASE WHEN " + predicate + " THEN " + extraction +
+                     " ELSE NULL END FROM timestamps");
+    check_extraction("SELECT id, " + extraction + " FROM timestamps WHERE " + predicate);
+  }
 }
