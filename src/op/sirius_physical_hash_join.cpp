@@ -1163,19 +1163,8 @@ std::pair<bool, bool> sirius_physical_hash_join::refresh_cross_schedule()
   // Re-poll both ports and merge any newly-arrived batch IDs (first-seen order preserved; the
   // *_seen sets both dedup and keep already-popped IDs from being re-added).
   for (std::size_t p = 0; p < num_partitions; ++p) {
-    auto& c = _cross[p];
-    for (uint64_t id : probe_port->repo->get_batch_ids(p)) {
-      if (c.probe_id_seen.insert(id).second) {
-        c.probe_ids.push_back(id);
-        c.probe_paired_count.push_back(0);
-      }
-    }
-    for (uint64_t id : build_port->repo->get_batch_ids(p)) {
-      if (c.build_id_seen.insert(id).second) {
-        c.build_ids.push_back(id);
-        c.build_paired_count.push_back(0);
-      }
-    }
+    merge_cross_schedule_batch_ids(
+      _cross[p], probe_port->repo->get_batch_ids(p), build_port->repo->get_batch_ids(p));
   }
 
   // Non-INNER whole-side invariant: whichever side must be seen whole for this join type must stay

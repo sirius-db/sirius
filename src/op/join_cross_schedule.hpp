@@ -48,6 +48,12 @@ struct partition_cross_schedule {
   std::unordered_set<uint64_t> build_popped;     ///< build IDs already freed from the repo
 };
 
+/// Merge newly discovered IDs into a partition, preserving first-seen order and existing pairing
+/// counts. Seen sets prevent duplicates, including IDs already popped from the repositories.
+void merge_cross_schedule_batch_ids(partition_cross_schedule& cross,
+                                    std::vector<uint64_t> const& probe_ids,
+                                    std::vector<uint64_t> const& build_ids);
+
 /// A fully-consumed batch that can be freed from its repository.
 struct cross_schedule_discard {
   std::size_t partition = 0;

@@ -321,18 +321,7 @@ std::pair<bool, bool> sirius_physical_nested_loop_join::refresh_cross_schedule()
   bool const build_finished = build->src_pipeline->is_pipeline_finished();
   if (cross_schedule.empty()) { cross_schedule.resize(1); }
   auto& c = cross_schedule.front();
-  for (auto id : probe->repo->get_batch_ids(0)) {
-    if (c.probe_id_seen.insert(id).second) {
-      c.probe_ids.push_back(id);
-      c.probe_paired_count.push_back(0);
-    }
-  }
-  for (auto id : build->repo->get_batch_ids(0)) {
-    if (c.build_id_seen.insert(id).second) {
-      c.build_ids.push_back(id);
-      c.build_paired_count.push_back(0);
-    }
-  }
+  merge_cross_schedule_batch_ids(c, probe->repo->get_batch_ids(0), build->repo->get_batch_ids(0));
 
   // CONCAT must fold the opposite side before we can decide unmatched / existential rows.
   // Check on every pull as well as every hint: task creation can drain several pairs per hint.
@@ -401,6 +390,10 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::get_next_task_i
         throw std::logic_error("Nested loop join lost an input batch before scheduling its pair");
       }
       pending.slice      = 0;
+      // Here when we call get_batch_rows_and_bytes we need to get read_only lock on the batch.
+      // Simulatenously we also have a lock on task creation. 
+      // This is not ideal, but it only happens once per pair, only for cross joins and it is a bounded lock.
+      // We should make all data_batches be able to report size in bytes and num rows without locking the batch.
       pending.num_slices = conditions.empty()
                              ? cross_join_num_slices(get_batch_rows_and_bytes(*pending.left),
                                                      get_batch_rows_and_bytes(*pending.right),

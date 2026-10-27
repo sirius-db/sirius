@@ -20,6 +20,24 @@
 
 namespace sirius::op {
 
+void merge_cross_schedule_batch_ids(partition_cross_schedule& cross,
+                                    std::vector<uint64_t> const& probe_ids,
+                                    std::vector<uint64_t> const& build_ids)
+{
+  for (uint64_t id : probe_ids) {
+    if (cross.probe_id_seen.insert(id).second) {
+      cross.probe_ids.push_back(id);
+      cross.probe_paired_count.push_back(0);
+    }
+  }
+  for (uint64_t id : build_ids) {
+    if (cross.build_id_seen.insert(id).second) {
+      cross.build_ids.push_back(id);
+      cross.build_paired_count.push_back(0);
+    }
+  }
+}
+
 std::vector<cross_schedule_discard> collect_cross_schedule_discards(
   std::vector<partition_cross_schedule>& cross, bool probe_finished, bool build_finished)
 {
