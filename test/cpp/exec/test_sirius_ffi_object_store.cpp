@@ -18,6 +18,7 @@
 // required; isolated contexts use the same small memory configuration as the existing FFI guards.
 
 #include "sirius/ffi.hpp"
+#include "sirius_ffi_testing.hpp"
 #include "utils/ffi_object_store_fixture.hpp"
 
 #include <arpa/inet.h>
@@ -33,6 +34,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <latch>
 #include <limits>
@@ -368,6 +370,47 @@ std::string authentication_suffix()
          "&X-Amz-Signature=" + std::string(object_store_sentinels[1]) + "#" +
          std::string(object_store_sentinels[0]);
 }
+
+// Cleanup releases and joins the worker even if a main-thread assertion aborts the case.
+struct capture_pause_guard {
+  ~capture_pause_guard() { finish(); }
+
+  void pause()
+  {
+    std::unique_lock lock(mutex);
+    ++calls;
+    hook_thread = std::this_thread::get_id();
+    paused      = true;
+    cv.notify_all();
+    cv.wait(lock, [&] { return resumed; });
+  }
+
+  bool wait_until_paused()
+  {
+    std::unique_lock lock(mutex);
+    return cv.wait_for(lock, 5s, [&] { return paused; });
+  }
+
+  void finish()
+  {
+    {
+      std::lock_guard lock(mutex);
+      resumed = true;
+    }
+    cv.notify_all();
+    if (worker.joinable()) { worker.join(); }
+    sirius::ffi::testing::set_capture_pause_hook({});
+  }
+
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool paused{};
+  bool resumed{};
+  std::size_t calls{};
+  std::thread::id hook_thread;
+  std::exception_ptr failure;
+  std::thread worker;
+};
 
 }  // namespace
 
@@ -773,4 +816,65 @@ TEST_CASE("FFI object store failed fragment builds recapture on retry",
   observer.finish();
   CHECK(observer.error() == 0);
   CHECK(observer.accepted() == 1);  // Only the positive control.
+}
+
+TEST_CASE("FFI object store preserves captured snapshots across publication changes",
+          "[isolated_context][ffi][object_store]")
+{
+  connection_observer observer_a;
+  connection_observer observer_b;
+  observer_a.positive_control();
+  observer_b.positive_control();
+  REQUIRE(observer_a.endpoint() != observer_b.endpoint());
+  {
+    object_store_inputs inputs_a;
+    inputs_a.endpoint = observer_a.endpoint();
+    inputs_a.uri_prefix.clear();
+    auto inputs_b         = inputs_a;
+    inputs_b.endpoint     = observer_b.endpoint();
+    inputs_b.uri_prefix   = "s3://other-bucket/";
+    auto const snapshot_b = inputs_b.snapshot();
+    auto const plan       = read_plan({{"s3://bucket/k.parquet" + authentication_suffix()}});
+
+    for (auto const entry : {entry_point::execute, entry_point::fragment_build}) {
+      for (bool const replace_with_b : {false, true}) {
+        CAPTURE(entry == entry_point::execute, replace_with_b);
+        auto context    = make_context_from_config(memory_config(), inputs_a.snapshot());
+        auto const next = replace_with_b ? snapshot_b : nullptr;
+        capture_pause_guard pause;
+        sirius::ffi::testing::set_capture_pause_hook([&] { pause.pause(); });
+        pause.worker         = std::thread([&] {
+          try {
+            invoke_plan(*context, entry, plan);
+          } catch (...) {
+            pause.failure = std::current_exception();
+          }
+        });
+        auto const worker_id = pause.worker.get_id();
+        REQUIRE(pause.wait_until_paused());
+        context->set_object_store(next);
+        CHECK(context->object_store_config().get() == next.get());
+
+        pause.finish();
+        CHECK(pause.calls == 1);
+        CHECK(pause.hook_thread == worker_id);
+        check_refusal(
+          [&] {
+            if (pause.failure) { std::rethrow_exception(pause.failure); }
+          },
+          "object_store_route_unavailable:",
+          "s3://bucket/k.parquet");
+        check_refusal([&] { invoke_plan(*context, entry, plan); },
+                      replace_with_b ? "object_store_scope:" : "object_store_unconfigured:",
+                      "s3://bucket/k.parquet");
+        CHECK(pause.calls == 1);
+      }
+    }
+  }
+  observer_a.finish();
+  observer_b.finish();
+  CHECK(observer_a.error() == 0);
+  CHECK(observer_b.error() == 0);
+  CHECK(observer_a.accepted() == 1);
+  CHECK(observer_b.accepted() == 1);
 }
