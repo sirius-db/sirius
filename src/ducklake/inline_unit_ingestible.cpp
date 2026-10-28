@@ -296,8 +296,14 @@ struct inline_unit_ingestible::impl {
       chunk  = reader->next();
       offset = 0;
     }
-    size_t count = chunk ? std::min(row_limit, static_cast<size_t>(chunk->size()) - offset) : 0;
-    if (!chunk) done = true;
+    if (!chunk) {
+      done = true;
+      return nullptr;
+    }
+    // Empty provider output advances the reader without creating a GPU batch.
+    // The composite scan supplies an empty carrier only if the whole scan is empty.
+    if (!chunk->size()) return nullptr;
+    size_t count = std::min(row_limit, static_cast<size_t>(chunk->size()) - offset);
     std::array<size_t, columns> string_sizes{};
     if (!strings.empty()) {
       size_t accepted = 0, used = 0;

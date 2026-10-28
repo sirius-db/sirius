@@ -1911,11 +1911,60 @@ TEST_CASE("Production DuckLake inline batch sizing preserves wide nullable rows"
     CHECK(counters->arrow_rows_imported.load() - rows == 4097);
     auto imported = counters->arrow_batches_imported.load() - batches;
     CHECK(imported > 0);
-    // Provider chunk boundaries and empty carriers affect the exact count.
+    // Provider chunk boundaries affect the exact count.
     // A narrow scan must still need fewer imports than 256-row data batches alone.
     if (width == 2) CHECK(imported < 17);
     if (width == 32) CHECK(imported >= 17);
     CHECK(hosts[0]->get_total_reserved_memory() == reserved);
+  }
+}
+
+TEST_CASE("DuckLake inline completion does not import empty Arrow batches",
+          "[isolated_context][ducklake][ducklake_inline_completion]")
+{
+  auto mixed = GENERATE(false, true);
+  INFO(mixed);
+  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
+  sirius::test::scoped_temp_directory disk;
+  sirius::test::shared_test_env env(lake_config());
+  auto con = env.make_connection();
+  if (!load_ducklake(con)) return;
+  query(con, "SET gpu_execution=false");
+  attach_lake(con, disk.directory);
+  query(con, "CALL lake.set_option('data_inlining_row_limit',100)");
+  query(con, "CREATE TABLE lake.q(id BIGINT, s VARCHAR)");
+  if (mixed) {
+    query(con, "INSERT INTO lake.q VALUES (1,'parquet'),(2,NULL)");
+    query(con, "CALL ducklake_flush_inlined_data('lake')");
+  }
+  query(con, "INSERT INTO lake.q VALUES (3,'inline'),(4,NULL),(NULL,'value')");
+  auto expected = ducklake_result_bag(*query(con, "SELECT * FROM lake.q"));
+  auto runtime  = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(runtime);
+  auto counters         = runtime->physical_counters();
+  counters->track_units = true;
+  auto hosts =
+    runtime->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+  REQUIRE(hosts.size() == 1);
+  auto reserved = hosts[0]->get_total_reserved_memory();
+  query(con, "SET gpu_execution=true");
+  query(con, "SET enable_duckdb_fallback=false");
+  for (bool explicit_entry : {false, true}) {
+    auto prepared = con.Prepare(explicit_entry ? "CALL gpu_execution('SELECT * FROM lake.q')"
+                                               : "SELECT * FROM lake.q");
+    REQUIRE_FALSE(prepared->HasError());
+    for (int repeat = 0; repeat < 3; ++repeat) {
+      auto batches = counters->arrow_batches_imported.load();
+      auto rows    = counters->arrow_rows_imported.load();
+      auto result  = prepared->Execute();
+      INFO((result->HasError() ? result->GetError() : "GPU scan completed"));
+      REQUIRE_FALSE(result->HasError());
+      CHECK(ducklake_result_bag(*result) == expected);
+      result.reset();
+      CHECK(counters->arrow_rows_imported.load() - rows == 3);
+      CHECK(counters->arrow_batches_imported.load() - batches == 1);
+      CHECK(hosts[0]->get_total_reserved_memory() == reserved);
+    }
   }
 }
 
