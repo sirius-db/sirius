@@ -36,9 +36,9 @@ void split_connector::push_split(std::unique_ptr<op::operator_data> split)
   auto const split_bytes = split->get_estimated_size_in_bytes();
   push_split_sized(std::move(split), split_bytes);
 }
-void split_connector::set_consumption_callback(std::function<void(size_t)> callback)
+void split_connector::set_consumption_callback(std::function<void(size_t, size_t)> callback)
 {
-  auto owning = std::make_shared<std::function<void(size_t)> const>(std::move(callback));
+  auto owning = std::make_shared<std::function<void(size_t, size_t)> const>(std::move(callback));
   std::lock_guard lock(_mutex);
   _on_consumption = std::move(owning);
 }
@@ -54,6 +54,22 @@ void split_connector::push_split_sized(std::unique_ptr<op::operator_data>&& spli
     // A zero estimate means unknown, not empty; latch it so the total remains conservative.
     _discovered_bytes += split_bytes;
     _has_unsized_splits = _has_unsized_splits || split_bytes == 0;
+  }
+  _cv.notify_one();
+}
+
+void split_connector::push_prepared_scan(std::unique_ptr<op::scan::scan_operator_input>& input,
+                                         size_t bytes,
+                                         size_t preparation_bytes,
+                                         size_t source_id)
+{
+  {
+    std::lock_guard lock(_mutex);
+    if (_closed) throw std::logic_error("prepared scan published after connector close");
+    _splits.emplace_back();  // Allocate before moving or erasing the concrete type.
+    _splits.back() = {std::move(input), preparation_bytes, source_id};
+    _discovered_bytes += bytes;
+    _has_unsized_splits = _has_unsized_splits || bytes == 0;
   }
   _cv.notify_one();
 }
@@ -86,7 +102,7 @@ std::optional<std::unique_ptr<op::operator_data>> split_connector::get_next_spli
                        std::memory_order_relaxed);
     auto consumed = _on_consumption;
     lock.unlock();
-    if (consumed) (*consumed)(split.preparation_bytes);
+    if (consumed) (*consumed)(split.preparation_bytes, split.source_id);
     return std::optional<std::unique_ptr<op::operator_data>>{std::move(split.input)};
   }
   return std::nullopt;

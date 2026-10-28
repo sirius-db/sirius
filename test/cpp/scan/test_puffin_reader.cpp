@@ -254,7 +254,7 @@ std::vector<int64_t> read_for_test(DeletionVectorRef ref,
   auto parser          = static_cast<uint64_t>(ref.file_size_in_bytes) * 14 + 512;
   provider.grant_bytes = positions + blob + parser;
   preparation_ledger ledger(provider);
-  std::array scans{scan_envelope{{{blob, parser, 0, positions}}, 0, 0, true}};
+  std::array scans{scan_envelope{{{{blob, parser, 0}, positions}}, {}, true}};
   REQUIRE(ledger.admit(scans, memory_space_id(cucascade::memory::Tier::HOST, 0)).deferred);
   ledger.register_unit({1, 1}, positions);
   auto permit = ledger.acquire_permit({1, 1});
@@ -681,7 +681,7 @@ TEST_CASE(
   preparation_ledger ledger(provider);
   auto ref               = fixture_ref();
   ref.file_size_in_bytes = fs::file_size(ref.puffin_path);
-  std::array scans{scan_envelope{{{44, 64 * 1024, 0, 16}}, 0, 0, true}};
+  std::array scans{scan_envelope{{{{44, 64 * 1024, 0}, 16}}, {}, true}};
   REQUIRE(ledger.admit(scans, memory_space_id(cucascade::memory::Tier::HOST, 0)).deferred);
   ledger.register_unit({1, 1}, 16);
   auto permit = ledger.acquire_permit({1, 1});

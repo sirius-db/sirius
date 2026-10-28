@@ -18,12 +18,14 @@
 
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
+#include "helper/type_conversions.hpp"
 #include "op/input_free_operator_data.hpp"
 #include "telemetry/nvtx.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/null_mask.hpp>
+#include <cudf/scalar/scalar.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/error.hpp>
 
@@ -49,6 +51,60 @@
 namespace sirius::op {
 
 namespace {
+
+// Empty Parquet sources carry the exact bound schema in an owned empty collection.
+// Unlike flat Sirius types, this retains every nested child without reading a footer.
+std::unique_ptr<cudf::column> empty_bound_column(duckdb::LogicalType const& type,
+                                                 ::cuda::stream_ref stream,
+                                                 rmm::device_async_resource_ref mr)
+{
+  using id = duckdb::LogicalTypeId;
+  if (type.id() == id::VARCHAR) {
+    // Keep an offsets child even for zero strings: nested host-result conversion
+    // visits this schema, while make_empty_column(STRING) is childless.
+    cudf::numeric_scalar<int32_t> zero(0, true, stream, mr);
+    std::vector<std::unique_ptr<cudf::column>> children;
+    children.push_back(cudf::make_column_from_scalar(zero, 1, stream, mr));
+    return std::make_unique<cudf::column>(
+      cudf::data_type{cudf::type_id::STRING},
+      0,
+      rmm::device_buffer{},
+      cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr),
+      0,
+      std::move(children));
+  }
+  if (type.id() == id::STRUCT) {
+    std::vector<std::unique_ptr<cudf::column>> children;
+    for (auto const& [name, child] : duckdb::StructType::GetChildTypes(type)) {
+      children.push_back(empty_bound_column(child, stream, mr));
+    }
+    return cudf::make_structs_column(
+      0,
+      std::move(children),
+      0,
+      cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr),
+      stream,
+      mr);
+  }
+  if (type.id() == id::LIST || type.id() == id::ARRAY || type.id() == id::MAP) {
+    auto const child_type =
+      type.id() == id::ARRAY ? duckdb::ArrayType::GetChildType(type)
+      : type.id() == id::MAP
+        ? duckdb::LogicalType::STRUCT(
+            {{"key", duckdb::MapType::KeyType(type)}, {"value", duckdb::MapType::ValueType(type)}})
+        : duckdb::ListType::GetChildType(type);
+    auto child = empty_bound_column(child_type, stream, mr);
+    cudf::numeric_scalar<int32_t> zero(0, true, stream, mr);
+    auto offsets = cudf::make_column_from_scalar(zero, 1, stream, mr);
+    return cudf::make_lists_column(
+      0,
+      std::move(offsets),
+      std::move(child),
+      0,
+      cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr));
+  }
+  return cudf::make_empty_column(sirius::require_cudf_type(sirius::from_duckdb(type)));
+}
 
 //===----------------------------------------------------------------------===//
 // Host-side column staging
@@ -354,7 +410,27 @@ std::unique_ptr<operator_data> sirius_physical_gpu_values::execute(const operato
     // EMPTY_RESULT (or an empty collection): 0-row table with the declared
     // schema, so downstream operators see a real (empty) input — the same
     // shape a filter-everything pipeline produces.
-    output_table = sirius::make_empty_table(types);
+    if (_collection && !_collection->Types().empty()) {
+      auto const& schema = _collection->Types();
+      if (schema.size() != types.size()) {
+        throw std::runtime_error("empty GPU VALUES schema width differs from output types");
+      }
+      std::vector<std::unique_ptr<cudf::column>> columns;
+      for (size_t i = 0; i < schema.size(); ++i) {
+        auto const nested = schema[i].id() == duckdb::LogicalTypeId::LIST ||
+                            schema[i].id() == duckdb::LogicalTypeId::STRUCT ||
+                            schema[i].id() == duckdb::LogicalTypeId::MAP ||
+                            schema[i].id() == duckdb::LogicalTypeId::ARRAY;
+        columns.push_back(has_physical_overrides() && !nested &&
+                              get_physical_types()[i].id() != cudf::type_id::STRING
+                            ? cudf::make_empty_column(get_physical_types()[i])
+                            : empty_bound_column(schema[i], stream, mr));
+      }
+      output_table = std::make_unique<cudf::table>(std::move(columns));
+    } else {
+      output_table = has_physical_overrides() ? sirius::make_empty_table(get_physical_types())
+                                              : sirius::make_empty_table(types);
+    }
   }
 
   auto batch =

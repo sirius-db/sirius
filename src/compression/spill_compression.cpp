@@ -176,6 +176,7 @@ encoded_batch encode_for_spill(const cucascade::gpu_table_representation& source
                                ::cuda::stream_ref stream)
 {
   nvtx_scoped_range nvtx_range{"sirius::compression::spill_encode"};
+  source.wait_for_writer(stream);
   auto const settings = compression::get_spill_compression_settings();
   auto const view     = source.get_table_view();
 

@@ -16,20 +16,23 @@
 
 #include "op/dynamic_filter/dynamic_filter_replica_space.hpp"
 
-#include <cucascade/memory/common.hpp>
+#include "memory/pool_peer_access.hpp"
+
+#include <cucascade/memory/memory_space.hpp>
+
+#include <vector>
 
 namespace sirius::op {
 
-std::optional<std::pair<int, int>> find_pair_without_peer_dma(std::span<int const> device_ids)
+std::optional<std::pair<int, int>> find_pair_without_pool_access(
+  std::span<dynamic_filter_replica_space const> replicas)
 {
-  for (auto const source : device_ids) {
-    for (auto const destination : device_ids) {
-      if (source != destination && !cucascade::memory::probe_peer_dma_works(source, destination)) {
-        return std::pair{source, destination};
-      }
-    }
+  std::vector<cucascade::memory::memory_space const*> spaces;
+  spaces.reserve(replicas.size());
+  for (auto const& replica : replicas) {
+    spaces.push_back(&replica.get_gpu_space());
   }
-  return std::nullopt;
+  return sirius::memory::find_pair_without_pool_access(spaces);
 }
 
 }  // namespace sirius::op

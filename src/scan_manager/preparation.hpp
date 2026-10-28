@@ -16,6 +16,7 @@
 
 #pragma once
 #include "op/scan/table_scan/scan_contract.hpp"
+#include "scan_manager/coordinator_pool.hpp"
 #include "transparent/replay_admission.hpp"
 
 #include <bitset>
@@ -30,6 +31,7 @@
 #include <string>
 
 namespace sirius::scan_manager {
+enum class preparation_execution_domain { metadata_worker, query_owner, native_reader };
 enum class required_input : uint8_t { footer, segments, visibility, checkpoint_iteration };
 using required_input_set = std::bitset<4>;
 enum class unit_state : uint8_t { pending, ready, failed, cancelled };
@@ -69,6 +71,16 @@ struct checkpoint_input {
 struct preparation_gate {
   std::mutex mutex;
   std::condition_variable cv;
+  // Protected by mutex; captures notifications that arrive during unlocked callbacks.
+  uint64_t wake_generation = 0;
+  // Lock order is gate -> pool. This only schedules a step, never executes it inline.
+  coordinator_pool::wakeup pool_wakeup;
+  void notify_under_lock() noexcept
+  {
+    ++wake_generation;
+    cv.notify_all();
+    pool_wakeup();
+  }
   // Bound before arm; callers hold mutex while checking admission or publication.
   std::function<bool()> interrupted;
   void check_interrupted();
@@ -76,6 +88,22 @@ struct preparation_gate {
   size_t callbacks = 0;
   std::function<void(std::exception_ptr)> report_error;
   std::function<void(preparation_failure const&)> report_failure;
+};
+// A resource owner can signal readiness, but cannot install arbitrary cleanup callbacks.
+class preparation_wakeup {
+ public:
+  preparation_wakeup() = default;
+  explicit preparation_wakeup(std::weak_ptr<preparation_gate> gate) : gate_(std::move(gate)) {}
+  void operator()() const noexcept
+  {
+    if (auto gate = gate_.lock()) {
+      std::lock_guard lock(gate->mutex);
+      gate->notify_under_lock();
+    }
+  }
+
+ private:
+  std::weak_ptr<preparation_gate> gate_;
 };
 // The attempt owns registration; workers receive only this unit and independent inputs.
 // Readiness is not publication: the attempt's publication gate is checked separately.

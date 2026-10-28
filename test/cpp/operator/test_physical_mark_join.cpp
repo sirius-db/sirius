@@ -1108,8 +1108,8 @@ TEST_CASE("sirius_physical_nested_loop_join rejects join types it cannot execute
   }
 }
 
-// SINGLE reaches neither GPU join: both dispatches fall through to a mid-query throw.
-// are_conditions_supported now folds in the join-type screen so the planner rejects it.
+// are_conditions_supported folds in the join-type screen so the planner rejects what no GPU
+// join executes.
 TEST_CASE("sirius_physical_hash_join rejects join types it cannot execute",
           "[physical_hash_join][join_type]")
 {
@@ -1123,11 +1123,12 @@ TEST_CASE("sirius_physical_hash_join rejects join types it cannot execute",
                          JT::RIGHT_SEMI,
                          JT::RIGHT_ANTI,
                          JT::MARK,
-                         JT::OUTER}) {
+                         JT::OUTER,
+                         JT::SINGLE}) {
     INFO("join type " << duckdb::JoinTypeToString(join_type));
     REQUIRE(sirius_physical_hash_join::is_join_type_supported(join_type));
   }
-  REQUIRE_FALSE(sirius_physical_hash_join::is_join_type_supported(JT::SINGLE));
+  REQUIRE_FALSE(sirius_physical_hash_join::is_join_type_supported(JT::INVALID));
 
   // A plain equality condition the hash join would otherwise accept.
   auto make_conditions = [](duckdb::ExpressionType comparison) {
@@ -1143,8 +1144,9 @@ TEST_CASE("sirius_physical_hash_join rejects join types it cannot execute",
   auto equal_conditions = make_conditions(duckdb::ExpressionType::COMPARE_EQUAL);
   REQUIRE(sirius_physical_hash_join::are_conditions_supported(equal_conditions, JT::INNER));
   REQUIRE(sirius_physical_hash_join::are_conditions_supported(equal_conditions, JT::MARK));
+  REQUIRE(sirius_physical_hash_join::are_conditions_supported(equal_conditions, JT::SINGLE));
   // Rejected on the join type alone, not the conditions.
-  REQUIRE_FALSE(sirius_physical_hash_join::are_conditions_supported(equal_conditions, JT::SINGLE));
+  REQUIRE_FALSE(sirius_physical_hash_join::are_conditions_supported(equal_conditions, JT::INVALID));
 
   // An all-null-safe MARK is supported: one EQUAL covers every key and the marks are definite.
   auto null_safe_conditions = make_conditions(duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM);

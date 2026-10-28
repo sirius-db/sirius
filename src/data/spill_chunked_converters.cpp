@@ -264,7 +264,8 @@ std::unique_ptr<cucascade::idata_representation> convert_gpu_to_host_chunked(
 {
   nvtx3::scoped_range nvtx_range{"sirius::spill::gpu_to_host_chunked"};
 
-  auto& gpu_source            = source.cast<cucascade::gpu_table_representation>();
+  auto const& gpu_source = source.cast<cucascade::gpu_table_representation>();
+  gpu_source.wait_for_writer(stream);
   const cudf::table_view view = gpu_source.get_table_view();
 
   // Pass 1: plan the allocation layout.
