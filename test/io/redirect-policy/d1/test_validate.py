@@ -54,7 +54,7 @@ class NegativeReceipts(unittest.TestCase):
         for name in ['observer_failure', 'observer_overflow', 'observer_exception']:
             cases.append((name, load(ROOT / (name + '.jsonl')), 'reuse'))
         bad = load(ROOT / 'stale.jsonl')
-        next((e for e in bad if e['kind'] == 'invalidated'))['current'] = 0
+        next((e for e in bad if e['kind'] == 'invalidated' and e['id'] == 64))['current'] = 0
         cases.append(('wrong_publication', bad, 'stale'))
         bad = load(ROOT / 'reuse.jsonl')
         bad.pop(1)
