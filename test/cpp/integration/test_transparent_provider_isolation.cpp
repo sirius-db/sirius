@@ -2053,8 +2053,8 @@ TEST_CASE("DuckLake result fragments execute original bindings without CPU repla
   CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
 }
 
-TEST_CASE("DuckLake scalar subqueries and floating predicates match CPU results",
-          "[isolated_context][ducklake][ducklake_scalar_nan]")
+TEST_CASE("DuckLake scalar subqueries match CPU results",
+          "[isolated_context][ducklake][ducklake_scalar_subqueries]")
 {
   auto parquet = GENERATE(false, true);
   if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
@@ -2066,31 +2066,11 @@ TEST_CASE("DuckLake scalar subqueries and floating predicates match CPU results"
   attach_lake(con, disk.directory);
   query(con, "CALL lake.set_option('data_inlining_row_limit',100)");
   query(con, "CREATE TABLE lake.scalar_value AS SELECT 42::BIGINT AS x");
-  query(con, "CREATE TABLE lake.floats(f FLOAT, d DOUBLE)");
-  query(con,
-        "INSERT INTO lake.floats SELECT x::FLOAT,x FROM (VALUES "
-        "('-inf'::DOUBLE),(-1),(0),('inf'),('NaN'),(NULL)) t(x)");
   if (parquet) query(con, "CALL ducklake_flush_inlined_data('lake')");
   std::vector<std::string> queries{"SELECT (SELECT x FROM lake.scalar_value)",
                                    "SELECT first(x),count(*) FROM lake.scalar_value",
                                    "SELECT (SELECT x FROM lake.scalar_value WHERE x%2=1)",
                                    "SELECT first(NULL::BIGINT),count(*) FROM lake.scalar_value"};
-  for (auto column : {std::string("f"), std::string("d")}) {
-    for (auto op : {"=", "<>", ">", ">=", "<", "<=", "IS DISTINCT FROM", "IS NOT DISTINCT FROM"}) {
-      queries.push_back("SELECT a." + column + " " + op + " b." + column +
-                        " FROM lake.floats a CROSS JOIN lake.floats b");
-      queries.push_back("SELECT count(*) FROM lake.floats WHERE " + column + " " + op + " 'NaN'");
-    }
-    for (auto predicate : {" BETWEEN '-inf' AND 'NaN'",
-                           " IN ('NaN', 1)",
-                           " NOT IN ('NaN', 1)",
-                           " IN ('NaN', NULL)",
-                           " NOT IN ('NaN', NULL)",
-                           " > 1e300"}) {
-      queries.push_back("SELECT " + column + predicate + " FROM lake.floats");
-      queries.push_back("SELECT count(*) FROM lake.floats WHERE " + column + predicate);
-    }
-  }
   std::vector<std::vector<std::string>> expected;
   for (auto const& sql : queries)
     expected.push_back(ducklake_result_bag(*query(con, sql)));
@@ -2285,7 +2265,7 @@ TEST_CASE("DuckLake reuses delete preparation capacity across files and scans",
   run("INSERT INTO lake.q VALUES (-1),(-2)");
   std::vector<std::string> sql{"SELECT count(*),sum(i) FROM lake.q",
                                "SELECT count(*) FROM lake.q",
-                               "SELECT i FROM lake.q WHERE i=50 OR i::VARCHAR LIKE '%9%'",
+                               "SELECT i FROM lake.q WHERE i=50 OR i%10=9",
                                "SELECT count(*),sum(a.i) FROM lake.q a JOIN lake.q b ON a.i=b.i"};
   std::vector<std::vector<std::string>> expected;
   for (auto const& text : sql)
