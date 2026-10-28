@@ -320,7 +320,7 @@ bool binding_handle::can_prune_unit(uint64_t index) const
     ExpressionType comparison;
     Value threshold;
     {
-      lock_guard<mutex> guard(dynamic->lock);
+      annotated_lock_guard<annotated_shared_mutex> guard(dynamic->lock);
       if (!dynamic->initialized) continue;
       comparison = dynamic->comparison_type;
       threshold  = dynamic->constant;

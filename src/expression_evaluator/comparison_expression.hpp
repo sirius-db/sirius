@@ -20,7 +20,11 @@
 #include "helper/logical_type.hpp"
 #include "sirius/exception.hpp"
 
+// cuDF AST literals use std::variant without including its header.
+// clang-format off
+#include <variant>
 #include <cudf/ast/expressions.hpp>
+// clang-format on
 
 namespace sirius {
 inline bool floating_comparison(logical_type const& left, logical_type const& right)
