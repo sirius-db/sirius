@@ -30,7 +30,7 @@ Every byte of data lives in exactly one **memory tier** at any moment. Tiers, fa
 |------|-----------|-------------------|-----------------|
 | `GPU` | `cuda_async_memory_resource` (one pool per device) | Bounded by GPU device memory × `usage_limit_fraction` | Active query data |
 | `HOST` | NUMA-local pinned host memory | Set by config: `memory.host.capacity_bytes` (per NUMA host memory resource) | Downgrade target when GPU is full |
-| `DISK` | On-disk file pool via cucascade's `idisk_io_backend` | Configured via `set_disk_mounting_point(gpu_id, capacity, path)` | Last-resort downgrade target |
+| `DISK` | Raw and `.hpln` spill files via a per-space `std::shared_ptr<cucascade::io::ioctx>` ([I/O ownership](memory-management.md#disk-io-and-ownership)) | Reservation bound via `set_disk_mounting_point(disk_id, capacity, path)` | Last-resort downgrade target |
 
 `HOST` is partitioned by NUMA node — each GPU has a paired host region on its NUMA-local memory controller for fast downgrade. This is configured via `cucascade::memory::reservation_manager_configurator::use_host_per_gpu()` at startup.
 
