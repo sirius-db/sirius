@@ -49,7 +49,6 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
-#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -133,29 +132,50 @@ constexpr std::size_t kBitpackChunk = 1024;
 /// A delta plan replaces plain bitpack only when it is estimated this much smaller.
 constexpr double kMinDeltaSaving = 0.9;
 
-/// Estimated bitpack size of @p values: each chunk at the bit width of its range, plus
-/// its min/count/width header.
-double estimated_bitpack_bytes(std::vector<__int128> const& values)
-{
-  double bytes = 0;
-  for (std::size_t begin = 0; begin < values.size(); begin += kBitpackChunk) {
-    auto const end      = std::min(values.size(), begin + kBitpackChunk);
-    auto const [lo, hi] = std::minmax_element(values.begin() + begin, values.begin() + end);
-    auto range          = static_cast<unsigned __int128>(*hi - *lo);
-    int bits            = 0;
+/// Estimated bitpack size of a stream of values pushed one at a time: each chunk at the
+/// bit width of its range, plus its min/count/width header.
+class bitpack_size_estimate {
+ public:
+  void push(__int128 value)
+  {
+    lo_ = count_ == 0 ? value : std::min(lo_, value);
+    hi_ = count_ == 0 ? value : std::max(hi_, value);
+    if (++count_ == kBitpackChunk) { close_chunk(); }
+  }
+
+  /// The estimate, counting a partial last chunk.
+  double finish()
+  {
+    close_chunk();
+    return bytes_;
+  }
+
+ private:
+  void close_chunk()
+  {
+    if (count_ == 0) { return; }
+    auto range = static_cast<unsigned __int128>(hi_ - lo_);
+    int bits   = 0;
     for (; range != 0; range >>= 1) {
       ++bits;
     }
-    bytes += static_cast<double>(end - begin) * bits / 8 + 16;
+    bytes_ += static_cast<double>(count_) * bits / 8 + 16;
+    count_ = 0;
   }
-  return bytes;
-}
+
+  __int128 lo_{0};
+  __int128 hi_{0};
+  std::size_t count_{0};
+  double bytes_{0};
+};
 
 /// Integer-valued columns (integers, decimals up to 64 bits, dates and times) choose
 /// between bitpack, delta -> bitpack and delta -> rle -> bitpack by estimating each one's
 /// size on a prefix sample. Sorted keys, which often reach a spill still in order, pack
-/// far smaller as differences, and runs of equal keys smaller still as runs.
-std::string integer_spill_plan(cudf::column_view const& column, rmm::cuda_stream_view stream)
+/// far smaller as differences, and runs of equal keys smaller still as runs. The sample
+/// is bounded (kIntegerSampleRows), so estimating it on the host costs little next to
+/// the GPU encode that follows.
+std::string integer_spill_plan(cudf::column_view const& column, ::cuda::stream_ref stream)
 {
   auto const width = cudf::size_of(column.type());
   auto const rows  = static_cast<std::size_t>(std::min(column.size(), kIntegerSampleRows));
@@ -164,37 +184,46 @@ std::string integer_spill_plan(cudf::column_view const& column, rmm::cuda_stream
                                 column.head<std::uint8_t>() + column.offset() * width,
                                 raw.size(),
                                 cudaMemcpyDeviceToHost,
-                                stream.value()));
-  stream.synchronize();
+                                stream.get()));
+  stream.sync();
 
-  // Widen every value to 128 bits so differences cannot overflow.
   bool const is_unsigned = cudf::is_unsigned(column.type());
   auto const shift       = 64 - 8 * static_cast<int>(width);
-  std::vector<__int128> values(rows);
+  bitpack_size_estimate values;
+  bitpack_size_estimate deltas;
+  bitpack_size_estimate run_lengths;
+  bitpack_size_estimate run_values;
+  __int128 previous      = 0;
+  __int128 run_value     = 0;
+  std::size_t run_length = 0;
   for (std::size_t i = 0; i < rows; ++i) {
+    // Widened to 128 bits so differences cannot overflow.
     std::uint64_t bits = 0;
     std::memcpy(&bits, raw.data() + i * width, width);
-    values[i] =
+    __int128 const value =
       is_unsigned ? static_cast<__int128>(bits) : static_cast<std::int64_t>(bits << shift) >> shift;
-  }
-
-  std::vector<__int128> deltas(values.size());
-  std::adjacent_difference(values.begin(), values.end(), deltas.begin());
-  std::vector<__int128> run_lengths;
-  std::vector<__int128> run_values;
-  for (std::size_t i = 0; i < deltas.size();) {
-    auto j = i + 1;
-    while (j < deltas.size() && deltas[j] == deltas[i]) {
-      ++j;
+    // The first value is its own difference, as delta stores it.
+    __int128 const delta = i == 0 ? value : value - previous;
+    previous             = value;
+    values.push(value);
+    deltas.push(delta);
+    if (run_length > 0 && delta == run_value) {
+      ++run_length;
+      continue;
     }
-    run_values.push_back(deltas[i]);
-    run_lengths.push_back(static_cast<__int128>(j - i));
-    i = j;
+    if (run_length > 0) {
+      run_lengths.push(static_cast<__int128>(run_length));
+      run_values.push(run_value);
+    }
+    run_value  = delta;
+    run_length = 1;
   }
+  run_lengths.push(static_cast<__int128>(run_length));
+  run_values.push(run_value);
 
-  auto const bitpack = estimated_bitpack_bytes(values);
-  auto const delta   = estimated_bitpack_bytes(deltas);
-  auto const rle     = estimated_bitpack_bytes(run_lengths) + estimated_bitpack_bytes(run_values);
+  auto const bitpack = values.finish();
+  auto const delta   = deltas.finish();
+  auto const rle     = run_lengths.finish() + run_values.finish();
   if (rle < kMinDeltaSaving * std::min(bitpack, delta)) { return kDeltaRleBitpackPlan; }
   if (delta < kMinDeltaSaving * bitpack) { return kDeltaBitpackPlan; }
   return kBitpackPlan;
@@ -202,7 +231,7 @@ std::string integer_spill_plan(cudf::column_view const& column, rmm::cuda_stream
 
 }  // namespace
 
-std::string default_spill_plan(cudf::column_view const& column, rmm::cuda_stream_view stream)
+std::string default_spill_plan(cudf::column_view const& column, ::cuda::stream_ref stream)
 {
   if (column.type().id() == cudf::type_id::STRING) {
     if (column.size() < kMinDictionaryRows) { return kStoredPlan; }
