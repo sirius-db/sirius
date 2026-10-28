@@ -28,6 +28,7 @@
 #include <rmm/device_uvector.hpp>
 #include <rmm/error.hpp>
 
+#include <cuda/buffer>
 #include <cuda_runtime_api.h>
 
 #include <data/data_batch_utils.hpp>
@@ -993,7 +994,17 @@ void apply_cached(application_result_state& result,
     // Both paths have resolved the residual's nulls into its values. The validity is freed in
     // stream order, after the work already submitted that reads it.
     if (result.conjunction->nullable()) {
-      result.conjunction->set_null_mask(rmm::device_buffer{}, 0);
+      auto clear_null_mask = [stream, mr]<typename Column>(Column& column) {
+        if constexpr (requires {
+                        column.set_null_mask(cuda::device_buffer<cudf::bitmask_type>{stream, mr},
+                                             0);
+                      }) {
+          column.set_null_mask(cuda::device_buffer<cudf::bitmask_type>{stream, mr}, 0);
+        } else {
+          column.set_null_mask(rmm::device_buffer{}, 0);
+        }
+      };
+      clear_null_mask(*result.conjunction);
     }
     if (result.fused_rounds != 0) {
       // std::ranges::fill does not accept std::vector<bool>.
