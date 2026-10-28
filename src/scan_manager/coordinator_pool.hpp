@@ -73,6 +73,8 @@ class coordinator_pool {
   // Starts workers lazily. Registration is dormant until wake(); wake never allocates
   // or waits for capacity. Drain before releasing the registration.
   // Steps must not wait for I/O, capacity or dependencies. stop and fail must not throw.
+  // The pool does not select a CUDA device for its workers. Control hooks do host-side work;
+  // device work runs in an execution domain that explicitly selects the required device.
   std::shared_ptr<registration> add(std::function<step_result()> step,
                                     std::function<void()> stop,
                                     std::function<void(std::exception_ptr)> fail);

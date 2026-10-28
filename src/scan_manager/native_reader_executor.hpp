@@ -33,6 +33,13 @@ class native_reader_executor {
   struct operation {
     virtual ~operation()        = default;
     virtual void run() noexcept = 0;
+    // Valid CUDA device ordinal for run(), or -1 for host-only work. Workers have no fixed
+    // device affinity; the executor selects this device for the duration of run() and of the
+    // operation's destruction that follows it. An operation
+    // that leaves device-resident output must record a writer event after its last write and hand
+    // it over with the output; the consumer waits on that event on its own stream before reading.
+    // Never synchronize the whole device.
+    virtual int device_id() const noexcept { return -1; }
   };
   class lease {
    public:

@@ -18,6 +18,8 @@
 
 #include "transparent/replay_admission.hpp"
 
+#include <rmm/cuda_device.hpp>
+
 #include <algorithm>
 #include <cassert>
 #include <condition_variable>
@@ -77,8 +79,14 @@ struct native_reader_executor::state {
         slot.running = true;
         work         = std::move(slot.pending);
       }
-      work->run();
-      work.reset();  // The operation and its captures die on the assigned thread, unlocked.
+      if (auto const device = work->device_id(); device >= 0) {
+        rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{device}};
+        work->run();
+        work.reset();  // Captures that hold device resources are released on that device.
+      } else {
+        work->run();
+        work.reset();  // The operation and its captures die on the assigned thread, unlocked.
+      }
       {
         std::lock_guard lock(mutex);
         slots[selected].running = false;
