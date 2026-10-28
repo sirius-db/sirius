@@ -287,6 +287,7 @@ jobs:
           chmod -R a+r test_datasets/
           mkdir -p test_datasets/tpch_parquet_sf1
           ./sirius-duckdb/build/release/duckdb -f scripts/tpch_to_parquet.sql
+          ./test/tpcds_performance/generate_tpcds_data.sh 1 --format parquet
 
       - name: S3 integration tests
         run: make s3-test
@@ -324,6 +325,37 @@ jobs:
         with:
           name: tpch-run-${{ github.run_id }}-cuda-${{ matrix.cuda.version }}
           path: ${{ steps.tpch.outputs.run_dir }}
+          retention-days: 14
+
+      - name: TPC-DS performance snapshot
+        id: tpcds
+        env:
+          SIRIUS_CONFIG_FILE: ${{ github.workspace }}/test/cpp/integration/integration.yaml
+          PARQUET_DIR: ${{ github.workspace }}/test_datasets/tpcds_parquet_sf1
+        run: |
+          ./test/tpcds_performance/benchmark_and_validate.sh 1
+          RUN_DIR=$(ls -td runs/*/ | head -1)
+          echo "run_dir=$RUN_DIR" >> "$GITHUB_OUTPUT"
+          {
+            echo "## TPC-DS Performance (SF1)"
+            echo '```'
+            cat "$RUN_DIR/comparison.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          ERRORS=$(tail -n +2 "$RUN_DIR/validation.csv" | grep -cE ',error$' || true)
+          if [ "$ERRORS" -gt 0 ]; then
+            echo "::error::TPC-DS snapshot: $ERRORS queries errored"
+            if [ "${{ github.event_name }}" = "merge_group" ]; then
+              exit 1
+            fi
+          fi
+
+      - name: Upload TPC-DS run artifacts
+        if: always() && steps.tpcds.outputs.run_dir != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tpcds-run-${{ github.run_id }}-cuda-${{ matrix.cuda.version }}
+          path: ${{ steps.tpcds.outputs.run_dir }}
           retention-days: 14
 
   test:
