@@ -712,7 +712,7 @@ void SiriusRegistration::GPUExecutionFunction(ClientContext& context,
   auto result_chunk = gstate.res->Fetch();
   if (result_chunk == nullptr) {
     gstate.finished = true;
-    output.SetCardinalityUnsafe(0);
+    output.CheckCardinality(0);
     return;
   }
 
