@@ -69,8 +69,8 @@ SiriusContext (src/sirius_context.{hpp,cpp})
 │     └─ (Tier::DISK shared by all GPUs)
 │
 ├─ sirius_scan_manager
-│  ├─ _io_ctx          local ioctx: uring, or kvikio on the single-GPU opt-out
-│  ├─ _ioctx_registry  path → backend type + factory (uring / restful / kvikio)
+│  ├─ _io_ctx          local ioctx: uring (cuFile is single-GPU only)
+│  ├─ _ioctx_registry  path → backend type + factory (uring / restful / cufile)
 │  ├─ _routed_io_ctxs  one ioctx per routed backend type, built on first use
 │  │
 │  │  manages pinned_entry records; populated by pin_table
@@ -104,7 +104,7 @@ Ownership goes one direction: `SiriusContext` owns everything below it. Connecti
 3. **Build memory spaces.** A `reservation_manager_configurator` is configured with per-GPU usage limits, per-host capacities, optional disk mounts, and NUMA pairings. `builder.build()` produces `memory_space_config`s, which `sirius_memory_reservation_manager` consumes to construct all tier × gpu spaces.
 4. **Grant actual pool access, then install per-GPU device resource refs.** The manager calls `sirius::memory::try_grant_pool_access` for each ordered pair of distinct configured GPU spaces before installing any resource reference. Only ordinary RMM async pools have established allocation properties; unknown resources remain unavailable. Unsupported or failed byte verification is nonfatal, while a CUDA error aborts construction. No ordinary `cudaDeviceEnablePeerAccess` call or device-default-pool grant is made. For each GPU, `sirius_memory_reservation_manager`'s constructor sets that GPU's `cuda_async_memory_resource` as cudf's `current_device_resource_ref` (saving the previous ref for restoration on shutdown). This ensures cudf operations on each GPU allocate through that GPU's reservation-tracked pool.
 5. **Construct the scan manager and its local ioctx.** The scan manager creates one `uring_ioctx` for local files. Its reactor pool accepts device-read requests for any visible GPU.
-6. **Register the path-routed backends.** The scan manager's `io_context_registry` holds one entry per backend type (`uring` / `restful` / `kvikio`), each a path checker and a factory. A REST ioctx for `s3://` is built on first use and shared by all GPUs.
+6. **Register the path-routed backends.** The scan manager's `io_context_registry` holds one entry per backend type (`uring` / `restful` / `cufile`), each a path checker and a factory, with no catch-all. A REST ioctx for `s3://` is built on first use and shared by all GPUs; its workers drive HTTP/1.1 over io_uring, with kTLS or user-space TLS for HTTPS endpoints.
 7. **Restore cudf device-resource refs on shutdown.** `sirius_memory_reservation_manager`'s destructor first synchronizes each managed GPU (`cudaDeviceSynchronize()`) so pending `cudaFreeAsync` operations against the soon-to-be-destroyed pool complete, then restores cudf's previous device resource ref. The sync step is critical — without it, tests that leave async deallocations un-synchronized can corrupt the driver's per-device pool list and crash the next manager construction on the same device.
 
 After `initialize()`, the engine has per-GPU memory pools, the default backend's I/O reactor pool (other backends' pools are built on first use), path-based datasource routing, and a manager that translates `(Tier, gpu_id)` into an allocator.
@@ -200,18 +200,18 @@ Sirius ordinary dynamic-filter replication and late materialization share `memor
 
 ## Multi-GPU-Safe Parquet I/O
 
-Multi-GPU parquet reads, local and `s3://`, stay **off kvikio**. The registry still carries a kvikio catch-all for paths no explicit backend claims; the config below keeps local parquet from falling through to it. The reasoning: cudf's bundled `file_source` factory uses kvikio, which binds the file handle to whichever CUDA context was active at construction time. In multi-GPU execution that's a hidden source of corruption — a file_handle bound to GPU 0 will silently funnel reads through GPU 0 even when the consumer is on GPU 1. `sirius_config::enforce_native_backend_for_multi_gpu()` therefore forces `scan_manager_config::backend = io_backend::native` whenever more than one GPU memory space is configured, and emits a warning if the user-supplied value was `kvikio`.
+Multi-GPU parquet reads, local and `s3://`, use cuCascade's native I/O stack rather than cuDF's path-based file-source factory, which can bind a file handle to the CUDA context active at construction. A handle bound to GPU 0 must not silently funnel reads through GPU 0 when the consumer is on GPU 1. `sirius_config::enforce_native_backend_for_multi_gpu()` therefore forces `scan_manager_config::backend = io_backend::native` whenever more than one GPU memory space is configured, with a warning for a non-native selection. The existing `backend: cufile` selection remains single-GPU only.
 
-Single-GPU configurations may still opt out via `backend: kvikio`; the per-FileHandle context binding is harmless with only one CUDA context in play. With that setting, local paths resolve to `kvikio_context` instead of `uring_ioctx`. Reads still use the `cucascade::io::datasource` interface, and the kvikio backend reads through kvikIO's file and remote handles. The rest of this section describes the multi-GPU (`backend: native`) path.
+The kvikIO backend and registry catch-all have been removed for every GPU count. `backend: kvikio` and the `scan_manager.kvikio` block are rejected with an error directing users to `native`; neither is an alias or an ignored block.
 
 The native path:
 
 1. **Managed file reads go through `sirius::io::open_datasource(io_ctx, path)`**, which normalizes the path and calls cuCascade's `cucascade::io::open_datasource`. Never `cudf::io::datasource::create(path)` and never `cudf::io::source_info{path}`.
 2. **An ioctx is shared across GPUs.** The ioctx and its reactors bind no device at construction. A device read captures the caller's current CUDA device when it is submitted and carries it on the request. The reactor that serves the request makes that device current for the H2D copy and records the copy's event on it.
-3. **Paths are resolved through `io_context_registry`.** The registry runs each backend's path checker and returns a backend type. Uring's checker is a filesystem stat, applied after the scan manager strips a leading `file://`. Local files use the shared uring ioctx, `s3://` the REST ioctx. A kvikio catch-all claims what no explicit backend takes. A null datasource means the resolved backend's factory declined to construct, for example an unconfigured object store.
+3. **Paths are resolved through `io_context_registry`.** The registry runs each backend's path checker and returns a backend type. Uring's checker is a filesystem stat, applied after the scan manager strips a leading `file://`. Local files use the shared uring ioctx, `s3://` the REST ioctx. An unclaimed path has no backend. Raw `http://` / `https://` input paths fail explicitly: use `s3://` and configure the HTTP(S) object-store endpoint instead. A null datasource for a claimed path means the backend could not be built or started, for example an unconfigured object store or unavailable io_uring.
 4. **Pin-table placement is carried by `memory_space`.** All files of a pin go through the same ioctx. The destination GPU comes from the current-device guard and the target space's allocator, and is recorded per chunk for task creation.
 
-Every managed read on the multi-GPU path resolves through `sirius::io::open_datasource` — the unified `sirius_gpu_scan_operator`, the split providers, `sirius_extension`, and the pin path all route through it. Under the single-GPU `backend: kvikio` opt-out the same open path is used, on `kvikio_context`; `cudf::io::datasource::create(path)` remains only as the fallback for a slice that carries no datasource. The kvikio catch-all still serves paths no explicit backend claims. The parquet reader wraps `cucascade::io::datasource`s through the `datasource*` overload.
+Every managed read on the multi-GPU path resolves through `sirius::io::open_datasource` — the unified `sirius_gpu_scan_operator`, the split providers, `sirius_extension`, and the pin path all route through it. The parquet reader wraps `cucascade::io::datasource`s through the `datasource*` overload. Unclaimed schemes are not rerouted through cuDF's path-based factory.
 
 ## Memory Pressure: Reservations and Downgrade
 
@@ -245,7 +245,7 @@ After a downgrade frees enough space, the rescheduled task retries. The reservat
 | HYG-02 invariant: 0 new `rmm::cuda_stream_default` in `src/` outside `legacy/` | grep gate | Default-stream usage breaks per-task-device contract under SCHED-RR |
 | Accumulated Bloom contributions fold into an exclusive per-GPU partial stream (`cudaStreamWaitEvent` on a transient event) instead of waiting on the host | `src/cuda/sirius_dynamic_bloom_filter.cu` (`accumulated_bloom_builder::enqueue_add`) | Every later copy out of, or free of, a partial array is ordered after all inserts into it, with no per-task host sync |
 | Accumulated Bloom publication requires actual-pool grants for every ordered pair of replica GPUs | `src/op/dynamic_filter/dynamic_filter_publisher.cpp` (`try_begin_accumulation`) | The chunk pipeline issues `cudaMemcpyPeerAsync`; unavailable pool capability declines the optional filter |
-| Multi-GPU parquet reads resolve to `cucascade::io::datasource`, not kvikio | `sirius_config::enforce_native_backend_for_multi_gpu()` forces `backend: native` when >1 GPU is configured | Any file-path datasource via cudf silently uses kvikio, which binds to a single CUDA context |
+| Multi-GPU parquet reads resolve to `cucascade::io::datasource`, not cuDF's path-based factory | `sirius_config::enforce_native_backend_for_multi_gpu()` forces `backend: native` when >1 GPU is configured | A path-based file source can bind to a single CUDA context; native device reads carry the caller's device |
 
 ## Hardware Caveats
 
@@ -268,7 +268,7 @@ After a downgrade frees enough space, the rescheduled task retries. The reservat
 | `src/scan_manager/split_provider.cpp` | Fresh-read split provider; resolves an ioctx per file |
 | `src/scan_manager/sirius_scan_manager.cpp` | `cached_databatch_provider`; ioctx ownership and path routing |
 | `src/io/path_utils.{hpp,cpp}` | `sirius::io::open_datasource`: path normalization before cuCascade's `open_datasource` |
-| `cucascade/include/cucascade/io/datasource_factory.hpp` | cuCascade backend registry (`uring` / `restful` / `kvikio`); resolves a path to a backend type via per-backend checkers |
+| `cucascade/include/cucascade/io/datasource_factory.hpp` | cuCascade backend registry (`uring` / `restful` / `cufile`); resolves a path via per-backend checkers, with no catch-all |
 | `cucascade/src/io/uring/uring_reactor.cpp` | cuCascade uring reactor; sets the request's device for each H2D copy |
 | `src/op/scan/sirius_gpu_scan_operator.cpp` | Unified `GPU_SCAN` source operator (multi-GPU-aware) |
 | `src/creator/task_creator.cpp` | Per-task `preferred_device_id` resolution, partition device pin |

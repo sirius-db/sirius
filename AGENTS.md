@@ -66,8 +66,8 @@ interception before a bounded run. CLI details live in [test/fuzz/README.md](tes
 `src/cuda/` (GPU kernels). **Read `docs/super-sirius/` before modifying Super Sirius code** —
 see its [README](docs/super-sirius/README.md) for reading order.
 
-The I/O layer (`cucascade::io`: io_uring / REST / kvikIO backends, the pinned `fs_cache`,
-`cucascade::io::datasource`) comes from the cuCascade submodule, linked as
+The I/O layer (`cucascade::io`: local io_uring, native HTTP/1.1 REST with kTLS or user-space
+TLS, cuFile, the pinned `fs_cache`, `cucascade::io::datasource`) comes from the cuCascade submodule, linked as
 `cuCascade::cucascade_io` (the `cudf::io::datasource` bridge is in `cuCascade::cucascade_cudf`); `src/io/` keeps only Sirius glue (`path_utils`, `ioctx_resolver`,
 `parquet_helpers`, `s3/sirius_httpfs`). The shared `src/exec/` primitives (`semi_future`, `try_t`, `completion_controller`, ...)
 re-export `cucascade::exec`; `thread_pool.hpp` and `scoped_dispatcher.hpp` retain Sirius's

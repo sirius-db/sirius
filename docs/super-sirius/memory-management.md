@@ -80,7 +80,8 @@ a separate reactor pool per mount. An unused DISK space starts no I/O workers.
 Automatic selection prefers **cuFile with real GDS**, then **usable io_uring**, then the
 **cuFile POSIX/staging path** when io_uring is unavailable or forbidden. cuFile compatibility
 mode alone is not real GDS. The cuCascade DISK factory supports `automatic`, `uring`, and
-`cufile`; kvikIO remains available for reads but is not a writing DISK backend.
+`cufile`. These DISK contexts are independent of the scan backend; the removed kvikIO
+backend is not supported for reads or writes.
 
 Factory contexts own private staging rather than borrowing Sirius's HOST allocator
 (uring uses 64 MiB of portable pinned staging per reactor). Destruction stops/drains reactor

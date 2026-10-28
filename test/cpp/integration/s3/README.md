@@ -3,8 +3,17 @@
 Catch2 tests cover scan-manager routing and `create_datasource`,
 `describe_parquet`, the `sirius_httpfs` filesystem, and SQL over S3 with and
 without the cache. Loopback routing tests run in the default unit suite. The
-REST backend itself (range reads, retries, SigV4 signing) is cuCascade's and is
-tested in cuCascade.
+REST backend itself (range reads, retries, SigV4 signing, native HTTP/1.1 over
+io_uring, and TLS) is cuCascade's and is tested in cuCascade. HTTPS endpoints use
+kTLS when available, with user-space TLS fallback by default; scans no longer
+use libcurl for transport.
+
+S3 reads require usable io_uring on Linux 6.1+, including for plain HTTP
+endpoints. Container seccomp policies or `kernel.io_uring_disabled` can prevent
+REST startup; there is no libcurl fallback. Raw `http://` / `https://` input URLs
+are explicitly unsupported: use `s3://bucket/key` and an HTTP(S) object-store
+endpoint. The removed `backend: kvikio` selection and `scan_manager.kvikio`
+block are rejected with an error to use `native`.
 
 ## Running the gates
 
@@ -54,7 +63,7 @@ The S3 tag vocabulary is:
 |---|---|
 | Gate selection | `[s3]`, `[integration]`, `[sql]`, `[large]`, `[large-cache]`, `[large-nocache]`, `[tpch]`, `[glob-scale]`, `[aws]` |
 | Execution path | `[transparent]` marks the `SET gpu_execution` path |
-| Topics | `[rest]`, `[sigv4]`, `[list]`, `[filesystem]`, `[glob]`, `[routing]`, `[describe_parquet]`, `[config]`, `[footerbind]`, `[pushdown]`, `[nested]`, `[fallback]`, `[kvikio]` |
+| Topics | `[rest]`, `[sigv4]`, `[list]`, `[filesystem]`, `[glob]`, `[routing]`, `[describe_parquet]`, `[config]`, `[footerbind]`, `[pushdown]`, `[nested]`, `[fallback]` |
 | File topics | `[object_store_config]` |
 | Slow cases | `[stress]` |
 
@@ -73,7 +82,7 @@ Without an external endpoint, SeaweedFS-backed cases skip when
 `SIRIUS_TEST_S3_STRICT=1` so missing prerequisites fail instead.
 SF10, SF1 TPC-H and glob-scale also require their LARGE, TPCH and
 GLOB_SCALE switches; the targets export them for the appropriate
-process. The three harness-PUT cases skip against an external endpoint,
+process. The two harness-PUT cases skip against an external endpoint,
 even in strict mode.
 
 Catch2's `[.]` hides a case from an unfiltered run only. A hidden case
@@ -112,31 +121,31 @@ spec='[s3][integration]~[large]~[aws]'
 "$bin" --list-tests --verbosity quiet "$spec"
 ```
 
-The gate lists contain 105, 5, 3 and 3 cases respectively; the deprecated
-TPC-H target selects two. `--list-tags "[s3]"` lists the 26 tags above
-plus `[.]`.
+Use the listing commands above for current gate membership after backend or
+case changes. `--list-tags "[s3]"` lists the tags above plus `[.]`.
 
 ## SeaweedFS lifecycle
 
 The binary starts one SeaweedFS process with HTTP and HTTPS listeners sharing
 one backend, using dynamically selected loopback ports. It generates a
 self-signed certificate with `openssl`, uploads fixtures with SigV4 and libcurl,
-and publishes the environment used by the tests.
+and publishes the environment used by the tests. libcurl here is fixture-upload
+infrastructure, not the scan REST transport.
 
 An existing `SIRIUS_TEST_S3_ENDPOINT` is used as-is. Otherwise,
 `SIRIUS_TEST_S3_AUTO=1` opts into server startup. SQL, httpfs and TPC-H
 tests pass missing required `SIRIUS_TEST_S3_*` settings to
 `skip_or_fail_unless`: a skip, or a failure with `SIRIUS_TEST_S3_STRICT=1`.
-REST, describe_parquet and kvikio tests use that helper only for
+REST and describe_parquet tests use that helper only for
 `ensure_s3_test_env`. Once an endpoint is set, missing BUCKET,
 ACCESS_KEY or SECRET_KEY fails those tests regardless of STRICT.
 
 The LARGE, TPCH and GLOB_SCALE switches use the same skip-or-fail rule.
 Live HEAD/GET and query errors fail regardless of STRICT, except that
 SF10 tests report a failed describe of the SF10 object as a skip unless
-STRICT is set. The three tests that PUT objects into managed SeaweedFS skip when
+STRICT is set. The two tests that PUT objects into managed SeaweedFS skip when
 the endpoint is externally managed; device tests also report unavailable CUDA.
-The PUT cases cover ETag invalidation, kvikio stream ordering, and
+The PUT cases cover ETag invalidation and
 `transparent S3 glob refuses semantic type drift before decoding`.
 
 `unittest.cpp` terminates and reaps the server before exiting. On Linux the
@@ -180,7 +189,7 @@ for virtual-column name collision checks.
 | `tpch/lineitem_sf10.parquet` | SF10 lineitem; requires LARGE |
 | `tpch/sf1/*` | Eight SF1 tables; requires TPCH |
 | `glob-scale/part_*.parquet` | 1001 nation copies; requires GLOB_SCALE |
-| Objects written during tests | ETag overwrite, kvikio stream-ordering inputs and schema-drift parquet pair |
+| Objects written during tests | ETag overwrite inputs and schema-drift parquet pair |
 
 The SF10 cache was 2,223,320,375 bytes (about 2.07 GiB), measured on
 2026-05-21, before the DuckDB v1.5.6 pin.
@@ -191,7 +200,12 @@ on every run.
 
 `nation.parquet` has 25 rows, keys 0-24, and five nations per region.
 The HTTPS tests use the generated CA bundle so `rest_ioctx` checks the
-certificate. SeaweedFS uses region `us-east-1`.
+certificate. Trust comes from the resolved `object_store_config`'s
+`ca_bundle_path` / `tls_verify` (or the selected SQL secret), not from
+`scan_manager.rest.tls`. That YAML block exposes protocol/offload policy only;
+trust keys such as `verify` and `ca_file` are rejected. See the
+[REST/TLS configuration reference](../../../../docs/super-sirius/configuration.md#scan_managerrest--rest--s3-backend-iorestconfighpp).
+SeaweedFS uses region `us-east-1`.
 
 ## Environment
 

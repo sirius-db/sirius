@@ -18,7 +18,7 @@ graph TD
     TC -->|"schedule GPU tasks"| GPE
 
     SM["sirius_scan_manager"] -->|"prepare per-scan state"| GPE
-    SM -->|"I/O backends + fs_cache"| IO["cuCascade io ioctx (uring / rest / kvikio)"]
+    SM -->|"I/O backends + fs_cache"| IO["cuCascade io ioctx (uring / rest / cufile)"]
 
     GPE -->|"unified GPU scan source"| SM
     GPE -->|"memory reservations"| MRM["sirius_memory_reservation_manager"]
@@ -66,7 +66,7 @@ Key lifecycle methods on `SiriusContext`:
 See [Concurrent queries](concurrent-queries.md) and [Query lifetime](query-lifecycle.md) for
 work ownership, cancellation, and exclusive maintenance.
 
-Scans are not a separate executor. A unified `sirius_gpu_scan_operator` (operator type `GPU_SCAN`) is the pipeline source: it pulls splits from a `split_connector` and delegates per-split materialization to an installed `gpu_ingestible` (parquet or duckdb-native today). The `sirius_scan_manager` prepares this state per query — it builds the per-table ingestible, installs the split connector, drives a `split_provider`, and owns the I/O contexts (cuCascade `cucascade::io::ioctx`s: io_uring for local files, REST for `s3://`, or kvikIO) and their `fs_cache`s.
+Scans are not a separate executor. A unified `sirius_gpu_scan_operator` (operator type `GPU_SCAN`) is the pipeline source: it pulls splits from a `split_connector` and delegates per-split materialization to an installed `gpu_ingestible` (parquet or duckdb-native today). The `sirius_scan_manager` prepares this state per query — it builds the per-table ingestible, installs the split connector, drives a `split_provider`, and owns the I/O contexts (cuCascade `cucascade::io::ioctx`s: io_uring for local files, native HTTP/1.1 REST over io_uring for `s3://`, or single-GPU local cuFile) and their `fs_cache`s.
 
 ## Thread Model
 
@@ -109,9 +109,9 @@ Super Sirius uses multiple dedicated thread pools, each with a specific role:
 │  - Worker thread pool: per-scan preparation                    │
 │  - Driver thread: runs split providers sequentially, feeding    │
 │    splits into each scan operator's split_connector            │
-│  - cuCascade io reactor threads: io_uring (local disk) and REST │
-│    (s3://); kvikIO has none. Pinned fs_cache per context        │
-│    under cache.mode: cucs                                       │
+│  - cuCascade reactor threads: local io_uring, REST over         │
+│    io_uring (HTTP/1.1, kTLS or user-space TLS), or local cuFile  │
+│  - Pinned fs_cache under cache.mode: cucs (uring / REST only)    │
 └─────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────┐
@@ -136,7 +136,7 @@ A query through Super Sirius follows these steps:
    - Wires data repositories between pipelines with barrier types
 4. **Query Preparation** — `sirius_engine::execute()` creates this query's `completion_handler` and future. `SiriusContext::create_query()` passes the handler to `task_creator::prepare_for_query()`, which makes it available to the query's pipeline tasks, while `sirius_scan_manager::prepare_for_query()` registers per-query scan state, builds split providers, and matches pinned-cache entries
 5. **Query Start** — `task_scheduler::start_query(query)` schedules the initial scan operator; the engine waits on the future it already owns
-6. **Scan Phase** — The scan manager drives split providers that pull bytes through the `io_context` (io_uring locally, or REST/kvikio backends) and cuCascade's pinned `fs_cache`; the unified GPU scan source consumes splits and materializes GPU-ready batches into data repositories
+6. **Scan Phase** — The scan manager drives split providers that pull bytes through the `io_context` (local io_uring or single-GPU cuFile, REST for `s3://`) and cuCascade's pinned `fs_cache`; the unified GPU scan source consumes splits and materializes GPU-ready batches into data repositories
 7. **Pipeline Execution** — GPU executor threads pull tasks from the queue, acquire memory reservations, and call `execute()` on every operator in the pipeline (source through sink) on CUDA streams, then call the sink's `sink()` to push results downstream
 8. **Task Creation** — After each task completes, the task creator is notified to schedule downstream consumers based on data availability in ports
 9. **Memory Management** — Downgrade executors monitor GPU memory pressure and spill data to host memory when thresholds are exceeded
@@ -158,6 +158,6 @@ A query through Super Sirius follows these steps:
 | `src/op/scan/sirius_gpu_scan_operator.hpp` | Unified GPU scan source operator |
 | `src/op/scan/gpu_ingestible.hpp` | Per-format split materialization (parquet, duckdb-native) |
 | `src/scan_manager/sirius_scan_manager.hpp` | Per-scan preparation, split providers, I/O ownership |
-| `src/io/` | Sirius I/O glue (`path_utils`, `ioctx_resolver`, `parquet_helpers`, `s3/sirius_httpfs`); the I/O layer itself (uring / REST / kvikIO backends, `fs_cache`) is cuCascade's `cucascade::io`, documented in the doc comments of its headers under `cucascade/include/cucascade/io/` |
+| `src/io/` | Sirius I/O glue (`path_utils`, `ioctx_resolver`, `parquet_helpers`, `s3/sirius_httpfs`); the I/O layer itself (uring / native HTTP/1.1 REST / cuFile backends, `fs_cache`) is cuCascade's `cucascade::io`, documented in the doc comments of its headers under `cucascade/include/cucascade/io/` |
 | `src/downgrade/downgrade_executor.hpp` | Memory spilling |
 | `src/memory/sirius_memory_reservation_manager.hpp` | Memory management |

@@ -195,8 +195,7 @@ The existing `disk_id`, `capacity_bytes`, and `downgrade_root_dirs` keys and spi
 layouts are unchanged. There are no additional DISK-backend or per-mount reactor YAML
 settings, and no backend registration is required. `sirius.executor.scan_manager.backend`,
 reactor counts and cache settings configure independent scan contexts, not this spill
-default. Existing kvikIO read settings and environment controls remain available; kvikIO
-is not a writing DISK backend.
+default. The removed kvikIO backend is not available for reads or writes.
 
 ### Input-table compression (`sirius.compression`)
 
@@ -369,7 +368,7 @@ This adds no configuration keys.
 
 ## Scan Manager & IO Configuration
 
-**Files:** `src/scan_manager/config.hpp`, `src/sirius_config.cpp` (YAML parsing); the IO sub-configs are cuCascade's, under `cucascade/include/cucascade/io/`: `uring/config.hpp`, `rest/config.hpp`, `cufile/config.hpp`, `kvikio/config.hpp`, `cache/config.hpp`, `object_store_config.hpp`
+**Files:** `src/scan_manager/config.hpp`, `src/sirius_config.cpp` (YAML parsing); the IO sub-configs are cuCascade's, under `cucascade/include/cucascade/io/`: `uring/config.hpp`, `rest/config.hpp`, `cufile/config.hpp`, `tls/config.hpp`, `cache/config.hpp`, `object_store_config.hpp`
 
 The `sirius.executor.scan_manager` block configures the scan-metadata thread pool and the cuCascade IO layer that feeds the GPU scan operators.
 
@@ -377,18 +376,18 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 |-----|------|---------|-------------|
 | `num_threads` | int (**> 0**) | remaining cores (min 4) | Metadata-producer worker threads. |
 | `cpu_affinity` | list of int | — | Cores to pin scan-manager threads to. |
-| `backend` | enum: `native`, `cufile`, `kvikio` | `native` | IO backend for reads. `native` uses `io_uring` for local paths and REST for `s3://`; `cufile` uses cuFile with compatibility/POSIX fallback for local regular files and keeps REST for `s3://`; `kvikio` serves local files and `s3://` objects through its local/remote handles. S3 listing and glob expansion always use REST. Both `cufile` and `kvikio` are single-GPU only: a multi-GPU configuration forces the backend to `native` with a warning. `sirius` remains a deprecated alias of `native`. Values are lowercase. |
+| `backend` | enum: `native`, `cufile` | `native` | IO backend for reads. `native` uses io_uring for local paths and native REST (HTTP/1.1 over io_uring, with kTLS or user-space TLS) for `s3://`; `cufile` uses cuFile with compatibility/POSIX fallback for local regular files and keeps REST for `s3://`. S3 listing and globs always use REST. cuFile remains single-GPU only: a multi-GPU configuration forces `native` with a warning. `sirius` remains a deprecated alias of `native`. `backend: kvikio` and any `scan_manager.kvikio` block are rejected with a clear error to use `native`, not accepted as aliases. Values are lowercase. |
 | `uring_n_reactors` | int (**> 0**) | 4 | Number of uring reactors for local-disk reads. Each reactor is one worker thread with its own io_uring ring and request queue, and allocates its own pinned staging from the host memory space when the IO context starts: 64 MiB of whole host blocks (at most 64 slots, at least one block). |
-| `rest_n_reactors` | int (**> 0**) | 2 | Number of REST reactors for object-store (`s3://`) reads, each one worker thread with its own libcurl event loop and connection pool. |
+| `rest_n_reactors` | int (**> 0**) | 2 | Number of REST reactors for object-store (`s3://`) reads, each one worker thread with its own io_uring ring and native HTTP/1.1 connection pools. |
 | `cufile_n_reactors` | int (**> 0**) | 4 | Number of cuFile reactors for local reads, each with one worker thread. Single-GPU only. |
 | `max_readahead_scans` | int | — (unset) | Scans the readahead may keep in flight, and the switch that runs it at all. See below. |
 | `readahead_strategy` | enum: `eager`, `opportunistic` | — (unset) | When the readahead issues. Unset takes the serving backend's own preference: `eager` for object-store (REST) reads, `opportunistic` for local (uring) ones. Values are lowercase. |
 
 Caching itself is configured in the [`cache`](#scan_managercache--read-path-caching-iocacheconfighpp)
-sub-config below. cuFile and kvikIO cannot use `fs_cache` for scan readahead.
+sub-config below. cuFile cannot use `fs_cache` for scan readahead.
 Neither `cache.mode: cucs` nor an explicit positive `max_readahead_scans`
 creates a readahead manager without an eligible advertised backend. This also
-excludes empty queries, kvikIO-only queries and requested pinned caches that failed to build.
+excludes empty queries, cuFile-only queries and requested pinned caches that failed to build.
 The readahead policies below apply only to eligible backends; routed REST reads retain their own policy.
 
 `max_readahead_scans` has three states:
@@ -447,50 +446,117 @@ accepted and ignored with a warning, and will be removed.
 
 ### `scan_manager.rest` — REST / S3 backend (`io/rest/config.hpp`)
 
-TLS verification policy and the CA bundle are configured only under
-`scan_manager.object_store`. The REST backend consumes those values so signing
-and transport use one trust policy; there are no separate REST YAML controls.
+The native REST backend uses HTTP/1.1 over io_uring, not libcurl. HTTPS endpoints
+use kTLS where available and user-space TLS otherwise. It requires Linux 6.1+
+and usable io_uring; a container seccomp policy or `kernel.io_uring_disabled`
+can make S3 unavailable. There is no alternate transport fallback.
+
+TLS trust is supplied by the resolved `object_store_config`: its
+`ca_bundle_path` and `tls_verify` are applied to transport as well as signing.
+Use `sirius_config::set_object_store_config()` or a selected SQL secret
+(`VERIFY_SSL` controls verification). `scan_manager.object_store` and
+`rest.ca_bundle_path` / `rest.tls_verify` are not YAML-loadable and are rejected.
+The `rest.tls` block below controls protocol/offload policy only, not trust.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `n_max_concurrent_scans` | int | max(8, 2 × `pipeline.num_threads`) | Readahead budget the REST backend publishes, which an unset `max_readahead_scans` defers to. Unset derives it from the pipeline pool, since several splits per pipeline thread give an object-store prefetch time to land; an explicit value wins. |
-| `request_timeout_s` | int (seconds) | 30 | Whole-request timeout for control-plane requests (HEAD / LIST / footer probe / warmup) and the presigned-URL TTL, which is this value plus 60 s. `0` does not remove the limit: control-plane requests then keep the transport's built-in 30 s limit, and presigned URLs get a 300 s TTL. Data GETs use the stall detector below instead. |
-| `stall_speed_limit_bytes` | int (bytes/s) | 65536 | Stall detector for data GETs: a transfer below this rate for `stall_time_s` consecutive seconds fails and is retried (0 disables). |
-| `stall_time_s` | int (seconds) | 30 | How long a data GET may stay below `stall_speed_limit_bytes` before it is cut loose (0 disables). |
-| `merge_max_gap` | bytes | 512Ki | Largest gap between two segments still fetched by a single GET. The bridged bytes are read and discarded, trading them for a saved round trip. 0 fuses only adjacent segments. |
-| `upkeep_interval_ms` | int (ms) | 15000 | Idle-connection keepalive interval (`curl_easy_upkeep`; 0 disables). |
-| `conn_max_age_s` | int (seconds) | 20 | Max age curl may reuse a pooled connection (`CURLOPT_MAXAGE_CONN`; 0 = curl default). |
+| `n_max_concurrent_scans` | int | max(8, 2 × `pipeline.num_threads`) | Readahead budget the REST backend publishes, which an unset `max_readahead_scans` defers to. Unset derives it from the pipeline pool; an explicit value wins. |
+| `request_timeout_s` | int (seconds) | 30 | Whole-request timeout for control-plane requests (HEAD / LIST / footer probe) and the base for the presigned-URL TTL (this value plus 60 s). At `0`, control requests retain the transport's 30 s limit and presigned URLs use 300 s. Data GETs use the stall detector instead. |
+| `connect_timeout_ms` | int (ms, **> 0**) | 3000 | TCP connection deadline; separate from the TLS handshake deadline. |
+| `tls_handshake_timeout_ms` | int (ms, **> 0**) | 3000 | TLS handshake deadline per connection. |
+| `stall_speed_limit_bytes` | int (bytes/s) | 65536 | Data GETs below this wire-progress rate for `stall_time_s` fail and are retried. `0` disables the detector. |
+| `stall_time_s` | int (seconds) | 30 | How long a data GET may remain below the stall rate; `0` disables the detector. |
+| `max_connections` | int (**> 0**) | 64 | Maximum connections per reactor per endpoint, not a process-wide cap. |
+| `conn_max_age_s` | int (seconds) | 4 | Idle cutoff of pooled connections, also the warmup rate limit. `0` uses 4 s. |
+| `keep_warm_connections` | int (**>= 0**) | 0 | Connections kept open per endpoint while idle; `0` disables warming. |
+| `min_segment_bytes` | bytes (**> 0**) | 1Mi | Lower target bound for adaptive physical GET sizing; a short remainder may be smaller. Must not exceed `max_segment_bytes`. |
+| `max_segment_bytes` | bytes (**> 0**) | 32Mi | Upper bound for adaptive physical GET sizing. |
+| `merge_max_gap` | bytes | 512Ki | Logical cache/read-planner coalescing hint. `0` merges only adjacent ranges. Does not set physical GET segments or replace the segment bounds above. |
+| `enable_controller` | bool | true | Endpoint admission/throughput controller; backs off on HTTP 503/429 throttling. |
+| `link_gbps` | finite double (**>= 0**) | 0 | Link-speed seed in Gbps. `0` discovers the EC2 NIC speed through IMDS, or seeds 10 Gbps elsewhere; this is not credential discovery. |
+| `ring_entries` | int (**8..32768**) | 1024 | Submission-queue entries per REST reactor's io_uring ring. |
+| `iowq_max_unbound` | int (**>= 0**) | 0 | io-wq unbound-worker cap when kTLS receives use io-wq. `0` selects the automatic bound of 16, not unlimited workers. |
+| `write_part_bytes` | bytes (**>= 5Mi**) | 16Mi | S3 multipart part size, mapped to cuCascade's `write_split_bytes` and rounded down to its write granule. Applies to ioctx writes, not scan GETs. |
+| `expect_continue` | bool | false | Wait for HTTP `100 Continue` before sending a PUT body. |
 | `retry_backoff_base_ms` | int (ms) | 50 | Base backoff between retries. |
-| `retry_jitter_ms` | int (ms) | 50 | Random jitter added to retry backoff. |
-| `max_retry_attempts` | int | 10 | Retry attempts for transient errors. |
-| `max_auth_retry_attempts` | int | 3 | Retry attempts for HTTP 403 (expired presigned URL). Kept low so a genuine AccessDenied fails fast. |
+| `max_retry_attempts` | int | 10 | Retry budget for transient transport and HTTP failures. |
+| `max_auth_retry_attempts` | int | 3 | Async data retry budget for HTTP 403; each attempt re-authorizes. Control requests treat 403 as terminal. |
 | `honor_retry_after` | bool | true | Respect the server's `Retry-After` header. |
-| `footer_probe_bytes` | bytes | 512Ki | Suffix-range window for the parquet footer probe. Must cover the footer, so err large. |
-| `list_max_matches` | int | 100000 | Cap on files a glob/listing may accumulate (throws "narrow the glob prefix", never truncates). |
-| `list_max_scanned` | int | 1000000 | Cap on objects a LIST sweep may scan across pages (throws, never truncates). |
+| `footer_probe_bytes` | bytes | 512Ki | Suffix-range window for the parquet footer probe; should cover the footer. |
+| `list_max_matches` | int | 100000 | Cap on glob/listing matches; throws rather than truncating. |
+| `list_max_scanned` | int | 1000000 | Cap on objects scanned across LIST pages; throws rather than truncating. |
+| `upkeep_interval_ms` | any (ignored) | — | Deprecated: accepted and ignored with a warning. The old transport's upkeep has no HTTP/1.1 equivalent; use `keep_warm_connections`. |
+| `retry_jitter_ms` | any (ignored) | — | Deprecated: accepted and ignored with a warning; does not change native retry timing. |
 
-Two REST values are deliberately not YAML keys. **Connections per reactor** are
-fixed at 64 — the useful number is a property of one reactor thread, not of a
-deployment, and more concurrency comes from adding reactors (`rest_n_reactors`),
-each with its own thread and connection pool. **Physical GET size** is reactor-owned:
-each reactor derives a target between 4 MiB and 16 MiB from the queued logical
-bytes and its currently free connections. Large contiguous requests are balanced
-under the 16 MiB ceiling. Fragmented cache fills are grouped only at whole
-cache-chunk boundaries so a chunk is never published before all of its bytes
-arrive.
+Explicit bucket warmup preconnects each reactor's TCP/TLS pool without sending
+HEAD or GET requests. It uses the connect and TLS handshake deadlines and is
+rate-limited by `conn_max_age_s`.
 
-`merge_max_gap` remains a logical planner hint: nearby ranges can be represented
-as prepared slices without forcing a static physical layout. Device operations
-allocate as many pinned CuCascade blocks as their selected physical range needs;
-those blocks stay owned through curl retries, the asynchronous H2D copy, and its
-CUDA completion event. Staging is therefore proportional to active device work
-instead of being reserved as one fixed bounce slot per connection.
+Physical GET sizing remains reactor-owned within the configured segment bounds.
+The worker uses endpoint throughput estimates and cuts a request evenly, rather
+than turning each logical prepared slice into a fixed GET. Fragmented cache fills
+are grouped at whole cache-chunk boundaries so a chunk is not published until all
+its bytes arrive. `merge_max_gap` remains a logical planner hint, not a physical
+segmentation knob. Device reads retain their pinned staging through REST retries,
+the asynchronous H2D copy, and its CUDA completion event.
+
+#### `scan_manager.rest.tls` — TLS protocol and offload policy (`io/tls/config.hpp`)
+
+All enum values are lowercase. Certificate/hostname verification stays enabled by
+default; configure trust through `object_store_config`, not this block.
+`verify`, `ca_file`, `ca_dir`, and `ca_blob` under `rest.tls` are rejected
+with an error directing users to the object-store trust configuration.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `ktls` | enum: `prefer`, `require`, `disable` | `prefer` | Try kernel TLS then fall back to user space; `require` fails if kTLS cannot be installed; `disable` never requests it. |
+| `user_space_rx` | enum: `record_layer`, `library` | `record_layer` | Built-in AES-GCM receive record layer or the TLS library's receive path. Unsupported suites use the library path. |
+| `min_version` | enum: `tls1.2`, `tls1.3` | `tls1.2` | Minimum TLS version. |
+| `max_version` | enum: `tls1.2`, `tls1.3`, `auto` | `auto` | Automatic maximum considers kTLS and kernel re-key support, plus `allow_tls13_without_rekey`; with kTLS disabled, automatic permits TLS 1.3. Must not be below the minimum. |
+| `recv_placement` | enum: `automatic`, `inline`, `iowq` | `automatic` | Where kTLS body decryption runs: io-wq on EC2 and inline elsewhere by default. `iowq` is bounded by `rest.iowq_max_unbound`. |
+| `expect_no_pad` | bool | true | Request the TLS 1.3 kTLS no-padding receive optimization. |
+| `session_cache` | bool | false | Enable the client TLS session cache; useful for compatible stores that resume sessions. |
+| `session_cache_per_endpoint` | int (**> 0**) | 256 | Maximum cached TLS sessions per endpoint when the cache is enabled. |
+| `max_connection_bytes` | bytes | 64Gi | Close a connection at check-in after this many bytes, limiting KeyUpdate exposure. `0` disables the bound. |
+| `ciphersuites` | string | TLS 1.3 AES-128/256-GCM | TLS 1.3 suites in OpenSSL syntax (`TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384` by default). |
+| `cipher_list` | string | TLS 1.2 ECDHE + AES-128/256-GCM | TLS 1.2 ciphers in OpenSSL syntax; the default includes ECDSA and RSA authentication. |
+| `groups` | string | "" | Key-exchange groups in library syntax; empty keeps the library default. |
+| `sni_override` | string | "" | Send this SNI name and verify the certificate against it instead of the endpoint host. Does not disable verification. |
+| `allow_tls13_without_rekey` | bool | true | Permit TLS 1.3 on kernels without kTLS TLS 1.3 re-key support; a KeyUpdate then requires reconnection. |
+
+The YAML loader intentionally leaves TLS fields `alpn_http11`, `client_cert_file`,
+`client_key_file`, and `keylog_env`, and REST fields `footer_resolve_max_inflight`
+and `footer_resolve_stash_budget`, at their cuCascade struct defaults; these
+fields are not YAML-loadable.
+
+For example, tune transport independently of the credentials supplied by a secret
+or the programmatic object-store config:
+
+```yaml
+sirius:
+  executor:
+    scan_manager:
+      backend: native
+      rest_n_reactors: 2
+      rest:
+        max_connections: 64
+        connect_timeout_ms: 3000
+        tls_handshake_timeout_ms: 3000
+        min_segment_bytes: 1Mi
+        max_segment_bytes: 32Mi
+        ring_entries: 1024
+        iowq_max_unbound: 0
+        tls:
+          ktls: prefer
+          user_space_rx: record_layer
+          recv_placement: automatic
+```
 
 ### `scan_manager.cufile` — local cuFile reads (`io/cufile/config.hpp`)
 
 Select cuFile with the existing `backend` key. The default remains `native`.
 This backend reads local regular files only; `s3://` reads, listing and globs still use
-REST/libcurl. The existing multi-GPU guard forces `backend: native` with a warning
+native REST. The existing multi-GPU guard forces `backend: native` with a warning
 when more than one GPU is configured; this does not add multi-GPU cuFile placement.
 
 ```yaml
@@ -559,34 +625,6 @@ export CUFILE_ENV_PATH_JSON=/absolute/path/to/cufile.json
 Use a more verbose level such as `TRACE` only when diagnosing transfer mode; verbose
 logging can affect performance. This is cuFile configuration, not a Sirius YAML setting.
 
-### `scan_manager.kvikio` — kvikIO backend (`io/kvikio/config.hpp`)
-
-Used when `backend: kvikio` routes reads (local files and `s3://` objects)
-to kvikIO. **Every key is optional and unset means "leave kvikIO's own default
-alone"** — kvikIO seeds each setting from an environment variable at first use, so
-omitting a key preserves that value and setting one overrides it.
-
-**These are process-global.** Every key except `compat_mode` maps to a setter on
-kvikIO's `defaults` singleton, so the last context constructed wins and the
-setting is shared with every other kvikIO user in the process. Treat it as
-startup configuration. `compat_mode` is the exception: it rides the file-handle
-constructor, so it scopes to files this backend opens.
-
-This backend runs without the prefetching cache and therefore without the
-readahead, so `scan_manager.cache.*`, `max_readahead_scans` and
-`readahead_strategy` have no effect on it.
-
-| Key | Type | Env default | Description |
-|-----|------|-------------|-------------|
-| `nthreads` | int (**> 0**) | `KVIKIO_NTHREADS` (1) | Threads in kvikIO's task pool — the parallelism bound for a single read. |
-| `task_size` | bytes (**> 0**) | `KVIKIO_TASK_SIZE` (4Mi) | Chunk size a parallel read is split into. Keep it a page multiple when `auto_direct_io_read` is on. |
-| `gds_threshold` | bytes | `KVIKIO_GDS_THRESHOLD` (1Mi) | Minimum read size routed through GDS + the thread pool; smaller reads take a direct POSIX shortcut. 0 is legal. |
-| `bounce_buffer_size` | bytes (**> 0**) | `KVIKIO_BOUNCE_BUFFER_SIZE` (16Mi) | Host staging buffer for device reads that cannot go straight to GPU memory. |
-| `auto_direct_io_read` | bool | `KVIKIO_AUTO_DIRECT_IO_READ` | Use `O_DIRECT` for POSIX reads. POSIX path only — the cuFile/GDS path manages its own I/O mode. |
-| `auto_direct_io_read_overread` | bool | `KVIKIO_AUTO_DIRECT_IO_READ_OVERREAD` (false) | Align device-read offsets down and sizes up to pages so the whole transfer is pure Direct I/O, at the cost of extra bytes. Requires `auto_direct_io_read`. |
-| `thread_pool_per_block_device` | bool | `KVIKIO_THREAD_POOL_PER_BLOCK_DEVICE` (false) | Give each block device its own pool instead of sharing one global pool. |
-| `compat_mode` | enum: `auto`, `on`, `off` | `KVIKIO_COMPAT_MODE` | cuFile vs POSIX selection, per file handle. `off` enforces cuFile/GDS, `on` enforces POSIX, `auto` tries cuFile and falls back. Values are lowercase. |
-
 ### `scan_manager.cache` — read-path caching (`io/cache/config.hpp`)
 
 Everything about read-path caching lives in this one block — rather than a mode on the
@@ -611,7 +649,7 @@ sirius:
 For the native local backend, `mode: none` bypasses every cache (`O_DIRECT`, no
 prefetching cache), `mode: os` reads through the kernel page cache, and `mode: cucs`
 reads `O_DIRECT` into cuCascade's pinned prefetching cache (`fs_cache`). REST can also
-use `fs_cache` under `cucs`. cuFile and kvikIO never attach `fs_cache` or run scan
+use `fs_cache` under `cucs`. cuFile never attaches `fs_cache` or runs scan
 readahead, regardless of this mode; cuFile's direct-open policy is set by
 `cufile.use_odirect`, not derived from the cache mode.
 
@@ -625,22 +663,30 @@ Those two knobs derive the settings below, which are therefore **not** individua
 | Derived setting | Derived from |
 |-----------------|--------------|
 | `uring.use_odirect` | `mode` — true for everything but `os` |
-| whether the prefetching cache is armed | `mode` — only under `cucs`, and only for a backend that supports `fs_cache` (not cuFile or kvikIO) |
+| whether the prefetching cache is armed | `mode` — only under `cucs`, and only for a backend that supports `fs_cache` (not cuFile) |
 | `dispose_on_idle` | `eviction` — true under `idle` |
 | the readahead's default budget | `mode` — the readahead does not run under `none`; see [`max_readahead_scans`](#scan-manager--io-configuration) |
 
-### `scan_manager.object_store` — S3 credentials & endpoint (`io/object_store_config.hpp`)
+### `scan_manager.object_store` — programmatic S3 config (`io/object_store_config.hpp`)
 
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `endpoint` | string | "" | S3 endpoint URL. |
-| `region` | string | "" | AWS region. |
+This is a C++ configuration reference, **not a YAML block**.
+`scan_manager.object_store` in YAML is rejected: supply
+`cucascade::io::object_store_config` through
+`sirius_config::set_object_store_config()`, or use
+`CREATE SECRET (TYPE SIRIUS_S3, ...)`. A matching SQL secret takes precedence
+over this fallback; an invalid matching secret is an error, not a reason to fall
+back. See [S3 authorization](scan.md#s3--object-store-backend).
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `endpoint` | string | "" | S3 endpoint URL, including `http://` or `https://`. Input paths remain `s3://bucket/key`; raw HTTP(S) input URLs are unsupported. |
+| `region` | string | "" | AWS signing region. |
 | `access_key` / `secret_key` | string | "" | Static credentials. |
 | `session_token` | string | "" | STS session token for temporary credentials. |
-| `signing_mode` | enum: `presigned`, `header` | `presigned` | SigV4 form: `presigned` (auth in the URL query string) or `header` (`Authorization` + `x-amz-*` headers). Values are lowercase. |
-| `s3_transport` | enum: `auto`, `http`, `https`, `rdma` | `auto` | Transport selection. Values are lowercase; `https` is an alias for `http`. `auto` lets the backend choose from the URI scheme and endpoint. |
-| `ca_bundle_path` | string | "" | Sole YAML source for the REST endpoint's PEM CA bundle. |
-| `tls_verify` | bool | true | Sole YAML source for REST endpoint certificate verification. |
+| `signing_mode` | enum: `presigned`, `header` | `presigned` | SigV4 form: auth in the URL query or in signed headers. |
+| `s3_transport` | enum: `auto`, `http`, `https`, `rdma` | `auto` | Transport selection; `https` aliases `http`. HTTP versus HTTPS comes from the endpoint scheme. |
+| `ca_bundle_path` | string | "" | PEM CA bundle for the REST endpoint; empty uses the TLS provider's default trust discovery. |
+| `tls_verify` | bool | true | Certificate and hostname verification. Disable only for development endpoints. Applied with the CA bundle on top of the REST TLS policy. |
 
 ### `sirius.executor.scan_manager.preparation`
 
@@ -1174,10 +1220,11 @@ conversion); sweep 16-64 Mi if small-host-allocation fragmentation is a
 concern.  Each uring reactor stages through whole host blocks under a fixed
 64 MiB budget, so at `block_size: 64Mi` it pins exactly one block per reactor
 and even a small device miss occupies that whole block for the duration of
-its I/O. On the REST backend one cache fill is one GET of up to `block_size`,
-so data GETs are bounded by a stall detector (`stall_speed_limit_bytes` /
-`stall_time_s`) rather than by a whole-transfer deadline: a large block does
-not time out on a slow link as long as bytes keep arriving.
+its I/O. On the REST backend physical GET sizing is adaptive within
+`rest.min_segment_bytes` / `rest.max_segment_bytes`, and fragmented cache fills
+respect whole-chunk boundaries. Data GETs are bounded by a stall detector
+(`stall_speed_limit_bytes` / `stall_time_s`) rather than by a whole-transfer
+deadline, so a large transfer does not time out merely because a link is slow.
 `pipeline.num_threads` 4 → 8 helps task-parallel aggregation
 queries (q1 -16%, q12 -14%). The prefetcher block overlaps pinned-cache
 uploads with compute (see `scan_manager.memory_prefetcher` above). Numbers
