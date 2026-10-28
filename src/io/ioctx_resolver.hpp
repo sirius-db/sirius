@@ -24,8 +24,7 @@
 
 namespace sirius::io {
 
-/// Resolves the serving ioctx: local -> uring/cufile/kvikio; s3:// -> REST,
-/// except that backend=kvikio also routes remote reads through kvikIO.
+/// Resolves the serving ioctx: local -> uring/cufile; s3:// -> REST.
 /// Returns a valid ioctx or throws if no backend supports the path.
 using ioctx_resolver = std::function<std::shared_ptr<cucascade::io::ioctx>(std::string_view)>;
 

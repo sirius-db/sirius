@@ -21,11 +21,11 @@
 #include <catch.hpp>
 #include <cucascade/exec/semi_future.hpp>
 #include <cucascade/io/io_errors.hpp>
-#include <cucascade/io/kvikio/kvikio_context.hpp>
 #include <duckdb/common/multi_file/multi_file_reader.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
 #include <utils/dynamic_filter_test_utils.hpp>
 #include <utils/gpu_execution_fixture.hpp>
+#include <utils/local_ioctx.hpp>
 #include <utils/parquet_fixture_utils.hpp>
 #include <utils/table_filter_test_utils.hpp>
 
@@ -911,7 +911,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   info->field_mapping_requirements =
     std::vector<field_requirement>{{1, duckdb::LogicalType::BIGINT, {}, true}};
   auto ingestible = make_ingestible(std::move(info));
-  auto ioctx      = std::make_shared<cucascade::io::kvikio_context>();
+  auto ioctx      = sirius::test::make_test_local_ioctx();
   auto prepare    = ingestible->next_split_provider(
     [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
   auto prepared    = prepare({});
@@ -969,7 +969,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
       std::move(metadata), identity, std::move(program), std::move(fields)));
   };
   auto ingestible = make_ingestible(std::move(info));
-  auto ioctx      = std::make_shared<cucascade::io::kvikio_context>();
+  auto ioctx      = sirius::test::make_test_local_ioctx();
   auto prepare    = ingestible->next_split_provider(
     [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
   auto prepared = prepare({});
@@ -1035,7 +1035,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
                                                       duckdb::Value::BIGINT(6000)));
   info->table_filters = std::move(filters);
   auto ingestible     = make_ingestible(std::move(info));
-  auto ioctx          = std::make_shared<cucascade::io::kvikio_context>();
+  auto ioctx          = sirius::test::make_test_local_ioctx();
   auto prepare        = ingestible->next_split_provider(
     [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
   REQUIRE(prepare);
@@ -1091,7 +1091,7 @@ class failing_dv_context final : public cucascade::io::ioctx {
   ~failing_dv_context() override { pre_destroy(); }
   cucascade::io::io_context_type type() const noexcept override
   {
-    return cucascade::io::io_context_type::kvikio;
+    return cucascade::io::io_context_type::uring;
   }
   void shutdown() noexcept override {}
   bool supports(std::string_view) const noexcept override { return true; }
@@ -1220,7 +1220,7 @@ TEST_CASE("Iceberg Puffin wrapper retains failure diagnostics", "[materializatio
   info->profiles->counters     = counters;
   auto ingestible              = make_ingestible(std::move(info));
   ingestible->attach_preparation_ledger(ledger);
-  auto dataio  = std::make_shared<cucascade::io::kvikio_context>();
+  auto dataio  = sirius::test::make_test_local_ioctx();
   auto dvio    = std::make_shared<failing_dv_context>(mode);
   auto claimed = ingestible->try_claim_split(
     [&](std::string_view name) -> std::shared_ptr<cucascade::io::ioctx> {

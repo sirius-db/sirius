@@ -63,8 +63,7 @@ set(SIRIUS_LINK_LIBRARIES
     PkgConfig::LIBURING
     ${SIRIUS_CURL_TARGET}
     OpenSSL::Crypto
-    absl::any_invocable
-    kvikio::kvikio)
+    absl::any_invocable)
 if(BUILD_WITH_CTRACK)
   list(APPEND SIRIUS_LINK_LIBRARIES $<BUILD_INTERFACE:ctrack::ctrack>)
 endif()
@@ -130,7 +129,7 @@ foreach(_target sirius_objects sirius_context_config sirius_core sirius_shared)
   # cuCascade::cucascade_cudf holds the cudf-coupled representations and
   # converters Sirius uses; it transitively links the cudf-free core
   # (cuCascade::cucascade) and cudf::cudf. cuCascade::cucascade_io is the io
-  # library (uring/REST/kvikio reactors, fs_cache) Sirius consumes directly.
+  # library (uring/REST/cuFile reactors, fs_cache) Sirius consumes directly.
 
   target_link_libraries(${_target} PRIVATE ${SIRIUS_LINK_LIBRARIES})
 

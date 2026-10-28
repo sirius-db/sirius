@@ -460,7 +460,7 @@ struct equality_delete_read_result {
 
 /// Reads an equality-delete file into a GPU table, plus its column names and Iceberg field ids.
 /// Stays on device because the result feeds a cudf::distinct_hash_join directly. @p ioctx must
-/// be non-null: this entry point has no kvikio bypass.
+/// be non-null: the caller must provide an ioctx.
 equality_delete_read_result read_equality_delete_file(
   std::string const& delete_file_path, std::shared_ptr<cucascade::io::ioctx> const& ioctx)
 {
@@ -736,8 +736,8 @@ std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data_uncached(
 
   if (metadata_ioctx == nullptr) {
     throw std::invalid_argument(
-      "[iceberg] read_iceberg_delete_data: metadata_ioctx is null; caller must provide a "
-      "ioctx (this entry point does not implement a kvikio fallback).");
+      "[iceberg] read_iceberg_delete_data: metadata_ioctx is null; caller must provide an "
+      "ioctx.");
   }
 
   // Errors propagate rather than degrading to empty delete data: empty is indistinguishable

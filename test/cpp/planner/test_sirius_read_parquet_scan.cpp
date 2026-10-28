@@ -27,7 +27,6 @@
 #include <cudf/utilities/default_stream.hpp>
 
 #include <catch.hpp>
-#include <cucascade/io/kvikio/kvikio_context.hpp>
 #include <duckdb.hpp>
 #include <duckdb/common/multi_file/multi_file_reader.hpp>
 #include <duckdb/execution/column_binding_resolver.hpp>
@@ -40,6 +39,7 @@
 #include <op/sirius_physical_table_scan.hpp>
 #include <planner/sirius_physical_plan_generator.hpp>
 #include <sirius_context.hpp>
+#include <utils/local_ioctx.hpp>
 #include <utils/parquet_fixture_utils.hpp>
 #include <utils/sirius_test_env.hpp>
 #include <utils/table_filter_test_utils.hpp>
@@ -397,7 +397,7 @@ TEST_CASE("parquet lineage and lowering agree on registered dynamic-filter chann
     auto& reader     = dynamic_cast<scan::parquet_gpu_ingestible&>(gpu.get_ingestible());
     auto const& bind = static_cast<scan::parquet_ingestible_table_info const&>(reader.table_info());
     CHECK(bool(bind.sirius_dynamic_filters) == (channel_state == 2));
-    auto ioctx = std::make_shared<cucascade::io::kvikio_context>();
+    auto ioctx = sirius::test::make_test_local_ioctx();
     auto task  = reader.next_split_provider([&](std::string_view) { return ioctx; });
     REQUIRE(task);
     auto coalescer = reader.create_batch_coalescer();

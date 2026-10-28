@@ -129,13 +129,13 @@ TEST_CASE("public configuration returns errors for invalid inputs", "[context_co
   SECTION("malformed time values")
   {
     for (const auto& value : {std::string("-ms"), std::string(400, '9') + "ms"}) {
-      scoped_yaml file("sirius: {executor: {scan_manager: {rest: {upkeep_interval_ms: '" + value +
+      scoped_yaml file("sirius: {executor: {scan_manager: {rest: {connect_timeout_ms: '" + value +
                        "'}}}}");
       auto result = ContextConfigBuilder::from_yaml(file.path);
       REQUIRE_FALSE(result.has_value());
       CHECK(result.error().code == ErrorCode::invalid_configuration);
       CHECK(result.error().message.find(file.path.string()) != std::string::npos);
-      CHECK(result.error().message.find("upkeep_interval_ms") != std::string::npos);
+      CHECK(result.error().message.find("connect_timeout_ms") != std::string::npos);
     }
   }
 }

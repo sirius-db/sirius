@@ -109,7 +109,6 @@ char const* to_string(cucascade::io::io_context_type type) noexcept
   switch (type) {
     case cucascade::io::io_context_type::uring: return "uring";
     case cucascade::io::io_context_type::restful: return "restful";
-    case cucascade::io::io_context_type::kvikio: return "kvikio";
     case cucascade::io::io_context_type::cufile: return "cufile";
     case cucascade::io::io_context_type::s3rdma: return "s3rdma";
   }
@@ -154,9 +153,6 @@ prefetch_strategy backend_prefetch_strategy(cucascade::io::io_context_type type)
     case cucascade::io::io_context_type::s3rdma: return prefetch_strategy::eager;
     case cucascade::io::io_context_type::uring:
     case cucascade::io::io_context_type::cufile: return prefetch_strategy::opportunistic;
-    // kvikIO cannot use the prefetching cache, so prepare_for_query excludes it
-    // before backend selection (as it does cuFile above).
-    case cucascade::io::io_context_type::kvikio: break;
   }
   return prefetch_strategy::eager;
 }
@@ -1391,8 +1387,8 @@ sirius_scan_manager::sirius_scan_manager(
   }
 
   // The configured local context is mandatory: uring for native, cuFile for
-  // cufile, or kvikIO. The registry also routes remote paths independently;
-  // native/cufile use REST for S3, while kvikIO keeps its catch-all read route.
+  // cufile. The registry routes S3 paths independently to the REST backend;
+  // there is no catch-all backend for other URL schemes.
   //
   // The default ioctx is mandatory, so its failure is thrown rather than logged:
   // the cause is explained once, in the exception.
@@ -1445,10 +1441,6 @@ sirius_scan_manager::sirius_scan_manager(
       SIRIUS_LOG_DEBUG("[sirius_scan_manager] default io context: cufile n_reactors={}",
                        _config.cufile_n_reactors);
       break;
-    case scan_manager::io_backend::kvikio:
-      _io_ctx = make_default_ioctx(cucascade::io::io_context_type::kvikio);
-      SIRIUS_LOG_DEBUG("[sirius_scan_manager] backend=kvikio — using kvikio_context fallback");
-      break;
   }
 
   // Build the fs_cache when cache.mode is cucs and the backend can use one;
@@ -1456,7 +1448,7 @@ sirius_scan_manager::sirius_scan_manager(
   init_cache_for(*_io_ctx);
 
   // start() spawns one worker thread per reactor (for uring each with its own
-  // ring and pinned staging).  No-op for the kvikio fallback.
+  // ring and pinned staging).
   try {
     _io_ctx->start();
   } catch (std::exception const& e) {
@@ -1681,7 +1673,7 @@ void sirius_scan_manager::prepare_for_query(
     auto const plan    = _config.resolve_readahead(backend.budget, backend.strategy);
 
     // A budget override cannot make an ineligible backend fill a cache. Do not
-    // subscribe or start a worker for cuFile/kvikIO-only queries, failed pinned
+    // subscribe or start a worker for cuFile-only queries, failed pinned
     // caches, or queries that advertise no IO backend at all.
     if (!backend_policies.empty() && plan.budget > 0) {
       // Registers its mailbox for the query's lifetime; unregistered in reset().
@@ -2354,7 +2346,12 @@ std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_path(std::s
   // Normalize here so every caller (incl. the scan resolver, which forwards raw
   // ingestible paths) routes `file://` the same way create_datasource does.
   auto file_path = normalize_path(std::string(path));
-  auto type      = _ioctx_registry.lookup_path(file_path);
+  if (file_path.starts_with("http://") || file_path.starts_with("https://")) {
+    throw std::invalid_argument(
+      "[sirius_scan_manager] unsupported URL scheme: raw HTTP(S) paths are not supported; "
+      "use s3://bucket/key with an object_store endpoint");
+  }
+  auto type = _ioctx_registry.lookup_path(file_path);
   if (!type) { return nullptr; }
   return ioctx_for_type(*type, file_path);
 }
@@ -2373,14 +2370,13 @@ std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_type(
   cucascade::io::io_context_type type, std::string_view path)
 {
   auto const canonical_path = path.empty() ? std::string{} : normalize_path(std::string(path));
-  bool const uses_object_store_config = type == cucascade::io::io_context_type::restful ||
-                                        type == cucascade::io::io_context_type::kvikio;
-  auto const snapshot  = uses_object_store_config && !canonical_path.empty()
-                           ? _s3_configs.resolve(canonical_path)
-                           : std::optional<sirius::io::scoped_object_store_configs::snapshot>{};
-  auto const config_id = snapshot ? snapshot->id : 0;
-  auto const cache_key = routed_ioctx_key{type, config_id};
-  // The local default `_io_ctx` already serves uring/cufile/kvikio; only an off-default
+  bool const uses_object_store_config = type == cucascade::io::io_context_type::restful;
+  auto const snapshot                 = uses_object_store_config && !canonical_path.empty()
+                                          ? _s3_configs.resolve(canonical_path)
+                                          : std::optional<sirius::io::scoped_object_store_configs::snapshot>{};
+  auto const config_id                = snapshot ? snapshot->id : 0;
+  auto const cache_key                = routed_ioctx_key{type, config_id};
+  // The local default `_io_ctx` already serves uring/cufile; only an off-default
   // backend (e.g. s3:// -> restful) needs a separate, lazily-built context.
   if (_io_ctx && _io_ctx->type() == type && !snapshot) { return _io_ctx; }
 
@@ -2474,9 +2470,6 @@ sirius_scan_manager::ioctx_failure sirius_scan_manager::explain_ioctx_failure(
                 "Direct reads require libcufile and a compatible GDS path; compat_mode=on "
                 "uses POSIX fallback without requiring GDS availability",
               .by_configuration = false};
-    case cucascade::io::io_context_type::kvikio:
-      return {.cause = "kvikIO backend could not be constructed (check kvikio.* settings)",
-              .by_configuration = false};
     case cucascade::io::io_context_type::s3rdma: break;
   }
   return {.cause = "the io registry has no factory for this backend", .by_configuration = false};
@@ -2533,13 +2526,11 @@ void sirius_scan_manager::install_s3_config(std::string_view path,
   auto superseded_id = _s3_configs.install(scope, std::move(config));
   if (!superseded_id) { return; }
   std::lock_guard ctx_lk{_routed_io_ctxs_mtx};
-  for (auto const type :
-       {cucascade::io::io_context_type::restful, cucascade::io::io_context_type::kvikio}) {
-    auto it = _routed_io_ctxs.find(routed_ioctx_key{type, *superseded_id});
-    if (it != _routed_io_ctxs.end()) {
-      retired.push_back(std::move(it->second));
-      _routed_io_ctxs.erase(it);
-    }
+  auto it =
+    _routed_io_ctxs.find(routed_ioctx_key{cucascade::io::io_context_type::restful, *superseded_id});
+  if (it != _routed_io_ctxs.end()) {
+    retired.push_back(std::move(it->second));
+    _routed_io_ctxs.erase(it);
   }
 }
 

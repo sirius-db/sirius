@@ -201,7 +201,7 @@ TEST_CASE("rest datasource fans out host_read_ranges_async against the SeaweedFS
   scan_manager_fixture fixture;
   auto cfg                 = make_s3_rest_config();
   cfg.rest.max_connections = 4;
-  cfg.rest.merge_max_gap   = 0;  // one GET per range: no bridging across the gaps
+  cfg.rest.merge_max_gap   = 0;  // no logical gap coalescing; physical GET sizing is worker-owned
   sirius::exec::query_lifecycle_registry scan_lifecycle;
   sirius_scan_manager manager{scan_lifecycle, cfg, *fixture.memory, fixture.topology};
   auto datasource = manager.create_datasource("s3://" + bucket + "/medium.bin");

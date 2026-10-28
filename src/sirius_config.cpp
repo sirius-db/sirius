@@ -23,6 +23,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include <cucascade/io/tls/config.hpp>
 #include <cucascade/io/uring/config.hpp>
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
@@ -30,12 +31,15 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <exception>
+#include <initializer_list>
 #include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -193,6 +197,96 @@ static void from_yaml(const YAML::Node& node, creator::task_creator_config& opt)
   r.reject_unknown();
 }
 
+// Read counts signed first, so negative YAML values cannot wrap into an unsigned field.
+template <typename T>
+static void read_count(yaml::reader& r,
+                       char const* key,
+                       T& out,
+                       bool positive     = false,
+                       std::uint64_t max = std::numeric_limits<T>::max())
+{
+  std::int64_t value{};
+  r.optional(key, value, [=](auto v) {
+    if (v < 0 || (positive && v == 0) || static_cast<std::uint64_t>(v) > max) {
+      throw std::runtime_error(positive ? "must be a positive integer in range"
+                                        : "must be a nonnegative integer in range");
+    }
+    return true;
+  });
+  if (r.has_value(key)) { out = static_cast<T>(value); }
+}
+
+static void from_yaml(const YAML::Node& node, cucascade::io::tls::config& opt)
+{
+  namespace tls = cucascade::io::tls;
+  yaml::reader r(node, "rest.tls");
+  for (auto const* key : {"verify", "ca_file", "ca_dir", "ca_blob"}) {
+    if (r.has(key)) {
+      throw std::runtime_error("'sirius.executor.scan_manager.rest.tls." + std::string(key) +
+                               "': trust is owned by object_store; use CREATE SECRET "
+                               "(TYPE SIRIUS_S3, ...) or "
+                               "sirius_config::set_object_store_config() instead");
+    }
+  }
+  auto enum_value = [&]<typename T>(char const* key,
+                                    T& out,
+                                    std::initializer_list<std::pair<std::string_view, T>> choices) {
+    std::string value;
+    r.optional(key, value, [&](auto const& spelling) {
+      for (auto const& [name, choice] : choices) {
+        if (spelling == name) {
+          out = choice;
+          return true;
+        }
+      }
+      throw std::runtime_error("invalid enum value '" + spelling + "'");
+    });
+  };
+  enum_value("ktls",
+             opt.ktls,
+             {{"prefer", tls::ktls_mode::prefer},
+              {"require", tls::ktls_mode::require},
+              {"disable", tls::ktls_mode::disable}});
+  enum_value(
+    "user_space_rx",
+    opt.fallback_rx,
+    {{"record_layer", tls::user_space_rx::record_layer}, {"library", tls::user_space_rx::library}});
+  enum_value("recv_placement",
+             opt.placement,
+             {{"automatic", tls::recv_placement::automatic},
+              {"inline", tls::recv_placement::inline_},
+              {"iowq", tls::recv_placement::iowq}});
+  enum_value("min_version",
+             opt.min_version,
+             {{"tls1.2", tls::version_bound::tls1_2}, {"tls1.3", tls::version_bound::tls1_3}});
+  std::string max_version;
+  r.optional("max_version", max_version, [&](auto const& value) {
+    if (value == "auto") {
+      opt.max_version.reset();
+    } else if (value == "tls1.2") {
+      opt.max_version = tls::version_bound::tls1_2;
+    } else if (value == "tls1.3") {
+      opt.max_version = tls::version_bound::tls1_3;
+    } else {
+      throw std::runtime_error("invalid enum value '" + value + "'");
+    }
+    return true;
+  });
+  if (opt.max_version && opt.min_version > *opt.max_version) {
+    throw std::runtime_error("'rest.tls.max_version': must be at least rest.tls.min_version");
+  }
+  r.optional("expect_no_pad", opt.expect_no_pad);
+  r.optional("session_cache", opt.session_cache);
+  read_count(r, "session_cache_per_endpoint", opt.session_cache_per_endpoint, true);
+  r.optional("max_connection_bytes", yaml::bytes(opt.max_connection_bytes));
+  r.optional("ciphersuites", opt.ciphersuites);
+  r.optional("cipher_list", opt.cipher_list);
+  r.optional("groups", opt.groups);
+  r.optional("sni_override", opt.sni_override);
+  r.optional("allow_tls13_without_rekey", opt.allow_tls13_without_rekey);
+  r.reject_unknown();
+}
+
 static void from_yaml(const YAML::Node& node, cucascade::io::rest::config& opt)
 {
   yaml::reader r(node, "rest");
@@ -202,30 +296,66 @@ static void from_yaml(const YAML::Node& node, cucascade::io::rest::config& opt)
                                "': removed; use sirius_config::set_object_store_config() instead");
     }
   }
-  {
-    // Read through an optional so "set to the struct default" is distinguishable
-    // from "not set" -- see config::n_max_concurrent_scans_explicit.
-    std::optional<std::size_t> n_max;
-    r.optional("n_max_concurrent_scans", n_max);
-    if (n_max.has_value()) {
-      opt.n_max_concurrent_scans          = *n_max;
-      opt.n_max_concurrent_scans_explicit = true;
+  read_count(r, "n_max_concurrent_scans", opt.n_max_concurrent_scans);
+  // Naming even the struct default must prevent pipeline-width default derivation.
+  if (r.has_value("n_max_concurrent_scans")) { opt.n_max_concurrent_scans_explicit = true; }
+  r.optional("request_timeout_s", opt.request_timeout_s, yaml::greater_than<long>{-1});
+  r.optional("stall_speed_limit_bytes", opt.stall_speed_limit_bytes, yaml::greater_than<long>{-1});
+  r.optional("stall_time_s", opt.stall_time_s, yaml::greater_than<long>{-1});
+  // Still consumed by the logical range planner, independently of physical GET sizing.
+  r.optional("merge_max_gap", yaml::bytes(opt.merge_max_gap));
+  for (auto const* key : {"upkeep_interval_ms", "retry_jitter_ms"}) {
+    if (r.has(key)) {
+      (void)r.optional_node(key);
+      SIRIUS_LOG_WARN(
+        "'rest.{}' is deprecated and ignored by the io_uring REST transport; "
+        "remove the key from the config",
+        key);
     }
   }
-  r.optional("request_timeout_s", opt.request_timeout_s);
-  r.optional("stall_speed_limit_bytes", opt.stall_speed_limit_bytes);
-  r.optional("stall_time_s", opt.stall_time_s);
-  r.optional("merge_max_gap", yaml::bytes(opt.merge_max_gap));
-  r.optional("upkeep_interval_ms", opt.upkeep_interval);
-  r.optional("conn_max_age_s", opt.conn_max_age);
-  r.optional("retry_backoff_base_ms", opt.retry_backoff_base);
-  r.optional("retry_jitter_ms", opt.retry_jitter);
-  r.optional("max_retry_attempts", opt.max_retry_attempts);
-  r.optional("max_auth_retry_attempts", opt.max_auth_retry_attempts);
+  auto nonnegative_duration = [](auto value) { return value.count() >= 0; };
+  auto positive_duration    = [](auto value) { return value.count() > 0; };
+  r.optional("conn_max_age_s", opt.conn_max_age, nonnegative_duration);
+  r.optional("retry_backoff_base_ms", opt.retry_backoff_base, nonnegative_duration);
+  read_count(
+    r, "max_retry_attempts", opt.max_retry_attempts, false, std::numeric_limits<unsigned>::max());
+  read_count(r,
+             "max_auth_retry_attempts",
+             opt.max_auth_retry_attempts,
+             false,
+             std::numeric_limits<unsigned>::max());
   r.optional("honor_retry_after", opt.honor_retry_after);
   r.optional("footer_probe_bytes", yaml::bytes(opt.footer_probe_bytes));
-  r.optional("list_max_matches", opt.list_max_matches);
-  r.optional("list_max_scanned", opt.list_max_scanned);
+  read_count(r, "list_max_matches", opt.list_max_matches, true);
+  read_count(r, "list_max_scanned", opt.list_max_scanned, true);
+  r.optional("connect_timeout_ms", opt.connect_timeout, positive_duration);
+  r.optional("tls_handshake_timeout_ms", opt.tls_handshake_timeout, positive_duration);
+  read_count(r, "keep_warm_connections", opt.keep_warm_connections);
+  read_count(r, "max_connections", opt.max_connections, true, std::numeric_limits<unsigned>::max());
+  r.optional("min_segment_bytes", yaml::bytes(opt.min_segment_bytes));
+  r.optional("max_segment_bytes", yaml::bytes(opt.max_segment_bytes));
+  if (opt.min_segment_bytes == 0) {
+    throw std::runtime_error("'rest.min_segment_bytes': must be positive");
+  }
+  if (opt.max_segment_bytes == 0 || opt.max_segment_bytes < opt.min_segment_bytes) {
+    throw std::runtime_error(
+      "'rest.max_segment_bytes': must be positive and at least "
+      "rest.min_segment_bytes");
+  }
+  r.optional("enable_controller", opt.enable_controller);
+  r.optional(
+    "link_gbps", opt.link_gbps, [](double value) { return std::isfinite(value) && value >= 0; });
+  read_count(r, "ring_entries", opt.ring_entries, true, 32768);
+  if (opt.ring_entries < 8) {
+    throw std::runtime_error("'rest.ring_entries': must be between 8 and 32768");
+  }
+  read_count(r, "iowq_max_unbound", opt.iowq_max_unbound);
+  r.optional("write_part_bytes", yaml::bytes(opt.write_split_bytes));
+  if (opt.write_split_bytes < (5UL << 20)) {
+    throw std::runtime_error("'rest.write_part_bytes': must be at least 5 MiB");
+  }
+  r.optional("expect_continue", opt.expect_continue);
+  if (auto n = r.optional_node("tls")) sirius::from_yaml(*n, opt.tls);
   r.reject_unknown();
 }
 
@@ -335,33 +465,6 @@ static void from_yaml(const YAML::Node& node, cucascade::io::cufile::config& opt
   r.reject_unknown();
 }
 
-static void from_yaml(const YAML::Node& node, cucascade::io::kvikio_config& opt)
-{
-  yaml::reader r(node, "kvikio");
-  r.optional("nthreads", opt.nthreads);
-  r.optional("task_size", yaml::bytes(opt.task_size));
-  r.optional("gds_threshold", yaml::bytes(opt.gds_threshold));
-  r.optional("bounce_buffer_size", yaml::bytes(opt.bounce_buffer_size));
-  r.optional("auto_direct_io_read", opt.auto_direct_io_read);
-  r.optional("auto_direct_io_read_overread", opt.auto_direct_io_read_overread);
-  r.optional("thread_pool_per_block_device", opt.thread_pool_per_block_device);
-  std::string compat;
-  r.optional("compat_mode", compat);
-  if (!compat.empty()) {
-    if (compat == "auto") {
-      opt.compat_mode = kvikio::CompatMode::AUTO;
-    } else if (compat == "on") {
-      opt.compat_mode = kvikio::CompatMode::ON;
-    } else if (compat == "off") {
-      opt.compat_mode = kvikio::CompatMode::OFF;
-    } else {
-      throw std::runtime_error("'kvikio.compat_mode': invalid enum value '" + compat +
-                               "' (expected auto, on or off)");
-    }
-  }
-  r.reject_unknown();
-}
-
 static void from_yaml(const YAML::Node& node, cucascade::io::cache::config& opt)
 {
   yaml::reader r(node, "cache");
@@ -454,7 +557,23 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   }
   r.optional("num_threads", opt.thread_pool.num_threads, yaml::greater_than<int>{0});
   r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
-  r.optional("backend", opt.backend);
+  std::optional<std::string> backend;
+  r.optional("backend", backend);
+  if (backend) {
+    if (*backend == "kvikio") {
+      throw std::runtime_error(
+        "'scan_manager.backend': backend: kvikio has been removed; "
+        "use backend: native instead");
+    }
+    if (!scan_manager::string_to_enum(*backend, opt.backend)) {
+      throw std::runtime_error("'scan_manager.backend': invalid enum value '" + *backend + "'");
+    }
+  }
+  if (r.has("kvikio")) {
+    throw std::runtime_error(
+      "'scan_manager.kvikio': removed; remove this block and use "
+      "backend: native instead");
+  }
   r.optional("max_concurrent_queries", opt.max_concurrent_queries, yaml::greater_than<int>{0});
   r.optional("uring_n_reactors", opt.uring_n_reactors, yaml::greater_than<std::size_t>{0});
   r.optional("rest_n_reactors", opt.rest_n_reactors, yaml::greater_than<std::size_t>{0});
@@ -467,7 +586,6 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   r.optional("readahead_strategy", opt.readahead_strategy);
   if (auto n = r.optional_node("uring")) sirius::from_yaml(*n, opt.uring);
   if (auto n = r.optional_node("rest")) sirius::from_yaml(*n, opt.rest);
-  if (auto n = r.optional_node("kvikio")) sirius::from_yaml(*n, opt.kvikio);
   if (auto n = r.optional_node("cufile")) sirius::from_yaml(*n, opt.cufile);
   if (auto n = r.optional_node("cache")) sirius::from_yaml(*n, opt.cache);
   if (auto n = r.optional_node("memory_prefetcher")) from_yaml(*n, opt.memory_prefetcher);

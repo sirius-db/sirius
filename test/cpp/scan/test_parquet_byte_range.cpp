@@ -18,10 +18,11 @@
 #include <catch.hpp>
 
 // sirius
-#include <cucascade/io/kvikio/kvikio_context.hpp>
+
 #include <op/scan/parquet_byte_range.hpp>
 #include <op/scan/parquet_gpu_ingestible.hpp>
 #include <sirius/exception.hpp>
+#include <utils/local_ioctx.hpp>
 
 // cudf
 #include <cudf/column/column_factories.hpp>
@@ -330,7 +331,7 @@ std::pair<std::vector<cudf::size_type>, std::int64_t> scan_selection(
   std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> info)
 {
   auto ingestible = sirius::op::scan::make_ingestible(std::move(info));
-  auto ioctx      = std::make_shared<cucascade::io::kvikio_context>();
+  auto ioctx      = sirius::test::make_test_local_ioctx();
   auto task       = ingestible->next_split_provider(
     [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
   REQUIRE(task);

@@ -8,7 +8,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <cucascade/cudf/datasource.hpp>
-#include <cucascade/io/kvikio/kvikio_context.hpp>
+#include <utils/local_ioctx.hpp>
 
 #include <chrono>
 #include <cstdio>
@@ -40,7 +40,7 @@ TEST_CASE("Ten thousand real Parquet files reuse verified footer records",
   }
   // Files were just copied: OS page cache is warm in both passes. Only the
   // metadata cache changes from cold to warm; raw prefetch is not initialized.
-  auto context = std::make_shared<cucascade::io::kvikio_context>();
+  auto context = sirius::test::make_test_local_ioctx();
   auto options = cudf::io::parquet_reader_options::builder().build();
   for (int pass = 0; pass < 2; ++pass) {
     auto start  = std::chrono::steady_clock::now();
