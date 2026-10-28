@@ -19,8 +19,7 @@
 namespace sirius::op::scan {
 class parquet_scan_core {
  public:
-  using metadata_scan_task_t           = gpu_ingestible::metadata_scan_task_t;
-  using stoppable_metadata_scan_task_t = gpu_ingestible::stoppable_metadata_scan_task_t;
+  using metadata_scan_task_t = gpu_ingestible::metadata_scan_task_t;
   void set_execution_completion(std::shared_ptr<pipeline::completion_handler> c)
   {
     _execution_completion = std::move(c);
@@ -45,8 +44,6 @@ class parquet_scan_core {
   [[nodiscard]] bool source_selection_empty() const noexcept { return _source_selection_empty; }
 
   metadata_scan_task_t next_split_provider(io::ioctx_resolver resolve);
-  metadata_scan_task_t next_split_provider(io::ioctx_resolver resolve, std::stop_token stop);
-  stoppable_metadata_scan_task_t next_split_provider_with_stop(io::ioctx_resolver resolve);
 
   filtered_table materialize_metadata_to_table(
     scan_info const& info,

@@ -46,7 +46,8 @@ namespace sirius::op {
 
 namespace detail {
 class accumulated_bloom_builder;
-}
+struct fused_probe;
+}  // namespace detail
 
 enum class sirius_dynamic_filter_kind { ZONE_MAP, IN_LIST, BLOOM };
 
@@ -57,12 +58,20 @@ class sirius_dynamic_filter {
  public:
   virtual ~sirius_dynamic_filter() = default;
 
+  // Set only before publication; consumers see an immutable flag. Keeping all NULLs is safe
+  // even when the build contains none: the exact join still evaluates the original condition.
+  void set_preserve_nulls(bool value) noexcept { _preserve_nulls = value; }
+  [[nodiscard]] bool preserves_nulls() const noexcept { return _preserve_nulls; }
+
   [[nodiscard]] virtual sirius_dynamic_filter_kind kind() const = 0;
 
   [[nodiscard]] virtual bool is_available_on_device(int /*device_id*/) const noexcept
   {
     return true;
   }
+
+ private:
+  bool _preserve_nulls = false;
 };
 
 /**
@@ -168,6 +177,30 @@ class sirius_mask_applicable {
   virtual ~sirius_mask_applicable() = default;
 
   /**
+   * @brief Describes a device-local probe for try_fused_membership_mask
+   *
+   * Unlike compute_mask[_if](), this host-only operation submits no GPU work and allocates no
+   * device storage. It simply describes how a fused kernel should perform a given membership test.
+   * A successful descriptor borrows this filter's replica and the probe column until GPU
+   * completion. False leaves `out` unchanged and does not imply that compute_mask must decline.
+   *
+   * A true result replaces compute_mask[_if]() for this probe: the descriptor must keep exactly the
+   * rows compute_mask_if() would keep for the same probe and prior, and implies compute_mask[_if]()
+   * would not decline. An override of compute_mask[_if]() must therefore also override this.
+   *
+   * @param probe Keys to probe
+   * @param device_id Device holding the filter replica
+   * @param out Destination for a supported descriptor
+   * @return Whether the descriptor is ready
+   */
+  [[nodiscard]] virtual bool prepare_fused_probe(cudf::column_view const& /*probe*/,
+                                                 int /*device_id*/,
+                                                 detail::fused_probe& /*out*/) const
+  {
+    return false;
+  }
+
+  /**
    * @brief Returns `probe.size()` BOOL8 values (`true` keeps), or null for an incompatible probe
    *
    * The membership implementations accept any integer carrier of the key's signedness
@@ -184,9 +217,8 @@ class sirius_mask_applicable {
    * skip the probe. A pruning hint only; ignoring it is sound because every caller ANDs the
    * result with that same mask.
    *
-   * The result is never nullable. A null probe row is written as `false`: admission never routes
-   * a null-safe comparison to a dynamic filter and the authoritative join runs with
-   * `null_equality::UNEQUAL`, so a null key is a definite non-member on either side.
+   * The result is never nullable. NULL probe rows are rejected for ordinary equality and
+   * retained for explicitly NULL-preserving membership, unless the prior mask rejected them.
    */
   [[nodiscard]] virtual std::unique_ptr<cudf::column> compute_mask(
     cudf::column_view const& probe,
@@ -241,8 +273,8 @@ class sirius_mask_applicable {
  * distinct strings sharing a fingerprint pass a probe the authoritative join then drops. The
  * backing set reserves one sentinel value it cannot store (`numeric_limits::min()` for signed
  * reps, `::max()` for unsigned and string fingerprints); probes equal to it are kept to avoid
- * false negatives. Null build keys are compacted out (they match nothing under the join's
- * `null_equality::UNEQUAL`).
+ * false negatives. Null build keys are compacted out; NULL-safe admission instead preserves
+ * NULL probe rows independently of membership.
  */
 class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
                                             public sirius_mask_applicable,
@@ -289,6 +321,10 @@ class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
     int device_id,
     ::cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) const override;
+
+  [[nodiscard]] bool prepare_fused_probe(cudf::column_view const& probe,
+                                         int device_id,
+                                         detail::fused_probe& out) const override;
 
   void replicate_to_devices(std::span<dynamic_filter_replica_space const> spaces) override;
   [[nodiscard]] bool is_available_on_device(int device_id) const noexcept override;
@@ -371,11 +407,15 @@ class sirius_dynamic_small_in_list_filter final : public sirius_dynamic_filter,
     ::cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) const override;
 
+  [[nodiscard]] bool prepare_fused_probe(cudf::column_view const& probe,
+                                         int device_id,
+                                         detail::fused_probe& out) const override;
+
   void replicate_to_devices(std::span<dynamic_filter_replica_space const> spaces) override;
   [[nodiscard]] bool is_available_on_device(int device_id) const noexcept override;
 
   [[nodiscard]] std::size_t replica_count() const noexcept;
-  [[nodiscard]] std::size_t size() const noexcept { return _num_keys; }
+  [[nodiscard]] std::size_t size() const noexcept;
   [[nodiscard]] membership_key_domain const& domain() const noexcept { return _domain; }
   [[nodiscard]] static bool supports(cudf::column_view const& keys) noexcept;
 
@@ -389,7 +429,6 @@ class sirius_dynamic_small_in_list_filter final : public sirius_dynamic_filter,
     rmm::device_async_resource_ref mr) const;
 
   membership_key_domain _domain{};
-  std::size_t _num_keys = 0;
 
   struct needle_store;
   std::unique_ptr<needle_store> _store;
@@ -449,6 +488,10 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
     int device_id,
     ::cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) const override;
+
+  [[nodiscard]] bool prepare_fused_probe(cudf::column_view const& probe,
+                                         int device_id,
+                                         detail::fused_probe& out) const override;
 
   void replicate_to_devices(std::span<dynamic_filter_replica_space const> spaces) override;
   [[nodiscard]] bool is_available_on_device(int device_id) const noexcept override;

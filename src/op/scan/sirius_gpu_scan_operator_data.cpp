@@ -153,10 +153,20 @@ scan_operator_input::scan_operator_input(
 
 void scan_operator_input::initialize_prefetch()
 {
-  if (std::exchange(_prefetch_started, true)) {
+  prepare_prefetch();
+  publish_prefetch();
+}
+
+void scan_operator_input::prepare_prefetch()
+{
+  if (_prefetch_phase != prefetch_phase::idle) {
     throw std::logic_error("scan input prefetch initialization already attempted");
   }
-  if (!has_scan_metadata()) return;
+  _prefetch_phase = prefetch_phase::preparing;
+  if (!has_scan_metadata()) {
+    _prefetch_phase = prefetch_phase::prepared;
+    return;
+  }
   auto const& stored    = std::get<std::shared_ptr<scan_info>>(materialization_info);
   auto preferred_device = get_preferred_device_id();
 
@@ -178,6 +188,16 @@ void scan_operator_input::initialize_prefetch()
   // Never wait for synchronous eviction while initializing a scan input.
   static_cast<void>(stored->prepare_for_prefetching(false));
 
+  _prefetch_phase = prefetch_phase::prepared;
+}
+
+void scan_operator_input::publish_prefetch()
+{
+  if (_prefetch_phase != prefetch_phase::prepared)
+    throw std::logic_error("scan input must be prepared exactly once before publication");
+  _prefetch_phase = prefetch_phase::published;
+  if (!has_scan_metadata()) return;
+  auto const& stored = std::get<std::shared_ptr<scan_info>>(materialization_info);
   // The publication barrier.  register_scan_task takes the readahead's mutex,
   // which the worker also takes to collect, so the hints above are ordered
   // before any read of them on the worker's side.  Keep this last.

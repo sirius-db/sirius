@@ -93,6 +93,8 @@ class dynamic_filter_publish_plan final {
     std::size_t build_key_domain_cardinality = 0;
     // Required before row count can represent key-domain coverage.
     bool build_key_proven_unique = false;
+    // NULL-safe equality: retain probe NULLs as conservative false positives.
+    bool preserve_nulls = false;
 
     [[nodiscard]] bool operator==(admitted_key const&) const = default;
   };

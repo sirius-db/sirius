@@ -29,6 +29,7 @@
 #include <log/logging.hpp>
 #include <op/scan/iceberg_gpu_ingestible.hpp>
 #include <op/scan/parquet_batch_layout.hpp>
+#include <transparent/read_view_registry.hpp>
 #include <transparent/replay_admission.hpp>
 
 #include <cstdint>
@@ -137,24 +138,21 @@ iceberg_gpu_ingestible::iceberg_gpu_ingestible(std::unique_ptr<iceberg_ingestibl
 
 namespace {
 std::shared_ptr<iceberg_delete_set const> read_prepared_delete_set(
-  iceberg_dv_preparation const& prepared,
-  iceberg_dv_preparation::file const& descriptor,
-  scan_manager::w_permit const& permit,
-  iceberg_dv_attempt const& prepared_attempt,
+  iceberg_dv_attempt::file_job const& job,
   io::ioctx_resolver const& resolve,
   std::shared_ptr<physical_check_counters> const& counters,
   std::stop_token stop = {})
 {
   if (stop.stop_requested())
     throw std::system_error(std::make_error_code(std::errc::operation_canceled));
-  auto const* dv = descriptor.dv;
+  auto const& descriptor = job.descriptor();
+  auto const* dv         = descriptor.dv;
   if (!dv)
     return std::make_shared<iceberg_delete_set const>(
-      descriptor.path, scan_manager::charged_block{}, 0, 0, prepared.path_owner());
+      descriptor.path, scan_manager::charged_block{}, 0, 0, job.path_owner());
 
   std::shared_ptr<iceberg_delete_set const> set;
-  // The execution attempt owns the ledger; the permit travels with the task.
-  auto allocator = prepared_attempt.ledger()->allocator(permit);
+  auto allocator = job.allocator();
   struct phase_guard {
     std::shared_ptr<physical_check_counters> counters;
     std::string path;
@@ -216,8 +214,8 @@ std::shared_ptr<iceberg_delete_set const> read_prepared_delete_set(
                                                              dv->record_count},
                                        allocator,
                                        descriptor.path,
-                                       prepared.path_owner(),
-                                       prepared.contract(),
+                                       job.path_owner(),
+                                       job.key().contract,
                                        *source);
   } catch (unsupported_physical_input const& error) {
     if (counters) {
@@ -263,71 +261,6 @@ void attach_delete_set(parquet_file_scan_info& file, std::shared_ptr<iceberg_del
 }
 }  // namespace
 
-gpu_ingestible::metadata_scan_task_t iceberg_gpu_ingestible::next_split_provider(
-  io::ioctx_resolver resolve)
-{
-  return next_split_provider_with_stop(std::move(resolve));
-}
-
-gpu_ingestible::stoppable_metadata_scan_task_t
-iceberg_gpu_ingestible::next_split_provider_with_stop(io::ioctx_resolver resolve)
-{
-  if (_deferred && !_attempt) throw std::logic_error("DV preparation attempt has not started");
-  auto resolve_for_dv = resolve;
-  auto work           = _core.next_split_provider_with_stop(std::move(resolve));
-  if (!work) return {};
-  if (_deferred) {
-    auto index = _next_preparation;
-    struct preparation_inputs {
-      scan_manager::w_permit permit;
-      std::shared_ptr<scan_manager::preparation_ledger> ledger;
-      scan_manager::unit_key key;
-      ~preparation_inputs()
-      {
-        permit.release();
-        if (ledger) ledger->retire_unit(key);
-      }
-    };
-    auto held    = std::make_shared<preparation_inputs>();
-    held->permit = std::move(_next_permit);
-    held->key    = {_deferred->contract(), index + 1};
-    if (_next_registered) held->ledger = _attempt->ledger();
-    _next_registered = false;
-    ++_next_preparation;
-    auto prepared        = _deferred;
-    auto attempt         = _attempt;
-    auto const& profiles = static_cast<iceberg_ingestible_table_info const&>(table_info()).profiles;
-    auto counters        = profiles ? profiles->counters : nullptr;
-    return [work = std::move(work),
-            prepared,
-            attempt,
-            held = std::move(held),
-            index,
-            counters,
-            resolve = std::move(resolve_for_dv)](std::stop_token stop) mutable {
-      if (stop.stop_requested())
-        throw std::system_error(std::make_error_code(std::errc::operation_canceled));
-      auto metadata          = work(stop);
-      auto& file             = dynamic_cast<parquet_file_scan_info&>(*metadata);
-      auto const& descriptor = prepared->files()[index];
-      auto set               = read_prepared_delete_set(
-        *prepared, descriptor, held->permit, *attempt, resolve, counters, stop);
-      attempt->record(index, set);
-      attach_delete_set(file, std::move(set));
-      return metadata;
-    };
-  }
-  auto sets = _delete_sets;
-  return [work = std::move(work), sets = std::move(sets)](std::stop_token stop) mutable {
-    if (stop.stop_requested())
-      throw std::system_error(std::make_error_code(std::errc::operation_canceled));
-    auto metadata = work(stop);
-    auto& file    = dynamic_cast<parquet_file_scan_info&>(*metadata);
-    attach_delete_set(file, sets->at(file.file_path));
-    return metadata;
-  };
-}
-
 bool iceberg_ingestible_table_info::allows_cached_rows() const
 {
   // Cached Parquet batches carry physical column positions only.  They do not
@@ -348,76 +281,83 @@ bool iceberg_ingestible_table_info::allows_cached_rows() const
   return true;
 }
 
+gpu_ingestible::metadata_scan_task_t iceberg_gpu_ingestible::next_split_provider(
+  io::ioctx_resolver resolve)
+{
+  if (_deferred) throw std::logic_error("deferred DV work requires an owning claim");
+  auto work = _core.next_split_provider(std::move(resolve));
+  if (!work) return {};
+  return [work = std::move(work), sets = _delete_sets](scan_manager::preparation_stop_token stop) {
+    if (stop.stop_requested())
+      throw std::system_error(std::make_error_code(std::errc::operation_canceled));
+    auto metadata = work(stop);
+    auto& file    = dynamic_cast<parquet_file_scan_info&>(*metadata);
+    attach_delete_set(file, sets->at(file.file_path));
+    return metadata;
+  };
+}
+
+gpu_ingestible::metadata_claim iceberg_gpu_ingestible::try_claim_split(io::ioctx_resolver resolve)
+{
+  if (!_deferred) return gpu_ingestible::try_claim_split(std::move(resolve));
+  if (!_attempt) throw std::logic_error("DV preparation claimed without an active attempt");
+  auto claim = _attempt->try_claim();
+  if (std::holds_alternative<scan_manager::preparation_pending>(claim))
+    return scan_manager::preparation_pending{};
+  auto* ready = std::get_if<std::shared_ptr<iceberg_dv_attempt::file_job>>(&claim);
+  if (!ready) return scan_manager::preparation_exhausted{};
+  auto owned           = std::move(*ready);
+  auto key             = owned->key();
+  auto const& bind     = static_cast<iceberg_ingestible_table_info const&>(table_info());
+  auto const& profiles = bind.profiles;
+  auto required        = scan_manager::required_inputs(
+    bind.read_views->entry(bind.contract_id).eligibility.later_checks, true);
+  // Construct the resource-owning wrapper before advancing the Parquet cursor.
+  struct operation {
+    std::shared_ptr<iceberg_dv_attempt::file_job> owned;
+    metadata_scan_task_t footer;
+    io::ioctx_resolver resolve;
+    std::shared_ptr<physical_check_counters> counters;
+    std::unique_ptr<scan_info> run(scan_manager::preparation_stop_token stop)
+    {
+      auto metadata = footer(stop);
+      auto& file    = dynamic_cast<parquet_file_scan_info&>(*metadata);
+      auto set      = read_prepared_delete_set(*owned, resolve, counters, stop.token());
+      owned->complete(set);
+      attach_delete_set(file, std::move(set));
+      return metadata;
+    }
+  };
+  auto state = std::make_shared<operation>(
+    operation{owned, {}, resolve, profiles ? profiles->counters : nullptr});
+  metadata_scan_task_t work = [state](scan_manager::preparation_stop_token stop) {
+    return state->run(stop);
+  };
+  state->footer = _core.next_split_provider(std::move(resolve));
+  if (!state->footer) throw std::logic_error("Parquet and DV descriptor cursors disagree");
+  owned->commit();
+  return metadata_job{std::move(work), metadata_unit{key, required}};
+}
+void iceberg_gpu_ingestible::bind_preparation_wakeup(scan_manager::preparation_wakeup wake)
+{
+  if (_attempt) _attempt->bind_wakeup(std::move(wake));
+}
+
 std::shared_ptr<scan_manager::preparation_admission> iceberg_gpu_ingestible::preparation_admission()
   const
 {
   return _deferred ? _deferred->admission() : nullptr;
 }
-
 void iceberg_gpu_ingestible::attach_preparation_ledger(
   std::shared_ptr<scan_manager::preparation_ledger> ledger)
 {
-  if (_deferred)
-    begin_preparation(std::make_shared<iceberg_dv_attempt>(_deferred, std::move(ledger)));
-}
-
-void iceberg_gpu_ingestible::begin_preparation(std::shared_ptr<iceberg_dv_attempt> attempt)
-{
-  if (!_deferred) throw std::logic_error("DV preparation is not configured");
+  if (!_deferred) throw std::logic_error("scan has no deferred DV preparation");
   if (_attempt) throw std::logic_error("DV preparation attempt already started");
-  if (!attempt) throw std::logic_error("DV preparation attempt is null");
-  if (&attempt->plan() != _deferred.get())
-    throw std::logic_error("DV preparation attempt belongs to another preparation");
-  _attempt = std::move(attempt);
+  _attempt = std::make_shared<iceberg_dv_attempt>(_deferred, std::move(ledger));
 }
 
-gpu_ingestible::preparation_claim iceberg_gpu_ingestible::claim_preparation(
-  io::ioctx_resolver resolve)
-{
-  // Coordinator serializes claims. Capture the key and transfer its permit with this work.
-  std::optional<scan_manager::unit_key> key;
-  scan_manager::required_input_set required;
-  if (_deferred) {
-    key              = next_preparation_unit();
-    auto const& bind = static_cast<iceberg_ingestible_table_info const&>(table_info());
-    required         = scan_manager::required_inputs(
-      bind.read_views->entry(bind.contract_id).eligibility.later_checks, true);
-  }
-  auto stop_work = next_split_provider_with_stop(std::move(resolve));
-  if (!stop_work) return {};
-  auto work = stop_work;
-  return {[work = std::move(work)](std::stop_token stop) { return work(stop); },
-          std::move(stop_work),
-          key,
-          required};
-}
-
-scan_manager::unit_key iceberg_gpu_ingestible::next_preparation_unit() const
-{
-  return {_deferred->contract(), _next_preparation + 1};
-}
-bool iceberg_gpu_ingestible::can_claim_preparation()
-{
-  if (!_deferred || _next_preparation >= _deferred->files().size()) return true;
-  if (!_deferred->files()[_next_preparation].dv) return true;
-  if (!_attempt) throw std::logic_error("DV preparation has no attempt ledger");
-  if (!_next_registered) {
-    _attempt->ledger()->register_unit(
-      {_deferred->contract(), _next_preparation + 1},
-      _deferred->files()[_next_preparation].dv->record_count * sizeof(int64_t));
-    _next_registered = true;
-  }
-  if (!_next_permit)
-    _next_permit =
-      _attempt->ledger()->acquire_permit({_deferred->contract(), _next_preparation + 1});
-  return bool(_next_permit);
-}
 void iceberg_gpu_ingestible::stop_preparation() noexcept
 {
-  _next_permit.release();
-  if (_next_registered && _attempt)
-    _attempt->ledger()->retire_unit({_deferred->contract(), _next_preparation + 1});
-  _next_registered = false;
   if (_attempt) _attempt->stop();
 }
 void iceberg_gpu_ingestible::finish_preparation() noexcept
@@ -425,18 +365,10 @@ void iceberg_gpu_ingestible::finish_preparation() noexcept
   stop_preparation();
   if (_attempt) {
     _attempt->finish();
-    // retire_query_work can be called more than once (normal completion followed
-    // by engine destruction, or a cancellation retry). Drop the finished attempt
-    // so its plan release is strictly once and repeated cleanup is idempotent.
     _attempt.reset();
   } else if (_deferred) {
-    // A start/ledger/attempt failure can leave the plan owned by the live
-    // physical operator without ever installing an execution attempt.  The
-    // attempt is normally the object that retires the descriptor arena, but
-    // this path still reaches the barrier-backed final cleanup.
     _deferred->release();
   }
-  _deferred.reset();
 }
 
 void iceberg_gpu_ingestible::build_delete_key_map(
@@ -573,10 +505,7 @@ filtered_table iceberg_gpu_ingestible::materialize_metadata_to_table(
       std::dynamic_pointer_cast<iceberg_delete_set const>(split.dependencies()[i].visibility);
     std::shared_ptr<iceberg_delete_set const> expected;
     if (_deferred) {
-      if (slice.file_index < _deferred->files().size()) {
-        auto const& f = _deferred->files()[slice.file_index];
-        if (f.path == slice.file_path) expected = f.result.lock();
-      }
+      if (_attempt) expected = _attempt->result(slice.file_index, slice.file_path);
     } else {
       auto entry = _delete_sets->find(slice.file_path);
       if (entry != _delete_sets->end()) expected = entry->second;

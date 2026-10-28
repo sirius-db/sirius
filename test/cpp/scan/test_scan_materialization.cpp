@@ -10,6 +10,7 @@
 #include "scan_manager/preparation_test_support.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
+#include "transparent/read_view_registry.hpp"
 #include "transparent/replay_admission.hpp"
 
 #include <cudf/column/column_factories.hpp>
@@ -1192,9 +1193,14 @@ TEST_CASE("Iceberg Puffin wrapper retains failure diagnostics", "[materializatio
   auto envelope = iceberg_dv_preparation::envelope(*discovery, paths);
   REQUIRE(ledger->admit(std::array{envelope}, memory_space_id(cucascade::memory::Tier::HOST, 0))
             .deferred);
-  auto plan = std::make_shared<iceberg_dv_preparation>(93, "table", paths, discovery, *ledger);
-  auto info = std::make_unique<iceberg_ingestible_table_info>();
-  info->contract_id            = 93;
+  auto views    = std::make_shared<sirius::transparent::read_view_registry>();
+  auto contract = allocate_scan_contract(
+    *views, {}, 0, 1, nullptr, {}, {}, {materializer_kind::iceberg, "iceberg.v1"});
+  auto plan =
+    std::make_shared<iceberg_dv_preparation>(contract, "table", paths, discovery, *ledger);
+  auto info                    = std::make_unique<iceberg_ingestible_table_info>();
+  info->contract_id            = contract;
+  info->read_views             = views;
   info->table_path             = "table";
   info->resolved_file_paths    = paths;
   info->names                  = {"n_nationkey", "n_name", "n_regionkey", "n_comment"};
@@ -1209,17 +1215,18 @@ TEST_CASE("Iceberg Puffin wrapper retains failure diagnostics", "[materializatio
   auto counters                = std::make_shared<physical_check_counters>();
   info->profiles->counters     = counters;
   auto ingestible              = make_ingestible(std::move(info));
-  ingestible->begin_preparation(std::make_shared<iceberg_dv_attempt>(plan, ledger));
-  REQUIRE(ingestible->can_claim_preparation());
+  ingestible->attach_preparation_ledger(ledger);
   auto dataio = std::make_shared<sirius::io::kvikio_context>();
   auto dvio   = std::make_shared<failing_dv_context>(mode);
-  auto work   = ingestible->next_split_provider(
-    [&](std::string_view name) -> std::shared_ptr<sirius::io::ioctx> {
+  auto claimed =
+    ingestible->try_claim_split([&](std::string_view name) -> std::shared_ptr<sirius::io::ioctx> {
       return name == dvpath ? std::static_pointer_cast<sirius::io::ioctx>(dvio) : dataio;
     });
-  REQUIRE(work);
+  REQUIRE(std::holds_alternative<preparation_job>(claimed));
+  auto work = std::move(std::get<preparation_job>(claimed));
+  work.unit = std::make_shared<preparation_unit>(work.requirement->key, work.requirement->required);
   try {
-    (void)work({});
+    (void)work.run({});
     FAIL("DV failure was not reported");
   } catch (unsupported_physical_input const& error) {
     REQUIRE(mode == failure::corrupt);

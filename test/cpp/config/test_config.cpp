@@ -64,7 +64,8 @@ TEST_CASE("operator parameters start with hardware-independent defaults", "[conf
   CHECK(params.hash_partition_bytes == config::DEFAULT_BATCH_SIZE);
   CHECK(params.concat_batch_bytes == config::DEFAULT_BATCH_SIZE);
   CHECK(params.sort_sample_bytes == config::DEFAULT_BATCH_SIZE);
-  CHECK(params.max_build_hash_table_bytes == 2 * config::DEFAULT_BATCH_SIZE);
+  CHECK(params.max_build_hash_table_bytes == 8 * config::DEFAULT_BATCH_SIZE);
+  CHECK(params.max_build_probe_resident_bytes == 8 * config::DEFAULT_BATCH_SIZE);
 }
 
 TEST_CASE("yaml reader basic types", "[config_opt][basic]")

@@ -45,6 +45,7 @@
 #include "helper/numeric_narrowing.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
+#include "memory/size_arithmetic.hpp"
 #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/key_preparation.hpp"
@@ -78,6 +79,27 @@
 
 namespace sirius {
 namespace op {
+
+namespace {
+
+void discard_build_partition(cucascade::shared_data_repository& repository, std::size_t partition)
+{
+  while (auto batch = repository.pop_next_data_batch(partition)) {
+    std::optional<int> device;
+    {
+      auto ro = batch->to_read_only();
+      if (auto const* space = ro.get_memory_space();
+          space != nullptr && space->get_tier() == cucascade::memory::Tier::GPU) {
+        device = space->get_device_id();
+      }
+    }
+    std::optional<rmm::cuda_set_device_raii> device_guard;
+    if (device) { device_guard.emplace(rmm::cuda_device_id{*device}); }
+    batch.reset();
+  }
+}
+
+}  // namespace
 
 static void collect_reference_indices(sirius::ast::node const& expr,
                                       std::unordered_set<std::size_t>& indices)
@@ -637,7 +659,7 @@ build_probe_decision select_build_probe_action(std::vector<build_probe_slot_view
   //      - NOT_BUILT-with-build-but-no-probe (a broadcast orphan) and BUILT-and-drained slots
   //        wait on the probe producer only until probe_finished -- after that they have nothing
   //        left to do, whether or not they have been torn down yet (teardown is a resource-release
-  //        side effect handled by discard_build_only_slots_if_probe_complete / finalize, not a
+  //        side effect handled by reclaim_build_only_slots_if_probe_complete / finalize, not a
   //        precondition for reporting completion here).
   //      - SCHEDULING/SCHEDULED means a task is in flight for that slot; treated as still-active so
   //        completion can never be reported while a task could still be running against it.
@@ -817,16 +839,19 @@ cross_schedule_kind peek_cross_schedule_kind(std::vector<partition_cross_schedul
 }
 
 partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
+                                                        std::optional<uint64_t> total_rows,
                                                         bool is_build_side,
                                                         bool build_foldable,
                                                         std::vector<int> const& active_gpu_ids,
                                                         std::size_t single_partition_rotation,
                                                         uint64_t hash_partition_bytes,
                                                         uint64_t max_build_hash_table_bytes,
+                                                        uint64_t max_build_probe_resident_bytes,
                                                         uint64_t max_broadcast_join_size,
                                                         duckdb::JoinType join_type,
                                                         HASH_JOIN_MODE join_mode,
-                                                        double estimated_probe_to_build_ratio)
+                                                        double estimated_probe_to_build_ratio,
+                                                        std::optional<uint64_t> resident_bytes)
 {
   // Without a GPU list (engine-free tests) plan as a single GPU and leave partitions unpinned.
   int const num_gpus = std::max(1, static_cast<int>(active_gpu_ids.size()));
@@ -860,19 +885,24 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
     total_bytes < small || (total_bytes < max_broadcast_join_size &&
                             estimated_probe_to_build_ratio >= static_cast<double>(num_gpus) * 1.25);
 
-  // BUILD_PROBE eligibility. MARK/SEMI/ANTI are eligible (persistent filtered_join built on the
-  // right, reused across streamed left probe batches); RIGHT_SEMI/RIGHT_ANTI/RIGHT and full OUTER
-  // emit build-side output and stay on the STANDARD path.
-  //
-  // Evaluated at the count BUILD_PROBE would run with — one build table per GPU, capped at
-  // `natural` — not at the natural count: `hash_partition_bytes` targets a streaming batch size
-  // and must not veto `max_build_hash_table_bytes`, which is what sizes the folded hash table.
-  // A broadcast join charges the FULL build to every GPU; a hash-partitioned build charges the
-  // per-GPU average.
+  // Admission sizes one folded build per GPU. Broadcast charges the whole build; otherwise use
+  // rounded-up averages. Hash skew and cuco capacity rounding can exceed these estimates.
   int const build_probe_partitions = std::max(1, std::min(natural, num_gpus));
-  uint64_t const per_gpu_build_bytes =
-    broadcast_candidate ? total_bytes : total_bytes / static_cast<uint64_t>(build_probe_partitions);
-  bool build_probe = per_gpu_build_bytes < max_build_hash_table_bytes && build_foldable &&
+  auto const per_gpu               = [&](uint64_t total) {
+    auto const partitions = static_cast<uint64_t>(build_probe_partitions);
+    return broadcast_candidate ? total : total / partitions + (total % partitions != 0);
+  };
+  uint64_t const per_gpu_build_bytes = per_gpu(resident_bytes.value_or(total_bytes));
+  uint64_t const per_gpu_table_bytes_est =
+    total_rows
+      ? memory::saturating_mul(per_gpu(*total_rows), config::BUILD_PROBE_HASH_TABLE_BYTES_PER_ROW)
+      : std::numeric_limits<uint64_t>::max();
+  // Bounding the full row count prevents an oversized concat even when every key hashes to one
+  // partition. Unknown counts cannot establish either the hash-table estimate or this limit.
+  bool const fold_rows_fit =
+    total_rows && *total_rows <= static_cast<uint64_t>(std::numeric_limits<cudf::size_type>::max());
+  bool build_probe = fold_rows_fit && per_gpu_table_bytes_est < max_build_hash_table_bytes &&
+                     per_gpu_build_bytes < max_build_probe_resident_bytes && build_foldable &&
                      !is_right_family && !is_mixed && !is_full_outer;
 
   bool const broadcast = broadcast_candidate && build_probe;
@@ -929,16 +959,19 @@ partition_strategy sirius_physical_hash_join::get_partition_strategy(
   // Unnumbered operators (unit-test fixtures) have no id to rotate by.
   std::size_t const rotation = operator_id != invalid_operator_id ? operator_id : 0;
   auto const strategy        = compute_hash_join_partition_strategy(in.total_bytes,
+                                                             in.measured_rows,
                                                              in.is_build_side,
                                                              in.build_foldable,
                                                              active_gpu_ids(),
                                                              rotation,
                                                              _hash_partition_bytes,
                                                              _max_build_hash_table_bytes,
+                                                             max_build_probe_resident_bytes,
                                                              _max_broadcast_join_size,
                                                              join_type,
                                                              _join_mode,
-                                                             estimated_probe_to_build_ratio);
+                                                             estimated_probe_to_build_ratio,
+                                                             in.resident_bytes);
 
   // A hash-partitioned MARK build: marks use the join-wide build observation.
   if (join_type == duckdb::JoinType::MARK && in.is_build_side) {
@@ -972,13 +1005,21 @@ partition_strategy sirius_physical_hash_join::get_partition_strategy(
                               : _join_mode == HASH_JOIN_MODE::MIXED_JOIN ? "MIXED_JOIN"
                                                                          : "STANDARD";
 
+  uint64_t const est_table_bytes =
+    in.measured_rows
+      ? memory::saturating_mul(*in.measured_rows, config::BUILD_PROBE_HASH_TABLE_BYTES_PER_ROW)
+      : std::numeric_limits<uint64_t>::max();
   SIRIUS_LOG_DEBUG(
     "sirius_physical_hash_join id {} partition strategy: {} partitions ({} GPUs), build side {} "
-    "bytes. Join Type: {}. Join Mode: {} {}. build_card_est {} probe_card_est {} placement {}",
+    "bytes, {} rows{}, estimated hash table {} bytes. Join Type: {}. Join Mode: {} {}. "
+    "build_card_est {} probe_card_est {} placement {}",
     this->get_operator_id(),
     strategy.num_partitions,
     num_gpus(),
     in.total_bytes,
+    in.measured_rows.value_or(0),
+    (in.measured_rows ? "" : " (rows-unmeasured)"),
+    est_table_bytes,
     duckdb::JoinTypeToString(join_type),
     join_mode_str,
     (strategy.broadcast ? " [broadcast]" : ""),
@@ -1049,54 +1090,31 @@ std::vector<build_probe_slot_view> sirius_physical_hash_join::snapshot_build_pro
   return slots;
 }
 
-std::vector<std::size_t> broadcast_slots_to_discard(std::vector<build_probe_slot_view> const& slots,
-                                                    bool probe_finished)
+std::vector<std::size_t> build_probe_slots_to_reclaim(
+  std::vector<build_probe_slot_view> const& slots, bool probe_finished)
 {
-  std::vector<std::size_t> to_discard;
-  if (!probe_finished) { return to_discard; }
+  std::vector<std::size_t> candidates;
+  if (!probe_finished) { return candidates; }
   for (std::size_t p = 0; p < slots.size(); ++p) {
-    auto const& s = slots[p];
-    // NOT_BUILT means the slot was never scheduled (so its replicated build batch is still in the
-    // repo); no probe batch with the probe side finished means none is coming. A BUILT slot already
-    // consumed its build batch, and a slot with probe data will still be built — leave those.
-    if (s.state == BUILD_HASH_TABLE_STATE::NOT_BUILT && s.has_build_batch && !s.has_probe_batch) {
-      to_discard.push_back(p);
+    auto const& slot = slots[p];
+    if (slot.state == BUILD_HASH_TABLE_STATE::NOT_BUILT && slot.has_build_batch &&
+        !slot.has_probe_batch) {
+      candidates.push_back(p);
     }
   }
-  return to_discard;
+  return candidates;
 }
 
-void sirius_physical_hash_join::discard_build_only_slots_if_probe_complete()
+void sirius_physical_hash_join::reclaim_build_only_slots_if_probe_complete(bool probe_finished)
 {
-  if (!_broadcast) { return; }
+  if (!probe_finished) { return; }
   auto* build_port = get_port("build");
   auto* probe_port = get_port("default");
-  if (!build_port || !probe_port) { return; }
-  // Only once the probe upstream is finished do we know no further probe data can arrive for any
-  // slot. Broadcast replicates the build table to every slot, but the probe side is unpartitioned,
-  // so slots on GPUs that saw no probe rows get build data that will never be probed.
-  bool const probe_finished =
-    probe_port->src_pipeline && probe_port->src_pipeline->is_pipeline_finished();
-
-  for (std::size_t p : broadcast_slots_to_discard(snapshot_build_probe_slots(), probe_finished)) {
-    // Build-only slot with no probe and none coming: drop its replicated build batch(es), freeing
-    // each on the GPU it was folded onto (rmm requires the owning device to be current).
-    while (auto batch = build_port->repo->pop_next_data_batch(p)) {
-      int device_id = -1;
-      {
-        auto ro = batch->to_read_only();
-        if (auto* ms = ro.get_memory_space(); ms != nullptr) { device_id = ms->get_device_id(); }
-      }
-      std::optional<rmm::cuda_set_device_raii> device_guard;
-      if (device_id >= 0) { device_guard.emplace(rmm::cuda_device_id{device_id}); }
-      batch.reset();
-    }
-    _partition_build_states[p].build_state.store(BUILD_HASH_TABLE_STATE::DESTROYED,
-                                                 std::memory_order_release);
-    SIRIUS_LOG_DEBUG(
-      "sirius_physical_hash_join id {}: broadcast discard of build-only slot {} (probe complete)",
-      this->get_operator_id(),
-      p);
+  for (auto const partition :
+       build_probe_slots_to_reclaim(snapshot_build_probe_slots(), probe_finished)) {
+    discard_build_partition(*build_port->repo, partition);
+    _partition_build_states[partition].build_state.store(BUILD_HASH_TABLE_STATE::DESTROYED,
+                                                         std::memory_order_release);
   }
 }
 
@@ -1144,11 +1162,9 @@ std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint(
     // sequences interleave (a built partition probes on its GPU while another still builds on a
     // different GPU). Pick the next action from a per-partition snapshot.
 
-    // Broadcast mode: reclaim slots that will never be probed before deciding the next action, so
-    // the operator can reach completion instead of waiting forever on their absent probe data.
-    discard_build_only_slots_if_probe_complete();
     bool const probe_finished =
       probe_port->src_pipeline && probe_port->src_pipeline->is_pipeline_finished();
+    reclaim_build_only_slots_if_probe_complete(probe_finished);
     auto const decision = select_build_probe_action(snapshot_build_probe_slots(), probe_finished);
     switch (decision.action) {
       case build_probe_action::schedule_build:

@@ -511,7 +511,11 @@ TEST_CASE("direct chunked spill waits before reading string geometry and null ma
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(make_ordering_strings(producer));
   columns.push_back(
-    cudf::make_structs_column(5, std::move(children), 0, rmm::device_buffer{}, producer));
+    cudf::make_structs_column(5,
+                              std::move(children),
+                              0,
+                              cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, producer),
+                              producer));
   cudf::table full{std::move(columns)};
   bool const sliced = GENERATE(false, true);
   // The converter requires zero offsets; exercise the canonicalized sliced scan input too.

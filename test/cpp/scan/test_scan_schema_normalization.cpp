@@ -1254,24 +1254,28 @@ struct resident_parquet_fixture {
                            std::size_t output_arity,
                            bool cached              = true,
                            duckdb::LogicalType type = duckdb::LogicalType::BIGINT,
-                           bool force_counts        = true)
+                           bool force_counts        = true,
+                           bool fused_membership    = true)
     : resident_parquet_fixture(std::move(info),
                                duckdb::vector<duckdb::LogicalType>(output_arity, type),
                                cached,
-                               force_counts)
+                               force_counts,
+                               fused_membership)
   {
   }
 
   resident_parquet_fixture(std::unique_ptr<scan::parquet_ingestible_table_info> info,
                            duckdb::vector<duckdb::LogicalType> const& output_types,
-                           bool cached       = true,
-                           bool force_counts = true)
+                           bool cached           = true,
+                           bool force_counts     = true,
+                           bool fused_membership = true)
     : ingestible(scan::make_ingestible(std::move(info))),
       consumer(std::make_shared<scan::dynamic_filter_consumer>(
         channel,
         scan::consumer_config{.mode = scan::dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY,
                               .force_counts     = force_counts,
                               .cached_placement = cached,
+                              .fused_membership = fused_membership,
                               .stats            = &stats},
         scan::scan_decode_bindings(*ingestible, output_types.size()))),
       op(sirius::from_duckdb_vec(output_types), 0, ingestible, 1, nullptr, nullptr, consumer)
@@ -1306,10 +1310,12 @@ struct resident_parquet_fixture {
 TEST_CASE("resident Parquet filters a shared narrow projection before restoring duplicate outputs",
           "[scan_normalization][cached_scan][cached_projection]")
 {
-  bool cached = true;
+  auto const fused = GENERATE(false, true);
+  bool cached      = true;
   SECTION("cached placement") {}
   SECTION("placement disabled") { cached = false; }
-  resident_parquet_fixture f(resident_parquet_info({1, 0, 1, 2}, 3, 3), 3, cached);
+  resident_parquet_fixture f(
+    resident_parquet_info({1, 0, 1, 2}, 3, 3), 3, cached, duckdb::LogicalType::BIGINT, true, fused);
   f.publish(1, {41, 83, 29, 53});
   REQUIRE(f.ingestible->materialized_column_order() == std::vector<std::size_t>{1, 0, 2});
   std::vector<std::unique_ptr<cudf::column>> columns;
@@ -1572,7 +1578,10 @@ TEST_CASE("resident Parquet accepts proven dropped filter columns and rejects mi
 TEST_CASE("resident Parquet uses a BOOL8 pure-filter answer only as a residual",
           "[scan_normalization][cached_scan][cached_layout]")
 {
-  resident_parquet_fixture f(resident_parquet_info({0, 1}, 1, 1), 1);
+  // The residual is nullable, which the ordinary fold and the fused rounds resolve separately.
+  auto const fused = GENERATE(false, true);
+  resident_parquet_fixture f(
+    resident_parquet_info({0, 1}, 1, 1), 1, true, duckdb::LogicalType::BIGINT, true, fused);
   f.publish(0, {41, 29, 53});
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(resident_column<std::int32_t>({41, 29, 53, 17}, cudf::type_id::INT32));
@@ -1790,7 +1799,10 @@ TEST_CASE("owned Parquet transfers bypass cached placement and remain filterable
 TEST_CASE("cached Parquet deferral validates original rows and restores source-relative survivors",
           "[scan_normalization][cached_scan][cached_late_mat][assembly_fault][late_mat]")
 {
-  resident_parquet_fixture f(resident_parquet_info({0, 1, 2}, 2, 2), 2);
+  // Positions and retained assembly owners must not depend on how the membership mask was formed.
+  auto const fused = GENERATE(false, true);
+  resident_parquet_fixture f(
+    resident_parquet_info({0, 1, 2}, 2, 2), 2, true, duckdb::LogicalType::BIGINT, true, fused);
   auto filter             = f.publish(0, {41, 83, 29, 53});
   auto handle             = std::make_shared<sirius::late_mat::pin_entry_handle>("resident", 1);
   auto entry              = std::make_shared<sirius::scan_manager::pinned_entry>();

@@ -527,8 +527,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       (!needs_early_publication ||
        (early_publication && op_params.max_dynamic_filter_bloom_bytes_per_gpu > 0));
     if (discovery_runs) {
-      bool const scan_bind_armed = scan_route_join_type_admissible(op.join_type);
-      descent_policy const policy{.descend_build_blocks = true};
+      bool const scan_bind_armed = probe_filter_join_type_admissible(op.join_type);
       std::unordered_map<sirius::op::sirius_physical_operator const*, std::size_t> target_by_scan;
       for (std::size_t key_index = 0; key_index < admitted_keys.size(); ++key_index) {
         auto const& key       = admitted_keys[key_index];
@@ -539,6 +538,8 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
             !sirius::op::detail::accumulated_bloom_builder::supports(key.storage_type)) {
           continue;
         }
+        descent_policy const policy{.descend_build_blocks = true,
+                                    .preserve_nulls       = key.preserve_nulls};
         // Terminal ordinals are local to each terminal, not the probe entry schema.
         auto const terminals =
           trace_probe_key(*left, static_cast<std::size_t>(key.probe_key_ordinal), policy);
@@ -704,9 +705,10 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       op_params.hash_partition_bytes,
       op_params.max_broadcast_join_size,
       stats);
-    auto& hj                        = join->Cast<sirius::op::sirius_physical_hash_join>();
-    hj.mark_join_build_switch_ratio = op_params.mark_join_build_switch_ratio;
-    hj.runtime_distinct_build_probe = op_params.enable_runtime_distinct_build_probe;
+    auto& hj                          = join->Cast<sirius::op::sirius_physical_hash_join>();
+    hj.mark_join_build_switch_ratio   = op_params.mark_join_build_switch_ratio;
+    hj.runtime_distinct_build_probe   = op_params.enable_runtime_distinct_build_probe;
+    hj.max_build_probe_resident_bytes = op_params.max_build_probe_resident_bytes;
     hj.set_single_join_error_on_multiple_rows(
       duckdb::Settings::Get<duckdb::ScalarSubqueryErrorOnMultipleRowsSetting>(context));
 

@@ -21,6 +21,7 @@
 #include "operator/operator_test_utils.hpp"
 
 #include <cudf/column/column_factories.hpp>
+#include <cudf/copying.hpp>
 #include <cudf/hashing.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/table/table.hpp>
@@ -172,9 +173,10 @@ std::shared_ptr<cucascade::data_batch> gpu_batch(std::unique_ptr<cudf::table> ta
   return batch;
 }
 
-/// One million rows: a run of INT64s, nullable small INT32s, DECIMAL(38,2) values, a
-/// low-cardinality string column (dictionary) and a nullable high-cardinality string column
-/// with empty values (str_split) -- one column per default plan.
+/// One million rows, one column per default plan: a run of INT64s (delta -> rle), sorted
+/// INT64 keys (delta -> bitpack), nullable small INT32s, DECIMAL(38,2) values (bitpack), a
+/// low-cardinality string column (dictionary) and a nullable high-cardinality string
+/// column with empty values (str_split).
 std::unique_ptr<cudf::table> compressible_table()
 {
   constexpr std::size_t rows = 1'000'000;
@@ -184,9 +186,11 @@ std::unique_ptr<cudf::table> compressible_table()
   std::iota(keys.begin(), keys.end(), std::int64_t{1'000'000});
   std::vector<std::int32_t> small(rows);
   std::vector<__int128> amounts(rows);
+  std::vector<std::int64_t> sorted(rows);
   std::vector<std::string> flags(rows);
   std::vector<std::string> names(rows);
   for (std::size_t i = 0; i < rows; ++i) {
+    sorted[i]  = static_cast<std::int64_t>(i * 100 + i % 7);
     small[i]   = static_cast<std::int32_t>(i % 1000);
     amounts[i] = static_cast<__int128>(i % 50'000) * 100 + 25;
     flags[i]   = (i % 3 == 0) ? "RETURNED" : (i % 3 == 1 ? "NONE" : "DELIVER IN PERSON");
@@ -195,6 +199,7 @@ std::unique_ptr<cudf::table> compressible_table()
 
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(numeric_column(cudf::data_type{cudf::type_id::INT64}, keys, stream));
+  columns.push_back(numeric_column(cudf::data_type{cudf::type_id::INT64}, sorted, stream));
   columns.push_back(numeric_column(cudf::data_type{cudf::type_id::INT32}, small, stream));
   null_every_seventh(*columns.back(), stream);
   columns.push_back(
@@ -246,7 +251,8 @@ bool holds(cucascade::data_batch& batch)
 
 }  // namespace
 
-TEST_CASE("spill compression: default plans follow the column type", "[compression][spill]")
+TEST_CASE("spill compression: default plans follow the column type and a sample",
+          "[compression][spill]")
 {
   if (!has_gpu()) { return; }
   auto stream = utils::default_stream();
@@ -255,15 +261,47 @@ TEST_CASE("spill compression: default plans follow the column type", "[compressi
     return sirius::compression::default_spill_plan(c, stream);
   };
 
-  auto const ints = numeric_column(
-    cudf::data_type{cudf::type_id::INT32}, std::vector<std::int32_t>(10'000, 7), stream);
+  auto const contains = [](std::string const& plan, char const* op) {
+    return plan.find(op) != std::string::npos;
+  };
+
+  // Integer-valued columns: the sample decides between bitpack and the delta plans.
+  std::mt19937_64 rng{7};
+  std::vector<std::int64_t> random(100'000), sorted(100'000), repeated_keys(100'000);
+  for (std::size_t i = 0; i < random.size(); ++i) {
+    random[i]        = static_cast<std::int64_t>(rng() % 1'000'000'000);
+    sorted[i]        = static_cast<std::int64_t>(i * 1000 + rng() % 7);
+    repeated_keys[i] = static_cast<std::int64_t>(i / 4 * 1000);
+  }
+  auto const int64       = cudf::data_type{cudf::type_id::INT64};
+  auto const random_plan = plan(numeric_column(int64, random, stream)->view());
+  CHECK(contains(random_plan, "bitpack"));
+  CHECK_FALSE(contains(random_plan, "delta"));
+  auto const sorted_plan = plan(numeric_column(int64, sorted, stream)->view());
+  CHECK(contains(sorted_plan, "delta"));
+  CHECK_FALSE(contains(sorted_plan, "rle"));
+  auto const repeated_column = numeric_column(int64, repeated_keys, stream);
+  CHECK(contains(plan(repeated_column->view()), "rle"));
+  // The sample starts at the column's offset, not at its buffer.
+  std::vector<std::int64_t> random_then_repeated(random);
+  random_then_repeated.insert(
+    random_then_repeated.end(), repeated_keys.begin(), repeated_keys.end());
+  auto const spliced = numeric_column(int64, random_then_repeated, stream);
+  auto const tail    = cudf::slice(spliced->view(),
+                                   {static_cast<cudf::size_type>(random.size()),
+                                    static_cast<cudf::size_type>(random_then_repeated.size())},
+                                stream)
+                      .front();
+  CHECK(contains(plan(tail), "rle"));
+
+  // Other fixed-width types are bitpacked as they are.
   auto const doubles = numeric_column(
     cudf::data_type{cudf::type_id::FLOAT64}, std::vector<double>(10'000, 1.5), stream);
   auto const decimals = numeric_column(
     cudf::data_type{cudf::type_id::DECIMAL128, -2}, std::vector<__int128>(10'000, 42), stream);
-  CHECK(plan(ints->view()).find("bitpack") != std::string::npos);
-  CHECK(plan(doubles->view()).find("bitpack") != std::string::npos);
-  CHECK(plan(decimals->view()).find("bitpack") != std::string::npos);
+  CHECK(plan(doubles->view()) == plan(decimals->view()));
+  CHECK(contains(plan(doubles->view()), "bitpack"));
+  CHECK_FALSE(contains(plan(doubles->view()), "delta"));
 
   std::vector<std::string> repeated(10'000), unique(10'000);
   for (std::size_t i = 0; i < repeated.size(); ++i) {

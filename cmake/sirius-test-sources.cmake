@@ -6,6 +6,9 @@ set(TEST_SOURCES
     test/cpp/io/cache/test_metadata_store.cpp
     test/cpp/io/test_object_identity.cpp
     test/cpp/scan_manager/test_preparation_readiness.cpp
+    test/cpp/scan_manager/test_coordinator_pool.cpp
+    test/cpp/scan_manager/test_preparation_output_lifetime.cpp
+    test/cpp/scan_manager/test_native_reader_executor.cpp
     test/cpp/scan_manager/test_preparation.cpp
     test/cpp/scan_manager/test_preparation_unit.cpp
     test/cpp/scan_manager/test_preparation_ledger.cpp
@@ -124,7 +127,9 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_regexp_replace.cpp
     test/cpp/integration/test_gpu_execution_size_estimation.cpp
     test/cpp/integration/test_gpu_execution_parquet_nulls.cpp
+    test/cpp/integration/test_gpu_execution_parquet_nan.cpp
     test/cpp/integration/test_gpu_execution_semantic_cast_fallback.cpp
+    test/cpp/integration/test_gpu_execution_integer_varchar_cast.cpp
     test/cpp/integration/test_gpu_execution_setting_scope.cpp
     test/cpp/integration/test_gpu_execution_abs.cpp
     test/cpp/integration/test_gpu_execution_negate.cpp
@@ -217,6 +222,9 @@ set(TEST_SOURCES
     test/cpp/memory/test_topology_index.cpp
     test/cpp/operator/test_build_probe_chunked.cpp
     test/cpp/operator/test_build_probe_scheduling.cpp
+    test/cpp/operator/test_build_probe_reclaim.cpp
+    test/cpp/operator/test_ungrouped_aggregate_empty_input.cpp
+    test/cpp/integration/test_gpu_execution_join_empty_sides.cpp
     test/cpp/operator/test_partition_placement.cpp
     test/cpp/operator/test_partition_exchange.cpp
     test/cpp/operator/test_cross_schedule.cpp

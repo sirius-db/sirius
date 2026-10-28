@@ -1077,20 +1077,6 @@ bool parquet_scan_core::has_processed_all_metadata() const
 parquet_scan_core::metadata_scan_task_t parquet_scan_core::next_split_provider(
   io::ioctx_resolver resolve)
 {
-  return next_split_provider_with_stop(std::move(resolve));
-}
-
-parquet_scan_core::metadata_scan_task_t parquet_scan_core::next_split_provider(
-  io::ioctx_resolver resolve, std::stop_token stop)
-{
-  auto task = next_split_provider_with_stop(std::move(resolve));
-  if (!task) return {};
-  return [task = std::move(task), stop](std::stop_token) mutable { return task(stop); };
-}
-
-parquet_scan_core::stoppable_metadata_scan_task_t parquet_scan_core::next_split_provider_with_stop(
-  io::ioctx_resolver resolve)
-{
   if (!resolve) { throw std::runtime_error("parquet_scan_core: no scan_manager is wired."); }
   auto const position = _next_file_idx.fetch_add(1, std::memory_order_relaxed);
   if (position >= _selected_file_indices.size()) { return nullptr; }
@@ -1103,12 +1089,12 @@ parquet_scan_core::stoppable_metadata_scan_task_t parquet_scan_core::next_split_
   auto const& file_path = _file_paths[idx];
   // The resolver returns a valid ioctx or throws if no backend supports the path.
   return [this, file_path, idx, resolve = std::move(resolve)](
-           std::stop_token stop) -> std::unique_ptr<scan_info> {
+           scan_manager::preparation_stop_token stop) -> std::unique_ptr<scan_info> {
     if (stop.stop_requested())
       throw std::system_error(std::make_error_code(std::errc::operation_canceled));
     auto io_ctx = resolve(file_path);
     try {
-      return build_file_scan_info(file_path, idx, io_ctx, stop);
+      return build_file_scan_info(file_path, idx, io_ctx, stop.token());
     } catch (unsupported_physical_input const&) {
       throw;
     } catch (transparent::classified_execution_error const&) {
@@ -2568,6 +2554,11 @@ filtered_table parquet_scan_core::materialize_metadata_to_table(
     if (!all_slices_pruned && _info->profiles->counters)
       for (auto const& slice : split.rg_slices)
         _info->profiles->counters->parquet_phase(slice.file_path, false);
+  }
+
+  if (auto const& counters = _info->profiles->counters;
+      counters && counters->track_units && counters->parquet_filter_for_testing) {
+    counters->parquet_filter_for_testing(opts.get_filter().has_value(), table->num_rows());
   }
 
   // Hive-partition scans assemble inline here: partition_values are per-split

@@ -162,6 +162,11 @@ fanout_counts fan_out(dynamic_filter_publish_plan const& plan,
                       OnFirstPush&& on_first_push) noexcept
 {
   fanout_counts counts;
+  for (std::size_t i = 0; i < filters.size(); ++i) {
+    if (filters[i].membership) {
+      filters[i].membership->set_preserve_nulls(plan.admitted_keys()[i].preserve_nulls);
+    }
+  }
   auto const push = [&](sirius_dynamic_filter_set::producer const& producer,
                         std::size_t ordinal,
                         std::shared_ptr<sirius_dynamic_filter> const& filter) noexcept {
@@ -176,8 +181,8 @@ fanout_counts fan_out(dynamic_filter_publish_plan const& plan,
     auto const& producer = producers[target_index];
     for (auto const& binding : target.key_bindings) {
       auto const& key = filters[binding.admitted_key_index];
-      if (key.zone_map && target.accepts_zone_map_filters &&
-          binding.probe_storage_type == key.zone_map_type) {
+      if (key.zone_map && !plan.admitted_keys()[binding.admitted_key_index].preserve_nulls &&
+          target.accepts_zone_map_filters && binding.probe_storage_type == key.zone_map_type) {
         push(producer, binding.channel_push_ordinal, key.zone_map);
       }
       if (!key.membership) { continue; }
