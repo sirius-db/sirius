@@ -69,7 +69,13 @@ system memory exhaustion.
 
 `validate.py` verifies exact event structure, operation/publication association,
 selection gates and counters, wire legs, classifier, invalidation, final result
-and completion; then compares the two valid engines' per-op receipts exactly.
+and completion. Before grouping by operation, it tracks the live publication and
+all published snapshot identities in original observer order. Only a successful
+seed may publish a new identity, and invalidation clears only the selected
+current identity. Seed, hit and refresh counters must increase at their exact
+observed boundaries, including the immediate refresh continuation in this
+single-worker fixture; unchanged and failed transitions must not increment. It
+then compares the two valid engines' per-op receipts exactly.
 It is a finite fixture oracle, not a general concurrent trace comparator.
 Historical S2 owner-lifetime/allocation/AC9 evidence remains separate.
 
@@ -81,6 +87,10 @@ python3 test_validate.py /run/reference
 
 The single-receipt command returns nonzero for observer failures, wrong
 associations, missing events or other invalid evidence. Negative tests cover
-29 mutated receipts and five CLI failures per engine. Generated sources and
-raw failed attempts should be preserved alongside successful runs. An
-implementation self-check does not close D1 without independent review.
+29 original mutated receipts and five original CLI failures per engine, plus
+eight causal mutations (unpublished identity, missing seed/refresh increments,
+early/late increments and an increment on a failed seed). Each new mutation
+must fail as a single receipt, a one-sided pair and a common-error pair, for 24
+additional nonzero CLI checks per engine. Normal receipts and a normal pair
+remain positive controls. Generated sources and raw failed attempts should be
+preserved alongside successful runs. An implementation self-check does not close D1 without independent review.
