@@ -13,6 +13,8 @@ advance together.
 | --- | --- | --- |
 | Request identity | `simpatico-request-v2` | `request_identity()` |
 | Environment identity | `simpatico-environment-v2` | `environment_identity()` |
+| Meld request identity | `simpatico-meld-request-v2` | `describe()` in [meld_backend.cpp](src/bridge/meld_backend.cpp) |
+| Meld environment identity | `simpatico-meld-environment-v2` | `meld_environment()` in [meld_backend.cpp](src/bridge/meld_backend.cpp) |
 | Disk path layout | `v2/` | `CompilationIdentity::relative_path()` |
 | Disk record marker | `SIMPJIT2` | `disk_cache.cpp` (compile-time version check) |
 
@@ -50,6 +52,11 @@ those bytes, with no terminator. Remaining fields, in order:
   Target SM is included through `-arch=sm_...`.
 - **Environment:** project-header digest string, CCCL-header digest string;
   NVRTC major, then minor, each encoded as a number.
+
+Meld's identities are encoded by `framed_identity()`: a field count, then each field.
+
+- **Meld request:** the scheme's text, the entry symbol, `sm_<arch>`.
+- **Meld environment:** `meld::codec::compilerIdentity()` and the CUDA driver version.
 
 Records are streamed into XXH3-128 without concatenating the source. Runtime
 hashing is header-only, with no shared-library dependency or CLI invocation.

@@ -137,6 +137,13 @@ libcuvs = "==26.10.00"
 CUDAARCHS = "75-real;80-real;86-real;89-real;90a-real;100f-real;120f-real"
 VCPKG_CUDA_VERSION = "13"
 
+[feature.meld]
+platforms = ["linux-64-cuda13", "linux-aarch64-cuda13"]
+
+[feature.meld.dependencies]
+# In lockstep with `clang` above.
+mlir = "22.*"
+
 [feature.cuda12]
 platforms = ["linux-64-cuda12", "linux-aarch64-cuda12"]
 
@@ -179,6 +186,7 @@ nightly-run = "scripts/generate_nightly_env.sh && env -u PIXI_ENVIRONMENT_NAME p
 
 [environments]
 default = ["dev-libs", "cuda13"]
+meld = ["dev-libs", "cuda13", "meld"]
 cuda12 = ["dev-libs", "cuda12"]
 vcpkg = ["vcpkg", "cuda13"]
 vcpkg-cuda12 = ["vcpkg", "cuda12"]

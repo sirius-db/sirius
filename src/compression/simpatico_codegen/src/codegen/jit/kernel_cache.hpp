@@ -6,6 +6,7 @@
 #include "nvrtc_compiler.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -39,6 +40,17 @@ class KernelCache {
   std::shared_ptr<const CompiledKernel> get_or_compile_plain(const std::string& source,
                                                              const std::string& entry_symbol,
                                                              const CompileOptions& opts = {});
+
+  /**
+   * @brief get_or_compile_plain for another compiler, whose `request` and `environment` digests
+   * are framed under a domain of its own. `environment` is called only on a disk lookup.
+   */
+  std::shared_ptr<const CompiledKernel> get_or_build(
+    const detail::Digest& request,
+    const std::function<detail::Digest()>& environment,
+    const std::string& entry_symbol,
+    const std::string& source,
+    const std::function<CompiledKernel()>& build);
 
   std::size_t size() const;
   void clear();
