@@ -89,6 +89,7 @@ enum class TaskCreationHint { WAITING_FOR_INPUT_DATA, READY };
     case ::cucascade::memory::Tier::GPU: return "GPU";
     case ::cucascade::memory::Tier::HOST: return "HOST";
     case ::cucascade::memory::Tier::DISK: return "DISK";
+    case ::cucascade::memory::Tier::REMOTE: return "REMOTE";
     default: return "UNKNOWN";
   }
 }

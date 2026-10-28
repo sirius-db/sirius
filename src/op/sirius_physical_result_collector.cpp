@@ -196,7 +196,8 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
       data          = result_ro_opt->get_data();
 
     } else if (data->get_current_tier() != cucascade::memory::Tier::HOST) {
-      // Data must be in HOST tier (i.e., cannot currently reside in DISK tier)
+      // Collection holds a processing lock: storage tiers (DISK/REMOTE) must
+      // already have been materialized by the pipeline before reaching this sink.
       throw invalid_input_exception(
         "[GPUPhysicalMaterializedCollector] Expected host_data_representation in HOST tier");
     }

@@ -57,6 +57,7 @@
 #include <cuda_runtime_api.h>
 
 #include <cucascade/cudf/host_data_representation.hpp>
+#include <cucascade/cudf/remote_io_context.hpp>
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
@@ -84,12 +85,14 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <utility>
 #include <variant>
+#include <vector>
 
 namespace duckdb {
 
@@ -228,13 +231,9 @@ SiriusContext::~SiriusContext() noexcept
 {
   // terminate() may throw during database teardown; a noexcept destructor must contain it.
   if (!is_initialized_) {
-    // A context that threw during initialize() may have installed the cuDF
-    // pinned resource before failing; restore it before the slab allocator
-    // members unwind so cuDF is not left with a dangling reference. No-op when
-    // nothing was installed, and the in-initialize() rollback already covers
-    // the common path -- this is the backstop for any other drop-while-
-    // uninitialized route.
-    restore_cudf_pinned_memory_resource();
+    // Backstop for partial startup: shutdown() alone does not release a memory
+    // space's I/O context. Explicitly release owners before their member teardown.
+    rollback_initialization();
     event_publisher_->stop();
     return;
   }
@@ -928,23 +927,112 @@ void SiriusContext::restore_cudf_pinned_memory_resource() noexcept
   prev_pinned_mr_.reset();
 }
 
+void SiriusContext::drain_remote_removals_for_shutdown() noexcept
+{
+  if (!memory_manager_) { return; }
+  auto const spaces  = memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::REMOTE);
+  auto const timeout = config_.get_remote_spill_config().shutdown_removal_timeout_ms;
+  cucascade::remote_removal_drain_result result{};
+  try {
+    std::vector<std::shared_ptr<cucascade::io::ioctx>> contexts;
+    contexts.reserve(spaces.size());
+    // All attached REMOTE contexts are currently created by Sirius in initialize().
+    // If external contexts are supported later, track and filter Sirius-owned contexts here.
+    for (auto const* space : spaces) {
+      if (auto context = space->get_io_context()) { contexts.push_back(std::move(context)); }
+    }
+    if (contexts.empty()) { return; }
+    // Repositories and workers are gone: nothing can submit further removals on these contexts.
+    result = cucascade::drain_remote_object_removals(contexts, std::chrono::milliseconds{timeout});
+  } catch (...) {
+    // Allocation failure must not skip cancellation during noexcept rollback. Drain one
+    // context at a time without allocating, cancelling immediately rather than waiting again.
+    for (auto const* space : spaces) {
+      if (auto context = space->get_io_context()) {
+        auto const cancelled = cucascade::drain_remote_object_removals(
+          std::span<std::shared_ptr<cucascade::io::ioctx> const>{&context, 1},
+          std::chrono::milliseconds{0});
+        result.abandoned += cancelled.abandoned;
+        result.timed_out = result.timed_out || cancelled.timed_out;
+      }
+    }
+  }
+  if (result.timed_out) {
+    sirius::log::log_noexcept([&] {
+      SIRIUS_LOG_WARN(
+        "SiriusContext: abandoned {} pending REMOTE object removal(s) after {} ms; "
+        "objects are left to the bucket lifecycle rule",
+        result.abandoned,
+        timeout);
+    });
+  }
+}
+
+void SiriusContext::rollback_initialization() noexcept
+{
+  // Startup has not published this context or accepted queries. Stop any workers
+  // already started, then destroy borrowers before the memory manager they use.
+  auto attempt = [](auto&& cleanup) noexcept {
+    try {
+      cleanup();
+    } catch (...) {
+      sirius::log::log_noexcept(
+        [] { SIRIUS_LOG_ERROR("SiriusContext: partial initialization cleanup failed"); });
+    }
+  };
+  attempt([&] {
+    if (query_event_publisher_) query_event_publisher_->stop();
+  });
+  attempt([&] {
+    if (task_scheduler_) task_scheduler_->stop();
+  });
+  attempt([&] {
+    if (scan_manager_) scan_manager_->stop();
+  });
+  attempt([&] {
+    if (task_creator_) task_creator_->stop_thread_pool();
+  });
+  for (auto& executor : downgrade_executors_) {
+    attempt([&] { executor->stop(); });
+  }
+  task_creator_.reset();
+  downgrade_executors_.clear();
+  scan_manager_.reset();
+  task_scheduler_.reset();
+  telemetry_context_.reset();
+  query_event_publisher_.reset();
+  cuvs_index_cache_.reset();
+  attempt([&] { data_repository_registry_.clear(); });
+  attempt([&] { query_lifecycle_.clear(); });
+  drain_remote_removals_for_shutdown();
+  restore_cudf_pinned_memory_resource();
+  small_pinned_allocator_view_.reset();
+  small_pinned_allocator_.reset();
+  if (memory_manager_) {
+    attempt([&] { memory_manager_->shutdown(); });
+    // Unlike shutdown(), destruction releases spaces and their private REST
+    // reactors/staging immediately, even when the failed context remains alive.
+    memory_manager_.reset();
+  }
+  topology_index_.reset();
+  hw_decompression_env_guard_.reset();
+}
+
 void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
 {
   if (is_initialized_) { throw std::runtime_error("Sirius context is already initialized."); }
 
-  // A throw anywhere after the cuDF pinned resource is installed (and before
-  // is_initialized_ is set) must restore cuDF's global pinned resource before
-  // small_pinned_allocator_(_view_) unwind, or cuDF is left holding a dangling
-  // reference to freed slab storage. Idempotent + guarded, so arming it here
-  // (before the install) is safe; dismissed once initialization commits.
-  struct pinned_rollback_guard {
+  // Every non-committed path releases partial-startup resources, not just the
+  // cuDF pinned-resource override: REMOTE reactors start before later steps that
+  // can throw. The destructor repeats this idempotent cleanup as a backstop.
+  struct initialization_rollback_guard {
     SiriusContext* self;
     bool dismissed = false;
-    ~pinned_rollback_guard()
+    ~initialization_rollback_guard()
     {
-      if (!dismissed) { self->restore_cudf_pinned_memory_resource(); }
+      if (!dismissed) { self->rollback_initialization(); }
     }
-  } pinned_rollback{this};
+  } initialization_rollback{this};
 
   auto quent_context = sirius::telemetry::make_quent_context(config.get_telemetry_config());
   cucascade::memory::topology_discovery discovery;
@@ -955,7 +1043,11 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
   if (discovery.get_topology().num_gpus == 0) {
     throw std::runtime_error("SiriusContext::initialize: no GPUs discovered");
   }
-  config_ = config.resolve(discovery.get_topology());
+  // Preserve credentials installed through get_config().set_object_store_config()
+  // before initialize(); parsing/resolution never obtains secrets from YAML.
+  auto object_store_config = config_.get_scan_manager_config().object_store;
+  config_                  = config.resolve(discovery.get_topology());
+  config_.set_object_store_config(std::move(object_store_config));
   // The spill converters run on downgrade threads with no client context, so they
   // read process-wide settings rather than this configuration.
   sirius::compression::apply_spill_compression_config(config_.get_compression_config());
@@ -986,6 +1078,55 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
 
   memory_manager_ = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
     config_.get_memory_space_configs());
+
+  // Remote spill is wired once at initialization. CREATE SECRET installed later
+  // only affects scans; lazy credential attach/refresh is intentionally deferred.
+  for (auto const* remote_space :
+       memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::REMOTE)) {
+    if (remote_space->get_io_context()) { continue; }
+    auto object_store  = config_.get_scan_manager_config().object_store;
+    auto const& remote = config_.get_remote_spill_config();
+    auto env_value     = [](char const* name) -> std::string {
+      auto const* value = std::getenv(name);
+      return value ? value : "";
+    };
+    // Never combine one half of programmatic credentials with a different AWS
+    // identity. A complete environment pair is used only when neither key is set.
+    if (object_store.access_key.empty() && object_store.secret_key.empty()) {
+      object_store.access_key    = env_value("AWS_ACCESS_KEY_ID");
+      object_store.secret_key    = env_value("AWS_SECRET_ACCESS_KEY");
+      object_store.session_token = env_value("AWS_SESSION_TOKEN");
+    }
+    if (!remote.endpoint.empty()) { object_store.endpoint = remote.endpoint; }
+    if (!remote.region.empty()) { object_store.region = remote.region; }
+    if (remote.signing_mode) { object_store.s3_signing_mode = *remote.signing_mode; }
+    if (object_store.region.empty()) { object_store.region = env_value("AWS_REGION"); }
+    if (object_store.region.empty()) { object_store.region = env_value("AWS_DEFAULT_REGION"); }
+    if (object_store.region.empty()) { object_store.region = "us-east-1"; }
+    if (object_store.endpoint.empty()) {
+      object_store.endpoint = "https://s3." + object_store.region + ".amazonaws.com";
+    }
+    if (object_store.access_key.empty() || object_store.secret_key.empty()) {
+      SIRIUS_LOG_WARN(
+        "SiriusContext: remote spill disabled for REMOTE space {}: missing "
+        "credentials; supply object_store_config before initialization or "
+        "AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY",
+        remote_space->get_device_id());
+      continue;
+    }
+    cucascade::remote_io_context_options options;
+    options.object_store              = std::move(object_store);
+    options.rest                      = config_.get_scan_manager_config().rest;
+    options.n_reactors                = remote.n_reactors;
+    options.staging_bytes_per_reactor = remote.staging_bytes;
+    auto* mutable_space = memory_manager_->get_memory_space(cucascade::memory::Tier::REMOTE,
+                                                            remote_space->get_device_id());
+    mutable_space->set_io_context(cucascade::make_remote_io_context(options));
+  }
+
+  if (initialization_hook_for_testing) {
+    initialization_hook_for_testing("remote_contexts_attached", *memory_manager_);
+  }
 
   // Session cache for pinned GPU-resident cuVS ANN indexes. Takes the memory
   // manager so an index build can reserve its GPU footprint through Sirius.
@@ -1187,8 +1328,11 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
   scan_manager_->start();
   task_scheduler_->start();
 
-  is_initialized_           = true;
-  pinned_rollback.dismissed = true;
+  if (initialization_hook_for_testing) {
+    initialization_hook_for_testing("workers_started", *memory_manager_);
+  }
+  is_initialized_                   = true;
+  initialization_rollback.dismissed = true;
 }
 
 void SiriusContext::terminate()
@@ -1247,6 +1391,12 @@ void SiriusContext::terminate()
   // downgrade executors (the only other holders of a manager reference) were stopped above, so
   // no borrower can outlive this.
   data_repository_registry_.clear();
+
+  // The removal queue holds a reference to each REMOTE context until its deletions settle.
+  // Wait for at most shutdown_removal_timeout_ms, then cancel what is left by shutting
+  // those contexts down. The spaces' own references are released by memory_manager_.reset()
+  // below, still before CUDA teardown.
+  drain_remote_removals_for_shutdown();
 
   // Restore the previous cuDF pinned memory resource and threshold before destroying the
   // slab allocator — cuDF holds a non-owning reference and would dangle after reset().

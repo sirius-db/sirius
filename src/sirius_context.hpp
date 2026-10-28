@@ -475,6 +475,11 @@ class SiriusContext : public ClientContextState {
   /// \brief Initialize the Sirius context with the given configuration.
   void initialize(const sirius::parsed_sirius_config& config);
 
+  /// Set before initialize(); invoked after remote attachment and after workers start.
+  /// Tests may throw here to exercise rollback of partially initialized resources.
+  std::function<void(std::string_view, const sirius::memory::sirius_memory_reservation_manager&)>
+    initialization_hook_for_testing;
+
   /**
    * @brief Suppress QueryBegin/QueryEnd side-effects for internal DuckDB connections.
    *
@@ -876,6 +881,9 @@ class SiriusContext : public ClientContextState {
 
  private:
   void throw_if_not_initialized() const;
+  /// Stop partial-startup borrowers and release their resources, including REMOTE contexts.
+  void rollback_initialization() noexcept;
+  void drain_remote_removals_for_shutdown() noexcept;
   void rebind_fs_cache_on_host_executors();
   /// Acquire the slot. Errors on same-thread reacquire — a nested acquire on
   /// one thread would otherwise be a silent permanent wait. After acquiring

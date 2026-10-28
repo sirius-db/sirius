@@ -174,6 +174,19 @@ static void from_yaml(const YAML::Node& node, cucascade::memory::disk_memory_spa
   r.reject_unknown();
 }
 
+static void from_yaml(const YAML::Node& node, cucascade::memory::remote_memory_space_config& opt)
+{
+  yaml::reader r(node, "remote_memory_space");
+  r.optional("remote_id", opt.remote_id, yaml::greater_than<int>{-1});
+  r.required("uri_prefix", opt.uri_prefix);
+  r.optional("memory_capacity", yaml::bytes(opt.memory_capacity));
+  r.reject_unknown();
+  opt.uri_prefix = cucascade::memory::validate_remote_uri_prefix(opt.uri_prefix);
+  if (opt.memory_capacity == 0) {
+    throw std::runtime_error("sirius.space.remote.memory_capacity must be greater than zero");
+  }
+}
+
 static void from_yaml(const YAML::Node& node, exec::thread_pool_config& opt)
 {
   yaml::reader r(node, "thread_pool");
@@ -1049,6 +1062,52 @@ struct disk_mem_config {
   }
 };
 
+struct remote_mem_config {
+  int remote_id{0};
+  std::size_t capacity_bytes{cucascade::memory::unbounded_remote_capacity};
+  std::string uri;
+
+  static void from_yaml(const YAML::Node& node,
+                        remote_mem_config& opt,
+                        remote_spill_config& transport)
+  {
+    yaml::reader r(node, "memory.remote");
+    r.optional("remote_id", opt.remote_id, yaml::greater_than<int>{-1});
+    r.optional("uri", opt.uri);
+    r.optional("capacity_bytes", yaml::bytes(opt.capacity_bytes));
+    r.optional("endpoint", transport.endpoint, [](std::string const& value) {
+      if (value.find('@') != std::string::npos) {
+        throw std::runtime_error("must not contain URL credentials");
+      }
+      return true;
+    });
+    r.optional("region", transport.region);
+    cucascade::io::object_store_config::signing_mode mode{};
+    r.optional("signing_mode", mode);
+    if (r.has_value("signing_mode")) { transport.signing_mode = mode; }
+    read_count(r, "n_reactors", transport.n_reactors, true);
+    r.optional("staging_bytes", yaml::bytes(transport.staging_bytes));
+    r.optional("shutdown_removal_timeout_ms",
+               transport.shutdown_removal_timeout_ms,
+               yaml::greater_than<std::int64_t>{-1});
+    r.reject_unknown();  // Includes credentials: object_store_config is programmatic only.
+    if (transport.staging_bytes == 0) {
+      throw std::runtime_error("sirius.memory.remote.staging_bytes must be greater than zero");
+    }
+    if (!opt.uri.empty()) {
+      opt.uri = cucascade::memory::validate_remote_uri_prefix(opt.uri);
+      if (opt.capacity_bytes == 0) {
+        throw std::runtime_error("sirius.memory.remote.capacity_bytes must be greater than zero");
+      }
+    }
+  }
+
+  void setup_configurator(cucascade::memory::reservation_manager_configurator& builder) const
+  {
+    if (!uri.empty()) { builder.add_remote_space(remote_id, uri, capacity_bytes); }
+  }
+};
+
 // Helper: read a vector using file-local from_yaml overloads
 template <typename T>
 void read_yaml_vec(const YAML::Node& node, std::vector<T>& out)
@@ -1100,6 +1159,7 @@ struct parsed_sirius_config::Impl {
   gpu_mem_config gpu_cfg;
   host_mem_config host_cfg;
   disk_mem_config disk_cfg;
+  remote_mem_config remote_cfg;
   std::filesystem::path source_path;
   bool use_effective_gpu_capacity = false;
   std::vector<uint64_t operator_params::*> explicit_batch_settings;
@@ -1175,12 +1235,14 @@ try {
   auto& gpu_cfg                         = impl->gpu_cfg;
   auto& host_cfg                        = impl->host_cfg;
   auto& disk_cfg                        = impl->disk_cfg;
+  auto& remote_cfg                      = impl->remote_cfg;
   bool high_level_memory_configured     = false;
   bool explicit_high_level_gpu_capacity = false;
   std::optional<YAML::Node> operator_node;
   std::vector<cucascade::memory::gpu_memory_space_config> gpu_space_configs;
   std::vector<cucascade::memory::host_memory_space_config> host_space_configs;
   std::vector<cucascade::memory::disk_memory_space_config> disk_space_configs;
+  std::vector<cucascade::memory::remote_memory_space_config> remote_space_configs;
 
   yaml::reader top(root);
   auto sirius_node = top.optional_node("sirius");
@@ -1211,6 +1273,10 @@ try {
     if (auto n = mr.optional_node("disk")) {
       high_level_memory_configured = true;
       disk_mem_config::from_yaml(*n, disk_cfg);
+    }
+    if (auto n = mr.optional_node("remote")) {
+      high_level_memory_configured = true;
+      remote_mem_config::from_yaml(*n, remote_cfg, settings._remote_spill_config);
     }
     mr.reject_unknown();
   }
@@ -1260,11 +1326,13 @@ try {
     if (auto n = sr.optional_node("gpu")) read_yaml_vec(*n, gpu_space_configs);
     if (auto n = sr.optional_node("host")) read_yaml_vec(*n, host_space_configs);
     if (auto n = sr.optional_node("disk")) read_yaml_vec(*n, disk_space_configs);
+    if (auto n = sr.optional_node("remote")) read_yaml_vec(*n, remote_space_configs);
     sr.reject_unknown();
   }
 
   bool const explicit_space_configured =
-    !gpu_space_configs.empty() || !host_space_configs.empty() || !disk_space_configs.empty();
+    !gpu_space_configs.empty() || !host_space_configs.empty() || !disk_space_configs.empty() ||
+    !remote_space_configs.empty();
   if (high_level_memory_configured && explicit_space_configured) {
     throw std::runtime_error(
       "sirius.memory and non-empty sirius.space lists are mutually exclusive");
@@ -1281,6 +1349,9 @@ try {
             std::back_inserter(settings._memory_space_configs));
   std::copy(disk_space_configs.begin(),
             disk_space_configs.end(),
+            std::back_inserter(settings._memory_space_configs));
+  std::copy(remote_space_configs.begin(),
+            remote_space_configs.end(),
             std::back_inserter(settings._memory_space_configs));
 
   bool const explicit_low_level_gpu_capacity =
@@ -1307,12 +1378,13 @@ try {
 sirius_config parsed_sirius_config::resolve(
   const cucascade::memory::system_topology_info& hw_topology) const
 try {
-  auto settings         = impl_->settings;
-  settings._hw_topology = hw_topology;
-  const auto& topo      = impl_->topo;
-  const auto& gpu_cfg   = impl_->gpu_cfg;
-  const auto& host_cfg  = impl_->host_cfg;
-  const auto& disk_cfg  = impl_->disk_cfg;
+  auto settings          = impl_->settings;
+  settings._hw_topology  = hw_topology;
+  const auto& topo       = impl_->topo;
+  const auto& gpu_cfg    = impl_->gpu_cfg;
+  const auto& host_cfg   = impl_->host_cfg;
+  const auto& disk_cfg   = impl_->disk_cfg;
+  const auto& remote_cfg = impl_->remote_cfg;
   if (settings._memory_space_configs.empty()) {
     cucascade::memory::reservation_manager_configurator builder;
     if (std::holds_alternative<size_t>(topo.num_gpus_or_gpu_ids)) {
@@ -1325,6 +1397,7 @@ try {
     gpu_cfg.setup_configurator(builder);
     host_cfg.setup_configurator(builder);
     disk_cfg.setup_configurator(builder);
+    remote_cfg.setup_configurator(builder);
     if (auto bytes = std::get_if<std::uint64_t>(&gpu_cfg.usage_limit)) {
       // Resolve selected devices through the same configurator before its byte-limit assertion.
       auto capacity_builder = builder;
