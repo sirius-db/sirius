@@ -72,8 +72,9 @@ struct SIRIUS_FFI_EXPORT ObjectStoreConfig {
   /// store.
   const std::string ca_bundle_path;
   /// Namespace this snapshot may read: empty = any `s3://` object at the endpoint;
-  /// `"s3://bucket/"` or `"s3://bucket/prefix/"` limits reads to that prefix. A plan naming an
-  /// object outside it is refused before binding (`object_store_scope`).
+  /// `"s3://bucket/"` or `"s3://bucket/prefix/"` limits reads to that prefix.
+  /// With a non-empty prefix, an item outside it, an empty object key, or a key containing an
+  /// empty, `.` or `..` segment or a percent byte is refused before binding (`object_store_scope`).
   const std::string uri_prefix;
 
   /// A new snapshot with these credentials and every other field copied from `*this`, which is
