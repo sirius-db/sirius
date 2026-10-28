@@ -36,7 +36,6 @@ using `all`; without a proof there is no group-by-rowid ride and no riders.
 |---|---|---|
 | `SIRIUS_EXP_LATE_MAT` | off | The master gate. |
 | `SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS` | off | Columns the pin-time uniqueness probe observes: `all`, a name list, or `none`. |
-| `SIRIUS_EXP_LATE_MAT_EXACT_MAX_ROWS` | 300000000 | Row cap on the exact uniqueness stage, so a fact table does not buy a sort per column at pin time. |
 | `SIRIUS_EXP_LATE_MAT_MIN_BOUNDARIES` | 4 | Port crossings a ride must save. |
 | `SIRIUS_EXP_LATE_MAT_MIN_VALUE_X_BOUNDARIES` | 128 | Net bytes/row TIMES crossings saved — value and crossings trade off, so this is the floor that matters. |
 | `SIRIUS_EXP_LATE_MAT_COUNT_DEFER` | off | Count-on-deferred (below). |
@@ -141,11 +140,19 @@ with distinct count equal to row count and pairwise disjoint ranges; then, exact
 ranges leave undecided, by sorting the concatenated chunks and counting runs. The exact stage is
 load-bearing rather than a fallback, because chunk ranges usually overlap.
 
-`SIRIUS_EXP_LATE_MAT_EXACT_MAX_ROWS` is a ROW cap only — there is no separate memory guard on the
-exact stage. It concatenates and sorts, so a wide or variable-width column just under the cap is
-a multi-GB GPU allocation at pin time, on top of the pin itself. This is the sharpest edge of
-`PIN_UNIQUE_COLS=all`: it is not just "extra pin-time work" (above) but, for a wide column near
-the cap, a pin-time OOM risk rather than a slow pin. Name the columns a ride actually needs.
+The same facts also serve joins: with `pin_table_prove_unique_keys` (on by default), a pinned
+parquet column proven distinct counts as a unique build key, and the pin observes every integer
+column automatically under a stricter standard (an unsorted chunk is sorted on the spot, so a
+column that repeats a value is refused at its first chunk). See
+[Pin-Proven Unique Join Keys](optimizations.md#pin-proven-unique-join-keys).
+
+The exact stage is bounded per column in bytes by `pin_table_unique_exact_max_bytes` (default
+10% of the GPU memory space capacity), which replaces the former row cap
+`SIRIUS_EXP_LATE_MAT_EXACT_MAX_ROWS`. The cap bounds the concatenated column; the stage holds the
+retained chunks, their concatenation and the sorted copy at once, so its peak is about three
+times the cap, on top of the pin itself. A column past the cap stays UNKNOWN and the other
+columns continue. Wide columns under `PIN_UNIQUE_COLS=all` are still extra pin-time work, so name
+the columns a ride actually needs.
 
 **Absence of a fact means UNKNOWN, never "not unique."** A false positive would collapse
 distinct groups into one — wrong answers, not slow ones. Facts attach to the pinned entry BY
