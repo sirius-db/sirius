@@ -1045,6 +1045,18 @@ TEST_CASE("explicit operator batch values override effective-capacity defaults",
   REQUIRE(params.cross_join_task_bytes == 6 * mib);
 }
 
+TEST_CASE("max_build_hash_table_bytes defaults to twice the hash partition size in effect",
+          "[sirius][config][operator_defaults]")
+{
+  sirius::sirius_config config;
+  config.load_from_file(config_fixture("operator_defaults_hash_partition_only.yaml"));
+
+  constexpr uint64_t mib = 1024ULL * 1024;
+  auto const& params     = config.get_operator_params();
+  REQUIRE(params.hash_partition_bytes == 3 * mib);
+  REQUIRE(params.max_build_hash_table_bytes == 6 * mib);
+}
+
 TEST_CASE("ordinary defaults stay physical-memory-derived without an explicit GPU cap",
           "[sirius][config][operator_defaults]")
 {

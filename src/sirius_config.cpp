@@ -990,12 +990,24 @@ try {
 
   const auto defaults =
     operator_defaults_for(settings._memory_space_configs, impl_->use_effective_gpu_capacity);
+  auto const is_explicit = [&](uint64_t operator_params::* member) {
+    return std::find(impl_->explicit_batch_settings.begin(),
+                     impl_->explicit_batch_settings.end(),
+                     member) != impl_->explicit_batch_settings.end();
+  };
   for (const auto& setting : batch_settings) {
-    if (std::find(impl_->explicit_batch_settings.begin(),
-                  impl_->explicit_batch_settings.end(),
-                  setting.member) == impl_->explicit_batch_settings.end()) {
+    if (!is_explicit(setting.member)) {
       settings._operator_params.*setting.member = defaults.*setting.member;
     }
+  }
+  // Unless set explicitly, the BUILD_PROBE threshold is 2x the hash partition size in effect
+  // (explicit or derived), so tuning hash_partition_bytes carries the threshold along with it.
+  if (!is_explicit(&operator_params::max_build_hash_table_bytes)) {
+    auto const hash_partition_bytes = settings._operator_params.hash_partition_bytes;
+    settings._operator_params.max_build_hash_table_bytes =
+      hash_partition_bytes > std::numeric_limits<uint64_t>::max() / 2
+        ? std::numeric_limits<uint64_t>::max()
+        : 2 * hash_partition_bytes;
   }
   settings.finalize_derived_config();
   return settings;

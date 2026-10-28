@@ -1,0 +1,7 @@
+sirius:
+  space:
+    gpu:
+      - device_id: 0
+        memory_capacity: 256MiB
+  operator_params:
+    hash_partition_bytes: 3MiB

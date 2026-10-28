@@ -164,8 +164,8 @@ struct operator_params {
   /// Target size (bytes) of data to sample before computing sort partition boundaries.
   uint64_t sort_sample_bytes = config::DEFAULT_SORT_SAMPLE_BYTES;
 
-  /// Maximum build-side bytes for switching to BUILD_PROBE join mode: 2x the shared
-  /// batch default. May be larger than concat_batch_bytes; build-side batches will be
+  /// Maximum build-side bytes for switching to BUILD_PROBE join mode: 2x hash_partition_bytes
+  /// unless set explicitly. May be larger than concat_batch_bytes; build-side batches will be
   /// concatenated if needed.
   uint64_t max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES;
 
