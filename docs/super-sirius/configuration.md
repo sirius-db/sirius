@@ -182,8 +182,20 @@ Controls the disk spill tier. Data evicted from host memory is written here. Dis
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `disk_id` | int | 0 | Identifier for the disk space. |
-| `capacity_bytes` | bytes | 1Ti | Maximum disk space for spill files. |
+| `capacity_bytes` | bytes | 1Ti | Capacity bound for reservations / in-flight conversions, not a quota on stored spill files. The filesystem must have enough free space. |
 | `downgrade_root_dirs` | string | "" | Directory path for spill files. **Must be set** to enable disk spilling. Use a fast local mount (NVMe preferred). |
+
+Raw and compressed `.hpln` spills use the DISK space's shared `cucascade::io::ioctx`.
+The default is adopted lazily on first conversion and shared process-wide through a weak
+cache. Automatic selection prefers **real GDS via cuFile**, then **usable io_uring**, then
+**cuFile POSIX/staging** if io_uring is unavailable or forbidden. The context owns its
+private staging and reactor teardown; see [DISK I/O and ownership](memory-management.md#disk-io-and-ownership).
+
+The existing `disk_id`, `capacity_bytes`, and `downgrade_root_dirs` keys and spill-file
+layouts are unchanged. There are no additional DISK-backend or per-mount reactor YAML
+settings, and no backend registration is required. `sirius.executor.scan_manager.backend`,
+reactor counts and cache settings configure independent scan contexts, not this spill
+default. The removed kvikIO backend is not available for reads or writes.
 
 ### Input-table compression (`sirius.compression`)
 
@@ -210,7 +222,9 @@ With spill compression on, a GPU batch the downgrade executor moves to the host 
 stored Simpatico-compressed and decoded on its way back to the GPU. Plans are chosen per column
 from its type (see [Memory Management](memory-management.md#spill-compression)); no plan files are
 involved. A batch that does not qualify, saves too little, or fails to encode spills
-uncompressed.
+uncompressed. Compressed DISK spills use the same per-space ioctx as raw spills, with
+unchanged `.hpln` layout. This I/O transport change does not change the settings below or
+the process-wide SQL `spill_compression` semantics.
 
 | Key | DuckDB setting | Type | Default | Description |
 |-----|----------------|------|---------|-------------|
@@ -288,7 +302,10 @@ Each tier is a **YAML sequence** of space configs. Byte fields accept suffixes; 
 |-----|------|---------|-------------|
 | `disk_id` | int | 0 | Identifier for the disk space. |
 | `mount_path` | string | "" | Spill directory. |
-| `memory_capacity` | bytes | space default | Maximum disk space for spill files. |
+| `memory_capacity` | bytes | space default | Reservation / in-flight conversion bound, not a stored-file quota. |
+
+These spaces use the same [lazy DISK I/O default](#disk-memory-siriusmemorydisk),
+independent of the scan contexts; the low-level YAML surface adds no I/O selection knobs.
 
 ```yaml
 sirius:
@@ -340,16 +357,16 @@ Thread pool (default `num_threads: 1`) plus:
 |-----|------|---------|-------------|
 | `monitor_period` | int (ms) | 10 | Period of the memory-pressure monitor loop. Set to `0` to disable the monitor loop entirely. |
 
-HOST downgrade executors synchronously reclaim idle staging chunks from the default local
-ioctx's `fs_cache` before spilling repository batches or queued tasks. If a byte-target request
+HOST downgrade executors synchronously reclaim idle staging chunks from the scan manager's
+default local ioctx's `fs_cache` before spilling repository batches or queued tasks. If a byte-target request
 is still short after those workers finish, a forced pass reclaims additional unpinned,
 non-loading chunks up to the remaining deficit, even if a future scan subscribes to them.
 Only bytes above the cache's prefetch reservation (`scan_manager.cache.min_prefetching_budget_fraction`
 of each HOST space) relieve HOST pressure: the executor reclaims and credits only those bytes,
 from its own NUMA space. Chunks inside the reservation are kept. Reclaim performs no disk writes
 and needs no DISK tier. Without DISK, a HOST executor whose cache holds nothing above the
-reservation backs off like any other non-viable executor. GPU executors and routed remote
-ioctx caches do not participate. This adds no configuration keys.
+reservation backs off like any other non-viable executor. GPU executors, independent DISK spill
+contexts and routed remote ioctx caches do not participate. This adds no configuration keys.
 
 ## Scan Manager & IO Configuration
 
