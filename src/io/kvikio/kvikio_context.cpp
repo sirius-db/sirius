@@ -27,6 +27,7 @@
 
 #include <rmm/cuda_device.hpp>
 
+#include <cuda.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -354,6 +355,33 @@ void check_cuda(cudaError_t status)
 /// Largest merged cache-fill read, matching the REST backend's largest GET segment.
 constexpr std::size_t max_merged_read = 16UL << 20;
 
+/// Start of the device allocation holding @p ptr, or @p ptr itself if the
+/// driver cannot tell.  Device reads are merged only within one allocation:
+/// kvikIO copies a read to the device with one memcpy, and a memcpy may not
+/// cross from one allocation into another even where their addresses touch.
+std::uintptr_t allocation_start(std::uint8_t* ptr) noexcept
+{
+  using get_attribute_fn = CUresult (*)(void*, CUpointer_attribute, CUdeviceptr);
+  static get_attribute_fn const get_attribute = [] {
+    void* fn = nullptr;
+    cudaDriverEntryPointQueryResult status{};
+    if (cudaGetDriverEntryPointByVersion(
+          "cuPointerGetAttribute", &fn, 12000, cudaEnableDefault, &status) != cudaSuccess ||
+        status != cudaDriverEntryPointSuccess) {
+      fn = nullptr;
+    }
+    return reinterpret_cast<get_attribute_fn>(fn);
+  }();
+  CUdeviceptr start = 0;
+  if (get_attribute == nullptr ||
+      get_attribute(&start,
+                    CU_POINTER_ATTRIBUTE_RANGE_START_ADDR,
+                    reinterpret_cast<CUdeviceptr>(ptr)) != CUDA_SUCCESS) {
+    return reinterpret_cast<std::uintptr_t>(ptr);
+  }
+  return static_cast<std::uintptr_t>(start);
+}
+
 /// Running totals of cache-chunk fills and the kvikIO reads that served them,
 /// logged at most every 30 s.  Every kvikIO read wakes all of kvikIO's reactor
 /// threads, so the reads-per-fill ratio is what merging is meant to drive down.
@@ -536,14 +564,45 @@ exec::semi_future<size_t> kvikio_context::mixed_readv_async_io(
         rmm::cuda_set_device_raii const guard{resolve_device(device_id)};
         check_cuda(cudaStreamSynchronize(stream));
       }
+      // Device reads are merged like cache-chunk fills: a cache that cannot
+      // hold a request's chunks hands over one device slice per missed chunk,
+      // and a request's adjacent misses are adjacent on the device too.
+      struct device_read_piece {
+        int device_id;
+        std::uintptr_t allocation;
+        std::size_t lo;
+        std::size_t hi;
+        std::uint8_t* dst;
+      };
+      std::vector<device_read_piece> pieces;
       for (std::size_t i = 0; i < batch->slices.size(); ++i) {
         auto& slice = batch->slices[i];
         if (slice.size() == 0 || !slice.has_device_request() || !slice.needs_staging()) {
           continue;
         }
-        rmm::cuda_set_device_raii const guard{resolve_device(slice.d_buffer.device_id)};
-        batch->reads[i].push_back(
-          object->read_async(slice.d_buffer.data, slice.size(), slice.offset()));
+        pieces.push_back({resolve_device(slice.d_buffer.device_id).value(),
+                          allocation_start(slice.d_buffer.data),
+                          slice.offset(),
+                          slice.offset() + slice.size(),
+                          slice.d_buffer.data});
+        batch->expected[i] = 0;  // Checked per merged read through @c fills.
+      }
+      std::sort(pieces.begin(), pieces.end(), [](auto const& a, auto const& b) {
+        return std::tie(a.device_id, a.lo) < std::tie(b.device_id, b.lo);
+      });
+      std::size_t run = 0;
+      for (std::size_t p = 1; p <= pieces.size(); ++p) {
+        bool const extends = p < pieces.size() && pieces[p].device_id == pieces[run].device_id &&
+                             pieces[p].allocation == pieces[run].allocation &&
+                             pieces[p].lo == pieces[p - 1].hi &&
+                             pieces[p].dst == pieces[p - 1].dst + (pieces[p - 1].hi - pieces[p - 1].lo) &&
+                             pieces[p].hi - pieces[run].lo <= max_merged_read;
+        if (extends) { continue; }
+        auto const bytes = pieces[p - 1].hi - pieces[run].lo;
+        rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{pieces[run].device_id}};
+        batch->fills.emplace_back(object->read_async(pieces[run].dst, bytes, pieces[run].lo),
+                                  bytes);
+        run = p;
       }
     } catch (...) {
       batch->wait_all();
