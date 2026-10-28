@@ -69,6 +69,18 @@
 // production registration bypass. All execution and retirement use the manager.
 namespace sirius::scan_manager {
 struct scan_manager_query_test {
+  static void register_ioctx(sirius_scan_manager& manager,
+                             cucascade::io::io_context_type type,
+                             cucascade::io::io_context_registry::scheme_checker_type checker,
+                             cucascade::io::io_context_registry::factory_type factory)
+  {
+    manager._ioctx_registry.register_ioctx(type, std::move(checker), std::move(factory));
+  }
+  static std::shared_ptr<cucascade::io::ioctx> ioctx_for_path(sirius_scan_manager& manager,
+                                                              std::string_view path)
+  {
+    return manager.ioctx_for_path(path);
+  }
   static void advance(sirius_scan_manager& manager, sirius::query_id_t id)
   {
     if (auto state = manager.get_query_state(id); state && state->coordinator)
@@ -229,7 +241,112 @@ struct manager_fixture : fixture {
   }
 };
 
+struct start_failing_ioctx : cucascade::io::ioctx {
+  std::atomic<size_t>* starts;
+  std::atomic<bool>* fail;
+
+  start_failing_ioctx(std::atomic<size_t>& starts, std::atomic<bool>& fail)
+    : starts(&starts), fail(&fail)
+  {
+  }
+  ~start_failing_ioctx() override { pre_destroy(); }
+  cucascade::io::io_context_type type() const noexcept override
+  {
+    return cucascade::io::io_context_type::restful;
+  }
+  void start() override
+  {
+    ++*starts;
+    if (fail->load()) { throw std::runtime_error("injected start failure"); }
+  }
+  void shutdown() noexcept override {}
+  bool supports(std::string_view) const noexcept override { return true; }
+  bool supports_device_read() const noexcept override { return false; }
+  bool supports_host_to_device_read() const noexcept override { return false; }
+  bool supports_vector_host_read() const noexcept override { return false; }
+  bool supports_device_range_read() const noexcept override { return false; }
+  std::vector<cucascade::io::byte_range> align_and_coalesce(
+    std::span<cucascade::io::byte_range const> ranges,
+    std::optional<size_t>) const noexcept override
+  {
+    return {ranges.begin(), ranges.end()};
+  }
+  size_t host_read_io(cucascade::io::io_object const&, size_t, size_t, uint8_t*) override
+  {
+    throw std::runtime_error("test context must not read");
+  }
+  cucascade::exec::semi_future<size_t> mixed_readv_async_io(
+    cucascade::io::io_object const&,
+    std::vector<cucascade::io::prepared_io_slice>&&) noexcept override
+  {
+    return cucascade::exec::make_semi_future<size_t>(
+      std::make_exception_ptr(std::runtime_error("test context must not read")));
+  }
+  std::shared_ptr<cucascade::io::io_object> create_io_object(std::string) override
+  {
+    throw std::runtime_error("test context must not open");
+  }
+};
+
 }  // namespace
+
+TEST_CASE("routed ioctx start failure is not cached and the next lookup retries",
+          "[scan_manager][query_state][routing]")
+{
+  using cucascade::io::io_context_type;
+  using sirius::scan_manager::scan_manager_query_test;
+  std::atomic<size_t> constructions{0};
+  std::atomic<size_t> starts{0};
+  std::atomic<bool> fail{true};
+  manager_fixture f;
+  auto const path = "s3://bucket/a.parquet";
+
+  scan_manager_query_test::register_ioctx(
+    f.manager,
+    io_context_type::restful,
+    [](std::string_view p) { return p.starts_with("s3://"); },
+    [&](auto const&) {
+      ++constructions;
+      return std::make_shared<start_failing_ioctx>(starts, fail);
+    });
+
+  REQUIRE_THROWS_WITH(scan_manager_query_test::ioctx_for_path(f.manager, path),
+                      Catch::Matchers::ContainsSubstring("injected start failure"));
+  REQUIRE(constructions == 1);
+  REQUIRE(starts == 1);
+  REQUIRE_THROWS_WITH(f.manager.create_datasource(path),
+                      Catch::Matchers::ContainsSubstring("injected start failure"));
+  REQUIRE(constructions == 2);
+  REQUIRE(starts == 2);
+
+  fail     = false;
+  auto ctx = scan_manager_query_test::ioctx_for_path(f.manager, path);
+  REQUIRE(ctx);
+  CHECK(ctx->type() == io_context_type::restful);
+  CHECK(constructions == 3);
+  CHECK(starts == 3);
+  CHECK(scan_manager_query_test::ioctx_for_path(f.manager, path) == ctx);
+  CHECK(constructions == 3);
+  CHECK(starts == 3);
+}
+
+TEST_CASE("routed ioctx factory declines remain cached", "[scan_manager][query_state][routing]")
+{
+  using sirius::scan_manager::scan_manager_query_test;
+  std::atomic<size_t> constructions{0};
+  manager_fixture f;
+  scan_manager_query_test::register_ioctx(
+    f.manager,
+    cucascade::io::io_context_type::restful,
+    [](std::string_view p) { return p.starts_with("s3://"); },
+    [&](auto const&) -> std::shared_ptr<cucascade::io::ioctx> {
+      ++constructions;
+      return nullptr;
+    });
+  CHECK_FALSE(scan_manager_query_test::ioctx_for_path(f.manager, "s3://bucket/a.parquet"));
+  CHECK_FALSE(scan_manager_query_test::ioctx_for_path(f.manager, "s3://bucket/a.parquet"));
+  CHECK(constructions == 1);
+}
 
 TEST_CASE("two queries register independently and reset drops only one",
           "[scan_manager][query_state]")
