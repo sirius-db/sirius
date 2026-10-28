@@ -16,8 +16,8 @@
 
 #include "ducklake/dv_visibility.hpp"
 #include "ducklake/field_mapping.hpp"
+#include "ducklake/inline_batch_producer.hpp"
 #include "ducklake/inline_staging.hpp"
-#include "ducklake/inline_unit_ingestible.hpp"
 #include "ducklake/inline_varchar.hpp"
 #include "ducklake/preparation_identity.hpp"
 #include "ducklake/preparation_slot.hpp"
@@ -429,15 +429,14 @@ TEST_CASE("DuckLake VARCHAR defaults preserve bytes and reject implicit conversi
   }
   CHECK_THROWS(bind_field(99, LogicalType::VARCHAR, Value::INTEGER(7)));
   CHECK_THROWS(bind_field(99, LogicalType::VARCHAR, Value::BLOB("binary")));
-  CHECK(inline_unit_ingestible::batch_capacity(2, 1) ==
-        inline_unit_ingestible::batch_capacity(2) + inline_unit_ingestible::max_string_bytes);
-  CHECK(inline_unit_ingestible::batch_capacity(2, 2) ==
-        inline_unit_ingestible::batch_capacity(2, 1));
-  CHECK_THROWS(inline_unit_ingestible::batch_capacity(1, 2));
-  auto envelope = inline_unit_ingestible::envelope(2, 1);
+  CHECK(inline_batch_producer::batch_capacity(2, 1) ==
+        inline_batch_producer::batch_capacity(2) + inline_batch_producer::max_string_bytes);
+  CHECK(inline_batch_producer::batch_capacity(2, 2) == inline_batch_producer::batch_capacity(2, 1));
+  CHECK_THROWS(inline_batch_producer::batch_capacity(1, 2));
+  auto envelope = inline_batch_producer::envelope(2, 1);
   REQUIRE(envelope.temporary.size() == 2);
-  CHECK(envelope.temporary[0] == inline_unit_ingestible::batch_capacity(2));
-  CHECK(envelope.temporary[1] == inline_unit_ingestible::max_string_bytes);
+  CHECK(envelope.temporary[0] == inline_batch_producer::batch_capacity(2));
+  CHECK(envelope.temporary[1] == inline_batch_producer::max_string_bytes);
 }
 
 TEST_CASE("DuckLake temporal defaults preserve units and reject adjacent logical types",
@@ -833,20 +832,20 @@ TEST_CASE("DuckLake preparation identities do not alias across concurrent unit s
 TEST_CASE("DuckLake inline batches use spare column capacity without expanding their byte bound",
           "[ducklake_units][ducklake_batch_capacity]")
 {
-  using sirius::ducklake::inline_unit_ingestible;
-  CHECK(inline_unit_ingestible::batch_rows(0) == 2048);
-  CHECK(inline_unit_ingestible::batch_rows(2) == 2048);
-  CHECK(inline_unit_ingestible::batch_rows(5) == 1600);
-  CHECK(inline_unit_ingestible::batch_rows(32) == 256);
-  CHECK_THROWS(inline_unit_ingestible::batch_rows(33));
-  auto ceiling = inline_unit_ingestible::batch_capacity(32);
+  using sirius::ducklake::inline_batch_producer;
+  CHECK(inline_batch_producer::batch_rows(0) == 2048);
+  CHECK(inline_batch_producer::batch_rows(2) == 2048);
+  CHECK(inline_batch_producer::batch_rows(5) == 1600);
+  CHECK(inline_batch_producer::batch_rows(32) == 256);
+  CHECK_THROWS(inline_batch_producer::batch_rows(33));
+  auto ceiling = inline_batch_producer::batch_capacity(32);
   for (size_t columns = 1; columns <= 32; ++columns) {
-    auto rows = inline_unit_ingestible::batch_rows(columns);
+    auto rows = inline_batch_producer::batch_rows(columns);
     CHECK(rows >= 256);
     CHECK(rows <= 2048);
     CHECK(rows % 64 == 0);
     CHECK(rows * columns <= 8192);
-    CHECK(inline_unit_ingestible::batch_capacity(columns) <= ceiling);
+    CHECK(inline_batch_producer::batch_capacity(columns) <= ceiling);
   }
 }
 

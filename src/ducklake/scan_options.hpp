@@ -15,6 +15,7 @@
  */
 
 #pragma once
+#include "ducklake/preparation_gate.hpp"
 #include "ducklake/preparation_identity.hpp"
 #include "sirius_config.hpp"
 
@@ -28,7 +29,6 @@ namespace sirius::op::scan {
 struct physical_profile_table;
 }
 namespace sirius::ducklake {
-struct preparation_gate;
 class preparation_slot;
 // Filters and output positions index the selected required_columns, not the
 // original table or physical file. Omitted output means all selected columns;

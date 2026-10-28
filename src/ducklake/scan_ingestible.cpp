@@ -19,7 +19,7 @@
 #include "ducklake/binding_bridge.hpp"
 #include "ducklake/dv_visibility.hpp"
 #include "ducklake/field_mapping.hpp"
-#include "ducklake/inline_unit_ingestible.hpp"
+#include "ducklake/inline_batch_producer.hpp"
 #include "ducklake/parquet_unit_ingestible.hpp"
 #include "ducklake/preparation_gate.hpp"
 #include "ducklake/preparation_slot.hpp"
@@ -457,8 +457,8 @@ scan_ingestible::scan_ingestible(std::shared_ptr<binding_handle> binding,
 scan_ingestible::~scan_ingestible() = default;
 sm::unit_envelope scan_ingestible::envelope()
 {
-  auto result              = inline_unit_ingestible::envelope(inline_unit_ingestible::max_columns,
-                                                 inline_unit_ingestible::max_columns);
+  auto result              = inline_batch_producer::envelope(inline_batch_producer::max_columns,
+                                                inline_batch_producer::max_columns);
   result.temporary.front() = std::max<uint64_t>(dv_max_file_bytes, result.temporary.front());
   result.retained = 14 * dv_max_footer_bytes + 512 + 4 * dv_max_positions * sizeof(int64_t);
   return result;

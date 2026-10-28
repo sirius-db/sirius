@@ -18,8 +18,8 @@
 
 #include "ducklake/dv_visibility.hpp"
 #include "ducklake/field_mapping.hpp"
+#include "ducklake/inline_batch_producer.hpp"
 #include "ducklake/inline_reader.hpp"
-#include "ducklake/inline_unit_ingestible.hpp"
 #include "ducklake/parquet_unit_ingestible.hpp"
 #include "io/io_errors.hpp"
 #include "planner/connector_registry.hpp"
@@ -725,7 +725,7 @@ std::unique_ptr<inline_reader> binding_handle::open_inline_unit(uint64_t index)
   throw std::runtime_error("DuckLake private binding bridge is not built");
 #endif
 }
-std::shared_ptr<inline_unit_ingestible> binding_handle::make_inline_unit(
+std::shared_ptr<op::scan::arrow_import_ingestible> binding_handle::make_inline_unit(
   uint64_t index,
   uint64_t contract,
   uint64_t generation,
@@ -736,15 +736,17 @@ std::shared_ptr<inline_unit_ingestible> binding_handle::make_inline_unit(
 {
   auto unit = unit_at(index);
   if (!unit) throw std::out_of_range("DuckLake original inline index");
-  return std::shared_ptr<inline_unit_ingestible>(
-    new inline_unit_ingestible(shared_from_this(),
-                               std::move(*unit),
-                               contract,
-                               generation,
-                               std::move(admission),
-                               count_only,
-                               std::move(required_columns),
-                               std::move(options)));
+  auto producer =
+    std::shared_ptr<inline_batch_producer>(new inline_batch_producer(shared_from_this(),
+                                                                     std::move(*unit),
+                                                                     contract,
+                                                                     generation,
+                                                                     std::move(admission),
+                                                                     count_only,
+                                                                     std::move(required_columns),
+                                                                     std::move(options)));
+  auto bound = producer->take_binding();
+  return std::make_shared<op::scan::arrow_import_ingestible>(std::move(bound), std::move(producer));
 }
 op::scan::bound_read_view capture_read_view(BoundTableFunction const& function,
                                             FunctionData const* data,

@@ -1922,8 +1922,9 @@ TEST_CASE("Production DuckLake inline batch sizing preserves wide nullable rows"
 TEST_CASE("DuckLake inline completion does not import empty Arrow batches",
           "[isolated_context][ducklake][ducklake_inline_completion]")
 {
-  auto mixed = GENERATE(false, true);
-  INFO(mixed);
+  auto mixed             = GENERATE(false, true);
+  auto transaction_local = GENERATE(false, true);
+  CAPTURE(mixed, transaction_local);
   if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
   sirius::test::scoped_temp_directory disk;
   sirius::test::shared_test_env env(lake_config());
@@ -1937,6 +1938,7 @@ TEST_CASE("DuckLake inline completion does not import empty Arrow batches",
     query(con, "INSERT INTO lake.q VALUES (1,'parquet'),(2,NULL)");
     query(con, "CALL ducklake_flush_inlined_data('lake')");
   }
+  if (transaction_local) query(con, "BEGIN");
   query(con, "INSERT INTO lake.q VALUES (3,'inline'),(4,NULL),(NULL,'value')");
   auto expected = ducklake_result_bag(*query(con, "SELECT * FROM lake.q"));
   auto runtime  = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
@@ -1966,6 +1968,7 @@ TEST_CASE("DuckLake inline completion does not import empty Arrow batches",
       CHECK(hosts[0]->get_total_reserved_memory() == reserved);
     }
   }
+  if (transaction_local) query(con, "ROLLBACK");
 }
 
 TEST_CASE("DuckLake result fragments execute original bindings without CPU replay",

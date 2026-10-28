@@ -43,7 +43,7 @@ If a trusted definition is unavailable, Sirius warns once per source and decline
 
 `SIRIUS_BUILD_DUCKLAKE_BRIDGE` enables the optional connector and is off by default. It requires the pinned, host-patched DuckLake source and matching library. Private provider headers stay inside `binding_bridge.cpp`; installed packages include the matching provider library.
 
-The connector verifies the provider callbacks and reads the original binding's snapshot, schema and transaction-local state. Each execution owns its readers and cursors; the saved CPU reader remains available for replay. Parquet and inline units share the existing preparation coordinator, split validation and query recovery. Discovery is lazy and must cover every unit in the binding.
+The connector verifies the provider callbacks and reads the original binding's snapshot, schema and transaction-local state. Each execution owns its readers and cursors; the saved CPU reader remains available for replay. Parquet and inline units share the existing preparation coordinator, split validation and query recovery. Discovery is lazy and must cover every unit in the binding. Inline readers supply detached batches to the shared Arrow driver; DuckLake retains transaction and provenance checks, while the driver handles admission, import and batch retirement.
 
 | Input or condition | Behavior |
 |---|---|

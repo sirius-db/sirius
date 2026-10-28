@@ -21,6 +21,9 @@
 
 #include <duckdb/function/table_function.hpp>
 
+namespace sirius::op::scan {
+class arrow_import_ingestible;
+}
 namespace sirius::scan_manager {
 class preparation_admission;
 class charging_allocator;
@@ -28,7 +31,6 @@ class preparation_stop_token;
 }  // namespace sirius::scan_manager
 namespace sirius::ducklake {
 class parquet_unit_ingestible;
-class inline_unit_ingestible;
 class inline_reader;
 struct dv_visibility;
 // Only the implementation may include provider-private headers. Availability
@@ -58,7 +60,7 @@ class binding_handle : public std::enable_shared_from_this<binding_handle> {
     unit_scan_options options            = {});
 
   std::unique_ptr<inline_reader> open_inline_unit(uint64_t original_file_index);
-  std::shared_ptr<inline_unit_ingestible> make_inline_unit(
+  std::shared_ptr<op::scan::arrow_import_ingestible> make_inline_unit(
     uint64_t original_file_index,
     uint64_t contract,
     uint64_t generation,

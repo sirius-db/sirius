@@ -18,7 +18,7 @@
 
 #include "ducklake/binding_bridge.hpp"
 #include "ducklake/field_mapping.hpp"
-#include "ducklake/inline_unit_ingestible.hpp"
+#include "ducklake/inline_batch_producer.hpp"
 #include "ducklake/inline_varchar.hpp"
 #include "ducklake/scan_ingestible.hpp"
 #include "op/scan/dynamic_filter_merge.hpp"
@@ -57,7 +57,7 @@ scan_layout layout(op::sirius_physical_table_scan const& scan)
         "DuckLake selected column is outside the scalar materialization profile");
     result.selected.push_back(index);
   }
-  if (result.selected.empty() || result.selected.size() > inline_unit_ingestible::max_columns)
+  if (result.selected.empty() || result.selected.size() > inline_batch_producer::max_columns)
     throw std::invalid_argument(
       "DuckLake selected column count exceeds the materialization profile");
   auto outputs = std::vector<size_t>(scan.projection_ids.begin(), scan.projection_ids.end());

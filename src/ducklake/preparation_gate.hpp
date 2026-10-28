@@ -15,14 +15,8 @@
  */
 
 #pragma once
-#include "scan_manager/preparation.hpp"
-
-#include <atomic>
+#include "op/scan/arrow/arrow_batch_producer.hpp"
 namespace sirius::ducklake {
-// Shared across inline batches and retained Parquet visibility in one scan.
-// A scan cannot retain another temporary permit until its previous input retires.
-struct preparation_gate {
-  std::atomic<bool> active{false};
-  scan_manager::preparation_wakeup wake;
-};
+// Share the input gate with retained Parquet visibility in a mixed scan.
+using preparation_gate = op::scan::arrow_input_gate;
 }  // namespace sirius::ducklake
