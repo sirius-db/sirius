@@ -33,7 +33,7 @@ sirius_physical_concat::sirius_physical_concat(duckdb::vector<sirius::logical_ty
   : sirius_physical_partition_consumer_operator(
       SiriusPhysicalOperatorType::CONCAT, std::move(types), estimated_cardinality)
 {
-  _concat_all         = concat_all;
+  _mode               = concat_all ? grouping_mode::ALL : grouping_mode::BOUNDED;
   _concat_batch_bytes = concat_batch_bytes;
 }
 
@@ -44,9 +44,11 @@ std::optional<std::vector<uint64_t>> sirius_physical_concat::plan_pull_for_parti
 {
   auto batch_ids = repo.get_batch_ids(partition_idx);
   if (batch_ids.empty()) { return std::nullopt; }
+  // Keep the normal preparation, validation, and singleton forwarding path in execute().
+  if (passthrough()) { return std::vector<uint64_t>{batch_ids.front()}; }
 
   // A concat-all group is the whole partition, so it can only form once the source is done.
-  if (_concat_all && !pipeline_finished) { return std::nullopt; }
+  if (concat_all() && !pipeline_finished) { return std::nullopt; }
 
   std::vector<uint64_t> group;
   std::size_t total_batch_size = 0;
@@ -57,7 +59,7 @@ std::optional<std::vector<uint64_t>> sirius_physical_concat::plan_pull_for_parti
     auto const stats = get_batch_rows_and_bytes(*batch_idle);
     if (stats.rows.has_value()) {
       if (*stats.rows > row_limit - total_rows) {
-        if (!_concat_all && !group.empty()) { return group; }
+        if (!concat_all() && !group.empty()) { return group; }
         throw std::overflow_error("CONCAT partition exceeds the cuDF row-count limit");
       }
       total_rows += *stats.rows;
@@ -65,7 +67,7 @@ std::optional<std::vector<uint64_t>> sirius_physical_concat::plan_pull_for_parti
     // Unknown row counts are checked against the actual tables after preparation. The byte count
     // is the decoded size: a compressed batch occupies a fraction of what the task will decode.
     total_batch_size = memory::saturating_add(total_batch_size, stats.bytes);
-    if (!_concat_all && total_batch_size > _concat_batch_bytes) {
+    if (!concat_all() && total_batch_size > _concat_batch_bytes) {
       // The accumulated group is complete; the overflowing batch seeds the next group.
       if (!group.empty()) { return group; }
       // The first batch alone exceeds the threshold. Release it as a single-batch group unless
@@ -100,7 +102,7 @@ std::optional<task_creation_hint> sirius_physical_concat::get_next_task_hint()
     return std::nullopt;
   }
 
-  if (_concat_all) {
+  if (concat_all()) {
     // if we need to concat all then we need to wait for the pipeline to be finished
     return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA,
                               &(port_ptr->src_pipeline->get_operators()[0].get())};
@@ -236,13 +238,33 @@ MemoryBarrierType sirius_physical_concat::input_barrier_for(
   return sirius_physical_operator::input_barrier_for(producer);
 }
 
-void sirius_physical_concat::set_concat_all(bool concat_all)
+void sirius_physical_concat::set_mode_locked(grouping_mode mode)
 {
-  std::lock_guard<std::mutex> lg(lock);
-  if (_input_claimed && _concat_all != concat_all) {
+  if (_input_claimed && _mode != mode) {
     throw std::logic_error("CONCAT requirement changed after the first input claim");
   }
-  _concat_all = concat_all;
+  _mode = mode;
+  SIRIUS_LOG_DEBUG("sirius_physical_concat id {} grouping mode {}",
+                   operator_id,
+                   mode == grouping_mode::ALL           ? "ALL"
+                   : mode == grouping_mode::PASSTHROUGH ? "PASSTHROUGH"
+                                                        : "BOUNDED");
+}
+
+void sirius_physical_concat::set_concat_all(bool enabled)
+{
+  std::lock_guard<std::mutex> lg(lock);
+  // Repeating a false whole-partition requirement must not disable passthrough.
+  set_mode_locked(enabled ? grouping_mode::ALL : concat_all() ? grouping_mode::BOUNDED : _mode);
+}
+
+void sirius_physical_concat::set_passthrough(bool enabled)
+{
+  std::lock_guard<std::mutex> lg(lock);
+  // A whole-partition requirement always wins, including when configured by the planner.
+  set_mode_locked(concat_all() ? grouping_mode::ALL
+                  : enabled    ? grouping_mode::PASSTHROUGH
+                               : grouping_mode::BOUNDED);
 }
 
 std::size_t sirius_physical_concat::no_history_peak_memory_estimate(

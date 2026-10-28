@@ -893,3 +893,15 @@ TEST_CASE("multi-partition dynamic-filter byte budgets reject zero and negative 
   std::error_code ec;
   std::filesystem::remove(path, ec);
 }
+
+TEST_CASE("probe concat passthrough defaults on and can be disabled in YAML",
+          "[config_opt][concat_passthrough]")
+{
+  CHECK(operator_params{}.enable_probe_concat_passthrough);
+  CHECK(parsed_sirius_config{}.get_operator_params().enable_probe_concat_passthrough);
+  bool const enabled = GENERATE(false, true);
+  auto root          = YAML::Load("sirius: { operator_params: {} }");
+  root["sirius"]["operator_params"]["enable_probe_concat_passthrough"] = enabled;
+  auto const cfg = parsed_sirius_config::from_node(root);
+  CHECK(cfg.get_operator_params().enable_probe_concat_passthrough == enabled);
+}

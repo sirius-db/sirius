@@ -156,6 +156,8 @@ struct operator_params {
 
   /// Target size (bytes) for the concat operator output batch.
   uint64_t concat_batch_bytes = config::DEFAULT_CONCAT_BATCH_BYTES;
+  /// Stream probe batches without concatenation for BUILD_PROBE (including broadcast) joins.
+  bool enable_probe_concat_passthrough = true;
 
   /// Target output size (bytes) of each cross product task. A pair of input batches whose cross
   /// join is larger is split into tasks over row ranges of the left batch.

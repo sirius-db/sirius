@@ -474,10 +474,18 @@ Publishes an optional equality-key Bloom filter before a RIGHT_SEMI/RIGHT_ANTI j
 Groups batches within an existing partition layout and preserves each output partition index.
 The caller selects the grouping requirement:
 
-- `concat_all = true`: waits for producer completion, then emits one indexed batch per nonempty input partition, forwarding singletons;
-- `concat_all = false`: retains byte-target grouping, including oversized singletons and the final under-target tail.
+- `ALL` (`concat_all = true`): waits for producer completion, then emits one indexed batch per nonempty input partition, forwarding singletons;
+- `BOUNDED`: retains byte-target grouping, including oversized singletons and the final under-target tail;
+- `PASSTHROUGH`: releases one available batch immediately, forwarding the same batch without concatenation even while the producer is running.
 
-Group selection also checks available row-count metadata before claiming or transferring input.
+The join's partition-policy callback enables `PASSTHROUGH` for eligible BUILD_PROBE probes
+(including broadcast) before publishing either input layout. It is enabled by default;
+`SET enable_probe_concat_passthrough = false` restores bounded grouping. `ALL` always takes
+precedence on the same CONCAT instance, and grouping cannot change after the first input claim.
+All modes preserve partition/device placement and use the existing preparation and ownership paths.
+Passthrough saves concat allocations and copies but may increase task overhead for small batches.
+
+Bounded and complete-partition group selection also check available row-count metadata before claiming or transferring input.
 Bounded groups stop before exceeding the cuDF row-count limit; a complete partition above the
 limit is rejected. Execution checks the actual prepared tables, including representations
 without row-count metadata. Input preparation and allocation failures use the standard

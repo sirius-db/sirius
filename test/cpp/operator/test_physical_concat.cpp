@@ -1146,7 +1146,8 @@ TEST_CASE("sibling partitions install one placement on the join and both CONCATs
   attach_port(*fixture.hash_join, "default", join_default_repo);
 
   REQUIRE_THROWS_AS(fixture.hash_join->placement(), sirius::internal_exception);
-  bind_partition_inputs(*fixture.hash_join, build_partition, probe_partition, &build_concat, true);
+  bind_partition_inputs(
+    *fixture.hash_join, build_partition, probe_partition, &build_concat, true, &probe_concat);
   REQUIRE(build_partition.get_next_task_input_data() != nullptr);
 
   auto const placement = fixture.hash_join->placement();
@@ -1155,6 +1156,7 @@ TEST_CASE("sibling partitions install one placement on the join and both CONCATs
   // Every emitter of this exchange shares the one object the join chose.
   CHECK(build_concat.placement() == placement);
   CHECK(probe_concat.placement() == placement);
+  CHECK_FALSE(probe_concat.passthrough());
 
   // The CONCAT stamps the partition's device on what it emits.
   cucascade::shared_data_repository concat_repo;
@@ -1209,12 +1211,14 @@ TEST_CASE("an empty sizing side installs a single-partition placement", "[physic
 
   // The waiting probe side elects one partition without asking the join (a zero-byte build would
   // otherwise pick BUILD_PROBE, which cannot run without a build batch).
-  bind_partition_inputs(*fixture.hash_join, build_partition, probe_partition, nullptr);
+  bind_partition_inputs(
+    *fixture.hash_join, build_partition, probe_partition, nullptr, false, &probe_concat);
   CHECK_FALSE(probe_partition.get_next_task_hint().has_value());
   auto const placement = fixture.hash_join->placement();
   REQUIRE(placement != nullptr);
   CHECK(*placement == partition_placement::unpinned(1));
   CHECK(probe_concat.placement() == placement);
+  CHECK_FALSE(probe_concat.passthrough());
   CHECK_FALSE(fixture.hash_join->is_build_probe_mode());
 
   // The surviving side's CONCAT retains its partition index without forcing a GPU.
@@ -1508,11 +1512,13 @@ TEST_CASE("CONCAT rejects changing grouping after any input claim", "[physical_c
 TEST_CASE("either partition sibling fixes runtime CONCAT requirements before publishing",
           "[physical_partition][physical_concat]")
 {
-  bool const probe_initiates = GENERATE(false, true);
-  bool const mixed_filter    = GENERATE(false, true);
-  auto* space                = get_shared_mem_space();
-  auto fixture               = create_test_hash_join(duckdb::JoinType::INNER,
-                                                     {duckdb::LogicalType::INTEGER},
+  bool const probe_initiates     = GENERATE(false, true);
+  bool const mixed_filter        = GENERATE(false, true);
+  bool const passthrough_enabled = GENERATE(false, true);
+  bool const probe_whole         = GENERATE(false, true);
+  auto* space                    = get_shared_mem_space();
+  auto fixture                   = create_test_hash_join(duckdb::JoinType::INNER,
+                                                         {duckdb::LogicalType::INTEGER},
                                        sirius::config::DEFAULT_HASH_PARTITION_BYTES,
                                        mixed_filter);
   fixture.hash_join->set_active_gpu_ids({space->get_device_id()});
@@ -1523,7 +1529,7 @@ TEST_CASE("either partition sibling fixes runtime CONCAT requirements before pub
   sirius_physical_partition probe(
     types, 9, sirius::test::operator_utils::hash_partition_spec(*fixture.hash_join, false));
   sirius_physical_concat build_concat(types, 4, false, 1);
-  sirius_physical_concat probe_concat(types, 9, false, 1);
+  sirius_physical_concat probe_concat(types, 9, probe_whole, 1);
   build.add_next_port_after_sink({&build_concat, "input"});
   probe.add_next_port_after_sink({&probe_concat, "input"});
   cucascade::shared_data_repository build_repo;
@@ -1541,10 +1547,14 @@ TEST_CASE("either partition sibling fixes runtime CONCAT requirements before pub
   size_t id = 100;
   number_operator_tree(build, id);
   number_operator_tree(probe, id);
-  bind_partition_inputs(*fixture.hash_join, build, probe, &build_concat);
+  bind_partition_inputs(
+    *fixture.hash_join, build, probe, &build_concat, false, &probe_concat, passthrough_enabled);
   auto& first = probe_initiates ? probe : build;
   REQUIRE(first.get_next_task_input_data() != nullptr);
   CHECK(fixture.hash_join->is_build_probe_mode() == !mixed_filter);
+  CHECK(probe_concat.passthrough() == (passthrough_enabled && !mixed_filter && !probe_whole));
+  CHECK(probe_concat.concat_all() == probe_whole);
+  CHECK_FALSE(build_concat.passthrough());
 
   // Model fragmented partition publication after negotiation, before producer completion.
   cucascade::shared_data_repository concat_repo;
@@ -1794,4 +1804,94 @@ TEST_CASE("sirius_physical_concat counts compressed batches at their decoded siz
   auto hint = concat_op.get_next_task_hint();
   REQUIRE(hint.has_value());
   CHECK(hint->hint == TaskCreationHint::READY);
+}
+
+TEST_CASE("passthrough CONCAT releases singleton batches before producer completion",
+          "[physical_concat][concat_passthrough]")
+{
+  auto* space = get_shared_mem_space();
+  auto const types =
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER});
+  sirius_physical_concat concat(types, 0, false);
+  concat.set_passthrough(true);
+  concat.set_placement(std::make_shared<const partition_placement>(
+    partition_placement::round_robin(3, {space->get_device_id()})));
+  cucascade::shared_data_repository repo;
+  repo.set_num_partitions(3);
+  auto producer = create_unfinished_source_pipeline();
+  attach_concat_port(concat, repo, producer.pipeline);
+
+  auto check_waiting = [&] {
+    auto hint = concat.get_next_task_hint();
+    REQUIRE(hint.has_value());
+    CHECK(hint->hint == TaskCreationHint::WAITING_FOR_INPUT_DATA);
+    CHECK(concat.get_next_task_input_data() == nullptr);
+  };
+  check_waiting();
+  auto first  = make_int32_batch(*space, 4);
+  auto second = make_int32_batch(*space, 2);
+  auto tail   = make_int32_batch(*space, 1);
+  repo.add_data_batch(first, 2);
+  auto forward = [&](std::shared_ptr<data_batch> const& expected) {
+    auto hint = concat.get_next_task_hint();
+    REQUIRE(hint.has_value());
+    CHECK(hint->hint == TaskCreationHint::READY);
+    auto input = concat.get_next_task_input_data();
+    REQUIRE(input != nullptr);
+    auto const& indexed = dynamic_cast<partitioned_operator_data const&>(*input);
+    CHECK(indexed.get_partition_idx() == 2);
+    CHECK(indexed.get_preferred_device_id() == space->get_device_id());
+    CHECK(indexed.get_data_batches() == std::vector<std::shared_ptr<data_batch>>{expected});
+    input->prepare_for_processing(space, default_stream());
+    auto output           = concat.execute(*input, default_stream());
+    auto const& forwarded = dynamic_cast<partitioned_operator_data const&>(*output);
+    CHECK(forwarded.get_data_batches() == indexed.get_data_batches());
+    CHECK(forwarded.get_partition_idx() == indexed.get_partition_idx());
+    CHECK(forwarded.get_preferred_device_id() == indexed.get_preferred_device_id());
+  };
+  forward(first);  // A lone batch must not wait for another batch or producer completion.
+  check_waiting();
+  repo.add_data_batch(second, 2);
+  repo.add_data_batch(tail, 2);
+  forward(second);
+  CHECK(repo.size(2) == 1);
+  producer.pipeline->set_finished(true);
+  forward(tail);
+  CHECK_FALSE(concat.get_next_task_hint().has_value());
+  CHECK(concat.get_next_task_input_data() == nullptr);
+  CHECK_NOTHROW(concat.set_passthrough(true));
+  CHECK_NOTHROW(concat.set_concat_all(false));
+  CHECK_THROWS_AS(concat.set_passthrough(false), std::logic_error);
+  CHECK_THROWS_AS(concat.set_concat_all(true), std::logic_error);
+}
+
+TEST_CASE("whole-partition CONCAT takes precedence over passthrough before claims",
+          "[physical_concat][concat_passthrough]")
+{
+  bool const whole_first = GENERATE(false, true);
+  auto const types =
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER});
+  sirius_physical_concat concat(types, 0, whole_first);
+  concat.set_passthrough(true);
+  if (!whole_first) { concat.set_concat_all(true); }
+  REQUIRE(concat.concat_all());
+  REQUIRE_FALSE(concat.passthrough());
+  concat.set_placement(
+    std::make_shared<const partition_placement>(partition_placement::unpinned(1)));
+  cucascade::shared_data_repository repo;
+  auto producer = create_unfinished_source_pipeline();
+  attach_concat_port(concat, repo, producer.pipeline);
+  repo.add_data_batch(make_int32_batch(*get_shared_mem_space(), 2), 0);
+  repo.add_data_batch(make_int32_batch(*get_shared_mem_space(), 2), 0);
+  CHECK(concat.get_next_task_input_data() == nullptr);
+  auto hint = concat.get_next_task_hint();
+  REQUIRE(hint.has_value());
+  CHECK(hint->hint == TaskCreationHint::WAITING_FOR_INPUT_DATA);
+  producer.pipeline->set_finished(true);
+  auto input = concat.get_next_task_input_data();
+  REQUIRE(input != nullptr);
+  CHECK(dynamic_cast<pipelineable_operator_data&>(*input).get_data_batches().size() == 2);
+  CHECK_NOTHROW(concat.set_passthrough(true));
+  CHECK(concat.concat_all());
+  CHECK_THROWS_AS(concat.set_concat_all(false), std::logic_error);
 }

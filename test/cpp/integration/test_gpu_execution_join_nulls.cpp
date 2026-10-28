@@ -25,6 +25,8 @@
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <utils/gpu_execution_fixture.hpp>
+#include <utils/parquet_fixture_utils.hpp>
+#include <utils/scoped_sirius_setting.hpp>
 
 #include <string>
 
@@ -232,4 +234,45 @@ TEST_CASE_METHOD(JoinNullFixture,
   run_ok("CREATE TABLE tuple_r AS SELECT row(id, k) AS k FROM r");
   run_ok("CHECKPOINT");
   expect_plan_fallback_matches_cpu("SELECT count(*) FROM tuple_l l JOIN tuple_r r ON l.k = r.k");
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "streamed hash-join probes preserve duplicate and NULL results",
+                 "[integration][gpu_execution][join][concat_passthrough]")
+{
+  bool const passthrough = GENERATE(false, true);
+  sirius::test::scoped_sirius_setting const mode{
+    *con, "enable_probe_concat_passthrough", passthrough};
+  sirius::test::scoped_sirius_setting const scan_bytes{
+    *con, "scan_task_batch_size", uint64_t{16384}};
+  sirius::test::scoped_sirius_setting const concat_bytes{
+    *con, "concat_batch_bytes", uint64_t{1048576}};
+  // Keep probe rows intact for SEMI/ANTI/INNER coverage instead of filtering them at the scan.
+  sirius::test::scoped_sirius_setting const filters{*con, "enable_dynamic_filter", false};
+  sirius::test::scratch_dir const dir{"probe_concat_passthrough"};
+  run_ok(
+    "COPY (SELECT i::INTEGER id, CASE WHEN i % 11 = 0 THEN NULL ELSE "
+    "(i % 100)::INTEGER END k FROM range(18000) t(i)) TO " +
+    dir.file_literal("probe.parquet") + " (FORMAT PARQUET, ROW_GROUP_SIZE 2048)");
+  run_ok("CREATE VIEW probe AS SELECT * FROM read_parquet(" + dir.file_literal("probe.parquet") +
+         ")");
+  run_ok(
+    "CREATE TABLE build AS SELECT i::INTEGER id, CASE WHEN i % 7 = 0 THEN NULL ELSE "
+    "(i % 50)::INTEGER END k FROM range(100) t(i)");
+  run_ok("CREATE TABLE empty_build (id INTEGER, k INTEGER)");
+  run_ok("CHECKPOINT");
+  // Several probe scan batches share one small, complete build. Compare full rows so duplicate
+  // multiplicity, unmatched rows, and MARK's three-valued results cannot hide behind aggregates.
+  for (auto const* join : {"JOIN", "LEFT JOIN", "SEMI JOIN", "ANTI JOIN"}) {
+    INFO("join=" << join << " passthrough=" << passthrough);
+    std::string const projection = std::string{join} == "JOIN" || std::string{join} == "LEFT JOIN"
+                                     ? "probe.id, build.id"
+                                     : "probe.id";
+    compare_gpu_vs_cpu("SELECT " + projection + " FROM probe " + join +
+                       " build ON probe.k = build.k");
+    compare_gpu_vs_cpu("SELECT probe.id FROM probe " + std::string{join} +
+                       " empty_build ON probe.k = empty_build.k");
+  }
+  compare_gpu_vs_cpu("SELECT id, k IN (SELECT k FROM build) FROM probe");
+  compare_gpu_vs_cpu("SELECT id, k IN (SELECT k FROM empty_build) FROM probe");
 }

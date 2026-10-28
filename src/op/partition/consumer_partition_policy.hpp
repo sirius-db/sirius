@@ -30,7 +30,9 @@ void bind_partition_inputs(sirius_physical_hash_join& join,
                            sirius_physical_partition& build,
                            sirius_physical_partition& probe,
                            sirius_physical_concat* build_concat,
-                           bool probe_drives = false);
+                           bool probe_drives                    = false,
+                           sirius_physical_concat* probe_concat = nullptr,
+                           bool enable_probe_concat_passthrough = true);
 void bind_partition_inputs(sirius_physical_nested_loop_join& join,
                            sirius_physical_partition& build,
                            sirius_physical_partition& probe);

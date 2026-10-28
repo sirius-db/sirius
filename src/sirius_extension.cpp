@@ -2623,6 +2623,16 @@ static void SetConcatBatchBytes(ClientContext& context, SetScope scope, Value& p
   SIRIUS_LOG_DEBUG("Updated config CONCAT_BATCH_BYTES to {}", params->concat_batch_bytes);
 }
 
+static void SetEnableProbeConcatPassthrough(ClientContext& context,
+                                            SetScope scope,
+                                            Value& parameter)
+{
+  auto* params                            = get_operator_params(context, scope);
+  params->enable_probe_concat_passthrough = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_PROBE_CONCAT_PASSTHROUGH to {}",
+                   params->enable_probe_concat_passthrough);
+}
+
 static void SetCrossJoinTaskBytes(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params                  = get_operator_params(context, scope);
@@ -3322,6 +3332,13 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                     LogicalType::DOUBLE,
                     Value::DOUBLE(operator_defaults.dense_count_join_memory_fraction),
                     SetDenseCountJoinMemoryFraction);
+  add_sirius_option(config,
+                    option_visibility::user,
+                    "enable_probe_concat_passthrough",
+                    "forward probe batches without concatenation for BUILD_PROBE joins",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(operator_defaults.enable_probe_concat_passthrough),
+                    SetEnableProbeConcatPassthrough);
   add_sirius_option(config,
                     option_visibility::internal,
                     "concat_batch_bytes",

@@ -57,7 +57,9 @@ void bind_partition_inputs(sirius_physical_hash_join& join,
                            sirius_physical_partition& build,
                            sirius_physical_partition& probe,
                            sirius_physical_concat* build_concat,
-                           bool probe_drives)
+                           bool probe_drives,
+                           sirius_physical_concat* probe_concat,
+                           bool enable_probe_concat_passthrough)
 {
   build.set_input_barrier(MemoryBarrierType::FULL);
   probe.set_input_barrier(probe_drives ? MemoryBarrierType::FULL : MemoryBarrierType::PARTIAL);
@@ -67,7 +69,8 @@ void bind_partition_inputs(sirius_physical_hash_join& join,
     {&build, &probe},
     probe_drives ? 1 : 0,
     false,
-    [&join, build_concat, probe_drives](auto const& stats, bool empty) {
+    [&join, build_concat, probe_concat, probe_drives, enable_probe_concat_passthrough](
+      auto const& stats, bool empty) {
       auto const& sizing = stats[probe_drives ? 1 : 0];
       partition_sizing_input in{sizing.bytes,
                                 !probe_drives,
@@ -86,6 +89,11 @@ void bind_partition_inputs(sirius_physical_hash_join& join,
                  in.total_bytes < join.max_build_hash_table_bytes()) {
         if (build_concat) { build_concat->set_concat_all(true); }
         build_arrives_whole = build_concat != nullptr;
+      }
+      // Resolve grouping before the exchange publishes either input layout. Broadcast already
+      // implies BUILD_PROBE; the probe CONCAT itself preserves any whole-partition requirement.
+      if (probe_concat) {
+        probe_concat->set_passthrough(enable_probe_concat_passthrough && strategy.build_probe);
       }
       join.set_build_arrives_whole(build_arrives_whole);
       install_placement(join, strategy);

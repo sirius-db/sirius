@@ -113,6 +113,7 @@ sirius:
     max_sort_partition_bytes:   0           # 0 = auto (33% GPU memory)
     hash_partition_bytes:       805306368   # 768 MiB
     concat_batch_bytes:         805306368   # 768 MiB
+    enable_probe_concat_passthrough: true  # stream eligible join probes without concatenation
     max_build_hash_table_bytes: 805306368   # 768 MiB
     enable_dynamic_filter: true    # scan and join-edge runtime filters
     enable_dynamic_filter_multi_partition: true   # Bloom accumulation for multi-partition builds
@@ -600,6 +601,7 @@ individually.
 | `max_sort_partition_bytes` | 0 (auto) | Max bytes per sort partition. Auto = 33% of GPU memory. |
 | `hash_partition_bytes` | Shared physical/effective GPU batch default described above | Target partition size for hash joins and group-bys; must be greater than zero |
 | `concat_batch_bytes` | Shared physical/effective GPU batch default described above | Target output batch size for CONCAT operator |
+| `enable_probe_concat_passthrough` | true | Forward one probe batch at a time for BUILD_PROBE joins, including broadcast. Whole-partition CONCAT requirements take precedence. Disable with `SET enable_probe_concat_passthrough = false` or the corresponding `operator_params` YAML key to restore bounded probe concatenation. |
 | `cross_join_task_bytes` | Shared physical/effective GPU batch default described above | Target output size of each cross product task; a larger pair of input batches is split into tasks over row ranges of the left batch |
 | `sort_sample_bytes` | Shared physical/effective GPU batch default described above | Bytes sampled before computing sort partition boundaries |
 | `max_build_hash_table_bytes` | 2× `hash_partition_bytes` | Max build-side size for BUILD_PROBE join mode |
@@ -622,7 +624,7 @@ individually.
 
 **Note:** `admission_bytes_per_gpu` is a parallelism dial, not a memory budget. Peak GPU residency is bounded by partition sizing (`hash_partition_bytes` and the batch settings), not by the admitted GPU count — a query on fewer GPUs processes more partitions sequentially at roughly unchanged peak memory, trading wall-clock for freed devices. Tune it against how much of the fleet a query should occupy, not against VRAM.
 
-**Note:** `max_build_hash_table_bytes` can be larger than `concat_batch_bytes`. When it is, the partition operator configures CONCAT to concatenate all batches, enabling the more efficient BUILD_PROBE join mode for larger build sides. Other joins (STANDARD, MIXED) still use `concat_batch_bytes` as the batch size threshold.
+**Note:** `max_build_hash_table_bytes` can be larger than `concat_batch_bytes`. When it is, the partition operator configures CONCAT to concatenate all batches, enabling the more efficient BUILD_PROBE join mode for larger build sides. Eligible probe-side CONCATs forward each batch immediately by default, preserving partition and GPU placement. This avoids concat allocations and copies but can increase task and kernel-launch overhead for small batches; disabling `enable_probe_concat_passthrough` restores bounded grouping. The policy is fixed before the first input claim. Other joins (STANDARD, MIXED) still use `concat_batch_bytes` as the batch size threshold.
 
 Runtime distinct-build probing is an internal join policy, not a user configuration choice. It is
 temporarily disabled while the cuCollections defect tracked in #1600 remains unresolved. The

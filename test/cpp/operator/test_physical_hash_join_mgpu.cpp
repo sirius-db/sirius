@@ -674,6 +674,7 @@ TEST_CASE("physical_hash_join - broadcast small-build BUILD_PROBE replicates acr
           "[mgpu][operator-mgpu][hash_join][build_probe][broadcast][gpu_execution][multi_gpu]")
 {
   if (!require_two_gpus()) return;
+  bool const passthrough = GENERATE(false, true);
 
   auto tmp = make_tmp("broadcast-replicate");
   std::error_code ec;
@@ -708,7 +709,11 @@ TEST_CASE("physical_hash_join - broadcast small-build BUILD_PROBE replicates acr
 
   std::map<int, size_t> tasks_per_gpu;
   {
-    auto con = env.make_connection();
+    auto con     = env.make_connection();
+    auto setting = con.Query(std::string{"SET enable_probe_concat_passthrough = "} +
+                             (passthrough ? "true" : "false"));
+    REQUIRE(setting != nullptr);
+    REQUIRE_FALSE(setting->HasError());
     require_gpu_matches_cpu(con, inner_query, /*force_cpu_reference=*/true);
     auto& scheduler = env.get_task_scheduler(con);
     scheduler.visit_executors(
@@ -720,6 +725,7 @@ TEST_CASE("physical_hash_join - broadcast small-build BUILD_PROBE replicates acr
   // The broadcast path engaged: the small build was replicated, not funneled to one GPU.
   INFO("log dir: " << log_dir.path());
   REQUIRE(log_dir_contains(log_dir.path(), "[broadcast]"));
+  CHECK(log_dir_contains(log_dir.path(), "grouping mode PASSTHROUGH") == passthrough);
 
   // Both GPUs built their own hash table from the replicated build and did probe work.
   REQUIRE(tasks_per_gpu.count(0));

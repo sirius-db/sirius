@@ -153,7 +153,8 @@ struct partitioned_join_options {
                             *tree.build_partition,
                             *tree.probe_partition,
                             &tree.join->children[1]->Cast<op::sirius_physical_concat>(),
-                            tree.join->is_right_family());
+                            tree.join->is_right_family(),
+                            &tree.join->children[0]->Cast<op::sirius_physical_concat>());
   sirius::planner::sirius_physical_plan_generator::set_parent_ops(*tree.join, nullptr);
   return tree;
 }

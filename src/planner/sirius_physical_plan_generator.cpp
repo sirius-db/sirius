@@ -1646,18 +1646,23 @@ void wrap_dense_count_join(sirius::op::sirius_physical_operator& dense_count_op,
 }
 
 // Bind the exact wrappers just constructed by this pass. Conversion does not discover roles.
-void bind_wrapped_join(sirius::op::sirius_physical_operator& join_op, bool probe_drives)
+void bind_wrapped_join(sirius::op::sirius_physical_operator& join_op,
+                       bool probe_drives,
+                       bool enable_probe_concat_passthrough)
 {
   if (join_op.children.size() != 2) { throw std::logic_error("partitioned join needs two inputs"); }
   auto& build_concat = join_op.children[1]->Cast<sirius::op::sirius_physical_concat>();
   auto& build        = build_concat.children[0]->Cast<sirius::op::sirius_physical_partition>();
-  auto& probe = join_op.children[0]->children[0]->Cast<sirius::op::sirius_physical_partition>();
+  auto& probe_concat = join_op.children[0]->Cast<sirius::op::sirius_physical_concat>();
+  auto& probe        = probe_concat.children[0]->Cast<sirius::op::sirius_physical_partition>();
   if (join_op.type == sirius::op::SiriusPhysicalOperatorType::HASH_JOIN) {
     sirius::op::bind_partition_inputs(join_op.Cast<sirius::op::sirius_physical_hash_join>(),
                                       build,
                                       probe,
                                       &build_concat,
-                                      probe_drives);
+                                      probe_drives,
+                                      &probe_concat,
+                                      enable_probe_concat_passthrough);
   } else {
     sirius::op::bind_partition_inputs(
       join_op.Cast<sirius::op::sirius_physical_nested_loop_join>(), build, probe);
@@ -1681,7 +1686,7 @@ void wrap_join(sirius::op::sirius_physical_operator& join_op,
     auto const& hash_join = join_op.Cast<sirius::op::sirius_physical_hash_join>();
     probe_drives          = hash_join.is_right_family() && !hash_join.is_delim_join_inner();
   }
-  bind_wrapped_join(join_op, probe_drives);
+  bind_wrapped_join(join_op, probe_drives, op_params.enable_probe_concat_passthrough);
 }
 
 //! Terminate one UNION arm with a `PASSTHROUGH_SINK`. Where a join arm needs `PARTITION -> CONCAT`

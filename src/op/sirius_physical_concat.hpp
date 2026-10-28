@@ -64,7 +64,12 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
   void set_concat_all(bool concat_all);
 
   //! Whether each partition is released as one group once the source pipeline finishes.
-  [[nodiscard]] bool concat_all() const { return _concat_all; }
+  [[nodiscard]] bool concat_all() const { return _mode == grouping_mode::ALL; }
+
+  //! Forward singleton batches immediately unless complete-partition grouping is required.
+  //! Configure before the first claim; ALL takes precedence over passthrough.
+  void set_passthrough(bool enabled);
+  [[nodiscard]] bool passthrough() const { return _mode == grouping_mode::PASSTHROUGH; }
 
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
     const op::input_stats& stats) const override;
@@ -77,7 +82,8 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
    * `_concat_batch_bytes`; the overflowing batch remains for the next group. A batch that exceeds
    * the threshold by itself becomes a single-batch group after another batch arrives or the source
    * pipeline finishes. Finishing the pipeline also releases an under-threshold tail. When
-   * `_concat_all` is set, the complete partition becomes one group after the pipeline finishes.
+   * `ALL` is selected, the complete partition becomes one group after the pipeline finishes.
+   * PASSTHROUGH releases one available batch immediately, even while the producer is running.
    * Known row counts also bound each group by the cuDF row-count limit; a complete partition
    * above that limit is rejected before any batches are claimed or transferred.
    *
@@ -94,8 +100,11 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
     std::size_t partition_idx,
     bool pipeline_finished) const;
 
+  enum class grouping_mode { BOUNDED, ALL, PASSTHROUGH };
+  void set_mode_locked(grouping_mode mode);
+
   bool _input_claimed = false;
-  bool _concat_all;
+  grouping_mode _mode;
   uint64_t _concat_batch_bytes;
 };
 

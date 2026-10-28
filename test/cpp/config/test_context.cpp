@@ -1486,6 +1486,17 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   REQUIRE(settings->Collection().GetValue(21, 0).GetValue<uint64_t>() == 17 * mib);
   REQUIRE(settings->Collection().GetValue(22, 0).GetValue<bool>());
 
+  // The probe CONCAT switch is user-visible and applies to this connection's plan snapshot.
+  REQUIRE(duckdb::session_operator_params(*con.context).enable_probe_concat_passthrough);
+  auto disable_probe_concat = con.Query("SET enable_probe_concat_passthrough = false");
+  REQUIRE(disable_probe_concat != nullptr);
+  REQUIRE_FALSE(disable_probe_concat->HasError());
+  REQUIRE_FALSE(duckdb::session_operator_params(*con.context).enable_probe_concat_passthrough);
+  auto reset_probe_concat = con.Query("RESET enable_probe_concat_passthrough");
+  REQUIRE(reset_probe_concat != nullptr);
+  REQUIRE_FALSE(reset_probe_concat->HasError());
+  REQUIRE(duckdb::session_operator_params(*con.context).enable_probe_concat_passthrough);
+
   for (auto const* invalid_budget : {"-1", "0", "18446744073709551616"}) {
     auto rejected =
       con.Query(std::string{"SET max_dynamic_filter_bloom_bytes_per_gpu = "} + invalid_budget);
