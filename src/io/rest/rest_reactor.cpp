@@ -447,15 +447,8 @@ char const* retention_name(config const& cfg) noexcept
   return cfg.cluster_redirect.retention == redirect_retention::expanded ? "expanded" : "legacy";
 }
 
-bool route_reuse_enabled(config const& cfg) noexcept
-{
-  return cfg.cluster_redirect.enabled &&
-         cfg.cluster_redirect.route_reuse == redirect_route_reuse::same_open;
-}
-
-/// Longest Location stored as an open's route; longer ones are used once and
-/// not kept.
-constexpr std::size_t k_max_route_bytes = 2048;
+using redirect_routes::k_max_route_bytes;
+using redirect_routes::route_reuse_enabled;
 
 char const* route_kind(rest_io_op_request const& request) noexcept
 {
@@ -1047,14 +1040,7 @@ bool rest_reactor::seed_route(io_object const& obj, std::string_view route) noex
   }
   auto const* rest_obj = dynamic_cast<rest_io_object const*>(&obj);
   if (rest_obj == nullptr) { return false; }
-  try {
-    if (!rest_obj->seed_route(std::make_shared<const std::string>(route),
-                              std::weak_ptr<const void>(_ctx))) {
-      return false;
-    }
-  } catch (...) {
-    return false;
-  }
+  if (!rest_obj->try_seed_route(route, std::weak_ptr<const void>(_ctx))) { return false; }
   _route_seeds.fetch_add(1, std::memory_order_relaxed);
   log::log_noexcept(
     [&] { SIRIUS_LOG_DEBUG("rest_reactor: stored storage-node route for {}", obj.object_path()); });
@@ -1935,8 +1921,11 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
 
     // Keep allocating route selection inside the slot's completion/error boundary.
     auto select_route = [&](rest_io_op_request& request) {
-      if (!route_reuse_enabled(_config) || !request.delegated_url.empty() ||
-          request.route_refreshed || request.attempt != 0 || request.auth_attempt != 0) {
+      if (!redirect_routes::first_submission_eligible(_config,
+                                                      request.delegated_url,
+                                                      request.route_refreshed,
+                                                      request.attempt,
+                                                      request.auth_attempt)) {
         return;
       }
       auto const* file = dynamic_cast<rest_io_object const*>(request.op->obj.get());

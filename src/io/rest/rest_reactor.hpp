@@ -19,6 +19,7 @@
 #include "io/cache/types.hpp"
 #include "io/rest/authorizer.hpp"
 #include "io/rest/config.hpp"
+#include "io/rest/redirect_policy.hpp"
 #include "io/rest/types.hpp"
 #include "io/types.hpp"
 
@@ -226,23 +227,19 @@ class rest_io_object : public io_object {
   [[nodiscard]] std::shared_ptr<const std::string> route(
     std::shared_ptr<const void> const& owner) const
   {
-    std::lock_guard lock(_route_mutex);
-    if (_route == nullptr) { return nullptr; }
-    auto const live = _route_owner.lock();
-    return live != nullptr && live == owner ? _route : nullptr;
+    return _routes.route(owner);
   }
   bool seed_route(std::shared_ptr<const std::string> route, std::weak_ptr<const void> owner) const
   {
-    std::lock_guard lock(_route_mutex);
-    if (_route != nullptr) { return false; }
-    _route       = std::move(route);
-    _route_owner = std::move(owner);
-    return true;
+    return _routes.seed_route(std::move(route), std::move(owner));
   }
   void drop_route(std::shared_ptr<const std::string> const& stale) const
   {
-    std::lock_guard lock(_route_mutex);
-    if (_route == stale) { _route.reset(); }
+    _routes.drop_route(stale);
+  }
+  bool try_seed_route(std::string_view route, std::weak_ptr<const void> owner) const noexcept
+  {
+    return _routes.try_seed_route(route, std::move(owner));
   }
 
  private:
@@ -261,9 +258,7 @@ class rest_io_object : public io_object {
   shared_byte_span _stash;
   std::string _etag;
   std::string _cache_id;
-  mutable std::mutex _route_mutex;
-  mutable std::shared_ptr<const std::string> _route;
-  mutable std::weak_ptr<const void> _route_owner;
+  redirect_routes::route_cache _routes;
 };
 
 // ---------------------------------------------------------------------------

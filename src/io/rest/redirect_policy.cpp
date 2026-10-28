@@ -19,6 +19,7 @@
 #include "io/rest/config.hpp"
 
 #include <cctype>
+#include <utility>
 
 namespace sirius::io::rest::redirect_admission {
 namespace {
@@ -92,3 +93,56 @@ redirect_decision evaluate_cluster_redirect(config const& cfg,
 }
 
 }  // namespace sirius::io::rest::redirect_admission
+
+namespace sirius::io::rest::redirect_routes {
+
+snapshot route_cache::route(std::shared_ptr<const void> const& owner) const
+{
+  std::lock_guard lock(_route_mutex);
+  if (_route == nullptr) { return nullptr; }
+  auto const live = _route_owner.lock();
+  return live != nullptr && live == owner ? _route : nullptr;
+}
+
+bool route_cache::seed_route(snapshot route, std::weak_ptr<const void> owner) const
+{
+  std::lock_guard lock(_route_mutex);
+  if (_route != nullptr) { return false; }
+  _route       = std::move(route);
+  _route_owner = std::move(owner);
+  return true;
+}
+
+void route_cache::drop_route(snapshot const& stale) const
+{
+  std::lock_guard lock(_route_mutex);
+  if (_route == stale) { _route.reset(); }
+}
+
+bool route_cache::try_seed_route(std::string_view route,
+                                 std::weak_ptr<const void> owner) const noexcept
+{
+  try {
+    return seed_route(std::make_shared<const std::string>(route), std::move(owner));
+  } catch (...) {
+    return false;
+  }
+}
+
+bool route_reuse_enabled(config const& cfg) noexcept
+{
+  return cfg.cluster_redirect.enabled &&
+         cfg.cluster_redirect.route_reuse == redirect_route_reuse::same_open;
+}
+
+bool first_submission_eligible(config const& cfg,
+                               std::string_view delegated_url,
+                               bool refreshed,
+                               std::size_t attempt,
+                               std::size_t auth_attempt) noexcept
+{
+  return route_reuse_enabled(cfg) && delegated_url.empty() && !refreshed && attempt == 0 &&
+         auth_attempt == 0;
+}
+
+}  // namespace sirius::io::rest::redirect_routes
