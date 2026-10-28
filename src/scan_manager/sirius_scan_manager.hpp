@@ -492,7 +492,8 @@ class sirius_scan_manager {
    * @brief Construct a new scan manager.
    *
    * The scan_manager owns a default ioctx for local paths (@c uring_ioctx with
-   * backend=native, @c kvikio_context with backend=kvikio), built by the
+   * backend=native, @c cufile_ioctx with backend=cufile, or @c kvikio_context
+   * with backend=kvikio), built by the
    * @c cucascade::io::io_context_registry from @p config, plus the backends other
    * paths route to (e.g. the REST ioctx for @c s3://), built lazily on first use.
    * Each ioctx carries its own prefetching cache when @c cache.mode is @c cucs.
@@ -540,8 +541,8 @@ class sirius_scan_manager {
   ///
   /// Registers a NEW per-query state entry keyed by @p query 's id; it does NOT touch any
   /// other query's entry. Call reset(query_id) when the query finishes. A query with no GPU
-  /// scan operators registers no active scan work; it retains only a configured readahead
-  /// subscription, when present, so cleanup can stop it.
+  /// scan operators registers no active scan work or readahead subscription, regardless of
+  /// an explicit readahead budget: no advertised backend can make use of it.
   ///
   /// @param query                           The query whose scan operators must be prepared.
   /// @param enable_pinned_zone_map_pruning  Per-query snapshot of the serve-side pruning flag (the
@@ -875,8 +876,8 @@ class sirius_scan_manager {
                                  std::optional<std::vector<std::string>> const& cols);
 
   /// \brief Process-wide ioctx used to mint @c cucascade::io::datasource instances.
-  ///        Holds a @c uring_ioctx, or a @c kvikio_context when the manager
-  ///        was configured with @c backend=kvikio.
+  ///        Holds the configured local @c uring_ioctx, @c cufile_ioctx, or
+  ///        @c kvikio_context. cuFile and kvikIO are single-GPU only.
   [[nodiscard]] cucascade::io::ioctx* io_ctx() const noexcept { return _io_ctx.get(); }
 
   /// \brief Shared ownership of the process-wide ioctx (see @ref io_ctx), for callers
@@ -1078,7 +1079,8 @@ class sirius_scan_manager {
   /// — including the scan resolver — may pass a raw `file://` / `s3://` URI),
   /// building it once per backend on first use.  Routes by path through the registry
   /// so an `s3://` URI reaches the rest_ioctx even when the local default `_io_ctx`
-  /// is uring/kvikio.  Returns nullptr when no backend supports the path.
+  /// is uring/cufile (kvikIO overrides remote reads too). Returns nullptr when
+  /// no backend supports the path.
   std::shared_ptr<cucascade::io::ioctx> ioctx_for_path(std::string_view path);
 
   /// Resolve the ioctx of @p type, building and caching it on first use (the

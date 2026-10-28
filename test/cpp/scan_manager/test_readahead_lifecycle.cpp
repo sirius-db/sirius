@@ -21,6 +21,7 @@
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
+#include "op/scan/table_scan/scan_contract.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/pipeline_build_context.hpp"
 #include "pipeline/repository_wiring.hpp"
@@ -668,33 +669,25 @@ scan_manager_config config_with_readahead_budget(std::size_t budget)
 }
 }  // namespace
 
-TEST_CASE("a zero readahead budget builds no manager for the query", "[scan_manager][readahead]")
+#ifdef CUCASCADE_HAS_CUFILE
+TEST_CASE("cuFile ignores an explicit readahead budget without an eligible backend",
+          "[scan_manager][readahead][cufile][scan]")
 {
   auto memory   = initialize_memory_manager(1);
   auto topology = single_gpu_index();
   empty_query query;
-
-  // Control: a usable budget does build one, so the check below is about the
-  // budget rather than about the query having nothing to scan.
-  {
-    sirius::exec::query_lifecycle_registry scan_lifecycle;
-    sirius::scan_manager::sirius_scan_manager manager{
-      scan_lifecycle, config_with_readahead_budget(4), *memory, topology};
-    manager.prepare_for_query(query.get(), false, std::vector<int>{0});
-    CHECK(manager.has_readahead_for_testing());
-  }
-
-  // A zero budget must leave it unbuilt.  Building one and merely not starting
-  // its worker still subscribes it to the publisher, which then buffers one
-  // event per deployed task in a mailbox nothing drains -- for the whole query.
-  {
-    sirius::exec::query_lifecycle_registry scan_lifecycle;
-    sirius::scan_manager::sirius_scan_manager manager{
-      scan_lifecycle, config_with_readahead_budget(0), *memory, topology};
-    manager.prepare_for_query(query.get(), false, std::vector<int>{0});
-    CHECK_FALSE(manager.has_readahead_for_testing());
-  }
+  auto config               = config_with_readahead_budget(4);
+  config.backend            = sirius::scan_manager::io_backend::cufile;
+  config.cufile.compat_mode = cucascade::io::cufile::compat::on;
+  config.cufile.use_odirect = false;
+  sirius::exec::query_lifecycle_registry lifecycle;
+  sirius::scan_manager::sirius_scan_manager manager{lifecycle, config, *memory, topology};
+  CHECK_FALSE(manager.io_ctx()->can_use_fs_cache());
+  CHECK(manager.io_ctx()->cache() == nullptr);
+  manager.prepare_for_query(query.get(), false, std::vector<int>{0});
+  CHECK_FALSE(manager.has_readahead_for_testing());
 }
+#endif
 
 TEST_CASE("the kvikIO backend builds no readahead however the cache is configured",
           "[scan_manager][readahead]")
@@ -739,7 +732,7 @@ TEST_CASE("the kvikIO backend builds no readahead however the cache is configure
 //
 // Backend selection only sees the backends serving the query's scan paths, so
 // these need a query with a real scan behind it: an empty query selects no
-// backend at all and reads ahead only on an explicit budget.
+// backend at all and must not build a readahead even with an explicit budget.
 
 namespace {
 
@@ -843,6 +836,94 @@ initialize_memory_manager_too_wide_for_cache()
 
 }  // namespace
 
+TEST_CASE("a zero readahead budget builds no manager for a real local scan",
+          "[scan_manager][readahead]")
+{
+  auto memory   = initialize_memory_manager(1);
+  auto topology = single_gpu_index();
+  for (auto const budget : {0UL, 4UL}) {
+    sirius::exec::query_lifecycle_registry lifecycle;
+    sirius::scan_manager::sirius_scan_manager manager{
+      lifecycle, config_with_readahead_budget(budget), *memory, topology};
+    // The positive control advertises an eligible backend, not an empty query.
+    CHECK(local_scan_reads_ahead(manager, sirius::make_query_id(20 + budget)) == (budget > 0));
+  }
+}
+
+TEST_CASE("an empty query does not subscribe readahead even with an explicit budget",
+          "[scan_manager][readahead]")
+{
+  auto memory = initialize_memory_manager(1);
+  empty_query query;
+  sirius::exec::query_lifecycle_registry lifecycle;
+  sirius::scan_manager::sirius_scan_manager manager{
+    lifecycle, config_with_readahead_budget(4), *memory, single_gpu_index()};
+  manager.prepare_for_query(query.get(), false, std::vector<int>{0});
+  CHECK_FALSE(manager.has_readahead_for_testing());
+}
+
+TEST_CASE("uncached local backends do not subscribe readahead or charge reading transitions",
+          "[scan_manager][readahead][cufile][scan]")
+{
+#ifdef CUCASCADE_HAS_CUFILE
+  auto backend =
+    GENERATE(sirius::scan_manager::io_backend::kvikio, sirius::scan_manager::io_backend::cufile);
+#else
+  auto backend = sirius::scan_manager::io_backend::kvikio;
+#endif
+  CAPTURE(static_cast<int>(backend));
+  auto memory               = initialize_memory_manager(1);
+  auto config               = config_with_readahead_budget(4);
+  config.backend            = backend;
+  config.cufile.compat_mode = cucascade::io::cufile::compat::on;
+  config.cufile.use_odirect = false;
+  auto counters             = std::make_shared<sirius::op::scan::physical_check_counters>();
+  counters->track_units     = true;
+  sirius::test::scoped_recording_log_sink logs{"info"};
+  sirius::exec::query_lifecycle_registry lifecycle;
+  sirius::scan_manager::sirius_scan_manager manager{
+    lifecycle, config, *memory, single_gpu_index(), counters};
+  auto const id = sirius::make_query_id(30);
+  auto query    = make_local_scan_query(id);
+  manager.prepare_for_query(*query.query, false, std::vector<int>{0});
+  REQUIRE_FALSE(manager.has_readahead_for_testing());
+  REQUIRE_FALSE(manager.io_ctx()->can_use_fs_cache());
+
+  std::size_t consumed = 0;
+  auto consumer        = std::async(std::launch::async, [&] {
+    while (auto split = query.scan_op->get_split_connector().get_next_split()) {
+      auto* input = dynamic_cast<sirius::op::scan::scan_operator_input*>(split->get());
+      if (!input) { throw std::runtime_error("expected a real Parquet scan input"); }
+      // These transitions would acquire/release cold-read tickets if an idle
+      // readahead manager had accidentally been installed in the real split.
+      input->update(scan_stage::reading);
+      input->update(scan_stage::disposed);
+      ++consumed;
+    }
+  });
+  try {
+    manager.start_preparation(id);
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    manager.await_query_completion(
+      id, consumer, [&] { return std::chrono::steady_clock::now() >= deadline; });
+  } catch (...) {
+    manager.reset(id);
+    throw;
+  }
+  CHECK(consumed > 0);
+  CHECK_FALSE(manager.has_readahead_for_testing());
+  manager.reset(id);
+  {
+    std::lock_guard lock(counters->units_mutex);
+    CHECK(counters->publications_by_query[sirius::value_of(id)].readahead_registrations.empty());
+  }
+  // No worker/subscription means there is no cold-read ticket accounting or
+  // teardown report even after real consumer reading/disposal transitions.
+  for (auto const& record : logs.records()) {
+    CHECK_FALSE(record.message.starts_with("[readahead]"));
+  }
+}
+
 TEST_CASE("cache.mode os keeps the readahead enabled by configuration", "[scan_manager][readahead]")
 {
   auto memory   = initialize_memory_manager(1);
@@ -883,9 +964,11 @@ TEST_CASE("a requested cache that failed to build turns the readahead off",
   // publishes a budget.
   {
     auto memory = initialize_memory_manager_too_wide_for_cache();
+    auto config = config_with_uring_budget(cache_mode::cucs);
+    // An explicit override cannot bypass the failed requested-cache gate.
+    config.max_readahead_scans = 4;
     sirius::exec::query_lifecycle_registry scan_lifecycle;
-    sirius::scan_manager::sirius_scan_manager manager{
-      scan_lifecycle, config_with_uring_budget(cache_mode::cucs), *memory, topology};
+    sirius::scan_manager::sirius_scan_manager manager{scan_lifecycle, config, *memory, topology};
     REQUIRE(manager.io_ctx()->can_use_fs_cache());
     REQUIRE(manager.io_ctx()->cache() == nullptr);
     CHECK_FALSE(local_scan_reads_ahead(manager, sirius::make_query_id(5)));
