@@ -287,6 +287,54 @@ static void from_yaml(const YAML::Node& node, cucascade::io::uring::config& opt)
   r.reject_unknown();
 }
 
+static void from_yaml(const YAML::Node& node, cucascade::io::cufile::config& opt)
+{
+  yaml::reader r(node, "cufile");
+  auto count = [&](char const* key, std::size_t& out, bool positive = false) {
+    std::optional<std::int64_t> value;
+    r.optional(key, value);
+    if (!value) { return; }
+    if (*value < 0 || (positive && *value == 0)) {
+      throw std::runtime_error("'cufile." + std::string(key) + "': must be " +
+                               (positive ? "positive" : "nonnegative"));
+    }
+    out = static_cast<std::size_t>(*value);
+  };
+  if (r.has("n_max_concurrent_scans")) {
+    throw std::runtime_error(
+      "'cufile.n_max_concurrent_scans': not configurable; cuFile cannot "
+      "use fs_cache or scan readahead (use cufile_n_reactors and "
+      "cufile.max_inflight for read concurrency)");
+  }
+  count("max_inflight", opt.max_inflight, true);
+  count("poll_interval_us", opt.poll_interval_us);
+  count("low_service_interval", opt.low_service_interval);
+  r.optional("max_op_bytes", yaml::bytes(opt.max_op_bytes));
+  if (opt.max_op_bytes < cucascade::io::IO_BLOCK_SIZE) {
+    throw std::runtime_error("'cufile.max_op_bytes': must be at least 4 KiB");
+  }
+  r.optional("gds_threshold", yaml::bytes(opt.gds_threshold));
+  r.optional("use_odirect", opt.use_odirect);
+  std::optional<std::string> compat;
+  r.optional("compat_mode", compat);
+  if (compat) {
+    if (*compat == "auto") {
+      opt.compat_mode = cucascade::io::cufile::compat::automatic;
+    } else if (*compat == "on") {
+      opt.compat_mode = cucascade::io::cufile::compat::on;
+    } else if (*compat == "off") {
+      opt.compat_mode = cucascade::io::cufile::compat::off;
+    } else {
+      throw std::runtime_error("'cufile.compat_mode': invalid enum value '" + *compat +
+                               "' (expected auto, on or off)");
+    }
+  }
+  if (!opt.use_odirect && opt.compat_mode == cucascade::io::cufile::compat::off) {
+    throw std::runtime_error("'cufile.use_odirect': false conflicts with cufile.compat_mode=off");
+  }
+  r.reject_unknown();
+}
+
 static void from_yaml(const YAML::Node& node, cucascade::io::kvikio_config& opt)
 {
   yaml::reader r(node, "kvikio");
@@ -410,11 +458,17 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   r.optional("max_concurrent_queries", opt.max_concurrent_queries, yaml::greater_than<int>{0});
   r.optional("uring_n_reactors", opt.uring_n_reactors, yaml::greater_than<std::size_t>{0});
   r.optional("rest_n_reactors", opt.rest_n_reactors, yaml::greater_than<std::size_t>{0});
+  {
+    std::int64_t reactors = static_cast<std::int64_t>(opt.cufile_n_reactors);
+    r.optional("cufile_n_reactors", reactors, yaml::greater_than<std::int64_t>{0});
+    opt.cufile_n_reactors = static_cast<std::size_t>(reactors);
+  }
   r.optional("max_readahead_scans", opt.max_readahead_scans);
   r.optional("readahead_strategy", opt.readahead_strategy);
   if (auto n = r.optional_node("uring")) sirius::from_yaml(*n, opt.uring);
   if (auto n = r.optional_node("rest")) sirius::from_yaml(*n, opt.rest);
   if (auto n = r.optional_node("kvikio")) sirius::from_yaml(*n, opt.kvikio);
+  if (auto n = r.optional_node("cufile")) sirius::from_yaml(*n, opt.cufile);
   if (auto n = r.optional_node("cache")) sirius::from_yaml(*n, opt.cache);
   if (auto n = r.optional_node("memory_prefetcher")) from_yaml(*n, opt.memory_prefetcher);
   if (auto n = r.optional_node("preparation")) from_yaml(*n, opt.preparation);
