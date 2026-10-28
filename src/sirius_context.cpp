@@ -1309,6 +1309,12 @@ uint64_t SiriusContext::next_distributed_query(ClientContext& context)
   return query;
 }
 
+void SiriusContext::release_distributed_connection(ClientContext& context)
+{
+  std::lock_guard lock{exchange_mutex_};
+  if (distributed_connection_ == context.GetConnectionId()) { distributed_connection_.reset(); }
+}
+
 uint64_t SiriusContext::distributed_query_of(sirius::query_id_t window)
 {
   std::lock_guard lock{exchange_mutex_};
@@ -2360,6 +2366,7 @@ void SiriusContextExtensionCallback::OnConnectionOpened(ClientContext& context)
 void SiriusContextExtensionCallback::OnConnectionClosed(ClientContext& context)
 {
   SIRIUS_LOG_INFO("Connection closed.");
+  if (context_) { context_->release_distributed_connection(context); }
   // remove the context from the registered state
   context.registered_state->Remove("sirius_state");
   context.registered_state->Remove("sirius_connection_state");
