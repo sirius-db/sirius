@@ -20,6 +20,7 @@
 #include "io/cache/types.hpp"
 #include "io/io_errors.hpp"
 #include "io/rest/rest_reactor.hpp"
+#include "log/logging.hpp"
 
 #include <kvikio/defaults.hpp>
 #include <kvikio/remote_handle.hpp>
@@ -29,6 +30,8 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstring>
 #include <cstdint>
@@ -41,6 +44,7 @@
 #include <string_view>
 #include <tuple>
 #include <utility>
+#include <vector>
 
 namespace sirius::io {
 
@@ -347,14 +351,41 @@ void check_cuda(cudaError_t status)
   return device;
 }
 
+/// Largest merged cache-fill read, matching the REST backend's largest GET segment.
+constexpr std::size_t max_merged_read = 16UL << 20;
+
+/// Running totals of cache-chunk fills and the kvikIO reads that served them,
+/// logged at most every 30 s.  Every kvikIO read wakes all of kvikIO's reactor
+/// threads, so the reads-per-fill ratio is what merging is meant to drive down.
+void note_fill_reads(std::size_t fills, std::size_t reads) noexcept
+{
+  static std::atomic<std::uint64_t> total_fills{0};
+  static std::atomic<std::uint64_t> total_reads{0};
+  static std::atomic<std::int64_t> last_log_s{0};
+  auto const f   = total_fills.fetch_add(fills, std::memory_order_relaxed) + fills;
+  auto const r   = total_reads.fetch_add(reads, std::memory_order_relaxed) + reads;
+  auto const now = std::chrono::duration_cast<std::chrono::seconds>(
+                     std::chrono::steady_clock::now().time_since_epoch())
+                     .count();
+  auto last = last_log_s.load(std::memory_order_relaxed);
+  if (now - last >= 30 && last_log_s.compare_exchange_strong(last, now)) {
+    SIRIUS_LOG_INFO(
+      "kvikio_context: cache fills so far: {} chunk fills served by {} kvikIO reads", f, r);
+  }
+}
+
 /// One batch handed to @c mixed_readv_async_io, from issue to completion.
 struct readv_batch {
   std::vector<prepared_io_slice> slices;
   /// The reads started for each slice: one for a contiguous or device
-  /// destination, one per cache chunk for a fragmented one.
+  /// destination.  Cache-chunk fills are read through @c fills instead.
   std::vector<std::vector<std::future<std::size_t>>> reads;
   /// Bytes each slice's reads must return in total.
   std::vector<std::size_t> expected;
+  /// One read per run of cache-chunk fills that are back to back both in the
+  /// object and in host memory, from any of the batch's slices, and the bytes
+  /// it must return.
+  std::vector<std::pair<std::future<std::size_t>, std::size_t>> fills;
   exec::promise<size_t> promise;
 
   /// Wait for every started read: a destination stays in use until its read finishes.
@@ -364,6 +395,9 @@ struct readv_batch {
       for (auto& read : slice_reads) {
         if (read.valid()) { read.wait(); }
       }
+    }
+    for (auto& [read, bytes] : fills) {
+      if (read.valid()) { read.wait(); }
     }
   }
 
@@ -413,6 +447,20 @@ exec::semi_future<size_t> kvikio_context::mixed_readv_async_io(
     // Start every host and cache read now, before waiting on anything, so
     // kvikIO serves them concurrently.  Reads straight into the device start
     // in the settle task below: they first wait for their destination streams.
+    //
+    // Cache-chunk fills are gathered across all slices first.  The prefetching
+    // cache hands over one slice per chunk, and every kvikIO read wakes all of
+    // kvikIO's reactor threads, so one read per chunk costs far more than the
+    // bytes it moves.  Fills that are back to back in the object and in host
+    // memory (chunks allocated together usually are) are read with one kvikIO
+    // read of up to max_merged_read bytes, as the REST backend reads a slice's
+    // back-to-back fills with one GET.
+    struct chunk_fill_piece {
+      std::size_t lo;
+      std::size_t hi;
+      std::uint8_t* dst;
+    };
+    std::vector<chunk_fill_piece> pieces;
     for (std::size_t i = 0; i < batch->slices.size(); ++i) {
       auto& slice      = batch->slices[i];
       auto& reads      = batch->reads[i];
@@ -433,9 +481,7 @@ exec::semi_future<size_t> kvikio_context::mixed_readv_async_io(
           if (chunk->data == nullptr) {
             throw std::runtime_error("kvikio_context: cache chunk has no buffer");
           }
-          reads.push_back(
-            object->read_async(chunk->data + (fill_lo - chunk->offset), hi - fill_lo, fill_lo));
-          batch->expected[i] += hi - fill_lo;
+          pieces.push_back({fill_lo, hi, chunk->data + (fill_lo - chunk->offset)});
         }
       } else if (slice.is_contiguous()) {
         // Host destination, copied on to the device afterwards when requested.
@@ -448,6 +494,19 @@ exec::semi_future<size_t> kvikio_context::mixed_readv_async_io(
         throw std::invalid_argument("prepared slice has no destination");
       }
     }
+
+    std::sort(pieces.begin(), pieces.end(), [](auto const& a, auto const& b) { return a.lo < b.lo; });
+    std::size_t run = 0;
+    for (std::size_t p = 1; p <= pieces.size(); ++p) {
+      bool const extends = p < pieces.size() && pieces[p].lo == pieces[p - 1].hi &&
+                           pieces[p].dst == pieces[p - 1].dst + (pieces[p - 1].hi - pieces[p - 1].lo) &&
+                           pieces[p].hi - pieces[run].lo <= max_merged_read;
+      if (extends) { continue; }
+      auto const bytes = pieces[p - 1].hi - pieces[run].lo;
+      batch->fills.emplace_back(object->read_async(pieces[run].dst, bytes, pieces[run].lo), bytes);
+      run = p;
+    }
+    note_fill_reads(pieces.size(), batch->fills.size());
   } catch (...) {
     issue_error = std::current_exception();
   }
@@ -494,6 +553,9 @@ exec::semi_future<size_t> kvikio_context::mixed_readv_async_io(
     batch->wait_all();
     std::size_t total = 0;
     try {
+      for (auto& [read, bytes] : batch->fills) {
+        if (read.get() != bytes) { throw std::runtime_error("kvikio_context: short read"); }
+      }
       std::vector<std::pair<int, cudaStream_t>> copied;
       for (std::size_t i = 0; i < batch->slices.size(); ++i) {
         auto& slice      = batch->slices[i];

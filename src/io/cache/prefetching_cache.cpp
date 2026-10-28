@@ -720,6 +720,12 @@ prepare_result prefetching_cache::prepare_request(prefetch_request& req, bool wa
     return prepare_result::fallen_behind;
   }
 
+  // Hand the buffers out in ascending address order (the walk takes them from
+  // the back), so a request's file-adjacent chunks land in adjacent memory
+  // whenever the pool's free list allows it.  The free list returns blocks in
+  // eviction order, and a backend that reads straight into chunk memory can
+  // then fill a run of adjacent chunks with one read instead of one per chunk.
+  std::ranges::sort(buffers, std::ranges::greater{});
   for (auto* c : chunks) {
     if (buffers.empty()) { break; }
     if (c->state.mark_queued()) {
