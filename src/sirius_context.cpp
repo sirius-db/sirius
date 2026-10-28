@@ -53,6 +53,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include <cucascade/io/io_context.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
@@ -74,6 +75,7 @@
 #include <cstddef>
 #include <cstdio>   // for fprintf/fileno (fallback banner)
 #include <cstdlib>  // for std::getenv
+#include <exception>
 #include <filesystem>
 #include <memory>
 #include <optional>
@@ -1069,7 +1071,8 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
 
   // Create the downgrade executors BEFORE task_scheduler, so pointers are available for
   // injection into gpu_pipeline_executors: one per GPU memory space (spills GPU -> HOST/DISK)
-  // and one per HOST memory space (spills HOST -> DISK).
+  // and one per HOST memory space (spills HOST -> DISK). HOST executors also reclaim local
+  // fs_cache staging buffers, even when no DISK spill tier is configured.
   //
   // Per-GPU NUMA-aware downgrade: each GPU's downgrade_executor gets its own copy of
   // downgrade_executor_config with preferred_numa_node populated from
@@ -1131,6 +1134,10 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
   for (auto& executor : downgrade_executors_) {
     executor->set_pipeline_task_queue(task_scheduler_->get_pipeline_task_queue());
   }
+
+  // Only the default local ioctx cache participates in HOST downgrade reclaim. Routed remote
+  // caches are deliberately outside this binding's scope.
+  rebind_fs_cache_on_host_executors();
 
   // Start everything -- downgrade executors deferred until now
   for (auto& executor : downgrade_executors_) {
@@ -1328,6 +1335,63 @@ const sirius::scan_manager::sirius_scan_manager& SiriusContext::get_scan_manager
 {
   throw_if_not_initialized();
   return *scan_manager_;
+}
+
+void SiriusContext::rebind_fs_cache_on_host_executors()
+{
+  auto* io_ctx = scan_manager_ ? scan_manager_->io_ctx() : nullptr;
+  auto* cache  = io_ctx ? io_ctx->cache() : nullptr;
+  for (auto& executor : downgrade_executors_) {
+    if (executor->get_space_id().tier == cucascade::memory::Tier::HOST) {
+      executor->set_fs_cache(cache);
+    }
+  }
+}
+
+void SiriusContext::reset_caches()
+{
+  throw_if_not_initialized();
+
+  std::vector<sirius::parallel::downgrade_executor*> paused;
+  paused.reserve(downgrade_executors_.size());
+  std::exception_ptr reset_error;
+  try {
+    for (auto& executor : downgrade_executors_) {
+      if (executor->get_space_id().tier == cucascade::memory::Tier::HOST) {
+        // Pause first: both processing and monitoring may still be reading the old cache.
+        executor->pause();
+        paused.push_back(executor.get());
+        executor->set_fs_cache(nullptr);
+      }
+    }
+    scan_manager_->reset_caches();
+  } catch (...) {
+    reset_error = std::current_exception();
+  }
+
+  // A rebuild can fail after destroying the old cache. Restore only borrowers this call
+  // successfully paused: a later pause failure leaves the other executors running, with
+  // their original cache still valid. Attempt every rebind and resume on either path.
+  auto* io_ctx = scan_manager_->io_ctx();
+  auto* cache  = io_ctx ? io_ctx->cache() : nullptr;
+  std::exception_ptr restore_error;
+  for (auto* executor : paused) {
+    try {
+      executor->set_fs_cache(cache);
+    } catch (...) {
+      if (!restore_error) { restore_error = std::current_exception(); }
+    }
+  }
+  for (auto* executor : paused) {
+    try {
+      executor->resume();
+    } catch (...) {
+      if (!restore_error) { restore_error = std::current_exception(); }
+    }
+  }
+  if (restore_error) { mark_runtime_unavailable(); }
+  if (reset_error) { std::rethrow_exception(reset_error); }
+  if (restore_error) { std::rethrow_exception(restore_error); }
 }
 
 sirius::vss::cuvs_index_cache& SiriusContext::get_cuvs_index_cache()
