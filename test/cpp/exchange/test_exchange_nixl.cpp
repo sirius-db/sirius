@@ -15,7 +15,7 @@
  */
 
 // The exchange transport over NIXL: two ranks in one process, and (hidden, launched by
-// scripts/exchange_nixl_ranks.sh) one rank per process and GPU.
+// scripts/distributed_test_nixl.sh) one rank per process and GPU.
 
 #include "catch.hpp"
 #include "exchange/nixl_fabric.hpp"
