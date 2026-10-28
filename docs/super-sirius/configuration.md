@@ -179,8 +179,20 @@ Controls the disk spill tier. Data evicted from host memory is written here. Dis
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `disk_id` | int | 0 | Identifier for the disk space. |
-| `capacity_bytes` | bytes | 1Ti | Maximum disk space for spill files. |
+| `capacity_bytes` | bytes | 1Ti | Capacity bound for reservations / in-flight conversions, not a quota on stored spill files. The filesystem must have enough free space. |
 | `downgrade_root_dirs` | string | "" | Directory path for spill files. **Must be set** to enable disk spilling. Use a fast local mount (NVMe preferred). |
+
+Raw and compressed `.hpln` spills use the DISK space's shared `cucascade::io::ioctx`.
+The default is adopted lazily on first conversion and shared process-wide through a weak
+cache. Automatic selection prefers **real GDS via cuFile**, then **usable io_uring**, then
+**cuFile POSIX/staging** if io_uring is unavailable or forbidden. The context owns its
+private staging and reactor teardown; see [DISK I/O and ownership](memory-management.md#disk-io-and-ownership).
+
+The existing `disk_id`, `capacity_bytes`, and `downgrade_root_dirs` keys and spill-file
+layouts are unchanged. There are no additional DISK-backend or per-mount reactor YAML
+settings, and no backend registration is required. `sirius.executor.scan_manager.backend`,
+reactor counts and cache settings configure independent scan contexts, not this spill
+default. The removed kvikIO backend is not available for reads or writes.
 
 ### Input-table compression (`sirius.compression`)
 
@@ -207,7 +219,9 @@ With spill compression on, a GPU batch the downgrade executor moves to the host 
 stored Simpatico-compressed and decoded on its way back to the GPU. Plans are chosen per column
 from its type (see [Memory Management](memory-management.md#spill-compression)); no plan files are
 involved. A batch that does not qualify, saves too little, or fails to encode spills
-uncompressed.
+uncompressed. Compressed DISK spills use the same per-space ioctx as raw spills, with
+unchanged `.hpln` layout. This I/O transport change does not change the settings below or
+the process-wide SQL `spill_compression` semantics.
 
 | Key | DuckDB setting | Type | Default | Description |
 |-----|----------------|------|---------|-------------|
@@ -285,7 +299,10 @@ Each tier is a **YAML sequence** of space configs. Byte fields accept suffixes; 
 |-----|------|---------|-------------|
 | `disk_id` | int | 0 | Identifier for the disk space. |
 | `mount_path` | string | "" | Spill directory. |
-| `memory_capacity` | bytes | space default | Maximum disk space for spill files. |
+| `memory_capacity` | bytes | space default | Reservation / in-flight conversion bound, not a stored-file quota. |
+
+These spaces use the same [lazy DISK I/O default](#disk-memory-siriusmemorydisk),
+independent of the scan contexts; the low-level YAML surface adds no I/O selection knobs.
 
 ```yaml
 sirius:
@@ -337,8 +354,8 @@ Thread pool (default `num_threads: 1`) plus:
 |-----|------|---------|-------------|
 | `monitor_period` | int (ms) | 10 | Period of the memory-pressure monitor loop. Set to `0` to disable the monitor loop entirely. |
 
-HOST downgrade executors synchronously reclaim idle staging chunks from the default local
-ioctx's `fs_cache` before spilling repository batches or queued tasks. If a byte-target request
+HOST downgrade executors synchronously reclaim idle staging chunks from the scan manager's
+default local ioctx's `fs_cache` before spilling repository batches or queued tasks. If a byte-target request
 is still short after those workers finish, a forced pass reclaims additional unpinned,
 non-loading chunks up to the remaining deficit, even if a future scan subscribes to them. That
 includes the chunks of a `pin_table(..., tier => 'parquet')` pin, whatever the eviction settings:
@@ -355,8 +372,8 @@ reservation, it backs off like any other non-viable executor. If the cache holds
 monitor request frees nothing (every chunk above the reservation is pinned by a reader or still
 loading), the monitor waits before its next request: the wait starts at `monitor_period` and
 doubles up to `max(monitor_period, 1 s)`. It resets as soon as a request frees memory or the
-pressure clears. GPU executors and routed remote ioctx caches do not participate. This adds no
-configuration keys.
+pressure clears. GPU executors, independent DISK spill contexts and routed remote ioctx caches
+do not participate. This adds no configuration keys.
 
 ## Scan Manager & IO Configuration
 
