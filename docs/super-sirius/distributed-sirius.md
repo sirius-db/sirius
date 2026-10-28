@@ -129,7 +129,7 @@ its path to every peer at start.
 
 | Mode | Routes | Notes |
 |---|---|---|
-| `hash` | by a hash of the key columns | PARTITION's key casts; its own seed, so PARTITION's split of each rank's share stays even |
+| `hash` | by a hash of the key columns | PARTITION's key casts; its own seed, so PARTITION's split of each rank's share stays even. With `null_keys_to_every_rank`, a row with a NULL in a key column goes to every rank |
 | `range` | by the key columns against world − 1 boundaries | Input batches sorted on the keys; each rank's rows are one sorted run, cut at `lower_bound` as `SORT_PARTITION` cuts |
 | `broadcast` | every row to every rank | |
 | `gather` | every row to one rank | |
@@ -201,6 +201,9 @@ gathered scalar): rank 0 sends its rows by key, and the other ranks' copies of i
 
 A hash join's build side is broadcast when its estimated size is at most 1 GiB and at most the
 probe side's divided by ranks − 1, and when its join type emits build rows only with a probe match.
+A hashed `MARK` join (`IN`, `NOT IN`, `ANY`) sends build rows with a NULL key to every rank: one
+NULL build key makes an unmatched probe row's mark NULL rather than false, on whichever rank that
+row is.
 A nested-loop join refuses the types that emit unmatched build rows (`RIGHT`, `OUTER`,
 `RIGHT_SEMI`, `RIGHT_ANTI`), since every rank holds the whole build.
 
