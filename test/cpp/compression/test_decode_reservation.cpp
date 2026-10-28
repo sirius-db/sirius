@@ -595,7 +595,7 @@ TEST_CASE("compressed converters reject streams on another GPU",
   if (!sirius::test::has_gpus(2)) { return; }
   rmm::cuda_set_device_raii device{rmm::cuda_device_id{0}};
   rmm::cuda_stream stream{rmm::cuda_stream::flags::non_blocking};
-  const_compressed_sources sources{stream.view()};
+  const_compressed_sources sources{stream};
   rmm::cuda_set_device_raii other_device{rmm::cuda_device_id{1}};
   rmm::cuda_stream other_stream{rmm::cuda_stream::flags::non_blocking};
   for (cucascade::idata_representation const* source :
