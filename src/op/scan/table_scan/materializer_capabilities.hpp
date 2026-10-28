@@ -17,12 +17,16 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 
 namespace sirius::op::scan {
+class split_validator;
 enum class materializer_kind : uint8_t { duckdb_native, parquet, iceberg, stream };
 struct materializer_contract_identity {
   materializer_kind kind = materializer_kind::duckdb_native;
   std::string profile;
+  // Selected by trusted planning, never supplied by an input split.
+  std::shared_ptr<split_validator const> validator;
 };
 }  // namespace sirius::op::scan

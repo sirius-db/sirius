@@ -48,6 +48,9 @@ struct scan_envelope {
   std::vector<unit_envelope> units;
   std::vector<uint64_t> retained;
   bool qualified = false;
+  // Output may retain temporary credit while waiting for another scan to run.
+  // Such scans contribute a minimum that admission must not reduce.
+  uint32_t minimum_permits = 0;
 };
 struct admission_decision {
   bool deferred           = false;
@@ -175,7 +178,7 @@ class preparation_ledger {
   ~preparation_ledger() { close(); }
   preparation_ledger(preparation_ledger const&)            = delete;
   preparation_ledger& operator=(preparation_ledger const&) = delete;
-  // Request bounded parallel work; failed large requests back off to one permit.
+  // Request bounded parallel work; smaller grants must preserve scan progress minima.
   admission_decision admit(std::span<scan_envelope const>,
                            memory_space_id,
                            uint32_t max_permits = 1);
@@ -191,6 +194,8 @@ class preparation_ledger {
   void bind_wakeup(preparation_wakeup);
   charging_allocator allocator(w_permit const&);
   uint64_t charged_bytes(unit_key) const;
+  // Live temporary plus retained allocations held by this admitted input.
+  uint64_t charged_bytes(w_permit const&) const;
   uint64_t granted_capacity() const;
   uint32_t permits_in_flight() const;
   uint64_t bound_exceeded() const;

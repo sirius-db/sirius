@@ -1485,3 +1485,72 @@ TEST_CASE("Resource wake handles cannot execute arbitrary throwing cleanup hooks
   }
   REQUIRE_NOTHROW(expired());
 }
+
+TEST_CASE("Admission preserves output-holding scans minimum progress credits",
+          "[scan_preparation][ledger]")
+{
+  test_reservation_provider provider;
+  auto scan            = sample().front();
+  scan.minimum_permits = 1;
+  std::array scans{scan, scan};
+  SECTION("configured limit cannot serialize mutually dependent scans")
+  {
+    preparation_ledger ledger(provider);
+    auto decision = ledger.admit(scans, host, 1);
+    CHECK_FALSE(decision.deferred);
+    CHECK(decision.reason == admission_reason::capacity);
+    CHECK(provider.seen->requests == 0);
+  }
+  SECTION("short grant cannot drop a required permit")
+  {
+    provider.grant_bytes = 103;
+    preparation_ledger ledger(provider);
+    auto decision = ledger.admit(scans, host, 2);
+    CHECK_FALSE(decision.deferred);
+    CHECK(decision.reason == admission_reason::short_grant);
+    CHECK(provider.seen->requests == 1);
+    CHECK(provider.outstanding() == 0);
+  }
+  SECTION("each scan can hold output while another acquires credit")
+  {
+    provider.grant_bytes = 104;
+    preparation_ledger ledger(provider);
+    auto decision = ledger.admit(scans, host, 2);
+    REQUIRE(decision.deferred);
+    CHECK(decision.n_permits == 2);
+    auto a = ledger.try_acquire_unit({1, 0}, 20);
+    auto b = ledger.try_acquire_unit({2, 0}, 20);
+    REQUIRE(a);
+    REQUIRE(b);
+    auto output = ledger.allocator(a).allocate(32);
+    a.release();
+    CHECK(ledger.permits_in_flight() == 2);
+    b.release();
+    auto next = ledger.try_acquire_unit({2, 1}, 0);
+    CHECK(bool(next));
+  }
+}
+
+TEST_CASE("Input accounting includes temporary and retained allocations from its permit",
+          "[scan_preparation][ledger]")
+{
+  test_reservation_provider provider;
+  preparation_ledger ledger(provider);
+  REQUIRE(ledger.admit(sample(), host).deferred);
+  auto permit = ledger.try_acquire_unit({1, 2}, 20);
+  REQUIRE(permit);
+  auto allocator = ledger.allocator(permit);
+  auto temporary = allocator.allocate(8);
+  auto retained  = allocator.allocate_retained(12);
+  CHECK(ledger.charged_bytes(permit) == 20);
+  CHECK(ledger.charged_bytes(unit_key{1, 2}) == 12);
+  temporary.release();
+  CHECK(ledger.charged_bytes(permit) == 12);
+  retained.release();
+  CHECK(ledger.charged_bytes(permit) == 0);
+  preparation_ledger foreign(provider);
+  CHECK_THROWS_AS(foreign.charged_bytes(permit), std::logic_error);
+  ledger.retire_unit({1, 2});
+  permit.release();
+  CHECK_THROWS_AS(ledger.charged_bytes(permit), std::logic_error);
+}
