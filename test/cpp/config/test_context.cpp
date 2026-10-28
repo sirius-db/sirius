@@ -19,6 +19,7 @@
 #include "log/level.hpp"
 #include "log/sink.hpp"
 #include "sirius/ffi.hpp"
+#include "sirius_config.hpp"
 #include "sirius_context.hpp"
 #include "util/env_guard.hpp"
 #include "utils/log_test_utils.hpp"
@@ -34,6 +35,7 @@
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
+#include <cucascade/io/io_context.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
@@ -45,6 +47,7 @@
 #include <duckdb/main/settings.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
 #include <utils/utils.hpp>
+#include <yaml-cpp/yaml.h>
 
 #include <algorithm>
 #include <array>
@@ -66,6 +69,42 @@
 #include <vector>
 
 namespace {
+YAML::Node remote_spill_context_yaml()
+{
+  return YAML::Load(R"(
+    sirius:
+      topology:
+        num_gpus: 1
+      memory:
+        gpu:
+          usage_limit_bytes: 512MiB
+        host:
+          capacity_bytes: 512MiB
+          initial_number_pools: 1
+        remote:
+          remote_id: 7
+          uri: s3://spill-bucket/context-test
+          capacity_bytes: 1GiB
+          endpoint: http://127.0.0.1:1
+          region: us-west-2
+          signing_mode: header
+          n_reactors: 1
+          staging_bytes: 32MiB
+      executor:
+        task_creator:
+          num_threads: 1
+        pipeline:
+          num_threads: 1
+        downgrade:
+          num_threads: 1
+        scan_manager:
+          num_threads: 1
+          uring_n_reactors: 1
+      telemetry:
+        enable_quent: false
+  )");
+}
+
 // Data integrity guard: FNV-1a checksum over a packed batch payload.
 // Duplicated here because the
 // equivalent helper in test/cpp/downgrade/test_downgrade_executor.cpp lives
@@ -614,6 +653,200 @@ TEST_CASE("Sirius configuration loading from file with configurator",
   REQUIRE_FALSE(telemetry.enable_quent);
   REQUIRE(telemetry.output_directory == "/tmp/sirius_telemetry_config_test");
   REQUIRE(telemetry.engine_name == "sirius_config_test");
+}
+
+TEST_CASE("SiriusContext retains REMOTE spaces without credentials and warns",
+          "[sirius][context][config][remote][isolated_context]")
+{
+  sirius::util::env_guard const access_key{"AWS_ACCESS_KEY_ID", std::nullopt};
+  sirius::util::env_guard const secret_key{"AWS_SECRET_ACCESS_KEY", std::nullopt};
+  sirius::util::env_guard const session_token{"AWS_SESSION_TOKEN", std::nullopt};
+  sirius::util::env_guard const region{"AWS_REGION", std::nullopt};
+  sirius::util::env_guard const default_region{"AWS_DEFAULT_REGION", std::nullopt};
+  sirius::test::scoped_recording_log_sink logs{"warn"};
+
+  duckdb::SiriusContext context;
+  REQUIRE_NOTHROW(
+    context.initialize(sirius::parsed_sirius_config::from_node(remote_spill_context_yaml())));
+
+  auto const& manager = context.get_memory_manager();
+  CHECK(manager.get_all_memory_spaces().size() ==
+        context.get_config().get_memory_space_configs().size());
+  CHECK(manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU).size() == 1);
+  CHECK_FALSE(manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST).empty());
+  CHECK(manager.get_memory_spaces_for_tier(cucascade::memory::Tier::DISK).empty());
+  auto const spaces = manager.get_memory_spaces_for_tier(cucascade::memory::Tier::REMOTE);
+  REQUIRE(spaces.size() == 1);
+  CHECK(spaces.front()->get_device_id() == 7);
+  CHECK(spaces.front()->get_io_context() == nullptr);
+
+  auto const records = logs.records();
+  CHECK(std::any_of(records.begin(), records.end(), [](auto const& record) {
+    return record.level == sirius::log::level::warn &&
+           record.message.find("remote spill disabled") != std::string::npos;
+  }));
+}
+
+TEST_CASE("SiriusContext does not mix partial programmatic credentials with the AWS environment",
+          "[sirius][context][config][remote][isolated_context]")
+{
+  auto const has_access_key = GENERATE(true, false);
+  CAPTURE(has_access_key);
+  sirius::util::env_guard const access_key{"AWS_ACCESS_KEY_ID", "environment-access"};
+  sirius::util::env_guard const secret_key{"AWS_SECRET_ACCESS_KEY", "environment-secret"};
+  sirius::util::env_guard const session_token{"AWS_SESSION_TOKEN", "environment-token"};
+  sirius::util::env_guard const region{"AWS_REGION", std::nullopt};
+  sirius::util::env_guard const default_region{"AWS_DEFAULT_REGION", std::nullopt};
+  sirius::test::scoped_recording_log_sink logs{"warn"};
+
+  cucascade::io::object_store_config object_store;
+  if (has_access_key) {
+    object_store.access_key = "programmatic-access";
+  } else {
+    object_store.secret_key = "programmatic-secret";
+  }
+  duckdb::SiriusContext context;
+  context.get_config().set_object_store_config(object_store);
+  REQUIRE_NOTHROW(
+    context.initialize(sirius::parsed_sirius_config::from_node(remote_spill_context_yaml())));
+
+  auto const spaces =
+    context.get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::REMOTE);
+  REQUIRE(spaces.size() == 1);
+  CHECK(spaces.front()->get_io_context() == nullptr);
+  auto const& retained = context.get_config().get_scan_manager_config().object_store;
+  CHECK(retained.access_key == object_store.access_key);
+  CHECK(retained.secret_key == object_store.secret_key);
+  CHECK(retained.session_token.empty());
+
+  auto const records = logs.records();
+  CHECK(std::any_of(records.begin(), records.end(), [](auto const& record) {
+    return record.level == sirius::log::level::warn &&
+           record.message.find("remote spill disabled") != std::string::npos;
+  }));
+}
+
+TEST_CASE("SiriusContext initializes REMOTE spill with programmatic credentials",
+          "[sirius][context][config][remote][isolated_context]")
+{
+  sirius::util::env_guard const access_key{"AWS_ACCESS_KEY_ID", std::nullopt};
+  sirius::util::env_guard const secret_key{"AWS_SECRET_ACCESS_KEY", std::nullopt};
+  sirius::util::env_guard const session_token{"AWS_SESSION_TOKEN", std::nullopt};
+  sirius::util::env_guard const region{"AWS_REGION", std::nullopt};
+  sirius::util::env_guard const default_region{"AWS_DEFAULT_REGION", std::nullopt};
+  sirius::test::scoped_recording_log_sink logs{"warn"};
+
+  cucascade::io::object_store_config object_store;
+  object_store.endpoint      = "http://127.0.0.1:2";
+  object_store.region        = "us-east-2";
+  object_store.access_key    = "remote-context-access";
+  object_store.secret_key    = "remote-context-secret";
+  object_store.session_token = "remote-context-token";
+  duckdb::SiriusContext context;
+  context.get_config().set_object_store_config(object_store);
+  // Starting the ioctx does not contact the endpoint; no external S3 service is required.
+  REQUIRE_NOTHROW(
+    context.initialize(sirius::parsed_sirius_config::from_node(remote_spill_context_yaml())));
+
+  auto const spaces =
+    context.get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::REMOTE);
+  REQUIRE(spaces.size() == 1);
+  CHECK(spaces.front()->get_device_id() == 7);
+  auto const ioctx = spaces.front()->get_io_context();
+  REQUIRE(ioctx != nullptr);
+  CHECK(ioctx->type() == cucascade::io::io_context_type::restful);
+  CHECK(ioctx->supports_write());
+  CHECK(ioctx->cache() == nullptr);
+
+  // Resolving YAML must not discard the caller's in-memory credentials. The REMOTE
+  // overrides stay separate so unrelated scans retain their original object-store settings.
+  auto const& retained = context.get_config().get_scan_manager_config().object_store;
+  CHECK(retained.access_key == object_store.access_key);
+  CHECK(retained.secret_key == object_store.secret_key);
+  CHECK(retained.session_token == object_store.session_token);
+  CHECK(retained.endpoint == object_store.endpoint);
+  CHECK(retained.region == object_store.region);
+  auto const& remote = context.get_config().get_remote_spill_config();
+  CHECK(remote.endpoint == "http://127.0.0.1:1");
+  CHECK(remote.region == "us-west-2");
+  REQUIRE(remote.signing_mode.has_value());
+  CHECK(*remote.signing_mode == cucascade::io::object_store_config::signing_mode::header);
+
+  auto const records = logs.records();
+  CHECK(std::none_of(records.begin(), records.end(), [](auto const& record) {
+    return record.message.find("remote spill disabled") != std::string::npos;
+  }));
+}
+
+TEST_CASE("SiriusContext initializes REMOTE spill with AWS environment credentials",
+          "[sirius][context][config][remote][isolated_context]")
+{
+  auto const region_source = GENERATE("AWS_REGION", "AWS_DEFAULT_REGION");
+  CAPTURE(region_source);
+  sirius::util::env_guard const access_key{"AWS_ACCESS_KEY_ID", "remote-context-access"};
+  sirius::util::env_guard const secret_key{"AWS_SECRET_ACCESS_KEY", "remote-context-secret"};
+  sirius::util::env_guard const session_token{"AWS_SESSION_TOKEN", "remote-context-token"};
+  sirius::util::env_guard const region{"AWS_REGION", std::nullopt};
+  sirius::util::env_guard const default_region{"AWS_DEFAULT_REGION", std::nullopt};
+  sirius::util::env_guard const selected_region{region_source, "eu-west-1"};
+  sirius::test::scoped_recording_log_sink logs{"warn"};
+
+  auto node = remote_spill_context_yaml();
+  node["sirius"]["memory"]["remote"].remove("region");
+  duckdb::SiriusContext context;
+  REQUIRE_NOTHROW(context.initialize(sirius::parsed_sirius_config::from_node(node)));
+
+  auto const spaces =
+    context.get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::REMOTE);
+  REQUIRE(spaces.size() == 1);
+  auto const ioctx = spaces.front()->get_io_context();
+  REQUIRE(ioctx != nullptr);
+  CHECK(ioctx->type() == cucascade::io::io_context_type::restful);
+  CHECK(ioctx->supports_write());
+  auto const records = logs.records();
+  CHECK(std::none_of(records.begin(), records.end(), [](auto const& record) {
+    return record.message.find("remote spill disabled") != std::string::npos;
+  }));
+}
+
+TEST_CASE("SiriusContext releases REMOTE contexts when later initialization fails",
+          "[sirius][context][config][remote][isolated_context]")
+{
+  auto const fail_at = GENERATE("remote_contexts_attached", "workers_started");
+  auto const retry   = GENERATE(false, true);
+  CAPTURE(fail_at, retry);
+  auto const previous_threshold = cudf::get_allocate_host_as_pinned_threshold();
+  std::weak_ptr<cucascade::io::ioctx> remote_context;
+  {
+    duckdb::SiriusContext context;
+    cucascade::io::object_store_config object_store;
+    object_store.access_key = "rollback-test-access";
+    object_store.secret_key = "rollback-test-secret";
+    context.get_config().set_object_store_config(object_store);
+    context.initialization_hook_for_testing = [&](std::string_view phase, auto const& manager) {
+      if (phase != fail_at) { return; }
+      auto const spaces = manager.get_memory_spaces_for_tier(cucascade::memory::Tier::REMOTE);
+      REQUIRE(spaces.size() == 1);
+      remote_context = spaces.front()->get_io_context();
+      REQUIRE_FALSE(remote_context.expired());
+      throw std::runtime_error("injected late initialization failure");
+    };
+    auto const config = sirius::parsed_sirius_config::from_node(remote_spill_context_yaml());
+    REQUIRE_THROWS_WITH(context.initialize(config),
+                        Catch::Matchers::ContainsSubstring("injected late initialization failure"));
+    CHECK_FALSE(context.is_initialized());
+    // Check before destruction: a failed runtime may stay registered/alive. Both
+    // reactor threads and their private pinned staging must already be released.
+    CHECK(remote_context.expired());
+    CHECK(cudf::get_allocate_host_as_pinned_threshold() == previous_threshold);
+    if (retry) {
+      context.initialization_hook_for_testing = {};
+      REQUIRE_NOTHROW(context.initialize(config));
+      CHECK(context.is_initialized());
+    }
+  }
+  CHECK(remote_context.expired());
+  CHECK(cudf::get_allocate_host_as_pinned_threshold() == previous_threshold);
 }
 
 TEST_CASE("SiriusContext init failure restores the cuDF pinned resource",
