@@ -492,3 +492,52 @@ TEST_CASE("a failed exchange fails the next task of its sources", "[exchange][op
   CHECK_THROWS(source.get_next_task_input_data());
   CHECK_FALSE(source.all_ports_empty());
 }
+
+TEST_CASE("a hash exchange with null keys to every rank sends rows with a NULL key to every rank",
+          "[exchange][operators]")
+{
+  ranks c(3);
+  exchange_spec spec;
+  spec.key_columns             = {0};
+  spec.null_keys_to_every_rank = true;
+  constexpr stream_id stream   = 10;
+  std::vector<std::unique_ptr<sirius_physical_exchange_source>> sources;
+  for (rank_t r = 0; r < c.world(); ++r) {
+    sources.push_back(std::make_unique<sirius_physical_exchange_source>(
+      key_value_types(), 0, c.all[r].service, stream, std::set<rank_t>{0, 1, 2}, false));
+  }
+  cudf::size_type nulls_per_batch = 0;
+  for (rank_t r = c.world(); r-- > 0;) {
+    sirius_physical_exchange_sink sink(key_value_types(), 0, c.all[r].service, stream, spec);
+    auto table = std::make_unique<cudf::table>(
+      sirius::get_cudf_table_view(key_value_batch(r, 0)->to_read_only()), utils::default_stream());
+    auto columns = table->release();
+    null_every_seventh(*columns[0], utils::default_stream());
+    nulls_per_batch = columns[0]->null_count();
+    sink_batch(sink, gpu_batch(std::make_unique<cudf::table>(std::move(columns))));
+    sink.finalize_operator();
+  }
+
+  cudf::size_type keyed_total = 0;
+  for (rank_t r = 0; r < c.world(); ++r) {
+    cudf::size_type nulls = 0;
+    auto const deadline   = std::chrono::steady_clock::now() + std::chrono::seconds{60};
+    while (!sources[r]->all_ports_empty()) {
+      REQUIRE(std::chrono::steady_clock::now() < deadline);
+      auto data = sources[r]->get_next_task_input_data();
+      if (!data) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+        continue;
+      }
+      for (auto const& batch :
+           dynamic_cast<pipelineable_operator_data&>(*data).get_data_batches()) {
+        auto const keys = sirius::get_cudf_table_view(batch->to_read_only()).column(0);
+        nulls += keys.null_count();
+        keyed_total += keys.size() - keys.null_count();
+      }
+    }
+    CHECK(nulls == nulls_per_batch * static_cast<cudf::size_type>(c.world()));
+  }
+  CHECK(keyed_total ==
+        (rows_per_batch - nulls_per_batch) * static_cast<cudf::size_type>(c.world()));
+}

@@ -159,13 +159,15 @@ struct rewriter {
 
   /// A hash exchange on @p partition's keys, between it and its input. An input on rank 0 alone
   /// (a gathered aggregate) is spread from there; the other ranks' copies of it hold no rows.
-  placement hash_below(op::sirius_physical_operator& partition_node)
+  placement hash_below(op::sirius_physical_operator& partition_node,
+                       bool null_keys_to_every_rank = false)
   {
     auto& partition = expect(partition_node, T::PARTITION).Cast<op::sirius_physical_partition>();
     visit(partition.children[0]);
     exchange_spec spec;
-    spec.key_columns    = partition.partition_keys();
-    spec.key_cast_types = partition.specification().key_cast_types;
+    spec.key_columns             = partition.partition_keys();
+    spec.key_cast_types          = partition.specification().key_cast_types;
+    spec.null_keys_to_every_rank = null_keys_to_every_rank;
     insert(partition.children[0], std::move(spec), false);
     return placement::spread;
   }
@@ -228,9 +230,11 @@ struct rewriter {
           return done(probe_rows == placement::rank0 ? placement::rank0 : placement::spread);
         }
         merge_filters_across_ranks(join);
-        // Each side's rows meet their matches once both are exchanged on the join keys.
+        // Each side's rows meet their matches once both are exchanged on the join keys. A MARK
+        // join's NULL build keys match nothing yet turn a missed probe row's mark NULL, so every
+        // rank needs them.
         hash_below(probe);
-        hash_below(build);
+        hash_below(build, join.join_type == duckdb::JoinType::MARK);
         return done(placement::spread);
       }
 
