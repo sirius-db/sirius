@@ -4686,6 +4686,55 @@ TEST_CASE("fused membership handles empty and all-null hash-set and Bloom builds
   REQUIRE(fused.counts == std::vector<cudf::size_type>{4, 0});
 }
 
+TEST_CASE("fused membership preserves null-safe keys without reviving rejected rows",
+          "[dynamic_filter][fused_membership][null_safe_rf]")
+{
+  auto const kind                    = GENERATE(0, 1, 2);
+  auto const preserve_nulls          = GENERATE(false, true);
+  auto const reject_null_in_residual = GENERATE(false, true);
+  auto const strict_last             = GENERATE(false, true);
+  CAPTURE(kind, preserve_nulls, reject_null_in_residual, strict_last);
+  ::cuda::stream_ref stream = cudf::get_default_stream();
+  auto input                = make_cached_residual_input(
+    40,
+    35,
+    stream,
+    reject_null_in_residual ? std::optional<cudf::size_type>{20} : std::nullopt,
+    20);
+  auto view = cudf::slice(input->view(), std::vector<cudf::size_type>{5, 35}).front();
+  auto keys =
+    make_device_column<int32_t>({7, 12, 20}, cudf::data_type{cudf::type_id::INT32}, stream);
+  auto filter = make_membership_filter(kind, keys->view(), stream);
+  auto* base  = dynamic_cast<sirius::op::sirius_dynamic_filter*>(filter.get());
+  REQUIRE(base != nullptr);
+  base->set_preserve_nulls(preserve_nulls);
+  auto last       = make_membership_filter(kind, keys->view(), stream);
+  auto* last_base = dynamic_cast<sirius::op::sirius_dynamic_filter*>(last.get());
+  REQUIRE(last_base != nullptr);
+  last_base->set_preserve_nulls(preserve_nulls && !strict_last);
+  // Five probes cross the four-probe round boundary. The last filter can reject NULL independently.
+  std::vector<fused_membership_input> steps(4, {filter.get(), view.column(0)});
+  steps.push_back({last.get(), view.column(0)});
+  auto expected = lone_mask(*filter, view.column(0), stream);
+  expected[15]  = preserve_nulls && !reject_null_in_residual;
+  auto const first_count =
+    static_cast<cudf::size_type>(std::count(expected.begin(), expected.end(), 1));
+  auto const last_mask = lone_mask(*last, view.column(0), stream);
+  for (std::size_t i = 0; i < expected.size(); ++i) {
+    expected[i] &= last_mask[i];
+  }
+  auto const fused = run_membership(steps, view.column(1), true, stream);
+  REQUIRE(fused.rounds == 2);
+  REQUIRE(fused.mask == expected);
+  REQUIRE(fused.mask[15] == (preserve_nulls && !strict_last && !reject_null_in_residual));
+  REQUIRE(fused.mask[2] == 1);
+  REQUIRE(fused.mask[7] == 1);
+  std::vector<cudf::size_type> counts{reject_null_in_residual ? 29 : 30};
+  counts.insert(counts.end(), 4, first_count);
+  counts.push_back(static_cast<cudf::size_type>(std::count(expected.begin(), expected.end(), 1)));
+  REQUIRE(fused.counts == counts);
+}
+
 TEST_CASE("fused membership shares signed conversion and sentinel semantics",
           "[dynamic_filter][fused_membership]")
 {
