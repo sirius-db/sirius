@@ -48,6 +48,7 @@ set(TEST_SOURCES
     test/cpp/creator/test_task_creator.cpp
     test/cpp/downgrade/test_downgrade_executor.cpp
     test/cpp/downgrade/test_downgrade_lifecycle.cpp
+    test/cpp/downgrade/test_fs_cache_reclaim.cpp
     test/cpp/downgrade/test_spill_policy.cpp
     test/cpp/exec/test_arrow_result_stream.cpp
     test/cpp/exec/test_batch_stream.cpp

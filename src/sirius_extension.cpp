@@ -1530,7 +1530,7 @@ void SiriusRegistration::ResetSiriusCacheFunction(ClientContext& context,
     // rebuilding a cache creates no per-query runtime state to clean up.
     duckdb::SiriusContext::SlotGuard slot(
       *sirius_ctx, context, sirius::exec::query_admission::access::maintenance);
-    sirius_ctx->get_scan_manager().reset_caches();
+    sirius_ctx->reset_caches();
   }
 
   output.data[0].Append(Value::BOOLEAN(true));
