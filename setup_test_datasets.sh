@@ -2,11 +2,11 @@
 
 cd test_datasets
 
-if [ ! -f tpch-dbgen/s1/customer.tbl ]; then
+if [ ! -f tpch-dbgen/s10/customer.tbl ]; then
     unzip -n tpch-dbgen.zip
     cd tpch-dbgen
     make -f Makefile dbgen
-    ./dbgen -f -s 1 && mkdir -p s1 && mv *.tbl s1
+    ./dbgen -f -s 10 && mkdir -p s10 && mv *.tbl s10
     cd ..
 fi
 

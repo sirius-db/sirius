@@ -285,9 +285,9 @@ jobs:
         run: |
           ./setup_test_datasets.sh
           chmod -R a+r test_datasets/
-          mkdir -p test_datasets/tpch_parquet_sf1
+          mkdir -p test_datasets/tpch_parquet_sf10
           ./sirius-duckdb/build/release/duckdb -f scripts/tpch_to_parquet.sql
-          ./test/tpcds_performance/generate_tpcds_data.sh 1 --format parquet
+          ./test/tpcds_performance/generate_tpcds_data.sh 10 --format parquet
 
       - name: S3 integration tests
         run: make s3-test
@@ -300,13 +300,13 @@ jobs:
         id: tpch
         env:
           SIRIUS_CONFIG_FILE: ${{ github.workspace }}/test/cpp/integration/integration.yaml
-          PARQUET_DIR: ${{ github.workspace }}/test_datasets/tpch_parquet_sf1
+          PARQUET_DIR: ${{ github.workspace }}/test_datasets/tpch_parquet_sf10
         run: |
-          ./test/tpch_performance/benchmark_and_validate.sh 1
+          ./test/tpch_performance/benchmark_and_validate.sh 10
           RUN_DIR=$(ls -td runs/*/ | head -1)
           echo "run_dir=$RUN_DIR" >> "$GITHUB_OUTPUT"
           {
-            echo "## TPC-H Performance (SF1)"
+            echo "## TPC-H Performance (SF10)"
             echo '```'
             cat "$RUN_DIR/comparison.txt"
             echo '```'
@@ -331,13 +331,13 @@ jobs:
         id: tpcds
         env:
           SIRIUS_CONFIG_FILE: ${{ github.workspace }}/test/cpp/integration/integration.yaml
-          PARQUET_DIR: ${{ github.workspace }}/test_datasets/tpcds_parquet_sf1
+          PARQUET_DIR: ${{ github.workspace }}/test_datasets/tpcds_parquet_sf10
         run: |
-          ./test/tpcds_performance/benchmark_and_validate.sh 1
+          ./test/tpcds_performance/benchmark_and_validate.sh 10
           RUN_DIR=$(ls -td runs/*/ | head -1)
           echo "run_dir=$RUN_DIR" >> "$GITHUB_OUTPUT"
           {
-            echo "## TPC-DS Performance (SF1)"
+            echo "## TPC-DS Performance (SF10)"
             echo '```'
             cat "$RUN_DIR/comparison.txt"
             echo '```'
