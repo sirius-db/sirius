@@ -62,6 +62,13 @@ gpu_pipeline_executor::gpu_pipeline_executor(
     _memory_space(mem_space),
     _downgrade_executor(downgrade_executor)
 {
+  if (config.cpu_affinity_list.empty()) {
+    SIRIUS_LOG_WARN(
+      "GPU Pipeline Executor: GPU {} worker CPU affinity is unspecified (empty CPU list); "
+      "{} workers will retain inherited CPU affinity",
+      mem_space->get_device_id(),
+      config.num_threads);
+  }
 }
 
 gpu_pipeline_executor::~gpu_pipeline_executor() { stop(); }
