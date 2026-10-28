@@ -729,6 +729,45 @@ TEST_CASE("FFI object store scopes remote plans before either entry point binds"
   CHECK(observer.accepted() == 1);  // Only the positive control.
 }
 
+TEST_CASE("FFI object store scopes bare empty and trailing object keys",
+          "[isolated_context][ffi][object_store]")
+{
+  connection_observer observer;
+  observer.positive_control();
+  {
+    object_store_inputs inputs;
+    inputs.endpoint = observer.endpoint();
+    auto context    = make_context_from_config(memory_config(), nullptr);
+    struct scope_case {
+      std::string prefix;
+      std::string path;
+      bool in_scope;
+    };
+    std::vector<scope_case> const cases{
+      {"s3://bucket/", "s3://bucket/", false},
+      {"s3://bucket/", "s3://bucket/allowed/k.parquet", true},
+      {"s3://bucket/allowed/", "s3://bucket/allowed/", false},
+      {"s3://bucket/allowed/", "s3://bucket/allowed/k.parquet", true},
+      {"", "s3://bucket/", true},
+      {"", "s3://bucket/allowed/", true},
+    };
+    for (auto const& item : cases) {
+      inputs.uri_prefix = item.prefix;
+      context->set_object_store(inputs.snapshot());
+      for (auto const entry : {entry_point::execute, entry_point::fragment_build}) {
+        CAPTURE(item.prefix, item.path, entry == entry_point::execute);
+        auto const plan = read_plan({{item.path}});
+        check_refusal([&] { invoke_plan(*context, entry, plan); },
+                      item.in_scope ? "object_store_route_unavailable:" : "object_store_scope:",
+                      item.path);
+      }
+    }
+  }
+  observer.finish();
+  CHECK(observer.error() == 0);
+  CHECK(observer.accepted() == 1);  // Only the positive control.
+}
+
 TEST_CASE("FFI object store refuses remote plans before range validation without network access",
           "[isolated_context][ffi][object_store]")
 {

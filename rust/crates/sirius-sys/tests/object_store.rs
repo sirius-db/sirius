@@ -1,9 +1,40 @@
-// Exercises only the public cxx bridge. Running this test requires one GPU; CI's
+// Exercises only the public cxx bridge. The snapshot test requires one GPU; CI's
 // cargo test --no-run checks that the bridge and the selected Sirius artifact link.
 use cxx::{SharedPtr, let_cxx_string};
 use sirius_sys::{
     ObjectStoreConfigArgs, make_context_from_config_with_object_store, make_object_store_config,
 };
+
+#[test]
+fn object_store_debug_redacts_credentials() {
+    let args = ObjectStoreConfigArgs {
+        endpoint: "https://debug-endpoint.invalid:9443".into(),
+        region: "debug-region".into(),
+        access_key: "AKIA_SENTINEL_7f3a".into(),
+        secret_key: "SECRET_SENTINEL_9b42".into(),
+        session_token: "TOKEN_SENTINEL_c681".into(),
+        transport: "rdma".into(),
+        signing_mode: "header".into(),
+        ca_bundle_path: "/debug-ca-bundle.pem".into(),
+        uri_prefix: "s3://debug-bucket/allowed/".into(),
+    };
+    for rendered in [format!("{args:?}"), format!("{args:#?}")] {
+        for credential in [&args.access_key, &args.secret_key, &args.session_token] {
+            assert!(!rendered.contains(credential.as_str()));
+        }
+        assert_eq!(rendered.matches("<redacted>").count(), 3);
+        for value in [
+            &args.endpoint,
+            &args.region,
+            &args.transport,
+            &args.signing_mode,
+            &args.ca_bundle_path,
+            &args.uri_prefix,
+        ] {
+            assert!(rendered.contains(value.as_str()));
+        }
+    }
+}
 
 #[test]
 fn object_store_snapshot_round_trip() {
