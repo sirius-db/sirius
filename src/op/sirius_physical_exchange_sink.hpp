@@ -53,6 +53,9 @@ struct exchange_spec {
   /// hash: per-key cast before hashing, as PARTITION's; empty = hash as-is.
   std::vector<cudf::data_type> key_cast_types;
   std::uint32_t hash_seed = default_hash_seed;
+  /// hash: a row with a NULL in any key column goes to every rank. A MARK join's build needs
+  /// this: one NULL build key makes every unmatched probe row's mark NULL, on whichever rank.
+  bool null_keys_to_every_rank = false;
   /// range: the order of each key column.
   std::vector<cudf::order> column_order;
   std::vector<cudf::null_order> null_precedence;

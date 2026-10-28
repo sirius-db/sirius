@@ -22,16 +22,61 @@
 #include "op/partition/gpu_partition_impl.hpp"
 #include "sirius/exception.hpp"
 
+#include <cudf/binaryop.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/search.hpp>
+#include <cudf/stream_compaction.hpp>
+#include <cudf/unary.hpp>
 #include <cudf/utilities/error.hpp>
 
 #include <cucascade/data/data_batch.hpp>
 
 #include <algorithm>
+#include <optional>
 #include <utility>
 
 namespace sirius::op {
+namespace {
+
+struct null_key_split {
+  std::shared_ptr<cucascade::data_batch> null_keys;  ///< Rows with a NULL in a key column.
+  std::shared_ptr<cucascade::data_batch> keyed;      ///< The other rows.
+};
+
+/// Splits @p batch by whether a row has a NULL in any of @p key_columns; nullopt when none does.
+std::optional<null_key_split> split_null_keys(cucascade::read_only_data_batch const& batch,
+                                              std::vector<int> const& key_columns,
+                                              ::cuda::stream_ref stream,
+                                              telemetry::batch_telemetry_info const& telemetry)
+{
+  auto const table = get_cudf_table_view(batch);
+  auto const keys  = table.select(key_columns);
+  if (!cudf::has_nulls(keys)) { return std::nullopt; }
+  auto* space = batch.get_memory_space();
+  if (space == nullptr) {
+    throw sirius::internal_exception("exchange sink: the input batch is not resident");
+  }
+  auto const mr = space->get_default_allocator();
+  auto keyed    = cudf::is_valid(keys.column(0), stream, mr);
+  for (cudf::size_type k = 1; k < keys.num_columns(); ++k) {
+    auto const valid = cudf::is_valid(keys.column(k), stream, mr);
+    keyed            = cudf::binary_operation(keyed->view(),
+                                   valid->view(),
+                                   cudf::binary_operator::LOGICAL_AND,
+                                   cudf::data_type{cudf::type_id::BOOL8},
+                                   stream,
+                                   mr);
+  }
+  auto const null_keys =
+    cudf::unary_operation(keyed->view(), cudf::unary_operator::NOT, stream, mr);
+  return null_key_split{
+    make_data_batch(
+      cudf::apply_boolean_mask(table, null_keys->view(), stream, mr), *space, stream, telemetry),
+    make_data_batch(
+      cudf::apply_boolean_mask(table, keyed->view(), stream, mr), *space, stream, telemetry)};
+}
+
+}  // namespace
 
 sirius_physical_exchange_sink::sirius_physical_exchange_sink(
   duckdb::vector<sirius::logical_type> types,
@@ -66,6 +111,10 @@ sirius_physical_exchange_sink::sirius_physical_exchange_sink(
   if (_spec.routing == mode::range && (_spec.column_order.size() != _spec.key_columns.size() ||
                                        _spec.null_precedence.size() != _spec.key_columns.size())) {
     throw sirius::invalid_input_exception("exchange sink: range routing needs an order per key");
+  }
+  if (_spec.null_keys_to_every_rank && _spec.routing != mode::hash) {
+    throw sirius::invalid_input_exception(
+      "exchange sink: null keys go to every rank only in hash routing");
   }
   if (_spec.routing == mode::gather && _spec.target >= _service->world_size()) {
     throw sirius::invalid_input_exception(
@@ -103,7 +152,22 @@ std::unique_ptr<operator_data> sirius_physical_exchange_sink::execute(
   for (std::size_t b = 0; b < handles.size(); ++b) {
     // Nothing to send, and a range exchange's boundaries may not exist when no rank has rows.
     if (get_cudf_table_view(batches[b]).num_rows() == 0) { continue; }
-    auto routed = route(batches[b], handles[b], stream);
+    std::vector<std::shared_ptr<cucascade::data_batch>> routed;
+    auto split = _spec.null_keys_to_every_rank
+                   ? split_null_keys(batches[b], _spec.key_columns, stream, batch_telemetry())
+                   : std::nullopt;
+    if (!split) {
+      routed = route(batches[b], handles[b], stream);
+    } else {
+      for (exchange::rank_t r = 0; r < _service->world_size(); ++r) {
+        slices.push_back(split->null_keys);
+        ranks.push_back(r);
+      }
+      auto const keyed = split->keyed->to_read_only();
+      if (get_cudf_table_view(keyed).num_rows() > 0) {
+        routed = route(keyed, split->keyed, stream);
+      }
+    }
     for (exchange::rank_t r = 0; r < routed.size(); ++r) {
       if (!routed[r] || get_cudf_table_view(*routed[r]).num_rows() == 0) { continue; }
       slices.push_back(std::move(routed[r]));
