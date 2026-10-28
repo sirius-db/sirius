@@ -26,9 +26,11 @@
 #include "op/partition/gpu_partition_impl.hpp"
 #include "op/sirius_physical_exchange_sink.hpp"
 #include "op/sirius_physical_exchange_source.hpp"
+#include "op/sirius_physical_gpu_values.hpp"
 #include "op/sirius_physical_top_n_merge.hpp"
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
 #include "pipeline/sirius_pipeline.hpp"
+#include "planner/distributed_plan.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 
 #include <cudf/column/column_factories.hpp>
@@ -40,6 +42,7 @@
 #include <chrono>
 #include <memory>
 #include <set>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -540,4 +543,39 @@ TEST_CASE("a hash exchange with null keys to every rank sends rows with a NULL k
   }
   CHECK(keyed_total ==
         (rows_per_batch - nulls_per_batch) * static_cast<cudf::size_type>(c.world()));
+}
+
+TEST_CASE("a VALUES source keeps its rows on rank 0 alone", "[exchange][operators]")
+{
+  ranks c(2);
+  auto const query = sirius::make_query_id(42);
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(query);
+  std::vector<cudf::size_type> rows(c.world(), -1);
+  std::vector<std::string> errors(c.world());
+  std::vector<std::thread> threads;
+  for (rank_t r = 0; r < c.world(); ++r) {
+    threads.emplace_back([&, r] {
+      try {
+        duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan =
+          duckdb::make_uniq<sirius::op::sirius_physical_gpu_values>(
+            key_value_types(), 1, /*produce_single_row=*/true);
+        sirius::planner::distribute_plan(plan, c.all[r].service, *env().gpu, 3, lifecycle);
+        auto& values = plan->Cast<sirius::op::sirius_physical_gpu_values>();
+        auto input   = values.get_next_task_input_data();
+        input->prepare_for_processing(env().gpu, utils::default_stream());
+        auto out            = values.execute(*input, utils::default_stream());
+        auto const& batches = dynamic_cast<pipelineable_operator_data&>(*out).get_data_batches();
+        rows[r]             = sirius::get_cudf_table_view(batches.at(0)->to_read_only()).num_rows();
+      } catch (std::exception const& e) {
+        errors[r] = e.what();
+      }
+    });
+  }
+  for (auto& t : threads) {
+    t.join();
+  }
+  CHECK(errors == std::vector<std::string>(c.world()));
+  CHECK(rows[0] == 1);
+  CHECK(rows[1] == 0);
 }

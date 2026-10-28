@@ -24,6 +24,7 @@
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_exchange_sink.hpp"
 #include "op/sirius_physical_exchange_source.hpp"
+#include "op/sirius_physical_gpu_values.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_nested_loop_join.hpp"
@@ -275,6 +276,20 @@ struct rewriter {
 
       // A rank's share of its delim join's DISTINCT (see LEFT_DELIM_JOIN).
       case T::DELIM_SCAN: return done(placement::spread);
+
+      // A literal table (VALUES, or a count DuckDB took from Parquet metadata): every rank planned
+      // the same rows, so rank 0 keeps them and the other ranks emit none.
+      case T::GPU_VALUES: {
+        if (service->rank() != 0) {
+          auto none = duckdb::make_uniq<op::sirius_physical_gpu_values>(
+            node.types, node.estimated_cardinality, /*produce_single_row=*/false);
+          if (node.has_physical_overrides()) {
+            none->set_physical_types(node.get_physical_types());
+          }
+          slot = std::move(none);
+        }
+        return done(placement::rank0);
+      }
 
       case T::NESTED_LOOP_JOIN: {
         // NESTED_LOOP_JOIN → CONCAT → PARTITION → input, probe then build. Every rank keeps its
