@@ -1,7 +1,11 @@
 sirius:
-  space:
+  topology:
+    num_gpus: 1
+  memory:
     gpu:
-      - device_id: 0
-        memory_capacity: 256MiB
+      usage_limit_bytes: 256MiB
+    host:
+      # Four default I/O reactors use 256 MiB of staging; leave room for execution.
+      capacity_bytes: 512MiB
   operator_params:
     hash_partition_bytes: 3MiB

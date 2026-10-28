@@ -49,6 +49,19 @@ using sirius::test::operator_utils::make_numeric_batch;
 
 namespace {
 
+// Model measured INTEGER build metadata; the execution fixtures keep their actual batches tiny.
+partition_sizing_input measured_build_sizing(uint64_t bytes)
+{
+  auto const rows = bytes / sizeof(int32_t);
+  return {.total_bytes          = bytes,
+          .is_build_side        = true,
+          .build_foldable       = true,
+          .combined_total_bytes = bytes,
+          .total_rows           = rows,
+          .measured_rows        = rows,
+          .resident_bytes       = bytes};
+}
+
 memory_space* get_shared_mem_space()
 {
   static auto manager = sirius::test::operator_utils::initialize_memory_manager();
@@ -197,8 +210,7 @@ TEST_CASE("hash_join BUILD_PROBE reclaim - broadcast join with a zero-batch prob
   auto h = make_reclaim_join_harness(duckdb::JoinType::INNER);
 
   // A small build on one GPU sizes as a single-partition broadcast BUILD_PROBE join.
-  auto const strategy = h->hash_join->get_partition_strategy(
-    {/*total_bytes=*/1024, /*is_build_side=*/true, /*build_foldable=*/true});
+  auto const strategy = h->hash_join->get_partition_strategy(measured_build_sizing(1024));
   REQUIRE(strategy.build_probe);
   h->hash_join->set_placement(std::make_shared<const partition_placement>(strategy.placement));
   REQUIRE(strategy.broadcast);
@@ -221,8 +233,8 @@ TEST_CASE("hash_join BUILD_PROBE reclaim - non-broadcast join with a zero-batch 
 
   // A build over the small-table threshold (16 MB/GPU) but under the hash-table budget sizes as
   // a single-partition non-broadcast BUILD_PROBE join.
-  auto const strategy = h->hash_join->get_partition_strategy(
-    {/*total_bytes=*/32ull * 1024 * 1024, /*is_build_side=*/true, /*build_foldable=*/true});
+  auto const strategy =
+    h->hash_join->get_partition_strategy(measured_build_sizing(32ull * 1024 * 1024));
   REQUIRE(strategy.build_probe);
   h->hash_join->set_placement(std::make_shared<const partition_placement>(strategy.placement));
   REQUIRE_FALSE(strategy.broadcast);
@@ -246,8 +258,7 @@ TEST_CASE("hash_join BUILD_PROBE reclaim - all never-probed slots are discarded"
   // Two GPUs and a small build: broadcast BUILD_PROBE with one replicated slot per GPU. With the
   // probe side finished and empty, both replicated build slots are discarded.
   h->hash_join->set_active_gpu_ids({0, 7});
-  auto const strategy = h->hash_join->get_partition_strategy(
-    {/*total_bytes=*/1024, /*is_build_side=*/true, /*build_foldable=*/true});
+  auto const strategy = h->hash_join->get_partition_strategy(measured_build_sizing(1024));
   REQUIRE(strategy.build_probe);
   h->hash_join->set_placement(std::make_shared<const partition_placement>(strategy.placement));
   REQUIRE(strategy.broadcast);
@@ -273,8 +284,7 @@ TEST_CASE("hash_join BUILD_PROBE reclaim - MARK join with a zero-batch probe sid
   auto h = make_reclaim_join_harness(duckdb::JoinType::MARK);
 
   // A small foldable MARK build uses one BUILD_PROBE partition on a single GPU.
-  auto const strategy = h->hash_join->get_partition_strategy(
-    {/*total_bytes=*/1024, /*is_build_side=*/true, /*build_foldable=*/true});
+  auto const strategy = h->hash_join->get_partition_strategy(measured_build_sizing(1024));
   REQUIRE(strategy.build_probe);
   h->hash_join->set_placement(std::make_shared<const partition_placement>(strategy.placement));
   REQUIRE(strategy.num_partitions == 1);
@@ -320,7 +330,7 @@ TEST_CASE("hash_join BUILD_PROBE reclaim safely reclaims HOST and DISK builds wi
   REQUIRE(batch->to_read_only().get_current_tier() == tier);
   std::weak_ptr<cucascade::data_batch> lifetime = batch;
   auto h              = make_reclaim_join_harness(duckdb::JoinType::INNER);
-  auto const strategy = h->hash_join->get_partition_strategy({32ULL << 20, true, true});
+  auto const strategy = h->hash_join->get_partition_strategy(measured_build_sizing(32ULL << 20));
   h->hash_join->set_placement(std::make_shared<const partition_placement>(strategy.placement));
   h->hash_join->push_data_batch_partitioned("build", std::move(batch), 0);
   h->probe_src_pipeline->finished = true;

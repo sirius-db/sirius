@@ -41,6 +41,7 @@
 #include "helper/numeric_narrowing.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
+#include "memory/size_arithmetic.hpp"
 #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/key_preparation.hpp"
@@ -834,16 +835,19 @@ cross_schedule_kind peek_cross_schedule_kind(std::vector<partition_cross_schedul
 }
 
 partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
+                                                        std::optional<uint64_t> total_rows,
                                                         bool is_build_side,
                                                         bool build_foldable,
                                                         std::vector<int> const& active_gpu_ids,
                                                         std::size_t single_partition_rotation,
                                                         uint64_t hash_partition_bytes,
                                                         uint64_t max_build_hash_table_bytes,
+                                                        uint64_t max_build_probe_resident_bytes,
                                                         uint64_t max_broadcast_join_size,
                                                         duckdb::JoinType join_type,
                                                         HASH_JOIN_MODE join_mode,
-                                                        double estimated_probe_to_build_ratio)
+                                                        double estimated_probe_to_build_ratio,
+                                                        std::optional<uint64_t> resident_bytes)
 {
   // Without a GPU list (engine-free tests) plan as a single GPU and leave partitions unpinned.
   int const num_gpus = std::max(1, static_cast<int>(active_gpu_ids.size()));
@@ -877,19 +881,24 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
     total_bytes < small || (total_bytes < max_broadcast_join_size &&
                             estimated_probe_to_build_ratio >= static_cast<double>(num_gpus) * 1.25);
 
-  // BUILD_PROBE eligibility. MARK/SEMI/ANTI are eligible (persistent filtered_join built on the
-  // right, reused across streamed left probe batches); RIGHT_SEMI/RIGHT_ANTI/RIGHT and full OUTER
-  // emit build-side output and stay on the STANDARD path.
-  //
-  // Evaluated at the count BUILD_PROBE would run with — one build table per GPU, capped at
-  // `natural` — not at the natural count: `hash_partition_bytes` targets a streaming batch size
-  // and must not veto `max_build_hash_table_bytes`, which is what sizes the folded hash table.
-  // A broadcast join charges the FULL build to every GPU; a hash-partitioned build charges the
-  // per-GPU average.
+  // Admission sizes one folded build per GPU. Broadcast charges the whole build; otherwise use
+  // rounded-up averages. Hash skew and cuco capacity rounding can exceed these estimates.
   int const build_probe_partitions = std::max(1, std::min(natural, num_gpus));
-  uint64_t const per_gpu_build_bytes =
-    broadcast_candidate ? total_bytes : total_bytes / static_cast<uint64_t>(build_probe_partitions);
-  bool build_probe = per_gpu_build_bytes < max_build_hash_table_bytes && build_foldable &&
+  auto const per_gpu               = [&](uint64_t total) {
+    auto const partitions = static_cast<uint64_t>(build_probe_partitions);
+    return broadcast_candidate ? total : total / partitions + (total % partitions != 0);
+  };
+  uint64_t const per_gpu_build_bytes = per_gpu(resident_bytes.value_or(total_bytes));
+  uint64_t const per_gpu_table_bytes_est =
+    total_rows
+      ? memory::saturating_mul(per_gpu(*total_rows), config::BUILD_PROBE_HASH_TABLE_BYTES_PER_ROW)
+      : std::numeric_limits<uint64_t>::max();
+  // Bounding the full row count prevents an oversized concat even when every key hashes to one
+  // partition. Unknown counts cannot establish either the hash-table estimate or this limit.
+  bool const fold_rows_fit =
+    total_rows && *total_rows <= static_cast<uint64_t>(std::numeric_limits<cudf::size_type>::max());
+  bool build_probe = fold_rows_fit && per_gpu_table_bytes_est < max_build_hash_table_bytes &&
+                     per_gpu_build_bytes < max_build_probe_resident_bytes && build_foldable &&
                      !is_right_family && !is_mixed && !is_full_outer;
 
   bool const broadcast = broadcast_candidate && build_probe;
@@ -946,16 +955,19 @@ partition_strategy sirius_physical_hash_join::get_partition_strategy(
   // Unnumbered operators (unit-test fixtures) have no id to rotate by.
   std::size_t const rotation = operator_id != invalid_operator_id ? operator_id : 0;
   auto const strategy        = compute_hash_join_partition_strategy(in.total_bytes,
+                                                             in.measured_rows,
                                                              in.is_build_side,
                                                              in.build_foldable,
                                                              active_gpu_ids(),
                                                              rotation,
                                                              _hash_partition_bytes,
                                                              _max_build_hash_table_bytes,
+                                                             max_build_probe_resident_bytes,
                                                              _max_broadcast_join_size,
                                                              join_type,
                                                              _join_mode,
-                                                             estimated_probe_to_build_ratio);
+                                                             estimated_probe_to_build_ratio,
+                                                             in.resident_bytes);
 
   // A hash-partitioned MARK build: marks use the join-wide build observation.
   if (join_type == duckdb::JoinType::MARK && in.is_build_side) {
@@ -989,13 +1001,21 @@ partition_strategy sirius_physical_hash_join::get_partition_strategy(
                               : _join_mode == HASH_JOIN_MODE::MIXED_JOIN ? "MIXED_JOIN"
                                                                          : "STANDARD";
 
+  uint64_t const est_table_bytes =
+    in.measured_rows
+      ? memory::saturating_mul(*in.measured_rows, config::BUILD_PROBE_HASH_TABLE_BYTES_PER_ROW)
+      : std::numeric_limits<uint64_t>::max();
   SIRIUS_LOG_DEBUG(
     "sirius_physical_hash_join id {} partition strategy: {} partitions ({} GPUs), build side {} "
-    "bytes. Join Type: {}. Join Mode: {} {}. build_card_est {} probe_card_est {} placement {}",
+    "bytes, {} rows{}, estimated hash table {} bytes. Join Type: {}. Join Mode: {} {}. "
+    "build_card_est {} probe_card_est {} placement {}",
     this->get_operator_id(),
     strategy.num_partitions,
     num_gpus(),
     in.total_bytes,
+    in.measured_rows.value_or(0),
+    (in.measured_rows ? "" : " (rows-unmeasured)"),
+    est_table_bytes,
     duckdb::JoinTypeToString(join_type),
     join_mode_str,
     (strategy.broadcast ? " [broadcast]" : ""),

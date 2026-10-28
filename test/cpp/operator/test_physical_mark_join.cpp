@@ -1288,11 +1288,11 @@ TEST_CASE(
   attach_port("build", *build_repo, build_pipeline);
   attach_port("default", *probe_repo, probe_pipeline);
 
-  // Size the join as the build PARTITION would: a build far over both budgets runs STANDARD at
-  // its natural (multi-partition) count.
+  // Size the join as the build PARTITION would: a build far over the resident budget runs
+  // STANDARD at its natural (multi-partition) count.
   constexpr uint64_t build_bytes = 8 * sirius::config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES;
-  auto const strategy =
-    f.hash_join->get_partition_strategy({build_bytes, true, true, build_bytes, 1000});
+  auto const strategy            = f.hash_join->get_partition_strategy(
+    {build_bytes, true, true, build_bytes, 1000, 1000, build_bytes});
   REQUIRE(strategy.num_partitions >= 3);
   REQUIRE_FALSE(strategy.build_probe);
   REQUIRE_FALSE(strategy.broadcast);
@@ -1408,8 +1408,8 @@ TEST_CASE(
   // is far over the broadcast limit. Tasks run on this test's device; only the sizing is 2-GPU.
   f.hash_join->set_active_gpu_ids({0, 1});
   constexpr uint64_t build_bytes = 2 * sirius::config::DEFAULT_HASH_PARTITION_BYTES;
-  auto const strategy =
-    f.hash_join->get_partition_strategy({build_bytes, true, true, build_bytes, 1000});
+  auto const strategy            = f.hash_join->get_partition_strategy(
+    {build_bytes, true, true, build_bytes, 1000, 1000, build_bytes});
   REQUIRE(strategy.num_partitions == 2);
   REQUIRE(strategy.build_probe);
   REQUIRE_FALSE(strategy.broadcast);

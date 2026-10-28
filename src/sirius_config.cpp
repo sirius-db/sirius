@@ -80,7 +80,8 @@ constexpr batch_setting batch_settings[] = {
   {"concat_batch_bytes", &operator_params::concat_batch_bytes, 1},
   {"cross_join_task_bytes", &operator_params::cross_join_task_bytes, 1},
   {"sort_sample_bytes", &operator_params::sort_sample_bytes, 1},
-  {"max_build_hash_table_bytes", &operator_params::max_build_hash_table_bytes, 2}};
+  {"max_build_hash_table_bytes", &operator_params::max_build_hash_table_bytes, 8},
+  {"max_build_probe_resident_bytes", &operator_params::max_build_probe_resident_bytes, 8}};
 
 }  // namespace
 
@@ -385,6 +386,7 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.optional("cross_join_task_bytes", yaml::bytes(opt.cross_join_task_bytes));
   r.optional("sort_sample_bytes", yaml::bytes(opt.sort_sample_bytes));
   r.optional("max_build_hash_table_bytes", yaml::bytes(opt.max_build_hash_table_bytes));
+  r.optional("max_build_probe_resident_bytes", yaml::bytes(opt.max_build_probe_resident_bytes));
   r.optional("max_broadcast_join_size", yaml::bytes(opt.max_broadcast_join_size));
   r.optional("mark_join_build_switch_ratio",
              opt.mark_join_build_switch_ratio,
@@ -1001,12 +1003,13 @@ try {
       settings._operator_params.*setting.member = defaults.*setting.member;
     }
   }
-  // Unless set explicitly, the BUILD_PROBE threshold is 2x the hash partition size in effect
-  // (explicit or derived) at startup, so tuning hash_partition_bytes in YAML carries the threshold
-  // along with it. `SET hash_partition_bytes` does not re-derive it.
+  // Derive the index budget from the startup partition size, preserving YAML tuning.
+  // The former payload limit was 2x partitions; 4-byte rows need a 4x larger index estimate
+  // (16 bytes/row). The independent resident budget remains batch-derived.
+  // SET hash_partition_bytes does not re-derive either budget.
   if (!is_explicit(&operator_params::max_build_hash_table_bytes)) {
     settings._operator_params.max_build_hash_table_bytes =
-      sirius::memory::saturating_mul(2, settings._operator_params.hash_partition_bytes);
+      sirius::memory::saturating_mul(8, settings._operator_params.hash_partition_bytes);
   }
   settings.finalize_derived_config();
   return settings;

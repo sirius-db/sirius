@@ -116,11 +116,12 @@ struct build_probe_decision {
 /// key, any row) are observed while the build is hash-partitioned, before any probe task runs; see
 /// sirius_physical_hash_join::observe_partitioned_build_batch.
 ///
-/// BUILD_PROBE eligibility requires: the build folds to one hash table per GPU within
-/// `max_build_hash_table_bytes` (a broadcast join charges the FULL build to every GPU; a
-/// hash-partitioned build charges the per-GPU average), the build folds to one batch, and the
-/// join is not right-family, mixed, or full-outer (those over-emit build rows on the streamed
-/// path). `join_mode` distinguishes MIXED_JOIN; `join_type` supplies the rest.
+/// BUILD_PROBE requires measured rows, a full build within cudf::size_type's row limit, and a
+/// build-side CONCAT. Two independent bounds charge each GPU for the estimated cuco table (rows x
+/// config::BUILD_PROBE_HASH_TABLE_BYTES_PER_ROW) and decoded resident payload. Broadcast charges
+/// the full build; hash partitioning charges rounded-up averages, which do not bound hash skew.
+/// Missing rows disable BUILD_PROBE including MARK joins. Right-family, mixed,
+/// and full-outer joins remain STANDARD because streaming would over-emit build rows.
 ///
 /// Broadcast candidacy: a build is replicate-worthy when it is below the small-table threshold, OR
 /// when it is below `max_broadcast_join_size` AND the probe side is large relative to the build
@@ -135,16 +136,19 @@ struct build_probe_decision {
 /// `active_gpu_ids` yields unpinned placements.
 [[nodiscard]] partition_strategy compute_hash_join_partition_strategy(
   uint64_t total_bytes,
+  std::optional<uint64_t> total_rows,
   bool is_build_side,
   bool build_foldable,
   std::vector<int> const& active_gpu_ids,
   std::size_t single_partition_rotation,
   uint64_t hash_partition_bytes,
   uint64_t max_build_hash_table_bytes,
+  uint64_t max_build_probe_resident_bytes,
   uint64_t max_broadcast_join_size,
   duckdb::JoinType join_type,
   HASH_JOIN_MODE join_mode,
-  double estimated_probe_to_build_ratio);
+  double estimated_probe_to_build_ratio,
+  std::optional<uint64_t> resident_bytes = std::nullopt);
 
 /**
  * @brief Select never-probed build slots that can be reclaimed after the probe producer closes.
@@ -307,7 +311,10 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   //! right_rows >= ratio * left_rows; 0 disables. Set from operator_params at planning time.
   double mark_join_build_switch_ratio = config::DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO;
 
-  //! Join Keys statistics (optional)
+  //! Per-GPU cap on the folded build payload a BUILD_PROBE join keeps GPU-resident and
+  //! read-only-locked for the lifetime of its probe stream. Set from operator_params at
+  //! planning time. 0 disables BUILD_PROBE for all joins including MARK.
+  uint64_t max_build_probe_resident_bytes = config::DEFAULT_MAX_BUILD_PROBE_RESIDENT_BYTES;
 
   void restrict_dynamic_filter_replicas(std::vector<int> const& admitted_gpu_ids)
   {

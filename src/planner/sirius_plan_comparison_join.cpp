@@ -702,9 +702,10 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       op_params.hash_partition_bytes,
       op_params.max_broadcast_join_size,
       stats);
-    auto& hj                        = join->Cast<sirius::op::sirius_physical_hash_join>();
-    hj.mark_join_build_switch_ratio = op_params.mark_join_build_switch_ratio;
-    hj.runtime_distinct_build_probe = op_params.enable_runtime_distinct_build_probe;
+    auto& hj                          = join->Cast<sirius::op::sirius_physical_hash_join>();
+    hj.mark_join_build_switch_ratio   = op_params.mark_join_build_switch_ratio;
+    hj.runtime_distinct_build_probe   = op_params.enable_runtime_distinct_build_probe;
+    hj.max_build_probe_resident_bytes = op_params.max_build_probe_resident_bytes;
     hj.set_single_join_error_on_multiple_rows(
       duckdb::Settings::Get<duckdb::ScalarSubqueryErrorOnMultipleRowsSetting>(context));
 
