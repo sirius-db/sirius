@@ -18,9 +18,12 @@
 #include "sirius_config.hpp"
 #include "yaml_reader.hpp"
 
+#include <cucascade/memory/config.hpp>
+#include <cucascade/memory/topology_discovery.hpp>
 #include <yaml-cpp/yaml.h>
 
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
@@ -29,7 +32,9 @@
 #include <new>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <variant>
+#include <vector>
 
 using namespace sirius;
 
@@ -37,6 +42,28 @@ namespace {
 struct allocation_failure {
   static void from_yaml(const YAML::Node&, allocation_failure&) { throw std::bad_alloc(); }
 };
+
+sirius_config resolve_remote_config(const YAML::Node& node)
+{
+  cucascade::memory::system_topology_info topology{};
+  topology.num_gpus       = 1;
+  topology.num_numa_nodes = 1;
+  topology.gpus           = {{.id = 0, .numa_node = 0}};
+  topology.numa_nodes     = {{.id = 0, .memory_capacity = 1ULL << 30, .has_cpus = true}};
+  return parsed_sirius_config::from_node(node).resolve(topology);
+}
+
+std::vector<cucascade::memory::remote_memory_space_config> remote_spaces(
+  const sirius_config& config)
+{
+  std::vector<cucascade::memory::remote_memory_space_config> result;
+  for (const auto& space : config.get_memory_space_configs()) {
+    if (const auto* remote = std::get_if<cucascade::memory::remote_memory_space_config>(&space)) {
+      result.push_back(*remote);
+    }
+  }
+  return result;
+}
 }  // namespace
 
 TEST_CASE("yaml reader preserves allocation failures", "[config_opt][allocation]")
@@ -893,4 +920,326 @@ TEST_CASE("multi-partition dynamic-filter byte budgets reject zero and negative 
   }
   std::error_code ec;
   std::filesystem::remove(path, ec);
+}
+
+TEST_CASE("REMOTE spill is disabled by default and by an empty URI", "[sirius][config][remote]")
+{
+  auto node = YAML::Load("sirius: {}");
+  SECTION("omitted remote configuration") {}
+  SECTION("empty remote configuration")
+  {
+    node["sirius"]["memory"]["remote"] = YAML::Node(YAML::NodeType::Map);
+  }
+  SECTION("explicit empty URI") { node["sirius"]["memory"]["remote"]["uri"] = ""; }
+  SECTION("zero capacity is allowed only while disabled")
+  {
+    node["sirius"]["memory"]["remote"]["uri"]            = "";
+    node["sirius"]["memory"]["remote"]["capacity_bytes"] = 0;
+  }
+
+  auto const config = resolve_remote_config(node);
+  CHECK(remote_spaces(config).empty());
+  auto const& transport = config.get_remote_spill_config();
+  CHECK(transport.endpoint.empty());
+  CHECK(transport.region.empty());
+  CHECK_FALSE(transport.signing_mode.has_value());
+  CHECK(transport.n_reactors == 2);
+  CHECK(transport.staging_bytes == 256ULL * 1024 * 1024);
+}
+
+TEST_CASE("REMOTE high-level YAML resolves an S3 URI with default capacity",
+          "[sirius][config][remote]")
+{
+  auto const uri = GENERATE("s3://spill-bucket", "s3://spill-bucket/spills/run-1");
+  auto node      = YAML::Load("sirius: {}");
+  node["sirius"]["memory"]["remote"]["uri"] = uri;
+
+  auto const config = resolve_remote_config(node);
+  auto const spaces = remote_spaces(config);
+  REQUIRE(spaces.size() == 1);
+  CHECK(spaces.front().remote_id == 0);
+  CHECK(spaces.front().uri_prefix == uri);
+  CHECK(spaces.front().memory_capacity == (1ULL << 50));
+  CHECK(spaces.front().io_context == nullptr);
+}
+
+TEST_CASE("REMOTE YAML normalizes S3 schemes and trailing slashes", "[sirius][config][remote]")
+{
+  auto node = YAML::Load("sirius: {}");
+  SECTION("high-level")
+  {
+    node["sirius"]["memory"]["remote"]["uri"] = "S3://spill-bucket/prefix///";
+  }
+  SECTION("low-level")
+  {
+    node["sirius"]["space"]["remote"] = YAML::Load("[{uri_prefix: 'S3://spill-bucket/prefix///'}]");
+  }
+  auto const config = resolve_remote_config(node);
+  auto const spaces = remote_spaces(config);
+  REQUIRE(spaces.size() == 1);
+  CHECK(spaces.front().uri_prefix == "s3://spill-bucket/prefix");
+}
+
+TEST_CASE("REMOTE high-level YAML preserves transport overrides and byte units",
+          "[sirius][config][remote]")
+{
+  using signing_mode = cucascade::io::object_store_config::signing_mode;
+  auto const mode    = GENERATE("presigned", "header");
+  auto node          = YAML::Load(R"(
+    sirius:
+      memory:
+        remote:
+          remote_id: 7
+          uri: s3://spill-bucket/spills
+          capacity_bytes: 1.5GiB
+          endpoint: http://localhost:8333
+          region: us-west-2
+          n_reactors: 3
+          staging_bytes: 64MiB
+  )");
+  node["sirius"]["memory"]["remote"]["signing_mode"] = mode;
+
+  auto const config = resolve_remote_config(node);
+  auto const spaces = remote_spaces(config);
+  REQUIRE(spaces.size() == 1);
+  CHECK(spaces.front().remote_id == 7);
+  CHECK(spaces.front().uri_prefix == "s3://spill-bucket/spills");
+  CHECK(spaces.front().memory_capacity == 1536ULL * 1024 * 1024);
+  CHECK(spaces.front().io_context == nullptr);
+  auto const& transport = config.get_remote_spill_config();
+  CHECK(transport.endpoint == "http://localhost:8333");
+  CHECK(transport.region == "us-west-2");
+  REQUIRE(transport.signing_mode.has_value());
+  CHECK(*transport.signing_mode ==
+        (std::string(mode) == "header" ? signing_mode::header : signing_mode::presigned));
+  CHECK(transport.n_reactors == 3);
+  CHECK(transport.staging_bytes == 64ULL * 1024 * 1024);
+  CHECK(transport.shutdown_removal_timeout_ms == 10000);
+}
+
+TEST_CASE("REMOTE low-level YAML resolves multiple spaces and default capacity",
+          "[sirius][config][remote]")
+{
+  auto const config = resolve_remote_config(YAML::Load(R"(
+    sirius:
+      space:
+        remote:
+          - uri_prefix: s3://spill-bucket/first
+          - remote_id: 9
+            uri_prefix: s3://other-bucket/second
+            memory_capacity: 48GiB
+  )"));
+  auto const spaces = remote_spaces(config);
+  REQUIRE(spaces.size() == 2);
+  CHECK(spaces[0].remote_id == 0);
+  CHECK(spaces[0].uri_prefix == "s3://spill-bucket/first");
+  CHECK(spaces[0].memory_capacity == (1ULL << 50));
+  CHECK(spaces[0].io_context == nullptr);
+  CHECK(spaces[1].remote_id == 9);
+  CHECK(spaces[1].uri_prefix == "s3://other-bucket/second");
+  CHECK(spaces[1].memory_capacity == 48ULL * 1024 * 1024 * 1024);
+  CHECK(spaces[1].io_context == nullptr);
+  auto const& transport = config.get_remote_spill_config();
+  CHECK(transport.endpoint.empty());
+  CHECK(transport.region.empty());
+  CHECK_FALSE(transport.signing_mode.has_value());
+  CHECK(transport.n_reactors == 2);
+  CHECK(transport.staging_bytes == 256ULL * 1024 * 1024);
+  CHECK(transport.shutdown_removal_timeout_ms == 10000);
+}
+
+TEST_CASE("REMOTE shutdown removal timeout accepts nonnegative milliseconds",
+          "[sirius][config][remote]")
+{
+  auto const timeout = GENERATE(0, 250);
+  auto node          = YAML::Load("sirius: {memory: {remote: {uri: 's3://spill-bucket/spills'}}}");
+  node["sirius"]["memory"]["remote"]["shutdown_removal_timeout_ms"] = timeout;
+  CHECK(resolve_remote_config(node).get_remote_spill_config().shutdown_removal_timeout_ms ==
+        timeout);
+}
+
+TEST_CASE("REMOTE shutdown removal timeout rejects negative milliseconds",
+          "[sirius][config][remote]")
+{
+  auto node = YAML::Load("sirius: {memory: {remote: {uri: 's3://spill-bucket/spills'}}}");
+  node["sirius"]["memory"]["remote"]["shutdown_removal_timeout_ms"] = -1;
+  CHECK_THROWS_WITH(
+    parsed_sirius_config::from_node(node),
+    Catch::Matchers::ContainsSubstring("memory.remote.shutdown_removal_timeout_ms") &&
+      Catch::Matchers::ContainsSubstring("value out of range"));
+}
+
+TEST_CASE("REMOTE YAML participates in global high-level and low-level exclusivity",
+          "[sirius][config][remote]")
+{
+  auto node = YAML::Load("sirius: {}");
+  SECTION("high-level remote excludes every non-empty low-level tier")
+  {
+    auto const uri  = GENERATE("", "s3://spill-bucket/spills");
+    auto const tier = GENERATE("gpu", "host", "disk", "remote");
+    CAPTURE(uri, tier);
+    node["sirius"]["memory"]["remote"]["uri"] = uri;
+    auto space                                = YAML::Load("{}");
+    if (std::string(tier) == "remote") { space["uri_prefix"] = "s3://spill-bucket/low"; }
+    node["sirius"]["space"][tier].push_back(space);
+  }
+  SECTION("low-level remote excludes every other high-level tier")
+  {
+    auto const tier = GENERATE("gpu", "host", "disk");
+    CAPTURE(tier);
+    node["sirius"]["memory"][tier]    = YAML::Node(YAML::NodeType::Map);
+    node["sirius"]["space"]["remote"] = YAML::Load("[{uri_prefix: 's3://spill-bucket/low'}]");
+  }
+
+  CHECK_THROWS_WITH(parsed_sirius_config::from_node(node),
+                    Catch::Matchers::ContainsSubstring("sirius.memory") &&
+                      Catch::Matchers::ContainsSubstring("sirius.space") &&
+                      Catch::Matchers::ContainsSubstring("mutually exclusive"));
+}
+
+TEST_CASE("REMOTE high-level YAML permits empty low-level space lists", "[sirius][config][remote]")
+{
+  auto const config = resolve_remote_config(YAML::Load(R"(
+    sirius:
+      memory:
+        remote:
+          uri: s3://spill-bucket/spills
+      space:
+        gpu: []
+        host: []
+        disk: []
+        remote: []
+  )"));
+  auto const spaces = remote_spaces(config);
+  REQUIRE(spaces.size() == 1);
+  CHECK(spaces.front().uri_prefix == "s3://spill-bucket/spills");
+}
+
+TEST_CASE("REMOTE YAML rejects unknown keys and credential material", "[sirius][config][remote]")
+{
+  auto const field = GENERATE("capacitty_bytes",
+                              "access_key",
+                              "secret_key",
+                              "access_key_id",
+                              "secret_access_key",
+                              "session_token",
+                              "credentials",
+                              "object_store",
+                              "AWS_ACCESS_KEY_ID",
+                              "AWS_SECRET_ACCESS_KEY");
+  CAPTURE(field);
+  auto node = YAML::Load("sirius: {}");
+  SECTION("high-level")
+  {
+    auto remote   = node["sirius"]["memory"]["remote"];
+    remote["uri"] = "s3://spill-bucket/spills";
+    remote[field] = "not-a-credential";
+  }
+  SECTION("low-level")
+  {
+    auto remote   = YAML::Load("{uri_prefix: 's3://spill-bucket/spills'}");
+    remote[field] = "not-a-credential";
+    node["sirius"]["space"]["remote"].push_back(remote);
+  }
+
+  CHECK_THROWS_WITH(parsed_sirius_config::from_node(node),
+                    Catch::Matchers::ContainsSubstring("unknown config key") &&
+                      Catch::Matchers::ContainsSubstring(field));
+}
+
+TEST_CASE("REMOTE low-level YAML rejects high-level transport keys", "[sirius][config][remote]")
+{
+  auto const field = GENERATE("uri",
+                              "capacity_bytes",
+                              "endpoint",
+                              "region",
+                              "signing_mode",
+                              "n_reactors",
+                              "staging_bytes",
+                              "shutdown_removal_timeout_ms");
+  CAPTURE(field);
+  auto node                                   = YAML::Load(R"(
+    sirius:
+      space:
+        remote:
+          - uri_prefix: s3://spill-bucket/spills
+  )");
+  node["sirius"]["space"]["remote"][0][field] = "invalid";
+  CHECK_THROWS_WITH(parsed_sirius_config::from_node(node),
+                    Catch::Matchers::ContainsSubstring("unknown config key") &&
+                      Catch::Matchers::ContainsSubstring(field));
+}
+
+TEST_CASE("REMOTE YAML rejects malformed S3 URIs before topology resolution",
+          "[sirius][config][remote]")
+{
+  auto const uri = GENERATE("https://spill-bucket/spills",
+                            "file:///tmp/spills",
+                            "spill-bucket/spills",
+                            "s3://",
+                            "s3:///spills",
+                            "s3://spill-bucket?query=1",
+                            "s3://spill-bucket#fragment",
+                            "s3://spill-bucket/spills?query=1",
+                            "s3://spill-bucket/spills#fragment",
+                            "s3://user@spill-bucket/spills",
+                            "s3://user:secret@spill-bucket/spills",
+                            "s3://spill-bucket:9000/spills",
+                            "s3://spill bucket/spills",
+                            "s3://spill-bucket/spill path",
+                            " s3://spill-bucket/spills",
+                            "s3://spill-bucket/spills ",
+                            "s3://spill-bucket/spills\tnext",
+                            "s3://spill-bucket/spills\nnext");
+  CAPTURE(uri);
+  auto node = YAML::Load("sirius: {}");
+  SECTION("high-level") { node["sirius"]["memory"]["remote"]["uri"] = uri; }
+  SECTION("low-level")
+  {
+    auto remote          = YAML::Load("{}");
+    remote["uri_prefix"] = uri;
+    node["sirius"]["space"]["remote"].push_back(remote);
+  }
+  CHECK_THROWS_AS(parsed_sirius_config::from_node(node), configuration_input_error);
+}
+
+TEST_CASE("REMOTE high-level YAML rejects invalid capacity and transport values",
+          "[sirius][config][remote]")
+{
+  auto const [field, value] = GENERATE(table<std::string, std::string>({
+    {"remote_id", "-1"},
+    {"remote_id", "1.5"},
+    {"capacity_bytes", "0"},
+    {"capacity_bytes", "-1"},
+    {"capacity_bytes", "-1GiB"},
+    {"n_reactors", "0"},
+    {"n_reactors", "-1"},
+    {"n_reactors", "1.5"},
+    {"staging_bytes", "0"},
+    {"staging_bytes", "-1"},
+    {"staging_bytes", "-1MiB"},
+    {"signing_mode", "anonymous"},
+    {"endpoint", "http://user:secret@localhost:8333"},
+  }));
+  CAPTURE(field, value);
+  auto node = YAML::Load("sirius: {memory: {remote: {uri: 's3://spill-bucket/spills'}}}");
+  node["sirius"]["memory"]["remote"][field] = YAML::Load(value);
+  CHECK_THROWS_WITH(parsed_sirius_config::from_node(node),
+                    Catch::Matchers::ContainsSubstring(field));
+}
+
+TEST_CASE("REMOTE low-level YAML requires a URI and positive capacity", "[sirius][config][remote]")
+{
+  auto const remote = GENERATE("{}",
+                               "{uri_prefix: ''}",
+                               "{uri_prefix: []}",
+                               "{uri_prefix: 's3://spill-bucket', memory_capacity: 0}",
+                               "{uri_prefix: 's3://spill-bucket', memory_capacity: -1}",
+                               "{uri_prefix: 's3://spill-bucket', memory_capacity: -1GiB}",
+                               "{uri_prefix: 's3://spill-bucket', remote_id: -1}",
+                               "{uri_prefix: 's3://spill-bucket', remote_id: 1.5}");
+  CAPTURE(remote);
+  auto node = YAML::Load("sirius: {}");
+  node["sirius"]["space"]["remote"].push_back(YAML::Load(remote));
+  CHECK_THROWS_AS(parsed_sirius_config::from_node(node), configuration_input_error);
 }
