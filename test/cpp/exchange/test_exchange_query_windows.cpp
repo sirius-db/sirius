@@ -57,4 +57,12 @@ TEST_CASE("distributed queries are numbered on one connection and tied to their 
 
   // Another connection's statements would number differently on each rank.
   CHECK_THROWS_AS(ctx->next_distributed_query(*other->context), sirius::invalid_input_exception);
+
+  // Closing the connection hands the role on; numbering continues where it stopped.
+  owner.reset();
+  auto const third = ctx->next_distributed_query(*other->context);
+  CHECK(third == first + 2);
+  auto later =
+    std::make_unique<duckdb::Connection>(sirius::test::g_integration_env->make_connection());
+  CHECK_THROWS_AS(ctx->next_distributed_query(*later->context), sirius::invalid_input_exception);
 }
