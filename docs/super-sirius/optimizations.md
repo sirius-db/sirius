@@ -527,7 +527,7 @@ If translation fails, filtering falls back to `expression_evaluator` on the deco
 - `src/io/io_context.cpp` — `ioctx` cache integration and coverage policy
 - `src/exec/semi_future.hpp` — async I/O completion primitive
 
-**Config:** the `cache` block under `executor.scan_manager` — `mode: sirius` arms it, `eviction` (`lru` / `idle`) picks what retires an idle chunk, and `eviction_threshold_fraction` / `min_prefetching_budget_fraction` size it
+**Config:** the `cache` block under `executor.scan_manager` — `mode: sirius` arms it, `eviction` (`lru` / `idle`) picks what retires an idle chunk, and `max_host_fraction` / `min_prefetching_budget_fraction` size it
 
 ### Load-Balanced Scan Batch Coalescing (PR #997)
 

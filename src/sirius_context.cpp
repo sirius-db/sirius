@@ -1234,6 +1234,14 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
                                                                 physical_counters_);
   scan_manager_->set_query_event_publisher(*query_event_publisher_);
 
+  // Executors take memory back from the prefetching caches before data goes to disk. They are
+  // stopped and destroyed before scan_manager_ in terminate().
+  for (auto& executor : downgrade_executors_) {
+    executor->set_host_memory_releaser([scan_manager = scan_manager_.get()](std::size_t bytes) {
+      return scan_manager->release_idle_cache_memory(bytes);
+    });
+  }
+
   // Wire the pipeline task queue into downgrade executors now that task_scheduler_
   // has been constructed.
   for (auto& executor : downgrade_executors_) {

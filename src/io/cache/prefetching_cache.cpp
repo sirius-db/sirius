@@ -333,7 +333,7 @@ prefetching_cache::prefetching_cache(
   std::shared_ptr<const sirius::memory::topology_index> topology_index)
   : _cfg(cfg),
     _pool(std::make_shared<buffer_pool>(
-      reservation_manager, cfg.min_prefetching_budget_fraction, cfg.eviction_threshold_fraction)),
+      reservation_manager, cfg.min_prefetching_budget_fraction, cfg.max_host_fraction)),
     _io_ctx(io_ctx),
     _topology_index(std::move(topology_index)),
     _armed(_io_ctx->can_use_prefetching_cache()),
@@ -666,10 +666,16 @@ prepare_result prefetching_cache::prepare_request(prefetch_request& req, bool wa
   std::size_t n_chunks_needed = std::ranges::count_if(
     chunks, [](cached_chunk* c) { return c->state.get_state() == chunk_state::empty; });
 
+  // allocate_bulk refuses a request that would cross the pool's hard cap, like
+  // an exhausted pool.  A demand read over its chunks is then served uncached
+  // through reactor-owned staging.
   int numa_allocated = req.preferred_numa;
   auto buffers       = _pool->allocate_bulk(n_chunks_needed, numa_allocated);
   if (buffers.size() != n_chunks_needed) {
-    auto const shortage = n_chunks_needed - buffers.size();
+    // Over the cap, free only what lets this request fit; otherwise the pool
+    // itself ran dry and the whole remainder is the shortfall.
+    auto const over_cap = _pool->chunks_over_cap(n_chunks_needed);
+    auto const shortage = over_cap != 0 ? over_cap : n_chunks_needed - buffers.size();
     if (!buffers.empty()) { _pool->deallocate_bulk(std::move(buffers), numa_allocated); }
     if (!wait_for_eviction) {
       // Get reclamation moving without stalling the scan-input constructor.
@@ -1297,6 +1303,45 @@ std::size_t prefetching_cache::claimed_bytes() const noexcept
   return _pool ? _pool->total_allocated_bytes() : 0;
 }
 
+std::size_t prefetching_cache::max_resident_bytes() const noexcept
+{
+  return _pool ? _pool->max_allowed_budget_for_prefetching() : 0;
+}
+
+prefetching_cache::object_residency prefetching_cache::residency(std::string_view object_path) const
+{
+  // Locked under the map mutex, inspected after it: dropping the last reference to a retired
+  // generation runs its deleter, which is no work to do while holding the map.
+  std::vector<std::shared_ptr<cache_generation>> family;
+  {
+    std::shared_lock lk(_map_mtx);
+    auto const it = _generations_by_path.find(std::string(object_path));
+    if (it == _generations_by_path.end()) { return {}; }
+    for (auto const& weak : it->second) {
+      family.push_back(weak.lock());
+    }
+  }
+  std::shared_ptr<cache_generation> current;
+  for (auto& generation : family) {
+    if (generation && !generation->retired.load(std::memory_order_acquire)) {
+      current = std::move(generation);
+    }
+  }
+  if (!current) { return {}; }
+
+  object_residency out{0, current->file_size};
+  std::shared_lock lock(current->mtx);
+  for (std::size_t slot = 0; slot < current->slots.size(); ++slot) {
+    auto const* c = current->slots[slot];
+    if (c == nullptr) { continue; }
+    auto const state = c->state.get_state();
+    if (state != chunk_state::cached && state != chunk_state::in_use) { continue; }
+    out.resident_bytes +=
+      std::min(current->chunk_size, current->file_size - slot * current->chunk_size);
+  }
+  return out;
+}
+
 void prefetching_cache::evict(std::size_t bytes_to_free)
 {
   // Nothing to free, nothing holding memory, or a cache on its way down -- in
@@ -1314,6 +1359,26 @@ void prefetching_cache::evict_sync(std::size_t bytes_to_free)
     return;
   }
   processed->wait();
+}
+
+std::size_t prefetching_cache::release_idle(std::size_t bytes)
+{
+  if (bytes == 0 || !_armed || _shutting_down.load(std::memory_order_acquire)) { return 0; }
+  auto const floor       = _pool->reservation_size_for_prefetching();
+  auto const above_floor = [this, floor] {
+    auto const held = _pool->total_allocated_bytes();
+    return held > floor ? held - floor : 0;
+  };
+  auto const before = above_floor();
+  if (before == 0) { return 0; }
+  auto processed = std::make_shared<std::latch>(1);
+  if (!_eviction_queue.enqueue(
+        cache_request{eviction_request{std::min(bytes, before), processed, true}})) {
+    return 0;
+  }
+  processed->wait();
+  auto const after = above_floor();
+  return before > after ? before - after : 0;
 }
 
 void prefetching_cache::drain_and_abandon(request_queue_type& queue) noexcept
@@ -1471,6 +1536,8 @@ void prefetching_cache::evict_loop(const std::stop_token& st)
     // leaves the other one still waiting.
     std::size_t requested_bytes = 0;
     bool eviction_requested     = false;
+    // Whether any demand may take chunks a live request still subscribes to.
+    bool any_demand_takes_subscribed = false;
     std::vector<std::shared_ptr<std::latch>> processed;
     auto acknowledge_evictions = [&processed] {
       for (auto const& completion : processed) {
@@ -1493,6 +1560,7 @@ void prefetching_cache::evict_loop(const std::stop_token& st)
             // does nothing and the pool never recovers.
             eviction_requested = true;
             requested_bytes += r.bytes_to_free;
+            any_demand_takes_subscribed |= !r.idle_only;
             if (r.processed != nullptr) { processed.push_back(std::move(r.processed)); }
           }
         },
@@ -1548,8 +1616,8 @@ void prefetching_cache::evict_loop(const std::stop_token& st)
 
     // When disposing on idle we reclaim everything; otherwise we only evict
     // under memory pressure and stop once enough chunks are free again.  Memory
-    // pressure is scored as outstanding (handed-out) chunks against the pool's
-    // aggregate reserved capacity.
+    // pressure is scored as the pool's own outstanding (handed-out) chunks
+    // against its hard cap -- not system-wide host usage, which includes spills.
     bool const should_evict =
       _cfg.dispose_on_idle || eviction_requested || _pool->should_start_evicting();
     if (!should_evict) {
@@ -1588,8 +1656,11 @@ void prefetching_cache::evict_loop(const std::stop_token& st)
     // dispose_on_idle the target is unbounded, so pass 1 would run every round
     // and strip chunks another live request still names — and a chunk somebody
     // is still subscribed to is not idle.
-    size_t reclaimed   = 0;
-    int const n_passes = _cfg.dispose_on_idle ? 1 : 2;
+    size_t reclaimed = 0;
+    // Idle-only demands get no second pass unless the pool is also over its own cap.
+    bool const sweep_subscribed =
+      !_cfg.dispose_on_idle && (any_demand_takes_subscribed || _pool->over_static_cap());
+    int const n_passes = sweep_subscribed ? 2 : 1;
     for (int pass = 0; pass < n_passes && reclaimed < need; ++pass) {
       bool const respect_subscribers = (pass == 0);
       for (auto& er : eviction_batch) {

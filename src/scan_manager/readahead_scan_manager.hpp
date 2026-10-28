@@ -31,6 +31,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -126,6 +127,11 @@ struct readahead_counters {
   std::atomic<std::uint64_t> idle_polls{0};
   /// Could not even take a slot: every one was already in flight.
   std::atomic<std::uint64_t> gate_timeouts{0};
+  /// Held a candidate back because issuing it would push the bytes held in
+  /// landed-but-undisposed prefetches past the resident budget.
+  std::atomic<std::uint64_t> resident_waits{0};
+  /// Held a candidate back because the host memory tier reported pressure.
+  std::atomic<std::uint64_t> host_pressure_waits{0};
 
   // ---- competition from the executor ---------------------------------------
   /// Reads the readahead never covered, which therefore spent a ticket of its
@@ -135,6 +141,51 @@ struct readahead_counters {
   /// over-subscribed until the ticket came back.  A quiet readahead with a high
   /// count here was crowded out; one with a low count simply had nothing to do.
   std::atomic<std::uint64_t> borrowed{0};
+};
+
+/// Bytes the readahead holds in prefetches the consumer has not yet disposed.
+///
+/// The IO budget caps reads in flight (a ticket returns when a prefetch lands);
+/// a landed prefetch still pins its chunks until its split is disposed, so this
+/// is the byte-denominated bound.  Each charge is recorded on the split
+/// (@c scan_info::set_readahead_resident_bytes) so that whichever release path
+/// runs first -- no IO issued, or split disposed -- returns it exactly once.
+class readahead_byte_budget {
+ public:
+  /// @p max_bytes of zero means unlimited.
+  explicit readahead_byte_budget(std::size_t max_bytes = 0) noexcept : _max_bytes(max_bytes) {}
+
+  [[nodiscard]] std::size_t resident() const noexcept
+  {
+    return _resident.load(std::memory_order_acquire);
+  }
+
+  /// Whether a split of @p bytes may be issued now.  Nothing resident always
+  /// admits, so a split larger than the whole budget cannot deadlock the
+  /// readahead -- it simply runs alone.
+  [[nodiscard]] bool admits(std::size_t bytes) const noexcept
+  {
+    auto const held = resident();
+    return _max_bytes == 0 || held == 0 || held + bytes <= _max_bytes;
+  }
+
+  /// Charge @p bytes for @p split's prefetch.  Must run before the prefetch is
+  /// issued: its completion can fire inline and refund the charge.
+  ///
+  /// A dispose racing the charge is resolved on the split's record: the dispose
+  /// takes the record (an RMW) after publishing the @c disposed stage.  If that
+  /// take ran before our set, our set's acquire sees the stage and we take the
+  /// record back ourselves; otherwise the dispose's take sees our bytes.
+  /// Returns the resident total after the charge.
+  std::size_t charge(op::scan::scan_info const& split, std::size_t bytes);
+
+  /// Return whatever is still charged for @p split.  Safe to call from every
+  /// release path; only the first finds anything.
+  void release(op::scan::scan_info const& split) noexcept;
+
+ private:
+  std::size_t _max_bytes{0};
+  std::atomic<std::size_t> _resident{0};
 };
 
 /// Per-query readahead for GPU scans.
@@ -159,10 +210,19 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
   /// between the readahead and the executor.  Zero means the backend opts out,
   /// and @ref start is then a no-op: there is no point running a worker that may
   /// never issue anything.
+  ///
+  /// @p max_resident_bytes bounds the bytes held in prefetches that have landed
+  /// but whose split has not been disposed (0 = unlimited); see
+  /// @ref readahead_byte_budget.  @p host_under_pressure, when set, is asked
+  /// before each issue while anything is resident; returning true holds the
+  /// candidate back until a split is disposed.  Unset means never under
+  /// pressure.
   readahead_scan_manager(event::query_event_publisher& publisher,
                          std::size_t budget,
                          std::shared_ptr<shared_scan_budget> shared_budget = nullptr,
                          std::optional<std::size_t> budget_override        = std::nullopt,
+                         std::size_t max_resident_bytes                    = 0,
+                         std::function<bool()> host_under_pressure         = {},
                          std::shared_ptr<op::scan::physical_check_counters> physical_counters = {})
     : event::query_event_subscriber(publisher,
                                     {event::event_type::task_deployed,
@@ -173,7 +233,9 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
       _gatekeeper(static_cast<int>(budget)),
       _physical_counters(std::move(physical_counters)),
       _shared_budget(std::move(shared_budget)),
-      _budget_override(budget_override)
+      _budget_override(budget_override),
+      _resident(max_resident_bytes),
+      _host_under_pressure(std::move(host_under_pressure))
   {
   }
   /// Stops and joins both workers -- the prefetch worker and the event subscriber.
@@ -276,6 +338,9 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
   /// This query's readahead outcomes.  Exposed for tests and diagnostics; the
   /// log line built from them is @ref summary.
   [[nodiscard]] readahead_counters const& counters() const noexcept { return _counters; }
+
+  /// Bytes currently charged to prefetches whose split has not been disposed.
+  [[nodiscard]] std::size_t resident_bytes() const noexcept { return _resident.resident(); }
 
   /// One-line account of this query's readahead, in the shape
   /// @c prefetching_cache::summary uses.  Safe to call at any time; the
@@ -405,6 +470,16 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
   shared_scan_budget::token acquire_shared_ticket(const op::scan::scan_info& task, bool demand);
   std::atomic<bool> _prefetching_started{false};
   std::atomic<size_t> _cursor{0};
+
+  /// Bytes held in landed-but-undisposed prefetches; see @ref readahead_byte_budget.
+  readahead_byte_budget _resident;
+  /// True while the host tier wants memory back; empty = never.
+  std::function<bool()> _host_under_pressure;
+  /// Generation of disposed splits, which a candidate held back for room waits
+  /// on (bounded by its retry timer).
+  std::mutex _disposal_mutex;
+  std::condition_variable _disposal_cv;
+  std::uint64_t _disposal_generation{0};
 
   /// Fill speculative capacity; abandon a candidate after bounded eviction attempts.
   void worker_loop(const std::stop_token& st);

@@ -251,6 +251,13 @@ class grouped_io_request final {
     return bytes;
   }
 
+  /// Unconsumed slice @p i, relative to the current head.
+  [[nodiscard]] prepared_io_slice const& slice_at(std::size_t i) const noexcept
+  {
+    assert(_next + i < slices.size());
+    return slices[_next + i];
+  }
+
   [[nodiscard]] prepared_io_slice& front() noexcept
   {
     assert(!empty());
@@ -350,6 +357,16 @@ struct device_cpy_request {
   }
 };
 
+/// One extra logical slice riding on a fused physical operation: the first
+/// stays in the operation's own fields, the rest live here.  device_cpy_request
+/// copies only `intersect(req_rng, io_rng)` out of the shared buffers, so a
+/// constituent needs nothing beyond its own window and destination.
+struct fused_constituent {
+  std::unique_ptr<device_cpy_request> device_copy;
+  std::shared_ptr<prepared_io_completion> on_complete;
+  std::vector<cache::cached_chunk*> completion_chunks;
+};
+
 /**
  * @brief Backend-neutral physical operation produced by a reactor worker.
  *
@@ -366,12 +383,22 @@ struct io_op_request {
   std::shared_ptr<grouped_coordinator> coordinator;
   std::shared_ptr<prepared_io_completion> on_complete;
   std::vector<cache::cached_chunk*> completion_chunks;
+  /// Empty unless the backend fused further slices into this operation; each
+  /// settles its own coordinator credit.
+  std::vector<fused_constituent> fused_extra;
+
+  /// Logical slices this operation settles: itself plus any fused constituents.
+  [[nodiscard]] std::size_t logical_slices() const noexcept { return 1 + fused_extra.size(); }
 
   void finish_success() noexcept
   {
     if (_terminal.exchange(true, std::memory_order_acq_rel)) return;
     if (on_complete != nullptr) { (*on_complete)(completion_chunks, true); }
     coordinator->on_complete();
+    for (auto& part : fused_extra) {
+      if (part.on_complete != nullptr) { (*part.on_complete)(part.completion_chunks, true); }
+      coordinator->on_complete();
+    }
   }
 
   void finish_error(grouped_coordinator::error_type const& error,
@@ -380,6 +407,12 @@ struct io_op_request {
     if (_terminal.exchange(true, std::memory_order_acq_rel)) return;
     if (on_complete != nullptr) { (*on_complete)(completion_chunks, host_data_valid); }
     coordinator->report_error(error);
+    for (auto& part : fused_extra) {
+      if (part.on_complete != nullptr) {
+        (*part.on_complete)(part.completion_chunks, host_data_valid);
+      }
+      coordinator->report_error(error);
+    }
   }
 
   [[nodiscard]] bool terminal() const noexcept { return _terminal.load(std::memory_order_acquire); }

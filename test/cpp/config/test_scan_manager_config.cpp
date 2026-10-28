@@ -416,12 +416,44 @@ TEST_CASE("sirius_config reads the cache tunables", "[scan_manager][config][cach
   auto const cfg = load_scan_manager("sirius_cache_tunables.yaml",
                                      cache_yaml("        mode: sirius\n"
                                                 "        eviction: idle\n"
-                                                "        eviction_threshold_fraction: 0.25\n"
+                                                "        max_host_fraction: 0.25\n"
                                                 "        min_prefetching_budget_fraction: 0.5\n"));
 
-  CHECK(cfg.cache.eviction_threshold_fraction == Approx(0.25));
+  CHECK(cfg.cache.max_host_fraction == Approx(0.25));
   CHECK(cfg.cache.min_prefetching_budget_fraction == Approx(0.5));
   CHECK(cfg.cache.dispose_on_idle);
+}
+
+TEST_CASE("sirius_config defaults the cache cap to 0.8 of the host tier",
+          "[scan_manager][config][cache_mode]")
+{
+  auto const cfg =
+    load_scan_manager("sirius_cache_cap_default.yaml", cache_yaml("        mode: sirius\n"));
+
+  CHECK(cfg.cache.max_host_fraction == Approx(0.8));
+}
+
+TEST_CASE("sirius_config accepts eviction_threshold_fraction as a deprecated alias of the cap",
+          "[scan_manager][config][cache_mode]")
+{
+  auto const cfg = load_scan_manager("sirius_cache_cap_alias.yaml",
+                                     cache_yaml("        mode: sirius\n"
+                                                "        eviction_threshold_fraction: 0.4\n"));
+
+  CHECK(cfg.cache.max_host_fraction == Approx(0.4));
+}
+
+TEST_CASE("sirius_config rejects the cache cap given under both of its names",
+          "[scan_manager][config][cache_mode]")
+{
+  scoped_yaml yaml("sirius_cache_cap_both.yaml",
+                   cache_yaml("        mode: sirius\n"
+                              "        max_host_fraction: 0.4\n"
+                              "        eviction_threshold_fraction: 0.4\n"));
+
+  sirius::sirius_config cfg;
+  CHECK_THROWS_WITH(cfg.load_from_file(yaml.path()),
+                    Catch::Matchers::ContainsSubstring("deprecated alias"));
 }
 
 TEST_CASE("sirius_config rejects an unknown cache mode", "[scan_manager][config][cache_mode]")
@@ -611,6 +643,32 @@ TEST_CASE("sirius_config reads max_readahead_scans", "[scan_manager][config][rea
                                         scan_manager_yaml("      max_readahead_scans: 12\n"));
   REQUIRE(budget.max_readahead_scans.has_value());
   CHECK(*budget.max_readahead_scans == 12);
+}
+
+TEST_CASE("max_readahead_bytes is read from YAML and overrides the cache budget",
+          "[scan_manager][config][readahead]")
+{
+  using sirius::scan_manager::prefetch_strategy;
+  auto cfg = load_scan_manager("sirius_readahead_bytes_unset.yaml",
+                               scan_manager_yaml("      rest_n_reactors: 1\n"));
+  CHECK_FALSE(cfg.max_readahead_bytes.has_value());
+  // Unset: the smallest cache prefetching budget the caller found, else unlimited.
+  CHECK(cfg.resolve_readahead(8, prefetch_strategy::eager, 5ull << 30).max_resident_bytes ==
+        (5ull << 30));
+  CHECK(cfg.resolve_readahead(8, prefetch_strategy::eager).max_resident_bytes == 0);
+
+  // Byte strings, like every other byte-valued key; an explicit value wins.
+  auto const sized = load_scan_manager("sirius_readahead_bytes_sized.yaml",
+                                       scan_manager_yaml("      max_readahead_bytes: 2GiB\n"));
+  REQUIRE(sized.max_readahead_bytes == (2ull << 30));
+  CHECK(sized.resolve_readahead(8, prefetch_strategy::eager, 5ull << 30).max_resident_bytes ==
+        (2ull << 30));
+
+  // An explicit zero means no byte bound, whatever the caches say.
+  auto const zero = load_scan_manager("sirius_readahead_bytes_zero.yaml",
+                                      scan_manager_yaml("      max_readahead_bytes: 0\n"));
+  REQUIRE(zero.max_readahead_bytes == std::size_t{0});
+  CHECK(zero.resolve_readahead(8, prefetch_strategy::eager, 5ull << 30).max_resident_bytes == 0);
 }
 
 TEST_CASE("sirius_config reads readahead_strategy", "[scan_manager][config][readahead]")

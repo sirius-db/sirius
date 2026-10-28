@@ -44,6 +44,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -126,7 +127,7 @@ scan_manager_config constrained_lru_config()
   // fills the small host tier. Only failed preparations' explicit requests may
   // free the disposable requests below.
   cfg.cache.min_prefetching_budget_fraction = 0.25;
-  cfg.cache.eviction_threshold_fraction     = 1.0;
+  cfg.cache.max_host_fraction               = 1.0;
   return cfg;
 }
 
@@ -162,7 +163,7 @@ TEST_CASE("claimed_bytes tracks the staging memory the cache is holding",
   sirius::exec::query_lifecycle_registry scan_lifecycle;
 
   sirius_scan_manager manager{scan_lifecycle, lru_config(), *memory, topology};
-  auto* cache = manager.io_ctx()->cache();
+  auto* cache = manager.ensure_default_cache();
   REQUIRE(cache != nullptr);
   REQUIRE(cache->is_armed());
 
@@ -193,7 +194,7 @@ TEST_CASE("an explicit evict reclaims a disposed request the pressure rule would
   sirius::exec::query_lifecycle_registry scan_lifecycle;
 
   sirius_scan_manager manager{scan_lifecycle, lru_config(), *memory, topology};
-  auto* cache = manager.io_ctx()->cache();
+  auto* cache = manager.ensure_default_cache();
   REQUIRE(cache != nullptr);
   REQUIRE(cache->is_armed());
 
@@ -232,7 +233,7 @@ TEST_CASE("blocking prepare waits for earlier asynchronous eviction before retry
   sirius::exec::query_lifecycle_registry scan_lifecycle;
 
   sirius_scan_manager manager{scan_lifecycle, constrained_lru_config(), *memory, topology};
-  auto* cache = manager.io_ctx()->cache();
+  auto* cache = manager.ensure_default_cache();
   REQUIRE(cache != nullptr);
 
   // Fill whatever portion of the constrained tier remains after ioctx's own
@@ -271,7 +272,7 @@ TEST_CASE("failed nonblocking preparation starts eviction without waiting",
   sirius::exec::query_lifecycle_registry scan_lifecycle;
 
   sirius_scan_manager manager{scan_lifecycle, constrained_lru_config(), *memory, topology};
-  auto* cache = manager.io_ctx()->cache();
+  auto* cache = manager.ensure_default_cache();
   REQUIRE(cache != nullptr);
 
   // Provide an unsubscribed victim, then fill the remaining capacity with
@@ -318,7 +319,7 @@ TEST_CASE("prepare does not publish a request the retry's eviction left short of
   sirius::exec::query_lifecycle_registry scan_lifecycle;
 
   sirius_scan_manager manager{scan_lifecycle, constrained_lru_config(), *memory, topology};
-  auto* cache = manager.io_ctx()->cache();
+  auto* cache = manager.ensure_default_cache();
   REQUIRE(cache != nullptr);
 
   REQUIRE(cache->chunk_size() == mib);
@@ -385,6 +386,9 @@ TEST_CASE("prepare abandons immediately after the consumer reaches the split",
   sirius::exec::query_lifecycle_registry scan_lifecycle;
 
   sirius_scan_manager manager{scan_lifecycle, lru_config(), *memory, topology};
+  // Built before the datasource registers its request; the default cache is
+  // otherwise only built when a query reads through it.
+  REQUIRE(manager.ensure_default_cache() != nullptr);
   auto ds = manager.create_datasource(file.path.string());
   REQUIRE(ds != nullptr);
 
@@ -394,7 +398,7 @@ TEST_CASE("prepare abandons immediately after the consumer reaches the split",
   ds->update(sirius::io::cache::scan_stage::preparing);
 
   CHECK(ds->prepare_prefetch(true) == sirius::io::prepare_result::fallen_behind);
-  CHECK(manager.io_ctx()->cache()->claimed_bytes() == 0);
+  CHECK(manager.ensure_default_cache()->claimed_bytes() == 0);
 }
 
 TEST_CASE("an explicit evict frees at least what was asked for", "[cache][eviction][explicit]")
@@ -406,7 +410,7 @@ TEST_CASE("an explicit evict frees at least what was asked for", "[cache][evicti
   sirius::exec::query_lifecycle_registry scan_lifecycle;
 
   sirius_scan_manager manager{scan_lifecycle, lru_config(), *memory, topology};
-  auto* cache = manager.io_ctx()->cache();
+  auto* cache = manager.ensure_default_cache();
   REQUIRE(cache != nullptr);
 
   std::vector<cudf::io::text::byte_range_info> ranges;
@@ -437,7 +441,7 @@ TEST_CASE("a zero-byte evict is a no-op", "[cache][eviction][explicit]")
   sirius::exec::query_lifecycle_registry scan_lifecycle;
 
   sirius_scan_manager manager{scan_lifecycle, lru_config(), *memory, topology};
-  auto* cache = manager.io_ctx()->cache();
+  auto* cache = manager.ensure_default_cache();
   REQUIRE(cache != nullptr);
 
   std::vector<cudf::io::text::byte_range_info> ranges;
@@ -467,7 +471,7 @@ TEST_CASE("the evictor retires disposed requests while the pool is under its thr
   sirius::exec::query_lifecycle_registry scan_lifecycle;
 
   sirius_scan_manager manager{scan_lifecycle, lru_config(), *memory, topology};
-  auto* cache = manager.io_ctx()->cache();
+  auto* cache = manager.ensure_default_cache();
   REQUIRE(cache != nullptr);
   REQUIRE(cache->is_armed());
 
@@ -502,6 +506,79 @@ TEST_CASE("the evictor retires disposed requests while the pool is under its thr
   CHECK(tracked <= max_tracked);
 }
 
+TEST_CASE("residency reports the loaded share of an object by path", "[cache][residency]")
+{
+  temp_data_file file(8ull << 20);  // 8 MiB
+  auto memory   = initialize_memory_manager(1);
+  auto topology = single_gpu_index_for_evict();
+
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+
+  sirius_scan_manager manager{scan_lifecycle, lru_config(), *memory, topology};
+  auto* cache = manager.ensure_default_cache();
+  REQUIRE(cache != nullptr);
+  REQUIRE(cache->is_armed());
+  auto const chunk = cache->chunk_size();
+  REQUIRE(2 * chunk <= (8ull << 20));
+
+  // A path the cache has never seen: nothing held, and no size to report either.
+  auto const unseen = cache->residency(file.path.string());
+  CHECK(unseen.resident_bytes == 0);
+  CHECK(unseen.object_bytes == 0);
+
+  // Read two chunks through the cache. Only loaded chunks count; the rest of the file does not.
+  auto ds = manager.create_datasource(file.path.string());
+  REQUIRE(ds != nullptr);
+  std::vector<cudf::io::text::byte_range_info> ranges;
+  ranges.emplace_back(0, static_cast<std::int64_t>(2 * chunk));
+  ds->fadvise(ranges, 0);
+  REQUIRE(ds->prepare_prefetch(false) == sirius::io::prepare_result::prepared);
+  std::vector<std::uint8_t> bytes(2 * chunk);
+  REQUIRE(ds->host_read(0, bytes.size(), bytes.data()) == bytes.size());
+
+  auto const held = cache->residency(file.path.string());
+  INFO("cache: " << cache->summary());
+  CHECK(held.object_bytes == (8ull << 20));
+  CHECK(held.resident_bytes == 2 * chunk);
+}
+
+TEST_CASE("release_idle gives back idle chunks above the reservation and keeps live ones",
+          "[cache][eviction][release_idle]")
+{
+  constexpr std::size_t mib = 1ull << 20;  // also the pool's chunk size
+  temp_data_file file(256ull << 20);
+  auto memory   = constrained_memory_manager();
+  auto topology = single_gpu_index_for_evict();
+
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+
+  sirius_scan_manager manager{scan_lifecycle, constrained_lru_config(), *memory, topology};
+  auto* cache = manager.ensure_default_cache();
+  REQUIRE(cache != nullptr);
+  REQUIRE(cache->chunk_size() == mib);
+
+  auto prepare = [&](std::int64_t offset, std::int64_t bytes) {
+    std::vector<cudf::io::text::byte_range_info> ranges;
+    ranges.emplace_back(offset, bytes);
+    auto ds = manager.create_datasource(file.path.string());
+    REQUIRE(ds != nullptr);
+    ds->fadvise(ranges, 0);
+    REQUIRE(ds->prepare_prefetch(false) == sirius::io::prepare_result::prepared);
+    return ds;
+  };
+  // 64 MiB of the 256 MiB tier is the pool's reservation (constrained_lru_config).
+  auto live = prepare(0, static_cast<std::int64_t>(8 * mib));
+  auto idle = prepare(static_cast<std::int64_t>(8 * mib), static_cast<std::int64_t>(92 * mib));
+  REQUIRE(cache->claimed_bytes() == 100 * mib);
+  idle.reset();
+
+  // Only the 36 MiB above the reservation reach the host tier; the live request's chunks stay.
+  CHECK(cache->release_idle(1ull << 30) == 36 * mib);
+  CHECK(cache->claimed_bytes() == 64 * mib);
+  CHECK(cache->release_idle(1ull << 30) == 0);
+  live.reset();
+}
+
 TEST_CASE("readahead bounds memory retries and returns capacity on abandonment",
           "[cache][eviction][readahead][retry]")
 {
@@ -520,6 +597,8 @@ TEST_CASE("readahead bounds memory retries and returns capacity on abandonment",
   sirius::exec::query_lifecycle_registry lifecycle;
   sirius_scan_manager scans{
     lifecycle, constrained_lru_config(), *memory, single_gpu_index_for_evict()};
+  // The default cache is built on first use; build it before the tier is exhausted.
+  REQUIRE(scans.ensure_default_cache() != nullptr);
   auto host     = memory->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST).front();
   auto* host_mr = host->get_memory_resource_of<cucascade::memory::Tier::HOST>();
   auto pressure = host_mr->allocate_multiple_blocks(host_mr->get_available_memory());

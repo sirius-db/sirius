@@ -249,6 +249,10 @@ class rest_reactor {
   /// cannot do when ranges arrive one at a time as a reader walks the file.
   static constexpr bool prefers_bulk_io = true;
 
+  /// The worker serves a run of nearby slices with one GET, so dispatch keeps
+  /// such runs on one reactor (see templated_ioctx).
+  static constexpr bool fuses_runs = true;
+
   /// Shared, immutable services for a pool of reactors.  One instance is built
   /// by @c rest_ioctx and shared (via shared_ptr) across every reactor in the
   /// pool, so it is the natural home for things that are shared rather than

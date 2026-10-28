@@ -613,6 +613,12 @@ class sirius_scan_manager {
   /// this and a registry still listing them would be lying.  Re-pin afterwards.
   void reset_caches();
 
+  /// Give the host tier back up to @p bytes from the prefetching caches' idle
+  /// chunks (@ref sirius::io::cache::prefetching_cache::release_idle), default
+  /// cache first, and return how many bytes it got back. Safe against a running
+  /// query; serialized against @ref reset_caches.
+  std::size_t release_idle_cache_memory(std::size_t bytes);
+
   /// Retain a checkpoint key until this execution window is reset. Pinning may hold
   /// keys without registering scan providers, so their lifetime is tracked separately.
   void acquire_checkpoint_key(sirius::query_id_t query_id, duckdb::AttachedDatabase& database);
@@ -862,6 +868,16 @@ class sirius_scan_manager {
   ///        was configured with @c backend=kvikio.
   [[nodiscard]] sirius::io::ioctx* io_ctx() const noexcept { return _io_ctx.get(); }
 
+  /// \brief The default ioctx's prefetching cache, built on first use.
+  ///
+  /// Not built in the constructor: every cache reserves
+  /// @c min_prefetching_budget_fraction of the host tier up front, so an
+  /// object-store-only workload would hold that much pinned memory for a local
+  /// cache it never reads through.  @ref prepare_for_query calls this when a
+  /// query scans through the default ioctx, as does @ref pin_parquet_ranges.
+  /// Idempotent and safe to call concurrently.  Null when the configuration or
+  /// the backend gives the default ioctx no cache.
+  sirius::io::cache::prefetching_cache* ensure_default_cache();
   /// Aggregate metadata-cache diagnostics across the default and routed ioctxs.
   [[nodiscard]] sirius::io::cache::metadata_store::counters metadata_cache_statistics() const;
 
@@ -1077,6 +1093,10 @@ class sirius_scan_manager {
   std::shared_ptr<shared_scan_budget> _shared_readahead_budget =
     std::make_shared<shared_scan_budget>();
   std::shared_ptr<sirius::io::ioctx> _io_ctx;
+  /// Serializes building (@ref ensure_default_cache) and rebuilding
+  /// (@ref reset_caches) the default ioctx's cache: @c ioctx::initialize_cache
+  /// is a check-then-build and is not safe to race.
+  std::mutex _default_cache_mtx;
   /// Lazily-built per-backend ioctxs for path-routed datasources (e.g. an s3://
   /// REST or kvikIO context alongside the local `_io_ctx`). Contexts are keyed
   /// by the immutable resolved-config snapshot, not merely by backend type, so

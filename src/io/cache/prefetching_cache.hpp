@@ -220,6 +220,11 @@ struct eviction_request {
   /// Present when a caller may wait for this pass (including after an async
   /// prepare failure). Counted down even when nothing was reclaimable.
   std::shared_ptr<std::latch> processed;
+  /// Reclaim only chunks no live request is subscribed to: chunks the readahead
+  /// fetched for a scan that has not read them yet stay. Set when the memory is
+  /// wanted by something other than the cache's own reads, which would only
+  /// fetch those chunks again.
+  bool idle_only{false};
 };
 
 /// What the evictor's queue carries.  Two things reach it: prefetch requests,
@@ -384,6 +389,23 @@ class prefetching_cache {
   /// rather than a value to compute an exact target from.
   [[nodiscard]] std::size_t claimed_bytes() const noexcept;
 
+  /// Hard cap on the cache's resident chunk bytes (@c max_host_fraction
+  /// of the host tier, chunk aligned); the readahead's default resident-byte
+  /// bound.  0 without a pool (or uncapped).
+  [[nodiscard]] std::size_t max_resident_bytes() const noexcept;
+
+  /// How much of one object the cache holds.
+  struct object_residency {
+    std::size_t resident_bytes = 0;  ///< bytes of chunks cached or in use
+    std::size_t object_bytes   = 0;  ///< the object's size; 0 when the cache has not seen it
+  };
+
+  /// What the cache holds of the object at @p object_path (@c io_object::object_path) in its
+  /// current generation. Takes a path rather than an @c io_object so it can be asked before the
+  /// file is opened. Read-only: subscribes, pins and reorders nothing. Chunks count whole, so
+  /// this is an estimate -- meant for choosing what to read first.
+  [[nodiscard]] object_residency residency(std::string_view object_path) const;
+
   /// Ask the evictor to free at least @p bytes_to_free bytes of staging memory.
   ///
   /// Asynchronous and best-effort: this enqueues the demand and returns.  The
@@ -405,6 +427,12 @@ class prefetching_cache {
   /// request has been processed. This acknowledges an eviction pass, not that
   /// the requested number of bytes could necessarily be reclaimed.
   void evict_sync(std::size_t bytes_to_free);
+
+  /// Give the host tier back up to @p bytes of chunks nobody reads or waits for,
+  /// and return how many bytes the host tier got back. Only chunks above the
+  /// pool's reservation count: those inside it stay charged to the cache.
+  /// Synchronous; for a spill that would otherwise move data to disk.
+  std::size_t release_idle(std::size_t bytes);
 
   /// Observe totals and activity since the last refresh without advancing the baseline.
   [[nodiscard]] std::string summary() const;
