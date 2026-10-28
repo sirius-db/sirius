@@ -229,6 +229,8 @@ struct physical_check_counters {
   // true = before footer processing, false = after successful cuDF decode.
   std::function<void(std::string const&, bool)> parquet_phase_for_testing;
   std::function<void(std::string const&, bool)> parquet_metadata_for_testing;
+  // Per decoded batch, before any residual filter: reader filter present, output rows.
+  std::function<void(bool, uint64_t)> parquet_filter_for_testing;
   std::function<void()> after_certify_for_testing;
   std::function<void(std::string const&, bool)> iceberg_dv_phase_for_testing;
   std::function<void(scan_contract_id, bool)> iceberg_preparation_route_for_testing;
