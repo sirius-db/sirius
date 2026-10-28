@@ -149,7 +149,7 @@ planner::connector scan_connector()
               return result;
             },
           .provider =
-            planner::provider_profile{"ducklake", "80e6155e41", "ducklake.original-statement.v1"},
+            planner::provider_profile{"ducklake", "417a9117f5", "ducklake.original-statement.v1"},
           .certify =
             [](op::scan::bound_table_scan const&,
                op::sirius_physical_table_scan const& scan,

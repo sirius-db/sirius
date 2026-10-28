@@ -66,7 +66,7 @@ bool qualified_provider(DatabaseInstance& db)
   auto& manager = ExtensionManager::Get(db);
   if (!manager.ExtensionIsLoaded("ducklake")) return false;
   auto info = manager.GetExtensionInfo("ducklake");
-  if (!info || !info->install_info || info->install_info->version != "80e6155e41" ||
+  if (!info || !info->install_info || info->install_info->version != "417a9117f5" ||
       info->install_info->full_path.empty())
     return false;
   Dl_info code{};
@@ -385,7 +385,6 @@ std::optional<unit_descriptor> binding_handle::unit_at(uint64_t index) const
   result.data_file_id       = optional(entry.data_file_id);
   result.row_id_start       = optional(entry.row_id_start);
   result.insertion_snapshot = optional(entry.snapshot_id);
-  result.max_row_count      = optional(entry.max_row_count);
   result.snapshot_min       = optional(entry.snapshot_filter_min);
   result.snapshot_max       = optional(entry.snapshot_filter_max);
   result.file_size          = entry.file.file_size_bytes;

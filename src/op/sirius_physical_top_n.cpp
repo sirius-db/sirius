@@ -134,7 +134,7 @@ void publish_top_n_boundary(cudf::table_view sorted,
   auto value  = top_n_boundary(*scalar, stream);
   if (value.IsNull() || value.type() != order.expression->GetReturnType()) return;
   bool ascending = order.type == duckdb::OrderType::ASCENDING;
-  std::lock_guard<duckdb::mutex> guard(filter->lock);
+  duckdb::annotated_lock_guard<duckdb::annotated_shared_mutex> guard(filter->lock);
   // Internal key compression can change the sort value's domain.
   if (value.type() != filter->constant.type()) return;
   auto comparison = filter->comparison_type;

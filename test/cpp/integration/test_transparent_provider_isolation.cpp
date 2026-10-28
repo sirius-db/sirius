@@ -638,7 +638,7 @@ bool load_ducklake(duckdb::Connection& con)
                        "SELECT extension_version FROM duckdb_extensions() WHERE extension_name = "
                        "'ducklake' AND loaded");
   REQUIRE(version->RowCount() == 1);
-  REQUIRE(version->Collection().GetValue(0, 0).ToString() == "80e6155e41");
+  REQUIRE(version->Collection().GetValue(0, 0).ToString() == "417a9117f5");
   return true;
 }
 
@@ -780,6 +780,9 @@ TEST_CASE("DuckLake SQL preserves snapshot and transaction visibility",
   if (!load_ducklake(con)) return;
   query(con, "SET GLOBAL gpu_execution = true");
   attach_lake(con, disk.directory);
+  auto inline_limit = GENERATE(0, 1000);
+  query(con,
+        "CALL lake.set_option('data_inlining_row_limit', " + std::to_string(inline_limit) + ")");
   query(con, "CREATE TABLE lake.t(id BIGINT)");
   query(con, "INSERT INTO lake.t VALUES (1), (2)");
   auto snapshot  = query(con,
@@ -795,11 +798,11 @@ TEST_CASE("DuckLake SQL preserves snapshot and transaction visibility",
   auto current = query(con, "SELECT sum(id)::BIGINT FROM lake.t");
   REQUIRE(current->Collection().GetValue(0, 0).GetValue<int64_t>() == 9);
   for (auto const& selector : {"VERSION => " + version, "TIMESTAMP => " + timestamp}) {
-    // Historical reads can still include transaction-local changes. Preserve the
-    // provider's visibility rather than assuming a committed-only snapshot.
+    // Explicit snapshots exclude this transaction's uncommitted inserts and deletes.
     auto sql = "SELECT sum(id)::BIGINT FROM lake.t AT (" + selector + ")";
     query(con, "SET SESSION gpu_execution = false");
     auto baseline = query(con, sql);
+    REQUIRE(baseline->Collection().GetValue(0, 0).GetValue<int64_t>() == 3);
     query(con, "SET SESSION gpu_execution = true");
     auto selected = query(con, sql);
     REQUIRE(selected->Collection().GetValue(0, 0) == baseline->Collection().GetValue(0, 0));

@@ -64,7 +64,7 @@ void copy_top_n_states(duckdb::LogicalOperator const& from,
   if (from.type == duckdb::LogicalOperatorType::LOGICAL_TOP_N) {
     auto const& original = from.Cast<duckdb::LogicalTopN>().dynamic_filter;
     if (original) {
-      std::lock_guard<duckdb::mutex> guard(original->lock);
+      duckdb::annotated_lock_guard<duckdb::annotated_shared_mutex> guard(original->lock);
       auto fresh = duckdb::make_shared_ptr<duckdb::DynamicFilterData>(original->comparison_type,
                                                                       original->constant);
       to.Cast<duckdb::LogicalTopN>().dynamic_filter = fresh;

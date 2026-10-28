@@ -27,9 +27,9 @@ execute_process(
   COMMAND "${GIT_EXECUTABLE}" -C "${SIRIUS_DUCKDB_SOURCE_DIR}" rev-parse HEAD
   OUTPUT_VARIABLE _ducklake_host_revision
   OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
-if(NOT _ducklake_revision STREQUAL "80e6155e415b922ce27a0f67f02fc62edd508f37"
+if(NOT _ducklake_revision STREQUAL "417a9117f590e8141742ac0579d02f6a90162e37"
    OR NOT _ducklake_host_revision STREQUAL
-      "88ecd0a49d7d3d838e002b2fbc0ce91ccf74110e")
+      "d54cbbe3df17e8e5ce68312f483b4155836112aa")
   message(
     FATAL_ERROR "DuckLake private bridge source/host ABI is not qualified")
 endif()
