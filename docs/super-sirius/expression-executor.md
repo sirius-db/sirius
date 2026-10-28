@@ -144,7 +144,7 @@ The evaluator supports three strategies, selected via `policy.strategy` in the `
 
 | Strategy | How it executes | cuDF API |
 |----------|-----------------|----------|
-| `MATERIALIZE` | Every expression node becomes a single kernel. Intermediate results are materialized as `cudf::column`s. | `cudf::unary_operation`, `cudf::binary_operation`, etc. (one per node) |
+| `MATERIALIZE` | Materializes intermediate results as `cudf::column`s. Floating comparisons use small interpreted ASTs for NaN semantics; this strategy never selects AST JIT. | `cudf::unary_operation`, `cudf::binary_operation`, `cudf::compute_column` |
 | `AST_INTERPRET` (default) | Builds a `cudf::ast::tree` and interprets it with a single monolithic kernel. | `cudf::compute_column` |
 | `AST_JIT` | Builds a `cudf::ast::tree` and JIT-compiles it into a fused kernel. | `cudf::compute_column_jit` |
 
@@ -156,9 +156,9 @@ The result is a tree of AST trees whose edges are AST breakers. Each AST tree is
 
 ### `min_ast_size` — per-subtree mode selection
 
-An AST subtree with only one operator gains little from AST execution and would pay the launch overhead of `compute_column`. The `min_ast_size` constructor parameter (default `2`) sets the threshold: before adding a subtree to the AST tree, the evaluator calls `cudf_ast_op_count()` on it; if the count is below `min_ast_size`, the subtree is evaluated operator-by-operator in MATERIALIZE mode instead.
+For nodes that use size-based mode selection, the `min_ast_size` constructor parameter (default `2`) controls whether a subtree is materialized operator-by-operator or built as an AST. The evaluator uses `cudf_ast_op_count()` to estimate its size; a subtree below the threshold normally materializes unless its parent requests AST mode. This is a heuristic, not a universal rule: floating comparisons, BETWEEN, and floating membership may require NaN-aware ASTs independently of the threshold.
 
-This means `MATERIALIZE` strategy is effectively `AST_INTERPRET` with `min_ast_size = ∞`.
+`MATERIALIZE` and `AST_INTERPRET` with `min_ast_size = ∞` are therefore not interchangeable. In particular, an all-constant FLOAT/DOUBLE IN list uses `cudf::contains` under `MATERIALIZE`, but follows the floating comparison AST path under `AST_INTERPRET` even when the threshold exceeds the expression size. Floating lists with nonconstant entries retain the comparison chain under either strategy. AST evaluation requested under `MATERIALIZE` is interpreted; only `AST_JIT` selects the JIT backend.
 
 ### `evaluation_mode` (internal)
 
@@ -216,7 +216,11 @@ constant after constant folding has run, so `month(coalesce(DATE '2020-02-01', d
 GPU as `month(DATE '2020-02-01')`.
 Parameters that must be constants, such as a `LIKE` pattern or `substring` bounds, stay scalars.
 
-`in_list` covers the full numeric set (INT8–INT64, UINT8–UINT64, BOOL8, FLOAT, DOUBLE, DECIMAL32/64/128, all TIMESTAMP precisions, DATE) plus VARCHAR. BOOL8 dispatches via `uint8_t` because `std::vector<bool>::data()` is deleted. `x IN (a, b)` follows SQL semantics: TRUE on any match, otherwise NULL if `x` or any list entry is NULL, otherwise FALSE; NOT IN negates that. The AST lowerings for IN chain the per-entry `EQUAL`s with `NULL_LOGICAL_OR`. The standalone translator lowers NOT IN to `NOT_EQUAL` comparisons joined by `NULL_LOGICAL_AND`, so parquet pruning never negates Bloom membership answers (see [Row Group Pruning](scan.md#row-group-pruning)). The row evaluator can negate its IN result because it operates on actual row values. The all-constant materialize path runs `cudf::contains` over the non-NULL entries and, when the list also has a NULL, ORs the result with a NULL scalar.
+`in_list` covers the full numeric set (INT8–INT64, UINT8–UINT64, BOOL8, FLOAT, DOUBLE, DECIMAL32/64/128, all TIMESTAMP precisions, DATE) plus VARCHAR. BOOL8 dispatches via `uint8_t` because `std::vector<bool>::data()` is deleted. `x IN (a, b)` follows SQL semantics: TRUE on any match, otherwise NULL if `x` or any list entry is NULL, otherwise FALSE; NOT IN negates that.
+
+The AST lowering for IN joins per-entry equality comparisons with `NULL_LOGICAL_OR`. The standalone translator lowers NOT IN to per-entry inequality comparisons joined by `NULL_LOGICAL_AND`. For non-floating operands these use primitive `EQUAL` and `NOT_EQUAL` nodes. FLOAT/DOUBLE comparisons instead use the shared NaN-aware comparison builder: equality expands to `EQUAL OR both_nan`, and inequality to `NOT(EQUAL OR both_nan)`, where `both_nan` means both operands are valid NaNs. These expressions retain ordinary comparison NULL propagation. The pinned cuDF implementation normalizes the expanded predicate before Parquet membership pruning; the floating inequality's `NOT` node must not be confused with negating a Bloom-filter membership answer (see [Row Group Pruning](scan.md#row-group-pruning)). The row evaluator can negate its IN result because it operates on actual row values.
+
+Under `MATERIALIZE`, all-constant lists (including FLOAT/DOUBLE) use `cudf::contains` over the non-NULL entries; this lookup treats NaNs and signed zeros as equal. When the list also has a NULL, the evaluator combines the result with a NULL scalar using `NULL_LOGICAL_OR`. Floating lists with nonconstant entries retain the NaN-aware comparison chain.
 
 ### String concatenation
 
@@ -305,7 +309,9 @@ HUGEINT falls back at plan time.
 
 ### Logical AND/OR NULL semantics
 
-SQL `AND`/`OR` use Kleene three-valued logic (`TRUE OR NULL = TRUE`, `FALSE AND NULL = FALSE`), so conjunctions map to cuDF's Kleene operators — `NULL_LOGICAL_AND`/`NULL_LOGICAL_OR` as AST operators and `cudf::binary_operator::NULL_LOGICAL_*` on the materialize path — never the null-propagating `LOGICAL_*` variants. The plain `LOGICAL_AND` still appears for internal structural conjunctions where operands cannot be NULL, such as the BETWEEN lowering and the AND that combines multi-condition join predicates.
+SQL `AND`/`OR` use Kleene three-valued logic (`TRUE OR NULL = TRUE`, `FALSE AND NULL = FALSE`), so SQL conjunctions map to cuDF's Kleene operators — `NULL_LOGICAL_AND`/`NULL_LOGICAL_OR` as AST operators and `cudf::binary_operator::NULL_LOGICAL_*` on the materialize path — rather than the strictly null-propagating `LOGICAL_*` variants.
+
+BETWEEN follows the same rule: `(val >= lower) AND (val <= upper)` uses `NULL_LOGICAL_AND` in the evaluator's AST and materialized paths and in the standalone translator. Its comparison operands can be NULL. For example, `(val, lower, upper) = (2, NULL, 1)` gives `NULL AND FALSE`, which is FALSE; reversing the conjunction to `FALSE AND NULL` also gives FALSE. NOT BETWEEN negates that result and therefore returns TRUE in this example.
 
 Per-expression-type dispatch lives in `src/expression_evaluator/specializations/` (one file per Sirius AST alternative: `comparison.cpp`, `case.cpp`, etc.). Each specialization decides how to emit cuDF AST nodes, materialize, or fall back based on the effective evaluation mode.
 
