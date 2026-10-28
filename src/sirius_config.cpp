@@ -18,6 +18,7 @@
 
 #include "exec/config.hpp"
 #include "log/logging.hpp"
+#include "memory/size_arithmetic.hpp"
 #include "yaml_reader.hpp"
 
 #include <cuda_runtime_api.h>
@@ -1001,13 +1002,11 @@ try {
     }
   }
   // Unless set explicitly, the BUILD_PROBE threshold is 2x the hash partition size in effect
-  // (explicit or derived), so tuning hash_partition_bytes carries the threshold along with it.
+  // (explicit or derived) at startup, so tuning hash_partition_bytes in YAML carries the threshold
+  // along with it. `SET hash_partition_bytes` does not re-derive it.
   if (!is_explicit(&operator_params::max_build_hash_table_bytes)) {
-    auto const hash_partition_bytes = settings._operator_params.hash_partition_bytes;
     settings._operator_params.max_build_hash_table_bytes =
-      hash_partition_bytes > std::numeric_limits<uint64_t>::max() / 2
-        ? std::numeric_limits<uint64_t>::max()
-        : 2 * hash_partition_bytes;
+      sirius::memory::saturating_mul(2, settings._operator_params.hash_partition_bytes);
   }
   settings.finalize_derived_config();
   return settings;

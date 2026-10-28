@@ -109,7 +109,7 @@ In BUILD_PROBE mode, each partition's first task builds a `cudf::hash_join` hash
 
 **Code path:** `src/op/sirius_physical_hash_join.cpp` — `compute_hash_join_partition_strategy()`, `get_partition_strategy()`; `src/op/sirius_physical_partition.cpp` — broadcast slot routing by the join's partition placement
 
-**Config:** `max_build_hash_table_bytes` (default: 500 MB)
+**Config:** `max_build_hash_table_bytes` (default: 2× `hash_partition_bytes`)
 
 ### COUNT DISTINCT Optimization (PR #414)
 
@@ -174,7 +174,7 @@ Only applies to INNER and LEFT joins with pure equality conditions (excludes IS 
 
 **Code path:** `src/creator/task_creator.cpp` — `manager_loop()`, `src/pipeline/task_scheduler.cpp` — `schedule_next_scan_tasks()`
 
-**Config:** `max_build_hash_table_bytes` (default: 500 MB) — now independent from `concat_batch_bytes`, enabling larger build sides in BUILD_PROBE mode without affecting other joins.
+**Config:** `max_build_hash_table_bytes` (default: 2× `hash_partition_bytes`) — now independent from `concat_batch_bytes`, enabling larger build sides in BUILD_PROBE mode without affecting other joins.
 
 ### Zero-Copy Projection Passthrough (PR #991)
 
