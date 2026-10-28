@@ -35,7 +35,6 @@
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/gpu_ingestible.hpp"
-#include "op/scan/iceberg_dv_preparation.hpp"
 #include "op/scan/iceberg_gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "op/scan/parquet_materialize.hpp"
@@ -48,6 +47,7 @@
 #include "op/sirius_physical_operator_type.hpp"
 #include "planner/late_mat_plan_pass.hpp"
 #include "planner/query.hpp"
+#include "scan_manager/preparation_ledger.hpp"
 #include "scan_manager/round_robin_strategy.hpp"
 #include "sirius_context.hpp"
 
@@ -1346,6 +1346,9 @@ sirius_scan_manager::sirius_scan_manager(
     _thread_pool(_config.thread_pool.num_threads,
                  _config.thread_pool.thread_name_prefix,
                  _config.thread_pool.cpu_affinity_list),
+    _native_readers(_config.preparation.resolved_native_workers(),
+                    _config.preparation.resolved_native_readers()),
+    _coordinators(_config.preparation.resolved_coordinator_workers()),
     _ioctx_registry(_config, reservation_manager)
 {
   if (!_topology_index) {
@@ -1483,6 +1486,34 @@ void sirius_scan_manager::prepare_for_query(
       query_id);
     reset(query_id);
   }
+
+  // Open/validate all bound provider transactions before any scan can hold a native
+  // checkpoint key. A later provider must not start its backend behind a forced checkpoint
+  // waiting on an earlier scan's key. Keep this pass before cache matching as well.
+  auto check_preflight = [&] {
+    if (completion) {
+      if (auto error = completion->terminal_error()) { std::rethrow_exception(error); }
+    }
+    if (interrupted && interrupted()) {
+      if (completion) {
+        completion->report_error(std::make_exception_ptr(duckdb::InterruptException()));
+        if (auto error = completion->terminal_error()) { std::rethrow_exception(error); }
+      }
+      throw duckdb::InterruptException();
+    }
+    if (checkpoint_key_count(query_id) != 0) {
+      throw std::logic_error("provider preflight requires an attempt without checkpoint keys");
+    }
+  };
+  std::unordered_set<op::scan::gpu_ingestible*> preflighted;
+  for (auto const& scan_op : query.get_scan_operators()) {
+    if (scan_op->type != ::sirius::op::SiriusPhysicalOperatorType::GPU_SCAN) { continue; }
+    auto& input = scan_op->Cast<op::scan::sirius_gpu_scan_operator>().get_ingestible();
+    if (!preflighted.insert(&input).second) { continue; }
+    check_preflight();
+    input.preflight_for_query();
+  }
+  check_preflight();
 
   // Refresh synchronized cache accounting; cache entries retain their own IO/read leases.
   if (_io_ctx && _io_ctx->cache()) {
@@ -1799,8 +1830,6 @@ void sirius_scan_manager::prepare_for_query(
   // The rides that DID install, so a rider can be argued against the scan that
   // owns the port it would join.
   std::vector<installed_ride> installed_rides;
-  auto const gpu_space_count =
-    _reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU).size();
   // A port carries one ride, and the scan that installs there first owns it: a later scan whose
   // bundle lands at the same port can only ride along. Visit the scans whose own bundle would save
   // the most (bytes per row times port crossings) first, so the plan's value decides who owns the
@@ -1841,6 +1870,8 @@ void sirius_scan_manager::prepare_for_query(
   };
   std::vector<provider_inputs> provider_inputs_by_assignment;
   provider_inputs_by_assignment.reserve(cached_assignments.size());
+  auto const gpu_space_count =
+    _reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU).size();
   for (auto& assignment : cached_assignments) {
     mvcc_chunk_mask_set masks;  // stays empty for parquet pins
     std::vector<insert_delta_split> delta_splits;
@@ -2013,12 +2044,22 @@ void sirius_scan_manager::prepare_for_query(
 
   // Publish only once the state is fully built: a prepare that threw above destroys `state`
   // locally and never leaves a half-built entry visible to reset() or a concurrent prepare.
+  start_metadata_processing(*state, std::move(interrupted));
   {
     std::lock_guard lk{_query_states_mutex};
     _query_states.emplace(query_id, state);
   }
+}
 
-  start_metadata_processing(*state, std::move(interrupted));
+std::unique_ptr<preparation_coordinator> sirius_scan_manager::make_preparation_coordinator(
+  query_scan_manager_state& state)
+{
+  return std::make_unique<preparation_coordinator>(
+    *state.completion,
+    *state.dispatcher,
+    state.preparation,
+    &_native_readers,
+    _config.preparation.resolved_coordinator_workers() ? &_coordinators : nullptr);
 }
 
 void sirius_scan_manager::start_metadata_processing(query_scan_manager_state& state,
@@ -2027,22 +2068,17 @@ void sirius_scan_manager::start_metadata_processing(query_scan_manager_state& st
   std::shared_ptr<preparation_admission> admission;
   for (auto const& entry : state.scans) {
     auto& ingestible = entry.op->get_ingestible();
-    auto const* info =
-      dynamic_cast<op::scan::iceberg_ingestible_table_info const*>(&ingestible.table_info());
-    if (!info || !info->deferred) continue;
+    auto requested   = ingestible.preparation_admission();
+    if (!requested) continue;
     if (!admission) {
-      admission    = info->deferred->admission();
+      admission    = std::move(requested);
       state.ledger = admission->consume();
-    } else if (admission != info->deferred->admission()) {
-      throw std::logic_error("Iceberg scans must share the statement admission");
+    } else if (admission != requested) {
+      throw std::logic_error("scans must share the statement preparation admission");
     }
-    auto* iceberg = dynamic_cast<op::scan::iceberg_gpu_ingestible*>(&ingestible);
-    if (!iceberg) throw std::logic_error("deferred DV preparation requires an Iceberg ingestible");
-    iceberg->begin_preparation(
-      std::make_shared<op::scan::iceberg_dv_attempt>(info->deferred, state.ledger));
+    ingestible.attach_preparation_ledger(state.ledger);
   }
-  state.coordinator = std::make_unique<preparation_coordinator>(
-    *state.completion, *state.dispatcher, state.preparation);
+  state.coordinator = make_preparation_coordinator(state);
   for (auto& scan : state.scans)
     if (auto* disk = std::get_if<query_scan_manager_state::disk_scan>(&scan.source))
       state.metadata_processor->register_coordinator_source(
@@ -2051,27 +2087,49 @@ void sirius_scan_manager::start_metadata_processing(query_scan_manager_state& st
   state.coordinator->arm();
 }
 
-void sirius_scan_manager::run_preparation_on_query_thread(sirius::query_id_t id)
+void sirius_scan_manager::start_preparation(sirius::query_id_t id)
 {
   auto state = get_query_state(id);
-  if (!state || !state->coordinator) return;
+  if (!state) return;
+  std::lock_guard execution_lock(state->execution_mutex);
+  if (state->draining || state->drained || !state->coordinator) return;
   auto cached = state->metadata_processor->prepare_cached_workers(*state->coordinator);
   for (auto& work : cached)
     state->dispatcher->enqueue(std::move(work));
   maybe_start_memory_prefetcher(*state);
-  state->coordinator->run_on_query_thread();
-  if (state->physical_counters && state->physical_counters->track_units) {
-    auto stats = state->coordinator->snapshot();
-    std::lock_guard lock(state->physical_counters->units_mutex);
-    auto& observation         = state->physical_counters->publications_by_query[state->query_token];
-    observation.execute_owner = state->completion->execution_owner;
-    observation.preparation_owner     = stats.owner;
-    observation.preparation_runner    = stats.runner;
-    observation.preparation_publisher = stats.publisher;
-    observation.preparation_runs      = stats.runs;
-    observation.partial_emissions     = stats.partial_emissions;
-    observation.max_residence         = stats.max_residence;
+  state->coordinator->start();
+}
+
+void sirius_scan_manager::await_query_completion(sirius::query_id_t id,
+                                                 std::future<void>& future,
+                                                 std::function<bool()> interrupted)
+{
+  // Retain the attempt through the wait. Registry and execution locks must never
+  // be held while entering a thread-affine provider operation.
+  auto state = get_query_state(id);
+  while (future.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
+    bool cancelled = false;
+    try {
+      cancelled = interrupted && interrupted();
+      if (cancelled) throw duckdb::InterruptException();
+    } catch (...) {
+      if (!state || !state->completion) throw;
+      // Record the cause before waking cleanup, which can itself fail.
+      state->completion->report_error(std::current_exception());
+      if (state->coordinator)
+        state->coordinator->request_stop(cancelled ? stop_reason::user_cancel
+                                                   : stop_reason::failure_induced);
+      break;  // Cancellation and health failures must preserve the first execution error.
+    }
+    // One operation per turn: recheck logical completion and cancellation before
+    // another pull. Logical completion still needs the owner's retirement barrier.
+    if (state && state->coordinator) {
+      state->coordinator->advance(std::chrono::milliseconds(25));
+    } else {
+      future.wait_for(std::chrono::milliseconds(25));
+    }
   }
+  future.get();
 }
 
 void sirius_scan_manager::close_preparation(sirius::query_id_t id, stop_reason reason) noexcept
@@ -2310,24 +2368,50 @@ void sirius_scan_manager::query_scan_manager_state::drain() noexcept
   // The engine retires scans while their operators are alive. Window cleanup and state
   // destruction repeat this barrier after a prepared statement may have released its plan.
   // Keep providers alive for batch disposal, but never revisit the borrowed operators.
-  if (std::exchange(drained, true)) { return; }
-  if (coordinator) coordinator->request_stop(stop_reason::normal_eos);
-  if (completion && completion->injections)
-    completion->release_footer_for_testing(completion->injections->hold_footer_index);
-  // Stop the prefetcher first: it holds shared_ptrs to the operators'
-  // connectors and must not convert batches while per-query state is torn down.
-  if (prefetcher) {
-    prefetcher->stop();
-    if (physical_counters && physical_counters->track_units) {
-      try {
-        physical_counters->prefetcher_conversions(query_token, prefetcher->batches_prefetched());
-      } catch (...) {  // Test observation must not interrupt cleanup.
+  {
+    std::lock_guard execution_lock(execution_mutex);
+    if (drained) return;
+    if (!draining) {
+      draining = true;  // Close start admission, not the completed-retirement barrier.
+      if (coordinator) coordinator->request_stop(stop_reason::normal_eos);
+      if (completion && completion->injections)
+        completion->release_footer_for_testing(completion->injections->hold_footer_index);
+      // Prefetch workers do not enter provider code. Stop them before retiring
+      // the coordinator; only this first caller owns their stop/join and reset.
+      if (prefetcher) {
+        prefetcher->stop();
+        if (physical_counters)
+          physical_counters->prefetcher_conversions(query_token, prefetcher->batches_prefetched());
+        prefetcher.reset();
       }
     }
-    prefetcher.reset();
   }
+  // All callers may enter this barrier. An external caller waits while Q pumps
+  // accepted work and close controls; it must not hold a lock Q needs to retire.
   if (coordinator) coordinator->drain();
-  if (!dispatcher) { return; }
+
+  // Provider close has finished. Serialize the remaining resource teardown once,
+  // and only mark drained after every caller can safely observe physical retirement.
+  std::lock_guard execution_lock(execution_mutex);
+  if (drained) return;
+  if (coordinator && physical_counters && physical_counters->track_units) {
+    try {
+      auto stats = coordinator->snapshot();
+      physical_counters->preparation_finished(query_token,
+                                              {.execute_owner         = completion->execution_owner,
+                                               .preparation_owner     = stats.owner,
+                                               .preparation_runner    = stats.runner,
+                                               .preparation_publisher = stats.publisher,
+                                               .preparation_runs      = stats.runs,
+                                               .partial_emissions     = stats.partial_emissions,
+                                               .max_residence         = stats.max_residence});
+    } catch (...) {  // Snapshot observation must not interrupt retirement.
+    }
+  }
+  if (!dispatcher) {
+    drained = true;
+    return;
+  }
   dispatcher->request_stop();
   dispatcher->wait_for_all();
   if (metadata_processor) metadata_processor->close_all_slots();
@@ -2337,9 +2421,9 @@ void sirius_scan_manager::query_scan_manager_state::drain() noexcept
   readahead.reset();
   if (ledger) ledger->close();
   for (auto const& entry : scans)
-    if (auto* ice = dynamic_cast<op::scan::iceberg_gpu_ingestible*>(&entry.op->get_ingestible()))
-      ice->stop_preparation();
+    entry.op->get_ingestible().stop_preparation();
   ledger.reset();
+  drained = true;
 }
 
 std::shared_ptr<sirius_scan_manager::query_scan_manager_state> sirius_scan_manager::get_query_state(
@@ -2355,6 +2439,15 @@ void sirius_scan_manager::quiesce(sirius::query_id_t query_id)
   if (auto state = get_query_state(query_id)) { state->drain(); }
 }
 
+void sirius_scan_manager::finish_preparation(sirius::query_id_t query_id) noexcept
+{
+  if (auto state = get_query_state(query_id)) {
+    for (auto const& entry : state->scans) {
+      entry.op->get_ingestible().finish_preparation();
+    }
+  }
+}
+
 void sirius_scan_manager::reset(sirius::query_id_t query_id)
 {
   drain_query(query_id);
@@ -2363,26 +2456,19 @@ void sirius_scan_manager::reset(sirius::query_id_t query_id)
 
 void sirius_scan_manager::drain_query(sirius::query_id_t query_id)
 {
-  std::shared_ptr<query_scan_manager_state> state;
+  auto state = get_query_state(query_id);
+  if (!state) return;
+  // Keep the state discoverable while an external caller waits for Q-owned
+  // work/close. Q may still need to resolve this id in its wait or retirement path.
+  // Neither the registry lock nor a once-only cleanup lock covers this barrier.
+  state->drain();
   {
     std::lock_guard lk{_query_states_mutex};
     auto it = _query_states.find(query_id);
-    if (it != _query_states.end()) {
-      state = std::move(it->second);
-      _query_states.erase(it);
-    }
+    if (it != _query_states.end() && it->second == state) _query_states.erase(it);
   }
-  // Outside the lock on purpose: draining waits out this query's in-flight reads, which can
-  // take as long as the slowest outstanding IO. Holding _query_states_mutex across it would
-  // park another connection's prepare_for_query behind this query's teardown.
-  //
-  // Order matters: stop and join FIRST, then let `state` die. The sequencer task captures the
-  // coalescer by `this` and the split tasks captured the providers, so destroying either with
-  // a task still running is a use-after-free (scoped_dispatcher's dtor asserts on it).
-  // ~query_scan_manager_state then runs: coordinator first, then dispatcher (already idle),
-  // then the coalescer and providers.
-  if (state) { state->drain(); }
-  state.reset();
+  // Destruction stays outside the registry lock, after coordinator and dispatcher
+  // retirement. Concurrent callers retain their own references through the same barrier.
 }
 
 void sirius_scan_manager::reset_all()
@@ -2560,7 +2646,11 @@ void sirius_scan_manager::stop()
 {
   // Every query's scan work must be off the pool before the pool stops: a sequencer parked on
   // a dequeue that will never be satisfied would otherwise never return.
+  // Requires the runtime owner to prevent new queries and finish preparation construction.
+  // Concurrent prepare/stop is outside this manager shutdown contract.
   reset_all();
+  _coordinators.stop();
+  _native_readers.stop();  // Every accepted reader has closed and returned its lease.
   _thread_pool.stop();
 }
 
@@ -2650,19 +2740,9 @@ std::vector<std::size_t> cache_entry_info::can_serve_with_columns(
   // serves a duckdb scan over the same catalog.schema.table. A cache of one format
   // never serves a scan of the other — the identity check below falls through (a
   // duckdb cache has empty resolved_file_paths; a parquet cache has an empty table_name).
-  // An iceberg scan carrying deletes is NOT a parquet scan over the same files, even though its
-  // bind data derives from parquet's and its file set matches exactly. A pinned entry holds the
-  // data files' rows as written; the deletes live in manifests the pin never saw. Serving that
-  // cache would return rows the table logically deleted, and would look like a cache hit rather
-  // than a correctness bug — so an iceberg scan with deletes always reads from disk.
-  if (auto const* ice = dynamic_cast<op::scan::iceberg_ingestible_table_info const*>(&other)) {
-    if (ice->deferred || (ice->delete_data && !ice->delete_data->empty()) ||
-        (ice->delete_sets && std::ranges::any_of(*ice->delete_sets, [](auto const& e) {
-           return !e.second || !e.second->positions.empty();
-         }))) {
-      return {};
-    }
-  }
+  // The adapter owns visibility semantics.  A source with deletes, overlays,
+  // or other row-level state absent from the pinned entry vetoes reuse here.
+  if (!other.allows_cached_rows()) return {};
   if (auto const* p = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(&other)) {
     // Cached parquet batches have no per-row file provenance.
     if (p->has_requested_user_virtual_columns()) { return {}; }
@@ -3305,9 +3385,8 @@ std::size_t sirius_scan_manager::pin_parquet_ranges(
 
   std::size_t total_bytes = 0;
   for (auto const& path : file_paths) {
-    auto const cache_key     = normalize_path(path);
     auto const io_ctx        = ioctx_for_path(path);
-    bool const footer_cached = io_ctx && io_ctx->metadata_store().has_path(cache_key);
+    auto const footer_cached = io_ctx && io_ctx->metadata_store().has_path(path);
     auto datasource          = create_datasource(
       path,
       footer_cached ? sirius::io::open_hint::generic : sirius::io::open_hint::parquet_footer_probe);
@@ -3319,8 +3398,15 @@ std::size_t sirius_scan_manager::pin_parquet_ranges(
     // file is parsed at most once per process however it is first touched.
     auto const probe_options     = cudf::io::parquet_reader_options::builder().build();
     auto const expected_identity = datasource->get_io_object().identity_cache_key();
-    auto const resolution =
+    auto resolution =
       op::scan::resolve_parquet_metadata_with_identity(*datasource, 0, path, probe_options);
+    if (resolution.identity != expected_identity) {
+      // A stale local footer from a previous open must never poison a pin. Clear the
+      // backend's metadata generation and retry once after observing the new object.
+      if (io_ctx) io_ctx->metadata_store().invalidate(datasource->get_io_object().object_path());
+      resolution =
+        op::scan::resolve_parquet_metadata_with_identity(*datasource, 0, path, probe_options);
+    }
     if (resolution.identity != expected_identity) {
       if (_physical_counters)
         _physical_counters->metadata_provenance_mismatches.fetch_add(1, std::memory_order_relaxed);

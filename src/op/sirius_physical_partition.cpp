@@ -290,10 +290,9 @@ partition_input_stats sirius_physical_partition::compute_input_totals()
     if (batch) {
       auto ro = batch->to_read_only();
       if (ro.get_data()) {
-        auto const bytes      = ro.get_data()->get_size_in_bytes();
-        totals.bytes          = memory::saturating_add(totals.bytes, bytes);
-        totals.resident_bytes = memory::saturating_add(
-          *totals.resident_bytes, ro.get_data()->get_uncompressed_data_size_in_bytes());
+        auto const bytes         = ro.get_data()->get_uncompressed_data_size_in_bytes();
+        totals.bytes             = memory::saturating_add(totals.bytes, bytes);
+        totals.resident_bytes    = memory::saturating_add(*totals.resident_bytes, bytes);
         auto const measured_rows = representation_num_rows(*ro.get_data());
         if (totals.measured_rows) {
           totals.measured_rows = measured_rows ? std::optional<uint64_t>{memory::saturating_add(

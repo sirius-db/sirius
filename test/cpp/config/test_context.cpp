@@ -15,6 +15,7 @@
  */
 
 #include "catch.hpp"
+#include "compression/spill_compression.hpp"
 #include "log/level.hpp"
 #include "log/sink.hpp"
 #include "sirius/ffi.hpp"
@@ -65,48 +66,14 @@
 #include <vector>
 
 namespace {
-// MGPU-06 test helper: enable CUDA driver-level peer access for every GPU
-// pair, idempotently, with sticky-error consumption (matches Plan 07-01's
-// enable-loop pattern at sirius_context.cpp). Test-scope because this
-// TEST_CASE builds a bare memory manager rather than going through
-// SiriusContext::initialize() — without this the peer-async convert path
-// hits cudaErrorIllegalAddress on the return leg. Returns true if at
-// least one pair is bidirectionally P2P-capable.
-bool enable_p2p_for_test(int num_gpus)
-{
-  bool any_enabled = false;
-  for (int i = 0; i < num_gpus; ++i) {
-    for (int j = 0; j < num_gpus; ++j) {
-      if (i == j) { continue; }
-      int can_access = 0;
-      if (cudaDeviceCanAccessPeer(&can_access, i, j) != cudaSuccess || !can_access) {
-        (void)cudaGetLastError();
-        continue;
-      }
-      cudaError_t prev_dev_err = cudaSetDevice(i);
-      (void)prev_dev_err;
-      cudaError_t enable_err = cudaDeviceEnablePeerAccess(j, 0);
-      (void)cudaGetLastError();  // consume sticky state (see 07-01 SUMMARY)
-      if (enable_err == cudaSuccess || enable_err == cudaErrorPeerAccessAlreadyEnabled) {
-        any_enabled = true;
-      }
-    }
-  }
-  cudaSetDevice(0);
-  (void)cudaGetLastError();
-  return any_enabled;
-}
-
-// MGPU-06 data integrity guard (Phase 7 / RESEARCH.md Pitfall 2). FNV-1a
-// checksum over a packed batch payload. Duplicated here because the
+// Data integrity guard: FNV-1a checksum over a packed batch payload.
+// Duplicated here because the
 // equivalent helper in test/cpp/downgrade/test_downgrade_executor.cpp lives
 // in an anonymous namespace and is not reachable from this TU.
-// Phase 18 / DB-03: const dropped from data_batch& parameter (mirrors
-// debug_utils.hpp pattern from plan 18-04). cucascade #117's to_read_only is
-// non-const because it acquires the shared lock.
+// The batch is mutable because to_read_only acquires its shared lock.
 uint64_t compute_batch_checksum_fnv1a64(cucascade::data_batch& batch, ::cuda::stream_ref stream)
 {
-  // Phase 18 / DB-03 Recipe R1: scoped read-only accessor for the lifetime
+  // Hold a scoped read-only accessor for the lifetime
   // of gpu_rep, packed, and host_buf — released at function exit.
   auto ro             = batch.to_read_only();
   auto const& gpu_rep = ro.get_data()->cast<cucascade::gpu_table_representation>();
@@ -896,6 +863,36 @@ TEST_CASE("Sirius configuration accepts intentional compression retention fracti
   require_fraction("valid_compression_fraction_above_one.yaml", 1.5);
 }
 
+TEST_CASE("Sirius configuration loads spill compression settings", "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
+
+  sirius::sirius_config config;
+  REQUIRE_NOTHROW(config.load_from_file(data_dir / "valid_spill_compression.yaml"));
+  auto const& compression = config.get_compression_config();
+  REQUIRE(compression.enable_spill_compression);
+  REQUIRE(compression.spill_min_batch_bytes == 32ULL * 1024 * 1024);
+  REQUIRE(compression.spill_max_compressed_fraction == Approx(0.5));
+  REQUIRE(compression.max_compressed_fraction ==
+          Approx(sirius::compression_config{}.max_compressed_fraction));
+  REQUIRE(compression.spill_encode_reserve_fraction == Approx(0.25));
+
+  sirius::sirius_config negative_fraction;
+  REQUIRE_THROWS_WITH(negative_fraction.load_from_file(
+                        data_dir / "invalid_spill_max_compressed_fraction_negative.yaml"),
+                      Catch::Matchers::ContainsSubstring("spill_max_compressed_fraction"));
+
+  for (auto const* fixture : {"invalid_spill_encode_reserve_fraction_above_one.yaml",
+                              "invalid_spill_encode_reserve_fraction_negative.yaml",
+                              "invalid_spill_encode_reserve_fraction_nan.yaml"}) {
+    INFO("fixture=" << fixture);
+    sirius::sirius_config rejected;
+    REQUIRE_THROWS_WITH(rejected.load_from_file(data_dir / fixture),
+                        Catch::Matchers::ContainsSubstring("spill_encode_reserve_fraction"));
+  }
+}
+
 TEST_CASE("Sirius configuration keeps task creation policy internal", "[sirius][config]")
 {
   std::source_location loc = std::source_location::current();
@@ -1406,9 +1403,12 @@ TEST_CASE("DuckDB setting rejects invalid compression retention fractions withou
 TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
           "[sirius][context][config][isolated_context]")
 {
-  finally cleanup_env{[]() {
+  // The fixture turns spill compression on, which applies to the whole process.
+  auto const saved_spill_settings = sirius::compression::get_spill_compression_settings();
+  finally cleanup_env{[saved_spill_settings]() {
     unsetenv("SIRIUS_CONFIG_FILE");
     setenv("SIRIUS_DISABLE", "1", 1);
+    sirius::compression::set_spill_compression_settings(saved_spill_settings);
   }};
 
   std::source_location loc = std::source_location::current();
@@ -1447,7 +1447,8 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
       current_setting('dynamic_filter_inlist_max_l2_fraction')::DOUBLE,
       current_setting('enable_dynamic_filter_multi_partition')::BOOLEAN,
       current_setting('max_dynamic_filter_bloom_bytes_per_gpu')::UBIGINT,
-      current_setting('max_build_probe_resident_bytes')::UBIGINT
+      current_setting('max_build_probe_resident_bytes')::UBIGINT,
+      current_setting('spill_compression')::BOOLEAN
   )");
   REQUIRE(settings != nullptr);
   REQUIRE_FALSE(settings->HasError());
@@ -1492,6 +1493,7 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   REQUIRE(resident_reset != nullptr);
   REQUIRE_FALSE(resident_reset->HasError());
   require_resident_budget(9 * mib);
+  REQUIRE(settings->Collection().GetValue(23, 0).GetValue<bool>());
 
   for (auto const* invalid_budget : {"-1", "0", "18446744073709551616"}) {
     auto rejected =
@@ -2294,13 +2296,6 @@ TEST_CASE("gpu_to_gpu round-trip preserves bytes on N>=2 hosts (MGPU-04 + MGPU-0
   REQUIRE(gpu0->get_device_id() == 0);
   REQUIRE(gpu1->get_device_id() == 1);
 
-  // Enable CUDA driver-level peer access for every GPU pair — Plan 07-01's
-  // enable loop normally runs inside SiriusContext::initialize(), but this
-  // TEST_CASE builds a bare memory manager and bypasses that seam. Without
-  // the enable call cucascade's peer-async convert_gpu_to_gpu triggers
-  // cudaErrorIllegalAddress on the GPU1 -> GPU0 return leg (MGPU-06 bug).
-  enable_p2p_for_test(2);
-
   // Build a minimal GPU-resident batch on gpu0. The make_gpu_batch helper in
   // test_downgrade_executor.cpp lives in an anonymous namespace and is not
   // reachable from this TU; replicate its body inline using the
@@ -2334,7 +2329,7 @@ TEST_CASE("gpu_to_gpu round-trip preserves bytes on N>=2 hosts (MGPU-04 + MGPU-0
   auto checksum_pre = compute_batch_checksum_fnv1a64(*batch, stream);
 
   // GPU0 -> GPU1 forward leg.
-  // Phase 18 / DB-03 Recipe R8 + R3: scoped mutable accessor.
+  // Scoped mutable accessor.
   {
     auto mut = batch->to_mutable();
     mut.convert_to<cucascade::gpu_table_representation>(registry, gpu1, stream);
@@ -2350,7 +2345,7 @@ TEST_CASE("gpu_to_gpu round-trip preserves bytes on N>=2 hosts (MGPU-04 + MGPU-0
   // SiriusContext::initialize() closes the Phase-4-deferred GPU1 -> GPU0
   // bug. Checksum integrity guard per RESEARCH.md Pitfall 2 (silent data
   // corruption on Ada Lovelace + Sapphire Rapids).
-  // Phase 18 / DB-03 Recipe R8 + R3: scoped mutable accessor.
+  // Scoped mutable accessor.
   {
     auto mut = batch->to_mutable();
     mut.convert_to<cucascade::gpu_table_representation>(registry, gpu0, stream);
@@ -2588,4 +2583,33 @@ TEST_CASE("Sirius query options stay local and snapshots remain immutable",
   execute(a, "RESET scan_task_batch_size");
   CHECK(duckdb::query_operator_options(*a.context)->scan_task_batch_size ==
         defaults.scan_task_batch_size);
+}
+
+TEST_CASE("Sirius admission configuration has one authoritative limit",
+          "[sirius][config][query_admission]")
+{
+  auto path = fs::temp_directory_path() / "sirius_admission_config.yaml";
+  finally remove{[&] { fs::remove(path); }};
+  auto load = [&](const char* yaml) {
+    {
+      std::ofstream out(path);
+      out << yaml;
+    }
+    sirius::sirius_config cfg;
+    cfg.load_from_file(path);
+    return cfg;
+  };
+  CHECK(load("sirius: {max_concurrent_queries: 4}").max_concurrent_queries() == 4);
+  CHECK(load("sirius: {executor: {scan_manager: {max_concurrent_queries: 2}}}")
+          .max_concurrent_queries() == 2);
+  CHECK(
+    load(
+      "sirius: {max_concurrent_queries: 2, executor: {scan_manager: {max_concurrent_queries: 2}}}")
+      .max_concurrent_queries() == 2);
+  REQUIRE_THROWS_WITH(
+    load(
+      "sirius: {max_concurrent_queries: 2, executor: {scan_manager: {max_concurrent_queries: 3}}}"),
+    Catch::Matchers::ContainsSubstring("conflicting"));
+  REQUIRE_THROWS(load("sirius: {max_concurrent_queries: 0}"));
+  CHECK(load("sirius: {}").max_concurrent_queries() == 1);
 }

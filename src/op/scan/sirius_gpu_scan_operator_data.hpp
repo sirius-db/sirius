@@ -66,6 +66,9 @@ struct membership_snapshot {
     probes;                      ///< Parallel to selected slots; closures retain filters.
   std::uint64_t generation = 0;  ///< Channel generation captured with these probes.
   std::vector<applied_entry> attached;
+  /// Whether the decode reports the probes' keep ratio (`decode_selection::measure` and
+  /// `decode_selection::complete`).
+  sirius::membership_measurement_request measurement;
 };
 
 /**
@@ -175,6 +178,10 @@ class scan_operator_input : public op::operator_data {
   /// Initialize hints, buffers and readahead before exposing this input to consumers.
   /// Single-owner, at most once; an exception requires discarding the input, not retrying it.
   void initialize_prefetch();
+  // Single-owner stages: prepare may call datasources and must run outside the publication gate.
+  // Publish only registers the prepared input with readahead; it never calls datasource hooks.
+  void prepare_prefetch();
+  void publish_prefetch();
 
   explicit scan_operator_input(
     std::shared_ptr<cucascade::data_batch> cached_batch,
@@ -210,6 +217,25 @@ class scan_operator_input : public op::operator_data {
   {
     return is_resident() && !mvcc_keep_mask.has_mask() &&
            (!row_filter_pending || pushdown_row_filtered);
+  }
+
+  /// Whether materialize_table will serve a view of the cached batch itself: the split is resident,
+  /// carries no mvcc keep-mask, and prepare_for_processing has not taken its table.
+  [[nodiscard]] bool borrows_resident_batch() const noexcept
+  {
+    return is_resident() && !mvcc_keep_mask.has_mask() && stolen_table == nullptr &&
+           !stolen_table_consumed;
+  }
+
+  /// Whether `sirius_gpu_scan_operator::execute`, after any transfer, offers this split to the
+  /// scan's cached dynamic-filter checkpoint. The working-set estimate reserves the checkpoint's
+  /// envelope on the same condition unless the split's decode is forecast to compact. Before
+  /// prepare_for_processing this also holds for a split whose table a steal or execute's transfer
+  /// will take, so a cold estimate may reserve the envelope for a split that never reaches the
+  /// checkpoint, but never misses one that does.
+  [[nodiscard]] bool cached_checkpoint_possible() const noexcept
+  {
+    return cached_view_possible && borrows_resident_batch();
   }
 
   [[nodiscard]] bool has_scan_metadata() const noexcept
@@ -346,6 +372,9 @@ class scan_operator_input : public op::operator_data {
   /// membership probes for this split's decode through its decode bindings; null when no decode
   /// attachment is permitted.
   std::shared_ptr<dynamic_filter_consumer> consumer;
+  /// `sirius_gpu_scan_operator::cached_view_possible`, stamped by
+  /// `sirius_gpu_scan_operator::get_next_task_input_data` before any reservation estimate runs.
+  bool cached_view_possible{false};
   /// Possible membership applications attached to this split's current decoded rows.
   std::vector<applied_entry> decode_attached;
   /// Operator-shared latch for "compacting this scan's batches during decode
@@ -400,6 +429,11 @@ class scan_operator_input : public op::operator_data {
   /// @throws std::runtime_error if the decode compacted rows but left an mvcc keep-mask unconsumed.
   void record_decode_outcome(::cucascade::idata_representation const* data);
 
+  /// Reports the keep ratios a decode measured for the membership probes attached from `consumer`,
+  /// together and per filter, so the consumer can decide without a clean batch.
+  void report_membership_keep(
+    std::optional<pushdown_outcome::membership_keep_observation> const& observation) const noexcept;
+
   /// Whether the input has already been decoded for a retry (preserve dynamic filter history)
   bool _decoded_input_reused{false};
   /// Per-query readahead bookkeeping this split reports into; null when the
@@ -407,7 +441,8 @@ class scan_operator_input : public op::operator_data {
   std::shared_ptr<scan_manager::readahead_scan_manager> _readahead;
   /// Operator id this split was emitted under, the key @ref _readahead uses.
   std::size_t _operator_id{0};
-  bool _prefetch_started{false};
+  enum class prefetch_phase { idle, preparing, prepared, published };
+  prefetch_phase _prefetch_phase{prefetch_phase::idle};
 };
 
 }  // namespace sirius::op::scan

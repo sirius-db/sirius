@@ -646,14 +646,9 @@ bool dynamic_filter_publication_session::try_begin_accumulation(
       selection.accumulations_skipped_admission = 1;
       return false;
     }
-    std::vector<int> replica_devices;
-    replica_devices.reserve(replicas.size());
-    for (auto const& replica : replicas) {
-      replica_devices.push_back(replica.get_gpu_space().get_device_id());
-    }
-    if (auto const broken = find_pair_without_peer_dma(replica_devices)) {
+    if (auto const broken = find_pair_without_pool_access(replicas)) {
       SIRIUS_LOG_INFO(
-        "[dynamic_filter_publication_session] accumulated Bloom skipped: no working peer DMA "
+        "[dynamic_filter_publication_session] accumulated Bloom skipped: unavailable pool access "
         "from GPU {} to GPU {}.",
         broken->first,
         broken->second);

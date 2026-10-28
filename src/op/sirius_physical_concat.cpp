@@ -62,10 +62,9 @@ std::optional<std::vector<uint64_t>> sirius_physical_concat::plan_pull_for_parti
       }
       total_rows += *stats.rows;
     }
-    // Unknown row counts are checked against the actual tables after preparation.
-    auto batch_ro = batch_idle->to_read_only();
-    total_batch_size =
-      memory::saturating_add(total_batch_size, batch_ro.get_data()->get_size_in_bytes());
+    // Unknown row counts are checked against the actual tables after preparation. The byte count
+    // is the decoded size: a compressed batch occupies a fraction of what the task will decode.
+    total_batch_size = memory::saturating_add(total_batch_size, stats.bytes);
     if (!_concat_all && total_batch_size > _concat_batch_bytes) {
       // The accumulated group is complete; the overflowing batch seeds the next group.
       if (!group.empty()) { return group; }

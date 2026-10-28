@@ -75,6 +75,37 @@ TEST_CASE_METHOD(AggNullFixture,
 }
 
 TEST_CASE_METHOD(AggNullFixture,
+                 "gpu_execution partition-wide COUNT(*) counts NULL rows",
+                 "[integration][gpu_execution][aggregate][nulls][count_star_window]")
+{
+  // DuckDB rewrites this partition-wide window to a grouped aggregate whose
+  // COUNT(*) is named count and has no arguments (#2291). The NULL partition
+  // key and all-NULL values must not make that row count skip any rows.
+  compare_gpu_vs_cpu(
+    "SELECT g, v, COUNT(*) OVER w, COUNT(v) OVER w, COUNT(allnull) OVER w, "
+    "COUNT(DISTINCT v) OVER w FROM agg_n WINDOW w AS (PARTITION BY g)");
+}
+
+TEST_CASE_METHOD(AggNullFixture,
+                 "gpu_execution QUALIFY uses partition-wide COUNT(*)",
+                 "[integration][gpu_execution][aggregate][nulls][count_star_window]")
+{
+  // Keep the NULL-key partition and discard the singleton all-NULL group.
+  compare_gpu_vs_cpu(
+    "SELECT g, v, COUNT(*) OVER w FROM agg_n WINDOW w AS (PARTITION BY g) "
+    "QUALIFY COUNT(*) OVER w > 1");
+}
+
+TEST_CASE_METHOD(AggNullFixture,
+                 "gpu_execution COUNT over empty input",
+                 "[integration][gpu_execution][aggregate][nulls][count_empty]")
+{
+  // An ungrouped count emits one row of zeros; a grouped count emits no rows.
+  compare_gpu_vs_cpu("SELECT COUNT(*), COUNT(v), COUNT(DISTINCT v) FROM agg_n WHERE g = 999");
+  compare_gpu_vs_cpu("SELECT g, COUNT(*), COUNT(v) FROM agg_n WHERE g = 999 GROUP BY g");
+}
+
+TEST_CASE_METHOD(AggNullFixture,
                  "gpu_execution ungrouped SUM/MIN/MAX skip NULLs",
                  "[integration][gpu_execution][aggregate][nulls]")
 {

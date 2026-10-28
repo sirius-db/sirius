@@ -71,6 +71,7 @@
 // standard library
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <utility>
 
 namespace sirius::op::detail {
@@ -115,6 +116,21 @@ __device__ __forceinline__ bool prior_mask_keeps(std::uint32_t const* words,
   return words == nullptr ||
          ((words[static_cast<std::size_t>(row) >> 5] >> (static_cast<std::uint32_t>(row) & 31U)) &
           1U) != 0U;
+}
+
+__device__ __forceinline__ bool prior_mask_keeps(bool const* keep, cudf::size_type row) noexcept
+{
+  return keep == nullptr || keep[row];
+}
+
+inline bool const* checked_prior_keep(cudf::column_view const& probe,
+                                      cudf::column_view const& prior_keep)
+{
+  if (prior_keep.type().id() != cudf::type_id::BOOL8 || prior_keep.nullable() ||
+      prior_keep.size() != probe.size()) {
+    throw std::invalid_argument{"prior_keep must be nonnullable BOOL8 with probe.size() rows"};
+  }
+  return prior_keep.is_empty() ? nullptr : prior_keep.data<bool>();
 }
 
 /// Validity of the probe rows. A null probe key can never equal a build key: admission never
@@ -261,6 +277,17 @@ bool dispatch_probe_adapter(membership_key_domain const& domain,
 // Probe kernel
 //===----------------------------------------------------------------------===//
 
+template <class Adapter, class Lookup>
+__device__ __forceinline__ bool membership_row_keeps(Adapter const& adapt,
+                                                     Lookup const& lookup,
+                                                     probe_validity valid,
+                                                     cudf::size_type row) noexcept
+{
+  if (!valid(row)) { return false; }
+  typename Adapter::key_type key;
+  return adapt(row, key) && lookup(key);
+}
+
 /// The per-row probe shared by the three filters. A row the prior keep-mask killed or whose probe
 /// key is null is a definite non-member (null build slots were compacted out and the join never
 /// matches nulls); so is a value the adapter cannot represent in the key domain, since every
@@ -273,16 +300,16 @@ struct membership_probe_functor {
   Lookup lookup;
   bool* __restrict__ out;
   std::uint32_t const* __restrict__ prior_words;  // packed 1 bit/row, or null
+  bool const* __restrict__ prior_keep;
   probe_validity valid;
 
   __device__ __forceinline__ void operator()(cudf::size_type idx) const noexcept
   {
-    if (!prior_mask_keeps(prior_words, idx) || !valid(idx)) {
-      out[idx] = false;
-      return;
-    }
-    key_type key;
-    out[idx] = adapt(idx, key) && lookup(key);
+    // clang-format off
+    out[idx] = prior_mask_keeps(prior_words, idx) &&
+               prior_mask_keeps(prior_keep, idx) &&
+               membership_row_keeps(adapt, lookup, valid, idx);
+    // clang-format on
   }
 };
 
@@ -299,7 +326,8 @@ template <class KeyT, class Lookup>
   std::uint32_t const* prior_mask_words,
   ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr,
-  Lookup lookup)
+  Lookup lookup,
+  bool const* prior_keep = nullptr)
 {
   std::unique_ptr<cudf::column> out;
   auto const n          = probe.size();
@@ -307,11 +335,11 @@ template <class KeyT, class Lookup>
     out = cudf::make_numeric_column(
       cudf::data_type{cudf::type_id::BOOL8}, n, cudf::mask_state::UNALLOCATED, stream, mr);
     auto* const outp = out->mutable_view().data<bool>();
-    CUCASCADE_CUDA_TRY(
-      cub::DeviceFor::Bulk(n,
-                           membership_probe_functor<decltype(adapter), Lookup>{
-                             adapter, lookup, outp, prior_mask_words, probe_validity_of(probe)},
-                           stream.get()));
+    CUCASCADE_CUDA_TRY(cub::DeviceFor::Bulk(
+      n,
+      membership_probe_functor<decltype(adapter), Lookup>{
+        adapter, lookup, outp, prior_mask_words, prior_keep, probe_validity_of(probe)},
+      stream.get()));
   });
   if (!dispatched) { return nullptr; }
   return out;

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // selection_wave.cu — device helpers for the row-selection wave
-// (SIRIUS_EXP_FUSED_SCAN_FILTER). Three pieces, all mask-shaped (1 bit/row,
+// (SIRIUS_EXP_FUSED_SCAN_FILTER). Four pieces, all mask-shaped (1 bit/row,
 // 32 uint32 words per 1024-row chunk, tail bits zero):
 //
 //   * combine_masks_and : AND k per-column ballot masks into one batch mask.
@@ -11,6 +11,9 @@
 //                         wave-2 allocations).
 //   * mask_to_row_indices : mask -> ascending int32 survivor rows (the TierB
 //                         cudf::gather map, built once per batch).
+//   * count_masked_rows : the rows set in the AND of a few masks, accumulated into
+//                         a device counter that run_selection_cnt can read back
+//                         with its host sync (the membership measurement).
 //
 // CNT's shape is deliberate and was measured: one block per chunk is the
 // obvious form and the slow one; it is word-per-thread grid-stride with a warp
@@ -52,7 +55,9 @@
 #include <cub/device/device_scan.cuh>
 #include <cuda_runtime.h>
 
+#include <array>
 #include <cstdint>
+#include <span>
 #include <stdexcept>
 #include <string>
 
@@ -130,6 +135,27 @@ __global__ void chunk_popcount_kernel(uint32_t const* __restrict__ words,
       pc += __shfl_down_sync(kFullWarp, pc, o);
     if (lane == 0) counts[warp] = pc;
   }
+}
+
+// *count += popcount(AND of the sources) over every word: thread popcount, warp reduce, one atomic
+// per warp. Grid-stride.
+__global__ void count_and_rows_kernel(mask_src_ptrs srcs,
+                                      int num_srcs,
+                                      int64_t num_words,
+                                      uint32_t* __restrict__ count)
+{
+  int64_t const stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  unsigned pc          = 0;
+  for (int64_t w = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; w < num_words;
+       w += stride) {
+    uint32_t v = srcs.p[0][w];
+    for (int s = 1; s < num_srcs; ++s)
+      v &= srcs.p[s][w];
+    pc += __popc(v);
+  }
+  for (int o = 16; o; o >>= 1)
+    pc += __shfl_down_sync(kFullWarp, pc, o);
+  if ((threadIdx.x & 31) == 0 && pc != 0) atomicAdd(count, pc);
 }
 
 // Sentinel: chunk_offsets[nc] = chunk_offsets[nc-1] + counts[nc-1]. One thread;
@@ -274,9 +300,27 @@ void combine_masks_and(uint32_t* dst_words,
   throw_on_cuda(cudaPeekAtLastError(), "mask_and_combine launch");
 }
 
+void count_masked_rows(uint32_t const* const* src_words,
+                       int num_srcs,
+                       int64_t num_words,
+                       uint32_t* count,
+                       ::cuda::stream_ref stream)
+{
+  if (num_srcs < 1 || num_srcs > 8)
+    throw std::runtime_error("selection_wave: count_masked_rows needs 1..8 sources");
+  if (num_words == 0) return;
+  mask_src_ptrs srcs{};
+  for (int s = 0; s < num_srcs; ++s)
+    srcs.p[s] = src_words[s];
+  count_and_rows_kernel<<<grid_for(num_words, kBlock), kBlock, 0, stream.get()>>>(
+    srcs, num_srcs, num_words, count);
+  throw_on_cuda(cudaPeekAtLastError(), "count_and_rows launch");
+}
+
 int64_t run_selection_cnt(selection_mask& mask,
                           ::cuda::stream_ref stream,
-                          rmm::device_async_resource_ref mr)
+                          rmm::device_async_resource_ref mr,
+                          counter_readback counters)
 {
   if (mask.words == nullptr || mask.chunk_offsets == nullptr || mask.num_rows <= 0)
     throw std::runtime_error("selection_wave: run_selection_cnt on an unbound mask");
@@ -310,7 +354,11 @@ int64_t run_selection_cnt(selection_mask& mask,
   // TierA columns, the TierB gather map). Staged through the thread's pinned slab, see
   // read_device_bytes_completed.
   std::uint32_t total = 0;
-  simpatico::read_device_bytes_completed(&total, mask.chunk_offsets + nc, sizeof total, stream);
+  std::array<simpatico::device_read, 2> const reads{
+    simpatico::device_read{&total, mask.chunk_offsets + nc, sizeof total},
+    simpatico::device_read{counters.host.data(), counters.device, counters.host.size_bytes()}};
+  simpatico::read_device_bytes_completed(std::span{reads}.first(counters.host.empty() ? 1 : 2),
+                                         stream);
 
   mask.survivor_count = static_cast<int64_t>(total);
   return mask.survivor_count;

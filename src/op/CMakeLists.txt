@@ -4,6 +4,7 @@ target_sources(
           aggregate/stddev.cpp
           aggregate/group_key_labels.cpp
           aggregate/gpu_aggregate_impl.cpp
+          window/whole_partition.cpp
           merge/gpu_merge_impl.cpp
           order/gpu_order_impl.cpp
           partition/gpu_partition_impl.cpp
@@ -23,6 +24,7 @@ target_sources(
           scan/owning_table_view.cpp
           scan/parquet_batch_layout.cpp
           scan/parquet_byte_range.cpp
+          scan/parquet_source_filter.cpp
           scan/parquet_schema_mapping.cpp
           scan/scan_plan.cpp
           scan/scan_filter_analysis.cpp
@@ -31,6 +33,11 @@ target_sources(
           scan/sirius_gpu_scan_operator_data.cpp
           scan/gpu_ingestible.cpp
           scan/parquet_gpu_ingestible.cpp
+          scan/parquet_scan_core.cpp
+          scan/materialization_contract.cpp
+          scan/positional_visibility.cpp
+          scan/field_id_mapping.cpp
+          scan/arrow_materializer.cpp
           scan/parquet_materialize.cpp
           scan/duckdb_native_gpu_ingestible.cpp
           scan/table_scan/bound_read_view.cpp

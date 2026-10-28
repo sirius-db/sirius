@@ -116,10 +116,10 @@ The alternative order is part of the ABI: `std::variant` indexes by position and
 | `between` | `sirius::ast::between` | `BETWEEN … AND …` |
 | `case_expr` | `sirius::ast::case_expr` | `CASE WHEN … THEN … ELSE … END` |
 | `cast` | `sirius::ast::cast` | `CAST(x AS T)` |
-| `unary_op` | `sirius::ast::unary_op` | `NOT x`, `-x`, arithmetic binary ops (`+`, `-`, `*`, `/`) |
+| `unary_op` | `sirius::ast::unary_op` | `NOT x`, `x IS NULL`, `x IS NOT NULL` |
 | `coalesce` | `sirius::ast::coalesce` | `COALESCE(a, b, 0)` |
 | `in_list` | `sirius::ast::in_list` | `x IN (1, 2, 3)` |
-| `function_call` | `sirius::ast::function_call` | Named function (`YEAR`, `UPPER`, `concat`, etc.) — `sirius::function_id` enum |
+| `function_call` | `sirius::ast::function_call` | Named function (`YEAR`, `UPPER`, `concat`, etc.) and arithmetic (`a + b`, `-x`) — `sirius::function_id` enum |
 | `aggregate` | `sirius::ast::aggregate` | Aggregate function (`SUM`, `COUNT`, etc.) — `sirius::aggregate_id` enum |
 
 **Translation boundary:** `sirius::ast::from_duckdb(expr)` produces a `sirius::ast::node` from a `duckdb::Expression`. This happens once at plan time in the plan builders (and at the scan boundary for pushdown filters); the resulting node is owned by the operator and never re-translated.
@@ -193,7 +193,8 @@ mutable process globals. Standalone callers may omit the policy to use fixed def
 | Constant | `sirius::ast::constant` | `42`, `'hello'` |
 | Comparison | `sirius::ast::comparison` | `a > b`, `x = 10`, `a IS NOT DISTINCT FROM b` |
 | Conjunction | `sirius::ast::conjunction` | `a AND b`, `x OR y` |
-| Arithmetic / unary | `sirius::ast::unary_op` | `a + b`, `NOT x`, `-x` |
+| Arithmetic | `sirius::ast::function_call` | `a + b`, `-x` |
+| Unary predicate | `sirius::ast::unary_op` | `NOT x`, `x IS NULL` |
 | COALESCE | `sirius::ast::coalesce` | `COALESCE(a, b, 0)` |
 | IN-list | `sirius::ast::in_list` | `x IN (1, 2, 3)` |
 | Function call | `sirius::ast::function_call` | `UPPER(name)`, `YEAR(date)`, `a \|\| b` |
@@ -215,7 +216,7 @@ constant after constant folding has run, so `month(coalesce(DATE '2020-02-01', d
 GPU as `month(DATE '2020-02-01')`.
 Parameters that must be constants, such as a `LIKE` pattern or `substring` bounds, stay scalars.
 
-`in_list` covers the full numeric set (INT8–INT64, UINT8–UINT64, BOOL8, FLOAT, DOUBLE, DECIMAL32/64/128, all TIMESTAMP precisions, DATE) plus VARCHAR. BOOL8 dispatches via `uint8_t` because `std::vector<bool>::data()` is deleted. `x IN (a, b)` follows SQL semantics: TRUE on any match, otherwise NULL if `x` or any list entry is NULL, otherwise FALSE; NOT IN negates that. The AST lowerings chain the per-entry `EQUAL`s with `NULL_LOGICAL_OR`. The all-constant materialize path runs `cudf::contains` over the non-NULL entries and, when the list also has a NULL, ORs the result with a NULL scalar.
+`in_list` covers the full numeric set (INT8–INT64, UINT8–UINT64, BOOL8, FLOAT, DOUBLE, DECIMAL32/64/128, all TIMESTAMP precisions, DATE) plus VARCHAR. BOOL8 dispatches via `uint8_t` because `std::vector<bool>::data()` is deleted. `x IN (a, b)` follows SQL semantics: TRUE on any match, otherwise NULL if `x` or any list entry is NULL, otherwise FALSE; NOT IN negates that. The AST lowerings for IN chain the per-entry `EQUAL`s with `NULL_LOGICAL_OR`. The standalone translator lowers NOT IN to `NOT_EQUAL` comparisons joined by `NULL_LOGICAL_AND`, so parquet pruning never negates Bloom membership answers (see [Row Group Pruning](scan.md#row-group-pruning)). The row evaluator can negate its IN result because it operates on actual row values. The all-constant materialize path runs `cudf::contains` over the non-NULL entries and, when the list also has a NULL, ORs the result with a NULL scalar.
 
 ### String concatenation
 
@@ -268,6 +269,19 @@ collisions. Date differences widen both day counts before subtraction and return
 BIGINT. These operations materialize under every evaluator strategy; standalone
 cuDF AST translation declines them because it cannot implement the checks.
 The existing reference evaluator restores compressed operands before execution.
+
+### Arity and negation
+
+`from_duckdb_function_name` resolves a (name, argument count) pair against one signature table
+in `function_id.cpp`: a one-argument `-` is `function_id::negate`, a two-argument `-` is
+`function_id::sub`, and an arity no GPU handler takes stays on the CPU. A one-argument `+`
+translates to its operand. The `function_call` constructor throws on a mismatched arity.
+
+`negate` runs `cudf::unary_operation(NEGATE)` on signed integers, FLOAT, DOUBLE and DECIMAL,
+keeping the input type (`-0.0` matches DuckDB). Negating a signed integer's minimum raises
+DuckDB's `Overflow in negation of numeric value!`; the check is a `cudf::contains` shared with
+`abs` (one stream sync). Unsigned, HUGEINT and INTERVAL negation, and a result type that differs
+from the operand's, stay on the CPU. `negate` is an AST breaker. Tests are tagged `[negate]`.
 
 ### Rounding
 

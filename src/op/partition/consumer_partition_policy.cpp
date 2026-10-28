@@ -62,6 +62,7 @@ void bind_partition_inputs(sirius_physical_hash_join& join,
   build.set_input_barrier(MemoryBarrierType::FULL);
   probe.set_input_barrier(probe_drives ? MemoryBarrierType::FULL : MemoryBarrierType::PARTIAL);
   build.set_input_observer(std::make_unique<hash_join_partition_observer>(join, build));
+  join.note_build_observer_attached();
   partition_exchange::bind(
     {&build, &probe},
     probe_drives ? 1 : 0,

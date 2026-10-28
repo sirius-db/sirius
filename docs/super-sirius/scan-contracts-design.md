@@ -16,9 +16,9 @@ Scan contracts validate GPU scan inputs, split ownership, checkpoint protection,
 
 1. Verify sources and capture the original logical bindings before copying the plan.
 2. Compare GPU inputs with the original logical and physical bindings.
-3. During physical tree construction, acquire native checkpoint leases before preparing storage metadata and retain any early scan refusal.
+3. During physical tree construction, retain early scan refusals; defer native storage metadata walks until execution preparation.
 4. Once the tree completes, record one verdict for each registered scan in the planning attempt before lowering any scan.
-5. Produce physical evidence for each input unit as its metadata becomes available, then validate it before GPU consumption.
+5. At execution preparation, preflight all bound providers on the query thread before acquiring native checkpoint leases and walking storage metadata. Produce physical evidence for each input unit as its metadata becomes available, then validate it before GPU consumption.
 6. Publish only ready, validated inputs; drain preparation and GPU work and release leases before any CPU replay.
 
 ## Verdict at planning
@@ -63,7 +63,7 @@ Missing correspondence or changed inputs prevent GPU admission. Rebuilds and rep
 
 Each fresh split must belong to its consuming scan, even when another scan reads the same files. Parquet checks ownership before coalescing and validates each slice's certificate and footer before materialization.
 
-Physical checks run per input unit. A Parquet file is checked from its retained footer for codec, encryption, and type compatibility before cuDF reads it. The codec table follows the pinned libcudf 26.08.01 support set: UNCOMPRESSED, SNAPPY, GZIP, ZSTD, LZ4_RAW, and BROTLI; level encodings and an empty encoding list do not cause a refusal. Iceberg checks its file schema in the metadata worker before the profile check; its former planning-time full-table footer sweep is gone. A pruned row group does not require a profile check. Type drift is allowed only for an export-only leaf when the actual export path performs the conversion; other semantic uses are refused before decode.
+Physical checks run per input unit. A Parquet file is checked from its retained footer for codec, encryption, and type compatibility before cuDF reads it. The codec table follows the pinned libcudf 26.10.00 support set: UNCOMPRESSED, SNAPPY, GZIP, ZSTD, LZ4_RAW, and BROTLI; level encodings and an empty encoding list do not cause a refusal. Iceberg checks its file schema in the metadata worker before the profile check; qualified flat evolution compiles an immutable field-ID mapping and validates its physical read types before logical normalization; its former planning-time full-table footer sweep is gone. A pruned row group does not require a profile check. Type drift is allowed only for an export-only leaf when the actual export path performs the conversion; other semantic uses are refused before decode.
 
 Each Parquet footer producer stores the original schema record and encryption evidence before reader normalization. Coalescing ends a run when the next file's original schema differs, including its `ARROW:schema` entry. This keeps an admitted export-only type drift out of a mixed-schema multi-file reader.
 
@@ -71,23 +71,139 @@ Native ranges carry their actual storage version and data and validity codec evi
 
 Cached batches use pin identity, layout, structure, and applicable iteration and visibility checks. The query token and all applicable results are validated before publication to the split connector, so the prefetcher cannot consume an unadmitted batch. Streaming inputs do not produce storage splits.
 
-In tests, the scan statistics retain each query's readahead registrations by file and its successful memory-prefetch conversions after the query state is drained. These observations do not change scan admission or publication.
-
 ## Preparation and publication
 
-Each execution attempt owns its preparation units. A unit identifies one scan input and stays pending until all required evidence is ready: footer approval, native segment checks, a delete set, or checkpoint state. Readiness alone does not authorize publication. The gate rechecks cancellation and validates the split before prefetch initialization or connector insertion.
+Each execution attempt owns its preparation units. A unit identifies one scan input and stays pending until all required evidence is ready: footer approval, native segment checks, row visibility, or checkpoint state. Readiness alone does not authorize publication. The coordinator checks cancellation before preparing prefetch buffers outside the gate. The gate checks again before readahead registration and connector insertion.
 
-Eligible Iceberg deletion-vector scans share one host-memory admission for the statement. The reservation covers retained descriptors and delete positions plus bounded temporary decode work, including allocation granularity. Buffers use the reserved backing, and immutable per-file delete sets retain it until their last consumer releases it. A prepared execution consumes its admission once; a later execution needs a fresh admission.
+Providers declare bounded temporary allocations and retained storage through `preparation_request`. `prepare_statement_resources()` aggregates them into one statement reservation, prepares each provider's descriptors, then binds the shared admission. Failed preparation or binding rolls back all requests; runtime keeps the backing owner, not planning callbacks. Format-specific sizing stays in the adapter.
+
+Eligible Iceberg deletion-vector scans use this admission. The reservation covers retained descriptors and delete positions plus bounded temporary decode work, including allocation granularity. Buffers use the reserved backing, and immutable per-file delete sets retain it until their last consumer releases it. A prepared execution consumes its admission once; a later execution needs a fresh admission.
 
 Temporary capacity is requested for multiple DV jobs, bounded by the DV unit count, scan workers, and preparation job, active-unit, and result-slot limits. If a request fails, admission halves the target concurrency down to one job. A valid partial grant is used only when it covers all retained results and at least one job's temporary bound; its size limits the admitted concurrency. Only one successful reservation is retained.
 
 Unbounded inputs, the statement deletion-vector limit, or insufficient host capacity select eager delete loading before deferred execution starts. Positional-delete files keep their existing loading path. This route decision does not itself select CPU fallback. Once deferred work starts, read, validation, and allocation failures use the normal failure and replay rules; they never become an empty delete set.
 
-Cancellation closes admission and publication and wakes blocked work. Completion waits for workers, queued results, callbacks, and published consumers to drain. GPU completion alone cannot report success while preparation is still open.
+Cancellation closes admission and publication and wakes blocked work. Completion waits for workers, queued results, query-owned callbacks, and published consumers to drain. GPU completion alone cannot report success while preparation is still open.
 
-### Preparation limits
+### Host Arrow batch source contract
 
-Preparation limits default to values derived from the scan worker count. They bound active jobs, units, pending results, and coalescing work. By default, coordinator waits check interruption every 10 ms; draining an active read can take longer. An underfilled batch becomes due 10 ms after its first retained input, without waiting for later metadata. New arrivals do not reset that deadline. Publication still requires output capacity and can be delayed by scheduling. The limits and timing values accept startup YAML overrides under [`sirius.executor.scan_manager.preparation`](configuration.md#siriusexecutorscan_managerpreparation); a zero residence disables timed publication.
+The shared host Arrow path has two explicit boundaries. `import_arrow_host()` consumes one owned `ArrowSchema` plus `ArrowArray` record batch and retains its input capacity through the retirement lane. `materialize_arrow_stream()` consumes a sequential internal `arrow_batch_source`: each item carries an independently owned batch, a contiguous sequence number, and declared row and byte bounds; `nullopt` is the only EOS marker. The verifier compares the declared row count with the imported batch, sends results directly to a bounded sink, and calls `cancel()` on source, validation, import, or sink failure. Producers acquire preparation/output capacity and split oversized input before returning an item. An adapter may bridge an `ArrowArrayStream` one batch at a time, but this interface does not add a public Fragment Arrow-input API or a native Paimon/DuckLake adapter.
+
+### Execution and ownership
+
+The coordinator claims work, coalesces results and publishes batches after GPU consumers are ready. Metadata-only attempts advance on the query owner without another thread. An attempt with query-owner or native-reader sources runs coordination independently of reader calls: on the manager's shared pool by default, or on a dedicated thread when `coordinator_workers` is `0`. All drivers use the same bounded control steps, publication gate and retirement path. Sources choose where their jobs run:
+
+| Execution domain | Work and cleanup | Use |
+|---|---|---|
+| Metadata | Work runs in the metadata pool; source close runs on the control driver. | Independent file and metadata preparation. |
+| Query owner | Provider operations, accepted-job disposal and close run on the statement thread. | Readers that require execution on the query's owning thread. |
+| Native reader | Operations, accepted-job disposal and close run on one assigned native worker. | Readers with thread affinity. |
+
+`gpu_ingestible::make_preparation_sources()` returns one or more preparation lanes for a scan. The default wraps `make_preparation_source()` for existing adapters. Each lane has its own execution domain, cursor and coalescer; all lanes publish to the scan's connector. Multi-lane factories supply an independent coalescer for every lane. Register the complete group before arming; an empty scan still supplies a source that reports exhausted.
+
+Registration creates control state only. Readers initialize in their execution domain. Register and arm query-owner lanes on the statement thread. Control state must be safe to destroy without reader close if registration or native admission fails. The ingestible must outlive drain.
+
+| Boundary | Contract |
+|---|---|
+| Cross-lane dependency | The adapter owns dependency state. Claim returns pending while inputs are unavailable; the adapter wakes the coordinator when they become ready. Never block a worker waiting for another lane. |
+| Backpressure | Each lane has bounded lookahead and completion credits; the scan window is the sum of its lane windows. Consumption returns credit to the producing lane. Shared backing is charged once. |
+| End of input | Close the scan output only after every lane has published or discarded its tail. Queued batches may still be consumed afterwards. |
+| Reader close | Release only that lane's thread-affine resources. Other lanes may still be using shared adapter state. |
+| Failure or cancellation | Stop all lanes, drain accepted work and close the output even when native admission failed before readers opened. |
+
+The manager consumes the shared statement admission once; each ingestible installs its own execution state. Cleanup has two boundaries, separate from reader close:
+
+| Hook | When it runs | What it releases |
+|---|---|---|
+| `stop_preparation()` | After preparation jobs and source close drain. | Producer state; retain resources still used by GPU consumers. |
+| `finish_preparation()` | After GPU consumers retire. | Remaining scan-owned results and descriptors. |
+
+Both hooks must be safe to repeat and to call after failed startup. Thread-affine reader cleanup stays in the source's `close` callback.
+
+`try_claim` runs on the coordinator and must not enter SQL or a reader. It returns:
+
+| Result | Meaning |
+|---|---|
+| Owning job | Resources are acquired; the job executes at most once. |
+| Pending | No cursor advances and no permit is consumed. Other sources can progress until this source signals readiness. |
+| Exhausted | No more jobs will be produced. An empty result batch alone does not mean exhaustion. |
+
+Jobs that use a preparation unit carry its key and required inputs, derived by the provider from the bound scan. The shared registration path does not inspect format-specific bindings. Required evidence must be present before the result can enter coalescing; missing evidence fails the job.
+
+The control driver reserves a claim before calling the adapter outside the gate. The returned job enters its execution domain before admission is checked. If stop wins that check, the domain disposes the job without executing it. Jobs retain their descriptors and resources through execution or disposal; their destructors do not stop source enumeration. The completion ticket reports work dropped without a stop request. Resource release and provider callbacks run outside the publication lock.
+
+Query-owner and native sources allow one outstanding operation or unprocessed result per reader. They share the existing coalescing and publication path and do not consume metadata-worker permits. The query owner calls `advance()` while waiting for query completion: it advances metadata-only coordination or services one provider request. It remains available through drain; an external reset may request stop and wait, but cannot run provider operations itself.
+
+The coordinator pool selects runnable or expired registrations by rotating through registration slots, advancing its cursor after each selection. This is round-robin slot selection, not FIFO wake order or earliest-deadline-first scheduling. Each attempt executes at most one step at a time; consecutive steps may run on different workers.
+
+Steps return runnable, parked with an optional deadline, or finished. Racing wakes are retained, and workers service deadlines without owner ticks or extra timer threads. Control hooks must not retain thread-local state, require a fixed worker, or wait for I/O, capacity or dependencies. Provider work and disposal remain on the query owner; native work and disposal remain on the assigned native worker.
+
+Native reader slots are shared across queries in a scan manager. An attempt reserves all its slots before any reader starts; insufficient capacity fails immediately as `late_failure_cause::resource`, without holding a partial group. CPU replay still requires the existing fallback, source-policy, transaction and cleanup checks; this classification grants no replay permission. Several readers may share a worker. A blocked native call can delay those readers, but not the coordinator or metadata pool. Worker and slot limits are documented in [configuration](configuration.md#siriusexecutorscan_managerpreparation).
+
+### Control steps and driver waits
+
+`state::control_step()` performs one bounded turn and returns `runnable`, `parked` with a wake generation and optional deadline, or `retire`. `retire_step()` advances cleanup without waiting for workers: cancel units, stop and drain metadata, close readers in their execution domains, then release remaining state. Pending stages park until a completion notification arrives. Query-owner, dedicated-thread and pooled drivers use these steps; the driver owns waits and serializes advancement.
+
+Before sleeping, the query-owner and dedicated-thread drivers recheck the returned wake generation under the gate; stop also advances that generation. A wake between the step and the wait therefore cannot be lost. A timeout requests another step, which rechecks eligibility; it does not publish directly. Partial-batch deadlines use the coalescer clock; the driver also bounds waits for interrupt checks and the caller's idle limit.
+
+Lock order is publication gate before pool or executor bookkeeping. Pool callbacks run without the pool mutex; executor completion must release executor bookkeeping locks before waking the gate. Adapter claims, input construction, capture destruction and completion notifications run outside the gate. Interruption checks, metadata inspection and the explicitly gated publication operations below may run under it; they must not reenter the gate. They must not wait for another attempt or synchronously drain their own execution domain.
+
+The action limit bounds work count, not hook duration. Adapters used with the shared pool must preserve these control-path boundaries:
+
+| Call on the control path | Current boundary |
+|---|---|
+| `try_claim` | Returns work, pending or exhausted without entering a reader. Parquet/Iceberg resolve and read inside the job. DuckDB-native storage walks must finish during manager setup; its legacy claim fallback can still perform the walk if setup is bypassed. |
+| Job submission | Metadata enqueue does not wait for a worker slot; query-owner/native handoff uses the admitted mailbox or lease. Submission may allocate and take locks. |
+| Coalescer `advance`, `partial_emit`, `flush`; input construction | Manipulate prepared metadata and allocate descriptors. Datasource duplication shares existing handles. Allocation, locks and capture destruction still run inline. |
+| `prepare_prefetch` | Does not wait for eviction or device progress. It takes cache locks, allocates buffers and invokes ready completion callbacks inline. |
+| Final publication | Readahead registration and connector insertion run under the gate; no arbitrary adapter hooks are allowed there. Their locks and allocations remain part of the step. |
+| Source/output close and released captures | Metadata close and output notifications can run inline. Query-owner/native reader close and accepted-job disposal stay in their assigned execution domain. |
+| Error reporting and retirement | Error observers and stop callbacks run inline. Unit cancellation, queue disposal and final cleanup yield between bounded steps; waiting for dispatcher drain or reader close parks the attempt. |
+
+Stop requests immediately close admission and publication and signal running jobs; they do not walk the unit registry. Retirement keeps one control owner and cancels at most `max_control_work` units per step before proceeding to queue disposal and final cleanup, which use the same action limit. A pending unit removed during cancellation is cancelled by its retiring owner before release. Pending unit records may remain pending until their cancellation step, but cannot accept new inputs after the gate closes. Waiting for worker completion parks the attempt; unfinished cleanup keeps it runnable. The dispatcher sends one notification after stopped work and its captures drain; reader completion wakes the same driver. The query owner keeps servicing provider operations. `drain()` returns only after final cleanup and completion notifications have returned and control ownership has ended.
+
+### Publication and cancellation
+
+Publication uses typed `scan_operator_input` objects. Input construction and prefetch preparation run outside the publication lock. Only cancellation validation, readahead registration and connector insertion run inside it; adapters cannot add arbitrary callbacks there. Cache preparation may create requests, attach buffers and queue eviction before the final check. These buffers belong to the bounded cache pool, not the preparation job budget; rejecting publication does not immediately free them.
+
+| Situation | Required behavior |
+|---|---|
+| External stop or drain | Close admission and publication, signal running jobs and wake the control driver. The driver retires queues after the active claim returns; drain callers wait for retirement. |
+| Stop during claim | Keep the source alive through ownership transfer. Dispose of a rejected job in its execution domain before closing the reader. |
+| Final gate rejects publication | Do not register readahead or insert into the connector. Destroy the input outside the gate and return its output credit once. |
+| Cache preparation is abandoned | Input disposal marks its requests disposed; repeated disposal is harmless. The cache evictor drops each request's subscriptions once and reclaims buffers according to policy, respecting active reads. |
+| Cache maintenance after drain | Preparation drain finishes input disposal, not cache eviction. Cache-owned generations, buffers and eviction requests may outlive the query; they must not depend on its reader or transaction. |
+| Failure during preparation or commit | Dispose the surviving input. Any readahead work already registered follows normal query teardown; cache maintenance retains its own ownership. |
+| Queued provider work | Dispose of it in its assigned execution domain without invoking the reader. |
+| Active provider work | Use a supported interrupt or wait for return; discard late results before closing. The framework cannot forcibly interrupt SQL or native calls. |
+| Between provider operations | Check the attempt's stop state before re-entering the reader. A DuckDB connection interrupt flag may be reset by a later query. |
+| Reader close | Close without waiting for output capacity, and release thread-affine resources even when close reports an error. Remaining state must be safe to destroy on other threads. |
+
+`preparation_stop_token` reaches the adapter task unchanged and distinguishes normal completion, execution failure and user cancellation. Normal completion or failure cleanup must not blindly interrupt the original transaction or replace the first query error. Logical completion does not finish cleanup: the query owner remains available through provider close. After physical work drains, a close failure retains checkpoint keys and query resources until runtime shutdown and prevents CPU replay. See [query retirement](query-lifecycle.md#retirement) for shutdown and close-failure handling.
+
+### Provider read view
+
+| Boundary | Requirement |
+|---|---|
+| Reader creation | Preserve the original binding, snapshot, schema and transaction; use a separate mutable cursor from the CPU reader. |
+| Repeated execution | Create fresh reader state from that execution's binding. Never reuse a cursor across transaction generations. |
+| Provider SQL | Use the provider's internal SQL path on CPU; never re-enter the active outer `ClientContext::Query`. Ordinary user SQL keeps its normal GPU eligibility. |
+| Session lifetime | Retain context, transaction and plan owners through reader close and their last dependent use. A weak prepared handle is insufficient. |
+| Provider failure | Preserve the error and close safely. Do not reopen an invalid transaction to continue the read. |
+
+### Output ownership and limits
+
+Published batches must own their storage independently of the reader and transaction. Detach reusable reader buffers before publication. Multiple descriptors or GPU consumers sharing an allocation share its owner and charge it once.
+
+| Resource | Lifetime or limit |
+|---|---|
+| Preparation jobs and results | Bounded slots limit outstanding work, not total memory. |
+| Output lookahead | Counts results, coalescer input and queued batches. Taking a batch returns lookahead capacity, not storage; submitted work may overshoot the target. |
+| Reserved backing | The last physical owner releases the allocation and its reservation. Provider SQL, SDK allocations and decoder working memory are not automatically covered. |
+| Arrow input | Use the shared importer with an explicit staging PMR kept alive by the capacity owner. Retain host backing, staging and capacity through the last asynchronous read, including cancellation and failure. Release callbacks and staging deallocation must be safe outside the statement thread. |
+| GPU output | May outlive the source and imported host batch. After destroying imported outputs, call `lane.quiesce()` even if the lane is idle; retain the stream, device allocator and backing through that barrier. |
+
+Partial publication follows the configured fill and residence limits. Residence starts at the first retained input; later arrivals do not reset it. Backpressure may delay publication. See [preparation settings](configuration.md#siriusexecutorscan_managerpreparation) for defaults.
 
 ## Native checkpoint lease
 
@@ -96,6 +212,18 @@ Native scans and pinning acquire a shared checkpoint lease before inspecting sto
 An active lease makes `CHECKPOINT` fail and `FORCE CHECKPOINT` wait. A waiting forced checkpoint blocks new transactions except read-only ones until it is interrupted or the checkpoint keys are released. Sirius starts internal metadata transactions read-only and rejects an internal read-write start while its execution window holds checkpoint leases, avoiding a wait on its own protection.
 
 Failed cleanup retains checkpoint keys until the Sirius runtime is destroyed and prevents CPU fallback. Interrupting `FORCE CHECKPOINT` ends its wait but does not release Sirius's keys.
+
+Provider metadata connections need the same ordering. Starting a non-read-only DuckDB backend transaction while holding a checkpoint lease can deadlock with a waiting forced checkpoint. `BEGIN` or an existing connection alone does not prove that the backend transaction has started.
+
+The scan manager calls `gpu_ingestible::preflight_for_query()` on the query thread for all bound providers, including cache hits, before scan preparation or checkpoint-lease acquisition. Each adapter is responsible for discovering its metadata targets and validating the original transaction.
+
+| Boundary | Requirement |
+|---|---|
+| Preflight | Establish or validate the bound backend transaction. Do not rebind, acquire checkpoint leases, start readers or launch background work. Repeat for every execution attempt. |
+| Preflight failure or cancellation | Stop before scan preparation starts. Release temporary resources without replacing the original error or rolling back another provider's bound transaction. |
+| Reader initialization and pulls | Validate owner thread, target, transaction generation and validity before using the retained backend witness. Use lookup that cannot start or reopen a backend while checkpoint leases are held; never dereference a stale witness. |
+| Unknown or replaced backend | Refuse provider work. Preflight does not authorize reconnecting under a checkpoint lease. |
+| Metadata writes | Require their own lock-order policy during checkpoint contention. |
 
 ## CPU replay policy
 

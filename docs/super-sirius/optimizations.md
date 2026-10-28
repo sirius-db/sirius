@@ -100,7 +100,7 @@ look-ahead is not a user-selectable YAML setting.
 
 **Mechanism:** `compute_hash_join_partition_strategy()` selects BUILD_PROBE mode when:
 - `num_partitions <= num_gpus` (one hash table per partition, at most one partition per GPU; reduces to a single partition when `num_gpus == 1`)
-- two independent per-GPU bounds hold: the estimated cuco hash-table bytes (measured build rows x 16 B; unavailable row counts decline admission except MARK) stay under `max_build_hash_table_bytes`, and the folded build payload that stays GPU-resident for the whole probe stream stays under `max_build_probe_resident_bytes`; the build must fold to a single batch per partition
+- two independent per-GPU bounds hold: the estimated cuco hash-table bytes (measured build rows x 16 B; unavailable row counts decline admission including MARK) stay under `max_build_hash_table_bytes`, and the folded build payload that stays GPU-resident for the whole probe stream stays under `max_build_probe_resident_bytes`; the build must fold to a single batch per partition
 - the join is neither RIGHT-family, `MIXED_JOIN`, nor full `OUTER`
 
 In BUILD_PROBE mode, each partition's first task builds a `cudf::hash_join` hash table and caches it; subsequent tasks for that partition only probe.

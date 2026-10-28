@@ -32,6 +32,7 @@
 
 // cudf
 #include <cudf/types.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/resource_ref.hpp>
 
@@ -41,6 +42,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -66,10 +68,11 @@ struct scan_column_layout {
  * injection, post-filter output assembly — read from this single structure
  * instead of maintaining parallel vectors.
  *
- * Three index spaces appear throughout the scan pipeline:
+ * The scan plan maps the following spaces (R additionally contains optional
+ * cuDF provenance columns before the physical D suffix):
  *   P = primary index       (position in DuckDB's full schema @c names / @c returned_types)
  *   C = column_ids position (position in the operator's @c column_ids list)
- *   D = batch position      (position in the reader's output table, after hive removal)
+ *   D = physical position   (position in the reader's physical suffix, after hive removal)
  *   M = materialized pos.   (D followed by synthesized parquet virtual columns)
  *
  * Hive-partition columns live in P-space but are not in the parquet file, so
@@ -206,6 +209,21 @@ struct bound_virtual_column {
 /// columns past that prefix (pure-filter columns) may follow.
 [[nodiscard]] bool output_is_leading_prefix(scan_plan const& plan) noexcept;
 
+/// Select the materialized (M-space) @p positions of @p table, in order.
+///
+/// Without repeated positions the result is a non-owning selection of @p table. Otherwise it is
+/// owned: each repeat of an earlier position is copied before the selected columns are released, so
+/// a failed copy leaves @p table owning the source that submitted copies read.
+///
+/// @param table      The batch to select from (consumed unless a copy fails).
+/// @param positions  Positions in the currently-exposed view of @p table, in output order.
+/// @param stream     CUDA stream for the copies.
+/// @param mr         Resource for copied and released columns.
+[[nodiscard]] owning_table_view select_scan_columns(owning_table_view&& table,
+                                                    std::span<std::size_t const> positions,
+                                                    ::cuda::stream_ref stream,
+                                                    rmm::device_async_resource_ref mr);
+
 /// Reshape the materialized M-order batch to the plan's output layout.
 ///
 /// Input DATA indexes are materialized M-space positions: reader columns followed by synthesized
@@ -219,18 +237,20 @@ struct bound_virtual_column {
 /// emitting a 0-column table would erase the row count downstream aggregations
 /// consume).
 ///
-/// @param table             The reader's D-order batch to reshape (consumed).
+/// @param table             The materialized M-order batch to reshape (consumed).
 /// @param plan              The scan plan describing the layout.
 /// @param partition_values  Partition values for this split, in
 ///                          @c partition_columns order. Empty when the plan has
 ///                          no partition columns.
 /// @param stream            CUDA stream for any GPU work (scalar-backed column
 ///                          construction on the partition path).
+/// @param mr                Resource for released, copied, and constructed output columns.
 [[nodiscard]] owning_table_view assemble_scan_output(
   scan_plan const& plan,
   owning_table_view&& table,
   std::vector<std::string> const& partition_values,
-  ::cuda::stream_ref stream);
+  ::cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr);
 
 /// Materialized-batch (M-space) positions of the output DATA columns, in @c output_layout order.
 /// Empty when @c output_layout has no DATA entries (SELECT count(*) or a partition-only output), in
@@ -269,7 +289,8 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
                           duckdb::vector<sirius::logical_type> const& returned_types,
                           std::size_t projected_output_count,
                           duckdb::vector<duckdb::HivePartitioningIndex> const& partition_indices,
-                          std::vector<bound_virtual_column> const& virtual_columns = {});
+                          std::vector<bound_virtual_column> const& virtual_columns = {},
+                          bool allow_metadata_only                                 = false);
 
 /// True when @p column_ids is a pruned or reordered subset of the full schema (of
 /// size @p full_schema_size) — a non-identity projection the cuDF reader must

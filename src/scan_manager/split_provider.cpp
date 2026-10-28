@@ -16,13 +16,8 @@
 
 #include "scan_manager/split_provider.hpp"
 
-#include "exec/completion_controller.hpp"
-#include "exec/scoped_dispatcher.hpp"
-#include "exec/try.hpp"
 #include "op/scan/gpu_ingestible.hpp"
 
-#include <cassert>
-#include <exception>
 #include <utility>
 
 namespace sirius::scan_manager {
@@ -32,41 +27,9 @@ split_provider::split_provider(op::scan::gpu_ingestible& ingestible, io::ioctx_r
 {
 }
 
-bool split_provider::has_more_splits() const { return !_ingestible->has_processed_all_metadata(); }
-
-op::scan::gpu_ingestible::metadata_scan_task_t split_provider::next_split_provider()
+std::vector<op::scan::gpu_ingestible::preparation_source> split_provider::make_preparation_sources()
 {
-  return _ingestible->next_split_provider(_resolve);
+  return _ingestible->make_preparation_sources(_resolve);
 }
-
-template <typename Scheduler>
-void split_provider::run(Scheduler& scheduler, const push_callback_t& on_split)
-{
-  using split_type = typename value_type::value_type;
-  assert(on_split);
-  exec::completion_controller ctrl;
-  _completion_token =
-    ctrl.on_completion([on_split] { on_split(exec::make_empty_try<split_type>()); });
-  while (has_more_splits()) {
-    auto work = next_split_provider();
-    if (!work) { continue; }
-    scheduler.enqueue(
-      [on_split, work = std::move(work), token = ctrl.acquire()](std::stop_token stop) mutable {
-        try {
-          auto split = work(stop);
-          on_split(std::move(split));
-        } catch (...) {
-          on_split(std::current_exception());
-        }
-      });
-  }
-}
-
-// run() is a template parameterised on the scheduler, so its definition lives
-// here rather than in the header. Explicitly instantiate it for the only
-// scheduler the codebase drives it with (sirius_scan_manager's
-// scoped_dispatcher); add a line here if a new scheduler type ever calls run().
-template void split_provider::run<exec::scoped_dispatcher>(exec::scoped_dispatcher&,
-                                                           const push_callback_t&);
 
 }  // namespace sirius::scan_manager

@@ -13,7 +13,7 @@ The GPU scan path is a single unified source operator, `sirius_gpu_scan_operator
 
 The pipeline converter rewrites a DuckDB table scan into a `GPU_SCAN` source: it lowers the bind data into the appropriate `ingestible_table_info`, calls the free `make_ingestible(...)` factory to build the `gpu_ingestible`, constructs the operator carrying it, and inserts it at `operators[0]` of the pipeline. When a dynamic-filter channel is wired to the scan, a `DYNAMIC_FILTER` operator sits directly above it (see [Dynamic Filters](dynamic-filters.md)). No separate metadata pipeline is created.
 
-Before a query runs, `sirius_scan_manager::prepare_for_query` walks the plan's `GPU_SCAN` operators. For each it either (a) matches a pinned-table cache entry and serves the scan from cached batches, or (b) builds a `split_provider` over the operator's ingestible. Scan workers prepare metadata while the query-thread `preparation_coordinator` coalesces ready inputs, balances each batch onto a GPU, and publishes splits to each operator's `split_connector`.
+Before a query runs, `sirius_scan_manager::prepare_for_query` walks the plan's `GPU_SCAN` operators. For each it either (a) matches a pinned-table cache entry and serves the scan from cached batches, or (b) builds a `split_provider` over the operator's ingestible. Scan workers prepare metadata while `preparation_coordinator` coalesces ready inputs, balances each batch onto a GPU, and publishes splits to each operator's `split_connector`.
 
 Data reaches the GPU through the Sirius IO subsystem (`io::ioctx` / `io::sirius_datasource`, with a pinned-memory prefetching cache) — see the IO sections later in this document. The scan path consumes that layer: each split carries prefetch hints, and the read for a split goes through the `ioctx` its backend resolves to. The target device travels with the request.
 
@@ -38,7 +38,7 @@ The single GPU scan source operator. It owns:
 **Execution.** `execute(input_data, stream)` runs one split:
 
 1. `gpu_ingestible::materialize_table(split, stream)` produces a `filtered_table` — the materialized `cudf::table` (wrapped in an `owning_table_view`) plus a `filter_state` tag describing how much filter/projection the materialize step already applied.
-2. If the tag is `ROW_FILTERED_AND_PROJECTED` the table is already in final output layout and is released directly; otherwise `gpu_ingestible::post_filter_and_project(...)` applies any pending row filter and projection.
+2. If the tag is `ROW_FILTERED_AND_PROJECTED` the table is already in final output layout and is released directly; otherwise `gpu_ingestible::post_filter_and_project(...)` applies any pending row filter and projection. The internal resident Parquet checkpoint can instead combine the residual with membership masks before one projected gather; its placement flag is true by default (see [Dynamic Filters](dynamic-filters.md#resident-parquet-checkpoint)).
 3. If the plan carries a compressed-materialization physical sidecar, exact runtime bounds verify wider-to-narrower casts for columns containing non-null values before the table is normalized to that complete physical schema. Such a sidecar exists only for scans the pinned cache serves with pin-time-narrowed columns (the plan-time residency gate); fresh unpinned scans carry no sidecar and skip normalization entirely. A resident cached input without an override is restored to the native schema when its stored numeric carrier is narrow. Fresh feature-off scans retain their existing natural shape and types. See [Compressed Materialization](compressed-materialization.md) for the narrowing/restoration rules and [Compressed Pinning](compressed-pinning.md) for Simpatico-compressed pinned chunks.
 4. The result is wrapped in a `data_batch` tagged with the split's target `memory_space` and returned as a `pipelineable_operator_data` for the downstream pipeline.
 
@@ -46,7 +46,7 @@ The operator handles two split shapes transparently, both delivered as `scan_ope
 
 Before execution, a resident split is converted or decompressed to a plain GPU table when necessary. An unmasked split with no filtering ahead of it — unfiltered, or decode-row-filtered by the pushdown decode — may detach that per-query table: a split needing no carrier cast transfers it directly to the output, while a carrier-casting split keeps the wrapper as the retained source of a transactional steal in which execute builds every replacement column before committing the take, so an OOM mid-cast leaves the split rematerializable. Because the transactional steal bypasses `post_filter_and_project`, a decode-row-filtered split takes it only when the planned column layout says its output is a leading identity (no partition synthesis or output reordering) and the decoded batch is exactly the output width. A compressed pin's filtered decode reaches that width by omitting slots marked filter-only after it has applied the whole filter. A width match alone cannot prove the layout, since filter-only slots can offset synthesized output columns. Masked or still-to-be-filtered splits retain the wrapper view, which preserves the source for copy-based filtering.
 
-`no_history_peak_memory_estimate()` uses the larger of stored and working-set bytes for resident inputs that need no carrier conversion. For a known conversion it adds the exact destination bytes to the working set. The named maximum carrier expansion (8) is used only when a converting destination cannot be sized. A resident input with a physical sidecar but no reported conversion reserves the working set plus stored bytes as a source-bounded floor. For fresh reads the estimate remains 8 times the projected-column estimate plus decoded filter-only column buffers. The projected-column estimate remains the execution-history basis, and history-based reservations are clamped to the known decoded column-buffer footprint.
+`no_history_peak_memory_estimate()` uses the larger of stored and working-set bytes for resident inputs that need no carrier conversion. For a known conversion it adds the exact destination bytes to the working set. The named maximum carrier expansion (8) is used only when a converting destination cannot be sized. A resident input with a physical sidecar but no reported conversion reserves the working set plus stored bytes as a source-bounded floor. For fresh reads the estimate remains 8 times the projected-column estimate plus decoded filter-only column buffers. The projected-column estimate remains the execution-history basis, and history-based reservations are clamped to the known decoded column-buffer footprint. A resident split that can reach the resident Parquet checkpoint (`scan_operator_input::cached_checkpoint_possible`) reports a working set of twice its batch bytes, for the membership masks and one gather, whether or not decompression pushdown is enabled, unless its decode is forecast to compact. The splits of other ingestibles never reach it and keep their estimate; a split whose table a transfer will take may also report twice its batch bytes, because the estimate runs before `prepare_for_processing` (see [Memory Management](memory-management.md#integration)).
 
 > `sirius_physical_table_scan` (`TABLE_SCAN`) remains only as the plan-time carrier that `wrap_table_scan_source` consumes; the read path for parquet and DuckDB-native tables runs entirely through `GPU_SCAN`.
 
@@ -61,14 +61,26 @@ Before execution, a resident split is converted or decompressed to a plain GPU t
 | Method | Role |
 |--------|------|
 | `has_processed_all_metadata()` | Thread-safe snapshot: is all metadata enumerated? Typically an atomic cursor vs. a precomputed total. |
+| `make_preparation_sources(resolve)` | Register one or more lanes with independent coalescers and a shared scan output. The default wraps `make_preparation_source(resolve)`; see [preparation contracts](scan-contracts-design.md#execution-and-ownership). |
+| `try_claim_split(resolve)` | Return an owning metadata job, pending, or exhausted. Pending leaves the cursor unchanged. |
 | `next_split_provider(resolve)` | Atomically claim the next metadata unit and return a callable that produces its `scan_info`(s); `resolve` maps each file path to its ioctx. Null when nothing left to claim. |
 | `create_batch_coalescer()` | Build the format's `batch_coalescer`, which bundles per-unit metadata into right-sized data-batch splits. |
 | `materialize_table(split, stream)` | Produce the `filtered_table` for one split (dispatches to `materialize_metadata_to_table` for a fresh read, or wraps the resident batch for a cache hit). |
 | `materialize_metadata_to_table(info, mem_space, stream)` | Issue the read/decode for one split into a `cudf::table`. `mem_space` names the destination: its allocator is where the decoded columns land. It does not select an ioctx. |
 | `post_filter_and_project(table, mem_space, stream)` | Apply a pending post-decode filter and/or projection to output layout. |
+| `can_serve_cached_view()` | Plan-static: whether `view_layout` can describe any resident batch of the scan. Only plain Parquet with an all-data output layout answers true; the base implementation answers false, which keeps the scan's splits out of the resident checkpoint and its reservation envelope. |
+| `view_layout(table, elided)` | Optional owned host mapping and residual for the resident checkpoint. Exact Parquet data layouts opt in; the base implementation declines. |
 | `table_info()` | The per-table bind data (`ingestible_table_info`). |
 | `materialized_column_order()` | Storage indices from the planned column layout, in the order `materialize_table` emits them. The pinned-cache path serves columns in this order so a cached batch matches a fresh read. |
 | `output_prefix_width()` | A view of the planned layout's output prefix. A compressed pin's filtered decode may omit trailing filter-only slots after applying the scan's whole filter. Nullopt makes no promise; zero-output scans have no output prefix. |
+
+Claiming a task and executing it are separate steps. Claiming returns a job that owns the resources needed for execution or disposal; reader calls and I/O belong inside that job, where they run in the assigned execution domain.
+
+- Asynchronous preparation calls `try_claim_split()`. Its default implementation wraps `next_split_provider()` when the next metadata task is immediately available.
+- Override `try_claim_split()` if claiming may need to wait or must transfer a resource permit into the job. Return pending when work is temporarily unavailable, and exhausted only when no more work remains.
+- Synchronous pinning calls `next_split_provider()` directly and drives the task without the asynchronous coordinator.
+
+Both paths pass `preparation_stop_token` to the task so it can distinguish normal completion, execution failure and user cancellation.
 
 ### Bind data vs. split descriptors
 
@@ -88,7 +100,7 @@ Two polymorphic carriers separate per-table from per-split state (`gpu_ingestibl
 | `ROW_FILTERED` | The reader applied the row-level filter (parquet reader-side pushdown). |
 | `ROW_FILTERED_AND_PROJECTED` | Fully assembled to output layout (parquet hive-partition path, or a per-query-cached table). |
 
-The operator skips `post_filter_and_project` only when the state is already `ROW_FILTERED_AND_PROJECTED`.
+The operator skips `post_filter_and_project` when the state is already `ROW_FILTERED_AND_PROJECTED`, a permitted table transfer succeeds, or the enabled resident checkpoint supplies the projected output.
 
 Required scan predicates, including `IS NOT NULL` introduced by DuckDB's string-predicate
 rewrites, belong to the scan's row-level evaluator. Native reads and pinned batches retain
@@ -101,7 +113,7 @@ outputs remain in the output layout. A count-style scan with a filter uses its f
 carry the row count; a column-less scan may add a dedicated carrier. The native scan uses the
 same recorded boundary for its materialized order and output projection.
 
-Parquet (and its Iceberg subclass) also retains NULL predicates in the residual. Null-count
+Parquet (and the Iceberg adapter) also retains NULL predicates in the residual. Null-count
 statistics can prune whole row groups, but mixed groups still need row filtering. NULL tests
 never enter cuDF's min/max statistics expression; a partial reader pushdown cannot claim the
 whole predicate was applied. Numeric decode-range analysis likewise retains the residual when
@@ -114,7 +126,17 @@ There is no factory class. Each implementation provides a free `make_ingestible(
 
 ### Parquet ingestible
 
-`parquet_gpu_ingestible` (`parquet_gpu_ingestible.{hpp,cpp}`) builds the canonical `scan_plan` and shared `parquet_reader_options` (column projection only) once in its constructor, and pre-coalesces the DuckDB filter into a stored expression (partition-column filters dropped — DuckDB already prunes the file list by hive value). `next_split_provider` hands out **one file at a time**: each metadata task opens the file's `sirius_datasource`, reuses or parses+caches the footer, runs the FLBA-decimal pushdown-safety probe, translates the filter to a cuDF AST and prunes row groups by statistics, estimates each surviving row group's projected data columns and all decoded column buffers (plus the partition columns the split will synthesize, which count toward both estimates), and emits one `parquet_file_scan_info`. A column-less scan's row-count carrier (see `scan_plan` below) is resolved per file: a file that lacks the carrier column, or has no row groups to resolve it against, keeps natural-batch reader options and is sized as the full-width read it is. The coalescer caps batches on decoded column-buffer bytes, while preserving projected-column bytes separately for memory history, and never puts files with different reader options in one split. `materialize_metadata_to_table` reads the bundled row-group slices via `cudf::io::read_parquet` (re-translating the filter on the task-local stream for reader-side pushdown unless the per-file probe disabled it), and assembles hive-partition output inline. Reader-side filter pushdown is a per-split decision.
+`parquet_gpu_ingestible` prunes files using supported `filename`/`file_index` predicates, then uses footer statistics to select row groups and batch compatible files. Plain Parquet virtual-column scans use one cuDF read per split. cuDF preserves original row positions through filtering; Sirius maps reader-local source indexes back to bound file identities. Partial pushdown keeps the full residual predicate.
+
+The source-pruning helper evaluates these shapes on the bound `filename` (VARCHAR) or `file_index` (UBIGINT):
+
+- Same-type constant comparisons: `=`, `!=`, `<`, `<=`, `>`, `>=`.
+- Constant `IN` lists and `IS NULL` / `IS NOT NULL`.
+- `AND` / `OR` combinations of these predicates.
+
+Expression comparisons require the column reference on the left and the constant on the right; `BETWEEN` is handled only when lowered to supported comparisons. Only a definite false or SQL NULL result eliminates a file. Unsupported shapes, including `LIKE`, `NOT IN`, casts, and collation expressions, return unknown and conservatively retain files unless another conjunct rules them out. DuckDB may prune filename predicates earlier when selecting the bound file list, independently of this helper. Virtual predicates remain in the residual, and `file_row_number` is not used for source pruning.
+
+Virtual-only queries with no physical value dependency or potential dynamic filter can synthesize rows from footer counts without a data read. Iceberg retains its existing per-row-group layout and delete handling. See [scan_plan](#scan_plan) for column layout and carrier selection.
 
 ### DuckDB-native ingestible
 
@@ -122,7 +144,7 @@ There is no factory class. Each implementation provides a free `make_ingestible(
 
 ### Iceberg ingestible
 
-`iceberg_gpu_ingestible` (`iceberg_gpu_ingestible.{hpp,cpp}`) **extends** `parquet_gpu_ingestible` rather than reimplementing it: an Iceberg table's data files are parquet, and `iceberg_scan` resolves its manifests into the same `MultiFileBindData` file list `read_parquet` produces, so the parquet ingestible reads them unchanged. Only two behaviours differ. `create_batch_coalescer` wraps the parquet coalescer and stamps `disable_filter_pushdown` on every emitted split — but **only when the table has deletes** (per-split stamping is required; `reader_options` is one shared object handed to every split). `materialize_metadata_to_table` decodes through the base, then applies the delete pipeline to each decoded batch.
+`iceberg_gpu_ingestible` composes `parquet_scan_core`, as does the plain Parquet facade. The adapter supplies Iceberg schema mapping and delete preparation. Files whose schema already matches retain the existing reader route and pruning. Eligible evolved files use the `iceberg_flat_v1` mapping profile before visibility and residual filtering. Files with deletes disable reader-side row filtering so that original row positions remain available.
 
 Suppressing pushdown is load-bearing, not conservative. Positional deletes and deletion vectors are keyed on a row's position **within its data file**; if cuDF drops rows during decode, decoded positions no longer identify file positions and the mapping is unrecoverable. Materialize therefore returns `UNFILTERED` and `post_filter_and_project` applies the predicate *after* deletes — which is also Iceberg's required order. A non-`UNFILTERED` state from the base throws. Row-group pruning stays on and is safe: it only removes rows the predicate could not have matched, and offsets come from the footer, which lists pruned groups.
 
@@ -162,12 +184,16 @@ Currently declined:
 - **Equality deletes.** The filter, the GPU anti-join mask and the group build all exist, but key projection is not wired, and two pieces do not implement the spec: the applicability test compares the *manifest's* sequence number rather than the entry's inherited data sequence number, and keys are taken from every column of the delete file rather than the entry's declared `equality_ids`. `read_iceberg_delete_data` refuses live equality entries behind `kEqualityDeleteRouteImplementedToSpec`, which is the single switch that turns the route on; the components are covered directly by `test/cpp/scan/test_iceberg_equality_delete.cpp`, because no SQL test can reach them.
 - **`snapshot_from_timestamp` and `version`.** The delete path resolves only by `snapshot_from_id`, so these would read one snapshot's data against another's deletes.
 - **`allow_moved_paths = true`.** It rewrites every data-file path to `<table_path>/data/<name>`, while delete discovery calls `iceberg_metadata()` without the flag and keeps the manifests' original paths; the two would not match and the deletes would be dropped.
-- **Any data file whose schema differs from the table's current one** — a dropped field id (gap test, bind data only), a rename or an addition (name+id pair comparison against every data file's footer), a promoted type (`int` -> `long` keeps the name and id while the old file stays INT32), or a file carrying **no** field ids at all (a name-mapped `add_files` migration, which the probe must decline rather than skip).
+- **Schema changes outside `iceberg_flat_v1`**, including nested transformations, date/timestamp or decimal evolution, files lacking complete field IDs, and missing columns whose partition-constant semantics cannot be proved. Existing matching-schema support for these types is unchanged.
 - **A deletion vector whose Puffin footer descriptor contradicts its manifest entry**, or whose decoded position count contradicts the entry's `record_count`.
 
 Any code opening its own `Connection` on this path must bracket it with `SiriusContext::InternalQueryGuard` on **that connection's** context — the bracket is per-connection, so a caller's guard does not cover a connection it opens.
 
-**Known limitation.** Projected columns are resolved by **name** (`parquet_gpu_ingestible.cpp`), while Iceberg's data model is field-ID keyed. A column dropped and re-added under the same name is a *new* field ID absent from older data files and must read NULL; name resolution would find the old column and return stale data. The plan-time gates above close that off by declining every evolved table, so the limitation costs performance rather than correctness — but it is why the gates are as broad as they are. Resolving by field ID is the real fix and removes all of them: DuckDB's `MultiFileColumnDefinition` already carries the field ID (`identifier`, `GetIdentifierFieldId()`, `GetDefaultValue()`) and `MultiFileColumnMapper` implements the spec rule, including the name-mapping fallback for files without field IDs.
+**Flat schema evolution.** The adapter exports field IDs, types and typed initial defaults from the trusted DuckDB binding. Boolean, integer, floating-point and string fields support renaming, reordering, deletion, addition, and same-name drop/re-add; permitted promotions are INT32 to INT64 and FLOAT32 to FLOAT64. A per-file immutable mapper selects physical columns by ID and normalizes to the bound schema before deletes, filters and output projection. Absent columns use the bound initial default, including typed NULL, never a retired same-name column or the write default.
+
+Missing-column defaults require proof that partition metadata cannot override them. During lowering, one `LIMIT 0` Avro schema query per distinct data manifest checks for an empty partition record; nonempty or unavailable schemas do not grant this proof. No data-file footer sweep is added. Files with present fields can still map without this proof. This deliberately leaves identity-partition reconstruction outside the profile.
+
+Mapped files disable reader/statistics/null-count pruning and apply residual predicates after normalization. They use per-file reader options, so coalescing ends at their file boundary; row groups within a file still batch normally. Conversion/default buffers are included in the working-set estimate. If every requested field is absent, one physical column carries row count. Unsupported mappings fail before decoding and follow the existing late-failure policy. These choices preserve correctness but add manifest-header work and may reduce pruning/coalescing efficiency; performance acceptance is separate.
 
 ## owning_table_view
 
@@ -190,27 +216,32 @@ struct scan_plan {
   std::vector<data_column>           data_columns;       // columns read from parquet, in batch order (D)
   std::vector<partition_column>      partition_columns;  // hive-injected columns (name, type, primary index)
   std::vector<output_entry>          output_layout;      // one entry per output column, in DuckDB order
-  std::vector<std::optional<size_t>> batch_position_by_column_id;  // C -> D map
+  std::vector<std::optional<size_t>> batch_position_by_column_id;  // C -> M map
   std::unordered_set<size_t>         partition_primary_indices;    // for filter-skip
   std::optional<size_t>              carrier_batch_index;          // D index of a column-less scan's row-count carrier
 };
 ```
 
-Three index spaces appear in the parquet path:
+The scan plan distinguishes four column positions:
 
-- **P (primary index)** — DuckDB schema position
-- **C (column-ids position)** — index into the scan's `column_ids` list
-- **D (batch position)** — column position in the cuDF reader output (post-hive-removal)
+- **P** — position in DuckDB's full schema.
+- **C** — position in `column_ids`.
+- **D** — physical data position, after removing cuDF's optional source/row index columns.
+- **M** — D followed by synthesized virtual columns.
 
-`output_layout` is walked once during materialization to produce the final table: `DATA(k)` entries `std::move` from the read batch at position k, `PARTITION(k)` entries synthesize a scalar-backed column from the hive partition value. Pure-filter data columns (read but not output) fall out of scope and free.
+`batch_position_by_column_id` maps C to M. In `output_layout`, `DATA(k)` selects M[k] and `PARTITION(k)` selects a Hive partition value. Reader filters may reference only the physical D prefix. Output assembly moves unique columns, copies repeated selections, and drops filter-only columns.
 
-For `SELECT *` with no partitions and no pure-filter columns, the plan is a trivial identity and the reader output is forwarded unchanged — no permute, no copy. `SELECT count(*)` also has an empty `output_layout`; that short circuit leaves the read batch unchanged rather than synthesizing a 0-column table (a zero-column cudf table carries no row count), and the downstream count aggregation uses the batch row count. So that this batch does not decode every file column, `build_scan_plan` gives a column-less scan (count(*), virtual-only, or partition-only) a **row-count carrier**: the narrowest fixed-width non-partition column, read as a data column with no output entry — the same shape as a pure-filter column — and recorded in `carrier_batch_index`, so the reader projects to that one column. Schemas with no fixed-width column keep the natural batch; `set_column_names({})` is never passed to cuDF. Partition columns synthesized for the output count toward both size estimates, so a partition-only scan is not sized by its carrier alone.
+A query without physical output may read an unused **row-count carrier**, since a zero-column cuDF table cannot preserve cardinality. Ordinary count/partition-only scans and Iceberg keep their existing carrier selection. Plain Parquet virtual-column scans choose a narrow carrier from each file and normalize this unused column to INT8; when no better candidate is known, the existing fallback remains.
 
-Sirius keeps `file_index` as the zero-based index in the original bound file list. When `file_index` is projected, DuckDB may instead renumber files after a runtime join filter on a Hive partition column or the legacy `filename=true` column; this known difference is tracked in [duckdb/duckdb#26044](https://github.com/duckdb/duckdb/issues/26044).
+Eligible metadata-only scans synthesize the carrier and virtual columns, including nested-only files that need no physical carrier. Their empty physical projection still validates footer identity and encryption evidence. Registered dynamic-filter producers prevent this mode even before publication. Join construction registers producers before semantic lineage is collected; scan lowering then removes unused channels with no producers, matching lineage's carrier-free layout decision. Direct ingestible callers may register producers later, so any non-null channel they supply prevents metadata-only reads. `set_column_names({})` is never passed to cuDF.
+
+Sirius keeps `file_index` as the zero-based index in the original bound file list. When `file_index` is projected, DuckDB may instead renumber files after a runtime join filter on a Hive partition column or the legacy `filename=true` column. DuckDB defines this as the index in the final scanned file set and [confirmed that its behavior is intentional](https://github.com/duckdb/duckdb/issues/26044#issuecomment-6265829648). This is an existing compatibility difference: ordinary CPU/GPU differential tests still apply, while the runtime-pruning regression asserts each engine's documented numbering separately.
+
+When file-level predicates eliminate every plain Parquet file, the ingestible has no metadata tasks or splits. SQL lowering reuses the typed empty `GPU_VALUES` source used for `EMPTY_RESULT`, with the exact bound output schema (including nested child types) and any propagated physical carriers. Execution performs no path resolution, datasource open, or footer parsing for eliminated files; binding may already have accessed a file to establish its schema. The empty input still runs downstream operators, so ungrouped aggregates emit their SQL identities (`COUNT(*) = 0`, `SUM = NULL`) and joins preserve empty-side semantics. This path does not apply to Iceberg. Footer/row-group pruning remains separate: it validates physical input and retains one typed empty split when every row group is eliminated.
 
 ## Column Mapping
 
-Parquet column-chunk order is not guaranteed to match DuckDB's logical column order. `parquet_gpu_ingestible` builds a name-based DuckDB->parquet mapping via `parquet_schema_mapping::leaf_indices_for_column(schema, column_name)`, which walks the parquet schema's `path_in_schema` (case-insensitive, mirroring DuckDB).
+Parquet column-chunk order is not guaranteed to match DuckDB's logical column order. `parquet_gpu_ingestible` builds a name-based DuckDB->parquet mapping via `parquet_schema_mapping::leaf_indices_for_column(schema, column_name)`, which walks the parquet schema's `path_in_schema` using the exact bound column name.
 
 For nested types (`STRUCT`, `LIST`, `MAP`), one DuckDB column maps to multiple parquet leaf chunks; the mapping returns all leaves under the top-level column name. The cuDF parquet reader, given a top-level column name, materializes the nested `cudf::column` natively without post-read reassembly. MAP-annotated groups are recognized in the schema walk (`parquet_helpers.cpp`), consuming the `key_value` repeated group and mapping to `duckdb::LogicalType::MAP`. Nested columns can be scanned and projected through to the result, but not *operated on* — a nested column in WHERE, GROUP BY, or JOIN ON is rejected during plan generation (see [Physical Plan Generation](physical-plan-generation.md)).
 
@@ -225,9 +256,9 @@ For nested types (`STRUCT`, `LIST`, `MAP`), one DuckDB column maps to multiple p
 | Component | File | Role |
 |-----------|------|------|
 | `sirius_scan_manager` | `scan_manager/sirius_scan_manager.{hpp,cpp}` | Owns the shared thread pool, ioctx, cache, and pinned-table registry; `prepare_for_query` registers per-query providers; `start_metadata_processing` arms preparation |
-| `split_provider` | `scan_manager/split_provider.{hpp,cpp}` | Concrete driver that composes a `gpu_ingestible`; `run()` dispatches one metadata task per claimed unit onto the dispatcher |
-| `load_balancing_scan_batch_coalescer` | `scan_manager/load_balancing_scan_batch_coalescer.{hpp,cpp}` | Per-query sequencer: drains each provider's metadata output through the format's `batch_coalescer`, balances each batch onto a GPU, fires prefetch hints, pushes splits onto the connector |
-| `preparation_coordinator` | `scan_manager/preparation_coordinator.{hpp,cpp}` | Runs preparation on the query thread, bounds pending work, and validates publication |
+| `split_provider` | `scan_manager/split_provider.{hpp,cpp}` | Binds a `gpu_ingestible` to its I/O resolver and returns its preparation sources |
+| `load_balancing_scan_batch_coalescer` | `scan_manager/load_balancing_scan_batch_coalescer.{hpp,cpp}` | Registers per-scan coalescing, placement and publication with the coordinator; drains cached providers on workers |
+| `preparation_coordinator` | `scan_manager/preparation_coordinator.{hpp,cpp}` | Bounds pending work and validates publication; runs on the query owner for metadata-only attempts, otherwise on the manager coordinator pool, with dedicated threads available via `coordinator_workers: 0` |
 | `batch_coalescer` | `op/scan/batch_coalescer.hpp` (impls in the ingestibles) | Bundles per-unit `scan_info`s into right-sized data-batch splits |
 | `balancing_strategy` / `round_robin_strategy` | `scan_manager/balancing_strategy.hpp`, `round_robin_strategy.{hpp,cpp}` | Picks the target GPU for each split and stamps `preferred_device_id` on it |
 | `split_connector` | `scan_manager/split_connector.{hpp,cpp}` | Lock-protected blocking queue between the producer (sequencer) and the operator |
@@ -239,16 +270,16 @@ For nested types (`STRUCT`, `LIST`, `MAP`), one DuckDB column maps to multiple p
 2. **Per-query preparation.** `prepare_for_query(query, pruning, allocated_gpu_ids)` creates state keyed by the query id, builds a `round_robin_strategy` over the query's admitted GPU ids and a fresh `load_balancing_scan_batch_coalescer`, then walks the query's `GPU_SCAN` operators in order. The admitted set is passed in by `SiriusContext::create_query`, which reads it back off `task_creator` after `sirius_engine::initialize_internal` installed it — so scan placement, partition pins and `pipeline_build_context` all draw on one list (see [configuration.md](configuration.md) for `topology.gpus_per_query`). For each it `register_pipeline`s a sequencer slot (which builds the ingestible's `batch_coalescer` and captures the operator's connector). Then either:
    - **Cache hit** — `try_assign_cached_entries` finds a pinned entry whose identity and columns can serve the scan; it attaches a `databatch_provider` to the slot and skips disk reading entirely; or
    - **Cache miss** — a `split_provider` is built over the operator's ingestible and stored with that query's scan entry.
-3. **Execution.** `start_metadata_processing` arms the coordinator; `run_preparation_on_query_thread` drives it while scan workers prepare metadata. Through `load_balancing_scan_batch_coalescer`, it coalesces ready inputs, balances each batch onto a GPU, and validates publication before initializing prefetch and pushing a `scan_operator_input` onto the operator's connector. Later scans can progress before earlier scans close. Consumers (the scan operators) block in `split_connector::get_next_split` until splits arrive.
-4. **Teardown.** The coordinator closes each connector when its source is drained (forwarding any worker-captured exception, first-writer-wins). Once closed and drained, the operator's `all_ports_empty()` returns true and `get_next_task_hint()` returns `nullopt`. Success requires both preparation and GPU work to drain. Failure or interruption stops new preparation and publication and drains workers and consumers before resources are released. `quiesce(query_id)` stops and joins that query's preparation while retaining its providers; after execution work retires, `reset(query_id)` releases that query's state without stopping the shared pool.
+3. **Execution.** Preparation starts after GPU consumers are ready. Metadata-only attempts advance coordination on the query owner. Attempts with query-owner or native-reader sources use the manager's shared coordinator pool by default; `coordinator_workers: 0` selects a dedicated thread per attempt. All drivers use the same control steps to coalesce and validate ready inputs, select a GPU, and publish batches to each operator's connector. Later scans can progress before earlier scans close. See [execution domains and ownership](scan-contracts-design.md#execution-and-ownership).
+4. **Teardown.** The coordinator closes each connector after all of its preparation lanes settle. Preparation errors are reported through the query completion handler, which preserves the first error. Once closed and drained, the operator's `all_ports_empty()` returns true and `get_next_task_hint()` returns `nullopt`. Success requires both preparation and GPU work to drain. Failure or interruption stops new preparation and publication and drains workers and consumers before resources are released. `quiesce(query_id)` drains that query's preparation and waits for its final control step to return, while retaining its providers; after execution work retires, `reset(query_id)` releases that query's state without stopping the shared pool.
 
 ### split_provider
 
-`split_provider` is concrete and composes a `gpu_ingestible` non-owningly (the operator owns the lifetime; the provider is always torn down first by `reset(query_id)`). Its `has_more_splits` / `next_split_provider` delegate to the ingestible. The standalone `run(scheduler, on_split)` path enqueues one task per claimed metadata unit; the connector is closed (with any captured exception) when the last enqueued task drops its reference to the shared completion state.
+`split_provider` borrows the operator-owned `gpu_ingestible` and supplies its I/O resolver to `make_preparation_sources()`. The coordinator claims owning jobs and runs them in their assigned execution domains. Synchronous pinning calls the ingestible task directly; it does not start a coordinator. Both paths use `preparation_stop_token`.
 
 ### load_balancing_scan_batch_coalescer
 
-This supplies coalescing, balancing, and publication for the query-thread coordinator. Its standalone sequencer path works as follows. Each `GPU_SCAN` operator gets a `metadata_processing_state` slot holding a blocking queue (fed by the provider's metadata tasks), the ingestible's `batch_coalescer`, the shared `balancing_strategy`, and the operator's `split_connector`. A single worker walks the slots in registration order. For a live scan it dequeues per-unit `scan_info`s, pushes them through the coalescer, and for each coalesced batch: picks a GPU via the balancer (stamping `preferred_device_id`), fires `fadvise` and an `opportunistic` prefetch for the batch's byte ranges, and pushes a `scan_operator_input` onto the connector. For a cached pipeline it replays the attached `databatch_provider`, pushing one resident `scan_operator_input` per cached chunk. Serialising the opportunistic prefetch tier across pipelines in execution order gives the prefetching cache its longest lead time for the head-of-line pipeline.
+Each `GPU_SCAN` has a slot holding its coalescer, placement strategy, readahead state and connector. `register_coordinator_source()` supplies these to the coordinator, which prepares live inputs and publishes validated batches. Cached scans use `prepare_cached_workers()` to drain their `databatch_provider` on workers under the same publication gate.
 
 ### Device balancing
 
@@ -310,6 +341,8 @@ Pinning drives the source's `gpu_ingestible` to completion (`materialize_all_bat
 - **Simpatico compression:** with `CALL pin_table(..., compression => true)`, pinned chunks can additionally be stored compressed on either tier instead of (or after) narrowing — see [Compressed Pinning](compressed-pinning.md) for tier choice, plan selection, and measured results.
 - **GPU tier** (`materialize_all_batches`): each resulting batch is stored as a GPU-resident `cudf::table`, round-robining placement across the GPU memory spaces. Placement is deterministic so re-pinning the same source yields identical per-chunk placement (required by the merge path below).
 - **HOST tier** (`materialize_pin_to_host`): each resulting batch is converted on its round-robin GPU to a `host_data_representation` that preserves carrier type and decimal scale on that GPU's NUMA-local host space, then the GPU table is freed before the next batch. Peak GPU residency is therefore ~one batch, so a host pin never needs the whole table to fit in GPU memory.
+
+Pinned scans preserve these chunk boundaries. Host-affinity task placement rotates independently among the GPUs of each host NUMA domain; a shared counter across domains would repeatedly select the same local GPU for alternating host spaces. Query admission can still override a locality pick outside the admitted GPU set.
 
 ### Storage and matching
 
@@ -418,7 +451,7 @@ the direct column-merge API also rejects a merge while readers retain the existi
 
 When many small files (or row-group ranges) each yield a tiny GPU batch, per-task scheduling and kernel-launch overhead dominates. Coalescing is a responsibility of each `gpu_ingestible`, exposed through the `batch_coalescer` interface (`op/scan/batch_coalescer.hpp`): as the metadata side emits per-unit `scan_info`s, the sequencer feeds each one to the coalescer via `push()` (which may buffer and return zero or more ready batches) and `flush()` (remaining buffered batches at end of input).
 
-- **`parquet_batch_coalescer`** (in `parquet_gpu_ingestible.cpp`): accumulates each file's pruned row groups into `parquet_split_info` batches sized to `approximate_batch_size` decoded column-buffer bytes, including filter-only columns. A single large file fills multiple batches; several small files bundle into one batch — but only when they share identical hive-partition values and the same pushdown decision (a mismatch on either forces a flush). It also seals a batch before it would exceed `cudf::size_type` rows. The downstream `cudf::io::read_parquet` reads all bundled slices in one invocation. Virtual-column scans are currently an exception: they read selected row groups separately and concatenate the results to preserve file and file-row provenance.
+- **`parquet_batch_coalescer`** (in `parquet_scan_core.cpp`): accumulates each file's pruned row groups into `parquet_split_info` batches sized to `approximate_batch_size` decoded column-buffer bytes, including filter-only columns. A single large file fills multiple batches; several small files bundle into one batch — but only when they share identical hive-partition values and the same pushdown decision (a mismatch on either forces a flush). It also seals a batch before it would exceed `cudf::size_type` rows. The downstream `cudf::io::read_parquet` reads all bundled slices in one invocation. Iceberg virtual-column scans retain per-row-group reads and concatenation for their delete layout.
 - **`duckdb_native_batch_coalescer`** (in `duckdb_native_gpu_ingestible.cpp`): accumulates row-group ranges up to `approximate_batch_size` decoded bytes, and additionally seals a batch before any VARCHAR column's accumulated bytes would cross the cuDF int32 string-offset threshold.
 
 The coalescer runs inside the per-query sequencer (`load_balancing_scan_batch_coalescer`), so coalescing, device balancing, and prefetch hinting happen at one place per emitted batch.
@@ -495,11 +528,11 @@ When filter pushdown is enabled and the `gpu_expression_translator` successfully
 
    Before cuDF 26.12, the reader's bloom filter probe is wrong for some column types (rapidsai/cudf#24319). The reader filter (`_reader_pushdown_expression`) therefore leaves out equalities on the types listed by `has_unreliable_bloom_filter_probe()`, and they are applied post-decode. From cuDF 26.12 the list is empty.
 
+   `NOT IN` translates to inequalities joined by `NULL_LOGICAL_AND`, preserving SQL NULL semantics. It must not become `NOT` over an OR of equalities: the reader rewrites those equalities to Bloom membership probes, whose positive answers only mean a row group may contain a value. Negating those answers can discard mixed groups that also contain rows satisfying `NOT IN`.
+
 Reader-side pushdown is a per-split decision: an FLBA-decimal safety probe can disable it for a file, in which case the cached DuckDB filter expression is evaluated through `expression_evaluator` on the decoded batch in `post_filter_and_project`.
 
-Virtual-column scans currently disable reader-side row filtering, including dynamic-filter AST merging. Row-group statistics pruning remains enabled, but all rows in selected row groups are decoded before residual predicates and membership filters run—even for a selective `WHERE filename = ...`.
-
-Follow-up work can use cuDF 26.08.01's existing `enable_prepend_source_index_column()` and `enable_prepend_row_index_column()` APIs to preserve file and row identity during whole-split reads with filtering. Source selection for `filename`/`file_index` predicates and Iceberg positional-delete handling need separate integration.
+Ordinary Parquet virtual-column scans can use cuDF's source and row index columns to preserve file and row identity during reader filtering. Static `filename`/`file_index` filters can discard whole sources before footer work; row-group statistics pruning remains a separate step. Iceberg retains its existing row layout and positional-delete handling.
 
 **Filter translation path:** `TableFilterSet` -> `convert_table_filters_to_expression()` (skips `OPTIONAL_FILTER` and partition-column filters) -> `gpu_expression_translator` -> cuDF AST tree. Ordinary scans also skip top-level `IS_NOT_NULL`; virtual-column scans retain it in the residual predicate evaluated after decoding. Null-count pruning collects null-test predicates directly from the original `TableFilterSet`, independently of expression translation.
 
@@ -565,6 +598,8 @@ The scan manager builds a local ioctx (`uring_ioctx` for `backend: sirius`, othe
 
 `rest_ioctx = templated_ioctx<rest_reactor>` handles `s3://` paths for AWS S3 and compatible stores such as MinIO. The `gs://` and `azure://` schemes parsed by `uri_parser` have no registered backend. DuckDB uses the read-only `sirius_httpfs` to bind transparent `read_parquet('s3://...')` queries, while scan-manager callers can open the same path directly through the datasource registry. S3 scans require GPU execution and have no DuckDB CPU fallback.
 
+For an explicit `gpu_execution` call, the S3 SQL rewrite uses the internal single-URI `sirius_read_parquet` function. Its virtual-column callback exposes the same IDs and types as native Parquet: `filename` (VARCHAR), `file_index` (UBIGINT), and `file_row_number` (BIGINT). Explicit references can project or filter these columns; `SELECT *` excludes them, and same-named physical columns retain their physical identity. The filename is the bound S3 URI. Transparent SQL continues to use the native binder, including its glob expansion. The strict `pixi run make s3-test` gate exercises both entries with fallback disabled; the default test suite covers registration and the internal binder with local fixtures but does not start the managed SeaweedFS backend.
+
 **Key semantics.** The key portion of an `s3://` URI is literal text. `uri_parser` does not percent-decode it or split it at `?` or `#`; SigV4 applies RFC 3986 encoding when it builds the request, matching AWS CLI behavior. So `s3://bucket/my%20file.parquet` addresses the key `my%20file.parquet`; use an actual space to address `my file.parquet`.
 
 DuckDB still decodes Hive partition values, so `col=a%20b/` yields `a b`. Glob syntax is unchanged: `?` in a pattern is still a wildcard. A concrete key whose directory segment contains both `=` and a literal `?` is rejected, because DuckDB would drop that partition column; encode it as `%3F`. A `?` in the final filename is allowed.
@@ -625,7 +660,7 @@ The cache does two things beyond classic prefetch:
 - **Partial reads.** A `device_read` over a range whose chunks are only partially cached copies the cached chunks straight to device and completes the rest from the backend in the same call, instead of treating a partial overlap as a miss.
 - **Populate-on-read.** On a backend that supports bounce-staged host-to-device reads, an uncached chunk being read for the device is loaded into a cache buffer (file → cache chunk → device) and published to the cache, so the next read of the same chunk is a hit — caching as a side effect of reading, like an OS page cache. A heavily-partial boundary chunk whose over-read would exceed ~25% of the chunk is instead read through an internal bounce slot and left uncached (zero over-read).
 
-Separately from the prefetching cache, the ioctx always exposes a `metadata_store` so parsed file metadata (e.g. a parquet footer) survives across scans of the same object generation regardless of whether prefetching is wired up. The resident store has one entry per exact path and parser profile; the entry carries the object identity and the opened object's identity must match before reuse. For local files, the reusable identity is `{device, inode, size, ctime_ns}` captured from the opened descriptor. A same-inode in-place rewrite that preserves that tuple can therefore reuse older raw bytes or a parsed footer; local inputs are required to be immutable during a scan and should be updated by atomic replacement, which produces a new descriptor identity. A normal hit performs one exact index lookup and an identity check; there is no recency update or LRU scan. `has_path()` is only an *open hint* (skip the footer probe when some generation's footer is known); a path-level reverse index is used only to invalidate profiles when that path's identity changes. There is currently no per-statement opt-out for cross-statement local footer/byte reuse; an opt-out can be revisited with the retention owner after #209/#2108. HOST/runtime residency budgets, byte accounting, eviction limits, and their diagnostics remain a follow-up owned by the finalized cuCascade IO lifecycle in #2108, after the #209/#2108 identity-header handoff. R3 keeps the existing ioctx-scoped residency behavior and does not claim those bounds are implemented here.
+Separately from the prefetching cache, the ioctx always exposes a `metadata_store` so parsed file metadata (e.g. a parquet footer) survives across scans of the same object generation regardless of whether prefetching is wired up. The resident store has one entry per exact path and parser profile; the entry carries the object identity and the opened object's identity must match before reuse. For local files, the reusable identity is `{device, inode, size, ctime_ns}` captured from the opened descriptor. A same-inode in-place rewrite that preserves that tuple can therefore reuse older raw bytes or a parsed footer; local inputs are required to be immutable during a scan and should be updated by atomic replacement, which produces a new descriptor identity. A normal hit performs one exact index lookup and an identity check; there is no recency update or LRU scan. `has_path()` is only an *open hint* (skip the footer probe when some generation's footer is known); a path-level reverse index is used only to invalidate profiles when that path's identity changes. There is currently no per-statement opt-out for cross-statement local footer/byte reuse; an opt-out can be revisited with the retention owner after #209/#2108. HOST/runtime residency budgets, byte accounting, eviction limits, and their diagnostics remain a follow-up owned by the finalized cuCascade IO lifecycle in #2108, after the #209/#2108 identity-header handoff. The metadata store keeps the existing ioctx-scoped residency behavior and does not claim those bounds are implemented here.
 
 **fadvise protocol.** `sirius_datasource::fadvise(ranges, dev_id)` registers a scan range set and stashes its `cache_handle`. The readahead manager later drives that handle through allocation and asynchronous prefetch; the consumer stage records when reading begins so stale work can be refused or awaited instead of issuing duplicate I/O.
 
@@ -663,17 +698,23 @@ five counters are individually sampled rather than an atomic snapshot of an enti
 
 ```mermaid
 graph TD
-    CONV[pipeline converter] -->|make_ingestible| ING["gpu_ingestible<br/>(parquet / duckdb-native)"]
+    CONV[pipeline converter] -->|make_ingestible| ING["gpu_ingestible<br/>(Parquet / Iceberg / native tables)"]
     ING -->|carried by| OP[sirius_gpu_scan_operator GPU_SCAN]
 
     SM[sirius_scan_manager.prepare_for_query] -->|cache miss| SP["split_provider<br/>(composes ingestible)"]
     SM -->|pinned-cache hit| DBP[cached_databatch_provider]
 
-    SP -->|one task per file/range| DISP[dispatcher thread pool]
-    DISP -->|metadata scan_info| SEQ["preparation_coordinator<br/>(query thread)"]
-    DBP -->|resident batches| SEQ
+    SP -->|make_preparation_sources| SEQ["preparation_coordinator<br/>metadata only: query owner<br/>reader sources: dedicated thread or shared pool"]
+    SEQ -->|metadata jobs| DISP[dispatcher thread pool]
+    SEQ -->|provider jobs| Q["query owner<br/>await_query_completion / advance"]
+    SEQ -->|native reader jobs| N[native_reader_executor]
+    DISP -->|scan_info| SEQ
+    Q -->|detached scan_info| SEQ
+    N -->|detached scan_info| SEQ
 
     SEQ -->|coalesce + balance + validate + prefetch| SC["split_connector<br/>(per operator)"]
+    DBP -->|resident batches| CACHE["load_balancing_scan_batch_coalescer<br/>cached worker"]
+    CACHE -->|shared publication gate| SC
     SC -->|get_next_split| OP
 
     OP -->|get_next_task_input_data| TC[task_creator]
@@ -682,7 +723,99 @@ graph TD
     EX -->|pipelineable_operator_data| NEXT[downstream pipeline]
 ```
 
-The converter builds a `gpu_ingestible` and parks it on the `GPU_SCAN` operator. At query prep the scan manager either serves the operator from a pinned cache (`cached_databatch_provider`) or builds a `split_provider` over the ingestible. The provider dispatches one metadata task per file (parquet) or row-group range (duckdb-native); the query-thread coordinator coalesces and balances each batch, validates publication before prefetch, then pushes splits onto the operator's connector. The task creator turns each pulled split into a `gpu_pipeline_task` on the split's preferred GPU; `execute()` materializes, optionally post-filters/projects, and emits a `data_batch` to the downstream pipeline.
+The converter builds a `gpu_ingestible` and parks it on the `GPU_SCAN` operator. At query prep the scan manager either serves the operator from a pinned cache (`cached_databatch_provider`) or builds a `split_provider` over the ingestible. The coordinator claims jobs from the provider and dispatches them to the declared execution domain. It coalesces returned inputs, selects a GPU and validates publication before pushing splits onto the operator's connector. Cached batches bypass preparation and use the same publication gate. The task creator turns each pulled split into a `gpu_pipeline_task` on the split's preferred GPU; `execute()` materializes, optionally post-filters/projects, and emits a `data_batch` to the downstream pipeline.
+
+## Shared materialization components
+
+`parquet_gpu_ingestible` and `iceberg_gpu_ingestible` compose `parquet_scan_core`.
+The core retains file enumeration, footer preparation, coalescing, reader options,
+and the existing bulk/general decoder selection. Iceberg owns snapshot and delete
+applicability, suppresses row filtering during decode when positions are needed,
+and delegates the mask operation to `positional_visibility`.
+
+`finish_materialization()` orders mapping, visibility, residual evaluation, and
+projection. A batch carries its contract and execution generation, cardinality,
+completion flags, and per-conjunct predicate progress. Pruning is not enforcement;
+an answer is a bound BOOL8 slot. `residual_filter::against_progress()` refuses
+unknown conjuncts and attempts to reconstruct values overwritten by answers.
+The legacy Parquet bridge retains its existing AST, survivor rowid, and scan-plan
+assembly. Its one expression-completion flag is derived from legacy state at the
+bridge; it does not introduce a second mutable conjunct map.
+
+Source lineage is either original-file runs, explicit original positions, or
+unavailable. Runs retain offsets across pruned row groups. Visibility requires
+lineage until it has completed; it must not use pinned-input survivor rowids as
+file positions. An internal INT8 carrier preserves positive cardinality for a
+zero-column batch. A zero-row batch does not mean end-of-stream.
+
+Two reusable entry points additionally exercise this finish contract:
+
+- `materialize_mapped_parquet()` takes an immutable `field_id_mapping`, the opened
+  datasource, retained footer, physical contract, and exact row groups. The mapper
+  binds physical names by field ID, reorders fields, fills explicitly typed defaults,
+  and permits INT32-to-INT64 or FLOAT32-to-FLOAT64 conversion only when approved at compilation. It checks
+  the decoded dtype before conversion and preserves original file row positions.
+  The current core profile accepts flat boolean, integer, float, and string fields.
+  `materialize_mapped_parquet_runs()` coalesces compatible admitted units and flushes
+  at mapping/default/original-schema boundaries. Different object identities can
+  coalesce; repeated files retain repeated rows and separate lineage. The caller
+  reserves decoded memory plus `additional_bytes()` for each admitted run, including
+  all results retained in the returned vector. The production Iceberg adapter uses
+  the same mapper under its qualified `iceberg_flat_v1` rules.
+- `import_arrow_host()` accepts an owned Arrow C Data tree, its bound input schema,
+  task memory resource, and retirement lane. The flat host profile accepts booleans,
+  signed/unsigned integers, FLOAT32/64, UTF8, DATE32, microsecond timestamps without
+  timezone, and DECIMAL128 (precision 1–38, nonnegative scale no larger than precision).
+  It refuses nested, dictionary, extension, binary, large-string, and device arrays.
+  Decimal imports normalize to the approved DECIMAL128 carrier. Input buffers and
+  metadata must be readable producer-owned C Data memory. For every non-null metadata
+  buffer on the root or a child schema, the producer supplies a trusted readable byte
+  length in `arrow_metadata_lengths` and keeps that memory alive through import.
+  Arrow C Data carries no allocation extents: a raw pointer, lengths encoded inside
+  metadata, or `strnlen` cannot establish its readable range, and copying from an
+  unknown range cannot establish one either. The consumer rejects non-null metadata
+  without a trusted length and parses it only within that buffer's supplied bound.
+  The consumer owns extension/profile and bound-schema checks, admission, publication,
+  cancellation, and ownership/retirement. The producer must detach statement-affine
+  callbacks before ownership transfer. Input/staging capacity remains owned through
+  retirement, even if import throws. The caller reserves output/temporary memory and
+  drains the lane.
+  The conversion leaf incorporates the checked host normalization from
+  [#2216](https://github.com/sirius-db/sirius/pull/2216), whose original helper was
+  extracted from [#1965](https://github.com/sirius-db/sirius/pull/1965). It checks the
+  entire selected batch before GPU work, then builds owning cuDF columns with the
+  supplied device resource and lane stream, without intermediate cuDF Arrow import
+  or decimal casts. Decimal payloads must fit their declared precision; the output
+  remains DECIMAL128, and zero-column batches retain their separate row count.
+  `owned_arrow_batch` requires an explicit staging PMR. Boolean bytes, rebased UTF8
+  offsets and selected validity bits use that resource; roots, capacity and staging
+  stay retained on the lane until completion, including post-enqueue failures. The
+  capacity owner must keep the PMR alive until those staging buffers are destroyed.
+  An absent bitmap with unknown null count is treated as all-valid; positive null
+  counts without a bitmap are refused. No decimal rescaling or large-string support
+  is added. Metadata semantics and the other consumer responsibilities above remain
+  unchanged. Normal import does not synchronize the stream on the host; neither a
+  returned table nor an exception permits releasing pending inputs or replaying a
+  query before a successful attempt-level drain. A failed drain retains ownership,
+  not permission to release it. After output destruction/unwinding, the caller must
+  call `lane.quiesce()` even if `lane.idle()` or input retirement already completed:
+  commit-error recovery may precede subsequently queued output frees. The output
+  allocator and its backing reservation must outlive that final barrier.
+  No CPU/GPU overlap or throughput guarantee is made;
+  pageable producer or PMR buffers may cause CUDA-internal staging/synchronization.
+  `materialize_arrow_stream()` is the internal sequential verifier above this
+  single-batch importer. Its source returns independently owned batches with a
+  contiguous sequence, declared row/byte envelope, and explicit `nullopt` EOS;
+  zero-row batches remain data. It validates the envelope against the imported
+  batch, sends each result directly to a sink without an unbounded queue, and
+  calls source cancellation on source, import, validation, or sink failure.
+  An adapter may translate an `ArrowArrayStream` one batch at a time, but no
+  public Fragment Arrow-input API or Paimon/DuckLake reader is introduced here.
+
+A direct GPU reader can supply an owning batch to the same validator and finish
+without an Arrow or CPU-vector round trip. These helpers do not register a new SQL
+source adapter or relax the existing Iceberg equality-delete, snapshot or
+remote-DV gates. Schema evolution is limited to the qualified flat profile described above.
 
 ## Key Files
 
@@ -692,11 +825,15 @@ The converter builds a `gpu_ingestible` and parks it on the `GPU_SCAN` operator.
 | `src/op/scan/sirius_gpu_scan_operator_data.hpp` | `scan_operator_input` (fresh-read or resident-batch split) |
 | `src/op/scan/gpu_ingestible.hpp` / `src/op/scan/gpu_ingestible.cpp` | `gpu_ingestible` abstraction + `materialize_table` dispatch |
 | `src/op/scan/gpu_ingestible_types.hpp` | `ingestible_table_info`, `scan_info`, `filtered_table` / `filter_state` |
-| `src/op/scan/parquet_gpu_ingestible.hpp` / `src/op/scan/parquet_gpu_ingestible.cpp` | Parquet ingestible + `parquet_batch_coalescer` + `make_ingestible` |
+| `src/op/scan/parquet_gpu_ingestible.hpp` / `src/op/scan/parquet_gpu_ingestible.cpp` | Parquet facade + `make_ingestible` |
+| `src/op/scan/parquet_scan_core.hpp` / `.cpp` | Shared Parquet preparation, coalescing, decode, and legacy finish bridge |
+| `src/op/scan/materialization_contract.hpp` / `.cpp` | Program/batch validation and shared finish ordering |
+| `src/op/scan/field_id_mapping.hpp` / `.cpp` | Per-file immutable field-ID mapping and conversion approval |
+| `src/op/scan/arrow_materializer.hpp` / `.cpp` | Owned host Arrow import with stream retirement |
 | `src/op/scan/duckdb_native_gpu_ingestible.cpp` / `src/op/scan/duckdb_native_gpu_ingestible.hpp` | DuckDB-native ingestible + `duckdb_native_batch_coalescer` |
 | `src/op/scan/batch_coalescer.hpp` | Coalescer interface |
 | `src/op/scan/owning_table_view.hpp` | View-or-table handle with no-alloc reorder/drop/select |
-| `src/op/scan/scan_plan.hpp` / `src/op/scan/scan_plan.cpp` | Index-space mapping (P/C/D), output layout, partition injection |
+| `src/op/scan/scan_plan.hpp` / `src/op/scan/scan_plan.cpp` | Index-space mapping (P/C/D/M/O), output layout, partition injection |
 | `src/op/scan/parquet_schema_mapping.hpp` | Name-based DuckDB->parquet column resolution |
 | `src/op/scan/row_group_metadata.hpp` | `row_group_slice` + `hybrid_scan_reader` |
 | `src/op/scan/duckdb_native_metadata.hpp` / `duckdb_native_decoder.hpp` | DuckDB-native row-group walk + GPU decode |

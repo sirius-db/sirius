@@ -14,10 +14,10 @@
  * limitations under the License.
  */
 
+#include "cudf/ast_compat.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "utils/host_allocation_fault.hpp"
 
-#include <cudf/ast/expressions.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
