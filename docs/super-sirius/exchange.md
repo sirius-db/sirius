@@ -320,8 +320,8 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
   split by byte range have no such limit.
 - **Query start:** every rank must run the same statements in the same order, which is what
   numbers the exchanges' streams. So one connection per process runs distributed queries; another
-  connection's distributed query is refused. With `max_concurrent_queries` above 1, other
-  connections can run local queries alongside it.
+  connection's distributed query is refused until that one closes. With `max_concurrent_queries`
+  above 1, other connections can run local queries alongside it.
 - **Unspillable buffers:** an unordered `EXCHANGE_SOURCE` queues arrivals in its port's
   repository, where they spill like any port's batches. Arrivals before the port is wired, an
   ordered gather's batches, and batches held for a stream not yet attached stay outside any

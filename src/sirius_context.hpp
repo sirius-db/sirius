@@ -815,6 +815,10 @@ class SiriusContext : public ClientContextState {
   /// @throws sirius::invalid_input_exception when another connection already runs them.
   [[nodiscard]] uint64_t next_distributed_query(ClientContext& context);
 
+  /// \brief @p context is closing: if it runs distributed queries, the next connection to plan
+  /// one takes over, and numbering continues where it stopped.
+  void release_distributed_connection(ClientContext& context);
+
   /// \brief The distributed query execution window @p window runs, or 0.
   [[nodiscard]] uint64_t distributed_query_of(sirius::query_id_t window);
 
