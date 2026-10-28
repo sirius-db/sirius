@@ -227,7 +227,7 @@ jobs:
         run: |
           gh run download "$RUN_ID" \
             --repo "$REPO" \
-            --pattern "sirius-v*-extension-linux_*-cuda*" \
+            --pattern "sirius-*-extension-linux_*-cuda*" \
             --dir artifacts
         env:
           GH_TOKEN: ${{ github.token }}
@@ -255,7 +255,7 @@ jobs:
           for d in "${dirs[@]}"; do
             name="${d%/}"
             # e.g. sirius-v1.5.6-extension-linux_amd64-cuda12
-            if [[ "$name" =~ ^sirius-(v[0-9.]+)-extension-(linux_[a-z0-9]+)-cuda([0-9]+)$ ]]; then
+            if [[ "$name" =~ ^sirius-(v[0-9.]+|[0-9a-f]{40})-extension-(linux_[a-z0-9]+)-cuda([0-9]+)$ ]]; then
               version="${BASH_REMATCH[1]}"
               arch="${BASH_REMATCH[2]}"
               cuda="${BASH_REMATCH[3]}"
@@ -377,6 +377,15 @@ jobs:
 
           with open(".github/workflows/release/GETTING_STARTED.md") as f:
               notes = f.read()
+          if len(duckdb_version) == 40 and all(c in "0123456789abcdef" for c in duckdb_version):
+              notes = notes.replace(
+                  "curl https://install.duckdb.org | DUCKDB_VERSION={{DUCKDB_VERSION_BARE}} sh",
+                  "git clone https://github.com/duckdb/duckdb.git\n"
+                  "cd duckdb\n"
+                  f"git checkout {duckdb_version}\n"
+                  "make release\n"
+                  'export PATH="$PWD/build/release:$PATH"',
+              )
           notes = (
               notes.replace("{{DUCKDB_VERSION_BARE}}", duckdb_version_bare)
               .replace("{{DUCKDB_VERSION}}", duckdb_version)

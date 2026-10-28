@@ -29,6 +29,7 @@
 #include <duckdb.hpp>
 #include <duckdb/execution/column_binding_resolver.hpp>
 #include <duckdb/main/config.hpp>
+#include <duckdb/main/settings.hpp>
 #include <duckdb/optimizer/optimizer.hpp>
 #include <duckdb/parser/parser.hpp>
 #include <duckdb/planner/planner.hpp>
@@ -94,7 +95,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> generate_sirius_plan(
 
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> result;
   try {
-    Parser parser(context.GetParserOptions());
+    Parser parser(context);
     parser.ParseQuery(query);
     REQUIRE(!parser.statements.empty());
 
@@ -104,7 +105,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> generate_sirius_plan(
 
     auto plan = std::move(planner.plan);
 
-    if (context.config.enable_optimizer) {
+    if (duckdb::Settings::Get<duckdb::EnableOptimizerSetting>(context)) {
       Optimizer optimizer(*planner.binder, context);
       plan = optimizer.Optimize(std::move(plan));
     }
@@ -112,7 +113,8 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> generate_sirius_plan(
     plan->ResolveOperatorTypes();
 
     ColumnBindingResolver resolver;
-    ColumnBindingResolver::Verify(*plan);
+    duckdb::ColumnBindingResolver verifier(true);
+    verifier.VisitOperator(*plan);
     resolver.VisitOperator(*plan);
 
     sirius::planner::sirius_physical_plan_generator gen(context);
@@ -177,11 +179,15 @@ bool subtree_has_delim_scan(sirius::op::sirius_physical_operator* root)
   });
 }
 
-/// A hash join's build side is children[1]; the probe side is children[0].
+/// Follow unary build-side wrappers to the DELIM_SCAN, excluding joins above that scan.
 bool builds_on_delim_scan(sirius::op::sirius_physical_hash_join* hj)
 {
   REQUIRE(hj->children.size() == 2);
-  return subtree_has_delim_scan(hj->children[1].get());
+  auto* build = hj->children[1].get();
+  while (build->children.size() == 1) {
+    build = build->children[0].get();
+  }
+  return build->type == sirius::op::SiriusPhysicalOperatorType::DELIM_SCAN;
 }
 
 bool touches_delim_scan(sirius::op::sirius_physical_hash_join* hj)
@@ -434,6 +440,7 @@ TEST_CASE_METHOD(distinct_hash_join_fixture,
                  "distinct_hash_join - DELIM_GET build side enables unique_build_keys",
                  "[distinct_hash_join][isolated_context]")
 {
+  REQUIRE_FALSE(con->Query("SET delim_join_as_cte=false")->HasError());
   // Decorrelates into a DELIM_JOIN whose inner re-join probes delim_big against a
   // DELIM_GET replaying the duplicate-eliminated k keys — the TPC-H q22 shape.
   auto plan = generate_sirius_plan(
@@ -459,6 +466,7 @@ TEST_CASE_METHOD(distinct_hash_join_fixture,
                  "distinct_hash_join - non-unique build still refused alongside DELIM_GET",
                  "[distinct_hash_join][isolated_context]")
 {
+  REQUIRE_FALSE(con->Query("SET delim_join_as_cte=false")->HasError());
   // Same delim shape, but the outer query also joins the non-unique delim_fact build.
   auto plan = generate_sirius_plan(
     *con,

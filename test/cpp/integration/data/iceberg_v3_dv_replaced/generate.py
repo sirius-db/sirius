@@ -285,13 +285,15 @@ def main():
     for avro_path in sorted((HERE / "metadata").glob("*.avro")):
         with avro_path.open("rb") as fh:
             reader = fastavro.reader(fh)
+            metadata = dict(reader.metadata)
             schema, records = reader.writer_schema, [rewrite_paths(r) for r in reader]
         with avro_path.open("wb") as fh:
-            fastavro.writer(fh, schema, records, codec="null")
+            fastavro.writer(fh, schema, records, codec="null", metadata=metadata)
 
     list_path = next((HERE / "metadata").glob("snap-*.avro"))
     with list_path.open("rb") as fh:
         reader = fastavro.reader(fh)
+        list_metadata = dict(reader.metadata)
         list_schema, list_records = reader.writer_schema, list(reader)
 
     # --- one Puffin file per vector, as a rewrite produces ----------------------------------
@@ -324,6 +326,7 @@ def main():
     manifest_path = next((HERE / "metadata").glob("*-m1.avro"))
     with manifest_path.open("rb") as fh:
         reader = fastavro.reader(fh)
+        metadata = dict(reader.metadata)
         schema, records = reader.writer_schema, list(reader)
 
     template = next(
@@ -354,13 +357,15 @@ def main():
         rebuilt.append(entry)
 
     with manifest_path.open("wb") as fh:
-        fastavro.writer(fh, schema, others + rebuilt, codec="null")
+        fastavro.writer(fh, schema, others + rebuilt, codec="null", metadata=metadata)
     print(
         f"wrote {manifest_path.name}: statuses {[r['status'] for r in rebuilt]} (DELETED last)"
     )
 
     with list_path.open("wb") as fh:
-        fastavro.writer(fh, list_schema, list_records, codec="null")
+        fastavro.writer(
+            fh, list_schema, list_records, codec="null", metadata=list_metadata
+        )
 
     print("validating:")
     return 0 if verify() else 1

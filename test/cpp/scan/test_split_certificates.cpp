@@ -16,7 +16,10 @@
 
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
+#include "op/scan/iceberg_delete_set.hpp"
+#include "op/scan/iceberg_gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
+#include "op/scan/parquet_metadata.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "op/scan/table_scan/bound_read_view.hpp"
@@ -24,6 +27,7 @@
 #include "sirius_context.hpp"
 #include "test_utils.hpp"
 #include "transparent/read_view_registry.hpp"
+#include "transparent/replay_admission.hpp"
 
 #include <catch.hpp>
 #include <cucascade/cudf/datasource.hpp>
@@ -32,8 +36,10 @@
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
 #include <duckdb/execution/physical_plan_generator.hpp>
+#include <duckdb/main/attached_database.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/planner/filter/constant_filter.hpp>
+#include <duckdb/planner/filter/expression_filter.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
 #include <duckdb/planner/table_filter.hpp>
 #include <duckdb/storage/data_table.hpp>
@@ -136,10 +142,13 @@ std::unique_ptr<duckdb_native_ingestible_table_info> native_info(native_database
   info->projected_types.push_back(type);
   info->returned_types.push_back(type);
   info->output_types.push_back(type);
+  info->projected_output_count = 1;
   if (all_pruned) {
-    info->table_filters             = duckdb::make_uniq<duckdb::TableFilterSet>();
-    info->table_filters->filters[0] = duckdb::make_uniq<duckdb::ConstantFilter>(
-      duckdb::ExpressionType::COMPARE_LESSTHAN, duckdb::Value::INTEGER(-1));
+    info->table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
+    info->table_filters->PushFilter(
+      duckdb::ProjectionIndex(0),
+      duckdb::ExpressionFilter::CreateComparisonFilter(duckdb::ExpressionType::COMPARE_LESSTHAN,
+                                                       duckdb::Value::INTEGER(-1)));
   }
   return info;
 }
@@ -156,7 +165,7 @@ std::unique_ptr<parquet_ingestible_table_info> parquet_info(scan_contract_id con
   info->returned_types.push_back(sirius::logical_type::make(sirius::type_id::INTEGER));
   info->returned_types.push_back(sirius::logical_type::make(sirius::type_id::VARCHAR));
   info->column_ids.push_back(duckdb::ColumnIndex(0));
-  info->scan_output_arity = 1;
+  info->projected_output_count = 1;
   return info;
 }
 
@@ -186,7 +195,7 @@ struct parquet_certificate_fixture {
     auto provider = ingestible->next_split_provider(
       [this](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
     REQUIRE(provider);
-    auto info  = provider();
+    auto info  = provider({});
     auto* file = dynamic_cast<parquet_file_scan_info*>(info.get());
     REQUIRE(file);
     REQUIRE(file->certificates().size() == 1);
@@ -232,6 +241,7 @@ void check_parquet_file_split(scan_info const& info,
   CHECK(split->certificates()[0].input_identity == file.certificates()[0].input_identity);
   CHECK(split->certificates()[0].split_id == split_id);
   CHECK(split->dependencies()[0].footer == file.file_metadata);
+  CHECK(split->dependencies()[0].visibility == file.dependencies()[0].visibility);
   CHECK(split->rg_slices[0].file_metadata == file.file_metadata);
   CHECK(split->rg_slices[0].file_path == file.file_path);
   CHECK(split->rg_slices[0].file_index == file.file_index);
@@ -478,7 +488,7 @@ TEST_CASE("Fresh Parquet slices carry physical input certificates", "[scan][cert
       auto provider = warmer->next_split_provider(
         [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
       REQUIRE(provider);
-      REQUIRE(provider());
+      REQUIRE(provider({}));
       REQUIRE(cucascade::io::open_datasource(ioctx, path)->metadata());
     }
   }
@@ -493,7 +503,7 @@ TEST_CASE("Fresh Parquet slices carry physical input certificates", "[scan][cert
     auto provider = ingestible->next_split_provider(
       [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
     REQUIRE(provider);
-    auto file = provider();
+    auto file = provider({});
     REQUIRE(file);
     REQUIRE(file->certificates().size() == 1);
     REQUIRE(file->dependencies().size() == 1);
@@ -540,6 +550,101 @@ TEST_CASE("Fresh Parquet slices carry physical input certificates", "[scan][cert
   CHECK(position == paths.size());
 }
 
+TEST_CASE("File bounded cursors preserve batching and partial emission never fabricates EOS",
+          "[scan_preparation][coalescer][parquet_certificate]")
+{
+  auto const iceberg = GENERATE(false, true);
+  CAPTURE(iceberg);
+  sirius::test::scoped_sirius_disable disable;
+  temporary_directory files;
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  auto path = (files.path / "multi.parquet").string();
+  exec_ok(con,
+          "COPY (SELECT i::INTEGER n_nationkey,'name' n_name,0::INTEGER n_regionkey,'comment' "
+          "n_comment FROM range(10000) t(i)) TO " +
+            sirius::test::sql_literal(path) + " (FORMAT PARQUET, ROW_GROUP_SIZE 2048)");
+  auto info                    = parquet_info(53);
+  info->resolved_file_paths    = {path};
+  info->approximate_batch_size = 64 * 1024 * 1024;
+  std::shared_ptr<gpu_ingestible> ingestible;
+  if (iceberg) {
+    auto bind                         = std::make_unique<iceberg_ingestible_table_info>();
+    bind->contract_id                 = info->contract_id;
+    bind->names                       = std::move(info->names);
+    bind->returned_types              = std::move(info->returned_types);
+    bind->column_ids                  = std::move(info->column_ids);
+    bind->projected_output_count      = info->projected_output_count;
+    bind->resolved_file_paths         = std::move(info->resolved_file_paths);
+    bind->approximate_batch_size      = info->approximate_batch_size;
+    auto deletes                      = std::make_shared<IcebergDeleteData>();
+    deletes->positional_deletes[path] = {0};
+    bind->delete_data                 = std::move(deletes);
+    ingestible                        = make_ingestible(std::move(bind));
+  } else {
+    ingestible = make_ingestible(std::move(info));
+  }
+  auto ioctx = std::make_shared<cucascade::io::kvikio_context>();
+  auto work  = ingestible->next_split_provider(
+    [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
+  auto metadata = work({});
+  auto& file    = dynamic_cast<parquet_file_scan_info&>(*metadata);
+  REQUIRE(file.row_groups.size() > 1);
+  CHECK(file.disable_filter_pushdown == iceberg);
+  auto expected                     = copy_parquet_file_metadata(file);
+  expected->disable_filter_pushdown = iceberg;
+  auto coalescer                    = ingestible->create_batch_coalescer();
+  size_t cursor                     = 0;
+  std::optional<batch_coalescer::clock::time_point> first;
+  while (cursor < file.row_groups.size()) {
+    auto before = cursor;
+    auto step   = coalescer->advance(file, cursor, 1);
+    CHECK(cursor - before <= 1);
+    CHECK_FALSE(step.batch);
+    REQUIRE(coalescer->first_retained_time());
+    if (!first) first = coalescer->first_retained_time();
+    CHECK(coalescer->first_retained_time() == first);
+  }
+  auto unrelated_pruned = copy_parquet_file_metadata(file);
+  unrelated_pruned->row_groups.clear();
+  unrelated_pruned->partition_values = {"pruned"};
+  size_t pruned_cursor               = 0;
+  auto pruned_step                   = coalescer->advance(*unrelated_pruned, pruned_cursor, 1);
+  CHECK(pruned_step.finished);
+  CHECK_FALSE(pruned_step.batch);
+  CHECK(coalescer->first_retained_time() == first);
+  auto partial = coalescer->partial_emit();
+  REQUIRE(partial);
+  check_parquet_file_split(*partial, *expected, 1);
+  CHECK_FALSE(coalescer->first_retained_time());
+  CHECK_FALSE(coalescer->partial_emit());
+  auto next_file = copy_parquet_file_metadata(file);
+  cursor         = 0;
+  while (cursor < next_file->row_groups.size()) {
+    auto step = coalescer->advance(*next_file, cursor, 1);
+    CHECK_FALSE(step.batch);
+  }
+  REQUIRE(coalescer->first_retained_time());
+  auto tail = coalescer->flush();
+  REQUIRE(tail.size() == 1);
+  check_parquet_file_split(*tail.front(), *expected, 2);
+  CHECK_FALSE(coalescer->first_retained_time());
+  CHECK_FALSE(coalescer->partial_emit());
+  CHECK(coalescer->flush().empty());
+  auto pruned = ingestible->create_batch_coalescer();
+  auto empty  = copy_parquet_file_metadata(file);
+  empty->row_groups.clear();
+  cursor = 0;
+  CHECK(pruned->advance(*empty, cursor, 1).finished);
+  CHECK_FALSE(pruned->first_retained_time());
+  CHECK_FALSE(pruned->partial_emit());
+  auto final_empty = pruned->flush();
+  REQUIRE(final_empty.size() == 1);
+  REQUIRE(dynamic_cast<parquet_split_info&>(*final_empty.front())
+            .rg_slices.front()
+            .row_group_indices.empty());
+  CHECK(pruned->flush().empty());
+}
 TEST_CASE("Parquet coalescing rejects malformed files without changing pending work",
           "[scan][certificate][parquet_certificate]")
 {
@@ -699,8 +804,10 @@ TEST_CASE("Parquet certificates include physical-original file evidence after co
   REQUIRE(first_provider);
   REQUIRE(second_provider);
   // Metadata tasks share the ingestible and may initialize its evidence index concurrently.
-  auto first_file  = std::async(std::launch::async, std::move(first_provider));
-  auto second_file = std::async(std::launch::async, std::move(second_provider));
+  auto first_file = std::async(
+    std::launch::async, [provider = std::move(first_provider)]() mutable { return provider({}); });
+  auto second_file = std::async(
+    std::launch::async, [provider = std::move(second_provider)]() mutable { return provider({}); });
   std::vector<std::unique_ptr<scan_info>> splits;
   splits.push_back(first_file.get());
   splits.push_back(second_file.get());
@@ -779,7 +886,7 @@ TEST_CASE("Local glob evidence reaches Parquet certificates through physical com
     auto provider = ingestible->next_split_provider(
       [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
     REQUIRE(provider);
-    auto file = provider();
+    auto file = provider({});
     REQUIRE(file);
     REQUIRE(file->certificates().size() == 1);
     auto const identity = file->certificates().front().input_identity;
@@ -809,7 +916,7 @@ TEST_CASE("Native decode rejects metadata from an earlier checkpoint",
   auto provider   = ingestible->next_split_provider(
     [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
   REQUIRE(provider);
-  auto split = provider();
+  auto split = provider({});
   REQUIRE(split);
   REQUIRE_FALSE(split->dependencies().empty());
   REQUIRE(split->dependencies().front().checkpoint_iteration);
@@ -842,6 +949,8 @@ TEST_CASE("Native decode rejects metadata from an earlier checkpoint",
 TEST_CASE("Fresh native ranges and coalesced splits preserve every certificate",
           "[scan][certificate][integration]")
 {
+  auto const bounded = GENERATE(false, true);
+  CAPTURE(bounded);
   constexpr scan_contract_id contract_id = 61;
   native_database fixture;
   exec_ok(*fixture.connection, "CREATE TABLE items(id INTEGER)");
@@ -858,7 +967,7 @@ TEST_CASE("Fresh native ranges and coalesced splits preserve every certificate",
   std::vector<std::unique_ptr<scan_info>> splits;
   while (auto provider = ingestible->next_split_provider(
            [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; })) {
-    auto range = provider();
+    auto range = provider({});
     ++input_ranges;
     REQUIRE(range);
     auto const* native_range = dynamic_cast<duckdb_native_scan_info const*>(range.get());
@@ -867,12 +976,34 @@ TEST_CASE("Fresh native ranges and coalesced splits preserve every certificate",
     REQUIRE(range->certificates().size() == native_range->row_groups.size());
     REQUIRE(range->dependencies().size() == range->certificates().size());
     input_slices += range->certificates().size();
-    auto emitted = coalescer->push(std::move(range));
-    for (auto& split : emitted) {
-      splits.push_back(std::move(split));
+    if (bounded) {
+      size_t cursor = 0;
+      for (;;) {
+        auto before = cursor;
+        auto step   = coalescer->advance(*range, cursor, 1);
+        CHECK(cursor - before <= 1);
+        CHECK((step.batch || step.finished || cursor > before));
+        if (step.batch) splits.push_back(std::move(step.batch));
+        if (step.finished) break;
+      }
+    } else {
+      auto emitted = coalescer->push(std::move(range));
+      for (auto& split : emitted) {
+        splits.push_back(std::move(split));
+      }
     }
   }
+  if (bounded) {
+    REQUIRE(coalescer->first_retained_time());
+    auto partial = coalescer->partial_emit();
+    REQUIRE(partial);
+    splits.push_back(std::move(partial));
+    CHECK_FALSE(coalescer->first_retained_time());
+    CHECK_FALSE(coalescer->partial_emit());
+  }
   auto tail = coalescer->flush();
+  CHECK_FALSE(coalescer->first_retained_time());
+  CHECK(coalescer->flush().empty());
   for (auto& split : tail) {
     splits.push_back(std::move(split));
   }
@@ -880,7 +1011,7 @@ TEST_CASE("Fresh native ranges and coalesced splits preserve every certificate",
   REQUIRE(input_slices > 1);
   REQUIRE(input_ranges > 1);
   REQUIRE(splits.size() > 1);
-  std::size_t output_slices = 0;
+  std::size_t output_slices = 0, output_rows = 0;
   for (auto const& split : splits) {
     auto const* native_split = dynamic_cast<duckdb_native_scan_info const*>(split.get());
     REQUIRE(native_split);
@@ -892,6 +1023,7 @@ TEST_CASE("Fresh native ranges and coalesced splits preserve every certificate",
       auto const& dependency  = split->dependencies()[i];
       CHECK(certificate.contract_id == contract_id);
       auto const& group = native_split->row_groups[i];
+      output_rows += group.row_count;
       CHECK(certificate.split_id == static_cast<uint64_t>(group.row_group_index));
       REQUIRE(dependency.checkpoint_iteration.has_value());
       CHECK(certificate.input_identity == fixture.path.string() + "|checkpoint=" +
@@ -914,6 +1046,7 @@ TEST_CASE("Fresh native ranges and coalesced splits preserve every certificate",
     output_slices += split->certificates().size();
   }
   CHECK(output_slices == input_slices);
+  CHECK(output_rows == 1000000);
 }
 
 TEST_CASE("Native coalescing rejects missing or surplus row-group certificates",
@@ -943,7 +1076,7 @@ TEST_CASE("Native coalescing rejects missing or surplus row-group certificates",
   auto provider = ingestible->next_split_provider(
     [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
   REQUIRE(provider);
-  REQUIRE(coalescer->push(provider()).empty());
+  REQUIRE(coalescer->push(provider({})).empty());
   auto splits = coalescer->flush();
   REQUIRE(splits.size() == 1);
   REQUIRE(splits.front()->certificates().size() == 1);
@@ -966,7 +1099,9 @@ TEST_CASE("An all-pruned native scan keeps its contract on the empty fallback sp
   std::vector<std::unique_ptr<scan_info>> splits;
   while (auto provider = ingestible->next_split_provider(
            [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; })) {
-    auto emitted = coalescer->push(provider());
+    auto emitted = coalescer->push(provider({}));
+    CHECK_FALSE(coalescer->first_retained_time());
+    CHECK_FALSE(coalescer->partial_emit());
     for (auto& split : emitted) {
       splits.push_back(std::move(split));
     }
@@ -1024,6 +1159,28 @@ TEST_CASE("Split consumption rejects a foreign projection contract", "[scan][cer
   CHECK(after.certificate_mismatches == before.certificate_mismatches + 1);
 }
 
+TEST_CASE("Execution rebuilds foreign footer provenance before schema access",
+          "[scan][certificate][consumption][metadata_retention]")
+{
+  auto info    = parquet_info(81);
+  auto path    = info->resolved_file_paths.front();
+  auto ioctx   = std::make_shared<cucascade::io::kvikio_context>();
+  auto source  = cucascade::io::open_datasource(ioctx, path);
+  auto foreign = std::make_shared<parquet_metadata>(nullptr,
+                                                    64,
+                                                    parquet_encryption_evidence{},
+                                                    std::vector<uint8_t>{},
+                                                    std::string{},
+                                                    std::vector<uint8_t>{},
+                                                    "foreign-open");
+  REQUIRE(source->store_metadata(foreign));
+  auto ingestible = make_ingestible(std::move(info));
+  auto provider   = ingestible->next_split_provider(
+    [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
+  auto split = provider({});
+  REQUIRE(split != nullptr);
+}
+
 TEST_CASE("Consumption requires per-unit coverage and matching dependencies",
           "[scan][certificate][consumption]")
 {
@@ -1033,7 +1190,7 @@ TEST_CASE("Consumption requires per-unit coverage and matching dependencies",
   auto provider   = ingestible->next_split_provider(
     [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
   auto coalescer = ingestible->create_batch_coalescer();
-  auto splits    = coalescer->push(provider());
+  auto splits    = coalescer->push(provider({}));
   auto tail      = coalescer->flush();
   for (auto& s : tail)
     splits.push_back(std::move(s));
@@ -1055,6 +1212,31 @@ TEST_CASE("Consumption requires per-unit coverage and matching dependencies",
     certificates[0].input_identity = parquet->rg_slices[0].file_path + "|footer=0";
   }
   SECTION("missing file approval") { dependencies[0].parquet_approval.reset(); }
+  SECTION("missing metadata owner")
+  {
+    auto approval = std::make_shared<parquet_input_approval>(*dependencies[0].parquet_approval);
+    approval->metadata_owner.reset();
+    dependencies[0].parquet_approval = std::move(approval);
+  }
+  SECTION("foreign metadata owner")
+  {
+    auto approval = std::make_shared<parquet_input_approval>(*dependencies[0].parquet_approval);
+    approval->metadata_owner         = std::make_shared<cucascade::io::io_object_metadata>();
+    dependencies[0].parquet_approval = std::move(approval);
+  }
+  SECTION("missing object identity")
+  {
+    auto approval = std::make_shared<parquet_input_approval>(*dependencies[0].parquet_approval);
+    approval->object_identity.clear();
+    dependencies[0].parquet_approval = std::move(approval);
+  }
+  SECTION("foreign object identity")
+  {
+    auto approval = std::make_shared<parquet_input_approval>(*dependencies[0].parquet_approval);
+    approval->object_identity += "different-version";
+    dependencies[0].parquet_approval = std::move(approval);
+  }
+
   SECTION("row group outside approved set")
   {
     auto approval = std::make_shared<parquet_input_approval>(*dependencies[0].parquet_approval);
@@ -1200,7 +1382,7 @@ TEST_CASE("Native consumption rejects shuffled groups and missing iteration evid
   auto ioctx      = std::make_shared<cucascade::io::kvikio_context>();
   auto provider   = ingestible->next_split_provider(
     [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
-  auto split = provider();
+  auto split = provider({});
   auto required =
     check_bit(later_check::segments_per_range) | check_bit(later_check::matrix_per_range);
   REQUIRE_NOTHROW(validate_split_for_gpu(81, required, {}, *split));
@@ -1230,4 +1412,351 @@ TEST_CASE("Native consumption rejects shuffled groups and missing iteration evid
   }
   split->set_contract_payload(81, std::move(certificates), std::move(dependencies));
   REQUIRE_THROWS_AS(validate_split_for_gpu(81, required, {}, *split), certificate_incomplete);
+}
+
+TEST_CASE("Metadata-only production scans publish on the query owner",
+          "[integration][scan][certificate][scan_preparation][coordinator_thread]")
+{
+  sirius::test::GpuExecutionFixture fixture;
+  auto& con = *fixture.con;
+  exec_ok(con, "SET gpu_execution=false");
+  exec_ok(con, "CREATE TABLE owner_items AS SELECT i FROM range(1000) t(i)");
+  exec_ok(con, "CHECKPOINT");
+  auto context          = sirius::test::get_registered_sirius_context(con);
+  auto counters         = context->physical_counters();
+  counters->track_units = true;
+  auto execution_before = context->get_transparent_execution_stats();
+  exec_ok(con, "SET gpu_execution=true");
+  for (auto const* sql : {"SELECT sum(i) FROM owner_items", "SELECT i FROM owner_items LIMIT 1"}) {
+    auto before = [&] {
+      std::lock_guard lock(counters->units_mutex);
+      return counters->publications_by_query;
+    }();
+    auto result = con.Query(sql);
+    REQUIRE(result);
+    if (result->HasError()) { INFO(result->GetError()); }
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->RowCount() == 1);
+    auto chunk = result->Fetch();
+    if (std::string_view(sql).starts_with("SELECT sum"))
+      CHECK(chunk->GetValue(0, 0).ToString() == "499500");
+    else {
+      auto value = chunk->GetValue(0, 0).GetValue<int64_t>();
+      CHECK(value >= 0);
+      CHECK(value < 1000);
+    }
+    {
+      std::lock_guard lock(counters->units_mutex);
+      REQUIRE(counters->publications_by_query.size() > before.size());
+      for (auto const& [token, observation] : counters->publications_by_query) {
+        if (before.contains(token)) continue;
+        REQUIRE(observation.preparation_runs == 1);
+        CHECK(observation.execute_owner != std::thread::id{});
+        CHECK(observation.preparation_owner == observation.execute_owner);
+        CHECK(observation.preparation_runner == observation.execute_owner);
+        CHECK(observation.preparation_publisher == observation.preparation_runner);
+      }
+    }
+  }
+  auto execution_after = context->get_transparent_execution_stats();
+  CHECK(execution_after.executions == execution_before.executions + 2);
+  CHECK(execution_after.runtime_fallbacks == execution_before.runtime_fallbacks);
+  CHECK(context->get_scan_manager().num_active_queries() == 0);
+}
+
+namespace {
+std::unique_ptr<iceberg_ingestible_table_info> iceberg_info(
+  std::vector<std::string> paths, std::shared_ptr<IcebergDeleteData const> payload = nullptr)
+{
+  auto base                    = parquet_info(53);
+  auto info                    = std::make_unique<iceberg_ingestible_table_info>();
+  info->contract_id            = base->contract_id;
+  info->names                  = std::move(base->names);
+  info->returned_types         = std::move(base->returned_types);
+  info->column_ids             = std::move(base->column_ids);
+  info->projected_output_count = base->projected_output_count;
+  info->resolved_file_paths    = std::move(paths);
+  info->delete_data            = std::move(payload);
+  info->table_path             = "test-table";
+  return info;
+}
+}  // namespace
+
+TEST_CASE("Iceberg legacy results become complete per-file split dependencies",
+          "[scan_preparation][iceberg][delete_set][parquet_certificate]")
+{
+  auto const alias  = std::string{GENERATE("exact", "file_uri", "suffix")};
+  auto const legacy = GENERATE(false, true);
+  CAPTURE(alias, legacy);
+  sirius::test::scoped_sirius_disable disable;
+  temporary_directory files;
+  auto base         = parquet_info(53);
+  auto const source = base->resolved_file_paths.front();
+  auto deleted      = (files.path / "deleted.parquet").string();
+  auto intact       = (files.path / "intact.parquet").string();
+  std::filesystem::copy_file(source, deleted);
+  std::filesystem::copy_file(source, intact);
+  auto payload                                        = std::make_shared<IcebergDeleteData>();
+  auto key                                            = alias == "file_uri" ? "file://" + deleted
+                                                        : alias == "suffix" ? "deleted.parquet"
+                                                                            : deleted;
+  payload->positional_deletes[key]                    = {0, 0, 4};
+  payload->positional_deletes["unreferenced.parquet"] = {1};
+  auto const* positions                               = payload->positional_deletes[key].data();
+  std::weak_ptr<IcebergDeleteData const> owner        = payload;
+  auto info = iceberg_info({deleted, intact}, legacy ? payload : nullptr);
+  if (!legacy) {
+    info->delete_sets.emplace();
+    for (auto const& [path, positions] : payload->positional_deletes) {
+      auto backing = std::shared_ptr<std::vector<int64_t> const>(payload, &positions);
+      info->delete_sets->emplace(
+        path, std::make_shared<iceberg_delete_set const>(path, std::move(backing)));
+    }
+    info->delete_sets->emplace(intact, std::make_shared<iceberg_delete_set const>(intact));
+  }
+  auto ingestible = make_ingestible(std::move(info));
+  auto ioctx      = std::make_shared<cucascade::io::kvikio_context>();
+  std::vector<std::unique_ptr<scan_info>> splits;
+  auto coalescer = ingestible->create_batch_coalescer();
+  for (auto const& path : {deleted, intact}) {
+    auto work = ingestible->next_split_provider(
+      [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
+    REQUIRE(work);
+    auto metadata = work({});
+    REQUIRE(metadata->dependencies().size() == 1);
+    auto const set = metadata->dependencies().front().visibility;
+    REQUIRE(set);
+    auto const iceberg_set = std::dynamic_pointer_cast<iceberg_delete_set const>(set);
+    REQUIRE(iceberg_set);
+    CHECK(iceberg_set->positions.empty() == (path == intact));
+    if (path == deleted) {
+      CHECK(iceberg_set->positions.data() == positions);
+      CHECK(std::vector<int64_t>(iceberg_set->positions.begin(), iceberg_set->positions.end()) ==
+            std::vector<int64_t>{0, 0, 4});
+    }
+    auto const& file = dynamic_cast<parquet_file_scan_info const&>(*metadata);
+    CHECK(file.disable_filter_pushdown == (path == deleted));
+    auto batches = coalescer->push(std::move(metadata));
+    CHECK(batches.size() == (path == intact ? 1 : 0));
+    for (auto& batch : batches)
+      splits.push_back(std::move(batch));
+  }
+  auto tail = coalescer->flush();
+  REQUIRE(tail.size() == 1);
+  splits.push_back(std::move(tail.front()));
+  REQUIRE(splits.size() == 2);
+  for (size_t i = 0; i < splits.size(); ++i) {
+    REQUIRE(splits[i]->dependencies().size() == 1);
+    auto const& set = splits[i]->dependencies().front().visibility;
+    REQUIRE(set);
+    auto const iceberg_set = std::dynamic_pointer_cast<iceberg_delete_set const>(set);
+    REQUIRE(iceberg_set);
+    CHECK(iceberg_set->positions.empty() == (i == 1));
+    CHECK(dynamic_cast<parquet_split_info const&>(*splits[i]).disable_filter_pushdown == (i == 0));
+  }
+  coalescer.reset();
+  ingestible.reset();
+  payload.reset();
+  CHECK_FALSE(owner.expired());
+  auto first_set = std::dynamic_pointer_cast<iceberg_delete_set const>(
+    splits.front()->dependencies().front().visibility);
+  REQUIRE(first_set);
+  CHECK(first_set->positions.front() == 0);
+  first_set.reset();
+  splits.clear();
+  CHECK(owner.expired());
+}
+
+TEST_CASE("Iceberg per-file input distinguishes complete empty results from missing results",
+          "[scan_preparation][iceberg][delete_set][parquet_certificate]")
+{
+  sirius::test::scoped_sirius_disable disable;
+  auto const path = parquet_info(53)->resolved_file_paths.front();
+  auto info       = iceberg_info({path});
+  info->delete_sets.emplace();
+  SECTION("complete empty result needs no table-wide payload")
+  {
+    auto set = std::make_shared<iceberg_delete_set const>(path);
+    info->delete_sets->emplace(path, set);
+    auto ingestible = make_ingestible(std::move(info));
+    auto ioctx      = std::make_shared<cucascade::io::kvikio_context>();
+    auto work       = ingestible->next_split_provider(
+      [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
+    auto metadata = work({});
+    CHECK(metadata->dependencies().front().visibility == set);
+    CHECK_FALSE(dynamic_cast<parquet_file_scan_info&>(*metadata).disable_filter_pushdown);
+    auto coalescer = ingestible->create_batch_coalescer();
+    CHECK(coalescer->push(std::move(metadata)).empty());
+    auto splits = coalescer->flush();
+    REQUIRE(splits.size() == 1);
+    CHECK(splits.front()->dependencies().front().visibility == set);
+  }
+  SECTION("missing result must not become empty")
+  {
+    CHECK_THROWS_WITH(make_ingestible(std::move(info)),
+                      "[iceberg_gpu_ingestible] no complete delete set for '" + path + "'");
+  }
+  SECTION("pending result must not become empty")
+  {
+    info->delete_sets->emplace(path, nullptr);
+    CHECK_THROWS_WITH(
+      make_ingestible(std::move(info)),
+      "[iceberg_gpu_ingestible] incomplete or misbound delete set for '" + path + "'");
+  }
+  SECTION("wrong file identity is refused")
+  {
+    info->delete_sets->emplace(path, std::make_shared<iceberg_delete_set const>("other.parquet"));
+    CHECK_THROWS_WITH(
+      make_ingestible(std::move(info)),
+      "[iceberg_gpu_ingestible] incomplete or misbound delete set for '" + path + "'");
+  }
+  SECTION("two input modes cannot silently bypass legacy checks")
+  {
+    info->delete_sets->emplace(path, std::make_shared<iceberg_delete_set const>(path));
+    auto payload = std::make_shared<IcebergDeleteData>();
+    payload->equality_delete_groups.emplace_back();
+    info->delete_data = std::move(payload);
+    CHECK_THROWS_WITH(
+      make_ingestible(std::move(info)),
+      "[iceberg_gpu_ingestible] both legacy and per-file delete inputs were supplied");
+  }
+}
+
+TEST_CASE("Iceberg per-file adaptation preserves path ambiguity and unsupported-delete errors",
+          "[scan_preparation][iceberg][delete_set][parquet_certificate]")
+{
+  auto const legacy = GENERATE(false, true);
+  CAPTURE(legacy);
+  sirius::test::scoped_sirius_disable disable;
+  auto make_info = [&](std::vector<std::string> paths, std::vector<std::string> keys) {
+    auto info = iceberg_info(std::move(paths));
+    if (legacy) {
+      auto payload = std::make_shared<IcebergDeleteData>();
+      for (auto const& key : keys)
+        payload->positional_deletes[key] = {1};
+      info->delete_data = std::move(payload);
+    } else {
+      info->delete_sets.emplace();
+      for (auto const& key : keys) {
+        auto positions = std::make_shared<std::vector<int64_t> const>(std::vector<int64_t>{1});
+        info->delete_sets->emplace(key, std::make_shared<iceberg_delete_set const>(key, positions));
+      }
+    }
+    return info;
+  };
+  SECTION("one manifest key must not name two scanned files")
+  {
+    auto info = make_info({"/a/data.parquet", "/b/data.parquet"}, {"data.parquet"});
+    CHECK_THROWS_WITH(make_ingestible(std::move(info)),
+                      Catch::Matchers::ContainsSubstring(
+                        "delete file entry '{}' matches more than one scanned data file, "
+                        "so its deleted rows cannot be attributed"));
+  }
+  SECTION("an exact path must not hide a second alias")
+  {
+    auto info = make_info({"/a/data.parquet"}, {"/a/data.parquet", "file:///a/data.parquet"});
+    CHECK_THROWS_WITH(make_ingestible(std::move(info)),
+                      Catch::Matchers::ContainsSubstring(
+                        "scanned data file '{}' is named by {} different manifest entries"));
+  }
+  SECTION("suffix matching requires a path component boundary")
+  {
+    auto info = make_info({"/a/notdata.parquet"}, {"data.parquet"});
+    if (legacy)
+      CHECK_NOTHROW(make_ingestible(std::move(info)));
+    else
+      CHECK_THROWS_WITH(make_ingestible(std::move(info)),
+                        "[iceberg_gpu_ingestible] no complete delete set for '/a/notdata.parquet'");
+  }
+  SECTION("hive and positional deletes retain the original refusal")
+  {
+    auto info = make_info({"/a/data.parquet"}, {"/a/data.parquet"});
+    info->partition_indices.emplace_back("p", 1);
+    CHECK_THROWS_WITH(
+      make_ingestible(std::move(info)),
+      Catch::Matchers::ContainsSubstring(
+        "iceberg table '{}' combines hive partition columns with positional deletes, "
+        "which the GPU scan path cannot order correctly"));
+  }
+  if (legacy) {
+    SECTION("unresolved legacy payload retains the original refusal")
+    {
+      CHECK_THROWS_WITH(
+        make_ingestible(iceberg_info({"/a/data.parquet"})),
+        "[iceberg_gpu_ingestible] no delete data for 'test-table'; the planner must resolve it "
+        "(or decline the scan) before building the ingestible");
+    }
+    SECTION("equality deletes retain the original refusal")
+    {
+      auto info    = make_info({"/a/data.parquet"}, {});
+      auto payload = std::make_shared<IcebergDeleteData>();
+      payload->equality_delete_groups.emplace_back();
+      info->delete_data = std::move(payload);
+      CHECK_THROWS_WITH(
+        make_ingestible(std::move(info)),
+        Catch::Matchers::ContainsSubstring("iceberg table '{}' carries equality deletes, which the "
+                                           "GPU scan path does not apply yet"));
+    }
+  }
+}
+
+TEST_CASE("Iceberg materialization refuses missing or replaced delete dependencies before decode",
+          "[scan_preparation][iceberg][consumer_guard][integration]")
+{
+  auto const defect =
+    std::string{GENERATE("valid", "missing", "wrong_file", "replacement", "pushdown")};
+  auto const legacy = GENERATE(false, true);
+  CAPTURE(defect, legacy);
+  native_database fixture;
+  auto context = sirius::test::get_registered_sirius_context(*fixture.connection);
+  auto* space =
+    sirius::scan_test_utils::get_space(context->get_memory_manager(), cucascade::memory::Tier::GPU);
+  REQUIRE(space);
+  auto const path                  = parquet_info(53)->resolved_file_paths.front();
+  auto const key                   = "file://" + path;
+  auto payload                     = std::make_shared<IcebergDeleteData>();
+  payload->positional_deletes[key] = {0, 4};
+  auto info                        = iceberg_info({path}, legacy ? payload : nullptr);
+  if (!legacy) {
+    info->delete_sets.emplace();
+    auto backing =
+      std::shared_ptr<std::vector<int64_t> const>(payload, &payload->positional_deletes.at(key));
+    info->delete_sets->emplace(key, std::make_shared<iceberg_delete_set const>(key, backing));
+  }
+  auto ingestible = make_ingestible(std::move(info));
+  auto ioctx      = std::make_shared<cucascade::io::kvikio_context>();
+  auto work       = ingestible->next_split_provider(
+    [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
+  auto coalescer = ingestible->create_batch_coalescer();
+  CHECK(coalescer->push(work({})).empty());
+  auto batches = coalescer->flush();
+  REQUIRE(batches.size() == 1);
+  auto& split = dynamic_cast<parquet_split_info&>(*batches.front());
+  auto dependencies =
+    std::vector<split_dependencies>(split.dependencies().begin(), split.dependencies().end());
+  std::string expected =
+    "[iceberg_gpu_ingestible] incomplete or misbound delete set for '" + path + "'";
+  if (defect == "missing") {
+    dependencies.front().visibility.reset();
+  } else if (defect == "wrong_file") {
+    dependencies.front().visibility = std::make_shared<iceberg_delete_set const>("other.parquet");
+  } else if (defect == "replacement") {
+    dependencies.front().visibility = std::make_shared<iceberg_delete_set const>(key);
+  } else if (defect == "pushdown") {
+    split.disable_filter_pushdown = false;
+    expected = "[iceberg_gpu_ingestible] positional deletes require pushdown suppression";
+  }
+  split.set_contract_payload(split.contract_id(),
+                             std::vector<split_materializer_certificate>(
+                               split.certificates().begin(), split.certificates().end()),
+                             std::move(dependencies));
+  rmm::cuda_stream stream;
+  if (defect == "valid") {
+    auto result = ingestible->materialize_metadata_to_table(split, *space, stream, false, nullptr);
+    CHECK(result.table.num_rows() == 23);
+    CHECK(result.state == filter_state::UNFILTERED);
+  } else {
+    CHECK_THROWS_WITH(
+      ingestible->materialize_metadata_to_table(split, *space, stream, false, nullptr), expected);
+  }
 }

@@ -163,6 +163,10 @@ not uploaded.
 
 Fixtures are uploaded once and are available through both HTTP and HTTPS.
 
+The harness also generates `parquet/virtual_provenance.parquet` (8,193 rows with
+2,048-row groups) for provenance checks, and `parquet/virtual_physical_names.parquet`
+for virtual-column name collision checks.
+
 | Object group | Contents |
 |---|---|
 | `hello.txt` | 16 bytes; HEAD and tiny reads |

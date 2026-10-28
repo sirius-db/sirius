@@ -75,6 +75,7 @@ def build(dst_name, src_name):
     for avro_path in sorted(dst.glob("metadata/*.avro")):
         with avro_path.open("rb") as fh:
             reader = fastavro.reader(fh)
+            metadata = dict(reader.metadata)
             schema, records = reader.writer_schema, [
                 rewrite(r, src_name, dst_name) for r in reader
             ]
@@ -85,7 +86,7 @@ def build(dst_name, src_name):
                 record["status"] = STATUS_DELETED
                 retired += 1
         with avro_path.open("wb") as fh:
-            fastavro.writer(fh, schema, records, codec="null")
+            fastavro.writer(fh, schema, records, codec="null", metadata=metadata)
         if retired:
             print(f"  {avro_path.name}: retired {retired} delete entry/entries")
 

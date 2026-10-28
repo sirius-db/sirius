@@ -87,12 +87,35 @@ std::size_t bytes_after_full_eviction(cucascade::io::cache::fs_cache& cache)
 
 }  // namespace
 
+TEST_CASE("pin does not reuse foreign local footer across opens",
+          "[scan_manager][cache][pin_parquet][metadata_retention]")
+{
+  auto memory   = initialize_memory_manager(1);
+  auto topology = single_gpu_index_for_pin();
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, config_with_cucs_cache(), *memory, topology};
+  auto source = manager.create_datasource(good_parquet());
+  REQUIRE(source);
+  auto foreign = std::make_shared<sirius::op::scan::parquet_metadata>(
+    nullptr,
+    64,
+    sirius::op::scan::parquet_encryption_evidence{},
+    std::vector<uint8_t>{},
+    std::string{},
+    std::vector<uint8_t>{},
+    "foreign-open");
+  REQUIRE(source->store_metadata(foreign));
+  CHECK_NOTHROW(manager.pin_parquet_ranges("foreign", {good_parquet()}, std::nullopt));
+}
+
 TEST_CASE("a pin that throws part way through pins nothing", "[scan_manager][cache][pin_parquet]")
 {
   auto memory   = initialize_memory_manager(1);
   auto topology = single_gpu_index_for_pin();
 
-  sirius_scan_manager manager{config_with_cucs_cache(), *memory, topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+
+  sirius_scan_manager manager{scan_lifecycle, config_with_cucs_cache(), *memory, topology};
   auto* cache = manager.io_ctx()->cache();
   REQUIRE(cache != nullptr);
   REQUIRE(cache->is_armed());
@@ -108,11 +131,12 @@ TEST_CASE("a pin that throws part way through pins nothing", "[scan_manager][cac
 }
 
 TEST_CASE("parquet tier pin caches complete footer evidence for every file",
-          "[scan_manager][cache][pin_parquet][r2a]")
+          "[scan_manager][cache][pin_parquet][metadata_retention]")
 {
   auto memory   = initialize_memory_manager(1);
   auto topology = single_gpu_index_for_pin();
-  sirius_scan_manager manager{config_with_cucs_cache(), *memory, topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, config_with_cucs_cache(), *memory, topology};
   sirius::test::scratch_dir directory("pin_parquet_evidence");
   std::vector<std::string> paths;
   for (auto const* name : {"a.parquet", "b.parquet"}) {
@@ -138,7 +162,9 @@ TEST_CASE("a failed re-pin leaves the previous pin intact", "[scan_manager][cach
   auto memory   = initialize_memory_manager(1);
   auto topology = single_gpu_index_for_pin();
 
-  sirius_scan_manager manager{config_with_cucs_cache(), *memory, topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+
+  sirius_scan_manager manager{scan_lifecycle, config_with_cucs_cache(), *memory, topology};
   auto* cache = manager.io_ctx()->cache();
   REQUIRE(cache != nullptr);
   REQUIRE(cache->is_armed());
@@ -163,7 +189,9 @@ TEST_CASE("reset_caches drops parquet pins rather than leave them stale",
   auto memory   = initialize_memory_manager(1);
   auto topology = single_gpu_index_for_pin();
 
-  sirius_scan_manager manager{config_with_cucs_cache(), *memory, topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+
+  sirius_scan_manager manager{scan_lifecycle, config_with_cucs_cache(), *memory, topology};
   auto* cache = manager.io_ctx()->cache();
   REQUIRE(cache != nullptr);
   REQUIRE(cache->is_armed());

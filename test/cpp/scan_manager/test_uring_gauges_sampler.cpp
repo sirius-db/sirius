@@ -78,14 +78,14 @@ TEST_CASE("uring gauges: deltas, rate and per-tier queue delay", "[scan_manager]
   g.bytes_submitted  = std::size_t{110} << 20;
   g.preemptions      = 3;
 
-  auto& high         = g.queue_delay[0];
+  auto& high         = g.queue_delay_high;
   high.count         = 3;
   high.sum_ns        = 4'500'000;
   high.max_ns        = 2'000'000;
   high.histogram[3]  = 1;
   high.histogram[11] = 2;
 
-  auto& low        = g.queue_delay[1];
+  auto& low        = g.queue_delay_low;
   low.count        = 1;
   low.sum_ns       = 300'000;
   low.max_ns       = 300'000;
@@ -102,6 +102,6 @@ TEST_CASE("uring gauges: deltas, rate and per-tier queue delay", "[scan_manager]
 
   // A queue-delay record alone (no movement otherwise) is not idle.
   gauges delayed_only{};
-  delayed_only.queue_delay[1].count = 1;
+  delayed_only.queue_delay_low.count = 1;
   CHECK(format_gauges_line(0, delayed_only, &delayed_only, 0.25).has_value());
 }

@@ -140,11 +140,11 @@ expression_evaluator::expression_evaluator(
   duckdb::vector<std::unique_ptr<sirius::ast::node>> const& expressions,
   rmm::device_async_resource_ref resource_ref,
   ::cuda::stream_ref stream,
-  expression_evaluator_strategy strategy,
+  expression_query_policy policy,
   std::size_t min_ast_size,
   bool like_swar_fastpath,
   std::shared_ptr<like_multiliteral_cache const> like_cache)
-  : _strategy(strategy),
+  : _policy(policy),
     _mr(resource_ref),
     _stream(stream),
     _min_ast_size(min_ast_size),
@@ -161,14 +161,14 @@ expression_evaluator::expression_evaluator(
   sirius::ast::node const& expression,
   rmm::device_async_resource_ref resource_ref,
   ::cuda::stream_ref stream,
-  expression_evaluator_strategy strategy,
+  expression_query_policy policy,
   std::size_t min_ast_size,
   bool like_swar_fastpath,
   std::shared_ptr<like_multiliteral_cache const> like_cache)
   : expression_evaluator(&expression,
                          resource_ref,
                          stream,
-                         strategy,
+                         policy,
                          min_ast_size,
                          like_swar_fastpath,
                          std::move(like_cache))
@@ -179,11 +179,11 @@ expression_evaluator::expression_evaluator(
   sirius::ast::node const* expression,
   rmm::device_async_resource_ref resource_ref,
   ::cuda::stream_ref stream,
-  expression_evaluator_strategy strategy,
+  expression_query_policy policy,
   std::size_t min_ast_size,
   bool like_swar_fastpath,
   std::shared_ptr<like_multiliteral_cache const> like_cache)
-  : _strategy(strategy),
+  : _policy(policy),
     _mr(resource_ref),
     _stream(stream),
     _min_ast_size(min_ast_size),
@@ -197,12 +197,12 @@ expression_evaluator::expression_evaluator(
   std::vector<sirius::ast::node const*> expressions,
   rmm::device_async_resource_ref resource_ref,
   ::cuda::stream_ref stream,
-  expression_evaluator_strategy strategy,
+  expression_query_policy policy,
   std::size_t min_ast_size,
   bool like_swar_fastpath,
   std::shared_ptr<like_multiliteral_cache const> like_cache)
   : _ast_expressions(std::move(expressions)),
-    _strategy(strategy),
+    _policy(policy),
     _mr(resource_ref),
     _stream(stream),
     _min_ast_size(min_ast_size),
@@ -232,11 +232,13 @@ std::unique_ptr<cudf::column> expression_evaluator::evaluate_ast(expr_ref root_e
   }
 
   cudf::table_view combined_table_view(combined_column_views);
-  if (_strategy == expression_evaluator_strategy::AST_INTERPRET) {
-    return cudf::compute_column(combined_table_view, root_expr.get(), _stream, _mr);
-  } else {
+  if (_policy.strategy == expression_evaluator_strategy::AST_JIT) {
+    ++_ast_jit_evaluation_count;
     return cudf::compute_column_jit(combined_table_view, root_expr.get(), _stream, _mr);
   }
+  // MATERIALIZE uses a small interpreted AST for floating comparison semantics.
+  // Building that AST must not opt a query into the JIT backend.
+  return cudf::compute_column(combined_table_view, root_expr.get(), _stream, _mr);
 }
 
 evaluate_result expression_evaluator::materialize_as_ast_column(
@@ -247,6 +249,14 @@ evaluate_result expression_evaluator::materialize_as_ast_column(
   _temp_columns.push_back(std::move(column));
   auto const& col_ref = _ast_tree.emplace<cudf::ast::column_reference>(col_idx);
   return evaluate_result(ast_result(col_ref, std::vector<std::size_t>{}, {temp_column_idx}));
+}
+
+evaluate_result expression_evaluator::evaluate_as_column(sirius::ast::node const& expr)
+{
+  auto result = evaluate(expr, evaluation_mode::MATERIALIZE);
+  if (!result.is_scalar()) { return result; }
+  return evaluate_result(
+    cudf::make_column_from_scalar(result.get_scalar(), _input_table.num_rows(), _stream, _mr));
 }
 
 void expression_evaluator::release_temporaries(
@@ -300,7 +310,7 @@ std::unique_ptr<cudf::table> expression_evaluator::evaluate(cudf::table_view inp
       // type. E.g., `extract(year from col)` from libcudf returns int16_t but the SQL type is
       // int64_t. Only use cudf::cast when both types are fixed-width (cast does not support
       // STRING/LIST/STRUCT).
-      auto const cudf_return_type = sirius::get_cudf_type(expr.return_type());
+      auto const cudf_return_type = sirius::require_cudf_type(expr.return_type());
       std::unique_ptr<cudf::column> result_column;
       if (result.is_scalar()) {
         result_column =
@@ -369,7 +379,7 @@ std::unique_ptr<cudf::table> expression_evaluator::select(
       "all-columns select() overload for count(*)-style filters with no output columns");
   }
   auto mask = compute_mask(input);
-  return ApplyRetentionMask(
+  return sirius::apply_retention_mask(
     input.select(output_indices.begin(), output_indices.end()), mask->view(), _stream, _mr);
 }
 
@@ -385,7 +395,7 @@ std::unique_ptr<cudf::table> expression_evaluator::select_with_survivors(
   // ONE mask, used twice: the survivors must be exactly the rows the output
   // holds, so computing the predicate a second time would risk two answers.
   auto mask     = compute_mask(input);
-  auto selected = ApplyRetentionMask(
+  auto selected = sirius::apply_retention_mask(
     input.select(output_indices.begin(), output_indices.end()), mask->view(), _stream, _mr);
 
   auto const rows = input.num_rows();
@@ -395,7 +405,7 @@ std::unique_ptr<cudf::table> expression_evaluator::select_with_survivors(
                                   _stream,
                                   _mr);
   auto surviving =
-    ApplyRetentionMask(cudf::table_view{{positions->view()}}, mask->view(), _stream, _mr);
+    sirius::apply_retention_mask(cudf::table_view{{positions->view()}}, mask->view(), _stream, _mr);
   survivors = std::make_unique<cudf::column>(surviving->get_column(0), _stream, _mr);
   return selected;
 }
@@ -403,7 +413,7 @@ std::unique_ptr<cudf::table> expression_evaluator::select_with_survivors(
 std::unique_ptr<cudf::table> expression_evaluator::select(cudf::table_view input)
 {
   auto mask = compute_mask(input);
-  return ApplyRetentionMask(input, mask->view(), _stream, _mr);
+  return sirius::apply_retention_mask(input, mask->view(), _stream, _mr);
 }
 
 evaluate_result expression_evaluator::evaluate(sirius::ast::aggregate const& /*expr*/,

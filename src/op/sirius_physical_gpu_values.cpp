@@ -18,11 +18,14 @@
 
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
+#include "helper/type_conversions.hpp"
+#include "op/input_free_operator_data.hpp"
 #include "telemetry/nvtx.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/null_mask.hpp>
+#include <cudf/scalar/scalar.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/error.hpp>
 
@@ -35,6 +38,9 @@
 #include <duckdb/common/types/data_chunk.hpp>
 #include <duckdb/common/types/validity_mask.hpp>
 #include <duckdb/common/types/vector.hpp>
+#include <duckdb/common/vector/array_vector.hpp>
+#include <duckdb/common/vector/flat_vector.hpp>
+#include <duckdb/common/vector/struct_vector.hpp>
 
 #include <algorithm>
 #include <cstring>
@@ -45,6 +51,60 @@
 namespace sirius::op {
 
 namespace {
+
+// Empty Parquet sources carry the exact bound schema in an owned empty collection.
+// Unlike flat Sirius types, this retains every nested child without reading a footer.
+std::unique_ptr<cudf::column> empty_bound_column(duckdb::LogicalType const& type,
+                                                 ::cuda::stream_ref stream,
+                                                 rmm::device_async_resource_ref mr)
+{
+  using id = duckdb::LogicalTypeId;
+  if (type.id() == id::VARCHAR) {
+    // Keep an offsets child even for zero strings: nested host-result conversion
+    // visits this schema, while make_empty_column(STRING) is childless.
+    cudf::numeric_scalar<int32_t> zero(0, true, stream, mr);
+    std::vector<std::unique_ptr<cudf::column>> children;
+    children.push_back(cudf::make_column_from_scalar(zero, 1, stream, mr));
+    return std::make_unique<cudf::column>(
+      cudf::data_type{cudf::type_id::STRING},
+      0,
+      rmm::device_buffer{},
+      cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr),
+      0,
+      std::move(children));
+  }
+  if (type.id() == id::STRUCT) {
+    std::vector<std::unique_ptr<cudf::column>> children;
+    for (auto const& [name, child] : duckdb::StructType::GetChildTypes(type)) {
+      children.push_back(empty_bound_column(child, stream, mr));
+    }
+    return cudf::make_structs_column(
+      0,
+      std::move(children),
+      0,
+      cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr),
+      stream,
+      mr);
+  }
+  if (type.id() == id::LIST || type.id() == id::ARRAY || type.id() == id::MAP) {
+    auto const child_type =
+      type.id() == id::ARRAY ? duckdb::ArrayType::GetChildType(type)
+      : type.id() == id::MAP
+        ? duckdb::LogicalType::STRUCT(
+            {{"key", duckdb::MapType::KeyType(type)}, {"value", duckdb::MapType::ValueType(type)}})
+        : duckdb::ListType::GetChildType(type);
+    auto child = empty_bound_column(child_type, stream, mr);
+    cudf::numeric_scalar<int32_t> zero(0, true, stream, mr);
+    auto offsets = cudf::make_column_from_scalar(zero, 1, stream, mr);
+    return cudf::make_lists_column(
+      0,
+      std::move(offsets),
+      std::move(child),
+      0,
+      cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr));
+  }
+  return cudf::make_empty_column(sirius::require_cudf_type(sirius::from_duckdb(type)));
+}
 
 //===----------------------------------------------------------------------===//
 // Host-side column staging
@@ -184,7 +244,7 @@ std::unique_ptr<cudf::column> make_device_column(const column_staging& s,
   }
 
   return std::make_unique<cudf::column>(
-    sirius::get_cudf_type(type),
+    sirius::require_cudf_type(type),
     num_rows,
     to_device(s.fixed_data.data(), s.fixed_data.size(), stream, mr),
     std::move(null_mask),
@@ -265,7 +325,7 @@ bool sirius_physical_gpu_values::all_ports_empty()
 std::unique_ptr<operator_data> sirius_physical_gpu_values::get_next_task_input_data()
 {
   if (_input_handed_out.exchange(true, std::memory_order_acq_rel)) { return nullptr; }
-  return std::make_unique<gpu_values_input>(estimated_source_bytes());
+  return std::make_unique<input_free_operator_data>(estimated_source_bytes());
 }
 
 //===----------------------------------------------------------------------===//
@@ -276,19 +336,15 @@ std::unique_ptr<operator_data> sirius_physical_gpu_values::execute(const operato
 {
   nvtx_scoped_range nvtx_range{"sirius_physical_gpu_values::execute"};
 
-  auto const* values_input = dynamic_cast<const gpu_values_input*>(&input_data);
+  auto const* values_input = dynamic_cast<const input_free_operator_data*>(&input_data);
   if (!values_input) {
     throw std::runtime_error(
-      "[sirius_physical_gpu_values::execute] expected input of type gpu_values_input; got " +
+      "[sirius_physical_gpu_values::execute] expected input of type input_free_operator_data; "
+      "got " +
       std::string(typeid(input_data).name()));
   }
-  auto* mem_space = values_input->get_gpu_memory_space();
-  if (!mem_space) {
-    throw std::runtime_error(
-      "[sirius_physical_gpu_values::execute] no memory space set on task input; "
-      "prepare_for_processing was not called");
-  }
-  auto mr = mem_space->get_default_allocator();
+  auto* mem_space = &values_input->get_gpu_memory_space();
+  auto mr         = mem_space->get_default_allocator();
 
   std::unique_ptr<cudf::table> output_table;
   if (_collection && _collection->Count() > 0) {
@@ -354,7 +410,27 @@ std::unique_ptr<operator_data> sirius_physical_gpu_values::execute(const operato
     // EMPTY_RESULT (or an empty collection): 0-row table with the declared
     // schema, so downstream operators see a real (empty) input — the same
     // shape a filter-everything pipeline produces.
-    output_table = sirius::make_empty_table(types);
+    if (_collection && !_collection->Types().empty()) {
+      auto const& schema = _collection->Types();
+      if (schema.size() != types.size()) {
+        throw std::runtime_error("empty GPU VALUES schema width differs from output types");
+      }
+      std::vector<std::unique_ptr<cudf::column>> columns;
+      for (size_t i = 0; i < schema.size(); ++i) {
+        auto const nested = schema[i].id() == duckdb::LogicalTypeId::LIST ||
+                            schema[i].id() == duckdb::LogicalTypeId::STRUCT ||
+                            schema[i].id() == duckdb::LogicalTypeId::MAP ||
+                            schema[i].id() == duckdb::LogicalTypeId::ARRAY;
+        columns.push_back(has_physical_overrides() && !nested &&
+                              get_physical_types()[i].id() != cudf::type_id::STRING
+                            ? cudf::make_empty_column(get_physical_types()[i])
+                            : empty_bound_column(schema[i], stream, mr));
+      }
+      output_table = std::make_unique<cudf::table>(std::move(columns));
+    } else {
+      output_table = has_physical_overrides() ? sirius::make_empty_table(get_physical_types())
+                                              : sirius::make_empty_table(types);
+    }
   }
 
   auto batch =
@@ -396,8 +472,10 @@ void sirius_physical_gpu_values::throw_if_unsupported_types(
         "cuDF; falling back to DuckDB CPU");
     }
     if (!t.is_varchar()) {
-      // Both throw for unsupported types → CPU fallback.
-      static_cast<void>(sirius::get_cudf_type(t));
+      if (!sirius::get_cudf_type(t)) {
+        throw duckdb::NotImplementedException("GPU VALUES type %s cannot be mapped to cuDF",
+                                              t.to_string());
+      }
       static_cast<void>(t.fixed_width_byte_size());
     }
   }

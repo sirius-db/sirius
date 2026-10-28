@@ -1,6 +1,11 @@
 target_sources(
   sirius_objects
-  PRIVATE late_mat_resolver.cpp
+  PRIVATE preparation_coordinator.cpp
+          coordinator_pool.cpp
+          native_reader_executor.cpp
+          preparation.cpp
+          preparation_ledger.cpp
+          late_mat_resolver.cpp
           load_balancing_scan_batch_coalescer.cpp
           insert_delta_job.cpp
           mvcc_mask_job.cpp

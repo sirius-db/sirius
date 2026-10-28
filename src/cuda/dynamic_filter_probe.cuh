@@ -71,6 +71,7 @@
 // standard library
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <utility>
 
 namespace sirius::op::detail {
@@ -117,10 +118,24 @@ __device__ __forceinline__ bool prior_mask_keeps(std::uint32_t const* words,
           1U) != 0U;
 }
 
-/// Validity of the probe rows. A null probe key can never equal a build key: admission never
-/// routes a null-safe (IS NOT DISTINCT FROM) comparison here and the authoritative join runs with
-/// null_equality::UNEQUAL, so a null row is a definite non-member and the kernels write `false`
-/// for it instead of propagating the probe's null mask onto the output. @p words is the probe
+__device__ __forceinline__ bool prior_mask_keeps(bool const* keep, cudf::size_type row) noexcept
+{
+  return keep == nullptr || keep[row];
+}
+
+inline bool const* checked_prior_keep(cudf::column_view const& probe,
+                                      cudf::column_view const& prior_keep)
+{
+  if (prior_keep.type().id() != cudf::type_id::BOOL8 || prior_keep.nullable() ||
+      prior_keep.size() != probe.size()) {
+    throw std::invalid_argument{"prior_keep must be nonnullable BOOL8 with probe.size() rows"};
+  }
+  return prior_keep.is_empty() ? nullptr : prior_keep.data<bool>();
+}
+
+/// Validity of the probe rows. Ordinary equality rejects NULL probe keys; explicitly null-safe
+/// membership preserves them unless a prior mask rejected the row. Both policies produce a
+/// nonnullable output mask. @p words is the probe
 /// column's own bitmask (null = the column has no nulls), read at `offset + row` because a
 /// column_view's mask pointer is not offset-adjusted.
 struct probe_validity {
@@ -261,10 +276,23 @@ bool dispatch_probe_adapter(membership_key_domain const& domain,
 // Probe kernel
 //===----------------------------------------------------------------------===//
 
+template <class Adapter, class Lookup>
+__device__ __forceinline__ bool membership_row_keeps(Adapter const& adapt,
+                                                     Lookup const& lookup,
+                                                     probe_validity valid,
+                                                     cudf::size_type row,
+                                                     bool preserve_nulls = false) noexcept
+{
+  if (!valid(row)) { return preserve_nulls; }
+  typename Adapter::key_type key;
+  return adapt(row, key) && lookup(key);
+}
+
 /// The per-row probe shared by the three filters. A row the prior keep-mask killed or whose probe
-/// key is null is a definite non-member (null build slots were compacted out and the join never
-/// matches nulls); so is a value the adapter cannot represent in the key domain, since every
-/// stored key fits it. Only a converted key reaches @p Lookup, which is the filter-specific part:
+/// key is null under ordinary equality is a definite non-member. Null-safe filters preserve NULL
+/// keys, but never revive rows rejected by a prior mask. A value the adapter cannot represent is
+/// also a non-member, since every stored key fits it. Only a converted key reaches @p Lookup,
+/// which is the filter-specific part:
 /// a set `contains`, a Bloom `contains`, or a needle scan.
 template <class Adapter, class Lookup>
 struct membership_probe_functor {
@@ -273,16 +301,17 @@ struct membership_probe_functor {
   Lookup lookup;
   bool* __restrict__ out;
   std::uint32_t const* __restrict__ prior_words;  // packed 1 bit/row, or null
+  bool const* __restrict__ prior_keep;
   probe_validity valid;
+  bool preserve_nulls;
 
   __device__ __forceinline__ void operator()(cudf::size_type idx) const noexcept
   {
-    if (!prior_mask_keeps(prior_words, idx) || !valid(idx)) {
-      out[idx] = false;
-      return;
-    }
-    key_type key;
-    out[idx] = adapt(idx, key) && lookup(key);
+    // clang-format off
+    out[idx] = prior_mask_keeps(prior_words, idx) &&
+               prior_mask_keeps(prior_keep, idx) &&
+               membership_row_keeps(adapt, lookup, valid, idx, preserve_nulls);
+    // clang-format on
   }
 };
 
@@ -290,8 +319,8 @@ struct membership_probe_functor {
 /// returns null when the probe type is incompatible; otherwise allocates the BOOL8 result and
 /// launches `membership_probe_functor` with @p lookup on @p stream. A pinned chunk may store the
 /// key narrowed while the filter was published at the native carrier; the kernel converts per
-/// element rather than materializing a widened copy. Null probe rows are written as `false`
-/// in-kernel, so the mask is non-nullable by construction.
+/// element rather than materializing a widened copy. Null probe rows use the NULL-preservation
+/// policy in-kernel, so the mask is non-nullable by construction.
 template <class KeyT, class Lookup>
 [[nodiscard]] std::unique_ptr<cudf::column> run_membership_probe(
   membership_key_domain const& domain,
@@ -299,7 +328,9 @@ template <class KeyT, class Lookup>
   std::uint32_t const* prior_mask_words,
   ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr,
-  Lookup lookup)
+  Lookup lookup,
+  bool const* prior_keep = nullptr,
+  bool preserve_nulls    = false)
 {
   std::unique_ptr<cudf::column> out;
   auto const n          = probe.size();
@@ -307,11 +338,16 @@ template <class KeyT, class Lookup>
     out = cudf::make_numeric_column(
       cudf::data_type{cudf::type_id::BOOL8}, n, cudf::mask_state::UNALLOCATED, stream, mr);
     auto* const outp = out->mutable_view().data<bool>();
-    CUCASCADE_CUDA_TRY(
-      cub::DeviceFor::Bulk(n,
-                           membership_probe_functor<decltype(adapter), Lookup>{
-                             adapter, lookup, outp, prior_mask_words, probe_validity_of(probe)},
-                           stream.get()));
+    CUCASCADE_CUDA_TRY(cub::DeviceFor::Bulk(
+      n,
+      membership_probe_functor<decltype(adapter), Lookup>{adapter,
+                                                          lookup,
+                                                          outp,
+                                                          prior_mask_words,
+                                                          prior_keep,
+                                                          probe_validity_of(probe),
+                                                          preserve_nulls},
+      stream.get()));
   });
   if (!dispatched) { return nullptr; }
   return out;

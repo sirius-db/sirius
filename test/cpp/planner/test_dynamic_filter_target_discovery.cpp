@@ -53,8 +53,8 @@ using sirius::planner::descent_steps;
 using sirius::planner::group_by_key_input;
 using sirius::planner::join_block_descent;
 using sirius::planner::place_endpoint;
+using sirius::planner::probe_filter_join_type_admissible;
 using sirius::planner::projection_reference_input;
-using sirius::planner::scan_route_join_type_admissible;
 using sirius::planner::trace_probe_key;
 
 constexpr descent_policy kSipOn{.descend_build_blocks = true};
@@ -153,7 +153,11 @@ duckdb::unique_ptr<sirius::op::scan::sirius_physical_dynamic_filter> make_endpoi
   return duckdb::make_uniq<sirius::op::scan::sirius_physical_dynamic_filter>(
     std::move(types),
     /*estimated_cardinality=*/0,
-    std::make_shared<sirius::op::sirius_dynamic_filter_set>());
+    std::make_shared<sirius::op::scan::dynamic_filter_consumer>(
+      std::make_shared<sirius::op::sirius_dynamic_filter_set>(),
+      sirius::op::scan::consumer_config{
+        .mode = sirius::op::scan::dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY},
+      std::vector<sirius::op::scan::binding>{}));
 }
 
 // A place_endpoint factory that splices in a real endpoint operator and records every splice.
@@ -325,25 +329,28 @@ TEST_CASE("join_block_descent refuses a build ordinal past the build block",
 }
 
 // ---------------------------------------------------------------------------------------------
-// scan_route_join_type_admissible
+// probe_filter_join_type_admissible
 // ---------------------------------------------------------------------------------------------
 
-TEST_CASE("scan_route_join_type_admissible mirrors DuckDB's producer join-type gate",
+TEST_CASE("runtime-filter producers can discard probe rows with no matching build key",
           "[dynamic_filter][placement][discovery]")
 {
-  for (auto const join_type :
-       {duckdb::JoinType::INNER, duckdb::JoinType::RIGHT, duckdb::JoinType::SEMI}) {
-    REQUIRE(scan_route_join_type_admissible(join_type));
+  for (auto const join_type : {duckdb::JoinType::INNER,
+                               duckdb::JoinType::RIGHT,
+                               duckdb::JoinType::SEMI,
+                               duckdb::JoinType::RIGHT_SEMI,
+                               duckdb::JoinType::RIGHT_ANTI}) {
+    CAPTURE(join_type);
+    REQUIRE(probe_filter_join_type_admissible(join_type));
   }
   for (auto const join_type : {duckdb::JoinType::LEFT,
                                duckdb::JoinType::OUTER,
                                duckdb::JoinType::ANTI,
                                duckdb::JoinType::MARK,
                                duckdb::JoinType::SINGLE,
-                               duckdb::JoinType::RIGHT_SEMI,
-                               duckdb::JoinType::RIGHT_ANTI,
                                duckdb::JoinType::INVALID}) {
-    REQUIRE_FALSE(scan_route_join_type_admissible(join_type));
+    CAPTURE(join_type);
+    REQUIRE_FALSE(probe_filter_join_type_admissible(join_type));
   }
 }
 
@@ -710,4 +717,40 @@ TEST_CASE("a second placement descends past the endpoint the first placed",
   REQUIRE(first_endpoints[0]->children[0].get() == second_endpoints[0]);
   REQUIRE(second_endpoints[0]->children.size() == 1);
   REQUIRE(second_endpoints[0]->children[0].get() == scan_node);
+}
+
+TEST_CASE("NULL-safe routing follows preserved values and stops at NULL-generating sides",
+          "[dynamic_filter][placement]")
+{
+  std::vector<cudf::size_type> const probe_cols{3, 1};
+  std::vector<cudf::size_type> const build_cols{4, 2};
+  descent_policy const policy{.descend_build_blocks = true, .preserve_nulls = true};
+  for (auto type : {duckdb::JoinType::INNER,
+                    duckdb::JoinType::LEFT,
+                    duckdb::JoinType::SEMI,
+                    duckdb::JoinType::ANTI,
+                    duckdb::JoinType::MARK}) {
+    auto step = join_block_descent(type, probe_cols, build_cols, 1, policy);
+    REQUIRE(step.has_value());
+    CHECK(step->child_index == 0);
+    CHECK(step->child_ordinal == 1);
+  }
+  for (auto type : {duckdb::JoinType::INNER, duckdb::JoinType::RIGHT}) {
+    auto step = join_block_descent(type, probe_cols, build_cols, 2, policy);
+    REQUIRE(step.has_value());
+    CHECK(step->child_index == 1);
+    CHECK(step->child_ordinal == 4);
+  }
+  for (auto type : {duckdb::JoinType::RIGHT, duckdb::JoinType::OUTER}) {
+    CHECK_FALSE(join_block_descent(type, probe_cols, build_cols, 0, policy).has_value());
+  }
+  for (auto type : {duckdb::JoinType::LEFT, duckdb::JoinType::OUTER}) {
+    CHECK_FALSE(join_block_descent(type, probe_cols, build_cols, 2, policy).has_value());
+  }
+  CHECK_FALSE(join_block_descent(duckdb::JoinType::INNER,
+                                 probe_cols,
+                                 build_cols,
+                                 2,
+                                 {.descend_build_blocks = false, .preserve_nulls = true})
+                .has_value());
 }

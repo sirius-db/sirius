@@ -32,7 +32,7 @@ duckdb::unique_ptr<duckdb::BaseSecret> create_test_httpfs_s3_secret(
   auto secret =
     duckdb::make_uniq<duckdb::KeyValueSecret>(input.scope, input.type, input.provider, input.name);
   for (auto const& [key, value] : input.options) {
-    secret->secret_map[key] = value;
+    secret->secret_map[duckdb::Identifier(key)] = value;
   }
   secret->redact_keys.insert("secret");
   return duckdb::unique_ptr_cast<duckdb::KeyValueSecret, duckdb::BaseSecret>(std::move(secret));
@@ -42,7 +42,7 @@ void register_test_httpfs_s3_secret(duckdb::SecretManager& manager)
 {
   auto const secret_types = manager.AllSecretTypes();
   if (std::any_of(secret_types.begin(), secret_types.end(), [](duckdb::SecretType const& type) {
-        return duckdb::StringUtil::CIEquals(type.name, "s3");
+        return type.name == "s3";
       })) {
     return;
   }

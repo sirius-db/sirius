@@ -20,14 +20,6 @@
 // clang-format on
 
 #include <cudf/cudf_utils.hpp>
-#include <cudf/reduction.hpp>
-#include <cudf/scalar/scalar.hpp>
-#include <cudf/strings/find.hpp>
-#include <cudf/strings/regex/regex_program.hpp>
-#include <cudf/strings/replace_re.hpp>
-#include <cudf/strings/strings_column_view.hpp>
-
-#include <vector>
 
 namespace sirius {
 namespace regex {
@@ -35,24 +27,6 @@ namespace regex {
 std::unique_ptr<cudf::column> regex_playground::jit_transform_clickbench_q28_regex(
   const cudf::column_view& input, ::cuda::stream_ref stream, rmm::device_async_resource_ref mr)
 {
-  // libcudf's $ anchor matches before one final LF. Replacing that match retains the unmatched LF,
-  // which a string-view transform cannot synthesize after extracting a non-contiguous domain.
-  // Route the whole batch through the generic implementation when any row ends in LF.
-  auto final_newline_rows = cudf::strings::ends_with(
-    cudf::strings_column_view(input), cudf::string_scalar("\n", true, stream, mr), stream, mr);
-  auto any_final_newline = cudf::reduce(final_newline_rows->view(),
-                                        *cudf::make_any_aggregation<cudf::reduce_aggregation>(),
-                                        cudf::data_type{cudf::type_id::BOOL8},
-                                        stream,
-                                        mr);
-  auto const& any_final_newline_scalar =
-    static_cast<cudf::scalar_type_t<bool> const&>(*any_final_newline);
-  if (any_final_newline_scalar.is_valid(stream) && any_final_newline_scalar.value(stream)) {
-    auto regex_prog = cudf::strings::regex_program::create(R"(^https?://(?:www\.)?([^/]+)/.*$)");
-    return cudf::strings::replace_with_backrefs(
-      cudf::strings_column_view(input), *regex_prog, R"(\1)", stream, mr);
-  }
-
   auto udf = R"***(
 __device__ void extract_domain(cuda::std::optional<cudf::string_view>* out, cuda::std::optional<cudf::string_view> const url_opt) {
     // Skip null
@@ -99,8 +73,8 @@ __device__ void extract_domain(cuda::std::optional<cudf::string_view>* out, cuda
     }
     *out = next.substr(0, pos);
 
-    // For "/.*", an internal newline triggers a mismatch. A final newline is handled by the
-    // batch-level generic fallback above because libcudf's $ anchor preserves it.
+    // For "/.*$": RE2's . excludes newlines and its $ only matches at the end of the text,
+    // so any newline after the host, trailing or not, means the pattern does not match.
     next = next.substr(pos + 1, next.length() - pos - 1);
     if (next.find('\n') != cudf::string_view::npos) {
         *out = url;
@@ -111,7 +85,6 @@ __device__ void extract_domain(cuda::std::optional<cudf::string_view>* out, cuda
 )***";
 
   cudf::transform_input ti = input;
-#if CUDF_VERSION_NUM >= 2610
   cudf::transform_output const output{cudf::data_type{cudf::type_id::STRING},
                                       cudf::output_nullability::PRESERVE};
   auto result  = cudf::transform(udf,
@@ -126,18 +99,6 @@ __device__ void extract_domain(cuda::std::optional<cudf::string_view>* out, cuda
                                 mr);
   auto columns = result->release();
   return std::move(columns.front());
-#else
-  return cudf::transform_extended(std::span(&ti, 1),
-                                  udf,
-                                  cudf::data_type{cudf::type_id::STRING},
-                                  cudf::udf_source_type::CUDA,
-                                  std::nullopt,
-                                  cudf::null_aware::YES,
-                                  std::nullopt,
-                                  cudf::output_nullability::PRESERVE,
-                                  stream,
-                                  mr);
-#endif
 }
 
 }  // namespace regex

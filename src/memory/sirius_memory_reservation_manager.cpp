@@ -18,6 +18,8 @@
 #include "memory/sirius_memory_reservation_manager.hpp"
 
 #include "cucascade/memory/common.hpp"
+#include "log/logging.hpp"
+#include "memory/pool_peer_access.hpp"
 
 #include <cudf/utilities/memory_resource.hpp>
 
@@ -27,8 +29,31 @@
 
 #include <cucascade/memory/memory_reservation_manager.hpp>
 
+#include <mutex>
+#include <shared_mutex>
+#include <unordered_map>
+#include <variant>
+
 namespace sirius {
 namespace memory {
+
+namespace {
+
+using allocation_tracking_scope = sirius_memory_reservation_manager::allocation_tracking_scope;
+
+// Register live GPU-space addresses after construction and remove them before base-class teardown.
+struct gpu_tracking_scope_registry {
+  std::shared_mutex mutex;
+  std::unordered_map<cucascade::memory::memory_space const*, allocation_tracking_scope> scopes;
+};
+
+gpu_tracking_scope_registry& gpu_tracking_scopes()
+{
+  static gpu_tracking_scope_registry registry;
+  return registry;
+}
+
+}  // namespace
 
 sirius_memory_reservation_manager::sirius_memory_reservation_manager(
   const std::vector<cucascade::memory::memory_space_config>& configs)
@@ -38,7 +63,15 @@ sirius_memory_reservation_manager::sirius_memory_reservation_manager(
   if (gpu_spaces.empty()) {
     throw std::runtime_error("At least one GPU memory space must be configured");
   }
+  // Complete grants before installing resource references that constructor unwinding could
+  // invalidate.
+  for_each_pair_without_pool_access(gpu_spaces, [](int owner_device, int accessor_device) {
+    SIRIUS_LOG_INFO(
+      "Pool access unavailable: owner GPU {}, accessor GPU {}", owner_device, accessor_device);
+    return true;
+  });
   for (const auto* space : gpu_spaces) {
+    runtime_stream_pools_.push_back(runtime_stream_pool::install(*space));
     auto const device_mr = space->get_default_allocator();
     rmm::cuda_set_device_raii set_device{rmm::cuda_device_id{space->get_device_id()}};
     // Capture the old resource by value (not by ref) — see comment in header for why.
@@ -46,11 +79,36 @@ sirius_memory_reservation_manager::sirius_memory_reservation_manager(
     prev_device_mrs_.push_back(cudf::set_current_device_resource(
       ::cuda::mr::any_resource<::cuda::mr::device_accessible>{device_mr}));
   }
+
+  auto& registry = gpu_tracking_scopes();
+  std::unique_lock lock{registry.mutex};
+  try {
+    for (auto const& config : configs) {
+      auto const* gpu = std::get_if<cucascade::memory::gpu_memory_space_config>(&config);
+      if (gpu == nullptr) { continue; }
+      registry.scopes.insert_or_assign(
+        get_memory_space(cucascade::memory::Tier::GPU, gpu->device_id),
+        gpu->per_stream_reservation ? allocation_tracking_scope::PER_STREAM
+                                    : allocation_tracking_scope::PER_THREAD);
+    }
+  } catch (...) {
+    for (auto const* space : gpu_spaces) {
+      registry.scopes.erase(space);
+    }
+    throw;
+  }
 }
 
 sirius_memory_reservation_manager::~sirius_memory_reservation_manager()
 {
   auto gpu_spaces = this->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+  {
+    auto& registry = gpu_tracking_scopes();
+    std::unique_lock lock{registry.mutex};
+    for (auto const* space : gpu_spaces) {
+      registry.scopes.erase(space);
+    }
+  }
   // Restore the previous cuDF device resources saved in the constructor.
   // Calling reset_current_device_resource_ref() would leave cuDF with a null/invalid
   // resource that crashes subsequent allocations in other tests or code paths.
@@ -65,9 +123,30 @@ sirius_memory_reservation_manager::~sirius_memory_reservation_manager()
   // device. The cost is a single device sync per managed GPU at teardown.
   for (std::size_t i = 0; i < gpu_spaces.size() && i < prev_device_mrs_.size(); ++i) {
     rmm::cuda_set_device_raii set_device{rmm::cuda_device_id{gpu_spaces[i]->get_device_id()}};
-    cudaDeviceSynchronize();
+    auto const status = cudaDeviceSynchronize();
+    if (status != cudaSuccess) {
+      log::log_noexcept([&] {
+        SIRIUS_LOG_ERROR(
+          "GPU {} teardown synchronization failed: {} ({}); continuing best-effort cleanup",
+          gpu_spaces[i]->get_device_id(),
+          cudaGetErrorName(status),
+          cudaGetErrorString(status));
+      });
+    }
+    runtime_stream_pools_[i].reset();
     cudf::set_current_device_resource(std::move(prev_device_mrs_[i]));
   }
+}
+
+std::optional<allocation_tracking_scope>
+sirius_memory_reservation_manager::gpu_allocation_tracking_scope(
+  cucascade::memory::memory_space const& space)
+{
+  auto& registry = gpu_tracking_scopes();
+  std::shared_lock lock{registry.mutex};
+  auto const found = registry.scopes.find(&space);
+  if (found == registry.scopes.end()) { return std::nullopt; }
+  return found->second;
 }
 
 }  // namespace memory

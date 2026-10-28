@@ -17,6 +17,8 @@
 #include "io/scoped_object_store_configs.hpp"
 
 #include <algorithm>
+#include <cctype>
+#include <string>
 #include <utility>
 
 namespace sirius::io {
@@ -49,12 +51,23 @@ std::size_t hash_object_store_config(object_store_config const& config)
   return hash;
 }
 
+std::string canonicalize_scheme(std::string_view path)
+{
+  std::string canonical{path};
+  auto const delimiter = canonical.find("://");
+  if (delimiter == std::string::npos) { return canonical; }
+  for (std::size_t i = 0; i < delimiter; ++i) {
+    canonical[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(canonical[i])));
+  }
+  return canonical;
+}
+
 }  // namespace
 
 std::optional<std::uint64_t> scoped_object_store_configs::install(std::string_view path,
                                                                   object_store_config config)
 {
-  std::string scope{path};
+  std::string scope   = canonicalize_scheme(path);
   auto const wildcard = scope.find_first_of("*?[");
   if (wildcard != std::string::npos) {
     auto const slash = scope.rfind('/', wildcard);
@@ -110,7 +123,8 @@ std::optional<scoped_object_store_configs::snapshot> scoped_object_store_configs
   std::string_view path) const
 {
   std::lock_guard lk{_mtx};
-  auto candidate = path;
+  auto canonical = canonicalize_scheme(path);
+  auto candidate = std::string_view{canonical};
   while (!candidate.empty()) {
     auto it = _scope_ids.find(candidate);
     if (it != _scope_ids.end()) return _snapshots.at(it->second).value;

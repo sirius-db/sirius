@@ -39,12 +39,8 @@ class memory_reservation_manager;
 class topology_index;
 }  // namespace cucascade::memory
 
-namespace cucascade::exec {
-class scoped_dispatcher;
-}  // namespace cucascade::exec
-
 namespace sirius::exec {
-using cucascade::exec::scoped_dispatcher;
+class scoped_dispatcher;
 }  // namespace sirius::exec
 
 namespace cucascade::io {

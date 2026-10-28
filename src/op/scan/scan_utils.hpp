@@ -22,7 +22,7 @@
 
 // duckdb
 #include <duckdb/common/types.hpp>
-#include <duckdb/planner/table_filter.hpp>
+#include <duckdb/planner/table_filter_set.hpp>
 
 // standard library
 #include <cstdint>
@@ -93,8 +93,8 @@ struct resolved_filter_column {
  * reference when that column arrives already reduced to a boolean answer.
  */
 struct table_filter_conjunct {
-  std::size_t primary_index  = 0;
-  std::size_t batch_position = 0;
+  std::optional<std::size_t> primary_index;
+  std::optional<std::size_t> batch_position;
   duckdb::unique_ptr<duckdb::Expression> expr;
 };
 

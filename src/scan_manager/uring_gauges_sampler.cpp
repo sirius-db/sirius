@@ -73,7 +73,7 @@ std::optional<std::string> format_gauges_line(std::size_t index,
     previous != nullptr ? g.bytes_submitted - previous->bytes_submitted : std::uint64_t{0};
   bool const idle = g.max_inflight_ops == 0 && g.pending_ops == 0 &&
                     g.active_remaining_slices == 0 && g.queued_requests == 0 && started == 0 &&
-                    bytes == 0 && g.queue_delay[0].count == 0 && g.queue_delay[1].count == 0;
+                    bytes == 0 && g.queue_delay_high.count == 0 && g.queue_delay_low.count == 0;
   if (idle) { return std::nullopt; }
   return std::format(
     "[uring_gauges] reactor={} inflight={} max_inflight={} pending_ops={} "
@@ -90,8 +90,8 @@ std::optional<std::string> format_gauges_line(std::size_t index,
     started,
     previous != nullptr ? g.preemptions - previous->preemptions : std::uint64_t{0},
     seconds > 0 ? static_cast<double>(bytes) / static_cast<double>(1 << 20) / seconds : 0.0,
-    format_queue_delay(g.queue_delay[0], "h"),
-    format_queue_delay(g.queue_delay[1], "l"));
+    format_queue_delay(g.queue_delay_high, "h"),
+    format_queue_delay(g.queue_delay_low, "l"));
 }
 
 uring_gauges_sampler::uring_gauges_sampler(

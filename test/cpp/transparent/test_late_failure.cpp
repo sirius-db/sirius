@@ -16,9 +16,12 @@
 
 #include "catch.hpp"
 #include "pipeline/completion_handler.hpp"
+#include "scan_manager/preparation_coordinator.hpp"
 #include "sirius_context.hpp"
 #include "transparent/replay_admission.hpp"
+#include "utils/duckdb_table_identity.hpp"
 #include "utils/gpu_execution_fixture.hpp"
+#include "utils/isolated_checkpoint_test.hpp"
 #include "utils/log_test_utils.hpp"
 #include "utils/parquet_fixture_utils.hpp"
 #include "utils/transparent_execution_test_utils.hpp"
@@ -29,6 +32,7 @@
 #include <duckdb/main/prepared_statement_data.hpp>
 #include <duckdb/transaction/meta_transaction.hpp>
 
+#include <array>
 #include <barrier>
 #include <future>
 #include <thread>
@@ -36,29 +40,45 @@
 using namespace sirius::transparent;
 
 TEST_CASE("late failure keeps the terminal winner across racing reporters",
-          "[transparent][late_failure]")
+          "[transparent][late_failure][preparation_cleanup]")
 {
+  bool const cleanup_reporter = GENERATE(false, true);
+  CAPTURE(cleanup_reporter);
   for (int attempt = 0; attempt < 32; ++attempt) {
     sirius::pipeline::completion_handler completion;
     auto future = completion.get_awaitable();
     std::barrier start(3);
-    auto report = [&](late_failure_cause cause, const char* message) {
+    auto report = [&](late_failure_cause cause, const char* message, bool cleanup) {
       start.arrive_and_wait();
-      completion.report_error(std::make_exception_ptr(classified_execution_error(cause, message)));
+      auto error = std::make_exception_ptr(classified_execution_error(cause, message));
+      if (cleanup)
+        completion.report_preparation_cleanup_error(error);
+      else
+        completion.report_error(error);
     };
-    std::jthread first(report, late_failure_cause::physical_input, "physical");
-    std::jthread second(report, late_failure_cause::oom_exhausted, "oom");
+    std::jthread first(report, late_failure_cause::physical_input, "physical", false);
+    std::jthread second(report, late_failure_cause::oom_exhausted, "oom", cleanup_reporter);
     start.arrive_and_wait();
+    std::exception_ptr terminal_error;
     try {
       future.get();
       FAIL("expected terminal error");
     } catch (classified_execution_error const& error) {
-      auto failure = completion.failure();
+      terminal_error = std::current_exception();
+      auto failure   = completion.failure();
       CHECK(failure.cause == error.cause);
       CHECK(failure.detail == error.what());
     }
     first.join();
     second.join();
+    if (cleanup_reporter) {
+      try {
+        completion.throw_if_preparation_cleanup_failed();
+        FAIL("cleanup latch was lost");
+      } catch (classified_execution_error const&) {
+        CHECK(std::current_exception() == terminal_error);
+      }
+    }
     auto winner = completion.failure();
     completion.report_error("later reporter");
     CHECK(completion.failure().cause == winner.cause);
@@ -82,10 +102,10 @@ TEST_CASE("replay admission checks transactions cancellation and nonrollbackable
         late_failure_condition::not_read_only);
   CHECK(admit_cpu_replay(ctx, true, transaction ^ 1, false, false).refused_by ==
         late_failure_condition::transaction_invalid);
-  ctx.interrupted = true;
+  ctx.Interrupt();
   CHECK(admit_cpu_replay(ctx, true, transaction, false, false).refused_by ==
         late_failure_condition::cancelled);
-  ctx.interrupted = false;
+  ctx.ClearInterrupt();
   CHECK(admit_cpu_replay(ctx, true, transaction, true, false).refused_by ==
         late_failure_condition::non_rollbackable);
   ctx.transaction.ActiveTransaction().transaction_validity.Invalidate(
@@ -97,8 +117,8 @@ TEST_CASE("replay admission checks transactions cancellation and nonrollbackable
   REQUIRE_FALSE(con.Query("CREATE SEQUENCE late_seq")->HasError());
   auto bound = con.Prepare("SELECT nextval('late_seq')");
   REQUIRE_FALSE(bound->HasError());
-  REQUIRE(bound->data);
-  CHECK_FALSE(bound->data->properties.IsReadOnly());
+  auto properties = bound->GetStatementProperties();
+  CHECK_FALSE(properties.IsReadOnly());
 }
 
 TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
@@ -126,7 +146,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
           explicit_entry ? "CALL gpu_execution(" + sirius::test::sql_literal(sql) + ")" : sql);
         if (result->HasError()) INFO(result->GetError());
         REQUIRE_FALSE(result->HasError());
-        CHECK(result->GetValue(0, 0).ToString() == "8128");
+        CHECK(result->Collection().GetValue(0, 0).ToString() == "8128");
         CHECK(std::chrono::steady_clock::now() - started < std::chrono::seconds(1));
         auto after = sirius::test::get_transparent_execution_stats(*con);
         auto cause = static_cast<size_t>(oom ? late_failure_cause::oom_exhausted
@@ -192,7 +212,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   auto sql = "SELECT sum(x) FROM read_parquet(" + directory.file_literal("*.parquet") + ")";
   auto cpu = con->Query(sql);
   REQUIRE_FALSE(cpu->HasError());
-  auto expected = cpu->GetValue(0, 0).ToString();
+  auto expected = cpu->Collection().GetValue(0, 0).ToString();
   run_ok("SET gpu_execution=true");
   auto previous_batch = con->Query("SELECT current_setting('scan_task_batch_size')::UBIGINT");
   REQUIRE_FALSE(previous_batch->HasError());
@@ -206,7 +226,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
       } catch (...) { /* preserve the test failure */
       }
     }
-  } restore{*con, previous_batch->GetValue(0, 0).GetValue<uint64_t>()};
+  } restore{*con, previous_batch->Collection().GetValue(0, 0).GetValue<uint64_t>()};
   run_ok("SET scan_task_batch_size=1");
   run_ok("SET sirius_test_hold_footer_index=2");
   auto state = sirius::test::get_registered_sirius_context(*con);
@@ -234,7 +254,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
       REQUIRE(published);
       if (rows->HasError()) INFO(rows->GetError());
       CHECK(rows->HasError() == !fallback);
-      if (fallback) CHECK(rows->GetValue(0, 0).ToString() == expected);
+      if (fallback) CHECK(rows->Collection().GetValue(0, 0).ToString() == expected);
       auto after = state->get_transparent_execution_stats();
       auto cause = static_cast<size_t>(late_failure_cause::physical_input);
       CHECK(after.late_failures[cause] == before.late_failures[cause] + 1);
@@ -267,7 +287,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     if (result->HasError()) INFO(result->GetError());
     REQUIRE(result->HasError() == !fallback);
     if (fallback)
-      CHECK(result->GetValue(0, 0).ToString() == "9128");
+      CHECK(result->Collection().GetValue(0, 0).ToString() == "9128");
     else
       CHECK(result->GetError().find("checkpointed after pin_table") != std::string::npos);
     auto after = sirius::test::get_transparent_execution_stats(*con);
@@ -310,11 +330,11 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   auto before      = sirius::test::get_transparent_execution_stats(*con);
   auto transparent = con->Query(query);
   REQUIRE_FALSE(transparent->HasError());
-  CHECK(transparent->GetValue(0, 0).ToString() == "8128");
+  CHECK(transparent->Collection().GetValue(0, 0).ToString() == "8128");
   auto explicit_result = con->Query("CALL gpu_execution(" + sirius::test::sql_literal(query) + ")");
   if (explicit_result->HasError()) INFO(explicit_result->GetError());
   REQUIRE_FALSE(explicit_result->HasError());
-  CHECK(explicit_result->GetValue(0, 0).ToString() == "9128");
+  CHECK(explicit_result->Collection().GetValue(0, 0).ToString() == "9128");
   auto after = sirius::test::get_transparent_execution_stats(*con);
   CHECK(after.runtime_fallbacks == before.runtime_fallbacks + 2);
   CHECK(after.late_replays[static_cast<size_t>(late_failure_cause::oom_exhausted)] ==
@@ -375,9 +395,9 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   run_ok("COPY (SELECT i::INTEGER x FROM range(128) t(i)) TO " +
          directory.file_literal("data.parquet") + " (FORMAT PARQUET)");
   // DuckDB never binds this unused CTE. The bound policy sees only the local
-  // scan; R1's retained SQL-text veto still conservatively forbids replay.
+  // scan; the SQL-text S3 veto still conservatively forbids replay.
   auto sql =
-    "WITH unused AS (SELECT * FROM read_parquet('s3://r2a-unread/file.parquet')) "
+    "WITH unused AS (SELECT * FROM read_parquet('s3://unread-source/file.parquet')) "
     "SELECT sum(x) FROM read_parquet(" +
     directory.file_literal("data.parquet") + ")";
   run_ok("SET gpu_execution=true");
@@ -416,9 +436,126 @@ TEST_CASE("late failure classification uses exception types rather than message 
   auto credentials = std::make_exception_ptr(cucascade::io::credential_error("signing failed"));
   CHECK(classify_failure(credentials, late_failure_cause::gpu_error).cause ==
         late_failure_cause::reader_io);
+  auto descriptor =
+    std::make_exception_ptr(cucascade::io::descriptor_mismatch_error("descriptor mismatch"));
+  CHECK(classify_failure(descriptor, late_failure_cause::gpu_error).cause ==
+        late_failure_cause::reader_io);
   auto text_only = std::make_exception_ptr(
     std::runtime_error("OOM physical input checkpoint certificate reader failed"));
   CHECK(classify_failure(text_only).cause == late_failure_cause::other);
   CHECK(classify_failure(text_only, late_failure_cause::gpu_error).cause ==
         late_failure_cause::gpu_error);
+}
+
+namespace {
+struct empty_cleanup_coalescer final : sirius::op::scan::batch_coalescer {
+  size_t target_batch_bytes() const noexcept override { return 1; }
+  std::vector<std::unique_ptr<sirius::op::scan::scan_info>> push(
+    std::unique_ptr<sirius::op::scan::scan_info>) override
+  {
+    return {};
+  }
+  std::vector<std::unique_ptr<sirius::op::scan::scan_info>> flush() override { return {}; }
+};
+
+void retire_test_reader(sirius::pipeline::completion_handler& completion,
+                        sirius::scan_manager::preparation_coordinator::execution_domain domain,
+                        bool initial_error,
+                        bool close_error)
+{
+  using namespace sirius::scan_manager;
+  sirius::exec::static_thread_pool pool(1);
+  sirius::exec::scoped_dispatcher dispatcher(pool);
+  native_reader_executor native(1, 1);
+  preparation_coordinator coordinator(
+    completion, dispatcher, preparation_options{1, 1, 1, 1}, &native);
+  size_t closed = 0;
+  preparation_coordinator::source source;
+  source.execution   = domain;
+  source.coalescer   = std::make_shared<empty_cleanup_coalescer>();
+  source.destination = std::make_shared<split_connector>();
+  source.try_claim = [] { return preparation_coordinator::claim_result{preparation_exhausted{}}; };
+  source.construct = [](auto) { return preparation_coordinator::publication{}; };
+  source.close     = [&] {
+    ++closed;
+    if (close_error) throw std::runtime_error("reader close failed");
+  };
+  coordinator.add_source(std::move(source));
+  coordinator.arm();
+  if (initial_error)
+    completion.report_error(std::make_exception_ptr(
+      classified_execution_error(late_failure_cause::gpu_error, "original query failure")));
+  coordinator.request_stop(stop_reason::normal_eos);
+  coordinator.drain();
+  CHECK(closed == 1);
+  CHECK(coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
+}
+}  // namespace
+
+TEST_CASE("Reader cleanup outcome controls window replay and runtime reuse",
+          "[integration][transparent][preparation_cleanup]")
+{
+  // Each combination gets a fresh process because failed cleanup poisons the runtime.
+  auto const* child = std::getenv("SIRIUS_NATIVE_LEASE_UNAVAILABLE_VARIANT");
+  auto variant =
+    child && *child ? std::stoi(child) : GENERATE(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11);
+  if (sirius::test::run_isolated(std::to_string(variant))) return;
+  using domain = sirius::scan_manager::preparation_coordinator::execution_domain;
+  enum class outcome { clean_after_error, close_error_only, error_then_finish, error_then_unwind };
+  auto execution =
+    std::array{domain::metadata_worker, domain::query_owner, domain::native_reader}[variant / 4];
+  auto mode = static_cast<outcome>(variant % 4);
+  CAPTURE(execution, mode);
+  bool const close_error   = mode != outcome::clean_after_error;
+  bool const initial_error = mode != outcome::close_error_only;
+  sirius::test::duckdb_identity_fixture checkpoint_storage;
+  sirius::test::GpuExecutionFixture fixture;
+  auto& con     = fixture.con;
+  auto state    = sirius::test::get_registered_sirius_context(*con);
+  auto before   = state->get_transparent_execution_stats();
+  bool failed   = false;
+  auto query_id = sirius::make_query_id(0);
+  try {
+    duckdb::SiriusContext::StandaloneQueryScope window(*state, *con->context, "reader_cleanup");
+    query_id = window.query_id();
+    checkpoint_storage.con.BeginTransaction();
+    auto& table = duckdb::Catalog::GetEntry<duckdb::DuckTableEntry>(
+      *checkpoint_storage.con.context, "", "main", "identity_t");
+    state->get_scan_manager().acquire_checkpoint_key(query_id, table.GetStorage().GetAttached());
+    checkpoint_storage.con.Rollback();
+    REQUIRE(state->get_scan_manager().checkpoint_key_count(query_id) == 1);
+    auto completion = state->window_completion(window.query_id());
+    REQUIRE(completion);
+    auto future = completion->get_awaitable();
+    retire_test_reader(*completion, execution, initial_error, close_error);
+    if (initial_error) CHECK(completion->failure().detail == "original query failure");
+    CHECK_THROWS_WITH(future.get(),
+                      initial_error ? "original query failure" : "reader close failed");
+    if (mode == outcome::error_then_unwind)
+      throw classified_execution_error(late_failure_cause::gpu_error, "original query failure");
+    window.finish();
+  } catch (classified_execution_error const& error) {
+    failed = true;
+    CHECK(initial_error);
+    CHECK(error.cause == late_failure_cause::gpu_error);
+    CHECK(std::string(error.what()) == "original query failure");
+  } catch (std::runtime_error const& error) {
+    failed = true;
+    CHECK(mode == outcome::close_error_only);
+    CHECK(std::string(error.what()) == "reader close failed");
+  }
+  CHECK(failed == close_error);
+  CHECK(state->get_scan_manager().checkpoint_key_count(query_id) == (close_error ? 1 : 0));
+  CHECK(state->get_runtime_health() == (close_error
+                                          ? duckdb::SiriusContext::runtime_health::UNAVAILABLE
+                                          : duckdb::SiriusContext::runtime_health::OK));
+  CHECK(state->get_transparent_execution_stats().runtime_fallbacks == before.runtime_fallbacks);
+  if (close_error) {
+    CHECK_THROWS_AS(
+      duckdb::SiriusContext::StandaloneQueryScope(*state, *con->context, "after_cleanup"),
+      duckdb::SiriusRuntimeUnavailableException);
+  } else {
+    duckdb::SiriusContext::StandaloneQueryScope next(*state, *con->context, "after_read_error");
+    CHECK_NOTHROW(next.finish());
+  }
 }

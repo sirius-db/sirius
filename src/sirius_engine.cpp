@@ -16,11 +16,14 @@
 
 #include "sirius_engine.hpp"
 
+#include "cuda/device_health.hpp"
 #include "duckdb/execution/execution_context.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parallel/thread_context.hpp"
 #include "log/logging.hpp"
+#include "op/scan/gpu_ingestible.hpp"
+#include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_cte.hpp"
 #include "op/sirius_physical_delim_join.hpp"
@@ -38,6 +41,7 @@
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
 #include "sirius_interface.hpp"
+#include "telemetry-bridge/gen/quent.hpp"
 #include "telemetry/nvtx.hpp"
 
 #include <cucascade/data/data_repository_manager.hpp>
@@ -51,15 +55,26 @@ namespace sirius {
 
 namespace {
 
+// Walks the live plan rather than the query index: on a failed start the engine never receives
+// the index, while the plan still names every scan whose descriptors must be retired.
+void finish_scan_preparation(op::sirius_physical_operator const* plan) noexcept
+{
+  if (!plan) return;
+  planner::for_each_gpu_scan(*plan, [](op::sirius_physical_operator const& source) {
+    if (auto const* scan = dynamic_cast<op::scan::sirius_gpu_scan_operator const*>(&source))
+      scan->get_ingestible().finish_preparation();
+  });
+}
+
 /// Select the GPU subset this query is admitted with: gpus_per_query caps the fleet, and
 /// within that cap a non-zero admission_bytes_per_gpu narrows further by estimated scan
 /// bytes. With neither set, every active GPU is used.
 std::vector<int> compute_admission_gpu_ids(const op::sirius_physical_operator& plan,
                                            std::vector<int> gpu_ids,
-                                           const sirius_config& config)
+                                           const sirius_config& config,
+                                           const operator_params& op_params)
 {
-  auto const& op_params = config.get_operator_params();
-  auto const bpg        = op_params.admission_bytes_per_gpu;
+  auto const bpg = op_params.admission_bytes_per_gpu;
 
   gpu_ids           = planner::apply_gpu_cap(std::move(gpu_ids), config.gpus_per_query());
   auto const n_gpus = static_cast<int>(gpu_ids.size());
@@ -114,19 +129,55 @@ sirius_engine::sirius_engine(duckdb::ClientContext& context,
   : context(context),
     query_id_(query_id),
     telemetry_context_(get_telemetry_context_from_client_context(this->context)),
-    query_handle_(quent::query::create(
-      telemetry_context_->context(),
-      quent::query::Init{
-        .instance_name  = query_label.value_or("unnamed_query"),
-        .query_group_id = telemetry_context_->query_group_id_for(session_label),
-      }))
+    query_handle_(telemetry_context_->context()
+                    .query_observer()
+                    ->handle()
+                    .init({
+                      .instance_name  = query_label.value_or("unnamed_query"),
+                      .query_group_id = quent::query_group::QueryGroupId(
+                        telemetry_context_->query_group_id_for(session_label)),
+                    })
+                    .into_dynamic())
 {
 }
 
-sirius_engine::~sirius_engine() { query_handle_->exit(); }
+sirius_engine::~sirius_engine()
+{
+  // The engine is the execution owner of the physical plan. Retire asynchronous users here,
+  // including partially initialized executions, before member destruction can release operators.
+  cancel_dynamic_filter_publications();
+  if (auto runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+      runtime && runtime->is_initialized()) {
+    try {
+      runtime->retire_query_work(query_id_,
+                                 duckdb::SiriusContext::query_retirement_mode::cancelled);
+      finish_scan_preparation(sirius_physical_plan.get());
+    } catch (...) {
+      // The registry retains the plan if retirement fails. Do not free resources whose
+      // borrowers cannot be proved idle; the shutdown path retires them after worker joins.
+      runtime->mark_runtime_unavailable();
+    }
+  }
+  try {
+    query_handle_.finished();
+  } catch (std::exception const& e) {
+    SIRIUS_LOG_ERROR("query telemetry finish failed: {}", e.what());
+  }
+}
+
+void sirius_engine::quiesce_plan_users()
+{
+  if (plan_users_quiescent_) return;
+  if (auto ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")) {
+    ctx->retire_query_work(query_id_, duckdb::SiriusContext::query_retirement_mode::cancelled);
+  }
+  finish_scan_preparation(sirius_physical_plan.get());
+  plan_users_quiescent_ = true;
+}
 
 void sirius_engine::reset()
 {
+  quiesce_plan_users();
   // Before the plan: the query indexes it, so it must not outlive a plan swap.
   query_.reset();
   sirius_physical_plan = nullptr;
@@ -181,16 +232,18 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_engine::get_result()
 void sirius_engine::initialize(duckdb::unique_ptr<op::sirius_physical_operator> plan)
 {
   SIRIUS_LOG_DEBUG("Initializing sirius_engine");
-  query_handle_->planning();
   reset();
-  sirius_owned_plan = std::move(plan);
+  sirius_owned_plan = std::shared_ptr<op::sirius_physical_operator>(plan.release());
+  if (auto runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")) {
+    runtime->get_query_lifecycle_registry().retain_resources(query_id_, sirius_owned_plan);
+  }
   initialize_internal(*sirius_owned_plan);
 }
 
 void sirius_engine::execute()
 {
   nvtx_scoped_range nvtx_range{"sirius::query"};
-  query_handle_->executing();
+  query_handle_.executing();
 
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (sirius_ctx == nullptr) {
@@ -200,7 +253,7 @@ void sirius_engine::execute()
   // Quent mints its own UUID for the query and its Init struct takes no caller-supplied id, so
   // telemetry stays UUID-native while the engine uses the numeric window id. Emit the mapping
   // once so log lines (keyed by query id) and telemetry (keyed by UUID) can be joined.
-  auto const telemetry_uuid = query_handle_->uuid();
+  auto const telemetry_uuid = query_handle_.id().raw();
   SIRIUS_LOG_INFO("query {} telemetry_query={:016x}{:016x}",
                   query_id_,
                   telemetry_uuid.high_bits,
@@ -212,8 +265,11 @@ void sirius_engine::execute()
   if (!completion_handler_) {
     throw std::logic_error("execution requires a live window completion handler");
   }
-  auto future = completion_handler_->get_awaitable();
+  auto* registry                       = &sirius_ctx->get_query_lifecycle_registry();
+  completion_handler_->execution_owner = std::this_thread::get_id();
+  auto future                          = completion_handler_->get_awaitable();
 
+  plan_users_quiescent_ = false;
   // Create the query with the pipelines. It is owned here, alongside the plan it indexes.
   try {
     query_ = sirius_ctx->create_query(std::move(new_scheduled),
@@ -221,30 +277,42 @@ void sirius_engine::execute()
                                       completion_handler_,
                                       telemetry::query_telemetry_info{
                                         .telemetry_query_id = telemetry_uuid,
-                                        .worker_id          = telemetry_context_->worker_id(),
+                                        .worker_id          = telemetry_context_->worker_id().raw(),
                                         .query_id           = query_id_,
-                                      });
+                                      },
+                                      [&client = context] { return client.IsInterrupted(); });
     sirius_ctx->get_task_scheduler().start_query(*query_);
+    sirius_ctx->get_scan_manager().start_preparation(query_id_);
   } catch (...) {
     // Prepare/start failures and asynchronous failures compete for the same terminal winner.
     completion_handler_->report_error(std::current_exception());
   }
   try {
-    future.get();
-    sirius_ctx->get_task_scheduler().wait_for_completion(query_id_);
+    sirius_ctx->get_scan_manager().await_query_completion(
+      query_id_, future, [&client = context, sirius_ctx] {
+        if (client.IsInterrupted()) return true;
+        if (sirius_ctx->get_runtime_health() == duckdb::SiriusContext::runtime_health::UNAVAILABLE)
+          sirius_ctx->throw_runtime_unavailable();
+        return false;
+      });
+    if (sirius_ctx->get_runtime_health() == duckdb::SiriusContext::runtime_health::UNAVAILABLE)
+      sirius_ctx->throw_runtime_unavailable();
+    sirius_ctx->retire_query_work(query_id_,
+                                  duckdb::SiriusContext::query_retirement_mode::completed);
+    finish_scan_preparation(sirius_physical_plan.get());
+    plan_users_quiescent_ = true;
   } catch (const std::exception& e) {
+    registry->report_failure(std::current_exception(), query_id_);
     SIRIUS_LOG_ERROR("Error executing query: {}", e.what());
     cancel_dynamic_filter_publications();
-    // Drain all in-flight GPU tasks before returning.  QueryEnd() will call
-    // clear_all_repositories() immediately after execute() throws; without
-    // this drain, tasks still running in the thread pool hold raw pointers to
-    // those repositories and cause a use-after-free / heap corruption.
-    sirius_ctx->get_task_scheduler().drain_after_error(query_id_);
+    // Retire asynchronous borrowers before the execution window can release repositories.
+    quiesce_plan_users();
     throw;
   } catch (...) {
+    registry->report_failure(std::current_exception(), query_id_);
     SIRIUS_LOG_ERROR("Unknown error executing query");
     cancel_dynamic_filter_publications();
-    sirius_ctx->get_task_scheduler().drain_after_error(query_id_);
+    quiesce_plan_users();
     throw;
   }
 
@@ -273,6 +341,8 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
       "and review extension loading logs for errors.");
   }
 
+  query_handle_.planning();
+
   sirius_physical_plan = &plan;
 
   std::vector<int> gpu_ids;
@@ -286,9 +356,10 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
   // Admit the query here, before anything downstream is built, so that the build context,
   // partition->GPU routing and the scan round-robin all derive from this one list. Order
   // matters: task_creator holds it, and create_query later reads it back for scan_manager.
-  auto const full_gpu_count = gpu_ids.size();
-  std::vector<int> active_gpu_ids =
-    compute_admission_gpu_ids(plan, std::move(gpu_ids), sirius_ctx_ptr->get_config());
+  auto query_operator_params      = duckdb::query_operator_options(context);
+  auto const full_gpu_count       = gpu_ids.size();
+  std::vector<int> active_gpu_ids = compute_admission_gpu_ids(
+    plan, std::move(gpu_ids), sirius_ctx_ptr->get_config(), *query_operator_params);
   sirius_ctx_ptr->get_task_creator().set_active_gpu_ids(query_id_, active_gpu_ids, full_gpu_count);
   try {
     std::string gpu_list;
@@ -299,10 +370,6 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
     SIRIUS_LOG_INFO("[gpu_alloc] query allocated {} GPU(s): [{}]", active_gpu_ids.size(), gpu_list);
   } catch (...) {  // best-effort observability
   }
-
-  auto query_operator_params =
-    std::make_shared<sirius::operator_params>(sirius_ctx_ptr->get_config().get_operator_params());
-  query_operator_params->like_swar_fastpath = duckdb::like_swar_fastpath_enabled(context);
 
   // Create the plan-time context with one immutable snapshot of query policy.
   const pipeline::pipeline_build_context build_ctx{

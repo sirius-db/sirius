@@ -1,5 +1,12 @@
 # Dependencies
 find_package(cudf REQUIRED CONFIG)
+if(NOT VCPKG_BUILD)
+  # TODO: Remove with ast_compat.hpp and the cudf port patch after cudf#24173
+  # ships. Cover transitive AST includes regardless of source header order.
+  target_compile_options(
+    cudf::cudf
+    INTERFACE "$<$<COMPILE_LANGUAGE:CXX,CUDA>:SHELL:-include variant>")
+endif()
 find_package(raft REQUIRED CONFIG) # raft must be found before cuvs
 find_package(cuvs REQUIRED CONFIG)
 find_package(spdlog REQUIRED CONFIG)
@@ -135,8 +142,8 @@ add_subdirectory(cucascade "${CMAKE_BINARY_DIR}/cucascade" EXCLUDE_FROM_ALL)
 endblock()
 # cuCascade has no C++ modules; scanning breaks older compiler caches.
 # cucascade_io_objects exists only when CUCASCADE_BUILD_IO is ON.
-foreach(target cucascade_objects cucascade_cudf_objects cucascade_topology_discovery_objects
-               cucascade_io_objects)
+foreach(target cucascade_objects cucascade_cudf_objects
+               cucascade_topology_discovery_objects cucascade_io_objects)
   if(TARGET ${target})
     set_target_properties(${target} PROPERTIES CXX_SCAN_FOR_MODULES OFF)
   endif()

@@ -88,6 +88,10 @@ columns on inside one pipeline and a wide column rides past it for free.
 **The walk fails closed.** Any operator shape it does not model reads everything, which can only
 end a ride early.
 
+`sirius_physical_dynamic_filter` needs the values of columns registered in its consumer channel, even when no filter has been published yet. Registration is complete before lifetime analysis. `trace_through` matches `planned_target_columns()` against each column's current endpoint input position, after any projection, filter or join remapping.
+
+Registered targets end their deferred ride at that endpoint; an unscoped producer ends every column's ride there. A profitable deferral may still restore values immediately before the endpoint executes. Untargeted payload can continue through a scoped endpoint, and an endpoint with no consumer or no registered producers is transparent.
+
 Two things then decide whether the ride is taken:
 
 - **It has to repay.** Value per row and crossings saved TRADE OFF — a thin ride over many
@@ -99,6 +103,8 @@ Two things then decide whether the ride is taken:
   more than an order of magnitude.
 
 One bundle installs per scan (one rowid rides), and arbitration is widest-wins.
+
+A consumer carries one ride as well. When two scans' bundles land at the same consumer, the scan that installs first owns it and the other can only join as a rider (below). The scan manager therefore visits scans in order of what their own bundle would save, net bytes per row times port crossings, largest first, instead of the order the plan lists them. A scan that finds its consumer already taken is offered to the rider pass rather than refused. DuckDB v2 lists q10's `nation` scan before `customer`, because it joins nation to customer first; without the ordering, nation's one-column ride claimed the consumer and customer's five wide columns were materialized early.
 
 ## Riding through a group-by, and riders
 
@@ -152,6 +158,12 @@ row positions, taken from the same mask the scan filters with. It is refused whe
 are decided somewhere this path cannot see them — a compressed pin filters inside the fused
 decode (see [Compressed Pinning](compressed-pinning.md)).
 
+Dynamic membership filters cannot meet a deferral during decode today: the decode attaches them only to compressed pins, and install refuses every compressed origin (see Known limits). A guard keeps it that way should compressed origins become deferrable: `sirius_gpu_scan_operator::decode_consumer` is null once a deferral is installed, and `prepare_for_query` installs every deferral, riders included, before it builds any provider, so the scan's dynamic-filter endpoint would apply those filters after substitution instead. Should a deferring scan's decode remove rows anyway, `execute` fails with a named internal error, before any filtering or projection, rather than addressing rows the batch no longer holds.
+
+With the internal resident Parquet checkpoint enabled, the scan can apply membership masks before substitution. It checks the original materialized row count against the chunk origin before any mask, then selects original positions with the same conjunction used for the payload. Substitution forms each rowid from the origin offset plus that selected position, including when all deferred output columns were elided. The scan keeps the ordinary owned output representation. The placement flag is true by default.
+
+Port restoration changes values, not rows, so it keeps the payload it restores: its dynamic type, original batch IDs, preferred device, partition index and scan receipt (see [Dynamic Filters](dynamic-filters.md#scan-receipts-and-decode-history)).
+
 A column every reader only COUNTs needs no far end at all: `install_count_deferral` is the one
 deferral with a single half, admitted only over pinned columns with no nulls. Off by default.
 
@@ -168,9 +180,8 @@ deferral with a single half, admitted only over pinned columns with no nulls. Of
   `materialize_compressed`'s decode routes in `materialize.cpp` do write values only, with no
   output validity buffer — but that is a secondary reason and moot in practice, since a compressed
   origin never reaches them today.
-- A compressed origin cannot skip its decode — the scan substitutes on the FINISHED output, so a
-  deferred column from a compressed pin is decompressed and then discarded.
-- Filtered scans of compressed pins are refused (above).
+- Admitting compressed origins would not make them pay on their own: the scan substitutes on the FINISHED output, so a deferred column from a compressed pin would be decompressed and then discarded. A deferring scan's decode would also give up dynamic membership compaction (`decode_consumer` withholds the probes).
+- Filtered scans of compressed pins are refused (above). Lifting that refusal, and the lost membership compaction above, both need a decode that reports its survivor positions (or a cached-view checkpoint that gathers a row-index sequence with its residual mask); that one capability would lift both limits together.
 - Deferred-value widths are ESTIMATED for variable-width columns, not measured, and the error runs
   both ways: underestimating a wide column can refuse a bundle that would have qualified, but
   overestimating a short one can just as easily admit a bundle that does not actually repay (a
@@ -192,19 +203,50 @@ deferral with a single half, admitted only over pinned columns with no nulls. Of
   remove the old entry from the registry immediately, but do not revoke queries that already
   acquired it: each handle identifies that exact entry weakly, and resolution promotes it to an
   owning lease for the whole deferred gather. The old entry expires after its last serving query
-  releases it, while a new query sees only the replacement (or no pin). A true in-place column
-  merge still bumps the generation (`pin_entry_handle`, `column_origin.hpp`) because positional
-  metadata captured before that mutation may be stale. A consumer resolving an expired or
+  releases it, while a new query sees only the replacement (or no pin). Column merges also build
+  a replacement entry privately and publish it with a fresh handle and generation
+  (`pin_entry_handle`, `column_origin.hpp`); they do not mutate the previous entry's metadata or
+  invalidate its handle. A failure before publication leaves the previous entry intact. SQL pin
+  operations require exclusive maintenance, and the direct column-merge API rejects a merge
+  while readers retain the existing entry. A consumer resolving an expired or
   generation-mismatched origin gets `nullopt`, never a dangling pointer and never an entry later
   installed under the same name. Fail-closed here means the PORT THROWS, not that the query quietly
   re-reads: by that point the scan has emitted rowids in place of values, so no local fallback is
   possible.
-- **Multi-GPU pins are refused.** `resolve_pinned_column`/`materialize()` pass a pin's raw column
-  views and compressed-table pointers straight to a gather on the consumer's current GPU, with no
-  per-device tag and no P2P check, clone, or host-staging fallback — a chunk pinned on a different
-  GPU than the consumer could otherwise be dereferenced directly. Installation refuses outright
-  whenever more than one GPU memory space is active, matching the memory prefetcher's own
-  single-GPU prototype scope.
+- **A compressed chunk on a multi-GPU pin is refused.** Its decode runs on the GPU that holds
+  it, against a selection that lives on the consumer's; the installer declines such a pin
+  rather than stage the selection across, and the query runs as an ordinary scan. (Compressed
+  origins are refused on nullability grounds today anyway, above.) A pin whose chunks have no
+  recorded placement is refused the same way, since a consumer on another GPU could not reach
+  them. `materialize_remote_batch` still refuses such a batch if one reaches it, as an internal
+  error: by then the scan has emitted rowids, so there is nothing to fall back to.
+
+## More than one GPU
+
+A pin is spread round-robin over every GPU memory space, one coalesced batch per chunk, and the
+port may run on any GPU the scheduler hands its task to. So on a multi-GPU host most pins have
+chunks a consumer cannot dereference: pool memory on another device.
+
+Each `batch_source` therefore carries the `memory_space` its chunk lives in (the resolver reads
+it off `device_pin_chunk::memory_space` or `pinned_entry::chunk_memory_spaces`), and
+`materialize()` treats a batch on another GPU differently (`materialize_remote_batch`):
+
+1. The batch-local gather indices are peer-copied to the owning GPU, on a stream of that GPU's
+   memory space, ordered behind the consumer's selection build by an event.
+2. The gather runs THERE, with the owner's allocator, so only the surviving rows are produced.
+3. The gathered column is rebuilt on the consumer's GPU buffer by buffer (data, validity,
+   children, recursively — any dtype crosses), ordered behind the owner's gather by an event.
+4. The owner's temporaries are freed on the owner's stream only after an event records that the
+   consumer's copies have been enqueued.
+
+Both transfers use Sirius's shared byte-copy utility (`memory::enqueue_device_copy`). Each direction requests access to its actual source pool: the consumer's pool for indices and the owner's pool for gathered buffers. A successful grant selects `cudaMemcpyPeerAsync`; unavailable access selects explicit GPU -> pinned HOST -> GPU copies using managed HOST blocks for the entire transfer. Each leg is submitted as a batch where supported, with one completion wait per leg. The direct path stays asynchronous, while staging completes before returning. Existing selection-ready and gather-ready events order the stream that actually reads each source. Exceptions drain both participating streams while the borrowed selection and pinned source still exist; normal completion reports ordering failures instead of discarding them.
+
+What crosses is the size of the selection, not the chunk. A remote batch forces the canonical path (per-batch selections), because the one-pass raw gather dereferences every batch from the consumer's GPU. HOST staging space is borrowed from the task's configured memory resources; it is required only when a remote transfer needs staging.
+
+The `[multi_gpu]`-tagged cases in `test_materialize.cpp` and `test_late_mat_deferred_query.cpp`
+exercise this with a batch pinned on GPU 1 and a consumer on GPU 0, and the latter also pins the
+table compressed across both GPUs to show the installer declines and the query still comes back
+right; `run_unit_tests.py`'s `late_mat` step runs them with every GPU visible.
 
 ## Results
 

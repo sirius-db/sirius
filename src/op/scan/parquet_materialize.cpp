@@ -256,7 +256,12 @@ std::unique_ptr<cudf::table> materialize_general(std::span<parquet_source const>
   }
 
   auto opts = options;
-  opts.set_row_groups(std::move(rg_per_src));
+  if (std::all_of(
+        rg_per_src.begin(), rg_per_src.end(), [](auto const& groups) { return groups.empty(); })) {
+    opts.set_num_rows(0);
+  } else {
+    opts.set_row_groups(std::move(rg_per_src));
+  }
 
   auto [table, _] =
     cudf::io::read_parquet(std::move(cudf_sources), std::move(metadatas), opts, stream, mr);

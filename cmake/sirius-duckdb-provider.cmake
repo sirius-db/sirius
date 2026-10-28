@@ -12,13 +12,19 @@ endif()
 
 function(sirius_add_duckdb_source)
   # Keep DuckDB options scoped to its dependency build.
-  if(NOT DEFINED OVERRIDE_GIT_DESCRIBE)
-    set(OVERRIDE_GIT_DESCRIBE "v1.5.6")
-  endif()
   set(DUCKDB_EXTENSION_CONFIGS "")
   set(BUILD_EXTENSIONS "core_functions;parquet")
   set(BUILD_SHELL OFF)
   set(BUILD_UNITTESTS OFF)
+  if(NOT DEFINED DUCKDB_EXPLICIT_VERSION)
+    execute_process(
+      COMMAND git -C "${SIRIUS_DUCKDB_SOURCE_DIR}" rev-parse HEAD
+      OUTPUT_VARIABLE sirius_duckdb_commit
+      OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    if(sirius_duckdb_commit STREQUAL "d54cbbe3df17e8e5ce68312f483b4155836112aa")
+      set(DUCKDB_EXPLICIT_VERSION "v2.0.0")
+    endif()
+  endif()
   # Root sanitizer presets supply flags to both the library and its dependency.
   set(ENABLE_SANITIZER OFF)
   set(ENABLE_UBSAN OFF)
@@ -34,6 +40,7 @@ target_include_directories(
   sirius_duckdb_dependency
   INTERFACE "${SIRIUS_DUCKDB_SOURCE_DIR}/src/include"
             "${SIRIUS_DUCKDB_SOURCE_DIR}/third_party/fmt/include"
+            "${SIRIUS_DUCKDB_SOURCE_DIR}/third_party/re2"
             "${SIRIUS_DUCKDB_SOURCE_DIR}/third_party/concurrentqueue"
             "${SIRIUS_DUCKDB_SOURCE_DIR}/third_party/fastpforlib"
             "${SIRIUS_DUCKDB_SOURCE_DIR}/third_party/yyjson/include"
@@ -70,3 +77,9 @@ add_library(duckdb::moodycamel ALIAS sirius_duckdb_moodycamel)
 target_include_directories(
   sirius_duckdb_moodycamel
   INTERFACE "${SIRIUS_DUCKDB_SOURCE_DIR}/third_party/concurrentqueue")
+
+function(sirius_link_duckdb_extensions target)
+  set(DUCKDB_MODULE_BASE_DIR "${SIRIUS_DUCKDB_SOURCE_DIR}")
+  duckdb_link_extensions(${target} ${ARGN} httplib loadable_extensions
+                         core_functions parquet)
+endfunction()

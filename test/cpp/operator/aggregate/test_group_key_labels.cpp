@@ -385,5 +385,5 @@ TEST_CASE("group key labels use the supplied stream and memory resource",
 
   auto contents = actual.labels->release();
   REQUIRE(contents.data != nullptr);
-  REQUIRE(contents.data->memory_resource() == mr);
+  REQUIRE((contents.data->memory_resource() == mr));
 }

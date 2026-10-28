@@ -144,8 +144,10 @@ TEST_CASE("reset_caches replaces a populated cache with an empty one",
   auto memory   = initialize_memory_manager(1);
   auto topology = single_gpu_index_for_reset();
 
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+
   sirius_scan_manager manager{
-    config_with_cache(cucascade::io::cache::cache_mode::cucs), *memory, topology};
+    scan_lifecycle, config_with_cache(cucascade::io::cache::cache_mode::cucs), *memory, topology};
   auto* before = manager.io_ctx()->cache();
   REQUIRE(before != nullptr);
   bool const was_armed = before->is_armed();
@@ -177,8 +179,10 @@ TEST_CASE("a rebuilt cache is usable again", "[scan_manager][cache][reset_cache]
   auto memory   = initialize_memory_manager(1);
   auto topology = single_gpu_index_for_reset();
 
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+
   sirius_scan_manager manager{
-    config_with_cache(cucascade::io::cache::cache_mode::cucs), *memory, topology};
+    scan_lifecycle, config_with_cache(cucascade::io::cache::cache_mode::cucs), *memory, topology};
   REQUIRE(claim_some_cache(manager, file) > 0);
   manager.reset_caches();
 
@@ -193,8 +197,10 @@ TEST_CASE("reset_caches is idempotent", "[scan_manager][cache][reset_cache]")
   auto memory   = initialize_memory_manager(1);
   auto topology = single_gpu_index_for_reset();
 
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+
   sirius_scan_manager manager{
-    config_with_cache(cucascade::io::cache::cache_mode::cucs), *memory, topology};
+    scan_lifecycle, config_with_cache(cucascade::io::cache::cache_mode::cucs), *memory, topology};
   REQUIRE(manager.io_ctx()->cache() != nullptr);
 
   manager.reset_caches();
@@ -210,11 +216,12 @@ TEST_CASE("reset_caches reclaims still-resident chunk buffers, not just evicted 
 {
   // claim_some_cache() only attaches buffers (fadvise + prepare_prefetch); unlike
   // the "replaces a populated cache" test above, nothing here evicts them before
-  // reset_caches() runs. Invariant: destroying the cache (fs_cache) must return
-  // every chunk buffer still resident in it to the underlying
-  // fixed_size_host_memory_resource; a buffer it drops instead is gone from the
-  // free list for the rest of the process's life, even though the cache that
-  // held it no longer exists.
+  // reset_caches() runs. This is the exact shape that used to leak: the old
+  // fs_cache destructor tore down _file_cache and _pool without ever
+  // returning a still-resident chunk's buffer to the underlying
+  // fixed_size_host_memory_resource, so the block was gone from its free list
+  // for the rest of the process's life even though the cache object reporting
+  // it was destroyed.
   temp_data_file file(8ull << 20);  // 8 MiB
   auto memory   = initialize_memory_manager(1);
   auto topology = single_gpu_index_for_reset();
@@ -224,8 +231,10 @@ TEST_CASE("reset_caches reclaims still-resident chunk buffers, not just evicted 
   auto* host_mr = host_space->get_memory_resource_of<cucascade::memory::Tier::HOST>();
   REQUIRE(host_mr != nullptr);
 
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+
   sirius_scan_manager manager{
-    config_with_cache(cucascade::io::cache::cache_mode::cucs), *memory, topology};
+    scan_lifecycle, config_with_cache(cucascade::io::cache::cache_mode::cucs), *memory, topology};
   REQUIRE(manager.io_ctx()->cache() != nullptr);
 
   // Baseline AFTER construction: the scan manager's own io/uring buffers are
@@ -252,8 +261,10 @@ TEST_CASE("reset_caches is a no-op where the configuration does not cache",
   auto memory   = initialize_memory_manager(1);
   auto topology = single_gpu_index_for_reset();
 
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+
   sirius_scan_manager manager{
-    config_with_cache(cucascade::io::cache::cache_mode::none), *memory, topology};
+    scan_lifecycle, config_with_cache(cucascade::io::cache::cache_mode::none), *memory, topology};
   // Caching off, so no cache was ever built...
   REQUIRE(manager.io_ctx()->cache() == nullptr);
 

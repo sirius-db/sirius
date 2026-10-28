@@ -32,6 +32,7 @@
 #include <duckdb.hpp>
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
+#include <duckdb/main/attached_database.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/storage/data_table.hpp>
 #include <duckdb/storage/storage_manager.hpp>
@@ -104,7 +105,8 @@ duckdb::DataTable& resolve_storage(duckdb::Connection& con, const std::string& t
   auto& catalog = duckdb::Catalog::GetCatalog(ctx, "");
   duckdb::CatalogTransaction txn(catalog, ctx);
   auto& schema = catalog.GetSchema(txn, "main");
-  auto entry   = schema.GetEntry(txn, duckdb::CatalogType::TABLE_ENTRY, table_name);
+  auto entry =
+    schema.GetEntry(txn, duckdb::CatalogType::TABLE_ENTRY, duckdb::Identifier(table_name));
   REQUIRE(entry);
   return entry->Cast<duckdb::DuckTableEntry>().GetStorage();
 }
@@ -139,13 +141,14 @@ insert_delta_job_request make_request(duckdb::Connection& con,
                                       std::vector<sirius::logical_type> types)
 {
   insert_delta_job_request request;
-  request.storage         = &storage;
-  request.context         = con.context.get();
-  request.n_cache         = n_cache;
-  request.union_cols      = std::move(cols);
-  request.union_types     = std::move(types);
-  request.entry_name      = "t";
-  request.storage_version = storage.GetAttached().GetStorageManager().GetStorageVersion();
+  request.storage     = &storage;
+  request.context     = con.context.get();
+  request.n_cache     = n_cache;
+  request.union_cols  = std::move(cols);
+  request.union_types = std::move(types);
+  request.entry_name  = "t";
+  request.storage_version =
+    static_cast<uint64_t>(storage.GetAttached().GetStorageManager().GetStorageVersion());
   return request;
 }
 
@@ -610,7 +613,7 @@ TEST_CASE("insert-delta physical evidence is the union inside a mixed row group"
                             stream.value()) == cudaSuccess);
     stream.synchronize();
     for (std::size_t row = 0; row < values.size(); ++row)
-      CHECK(values[row] == cpu->GetValue(c, row).GetValue<int32_t>());
+      CHECK(values[row] == cpu->Collection().GetValue(c, row).GetValue<int32_t>());
   }
   exec_ok(*tdb.con, "ROLLBACK");
 }
@@ -631,7 +634,7 @@ TEST_CASE("insert-delta physical refusal preserves the first contract through fa
   auto codecs =
     tdb.con->Query("SELECT count(*) FROM pragma_storage_info('t') WHERE compression='ZSTD'");
   REQUIRE_FALSE(codecs->HasError());
-  REQUIRE(codecs->GetValue(0, 0).GetValue<int64_t>() > 0);
+  REQUIRE(codecs->Collection().GetValue(0, 0).GetValue<int64_t>() > 0);
   exec_ok(*tdb.con, "BEGIN TRANSACTION");
   auto& storage = resolve_storage(*tdb.con, "t");
   std::vector<insert_delta_job_request> requests;

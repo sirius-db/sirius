@@ -33,6 +33,13 @@ See [test/README.md](test/README.md) for its options.
 Test logs are written to `build/release/test/cpp/log/`, one subdirectory per
 test process.
 
+### On-demand SQL fuzzing
+
+The [Sirius fuzzer guide](test/fuzz/README.md) covers GPU setup, bounded SQL campaigns,
+replayable findings and rechecking them after a fix. Run it directly or use the
+[sirius-fuzz agent skill](.agents/skills/sirius-fuzz/SKILL.md) with an available development GPU.
+Harness unit tests use `pixi run fuzz-test` and do not require a GPU.
+
 ## Code style
 
 Sirius uses pre-commit hooks for formatting and linting. Install them once after cloning:

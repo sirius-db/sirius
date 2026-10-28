@@ -87,7 +87,7 @@ std::string cpu_count(fs::path const& path)
               ") WHERE " + std::string(kWhere) + ";");
   REQUIRE(r);
   REQUIRE_FALSE(r->HasError());
-  return r->GetValue(0, 0).ToString();
+  return r->Collection().GetValue(0, 0).ToString();
 }
 
 void write_config(fs::path const& yaml_path)
@@ -178,7 +178,8 @@ TEST_CASE("pin_table - cached scan serves columns in materialized order (column-
         REQUIRE(res);
         if (res->HasError()) { UNSCOPED_INFO("query error: " << res->GetError()); }
         REQUIRE_FALSE(res->HasError());  // before the fix: cuDF non-matching-operand crash
-        REQUIRE(res->GetValue(0, 0).ToString() == expected);  // and the count must be correct
+        REQUIRE(res->Collection().GetValue(0, 0).ToString() ==
+                expected);  // and the count must be correct
 
         auto unpin = con.Query("CALL unpin_table('colorder');");
         REQUIRE(unpin);

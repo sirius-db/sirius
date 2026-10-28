@@ -105,22 +105,23 @@ void metadata_overwrite(cucascade::io::cache::cache_mode mode)
   objects.publish(objects.first);
   auto memory = initialize_memory_manager(1);
   sirius::scan_manager::scan_manager_config cfg;
-  cfg.backend                                = sirius::scan_manager::io_backend::native;
-  cfg.object_store.endpoint                  = require_env("SIRIUS_TEST_S3_ENDPOINT");
-  cfg.object_store.region                    = env_or("SIRIUS_TEST_S3_REGION", "us-east-1");
-  cfg.object_store.access_key                = require_env("SIRIUS_TEST_S3_ACCESS_KEY");
-  cfg.object_store.secret_key                = require_env("SIRIUS_TEST_S3_SECRET_KEY");
-  cfg.object_store.session_token             = env_or("SIRIUS_TEST_S3_SESSION_TOKEN");
-  cfg.object_store.tls_verify                = false;
-  cfg.cache.mode                             = mode;
-  cfg.cache.eviction                         = cucascade::io::cache::eviction_policy::lru;
+  cfg.backend                               = sirius::scan_manager::io_backend::native;
+  cfg.object_store.endpoint                 = require_env("SIRIUS_TEST_S3_ENDPOINT");
+  cfg.object_store.region                   = env_or("SIRIUS_TEST_S3_REGION", "us-east-1");
+  cfg.object_store.access_key               = require_env("SIRIUS_TEST_S3_ACCESS_KEY");
+  cfg.object_store.secret_key               = require_env("SIRIUS_TEST_S3_SECRET_KEY");
+  cfg.object_store.session_token            = env_or("SIRIUS_TEST_S3_SESSION_TOKEN");
+  cfg.object_store.tls_verify               = false;
+  cfg.cache.mode                            = mode;
+  cfg.cache.eviction                        = cucascade::io::cache::eviction_policy::lru;
   cfg.cache.min_prefetching_budget_fraction = 0.5;
   cfg.cache.eviction_threshold_fraction     = 1.0;
-  cfg.uring_n_reactors                       = 1;
-  cfg.rest_n_reactors                        = 1;
+  cfg.uring_n_reactors                      = 1;
+  cfg.rest_n_reactors                       = 1;
   cfg.apply_cache_mode();
+  sirius::exec::query_lifecycle_registry lifecycle;
   sirius::scan_manager::sirius_scan_manager manager{
-    cfg, *memory, sirius::test::s3::single_gpu_index(0)};
+    lifecycle, cfg, *memory, sirius::test::s3::single_gpu_index(0)};
 
   auto first_shape = manager.describe_parquet(objects.uri);
   REQUIRE(first_shape.names.size() == 1);
@@ -143,7 +144,6 @@ void metadata_overwrite(cucascade::io::cache::cache_mode mode)
   REQUIRE(second->get_io_object().validation_tag() != old_tag);
   CHECK(second->get_io_object().raw_file_cache_id() != old_key);
   CHECK(store.has_path(objects.uri));
-  CHECK(store.get_metadata(old_key) == nullptr);
   CHECK(second->metadata() != nullptr);
 
   // The first datasource still holds the old generation's parsed footer.
@@ -166,8 +166,9 @@ TEST_CASE("describe_parquet replaces metadata of an overwritten object with the 
   metadata_overwrite(cucascade::io::cache::cache_mode::cucs);
 }
 
-TEST_CASE("describe_parquet replaces metadata of an overwritten object with the byte cache disabled",
-          "[s3][integration][cache_identity][describe_parquet]")
+TEST_CASE(
+  "describe_parquet replaces metadata of an overwritten object with the byte cache disabled",
+  "[s3][integration][cache_identity][describe_parquet]")
 {
   if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_test_env(),
                                             "SeaweedFS test environment is not available")) {

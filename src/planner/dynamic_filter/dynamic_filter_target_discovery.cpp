@@ -100,12 +100,20 @@ std::optional<descent_step> join_block_descent(
 {
   auto const probe_block_size = probe_block_output_columns.size();
   if (output_ordinal < probe_block_size) {
+    if (policy.preserve_nulls &&
+        (join_type == duckdb::JoinType::RIGHT || join_type == duckdb::JoinType::OUTER)) {
+      return std::nullopt;
+    }
     if (!probe_block_descent_admissible(join_type)) { return std::nullopt; }
     return descent_step{
       .child_index   = 0,
       .child_ordinal = static_cast<std::size_t>(probe_block_output_columns[output_ordinal])};
   }
   if (!policy.descend_build_blocks) { return std::nullopt; }
+  if (policy.preserve_nulls &&
+      (join_type == duckdb::JoinType::LEFT || join_type == duckdb::JoinType::OUTER)) {
+    return std::nullopt;
+  }
   if (!build_block_descent_admissible(join_type)) { return std::nullopt; }
   auto const build_ordinal = output_ordinal - probe_block_size;
   if (build_ordinal >= build_block_output_columns.size()) { return std::nullopt; }
@@ -244,11 +252,12 @@ std::vector<descent_step> descent_steps(sirius::op::sirius_physical_operator con
     case SiriusPhysicalOperatorType::UPDATE_EXTENSIONS:
     case SiriusPhysicalOperatorType::CREATE_SECRET:
     // Feeders are added after discovery in `insert_gpu_pipeline_operators()`: the join child's
-    // CONCAT -> PARTITION -> existing child, and the UNION arm's PASSTHROUGH_SINK -> existing
-    // child. Targets therefore end up below the wrappers either way, even though each wrapper is
-    // terminal if encountered here.
+    // CONCAT -> PARTITION -> optional BUILD_FILTER -> existing child, and the UNION arm's
+    // PASSTHROUGH_SINK -> existing child. Targets therefore end up below the wrappers either way,
+    // even though each wrapper is terminal if encountered here.
     case SiriusPhysicalOperatorType::PARTITION:
     case SiriusPhysicalOperatorType::CONCAT:
+    case SiriusPhysicalOperatorType::BUILD_FILTER:
     case SiriusPhysicalOperatorType::PASSTHROUGH_SINK:
     case SiriusPhysicalOperatorType::MERGE_SORT:
     case SiriusPhysicalOperatorType::MERGE_GROUP_BY:

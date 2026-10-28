@@ -16,6 +16,8 @@
 
 #include "expression/ast/from_duckdb.hpp"
 
+#include <duckdb/planner/filter/expression_filter.hpp>
+
 // sirius
 #include "expression/aggregate_id.hpp"
 #include "expression/ast/aggregate.hpp"
@@ -53,11 +55,13 @@
 #include <duckdb/planner/expression/bound_function_expression.hpp>
 #include <duckdb/planner/expression/bound_operator_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
+#include <re2/re2.h>
 
 // standard library
 #include <cstddef>
 #include <memory>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -86,17 +90,17 @@ std::optional<std::vector<std::unique_ptr<node>>> translate_children(Children co
 std::unique_ptr<node> translate_reference(duckdb::BoundReferenceExpression const& expr)
 {
   return std::make_unique<node>(
-    reference{static_cast<uint32_t>(expr.index), sirius::from_duckdb(expr.return_type)});
+    reference{static_cast<uint32_t>(expr.Index()), sirius::from_duckdb(expr.GetReturnType())});
 }
 
 std::unique_ptr<node> translate_constant(duckdb::BoundConstantExpression const& expr)
 {
-  auto return_type = sirius::from_duckdb(expr.return_type);
-  auto payload     = sirius::from_duckdb(expr.value, return_type);
+  auto return_type = sirius::from_duckdb(expr.GetReturnType());
+  auto payload     = sirius::from_duckdb(expr.GetValue(), return_type);
   return std::make_unique<node>(constant{std::move(payload), std::move(return_type)});
 }
 
-std::unique_ptr<node> translate_comparison(duckdb::BoundComparisonExpression const& expr)
+std::unique_ptr<node> translate_comparison(duckdb::BoundFunctionExpression const& expr)
 {
   // Filter the BoundComparisonExpression ExpressionType down to the set that the
   // Sirius comparison node carries (sirius::comparison_type). The set mirrors
@@ -112,8 +116,8 @@ std::unique_ptr<node> translate_comparison(duckdb::BoundComparisonExpression con
     case duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM: break;
     default: return nullptr;
   }
-  auto left  = from_duckdb(*expr.left);
-  auto right = from_duckdb(*expr.right);
+  auto left  = from_duckdb(duckdb::BoundComparisonExpression::Left(expr));
+  auto right = from_duckdb(duckdb::BoundComparisonExpression::Right(expr));
   if (!left || !right) { return nullptr; }
   return std::make_unique<node>(comparison{
     /*op=*/sirius::from_duckdb(expr.GetExpressionType()),
@@ -130,49 +134,49 @@ std::unique_ptr<node> translate_conjunction(duckdb::BoundConjunctionExpression c
     case duckdb::ExpressionType::CONJUNCTION_OR: op = conjunction::kind::op_or; break;
     default: return nullptr;
   }
-  auto children = translate_children(expr.children);
+  auto children = translate_children(expr.GetChildren());
   if (!children) { return nullptr; }
   return std::make_unique<node>(conjunction{op, std::move(*children)});
 }
 
-std::unique_ptr<node> translate_between(duckdb::BoundBetweenExpression const& expr)
+std::unique_ptr<node> translate_between(duckdb::BoundFunctionExpression const& expr)
 {
-  auto input = from_duckdb(*expr.input);
-  auto lower = from_duckdb(*expr.lower);
-  auto upper = from_duckdb(*expr.upper);
+  auto input = from_duckdb(duckdb::BoundBetweenExpression::Input(expr));
+  auto lower = from_duckdb(duckdb::BoundBetweenExpression::LowerBound(expr));
+  auto upper = from_duckdb(duckdb::BoundBetweenExpression::UpperBound(expr));
   if (!input || !lower || !upper) { return nullptr; }
   return std::make_unique<node>(between{
     /*input=*/std::move(input),
     /*lower=*/std::move(lower),
     /*upper=*/std::move(upper),
-    /*lower_inclusive=*/expr.lower_inclusive,
-    /*upper_inclusive=*/expr.upper_inclusive,
+    /*lower_inclusive=*/duckdb::BoundBetweenExpression::LowerInclusive(expr),
+    /*upper_inclusive=*/duckdb::BoundBetweenExpression::UpperInclusive(expr),
   });
 }
 
 std::unique_ptr<node> translate_case(duckdb::BoundCaseExpression const& expr)
 {
   std::vector<case_expr::when_then> cases;
-  cases.reserve(expr.case_checks.size());
-  for (auto const& check : expr.case_checks) {
+  cases.reserve(expr.CaseChecks().size());
+  for (auto const& check : expr.CaseChecks()) {
     auto when_node = from_duckdb(*check.when_expr);
     auto then_node = from_duckdb(*check.then_expr);
     if (!when_node || !then_node) { return nullptr; }
     cases.push_back(case_expr::when_then{std::move(when_node), std::move(then_node)});
   }
-  auto else_node = from_duckdb(*expr.else_expr);
+  auto else_node = from_duckdb(expr.Else());
   if (!else_node) { return nullptr; }
   return std::make_unique<node>(
-    case_expr{std::move(cases), std::move(else_node), sirius::from_duckdb(expr.return_type)});
+    case_expr{std::move(cases), std::move(else_node), sirius::from_duckdb(expr.GetReturnType())});
 }
 
-std::unique_ptr<node> translate_cast(duckdb::BoundCastExpression const& expr)
+std::unique_ptr<node> translate_cast(duckdb::BoundFunctionExpression const& expr)
 {
   // cuDF does not implement DuckDB's temporal-numeric cast semantics. Decline the expression
   // before a same-shaped DATE carrier conversion can reach the representation tunnel; planning
   // then applies the configured fallback policy. Planner-generated restores bypass translation.
-  auto const& source_type = expr.child->return_type;
-  auto const& target_type = expr.return_type;
+  auto const& source_type = duckdb::BoundCastExpression::Child(expr).GetReturnType();
+  auto const& target_type = expr.GetReturnType();
   if ((source_type.IsTemporal() && target_type.IsNumeric()) ||
       (source_type.IsNumeric() && target_type.IsTemporal())) {
     return nullptr;
@@ -204,19 +208,19 @@ std::unique_ptr<node> translate_cast(duckdb::BoundCastExpression const& expr)
     }
   }
 
-  auto child = from_duckdb(*expr.child);
+  auto child = from_duckdb(duckdb::BoundCastExpression::Child(expr));
   if (!child) { return nullptr; }
   return std::make_unique<node>(cast{
     /*child=*/std::move(child),
     /*target_type=*/sirius::from_duckdb(target_type),
-    /*try_cast=*/expr.try_cast,
+    /*try_cast=*/duckdb::BoundCastExpression::IsTryCast(expr),
   });
 }
 
 std::optional<int64_t> bigint_constant(duckdb::Expression const& expr)
 {
   if (expr.GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) { return std::nullopt; }
-  auto const& value = expr.Cast<duckdb::BoundConstantExpression>().value;
+  auto const& value = expr.Cast<duckdb::BoundConstantExpression>().GetValue();
   if (value.IsNull() || value.type().id() != duckdb::LogicalTypeId::BIGINT) { return std::nullopt; }
   return value.GetValue<int64_t>();
 }
@@ -225,40 +229,84 @@ std::optional<int64_t> bigint_constant(duckdb::Expression const& expr)
 // gpu_substring_slice can map onto DuckDB's semantics.
 bool gpu_supports_substring(duckdb::BoundFunctionExpression const& expr)
 {
-  if (expr.children.size() != 2 && expr.children.size() != 3) { return false; }
-  auto const offset = bigint_constant(*expr.children[1]);
-  auto const length =
-    expr.children.size() == 3 ? bigint_constant(*expr.children[2]) : substring_default_length;
+  auto const offset = bigint_constant(*expr.GetChildren()[1]);
+  auto const length = expr.GetChildren().size() == 3 ? bigint_constant(*expr.GetChildren()[2])
+                                                     : substring_default_length;
   return offset && length && gpu_substring_slice(*offset, *length);
 }
 
 // The GPU evaluator rounds FLOAT and DOUBLE inputs to a constant number of decimal places.
 bool gpu_supports_round(duckdb::BoundFunctionExpression const& expr)
 {
-  if (expr.children.size() != 1 && expr.children.size() != 2) { return false; }
-  auto const input_type = expr.children[0]->return_type.id();
+  auto const input_type = expr.GetChildren()[0]->GetReturnType().id();
   if (input_type != duckdb::LogicalTypeId::FLOAT && input_type != duckdb::LogicalTypeId::DOUBLE) {
     return false;
   }
-  if (expr.children.size() == 1) { return true; }
-  auto const& precision = *expr.children[1];
+  if (expr.GetChildren().size() == 1) { return true; }
+  auto const& precision = *expr.GetChildren()[1];
   if (precision.GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) { return false; }
-  auto const& value = precision.Cast<duckdb::BoundConstantExpression>().value;
+  auto const& value = precision.Cast<duckdb::BoundConstantExpression>().GetValue();
   return !value.IsNull() && value.type().id() == duckdb::LogicalTypeId::INTEGER;
+}
+
+// The GPU evaluator takes the absolute value of numeric inputs.
+bool gpu_supports_abs(duckdb::BoundFunctionExpression const& expr)
+{
+  auto const& type = expr.GetChildren()[0]->GetReturnType();
+  // Everything numeric besides HUGEINT and UHUGEINT.
+  return type.IsNumeric() && type.id() != duckdb::LogicalTypeId::HUGEINT &&
+         type.id() != duckdb::LogicalTypeId::UHUGEINT;
+}
+
+// Unsigned (DuckDB rejects nonzero), HUGEINT (INT64 carrier) and INTERVAL negation stay on the CPU.
+// cuDF's negation keeps its input type, so the result type must match it.
+bool gpu_supports_negate(duckdb::BoundFunctionExpression const& expr)
+{
+  auto const& type = expr.GetChildren()[0]->GetReturnType();
+  if (expr.GetReturnType() != type) { return false; }
+  switch (type.id()) {
+    case duckdb::LogicalTypeId::TINYINT:
+    case duckdb::LogicalTypeId::SMALLINT:
+    case duckdb::LogicalTypeId::INTEGER:
+    case duckdb::LogicalTypeId::BIGINT:
+    case duckdb::LogicalTypeId::FLOAT:
+    case duckdb::LogicalTypeId::DOUBLE:
+    case duckdb::LogicalTypeId::DECIMAL: return true;
+    default: return false;
+  }
 }
 
 std::unique_ptr<node> translate_function(duckdb::BoundFunctionExpression const& expr)
 {
-  auto func_id_opt = sirius::from_duckdb_function_name(expr.function.name);
+  // Optional scan predicates are hints; the required predicate remains in the plan.
+  if (duckdb::ExpressionFilter::IsRootOptionalExpression(expr)) {
+    return translate_constant(duckdb::BoundConstantExpression(duckdb::Value::BOOLEAN(true)));
+  }
+  if (duckdb::BoundComparisonExpression::IsComparison(expr)) { return translate_comparison(expr); }
+  if (duckdb::BoundCastExpression::IsCast(expr)) { return translate_cast(expr); }
+  if (expr.GetExpressionType() == duckdb::ExpressionType::COMPARE_BETWEEN) {
+    return translate_between(expr);
+  }
+  auto const name      = expr.Function().GetName().GetIdentifierName();
+  auto const& children = expr.GetChildren();
+  // A one-argument "+" is the identity. DuckDB also names BIGNUM negation "+"; IsNumeric excludes
+  // it.
+  if (children.size() == 1 && from_duckdb_function_name(name, 2) == function_id::add) {
+    auto const& operand_type = children[0]->GetReturnType();
+    if (!operand_type.IsNumeric() || expr.GetReturnType() != operand_type) { return nullptr; }
+    return from_duckdb(*children[0]);
+  }
+  auto const func_id_opt = sirius::from_duckdb_function_name(name, children.size());
   if (!func_id_opt.has_value()) { return nullptr; }
+  if (*func_id_opt == function_id::negate && !gpu_supports_negate(expr)) { return nullptr; }
   if (*func_id_opt == function_id::date_trunc) {
     // Match the GPU evaluator's supported frequencies. It requires a constant string;
     // reject other forms here so neither unsupported units nor dynamic units reach execution.
-    if (expr.children.size() != 2 ||
-        expr.children[0]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) {
+    if (expr.GetChildren()[0]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) {
       return nullptr;
     }
-    auto const& frequency = expr.children[0]->Cast<duckdb::BoundConstantExpression>().value;
+    auto const& frequency =
+      expr.GetChildren()[0]->Cast<duckdb::BoundConstantExpression>().GetValue();
     if (frequency.IsNull() || frequency.type().id() != duckdb::LogicalTypeId::VARCHAR) {
       return nullptr;
     }
@@ -267,27 +315,102 @@ std::unique_ptr<node> translate_function(duckdb::BoundFunctionExpression const& 
   }
   if (*func_id_opt == function_id::constant_or_null) {
     // The GPU evaluator reads the result value from a constant first argument.
-    if (expr.children.size() < 2 ||
-        expr.children[0]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) {
+    if (expr.GetChildren()[0]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) {
       return nullptr;
     }
   }
   if (*func_id_opt == function_id::substring && !gpu_supports_substring(expr)) { return nullptr; }
   if (*func_id_opt == function_id::round && !gpu_supports_round(expr)) { return nullptr; }
-  auto arguments = translate_children(expr.children);
+  if (*func_id_opt == function_id::abs && !gpu_supports_abs(expr)) { return nullptr; }
+  if (*func_id_opt == function_id::regexp_replace) {
+    // The GPU implementation supports constant patterns/replacements and DuckDB's default
+    // options only.
+    for (std::size_t i = 1; i < 3; ++i) {
+      if (expr.GetChildren()[i]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) {
+        return nullptr;
+      }
+      auto const& value = expr.GetChildren()[i]->Cast<duckdb::BoundConstantExpression>().GetValue();
+      if (value.IsNull() || value.type() != duckdb::LogicalType::VARCHAR) { return nullptr; }
+    }
+    auto const& pattern = duckdb::StringValue::Get(
+      expr.GetChildren()[1]->Cast<duckdb::BoundConstantExpression>().GetValue());
+    // RE2's shorthand classes and word boundaries are ASCII-only; cuDF's are Unicode-aware.
+    // cuDF also does not implement POSIX classes. Skip escaped characters so a literal \\w
+    // remains supported, but reject these constructs wherever they occur in the pattern.
+    for (std::size_t i = 0; i < pattern.size(); ++i) {
+      if (pattern[i] == '\\' && i + 1 < pattern.size()) {
+        switch (pattern[++i]) {
+          case 'w':
+          case 'W':
+          case 'd':
+          case 'D':
+          case 's':
+          case 'S':
+          case 'b':
+          case 'B': return nullptr;
+          default: break;
+        }
+      } else if (pattern.compare(i, 2, "[:") == 0) {
+        return nullptr;
+      } else if (pattern.compare(i, 2, "(?") == 0 && pattern.compare(i, 3, "(?:") != 0) {
+        // cuDF only supports non-capturing groups among the (?...) forms. Inline flags such
+        // as (?m) would also change the anchor semantics the evaluator relies on.
+        return nullptr;
+      }
+    }
+    duckdb_re2::RE2::Options options;
+    options.set_log_errors(false);
+    duckdb_re2::RE2 const regex(pattern, options);
+    if (!regex.ok()) { return nullptr; }
+    // cuDF can compile empty-only patterns such as (?:) and a{0} into programs that never
+    // replace anything. RE2 bounds every possible match; two empty bounds prove that no
+    // nonempty match is possible. One byte is enough to distinguish this from a* or a?.
+    std::string min_match, max_match;
+    if (regex.PossibleMatchRange(&min_match, &max_match, 1) && min_match.empty() &&
+        max_match.empty()) {
+      return nullptr;
+    }
+    auto const& replacement = duckdb::StringValue::Get(
+      expr.GetChildren()[2]->Cast<duckdb::BoundConstantExpression>().GetValue());
+    // cuDF's template syntax differs from RE2's. Only translate single-digit backreferences;
+    // leave escaped backslashes and invalid rewrite escapes to DuckDB. Braced references are
+    // reserved for the translated cuDF template below, but are literal text in DuckDB.
+    bool has_backrefs = false;
+    for (std::size_t i = 0; i < replacement.size(); ++i) {
+      if (replacement[i] != '\\') { continue; }
+      if (++i == replacement.size() || replacement[i] < '0' || replacement[i] > '9') {
+        return nullptr;
+      }
+      has_backrefs = true;
+    }
+    if (has_backrefs && replacement.find("${") != std::string::npos) { return nullptr; }
+    if (has_backrefs) {
+      std::string error;
+      // Validate against the original captures before adding the GPU wrapper groups.
+      if (!regex.CheckRewriteString(replacement, &error)) { return nullptr; }
+    }
+  }
+  auto arguments = translate_children(expr.GetChildren());
   if (!arguments) { return nullptr; }
-  auto return_type = sirius::from_duckdb(expr.return_type);
+  auto return_type = sirius::from_duckdb(expr.GetReturnType());
   return std::make_unique<node>(
     function_call{*func_id_opt, std::move(*arguments), std::move(return_type)});
 }
 
 std::unique_ptr<node> translate_aggregate(duckdb::BoundAggregateExpression const& aggr)
 {
-  auto agg_id_opt = sirius::from_duckdb_aggregate_name(aggr.function.name);
+  auto agg_id_opt =
+    sirius::from_duckdb_aggregate_name(aggr.Function().GetName().GetIdentifierName());
   if (!agg_id_opt.has_value()) { return nullptr; }
-  auto arguments = translate_children(aggr.children);
+  if (*agg_id_opt == aggregate_id::count && aggr.GetChildren().empty()) {
+    // DuckDB's window-to-aggregate rewrite keeps the nullary overload named count.
+    // It counts rows, including NULLs, just like count_star.
+    if (aggr.IsDistinct()) { return nullptr; }
+    agg_id_opt = aggregate_id::count_star;
+  }
+  auto arguments = translate_children(aggr.GetChildren());
   if (!arguments) { return nullptr; }
-  auto return_type = sirius::from_duckdb(aggr.return_type);
+  auto return_type = sirius::from_duckdb(aggr.GetReturnType());
   return std::make_unique<node>(
     aggregate{*agg_id_opt, std::move(*arguments), std::move(return_type), aggr.IsDistinct()});
 }
@@ -309,25 +432,25 @@ std::unique_ptr<node> translate_operator(duckdb::BoundOperatorExpression const& 
     default: break;
   }
   if (unary_kind != unary_op::kind::invalid) {
-    D_ASSERT(!expr.children.empty());
-    auto child = from_duckdb(*expr.children[0]);
+    D_ASSERT(!expr.GetChildren().empty());
+    auto child = from_duckdb(*expr.GetChildren()[0]);
     if (!child) { return nullptr; }
     return std::make_unique<node>(unary_op{unary_kind, std::move(child)});
   }
 
   if (op_type == duckdb::ExpressionType::OPERATOR_COALESCE) {
-    auto children = translate_children(expr.children);
+    auto children = translate_children(expr.GetChildren());
     if (!children) { return nullptr; }
     return std::make_unique<node>(
-      coalesce{std::move(*children), sirius::from_duckdb(expr.return_type)});
+      coalesce{std::move(*children), sirius::from_duckdb(expr.GetReturnType())});
   }
 
   if (op_type == duckdb::ExpressionType::COMPARE_IN ||
       op_type == duckdb::ExpressionType::COMPARE_NOT_IN) {
-    D_ASSERT(!expr.children.empty());
-    auto probe = from_duckdb(*expr.children[0]);
+    D_ASSERT(!expr.GetChildren().empty());
+    auto probe = from_duckdb(*expr.GetChildren()[0]);
     if (!probe) { return nullptr; }
-    auto values = translate_children(expr.children, /*start=*/1);
+    auto values = translate_children(expr.GetChildren(), /*start=*/1);
     if (!values) { return nullptr; }
     return std::make_unique<node>(in_list{
       /*probe=*/std::move(probe),
@@ -346,14 +469,8 @@ std::unique_ptr<node> from_duckdb(duckdb::Expression const& expr)
   switch (expr.GetExpressionClass()) {
     case duckdb::ExpressionClass::BOUND_AGGREGATE:
       return translate_aggregate(expr.Cast<duckdb::BoundAggregateExpression>());
-    case duckdb::ExpressionClass::BOUND_BETWEEN:
-      return translate_between(expr.Cast<duckdb::BoundBetweenExpression>());
     case duckdb::ExpressionClass::BOUND_CASE:
       return translate_case(expr.Cast<duckdb::BoundCaseExpression>());
-    case duckdb::ExpressionClass::BOUND_CAST:
-      return translate_cast(expr.Cast<duckdb::BoundCastExpression>());
-    case duckdb::ExpressionClass::BOUND_COMPARISON:
-      return translate_comparison(expr.Cast<duckdb::BoundComparisonExpression>());
     case duckdb::ExpressionClass::BOUND_CONJUNCTION:
       return translate_conjunction(expr.Cast<duckdb::BoundConjunctionExpression>());
     case duckdb::ExpressionClass::BOUND_CONSTANT:

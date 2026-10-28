@@ -20,6 +20,7 @@
 #include "expression/ast/from_duckdb.hpp"
 #include "expression_evaluator/expression_evaluator.hpp"
 #include "log/logging.hpp"
+#include "op/scan/iceberg_gpu_ingestible.hpp"
 #include "op/scan/scan_utils.hpp"
 #include "sirius_config.hpp"
 #include "telemetry/nvtx.hpp"
@@ -36,6 +37,7 @@
 
 namespace sirius {
 namespace op {
+sirius_physical_table_scan::~sirius_physical_table_scan() = default;
 
 uint64_t get_chunk_data_byte_size(sirius::logical_type type, std::size_t cardinality)
 {
@@ -44,7 +46,7 @@ uint64_t get_chunk_data_byte_size(sirius::logical_type type, std::size_t cardina
 
 sirius_physical_table_scan::sirius_physical_table_scan(
   duckdb::vector<sirius::logical_type> types,
-  duckdb::TableFunction function_p,
+  duckdb::BoundTableFunction function_p,
   duckdb::unique_ptr<duckdb::FunctionData> bind_data_p,
   duckdb::vector<sirius::logical_type> returned_types_p,
   duckdb::vector<duckdb::ColumnIndex> column_ids_p,
@@ -55,6 +57,7 @@ sirius_physical_table_scan::sirius_physical_table_scan(
   duckdb::ExtraOperatorInfo extra_info,
   duckdb::vector<duckdb::Value> parameters_p,
   duckdb::virtual_column_map_t virtual_columns_p,
+  std::size_t projected_output_count_p,
   duckdb::vector<duckdb::LogicalType> duckdb_types_p)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::TABLE_SCAN, std::move(types), estimated_cardinality),
@@ -64,6 +67,7 @@ sirius_physical_table_scan::sirius_physical_table_scan(
     returned_types(std::move(returned_types_p)),
     column_ids(std::move(column_ids_p)),
     projection_ids(std::move(projection_ids_p)),
+    projected_output_count(projected_output_count_p),
     names(std::move(names_p)),
     table_filters(std::move(table_filters_p)),
     extra_info(std::move(extra_info)),
@@ -188,7 +192,7 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
     expression_evaluator evaluator(*local_filter_expr,
                                    cudf::get_current_device_resource_ref(),
                                    stream,
-                                   strategy_from_config(),
+                                   expression_policy(),
                                    expression_evaluator::default_min_ast_size,
                                    like_swar_fastpath_enabled(),
                                    like_cache());

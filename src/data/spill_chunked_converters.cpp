@@ -256,7 +256,7 @@ void submit_chunk(std::span<const copy_op> ops,
  * final synchronize preserves the converter contract: source buffers are dead after return.
  */
 std::unique_ptr<cucascade::idata_representation> convert_gpu_to_host_chunked(
-  cucascade::idata_representation& source,
+  const cucascade::idata_representation& source,
   const cucascade::memory::memory_space* target_memory_space,
   ::cuda::stream_ref stream,
   cucascade::memory::reservation* reservation,
@@ -264,7 +264,8 @@ std::unique_ptr<cucascade::idata_representation> convert_gpu_to_host_chunked(
 {
   nvtx3::scoped_range nvtx_range{"sirius::spill::gpu_to_host_chunked"};
 
-  auto& gpu_source            = source.cast<cucascade::gpu_table_representation>();
+  auto const& gpu_source = source.cast<cucascade::gpu_table_representation>();
+  gpu_source.wait_for_writer(stream);
   const cudf::table_view view = gpu_source.get_table_view();
 
   // Pass 1: plan the allocation layout.
@@ -324,7 +325,7 @@ void register_chunked_spill_converters(cucascade::representation_converter_regis
                                 cucascade::host_data_representation>();
   registry
     .register_converter<cucascade::gpu_table_representation, cucascade::host_data_representation>(
-      [chunk_bytes](cucascade::idata_representation& source,
+      [chunk_bytes](const cucascade::idata_representation& source,
                     const cucascade::memory::memory_space* target_memory_space,
                     ::cuda::stream_ref stream,
                     cucascade::memory::reservation* reservation) {

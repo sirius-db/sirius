@@ -251,7 +251,6 @@ io_stack make_io_stack(std::size_t n_reactors)
 
   auto ctx = std::make_shared<cucascade::io::uring::uring_reactor::reactor_context>(
     cucascade::io::uring::uring_reactor::reactor_config_type{}, stack.bounce_mr.get());
-  // n_reactors = runner threads that start() spawns.
   stack.io_ctx = std::make_shared<cucascade::io::uring::uring_ioctx>(n_reactors, std::move(ctx));
   stack.io_ctx->start();
   return stack;
@@ -516,9 +515,11 @@ int main(int argc, char** argv)
     auto t0 = clock_type::now();
     std::promise<bool> p;
     auto fut = p.get_future();
-    b_issued = prep.ds->prefetch_async([&p](bool ok) noexcept { p.set_value(ok); }) ==
-               cucascade::io::prefetch_refusal::issued;
-    b_ok                     = fut.get();
+    b_issued = prep.ds->prefetch_async([&p](cucascade::io::cache::prefetch_result result) noexcept {
+      bool const ok = result.ok;
+      p.set_value(ok);
+    }) == cucascade::io::prefetch_refusal::issued;
+    b_ok     = fut.get();
     double const prefetch_ms = now_ms(t0);
     auto rr = read_ranges_to_device(*prep.ds, prep.ranges, device_mr, stream, decode_wait);
     results.push_back({"B prefetch 1 file",
@@ -590,10 +591,12 @@ int main(int argc, char** argv)
         std::size_t const inflight = k + 1 - parse_pos.load(std::memory_order_acquire);
         d_peak_inflight            = std::max(d_peak_inflight, inflight);
         d_io_start[k]              = now_ms(t0);
-        if (preps[k].ds->prefetch_async([&promises, &d_io_end, t0, k](bool ok) noexcept {
-              d_io_end[k] = now_ms(t0);
-              promises[k].set_value(ok);
-            }) == cucascade::io::prefetch_refusal::issued) {
+        if (preps[k].ds->prefetch_async(
+              [&promises, &d_io_end, t0, k](cucascade::io::cache::prefetch_result result) noexcept {
+                bool const ok = result.ok;
+                d_io_end[k]   = now_ms(t0);
+                promises[k].set_value(ok);
+              }) == cucascade::io::prefetch_refusal::issued) {
           ++issued_ok;
         }
       }
