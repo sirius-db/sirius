@@ -496,6 +496,26 @@ TEST_CASE("a failed exchange fails the next task of its sources", "[exchange][op
   CHECK_FALSE(source.all_ports_empty());
 }
 
+TEST_CASE("a failed exchange tells a later query to restart every rank", "[exchange][operators]")
+{
+  ranks c(2, {.fail_after_writes = 0});
+  exchange_spec spec;
+  spec.routing = mode::broadcast;
+  sirius_physical_exchange_source failed(key_value_types(), 0, c.all[1].service, 8, {0, 1}, false);
+  sirius_physical_exchange_sink sink(key_value_types(), 0, c.all[0].service, 8, spec);
+  sink_batch(sink, key_value_batch(0, 0));
+  auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds{30};
+  while (failed.get_next_task_hint()->hint != sirius::op::TaskCreationHint::READY) {
+    REQUIRE(std::chrono::steady_clock::now() < deadline);
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+  }
+  sirius_physical_exchange_source later(key_value_types(), 0, c.all[1].service, 9, {0, 1}, false);
+  CHECK_THROWS_WITH(later.get_next_task_input_data(),
+                    Catch::Matchers::ContainsSubstring("restart every rank"));
+  CHECK_THROWS_WITH(c.all[0].service->send(9, 1, key_value_batch(0, 1)),
+                    Catch::Matchers::ContainsSubstring("restart every rank"));
+}
+
 TEST_CASE("a hash exchange with null keys to every rank sends rows with a NULL key to every rank",
           "[exchange][operators]")
 {

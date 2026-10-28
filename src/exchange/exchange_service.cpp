@@ -20,10 +20,26 @@
 
 #include <cucascade/data/data_batch.hpp>
 
+#include <exception>
+#include <string>
 #include <utility>
 #include <vector>
 
 namespace sirius::exchange {
+namespace {
+
+std::string what_of(std::exception_ptr const& error)
+{
+  try {
+    std::rethrow_exception(error);
+  } catch (std::exception const& e) {
+    return e.what();
+  } catch (...) {
+    return "unknown error";
+  }
+}
+
+}  // namespace
 
 exchange_service::exchange_service(fabric& fabric,
                                    frame_ring& send,
@@ -49,7 +65,11 @@ exchange_service::exchange_service(fabric& fabric,
                             std::map<stream_id, std::shared_ptr<inbound>> receivers;
                             {
                               std::lock_guard lock{_mutex};
-                              _error    = error;
+                              // Fail-stop: nothing reconnects, so later queries say how to recover.
+                              _error    = std::make_exception_ptr(sirius::internal_exception(
+                                "exchange: the transport to the other ranks failed ({}); restart "
+                                   "every rank to run distributed queries again",
+                                what_of(error)));
                               receivers = _receivers;
                             }
                             for (auto& [stream, r] : receivers) {
@@ -119,6 +139,26 @@ void exchange_service::attach(stream_id stream, std::shared_ptr<inbound> receive
   if (auto it = _aborted.find(query_of(stream)); it != _aborted.end()) {
     receiver->on_error(it->second);
   }
+}
+
+void exchange_service::send(stream_id stream,
+                            rank_t to,
+                            std::shared_ptr<cucascade::data_batch> batch)
+{
+  throw_if_failed();
+  _transport->send(stream, to, std::move(batch));
+}
+
+void exchange_service::close(stream_id stream, rank_t to)
+{
+  throw_if_failed();
+  _transport->close(stream, to);
+}
+
+void exchange_service::throw_if_failed()
+{
+  std::lock_guard lock{_mutex};
+  if (_error) { std::rethrow_exception(_error); }
 }
 
 void exchange_service::detach(stream_id stream)
