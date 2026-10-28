@@ -1,0 +1,39 @@
+NIXL 1.5.0: use the installed toml++ headers without its optional shared library.
+
+--- a/src/utils/common/meson.build
++++ b/src/utils/common/meson.build
+@@ -14,6 +14,12 @@
+ # limitations under the License.
+ 
+ tomlplusplus_dep = dependency('tomlplusplus', required: true, default_options: ['build_lib=false', 'compile_library=false'])
++if native_only
++    # Use the header-only API even when the installed package defaults to a shared library.
++    tomlplusplus_dep = declare_dependency(
++        dependencies: tomlplusplus_dep.partial_dependency(includes: true),
++        compile_args: ['-DTOML_HEADER_ONLY=1'])
++endif
+ 
+ nixl_common_inc = include_directories('.')
+ 
+--- a/src/utils/common/configuration.h
++++ b/src/utils/common/configuration.h
+@@ -24,7 +24,7 @@
+ #include "nixl_types.h"
+ #include "toml_traits.h"
+ 
+-#include <toml++/toml.hpp>
++#include <toml++/toml.h>
+ 
+ #include <algorithm>
+ #include <cstdlib>
+--- a/src/utils/common/toml_traits.h
++++ b/src/utils/common/toml_traits.h
+@@ -20,7 +20,7 @@
+ 
+ #include "exception.h"
+ 
+-#include <toml++/toml.hpp>
++#include <toml++/toml.h>
+ 
+ #include <chrono>
+ #include <filesystem>

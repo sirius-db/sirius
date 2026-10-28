@@ -1,0 +1,26 @@
+NIXL 1.5.0: honor static linkage for common utilities and install the UCX archive.
+
+--- a/src/utils/common/meson.build
++++ b/src/utils/common/meson.build
+@@ -33,8 +33,8 @@
+ git_hash = run_command('git', 'rev-parse', '--short=8', 'HEAD', check: false, capture: true)
+ git_commit = git_hash.returncode() == 0 ? git_hash.stdout().strip() : 'unknown'
+ 
+-# Define a shared library for common utilities
+-nixl_common_lib = shared_library('nixl_common',
++# Honor the project's shared/static library selection.
++nixl_common_lib = library('nixl_common',
+     'hw_info.cpp',
+     'nixl_log.cpp',
+     'uuid_v4.cpp',
+--- a/src/plugins/ucx/meson.build
++++ b/src/plugins/ucx/meson.build
+@@ -45,7 +45,7 @@
+                ucx_backend_sources,
+                dependencies: ucx_backend_dependencies,
+                include_directories: ucx_backend_include_directories,
+-               install: false,
++               install: true,
+                name_prefix: 'libplugin_')  # Custom prefix for plugin libraries
+ else
+     ucx_backend_lib = shared_library('UCX',
