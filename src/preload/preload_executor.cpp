@@ -367,6 +367,14 @@ preload_executor::preload_executor(event::query_event_publisher& publisher,
     }
     if (hook && *hook) { (*hook)(job); }
   };
+  _env.post_convert_hook = [this](promotion_job const& job) {
+    std::shared_ptr<std::function<void(promotion_job const&)>> hook;
+    {
+      std::lock_guard const g{_hook_mu};
+      hook = _post_convert_hook;
+    }
+    if (hook && *hook) { (*hook)(job); }
+  };
 }
 
 preload_executor::~preload_executor() { stop(); }
@@ -1818,6 +1826,14 @@ void preload_executor::set_promotion_hook_for_testing(
   auto shared = std::make_shared<std::function<void(promotion_job const&)>>(std::move(hook));
   std::lock_guard const g{_hook_mu};
   _hook = std::move(shared);
+}
+
+void preload_executor::set_post_convert_hook_for_testing(
+  std::function<void(promotion_job const&)> hook)
+{
+  auto shared = std::make_shared<std::function<void(promotion_job const&)>>(std::move(hook));
+  std::lock_guard const g{_hook_mu};
+  _post_convert_hook = std::move(shared);
 }
 
 std::size_t preload_executor::outstanding_bytes_for_testing(std::size_t gpu) const

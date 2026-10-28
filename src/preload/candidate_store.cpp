@@ -293,6 +293,12 @@ void candidate_store::retire_query(query_id_t q) noexcept
       qs.ledger_ids.erase(first);
     }
   }
+  // Claimed tombstones have no candidate or ledger entry, so release their board watches here.
+  if (_budget) {
+    for (auto const& [id, seq] : qs.claimed_seqs) {
+      _budget->unwatch(id);
+    }
+  }
   try {
     _stats_by_query.insert_or_assign(q, it->second.stats);
   } catch (...) {
@@ -363,6 +369,17 @@ intake_status candidate_store::intake(query_id_t q, event::downgraded_batch cons
     if (_budget && new_generation) { _budget->watch(id); }
     count(q, counter::merged);
     return intake_status::merged;
+  }
+
+  // A claimed tombstone (the batch was claimed by a task and its candidate removed): a duplicate
+  // or older record must not recreate an unclaimed candidate. Only a strictly newer conversion
+  // sequence reopens it; its fresh watch then renews the board entry (claimed -> unclaimed).
+  if (auto const tit = qs.claimed_seqs.find(id); tit != qs.claimed_seqs.end()) {
+    if (rec.conversion_seq <= tit->second) {
+      count(q, counter::dropped_stale_record);
+      return intake_status::dropped_stale_record;
+    }
+    qs.claimed_seqs.erase(tit);
   }
 
   if (rec.batch.expired()) {
@@ -499,8 +516,23 @@ void candidate_store::erase_candidate(candidate_map::iterator it) noexcept
       }
     }
   }
-  auto const id = it->second.batch_id;
+  auto const id       = it->second.batch_id;
+  auto const query    = it->second.query;
+  auto const last_seq = it->second.last_seq;
   _by_id.erase(it);
+  // If a task already claimed this batch, keep the board's claimed entry as a tombstone and record
+  // the sequence it was claimed at, so a delayed duplicate or older downgrade record cannot
+  // recreate an unclaimed candidate; only a strictly newer sequence reopens it.
+  if (_budget && _budget->is_claimed(id)) {
+    if (auto const qit = _queries.find(query); qit != _queries.end()) {
+      try {
+        qit->second.claimed_seqs.insert_or_assign(id, last_seq);
+        return;  // keep the board entry (do not unwatch)
+      } catch (...) {
+        // Could not record the tombstone: fall back to releasing the watch.
+      }
+    }
+  }
   maybe_unwatch(id);
 }
 
@@ -879,6 +911,11 @@ void candidate_store::clear() noexcept
     }
     for (auto const& [id, e] : _ledger) {
       _budget->unwatch(id);
+    }
+    for (auto const& [q, qs] : _queries) {
+      for (auto const& [id, seq] : qs.claimed_seqs) {
+        _budget->unwatch(id);
+      }
     }
   }
   _by_id.clear();

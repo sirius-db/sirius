@@ -180,6 +180,16 @@ class device_preload_budget {
              : 0;
   }
 
+  /// Whether @p batch_id has been claimed by a task (and not since renewed by @ref watch). Lets
+  /// the preload executor keep a claimed entry as a tombstone when its candidate is removed, so a
+  /// delayed duplicate record cannot recreate an unclaimed watch.
+  [[nodiscard]] bool is_claimed(std::uint64_t batch_id) const noexcept
+  {
+    std::lock_guard const lk{_mu};
+    auto const it = _entries.find(batch_id);
+    return it != _entries.end() && it->second.claimed;
+  }
+
   /// Whether no id is watched (a lock-free fast path for the matcher).
   [[nodiscard]] bool empty() const noexcept
   {

@@ -290,9 +290,9 @@ struct gpu_ceiling_bytes {
   return c2c ? 5 : 1;
 }
 
-/// Concurrent promotions out of one DISK space: @c concurrent_preloads when set, else 1. This
-/// port has no GPUDirect Storage path (every DISK->GPU copy bounces through host memory), so the
-/// auto width is unconditionally 1.
+/// Concurrent promotions out of one DISK space: @c concurrent_preloads when set, else 1. Sirius
+/// has no GPUDirect Storage path for DISK spaces yet (every DISK->GPU copy bounces through host
+/// memory), so the auto width is unconditionally 1.
 [[nodiscard]] constexpr int disk_cap(preload_executor_config const& cfg,
                                      [[maybe_unused]] bool gds) noexcept
 {

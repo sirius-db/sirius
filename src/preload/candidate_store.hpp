@@ -120,6 +120,12 @@ struct query_state {
   std::set<std::pair<std::uint64_t, std::uint64_t>> by_seq;
   /// Batch ids of this query's ledger entries, so retiring it needs no scan of the ledger.
   std::unordered_set<std::uint64_t> ledger_ids;
+  /// Claimed tombstones: a batch a task claimed whose candidate was then removed, mapped to the
+  /// conversion sequence it was claimed at. A duplicate or older downgrade record of such a batch
+  /// must not recreate an unclaimed candidate; only a strictly newer sequence reopens it. The
+  /// board keeps the matching entry claimed until the tombstone is unwatched (retire/forget/
+  /// clear/stop).
+  std::unordered_map<std::uint64_t, std::uint64_t> claimed_seqs;
   per_query_stats stats;
   /// A FULL barrier of this query may have cleared since the last pass.
   bool readiness_dirty{true};

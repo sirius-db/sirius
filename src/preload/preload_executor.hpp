@@ -245,6 +245,9 @@ class preload_executor final : public event::query_event_subscriber {
   [[nodiscard]] std::vector<promotion_record> promotion_log_for_testing() const;
   /// Run @p hook inside each promotion, once its target reservation is made and admitted.
   void set_promotion_hook_for_testing(std::function<void(promotion_job const&)> hook);
+  /// Run @p hook inside each GPU promotion after the conversion completes and before the outcome
+  /// is installed.
+  void set_post_convert_hook_for_testing(std::function<void(promotion_job const&)> hook);
   /// Preloaded, unconsumed bytes on GPU index @p gpu.
   [[nodiscard]] std::size_t outstanding_bytes_for_testing(std::size_t gpu) const;
   /// The class-B part of @ref outstanding_bytes_for_testing.
@@ -538,6 +541,7 @@ class preload_executor final : public event::query_event_subscriber {
   /// Test hook, read by each promotion.
   mutable std::mutex _hook_mu;
   std::shared_ptr<std::function<void(promotion_job const&)>> _hook;
+  std::shared_ptr<std::function<void(promotion_job const&)>> _post_convert_hook;
   promotion_env _env;
 
   /// Guards start() and stop(), including starting and stopping event delivery.

@@ -344,8 +344,8 @@ void task_scheduler::management_eventloop()
         if (auto* gpu_task = dynamic_cast<pipeline::gpu_pipeline_task*>(task.get())) {
           // Release this task's preloaded input charges the instant it is claimed, before
           // task_deployed is published, so the preload planner pass that event triggers already
-          // sees the freed device preloading budget. The board releases whatever device holds a
-          // charge (R3 has no same-device exception). Skipped when the board is absent or empty.
+          // sees the freed device preloading budget. The board releases a charge whatever device
+          // holds it. Skipped when the board is absent or empty.
           if (_device_preload_budget && !_device_preload_budget->empty()) {
             if (auto const* data =
                   sirius::convertible_gpu_pipeline_task::get_pipelineable_data(*task)) {

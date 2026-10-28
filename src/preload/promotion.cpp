@@ -161,6 +161,11 @@ void run_test_hook(promotion_env const& env, promotion_job const& job)
   if (env.test_hook) { env.test_hook(job); }
 }
 
+void run_post_convert_hook(promotion_env const& env, promotion_job const& job)
+{
+  if (env.post_convert_hook) { env.post_convert_hook(job); }
+}
+
 /**
  * @brief Promote a HOST or DISK batch to the GPU target `env.gpus[job.t.index]`.
  *
@@ -256,8 +261,10 @@ promotion_result promote_to_gpu(promotion_job const& job,
                                cudaGetErrorString(err));
     }
   }
-  return promoted(
-    from_disk ? promotion_kind::d2g : promotion_kind::h2g, need, next_conversion_seq());
+  auto const seq = next_conversion_seq();
+  // Tests only: the conversion has completed but no outcome is installed yet.
+  run_post_convert_hook(env, job);
+  return promoted(from_disk ? promotion_kind::d2g : promotion_kind::h2g, need, seq);
 }
 
 /**

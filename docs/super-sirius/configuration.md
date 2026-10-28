@@ -371,7 +371,7 @@ board created.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `concurrent_preloads` | optional int (**0–64**) | *absent* | Workers per lane (each GPU HOST→GPU lane and each DISK lane) and, for a GPU lane, its HOST→GPU token count. *Absent* = auto: a GPU lane is 5 with a C2C link else 1; a DISK lane is 1 (this port has no GPUDirect Storage path). `0` turns preload off entirely. A per-lane cap, not process-wide. |
+| `concurrent_preloads` | optional int (**0–64**) | *absent* | Workers per lane (each GPU HOST→GPU lane and each DISK lane) and, for a GPU lane, its HOST→GPU token count. *Absent* = auto: a GPU lane is 5 with a C2C link else 1; a DISK lane is 1 (Sirius has no GPUDirect Storage path for DISK spaces yet). `0` turns preload off entirely. A per-lane cap, not process-wide. |
 | `device_preloading_budget` | float (0.0–1.0) | 0.0 | Maximum preloaded-but-not-yet-claimed bytes per GPU, as a fraction of its capacity. `0` (default) disables device preloading: no GPU is ever a target and no stream pool or budget board is created. |
 | `device_preloading_ceiling` | optional float (**0.0 < x ≤ 1.0**) | *absent* | GPU promotions run only while the GPU's consumed memory (counting the copy's own reservation) stays at or below this fraction of capacity. *Absent* = each GPU's own `downgrade_stop_fraction`; an explicit value above a GPU's `downgrade_stop_fraction` is clamped to it (one WARN). This is the committed (class A) GPU ceiling. |
 | `gpu_speculative_headroom_fraction` | float (0.0–1.0) | 0.1 | The speculative (class B) GPU ceiling is `device_preloading_ceiling − this`, saturating at 0. |

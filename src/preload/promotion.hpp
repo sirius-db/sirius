@@ -105,6 +105,9 @@ struct promotion_env {
   /// Tests only. Runs on the promoting thread once the target reservation is made and admitted,
   /// before the batch is locked.
   std::function<void(promotion_job const&)> test_hook{};
+  /// Tests only. Runs on the promoting thread for a GPU promotion after the conversion completes
+  /// and before the outcome is installed, so a test can claim a batch in exactly that window.
+  std::function<void(promotion_job const&)> post_convert_hook{};
 };
 
 /**
