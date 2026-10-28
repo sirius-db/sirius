@@ -15,6 +15,7 @@
  */
 
 #include "catch.hpp"
+#include "cuda/device_health.hpp"
 #include "data/convertible_data.hpp"
 #include "data/data_batch_utils.hpp"
 #include "data/data_repository_manager_registry.hpp"
@@ -857,6 +858,29 @@ TEST_CASE(
     CHECK(result.outcome == promotion_outcome::oom);
     CHECK(unreserved.load() == others);
   }
+}
+
+TEST_CASE("a fatal CUDA status is latched by the promotion sync guard", "[preload_promotion]")
+{
+  // After a GPU promotion, if the output has no writer event, the promotion synchronizes its
+  // stream and routes a failed sync through check_cuda_health(), so a fatal status poisons the
+  // shared context (fatal_device_status recognizes it) instead of becoming an advisory failure.
+  std::exception_ptr fatal;
+  try {
+    sirius::check_cuda_health(cudaErrorIllegalAddress);
+  } catch (...) {
+    fatal = std::current_exception();
+  }
+  REQUIRE(fatal);
+  auto const status = sirius::fatal_device_status(fatal);
+  REQUIRE(status.has_value());
+  CHECK(*status == cudaErrorIllegalAddress);
+
+  // A non-fatal status is not latched: the sync failure stays an ordinary failed promotion.
+  CHECK_NOTHROW(sirius::check_cuda_health(cudaErrorNotReady));
+  CHECK_FALSE(sirius::fatal_device_status(std::make_exception_ptr(std::runtime_error(
+                                            "preload: stream sync after promotion failed")))
+                .has_value());
 }
 
 TEST_CASE("preload stream pools are per device and grow on demand", "[preload_promotion]")

@@ -176,6 +176,23 @@ TEST_CASE("preload ceilings follow the device preloading ceiling, in consumed by
     CHECK(gpu_ceilings_bytes(cfg, space_limits{}).committed == 0);
     CHECK(host_ceiling_bytes(cfg, space_limits{}) == 0);
   }
+
+  SECTION("heterogeneous GPUs get per-GPU committed ceilings")
+  {
+    space_limits const big{100 * GiB, 100 * GiB, 60 * GiB};  // stop 0.6
+    space_limits const small{50 * GiB, 50 * GiB, 20 * GiB};  // stop 0.4
+    // Absent ceiling: each GPU's committed ceiling is its own downgrade stop.
+    CHECK(gpu_ceilings_bytes(cfg, big).committed == 60 * GiB);
+    CHECK(gpu_ceilings_bytes(cfg, small).committed == 20 * GiB);
+    // An explicit ceiling is clamped per GPU to that GPU's downgrade stop.
+    cfg.device_preloading_ceiling = 0.5;
+    CHECK(gpu_ceilings_bytes(cfg, big).committed == fraction_of(0.5, 100 * GiB));  // below 0.6 stop
+    CHECK(gpu_ceilings_bytes(cfg, small).committed == 20 * GiB);  // clamped to the 0.4 stop
+    // The speculative headroom is subtracted per GPU from each committed ceiling.
+    cfg.gpu_speculative_headroom_fraction = 0.1;
+    CHECK(gpu_ceilings_bytes(cfg, big).speculative == fraction_of(0.4, 100 * GiB));   // 0.5 - 0.1
+    CHECK(gpu_ceilings_bytes(cfg, small).speculative == fraction_of(0.3, 50 * GiB));  // 0.4 - 0.1
+  }
 }
 
 // ---- budgets -----------------------------------------------------------------------------------

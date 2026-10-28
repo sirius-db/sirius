@@ -509,6 +509,42 @@ TEST_CASE("candidate_store: a duplicate or stale downgrade record never undoes a
   }
 }
 
+TEST_CASE("candidate_store: a claim survives the candidate's removal via a tombstone", "[preload]")
+{
+  store_fixture f;
+  fake_batch b;
+  REQUIRE(f.store.intake(f.q1, record(b, 7, 5, gpu0, host0, 100)) == intake_status::inserted);
+  // A task claims the watched id before preload takes it.
+  std::array<std::uint64_t, 1> const ids{7};
+  f.budget.claim(ids);
+  // The refused TAKE erases the candidate but keeps a claimed tombstone (seq 5).
+  CHECK_FALSE(f.store.take({7, gpu_t0, klass::A, 0}).has_value());
+  CHECK(f.counters.get(counter::claimed) == 1);
+  REQUIRE(f.store.find(7) == nullptr);
+
+  SECTION("a duplicate or older record after removal is rejected, not recreated unclaimed")
+  {
+    CHECK(f.store.intake(f.q1, record(b, 7, 5, gpu0, host0, 100)) ==
+          intake_status::dropped_stale_record);  // duplicate
+    CHECK(f.store.intake(f.q1, record(b, 7, 3, gpu0, host0, 100)) ==
+          intake_status::dropped_stale_record);  // older
+    CHECK(f.store.find(7) == nullptr);
+    CHECK(f.store.outstanding_bytes(0) == 0);
+  }
+  SECTION("a strictly newer record reopens it as a fresh eligible candidate")
+  {
+    REQUIRE(f.store.intake(f.q1, record(b, 7, 6, gpu0, host0, 100)) == intake_status::inserted);
+    auto const job = f.store.take({7, gpu_t0, klass::A, 0});
+    REQUIRE(job.has_value());  // the new generation cleared the claim, so the charge succeeds
+    CHECK(f.store.outstanding_bytes(0) == store_fixture::charged(100));
+  }
+  SECTION("retire releases the tombstone's board watch")
+  {
+    f.store.retire_query(f.q1);
+    CHECK(f.budget.watched_count() == 0);
+  }
+}
+
 TEST_CASE("candidate_store: too_big bans the GPU at once", "[preload]")
 {
   store_fixture f;

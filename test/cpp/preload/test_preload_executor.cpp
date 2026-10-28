@@ -52,6 +52,7 @@
 #include <cuda/stream>
 #include <cuda_runtime_api.h>
 
+#include <absl/cleanup/cleanup.h>
 #include <cucascade/cuda/event.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
@@ -302,6 +303,17 @@ struct executor_fixture {
                                             .caps                     = caps});
     exec->enable_promotion_log_for_testing();
     if (start) { exec->start(); }
+  }
+
+  /// An RAII guard for a gated test: on any exit path (success, a failed REQUIRE, an exception),
+  /// it opens @p gate and stops/joins the executor while the gate is still alive, so no worker is
+  /// left blocked in @c promotion_gate::enter() when the gate is destroyed.
+  [[nodiscard]] auto arm_gate(promotion_gate& gate)
+  {
+    return absl::Cleanup{[this, &gate] {
+      gate.release();
+      if (exec) { exec->stop(); }
+    }};
   }
 
   /// Open query @p id in the lifecycle and in preload.
@@ -597,6 +609,7 @@ TEST_CASE_METHOD(executor_fixture,
   cfg.concurrent_preloads = 2;
   build(cfg);
   promotion_gate gate;
+  auto gate_guard = arm_gate(gate);
   exec->set_promotion_hook_for_testing([&](promotion_job const&) { gate.enter(); });
   auto const q     = open_query(1);
   auto const state = pipeline_state(priority(q, 1));
@@ -949,6 +962,7 @@ TEST_CASE_METHOD(executor_fixture,
   auto const batch = spilled(*host);
   push_task(pipeline_state(priority(q, 1)), {batch});
   promotion_gate gate;
+  auto gate_guard = arm_gate(gate);
   exec->set_promotion_hook_for_testing([&](promotion_job const&) { gate.enter(); });
 
   downgraded(q, record(batch));
@@ -993,6 +1007,7 @@ TEST_CASE_METHOD(executor_fixture, "preload executor: stop and destruction", "[p
     auto const batch = spilled(*host);
     push_task(pipeline_state(priority(q, 1)), {batch});
     promotion_gate gate;
+    auto gate_guard = arm_gate(gate);
     exec->set_promotion_hook_for_testing([&](promotion_job const&) { gate.enter(); });
     downgraded(q, record(batch));
     REQUIRE(gate.wait_entered(1));
@@ -1031,6 +1046,7 @@ TEST_CASE_METHOD(executor_fixture,
     cfg.max_batch_fraction    = inflight_fraction;
     build(cfg);
     promotion_gate gate;
+    auto gate_guard = arm_gate(gate);
     exec->set_promotion_hook_for_testing([&](promotion_job const&) { gate.enter(); });
     auto const q     = open_query(id);
     auto const state = pipeline_state(priority(q, 1));
@@ -1121,6 +1137,7 @@ TEST_CASE_METHOD(executor_fixture,
   auto const h2g   = spilled(*host);
   auto const d2g   = spilled(*disk);
   promotion_gate gate;
+  auto gate_guard = arm_gate(gate);
   std::atomic<bool> disk_started{false};
   exec->set_promotion_hook_for_testing([&](promotion_job const& job) {
     if (job.batch_id == h2g->get_batch_id()) {
@@ -1406,6 +1423,7 @@ TEST_CASE_METHOD(executor_fixture,
   SECTION("claim during the copy releases immediately; landing does not recharge")
   {
     promotion_gate gate;
+    auto gate_guard = arm_gate(gate);
     exec->set_promotion_hook_for_testing([&](promotion_job const&) { gate.enter(); });
     auto const batch = spilled(*host);
     push_task(pipeline_state(priority(q, 1)), {batch});
@@ -1419,6 +1437,27 @@ TEST_CASE_METHOD(executor_fixture,
     settle();
     CHECK(tier_of(*batch) == Tier::GPU);  // the copy still landed
     CHECK(budget->outstanding(0) == 0);   // landing did not recharge
+    CHECK(budget->claimed_releases() >= 1);
+  }
+
+  SECTION("claim after the conversion completes but before the outcome is installed")
+  {
+    promotion_gate gate;
+    auto gate_guard = arm_gate(gate);
+    // The post-convert hook runs once the conversion is done and before the outcome installs.
+    exec->set_post_convert_hook_for_testing([&](promotion_job const&) { gate.enter(); });
+    auto const batch = spilled(*host);
+    push_task(pipeline_state(priority(q, 1)), {batch});
+    downgraded(q, record(batch));
+    REQUIRE(gate.wait_entered(1));        // conversion complete, outcome not yet installed
+    REQUIRE(budget->outstanding(0) > 0);  // still charged from TAKE
+    std::array<std::uint64_t, 1> const ids{batch->get_batch_id()};
+    budget->claim(ids);
+    CHECK(budget->outstanding(0) == 0);  // released in exactly this window
+    gate.release();
+    settle();
+    CHECK(tier_of(*batch) == Tier::GPU);
+    CHECK(budget->outstanding(0) == 0);  // installing the outcome did not recharge
     CHECK(budget->claimed_releases() >= 1);
   }
 
@@ -1450,6 +1489,7 @@ TEST_CASE_METHOD(executor_fixture,
   cfg.max_batch_fraction       = 1.0;
   build(cfg);
   promotion_gate gate;
+  auto gate_guard = arm_gate(gate);
   exec->set_promotion_hook_for_testing([&](promotion_job const&) { gate.enter(); });
   auto const q     = open_query(1);
   auto const state = pipeline_state(priority(q, 1));
@@ -1583,6 +1623,7 @@ TEST_CASE_METHOD(executor_fixture,
   push_task(state, {first});
   push_task(state, {other});
   promotion_gate gate;
+  auto gate_guard = arm_gate(gate);
   exec->set_promotion_hook_for_testing([&](promotion_job const&) { gate.enter(); });
 
   downgraded(q, record(first));

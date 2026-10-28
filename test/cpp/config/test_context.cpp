@@ -3295,7 +3295,7 @@ TEST_CASE("SiriusContext per-stream GPU tracking disables device preloading but 
   SECTION("per-stream + budget + an explicit width still runs DISK->HOST staging")
   {
     // The real context decision must treat device preloading as off (per stream) yet keep the
-    // explicitly-enabled staging, rather than refusing to start (F2).
+    // explicitly-enabled staging, rather than refusing to start.
     auto ctx = init(/*per_stream=*/true,
                     "      concurrent_preloads: 2\n      device_preloading_budget: 0.2\n");
     REQUIRE(ctx->get_preload_executor() != nullptr);

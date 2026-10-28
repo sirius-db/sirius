@@ -361,7 +361,7 @@ std::vector<preload_stats> run_off_and_on(sirius::test::scratch_dir const& dir,
     auto const after_all = sirius::test::get_transparent_execution_stats(*db.con);
     CHECK(after_all.executions - before_all.executions == queries.size());
     CHECK(after_all.runtime_fallbacks == before_all.runtime_fallbacks);
-    // Device preloading released budget when claimed tasks were popped (R3). Only assert it when
+    // Device preloading released budget when claimed tasks were popped. Only assert it when
     // something was actually promoted onto a GPU (and so charged against the budget).
     auto const budget =
       sirius::test::get_registered_sirius_context(*db.con)->device_preload_budget_for_testing();
