@@ -213,6 +213,9 @@ set(TEST_SOURCES
     test/cpp/memory/test_multiple_blocks_allocation_accessor.cpp
     test/cpp/memory/test_topology_index.cpp
     test/cpp/operator/test_build_probe_scheduling.cpp
+    test/cpp/operator/test_build_probe_reclaim.cpp
+    test/cpp/operator/test_ungrouped_aggregate_empty_input.cpp
+    test/cpp/integration/test_gpu_execution_join_empty_sides.cpp
     test/cpp/operator/test_partition_placement.cpp
     test/cpp/operator/test_partition_exchange.cpp
     test/cpp/operator/test_cross_schedule.cpp

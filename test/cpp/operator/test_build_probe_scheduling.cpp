@@ -45,10 +45,10 @@
 #include <stdexcept>
 #include <string_view>
 
-using sirius::op::broadcast_slots_to_discard;
 using sirius::op::BUILD_HASH_TABLE_STATE;
 using sirius::op::build_probe_action;
 using sirius::op::build_probe_slot_view;
+using sirius::op::build_probe_slots_to_reclaim;
 using sirius::op::compute_hash_join_partition_strategy;
 using sirius::op::HASH_JOIN_MODE;
 using sirius::op::partition_placement;
@@ -706,48 +706,51 @@ TEST_CASE("select_build_probe_action - first ready build wins across many partit
 }
 
 //===----------------------------------------------------------------------===//
-// broadcast_slots_to_discard
+// build_probe_slots_to_reclaim
 //===----------------------------------------------------------------------===//
 
-TEST_CASE("broadcast_slots_to_discard - nothing is discarded until the probe side finishes",
-          "[build_probe]")
+TEST_CASE("build_probe_slots_to_reclaim waits for the probe producer", "[build_probe]")
 {
-  // Build-only slots exist, but probe may still deliver data — discard nothing yet.
-  auto const d = broadcast_slots_to_discard(
-    {
-      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false),
-      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false),
-    },
-    /*probe_finished=*/false);
-  REQUIRE(d.empty());
+  auto const candidates =
+    build_probe_slots_to_reclaim({slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false)}, false);
+  CHECK(candidates.empty());
 }
 
-TEST_CASE("broadcast_slots_to_discard - discards only NOT_BUILT slots with build but no probe",
-          "[build_probe]")
+TEST_CASE("build_probe_slots_to_reclaim selects every never-probed build", "[build_probe]")
 {
-  // p0: has probe -> will be built, keep.  p1: build-only -> discard.  p2: already BUILT -> keep.
-  // p3: build-only -> discard.  p4: no build batch at all -> nothing to discard.
-  auto const d = broadcast_slots_to_discard(
-    {
-      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, true),
-      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false),
-      slot(BUILD_HASH_TABLE_STATE::BUILT, false, false),
-      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false),
-      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, false, false),
-    },
-    /*probe_finished=*/true);
-  REQUIRE(d == std::vector<std::size_t>{1, 3});
+  auto const candidates =
+    build_probe_slots_to_reclaim({slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false),
+                                  slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false),
+                                  slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false)},
+                                 true);
+  CHECK(candidates == std::vector<std::size_t>{0, 1, 2});
 }
 
-TEST_CASE("broadcast_slots_to_discard - a DESTROYED slot is not rediscarded", "[build_probe]")
+TEST_CASE("build_probe_slots_to_reclaim preserves probe data and active slots", "[build_probe]")
 {
-  auto const d = broadcast_slots_to_discard(
-    {
-      slot(BUILD_HASH_TABLE_STATE::DESTROYED, false, false),
-      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false),
-    },
-    /*probe_finished=*/true);
-  REQUIRE(d == std::vector<std::size_t>{1});
+  auto const candidates =
+    build_probe_slots_to_reclaim({slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, true),
+                                  slot(BUILD_HASH_TABLE_STATE::SCHEDULING, true, false),
+                                  slot(BUILD_HASH_TABLE_STATE::SCHEDULED, true, false),
+                                  slot(BUILD_HASH_TABLE_STATE::BUILT, true, false),
+                                  slot(BUILD_HASH_TABLE_STATE::DESTROYED, true, false),
+                                  slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, false, false),
+                                  slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false)},
+                                 true);
+  CHECK(candidates == std::vector<std::size_t>{6});
+}
+
+TEST_CASE("build_probe_slots_to_reclaim handles a build arriving after probe closure",
+          "[build_probe]")
+{
+  std::vector<build_probe_slot_view> slots{slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, false, false),
+                                           slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false)};
+  CHECK(build_probe_slots_to_reclaim(slots, true) == std::vector<std::size_t>{1});
+  slots[1]                 = slot(BUILD_HASH_TABLE_STATE::DESTROYED, false, false);
+  slots[0].has_build_batch = true;
+  CHECK(build_probe_slots_to_reclaim(slots, true) == std::vector<std::size_t>{0});
+  slots[0] = slot(BUILD_HASH_TABLE_STATE::DESTROYED, false, false);
+  CHECK(build_probe_slots_to_reclaim(slots, true).empty());
 }
 
 //===----------------------------------------------------------------------===//
