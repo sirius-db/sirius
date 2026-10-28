@@ -23,6 +23,7 @@
 #include <cudf/transform.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/span.hpp>
+#include <cudf/version_config.hpp>
 
 #include <rmm/device_buffer.hpp>
 #include <rmm/device_uvector.hpp>
@@ -994,17 +995,11 @@ void apply_cached(application_result_state& result,
     // Both paths have resolved the residual's nulls into its values. The validity is freed in
     // stream order, after the work already submitted that reads it.
     if (result.conjunction->nullable()) {
-      auto clear_null_mask = [stream, mr]<typename Column>(Column& column) {
-        if constexpr (requires {
-                        column.set_null_mask(cuda::device_buffer<cudf::bitmask_type>{stream, mr},
-                                             0);
-                      }) {
-          column.set_null_mask(cuda::device_buffer<cudf::bitmask_type>{stream, mr}, 0);
-        } else {
-          column.set_null_mask(rmm::device_buffer{}, 0);
-        }
-      };
-      clear_null_mask(*result.conjunction);
+#if CUDF_VERSION_MAJOR > 26 || (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 12)
+      result.conjunction->set_null_mask(cuda::device_buffer<cudf::bitmask_type>{stream, mr}, 0);
+#else
+      result.conjunction->set_null_mask(rmm::device_buffer{}, 0);
+#endif
     }
     if (result.fused_rounds != 0) {
       // std::ranges::fill does not accept std::vector<bool>.
