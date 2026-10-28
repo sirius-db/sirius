@@ -143,19 +143,18 @@ SELECT count(DISTINCT (a,b)) FILTER (WHERE a<2) FROM t6;
 ----
 2
 
-# 10. Cases 1-2 again with a nullable aggregate input: NULLIF sends x=500 (100 rows) to NULL,
-# crossing the filter mask with pre-existing validity.
+# 10. NULLIF makes xn NULL at x=50 (100 rows), which still pass the filter on the original x.
+# count(*) includes those rows, while count(xn) and the other aggregates skip their NULL inputs.
 statement ok
-CREATE TABLE tn AS SELECT NULLIF(x, 500) x FROM t;
+CREATE TABLE tn AS SELECT x, NULLIF(x, 50) xn FROM t;
 
 query IIIIIR
-SELECT count(*) FILTER (WHERE x<100), count(x) FILTER (WHERE x<100), sum(x) FILTER (WHERE x<100), min(x) FILTER (WHERE x<100), max(x) FILTER (WHERE x<100), avg(x) FILTER (WHERE x<100) FROM tn;
+SELECT count(*) FILTER (WHERE x<100), count(xn) FILTER (WHERE x<100), sum(xn) FILTER (WHERE x<100), min(xn) FILTER (WHERE x<100), max(xn) FILTER (WHERE x<100), avg(xn) FILTER (WHERE x<100) FROM tn;
 ----
-10000	10000	495000	0	99	49.5
+10000	9900	490000	0	99	49.494949494949495
 
 query IIII
-SELECT x%2 g, count(*) FILTER (WHERE x<100), sum(x) FILTER (WHERE x<100), count(*) FROM tn GROUP BY g ORDER BY g;
+SELECT x%2 g, count(*) FILTER (WHERE x<100), sum(xn) FILTER (WHERE x<100), count(*) FROM tn GROUP BY g ORDER BY g;
 ----
-0	5000	245000	49900
+0	5000	240000	50000
 1	5000	250000	50000
-NULL	0	NULL	100

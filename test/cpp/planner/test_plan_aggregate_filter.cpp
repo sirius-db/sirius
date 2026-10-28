@@ -42,6 +42,7 @@
 #include <duckdb/main/settings.hpp>
 #include <duckdb/optimizer/optimizer.hpp>
 #include <duckdb/parser/parser.hpp>
+#include <duckdb/planner/bound_result_modifier.hpp>
 #include <duckdb/planner/expression/bound_aggregate_expression.hpp>
 #include <duckdb/planner/expression/bound_comparison_expression.hpp>
 #include <duckdb/planner/expression/bound_constant_expression.hpp>
@@ -100,7 +101,10 @@ class scoped_temp_db_path {
 /// test instead of silently skipping it -- and so REQUIRE_THROWS_AS can assert the
 /// NotImplementedException the FILTER gate raises for rejected shapes.
 duckdb::unique_ptr<sirius_physical_operator> generate_sirius_plan(
-  Connection& con, const std::string& query, std::function<void(LogicalOperator&)> customize = {})
+  Connection& con,
+  const std::string& query,
+  std::function<void(LogicalOperator&)> customize = {},
+  bool enable_common_subexpressions               = false)
 {
   auto& context = *con.context;
 
@@ -108,7 +112,11 @@ duckdb::unique_ptr<sirius_physical_operator> generate_sirius_plan(
   auto& disabled         = DBConfig::GetConfig(context).options.disabled_optimizers;
   disabled.insert(OptimizerType::IN_CLAUSE);
   disabled.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
-  disabled.insert(OptimizerType::COMMON_SUBEXPRESSIONS);
+  if (enable_common_subexpressions) {
+    disabled.erase(OptimizerType::COMMON_SUBEXPRESSIONS);
+  } else {
+    disabled.insert(OptimizerType::COMMON_SUBEXPRESSIONS);
+  }
   disabled.insert(OptimizerType::COMMON_AGGREGATE);
   disabled.insert(OptimizerType::AGGREGATE_FUNCTION_REWRITER);
 
@@ -292,6 +300,45 @@ TEST_CASE_METHOD(plan_aggregate_filter_fixture,
 }
 
 TEST_CASE_METHOD(plan_aggregate_filter_fixture,
+                 "aggregate filter - ordered FILTER is rejected before child planning",
+                 "[aggregate_filter][isolated_context]")
+{
+  for (bool grouped : {false, true}) {
+    for (bool filtered : {false, true}) {
+      CAPTURE(grouped, filtered);
+      auto const query = std::string("SELECT ") + (grouped ? "id % 2 AS g, " : "") + "sum(val)" +
+                         (filtered ? " FILTER (WHERE val < 5)" : "") + " FROM events" +
+                         (grouped ? " GROUP BY g" : "");
+      auto customize = [](LogicalOperator& root) {
+        auto* op = &root;
+        while (op->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+          REQUIRE(op->children.size() == 1);
+          op = op->children[0].get();
+        }
+        REQUIRE(op->expressions.size() == 1);
+        auto& aggregate = op->expressions[0]->Cast<BoundAggregateExpression>();
+        REQUIRE(aggregate.GetChildren().size() == 1);
+
+        // Add ordering after optimization so DuckDB cannot remove it before the support check.
+        auto orders = duckdb::make_uniq<BoundOrderModifier>();
+        orders->orders.emplace_back(
+          OrderType::ASCENDING, OrderByNullType::NULLS_LAST, aggregate.GetChildren()[0]->Copy());
+        aggregate.GetOrderBysMutable() = std::move(orders);
+
+        // The child must only be reached by the unfiltered control, which bypasses the FILTER gate.
+        REQUIRE(op->children.size() == 1);
+        op->children[0]->type = LogicalOperatorType::LOGICAL_INVALID;
+      };
+      REQUIRE_THROWS_MATCHES(
+        generate_sirius_plan(*con, query, customize),
+        duckdb::NotImplementedException,
+        Catch::Matchers::MessageMatches(Catch::Matchers::ContainsSubstring(
+          filtered ? "Aggregate FILTER not supported" : "Unimplemented logical operator type")));
+    }
+  }
+}
+
+TEST_CASE_METHOD(plan_aggregate_filter_fixture,
                  "aggregate filter - identical masked values share one column across functions",
                  "[aggregate_filter][isolated_context]")
 {
@@ -357,6 +404,194 @@ TEST_CASE_METHOD(plan_aggregate_filter_fixture,
 }
 
 TEST_CASE_METHOD(plan_aggregate_filter_fixture,
+                 "aggregate filter - complete predicates share one column across different inputs",
+                 "[aggregate_filter][isolated_context]")
+{
+  for (bool grouped : {false, true}) {
+    CAPTURE(grouped);
+    auto plan =
+      generate_sirius_plan(*con,
+                           std::string("SELECT ") + (grouped ? "id AS g, " : "") +
+                             "min(val) FILTER (WHERE id < 50), max(id) FILTER (WHERE id < 50), "
+                             "count(*) FILTER (WHERE id < 50), "
+                             "min(CAST(val AS DOUBLE)) FILTER (WHERE id >= 50), "
+                             "max(id) FILTER (WHERE id >= 50), count(val) FILTER (WHERE id >= 50), "
+                             "sum(id), min(CASE WHEN id < 50 THEN val ELSE NULL END) FROM events" +
+                             (grouped ? " GROUP BY g" : ""));
+    auto* aggregate = find_first(plan.get(),
+                                 grouped ? SiriusPhysicalOperatorType::HASH_GROUP_BY
+                                         : SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE);
+    REQUIRE(aggregate);
+    auto* projection = find_first(aggregate, SiriusPhysicalOperatorType::PROJECTION);
+    REQUIRE(projection);
+    auto const& masks = projection->Cast<sirius::op::sirius_physical_projection>();
+    REQUIRE(masks.children.size() == 1);
+    REQUIRE(masks.children[0]->type == SiriusPhysicalOperatorType::PROJECTION);
+    auto const& predicates = masks.children[0]->Cast<sirius::op::sirius_physical_projection>();
+    REQUIRE(predicates.children.size() == 1);
+    auto const input_width = predicates.children[0]->types.size();
+    REQUIRE(predicates.select_list.size() == input_width + 2);
+    REQUIRE(predicates.types.size() == input_width + 2);
+    for (std::size_t i = 0; i < input_width; ++i) {
+      REQUIRE(predicates.select_list[i]->holds<sirius::ast::reference>());
+      CHECK(predicates.select_list[i]->get<sirius::ast::reference>().column_index == i);
+      CHECK(predicates.types[i] == predicates.children[0]->types[i]);
+      CHECK(predicates.select_list[i]->return_type() == predicates.types[i]);
+    }
+    for (std::size_t i = input_width; i < input_width + 2; ++i) {
+      CHECK(predicates.select_list[i]->holds<sirius::ast::comparison>());
+      CHECK(predicates.types[i].id() == sirius::type_id::BOOLEAN);
+    }
+
+    auto const offset = grouped ? 1 : 0;
+    REQUIRE(masks.select_list.size() == offset + 8);
+    for (std::size_t i = 0; i < 6; ++i) {
+      auto const& expression = *masks.select_list[offset + i];
+      REQUIRE(expression.holds<sirius::ast::case_expr>());
+      auto const& mask = expression.get<sirius::ast::case_expr>();
+      REQUIRE(mask.cases.size() == 1);
+      REQUIRE(mask.cases[0].when_->holds<sirius::ast::reference>());
+      CHECK(mask.cases[0].when_->get<sirius::ast::reference>().column_index ==
+            input_width + (i < 3 ? 0 : 1));
+      CHECK(mask.cases[0].when_->return_type().id() == sirius::type_id::BOOLEAN);
+    }
+    CHECK(masks.select_list[offset + 3]->return_type().id() == sirius::type_id::DOUBLE);
+    CHECK(masks.select_list[offset + 6]->holds<sirius::ast::reference>());
+    auto const& user_case = masks.select_list[offset + 7]->get<sirius::ast::case_expr>();
+    CHECK(user_case.cases[0].when_->holds<sirius::ast::comparison>());
+    if (grouped) {
+      REQUIRE(masks.select_list[0]->holds<sirius::ast::reference>());
+      CHECK(masks.select_list[0]->get<sirius::ast::reference>().column_index < input_width);
+    } else {
+      auto const& aggs =
+        aggregate->Cast<sirius::op::sirius_physical_ungrouped_aggregate>().aggregates;
+      REQUIRE(aggs.size() == 8);
+      for (std::size_t i = 0; i < aggs.size(); ++i) {
+        CHECK(aggs[i]
+                ->get<sirius::ast::aggregate>()
+                .arguments()[0]
+                ->get<sirius::ast::reference>()
+                .column_index == i);
+      }
+      CHECK(aggs[2]->get<sirius::ast::aggregate>().function() == sirius::aggregate_id::count);
+    }
+  }
+}
+
+TEST_CASE_METHOD(plan_aggregate_filter_fixture,
+                 "aggregate filter - DuckDB shared predicates need no additional stage",
+                 "[aggregate_filter][isolated_context]")
+{
+  auto plan = generate_sirius_plan(
+    *con,
+    "SELECT min(val) FILTER (WHERE id < 50), max(id) FILTER (WHERE id < 50), "
+    "count(*) FILTER (WHERE id < 50) FROM events",
+    [](LogicalOperator& root) {
+      visit_aggregates(root, [](BoundAggregateExpression& aggregate) {
+        REQUIRE(aggregate.GetFilter());
+        CHECK(aggregate.GetFilter()->GetExpressionClass() == ExpressionClass::BOUND_REF);
+      });
+    },
+    true);
+  auto* aggregate = find_first(plan.get(), SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE);
+  REQUIRE(aggregate);
+  auto* projection = find_first(aggregate, SiriusPhysicalOperatorType::PROJECTION);
+  REQUIRE(projection);
+  auto const& masks = projection->Cast<sirius::op::sirius_physical_projection>();
+  REQUIRE(masks.select_list.size() == 3);
+  REQUIRE(masks.children.size() == 1);
+  REQUIRE(masks.children[0]->type == SiriusPhysicalOperatorType::PROJECTION);
+  auto const& predicates = masks.children[0]->Cast<sirius::op::sirius_physical_projection>();
+  std::size_t computed_predicates = 0;
+  for (auto const& expression : predicates.select_list) {
+    if (expression->holds<sirius::ast::comparison>()) { ++computed_predicates; }
+  }
+  CHECK(computed_predicates == 1);
+  REQUIRE(predicates.children.size() == 1);
+  CHECK(predicates.children[0]->type != SiriusPhysicalOperatorType::PROJECTION);
+  for (auto const& expression : masks.select_list) {
+    auto const& mask = expression->get<sirius::ast::case_expr>();
+    CHECK(mask.cases[0].when_->holds<sirius::ast::reference>());
+  }
+}
+
+TEST_CASE_METHOD(plan_aggregate_filter_fixture,
+                 "aggregate filter - a reused whole mask needs no predicate projection",
+                 "[aggregate_filter][isolated_context]")
+{
+  auto plan = generate_sirius_plan(
+    *con, "SELECT min(val) FILTER (WHERE id < 50), max(val) FILTER (WHERE id < 50) FROM events");
+  auto* aggregate = find_first(plan.get(), SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE);
+  REQUIRE(aggregate);
+  auto* projection = find_first(aggregate, SiriusPhysicalOperatorType::PROJECTION);
+  REQUIRE(projection);
+  auto const& masks = projection->Cast<sirius::op::sirius_physical_projection>();
+  REQUIRE(masks.select_list.size() == 1);
+  auto const& mask = masks.select_list[0]->get<sirius::ast::case_expr>();
+  CHECK(mask.cases[0].when_->holds<sirius::ast::comparison>());
+  REQUIRE(masks.children.size() == 1);
+  CHECK(masks.children[0]->type != SiriusPhysicalOperatorType::PROJECTION);
+}
+
+TEST_CASE_METHOD(
+  plan_aggregate_filter_fixture,
+  "aggregate filter - different complete predicates retain their evaluation boundaries",
+  "[aggregate_filter][isolated_context]")
+{
+  auto plan       = generate_sirius_plan(*con,
+                                   "SELECT min(val) FILTER (WHERE id < 50 AND val > 1), "
+                                         "max(id) FILTER (WHERE id < 50 OR val > 2) FROM events");
+  auto* aggregate = find_first(plan.get(), SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE);
+  REQUIRE(aggregate);
+  auto* projection = find_first(aggregate, SiriusPhysicalOperatorType::PROJECTION);
+  REQUIRE(projection);
+  auto const& masks = projection->Cast<sirius::op::sirius_physical_projection>();
+  REQUIRE(masks.select_list.size() == 2);
+  for (auto const& expression : masks.select_list) {
+    auto const& mask = expression->get<sirius::ast::case_expr>();
+    CHECK(mask.cases[0].when_->holds<sirius::ast::conjunction>());
+  }
+  REQUIRE(masks.children.size() == 1);
+  CHECK(masks.children[0]->type != SiriusPhysicalOperatorType::PROJECTION);
+}
+
+TEST_CASE_METHOD(plan_aggregate_filter_fixture,
+                 "aggregate filter - trivial predicates need no extra projection",
+                 "[aggregate_filter][isolated_context]")
+{
+  auto created = con->Query("CREATE TABLE flags AS SELECT id, val, id < 50 AS keep FROM events");
+  REQUIRE_FALSE(created->HasError());
+  for (bool constant : {false, true}) {
+    CAPTURE(constant);
+    auto plan =
+      generate_sirius_plan(*con,
+                           "SELECT min(val) FILTER (WHERE keep), max(id) FILTER (WHERE keep), "
+                           "count(*) FILTER (WHERE keep) FROM flags",
+                           [&](LogicalOperator& root) {
+                             if (constant) {
+                               visit_aggregates(root, [](BoundAggregateExpression& aggregate) {
+                                 aggregate.GetFilterMutable() =
+                                   duckdb::make_uniq<BoundConstantExpression>(Value::BOOLEAN(true));
+                               });
+                             }
+                           });
+    auto* aggregate = find_first(plan.get(), SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE);
+    REQUIRE(aggregate);
+    auto* projection = find_first(aggregate, SiriusPhysicalOperatorType::PROJECTION);
+    REQUIRE(projection);
+    auto const& masks = projection->Cast<sirius::op::sirius_physical_projection>();
+    REQUIRE(masks.select_list.size() == 3);
+    for (auto const& expression : masks.select_list) {
+      auto const& mask = expression->get<sirius::ast::case_expr>();
+      CHECK(mask.cases[0].when_->holds<sirius::ast::constant>() == constant);
+      CHECK(mask.cases[0].when_->holds<sirius::ast::reference>() == !constant);
+    }
+    REQUIRE(masks.children.size() == 1);
+    CHECK(masks.children[0]->type != SiriusPhysicalOperatorType::PROJECTION);
+  }
+}
+
+TEST_CASE_METHOD(plan_aggregate_filter_fixture,
                  "aggregate filter - unsafe value and predicate trees are never shared",
                  "[aggregate_filter][isolated_context]")
 {
@@ -388,7 +623,14 @@ TEST_CASE_METHOD(plan_aggregate_filter_fixture,
       REQUIRE(aggregate);
       auto* projection = find_first(aggregate, SiriusPhysicalOperatorType::PROJECTION);
       REQUIRE(projection);
-      CHECK(count_case_entries(projection->Cast<sirius::op::sirius_physical_projection>()) == 2);
+      auto const& masks = projection->Cast<sirius::op::sirius_physical_projection>();
+      CHECK(count_case_entries(masks) == 2);
+      for (auto const& expression : masks.select_list) {
+        auto const& mask = expression->get<sirius::ast::case_expr>();
+        CHECK(mask.cases[0].when_->holds<sirius::ast::reference>() == !predicate);
+      }
+      REQUIRE(masks.children.size() == 1);
+      CHECK((masks.children[0]->type == SiriusPhysicalOperatorType::PROJECTION) == !predicate);
       auto const& aggs =
         aggregate->Cast<sirius::op::sirius_physical_ungrouped_aggregate>().aggregates;
       REQUIRE(aggs.size() == 2);
@@ -403,6 +645,34 @@ TEST_CASE_METHOD(plan_aggregate_filter_fixture,
                                  .column_index);
     }
   }
+}
+
+TEST_CASE_METHOD(plan_aggregate_filter_fixture,
+                 "aggregate filter - an unsupported shared predicate still declines translation",
+                 "[aggregate_filter][isolated_context]")
+{
+  REQUIRE_THROWS_AS(
+    generate_sirius_plan(
+      *con,
+      "SELECT min(val) FILTER (WHERE id < 50), max(id) FILTER (WHERE id < 50) FROM events",
+      [](LogicalOperator& root) {
+        duckdb::unique_ptr<Expression> predicate;
+        visit_aggregates(root, [&](BoundAggregateExpression& aggregate) {
+          if (!predicate) {
+            ScalarFunction function(Identifier("unsupported_filter_predicate"),
+                                    duckdb::vector<LogicalType>{LogicalType::INTEGER},
+                                    LogicalType::BOOLEAN,
+                                    nullptr);
+            function.SetStability(FunctionStability::CONSISTENT);
+            duckdb::vector<duckdb::unique_ptr<Expression>> arguments;
+            arguments.push_back(aggregate.GetChildren()[0]->Copy());
+            predicate = duckdb::make_uniq<BoundFunctionExpression>(
+              BoundScalarFunction(function), std::move(arguments), nullptr);
+          }
+          aggregate.GetFilterMutable() = predicate->Copy();
+        });
+      }),
+    duckdb::NotImplementedException);
 }
 
 TEST_CASE_METHOD(plan_aggregate_filter_fixture,

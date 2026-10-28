@@ -24,6 +24,7 @@
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <utils/gpu_execution_fixture.hpp>
+#include <utils/scoped_sirius_setting.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
 
 #include <string>
@@ -87,12 +88,12 @@ TEST_CASE_METHOD(AggFilterFixture,
                  "gpu_execution ungrouped FILTER on all supported aggregates",
                  "[integration][gpu_execution][aggregate][aggregate_filter]")
 {
-  // Every supported function with the same filter, plus unfiltered aggregates in the same
-  // query to prove the mask stays local to the filtered inputs.
+  // The x=50 rows pass with NULL xn, so count(*) includes them and count(xn) skips them. Unfiltered
+  // aggregates prove the mask stays local to the filtered inputs.
   compare_gpu_vs_cpu(
-    "SELECT count(*) FILTER (WHERE x < 50), count(xn) FILTER (WHERE x < 50),"
-    "       sum(x) FILTER (WHERE x < 50), min(x) FILTER (WHERE x < 50),"
-    "       max(x) FILTER (WHERE x < 50), avg(x) FILTER (WHERE x < 50),"
+    "SELECT count(*) FILTER (WHERE x <= 50), count(xn) FILTER (WHERE x <= 50),"
+    "       sum(x) FILTER (WHERE x <= 50), min(x) FILTER (WHERE x <= 50),"
+    "       max(x) FILTER (WHERE x <= 50), avg(x) FILTER (WHERE x <= 50),"
     "       count(*), sum(x) "
     "FROM agg_f");
 }
@@ -102,9 +103,9 @@ TEST_CASE_METHOD(AggFilterFixture,
                  "[integration][gpu_execution][aggregate][aggregate_filter]")
 {
   compare_gpu_vs_cpu(
-    "SELECT g, count(*) FILTER (WHERE x < 50), count(xn) FILTER (WHERE x < 50),"
-    "       sum(x) FILTER (WHERE x < 50), min(x) FILTER (WHERE x < 50),"
-    "       max(x) FILTER (WHERE x < 50), avg(x) FILTER (WHERE x < 50),"
+    "SELECT g, count(*) FILTER (WHERE x <= 50), count(xn) FILTER (WHERE x <= 50),"
+    "       sum(x) FILTER (WHERE x <= 50), min(x) FILTER (WHERE x <= 50),"
+    "       max(x) FILTER (WHERE x <= 50), avg(x) FILTER (WHERE x <= 50),"
     "       count(*) "
     "FROM agg_f GROUP BY g");
 }
@@ -192,6 +193,38 @@ TEST_CASE_METHOD(AggFilterFixture,
                        "count(v) FILTER (WHERE keep), count(*) FILTER (WHERE keep), "
                        "count(v) FILTER (WHERE NOT keep), sum(v) FILTER (WHERE NOT keep) "
                        "FROM agg_nulls" +
+                       (grouped ? " GROUP BY g" : ""));
+  }
+}
+
+TEST_CASE_METHOD(AggFilterFixture,
+                 "gpu_execution shared FILTER predicates preserve NULL inputs and empty groups",
+                 "[integration][gpu_execution][aggregate][aggregate_filter]")
+{
+  auto current = con->Query("SELECT current_setting('disabled_optimizers')");
+  REQUIRE(current);
+  REQUIRE_FALSE(current->HasError());
+  auto disabled = current->Collection().GetValue(0, 0).ToString();
+  if (!disabled.empty()) { disabled += ","; }
+  disabled += "common_subexpressions";
+  // Exercise Sirius predicate sharing even when DuckDB has not already projected the predicate.
+  sirius::test::scoped_sirius_setting guard(
+    *con, "disabled_optimizers", std::string_view(disabled));
+
+  for (bool grouped : {false, true}) {
+    for (auto const* table : {"agg_nulls", "agg_empty"}) {
+      compare_gpu_vs_cpu(
+        std::string("SELECT ") + (grouped ? "g, " : "") +
+        "sum(v) FILTER (WHERE keep OR v < 0), min(g) FILTER (WHERE keep OR v < 0), "
+        "count(v) FILTER (WHERE keep OR v < 0), count(*) FILTER (WHERE keep OR v < 0), "
+        "sum(v) FILTER (WHERE NOT keep), count(*) FILTER (WHERE NOT keep), count(*), sum(v) "
+        "FROM " +
+        table + (grouped ? " GROUP BY g" : ""));
+    }
+    compare_gpu_vs_cpu(std::string("SELECT ") + (grouped ? "g, " : "") +
+                       "sum(d) FILTER (WHERE x <= 50), min(s) FILTER (WHERE x <= 50), "
+                       "max(xn) FILTER (WHERE x <= 50), count(xn) FILTER (WHERE x <= 50), "
+                       "count(*) FILTER (WHERE x <= 50), sum(x) FROM agg_f" +
                        (grouped ? " GROUP BY g" : ""));
   }
 }

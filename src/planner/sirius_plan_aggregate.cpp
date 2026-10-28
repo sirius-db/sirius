@@ -82,13 +82,13 @@ duckdb::vector<std::unique_ptr<sirius::ast::node>> translate_expressions(
   return out;
 }
 
-// Policy gate for the aggregate FILTER clause. Mask-to-null lowering is exact only for
-// NULL-skipping aggregates, so any other filtered shape is refused here and the query takes the
-// transparent CPU fallback.
+// Policy gate for the aggregate FILTER clause. Mask-to-null lowering supports unordered
+// NULL-skipping aggregates only. Reject ORDER BY before child planning and sorted binding can
+// append sort keys to the aggregate arguments.
 void throw_if_aggregate_filter_unsupported(duckdb::BoundAggregateExpression const& aggr)
 {
   auto const id = sirius::from_duckdb_aggregate_name(aggr.Function().GetName().GetIdentifierName());
-  bool supported = id.has_value() && !aggr.IsDistinct();
+  bool supported = id.has_value() && !aggr.IsDistinct() && !aggr.GetOrderBys();
   if (supported) {
     switch (*id) {
       case sirius::aggregate_id::count_star: supported = aggr.GetChildren().empty(); break;
@@ -119,6 +119,7 @@ duckdb::unique_ptr<duckdb::Expression> make_filter_mask(
     std::move(filter), std::move(value), std::move(null_else));
 }
 
+// Recurse through expression tree at root @p expression to find any ordered functions
 bool has_ordered_function(duckdb::Expression const& expression)
 {
   if (expression.GetExpressionClass() == duckdb::ExpressionClass::BOUND_FUNCTION &&
@@ -130,6 +131,74 @@ bool has_ordered_function(duckdb::Expression const& expression)
     ordered = ordered || has_ordered_function(child);
   });
   return ordered;
+}
+
+bool can_share_expression(duckdb::Expression const& expression)
+{
+  return expression.IsConsistent() && !expression.IsVolatile() && !has_ordered_function(expression);
+}
+
+// Only generated mask predicates are considered here. Group expressions and user CASE inputs retain
+// their evaluation boundaries. Discover matches before changing any borrowed expression-map keys.
+duckdb::unique_ptr<sirius::op::sirius_physical_operator> project_shared_filter_predicates(
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> child,
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>& expressions,
+  duckdb::vector<duckdb::idx_t> const& masked_columns)
+{
+  // Deduplicate the mask predicates into @c groups
+  duckdb::expression_map_t<duckdb::idx_t> predicates;
+  duckdb::vector<duckdb::vector<duckdb::idx_t>> groups;
+  for (auto const column : masked_columns) {
+    auto const& mask = expressions[column]->Cast<duckdb::BoundCaseExpression>();
+    D_ASSERT(mask.CaseChecks().size() == 1);
+    auto const& predicate = *mask.CaseChecks()[0].when_expr;
+    if (predicate.GetExpressionClass() == duckdb::ExpressionClass::BOUND_CONSTANT ||
+        predicate.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF ||
+        !can_share_expression(predicate)) {
+      continue;
+    }
+    auto const [entry, inserted] = predicates.try_emplace(predicate, groups.size());
+    if (inserted) { groups.emplace_back(); }
+    groups[entry->second].push_back(column);
+  }
+  predicates.clear();
+
+  auto const input_width = child->types.size();
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> shared_predicates;
+  for (auto const& group : groups) {
+    if (group.size() < 2) { continue; }
+    auto const index = input_width + shared_predicates.size();
+    auto& first      = expressions[group[0]]->Cast<duckdb::BoundCaseExpression>();
+    shared_predicates.push_back(std::move(first.CaseChecksMutable()[0].when_expr));
+    for (auto const column : group) {
+      auto& mask = expressions[column]->Cast<duckdb::BoundCaseExpression>();
+      mask.CaseChecksMutable()[0].when_expr =
+        duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::BOOLEAN, index);
+    }
+  }
+  if (shared_predicates.empty()) { return child; }
+
+  auto types = child->types;
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> projected;
+  projected.reserve(input_width + shared_predicates.size());
+  for (std::size_t index = 0; index < input_width; ++index) {
+    projected.push_back(std::make_unique<sirius::ast::node>(
+      sirius::ast::reference{static_cast<uint32_t>(index), types[index]}));
+  }
+  for (auto& predicate : translate_expressions(std::move(shared_predicates))) {
+    types.push_back(sirius::logical_type::make(sirius::type_id::BOOLEAN));
+    projected.push_back(std::move(predicate));
+  }
+  auto const estimated_cardinality = child->estimated_cardinality;
+  return push_projection(
+    std::move(child), std::move(types), std::move(projected), estimated_cardinality);
+}
+
+duckdb::AggregateFunctionCatalogEntry& builtin_count_entry(duckdb::ClientContext& context)
+{
+  auto& catalog = duckdb::Catalog::GetSystemCatalog(context);
+  return catalog.GetEntry<duckdb::AggregateFunctionCatalogEntry>(
+    context, duckdb::QualifiedName(catalog.GetName(), DEFAULT_SCHEMA, "count"));
 }
 
 // Hoist groups and aggregate inputs, consuming every supported FILTER into a nullable CASE input.
@@ -145,16 +214,12 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> extract_aggregate_expre
 {
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions;
   duckdb::vector<duckdb::LogicalType> types;
+  duckdb::vector<duckdb::idx_t> masked_columns;
   // Keys borrow immutable heap nodes owned by expressions; moving their unique_ptrs does not move
   // the nodes. Clear the map before translation drains those owners.
   duckdb::expression_map_t<duckdb::idx_t> masked_inputs;
   auto project_input = [&](duckdb::unique_ptr<duckdb::Expression> expression, bool masked) {
-    // clang-format off
-    bool const shareable = masked &&
-                           expression->IsConsistent() &&
-                           !expression->IsVolatile() &&
-                           !has_ordered_function(*expression);
-    // clang-format on
+    bool const shareable = masked && can_share_expression(*expression);
     if (shareable) {
       auto const found = masked_inputs.find(*expression);
       if (found != masked_inputs.end()) { return found->second; }
@@ -162,6 +227,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> extract_aggregate_expre
     auto const index = expressions.size();
     types.push_back(expression->GetReturnType());
     expressions.push_back(std::move(expression));
+    if (masked) { masked_columns.push_back(index); }
     if (shareable) { masked_inputs.emplace(*expressions.back(), index); }
     return index;
   };
@@ -203,9 +269,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> extract_aggregate_expre
       duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> arguments;
       arguments.push_back(
         duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::BOOLEAN, index));
-      auto& count =
-        duckdb::Catalog::GetSystemCatalog(context).GetEntry<duckdb::AggregateFunctionCatalogEntry>(
-          context, duckdb::QualifiedName("", DEFAULT_SCHEMA, "count"));
+      auto& count = builtin_count_entry(context);
       auto function =
         count.functions.GetFunctionByArguments(context, {duckdb::LogicalType::BOOLEAN});
       duckdb::FunctionBinder binder(context);
@@ -217,6 +281,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> extract_aggregate_expre
   }
   masked_inputs.clear();
   if (expressions.empty()) { return child; }
+  child = project_shared_filter_predicates(std::move(child), expressions, masked_columns);
   auto const estimated_cardinality = child->estimated_cardinality;
   return push_projection(std::move(child),
                          sirius::from_duckdb_vec(types),
@@ -344,11 +409,8 @@ static bool is_host_builtin_count(duckdb::ClientContext& context,
                                   duckdb::BoundAggregateFunction const& function,
                                   std::size_t arity)
 {
-  auto const& overloads =
-    duckdb::Catalog::GetSystemCatalog(context)
-      .GetEntry<duckdb::AggregateFunctionCatalogEntry>(context, DEFAULT_SCHEMA, "count")
-      .functions.functions;
-  auto const canonical = std::ranges::find_if(overloads, [arity](auto const& candidate) {
+  auto const& overloads = builtin_count_entry(context).functions.functions;
+  auto const canonical  = std::ranges::find_if(overloads, [arity](auto const& candidate) {
     return candidate->GetSignature().GetParameters().size() == arity;
   });
   return canonical != overloads.end() && function.GetCallbacks() == (*canonical)->GetCallbacks();
