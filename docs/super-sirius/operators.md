@@ -249,6 +249,9 @@ Joining each build batch against each probe batch and unioning the results is on
 
 **Empty-opposite side (orphan tasks).** When one side is a genuinely empty table, its concat emits *zero* batches. The surviving side's batches then have nothing to pair with, so once both producers finish, `next_cross_schedule_orphan` claims each survivor and `get_next_task_input_data` **synthesizes an empty opposite batch** for it (`sirius::make_empty_table` from the absent child's output types, built on the survivor's device) and returns an ordinary two-batch task. `execute()` then runs the normal join dispatch unchanged, so cuDF NULL-pads the survivor for LEFT/RIGHT/OUTER/ANTI and yields zero rows for INNER/SEMI. Popping the survivor also drains the repository, so the pipeline completes instead of hanging. FULL OUTER and RIGHT-family joins are the reachable cases (they always run STANDARD); small-build INNER/LEFT/SEMI/ANTI take BUILD_PROBE, which handles an empty side separately.
 
+For BUILD_PROBE, a closed zero-batch probe reclaims every never-probed build slot. The unused GPU build is released on its owning device; HOST/DISK builds are released directly without uploading them or constructing a hash table. The join can finish without emitting any batch. Downstream ungrouped aggregate finalization owns the empty-input result. MARK pre-sizing and empty-build semantics continue through the normal MARK paths.
+
+
 The following table summarizes, per join type, what concat folds, which side streams under this scheme, and the partition / broadcast / mode support:
 
 | JoinType | concat fold (whole side) | Streams multi-batch | batch×batch + union | Multi-partition | Broadcast | Supported modes |
@@ -534,6 +537,8 @@ Merges grouped aggregate results from multiple partitions. Drains one partition 
 **File:** `src/op/sirius_physical_ungrouped_aggregate_merge.hpp`
 
 Merges ungrouped aggregate results from multiple partitions.
+
+An empty input may contain zero batches or a batch with zero rows. After its producer finishes, the merge schedules exactly one task even if no partial aggregates arrived. With no batches, `input_free_operator_data` captures the task reservation's GPU space and the merge constructs one final row: COUNT variants return zero, and the other supported aggregates return typed NULLs. Normal input still merges all partials in one task. Pending finalization keeps the source non-exhausted until its task descriptor is handed out; ordinary task counters then keep execution and retries in flight. Grouped aggregates do not synthesize a group for empty input.
 
 ### `sirius_physical_top_n_merge` — `MERGE_TOP_N`
 **File:** `src/op/sirius_physical_top_n_merge.hpp`

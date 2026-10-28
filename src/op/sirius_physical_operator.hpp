@@ -112,7 +112,7 @@ enum class operator_data_type : uint8_t {
   PIPELINEABLE,
   PARTITIONED,
   GPU_SCAN,
-  GPU_VALUES,
+  INPUT_FREE,
 };
 
 /**

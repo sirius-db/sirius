@@ -18,6 +18,7 @@
 
 #include "exec/config.hpp"
 #include "log/logging.hpp"
+#include "memory/size_arithmetic.hpp"
 #include "yaml_reader.hpp"
 
 #include <cuda_runtime_api.h>
@@ -992,12 +993,23 @@ try {
 
   const auto defaults =
     operator_defaults_for(settings._memory_space_configs, impl_->use_effective_gpu_capacity);
+  auto const is_explicit = [&](uint64_t operator_params::* member) {
+    return std::find(impl_->explicit_batch_settings.begin(),
+                     impl_->explicit_batch_settings.end(),
+                     member) != impl_->explicit_batch_settings.end();
+  };
   for (const auto& setting : batch_settings) {
-    if (std::find(impl_->explicit_batch_settings.begin(),
-                  impl_->explicit_batch_settings.end(),
-                  setting.member) == impl_->explicit_batch_settings.end()) {
+    if (!is_explicit(setting.member)) {
       settings._operator_params.*setting.member = defaults.*setting.member;
     }
+  }
+  // Derive the index budget from the startup partition size, preserving YAML tuning.
+  // The former payload limit was 2x partitions; 4-byte rows need a 4x larger index estimate
+  // (16 bytes/row). The independent resident budget remains batch-derived.
+  // SET hash_partition_bytes does not re-derive either budget.
+  if (!is_explicit(&operator_params::max_build_hash_table_bytes)) {
+    settings._operator_params.max_build_hash_table_bytes =
+      sirius::memory::saturating_mul(8, settings._operator_params.hash_partition_bytes);
   }
   settings.finalize_derived_config();
   return settings;

@@ -76,6 +76,27 @@
 namespace sirius {
 namespace op {
 
+namespace {
+
+void discard_build_partition(cucascade::shared_data_repository& repository, std::size_t partition)
+{
+  while (auto batch = repository.pop_next_data_batch(partition)) {
+    std::optional<int> device;
+    {
+      auto ro = batch->to_read_only();
+      if (auto const* space = ro.get_memory_space();
+          space != nullptr && space->get_tier() == cucascade::memory::Tier::GPU) {
+        device = space->get_device_id();
+      }
+    }
+    std::optional<rmm::cuda_set_device_raii> device_guard;
+    if (device) { device_guard.emplace(rmm::cuda_device_id{*device}); }
+    batch.reset();
+  }
+}
+
+}  // namespace
+
 static void collect_reference_indices(sirius::ast::node const& expr,
                                       std::unordered_set<std::size_t>& indices)
 {
@@ -634,7 +655,7 @@ build_probe_decision select_build_probe_action(std::vector<build_probe_slot_view
   //      - NOT_BUILT-with-build-but-no-probe (a broadcast orphan) and BUILT-and-drained slots
   //        wait on the probe producer only until probe_finished -- after that they have nothing
   //        left to do, whether or not they have been torn down yet (teardown is a resource-release
-  //        side effect handled by discard_build_only_slots_if_probe_complete / finalize, not a
+  //        side effect handled by reclaim_build_only_slots_if_probe_complete / finalize, not a
   //        precondition for reporting completion here).
   //      - SCHEDULING/SCHEDULED means a task is in flight for that slot; treated as still-active so
   //        completion can never be reported while a task could still be running against it.
@@ -1041,54 +1062,31 @@ std::vector<build_probe_slot_view> sirius_physical_hash_join::snapshot_build_pro
   return slots;
 }
 
-std::vector<std::size_t> broadcast_slots_to_discard(std::vector<build_probe_slot_view> const& slots,
-                                                    bool probe_finished)
+std::vector<std::size_t> build_probe_slots_to_reclaim(
+  std::vector<build_probe_slot_view> const& slots, bool probe_finished)
 {
-  std::vector<std::size_t> to_discard;
-  if (!probe_finished) { return to_discard; }
+  std::vector<std::size_t> candidates;
+  if (!probe_finished) { return candidates; }
   for (std::size_t p = 0; p < slots.size(); ++p) {
-    auto const& s = slots[p];
-    // NOT_BUILT means the slot was never scheduled (so its replicated build batch is still in the
-    // repo); no probe batch with the probe side finished means none is coming. A BUILT slot already
-    // consumed its build batch, and a slot with probe data will still be built — leave those.
-    if (s.state == BUILD_HASH_TABLE_STATE::NOT_BUILT && s.has_build_batch && !s.has_probe_batch) {
-      to_discard.push_back(p);
+    auto const& slot = slots[p];
+    if (slot.state == BUILD_HASH_TABLE_STATE::NOT_BUILT && slot.has_build_batch &&
+        !slot.has_probe_batch) {
+      candidates.push_back(p);
     }
   }
-  return to_discard;
+  return candidates;
 }
 
-void sirius_physical_hash_join::discard_build_only_slots_if_probe_complete()
+void sirius_physical_hash_join::reclaim_build_only_slots_if_probe_complete(bool probe_finished)
 {
-  if (!_broadcast) { return; }
+  if (!probe_finished) { return; }
   auto* build_port = get_port("build");
   auto* probe_port = get_port("default");
-  if (!build_port || !probe_port) { return; }
-  // Only once the probe upstream is finished do we know no further probe data can arrive for any
-  // slot. Broadcast replicates the build table to every slot, but the probe side is unpartitioned,
-  // so slots on GPUs that saw no probe rows get build data that will never be probed.
-  bool const probe_finished =
-    probe_port->src_pipeline && probe_port->src_pipeline->is_pipeline_finished();
-
-  for (std::size_t p : broadcast_slots_to_discard(snapshot_build_probe_slots(), probe_finished)) {
-    // Build-only slot with no probe and none coming: drop its replicated build batch(es), freeing
-    // each on the GPU it was folded onto (rmm requires the owning device to be current).
-    while (auto batch = build_port->repo->pop_next_data_batch(p)) {
-      int device_id = -1;
-      {
-        auto ro = batch->to_read_only();
-        if (auto* ms = ro.get_memory_space(); ms != nullptr) { device_id = ms->get_device_id(); }
-      }
-      std::optional<rmm::cuda_set_device_raii> device_guard;
-      if (device_id >= 0) { device_guard.emplace(rmm::cuda_device_id{device_id}); }
-      batch.reset();
-    }
-    _partition_build_states[p].build_state.store(BUILD_HASH_TABLE_STATE::DESTROYED,
-                                                 std::memory_order_release);
-    SIRIUS_LOG_DEBUG(
-      "sirius_physical_hash_join id {}: broadcast discard of build-only slot {} (probe complete)",
-      this->get_operator_id(),
-      p);
+  for (auto const partition :
+       build_probe_slots_to_reclaim(snapshot_build_probe_slots(), probe_finished)) {
+    discard_build_partition(*build_port->repo, partition);
+    _partition_build_states[partition].build_state.store(BUILD_HASH_TABLE_STATE::DESTROYED,
+                                                         std::memory_order_release);
   }
 }
 
@@ -1136,11 +1134,9 @@ std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint(
     // sequences interleave (a built partition probes on its GPU while another still builds on a
     // different GPU). Pick the next action from a per-partition snapshot.
 
-    // Broadcast mode: reclaim slots that will never be probed before deciding the next action, so
-    // the operator can reach completion instead of waiting forever on their absent probe data.
-    discard_build_only_slots_if_probe_complete();
     bool const probe_finished =
       probe_port->src_pipeline && probe_port->src_pipeline->is_pipeline_finished();
+    reclaim_build_only_slots_if_probe_complete(probe_finished);
     auto const decision = select_build_probe_action(snapshot_build_probe_slots(), probe_finished);
     switch (decision.action) {
       case build_probe_action::schedule_build:

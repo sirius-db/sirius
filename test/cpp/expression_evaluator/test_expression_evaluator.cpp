@@ -4075,3 +4075,325 @@ TEMPLATE_TEST_CASE("integer to VARCHAR composes with OR and LIKE and broadcasts 
     REQUIRE(output->view().column(1).null_count() == rows);
   }
 }
+
+TEST_CASE("Floating comparisons order NaN above infinity and preserve NULL",
+          "[expression_evaluator][nan_comparison]")
+{
+  auto& space   = *get_default_gpu_space();
+  auto strategy = GENERATE(
+    exp_strategy_enum::MATERIALIZE, exp_strategy_enum::AST_INTERPRET, exp_strategy_enum::AST_JIT);
+  auto single_precision = GENERATE(false, true);
+  auto const inf        = std::numeric_limits<double>::infinity();
+  std::vector<double> domain{-inf, -1, 0, inf, std::numeric_limits<double>::quiet_NaN(), 0};
+  std::vector<double> left, right;
+  for (auto a : domain)
+    for (auto b : domain) {
+      left.push_back(a);
+      right.push_back(b);
+    }
+  auto make_column = [&](std::vector<double> const& values, bool lhs) {
+    auto col    = single_precision
+                    ? make_carrier_column(space,
+                                       cudf::data_type{cudf::type_id::FLOAT32},
+                                       std::vector<float>(values.begin(), values.end()))
+                    : make_carrier_column(space, cudf::data_type{cudf::type_id::FLOAT64}, values);
+    auto stream = cudf::get_default_stream();
+    auto mask   = cudf::create_null_mask(
+      values.size(), cudf::mask_state::ALL_VALID, stream, get_resource_ref(space));
+    for (size_t i = 0; i < values.size(); ++i) {
+      if ((lhs ? i / domain.size() : i % domain.size()) == domain.size() - 1)
+        cudf::set_null_mask(static_cast<cudf::bitmask_type*>(mask.data()), i, i + 1, false, stream);
+    }
+    col->set_null_mask(std::move(mask), domain.size());
+    return col;
+  };
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(make_column(left, true));
+  columns.push_back(make_column(right, false));
+  auto input = make_batch_from_columns(space, std::move(columns));
+  auto type  = logical_type::make(single_precision ? type_id::FLOAT : type_id::DOUBLE);
+  using cmp  = sirius::comparison_type;
+  std::vector<cmp> comparisons{cmp::equal,
+                               cmp::not_equal,
+                               cmp::gt,
+                               cmp::ge,
+                               cmp::lt,
+                               cmp::le,
+                               cmp::distinct_from,
+                               cmp::not_distinct_from};
+  duckdb::vector<std::unique_ptr<ast_node>> nodes;
+  for (auto comparison : comparisons)
+    nodes.push_back(make_cmp(comparison, make_ref_typed(0, type), make_ref_typed(1, type)));
+  exp_executor executor(nodes,
+                        get_resource_ref(space),
+                        cudf::get_default_stream(),
+                        sirius::expression_query_policy{strategy});
+  auto output = executor.evaluate(sirius::get_cudf_table_view(*input));
+  REQUIRE(output != nullptr);
+  CHECK((executor.ast_jit_evaluation_count_for_testing() > 0) ==
+        (strategy == exp_strategy_enum::AST_JIT));
+  for (size_t c = 0; c < comparisons.size(); ++c) {
+    auto values = copy_column_to_host<int8_t>(output->view().column(c));
+    auto valid  = copy_valids_to_host(output->view().column(c));
+    for (size_t i = 0; i < left.size(); ++i) {
+      CAPTURE(strategy, single_precision, c, i);
+      bool ln   = i / domain.size() == domain.size() - 1;
+      bool rn   = i % domain.size() == domain.size() - 1;
+      bool safe = c >= 6;
+      REQUIRE(valid[i] == (safe || (!ln && !rn)));
+      if (!valid[i]) continue;
+      bool equal      = (std::isnan(left[i]) && std::isnan(right[i])) || left[i] == right[i];
+      bool less       = (!std::isnan(left[i]) && std::isnan(right[i])) || left[i] < right[i];
+      bool greater    = (!std::isnan(right[i]) && std::isnan(left[i])) || left[i] > right[i];
+      bool null_equal = (ln || rn) ? (ln && rn) : equal;
+      std::vector<bool> expected{
+        equal, !equal, greater, greater || equal, less, less || equal, !null_equal, null_equal};
+      REQUIRE(bool(values[i]) == expected[c]);
+    }
+  }
+}
+
+TEMPLATE_TEST_CASE("BETWEEN and NOT BETWEEN preserve three-valued logic with column bounds",
+                   "[expression_evaluator][between][null_logic]",
+                   int32_t,
+                   float,
+                   double)
+{
+  auto& space         = *get_default_gpu_space();
+  auto const strategy = GENERATE(MAT, exp_strategy_enum::AST_INTERPRET, exp_strategy_enum::AST_JIT);
+  auto const negated  = GENERATE(false, true);
+  auto const type     = logical_type::make(std::is_same_v<TestType, int32_t> ? type_id::INTEGER
+                                       : std::is_same_v<TestType, float> ? type_id::FLOAT
+                                                                         : type_id::DOUBLE);
+  struct between_case {
+    std::optional<TestType> input, lower, upper;
+    std::optional<bool> expected;
+  };
+  std::vector<between_case> cases{{2, std::nullopt, 1, false},
+                                  {2, 3, std::nullopt, false},
+                                  {2, std::nullopt, 3, std::nullopt},
+                                  {2, 1, std::nullopt, std::nullopt},
+                                  {2, std::nullopt, std::nullopt, std::nullopt},
+                                  {std::nullopt, 1, 3, std::nullopt},
+                                  {2, 1, 3, true},
+                                  {2, 3, 1, false},
+                                  {2, 2, 2, true}};
+  if constexpr (std::is_floating_point_v<TestType>) {
+    auto const nan = std::numeric_limits<TestType>::quiet_NaN();
+    auto const inf = std::numeric_limits<TestType>::infinity();
+    cases.insert(cases.end(),
+                 {{nan, 0, nan, true},
+                  {inf, 0, nan, true},
+                  {nan, 0, inf, false},
+                  {2, nan, std::nullopt, false},
+                  {2, std::nullopt, nan, std::nullopt},
+                  {nan, std::nullopt, inf, false},
+                  {nan, nan, nan, true},
+                  {-inf, -inf, inf, true}});
+  }
+  std::vector<std::optional<TestType>> inputs, lowers, uppers;
+  for (auto const& row : cases) {
+    inputs.push_back(row.input);
+    lowers.push_back(row.lower);
+    uppers.push_back(row.upper);
+  }
+  auto const carrier = sirius::require_cudf_type(type);
+  auto input         = make_nullable_rep_column<TestType>(space, carrier, inputs, TestType{0});
+  auto lower         = make_nullable_rep_column<TestType>(space, carrier, lowers, TestType{0});
+  auto upper         = make_nullable_rep_column<TestType>(space, carrier, uppers, TestType{0});
+  // Use column bounds so neither DuckDB constant folding nor scalar-only handling hides NULLs.
+  auto expr = make_between(
+    make_ref_typed(0, type), make_ref_typed(1, type), make_ref_typed(2, type), true, true);
+  if (negated) expr = make_unary(sirius::ast::unary_op::kind::op_not, std::move(expr));
+  exp_executor evaluator(*expr,
+                         get_resource_ref(space),
+                         cudf::get_default_stream(),
+                         sirius::expression_query_policy{strategy},
+                         1);
+  auto output = evaluator.evaluate(cudf::table_view{{input->view(), lower->view(), upper->view()}});
+  auto const values = copy_column_to_host<int8_t>(output->view().column(0));
+  auto const valid  = copy_valids_to_host(output->view().column(0));
+  REQUIRE(values.size() == cases.size());
+  for (size_t i = 0; i < cases.size(); ++i) {
+    CAPTURE(strategy, negated, i);
+    auto const expected = cases[i].expected;
+    REQUIRE(valid[i] == expected.has_value());
+    if (expected) CHECK(bool(values[i]) == (negated ? !*expected : *expected));
+  }
+}
+
+TEMPLATE_TEST_CASE("Floating IN and NOT IN distinguish NaN matches from NULL nonmatches",
+                   "[expression_evaluator][in_list][nan_comparison][null_logic]",
+                   float,
+                   double)
+{
+  auto& space         = *get_default_gpu_space();
+  auto const strategy = GENERATE(MAT, exp_strategy_enum::AST_INTERPRET, exp_strategy_enum::AST_JIT);
+  auto const negated  = GENERATE(false, true);
+  auto const null_first   = GENERATE(false, true);
+  auto const finite_match = GENERATE(false, true);
+  auto const type =
+    logical_type::make(std::is_same_v<TestType, float> ? type_id::FLOAT : type_id::DOUBLE);
+  auto const nan = std::numeric_limits<TestType>::quiet_NaN();
+  auto const inf = std::numeric_limits<TestType>::infinity();
+  std::vector<std::optional<TestType>> const probes{
+    nan, -nan, -inf, inf, -TestType{0}, TestType{0}, TestType{1}, TestType{2}, std::nullopt};
+  // Hide a NaN under the NULL probe: validity must take precedence over the payload.
+  auto input =
+    make_nullable_rep_column<TestType>(space, sirius::require_cudf_type(type), probes, nan);
+  auto constant = [&](TestType value) {
+    return std::make_unique<ast_node>(sirius::ast::constant{sirius::value{value}, type});
+  };
+  std::vector<std::unique_ptr<ast_node>> list;
+  if (null_first) list.push_back(make_null_const(type));
+  list.push_back(constant(nan));
+  if (finite_match) list.push_back(constant(TestType{1}));
+  if (!null_first) list.push_back(make_null_const(type));
+  auto expr = make_in(make_ref_typed(0, type), std::move(list), negated);
+  exp_executor evaluator(*expr,
+                         get_resource_ref(space),
+                         cudf::get_default_stream(),
+                         sirius::expression_query_policy{strategy},
+                         1);
+  auto output       = evaluator.evaluate(cudf::table_view{{input->view()}});
+  auto const values = copy_column_to_host<int8_t>(output->view().column(0));
+  auto const valid  = copy_valids_to_host(output->view().column(0));
+  REQUIRE(values.size() == probes.size());
+  for (size_t i = 0; i < probes.size(); ++i) {
+    CAPTURE(strategy, negated, null_first, finite_match, i);
+    // A match wins over the NULL list entry. Every nonmatch is UNKNOWN, even for NOT IN.
+    bool const matches = probes[i] && (std::isnan(*probes[i]) || (finite_match && *probes[i] == 1));
+    REQUIRE(valid[i] == matches);
+    if (matches) CHECK(bool(values[i]) == !negated);
+  }
+}
+
+TEMPLATE_TEST_CASE("MATERIALIZE floating constant IN lists preserve membership semantics at scale",
+                   "[expression_evaluator][in_list][nan_comparison][constant_in]",
+                   float,
+                   double)
+{
+  auto& space             = *get_default_gpu_space();
+  auto const length       = GENERATE(1, 2048);
+  auto const include_nan  = GENERATE(false, true);
+  auto const include_null = GENERATE(false, true);
+  auto const negated      = GENERATE(false, true);
+  auto const type =
+    logical_type::make(std::is_same_v<TestType, float> ? type_id::FLOAT : type_id::DOUBLE);
+  auto const carrier    = sirius::require_cudf_type(type);
+  auto nan_with_payload = [](char const* payload) -> TestType {
+    if constexpr (std::is_same_v<TestType, float>)
+      return std::nanf(payload);
+    else
+      return std::nan(payload);
+  };
+  auto const nan       = nan_with_payload("1");
+  auto const other_nan = nan_with_payload("2");
+  auto const inf       = std::numeric_limits<TestType>::infinity();
+  std::vector<std::optional<TestType>> const probes{nan,
+                                                    other_nan,
+                                                    -nan,
+                                                    -TestType{0},
+                                                    TestType{0},
+                                                    TestType{1},
+                                                    TestType{-1},
+                                                    inf,
+                                                    -inf,
+                                                    TestType(length - 1),
+                                                    TestType(length),
+                                                    std::nullopt};
+  auto input    = make_nullable_rep_column<TestType>(space, carrier, probes, nan);
+  auto constant = [&](TestType value) {
+    return std::make_unique<ast_node>(sirius::ast::constant{sirius::value{value}, type});
+  };
+  std::vector<std::unique_ptr<ast_node>> list;
+  for (int i = 0; i < length; ++i)
+    list.push_back(constant(TestType(i)));
+  if (include_nan) list.push_back(constant(nan));
+  if (include_null) list.push_back(make_null_const(type));
+  auto expr = make_in(make_ref_typed(0, type), std::move(list), negated);
+  exp_executor evaluator(*expr,
+                         get_resource_ref(space),
+                         cudf::get_default_stream(),
+                         sirius::expression_query_policy{MAT},
+                         1);
+  auto check = [&](cudf::column_view view, size_t offset) {
+    auto output       = evaluator.evaluate(cudf::table_view{{view}});
+    auto const values = copy_column_to_host<int8_t>(output->view().column(0));
+    auto const valid  = copy_valids_to_host(output->view().column(0));
+    REQUIRE(values.size() == size_t(view.size()));
+    for (size_t i = 0; i < values.size(); ++i) {
+      CAPTURE(length, include_nan, include_null, negated, offset, i);
+      auto const probe = probes[i + offset];
+      bool const matches =
+        probe && (std::isnan(*probe) ? include_nan : *probe >= 0 && *probe < length);
+      bool const expected_valid = probe.has_value() && (matches || !include_null);
+      REQUIRE(valid[i] == expected_valid);
+      if (expected_valid) CHECK(bool(values[i]) == (negated ? !matches : matches));
+    }
+  };
+  check(input->view(), 0);
+  check(cudf::slice(input->view(), {1, int32_t(probes.size())}, cudf::get_default_stream()).front(),
+        1);
+  auto empty = cudf::make_empty_column(carrier);
+  check(empty->view(), 0);
+}
+
+TEMPLATE_TEST_CASE("MATERIALIZE floating IN with column entries retains NaN and NULL semantics",
+                   "[expression_evaluator][in_list][nan_comparison]",
+                   float,
+                   double)
+{
+  auto& space        = *get_default_gpu_space();
+  auto const negated = GENERATE(false, true);
+  auto const type =
+    logical_type::make(std::is_same_v<TestType, float> ? type_id::FLOAT : type_id::DOUBLE);
+  auto const carrier = sirius::require_cudf_type(type);
+  auto const nan     = std::numeric_limits<TestType>::quiet_NaN();
+  auto input =
+    make_nullable_rep_column<TestType>(space, carrier, {nan, 1, 2, 3, std::nullopt}, nan);
+  auto item = make_nullable_rep_column<TestType>(
+    space, carrier, {std::nullopt, 1, std::nullopt, 4, nan}, nan);
+  std::vector<std::unique_ptr<ast_node>> list;
+  list.push_back(make_ref_typed(1, type));
+  list.push_back(std::make_unique<ast_node>(sirius::ast::constant{sirius::value{nan}, type}));
+  auto expr = make_in(make_ref_typed(0, type), std::move(list), negated);
+  exp_executor evaluator(*expr,
+                         get_resource_ref(space),
+                         cudf::get_default_stream(),
+                         sirius::expression_query_policy{MAT},
+                         1);
+  auto output       = evaluator.evaluate(cudf::table_view{{input->view(), item->view()}});
+  auto const values = copy_column_to_host<int8_t>(output->view().column(0));
+  REQUIRE(copy_valids_to_host(output->view().column(0)) ==
+          std::vector<bool>{true, true, false, true, false});
+  CHECK(bool(values[0]) == !negated);
+  CHECK(bool(values[1]) == !negated);
+  CHECK(bool(values[3]) == negated);
+}
+
+TEMPLATE_TEST_CASE("MATERIALIZE floating IN with only NULL constants returns NULL",
+                   "[expression_evaluator][in_list][constant_in][null_logic]",
+                   float,
+                   double)
+{
+  auto& space        = *get_default_gpu_space();
+  auto const negated = GENERATE(false, true);
+  auto const type =
+    logical_type::make(std::is_same_v<TestType, float> ? type_id::FLOAT : type_id::DOUBLE);
+  auto const nan = std::numeric_limits<TestType>::quiet_NaN();
+  auto input     = make_nullable_rep_column<TestType>(
+    space, sirius::require_cudf_type(type), {nan, 1, std::nullopt}, nan);
+  std::vector<std::unique_ptr<ast_node>> list;
+  list.push_back(make_null_const(type));
+  list.push_back(make_null_const(type));
+  auto expr = make_in(make_ref_typed(0, type), std::move(list), negated);
+  exp_executor evaluator(*expr,
+                         get_resource_ref(space),
+                         cudf::get_default_stream(),
+                         sirius::expression_query_policy{MAT},
+                         1);
+  auto output = evaluator.evaluate(cudf::table_view{{input->view()}});
+  REQUIRE(output->num_rows() == 3);
+  REQUIRE(copy_valids_to_host(output->view().column(0)) == std::vector<bool>{false, false, false});
+}

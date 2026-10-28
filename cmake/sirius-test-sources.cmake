@@ -120,6 +120,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_regexp_replace.cpp
     test/cpp/integration/test_gpu_execution_size_estimation.cpp
     test/cpp/integration/test_gpu_execution_parquet_nulls.cpp
+    test/cpp/integration/test_gpu_execution_parquet_nan.cpp
     test/cpp/integration/test_gpu_execution_semantic_cast_fallback.cpp
     test/cpp/integration/test_gpu_execution_integer_varchar_cast.cpp
     test/cpp/integration/test_gpu_execution_setting_scope.cpp
@@ -213,6 +214,9 @@ set(TEST_SOURCES
     test/cpp/memory/test_multiple_blocks_allocation_accessor.cpp
     test/cpp/memory/test_topology_index.cpp
     test/cpp/operator/test_build_probe_scheduling.cpp
+    test/cpp/operator/test_build_probe_reclaim.cpp
+    test/cpp/operator/test_ungrouped_aggregate_empty_input.cpp
+    test/cpp/integration/test_gpu_execution_join_empty_sides.cpp
     test/cpp/operator/test_partition_placement.cpp
     test/cpp/operator/test_partition_exchange.cpp
     test/cpp/operator/test_cross_schedule.cpp

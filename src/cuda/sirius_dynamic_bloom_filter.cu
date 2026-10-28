@@ -544,15 +544,23 @@ std::unique_ptr<cudf::column> sirius_dynamic_bloom_filter::compute_mask_impl(
   ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr) const
 {
-  return detail::compute_membership_mask(
-    _impl.get(), _domain, probe, prior_mask_words, prior_keep, device_id, stream, mr);
+  return detail::compute_membership_mask(_impl.get(),
+                                         _domain,
+                                         probe,
+                                         prior_mask_words,
+                                         prior_keep,
+                                         device_id,
+                                         stream,
+                                         mr,
+                                         preserves_nulls());
 }
 
 bool sirius_dynamic_bloom_filter::prepare_fused_probe(cudf::column_view const& probe,
                                                       int device_id,
                                                       detail::fused_probe& out) const
 {
-  return detail::prepare_fused_membership_probe(_impl.get(), _domain, probe, device_id, out);
+  return detail::prepare_fused_membership_probe(
+    _impl.get(), _domain, probe, device_id, out, preserves_nulls());
 }
 
 namespace detail {

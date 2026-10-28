@@ -33,6 +33,7 @@
 #include <duckdb/planner/logical_operator.hpp>
 #include <io/kvikio/kvikio_context.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
+#include <op/input_free_operator_data.hpp>
 #include <op/scan/parquet_gpu_ingestible.hpp>
 #include <op/scan/sirius_gpu_scan_operator.hpp>
 #include <op/sirius_physical_gpu_values.hpp>
@@ -194,7 +195,7 @@ TEST_CASE("parquet all-pruned lowering owns a typed empty source without a scan"
   // exactly one GPU task descriptor, with no scan or metadata task descriptor.
   REQUIRE(empty->get_next_task_hint());
   auto input = empty->get_next_task_input_data();
-  REQUIRE(dynamic_cast<sirius::op::gpu_values_input*>(input.get()));
+  REQUIRE(dynamic_cast<sirius::op::input_free_operator_data*>(input.get()));
   auto state        = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
   auto const* space = state->get_memory_manager().get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space);

@@ -1047,6 +1047,71 @@ TEST_CASE("explicit operator batch values override effective-capacity defaults",
   REQUIRE(params.max_build_probe_resident_bytes == 7 * mib);
 }
 
+TEST_CASE(
+  "BUILD_PROBE index budget follows startup hash partitions and residency stays batch-derived",
+  "[sirius][config][operator_defaults]")
+{
+  sirius::sirius_config config;
+  config.load_from_file(config_fixture("operator_defaults_hash_partition_only.yaml"));
+
+  constexpr uint64_t mib = 1024ULL * 1024;
+  auto const& params     = config.get_operator_params();
+  REQUIRE(params.hash_partition_bytes == 3 * mib);
+  REQUIRE(params.max_build_hash_table_bytes == 24 * mib);
+  REQUIRE(params.max_build_probe_resident_bytes == 8 * expected_effective_batch(config));
+}
+
+TEST_CASE("startup BUILD_PROBE budgets remain independent through SET and RESET",
+          "[sirius][config][operator_defaults][isolated_context]")
+{
+  finally cleanup_env{[]() {
+    unsetenv("SIRIUS_CONFIG_FILE");
+    setenv("SIRIUS_DISABLE", "1", 1);
+  }};
+  auto const cfg = config_fixture("operator_defaults_hash_partition_only.yaml");
+  unsetenv("SIRIUS_DISABLE");
+  setenv("SIRIUS_CONFIG_FILE", cfg.string().c_str(), 1);
+
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  constexpr uint64_t mib              = 1024ULL * 1024;
+  constexpr uint64_t index_default    = 24 * mib;
+  constexpr uint64_t resident_default = 8 * ((256 * mib) / 40);
+  auto execute                        = [&](char const* sql) {
+    auto result = con.Query(sql);
+    REQUIRE(result != nullptr);
+    if (result->HasError()) { INFO(result->GetError()); }
+    REQUIRE_FALSE(result->HasError());
+  };
+  auto require_budgets = [&](uint64_t index, uint64_t resident) {
+    auto result = con.Query(R"(
+      SELECT current_setting('max_build_hash_table_bytes')::UBIGINT,
+             current_setting('max_build_probe_resident_bytes')::UBIGINT
+    )");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->Collection().GetValue(0, 0).GetValue<uint64_t>() == index);
+    REQUIRE(result->Collection().GetValue(1, 0).GetValue<uint64_t>() == resident);
+    auto const& params = duckdb::session_operator_params(*con.context);
+    REQUIRE(params.max_build_hash_table_bytes == index);
+    REQUIRE(params.max_build_probe_resident_bytes == resident);
+  };
+
+  require_budgets(index_default, resident_default);
+  execute("SET hash_partition_bytes = 99");
+  require_budgets(index_default, resident_default);
+  execute("SET max_build_hash_table_bytes = 123");
+  execute("SET max_build_probe_resident_bytes = 456");
+  require_budgets(123, 456);
+  execute("RESET max_build_hash_table_bytes");
+  execute("RESET max_build_probe_resident_bytes");
+  require_budgets(index_default, resident_default);
+  REQUIRE(duckdb::session_operator_params(*con.context).hash_partition_bytes == 99);
+  execute("RESET hash_partition_bytes");
+  REQUIRE(duckdb::session_operator_params(*con.context).hash_partition_bytes == 3 * mib);
+  require_budgets(index_default, resident_default);
+}
+
 TEST_CASE("ordinary defaults stay physical-memory-derived without an explicit GPU cap",
           "[sirius][config][operator_defaults]")
 {

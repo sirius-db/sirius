@@ -437,10 +437,10 @@ std::unique_ptr<Buffer> peer_copy(std::unique_ptr<Buffer> source,
     }
   }();
   if (bytes > 0) {
-    (void)memory::enqueue_device_copy({static_cast<std::byte*>(copy->data()), bytes},
+    (void)memory::enqueue_device_copy({reinterpret_cast<std::byte*>(copy->data()), bytes},
                                       rmm::cuda_device_id{destination_device},
                                       stream,
-                                      {static_cast<std::byte const*>(retained->data()), bytes},
+                                      {reinterpret_cast<std::byte const*>(retained->data()), bytes},
                                       rmm::cuda_device_id{source_device},
                                       &source_space,
                                       ready,

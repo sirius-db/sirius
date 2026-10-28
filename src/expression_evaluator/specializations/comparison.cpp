@@ -15,6 +15,8 @@
  */
 
 // sirius
+#include "expression_evaluator/comparison_expression.hpp"
+
 #include <expression/ast/node.hpp>
 #include <expression/join_condition.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
@@ -33,24 +35,6 @@ namespace sirius {
 using evaluate_result = expression_evaluator::evaluate_result;
 
 namespace {
-
-cudf::ast::ast_operator comparison_op_to_ast(sirius::comparison_type op)
-{
-  switch (op) {
-    case sirius::comparison_type::equal: return cudf::ast::ast_operator::EQUAL;
-    case sirius::comparison_type::gt: return cudf::ast::ast_operator::GREATER;
-    case sirius::comparison_type::ge: return cudf::ast::ast_operator::GREATER_EQUAL;
-    case sirius::comparison_type::lt: return cudf::ast::ast_operator::LESS;
-    case sirius::comparison_type::le: return cudf::ast::ast_operator::LESS_EQUAL;
-    case sirius::comparison_type::not_equal: return cudf::ast::ast_operator::NOT_EQUAL;
-    case sirius::comparison_type::distinct_from:  // fallthrough — wrapped in NOT below
-    case sirius::comparison_type::not_distinct_from: return cudf::ast::ast_operator::NULL_EQUAL;
-    default:
-      throw invalid_input_exception(
-        "[expression_evaluator:comparison] Unrecognized comparison type : {}",
-        static_cast<int>(op));
-  }
-}
 
 cudf::binary_operator comparison_op_to_binary(sirius::comparison_type op)
 {
@@ -90,17 +74,13 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::comparison const& al
   if (narrow_carrier) { ++_narrow_domain_comparison_count; }
 
   auto const ast_op_count = alt.cudf_ast_op_count();
-  if (_policy.strategy != expression_evaluator_strategy::MATERIALIZE &&
-      (mode == evaluation_mode::AST || ast_op_count >= _min_ast_size)) {
+  auto const floating     = floating_comparison(alt.left->return_type(), alt.right->return_type());
+  if (floating || (_policy.strategy != expression_evaluator_strategy::MATERIALIZE &&
+                   (mode == evaluation_mode::AST || ast_op_count >= _min_ast_size))) {
     auto left  = evaluate_narrow_domain_operand(*alt.left, narrow_carrier, evaluation_mode::AST);
     auto right = evaluate_narrow_domain_operand(*alt.right, narrow_carrier, evaluation_mode::AST);
-    auto const& comp_expr = _ast_tree.emplace<cudf::ast::operation>(
-      comparison_op_to_ast(alt.op), left.get_expr(), right.get_expr());
-    // DISTINCT_FROM is semantically equivalent to NOT(NULL_EQUAL())
     auto const& final_comp_expr =
-      alt.op == sirius::comparison_type::distinct_from
-        ? _ast_tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::NOT, comp_expr)
-        : comp_expr;
+      comparison_expression(_ast_tree, alt.op, left.get_expr(), right.get_expr(), floating);
 
     //===----------1: AST Mode----------===//
     if (mode == evaluation_mode::AST) {

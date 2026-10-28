@@ -2556,6 +2556,11 @@ filtered_table parquet_scan_core::materialize_metadata_to_table(
         _info->profiles->counters->parquet_phase(slice.file_path, false);
   }
 
+  if (auto const& counters = _info->profiles->counters;
+      counters && counters->track_units && counters->parquet_filter_for_testing) {
+    counters->parquet_filter_for_testing(opts.get_filter().has_value(), table->num_rows());
+  }
+
   // Hive-partition scans assemble inline here: partition_values are per-split
   // (carried on parquet_split_info) and do not travel to the pipeline-shared
   // post_filter info. Apply the row filter first when pushdown did not, then

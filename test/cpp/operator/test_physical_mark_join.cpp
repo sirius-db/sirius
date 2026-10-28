@@ -25,6 +25,7 @@
 #include <cucascade/data/data_repository.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/common/exception.hpp>
+#include <duckdb/common/operator/comparison_operators.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/operator/logical_comparison_join.hpp>
 #include <op/sirius_physical_hash_join.hpp>
@@ -35,6 +36,7 @@
 #include <algorithm>
 #include <limits>
 #include <map>
+#include <optional>
 
 using namespace duckdb;
 using namespace sirius::op;
@@ -1721,4 +1723,136 @@ TEST_CASE("native nested-loop semantic timestamp casts retain checked overflow",
   f.nlj->conditions[0].right =
     std::make_unique<sirius::ast::node>(sirius::ast::reference{0, micros});
   REQUIRE_THROWS_AS(execute_projected_nlj(*f.nlj, left, right), sirius::invalid_input_exception);
+}
+
+TEST_CASE("Nested-loop floating comparisons follow DuckDB NaN and NULL semantics",
+          "[physical_mark_join][nan_comparison]")
+{
+  auto& space           = *get_shared_mem_space();
+  auto single_precision = GENERATE(false, true);
+  auto comparison       = GENERATE(ExpressionType::COMPARE_EQUAL,
+                             ExpressionType::COMPARE_NOTEQUAL,
+                             ExpressionType::COMPARE_GREATERTHAN,
+                             ExpressionType::COMPARE_GREATERTHANOREQUALTO,
+                             ExpressionType::COMPARE_LESSTHAN,
+                             ExpressionType::COMPARE_LESSTHANOREQUALTO,
+                             ExpressionType::COMPARE_DISTINCT_FROM,
+                             ExpressionType::COMPARE_NOT_DISTINCT_FROM);
+  auto join_type        = GENERATE(JoinType::INNER,
+                            JoinType::LEFT,
+                            JoinType::RIGHT,
+                            JoinType::OUTER,
+                            JoinType::SEMI,
+                            JoinType::ANTI,
+                            JoinType::MARK);
+  CAPTURE(single_precision, comparison, join_type);
+  double const inf = std::numeric_limits<double>::infinity();
+  std::vector<double> domain{-inf, -1, 0, inf, std::numeric_limits<double>::quiet_NaN(), 0};
+  std::vector<bool> valid{true, true, true, true, true, false};
+  std::vector<int32_t> ids{0, 1, 2, 3, 4, 5};
+  auto make_input = [&] {
+    auto keys =
+      single_precision
+        ? make_numeric_batch_with_nulls<float>(
+            space, std::vector<float>(domain.begin(), domain.end()), valid, cudf::type_id::FLOAT32)
+        : make_numeric_batch_with_nulls<double>(space, domain, valid, cudf::type_id::FLOAT64);
+    auto payload = make_numeric_batch<int32_t>(space, ids, cudf::type_id::INT32);
+    return concatenate_batches_horizontal({keys, payload}, space);
+  };
+  auto const type = single_precision ? LogicalType::FLOAT : LogicalType::DOUBLE;
+  auto child      = [&] {
+    return duckdb::make_uniq<sirius_physical_operator>(
+      SiriusPhysicalOperatorType::PROJECTION,
+      sirius::from_duckdb_vec(duckdb::vector<LogicalType>{type, LogicalType::INTEGER}),
+      domain.size());
+  };
+  LogicalComparisonJoin logical(join_type);
+  logical.types = {LogicalType::INTEGER};
+  if (join_type == JoinType::MARK)
+    logical.types.push_back(LogicalType::BOOLEAN);
+  else if (join_type != JoinType::SEMI && join_type != JoinType::ANTI)
+    logical.types.push_back(LogicalType::INTEGER);
+  duckdb::vector<JoinCondition> conditions;
+  conditions.emplace_back(duckdb::make_uniq<BoundReferenceExpression>(type, 0),
+                          duckdb::make_uniq<BoundReferenceExpression>(type, 0),
+                          comparison);
+  sirius_physical_nested_loop_join join(logical,
+                                        child(),
+                                        child(),
+                                        sirius::wrap_join_conditions(std::move(conditions)),
+                                        join_type,
+                                        domain.size(),
+                                        duckdb::vector<std::size_t>{1},
+                                        duckdb::vector<std::size_t>{1});
+
+  // Use DuckDB's own floating comparison operators as the oracle. NULL produces UNKNOWN
+  // except for the two null-safe comparisons; NaN remains a valid floating value.
+  auto matches = [&](size_t i, size_t j) -> std::optional<bool> {
+    bool const eq      = Equals::Operation(domain[i], domain[j]);
+    bool const null_eq = (!valid[i] || !valid[j]) ? valid[i] == valid[j] : eq;
+    if (comparison == ExpressionType::COMPARE_NOT_DISTINCT_FROM) return null_eq;
+    if (comparison == ExpressionType::COMPARE_DISTINCT_FROM) return !null_eq;
+    if (!valid[i] || !valid[j]) return std::nullopt;
+    switch (comparison) {
+      case ExpressionType::COMPARE_EQUAL: return eq;
+      case ExpressionType::COMPARE_NOTEQUAL: return !eq;
+      case ExpressionType::COMPARE_GREATERTHAN: return GreaterThan::Operation(domain[i], domain[j]);
+      case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+        return GreaterThanEquals::Operation(domain[i], domain[j]);
+      case ExpressionType::COMPARE_LESSTHAN: return LessThan::Operation(domain[i], domain[j]);
+      case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+        return LessThanEquals::Operation(domain[i], domain[j]);
+      default: FAIL("Unexpected comparison"); return false;
+    }
+  };
+  // Compare projected row identities, so an incorrect match cannot hide behind an equal row count.
+  // -1 denotes NULL or the absent second column of a semi/anti join.
+  std::vector<std::pair<int32_t, int32_t>> expected;
+  std::vector<bool> right_matched(domain.size(), false);
+  for (size_t i = 0; i < domain.size(); ++i) {
+    bool matched = false, unknown = false;
+    for (size_t j = 0; j < domain.size(); ++j) {
+      auto match = matches(i, j);
+      unknown |= !match.has_value();
+      if (!match.value_or(false)) continue;
+      matched          = true;
+      right_matched[j] = true;
+      if (join_type != JoinType::SEMI && join_type != JoinType::ANTI && join_type != JoinType::MARK)
+        expected.emplace_back(ids[i], ids[j]);
+    }
+    if (join_type == JoinType::MARK)
+      expected.emplace_back(ids[i], matched ? 1 : unknown ? -1 : 0);
+    else if ((join_type == JoinType::SEMI && matched) ||
+             (join_type == JoinType::ANTI && !matched) ||
+             ((join_type == JoinType::LEFT || join_type == JoinType::OUTER) && !matched))
+      expected.emplace_back(ids[i], -1);
+  }
+  if (join_type == JoinType::RIGHT || join_type == JoinType::OUTER)
+    for (size_t j = 0; j < domain.size(); ++j)
+      if (!right_matched[j]) expected.emplace_back(-1, ids[j]);
+
+  auto result = execute_projected_nlj(join, make_input(), make_input());
+  REQUIRE(result.view.num_columns() == logical.types.size());
+  auto left_ids   = copy_column_to_host<int32_t>(result.view.column(0));
+  auto left_valid = copy_validity_to_host(result.view.column(0));
+  std::vector<std::pair<int32_t, int32_t>> actual;
+  std::vector<int32_t> right_ids(left_ids.size(), -1);
+  if (result.view.num_columns() == 2) {
+    auto col         = result.view.column(1);
+    auto right_valid = copy_validity_to_host(col);
+    if (join_type == JoinType::MARK) {
+      auto marks = copy_column_to_host<bool>(col);
+      for (size_t i = 0; i < marks.size(); ++i)
+        right_ids[i] = right_valid[i] ? int32_t(marks[i]) : -1;
+    } else {
+      right_ids = copy_column_to_host<int32_t>(col);
+      for (size_t i = 0; i < right_ids.size(); ++i)
+        if (!right_valid[i]) right_ids[i] = -1;
+    }
+  }
+  for (size_t i = 0; i < left_ids.size(); ++i)
+    actual.emplace_back(left_valid[i] ? left_ids[i] : -1, right_ids[i]);
+  std::sort(actual.begin(), actual.end());
+  std::sort(expected.begin(), expected.end());
+  REQUIRE(actual == expected);
 }

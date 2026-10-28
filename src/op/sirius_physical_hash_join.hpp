@@ -150,13 +150,10 @@ struct build_probe_decision {
   double estimated_probe_to_build_ratio,
   std::optional<uint64_t> resident_bytes = std::nullopt);
 
-/// Which broadcast slots to discard. In a broadcast join the build table is replicated to every
-/// slot but the probe side is unpartitioned, so a slot may hold build data yet never receive probe
-/// data. Once the probe upstream is finished (`probe_finished`), any slot that is still NOT_BUILT
-/// with a build batch but no probe batch will never be probed and is returned for discard. Returns
-/// empty while the probe side may still deliver data. Pure/unit-testable counterpart of
-/// discard_build_only_slots_if_probe_complete.
-[[nodiscard]] std::vector<std::size_t> broadcast_slots_to_discard(
+/**
+ * @brief Select never-probed build slots that can be reclaimed after the probe producer closes.
+ */
+[[nodiscard]] std::vector<std::size_t> build_probe_slots_to_reclaim(
   std::vector<build_probe_slot_view> const& slots, bool probe_finished);
 
 //===----------------------------------------------------------------------===//
@@ -427,11 +424,13 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// scheduler (`select_build_probe_action`). Must be called with `op_state_mutex` held.
   std::vector<build_probe_slot_view> snapshot_build_probe_slots();
 
-  /// Broadcast-mode cleanup: once the probe upstream is finished, any NOT_BUILT slot that holds a
-  /// (replicated) build batch but never received probe data is discarded — its build batch is freed
-  /// on its own GPU and the slot is marked DESTROYED so the operator can complete. No-op unless
-  /// `_broadcast`. Must be called with `op_state_mutex` held.
-  void discard_build_only_slots_if_probe_complete();
+  /**
+   * @brief Release never-probed builds after the probe producer closes.
+   *
+   * @param probe_finished True if the probe producer has finished.
+   * @pre `op_state_mutex` is held, and the probe producer has finished.
+   */
+  void reclaim_build_only_slots_if_probe_complete(bool probe_finished);
 
   std::optional<task_creation_hint> get_next_task_hint() override;
 
