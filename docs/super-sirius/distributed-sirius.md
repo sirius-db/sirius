@@ -198,6 +198,8 @@ single-process plan already partitions:
 places nothing itself: each rank materializes its share, and the `CTE_SCAN`s under the consumer side
 take the materialization's placement. A hash exchange may start from an input on rank 0 alone (a
 gathered scalar): rank 0 sends its rows by key, and the other ranks' copies of it hold none.
+A `GPU_VALUES` (a `VALUES` list, or a `count(*)` DuckDB answered from Parquet metadata) is on
+rank 0 the same way: every rank planned the same rows, so the other ranks' copies emit none.
 
 A hash join's build side is broadcast when its estimated size is at most 1 GiB and at most the
 probe side's divided by ranks − 1, and when its join type emits build rows only with a probe match.
@@ -345,7 +347,7 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
 |---|---|
 | `[exchange][wire]`, `[exchange][batch_io]` | Headers and refusals; batches through 64 KiB to 1 MiB frames to the GPU and host |
 | `[exchange][transport]` | All-to-all on 3 and 4 ranks over the loopback fabric; one credit per peer; shuffled notifications; no room; failed writes |
-| `[exchange][operators]` | Hash, range, broadcast, gather, ordered gather, early arrivals, hints, failure |
+| `[exchange][operators]` | Hash, range, broadcast, gather, ordered gather, early arrivals, hints, failure; NULL keys to every rank; `VALUES` on rank 0 |
 | `[exchange][byte_range]` | Byte spans tile every file exactly once across ranks; one file split in two; balance by bytes |
 | `[exchange][collectives]` | All-gather; distributed `SORT_SAMPLE` on skewed and empty inputs; `SORT_SAMPLE` feeding a range exchange |
 | `[exchange][nixl]` | Two ranks in one process over NIXL (NIXL builds only) |
