@@ -169,7 +169,7 @@ Controls pinned host memory pools. One pool group is created per NUMA node (auto
 | `capacity_bytes` | bytes | — | Pinned host memory capacity **per NUMA node** as absolute bytes, allocated with `cudaMallocHost`. Mutually exclusive with `capacity_fraction`; configuration loading rejects both when both values are non-null. |
 | `reservation_limit_fraction` | double | 1.0 | Fraction of host capacity that can be reserved. Mutually exclusive with `reservation_limit_bytes`; configuration loading rejects both when both values are non-null. |
 | `reservation_limit_bytes` | bytes | — | Absolute reservation limit. Mutually exclusive with `reservation_limit_fraction`; configuration loading rejects both when both values are non-null. |
-| `downgrade_trigger_fraction` | double (0,1] | 0.9 | Start evicting host-resident data to disk when reserved memory exceeds this fraction. Must be greater than `downgrade_stop_fraction`. Eviction also requires a configured `downgrade_root_dirs`; without one the downgrade executor logs a warning and skips. |
+| `downgrade_trigger_fraction` | double (0,1] | 0.9 | Start HOST memory reclamation above this fraction. Must be greater than `downgrade_stop_fraction`. File-cache reclaim needs no DISK tier; spilling HOST repository data requires configured `downgrade_root_dirs`. |
 | `downgrade_stop_fraction` | double (0,1] | 0.8 | Stop evicting when reserved memory drops to this fraction. Must be less than `downgrade_trigger_fraction`; configuration loading rejects an invalid pair. |
 | `block_size` | bytes | 1Mi | Size of each allocation block in the pool. Larger blocks reduce allocation overhead but waste memory on small allocations. |
 | `pool_size` | int | 128 | Number of blocks per pool. Total pool capacity = `block_size × pool_size`. |
@@ -339,6 +339,14 @@ Thread pool (default `num_threads: 1`) plus:
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `monitor_period` | int (ms) | 10 | Period of the memory-pressure monitor loop. Set to `0` to disable the monitor loop entirely. |
+
+HOST downgrade executors synchronously reclaim idle staging chunks from the default local
+ioctx's `fs_cache` before spilling repository batches or queued tasks. If a byte-target request
+is still short after those workers finish, a forced pass reclaims additional unpinned,
+non-loading chunks up to the remaining deficit, even if a future scan subscribes to them.
+Reclaim credits bytes actually returned to the shared host pool; it performs no disk writes
+and needs no DISK tier. GPU executors and routed remote ioctx caches do not participate.
+This adds no configuration keys.
 
 ## Scan Manager & IO Configuration
 
