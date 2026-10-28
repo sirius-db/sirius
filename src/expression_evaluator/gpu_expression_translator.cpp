@@ -566,7 +566,7 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
                           *upper_expr,
                           floating);
   return _ast_tree.emplace<cudf::ast::operation>(
-    cudf::ast::ast_operator::LOGICAL_AND, lower_cmp_op, upper_cmp_op);
+    cudf::ast::ast_operator::NULL_LOGICAL_AND, lower_cmp_op, upper_cmp_op);
 }
 
 //===----------CASE----------===//

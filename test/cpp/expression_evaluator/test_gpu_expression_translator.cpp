@@ -1709,3 +1709,46 @@ TEST_CASE("translator: floating IN and NOT IN include NaN",
   auto expected = negated ? std::vector<int8_t>{1, 1, 0, 1, 0} : std::vector<int8_t>{0, 0, 1, 0, 1};
   REQUIRE(actual == expected);
 }
+
+TEST_CASE("translator: BETWEEN and NOT BETWEEN preserve NULL conjunction semantics",
+          "[expression_translator][between][null_logic]")
+{
+  auto const negated = GENERATE(false, true);
+  auto const nan     = std::numeric_limits<double>::quiet_NaN();
+  auto const inf     = std::numeric_limits<double>::infinity();
+  auto column        = [&](std::vector<double> const& values, std::vector<size_t> const& nulls) {
+    auto table   = make_float64_table(values);
+    auto columns = table->release();
+    auto col     = std::move(columns.front());
+    auto mask    = cudf::create_null_mask(values.size(), cudf::mask_state::ALL_VALID, stream, mr);
+    for (auto i : nulls)
+      cudf::set_null_mask(static_cast<cudf::bitmask_type*>(mask.data()), i, i + 1, false, stream);
+    col->set_null_mask(std::move(mask), nulls.size());
+    return col;
+  };
+  // FALSE AND NULL in either order, TRUE AND NULL, NULL input, then NaN/infinity bounds.
+  auto input      = column({2, 2, 2, 2, 0, nan, inf, nan, 2, nan}, {4});
+  auto lower      = column({0, 3, 0, 1, 1, 0, 0, 0, nan, 0}, {0, 2, 9});
+  auto upper      = column({1, 0, 3, 0, 3, nan, nan, inf, 0, inf}, {1, 3, 8});
+  auto const type = logical_type::make(type_id::DOUBLE);
+  auto expr       = make_between(
+    make_ref_typed(0, type), make_ref_typed(1, type), make_ref_typed(2, type), true, true);
+  if (negated) expr = make_unary(sirius::ast::unary_op::kind::op_not, std::move(expr));
+  auto translator = make_translator();
+  auto ast_tree   = translate(translator, *expr);
+  REQUIRE(ast_tree.has_value());
+  auto result = cudf::compute_column(
+    cudf::table_view{{input->view(), lower->view(), upper->view()}}, ast_tree->back(), stream, mr);
+  auto const values = copy_column_to_host<int8_t>(result->view());
+  auto const valid  = copy_valids_to_host(result->view());
+  std::vector<bool> const expected_valid{
+    true, true, false, false, false, true, true, true, true, true};
+  std::vector<bool> const expected{
+    false, false, false, false, false, true, true, false, false, false};
+  REQUIRE(valid == expected_valid);
+  REQUIRE(values.size() == expected.size());
+  for (size_t i = 0; i < values.size(); ++i) {
+    CAPTURE(negated, i);
+    if (valid[i]) CHECK(bool(values[i]) == (negated ? !expected[i] : expected[i]));
+  }
+}

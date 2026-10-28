@@ -61,8 +61,9 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::between const& alt,
                             input.get_expr(),
                             upper.get_expr(),
                             floating);
+    // SQL BETWEEN is a three-valued conjunction: FALSE AND NULL is FALSE.
     auto const& between_expr = _ast_tree.emplace<cudf::ast::operation>(
-      cudf::ast::ast_operator::LOGICAL_AND, lower_expr, upper_expr);
+      cudf::ast::ast_operator::NULL_LOGICAL_AND, lower_expr, upper_expr);
 
     //===----------1: AST Mode----------===//
     if (mode == evaluation_mode::AST) {
@@ -112,7 +113,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::between const& alt,
   }
   auto result_column = cudf::binary_operation(lower_cmp->view(),
                                               upper_cmp->view(),
-                                              cudf::binary_operator::LOGICAL_AND,
+                                              cudf::binary_operator::NULL_LOGICAL_AND,
                                               output_type,
                                               _stream,
                                               _mr);

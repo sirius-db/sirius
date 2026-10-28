@@ -352,9 +352,18 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::in_list const& alt,
   }
   auto const ast_op_count = alt.cudf_ast_op_count();
 
+  auto const all_constants = std::all_of(alt.values.begin(), alt.values.end(), [](auto const& v) {
+    return v && v->template holds<sirius::ast::constant>();
+  });
+  // cuDF contains treats NaNs and signed zeros as equal. Keep its constant-list lookup under
+  // MATERIALIZE; the path below also handles NULL list entries and NOT IN. Nonconstant floating
+  // lists still need the NaN-aware comparison chain, including when MATERIALIZE is selected.
+  auto const constant_lookup =
+    _policy.strategy == expression_evaluator_strategy::MATERIALIZE && all_constants;
   auto const floating = floating_comparison(alt.probe->return_type(), alt.probe->return_type());
-  if (floating || (_policy.strategy != expression_evaluator_strategy::MATERIALIZE &&
-                   (mode == evaluation_mode::AST || ast_op_count >= _min_ast_size))) {
+  if ((floating && !constant_lookup) ||
+      (_policy.strategy != expression_evaluator_strategy::MATERIALIZE &&
+       (mode == evaluation_mode::AST || ast_op_count >= _min_ast_size))) {
     D_ASSERT(!alt.values.empty());
 
     // `x IN (a, b)` is `x = a OR x = b` under Kleene logic, so a match stays TRUE when another
@@ -416,11 +425,6 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::in_list const& alt,
     return evaluate_result(
       cudf::unary_operation(in_result->view(), cudf::unary_operator::NOT, _stream, _mr));
   };
-
-  // Optimization: special handling when every haystack entry is a constant.
-  auto const all_constants = std::all_of(alt.values.begin(), alt.values.end(), [](auto const& v) {
-    return v && v->template holds<sirius::ast::constant>();
-  });
 
   if (all_constants) {
     // A NULL entry never matches, but it turns every non-match into NULL instead of FALSE.
