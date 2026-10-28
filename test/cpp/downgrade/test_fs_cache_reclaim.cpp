@@ -161,9 +161,13 @@ struct reclaim_fixture {
   }
 };
 
-void dispose_and_wait(cache::cache_handle& handle)
+void dispose_and_wait(reclaim_fixture& fixture, cache::cache_handle& handle)
 {
   handle.update(cache::scan_stage::disposed);
+  // Disposal alone does not wake the evictor to release subscribers. An empty-range
+  // fadvise request wakes it without allocating or evicting chunks needed by the test.
+  auto wake = fixture.scans.create_datasource(fixture.file.path.string());
+  wake->fadvise({}, 0);
   auto const chunks = handle.chunks();
   REQUIRE(chunks != nullptr);
   auto const unsubscribed = [&] {
@@ -211,7 +215,7 @@ TEST_CASE("HOST downgrade satisfies a target from idle cache before repositories
   reclaim_fixture fixture;
   auto idle = fixture.prepare(0, 2);
   auto live = fixture.prepare(2, 2);
-  dispose_and_wait(idle);
+  dispose_and_wait(fixture, idle);
 
   auto const query_id = sirius::make_query_id(1);
   fixture.lifecycle.open_query(query_id);
