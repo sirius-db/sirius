@@ -130,15 +130,21 @@ std::vector<std::optional<cudf::data_type>>
 sirius_physical_grouped_aggregate::wide_integer_sum_partial_types() const
 {
   auto const aggregate_offset = num_output_group_columns();
-  if (std::ranges::none_of(cudf_aggregate_is_wide_integer_sum, std::identity{}) ||
+  auto const has_two_carriers = [](AggregateSlot const& slot) {
+    return slot.is_wide_integer_sum || slot.returns_hugeint;
+  };
+  if (std::ranges::none_of(aggregate_slots, has_two_carriers) ||
       types.size() != aggregate_offset + cudf_aggregates.size()) {
     return {};
   }
+  // The partial is INT64 or DECIMAL128 with scale 0; the alternate is whichever is not native.
   std::vector<std::optional<cudf::data_type>> alternates(types.size());
-  for (size_t i = 0; i < cudf_aggregate_is_wide_integer_sum.size(); ++i) {
-    if (cudf_aggregate_is_wide_integer_sum[i]) {
-      alternates[aggregate_offset + i] = wide_integer_sum_type();
-    }
+  for (auto const& slot : aggregate_slots) {
+    if (!has_two_carriers(slot)) { continue; }
+    auto const column  = aggregate_offset + slot.cudf_idx;
+    alternates[column] = sirius::require_cudf_type(types[column]) == wide_integer_sum_type()
+                           ? cudf::data_type{cudf::type_id::INT64}
+                           : wide_integer_sum_type();
   }
   return alternates;
 }

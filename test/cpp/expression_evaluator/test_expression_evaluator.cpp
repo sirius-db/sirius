@@ -1179,10 +1179,15 @@ TEMPLATE_TEST_CASE("evaluate casts scalar constants including HUGEINT and NULL",
     auto const view = output->view();
     REQUIRE(view.num_rows() == row_count);
     REQUIRE(view.num_columns() == 5);
-    for (int i = 0; i < 4; ++i) {
+    // HUGEINT is carried as DECIMAL128 with scale 0.
+    for (int i : {0, 2}) {
+      REQUIRE(view.column(i).type() == cudf::data_type{cudf::type_id::DECIMAL128, 0});
+    }
+    for (int i : {1, 3}) {
       REQUIRE(view.column(i).type() == cudf::data_type{cudf::type_id::INT64});
     }
-    REQUIRE(copy_column_to_host<int64_t>(view.column(0)) == std::vector<int64_t>(row_count, -42));
+    REQUIRE(copy_column_to_host<__int128_t>(view.column(0)) ==
+            std::vector<__int128_t>(row_count, -42));
     REQUIRE(copy_column_to_host<int64_t>(view.column(1)) == std::vector<int64_t>(row_count, 1));
     REQUIRE(view.column(0).null_count() == 0);
     REQUIRE(view.column(1).null_count() == 0);

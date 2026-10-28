@@ -258,19 +258,19 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
   bool const has_stddev =
     std::ranges::any_of(aggregate_slots, [](auto const& slot) { return slot.is_stddev_samp; });
   auto const num_group_cols = static_cast<int>(num_output_group_columns());
-  // A wide integer SUM that was accumulated over DECIMAL128 is narrowed back to its INT64 result
-  // in the post-merge projection; one that stayed INT64 passes through.
-  auto const has_widened_sum = [&](cudf::table_view const& view) {
+  // An aggregate whose result is HUGEINT but whose sum stayed INT64 is widened to HUGEINT's
+  // DECIMAL128 carrier in the post-merge projection; a DECIMAL128 one passes through.
+  auto const has_int64_hugeint = [&](cudf::table_view const& view) {
     return std::ranges::any_of(aggregate_slots, [&](auto const& slot) {
-      return slot.is_wide_integer_sum && !slot.is_avg &&
-             view.column(num_group_cols + static_cast<int>(slot.cudf_idx)).type() ==
-               wide_integer_sum_type();
+      return slot.returns_hugeint &&
+             view.column(num_group_cols + static_cast<int>(slot.cudf_idx)).type().id() ==
+               cudf::type_id::INT64;
     });
   };
 
   // Fast path: single batch with no post-processing needed
   if (input_batches.size() == 1 && !has_avg && !has_count_distinct && !has_stddev &&
-      !has_widened_sum(get_cudf_table_view(input_batches[0]))) {
+      !has_int64_hugeint(get_cudf_table_view(input_batches[0]))) {
     return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
   }
 
@@ -294,7 +294,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
 
   // If no post-processing needed, return merged result directly
   if (!has_avg && !has_count_distinct && !has_stddev &&
-      !has_widened_sum(get_cudf_table_view(merged->to_read_only()))) {
+      !has_int64_hugeint(get_cudf_table_view(merged->to_read_only()))) {
     return std::make_unique<pipelineable_operator_data>(
       std::vector<std::shared_ptr<::cucascade::data_batch>>{merged});
   }
@@ -356,10 +356,10 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
       auto count_int64 =
         cudf::cast(count_int32->view(), cudf::data_type{cudf::type_id::INT64}, stream, mr);
       output_cols.push_back(std::move(count_int64));
-    } else if (slot.is_wide_integer_sum) {
-      // INT64 passes through; DECIMAL128 is narrowed, or the query falls back if it overflows.
+    } else if (slot.returns_hugeint) {
+      // INT64 is widened to HUGEINT's carrier; DECIMAL128 passes through.
       int col_idx = num_group_cols + static_cast<int>(slot.cudf_idx);
-      output_cols.push_back(narrow_wide_integer_sum(std::move(merged_cols[col_idx]), stream, mr));
+      output_cols.push_back(to_hugeint_carrier(std::move(merged_cols[col_idx]), stream, mr));
     } else {
       // Move non-AVG, non-count-distinct aggregate columns directly (zero-copy)
       int col_idx = num_group_cols + static_cast<int>(slot.cudf_idx);

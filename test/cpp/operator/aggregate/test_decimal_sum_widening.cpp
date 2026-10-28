@@ -289,8 +289,8 @@ bool narrows(std::unique_ptr<cudf::column> const& column)
 }
 
 using sirius::op::is_wide_integer_sum;
-using sirius::op::narrow_wide_integer_sum;
 using sirius::op::partial_sums_may_overflow;
+using sirius::op::to_hugeint_carrier;
 using sirius::op::wide_integer_sum_type;
 
 std::unique_ptr<cudf::column> i64(std::vector<int64_t> const& values)
@@ -308,22 +308,22 @@ std::unique_ptr<cudf::column> d128(std::vector<__int128_t> const& values)
   return make_column(wide_integer_sum_type(), values);
 }
 
-std::vector<int64_t> to_host(cudf::column_view const& column)
-{
-  return sirius::test::operator_utils::copy_column_to_host<int64_t>(column,
-                                                                    cudf::get_default_stream());
-}
-
 bool partials_may_overflow(std::unique_ptr<cudf::column> const& column)
 {
   return partial_sums_may_overflow(
     column->view(), cudf::get_default_stream(), cudf::get_current_device_resource_ref());
 }
 
-std::unique_ptr<cudf::column> narrow(std::unique_ptr<cudf::column> column)
+std::unique_ptr<cudf::column> to_hugeint(std::unique_ptr<cudf::column> column)
 {
-  return narrow_wide_integer_sum(
+  return to_hugeint_carrier(
     std::move(column), cudf::get_default_stream(), cudf::get_current_device_resource_ref());
+}
+
+std::vector<__int128_t> to_host_128(cudf::column_view const& column)
+{
+  return sirius::test::operator_utils::copy_column_to_host<__int128_t>(column,
+                                                                       cudf::get_default_stream());
 }
 
 }  // namespace
@@ -415,15 +415,17 @@ TEST_CASE("wide integer sum - which aggregates DuckDB accumulates in HUGEINT",
   using sirius::aggregate_id;
   using sirius::logical_type;
   using sirius::type_id;
-  for (auto id : {type_id::INTEGER, type_id::BIGINT, type_id::HUGEINT}) {
+  for (auto id : {type_id::INTEGER, type_id::BIGINT}) {
     CHECK(is_wide_integer_sum(aggregate_id::sum, logical_type::make(id)));
     CHECK(is_wide_integer_sum(aggregate_id::avg, logical_type::make(id)));
     // DuckDB's statistics proved the total fits in INT64.
     CHECK_FALSE(is_wide_integer_sum(aggregate_id::sum_no_overflow, logical_type::make(id)));
     CHECK_FALSE(is_wide_integer_sum(aggregate_id::min, logical_type::make(id)));
   }
-  // DuckDB itself sums these in INT64; decimals have their own widening.
-  for (auto id : {type_id::TINYINT, type_id::SMALLINT, type_id::BOOLEAN, type_id::DOUBLE}) {
+  // Narrow totals cannot leave INT64; HUGEINT is a DECIMAL128 carrier and, like decimals, has its
+  // own SUM path.
+  for (auto id :
+       {type_id::TINYINT, type_id::SMALLINT, type_id::BOOLEAN, type_id::DOUBLE, type_id::HUGEINT}) {
     CHECK_FALSE(is_wide_integer_sum(aggregate_id::sum, logical_type::make(id)));
   }
   CHECK_FALSE(is_wide_integer_sum(aggregate_id::sum, logical_type::make_decimal(18, 2)));
@@ -462,29 +464,30 @@ TEST_CASE("wide integer sum - INT64 partials are merged in INT64 only below 2^62
   CHECK_THROWS_AS(partials_may_overflow(d64({1})), sirius::internal_exception);
 }
 
-TEST_CASE("wide integer sum - a DECIMAL128 total narrows to INT64 or falls back",
+TEST_CASE("wide integer sum - a HUGEINT result is finalized to DECIMAL128 with scale 0",
           "[aggregate][wide_integer_sum]")
 {
-  // INT64 passes through untouched.
-  auto int64_result = narrow(i64({5, -7}));
-  CHECK(int64_result->type().id() == cudf::type_id::INT64);
-  CHECK(to_host(int64_result->view()) == std::vector<int64_t>{5, -7});
+  // INT64 totals, including both extremes, widen exactly.
+  auto widened = to_hugeint(i64({kMax64, kMin64, 0}));
+  CHECK(widened->type() == wide_integer_sum_type());
+  CHECK(to_host_128(widened->view()) == std::vector<__int128_t>{kMax64, kMin64, 0});
 
-  // Totals inside the INT64 range, including both extremes, narrow exactly.
-  auto narrowed = narrow(d128({kMax64, kMin64, 0}));
-  CHECK(narrowed->type().id() == cudf::type_id::INT64);
-  CHECK(to_host(narrowed->view()) == std::vector<int64_t>{kMax64, kMin64, 0});
+  // DECIMAL128 totals past either end pass through untouched.
+  auto const past_max = __int128_t{kMax64} + 1;
+  auto const past_min = __int128_t{kMin64} - 1;
+  auto passed         = to_hugeint(d128({past_max, past_min}));
+  CHECK(passed->type() == wide_integer_sum_type());
+  CHECK(to_host_128(passed->view()) == std::vector<__int128_t>{past_max, past_min});
 
-  // One past either end is a HUGEINT result: the query must fall back to DuckDB.
-  CHECK_THROWS_AS(narrow(d128({__int128_t{kMax64} + 1})), sirius::not_implemented_exception);
-  CHECK_THROWS_AS(narrow(d128({0, __int128_t{kMin64} - 1})), sirius::not_implemented_exception);
-
-  // An all-null total (an all-null group) narrows to an all-null INT64 column.
-  auto all_null = d128({__int128_t{kMax64} * 4});
+  // An all-null INT64 total (an all-null group) widens to an all-null DECIMAL128 column.
+  auto all_null = i64({kMax64});
   set_all_null(*all_null);
-  auto narrowed_null = narrow(std::move(all_null));
-  CHECK(narrowed_null->type().id() == cudf::type_id::INT64);
-  CHECK(narrowed_null->null_count() == 1);
+  auto widened_null = to_hugeint(std::move(all_null));
+  CHECK(widened_null->type() == wide_integer_sum_type());
+  CHECK(widened_null->null_count() == 1);
+
+  CHECK_THROWS_AS(to_hugeint(i32({1})), sirius::internal_exception);
+  CHECK_THROWS_AS(to_hugeint(d64({1})), sirius::internal_exception);
 }
 
 namespace {

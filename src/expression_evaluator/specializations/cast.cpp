@@ -27,12 +27,14 @@
 // cudf
 #include <cudf/column/column_factories.hpp>
 #include <cudf/cudf_utils.hpp>
+#include <cudf/strings/convert/convert_fixed_point.hpp>
 #include <cudf/strings/convert/convert_integers.hpp>
 #include <cudf/unary.hpp>
 #include <cudf/utilities/traits.hpp>
 
 // standard library
 #include <algorithm>
+#include <limits>
 
 namespace sirius {
 using evaluate_result = expression_evaluator::evaluate_result;
@@ -53,14 +55,74 @@ cudf::ast::ast_operator cast_op_to_ast(sirius::type_id id)
   }
 }
 
+// Largest power of ten an int128 holds is 10^38.
+__int128_t power_of_ten(int32_t exponent)
+{
+  __int128_t result = 1;
+  for (int32_t i = 0; i < exponent; ++i) {
+    result *= 10;
+  }
+  return result;
+}
+
+// cuDF narrows a DECIMAL128 HUGEINT carrier by wrapping, where DuckDB's CAST raises an error and
+// TRY_CAST returns NULL. Throw when any value lies outside @p target's SQL range so the query
+// falls back to DuckDB, which gives its exact behavior. Wider targets need no check.
+void require_hugeint_cast_in_range(cudf::column_view const& input,
+                                   logical_type const& target,
+                                   ::cuda::stream_ref stream,
+                                   rmm::device_async_resource_ref mr)
+{
+  __int128_t minimum = 0;
+  __int128_t maximum = 0;
+  switch (target.id()) {
+    case type_id::TINYINT:
+      minimum = std::numeric_limits<int8_t>::min();
+      maximum = std::numeric_limits<int8_t>::max();
+      break;
+    case type_id::SMALLINT:
+      minimum = std::numeric_limits<int16_t>::min();
+      maximum = std::numeric_limits<int16_t>::max();
+      break;
+    case type_id::INTEGER:
+      minimum = std::numeric_limits<int32_t>::min();
+      maximum = std::numeric_limits<int32_t>::max();
+      break;
+    case type_id::BIGINT:
+      minimum = std::numeric_limits<int64_t>::min();
+      maximum = std::numeric_limits<int64_t>::max();
+      break;
+    case type_id::UTINYINT: maximum = std::numeric_limits<uint8_t>::max(); break;
+    case type_id::USMALLINT: maximum = std::numeric_limits<uint16_t>::max(); break;
+    case type_id::UINTEGER: maximum = std::numeric_limits<uint32_t>::max(); break;
+    // UHUGEINT is carried as UINT64.
+    case type_id::UBIGINT:
+    case type_id::UHUGEINT: maximum = std::numeric_limits<uint64_t>::max(); break;
+    case type_id::DECIMAL: {
+      // |v| < 10^(p-s) also keeps the rescaled value within the target's p digits.
+      auto const digits = target.decimal_precision() - target.decimal_scale();
+      if (digits >= 38) { return; }
+      maximum = power_of_ten(digits) - 1;
+      minimum = -maximum;
+      break;
+    }
+    default: return;
+  }
+  auto const range = compute_exact_numeric_range(input, stream, mr);
+  // Empty and all-NULL columns have no values to overflow.
+  if (!range) { return; }
+  if (range->minimum < minimum || range->maximum > maximum) {
+    throw not_implemented_exception(
+      "[expression_evaluator:cast] HUGEINT value out of range for {}; falling back to DuckDB",
+      target.to_string());
+  }
+}
+
 }  // namespace
 
 evaluate_result expression_evaluator::evaluate(sirius::ast::cast const& alt, evaluation_mode mode)
 {
-  auto const ast_supported =
-    std::find(supported_ast_cast_types_native.begin(),
-              supported_ast_cast_types_native.end(),
-              alt.target_type.id()) != supported_ast_cast_types_native.end();
+  auto const ast_supported = ast_supports_cast(alt.child->return_type(), alt.target_type);
 
   auto const ast_op_count = alt.cudf_ast_op_count();
 
@@ -99,6 +161,10 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::cast const& alt, eva
   } else if (return_type.id() == cudf::type_id::STRING &&
              cudf::is_integral_not_bool(input.type())) {
     result_column = cudf::strings::from_integers(input, _stream, _mr);
+  } else if (return_type.id() == cudf::type_id::STRING &&
+             alt.child->return_type().id() == type_id::HUGEINT) {
+    // HUGEINT's carrier is DECIMAL128 with scale 0, which formats as a plain integer.
+    result_column = cudf::strings::from_fixed_point(input, _stream, _mr);
   } else if (input.type().id() == cudf::type_id::TIMESTAMP_DAYS &&
              (return_type.id() == cudf::type_id::TIMESTAMP_SECONDS ||
               return_type.id() == cudf::type_id::TIMESTAMP_MILLISECONDS ||
@@ -112,6 +178,9 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::cast const& alt, eva
     // Carrier restores were handled above; only semantic casts reach this branch.
     result_column = temporal::cast_to_microseconds_checked(input, _stream, _mr);
   } else {
+    if (alt.child->return_type().id() == type_id::HUGEINT) {
+      require_hugeint_cast_in_range(input, alt.target_type, _stream, _mr);
+    }
     result_column = cudf::cast(input, return_type, _stream, _mr);
   }
   if (mode == evaluation_mode::AST) {

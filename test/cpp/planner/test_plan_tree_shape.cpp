@@ -1338,12 +1338,13 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
     auto const int64      = cudf::data_type{cudf::type_id::INT64};
     auto const decimal128 = cudf::data_type{cudf::type_id::DECIMAL128, 0};
+    // HUGEINT's native carrier is DECIMAL128, so INT64 is the alternate.
     for (auto const* op : {local, partition}) {
       REQUIRE(op->get_types().size() == 2);
       CHECK(op->get_types()[1].id() == sirius::type_id::HUGEINT);
-      CHECK(op->is_alternate_physical_type(1, decimal128));
-      CHECK_FALSE(op->is_alternate_physical_type(1, int64));
-      CHECK_FALSE(op->is_alternate_physical_type(0, decimal128));
+      CHECK(op->is_alternate_physical_type(1, int64));
+      CHECK_FALSE(op->is_alternate_physical_type(1, decimal128));
+      CHECK_FALSE(op->is_alternate_physical_type(0, int64));
     }
   }
 

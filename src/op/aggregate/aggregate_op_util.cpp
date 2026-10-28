@@ -82,8 +82,7 @@ bool is_wide_integer_sum(sirius::aggregate_id id, sirius::logical_type const& in
   if (id != sirius::aggregate_id::sum && id != sirius::aggregate_id::avg) { return false; }
   switch (input_type.id()) {
     case sirius::type_id::INTEGER:
-    case sirius::type_id::BIGINT:
-    case sirius::type_id::HUGEINT: return true;
+    case sirius::type_id::BIGINT: return true;
     default: return false;
   }
 }
@@ -218,9 +217,11 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
     }
     result.cudf_aggregate_struct_col_indices.push_back({});
     bool const is_stddev_samp = fid == sirius::aggregate_id::stddev_samp;
-    result.aggregate_slots.push_back({.cudf_idx            = current_position,
-                                      .is_stddev_samp      = is_stddev_samp,
-                                      .is_wide_integer_sum = wide});
+    result.aggregate_slots.push_back(
+      {.cudf_idx            = current_position,
+       .is_stddev_samp      = is_stddev_samp,
+       .is_wide_integer_sum = wide,
+       .returns_hugeint     = aggr.return_type().id() == sirius::type_id::HUGEINT});
     result.local_types.push_back(
       is_stddev_samp ? sirius::logical_type::make(sirius::type_id::STRUCT) : aggr.return_type());
   }
@@ -560,24 +561,17 @@ bool partial_sums_may_overflow(cudf::column_view const& column,
   return !(sum_of_magnitudes(column, stream, mr) < limit);
 }
 
-std::unique_ptr<cudf::column> narrow_wide_integer_sum(std::unique_ptr<cudf::column> column,
-                                                      ::cuda::stream_ref stream,
-                                                      rmm::device_async_resource_ref mr)
+std::unique_ptr<cudf::column> to_hugeint_carrier(std::unique_ptr<cudf::column> column,
+                                                 ::cuda::stream_ref stream,
+                                                 rmm::device_async_resource_ref mr)
 {
   auto const type = column->type();
-  if (type.id() == cudf::type_id::INT64) { return column; }
-  if (type != wide_integer_sum_type()) {
-    throw sirius::internal_exception("narrow_wide_integer_sum: unexpected column type {}",
+  if (type == wide_integer_sum_type()) { return column; }
+  if (type.id() != cudf::type_id::INT64) {
+    throw sirius::internal_exception("to_hugeint_carrier: unexpected column type {}",
                                      cudf::type_to_name(type));
   }
-  // DECIMAL64 with scale 0 has INT64's storage range. The check passes a column with no valid
-  // value and fails one whose bounds cannot be established.
-  if (!column_values_fit(
-        column->view(), cudf::data_type{cudf::type_id::DECIMAL64, 0}, stream, mr)) {
-    throw sirius::not_implemented_exception(
-      "SUM result outside the BIGINT range is not supported on GPU (HUGEINT result)");
-  }
-  return cudf::cast(column->view(), cudf::data_type{cudf::type_id::INT64}, stream, mr);
+  return cudf::cast(column->view(), wide_integer_sum_type(), stream, mr);
 }
 
 }  // namespace op

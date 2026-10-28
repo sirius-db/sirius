@@ -24,6 +24,7 @@
 #include <duckdb/common/types.hpp>
 
 // standard library
+#include <algorithm>
 #include <array>
 
 // Internal AST capability lists shared by the evaluator, translator, and planning code.
@@ -39,6 +40,16 @@ inline constexpr std::array<duckdb::LogicalTypeId, 3> supported_ast_cast_types{
 /// types as above, expressed via sirius::type_id for native AST consumers.
 inline constexpr std::array<sirius::type_id, 3> supported_ast_cast_types_native{
   {sirius::type_id::UBIGINT, sirius::type_id::BIGINT, sirius::type_id::DOUBLE}};
+
+/// Whether a semantic CAST of @p source to @p target lowers to one cuDF AST op. The AST's integer
+/// casts wrap, so a HUGEINT source, which a narrowing cast must range-check, lowers only to DOUBLE.
+[[nodiscard]] inline bool ast_supports_cast(logical_type const& source, logical_type const& target)
+{
+  auto const supported = std::find(supported_ast_cast_types_native.begin(),
+                                   supported_ast_cast_types_native.end(),
+                                   target.id()) != supported_ast_cast_types_native.end();
+  return supported && (source.id() != type_id::HUGEINT || target.id() == type_id::DOUBLE);
+}
 
 /// BOUND_FUNCTION names that are currently safe to lower into a cuDF AST.
 inline constexpr std::array<function_id, 6> supported_ast_functions{function_id::add,

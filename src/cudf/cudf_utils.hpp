@@ -212,9 +212,9 @@ inline std::size_t estimate_referenced_column_bytes(
     case type_id::SMALLINT: return cudf::data_type(cudf::type_id::INT16);
     case type_id::INTEGER: return cudf::data_type(cudf::type_id::INT32);
     case type_id::BIGINT: return cudf::data_type(cudf::type_id::INT64);
-    case type_id::HUGEINT:
-      // FIXME: Unsafe 128-to-64-bit narrowing can corrupt values outside the INT64 range.
-      return cudf::data_type(cudf::type_id::INT64);
+    // cuDF has no INT128; DECIMAL128 with scale 0 is an exact 128-bit integer laid out like
+    // duckdb::hugeint_t.
+    case type_id::HUGEINT: return cudf::data_type(cudf::type_id::DECIMAL128, 0);
     case type_id::UTINYINT: return cudf::data_type(cudf::type_id::UINT8);
     case type_id::USMALLINT: return cudf::data_type(cudf::type_id::UINT16);
     case type_id::UINTEGER: return cudf::data_type(cudf::type_id::UINT32);
@@ -267,8 +267,8 @@ inline std::size_t estimate_referenced_column_bytes(
 /**
  * @brief Convert a non-null DuckDB value to a cuDF scalar.
  *
- * The value must have type @p t. DECIMAL128 and nested types return STRING using `val.ToString()`;
- * unmappable types throw `InvalidInputException`.
+ * The value must have type @p t. Nested types return STRING using `val.ToString()`; unmappable
+ * types throw `InvalidInputException`.
  */
 [[nodiscard]] inline std::unique_ptr<cudf::scalar> value_to_cudf_scalar(duckdb::Value const& val,
                                                                         logical_type const& t,
@@ -310,6 +310,15 @@ inline std::size_t estimate_referenced_column_bytes(
         numeric::scale_type{-static_cast<int32_t>(t.decimal_scale())},
         true,
         stream);
+    case cudf::type_id::DECIMAL128: {
+      // HUGEINT and DECIMAL(19..38) both store a duckdb::hugeint_t.
+      auto const hi = val.GetValueUnsafe<duckdb::hugeint_t>();
+      return std::make_unique<cudf::fixed_point_scalar<numeric::decimal128>>(
+        (static_cast<__int128_t>(hi.upper) << 64) | hi.lower,
+        numeric::scale_type{cudf_type.scale()},
+        true,
+        stream);
+    }
     default: return std::make_unique<cudf::string_scalar>(val.ToString(), true, stream);
   }
 }
@@ -387,10 +396,9 @@ inline std::unique_ptr<cudf::table> make_empty_table(const std::vector<cudf::dat
     case LogicalTypeId::TINYINT: return cudf::data_type(cudf::type_id::INT8);
     case LogicalTypeId::SMALLINT: return cudf::data_type(cudf::type_id::INT16);
     case LogicalTypeId::INTEGER: return cudf::data_type(cudf::type_id::INT32);
-    case LogicalTypeId::BIGINT:
-    case LogicalTypeId::HUGEINT:  // FIXME: unsafe conversion from duckdb HugeInt to cudf Int64,
-                                  // since cudf does not support Int128.
-      return cudf::data_type(cudf::type_id::INT64);
+    case LogicalTypeId::BIGINT: return cudf::data_type(cudf::type_id::INT64);
+    // An exact 128-bit integer laid out like duckdb::hugeint_t; cuDF has no INT128.
+    case LogicalTypeId::HUGEINT: return cudf::data_type(cudf::type_id::DECIMAL128, 0);
     case LogicalTypeId::UTINYINT: return cudf::data_type(cudf::type_id::UINT8);
     case LogicalTypeId::USMALLINT: return cudf::data_type(cudf::type_id::UINT16);
     case LogicalTypeId::UINTEGER: return cudf::data_type(cudf::type_id::UINT32);

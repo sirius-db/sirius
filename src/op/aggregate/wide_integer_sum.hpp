@@ -39,7 +39,7 @@ inline cudf::data_type wide_integer_sum_type()
  * @brief The exact sum of the valid values of @p input, accumulated in 128 bits in one pass.
  *
  * Returns a one-row DECIMAL128 column with scale 0 (wide_integer_sum_type()), NULL when no value
- * is valid. @p input is INT32 or INT64 (a BIGINT or HUGEINT carrier). The sum cannot overflow: a
+ * is valid. @p input is INT32 or INT64 (an INTEGER or BIGINT carrier). The sum cannot overflow: a
  * column holds fewer than 2^31 rows of magnitude at most 2^63, so the total stays below 2^94. It
  * reads the input once like an INT64 reduction, without the per-batch magnitude scan or the
  * widening copy a DECIMAL128 reduction would need. Throws sirius::internal_exception for any

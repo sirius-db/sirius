@@ -46,7 +46,11 @@ value from_duckdb(const duckdb::Value& v, const logical_type& type)
     case type_id::SMALLINT: return value{v.GetValue<int16_t>()};
     case type_id::INTEGER: return value{v.GetValue<int32_t>()};
     case type_id::BIGINT: return value{v.GetValue<int64_t>()};
-    case type_id::HUGEINT: return value{v.GetValue<int64_t>()};  // narrowing
+    case type_id::HUGEINT: {
+      // An exact 128-bit integer: DECIMAL128 with scale 0, as on the GPU.
+      auto const hi = v.GetValueUnsafe<duckdb::hugeint_t>();
+      return value{decimal128{(static_cast<__int128_t>(hi.upper) << 64) | hi.lower, 0}};
+    }
     case type_id::UTINYINT: return value{v.GetValue<uint8_t>()};
     case type_id::USMALLINT: return value{v.GetValue<uint16_t>()};
     case type_id::UINTEGER: return value{v.GetValue<uint32_t>()};
@@ -109,8 +113,11 @@ duckdb::Value to_duckdb(const value& v, const logical_type& type)
     case type_id::SMALLINT: return duckdb::Value::SMALLINT(std::get<int16_t>(v));
     case type_id::INTEGER: return duckdb::Value::INTEGER(std::get<int32_t>(v));
     case type_id::BIGINT: return duckdb::Value::BIGINT(std::get<int64_t>(v));
-    case type_id::HUGEINT:
-      return duckdb::Value::HUGEINT(std::get<int64_t>(v));  // narrowed alt → widen via factory
+    case type_id::HUGEINT: {
+      auto const& d = std::get<decimal128>(v);
+      return duckdb::Value::HUGEINT(
+        duckdb::hugeint_t{static_cast<int64_t>(d.value >> 64), static_cast<uint64_t>(d.value)});
+    }
     case type_id::UTINYINT: return duckdb::Value::UTINYINT(std::get<uint8_t>(v));
     case type_id::USMALLINT: return duckdb::Value::USMALLINT(std::get<uint16_t>(v));
     case type_id::UINTEGER: return duckdb::Value::UINTEGER(std::get<uint32_t>(v));

@@ -58,11 +58,12 @@ namespace op {
 std::optional<cudf::aggregation::Kind> to_cudf_aggregation_kind(sirius::aggregate_id id);
 
 /// Whether @p id over an input of type @p input_type is a SUM that DuckDB accumulates in HUGEINT
-/// (128 bits): `sum` or `avg` over INTEGER, BIGINT or HUGEINT. Its total can exceed INT64 even
-/// when every input fits, so the GPU must not accumulate it in INT64 unchecked. `sum_no_overflow`
-/// is excluded: DuckDB's statistics propagation already proved that the total fits in INT64.
-/// Narrower inputs (TINYINT, SMALLINT, BOOLEAN) are excluded because DuckDB itself sums them in
-/// INT64. On the GPU HUGEINT is carried as INT64, both as an input and as the result of such a SUM.
+/// (128 bits) from an integer column the GPU carries as INT32 or INT64: `sum` or `avg` over
+/// INTEGER or BIGINT. Its total can exceed INT64 even when every input fits, so the GPU must not
+/// accumulate it in INT64 unchecked. `sum_no_overflow` is excluded: DuckDB's statistics
+/// propagation already proved that the total fits in INT64. Narrower inputs (SMALLINT, BOOLEAN)
+/// are excluded: leaving INT64 would take more than 2^48 rows. A HUGEINT input is carried as
+/// DECIMAL128 with scale 0 and takes the decimal SUM path.
 bool is_wide_integer_sum(sirius::aggregate_id id, sirius::logical_type const& input_type);
 
 /// The type a SUM over a column of type @p type is computed in when it must not overflow the
@@ -127,14 +128,13 @@ bool partial_sums_may_overflow(cudf::column_view const& column,
                                ::cuda::stream_ref stream,
                                rmm::device_async_resource_ref mr);
 
-/// The final value of a wide integer SUM: @p column as INT64. An INT64 column is returned as is.
-/// A DECIMAL128 column (a sum that was accumulated over 128 bits) is cast to INT64 after checking
-/// that every valid value fits; if one does not, throws sirius::not_implemented_exception so that
-/// the query is replayed on DuckDB, which returns the exact HUGEINT. Synchronizes @p stream for a
-/// DECIMAL128 column.
-std::unique_ptr<cudf::column> narrow_wide_integer_sum(std::unique_ptr<cudf::column> column,
-                                                      ::cuda::stream_ref stream,
-                                                      rmm::device_async_resource_ref mr);
+/// The final value of an aggregate whose result is HUGEINT: @p column in HUGEINT's carrier,
+/// DECIMAL128 with scale 0. An INT64 column (a SUM that was accumulated in 64 bits) is widened; a
+/// DECIMAL128 column with scale 0 is returned as is. Throws sirius::internal_exception for any
+/// other type.
+std::unique_ptr<cudf::column> to_hugeint_carrier(std::unique_ptr<cudf::column> column,
+                                                 ::cuda::stream_ref stream,
+                                                 rmm::device_async_resource_ref mr);
 
 /// The narrower type a SUM over a column of type @p type can be computed in when the batch's values
 /// are small enough: DECIMAL64 at the same scale for DECIMAL128, nullopt otherwise.
@@ -175,6 +175,9 @@ struct AggregateSlot {
   /// True if the SUM at cudf_idx is a wide integer SUM (is_wide_integer_sum): its partial results
   /// are INT64 or, where INT64 could overflow, DECIMAL128 with scale 0.
   bool is_wide_integer_sum = false;
+  /// True if the aggregate's DuckDB result is HUGEINT. Its partials may be INT64; the merge
+  /// finalizes them to DECIMAL128 with scale 0 (to_hugeint_carrier).
+  bool returns_hugeint = false;
 };
 
 /**
