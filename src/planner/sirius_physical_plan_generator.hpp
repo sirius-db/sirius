@@ -48,6 +48,7 @@ class Value;
 class ColumnDataCollection;
 class LogicalOperator;
 class LogicalAggregate;
+class LogicalAnyJoin;
 class LogicalColumnDataGet;
 class LogicalComparisonJoin;
 class LogicalCrossProduct;
@@ -157,8 +158,8 @@ class sirius_physical_plan_generator {
 
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
     duckdb::LogicalAggregate& op);
-  // duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalAnyJoin
-  // &op);
+  //! Plan an INNER ANY join as a cross product filtered by its condition; other join types throw.
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalAnyJoin& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
     duckdb::LogicalColumnDataGet& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(

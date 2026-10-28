@@ -15,8 +15,12 @@
  */
 
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/planner/operator/logical_any_join.hpp"
 #include "duckdb/planner/operator/logical_cross_product.hpp"
+#include "expression/ast/from_duckdb.hpp"
+#include "helper/type_conversions.hpp"
 #include "memory/size_arithmetic.hpp"
+#include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius_context.hpp"
@@ -73,6 +77,48 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalCrossProduct& op)
                                  rhs_cardinality,
                                  /*left_projection_map=*/{},
                                  /*right_projection_map=*/{});
+}
+
+duckdb::unique_ptr<sirius::op::sirius_physical_operator>
+sirius_physical_plan_generator::create_plan(duckdb::LogicalAnyJoin& op)
+{
+  D_ASSERT(op.children.size() == 2);
+  D_ASSERT(op.condition);
+
+  // DuckDB plans an ANY join as a blockwise nested loop join that evaluates the condition on each
+  // (left, right) pair. For INNER that equals filtering the cross product by the condition, whose
+  // references already index the left columns followed by the right columns. Outer, semi, anti and
+  // mark joins must evaluate the condition while matching rows, which the GPU does not do yet.
+  if (op.join_type != duckdb::JoinType::INNER) {
+    throw duckdb::NotImplementedException("Any join with join type " +
+                                          duckdb::JoinTypeToString(op.join_type) +
+                                          " not supported in GPU");
+  }
+  // DuckDB's blockwise join ignores projection maps, so an ANY join never carries one.
+  if (!op.left_projection_map.empty() || !op.right_projection_map.empty()) {
+    throw duckdb::NotImplementedException("Any join with a projection map not supported in GPU");
+  }
+  reject_nested_column_operation(*op.condition, "a join predicate");
+  auto predicate = sirius::ast::from_duckdb(*op.condition);
+  if (!predicate) { throw duckdb::NotImplementedException("Unsupported any join condition"); }
+
+  auto const estimated_cardinality = op.estimated_cardinality;
+  auto const lhs_cardinality       = op.children[0]->EstimateCardinality(context);
+  auto const rhs_cardinality       = op.children[1]->EstimateCardinality(context);
+  auto left                        = create_plan(*op.children[0]);
+  auto right                       = create_plan(*op.children[1]);
+  auto cross_product               = make_cross_product_join(op,
+                                               std::move(left),
+                                               std::move(right),
+                                               duckdb::JoinType::INNER,
+                                               lhs_cardinality,
+                                               rhs_cardinality,
+                                               /*left_projection_map=*/{},
+                                               /*right_projection_map=*/{});
+  auto filter                      = duckdb::make_uniq<sirius::op::sirius_physical_filter>(
+    sirius::from_duckdb_vec(op.types), std::move(predicate), estimated_cardinality);
+  filter->children.push_back(std::move(cross_product));
+  return filter;
 }
 
 }  // namespace sirius::planner
