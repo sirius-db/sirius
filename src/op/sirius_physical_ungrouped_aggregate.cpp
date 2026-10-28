@@ -693,14 +693,15 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
   auto const& input  = dynamic_cast<pipelineable_operator_data const&>(input_data);
   auto input_batches = input.get_read_only_batches();
   if (input_batches.empty()) {
-    return std::make_unique<pipelineable_operator_data>(
-      std::vector<std::shared_ptr<cucascade::data_batch>>{});
+    throw sirius::internal_exception(
+      "[sirius_physical_ungrouped_aggregate_merge::execute] empty input must arrive as "
+      "input_free_operator_data");
   }
 
   cucascade::memory::memory_space* space = input_batches[0].get_memory_space();
   if (space == nullptr) {
-    return std::make_unique<pipelineable_operator_data>(
-      std::vector<std::shared_ptr<cucascade::data_batch>>{});
+    throw sirius::internal_exception(
+      "[sirius_physical_ungrouped_aggregate_merge::execute] input batch has no memory space");
   }
 
   auto layout = build_aggregate_layout(aggregates);

@@ -163,6 +163,18 @@ std::shared_ptr<cucascade::data_batch> only_batch(operator_data const& output)
 
 }  // namespace
 
+TEST_CASE("ungrouped merge rejects empty ordinary input descriptors",
+          "[ungrouped_empty_input][physical_ungrouped_aggregate]")
+{
+  merge_fixture fixture;
+  pipelineable_operator_data input;
+  REQUIRE_THROWS_MATCHES(fixture.merge.execute(input, default_stream()),
+                         sirius::internal_exception,
+                         Catch::Matchers::Message(
+                           "[sirius_physical_ungrouped_aggregate_merge::execute] empty input must "
+                           "arrive as input_free_operator_data"));
+}
+
 TEST_CASE("ungrouped merge claims one task after zero-batch input closes",
           "[ungrouped_empty_input][scheduling]")
 {
