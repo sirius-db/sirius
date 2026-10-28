@@ -313,6 +313,12 @@ static void from_yaml(const YAML::Node& node, scan_manager::preparation_config& 
   limit("lookahead_batches", opt.lookahead_batches);
   limit("max_control_work", opt.max_control_work);
   limit("drain_quantum", opt.drain_quantum);
+  limit("coordinator_workers", opt.coordinator_workers, true);
+  limit("native_reader_workers", opt.native_reader_workers);
+  limit("max_native_readers", opt.max_native_readers);
+  if (opt.resolved_native_readers() < opt.resolved_native_workers())
+    throw std::runtime_error(
+      "preparation.max_native_readers must be at least native_reader_workers");
   if (auto node = r.optional_node("partial_batch")) {
     auto& policy = opt.partial_batch.emplace();
     yaml::reader partial(*node, "preparation.partial_batch");

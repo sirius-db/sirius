@@ -86,6 +86,7 @@ jobs:
         run: |
           cmake -S duckdb -B build/validation-host -G Ninja \
             -DCMAKE_BUILD_TYPE=Release -DBUILD_UNITTESTS=OFF \
+            -DDUCKDB_EXPLICIT_VERSION=v2.0.0 \
             -DBUILD_EXTENSIONS="core_functions;parquet" \
             -DEXPORT_DYNAMIC_SYMBOLS=ON \
             -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc"

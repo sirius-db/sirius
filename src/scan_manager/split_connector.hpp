@@ -34,6 +34,10 @@ namespace cucascade {
 class data_batch;
 }  // namespace cucascade
 
+namespace sirius::op::scan {
+class scan_operator_input;
+}
+
 namespace sirius::scan_manager {
 
 class split_provider;
@@ -75,8 +79,8 @@ class split_connector : public std::enable_shared_from_this<split_connector> {
   ///                  has been drained. Subsequent close() calls do not
   ///                  overwrite an already-stored exception.
   void close(std::exception_ptr const& exception = nullptr);
-  // Internal construction seam: consumer callbacks run after releasing the queue mutex.
-  void set_consumption_callback(std::function<void(size_t)> callback);
+  // Internal construction seam: callback(bytes, source_id) runs after releasing the queue mutex.
+  void set_consumption_callback(std::function<void(size_t, size_t)> callback);
 
   /// \brief Pull the next split, blocking until one is available or the connector
   ///        is closed and drained.
@@ -123,6 +127,12 @@ class split_connector : public std::enable_shared_from_this<split_connector> {
 
  private:
   friend class load_balancing_scan_batch_coalescer;
+  friend class preparation_coordinator;
+  // Retains the concrete owner if queue allocation fails; destruction stays outside the gate.
+  void push_prepared_scan(std::unique_ptr<op::scan::scan_operator_input>&,
+                          size_t bytes,
+                          size_t preparation_bytes,
+                          size_t source_id);
 
   /// \brief Enqueue a ready split. Producer side. Wakes a waiting consumer.
   ///        Reachable only via @ref split_provider::push_to_connector so all
@@ -132,13 +142,14 @@ class split_connector : public std::enable_shared_from_this<split_connector> {
   void push_split_sized(std::unique_ptr<op::operator_data>&& split,
                         size_t bytes,
                         size_t preparation_bytes = 0);
-  std::shared_ptr<std::function<void(size_t)> const> _on_consumption;
+  std::shared_ptr<std::function<void(size_t, size_t)> const> _on_consumption;
 
   mutable std::mutex _mutex;
   std::condition_variable _cv;
   struct queued_split {
     std::unique_ptr<op::operator_data> input;
     size_t preparation_bytes;
+    size_t source_id = 0;
   };
   std::deque<queued_split> _splits;
   bool _closed{false};

@@ -55,6 +55,7 @@
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/unary.hpp>
+#include <cudf/utilities/type_dispatcher.hpp>
 
 #include <cuda_runtime_api.h>
 
@@ -3967,4 +3968,110 @@ TEST_CASE("negate of a signed integer minimum raises like DuckDB", "[expression_
   run.template operator()<int16_t>(type_id::SMALLINT, cudf::type_id::INT16);
   run.template operator()<int32_t>(type_id::INTEGER, cudf::type_id::INT32);
   run.template operator()<int64_t>(type_id::BIGINT, cudf::type_id::INT64);
+}
+
+TEMPLATE_TEST_CASE("integer to VARCHAR preserves values and validity",
+                   "[expression_evaluator][integer_varchar_cast]",
+                   int8_t,
+                   int16_t,
+                   int32_t,
+                   int64_t,
+                   uint8_t,
+                   uint16_t,
+                   uint32_t,
+                   uint64_t)
+{
+  auto* space         = get_default_gpu_space();
+  auto mr             = get_resource_ref(*space);
+  auto stream         = cudf::get_default_stream();
+  auto const strategy = GENERATE(MAT, exp_strategy_enum::AST_INTERPRET, exp_strategy_enum::AST_JIT);
+  auto const try_cast = GENERATE(false, true);
+  auto const type     = cudf::data_type{cudf::type_to_id<TestType>()};
+  std::vector<TestType> const values{
+    42, std::numeric_limits<TestType>::lowest(), 0, std::numeric_limits<TestType>::max(), 9};
+  auto input =
+    cudf::make_numeric_column(type, values.size(), cudf::mask_state::ALL_VALID, stream, mr);
+  REQUIRE(cudaMemcpyAsync(input->mutable_view().template data<TestType>(),
+                          values.data(),
+                          values.size() * sizeof(TestType),
+                          cudaMemcpyHostToDevice,
+                          stream.get()) == cudaSuccess);
+  cudf::set_null_mask(input->mutable_view().null_mask(), 4, 5, false, stream);
+  input->set_null_count(1);
+  auto expr = make_cast(make_ref(0), logical_type::make(type_id::VARCHAR), try_cast);
+  exp_executor evaluator(*expr, mr, stream, sirius::expression_query_policy{strategy}, 1);
+
+  auto check = [&](cudf::column_view view,
+                   std::vector<std::string> const& expected,
+                   std::vector<bool> const& valid) {
+    auto output = evaluator.evaluate(cudf::table_view{{view}});
+    REQUIRE(output->num_columns() == 1);
+    REQUIRE(output->view().column(0).type().id() == cudf::type_id::STRING);
+    REQUIRE(copy_string_column_to_host(output->view().column(0)) == expected);
+    REQUIRE(copy_valids_to_host(output->view().column(0)) == valid);
+  };
+  auto const low  = std::to_string(values[1]);
+  auto const high = std::to_string(values[3]);
+  check(input->view(), {"42", low, "0", high, ""}, {true, true, true, true, false});
+  check(cudf::slice(input->view(), {1, 5}, stream).front(),
+        {low, "0", high, ""},
+        {true, true, true, false});
+  check(cudf::slice(input->view(), {4, 5}, stream).front(), {""}, {false});
+  auto empty = cudf::make_empty_column(type);
+  check(empty->view(), {}, {});
+}
+
+TEMPLATE_TEST_CASE("integer to VARCHAR composes with OR and LIKE and broadcasts constants",
+                   "[expression_evaluator][integer_varchar_cast]",
+                   mat_strategy,
+                   ast_interpret_strategy,
+                   ast_jit_strategy)
+{
+  auto* space        = get_default_gpu_space();
+  auto const integer = logical_type::make(type_id::INTEGER);
+  auto const varchar = logical_type::make(type_id::VARCHAR);
+  auto input         = make_two_int32_batch_with_nulls(*space,
+                                                       {50, 51, 52, 53, 54, 50},
+                                                       {true, true, true, true, true, true},
+                                                       {1, 9, 19, 2, 0, 0},
+                                                       {true, true, true, true, false, false});
+  std::vector<std::unique_ptr<ast_node>> like_args;
+  like_args.push_back(make_cast(make_ref_typed(1, integer), varchar, false));
+  like_args.push_back(make_str_const("%9%"));
+  std::vector<std::unique_ptr<ast_node>> disjuncts;
+  disjuncts.push_back(
+    make_cmp(sirius::comparison_type::equal, make_ref_typed(0, integer), make_int_const(50)));
+  disjuncts.push_back(make_func(
+    sirius::function_id::like, std::move(like_args), logical_type::make(type_id::BOOLEAN)));
+  auto predicate = make_conj(sirius::ast::conjunction::kind::op_or, std::move(disjuncts));
+  auto [in_batch, out_batch, iv, ov] =
+    run_select(*space, input, std::move(predicate), TestType::value);
+  REQUIRE(copy_column_to_host<int32_t>(ov.column(0)) == std::vector<int32_t>{50, 51, 52, 50});
+
+  for (auto const rows : {0, 1, 7}) {
+    CAPTURE(rows);
+    auto column = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                            rows,
+                                            cudf::mask_state::UNALLOCATED,
+                                            cudf::get_default_stream(),
+                                            get_resource_ref(*space));
+    std::vector<std::unique_ptr<ast_node>> exprs;
+    exprs.push_back(make_cast(make_int_const(-42), varchar, false));
+    exprs.push_back(make_cast(make_null_const(integer), varchar, true));
+    std::vector<ast_node const*> expressions;
+    for (auto const& expr : exprs) {
+      expressions.push_back(expr.get());
+    }
+    exp_executor evaluator(expressions,
+                           get_resource_ref(*space),
+                           cudf::get_default_stream(),
+                           sirius::expression_query_policy{TestType::value},
+                           1);
+    auto output = evaluator.evaluate(cudf::table_view{{column->view()}});
+    REQUIRE(output->num_rows() == rows);
+    REQUIRE(copy_string_column_to_host(output->view().column(0)) ==
+            std::vector<std::string>(rows, "-42"));
+    REQUIRE(output->view().column(0).null_count() == 0);
+    REQUIRE(output->view().column(1).null_count() == rows);
+  }
 }

@@ -27,7 +27,6 @@
 #include <cudf/table/table.hpp>
 
 #include <rmm/cuda_stream.hpp>
-#include <rmm/device_buffer.hpp>
 
 #include <cuda_runtime.h>
 
@@ -136,7 +135,14 @@ void null_every_seventh(cudf::column& column, ::cuda::stream_ref stream)
       words[static_cast<std::size_t>(i) / 32] |= 1u << (i % 32);
     }
   }
-  rmm::device_buffer mask(words.data(), words.size() * sizeof(std::uint32_t), stream);
+  auto mask = cudf::create_null_mask(
+    rows, cudf::mask_state::UNINITIALIZED, stream, utils::get_resource_ref(*env().gpu));
+  REQUIRE(cudaMemcpyAsync(mask.data(),
+                          words.data(),
+                          words.size() * sizeof(std::uint32_t),
+                          cudaMemcpyHostToDevice,
+                          stream.get()) == cudaSuccess);
+  REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);
   column.set_null_mask(std::move(mask), nulls);
 }
 
@@ -233,7 +239,7 @@ void move_to(std::shared_ptr<cucascade::data_batch> const& batch,
              cucascade::memory::memory_space* space)
 {
   sirius::convertible_data_batch convertible(batch);
-  REQUIRE(convertible.convert({space}, env().stream.view(), *env().mgr, true).has_value());
+  REQUIRE(convertible.convert({space}, env().stream, *env().mgr, true).has_value());
 }
 
 template <typename Representation>
@@ -330,7 +336,7 @@ TEST_CASE("spill compression: GPU -> compressed host -> GPU", "[compression][spi
     CHECK(ro.get_data()->get_uncompressed_data_size_in_bytes() == device_bytes);
   }
   // The encode's reservation is detached and released once the batch is encoded.
-  CHECK_FALSE(gpu_mr->is_stream_tracked(env().stream.view()));
+  CHECK_FALSE(gpu_mr->is_stream_tracked(env().stream));
   CHECK(gpu_mr->get_total_reserved_bytes() == reserved_before);
 
   move_to(batch, env().gpu);

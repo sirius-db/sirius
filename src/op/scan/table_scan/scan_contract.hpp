@@ -259,11 +259,26 @@ struct physical_check_counters {
     std::lock_guard lock(units_mutex);
     ++publications_by_query[query_token].readahead_registrations[file];
   }
-  void prefetcher_conversions(uint64_t query_token, uint64_t count)
+  void prefetcher_conversions(uint64_t query_token, uint64_t count) noexcept
   {
     if (!track_units || count == 0) return;
-    std::lock_guard lock(units_mutex);
-    publications_by_query[query_token].prefetcher_conversions += count;
+    try {
+      std::lock_guard lock(units_mutex);
+      publications_by_query[query_token].prefetcher_conversions += count;
+    } catch (...) {  // Observation must not interrupt resource retirement.
+    }
+  }
+  void preparation_finished(uint64_t query_token, scan_publication_observation observation) noexcept
+  {
+    if (!track_units) return;
+    try {
+      std::lock_guard lock(units_mutex);
+      auto& stored = publications_by_query[query_token];
+      observation.readahead_registrations.swap(stored.readahead_registrations);
+      observation.prefetcher_conversions = stored.prefetcher_conversions;
+      stored                             = std::move(observation);
+    } catch (...) {  // Observation must not interrupt resource retirement.
+    }
   }
   void reader_call(std::string const& file)
   {

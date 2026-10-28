@@ -38,6 +38,7 @@
 // to degrade to. The install side is what keeps those cases from arising.
 
 #include "late_mat/defer_directive.hpp"
+#include "late_mat/transfer_context.hpp"
 
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
@@ -69,6 +70,7 @@ namespace sirius::late_mat {
   port_materialize_directive const& directive,
   cudf::table_view const& batch,
   ::cuda::stream_ref stream,
-  rmm::device_async_resource_ref mr);
+  rmm::device_async_resource_ref mr,
+  transfer_context transfers = {});
 
 }  // namespace sirius::late_mat

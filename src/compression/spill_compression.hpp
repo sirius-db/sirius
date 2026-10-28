@@ -18,7 +18,7 @@
 
 #include <cudf/column/column_view.hpp>
 
-#include <cuda/stream_ref>
+#include <cuda/stream>
 
 #include <cucascade/data/representation_converter.hpp>
 
