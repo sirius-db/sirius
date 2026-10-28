@@ -899,7 +899,7 @@ surface.
 
 ### Distributed Execution
 
-See [Distributed Execution](exchange.md). Both settings must be set before the connection's first
+See [Distributed Execution](distributed-sirius.md). Both settings must be set before the connection's first
 distributed query and cannot change after it.
 
 | Variable | Default | Description |
@@ -1008,7 +1008,7 @@ These are compile-time defaults. Runtime configuration via `sirius_config` and D
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `SIRIUS_WITH_NIXL` | OFF | Build the exchange's NIXL fabric for [distributed execution](exchange.md), linking the NIXL install at `SIRIUS_NIXL_PREFIX` (default: the `NIXL_PREFIX` environment variable). |
+| `SIRIUS_WITH_NIXL` | OFF | Build the exchange's NIXL fabric for [distributed execution](distributed-sirius.md), linking the NIXL install at `SIRIUS_NIXL_PREFIX` (default: the `NIXL_PREFIX` environment variable). |
 
 ## Key Files
 

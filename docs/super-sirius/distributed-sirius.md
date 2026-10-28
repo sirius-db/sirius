@@ -1,4 +1,4 @@
-# Distributed Execution: the Exchange
+# Distributed Sirius: running one query across GPUs
 
 Sirius can run one SQL query across several processes, one per GPU, on one host or several.
 Every rank runs the same SQL. Each scans its own share of each table, and the plan moves rows
@@ -280,7 +280,7 @@ Without it, a distributed query fails with "needs a Sirius built with -DSIRIUS_W
 
 ## Running TPC-H Q12 on 4 GPUs
 
-`scripts/exchange_sql_ranks.sh <ranks> <file.sql> [base port] [log dir]` runs a SQL file on N
+`scripts/distributed_run_sql.sh <ranks> <file.sql> [base port] [log dir]` runs a SQL file on N
 local GPUs, rank i on GPU i, and prints rank 0's output. It prepends loading the extension,
 `enable_duckdb_fallback = false` and the two exchange settings.
 
@@ -298,7 +298,7 @@ where o_orderkey = l_orderkey and l_shipmode in ('MAIL', 'SHIP')
   and l_receiptdate >= date '1994-01-01' and l_receiptdate < date '1995-01-01'
 group by l_shipmode order by l_shipmode;
 SQL
-pixi run scripts/exchange_sql_ranks.sh 4 /tmp/q12.sql
+pixi run scripts/distributed_run_sql.sh 4 /tmp/q12.sql
 ```
 
 Expected at SF1000: `MAIL 6233248 9344850` and `SHIP 6235412 9349394`, DuckDB's answer.
@@ -346,7 +346,7 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
 | `[exchange][byte_range]` | Byte spans tile every file exactly once across ranks; one file split in two; balance by bytes |
 | `[exchange][collectives]` | All-gather; distributed `SORT_SAMPLE` on skewed and empty inputs; `SORT_SAMPLE` feeding a range exchange |
 | `[exchange][nixl]` | Two ranks in one process over NIXL (NIXL builds only) |
-| `[nixl_multiprocess]` (hidden) | One rank per process and GPU: `pixi run scripts/exchange_nixl_ranks.sh 4` |
+| `[nixl_multiprocess]` (hidden) | One rank per process and GPU: `pixi run scripts/distributed_test_nixl.sh 4` |
 | `[dynamic_filter][probe]` | Merging two Blooms of one capacity |
 
 ## Files
@@ -361,4 +361,4 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
 | `src/op/sirius_physical_sort_sample.*` | Distributed sampling |
 | `src/planner/distributed_plan.*` | The plan rewrite and plan-shape check |
 | `src/op/dynamic_filter/dynamic_filter_publisher.cpp` | Bloom merge across ranks |
-| `scripts/exchange_sql_ranks.sh`, `exchange_nixl_ranks.sh`, `nixl_env.sh` | Launchers and runtime paths |
+| `scripts/distributed_run_sql.sh`, `distributed_test_nixl.sh`, `nixl_env.sh` | Launchers and runtime paths |
