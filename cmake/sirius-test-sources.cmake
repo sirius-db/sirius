@@ -169,12 +169,15 @@ set(TEST_SOURCES
     test/cpp/cuda/test_device_copy_batch.cpp
     test/cpp/io/test_parquet_helpers.cpp
     test/cpp/io/test_path_utils.cpp
+    test/cpp/io/rest/test_rest_datasource_integration.cpp
     test/cpp/log/test_duckdb_sink.cpp
     test/cpp/log/test_logging.cpp
     test/cpp/scan_manager/test_s3_routing_cutover.cpp
     test/cpp/scan_manager/test_s3_config_scopes.cpp
+    test/cpp/scan_manager/test_scan_input_prefetch.cpp
     test/cpp/scan_manager/test_prefetching_scheduler.cpp
     test/cpp/scan_manager/test_readahead_lifecycle.cpp
+    test/cpp/scan_manager/test_readahead_tickets.cpp
     test/cpp/scan_manager/test_shared_scan_budget.cpp
     test/cpp/scan_manager/test_scan_manager_query_state.cpp
     test/cpp/scan_manager/test_reset_caches.cpp

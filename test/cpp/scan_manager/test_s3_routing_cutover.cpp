@@ -61,6 +61,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iterator>
 #include <memory>
 #include <optional>
@@ -243,6 +244,8 @@ struct range_fault_policy {
   /// Strong validator sent on HEAD 200, GET 206 and GET 200 when non-empty. Empty keeps the
   /// object tagless: every open then gets a per-open identity and shares nothing across opens.
   std::string etag;
+  /// Held before every GET response is sent, so a read stays in flight that long.
+  std::chrono::milliseconds response_delay{0};
 };
 
 class range_s3_server {
@@ -344,6 +347,7 @@ class range_s3_server {
       send_all(fd, response);
     } else if (is_get) {
       auto const get_idx = _get_count.fetch_add(1, std::memory_order_relaxed);
+      if (_fault.response_delay.count() > 0) { std::this_thread::sleep_for(_fault.response_delay); }
       if (_fault.fail_all_gets || get_idx < _fault.fail_first_gets) {
         response = "HTTP/1.1 " + std::to_string(_fault.fail_status) +
                    " Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
@@ -873,17 +877,18 @@ TEST_CASE("describe_parquet probes the S3 footer on a cold bind and reuses the m
   CHECK(server.get_count() == 1);
   CHECK(server.suffix_get_count() == 1);
 
-  // Warm bind: the path is known to the metadata store, so the open takes open_hint::generic (a
-  // HEAD for the size). With a strong tag the stored footer is found under the same identity and
-  // no footer bytes are downloaded; without one the open has a fresh identity and reads the
-  // footer again — one GET, since cuDF's speculative tail read (64 KiB by default) covers this
-  // small file's footer in a single range.
+  // Warm bind. With a strong tag the path is a reusable candidate in the metadata store
+  // (has_path), so the open takes open_hint::generic (a HEAD for the size) and finds the stored
+  // footer under the same identity: no footer bytes are downloaded. A tagless open's footer is
+  // scoped to that open (an opened-handle identity), which cannot justify skipping the probe for
+  // the next open (#2132): the warm bind probes again, one more suffix GET and no HEAD.
   auto const second = manager.describe_parquet(uri);
   CHECK(second.object_size == first.object_size);
   CHECK(second.total_num_rows == first.total_num_rows);
   CHECK(second.names == first.names);
-  CHECK(server.head_count() == 1);
+  CHECK(server.head_count() == (strong_tag ? 1 : 0));
   CHECK(server.get_count() == (strong_tag ? 1 : 2));
+  CHECK(server.suffix_get_count() == (strong_tag ? 1 : 2));
 }
 
 TEST_CASE("routed S3 cache fill at the object tail is clipped to EOF", "[s3][routing]")
@@ -913,4 +918,97 @@ TEST_CASE("routed S3 cache fill at the object tail is clipped to EOF", "[s3][rou
   CHECK(std::equal(destination.begin(), destination.end(), payload.begin() + page_size));
   // The cache fills whole pages; the one holding the tail must not ask past the object's end.
   CHECK(server.max_requested_end() == payload.size());
+}
+
+TEST_CASE("scan_manager teardown resolves an in-flight S3 read", "[s3][routing]")
+{
+  using namespace std::chrono_literals;
+  std::vector<std::uint8_t> payload(128 * 1024);
+  for (std::size_t i = 0; i < payload.size(); ++i) {
+    payload[i] = static_cast<std::uint8_t>((i * 131U + 17U) & 0xffU);
+  }
+  range_fault_policy fault;
+  fault.response_delay = 500ms;
+  auto server          = std::make_shared<range_s3_server>(payload, fault);
+
+  auto fixture = std::make_unique<scan_manager_fixture>();
+  auto cfg     = make_s3_scan_config(server->endpoint(), sirius::scan_manager::io_backend::native);
+  auto lifecycle = std::make_shared<sirius::exec::query_lifecycle_registry>();
+  auto manager =
+    std::make_unique<sirius_scan_manager>(*lifecycle, cfg, *fixture->memory, fixture->topology);
+  auto datasource = manager->create_datasource("s3://teardown-bucket/object.bin");
+  REQUIRE(datasource != nullptr);
+  REQUIRE(datasource->io_ctx() != nullptr);
+  REQUIRE(datasource->io_ctx()->type() == io_context_type::restful);
+  std::weak_ptr<cucascade::io::ioctx> const weak_ctx = datasource->io_ctx();
+
+  auto buffer = std::make_shared<std::vector<std::uint8_t>>(4096, std::uint8_t{0});
+  std::array<cucascade::io::slice, 1> const slices{
+    cucascade::io::slice{0, buffer->size(), buffer->data()}};
+  auto future = datasource->host_read_ranges_async(slices);
+
+  // Tear down on a worker so a hang fails the test instead of blocking it.
+  std::promise<void> completed;
+  auto teardown = completed.get_future();
+  std::thread worker([datasource = std::move(datasource),
+                      manager    = std::move(manager),
+                      fixture    = std::move(fixture),
+                      lifecycle  = std::move(lifecycle),
+                      completed  = std::move(completed)]() mutable {
+    datasource.reset();
+    manager.reset();
+    lifecycle.reset();
+    fixture.reset();
+    completed.set_value();
+  });
+  if (teardown.wait_for(10s) != std::future_status::ready) {
+    worker.detach();
+    FAIL("scan manager teardown did not return within 10 s");
+  }
+  worker.join();
+
+  REQUIRE(future.valid());
+  REQUIRE(future.wait_for(5s) == std::future_status::ready);
+  try {
+    auto const bytes = future.get();
+    if (bytes != 0) {
+      REQUIRE(bytes == buffer->size());
+      CHECK(std::equal(buffer->begin(), buffer->end(), payload.begin()));
+    }
+  } catch (std::exception const& e) {
+    INFO("in-flight read settled with an exception during teardown: " << e.what());
+    SUCCEED("in-flight read settled with an exception during teardown");
+  }
+
+  // The settled read holds no reference to the torn-down REST ioctx.
+  auto const deadline = std::chrono::steady_clock::now() + 5s;
+  while (!weak_ctx.expired() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(10ms);
+  }
+  CHECK(weak_ctx.expired());
+}
+
+TEST_CASE("backend=kvikio without an object store rejects s3 paths with a clear error",
+          "[s3][routing]")
+{
+  scan_manager_fixture fixture;
+  scan_manager_config cfg{};
+  cfg.backend                 = sirius::scan_manager::io_backend::kvikio;
+  cfg.thread_pool.num_threads = 1;
+  cfg.uring_n_reactors        = 1;
+  cfg.cache.mode              = cucascade::io::cache::cache_mode::none;
+  REQUIRE(cfg.object_store.endpoint.empty());
+  REQUIRE(cfg.object_store.access_key.empty());
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, cfg, *fixture.memory, fixture.topology};
+
+  REQUIRE_THROWS_WITH(manager.create_datasource("s3://unconfigured-bucket/key.parquet"),
+                      Catch::Matchers::ContainsSubstring("object store not configured"));
+
+  // Local paths are still served by kvikIO on the same manager.
+  auto const local_path = make_regular_file();
+  auto local            = manager.create_datasource(local_path.string());
+  REQUIRE(local != nullptr);
+  REQUIRE(local->io_ctx() != nullptr);
+  CHECK(local->io_ctx()->type() == io_context_type::kvikio);
 }

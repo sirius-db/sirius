@@ -20,6 +20,7 @@
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
+#include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/pipeline_build_context.hpp"
 #include "pipeline/repository_wiring.hpp"
@@ -31,21 +32,33 @@
 #include "scan_manager/gatekeeper.hpp"
 #include "scan_manager/readahead_scan_manager.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
+#include "utils/log_test_utils.hpp"
 #include "utils/telemetry_utils.hpp"
 
+#include <cucascade/cudf/datasource.hpp>
 #include <cucascade/io/cache/config.hpp>
+#include <cucascade/io/cache/fs_cache.hpp>
 #include <cucascade/io/cache/types.hpp>
 #include <cucascade/io/kvikio/kvikio_context.hpp>
+#include <unistd.h>
 
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
+#include <fstream>
+#include <functional>
 #include <future>
 #include <memory>
+#include <regex>
+#include <source_location>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using cucascade::io::cache::cache_mode;
@@ -878,4 +891,212 @@ TEST_CASE("a requested cache that failed to build turns the readahead off",
     REQUIRE(manager.io_ctx()->cache() == nullptr);
     CHECK_FALSE(local_scan_reads_ahead(manager, sirius::make_query_id(5)));
   }
+}
+
+// ===========================================================================
+// scan inputs fill the cache on their own
+// ===========================================================================
+
+namespace {
+
+/// A real on-disk file, so the uring backend opens it and the cache sizes its
+/// slot table from a genuine object size.
+struct temp_data_file {
+  std::filesystem::path path;
+
+  explicit temp_data_file(std::size_t bytes)
+  {
+    path = std::filesystem::temp_directory_path() /
+           ("sirius_readahead_lifecycle_" + std::to_string(::getpid()) + "_" +
+            std::to_string(reinterpret_cast<std::uintptr_t>(this)));
+    std::ofstream out(path, std::ios::binary);
+    std::vector<char> data(bytes, 'z');
+    out.write(data.data(), static_cast<std::streamsize>(bytes));
+  }
+
+  ~temp_data_file()
+  {
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+  }
+
+  temp_data_file(temp_data_file const&)            = delete;
+  temp_data_file& operator=(temp_data_file const&) = delete;
+};
+
+/// Pull `global[... <name>=N ...]` out of fs_cache::summary().
+std::uint64_t global_counter(std::string const& summary, std::string const& name)
+{
+  std::smatch m;
+  auto const re = std::regex("global\\[[^\\]]*\\b" + name + "=(\\d+)");
+  if (!std::regex_search(summary, m, re)) { return 0; }
+  return std::stoull(m[1].str());
+}
+
+}  // namespace
+
+TEST_CASE("scan inputs populate the cache without a readahead manager",
+          "[scan_manager][readahead][no_readahead]")
+{
+  temp_data_file file(8ull << 20);
+  auto memory   = initialize_memory_manager(1);
+  auto topology = single_gpu_index();
+  auto cfg      = config_with_readahead_budget(0);
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius::scan_manager::sirius_scan_manager manager{scan_lifecycle, cfg, *memory, topology};
+  auto* cache = manager.io_ctx()->cache();
+  REQUIRE(cache != nullptr);
+  REQUIRE(cache->is_armed());
+  REQUIRE(cache->claimed_bytes() == 0);
+
+  auto const query_id = sirius::make_query_id(6);
+  auto q              = make_local_scan_query(query_id);
+  manager.prepare_for_query(*q.query, false, std::vector<int>{0});
+  REQUIRE_FALSE(manager.has_readahead_for_testing());
+
+  auto make_input = [&]() {
+    auto ds = manager.create_datasource(file.path.string());
+    REQUIRE(ds != nullptr);
+    std::vector<sirius::op::scan::scan_info::fadvise_entry> hints;
+    hints.push_back({ds, {cudf::io::text::byte_range_info{0, 4096}}});
+    auto info = std::make_shared<sirius::op::scan::scan_info>(std::move(hints));
+    return std::pair{ds, std::make_unique<sirius::op::scan::scan_operator_input>(info)};
+  };
+
+  auto [first_ds, first_input] = make_input();
+  CHECK(cache->claimed_bytes() > 0);
+  // A later readahead preparation of the same handle is idempotent.
+  REQUIRE(first_ds->prepare_prefetch(false) == cucascade::io::prepare_result::prepared);
+  std::vector<std::uint8_t> bytes(4096);
+  REQUIRE(first_ds->host_read(0, bytes.size(), bytes.data()) == bytes.size());
+  CHECK(bytes.front() == static_cast<std::uint8_t>('z'));
+  INFO(cache->summary());
+  CHECK(global_counter(cache->summary(), "h2d") > 0);
+  CHECK(global_counter(cache->summary(), "hits") == 0);
+
+  first_input.reset();
+  auto [second_ds, second_input] = make_input();
+  REQUIRE(second_ds->host_read(0, bytes.size(), bytes.data()) == bytes.size());
+  CHECK(bytes.back() == static_cast<std::uint8_t>('z'));
+  INFO(cache->summary());
+  CHECK(global_counter(cache->summary(), "hits") > 0);
+
+  second_input.reset();
+  manager.reset(query_id);
+}
+
+namespace {
+
+/// Pull a counter from either section of a cache report; a missing counter is an error, not 0.
+std::uint64_t report_counter(std::string const& summary,
+                             std::string const& name,
+                             std::string const& section = "global")
+{
+  std::smatch m;
+  auto const re = std::regex(section + "\\[[^\\]]*\\b" + name + "=(\\d+)");
+  if (!std::regex_search(summary, m, re)) {
+    throw std::runtime_error("Missing cache counter: " + summary);
+  }
+  return std::stoull(m[1].str());
+}
+
+// Insert real cache activity while the scan manager emits its INFO report. This
+// exercises the old gap between that report and the baseline update, without
+// adding synchronization hooks or counter setters to the production cache.
+class read_during_summary_log final : public sirius::log::sink {
+ public:
+  read_during_summary_log(std::shared_ptr<sirius::log::sink> delegate, std::function<void()> read)
+    : delegate_(std::move(delegate)), read_(std::move(read))
+  {
+  }
+  void set_level(sirius::log::level level) override { delegate_->set_level(level); }
+  bool should_log(sirius::log::level level) const override { return delegate_->should_log(level); }
+  bool flush() override { return delegate_->flush(); }
+  void log(sirius::log::level level,
+           std::source_location const& location,
+           std::string_view message) override
+  {
+    delegate_->log(level, location, message);
+    if (message.starts_with("[sirius_scan_manager] cache summary:") && !read_done_.exchange(true))
+      read_();
+  }
+
+ private:
+  std::shared_ptr<sirius::log::sink> delegate_;
+  std::function<void()> read_;
+  std::atomic<bool> read_done_{false};
+};
+
+}  // namespace
+
+// The cache-level halves of upstream's "cache refresh reports each increment once across
+// overlapping refreshes" (#2003) live in cuCascade; this is its scan-manager section.
+TEST_CASE("scan manager logs the cache sample it closes and preserves activity during logging",
+          "[scan_manager][readahead][cache_summary]")
+{
+  temp_data_file file(8ull << 20);
+  auto memory             = initialize_memory_manager(1);
+  auto cfg                = config_with_readahead_budget(0);
+  cfg.cache.eviction      = eviction_policy::lru;
+  cfg.max_readahead_scans = 0;
+  cfg.apply_cache_mode();
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius::scan_manager::sirius_scan_manager manager{
+    scan_lifecycle, cfg, *memory, single_gpu_index()};
+  auto* cache = manager.io_ctx()->cache();
+  REQUIRE(cache);
+  REQUIRE(cache->is_armed());
+  auto ds = manager.create_datasource(file.path.string());
+  std::array ranges{cudf::io::text::byte_range_info{0, 4096}};
+  ds->fadvise(ranges, 0);
+  REQUIRE(ds->prepare_prefetch(false) == cucascade::io::prepare_result::prepared);
+  std::vector<std::uint8_t> bytes(4096);
+  auto read = [&] {
+    if (ds->host_read(0, bytes.size(), bytes.data()) != bytes.size())
+      throw std::runtime_error("Incomplete cache read");
+  };
+  read();  // Populate the chunk; subsequent reads count as hits.
+  auto const before = cache->prepare_for_query();
+  std::vector<std::string> reports;
+  constexpr std::array names{"reads", "hits", "h2d", "miss", "evictions"};
+
+  read();
+  auto tctx           = sirius::test::make_test_telemetry_context();
+  auto const query_id = sirius::make_query_id(7);
+  sirius::telemetry::query_telemetry_info tinfo{quent::now_v7(), tctx->worker_id().raw(), query_id};
+  sirius::planner::query empty{std::vector<std::shared_ptr<sirius::pipeline::sirius_pipeline>>{},
+                               tctx->context(),
+                               query_id,
+                               tinfo};
+  std::string info_report;
+  {
+    sirius::test::scoped_recording_log_sink logs;
+    sirius::log::set_sink(std::make_shared<read_during_summary_log>(logs.sink_ptr(), read));
+    manager.prepare_for_query(empty, true, {});
+    // cuCascade's own trace record of the same report is compiled out, so only the scan
+    // manager's INFO record is checked.
+    for (auto const& record : logs.records()) {
+      auto const pos = record.message.find("fs_cache: global[");
+      if (pos == std::string::npos) continue;
+      if (record.level == sirius::log::level::info) info_report = record.message.substr(pos);
+    }
+  }
+  REQUIRE_FALSE(info_report.empty());
+  // The logged report is the very sample the refresh closed: one hit since `before`.
+  CHECK(report_counter(info_report, "hits", "last_cycle") == 1);
+  reports.push_back(info_report);
+  // The read injected by the INFO sink belongs to the next interval.
+  CHECK(report_counter(cache->summary(), "hits", "last_cycle") == 1);
+
+  reports.push_back(cache->prepare_for_query());
+  auto const after = cache->summary();
+  CHECK(report_counter(after, "hits") > report_counter(before, "hits"));
+  for (auto const* name : names) {
+    INFO(name);
+    std::uint64_t reported = 0;
+    for (auto const& report : reports)
+      reported += report_counter(report, name, "last_cycle");
+    CHECK(reported == report_counter(after, name) - report_counter(before, name));
+  }
+  manager.reset(query_id);
 }
