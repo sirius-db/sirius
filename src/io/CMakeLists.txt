@@ -9,6 +9,7 @@ target_sources(
           cache/prefetching_cache.cpp
           cache/types.cpp
           kvikio/kvikio_context.cpp
+          rest/redirect_policy.cpp
           rest/curl_handle.cpp
           rest/rest_ioctx.cpp
           rest/rest_reactor.cpp

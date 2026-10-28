@@ -21,6 +21,7 @@
 #include "io/details/slot_pool.hpp"
 #include "io/io_errors.hpp"
 #include "io/rest/curl_handle.hpp"
+#include "io/rest/redirect_policy.hpp"
 #include "io/uri_parser.hpp"
 #include "log/logging.hpp"
 
@@ -340,37 +341,7 @@ size_t suffix_write_cb(char* ptr, size_t size, size_t nmemb, void* userdata)
 
 // ---- cluster-redirect policy -----------------------------------------------
 
-/// ASCII case-insensitive equality.  Used for schemes and for `host[:port]`
-/// authorities, where the port is compared literally: the configured spelling
-/// has to match the server's, default ports are not normalized.
-bool ascii_iequals(std::string_view a, std::string_view b) noexcept
-{
-  if (a.size() != b.size()) { return false; }
-  for (size_t i = 0; i < a.size(); ++i) {
-    if (ascii_lower(a[i]) != ascii_lower(b[i])) { return false; }
-  }
-  return true;
-}
-
-/// `scheme` and `host[:port]` of an absolute http(s) URL, or nullopt when
-/// @p url is not one (relative Location, other scheme, empty authority).
-struct url_authority {
-  std::string_view scheme;
-  std::string_view authority;
-};
-
-std::optional<url_authority> split_authority(std::string_view url) noexcept
-{
-  auto const sep = url.find("://");
-  if (sep == std::string_view::npos) { return std::nullopt; }
-  std::string_view const scheme = url.substr(0, sep);
-  if (!ascii_iequals(scheme, "http") && !ascii_iequals(scheme, "https")) { return std::nullopt; }
-  std::string_view const rest      = url.substr(sep + 3);
-  auto const end                   = rest.find_first_of("/?#");
-  std::string_view const authority = end == std::string_view::npos ? rest : rest.substr(0, end);
-  if (authority.empty()) { return std::nullopt; }
-  return url_authority{scheme, authority};
-}
+using redirect_admission::detail::split_authority;
 
 bool is_alnum_ascii(unsigned char c) noexcept
 {
@@ -548,49 +519,6 @@ std::string_view range_value(std::string_view header_line) noexcept
 {
   auto const sep = header_line.find(": ");
   return sep == std::string_view::npos ? header_line : header_line.substr(sep + 2);
-}
-
-/// Whether one 307 may be delegated under @c config::cluster_redirect, and if
-/// not, why — the reason goes into the terminal error so a misconfigured
-/// target list and an unexpected redirect read differently in a log.
-struct redirect_decision {
-  bool follow{false};
-  std::string reason;
-};
-
-redirect_decision evaluate_cluster_redirect(config const& cfg,
-                                            std::string_view request_url,
-                                            bool already_delegated,
-                                            long status,
-                                            std::string_view location)
-{
-  auto const& policy = cfg.cluster_redirect;
-  if (!policy.enabled) { return {false, "redirects are not followed"}; }
-  if (status != 307) { return {false, "only 307 is delegated"}; }
-  if (already_delegated) { return {false, "the storage node redirected again"}; }
-  if (location.empty()) { return {false, "307 without Location"}; }
-  auto const from = split_authority(request_url);
-  if (!from || !ascii_iequals(from->authority, policy.origin)) {
-    return {false, "the request did not go to the configured cluster origin"};
-  }
-  auto const to = split_authority(location);
-  if (!to) { return {false, "Location is not an absolute http(s) URL"}; }
-  // The Location goes to curl as-is, so what curl would reject must not count
-  // as a delegation: no whitespace or control bytes anywhere in it.
-  for (unsigned char const c : location) {
-    if (c <= 0x20 || c == 0x7f) { return {false, "Location contains whitespace or control bytes"}; }
-  }
-  if (to->authority.find('@') != std::string_view::npos ||
-      location.find('#') != std::string_view::npos) {
-    return {false, "Location carries userinfo or a fragment"};
-  }
-  if (ascii_iequals(from->scheme, "https") && ascii_iequals(to->scheme, "http")) {
-    return {false, "Location downgrades https to http"};
-  }
-  for (auto const& allowed : policy.allowed_targets) {
-    if (ascii_iequals(to->authority, allowed)) { return {true, {}}; }
-  }
-  return {false, "Location names a storage node outside allowed_targets"};
 }
 
 // ---- retry classification --------------------------------------------------
@@ -1075,8 +1003,8 @@ bool rest_reactor::delegate_redirect(object_ref const& obj,
                                      std::string_view location,
                                      std::string& reason_out)
 {
-  auto decision =
-    evaluate_cluster_redirect(_config, request_url, already_delegated, status, location);
+  auto decision = redirect_admission::evaluate_cluster_redirect(
+    _config, request_url, already_delegated, status, location);
   if (decision.follow) {
     _redirects_followed.fetch_add(1, std::memory_order_relaxed);
     // The Location may carry the gateway's own authorization in its path or
