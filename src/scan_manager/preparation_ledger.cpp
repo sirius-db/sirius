@@ -192,9 +192,10 @@ admission_decision preparation_ledger::admit(std::span<scan_envelope const> scan
   try {
     auto quantum             = provider->allocation_granularity(space);
     d.allocation_granularity = quantum;
-    uint64_t units           = 0;
+    uint64_t units = 0, minimum_permits = 0;
     for (auto const& scan : scans) {
       if (!scan.qualified) return d;
+      minimum_permits = add(minimum_permits, scan.minimum_permits);
       for (auto bytes : scan.retained)
         d.sigma_retained = add(d.sigma_retained, round(bytes, quantum));
       for (auto const& unit : scan.units) {
@@ -206,7 +207,14 @@ admission_decision preparation_ledger::admit(std::span<scan_envelope const> scan
         d.w              = std::max(d.w, unit_w);
       }
     }
-    auto minimum = add(d.sigma_retained, d.w);
+    if (minimum_permits > max_permits || minimum_permits > units) {
+      d.reason = admission_reason::capacity;
+      return d;
+    }
+    minimum_permits = std::max<uint64_t>(1, minimum_permits);
+    if (d.w > (std::numeric_limits<uint64_t>::max() - d.sigma_retained) / minimum_permits)
+      throw std::overflow_error("preparation minimum progress envelope overflow");
+    auto minimum = d.sigma_retained + minimum_permits * d.w;
     auto permits = std::min<uint64_t>(units, max_permits);
     if (d.w)
       permits = std::min(permits, (std::numeric_limits<uint64_t>::max() - d.sigma_retained) / d.w);
@@ -222,7 +230,7 @@ admission_decision preparation_ledger::admit(std::span<scan_envelope const> scan
       try {
         grant = provider->request(space, d.c_requested);
       } catch (std::bad_alloc const&) {
-        // A smaller reservation can still preserve the original one-permit route.
+        // A smaller reservation must still preserve every scan progress requirement.
       }
       d.reason = grant ? admission_reason::short_grant : admission_reason::no_grant;
       if (grant) {
@@ -242,12 +250,12 @@ admission_decision preparation_ledger::admit(std::span<scan_envelope const> scan
           return d;
         }
       }
-      if (permits <= 1) {
+      if (permits <= minimum_permits) {
         state_.reset();
         return d;
       }
       // Bound admission work even with a very large configured worker count.
-      permits = std::max<uint64_t>(1, permits / 2);
+      permits = std::max<uint64_t>(minimum_permits, permits / 2);
     }
     state_->retained_limit = d.sigma_retained;
     state_->w              = d.w;
@@ -418,6 +426,13 @@ uint64_t preparation_ledger::charged_bytes(unit_key key) const
   std::lock_guard lock(state_->mutex);
   auto it = state_->units.find(key);
   return it == state_->units.end() ? 0 : it->second.retained;
+}
+uint64_t preparation_ledger::charged_bytes(w_permit const& permit) const
+{
+  if (!state_ || !permit.state_ || permit.state_->ledger != state_)
+    throw std::logic_error("temporary-memory permit belongs to another ledger");
+  std::lock_guard lock(state_->mutex);
+  return add(permit.state_->temporary, state_->units.at(permit.state_->key).retained);
 }
 uint64_t preparation_ledger::granted_capacity() const
 {

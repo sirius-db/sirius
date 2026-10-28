@@ -1,5 +1,6 @@
 /* Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0 */
 #include "op/scan/arrow_materializer.hpp"
+#include "op/scan/table_scan/owned_arrow_scan.hpp"
 
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/utilities/memory_resource.hpp>
@@ -581,7 +582,19 @@ TEST_CASE("Arrow import validates only the selected UTF8 window including empty 
     std::make_shared<owned_arrow_batch>(producer->schema, producer->array, producer, host);
   materialization_program program{603, 1, {cudf::data_type{cudf::type_id::STRING}}, 0, false};
   program.input_types = program.output_types;
-  auto batch = import_arrow_host(input, program, lane, cudf::get_current_device_resource_ref());
+  auto profiles       = std::make_shared<physical_profile_table>();
+  owned_arrow_scan_info descriptor(
+    input, program.contract, program.generation, 0, profiles, sizeof(producer_batch));
+  auto validator = owned_arrow_split_validator(program);
+  REQUIRE_NOTHROW(validate_split_for_gpu(program.contract,
+                                         check_bit(later_check::host_staged),
+                                         {},
+                                         descriptor,
+                                         *validator,
+                                         program.generation,
+                                         profiles));
+  auto batch =
+    import_arrow_host(descriptor.batch(), program, lane, cudf::get_current_device_resource_ref());
   REQUIRE(lane.quiesce() == cudaSuccess);
   CHECK(batch.rows == rows);
   CHECK(batch.table.view().column(0).size() == rows);

@@ -323,6 +323,81 @@ std::vector<cudf::data_type> validate_arrow_host_flat(
   return types;
 }
 
+std::size_t arrow_import_staging_bytes(ArrowArray const& array,
+                                       std::span<cudf::data_type const> types)
+{
+  std::size_t total = 0;
+  auto add          = [&](uint64_t bytes) {
+    constexpr auto alignment = alignof(std::max_align_t);
+    auto max                 = std::numeric_limits<std::size_t>::max();
+    if (bytes > max - (alignment - 1)) throw std::overflow_error("Arrow staging size overflow");
+    auto rounded = (bytes + alignment - 1) / alignment * alignment;
+    if (rounded > max - total) throw std::overflow_error("Arrow staging size overflow");
+    total += rounded;
+  };
+  add(types.size() * sizeof(normalized_column));
+  auto rows = static_cast<uint64_t>(array.length);
+  for (auto type : types) {
+    if (type.id() == cudf::type_id::STRING) add((rows + 1) * sizeof(int32_t));
+    if (type.id() == cudf::type_id::BOOL8) add(rows);
+    add(cudf::bitmask_allocation_size_bytes(array.length));
+  }
+  return total;
+}
+
+std::vector<cudf::data_type> owned_arrow_batch::input_types() const
+{
+  return validate_arrow_host_flat(schema, array, metadata_lengths);
+}
+std::size_t owned_arrow_batch::estimated_device_bytes() const
+{
+  auto types        = input_types();
+  std::size_t total = 0;
+  auto add          = [&](uint64_t count, uint64_t width) {
+    if (count > (std::numeric_limits<std::size_t>::max() - total) / width)
+      throw std::overflow_error("Arrow device size overflow");
+    total += count * width;
+  };
+  for (std::size_t i = 0; i < types.size(); ++i) {
+    auto const& child = *array.children[i];
+    auto rows         = static_cast<uint64_t>(array.length);
+    // Account for allocated validity alignment even for unknown null counts.
+    add(rows / 512 + 1, 64);
+    if (types[i].id() == cudf::type_id::STRING) {
+      add(rows + 1, sizeof(int32_t));
+      if (rows) {
+        auto begin = child.offset + array.offset;
+        auto bytes = string_offset(child.buffers[1], begin + array.length) -
+                     string_offset(child.buffers[1], begin);
+        add(static_cast<uint64_t>(bytes), 1);
+      }
+    } else {
+      add(rows, cudf::size_of(types[i]));
+    }
+  }
+  // A positive-cardinality zero-column batch needs an internal row-count carrier.
+  if (types.empty()) add(static_cast<uint64_t>(array.length), sizeof(int8_t));
+  return total;
+}
+
+void owned_arrow_batch::validate_for(materialization_program const& program) const
+{
+  if (!capacity || !schema.release || !array.release || !program.contract || !program.generation)
+    throw std::invalid_argument("Arrow import requires admitted input and program");
+  auto types = validate_arrow_host_flat(schema, array, metadata_lengths);
+  if (!program.input_types || types != *program.input_types)
+    throw std::invalid_argument("Arrow schema does not match its bound program");
+  for (std::size_t i = 0; i < types.size(); ++i) {
+    if (types[i].id() != cudf::type_id::DECIMAL128) continue;
+    int precision = 0;
+    std::string_view format(schema.children[i]->format);
+    (void)std::from_chars(format.data() + 2, format.data() + format.size(), precision);
+    if (program.decimal_precisions.size() != types.size() ||
+        program.decimal_precisions[i] != precision)
+      throw std::invalid_argument("Arrow decimal precision does not match its bound program");
+  }
+}
+
 materialized_batch import_arrow_host(std::shared_ptr<owned_arrow_batch> input,
                                      materialization_program const& program,
                                      exec::retire_lane& lane,
@@ -330,19 +405,9 @@ materialized_batch import_arrow_host(std::shared_ptr<owned_arrow_batch> input,
 {
   if (!input || !input->capacity || !program.contract || !program.generation)
     throw std::invalid_argument("Arrow import requires admitted input and program");
-  auto types = validate_arrow_host_flat(input->schema, input->array, input->metadata_lengths);
-  if (!program.input_types || types != *program.input_types)
-    throw std::invalid_argument("Arrow schema does not match its bound program");
-  for (std::size_t i = 0; i < types.size(); ++i) {
-    if (types[i].id() != cudf::type_id::DECIMAL128) continue;
-    int precision = 0;
-    std::string_view format(input->schema.children[i]->format);
-    (void)std::from_chars(format.data() + 2, format.data() + format.size(), precision);
-    if (program.decimal_precisions.size() != types.size() ||
-        program.decimal_precisions[i] != precision)
-      throw std::invalid_argument("Arrow decimal precision does not match its bound program");
-  }
-  auto normalized = std::make_shared<normalized_batch>(input, input->staging_resource);
+  input->validate_for(program);
+  auto const& types = *program.input_types;
+  auto normalized   = std::make_shared<normalized_batch>(input, input->staging_resource);
   normalize_columns(*normalized, input->array, types, input->staging_resource);
   auto submission = lane.begin();
   // Register roots, capacity and PMR staging before any partially failing copy.

@@ -89,6 +89,20 @@ Cancellation closes admission and publication and wakes blocked work. Completion
 
 The shared host Arrow path has two explicit boundaries. `import_arrow_host()` consumes one owned `ArrowSchema` plus `ArrowArray` record batch and retains its input capacity through the retirement lane. `materialize_arrow_stream()` consumes a sequential internal `arrow_batch_source`: each item carries an independently owned batch, a contiguous sequence number, and declared row and byte bounds; `nullopt` is the only EOS marker. The verifier compares the declared row count with the imported batch, sends results directly to a bounded sink, and calls `cancel()` on source, validation, import, or sink failure. Producers acquire preparation/output capacity and split oversized input before returning an item. An adapter may bridge an `ArrowArrayStream` one batch at a time, but this interface does not add a public Fragment Arrow-input API or a native Paimon/DuckLake adapter.
 
+### Shared Arrow scan driver
+
+`arrow_import_ingestible` drives one `arrow_batch_producer` on its declared execution domain. Trusted planning binds the schema, materialization program, original read identity and optional provider validator. Claims inspect cached readiness and acquire a preparation permit before entering the producer. The accepted root retains its charged backing and permit through GPU completion. Import waits on the borrowed task stream; it does not create a stream or synchronize the whole device.
+
+| Input or lifecycle event | Behavior |
+|---|---|
+| Open push queue without input | Pending; an offer or terminal transition wakes the coordinator. |
+| Non-null zero-row input | A real batch; validated and imported normally. |
+| Normal EOS without any accepted input | One rootless empty descriptor; no Arrow import or input credit. A mixed outer scan can supply its own empty carrier instead. |
+| Failure or cancellation | Propagates through the attempt; never treated as EOS. |
+| Synchronous pin or cached rows | Unsupported throughout the source lifecycle. |
+
+The push adapter accepts one offered root at a time. Concurrent offers return false without retaining another root. The external submitting thread waits until its root is copied or the queue terminates; it must hold no engine resource needed for progress. Offered views stay immutable and their owner covers all referenced buffers, including retained parent extents. Schema, row, copy and staging bounds are checked before ownership is accepted. The admitted job copies the selected window through the charged allocator; foreign backing is not adopted as reservation backing. Admission includes offered-input/copy overlap and normalization storage. `finish()` drains queued input before EOS; failure, cancellation and close release blocked offers.
+
 ### Execution and ownership
 
 The coordinator claims work, coalesces results and publishes batches after GPU consumers are ready. Metadata-only attempts advance on the query owner without another thread. An attempt with query-owner or native-reader sources runs coordination independently of reader calls: on the manager's shared pool by default, or on a dedicated thread when `coordinator_workers` is `0`. All drivers use the same bounded control steps, publication gate and retirement path. Sources choose where their jobs run:
