@@ -25,6 +25,7 @@
 
 #include <absl/cleanup/cleanup.h>
 #include <catch.hpp>
+#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <duckdb/planner/expression/bound_aggregate_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <expression/ast/from_duckdb.hpp>

@@ -145,17 +145,24 @@ class scan_validator final : public scan::split_validator {
     return evidence;
   }
 };
+struct scan_emission_state {
+  std::atomic<size_t> remaining;
+  std::atomic<bool> produced{false};
+  explicit scan_emission_state(size_t lanes) : remaining(lanes) {}
+};
 class unit_coalescer final : public scan::batch_coalescer {
   std::shared_ptr<scan_owner const> owner_;
-  bool owner_lane_;
+  std::shared_ptr<scan_emission_state> emission_;
   size_t target_batch_bytes_;
-  bool produced_ = false;
+  bool flushed_ = false;
   std::shared_ptr<unit_state> active_;
   scan::batch_coalescer* inner_ = nullptr;
 
  public:
-  unit_coalescer(std::shared_ptr<scan_owner const> o, bool owner_lane, size_t target_batch_bytes)
-    : owner_(std::move(o)), owner_lane_(owner_lane), target_batch_bytes_(target_batch_bytes)
+  unit_coalescer(std::shared_ptr<scan_owner const> o,
+                 std::shared_ptr<scan_emission_state> emission,
+                 size_t target_batch_bytes)
+    : owner_(std::move(o)), emission_(std::move(emission)), target_batch_bytes_(target_batch_bytes)
   {
   }
   size_t target_batch_bytes() const noexcept override { return target_batch_bytes_; }
@@ -166,7 +173,7 @@ class unit_coalescer final : public scan::batch_coalescer {
     auto output = inner_->partial_emit();
     if (!inner_->retained_bytes()) clear_retained();
     if (!output) return {};
-    produced_ = true;
+    emission_->produced = true;
     return std::make_unique<unit_split>(owner_, active_, std::move(output), nullptr, true);
   }
   cursor_step advance(scan::scan_info& input, size_t& cursor, size_t quantum) override
@@ -195,13 +202,13 @@ class unit_coalescer final : public scan::batch_coalescer {
       if (tail.size() > 1) throw std::logic_error("DuckLake coalescer exceeded bounded tail");
       if (!tail.empty()) output = std::move(tail.front());
       if (output) {
-        produced_ = true;
+        emission_->produced = true;
         return {std::make_unique<unit_split>(owner_, split.unit, std::move(output), nullptr, true),
                 true};
       }
       return {nullptr, true};
     }
-    produced_ = true;
+    emission_->produced = true;
     // A direct batch must retire its input in the same step. Retaining that
     // input until another lookahead slot opens can pin the last shared permit
     // behind a join whose build scan is waiting for that permit.
@@ -221,7 +228,9 @@ class unit_coalescer final : public scan::batch_coalescer {
   std::vector<std::unique_ptr<scan::scan_info>> flush() override
   {
     std::vector<std::unique_ptr<scan::scan_info>> result;
-    if (owner_lane_ && !std::exchange(produced_, true))
+    // Only the final lane can establish that the entire scan had no output.
+    if (!std::exchange(flushed_, true) && emission_->remaining.fetch_sub(1) == 1 &&
+        !emission_->produced.load())
       result.push_back(std::make_unique<unit_split>(owner_, nullptr, nullptr, nullptr, true));
     return result;
   }
@@ -471,6 +480,7 @@ std::vector<scan_ingestible::preparation_source> scan_ingestible::make_preparati
 {
   impl_->completion = _execution_completion;
   std::vector<preparation_source> result;
+  auto emission = std::make_shared<scan_emission_state>(2);
   for (auto domain : {sm::preparation_execution_domain::query_owner,
                       sm::preparation_execution_domain::metadata_worker}) {
     preparation_source source;
@@ -485,16 +495,15 @@ std::vector<scan_ingestible::preparation_source> scan_ingestible::make_preparati
       if (auto unit = state->current.load()) state->close_lanes(unit, domain);
     };
     source.coalescer =
-      std::make_unique<unit_coalescer>(impl_->owner,
-                                       domain == sm::preparation_execution_domain::query_owner,
-                                       impl_->options.scan_task_batch_size);
+      std::make_unique<unit_coalescer>(impl_->owner, emission, impl_->options.scan_task_batch_size);
     result.push_back(std::move(source));
   }
   return result;
 }
 std::unique_ptr<scan::batch_coalescer> scan_ingestible::create_batch_coalescer() const
 {
-  return std::make_unique<unit_coalescer>(impl_->owner, true, impl_->options.scan_task_batch_size);
+  return std::make_unique<unit_coalescer>(
+    impl_->owner, std::make_shared<scan_emission_state>(1), impl_->options.scan_task_batch_size);
 }
 std::shared_ptr<sm::preparation_admission> scan_ingestible::preparation_admission() const
 {

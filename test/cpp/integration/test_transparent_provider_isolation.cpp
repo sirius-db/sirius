@@ -2278,3 +2278,47 @@ TEST_CASE("DuckLake reuses delete preparation capacity across files and scans",
     CHECK(hosts[0]->get_total_reserved_memory() == reserved);
   }
 }
+
+TEST_CASE("DuckLake empty scans preserve scalar aggregate results",
+          "[isolated_context][ducklake][ducklake_empty_aggregate]")
+{
+  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
+  auto shape = GENERATE(
+    std::string("empty"), std::string("inline"), std::string("parquet"), std::string("mixed"));
+  INFO(shape);
+  sirius::test::scoped_temp_directory disk;
+  sirius::test::shared_test_env env(lake_config());
+  auto con = env.make_connection();
+  if (!load_ducklake(con)) return;
+  query(con, "SET gpu_execution=false");
+  attach_lake(con, disk.directory);
+  query(con, "CALL lake.set_option('data_inlining_row_limit',100)");
+  query(con, "CREATE TABLE lake.q(x BIGINT, s VARCHAR)");
+  if (shape != "empty") query(con, "INSERT INTO lake.q VALUES (NULL,NULL),(42,'value')");
+  if (shape == "parquet" || shape == "mixed")
+    query(con, "CALL ducklake_flush_inlined_data('lake')");
+  if (shape == "mixed") query(con, "INSERT INTO lake.q VALUES (NULL,NULL)");
+  std::vector<std::string> statements;
+  for (auto suffix : {"", " WHERE x>1000", " WHERE x%3=1"}) {
+    statements.push_back(
+      std::string(
+        "SELECT COUNT(*),COUNT(x),SUM(x),FIRST(x),FIRST(s),AVG(x),MIN(x),MAX(x) FROM lake.q") +
+      suffix);
+  }
+  std::vector<std::vector<std::string>> expected;
+  for (auto const& sql : statements)
+    expected.push_back(ducklake_result_bag(*query(con, sql)));
+  query(con, "SET gpu_execution=true");
+  query(con, "SET enable_duckdb_fallback=false");
+  for (size_t i = 0; i < statements.size(); ++i) {
+    INFO(statements[i]);
+    auto prepared = con.Prepare(statements[i]);
+    REQUIRE_FALSE(prepared->HasError());
+    for (int repeat = 0; repeat < 3; ++repeat) {
+      auto result = prepared->Execute();
+      INFO((result->HasError() ? result->GetError() : "GPU aggregate completed"));
+      REQUIRE_FALSE(result->HasError());
+      CHECK(ducklake_result_bag(*result) == expected[i]);
+    }
+  }
+}
