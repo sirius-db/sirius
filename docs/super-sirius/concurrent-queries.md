@@ -102,11 +102,28 @@ facts, uniqueness proofs and late-materialization handle. Re-pin builds privatel
 the previous entry usable. Readers hold entry snapshots and query-local visibility masks. SQL pin
 replacement and cache reset remain exclusive maintenance operations.
 
-Metadata producers use the shared worker pool; each query owner drives preparation and
-coalescing without occupying the workers needed to produce its inputs. I/O readahead shares runtime backend budgets across
-queries. Demand reads borrow immediately and block further speculation until their debt is repaid.
-Canceling one subscriber releases its interest without invalidating another subscriber's bytes.
-Cache pressure permits a bounded eviction attempt before abandoning speculative work.
+Metadata producers use the shared metadata worker pool. Coordination and preparation retirement depend on the attempt's sources and [preparation configuration](configuration.md#siriusexecutorscan_managerpreparation):
+
+| Attempt | Coordination | Preparation retirement |
+|---|---|---|
+| Metadata-only | Query owner; no additional coordinator thread. | The owner drains preparation. |
+| Provider or native-reader sources, `coordinator_workers > 0` (default `1`) | Workers shared by the scan manager, started lazily. | Wait for the registration's final step and any in-flight stop notification to return. |
+| Provider or native-reader sources, `coordinator_workers: 0` | One dedicated coordinator thread per attempt. | Join that attempt's coordinator thread. |
+
+The default of one coordinator worker limits thread overhead and matches the default admission limit of one concurrent query. It is a starting configuration, not a measured throughput optimum; more workers can be configured, and dedicated mode remains available for comparison.
+
+The additional preparation-thread budget per scan manager accounts for lazy startup:
+
+| Mode | Additional threads |
+|---|---|
+| Shared coordinator pool | `W_started + N_started` |
+| Dedicated coordinators | `R + N_started` |
+
+`W_started` is zero before the coordinator pool starts, then `coordinator_workers` (default 1). `N_started` is zero before the first native reservation starts its pool, then `native_reader_workers` (default 2). Both pools retain their workers until manager shutdown. `R` counts reader attempts whose dedicated coordinator threads have started but not exited. Metadata-only attempts add no coordinator threads. There are no separate timer or retirement threads; query-owner, metadata and I/O threads are outside this additional budget. `max_native_readers` limits reader slots, not threads.
+
+Preparation retirement completes before the query slot is released. Shared coordinator workers are joined when the scan manager stops. The query owner remains available for statement-bound provider work through drain; native readers use a separate shared executor. Coalescing does not occupy metadata workers or wait for a blocked provider call.
+
+I/O readahead shares runtime backend budgets across queries. Demand reads borrow immediately and block further speculation until their debt is repaid. Canceling one subscriber releases its interest without invalidating another subscriber's bytes. Cache pressure permits a bounded eviction attempt before abandoning speculative work.
 
 GPU memory prefetch selects from the query's admitted GPU set, checks each device's headroom and
 uses real reservations. Runtime-owned exclusive stream leases cover prefetch, pin materialization

@@ -178,6 +178,10 @@ class scan_operator_input : public op::operator_data {
   /// Initialize hints, buffers and readahead before exposing this input to consumers.
   /// Single-owner, at most once; an exception requires discarding the input, not retrying it.
   void initialize_prefetch();
+  // Single-owner stages: prepare may call datasources and must run outside the publication gate.
+  // Publish only registers the prepared input with readahead; it never calls datasource hooks.
+  void prepare_prefetch();
+  void publish_prefetch();
 
   explicit scan_operator_input(
     std::shared_ptr<cucascade::data_batch> cached_batch,
@@ -437,7 +441,8 @@ class scan_operator_input : public op::operator_data {
   std::shared_ptr<scan_manager::readahead_scan_manager> _readahead;
   /// Operator id this split was emitted under, the key @ref _readahead uses.
   std::size_t _operator_id{0};
-  bool _prefetch_started{false};
+  enum class prefetch_phase { idle, preparing, prepared, published };
+  prefetch_phase _prefetch_phase{prefetch_phase::idle};
 };
 
 }  // namespace sirius::op::scan

@@ -231,7 +231,7 @@ TEST_CASE("Delete result validation rejects invalid positions and releases its r
 {
   sirius::scan_manager::test::test_reservation_provider provider;
   preparation_ledger ledger(provider);
-  std::array scans{scan_envelope{{{8, 8, 16, 20}}, 0, 0, true}};
+  std::array scans{scan_envelope{{{{8, 8, 16}, 20}}, {}, true}};
   REQUIRE(ledger.admit(scans, memory_space_id(cucascade::memory::Tier::HOST, 0)).deferred);
   ledger.register_unit({1, 1}, 20);
   auto permit    = ledger.acquire_permit({1, 1});
