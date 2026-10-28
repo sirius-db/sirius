@@ -146,3 +146,36 @@ bool first_submission_eligible(config const& cfg,
 }
 
 }  // namespace sirius::io::rest::redirect_routes
+
+namespace sirius::io::rest::redirect_retention_policy {
+
+std::size_t connection_retention(bool enabled,
+                                 redirect_retention mode,
+                                 std::size_t per_host,
+                                 std::size_t targets) noexcept
+{
+  constexpr std::size_t cap = 4096;
+  if (!enabled || mode == redirect_retention::legacy || per_host >= cap) { return per_host; }
+  if (per_host == 0) { return 0; }
+  // With positive C and T >= cap the mathematical product exceeds the cap.
+  // This check also makes 1 + T safe without constructing an overflowing sum.
+  if (targets >= cap) { return cap; }
+  auto const authorities = targets + 1;
+  if (per_host > cap / authorities) { return cap; }
+  return per_host * authorities;
+}
+
+std::size_t connection_retention(config const& cfg) noexcept
+{
+  return connection_retention(cfg.cluster_redirect.enabled,
+                              cfg.cluster_redirect.retention,
+                              cfg.max_connections,
+                              cfg.cluster_redirect.allowed_targets.size());
+}
+
+char const* retention_name(config const& cfg) noexcept
+{
+  return cfg.cluster_redirect.retention == redirect_retention::expanded ? "expanded" : "legacy";
+}
+
+}  // namespace sirius::io::rest::redirect_retention_policy

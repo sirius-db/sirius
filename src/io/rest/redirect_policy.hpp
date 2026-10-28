@@ -17,6 +17,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -25,6 +26,7 @@
 
 namespace sirius::io::rest {
 struct config;
+enum class redirect_retention;
 
 namespace redirect_admission {
 
@@ -93,4 +95,45 @@ bool first_submission_eligible(config const& cfg,
                                std::size_t auth_attempt) noexcept;
 
 }  // namespace redirect_routes
+
+namespace redirect_retention_policy {
+
+/// Effective idle-connection allowance, not active sockets or a per-host reserve.
+/// Clamp before addition/multiplication so even synthetic size_t extremes cannot
+/// wrap. The reactor still rejects a zero per-host limit; this pure rule returns 0.
+std::size_t connection_retention(bool enabled,
+                                 redirect_retention mode,
+                                 std::size_t per_host,
+                                 std::size_t targets) noexcept;
+std::size_t connection_retention(config const& cfg) noexcept;
+/// Requested mode, independent of the effective allowance and enabled guard.
+char const* retention_name(config const& cfg) noexcept;
+
+}  // namespace redirect_retention_policy
+
+namespace redirect_records {
+
+/// Borrowed, normalized observation for synchronous adapter emission only.
+/// The adapter supplies a sanitized authority (never the URL/grant), structural
+/// Range ("-" when absent), outcome text and connects ("-" when unknown).
+/// No resource ownership, transport types, clock reads or emission occur here.
+struct transfer_record {
+  static constexpr char format[] =
+    "rest_reactor: transfer method={} authority={} range={} status={} curl={} bytes={} attempt={} "
+    "delegated={} elapsed_ms={} route={} connects={}";
+
+  std::string_view method;
+  std::string_view authority;
+  std::string_view range;
+  long status;
+  std::string_view outcome;
+  std::size_t bytes;
+  std::size_t attempt;
+  bool delegated;
+  std::int64_t elapsed_ms;
+  std::string_view route;
+  std::string_view connects;
+};
+
+}  // namespace redirect_records
 }  // namespace sirius::io::rest

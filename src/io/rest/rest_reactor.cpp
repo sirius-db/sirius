@@ -428,24 +428,8 @@ std::string_view log_authority(std::string_view url) noexcept
   return authority;
 }
 
-/// Retention budget shared by the worker's origin and target connections.
-/// This does not cap active transfers or reserve capacity per authority.
-std::size_t connection_retention(config const& cfg) noexcept
-{
-  auto const base    = cfg.max_connections;
-  auto const& policy = cfg.cluster_redirect;
-  if (!policy.enabled || policy.retention == redirect_retention::legacy) { return base; }
-  constexpr std::size_t cap = 4096;
-  if (base >= cap) { return base; }
-  auto const authorities = policy.allowed_targets.size() + 1;
-  if (base > cap / authorities) { return cap; }
-  return base * authorities;
-}
-
-char const* retention_name(config const& cfg) noexcept
-{
-  return cfg.cluster_redirect.retention == redirect_retention::expanded ? "expanded" : "legacy";
-}
+using redirect_retention_policy::connection_retention;
+using redirect_retention_policy::retention_name;
 
 using redirect_routes::k_max_route_bytes;
 using redirect_routes::route_reuse_enabled;
@@ -485,20 +469,29 @@ void log_transfer(std::string_view method,
   auto const elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::steady_clock::now() - started)
                             .count();
-  SIRIUS_LOG_INFO(
-    "rest_reactor: transfer method={} authority={} range={} status={} curl={} bytes={} attempt={} "
-    "delegated={} elapsed_ms={} route={} connects={}",
-    method,
-    log_authority(url),
-    range.empty() ? std::string_view{"-"} : range,
-    status,
-    outcome,
-    bytes,
-    attempt,
-    delegated,
-    elapsed_ms,
-    route,
-    connects);
+  redirect_records::transfer_record const record{method,
+                                                 log_authority(url),
+                                                 range.empty() ? std::string_view{"-"} : range,
+                                                 status,
+                                                 outcome,
+                                                 bytes,
+                                                 attempt,
+                                                 delegated,
+                                                 elapsed_ms,
+                                                 route,
+                                                 connects};
+  SIRIUS_LOG_INFO(redirect_records::transfer_record::format,
+                  record.method,
+                  record.authority,
+                  record.range,
+                  record.status,
+                  record.outcome,
+                  record.bytes,
+                  record.attempt,
+                  record.delegated,
+                  record.elapsed_ms,
+                  record.route,
+                  record.connects);
 }
 
 char const* curl_outcome(CURLcode rc) noexcept
