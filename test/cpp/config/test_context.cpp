@@ -15,6 +15,7 @@
  */
 
 #include "catch.hpp"
+#include "compression/spill_compression.hpp"
 #include "log/level.hpp"
 #include "log/sink.hpp"
 #include "sirius/ffi.hpp"
@@ -65,38 +66,6 @@
 #include <vector>
 
 namespace {
-// MGPU-06 test helper: enable CUDA driver-level peer access for every GPU
-// pair, idempotently, with sticky-error consumption (matches Plan 07-01's
-// enable-loop pattern at sirius_context.cpp). Test-scope because this
-// TEST_CASE builds a bare memory manager rather than going through
-// SiriusContext::initialize() — without this the peer-async convert path
-// hits cudaErrorIllegalAddress on the return leg. Returns true if at
-// least one pair is bidirectionally P2P-capable.
-bool enable_p2p_for_test(int num_gpus)
-{
-  bool any_enabled = false;
-  for (int i = 0; i < num_gpus; ++i) {
-    for (int j = 0; j < num_gpus; ++j) {
-      if (i == j) { continue; }
-      int can_access = 0;
-      if (cudaDeviceCanAccessPeer(&can_access, i, j) != cudaSuccess || !can_access) {
-        (void)cudaGetLastError();
-        continue;
-      }
-      cudaError_t prev_dev_err = cudaSetDevice(i);
-      (void)prev_dev_err;
-      cudaError_t enable_err = cudaDeviceEnablePeerAccess(j, 0);
-      (void)cudaGetLastError();  // consume sticky state (see 07-01 SUMMARY)
-      if (enable_err == cudaSuccess || enable_err == cudaErrorPeerAccessAlreadyEnabled) {
-        any_enabled = true;
-      }
-    }
-  }
-  cudaSetDevice(0);
-  (void)cudaGetLastError();
-  return any_enabled;
-}
-
 // Data integrity guard: FNV-1a checksum over a packed batch payload.
 // Duplicated here because the
 // equivalent helper in test/cpp/downgrade/test_downgrade_executor.cpp lives
@@ -894,6 +863,36 @@ TEST_CASE("Sirius configuration accepts intentional compression retention fracti
   require_fraction("valid_compression_fraction_above_one.yaml", 1.5);
 }
 
+TEST_CASE("Sirius configuration loads spill compression settings", "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
+
+  sirius::sirius_config config;
+  REQUIRE_NOTHROW(config.load_from_file(data_dir / "valid_spill_compression.yaml"));
+  auto const& compression = config.get_compression_config();
+  REQUIRE(compression.enable_spill_compression);
+  REQUIRE(compression.spill_min_batch_bytes == 32ULL * 1024 * 1024);
+  REQUIRE(compression.spill_max_compressed_fraction == Approx(0.5));
+  REQUIRE(compression.max_compressed_fraction ==
+          Approx(sirius::compression_config{}.max_compressed_fraction));
+  REQUIRE(compression.spill_encode_reserve_fraction == Approx(0.25));
+
+  sirius::sirius_config negative_fraction;
+  REQUIRE_THROWS_WITH(negative_fraction.load_from_file(
+                        data_dir / "invalid_spill_max_compressed_fraction_negative.yaml"),
+                      Catch::Matchers::ContainsSubstring("spill_max_compressed_fraction"));
+
+  for (auto const* fixture : {"invalid_spill_encode_reserve_fraction_above_one.yaml",
+                              "invalid_spill_encode_reserve_fraction_negative.yaml",
+                              "invalid_spill_encode_reserve_fraction_nan.yaml"}) {
+    INFO("fixture=" << fixture);
+    sirius::sirius_config rejected;
+    REQUIRE_THROWS_WITH(rejected.load_from_file(data_dir / fixture),
+                        Catch::Matchers::ContainsSubstring("spill_encode_reserve_fraction"));
+  }
+}
+
 TEST_CASE("Sirius configuration keeps task creation policy internal", "[sirius][config]")
 {
   std::source_location loc = std::source_location::current();
@@ -1400,9 +1399,12 @@ TEST_CASE("DuckDB setting rejects invalid compression retention fractions withou
 TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
           "[sirius][context][config][isolated_context]")
 {
-  finally cleanup_env{[]() {
+  // The fixture turns spill compression on, which applies to the whole process.
+  auto const saved_spill_settings = sirius::compression::get_spill_compression_settings();
+  finally cleanup_env{[saved_spill_settings]() {
     unsetenv("SIRIUS_CONFIG_FILE");
     setenv("SIRIUS_DISABLE", "1", 1);
+    sirius::compression::set_spill_compression_settings(saved_spill_settings);
   }};
 
   std::source_location loc = std::source_location::current();
@@ -1440,7 +1442,8 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
       current_setting('pin_table_compression_max_compressed_fraction')::DOUBLE,
       current_setting('dynamic_filter_inlist_max_l2_fraction')::DOUBLE,
       current_setting('enable_dynamic_filter_multi_partition')::BOOLEAN,
-      current_setting('max_dynamic_filter_bloom_bytes_per_gpu')::UBIGINT
+      current_setting('max_dynamic_filter_bloom_bytes_per_gpu')::UBIGINT,
+      current_setting('spill_compression')::BOOLEAN
   )");
   REQUIRE(settings != nullptr);
   REQUIRE_FALSE(settings->HasError());
@@ -1469,6 +1472,7 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   REQUIRE(settings->Collection().GetValue(19, 0).GetValue<double>() == Approx(0.4));
   REQUIRE(settings->Collection().GetValue(20, 0).GetValue<bool>());
   REQUIRE(settings->Collection().GetValue(21, 0).GetValue<uint64_t>() == 17 * mib);
+  REQUIRE(settings->Collection().GetValue(22, 0).GetValue<bool>());
 
   for (auto const* invalid_budget : {"-1", "0", "18446744073709551616"}) {
     auto rejected =
@@ -2269,13 +2273,6 @@ TEST_CASE("gpu_to_gpu round-trip preserves bytes on N>=2 hosts (MGPU-04 + MGPU-0
   auto* gpu1 = const_cast<cucascade::memory::memory_space*>(gpu_spaces[1]);
   REQUIRE(gpu0->get_device_id() == 0);
   REQUIRE(gpu1->get_device_id() == 1);
-
-  // Enable CUDA driver-level peer access for every GPU pair — Plan 07-01's
-  // enable loop normally runs inside SiriusContext::initialize(), but this
-  // TEST_CASE builds a bare memory manager and bypasses that seam. Without
-  // the enable call cucascade's peer-async convert_gpu_to_gpu triggers
-  // cudaErrorIllegalAddress on the GPU1 -> GPU0 return leg (MGPU-06 bug).
-  enable_p2p_for_test(2);
 
   // Build a minimal GPU-resident batch on gpu0. The make_gpu_batch helper in
   // test_downgrade_executor.cpp lives in an anonymous namespace and is not

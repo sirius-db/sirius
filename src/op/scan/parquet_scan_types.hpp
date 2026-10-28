@@ -180,10 +180,15 @@ struct filename_column_size_estimate {
   std::size_t working_bytes;
 };
 
-/// Size the repeated filename column and cuDF's temporary pointer/length pairs.
+/// Size the repeated filename column, temporary pointer/length pairs, and the
+/// scalar's device character buffer. Empty columns need no device allocation.
 /// Uses the active cuDF large-string settings and saturates on overflow.
 [[nodiscard]] filename_column_size_estimate estimate_filename_column_size(std::size_t rows,
                                                                           std::size_t path_bytes);
+
+/// Iceberg keeps its contiguous row-group/delete-layout contract.
+enum class parquet_source_kind { PLAIN_PARQUET, ICEBERG };
+enum class parquet_read_mode { READER, METADATA_ONLY };
 
 //===----------------------------------------------------------------------===//
 // parquet_split_info
@@ -224,6 +229,8 @@ class parquet_split_info : public scan_info {
   /// Row-group slices for this batch — possibly across multiple parquet
   /// files when the per-file row groups don't fill the byte budget.
   std::vector<row_group_slice> rg_slices;
+  parquet_source_kind source_kind = parquet_source_kind::PLAIN_PARQUET;
+  parquet_read_mode read_mode     = parquet_read_mode::READER;
   /// Shared parquet_reader_options (column projection, filter pushdown
   /// when AST translation succeeded). Shared across every split emitted
   /// by the same batch.
@@ -263,10 +270,11 @@ class parquet_split_info : public scan_info {
       total = memory::saturating_add(total, s.estimated_decode_working_bytes);
       runs  = memory::saturating_add(runs, s.row_group_indices.size());
     }
-    // The provenance-preserving virtual path decodes one table per selected row group. When
-    // several pieces are present they all remain alive while concatenate allocates an equally
-    // sized result, so reserve both sides of that peak.
-    return plan && plan->has_user_virtual_columns() && runs > 1
+    // Iceberg retains the per-row-group virtual path and its pieces/concat peak.
+    // Plain reader and metadata-only modes already charge their different allocation
+    // lifetimes in each row group's decode_working_bytes.
+    return source_kind == parquet_source_kind::ICEBERG && plan &&
+               plan->has_user_virtual_columns() && runs > 1
              ? memory::saturating_mul(total, std::size_t{2})
              : total;
   }
@@ -345,10 +353,10 @@ class parquet_file_scan_info : public scan_info {
   /// cannot compare against an AST literal — reader-side pushdown must be
   /// disabled for any split that includes it.
   bool disable_filter_pushdown = false;
-  /// When true, the plan's row-count carrier column (scan_plan::carrier_batch_index)
-  /// could not be resolved in this file — schema evolution, or no row groups —
-  /// so @ref reader_options carries no column projection and the file reads its
-  /// natural batch. Splits never mix files that differ on this.
+  /// No projected carrier was resolved (for example an empty footer). Reader mode
+  /// retains the natural-schema fallback if neither a per-file virtual-scan
+  /// carrier nor the bind-selected carrier is available. Metadata-only mode does
+  /// not decode a carrier.
   bool carrier_unavailable = false;
 
   [[nodiscard]] std::size_t estimated_bytes() const noexcept override

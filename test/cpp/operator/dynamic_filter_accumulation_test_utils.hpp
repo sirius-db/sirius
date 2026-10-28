@@ -264,16 +264,15 @@ void wait_until(Predicate done, std::chrono::milliseconds timeout = std::chrono:
 }
 
 /**
- * @brief Whether the first @p devices GPUs exist and every ordered pair has working peer DMA; warns
- * when not, like `sirius::test::has_gpus`, so callers must be tagged `[multi_gpu]`.
+ * @brief Whether these fixture pools permit every access needed by accumulation
+ *
+ * CUDA failures propagate; unavailable pool capability warns and returns false.
  */
-[[nodiscard]] inline bool has_peer_connected_gpus(int devices)
+[[nodiscard]] inline bool has_pool_access(
+  std::span<sirius::op::dynamic_filter_replica_space const> spaces)
 {
-  if (!sirius::test::has_gpus(devices)) { return false; }
-  std::vector<int> device_ids(static_cast<std::size_t>(devices));
-  std::iota(device_ids.begin(), device_ids.end(), 0);
-  if (sirius::op::find_pair_without_peer_dma(device_ids)) {
-    WARN("test needs working peer DMA between the first " << devices << " GPUs; skipping");
+  if (sirius::op::find_pair_without_pool_access(spaces)) {
+    WARN("test needs access to every fixture replica pool; skipping");
     return false;
   }
   return true;
@@ -673,6 +672,9 @@ struct fixture {
 inline void load_accumulation_kernels(std::size_t devices)
 {
   fixture warm_up({.devices = devices});
+  if (!has_pool_access(warm_up.spaces)) {
+    SKIP("accumulation kernel warm-up requires access to every replica pool");
+  }
   std::vector<batch_ptr> batches;
   for (std::size_t device = 0; device < devices; ++device) {
     batches.push_back(

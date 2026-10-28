@@ -285,7 +285,9 @@ void populate_parquet_schema(sirius::op::scan::parquet_ingestible_table_info& ou
           id, scan_op.names[primary_idx], scan_op.returned_types[primary_idx], kind});
       }
     };
-    if (bind_data.reader_bind.filename_idx.IsValid()) {
+    if (bind_data.reader_bind.filename_idx.IsValid() &&
+        bind_data.reader_bind.filename_idx.GetIndex() !=
+          duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILENAME) {
       add_legacy_virtual(bind_data.reader_bind.filename_idx.GetIndex(),
                          sirius::op::scan::scan_plan::parquet_virtual_column_kind::FILENAME);
     }
@@ -772,6 +774,10 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_gpu_scan_leaf(
   duckdb::SiriusContext* sirius_ctx)
 {
   auto dynamic_filters = scan.sirius_dynamic_filters;
+  // Join construction registered every producer before collect_semantic_lineage(). Its
+  // no-producer check and this normalization therefore agree. An unpublished producer still
+  // blocks metadata-only reads; has_filters() cannot be used here. Direct ingestible callers
+  // may register later and must retain their non-null channel instead of normalizing it there.
   if (dynamic_filters && !dynamic_filters->has_producers()) { dynamic_filters.reset(); }
   // Parquet also prunes with its own snapshot of the channel.
   if constexpr (requires { info->sirius_dynamic_filters; }) {
@@ -789,6 +795,24 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_gpu_scan_leaf(
   }
 
   auto ingestible = sirius::op::scan::make_ingestible(std::move(info));
+  if constexpr (std::is_same_v<InfoT, op::scan::parquet_ingestible_table_info>) {
+    if (ingestible->source_selection_empty()) {
+      // Reuse EMPTY_RESULT's typed empty input. A zero-split scan can complete,
+      // but does not run its in-pipeline ungrouped aggregate (COUNT must emit 0).
+      // No execution-time resolver, datasource or footer is needed, and no
+      // physical-input certificate is fabricated for an eliminated file.
+      // The exact DuckDB schema retains LIST/STRUCT child metadata that the
+      // flat Sirius types omit. An owned empty collection carries it without IO.
+      auto schema = duckdb::make_uniq<duckdb::ColumnDataCollection>(
+        duckdb::Allocator::DefaultAllocator(), scan.duckdb_types);
+      auto empty = duckdb::make_uniq<op::sirius_physical_gpu_values>(
+        scan.types,
+        0,
+        duckdb::optionally_owned_ptr<duckdb::ColumnDataCollection>(std::move(schema)));
+      if (scan.has_physical_overrides()) { empty->set_physical_types(scan.get_physical_types()); }
+      return empty;
+    }
+  }
   auto consumer =
     dynamic_filters
       ? sirius::op::scan::make_dynamic_filter_consumer(
@@ -892,13 +916,23 @@ plan_lineage collect_semantic_lineage(
     if (scan.function.GetName() != "seq_scan" && scan.children.empty() && !scan.pre_declined) {
       op::scan::parquet_ingestible_table_info info;
       populate_parquet_schema(info, scan, context);
+      // Lineage must permit the same carrier-free virtual layout as the plain
+      // Parquet metadata reader. The ingestible still checks its final physical
+      // dependencies and read-mode eligibility before producing any split.
+      auto const& function_name = scan.function.GetName();
+      bool const allow_metadata_only =
+        (function_name == "parquet_scan" || function_name == "read_parquet" ||
+         function_name == "sirius_read_parquet") &&
+        info.has_requested_user_virtual_columns() &&
+        (!scan.sirius_dynamic_filters || !scan.sirius_dynamic_filters->has_producers());
       auto layout = op::scan::build_scan_plan(info.column_ids,
                                               info.projection_ids,
                                               info.names,
                                               info.returned_types,
                                               info.projected_output_count,
                                               info.partition_indices,
-                                              info.virtual_columns);
+                                              info.virtual_columns,
+                                              allow_metadata_only);
       scan.semantic_columns.assign(layout.data_columns.size(), false);
       for (std::size_t d = 0; d < layout.data_columns.size(); ++d)
         result.inputs.push_back({&scan, d});
@@ -1486,14 +1520,17 @@ bool join_concat_all(sirius::op::sirius_physical_operator const& join, bool is_b
   auto const& hash_join = join.Cast<sirius::op::sirius_physical_hash_join>();
   switch (hash_join.join_type) {
     case duckdb::JoinType::LEFT:
+    case duckdb::JoinType::SINGLE:
     case duckdb::JoinType::SEMI:
-    case duckdb::JoinType::ANTI: return is_build;
+    case duckdb::JoinType::ANTI:
+    // Every probe row must see its partition's whole build to get one mark; MARK may run
+    // hash-partitioned STANDARD, like SEMI.
+    case duckdb::JoinType::MARK: return is_build;
     case duckdb::JoinType::RIGHT:
     case duckdb::JoinType::RIGHT_SEMI:
     case duckdb::JoinType::RIGHT_ANTI: return !is_build;
     case duckdb::JoinType::OUTER: return true;
-    case duckdb::JoinType::INNER:
-    case duckdb::JoinType::MARK: return false;
+    case duckdb::JoinType::INNER: return false;
     default:
       throw duckdb::NotImplementedException("sirius_physical_hash_join: unsupported join type: " +
                                             duckdb::JoinTypeToString(hash_join.join_type));

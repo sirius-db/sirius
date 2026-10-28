@@ -21,10 +21,13 @@
 namespace sirius::op::scan {
 class parquet_gpu_ingestible : public gpu_ingestible {
  public:
-  explicit parquet_gpu_ingestible(std::unique_ptr<parquet_ingestible_table_info> info)
-    : _core(std::move(info))
+  explicit parquet_gpu_ingestible(
+    std::unique_ptr<parquet_ingestible_table_info> info,
+    parquet_source_kind source_kind = parquet_source_kind::PLAIN_PARQUET)
+    : _core(std::move(info), source_kind)
   {
   }
+  [[nodiscard]] std::size_t reader_calls() const noexcept { return _core.reader_calls(); }
   void set_execution_completion(std::shared_ptr<pipeline::completion_handler> c) override
   {
     gpu_ingestible::set_execution_completion(c);
@@ -35,6 +38,10 @@ class parquet_gpu_ingestible : public gpu_ingestible {
     return _core.create_batch_coalescer();
   }
   bool has_processed_all_metadata() const override { return _core.has_processed_all_metadata(); }
+  [[nodiscard]] bool source_selection_empty() const noexcept
+  {
+    return _core.source_selection_empty();
+  }
   const ingestible_table_info& table_info() const noexcept override { return _core.table_info(); }
   std::vector<std::size_t> materialized_column_order() const override
   {

@@ -25,13 +25,23 @@ class parquet_scan_core {
     _execution_completion = std::move(c);
   }
   /// Owns the Parquet bind data for the lifetime of the composing ingestible.
-  explicit parquet_scan_core(std::unique_ptr<parquet_ingestible_table_info> info);
+  explicit parquet_scan_core(std::unique_ptr<parquet_ingestible_table_info> info,
+                             parquet_source_kind source_kind = parquet_source_kind::PLAIN_PARQUET);
 
   ~parquet_scan_core();
+
+  /// Data-reader calls made by this ingestible (footer probes excluded).
+  [[nodiscard]] std::size_t reader_calls() const noexcept
+  {
+    return _reader_calls.load(std::memory_order_relaxed);
+  }
 
   std::unique_ptr<batch_coalescer> create_batch_coalescer() const;
 
   [[nodiscard]] bool has_processed_all_metadata() const;
+
+  /// Bind-time file predicates eliminated every file; no physical input is consumed.
+  [[nodiscard]] bool source_selection_empty() const noexcept { return _source_selection_empty; }
 
   metadata_scan_task_t next_split_provider(io::ioctx_resolver resolve);
 
@@ -108,14 +118,16 @@ class parquet_scan_core {
   // Built only when physical evidence is consumed, after finalize has published it.
   std::once_flag _evidence_index_once;
   std::vector<std::size_t> _evidence_index_by_file;
+  const parquet_source_kind _source_kind;
+  parquet_read_mode _read_mode = parquet_read_mode::READER;
 
   // Canonical scan plan — built once in the constructor, shared by every
   // emitted split via its parquet_split_info::plan member.
   std::shared_ptr<scan_plan const> _plan;
   // Shared plan-level projection options. Filters are applied per split.
   std::shared_ptr<cudf::io::parquet_reader_options> _reader_options;
-  // The same options without a column projection: stamped onto files whose
-  // carrier column is unavailable (parquet_file_scan_info::carrier_unavailable).
+  // Options without projection: footer parsing, metadata-only splits, and the
+  // retained natural-schema fallback. Per-file reader carrier options may differ.
   std::shared_ptr<cudf::io::parquet_reader_options> _natural_reader_options;
   // Coalesced DuckDB filter expression. Empty when no filters survived the
   // partition-column drop pass.
@@ -164,10 +176,13 @@ class parquet_scan_core {
   std::vector<null_prune_predicate> _null_prune_predicates;
 
   std::vector<std::string> _file_paths;
+  std::vector<std::size_t> _selected_file_indices;
+  bool _source_selection_empty = false;
 
   // Per-file metadata-scan cursor. next_split_provider hands out one file index
   // per claim; the coalescer downstream batches files and chunks row groups.
   std::atomic<std::size_t> _next_file_idx{0};
+  std::atomic<std::size_t> _reader_calls{0};
 
   // Dynamic join filters shared with the producing hash join; null when none are wired.
   // AST-capable filters are ANDed into the parquet reader filter; membership filtering happens in

@@ -2450,3 +2450,33 @@ TEST_CASE("plan tree shape - an explicit global delim_join_as_cte survives loadi
   Connection con(db);
   CHECK(delim_join_as_cte(con));
 }
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - a correlated count(*) plans a condition-less LEFT nested loop "
+                 "join and a SINGLE hash join",
+                 "[plan_tree_shape][isolated_context]")
+{
+  // DuckDB flattens a correlated scalar count(*) into a SINGLE join over a LEFT join with no
+  // conditions, the latter gluing a one-row `count(*) = 0` default onto every row.
+  auto plan = generate_sirius_plan(*con,
+                                   "SELECT val FROM big_left l WHERE (SELECT count(*) FROM "
+                                   "small_right r WHERE r.rid = l.id AND r.other > 0) > 0");
+  INFO(tree_to_string(plan.get()));
+
+  bool found_cross_left = false;
+  for (auto* op : collect(plan.get(), SiriusPhysicalOperatorType::NESTED_LOOP_JOIN)) {
+    auto& nlj = op->Cast<sirius::op::sirius_physical_nested_loop_join>();
+    if (nlj.conditions.empty() && nlj.join_type == duckdb::JoinType::LEFT) {
+      found_cross_left = true;
+    }
+  }
+  CHECK(found_cross_left);
+
+  bool found_single = false;
+  for (auto* op : collect(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN)) {
+    if (op->Cast<sirius::op::sirius_physical_hash_join>().join_type == duckdb::JoinType::SINGLE) {
+      found_single = true;
+    }
+  }
+  CHECK(found_single);
+}
