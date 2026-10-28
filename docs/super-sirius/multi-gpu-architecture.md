@@ -4,11 +4,11 @@ How Sirius executes SQL across every GPU on a single node — the components, da
 
 ## The Mental Model
 
-Sirius treats a multi-GPU host as a set of cooperating execution units that share host memory and disk but have private device memory. The engine's job is to:
+Sirius treats a multi-GPU host as a set of cooperating execution units that share host memory, disk, and optional remote object-store spill spaces but have private device memory. The engine's job is to:
 
 1. **Place data** so that each row lives in the GPU (or NUMA host region, or local disk) closest to where it will be consumed
 2. **Place tasks** so each task runs on the GPU that already holds its inputs
-3. **Move data when locality fails** — across GPUs via peer-copy calls or explicit host staging, to host or disk on memory pressure, and back to GPU when the next task needs it
+3. **Move data when locality fails** — across GPUs via peer-copy calls or explicit host staging, to host, disk, or an enabled remote spill space on memory pressure, and back to GPU when the next task needs it
 
 The user writes plain SQL. The Sirius optimizer extension intercepts the physical plan and routes supported operators to the multi-GPU execution path; unsupported plans fall back to DuckDB's CPU engine transparently.
 
@@ -30,11 +30,18 @@ Every byte of data lives in exactly one **memory tier** at any moment. Tiers, fa
 |------|-----------|-------------------|-----------------|
 | `GPU` | `cuda_async_memory_resource` (one pool per device) | Bounded by GPU device memory × `usage_limit_fraction` | Active query data |
 | `HOST` | NUMA-local pinned host memory | Set by config: `memory.host.capacity_bytes` (per NUMA host memory resource) | Downgrade target when GPU is full |
-| `DISK` | Raw and `.hpln` spill files via a per-space `std::shared_ptr<cucascade::io::ioctx>` ([I/O ownership](memory-management.md#disk-io-and-ownership)) | Reservation bound via `set_disk_mounting_point(disk_id, capacity, path)` | Last-resort downgrade target |
+| `DISK` | Raw and `.hpln` spill files via a per-space `std::shared_ptr<cucascade::io::ioctx>` ([I/O ownership](memory-management.md#disk-io-and-ownership)) | Reservation bound via `set_disk_mounting_point(disk_id, capacity, path)` | Local spill target, preferred over REMOTE |
+| `REMOTE` | S3-compatible spill objects via an attached REST `ioctx`, shared across GPUs | `memory.remote.capacity_bytes` (default 1 PiB): in-flight reservation bound, **not a stored-object quota** | Optional spill target after DISK; eligible only with an attached `ioctx` |
 
 `HOST` is partitioned by NUMA node — each GPU has a paired host region on its NUMA-local memory controller for fast downgrade. This is configured via `cucascade::memory::reservation_manager_configurator::use_host_per_gpu()` at startup.
 
-Conceptually:
+`REMOTE` is disabled by default (empty `sirius.memory.remote.uri`). It is a spill tier, not
+distributed query execution. GPU/HOST downgrade workers consider usable REMOTE spaces after
+DISK targets, or without a DISK tier; there is **no DISK→REMOTE demotion or direct DISK↔REMOTE
+converter**. See [Remote Memory](configuration.md#remote-memory-siriusmemoryremote) for high-level
+`memory.remote`, low-level `space.remote[]`, and initialization-time credentials.
+
+Conceptually (the lower branches are alternative targets, not DISK→REMOTE transfers):
 
 ```
 ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐
@@ -47,9 +54,11 @@ Conceptually:
       │ (NUMA0) │               │ (NUMA1) │      ← Tier::HOST (per-NUMA, shared by sibling GPUs)
       └────┬────┘               └────┬────┘
            └─────────────┬───────────┘
-                    ┌────┴────┐
-                    │  Disk   │                  ← Tier::DISK (shared pool)
-                    └─────────┘
+                         ├───────────────────┐
+                    ┌────┴────┐         ┌────┴─────┐
+                    │  Disk   │         │  Remote  │
+                    └─────────┘         └──────────┘
+                    Tier::DISK          Tier::REMOTE (optional, attached ioctx only)
 ```
 
 A `cucascade::memory::memory_space` is the in-memory representation of one (tier, gpu_id) pair. The engine queries spaces via `manager.get_memory_space(Tier, gpu_id)` and routes allocations through that space's `device_async_resource_ref`. Each space owns its allocator and a `reservation_aware_resource_adaptor` that tracks per-thread byte budgets so OOM is detectable before the driver fails.
@@ -66,7 +75,7 @@ SiriusContext (src/sirius_context.{hpp,cpp})
 │  └─ For each gpu_id:
 │     ├─ Tier::GPU  memory_space  →  cuda_async_memory_resource pool
 │     ├─ Tier::HOST memory_space  →  NUMA-local pinned-host pool
-│     └─ (Tier::DISK shared by all GPUs)
+│     └─ (Tier::DISK and optional Tier::REMOTE shared by all GPUs)
 │
 ├─ sirius_scan_manager
 │  ├─ _io_ctx          local ioctx: uring (cuFile is single-GPU only)
@@ -89,7 +98,7 @@ SiriusContext (src/sirius_context.{hpp,cpp})
 │                                engine calls materialize_repository_wiring()
 │
 └─ downgrade_executor (one per GPU's HOST-tier path)
-   │  monitors memory pressure; downgrades batches GPU→HOST→DISK
+   │  monitors memory pressure; GPU→HOST, then DISK or usable REMOTE targets
    └─ Phase 22.2 K.6: only runs cudaSetDevice for tier == GPU
 ```
 
@@ -101,7 +110,7 @@ Ownership goes one direction: `SiriusContext` owns everything below it. Connecti
 
 1. **Discover GPUs.** `topology_discovery` enumerates devices visible to the process (respects `CUDA_VISIBLE_DEVICES`), and records each GPU's NUMA node. A NUMA node the OS cannot resolve stays `-1` ("unknown") — the sentinel is carried through rather than normalized to node 0, and consumers fall back explicitly (e.g. the first host space) when they meet it.
 2. **Build the topology index.** After the memory manager is populated, `initialize()` builds one immutable `sirius::memory::topology_index` (`src/memory/topology_index.hpp`) — the single NUMA↔GPU map — and injects it (as `shared_ptr<const>`) into the `task_creator`, the `sirius_scan_manager`, the NUMA-aware small pinned host resource, and the per-GPU downgrade configs (`numa_node_of(device_id)`). `terminate()` resets it. Locality decisions all route through `topology_index::gpus_of()` / `numa_node_of()` rather than component-private maps.
-3. **Build memory spaces.** A `reservation_manager_configurator` is configured with per-GPU usage limits, per-host capacities, optional disk mounts, and NUMA pairings. `builder.build()` produces `memory_space_config`s, which `sirius_memory_reservation_manager` consumes to construct all tier × gpu spaces.
+3. **Build memory spaces.** A `reservation_manager_configurator` is configured with per-GPU usage limits, per-host capacities, optional disk mounts and remote URI prefixes, and NUMA pairings. `builder.build()` produces `memory_space_config`s, which `sirius_memory_reservation_manager` consumes to construct all tier × gpu spaces. Once the manager exists, Sirius builds and attaches each REMOTE space's REST `ioctx` using `set_object_store_config()` / standard AWS environment credentials and the REST transport/TLS policy. Missing credentials log a warning and leave the space without a context, so downgrade skips it. A later SQL `CREATE SECRET` does not attach credentials or enable REMOTE spilling.
 4. **Grant actual pool access, then install per-GPU device resource refs.** The manager calls `sirius::memory::try_grant_pool_access` for each ordered pair of distinct configured GPU spaces before installing any resource reference. Only ordinary RMM async pools have established allocation properties; unknown resources remain unavailable. Unsupported or failed byte verification is nonfatal, while a CUDA error aborts construction. No ordinary `cudaDeviceEnablePeerAccess` call or device-default-pool grant is made. For each GPU, `sirius_memory_reservation_manager`'s constructor sets that GPU's `cuda_async_memory_resource` as cudf's `current_device_resource_ref` (saving the previous ref for restoration on shutdown). This ensures cudf operations on each GPU allocate through that GPU's reservation-tracked pool.
 5. **Construct the scan manager and its local ioctx.** The scan manager creates one `uring_ioctx` for local files. Its reactor pool accepts device-read requests for any visible GPU.
 6. **Register the path-routed backends.** The scan manager's `io_context_registry` holds one entry per backend type (`uring` / `restful` / `cufile`), each a path checker and a factory, with no catch-all. A REST ioctx for `s3://` is built on first use and shared by all GPUs; its workers drive HTTP/1.1 over io_uring, with kTLS or user-space TLS for HTTPS endpoints.
@@ -184,7 +193,7 @@ The pin also survives OOM reschedule. When a partitioned task OOMs and is rebuil
 
 When an operator must consume data on GPU A that lives on GPU B (e.g., a hash join's probe side has chunks scattered across all GPUs), `lock_or_prepare_batch` (`src/pipeline/batch_lock_utils.hpp`) **clones the batch into the consumer's memory space under a shared (read) lock** via `read_only_data_batch::clone_to`. The source batch is never exclusively locked and never mutated: it stays resident on GPU B for consumers local to that device, concurrent readers proceed during the transfer, and the source drops back to the idle state as soon as the prepare completes — making it immediately downgrade-eligible. Source lifetime is ownership-driven: repositories and other tasks holding the batch keep it alive, and the consuming task releases its own pin on the original right after prepare, so a single-consumer source is freed as soon as its clone exists. The clone's allocation is charged to the consuming task's memory reservation, and the reservation estimator counts GPU inputs residing in a different memory space in `bytes_to_materialize_input`.
 
-Host- and disk-resident inputs intentionally keep **move semantics**: `lock_or_prepare_batch` upgrades them to the GPU in place, freeing the spilled copy — the common case is a single consumer re-materializing a downgraded batch.
+Host-, disk-, and remote-resident inputs intentionally keep **move semantics**: `lock_or_prepare_batch` upgrades them to the GPU in place, freeing the spilled copy — the common case is a single consumer re-materializing a downgraded batch.
 
 The underlying byte transfer is `cucascade::convert_gpu_to_gpu` (in `cucascade/src/cudf/representation_converter_builtins.cpp`), which orders the source writer and synchronizes its copy stream before returning. The upstream converter still chooses `cudaMemcpyPeerAsync` or explicit host staging through its directional `probe_peer_dma_works` query; Sirius does not replace that upstream selection policy.
 
@@ -223,11 +232,17 @@ Every allocation through a `memory_space`'s default allocator goes through a `re
 
 On OOM the engine triggers a **downgrade**:
 
-- The `downgrade_executor` monitors per-tier memory pressure. When a tier crosses its threshold, it picks candidate batches (LRU within the tier) and converts them to the next-cheaper tier (`GPU` → `HOST`, `HOST` → `DISK`).
-- Downgrades are stream-ordered: `cudaFreeAsync` on the source tier, then `cudaMallocFromPoolAsync` + memcpy on the target tier. The new tier's `memory_space` becomes the batch's owning space.
+- The `downgrade_executor` monitors per-tier memory pressure. When a tier crosses its threshold, it picks candidate batches (LRU within the tier) and tries cheaper targets: HOST for GPU data, then DISK, then REMOTE for GPU/HOST sources. Only REMOTE spaces with an attached `ioctx` are viable targets; REMOTE does not require DISK, and DISK data is not demoted to REMOTE.
+- In-memory transfers are stream-ordered. Spill conversions use the target tier's I/O context; a REMOTE write must be committed before the new representation becomes visible. The new tier's `memory_space` becomes the batch's owning space.
 - Phase 22.2 K.6 fix: the executor only calls `cudaSetDevice` when its `_space_id.tier == GPU`. HOST-tier downgrade workers operate on host memory only — calling `cudaSetDevice(-1)` for a HOST-tier `space_id` was the K.6 SIGSEGV root cause.
 
 After a downgrade frees enough space, the rescheduled task retries. The reservation tracking ensures the same task doesn't try to allocate more bytes than its reservation; if the reservation itself can't grow, the task fails out of the pipeline.
+
+REMOTE capacity bounds reservations / in-flight conversions, not the total bytes of retained
+spill objects. Normal representation release deletes its object, but crashes or failed deletion
+can leave objects and multipart uploads behind. A bucket lifecycle policy with **spill-prefix
+expiry and `AbortIncompleteMultipartUpload` is required**; choose expiry longer than the lifetime
+of a live spill. There is no crash-leftover startup/shutdown sweep.
 
 ## Concurrency Invariants (Quick Reference)
 
@@ -260,7 +275,7 @@ After a downgrade frees enough space, the rescheduled task retries. The reservat
 
 | Path | Role |
 |------|------|
-| `src/sirius_context.{hpp,cpp}` | `SiriusContext`, per-GPU memory/topology initialization |
+| `src/sirius_context.{hpp,cpp}` | `SiriusContext`, per-GPU memory/topology initialization, REMOTE I/O context attachment |
 | `src/memory/sirius_memory_reservation_manager.{hpp,cpp}` | Extends `cucascade::memory_reservation_manager`; grants actual managed-pool access before setting cudf device resource refs; synchronizes on destruction |
 | `src/scan_manager/sirius_scan_manager.hpp` | `pinned_entry`, `chunk_memory_spaces` invariant |
 | `src/memory/topology_index.hpp` | `topology_index` — the single NUMA↔GPU map injected into task creator, scan manager, downgrade configs |
@@ -274,7 +289,7 @@ After a downgrade frees enough space, the rescheduled task retries. The reservat
 | `src/creator/task_creator.cpp` | Per-task `preferred_device_id` resolution, partition device pin |
 | `src/pipeline/gpu_pipeline_task.hpp` | `preferred_device_id` two-level lookup |
 | `src/pipeline/gpu_pipeline_executor.cpp` + `task_scheduler.cpp` | Ready-device matching, reservation-device execution, OOM-reschedule pin carry-forward |
-| `src/downgrade/downgrade_executor.cpp` | Per-tier downgrade workers, K.6-gated `cudaSetDevice` |
+| `src/downgrade/downgrade_executor.cpp` | Per-tier downgrade workers, usable REMOTE targets after DISK, K.6-gated `cudaSetDevice` |
 | `cucascade/src/cudf/representation_converter_builtins.cpp` | `convert_gpu_to_gpu` / `alloc_and_peer_copy_async` with peer-DMA probe + dst_guard |
 | `cucascade/src/memory/common.cpp` | private-pool verification and typed `grant_pool_peer_access` |
 

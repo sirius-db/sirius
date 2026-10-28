@@ -9,7 +9,7 @@ This document covers Super Sirius configuration: the `sirius_config` class, oper
 The `sirius_config` class loads configuration from a YAML file or uses built-in defaults. It provides:
 
 - Hardware topology (GPU count, NUMA layout)
-- Memory space configurations (GPU, Host, Disk)
+- Memory space configurations (GPU, Host, Disk, Remote)
 - Thread pool configs for all executor types
 - Operator parameters (batch sizes, limits)
 - Telemetry options
@@ -99,6 +99,12 @@ sirius:
       downgrade_stop_fraction: 0.6
     host: { capacity_bytes: 25GB, initial_number_pools: 50, pool_size: 512, block_size: 1048576 }
     disk: { disk_id: 0, capacity_bytes: 1000000000000, downgrade_root_dirs: "/tmp/sirius_disk_memory" }
+    remote:
+      remote_id: 0
+      uri: ""                      # Empty = disabled; enable with s3://bucket/spill-prefix
+      capacity_bytes: 1125899906842624  # 1 PiB; in-flight bound, not stored-object quota
+      n_reactors: 2
+      staging_bytes: 256Mi         # Per reactor
   executor:
     scan_manager:
       num_threads: 4
@@ -132,7 +138,7 @@ sirius:
 
 ## Memory Configuration
 
-Sirius uses cuCascade for tiered memory management across GPU, Host (pinned), and Disk tiers. The `memory` section provides a high-level interface that maps to cuCascade's underlying memory space configs.
+Sirius uses cuCascade for tiered memory management across GPU, Host (pinned), Disk, and optional Remote object-store tiers. The `memory` section provides a high-level interface that maps to cuCascade's underlying memory space configs.
 
 ### Topology
 
@@ -169,7 +175,7 @@ Controls pinned host memory pools. One pool group is created per NUMA node (auto
 | `capacity_bytes` | bytes | — | Pinned host memory capacity **per NUMA node** as absolute bytes, allocated with `cudaMallocHost`. Mutually exclusive with `capacity_fraction`; configuration loading rejects both when both values are non-null. |
 | `reservation_limit_fraction` | double | 1.0 | Fraction of host capacity that can be reserved. Mutually exclusive with `reservation_limit_bytes`; configuration loading rejects both when both values are non-null. |
 | `reservation_limit_bytes` | bytes | — | Absolute reservation limit. Mutually exclusive with `reservation_limit_fraction`; configuration loading rejects both when both values are non-null. |
-| `downgrade_trigger_fraction` | double (0,1] | 0.9 | Start HOST memory reclamation above this fraction. Must be greater than `downgrade_stop_fraction`. File-cache reclaim needs no DISK tier; spilling HOST repository data requires configured `downgrade_root_dirs`. |
+| `downgrade_trigger_fraction` | double (0,1] | 0.9 | Start HOST memory reclamation above this fraction. Must be greater than `downgrade_stop_fraction`. File-cache reclaim needs no storage tier; spilling HOST repository data requires DISK or a usable REMOTE target. |
 | `downgrade_stop_fraction` | double (0,1] | 0.8 | Stop evicting when reserved memory drops to this fraction. Must be less than `downgrade_trigger_fraction`; configuration loading rejects an invalid pair. |
 | `block_size` | bytes | 1Mi | Size of each allocation block in the pool. Larger blocks reduce allocation overhead but waste memory on small allocations. |
 | `pool_size` | int | 128 | Number of blocks per pool. Total pool capacity = `block_size × pool_size`. |
@@ -196,6 +202,52 @@ layouts are unchanged. There are no additional DISK-backend or per-mount reactor
 settings, and no backend registration is required. `sirius.executor.scan_manager.backend`,
 reactor counts and cache settings configure independent scan contexts, not this spill
 default. The removed kvikIO backend is not available for reads or writes.
+
+### Remote Memory (`sirius.memory.remote`)
+
+Controls the optional `REMOTE` spill tier backed by an S3-compatible object store. It is
+**disabled by default** (empty `uri`). A non-empty URI must be `s3://bucket[/prefix]`
+with a bucket and optional prefix; the HTTP(S) service address belongs in `endpoint`, not `uri`.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `remote_id` | int | 0 | Identifier for the remote space. |
+| `uri` | string | "" | Spill-object URI prefix. Empty disables the high-level REMOTE tier. |
+| `capacity_bytes` | bytes | 1 PiB (1,125,899,906,842,624 bytes) | Reservation / in-flight conversion bound only, **not a quota on stored objects**. |
+| `endpoint` | string | "" | Non-empty value overrides the programmatic object-store endpoint; include `http://` or `https://`. Otherwise use the programmatic endpoint or derive the AWS S3 endpoint from the region. |
+| `region` | string | "" | Non-empty value overrides the programmatic signing region. Otherwise use the programmatic region, `AWS_REGION`, then `AWS_DEFAULT_REGION`, falling back to `us-east-1`. |
+| `signing_mode` | enum: `presigned`, `header` | inherited (`presigned` by default) | Optional override of the existing [object-store signing mode](#scan_managerobject_store--programmatic-s3-config-ioobject_store_confighpp): SigV4 authentication in URL queries or signed headers. |
+| `n_reactors` | int (**> 0**) | 2 | REST reactor count for remote spilling, independent of the scan manager's reactor count. |
+| `staging_bytes` | bytes (**> 0**) | 256Mi | Private pinned staging budget **per reactor**. Context construction requires at least 1Mi per reactor and at least twice `scan_manager.rest.write_part_bytes` across all reactors. |
+
+**Credentials are never YAML-loadable.** Before Sirius initialization, supply an in-memory
+`cucascade::io::object_store_config` through `sirius_config::set_object_store_config()`
+(e.g. `context.get_config().set_object_store_config(config)` before `context.initialize(...)`),
+or set the standard AWS environment variables `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+and optional `AWS_SESSION_TOKEN`. Environment credentials are used only when both programmatic
+key fields are empty; partial credentials disable spilling rather than mixing identities.
+`SiriusContext::initialize()` reads these environment variables and passes the resolved
+`object_store_config` to `make_remote_io_context()`; the cuCascade factory does not read the
+environment itself. This chain does not load AWS profiles or refresh credentials through STS/IMDS.
+REMOTE initialization does **not** consult DuckDB's SecretManager. `CREATE SECRET` only supplies
+scan credentials: neither an existing secret nor a later `CREATE SECRET` enables remote spilling;
+lazy secret attachment is deferred.
+
+At initialization, Sirius attaches a started REST `ioctx` to each usable REMOTE space,
+using the object-store configuration plus the overrides above and the scan manager's REST
+transport/TLS policy. Missing credentials leave the context unset and log a warning that
+remote spill is disabled. GPU- and HOST-source downgrade workers consider REMOTE targets
+**after DISK targets, and only when an `ioctx` is attached**. REMOTE can be used without a
+DISK tier; this is target preference, not a DISK-to-REMOTE conversion chain. Direct
+DISK↔REMOTE conversion and DISK→REMOTE demotion are not supported. REMOTE stores raw
+HOST/GPU representations; already Simpatico-compressed batches are not remote spill targets.
+
+The capacity bound does not track retained spill-object bytes or reserve bucket storage.
+Normal representation release queues deletion of its spill object; Sirius shutdown drains
+pending removals before tearing down CUDA resources. Crashes and failed cleanup can leave
+objects or multipart uploads behind. **Configure lifecycle expiry for the spill prefix
+and `AbortIncompleteMultipartUpload`** on the bucket. Choose an expiry longer than the
+maximum lifetime of a live spill; no startup/shutdown sweep reclaims crash leftovers.
 
 ### Input-table compression (`sirius.compression`)
 
@@ -248,6 +300,9 @@ Each memory tier uses a trigger/stop threshold pair to control data eviction:
 - Above `downgrade_trigger`: actively evict data to the next lower tier
 - Above `reservation_limit`: new reservations are denied (triggers OOM retry)
 
+For GPU/HOST sources, optional REMOTE targets follow DISK targets and are eligible only
+with an attached `ioctx`; the ordering does not enable DISK→REMOTE demotion.
+
 The gap between `trigger` and `stop` prevents oscillation — without it, evicting one batch could drop below trigger, then the next allocation re-triggers eviction.
 Configuration loading enforces `0 < downgrade_stop_fraction < downgrade_trigger_fraction <= 1`
 for both the high-level and low-level GPU and host surfaces. Missing or explicit-null
@@ -257,10 +312,9 @@ members retain their surface defaults before the pair is validated.
 
 > **Mutually exclusive with configured `sirius.memory` sub-blocks.** `sirius.space` is a low-level
 > alternative that declares individual memory spaces directly, bypassing the high-level
-> `sirius.memory` configurator. If any `sirius.space.{
-  gpu, host, disk}` list is non-empty, the
-> configuration loader rejects a simultaneous non-null `sirius.memory.{
-  gpu, host, disk}` sub-block
+> `sirius.memory` configurator. If any `sirius.space.{gpu, host, disk, remote}` list is non-empty,
+> the configuration loader rejects a simultaneous non-null
+> `sirius.memory.{gpu, host, disk, remote}` sub-block
 > instead of silently ignoring it. A null memory sub-block is absent; a non-null mapping selects
 > the high-level path even when the mapping is empty or its individual values are null. Empty
 > `sirius.space` lists do not select the low-level path. This path is generally reserved for
@@ -307,6 +361,20 @@ Each tier is a **YAML sequence** of space configs. Byte fields accept suffixes; 
 These spaces use the same [lazy DISK I/O default](#disk-memory-siriusmemorydisk),
 independent of the scan contexts; the low-level YAML surface adds no I/O selection knobs.
 
+#### `sirius.space.remote[]` — one entry per remote spill space
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `remote_id` | int | 0 | Identifier for the remote space. |
+| `uri_prefix` | string | "" | Required non-empty `s3://bucket[/prefix]` for each declared space; an empty value is invalid, unlike the disabled high-level `memory.remote.uri`. |
+| `memory_capacity` | bytes | 1 PiB | Reservation / in-flight conversion bound, not a stored-object quota. |
+
+These spaces use the same initialization-time [REMOTE credentials and lifecycle requirements](#remote-memory-siriusmemoryremote).
+Only `remote_id`, `uri_prefix`, and `memory_capacity` are accepted here. Use the programmatic
+object-store configuration for endpoint and signing mode; region and credentials can also
+come from the AWS environment. A simultaneous `sirius.memory.remote` block is forbidden.
+Unknown keys are rejected on both REMOTE YAML surfaces.
+
 ```yaml
 sirius:
 #NOTE : do NOT also configure sirius.memory — the loader rejects both paths together.
@@ -317,6 +385,8 @@ sirius:
       - { numa_id: 0, memory_capacity: 32Gi, block_size: 1Mi, pool_size: 128 }
     disk:
       - { disk_id: 0, mount_path: /tmp/sirius_disk_memory, memory_capacity: 1Ti }
+    remote:
+      - { remote_id: 0, uri_prefix: "s3://my-spill-bucket/sirius", memory_capacity: 64Ti }
 ```
 
 ## Executor Configuration
@@ -677,6 +747,11 @@ This is a C++ configuration reference, **not a YAML block**.
 over this fallback; an invalid matching secret is an error, not a reason to fall
 back. See [S3 authorization](scan.md#s3--object-store-backend).
 
+For **REMOTE spilling**, supply this programmatic config before Sirius initialization or
+use the AWS environment variables read by `SiriusContext::initialize()`. REMOTE initialization
+does not resolve SQL secrets, and later `CREATE SECRET` statements do not attach credentials to
+REMOTE spaces; see [Remote Memory](#remote-memory-siriusmemoryremote).
+
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `endpoint` | string | "" | S3 endpoint URL, including `http://` or `https://`. Input paths remain `s3://bucket/key`; raw HTTP(S) input URLs are unsupported. |
@@ -753,7 +828,7 @@ devices; independent background placement could conflict with a task's already s
 
 ### Programmatic S3 credentials
 
-S3 credentials are not YAML-loadable. Use `CREATE SECRET (TYPE SIRIUS_S3, ...)` for SQL-managed credentials, or set an in-memory `io::object_store_config` through `sirius_config::set_object_store_config()` before initializing the scan manager. A matching secret takes precedence over this programmatic fallback. YAML containing `sirius.executor.scan_manager.object_store` is rejected.
+S3 credentials are not YAML-loadable. For scans, use `CREATE SECRET (TYPE SIRIUS_S3, ...)` for SQL-managed credentials, or set an in-memory `io::object_store_config` through `sirius_config::set_object_store_config()` before initializing the scan manager. A matching secret takes precedence over this programmatic fallback. YAML containing `sirius.executor.scan_manager.object_store` is rejected. For REMOTE spilling, `SiriusContext::initialize()` instead uses the programmatic config or reads the documented AWS environment variables before calling cuCascade's factory (which itself does not read the environment). REMOTE startup does not consult SecretManager, and a later `CREATE SECRET` does not enable the tier; lazy attachment is deferred.
 
 ## Operator Parameters
 
@@ -1187,6 +1262,9 @@ These are compile-time defaults. Runtime configuration via `sirius_config` and D
 | File | Purpose |
 |------|---------|
 | `src/sirius_config.hpp` | Config class, operator_params, thread pool configs |
+| `src/sirius_config.cpp` | YAML parsing, including high-level `memory.remote` and low-level `space.remote[]` |
+| `src/sirius_context.cpp` | Initialization-time attachment of REMOTE I/O contexts and credentials |
+| `cucascade/include/cucascade/cudf/remote_io_context.hpp` | REMOTE REST context options and factory |
 | `src/config.hpp` | Static config flags |
 | `src/sirius_extension.cpp` | SET variable registration |
 | `src/scan_manager/config.hpp` | Scan manager config (thread pool, IO reactors, readahead, object store) |
