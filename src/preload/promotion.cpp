@@ -207,8 +207,7 @@ promotion_result promote_to_gpu(promotion_job const& job,
   auto& registry  = sirius::converter_registry::get();
   if (kind == repr_kind::other) { return outcome(promotion_outcome::unsupported); }
 
-  auto const need = sat_mul(with_slack(promotion_peak_bytes(*data)),
-                            std::max<std::uint32_t>(job.oom_multiplier, 1));
+  auto const need = with_slack(promotion_peak_bytes(*data));
   if (need > gpu.max_batch_bytes) { return outcome(promotion_outcome::too_big); }
   if (need > reservation->size() && !reservation->grow_by(need - reservation->size())) {
     return outcome(promotion_outcome::no_memory);
@@ -249,6 +248,10 @@ promotion_result promote_to_gpu(promotion_job const& job,
   if (auto const* const produced = mut->get_data();
       produced != nullptr && produced->get_writer_event() == nullptr) {
     if (auto const err = cudaStreamSynchronize(s.get()); err != cudaSuccess) {
+      // Latch a fatal status as a recognized CUDA exception so report_if_fatal poisons the shared
+      // context (fatal_device_status never decodes arbitrary runtime-error text); a non-fatal
+      // sync failure stays an advisory failed promotion.
+      sirius::check_cuda_health(err);
       throw std::runtime_error(std::string{"preload: stream sync after promotion failed: "} +
                                cudaGetErrorString(err));
     }

@@ -144,8 +144,6 @@ struct promotion_job {
   klass k{klass::A};
   /// Bytes to reserve before taking the batch lock.
   std::size_t est_reserve{0};
-  /// Factor applied to the exact need after earlier out-of-memory attempts (GPU targets only).
-  std::uint32_t oom_multiplier{1};
   /// The preload ceiling of the target, in consumed bytes.
   std::size_t ceiling{0};
   /// Memory epoch of the target when the job was taken; a memory refusal gates with this value.
@@ -189,24 +187,16 @@ struct promotion_job {
   return sat_add(bytes, std::max(min_slack, bytes / 64));
 }
 
-/// The estimate multiplier after @p oom_count out-of-memory attempts: 2^oom_count, saturating.
-[[nodiscard]] constexpr std::uint32_t oom_multiplier(std::uint32_t oom_count) noexcept
-{
-  return oom_count >= 31 ? std::uint32_t{1} << 31 : std::uint32_t{1} << oom_count;
-}
-
 /**
  * @brief Bytes to reserve before locking a candidate.
  *
  * @param est_bytes The candidate's size estimate (its largest recorded size).
- * @param multiplier The OOM multiplier (1 for HOST targets).
- * @return `with_slack(max(est_bytes, 1) x multiplier)`.
+ * @return `with_slack(max(est_bytes, 1))`. There is no out-of-memory retry: the first GPU OOM
+ *         bans the candidate (@ref promotion_outcome::oom), so the estimate is never inflated.
  */
-[[nodiscard]] constexpr std::size_t reserve_estimate(std::size_t est_bytes,
-                                                     std::uint32_t multiplier) noexcept
+[[nodiscard]] constexpr std::size_t reserve_estimate(std::size_t est_bytes) noexcept
 {
-  return with_slack(
-    sat_mul(std::max<std::size_t>(est_bytes, 1), std::max<std::uint32_t>(multiplier, 1)));
+  return with_slack(std::max<std::size_t>(est_bytes, 1));
 }
 
 /// @p fraction of @p capacity in bytes, rounded to the nearest byte and clamped to
@@ -300,12 +290,14 @@ struct gpu_ceiling_bytes {
   return c2c ? 5 : 1;
 }
 
-/// Concurrent promotions out of one DISK space: @c concurrent_preloads when set, else 5 with
-/// GPUDirect Storage and 1 without.
-[[nodiscard]] constexpr int disk_cap(preload_executor_config const& cfg, bool gds) noexcept
+/// Concurrent promotions out of one DISK space: @c concurrent_preloads when set, else 1. This
+/// port has no GPUDirect Storage path (every DISK->GPU copy bounces through host memory), so the
+/// auto width is unconditionally 1.
+[[nodiscard]] constexpr int disk_cap(preload_executor_config const& cfg,
+                                     [[maybe_unused]] bool gds) noexcept
 {
   if (cfg.concurrent_preloads) { return static_cast<int>(*cfg.concurrent_preloads); }
-  return gds ? 5 : 1;
+  return 1;
 }
 
 /**
@@ -754,12 +746,9 @@ struct assign_item {
   /// GPU item. Empty when staging is not possible. The caller leaves it empty whenever
   /// `stage_to_host` is false: @ref assign_head_of_line does not read the configuration.
   std::optional<std::size_t> host;
-  /// Bytes the item needs on the GPU (with its OOM multiplier) and on the HOST.
+  /// Bytes the item needs on the GPU and on the HOST.
   std::size_t gpu_bytes{0};
   std::size_t host_bytes{0};
-  /// The candidate ran out of memory before: it never closes its GPU, so its inflated estimate
-  /// cannot block smaller items behind it.
-  bool oomed{false};
 };
 
 /// One accepted item.
@@ -781,8 +770,7 @@ struct assignment_result {
  *
  * - An item that fits its GPU's class budget takes it.
  * - The first item that does not fit closes its GPU for its class (class A closes both) for the
- *   rest of the pass, so a later, smaller item can never overtake it. An item whose candidate has
- *   run out of memory before is skipped without closing.
+ *   rest of the pass, so a later, smaller item can never overtake it.
  * - An item above the GPU's per-batch limit never targets that GPU and closes nothing.
  * - An item refused by its GPU for any reason other than a hold-off falls back to its HOST target
  *   when it has one.
@@ -821,7 +809,7 @@ struct assignment_result {
           continue;
         }
         refuse(b.reason);
-        if (!item.oomed) { g.close(item.k, b.reason); }
+        g.close(item.k, b.reason);
         if (b.reason == refusal::held_off) { try_host = false; }
       }
     }

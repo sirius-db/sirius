@@ -521,6 +521,11 @@ class preload_executor final : public event::query_event_subscriber {
   std::vector<cucascade::memory::memory_space*> _disks;
   std::vector<promotion_gpu> _promotion_gpus;
   std::vector<promotion_host> _promotion_hosts;
+  /// Explicit space-to-lane maps, built in @ref build_lanes. A GPU lane exists only with device
+  /// preloading, so GPU lanes do not always precede DISK lanes: the index must be looked up, not
+  /// computed as `gpu_count + disk_index`.
+  std::vector<std::optional<std::size_t>> _gpu_lane;  ///< GPU index -> HOST->GPU lane index
+  std::vector<std::size_t> _disk_lane;                ///< DISK index -> DISK lane index
 
   /// Per GPU, then per HOST: bytes running jobs will reserve in the space but have not yet. A
   /// lane slot adds the job's estimate under `_mu`; @ref promote_one takes it back, without

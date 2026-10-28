@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <unordered_map>
 
@@ -135,15 +136,20 @@ class device_preload_budget {
     if (_watched.load(std::memory_order_relaxed) == 0) { return; }
     std::lock_guard const lk{_mu};
     for (auto const id : batch_ids) {
-      auto const it = _entries.find(id);
-      if (it == _entries.end()) { continue; }
-      auto& e = it->second;
-      if (e.bytes != 0) {
-        _claimed_bytes.fetch_add(e.bytes, std::memory_order_relaxed);
-        _claimed_releases.fetch_add(1, std::memory_order_relaxed);
-        subtract(e);
-      }
-      e.claimed = true;
+      claim_one_locked(id);
+    }
+  }
+
+  /// Matcher: claim the ids of @p range's elements, where @p get_id(element) returns the id (or
+  /// @c std::nullopt to skip). Allocation-free: it reads the task's existing batch range in place
+  /// under a single board lock. @p GetId must be noexcept-callable.
+  template <typename Range, typename GetId>
+  void claim_range(Range const& range, GetId&& get_id) noexcept
+  {
+    if (_watched.load(std::memory_order_relaxed) == 0) { return; }
+    std::lock_guard const lk{_mu};
+    for (auto const& element : range) {
+      if (std::optional<std::uint64_t> const id = get_id(element)) { claim_one_locked(*id); }
     }
   }
 
@@ -206,6 +212,21 @@ class device_preload_budget {
     std::size_t bytes{0};
     std::uint64_t job_seq{0};
   };
+
+  /// Release @p batch_id's charge (whatever device holds it) and mark it claimed. Call under @c
+  /// _mu.
+  void claim_one_locked(std::uint64_t batch_id) noexcept
+  {
+    auto const it = _entries.find(batch_id);
+    if (it == _entries.end()) { return; }
+    auto& e = it->second;
+    if (e.bytes != 0) {
+      _claimed_bytes.fetch_add(e.bytes, std::memory_order_relaxed);
+      _claimed_releases.fetch_add(1, std::memory_order_relaxed);
+      subtract(e);
+    }
+    e.claimed = true;
+  }
 
   [[nodiscard]] bool in_range(int device) const noexcept { return device >= 0 && device < _n; }
 

@@ -1202,8 +1202,10 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
       !memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::DISK).empty();
     bool const explicit_width =
       preload_config.concurrent_preloads.has_value() && *preload_config.concurrent_preloads > 0;
+    // Staging-only runs whenever device preloading is NOT effectively enabled (budget 0, or
+    // per-stream tracking disabled it) but an explicit width gives DISK->HOST staging work.
     bool const staging_only_has_work =
-      !wants_device && explicit_width && preload_config.stage_to_host && has_disk;
+      !device_preloading && explicit_width && preload_config.stage_to_host && has_disk;
 
     if (wants_device && any_per_stream) {
       SIRIUS_LOG_WARN(

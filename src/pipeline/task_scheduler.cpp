@@ -347,16 +347,18 @@ void task_scheduler::management_eventloop()
           // sees the freed device preloading budget. The board releases whatever device holds a
           // charge (R3 has no same-device exception). Skipped when the board is absent or empty.
           if (_device_preload_budget && !_device_preload_budget->empty()) {
-            std::vector<std::uint64_t> input_ids;
             if (auto const* data =
                   sirius::convertible_gpu_pipeline_task::get_pipelineable_data(*task)) {
-              auto const& batches = data->get_data_batches();
-              input_ids.reserve(batches.size());
-              for (auto const& batch : batches) {
-                if (batch) { input_ids.push_back(batch->get_batch_id()); }
-              }
+              // Consume the task's existing batch range in place (no allocation on the matcher
+              // thread, so an advisory accounting op can never fail the SQL task with bad_alloc).
+              _device_preload_budget->claim_range(
+                data->get_data_batches(),
+                [](std::shared_ptr<cucascade::data_batch> const& batch) noexcept
+                  -> std::optional<std::uint64_t> {
+                  if (batch) { return batch->get_batch_id(); }
+                  return std::nullopt;
+                });
             }
-            _device_preload_budget->claim(input_ids);
           }
           {
             // Priority packs query_id in its high 32 bits (see task_creator); the

@@ -41,8 +41,8 @@ struct preload_executor_config {
   /// Worker threads per lane (each GPU's HOST->GPU lane and each DISK lane) and, for a GPU lane,
   /// the per-GPU HOST->GPU token count. A per-lane cap, not a process-wide one.
   ///
-  /// - absent = auto: a GPU lane is 5 with a C2C link else 1; a DISK lane is 5 with GPUDirect
-  ///   Storage else 1.
+  /// - absent = auto: a GPU lane is 5 with a C2C link else 1; a DISK lane is 1 (this port has no
+  ///   GPUDirect Storage path).
   /// - 0 = the preload executor is off entirely (no executor, threads, subscription, board,
   ///   streams or conversion records). 0 wins over every other preload setting.
   /// - N in [1, 64] = N workers per lane.

@@ -132,7 +132,7 @@ Super Sirius uses multiple dedicated thread pools, each with a specific role:
 │  - HOST→GPU lane per GPU (preload-h2g-<gpu>-<i>), device preload │
 │    only: concurrent_preloads workers; auto 5 with C2C, else 1   │
 │  - Lane per DISK space (preload-dsk-<disk>-<i>): concurrent_     │
-│    preloads workers; auto 5 with GPUDirect Storage, else 1      │
+│    preloads workers; auto 1 (no GPUDirect Storage path)         │
 └─────────────────────────────────────────────────────────────────┘
 ```
 

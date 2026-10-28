@@ -354,11 +354,13 @@ intake_status candidate_store::intake(query_id_t q, event::downgraded_batch cons
   }
 
   if (auto const cit = _by_id.find(id); cit != _by_id.end()) {
+    // A genuinely newer downgrade (or a bounce) is a new generation that reopens the id for
+    // preloading; a duplicate or delayed record that only fills hints must NOT renew the watch,
+    // or it would undo a claim and let the worker charge an already-claimed generation.
+    bool const new_generation = bounced || rec.conversion_seq > cit->second.last_seq;
     merge(cit->second, qs, rec);
     if (bounced) { cit->second.speculative_banned = true; }
-    // Renew the budget generation: a fresh downgrade of a batch a task may have claimed makes
-    // it a candidate again (any old charge was released by the bounce/erase path above).
-    if (_budget) { _budget->watch(id); }
+    if (_budget && new_generation) { _budget->watch(id); }
     count(q, counter::merged);
     return intake_status::merged;
   }
@@ -596,8 +598,7 @@ std::optional<promotion_job> candidate_store::take(ready_item const& item)
   job.expected_source     = c.location;
   job.t                   = item.t;
   job.k                   = item.k;
-  job.oom_multiplier      = 1;  // the first OOM bans the candidate; there is no doubled retry.
-  job.est_reserve         = reserve_estimate(c.est_bytes, job.oom_multiplier);
+  job.est_reserve         = reserve_estimate(c.est_bytes);
   job.ceiling             = item.ceiling;
   job.mem_epoch_at_take   = _mem_epoch[*s];
   job.queue_epoch_at_take = _queue_epoch;
@@ -738,9 +739,9 @@ outcome_effect candidate_store::apply_outcome(promotion_job const& job,
     case promotion_outcome::held_off: break;
     case promotion_outcome::contended: lost_race(); break;
     case promotion_outcome::oom:
-      // The first out-of-memory bans the candidate from GPUs for its lifetime: the next pass
-      // stages a DISK candidate on HOST instead, and a HOST candidate stays where it is.
-      if (c.oom_count < std::numeric_limits<std::uint32_t>::max()) { ++c.oom_count; }
+      // The first out-of-memory bans the candidate from GPUs for its lifetime (no doubled-estimate
+      // retry): the next pass stages a DISK candidate on HOST instead, and a HOST candidate stays
+      // where it is.
       if (!c.gpu_banned) {
         c.gpu_banned = true;
         count(job.query, counter::gpu_banned);

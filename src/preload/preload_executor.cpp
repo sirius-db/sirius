@@ -444,7 +444,11 @@ void preload_executor::build_spaces()
 
 void preload_executor::build_lanes()
 {
-  // GPU HOST->GPU lanes exist only with device preloading; staging-only mode has DISK lanes only.
+  _gpu_lane.assign(_gpus.size(), std::nullopt);
+  _disk_lane.assign(_disks.size(), 0);
+  // GPU HOST->GPU lanes exist only with device preloading; staging-only mode has DISK lanes only,
+  // so DISK lanes do not always start at index _gpus.size(). Record the exact lane index of each
+  // space (see @ref lane_of).
   if (_device_preloading) {
     for (std::size_t i = 0; i < _gpus.size(); ++i) {
       auto l           = std::make_unique<lane>();
@@ -455,6 +459,7 @@ void preload_executor::build_lanes()
       l->threads       = _gpus[i].h2g_cap;
       l->effective_cap = _gpus[i].h2g_cap;
       l->refined       = true;
+      _gpu_lane[i]     = l->idx;
       _lanes.push_back(std::move(l));
     }
   }
@@ -464,6 +469,7 @@ void preload_executor::build_lanes()
     l->kind        = lane_kind::disk;
     l->space_index = k;
     l->space       = _disks[k];
+    _disk_lane[k]  = l->idx;
     _lanes.push_back(std::move(l));
   }
 }
@@ -1392,9 +1398,8 @@ bool preload_executor::add_entry(std::vector<plan_entry>& entries,
   e.k            = request.k;
   e.source       = c.location;
   e.a.k          = request.k;
-  e.a.oomed      = c.oom_count > 0;
-  e.a.gpu_bytes  = reserve_estimate(c.est_bytes, oom_multiplier(c.oom_count));
-  e.a.host_bytes = reserve_estimate(c.est_bytes, 1);
+  e.a.gpu_bytes  = reserve_estimate(c.est_bytes);
+  e.a.host_bytes = reserve_estimate(c.est_bytes);
   if (choice.decision == target_decision::gpu) { e.a.gpu = _store.gpu_index_of(choice.device); }
   // HOST is the target of a staging item and the fallback of a DISK-resident GPU item, and never
   // a target at all when staging is off.
@@ -1445,12 +1450,13 @@ void preload_executor::rebuild_ready_lists(std::vector<plan_entry> const& entrie
 std::optional<std::size_t> preload_executor::lane_of(cucascade::memory::memory_space_id source,
                                                      target t) const noexcept
 {
-  if (source.tier == Tier::HOST && t.tier == Tier::GPU && t.index < _gpus.size()) {
-    return t.index;
+  // A HOST->GPU item uses its GPU's lane, which exists only with device preloading.
+  if (source.tier == Tier::HOST && t.tier == Tier::GPU && t.index < _gpu_lane.size()) {
+    return _gpu_lane[t.index];
   }
   if (source.tier == Tier::DISK) {
     for (std::size_t k = 0; k < _disks.size(); ++k) {
-      if (_disks[k]->get_device_id() == source.device_id) { return _gpus.size() + k; }
+      if (_disks[k]->get_device_id() == source.device_id) { return _disk_lane[k]; }
     }
   }
   return std::nullopt;
@@ -1678,9 +1684,9 @@ bool preload_executor::replan_after(promotion_job const& job,
     case promotion_outcome::expired:
     case promotion_outcome::already_resident:
     case promotion_outcome::failed: return _room_refused;
-    // A staged batch can go on to its GPU; a new location, a ban or a doubled estimate changes
-    // the candidate's target; a gate may send DISK items to HOST instead; and the event that
-    // ends a hold-off may have come during the attempt, while the candidate could not be planned.
+    // A staged batch can go on to its GPU; a new location or a ban changes the candidate's
+    // target; a gate may send DISK items to HOST instead; and the event that ends a hold-off may
+    // have come during the attempt, while the candidate could not be planned.
     case promotion_outcome::held_off:
     case promotion_outcome::promoted:
     case promotion_outcome::stale:

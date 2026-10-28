@@ -25,6 +25,7 @@
 
 #include <cucascade/memory/common.hpp>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -115,7 +116,7 @@ struct store_fixture {
   query_id_t const q1 = make_query_id(1);
 
   /// Bytes the board charges when a GPU job of a candidate with @p est_bytes is taken.
-  static std::size_t charged(std::size_t est_bytes) { return reserve_estimate(est_bytes, 1); }
+  static std::size_t charged(std::size_t est_bytes) { return reserve_estimate(est_bytes); }
   query_id_t const q2 = make_query_id(2);
 
   store_fixture()
@@ -467,18 +468,45 @@ TEST_CASE("candidate_store: the first OOM bans the GPU for the candidate's lifet
   REQUIRE(f.store.intake(f.q1, record(b, 7, 1, gpu0, disk0, 64 << 20)) == intake_status::inserted);
 
   auto job = f.take(7, gpu_t0);
-  // No doubled-estimate retry: the estimate uses a multiplier of 1.
-  CHECK(job.oom_multiplier == 1);
-  CHECK(job.est_reserve == reserve_estimate(64 << 20, 1));
+  // No doubled-estimate retry: the reserve estimate is never inflated.
+  CHECK(job.est_reserve == reserve_estimate(64 << 20));
   f.store.apply_outcome(job, outcome(promotion_outcome::oom));
   CHECK_FALSE(f.store.gated(gpu_t0));  // local to the candidate
   CHECK(f.store.find(7)->gpu_banned);  // banned on the first OOM
   CHECK(f.counters.get(counter::gpu_banned) == 1);
 
-  // Staging is not inflated by the GPU's OOM history.
+  // Staging is not inflated by the GPU's OOM history either.
   job = f.take(7, host_t0);
-  CHECK(job.oom_multiplier == 1);
-  CHECK(job.est_reserve == reserve_estimate(64 << 20, 1));
+  CHECK(job.est_reserve == reserve_estimate(64 << 20));
+}
+
+TEST_CASE("candidate_store: a duplicate or stale downgrade record never undoes a claim",
+          "[preload]")
+{
+  store_fixture f;
+  fake_batch b;
+  REQUIRE(f.store.intake(f.q1, record(b, 7, 5, gpu0, host0, 100)) == intake_status::inserted);
+  // A task claims the watched id before preload ever takes it.
+  std::array<std::uint64_t, 1> const ids{7};
+  f.budget.claim(ids);
+
+  SECTION("an equal or older record only fills hints and leaves the claim standing")
+  {
+    REQUIRE(f.store.intake(f.q1, record(b, 7, 5, gpu0, host0, 100)) == intake_status::merged);
+    REQUIRE(f.store.intake(f.q1, record(b, 7, 3, gpu0, host0, 100)) == intake_status::merged);
+    // A worker TAKE is refused (the charge finds the id claimed) and the candidate is dropped.
+    CHECK_FALSE(f.store.take({7, gpu_t0, klass::A, 0}).has_value());
+    CHECK(f.counters.get(counter::claimed) == 1);
+    CHECK(f.store.find(7) == nullptr);
+    CHECK(f.store.outstanding_bytes(0) == 0);
+  }
+  SECTION("a strictly newer record starts a new generation and reopens the id")
+  {
+    REQUIRE(f.store.intake(f.q1, record(b, 7, 6, gpu0, host0, 100)) == intake_status::merged);
+    auto const job = f.store.take({7, gpu_t0, klass::A, 0});
+    REQUIRE(job.has_value());  // the new generation cleared the claim, so the charge succeeds
+    CHECK(f.store.outstanding_bytes(0) == store_fixture::charged(100));
+  }
 }
 
 TEST_CASE("candidate_store: too_big bans the GPU at once", "[preload]")

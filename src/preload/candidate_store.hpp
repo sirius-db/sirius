@@ -80,7 +80,6 @@ struct candidate {
   std::optional<exec::queue_priority> task_priority;
   std::optional<int> preferred_device;
   std::uint32_t lock_misses{0};
-  std::uint32_t oom_count{0};
   bool in_flight{false};
   bool unsupported{false};
   bool speculative_banned{false};
@@ -241,8 +240,9 @@ struct pass_snapshot {
  *   store does not know update statistics only, so nothing comes back after @ref retire_query.
  * - A refusal gate is stamped with the epoch the job saw when it was taken, so a memory event
  *   during the attempt always leaves the space ungated.
- * - Outstanding bytes per GPU always equal the sum over the ledger's GPU entries, and every path
- *   that removes a query's entries removes its bytes.
+ * - The device preloading budget is charged per live job at TAKE and released at claim or on any
+ *   non-promoting outcome; the ledger records each charge's generation so a later erase releases
+ *   exactly it. The ledger itself is kept only for statistics, not for byte accounting.
  */
 class candidate_store {
  public:

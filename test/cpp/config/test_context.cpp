@@ -2973,10 +2973,19 @@ sirius::parsed_sirius_config preload_context_config(bool enabled, fs::path const
     YAML::Load(preload_context_yaml(enabled, disk_dir)));
 }
 
-/// A one-GPU, one-DISK context whose @c preload block is @p preload_block (indented under
-/// @c preload:).
-std::string preload_context_yaml_custom(std::string const& preload_block, fs::path const& disk_dir)
+/// A one-GPU context whose @c preload block is @p preload_block (indented under @c preload:),
+/// with a DISK tier iff @p with_disk.
+std::string preload_context_yaml_custom(std::string const& preload_block,
+                                        fs::path const& disk_dir,
+                                        bool with_disk = true)
 {
+  std::string const disk = with_disk ? std::string{R"(
+    disk:
+      disk_id: 0
+      capacity_bytes: 1000000000
+      downgrade_root_dirs: ")"} + disk_dir.string() +
+                                         "\""
+                                     : std::string{};
   return std::string{R"(sirius:
   topology:
     num_gpus: 1
@@ -2985,11 +2994,44 @@ std::string preload_context_yaml_custom(std::string const& preload_block, fs::pa
       usage_limit_fraction: 0.1
       reservation_limit_fraction: 1.0
     host:
-      capacity_bytes: 1000000000
+      capacity_bytes: 1000000000)"} +
+         disk + R"(
+  executor:
+    pipeline:
+      num_threads: 2
+    downgrade:
+      num_threads: 1
+      monitor_period: 10ms
+    scan_manager:
+      uring_n_reactors: 1
+    preload:
+)" + preload_block +
+         R"(  telemetry:
+    enable_quent: false
+)";
+}
+
+/// A one-GPU, one-DISK context whose single GPU tracks reservations @p per_stream, configured
+/// through the low-level @c space.gpu[] surface (the only place that exposes per_stream control).
+std::string per_stream_context_yaml(std::string const& preload_block,
+                                    bool per_stream,
+                                    fs::path const& disk_dir)
+{
+  return std::string{R"(sirius:
+  space:
+    gpu:
+      - device_id: 0
+        memory_capacity: 1GiB
+        reservation_limit_fraction: 1.0
+        per_stream_reservation: )"} +
+         (per_stream ? "true" : "false") + R"(
+    host:
+      - numa_id: 0
+        memory_capacity: 1GiB
     disk:
-      disk_id: 0
-      capacity_bytes: 1000000000
-      downgrade_root_dirs: ")"} +
+      - disk_id: 0
+        memory_capacity: 1GiB
+        mount_path: ")" +
          disk_dir.string() + R"("
   executor:
     pipeline:
@@ -3007,11 +3049,12 @@ std::string preload_context_yaml_custom(std::string const& preload_block, fs::pa
 }
 
 std::unique_ptr<duckdb::SiriusContext> custom_preload_context(std::string const& preload_block,
-                                                              fs::path const& disk_dir)
+                                                              fs::path const& disk_dir,
+                                                              bool with_disk = true)
 {
   auto ctx = std::make_unique<duckdb::SiriusContext>();
   ctx->initialize(sirius::parsed_sirius_config::from_node(
-    YAML::Load(preload_context_yaml_custom(preload_block, disk_dir))));
+    YAML::Load(preload_context_yaml_custom(preload_block, disk_dir, with_disk))));
   return ctx;
 }
 
@@ -3211,9 +3254,60 @@ TEST_CASE("SiriusContext preload existence rule and device-preloading gating",
     CHECK(ctx->device_preload_budget_for_testing().expired());
     ctx->terminate();
   }
-  // Per-stream reservation tracking disabling device preloading is covered behaviorally by
-  // test_preload_executor.cpp (the fixture's per_stream option); the high-level memory.gpu config
-  // block has no per_stream_reservation key to drive it from here.
+  SECTION("an explicit width with no budget and no DISK tier starts nothing")
+  {
+    auto ctx = custom_preload_context("      concurrent_preloads: 2\n",
+                                      dir.path(),
+                                      /*with_disk=*/false);
+    CHECK(ctx->get_preload_executor() == nullptr);
+    CHECK(ctx->device_preload_budget_for_testing().expired());
+    ctx->terminate();
+  }
+  SECTION("an explicit width with no budget and stage_to_host:false starts nothing")
+  {
+    auto ctx = custom_preload_context("      concurrent_preloads: 2\n      stage_to_host: false\n",
+                                      dir.path());
+    CHECK(ctx->get_preload_executor() == nullptr);
+    CHECK(ctx->device_preload_budget_for_testing().expired());
+    ctx->terminate();
+  }
+}
+
+TEST_CASE("SiriusContext per-stream GPU tracking disables device preloading but keeps staging",
+          "[sirius][context][isolated_context][preload_context]")
+{
+  sirius::test::scratch_dir dir{"preload_per_stream"};
+  auto const init = [&](bool per_stream, std::string const& preload_block) {
+    auto ctx = std::make_unique<duckdb::SiriusContext>();
+    ctx->initialize(sirius::parsed_sirius_config::from_node(
+      YAML::Load(per_stream_context_yaml(preload_block, per_stream, dir.path()))));
+    return ctx;
+  };
+
+  SECTION("baseline: without per-stream tracking a budget enables device preloading")
+  {
+    auto ctx = init(/*per_stream=*/false, "      device_preloading_budget: 0.2\n");
+    REQUIRE(ctx->get_preload_executor() != nullptr);
+    CHECK_FALSE(ctx->device_preload_budget_for_testing().expired());
+    CHECK_FALSE(ctx->preload_streams_for_testing().expired());
+    ctx->terminate();
+  }
+  SECTION("per-stream + budget + an explicit width still runs DISK->HOST staging")
+  {
+    // The real context decision must treat device preloading as off (per stream) yet keep the
+    // explicitly-enabled staging, rather than refusing to start (F2).
+    auto ctx = init(/*per_stream=*/true,
+                    "      concurrent_preloads: 2\n      device_preloading_budget: 0.2\n");
+    REQUIRE(ctx->get_preload_executor() != nullptr);
+    CHECK(ctx->device_preload_budget_for_testing().expired());  // no board: device preloading off
+    CHECK(ctx->preload_streams_for_testing().expired());        // no streams
+  }
+  SECTION("per-stream + budget with only an auto width starts nothing")
+  {
+    auto ctx = init(/*per_stream=*/true, "      device_preloading_budget: 0.2\n");
+    CHECK(ctx->get_preload_executor() == nullptr);
+    ctx->terminate();
+  }
 }
 
 TEST_CASE("SiriusContext re-initializes with preload after terminate",

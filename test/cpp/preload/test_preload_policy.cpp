@@ -108,14 +108,10 @@ TEST_CASE("preload size arithmetic saturates and estimates with slack", "[preloa
   STATIC_REQUIRE(with_slack(64 * MiB) == 65 * MiB);
   STATIC_REQUIRE(with_slack(1024 * MiB) == 1040 * MiB);
 
-  STATIC_REQUIRE(oom_multiplier(0) == 1);
-  STATIC_REQUIRE(oom_multiplier(1) == 2);
-  STATIC_REQUIRE(oom_multiplier(3) == 8);
-  STATIC_REQUIRE(oom_multiplier(1000) == (std::uint32_t{1} << 31));
-
-  STATIC_REQUIRE(reserve_estimate(0, 1) == with_slack(1));
-  STATIC_REQUIRE(reserve_estimate(64 * MiB, 2) == with_slack(128 * MiB));
-  STATIC_REQUIRE(reserve_estimate(64 * MiB, 0) == with_slack(64 * MiB));
+  // There is no OOM multiplier: the first GPU OOM bans the candidate, so the estimate is never
+  // inflated. reserve_estimate is just with_slack(max(est, 1)).
+  STATIC_REQUIRE(reserve_estimate(0) == with_slack(1));
+  STATIC_REQUIRE(reserve_estimate(64 * MiB) == with_slack(64 * MiB));
 
   STATIC_REQUIRE(fraction_of(0.5, 100) == 50);
   STATIC_REQUIRE(fraction_of(-0.1, 100) == 0);
@@ -320,9 +316,9 @@ TEST_CASE("head-of-line assignment closes a target at the first item that does n
   SECTION("a refusal blocks every later item on that GPU, however small")
   {
     std::vector<assign_item> items{
-      {klass::A, 0, std::nullopt, 6 * GiB, 0, false},
-      {klass::A, 0, std::nullopt, 6 * GiB, 0, false},  // does not fit: closes GPU 0
-      {klass::A, 0, std::nullopt, 1 * GiB, 0, false},  // would fit, but behind the head
+      {klass::A, 0, std::nullopt, 6 * GiB, 0},
+      {klass::A, 0, std::nullopt, 6 * GiB, 0},  // does not fit: closes GPU 0
+      {klass::A, 0, std::nullopt, 1 * GiB, 0},  // would fit, but behind the head
     };
     auto const r = assign_head_of_line(items, gpus, hosts);
     REQUIRE(r.assigned.size() == 1);
@@ -331,28 +327,27 @@ TEST_CASE("head-of-line assignment closes a target at the first item that does n
     CHECK(refused(r, refusal::ceiling) == 2);
   }
 
-  SECTION("an item whose candidate ran out of memory before is skipped without closing")
+  SECTION("a refused item always closes its GPU (there is no OOM-retry exception)")
   {
     gpus[0].max_batch_bytes = 100 * GiB;
     std::vector<assign_item> items{
-      {klass::A, 0, std::nullopt, 20 * GiB, 0, true},
-      {klass::A, 0, std::nullopt, 1 * GiB, 0, false},
+      {klass::A, 0, std::nullopt, 20 * GiB, 0},  // does not fit: closes GPU 0
+      {klass::A, 0, std::nullopt, 1 * GiB, 0},   // behind the closed head, even though it fits
     };
     auto const r = assign_head_of_line(items, gpus, hosts);
-    REQUIRE(r.assigned.size() == 1);
-    CHECK(r.assigned[0].item == 1);
-    CHECK(gpus[0].closed_a == refusal::none);
+    CHECK(r.assigned.empty());
+    CHECK(gpus[0].closed_a == refusal::ceiling);
   }
 
   SECTION("a class-B refusal leaves class A open; a class-A refusal closes both")
   {
     gpus[0].speculative_window = 1 * GiB;
     std::vector<assign_item> items{
-      {klass::B, 0, std::nullopt, 2 * GiB, 0, false},  // speculative window: closes B
-      {klass::A, 0, std::nullopt, 2 * GiB, 0, false},  // A still fits
-      {klass::B, 0, std::nullopt, 1 * GiB, 0, false},  // B closed
-      {klass::A, 0, std::nullopt, 9 * GiB, 0, false},  // 8 GiB left: closes A
-      {klass::A, 0, std::nullopt, 1 * GiB, 0, false},
+      {klass::B, 0, std::nullopt, 2 * GiB, 0},  // speculative window: closes B
+      {klass::A, 0, std::nullopt, 2 * GiB, 0},  // A still fits
+      {klass::B, 0, std::nullopt, 1 * GiB, 0},  // B closed
+      {klass::A, 0, std::nullopt, 9 * GiB, 0},  // 8 GiB left: closes A
+      {klass::A, 0, std::nullopt, 1 * GiB, 0},
     };
     auto const r = assign_head_of_line(items, gpus, hosts);
     REQUIRE(r.assigned.size() == 1);
@@ -367,7 +362,7 @@ TEST_CASE("head-of-line assignment closes a target at the first item that does n
   {
     gpus[0].max_batch_bytes = 100 * GiB;
     std::vector<assign_item> items{
-      {klass::A, 0, 0, 11 * GiB, 11 * GiB, false},
+      {klass::A, 0, 0, 11 * GiB, 11 * GiB},
     };
     auto const r = assign_head_of_line(items, gpus, hosts);
     REQUIRE(r.assigned.size() == 1);
@@ -380,7 +375,7 @@ TEST_CASE("head-of-line assignment closes a target at the first item that does n
   {
     gpus[0].closed_a = gpus[0].closed_b = refusal::held_off;
     std::vector<assign_item> items{
-      {klass::A, 0, 0, 1 * GiB, 1 * GiB, false},
+      {klass::A, 0, 0, 1 * GiB, 1 * GiB},
     };
     auto const r = assign_head_of_line(items, gpus, hosts);
     CHECK(r.assigned.empty());
@@ -391,9 +386,9 @@ TEST_CASE("head-of-line assignment closes a target at the first item that does n
   {
     gpus[0].max_batch_bytes = 2 * GiB;
     std::vector<assign_item> items{
-      {klass::A, 0, std::nullopt, 3 * GiB, 0, false},
-      {klass::A, 0, 0, 4 * GiB, 4 * GiB, false},
-      {klass::A, 0, std::nullopt, 1 * GiB, 0, false},
+      {klass::A, 0, std::nullopt, 3 * GiB, 0},
+      {klass::A, 0, 0, 4 * GiB, 4 * GiB},
+      {klass::A, 0, std::nullopt, 1 * GiB, 0},
     };
     auto const r = assign_head_of_line(items, gpus, hosts);
     REQUIRE(r.assigned.size() == 2);
@@ -408,9 +403,9 @@ TEST_CASE("head-of-line assignment closes a target at the first item that does n
   {
     hosts[0].room = 5 * GiB;
     std::vector<assign_item> items{
-      {klass::B, std::nullopt, 0, 0, 3 * GiB, false},
-      {klass::B, std::nullopt, 0, 0, 3 * GiB, false},
-      {klass::B, std::nullopt, 0, 0, 1 * GiB, false},
+      {klass::B, std::nullopt, 0, 0, 3 * GiB},
+      {klass::B, std::nullopt, 0, 0, 3 * GiB},
+      {klass::B, std::nullopt, 0, 0, 1 * GiB},
     };
     auto const r = assign_head_of_line(items, gpus, hosts);
     REQUIRE(r.assigned.size() == 1);
@@ -422,8 +417,8 @@ TEST_CASE("head-of-line assignment closes a target at the first item that does n
   SECTION("items assigned to a GPU consume its windows")
   {
     std::vector<assign_item> items{
-      {klass::B, 0, std::nullopt, 3 * GiB, 0, false},
-      {klass::A, 0, std::nullopt, 3 * GiB, 0, false},
+      {klass::B, 0, std::nullopt, 3 * GiB, 0},
+      {klass::A, 0, std::nullopt, 3 * GiB, 0},
     };
     auto const r = assign_head_of_line(items, gpus, hosts);
     CHECK(r.assigned.size() == 2);
@@ -434,7 +429,7 @@ TEST_CASE("head-of-line assignment closes a target at the first item that does n
 
   SECTION("an item with no usable target is counted")
   {
-    std::vector<assign_item> items{{klass::A, 5, std::nullopt, 1, 0, false}};
+    std::vector<assign_item> items{{klass::A, 5, std::nullopt, 1, 0}};
     auto const r = assign_head_of_line(items, gpus, hosts);
     CHECK(r.assigned.empty());
     CHECK(refused(r, refusal::no_target) == 1);
@@ -657,12 +652,13 @@ TEST_CASE("queue margins: H for a device's bucket, H x GPUs for the shared bucke
 
 // ---- lane caps ---------------------------------------------------------------------------------
 
-TEST_CASE("lane caps: C2C x GDS x overrides", "[preload_policy]")
+TEST_CASE("lane caps: C2C x overrides", "[preload_policy]")
 {
   preload_executor_config cfg;
   CHECK(h2g_cap(cfg, true) == 5);
   CHECK(h2g_cap(cfg, false) == 1);
-  CHECK(disk_cap(cfg, true) == 5);
+  // The auto DISK width is always 1 at this pin: there is no GPUDirect Storage path.
+  CHECK(disk_cap(cfg, true) == 1);
   CHECK(disk_cap(cfg, false) == 1);
 
   // concurrent_preloads is one per-lane width for every GPU and DISK lane alike.

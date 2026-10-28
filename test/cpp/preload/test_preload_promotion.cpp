@@ -178,7 +178,7 @@ struct promotion_fixture {
     {
       auto ro           = batch->to_read_only();
       j.expected_source = ro.get_memory_space()->get_id();
-      j.est_reserve     = reserve_estimate(ro.get_data()->get_size_in_bytes(), 1);
+      j.est_reserve     = reserve_estimate(ro.get_data()->get_size_in_bytes());
     }
     j.t       = t;
     j.k       = k;

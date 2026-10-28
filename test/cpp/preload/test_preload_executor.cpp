@@ -65,6 +65,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -607,7 +608,7 @@ TEST_CASE_METHOD(executor_fixture,
   // Room for both estimates plus half of one. Counting the parked job's bytes twice, once as
   // its reservation and once as in flight, would leave room for only half of the second.
   std::size_t const bytes = 8 * mib;
-  auto const est          = reserve_estimate(bytes, 1);
+  auto const est          = reserve_estimate(bytes);
   auto const filler       = fill_gpu_to(committed_ceiling(cfg) - 2 * est - est / 2);
   REQUIRE_FALSE(gpu().should_downgrade_memory());
 
@@ -1016,16 +1017,21 @@ TEST_CASE_METHOD(executor_fixture,
                  "preload executor: lane concurrency and in-flight bytes stay under their caps",
                  "[preload_executor]")
 {
-  auto const run = [&](int cap, double inflight_fraction, std::uint32_t id) {
+  // Hold every promotion inside a gate so the overlap is observed deterministically (no sleep):
+  // @p want_overlap workers must be blocked in the gate at once before it is released.
+  auto const run = [&](int cap,
+                       double inflight_fraction,
+                       std::uint32_t id,
+                       int want_overlap,
+                       bool expect_inflight_refusal) {
     auto cfg                  = config();
     cfg.concurrent_preloads   = static_cast<std::size_t>(cap);
     cfg.lookahead_tasks       = 16;
     cfg.max_inflight_fraction = inflight_fraction;
     cfg.max_batch_fraction    = inflight_fraction;
     build(cfg);
-    exec->set_promotion_hook_for_testing([](promotion_job const&) {
-      std::this_thread::sleep_for(20ms);  // keep copies overlapping
-    });
+    promotion_gate gate;
+    exec->set_promotion_hook_for_testing([&](promotion_job const&) { gate.enter(); });
     auto const q     = open_query(id);
     auto const state = pipeline_state(priority(q, 1));
     std::vector<std::shared_ptr<cucascade::data_batch>> batches;
@@ -1036,9 +1042,16 @@ TEST_CASE_METHOD(executor_fixture,
         push_task(state, {batches.back()});
         downgraded(q, record(batches.back()));
       }
-      settle();
+      settle();  // held off: no copies start, so settle does not deadlock on the gate
     }
-    wait_ended(q);
+    wait_ended(q);  // release the hold-off: workers now enter the gate and block there
+    // Deterministic overlap: wait until want_overlap workers are blocked in the gate together.
+    REQUIRE(gate.wait_entered(want_overlap));
+    if (expect_inflight_refusal) {
+      // The in-flight-bytes cap refuses the rest while the first few are held in the gate.
+      REQUIRE(eventually([&] { return exec->stats()[counter::refused_inflight] >= 1; }));
+    }
+    gate.release();
     settle();
     for (auto const& b : batches) {
       CHECK(tier_of(*b) == Tier::GPU);
@@ -1052,20 +1065,20 @@ TEST_CASE_METHOD(executor_fixture,
 
   SECTION("cap 1")
   {
-    auto const s = run(1, 0.10, 1);
+    auto const s = run(1, 0.10, 1, /*want_overlap=*/1, /*expect_inflight_refusal=*/false);
     CHECK(s.lane_concurrency_max.at(0) == 1);
   }
   SECTION("cap 5")
   {
-    auto const s = run(5, 0.10, 2);
+    auto const s = run(5, 0.10, 2, /*want_overlap=*/2, /*expect_inflight_refusal=*/false);
     CHECK(s.lane_concurrency_max.at(0) <= 5);
     CHECK(s.lane_concurrency_max.at(0) >= 2);
   }
   SECTION("in-flight bytes")
   {
     double const fraction = 0.004;
-    auto const s          = run(5, fraction, 3);
-    auto const cap        = fraction_of(fraction, opts.gpu_capacity);
+    auto const s   = run(5, fraction, 3, /*want_overlap=*/1, /*expect_inflight_refusal=*/true);
+    auto const cap = fraction_of(fraction, opts.gpu_capacity);
     CHECK(s.gpu_inflight_bytes_max.at(0) <= cap);
     CHECK(s.lane_concurrency_max.at(0) < 5);
     CHECK(s[counter::refused_inflight] >= 1);
@@ -1073,20 +1086,20 @@ TEST_CASE_METHOD(executor_fixture,
 }
 
 TEST_CASE_METHOD(executor_fixture,
-                 "preload executor: DISK lane threads follow GPUDirect Storage",
+                 "preload executor: auto lane widths (C2C sizes the GPU lane; DISK is always 1)",
                  "[preload_executor]")
 {
   auto cfg                = config();
-  cfg.concurrent_preloads = std::nullopt;  // auto: C2C sizes the GPU lane, GDS the DISK lane
-  SECTION("without GDS")
+  cfg.concurrent_preloads = std::nullopt;  // auto: C2C sizes the GPU lane; DISK is 1 at this pin
+  SECTION("no C2C: both lanes are 1")
   {
     build(cfg, {false, false});
     CHECK(exec->lane_threads_for_testing() == std::vector<int>{1, 1});
   }
-  SECTION("with GDS")
+  SECTION("GDS does not raise the DISK lane (no GDS path at this pin)")
   {
     build(cfg, {false, true});
-    CHECK(exec->lane_threads_for_testing() == std::vector<int>{1, 5});
+    CHECK(exec->lane_threads_for_testing() == std::vector<int>{1, 1});
   }
   SECTION("C2C raises the HOST->GPU lane")
   {
@@ -1334,6 +1347,124 @@ TEST_CASE(
     CHECK(attempts == 0);
     CHECK(stat(*f.exec, counter::refused_ceiling) >= 1);
   }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Staging-only mode and the device preloading budget
+// ---------------------------------------------------------------------------------------------
+
+TEST_CASE_METHOD(executor_fixture,
+                 "preload executor: staging-only mode stages a DISK batch on HOST",
+                 "[preload_executor]")
+{
+  auto cfg                     = config();
+  cfg.concurrent_preloads      = 1;
+  cfg.device_preloading_budget = 0.0;  // explicit width, no budget: DISK->HOST staging only
+  build(cfg);
+  // No GPU HOST->GPU lane exists (device preloading off): only the DISK lane. Dispatching a
+  // staged item must resolve to that lane's actual index, not `gpu_count + disk_index`.
+  REQUIRE(exec->lane_threads_for_testing() == std::vector<int>{1});
+  auto const q     = open_query(1);
+  auto const batch = spilled(*disk);
+  push_task(pipeline_state(priority(q, 1)), {batch});
+  downgraded(q, record(batch));
+  settle();
+  CHECK(tier_of(*batch) == Tier::HOST);  // staged, never promoted to a GPU
+  CHECK(stat(*exec, counter::promoted_d2h) == 1);
+  CHECK(stat(*exec, counter::promoted_h2g) == 0);
+  CHECK(stat(*exec, counter::promoted_d2g) == 0);
+}
+
+TEST_CASE_METHOD(executor_fixture,
+                 "preload executor: a claim releases or refuses the device preloading budget",
+                 "[preload_executor]")
+{
+  build();  // device preloading on, budget 0.20
+  auto const q = open_query(1);
+
+  SECTION("claim before TAKE drops the job as claimed and charges nothing")
+  {
+    auto const batch = spilled(*host);
+    push_task(pipeline_state(priority(q, 1)), {batch});
+    // Hold off the GPU so no worker takes the job yet; the candidate is still watched.
+    std::optional<sirius::memory::memory_wait_board::waiter> hold{board->enter_wait(0)};
+    downgraded(q, record(batch));
+    settle();
+    REQUIRE(budget->watched_count() >= 1);
+    // A task claims the batch before preload ever takes it.
+    std::array<std::uint64_t, 1> const ids{batch->get_batch_id()};
+    budget->claim(ids);
+    hold.reset();
+    wait_ended(q);  // reopen the GPU and trigger a pass
+    settle();
+    CHECK(tier_of(*batch) == Tier::HOST);  // never promoted
+    CHECK(stat(*exec, counter::claimed) >= 1);
+    CHECK(budget->outstanding(0) == 0);
+    CHECK(stat(*exec, counter::promoted_h2g) == 0);
+  }
+
+  SECTION("claim during the copy releases immediately; landing does not recharge")
+  {
+    promotion_gate gate;
+    exec->set_promotion_hook_for_testing([&](promotion_job const&) { gate.enter(); });
+    auto const batch = spilled(*host);
+    push_task(pipeline_state(priority(q, 1)), {batch});
+    downgraded(q, record(batch));
+    REQUIRE(gate.wait_entered(1));        // the worker took the job (charged) and is in the hook
+    REQUIRE(budget->outstanding(0) > 0);  // charged at TAKE
+    std::array<std::uint64_t, 1> const ids{batch->get_batch_id()};
+    budget->claim(ids);                  // a task claims it mid-copy
+    CHECK(budget->outstanding(0) == 0);  // released immediately
+    gate.release();
+    settle();
+    CHECK(tier_of(*batch) == Tier::GPU);  // the copy still landed
+    CHECK(budget->outstanding(0) == 0);   // landing did not recharge
+    CHECK(budget->claimed_releases() >= 1);
+  }
+
+  SECTION("claim after landing releases the persisted charge")
+  {
+    auto const batch = spilled(*host);
+    push_task(pipeline_state(priority(q, 1)), {batch});
+    downgraded(q, record(batch));
+    settle();
+    REQUIRE(tier_of(*batch) == Tier::GPU);
+    REQUIRE(budget->outstanding(0) > 0);  // the charge persists after landing until claimed
+    std::array<std::uint64_t, 1> const ids{batch->get_batch_id()};
+    budget->claim(ids);
+    CHECK(budget->outstanding(0) == 0);
+    CHECK(budget->claimed_releases() >= 1);
+  }
+}
+
+TEST_CASE_METHOD(executor_fixture,
+                 "preload executor: the budget window fits two in-flight jobs but not three",
+                 "[preload_executor]")
+{
+  auto cfg                = config();
+  cfg.concurrent_preloads = 3;  // three lanes, so three copies could run at once
+  // One batch's reserve estimate is about 1 MiB (with_slack of a 4096-row INT32 batch); a 2.5 MiB
+  // budget fits two but not three. If in-flight bytes were double-counted, only one would fit.
+  cfg.device_preloading_budget = 2.5 / 1024.0;
+  cfg.max_inflight_fraction    = 1.0;  // keep the physical in-flight cap from binding first
+  cfg.max_batch_fraction       = 1.0;
+  build(cfg);
+  promotion_gate gate;
+  exec->set_promotion_hook_for_testing([&](promotion_job const&) { gate.enter(); });
+  auto const q     = open_query(1);
+  auto const state = pipeline_state(priority(q, 1));
+  std::vector<std::shared_ptr<cucascade::data_batch>> batches;
+  for (int i = 0; i < 3; ++i) {
+    batches.push_back(spilled(*host));
+    push_task(state, {batches.back()});
+    downgraded(q, record(batches.back()));
+  }
+  // Exactly two charges fit the window and reach the copy; the third is refused by the window.
+  REQUIRE(gate.wait_entered(2));
+  REQUIRE(eventually([&] { return stat(*exec, counter::refused_window) >= 1; }));
+  CHECK(gate.count() == 2);  // never three while the two are held
+  gate.release();
+  settle();
 }
 
 // ---------------------------------------------------------------------------------------------
