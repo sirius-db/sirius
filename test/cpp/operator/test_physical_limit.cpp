@@ -22,12 +22,10 @@
 
 #include <catch.hpp>
 #include <cucascade/data/disk_data_representation.hpp>
-#include <cucascade/data/disk_io_backend.hpp>
 #include <cucascade/memory/disk_table.hpp>
 #include <helper/type_conversions.hpp>
 #include <op/sirius_physical_limit.hpp>
 
-#include <atomic>
 #include <future>
 #include <map>
 #include <numeric>
@@ -42,40 +40,11 @@ namespace {
 
 using namespace sirius::test::operator_utils;
 
-class metadata_only_io : public cucascade::idisk_io_backend {
- public:
-  std::atomic<std::size_t> calls{0};
-  void write(const std::filesystem::path&,
-             const void*,
-             std::size_t,
-             std::size_t,
-             ::cuda::stream_ref) override
-  {
-    ++calls;
-    throw std::logic_error("Unexpected metadata test I/O");
-  }
-  void read(
-    const std::filesystem::path&, void*, std::size_t, std::size_t, ::cuda::stream_ref) override
-  {
-    ++calls;
-    throw std::logic_error("Unexpected metadata test I/O");
-  }
-  void write(const std::filesystem::path&, const void*, std::size_t, std::size_t) override
-  {
-    ++calls;
-    throw std::logic_error("Unexpected metadata test I/O");
-  }
-  void read(const std::filesystem::path&, void*, std::size_t, std::size_t) override
-  {
-    ++calls;
-    throw std::logic_error("Unexpected metadata test I/O");
-  }
-};
-
+// A DISK space without an io context: its batches carry row metadata only, and any disk I/O
+// would first have to install a context (see memory_space::get_or_init_io_context).
 struct limit_metadata_inputs {
-  std::shared_ptr<metadata_only_io> io = std::make_shared<metadata_only_io>();
   cucascade::memory::memory_space space{
-    cucascade::memory::disk_memory_space_config{0, 1ull << 20, "/tmp"}, io};
+    cucascade::memory::disk_memory_space_config{0, 1ull << 20, "/tmp"}};
   data_repository repo;
   uint64_t next_id = 0;
 
@@ -566,7 +535,7 @@ TEST_CASE("unordered limit execute refunds its claim when output construction fa
   cucascade::memory::disk_memory_space_config config;
   config.mount_paths     = "/tmp";
   config.memory_capacity = 1024;
-  cucascade::memory::memory_space space(config, std::make_shared<metadata_only_io>());
+  cucascade::memory::memory_space space(config);
   auto make_input = [&](std::size_t rows) -> std::unique_ptr<operator_data> {
     auto table = std::make_unique<cucascade::memory::disk_table_allocation>(
       "", std::vector<cucascade::memory::column_metadata>{}, 0);
@@ -747,7 +716,7 @@ TEST_CASE("full-barrier limit drains trailing spilled batches without scheduling
   for (const auto& batch : unused) {
     CHECK(batch.expired());
   }
-  CHECK(inputs.io->calls.load() == 0);
+  CHECK(inputs.space.get_io_context() == nullptr);
   CHECK_FALSE(limit.is_limit_exhausted());
   // A retry of the selected task retains its immutable claim even after the repository drains.
   auto retry              = slice.with_batches_preserving_rows(slice.get_data_batches());
@@ -777,7 +746,7 @@ TEST_CASE("full-barrier limit skips offset-only inputs without GPU tasks", "[ord
   CHECK_FALSE(limit.get_next_task_input_data());
   CHECK(trailing.expired());
   CHECK(inputs.repo.all_empty());
-  CHECK(inputs.io->calls.load() == 0);
+  CHECK(inputs.space.get_io_context() == nullptr);
 }
 
 TEST_CASE("full-barrier limit keeps one empty-output task when no rows are selected",
@@ -803,7 +772,7 @@ TEST_CASE("full-barrier limit keeps one empty-output task when no rows are selec
   CHECK(second.expired());
   CHECK(inputs.repo.all_empty());
   CHECK_FALSE(limit.get_next_task_input_data());
-  CHECK(inputs.io->calls.load() == 0);
+  CHECK(inputs.space.get_io_context() == nullptr);
 }
 
 TEST_CASE("full-barrier limit zero and offset past input produce one empty GPU batch",
