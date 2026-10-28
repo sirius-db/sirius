@@ -772,8 +772,8 @@ pressure. A pass reclaims at most the overflow's worth of chunks, so the cache k
 its reservation, apart from the race below. `fs_cache::reclaim` does not distinguish overflow
 chunks from the rest; it only stops at the byte target.
 
-With no DISK target, the executor skips repository and task spilling, since there is nowhere
-to convert into. A cache with no overflow makes the HOST monitor back off. A monitor request
+With no spill target (no DISK, and no REMOTE space with an attached I/O context), the executor
+skips repository and task spilling, since there is nowhere to convert into. A cache with no overflow makes the HOST monitor back off. A monitor request
 that frees nothing, because all overflow is pinned or loading, delays the next one, doubling
 from `monitor_period` up to `max(monitor_period, 1 s)`.
 
