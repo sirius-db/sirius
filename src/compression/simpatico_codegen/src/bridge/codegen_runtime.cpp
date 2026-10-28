@@ -52,6 +52,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -64,6 +65,7 @@
 // already compile fine without them.
 #include "api/compressed_table_io.hpp"
 #include "codegen/bridge/fused_tree_build.hpp"
+#include "codegen/bridge/meld_backend.hpp"
 #include "codegen/codegen_bridge.hpp"
 #include "codegen/plan/plan_interpreter.hpp"
 #include "codegen/plan/plan_tree.hpp"
@@ -746,11 +748,131 @@ std::shared_ptr<cdj::DecodeKernelSpec const> rendered_decode_spec(
   return specs.emplace(std::move(key), std::move(spec)).first->second;
 }
 
+// `transients` before `persisted`; per-chunk metadata must cover the grid.
+jit::LabeledBuffer const& bound_buffer(std::int32_t node_id,
+                                       std::string const& field,
+                                       jit::LabeledBuffers const& persisted,
+                                       jit::LabeledBuffers const& transients,
+                                       std::int32_t num_chunks)
+{
+  auto const key = jit::buffer_key(node_id, field);
+  auto found     = transients.find(key);
+  if (found == transients.end()) {
+    found = persisted.find(key);
+    if (found == persisted.end()) {
+      throw std::invalid_argument("simpatico decode: missing labeled buffer '" + key + "'");
+    }
+  }
+  bool const is_offset    = field == "rle_runs_offsets" || field == "bp_offsets";
+  bool const is_per_chunk = field == "chunk_min" || field == "chunk_divisors" ||
+                            field == "chunk_bits" || field == "chunk_count" ||
+                            field == "references" || field == "offsets" || is_offset;
+  auto const required = static_cast<std::size_t>(num_chunks) + (is_offset ? 1u : 0u);
+  if (is_per_chunk && found->second.length < required) {
+    throw std::invalid_argument("simpatico decode: metadata buffer '" + key + "' has " +
+                                std::to_string(found->second.length) + " entries; grid requires " +
+                                std::to_string(required));
+  }
+  return found->second;
+}
+
+void launch_meld_decode(simpatico::meld::DecodeKernel const& decoder,
+                        jit::LabeledBuffers const& persisted,
+                        jit::LabeledBuffers const& transients,
+                        std::int32_t num_chunks,
+                        std::int64_t num_rows,
+                        void* out,
+                        simpatico::decode_frame& frame)
+{
+  using Kind  = simpatico::meld::Parameter::Kind;
+  auto output = reinterpret_cast<CUdeviceptr>(out);
+  std::vector<CUdeviceptr> pointers;
+  pointers.reserve(decoder.parameters.size());
+  std::vector<void*> args;
+  args.reserve(decoder.parameters.size());
+  for (auto const& parameter : decoder.parameters) {
+    switch (parameter.kind) {
+      case Kind::channel:
+        pointers.push_back(reinterpret_cast<CUdeviceptr>(
+          bound_buffer(parameter.node, parameter.field, persisted, transients, num_chunks).ptr));
+        args.push_back(&pointers.back());
+        break;
+      case Kind::output: args.push_back(&output); break;
+      case Kind::row_count: args.push_back(&num_rows); break;
+    }
+  }
+
+  frame.keep_kernel(decoder.kernel);
+  auto function = decoder.kernel->func_for_current_device();
+  raise_shared_memory_limit(function, decoder.shared_bytes);
+  auto const grid = cuda::ceil_div(num_chunks, decoder.chunks_per_block);
+  simpatico::throw_if_cu_error(cuLaunchKernel(function,
+                                              static_cast<unsigned>(grid),
+                                              1,
+                                              1,
+                                              static_cast<unsigned>(decoder.block_threads),
+                                              1,
+                                              1,
+                                              static_cast<unsigned>(decoder.shared_bytes),
+                                              reinterpret_cast<CUstream>(frame.stream().get()),
+                                              args.data(),
+                                              nullptr),
+                               "simpatico decode: cuLaunchKernel (meld)");
+}
+
+// Synchronizes the stream; throws at the first row that differs from `out`.
+void shadow_meld_decode(simpatico::meld::DecodeKernel const& decoder,
+                        std::size_t element_size,
+                        jit::LabeledBuffers const& persisted,
+                        jit::LabeledBuffers const& transients,
+                        std::int32_t num_chunks,
+                        std::int64_t num_rows,
+                        void const* out,
+                        simpatico::decode_frame& frame)
+{
+  if (num_rows == 0) return;
+  auto const bytes = static_cast<std::size_t>(num_rows) * element_size;
+  rmm::device_buffer shadow(bytes, frame.stream(), frame.mr());
+  launch_meld_decode(decoder, persisted, transients, num_chunks, num_rows, shadow.data(), frame);
+  std::vector<unsigned char> expected(bytes), actual(bytes);
+  auto const stream = frame.stream().get();
+  simpatico::throw_if_cuda_error(
+    cudaMemcpyAsync(expected.data(), out, bytes, cudaMemcpyDeviceToHost, stream),
+    "simpatico decode: shadow copy (nvrtc)");
+  simpatico::throw_if_cuda_error(
+    cudaMemcpyAsync(actual.data(), shadow.data(), bytes, cudaMemcpyDeviceToHost, stream),
+    "simpatico decode: shadow copy (meld)");
+  simpatico::throw_if_cuda_error(cudaStreamSynchronize(stream),
+                                 "simpatico decode: shadow synchronize");
+  if (std::memcmp(expected.data(), actual.data(), bytes) == 0) return;
+
+  std::size_t row = 0;
+  while (std::memcmp(expected.data() + row * element_size,
+                     actual.data() + row * element_size,
+                     element_size) == 0)
+    ++row;
+  auto hex = [&](std::vector<unsigned char> const& values) {
+    static constexpr char digits[] = "0123456789abcdef";
+    std::string text               = "0x";
+    for (std::size_t byte = element_size; byte-- > 0;) {
+      auto const value = values[row * element_size + byte];
+      text += digits[value >> 4];
+      text += digits[value & 15];
+    }
+    return text;
+  };
+  throw std::runtime_error("simpatico decode: shadow mismatch at row " + std::to_string(row) +
+                           " of " + std::to_string(num_rows) + ": nvrtc " + hex(expected) +
+                           ", meld " + hex(actual) + "; scheme:\n" +
+                           decoder.kernel->rendered_source);
+}
+
 // Bind the renderer's ordered buffers and trailing arguments, looking up decode-only `transients`
 // before the persisted buffers. The caller owns every synthesized buffer until this launch has been
 // queued.
 void launch_rendered_decode(jit::FusedTree const& tree,
                             char const* cxx_dtype,
+                            std::size_t element_size,
                             jit::LabeledBuffers const& persisted,
                             jit::LabeledBuffers const& transients,
                             std::int64_t num_rows,
@@ -762,38 +884,38 @@ void launch_rendered_decode(jit::FusedTree const& tree,
     static_cast<std::int32_t>(std::max<std::int64_t>(1, (num_rows + kChunkSize - 1) / kChunkSize));
   // Bitpack nodes whose chunk_divisors channel is empty render the plain affine reader.
   std::vector<std::int32_t> undivided;
+  bool divided = false;
   for (auto const& [key, buffer] : persisted) {
     constexpr std::string_view kDivisors = ".chunk_divisors";
-    if (buffer.length == 0 && key.size() > kDivisors.size() && key.ends_with(kDivisors)) {
-      undivided.push_back(std::stoi(key.substr(0, key.size() - kDivisors.size())));
+    if (key.size() > kDivisors.size() && key.ends_with(kDivisors)) {
+      if (buffer.length == 0) {
+        undivided.push_back(std::stoi(key.substr(0, key.size() - kDivisors.size())));
+      } else {
+        divided = true;
+      }
     }
   }
   std::sort(undivided.begin(), undivided.end());
+
+  std::optional<simpatico::meld::DecodeKernel> meld_decoder;
+  auto const backend = simpatico::meld::decode_backend();
+  // Meld's decoder writes the column's own type, never a wider one, and does not divide.
+  if (backend != simpatico::meld::Backend::nvrtc && !divided && va.shape == cdj::kShapePlain &&
+      va.grid_blocks == 0 && va.out_dtype == nullptr) {
+    meld_decoder = simpatico::meld::plain_decode_kernel(tree, cxx_dtype);
+  }
+  if (meld_decoder && backend == simpatico::meld::Backend::meld) {
+    launch_meld_decode(*meld_decoder, persisted, transients, num_chunks, num_rows, out, frame);
+    return;
+  }
+
   auto const spec_ptr = rendered_decode_spec(tree, cxx_dtype, va.shape, va.out_dtype, undivided);
   auto const& spec    = *spec_ptr;
   std::vector<CUdeviceptr> pointers;
   pointers.reserve(spec.buffers.size());
   for (auto const& buffer : spec.buffers) {
-    auto const key = jit::buffer_key(buffer.node_id, buffer.field);
-    auto found     = transients.find(key);
-    if (found == transients.end()) {
-      found = persisted.find(key);
-      if (found == persisted.end()) {
-        throw std::invalid_argument("simpatico decode: missing labeled buffer '" + key + "'");
-      }
-    }
-    auto const& field       = buffer.field;
-    bool const is_offset    = field == "rle_runs_offsets" || field == "bp_offsets";
-    bool const is_per_chunk = field == "chunk_min" || field == "chunk_divisors" ||
-                              field == "chunk_bits" || field == "chunk_count" ||
-                              field == "references" || field == "offsets" || is_offset;
-    auto const required = static_cast<std::size_t>(num_chunks) + (is_offset ? 1u : 0u);
-    if (is_per_chunk && found->second.length < required) {
-      throw std::invalid_argument("simpatico decode: metadata buffer '" + key + "' has " +
-                                  std::to_string(found->second.length) +
-                                  " entries; grid requires " + std::to_string(required));
-    }
-    pointers.push_back(reinterpret_cast<CUdeviceptr>(found->second.ptr));
+    pointers.push_back(reinterpret_cast<CUdeviceptr>(
+      bound_buffer(buffer.node_id, buffer.field, persisted, transients, num_chunks).ptr));
   }
 
   auto output = reinterpret_cast<CUdeviceptr>(out);
@@ -812,6 +934,10 @@ void launch_rendered_decode(jit::FusedTree const& tree,
                        args.data(),
                        static_cast<unsigned>(va.grid_blocks > 0 ? va.grid_blocks : dense_grid),
                        frame);
+  if (meld_decoder) {
+    shadow_meld_decode(
+      *meld_decoder, element_size, persisted, transients, num_chunks, num_rows, out, frame);
+  }
 }
 }  // namespace
 
@@ -842,7 +968,8 @@ void launch_decode_fused_tree_impl(codegen::jit::FusedTree const& tree,
   check_variant_contract(variant, mask, num_rows, out, dtype, "fused kernel");
   auto const kernel_rows =
     num_rows + (variant.shape.consumer == cdj::Consumer::offsets_meta ? 1 : 0);
-  std::size_t const element_size = std::strcmp(cxx_dtype, "int64_t") == 0   ? 8u
+  std::size_t const element_size = std::strcmp(cxx_dtype, "__int128") == 0  ? 16u
+                                   : std::strcmp(cxx_dtype, "int64_t") == 0 ? 8u
                                    : std::strcmp(cxx_dtype, "int16_t") == 0 ? 2u
                                    : std::strcmp(cxx_dtype, "int8_t") == 0  ? 1u
                                                                             : 4u;
@@ -856,7 +983,8 @@ void launch_decode_fused_tree_impl(codegen::jit::FusedTree const& tree,
   codegen::jit::LabeledBuffers transients;
   synthesize_decode_transients(
     tree, element_size, allocate, frame.stream().get(), persisted, transients);
-  launch_rendered_decode(tree, cxx_dtype, persisted, transients, kernel_rows, out, variant, frame);
+  launch_rendered_decode(
+    tree, cxx_dtype, element_size, persisted, transients, kernel_rows, out, variant, frame);
 }
 
 }  // namespace
