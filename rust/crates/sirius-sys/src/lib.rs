@@ -24,8 +24,9 @@
 mod ffi {
     /// Named fields for building an [`ObjectStoreConfig`] snapshot; see the C++ struct for
     /// the meaning and value sets of each field. `transport` and `signing_mode` take the C++
-    /// defaults (`"auto"`, `"presigned"`) when left empty.
-    #[derive(Clone, Debug, Default)]
+    /// defaults (`"auto"`, `"presigned"`) when left empty. `Debug` is implemented by hand and
+    /// redacts the three credential fields.
+    #[derive(Clone, Default)]
     struct ObjectStoreConfigArgs {
         endpoint: String,
         region: String,
@@ -110,6 +111,22 @@ mod ffi {
             config_path: &CxxString,
             cfg: SharedPtr<ObjectStoreConfig>,
         ) -> Result<UniquePtr<Context>>;
+    }
+}
+
+impl std::fmt::Debug for ffi::ObjectStoreConfigArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ObjectStoreConfigArgs")
+            .field("endpoint", &self.endpoint)
+            .field("region", &self.region)
+            .field("access_key", &"<redacted>")
+            .field("secret_key", &"<redacted>")
+            .field("session_token", &"<redacted>")
+            .field("transport", &self.transport)
+            .field("signing_mode", &self.signing_mode)
+            .field("ca_bundle_path", &self.ca_bundle_path)
+            .field("uri_prefix", &self.uri_prefix)
+            .finish()
     }
 }
 

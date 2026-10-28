@@ -242,6 +242,9 @@ bool key_defeats_prefix_match(std::string_view path)
     sep == std::string_view::npos ? std::string_view::npos : path.find('/', sep + 3);
   if (bucket_end == std::string_view::npos) { return false; }
   auto key = path.substr(bucket_end + 1);
+  // An empty key or a trailing empty segment ("s3://bucket/", "s3://bucket/allowed/") names no
+  // object; treat it like any other empty segment.
+  if (key.empty() || key.back() == '/') { return true; }
   if (key.find('%') != std::string_view::npos) { return true; }
   while (!key.empty()) {
     auto const slash   = key.find('/');
