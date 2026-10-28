@@ -301,7 +301,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/rust-std-x86_64-unknown-linux-gnu-1.99.1-h480d76f_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/sysroot_linux-64-2.28-h4ee821c_9.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/tzdata-2026e-h5d301ff_0.conda
-      - conda: https://conda.anaconda.org/rapidsai/linux-64/libcudf-26.10.00-cuda13_261008011827_f9305b32.conda
+      - conda: https://conda.anaconda.org/rapidsai/linux-64/libcudf-26.10.02-cuda13_261020221108_2cd6c6c0.conda
       - conda: https://conda.anaconda.org/rapidsai/linux-64/libcuvs-26.10.00-cuda13_261008012506_24ee1bf1.conda
       - conda: https://conda.anaconda.org/rapidsai/linux-64/libcuvs-headers-26.10.00-cuda13_261008012506_24ee1bf1.conda
       - conda: https://conda.anaconda.org/rapidsai/linux-64/libkvikio-26.10.00-cuda13_261007164455_5530d767.conda
@@ -486,7 +486,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/rust-std-aarch64-unknown-linux-gnu-1.99.1-hb0489cc_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/sysroot_linux-aarch64-2.28-h585391f_9.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/tzdata-2026e-h5d301ff_0.conda
-      - conda: https://conda.anaconda.org/rapidsai/linux-aarch64/libcudf-26.10.00-cuda13_261008011827_f9305b32.conda
+      - conda: https://conda.anaconda.org/rapidsai/linux-aarch64/libcudf-26.10.02-cuda13_261020221108_2cd6c6c0.conda
       - conda: https://conda.anaconda.org/rapidsai/linux-aarch64/libcuvs-26.10.00-cuda13_261008012506_24ee1bf1.conda
       - conda: https://conda.anaconda.org/rapidsai/linux-aarch64/libcuvs-headers-26.10.00-cuda13_261008012506_24ee1bf1.conda
       - conda: https://conda.anaconda.org/rapidsai/linux-aarch64/libkvikio-26.10.00-cuda13_261007164455_5530d767.conda
@@ -605,7 +605,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/python_abi-3.15-9_cp315.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/sysroot_linux-64-2.28-h4ee821c_9.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/tzdata-2026e-h5d301ff_0.conda
-      - conda: https://conda.anaconda.org/rapidsai/linux-64/libcudf-26.10.00-cuda13_261008011827_f9305b32.conda
+      - conda: https://conda.anaconda.org/rapidsai/linux-64/libcudf-26.10.02-cuda13_261020221108_2cd6c6c0.conda
       - conda: https://conda.anaconda.org/rapidsai/linux-64/libcuvs-26.10.00-cuda13_261008012506_24ee1bf1.conda
       - conda: https://conda.anaconda.org/rapidsai/linux-64/libcuvs-headers-26.10.00-cuda13_261008012506_24ee1bf1.conda
       - conda: https://conda.anaconda.org/rapidsai/linux-64/libkvikio-26.10.00-cuda13_261007164455_5530d767.conda
@@ -721,7 +721,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/python_abi-3.15-9_cp315.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/sysroot_linux-aarch64-2.28-h585391f_9.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/tzdata-2026e-h5d301ff_0.conda
-      - conda: https://conda.anaconda.org/rapidsai/linux-aarch64/libcudf-26.10.00-cuda13_261008011827_f9305b32.conda
+      - conda: https://conda.anaconda.org/rapidsai/linux-aarch64/libcudf-26.10.02-cuda13_261020221108_2cd6c6c0.conda
       - conda: https://conda.anaconda.org/rapidsai/linux-aarch64/libcuvs-26.10.00-cuda13_261008012506_24ee1bf1.conda
       - conda: https://conda.anaconda.org/rapidsai/linux-aarch64/libcuvs-headers-26.10.00-cuda13_261008012506_24ee1bf1.conda
       - conda: https://conda.anaconda.org/rapidsai/linux-aarch64/libkvikio-26.10.00-cuda13_261007164455_5530d767.conda
@@ -6296,10 +6296,9 @@ packages:
   run_exports: {}
   size: 119208
   timestamp: 1792758382821
-- conda: https://conda.anaconda.org/rapidsai/linux-64/libcudf-26.10.00-cuda13_261008011827_f9305b32.conda
-  build_number: 0
-  sha256: 3a3f51723c01526e6959f59c7bd4bb06f3a9af0aa1cfba709eeeebc616464c38
-  md5: 3a1ea11fbb79628f31fc6ab0965725dc
+- conda: https://conda.anaconda.org/rapidsai/linux-64/libcudf-26.10.02-cuda13_261020221108_2cd6c6c0.conda
+  sha256: 21341473513607ad8d196809f5a026eaa625db3e9fe692cb10523257019b44a6
+  md5: c1e5204b130291cfa2ee8a170ac4dbc8
   depends:
   - cuda-version >=13,<14.0a0
   - cuda-nvrtc
@@ -6311,17 +6310,17 @@ packages:
   - dlpack >=0.8,<1.0
   - rapids-logger 0.3.*
   - libgcc >=14
-  - libstdcxx >=14
   - __glibc >=2.28,<3.0.a0
+  - libstdcxx >=14
   - libnvcomp >=5.3.0.16,<6.0a0
   - libnvjitlink >=13.4.92,<14.0a0
   - croaring >=4.4.2,<4.4.3.0a0
   license: Apache-2.0
   run_exports:
     weak:
-    - libcudf >=26.10.0,<26.11.0a0
-  size: 280397719
-  timestamp: 1791422503520
+    - libcudf >=26.10.2,<26.11.0a0
+  size: 280612854
+  timestamp: 1792534372286
 - conda: https://conda.anaconda.org/rapidsai/linux-64/libcuvs-26.10.00-cuda13_261008012506_24ee1bf1.conda
   build_number: 0
   sha256: bf2909650e892dfb0bcfd59d93089eab0827eaa109e977cf32a27fa578765585
@@ -6483,10 +6482,9 @@ packages:
   run_exports: {}
   size: 620842
   timestamp: 1791417023221
-- conda: https://conda.anaconda.org/rapidsai/linux-aarch64/libcudf-26.10.00-cuda13_261008011827_f9305b32.conda
-  build_number: 0
-  sha256: 54737abe12cabf24be06417757d64325a469d4614dbbe6cce17676b613c71a2b
-  md5: 316627b9d2410874b74b00659dd4eb14
+- conda: https://conda.anaconda.org/rapidsai/linux-aarch64/libcudf-26.10.02-cuda13_261020221108_2cd6c6c0.conda
+  sha256: d255be5e3039bb3462d2ecebab2b202d1d0494114cbad0a5c61792f564fc4207
+  md5: 5d8df98c2cc3d305cef767e5bb7dd2f2
   depends:
   - cuda-version >=13,<14.0a0
   - cuda-nvrtc
@@ -6500,15 +6498,15 @@ packages:
   - libstdcxx >=14
   - arm-variant * sbsa
   - __glibc >=2.28,<3.0.a0
-  - libnvcomp >=5.3.0.16,<6.0a0
   - libnvjitlink >=13.4.92,<14.0a0
+  - libnvcomp >=5.3.0.16,<6.0a0
   - croaring >=4.4.2,<4.4.3.0a0
   license: Apache-2.0
   run_exports:
     weak:
-    - libcudf >=26.10.0,<26.11.0a0
-  size: 278766279
-  timestamp: 1791422437128
+    - libcudf >=26.10.2,<26.11.0a0
+  size: 279258540
+  timestamp: 1792534370943
 - conda: https://conda.anaconda.org/rapidsai/linux-aarch64/libcuvs-26.10.00-cuda13_261008012506_24ee1bf1.conda
   build_number: 0
   sha256: 0637ab72b242325ba9e213bdea4367bca6aec04befd71144aaf5f3c5f51504b2

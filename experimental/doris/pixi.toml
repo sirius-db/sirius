@@ -60,7 +60,7 @@ platforms = ["linux-64-cuda13", "linux-aarch64-cuda13"]
 [feature.engine.dependencies]
 cxx-compiler = "*"
 cuda-version = "13.4.*"
-libcudf = "==26.10.00"
+libcudf = "==26.10.02"
 libcuvs = "==26.10.00"
 librmm = "*"
 libcurand-dev = "*"
