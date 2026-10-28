@@ -237,8 +237,10 @@ void assign_files_to_rank(sirius::op::scan::parquet_ingestible_table_info& info,
   if (remote) {
     if (files.size() < world) {
       throw sirius::not_implemented_exception(
-        "distributed execution: a remote table of {} files across {} ranks; each rank needs one",
+        "distributed execution: a remote table of {} files across {} ranks; each rank needs one. "
+        "Split it into at least {} files, or read it from local files, which split by byte range",
         files.size(),
+        world,
         world);
     }
     for (std::size_t i = rank; i < files.size(); i += world) {

@@ -71,12 +71,9 @@ class exchange_service {
   [[nodiscard]] rank_t world_size() const noexcept { return _transport->world_size(); }
 
   /// @throws the exchange's error once it has failed.
-  void send(stream_id stream, rank_t to, std::shared_ptr<cucascade::data_batch> batch)
-  {
-    _transport->send(stream, to, std::move(batch));
-  }
+  void send(stream_id stream, rank_t to, std::shared_ptr<cucascade::data_batch> batch);
   /// @throws the exchange's error once it has failed.
-  void close(stream_id stream, rank_t to) { _transport->close(stream, to); }
+  void close(stream_id stream, rank_t to);
 
   /// See transport::wait_sent.
   [[nodiscard]] bool wait_sent(std::uint64_t query, std::chrono::milliseconds timeout)
@@ -102,6 +99,7 @@ class exchange_service {
   };
 
   [[nodiscard]] std::shared_ptr<inbound> receiver_of(stream_id stream, held event);
+  void throw_if_failed();
   /// Fails @p query's receivers with @p error. @return false if it had already ended.
   bool end_query(std::uint64_t query, std::exception_ptr error);
 
@@ -110,6 +108,7 @@ class exchange_service {
   std::map<stream_id, std::vector<held>> _held;
   std::map<stream_id, bool> _detached;
   std::map<std::uint64_t, std::exception_ptr> _aborted;
+  /// The transport's failure, worded for the queries after it.
   std::exception_ptr _error;
   // Last: its engine thread calls back into the members above until it is destroyed.
   std::unique_ptr<transport> _transport;
