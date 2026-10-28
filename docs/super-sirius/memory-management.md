@@ -14,7 +14,7 @@ Super Sirius uses cuCascade for tiered memory management across three tiers:
 │  Host Pinned (Tier 1)    │  Medium speed, larger (>100GB)
 │  Pinned pools per NUMA   │  Used for caching, GPU↔CPU transfer
 ├──────────────────────────┤
-│  Disk (Tier 2)           │  Slow, unlimited (~1TB default)
+│  Disk (Tier 2)           │  Slow, limited by filesystem space
 │  Spill files on mount    │  Last resort for extreme pressure
 └──────────────────────────┘
 ```
@@ -65,8 +65,38 @@ initial_number_pools = 4;       // pools allocated at startup
 ```cpp
 disk_id;
 mount_paths;                    // directories for spill files
-memory_capacity = 1TB;          // total spill capacity
+memory_capacity = 1TB;          // reservation / in-flight conversion bound, not a stored-file quota
 ```
+
+### DISK I/O and ownership
+
+Raw spills and compressed `.hpln` spills use the same per-space
+`std::shared_ptr<cucascade::io::ioctx>`. Unless a context is supplied through the C++ API,
+`get_or_init_io_context(cucascade::default_disk_io_context)` adopts the default on first
+conversion. That default is process-shared but cached only through a weak pointer: live
+spaces and in-flight conversions hold strong references, not a static owning singleton or
+a separate reactor pool per mount. An unused DISK space starts no I/O workers.
+
+Automatic selection prefers **cuFile with real GDS**, then **usable io_uring**, then the
+**cuFile POSIX/staging path** when io_uring is unavailable or forbidden. cuFile compatibility
+mode alone is not real GDS. The cuCascade DISK factory supports `automatic`, `uring`, and
+`cufile`; kvikIO remains available for reads but is not a writing DISK backend.
+
+Factory contexts own private staging rather than borrowing Sirius's HOST allocator
+(uring uses 64 MiB of portable pinned staging per reactor). Destruction stops/drains reactor
+workers before releasing their staging. The weak default cache does not prolong that
+lifetime; spill representations and contexts must still be released before CUDA/RMM global
+teardown, including in debug builds. Each conversion retains its context, file object and
+source/destination owners until all submitted work completes, draining futures on errors
+before buffers or partial-file guards can unwind.
+
+The raw HOST/GPU↔DISK converters use one file object and one vectored request per table,
+and remain synchronous to their callers. The raw file layout, mount paths, file-removal
+ownership and downgrade/reservation policy are unchanged. Spill reads use cache-unaware
+I/O; factory DISK contexts do not arm `fs_cache`. The scan manager's contexts, backend,
+reactor counts and cache configuration are independent and are not shared with DISK by
+default. No new YAML settings or backend registration are needed; see
+[Disk Memory](configuration.md#disk-memory-siriusmemorydisk).
 
 ## Parquet scan working sets
 
@@ -147,9 +177,18 @@ With `compression.enable_spill_compression` on, `convertible_data_batch::convert
 | From | To | Converter |
 |------|----|-----------|
 | `gpu_table_representation` | `compressed_host_representation` | encode on the device, stage the payload in pinned host blocks |
-| `gpu_table_representation` | `compressed_disk_representation` | encode on the device, write an `.hpln` file under the disk space's mount path through its I/O backend |
-| `compressed_host_representation` | `compressed_disk_representation` | write the pinned header and payload as an `.hpln` file through the I/O backend (no decode) |
-| `compressed_disk_representation` | `gpu_table_representation` | read the header, then each compressed buffer straight into device memory, through the I/O backend; decode |
+| `gpu_table_representation` | `compressed_disk_representation` | encode on the device; one `mixed_writev_async` writes the host header and device payloads to `.hpln` through the target DISK space's ioctx |
+| `compressed_host_representation` | `compressed_disk_representation` | one `host_writev_async` writes the header and pinned payload blocks through the same per-space ioctx (no decode or device work) |
+| `compressed_disk_representation` | `gpu_table_representation` | open once through the source DISK space's ioctx; read the header with cache-unaware host I/O, then read each payload into device memory on the destination stream and decode |
+
+The `.hpln` header/payload byte layout is unchanged, including unaligned boundaries; no
+padding or relocation is introduced. Writers prepare all slices before submitting, await
+completion and validate the exact byte total. Readers validate header and payload read
+counts before decoding; device I/O honors the caller's stream and GPU binding. The
+context, file object and encoded/pinned/device buffers stay alive until submitted work
+drains, including on failure. Clones still share one immutable `.hpln` file, removed only
+after the last owner is destroyed. Compression gates, uncompressed fallback and retryable
+OOM decoding are unchanged.
 
 The compressed host representation decodes with the converter `pin_table` already uses. Each column's plan follows from its type and a prefix sample: fixed-width columns up to 8 GiB are bitpacked (bitpack's encode scratch holds a column at full width as 2^31 32-bit words at most; larger ones are stored as is). Integer-valued columns up to 64 bits (integers, decimals, chrono types) copy a 64K-row prefix to the host and estimate the size of bitpack, delta → bitpack and delta → rle → bitpack from per-1024-value-chunk bit widths; a delta plan is used when it is estimated at least 10% smaller, which is the case for sorted join and group keys, especially those with repeats. The choice is made per batch, not cached: it costs about a millisecond per column. Strings are dictionary-encoded when a sample has few distinct values and otherwise split into ans-coded chars and delta → bitpack offsets, anything else is stored as is. The encode allocates from the GPU pool the batch is being evicted from, so it runs under a reservation of `spill_encode_reserve_fraction` of the batch's size, attached to the allocation tracker for the encode's duration. Under per-thread tracking the reservation covers the column-parallel encode on the stream pool; under per-stream tracking it covers only the downgrade stream, so the encode runs on that stream alone. The batch spills uncompressed when the reservation is not grantable, when every column's plan stores it as is (the encode would only copy the batch), or when the compressed form exceeds `spill_max_compressed_fraction` of the batch. A spilled compressed batch reports its compressed size from `get_size_in_bytes()`, so code that sizes GPU work from waiting batches (the PARTITION operator's partition count, CONCAT's `concat_batch_bytes` grouping) uses `get_uncompressed_data_size_in_bytes()`, the size the task will decode to. Decoding back to the GPU reserves the batch's uncompressed size, and a decode that runs out of device memory or streams throws `rmm::out_of_memory`, which the executor reschedules like any other OOM.
 
