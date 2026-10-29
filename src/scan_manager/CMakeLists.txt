@@ -16,4 +16,5 @@ target_sources(
           memory_prefetcher.cpp
           sirius_scan_manager.cpp
           split_connector.cpp
-          split_provider.cpp)
+          split_provider.cpp
+          uring_gauges_sampler.cpp)

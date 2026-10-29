@@ -23,6 +23,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include <cucascade/io/uring/config.hpp>
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <yaml-cpp/yaml.h>
@@ -33,6 +34,7 @@
 #include <limits>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <variant>
 #include <vector>
@@ -191,7 +193,7 @@ static void from_yaml(const YAML::Node& node, creator::task_creator_config& opt)
   r.reject_unknown();
 }
 
-static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
+static void from_yaml(const YAML::Node& node, cucascade::io::rest::config& opt)
 {
   yaml::reader r(node, "rest");
   for (auto const* key : {"ca_bundle_path", "tls_verify"}) {
@@ -227,12 +229,15 @@ static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
   r.reject_unknown();
 }
 
-static void from_yaml(const YAML::Node& node, sirius::io::uring::config& opt)
+// cuCascade does not validate slices_per_pass (a value above the slot count merely acts
+// as no cap) and its factories report other config errors only through compiled-out
+// logging, so Sirius validates the uring keys here and names the key.
+static void from_yaml(const YAML::Node& node, cucascade::io::uring::config& opt)
 {
   yaml::reader r(node, "uring");
   {
     // Preserve whether the value was named: an explicit value may equal the
-    // struct default and must not be replaced by the pipeline-derived default.
+    // struct default, and cuCascade's readahead resolution tells the two apart.
     std::optional<std::size_t> n_max;
     r.optional("n_max_concurrent_scans", n_max);
     if (n_max.has_value()) {
@@ -240,10 +245,97 @@ static void from_yaml(const YAML::Node& node, sirius::io::uring::config& opt)
       opt.n_max_concurrent_scans_explicit = true;
     }
   }
+  {
+    // Deprecated: the reactor priority tiers replaced prefetch-reactor
+    // partitioning.  Consumed (so reject_unknown() passes) and ignored, so
+    // configs that still name it keep loading.
+    std::optional<long long> prefetch_reactors;
+    r.optional("prefetch_reactors", prefetch_reactors);
+    if (prefetch_reactors.has_value()) {
+      SIRIUS_LOG_WARN(
+        "'uring.prefetch_reactors' is deprecated and ignored: the reactor priority tiers replaced "
+        "prefetch-reactor partitioning; remove the key from the config");
+    }
+  }
+  {
+    // Signed, so a negative value is reported as itself rather than wrapped.
+    std::optional<long long> slices;
+    r.optional("slices_per_pass", slices);
+    if (slices.has_value()) {
+      auto const max_slices = static_cast<long long>(cucascade::io::uring::max_slices_per_pass);
+      if (*slices < 0 || *slices > max_slices) {
+        throw std::runtime_error(
+          "'uring.slices_per_pass': must be between 0 and " + std::to_string(max_slices) +
+          " (0 = no cap: fill every free staging slot), got " + std::to_string(*slices));
+      }
+      opt.slices_per_pass = static_cast<std::size_t>(*slices);
+    }
+  }
+  {
+    // Signed for the same reason.
+    std::optional<long long> batch;
+    r.optional("range_batch_slices", batch);
+    if (batch.has_value()) {
+      if (*batch < 0) {
+        throw std::runtime_error(
+          "'uring.range_batch_slices': must be 0 or more (0 = no split), got " +
+          std::to_string(*batch));
+      }
+      opt.range_batch_slices = static_cast<std::size_t>(*batch);
+    }
+  }
   r.reject_unknown();
 }
 
-static void from_yaml(const YAML::Node& node, sirius::io::kvikio_config& opt)
+static void from_yaml(const YAML::Node& node, cucascade::io::cufile::config& opt)
+{
+  yaml::reader r(node, "cufile");
+  auto count = [&](char const* key, std::size_t& out, bool positive = false) {
+    std::optional<std::int64_t> value;
+    r.optional(key, value);
+    if (!value) { return; }
+    if (*value < 0 || (positive && *value == 0)) {
+      throw std::runtime_error("'cufile." + std::string(key) + "': must be " +
+                               (positive ? "positive" : "nonnegative"));
+    }
+    out = static_cast<std::size_t>(*value);
+  };
+  if (r.has("n_max_concurrent_scans")) {
+    throw std::runtime_error(
+      "'cufile.n_max_concurrent_scans': not configurable; cuFile cannot "
+      "use fs_cache or scan readahead (use cufile_n_reactors and "
+      "cufile.max_inflight for read concurrency)");
+  }
+  count("max_inflight", opt.max_inflight, true);
+  count("poll_interval_us", opt.poll_interval_us);
+  count("low_service_interval", opt.low_service_interval);
+  r.optional("max_op_bytes", yaml::bytes(opt.max_op_bytes));
+  if (opt.max_op_bytes < cucascade::io::IO_BLOCK_SIZE) {
+    throw std::runtime_error("'cufile.max_op_bytes': must be at least 4 KiB");
+  }
+  r.optional("gds_threshold", yaml::bytes(opt.gds_threshold));
+  r.optional("use_odirect", opt.use_odirect);
+  std::optional<std::string> compat;
+  r.optional("compat_mode", compat);
+  if (compat) {
+    if (*compat == "auto") {
+      opt.compat_mode = cucascade::io::cufile::compat::automatic;
+    } else if (*compat == "on") {
+      opt.compat_mode = cucascade::io::cufile::compat::on;
+    } else if (*compat == "off") {
+      opt.compat_mode = cucascade::io::cufile::compat::off;
+    } else {
+      throw std::runtime_error("'cufile.compat_mode': invalid enum value '" + *compat +
+                               "' (expected auto, on or off)");
+    }
+  }
+  if (!opt.use_odirect && opt.compat_mode == cucascade::io::cufile::compat::off) {
+    throw std::runtime_error("'cufile.use_odirect': false conflicts with cufile.compat_mode=off");
+  }
+  r.reject_unknown();
+}
+
+static void from_yaml(const YAML::Node& node, cucascade::io::kvikio_config& opt)
 {
   yaml::reader r(node, "kvikio");
   r.optional("nthreads", opt.nthreads);
@@ -270,10 +362,23 @@ static void from_yaml(const YAML::Node& node, sirius::io::kvikio_config& opt)
   r.reject_unknown();
 }
 
-static void from_yaml(const YAML::Node& node, sirius::io::cache::config& opt)
+static void from_yaml(const YAML::Node& node, cucascade::io::cache::config& opt)
 {
   yaml::reader r(node, "cache");
-  r.optional("mode", opt.mode);
+  {
+    // Read as a string so the deprecated spelling `sirius` (the cache's name before it
+    // moved to cuCascade) still selects `cucs`; everything else goes through
+    // cuCascade's own parser, with the reader's usual error format.
+    std::optional<std::string> mode;
+    r.optional("mode", mode);
+    if (mode.has_value()) {
+      if (*mode == "sirius") {
+        opt.mode = cucascade::io::cache::cache_mode::cucs;
+      } else if (!cucascade::io::cache::string_to_enum(std::string_view{*mode}, opt.mode)) {
+        throw std::runtime_error("'cache.mode': invalid enum value '" + *mode + "'");
+      }
+    }
+  }
   r.optional("eviction", opt.eviction);
   r.optional("min_prefetching_budget_fraction",
              opt.min_prefetching_budget_fraction,
@@ -353,11 +458,17 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   r.optional("max_concurrent_queries", opt.max_concurrent_queries, yaml::greater_than<int>{0});
   r.optional("uring_n_reactors", opt.uring_n_reactors, yaml::greater_than<std::size_t>{0});
   r.optional("rest_n_reactors", opt.rest_n_reactors, yaml::greater_than<std::size_t>{0});
+  {
+    std::int64_t reactors = static_cast<std::int64_t>(opt.cufile_n_reactors);
+    r.optional("cufile_n_reactors", reactors, yaml::greater_than<std::int64_t>{0});
+    opt.cufile_n_reactors = static_cast<std::size_t>(reactors);
+  }
   r.optional("max_readahead_scans", opt.max_readahead_scans);
   r.optional("readahead_strategy", opt.readahead_strategy);
   if (auto n = r.optional_node("uring")) sirius::from_yaml(*n, opt.uring);
   if (auto n = r.optional_node("rest")) sirius::from_yaml(*n, opt.rest);
   if (auto n = r.optional_node("kvikio")) sirius::from_yaml(*n, opt.kvikio);
+  if (auto n = r.optional_node("cufile")) sirius::from_yaml(*n, opt.cufile);
   if (auto n = r.optional_node("cache")) sirius::from_yaml(*n, opt.cache);
   if (auto n = r.optional_node("memory_prefetcher")) from_yaml(*n, opt.memory_prefetcher);
   if (auto n = r.optional_node("preparation")) from_yaml(*n, opt.preparation);
@@ -1022,16 +1133,14 @@ try {
 
 void sirius_config::finalize_derived_config()
 {
-  // The uring (local-disk) readahead budget is NOT derived from the pipeline
-  // width: the local backend defaults to 0 (readahead off), because on local
-  // NVMe the prefetch competes with the executor's own reads for the same
-  // device.  An explicit uring.n_max_concurrent_scans in the config still wins.
+  // The uring (local-disk) readahead budget keeps its default of 0: on local
+  // NVMe a prefetch competes with the executor's own reads for the same device.
   // The opportunistic strategy schedules against what the executor can run,
   // not what the device can queue, so it needs the pipeline pool's width.
   _scan_manager_config.pipeline_width =
     static_cast<std::size_t>(std::max(1, _gpu_pipeline_executor_config.num_threads));
   derive_rest_scan_budget();
-  enforce_sirius_backend_for_multi_gpu();
+  enforce_native_backend_for_multi_gpu();
 }
 
 void sirius_config::derive_rest_scan_budget()
@@ -1041,7 +1150,8 @@ void sirius_config::derive_rest_scan_budget()
   // per pipeline thread the readahead has no lead — every split a thread picks
   // up is the split whose prefetch only just started, so the read blocks on it.
   // Several splits per thread give the prefetch time to land.  Local disk has no
-  // such round trip to hide, so uring stays at one per thread.
+  // such round trip to hide, so uring keeps its own default (0, readahead off)
+  // unless the config names a budget.
   //
   // Only the untouched default is replaced, so an explicit
   // rest.n_max_concurrent_scans in the config still wins.  The derived budget is
@@ -1067,18 +1177,18 @@ void sirius_config::derive_rest_scan_budget()
   _scan_manager_config.rest.n_max_concurrent_scans = derived;
 }
 
-void sirius_config::enforce_sirius_backend_for_multi_gpu()
+void sirius_config::enforce_native_backend_for_multi_gpu()
 {
   size_t num_gpus = std::ranges::count_if(_memory_space_configs, [](auto const& space) {
     return std::holds_alternative<cucascade::memory::gpu_memory_space_config>(space);
   });
-  if (num_gpus > 1 && _scan_manager_config.backend != scan_manager::io_backend::sirius) {
+  if (num_gpus > 1 && _scan_manager_config.backend != scan_manager::io_backend::native) {
     SIRIUS_LOG_WARN(
-      "sirius_config: backend was not 'sirius' but {} GPUs are configured; "
-      "the sirius backend is required for multi-GPU IO routing. Overriding "
-      "backend to 'sirius'.",
+      "sirius_config: backend was not 'native' but {} GPUs are configured; "
+      "the native backend is required for multi-GPU IO routing. Overriding "
+      "backend to 'native'.",
       num_gpus);
-    _scan_manager_config.backend = scan_manager::io_backend::sirius;
+    _scan_manager_config.backend = scan_manager::io_backend::native;
   }
 }
 
@@ -1113,7 +1223,7 @@ void sirius_config::set_scan_manager_config(scan_manager::scan_manager_config co
   _scan_manager_config = std::move(config);
 }
 
-void sirius_config::set_object_store_config(io::object_store_config config) noexcept
+void sirius_config::set_object_store_config(cucascade::io::object_store_config config) noexcept
 {
   _scan_manager_config.object_store = std::move(config);
 }

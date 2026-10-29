@@ -56,8 +56,12 @@ namespace sirius::planner {
 class query;
 }  // namespace sirius::planner
 
-namespace sirius::memory {
+namespace cucascade::memory {
 class topology_index;
+}  // namespace cucascade::memory
+
+namespace sirius::memory {
+using cucascade::memory::topology_index;
 }  // namespace sirius::memory
 
 namespace sirius::parallel {

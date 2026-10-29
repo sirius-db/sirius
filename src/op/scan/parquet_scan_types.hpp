@@ -339,7 +339,7 @@ class parquet_file_scan_info : public scan_info {
   std::size_t file_index = 0;
   /// Pre-built datasource for this file, reused by @c materialize_table. May be
   /// null for local paths no sirius backend claims.
-  std::shared_ptr<io::sirius_datasource> datasource;
+  std::shared_ptr<cucascade::io::datasource> datasource;
   /// Pruned row groups for this file, in file order, with byte accounting.
   std::vector<row_group_entry> row_groups;
   /// Per-file reader options. These differ from the plan defaults when the

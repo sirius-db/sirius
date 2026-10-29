@@ -28,6 +28,7 @@
 #include <utils/utils.hpp>
 
 // cucascade
+#include <cucascade/cudf/disk_io_context.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
@@ -210,6 +211,9 @@ TEST_CASE("Downgrade task falls back to DISK when HOST is full", "[downgrade_dis
     target_spaces.push_back(hs);
   }
   auto disk_spaces = mem_mgr->get_memory_spaces_for_tier(cucascade::memory::Tier::DISK);
+  REQUIRE(disk_spaces.size() == 1);
+  auto const* disk_space = disk_spaces.front();
+  REQUIRE(disk_space->get_io_context() == nullptr);
   for (auto* ds : disk_spaces) {
     target_spaces.push_back(ds);
   }
@@ -218,6 +222,10 @@ TEST_CASE("Downgrade task falls back to DISK when HOST is full", "[downgrade_dis
   REQUIRE(converted.has_value());
 
   REQUIRE(get_batch_tier(*batch) == cucascade::memory::Tier::DISK);
+  REQUIRE(disk_space->get_io_context() != nullptr);
+  CHECK(disk_space->get_io_context() == cucascade::default_disk_io_context());
+  auto ro = batch->to_read_only();
+  CHECK(dynamic_cast<cucascade::disk_data_representation const*>(ro.get_data()) != nullptr);
 }
 
 TEST_CASE("Downgrade task uses HOST when HOST has capacity", "[downgrade_disk]")
@@ -259,6 +267,9 @@ TEST_CASE("Downgrade task uses HOST when HOST has capacity", "[downgrade_disk]")
     target_spaces.push_back(hs);
   }
   auto disk_spaces = mem_mgr->get_memory_spaces_for_tier(cucascade::memory::Tier::DISK);
+  REQUIRE(disk_spaces.size() == 1);
+  auto const* disk_space = disk_spaces.front();
+  REQUIRE(disk_space->get_io_context() == nullptr);
   for (auto* ds : disk_spaces) {
     target_spaces.push_back(ds);
   }
@@ -267,6 +278,8 @@ TEST_CASE("Downgrade task uses HOST when HOST has capacity", "[downgrade_disk]")
   REQUIRE(converted.has_value());
 
   REQUIRE(get_batch_tier(*batch) == cucascade::memory::Tier::HOST);
+  // Merely considering DISK as a fallback must not start its shared IO stack.
+  CHECK(disk_space->get_io_context() == nullptr);
 }
 
 TEST_CASE("Downgrade task returns false when HOST full and no DISK tier", "[downgrade_disk]")

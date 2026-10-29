@@ -42,7 +42,6 @@
 #include "expression/ast/utils.hpp"
 #include "helper/type_conversions.hpp"
 #include "io/s3/duckdb_secret_config.hpp"
-#include "io/uri_parser.hpp"
 #include "log/logging.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/dynamic_filter/sirius_physical_build_filter.hpp"
@@ -90,6 +89,8 @@
 
 #include <cudf/cudf_utils.hpp>
 
+#include <cucascade/io/io_context.hpp>
+#include <cucascade/io/uri_parser.hpp>
 #include <duckdb/common/serializer/binary_serializer.hpp>
 #include <duckdb/common/serializer/memory_stream.hpp>
 
@@ -481,8 +482,12 @@ std::unique_ptr<sirius::op::scan::iceberg_ingestible_table_info> build_iceberg_t
   if (supplied_discovery)
     *supplied_discovery = std::move(discovery);
   else
-    info->delete_data = sirius::op::scan::load_delete_payload(
-      context, info->table_path, sirius_ctx->get_scan_manager().io_ctx(), snapshot_id, discovery);
+    info->delete_data =
+      sirius::op::scan::load_delete_payload(context,
+                                            info->table_path,
+                                            sirius_ctx->get_scan_manager().shared_io_ctx(),
+                                            snapshot_id,
+                                            discovery);
   auto const delete_elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
                                 std::chrono::steady_clock::now() - delete_started)
                                 .count();
@@ -537,7 +542,7 @@ void prepare_iceberg_statement(sirius::op::sirius_physical_operator& root,
     bool remote = false;
     std::string scheme;
     try {
-      auto const parsed = sirius::io::parse(dv.file_path);
+      auto const parsed = cucascade::io::parse(dv.file_path);
       scheme            = parsed.scheme;
       remote            = parsed.scheme != "file";
     } catch (std::invalid_argument const&) {
@@ -548,8 +553,8 @@ void prepare_iceberg_statement(sirius::op::sirius_physical_operator& root,
     if (!remote) return;
     auto const backend           = scan_manager.planning_io_backend(dv.file_path);
     auto const backend_available = scheme == "s3" && backend.has_value() &&
-                                   (*backend == sirius::io::io_context_type::restful ||
-                                    *backend == sirius::io::io_context_type::kvikio);
+                                   (*backend == cucascade::io::io_context_type::restful ||
+                                    *backend == cucascade::io::io_context_type::kvikio);
     remote_puffins.push_back({contract, dv.file_path, std::move(scheme), backend_available});
   };
   std::vector<scan_dv_count> counts;
@@ -677,9 +682,12 @@ void prepare_iceberg_statement(sirius::op::sirius_physical_operator& root,
       auto started = std::chrono::steady_clock::now();
       auto sid =
         static_cast<uint64_t>(c.scan->named_parameters.at("snapshot_from_id").GetValue<int64_t>());
-      c.info->delete_data = load_delete_payload(
-        context, c.info->table_path, sirius_ctx->get_scan_manager().io_ctx(), sid, *c.discovery);
-      auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+      c.info->delete_data = load_delete_payload(context,
+                                                c.info->table_path,
+                                                sirius_ctx->get_scan_manager().shared_io_ctx(),
+                                                sid,
+                                                *c.discovery);
+      auto us             = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - started)
                   .count();
       c.scan->read_views->record_delete_preparation(c.scan->contract_id, us);
