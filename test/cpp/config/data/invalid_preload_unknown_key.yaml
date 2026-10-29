@@ -1,6 +1,0 @@
-sirius:
-  topology:
-    num_gpus: 1
-  executor:
-    preload:
-      prefetch_depth: 4

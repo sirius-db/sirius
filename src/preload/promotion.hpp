@@ -19,26 +19,23 @@
 /**
  * @file promotion.hpp
  * @brief One promotion of one batch to a higher tier: HOST->GPU, DISK->GPU or DISK->HOST.
- *
- * @ref promote_one runs on a preload lane thread without any executor lock. It reserves target
- * memory before it touches the batch, never waits for a batch lock, re-checks the ceiling and the
- * hold-offs right before the copy, and maps every failure to a @ref promotion_outcome.
  */
 
-#include "memory/memory_wait_board.hpp"
-#include "preload/preload_policy.hpp"
+#include "query_id.hpp"
 
-#include <atomic>
+#include <cucascade/memory/common.hpp>
+
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
-#include <span>
-#include <vector>
+#include <limits>
+#include <memory>
 
 namespace cucascade {
+class data_batch;
 class idata_representation;
 namespace memory {
-class exclusive_stream_pool;
 class memory_space;
 }  // namespace memory
 }  // namespace cucascade
@@ -48,6 +45,40 @@ class query_lifecycle_registry;
 }  // namespace sirius::exec
 
 namespace sirius::preload {
+
+class preload_streams;
+
+[[nodiscard]] constexpr std::size_t sat_add(std::size_t a, std::size_t b) noexcept
+{
+  return a > std::numeric_limits<std::size_t>::max() - b ? std::numeric_limits<std::size_t>::max()
+                                                         : a + b;
+}
+
+[[nodiscard]] constexpr std::size_t sat_mul(std::size_t a, std::size_t b) noexcept
+{
+  if (a == 0 || b == 0) { return 0; }
+  return a > std::numeric_limits<std::size_t>::max() / b ? std::numeric_limits<std::size_t>::max()
+                                                         : a * b;
+}
+
+/// @p bytes plus the larger of 1 MiB and 1/64 of it: the slack every size estimate carries.
+[[nodiscard]] constexpr std::size_t with_slack(std::size_t bytes) noexcept
+{
+  constexpr std::size_t min_slack = std::size_t{1} << 20;
+  return sat_add(bytes, std::max(min_slack, bytes / 64));
+}
+
+/**
+ * @brief Consumed bytes of a space: `max_memory - min(max_memory, available)`.
+ *
+ * The quantity cuCascade's downgrade trigger compares with its thresholds, so every preload
+ * ceiling is in these units.
+ */
+[[nodiscard]] constexpr std::size_t consumed_bytes(std::size_t max_memory,
+                                                   std::size_t available) noexcept
+{
+  return max_memory - std::min(max_memory, available);
+}
 
 /// The representations a promotion distinguishes, by exact type.
 enum class repr_kind : std::uint8_t {
@@ -68,85 +99,74 @@ enum class repr_kind : std::uint8_t {
  */
 [[nodiscard]] std::size_t promotion_peak_bytes(cucascade::idata_representation const& data);
 
-/**
- * @brief A GPU target as a promotion sees it.
- *
- * The ceiling is enforced strictly only when the space tracks reservations per thread (Sirius's
- * default): per stream, HOST->GPU allocations on the space's shared stream pool are not charged
- * to the promotion's reservation.
- */
-struct promotion_gpu {
-  cucascade::memory::memory_space* space{nullptr};
-  /// A promotion whose exact need exceeds this is refused with @c too_big.
-  std::size_t max_batch_bytes{0};
-  /// The preload stream pool of this GPU. Must be non-null.
-  cucascade::memory::exclusive_stream_pool* streams{nullptr};
+/// What one promotion attempt ended with.
+enum class promotion_outcome : std::uint8_t {
+  promoted,    ///< the batch is now in the target space
+  not_needed,  ///< the query is gone, or the batch is gone, busy or already where it should be
+  no_room,     ///< the target space refused the reservation or is above the ceiling
+  failed       ///< unsupported representation, or an error during the copy
 };
 
-/// A HOST staging target as a promotion sees it.
-struct promotion_host {
-  cucascade::memory::memory_space* space{nullptr};
-  /// Indices into @ref promotion_env::gpus of the GPUs on this host's NUMA node. Staging yields
-  /// while any of them is held off or at its downgrade trigger: their spills need this host.
-  std::vector<std::size_t> local_gpus;
-  /// Pool that orders the staging copy (DISK->HOST copies do not run on it). Null uses the
-  /// calling thread's default stream.
-  cucascade::memory::exclusive_stream_pool* ordering_streams{nullptr};
+/// Result of one promotion attempt.
+struct promotion_result {
+  promotion_outcome outcome{promotion_outcome::failed};
+  /// When promoted: bytes reserved for the copy (the exact need, with slack for a GPU).
+  std::size_t bytes{0};
+  /// When not needed because the batch is already off the source tier: the tier it is in.
+  /// @c Tier::SIZE otherwise.
+  cucascade::memory::Tier found{cucascade::memory::Tier::SIZE};
+};
+
+/// One promotion, built under the executor's lock. Holds no strong reference to the batch.
+struct promotion_job {
+  std::weak_ptr<cucascade::data_batch> batch;
+  std::uint64_t batch_id{0};
+  std::uint64_t task_id{0};
+  query_id_t query{};
+  /// GPU or HOST.
+  cucascade::memory::Tier tier{cucascade::memory::Tier::SIZE};
+  /// Index of the target in the executor's GPU or HOST list.
+  std::size_t space{0};
+  /// The target space itself.
+  cucascade::memory::memory_space* target{nullptr};
+  /// Bytes reserved before the batch is locked; also the budget the executor charged.
+  std::size_t est_bytes{0};
+  /// The target's preload ceiling, in consumed bytes.
+  std::size_t ceiling_bytes{0};
 };
 
 /// Everything @ref promote_one reads besides the job. Borrowed; must outlive the call.
 struct promotion_env {
   exec::query_lifecycle_registry& lifecycle;
-  memory::memory_wait_board const& board;
-  /// GPU targets, by @ref target::index.
-  std::span<promotion_gpu const> gpus;
-  /// HOST targets, by @ref target::index.
-  std::span<promotion_host const> hosts;
-  /// Tests only. Runs on the promoting thread once the target reservation is made and admitted,
-  /// before the batch is locked.
+  /// Preload's stream pools. Required for GPU targets, unused for HOST targets.
+  preload_streams const* streams{nullptr};
+  /// Tests only. Runs once the target reservation is made and admitted, before the batch is
+  /// locked.
   std::function<void(promotion_job const&)> test_hook{};
-  /// Tests only. Runs on the promoting thread for a GPU promotion after the conversion completes
-  /// and before the outcome is installed, so a test can claim a batch in exactly that window.
-  std::function<void(promotion_job const&)> post_convert_hook{};
 };
 
 /**
- * @brief Promote one batch to the job's target. Never throws and never blocks on a batch lock.
+ * @brief Promote one batch to the job's target. Never throws and never waits for a batch lock.
  *
- * Order of checks (each refusal returns at once and releases what it holds):
- * 1. A work lease on the job's query, held for the whole call (@c retired otherwise).
- * 2. GPU target: a hold-off on that GPU; HOST target: a hold-off or trigger on a NUMA-local GPU
- *    (@c held_off).
- * 3. A non-blocking reservation of @c est_reserve in the target space (@c no_memory), then the
- *    ceiling: consumed bytes, counting that reservation, at or below `job.ceiling` and the space
- *    below its downgrade trigger (@c gated).
- * 4. The batch: alive (@c expired), idle and lockable without waiting (@c contended), not already
- *    promoted (@c already_resident), where the job expects it (@c stale), and for class B still
- *    unclaimed by a task (@c stale with the unchanged location).
- * 5. The representation: GPUs only ever receive a decoded @c gpu_table_representation from a
- *    HOST or DISK source; anything else is @c unsupported.
- * 6. The exact need (@ref promotion_peak_bytes with slack, times the OOM multiplier, for a GPU;
- *    the target's allocation size for HOST): @c too_big above the GPU's per-batch limit, else
- *    the reservation grows to it (@c no_memory).
- * 7. Hold-offs (@c held_off) and the ceiling (@c gated) once more, right before the copy.
+ * In order, each refusal returning at once:
+ * 1. A work lease on the job's query, held for the whole call (@c not_needed without one).
+ * 2. A non-blocking reservation of @c est_bytes in the target (@c no_room), then the ceiling:
+ *    consumed bytes, counting the reservation, at or below @c ceiling_bytes and the space below
+ *    its downgrade trigger (@c no_room).
+ * 3. The batch: alive and lockable with @c try_to_mutable (@c not_needed), and not already
+ *    there: on a GPU for a GPU target, off DISK for a HOST target (@c not_needed, with
+ *    @ref promotion_result::found).
+ * 4. The representation: a GPU takes a host or disk table, a HOST a disk table (@c failed).
+ * 5. The exact need (@ref promotion_peak_bytes with slack for a GPU, the disk size for HOST):
+ *    the reservation grows to it (@c no_room), and the ceiling is checked again (@c no_room).
  *
- * A GPU copy runs on a stream of the GPU's preload pool with the reservation attached to the
- * calling thread's allocation tracker under a fail-on-overrun policy, so a misestimate throws
- * @c rmm::out_of_memory (@c oom) instead of exceeding the ceiling. A HOST copy draws from the
- * reservation; an @c rmm::out_of_memory there gives @c no_memory (@c oom is for GPU targets
- * only). A DISK batch is staged to HOST with @c convert_to. Any other exception gives
- * @c failed. On @c promoted, the result carries the exact need in bytes,
- * the copy's @ref promotion_kind and a conversion sequence taken under the batch lock.
- *
- * @param job The promotion to attempt.
- * @param env The targets and shared state the attempt reads.
- * @param unreserved When set, the target's count of bytes that running jobs will reserve but
- *        have not yet, which includes this job's @c est_reserve. The call subtracts that once:
- *        as soon as the reservation of step 3 exists, or on return when it never does. The
- *        target's consumed bytes and this count then hold each running job exactly once.
+ * A GPU copy runs on a preload stream after the source's writer event, with the reservation
+ * attached to the stream's allocation tracker under a fail-on-overrun policy, so a low estimate
+ * throws @c rmm::out_of_memory (@c failed) instead of exceeding the reservation. A HOST copy
+ * draws its blocks from the reservation (@c no_room when the pool runs out). Any other
+ * exception gives @c failed; a fatal CUDA error is also reported to the query's lifecycle.
  */
 [[nodiscard]] promotion_result promote_one(promotion_job const& job,
-                                           promotion_env const& env,
-                                           std::atomic<std::size_t>* unreserved) noexcept;
+                                           promotion_env const& env) noexcept;
 
 }  // namespace sirius::preload

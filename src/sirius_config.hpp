@@ -390,8 +390,8 @@ struct sirius_config {
   [[nodiscard]] const exec::downgrade_executor_config& get_downgrade_executor_config()
     const noexcept;
 
-  /// The @c sirius.executor.preload block, after the clamps applied by
-  /// @ref finalize_derived_config. Disabled by default.
+  /// The @c sirius.executor.preload block, as configured. Disabled by default; the preload
+  /// executor clamps its ceilings per memory space.
   [[nodiscard]] const preload::preload_executor_config& get_preload_executor_config()
     const noexcept;
 
@@ -425,10 +425,10 @@ struct sirius_config {
  private:
   friend class parsed_sirius_config;
 
-  /// scan budgets, the @c pipeline_width stamp, the multi-GPU backend
-  /// override and the preload checks, in that order. Called by
-  /// parsed_sirius_config::resolve after memory capacities and operator
-  /// defaults are resolved.
+  /// Apply the knobs derived from the rest of the configuration: the readahead
+  /// scan budgets, the @c pipeline_width stamp and the multi-GPU backend
+  /// override, in that order. Called by parsed_sirius_config::resolve after
+  /// memory capacities and operator defaults are resolved.
   void finalize_derived_config();
 
   /// When @c _memory_space_configs contains more than one GPU memory space,
@@ -443,15 +443,6 @@ struct sirius_config {
   /// thread to stay ahead of demand. Called from
   /// @ref finalize_derived_config; an explicit config value is left alone.
   void derive_rest_scan_budget();
-
-  /// Check a configured @c sirius.executor.preload block against the memory spaces. Clamps, each
-  /// with one WARN: @c speculative_fraction is lowered to @c device_preloading_budget, and
-  /// @c max_batch_fraction is lowered to @c max_inflight_fraction. Then WARNs, per GPU, when an
-  /// explicit @c device_preloading_ceiling exceeds the GPU's @c downgrade_stop_fraction (it is
-  /// clamped to it), and when a GPU or HOST preload ceiling is at or below zero, which disables
-  /// that class of promotion there. Does nothing when @c concurrent_preloads is 0 or no preload
-  /// is configured. Called from @ref finalize_derived_config.
-  void warn_preload_config();
 
   cucascade::memory::system_topology_info _hw_topology{};
   int _gpus_per_query = 0;

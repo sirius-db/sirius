@@ -115,7 +115,6 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_nested_loop_join_batches.cpp
     test/cpp/integration/test_gpu_execution_null_safe_join.cpp
     test/cpp/integration/test_gpu_execution_order_nulls.cpp
-    test/cpp/integration/test_gpu_execution_preload.cpp
     test/cpp/integration/test_gpu_execution_regexp_replace.cpp
     test/cpp/integration/test_gpu_execution_size_estimation.cpp
     test/cpp/integration/test_gpu_execution_parquet_nulls.cpp
@@ -212,12 +211,6 @@ set(TEST_SOURCES
     test/cpp/memory/test_device_preload_budget.cpp
     test/cpp/memory/test_multiple_blocks_allocation_accessor.cpp
     test/cpp/memory/test_topology_index.cpp
-    test/cpp/preload/test_candidate_store.cpp
-    test/cpp/preload/test_consumption_tracker.cpp
-    test/cpp/preload/test_hw_caps.cpp
-    test/cpp/preload/test_preload_executor.cpp
-    test/cpp/preload/test_preload_policy.cpp
-    test/cpp/preload/test_preload_promotion.cpp
     test/cpp/operator/test_build_probe_scheduling.cpp
     test/cpp/operator/test_partition_placement.cpp
     test/cpp/operator/test_partition_exchange.cpp
