@@ -249,7 +249,7 @@ void preload_executor::on_task_downgraded(event::event_id_t event_id,
   try {
     // The downgrade executor and the scheduler publish into one mailbox in no guaranteed order,
     // so this event can arrive after its task was popped. It was published before the task was
-    // re-pushed, so its id is then smaller than the pop's.
+    // (re-)pushed, so its id is then smaller than the pop's.
     if (auto const pop = _recent_pops.find(task.task_id);
         pop != _recent_pops.end() && pop->second > event_id) {
       ++_counters.stale_event;

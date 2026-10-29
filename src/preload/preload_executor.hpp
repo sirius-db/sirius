@@ -202,7 +202,8 @@ class preload_executor final : public event::query_event_subscriber {
     std::uint64_t batch_id{0};
     /// Last known tier: HOST or DISK from the event, GPU or HOST after a promotion.
     cucascade::memory::Tier location{cucascade::memory::Tier::SIZE};
-    /// Size on the GPU before the spill (the largest reported): the reservation estimate. Raised
+    /// Device size estimate (the largest reported: the GPU size before a spill, or the peak to
+    /// materialize it for an input queued off the GPU): the reservation estimate. Raised
     /// to the exact need of a promotion that found no room, so it is not retried until that fits.
     std::size_t gpu_bytes{0};
     /// A worker is promoting it; the job, not this input, holds that charge.

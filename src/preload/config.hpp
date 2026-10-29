@@ -21,8 +21,9 @@ namespace sirius::preload {
 /**
  * @brief Configuration of the preload executor (`sirius.executor.preload`).
  *
- * The preload executor moves inputs of queued tasks that the downgrade executor spilled back to
- * a GPU (HOST->GPU, DISK->GPU) or, failing that, from DISK to HOST, before the task runs. It is
+ * The preload executor moves queued tasks' inputs that are off the GPU (spilled while queued, or
+ * queued already spilled) back to a GPU (HOST->GPU, DISK->GPU) or, failing that, from DISK to
+ * HOST, before the task runs. It is
  * advisory: a refused or failed promotion costs performance only.
  *
  * Every value is a fraction of the target memory space's capacity. Each ceiling is clamped per

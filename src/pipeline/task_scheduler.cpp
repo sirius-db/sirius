@@ -95,9 +95,13 @@ void publish_off_gpu_inputs(event::query_event_publisher& publisher,
   try {
     auto const* data = convertible_gpu_pipeline_task::get_pipelineable_data(task);
     if (data == nullptr) { return; }
+    auto record = convertible_gpu_pipeline_task::downgraded_task_identity(task);
+    if (!record) { return; }
     std::vector<event::downgraded_input> inputs;
     for (auto const& batch : data->get_data_batches()) {
-      if (!batch) { continue; }
+      // Only idle batches: then no accessor is held, so this thread never try-locks a mutex it
+      // already owns (undefined for a shared_mutex). A batch someone is reading is skipped.
+      if (!batch || batch->get_state() != cucascade::batch_state::idle) { continue; }
       auto const ro     = batch->try_to_read_only();
       auto const* space = ro ? ro->get_memory_space() : nullptr;
       if (space == nullptr || space->get_tier() == cucascade::memory::Tier::GPU) { continue; }
@@ -107,11 +111,10 @@ void publish_off_gpu_inputs(event::query_event_publisher& publisher,
                         .gpu_bytes = sirius::peak_materialization_bytes(ro->get_data())});
     }
     if (inputs.empty()) { return; }
-    auto record = convertible_gpu_pipeline_task::downgraded_task_identity(task);
-    if (!record) { return; }
     record->second.inputs = std::move(inputs);
     publisher.publish_task_downgraded(record->first, std::move(record->second));
   } catch (...) {
+    // Advisory: a lost event costs a promotion, never the task.
   }
 }
 

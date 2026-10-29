@@ -344,8 +344,9 @@ Thread pool (default `num_threads: 1`) plus:
 
 **File:** `src/preload/config.hpp`
 
-The preload executor moves the inputs of queued tasks that the downgrade executor spilled back to
-a GPU (HOST→GPU, DISK→GPU), or from DISK to HOST when the GPU has no room, before the task runs
+The preload executor moves queued tasks' inputs that are off the GPU (spilled while queued, or
+queued already spilled) back to a GPU (HOST→GPU, DISK→GPU), or from DISK to HOST when the GPU has
+no room, before the task runs
 (see [Memory Management](memory-management.md#preload-executor)). It is advisory: a refused or
 failed promotion costs performance only. It is not a thread pool: it runs one worker thread per
 GPU plus an event-subscriber thread, and has no `num_threads` or `cpu_affinity` key.
