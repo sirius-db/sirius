@@ -17,6 +17,7 @@
 #pragma once
 
 #include "data/data_batch_utils.hpp"
+#include "memory/pool_peer_access.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/dynamic_filter/complete_build_inventory.hpp"
 #include "op/dynamic_filter/detail/accumulated_bloom_builder.hpp"
@@ -74,9 +75,32 @@
 #include <sanitizer/tsan_interface.h>
 #endif
 
+namespace sirius::op::detail {
+
+/**
+ * @brief Exercises the private HOST path and workspace observations from tests
+ */
+struct accumulated_bloom_test_access {
+  using workspace_observation = accumulated_bloom_builder::workspace_observation;
+
+  static auto finish(accumulated_bloom_builder& builder,
+                     rmm::cuda_device_id root,
+                     ::cuda::stream_ref stream,
+                     rmm::device_async_resource_ref mr,
+                     bool force_host,
+                     workspace_observation* observation = nullptr)
+  {
+    if (!force_host && observation == nullptr) { return builder.finish(root, stream, mr); }
+    return builder.finish_impl(root, stream, mr, force_host, observation);
+  }
+};
+
+}  // namespace sirius::op::detail
+
 namespace sirius::test::accumulation {
 
-using batch_ptr = std::shared_ptr<cucascade::data_batch>;
+using batch_ptr      = std::shared_ptr<cucascade::data_batch>;
+using builder_access = sirius::op::detail::accumulated_bloom_test_access;
 
 inline constexpr std::size_t mib = std::size_t{1} << 20;
 
@@ -264,14 +288,27 @@ void wait_until(Predicate done, std::chrono::milliseconds timeout = std::chrono:
 }
 
 /**
- * @brief Whether these fixture pools permit every access needed by accumulation
- *
- * CUDA failures propagate; unavailable pool capability warns and returns false.
+ * @brief Whether every replica pool grants every other replica GPU, so publication can copy
+ * directly. CUDA failures propagate.
+ */
+[[nodiscard]] inline bool pool_access_available(
+  std::span<sirius::op::dynamic_filter_replica_space const> spaces)
+{
+  std::vector<cucascade::memory::memory_space const*> gpu_spaces;
+  gpu_spaces.reserve(spaces.size());
+  for (auto const& space : spaces) {
+    gpu_spaces.push_back(&space.get_gpu_space());
+  }
+  return !sirius::memory::find_pair_without_pool_access(gpu_spaces);
+}
+
+/**
+ * @brief `pool_access_available`, warning when a test that needs direct copies must skip.
  */
 [[nodiscard]] inline bool has_pool_access(
   std::span<sirius::op::dynamic_filter_replica_space const> spaces)
 {
-  if (sirius::op::find_pair_without_pool_access(spaces)) {
+  if (!pool_access_available(spaces)) {
     WARN("test needs access to every fixture replica pool; skipping");
     return false;
   }
@@ -672,9 +709,6 @@ struct fixture {
 inline void load_accumulation_kernels(std::size_t devices)
 {
   fixture warm_up({.devices = devices});
-  if (!has_pool_access(warm_up.spaces)) {
-    SKIP("accumulation kernel warm-up requires access to every replica pool");
-  }
   std::vector<batch_ptr> batches;
   for (std::size_t device = 0; device < devices; ++device) {
     batches.push_back(
@@ -713,6 +747,81 @@ inline bool publish_behind_gates(fixture const& owner,
     gate->open();
   }
   return running.get();
+}
+
+/**
+ * @brief Builds a diagnostic accumulator using the fixture's two integer columns.
+ */
+inline sirius::op::detail::accumulated_bloom_builder make_builder(
+  fixture const& owner,
+  sirius::op::detail::accumulated_bloom_geometry geometry,
+  std::size_t keys = 2)
+{
+  using builder = sirius::op::detail::accumulated_bloom_builder;
+  std::vector<builder::key> active{{0, cudf::data_type{cudf::type_id::INT32}}};
+  if (keys == 2) { active.push_back({1, cudf::data_type{cudf::type_id::INT64}}); }
+  auto result = builder::try_create(std::move(active), geometry, owner.spaces);
+  REQUIRE(result);
+  return std::move(*result);
+}
+
+/**
+ * @brief Adds a retained fixture batch and retires its input reads.
+ */
+inline void add_to_builder(sirius::op::detail::accumulated_bloom_builder& builder,
+                           fixture const& owner,
+                           batch_ptr const& batch)
+{
+  auto source       = batch->to_read_only();
+  auto const device = source.get_memory_space()->get_device_id();
+  rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device}};
+  REQUIRE(builder.enqueue_add(
+    sirius::get_cudf_table_view(source), rmm::cuda_device_id{device}, owner.task_stream(device)));
+  owner.task_stream(device).sync();
+}
+
+/**
+ * @brief Computes the complete CPU bitwise union of every private partial before publication.
+ */
+inline std::vector<std::vector<std::byte>> partial_union(
+  sirius::op::detail::accumulated_bloom_builder const& builder,
+  std::size_t keys,
+  std::size_t devices)
+{
+  std::vector<std::vector<std::byte>> expected(keys);
+  for (std::size_t key = 0; key < keys; ++key) {
+    for (std::size_t device = 0; device < devices; ++device) {
+      auto partial = builder.inspect_partial(key, rmm::cuda_device_id{static_cast<int>(device)});
+      REQUIRE(partial);
+      if (expected[key].empty()) { expected[key].resize(partial->bytes.size()); }
+      REQUIRE(expected[key].size() == partial->bytes.size());
+      for (std::size_t index = 0; index < partial->bytes.size(); ++index) {
+        expected[key][index] |= partial->bytes[index];
+      }
+    }
+  }
+  return expected;
+}
+
+/**
+ * @brief Checks every byte and readiness of every completed replica against the private-partial
+ * oracle.
+ */
+inline void require_exact_union(
+  std::span<std::shared_ptr<sirius::op::sirius_dynamic_bloom_filter> const> filters,
+  std::vector<std::vector<std::byte>> const& expected,
+  std::size_t devices)
+{
+  REQUIRE(filters.size() == expected.size());
+  for (std::size_t key = 0; key < expected.size(); ++key) {
+    for (std::size_t device = 0; device < devices; ++device) {
+      auto actual = sirius::op::detail::accumulated_bloom_builder::inspect_replica(
+        *filters[key], rmm::cuda_device_id{static_cast<int>(device)});
+      REQUIRE(actual);
+      REQUIRE(actual->stream_idle);
+      REQUIRE(actual->bytes == expected[key]);
+    }
+  }
 }
 
 }  // namespace sirius::test::accumulation

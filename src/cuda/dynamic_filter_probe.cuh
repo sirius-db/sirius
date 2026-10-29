@@ -102,7 +102,7 @@ decltype(auto) dispatch_key_rep(membership_key_rep rep, Fn&& fn)
 template <class KeyT, class ProbeT>
 __device__ __forceinline__ bool probe_key_convert(ProbeT value, KeyT& out) noexcept
 {
-  static_assert(cuda::std::is_signed_v<KeyT> == cuda::std::is_signed_v<ProbeT>,
+  static_assert(::cuda::std::is_signed_v<KeyT> == ::cuda::std::is_signed_v<ProbeT>,
                 "probe and key carriers must share a signedness");
   if (!sirius::value_fits<KeyT>(value)) { return false; }
   out = static_cast<KeyT>(value);
@@ -185,8 +185,8 @@ struct string_fingerprint_hasher {
   __host__ __device__ explicit string_fingerprint_hasher(std::uint64_t seed) : impl{seed} {}
   __device__ std::uint64_t operator()(cudf::string_view const& s) const noexcept
   {
-    return impl.compute_hash(reinterpret_cast<cuda::std::byte const*>(s.data()),
-                             static_cast<cuda::std::size_t>(s.size_bytes()));
+    return impl.compute_hash(reinterpret_cast<::cuda::std::byte const*>(s.data()),
+                             static_cast<::cuda::std::size_t>(s.size_bytes()));
   }
 };
 
@@ -216,7 +216,7 @@ struct string_hash_adapter {
 template <class KeyT, class Fn>
 bool dispatch_storage_carrier(cudf::data_type t, Fn&& fn)
 {
-  if constexpr (cuda::std::is_signed_v<KeyT>) {
+  if constexpr (::cuda::std::is_signed_v<KeyT>) {
     switch (sirius::integer_storage_type(t).id()) {
       case cudf::type_id::INT8: fn(std::int8_t{}); return true;
       case cudf::type_id::INT16: fn(std::int16_t{}); return true;
@@ -255,7 +255,7 @@ bool dispatch_probe_adapter(membership_key_domain const& domain,
 {
   if (!membership_probe_compatible(domain, probe.type())) { return false; }
   if (domain.family == membership_key_family::string_hash) {
-    if constexpr (cuda::std::is_same_v<KeyT, std::uint64_t>) {
+    if constexpr (::cuda::std::is_same_v<KeyT, std::uint64_t>) {
       // The device view is a host object whose child views live in a stream-ordered device
       // allocation released when it goes out of scope, after fn enqueued its kernel on stream.
       auto const device_view = cudf::column_device_view::create(probe, stream);
@@ -385,7 +385,7 @@ bool with_build_key_iterator(membership_key_domain const& domain,
                              Fn&& fn)
 {
   if (domain.family == membership_key_family::string_hash) {
-    if constexpr (cuda::std::is_same_v<KeyT, std::uint64_t>) {
+    if constexpr (::cuda::std::is_same_v<KeyT, std::uint64_t>) {
       if (keys.type().id() != cudf::type_id::STRING) { return false; }
       auto const fingerprints = materialize_string_fingerprints(keys, stream, mr);
       auto const* first       = fingerprints->view().data<std::uint64_t>();
@@ -399,10 +399,10 @@ bool with_build_key_iterator(membership_key_domain const& domain,
   if (!membership_probe_compatible(domain, keys.type())) { return false; }
   bool invoked = false;
   dispatch_storage_carrier<KeyT>(keys.type(), [&](auto carrier_tag) {
-    using carrier_type            = decltype(carrier_tag);
-    constexpr bool widens_or_same = sizeof(carrier_type) <= sizeof(KeyT);
-    constexpr bool verified_narrowing =
-      cuda::std::is_same_v<carrier_type, __int128_t> && cuda::std::is_same_v<KeyT, std::int64_t>;
+    using carrier_type                = decltype(carrier_tag);
+    constexpr bool widens_or_same     = sizeof(carrier_type) <= sizeof(KeyT);
+    constexpr bool verified_narrowing = ::cuda::std::is_same_v<carrier_type, __int128_t> &&
+                                        ::cuda::std::is_same_v<KeyT, std::int64_t>;
     if constexpr (widens_or_same || verified_narrowing) {
       auto const first =
         thrust::make_transform_iterator(keys.data<carrier_type>(), convert_to_rep<KeyT>{});

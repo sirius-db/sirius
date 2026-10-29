@@ -388,21 +388,26 @@ struct dynamic_filter_publication_session::state {
       if (task_space.get_tier() != cucascade::memory::Tier::GPU) {
         throw detail::accumulation_invariant_error{"publication task space must be a GPU space"};
       }
-      auto const filters = builder->finish(rmm::cuda_device_id{task_space.get_device_id()},
-                                           stream,
-                                           task_space.get_default_allocator());
-      if (!filters) {
+      auto const published_filters =
+        builder->finish(rmm::cuda_device_id{task_space.get_device_id()},
+                        stream,
+                        task_space.get_default_allocator());
+      if (!published_filters) {
         skip_locked(&dynamic_filter_stats_snapshot::accumulations_skipped_admission);
         return;
       }
+      auto const filters = published_filters->filters;
+      bool const host_staged =
+        published_filters->transport ==
+        detail::accumulated_bloom_builder::publication_transport::host_staged;
       {
         std::scoped_lock lock(mutex);
-        outcome.membership_filters_built = filters->size();
+        outcome.membership_filters_built = filters.size();
         if (end_if_fanout_forbidden()) { return; }
       }
       std::vector<key_filters> per_key(plan.admitted_keys().size());
       for (std::size_t index = 0; index < active_keys.size(); ++index) {
-        auto const& filter    = (*filters)[index];
+        auto const& filter    = filters[index];
         auto& key             = per_key[active_keys[index]];
         key.membership        = filter;
         key.membership_domain = filter->domain();
@@ -414,17 +419,19 @@ struct dynamic_filter_publication_session::state {
       });
       sirius::log::log_noexcept([&] {
         SIRIUS_LOG_INFO(
-          "[dynamic_filter_publication_session] accumulated Bloom published: {} filter(s) pushed "
-          "to {} target(s), {:.1f} ms after the final contribution.",
+          "[dynamic_filter_publication_session] accumulated Bloom published through {}: {} "
+          "filter(s) pushed to {} target(s), {:.1f} ms after the final contribution.",
+          host_staged ? "HOST staging" : "peer copies",
           counts.pushed,
           counts.active_targets,
           latency ? std::chrono::duration<double, std::milli>(*latency).count() : 0.0);
       });
       bool const published = counts.pushed != 0;
       std::scoped_lock lock(mutex);
-      outcome.filters_pushed                      = counts.pushed;
-      outcome.bindings_skipped_incompatible_probe = counts.incompatible_probes;
-      outcome.accumulation_publications_finished  = published ? 1 : 0;
+      outcome.filters_pushed                        = counts.pushed;
+      outcome.bindings_skipped_incompatible_probe   = counts.incompatible_probes;
+      outcome.accumulation_publications_finished    = published ? 1 : 0;
+      outcome.accumulation_publications_host_staged = published && host_staged ? 1 : 0;
       if (latency) {
         outcome.accumulation_publication_latency_ns = static_cast<std::uint64_t>(
           std::chrono::duration_cast<std::chrono::nanoseconds>(*latency).count());
@@ -643,15 +650,6 @@ bool dynamic_filter_publication_session::try_begin_accumulation(
 
     auto const& replicas = plan.replica_spaces();
     if (replicas.empty()) {
-      selection.accumulations_skipped_admission = 1;
-      return false;
-    }
-    if (auto const broken = find_pair_without_pool_access(replicas)) {
-      SIRIUS_LOG_INFO(
-        "[dynamic_filter_publication_session] accumulated Bloom skipped: unavailable pool access "
-        "from GPU {} to GPU {}.",
-        broken->first,
-        broken->second);
       selection.accumulations_skipped_admission = 1;
       return false;
     }
