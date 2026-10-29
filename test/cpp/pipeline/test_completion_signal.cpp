@@ -174,3 +174,49 @@ TEST_CASE("A pipeline left over from a finished query cannot signal the next one
   REQUIRE_NOTHROW(pipeline->update_pipeline_status(false));
   REQUIRE(pipeline->is_pipeline_finished());
 }
+
+TEST_CASE("Waiting for source input does not block task completion or finish a creation gap",
+          "[pipeline][completion]")
+{
+  auto sink     = make_sink(SiriusPhysicalOperatorType::RESULT_COLLECTOR);
+  auto pipeline = make_finishable_pipeline(sink);
+  auto handler  = std::make_shared<completion_handler>();
+  pipeline->set_completion_handler(handler);
+  auto awaitable = handler->get_awaitable();
+  pipeline->mark_task_created();
+  auto creation  = pipeline->get_task_creation_lock();
+  auto completed = std::async(std::launch::async, [&] { pipeline->mark_task_completed(); });
+  auto status    = completed.wait_for(2s);
+  // Always unblock a regression before joining the worker or failing an assertion.
+  if (status != std::future_status::ready) creation.unlock();
+  completed.get();
+  REQUIRE(status == std::future_status::ready);
+  CHECK_FALSE(pipeline->is_pipeline_finished());
+  CHECK(awaitable.wait_for(0s) != std::future_status::ready);
+  // Claiming the final input may make the source appear drained before its task exists.
+  pipeline->update_pipeline_status(false);
+  CHECK_FALSE(pipeline->is_pipeline_finished());
+  pipeline->mark_task_created();
+  creation.unlock();
+  pipeline->update_pipeline_status(false);
+  CHECK_FALSE(pipeline->is_pipeline_finished());
+  pipeline->mark_task_completed();
+  CHECK(pipeline->get_tasks_created() == 2);
+  CHECK(pipeline->get_tasks_completed() == 2);
+  REQUIRE(awaitable.wait_for(0s) == std::future_status::ready);
+  REQUIRE_NOTHROW(awaitable.get());
+}
+
+TEST_CASE("An exhausted source creation guard releases its finalization exclusion",
+          "[pipeline][completion]")
+{
+  auto sink     = make_sink(SiriusPhysicalOperatorType::RESULT_COLLECTOR);
+  auto pipeline = make_finishable_pipeline(sink);
+  {
+    auto creation = pipeline->get_task_creation_lock();
+    pipeline->update_pipeline_status(false);
+    CHECK_FALSE(pipeline->is_pipeline_finished());
+  }
+  pipeline->update_pipeline_status(false);
+  CHECK(pipeline->is_pipeline_finished());
+}
