@@ -92,13 +92,15 @@ struct scan_plan_inputs {
   /// Local byte-range attribution; remote ranges are never returned here.
   std::map<std::string, std::vector<scan_byte_range>> byte_ranges;
   /// Canonical paths of LocalFiles items (`uri_file` or `uri_path`) whose scheme is not a local
-  /// file, in first-encounter order, de-duplicated. The embedding context refuses or scopes
+  /// file, plus the metadata URI of every `iceberg_table` read whatever its scheme (a local
+  /// metadata file still names its data files by URI, so no Iceberg read is local before
+  /// binding), in first-encounter order, de-duplicated. The embedding context refuses or scopes
   /// these before binding; remote byte ranges are not attributed here (the direct
   /// `extract_scan_byte_ranges` keeps refusing them).
   std::vector<std::string> remote_paths;
 };
 
-/// Parse LocalFiles inputs once for the embedding pre-pass. A nonempty remote_paths
+/// Parse LocalFiles and Iceberg inputs once for the embedding pre-pass. A nonempty remote_paths
 /// inventory must be refused by the caller before binding or using byte_ranges.
 /// Local-only plans retain extract_scan_byte_ranges validation; the direct extractor
 /// separately retains its remote-range refusal.

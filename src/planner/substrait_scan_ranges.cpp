@@ -151,14 +151,24 @@ void visit_reads(const pb::Message& message, std::vector<std::map<std::string, r
 }
 
 /// Every remote LocalFiles item of the plan, by its own path form (`uri_file` or `uri_path`),
-/// in first-encounter order. Collected from the items directly, so a remote item is seen even
-/// when its path form is unsupported for byte-range attribution.
+/// and the metadata URI of every Iceberg read, in first-encounter order. Collected from the items
+/// directly, so a remote item is seen even when its path form is unsupported for byte-range
+/// attribution.
 void visit_remote_items(const pb::Message& message,
                         std::vector<std::string>& remote,
                         std::set<std::string>& seen)
 {
-  if (auto const* read = dynamic_cast<const substrait::ReadRel*>(&message);
-      read != nullptr && read->has_local_files()) {
+  auto const* read = dynamic_cast<const substrait::ReadRel*>(&message);
+  if (read != nullptr && read->has_iceberg_table()) {
+    // The consumer binds iceberg_scan(metadata_uri) at once, and even a local metadata file names
+    // its data files by URI, so no Iceberg read is local before binding: the metadata URI is
+    // inventoried whatever its scheme. An empty URI is left to the consumer's own rejection.
+    if (auto path = read->iceberg_table().direct().metadata_uri();
+        !path.empty() && seen.insert(path).second) {
+      remote.push_back(std::move(path));
+    }
+  }
+  if (read != nullptr && read->has_local_files()) {
     for (const auto& item : read->local_files().items()) {
       std::string raw;
       if (item.has_uri_file()) {
