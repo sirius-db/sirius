@@ -1354,3 +1354,44 @@ TEST_CASE("Generic temporal mapping does not widen Iceberg admission", "[scan][c
     CHECK_FALSE(sirius::planner::iceberg_flat_mapping_supported(&bind));
   }
 }
+
+TEST_CASE("Parquet binding verification rejects altered nested readers",
+          "[scan][parquet_interface][shared_context]")
+{
+  REQUIRE(sirius::test::g_shared_env);
+  auto con = sirius::test::g_shared_env->make_connection();
+  REQUIRE_FALSE(con.Query("SET gpu_execution=false")->HasError());
+  sirius::test::scratch_dir files("reader_verification");
+  auto const path = sirius::test::sql_literal((files.path() / "data.parquet").string());
+  REQUIRE_FALSE(con.Query("COPY (SELECT 1 AS id) TO " + path + " (FORMAT PARQUET)")->HasError());
+  REQUIRE_FALSE(con.Query("BEGIN")->HasError());
+  auto plan     = con.ExtractPlan("SELECT * FROM read_parquet(" + path + ")");
+  auto& get     = first_get(*plan);
+  auto& bind    = get.bind_data->Cast<duckdb::MultiFileBindData>();
+  auto* wrapper = dynamic_cast<duckdb::TableFunctionMultiFileWrapper*>(bind.interface.get());
+  REQUIRE(wrapper);
+  auto verify = [&] {
+    return sirius::planner::verified_parquet_interface(get.bind_data.get(), *con.context);
+  };
+  REQUIRE(verify());
+  auto const function        = wrapper->function;
+  auto const settings        = wrapper->settings;
+  wrapper->function.function = fake_scan;
+  CHECK_FALSE(verify());
+  wrapper->function      = function;
+  wrapper->function.bind = fake_bind;
+  CHECK_FALSE(verify());
+  wrapper->function             = function;
+  wrapper->settings.claim_batch = nullptr;
+  CHECK_FALSE(verify());
+  wrapper->settings                    = settings;
+  wrapper->settings.reuses_local_state = !settings.reuses_local_state;
+  CHECK_FALSE(verify());
+  wrapper->settings                        = settings;
+  wrapper->settings.glob_input.allow_empty = !settings.glob_input.allow_empty;
+  CHECK_FALSE(verify());
+  wrapper->settings = settings;
+  CHECK(verify());
+  CHECK_FALSE(sirius::planner::verified_parquet_interface(nullptr, *con.context));
+  REQUIRE_FALSE(con.Query("ROLLBACK")->HasError());
+}
