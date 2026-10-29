@@ -42,7 +42,7 @@ jobs:
           - version: "12"
             pixi-environment: cuda12
             runner: ubuntu-22.04
-            run-on-pr: false
+            run-on-pr: true
         exclude:
           # On PRs, drop non-PR CUDA variants; otherwise, run the full matrix.
           - cuda:
@@ -163,13 +163,13 @@ jobs:
           - version: "12"
             pixi-environment: cuda12
             runner: ubuntu-22.04
-            run-on-pr: false
+            run-on-pr: true
         exclude:
           # On PRs, drop non-PR CUDA variants; otherwise, run the full matrix.
           - cuda:
               run-on-pr: ${{ case(github.event_name == 'pull_request', false, 'no-match') }}
       fail-fast: false
-    runs-on: ${{ fromJSON(format('["self-hosted", "{0}", "{1}"]', matrix.cuda.runner, github.event_name == 'pull_request' && 'pr-gpu-2xt4' || 'gpu-2xt4')) }}
+    runs-on: ${{ fromJSON(format('["self-hosted", "{0}", "{1}"]', matrix.cuda.runner, github.event_name == 'pull_request' && 'dev-gpu-2xt4' || 'gpu-2xt4')) }}
     timeout-minutes: 90
     env:
       CUDA_CACHE_PATH: /home/runner/actions-runner/_work/.cuda-cache
