@@ -18,9 +18,9 @@
 
 #include "op/scan/iceberg_delete_set.hpp"
 
-#include <io/io_errors.hpp>
-#include <io/sirius_datasource.hpp>
-#include <io/uri_parser.hpp>
+#include <cucascade/cudf/datasource.hpp>
+#include <cucascade/io/io_errors.hpp>
+#include <cucascade/io/uri_parser.hpp>
 #include <log/logging.hpp>
 
 // Vendored by DuckDB core and already on this target's include path; duckdb_static bundles its
@@ -96,7 +96,7 @@ class local_puffin_source final : public puffin_byte_source {
 
 class datasource_puffin_source final : public puffin_byte_source {
  public:
-  explicit datasource_puffin_source(std::unique_ptr<io::sirius_datasource> source)
+  explicit datasource_puffin_source(std::unique_ptr<cucascade::io::datasource> source)
     : source_(std::move(source))
   {
   }
@@ -121,7 +121,7 @@ class datasource_puffin_source final : public puffin_byte_source {
       throw;
     } catch (duckdb::InterruptException const&) {
       throw;
-    } catch (io::object_changed_error const&) {
+    } catch (cucascade::io::object_changed_error const&) {
       // Preserve the typed version failure until the charged scan wrapper,
       // which records it and classifies the terminal outcome.
       throw;
@@ -145,7 +145,7 @@ class datasource_puffin_source final : public puffin_byte_source {
   }
 
  private:
-  std::unique_ptr<io::sirius_datasource> source_;
+  std::unique_ptr<cucascade::io::datasource> source_;
   std::streamoff offset_ = 0;
 };
 
@@ -492,7 +492,7 @@ bool read_puffin_bytes(puffin_byte_source& source,
     return source.read(destination);
   } catch (sirius::transparent::classified_execution_error const&) {
     throw;
-  } catch (io::object_changed_error const&) {
+  } catch (cucascade::io::object_changed_error const&) {
     throw;
   } catch (std::bad_alloc const&) {
     // Allocation failures are resource failures, not reader I/O failures.
@@ -852,7 +852,7 @@ std::vector<int64_t> read_deletion_vector(DeletionVectorRef const& ref)
 }
 
 std::unique_ptr<puffin_byte_source> make_puffin_byte_source(
-  std::unique_ptr<io::sirius_datasource> source)
+  std::unique_ptr<cucascade::io::datasource> source)
 {
   if (!source) return nullptr;
   return std::make_unique<datasource_puffin_source>(std::move(source));
@@ -887,7 +887,7 @@ decoded_positions read_charged_checked(Ref const& ref,
     return result;
   } catch (sirius::transparent::classified_execution_error const&) {
     throw;
-  } catch (io::object_changed_error const&) {
+  } catch (cucascade::io::object_changed_error const&) {
     // Preserve the typed version failure until the charged scan wrapper.
     throw;
   } catch (std::system_error const& error) {

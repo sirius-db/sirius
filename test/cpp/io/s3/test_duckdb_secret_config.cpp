@@ -83,7 +83,7 @@ TEST_CASE("Sirius S3 secrets resolve without httpfs and rotate by path", "[s3][s
                  "REGION 'test-region-1', SESSION_TOKEN 'first-token', "
                  "ENDPOINT 'object-store:9000', USE_SSL true, VERIFY_SSL false, URL_STYLE 'PATH')");
 
-  sirius::io::object_store_config defaults;
+  cucascade::io::object_store_config defaults;
   defaults.endpoint      = "https://yaml-endpoint";
   defaults.region        = "yaml-region";
   defaults.access_key    = "yaml-key";
@@ -165,7 +165,7 @@ TEST_CASE("Sirius S3 secret lookup prefers Sirius then httpfs then config", "[s3
   require_sql_ok(con,
                  "CREATE SECRET legacy (TYPE S3, SCOPE 's3://bucket/data/', "
                  "KEY_ID 'legacy-key', SECRET 'legacy-secret', REGION 'us-east-1')");
-  sirius::io::object_store_config defaults;
+  cucascade::io::object_store_config defaults;
   auto const legacy = sirius::io::s3::resolve_duckdb_s3_secret(
     *con.context, "s3://bucket/data/file.parquet", defaults);
   CHECK(legacy.access_key == "legacy-key");

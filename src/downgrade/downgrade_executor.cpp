@@ -25,12 +25,15 @@
 #include <nvtx3/nvtx3.hpp>
 
 #include <absl/cleanup/cleanup.h>
+#include <cucascade/io/cache/fs_cache.hpp>
 
 #include <algorithm>
 #include <chrono>
 #include <exception>
+#include <limits>
 #include <optional>
 #include <ranges>
+#include <stdexcept>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -71,8 +74,29 @@ downgrade_executor::~downgrade_executor() { stop(); }
 
 void downgrade_executor::start()
 {
+  std::lock_guard lock(_lifecycle_mutex);
   bool expected = false;
   if (!_running.compare_exchange_strong(expected, true)) { return; }
+  _paused.store(false);
+
+  absl::Cleanup rollback = [this]() {
+    {
+      std::lock_guard monitor_lock(_monitor_cv_mutex);
+      _running.store(false);
+    }
+    _request_queue.interrupt();
+    _monitor_cv.notify_all();
+    if (_pool) { _pool->interrupt(); }
+    if (_monitor_thread.joinable()) { _monitor_thread.join(); }
+    if (_processing_thread.joinable()) { _processing_thread.join(); }
+    if (_pool) {
+      _pool->wait_all();
+      _pool->stop();
+      _pool.reset();
+    }
+    cancel_pending_requests();
+    _stream_pool.reset();
+  };
 
   // HOST/DISK tier memory_spaces return device_id == -1; passing that to
   // rmm::cuda_device_id or cudaSetDevice fails with cudaErrorInvalidDevice.
@@ -115,12 +139,16 @@ void downgrade_executor::start()
   if (_memory_space && _config.monitor_period > std::chrono::milliseconds::zero()) {
     _monitor_thread = std::thread(&downgrade_executor::monitor_loop, this);
   }
+  std::move(rollback).Cancel();
 }
 
 void downgrade_executor::stop()
 {
-  bool expected = true;
-  if (!_running.compare_exchange_strong(expected, false)) { return; }
+  std::lock_guard lock(_lifecycle_mutex);
+  {
+    std::lock_guard monitor_lock(_monitor_cv_mutex);
+    if (!_running.exchange(false)) { return; }
+  }
 
   _pool->interrupt();
   _request_queue.interrupt();
@@ -134,21 +162,76 @@ void downgrade_executor::stop()
   _pool->stop();
   _pool.reset();
   _stream_pool.reset();
+  _paused.store(false);
 }
 
-void downgrade_executor::drain()
+void downgrade_executor::pause()
 {
+  std::lock_guard lock(_lifecycle_mutex);
+  if (!_running.load() || _paused.load()) { return; }
+  {
+    // Change the wait predicate under its mutex so a long monitor sleep cannot miss the wakeup.
+    std::lock_guard monitor_lock(_monitor_cv_mutex);
+    _paused.store(true);
+  }
+
   _pool->interrupt();
   _request_queue.interrupt();
+  _monitor_cv.notify_all();
 
+  // The monitor also borrows the cache for its viability check. Join it as well as the
+  // processing thread before permitting a rebind, and stop it from publishing while paused.
+  if (_monitor_thread.joinable()) { _monitor_thread.join(); }
   if (_processing_thread.joinable()) { _processing_thread.join(); }
 
   _pool->wait_all();
   cancel_pending_requests();
+}
+
+void downgrade_executor::resume()
+{
+  std::lock_guard lock(_lifecycle_mutex);
+  if (!_running.load() || !_paused.load()) { return; }
+
   _pool->resume();
   _request_queue.reactivate();
+  _paused.store(false);
+  try {
+    _processing_thread = std::thread(&downgrade_executor::processing_loop, this);
+    if (_memory_space && _config.monitor_period > std::chrono::milliseconds::zero()) {
+      _monitor_thread = std::thread(&downgrade_executor::monitor_loop, this);
+    }
+  } catch (...) {
+    // A thread-creation failure leaves a quiescent, rebindable executor, not a half-live
+    // borrower of a cache its owner may replace while unwinding.
+    {
+      std::lock_guard monitor_lock(_monitor_cv_mutex);
+      _paused.store(true);
+    }
+    _pool->interrupt();
+    _request_queue.interrupt();
+    _monitor_cv.notify_all();
+    if (_monitor_thread.joinable()) { _monitor_thread.join(); }
+    if (_processing_thread.joinable()) { _processing_thread.join(); }
+    _pool->wait_all();
+    cancel_pending_requests();
+    throw;
+  }
+}
 
-  _processing_thread = std::thread(&downgrade_executor::processing_loop, this);
+void downgrade_executor::drain()
+{
+  pause();
+  resume();
+}
+
+void downgrade_executor::set_fs_cache(cucascade::io::cache::fs_cache* cache)
+{
+  std::lock_guard lock(_lifecycle_mutex);
+  if (_running.load() && !_paused.load()) {
+    throw std::logic_error("fs_cache must be rebound before start() or while paused");
+  }
+  _fs_cache = cache;
 }
 
 void downgrade_executor::processing_loop()
@@ -259,6 +342,21 @@ void downgrade_executor::processing_loop()
       disk_not_configured = disk_spaces.empty();
       for (auto* ds : disk_spaces) {
         target_spaces.push_back(ds);
+      }
+
+      // === TIER 0: default-local fs_cache (HOST only, idle chunks first) ===
+      // Return unused staging buffers before spilling repository data. Credit both the
+      // completed and planned totals so byte-target requests do not over-dispatch batches.
+      if (_space_id.tier == cucascade::memory::Tier::HOST && _fs_cache &&
+          !predicate_satisfied(req.get()) && !target_completed()) {
+        auto const target =
+          req->target_bytes.has_value()
+            ? *req->target_bytes - req->bytes_freed.load(std::memory_order_relaxed)
+            : std::numeric_limits<std::size_t>::max();
+        auto const freed = _fs_cache->reclaim(cucascade::io::cache::reclaim_mode::idle, target);
+        req->bytes_freed.fetch_add(freed, std::memory_order_relaxed);
+        planned_bytes.fetch_add(freed, std::memory_order_relaxed);
+        predicate_satisfied(req.get());
       }
 
       // === TIER 1: Data repositories ===
@@ -476,6 +574,25 @@ void downgrade_executor::processing_loop()
     // until it returns.
     _pool->wait_all();
     failed_pipeline_candidates.clear();
+
+    // === TIER 3: default-local fs_cache (HOST only, forced final pass) ===
+    // Only a known, still-unmet byte target justifies dropping subscribed cache warmth.
+    // All workers have settled, so the deficit reflects actual rather than planned releases.
+    if (!dispatch_error && _space_id.tier == cucascade::memory::Tier::HOST && _fs_cache &&
+        req->target_bytes.has_value() && !predicate_satisfied(req.get()) && !target_completed()) {
+      try {
+        auto const remaining =
+          *req->target_bytes - req->bytes_freed.load(std::memory_order_relaxed);
+        auto const freed =
+          _fs_cache->reclaim(cucascade::io::cache::reclaim_mode::forced, remaining);
+        req->bytes_freed.fetch_add(freed, std::memory_order_relaxed);
+        planned_bytes.fetch_add(freed, std::memory_order_relaxed);
+        predicate_satisfied(req.get());
+      } catch (...) {
+        dispatch_error = std::current_exception();
+      }
+    }
+
     if (req->is_monitor_request) {
       _monitor_request_enqueued.store(false, std::memory_order_relaxed);
     }
@@ -596,9 +713,10 @@ bool downgrade_executor::has_viable_downgrade_target() const
   // DISK is an effectively unbounded sink and a valid target for any source tier.
   if (has_disk_tier()) { return true; }
 
-  // Without a disk tier, only a GPU source has a lower tier to downgrade to (HOST). processing_loop
-  // only adds HOST target spaces when the source is GPU, so a HOST (or other) source has no target
-  // at all and can never free anything -- it must back off rather than re-fire.
+  // HOST cache reclaim returns staging buffers without requiring a DISK spill target.
+  if (_space_id.tier == Tier::HOST) { return _fs_cache && _fs_cache->claimed_bytes() != 0; }
+
+  // Without a disk tier, only a GPU source has a lower tier to downgrade to (HOST).
   if (_space_id.tier != Tier::GPU) { return false; }
 
   // GPU source, no disk: viable iff some HOST space can currently accept a reservation. Probe with
@@ -637,7 +755,7 @@ void downgrade_executor::monitor_loop()
   // Monitor-thread-local; throttles the back-off warning to once per stall episode.
   bool backed_off = false;
 
-  while (_running.load()) {
+  while (_running.load() && !_paused.load()) {
     if (_memory_space && _memory_space->should_downgrade_memory() &&
         !_monitor_request_enqueued.load(std::memory_order_relaxed)) {
       // Stateless viability gate: only issue a downgrade request when one could plausibly free
@@ -687,8 +805,9 @@ void downgrade_executor::monitor_loop()
     }
     // Wait for the monitor period, but wake immediately on shutdown.
     std::unique_lock<std::mutex> lock(_monitor_cv_mutex);
-    _monitor_cv.wait_for(
-      lock, _config.monitor_period, [this]() { return !_running.load(std::memory_order_relaxed); });
+    _monitor_cv.wait_for(lock, _config.monitor_period, [this]() {
+      return !_running.load(std::memory_order_relaxed) || _paused.load(std::memory_order_relaxed);
+    });
   }
 }
 
@@ -702,6 +821,9 @@ void downgrade_executor::cancel_pending_requests()
       // Promise may already be fulfilled — safe to ignore
     }
   }
+  // All producers/consumers are joined by callers. A cancelled queued monitor request must not
+  // leave the monitor permanently believing that a request is still in flight after resume().
+  _monitor_request_enqueued.store(false, std::memory_order_relaxed);
 }
 
 void downgrade_executor::set_pipeline_task_queue(

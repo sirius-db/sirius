@@ -15,8 +15,7 @@
  */
 
 // sirius
-#include "io/cache/types.hpp"
-
+#include <cucascade/io/cache/types.hpp>
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
 #include <helper/numeric_narrowing.hpp>
@@ -709,7 +708,7 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::get_next_task_input
     scan_input->pushdown_selection_unprofitable = _decode_selection_unprofitable;
     scan_input->consumer                        = decode_consumer();
     scan_input->cached_view_possible            = cached_view_possible();
-    scan_input->update(io::cache::scan_stage::queued);
+    scan_input->update(cucascade::io::cache::scan_stage::queued);
   }
   return std::move(*next);
 }

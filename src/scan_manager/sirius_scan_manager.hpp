@@ -21,9 +21,7 @@
 #include "event/query_event_publisher.hpp"
 #include "exec/scoped_dispatcher.hpp"
 #include "exec/thread_pool.hpp"
-#include "io/datasource_factory.hpp"
-#include "io/rest/s3/list_parser.hpp"
-#include "io/sirius_datasource.hpp"
+#include "io/scoped_object_store_configs.hpp"
 #include "late_mat/column_origin.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "pin_snapshot_identity.hpp"
@@ -41,19 +39,22 @@
 #include "scan_manager/preparation_coordinator.hpp"
 #include "scan_manager/readahead_scan_manager.hpp"
 #include "scan_manager/split_provider.hpp"
+#include "scan_manager/uring_gauges_sampler.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/table/table.hpp>
 
 #include <compression/compressed_representation.hpp>
+#include <cucascade/cudf/datasource.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
+#include <cucascade/io/datasource_factory.hpp>
+#include <cucascade/io/rest/s3/list_parser.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/common/column_index.hpp>
 #include <duckdb/common/types.hpp>
 #include <duckdb/common/vector.hpp>
 #include <duckdb/storage/statistics/base_statistics.hpp>
 #include <duckdb/storage/storage_lock.hpp>
-#include <io/types.hpp>
 #include <op/scan/dynamic_filter_merge.hpp>
 
 namespace cucascade::memory {
@@ -74,27 +75,26 @@ class fixed_size_host_memory_resource;
 #include <string_view>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 #include <vector>
 
 namespace cucascade::memory {
 class memory_reservation_manager;
+class topology_index;
 }  // namespace cucascade::memory
 
 namespace sirius::memory {
-class topology_index;
+using cucascade::memory::topology_index;
 }  // namespace sirius::memory
 
-namespace sirius::io {
+namespace cucascade::io {
 class ioctx;
-namespace cache {
-class buffer_pool;
-}  // namespace cache
 namespace rest {
 class rest_ioctx;
 }  // namespace rest
-}  // namespace sirius::io
+}  // namespace cucascade::io
 
 namespace sirius::op::scan {
 class sirius_gpu_scan_operator;
@@ -116,6 +116,9 @@ struct batch_telemetry_info;
 }  // namespace sirius::telemetry
 
 namespace sirius::scan_manager {
+
+/// The backend's name, for log lines and exception text.
+[[nodiscard]] char const* to_string(cucascade::io::io_context_type type) noexcept;
 
 /// Lightweight descriptor of a pinned table's cache identity + column layout,
 /// stored on @ref pinned_entry in place of the read-side ingestible_table_info.
@@ -488,10 +491,17 @@ class sirius_scan_manager {
   /**
    * @brief Construct a new scan manager.
    *
-   * The scan_manager owns a single io_context (uring_ioctx) and optionally
-   * an S3 backend and a prefetch buffer pool, all created from @p config.
+   * The scan_manager owns a default ioctx for local paths (@c uring_ioctx with
+   * backend=native, @c cufile_ioctx with backend=cufile, or @c kvikio_context
+   * with backend=kvikio), built by the
+   * @c cucascade::io::io_context_registry from @p config, plus the backends other
+   * paths route to (e.g. the REST ioctx for @c s3://), built lazily on first use.
+   * Each ioctx carries its own prefetching cache when @c cache.mode is @c cucs.
    *
-   * @param config Scan-manager configuration (thread pool + sirius_datasource toggle).
+   * @throws std::runtime_error when the default ioctx cannot be built; the message
+   *         names the most likely cause.
+   *
+   * @param config Scan-manager configuration (thread pool, IO backend, cache).
    * @param reservation_manager Memory reservation manager for GPU memory.
    * @param topology_index Hardware GPU/NUMA topology index.  Drives round-robin
    *        GPU assignment for scans and is forwarded to the prefetching cache.
@@ -515,7 +525,7 @@ class sirius_scan_manager {
   /// Install the immutable S3 configuration resolved for @p path on the
   /// client thread while binding a query. Matching scans and LIST/glob calls
   /// reuse this snapshot; subsequent replacement affects only future lookups.
-  void install_s3_config(std::string_view path, sirius::io::object_store_config config);
+  void install_s3_config(std::string_view path, cucascade::io::object_store_config config);
 
   /// \brief Prepare per-scan state for the given query.
   ///
@@ -531,8 +541,8 @@ class sirius_scan_manager {
   ///
   /// Registers a NEW per-query state entry keyed by @p query 's id; it does NOT touch any
   /// other query's entry. Call reset(query_id) when the query finishes. A query with no GPU
-  /// scan operators registers no active scan work; it retains only a configured readahead
-  /// subscription, when present, so cleanup can stop it.
+  /// scan operators registers no active scan work or readahead subscription, regardless of
+  /// an explicit readahead budget: no advertised backend can make use of it.
   ///
   /// @param query                           The query whose scan operators must be prepared.
   /// @param enable_pinned_zone_map_pruning  Per-query snapshot of the serve-side pruning flag (the
@@ -606,7 +616,7 @@ class sirius_scan_manager {
   /// because the cache holds what it holds until something evicts it.
   ///
   /// A no-op for any context the configuration or the backend does not give a
-  /// cache to -- @c cache.mode other than @c sirius, or a backend that cannot
+  /// cache to -- @c cache.mode other than @c cucs, or a backend that cannot
   /// serve vector host reads.  Such a context has nothing to drop and nothing
   /// to rebuild, and this leaves it exactly as it was rather than teaching it
   /// to cache.
@@ -846,7 +856,7 @@ class sirius_scan_manager {
   /// serves from them. Nothing is decoded and nothing is materialised on the
   /// GPU, which is what separates this from the gpu/host tiers.
   ///
-  /// Residency is held by keeping each file's @c sirius_datasource -- and so its
+  /// Residency is held by keeping each file's @c cucascade::io::datasource -- and so its
   /// @c cache_handle -- alive under @p name until @ref remove_pinned_entry
   /// drops it. That is load-bearing rather than incidental: the evictor only
   /// considers a request's chunks once its consumer is disposed, so a live
@@ -865,13 +875,20 @@ class sirius_scan_manager {
                                  std::vector<std::string> const& file_paths,
                                  std::optional<std::vector<std::string>> const& cols);
 
-  /// \brief Process-wide ioctx used to mint @c sirius_datasource instances.
-  ///        Holds a @c uring_ioctx, or a @c kvikio_context when the manager
-  ///        was configured with @c backend=kvikio.
-  [[nodiscard]] sirius::io::ioctx* io_ctx() const noexcept { return _io_ctx.get(); }
+  /// \brief Process-wide ioctx used to mint @c cucascade::io::datasource instances.
+  ///        Holds the configured local @c uring_ioctx, @c cufile_ioctx, or
+  ///        @c kvikio_context. cuFile and kvikIO are single-GPU only.
+  [[nodiscard]] cucascade::io::ioctx* io_ctx() const noexcept { return _io_ctx.get(); }
+
+  /// \brief Shared ownership of the process-wide ioctx (see @ref io_ctx), for callers
+  ///        that open datasources on it: every datasource co-owns its ioctx.
+  [[nodiscard]] std::shared_ptr<cucascade::io::ioctx> shared_io_ctx() const noexcept
+  {
+    return _io_ctx;
+  }
 
   /// Aggregate metadata-cache diagnostics across the default and routed ioctxs.
-  [[nodiscard]] sirius::io::cache::metadata_store::counters metadata_cache_statistics() const;
+  [[nodiscard]] cucascade::io::cache::metadata_store::counters metadata_cache_statistics() const;
 
   /// Where the readahead subscribes for execution events.  Set once at startup;
   /// the readahead itself is per-query, so it registers and unregisters around
@@ -881,8 +898,8 @@ class sirius_scan_manager {
     _query_event_publisher = publisher.shared_from_this();
   }
 
-  [[nodiscard]] std::shared_ptr<sirius::io::sirius_datasource> create_datasource(
-    std::string_view path, sirius::io::open_hint hint = sirius::io::open_hint::generic);
+  [[nodiscard]] std::shared_ptr<cucascade::io::datasource> create_datasource(
+    std::string_view path, cucascade::io::open_hint hint = cucascade::io::open_hint::generic);
 
   /// \brief Stream ListObjectsV2 pages for @p s3_prefix_uri ("s3://bucket/prefix")
   ///        to @p sink, one call per page; @p sink returns false to stop early.
@@ -894,7 +911,7 @@ class sirius_scan_manager {
   void list_objects_paged(
     std::string const& s3_prefix_uri,
     std::size_t page_size,
-    std::function<bool(sirius::io::rest::s3::list_objects_v2_page const&)> const& sink,
+    std::function<bool(cucascade::io::rest::s3::list_objects_v2_page const&)> const& sink,
     std::optional<std::size_t> max_scanned = std::nullopt);
 
   /// \brief The configured glob-match cap (@c rest.list_max_matches) for the
@@ -905,7 +922,7 @@ class sirius_scan_manager {
   /// Resolve only the registered backend type for @p path. This is a planning
   /// query: it does not construct or start an ioctx, open an object, issue a
   /// HEAD, warm a backend, or probe credentials/network.
-  [[nodiscard]] std::optional<sirius::io::io_context_type> planning_io_backend(
+  [[nodiscard]] std::optional<cucascade::io::io_context_type> planning_io_backend(
     std::string_view path) const;
 
  private:
@@ -1062,21 +1079,50 @@ class sirius_scan_manager {
   /// — including the scan resolver — may pass a raw `file://` / `s3://` URI),
   /// building it once per backend on first use.  Routes by path through the registry
   /// so an `s3://` URI reaches the rest_ioctx even when the local default `_io_ctx`
-  /// is uring/kvikio.  Returns nullptr when no backend supports the path.
-  std::shared_ptr<sirius::io::ioctx> ioctx_for_path(std::string_view path);
+  /// is uring/cufile (kvikIO overrides remote reads too). Returns nullptr when
+  /// no backend supports the path.
+  std::shared_ptr<cucascade::io::ioctx> ioctx_for_path(std::string_view path);
 
   /// Resolve the ioctx of @p type, building and caching it on first use (the
   /// by-path routing above resolves to a type and then lands here).  Returns
   /// nullptr when the registry cannot build that backend.
-  std::shared_ptr<sirius::io::ioctx> ioctx_for_type(sirius::io::io_context_type type,
-                                                    std::string_view path = {});
+  std::shared_ptr<cucascade::io::ioctx> ioctx_for_type(cucascade::io::io_context_type type,
+                                                       std::string_view path = {});
+
+  /// Why the registry could not build a backend, as far as Sirius can tell.
+  struct ioctx_failure {
+    std::string cause;      ///< the most likely reason, for the log line and exceptions
+    bool by_configuration;  ///< absent by configuration (logged as WARN), not broken (ERROR)
+  };
+
+  /// The most likely reason the registry could not build a backend of @p type.
+  /// cuCascade's factories swallow their exceptions and its logging is compiled
+  /// out, so the cause is derived from Sirius's own config and state. @p scoped
+  /// is the path-scoped S3 config the build used, or nullptr for the default.
+  [[nodiscard]] ioctx_failure explain_ioctx_failure(
+    cucascade::io::io_context_type type,
+    cucascade::io::object_store_config const* scoped = nullptr) const;
+
+  /// Build an ioctx of @p type, logging @ref explain_ioctx_failure when that
+  /// returns nullptr.  Without @p scoped this is `_ioctx_registry.make_ioctx(type)`;
+  /// with a path-scoped S3 config the default config's object store is replaced
+  /// by @p scoped.  An unconfigured object store is a WARN, since that is the
+  /// normal state of a local-only deployment; anything else is an ERROR.
+  [[nodiscard]] std::shared_ptr<cucascade::io::ioctx> make_ioctx_or_explain(
+    cucascade::io::io_context_type type,
+    cucascade::io::object_store_config const* scoped = nullptr);
+
+  /// Give @p io_ctx a prefetching cache when the configuration and the backend
+  /// both allow one, and warn when it could not be built.  Returns whether a cache
+  /// was called for (built or not).
+  bool init_cache_for(cucascade::io::ioctx& io_ctx);
 
   /// The REST ioctx, which owns LIST / glob regardless of which backend serves
   /// object READS (with @c backend=kvikio, `s3://` reads route to kvikIO).
   /// Returns nullptr when the object store is not configured, i.e. the REST
   /// backend cannot be built. The caller shares ownership for the full LIST so
   /// credential rotation cannot retire the context while a request is in flight.
-  std::shared_ptr<sirius::io::rest::rest_ioctx> rest_ioctx_for_list(std::string_view path);
+  std::shared_ptr<cucascade::io::rest::rest_ioctx> rest_ioctx_for_list(std::string_view path);
 
   exec::query_lifecycle_registry& _query_lifecycle;
   scan_manager_config _config;
@@ -1092,7 +1138,10 @@ class sirius_scan_manager {
   // Threads start only when an attempt first admits native readers.
   native_reader_executor _native_readers;
   coordinator_pool _coordinators;
-  std::shared_ptr<sirius::io::ioctx> _io_ctx;
+  std::shared_ptr<cucascade::io::ioctx> _io_ctx;
+  /// `[uring_gauges]` DEBUG sampler of `_io_ctx` when it is a uring ioctx (null
+  /// otherwise).  Stopped in @ref stop, before any ioctx is released.
+  std::unique_ptr<uring_gauges_sampler> _uring_gauges_sampler;
   /// Lazily-built per-backend ioctxs for path-routed datasources (e.g. an s3://
   /// REST or kvikIO context alongside the local `_io_ctx`). Contexts are keyed
   /// by the immutable resolved-config snapshot, not merely by backend type, so
@@ -1104,20 +1153,26 @@ class sirius_scan_manager {
   mutable std::mutex _routed_io_ctxs_mtx;
   sirius::io::scoped_object_store_configs _s3_configs;
   struct routed_ioctx_key {
-    sirius::io::io_context_type type;
+    cucascade::io::io_context_type type;
     std::uint64_t config_id;
     bool operator==(routed_ioctx_key const&) const = default;
   };
   struct routed_ioctx_key_hash {
     std::size_t operator()(routed_ioctx_key const& key) const noexcept
     {
-      auto const type_hash = std::hash<sirius::io::io_context_type>{}(key.type);
+      auto const type_hash = std::hash<cucascade::io::io_context_type>{}(key.type);
       auto const id_hash   = std::hash<std::uint64_t>{}(key.config_id);
       return type_hash ^ (id_hash + 0x9e3779b9 + (type_hash << 6) + (type_hash >> 2));
     }
   };
-  std::unordered_map<routed_ioctx_key, std::shared_ptr<sirius::io::ioctx>, routed_ioctx_key_hash>
+  std::unordered_map<routed_ioctx_key, std::shared_ptr<cucascade::io::ioctx>, routed_ioctx_key_hash>
     _routed_io_ctxs;
+  /// Backends that failed to build, keyed like `_routed_io_ctxs`, so a path routed
+  /// to one does not re-run its factory (and repeat the explanation) on every
+  /// lookup.  A config snapshot is immutable, so a retry with the same key could
+  /// only fail the same way; installing a new S3 secret yields a new key.
+  /// Guarded by `_routed_io_ctxs_build_mtx`.
+  std::unordered_set<routed_ioctx_key, routed_ioctx_key_hash> _unavailable_io_ctxs;
   /// The pin table. Shared across every query and outliving all of them, so entries are
   /// held by shared_ptr rather than by value: a matched scan takes a reference for its
   /// whole duration, and an unpin from another connection drops only the map slot, leaving
@@ -1156,7 +1211,7 @@ class sirius_scan_manager {
   /// Datasources retained by @ref pin_parquet_ranges, keyed by pin name. Holding
   /// them is the pin: each owns the cache_handle whose live consumer keeps
   /// its chunks out of the evictor's reach.
-  std::unordered_map<std::string, std::vector<std::shared_ptr<sirius::io::sirius_datasource>>>
+  std::unordered_map<std::string, std::vector<std::shared_ptr<cucascade::io::datasource>>>
     _pinned_parquet_sources;
   /// Source of pin generations. Never 0 — that value means "invalidated", so
   /// an origin holding it can never resolve.
@@ -1189,7 +1244,7 @@ class sirius_scan_manager {
   mutable std::mutex _checkpoint_locks_mutex;
   std::atomic<std::shared_ptr<pipeline::completion_handler>> _execution_completion;
 
-  io::io_context_registry _ioctx_registry;
+  cucascade::io::io_context_registry _ioctx_registry;
 };
 
 }  // namespace sirius::scan_manager

@@ -17,11 +17,11 @@
 #pragma once
 
 #include "catch.hpp"
-#include "io/io_context.hpp"
-#include "io/rest/rest_ioctx.hpp"
-#include "io/sirius_datasource.hpp"
 #include "memory/topology_index.hpp"
 
+#include <cucascade/cudf/datasource.hpp>
+#include <cucascade/io/io_context.hpp>
+#include <cucascade/io/rest/rest_ioctx.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
 
 #include <cstdlib>
@@ -76,13 +76,13 @@ inline std::shared_ptr<const sirius::memory::topology_index> single_gpu_index(in
                                                           std::vector<int>{0});
 }
 
-inline sirius::io::rest::rest_ioctx* require_rest_ioctx(
-  std::shared_ptr<sirius::io::sirius_datasource> const& ds)
+inline cucascade::io::rest::rest_ioctx* require_rest_ioctx(
+  std::shared_ptr<cucascade::io::datasource> const& ds)
 {
   REQUIRE(ds != nullptr);
   REQUIRE(ds->io_ctx() != nullptr);
-  CHECK(ds->io_ctx()->type() == sirius::io::io_context_type::restful);
-  auto* rest_ctx = dynamic_cast<sirius::io::rest::rest_ioctx*>(ds->io_ctx().get());
+  CHECK(ds->io_ctx()->type() == cucascade::io::io_context_type::restful);
+  auto* rest_ctx = dynamic_cast<cucascade::io::rest::rest_ioctx*>(ds->io_ctx().get());
   REQUIRE(rest_ctx != nullptr);
   return rest_ctx;
 }

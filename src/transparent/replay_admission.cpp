@@ -16,10 +16,10 @@
 
 #include "transparent/replay_admission.hpp"
 
-#include "io/io_errors.hpp"
 #include "log/logging.hpp"
 #include "op/scan/table_scan/scan_contract.hpp"
 
+#include <cucascade/io/io_errors.hpp>
 #include <duckdb/common/exception.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/transaction/meta_transaction.hpp>
@@ -105,13 +105,13 @@ failure_cause classify_failure(std::exception_ptr error, late_failure_cause fall
     return {late_failure_cause::physical_input, e.what()};
   } catch (op::scan::certificate_incomplete const& e) {
     return {late_failure_cause::certificate, e.what()};
-  } catch (io::descriptor_mismatch_error const& e) {
+  } catch (cucascade::io::descriptor_mismatch_error const& e) {
     return {late_failure_cause::reader_io, e.what()};
   } catch (duckdb::IOException const& e) {
     return {late_failure_cause::reader_io, e.what()};
-  } catch (io::credential_error const& e) {
+  } catch (cucascade::io::credential_error const& e) {
     return {late_failure_cause::reader_io, e.what()};
-  } catch (io::object_changed_error const& e) {
+  } catch (cucascade::io::object_changed_error const& e) {
     return {late_failure_cause::object_changed, e.what()};
   } catch (std::exception const& e) {
     return {fallback, e.what()};
