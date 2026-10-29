@@ -323,6 +323,15 @@ TEST_CASE("prefetch completing a subset retains the ticket for a demand-owned ch
   complete_success(*demand_io);
   REQUIRE(read.wait_for(2s) == std::future_status::ready);
   CHECK(read.get() == read_size);
+  if (device_read) {
+    std::vector<std::uint8_t> copied(read_size);
+    REQUIRE(
+      cudaMemcpy(copied.data(), device_destination.data(), read_size, cudaMemcpyDeviceToHost) ==
+      cudaSuccess);
+    CHECK(std::ranges::all_of(copied, [](auto b) { return b == 0x5a; }));
+  } else {
+    CHECK(std::ranges::all_of(destination, [](auto b) { return b == 0x5a; }));
+  }
   CHECK(budget->active(backend) == 1);
   query.update(split, readahead_query::stage::disposed);
   query.update(split, readahead_query::stage::disposed);

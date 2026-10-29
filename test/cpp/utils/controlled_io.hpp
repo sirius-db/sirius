@@ -23,6 +23,8 @@
 // was queued, so a test can pause issue before its fan-in guard drops, or complete the request
 // inline.
 
+#include <cuda_runtime_api.h>
+
 #include <cucascade/io/byte_range.hpp>
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/io_request.hpp>
@@ -226,6 +228,18 @@ inline void complete_success(cucascade::io::grouped_io_request& request, std::ui
         if (source_offset >= slice.size() || chunk_offset >= chunk_size) { continue; }
         auto const bytes = std::min(slice.size() - source_offset, chunk_size - chunk_offset);
         std::fill_n(chunk->data + chunk_offset, bytes, value);
+      }
+    }
+    if (slice.has_device_request()) {
+      std::vector<std::uint8_t> const bytes(slice.size(), value);
+      auto const stream = slice.d_buffer.stream.get();
+      if (cudaMemcpyAsync(
+            slice.d_buffer.data, bytes.data(), bytes.size(), cudaMemcpyHostToDevice, stream) !=
+            cudaSuccess ||
+          cudaStreamSynchronize(stream) != cudaSuccess) {
+        if (slice.on_complete) { (*slice.on_complete)(slice.h_buffer.fragments(), false); }
+        request.coordinator->report_error(std::make_error_code(std::errc::io_error));
+        continue;
       }
     }
     if (slice.on_complete) { (*slice.on_complete)(slice.h_buffer.fragments(), true); }
