@@ -219,9 +219,9 @@ Implements LIMIT/OFFSET using atomic counters for parallel execution.
 
 Repeats each input row by a count column, then drops that column. The count is always the last input column; row `i` appears `count[i]` times, copies adjacent, in input order. The operator does not know what the count means. Today only the `EXCEPT ALL` / `INTERSECT ALL` lowering builds it (see [set operation planning](physical-plan-generation.md#set-operation-planning)).
 
-- **GPU execution:** two passes per input batch in `gpu_replicate_impl` (`src/op/replicate/gpu_replicate_impl.cu`). `plan_slices` takes an `INT64` prefix sum of the counts and a byte prefix weighted by `cudf::row_bit_count`, then cuts the output into slices of at most `max_rows` rows and at most `max_bytes` bytes plus one row. `materialize` copies one slice with one `cudf::repeat` call. `cudf::repeat` sums its counts in 32 bits without checking, so planning in 64 bits and capping a slice at `INT32_MAX` rows keeps every call exact.
+- **GPU execution:** `plan_slices` in `gpu_replicate_impl` (`src/op/replicate/gpu_replicate_impl.cu`) takes an `INT64` prefix sum of the counts and, when byte accounting is enabled, a byte prefix weighted by `cudf::row_bit_count`. It limits each slice to `max_rows` rows and uses `max_bytes` as a byte target, which the final row may cross. `materialize` searches the count prefix for each output position to build a gather map, then copies the slice with `cudf::gather`. The planner limits each slice to `INT32_MAX` rows.
 - **Output batches:** one per slice, on the input batch's memory space. An input with no copies gives one empty batch, so downstream operators still see the schema.
-- **Key members:** `_output_limits` (`gpu_replicate_impl::limits`). The planner sets `max_rows` to `INT32_MAX` and `max_bytes` to `concat_batch_bytes`, reading 0 as no cap (`SIZE_MAX`).
+- **Key members:** `_output_limits` (`gpu_replicate_impl::limits`). The planner sets `max_rows` to `INT32_MAX` and `max_bytes` to the `concat_batch_bytes` target, reading 0 as no byte accounting (`SIZE_MAX`).
 - **Errors:** a null or negative count, a non-integer count column, or a batch of the wrong width throws `sirius::internal_exception`. These are planner bugs, not reasons to fall back.
 - **Memory:** one `execute` holds the whole expansion of its input batches, so the limits shape output batches but do not bound peak memory. A key with very many copies is still one task.
 
@@ -608,7 +608,7 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 | FILTER | Relational | `expression_evaluator::select()` |
 | PROJECTION | Relational | `expression_evaluator::evaluate()` |
 | STREAMING_LIMIT | Relational | Atomic claim-based |
-| REPLICATE | Relational | `gpu_replicate_impl::plan_slices()` + `materialize()`; one `cudf::repeat` per output batch |
+| REPLICATE | Relational | `gpu_replicate_impl::plan_slices()` + `materialize()`; one `cudf::gather` per output batch |
 | ORDER_BY | Sort | `gpu_order_impl::local_order_by()` |
 | TOP_N | Sort | Order + limit |
 | SORT_SAMPLE | Sort | Sample + boundary computation |

@@ -27,6 +27,7 @@
 #include "op/sirius_physical_union.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
+#include "sirius/exception.hpp"
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
 
@@ -47,7 +48,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalSetOperation& op)
     case duckdb::LogicalOperatorType::LOGICAL_UNION: return plan_union(op);
     case duckdb::LogicalOperatorType::LOGICAL_EXCEPT:
     case duckdb::LogicalOperatorType::LOGICAL_INTERSECT: return plan_except_intersect(op);
-    default: throw duckdb::InternalException("Unrecognized operator type for LogicalSetOperation");
+    default: throw sirius::internal_exception("Unrecognized operator type for LogicalSetOperation");
   }
 }
 
@@ -121,7 +122,7 @@ std::string_view set_operation_keyword(duckdb::LogicalOperatorType type)
   switch (type) {
     case duckdb::LogicalOperatorType::LOGICAL_EXCEPT: return "EXCEPT";
     case duckdb::LogicalOperatorType::LOGICAL_INTERSECT: return "INTERSECT";
-    default: throw duckdb::InternalException("Unrecognized filtering set operation type");
+    default: throw sirius::internal_exception("Unrecognized filtering set operation type");
   }
 }
 
@@ -148,11 +149,11 @@ duckdb::vector<sirius::logical_type> reconcile_input_types(
   };
   for (duckdb::idx_t arm = 0; arm < arms.size(); ++arm) {
     if (planned_types(arm).size() != declared_types.size()) {
-      throw duckdb::NotImplementedException("%s input %d is planned with %d columns, not %d",
-                                            name,
-                                            arm,
-                                            static_cast<duckdb::idx_t>(planned_types(arm).size()),
-                                            static_cast<duckdb::idx_t>(declared_types.size()));
+      throw sirius::not_implemented_exception("{} input {} is planned with {} columns, not {}",
+                                              name,
+                                              arm,
+                                              static_cast<duckdb::idx_t>(planned_types(arm).size()),
+                                              static_cast<duckdb::idx_t>(declared_types.size()));
     }
   }
   duckdb::vector<sirius::logical_type> key_types;
@@ -163,20 +164,20 @@ duckdb::vector<sirius::logical_type> reconcile_input_types(
     for (duckdb::idx_t arm = 0; arm < arms.size(); ++arm) {
       auto const& planned = planned_types(arm)[i];
       if (planned != declared && planned != narrowed) {
-        throw duckdb::NotImplementedException("%s input %d plans column %d as %s, not %s",
-                                              name,
-                                              arm,
-                                              i,
-                                              planned.to_string(),
-                                              declared.to_string());
+        throw sirius::not_implemented_exception("{} input {} plans column {} as {}, not {}",
+                                                name,
+                                                arm,
+                                                i,
+                                                planned.to_string(),
+                                                declared.to_string());
       }
     }
     if (planned_types(0)[i] != planned_types(1)[i]) {
-      throw duckdb::NotImplementedException("%s inputs plan column %d as %s and %s",
-                                            name,
-                                            i,
-                                            planned_types(0)[i].to_string(),
-                                            planned_types(1)[i].to_string());
+      throw sirius::not_implemented_exception("{} inputs plan column {} as {} and {}",
+                                              name,
+                                              i,
+                                              planned_types(0)[i].to_string(),
+                                              planned_types(1)[i].to_string());
     }
     key_types.push_back(planned_types(0)[i]);
   }
@@ -206,7 +207,7 @@ std::vector<std::int8_t> input_tags(duckdb::LogicalOperatorType op_type, std::si
       return {left ? std::int8_t{1} : std::int8_t{-1}};
     case duckdb::LogicalOperatorType::LOGICAL_INTERSECT:
       return {left ? std::int8_t{1} : std::int8_t{0}, left ? std::int8_t{0} : std::int8_t{1}};
-    default: throw duckdb::InternalException("Unrecognized filtering set operation type");
+    default: throw sirius::internal_exception("Unrecognized filtering set operation type");
   }
 }
 
@@ -248,7 +249,7 @@ std::unique_ptr<sirius::ast::node> copy_count(duckdb::LogicalOperatorType op_typ
                         std::make_unique<sirius::ast::node>(
                           sirius::ast::constant{sirius::value{std::int64_t{0}}, bigint}));
     case duckdb::LogicalOperatorType::LOGICAL_INTERSECT: return lesser_of(sum(0), sum(1));
-    default: throw duckdb::InternalException("Unrecognized filtering set operation type");
+    default: throw sirius::internal_exception("Unrecognized filtering set operation type");
   }
 }
 
@@ -361,14 +362,14 @@ sirius_physical_plan_generator::plan_except_intersect(duckdb::LogicalSetOperatio
   auto const keyword = set_operation_keyword(op.type);
   // The distinct forms need a DISTINCT above a semi / anti join; only the ALL forms lower here.
   if (!op.setop_all) {
-    throw duckdb::NotImplementedException("%s (distinct) not supported on the GPU path",
-                                          std::string{keyword});
+    throw sirius::not_implemented_exception("{} (distinct) not supported on the GPU path",
+                                            std::string{keyword});
   }
   std::string const name = std::string{keyword} + " ALL";
 
   D_ASSERT(op.children.size() == 2);
   if (op.children.size() != 2) {
-    throw duckdb::NotImplementedException("%s requires exactly two inputs", name);
+    throw sirius::not_implemented_exception("{} requires exactly two inputs", name);
   }
 
   for (duckdb::idx_t i = 0; i < op.types.size(); ++i) {
@@ -376,8 +377,8 @@ sirius_physical_plan_generator::plan_except_intersect(duckdb::LogicalSetOperatio
     // DuckDB compares such a key through its collation or normalization; the GPU would compare raw
     // values.
     if (key_needs_collation(context, op.types[i], i)) {
-      throw duckdb::NotImplementedException(
-        "%s on column %d (%s): keys DuckDB compares through a collation or normalization not "
+      throw sirius::not_implemented_exception(
+        "{} on column {} ({}): keys DuckDB compares through a collation or normalization not "
         "supported on the GPU path",
         name,
         i,
@@ -386,8 +387,8 @@ sirius_physical_plan_generator::plan_except_intersect(duckdb::LogicalSetOperatio
     // A group keeps one of its -0.0 / +0.0 rows; DuckDB's ALL forms return the input's own rows.
     auto const type_id = op.types[i].id();
     if (type_id == duckdb::LogicalTypeId::FLOAT || type_id == duckdb::LogicalTypeId::DOUBLE) {
-      throw duckdb::NotImplementedException(
-        "%s on column %d (%s): floating-point keys not supported on the GPU path",
+      throw sirius::not_implemented_exception(
+        "{} on column {} ({}): floating-point keys not supported on the GPU path",
         name,
         i,
         op.types[i].ToString());

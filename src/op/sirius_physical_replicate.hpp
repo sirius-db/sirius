@@ -27,28 +27,38 @@
 namespace sirius {
 namespace op {
 
-//! Repeats each input row by a count column and drops that column. Input batches are the output
-//! columns followed by the count column, which must be last. Row `i` of an input batch appears
-//! `count[i]` times, copies adjacent, in input order. Streaming and stateless, like `FILTER`: it
-//! knows nothing of what the count means. A null or negative count is a planner bug and throws
-//! `sirius::internal_exception`. Each input batch becomes one or more output batches within
-//! `gpu_replicate_impl::limits`; one with no copies becomes one empty batch.
-//!
-//! One `execute` holds the whole expansion of its input batches in device memory, so the limits
-//! shape output batches but do not bound peak memory.
+/**
+ * @brief A physical operator that replicates rows based on a count column, dropping that column in
+ *        the process.
+ *
+ * The input batches are the output columns followed by the count column, which must be last. Row
+ * `i` of an input batch appears `count[i]` times in the output, with the copies adjacent and in
+ * input order. Each input batch becomes one or more output batches within @c
+ * gpu_replicate_impl::limits. One @c execute holds the whole expansion of its input batches in
+ * device memory, so the limits shape output batches but do not bound peak memory.
+ */
 class sirius_physical_replicate : public sirius_physical_operator {
  public:
   static constexpr SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::REPLICATE;
 
-  //! @throws sirius::internal_exception if @p types is empty or a limit in @p output_limits is not
-  //! positive.
-  //!
-  //! @param types  Output schema: the input schema without the count column.
+  /**
+   * @brief Construct a new sirius_physical_replicate object.
+   *
+   * @param types The types of the output columns (the input schema without the count column).
+   * @param output_limits The limits for the output batches.
+   * @param estimated_cardinality The estimated cardinality of the output.
+   * @throws sirius::internal_exception if @p types is empty or a limit in @p output_limits is not
+   *         positive.
+   */
   sirius_physical_replicate(duckdb::vector<sirius::logical_type> types,
                             gpu_replicate_impl::limits output_limits,
                             std::size_t estimated_cardinality);
 
-  //! Caps on each output batch.
+  /**
+   * @brief Get the output limits (maximum rows, maximum bytes) set for this operator.
+   *
+   * @return The output limits.
+   */
   [[nodiscard]] gpu_replicate_impl::limits const& output_limits() const noexcept
   {
     return _output_limits;
@@ -60,7 +70,7 @@ class sirius_physical_replicate : public sirius_physical_operator {
                                          ::cuda::stream_ref stream) override;
 
  private:
-  gpu_replicate_impl::limits _output_limits;
+  gpu_replicate_impl::limits _output_limits;  ///< Caps on each output batch.
 };
 
 }  // namespace op

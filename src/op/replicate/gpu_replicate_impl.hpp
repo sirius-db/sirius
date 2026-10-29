@@ -32,20 +32,20 @@
 #include <vector>
 
 /**
- * @brief Device work behind `sirius_physical_replicate`
+ * @brief Device work behind @c sirius_physical_replicate
  *
- * Repeats each row of a table by a count column. `plan_slices` cuts the whole expansion into slices
- * of consecutive output rows before any row is copied, and `materialize` copies one slice. Output
- * row `j` is a copy of input row `i` when `S[i-1] <= j < S[i]`, where `S` is the inclusive `INT64`
- * prefix sum of the counts. Each `cudf::repeat` call covers one slice, so its unchecked 32-bit
- * count sum never overflows.
+ * Repeats each row of a table by a count column. @c plan_slices cuts the whole expansion into
+ * slices of consecutive output rows before any row is copied, and @c materialize copies one slice.
+ * Output row `j` is a copy of input row `i` when `S[i-1] <= j < S[i]`, where `S` is the inclusive
+ * prefix sum of the counts. @c materialize reuses that prefix to gather each output slice.
  */
 namespace sirius::op::gpu_replicate_impl {
 
 /**
  * @brief Caps on one output table
  *
- * Both caps are positive. A `max_bytes` past `INT64_MAX` acts as `INT64_MAX`.
+ * Both caps are positive. A @c max_bytes past @c INT64_MAX acts as @c INT64_MAX. Setting @c
+ * max_bytes to `SIZE_MAX` skips byte accounting.
  */
 struct limits {
   cudf::size_type max_rows;  ///< Rows per output table
@@ -54,7 +54,7 @@ struct limits {
 
 /**
  * @brief Output rows `[output_begin, output_end)` of the whole expansion, and the input rows
- * `[input_begin, input_end)` they copy
+ *        `[input_begin, input_end)` they copy
  */
 struct slice {
   std::int64_t output_begin;    ///< First output row
@@ -67,18 +67,20 @@ struct slice {
  * @brief The slices one input table expands into
  */
 struct plan {
-  std::unique_ptr<cudf::column> row_prefix;  ///< `S`, `INT64`, one row per input row
+  std::unique_ptr<cudf::column>
+    row_prefix;               ///< Inclusive prefix sum of the counts, one row per input row
   std::vector<slice> slices;  ///< Non-empty, in order, tiling `[0, S[last])`; empty if no copies
 };
 
 /**
  * @brief Cuts the expansion of @p data by @p counts into slices within @p caps
  *
- * A row's size is its `cudf::row_bit_count` in whole bytes, at least one. The sum over all rows of
- * `count * size` must fit in `INT64`; nothing checks it.
+ * Estimate each output copy's size by rounding its @c cudf::row_bit_count up to bytes, with a
+ * minimum of one byte. The total estimated bytes across all copies must fit in a signed 64-bit
+ * integer. Overflow is not checked.
  *
  * @throws sirius::internal_exception if @p counts is not an integer column, differs from @p data in
- * length, or has a null or a negative value
+ *         length, or has a null or a negative value
  * @throws sirius::internal_exception if a cap in @p caps is not positive
  *
  * @param data Rows to repeat
@@ -98,8 +100,8 @@ plan plan_slices(cudf::table_view const& data,
  * @brief Copies one slice of an expansion
  *
  * @param data The table @p expansion was planned for
- * @param expansion What `plan_slices` returned for @p data
- * @param part One of `expansion.slices`
+ * @param expansion What @c plan_slices returned for @p data
+ * @param part One of @c expansion.slices
  * @param stream CUDA stream for device work
  * @param mr Memory resource for the returned table and temporary device memory
  * @return Output rows `[part.output_begin, part.output_end)` of the expansion

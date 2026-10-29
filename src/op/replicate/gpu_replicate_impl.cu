@@ -19,7 +19,6 @@
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
-#include <cudf/filling.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/unary.hpp>
 #include <cudf/utilities/error.hpp>
@@ -30,6 +29,7 @@
 
 #include <cuda/std/algorithm>
 #include <cuda_runtime.h>
+#include <cuda_runtime_api.h>
 #include <thrust/binary_search.h>
 #include <thrust/execution_policy.h>
 #include <thrust/iterator/counting_iterator.h>
@@ -42,38 +42,40 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <limits>
 #include <span>
+#include <type_traits>
 #include <vector>
 
 namespace sirius::op::gpu_replicate_impl {
 
 namespace {
 
-//! Whole bytes of one copy of a row; at least one, so every copy advances the byte prefix.
-__device__ std::int64_t bytes_of(std::int32_t bits)
+/// @brief Whole bytes of one copy of a row; at least one, so every copy advances the byte prefix.
+__device__ __forceinline__ std::int64_t bytes_of(std::int32_t bits)
 {
-  return ::cuda::std::max(std::int64_t{1}, (std::int64_t{bits} + 7) / 8);
+  return ::cuda::std::max(std::int64_t{1}, ::cuda::ceil_div(static_cast<std::int64_t>(bits), 8));
 }
 
-//! Bytes of all copies of row `i`.
+/// @brief Bytes of all copies of row `i`.
 struct copies_bytes {
   std::int64_t const* counts;
   std::int32_t const* bits;
-  __device__ std::int64_t operator()(cudf::size_type i) const
+  __device__ __forceinline__ std::int64_t operator()(cudf::size_type i) const
   {
     return counts[i] * bytes_of(bits[i]);
   }
 };
 
-//! First output row whose first byte is at or past `k * max_bytes`, for `k >= 1`.
+/// @brief First output row whose first byte is at or past `k * max_bytes`, for `k >= 1`.
 struct byte_cut {
   std::int64_t const* row_prefix;
   std::int64_t const* byte_prefix;
   std::int32_t const* bits;
   cudf::size_type rows;
   std::int64_t max_bytes;
-  __device__ std::int64_t operator()(std::int64_t k) const
+  __device__ __forceinline__ std::int64_t operator()(std::int64_t k) const
   {
     auto const target = k * max_bytes;
     // The callers keep `target` below the total bytes, so some row's copies span it.
@@ -82,15 +84,16 @@ struct byte_cut {
     auto const rows_before  = row == 0 ? std::int64_t{0} : row_prefix[row - 1];
     auto const bytes_before = row == 0 ? std::int64_t{0} : byte_prefix[row - 1];
     auto const row_bytes    = bytes_of(bits[row]);
-    return rows_before + (target - bytes_before + row_bytes - 1) / row_bytes;
+    return rows_before + ::cuda::ceil_div(target - bytes_before, row_bytes);
   }
 };
 
-//! Input row range `[input_begin, input_end)` holding output rows `[output_begin, output_end)`.
+/// @brief Computes the input row range `[input_begin, input_end)` holding output rows
+/// `[output_begin, output_end)`.
 struct input_rows {
   std::int64_t const* row_prefix;
   cudf::size_type rows;
-  __device__ thrust::pair<cudf::size_type, cudf::size_type> operator()(
+  __device__ __forceinline__ thrust::pair<cudf::size_type, cudf::size_type> operator()(
     thrust::pair<std::int64_t, std::int64_t> output_range) const
   {
     auto const* end  = row_prefix + rows;
@@ -101,18 +104,27 @@ struct input_rows {
   }
 };
 
-//! Copies of input row `input_begin + i` that fall in output rows `[output_begin, output_end)`.
-struct clipped_count {
+//! Emits a boundary only when its preceding output copy crosses a global byte
+//! target.
+template <typename Index>
+struct output_boundary_cut {
   std::int64_t const* row_prefix;
-  cudf::size_type input_begin;
-  std::int64_t output_begin;
-  std::int64_t output_end;
-  __device__ cudf::size_type operator()(cudf::size_type i) const
+  std::int64_t const* byte_prefix;
+  std::int32_t const* bits;
+  cudf::size_type rows;
+  std::int64_t max_bytes;
+
+  __device__ __forceinline__ Index operator()(std::int64_t boundary) const
   {
-    auto const row   = input_begin + i;
-    auto const start = row == 0 ? std::int64_t{0} : row_prefix[row - 1];
-    return static_cast<cudf::size_type>(::cuda::std::min(row_prefix[row], output_end) -
-                                        ::cuda::std::max(start, output_begin));
+    auto const previous = boundary - 1;
+    auto const row      = static_cast<cudf::size_type>(
+      thrust::upper_bound(thrust::seq, row_prefix, row_prefix + rows, previous) - row_prefix);
+    auto const rows_before  = row == 0 ? std::int64_t{0} : row_prefix[row - 1];
+    auto const bytes_before = row == 0 ? std::int64_t{0} : byte_prefix[row - 1];
+    auto const width        = bytes_of(bits[row]);
+    auto const start        = bytes_before + (previous - rows_before) * width;
+    bool const crosses      = width >= max_bytes || width >= max_bytes - start % max_bytes;
+    return crosses ? static_cast<Index>(boundary) : Index{0};
   }
 };
 
@@ -128,13 +140,43 @@ std::vector<T> to_host(rmm::device_uvector<T> const& values, ::cuda::stream_ref 
   return host;
 }
 
-//! Queues a copy of the last of the non-empty device array @p values into @p host.
+/// @brief Queues a copy of the last of the non-empty device array @p values into @p host.
 void copy_last_async(std::span<std::int64_t const> values,
                      std::int64_t& host,
                      ::cuda::stream_ref stream)
 {
   CUDF_CUDA_TRY(cudaMemcpyAsync(
     &host, values.data() + values.size() - 1, sizeof(host), cudaMemcpyDeviceToHost, stream.get()));
+}
+
+//! The caller selects an index width that can represent every interior output
+//! position.
+template <typename Index>
+std::vector<std::int64_t> output_boundary_cuts(std::int64_t const* row_prefix,
+                                               std::int64_t const* byte_prefix,
+                                               std::int32_t const* bits,
+                                               cudf::size_type rows,
+                                               std::int64_t total_rows,
+                                               std::int64_t max_bytes,
+                                               ::cuda::stream_ref stream,
+                                               rmm::device_async_resource_ref mr)
+{
+  if (total_rows == 1) { return {}; }
+  rmm::device_uvector<Index> device_cuts(total_rows - 1, stream, mr);
+  thrust::transform_n(rmm::exec_policy_nosync(stream, mr),
+                      thrust::counting_iterator<std::int64_t>(1),
+                      total_rows - 1,
+                      device_cuts.begin(),
+                      output_boundary_cut<Index>{row_prefix, byte_prefix, bits, rows, max_bytes});
+  auto selected = to_host(device_cuts, stream);
+  std::erase(selected, Index{0});
+  if constexpr (std::is_same_v<Index, std::int64_t>) {
+    return selected;
+  } else {
+    std::vector<std::int64_t> result(selected.size());
+    std::copy(selected.begin(), selected.end(), result.begin());
+    return result;
+  }
 }
 
 }  // namespace
@@ -155,7 +197,6 @@ plan plan_slices(cudf::table_view const& data,
   if (caps.max_rows <= 0 || caps.max_bytes == 0) {
     throw sirius::internal_exception("REPLICATE: output caps must be positive");
   }
-  // A CASE result can carry an all-valid mask, so the null count decides, not the mask.
   if (counts.null_count() > 0) {
     throw sirius::internal_exception("REPLICATE: the count column has {} nulls",
                                      counts.null_count());
@@ -168,6 +209,7 @@ plan plan_slices(cudf::table_view const& data,
 
   std::unique_ptr<cudf::column> widened;
   if (counts.type().id() != cudf::type_id::INT64) {
+    // EXCEPT/INTERSECT ALL carry INT64 count columns from the planner; this is for generality.
     widened = cudf::cast(counts, cudf::data_type{cudf::type_id::INT64}, stream, mr);
   }
   auto const* counts64 =
@@ -180,17 +222,24 @@ plan plan_slices(cudf::table_view const& data,
 
   auto* const row_prefix_data = row_prefix->mutable_view().data<std::int64_t>();
   thrust::inclusive_scan(policy, counts64, counts64 + rows, row_prefix_data);
-  auto const bit_counts = cudf::row_bit_count(data, stream, mr);
-  auto const* bits      = bit_counts->view().data<std::int32_t>();
-  rmm::device_uvector<std::int64_t> byte_prefix(rows, stream, mr);
-  auto const copies_bytes_it = thrust::make_transform_iterator(
-    thrust::counting_iterator<cudf::size_type>(0), copies_bytes{counts64, bits});
-  thrust::inclusive_scan(policy, copies_bytes_it, copies_bytes_it + rows, byte_prefix.begin());
+  // Every row costs at least one byte, so a one-byte target is a one-row limit.
+  auto const limit_bytes =
+    caps.max_bytes != 1 && caps.max_bytes != std::numeric_limits<std::size_t>::max();
+  auto const bit_counts = limit_bytes ? cudf::row_bit_count(data, stream, mr) : nullptr;
+  auto const* bits      = bit_counts ? bit_counts->view().data<std::int32_t>() : nullptr;
+  rmm::device_uvector<std::int64_t> byte_prefix(limit_bytes ? rows : 0, stream, mr);
+  if (limit_bytes) {
+    auto const copies_bytes_it = thrust::make_transform_iterator(
+      thrust::counting_iterator<cudf::size_type>(0), copies_bytes{counts64, bits});
+    thrust::inclusive_scan(policy, copies_bytes_it, copies_bytes_it + rows, byte_prefix.begin());
+  }
 
   std::int64_t total_rows  = 0;
   std::int64_t total_bytes = 0;
   copy_last_async({row_prefix_data, static_cast<std::size_t>(rows)}, total_rows, stream);
-  copy_last_async({byte_prefix.data(), byte_prefix.size()}, total_bytes, stream);
+  if (limit_bytes) {
+    copy_last_async({byte_prefix.data(), byte_prefix.size()}, total_bytes, stream);
+  }
   stream.sync();
   if (total_rows == 0) { return {std::move(row_prefix), {}}; }
 
@@ -199,22 +248,57 @@ plan plan_slices(cudf::table_view const& data,
   // The byte total fits in INT64, so a larger cap acts as INT64_MAX.
   auto const max_bytes = static_cast<std::int64_t>(
     std::min<std::size_t>(caps.max_bytes, std::numeric_limits<std::int64_t>::max()));
-  auto const byte_cut_count = (total_bytes - 1) / max_bytes;
-  rmm::device_uvector<std::int64_t> device_byte_cuts(byte_cut_count, stream, mr);
-  thrust::transform(policy,
-                    thrust::counting_iterator<std::int64_t>(1),
-                    thrust::counting_iterator<std::int64_t>(byte_cut_count + 1),
-                    device_byte_cuts.begin(),
-                    byte_cut{row_prefix_data, byte_prefix.data(), bits, rows, max_bytes});
-  auto cuts = to_host(device_byte_cuts, stream);
-  for (std::int64_t cut = caps.max_rows; cut < total_rows; cut += caps.max_rows) {
-    cuts.push_back(cut);
+  auto const row_limit = caps.max_bytes == 1 ? cudf::size_type{1} : caps.max_rows;
+  std::vector<std::int64_t> cuts;
+  rmm::device_uvector<std::int64_t> device_byte_cuts(0, stream, mr);
+  // Enumerate the smaller space: byte thresholds or interior output-row positions.
+  if (limit_bytes && (total_bytes - 1) / max_bytes > total_rows - 1) {
+    if (total_rows - 1 <= std::numeric_limits<std::int32_t>::max()) {
+      cuts = output_boundary_cuts<std::int32_t>(
+        row_prefix_data, byte_prefix.data(), bits, rows, total_rows, max_bytes, stream, mr);
+    } else {
+      cuts = output_boundary_cuts<std::int64_t>(
+        row_prefix_data, byte_prefix.data(), bits, rows, total_rows, max_bytes, stream, mr);
+    }
+    std::vector<std::int64_t> row_cuts{0};
+    for (std::int64_t cut = row_limit; cut < total_rows; cut += row_limit) {
+      row_cuts.push_back(cut);
+    }
+    row_cuts.push_back(total_rows);
+    std::vector<std::int64_t> merged;
+    merged.reserve(cuts.size() + row_cuts.size());
+    std::merge(
+      cuts.begin(), cuts.end(), row_cuts.begin(), row_cuts.end(), std::back_inserter(merged));
+    auto const duplicates = std::ranges::unique(merged);
+    merged.erase(duplicates.begin(), duplicates.end());
+    cuts = std::move(merged);
+  } else {
+    auto const byte_cut_count = limit_bytes ? (total_bytes - 1) / max_bytes : 0;
+    device_byte_cuts.resize(byte_cut_count, stream);
+    thrust::transform_n(policy,
+                        thrust::counting_iterator<std::int64_t>(1),
+                        byte_cut_count,
+                        device_byte_cuts.begin(),
+                        byte_cut{row_prefix_data, byte_prefix.data(), bits, rows, max_bytes});
+    cuts = to_host(device_byte_cuts, stream);
+    for (std::int64_t cut = row_limit; cut < total_rows; cut += row_limit) {
+      cuts.push_back(cut);
+    }
+    cuts.push_back(0);
+    cuts.push_back(total_rows);
+    std::ranges::sort(cuts);
+    auto const duplicates = std::ranges::unique(cuts);
+    cuts.erase(duplicates.begin(), duplicates.end());
   }
-  cuts.push_back(0);
-  cuts.push_back(total_rows);
-  std::ranges::sort(cuts);
-  auto const duplicates = std::ranges::unique(cuts);
-  cuts.erase(duplicates.begin(), duplicates.end());
+
+  if (rows == 1) {
+    std::vector<slice> slices;
+    slices.reserve(cuts.size() - 1);
+    for (std::size_t s = 1; s < cuts.size(); ++s) {
+      slices.push_back({cuts[s - 1], cuts[s], 0, 1});
+    }
+    return {std::move(row_prefix), std::move(slices)};
+  }
 
   auto const slice_count = cuts.size() - 1;
   std::vector<thrust::pair<std::int64_t, std::int64_t>> output_ranges(slice_count);
@@ -254,20 +338,25 @@ std::unique_ptr<cudf::table> materialize(cudf::table_view const& data,
                                          ::cuda::stream_ref stream,
                                          rmm::device_async_resource_ref mr)
 {
-  auto const rows = part.input_end - part.input_begin;
-  rmm::device_uvector<cudf::size_type> counts(rows, stream, mr);
-  thrust::transform(rmm::exec_policy_nosync(stream, mr),
-                    thrust::counting_iterator<cudf::size_type>(0),
-                    thrust::counting_iterator<cudf::size_type>(rows),
-                    counts.begin(),
-                    clipped_count{expansion.row_prefix->view().data<std::int64_t>(),
-                                  part.input_begin,
-                                  part.output_begin,
-                                  part.output_end});
-  cudf::column_view const count_view{
-    cudf::data_type{cudf::type_id::INT32}, rows, counts.data(), nullptr, 0};
+  auto const rows        = static_cast<cudf::size_type>(part.output_end - part.output_begin);
+  auto const* row_prefix = expansion.row_prefix->view().data<std::int64_t>();
+  rmm::device_uvector<cudf::size_type> gather_map(rows, stream, mr);
+  // Search the slice's input rows so the map indexes rows_view, including runs split across slices.
+  thrust::upper_bound(rmm::exec_policy_nosync(stream, mr),
+                      row_prefix + part.input_begin,
+                      row_prefix + part.input_end,
+                      thrust::counting_iterator<std::int64_t>(part.output_begin),
+                      thrust::counting_iterator<std::int64_t>(part.output_end),
+                      gather_map.begin());
+  cudf::column_view const map_view{
+    cudf::data_type{cudf::type_id::INT32}, rows, gather_map.data(), nullptr, 0};
   auto const rows_view = cudf::slice(data, {part.input_begin, part.input_end}, stream).front();
-  return cudf::repeat(rows_view, count_view, stream, mr);
+  return cudf::gather(rows_view,
+                      map_view,
+                      cudf::out_of_bounds_policy::DONT_CHECK,
+                      cudf::negative_index_policy::NOT_ALLOWED,
+                      stream,
+                      mr);
 }
 
 }  // namespace sirius::op::gpu_replicate_impl

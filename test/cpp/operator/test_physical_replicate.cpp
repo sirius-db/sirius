@@ -25,9 +25,12 @@
 #include "operator_type_traits.hpp"
 
 #include <cudf/concatenate.hpp>
+#include <cudf/copying.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/utilities/error.hpp>
+
+#include <rmm/mr/statistics_resource_adaptor.hpp>
 
 #include <catch.hpp>
 #include <op/replicate/gpu_replicate_impl.hpp>
@@ -248,6 +251,58 @@ TEST_CASE("gpu_replicate_impl - a byte cap past INT64_MAX leaves only the row ca
         std::vector<std::int64_t>{10, 10, 10, 20, 20, 20, 20, 20});
 }
 
+TEST_CASE("gpu_replicate_impl - a sliced input materializes a small slice past INT32_MAX",
+          "[operator][replicate]")
+{
+  auto values = int64_column({99, 10, 20, 30, 40, 50, 99});
+  auto counts = int64_column({0, std::int64_t{1} << 31, 0, 3, 0, 2, 0});
+  auto const data =
+    cudf::slice(cudf::table_view{{values->view()}}, {1, 6}, default_stream()).front();
+  auto const count_view = cudf::slice(counts->view(), {1, 6}, default_stream()).front();
+  auto const expansion =
+    plan_of(data, count_view, {1 << 30, std::numeric_limits<std::size_t>::max()});
+
+  REQUIRE(expansion.slices.size() == 3);
+  auto const& part = expansion.slices.back();
+  REQUIRE(part.output_begin == std::int64_t{1} << 31);
+  REQUIRE(part.output_end - part.output_begin == 5);
+  CHECK(part.input_begin == 2);
+  CHECK(part.input_end == 5);
+
+  // Only the small final slice is materialized; the preceding rows remain a prefix count.
+  auto const output = replicate::materialize(
+    data, expansion, part, default_stream(), get_resource_ref(*get_default_gpu_space()));
+  CHECK(copy_column_to_host<std::int64_t>(output->get_column(0).view()) ==
+        std::vector<std::int64_t>{30, 30, 30, 50, 50});
+}
+
+TEST_CASE("gpu_replicate_impl - sliced nullable strings preserve split runs with no byte cap",
+          "[operator][replicate]")
+{
+  auto names = string_column({"prefix", "a", "bb", "ccc", "dddd", "eeeee", "suffix"});
+  auto mask  = cudf::create_null_mask(
+    7, cudf::mask_state::ALL_VALID, default_stream(), get_resource_ref(*get_default_gpu_space()));
+  cudf::set_null_mask(static_cast<cudf::bitmask_type*>(mask.data()), 3, 4, false, default_stream());
+  names->set_null_mask(std::move(mask), 1);
+  auto counts = int64_column({0, 0, 2, 3, 0, 1, 0});
+  auto const data =
+    cudf::slice(cudf::table_view{{names->view()}}, {1, 6}, default_stream()).front();
+  auto const count_view = cudf::slice(counts->view(), {1, 6}, default_stream()).front();
+  replicate::limits const caps{4, std::numeric_limits<std::size_t>::max()};
+  auto const expansion = plan_of(data, count_view, caps);
+  require_exact_tiling(expansion, {0, 2, 3, 0, 1}, row_bytes_of(data), caps);
+  auto const output  = materialize_all(data, expansion);
+  auto const& column = output->get_column(0);
+
+  REQUIRE(column.size() == 6);
+  CHECK(copy_validity_to_host(column.view()) ==
+        std::vector<bool>{true, true, false, false, false, true});
+  auto const strings = copy_column_to_host<std::string>(column.view());
+  CHECK(strings[0] == "bb");
+  CHECK(strings[1] == "bb");
+  CHECK(strings[5] == "eeeee");
+}
+
 TEST_CASE("gpu_replicate_impl - one count above the row cap splits that row",
           "[operator][replicate]")
 {
@@ -271,7 +326,8 @@ TEST_CASE("gpu_replicate_impl - one count above the row cap splits that row",
 
 TEST_CASE("gpu_replicate_impl - zero counts produce no slices", "[operator][replicate]")
 {
-  replicate::limits const caps{4, unbounded_bytes};
+  auto const max_bytes = GENERATE(unbounded_bytes, std::numeric_limits<std::size_t>::max());
+  replicate::limits const caps{4, max_bytes};
   SECTION("every count is zero")
   {
     auto data_column   = int64_column({1, 2, 3});
@@ -312,6 +368,50 @@ TEST_CASE("gpu_replicate_impl - a long string row is cut by bytes", "[operator][
   REQUIRE(first->num_rows() == 2);
   CHECK(copy_column_to_host<std::string>(first->get_column(0).view()) ==
         std::vector<std::string>(2, std::string(std::size_t{1} << 20, 'x')));
+}
+
+TEST_CASE("gpu_replicate_impl - wide rows avoid redundant byte-cut scratch",
+          "[operator][replicate]")
+{
+  auto const max_bytes      = GENERATE(std::size_t{1}, std::size_t{31});
+  std::int64_t const copies = max_bytes == 1 ? 1 : 4;
+  auto data_column          = string_column({std::string(std::size_t{1} << 20, 'x')});
+  auto counts_column        = int64_column({copies});
+  cudf::table_view const data{{data_column->view()}};
+  replicate::limits const caps{std::numeric_limits<cudf::size_type>::max(), max_bytes};
+  auto mr = get_resource_ref(*get_default_gpu_space());
+  rmm::mr::statistics_resource_adaptor stats{
+    cuda::mr::any_resource<cuda::mr::device_accessible>{mr}};
+
+  auto const expansion = replicate::plan_slices(
+    data, counts_column->view(), caps, default_stream(), rmm::device_async_resource_ref{stats});
+
+  REQUIRE(expansion.slices.size() == static_cast<std::size_t>(copies));
+  require_exact_tiling(expansion, {copies}, {(std::int64_t{1} << 20) + 4}, caps);
+  // Count planner allocations only; the string and counts were allocated before the adaptor.
+  CHECK(stats.get_bytes_counter().peak < (std::int64_t{1} << 20));
+}
+
+TEST_CASE("gpu_replicate_impl - adaptive byte cuts preserve mixed row widths and zero counts",
+          "[operator][replicate]")
+{
+  std::string const wide(120, 'x');
+  auto data_column   = string_column({"unused", "a", wide, "unused", "b"});
+  auto counts_column = int64_column({0, 2, 3, 0, 1});
+  cudf::table_view const data{{data_column->view()}};
+  replicate::limits const caps{3, 31};
+
+  auto const expansion = plan_of(data, counts_column->view(), caps);
+  require_exact_tiling(expansion, {0, 2, 3, 0, 1}, {10, 5, 124, 10, 5}, caps);
+  // Keep the global byte grid: the first slice contains both narrow copies and one wide copy.
+  std::vector<std::int64_t> ends;
+  for (auto const& part : expansion.slices) {
+    ends.push_back(part.output_end);
+  }
+  CHECK(ends == std::vector<std::int64_t>{3, 4, 5, 6});
+  auto const output = materialize_all(data, expansion);
+  CHECK(copy_column_to_host<std::string>(output->get_column(0).view()) ==
+        std::vector<std::string>{"a", "a", wide, wide, wide, "b"});
 }
 
 TEST_CASE("gpu_replicate_impl - slices concatenate to the whole expansion", "[operator][replicate]")
