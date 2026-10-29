@@ -79,8 +79,9 @@ __global__ void split_halves_kernel(std::int64_t const* input,
                                     std::int64_t* low,
                                     cudf::size_type rows)
 {
-  auto const stride = static_cast<cudf::size_type>(blockDim.x * gridDim.x);
-  for (auto i = static_cast<cudf::size_type>(blockIdx.x * blockDim.x + threadIdx.x); i < rows;
+  // 64-bit, so the last stride past a row count near INT32_MAX cannot overflow.
+  auto const stride = static_cast<std::int64_t>(blockDim.x) * gridDim.x;
+  for (auto i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < rows;
        i += stride) {
     auto const value = input[i];
     high[i]          = value >> 32;
@@ -94,8 +95,8 @@ __global__ void combine_halves_kernel(std::int64_t const* high,
                                       __int128_t* out,
                                       cudf::size_type rows)
 {
-  auto const stride = static_cast<cudf::size_type>(blockDim.x * gridDim.x);
-  for (auto i = static_cast<cudf::size_type>(blockIdx.x * blockDim.x + threadIdx.x); i < rows;
+  auto const stride = static_cast<std::int64_t>(blockDim.x) * gridDim.x;
+  for (auto i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < rows;
        i += stride) {
     out[i] = (static_cast<__int128_t>(high[i]) << 32) + low[i];
   }
