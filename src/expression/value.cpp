@@ -16,6 +16,7 @@
 
 #include "expression/value.hpp"
 
+#include "helper/hugeint.hpp"
 #include "helper/type_conversions.hpp"
 #include "sirius/exception.hpp"
 
@@ -46,11 +47,9 @@ value from_duckdb(const duckdb::Value& v, const logical_type& type)
     case type_id::SMALLINT: return value{v.GetValue<int16_t>()};
     case type_id::INTEGER: return value{v.GetValue<int32_t>()};
     case type_id::BIGINT: return value{v.GetValue<int64_t>()};
-    case type_id::HUGEINT: {
+    case type_id::HUGEINT:
       // An exact 128-bit integer: DECIMAL128 with scale 0, as on the GPU.
-      auto const hi = v.GetValueUnsafe<duckdb::hugeint_t>();
-      return value{decimal128{(static_cast<__int128_t>(hi.upper) << 64) | hi.lower, 0}};
-    }
+      return value{decimal128{to_int128(v.GetValueUnsafe<duckdb::hugeint_t>()), 0}};
     case type_id::UTINYINT: return value{v.GetValue<uint8_t>()};
     case type_id::USMALLINT: return value{v.GetValue<uint16_t>()};
     case type_id::UINTEGER: return value{v.GetValue<uint32_t>()};
@@ -90,10 +89,7 @@ value from_duckdb(const duckdb::Value& v, const logical_type& type)
       if (precision <= logical_type::decimal_max_precision_int64) {
         return value{decimal64{v.GetValueUnsafe<int64_t>(), scale}};
       }
-      // DECIMAL128 unpack — mirror constant.cpp:162-163 EXACTLY.
-      auto const hi  = v.GetValueUnsafe<duckdb::hugeint_t>();
-      auto const rep = (static_cast<__int128_t>(hi.upper) << 64) | hi.lower;
-      return value{decimal128{rep, scale}};
+      return value{decimal128{to_int128(v.GetValueUnsafe<duckdb::hugeint_t>()), scale}};
     }
     default:
       throw not_implemented_exception("sirius::from_duckdb: unsupported type {}", type.to_string());
@@ -113,11 +109,7 @@ duckdb::Value to_duckdb(const value& v, const logical_type& type)
     case type_id::SMALLINT: return duckdb::Value::SMALLINT(std::get<int16_t>(v));
     case type_id::INTEGER: return duckdb::Value::INTEGER(std::get<int32_t>(v));
     case type_id::BIGINT: return duckdb::Value::BIGINT(std::get<int64_t>(v));
-    case type_id::HUGEINT: {
-      auto const& d = std::get<decimal128>(v);
-      return duckdb::Value::HUGEINT(
-        duckdb::hugeint_t{static_cast<int64_t>(d.value >> 64), static_cast<uint64_t>(d.value)});
-    }
+    case type_id::HUGEINT: return duckdb::Value::HUGEINT(to_hugeint(std::get<decimal128>(v).value));
     case type_id::UTINYINT: return duckdb::Value::UTINYINT(std::get<uint8_t>(v));
     case type_id::USMALLINT: return duckdb::Value::USMALLINT(std::get<uint16_t>(v));
     case type_id::UINTEGER: return duckdb::Value::UINTEGER(std::get<uint32_t>(v));
@@ -154,10 +146,7 @@ duckdb::Value to_duckdb(const value& v, const logical_type& type)
         auto const& d = std::get<decimal64>(v);
         return duckdb::Value::DECIMAL(d.value, precision, scale);
       }
-      // DECIMAL128 — repack into duckdb::hugeint_t (reverse of from_duckdb).
-      auto const& d = std::get<decimal128>(v);
-      duckdb::hugeint_t hi{static_cast<int64_t>(d.value >> 64), static_cast<uint64_t>(d.value)};
-      return duckdb::Value::DECIMAL(hi, precision, scale);
+      return duckdb::Value::DECIMAL(to_hugeint(std::get<decimal128>(v).value), precision, scale);
     }
     default:
       throw not_implemented_exception("sirius::to_duckdb: unsupported type {}", type.to_string());

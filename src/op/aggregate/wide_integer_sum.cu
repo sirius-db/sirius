@@ -88,7 +88,7 @@ __global__ void split_halves_kernel(std::int64_t const* input,
   }
 }
 
-/// out[i] = high[i] * 2^32 + low[i] in 128 bits. The product cannot overflow: |high| < 2^63.
+/// out[i] = high[i] * 2^32 + low[i] in 128 bits; |high| < 2^63, so the shift cannot overflow.
 __global__ void combine_halves_kernel(std::int64_t const* high,
                                       std::int64_t const* low,
                                       __int128_t* out,
@@ -97,7 +97,7 @@ __global__ void combine_halves_kernel(std::int64_t const* high,
   auto const stride = static_cast<cudf::size_type>(blockDim.x * gridDim.x);
   for (auto i = static_cast<cudf::size_type>(blockIdx.x * blockDim.x + threadIdx.x); i < rows;
        i += stride) {
-    out[i] = static_cast<__int128_t>(high[i]) * (__int128_t{1} << 32) + low[i];
+    out[i] = (static_cast<__int128_t>(high[i]) << 32) + low[i];
   }
 }
 

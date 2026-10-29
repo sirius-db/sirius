@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "cudf/hugeint_carrier.hpp"
+
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_view.hpp>
 #include <cudf/types.hpp>
@@ -30,11 +32,8 @@
 namespace sirius::op {
 
 /// The type a wide integer SUM (see is_wide_integer_sum) is accumulated in when INT64 could
-/// overflow: DECIMAL128 with scale 0, an exact 128-bit integer.
-inline cudf::data_type wide_integer_sum_type()
-{
-  return cudf::data_type{cudf::type_id::DECIMAL128, 0};
-}
+/// overflow: HUGEINT's carrier, an exact 128-bit integer.
+inline cudf::data_type wide_integer_sum_type() { return hugeint_carrier_type(); }
 
 /**
  * @brief The exact sum of the valid values of @p input, accumulated in 128 bits in one pass.

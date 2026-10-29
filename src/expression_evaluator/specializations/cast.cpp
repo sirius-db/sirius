@@ -56,7 +56,7 @@ cudf::ast::ast_operator cast_op_to_ast(sirius::type_id id)
 }
 
 // Largest power of ten an int128 holds is 10^38.
-__int128_t power_of_ten(int32_t exponent)
+constexpr __int128_t power_of_ten(int32_t exponent)
 {
   __int128_t result = 1;
   for (int32_t i = 0; i < exponent; ++i) {

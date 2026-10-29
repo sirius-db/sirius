@@ -17,6 +17,8 @@
 #pragma once
 
 #include "cudf/ast_compat.hpp"
+#include "cudf/hugeint_carrier.hpp"
+#include "helper/hugeint.hpp"
 #include "helper/logical_type.hpp"
 
 #include <cudf/aggregation.hpp>
@@ -212,9 +214,7 @@ inline std::size_t estimate_referenced_column_bytes(
     case type_id::SMALLINT: return cudf::data_type(cudf::type_id::INT16);
     case type_id::INTEGER: return cudf::data_type(cudf::type_id::INT32);
     case type_id::BIGINT: return cudf::data_type(cudf::type_id::INT64);
-    // cuDF has no INT128; DECIMAL128 with scale 0 is an exact 128-bit integer laid out like
-    // duckdb::hugeint_t.
-    case type_id::HUGEINT: return cudf::data_type(cudf::type_id::DECIMAL128, 0);
+    case type_id::HUGEINT: return hugeint_carrier_type();
     case type_id::UTINYINT: return cudf::data_type(cudf::type_id::UINT8);
     case type_id::USMALLINT: return cudf::data_type(cudf::type_id::UINT16);
     case type_id::UINTEGER: return cudf::data_type(cudf::type_id::UINT32);
@@ -312,9 +312,8 @@ inline std::size_t estimate_referenced_column_bytes(
         stream);
     case cudf::type_id::DECIMAL128: {
       // HUGEINT and DECIMAL(19..38) both store a duckdb::hugeint_t.
-      auto const hi = val.GetValueUnsafe<duckdb::hugeint_t>();
       return std::make_unique<cudf::fixed_point_scalar<numeric::decimal128>>(
-        (static_cast<__int128_t>(hi.upper) << 64) | hi.lower,
+        to_int128(val.GetValueUnsafe<duckdb::hugeint_t>()),
         numeric::scale_type{cudf_type.scale()},
         true,
         stream);
@@ -397,8 +396,7 @@ inline std::unique_ptr<cudf::table> make_empty_table(const std::vector<cudf::dat
     case LogicalTypeId::SMALLINT: return cudf::data_type(cudf::type_id::INT16);
     case LogicalTypeId::INTEGER: return cudf::data_type(cudf::type_id::INT32);
     case LogicalTypeId::BIGINT: return cudf::data_type(cudf::type_id::INT64);
-    // An exact 128-bit integer laid out like duckdb::hugeint_t; cuDF has no INT128.
-    case LogicalTypeId::HUGEINT: return cudf::data_type(cudf::type_id::DECIMAL128, 0);
+    case LogicalTypeId::HUGEINT: return hugeint_carrier_type();
     case LogicalTypeId::UTINYINT: return cudf::data_type(cudf::type_id::UINT8);
     case LogicalTypeId::USMALLINT: return cudf::data_type(cudf::type_id::UINT16);
     case LogicalTypeId::UINTEGER: return cudf::data_type(cudf::type_id::UINT32);

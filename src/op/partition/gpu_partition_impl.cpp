@@ -16,6 +16,7 @@
 
 #include "op/partition/gpu_partition_impl.hpp"
 
+#include "cudf/hugeint_carrier.hpp"
 #include "data/data_batch_utils.hpp"
 #include "op/key_preparation.hpp"
 
@@ -60,7 +61,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::hash_par
       auto const key = input_table.column(partition_key_idx[i]);
       // A HUGEINT key (DECIMAL128, scale 0) hashes as its INT64 wrap, like a BIGINT key; that is
       // a hash-only conversion, not a carrier restore.
-      bool const hugeint_to_int64 = key.type() == cudf::data_type{cudf::type_id::DECIMAL128, 0} &&
+      bool const hugeint_to_int64 = key.type() == hugeint_carrier_type() &&
                                     partition_key_cast_types[i].id() == cudf::type_id::INT64;
       auto cast_col =
         hugeint_to_int64
