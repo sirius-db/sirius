@@ -127,15 +127,7 @@ std::size_t in_list::cudf_ast_op_count() const
 
 std::size_t function_call::cudf_ast_op_count() const
 {
-  if (date_operation().has_value()) { return 0; }
-  // Materialize every decimal or HUGEINT function: cuDF AST does not enforce DuckDB's result width
-  // and scale.
-  if (return_type().has_fixed_point_carrier() ||
-      std::ranges::any_of(arguments(), [](auto const& arg) {
-        return arg->return_type().has_fixed_point_carrier();
-      })) {
-    return 0;
-  }
+  if (date_operation().has_value() || has_fixed_point_operand(*this)) { return 0; }
   bool const supported =
     std::find(supported_ast_functions.begin(), supported_ast_functions.end(), function()) !=
     supported_ast_functions.end();

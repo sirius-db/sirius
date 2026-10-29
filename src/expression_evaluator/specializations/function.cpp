@@ -121,14 +121,10 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
   auto const resolved_id = alt.function();
   auto const& args       = alt.arguments();
 
-  // Materialize every decimal or HUGEINT function: cuDF AST does not enforce DuckDB's result width
-  // and scale. Standalone ASTs cannot implement DATE infinity and overflow checks.
+  // Standalone ASTs cannot implement DATE infinity and overflow checks.
   auto const date_operation = alt.date_operation();
-  auto const skip_ast = alt.return_type().has_fixed_point_carrier() || date_operation.has_value() ||
-                        std::ranges::any_of(args, [](auto const& arg) {
-                          return arg->return_type().has_fixed_point_carrier();
-                        });
-  auto const ast_supported = !skip_ast && std::find(supported_ast_functions.begin(),
+  auto const skip_ast       = date_operation.has_value() || has_fixed_point_operand(alt);
+  auto const ast_supported  = !skip_ast && std::find(supported_ast_functions.begin(),
                                                     supported_ast_functions.end(),
                                                     resolved_id) != supported_ast_functions.end();
 

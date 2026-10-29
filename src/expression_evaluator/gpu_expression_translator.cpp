@@ -713,12 +713,8 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
   // Standalone ASTs cannot implement DATE infinity and overflow checks.
   if (alt.date_operation().has_value()) { return std::nullopt; }
 
-  // Materialize every decimal or HUGEINT function: cuDF AST does not enforce DuckDB's result width
-  // and scale. Unsupported functions fall through to the default arm below.
-  if (std::ranges::any_of(
-        alt.arguments(),
-        [](auto const& arg) { return arg->return_type().has_fixed_point_carrier(); }) ||
-      alt.return_type().has_fixed_point_carrier()) {
+  // Unsupported functions fall through to the default arm below.
+  if (has_fixed_point_operand(alt)) {
     SIRIUS_LOG_DEBUG("[expression_translator] Blocking decimal function from AST");
     return std::nullopt;
   }

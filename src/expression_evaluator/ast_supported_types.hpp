@@ -17,6 +17,7 @@
 #pragma once
 
 // sirius
+#include "expression/ast/node.hpp"
 #include "expression/function_id.hpp"
 #include "helper/logical_type.hpp"
 
@@ -49,6 +50,16 @@ inline constexpr std::array<sirius::type_id, 3> supported_ast_cast_types_native{
                                    supported_ast_cast_types_native.end(),
                                    target.id()) != supported_ast_cast_types_native.end();
   return supported && (source.id() != type_id::HUGEINT || target.id() == type_id::DOUBLE);
+}
+
+/// Whether @p call's result or any argument is DECIMAL or HUGEINT. cuDF AST does not enforce
+/// DuckDB's result width and scale for these, so such a function is materialized.
+[[nodiscard]] inline bool has_fixed_point_operand(ast::function_call const& call)
+{
+  return call.return_type().has_fixed_point_carrier() ||
+         std::ranges::any_of(call.arguments(), [](auto const& arg) {
+           return arg->return_type().has_fixed_point_carrier();
+         });
 }
 
 /// BOUND_FUNCTION names that are currently safe to lower into a cuDF AST.
