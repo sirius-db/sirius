@@ -80,6 +80,7 @@ target_sources(
           sirius_physical_partition_consumer_operator.cpp
           sirius_physical_passthrough_sink.cpp
           sirius_physical_projection.cpp
+          sirius_physical_replicate.cpp
           sirius_physical_result_collector.cpp
           sirius_physical_sort_partition.cpp
           sirius_physical_sort_sample.cpp
@@ -89,4 +90,5 @@ target_sources(
           sirius_physical_union.cpp
           aggregate/wide_integer_sum.cu
           partition/crc32_partition_hash.cu
+          replicate/gpu_replicate_impl.cu
           scan/equality_delete_mask.cu)

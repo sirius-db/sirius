@@ -36,6 +36,7 @@ The `sirius_physical_plan_generator::create_plan()` method is the entry point. I
 | `LOGICAL_CTE_REF` | `CTE_SCAN` | `src/planner/sirius_plan_recursive_cte.cpp` (materialized CTE refs only — recursive CTEs are unsupported) |
 | `LOGICAL_DUMMY_SCAN` | `DUMMY_SCAN` | `src/planner/sirius_plan_dummy_scan.cpp` |
 | `LOGICAL_EMPTY_RESULT` | `EMPTY_RESULT` | `src/planner/sirius_plan_empty_result.cpp` |
+| `LOGICAL_EXCEPT` / `LOGICAL_INTERSECT` (`ALL` forms only) | `REPLICATE` over `PROJECTION`, `HASH_GROUP_BY` and `UNION` | `src/planner/sirius_plan_set_operation.cpp` |
 
 `LOGICAL_DELIM_JOIN` reaches Sirius because Sirius loads with DuckDB's `delim_join_as_cte` defaulting to `false`. With the setting at DuckDB v2's own default (`true`), the same subqueries arrive as `LOGICAL_MATERIALIZED_CTE` plus `LOGICAL_CTE_REF` and ordinary semi, anti and mark joins; see [DuckDB Settings Changed by Sirius](configuration.md#duckdb-settings-changed-by-sirius).
 
@@ -71,6 +72,26 @@ A `LOGICAL_CROSS_PRODUCT` (`CROSS JOIN`, a comma join without a join predicate, 
 - **HUGEINT results** — the plan keeps DuckDB's HUGEINT result types; on the GPU they are carried as INT64 (cuDF has no int128)
 - **FILTER clause** — supported for `count(*)`, `count(col)`, `sum` (incl. `sum_no_overflow`, DuckDB's lowering of plain integer `sum`), `min`, `max`, and `avg`: `extract_aggregate_expressions` rewrites each filtered aggregate input to `CASE WHEN filter THEN input ELSE NULL END` in the projection hoisted below the aggregate, which is exact because every aggregate in that set lowers to a NULL-skipping cuDF aggregation. `count(*) FILTER` hoists a boolean mask column (`CASE WHEN filter THEN true ELSE NULL END`) and is rebound by `FunctionBinder` to the host system catalog's unary `count(BOOLEAN)` before translation. Identical generated CASE inputs reuse one projected column within the extraction, using DuckDB structural equality and hashing, only when the whole expression tree is consistent, nonvolatile, and has no function requiring ordered execution. Group keys and unfiltered inputs retain their existing handling. AVG's expanded SUM and COUNT slots share that input index; grouped execution already batches requests by input column. After whole-mask sharing, a safe nontrivial complete predicate still used by multiple distinct generated masks is computed once as a BOOLEAN column in a lower projection that also passes through every original input column. The masks reference that column, preserving FALSE/NULL filtering and count-star NULL masking without changing group keys or dropping rows. Constants and direct column references need no extra projection; predicates within different complete filters and user-written CASE inputs are not extracted. DuckDB's common-subexpression optimizer often already provides predicate columns, so this stage covers predicates that reach Sirius unshared, for example when that optimizer is disabled. DISTINCT aggregates, `first`, and any aggregate name outside the supported set throw `NotImplementedException` when filtered (transparent CPU fallback), and `translate_aggregate` declines any aggregate that still carries an unconsumed filter so no filtered aggregate can ever run unfiltered.
 - **Unsupported aggregate expressions** — `translate_expressions()` rejects any aggregate expression `from_duckdb` cannot translate (see *Unsupported expressions* above), and `can_use_partitioned_aggregate()` declines on a failed translation
+
+### Set Operation Planning
+
+**File:** `src/planner/sirius_plan_set_operation.cpp`
+
+`create_plan(LogicalSetOperation&)` sends `EXCEPT` and `INTERSECT` to `plan_except_intersect`. It lowers only the `ALL` forms, and it lowers them by counting rows rather than by joining, as Spark does. A distinct row seen `m` times in the left input and `n` times in the right is emitted `max(m - n, 0)` times for `EXCEPT ALL` and `min(m, n)` times for `INTERSECT ALL`:
+
+1. Each input is projected to its columns followed by constant `TINYINT` tags. `EXCEPT ALL` uses one tag (`1` on the left, `-1` on the right); `INTERSECT ALL` uses two (`1, 0` on the left, `0, 1` on the right).
+2. A `UNION` merges the two tagged inputs.
+3. A `HASH_GROUP_BY` on every column sums each tag into a `BIGINT`: `m - n` for `EXCEPT ALL`, `m` and `n` for `INTERSECT ALL`.
+4. A `PROJECTION` keeps the columns and appends the copy count as a `CASE` expression: `CASE WHEN s > 0 THEN s ELSE 0 END` or `CASE WHEN m < n THEN m ELSE n END`.
+5. `REPLICATE` repeats each row by that count and drops the count column. Its byte target is `concat_batch_bytes`; the final row may take a batch over that target. 0 disables byte accounting. Its row limit is `INT32_MAX`.
+
+The builder throws `NotImplementedException`, so the query falls back to CPU, for:
+
+- the distinct forms of `EXCEPT` and `INTERSECT`;
+- nested-type and `ARRAY` columns;
+- keys DuckDB compares through a collation or normalization, such as a collated `VARCHAR` or an `INTERVAL`, because the GPU would compare raw values;
+- `FLOAT` and `DOUBLE` keys, because a group keeps only one of its `-0.0` and `+0.0` rows, where DuckDB returns each input's own rows;
+- an input whose planned column type differs from the declared type. Aggregate results retain DuckDB's `HUGEINT` type throughout the set-operation plan.
 
 ### Distinct Planning
 

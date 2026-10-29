@@ -2465,9 +2465,10 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalOperator& op)
       break;
     case duckdb::LogicalOperatorType::LOGICAL_UNION:
     case duckdb::LogicalOperatorType::LOGICAL_EXCEPT:
-    case duckdb::LogicalOperatorType::LOGICAL_INTERSECT:
+    case duckdb::LogicalOperatorType::LOGICAL_INTERSECT: {
       plan = create_plan(op.Cast<duckdb::LogicalSetOperation>());
       break;
+    }
     case duckdb::LogicalOperatorType::LOGICAL_INSERT:
       throw duckdb::NotImplementedException("Insert not supported");
       // plan = create_plan(op.Cast<duckdb::LogicalInsert>());

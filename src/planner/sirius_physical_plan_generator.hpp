@@ -216,7 +216,7 @@ class sirius_physical_plan_generator {
   // create_plan(duckdb::LogicalCopyToFile &op);
   // duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalExplain
   // &op);
-  //! Dispatches a set operation on its type; EXCEPT / INTERSECT throw, so they run on the CPU.
+  //! Dispatches a set operation on its type.
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
     duckdb::LogicalSetOperation& op);
   // duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalUpdate
@@ -247,6 +247,11 @@ class sirius_physical_plan_generator {
     duckdb::LogicalComparisonJoin& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_delim_join(
     duckdb::LogicalComparisonJoin& op);
+  //! Lowers EXCEPT ALL / INTERSECT ALL to tag, UNION ALL, per-group tag sums, and
+  //! `sirius_physical_replicate`; refuses the distinct forms.
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_except_intersect(
+    duckdb::LogicalSetOperation& op);
+
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_union(
     duckdb::LogicalSetOperation& op);
 

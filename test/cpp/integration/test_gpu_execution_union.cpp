@@ -253,10 +253,10 @@ TEST_CASE_METHOD(UnionFixture,
                  "[integration][gpu_execution][union][union_all]")
 {
   // EXCEPT and INTERSECT must leave the GPU path cleanly via a fallback -- not error, and not
-  // silently return the union of both inputs. Both are refused during plan generation (the
-  // set-operation builder's switch), so this asserts a plan-time fallback. The helper also
-  // compares against the CPU result, which is what pins "still the right answer" without a
-  // hand-rolled second check.
+  // silently return the union of both inputs. Both are refused during plan generation
+  // (`plan_except_intersect` refuses the distinct forms), so this asserts a plan-time fallback.
+  // The helper also compares against the CPU result, which is what pins "still the right answer"
+  // without a hand-rolled second check.
   expect_plan_fallback_matches_cpu("SELECT k FROM ua EXCEPT SELECT k FROM ub");
   expect_plan_fallback_matches_cpu("SELECT k FROM ua INTERSECT SELECT k FROM ub");
 }
