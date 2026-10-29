@@ -362,6 +362,41 @@ TEST_CASE("decimal sum narrowing - measured values on the 2^63 - 1 boundary",
   CHECK(narrows(narrow_d128({1049999900, -1000000000, 7, 0})));
 }
 
+TEST_CASE("decimal sum narrowing - a batch whose SUM could pass 128 bits falls back",
+          "[aggregate][decimal_sum_overflow]")
+{
+  constexpr auto max128 = std::numeric_limits<__int128>::max();
+  CHECK_FALSE(narrows(narrow_d128({max128})));                     // 1 row: exact
+  CHECK_FALSE(narrows(narrow_d128({max128 / 2, -(max128 / 2)})));  // 2 * (2^126 - 1) < limit
+  CHECK_THROWS_AS(narrows(narrow_d128({max128 / 2 + 1, 0})), sirius::not_implemented_exception);
+  CHECK_THROWS_AS(narrows(narrow_d128({std::numeric_limits<__int128>::min(), 0})),
+                  sirius::not_implemented_exception);
+}
+
+TEST_CASE("decimal128 partial sums - the merge falls back unless the total stays below 2^127",
+          "[aggregate][decimal_sum_overflow]")
+{
+  constexpr auto max128 = std::numeric_limits<__int128>::max();
+  auto const check      = [](std::vector<cudf::column_view> const& partials) {
+    sirius::op::require_decimal128_partial_sums_in_range(
+      partials, cudf::get_default_stream(), cudf::get_current_device_resource_ref());
+  };
+  auto const third = d128({max128 / 3});
+  auto const small = d128({5, -7});
+  CHECK_NOTHROW(check({third->view(), third->view(), third->view()}));  // 3 * floor(max / 3)
+  CHECK_NOTHROW(check({third->view(), small->view()}));
+  auto const half = d128({max128 / 2 + 1});
+  // Each batch fits on its own; the total across batches could not.
+  CHECK_NOTHROW(check({half->view()}));
+  CHECK_THROWS_AS(check({half->view(), half->view()}), sirius::not_implemented_exception);
+  CHECK_THROWS_AS(check({third->view(), third->view(), third->view(), small->view()}),
+                  sirius::not_implemented_exception);
+  // INT64 partials and empty or all-null columns cannot contribute.
+  auto const int64_partials = i64({std::numeric_limits<int64_t>::max()});
+  auto const empty          = cudf::make_empty_column(wide_integer_sum_type());
+  CHECK_NOTHROW(check({half->view(), int64_partials->view(), empty->view()}));
+}
+
 TEST_CASE("decimal sum narrowing - nulls, empty input and no candidates",
           "[aggregate][decimal_sum_overflow]")
 {

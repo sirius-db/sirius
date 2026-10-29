@@ -104,6 +104,33 @@ TEST_CASE_METHOD(HugeintFixture,
 }
 
 TEST_CASE_METHOD(HugeintFixture,
+                 "hugeint - arithmetic and sums that could pass 2^127 fall back",
+                 "[integration][gpu_execution][hugeint]")
+{
+  // |s| = 4e19, so s * 4e18 = 1.6e38 stays below 2^127 (about 1.7e38) on the GPU.
+  compare_gpu_vs_cpu("SELECT k, s * 4000000000000000000 p FROM " + std::string{sums} + ";");
+  compare_gpu_vs_cpu("SELECT SUM(s * 1000) FROM " + std::string{sums} + ";");
+
+  run_ok("SET enable_duckdb_fallback = true;");
+  // cuDF wraps past 2^127; DuckDB raises an overflow error.
+  for (auto const* query : {"SELECT k, s * s p FROM ",
+                            "SELECT k, s * 5000000000000000000 p FROM ",
+                            "SELECT SUM(s * 4000000000000000000) FROM ",
+                            "SELECT AVG(s * 4000000000000000000) FROM "}) {
+    auto result = con->Query(std::string{query} + sums + ";");
+    REQUIRE(result->HasError());
+    CHECK_THAT(result->GetError(), Catch::Matchers::ContainsSubstring("Overflow"));
+  }
+  // 1.2e38 fits HUGEINT but not DECIMAL(38, 0).
+  expect_runtime_fallback_matches_cpu(
+    "SELECT k, TRY_CAST(s * 3000000000000000000 AS DECIMAL(38, 0)) "
+    "c FROM " +
+    std::string{sums} + ";");
+  // HUGEINT_MIN // -1 overflows, so a -1 divisor stays on the CPU.
+  expect_plan_fallback_matches_cpu("SELECT k, s // -1 q, s % -1 r FROM " + std::string{sums} + ";");
+}
+
+TEST_CASE_METHOD(HugeintFixture,
                  "hugeint - division by a column stays on the CPU",
                  "[integration][gpu_execution][hugeint]")
 {

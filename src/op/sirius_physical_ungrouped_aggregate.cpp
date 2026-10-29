@@ -133,6 +133,9 @@ struct aggregate_spec {
   /// The DuckDB result is HUGEINT, carried as DECIMAL128 with scale 0. An integer input reduced in
   /// INT64 has its one-row partial widened to that carrier, so the merge sums DECIMAL128 partials.
   bool returns_hugeint = false;
+  /// SUM or AVG over HUGEINT: its DECIMAL128 partials can approach 2^127, so the merge checks their
+  /// total cannot pass it.
+  bool sums_hugeint_input = false;
 };
 
 struct aggregate_layout {
@@ -184,7 +187,11 @@ aggregate_layout build_aggregate_layout(
     spec.local_count_idx = std::numeric_limits<size_t>::max();
     spec.wide_integer_sum =
       !children.empty() && is_wide_integer_sum(agg.function(), children[0]->return_type());
-    spec.returns_hugeint = agg_return_type.id() == duckdb::LogicalTypeId::HUGEINT;
+    spec.returns_hugeint    = agg_return_type.id() == duckdb::LogicalTypeId::HUGEINT;
+    spec.sums_hugeint_input = (agg.function() == sirius::aggregate_id::sum ||
+                               agg.function() == sirius::aggregate_id::avg) &&
+                              !children.empty() &&
+                              children[0]->return_type().id() == sirius::type_id::HUGEINT;
 
     switch (agg.function()) {
       case sirius::aggregate_id::count_star:
@@ -731,6 +738,17 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
     for (auto const& spec : layout.aggregates) {
       if (spec.kind == aggregate_kind::FIRST)
         first_row_counts[spec.local_sum_idx] = spec.local_count_idx;
+    }
+    // cuDF's SUM wraps past 128 bits; a HUGEINT input's partials can get there.
+    for (auto const& spec : layout.aggregates) {
+      if (!spec.sums_hugeint_input) { continue; }
+      std::vector<cudf::column_view> partials;
+      for (auto const& batch : input_batches) {
+        partials.push_back(
+          batch.get_data()->cast<cucascade::gpu_table_representation>().get_table_view().column(
+            static_cast<cudf::size_type>(spec.local_sum_idx)));
+      }
+      require_decimal128_partial_sums_in_range(partials, stream, space->get_default_allocator());
     }
     merged_batch = gpu_merge_impl::merge_ungrouped_aggregate(input_batches,
                                                              layout.merge_kinds,

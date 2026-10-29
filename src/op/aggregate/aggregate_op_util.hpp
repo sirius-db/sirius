@@ -119,6 +119,14 @@ std::unordered_set<int> sums_to_widen(cudf::table_view const& table,
                                       ::cuda::stream_ref stream,
                                       rmm::device_async_resource_ref mr);
 
+/// Throws not_implemented_exception, falling back to DuckDB, unless summing all of @p partials
+/// provably stays below 2^127: the bound is the sum of rows x max |v| over the DECIMAL128 columns
+/// (others are skipped). cuDF's SUM wraps where DuckDB raises an overflow error. Synchronizes
+/// @p stream once per checked column.
+void require_decimal128_partial_sums_in_range(std::vector<cudf::column_view> const& partials,
+                                              ::cuda::stream_ref stream,
+                                              rmm::device_async_resource_ref mr);
+
 /// Whether summing @p column (INT64 partial sums of a wide integer SUM, nulls skipped) can
 /// overflow INT64 in any group: true unless sum(|value|) over the whole column provably stays
 /// below 2^62. Any group's sum, and every running sum on the way, is bounded by that total, so a
@@ -178,6 +186,10 @@ struct AggregateSlot {
   /// True if the aggregate's DuckDB result is HUGEINT. Its partials may be INT64; the merge
   /// finalizes them to DECIMAL128 with scale 0 (to_hugeint_carrier).
   bool returns_hugeint = false;
+  /// True if the SUM at cudf_idx sums a HUGEINT input (SUM or AVG): its DECIMAL128 partials can
+  /// approach 2^127, so the merge checks their total cannot pass it
+  /// (require_decimal128_partial_sums_in_range).
+  bool sums_hugeint_input = false;
 };
 
 /**

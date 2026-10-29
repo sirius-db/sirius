@@ -283,6 +283,17 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
       stream,
       telemetry::quent_data_batch_probe::create(batch_telemetry(), clone_batch_id));
   } else {
+    // cuDF's SUM wraps past 128 bits; a HUGEINT input's partials can get there.
+    for (auto const& slot : aggregate_slots) {
+      if (!slot.sums_hugeint_input) { continue; }
+      std::vector<cudf::column_view> partials;
+      for (auto const& batch : input_batches) {
+        partials.push_back(
+          get_cudf_table_view(batch).column(num_group_cols + static_cast<int>(slot.cudf_idx)));
+      }
+      require_decimal128_partial_sums_in_range(
+        partials, stream, input_batches[0].get_memory_space()->get_default_allocator());
+    }
     merged = gpu_merge_impl::merge_grouped_aggregate(input_batches,
                                                      static_cast<int>(num_output_group_columns()),
                                                      cudf_aggregates,
