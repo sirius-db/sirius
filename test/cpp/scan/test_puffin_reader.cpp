@@ -24,12 +24,12 @@
 //
 // No GPU: file IO and parsing only.
 
-#include "io/io_errors.hpp"
 #include "op/scan/iceberg_delete_set.hpp"
 #include "op/scan/puffin_reader.hpp"
 #include "scan_manager/preparation_test_support.hpp"
 
 #include <catch.hpp>
+#include <cucascade/io/io_errors.hpp>
 #include <roaring/roaring.hh>
 
 #include <algorithm>
@@ -124,7 +124,7 @@ class identity_changing_puffin_source final : public puffin_byte_source {
   }
   bool read(std::span<std::byte>) override
   {
-    throw sirius::io::object_changed_error(path_, "\"v1\"", "\"v2\"");
+    throw cucascade::io::object_changed_error(path_, "\"v1\"", "\"v2\"");
   }
   [[nodiscard]] std::streamoff size() const override { return size_; }
 
@@ -773,7 +773,7 @@ TEST_CASE("Charged Puffin preserves an opened-object identity failure",
   try {
     read_for_test(ref, true, &source);
     FAIL("identity change was not reported");
-  } catch (sirius::io::object_changed_error const& failure) {
+  } catch (cucascade::io::object_changed_error const& failure) {
     CHECK(failure.object_path() == ref.puffin_path);
     CHECK(failure.expected_tag() == "\"v1\"");
     CHECK(failure.observed_tag() == "\"v2\"");

@@ -16,24 +16,20 @@
 
 #pragma once
 
+#include <cucascade/exec/config.hpp>
+
 #include <chrono>
 #include <cstddef>
 #include <optional>
-#include <string>
-#include <vector>
 
 namespace sirius::exec {
 
-/// Default pool sizes. The scan-manager pool takes the cores these leave over
-/// (see scan_manager::default_scan_manager_num_threads).
-inline constexpr int default_gpu_pipeline_num_threads = 4;
-inline constexpr int default_downgrade_num_threads    = 1;
+using cucascade::exec::default_gpu_pipeline_num_threads;
+using cucascade::exec::thread_pool_config;
 
-struct thread_pool_config {
-  int num_threads{0};
-  std::string thread_name_prefix{"thread"};
-  std::vector<int> cpu_affinity_list;
-};
+/// Default downgrade pool size. The scan-manager pool takes the cores these leave over
+/// (see scan_manager::default_scan_manager_num_threads).
+inline constexpr int default_downgrade_num_threads = 1;
 
 /// Configuration for the downgrade executor.
 /// Embeds the thread pool config plus downgrade-specific settings.

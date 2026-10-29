@@ -15,17 +15,18 @@
  */
 
 #include "catch.hpp"
-#include "io/object_store_config.hpp"
-#include "io/rest/config.hpp"
 #include "sirius_config.hpp"
+
+#include <cucascade/io/object_store_config.hpp>
+#include <cucascade/io/rest/config.hpp>
 
 #include <filesystem>
 #include <fstream>
 #include <string>
 
-using sirius::io::enum_to_string;
-using sirius::io::object_store_config;
-using sirius::io::string_to_enum;
+using cucascade::io::enum_to_string;
+using cucascade::io::object_store_config;
+using cucascade::io::string_to_enum;
 
 namespace {
 

@@ -16,11 +16,13 @@
 
 #pragma once
 
-#include "io/types.hpp"
 #include "op/scan/table_scan/parquet_physical_profile.hpp"
 
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/parquet_schema.hpp>
+
+#include <cucascade/cudf/datasource.hpp>
+#include <cucascade/io/types.hpp>
 
 #include <cstddef>
 #include <limits>
@@ -43,7 +45,7 @@ namespace sirius::op::scan {
 /// Lives with the parquet ingestible (its only producer/consumer): the bind
 /// path (@c sirius_scan_manager::describe_parquet) parses and parks it, and the
 /// metadata scan (@c parquet_gpu_ingestible::build_file_scan_info) reuses it.
-class parquet_metadata final : public sirius::io::io_object_metadata,
+class parquet_metadata final : public cucascade::io::io_object_metadata,
                                public std::enable_shared_from_this<parquet_metadata> {
  public:
   parquet_metadata(std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata,
@@ -95,7 +97,7 @@ struct parquet_metadata_resolution {
 // The three footer producers must publish the same complete evidence. Cache hits
 // return the very same record, including the original serialized schema.
 parquet_metadata_resolution resolve_parquet_metadata_with_identity(
-  io::sirius_datasource& source,
+  cucascade::io::datasource& source,
   scan_contract_id contract,
   std::string const& identity,
   cudf::io::parquet_reader_options const& options,
@@ -103,7 +105,7 @@ parquet_metadata_resolution resolve_parquet_metadata_with_identity(
   std::stop_token stop = {});
 
 std::shared_ptr<parquet_metadata> resolve_parquet_metadata(
-  io::sirius_datasource& source,
+  cucascade::io::datasource& source,
   scan_contract_id contract,
   std::string const& identity,
   cudf::io::parquet_reader_options const& options,

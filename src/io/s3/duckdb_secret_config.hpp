@@ -7,8 +7,7 @@
 
 #pragma once
 
-#include "io/object_store_config.hpp"
-
+#include <cucascade/io/object_store_config.hpp>
 #include <duckdb/main/client_context.hpp>
 
 #include <string_view>
@@ -18,6 +17,8 @@ class SecretManager;
 }
 
 namespace sirius::io::s3 {
+
+using cucascade::io::object_store_config;
 
 /// True when @p path begins with the S3 scheme (case-insensitive).
 bool is_s3_path(std::string_view path) noexcept;

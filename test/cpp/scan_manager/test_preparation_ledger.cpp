@@ -1352,7 +1352,7 @@ TEST_CASE("Rejected pre-start Iceberg claims leave the first file available",
   dv_precondition_fixture f;
   auto ledger     = f.consume();
   auto ingestible = make_ingestible(f.info());
-  auto resolve    = [](std::string_view) -> std::shared_ptr<sirius::io::ioctx> {
+  auto resolve    = [](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> {
     throw std::runtime_error("claim-only resolver was executed");
   };
   REQUIRE(f.paths.size() == 1);
@@ -1442,7 +1442,7 @@ TEST_CASE("Iceberg pending claims preserve both cursors and discarded jobs relea
   auto ledger     = f.consume();
   auto ingestible = make_ingestible(f.info());
   ingestible->attach_preparation_ledger(ledger);
-  auto resolve = [](std::string_view) -> std::shared_ptr<sirius::io::ioctx> {
+  auto resolve = [](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> {
     throw std::runtime_error("claim must not read files");
   };
   auto occupied = ledger->try_acquire_unit({99, 1}, 0);

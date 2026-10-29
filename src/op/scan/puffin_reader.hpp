@@ -25,8 +25,8 @@
 namespace sirius::scan_manager {
 class charging_allocator;
 }
-namespace sirius::io {
-class sirius_datasource;
+namespace cucascade::io {
+class datasource;
 }
 #include <string>
 #include <string_view>
@@ -47,7 +47,7 @@ class puffin_byte_source {
 };
 
 std::unique_ptr<puffin_byte_source> make_puffin_byte_source(
-  std::unique_ptr<sirius::io::sirius_datasource> source);
+  std::unique_ptr<cucascade::io::datasource> source);
 
 /// Hard ceiling on the positions one deletion vector may decode into, independent of anything the
 /// table says about itself.

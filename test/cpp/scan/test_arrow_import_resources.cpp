@@ -786,7 +786,7 @@ TEST_CASE("Arrow migration failed completion retains roots and staging until ver
   completion_fault fault;
   observed_device_resource device(cudf::get_current_device_resource_ref());
   device.state->expected_stream = stream.value();
-  sirius::exec::detail::completion_cuda_api api;
+  cucascade::exec::detail::completion_cuda_api api;
   api.add_callback = completion_fault::add;
   api.synchronize  = completion_fault::synchronize;
   sirius::exec::retire_lane lane(stream.value(), api);
@@ -840,7 +840,7 @@ TEST_CASE("Arrow migration final quiesce covers frees queued after failed commit
   device.state->delay_deallocation = true;
   completion_fault fault;
   fault.refuse_sync = false;
-  sirius::exec::detail::completion_cuda_api api;
+  cucascade::exec::detail::completion_cuda_api api;
   api.add_callback = completion_fault::add;
   api.synchronize  = completion_fault::synchronize;
   sirius::exec::retire_lane lane(stream.value(), api);
