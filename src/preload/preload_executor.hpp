@@ -173,7 +173,7 @@ class preload_executor final : public event::query_event_subscriber {
   [[nodiscard]] std::size_t outstanding_for_testing(cucascade::memory::memory_space_id id) const;
   [[nodiscard]] std::size_t candidate_count_for_testing() const;
   /// Run @p hook inside each promotion, on the worker, once the target reservation is made and
-  /// before the batch is locked.
+  /// before the batch is locked. Call before @ref start: the workers read it without a lock.
   void set_promotion_hook_for_testing(std::function<void(promotion_job const&)> hook);
 
  private:
@@ -202,12 +202,13 @@ class preload_executor final : public event::query_event_subscriber {
     std::uint64_t batch_id{0};
     /// Last known tier: HOST or DISK from the event, GPU or HOST after a promotion.
     cucascade::memory::Tier location{cucascade::memory::Tier::SIZE};
-    /// Size on the GPU before the spill (the largest reported): the reservation estimate.
+    /// Size on the GPU before the spill (the largest reported): the reservation estimate. Raised
+    /// to the exact need of a promotion that found no room, so it is not retried until that fits.
     std::size_t gpu_bytes{0};
     /// A worker is promoting it; the job, not this input, holds that charge.
     bool in_flight{false};
-    /// Its last promotion failed; not retried until it is downgraded again.
-    bool failed{false};
+    /// Its last promotion failed or found the batch busy; not retried until downgraded again.
+    bool skip{false};
     /// Budget this input holds after a successful promotion.
     charge held{};
   };
@@ -299,7 +300,6 @@ class preload_executor final : public event::query_event_subscriber {
   preload_counters _counters;
   std::uint64_t _events_handled{0};
   bool _unexpected_logged{false};
-  std::shared_ptr<std::function<void(promotion_job const&)>> _test_hook;
 };
 
 }  // namespace sirius::preload

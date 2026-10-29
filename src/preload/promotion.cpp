@@ -133,10 +133,10 @@ promotion_result promote_to_gpu(promotion_job const& job, promotion_env const& e
 
   auto const need = with_slack(promotion_peak_bytes(*data));
   if (need > reservation->size() && !reservation->grow_by(need - reservation->size())) {
-    return outcome(promotion_outcome::no_room);
+    return {promotion_outcome::no_room, need};
   }
   // Memory may have filled since the reservation was made.
-  if (!admissible(*gpu, job.ceiling_bytes)) { return outcome(promotion_outcome::no_room); }
+  if (!admissible(*gpu, job.ceiling_bytes)) { return {promotion_outcome::no_room, need}; }
 
   bool const from_disk = current->get_tier() == Tier::DISK;
   sirius::nvtx_scoped_range const range{from_disk ? "sirius::preload::promote_d2g"
@@ -215,9 +215,9 @@ promotion_result stage_to_host(promotion_job const& job, promotion_env const& en
   // upper bound on them, so the ceiling check may slightly over-count.
   auto const need = data->get_size_in_bytes();
   if (need > reservation->size() && !reservation->grow_by(need - reservation->size())) {
-    return outcome(promotion_outcome::no_room);
+    return {promotion_outcome::no_room, need};
   }
-  if (!admissible(*host, job.ceiling_bytes)) { return outcome(promotion_outcome::no_room); }
+  if (!admissible(*host, job.ceiling_bytes)) { return {promotion_outcome::no_room, need}; }
 
   sirius::nvtx_scoped_range const range{"sirius::preload::promote_d2h"};
   // A DISK->HOST conversion touches no GPU: the stream is only part of the converter signature.

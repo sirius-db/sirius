@@ -1182,7 +1182,8 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
   // Preload (docs/super-sirius/configuration.md). A GPU that tracks reservations per stream would
   // not charge a promotion's copy to the reservation preload attaches, so device promotion is
   // off there; DISK->HOST staging still runs.
-  auto preload_config = config_.get_preload_executor_config();
+  auto preload_config      = config_.get_preload_executor_config();
+  bool per_stream_disabled = false;
   if (preload_config.device_budget > 0.0) {
     for (auto const& space : config_.get_memory_space_configs()) {
       if (auto const* g = std::get_if<cucascade::memory::gpu_memory_space_config>(&space);
@@ -1191,12 +1192,16 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
           "[preload] device_budget is set but a GPU space tracks reservations per stream "
           "(per_stream_reservation: true); device promotion is disabled");
         preload_config.device_budget = 0.0;
+        per_stream_disabled          = true;
         break;
       }
     }
   }
   if (!sirius::preload::preload_enabled(preload_config)) {
-    SIRIUS_LOG_INFO("[preload] not started: device_budget and host_budget are 0");
+    SIRIUS_LOG_INFO("[preload] not started: {} and host_budget is 0",
+                    per_stream_disabled
+                      ? "device preloading is disabled by per-stream reservation tracking"
+                      : "device_budget is 0");
   } else {
     if (preload_config.device_budget > 0.0) {
       preload_streams_ = std::make_shared<sirius::preload::preload_streams>(active_gpu_ids);

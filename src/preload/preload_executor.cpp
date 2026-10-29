@@ -94,14 +94,6 @@ preload_executor::preload_executor(event::query_event_publisher& publisher,
     throw std::invalid_argument("preload_executor: device promotion needs stream pools");
   }
   build_spaces(deps);
-  _env.test_hook = [this](promotion_job const& job) {
-    std::shared_ptr<std::function<void(promotion_job const&)>> hook;
-    {
-      std::lock_guard const lk{_mu};
-      hook = _test_hook;
-    }
-    if (hook && *hook) { (*hook)(job); }
-  };
 }
 
 preload_executor::~preload_executor() { stop(); }
@@ -287,7 +279,7 @@ void preload_executor::on_task_downgraded(event::event_id_t event_id,
       release(in->held);
       in->location  = moved.to.tier;
       in->gpu_bytes = std::max(in->gpu_bytes, moved.gpu_bytes);
-      in->failed    = false;
+      in->skip      = false;
     }
   } catch (...) {
     log_unexpected("task_downgraded");
@@ -306,7 +298,6 @@ void preload_executor::on_task_popped(event::event_id_t event_id,
   ++_events_handled;
   ++_counters.pops;
   try {
-    remember_pop(task_id, event_id);
     // The task runs now: its inputs leave preload's budget.
     if (auto const it = _candidates.find(task_id); it != _candidates.end()) {
       release_all(it->second);
@@ -314,11 +305,14 @@ void preload_executor::on_task_popped(event::event_id_t event_id,
     }
     auto const g = std::find_if(
       _gpus.begin(), _gpus.end(), [gpu](gpu_state const& s) { return s.device == gpu; });
-    if (g == _gpus.end()) { return; }
-    // Pops that arrive while the worker is busy wait as credits; past the cap the oldest go.
-    if (g->credits.size() >= _pipeline_threads) { g->credits.pop_front(); }
-    g->credits.push_back({tasks_left, pipeline_id});
-    _work_cv.notify_all();
+    if (g != _gpus.end()) {
+      // Pops that arrive while the worker is busy wait as credits; past the cap the oldest go.
+      if (g->credits.size() >= _pipeline_threads) { g->credits.pop_front(); }
+      g->credits.push_back({tasks_left, pipeline_id});
+      _work_cv.notify_all();
+    }
+    // Last, so a throw here skips neither the release nor the credit.
+    remember_pop(task_id, event_id);
   } catch (...) {
     log_unexpected("task_popped");
   }
@@ -326,12 +320,18 @@ void preload_executor::on_task_popped(event::event_id_t event_id,
 
 void preload_executor::remember_pop(std::uint64_t task_id, event::event_id_t event_id)
 {
-  if (auto const it = _recent_pops.find(task_id); it != _recent_pops.end()) {
+  auto const [it, inserted] = _recent_pops.try_emplace(task_id, event_id);
+  if (!inserted) {
     it->second = std::max(it->second, event_id);
     return;
   }
-  _recent_pop_order.push_back(task_id);
-  _recent_pops.emplace(task_id, event_id);
+  // Undone if the FIFO push throws, so the map and the FIFO never disagree.
+  try {
+    _recent_pop_order.push_back(task_id);
+  } catch (...) {
+    _recent_pops.erase(it);
+    throw;
+  }
   if (_recent_pop_order.size() > recent_pops_cap) {
     _recent_pops.erase(_recent_pop_order.front());
     _recent_pop_order.pop_front();
@@ -402,6 +402,12 @@ std::optional<promotion_job> preload_executor::select(std::size_t g, pop_credit 
     ++(any_for_gpu ? _counters.gated : _counters.no_candidate);
     return std::nullopt;
   }
+  // Neither target has budget left (a zero budget has none): nothing can fit.
+  auto const has_room = [](space_state const& s) { return s.outstanding < s.budget_bytes; };
+  if (!has_room(gpu) && !(gpu.local_host && has_room(_hosts[*gpu.local_host]))) {
+    ++_counters.no_room;
+    return std::nullopt;
+  }
 
   // Pop order: the inputs of the task that runs first are needed first.
   std::sort(eligible.begin(), eligible.end(), [](auto const& a, auto const& b) {
@@ -409,7 +415,7 @@ std::optional<promotion_job> preload_executor::select(std::size_t g, pop_credit 
   });
   for (auto const& [key, c] : eligible) {
     for (auto& in : c->inputs) {
-      if (in.in_flight || in.failed || in.location == Tier::GPU) { continue; }
+      if (in.in_flight || in.skip || in.location == Tier::GPU) { continue; }
       auto const est = with_slack(std::max<std::size_t>(in.gpu_bytes, 1));
       std::optional<charge> target;
       if (_cfg.device_budget > 0.0 && fits(gpu, est)) {
@@ -477,10 +483,18 @@ void preload_executor::apply(promotion_job const& job, promotion_result const& r
       in->location = job.tier;
       break;
     case promotion_outcome::not_needed:
-      if (result.found != Tier::SIZE) { in->location = result.found; }
+      // Without a tier the batch was busy or gone: retrying it at once would take every credit.
+      if (result.found != Tier::SIZE) {
+        in->location = result.found;
+      } else {
+        in->skip = true;
+      }
       break;
-    case promotion_outcome::failed: in->failed = true; break;
-    case promotion_outcome::no_room: break;
+    case promotion_outcome::failed: in->skip = true; break;
+    case promotion_outcome::no_room:
+      // The exact need, when known: fits() refuses the input until that much is free.
+      in->gpu_bytes = std::max(in->gpu_bytes, result.bytes);
+      break;
   }
   if (in->batch.expired()) {
     release(in->held);
@@ -583,9 +597,10 @@ std::size_t preload_executor::candidate_count_for_testing() const
 void preload_executor::set_promotion_hook_for_testing(
   std::function<void(promotion_job const&)> hook)
 {
-  auto shared = std::make_shared<std::function<void(promotion_job const&)>>(std::move(hook));
-  std::lock_guard const lk{_mu};
-  _test_hook = std::move(shared);
+  std::lock_guard const lifecycle{_lifecycle_mu};
+  // The workers read it without a lock.
+  assert(_state == run_state::idle);
+  _env.test_hook = std::move(hook);
 }
 
 }  // namespace sirius::preload

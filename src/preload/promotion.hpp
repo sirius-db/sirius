@@ -110,7 +110,8 @@ enum class promotion_outcome : std::uint8_t {
 /// Result of one promotion attempt.
 struct promotion_result {
   promotion_outcome outcome{promotion_outcome::failed};
-  /// When promoted: bytes reserved for the copy (the exact need, with slack for a GPU).
+  /// When promoted: bytes reserved for the copy (the exact need, with slack for a GPU). When
+  /// no room once the exact need was known (step 5 of @ref promote_one): that need. 0 otherwise.
   std::size_t bytes{0};
   /// When not needed because the batch is already off the source tier: the tier it is in.
   /// @c Tier::SIZE otherwise.
