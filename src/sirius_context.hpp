@@ -543,10 +543,6 @@ class SiriusContext : public ClientContextState {
   std::function<void()> cpu_replay_hook_for_testing;
   std::function<void()> cpu_replay_query_hook_for_testing;
   void before_cpu_replay_for_testing(ClientContext& context);
-  /// Runs inside initialize() once the downgrade and preload executors are running, before the
-  /// task creator, scan manager and scheduler start. A throw takes initialize()'s failure path
-  /// with those executors' threads live. Set before initialize(); test-only.
-  std::function<void()> after_executor_start_hook_for_testing;
   /// The preload stream pools; empty unless preload promotes to GPUs.
   [[nodiscard]] std::weak_ptr<sirius::preload::preload_streams const> preload_streams_for_testing()
     const noexcept;

@@ -1242,7 +1242,6 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
     executor->start();
   }
   if (preload_executor_) { preload_executor_->start(); }
-  if (after_executor_start_hook_for_testing) { after_executor_start_hook_for_testing(); }
   task_creator_->start_thread_pool();
   scan_manager_->start();
   task_scheduler_->start();
@@ -1256,7 +1255,7 @@ void SiriusContext::terminate()
   // A terminate() that throws leaves the context initialized, and ~SiriusContext runs it again:
   // every step before the throw must therefore be safe to repeat (stops, resets and the cuDF
   // pinned-resource restore are idempotent, and members a first run already reset are
-  // null-guarded). The lifecycle clear() test relies on this.
+  // null-guarded).
   throw_if_not_initialized();
   admission_.close();
   mark_runtime_unavailable();

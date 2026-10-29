@@ -264,16 +264,6 @@ void downgrade_executor::processing_loop()
         target_spaces.push_back(ds);
       }
 
-      // Tier 2 records its moves and reports each converted task (task_downgraded) only while
-      // someone listens; the answer is fixed for the whole request so a worker never copies the
-      // publisher handle when nobody does.
-      bool const report_task_downgrades =
-        _query_event_publisher != nullptr &&
-        _query_event_publisher->has_subscribers(event::event_type::task_downgraded);
-      auto const task_queue_publisher = report_task_downgrades
-                                          ? _query_event_publisher
-                                          : std::shared_ptr<event::query_event_publisher>{};
-
       // === TIER 1: Data repositories ===
       // Memory pressure is a global condition, so candidates are drawn from EVERY in-flight
       // query: outer loop DESCENDING by query id (newest query first), inner loop in
@@ -403,6 +393,16 @@ void downgrade_executor::processing_loop()
 
       // === TIER 2: task_scheduler task queue ===
       if (!req->satisfied.load() && !target_completed() && _pipeline_task_queue) {
+        // Tier 2 records its moves and reports each converted task (task_downgraded) only while
+        // someone listens; the answer is fixed for the whole pass so a worker never copies the
+        // publisher handle when nobody does.
+        bool const report_task_downgrades =
+          _query_event_publisher != nullptr &&
+          _query_event_publisher->has_subscribers(event::event_type::task_downgraded);
+        auto const task_queue_publisher = report_task_downgrades
+                                            ? _query_event_publisher
+                                            : std::shared_ptr<event::query_event_publisher>{};
+
         size_t max_tasks_to_convert = _pipeline_task_queue->size();
         size_t tasks_converted      = 0;
         failed_pipeline_candidates.reserve(max_tasks_to_convert);
