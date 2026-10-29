@@ -227,6 +227,7 @@ struct physical_check_counters {
   std::atomic<uint64_t> iceberg_delete_corrupt_inputs{0};
   std::atomic<uint64_t> iceberg_inventory_bytes_peak{0};
   std::atomic<uint64_t> execution_record_shadow_mismatches{0};
+  std::atomic<uint64_t> execution_record_shadow_coverage_added{0};
 
   // Installed before a test query, cleared only after its workers have joined.
   // true = before footer processing, false = after successful cuDF decode.
@@ -235,6 +236,7 @@ struct physical_check_counters {
   // Per decoded batch, before any residual filter: reader filter present, output rows.
   std::function<void(bool, uint64_t)> parquet_filter_for_testing;
   std::function<void(bool, scan_execution_record const&)> scan_execution_for_testing;
+  std::function<void(std::vector<std::size_t> const&)> scan_residual_for_testing;
   // Actual cuDF prepend requests, independently for row and source index.
   std::function<void(bool, bool)> parquet_positions_for_testing;
   std::function<void()> after_certify_for_testing;

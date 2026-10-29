@@ -1948,6 +1948,21 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "gpu_execution iceberg - mapped virtual rows preserve deletion positions",
+                 "[integration][gpu_execution][iceberg][schema_evolution][virtual_columns]")
+{
+  bool const filtered = GENERATE(false, true);
+  auto query          = "SELECT count, score, fruit, added, file_row_number FROM " +
+               pinned_scan(evolved_fields_path) + (filtered ? " WHERE count >= 3" : "") +
+               " ORDER BY count;";
+  std::vector<std::vector<std::string>> expected{{"1", "1.5", "NULL", "7", "0"},
+                                                 {"3", "NULL", "NULL", "7", "2"},
+                                                 {"5", "5.5", "NULL", "7", "4"}};
+  if (filtered) expected.erase(expected.begin());
+  expect_iceberg_rows(query, gpu_route::gpu, std::move(expected));
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "gpu_execution iceberg - evolution preserves count and NULL predicates",
                  "[integration][gpu_execution][iceberg][schema_evolution]")
 {

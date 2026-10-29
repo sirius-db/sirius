@@ -956,7 +956,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
 
 TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
                  "Adapter mapping hook runs without an Iceberg physical schema",
-                 "[materialization][scan][mapping][adapter]")
+                 "[materialization][scan][mapping][adapter][integration]")
 {
   sirius::test::scratch_dir directory("materialization_adapter_mapping");
   auto path = directory.file("input.parquet");
@@ -990,6 +990,23 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   auto const& file = dynamic_cast<parquet_file_scan_info const&>(*prepared);
   REQUIRE(file.field_mapping);
   CHECK(file.field_mapping->read_names() == std::vector<std::string>{"old_id"});
+  auto coalescer = ingestible->create_batch_coalescer();
+  auto splits    = coalescer->push(std::move(prepared));
+  for (auto& split : coalescer->flush())
+    splits.push_back(std::move(split));
+  REQUIRE(splits.size() == 1);
+  auto context = sirius::test::get_registered_sirius_context(*con);
+  auto* space  = context->get_memory_manager().get_memory_space(
+    cucascade::memory::Tier::GPU, rmm::get_current_cuda_device().value());
+  REQUIRE(space);
+  rmm::cuda_stream stream;
+  auto batch =
+    ingestible->materialize_metadata_to_table(*splits.front(), *space, stream, false, nullptr);
+  REQUIRE(batch.execution);
+  CHECK_FALSE(batch.execution->authoritative);
+  auto output = ingestible->post_filter_and_project(std::move(batch), *space, stream);
+  CHECK(output->num_rows() == 1);
+  CHECK(output->view().column(0).type().id() == cudf::type_id::INT64);
 }
 
 TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,

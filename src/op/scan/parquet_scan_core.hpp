@@ -38,6 +38,8 @@ class parquet_scan_core {
 
   std::unique_ptr<batch_coalescer> create_batch_coalescer() const;
 
+  [[nodiscard]] scan_plan const& plan() const noexcept { return *_plan; }
+
   [[nodiscard]] bool has_processed_all_metadata() const;
 
   /// Bind-time file predicates eliminated every file; no physical input is consumed.
@@ -93,6 +95,9 @@ class parquet_scan_core {
   [[nodiscard]] scan_execution_record execution_progress(filtered_table const&) const;
   [[nodiscard]] scan_execution_record decoded_execution(bool static_filter_applied,
                                                         bool assembled) const;
+  [[nodiscard]] std::shared_ptr<void const> execution_layout(bool assembled) const;
+  [[nodiscard]] std::unique_ptr<sirius::ast::node> residual_against(
+    std::span<predicate_progress const>) const;
   [[nodiscard]] std::unique_ptr<sirius::ast::node> remaining_residual(
     filtered_table const& input) const;
 
@@ -105,16 +110,6 @@ class parquet_scan_core {
                                                   std::size_t file_index,
                                                   std::shared_ptr<io::ioctx> const& io_ctx,
                                                   std::stop_token stop = {});
-
-  /// Add the carrier and user-requested virtual columns to a decoded parquet batch.
-  [[nodiscard]] std::unique_ptr<cudf::table> append_virtual_columns(
-    std::unique_ptr<cudf::table> decoded,
-    cudf::io::parquet_reader_options const& reader_options,
-    std::string const& file_path,
-    std::size_t file_index,
-    std::int64_t file_row_offset,
-    ::cuda::stream_ref stream,
-    rmm::device_async_resource_ref mr) const;
 
   [[nodiscard]] bool can_project_during_filter() const noexcept;
 

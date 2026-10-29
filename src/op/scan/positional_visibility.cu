@@ -155,6 +155,9 @@ std::unique_ptr<cudf::table> apply_positional_visibility(
     // Copy one validation word, never the per-row positions, to the host.
     if (work->invalid->value(stream))
       throw std::invalid_argument("reader position is outside its bound input source");
+    // The validation word joins the mask kernel. Coordinates have no consumer
+    // after this point and must not coexist with the gathered output payload.
+    work->positions.reset();
     auto result = sirius::apply_retention_mask(work->table->view(), work->mask->view(), stream, mr);
     detail::check_read_checkpoint(detail::read_checkpoint::PAYLOAD_GATHER);
     return result;

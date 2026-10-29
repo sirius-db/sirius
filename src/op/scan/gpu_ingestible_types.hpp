@@ -399,6 +399,9 @@ struct filtered_table {
   std::optional<scan_execution_record> execution;
   /// Present only while an internal positional consumer still needs reader survivors.
   std::unique_ptr<gpu_row_positions> row_positions;
+  // Certified batch requirements, not reconstructed from execution.visibility_applied.
+  // Null for ordinary Parquet; Iceberg shares an empty binding when it has no deletes.
+  std::shared_ptr<visibility_bindings const> required_visibility;
 };
 
 /**

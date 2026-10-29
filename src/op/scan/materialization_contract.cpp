@@ -46,6 +46,12 @@ void validate_materialized_batch(materialized_batch const& batch,
       batch.table.num_rows() != batch.rows)
     throw std::invalid_argument("materialized cardinality mismatch");
   batch.lineage.validate(batch.rows);
+  if (program.required_visibility)
+    remaining_visibility(
+      *program.required_visibility, batch.visibility_applied, batch.visibility_complete);
+  auto const& layout = batch.projection_complete ? program.output_layout : program.input_layout;
+  if (layout && batch.layout != layout)
+    throw std::invalid_argument("materialized ordered layout mismatch");
   if (program.validate_output_schema && !program.input_types && !batch.projection_complete)
     throw std::invalid_argument("materialization requires a bound input schema");
   if (batch.logical_schema_complete && !batch.projection_complete && program.input_types) {
@@ -100,7 +106,19 @@ materialized_batch finish_materialization(materialized_batch batch,
     run(steps.mapping);
     batch.logical_schema_complete = true;
   }
-  if (program.needs_visibility && !batch.visibility_complete) {
+  if (program.required_visibility) {
+    finish_visibility(*program.required_visibility,
+                      batch.visibility_applied,
+                      batch.visibility_complete,
+                      [&](std::span<applied_visibility const> pending) {
+                        if (!batch.lineage.available() && batch.rows)
+                          throw std::invalid_argument("visibility needs original row positions");
+                        if (!steps.bound_visibility)
+                          throw std::invalid_argument("missing bound visibility step");
+                        steps.bound_visibility(batch, pending);
+                      });
+    validate_materialized_batch(batch, program);
+  } else if (program.needs_visibility && !batch.visibility_complete) {
     if (!batch.lineage.available() && batch.rows)
       throw std::invalid_argument("visibility needs original row positions");
     run(steps.visibility);
@@ -131,6 +149,7 @@ materialized_batch finish_materialization(materialized_batch batch,
     if (!steps.projection) throw std::invalid_argument("missing projection step");
     steps.projection(batch);
     batch.projection_complete = true;
+    batch.layout              = program.output_layout;
     for (auto& p : batch.predicates) {
       p.stage = predicate_stage::enforced;
       p.answer_slot.reset();

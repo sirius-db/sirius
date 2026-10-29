@@ -70,7 +70,13 @@ memory_capacity = 1TB;          // total spill capacity
 
 ## Parquet scan working sets
 
-Virtual-column reader scans budget selected rows before filtering, including cuDF source/row indexes, output columns and filter/cast scratch. Plain Parquet no longer needs the old per-row-group concatenation allowance; Iceberg still does. Filename estimates include characters, offsets and construction buffers, with saturating arithmetic.
+Index estimates use the input rows in selected row groups, before reader filtering. A cuDF row index is UINT64 (8 B/row); a source index is INT32 (4 B/row), omitted for a single reader source. Estimates allow both pre-filter and filtered index columns to coexist.
+
+For Iceberg positions without virtual columns, the alternative working set is `2P + 33N + 8D + 128G`, reduced to `2P + 25N + 8D + 128G` for one source. `P` is estimated decoded payload, `N` is input rows, `D` is deletes in selected row groups and `G` is selected row groups. The per-row allowance covers two row/source index sets, 8 B of selection scratch and a 1 B retention mask; the remaining terms cover payload coexistence, uploaded deletes and binding/range overhead.
+
+Virtual scans already budget their output columns, reader indices and selection/cast scratch; deletion adds only missing index allowances and delete storage. Source costs are conservative before coalescing, so virtual estimates may retain a source allowance for a single-file split. Filename estimates include characters, offsets and construction buffers. Arithmetic saturates on overflow. These are buffer estimates, not an exact bound on all cuDF decoder scratch.
+
+Internal-only positions qualify after normal batching against the finite batch cap. Their alternative peak is used by execution reservation, while file/split preparation charges and timed batch fill retain the same additive grouping estimate. Plain Parquet and Iceberg reader-mode virtual scans no longer reserve per-row-group table concatenation.
 
 Metadata-only scans reserve synthesized columns and temporary buffers, but no compressed data or data prefetch. Typed empty virtual columns allocate no scalar buffers. The coalescer and execution task use the same read mode for their estimates.
 

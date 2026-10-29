@@ -2,9 +2,14 @@
 #include "io/kvikio/kvikio_context.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/scan/detail/read_retirement.hpp"
+#include "op/scan/iceberg_dv_preparation.hpp"
 #include "op/scan/iceberg_gpu_ingestible.hpp"
 #include "op/scan/positional_visibility.hpp"
+#include "scan_manager/preparation_test_support.hpp"
+#include "sirius/exception.hpp"
 #include "sirius_context.hpp"
+#include "transparent/read_view_registry.hpp"
+#include "transparent/replay_admission.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/scalar/scalar.hpp>
@@ -12,19 +17,19 @@
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
 
+#include <cuda/stream>
+
 #include <catch.hpp>
-#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <duckdb/common/multi_file/multi_file_reader.hpp>
 #include <duckdb/planner/expression/bound_cast_expression.hpp>
-#include <sys/resource.h>
 #include <utils/dynamic_filter_test_utils.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/parquet_fixture_utils.hpp>
 #include <utils/table_filter_test_utils.hpp>
+#include <utils/tracking_kvikio_context.hpp>
 
-#include <chrono>
-#include <ctime>
-#include <iostream>
+#include <array>
+#include <fstream>
 #include <numeric>
 
 using namespace sirius::op::scan;
@@ -32,7 +37,7 @@ namespace {
 template <typename T>
 std::unique_ptr<cudf::column> device_column(std::vector<T> const& values,
                                             cudf::type_id type,
-                                            rmm::cuda_stream_view stream)
+                                            ::cuda::stream_ref stream)
 {
   auto col = cudf::make_numeric_column(
     cudf::data_type{type}, values.size(), cudf::mask_state::UNALLOCATED, stream);
@@ -41,13 +46,13 @@ std::unique_ptr<cudf::column> device_column(std::vector<T> const& values,
                             values.data(),
                             values.size() * sizeof(T),
                             cudaMemcpyHostToDevice,
-                            stream.value()) == cudaSuccess);
-    stream.synchronize();
+                            stream.get()) == cudaSuccess);
+    stream.sync();
   }
   return col;
 }
 template <typename T>
-std::vector<T> host_column(cudf::column_view col, rmm::cuda_stream_view stream)
+std::vector<T> host_column(cudf::column_view col, ::cuda::stream_ref stream)
 {
   std::vector<T> values(col.size());
   if (!values.empty())
@@ -55,11 +60,11 @@ std::vector<T> host_column(cudf::column_view col, rmm::cuda_stream_view stream)
                             col.data<T>(),
                             values.size() * sizeof(T),
                             cudaMemcpyDeviceToHost,
-                            stream.value()) == cudaSuccess);
-  stream.synchronize();
+                            stream.get()) == cudaSuccess);
+  stream.sync();
   return values;
 }
-std::unique_ptr<cudf::table> row_payload(int count, rmm::cuda_stream_view stream)
+std::unique_ptr<cudf::table> row_payload(int count, ::cuda::stream_ref stream)
 {
   std::vector<int32_t> data(count);
   std::iota(data.begin(), data.end(), 0);
@@ -201,4 +206,879 @@ TEST_CASE("Completed filtering retains answer layout until projection",
   CHECK_FALSE(result.predicates.front().answer_slot);
   CHECK(result.table.n_columns() == 1);
   stream.synchronize();
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "Iceberg reader positions and execution facts drive remaining work",
+                 "[scan][execution_record][row_positions][iceberg][integration]")
+{
+  auto const multi            = GENERATE(false, true);
+  auto const virtual_row      = GENERATE(false, true);
+  auto const wide_payload     = GENERATE(false, true);
+  auto const legacy_order     = GENERATE(false, true);
+  auto const authority        = GENERATE(false, true);
+  auto const offset           = GENERATE(0, 4096);
+  bool const reader_positions = !legacy_order;
+  CAPTURE(multi, virtual_row, wide_payload, legacy_order, authority, offset);
+  sirius::test::scratch_dir directory("iceberg_execution_record");
+  std::vector<std::string> paths{directory.file("a.parquet")};
+  if (multi) paths.push_back(directory.file("b.parquet"));
+  {
+    sirius::test::scoped_setting cpu(*con, "gpu_execution", false);
+    std::string payload_sql;
+    if (wide_payload)
+      for (int i = 0; i < 16; ++i)
+        payload_sql +=
+          ", (i+" + std::to_string((i + 1) * 1000000) + ")::BIGINT payload" + std::to_string(i);
+    for (auto const& name : multi ? std::vector<std::string>{"a.parquet", "b.parquet"}
+                                  : std::vector<std::string>{"a.parquet"}) {
+      auto written =
+        con->Query("COPY (SELECT i::INTEGER id, CASE WHEN i-" + std::to_string(offset) +
+                   " IN (11,301,701) THEN 200 ELSE 0 END amount, CASE WHEN i = " +
+                   std::to_string(offset + 701) + " THEN NULL ELSE 1 END region" + payload_sql +
+                   " FROM range(" + std::to_string(offset + 1000) + ") t(i) ORDER BY i) TO " +
+                   directory.file_literal(name) + " (FORMAT PARQUET, ROW_GROUP_SIZE 2048)");
+      REQUIRE(written);
+      REQUIRE_FALSE(written->HasError());
+    }
+  }
+  auto info                 = std::make_unique<iceberg_ingestible_table_info>();
+  info->resolved_file_paths = paths;
+  info->table_path          = "execution-record-table";
+  info->names               = {"id", "amount", "region"};
+  info->returned_types.assign(3, sirius::logical_type::make(sirius::type_id::INTEGER));
+  info->column_ids     = {duckdb::ColumnIndex(0), duckdb::ColumnIndex(1), duckdb::ColumnIndex(2)};
+  info->projection_ids = {0, 1, 2};
+  info->projected_output_count = 1;
+  info->approximate_batch_size = std::size_t{1} << 30;
+  if (wide_payload) {
+    info->projection_ids = {0};
+    for (int i = 0; i < 16; ++i) {
+      info->names.push_back("payload" + std::to_string(i));
+      info->returned_types.push_back(sirius::logical_type::make(sirius::type_id::BIGINT));
+      info->column_ids.emplace_back(3 + i);
+      info->projection_ids.push_back(3 + i);
+    }
+    info->projection_ids.push_back(1);
+    info->projection_ids.push_back(2);
+    info->projected_output_count = 17;
+  }
+  if (virtual_row) {
+    auto const id = duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER;
+    info->column_ids.emplace_back(id);
+    info->projection_ids.insert(info->projection_ids.begin() + 1, wide_payload ? 19 : 3);
+    ++info->projected_output_count;
+    info->virtual_columns = {{id,
+                              "file_row_number",
+                              sirius::logical_type::make(sirius::type_id::BIGINT),
+                              scan_plan::parquet_virtual_column_kind::FILE_ROW_NUMBER}};
+  }
+  info->table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
+  info->table_filters->PushFilter(
+    duckdb::ProjectionIndex(1),
+    sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_GREATERTHAN,
+                                  duckdb::Value::INTEGER(100)));
+  info->table_filters->PushFilter(duckdb::ProjectionIndex(2),
+                                  sirius::test::null_filter(duckdb::LogicalType::INTEGER, true));
+  info->delete_sets.emplace();
+  for (std::size_t i = 0; i < paths.size(); ++i) {
+    auto deleted =
+      std::make_shared<std::vector<int64_t> const>(std::vector<int64_t>{offset + (i ? 11 : 301)});
+    info->delete_sets->emplace(paths[i],
+                               std::make_shared<iceberg_delete_set const>(paths[i], deleted));
+  }
+  auto counters            = std::make_shared<physical_check_counters>();
+  counters->track_units    = true;
+  info->profiles->counters = counters;
+  std::vector<std::pair<bool, bool>> prepend;
+  counters->parquet_positions_for_testing = [&](bool row, bool source) {
+    prepend.emplace_back(row, source);
+  };
+  int decisions                        = 0;
+  counters->scan_execution_for_testing = [&](bool used_producer,
+                                             scan_execution_record const& facts) {
+    ++decisions;
+    CHECK(used_producer == authority);
+    CHECK_FALSE(facts.whole_static_complete);
+    if (authority) CHECK(facts.visibility_complete);
+    CHECK(facts.predicates.size() == (reader_positions && authority ? 1 : 0));
+    if (reader_positions && authority)
+      CHECK(facts.predicates.front().stage == sirius::op::predicate_stage::enforced);
+  };
+  auto ingestible = make_ingestible(std::move(info));
+  auto ioctx      = std::make_shared<sirius::io::kvikio_context>();
+  auto coalescer  = ingestible->create_batch_coalescer();
+  std::vector<std::unique_ptr<scan_info>> splits;
+  while (auto prepare = ingestible->next_split_provider(
+           [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; })) {
+    auto prepared = prepare({});
+    auto& file    = dynamic_cast<parquet_file_scan_info&>(*prepared);
+    CHECK(file.requires_row_positions == virtual_row);
+    CHECK(file.disable_filter_pushdown == !virtual_row);
+    if (legacy_order) {
+      file.requires_row_positions  = false;
+      file.disable_filter_pushdown = true;
+      for (auto& group : file.row_groups)
+        group.position_working_bytes = 0;
+    }
+    auto ready = coalescer->push(std::move(prepared));
+    for (auto& split : ready)
+      splits.push_back(std::move(split));
+  }
+  for (auto& split : coalescer->flush())
+    splits.push_back(std::move(split));
+  REQUIRE(splits.size() == 1);
+  CHECK(dynamic_cast<parquet_split_info const&>(*splits.front()).requires_row_positions ==
+        reader_positions);
+  auto context = sirius::test::get_registered_sirius_context(*con);
+  auto* space  = context->get_memory_manager().get_memory_space(
+    cucascade::memory::Tier::GPU, rmm::get_current_cuda_device().value());
+  REQUIRE(space);
+  rmm::cuda_stream stream;
+  auto batch =
+    ingestible->materialize_metadata_to_table(*splits.front(), *space, stream, false, nullptr);
+  REQUIRE(batch.execution);
+  CHECK(batch.execution->authoritative);
+  CHECK(batch.execution->visibility_applied.size() == paths.size());
+  REQUIRE(batch.required_visibility);
+  CHECK(batch.required_visibility->size() == paths.size());
+  batch.execution->authoritative = authority;
+  CHECK_FALSE(batch.row_positions);  // Hidden indices are released at the last consumer.
+  CHECK(batch.table.num_rows() == (reader_positions ? 2 : 999) * paths.size());
+  if (reader_positions) {
+    REQUIRE(prepend.size() == 1);
+    CHECK((prepend.front() == std::pair<bool, bool>{true, multi}));
+    // The completed, filter-only amount column has no remaining consumer.
+    // Poison it: re-evaluating that condition would now discard every survivor.
+    if (authority) {
+      auto owned = batch.table.release(stream, space->get_default_allocator());
+      REQUIRE(cudaMemsetAsync(owned->mutable_view().column(wide_payload ? 17 : 1).data<int32_t>(),
+                              0,
+                              owned->num_rows() * sizeof(int32_t),
+                              stream.value()) == cudaSuccess);
+      batch.table = owning_table_view(std::move(owned));
+    }
+  } else if (virtual_row) {
+    REQUIRE(prepend.size() == 1);
+    CHECK((prepend.front() == std::pair<bool, bool>{true, false}));
+  } else {
+    CHECK(prepend.empty());
+  }
+  auto output = ingestible->post_filter_and_project(std::move(batch), *space, stream);
+  CHECK(decisions == 1);
+  CHECK(counters->execution_record_shadow_mismatches.load() == 0);
+  CHECK(counters->execution_record_shadow_coverage_added.load() ==
+        (!authority && reader_positions ? 1 : 0));
+  REQUIRE(output->num_columns() == 1 + static_cast<int>(virtual_row) + (wide_payload ? 16 : 0));
+  auto ids = host_column<int32_t>(output->view().column(0), stream);
+  CHECK(ids == (multi ? std::vector<int32_t>{offset + 11, offset + 301}
+                      : std::vector<int32_t>{offset + 11}));
+  if (virtual_row) {
+    auto rows = host_column<int64_t>(output->view().column(1), stream);
+    CHECK(rows == std::vector<int64_t>(ids.begin(), ids.end()));
+  }
+  if (wide_payload) {
+    for (int i = 0; i < 16; ++i) {
+      std::vector<int64_t> expected;
+      for (auto id : ids)
+        expected.push_back(id + (i + 1) * 1000000);
+      CHECK(host_column<int64_t>(output->view().column(1 + static_cast<int>(virtual_row) + i),
+                                 stream) == expected);
+    }
+  }
+  if (!multi && !virtual_row && !legacy_order && authority && offset == 0) {
+    for (int fault : {0, 1, 2, 3}) {
+      auto invalid =
+        ingestible->materialize_metadata_to_table(*splits.front(), *space, stream, false, nullptr);
+      if (fault == 0) invalid.execution->visibility_applied.clear();
+      if (fault == 1) invalid.execution->visibility_applied.front().file = "foreign-file";
+      if (fault == 2)
+        invalid.execution->visibility_applied.front().input = std::make_shared<int const>(1);
+      if (fault == 3) invalid.required_visibility.reset();
+      REQUIRE_THROWS_AS(ingestible->post_filter_and_project(std::move(invalid), *space, stream),
+                        std::invalid_argument);
+    }
+  }
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "Position requests follow actual consumers",
+                 "[scan][row_positions][execution_record][integration]")
+{
+  auto const mode    = std::string(GENERATE("parquet",
+                                         "iceberg_empty",
+                                         "iceberg_unfiltered",
+                                         "iceberg_dynamic",
+                                         "iceberg_dynamic_pending",
+                                         "iceberg_dynamic_late",
+                                         "iceberg_cast",
+                                         "iceberg_partial",
+                                         "iceberg_all",
+                                         "iceberg_unselected"));
+  bool const dynamic = mode == "iceberg_dynamic" || mode == "iceberg_dynamic_pending" ||
+                       mode == "iceberg_dynamic_late";
+  auto const virtual_kind = GENERATE(0, 1, 2);  // none, row number, filename
+  bool const reader_positions =
+    dynamic || mode == "iceberg_partial" || mode == "iceberg_all" || mode == "iceberg_unselected";
+  bool const actual_positions = reader_positions && mode != "iceberg_dynamic_pending";
+  CAPTURE(mode, virtual_kind);
+  sirius::test::scratch_dir directory("position_demand");
+  auto const path = directory.file("input.parquet");
+  {
+    sirius::test::scoped_setting cpu(*con, "gpu_execution", false);
+    std::string payload;
+    for (int i = 0; i < 32; ++i)
+      payload += ", i::BIGINT payload" + std::to_string(i);
+    auto written =
+      con->Query("COPY (SELECT i::INTEGER id" + payload + " FROM range(1000) t(i)) TO " +
+                 directory.file_literal("input.parquet") + " (FORMAT PARQUET)");
+    REQUIRE(written);
+    REQUIRE_FALSE(written->HasError());
+  }
+  std::unique_ptr<parquet_ingestible_table_info> info;
+  if (mode == "parquet")
+    info = std::make_unique<parquet_ingestible_table_info>();
+  else {
+    auto iceberg        = std::make_unique<iceberg_ingestible_table_info>();
+    iceberg->table_path = "position-demand";
+    iceberg->delete_sets.emplace();
+    std::vector<int64_t> positions;
+    if (mode == "iceberg_unfiltered" || dynamic || mode == "iceberg_cast" ||
+        mode == "iceberg_partial")
+      positions = {301};
+    if (mode == "iceberg_unselected") positions = {11};
+    if (mode == "iceberg_all") {
+      positions.resize(1000);
+      std::iota(positions.begin(), positions.end(), 0);
+    }
+    auto deleted = std::make_shared<std::vector<int64_t> const>(std::move(positions));
+    iceberg->delete_sets->emplace(path, std::make_shared<iceberg_delete_set const>(path, deleted));
+    info = std::move(iceberg);
+  }
+  info->resolved_file_paths    = {path};
+  info->names                  = {"id"};
+  info->returned_types         = {sirius::logical_type::make(sirius::type_id::INTEGER)};
+  info->column_ids             = {duckdb::ColumnIndex(0)};
+  info->projected_output_count = virtual_kind ? 34 : 33;
+  info->approximate_batch_size = std::size_t{1} << 30;
+  for (int i = 0; i < 32; ++i) {
+    info->names.push_back("payload" + std::to_string(i));
+    info->returned_types.push_back(sirius::logical_type::make(sirius::type_id::BIGINT));
+    info->column_ids.emplace_back(1 + i);
+  }
+  if (virtual_kind) {
+    auto const id = virtual_kind == 1 ? duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER
+                                      : duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILENAME;
+    info->column_ids.emplace_back(id);
+    info->virtual_columns = {
+      {id,
+       virtual_kind == 1 ? "file_row_number" : "filename",
+       sirius::logical_type::make(virtual_kind == 1 ? sirius::type_id::BIGINT
+                                                    : sirius::type_id::VARCHAR),
+       virtual_kind == 1 ? scan_plan::parquet_virtual_column_kind::FILE_ROW_NUMBER
+                         : scan_plan::parquet_virtual_column_kind::FILENAME}};
+  }
+  std::optional<sirius::op::sirius_dynamic_filter_set::producer> dynamic_producer;
+  auto publish_dynamic = [&] {
+    using namespace sirius::op;
+    std::vector<zone_map_entry> zones;
+    zones.push_back({std::make_unique<cudf::numeric_scalar<int32_t>>(100, true),
+                     std::make_unique<cudf::numeric_scalar<int32_t>>(399, true)});
+    REQUIRE(dynamic_producer->push_filter(
+      0, std::make_shared<sirius_dynamic_zone_map_filter>(std::move(zones))));
+    dynamic_producer->finish(sirius_dynamic_filter_set::completion::PUBLISHED);
+  };
+  if (dynamic) {
+    using namespace sirius::op;
+    info->table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
+    info->table_filters->PushFilter(duckdb::ProjectionIndex(0),
+                                    sirius::test::null_filter(duckdb::LogicalType::INTEGER, true));
+    info->sirius_dynamic_filters = std::make_shared<sirius_dynamic_filter_set>();
+    dynamic_producer.emplace(info->sirius_dynamic_filters->register_producer({0}));
+    if (mode == "iceberg_dynamic") publish_dynamic();
+  } else if (mode != "iceberg_unfiltered") {
+    info->table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
+    info->table_filters->PushFilter(
+      duckdb::ProjectionIndex(0),
+      sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_GREATERTHAN,
+                                    duckdb::Value::INTEGER(100)));
+    if (mode == "iceberg_cast") {
+      auto cast = duckdb::BoundCastExpression::AddDefaultCastToType(
+        duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0),
+        duckdb::LogicalType::SMALLINT);
+      info->table_filters->PushFilter(
+        duckdb::ProjectionIndex(0),
+        // The NULL test keeps this cast in the residual. Even though the reader
+        // subset is a safe comparison, early selection could hide residual errors.
+        duckdb::make_uniq<duckdb::ExpressionFilter>(
+          duckdb::ExpressionFilter::CreateNullCheckExpression(
+            std::move(cast), duckdb::ExpressionType::OPERATOR_IS_NOT_NULL)));
+    }
+  }
+  auto counters            = std::make_shared<physical_check_counters>();
+  counters->track_units    = true;
+  info->profiles->counters = counters;
+  int row_requests = 0, source_requests = 0;
+  counters->parquet_positions_for_testing = [&](bool row, bool source) {
+    row_requests += row;
+    source_requests += source;
+  };
+  std::shared_ptr<gpu_ingestible> ingestible;
+  if (mode == "parquet")
+    ingestible = make_ingestible(std::move(info));
+  else
+    ingestible = make_ingestible(std::unique_ptr<iceberg_ingestible_table_info>(
+      static_cast<iceberg_ingestible_table_info*>(info.release())));
+  auto ioctx   = std::make_shared<sirius::io::kvikio_context>();
+  auto prepare = ingestible->next_split_provider(
+    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+  auto prepared = prepare({});
+  CHECK(dynamic_cast<parquet_file_scan_info&>(*prepared).requires_row_positions ==
+        (reader_positions && virtual_kind != 0));
+  if (mode == "iceberg_cast")
+    CHECK(dynamic_cast<parquet_file_scan_info&>(*prepared).disable_filter_pushdown);
+  auto coalescer = ingestible->create_batch_coalescer();
+  auto splits    = coalescer->push(std::move(prepared));
+  for (auto& split : coalescer->flush())
+    splits.push_back(std::move(split));
+  REQUIRE(splits.size() == 1);
+  if (mode == "iceberg_dynamic_late") publish_dynamic();
+  CHECK(dynamic_cast<parquet_split_info const&>(*splits.front()).requires_row_positions ==
+        reader_positions);
+  auto context = sirius::test::get_registered_sirius_context(*con);
+  auto* space  = context->get_memory_manager().get_memory_space(
+    cucascade::memory::Tier::GPU, rmm::get_current_cuda_device().value());
+  REQUIRE(space);
+  rmm::cuda_stream stream;
+  auto batch =
+    ingestible->materialize_metadata_to_table(*splits.front(), *space, stream, false, nullptr);
+  CHECK_FALSE(batch.row_positions);
+  CHECK(row_requests == (actual_positions || virtual_kind == 1 ? 1 : 0));
+  CHECK(source_requests == 0);  // One file's context is sufficient, even for filename output.
+  if (mode == "parquet" && !virtual_kind) {
+    REQUIRE(batch.execution);
+    batch.execution->authoritative = true;
+    auto width                     = batch.execution->layout_width;
+    batch.execution->layout_width  = batch.table.n_columns() + 1;
+    REQUIRE_THROWS_AS(ingestible->view_layout(batch, {}), std::invalid_argument);
+    batch.execution->layout_width = width;
+    auto layout                   = batch.execution->layout;
+    batch.execution->layout       = std::make_shared<int const>(0);
+    REQUIRE_THROWS_AS(ingestible->view_layout(batch, {}), std::invalid_argument);
+    batch.execution->layout = std::move(layout);
+  }
+  if (dynamic) {
+    REQUIRE(batch.execution);
+    CHECK_FALSE(batch.execution->whole_static_complete);
+    CHECK(batch.execution->predicates.empty());
+    CHECK(batch.execution->visibility_complete);
+    batch.execution->authoritative = true;
+    CHECK(batch.table.num_rows() == (actual_positions ? 299 : 999));
+  }
+  auto output = ingestible->post_filter_and_project(std::move(batch), *space, stream);
+  CHECK(output->num_rows() == (mode == "iceberg_all"          ? 0
+                               : mode == "iceberg_partial"    ? 898
+                               : dynamic                      ? (actual_positions ? 299 : 999)
+                               : mode == "iceberg_unfiltered" ? 999
+                               : mode == "iceberg_cast"       ? 898
+                                                              : 899));
+  CHECK(output->num_columns() == (virtual_kind ? 34 : 33));
+  stream.synchronize();
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "Unfiltered Iceberg virtual rows use one reader across row groups",
+                 "[scan][execution_record][row_positions][iceberg][integration]")
+{
+  bool const multi        = GENERATE(false, true);
+  auto const delete_files = GENERATE(0, 1, 2, 3);
+  CAPTURE(multi, delete_files);
+  sirius::test::scratch_dir directory("iceberg_virtual_reader");
+  auto info        = std::make_unique<iceberg_ingestible_table_info>();
+  info->table_path = "virtual-reader";
+  info->delete_sets.emplace();
+  {
+    sirius::test::scoped_setting cpu(*con, "gpu_execution", false);
+    for (int file = 0; file < (multi ? 2 : 1); ++file) {
+      auto name = std::to_string(file) + ".parquet";
+      auto written =
+        con->Query("COPY (SELECT i::INTEGER id FROM range(6144) t(i)) TO " +
+                   directory.file_literal(name) + " (FORMAT PARQUET, ROW_GROUP_SIZE 2048)");
+      REQUIRE(written);
+      REQUIRE_FALSE(written->HasError());
+      auto path = directory.file(name);
+      info->resolved_file_paths.push_back(path);
+      auto positions = std::make_shared<std::vector<int64_t> const>(
+        delete_files & (1 << file) ? std::vector<int64_t>{11, 4097} : std::vector<int64_t>{});
+      info->delete_sets->emplace(path, std::make_shared<iceberg_delete_set const>(path, positions));
+    }
+  }
+  auto const row_id            = duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER;
+  info->names                  = {"id"};
+  info->returned_types         = {sirius::logical_type::make(sirius::type_id::INTEGER)};
+  info->column_ids             = {duckdb::ColumnIndex(0), duckdb::ColumnIndex(row_id)};
+  info->virtual_columns        = {{row_id,
+                                   "file_row_number",
+                                   sirius::logical_type::make(sirius::type_id::BIGINT),
+                                   scan_plan::parquet_virtual_column_kind::FILE_ROW_NUMBER}};
+  info->projected_output_count = 2;
+  info->approximate_batch_size = std::size_t{1} << 30;
+  auto counters                = std::make_shared<physical_check_counters>();
+  counters->track_units        = true;
+  info->profiles->counters     = counters;
+  int requests = 0, decoded_sources = 0;
+  counters->parquet_positions_for_testing = [&](bool row, bool source) {
+    ++requests;
+    CHECK(row);
+    CHECK_FALSE(source);
+  };
+  counters->parquet_phase_for_testing = [&](std::string const&, bool footer) {
+    decoded_sources += !footer;
+  };
+  auto reader    = make_ingestible(std::move(info));
+  auto ioctx     = std::make_shared<sirius::io::kvikio_context>();
+  auto coalescer = reader->create_batch_coalescer();
+  std::vector<std::unique_ptr<scan_info>> splits;
+  std::size_t groups = 0;
+  while (auto prepare = reader->next_split_provider(
+           [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; })) {
+    auto metadata = prepare({});
+    groups += dynamic_cast<parquet_file_scan_info const&>(*metadata).row_groups.size();
+    for (auto& split : coalescer->push(std::move(metadata)))
+      splits.push_back(std::move(split));
+  }
+  for (auto& split : coalescer->flush())
+    splits.push_back(std::move(split));
+  REQUIRE(groups == (multi ? 6 : 3));
+  REQUIRE(splits.size() == 1);
+  CHECK_FALSE(dynamic_cast<parquet_split_info const&>(*splits.front()).requires_row_positions);
+  auto context = sirius::test::get_registered_sirius_context(*con);
+  auto* space  = context->get_memory_manager().get_memory_space(
+    cucascade::memory::Tier::GPU, rmm::get_current_cuda_device().value());
+  REQUIRE(space);
+  rmm::cuda_stream stream;
+  auto batch =
+    reader->materialize_metadata_to_table(*splits.front(), *space, stream, false, nullptr);
+  CHECK_FALSE(batch.row_positions);
+  auto output = reader->post_filter_and_project(std::move(batch), *space, stream);
+  CHECK(requests == 1);
+  CHECK(decoded_sources == (multi ? 2 : 1));
+  auto ids  = host_column<int32_t>(output->view().column(0), stream);
+  auto rows = host_column<int64_t>(output->view().column(1), stream);
+  std::vector<int64_t> expected;
+  for (int file = 0; file < (multi ? 2 : 1); ++file)
+    for (int64_t row = 0; row < 6144; ++row)
+      if (!(delete_files & (1 << file)) || (row != 11 && row != 4097)) expected.push_back(row);
+  CHECK(rows == expected);
+  CHECK(std::equal(ids.begin(), ids.end(), expected.begin(), expected.end()));
+}
+
+TEST_CASE("Shared materialization consumes only pending delete bindings",
+          "[scan][execution_record][materialization]")
+{
+  auto set_a = std::make_shared<int const>(1), set_b = std::make_shared<int const>(2);
+  auto required =
+    std::make_shared<visibility_bindings const>(visibility_bindings{{"a", set_a}, {"b", set_b}});
+  materialization_program program;
+  program.contract = program.generation = 1;
+  program.validate_output_schema        = false;
+  program.required_visibility           = required;
+  materialized_batch batch;
+  batch.contract = batch.generation = 1;
+  batch.logical_schema_complete = batch.projection_complete = true;
+  batch.visibility_applied                                  = {{"a", set_a}};
+  int calls                                                 = 0;
+  materialization_steps steps;
+  steps.bound_visibility = [&](materialized_batch&, auto pending) {
+    ++calls;
+    REQUIRE(pending.size() == 1);
+    CHECK(pending.front().file == "b");
+    CHECK(pending.front().input == set_b);
+  };
+  auto done = finish_materialization(std::move(batch), program, steps);
+  CHECK(done.visibility_complete);
+  CHECK(done.visibility_applied.size() == 2);
+  done = finish_materialization(std::move(done), program, steps);
+  CHECK(calls == 1);
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "Reader and Hive partial coverage respect qualified route authority",
+                 "[scan][execution_record][hive][integration]")
+{
+  bool const hive = GENERATE(false, true);
+  bool const bulk = GENERATE(false, true);
+  // No predicate, full/partial reader pushdown, and a residual-only predicate.
+  int const filter_kind = GENERATE(0, 1, 2, 3);
+  CAPTURE(hive, bulk, filter_kind);
+  sirius::test::scratch_dir directory("hive_execution_record");
+  std::filesystem::create_directories(directory.path() / "year=2024");
+  auto path = directory.file("year=2024/input.parquet");
+  {
+    sirius::test::scoped_setting cpu(*con, "gpu_execution", false);
+    auto written = con->Query(
+      "COPY (SELECT i::INTEGER id, CASE WHEN i IN (11,301) THEN 200 ELSE 0 END amount, CASE WHEN "
+      "i=301 THEN NULL ELSE 1 END region FROM range(1000) t(i)) TO " +
+      directory.file_literal("year=2024/input.parquet") + " (FORMAT PARQUET)");
+    REQUIRE(written);
+    REQUIRE_FALSE(written->HasError());
+  }
+  auto info                 = std::make_unique<parquet_ingestible_table_info>();
+  info->resolved_file_paths = {path};
+  info->names               = {"id", "amount", "region", "year"};
+  info->returned_types.assign(4, sirius::logical_type::make(sirius::type_id::INTEGER));
+  info->column_ids     = {duckdb::ColumnIndex(0), duckdb::ColumnIndex(1), duckdb::ColumnIndex(2)};
+  info->projection_ids = {0, 1, 2};
+  info->projected_output_count = 1;
+  if (hive) {
+    info->column_ids.emplace_back(3);
+    info->projection_ids         = {0, 3, 1, 2};
+    info->projected_output_count = 2;
+    info->partition_indices      = {duckdb::HivePartitioningIndex("2024", 3)};
+  }
+  if (filter_kind) {
+    info->table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
+    if (filter_kind != 3)
+      info->table_filters->PushFilter(
+        duckdb::ProjectionIndex(1),
+        sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_GREATERTHAN,
+                                      duckdb::Value::INTEGER(100)));
+    if (filter_kind >= 2)
+      info->table_filters->PushFilter(
+        duckdb::ProjectionIndex(2), sirius::test::null_filter(duckdb::LogicalType::INTEGER, true));
+  }
+  auto counters            = std::make_shared<physical_check_counters>();
+  counters->track_units    = true;
+  info->profiles->counters = counters;
+  int residual_calls = 0, decisions = 0;
+  counters->parquet_filter_for_testing = [&](bool filtered, uint64_t rows) {
+    CHECK(filtered == (filter_kind == 1 || filter_kind == 2));
+    CHECK(rows == (filter_kind == 1 || filter_kind == 2 ? 2 : 1000));
+  };
+  counters->scan_residual_for_testing = [&](auto const& pending) {
+    ++residual_calls;
+    // Both bulk routes retain legacy authority, including the inline Hive decision.
+    REQUIRE(pending.size() == (bulk && filter_kind == 2 ? 2 : 1));
+  };
+  counters->scan_execution_for_testing = [&](bool authority, auto const& facts) {
+    ++decisions;
+    CHECK(authority == !bulk);
+    CHECK(facts.whole_static_complete == (hive || filter_kind < 2));
+    CHECK(facts.projection_complete == hive);
+  };
+  auto reader  = make_ingestible(std::move(info));
+  auto ioctx   = std::make_shared<sirius::test::tracking_kvikio_context>(bulk);
+  auto prepare = reader->next_split_provider(
+    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+  auto coalescer = reader->create_batch_coalescer();
+  auto splits    = coalescer->push(prepare({}));
+  for (auto& split : coalescer->flush())
+    splits.push_back(std::move(split));
+  REQUIRE(splits.size() == 1);
+  auto context = sirius::test::get_registered_sirius_context(*con);
+  auto* space  = context->get_memory_manager().get_memory_space(
+    cucascade::memory::Tier::GPU, rmm::get_current_cuda_device().value());
+  REQUIRE(space);
+  rmm::cuda_stream stream;
+  auto batch =
+    reader->materialize_metadata_to_table(*splits.front(), *space, stream, false, nullptr);
+  REQUIRE(batch.execution);
+  CHECK(batch.execution->authoritative == !bulk);
+  auto const input_rows = filter_kind == 0           ? 1000
+                          : filter_kind == 3         ? (hive ? 999 : 1000)
+                          : hive && filter_kind == 2 ? 1
+                                                     : 2;
+  CHECK(batch.table.num_rows() == input_rows);
+  auto output = reader->post_filter_and_project(std::move(batch), *space, stream);
+  CHECK(residual_calls == (filter_kind >= 2 ? 1 : 0));
+  CHECK(decisions == 1);
+  REQUIRE(output->num_columns() == (hive ? 2 : 1));
+  std::vector<int32_t> expected =
+    filter_kind == 2 ? std::vector<int32_t>{11} : std::vector<int32_t>{11, 301};
+  if (filter_kind == 0 || filter_kind == 3) {
+    expected.resize(1000);
+    std::iota(expected.begin(), expected.end(), 0);
+    if (filter_kind == 3) expected.erase(expected.begin() + 301);
+  }
+  CHECK(host_column<int32_t>(output->view().column(0), stream) == expected);
+  if (hive)
+    CHECK(host_column<int32_t>(output->view().column(1), stream) ==
+          std::vector<int32_t>(expected.size(), 2024));
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "Iceberg residual errors preserve deletion before unsafe evaluation",
+                 "[scan][execution_record][iceberg][integration]")
+{
+  auto const deleted_row = GENERATE(-1, 0, 9);  // Empty set, bad row, or an unrelated row.
+  auto const authority   = GENERATE(false, true);
+  auto const virtual_row = GENERATE(false, true);
+  // Without virtual columns or deletes, preserve the already-enabled reader filter.
+  bool const reader_filtered = deleted_row == -1 && !virtual_row;
+  CAPTURE(deleted_row, authority, virtual_row);
+  sirius::test::scratch_dir directory("iceberg_execution_error");
+  auto path = directory.file("input.parquet");
+  {
+    sirius::test::scoped_setting cpu(*con, "gpu_execution", false);
+    std::string payload;
+    for (int i = 0; i < 32; ++i)
+      payload += ", i::BIGINT payload" + std::to_string(i);
+    auto written = con->Query(
+      "COPY (SELECT i::INTEGER id, CASE WHEN i=0 THEN DATE '10000-01-01' ELSE DATE '2024-01-01' "
+      "END d" +
+      payload + " FROM range(10) t(i)) TO " + directory.file_literal("input.parquet") +
+      " (FORMAT PARQUET)");
+    REQUIRE(written);
+    REQUIRE_FALSE(written->HasError());
+  }
+  auto info                 = std::make_unique<iceberg_ingestible_table_info>();
+  info->resolved_file_paths = {path};
+  info->table_path          = "error-order";
+  info->names               = {"id", "d"};
+  info->returned_types      = {sirius::logical_type::make(sirius::type_id::INTEGER),
+                               sirius::logical_type::make(sirius::type_id::DATE)};
+  info->column_ids          = {duckdb::ColumnIndex(0), duckdb::ColumnIndex(1)};
+  info->projection_ids      = {0};
+  for (int i = 0; i < 32; ++i) {
+    info->names.push_back("payload" + std::to_string(i));
+    info->returned_types.push_back(sirius::logical_type::make(sirius::type_id::BIGINT));
+    info->column_ids.emplace_back(2 + i);
+    info->projection_ids.push_back(2 + i);
+  }
+  info->projected_output_count = 33;
+  info->approximate_batch_size = std::size_t{1} << 30;
+  // The unsafe cast must preserve deletes-before-filter independently of payload
+  // width and whether a virtual column consumes original reader positions.
+  if (virtual_row) {
+    auto const row_id = duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER;
+    info->column_ids.emplace_back(row_id);
+    info->projection_ids.push_back(34);
+    ++info->projected_output_count;
+    info->virtual_columns = {{row_id,
+                              "file_row_number",
+                              sirius::logical_type::make(sirius::type_id::BIGINT),
+                              scan_plan::parquet_virtual_column_kind::FILE_ROW_NUMBER}};
+  }
+  info->projection_ids.push_back(1);
+  info->table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
+  info->table_filters->PushFilter(
+    duckdb::ProjectionIndex(0),
+    sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_GREATERTHAN,
+                                  duckdb::Value::INTEGER(0)));
+  auto cast = duckdb::BoundCastExpression::AddDefaultCastToType(
+    duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::DATE, 0),
+    duckdb::LogicalType::TIMESTAMP_NS);
+  info->table_filters->PushFilter(
+    duckdb::ProjectionIndex(1),
+    duckdb::make_uniq<duckdb::ExpressionFilter>(duckdb::ExpressionFilter::CreateNullCheckExpression(
+      std::move(cast), duckdb::ExpressionType::OPERATOR_IS_NOT_NULL)));
+  info->delete_sets.emplace();
+  info->delete_sets->emplace(
+    path,
+    std::make_shared<iceberg_delete_set const>(
+      path,
+      std::make_shared<std::vector<int64_t> const>(
+        deleted_row < 0 ? std::vector<int64_t>{} : std::vector<int64_t>{deleted_row})));
+  auto reader  = make_ingestible(std::move(info));
+  auto ioctx   = std::make_shared<sirius::io::kvikio_context>();
+  auto prepare = reader->next_split_provider(
+    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+  auto metadata    = prepare({});
+  auto const& file = dynamic_cast<parquet_file_scan_info const&>(*metadata);
+  CHECK_FALSE(file.position_filter_eligible);
+  CHECK_FALSE(file.requires_row_positions);
+  CHECK(file.disable_filter_pushdown == !reader_filtered);
+  auto coalescer = reader->create_batch_coalescer();
+  auto splits    = coalescer->push(std::move(metadata));
+  for (auto& split : coalescer->flush())
+    splits.push_back(std::move(split));
+  REQUIRE(splits.size() == 1);
+  auto context = sirius::test::get_registered_sirius_context(*con);
+  auto* space  = context->get_memory_manager().get_memory_space(
+    cucascade::memory::Tier::GPU, rmm::get_current_cuda_device().value());
+  REQUIRE(space);
+  rmm::cuda_stream stream;
+  auto batch =
+    reader->materialize_metadata_to_table(*splits.front(), *space, stream, false, nullptr);
+  REQUIRE(batch.execution);
+  batch.execution->authoritative = authority;
+  if (deleted_row == 0 || reader_filtered) {
+    auto output = reader->post_filter_and_project(std::move(batch), *space, stream);
+    CHECK(output->num_rows() == 9);
+  } else {
+    REQUIRE_THROWS_MATCHES(reader->post_filter_and_project(std::move(batch), *space, stream),
+                           sirius::invalid_input_exception,
+                           Catch::Matchers::Message("DATE value is out of range for TIMESTAMP"));
+  }
+  stream.synchronize();
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "Deferred Iceberg deletion vector drives internal reader positions",
+                 "[scan][execution_record][row_positions][iceberg][integration]")
+{
+  using namespace sirius::scan_manager;
+  auto const legacy_order = GENERATE(false, true);
+  sirius::test::scratch_dir directory("iceberg_internal_dv");
+  auto path   = directory.file("input.parquet");
+  auto dvpath = directory.file("input.puffin");
+  {
+    sirius::test::scoped_setting cpu(*con, "gpu_execution", false);
+    std::string payload;
+    for (int i = 0; i < 16; ++i)
+      payload +=
+        ", (i+" + std::to_string((i + 1) * 1000000) + ")::BIGINT payload" + std::to_string(i);
+    auto written = con->Query("COPY (SELECT i::INTEGER id, (i%100)::INTEGER amount" + payload +
+                              " FROM range(1000) t(i)) TO " +
+                              directory.file_literal("input.parquet") + " (FORMAT PARQUET)");
+    REQUIRE(written);
+    REQUIRE_FALSE(written->HasError());
+  }
+  // Reuse a real, checksummed DV bitmap for rows 1 and 3, but bind its Puffin
+  // footer to this data file. Both the manifest and footer are validated below.
+  {
+    std::ifstream fixture(
+      "test/cpp/integration/data/iceberg_v3_deletion_vector/data/"
+      "dv-00000-0-d7e8f9a0-0007-0007-0007-000000000002-00001.puffin",
+      std::ios::binary);
+    REQUIRE(fixture);
+    fixture.seekg(4);
+    std::array<char, 44> blob{};
+    fixture.read(blob.data(), blob.size());
+    REQUIRE(fixture.gcount() == blob.size());
+    auto footer =
+      "{\"blobs\":[{\"type\":\"deletion-vector-v1\",\"fields\":[],"
+      "\"snapshot-id\":-1,\"sequence-number\":-1,\"offset\":4,\"length\":44,"
+      "\"properties\":{\"referenced-data-file\":\"" +
+      path + "\",\"cardinality\":\"2\"}}],\"properties\":{}}";
+    std::ofstream output(dvpath, std::ios::binary);
+    output.write("PFA1", 4);
+    output.write(blob.data(), blob.size());
+    output.write("PFA1", 4);
+    output.write(footer.data(), footer.size());
+    for (int shift = 0; shift < 32; shift += 8)
+      output.put(static_cast<char>((footer.size() >> shift) & 0xff));
+    for (int i = 0; i < 4; ++i)
+      output.put(0);
+    output.write("PFA1", 4);
+    REQUIRE(output.good());
+  }
+  test::test_reservation_provider provider;
+  provider.grant_bytes = 64 * 1024;
+  auto ledger          = std::make_shared<preparation_ledger>(provider);
+  auto discovery       = std::make_shared<iceberg_delete_discovery>();
+  IcebergDeleteFileEntry dv;
+  dv.file_path             = dvpath;
+  dv.file_format           = "puffin";
+  dv.referenced_data_file  = path;
+  dv.content_offset        = 4;
+  dv.content_size_in_bytes = 44;
+  dv.file_size_in_bytes    = std::filesystem::file_size(dvpath);
+  dv.record_count          = 2;
+  discovery->deletion_vector_entries.push_back(std::move(dv));
+  std::vector<std::string> paths{path};
+  auto envelope = iceberg_dv_preparation::envelope(*discovery, paths);
+  REQUIRE(ledger->admit(std::array{envelope}, memory_space_id(cucascade::memory::Tier::HOST, 0))
+            .deferred);
+  auto views    = std::make_shared<sirius::transparent::read_view_registry>();
+  auto contract = allocate_scan_contract(
+    *views, {}, 0, 1, nullptr, {}, {}, {materializer_kind::iceberg, "iceberg.v1"});
+  auto plan =
+    std::make_shared<iceberg_dv_preparation>(contract, "internal-dv", paths, discovery, *ledger);
+  auto info                 = std::make_unique<iceberg_ingestible_table_info>();
+  info->contract_id         = contract;
+  info->read_views          = views;
+  info->table_path          = "internal-dv";
+  info->resolved_file_paths = paths;
+  info->deferred            = plan;
+  info->names               = {"id", "amount"};
+  info->returned_types.assign(2, sirius::logical_type::make(sirius::type_id::INTEGER));
+  info->column_ids     = {duckdb::ColumnIndex(0), duckdb::ColumnIndex(1)};
+  info->projection_ids = {0};
+  for (int i = 0; i < 16; ++i) {
+    info->names.push_back("payload" + std::to_string(i));
+    info->returned_types.push_back(sirius::logical_type::make(sirius::type_id::BIGINT));
+    info->column_ids.emplace_back(2 + i);
+    info->projection_ids.push_back(2 + i);
+  }
+  info->projection_ids.push_back(1);
+  info->projected_output_count = 17;
+  info->approximate_batch_size = std::size_t{1} << 30;
+  info->table_filters          = duckdb::make_uniq<duckdb::TableFilterSet>();
+  info->table_filters->PushFilter(
+    duckdb::ProjectionIndex(1),
+    sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_LESSTHAN,
+                                  duckdb::Value::INTEGER(3)));
+  auto counters                           = std::make_shared<physical_check_counters>();
+  counters->track_units                   = true;
+  info->profiles->counters                = counters;
+  int position_calls                      = 0;
+  counters->parquet_positions_for_testing = [&](bool row, bool source) {
+    ++position_calls;
+    CHECK(row);
+    CHECK_FALSE(source);
+  };
+  auto reader = make_ingestible(std::move(info));
+  reader->attach_preparation_ledger(ledger);
+  auto ioctx   = std::make_shared<sirius::io::kvikio_context>();
+  auto claimed = reader->try_claim_split(
+    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+  REQUIRE(std::holds_alternative<preparation_job>(claimed));
+  auto work = std::move(std::get<preparation_job>(claimed));
+  work.unit = std::make_shared<preparation_unit>(work.requirement->key, work.requirement->required);
+  auto metadata = work.run({});
+  CHECK(counters->iceberg_delete_payload_loads == 1);
+  auto& file = dynamic_cast<parquet_file_scan_info&>(*metadata);
+  REQUIRE(file.row_groups.size() == 1);
+  CHECK(file.row_groups.front().selected_deletes == 2);
+  if (legacy_order) file.row_groups.front().position_working_bytes = 0;
+  auto coalescer = reader->create_batch_coalescer();
+  auto splits    = coalescer->push(std::move(metadata));
+  for (auto& split : coalescer->flush())
+    splits.push_back(std::move(split));
+  REQUIRE(splits.size() == 1);
+  CHECK(dynamic_cast<parquet_split_info const&>(*splits.front()).requires_row_positions ==
+        !legacy_order);
+  auto context = sirius::test::get_registered_sirius_context(*con);
+  auto* space  = context->get_memory_manager().get_memory_space(
+    cucascade::memory::Tier::GPU, rmm::get_current_cuda_device().value());
+  REQUIRE(space);
+  rmm::cuda_stream stream;
+  auto batch =
+    reader->materialize_metadata_to_table(*splits.front(), *space, stream, false, nullptr);
+  REQUIRE(batch.execution);
+  CHECK(batch.execution->authoritative);
+  REQUIRE(batch.required_visibility);
+  REQUIRE(batch.required_visibility->size() == 1);
+  REQUIRE(batch.execution->visibility_applied.size() == 1);
+  CHECK(batch.execution->visibility_applied.front().file ==
+        batch.required_visibility->front().file);
+  CHECK(batch.execution->visibility_applied.front().input ==
+        batch.required_visibility->front().input);
+  CHECK(batch.execution->visibility_complete);
+  CHECK(batch.execution->whole_static_complete == !legacy_order);
+  CHECK_FALSE(batch.row_positions);
+  CHECK(position_calls == (legacy_order ? 0 : 1));
+  auto output = reader->post_filter_and_project(std::move(batch), *space, stream);
+  std::vector<int32_t> expected;
+  for (int i = 0; i < 1000; ++i)
+    if (i % 100 < 3 && i != 1 && i != 3) expected.push_back(i);
+  REQUIRE(output->num_columns() == 17);
+  CHECK(host_column<int32_t>(output->view().column(0), stream) == expected);
+  for (int col = 0; col < 16; ++col) {
+    std::vector<int64_t> payload;
+    for (auto id : expected)
+      payload.push_back(id + (col + 1) * 1000000);
+    CHECK(host_column<int64_t>(output->view().column(col + 1), stream) == payload);
+  }
+  output.reset();
+  splits.clear();
+  work = {};
+  reader->finish_preparation();
+  CHECK(ledger->tracked_units() == 0);
+  reader.reset();
+  plan.reset();
+  ledger->close();
+  ledger.reset();
+  CHECK(provider.outstanding() == 0);
 }

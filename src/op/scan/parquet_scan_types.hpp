@@ -186,7 +186,7 @@ struct filename_column_size_estimate {
 [[nodiscard]] filename_column_size_estimate estimate_filename_column_size(std::size_t rows,
                                                                           std::size_t path_bytes);
 
-/// Iceberg keeps its contiguous row-group/delete-layout contract.
+/// Physical source semantics are independent of reader provenance requests.
 enum class parquet_source_kind { PLAIN_PARQUET, ICEBERG };
 enum class parquet_read_mode { READER, METADATA_ONLY };
 
@@ -246,6 +246,9 @@ class parquet_split_info : public scan_info {
   bool disable_filter_pushdown = false;
   // Internal visibility demand. Virtual-column requests are computed independently.
   bool requires_row_positions = false;
+  // Internal-only positions are selected after legacy grouping. Their execution
+  // peak must not change the additive preparation charge inherited from files.
+  std::optional<std::size_t> deferred_position_working_bytes;
   /// Hive partition values for this split, in @c scan_plan::partition_columns
   /// order. Empty when the plan has no partition columns. Kept on the split so
   /// @ref materialize_table can call @c assemble_scan_output inline on the
@@ -266,24 +269,17 @@ class parquet_split_info : public scan_info {
 
   [[nodiscard]] std::size_t estimated_working_set_bytes() const noexcept override
   {
+    if (deferred_position_working_bytes) return *deferred_position_working_bytes;
     std::size_t total = 0;
-    std::size_t runs  = 0;
     for (auto const& s : rg_slices) {
       total = memory::saturating_add(total, s.estimated_decode_working_bytes);
-      runs  = memory::saturating_add(runs, s.row_group_indices.size());
     }
-    // Iceberg retains the per-row-group virtual path and its pieces/concat peak.
-    // Plain reader and metadata-only modes already charge their different allocation
-    // lifetimes in each row group's decode_working_bytes.
-    return source_kind == parquet_source_kind::ICEBERG && plan &&
-               plan->has_user_virtual_columns() && runs > 1
-             ? memory::saturating_mul(total, std::size_t{2})
-             : total;
+    return total;
   }
 
-  // Preparation retains the decoded inputs until the consumer takes the split.  The
-  // concatenated output is an execution-time peak and must not be charged as another
-  // preparation allocation; otherwise virtual-column batches reserve the same bytes twice.
+  // Keep the additive charge from file preparation until the split is consumed.
+  // Deferred positions are execution peaks, not additional
+  // preparation input; changing this sum would unbalance the coordinator ledger.
   [[nodiscard]] std::size_t preparation_bytes() const noexcept override
   {
     std::size_t total = 0;
@@ -329,6 +325,10 @@ class parquet_file_scan_info : public scan_info {
     std::size_t decode_working_bytes;
     std::size_t compressed_bytes;
     int64_t num_rows;
+    // Alternative only: no-virtual scans keep legacy grouping until the complete
+    // split can qualify the actual position working set.
+    std::size_t position_working_bytes = 0;
+    std::size_t selected_deletes       = 0;
   };
 
   /// Parsed footer metadata for this file.
@@ -358,6 +358,7 @@ class parquet_file_scan_info : public scan_info {
   // Set by the core only for a route/expression with qualified original positions.
   bool position_filter_eligible = false;
   bool requires_row_positions   = false;
+  bool defer_position_filter    = false;
   /// No projected carrier was resolved (for example an empty footer). Reader mode
   /// retains the natural-schema fallback if neither a per-file virtual-scan
   /// carrier nor the bind-selected carrier is available. Metadata-only mode does

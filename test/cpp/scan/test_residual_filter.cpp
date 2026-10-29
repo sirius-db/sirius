@@ -237,7 +237,8 @@ TEST_CASE("Shadow records cannot change decisions and producer authority is vali
   shadow.predicates = {{0, predicate_stage::enforced, {}}};
   selected          = select_execution_record(&shadow, legacy, catalogue, 17, 3);
   CHECK_FALSE(selected.used_producer);
-  CHECK(selected.shadow_mismatch);
+  CHECK_FALSE(selected.shadow_mismatch);
+  CHECK(selected.shadow_coverage_added);
   CHECK(selected.facts.predicates.empty());
   shadow.generation = 99;
   CHECK(select_execution_record(&shadow, legacy, catalogue, 17, 3).shadow_mismatch);
@@ -267,6 +268,75 @@ TEST_CASE("Invalid legacy answer reports remain observable without changing old 
   REQUIRE(selected.facts.predicates.size() == 1);
   CHECK(selected.facts.predicates.front().conjunct == 0);
   REQUIRE(catalogue.against_progress(selected.facts.predicates)->holds<sirius::ast::comparison>());
+}
+
+TEST_CASE("Execution records compare independently required visibility and ordered layout",
+          "[scan][execution_record]")
+{
+  using namespace sirius::op::scan;
+  residual_filter const catalogue{two_conjuncts(), {1, 2}};
+  auto set_a = std::make_shared<int const>(1), set_b = std::make_shared<int const>(2);
+  auto layout = std::make_shared<std::vector<int> const>(std::vector<int>{0, 1});
+  visibility_bindings required{{"a", set_a}, {"b", set_b}};
+  execution_requirements requirements{required, layout};
+  auto record = translate_legacy_execution({filter_state::UNFILTERED, {}, false}, catalogue, 17, 3);
+  record.layout              = layout;
+  record.layout_width        = 2;
+  record.visibility_complete = true;
+  record.visibility_applied  = required;
+  SECTION("exact bindings")
+  {
+    REQUIRE_NOTHROW(validate_execution_record(record, catalogue, 17, 3, &requirements));
+  }
+  SECTION("missing set")
+  {
+    record.visibility_applied.pop_back();
+    REQUIRE_THROWS(validate_execution_record(record, catalogue, 17, 3, &requirements));
+  }
+  SECTION("different set for the same file")
+  {
+    record.visibility_applied[0].input = std::make_shared<int const>(1);
+    REQUIRE_THROWS(validate_execution_record(record, catalogue, 17, 3, &requirements));
+  }
+  SECTION("wrong file")
+  {
+    record.visibility_applied[0].file = "c";
+    REQUIRE_THROWS(validate_execution_record(record, catalogue, 17, 3, &requirements));
+  }
+  SECTION("duplicate applied set")
+  {
+    record.visibility_applied.push_back(required.front());
+    REQUIRE_THROWS(validate_execution_record(record, catalogue, 17, 3, &requirements));
+  }
+  SECTION("same width reordered layout")
+  {
+    record.layout = std::make_shared<std::vector<int> const>(std::vector<int>{1, 0});
+    REQUIRE_THROWS(validate_execution_record(record, catalogue, 17, 3, &requirements));
+  }
+  SECTION("only remaining bindings execute and failed work is not recorded")
+  {
+    record.visibility_applied.resize(1);
+    record.visibility_complete = false;
+    int calls                  = 0;
+    REQUIRE_THROWS(finish_visibility(
+      required, record.visibility_applied, record.visibility_complete, [&](auto pending) {
+        ++calls;
+        REQUIRE(pending.size() == 1);
+        CHECK(pending[0].file == "b");
+        throw std::runtime_error("delete failed");
+      }));
+    CHECK_FALSE(record.visibility_complete);
+    CHECK(record.visibility_applied.size() == 1);
+    auto apply = [&](auto pending) {
+      ++calls;
+      REQUIRE(pending.size() == 1);
+      CHECK(pending[0].input == set_b);
+    };
+    finish_visibility(required, record.visibility_applied, record.visibility_complete, apply);
+    finish_visibility(required, record.visibility_applied, record.visibility_complete, apply);
+    CHECK(calls == 2);
+    CHECK(record.visibility_complete);
+  }
 }
 
 TEST_CASE("Residual combines exact coverage with an unevaluated answer", "[scan][residual_filter]")
