@@ -16,6 +16,7 @@
 
 #include "planner/substrait_scan_ranges.hpp"
 
+#include "io/s3/scope_policy.hpp"
 #include "sirius/exception.hpp"
 #include "substrait/plan.pb.h"
 
@@ -32,6 +33,8 @@
 namespace sirius::planner {
 
 namespace {
+
+using sirius::io::s3::redacted_uri;
 
 /// `file:` scheme variants (`file:/p`, `file:///p`, `file://localhost/p`) all name the local
 /// filesystem; the plan may carry one form (the FE's) while DuckDB's bind reports another (or
@@ -66,7 +69,7 @@ std::vector<scan_byte_range> scan_byte_ranges_state::claim(const std::string& pa
     throw sirius::invalid_input_exception(
       "two scans in one plan read byte ranges of '{}'; the ranges cannot be attributed to "
       "either without double-reading",
-      path);
+      redacted_uri(path));
   }
   return it->second;
 }
@@ -79,7 +82,7 @@ void scan_byte_ranges_state::assert_all_consumed() const
         "the plan carries {} byte range(s) for '{}' that no scan consumed; executing anyway "
         "would read whole files and duplicate rows across splits",
         ranges.size(),
-        path);
+        redacted_uri(path));
     }
   }
 }
@@ -130,7 +133,7 @@ void visit_reads(const pb::Message& message, std::vector<std::map<std::string, r
           "byte range ({}, {}) of '{}' overflows a 64-bit offset",
           item.start(),
           item.length(),
-          item.uri_file());
+          redacted_uri(item.uri_file()));
       }
       entry.ranges.emplace_back(item.start(), item.length());
     }
@@ -150,19 +153,16 @@ void visit_reads(const pb::Message& message, std::vector<std::map<std::string, r
   }
 }
 
-/// Every remote LocalFiles item of the plan, by its own path form (`uri_file` or `uri_path`),
-/// and the metadata URI of every Iceberg read, in first-encounter order. Collected from the items
-/// directly, so a remote item is seen even when its path form is unsupported for byte-range
-/// attribution.
+/// Remote LocalFiles items and non-empty direct Iceberg metadata URIs, in first-encounter order.
+/// Inspect the item fields before range validation so an unsupported range form cannot hide a read.
 void visit_remote_items(const pb::Message& message,
                         std::vector<std::string>& remote,
                         std::set<std::string>& seen)
 {
   auto const* read = dynamic_cast<const substrait::ReadRel*>(&message);
   if (read != nullptr && read->has_iceberg_table()) {
-    // The consumer binds iceberg_scan(metadata_uri) at once, and even a local metadata file names
-    // its data files by URI, so no Iceberg read is local before binding: the metadata URI is
-    // inventoried whatever its scheme. An empty URI is left to the consumer's own rejection.
+    // A local metadata path can reference remote data. Inventory each non-empty direct metadata URI
+    // before the consumer binds iceberg_scan. The consumer rejects an empty URI before that bind.
     if (auto path = read->iceberg_table().direct().metadata_uri();
         !path.empty() && seen.insert(path).second) {
       remote.push_back(std::move(path));
@@ -238,18 +238,19 @@ scan_plan_inputs inspect(const std::string& plan_bytes, bool refuse_remote_range
       if (has_remote_scheme(path)) {
         if (!refuse_remote_ranges) { continue; }
         throw sirius::invalid_input_exception(
-          "byte-range splits are only supported on local parquet files, not '{}'", path);
+          "byte-range splits are only supported on local parquet files, not '{}'",
+          redacted_uri(path));
       }
       if (items.whole) {
         throw sirius::invalid_input_exception(
           "a read names '{}' both whole and by byte range; one scan cannot read a file both ways",
-          path);
+          redacted_uri(path));
       }
       if (reads_per_path[path] > 1) {
         throw sirius::invalid_input_exception(
           "'{}' is read by byte range in a plan that reads it {} times; the ranges cannot be "
           "attributed to one read",
-          path,
+          redacted_uri(path),
           reads_per_path[path]);
       }
       out.byte_ranges[path] = items.ranges;

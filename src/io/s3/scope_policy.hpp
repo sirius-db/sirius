@@ -22,4 +22,15 @@ bool key_has_unstable_segment(std::string_view uri);
 bool key_defeats_prefix_match(std::string_view uri);
 
 
+/// @p uri as an error message may name it, without the authentication material a URI can
+/// carry: user-info, query (presigned `X-Amz-*` parameters live there) and fragment. Text
+/// without an `@` loses only its query and fragment, so plain paths and plain URIs come back
+/// unchanged. Text with an `@` is shown only when it starts with a well-formed `scheme://` and
+/// every `@` precedes the first `?` or `#`: then everything between the scheme and the last `@`
+/// is dropped, whatever bytes the user-info holds (`/`, `:` and `@` included), and the query and
+/// fragment are cut. Everything else (an `@` with no leading scheme, or an `@` after a `?`/`#`,
+/// whose role cannot be told from a raw secret) is replaced by a fixed placeholder. A key
+/// containing `@` is over-redacted, never under-redacted.
+std::string redacted_uri(std::string_view uri);
+
 }  // namespace sirius::io::s3

@@ -26,8 +26,12 @@
 namespace sirius::test {
 
 // Synthetic, deliberately recognizable bytes; never real credentials.
-inline constexpr std::array<std::string_view, 3> object_store_sentinels{
-  "AKIA_SENTINEL_7f3a", "SECRET_SENTINEL_9b42", "TOKEN_SENTINEL_c681"};
+inline constexpr std::array<std::string_view, 5> object_store_sentinels{
+  "AKIA_SENTINEL_7f3a",
+  "SECRET_SENTINEL_9b42",
+  "TOKEN_SENTINEL_c681",
+  "SECRET/SENTINEL/9b42",
+  "QUERY_SIGNATURE_SENTINEL_d806"};
 
 // Mutable test inputs let each negative case alter exactly one field before constructing
 // the public immutable aggregate. Tests never modify a published snapshot.

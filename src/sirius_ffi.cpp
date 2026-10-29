@@ -232,25 +232,7 @@ void check_intrinsic(const ObjectStoreConfig& cfg)
 
 using sirius::io::s3::key_defeats_prefix_match;
 using sirius::io::s3::lowercase_scheme;
-
-// Identify an offending plan item in an error without echoing authentication material a URI can
-// carry: user-info, query (e.g. presigned X-Amz-* parameters) and fragment are dropped.
-std::string redacted_uri(std::string_view uri)
-{
-  auto const cut = uri.find_first_of("?#");
-  std::string out{uri.substr(0, cut)};
-  auto const scheme_end = out.find("://");
-  if (scheme_end != std::string::npos) {
-    auto const authority_begin = scheme_end + 3;
-    auto const authority_end   = out.find('/', authority_begin);
-    auto const authority       = std::string_view{out}.substr(
-      authority_begin,
-      (authority_end == std::string::npos ? out.size() : authority_end) - authority_begin);
-    auto const at = authority.rfind('@');
-    if (at != std::string_view::npos) { out.erase(authority_begin, at + 1); }
-  }
-  return out;
-}
+using sirius::io::s3::redacted_uri;
 
 // The published snapshots, ordered longest uri_prefix first (the default scope, empty prefix,
 // last). Immutable once published: put/drop build a new set, so a captured set never changes.
