@@ -332,25 +332,25 @@ jobs:
         # Downloaded binaries may contain paths from a different build runner.
         run: echo "LD_LIBRARY_PATH=$PWD/build/release/install/lib:$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
 
-      - name: Prepare TPC-H/TPC-DS SF10 datasets
+      - name: Prepare TPC-H/TPC-DS SF1 datasets
         run: |
           ./setup_test_datasets.sh
           chmod -R a+r test_datasets/
-          mkdir -p test_datasets/tpch_parquet_sf10
+          mkdir -p test_datasets/tpch_parquet_sf1
           ./sirius-duckdb/build/release/duckdb -f scripts/tpch_to_parquet.sql
-          ./test/tpcds_performance/generate_tpcds_data.sh 10 --format parquet
+          ./test/tpcds_performance/generate_tpcds_data.sh 1 --format parquet
 
       - name: TPC-H performance snapshot
         id: tpch
         env:
           SIRIUS_CONFIG_FILE: ${{ github.workspace }}/test/cpp/integration/integration.yaml
-          PARQUET_DIR: ${{ github.workspace }}/test_datasets/tpch_parquet_sf10
+          PARQUET_DIR: ${{ github.workspace }}/test_datasets/tpch_parquet_sf1
         run: |
-          ./test/tpch_performance/benchmark_and_validate.sh 10
+          ./test/tpch_performance/benchmark_and_validate.sh 1
           RUN_DIR=$(ls -td runs/*/ | head -1)
           echo "run_dir=$RUN_DIR" >> "$GITHUB_OUTPUT"
           {
-            echo "## TPC-H Performance (SF10, shadow)"
+            echo "## TPC-H Performance (SF1)"
             echo '```'
             cat "$RUN_DIR/comparison.txt"
             echo '```'
@@ -371,19 +371,19 @@ jobs:
         id: tpcds
         env:
           SIRIUS_CONFIG_FILE: ${{ github.workspace }}/test/cpp/integration/integration.yaml
-          PARQUET_DIR: ${{ github.workspace }}/test_datasets/tpcds_parquet_sf10
+          PARQUET_DIR: ${{ github.workspace }}/test_datasets/tpcds_parquet_sf1
         run: |
-          ./test/tpcds_performance/benchmark_and_validate.sh 10
+          ./test/tpcds_performance/benchmark_and_validate.sh 1
           RUN_DIR=$(ls -td runs/*/ | head -1)
           echo "run_dir=$RUN_DIR" >> "$GITHUB_OUTPUT"
           {
-            echo "## TPC-DS Performance (SF10, shadow)"
+            echo "## TPC-DS Performance (SF1)"
             echo '```'
             cat "$RUN_DIR/comparison.txt"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           ERRORS=$(tail -n +2 "$RUN_DIR/validation.csv" | grep -cE ',error$' || true)
-          [ "$ERRORS" -gt 0 ] && echo "::warning::TPC-DS shadow snapshot: $ERRORS queries errored (non-blocking)"
+          [ "$ERRORS" -gt 0 ] && echo "::warning::TPC-DS snapshot: $ERRORS queries errored (non-blocking)"
           true
 
       - name: Upload TPC-DS shadow run artifacts

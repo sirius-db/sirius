@@ -1,4 +1,4 @@
--- Loads TPC-H SF10 data from .tbl files and exports to Parquet.
+-- Loads TPC-H SF1 data from .tbl files and exports to Parquet.
 -- Used by CI to prepare benchmark data without tpchgen-rs.
 -- Run from the project root: ./sirius-duckdb/build/release/duckdb -f scripts/tpch_to_parquet.sql
 
@@ -81,20 +81,20 @@ CREATE TABLE lineitem ( l_orderkey    BIGINT NOT NULL,
                         l_shipmode     CHAR(10) NOT NULL,
                         l_comment      VARCHAR(44) NOT NULL);
 
-COPY nation    FROM 'test_datasets/tpch-dbgen/s10/nation.tbl'    (HEADER false, DELIMITER '|');
-COPY region    FROM 'test_datasets/tpch-dbgen/s10/region.tbl'    (HEADER false, DELIMITER '|');
-COPY part      FROM 'test_datasets/tpch-dbgen/s10/part.tbl'      (HEADER false, DELIMITER '|');
-COPY supplier  FROM 'test_datasets/tpch-dbgen/s10/supplier.tbl'  (HEADER false, DELIMITER '|');
-COPY partsupp  FROM 'test_datasets/tpch-dbgen/s10/partsupp.tbl'  (HEADER false, DELIMITER '|');
-COPY customer  FROM 'test_datasets/tpch-dbgen/s10/customer.tbl'  (HEADER false, DELIMITER '|');
-COPY orders    FROM 'test_datasets/tpch-dbgen/s10/orders.tbl'    (HEADER false, DELIMITER '|');
-COPY lineitem  FROM 'test_datasets/tpch-dbgen/s10/lineitem.tbl'  (HEADER false, DELIMITER '|');
+COPY nation    FROM 'test_datasets/tpch-dbgen/s1/nation.tbl'    (HEADER false, DELIMITER '|');
+COPY region    FROM 'test_datasets/tpch-dbgen/s1/region.tbl'    (HEADER false, DELIMITER '|');
+COPY part      FROM 'test_datasets/tpch-dbgen/s1/part.tbl'      (HEADER false, DELIMITER '|');
+COPY supplier  FROM 'test_datasets/tpch-dbgen/s1/supplier.tbl'  (HEADER false, DELIMITER '|');
+COPY partsupp  FROM 'test_datasets/tpch-dbgen/s1/partsupp.tbl'  (HEADER false, DELIMITER '|');
+COPY customer  FROM 'test_datasets/tpch-dbgen/s1/customer.tbl'  (HEADER false, DELIMITER '|');
+COPY orders    FROM 'test_datasets/tpch-dbgen/s1/orders.tbl'    (HEADER false, DELIMITER '|');
+COPY lineitem  FROM 'test_datasets/tpch-dbgen/s1/lineitem.tbl'  (HEADER false, DELIMITER '|');
 
-COPY nation    TO 'test_datasets/tpch_parquet_sf10/nation.parquet'    (FORMAT PARQUET);
-COPY region    TO 'test_datasets/tpch_parquet_sf10/region.parquet'    (FORMAT PARQUET);
-COPY part      TO 'test_datasets/tpch_parquet_sf10/part.parquet'      (FORMAT PARQUET);
-COPY supplier  TO 'test_datasets/tpch_parquet_sf10/supplier.parquet'  (FORMAT PARQUET);
-COPY partsupp  TO 'test_datasets/tpch_parquet_sf10/partsupp.parquet'  (FORMAT PARQUET);
-COPY customer  TO 'test_datasets/tpch_parquet_sf10/customer.parquet'  (FORMAT PARQUET);
-COPY orders    TO 'test_datasets/tpch_parquet_sf10/orders.parquet'    (FORMAT PARQUET);
-COPY lineitem  TO 'test_datasets/tpch_parquet_sf10/lineitem.parquet'  (FORMAT PARQUET);
+COPY nation    TO 'test_datasets/tpch_parquet_sf1/nation.parquet'    (FORMAT PARQUET);
+COPY region    TO 'test_datasets/tpch_parquet_sf1/region.parquet'    (FORMAT PARQUET);
+COPY part      TO 'test_datasets/tpch_parquet_sf1/part.parquet'      (FORMAT PARQUET);
+COPY supplier  TO 'test_datasets/tpch_parquet_sf1/supplier.parquet'  (FORMAT PARQUET);
+COPY partsupp  TO 'test_datasets/tpch_parquet_sf1/partsupp.parquet'  (FORMAT PARQUET);
+COPY customer  TO 'test_datasets/tpch_parquet_sf1/customer.parquet'  (FORMAT PARQUET);
+COPY orders    TO 'test_datasets/tpch_parquet_sf1/orders.parquet'    (FORMAT PARQUET);
+COPY lineitem  TO 'test_datasets/tpch_parquet_sf1/lineitem.parquet'  (FORMAT PARQUET);
