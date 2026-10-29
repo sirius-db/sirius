@@ -152,15 +152,14 @@ static bool is_hash_equality_key(sirius::comparison_type c, bool route_null_safe
   return false;
 }
 
-// Routed keys must be references or use one of cuDF AST's three supported casts.
+// Routed keys must be references or casts the cuDF AST translator accepts (ast_supports_cast).
 // The planner materializes other expressions into referenced columns before this check.
 static bool is_ast_translatable_key_side(sirius::ast::node const& side)
 {
   if (side.holds<sirius::ast::reference>()) { return true; }
   if (side.holds<sirius::ast::cast>()) {
-    auto const& c         = side.get<sirius::ast::cast>();
-    auto const& supported = sirius::supported_ast_cast_types_native;
-    return std::find(supported.begin(), supported.end(), c.target_type.id()) != supported.end() &&
+    auto const& c = side.get<sirius::ast::cast>();
+    return sirius::ast_supports_cast(c.child->return_type(), c.target_type) &&
            is_ast_translatable_key_side(*c.child);
   }
   return false;

@@ -50,9 +50,11 @@ cudf::data_type derive_key_cast_type(const sirius::logical_type& t)
   switch (t.id()) {
     case sirius::type_id::TINYINT:
     case sirius::type_id::SMALLINT:
-    case sirius::type_id::INTEGER: return cudf::data_type{cudf::type_id::INT64};
+    case sirius::type_id::INTEGER:
+    // HUGEINT's DECIMAL128 carrier hashes 16 bytes; its INT64 wrap matches a BIGINT key exactly for
+    // every value a BIGINT can equal, and equal out-of-range values still wrap alike.
+    case sirius::type_id::HUGEINT: return cudf::data_type{cudf::type_id::INT64};
     case sirius::type_id::BIGINT:
-    case sirius::type_id::HUGEINT:
     case sirius::type_id::BOOLEAN:
     case sirius::type_id::VARCHAR: return cudf::data_type{cudf::type_id::EMPTY};
     case sirius::type_id::DECIMAL: return cudf::data_type{cudf::type_id::FLOAT64};

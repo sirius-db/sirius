@@ -468,8 +468,9 @@ void sirius_physical_gpu_values::throw_if_unsupported_types(
   for (auto const& t : types) {
     if (t.id() == sirius::type_id::HUGEINT || t.id() == sirius::type_id::UHUGEINT) {
       throw std::runtime_error(
-        "[sirius_physical_gpu_values] HUGEINT/UHUGEINT VALUES data cannot be represented in "
-        "cuDF; falling back to DuckDB CPU");
+        "[sirius_physical_gpu_values] HUGEINT/UHUGEINT VALUES data is not supported (UHUGEINT "
+        "has no 16-byte cuDF carrier, and HUGEINT's DECIMAL128 copy is unvalidated); falling "
+        "back to DuckDB CPU");
     }
     if (!t.is_varchar()) {
       if (!sirius::get_cudf_type(t)) {

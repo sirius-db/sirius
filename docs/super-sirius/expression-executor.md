@@ -262,6 +262,19 @@ so sentinel handling has one implementation. The evaluator boundary regressions
 are tagged `[timestamp_bounds]`; SQL extraction comparisons against DuckDB are
 tagged `[timestamp_extraction]`.
 
+### HUGEINT
+
+HUGEINT is carried as cuDF DECIMAL128 with scale 0, an exact 128-bit integer with the layout of
+`duckdb::hugeint_t`; its constants are `sirius::decimal128` values with scale 0. Like DECIMAL
+(`logical_type::has_fixed_point_carrier`), HUGEINT arithmetic is materialized rather than lowered
+to the cuDF AST. `//` and `%` with a HUGEINT result run on the GPU only by a nonzero constant
+divisor (cuDF leaves a zero divisor's row undefined, where DuckDB raises an error), and other
+divisors stay on the CPU. A cast from HUGEINT to a narrower integer or DECIMAL first checks the
+column's range and throws `not_implemented_exception` when a value does not fit, so the query falls
+back and DuckDB raises its conversion error (or returns NULL under `TRY_CAST`). Such casts never
+lower to the AST, whose integer casts wrap (`ast_supports_cast`); a cast to DOUBLE does. A cast to
+VARCHAR uses `cudf::strings::from_fixed_point`. Tests are tagged `[hugeint]`.
+
 `DATE + INTEGER`, `INTEGER + DATE`, `DATE - INTEGER`, and `DATE - DATE`
 match their already-bound signatures and execute through `date_arithmetic_checked()`.
 The helper uses a libcudf JIT transform with public CCCL overflow helpers and error
@@ -325,7 +338,7 @@ The following translate directly into cuDF AST nodes:
 | Comparison | `=`, `!=`, `<`, `>`, `<=`, `>=`, `IS NOT DISTINCT FROM` (via `NULL_EQUALS`) |
 | Logical | `AND`, `OR` (Kleene `NULL_LOGICAL_AND`/`NULL_LOGICAL_OR`), `NOT` |
 | BETWEEN | Translated to `(val >= lower) AND (val <= upper)` |
-| Casting | Fixed-width types: `UBIGINT`, `BIGINT`, `DOUBLE` (see `supported_ast_cast_types`) |
+| Casting | Fixed-width types: `UBIGINT`, `BIGINT`, `DOUBLE` (see `supported_ast_cast_types`); from HUGEINT only `DOUBLE` (`ast_supports_cast`) |
 
 Anything outside this set is an AST breaker and forces materialization at that node.
 
@@ -358,7 +371,7 @@ A second overload, `translate_expression_with_names`, produces `cudf::ast::colum
 These return `nullopt`, causing the caller to fall back to row-by-row evaluation:
 - `case_expr` nodes
 - `coalesce` nodes and `TRY`
-- `cast` with non-fixed-width target types (e.g., VARCHAR)
+- `cast` with non-fixed-width target types (e.g., VARCHAR), and a HUGEINT cast to anything but DOUBLE
 - `IS DISTINCT FROM` (throws `NotImplementedException`)
 
 ### Join Condition Translation

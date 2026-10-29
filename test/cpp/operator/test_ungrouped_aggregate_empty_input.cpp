@@ -57,6 +57,7 @@ using expressions = duckdb::vector<std::unique_ptr<sirius::ast::node>>;
 using schema      = duckdb::vector<logical_type>;
 
 auto const bigint  = logical_type::make(type_id::BIGINT);
+auto const hugeint = logical_type::make(type_id::HUGEINT);
 auto const integer = logical_type::make(type_id::INTEGER);
 
 std::unique_ptr<sirius::ast::node> aggregate(aggregate_id kind,
@@ -250,27 +251,28 @@ TEST_CASE("ungrouped merge gives equivalent SQL results for zero batches and zer
   auto manager            = sirius::test::operator_utils::initialize_memory_manager();
   auto* space             = manager->get_memory_space(Tier::GPU, 0);
   REQUIRE(space != nullptr);
+  // DuckDB returns HUGEINT for SUM and sum_no_overflow over INTEGER and BIGINT.
   schema types{bigint,
                bigint,
                bigint,
-               bigint,
+               hugeint,
                input_type,
                input_type,
                input_type,
                logical_type::make(type_id::DOUBLE),
-               bigint,
+               hugeint,
                logical_type::make(type_id::DOUBLE)};
   auto make_aggregates = [input_type] {
     expressions result;
     result.push_back(aggregate(aggregate_id::count_star, bigint));
     result.push_back(aggregate(aggregate_id::count, bigint, input_type));
     result.push_back(aggregate(aggregate_id::count, bigint, input_type, true));
-    result.push_back(aggregate(aggregate_id::sum, bigint, input_type));
+    result.push_back(aggregate(aggregate_id::sum, hugeint, input_type));
     result.push_back(aggregate(aggregate_id::min, input_type, input_type));
     result.push_back(aggregate(aggregate_id::max, input_type, input_type));
     result.push_back(aggregate(aggregate_id::first, input_type, input_type));
     result.push_back(aggregate(aggregate_id::avg, logical_type::make(type_id::DOUBLE), input_type));
-    result.push_back(aggregate(aggregate_id::sum_no_overflow, bigint, input_type));
+    result.push_back(aggregate(aggregate_id::sum_no_overflow, hugeint, input_type));
     result.push_back(
       aggregate(aggregate_id::stddev_samp, logical_type::make(type_id::DOUBLE), input_type));
     return result;

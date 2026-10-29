@@ -184,7 +184,7 @@ std::unique_ptr<node> translate_cast(duckdb::BoundFunctionExpression const& expr
 
   // cuDF casts can wrap where DuckDB CAST throws or TRY_CAST returns NULL. Reject
   // unsigned integer casts unless the target carrier fits the full source domain.
-  // HUGEINT/UHUGEINT currently use INT64/UINT64 on the GPU.
+  // HUGEINT is DECIMAL128 on the GPU (127 value bits); UHUGEINT still uses UINT64.
   // TODO: Implement checked GPU integer casts: return NULL on overflow for TRY_CAST
   // and raise an error for CAST, allowing these conversions without CPU fallback.
   if (source_type.IsUnsigned()) {
@@ -193,8 +193,8 @@ std::unique_ptr<node> translate_cast(duckdb::BoundFunctionExpression const& expr
       case duckdb::LogicalTypeId::TINYINT: target_value_bits = 7; break;
       case duckdb::LogicalTypeId::SMALLINT: target_value_bits = 15; break;
       case duckdb::LogicalTypeId::INTEGER: target_value_bits = 31; break;
-      case duckdb::LogicalTypeId::BIGINT:
-      case duckdb::LogicalTypeId::HUGEINT: target_value_bits = 63; break;
+      case duckdb::LogicalTypeId::BIGINT: target_value_bits = 63; break;
+      case duckdb::LogicalTypeId::HUGEINT: target_value_bits = 127; break;
       case duckdb::LogicalTypeId::UTINYINT: target_value_bits = 8; break;
       case duckdb::LogicalTypeId::USMALLINT: target_value_bits = 16; break;
       case duckdb::LogicalTypeId::UINTEGER: target_value_bits = 32; break;
@@ -258,7 +258,21 @@ bool gpu_supports_abs(duckdb::BoundFunctionExpression const& expr)
          type.id() != duckdb::LogicalTypeId::UHUGEINT;
 }
 
-// Unsigned (DuckDB rejects nonzero), HUGEINT (INT64 carrier) and INTERVAL negation stay on the CPU.
+// HUGEINT `//` and `%` run on the GPU only by a constant other than 0 and -1: cuDF leaves a zero
+// divisor's row undefined and wraps HUGEINT_MIN // -1, where DuckDB raises an error (or returns
+// NULL under TRY).
+bool gpu_supports_hugeint_division(duckdb::BoundFunctionExpression const& expr)
+{
+  auto const& divisor = *expr.GetChildren()[1];
+  if (expr.GetReturnType().id() != duckdb::LogicalTypeId::HUGEINT) { return true; }
+  if (divisor.GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) { return false; }
+  auto const& value = divisor.Cast<duckdb::BoundConstantExpression>().GetValue();
+  if (value.IsNull()) { return false; }
+  auto const divisor_value = value.GetValue<duckdb::hugeint_t>();
+  return divisor_value != duckdb::hugeint_t(0) && divisor_value != duckdb::hugeint_t(-1);
+}
+
+// Unsigned (DuckDB rejects nonzero), HUGEINT and INTERVAL negation stay on the CPU.
 // cuDF's negation keeps its input type, so the result type must match it.
 bool gpu_supports_negate(duckdb::BoundFunctionExpression const& expr)
 {
@@ -299,6 +313,10 @@ std::unique_ptr<node> translate_function(duckdb::BoundFunctionExpression const& 
   auto const func_id_opt = sirius::from_duckdb_function_name(name, children.size());
   if (!func_id_opt.has_value()) { return nullptr; }
   if (*func_id_opt == function_id::negate && !gpu_supports_negate(expr)) { return nullptr; }
+  if ((*func_id_opt == function_id::int_div || *func_id_opt == function_id::mod) &&
+      !gpu_supports_hugeint_division(expr)) {
+    return nullptr;
+  }
   if (*func_id_opt == function_id::date_trunc) {
     // Match the GPU evaluator's supported frequencies. It requires a constant string;
     // reject other forms here so neither unsupported units nor dynamic units reach execution.

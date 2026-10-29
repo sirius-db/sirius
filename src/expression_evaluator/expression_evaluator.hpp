@@ -452,8 +452,23 @@ class expression_evaluator {
   std::size_t _restored_reference_cast_count{0};   ///< For observability/testing
   std::size_t _narrow_domain_comparison_count{0};  ///< For observability/testing
 
+  /// Measured magnitude bounds of HUGEINT input columns, shared by every expression of one
+  /// top-level evaluation; nullopt where the bound could not be established.
+  std::vector<std::pair<std::uint32_t, std::optional<unsigned __int128>>> _hugeint_reference_bounds;
+
   [[nodiscard]] like_multiliteral_cache::entry_ptr const& get_or_classify_like(
     std::string_view pattern);
+
+  /// An upper bound on |v| over every value @p node can produce, from constants, the types of
+  /// integer casts and measured HUGEINT input columns; nullopt when unknown or not below 2^127.
+  [[nodiscard]] std::optional<unsigned __int128> hugeint_magnitude_bound(
+    sirius::ast::node const& node);
+
+  /// Throws not_implemented_exception, falling back to DuckDB, when the HUGEINT ADD, SUB or MUL
+  /// @p call could pass 2^127. cuDF wraps where DuckDB raises an overflow error.
+  void require_hugeint_arithmetic_in_range(sirius::ast::function_call const& call,
+                                           evaluate_result const& left,
+                                           evaluate_result const& right);
 
   // Evaluate the executor's single boolean predicate over @p input and return the resulting
   // mask column (the sole column of evaluate()'s output). Shared by both select() overloads.

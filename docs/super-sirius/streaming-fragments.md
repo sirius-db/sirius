@@ -160,8 +160,9 @@ physical plan, and roots it in a `sirius_physical_streaming_sink` or
   output with them.
 - **Hash-key cast types.** cuDF `murmur3` hashes raw bytes, so an `INT32` and an `INT64` sender
   would split matching keys. When `partitioning.key_cast_types` is empty, `build()` fills one per
-  key: `TINYINT`, `SMALLINT`, `INTEGER` → `INT64`; `BIGINT`, `HUGEINT` (an INT64 carrier), `BOOLEAN`,
-  `VARCHAR` → `EMPTY` (as-is);
+  key: `TINYINT`, `SMALLINT`, `INTEGER`, `HUGEINT` → `INT64` (a HUGEINT key's DECIMAL128 carrier
+  hashes as its INT64 wrap, which matches a BIGINT key); `BIGINT`, `BOOLEAN`, `VARCHAR` → `EMPTY`
+  (as-is);
   `DECIMAL` → `FLOAT64`; any other type throws. An out-of-range key column throws first.
 
 **`run()`**
