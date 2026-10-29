@@ -169,7 +169,7 @@ Controls pinned host memory pools. One pool group is created per NUMA node (auto
 | `capacity_bytes` | bytes | — | Pinned host memory capacity **per NUMA node** as absolute bytes, allocated with `cudaMallocHost`. Mutually exclusive with `capacity_fraction`; configuration loading rejects both when both values are non-null. |
 | `reservation_limit_fraction` | double | 1.0 | Fraction of host capacity that can be reserved. Mutually exclusive with `reservation_limit_bytes`; configuration loading rejects both when both values are non-null. |
 | `reservation_limit_bytes` | bytes | — | Absolute reservation limit. Mutually exclusive with `reservation_limit_fraction`; configuration loading rejects both when both values are non-null. |
-| `downgrade_trigger_fraction` | double (0,1] | 0.9 | Start HOST memory reclamation above this fraction. Must be greater than `downgrade_stop_fraction`. File-cache reclaim needs no DISK tier; spilling HOST repository data requires configured `downgrade_root_dirs`. |
+| `downgrade_trigger_fraction` | double (0,1] | 0.9 | Start HOST memory reclamation above this fraction. Must be greater than `downgrade_stop_fraction`. File-cache reclaim needs no DISK tier and only frees cache memory above the prefetch reservation; spilling HOST repository data requires configured `downgrade_root_dirs`. |
 | `downgrade_stop_fraction` | double (0,1] | 0.8 | Stop evicting when reserved memory drops to this fraction. Must be less than `downgrade_trigger_fraction`; configuration loading rejects an invalid pair. |
 | `block_size` | bytes | 1Mi | Size of each allocation block in the pool. Larger blocks reduce allocation overhead but waste memory on small allocations. |
 | `pool_size` | int | 128 | Number of blocks per pool. Total pool capacity = `block_size × pool_size`. |
@@ -344,9 +344,12 @@ HOST downgrade executors synchronously reclaim idle staging chunks from the defa
 ioctx's `fs_cache` before spilling repository batches or queued tasks. If a byte-target request
 is still short after those workers finish, a forced pass reclaims additional unpinned,
 non-loading chunks up to the remaining deficit, even if a future scan subscribes to them.
-Reclaim credits bytes actually returned to the shared host pool; it performs no disk writes
-and needs no DISK tier. GPU executors and routed remote ioctx caches do not participate.
-This adds no configuration keys.
+Only bytes above the cache's prefetch reservation (`scan_manager.cache.min_prefetching_budget_fraction`
+of each HOST space) relieve HOST pressure: the executor reclaims and credits only those bytes,
+from its own NUMA space. Chunks inside the reservation are kept. Reclaim performs no disk writes
+and needs no DISK tier. Without DISK, a HOST executor whose cache holds nothing above the
+reservation backs off like any other non-viable executor. GPU executors and routed remote
+ioctx caches do not participate. This adds no configuration keys.
 
 ## Scan Manager & IO Configuration
 

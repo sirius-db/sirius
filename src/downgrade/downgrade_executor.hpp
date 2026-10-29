@@ -33,6 +33,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <exception>
 #include <functional>
 #include <future>
@@ -44,6 +45,7 @@
 
 namespace cucascade::io::cache {
 class fs_cache;
+enum class reclaim_mode : std::uint8_t;
 }  // namespace cucascade::io::cache
 
 namespace sirius {
@@ -126,8 +128,9 @@ class downgrade_executor {
   void pause();
   void resume();
 
-  /// Non-owning default-local ioctx cache, used only by HOST executors. Wire before start()
-  /// or while paused; the owner must pause before replacing/destroying a bound cache.
+  /// Non-owning default-local ioctx cache, used only by HOST executors to reclaim bytes above
+  /// the prefetch reservation from their own NUMA space. Wire before start() or while paused;
+  /// the owner must pause before replacing/destroying a bound cache.
   void set_fs_cache(cucascade::io::cache::fs_cache* cache);
 
   /**
@@ -216,6 +219,9 @@ class downgrade_executor {
   void processing_loop();
   void monitor_loop();
   void cancel_pending_requests();
+
+  // Processing thread only: reclaim and credit only bytes that relieve this HOST space.
+  std::size_t reclaim_fs_cache(cucascade::io::cache::reclaim_mode mode, std::size_t deficit);
 
   /**
    * @brief Whether a downgrade from this executor's source tier could plausibly free memory.
