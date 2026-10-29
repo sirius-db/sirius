@@ -45,7 +45,8 @@ unit_gate assess_local_scope(unit_descriptor const& unit)
   if (!unit.delete_path.empty()) location(unit.delete_path, unit_gate_reason::remote_delete);
   if (unit.encrypted) reject(unit_gate_reason::encrypted_data);
   if (unit.delete_encrypted) reject(unit_gate_reason::encrypted_delete);
-  if (unit.snapshot_min || unit.snapshot_max) reject(unit_gate_reason::partial_data);
+  if ((unit.snapshot_min || unit.snapshot_max) && !unit.snapshot_visibility_probe)
+    reject(unit_gate_reason::partial_data);
   if (unit.snapshot_min && unit.snapshot_max && *unit.snapshot_min > *unit.snapshot_max)
     reject(unit_gate_reason::invalid_snapshot_range);
   if (unit.delete_path.empty() != (unit.deletes == delete_format::none)) {

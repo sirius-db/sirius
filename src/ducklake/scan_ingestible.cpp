@@ -107,12 +107,13 @@ struct scan_ingestible::impl {
     unit_scan_options opts;
     opts.scan_task_batch_size = options.scan_task_batch_size;
     if (options.filters) opts.filters = options.filters->Copy();
-    opts.output_columns = options.output_columns;
-    opts.profiles       = options.profiles;
-    opts.identities     = options.identities;
-    opts.inline_gate    = options.inline_gate;
-    opts.parquet_slot   = options.parquet_slot;
-    opts.owns_admission = false;
+    opts.output_columns            = options.output_columns;
+    opts.profiles                  = options.profiles;
+    opts.identities                = options.identities;
+    opts.inline_gate               = options.inline_gate;
+    opts.parquet_slot              = options.parquet_slot;
+    opts.owns_admission            = false;
+    opts.snapshot_visibility_probe = options.snapshot_visibility_probe;
     if (descriptor->kind == unit_kind::parquet) {
       auto source = binding->make_parquet_unit(
         next_file, contract, generation, admission, selected, count_only, std::move(opts));

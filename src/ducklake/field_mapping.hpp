@@ -15,6 +15,8 @@
  */
 
 #pragma once
+#include "ducklake/scan_options.hpp"
+#include "ducklake/unit_descriptor.hpp"
 #include "op/scan/field_id_mapping.hpp"
 namespace sirius::ducklake {
 // DuckLake policy, separate from the shared mapping mechanism. The caller must
@@ -31,5 +33,11 @@ std::vector<size_t> required_field_indices(size_t bound_count, std::vector<size_
 op::scan::field_id_mapping compile_field_mapping(std::shared_ptr<op::scan::parquet_metadata const>,
                                                  std::string const& identity,
                                                  op::scan::materialization_program,
-                                                 std::vector<op::scan::field_requirement>);
+                                                 std::vector<op::scan::field_requirement>,
+                                                 bool partial_data = false);
+// Append the mandatory hidden snapshot working column and inclusive residuals.
+// Preserve the caller's output ordering; the hidden column is never projected.
+bool add_partial_data_filter(unit_descriptor const&,
+                             std::vector<op::scan::field_requirement>&,
+                             unit_scan_options&);
 }  // namespace sirius::ducklake

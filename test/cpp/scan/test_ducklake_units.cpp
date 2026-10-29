@@ -34,6 +34,8 @@
 #include <duckdb/common/types/timestamp.hpp>
 #include <duckdb/common/types/vector.hpp>
 #include <duckdb/common/vector/flat_vector.hpp>
+#include <roaring/roaring.hh>
+#include <zlib.h>
 
 #include <algorithm>
 #include <array>
@@ -164,7 +166,8 @@ std::shared_ptr<pq::FileMetaData> mapping_footer()
   return footer;
 }
 scan::field_id_mapping compile_test(std::shared_ptr<pq::FileMetaData> footer,
-                                    std::vector<scan::field_requirement> fields)
+                                    std::vector<scan::field_requirement> fields,
+                                    bool partial_data = false)
 {
   auto metadata = std::make_shared<scan::parquet_metadata>(footer,
                                                            0,
@@ -180,7 +183,7 @@ scan::field_id_mapping compile_test(std::shared_ptr<pq::FileMetaData> footer,
   for (auto const& field : fields)
     program.input_types->push_back(*scan::field_mapping_type(field.type));
   program.output_types = *program.input_types;
-  return compile_field_mapping(metadata, "object", program, std::move(fields));
+  return compile_field_mapping(metadata, "object", program, std::move(fields), partial_data);
 }
 }  // namespace
 TEST_CASE("DuckLake stable IDs allow renamed dropped reordered and missing fields",
@@ -537,19 +540,25 @@ std::vector<std::byte> dv_test_payload()
   REQUIRE(file.good());
   return bytes;
 }
-dv_test_source dv_test_container(std::string properties, bool corrupt_second = false)
+dv_test_source dv_test_container(std::string properties,
+                                 bool corrupt_second                   = false,
+                                 std::string first_properties          = {},
+                                 std::vector<std::byte> first_payload  = {},
+                                 std::vector<std::byte> second_payload = {})
 {
-  auto payload = dv_test_payload();
-  auto blobs   = payload;
-  if (corrupt_second) payload.back() ^= std::byte{1};
-  blobs.insert(blobs.end(), payload.begin(), payload.end());
+  if (first_payload.empty()) first_payload = dv_test_payload();
+  if (second_payload.empty()) second_payload = dv_test_payload();
+  auto blobs = first_payload;
+  if (corrupt_second) second_payload.back() ^= std::byte{1};
+  blobs.insert(blobs.end(), second_payload.begin(), second_payload.end());
   std::string json = R"({"blobs":[)";
   for (int i = 0; i < 2; ++i) {
     if (i) json += ",";
     json +=
       R"({"type":"deletion-vector-v1","fields":[],"snapshot-id":-1,"sequence-number":-1,"offset":)" +
-      std::to_string(4 + i * 44) + R"(,"length":44,"properties":{)" +
-      (i ? properties : std::string{}) + "}}";
+      std::to_string(4 + (i ? first_payload.size() : 0)) + R"(,"length":)" +
+      std::to_string(i ? second_payload.size() : first_payload.size()) + R"(,"properties":{)" +
+      (i ? properties : first_properties) + "}}";
   }
   json += "]}";
   return dv_test_source(sirius::test::puffin_container(blobs, json));
@@ -937,4 +946,261 @@ TEST_CASE("DuckLake scalar layouts preserve decimal Boolean and temporal vector 
     inline_column_layout other(LogicalType::DECIMAL(precision, 1));
     CHECK_THROWS(other.copy_fixed_values(source, 0, 1, values.data(), validity.data()));
   }
+}
+
+TEST_CASE("DuckLake snapshot DV probe validates every blob before selecting visibility",
+          "[ducklake_units][ducklake_dv][ducklake_snapshot_visibility]")
+{
+  auto snapshot       = GENERATE(uint64_t{9}, uint64_t{10}, uint64_t{15}, uint64_t{20});
+  auto local_delete   = GENERATE(false, true);
+  auto reversed       = GENERATE(false, true);
+  auto early          = std::string(R"("ducklake-snapshot-id":"10","cardinality":"2")");
+  auto late           = std::string(R"("ducklake-snapshot-id":"20","cardinality":"2")");
+  auto source         = dv_test_container(reversed ? early : late, false, reversed ? late : early);
+  auto unit           = dv_test_unit(source);
+  unit.bound_snapshot = snapshot;
+  unit.transaction_local_delete = local_delete;
+  dv_test_budget budget(unit);
+  auto allocator = budget.ledger.allocator(budget.permit);
+  CHECK_THROWS(prepare_dv_visibility(unit, 5, "data", source, allocator, {}));
+  auto visibility = prepare_dv_visibility(
+    unit, 5, "data", source, allocator, {}, "delete", dv_snapshot_policy::bound_table_scan_probe);
+  CHECK(visibility->validated_blobs == 2);
+  CHECK(visibility->positions.size() == ((local_delete || snapshot >= 10) ? 2 : 0));
+  visibility.reset();
+  CHECK(budget.provider.seen->allocated_bytes == 0);
+}
+
+TEST_CASE("DuckLake snapshot DV probe rejects invalid future dependencies",
+          "[ducklake_units][ducklake_dv][ducklake_snapshot_visibility]")
+{
+  auto mode  = GENERATE(std::string("crc"),
+                       std::string("mixed"),
+                       std::string("negative"),
+                       std::string("overflow"),
+                       std::string("cardinality"),
+                       std::string("cancel"));
+  auto early = std::string(R"("ducklake-snapshot-id":"10")");
+  auto late  = std::string(R"("ducklake-snapshot-id":"20")");
+  if (mode == "mixed") late.clear();
+  if (mode == "negative") late = R"("ducklake-snapshot-id":"-1")";
+  if (mode == "overflow") late = R"("ducklake-snapshot-id":"18446744073709551616")";
+  if (mode == "cardinality") late += R"(,"cardinality":"3")";
+  auto source         = dv_test_container(late, mode == "crc", early);
+  auto unit           = dv_test_unit(source);
+  unit.bound_snapshot = 15;
+  dv_test_budget budget(unit);
+  auto allocator = budget.ledger.allocator(budget.permit);
+  std::stop_source stop;
+  if (mode == "cancel") stop.request_stop();
+  CHECK_THROWS(prepare_dv_visibility(unit,
+                                     5,
+                                     "data",
+                                     source,
+                                     allocator,
+                                     sm::preparation_stop_token(stop.get_token()),
+                                     "delete",
+                                     dv_snapshot_policy::bound_table_scan_probe));
+  CHECK(budget.provider.seen->allocated_bytes == 0);
+  CHECK(budget.ledger.charged_bytes({1, 1}) == 0);
+}
+
+namespace {
+std::vector<std::byte> snapshot_test_payload(std::initializer_list<uint32_t> positions)
+{
+  roaring::Roaring bitmap;
+  for (auto position : positions)
+    bitmap.add(position);
+  std::vector<std::byte> body(16 + bitmap.getSizeInBytes(), std::byte{0});
+  body[0] = std::byte{0xD1};
+  body[1] = std::byte{0xD3};
+  body[2] = std::byte{0x39};
+  body[3] = std::byte{0x64};
+  // Roaring64: one low-word bitmap, high-word key zero.
+  body[4] = std::byte{1};
+  bitmap.write(reinterpret_cast<char*>(body.data() + 16));
+  std::vector<std::byte> payload;
+  auto append_be = [&](uint32_t value) {
+    for (int shift = 24; shift >= 0; shift -= 8)
+      payload.push_back(std::byte((value >> shift) & 255));
+  };
+  append_be(body.size());
+  payload.insert(payload.end(), body.begin(), body.end());
+  append_be(crc32(0, reinterpret_cast<Bytef const*>(body.data()), body.size()));
+  return payload;
+}
+}  // namespace
+TEST_CASE("DuckLake snapshot DV selects earliest deletes and preserves visible inline deletes",
+          "[ducklake_units][ducklake_dv][ducklake_snapshot_visibility]")
+{
+  auto snapshot       = GENERATE(uint64_t{9}, uint64_t{10}, uint64_t{15}, uint64_t{20});
+  auto source         = dv_test_container(R"("ducklake-snapshot-id":"10","cardinality":"2")",
+                                  false,
+                                  R"("ducklake-snapshot-id":"20","cardinality":"3")",
+                                  snapshot_test_payload({1, 2, 5}),
+                                  snapshot_test_payload({1, 2}));
+  auto unit           = dv_test_unit(source);
+  unit.bound_snapshot = snapshot;
+  dv_test_budget budget(unit);
+  auto allocator  = budget.ledger.allocator(budget.permit);
+  auto visibility = prepare_dv_visibility(
+    unit, 6, "data", source, allocator, {}, "delete", dv_snapshot_policy::bound_table_scan_probe);
+  CHECK(visibility->validated_blobs == 2);
+  std::vector<int64_t> expected = snapshot < 10   ? std::vector<int64_t>{}
+                                  : snapshot < 20 ? std::vector<int64_t>{1, 2}
+                                                  : std::vector<int64_t>{1, 2, 5};
+  CHECK(std::vector<int64_t>(visibility->positions.begin(), visibility->positions.end()) ==
+        expected);
+  // Inline deletes remain effective even before the first file-delete snapshot.
+  std::array<uint64_t, 2> inlined{2, 4};
+  auto combined = combine_inline_visibility(visibility, inlined, 6, allocator);
+  expected      = snapshot < 10   ? std::vector<int64_t>{2, 4}
+                  : snapshot < 20 ? std::vector<int64_t>{1, 2, 4}
+                                  : std::vector<int64_t>{1, 2, 4, 5};
+  CHECK(std::vector<int64_t>(combined->positions.begin(), combined->positions.end()) == expected);
+  CHECK(combined->validated_blobs == 2);
+  combined.reset();
+  visibility.reset();
+  CHECK(budget.provider.seen->allocated_bytes == 0);
+}
+
+TEST_CASE("DuckLake partial Parquet deletes validate all rows before snapshot selection",
+          "[ducklake_units][ducklake_snapshot_visibility]")
+{
+  auto snapshot = GENERATE(uint64_t{9}, uint64_t{10}, uint64_t{15}, uint64_t{20});
+  auto local    = GENERATE(false, true);
+  std::array<int64_t, 3> output{};
+  parquet_delete_accumulator rows(output, true, snapshot, local);
+  rows.append(1, 10);
+  rows.append(2, 20);
+  rows.append(5, 10);  // Snapshot order need not follow position order.
+  CHECK(rows.validated_count() == 3);
+  CHECK(rows.last_position() == 5);
+  std::vector<int64_t> expected = local || snapshot >= 20 ? std::vector<int64_t>{1, 2, 5}
+                                  : snapshot >= 10        ? std::vector<int64_t>{1, 5}
+                                                          : std::vector<int64_t>{};
+  CHECK(std::vector<int64_t>(rows.positions().begin(), rows.positions().end()) == expected);
+}
+TEST_CASE("DuckLake partial Parquet deletes reject invalid invisible rows across batches",
+          "[ducklake_units][ducklake_snapshot_visibility]")
+{
+  auto mode  = GENERATE(0, 1, 2, 3, 4, 5);
+  auto local = GENERATE(false, true);
+  std::array<int64_t, 2> output{};
+  parquet_delete_accumulator rows(output, true, 15, local);
+  rows.append(2, 20);
+  if (mode == 0) CHECK_THROWS(rows.append(2, 30));
+  if (mode == 1) CHECK_THROWS(rows.append(1, 30));
+  if (mode == 2) CHECK_THROWS(rows.append({}, 30));
+  if (mode == 3) CHECK_THROWS(rows.append(3, {}));
+  if (mode == 4) CHECK_THROWS(rows.append(3, -1));
+  if (mode == 5) {
+    rows.append(3, 30);
+    CHECK_THROWS(rows.append(4, 30));
+  }
+}
+TEST_CASE("DuckLake partial Parquet deletes retain future row-domain evidence",
+          "[ducklake_units][ducklake_snapshot_visibility]")
+{
+  auto source                     = std::make_shared<dv_visibility>();
+  source->parquet_validated       = true;
+  source->delete_identity         = "delete-object";
+  source->last_validated_position = 5;
+  // No effective deletes at S15, but a future row 5 still needs validation.
+  CHECK_THROWS(bind_parquet_visibility(source, "data-object", 5));
+  auto visibility = bind_parquet_visibility(source, "data-object", 6);
+  CHECK(visibility->positions.empty());
+  CHECK(visibility->last_validated_position == 5);
+}
+TEST_CASE("DuckLake ordinary Parquet deletes do not require snapshot values",
+          "[ducklake_units][ducklake_snapshot_visibility]")
+{
+  std::array<int64_t, 2> output{};
+  parquet_delete_accumulator rows(output, false, 0, false);
+  rows.append(0, {});
+  rows.append(4, {});
+  CHECK(rows.validated_count() == 2);
+  REQUIRE(rows.positions().size() == 2);
+  CHECK(rows.positions()[0] == 0);
+  CHECK(rows.positions()[1] == 4);
+}
+
+TEST_CASE("DuckLake partial data adds an inclusive hidden snapshot filter",
+          "[ducklake_units][ducklake_snapshot_visibility]")
+{
+  auto count_only                = GENERATE(false, true);
+  auto bounds                    = GENERATE(0, 1, 2);
+  auto unit                      = local();
+  unit.snapshot_visibility_probe = true;
+  if (bounds != 1) unit.snapshot_min = 10;
+  if (bounds != 0) unit.snapshot_max = 20;
+  std::vector<scan::field_requirement> fields;
+  if (!count_only) fields.push_back(bind_field(4, duckdb::LogicalType::BIGINT, duckdb::Value()));
+  auto original_width = fields.size();
+  unit_scan_options options;
+  REQUIRE(add_partial_data_filter(unit, fields, options));
+  REQUIRE(options.output_columns);
+  CHECK(options.output_columns->size() == original_width);
+  REQUIRE(fields.size() == original_width + 1);
+  CHECK(fields.back().id == duckdb::MultiFileReader::LAST_UPDATED_SEQUENCE_NUMBER_ID);
+  CHECK_FALSE(fields.back().missing_value);
+  duckdb::TableFilterSet expected;
+  auto add = [&](uint64_t value, duckdb::ExpressionType comparison) {
+    expected.PushFilter(
+      duckdb::ProjectionIndex(original_width),
+      duckdb::ExpressionFilter::CreateComparisonFilter(comparison, duckdb::Value::BIGINT(value)));
+  };
+  if (unit.snapshot_min) add(10, duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO);
+  if (unit.snapshot_max) add(20, duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO);
+  CHECK(options.filters->Equals(expected));
+  auto footer                = mapping_footer();
+  footer->schema[2].field_id = fields.back().id;
+  footer->schema[2].name     = "_ducklake_internal_snapshot_id";
+  CHECK_NOTHROW(compile_test(footer, fields, true));
+  CHECK_THROWS(
+    compile_test(footer, fields));  // The default mapping cannot request hidden snapshot columns.
+  footer->schema[2].field_id = 9;
+  footer->schema[2].name     = "dropped";
+  CHECK_THROWS(compile_test(footer, fields, true));  // No default for missing snapshots.
+}
+TEST_CASE("DuckLake partial data preserves user projection and rejects unqualified bounds",
+          "[ducklake_units][ducklake_snapshot_visibility]")
+{
+  auto unit         = local();
+  unit.snapshot_min = 10;
+  unit.snapshot_max = 20;
+  auto fields       = std::vector{bind_field(4, duckdb::LogicalType::BIGINT, duckdb::Value()),
+                            bind_field(9, duckdb::LogicalType::BIGINT, duckdb::Value())};
+  unit_scan_options options;
+  options.output_columns = std::vector<size_t>{1, 0, 1};
+  CHECK_THROWS(add_partial_data_filter(unit, fields, options));
+  CHECK(assess_local_scope(unit).outside_local_scope);
+  unit.snapshot_visibility_probe = true;
+  CHECK_FALSE(assess_local_scope(unit).outside_local_scope);
+  REQUIRE(add_partial_data_filter(unit, fields, options));
+  CHECK(*options.output_columns == std::vector<size_t>{1, 0, 1});
+  CHECK(options.filters->HasFilter(duckdb::ProjectionIndex(2)));
+  unit.snapshot_min = 21;
+  CHECK(assess_local_scope(unit).outside_local_scope);
+  CHECK_THROWS(add_partial_data_filter(unit, fields, options));
+  unit.snapshot_min = 10;
+  unit.snapshot_max = uint64_t(INT64_MAX) + 1;
+  CHECK_THROWS(add_partial_data_filter(unit, fields, options));
+}
+TEST_CASE("DuckLake partial data requires exact snapshot identity and type",
+          "[ducklake_units][ducklake_snapshot_visibility]")
+{
+  auto mode       = GENERATE(0, 1, 2, 3, 4);
+  auto footer     = mapping_footer();
+  auto& column    = footer->schema[2];
+  column.name     = "_ducklake_internal_snapshot_id";
+  column.field_id = duckdb::MultiFileReader::LAST_UPDATED_SEQUENCE_NUMBER_ID;
+  scan::field_requirement snapshot{*column.field_id, duckdb::LogicalType::BIGINT, std::nullopt};
+  if (mode == 0) column.type = pq::Type::INT32;
+  if (mode == 1) column.name = "wrong_name";
+  if (mode == 2) snapshot.missing_value = duckdb::Value::BIGINT(0);
+  if (mode == 3) snapshot.allow_int32_to_int64 = true;
+  if (mode == 4) column.num_children = 1;
+  CHECK_THROWS(compile_test(footer, {snapshot}, true));
+  CHECK_THROWS(compile_test(mapping_footer(), {}, true));
 }

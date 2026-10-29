@@ -53,6 +53,8 @@ struct unit_descriptor {
   // Positions remain with the original list and can be copied into a bounded
   // caller buffer. Discovery never duplicates the complete position set.
   uint64_t inline_delete_count = 0;
+  // Internal development profile selected by the binding factory, never provider metadata.
+  bool snapshot_visibility_probe = false;
 };
 
 enum class unit_gate_reason : uint8_t {

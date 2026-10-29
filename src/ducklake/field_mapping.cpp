@@ -99,13 +99,18 @@ scan::field_requirement bind_field(int32_t id,
 scan::field_id_mapping compile_field_mapping(std::shared_ptr<scan::parquet_metadata const> metadata,
                                              std::string const& identity,
                                              scan::materialization_program program,
-                                             std::vector<scan::field_requirement> fields)
+                                             std::vector<scan::field_requirement> fields,
+                                             bool partial_data)
 {
   if (!metadata || !metadata->file_metadata())
     throw std::invalid_argument("DuckLake field mapping requires a footer");
   std::unordered_set<int32_t> bound_ids;
   for (auto const& field : fields) {
-    if (field.id <= 0 || internal_id(field.id) || !bound_ids.insert(field.id).second)
+    bool snapshot = partial_data &&
+                    field.id == duckdb::MultiFileReader::LAST_UPDATED_SEQUENCE_NUMBER_ID &&
+                    field.type == duckdb::LogicalType::BIGINT && !field.missing_value &&
+                    !field.allow_int32_to_int64 && !field.allow_float_to_double;
+    if (field.id <= 0 || (internal_id(field.id) && !snapshot) || !bound_ids.insert(field.id).second)
       throw std::invalid_argument("DuckLake bound field IDs are invalid or duplicated");
     if ((field.allow_float_to_double && field.type != duckdb::LogicalType::DOUBLE) ||
         (field.allow_int32_to_int64 && field.type != duckdb::LogicalType::BIGINT) ||
@@ -114,6 +119,8 @@ scan::field_id_mapping compile_field_mapping(std::shared_ptr<scan::parquet_metad
           field.missing_value->type() != field.type)))
       throw std::invalid_argument("DuckLake field mapping policy is not qualified");
   }
+  if (partial_data && !bound_ids.contains(duckdb::MultiFileReader::LAST_UPDATED_SEQUENCE_NUMBER_ID))
+    throw std::invalid_argument("DuckLake partial data requires the snapshot working column");
   std::vector<scan::field_requirement> internal_fields;
   auto const& schema = metadata->file_metadata()->schema;
   auto roots         = io::parquet_helpers::top_level_schema_indices(*metadata->file_metadata());
@@ -157,5 +164,37 @@ scan::field_id_mapping compile_field_mapping(std::shared_ptr<scan::parquet_metad
     std::move(fields),
     scan::field_mapping_scope::top_level_scalars,
     scan::row_count_carrier_policy::include_temporal_and_decimal);
+}
+bool add_partial_data_filter(unit_descriptor const& unit,
+                             std::vector<scan::field_requirement>& fields,
+                             unit_scan_options& options)
+{
+  validate_scan_options(options, fields.size());
+  if (!unit.snapshot_min && !unit.snapshot_max) return false;
+  if (!unit.snapshot_visibility_probe)
+    throw std::invalid_argument("DuckLake partial data requires the snapshot visibility probe");
+  if ((unit.snapshot_min && *unit.snapshot_min > INT64_MAX) ||
+      (unit.snapshot_max && *unit.snapshot_max > INT64_MAX) ||
+      (unit.snapshot_min && unit.snapshot_max && *unit.snapshot_min > *unit.snapshot_max))
+    throw std::invalid_argument("DuckLake partial data snapshot bounds are invalid");
+  auto column = fields.size();
+  if (!options.output_columns) {
+    options.output_columns.emplace();
+    for (size_t i = 0; i < column; ++i)
+      options.output_columns->push_back(i);
+  }
+  fields.push_back({duckdb::MultiFileReader::LAST_UPDATED_SEQUENCE_NUMBER_ID,
+                    duckdb::LogicalType::BIGINT,
+                    std::nullopt});
+  if (!options.filters) options.filters = duckdb::make_uniq<duckdb::TableFilterSet>();
+  auto add = [&](uint64_t bound, duckdb::ExpressionType comparison) {
+    options.filters->PushFilter(duckdb::ProjectionIndex(column),
+                                duckdb::ExpressionFilter::CreateComparisonFilter(
+                                  comparison, duckdb::Value::BIGINT(static_cast<int64_t>(bound))));
+  };
+  if (unit.snapshot_min)
+    add(*unit.snapshot_min, duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO);
+  if (unit.snapshot_max) add(*unit.snapshot_max, duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO);
+  return true;
 }
 }  // namespace sirius::ducklake
