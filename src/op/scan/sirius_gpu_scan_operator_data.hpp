@@ -377,6 +377,10 @@ class scan_operator_input : public op::operator_data {
   bool cached_view_possible{false};
   /// Possible membership applications attached to this split's current decoded rows.
   std::vector<applied_entry> decode_attached;
+  /// The scan's per-output-column normalization targets, set when the scan's output assembly is a
+  /// leading identity, so a compacted decode may write restored columns directly in their target
+  /// type. Empty otherwise.
+  std::vector<cudf::data_type> decode_restore_types;
   /// Operator-shared latch for "compacting this scan's batches during decode
   /// does not pay off", stamped by
   /// sirius_gpu_scan_operator::get_next_task_input_data on every split it hands
