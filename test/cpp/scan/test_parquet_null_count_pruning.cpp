@@ -27,10 +27,10 @@
 
 // test
 #include <catch.hpp>
+#include <utils/local_ioctx.hpp>
 #include <utils/table_filter_test_utils.hpp>
 
 // sirius
-#include <io/kvikio/kvikio_context.hpp>
 #include <op/scan/parquet_batch_layout.hpp>
 #include <op/scan/parquet_gpu_ingestible.hpp>
 #include <op/scan/scan_plan.hpp>
@@ -159,9 +159,9 @@ class NullCountFixture {
   std::size_t surviving_row_groups(std::optional<bool> filter_expects_null) const
   {
     auto ingestible = scan::make_ingestible(make_info(filter_expects_null));
-    auto ioctx      = std::make_shared<sirius::io::kvikio_context>();
+    auto ioctx      = sirius::test::make_test_local_ioctx();
     auto task       = ingestible->next_split_provider(
-      [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+      [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
     REQUIRE(task);
     auto info = task({});
     REQUIRE(info);
@@ -227,9 +227,9 @@ TEST_CASE_METHOD(NullCountFixture,
   info->table_filters = std::move(filters);
 
   auto ingestible = scan::make_ingestible(std::move(info));
-  auto ioctx      = std::make_shared<sirius::io::kvikio_context>();
+  auto ioctx      = sirius::test::make_test_local_ioctx();
   auto task       = ingestible->next_split_provider(
-    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+    [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
   REQUIRE(task);
   auto file_info = task({});
   auto* file     = dynamic_cast<scan::parquet_file_scan_info*>(file_info.get());

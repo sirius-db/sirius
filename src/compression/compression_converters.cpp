@@ -21,12 +21,14 @@
 #include "compressed_scan.hpp"
 #include "device_compressed_blob.hpp"
 #include "spill_compression.hpp"
+#include "spill_io.hpp"
 #include "telemetry/nvtx.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/table/table.hpp>
 
+#include <rmm/cuda_device.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/error.hpp>
 #include <rmm/mr/per_device_resource.hpp>
@@ -36,7 +38,6 @@
 #include <api/compressed_table_io.hpp>
 #include <api/simpatico_codegen.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
-#include <cucascade/data/disk_io_backend.hpp>
 #include <cucascade/data/representation_converter.hpp>
 #include <cucascade/error.hpp>
 #include <cucascade/memory/memory_space.hpp>
@@ -277,14 +278,24 @@ std::unique_ptr<cucascade::idata_representation> decompress_disk_to_gpu(
   nvtx_scoped_range nvtx_range{"sirius::compression::disk_to_gpu"};
   auto const& rep   = source.cast<compressed_disk_representation>();
   auto const& space = gpu_decode_space(target_memory_space, "disk-to-GPU decompression", stream);
-  auto& backend     = rep.get_memory_space().get_io_backend();
-
+  rmm::cuda_set_device_raii const device_guard{rmm::cuda_device_id{space.get_device_id()}};
+  auto ctx = compression::detail::spill_context(rep.get_memory_space());
+  if (!ctx->supports_device_read()) {
+    throw std::logic_error("compressed spill: DISK context cannot read device memory");
+  }
+  auto object = ctx->open_io_object(rep.path());
   std::vector<std::uint8_t> header(rep.header_bytes());
-  backend.read(rep.path(), header.data(), header.size(), 0);
-  // Read each compressed leaf buffer from the file straight into device memory.
+  // Cache-unaware primitives: spill files must not populate or be served by a scan cache.
+  compression::detail::check_spill_bytes(
+    ctx->host_read_io(*object, 0, header.size(), header.data()), header.size());
+  // Every fetch drains before reconstruction can release its destination buffer, including
+  // failures. Retain the context and the one opened object throughout all decode callbacks.
   simpatico::payload_fetch_fn fetch =
-    [&backend, &rep](std::uint64_t off, std::size_t sz, void* dst, ::cuda::stream_ref s) {
-      backend.read(rep.path(), dst, sz, rep.header_bytes() + off, s);
+    [ctx, object, header_bytes = rep.header_bytes()](
+      std::uint64_t off, std::size_t sz, void* dst, ::cuda::stream_ref s) {
+      compression::detail::spill_request request{ctx->device_read_async_io(
+        *object, header_bytes + off, sz, static_cast<std::uint8_t*>(dst), s)};
+      compression::detail::check_spill_bytes(request.get(), sz);
     };
 
   return reconstruct_and_decompress_to_gpu(

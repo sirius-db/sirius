@@ -314,7 +314,7 @@ TEST_CASE("Arrow reader outputs retain one backing through publication and impor
     rmm::cuda_stream first_stream, second_stream;
     std::array<materialized_batch, 2> outputs;
     std::array<gpu_read_hold, 2> holds;
-    sirius::exec::detail::completion_cuda_api api;
+    cucascade::exec::detail::completion_cuda_api api;
     api.add_callback = &gated_import_callback;
     sirius::exec::retire_lane first_lane(first_stream.value(), api);
     sirius::exec::retire_lane second_lane(second_stream.value(), api);

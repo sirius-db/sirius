@@ -16,7 +16,6 @@
 
 #include "scan_manager/readahead_scan_manager.hpp"
 
-#include "io/sirius_datasource.hpp"
 #include "log/logging.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
@@ -24,6 +23,8 @@
 #include "op/sirius_physical_operator.hpp"
 #include "planner/query.hpp"
 #include "planner/query_index.hpp"
+
+#include <cucascade/cudf/datasource.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -232,20 +233,22 @@ void readahead_scan_manager::mark_operator_closed(std::size_t operator_id)
 
 void readahead_scan_manager::update_scan_state(std::size_t,
                                                const op::scan::scan_info* task,
-                                               io::cache::scan_stage stage)
+                                               cucascade::io::cache::scan_stage stage)
 {
   // A zero budget means the backend opted out, so there is no readahead for this
   // read to compete with and no budget to charge it against.
   if (task == nullptr || _budget == 0) { return; }
-  if (stage != io::cache::scan_stage::reading && stage != io::cache::scan_stage::disposed) return;
+  if (stage != cucascade::io::cache::scan_stage::reading &&
+      stage != cucascade::io::cache::scan_stage::disposed)
+    return;
   auto key = task->weak_from_this();
   std::lock_guard lock(_tickets_mutex);
   auto it = _tickets.find(key);
 
-  if (stage == io::cache::scan_stage::reading) {
+  if (stage == cucascade::io::cache::scan_stage::reading) {
     // Stage publication precedes this call. Do not recreate an entry if a
     // disposal overtook this report while it was waiting for the mutex.
-    if (task->get_scan_stage() == io::cache::scan_stage::disposed) return;
+    if (task->get_scan_stage() == cucascade::io::cache::scan_stage::disposed) return;
     if (it != _tickets.end()) {
       it->second->demand_started = true;
       return;
@@ -264,7 +267,7 @@ void readahead_scan_manager::update_scan_state(std::size_t,
     return;
   }
 
-  if (stage == io::cache::scan_stage::disposed && it != _tickets.end()) {
+  if (stage == cucascade::io::cache::scan_stage::disposed && it != _tickets.end()) {
     // An in-flight prefetch still owns both credits until its completion, even
     // if its consumer is disposed or the manager is destroyed in the meantime.
     if (it->second->owner == scan_ticket::phase::demand) {
@@ -276,7 +279,10 @@ void readahead_scan_manager::update_scan_state(std::size_t,
 }
 
 prefetch_outcome_kind readahead_scan_manager::classify_prefetch(
-  bool allocation_failed, bool split_alive, bool issued_io, io::cache::scan_stage stage) noexcept
+  bool allocation_failed,
+  bool split_alive,
+  bool issued_io,
+  cucascade::io::cache::scan_stage stage) noexcept
 {
   // A hard failure outranks anything the consumer was doing: with no buffers
   // there was never an attempt to be early or late for.
@@ -284,14 +290,17 @@ prefetch_outcome_kind readahead_scan_manager::classify_prefetch(
   // The split is gone, so whatever it was going to be read for already happened.
   if (!split_alive) { return prefetch_outcome_kind::skipped_fell_behind; }
   if (!issued_io) {
-    return stage >= io::cache::scan_stage::preparing ? prefetch_outcome_kind::skipped_fell_behind
-                                                     : prefetch_outcome_kind::nothing_to_issue;
+    return stage >= cucascade::io::cache::scan_stage::preparing
+             ? prefetch_outcome_kind::skipped_fell_behind
+             : prefetch_outcome_kind::nothing_to_issue;
   }
   // IO landed.  `reading` is carved out of "preparing or higher" because it is
   // the more specific case: the consumer is on this split right now and is
   // waiting on the very prefetch that just settled.
-  if (stage == io::cache::scan_stage::reading) { return prefetch_outcome_kind::wait_for_prefetch; }
-  if (stage >= io::cache::scan_stage::preparing) {
+  if (stage == cucascade::io::cache::scan_stage::reading) {
+    return prefetch_outcome_kind::wait_for_prefetch;
+  }
+  if (stage >= cucascade::io::cache::scan_stage::preparing) {
     return prefetch_outcome_kind::skipped_fell_behind;
   }
   return prefetch_outcome_kind::prefetched;
@@ -329,7 +338,7 @@ void readahead_scan_manager::settle_prefetch(split_key const& split,
   auto it             = _tickets.find(split);
   auto task           = split.lock();
   bool const retained = it != _tickets.end() && it->second == ticket && task &&
-                        task->get_scan_stage() != io::cache::scan_stage::disposed;
+                        task->get_scan_stage() != cucascade::io::cache::scan_stage::disposed;
   if (retained && !covered && ticket->demand_started) {
     // Failure or partial coverage leaves demand IO outstanding. Transfer the
     // existing charge; disposal will release it, without a gap or double count.
@@ -357,7 +366,7 @@ void readahead_scan_manager::on_prefetch_complete(split_key const& split,
     classify_prefetch(out.declined_memory_pressure > 0,
                       task != nullptr,
                       out.issued > 0,
-                      task ? task->get_scan_stage() : io::cache::scan_stage::disposed));
+                      task ? task->get_scan_stage() : cucascade::io::cache::scan_stage::disposed));
 }
 
 void readahead_scan_manager::worker_loop(const std::stop_token& st)
@@ -514,7 +523,7 @@ shared_scan_budget::token readahead_scan_manager::acquire_shared_ticket(
   std::vector<shared_scan_budget::request> requests;
   for (auto const& source : task.datasources()) {
     auto backend = source->io_ctx();
-    if (!backend || !backend->can_use_prefetching_cache()) continue;
+    if (!backend || !backend->can_use_fs_cache()) continue;
     auto limit = _budget_override.value_or(backend->n_max_concurrent_scans());
     if (!limit) {
       if (!demand) return {};

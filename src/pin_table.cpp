@@ -22,7 +22,7 @@
 #include "data/sirius_converter_registry.hpp"
 #include "helper/numeric_narrowing.hpp"
 #include "helper/type_conversions.hpp"
-#include "io/io_context.hpp"
+#include "io/ioctx_resolver.hpp"
 #include "late_mat/pin_uniqueness.hpp"
 #include "log/logging.hpp"
 #include "memory/runtime_stream_pool.hpp"
@@ -47,6 +47,7 @@
 #include <api/simpatico_codegen.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
+#include <cucascade/io/io_context.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
@@ -221,7 +222,7 @@ narrowed_pin_chunk narrow_pin_chunk(std::unique_ptr<cudf::table> table,
 std::vector<late_mat::unique_verdict> materialize_pin_batches(
   op::scan::gpu_ingestible& ingestible,
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
-  io::ioctx& io_ctx,
+  cucascade::io::ioctx& io_ctx,
   duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
   pin_materialization_options options,
   const pin_batch_sink& on_batch,
@@ -587,7 +588,7 @@ bool compress_and_stage_batch(cudf::table const& tbl,
 materialized_pin materialize_all_batches(
   op::scan::gpu_ingestible& ingestible,
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
-  io::ioctx& io_ctx,
+  cucascade::io::ioctx& io_ctx,
   duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
   pin_materialization_options options)
 {
@@ -620,7 +621,7 @@ host_pin_result materialize_pin_to_host(
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
   const std::unordered_map<int, cucascade::memory::memory_space*>& host_space_by_gpu,
   scan_manager::host_pin_placement& placement,
-  io::ioctx& io_ctx,
+  cucascade::io::ioctx& io_ctx,
   duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
   compression_pin_config const& compression,
   pin_materialization_options options)
@@ -755,7 +756,7 @@ host_pin_result materialize_pin_to_host(
 device_pin_result materialize_all_batches_compressed(
   op::scan::gpu_ingestible& ingestible,
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
-  io::ioctx& io_ctx,
+  cucascade::io::ioctx& io_ctx,
   duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
   compression_pin_config const& compression,
   pin_materialization_options options)

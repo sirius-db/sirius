@@ -114,8 +114,8 @@ build/release/test/cpp/sirius_unittest
 
 Run tests associated with a specific tag or a specific test:
 ```
-build/release/test/cpp/sirius_unittest "[uri_parser]"
-build/release/test/cpp/sirius_unittest "uri_parser parses object-store URIs"
+build/release/test/cpp/sirius_unittest "[path_utils]"
+build/release/test/cpp/sirius_unittest "strip_file_scheme folds dot, dot-dot and empty segments"
 ```
 
 Test logs are saved in:
