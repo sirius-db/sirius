@@ -25,7 +25,9 @@
  * negative values (-2^31, -2^63), whose magnitude is one more than the maximum.
  */
 
+#include "data/data_batch_utils.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
+#include "op/aggregate/gpu_aggregate_impl.hpp"
 #include "op/aggregate/wide_integer_sum.hpp"
 #include "operator/operator_test_utils.hpp"
 #include "sirius/exception.hpp"
@@ -651,4 +653,90 @@ TEST_CASE("wide integer sum - grouped sums of the halves are exact past INT64",
   CHECK(
     grouped_split_sums(null_keys->view(), null_values->view()) ==
     std::map<int32_t, std::optional<__int128_t>>{{0, __int128_t{kMax64} * 2}, {1, std::nullopt}});
+}
+
+namespace {
+
+/// Groups -> SUM of a local grouped aggregate over (INT32 key, INT64 value), with the wide integer
+/// SUM split into halves or not. Also returns the result column's type and the group count.
+struct local_sum_result {
+  std::map<int32_t, __int128_t> sums;
+  cudf::data_type type;
+  cudf::size_type num_groups;
+};
+
+local_sum_result local_wide_sum(std::vector<int32_t> const& keys,
+                                std::vector<int64_t> const& values,
+                                bool split)
+{
+  auto* space       = sirius::test::operator_utils::get_default_gpu_space();
+  auto const stream = cudf::get_default_stream();
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(i32(keys));
+  columns.push_back(i64(values));
+  auto batch = sirius::make_data_batch(std::make_unique<cudf::table>(std::move(columns)),
+                                       *space,
+                                       stream,
+                                       sirius::telemetry::batch_telemetry_info{});
+  cudf::size_type num_groups = -1;
+  auto out        = sirius::op::gpu_aggregate_impl::local_grouped_aggregate(batch->to_read_only(),
+                                                                            {0},
+                                                                            {cudf::aggregation::Kind::SUM},
+                                                                            {1},
+                                                                            {},
+                                                                     stream,
+                                                                     *space,
+                                                                            {},
+                                                                            {},
+                                                                            {true},
+                                                                     split,
+                                                                     &num_groups);
+  auto const view = sirius::get_cudf_table_view(*out);
+  auto const key_host =
+    sirius::test::operator_utils::copy_column_to_host<int32_t>(view.column(0), stream);
+  std::vector<__int128_t> sum_host;
+  if (view.column(1).type() == wide_integer_sum_type()) {
+    sum_host = to_host_128(view.column(1));
+  } else {
+    for (auto v :
+         sirius::test::operator_utils::copy_column_to_host<int64_t>(view.column(1), stream)) {
+      sum_host.push_back(v);
+    }
+  }
+  local_sum_result result{{}, view.column(1).type(), num_groups};
+  for (std::size_t i = 0; i < key_host.size(); ++i) {
+    result.sums[key_host[i]] = sum_host[i];
+  }
+  return result;
+}
+
+}  // namespace
+
+TEST_CASE(
+  "wide integer sum - a grouped aggregate gives the same exact sums with or without the "
+  "split",
+  "[aggregate][wide_integer_sum]")
+{
+  // Values that make this batch able to overflow INT64, so the SUM is widened either way.
+  std::vector<int32_t> keys;
+  std::vector<int64_t> values;
+  for (int i = 0; i < 100; ++i) {
+    keys.push_back(i % 2);
+    values.push_back(i % 2 == 0 ? kMax64 : kMin64);
+  }
+  auto const expected =
+    std::map<int32_t, __int128_t>{{0, __int128_t{kMax64} * 50}, {1, __int128_t{kMin64} * 50}};
+  for (bool split : {false, true}) {
+    auto const result = local_wide_sum(keys, values, split);
+    CHECK(result.type == wide_integer_sum_type());
+    CHECK(result.num_groups == 2);
+    CHECK(result.sums == expected);
+  }
+
+  // Small values: the batch provably fits INT64, so neither path widens.
+  for (bool split : {false, true}) {
+    auto const result = local_wide_sum({0, 1, 0}, {5, 7, -2}, split);
+    CHECK(result.type.id() == cudf::type_id::INT64);
+    CHECK(result.sums == std::map<int32_t, __int128_t>{{0, 3}, {1, 7}});
+  }
 }

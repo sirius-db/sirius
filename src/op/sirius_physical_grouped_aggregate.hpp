@@ -29,6 +29,7 @@
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/sirius_physical_operator.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <numeric>
@@ -79,6 +80,17 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   /// Parallel to cudf_aggregates: true for the SUM of a wide integer SUM or AVG
   /// (AggregateSlot::is_wide_integer_sum), whose partial result may be DECIMAL128.
   std::vector<bool> cudf_aggregate_is_wide_integer_sum;
+
+  /// Max groups in the previous batch for a widened BIGINT SUM to be summed as two INT64 halves
+  /// instead of over DECIMAL128. From a group-count sweep on an RTX PRO 6000: the halves win up to
+  /// 10K groups (contention on cuDF's 128-bit CAS), tie at 100K-300K, and lose from 1M on (a second
+  /// atomic per row). 64K sits inside the tie range, well below the losses.
+  static constexpr std::int64_t split_wide_sum_max_groups = 1 << 16;
+
+  /// Groups in the most recent batch this operator aggregated; -1 until the first one. Batches
+  /// that start before any count is known split: a wasted split costs a few percent at most,
+  /// while a wasted DECIMAL128 sum with few groups costs up to 3x.
+  std::atomic<std::int64_t> _last_batch_groups{-1};
 
   // Partial aggregate layout and finalization metadata
   std::vector<AggregateSlot> aggregate_slots;

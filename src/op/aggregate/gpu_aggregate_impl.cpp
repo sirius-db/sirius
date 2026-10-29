@@ -147,7 +147,8 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
   ::cuda::stream_ref stream,
   cucascade::memory::memory_space& memory_space,
   const std::vector<std::optional<std::uint64_t>>& aggregate_input_max_abs = {},
-  const std::vector<bool>& aggregate_is_wide_integer_sum                   = {})
+  const std::vector<bool>& aggregate_is_wide_integer_sum                   = {},
+  bool split_wide_integer_sums                                             = false)
 {
   // Sanity check
   if (aggregates.size() != aggregate_idx.size()) {
@@ -304,11 +305,13 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
   // (see sums_to_widen) is computed over the column widened to the next decimal type. It uses the
   // key column index + widened_sum_key_offset, which keeps it in a request of its own. Every other
   // decimal SUM runs at the input width and its result is widened below. A wide integer SUM over
-  // INT64 is gated the same way. When widened, it is not summed over DECIMAL128: its high and low
-  // 32-bit halves are summed in INT64 instead (split_int64_halves), the low half in a request of
-  // its own appended after the others, and the halves are combined into the exact DECIMAL128 sum
-  // below. Both use native 64-bit atomics, where a DECIMAL128 SUM contends on cuDF's 128-bit
-  // compare-and-swap loop when few groups share many rows. One proven safe stays INT64 end to
+  // INT64 is gated the same way. When widened and @p split_wide_integer_sums is set, it is not
+  // summed over DECIMAL128: its high and low 32-bit halves are summed in INT64 instead
+  // (split_int64_halves), the low half in a request of its own appended after the others, and the
+  // halves are combined into the exact DECIMAL128 sum below. Both use native 64-bit atomics, where
+  // a DECIMAL128 SUM contends on cuDF's 128-bit compare-and-swap loop when few groups share many
+  // rows; with very many groups the second atomic costs more than it saves, so the caller only sets
+  // the flag when few groups are expected. One proven safe stays INT64 end to
   // end, so its per-group result is not widened and the merge decides for itself (see
   // gpu_merge_impl::merge_grouped_aggregate). A wide SUM over INT32 cannot overflow INT64 within
   // one batch (fewer than 2^31 rows of magnitude at most 2^31) and is never a candidate.
@@ -434,7 +437,7 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
       temp_struct_cols.push_back(std::move(narrow_col));
     } else if (aggregate_col_id >= widened_sum_key_offset) {
       auto const& col = input_table.column(aggregate_col_id - widened_sum_key_offset);
-      if (col.type().id() == cudf::type_id::INT64) {
+      if (split_wide_integer_sums && col.type().id() == cudf::type_id::INT64) {
         auto [high, low] = split_int64_halves(col, stream, memory_space.get_default_allocator());
         request.values   = high->view();
         low_half_inputs.emplace_back(aggregate_col_id, low->view());
@@ -774,7 +777,9 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
   cucascade::memory::memory_space& memory_space,
   const telemetry::batch_telemetry_info& telemetry_info,
   const std::vector<std::optional<std::uint64_t>>& aggregate_input_max_abs,
-  const std::vector<bool>& aggregate_is_wide_integer_sum)
+  const std::vector<bool>& aggregate_is_wide_integer_sum,
+  bool split_wide_integer_sums,
+  cudf::size_type* num_groups)
 {
   auto output_table = grouped_aggregate_table(get_cudf_table_view(input),
                                               group_idx,
@@ -784,7 +789,9 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
                                               stream,
                                               memory_space,
                                               aggregate_input_max_abs,
-                                              aggregate_is_wide_integer_sum);
+                                              aggregate_is_wide_integer_sum,
+                                              split_wide_integer_sums);
+  if (num_groups != nullptr) { *num_groups = output_table->num_rows(); }
   return make_data_batch(std::move(output_table), memory_space, stream, telemetry_info);
 }
 

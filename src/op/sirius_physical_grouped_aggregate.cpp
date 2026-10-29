@@ -175,7 +175,10 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
                                                           cudf_aggregate_is_wide_integer_sum));
       continue;
     }
-    auto result = gpu_aggregate_impl::local_grouped_aggregate(input_batch,
+    auto const last_groups     = _last_batch_groups.load(std::memory_order_relaxed);
+    bool const split_wide_sums = last_groups <= split_wide_sum_max_groups;
+    cudf::size_type num_groups = 0;
+    auto result                = gpu_aggregate_impl::local_grouped_aggregate(input_batch,
                                                               group_idx,
                                                               cudf_aggregates,
                                                               cudf_aggregate_idx,
@@ -184,7 +187,10 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
                                                               *space,
                                                               batch_telemetry(),
                                                               cudf_aggregate_input_max_abs,
-                                                              cudf_aggregate_is_wide_integer_sum);
+                                                              cudf_aggregate_is_wide_integer_sum,
+                                                              split_wide_sums,
+                                                              &num_groups);
+    _last_batch_groups.store(num_groups, std::memory_order_relaxed);
     results.push_back(std::move(result));
   }
   return std::make_unique<pipelineable_operator_data>(results);
