@@ -67,6 +67,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -125,9 +126,69 @@ struct promotion_gate {
   }
 };
 
+/// A subscriber of its own to the two events the executor consumes; counts what it receives.
+class event_probe final : public sirius::event::query_event_subscriber {
+ public:
+  explicit event_probe(sirius::event::query_event_publisher& publisher)
+    : query_event_subscriber(
+        publisher,
+        {sirius::event::event_type::task_downgraded, sirius::event::event_type::task_popped})
+  {
+    start();
+  }
+
+  ~event_probe() override { stop(); }
+
+  event_probe(event_probe const&)            = delete;
+  event_probe& operator=(event_probe const&) = delete;
+
+  [[nodiscard]] std::string_view name() const noexcept override { return "preload_probe"; }
+
+  /// At least @p n events have arrived, by @p limit.
+  bool wait_for(std::uint64_t n, std::chrono::milliseconds limit = 30s)
+  {
+    std::unique_lock lk{_mu};
+    return _cv.wait_for(lk, limit, [&] { return _received >= n; });
+  }
+
+ private:
+  void on_task_downgraded(sirius::event::event_id_t,
+                          sirius::event::timestamp_t,
+                          sirius::query_id_t,
+                          sirius::event::downgraded_task const&) noexcept override
+  {
+    received();
+  }
+
+  void on_task_popped(sirius::event::event_id_t,
+                      sirius::event::timestamp_t,
+                      sirius::query_id_t,
+                      std::uint64_t,
+                      std::size_t,
+                      int,
+                      std::size_t) noexcept override
+  {
+    received();
+  }
+
+  void received()
+  {
+    std::lock_guard lk{_mu};
+    ++_received;
+    _cv.notify_all();
+  }
+
+  std::mutex _mu;
+  std::condition_variable _cv;
+  std::uint64_t _received{0};
+};
+
 struct fixture_options {
   int gpus{1};
   std::size_t gpu_capacity{gib};
+  /// Reservable fraction of the capacity. Below 1, reservations hit the limit while consumed
+  /// bytes (capacity-based) are still 0.
+  double gpu_reservation{1.0};
   double gpu_trigger{0.9};
   double gpu_stop{0.8};
 };
@@ -160,7 +221,7 @@ struct executor_fixture {
     cucascade::memory::reservation_manager_configurator builder;
     builder.set_number_of_gpus(static_cast<std::size_t>(opts.gpus))
       .set_gpu_usage_limit(opts.gpu_capacity)
-      .set_reservation_fraction_per_gpu(1.0)
+      .set_reservation_fraction_per_gpu(opts.gpu_reservation)
       .set_downgrade_fractions_per_gpu(opts.gpu_trigger, opts.gpu_stop)
       .track_reservation_per_stream(false)
       .set_per_numa_region_capacity(4 * gib)
@@ -272,10 +333,10 @@ struct executor_fixture {
     stream.sync();
   }
 
-  /// A GPU batch moved to @p space.
-  [[nodiscard]] batch_ptr spilled(cucascade::memory::memory_space& space)
+  /// A GPU batch of @p rows moved to @p space.
+  [[nodiscard]] batch_ptr spilled(cucascade::memory::memory_space& space, std::size_t rows = 4096)
   {
-    auto batch = make_gpu_batch();
+    auto batch = make_gpu_batch(rows);
     move_to(batch, space);
     return batch;
   }
@@ -290,6 +351,41 @@ struct executor_fixture {
             .gpu_bytes = ro.get_data()->get_size_in_bytes()};
   }
 
+  /// The priority of the task of @p owner (default: the fixture's query) that pops @p rank-th.
+  [[nodiscard]] sirius::exec::queue_priority priority(
+    std::uint64_t rank, std::optional<sirius::query_id_t> owner = std::nullopt) const
+  {
+    return static_cast<sirius::exec::queue_priority>(
+      sirius::query_priority_bits(owner.value_or(query)) | static_cast<std::int64_t>(rank));
+  }
+
+  /// A task_downgraded payload for task @p task_id (pop order: its id) with @p batches.
+  [[nodiscard]] sirius::event::downgraded_task task(
+    std::uint64_t task_id,
+    std::vector<batch_ptr> const& batches,
+    std::size_t pipeline                    = candidate_pipeline,
+    std::optional<int> device               = 0,
+    std::optional<sirius::query_id_t> owner = std::nullopt) const
+  {
+    sirius::event::downgraded_task t{.task_id          = task_id,
+                                     .pipeline_id      = pipeline,
+                                     .preferred_device = device,
+                                     .priority         = priority(task_id, owner),
+                                     .inputs           = {}};
+    for (auto const& b : batches) {
+      t.inputs.push_back(input(b));
+    }
+    return t;
+  }
+
+  /// Publish task_downgraded with @p t for @p owner (default: the fixture's query).
+  void downgraded(sirius::event::downgraded_task t,
+                  std::optional<sirius::query_id_t> owner = std::nullopt)
+  {
+    ++published;
+    publisher->publish_task_downgraded(owner.value_or(query), std::move(t));
+  }
+
   /// Publish task_downgraded for task @p task_id (pop order: its id) with @p batches.
   void downgraded(std::uint64_t task_id,
                   std::vector<batch_ptr> const& batches,
@@ -297,19 +393,7 @@ struct executor_fixture {
                   std::optional<int> device               = 0,
                   std::optional<sirius::query_id_t> owner = std::nullopt)
   {
-    auto const q = owner.value_or(query);
-    sirius::event::downgraded_task task{
-      .task_id          = task_id,
-      .pipeline_id      = pipeline,
-      .preferred_device = device,
-      .priority         = static_cast<sirius::exec::queue_priority>(sirius::query_priority_bits(q) |
-                                                            static_cast<std::int64_t>(task_id)),
-      .inputs           = {}};
-    for (auto const& b : batches) {
-      task.inputs.push_back(input(b));
-    }
-    ++published;
-    publisher->publish_task_downgraded(q, std::move(task));
+    downgraded(task(task_id, batches, pipeline, device, owner), owner);
   }
 
   /// Publish task_popped for task @p task_id on GPU @p gpu_id.
@@ -343,6 +427,18 @@ struct executor_fixture {
   [[nodiscard]] std::size_t outstanding(cucascade::memory::memory_space const& space) const
   {
     return exec->outstanding_for_testing(space.get_id());
+  }
+
+  /// Reserve GPU memory so that only @p left more bytes can be reserved.
+  [[nodiscard]] std::unique_ptr<cucascade::memory::reservation> leave_reservable(std::size_t left)
+  {
+    auto& space = gpu();
+    // Available memory is measured against the capacity, reservations against the limit.
+    auto const allocated = opts.gpu_capacity - space.get_available_memory();
+    REQUIRE(space.get_max_memory() > allocated + left);
+    auto res = space.make_reservation_or_null(space.get_max_memory() - allocated - left);
+    REQUIRE(res != nullptr);
+    return res;
   }
 
   /// Reserve GPU memory so that its consumed bytes reach @p target.
@@ -460,6 +556,33 @@ TEST_CASE("preload executor: one pop promotes at most one input", "[preload][pre
   CHECK(f.outstanding(f.gpu()) == f.exec->counters().bytes_to_gpu);
 }
 
+TEST_CASE("preload executor: the task that pops first goes up first, whenever it was spilled",
+          "[preload][preload_executor]")
+{
+  executor_fixture f;
+  f.build(executor_fixture::config());
+  auto const runs_later = f.spilled(*f.host);
+  auto const runs_first = f.spilled(*f.host);
+  // Task 1 is spilled first, but task 2 has the smaller priority: it pops, and runs, first.
+  auto spilled_first      = f.task(1, {runs_later});
+  spilled_first.priority  = f.priority(9);
+  auto spilled_second     = f.task(2, {runs_first});
+  spilled_second.priority = f.priority(3);
+  f.downgraded(std::move(spilled_first));
+  f.downgraded(std::move(spilled_second));
+
+  f.popped(100, short_queue);
+  f.settle();
+  CHECK(f.exec->counters().promoted_to_gpu == 1);
+  CHECK(tier_of(*runs_first) == Tier::GPU);
+  CHECK(tier_of(*runs_later) == Tier::HOST);
+
+  f.popped(101, short_queue);
+  f.settle();
+  CHECK(f.exec->counters().promoted_to_gpu == 2);
+  CHECK(tier_of(*runs_later) == Tier::GPU);
+}
+
 TEST_CASE("preload executor: pops during a promotion wait as credits, capped at the threads",
           "[preload][preload_executor]")
 {
@@ -477,8 +600,13 @@ TEST_CASE("preload executor: pops during a promotion wait as credits, capped at 
 
   f.popped(100, short_queue);
   REQUIRE(gate.wait_entered(1));
-  // Five pops while the worker copies: only the newest two are kept.
-  for (std::uint64_t t = 101; t <= 105; ++t) {
+  // Five pops while the worker copies: only the newest two are kept. The three oldest would be
+  // gated (a deep queue of another pipeline) and the two newest promote, so keeping the oldest
+  // instead would promote nothing more.
+  for (std::uint64_t t = 101; t <= 103; ++t) {
+    f.popped(t, deep_queue);
+  }
+  for (std::uint64_t t = 104; t <= 105; ++t) {
     f.popped(t, short_queue);
   }
   REQUIRE(f.handled());
@@ -487,6 +615,7 @@ TEST_CASE("preload executor: pops during a promotion wait as credits, capped at 
   REQUIRE(f.exec->wait_idle_for_testing(30s));
 
   CHECK(gate.count() == 3);
+  CHECK(f.exec->counters().gated == 0);
   CHECK(f.exec->counters().promoted_to_gpu == 3);
   CHECK(std::ranges::count_if(inputs,
                               [](batch_ptr const& b) { return tier_of(*b) == Tier::GPU; }) == 3);
@@ -734,6 +863,120 @@ TEST_CASE("preload executor: a busy or failed input is retried only once downgra
   CHECK(tier_of(*a) == Tier::GPU);
 }
 
+TEST_CASE("preload executor: an input found already on the GPU is not tried again",
+          "[preload][preload_executor]")
+{
+  executor_fixture f;
+  f.build(executor_fixture::config());
+  // Reported on HOST, but back on the GPU before preload gets to it.
+  auto const back         = f.make_gpu_batch();
+  auto const spilled      = f.spilled(*f.host);
+  auto first              = f.task(1, {back});
+  first.inputs.front().to = f.host->get_id();
+  f.downgraded(std::move(first));
+  f.downgraded(2, {spilled});
+
+  f.popped(100, short_queue);
+  f.settle();
+  auto c = f.exec->counters();
+  CHECK(c.not_needed == 1);
+  CHECK(c.promoted_to_gpu == 0);
+  CHECK(tier_of(*spilled) == Tier::HOST);
+  CHECK(f.outstanding(f.gpu()) == 0);
+
+  // Now known to be on the GPU, it is skipped: the next credit goes to the other task.
+  f.popped(101, short_queue);
+  f.settle();
+  c = f.exec->counters();
+  CHECK(c.not_needed == 1);
+  CHECK(c.promoted_to_gpu == 1);
+  CHECK(tier_of(*spilled) == Tier::GPU);
+}
+
+TEST_CASE("preload executor: an input with no room for its exact need waits until that fits",
+          "[preload][preload_executor]")
+{
+  // Half the GPU is reservable, so reservations fail while nothing counts as consumed yet: only
+  // the reservation and the budget refuse here, never the ceiling.
+  executor_fixture f{fixture_options{.gpu_reservation = 0.5}};
+  auto const big   = f.spilled(*f.host, std::size_t{1} << 20);
+  auto const small = f.spilled(*f.host);
+  // Big is reported as 1 byte, so it is first selected with the 1 MiB minimum estimate.
+  auto const first_estimate = with_slack(1);
+  auto const big_need       = gpu_need(*big);
+  auto const raised         = with_slack(big_need);
+  auto const small_estimate = estimate(*small);
+  auto const small_need     = gpu_need(*small);
+  auto const below_big      = std::max({first_estimate, small_estimate, small_need});
+  REQUIRE(below_big < big_need);
+  // Room in the budget for both first estimates, not for big's raised one.
+  std::size_t const budget = (std::max(first_estimate, small_estimate) + raised) / 2;
+  auto cfg                 = executor_fixture::config();
+  cfg.device_budget        = static_cast<double>(budget) / static_cast<double>(f.opts.gpu_capacity);
+  f.build(cfg);
+  // Reservable: every estimate and small's need, not big's need.
+  auto const blocker = f.leave_reservable((below_big + big_need) / 2);
+  REQUIRE(f.gpu().make_reservation_or_null(big_need) == nullptr);
+
+  auto big_task                     = f.task(1, {big});
+  big_task.inputs.front().gpu_bytes = 1;
+  f.downgraded(std::move(big_task));
+  f.downgraded(2, {small});
+
+  // Big pops first: its estimate reserves, its exact need does not.
+  f.popped(100, short_queue);
+  f.settle();
+  auto c = f.exec->counters();
+  CHECK(c.no_room == 1);
+  CHECK(c.promoted_to_gpu == 0);
+  CHECK(tier_of(*big) == Tier::HOST);
+  CHECK(f.outstanding(f.gpu()) == 0);
+
+  // Big's estimate is now its exact need, which the budget refuses: the credit goes to small
+  // instead of to another doomed attempt on big.
+  f.popped(101, short_queue);
+  f.settle();
+  c = f.exec->counters();
+  CHECK(c.no_room == 1);
+  CHECK(c.promoted_to_gpu == 1);
+  CHECK(tier_of(*small) == Tier::GPU);
+  CHECK(tier_of(*big) == Tier::HOST);
+}
+
+TEST_CASE("preload executor: a task popped or retired during its promotion keeps no budget",
+          "[preload][preload_executor]")
+{
+  promotion_gate gate;
+  executor_fixture f;
+  f.build(executor_fixture::config(), 2, [&gate](promotion_job const&) { gate.enter(); });
+  auto const release = f.arm_gate(gate);
+  auto const a       = f.spilled(*f.host);
+  auto const charged = estimate(*a);
+  f.downgraded(1, {a});
+  f.popped(100, short_queue);
+  REQUIRE(gate.wait_entered(1));
+  REQUIRE(f.handled());
+  CHECK(f.outstanding(f.gpu()) == charged);
+
+  SECTION("its task is popped")
+  {
+    f.popped(1, deep_queue);
+    REQUIRE(f.handled());
+  }
+  SECTION("its query retires") { f.exec->retire_query(f.query); }
+  CHECK(f.exec->candidate_count_for_testing() == 0);
+  // The running job, not the gone candidate, holds the charge.
+  CHECK(f.outstanding(f.gpu()) == charged);
+
+  gate.release();
+  f.settle();
+  // The copy completes, its charge is released, and nothing is recorded as held.
+  CHECK(f.exec->counters().promoted_to_gpu == 1);
+  CHECK(tier_of(*a) == Tier::GPU);
+  CHECK(f.outstanding(f.gpu()) == 0);
+  CHECK(f.exec->candidate_count_for_testing() == 0);
+}
+
 TEST_CASE("preload executor: a task_downgraded delivered after its task's pop is dropped",
           "[preload][preload_executor]")
 {
@@ -741,14 +984,11 @@ TEST_CASE("preload executor: a task_downgraded delivered after its task's pop is
   f.build(executor_fixture::config());
   auto const a = f.spilled(*f.host);
   // The mailbox delivers one producer's events in order, so the reordering a downgrade worker
-  // and the scheduler can produce is staged by calling the hooks with chosen event ids.
-  auto& hooks = static_cast<sirius::event::query_event_subscriber&>(*f.exec);
-  sirius::event::downgraded_task const task{
-    .task_id          = 7,
-    .pipeline_id      = candidate_pipeline,
-    .preferred_device = 0,
-    .priority = static_cast<sirius::exec::queue_priority>(sirius::query_priority_bits(f.query) | 7),
-    .inputs   = {executor_fixture::input(a)}};
+  // and the scheduler can produce is staged by calling the hooks with chosen event ids. Safe from
+  // the test thread: this test publishes nothing, so the subscriber's worker never runs a hook
+  // concurrently, and the hooks take the executor's mutex for everything they touch anyway.
+  auto& hooks     = static_cast<sirius::event::query_event_subscriber&>(*f.exec);
+  auto const task = f.task(7, {a});
 
   hooks.on_task_popped(1000, {}, f.query, 7, other_pipeline, 0, deep_queue);
   REQUIRE(f.exec->wait_idle_for_testing(30s));
@@ -832,12 +1072,18 @@ TEST_CASE("preload executor: stop is idempotent and final", "[preload][preload_e
   f.exec->stop();
   f.exec->stop();
   f.exec->start();  // a no-op once stopped
+  CHECK_FALSE(f.exec->is_subscribed());
 
+  // A live subscriber receives both events, so they were published; publishing enqueues into
+  // every registered mailbox at once, and the stopped executor's was dropped.
+  event_probe probe{*f.publisher};
   auto const a = f.spilled(*f.host);
   f.downgraded(1, {a});
   f.popped(100, short_queue);
+  REQUIRE(probe.wait_for(2));
   CHECK(f.exec->events_handled_for_testing() == 0);
   CHECK(f.exec->counters().pops == 0);
+  CHECK(f.exec->candidate_count_for_testing() == 0);
   CHECK(f.exec->wait_idle_for_testing(1s));
   CHECK(tier_of(*a) == Tier::HOST);
 }

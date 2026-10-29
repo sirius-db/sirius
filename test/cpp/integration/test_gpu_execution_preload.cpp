@@ -285,14 +285,24 @@ void run_off_and_on(sirius::test::scratch_dir const& dir,
   // Let the workers finish the credits already delivered; the counters are then at least what the
   // queries' pops caused so far.
   REQUIRE(preload->wait_idle_for_testing(std::chrono::seconds(30)));
-  auto const counters = preload->counters();
-  INFO(report(counters));
-  // The scheduler's pops reached preload, and the downgrade executor's spills of queued tasks made
-  // candidates that some pops found. Whether a candidate is then promoted depends on when the GPU
-  // drops below its ceiling while the candidate is still queued, so it is not checked here; the
-  // unit tests cover it.
+  // A consistent snapshot: no event handled between the two reads, so the events handled are
+  // exactly the counted pops plus the task_downgraded events.
+  std::uint64_t handled = 0;
+  preload_counters counters;
+  do {
+    handled  = preload->events_handled_for_testing();
+    counters = preload->counters();
+  } while (preload->events_handled_for_testing() != handled);
+  INFO(report(counters) << " events_handled=" << handled);
+  // The scheduler's pops reached preload, and so did the downgrade executor's task_downgraded
+  // events, which made candidates that some pops found. Whether a candidate is then promoted
+  // depends on when the GPU drops below its ceiling while the candidate is still queued, so it is
+  // not checked here; the unit tests cover it.
   CHECK(counters.pops > 0);
-  CHECK(counters.no_candidate < counters.pops);
+  CHECK(handled > counters.pops);
+  CHECK(counters.gated + counters.no_room + counters.not_needed + counters.failed +
+          counters.promoted_to_gpu + counters.promoted_to_host >
+        0);
 }
 
 }  // namespace

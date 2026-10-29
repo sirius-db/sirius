@@ -35,6 +35,8 @@
 #include <cuda/stream>
 #include <cuda_runtime_api.h>
 
+#include <absl/cleanup/cleanup.h>
+
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -928,6 +930,9 @@ TEST_CASE(
   // One worker thread: GPU 0 pops its next task only once the previous one has run.
   task_scheduler sched(lifecycle, {1}, *manager, sirius::test::make_test_telemetry_context());
   sched.set_query_event_publisher(*events);
+  // On every exit, so a failed REQUIRE cannot leave ~task_scheduler joining a worker held at the
+  // gate: declared after the scheduler, it runs first.
+  absl::Cleanup const open_gate = [&gate] { gate.release(); };
 
   // GPU 0 pops its own bucket first, then the no-preference bucket in FIFO order; the task that
   // prefers another device is never counted.

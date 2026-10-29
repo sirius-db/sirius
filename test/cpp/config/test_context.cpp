@@ -2764,7 +2764,11 @@ TEST_CASE(
   CHECK(streams.expired() == !want.streams);
   auto const gpus =
     ctx->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::GPU).size();
-  if (want.streams) { CHECK(streams.lock()->size() == gpus); }
+  if (want.streams) {
+    auto const pools = streams.lock();
+    REQUIRE(pools != nullptr);
+    CHECK(pools->size() == gpus);
+  }
   // One worker per GPU whenever the executor runs, staging included.
   CHECK(preload_worker_threads() == (want.executor ? gpus : 0));
   if (preload != nullptr) {

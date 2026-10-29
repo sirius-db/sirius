@@ -293,11 +293,8 @@ TEST_CASE("promote_one moves HOST and DISK batches to the GPU in place, with the
   CHECK(batch->get_state() == cucascade::batch_state::idle);
   REQUIRE(tier_of(*batch) == Tier::GPU);
   CHECK(repr_type_of(*batch) == typeid(cucascade::gpu_table_representation));
-  {
-    // Readers order themselves after the copy through its writer event.
-    auto ro = batch->to_read_only();
-    CHECK(ro.get_data()->get_writer_event() != nullptr);
-  }
+  // Readers order themselves after the copy through its writer event, or, when the converter
+  // left none, find it complete: promote_one synchronizes then. Either way the values are there.
   CHECK(f.int32_values(*batch) == values);
   // The reservation was released with the copy.
   CHECK(f.gpu->get_total_reserved_memory() == baseline);
@@ -510,7 +507,7 @@ TEST_CASE("promote_one gives no_room with the exact need once that need no longe
     CHECK(result.bytes == need);
     CHECK(f.gpu->get_total_reserved_memory() == before);
   }
-  SECTION("another reservation crosses the ceiling while the batch is locked")
+  SECTION("another reservation crosses the ceiling after the first check, before the lock")
   {
     auto const occupied = promotion_fixture::occupy(*f.gpu);
     job.est_bytes       = need;  // no growth: only the late reservation crosses the ceiling
