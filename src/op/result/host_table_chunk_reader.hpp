@@ -179,9 +179,8 @@ class host_table_chunk_reader {
    * @param[in] host_table The cucascade::host_data_representation to read from
    * @param[in] types Full DuckDB types for the chunk columns — MUST carry nested
    * child types/names; the nested vectors are built from them.
-   * @throw std::runtime_error If there is a mismatch in column metadata and types, if the row count
-   * is negative or inconsistent across columns, or if the duckdb output logical type for any column
-   * is HUGEINT.
+   * @throw std::runtime_error If there is a mismatch in column metadata and types, or if the row
+   * count is negative or inconsistent across columns.
    */
   host_table_chunk_reader(duckdb::ClientContext& client_ctx,
                           cucascade::host_data_representation const& host_table,

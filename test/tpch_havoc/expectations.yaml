@@ -14,21 +14,15 @@
 
 expectations:
   - outcome: plan_rejected
-    reason: Aggregates with a FILTER clause not supported in GPU
+    reason: Aggregate FILTER not supported on GPU
     issue: 2285
-    queries: [Q01_V06, Q03_V07, Q04_V07, Q05_V07, Q06_V07, Q07_V07, Q08_V07, Q09_V07, Q10_V07,
-              Q11_V07, Q12_V07, Q13_V07, Q14_V07, Q15_V07, Q16_V07, Q17_V07, Q18_V07]
+    queries: [Q16_V07]
 
   - outcome: plan_rejected
     reason: Window not supported
     issue: 1745
     queries: [Q02_V07, Q02_V09, Q03_V09, Q04_V09, Q05_V09, Q06_V09, Q07_V09, Q08_V09, Q09_V09,
               Q10_V09, Q11_V09, Q12_V09, Q13_V09, Q14_V09, Q15_V09, Q18_V09]
-
-  - outcome: plan_rejected
-    reason: Any join not supported
-    issue: 2289
-    queries: [Q15_V10]
 
   - outcome: plan_rejected
     reason: "Unsupported expression in aggregate .*: list\\("

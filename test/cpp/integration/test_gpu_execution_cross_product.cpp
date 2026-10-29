@@ -21,7 +21,8 @@
  * A LOGICAL_CROSS_PRODUCT is planned as a nested loop join without conditions. A pair of input
  * batches whose cross join exceeds the task budget or the row limit of a cuDF column is split into
  * tasks over row ranges of the left batch. A slice whose cross join exceeds the GPU memory limit
- * fails at runtime before allocating its output.
+ * fails at runtime before allocating its output. An INNER ANY join runs as a cross product
+ * followed by a filter on its condition.
  */
 
 #include <catch.hpp>
@@ -245,4 +246,54 @@ TEST_CASE_METHOD(CrossProductFixture,
   {
     compare_gpu_vs_cpu("SELECT x, (SELECT count(*) FROM cp_b b WHERE b.y = a.x) c FROM cp_a a;");
   }
+}
+
+TEST_CASE_METHOD(CrossProductFixture,
+                 "any join - an INNER condition over both sides runs on the GPU",
+                 "[integration][gpu_execution][cross_product][any_join]")
+{
+  // DuckDB keeps a condition it cannot split into comparisons as one expression and plans an ANY
+  // join, which Sirius runs as a cross product filtered by the condition.
+  create_cross_tables(*this);
+  SECTION("scalar subquery compared inside a CASE (TPC-Havoc Q15_V10)")
+  {
+    compare_gpu_vs_cpu(
+      "SELECT x FROM cp_a WHERE CASE WHEN x = (SELECT max(y) FROM cp_b) THEN 1 ELSE 0 END = 1;");
+  }
+  SECTION("inequality against a scalar subquery inside a CASE")
+  {
+    compare_gpu_vs_cpu(
+      "SELECT x FROM cp_a WHERE CASE WHEN x > (SELECT avg(z) FROM cp_b) THEN 'hi' ELSE 'lo' END "
+      "= 'hi';");
+  }
+  SECTION("OR across both sides")
+  {
+    compare_gpu_vs_cpu("SELECT x, y, s FROM cp_a JOIN cp_b ON x + y = 3 OR s = 'b1';");
+  }
+  SECTION("no row matches")
+  {
+    compare_gpu_vs_cpu("SELECT x, y FROM cp_a JOIN cp_b ON x + y = 100 OR s = 'none';");
+  }
+}
+
+TEST_CASE_METHOD(CrossProductFixture,
+                 "any join - NaN equals NaN in the condition, as on the CPU",
+                 "[integration][gpu_execution][cross_product][any_join]")
+{
+  // DuckDB treats NaN = NaN as true, so the (NaN, 1) and (NaN, 2) rows match through x although
+  // their keys differ. Every left row matches every right row, through x or through k.
+  run_ok("CREATE TABLE nan_l AS SELECT * FROM (VALUES ('NaN'::DOUBLE, 1), (1.0, 2)) t(x, k);");
+  run_ok("CREATE TABLE nan_r AS SELECT * FROM (VALUES ('NaN'::DOUBLE, 2), (1.0, 1)) t(x, k);");
+  run_ok("CHECKPOINT;");
+  compare_gpu_vs_cpu(
+    "SELECT l.k AS lk, r.k AS rk FROM nan_l l JOIN nan_r r ON l.x = r.x OR l.k = r.k;");
+}
+
+TEST_CASE_METHOD(CrossProductFixture,
+                 "any join - outer joins fall back to the CPU at plan time",
+                 "[integration][gpu_execution][cross_product][any_join]")
+{
+  create_cross_tables(*this);
+  expect_plan_fallback_matches_cpu(
+    "SELECT x, y FROM cp_a LEFT JOIN cp_b ON x + y = 3 OR s = 'b1' ORDER BY x, y;");
 }

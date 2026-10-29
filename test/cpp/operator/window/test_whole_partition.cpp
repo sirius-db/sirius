@@ -142,7 +142,7 @@ TEST_CASE("whole-partition evaluator matches DuckDB while preserving unsorted in
     "(6,2,'c',NULL,NULL,99),(7,2,'c',NULL,NULL,99),(8,1,NULL,3,9,99),(9,1,NULL,4,10,99)");
   REQUIRE_FALSE(setup->HasError());
   rmm::cuda_stream owning_stream;
-  auto stream = owning_stream.view();
+  auto stream = static_cast<::cuda::stream_ref>(owning_stream);
   auto mr     = cudf::get_current_device_resource_ref();
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(
@@ -212,7 +212,7 @@ TEST_CASE("whole-partition evaluator widens before summation and handles cancell
           "[window_evaluator][gpu]")
 {
   rmm::cuda_stream owning_stream;
-  auto stream    = owning_stream.view();
+  auto stream    = static_cast<::cuda::stream_ref>(owning_stream);
   auto mr        = cudf::get_current_device_resource_ref();
   auto const max = std::numeric_limits<int64_t>::max();
   auto const min = std::numeric_limits<int64_t>::min();
@@ -258,7 +258,7 @@ TEMPLATE_TEST_CASE("whole-partition evaluator preserves decimal scale and null r
                    __int128_t)
 {
   rmm::cuda_stream owning_stream;
-  auto stream      = owning_stream.view();
+  auto stream      = static_cast<::cuda::stream_ref>(owning_stream);
   auto mr          = cudf::get_current_device_resource_ref();
   auto id          = decimal_id<TestType>();
   auto const keyed = GENERATE(false, true);
@@ -294,7 +294,7 @@ TEST_CASE("whole-partition evaluator returns typed empties and nulls for all-nul
           "[window_evaluator][gpu]")
 {
   rmm::cuda_stream owning_stream;
-  auto stream      = owning_stream.view();
+  auto stream      = static_cast<::cuda::stream_ref>(owning_stream);
   auto mr          = cudf::get_current_device_resource_ref();
   auto const keyed = GENERATE(false, true);
   auto const empty = GENERATE(false, true);
@@ -338,7 +338,7 @@ TEST_CASE("whole-partition evaluator reports decimal accumulator overflow",
           "[window_evaluator][gpu]")
 {
   rmm::cuda_stream owning_stream;
-  auto stream                 = owning_stream.view();
+  auto stream                 = static_cast<::cuda::stream_ref>(owning_stream);
   auto mr                     = cudf::get_current_device_resource_ref();
   auto const limit            = sirius::op::int128_pow10(38) - 1;
   auto const carrier_overflow = GENERATE(false, true);
@@ -363,7 +363,7 @@ TEST_CASE("whole-partition evaluator counts and takes extrema over NULL and non-
           "[window_evaluator][gpu]")
 {
   rmm::cuda_stream owning_stream;
-  auto stream      = owning_stream.view();
+  auto stream      = static_cast<::cuda::stream_ref>(owning_stream);
   auto mr          = cudf::get_current_device_resource_ref();
   auto const keyed = GENERATE(false, true);
   auto const dec   = cudf::data_type{cudf::type_id::DECIMAL64, -2};
@@ -423,7 +423,7 @@ TEST_CASE("whole-partition evaluator counts and takes extrema over NULL and non-
                                  std::vector<bool> const& expected_valid) {
     auto const column = result->view().column(c);
     CHECK(validity(column, stream) == expected_valid);
-    stream.synchronize();
+    owning_stream.synchronize();
     auto const values = sirius::test::operator_utils::copy_column_to_host<std::string>(column);
     for (std::size_t row = 0; row < expected.size(); ++row) {
       if (expected_valid[row]) { CHECK(values[row] == expected[row]); }
@@ -472,7 +472,7 @@ TEMPLATE_TEST_CASE("whole-partition evaluator orders NaN above every value in mi
                    double)
 {
   rmm::cuda_stream owning_stream;
-  auto stream      = owning_stream.view();
+  auto stream      = static_cast<::cuda::stream_ref>(owning_stream);
   auto mr          = cudf::get_current_device_resource_ref();
   auto const keyed = GENERATE(false, true);
   auto const type  = cudf::data_type{std::is_same_v<TestType, float> ? cudf::type_id::FLOAT32
@@ -534,7 +534,7 @@ TEMPLATE_TEST_CASE("whole-partition evaluator groups by decimal partition keys",
                    __int128_t)
 {
   rmm::cuda_stream owning_stream;
-  auto stream = owning_stream.view();
+  auto stream = static_cast<::cuda::stream_ref>(owning_stream);
   auto mr     = cudf::get_current_device_resource_ref();
   auto id     = decimal_id<TestType>();
   std::vector<std::unique_ptr<cudf::column>> columns;
@@ -560,7 +560,7 @@ TEMPLATE_TEST_CASE("whole-partition evaluator sums narrow integers exactly",
                    int32_t)
 {
   rmm::cuda_stream owning_stream;
-  auto stream      = owning_stream.view();
+  auto stream      = static_cast<::cuda::stream_ref>(owning_stream);
   auto mr          = cudf::get_current_device_resource_ref();
   auto const keyed = GENERATE(false, true);
   auto const id    = sizeof(TestType) == 1   ? cudf::type_id::INT8
@@ -605,7 +605,7 @@ TEMPLATE_TEST_CASE("whole-partition evaluator sums narrow integers exactly",
 TEST_CASE("whole-partition evaluator treats sum_no_overflow as sum", "[window_evaluator][gpu]")
 {
   rmm::cuda_stream owning_stream;
-  auto stream      = owning_stream.view();
+  auto stream      = static_cast<::cuda::stream_ref>(owning_stream);
   auto mr          = cudf::get_current_device_resource_ref();
   auto const keyed = GENERATE(false, true);
   std::vector<std::unique_ptr<cudf::column>> columns;
@@ -644,7 +644,7 @@ TEST_CASE("whole-partition evaluator treats sum_no_overflow as sum", "[window_ev
 TEST_CASE("whole-partition evaluator rejects invalid requests", "[window_evaluator][gpu]")
 {
   rmm::cuda_stream owning_stream;
-  auto stream = owning_stream.view();
+  auto stream = static_cast<::cuda::stream_ref>(owning_stream);
   auto mr     = cudf::get_current_device_resource_ref();
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(column<int32_t>({0, 0, 1}, cudf::data_type{cudf::type_id::INT32}, stream, mr));
@@ -689,7 +689,7 @@ TEST_CASE("whole-partition evaluator widens only the sum columns that could over
           "[window_evaluator][gpu]")
 {
   rmm::cuda_stream owning_stream;
-  auto stream      = owning_stream.view();
+  auto stream      = static_cast<::cuda::stream_ref>(owning_stream);
   auto mr          = cudf::get_current_device_resource_ref();
   auto const keyed = GENERATE(false, true);
   auto const max64 = std::numeric_limits<int64_t>::max();

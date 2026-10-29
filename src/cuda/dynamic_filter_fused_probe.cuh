@@ -180,6 +180,7 @@ struct fused_probe {
   fused_carrier carrier = fused_carrier::i8;
   void const* data      = nullptr;
   probe_validity valid;
+  bool preserve_nulls = false;
   union lookup_storage {
     bloom_lookup<bloom_ref<std::int32_t>> bloom_i32;
     bloom_lookup<bloom_ref<std::int64_t>> bloom_i64;
@@ -273,7 +274,8 @@ __device__ __forceinline__ bool fused_carrier_keeps(fused_probe const& probe,
       static_cast<Carrier const*>(probe.data)},
     lookup,
     probe.valid,
-    row);
+    row,
+    probe.preserve_nulls);
 }
 
 template <class Lookup>
@@ -321,8 +323,8 @@ __device__ __forceinline__ bool fused_probe_keeps(fused_probe const& probe,
  * @brief Creates a nonnullable BOOL8 mask column and enqueues its computation
  *
  * The returned column has one boolean value per probe row: true means keep the row as a possible
- * match, and false means reject it. Null probe keys, values outside the key representation, and
- * rows rejected by either supplied prior mask get false in the output column. Prior masks index
+ * match, and false means reject it. Null probe keys follow preserve_nulls. Values outside the key
+ * representation and rows rejected by either supplied prior mask get false. Prior masks index
  * rows relative to the probe view, including when it is sliced.
  *
  * The resolved device must be current and hold the probe and prior masks. Their buffers and the
@@ -339,6 +341,7 @@ __device__ __forceinline__ bool fused_probe_keeps(fused_probe const& probe,
  * @param device_id Device holding the replica; a negative ID selects the current device
  * @param stream Stream on which to allocate and compute the mask
  * @param mr Device memory resource for the result column
+ * @param preserve_nulls Keep NULL probe keys for null-safe equality
  * @return Owning pointer to the mask column with probe.size() rows, or nullptr if the store or
  * replica is unavailable or the probe is incompatible
  */
@@ -351,14 +354,15 @@ template <class Store>
   bool const* prior_keep,
   int device_id,
   ::cuda::stream_ref stream,
-  rmm::device_async_resource_ref mr)
+  rmm::device_async_resource_ref mr,
+  bool preserve_nulls = false)
 {
   std::unique_ptr<cudf::column> result;
   if (!store) { return result; }
   store->with_lookup(domain, resolve_dynamic_filter_device_id(device_id), [&](auto lookup) {
     using key_type = typename decltype(lookup)::key_type;
     result         = run_membership_probe<key_type>(
-      domain, probe, prior_mask_words, stream, mr, lookup, prior_keep);
+      domain, probe, prior_mask_words, stream, mr, lookup, prior_keep, preserve_nulls);
   });
   return result;
 }
@@ -376,6 +380,7 @@ template <class Store>
  * @param probe Column of keys to test
  * @param device_id Device holding the replica; a negative ID selects the current device
  * @param[out] out Destination for a supported descriptor
+ * @param preserve_nulls Keep NULL probe keys for null-safe equality
  * @return True if the descriptor is ready; false if the store or replica is unavailable, the probe
  * is incompatible, or its representation is unsupported by fusion
  */
@@ -384,12 +389,14 @@ template <class Store>
                                                   membership_key_domain const& domain,
                                                   cudf::column_view const& probe,
                                                   int device_id,
-                                                  fused_probe& out)
+                                                  fused_probe& out,
+                                                  bool preserve_nulls = false)
 {
   if (!store || !membership_probe_compatible(domain, probe.type())) { return false; }
   bool ready = false;
   store->with_lookup(domain, resolve_dynamic_filter_device_id(device_id), [&](auto lookup) {
     ready = describe_fused_probe(probe, lookup, out);
+    if (ready) { out.preserve_nulls = preserve_nulls; }
   });
   return ready;
 }

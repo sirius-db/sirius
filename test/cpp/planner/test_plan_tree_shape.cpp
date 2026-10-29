@@ -1105,7 +1105,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
 TEST_CASE_METHOD(
   plan_tree_shape_fixture,
-  "plan tree shape - null-safe right-family filters require a nonnull key and early publication",
+  "plan tree shape - null-safe right-family filters preserve NULLs and require early publication",
   "[plan_tree_shape][isolated_context][dynamic_filter][right_family][join_key_nullability]")
 {
   std::string const join_type    = GENERATE("SEMI", "ANTI");
@@ -1141,7 +1141,9 @@ TEST_CASE_METHOD(
   auto const& targets = join.dynamic_filter_plan().probe_targets();
   REQUIRE(join.children.size() == 2);
   auto* build_root = require_join_child_wrap(join.children[1].get(), &join, /*is_build=*/true);
-  if (enable_accumulation && probe_not_null) {
+  if (enable_accumulation) {
+    REQUIRE(join.dynamic_filter_plan().admitted_keys().size() == 1);
+    CHECK(join.dynamic_filter_plan().admitted_keys()[0].preserve_nulls == !probe_not_null);
     REQUIRE(targets.size() == 1);
     CHECK(targets[0].route_class == sirius::op::dynamic_filter_route_class::scan);
     CHECK(find_first(join.children[0].get(), SiriusPhysicalOperatorType::DYNAMIC_FILTER) !=
@@ -1338,7 +1340,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     auto const decimal128 = cudf::data_type{cudf::type_id::DECIMAL128, 0};
     for (auto const* op : {local, partition}) {
       REQUIRE(op->get_types().size() == 2);
-      CHECK(op->get_types()[1].id() == sirius::type_id::BIGINT);
+      CHECK(op->get_types()[1].id() == sirius::type_id::HUGEINT);
       CHECK(op->is_alternate_physical_type(1, decimal128));
       CHECK_FALSE(op->is_alternate_physical_type(1, int64));
       CHECK_FALSE(op->is_alternate_physical_type(0, decimal128));
@@ -1485,16 +1487,15 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     CHECK(projections[0]->children[0]->type == SiriusPhysicalOperatorType::MERGE_GROUP_BY);
   }
 
-  SECTION("DISTINCT over an aggregate planned narrower than declared takes the child's types")
+  SECTION("DISTINCT over an aggregate keeps sum()'s HUGEINT")
   {
-    // The DISTINCT node declares sum()'s HUGEINT; the aggregate below is planned as BIGINT.
     auto plan =
       generate_sirius_plan(*con, "SELECT DISTINCT val, sum(id) FROM big_left GROUP BY val");
     INFO(tree_to_string(plan.get()));
 
     duckdb::vector<sirius::logical_type> const planned{
       sirius::logical_type::make(sirius::type_id::INTEGER),
-      sirius::logical_type::make(sirius::type_id::BIGINT)};
+      sirius::logical_type::make(sirius::type_id::HUGEINT)};
     auto* aggregate = require_distinct_wrap_chain(plan.get());
     CHECK(aggregate->get_types() == planned);
     CHECK(aggregate->group_idx == std::vector<int>{0, 1});
@@ -1502,7 +1503,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
           planned);
   }
 
-  SECTION("DISTINCT ON reordering over a narrowed aggregate types the projection from the child")
+  SECTION("DISTINCT ON reordering over an aggregate types the projection from the child")
   {
     auto plan = generate_sirius_plan(
       *con,
@@ -1518,7 +1519,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     CHECK(plan->children[0]->type == SiriusPhysicalOperatorType::MERGE_GROUP_BY);
     CHECK(plan->get_types() == duckdb::vector<sirius::logical_type>{
                                  sirius::logical_type::make(sirius::type_id::INTEGER),
-                                 sirius::logical_type::make(sirius::type_id::BIGINT)});
+                                 sirius::logical_type::make(sirius::type_id::HUGEINT)});
   }
 
   SECTION("DISTINCT over nested materialized CTEs checks the body's schema")
@@ -1842,18 +1843,7 @@ TEST_CASE("set_parent_ops accepts a GPU scan without an ingestible",
   CHECK(scan.get_parent_op() == nullptr);
 }
 
-TEST_CASE("planned_aggregate_type narrows HUGEINT only", "[plan_tree_shape]")
-{
-  using generator = sirius::planner::sirius_physical_plan_generator;
-  CHECK(generator::planned_aggregate_type(LogicalType::HUGEINT) == LogicalType::BIGINT);
-  CHECK(generator::planned_aggregate_type(LogicalType::INTEGER) == LogicalType::INTEGER);
-  CHECK(generator::planned_aggregate_type(LogicalType::UHUGEINT) == LogicalType::UHUGEINT);
-  CHECK(generator::planned_aggregate_type(LogicalType::DECIMAL(38, 0)) ==
-        LogicalType::DECIMAL(38, 0));
-}
-
-TEST_CASE("require_planned_schema accepts the declared type or its aggregate narrowing",
-          "[plan_tree_shape]")
+TEST_CASE("require_planned_schema accepts only the declared type", "[plan_tree_shape]")
 {
   using generator    = sirius::planner::sirius_physical_plan_generator;
   auto const bigint  = sirius::from_duckdb(LogicalType::BIGINT);
@@ -1863,7 +1853,7 @@ TEST_CASE("require_planned_schema accepts the declared type or its aggregate nar
     generator::require_planned_schema(std::span{&planned, 1}, {declared}, "probe");
   };
   CHECK_NOTHROW(require(hugeint, LogicalType::HUGEINT));
-  CHECK_NOTHROW(require(bigint, LogicalType::HUGEINT));
+  CHECK_THROWS_AS(require(bigint, LogicalType::HUGEINT), duckdb::NotImplementedException);
   CHECK_NOTHROW(require(bigint, LogicalType::BIGINT));
   CHECK_THROWS_WITH(require(hugeint, LogicalType::BIGINT),
                     Catch::Matchers::ContainsSubstring("probe: the planned input has"));
@@ -2336,7 +2326,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "rejected",
                  "[plan_tree_shape][union][isolated_context]")
 {
-  // An aggregate arm plans BIGINT under the union's declared HUGEINT; that narrowing is allowed.
+  // An aggregate arm plans the union's declared HUGEINT.
   REQUIRE_NOTHROW(generate_sirius_plan(
     *con, "SELECT sum(id) FROM big_left UNION ALL SELECT sum(rid) FROM small_right"));
 
@@ -2479,4 +2469,56 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     }
   }
   CHECK(found_single);
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - null-safe RF stops only at a NULL-generating join side",
+                 "[plan_tree_shape][isolated_context][dynamic_filter][null_safe_rf]")
+{
+  std::string const nested_join = GENERATE("INNER", "LEFT", "RIGHT", "FULL OUTER");
+  bool const key_from_left      = GENERATE(false, true);
+  CAPTURE(nested_join, key_from_left);
+  REQUIRE_FALSE(con->Query("CREATE TABLE rf_a(id INTEGER, k INTEGER)")->HasError());
+  REQUIRE_FALSE(con->Query("INSERT INTO rf_a VALUES (1,7),(2,NULL)")->HasError());
+  REQUIRE_FALSE(con->Query("CREATE TABLE rf_b(id INTEGER, k INTEGER)")->HasError());
+  REQUIRE_FALSE(con->Query("INSERT INTO rf_b VALUES (1,7),(3,NULL)")->HasError());
+  REQUIRE_FALSE(con->Query("CREATE TABLE rf_keys(k INTEGER, keep INTEGER)")->HasError());
+  REQUIRE_FALSE(con->Query("INSERT INTO rf_keys VALUES (NULL,1),(10,1),(7,0)")->HasError());
+  dynamic_filter_switch_guard switch_on(*con, true);
+  auto plan =
+    generate_sirius_plan(*con,
+                         "SELECT p.k FROM (SELECT " + std::string(key_from_left ? "a.k" : "b.k") +
+                           " AS k FROM rf_a a " + nested_join +
+                           " JOIN rf_b b ON a.id=b.id) p "
+                           "INNER JOIN (SELECT k FROM rf_keys WHERE keep=1) c "
+                           "ON p.k IS NOT DISTINCT FROM c.k",
+                         {OptimizerType::JOIN_ORDER, OptimizerType::BUILD_SIDE_PROBE_SIDE});
+  INFO(tree_to_string(plan.get()));
+  auto joins = collect(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN);
+  REQUIRE(joins.size() == 2);
+  auto& producer = joins.front()->Cast<sirius::op::sirius_physical_hash_join>();
+  REQUIRE(producer.conditions.size() == 1);
+  REQUIRE(producer.conditions[0].comparison == sirius::comparison_type::not_distinct_from);
+  auto const& keys = producer.dynamic_filter_plan().admitted_keys();
+  REQUIRE(keys.size() == 1);
+  CHECK(keys[0].preserve_nulls);
+  auto const& targets = producer.dynamic_filter_plan().probe_targets();
+  REQUIRE(targets.size() == 1);
+  bool const generates_nulls = nested_join == "FULL OUTER" ||
+                               (nested_join == "LEFT" && !key_from_left) ||
+                               (nested_join == "RIGHT" && key_from_left);
+  CHECK(targets[0].route_class == (generates_nulls ? sirius::op::dynamic_filter_route_class::direct
+                                                   : sirius::op::dynamic_filter_route_class::scan));
+  if (generates_nulls) {
+    CHECK_FALSE(targets[0].accepts_zone_map_filters);
+    auto* probe = require_join_child_wrap(producer.children[0].get(), &producer, false);
+    while (probe->type == SiriusPhysicalOperatorType::PROJECTION) {
+      REQUIRE(probe->children.size() == 1);
+      probe = probe->children[0].get();
+    }
+    REQUIRE(probe->type == SiriusPhysicalOperatorType::DYNAMIC_FILTER);
+    REQUIRE(probe->children.size() == 1);
+    CHECK(probe->children[0]->type == SiriusPhysicalOperatorType::HASH_JOIN);
+  }
+  require_parent_links(plan.get(), nullptr);
 }

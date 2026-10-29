@@ -1712,8 +1712,10 @@ TEST_CASE("pin_table compression - narrowing stacks on the GPU tier and tier pol
   }
 
   // A filter-and-order-only k has no transport use, so the GPU-tier policy
-  // retracts the target at plan time and the decompressed narrow chunk widens
-  // during scan normalization.
+  // retracts the target at plan time. The filter compacts the decode, which then
+  // writes k directly in its native restore type, so scan normalization has no
+  // widening cast left to count. (The pin-on/query-off leg below has no filter
+  // and does count its restore.)
   {
     auto const before = sirius::test::get_compressed_materialization_stats(con);
     auto res          = con.Query("CALL gpu_execution(\"SELECT k FROM read_parquet('" + glob +
@@ -1725,7 +1727,7 @@ TEST_CASE("pin_table compression - narrowing stacks on the GPU tier and tier pol
     auto const after = sirius::test::get_compressed_materialization_stats(con);
     REQUIRE(after.scan_sidecars_installed > before.scan_sidecars_installed);
     REQUIRE(after.scan_narrow_targets_retracted > before.scan_narrow_targets_retracted);
-    REQUIRE(after.scan_columns_restored > before.scan_columns_restored);
+    REQUIRE(after.scan_columns_restored == before.scan_columns_restored);
   }
 
   // Pin-on / query-off over compressed chunks: the entry keeps its narrow carriers, the query

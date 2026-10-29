@@ -14,6 +14,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -126,6 +127,11 @@ struct decode_selection {
   /// the survivor index list (@c full), and are refused rather than silently
   /// decoded full width — the same footing the index walk was introduced on.
   sirius::codegen::chunk_row_set const* rows = nullptr;
+  /// Wider type the consumer will restore this column to (e.g. DECIMAL64 for a DECIMAL32-stored
+  /// column). A bitpack-rooted compacted decode then writes that type directly instead of the
+  /// stored type, saving the caller's separate widening cast. Ignored unless it is a same-family,
+  /// same-scale widening of the decoded type.
+  std::optional<cudf::data_type> output_type;
 
   [[nodiscard]] bool active() const noexcept
   {
