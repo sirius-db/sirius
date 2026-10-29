@@ -277,6 +277,19 @@ TEST_CASE_METHOD(CrossProductFixture,
 }
 
 TEST_CASE_METHOD(CrossProductFixture,
+                 "any join - NaN equals NaN in the condition, as on the CPU",
+                 "[integration][gpu_execution][cross_product][any_join]")
+{
+  // DuckDB treats NaN = NaN as true, so the (NaN, 1) and (NaN, 2) rows match through x although
+  // their keys differ. Every left row matches every right row, through x or through k.
+  run_ok("CREATE TABLE nan_l AS SELECT * FROM (VALUES ('NaN'::DOUBLE, 1), (1.0, 2)) t(x, k);");
+  run_ok("CREATE TABLE nan_r AS SELECT * FROM (VALUES ('NaN'::DOUBLE, 2), (1.0, 1)) t(x, k);");
+  run_ok("CHECKPOINT;");
+  compare_gpu_vs_cpu(
+    "SELECT l.k AS lk, r.k AS rk FROM nan_l l JOIN nan_r r ON l.x = r.x OR l.k = r.k;");
+}
+
+TEST_CASE_METHOD(CrossProductFixture,
                  "any join - outer joins fall back to the CPU at plan time",
                  "[integration][gpu_execution][cross_product][any_join]")
 {

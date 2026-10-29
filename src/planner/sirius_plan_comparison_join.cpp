@@ -37,6 +37,7 @@
 #include "expression_evaluator/ast_supported_types.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
+#include "memory/size_arithmetic.hpp"
 #include "op/dynamic_filter/detail/accumulated_bloom_builder.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/scan/sirius_physical_dynamic_filter.hpp"
@@ -430,13 +431,13 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       case duckdb::JoinType::LEFT:
       case duckdb::JoinType::RIGHT:
       case duckdb::JoinType::OUTER:
+        op.estimated_cardinality = memory::saturating_mul(lhs_cardinality, rhs_cardinality);
         return make_cross_product_join(
           op,
           std::move(left),
           std::move(right),
           op.join_type,
-          lhs_cardinality,
-          rhs_cardinality,
+          op.estimated_cardinality,
           duckdb::vector<std::size_t>(op.left_projection_map.begin(), op.left_projection_map.end()),
           duckdb::vector<std::size_t>(op.right_projection_map.begin(),
                                       op.right_projection_map.end()));
