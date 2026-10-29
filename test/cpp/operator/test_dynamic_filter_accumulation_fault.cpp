@@ -167,7 +167,7 @@ TEST_CASE(
   }
   REQUIRE(published);
   using transport = sirius::op::detail::accumulated_bloom_builder::publication_transport;
-  REQUIRE(published->transport == (point.staged ? transport::host_staged : transport::peer_copy));
+  REQUIRE(published->transport == (point.staged ? transport::HOST_STAGED : transport::PEER_COPY));
   acc::require_exact_union(published->filters, expected, 2);
 }
 

@@ -1976,7 +1976,7 @@ TEST_CASE("accumulated publication matches the complete partial union and bounde
                                             &workspace);
   }
   REQUIRE(published);
-  REQUIRE(published->transport == (force_host ? transport::host_staged : transport::peer_copy));
+  REQUIRE(published->transport == (force_host ? transport::HOST_STAGED : transport::PEER_COPY));
   acc::require_exact_union(published->filters, expected, devices);
   auto const scratch = sources == 0 ? 0
                        : force_host ? geometry.chunk_bytes
@@ -2026,7 +2026,7 @@ TEST_CASE("local-only HOST publication allocates no transfer workspace",
                                             &workspace);
   REQUIRE(result);
   REQUIRE(result->transport ==
-          op::detail::accumulated_bloom_builder::publication_transport::host_staged);
+          op::detail::accumulated_bloom_builder::publication_transport::HOST_STAGED);
   acc::require_exact_union(result->filters, expected, 1);
   REQUIRE(workspace.host_staging_bytes == 0);
   REQUIRE(workspace.device_scratch_bytes == 0);

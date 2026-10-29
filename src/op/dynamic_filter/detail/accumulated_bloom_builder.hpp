@@ -229,8 +229,8 @@ class accumulated_bloom_builder final {
    * @brief How `finish` moved partials and the union between GPUs.
    */
   enum class publication_transport : std::uint8_t {
-    peer_copy,   ///< `cudaMemcpyPeerAsync`; every replica pool grants every other replica GPU
-    host_staged  ///< Bounded pinned HOST staging, when a grant is unavailable or direct scratch
+    PEER_COPY,   ///< `cudaMemcpyPeerAsync`; every replica pool grants every other replica GPU
+    HOST_STAGED  ///< Bounded pinned HOST staging, when a grant is unavailable or direct scratch
                  ///< is refused
   };
 

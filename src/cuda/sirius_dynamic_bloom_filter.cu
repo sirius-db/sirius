@@ -1074,7 +1074,7 @@ std::optional<accumulated_bloom_builder::publication> accumulated_bloom_builder:
   std::unique_ptr<impl::chunk_pipeline> pipeline;
   sirius::cuda::device_copy_batch copies;
   bool prepared  = false;
-  auto transport = publication_transport::host_staged;
+  auto transport = publication_transport::HOST_STAGED;
   try {
     auto const execute = [&] {
       bool direct = !force_host && !sirius::memory::find_pair_without_pool_access(spaces);
@@ -1134,7 +1134,7 @@ std::optional<accumulated_bloom_builder::publication> accumulated_bloom_builder:
       }
       prepared = true;
       if (direct) {
-        transport = publication_transport::peer_copy;
+        transport = publication_transport::PEER_COPY;
         pipeline->order_after_inserts();
         for (std::size_t key_index = 0; key_index < _impl->keys.size(); ++key_index) {
           for (std::size_t offset = 0; offset < geometry.raw_bytes;
@@ -1227,7 +1227,7 @@ std::optional<accumulated_bloom_builder::publication> accumulated_bloom_builder:
     root->device_id,
     _impl->keys.size(),
     geometry.raw_bytes,
-    transport == publication_transport::peer_copy ? "peer copies" : "HOST staging",
+    transport == publication_transport::PEER_COPY ? "peer copies" : "HOST staging",
     sources.size(),
     targets.size());
   make_filters(root->device_id);

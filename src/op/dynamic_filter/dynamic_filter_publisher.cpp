@@ -404,7 +404,7 @@ struct dynamic_filter_publication_session::state {
       auto const filters = published_filters->filters;
       bool const host_staged =
         published_filters->transport ==
-        detail::accumulated_bloom_builder::publication_transport::host_staged;
+        detail::accumulated_bloom_builder::publication_transport::HOST_STAGED;
       {
         std::scoped_lock lock(mutex);
         outcome.membership_filters_built = filters.size();
