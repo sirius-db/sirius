@@ -19,6 +19,7 @@
 #include "data/convertible_data.hpp"
 #include "data/convertible_data_batch.hpp"
 #include "data/sirius_converter_registry.hpp"
+#include "event/downgraded_task.hpp"
 #include "exec/multi_index_priority_queue.hpp"
 #include "exec/query_lifecycle_registry.hpp"
 #include "log/logging.hpp"
@@ -255,6 +256,47 @@ class convertible_gpu_pipeline_task : public convertible_data {
     if (!gpt_ls) { return nullptr; }
 
     return dynamic_cast<const sirius::op::pipelineable_operator_data*>(gpt_ls->_input_data.get());
+  }
+
+  /**
+   * @brief The owned task's moves off the GPU, as one @c task_downgraded payload.
+   *
+   * One input per record in converted_batches() whose source is a GPU space, in the order the
+   * moves completed. Read once convert() has returned or thrown, while this wrapper still owns the
+   * task. The pipeline and query come from the same checked cast of the global state that
+   * tag_with_task() uses.
+   *
+   * Never throws: a lost record costs a promotion, never correctness.
+   *
+   * @return The query to report the payload under, and the payload; nullopt when no input moved
+   *         off the GPU, the task is not a gpu_pipeline_task, or it has no pipeline.
+   */
+  [[nodiscard]] std::optional<std::pair<query_id_t, event::downgraded_task>>
+  downgraded_task_record() const noexcept
+  {
+    try {
+      auto* gpt = _task ? _task->as<sirius::pipeline::gpu_pipeline_task>() : nullptr;
+      if (!gpt) { return std::nullopt; }
+      auto const* gs =
+        dynamic_cast<const sirius::pipeline::gpu_pipeline_task_global_state*>(gpt->global_state());
+      auto const* pipe = gs ? gs->get_pipeline() : nullptr;
+      if (!pipe) { return std::nullopt; }
+
+      event::downgraded_task task;
+      for (auto const& rec : converted_batches()) {
+        if (rec.from.tier != cucascade::memory::Tier::GPU) { continue; }
+        task.inputs.push_back(event::downgraded_input{
+          .batch = rec.batch, .batch_id = rec.batch_id, .to = rec.to, .gpu_bytes = rec.bytes});
+      }
+      if (task.inputs.empty()) { return std::nullopt; }
+      task.task_id          = gpt->get_task_id();
+      task.pipeline_id      = pipe->get_pipeline_id();
+      task.preferred_device = gpt->get_preferred_device_id();
+      task.priority         = gpt->get_priority();
+      return std::pair{pipe->get_query_id(), std::move(task)};
+    } catch (...) {
+      return std::nullopt;
+    }
   }
 
  private:

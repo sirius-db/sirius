@@ -178,6 +178,8 @@ class query_event_publisher : public std::enable_shared_from_this<query_event_pu
                                           int gpu_id,
                                           std::size_t granted_bytes) noexcept;
 
+  /// @p task is taken by value and moved into the event: pass it with
+  /// @c std::move, so no copy is made outside this @c noexcept boundary.
   void publish_task_downgraded(query_id_t query_id, downgraded_task task) noexcept;
 
   void publish_task_popped(query_id_t query_id,

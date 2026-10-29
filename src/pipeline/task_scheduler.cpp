@@ -51,6 +51,40 @@
 namespace sirius {
 namespace pipeline {
 
+namespace {
+
+/**
+ * @brief Report a task the matcher just popped for @p device_id as one @c task_popped event.
+ *
+ * Only a gpu_pipeline_task attached to a pipeline is reported; its pipeline and query are read
+ * through a checked cast of the global state. @c tasks_left counts what @p device_id can still
+ * pop: its own bucket plus the no-preference bucket. Never throws: the event is advisory and must
+ * not fail the popped task.
+ */
+void publish_task_popped(event::query_event_publisher& publisher,
+                         exec::multi_index_priority_queue<sirius::parallel::itask> const& queue,
+                         sirius::parallel::itask& task,
+                         int device_id) noexcept
+{
+  try {
+    auto* gpu_task = task.as<gpu_pipeline_task>();
+    if (gpu_task == nullptr) { return; }
+    auto const* gs = dynamic_cast<gpu_pipeline_task_global_state const*>(gpu_task->global_state());
+    auto const* pipe = gs != nullptr ? gs->get_pipeline() : nullptr;
+    if (pipe == nullptr) { return; }
+    auto const tasks_left = queue.size(exec::gpu_index{device_id}) +
+                            queue.size(exec::gpu_index{exec::no_preferred_device});
+    publisher.publish_task_popped(pipe->get_query_id(),
+                                  gpu_task->get_task_id(),
+                                  pipe->get_pipeline_id(),
+                                  device_id,
+                                  tasks_left);
+  } catch (...) {
+  }
+}
+
+}  // namespace
+
 task_scheduler::task_scheduler(
   sirius::exec::query_lifecycle_registry& lifecycle,
   const exec::thread_pool_config& gpu_executor_config,
@@ -356,7 +390,12 @@ void task_scheduler::management_eventloop()
         ++it;
         continue;
       }
-      popped_any           = true;
+      popped_any = true;
+      // Before anything that could dispatch or drop the task. Counting the buckets takes the queue
+      // lock, so it is skipped while nobody listens.
+      if (_query_event_publisher->has_subscribers(event::event_type::task_popped)) {
+        publish_task_popped(*_query_event_publisher, _task_queue, *task, device_id);
+      }
       auto* attributed     = dynamic_cast<gpu_pipeline_task*>(task.get());
       auto failure_handler = attributed ? attributed->get_completion_handler() : nullptr;
       try {

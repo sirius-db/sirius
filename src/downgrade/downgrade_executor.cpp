@@ -21,6 +21,7 @@
 #include "data/convertible_gpu_pipeline_task.hpp"
 #include "downgrade/spill_policy.hpp"
 #include "event/downgraded_batch.hpp"
+#include "event/downgraded_task.hpp"
 #include "event/query_event_publisher.hpp"
 #include "log/logging.hpp"
 
@@ -308,6 +309,15 @@ void downgrade_executor::processing_loop()
       auto const downgrade_publisher = report_downgrades
                                          ? _query_event_publisher
                                          : std::shared_ptr<event::query_event_publisher>{};
+      // Tier 2 also reports each converted task as a whole (task_downgraded), built from the same
+      // per-batch records, so its candidates record while either event has subscribers.
+      bool const report_task_downgrades =
+        _query_event_publisher != nullptr &&
+        _query_event_publisher->has_subscribers(event::event_type::task_downgraded);
+      bool const record_task_queue_downgrades = report_downgrades || report_task_downgrades;
+      auto const task_queue_publisher         = record_task_queue_downgrades
+                                                  ? _query_event_publisher
+                                                  : std::shared_ptr<event::query_event_publisher>{};
 
       // === TIER 1: Data repositories ===
       // Memory pressure is a global condition, so candidates are drawn from EVERY in-flight
@@ -455,7 +465,7 @@ void downgrade_executor::processing_loop()
             pipeline_provider.get_next_convertible(source_space, /*front_to_back=*/false);
           if (!candidate) break;
           tasks_converted++;
-          candidate->record_conversions(report_downgrades);
+          candidate->record_conversions(record_task_queue_downgrades);
 
           auto candidate_bytes = candidate->bytes_in_space(source_space);
 
@@ -485,7 +495,9 @@ void downgrade_executor::processing_loop()
              &host_target_stats,
              &disk_target_stats,
              predicate_satisfied,
-             publisher = downgrade_publisher]() mutable {
+             report_downgrades,
+             report_task_downgrades,
+             publisher = task_queue_publisher]() mutable {
               absl::Cleanup rollback = [&]() {
                 planned_bytes.fetch_sub(candidate_bytes, std::memory_order_relaxed);
                 std::lock_guard lock(failed_pipeline_candidates_mutex);
@@ -520,7 +532,18 @@ void downgrade_executor::processing_loop()
               }
               // Runs before `rollback`, while the wrapper still owns the extracted task, and also
               // after a throw: batches moved before it stay recorded and are reported.
-              publish_downgraded_batches(publisher.get(), *cand, std::nullopt);
+              publish_downgraded_batches(
+                report_downgrades ? publisher.get() : nullptr, *cand, std::nullopt);
+              // One task_downgraded for the task, before the wrapper can return it to the queue,
+              // so the task cannot be popped again before the event is published.
+              if (report_task_downgrades) {
+                if (auto const* task_cand =
+                      dynamic_cast<convertible_gpu_pipeline_task const*>(cand.get())) {
+                  if (auto record = task_cand->downgraded_task_record()) {
+                    publisher->publish_task_downgraded(record->first, std::move(record->second));
+                  }
+                }
+              }
             });
         }
       }
