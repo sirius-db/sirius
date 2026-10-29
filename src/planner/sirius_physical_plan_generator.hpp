@@ -143,11 +143,8 @@ class sirius_physical_plan_generator {
   static sirius::OrderPreservationType order_preservation_recursive(
     sirius::op::sirius_physical_operator& op);
 
-  //! The type an aggregate result declared as @p type is planned as; HUGEINT narrows to BIGINT.
-  [[nodiscard]] static duckdb::LogicalType planned_aggregate_type(duckdb::LogicalType const& type);
-
   //! Throws NotImplementedException (CPU fallback) unless each @p planned column is its @p declared
-  //! type, or `planned_aggregate_type` of it; @p subject names the input in the message.
+  //! type; @p subject names the input in the message.
   static void require_planned_schema(std::span<sirius::logical_type const> planned,
                                      duckdb::vector<duckdb::LogicalType> const& declared,
                                      std::string_view subject);

@@ -672,23 +672,6 @@ static bool can_use_perfect_hash_aggregate(duckdb::ClientContext& context,
   return true;
 }
 
-/// cuDF does not support HUGEINT (int128). DuckDB widens aggregates like sum(int32) to HUGEINT
-/// to avoid overflow. We downcast to BIGINT at the plan level so all downstream operators
-/// (including the result collector) use the correct type. The aggregate operators still sum
-/// such inputs without wrapping (op::is_wide_integer_sum): over DECIMAL128 where INT64 could
-/// overflow, and a SUM whose total does not fit BIGINT falls back to DuckDB at runtime.
-static void downcast_hugeint_types(duckdb::vector<duckdb::LogicalType>& types,
-                                   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>& exprs)
-{
-  for (auto& type : types) {
-    type = sirius_physical_plan_generator::planned_aggregate_type(type);
-  }
-  for (auto& expr : exprs) {
-    expr->SetReturnType(
-      sirius_physical_plan_generator::planned_aggregate_type(expr->GetReturnType()));
-  }
-}
-
 /// Plan an aggregate with several grouping sets or GROUPING() functions on top of @p child.
 ///
 /// The plan is a grouped aggregate with a projection on top:
@@ -759,12 +742,6 @@ bool decimal_sum_stats_bound_enabled(duckdb::ClientContext& context)
 
 }  // namespace
 
-duckdb::LogicalType sirius_physical_plan_generator::planned_aggregate_type(
-  duckdb::LogicalType const& type)
-{
-  return type == duckdb::LogicalType::HUGEINT ? duckdb::LogicalType::BIGINT : type;
-}
-
 void sirius_physical_plan_generator::require_planned_schema(
   std::span<sirius::logical_type const> planned,
   duckdb::vector<duckdb::LogicalType> const& declared,
@@ -777,12 +754,7 @@ void sirius_physical_plan_generator::require_planned_schema(
       std::to_string(declared.size()) + " (falling back to CPU)");
   }
   for (duckdb::idx_t i = 0; i < declared.size(); i++) {
-    // BIGINT may stand for a declared HUGEINT: the aggregate builder narrows its own output types
-    // and its parents keep DuckDB's.
-    if (planned[i] == sirius::from_duckdb(declared[i]) ||
-        planned[i] == sirius::from_duckdb(planned_aggregate_type(declared[i]))) {
-      continue;
-    }
+    if (planned[i] == sirius::from_duckdb(declared[i])) { continue; }
     throw duckdb::NotImplementedException(
       std::string(subject) + ": the planned input has " + planned[i].to_string() + " for column " +
       std::to_string(i) + " but the node declares " + sirius::from_duckdb(declared[i]).to_string() +
@@ -794,9 +766,6 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
 {
   D_ASSERT(op.children.size() == 1);
-
-  // Downcast HUGEINT to BIGINT since cuDF does not support int128
-  downcast_hugeint_types(op.types, op.expressions);
 
   // Reject nested GROUP BY keys before extract_aggregate_expressions rewrites
   // groups into bare references (which lose the name needed for the error).
