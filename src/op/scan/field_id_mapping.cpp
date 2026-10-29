@@ -7,6 +7,10 @@
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/unary.hpp>
+#include <cudf/wrappers/timestamps.hpp>
+
+#include <duckdb/common/types/date.hpp>
+#include <duckdb/common/types/timestamp.hpp>
 
 #include <algorithm>
 #include <bit>
@@ -46,6 +50,8 @@ cudf::data_type flat_type(duckdb::LogicalType const& type)
     case D::FLOAT: return cudf::data_type{C::FLOAT32};
     case D::DOUBLE: return cudf::data_type{C::FLOAT64};
     case D::VARCHAR: return cudf::data_type{C::STRING};
+    case D::DATE: return cudf::data_type{C::TIMESTAMP_DAYS};
+    case D::TIMESTAMP: return cudf::data_type{C::TIMESTAMP_MICROSECONDS};
     default: throw std::invalid_argument("field_id_core_v1: unsupported logical type");
   }
 }
@@ -107,8 +113,18 @@ std::unique_ptr<cudf::scalar> default_scalar(duckdb::Value const& value,
     case cudf::type_id::FLOAT64:
       return std::make_unique<cudf::numeric_scalar<double>>(
         value.GetValue<double>(), true, stream, mr);
+    case cudf::type_id::TIMESTAMP_DAYS:
+      return std::make_unique<cudf::timestamp_scalar<cudf::timestamp_D>>(
+        cudf::timestamp_D{cudf::duration_D{duckdb::DateValue::Get(value).days}}, true, stream, mr);
+    case cudf::type_id::TIMESTAMP_MICROSECONDS:
+      return std::make_unique<cudf::timestamp_scalar<cudf::timestamp_us>>(
+        cudf::timestamp_us{cudf::duration_us{duckdb::TimestampValue::Get(value).value}},
+        true,
+        stream,
+        mr);
     case cudf::type_id::STRING:
-      return std::make_unique<cudf::string_scalar>(value.GetValue<std::string>(), true, stream, mr);
+      return std::make_unique<cudf::string_scalar>(
+        duckdb::StringValue::Get(value), true, stream, mr);
     default: throw std::invalid_argument("unsupported field default");
   }
 }
@@ -126,7 +142,8 @@ std::optional<cudf::data_type> field_mapping_type(duckdb::LogicalType const& typ
 field_id_mapping field_id_mapping::compile(std::shared_ptr<parquet_metadata const> metadata,
                                            std::string const& opened_identity,
                                            materialization_program program,
-                                           std::vector<field_requirement> fields)
+                                           std::vector<field_requirement> fields,
+                                           field_mapping_scope scope)
 {
   if (!metadata || opened_identity.empty() || metadata->built_for_identity != opened_identity ||
       !program.contract || !program.generation)
@@ -136,10 +153,19 @@ field_id_mapping field_id_mapping::compile(std::shared_ptr<parquet_metadata cons
     throw std::invalid_argument("missing field mapping footer");
   auto index = index_parquet_field_ids(*footer);
   auto schema =
-    io::parquet_helpers::extract_schema(*footer, true, metadata->original_logical_annotations);
-  // v1 qualifies flat schemas only, without narrowing any legacy profile.
-  if (footer->schema.size() != schema.names.size() + 1)
+    scope == field_mapping_scope::top_level_scalars
+      ? io::parquet_helpers::extract_top_level_scalar_schema(*footer,
+                                                             metadata->original_logical_annotations)
+      : io::parquet_helpers::extract_schema(*footer, true, metadata->original_logical_annotations);
+  if (scope != field_mapping_scope::flat_file && scope != field_mapping_scope::top_level_scalars)
+    throw std::invalid_argument("unknown field mapping scope");
+  // Preserve the original flat-only default for existing adapters.
+  if (scope == field_mapping_scope::flat_file && footer->schema.size() != schema.names.size() + 1)
     throw std::invalid_argument("field_id_core_v1 requires a flat schema");
+  auto roots = io::parquet_helpers::top_level_schema_indices(*footer);
+  std::unordered_map<std::size_t, std::size_t> root_ordinals;
+  for (std::size_t i = 0; i < roots.size(); ++i)
+    root_ordinals.emplace(roots[i], i);
   std::unordered_set<std::string> physical_names;
   for (auto const& name : schema.names)
     if (!physical_names.insert(name).second)
@@ -157,7 +183,10 @@ field_id_mapping field_id_mapping::compile(std::shared_ptr<parquet_metadata cons
       if (!op.field.missing_value || op.field.missing_value->type() != op.field.type)
         throw std::invalid_argument("missing field requires an explicitly typed default");
     } else {
-      auto ordinal     = found->second - 1;
+      auto root = root_ordinals.find(found->second);
+      if (root == root_ordinals.end())
+        throw std::invalid_argument("requested field ID is not a top-level scalar");
+      auto ordinal     = root->second;
       op.physical_type = flat_type(schema.types.at(ordinal));
       if (op.physical_type != target &&
           !(op.field.allow_int32_to_int64 && op.physical_type.id() == cudf::type_id::INT32 &&
@@ -194,6 +223,18 @@ field_id_mapping field_id_mapping::compile(std::shared_ptr<parquet_metadata cons
   if (!result.program_.input_types || *result.program_.input_types != targets)
     throw std::invalid_argument("mapped schema does not match its bound program");
   return result;
+}
+
+std::optional<std::string> field_id_mapping::statistics_name(std::size_t output_index) const
+{
+  if (output_index >= operations_.size()) return std::nullopt;
+  auto const& op = operations_[output_index];
+  if (!op.physical_slot || op.physical_type != op.target_type) return std::nullopt;
+  auto const& name = read_names_.at(*op.physical_slot);
+  // Reader name expressions may interpret dots as nested paths. Positional
+  // decoding still supports such names, but statistics must not guess.
+  if (name.empty() || name.find('.') != std::string::npos) return std::nullopt;
+  return name;
 }
 
 bool field_id_mapping::compatible_with(field_id_mapping const& other) const
@@ -249,7 +290,7 @@ std::size_t field_id_mapping::additional_bytes(std::size_t rows) const
         throw std::invalid_argument("duplicate strings require decoded-size reservation");
       auto size = op.field.missing_value->IsNull()
                     ? 0
-                    : op.field.missing_value->GetValue<std::string>().size();
+                    : duckdb::StringValue::Get(*op.field.missing_value).size();
       if (size && rows > std::numeric_limits<std::size_t>::max() / size)
         throw std::overflow_error("field default reservation overflow");
       add(rows * size);

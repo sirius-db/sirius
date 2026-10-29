@@ -22,6 +22,8 @@
 
 #include <catch.hpp>
 #include <duckdb/common/multi_file/multi_file_reader.hpp>
+#include <duckdb/common/types/date.hpp>
+#include <duckdb/common/types/timestamp.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
 #include <utils/dynamic_filter_test_utils.hpp>
 #include <utils/gpu_execution_fixture.hpp>
@@ -430,6 +432,18 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     {4, duckdb::LogicalType::INTEGER, {}, false},
     {12, duckdb::LogicalType::INTEGER, duckdb::Value(duckdb::LogicalType::INTEGER), false}};
   auto mapping = field_id_mapping::compile(resolved.artifact, resolved.identity, program, fields);
+  CHECK_FALSE(mapping.statistics_name(0));  // Widened value.
+  CHECK_FALSE(mapping.statistics_name(1));  // Literal dot is not a nested path.
+  CHECK_FALSE(mapping.statistics_name(2));  // Missing field default.
+  CHECK_FALSE(mapping.statistics_name(3));  // Outside the logical working set.
+  auto exact_program            = program;
+  exact_program.output_types[0] = cudf::data_type{cudf::type_id::INT32};
+  exact_program.input_types     = exact_program.output_types;
+  auto exact_fields             = fields;
+  exact_fields[0]               = {9, duckdb::LogicalType::INTEGER, {}, false};
+  auto exact_mapping =
+    field_id_mapping::compile(resolved.artifact, resolved.identity, exact_program, exact_fields);
+  REQUIRE(exact_mapping.statistics_name(0) == std::optional<std::string>{"right"});
   REQUIRE(mapping.additional_bytes(3) >= 3 * (sizeof(int64_t) + sizeof(int32_t)));
   parquet_source input{source, resolved.artifact->file_metadata(), {0}};
   bound_table_scan contract;
@@ -1265,4 +1279,200 @@ TEST_CASE("Iceberg Puffin wrapper retains failure diagnostics", "[materializatio
   ledger->close();
   ledger.reset();
   CHECK(provider.outstanding() == 0);
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "Mapped footer pruning preserves physical groups and optional statistics",
+                 "[materialization][scan][mapping]")
+{
+  auto const mode = GENERATE(std::string("exact"),
+                             std::string("widen"),
+                             std::string("default"),
+                             std::string("no_stats"),
+                             std::string("all_pruned"),
+                             std::string("null"));
+  CAPTURE(mode);
+  rmm::cuda_stream stream;
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(constant(0, 6144, stream));
+  std::vector<int32_t> values(6144);
+  for (size_t i = 0; i < values.size(); ++i)
+    values[i] = (i / 2048) * 10;
+  REQUIRE(cudaMemcpyAsync(columns[0]->mutable_view().data<int32_t>(),
+                          values.data(),
+                          values.size() * sizeof(int32_t),
+                          cudaMemcpyHostToDevice,
+                          stream.value()) == cudaSuccess);
+  cudf::table table(std::move(columns));
+  cudf::io::table_input_metadata metadata(table.view());
+  metadata.column_metadata[0].set_name("physical").set_parquet_field_id(4);
+  sirius::test::scratch_dir directory("mapped_footer_pruning");
+  auto path   = directory.file("input.parquet");
+  auto writer = cudf::io::parquet_writer_options::builder(cudf::io::sink_info(path), table.view())
+                  .metadata(std::move(metadata))
+                  .row_group_size_rows(2048)
+                  .max_page_fragment_size(2048)
+                  .stats_level(mode == "no_stats" ? cudf::io::statistics_freq::STATISTICS_NONE
+                                                  : cudf::io::statistics_freq::STATISTICS_ROWGROUP)
+                  .build();
+  cudf::io::write_parquet(writer, stream);
+  stream.synchronize();
+  auto info                 = std::make_unique<parquet_ingestible_table_info>();
+  info->contract_id         = 93;
+  info->resolved_file_paths = {path};
+  info->names               = {"logical"};
+  auto type = mode == "widen" ? duckdb::LogicalType::BIGINT : duckdb::LogicalType::INTEGER;
+  info->returned_types = {mode == "widen" ? sirius::logical_type::make(sirius::type_id::BIGINT)
+                                          : sirius::logical_type::make(sirius::type_id::INTEGER)};
+  info->column_ids     = {duckdb::ColumnIndex(0)};
+  info->projected_output_count     = 1;
+  info->field_mapping_requirements = std::vector<field_requirement>{
+    {mode == "default" ? 8 : 4,
+     type,
+     mode == "default" ? std::optional<duckdb::Value>{duckdb::Value::INTEGER(10)} : std::nullopt,
+     mode == "widen"}};
+  info->prepare_field_mapping = [](std::shared_ptr<parquet_metadata const> metadata,
+                                   std::string const& identity,
+                                   materialization_program program,
+                                   std::vector<field_requirement> fields) {
+    return std::make_shared<field_id_mapping const>(field_id_mapping::compile(
+      std::move(metadata), identity, std::move(program), std::move(fields)));
+  };
+  auto filters = duckdb::make_uniq<duckdb::TableFilterSet>();
+  if (mode == "null") {
+    filters->PushFilter(duckdb::ProjectionIndex(0), sirius::test::null_filter(type));
+  } else {
+    auto value = [&](int x) {
+      return mode == "widen" ? duckdb::Value::BIGINT(x) : duckdb::Value::INTEGER(x);
+    };
+    filters->PushFilter(
+      duckdb::ProjectionIndex(0),
+      sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO,
+                                    value(mode == "all_pruned" ? 30 : 5)));
+    if (mode != "all_pruned")
+      filters->PushFilter(
+        duckdb::ProjectionIndex(0),
+        sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_LESSTHAN, value(15)));
+  }
+  info->table_filters = std::move(filters);
+  auto ingestible     = make_ingestible(std::move(info));
+  auto ioctx          = std::make_shared<sirius::io::kvikio_context>();
+  auto prepare        = ingestible->next_split_provider(
+    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+  auto prepared    = prepare({});
+  auto const& file = dynamic_cast<parquet_file_scan_info const&>(*prepared);
+  REQUIRE(file.field_mapping);
+  REQUIRE(file.file_metadata->row_groups.size() == 3);
+  CHECK(file.disable_filter_pushdown);
+  CHECK_FALSE(file.reader_options->get_filter().has_value());
+  auto all_pruned      = mode == "all_pruned" || mode == "null";
+  auto expected_groups = all_pruned ? 0 : mode == "exact" ? 1 : 3;
+  REQUIRE(file.row_groups.size() == expected_groups);
+  if (mode == "exact") CHECK(file.row_groups.front().index == 1);
+  auto coalescer = ingestible->create_batch_coalescer();
+  auto splits    = coalescer->push(std::move(prepared));
+  auto tail      = coalescer->flush();
+  for (auto& split : tail)
+    splits.push_back(std::move(split));
+  REQUIRE(splits.size() == 1);
+  auto const& split = dynamic_cast<parquet_split_info const&>(*splits.front());
+  REQUIRE(split.rg_slices.size() == 1);
+  auto const& slice = split.rg_slices.front();
+  bound_table_scan contract;
+  contract.contract_id = 93;
+  contract.profiles    = std::make_shared<physical_profile_table>();
+  std::vector<size_t> groups(slice.row_group_indices.begin(), slice.row_group_indices.end());
+  auto batch =
+    materialize_mapped_parquet({slice.datasource, slice.file_metadata, slice.row_group_indices},
+                               *split.field_mapping,
+                               contract,
+                               groups,
+                               stream,
+                               cudf::get_current_device_resource_ref());
+  CHECK(batch.rows == expected_groups * 2048);
+  if (mode == "exact") {
+    REQUIRE(batch.lineage.runs.size() == 1);
+    CHECK(batch.lineage.runs.front().file_row_offset == 2048);
+  }
+  CHECK(batch.table.view().num_columns() == 1);
+  stream.synchronize();
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "Scalar mapping preserves temporal defaults beside nested fields",
+                 "[materialization][scan][mapping]")
+{
+  namespace pq = cudf::io::parquet;
+  auto footer  = std::make_shared<pq::FileMetaData>();
+  footer->schema.resize(4);
+  footer->schema[0].num_children = 2;
+  footer->schema[1].name         = "nested";
+  footer->schema[1].field_id     = 1;
+  footer->schema[1].num_children = 1;
+  footer->schema[2].name         = "child";
+  footer->schema[2].field_id     = 2;
+  footer->schema[2].type         = pq::Type::INT32;
+  footer->schema[3].name         = "carrier";
+  footer->schema[3].field_id     = 3;
+  footer->schema[3].type         = pq::Type::INT32;
+  auto metadata                  = std::make_shared<parquet_metadata>(footer,
+                                                     0,
+                                                     parquet_encryption_evidence{},
+                                                     std::vector<uint8_t>{},
+                                                     std::string{},
+                                                     std::vector<uint8_t>{},
+                                                     "object");
+  materialization_program program;
+  program.contract     = 1;
+  program.generation   = 1;
+  program.output_types = {cudf::data_type{cudf::type_id::TIMESTAMP_DAYS},
+                          cudf::data_type{cudf::type_id::TIMESTAMP_MICROSECONDS}};
+  program.input_types  = program.output_types;
+  bool null            = GENERATE(false, true);
+  std::vector<field_requirement> fields{
+    {4,
+     duckdb::LogicalType::DATE,
+     null ? duckdb::Value(duckdb::LogicalType::DATE) : duckdb::Value::DATE(duckdb::date_t(-1))},
+    {5,
+     duckdb::LogicalType::TIMESTAMP,
+     null ? duckdb::Value(duckdb::LogicalType::TIMESTAMP)
+          : duckdb::Value::TIMESTAMP(duckdb::timestamp_t(-1))}};
+  auto compile = [&] {
+    return field_id_mapping::compile(
+      metadata, "object", program, fields, field_mapping_scope::top_level_scalars);
+  };
+  CHECK_THROWS(field_id_mapping::compile(metadata, "object", program, fields));
+  auto mapping = compile();
+  CHECK(mapping.read_indices() == std::vector<cudf::size_type>{1});
+  CHECK(mapping.metadata()->file_metadata().get() == footer.get());
+  CHECK_FALSE(mapping.statistics_name(0));
+  rmm::cuda_stream stream;
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(constant(7, 3, stream));
+  auto batch = mapping.apply(owning_table_view{std::make_unique<cudf::table>(std::move(columns))},
+                             3,
+                             stream,
+                             cudf::get_current_device_resource_ref());
+  stream.synchronize();
+  REQUIRE(batch.table.view().num_columns() == 2);
+  for (int i = 0; i < 2; ++i) {
+    auto column = batch.table.view().column(i);
+    CHECK(column.type() == program.output_types[i]);
+    CHECK(column.null_count() == (null ? 3 : 0));
+    if (!null) {
+      int64_t value = 0;
+      REQUIRE(cudaMemcpy(&value, column.head(), i == 0 ? 4 : 8, cudaMemcpyDeviceToHost) ==
+              cudaSuccess);
+      CHECK((i == 0 ? static_cast<int32_t>(value) : value) == -1);
+    }
+  }
+  footer->schema[0].children_idx = {3, 1};
+  footer->schema[1].children_idx = {2};
+  CHECK(compile().read_indices() == std::vector<cudf::size_type>{0});
+  fields[0].id = 2;
+  CHECK_THROWS(compile());
+  fields[0].id = 1;
+  CHECK_THROWS(compile());
+  footer->schema[0].children_idx = {1, 1};
+  CHECK_THROWS(compile());
 }
