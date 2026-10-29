@@ -152,6 +152,7 @@ enum class SiriusPhysicalOperatorType : uint8_t {
   STREAMING_SOURCE,
   STREAMING_SINK,
   DENSE_COUNT_JOIN,
+  PROBE_ACCUMULATE_EMIT,
   BUILD_FILTER
 };
 

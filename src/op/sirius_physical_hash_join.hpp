@@ -28,6 +28,7 @@
 #include "duckdb/planner/operator/logical_join.hpp"
 #include "expression/ast/node.hpp"  // complete sirius::ast::node for join_condition's destructor
 #include "expression/join_condition.hpp"
+#include "op/aggregate/probe_accumulate_context.hpp"
 #include "op/dynamic_filter/dynamic_filter_publish_plan.hpp"
 #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
 #include "op/dynamic_filter/dynamic_filter_stats.hpp"
@@ -315,6 +316,14 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   //! read-only-locked for the lifetime of its probe stream. Set from operator_params at
   //! planning time. 0 disables BUILD_PROBE for all joins including MARK.
   uint64_t max_build_probe_resident_bytes = config::DEFAULT_MAX_BUILD_PROBE_RESIDENT_BYTES;
+
+  //! Set by the planner to run this INNER join in probe-accumulate mode: instead of materializing
+  //! the joined rows, each probe batch is folded into per-build-row aggregates held here, and the
+  //! join emits only empty batches. `sirius_physical_probe_accumulate_emit` above the join reads
+  //! the finished aggregates. Requires provably unique build keys and a single-partition
+  //! BUILD_PROBE join, and takes the `cudf::distinct_hash_join` path to find each probe row's
+  //! build row. Null in every other join.
+  std::shared_ptr<probe_accumulate_context> accumulate;
 
   void restrict_dynamic_filter_replicas(std::vector<int> const& admitted_gpu_ids)
   {

@@ -435,6 +435,19 @@ sizing partitions have run.
 
 These operators are injected during pipeline splitting. They don't map to DuckDB logical operators.
 
+### `sirius_physical_probe_accumulate_emit` — `PROBE_ACCUMULATE_EMIT`
+**File:** `src/op/sirius_physical_probe_accumulate_emit.hpp`
+
+Emits the result of a `HASH_JOIN` in accumulate mode (`sirius_physical_hash_join::accumulate`, a shared `probe_accumulate_context`). The join folds each probe batch into per-build-row aggregates and outputs only empty batches; this operator waits for the join's pipeline to finish and then runs exactly one task that reads the finished accumulators and produces `[group key, aggregate...]` with one row per build row that matched at least once.
+
+- **Plan shape:** `PROBE_ACCUMULATE_EMIT → PASSTHROUGH_SINK → HASH_JOIN`. The sink ends the join's pipeline; without it this operator would execute inside every probe task.
+- **Task creation:** overrides `get_next_task_hint()` to wait for the producer pipeline and offer one task, because the base hint gates on queued bytes, which empty batches never add up to.
+- **Execution:** `probe_accumulate_state::emit()` compacts matched records on the GPU and gathers the build key; the table is cached in the context so a rescheduled task copies it instead of re-emitting consumed state.
+- **Memory:** `no_history_peak_memory_estimate()` sizes the reservation from the recorded build row count rather than from the (empty) input.
+- **Join side:** accumulate mode requires an INNER join on provably unique build keys (`distinct_hash_join`), a single-partition `BUILD_PROBE` strategy, and native (uncompressed) probe carriers; the compressed-schema and narrowing passes treat it as a restore boundary.
+
+See [Probe-Accumulate Join](probe-accumulate.md).
+
 ### `sirius_physical_partition` — `PARTITION`
 **File:** `src/op/sirius_physical_partition.hpp`
 

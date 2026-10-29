@@ -2296,6 +2296,16 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
     duckdb::ColumnBindingResolver resolver;
     resolver.VisitOperator(*op);
   }
+
+  // The rewrite targets the probe-accumulate join, so it follows that setting.
+  if (auto const sirius_ctx =
+        context.registered_state
+          ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
+          : nullptr;
+      sirius_ctx && duckdb::query_operator_options(context)->enable_probe_accumulate) {
+    rewrite_correlated_inequality_exists(context, op);
+  }
+
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan;
   auto preserve_first_pre_decline = [&] {
     if (!contract_provenance.first_pre_decline) return;

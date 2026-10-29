@@ -64,7 +64,7 @@ namespace sirius::planner {
 
 /// Returns a set of output column indices proven to form a unique key for the
 /// given logical operator subtree, or an empty set if uniqueness cannot be proven.
-static std::unordered_set<duckdb::idx_t> prove_unique_columns(duckdb::LogicalOperator& op)
+std::unordered_set<duckdb::idx_t> prove_unique_columns(duckdb::LogicalOperator& op)
 {
   switch (op.type) {
     case duckdb::LogicalOperatorType::LOGICAL_GET: {

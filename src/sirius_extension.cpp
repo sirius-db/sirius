@@ -2830,6 +2830,13 @@ static void SetEnableRuntimeDistinctBuildProbe(ClientContext& context,
                    params->enable_runtime_distinct_build_probe);
 }
 
+static void SetEnableProbeAccumulate(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params                    = get_operator_params(context, scope);
+  params->enable_probe_accumulate = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_PROBE_ACCUMULATE to {}", params->enable_probe_accumulate);
+}
+
 static void SetEnableDenseCountJoin(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params                    = get_operator_params(context, scope);
@@ -3319,6 +3326,13 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                     LogicalType::BOOLEAN,
                     Value::BOOLEAN(operator_defaults.enable_dense_count_join),
                     SetEnableDenseCountJoin);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "enable_probe_accumulate",
+                    "runtime override for probe-accumulate join planning",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(operator_defaults.enable_probe_accumulate),
+                    SetEnableProbeAccumulate);
   add_sirius_option(config,
                     option_visibility::internal,
                     "dense_count_join_max_bytes",

@@ -263,6 +263,7 @@ std::vector<descent_step> descent_steps(sirius::op::sirius_physical_operator con
     case SiriusPhysicalOperatorType::MERGE_GROUP_BY:
     case SiriusPhysicalOperatorType::MERGE_TOP_N:
     case SiriusPhysicalOperatorType::MERGE_AGGREGATE:
+    case SiriusPhysicalOperatorType::PROBE_ACCUMULATE_EMIT:
     case SiriusPhysicalOperatorType::SORT_PARTITION:
     case SiriusPhysicalOperatorType::SORT_SAMPLE:
     case SiriusPhysicalOperatorType::GPU_VALUES:

@@ -25,6 +25,7 @@ target_sources(
           sirius_plan_distinct.cpp
           sirius_plan_dummy_scan.cpp
           sirius_plan_empty_result.cpp
+          sirius_plan_exists_rewrite.cpp
           sirius_plan_expression_get.cpp
           sirius_plan_filter.cpp
           sirius_plan_get.cpp
@@ -32,6 +33,7 @@ target_sources(
           sirius_plan_narrowing_policy.cpp
           sirius_plan_order.cpp
           sirius_plan_projection.cpp
+          sirius_plan_probe_accumulate.cpp
           sirius_plan_projection_utils.cpp
           sirius_plan_recursive_cte.cpp
           sirius_plan_set_operation.cpp

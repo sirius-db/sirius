@@ -975,6 +975,13 @@ partition_strategy sirius_physical_hash_join::get_partition_strategy(
                                   std::memory_order_release);
   }
 
+  if (accumulate && (!strategy.build_probe || strategy.num_partitions != 1)) {
+    throw std::runtime_error(
+      "sirius_physical_hash_join id " + std::to_string(this->get_operator_id()) +
+      ": a probe-accumulate join needs a single-partition BUILD_PROBE join, but sizing chose " +
+      std::to_string(strategy.num_partitions) +
+      " partition(s), build_probe=" + (strategy.build_probe ? "true" : "false"));
+  }
   if (strategy.build_probe) {
     _join_mode = HASH_JOIN_MODE::BUILD_PROBE;
     // One hash-table slot per partition. Elements are non-movable (atomic build_state), so build a
@@ -1985,6 +1992,27 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
         } else {
           slot.hash_table = std::make_unique<cudf::hash_join>(build_keys, compare_nulls(), stream);
         }
+        if (accumulate) {
+          if (join_type != duckdb::JoinType::INNER || !slot.distinct_hash_table) {
+            throw std::runtime_error(
+              "sirius_physical_hash_join: a probe-accumulate join needs an INNER join on "
+              "provably unique build keys (cudf::distinct_hash_join), operator " +
+              std::to_string(this->get_operator_id()));
+          }
+          auto* const build_space = build_batch_ro.get_memory_space();
+          accumulate->state.initialize(
+            build_keys.num_rows(), stream, build_space->get_default_allocator());
+          std::lock_guard<std::mutex> accumulate_guard(accumulate->mutex);
+          accumulate->build_batch      = build_batch_ro;
+          accumulate->space            = build_space;
+          accumulate->build_key_column = right_key_col_indices.front();
+          SIRIUS_LOG_DEBUG(
+            "sirius_physical_hash_join id {}: probe-accumulate mode, {} build rows, {} "
+            "aggregate(s)",
+            this->get_operator_id(),
+            build_keys.num_rows(),
+            accumulate->state.specs().size());
+        }
         stream.sync();  // Ensure the hash table is fully built before we allow any probe
                         // batches to proceed.
         slot.build_state.store(BUILD_HASH_TABLE_STATE::BUILT, std::memory_order_release);
@@ -2038,6 +2066,20 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
             auto result   = slot.distinct_hash_table->inner_join(probe_keys, stream);
             left_indices  = std::move(result.first);
             right_indices = std::move(result.second);
+            if (accumulate) {
+              // Fold the matches into the build rows' aggregates and drop them, so the gather
+              // below yields an empty batch. The sync orders these atomics before the emit task,
+              // which reads the accumulators from another stream.
+              accumulate->state.accumulate(left_full,
+                                           cudf::device_span<cudf::size_type const>(
+                                             left_indices->data(), left_indices->size()),
+                                           cudf::device_span<cudf::size_type const>(
+                                             right_indices->data(), right_indices->size()),
+                                           stream);
+              stream.sync();
+              left_indices  = std::make_unique<rmm::device_uvector<cudf::size_type>>(0, stream);
+              right_indices = std::make_unique<rmm::device_uvector<cudf::size_type>>(0, stream);
+            }
           } else {
             // LEFT: returns only build indices; probe indices are implicit [0..N-1].
             auto build_indices = slot.distinct_hash_table->left_join(probe_keys, stream);

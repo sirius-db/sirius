@@ -118,6 +118,10 @@ constexpr bool DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE = false;
 
 constexpr bool DEFAULT_ENABLE_DENSE_COUNT_JOIN = true;
 
+/// Fuse `GROUP BY <join key>` MIN/MAX/COUNT over an INNER join with a provably unique build side
+/// into a probe-accumulate join. Off by default while the optimization is experimental.
+constexpr bool DEFAULT_ENABLE_PROBE_ACCUMULATE = false;
+
 /// 0 = auto: a share of GPU tier capacity, mirroring MAX_SORT_PARTITION_BYTES. The
 /// histogram is 2 * key_range * slot_bytes, so it tracks the key domain rather than
 /// any fixed size, and a constant admits it at one data size and rejects it at the next.
@@ -262,6 +266,11 @@ struct operator_params {
 
   /// Enable DENSE_COUNT_JOIN planning for eligible aggregates.
   bool enable_dense_count_join = config::DEFAULT_ENABLE_DENSE_COUNT_JOIN;
+
+  /// Enable probe-accumulate planning: a MIN/MAX/COUNT aggregate grouped by the key of an INNER
+  /// join whose build side is provably unique is computed inside the join probe, with no join
+  /// output and no group-by. See `sirius_physical_probe_accumulate_emit`.
+  bool enable_probe_accumulate = config::DEFAULT_ENABLE_PROBE_ACCUMULATE;
 
   /// Engine-owned histogram budget; 0 = derive from GPU tier capacity. A key range that
   /// does not fit declines the fusion, leaving the ordinary join + aggregate.
