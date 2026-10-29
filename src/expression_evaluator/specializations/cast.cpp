@@ -99,11 +99,11 @@ void require_hugeint_cast_in_range(cudf::column_view const& input,
     case type_id::UBIGINT:
     case type_id::UHUGEINT: maximum = std::numeric_limits<uint64_t>::max(); break;
     case type_id::DECIMAL: {
-      // |v| < 10^(p-s) also keeps the rescaled value within the target's p digits.
+      // |v| < 10^(p-s) also keeps the rescaled value within the target's p digits. At 38 digits
+      // the bound still matters: HUGEINT reaches about 1.7 * 10^38.
       auto const digits = target.decimal_precision() - target.decimal_scale();
-      if (digits >= 38) { return; }
-      maximum = power_of_ten(digits) - 1;
-      minimum = -maximum;
+      maximum           = power_of_ten(digits) - 1;
+      minimum           = -maximum;
       break;
     }
     default: return;
