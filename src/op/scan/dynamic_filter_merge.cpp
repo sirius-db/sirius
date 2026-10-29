@@ -996,7 +996,7 @@ void apply_cached(application_result_state& result,
     // stream order, after the work already submitted that reads it.
     if (result.conjunction->nullable()) {
 #if CUDF_VERSION_MAJOR > 26 || (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 12)
-      result.conjunction->set_null_mask(cuda::device_buffer<cudf::bitmask_type>{stream, mr}, 0);
+      result.conjunction->set_null_mask(::cuda::device_buffer<cudf::bitmask_type>{stream, mr}, 0);
 #else
       result.conjunction->set_null_mask(rmm::device_buffer{}, 0);
 #endif
