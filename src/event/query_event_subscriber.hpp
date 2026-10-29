@@ -249,6 +249,25 @@ class query_event_subscriber {
                                              int gpu_id,
                                              std::size_t granted_bytes) noexcept;
 
+  /// The downgrade executor moved inputs of a queued task of @p query_id off
+  /// the GPU.  One event per converted task; @c downgraded_task::inputs lists
+  /// only the inputs that moved, held weakly, so any may already be gone.
+  virtual void on_task_downgraded(event_id_t,
+                                  timestamp_t,
+                                  query_id_t query_id,
+                                  downgraded_task const& task) noexcept;
+
+  /// The scheduler popped task @p task_id of pipeline @p pipeline_id for
+  /// @p gpu.  @p tasks_left is how many queued tasks @p gpu can still pop: its
+  /// own bucket plus the no-preference bucket, counted right after the pop.
+  virtual void on_task_popped(event_id_t,
+                              timestamp_t,
+                              query_id_t query_id,
+                              std::uint64_t task_id,
+                              std::size_t pipeline_id,
+                              int gpu,
+                              std::size_t tasks_left) noexcept;
+
  protected:
   /// Inspect after stop() joins the worker to reject incomplete observations.
   [[nodiscard]] bool delivery_failed() const noexcept { return _queue->failed(); }

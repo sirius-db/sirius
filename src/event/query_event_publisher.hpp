@@ -178,6 +178,14 @@ class query_event_publisher : public std::enable_shared_from_this<query_event_pu
                                           int gpu_id,
                                           std::size_t granted_bytes) noexcept;
 
+  void publish_task_downgraded(query_id_t query_id, downgraded_task task) noexcept;
+
+  void publish_task_popped(query_id_t query_id,
+                           std::uint64_t task_id,
+                           std::size_t pipeline_id,
+                           int gpu,
+                           std::size_t tasks_left) noexcept;
+
  private:
   friend class query_event_subscriber;
   friend struct query_event_test_access;

@@ -180,6 +180,18 @@ void query_event_subscriber::on_memory_wait_ended_for_task(
 {
 }
 
+void query_event_subscriber::on_task_downgraded(event_id_t,
+                                                timestamp_t,
+                                                query_id_t,
+                                                downgraded_task const&) noexcept
+{
+}
+
+void query_event_subscriber::on_task_popped(
+  event_id_t, timestamp_t, query_id_t, std::uint64_t, std::size_t, int, std::size_t) noexcept
+{
+}
+
 // ---------------------------------------------------------------------------
 // worker
 // ---------------------------------------------------------------------------
@@ -235,6 +247,10 @@ void query_event_subscriber::dispatch(query_events const& event) noexcept
             on_task_completed(e.event_id, e.timestamp, args...);
           } else if constexpr (type == event_type::memory_wait_ended_for_task) {
             on_memory_wait_ended_for_task(e.event_id, e.timestamp, args...);
+          } else if constexpr (type == event_type::task_downgraded) {
+            on_task_downgraded(e.event_id, e.timestamp, args...);
+          } else if constexpr (type == event_type::task_popped) {
+            on_task_popped(e.event_id, e.timestamp, args...);
           } else {
             static_assert(unhandled_event_type<type>, "unhandled event_type");
           }

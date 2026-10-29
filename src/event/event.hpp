@@ -17,6 +17,7 @@
 #pragma once
 
 #include "event/downgraded_batch.hpp"
+#include "event/downgraded_task.hpp"
 #include "exec/queue_priority.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "query_id.hpp"
@@ -46,7 +47,9 @@ enum class event_type : std::uint8_t {
   compressed_materialization,
   batch_downgraded,
   task_completed,
-  memory_wait_ended_for_task
+  memory_wait_ended_for_task,
+  task_downgraded,
+  task_popped
 };
 
 /// What happened to compressed carriers. Counts describe columns, except
@@ -133,6 +136,18 @@ using task_completed_event =
 using memory_wait_ended_for_task_event =
   event<event_type::memory_wait_ended_for_task, query_id_t, std::size_t, int, std::size_t>;
 
+/// One per queued task the downgrade executor converted; lists only the inputs that moved.
+using task_downgraded_event = event<event_type::task_downgraded, query_id_t, downgraded_task>;
+
+/// Published by the scheduler right after it pops a task for @c gpu; @c tasks_left is the
+/// number of queued tasks that GPU can still pop (its own bucket plus the no-preference bucket).
+using task_popped_event = event<event_type::task_popped,
+                                query_id_t,
+                                std::uint64_t /*task_id*/,
+                                std::size_t /*pipeline_id*/,
+                                int /*gpu*/,
+                                std::size_t /*tasks_left*/>;
+
 /// Every event a @ref query_event_publisher can publish.  Subscribers receive this
 /// and nothing else, so adding an event is: an enumerator, an alias, an arm
 /// here, and an arm in the dispatch.
@@ -147,7 +162,9 @@ using query_events = std::variant<task_created_event,
                                   compressed_materialization_event,
                                   batch_downgraded_event,
                                   task_completed_event,
-                                  memory_wait_ended_for_task_event>;
+                                  memory_wait_ended_for_task_event,
+                                  task_downgraded_event,
+                                  task_popped_event>;
 
 /// Number of distinct events, and so the width of the publisher's routing table.
 inline constexpr std::size_t n_query_events = std::variant_size_v<query_events>;
@@ -175,6 +192,12 @@ static_assert(
   std::is_same_v<
     std::variant_alternative_t<event_index_v<memory_wait_ended_for_task_event>, query_events>,
     memory_wait_ended_for_task_event>);
+static_assert(
+  std::is_same_v<std::variant_alternative_t<event_index_v<task_downgraded_event>, query_events>,
+                 task_downgraded_event>);
+static_assert(
+  std::is_same_v<std::variant_alternative_t<event_index_v<task_popped_event>, query_events>,
+                 task_popped_event>);
 
 /// Every event, for the @ref query_event_publisher::register_subscriber overload
 /// that takes no subscription list.
@@ -190,6 +213,8 @@ inline constexpr std::array<event_type, n_query_events> all_query_events{
   event_type::compressed_materialization,
   event_type::batch_downgraded,
   event_type::task_completed,
-  event_type::memory_wait_ended_for_task};
+  event_type::memory_wait_ended_for_task,
+  event_type::task_downgraded,
+  event_type::task_popped};
 
 }  // namespace sirius::event
