@@ -36,6 +36,7 @@
 #include <fstream>
 #include <future>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -105,13 +106,33 @@ std::shared_ptr<const sirius::memory::topology_index> single_gpu_topology()
   return std::make_shared<sirius::memory::topology_index>(topology, std::vector<int>{0});
 }
 
-sirius::scan_manager::scan_manager_config cached_scan_config()
+std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> reclaim_memory_manager()
+{
+  sirius::converter_registry::reset_for_testing();
+  cucascade::memory::reservation_manager_configurator builder;
+  // Unlike the general scan fixture's 75% reservation limit / 85% trigger,
+  // these thresholds can be crossed with reservations alone (no large allocation).
+  builder.set_number_of_gpus(1)
+    .set_gpu_usage_limit(2ull << 30)
+    .set_reservation_fraction_per_gpu(0.75)
+    .set_per_numa_region_capacity(512ull << 20)
+    .use_gpu_id_as_host_id()
+    .set_reservation_fraction_per_numa_region(1.0)
+    .set_downgrade_fractions_per_numa_region(0.8, 0.7);
+  auto memory =
+    std::make_unique<sirius::memory::sirius_memory_reservation_manager>(builder.build());
+  sirius::converter_registry::initialize();
+  return memory;
+}
+
+sirius::scan_manager::scan_manager_config cached_scan_config(double floor_fraction)
 {
   sirius::scan_manager::scan_manager_config config;
-  config.thread_pool.num_threads = 1;
-  config.uring_n_reactors        = 1;
-  config.cache.mode              = cache::cache_mode::cucs;
-  config.cache.eviction          = cache::eviction_policy::lru;
+  config.thread_pool.num_threads               = 1;
+  config.uring_n_reactors                      = 1;
+  config.cache.mode                            = cache::cache_mode::cucs;
+  config.cache.eviction                        = cache::eviction_policy::lru;
+  config.cache.min_prefetching_budget_fraction = floor_fraction;
   config.apply_cache_mode();
   return config;
 }
@@ -119,12 +140,26 @@ sirius::scan_manager::scan_manager_config cached_scan_config()
 struct reclaim_fixture {
   temporary_file file{16ull << 20};
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory =
-    initialize_memory_manager(1);
+    reclaim_memory_manager();
   sirius::exec::query_lifecycle_registry lifecycle;
   sirius::data::data_repository_manager_registry repositories;
-  sirius::scan_manager::sirius_scan_manager scans{
-    lifecycle, cached_scan_config(), *memory, single_gpu_topology()};
+  sirius::scan_manager::sirius_scan_manager scans;
   std::unique_ptr<downgrade_executor> executor;
+
+  explicit reclaim_fixture(std::optional<std::size_t> floor_chunks = 0)
+    : scans(lifecycle,
+            cached_scan_config([&] {
+              if (!floor_chunks) { return cache::config{}.min_prefetching_budget_fraction; }
+              if (*floor_chunks == 0) { return 0.0; }
+              auto* host       = sirius::scan_test_utils::get_space(*memory, Tier::HOST);
+              auto const chunk = host->get_memory_resource_of<Tier::HOST>()->get_block_size();
+              return static_cast<double>(*floor_chunks * chunk - chunk / 2) /
+                     static_cast<double>(host->get_max_memory());
+            }()),
+            *memory,
+            single_gpu_topology())
+  {
+  }
 
   cache::fs_cache& fs_cache()
   {
@@ -147,13 +182,15 @@ struct reclaim_fixture {
     return handle;
   }
 
-  void start(Tier tier = Tier::HOST, bool bind_cache = true)
+  void start(Tier tier                                = Tier::HOST,
+             bool bind_cache                          = true,
+             std::chrono::milliseconds monitor_period = 0ms)
   {
     auto* space = sirius::scan_test_utils::get_space(*memory, tier);
     REQUIRE(space != nullptr);
     sirius::exec::downgrade_executor_config config{
       .thread_pool    = {.num_threads = 1, .thread_name_prefix = "cache_reclaim"},
-      .monitor_period = 0ms};
+      .monitor_period = monitor_period};
     executor = std::make_unique<downgrade_executor>(
       lifecycle, config, repositories, space->get_id(), space, *memory);
     if (bind_cache) { executor->set_fs_cache(&fs_cache()); }
@@ -207,6 +244,98 @@ class counted_host_representation : public cucascade::idata_representation {
 };
 
 }  // namespace
+
+TEST_CASE("HOST reclaim keeps chunks inside the prefetch reservation",
+          "[downgrade_executor][fs_cache]")
+{
+  reclaim_fixture fixture{8};
+  auto idle = fixture.prepare(0, 2);
+  auto live = fixture.prepare(2, 2);
+  dispose_and_wait(fixture, idle);
+  auto& cache = fixture.fs_cache();
+  auto* host  = sirius::scan_test_utils::get_space(*fixture.memory, Tier::HOST);
+  REQUIRE(host != nullptr);
+  auto const available = host->get_available_memory();
+  auto const claimed   = cache.claimed_bytes();
+  REQUIRE(claimed == 4 * cache.chunk_size());
+  REQUIRE(cache.releasable_bytes() == 0);
+  fixture.start();
+
+  CHECK(fixture.executor->request_free_memory_and_wait(claimed) == 0);
+  CHECK(cache.claimed_bytes() == claimed);
+  CHECK(host->get_available_memory() == available);
+  CHECK(cache.releasable_bytes() == 0);
+  for (auto const* handle : {&idle, &live}) {
+    for (auto* chunk : *handle->chunks()) {
+      CHECK(chunk->state.get_state() == cache::chunk_state::allocated);
+    }
+  }
+}
+
+TEST_CASE("HOST reclaim credits only bytes above the prefetch reservation",
+          "[downgrade_executor][fs_cache]")
+{
+  reclaim_fixture fixture{2};
+  auto idle = fixture.prepare(0, 4);
+  dispose_and_wait(fixture, idle);
+  auto& cache = fixture.fs_cache();
+  auto* host  = sirius::scan_test_utils::get_space(*fixture.memory, Tier::HOST);
+  REQUIRE(host != nullptr);
+  auto const available = host->get_available_memory();
+  auto const chunk     = cache.chunk_size();
+  REQUIRE(cache.claimed_bytes() == 4 * chunk);
+  REQUIRE(cache.releasable_bytes() == 2 * chunk);
+  fixture.start();
+
+  CHECK(fixture.executor->request_free_memory_and_wait(4 * chunk) == 2 * chunk);
+  CHECK(cache.claimed_bytes() == 2 * chunk);
+  CHECK(host->get_available_memory() - available == 2 * chunk);
+  CHECK(fixture.executor->request_free_memory_and_wait(chunk) == 0);
+  CHECK(cache.claimed_bytes() == 2 * chunk);
+}
+
+TEST_CASE("HOST monitor does not re-fire on a cache it cannot shrink",
+          "[downgrade_executor][fs_cache]")
+{
+  reclaim_fixture fixture{8};
+  auto live          = fixture.prepare(0, 4);
+  auto& cache        = fixture.fs_cache();
+  auto const claimed = cache.claimed_bytes();
+  auto* host         = sirius::scan_test_utils::get_space(*fixture.memory, Tier::HOST);
+  REQUIRE(host != nullptr);
+  auto pressure = host->make_reservation_upto(host->get_max_memory());
+  REQUIRE(host->should_downgrade_memory());
+  fixture.start(Tier::HOST, true, 1ms);
+
+  std::this_thread::sleep_for(100ms);
+  CHECK(fixture.executor->monitor_requests_issued_for_testing() == 0);
+  CHECK(cache.claimed_bytes() == claimed);
+  pressure.reset();
+}
+
+TEST_CASE("HOST monitor reclaims the cache once and then backs off",
+          "[downgrade_executor][fs_cache]")
+{
+  reclaim_fixture fixture{0};
+  auto live   = fixture.prepare(0, 4);
+  auto& cache = fixture.fs_cache();
+  auto* host  = sirius::scan_test_utils::get_space(*fixture.memory, Tier::HOST);
+  REQUIRE(host != nullptr);
+  auto pressure = host->make_reservation_upto(host->get_max_memory());
+  REQUIRE(host->should_downgrade_memory());
+  fixture.start(Tier::HOST, true, 1ms);
+
+  auto const deadline = std::chrono::steady_clock::now() + 5s;
+  while (cache.claimed_bytes() != 0 && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(1ms);
+  }
+  REQUIRE(cache.claimed_bytes() == 0);
+  auto const requests = fixture.executor->monitor_requests_issued_for_testing();
+  REQUIRE(requests >= 1);
+  std::this_thread::sleep_for(50ms);
+  CHECK(fixture.executor->monitor_requests_issued_for_testing() == requests);
+  pressure.reset();
+}
 
 TEST_CASE("HOST downgrade satisfies a target from idle cache before repositories",
           "[downgrade_executor][fs_cache]")
@@ -329,6 +458,7 @@ TEST_CASE("SiriusContext reset rebinds HOST reclaim to each rebuilt local cache"
       cache:
         mode: cucs
         eviction: lru
+        min_prefetching_budget_fraction: 0.0
   telemetry:
     enable_quent: false
 )yaml"}};
