@@ -18,10 +18,14 @@
 #include "compression/spill_compression.hpp"
 #include "log/level.hpp"
 #include "log/sink.hpp"
+#include "preload/config.hpp"
+#include "preload/preload_executor.hpp"
+#include "preload/preload_streams.hpp"
 #include "sirius/ffi.hpp"
 #include "sirius_context.hpp"
 #include "util/env_guard.hpp"
 #include "utils/log_test_utils.hpp"
+#include "utils/parquet_fixture_utils.hpp"
 #include "utils/sirius_test_env.hpp"
 
 #include <cudf/contiguous_split.hpp>
@@ -45,6 +49,7 @@
 #include <duckdb/main/settings.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
 #include <utils/utils.hpp>
+#include <yaml-cpp/yaml.h>
 
 #include <algorithm>
 #include <array>
@@ -2590,4 +2595,186 @@ TEST_CASE("Sirius admission configuration has one authoritative limit",
     Catch::Matchers::ContainsSubstring("conflicting"));
   REQUIRE_THROWS(load("sirius: {max_concurrent_queries: 0}"));
   CHECK(load("sirius: {}").max_concurrent_queries() == 1);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The preload executor: configuration, and its existence inside SiriusContext
+// ---------------------------------------------------------------------------------------------
+
+TEST_CASE("Sirius preload configuration defaults leave the executor off",
+          "[sirius][config][preload]")
+{
+  sirius::preload::preload_executor_config const defaults{};
+  CHECK(defaults.device_budget == 0.0);
+  CHECK(defaults.device_ceiling == 0.5);
+  CHECK(defaults.host_budget == 0.0);
+  CHECK(defaults.host_ceiling == 0.7);
+  CHECK_FALSE(sirius::preload::preload_enabled(defaults));
+
+  sirius::sirius_config config;
+  config.load_from_file(config_fixture("minimal.yaml"));
+  auto const& loaded = config.get_preload_executor_config();
+  CHECK(loaded.device_budget == defaults.device_budget);
+  CHECK(loaded.device_ceiling == defaults.device_ceiling);
+  CHECK(loaded.host_budget == defaults.host_budget);
+  CHECK(loaded.host_ceiling == defaults.host_ceiling);
+
+  // Either budget turns it on.
+  auto device_only          = defaults;
+  device_only.device_budget = 0.1;
+  CHECK(sirius::preload::preload_enabled(device_only));
+  auto host_only        = defaults;
+  host_only.host_budget = 0.1;
+  CHECK(sirius::preload::preload_enabled(host_only));
+}
+
+TEST_CASE("Sirius configuration reads the four preload keys", "[sirius][config][preload]")
+{
+  sirius::sirius_config config;
+  config.load_from_file(config_fixture("valid_preload.yaml"));
+  auto const& cfg = config.get_preload_executor_config();
+  CHECK(cfg.device_budget == 0.25);
+  CHECK(cfg.device_ceiling == 0.6);
+  CHECK(cfg.host_budget == 0.15);
+  CHECK(cfg.host_ceiling == 0.55);
+}
+
+TEST_CASE("Sirius configuration rejects removed preload keys and fractions out of range",
+          "[sirius][config][preload]")
+{
+  struct invalid_config {
+    char const* fixture;
+    char const* message;
+  };
+  invalid_config const cases[] = {
+    {"invalid_preload_concurrent_preloads.yaml",
+     "unknown config key: 'concurrent_preloads' in preload"},
+    {"invalid_preload_device_preloading_budget.yaml",
+     "unknown config key: 'device_preloading_budget' in preload"},
+    {"invalid_preload_fraction.yaml", "'preload.device_budget': value out of range"},
+    {"invalid_preload_negative_ceiling.yaml", "'preload.host_ceiling': value out of range"},
+  };
+  for (auto const& invalid : cases) {
+    INFO("fixture=" << invalid.fixture);
+    auto const path = config_fixture(invalid.fixture);
+    REQUIRE(fs::is_regular_file(path));
+    sirius::sirius_config config;
+    REQUIRE_THROWS_WITH(config.load_from_file(path),
+                        Catch::Matchers::ContainsSubstring(invalid.message));
+  }
+}
+
+namespace {
+
+/// A one-GPU context config whose @c preload block is @p preload_block (each line indented under
+/// @c preload:), with a DISK space under @p disk_dir. The GPU is configured through the low-level
+/// @c space.gpu[] surface, the only one that exposes @c per_stream_reservation.
+std::string preload_context_yaml(std::string const& preload_block,
+                                 fs::path const& disk_dir,
+                                 bool per_stream = false)
+{
+  return std::string{R"(sirius:
+  space:
+    gpu:
+      - device_id: 0
+        memory_capacity: 1GiB
+        reservation_limit_fraction: 1.0
+        per_stream_reservation: )"} +
+         (per_stream ? "true" : "false") + R"(
+    host:
+      - numa_id: 0
+        memory_capacity: 1GiB
+    disk:
+      - disk_id: 0
+        memory_capacity: 1GiB
+        mount_path: ")" +
+         disk_dir.string() + R"("
+  executor:
+    pipeline:
+      num_threads: 2
+    downgrade:
+      num_threads: 1
+      monitor_period: 10ms
+    scan_manager:
+      uring_n_reactors: 1
+    preload:
+)" + preload_block +
+         R"(  telemetry:
+    enable_quent: false
+)";
+}
+
+std::unique_ptr<duckdb::SiriusContext> preload_context(std::string const& preload_block,
+                                                       fs::path const& disk_dir,
+                                                       bool per_stream = false)
+{
+  auto ctx = std::make_unique<duckdb::SiriusContext>();
+  ctx->initialize(sirius::parsed_sirius_config::from_node(
+    YAML::Load(preload_context_yaml(preload_block, disk_dir, per_stream))));
+  return ctx;
+}
+
+/// Live threads of this process named like a preload worker ("preload-<device>").
+std::size_t preload_worker_threads()
+{
+  std::size_t n = 0;
+  std::error_code ec;
+  fs::directory_iterator it{"/proc/self/task", ec};
+  for (; !ec && it != fs::directory_iterator{}; it.increment(ec)) {
+    std::ifstream comm{it->path() / "comm"};
+    std::string name;
+    if (std::getline(comm, name) && name.starts_with("preload-")) { ++n; }
+  }
+  return n;
+}
+
+}  // namespace
+
+TEST_CASE(
+  "SiriusContext runs the preload executor only with a budget, and its streams only with "
+  "a device budget",
+  "[sirius][context][isolated_context][preload]")
+{
+  sirius::test::scratch_dir dir{"preload_context"};
+
+  struct expectation {
+    char const* preload_block;
+    bool per_stream;
+    bool executor;
+    bool streams;
+  };
+  expectation want{};
+  SECTION("no budget") { want = {"      device_ceiling: 0.4\n", false, false, false}; }
+  SECTION("a device budget") { want = {"      device_budget: 0.2\n", false, true, true}; }
+  SECTION("a host budget only") { want = {"      host_budget: 0.2\n", false, true, false}; }
+  SECTION("a device budget on a GPU tracking reservations per stream")
+  {
+    want = {"      device_budget: 0.2\n", true, false, false};
+  }
+  SECTION("per-stream tracking keeps the host budget")
+  {
+    want = {"      device_budget: 0.2\n      host_budget: 0.2\n", true, true, false};
+  }
+  CAPTURE(want.preload_block, want.per_stream);
+
+  auto ctx            = preload_context(want.preload_block, dir.path(), want.per_stream);
+  auto* const preload = ctx->get_preload_executor();
+  auto const streams  = ctx->preload_streams_for_testing();
+  CHECK((preload != nullptr) == want.executor);
+  CHECK(streams.expired() == !want.streams);
+  auto const gpus =
+    ctx->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::GPU).size();
+  if (want.streams) { CHECK(streams.lock()->size() == gpus); }
+  // One worker per GPU whenever the executor runs, staging included.
+  CHECK(preload_worker_threads() == (want.executor ? gpus : 0));
+  if (preload != nullptr) {
+    auto const c = preload->counters();
+    CHECK(c.pops == 0);
+    CHECK(c.promoted_to_gpu + c.promoted_to_host == 0);
+  }
+
+  ctx->terminate();
+  CHECK(streams.expired());
+  CHECK(preload_worker_threads() == 0);
+  CHECK_THROWS(ctx->get_preload_executor());
 }

@@ -20,9 +20,12 @@
 #include "event/query_event_subscriber.hpp"
 #include "exec/config.hpp"
 #include "exec/query_lifecycle_registry.hpp"
+#include "op/sirius_physical_operator.hpp"
 #include "pipeline/completion_handler.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
+#include "pipeline/pipeline_build_context.hpp"
 #include "pipeline/query_retirement_test_utils.hpp"
+#include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/task_scheduler.hpp"
 #include "query_id.hpp"
 #include "scan/test_utils.hpp"
@@ -34,7 +37,9 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <exception>
 #include <future>
 #include <memory>
@@ -43,6 +48,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 using namespace sirius::pipeline;
 using namespace sirius::parallel;
@@ -777,4 +783,184 @@ TEST_CASE("successful retirement reports queued execution work before the work b
   scheduler.discard_query_tasks(q);
   lifecycle.wait_for_work(q);
   lifecycle.close(q);
+}
+
+namespace {
+
+/// Every task_popped delivery, in delivery order.
+class task_popped_recorder final : public sirius::event::query_event_subscriber {
+ public:
+  struct entry {
+    sirius::query_id_t query;
+    std::uint64_t task_id;
+    std::size_t pipeline_id;
+    int gpu;
+    std::size_t tasks_left;
+  };
+
+  explicit task_popped_recorder(sirius::event::query_event_publisher& publisher)
+    : query_event_subscriber(publisher, {sirius::event::event_type::task_popped})
+  {
+    start();
+  }
+
+  ~task_popped_recorder() override { stop(); }
+
+  [[nodiscard]] std::string_view name() const noexcept override { return "task_popped_recorder"; }
+
+  /// What arrived once at least @p n entries did, or by @p timeout.
+  std::vector<entry> wait_for(std::size_t n, std::chrono::seconds timeout)
+  {
+    std::unique_lock lock(_mutex);
+    _cv.wait_for(lock, timeout, [&] { return _entries.size() >= n; });
+    return _entries;
+  }
+
+ private:
+  void on_task_popped(sirius::event::event_id_t,
+                      sirius::event::timestamp_t,
+                      sirius::query_id_t query_id,
+                      std::uint64_t task_id,
+                      std::size_t pipeline_id,
+                      int gpu,
+                      std::size_t tasks_left) noexcept override
+  {
+    std::lock_guard lock(_mutex);
+    _entries.push_back({query_id, task_id, pipeline_id, gpu, tasks_left});
+    _cv.notify_all();
+  }
+
+  std::mutex _mutex;
+  std::condition_variable _cv;
+  std::vector<entry> _entries;
+};
+
+/// Holds every task in execute() until released; counts the tasks that entered.
+struct execution_gate {
+  std::mutex mu;
+  std::condition_variable cv;
+  bool open{false};
+  int entered{0};
+
+  void enter()
+  {
+    std::unique_lock lock(mu);
+    ++entered;
+    cv.notify_all();
+    cv.wait(lock, [&] { return open; });
+  }
+
+  bool wait_entered(int n, std::chrono::seconds timeout)
+  {
+    std::unique_lock lock(mu);
+    return cv.wait_for(lock, timeout, [&] { return entered >= n; });
+  }
+
+  void release()
+  {
+    std::lock_guard lock(mu);
+    open = true;
+    cv.notify_all();
+  }
+};
+
+/// A task of a real pipeline that waits at @p gate when it runs.
+class gated_pipeline_task : public gpu_pipeline_task {
+ public:
+  gated_pipeline_task(uint64_t task_id,
+                      std::shared_ptr<gpu_pipeline_task_global_state> global_state,
+                      std::optional<int> preferred_device,
+                      execution_gate& gate)
+    : gpu_pipeline_task(task_id,
+                        std::vector<cucascade::shared_data_repository*>{},
+                        make_local_state(preferred_device),
+                        std::move(global_state)),
+      _gate(gate)
+  {
+  }
+
+  void execute(::cuda::stream_ref) override { _gate.enter(); }
+
+ private:
+  static std::unique_ptr<gpu_pipeline_task_local_state> make_local_state(
+    std::optional<int> preferred_device)
+  {
+    auto local =
+      std::make_unique<gpu_pipeline_task_local_state>(std::make_unique<pipelineable_operator_data>(
+        std::vector<std::shared_ptr<cucascade::data_batch>>{}));
+    if (preferred_device) { local->set_preferred_device_id(*preferred_device); }
+    return local;
+  }
+
+  execution_gate& _gate;
+};
+
+}  // namespace
+
+TEST_CASE(
+  "the scheduler publishes task_popped with the task, its pipeline and what the GPU can "
+  "still pop",
+  "[task_scheduler][preload]")
+{
+  auto const q = sirius::make_query_id(3);
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(q);
+  auto manager = initialize_memory_manager(1);
+
+  // A pipeline whose single operator is its source and sink, so its tasks can complete.
+  sirius_physical_operator source_and_sink(
+    SiriusPhysicalOperatorType::FILTER, duckdb::vector<sirius::logical_type>{}, 0);
+  source_and_sink.operator_id = 0;
+  auto pipeline = std::make_shared<sirius_pipeline>(pipeline_build_context{nullptr, true});
+  sirius_pipeline_build_state build_state;
+  build_state.set_pipeline_source(*pipeline, source_and_sink);
+  build_state.set_pipeline_sink(*pipeline, &source_and_sink, /*sink_pipeline_count=*/1);
+  pipeline->set_query_id(q);
+  pipeline->set_pipeline_id(9);
+  auto global = std::make_shared<gpu_pipeline_task_global_state>(
+    pipeline, sirius::test::make_test_telemetry_context());
+  global->set_priority(
+    static_cast<sirius::exec::queue_priority>(sirius::query_priority_bits(q) | 1));
+
+  execution_gate gate;
+  auto events = std::make_shared<sirius::event::query_event_publisher>();
+  task_popped_recorder recorder(*events);
+  // One worker thread: GPU 0 pops its next task only once the previous one has run.
+  task_scheduler sched(lifecycle, {1}, *manager, sirius::test::make_test_telemetry_context());
+  sched.set_query_event_publisher(*events);
+
+  // GPU 0 pops its own bucket first, then the no-preference bucket in FIFO order; the task that
+  // prefers another device is never counted.
+  sched.schedule(std::make_unique<gated_pipeline_task>(1, global, 0, gate));
+  sched.schedule(std::make_unique<gated_pipeline_task>(2, global, std::nullopt, gate));
+  sched.schedule(std::make_unique<gated_pipeline_task>(3, global, std::nullopt, gate));
+  constexpr int kAbsentDevice = 7;
+  sched.schedule(std::make_unique<gated_pipeline_task>(4, global, kAbsentDevice, gate));
+  sched.start();
+
+  REQUIRE(gate.wait_entered(1, 10s));
+  auto first = recorder.wait_for(1, 10s);
+  REQUIRE(first.size() == 1);
+  CHECK(first[0].query == q);
+  CHECK(first[0].task_id == 1);
+  CHECK(first[0].pipeline_id == 9);
+  CHECK(first[0].gpu == 0);
+  CHECK(first[0].tasks_left == 2);
+
+  gate.release();
+  REQUIRE(gate.wait_entered(3, 10s));
+  auto const all = recorder.wait_for(3, 10s);
+  REQUIRE(all.size() == 3);
+  CHECK(all[1].task_id == 2);
+  CHECK(all[1].tasks_left == 1);
+  CHECK(all[2].task_id == 3);
+  CHECK(all[2].tasks_left == 0);
+  for (auto const& e : all) {
+    CHECK(e.query == q);
+    CHECK(e.pipeline_id == 9);
+    CHECK(e.gpu == 0);
+  }
+  // Only the task GPU 0 cannot take is left.
+  CHECK(sched.get_pipeline_task_queue()->size() == 1);
+  sched.stop();
 }

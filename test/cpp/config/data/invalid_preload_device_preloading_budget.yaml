@@ -1,0 +1,7 @@
+# A key of the first preload executor, renamed device_budget.
+sirius:
+  topology:
+    num_gpus: 1
+  executor:
+    preload:
+      device_preloading_budget: 0.2
