@@ -42,7 +42,7 @@ jobs:
           - version: "12"
             pixi-environment: cuda12
             runner: ubuntu-22.04
-            run-on-pr: true
+            run-on-pr: false
         exclude:
           # On PRs, drop non-PR CUDA variants; otherwise, run the full matrix.
           - cuda:
@@ -163,7 +163,7 @@ jobs:
           - version: "12"
             pixi-environment: cuda12
             runner: ubuntu-22.04
-            run-on-pr: true
+            run-on-pr: false
         exclude:
           # On PRs, drop non-PR CUDA variants; otherwise, run the full matrix.
           - cuda:
