@@ -137,32 +137,6 @@ bool key_needs_collation(duckdb::ClientContext& context,
   return duckdb::ExpressionBinder::PushCollation(context, key, type);
 }
 
-//! The types an ALL plan carries: per column, the type both planned inputs share, or the narrowed
-//! type when one input plans the declared type and the other `planned_aggregate_type` of it.
-duckdb::vector<sirius::logical_type> reconcile_input_types(
-  std::array<duckdb::unique_ptr<sirius::op::sirius_physical_operator>, 2> const& arms,
-  duckdb::vector<duckdb::LogicalType> const& declared_types,
-  std::string const& name)
-{
-  auto const planned_types = [&](duckdb::idx_t arm) -> auto const& {
-    return arms[arm]->get_output_types();
-  };
-  for (duckdb::idx_t arm = 0; arm < arms.size(); ++arm) {
-    sirius_physical_plan_generator::require_planned_schema(
-      planned_types(arm), declared_types, name + " input " + std::to_string(arm));
-  }
-  duckdb::vector<sirius::logical_type> key_types;
-  for (duckdb::idx_t i = 0; i < declared_types.size(); ++i) {
-    // Inputs that differ here differ only by that narrowing, which keeps the physical type.
-    key_types.push_back(
-      planned_types(0)[i] == planned_types(1)[i]
-        ? planned_types(0)[i]
-        : sirius::from_duckdb(
-            sirius_physical_plan_generator::planned_aggregate_type(declared_types[i])));
-  }
-  return key_types;
-}
-
 //! The query's `operator_params`, including session overrides.
 sirius::operator_params current_operator_params(duckdb::ClientContext& context)
 {
@@ -385,7 +359,11 @@ sirius_physical_plan_generator::plan_except_intersect(duckdb::LogicalSetOperatio
   auto const op_params = current_operator_params(context);
   std::array arms{create_plan(*op.children[0]), create_plan(*op.children[1])};
   // The ALL plan is typed from these, so each arm must actually produce them.
-  auto const key_types = reconcile_input_types(arms, op.types, name);
+  for (duckdb::idx_t arm = 0; arm < arms.size(); ++arm) {
+    require_planned_schema(
+      arms[arm]->get_output_types(), op.types, name + " input " + std::to_string(arm));
+  }
+  auto const key_types = sirius::from_duckdb_vec(op.types);
   // concat_batch_bytes = 0 leaves batches whole, as in CONCAT: no byte cap, only the row cap.
   auto const max_bytes = op_params.concat_batch_bytes == 0 ? std::numeric_limits<std::size_t>::max()
                                                            : op_params.concat_batch_bytes;

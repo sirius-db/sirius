@@ -19,6 +19,7 @@
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
+#include <cudf/types.hpp>
 #include <cudf/utilities/traits.hpp>
 
 #include <rmm/device_buffer.hpp>
@@ -509,6 +510,38 @@ bound_fused_region bind_fused_region(PlanTree const& tree,
 
 bool uses_index_walk(PlanTree const& tree, decode_selection const& sel);
 
+/// The element type to store when a column decoded as @p decoded may be written directly as
+/// @p target, or nullptr when it may not. Allowed: a strictly wider signed integer, a DECIMAL of
+/// the same scale and greater width, or a wider DECIMAL or TIMESTAMP_DAYS from a narrower raw
+/// signed integer (the decode's representation of a stored DECIMAL or narrowed DATE; the caller
+/// checks the stored type's scale, see decompress_scan_filter). Each is a lossless sign-extending
+/// widening, so the stored value keeps its meaning.
+char const* widened_element_dtype(cudf::data_type decoded, cudf::data_type target)
+{
+  auto const is_signed_int = [](cudf::type_id id) {
+    return id == cudf::type_id::INT8 || id == cudf::type_id::INT16 || id == cudf::type_id::INT32 ||
+           id == cudf::type_id::INT64;
+  };
+  auto const is_decimal = [](cudf::type_id id) {
+    return id == cudf::type_id::DECIMAL32 || id == cudf::type_id::DECIMAL64;
+  };
+  if (!cudf::is_fixed_width(decoded) || !cudf::is_fixed_width(target) ||
+      cudf::size_of(target) <= cudf::size_of(decoded)) {
+    return nullptr;
+  }
+  bool const same_family =
+    (is_signed_int(decoded.id()) && is_signed_int(target.id())) ||
+    (is_decimal(decoded.id()) && is_decimal(target.id()) && decoded.scale() == target.scale()) ||
+    (is_signed_int(decoded.id()) &&
+     (is_decimal(target.id()) || target.id() == cudf::type_id::TIMESTAMP_DAYS));
+  if (!same_family) { return nullptr; }
+  switch (cudf::size_of(target)) {
+    case 4: return "int32_t";
+    case 8: return "int64_t";
+    default: return nullptr;
+  }
+}
+
 // Bind one region, allocate its output, and queue the decode launch.
 std::unique_ptr<cudf::column> decode_fused_subtree_impl(PlanTree const& tree,
                                                         NodeId root_nid,
@@ -523,8 +556,16 @@ std::unique_ptr<cudf::column> decode_fused_subtree_impl(PlanTree const& tree,
     throw std::runtime_error("decode selection exceeds the column row count");
   }
   auto const out_rows = masked ? static_cast<cudf::size_type>(sel->survivor_count) : num_rows;
-  auto output         = cudf::make_fixed_width_column(
-    region.root_type, out_rows, cudf::mask_state::UNALLOCATED, frame.stream(), frame.mr());
+  // A bitpack-rooted compacted decode can store each value directly in the wider type the caller
+  // will restore the column to, which saves a separate widening pass over the column.
+  char const* const out_dtype    = masked && root_nid < tree.nodes.size() &&
+                                    tree.nodes[root_nid].op == "bitpack" &&
+                                    sel->output_type.has_value()
+                                     ? widened_element_dtype(region.root_type, *sel->output_type)
+                                     : nullptr;
+  cudf::data_type const out_type = out_dtype != nullptr ? *sel->output_type : region.root_type;
+  auto output                    = cudf::make_fixed_width_column(
+    out_type, out_rows, cudf::mask_state::UNALLOCATED, frame.stream(), frame.mr());
   if (out_rows == 0) return output;
   auto const& built   = region.built;
   auto const& labeled = region.labeled;
@@ -548,7 +589,8 @@ std::unique_ptr<cudf::column> decode_fused_subtree_impl(PlanTree const& tree,
                                        hollow,
                                        row_enumeration{nullptr, sel->rows},
                                        out,
-                                       frame);
+                                       frame,
+                                       out_dtype);
     return output;
   }
   bool const by_index = uses_index_walk(tree, *sel);
@@ -560,7 +602,8 @@ std::unique_ptr<cudf::column> decode_fused_subtree_impl(PlanTree const& tree,
     *sel->mask,
     row_enumeration{by_index ? sel->survivor_indices.data<std::int32_t>() : nullptr, nullptr},
     out,
-    frame);
+    frame,
+    out_dtype);
   return output;
 }
 

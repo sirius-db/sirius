@@ -62,7 +62,7 @@ std::optional<cudf::aggregation::Kind> to_cudf_aggregation_kind(sirius::aggregat
 /// when every input fits, so the GPU must not accumulate it in INT64 unchecked. `sum_no_overflow`
 /// is excluded: DuckDB's statistics propagation already proved that the total fits in INT64.
 /// Narrower inputs (TINYINT, SMALLINT, BOOLEAN) are excluded because DuckDB itself sums them in
-/// INT64. On the GPU a HUGEINT input is carried as INT64, like the BIGINT result of such a SUM.
+/// INT64. On the GPU HUGEINT is carried as INT64, both as an input and as the result of such a SUM.
 bool is_wide_integer_sum(sirius::aggregate_id id, sirius::logical_type const& input_type);
 
 /// The type a SUM over a column of type @p type is computed in when it must not overflow the

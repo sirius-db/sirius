@@ -285,9 +285,18 @@ TEST_CASE("ungrouped merge gives equivalent SQL results for zero batches and zer
     auto partial = local.execute(pipelineable_operator_data({input}), default_stream());
     auto batch   = only_batch(*partial);
     auto view    = sirius::get_cudf_table_view(*batch);
+    // FIRST occupies a value column and an input-row-count column. AVG's
+    // sum/count and the later aggregate states follow both FIRST columns.
+    constexpr cudf::size_type first_row_count = 7;
+    constexpr cudf::size_type avg_sum         = 8;
+    constexpr cudf::size_type stddev_state    = 11;
+    REQUIRE(view.num_columns() == 12);
     CHECK(view.column(3).type() == cudf::data_type{cudf::type_id::DECIMAL128, 0});
-    CHECK(view.column(7).type() == cudf::data_type{cudf::type_id::DECIMAL128, 0});
-    CHECK(view.column(10).type() == cudf::data_type{cudf::type_id::STRUCT});
+    REQUIRE(view.column(first_row_count).type() == cudf::data_type{cudf::type_id::INT64});
+    CHECK(view.column(first_row_count).null_count() == 0);
+    CHECK(copy_column_to_host<int64_t>(view.column(first_row_count)) == std::vector<int64_t>{0});
+    CHECK(view.column(avg_sum).type() == cudf::data_type{cudf::type_id::DECIMAL128, 0});
+    CHECK(view.column(stddev_state).type() == cudf::data_type{cudf::type_id::STRUCT});
     fixture.merge.push_data_batch("default", std::move(batch));
   }
   fixture.close_input();

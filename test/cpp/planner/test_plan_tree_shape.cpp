@@ -1340,7 +1340,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     auto const decimal128 = cudf::data_type{cudf::type_id::DECIMAL128, 0};
     for (auto const* op : {local, partition}) {
       REQUIRE(op->get_types().size() == 2);
-      CHECK(op->get_types()[1].id() == sirius::type_id::BIGINT);
+      CHECK(op->get_types()[1].id() == sirius::type_id::HUGEINT);
       CHECK(op->is_alternate_physical_type(1, decimal128));
       CHECK_FALSE(op->is_alternate_physical_type(1, int64));
       CHECK_FALSE(op->is_alternate_physical_type(0, decimal128));
@@ -1487,16 +1487,15 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     CHECK(projections[0]->children[0]->type == SiriusPhysicalOperatorType::MERGE_GROUP_BY);
   }
 
-  SECTION("DISTINCT over an aggregate planned narrower than declared takes the child's types")
+  SECTION("DISTINCT over an aggregate keeps sum()'s HUGEINT")
   {
-    // The DISTINCT node declares sum()'s HUGEINT; the aggregate below is planned as BIGINT.
     auto plan =
       generate_sirius_plan(*con, "SELECT DISTINCT val, sum(id) FROM big_left GROUP BY val");
     INFO(tree_to_string(plan.get()));
 
     duckdb::vector<sirius::logical_type> const planned{
       sirius::logical_type::make(sirius::type_id::INTEGER),
-      sirius::logical_type::make(sirius::type_id::BIGINT)};
+      sirius::logical_type::make(sirius::type_id::HUGEINT)};
     auto* aggregate = require_distinct_wrap_chain(plan.get());
     CHECK(aggregate->get_types() == planned);
     CHECK(aggregate->group_idx == std::vector<int>{0, 1});
@@ -1504,7 +1503,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
           planned);
   }
 
-  SECTION("DISTINCT ON reordering over a narrowed aggregate types the projection from the child")
+  SECTION("DISTINCT ON reordering over an aggregate types the projection from the child")
   {
     auto plan = generate_sirius_plan(
       *con,
@@ -1520,7 +1519,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     CHECK(plan->children[0]->type == SiriusPhysicalOperatorType::MERGE_GROUP_BY);
     CHECK(plan->get_types() == duckdb::vector<sirius::logical_type>{
                                  sirius::logical_type::make(sirius::type_id::INTEGER),
-                                 sirius::logical_type::make(sirius::type_id::BIGINT)});
+                                 sirius::logical_type::make(sirius::type_id::HUGEINT)});
   }
 
   SECTION("DISTINCT over nested materialized CTEs checks the body's schema")
@@ -1844,18 +1843,7 @@ TEST_CASE("set_parent_ops accepts a GPU scan without an ingestible",
   CHECK(scan.get_parent_op() == nullptr);
 }
 
-TEST_CASE("planned_aggregate_type narrows HUGEINT only", "[plan_tree_shape]")
-{
-  using generator = sirius::planner::sirius_physical_plan_generator;
-  CHECK(generator::planned_aggregate_type(LogicalType::HUGEINT) == LogicalType::BIGINT);
-  CHECK(generator::planned_aggregate_type(LogicalType::INTEGER) == LogicalType::INTEGER);
-  CHECK(generator::planned_aggregate_type(LogicalType::UHUGEINT) == LogicalType::UHUGEINT);
-  CHECK(generator::planned_aggregate_type(LogicalType::DECIMAL(38, 0)) ==
-        LogicalType::DECIMAL(38, 0));
-}
-
-TEST_CASE("require_planned_schema accepts the declared type or its aggregate narrowing",
-          "[plan_tree_shape]")
+TEST_CASE("require_planned_schema accepts only the declared type", "[plan_tree_shape]")
 {
   using generator    = sirius::planner::sirius_physical_plan_generator;
   auto const bigint  = sirius::from_duckdb(LogicalType::BIGINT);
@@ -1865,7 +1853,7 @@ TEST_CASE("require_planned_schema accepts the declared type or its aggregate nar
     generator::require_planned_schema(std::span{&planned, 1}, {declared}, "probe");
   };
   CHECK_NOTHROW(require(hugeint, LogicalType::HUGEINT));
-  CHECK_NOTHROW(require(bigint, LogicalType::HUGEINT));
+  CHECK_THROWS_AS(require(bigint, LogicalType::HUGEINT), duckdb::NotImplementedException);
   CHECK_NOTHROW(require(bigint, LogicalType::BIGINT));
   CHECK_THROWS_WITH(require(hugeint, LogicalType::BIGINT),
                     Catch::Matchers::ContainsSubstring("probe: the planned input has"));
@@ -2338,7 +2326,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "rejected",
                  "[plan_tree_shape][union][isolated_context]")
 {
-  // An aggregate arm plans BIGINT under the union's declared HUGEINT; that narrowing is allowed.
+  // An aggregate arm plans the union's declared HUGEINT.
   REQUIRE_NOTHROW(generate_sirius_plan(
     *con, "SELECT sum(id) FROM big_left UNION ALL SELECT sum(rid) FROM small_right"));
 

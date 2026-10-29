@@ -366,11 +366,10 @@ TEST_CASE_METHOD(set_operation_lowering_fixture,
 }
 
 TEST_CASE_METHOD(set_operation_lowering_fixture,
-                 "set_operation - an ALL form carries an aggregate's narrowed type",
+                 "set_operation - an ALL form preserves an aggregate's HUGEINT type",
                  "[planner][set_operation][isolated_context]")
 {
-  // DuckDB types sum(INTEGER) as HUGEINT; the Sirius aggregate plans it as BIGINT.
-  auto const types = sirius::from_duckdb_vec({duckdb::LogicalType::BIGINT});
+  auto const types = sirius::from_duckdb_vec({duckdb::LogicalType::HUGEINT});
   SECTION("EXCEPT ALL")
   {
     auto const plan = lower("SELECT sum(k) FROM ia EXCEPT ALL SELECT sum(k) FROM ib");
@@ -384,17 +383,16 @@ TEST_CASE_METHOD(set_operation_lowering_fixture,
 }
 
 TEST_CASE_METHOD(set_operation_lowering_fixture,
-                 "set_operation - an ALL form with one narrowed input carries the narrowed type",
+                 "set_operation - an ALL form preserves HUGEINT across aggregate and cast inputs",
                  "[planner][set_operation][isolated_context]")
 {
-  // One input plans HUGEINT as BIGINT, the other as declared; both are INT64 on the GPU.
-  auto const types = sirius::from_duckdb_vec({duckdb::LogicalType::BIGINT});
-  SECTION("narrowed input first")
+  auto const types = sirius::from_duckdb_vec({duckdb::LogicalType::HUGEINT});
+  SECTION("aggregate input first")
   {
     auto const plan = lower("SELECT sum(k) FROM ia INTERSECT ALL SELECT k::HUGEINT FROM ib");
     require_replicate_plan(*plan, types, {{1, 0}, {0, 1}});
   }
-  SECTION("narrowed input second")
+  SECTION("aggregate input second")
   {
     auto const plan = lower("SELECT k::HUGEINT FROM ia EXCEPT ALL SELECT sum(k) FROM ib");
     require_replicate_plan(*plan, types, {{1}, {-1}});
