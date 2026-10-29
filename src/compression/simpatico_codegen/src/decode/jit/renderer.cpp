@@ -244,7 +244,8 @@ std::string out_param_decl(Consumer c, const std::string& dtype)
 // ---------------------------------------------------------------------
 class Walker {
  public:
-  Walker(std::string root_dtype, DecodeShape shape) : dtype_(std::move(root_dtype)), shape_(shape)
+  Walker(std::string root_dtype, DecodeShape shape, std::string out_dtype = {})
+    : dtype_(std::move(root_dtype)), out_dtype_(std::move(out_dtype)), shape_(shape)
   {
   }
 
@@ -289,6 +290,7 @@ class Walker {
 
  private:
   std::string dtype_;
+  std::string out_dtype_;  // empty: `out` holds dtype_ (see render)
   DecodeShape shape_        = kShapePlain;
   static constexpr int tbs_ = ::codegen::kTBSize;
   std::ostringstream params_;
@@ -415,13 +417,14 @@ class Walker {
     DecodeKernelSpec spec;
     spec.entry_symbol = make_entry_symbol(tree, dtype_, "simpatico_decode_");
     spec.entry_symbol += shape_symbol_suffix(shape_);
+    if (!out_dtype_.empty()) { spec.entry_symbol += "_to_" + out_dtype_; }
 
     // The `out` slot's type and meaning vary by variant; everything after
     // (out, n) comes from ONE table that yields both the declaration text and
     // spec.trailing, so what the kernel declares and what the launcher pushes
     // are the same list (see TrailingParam).
     std::vector<std::string> decls;
-    decls.push_back(out_param_decl(shape_.consumer, dtype_));
+    decls.push_back(out_param_decl(shape_.consumer, out_dtype_.empty() ? dtype_ : out_dtype_));
     decls.emplace_back("int64_t n");
     for (const auto& tp : shape_trailing_params(shape_)) {
       spec.trailing.push_back(tp.tag);
@@ -1598,9 +1601,9 @@ ValueSource Walker::raw_value_source_inline(const ::codegen::jit::FusedTree& nod
 }
 
 // =====================================================================
-// zigzag_value_source_inline — closed-form inverse ZigZag for the leaf.
+// zigzag_value_source_inline — closed-form inverse ZigZag over a Raw leaf.
 //
-// Reads the stored `zigzag` channel at fixed stride (base chunk_start) and
+// Reads the stored codes through the Raw child's closed-form expression and
 // applies the inverse map inline:  n = (z >> 1) ^ -(z & 1)  computed in the
 // unsigned domain to avoid signed-shift UB.  No shared memory — callers
 // splice the expression directly (Bitpack-like).
@@ -1608,24 +1611,23 @@ ValueSource Walker::raw_value_source_inline(const ::codegen::jit::FusedTree& nod
 ValueSource Walker::zigzag_value_source_inline(const ::codegen::jit::FusedTree& node,
                                                const std::string& elem_type)
 {
-  if (!node.children.empty()) { throw RenderError("decode render: Zigzag must be a leaf"); }
+  auto const zit = node.children.find("zigzag");
+  if (node.children.size() != 1 || zit == node.children.end() ||
+      zit->second->op != ::codegen::OpKind::Raw || !zit->second->children.empty()) {
+    throw RenderError("decode render: zigzag_value_source_inline needs a Raw 'zigzag' leaf");
+  }
   const std::size_t esize = dtype_elem_size(elem_type);
   if (esize == 0) {
     throw RenderError("decode render: zigzag_value_source_inline: unsupported dtype '" + elem_type +
                       "'");
   }
-  const std::string utype  = unsigned_counterpart(esize);
-  const std::int32_t id    = id_of(node);
-  const std::string idstr  = std::to_string(id);
-  const std::string p_data = "zigzag_" + idstr;
-
-  add_param("const " + elem_type + "* __restrict__", p_data);
-  add_buffer(id, "zigzag", esize);
+  const std::string utype = unsigned_counterpart(esize);
+  ValueSource const codes = raw_value_source_inline(*zit->second, elem_type);
 
   // Stored element at this position (read once textually; compiler CSEs the
-  // duplicate load).  base == chunk_start (chunk_id*CHUNK), known at entry.
+  // duplicate load).
   const std::string load = "static_cast<" + utype + ">(static_cast<" + exact_unsigned(esize) +
-                           ">(" + p_data + "[chunk_start + (__POS__)]))";
+                           ">(" + codes.read_expr + "))";
 
   ValueSource vs;
   vs.elem_type = elem_type;
@@ -1637,94 +1639,81 @@ ValueSource Walker::zigzag_value_source_inline(const ::codegen::jit::FusedTree& 
 }
 
 // =====================================================================
-// ZigZag — DUAL-MODE producer.
+// ZigZag — producer.
 //
-// Transformer mode (a fused op produced the ZigZag codes, e.g.
-// `zigzag.zigzag -> bitpack`): reconstruct the child's values, then apply the
-// inverse map  n = (z >> 1) ^ -(z & 1)  per element.  Two paths mirror FOR:
+// Reconstruct the `zigzag` child's codes (a fused op such as
+// `zigzag.zigzag -> bitpack`, or the Raw passthrough leaf that stores them),
+// then apply the inverse map  n = (z >> 1) ^ -(z & 1)  per element.  Two
+// paths mirror FOR:
 //   * Closed-form child (Bitpack/Raw leaf): splice its value_source expr.
 //   * Producer child (Delta/Rle): materialise into a shared slab first.
 // The code value is loaded into a local once so a non-trivial child read
 // (e.g. simpatico_bp_at) is evaluated a single time per element.
-//
-// Leaf mode: reads the stored `zigzag` channel, applies the inverse map,
-// writes `len` reconstructed elements into `dst`.
 // =====================================================================
 void Walker::emit_zigzag_producer(const ::codegen::jit::FusedTree& node,
                                   const std::string& dst,
                                   const std::string& len,
                                   const std::string& elem_type)
 {
-  if (!node.children.empty()) {
-    if (node.children.size() != 1) {
-      throw RenderError(
-        "decode render: Zigzag transformer must have exactly one child "
-        "named 'zigzag' (got " +
-        std::to_string(node.children.size()) + " children)");
-    }
-    auto zit = node.children.find("zigzag");
-    if (zit == node.children.end()) {
-      throw RenderError("decode render: Zigzag missing 'zigzag' child (got '" +
-                        node.children.begin()->first + "' instead)");
-    }
-    const std::size_t esize = dtype_elem_size(elem_type);
-    if (esize == 0) {
-      throw RenderError("decode render: Zigzag op-local dtype '" + elem_type + "' not supported");
-    }
-    const std::string utype = unsigned_counterpart(esize);
-    const std::int32_t id   = id_of(node);
-    const std::string idstr = std::to_string(id);
-
-    const bool child_is_leaf =
-      (zit->second->op == ::codegen::OpKind::Bitpack && zit->second->children.empty()) ||
-      (zit->second->op == ::codegen::OpKind::Raw && zit->second->children.empty());
-
-    body_ << "    // --- node " << id << ": Zigzag (reverse inline, " << elem_type << ") ---\n";
-
-    // Emit the per-element inverse, given a textual code-value expression
-    // `code_expr` (already position-substituted).
-    auto emit_inverse_loop = [&](const std::string& code_expr) {
-      // The exact-width unsigned inner cast prevents sign-extension garbage
-      // above the element's width in the shift below (matters for int8_t).
-      body_ << "    for (int32_t i = tid; i < static_cast<int32_t>(" << len << "); i += " << tbs_
-            << ") {\n"
-            << "        const " << utype << " _zc = static_cast<" << utype << ">(static_cast<"
-            << exact_unsigned(esize) << ">(" << code_expr << "));\n"
-            << "        (" << dst << ")[i] = static_cast<" << elem_type
-            << ">((_zc >> 1) ^ (static_cast<" << utype << ">(0) - (_zc & static_cast<" << utype
-            << ">(1))));\n"
-            << "    }\n"
-            << "    __syncthreads();\n";
-    };
-
-    if (child_is_leaf) {
-      const auto mark = sm_.mark();
-      ValueSource cvs = value_source(*zit->second, elem_type, len);
-      emit_inverse_loop(at_pos(cvs.read_expr, "i"));
-      sm_.release_to(mark);
-    } else {
-      const auto mark        = sm_.mark();
-      const std::string slab = "zz_slab_" + idstr;
-      const std::size_t off  = sm_.alloc(esize, ::codegen::kChunkSize);
-      body_ << "    " << elem_type << "* " << slab << " = reinterpret_cast<" << elem_type
-            << "*>(workspace + " << off << ");\n";
-      emit_producer(*zit->second, slab, len, elem_type);
-      body_ << "    __syncthreads();\n";
-      emit_inverse_loop(slab + "[i]");
-      sm_.release_to(mark);
-    }
-    return;
+  if (node.children.size() != 1) {
+    throw RenderError("decode render: Zigzag must have exactly one child named 'zigzag' (got " +
+                      std::to_string(node.children.size()) + " children)");
   }
+  auto zit = node.children.find("zigzag");
+  if (zit == node.children.end()) {
+    throw RenderError("decode render: Zigzag missing 'zigzag' child (got '" +
+                      node.children.begin()->first + "' instead)");
+  }
+  const std::size_t esize = dtype_elem_size(elem_type);
+  if (esize == 0) {
+    throw RenderError("decode render: Zigzag op-local dtype '" + elem_type + "' not supported");
+  }
+  const std::string utype = unsigned_counterpart(esize);
+  const std::int32_t id   = id_of(node);
+  const std::string idstr = std::to_string(id);
 
-  ValueSource vs = zigzag_value_source_inline(node, elem_type);
-  body_ << "    // --- node " << id_of(node) << ": Zigzag producer (" << elem_type << ") ---\n"
-        << "    for (int32_t i = tid; i < (" << len << "); i += " << tbs_ << ") {\n"
-        << "        (" << dst << ")[i] = " << at_pos(vs.read_expr, "i") << ";\n"
-        << "    }\n";
+  const bool child_is_leaf =
+    (zit->second->op == ::codegen::OpKind::Bitpack && zit->second->children.empty()) ||
+    (zit->second->op == ::codegen::OpKind::Raw && zit->second->children.empty());
+
+  body_ << "    // --- node " << id << ": Zigzag (reverse inline, " << elem_type << ") ---\n";
+
+  // Emit the per-element inverse, given a textual code-value expression
+  // `code_expr` (already position-substituted).
+  auto emit_inverse_loop = [&](const std::string& code_expr) {
+    // The exact-width unsigned inner cast prevents sign-extension garbage
+    // above the element's width in the shift below (matters for int8_t).
+    body_ << "    for (int32_t i = tid; i < static_cast<int32_t>(" << len << "); i += " << tbs_
+          << ") {\n"
+          << "        const " << utype << " _zc = static_cast<" << utype << ">(static_cast<"
+          << exact_unsigned(esize) << ">(" << code_expr << "));\n"
+          << "        (" << dst << ")[i] = static_cast<" << elem_type
+          << ">((_zc >> 1) ^ (static_cast<" << utype << ">(0) - (_zc & static_cast<" << utype
+          << ">(1))));\n"
+          << "    }\n"
+          << "    __syncthreads();\n";
+  };
+
+  if (child_is_leaf) {
+    const auto mark = sm_.mark();
+    ValueSource cvs = value_source(*zit->second, elem_type, len);
+    emit_inverse_loop(at_pos(cvs.read_expr, "i"));
+    sm_.release_to(mark);
+  } else {
+    const auto mark        = sm_.mark();
+    const std::string slab = "zz_slab_" + idstr;
+    const std::size_t off  = sm_.alloc(esize, ::codegen::kChunkSize);
+    body_ << "    " << elem_type << "* " << slab << " = reinterpret_cast<" << elem_type
+          << "*>(workspace + " << off << ");\n";
+    emit_producer(*zit->second, slab, len, elem_type);
+    body_ << "    __syncthreads();\n";
+    emit_inverse_loop(slab + "[i]");
+    sm_.release_to(mark);
+  }
 }
 
 // =====================================================================
-// value_source — closed-form expr (Bitpack / Raw / Zigzag leaf) or
+// value_source — closed-form expr (Bitpack / Raw / Zigzag over Raw) or
 // materialised-slab read (Delta / Rle / non-leaf).
 // =====================================================================
 ValueSource Walker::value_source(const ::codegen::jit::FusedTree& node,
@@ -1738,8 +1727,11 @@ ValueSource Walker::value_source(const ::codegen::jit::FusedTree& node,
   if (node.op == ::codegen::OpKind::Raw && node.children.empty()) {
     return raw_value_source_inline(node, elem_type);
   }
-  if (node.op == ::codegen::OpKind::Zigzag && node.children.empty()) {
-    return zigzag_value_source_inline(node, elem_type);
+  if (node.op == ::codegen::OpKind::Zigzag && node.children.size() == 1) {
+    auto const& child = *node.children.begin()->second;
+    if (child.op == ::codegen::OpKind::Raw && child.children.empty()) {
+      return zigzag_value_source_inline(node, elem_type);
+    }
   }
 
   // Delta / Rle / non-leaf: materialise the subtree into a fresh shared slab,
@@ -1850,8 +1842,14 @@ extern "C" __global__ void simpatico_masked_char_copy(
 DecodeKernelSpec render(const ::codegen::jit::FusedTree& tree,
                         const std::string& element_dtype,
                         std::int32_t num_chunks,
-                        DecodeShape shape)
+                        DecodeShape shape,
+                        const std::string& out_dtype)
 {
+  if (!out_dtype.empty() && (shape.consumer != Consumer::write_column ||
+                             dtype_elem_size(out_dtype) <= dtype_elem_size(element_dtype))) {
+    throw RenderError("decode render: out_dtype '" + out_dtype +
+                      "' must be a wider element type for a write_column consumer");
+  }
   if (element_dtype.empty()) {
     throw std::invalid_argument("decode render: element_dtype is empty");
   }
@@ -1863,7 +1861,7 @@ DecodeKernelSpec render(const ::codegen::jit::FusedTree& tree,
     throw RenderError("decode render: unsupported element_dtype '" + element_dtype +
                       "'. Supported: int32_t, int64_t");
   }
-  Walker w(element_dtype, shape);
+  Walker w(element_dtype, shape, out_dtype);
   return w.build(tree);
 }
 

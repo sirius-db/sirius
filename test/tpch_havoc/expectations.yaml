@@ -25,21 +25,6 @@ expectations:
               Q10_V09, Q11_V09, Q12_V09, Q13_V09, Q14_V09, Q15_V09, Q18_V09]
 
   - outcome: plan_rejected
-    reason: Cross product not supported in GPU
-    issue: 2287
-    queries: [Q04_V01, Q12_V01, Q13_V01, Q13_V08, Q16_V01]
-
-  - outcome: plan_rejected
-    reason: Join type SINGLE not supported in GPU
-    issue: 2288
-    queries: [Q02_V02, Q02_V10, Q08_V01]
-
-  - outcome: plan_rejected
-    reason: Any join not supported
-    issue: 2289
-    queries: [Q15_V10]
-
-  - outcome: plan_rejected
     reason: "Unsupported expression in aggregate .*: list\\("
     issue: 2290
     queries: [Q01_V07]

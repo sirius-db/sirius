@@ -229,6 +229,8 @@ struct physical_check_counters {
   // true = before footer processing, false = after successful cuDF decode.
   std::function<void(std::string const&, bool)> parquet_phase_for_testing;
   std::function<void(std::string const&, bool)> parquet_metadata_for_testing;
+  // Per decoded batch, before any residual filter: reader filter present, output rows.
+  std::function<void(bool, uint64_t)> parquet_filter_for_testing;
   std::function<void()> after_certify_for_testing;
   std::function<void(std::string const&, bool)> iceberg_dv_phase_for_testing;
   std::function<void(scan_contract_id, bool)> iceberg_preparation_route_for_testing;
@@ -259,11 +261,26 @@ struct physical_check_counters {
     std::lock_guard lock(units_mutex);
     ++publications_by_query[query_token].readahead_registrations[file];
   }
-  void prefetcher_conversions(uint64_t query_token, uint64_t count)
+  void prefetcher_conversions(uint64_t query_token, uint64_t count) noexcept
   {
     if (!track_units || count == 0) return;
-    std::lock_guard lock(units_mutex);
-    publications_by_query[query_token].prefetcher_conversions += count;
+    try {
+      std::lock_guard lock(units_mutex);
+      publications_by_query[query_token].prefetcher_conversions += count;
+    } catch (...) {  // Observation must not interrupt resource retirement.
+    }
+  }
+  void preparation_finished(uint64_t query_token, scan_publication_observation observation) noexcept
+  {
+    if (!track_units) return;
+    try {
+      std::lock_guard lock(units_mutex);
+      auto& stored = publications_by_query[query_token];
+      observation.readahead_registrations.swap(stored.readahead_registrations);
+      observation.prefetcher_conversions = stored.prefetcher_conversions;
+      stored                             = std::move(observation);
+    } catch (...) {  // Observation must not interrupt resource retirement.
+    }
   }
   void reader_call(std::string const& file)
   {

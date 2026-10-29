@@ -263,6 +263,7 @@ TEST_CASE("blocking prepare waits for earlier asynchronous eviction before retry
 TEST_CASE("failed nonblocking preparation starts eviction without waiting",
           "[cache][eviction][explicit][prepare]")
 {
+  auto cancel_failed        = GENERATE(false, true);
   constexpr std::size_t mib = 1ull << 20;
   temp_data_file file(1ull << 30);
   auto memory   = constrained_memory_manager();
@@ -297,6 +298,12 @@ TEST_CASE("failed nonblocking preparation starts eviction without waiting",
     auto const before = cache->claimed_bytes();
     if (filler->prepare_prefetch(false) == sirius::io::prepare_result::allocation_failed) {
       exhausted = true;
+      if (cancel_failed) {
+        filler->update(sirius::io::cache::scan_stage::disposed);
+        filler->update(sirius::io::cache::scan_stage::disposed);
+        CHECK(filler->prepare_prefetch(false) == sirius::io::prepare_result::fallen_behind);
+        filler.reset();
+      }
       // No explicit evict() or blocking prepare(true): the failed attempt
       // itself must have woken the evictor.
       CHECK(claimed_drops_below(*cache, before, std::chrono::milliseconds(2000)));
@@ -305,6 +312,11 @@ TEST_CASE("failed nonblocking preparation starts eviction without waiting",
     fillers.push_back(std::move(filler));
   }
   REQUIRE(exhausted);
+  fillers.clear();
+  cache->evict_sync(1ull << 30);
+  CHECK(cache->claimed_bytes() == 0);
+  cache->evict_sync(1ull << 30);
+  CHECK(cache->claimed_bytes() == 0);
 }
 
 TEST_CASE("prepare does not publish a request the retry's eviction left short of buffers",

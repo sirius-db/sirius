@@ -20,9 +20,11 @@
 #include "op/scan/iceberg_delete_set.hpp"
 #include "op/scan/iceberg_dv_preparation.hpp"
 #include "op/scan/iceberg_gpu_ingestible.hpp"
+#include "scan_manager/preparation_fixture.hpp"
 #include "scan_manager/preparation_ledger.hpp"
 #include "scan_manager/preparation_test_support.hpp"
 #include "scan_manager/split_provider.hpp"
+#include "transparent/read_view_registry.hpp"
 
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
@@ -40,17 +42,21 @@ using namespace sirius::scan_manager;
 using sirius::scan_manager::test::test_reservation_provider;
 namespace {
 auto const host = memory_space_id(cucascade::memory::Tier::HOST, 0);
-std::array<scan_envelope, 1> sample() { return {scan_envelope{{{8, 8, 16, 20}}, 0, 0, true}}; }
+std::array<scan_envelope, 1> sample() { return {scan_envelope{{{{8, 8, 16}, 20}}, {}, true}}; }
 
 struct dv_precondition_fixture {
   test_reservation_provider provider;
   std::vector<std::string> paths{"a.parquet"};
+  std::shared_ptr<sirius::transparent::read_view_registry> read_views;
   std::shared_ptr<sirius::op::scan::iceberg_dv_preparation> prepared;
   std::shared_ptr<preparation_admission> admission;
 
-  dv_precondition_fixture()
+  explicit dv_precondition_fixture(size_t file_count = 1)
+    : read_views(std::make_shared<sirius::transparent::read_view_registry>())
   {
     using namespace sirius::op::scan;
+    for (size_t i = 1; i < file_count; ++i)
+      paths.push_back(std::to_string(i) + ".parquet");
     provider.grant_bytes = 64 * 1024;
     auto discovery       = std::make_shared<iceberg_delete_discovery>();
     IcebergDeleteFileEntry dv;
@@ -60,13 +66,22 @@ struct dv_precondition_fixture {
     dv.content_size_in_bytes = 44;
     dv.record_count          = 2;
     dv.file_size_in_bytes    = 400;
-    dv.referenced_data_file  = paths.front();
-    discovery->deletion_vector_entries.push_back(dv);
+    for (auto const& path : paths) {
+      dv.file_path            = path == paths.front() ? "a.puffin" : path + ".puffin";
+      dv.referenced_data_file = path;
+      discovery->deletion_vector_entries.push_back(dv);
+    }
     auto ledger   = std::make_unique<preparation_ledger>(provider);
     auto envelope = iceberg_dv_preparation::envelope(*discovery, paths);
-    auto decision = ledger->admit(std::array{envelope}, host);
+    auto decision = ledger->admit(std::array{envelope}, host, file_count);
     REQUIRE(decision.deferred);
-    prepared  = std::make_shared<iceberg_dv_preparation>(7, "table", paths, discovery, *ledger);
+    auto contract =
+      read_views->entries().empty()
+        ? allocate_scan_contract(
+            *read_views, {}, 0, 1, nullptr, {}, {}, {materializer_kind::iceberg, "iceberg.v1"})
+        : read_views->entries().front().contract.contract_id;
+    prepared =
+      std::make_shared<iceberg_dv_preparation>(contract, "table", paths, discovery, *ledger);
     admission = std::make_shared<preparation_admission>(std::move(ledger), decision);
   }
 
@@ -81,6 +96,7 @@ struct dv_precondition_fixture {
     using namespace sirius::op::scan;
     auto bind                    = std::make_unique<iceberg_ingestible_table_info>();
     bind->contract_id            = prepared->contract();
+    bind->read_views             = read_views;
     bind->resolved_file_paths    = paths;
     bind->names                  = {"value"};
     bind->returned_types         = {sirius::logical_type::make(sirius::type_id::INTEGER)};
@@ -120,7 +136,7 @@ class contract_ingestible : public sirius::op::scan::gpu_ingestible {
   bool has_processed_all_metadata() const override { return false; }
   metadata_scan_task_t next_split_provider(sirius::io::ioctx_resolver) override
   {
-    return [](std::stop_token) { return std::make_unique<sirius::op::scan::scan_info>(); };
+    return [](preparation_stop_token) { return std::make_unique<sirius::op::scan::scan_info>(); };
   }
   sirius::op::scan::filtered_table materialize_metadata_to_table(
     sirius::op::scan::scan_info const&,
@@ -159,19 +175,15 @@ class contract_ingestible : public sirius::op::scan::gpu_ingestible {
   {
     attached = std::move(ledger);
   }
-  preparation_claim claim_preparation(sirius::io::ioctx_resolver) override
+  metadata_claim try_claim_split(sirius::io::ioctx_resolver) override
   {
     ++claim_calls;
-    auto work = [](std::stop_token) { return std::make_unique<sirius::op::scan::scan_info>(); };
-    return {work,
-            [this, work](std::stop_token stop) mutable {
-              custom_stop_seen = true;
-              if (stop.stop_requested())
-                throw std::system_error(std::make_error_code(std::errc::operation_canceled));
-              return work(stop);
-            },
-            {},
-            {}};
+    return metadata_job{[this](preparation_stop_token stop) {
+      custom_stop_seen = true;
+      if (stop.stop_requested())
+        throw std::system_error(std::make_error_code(std::errc::operation_canceled));
+      return std::make_unique<sirius::op::scan::scan_info>();
+    }};
   }
   void stop_preparation() noexcept override { ++stop_calls; }
   void finish_preparation() noexcept override { ++finish_calls; }
@@ -232,13 +244,14 @@ TEST_CASE("Non-Iceberg adapter consumes the shared preparation capability contra
   adapter.attach_preparation_ledger(std::shared_ptr<preparation_ledger>(std::move(consumed)));
   CHECK(adapter.attached);
 
-  auto claim = adapter.claim_preparation({});
-  REQUIRE(claim.work);
-  REQUIRE(claim.stop_work);
+  auto claim = adapter.try_claim_split({});
+  REQUIRE(std::holds_alternative<preparation_job>(claim));
   std::stop_source source;
   source.request_stop();
-  CHECK_THROWS_AS(claim.stop_work(source.get_token()), std::system_error);
-  CHECK(claim.stop_work({}));
+  CHECK_THROWS_AS(std::get<preparation_job>(claim).run(preparation_stop_token{source.get_token()}),
+                  std::system_error);
+  claim = adapter.try_claim_split({});
+  CHECK(std::get<preparation_job>(claim).run({}));
 
   adapter.stop_preparation();
   adapter.finish_preparation();
@@ -256,19 +269,22 @@ TEST_CASE("Preparation claim uses the adapter capability without an admission",
   contract_ingestible adapter;
   sirius::scan_manager::split_provider provider(adapter, {});
 
-  auto claim = provider.claim_preparation();
-  REQUIRE(claim.work);
-  REQUIRE(claim.stop_work);
+  auto sources = provider.make_preparation_sources();
+  REQUIRE(sources.size() == 1);
+  auto claim = sources.front().try_claim();
+  REQUIRE(std::holds_alternative<preparation_job>(claim));
   CHECK(adapter.claim_calls == 1);
 
   std::stop_source source;
   source.request_stop();
-  CHECK_THROWS_AS(claim.stop_work(source.get_token()), std::system_error);
+  CHECK_THROWS_AS(std::get<preparation_job>(claim).run(preparation_stop_token{source.get_token()}),
+                  std::system_error);
   CHECK(adapter.custom_stop_seen);
 }
 TEST_CASE("Ordinary split provider cancellation drains queued and running metadata",
           "[scan_preparation][split_provider][cancellation]")
 {
+  using namespace sirius::test::preparation;
   class cancellable_ingestible final : public contract_ingestible {
    public:
     metadata_scan_task_t work;
@@ -276,70 +292,50 @@ TEST_CASE("Ordinary split provider cancellation drains queued and running metada
     bool has_processed_all_metadata() const override { return claimed; }
     metadata_scan_task_t next_split_provider(sirius::io::ioctx_resolver) override
     {
-      claimed = true;
+      if (std::exchange(claimed, true)) return {};
       return std::move(work);
     }
+    metadata_claim try_claim_split(sirius::io::ioctx_resolver resolve) override
+    {
+      return gpu_ingestible::try_claim_split(std::move(resolve));
+    }
   } adapter;
-  bool queued = false;
-  SECTION("queued task is discarded before any IO") { queued = true; }
-  SECTION("running IO receives stop before opening the datasource") {}
-
-  std::promise<void> entered, release;
-  auto entered_future = entered.get_future();
-  auto released       = release.get_future().share();
-  unsigned work_calls = 0, datasource_opens = 0, completions = 0, results = 0;
-  std::exception_ptr error;
-  split_connector connector;
-  adapter.work = [&](std::stop_token stop) -> std::unique_ptr<sirius::op::scan::scan_info> {
+  auto queued = GENERATE(false, true);
+  fixture f(1, 1);
+  auto blocked = f.make_hold();
+  auto out     = std::make_shared<sink>();
+  std::promise<void> submitted;
+  auto accepted       = submitted.get_future();
+  unsigned work_calls = 0, datasource_opens = 0;
+  adapter.work = [&](preparation_stop_token stop) -> std::unique_ptr<sirius::op::scan::scan_info> {
     ++work_calls;
-    entered.set_value();
-    released.wait();
+    blocked->wait();
     if (stop.stop_requested())
       throw std::system_error(std::make_error_code(std::errc::operation_canceled));
     ++datasource_opens;
-    return std::make_unique<sirius::op::scan::scan_info>();
+    return std::make_unique<tagged>(0);
   };
-  sirius::exec::static_thread_pool pool(1);
-  sirius::exec::scoped_dispatcher dispatcher(pool, 1);
   split_provider provider(adapter, {});
-  if (queued) {
-    dispatcher.enqueue([&] {
-      entered.set_value();
-      released.wait();
-    });
-  }
-  provider.run(dispatcher, [&](split_provider::value_type&& item) {
-    if (item.is_empty()) {
-      ++completions;
-      connector.close();
-    } else if (item.has_exception()) {
-      error = item.exception();
-      connector.close(error);
-    } else {
-      ++results;
-    }
-  });
-  auto status = entered_future.wait_for(std::chrono::seconds(5));
-  dispatcher.request_stop();
-  release.set_value();
-  dispatcher.wait_for_all();
-  CHECK(status == std::future_status::ready);
+  auto sources = provider.make_preparation_sources();
+  REQUIRE(sources.size() == 1);
+  auto source        = make_source(preparation_execution_domain::metadata_worker);
+  source.try_claim   = std::move(sources.front().try_claim);
+  source.close       = std::move(sources.front().close);
+  source.bind_wakeup = std::move(sources.front().bind_wakeup);
+  f.register_source(std::move(source), out);
+  auto guard = f.shutdown_guard();
+  if (queued) f.dispatcher.enqueue([&] { blocked->wait(); });
+  f.coordinator.before_submission_for_testing([&] { submitted.set_value(); });
+  f.start();
+  REQUIRE(accepted.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+  REQUIRE(blocked->await());
+  f.coordinator.request_stop(stop_reason::normal_eos);
+  blocked->release();
+  f.finish();
   CHECK(work_calls == (queued ? 0 : 1));
   CHECK(datasource_opens == 0);
-  CHECK(results == 0);
-  CHECK(completions == 1);
-  if (queued) {
-    CHECK_FALSE(error);
-    CHECK_FALSE(connector.get_next_split());
-  } else {
-    REQUIRE(error);
-    try {
-      std::rethrow_exception(error);
-    } catch (std::system_error const& e) {
-      CHECK(e.code() == std::make_error_code(std::errc::operation_canceled));
-    }
-    CHECK_THROWS_AS(connector.get_next_split(), std::system_error);
-  }
+  CHECK(out->count() == 0);
+  CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
 }
 
 TEST_CASE("Admission sums retained results across scans and accounts for allocation granularity",
@@ -375,7 +371,7 @@ TEST_CASE("Unqualified bounds and overflow route to legacy before any request",
   preparation_ledger ledger(provider);
   auto s = sample();
   SECTION("missing proof") { s[0].qualified = false; }
-  SECTION("overflow") { s[0].units[0].blob = std::numeric_limits<uint64_t>::max(); }
+  SECTION("overflow") { s[0].units[0].temporary[0] = std::numeric_limits<uint64_t>::max(); }
   CHECK_FALSE(ledger.admit(s, host).deferred);
   CHECK(provider.seen->requests == 0);
 }
@@ -405,7 +401,7 @@ TEST_CASE("Parallel DV admission backs off without losing the one-permit route",
   } provider(capacity, mode);
   {
     preparation_ledger ledger(provider);
-    std::array scans{scan_envelope{std::vector<unit_envelope>(4, {8, 8, 16, 20}), 0, 0, true}};
+    std::array scans{scan_envelope{std::vector<unit_envelope>(4, {{8, 8, 16}, 20}), {}, true}};
     auto d = ledger.admit(scans, host, 4);
     CHECK(d.sigma_retained == 80);
     CHECK(d.w == 32);
@@ -449,7 +445,7 @@ TEST_CASE("DV permits are capped by work and configured concurrency even with an
   test_reservation_provider provider;
   provider.grant_bytes = 4096;
   preparation_ledger ledger(provider);
-  std::array scans{scan_envelope{std::vector<unit_envelope>(3, {8, 8, 16, 20}), 0, 0, true}};
+  std::array scans{scan_envelope{std::vector<unit_envelope>(3, {{8, 8, 16}, 20}), {}, true}};
   auto d = ledger.admit(scans, host, limit);
   REQUIRE(d.deferred);
   CHECK(d.n_permits == std::min(limit, 3u));
@@ -464,7 +460,7 @@ TEST_CASE("Parallel temporary capacity overflow preserves a representable single
   provider.grant_bytes = std::numeric_limits<uint64_t>::max();
   preparation_ledger ledger(provider);
   auto w = std::numeric_limits<uint64_t>::max() / 2 + 1;
-  std::array scans{scan_envelope{{{w, 0, 0, 0}, {w, 0, 0, 0}}, 0, 0, true}};
+  std::array scans{scan_envelope{{{{w, 0, 0}, 0}, {{w, 0, 0}, 0}}, {}, true}};
   auto d = ledger.admit(scans, host, 2);
   REQUIRE(d.deferred);
   CHECK(d.c_requested == w);
@@ -475,7 +471,7 @@ TEST_CASE("Scans without DV work need no temporary-memory permits", "[scan_prepa
 {
   test_reservation_provider provider;
   preparation_ledger ledger(provider);
-  std::array scans{scan_envelope{{}, 0, 0, true}};
+  std::array scans{scan_envelope{{}, {}, true}};
   auto d = ledger.admit(scans, host);
   CHECK(d.deferred);
   CHECK(d.w == 0);
@@ -564,19 +560,23 @@ TEST_CASE("Results keep backing after plan and attempt owners finish", "[scan_pr
   CHECK(provider.outstanding() == 0);
   CHECK(provider.seen->allocated_bytes == 0);
 }
-TEST_CASE("An unexecuted plan releases its grant and cannot be reused after finish",
+TEST_CASE("Unexecuted admission releases its grant on finish or destruction",
           "[scan_preparation][ledger]")
 {
+  bool explicit_finish = GENERATE(false, true);
   test_reservation_provider provider;
   {
     auto ledger = std::make_unique<preparation_ledger>(provider);
     auto d      = ledger->admit(sample(), host);
+    REQUIRE(d.deferred);
     preparation_admission owner(std::move(ledger), d);
     CHECK(provider.outstanding() == 1);
-    owner.finish();
-    owner.finish();
-    CHECK(provider.outstanding() == 0);
-    CHECK_THROWS_AS(owner.consume(), std::logic_error);
+    if (explicit_finish) {
+      owner.finish();
+      owner.finish();
+      CHECK(provider.outstanding() == 0);
+      CHECK_THROWS_AS(owner.consume(), std::logic_error);
+    }
   }
   CHECK(provider.outstanding() == 0);
 }
@@ -601,7 +601,7 @@ TEST_CASE("Temporary-memory permits are independent and closure rejects further 
   provider.grant_bytes = 84;
   preparation_ledger ledger(provider);
   auto scans = sample();
-  scans[0].units.push_back({8, 8, 16, 0});
+  scans[0].units.push_back({{8, 8, 16}, 0});
   REQUIRE(ledger.admit(scans, host, 2).n_permits == 2);
   ledger.register_unit({1, 1}, 20);
   ledger.register_unit({1, 2}, 0);
@@ -751,7 +751,7 @@ TEST_CASE("Large blob and small final positions still require the whole temporar
   test_reservation_provider provider;
   provider.grant_bytes = 76;
   preparation_ledger ledger(provider);
-  std::array scans{scan_envelope{{{64, 4, 4, 4}}, 0, 0, true}};
+  std::array scans{scan_envelope{{{{64, 4, 4}, 4}}, {}, true}};
   auto d = ledger.admit(scans, host);
   REQUIRE(d.deferred);
   CHECK(d.sigma_retained == 4);
@@ -799,29 +799,92 @@ TEST_CASE("Retained reallocation accounts for the simultaneous old and new buffe
   CHECK(ledger.charged_bytes({1, 1}) == 8);
 }
 
-TEST_CASE("Retained positions without a preparation work bound stay on the original path",
+TEST_CASE("Statement resource requests share backing and roll back failed preparation",
+          "[scan_preparation][ledger]")
+{
+  auto failure = GENERATE(0, 1, 2);  // success, prepare failure, bind failure
+  test_reservation_provider provider;
+  provider.grant_bytes = 128;
+  provider.quantum     = 8;
+  std::array<charged_block, 2> descriptors;
+  std::array<std::shared_ptr<preparation_admission>, 2> admissions;
+  std::array<uint64_t, 2> retained{7, 17};
+  size_t rollbacks = 0;
+  std::vector<preparation_request> requests;
+  for (size_t i = 0; i != 2; ++i) {
+    requests.push_back(
+      {scan_envelope{
+         {{i == 0 ? std::vector<uint64_t>{9, 1} : std::vector<uint64_t>{3}, retained[i]}},
+         {},
+         true},
+       [&, i](preparation_ledger& ledger) {
+         auto permit = ledger.try_acquire_unit({i + 1, 1}, retained[i]);
+         if (!permit) throw std::runtime_error("missing planning permit");
+         descriptors[i] = ledger.allocator(permit).allocate_retained(retained[i]);
+         if (i == 1 && failure == 1) throw std::runtime_error("prepare failed");
+       },
+       [&, i](auto admission) {
+         admissions[i] = std::move(admission);
+         if (i == 1 && failure == 2) throw std::runtime_error("bind failed");
+       },
+       [&, i]() noexcept {
+         descriptors[i].release();
+         admissions[i].reset();
+         ++rollbacks;
+       }});
+  }
+  if (failure) {
+    REQUIRE_THROWS_WITH(prepare_statement_resources(provider, requests, host),
+                        failure == 1 ? "prepare failed" : "bind failed");
+    CHECK(rollbacks == 2);
+    CHECK(provider.outstanding() == 0);
+    CHECK(provider.seen->allocated_bytes == 0);
+  } else {
+    auto decision = prepare_statement_resources(provider, requests, host);
+    REQUIRE(decision.deferred);
+    CHECK(decision.sigma_retained == 32);
+    CHECK(decision.w == 24);
+    CHECK(decision.c_requested == 56);
+    CHECK(provider.seen->requests == 1);
+    REQUIRE(admissions[0] == admissions[1]);
+    auto ledger = admissions[0]->consume();
+    auto first  = ledger->acquire_permit({1, 1});
+    REQUIRE(first);
+    CHECK_FALSE(ledger->acquire_permit({2, 1}));
+    first.release();
+    auto second = ledger->acquire_permit({2, 1});
+    REQUIRE(second);
+    second.release();
+    ledger.reset();
+    CHECK(provider.outstanding() == 1);
+    descriptors[0].release();
+    CHECK(provider.seen->allocated_bytes == 24);
+    descriptors[1].release();
+    CHECK(provider.outstanding() == 0);
+  }
+}
+
+TEST_CASE("Retained-only preparation jobs acquire permits without temporary storage",
           "[scan_preparation][ledger]")
 {
   test_reservation_provider provider;
   preparation_ledger ledger(provider);
-  std::array scans{scan_envelope{{{0, 0, 0, 20}}, 0, 0, true}};
+  auto bytes = GENERATE(uint64_t{0}, uint64_t{20});
+  std::array scans{scan_envelope{{{{}, bytes}}, {}, true}};
   auto decision = ledger.admit(scans, host);
-  CHECK_FALSE(decision.deferred);
-  CHECK(provider.seen->requests == 0);
-}
-
-TEST_CASE("Destroying an unexecuted admission releases its reservation without explicit finish",
-          "[scan_preparation][ledger]")
-{
-  test_reservation_provider provider;
-  {
-    auto ledger   = std::make_unique<preparation_ledger>(provider);
-    auto decision = ledger->admit(sample(), host);
-    REQUIRE(decision.deferred);
-    preparation_admission plan(std::move(ledger), decision);
-    CHECK(provider.outstanding() == 1);
-  }
-  CHECK(provider.outstanding() == 0);
+  REQUIRE(decision.deferred);
+  REQUIRE(decision.n_permits == 1);
+  auto permit = ledger.try_acquire_unit({1, 1}, bytes);
+  REQUIRE(permit);
+  auto output = ledger.allocator(permit).allocate_retained(bytes);
+  CHECK_FALSE(ledger.try_acquire_unit({2, 1}, 0));
+  permit.release();
+  auto next = ledger.try_acquire_unit({2, 1}, 0);
+  CHECK(next);
+  CHECK(output.size() == bytes);
+  CHECK_THROWS_AS(ledger.allocator(next).allocate(1), preparation_resource_error);
+  CHECK_THROWS_AS(ledger.allocator(next).allocate_retained(1), preparation_resource_error);
+  CHECK(ledger.bound_exceeded() == 2);
 }
 
 TEST_CASE("HOST reservation failure does not retry or leave a partial grant",
@@ -895,8 +958,8 @@ TEST_CASE("DV profile qualifies only complete bounded inputs and keeps append-on
   auto e = iceberg_dv_preparation::envelope(discovery, paths);
   REQUIRE(e.qualified);
   CHECK(e.units.size() == 1);
-  CHECK(e.units.front().positions == 16);
-  CHECK(e.units.front().roaring == 0);  // direct, nonallocating expansion
+  CHECK(e.units.front().retained == 16);
+  CHECK(e.units.front().temporary.size() == 2);  // Roaring expansion allocates no temporary block
   SECTION("a blob length is not a complete container bound")
   {
     discovery.deletion_vector_entries.front().file_size_in_bytes = 44;
@@ -945,28 +1008,24 @@ TEST_CASE("Charged DV descriptor names outlive the plan through the last publish
   CHECK(prepared->files()[0].dv != nullptr);
   CHECK(prepared->files()[1].dv == nullptr);
   auto arena_charge = ledger->charged_bytes({7, 0});
-  CHECK(arena_charge == e.retained_descriptors);
+  CHECK(arena_charge == e.retained.front());
   CHECK(ledger->tracked_units() == 1);
-  ledger->register_unit({7, 1}, 16);
-  auto permit = ledger->acquire_permit({7, 1});
-  REQUIRE(permit);
-  auto allocation = ledger->allocator(permit).allocate_retained(16);
+  auto attempt = std::make_shared<iceberg_dv_attempt>(prepared, ledger);
+  auto claim   = attempt->try_claim();
+  auto job     = std::get<std::shared_ptr<iceberg_dv_attempt::file_job>>(std::move(claim));
+  job->commit();
+  auto allocation = job->allocator().allocate_retained(16);
   auto* values    = reinterpret_cast<int64_t*>(allocation.data());
   values[0]       = 1;
   values[1]       = 3;
   auto result     = std::make_shared<iceberg_delete_set const>(
-    prepared->files()[0].path, std::move(allocation), 2, 1, prepared->path_owner());
-  iceberg_dv_attempt attempt{prepared, ledger};
-  attempt.record(0, result);
-  permit.release();
-  ledger->retire_unit({7, 1});
+    job->descriptor().path, std::move(allocation), 2, 1, job->path_owner());
+  job->complete(result);
+  job.reset();
   CHECK(ledger->tracked_units() == 2);
   SECTION("a retained result survives descriptor retirement")
   {
-    // Model the published split retaining the prepared visibility artifact.  The plan and
-    // attempt may finish at the query-wide barrier, but the descriptor arena must stay alive
-    // until this last consumer releases its result.
-    attempt.finish();
+    attempt->finish();
     prepared.reset();
     ledger->close();
     CHECK(result->data_file == "a.parquet");
@@ -977,12 +1036,12 @@ TEST_CASE("Charged DV descriptor names outlive the plan through the last publish
   }
   SECTION("an attempt's weak slot does not retain the result")
   {
-    CHECK(attempt.result(0) == result);
+    CHECK(attempt->result(0, prepared->files()[0].path) == result);
     result.reset();
-    CHECK(attempt.result(0) == nullptr);
+    CHECK(attempt->result(0, prepared->files()[0].path) == nullptr);
     CHECK(provider.seen->allocated_bytes == arena_charge);
     CHECK(ledger->tracked_units() == 1);
-    attempt.finish();
+    attempt->finish();
     prepared.reset();
     ledger->close();
     CHECK(ledger->tracked_units() == 0);
@@ -996,7 +1055,8 @@ TEST_CASE("DV descriptor accounting preserves the base layout and rounded admiss
           "[scan_preparation][ledger]")
 {
   using namespace sirius::op::scan;
-  static_assert(sizeof(iceberg_dv_preparation::file) == 40 &&
+  static_assert(sizeof(iceberg_dv_preparation::file) == 24 &&
+                sizeof(std::weak_ptr<iceberg_delete_set const>) == 16 &&
                 sizeof(iceberg_dv_preparation::file*) == 8);
   test_reservation_provider provider;
   provider.grant_bytes = 64 * 1024;
@@ -1017,7 +1077,7 @@ TEST_CASE("DV descriptor accounting preserves the base layout and rounded admiss
   auto empty     = iceberg_dv_preparation::envelope(*discovery, paths);
   CHECK(empty.qualified);
   CHECK(empty.units.empty());
-  CHECK(empty.retained_descriptors == 0);
+  CHECK(empty.retained.empty());
   IcebergDeleteFileEntry dv;
   dv.file_format           = "puffin";
   dv.file_path             = "a.puffin";
@@ -1030,9 +1090,9 @@ TEST_CASE("DV descriptor accounting preserves the base layout and rounded admiss
   auto envelope = iceberg_dv_preparation::envelope(*discovery, paths);
   REQUIRE(envelope.qualified);
   REQUIRE(envelope.units.size() == 1);
-  CHECK(envelope.retained_descriptors == expected_raw);
-  CHECK(envelope.resolver_index == 0);
-  CHECK(envelope.units.front().positions == 16);
+  CHECK(envelope.retained.front() == expected_raw);
+  CHECK(envelope.retained.size() == 1);
+  CHECK(envelope.units.front().retained == 16);
   {
     preparation_ledger ledger(provider);
     auto decision = ledger.admit(std::array{envelope}, host);
@@ -1084,29 +1144,47 @@ TEST_CASE("DV admission rejects null and replacement bindings without losing the
   CHECK(f.provider.seen->requests == 1);
 }
 
-TEST_CASE("DV attempt rejects out-of-range and retired result writes without changing live slots",
+TEST_CASE("DV jobs validate completion and retain result identity until retirement",
           "[scan_preparation][ledger]")
 {
   using namespace sirius::op::scan;
   static_assert(!std::is_copy_constructible_v<iceberg_dv_attempt>);
   static_assert(!std::is_copy_assignable_v<iceberg_dv_attempt>);
   dv_precondition_fixture f;
-  auto ledger = f.consume();
-  iceberg_dv_attempt attempt{f.prepared, ledger};
+  auto ledger  = f.consume();
+  auto attempt = std::make_shared<iceberg_dv_attempt>(f.prepared, ledger);
+  CHECK_THROWS_AS((iceberg_dv_attempt{f.prepared, ledger}), std::logic_error);
+  auto claim  = attempt->try_claim();
+  auto job    = std::get<std::shared_ptr<iceberg_dv_attempt::file_job>>(std::move(claim));
   auto result = std::make_shared<iceberg_delete_set const>(f.paths.front());
-  REQUIRE(f.prepared->files().size() == 1);
-  REQUIRE_NOTHROW(attempt.record(0, result));
-  CHECK(attempt.result(0) == result);
-  CHECK_THROWS_AS(attempt.record(f.prepared->files().size(), result), std::logic_error);
-  CHECK_THROWS_AS(attempt.record(std::numeric_limits<size_t>::max(), result), std::logic_error);
-  CHECK(attempt.result(0) == result);
-  CHECK(attempt.result(f.prepared->files().size()) == nullptr);
-  attempt.finish();
+  CHECK_THROWS_AS(job->complete(result), std::logic_error);
+  job->commit();
+  SECTION("completed result remains available until GPU retirement")
+  {
+    REQUIRE_NOTHROW(job->complete(result));
+    CHECK_THROWS_AS(job->complete(result), std::logic_error);
+    CHECK(attempt->result(0, f.paths.front()) == result);
+    CHECK(attempt->result(f.prepared->files().size(), f.paths.front()) == nullptr);
+    CHECK(attempt->result(0, "other.parquet") == nullptr);
+    job.reset();
+    attempt->stop();
+    CHECK(attempt->result(0, f.paths.front()) == result);
+  }
+  SECTION("late completion cannot write after stop or finish")
+  {
+    if (GENERATE(false, true))
+      attempt->finish();
+    else
+      attempt->stop();
+    CHECK_THROWS_AS(job->complete(result), std::logic_error);
+    CHECK(attempt->result(0, f.paths.front()) == nullptr);
+    job.reset();
+  }
+  attempt->finish();
   CHECK(f.prepared->files().empty());
-  CHECK_FALSE(attempt.ledger());
-  CHECK_THROWS_AS(attempt.record(0, result), std::logic_error);
-  CHECK(attempt.result(0) == nullptr);
-  REQUIRE_NOTHROW(attempt.finish());
+  CHECK_THROWS_AS(attempt->try_claim(), std::logic_error);
+  CHECK(attempt->result(0, f.paths.front()) == nullptr);
+  REQUIRE_NOTHROW(attempt->finish());
   CHECK(ledger->tracked_units() == 0);
   ledger->close();
   ledger.reset();
@@ -1114,47 +1192,133 @@ TEST_CASE("DV attempt rejects out-of-range and retired result writes without cha
   CHECK(f.provider.outstanding() == 0);
 }
 
-TEST_CASE(
-  "Iceberg preparation rejects missing foreign repeated and undeferred attempt installation",
-  "[scan_preparation][ledger]")
+TEST_CASE("Discarding a committed DV job does not invalidate a running sibling",
+          "[scan_preparation][ledger][claim]")
+{
+  using namespace sirius::op::scan;
+  dv_precondition_fixture f(3);
+  auto ledger  = f.consume();
+  auto attempt = std::make_shared<iceberg_dv_attempt>(f.prepared, ledger);
+  auto queued  = std::get<std::shared_ptr<iceberg_dv_attempt::file_job>>(attempt->try_claim());
+  queued->commit();
+  auto running = std::get<std::shared_ptr<iceberg_dv_attempt::file_job>>(attempt->try_claim());
+  running->commit();
+  CHECK(ledger->permits_in_flight() == 2);
+  auto result = std::make_shared<iceberg_delete_set const>(f.paths[1]);
+
+  // Normal EOS can dispose a queued job while another worker is just before complete().
+  queued.reset();
+  auto next = std::get<std::shared_ptr<iceberg_dv_attempt::file_job>>(attempt->try_claim());
+  CHECK(next->descriptor().path == f.paths[2]);
+  next->commit();
+  next.reset();
+  CHECK(std::holds_alternative<preparation_exhausted>(attempt->try_claim()));
+  REQUIRE_NOTHROW(running->complete(result));
+  CHECK(attempt->result(1, f.paths[1]) == result);
+  running.reset();
+  attempt->stop();
+  attempt->finish();
+  CHECK(ledger->permits_in_flight() == 0);
+  CHECK(ledger->tracked_units() == 0);
+  ledger->close();
+  ledger.reset();
+  CHECK(f.provider.outstanding() == 0);
+}
+
+TEST_CASE("External retirement waits for a DV claim before discarding queued work",
+          "[scan_preparation][ledger][claim]")
+{
+  using namespace sirius::op::scan;
+  using namespace sirius::test::preparation;
+  dv_precondition_fixture dv(2);
+  auto ledger  = dv.consume();
+  auto attempt = std::make_shared<iceberg_dv_attempt>(dv.prepared, ledger);
+  fixture f(1, 4, k_interrupt_check_interval, preparation_options{2, 4, 1, 1});
+  auto worker = f.make_hold();
+  auto claim  = f.make_hold();
+  auto out    = std::make_shared<sink>();
+  std::weak_ptr<iceberg_dv_attempt::file_job> queued;
+  std::atomic<size_t> claims{0}, reads{0};
+  std::atomic<bool> closed{false};
+  std::promise<void> stop_requested;
+  auto requested = stop_requested.get_future();
+  std::future<void> retiring;
+  auto guard = f.shutdown_guard();
+
+  // Occupy the only worker so the first DV job stays in the dispatcher queue.
+  f.dispatcher.enqueue([worker] { worker->wait(); });
+  REQUIRE(worker->await());
+  auto source      = make_source(preparation_coordinator::execution_domain::metadata_worker);
+  source.try_claim = [&]() -> preparation_coordinator::claim_result {
+    auto index = claims++;
+    if (index == 1) claim->wait();
+    auto claimed = attempt->try_claim();
+    auto* ready  = std::get_if<std::shared_ptr<iceberg_dv_attempt::file_job>>(&claimed);
+    if (!ready) return preparation_exhausted{};
+    auto owned = std::move(*ready);
+    owned->commit();
+    if (index == 0) queued = owned;
+    return preparation_coordinator::job{[&, owned = std::move(owned)] {
+      ++reads;
+      owned->complete(
+        std::make_shared<iceberg_delete_set const>(std::string(owned->descriptor().path)));
+      return std::make_unique<tagged>(0);
+    }};
+  };
+  source.close = [&] {
+    attempt->stop();
+    closed = true;
+    out->close();
+  };
+  f.register_source(std::move(source), out);
+  f.start();
+  REQUIRE(claim->await());
+  retiring = std::async(std::launch::async, [&] {
+    f.coordinator.request_stop(stop_reason::normal_eos);
+    stop_requested.set_value();
+    f.coordinator.drain();
+  });
+  REQUIRE(requested.wait_for(1s) == std::future_status::ready);
+  CHECK_FALSE(queued.expired());
+  CHECK_FALSE(closed);
+  CHECK(retiring.wait_for(0ms) == std::future_status::timeout);
+  claim->release();
+  worker->release();
+  f.finish();
+  retiring.get();
+
+  CHECK_FALSE(f.completion.has_error());
+  f.completion.mark_completed();
+  CHECK_NOTHROW(f.completion.get_awaitable().get());
+  CHECK(claims == 2);
+  CHECK(reads == 0);
+  CHECK(queued.expired());
+  CHECK(out->count() == 0);
+  CHECK(out->close_calls == 1);
+  CHECK(out->closing_thread == f.coordinator.snapshot().owner);
+  CHECK(ledger->permits_in_flight() == 0);
+  attempt->finish();
+  CHECK(ledger->tracked_units() == 0);
+  ledger->close();
+  ledger.reset();
+  CHECK(dv.provider.outstanding() == 0);
+}
+
+TEST_CASE("Iceberg ledger installation rejects missing repeated and undeferred state",
+          "[scan_preparation][ledger]")
 {
   using namespace sirius::op::scan;
   dv_precondition_fixture f;
   auto ledger     = f.consume();
   auto ingestible = make_ingestible(f.info());
-  auto attempt    = std::make_shared<iceberg_dv_attempt>(f.prepared, ledger);
-  bool installed  = false;
-  SECTION("null attempt")
-  {
-    CHECK_THROWS_AS(ingestible->begin_preparation(nullptr), std::logic_error);
-  }
-  SECTION("foreign preparation with the same contract and path")
-  {
-    dv_precondition_fixture other;
-    auto other_ledger = other.consume();
-    REQUIRE(other.prepared.get() != f.prepared.get());
-    REQUIRE(other.prepared->contract() == f.prepared->contract());
-    CHECK_THROWS_AS(ingestible->begin_preparation(
-                      std::make_shared<iceberg_dv_attempt>(other.prepared, other_ledger)),
-                    std::logic_error);
-  }
-  SECTION("second installation")
-  {
-    REQUIRE_NOTHROW(ingestible->begin_preparation(attempt));
-    installed = true;
-    CHECK_THROWS_AS(
-      ingestible->begin_preparation(std::make_shared<iceberg_dv_attempt>(f.prepared, ledger)),
-      std::logic_error);
-  }
-  SECTION("ingestible without deferred preparation")
-  {
-    auto legacy = make_ingestible(f.info(false));
-    CHECK_THROWS_AS(legacy->begin_preparation(attempt), std::logic_error);
-  }
-  if (!installed) REQUIRE_NOTHROW(ingestible->begin_preparation(attempt));
-  CHECK_THROWS_AS(ingestible->begin_preparation(attempt), std::logic_error);
+  CHECK_THROWS_AS(ingestible->attach_preparation_ledger(nullptr), std::logic_error);
+  auto legacy = make_ingestible(f.info(false));
+  CHECK_THROWS_AS(legacy->attach_preparation_ledger(ledger), std::logic_error);
+  REQUIRE_NOTHROW(ingestible->attach_preparation_ledger(ledger));
+  CHECK_THROWS_WITH(ingestible->attach_preparation_ledger(ledger),
+                    "DV preparation attempt already started");
   ingestible->finish_preparation();
-  CHECK_FALSE(attempt->ledger());
+  CHECK(ledger.use_count() == 1);
   CHECK(f.prepared->files().empty());
   CHECK(ledger->tracked_units() == 0);
   ledger->close();
@@ -1193,20 +1357,19 @@ TEST_CASE("Rejected pre-start Iceberg claims leave the first file available",
   };
   REQUIRE(f.paths.size() == 1);
   REQUIRE_FALSE(ingestible->has_processed_all_metadata());
-  CHECK_THROWS_AS(ingestible->next_split_provider(resolve), std::logic_error);
+  CHECK_THROWS_AS(ingestible->try_claim_split(resolve), std::logic_error);
   REQUIRE_FALSE(ingestible->has_processed_all_metadata());
-  auto attempt = std::make_shared<iceberg_dv_attempt>(f.prepared, ledger);
-  REQUIRE_NOTHROW(ingestible->begin_preparation(attempt));
-  REQUIRE(ingestible->can_claim_preparation());
-  auto work = ingestible->next_split_provider(resolve);
-  REQUIRE(work);
+  REQUIRE_NOTHROW(ingestible->attach_preparation_ledger(ledger));
+  auto claim = ingestible->try_claim_split(resolve);
+  auto work  = std::move(std::get<gpu_ingestible::metadata_job>(claim));
   CHECK(ingestible->has_processed_all_metadata());
-  CHECK_FALSE(ingestible->next_split_provider(resolve));
+  CHECK(std::holds_alternative<preparation_exhausted>(ingestible->try_claim_split(resolve)));
   work = {};
   CHECK(ledger->permits_in_flight() == 0);
   CHECK(ledger->tracked_units() == 1);
   ingestible->stop_preparation();
-  CHECK_FALSE(attempt->ledger());
+  CHECK(ledger.use_count() == 1);
+  CHECK_THROWS_AS(ingestible->try_claim_split(resolve), std::logic_error);
   CHECK(f.prepared->files().size() == 1);
   ingestible->finish_preparation();
   CHECK(ledger->tracked_units() == 0);
@@ -1214,4 +1377,111 @@ TEST_CASE("Rejected pre-start Iceberg claims leave the first file available",
   ledger.reset();
   CHECK(f.provider.seen->allocated_bytes == 0);
   CHECK(f.provider.outstanding() == 0);
+}
+
+TEST_CASE("Pending resource claims leave no registration and wake after physical release",
+          "[scan_preparation][ledger][claim]")
+{
+  test_reservation_provider provider;
+  preparation_ledger ledger(provider);
+  REQUIRE(ledger.admit(sample(), host).n_permits == 1);
+  auto gate = std::make_shared<preparation_gate>();
+  ledger.bind_wakeup(preparation_wakeup{gate});
+  auto first = ledger.try_acquire_unit({1, 1}, 8);
+  REQUIRE(first);
+  auto bytes = ledger.allocator(first).allocate(8);
+  for (unsigned n = 0; n != 3; ++n) {
+    CHECK_FALSE(ledger.try_acquire_unit({1, 2}, 12));
+    CHECK(ledger.tracked_units() == 1);
+  }
+  first.release();
+  ledger.retire_unit({1, 1});
+  CHECK(gate->wake_generation == 0);
+  bytes = {};
+  CHECK(gate->wake_generation == 1);
+  auto second = ledger.try_acquire_unit({1, 2}, 12);
+  REQUIRE(second);
+  second.release();
+  ledger.retire_unit({1, 2});
+  CHECK(ledger.tracked_units() == 0);
+}
+
+TEST_CASE("DV claim owns descriptors and resources after execution finish",
+          "[scan_preparation][ledger][claim]")
+{
+  using namespace sirius::op::scan;
+  dv_precondition_fixture f;
+  auto ledger  = f.consume();
+  auto attempt = std::make_shared<iceberg_dv_attempt>(f.prepared, ledger);
+  auto claimed = attempt->try_claim();
+  auto& owned  = std::get<std::shared_ptr<iceberg_dv_attempt::file_job>>(claimed);
+  REQUIRE(owned);
+  CHECK(owned->descriptor().path == f.paths.front());
+  CHECK(ledger->permits_in_flight() == 1);
+  attempt->finish();
+  CHECK(f.prepared->files().empty());
+  CHECK(owned->descriptor().path == "a.parquet");
+  CHECK(owned->descriptor().dv->file_path == "a.puffin");
+  CHECK_THROWS_AS(owned->commit(), std::logic_error);
+  auto allocator = owned->allocator();
+  auto temporary = allocator.allocate(8);
+  owned.reset();
+  CHECK(ledger->permits_in_flight() == 1);
+  temporary.release();
+  CHECK_THROWS_AS(allocator.allocate(8), std::logic_error);
+  CHECK(ledger->permits_in_flight() == 0);
+  CHECK(ledger->tracked_units() == 0);
+  CHECK(f.provider.seen->allocated_bytes == 0);
+}
+
+TEST_CASE("Iceberg pending claims preserve both cursors and discarded jobs release their permits",
+          "[scan_preparation][ledger][claim]")
+{
+  using namespace sirius::op::scan;
+  dv_precondition_fixture f;
+  auto ledger     = f.consume();
+  auto ingestible = make_ingestible(f.info());
+  ingestible->attach_preparation_ledger(ledger);
+  auto resolve = [](std::string_view) -> std::shared_ptr<sirius::io::ioctx> {
+    throw std::runtime_error("claim must not read files");
+  };
+  auto occupied = ledger->try_acquire_unit({99, 1}, 0);
+  REQUIRE(occupied);
+  auto registrations = ledger->tracked_units();
+  for (int i = 0; i != 3; ++i) {
+    CHECK(std::holds_alternative<preparation_pending>(ingestible->try_claim_split(resolve)));
+    CHECK_FALSE(ingestible->has_processed_all_metadata());
+    CHECK(ledger->tracked_units() == registrations);
+  }
+  occupied.release();
+  ledger->retire_unit({99, 1});
+  {
+    auto claim  = ingestible->try_claim_split(resolve);
+    auto& ready = std::get<gpu_ingestible::metadata_job>(claim);
+    REQUIRE(ready.requirement);
+    CHECK(ready.requirement->key == unit_key{f.prepared->contract(), 1});
+    CHECK(
+      ready.requirement->required ==
+      required_inputs(f.read_views->entry(f.prepared->contract()).eligibility.later_checks, true));
+    CHECK(ingestible->has_processed_all_metadata());
+  }
+  CHECK(std::holds_alternative<preparation_exhausted>(ingestible->try_claim_split(resolve)));
+  CHECK(ledger->permits_in_flight() == 0);
+  ingestible->finish_preparation();
+  CHECK(ledger->tracked_units() == 0);
+}
+
+TEST_CASE("Resource wake handles cannot execute arbitrary throwing cleanup hooks",
+          "[scan_preparation][ledger][claim]")
+{
+  static_assert(std::is_nothrow_invocable_v<preparation_wakeup>);
+  static_assert(!std::is_constructible_v<preparation_wakeup, std::function<void()>>);
+  preparation_wakeup expired;
+  {
+    auto gate = std::make_shared<preparation_gate>();
+    expired   = preparation_wakeup{gate};
+    expired();
+    CHECK(gate->wake_generation == 1);
+  }
+  REQUIRE_NOTHROW(expired());
 }

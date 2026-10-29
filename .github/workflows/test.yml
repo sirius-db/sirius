@@ -93,7 +93,7 @@ jobs:
           CUDAARCHS: "75" # 75 for T4 capability; 89 for L4 capability
         run: |
           set -o pipefail
-          make -j$(nproc) EXTRA_EXTENSION_CONFIGS="$PWD/sirius-duckdb/test/extension_config.cmake" 2>&1 | tee /tmp/build.log
+          make -j$(nproc) 2>&1 | tee /tmp/build.log
 
       - name: Test CUDA extension loader without a GPU
         run: |
@@ -212,11 +212,18 @@ jobs:
             --duckdb sirius-duckdb/build/release/duckdb \
             --extension sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension
 
-      - name: Install matching test extensions
+      - name: Provision DuckDB extensions the tests load
+        # Tests LOAD without INSTALL so they never reach the network; provision them here.
         run: |
-          ./sirius-duckdb/build/release/duckdb -unsigned -c "
-            INSTALL './sirius-duckdb/build/release/extension/avro/avro.duckdb_extension';
-            INSTALL './sirius-duckdb/build/release/extension/iceberg/iceberg.duckdb_extension';"
+          for attempt in 1 2 3; do
+            if ./sirius-duckdb/build/release/duckdb -c "INSTALL avro; INSTALL iceberg; INSTALL ducklake;"; then
+              exit 0
+            fi
+            echo "::warning::Extension install attempt ${attempt} failed; retrying in $((attempt * 10))s"
+            sleep $((attempt * 10))
+          done
+          echo "::error::Could not install the avro, iceberg and ducklake extensions after 3 attempts." >&2
+          exit 1
 
       - name: Test Simpatico cache across processes
         run: |
@@ -232,6 +239,7 @@ jobs:
       - name: Run C++ unit tests
         env:
           SIRIUS_EXTENSION_PATH: ${{ github.workspace }}/sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension
+          SIRIUS_TEST_REQUIRE_DUCKLAKE: "1"
         run: |
           nvidia-smi
           python3 scripts/run_unit_tests.py --require-gpus 2 -- --abort

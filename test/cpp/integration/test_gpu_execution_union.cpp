@@ -158,11 +158,10 @@ TEST_CASE_METHOD(UnionFixture,
 }
 
 TEST_CASE_METHOD(UnionFixture,
-                 "gpu_execution UNION over HUGEINT aggregates narrowed to BIGINT",
+                 "gpu_execution UNION ALL over HUGEINT aggregates",
                  "[integration][gpu_execution][union][union_all]")
 {
-  // DuckDB types sum(INTEGER) as HUGEINT and the union declares that, but each GPU arm plans the
-  // aggregate as BIGINT, so the union's declared type and its arms' planned type differ.
+  // DuckDB types sum(INTEGER) as HUGEINT; the union and its aggregate arms all plan that type.
   compare_gpu_vs_cpu("SELECT sum(k) AS s FROM ua UNION ALL SELECT sum(k) FROM ub");
   compare_gpu_vs_cpu(
     "SELECT s + 1 FROM (SELECT sum(k) AS s FROM ua UNION ALL SELECT sum(k) FROM ub) t");
@@ -491,10 +490,10 @@ TEST_CASE_METHOD(UnionFixture,
 }
 
 TEST_CASE_METHOD(UnionFixture,
-                 "gpu_execution distinct UNION over HUGEINT aggregates narrowed to BIGINT",
+                 "gpu_execution distinct UNION over HUGEINT aggregates",
                  "[integration][gpu_execution][union]")
 {
-  // The DISTINCT groups on the union's declared HUGEINT over arms planned as BIGINT.
+  // The DISTINCT groups on the union's HUGEINT sums.
   compare_gpu_vs_cpu("SELECT sum(k) FROM ua UNION SELECT sum(k) FROM ub");
   // Equal sums must collapse to one row.
   compare_gpu_vs_cpu("SELECT sum(k) FROM ua UNION SELECT sum(k) FROM ua");
