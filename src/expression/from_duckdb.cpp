@@ -258,15 +258,18 @@ bool gpu_supports_abs(duckdb::BoundFunctionExpression const& expr)
          type.id() != duckdb::LogicalTypeId::UHUGEINT;
 }
 
-// HUGEINT `//` and `%` run on the GPU only by a nonzero constant: cuDF leaves a zero divisor's row
-// undefined, where DuckDB raises an error (or returns NULL under TRY).
+// HUGEINT `//` and `%` run on the GPU only by a constant other than 0 and -1: cuDF leaves a zero
+// divisor's row undefined and wraps HUGEINT_MIN // -1, where DuckDB raises an error (or returns
+// NULL under TRY).
 bool gpu_supports_hugeint_division(duckdb::BoundFunctionExpression const& expr)
 {
   auto const& divisor = *expr.GetChildren()[1];
   if (expr.GetReturnType().id() != duckdb::LogicalTypeId::HUGEINT) { return true; }
   if (divisor.GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) { return false; }
   auto const& value = divisor.Cast<duckdb::BoundConstantExpression>().GetValue();
-  return !value.IsNull() && value.GetValue<duckdb::hugeint_t>() != duckdb::hugeint_t(0);
+  if (value.IsNull()) { return false; }
+  auto const divisor_value = value.GetValue<duckdb::hugeint_t>();
+  return divisor_value != duckdb::hugeint_t(0) && divisor_value != duckdb::hugeint_t(-1);
 }
 
 // Unsigned (DuckDB rejects nonzero), HUGEINT and INTERVAL negation stay on the CPU.

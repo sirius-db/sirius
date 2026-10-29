@@ -283,6 +283,7 @@ std::unique_ptr<cudf::table> expression_evaluator::evaluate(cudf::table_view inp
   // the restored-reference cache over them, and the per-call instrumentation do not carry stale
   // state across calls.
   _restored_reference_cache.clear();
+  _hugeint_reference_bounds.clear();
   _restored_reference_cast_count  = 0;
   _narrow_domain_comparison_count = 0;
   _ast_tree                       = cudf::ast::tree{};
