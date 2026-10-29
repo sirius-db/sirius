@@ -61,6 +61,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -87,7 +88,25 @@ bool completed_decode(::cuda::stream_ref stream, Args&&... args)
   std::array const streams{stream};
   simpatico::decode_session session{streams, rmm::mr::get_current_device_resource_ref()};
   auto& frame = simpatico::decode_session_test_access::frame(session);
-  Launch(std::forward<Args>(args)..., frame);
+  // A launcher passed as a non-type template argument decays to a plain function pointer, which
+  // drops default arguments, so the compacted launcher's trailing out_dtype must be given here.
+  if constexpr (std::is_invocable_v<decltype(Launch), Args&&..., decltype(frame)>) {
+    Launch(std::forward<Args>(args)..., frame);
+  } else {
+    Launch(std::forward<Args>(args)..., frame, nullptr);
+  }
+  session.finish();
+  return true;
+}
+
+// As completed_decode for the compacted launcher, storing each value in the wider `out_dtype`.
+template <typename... Args>
+bool completed_widened_decode(::cuda::stream_ref stream, char const* out_dtype, Args&&... args)
+{
+  std::array const streams{stream};
+  simpatico::decode_session session{streams, rmm::mr::get_current_device_resource_ref()};
+  auto& frame = simpatico::decode_session_test_access::frame(session);
+  simpatico::launch_decode_fused_tree_compacted(std::forward<Args>(args)..., frame, out_dtype);
   session.finish();
   return true;
 }
@@ -1578,15 +1597,15 @@ bool run_widened_output(int arch)
     CUdeviceptr d_out = enc.alloc(static_cast<std::size_t>(survivors) * sizeof(Wide));
     // 0xAB in every byte: a kernel that wrote only the low 32 bits would leave the high half set.
     cudaMemset(reinterpret_cast<void*>(d_out), 0xAB, survivors * sizeof(Wide));
-    REQUIRE_MSG(simpatico::launch_decode_fused_tree_compacted(*bp,
-                                                              enc.buffers,
-                                                              "int32_t",
-                                                              n,
-                                                              sm,
-                                                              walks[walk_idx],
-                                                              reinterpret_cast<void*>(d_out),
-                                                              stream,
-                                                              "int64_t"),
+    REQUIRE_MSG(completed_widened_decode(stream,
+                                         "int64_t",
+                                         *bp,
+                                         enc.buffers,
+                                         "int32_t",
+                                         n,
+                                         sm,
+                                         walks[walk_idx],
+                                         reinterpret_cast<void*>(d_out)),
                 "[widened/%s] compacted launch failed",
                 walk_names[walk_idx]);
     std::vector<Wide> got(survivors);

@@ -874,6 +874,7 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
                                      sel.survivor_count > 0;
       // Forward the caller's restore type only for a lossless widening of the stored type: same
       // DECIMAL scale, a wider signed integer, or TIMESTAMP_DAYS for a narrowed DATE.
+      // Unsigned storage is excluded: the JIT decoder has no unsigned element types.
       if (i < request.output_types.size() && request.output_types[i].has_value()) {
         auto const stored = column.dtype;
         auto const target = *request.output_types[i];
