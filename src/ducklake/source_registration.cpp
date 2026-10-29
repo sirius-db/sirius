@@ -28,6 +28,7 @@
 
 #include <duckdb/common/exception.hpp>
 #include <duckdb/common/multi_file/multi_file_states.hpp>
+#include <duckdb/main/database.hpp>
 
 #include <algorithm>
 #include <numeric>

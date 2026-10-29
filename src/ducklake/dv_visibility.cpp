@@ -44,8 +44,6 @@ char const* parquet_dependency_error(unit_descriptor const& unit)
         return "DuckLake encrypted data is outside the local scan profile";
       case unit_gate_reason::encrypted_delete:
         return "DuckLake encrypted deletes are outside the local scan profile";
-      case unit_gate_reason::partial_data:
-        return "DuckLake per-row snapshot-filtered data is outside the local scan profile";
       case unit_gate_reason::invalid_snapshot_range:
         return "DuckLake data snapshot range is invalid";
       case unit_gate_reason::unknown_delete_format:
@@ -139,6 +137,10 @@ std::shared_ptr<dv_visibility const> prepare_dv_visibility(unit_descriptor const
   bool container = std::memcmp(magic.data(), "PFA1", 4) == 0;
   std::shared_ptr<scan::puffin_container_metadata const> metadata;
   size_t blobs = 1;
+  // Bounded by the parser limit; no uncharged per-position state.
+  std::array<size_t, dv_max_blobs> order{};
+  std::array<std::optional<uint64_t>, dv_max_blobs> snapshot_ids{};
+  size_t snapshot_blobs = 0;
   if (container) {
     metadata = scan::read_puffin_metadata(source, allocator, {dv_max_footer_bytes, dv_max_blobs});
     if (unit.delete_footer_size &&
@@ -148,23 +150,37 @@ std::shared_ptr<dv_visibility const> prepare_dv_visibility(unit_descriptor const
     for (size_t i = 0; i < metadata->blob_count(); ++i) {
       auto blob = metadata->blob(i);
       if (blob.type != "deletion-vector-v1") continue;
-      ++blobs;
+      order[blobs++] = i;
       if (blob.compression_codec || blob.snapshot_id != -1 || blob.sequence_number != -1)
         throw std::runtime_error("DuckLake DV blob profile is unqualified");
-      if (metadata->property(i, "ducklake-snapshot-id"))
-        throw std::runtime_error("DuckLake snapshot-bearing DV is outside the local scan profile");
+      if (auto value = metadata->property(i, "ducklake-snapshot-id")) {
+        uint64_t snapshot = 0;
+        auto parsed       = std::from_chars(value->data(), value->data() + value->size(), snapshot);
+        if (value->empty() || parsed.ec != std::errc{} ||
+            parsed.ptr != value->data() + value->size())
+          throw std::runtime_error("DuckLake DV snapshot is not a nonnegative integer");
+        snapshot_ids[i] = snapshot;
+        ++snapshot_blobs;
+      }
       if (auto path = metadata->property(i, "referenced-data-file"))
         if (io::strip_file_scheme(std::string(*path)) != io::strip_file_scheme(unit.input.path))
           throw std::runtime_error("DuckLake DV referenced data file differs from original unit");
     }
     if (!blobs) throw std::runtime_error("DuckLake container has no relevant deletion vectors");
+    if (snapshot_blobs && snapshot_blobs != blobs)
+      throw std::runtime_error("DuckLake DV mixes blobs with and without snapshots");
+    if (snapshot_blobs)
+      std::sort(order.begin(), order.begin() + blobs, [&](size_t a, size_t b) {
+        return *snapshot_ids[a] < *snapshot_ids[b];
+      });
   } else if (unit.delete_footer_size && *unit.delete_footer_size)
     throw std::runtime_error("DuckLake container magic is missing");
   auto result             = std::make_shared<dv_visibility>();
   result->data_identity   = std::move(data_identity);
   result->delete_identity = std::move(delete_identity);
   size_t cumulative       = 0;
-  for (size_t i = 0; i < (metadata ? metadata->blob_count() : 1); ++i) {
+  for (size_t n = 0; n < blobs; ++n) {
+    auto i         = order[n];
     int64_t offset = 0, length = source.size();
     if (metadata) {
       auto blob = metadata->blob(i);
@@ -190,7 +206,15 @@ std::shared_ptr<dv_visibility const> prepare_dv_visibility(unit_descriptor const
     if (positions.size() > dv_max_positions - cumulative)
       throw sm::preparation_resource_error("DuckLake DV aggregate positions exceed limit", true);
     cumulative += positions.size();
-    if (!result->validated_blobs) {
+    ++result->validated_blobs;
+    check_stop(stop);
+    // SCAN_TABLE supplies no parser bounds. Future payloads still undergo
+    // CRC, cardinality, row-domain and resource validation above.
+    // Union of eligible blobs preserves earliest-delete semantics for this
+    // mode. Local deletes suppress the committed snapshot filter.
+    if (snapshot_ids[i] && !unit.transaction_local_delete && *snapshot_ids[i] > unit.bound_snapshot)
+      continue;
+    if (result->positions.empty()) {
       result->decoded   = std::move(decoded);
       result->positions = result->decoded->positions();
     } else if (!positions.empty()) {
@@ -207,8 +231,6 @@ std::shared_ptr<dv_visibility const> prepare_dv_visibility(unit_descriptor const
       result->decoded.reset();
       result->positions = {output, count};
     }
-    ++result->validated_blobs;
-    check_stop(stop);
   }
   if (result->validated_blobs != blobs)
     throw std::logic_error("DuckLake DV validation coverage incomplete");
@@ -221,20 +243,51 @@ void validate_delete_position(int64_t position, int64_t& previous)
       "DuckLake Parquet delete positions must be nonnegative and strictly increasing");
   previous = position;
 }
+void parquet_delete_accumulator::append(std::optional<int64_t> position,
+                                        std::optional<int64_t> snapshot)
+{
+  stage(validated_, position, snapshot);
+  consume_staged(validated_);
+}
+void parquet_delete_accumulator::stage(size_t offset,
+                                       std::optional<int64_t> position,
+                                       std::optional<int64_t> snapshot) const
+{
+  if (!position) throw std::runtime_error("DuckLake Parquet delete position cannot be NULL");
+  if (*position < 0)
+    throw std::runtime_error(
+      "DuckLake Parquet delete positions must be nonnegative and strictly increasing");
+  if (offset >= output_.size())
+    throw std::runtime_error("DuckLake Parquet deletes exceed footer coverage");
+  if (embedded_ && (!snapshot || *snapshot < 0))
+    throw std::runtime_error("DuckLake Parquet delete snapshot must be nonnegative and non-NULL");
+  // Use the sign bit to mark future deletes within the existing position budget.
+  bool visible    = !embedded_ || local_ || static_cast<uint64_t>(*snapshot) <= snapshot_;
+  output_[offset] = visible ? *position : ~*position;
+}
+void parquet_delete_accumulator::consume_staged(size_t offset)
+{
+  auto value = output_[offset];
+  validate_delete_position(value < 0 ? ~value : value, previous_);
+  ++validated_;
+  if (value >= 0) output_[effective_++] = value;
+}
 std::shared_ptr<dv_visibility const> bind_parquet_visibility(
   std::shared_ptr<dv_visibility const> source, std::string data_identity, int64_t file_rows)
 {
   if (!source || !source->parquet_validated || source->delete_identity.empty() ||
       data_identity.empty() || file_rows < 0)
     throw std::invalid_argument("DuckLake Parquet deletes lack validated file evidence");
-  if (!source->positions.empty() && source->positions.back() >= file_rows)
+  if (source->last_validated_position >= file_rows ||
+      (!source->positions.empty() && source->positions.back() >= file_rows))
     throw std::runtime_error("DuckLake Parquet delete position exceeds original file row domain");
-  auto result               = std::make_shared<dv_visibility>();
-  result->data_identity     = std::move(data_identity);
-  result->delete_identity   = source->delete_identity;
-  result->parquet_validated = true;
-  result->positions         = source->positions;
-  result->predecessor       = std::move(source);
+  auto result                     = std::make_shared<dv_visibility>();
+  result->data_identity           = std::move(data_identity);
+  result->delete_identity         = source->delete_identity;
+  result->parquet_validated       = true;
+  result->last_validated_position = source->last_validated_position;
+  result->positions               = source->positions;
+  result->predecessor             = std::move(source);
   return result;
 }
 std::shared_ptr<dv_visibility const> combine_inline_visibility(

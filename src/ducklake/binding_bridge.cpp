@@ -184,6 +184,7 @@ struct binding_handle::impl {
     field(key, std::to_string(info.table_id.index));
     field(key, std::to_string(info.snapshot.snapshot_id));
     field(key, std::to_string(info.snapshot.schema_version));
+    field(key, info.include_local_changes ? "1" : "0");
     // Until overlay generation is qualified, conservatively scope correspondence
     // to this statement/transaction. This is not a physical cache identity.
     field(key, std::to_string(transaction_id));
@@ -401,7 +402,8 @@ position_page binding_handle::inline_delete_positions(uint64_t index,
 std::shared_ptr<dv_visibility const> binding_handle::read_parquet_deletes(
   uint64_t index,
   scan_manager::charging_allocator& allocator,
-  scan_manager::preparation_stop_token stop)
+  scan_manager::preparation_stop_token stop,
+  op::scan::physical_check_counters* counters)
 {
   validate_statement();
   auto unit = unit_at(index);
@@ -425,8 +427,9 @@ std::shared_ptr<dv_visibility const> binding_handle::read_parquet_deletes(
   };
   auto result = std::make_shared<dv_visibility>();
   std::span<int64_t> positions;
-  int64_t previous = -1;
-  bool ordered     = false;
+  std::optional<parquet_delete_accumulator> accumulator;
+  bool embedded = false;
+  bool ordered  = false;
   op::scan::read_parquet_delete_batches(
     *context,
     OpenFileInfo(unit->delete_path),
@@ -437,45 +440,57 @@ std::shared_ptr<dv_visibility const> binding_handle::read_parquet_deletes(
           columns[1].type != duckdb::LogicalType::BIGINT)
         throw std::runtime_error(
           "DuckLake Parquet delete schema requires file name and BIGINT position");
-      if (columns.size() == 3 &&
-          StringUtil::CIEquals(columns[2].name, "_ducklake_internal_snapshot_id"))
-        throw std::runtime_error(
-          "DuckLake snapshot-bearing Parquet deletes are outside the local scan profile");
+      embedded = columns.size() == 3 &&
+                 StringUtil::CIEquals(columns[2].name, "_ducklake_internal_snapshot_id");
+      if (embedded && columns[2].type != duckdb::LogicalType::BIGINT)
+        throw std::runtime_error("DuckLake Parquet delete snapshot requires BIGINT");
       if (rows > dv_max_positions)
         throw scan_manager::preparation_resource_error(
           "DuckLake Parquet delete positions exceed limit", true);
       result->merged = allocator.allocate_retained(rows * sizeof(int64_t));
       positions = {reinterpret_cast<int64_t*>(result->merged.data()), static_cast<size_t>(rows)};
-      return std::vector<uint64_t>{1};
+      accumulator.emplace(
+        positions, embedded, unit->bound_snapshot, unit->transaction_local_delete);
+      return embedded ? std::vector<uint64_t>{1, 2} : std::vector<uint64_t>{1};
     },
     [&](bool in_file_order) {
       ordered = in_file_order;
       return [&, in_file_order](uint64_t offset, DataChunk& chunk) {
         UnifiedVectorFormat pos;
         chunk.data[0].ToUnifiedFormat(pos);
-        auto values = pos.GetData<int64_t>();
+        UnifiedVectorFormat snapshots_column;
+        if (embedded) chunk.data[1].ToUnifiedFormat(snapshots_column);
+        auto read = [](UnifiedVectorFormat const& column, idx_t row) -> std::optional<int64_t> {
+          auto index = column.sel->get_index(row);
+          if (!column.validity.RowIsValid(index)) return std::nullopt;
+          return column.GetData<int64_t>()[index];
+        };
         for (idx_t row = 0; row < chunk.size(); ++row) {
-          auto index = pos.sel->get_index(row);
-          if (!pos.validity.RowIsValid(index))
-            throw std::runtime_error("DuckLake Parquet delete position cannot be NULL");
-          auto value = values[index];
-          if (in_file_order) validate_delete_position(value, previous);
-          positions[offset + row] = value;
+          auto position = read(pos, row);
+          auto snapshot = embedded ? read(snapshots_column, row) : std::nullopt;
+          if (in_file_order)
+            accumulator->append(position, snapshot);
+          else
+            accumulator->stage(offset + row, position, snapshot);
         }
       };
     });
   validate_statement();
   if (!ordered) {
+    if (embedded && counters && counters->track_units)
+      counters->ducklake_parallel_snapshot_delete_rows.fetch_add(positions.size(),
+                                                                 std::memory_order_relaxed);
     for (size_t row = 0; row < positions.size(); ++row) {
       if (row % STANDARD_VECTOR_SIZE == 0) check_stop();
-      validate_delete_position(positions[row], previous);
+      accumulator->consume_staged(row);
     }
   }
   check_stop();
   result->delete_identity =
     "duckdb.local.parquet.read:" + std::to_string(cucascade::io::next_open_generation());
-  result->positions         = positions;
-  result->parquet_validated = true;
+  result->positions               = accumulator->positions();
+  result->last_validated_position = accumulator->last_position();
+  result->parquet_validated       = true;
   return result;
 }
 std::shared_ptr<parquet_unit_ingestible> binding_handle::make_parquet_unit(

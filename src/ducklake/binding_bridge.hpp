@@ -23,7 +23,8 @@
 
 namespace sirius::op::scan {
 class arrow_import_ingestible;
-}
+struct physical_check_counters;
+}  // namespace sirius::op::scan
 namespace sirius::scan_manager {
 class preparation_admission;
 class charging_allocator;
@@ -73,7 +74,8 @@ class binding_handle : public std::enable_shared_from_this<binding_handle> {
   // Independent native delete reader; called only on the captured owner lane.
   std::shared_ptr<dv_visibility const> read_parquet_deletes(uint64_t original_file_index,
                                                             scan_manager::charging_allocator&,
-                                                            scan_manager::preparation_stop_token);
+                                                            scan_manager::preparation_stop_token,
+                                                            op::scan::physical_check_counters*);
 
   op::scan::bound_read_view const& view() const noexcept;
   void validate_statement() const;

@@ -52,7 +52,8 @@ The connector verifies the provider callbacks and reads the original binding's s
 | Schema evolution | Match stable field IDs; use typed `initial_default` for missing fields. INTEGER-to-BIGINT and FLOAT-to-DOUBLE widening are supported. |
 | Ordinary Parquet deletes, local DVs and inline deletes | Combine visibility in the original file-row domain before residual filtering and projection. |
 | Nested selections, external name/Hive mappings or other conversions | Reject GPU execution. Unselected nested columns do not prevent scalar reads. |
-| Remote or encrypted inputs; snapshot-bearing deletes or per-row snapshot-filtered data | Reject GPU execution. |
+| Snapshot-bearing deletes and per-row snapshot-filtered data | Validate payloads and apply the bound snapshot before user filtering and projection. |
+| Remote or encrypted inputs | Reject GPU execution. |
 | Missing statistics, defaults or conversions without usable statistics | Keep affected row groups and evaluate residual filters. |
 | Malformed delete payload or invalid positions | Fail the scan; never treat invalid data as an empty delete set. |
 | Insufficient preparation capacity or an oversized row | Return a resource error without truncation or unbounded allocation. |

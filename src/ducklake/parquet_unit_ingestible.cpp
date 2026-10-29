@@ -30,6 +30,7 @@
 #include <cudf/io/parquet_schema.hpp>
 #include <cudf/table/table.hpp>
 
+#include <cucascade/cudf/datasource.hpp>
 #include <cucascade/io/io_errors.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/common/exception.hpp>
@@ -85,6 +86,11 @@ std::unique_ptr<plain_info> make_info(unit_descriptor const& unit,
   }
   if (fields.size() != info->names.size() || fields.size() != info->bound_types.size())
     throw std::invalid_argument("DuckLake field requirements do not match the bound schema");
+  bool partial_data = add_partial_data_filter(unit, fields, options);
+  if (partial_data) {
+    info->bound_types.push_back(duckdb::LogicalType::BIGINT);
+    info->names.push_back("_ducklake_internal_snapshot_id");
+  }
   for (size_t i = 0; i < fields.size(); ++i) {
     if (!scan::field_mapping_type(fields[i].type))
       throw std::invalid_argument("DuckLake plain Parquet requires qualified flat types");
@@ -110,7 +116,7 @@ std::unique_ptr<plain_info> make_info(unit_descriptor const& unit,
   info->physical_contract.profiles     = info->profiles;
   info->physical_contract.output_types = info->bound_types;
   info->field_mapping_requirements     = fields;
-  info->prepare_field_mapping          = [fields, generation, witness = info->mapping](
+  info->prepare_field_mapping = [fields, generation, partial_data, witness = info->mapping](
                                   std::shared_ptr<scan::parquet_metadata const> metadata,
                                   std::string const& identity,
                                   scan::materialization_program program,
@@ -127,7 +133,7 @@ std::unique_ptr<plain_info> make_info(unit_descriptor const& unit,
     program.generation = generation;
     // Compile original provider defaults/cast rules for the shared required set.
     auto mapping = std::make_shared<scan::field_id_mapping const>(compile_field_mapping(
-      std::move(metadata), identity, std::move(program), std::move(required)));
+      std::move(metadata), identity, std::move(program), std::move(required), partial_data));
     std::shared_ptr<scan::field_id_mapping const> absent;
     if (!witness->value.compare_exchange_strong(absent, mapping))
       throw std::logic_error("DuckLake unit mapping was already sealed");
@@ -140,6 +146,7 @@ std::unique_ptr<plain_info> make_info(unit_descriptor const& unit,
 struct sealed_file final : scan::mapped_parquet_visibility {
   std::shared_ptr<preparation_identity const> scan;
   size_t file_index;
+  bool requires_unfiltered_rows;
   std::string path;
   std::shared_ptr<dv_visibility const> visibility;
 };
@@ -175,7 +182,7 @@ class plain_validator final : public scan::split_validator {
            !parquet.field_mapping->compatible_with(*file->mapping)) ||
           file->mapping->metadata()->file_metadata() != slice.file_metadata ||
           file->mapping->identity() != dep.parquet_approval->object_identity ||
-          (!file->visibility->positions.empty() && !parquet.disable_filter_pushdown))
+          (file->requires_unfiltered_rows && !parquet.disable_filter_pushdown))
         throw scan::certificate_incomplete(
           context.contract, {}, "DuckLake unit/visibility evidence mismatch");
     }
@@ -313,10 +320,21 @@ op::scan::gpu_ingestible::metadata_claim parquet_unit_ingestible::try_claim_spli
     auto& file  = dynamic_cast<op::scan::parquet_file_scan_info&>(*result);
     if (file.file_path != unit_.input.path || file.certificates().size() != 1)
       throw std::logic_error("DuckLake Parquet unit preparation changed input");
-    file.file_index   = unit_.original_file_index;
-    auto certs        = std::vector(file.certificates().begin(), file.certificates().end());
-    auto deps         = std::vector(file.dependencies().begin(), file.dependencies().end());
-    certs[0].split_id = unit_.original_file_index;
+    file.file_index      = unit_.original_file_index;
+    auto certs           = std::vector(file.certificates().begin(), file.certificates().end());
+    auto deps            = std::vector(file.dependencies().begin(), file.dependencies().end());
+    certs[0].split_id    = unit_.original_file_index;
+    auto const& physical = deps.at(0);
+    if (!physical.datasource || !physical.parquet_approval)
+      throw std::logic_error("DuckLake Parquet unit lacks physical file evidence");
+    // The provider's descriptor is part of the bound read view. A cache hit
+    // proves the opened object identity, not agreement with that descriptor.
+    // Check before sealing visibility or allowing any dependent data decode.
+    if ((unit_.file_size && physical.datasource->size() != unit_.file_size) ||
+        (unit_.footer_size && physical.parquet_approval->footer_bytes != *unit_.footer_size))
+      throw transparent::classified_execution_error(
+        transparent::late_failure_cause::reader_io,
+        "DuckLake Parquet data file size or footer differs from binding");
     std::shared_ptr<dv_visibility const> visibility;
     auto data_identity = deps.at(0).parquet_approval->object_identity;
     if (unit_.deletes == delete_format::puffin) {
@@ -390,8 +408,10 @@ op::scan::gpu_ingestible::metadata_claim parquet_unit_ingestible::try_claim_spli
           (unit_.deletes == delete_format::puffin ? !visibility->validated_blobs
                                                   : !visibility->parquet_validated))))
       throw scan::certificate_incomplete(info.contract_id, {}, "DuckLake visibility is incomplete");
-    file.disable_filter_pushdown |= !visibility->positions.empty();
-    auto sealed        = std::make_shared<sealed_file>();
+    auto sealed = std::make_shared<sealed_file>();
+    sealed->requires_unfiltered_rows =
+      !visibility->positions.empty() || unit_.snapshot_min || unit_.snapshot_max;
+    file.disable_filter_pushdown |= sealed->requires_unfiltered_rows;
     sealed->scan       = info.identities;
     sealed->mapping    = file.field_mapping;
     sealed->file_index = file.file_index;
@@ -446,8 +466,8 @@ parquet_unit_ingestible::make_preparation_sources(io::ioctx_resolver resolve)
         }
         if (unit_.deletes == delete_format::parquet) {
           try {
-            result->ordinary =
-              binding_->read_parquet_deletes(unit_.original_file_index, allocator, stop);
+            result->ordinary = binding_->read_parquet_deletes(
+              unit_.original_file_index, allocator, stop, table_info().profiles->counters.get());
           } catch (duckdb::InterruptException const&) {
             throw;
           } catch (transparent::classified_execution_error const&) {

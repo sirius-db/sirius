@@ -21,7 +21,7 @@
 #include "scan_manager/preparation_stop_token.hpp"
 
 namespace sirius::ducklake {
-// Per-unit, local, no-snapshot DV profile. These bounds do not come from catalog counts.
+// Per-unit, local DV profile. These bounds do not come from catalog counts.
 inline constexpr uint64_t dv_max_file_bytes = 64ULL * 1024 * 1024;
 inline constexpr size_t dv_max_positions    = 1024 * 1024;
 inline constexpr size_t dv_max_footer_bytes = 1024 * 1024;
@@ -32,13 +32,43 @@ scan_manager::unit_envelope puffin_visibility_envelope(uint64_t file_bytes);
 scan_manager::unit_envelope parquet_unit_envelope(unit_descriptor const&);
 struct dv_visibility final : op::scan::prepared_visibility {
   std::string data_identity, delete_identity;
-  size_t validated_blobs = 0;
-  bool parquet_validated = false;
+  size_t validated_blobs          = 0;
+  bool parquet_validated          = false;
+  int64_t last_validated_position = -1;
   std::shared_ptr<dv_visibility const> predecessor;
   uint64_t inline_count = 0;
   std::span<int64_t const> positions;
   std::shared_ptr<op::scan::decoded_delete_positions const> decoded;
   scan_manager::charged_block merged;
+};
+// One payload, across every native-reader batch. Validate before snapshot selection.
+class parquet_delete_accumulator {
+ public:
+  parquet_delete_accumulator(std::span<int64_t> output,
+                             bool embedded_snapshots,
+                             uint64_t bound_snapshot,
+                             bool local_delete)
+    : output_(output),
+      embedded_(embedded_snapshots),
+      snapshot_(bound_snapshot),
+      local_(local_delete)
+  {
+  }
+  void append(std::optional<int64_t> position, std::optional<int64_t> snapshot);
+  // Parallel consumers stage rows at disjoint file offsets. Finish them in file order.
+  void stage(size_t offset, std::optional<int64_t> position, std::optional<int64_t> snapshot) const;
+  void consume_staged(size_t offset);
+  size_t validated_count() const { return validated_; }
+  std::span<int64_t const> positions() const { return output_.first(effective_); }
+  int64_t last_position() const { return previous_; }
+
+ private:
+  std::span<int64_t> output_;
+  bool embedded_;
+  uint64_t snapshot_;
+  bool local_;
+  size_t validated_ = 0, effective_ = 0;
+  int64_t previous_ = -1;
 };
 void validate_delete_position(int64_t position, int64_t& previous);
 std::shared_ptr<dv_visibility const> bind_parquet_visibility(std::shared_ptr<dv_visibility const>,

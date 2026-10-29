@@ -62,7 +62,6 @@ enum class unit_gate_reason : uint8_t {
   invalid_locator,
   encrypted_data,
   encrypted_delete,
-  partial_data,
   invalid_snapshot_range,
   unknown_delete_format,
   parquet_delete_semantics_required,

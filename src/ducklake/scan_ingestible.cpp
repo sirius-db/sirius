@@ -138,11 +138,14 @@ struct scan_ingestible::impl {
       state.checks    = scan::check_bit(scan::later_check::footer_per_file) |
                      scan::check_bit(scan::later_check::profile_per_file) |
                      scan::check_bit(scan::later_check::schema_per_file);
-      state.source        = std::move(source);
-      state.share_batches = [](scan::scan_info const& input) {
-        auto const* file = dynamic_cast<scan::parquet_file_scan_info const*>(&input);
-        return file && !file->row_groups.empty();
-      };
+      state.source = std::move(source);
+      // Snapshot bounds add a file-specific filter on the hidden snapshot column.
+      if (!descriptor->snapshot_min && !descriptor->snapshot_max) {
+        state.share_batches = [](scan::scan_info const& input) {
+          auto const* file = dynamic_cast<scan::parquet_file_scan_info const*>(&input);
+          return file && !file->row_groups.empty();
+        };
+      }
     } else {
       auto source = binding->make_inline_unit(
         next_file, contract, generation, admission, count_only, selected, std::move(opts));
