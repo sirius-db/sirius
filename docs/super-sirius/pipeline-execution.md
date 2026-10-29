@@ -286,6 +286,8 @@ while running:
     3. For each ready device, select a compatible queued task:
        a. pop the highest-priority exact-preference task
        b. if none exists, pop the highest-priority unbound task
+       c. if anyone subscribes (the preload executor), publish task_popped with the device and
+          the tasks it can still pop (its own bucket plus the unbound one)
     4. Dispatch; consume readiness only if the executor accepts the task
 ```
 
