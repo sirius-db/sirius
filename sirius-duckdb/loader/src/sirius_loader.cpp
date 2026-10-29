@@ -23,6 +23,7 @@
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/extension_helper.hpp"
+#include "duckdb/main/extension_install_info.hpp"
 #include "duckdb/main/settings.hpp"
 
 #include <dlfcn.h>
@@ -75,19 +76,21 @@ DUCKDB_CPP_EXTENSION_ENTRY(sirius, loader)
     throw duckdb::InvalidInputException(
       "Cannot load %s while %s is already loaded", backend, other);
   }
-  // Mirrors ExtensionHelper::AutoLoadExtension without its error wrapper; recheck on DuckDB
-  // upgrades.
   if (db.ExtensionIsLoaded(backend)) { return; }
   try {
     auto& fs = duckdb::FileSystem::GetLocal(db);
     if (duckdb::Settings::Get<duckdb::AutoinstallKnownExtensionsSetting>(db)) {
       auto repository = duckdb::ExtensionHelper::GetAutoinstallRepository(db);
+      if (repository.path == duckdb::ExtensionRepository::CORE_REPOSITORY_URL) {
+        if (!duckdb::ExtensionRepository::TryGetKnownRepository("community", repository)) {
+          throw duckdb::InternalException("DuckDB has no community extension repository");
+        }
+      }
       duckdb::ExtensionInstallOptions options;
       options.repository = repository;
       duckdb::ExtensionHelper::InstallExtension(db, fs, backend, options);
     }
     duckdb::ExtensionLoadOptions options(backend);
-    options.core_only = true;
     duckdb::ExtensionHelper::LoadExternalExtension(db, fs, options);
   } catch (std::exception const& error) {
     auto message = duckdb::StringUtil::Format(
