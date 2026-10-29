@@ -915,9 +915,11 @@ TEST_CASE("uring prefetch_reactors is accepted as a deprecated no-op",
   auto const baseline =
     load_scan_manager("sirius_uring_no_prefetch_reactors.yaml", uring_yaml("        {}\n"));
 
+  auto const value = GENERATE(as<std::string>{}, "1", "null", "auto", "[1, 2]", "-3");
+  CAPTURE(value);
   sirius::test::scoped_recording_log_sink logs{"warn"};
   auto const cfg = load_scan_manager("sirius_uring_prefetch_reactors.yaml",
-                                     uring_yaml("        prefetch_reactors: 1\n"));
+                                     uring_yaml("        prefetch_reactors: " + value + "\n"));
 
   auto const io          = cfg.to_io_config().uring;
   auto const baseline_io = baseline.to_io_config().uring;

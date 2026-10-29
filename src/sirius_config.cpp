@@ -36,6 +36,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <variant>
 #include <vector>
 
@@ -247,11 +248,10 @@ static void from_yaml(const YAML::Node& node, cucascade::io::uring::config& opt)
   }
   {
     // Deprecated: the reactor priority tiers replaced prefetch-reactor
-    // partitioning.  Consumed (so reject_unknown() passes) and ignored, so
-    // configs that still name it keep loading.
-    std::optional<long long> prefetch_reactors;
-    r.optional("prefetch_reactors", prefetch_reactors);
-    if (prefetch_reactors.has_value()) {
+    // partitioning. Consume any value (including null) without deserializing,
+    // always warn, then ignore it so configs that still name it keep loading.
+    if (r.has("prefetch_reactors")) {
+      std::ignore = r.optional_node("prefetch_reactors");
       SIRIUS_LOG_WARN(
         "'uring.prefetch_reactors' is deprecated and ignored: the reactor priority tiers replaced "
         "prefetch-reactor partitioning; remove the key from the config");
