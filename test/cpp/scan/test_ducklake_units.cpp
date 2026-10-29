@@ -21,10 +21,12 @@
 #include "ducklake/inline_varchar.hpp"
 #include "ducklake/preparation_identity.hpp"
 #include "ducklake/preparation_slot.hpp"
+#include "ducklake/scan_ingestible.hpp"
 #include "ducklake/unit_descriptor.hpp"
 #include "io/io_errors.hpp"
 #include "planner/connector_registry.hpp"
 #include "scan_manager/preparation_test_support.hpp"
+#include "utils/puffin_test_utils.hpp"
 
 #include <catch.hpp>
 #include <duckdb/common/multi_file/multi_file_function.hpp>
@@ -54,18 +56,15 @@ unit_descriptor local()
 }
 }  // namespace
 
-TEST_CASE("DuckLake unit scope preserves ordinary cutoff and inline dependencies",
-          "[ducklake_units]")
+TEST_CASE("DuckLake unit scope preserves inline visibility dependencies", "[ducklake_units]")
 {
   auto unit                     = local();
-  unit.max_row_count            = 0;
   unit.inline_delete_count      = 19;
   unit.transaction_local_delete = true;
   auto gate                     = assess_local_scope(unit);
   CHECK_FALSE(gate.outside_local_scope);
   CHECK(gate.reasons.empty());
   // These remain obligations for the later visibility/materialization seam.
-  CHECK(unit.max_row_count == 0);
   CHECK(unit.inline_delete_count == 19);
   CHECK(unit.transaction_local_delete);
   for (auto kind : {unit_kind::inline_table, unit_kind::transaction_local_inline}) {
@@ -75,12 +74,11 @@ TEST_CASE("DuckLake unit scope preserves ordinary cutoff and inline dependencies
   }
 }
 
-TEST_CASE("DuckLake local scans refuse partial data even when cutoff is zero", "[ducklake_units]")
+TEST_CASE("DuckLake local scans refuse partial snapshots", "[ducklake_units]")
 {
-  auto unit          = local();
-  unit.max_row_count = 0;
-  unit.snapshot_min  = 0;
-  auto gate          = assess_local_scope(unit);
+  auto unit         = local();
+  unit.snapshot_min = 0;
+  auto gate         = assess_local_scope(unit);
   CHECK(gate.outside_local_scope);
   CHECK(contains(gate, unit_gate_reason::partial_data));
   unit.snapshot_min = 9;
@@ -531,27 +529,8 @@ TEST_CASE("DuckLake zero-output mapping retains a physical carrier without user 
 }
 
 namespace {
-namespace sm = sirius::scan_manager;
-class dv_test_source final : public scan::puffin_byte_source {
- public:
-  std::vector<std::byte> bytes;
-  size_t offset  = 0;
-  bool fail_read = false;
-  bool seek(std::streamoff position) override
-  {
-    if (position < 0 || static_cast<size_t>(position) > bytes.size()) return false;
-    offset = position;
-    return true;
-  }
-  bool read(std::span<std::byte> out) override
-  {
-    if (fail_read || out.size() > bytes.size() - offset) return false;
-    std::copy_n(bytes.data() + offset, out.size(), out.data());
-    offset += out.size();
-    return true;
-  }
-  std::streamoff size() const override { return bytes.size(); }
-};
+namespace sm         = sirius::scan_manager;
+using dv_test_source = sirius::test::memory_puffin_source;
 std::vector<std::byte> dv_test_payload()
 {
   std::ifstream file(
@@ -567,17 +546,10 @@ std::vector<std::byte> dv_test_payload()
 }
 dv_test_source dv_test_container(std::string properties, bool corrupt_second = false)
 {
-  dv_test_source source;
-  auto append = [&](std::string_view text) {
-    for (auto c : text)
-      source.bytes.push_back(std::byte(c));
-  };
   auto payload = dv_test_payload();
-  append("PFA1");
-  source.bytes.insert(source.bytes.end(), payload.begin(), payload.end());
+  auto blobs   = payload;
   if (corrupt_second) payload.back() ^= std::byte{1};
-  source.bytes.insert(source.bytes.end(), payload.begin(), payload.end());
-  append("PFA1");
+  blobs.insert(blobs.end(), payload.begin(), payload.end());
   std::string json = R"({"blobs":[)";
   for (int i = 0; i < 2; ++i) {
     if (i) json += ",";
@@ -587,14 +559,7 @@ dv_test_source dv_test_container(std::string properties, bool corrupt_second = f
       (i ? properties : std::string{}) + "}}";
   }
   json += "]}";
-  append(json);
-  auto length = static_cast<uint32_t>(json.size());
-  for (int i = 0; i < 4; ++i)
-    source.bytes.push_back(std::byte((length >> (i * 8)) & 255));
-  for (int i = 0; i < 4; ++i)
-    source.bytes.push_back(std::byte{});
-  append("PFA1");
-  return source;
+  return dv_test_source(sirius::test::puffin_container(blobs, json));
 }
 unit_descriptor dv_test_unit(dv_test_source const& source)
 {
@@ -671,7 +636,6 @@ TEST_CASE("DuckLake DV invalid later blobs cannot publish partial visibility",
   auto unit   = dv_test_unit(source);
   if (mode == "size") ++unit.delete_file_size;
   if (mode == "footer") unit.delete_footer_size = 1;
-  if (mode == "crc") unit.max_row_count = 0;
   dv_test_budget budget(unit);
   if (mode == "allocation_failure") budget.provider.seen->fail_allocation = true;
   auto allocator = budget.ledger.allocator(budget.permit);
@@ -706,11 +670,7 @@ TEST_CASE("DuckLake DV bounded profile keeps adjacent dependencies unqualified",
   auto unit   = dv_test_unit(source);
   CHECK(parquet_unit_dependencies_supported(unit));
   auto mode = GENERATE(3, 5, 6);
-  if (mode == 0) unit.max_row_count = 0;
-  if (mode == 1) unit.inline_delete_count = 1;
-  if (mode == 2) unit.transaction_local_delete = true;
   if (mode == 3) unit.mapping_id = 1;
-  if (mode == 4) unit.deletes = delete_format::parquet;
   if (mode == 5) unit.delete_path = "s3://bucket/delete";
   if (mode == 6) unit.snapshot_min = 1;
   CHECK_FALSE(parquet_unit_dependencies_supported(unit));
@@ -720,21 +680,19 @@ TEST_CASE("DuckLake DV bounded profile keeps adjacent dependencies unqualified",
   CHECK_THROWS_AS(parquet_unit_envelope(unit), sm::preparation_resource_error);
 }
 
-TEST_CASE("DuckLake visibility unions inline positions without losing cutoff or file evidence",
+TEST_CASE("DuckLake visibility unions inline positions without losing file evidence",
           "[ducklake_units][ducklake_dv]")
 {
   auto source                   = dv_test_container({});
   auto unit                     = dv_test_unit(source);
   unit.inline_delete_count      = 3;
   unit.transaction_local_delete = true;
-  unit.max_row_count            = 0;
   CHECK(parquet_unit_dependencies_supported(unit));
   dv_test_budget budget(unit);
   auto allocator = budget.ledger.allocator(budget.permit);
   auto base      = prepare_dv_visibility(unit, 5, "data", source, allocator, {}, "deletes");
   std::array<uint64_t, 3> positions{0, 1, 4};
-  auto result = combine_inline_visibility(base, positions, 5, 0, allocator);
-  CHECK(result->max_row_count == 0);
+  auto result = combine_inline_visibility(base, positions, 5, allocator);
   CHECK(result->inline_count == 3);
   CHECK(result->data_identity == "data");
   CHECK(result->delete_identity == "deletes");
@@ -747,7 +705,7 @@ TEST_CASE("DuckLake visibility unions inline positions without losing cutoff or 
   base.reset();
   CHECK_FALSE(result->positions.empty());
   for (auto bad : std::vector<std::vector<uint64_t>>{{1, 1}, {4, 1}, {5}, {UINT64_MAX}})
-    CHECK_THROWS(combine_inline_visibility(result, bad, 5, 0, allocator));
+    CHECK_THROWS(combine_inline_visibility(result, bad, 5, allocator));
   result.reset();
   CHECK(budget.provider.seen->allocated_bytes == 0);
 }
@@ -931,4 +889,24 @@ TEST_CASE("DuckLake Parquet dependency errors distinguish mappings and snapshot 
   unit.delete_path = "s3://bucket/deletes";
   CHECK_THROWS_WITH(validate_parquet_unit_dependencies(unit),
                     "DuckLake remote deletes are outside the local scan profile");
+}
+
+TEST_CASE("DuckLake narrow scans admit without reserving unused string capacity",
+          "[ducklake_units]")
+{
+  auto strings = GENERATE(false, true);
+  sm::test::test_reservation_provider provider;
+  auto envelope        = scan_ingestible::envelope(1, strings ? 1 : 0);
+  provider.grant_bytes = envelope.retained + dv_max_file_bytes;
+  {
+    sm::preparation_ledger ledger(provider);
+    std::array scans{sm::scan_envelope{{envelope}, {}, true, 1}};
+    auto admitted = ledger.admit(scans, sm::memory_space_id(cucascade::memory::Tier::HOST, 0));
+    CHECK(admitted.deferred == !strings);
+    if (admitted.deferred) {
+      auto permit = ledger.try_acquire_unit({1, 1}, envelope.retained);
+      REQUIRE(permit);
+    }
+  }
+  CHECK(provider.outstanding() == 0);
 }

@@ -59,7 +59,8 @@ class binding_handle : public std::enable_shared_from_this<binding_handle> {
     bool count_only                      = false,
     unit_scan_options options            = {});
 
-  std::unique_ptr<inline_reader> open_inline_unit(uint64_t original_file_index);
+  std::unique_ptr<inline_reader> open_inline_unit(uint64_t original_file_index,
+                                                  std::vector<size_t> const& required_columns);
   std::shared_ptr<op::scan::arrow_import_ingestible> make_inline_unit(
     uint64_t original_file_index,
     uint64_t contract,
@@ -80,7 +81,7 @@ class binding_handle : public std::enable_shared_from_this<binding_handle> {
   // the statement preparation boundary transfers this private reader factory to Q.
   void bind_execution_owner();
   // Apply provider filtering to this execution's private list before discovery.
-  void configure_filters(std::vector<size_t> const&, duckdb::TableFilterSet&);
+  void configure_scan(std::vector<size_t> const&, duckdb::TableFilterSet*);
   bool can_prune_unit(uint64_t file_index) const;
   // Query/provider owner lane only. Lazily expand the original provider list;
   // return at most one descriptor, preserving its original index. No CPU scan.

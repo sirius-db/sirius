@@ -281,7 +281,7 @@ void binding_handle::bind_execution_owner()
   throw std::runtime_error("DuckLake private binding bridge is not built");
 #endif
 }
-void binding_handle::configure_filters(std::vector<size_t> const& selected, TableFilterSet& filters)
+void binding_handle::configure_scan(std::vector<size_t> const& selected, TableFilterSet* filters)
 {
   validate_statement();
 #ifdef SIRIUS_DUCKLAKE_PRIVATE_BRIDGE
@@ -292,13 +292,19 @@ void binding_handle::configure_filters(std::vector<size_t> const& selected, Tabl
     columns.emplace_back(index);
   auto context = impl_->context.lock();
   auto& bind   = *impl_->reader_binding;
-  MultiFileDynamicPushdownInfo info(
-    *context, bind.file_options, bind.names, bind.types, columns, filters);
-  auto filtered = bind.multi_file_reader->DynamicFilterPushdown(*impl_->files, info);
-  if (filtered) {
-    impl_->files   = shared_ptr<MultiFileList>(std::move(filtered));
-    bind.file_list = impl_->files;
+  if (filters) {
+    MultiFileDynamicPushdownInfo info(
+      *context, bind.file_options, bind.names, bind.types, columns, *filters);
+    auto filtered = bind.multi_file_reader->DynamicFilterPushdown(*impl_->files, info);
+    if (filtered) {
+      impl_->files   = shared_ptr<MultiFileList>(std::move(filtered));
+      bind.file_list = impl_->files;
+    }
   }
+  // Committed inline rows may be read while expanding the file list.
+  // Publish the projection before discovery, not only when opening its reader.
+  auto& schema = bind.reader_bind.schema.empty() ? bind.columns : bind.reader_bind.schema;
+  dynamic_cast<DuckLakeMultiFileList&>(*impl_->files).SetScanColumns(schema, columns);
 #endif
 }
 
@@ -627,11 +633,21 @@ struct inline_reader::impl {
   impl(std::shared_ptr<binding_handle> h,
        ClientContext& c,
        unique_ptr<MultiFileBindData> b,
-       unit_descriptor const& unit)
+       unit_descriptor const& unit,
+       std::vector<size_t> const& selected)
     : handle(std::move(h)), context(c), bind(std::move(b)), global(*bind->file_list), local(c)
   {
-    for (idx_t i = 0; i < bind->types.size(); ++i)
-      global.column_indexes.emplace_back(i);
+    duckdb::vector<duckdb::LogicalType> output_types;
+    for (auto index : selected) {
+      if (index >= bind->types.size())
+        throw std::invalid_argument("DuckLake inline projection index");
+      global.column_indexes.emplace_back(index);
+      output_types.push_back(bind->types[index]);
+    }
+    if (selected.empty()) {
+      global.column_indexes.emplace_back(COLUMN_IDENTIFIER_EMPTY);
+      output_types.push_back(duckdb::LogicalType::BOOLEAN);
+    }
     auto& columns = bind->reader_bind.schema.empty() ? bind->columns : bind->reader_bind.schema;
     global.multi_file_reader_state =
       bind->multi_file_reader->InitializeGlobalState(context,
@@ -646,7 +662,7 @@ struct inline_reader::impl {
     reader     = make_uniq<MultiFileReaderData>(std::move(opened));
     auto state = MultiFileFunction<ParquetMultiFileInfo>::InitializeReader(
       *reader, *bind, global.column_indexes, nullptr, context, unit.original_file_index, global);
-    output.Initialize(context, bind->types);
+    output.Initialize(context, output_types);
     if (state == ReaderInitializeType::SKIP_READING_FILE) {
       finished = true;
       return;
@@ -710,17 +726,18 @@ duckdb::DataChunk const* inline_reader::next()
   throw std::runtime_error("DuckLake private binding bridge is not built");
 #endif
 }
-std::unique_ptr<inline_reader> binding_handle::open_inline_unit(uint64_t index)
+std::unique_ptr<inline_reader> binding_handle::open_inline_unit(uint64_t index,
+                                                                std::vector<size_t> const& selected)
 {
   auto unit = unit_at(index);
   if (!unit || unit->kind == unit_kind::parquet || !assess_local_scope(*unit).reasons.empty() ||
-      unit->max_row_count || unit->inline_delete_count || unit->transaction_local_delete)
+      unit->inline_delete_count || unit->transaction_local_delete)
     throw std::invalid_argument("DuckLake inline unit has unqualified dependencies");
 #ifdef SIRIUS_DUCKLAKE_PRIVATE_BRIDGE
   auto context = impl_->context.lock();
   if (!context) throw std::runtime_error("DuckLake inline statement expired");
   return std::unique_ptr<inline_reader>(new inline_reader(std::make_unique<inline_reader::impl>(
-    shared_from_this(), *context, copy_reader_binding(*impl_->reader_binding), *unit)));
+    shared_from_this(), *context, copy_reader_binding(*impl_->reader_binding), *unit, selected)));
 #else
   throw std::runtime_error("DuckLake private binding bridge is not built");
 #endif

@@ -170,9 +170,7 @@ class plain_validator final : public scan::split_validator {
           (unit_.deletes == delete_format::puffin ? !visibility->validated_blobs
                                                   : !visibility->parquet_validated))) ||
         (visibility->inline_count != unit_.inline_delete_count) ||
-        visibility->max_row_count != unit_.max_row_count ||
-        ((!visibility->positions.empty() || visibility->max_row_count) &&
-         !parquet.disable_filter_pushdown))
+        (!visibility->positions.empty() && !parquet.disable_filter_pushdown))
       throw scan::certificate_incomplete(context.contract, {}, "DuckLake visibility is incomplete");
     for (size_t i = 0; i < parquet.rg_slices.size(); ++i) {
       auto const& slice = parquet.rg_slices[i];
@@ -363,15 +361,11 @@ op::scan::gpu_ingestible::metadata_claim parquet_unit_ingestible::try_claim_spli
       empty->data_identity = data_identity;
       visibility           = std::move(empty);
     }
-    if (copied || unit_.max_row_count) {
+    if (copied) {
       auto allocator = owned->ledger->allocator(owned->permit);
       try {
         visibility = combine_inline_visibility(
-          visibility,
-          copied ? std::span<uint64_t const>(copied->positions) : std::span<uint64_t const>{},
-          file.file_metadata->num_rows,
-          unit_.max_row_count,
-          allocator);
+          visibility, copied->positions, file.file_metadata->num_rows, allocator);
       } catch (transparent::classified_execution_error const&) {
         throw;
       } catch (std::bad_alloc const&) {
@@ -391,8 +385,7 @@ op::scan::gpu_ingestible::metadata_claim parquet_unit_ingestible::try_claim_spli
     std::shared_ptr<dv_visibility const> absent;
     if (!visibility_->value.compare_exchange_strong(absent, visibility))
       throw std::logic_error("DuckLake visibility was already sealed");
-    file.disable_filter_pushdown |=
-      !visibility->positions.empty() || visibility->max_row_count.has_value();
+    file.disable_filter_pushdown |= !visibility->positions.empty();
     deps[0].visibility = std::move(visibility);
     file.set_contract_payload(table_info().contract_id, std::move(certs), std::move(deps));
     return result;
@@ -525,7 +518,7 @@ op::scan::filtered_table parquet_unit_ingestible::materialize_metadata_to_table(
   auto visibility = visibility_->value.load();
   auto base       = parquet_gpu_ingestible::materialize_metadata_to_table(
     info, space, stream, like, std::move(cache), policy);
-  if (visibility->positions.empty() && !visibility->max_row_count) return base;
+  if (visibility->positions.empty()) return base;
   if (base.state != op::scan::filter_state::UNFILTERED)
     throw std::logic_error("DuckLake DV requires unfiltered original file rows");
   auto const& split = dynamic_cast<op::scan::parquet_split_info const&>(info);
@@ -541,11 +534,7 @@ op::scan::filtered_table parquet_unit_ingestible::materialize_metadata_to_table(
       return visibility->positions;
     },
     stream,
-    mr,
-    [&](std::string const& path) {
-      if (path != unit_.input.path) throw std::logic_error("DuckLake cutoff changed file");
-      return visibility->max_row_count;
-    });
+    mr);
   return {op::scan::owning_table_view{std::move(filtered)}, op::scan::filter_state::UNFILTERED};
 }
 }  // namespace sirius::ducklake

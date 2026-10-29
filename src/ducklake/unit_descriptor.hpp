@@ -40,7 +40,7 @@ struct unit_descriptor {
   duckdb::OpenFileInfo input;
   uint64_t bound_snapshot = 0, bound_schema_version = 0;
   std::optional<uint64_t> file_id, data_file_id, mapping_id, row_id_start, insertion_snapshot;
-  std::optional<uint64_t> max_row_count, snapshot_min, snapshot_max, inline_schema_version;
+  std::optional<uint64_t> snapshot_min, snapshot_max, inline_schema_version;
   uint64_t file_size = 0;
   std::optional<uint64_t> footer_size;
   bool encrypted = false;

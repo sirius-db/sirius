@@ -231,7 +231,6 @@ std::shared_ptr<dv_visibility const> combine_inline_visibility(
   std::shared_ptr<dv_visibility const> base,
   std::span<uint64_t const> inlined,
   int64_t file_rows,
-  std::optional<uint64_t> max_row_count,
   sm::charging_allocator& allocator)
 {
   if (!base || file_rows < 0)
@@ -249,7 +248,6 @@ std::shared_ptr<dv_visibility const> combine_inline_visibility(
   result->validated_blobs   = base->validated_blobs;
   result->parquet_validated = base->parquet_validated;
   result->inline_count      = inlined.size();
-  result->max_row_count     = max_row_count;
   auto count                = base->positions.size() + inlined.size();
   if (count) {
     result->merged = allocator.allocate_retained(count * sizeof(int64_t));

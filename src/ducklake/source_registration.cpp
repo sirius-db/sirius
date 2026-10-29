@@ -29,6 +29,7 @@
 #include <duckdb/common/exception.hpp>
 #include <duckdb/common/multi_file/multi_file_states.hpp>
 
+#include <algorithm>
 #include <numeric>
 namespace sirius::ducklake {
 namespace {
@@ -85,8 +86,13 @@ std::optional<scan_manager::preparation_request> prepare_scan(op::sirius_physica
     throw std::invalid_argument("DuckLake prepared binding differs from the certified read view");
   auto selected                          = std::make_shared<scan_layout>(layout(scan));
   selected->options.scan_task_batch_size = params.scan_task_batch_size;
+  auto const& types                      = scan.bound_view->identity->bound_types;
+  auto strings =
+    std::count_if(selected->selected.begin(), selected->selected.end(), [&](auto index) {
+      return types[index] == duckdb::LogicalType::VARCHAR;
+    });
   return scan_manager::preparation_request{
-    {{scan_ingestible::envelope()}, {}, true, 1},
+    {{scan_ingestible::envelope(selected->selected.size(), strings)}, {}, true, 1},
     [](scan_manager::preparation_ledger&) {},
     [&scan, binding, selected](std::shared_ptr<scan_manager::preparation_admission> admission) {
       auto const& entry = scan.read_views->entry(scan.contract_id);

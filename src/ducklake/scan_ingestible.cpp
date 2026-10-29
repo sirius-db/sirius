@@ -87,12 +87,6 @@ struct unit_split final : scan::scan_info {
       coalescer(c),
       coalesced(ready)
   {
-    set_contract_payload(
-      owner->contract,
-      input ? std::vector(input->certificates().begin(), input->certificates().end())
-            : std::vector<scan::split_materializer_certificate>{},
-      input ? std::vector(input->dependencies().begin(), input->dependencies().end())
-            : std::vector<scan::split_dependencies>{});
   }
   std::span<scan::split_materializer_certificate const> certificates() const override
   {
@@ -455,10 +449,9 @@ scan_ingestible::scan_ingestible(std::shared_ptr<binding_handle> binding,
 {
 }
 scan_ingestible::~scan_ingestible() = default;
-sm::unit_envelope scan_ingestible::envelope()
+sm::unit_envelope scan_ingestible::envelope(size_t columns, size_t string_columns)
 {
-  auto result              = inline_batch_producer::envelope(inline_batch_producer::max_columns,
-                                                inline_batch_producer::max_columns);
+  auto result              = inline_batch_producer::envelope(columns, string_columns);
   result.temporary.front() = std::max<uint64_t>(dv_max_file_bytes, result.temporary.front());
   result.retained = 14 * dv_max_footer_bytes + 512 + 4 * dv_max_positions * sizeof(int64_t);
   return result;
@@ -467,8 +460,7 @@ sm::unit_envelope scan_ingestible::envelope()
 void scan_ingestible::preflight_for_query()
 {
   impl_->binding->bind_execution_owner();
-  if (impl_->options.filters)
-    impl_->binding->configure_filters(impl_->selected, *impl_->options.filters);
+  impl_->binding->configure_scan(impl_->selected, impl_->options.filters.get());
 }
 bool scan_ingestible::has_processed_all_metadata() const { return impl_->done; }
 scan_ingestible::metadata_scan_task_t scan_ingestible::next_split_provider(io::ioctx_resolver)
@@ -515,7 +507,7 @@ void scan_ingestible::attach_preparation_ledger(std::shared_ptr<sm::preparation_
   impl_->options.parquet_slot = std::make_shared<preparation_slot>(
     ledger,
     sm::unit_key{impl_->owner->contract, impl_->options.identities->next()},
-    envelope().retained);
+    envelope(0, 0).retained);
   impl_->ledger = std::move(ledger);
 }
 void scan_ingestible::stop_preparation() noexcept

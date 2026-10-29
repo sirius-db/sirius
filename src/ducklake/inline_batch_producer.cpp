@@ -146,7 +146,7 @@ struct inline_batch_producer::impl {
     auto& predicate       = import.predicate;
     auto const& u         = binding->unit;
     if (!contract || !generation || !u.read_view || u.kind == unit_kind::parquet ||
-        !assess_local_scope(u).reasons.empty() || u.max_row_count || u.inline_delete_count ||
+        !assess_local_scope(u).reasons.empty() || u.inline_delete_count ||
         u.transaction_local_delete || !admission || !admission->decision.deferred)
       throw std::invalid_argument("DuckLake inline unit has unqualified dependencies/admission");
     auto const& types = u.read_view->bound_types;
@@ -234,7 +234,7 @@ struct inline_batch_producer::impl {
   {
     handle->validate_statement();
     if (cancelled || stop.stop_requested()) throw duckdb::InterruptException();
-    if (!reader) reader = handle->open_inline_unit(binding->unit.original_file_index);
+    if (!reader) reader = handle->open_inline_unit(binding->unit.original_file_index, selected);
     while (!chunk || offset == chunk->size()) {
       if (cancelled || stop.stop_requested()) throw duckdb::InterruptException();
       chunk  = reader->next();
@@ -250,7 +250,7 @@ struct inline_batch_producer::impl {
         std::array<size_t, columns> lengths{};
         bool fits = true;
         for (auto col : strings) {
-          auto value  = borrow_inline_varchar(chunk->data[selected[col]], offset + accepted);
+          auto value  = borrow_inline_varchar(chunk->data[col], offset + accepted);
           auto length = value ? value->size() : 0;
           if (length > max_string_bytes - used - row_bytes) {
             fits = false;
@@ -279,7 +279,9 @@ struct inline_batch_producer::impl {
     auto allocation = allocator.allocate(base_bytes);
     // Arrow buffers are independently owned. Character storage need not be
     // adjacent to the schema, fixed-width values or import staging arena.
-    auto characters = strings.empty() ? sm::charged_block{} : allocator.allocate(max_string_bytes);
+    auto char_bytes = std::accumulate(string_sizes.begin(), string_sizes.end(), size_t{0});
+    auto characters =
+      strings.empty() ? sm::charged_block{} : allocator.allocate(std::max<size_t>(1, char_bytes));
     auto staging_bytes      = width ? max_staging_bytes : 0;
     auto capacity           = std::make_shared<arrow_capacity>(std::move(input.lifetime),
                                                      std::move(allocation),
@@ -316,7 +318,7 @@ struct inline_batch_producer::impl {
       size_t char_offset = 0;
       for (size_t row = 0; row < count; ++row) {
         if (is_string) {
-          auto value = borrow_inline_varchar(chunk->data[selected[col]], offset + row);
+          auto value = borrow_inline_varchar(chunk->data[col], offset + row);
           if (value) {
             if (value->size() > string_sizes[col] - char_offset)
               throw std::logic_error("DuckLake borrowed VARCHAR changed during detach");
@@ -327,7 +329,7 @@ struct inline_batch_producer::impl {
             ++array.null_count;
           offsets[row + 1] = static_cast<int32_t>(char_offset);
         } else {
-          auto value = chunk->GetValue(selected[col], offset + row);
+          auto value = chunk->GetValue(col, offset + row);
           if (value.IsNull())
             ++array.null_count;
           else {

@@ -1642,33 +1642,6 @@ TEST_CASE("Planning binds validators before publishing correspondence",
   CHECK_THROWS_AS(registry.bind_split_validator(id, parquet_split_validator()), std::logic_error);
 }
 
-TEST_CASE("Original row limits compose with deletes across pruned file runs",
-          "[materialization][scan]")
-{
-  auto cutoff = GENERATE(uint64_t{0}, uint64_t{12}, uint64_t{31}, UINT64_MAX);
-  rmm::cuda_stream stream;
-  auto mr = cudf::get_current_device_resource_ref();
-  std::vector<std::unique_ptr<cudf::column>> columns;
-  columns.push_back(constant(7, 6, stream));
-  std::array<batch_row_run, 2> runs{{{"a", 10, 0, 3, 0}, {"a", 30, 3, 3, 0}}};
-  std::array<int64_t, 2> deleted{11, 30};
-  auto result = apply_positional_visibility(
-    std::make_unique<cudf::table>(std::move(columns)),
-    runs,
-    [&](std::string const& path) -> std::span<int64_t const> {
-      REQUIRE(path == "a");
-      return deleted;
-    },
-    stream,
-    mr,
-    [&](std::string const&) -> std::optional<uint64_t> { return cutoff; });
-  size_t expected = 0;
-  for (uint64_t pos : {10, 11, 12, 30, 31, 32})
-    if (pos < cutoff && pos != 11 && pos != 30) ++expected;
-  CHECK(result->num_rows() == expected);
-  stream.synchronize();
-}
-
 TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
                  "Mapped footer pruning preserves physical groups and optional statistics",
                  "[materialization][scan][mapping]")

@@ -35,7 +35,6 @@ struct dv_visibility final : op::scan::prepared_visibility {
   bool parquet_validated = false;
   std::shared_ptr<dv_visibility const> predecessor;
   uint64_t inline_count = 0;
-  std::optional<uint64_t> max_row_count;
   std::span<int64_t const> positions;
   std::shared_ptr<op::scan::decoded_delete_positions const> decoded;
   scan_manager::charged_block merged;
@@ -44,12 +43,10 @@ void validate_delete_position(int64_t position, int64_t& previous);
 std::shared_ptr<dv_visibility const> bind_parquet_visibility(std::shared_ptr<dv_visibility const>,
                                                              std::string data_identity,
                                                              int64_t file_rows);
-std::shared_ptr<dv_visibility const> combine_inline_visibility(
-  std::shared_ptr<dv_visibility const>,
-  std::span<uint64_t const>,
-  int64_t file_rows,
-  std::optional<uint64_t> max_row_count,
-  scan_manager::charging_allocator&);
+std::shared_ptr<dv_visibility const> combine_inline_visibility(std::shared_ptr<dv_visibility const>,
+                                                               std::span<uint64_t const>,
+                                                               int64_t file_rows,
+                                                               scan_manager::charging_allocator&);
 // Structural/source seam for adapter tests; it cannot publish a scan certificate.
 std::shared_ptr<dv_visibility const> prepare_dv_visibility(unit_descriptor const&,
                                                            int64_t file_rows,
