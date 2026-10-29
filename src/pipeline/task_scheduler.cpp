@@ -17,12 +17,10 @@
 #include "pipeline/task_scheduler.hpp"
 
 #include "creator/task_creator.hpp"
-#include "data/convertible_gpu_pipeline_task.hpp"
 #include "downgrade/downgrade_executor.hpp"
 #include "exec/config.hpp"
 #include "exec/multi_index_priority_queue.hpp"
 #include "log/logging.hpp"
-#include "memory/device_preload_budget.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
@@ -34,7 +32,6 @@
 #include "telemetry-bridge/gen/quent.hpp"
 #include "telemetry/telemetry_context.hpp"
 
-#include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
@@ -56,29 +53,25 @@ namespace {
 /**
  * @brief Report a task the matcher just popped for @p device_id as one @c task_popped event.
  *
- * Only a gpu_pipeline_task attached to a pipeline is reported; its pipeline and query are read
- * through a checked cast of the global state. @c tasks_left counts what @p device_id can still
- * pop: its own bucket plus the no-preference bucket. Never throws: the event is advisory and must
- * not fail the popped task.
+ * Only a task attached to a pipeline is reported; its pipeline and query are read through a
+ * checked cast of the global state. @c tasks_left counts what @p device_id can still pop: its own
+ * bucket plus the no-preference bucket. It is an advisory snapshot: the two buckets are counted
+ * under separate lock acquisitions, and tasks the downgrade executor has extracted at that moment
+ * are not counted. Never throws: the event is advisory and must not fail the popped task.
  */
 void publish_task_popped(event::query_event_publisher& publisher,
                          exec::multi_index_priority_queue<sirius::parallel::itask> const& queue,
-                         sirius::parallel::itask& task,
+                         gpu_pipeline_task& task,
                          int device_id) noexcept
 {
   try {
-    auto* gpu_task = task.as<gpu_pipeline_task>();
-    if (gpu_task == nullptr) { return; }
-    auto const* gs = dynamic_cast<gpu_pipeline_task_global_state const*>(gpu_task->global_state());
+    auto const* gs   = dynamic_cast<gpu_pipeline_task_global_state const*>(task.global_state());
     auto const* pipe = gs != nullptr ? gs->get_pipeline() : nullptr;
     if (pipe == nullptr) { return; }
     auto const tasks_left = queue.size(exec::gpu_index{device_id}) +
                             queue.size(exec::gpu_index{exec::no_preferred_device});
-    publisher.publish_task_popped(pipe->get_query_id(),
-                                  gpu_task->get_task_id(),
-                                  pipe->get_pipeline_id(),
-                                  device_id,
-                                  tasks_left);
+    publisher.publish_task_popped(
+      pipe->get_query_id(), task.get_task_id(), pipe->get_pipeline_id(), device_id, tasks_left);
   } catch (...) {
   }
 }
@@ -390,34 +383,17 @@ void task_scheduler::management_eventloop()
         ++it;
         continue;
       }
-      popped_any = true;
+      popped_any       = true;
+      auto* attributed = dynamic_cast<gpu_pipeline_task*>(task.get());
       // Before anything that could dispatch or drop the task. Counting the buckets takes the queue
       // lock, so it is skipped while nobody listens.
-      if (_query_event_publisher->has_subscribers(event::event_type::task_popped)) {
-        publish_task_popped(*_query_event_publisher, _task_queue, *task, device_id);
+      if (attributed != nullptr &&
+          _query_event_publisher->has_subscribers(event::event_type::task_popped)) {
+        publish_task_popped(*_query_event_publisher, _task_queue, *attributed, device_id);
       }
-      auto* attributed     = dynamic_cast<gpu_pipeline_task*>(task.get());
       auto failure_handler = attributed ? attributed->get_completion_handler() : nullptr;
       try {
         if (auto* gpu_task = dynamic_cast<pipeline::gpu_pipeline_task*>(task.get())) {
-          // Release this task's preloaded input charges the instant it is claimed, before
-          // task_deployed is published, so the preload planner pass that event triggers already
-          // sees the freed device preloading budget. The board releases a charge whatever device
-          // holds it. Skipped when the board is absent or empty.
-          if (_device_preload_budget && !_device_preload_budget->empty()) {
-            if (auto const* data =
-                  sirius::convertible_gpu_pipeline_task::get_pipelineable_data(*task)) {
-              // Consume the task's existing batch range in place (no allocation on the matcher
-              // thread, so an advisory accounting op can never fail the SQL task with bad_alloc).
-              _device_preload_budget->claim_range(
-                data->get_data_batches(),
-                [](std::shared_ptr<cucascade::data_batch> const& batch) noexcept
-                  -> std::optional<std::uint64_t> {
-                  if (batch) { return batch->get_batch_id(); }
-                  return std::nullopt;
-                });
-            }
-          }
           {
             // Priority packs query_id in its high 32 bits (see task_creator); the
             // queue's key extractor unpacks it the same way.

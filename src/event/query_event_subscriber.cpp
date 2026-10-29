@@ -163,23 +163,6 @@ void query_event_subscriber::on_compressed_materialization(event_id_t,
 {
 }
 
-void query_event_subscriber::on_batch_downgraded(event_id_t,
-                                                 timestamp_t,
-                                                 query_id_t,
-                                                 downgraded_batch const&) noexcept
-{
-}
-
-void query_event_subscriber::on_task_completed(
-  event_id_t, timestamp_t, query_id_t, std::size_t, int, task_outcome) noexcept
-{
-}
-
-void query_event_subscriber::on_memory_wait_ended_for_task(
-  event_id_t, timestamp_t, query_id_t, std::size_t, int, std::size_t) noexcept
-{
-}
-
 void query_event_subscriber::on_task_downgraded(event_id_t,
                                                 timestamp_t,
                                                 query_id_t,
@@ -241,12 +224,6 @@ void query_event_subscriber::dispatch(query_events const& event) noexcept
             on_wait_for_memory_for_task(e.event_id, e.timestamp, args...);
           } else if constexpr (type == event_type::compressed_materialization) {
             on_compressed_materialization(e.event_id, e.timestamp, args...);
-          } else if constexpr (type == event_type::batch_downgraded) {
-            on_batch_downgraded(e.event_id, e.timestamp, args...);
-          } else if constexpr (type == event_type::task_completed) {
-            on_task_completed(e.event_id, e.timestamp, args...);
-          } else if constexpr (type == event_type::memory_wait_ended_for_task) {
-            on_memory_wait_ended_for_task(e.event_id, e.timestamp, args...);
           } else if constexpr (type == event_type::task_downgraded) {
             on_task_downgraded(e.event_id, e.timestamp, args...);
           } else if constexpr (type == event_type::task_popped) {

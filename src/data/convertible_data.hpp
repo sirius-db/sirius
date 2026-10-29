@@ -16,12 +16,12 @@
 
 #pragma once
 
-#include "event/downgraded_batch.hpp"
 #include "exec/query_lifecycle_registry.hpp"
 
 #include <cuda/stream>
 
-#include <atomic>
+#include <cucascade/memory/common.hpp>
+
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -32,6 +32,7 @@
 
 // Forward declarations -- avoid pulling in heavy headers
 namespace cucascade {
+class data_batch;
 namespace memory {
 class memory_space;
 }  // namespace memory
@@ -45,15 +46,18 @@ class sirius_memory_reservation_manager;
 
 namespace sirius {
 
-/**
- * @brief Process-wide source of @c event::downgraded_batch::conversion_seq.
- *
- * Implementations take the next value while they hold the converted batch's exclusive lock.
- * The lock orders two conversions of the same batch, and every read-modify-write of one atomic
- * respects that order, so relaxed increments suffice: a later move of a batch always receives a
- * larger sequence number than an earlier one.
- */
-inline std::atomic<std::uint64_t> g_conversion_seq{0};
+/// One batch moved by convert() while recording was on.
+struct conversion_record {
+  /// The batch that was moved. Never extends its lifetime.
+  std::weak_ptr<cucascade::data_batch> batch;
+  std::uint64_t batch_id{0};
+  /// Memory space the batch was in before the move.
+  cucascade::memory::memory_space_id from{cucascade::memory::Tier::SIZE, -1};
+  /// Memory space the batch is in after the move.
+  cucascade::memory::memory_space_id to{cucascade::memory::Tier::SIZE, -1};
+  /// Size of the batch in @c from.
+  std::size_t bytes{0};
+};
 
 /**
  * @brief Abstract interface for a single unit of data that can be converted between memory tiers.
@@ -65,7 +69,7 @@ inline std::atomic<std::uint64_t> g_conversion_seq{0};
  * - Acquiring mutable_data_batch via to_mutable() (blocking) or try_to_mutable() (non-blocking)
  * - Performing the actual data conversion via convert_to on the mutable accessor
  * - RAII automatic state restoration on all exit paths (success, failure, exception)
- * - Recording one @c event::downgraded_batch per successful batch conversion while
+ * - Recording one @c conversion_record per successful batch conversion while
  *   record_conversions(true) is in effect, so the caller can report what moved once
  *   convert() has returned and every batch lock has been released.
  */
@@ -99,7 +103,7 @@ class convertible_data {
    * readable. Read only after convert() has returned or thrown; the next convert() may invalidate
    * the span.
    */
-  [[nodiscard]] std::span<const event::downgraded_batch> converted_batches() const noexcept
+  [[nodiscard]] std::span<const conversion_record> converted_batches() const noexcept
   {
     return _converted;
   }
@@ -148,7 +152,7 @@ class convertible_data {
    * Never throws: if the record cannot be stored it is dropped. A lost record only means the
    * move is not reported, which costs a missed promotion and never correctness.
    */
-  void note_converted(event::downgraded_batch rec) noexcept
+  void note_converted(conversion_record rec) noexcept
   {
     try {
       _converted.push_back(std::move(rec));
@@ -158,7 +162,7 @@ class convertible_data {
 
  private:
   bool _record{false};
-  std::vector<event::downgraded_batch> _converted;
+  std::vector<conversion_record> _converted;
 };
 
 /**

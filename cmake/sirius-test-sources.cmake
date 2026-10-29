@@ -45,7 +45,6 @@ set(TEST_SOURCES
     test/cpp/data/test_data_repository_manager_registry.cpp
     test/cpp/data/test_convertible_gpu_pipeline_task.cpp
     test/cpp/downgrade/test_downgrade_disk.cpp
-    test/cpp/downgrade/test_downgrade_events.cpp
     test/cpp/creator/test_task_creator.cpp
     test/cpp/downgrade/test_downgrade_executor.cpp
     test/cpp/downgrade/test_downgrade_lifecycle.cpp
@@ -207,8 +206,6 @@ set(TEST_SOURCES
     test/cpp/operator/test_physical_union.cpp
     test/cpp/operator/test_physical_union_mgpu.cpp
     test/cpp/operator/test_partition_memspace_mgpu.cpp
-    test/cpp/memory/test_memory_wait_board.cpp
-    test/cpp/memory/test_device_preload_budget.cpp
     test/cpp/memory/test_multiple_blocks_allocation_accessor.cpp
     test/cpp/memory/test_topology_index.cpp
     test/cpp/operator/test_build_probe_scheduling.cpp

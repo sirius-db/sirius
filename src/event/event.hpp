@@ -16,7 +16,6 @@
 
 #pragma once
 
-#include "event/downgraded_batch.hpp"
 #include "event/downgraded_task.hpp"
 #include "exec/queue_priority.hpp"
 #include "op/sirius_physical_operator_type.hpp"
@@ -45,9 +44,6 @@ enum class event_type : std::uint8_t {
   memory_downgrade_for_task,
   wait_for_memory_for_task,
   compressed_materialization,
-  batch_downgraded,
-  task_completed,
-  memory_wait_ended_for_task,
   task_downgraded,
   task_popped
 };
@@ -61,17 +57,6 @@ enum class compressed_materialization_activity : std::uint8_t {
   scan_sidecar_installed,
   partition_narrow_columns,
   scan_narrow_targets_retracted
-};
-
-/// How a task that reached the end of its run on an executor left it.
-///
-/// A task that fails terminally (an error, an exhausted retry budget, or a query that already
-/// failed) publishes no @c task_completed: its reservation is still released when it is
-/// destroyed, but subscribers learn of it only through the query's retirement.
-enum class task_outcome : std::uint8_t {
-  succeeded,       ///< ran to completion; its reservation and inputs have been released
-  rescheduled,     ///< handed back to the scheduler after a retryable failure
-  oom_rescheduled  ///< handed back to the scheduler after running out of memory
 };
 
 /// One published event: the tag that says which it is, and the arguments the
@@ -124,18 +109,6 @@ using wait_for_memory_for_task_event =
 using compressed_materialization_event =
   event<event_type::compressed_materialization, compressed_materialization_activity, std::uint64_t>;
 
-using batch_downgraded_event = event<event_type::batch_downgraded, query_id_t, downgraded_batch>;
-
-/// Carries the query's real id, taken from the task's pipeline.
-using task_completed_event =
-  event<event_type::task_completed, query_id_t, std::size_t, int, task_outcome>;
-
-/// Carries the query id recovered from the task's priority, exactly as the
-/// @c wait_for_memory_for_task and @c memory_downgrade_for_task events it ends
-/// do, so the three can be matched against one another.
-using memory_wait_ended_for_task_event =
-  event<event_type::memory_wait_ended_for_task, query_id_t, std::size_t, int, std::size_t>;
-
 /// One per queued task the downgrade executor converted; lists only the inputs that moved.
 using task_downgraded_event = event<event_type::task_downgraded, query_id_t, downgraded_task>;
 
@@ -160,9 +133,6 @@ using query_events = std::variant<task_created_event,
                                   memory_downgrade_for_task_event,
                                   wait_for_memory_for_task_event,
                                   compressed_materialization_event,
-                                  batch_downgraded_event,
-                                  task_completed_event,
-                                  memory_wait_ended_for_task_event,
                                   task_downgraded_event,
                                   task_popped_event>;
 
@@ -183,16 +153,6 @@ static_assert(
     std::variant_alternative_t<event_index_v<compressed_materialization_event>, query_events>,
     compressed_materialization_event>);
 static_assert(
-  std::is_same_v<std::variant_alternative_t<event_index_v<batch_downgraded_event>, query_events>,
-                 batch_downgraded_event>);
-static_assert(
-  std::is_same_v<std::variant_alternative_t<event_index_v<task_completed_event>, query_events>,
-                 task_completed_event>);
-static_assert(
-  std::is_same_v<
-    std::variant_alternative_t<event_index_v<memory_wait_ended_for_task_event>, query_events>,
-    memory_wait_ended_for_task_event>);
-static_assert(
   std::is_same_v<std::variant_alternative_t<event_index_v<task_downgraded_event>, query_events>,
                  task_downgraded_event>);
 static_assert(
@@ -211,9 +171,6 @@ inline constexpr std::array<event_type, n_query_events> all_query_events{
   event_type::memory_downgrade_for_task,
   event_type::wait_for_memory_for_task,
   event_type::compressed_materialization,
-  event_type::batch_downgraded,
-  event_type::task_completed,
-  event_type::memory_wait_ended_for_task,
   event_type::task_downgraded,
   event_type::task_popped};
 

@@ -37,9 +37,7 @@
 #include <cucascade/memory/memory_space.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
 
-#include <atomic>
 #include <cstddef>
-#include <cstdint>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -61,22 +59,18 @@ class convertible_data_batch : public convertible_data {
  public:
   /**
    * @brief Construct from a shared_ptr to a cucascade data_batch.
-   * @param batch      The data batch to wrap (shared ownership retained).
-   * @param repo_token Identity of the repository holding the batch, or 0 when the batch was not
-   *                   found in a repository. Only copied into conversion records.
-   * @param partition  Partition of that repository holding the batch.
-   * @param source_space When set, convert() moves the batch only while it is still in this space:
-   *        the space it was picked to relieve. It may have moved since, to another GPU whose
-   *        memory the caller's stream cannot serve.
+   * @param batch        The data batch to wrap (shared ownership retained).
+   * @param source_space When non-null, convert() only moves the batch while it is still in this
+   *                     space -- the space it was picked to relieve. The batch may have moved
+   *                     since (e.g. spilled and upgraded on another GPU), and converting it with
+   *                     the caller's stream, which belongs to the original device, would then
+   *                     fail inside cuCascade ("stream belongs to CUDA device N but this
+   *                     representation's memory lives on device M"). Leave null to allow
+   *                     conversion from any space.
    */
   explicit convertible_data_batch(std::shared_ptr<cucascade::data_batch> batch,
-                                  std::uintptr_t repo_token                           = 0,
-                                  std::size_t partition                               = 0,
                                   cucascade::memory::memory_space const* source_space = nullptr)
-    : _batch(std::move(batch)),
-      _repo_token(repo_token),
-      _partition(partition),
-      _source_space(source_space)
+    : _batch(std::move(batch)), _source_space(source_space)
   {
   }
 
@@ -89,8 +83,7 @@ class convertible_data_batch : public convertible_data {
    * the batch is converted via convert_to on the mutable accessor. The mutable_data_batch
    * RAII destructor automatically restores the batch to idle on all exit paths.
    *
-   * While recording is on, a successful conversion appends one record whose sequence number is
-   * taken before the exclusive lock is released.
+   * While recording is on, a successful conversion appends one record.
    *
    * @param target_spaces  Candidate memory spaces to convert into (tried in order).
    * @param stream         CUDA stream for asynchronous memory operations.
@@ -196,16 +189,12 @@ class convertible_data_batch : public convertible_data {
         // The batch has already moved and cannot be moved back, so a failure while building the
         // record drops the record rather than failing the conversion.
         try {
-          event::downgraded_batch rec;
-          rec.batch          = _batch;
-          rec.batch_id       = mut.get_batch_id();
-          rec.conversion_seq = g_conversion_seq.fetch_add(1, std::memory_order_relaxed);
+          conversion_record rec;
+          rec.batch    = _batch;
+          rec.batch_id = mut.get_batch_id();
           if (cur_space != nullptr) { rec.from = cur_space->get_id(); }
-          rec.to         = space->get_id();
-          rec.bytes      = data_size;
-          rec.source     = event::downgrade_source::repository;
-          rec.repository = _repo_token;
-          rec.partition  = _partition;
+          rec.to    = space->get_id();
+          rec.bytes = data_size;
           note_converted(std::move(rec));
         } catch (...) {
         }
@@ -268,8 +257,6 @@ class convertible_data_batch : public convertible_data {
   }
 
   std::shared_ptr<cucascade::data_batch> _batch;
-  std::uintptr_t _repo_token{0};
-  std::size_t _partition{0};
   /// Non-owning; null converts the batch from any space.
   cucascade::memory::memory_space const* _source_space{nullptr};
 };
@@ -431,8 +418,7 @@ class convertible_data_batch_provider : public convertible_data_provider {
     auto ro = batch->try_to_read_only();
     if (!ro) { return nullptr; }
     if (ro->get_memory_space() == space) {
-      return std::make_unique<convertible_data_batch>(
-        std::move(batch), reinterpret_cast<std::uintptr_t>(_repo), partition_idx, space);
+      return std::make_unique<convertible_data_batch>(std::move(batch), space);
     }
 
     return nullptr;
