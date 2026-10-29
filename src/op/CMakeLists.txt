@@ -31,6 +31,7 @@ target_sources(
           scan/scan_utils.cpp
           scan/sirius_gpu_scan_operator.cpp
           scan/sirius_gpu_scan_operator_data.cpp
+          scan/composite_scan_driver.cpp
           scan/gpu_ingestible.cpp
           scan/parquet_gpu_ingestible.cpp
           scan/parquet_scan_core.cpp
