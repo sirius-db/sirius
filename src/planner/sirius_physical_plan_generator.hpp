@@ -48,6 +48,7 @@ class Value;
 class ColumnDataCollection;
 class LogicalOperator;
 class LogicalAggregate;
+class LogicalAnyJoin;
 class LogicalColumnDataGet;
 class LogicalComparisonJoin;
 class LogicalCrossProduct;
@@ -154,8 +155,8 @@ class sirius_physical_plan_generator {
 
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
     duckdb::LogicalAggregate& op);
-  // duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalAnyJoin
-  // &op);
+  //! Plan an INNER ANY join as a cross product filtered by its condition; other join types throw.
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalAnyJoin& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
     duckdb::LogicalColumnDataGet& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
@@ -172,14 +173,14 @@ class sirius_physical_plan_generator {
     duckdb::LogicalCrossProduct& op);
   //! Lower a join with no conditions to the nested loop join's cross product. Shared by the
   //! LogicalCrossProduct overload and by plan_comparison_join for a LogicalComparisonJoin whose
-  //! condition list is empty, so the two entry points cannot drift.
+  //! condition list is empty, so the two entry points cannot drift. Leaves
+  //! op.estimated_cardinality to the caller.
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_cross_product_join(
     duckdb::LogicalOperator& op,
     duckdb::unique_ptr<sirius::op::sirius_physical_operator> left,
     duckdb::unique_ptr<sirius::op::sirius_physical_operator> right,
     duckdb::JoinType join_type,
-    std::size_t lhs_cardinality,
-    std::size_t rhs_cardinality,
+    std::size_t estimated_cardinality,
     duckdb::vector<std::size_t> left_projection_map,
     duckdb::vector<std::size_t> right_projection_map);
   // duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalDelete
