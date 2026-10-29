@@ -895,6 +895,45 @@ TEST_CASE("sirius_config rejects invalid cuFile settings with key context",
   }
 }
 
+TEST_CASE("the documented cuFile configuration example loads",
+          "[scan_manager][config][backend][cufile]")
+{
+  std::ifstream doc(SIRIUS_PROJECT_ROOT "/docs/super-sirius/configuration.md");
+  REQUIRE(doc.is_open());
+  bool in_yaml = false;
+  std::string block;
+  std::string example;
+  size_t examples = 0;
+  for (std::string line; std::getline(doc, line);) {
+    if (!in_yaml) {
+      if (line == "```yaml") {
+        in_yaml = true;
+        block.clear();
+      }
+    } else if (line == "```") {
+      if (block.find("backend: cufile") != std::string::npos) {
+        ++examples;
+        example = block;
+      }
+      in_yaml = false;
+    } else {
+      block += line + '\n';
+    }
+  }
+  REQUIRE(examples == 1);
+  scan_manager_config cfg;
+  REQUIRE_NOTHROW(cfg = load_scan_manager("sirius_documented_cufile.yaml", example));
+  CHECK(cfg.backend == io_backend::cufile);
+  CHECK(cfg.cufile_n_reactors == 4);
+  CHECK(cfg.cufile.max_inflight == 32);
+  CHECK(cfg.cufile.max_op_bytes == (64UL << 20));
+  CHECK(cfg.cufile.gds_threshold == (256UL << 10));
+  CHECK(cfg.cufile.use_odirect);
+  CHECK(cfg.cufile.compat_mode == cucascade::io::cufile::compat::automatic);
+  CHECK(cfg.cufile.poll_interval_us == 200);
+  CHECK(cfg.cufile.low_service_interval == 4);
+}
+
 TEST_CASE("sirius_config accepts the deprecated sirius backend as native",
           "[scan_manager][config][backend]")
 {
