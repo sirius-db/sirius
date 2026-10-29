@@ -156,8 +156,16 @@ class multi_index_priority_queue {
     std::unordered_map<device_key, std::map<queue_priority, std::list<node*>>>;
 
  public:
+  using enqueue_listener = std::function<void()>;
+
   /// @param extractor Computes each task's priority and index keys. Must be valid.
-  explicit multi_index_priority_queue(key_extractor extractor) : _extract(std::move(extractor))
+  /// @param on_enqueue Optional callback run on the pushing thread after every successful push,
+  ///        once the task is visible and outside the queue lock (it may re-enter the queue). Not
+  ///        run for a refused or throwing push. Fixed at construction, so pushes read it without
+  ///        synchronization. Should be cheap and not throw: an exception is swallowed, since the
+  ///        push has already succeeded.
+  explicit multi_index_priority_queue(key_extractor extractor, enqueue_listener on_enqueue = {})
+    : _extract(std::move(extractor)), _enqueue_listener(std::move(on_enqueue))
   {
     assert(_extract && "multi_index_priority_queue requires a valid key extractor");
   }
@@ -238,6 +246,7 @@ class multi_index_priority_queue {
       }
     }
     _cv.notify_all();
+    notify_enqueue_listener();
     return true;
   }
 
@@ -574,6 +583,15 @@ class multi_index_priority_queue {
   }
 
  private:
+  void notify_enqueue_listener() const noexcept
+  {
+    if (!_enqueue_listener) { return; }
+    try {
+      _enqueue_listener();
+    } catch (...) {
+    }
+  }
+
   /// Unlinks one task from the level and device indexes, frees it, and returns the
   /// owned task. Removes the level entirely (and its pipeline/query/operator
   /// lookups) if it becomes empty. Reads every field of `*n` before destroying it.
@@ -722,6 +740,7 @@ class multi_index_priority_queue {
     _operator_levels;           ///< operator -> its levels.
   device_index_map _by_device;  ///< device -> prio -> tasks.
   key_extractor _extract;
+  const enqueue_listener _enqueue_listener;  ///< May be empty.
   std::size_t _size{0};
 };
 

@@ -19,8 +19,10 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -718,6 +720,146 @@ TEST_CASE("multi_index interrupt wakes a blocked pop with nullptr", "[multi_inde
   REQUIRE(q.is_open());
   q.push(task(7, keys_of(1)));
   REQUIRE(q.pop()->id == 7);
+}
+
+// =============================================================================
+// Enqueue listener
+// =============================================================================
+
+TEST_CASE("multi_index enqueue listener fires once per successful push, after it is visible",
+          "[multi_index_priority_queue]")
+{
+  int calls = 0;
+  std::vector<std::size_t> size_seen;
+  multi_index_priority_queue<payload>* queue = nullptr;
+  multi_index_priority_queue<payload> q(by_keys(), [&] {
+    ++calls;
+    // Runs outside the queue lock, so re-entering the queue is safe; the new task is visible.
+    size_seen.push_back(queue->size());
+  });
+  queue = &q;
+
+  REQUIRE(q.push(task(1, keys_of(5))));
+  REQUIRE(calls == 1);
+  auto pending = task(2, keys_of(3, SiriusPhysicalOperatorType::FILTER, 0, 1));
+  REQUIRE(q.try_push(pending));
+  REQUIRE(calls == 2);
+  REQUIRE(size_seen == std::vector<std::size_t>{1, 2});
+
+  REQUIRE(q.try_pop_from(gpu_index{1}).has_value());
+  REQUIRE(q.try_pop().has_value());
+  REQUIRE(calls == 2);
+
+  // A push refused by an interrupted queue enqueues nothing and does not fire the listener.
+  q.interrupt();
+  auto refused = task(3, keys_of(1));
+  REQUIRE_FALSE(q.try_push(refused));
+  REQUIRE(refused);
+  REQUIRE_FALSE(q.push(task(4, keys_of(1))));
+  REQUIRE(calls == 2);
+
+  // After reactivate() the listener fires again.
+  q.reactivate();
+  REQUIRE(q.push(task(5, keys_of(1))));
+  REQUIRE(calls == 3);
+}
+
+TEST_CASE("multi_index without an enqueue listener pushes normally", "[multi_index_priority_queue]")
+{
+  multi_index_priority_queue<payload> q(by_keys(), {});
+  REQUIRE(q.push(task(1, keys_of(1))));
+  REQUIRE(q.try_pop().value()->id == 1);
+}
+
+TEST_CASE("multi_index enqueue listener can pop the task it was told about",
+          "[multi_index_priority_queue]")
+{
+  std::vector<int> popped_in_listener;
+  multi_index_priority_queue<payload>* queue = nullptr;
+  multi_index_priority_queue<payload> q(by_keys(), [&] {
+    if (auto t = queue->try_pop()) { popped_in_listener.push_back((*t)->id); }
+  });
+  queue = &q;
+
+  REQUIRE(q.push(task(11, keys_of(1))));
+  REQUIRE(q.push(task(12, keys_of(2))));
+  REQUIRE(popped_in_listener == std::vector<int>{11, 12});
+  REQUIRE(q.empty());
+}
+
+TEST_CASE("multi_index throwing enqueue listener does not undo the push",
+          "[multi_index_priority_queue]")
+{
+  multi_index_priority_queue<payload> q(by_keys(),
+                                        [] { throw std::runtime_error("listener failure"); });
+
+  auto t      = task(21, keys_of(1));
+  bool pushed = false;
+  REQUIRE_NOTHROW(pushed = q.try_push(t));
+  REQUIRE(pushed);
+  REQUIRE_FALSE(t);
+  REQUIRE(q.size() == 1);
+  REQUIRE(q.try_pop().value()->id == 21);
+}
+
+TEST_CASE("multi_index enqueue listener wakes a waiter that sleeps elsewhere",
+          "[multi_index_priority_queue]")
+{
+  // The listener exists for owners that sleep on their own primitive rather than the queue's
+  // condition variable: each producer's notification must find its task already poppable.
+  std::mutex m;
+  std::condition_variable cv;
+  int notified = 0;
+  multi_index_priority_queue<payload> q(by_keys(), [&] {
+    {
+      std::lock_guard<std::mutex> lock(m);
+      ++notified;
+    }
+    cv.notify_one();
+  });
+
+  constexpr int kProducers = 4;
+  constexpr int kPerThread = 250;
+  constexpr int kTotal     = kProducers * kPerThread;
+  // Each producer pushes its tasks at its own priority, so they share one FIFO level and must be
+  // popped in push order.
+  std::vector<int> last_popped(kProducers, -1);
+  bool in_order = true;
+  int consumed  = 0;
+  {
+    // jthread joins on unwind, so a failing REQUIRE does not destroy a joinable thread.
+    std::vector<std::jthread> producers;
+    for (int p = 0; p < kProducers; ++p) {
+      producers.emplace_back([&, p] {
+        for (int i = 0; i < kPerThread; ++i) {
+          q.push(task(p * kPerThread + i, keys_of(p + 1)));
+        }
+      });
+    }
+
+    int seen = 0;
+    while (consumed < kTotal) {
+      {
+        std::unique_lock<std::mutex> lock(m);
+        REQUIRE(cv.wait_for(lock, std::chrono::seconds(10), [&] { return notified > seen; }));
+        seen = notified;
+      }
+      // Every notification observed so far refers to a task that is already enqueued, so the
+      // queue holds at least as many tasks as notifications not yet matched by a pop.
+      while (consumed < seen) {
+        auto popped = q.try_pop();
+        REQUIRE(popped.has_value());
+        const int id          = (*popped)->id;
+        const int producer    = id / kPerThread;
+        in_order              = in_order && id > last_popped[producer];
+        last_popped[producer] = id;
+        ++consumed;
+      }
+    }
+  }
+  REQUIRE(notified == kTotal);
+  REQUIRE(in_order);
+  REQUIRE(q.empty());
 }
 
 TEST_CASE("multi_index drain drops all tasks and clears every index",

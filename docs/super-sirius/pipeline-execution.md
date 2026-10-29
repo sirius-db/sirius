@@ -206,7 +206,7 @@ if (evt->kind == task_request_kind::device_ready) {
 }
 ```
 
-`schedule()` pushes directly into the task queue and also publishes `task_available`. The queue push wakes a matcher waiting for work while a device is already ready; the channel event wakes it when it is waiting for a device signal.
+Every successful push into the task queue publishes `task_available` through the queue's enqueue listener, whichever path pushed (`schedule()` or the downgrade executor returning an extracted task); so does a per-query drain. The push itself wakes a matcher waiting on an empty queue; the channel event wakes it while it waits for a device signal or behind work no ready device can take.
 
 **Per-device match.** The scheduler first selects the highest-priority exact-device task and
 considers the unbound bucket only if no exact-device task is available. Priority ordering applies
@@ -272,12 +272,14 @@ sub-executor or scan-priority queue owned here.
 ### Management Event Loop
 
 `management_eventloop()` is a pull-signal matcher on a dedicated thread. GPU executors publish
-`device_ready` when a worker is available; `schedule()` publishes `task_available` after adding a
-task. Ready devices remain recorded until a compatible task arrives:
+`device_ready` when a worker is available; the task queue's enqueue listener publishes
+`task_available` after every successful push. Ready devices remain recorded until a compatible
+task arrives:
 
 ```
 while running:
-    1. Collect device_ready events; block on the request channel only when no device is ready
+    1. Collect device_ready events; block on the request channel when no device is ready, or
+       when the previous pass found no queued task that fits any ready device
     2. If the task queue is empty, ask the task creator to look ahead, then wait for a queue push
        (schedule_lookahead(first ready device) — speculatively warms up a
        not-yet-activated scan; no-op unless strategy is `lookahead`)

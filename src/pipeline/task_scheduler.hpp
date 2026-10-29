@@ -240,14 +240,21 @@ class task_scheduler {
  private:
   void management_eventloop();
 
+  /// Posts task_available to the event loop; _task_queue's enqueue listener. On allocation
+  /// failure sets _wake_pending instead.
+  void wake_event_loop() noexcept;
+
+  // Declared before _task_queue so they outlive its enqueue listener.
+
+  /// Wakes the management event loop: device_ready (from gpu_pipeline_executors) and
+  /// task_available (from wake_event_loop).
+  exec::channel<std::unique_ptr<task_request>> _task_request_channel;
+  exec::publisher<std::unique_ptr<task_request>> _wake_publisher;
+  /// A wake could not be posted; the event loop treats it as one before its channel sleep.
+  std::atomic<bool> _wake_pending{false};
+
   /// Pipeline-level task queue, ordered by task priority (highest dispatched first).
   exec::multi_index_priority_queue<sirius::parallel::itask> _task_queue;
-  exec::channel<std::unique_ptr<task_request>> _task_request_channel;
-  /// Publisher used by schedule() to wake the management event loop when a new
-  /// task is pushed into _task_queue. The event loop blocks on _task_request_channel
-  /// for two event kinds: device_ready (sent by gpu_pipeline_executors when a worker
-  /// thread is reserved) and task_available (sent by schedule()).
-  std::optional<exec::publisher<std::unique_ptr<task_request>>> _self_publisher;
   std::thread _management_thread;
   std::atomic<bool> _running{false};
 

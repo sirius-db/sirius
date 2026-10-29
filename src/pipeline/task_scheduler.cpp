@@ -58,9 +58,11 @@ task_scheduler::task_scheduler(
   std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
   const cucascade::memory::system_topology_info* sys_topology,
   const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>* downgrade_executors)
-  // Shared with every gpu_pipeline_executor's queue so both agree on which query a task
-  // belongs to; see pipeline::index_keys_for.
-  : _task_queue(&index_keys_for),
+  : _wake_publisher(_task_request_channel.make_publisher()),
+    // The key extractor is shared with every gpu_pipeline_executor's queue; see index_keys_for.
+    // The listener wakes the event loop on every push, including direct pushes that bypass
+    // schedule() (e.g. the downgrade executor returning extracted tasks).
+    _task_queue(&index_keys_for, [this]() noexcept { wake_event_loop(); }),
     _task_queue_telemetry(telemetry_context->context().task_queue_observer()->handle()),
     _query_lifecycle(lifecycle),
     _telemetry_context(std::move(telemetry_context))
@@ -70,11 +72,6 @@ task_scheduler::task_scheduler(
     .gpu_device_id = std::nullopt,
     .label         = "task-scheduler-gpu-queue",
   });
-
-  // Self-publisher: schedule() uses this to wake management_eventloop when a
-  // new task is pushed, so the loop can re-run the matcher against any device
-  // that is already in _ready_devices.
-  _self_publisher.emplace(_task_request_channel.make_publisher());
 
   auto gpu_spaces = mem_mgr.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
   // Initialize GPU pipeline executors for each available GPU
@@ -114,6 +111,22 @@ task_scheduler::task_scheduler(
 }
 
 task_scheduler::~task_scheduler() { stop(); }
+
+void task_scheduler::wake_event_loop() noexcept
+{
+  try {
+    auto wake  = std::make_unique<task_request>();
+    wake->kind = task_request_kind::task_available;
+    // A closed channel means the event loop is exiting and needs no wake.
+    [[maybe_unused]] auto const sent = _wake_publisher.send(std::move(wake));
+  } catch (...) {
+    // The loop checks this before its channel sleep; one already asleep waits for the next event.
+    _wake_pending.store(true, std::memory_order_release);
+    sirius::log::log_noexcept([] {
+      SIRIUS_LOG_WARN("task_scheduler: could not post a task_available wake to the event loop");
+    });
+  }
+}
 
 void task_scheduler::schedule(std::unique_ptr<sirius::parallel::itask> input)
 {
@@ -155,11 +168,7 @@ void task_scheduler::schedule(std::unique_ptr<sirius::parallel::itask> input)
         SIRIUS_LOG_DEBUG("task_scheduler: dropped a task for tearing-down query {}", pushed_query);
       }
     }
-    if (_self_publisher) {
-      auto wake                 = std::make_unique<task_request>();
-      wake->kind                = task_request_kind::task_available;
-      [[maybe_unused]] auto _ok = _self_publisher->send(std::move(wake));
-    }
+    // A successful push wakes the event loop through the queue's enqueue listener.
   } catch (...) {
     // try_push preserves ownership on failure. Report before task destruction can complete
     // its pipeline; the caller's catch runs after this local owner has already unwound.
@@ -186,10 +195,9 @@ void task_scheduler::stop()
 {
   bool expected = true;
   if (!_running.compare_exchange_strong(expected, false)) { return; }
-  // Pull-signal model: the management event loop blocks on
-  // _task_request_channel.get(), so closing the channel is what wakes it.
-  // _task_queue.interrupt() is still useful to reject any concurrent
-  // schedule() calls but no longer needed to wake the loop.
+  // The management event loop sleeps in either _task_request_channel.get() or _task_queue.wait(),
+  // so release both. Interrupting the queue also refuses later pushes, so the enqueue listener no
+  // longer runs.
   _task_queue.interrupt();
   _task_request_channel.close();
   // Join the management thread first so it can finish processing any drained
@@ -237,6 +245,8 @@ void task_scheduler::discard_query_tasks(sirius::query_id_t query_id)
   // Publication has settled, so no second sweep is needed. A manager or spill worker may
   // still hold a task; its lease protects it and any later queue handoff must pass the gate.
   _task_queue.drain(exec::query_index{static_cast<exec::query_key>(sirius::value_of(query_id))});
+  // A drain posts no event of its own; wake a channel-sleeping loop to re-check the queue.
+  wake_event_loop();
   for (auto& [device_id, gpu_exec] : _gpu_executors) {
     gpu_exec->discard_query_tasks(query_id);
   }
@@ -264,23 +274,30 @@ void task_scheduler::management_eventloop()
     .group_id = _telemetry_context->shared_group_id(),
   });
 
-  // Each pass tops up the two things the matcher needs — known ready devices
-  // and a non-empty queue — sleeping only for whichever is missing. The queue
-  // sleep (not the channel) is what hears the downgrade executor returning
-  // extracted tasks: that return is a direct _task_queue.push() with no
-  // task_available event, and blocking solely on the channel deadlocked once
-  // every executor had parked (#1467). Both sleeps are interrupted by stop().
+  // Each pass sleeps only when it cannot make progress:
+  //   - on the request channel while no device is parked, or while the previous pass found that
+  //     no queued task fits any parked device and the queue is still non-empty;
+  //   - on the queue while a device is parked and the queue is empty.
+  // Every successful push (including the downgrade executor's direct return of extracted tasks,
+  // #1467) posts task_available once the task is visible, and readiness arrives as device_ready,
+  // so the channel sleep cannot miss work a parked device could take. A downgrade extraction that
+  // empties the queue posts nothing, so the queue-empty hints wait for the next event.
+  bool parked_devices_unplaceable = false;
   while (_running.load()) {
-    // Devices: block only when none is parked (every executor is then busy
-    // and will post device_ready), then drain the pending burst.
-    auto evt = _task_request_channel.try_get();
-    if (!evt && _ready_devices.empty()) {
+    // Block when no pass can make progress, then drain the pending burst. A wake that could not
+    // be posted to the channel counts as one.
+    auto evt                = _task_request_channel.try_get();
+    const bool wake_pending = _wake_pending.exchange(false, std::memory_order_acq_rel);
+    const bool nothing_to_do =
+      _ready_devices.empty() || (parked_devices_unplaceable && !_task_queue.empty());
+    if (!evt && !wake_pending && nothing_to_do) {
       evt = _task_request_channel.get();
       if (evt == nullptr) {
         SIRIUS_LOG_INFO("Task request channel closed, exiting management event loop.");
         break;
       }
     }
+    parked_devices_unplaceable = false;
     while (evt) {
       if (evt->kind == task_request_kind::device_ready) {
         _ready_devices.emplace_back(evt->device_id);
@@ -314,6 +331,7 @@ void task_scheduler::management_eventloop()
     // is only valid on the preferred device. Step (ii) will introduce an
     // explicit strict-vs-prefer bit; for now, all preferences are treated as
     // binding to guarantee correctness.
+    bool popped_any = false;  // Dispatched or refused.
     for (auto it = _ready_devices.begin(); it != _ready_devices.end();) {
       const int device_id = *it;
       std::unique_ptr<sirius::parallel::itask> task;
@@ -338,6 +356,7 @@ void task_scheduler::management_eventloop()
         ++it;
         continue;
       }
+      popped_any           = true;
       auto* attributed     = dynamic_cast<gpu_pipeline_task*>(task.get());
       auto failure_handler = attributed ? attributed->get_completion_handler() : nullptr;
       try {
@@ -394,6 +413,9 @@ void task_scheduler::management_eventloop()
       }
       // Refusal does not consume the parked executor's readiness. Try its next task.
     }
+
+    // Every queued task prefers a device that is not parked; only a channel event can change that.
+    parked_devices_unplaceable = !popped_any && !_ready_devices.empty() && !_task_queue.empty();
   }
 }
 

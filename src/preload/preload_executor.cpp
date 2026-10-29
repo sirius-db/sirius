@@ -895,8 +895,8 @@ void preload_executor::on_executor_awaiting_task(event::event_id_t,
 
 void preload_executor::mark_idle() noexcept
 {
-  // While a device waits for a task it cannot take, the scheduler publishes these on every turn
-  // of its loop: only the first one after another event can change a plan.
+  // While a device waits for a task it cannot take, the scheduler repeats these once per pass of
+  // its loop: only the first one after another event can change a plan.
   if (_idle_wake_pending || !_store.has_candidates()) { return; }
   mark_dirty(dirty::idle);
   _idle_wake_pending = true;
