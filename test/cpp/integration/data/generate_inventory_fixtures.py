@@ -135,4 +135,157 @@ meta["location"] = str(dest)
 (dest / "metadata" / "v1.metadata.json").write_text(json.dumps(meta, indent=2))
 (dest / "metadata" / "version-hint.text").write_text("1")
 
+# Three independent DV/data-file pairs exercise preparation/GPU overlap without a
+# multi-scan read-view correspondence dependency. Footer references are absolute.
+for variant, names in (
+    ("dv_bounded", ("a",)),
+    ("dv_three", ("a", "b", "c")),
+    ("dv_corrupt_crc", ("a",)),
+    ("dv_missing_payload", ("a",)),
+    ("dv_unsupported_uri", ("a",)),
+    ("dv_unused_unsupported_uri", ("a",)),
+):
+    dest = out / variant
+    (dest / "metadata").mkdir(parents=True, exist_ok=True)
+    (dest / "data").mkdir(parents=True, exist_ok=True)
+    meta = json.loads((source / "metadata/v1.metadata.json").read_text())
+    meta["location"] = str(dest)
+    for snapshot in meta["snapshots"]:
+        snapshot["manifest-list"] = str(
+            dest / "metadata" / Path(snapshot["manifest-list"]).name
+        )
+    source_puffin = next((source / "data").glob("*.puffin")).read_bytes()
+    import struct
+
+    footer_length = struct.unpack("<i", source_puffin[-12:-8])[0]
+    source_footer = json.loads(source_puffin[-12 - footer_length : -12])
+    for path in (source / "metadata").glob("*.avro"):
+        schema, metadata, rows = read(path)
+        if "manifest_path" in rows[0]:
+            for row in rows:
+                row["manifest_path"] = str(
+                    dest / "metadata" / Path(row["manifest_path"]).name
+                )
+                row["added_files_count"] *= len(names)
+                row["added_rows_count"] *= len(names)
+        else:
+            expanded = []
+            unused = None
+            for original in rows:
+                for name in names:
+                    row = copy.deepcopy(original)
+                    data = dest / "data" / (name + ".parquet")
+                    df = row["data_file"]
+                    if df["content"] == 0:
+                        shutil.copyfile(repo / df["file_path"], data)
+                        if variant == "dv_three":
+                            pq.write_table(
+                                pq.read_table(data),
+                                data,
+                                row_group_size=3,
+                                compression="snappy",
+                            )
+                        df["file_path"] = str(data)
+                        df["file_size_in_bytes"] = data.stat().st_size
+                    else:
+                        if variant == "dv_unused_unsupported_uri":
+                            unused = copy.deepcopy(row)
+                        sidecar = dest / "data" / (name + ".puffin")
+                        footer = copy.deepcopy(source_footer)
+                        footer["blobs"][0]["properties"]["referenced-data-file"] = str(
+                            data
+                        )
+                        payload = json.dumps(footer, separators=(",", ":")).encode()
+                        framing = (
+                            b"PFA1"
+                            + payload
+                            + struct.pack("<i", len(payload))
+                            + bytes(4)
+                            + b"PFA1"
+                        )
+                        sidecar.write_bytes(
+                            source_puffin[: 4 + df["content_size_in_bytes"]] + framing
+                        )
+                        if variant == "dv_corrupt_crc":
+                            encoded = bytearray(sidecar.read_bytes())
+                            encoded[4 + df["content_size_in_bytes"] - 1] ^= 1
+                            sidecar.write_bytes(encoded)
+                        df["file_path"] = str(sidecar)
+                        df["referenced_data_file"] = str(data)
+                        df["file_size_in_bytes"] = sidecar.stat().st_size
+                        if variant == "dv_unsupported_uri":
+                            # Keep metadata, manifests, and data local while making only the
+                            # Puffin sidecar a remote URI with no registered Sirius backend.
+                            # The planner must refuse before opening this object.
+                            df["file_path"] = (
+                                "http://unsupported-puffin.invalid/sidecar.puffin"
+                            )
+                    expanded.append(row)
+            rows = expanded
+            if unused is not None:
+                unused["data_file"][
+                    "file_path"
+                ] = "http://unsupported-puffin.invalid/unused-sidecar.puffin"
+                unused["data_file"]["referenced_data_file"] = str(
+                    dest / "data" / "unselected.parquet"
+                )
+                rows.append(unused)
+        write(dest / "metadata" / path.name, schema, metadata, rows)
+    for path in (dest / "metadata").glob("snap-*.avro"):
+        schema, metadata, rows = read(path)
+        for row in rows:
+            row["manifest_length"] = Path(row["manifest_path"]).stat().st_size
+        write(path, schema, metadata, rows)
+    (dest / "metadata/v1.metadata.json").write_text(json.dumps(meta, indent=2))
+    (dest / "metadata/version-hint.text").write_text("1")
+    if variant == "dv_missing_payload":
+        (dest / "data/a.puffin").unlink()
+
+
+# Optional remote root keeps metadata, manifests, data and Puffin on the same backend.
+if len(sys.argv) > 2:
+    remote = sys.argv[2].rstrip("/")
+    local_prefix = str(out)
+
+    def relocate(value):
+        if isinstance(value, str):
+            return (
+                remote + value[len(local_prefix) :]
+                if value.startswith(local_prefix + "/")
+                else value
+            )
+        if isinstance(value, list):
+            return [relocate(item) for item in value]
+        if isinstance(value, dict):
+            return {key: relocate(item) for key, item in value.items()}
+        return value
+
+    def relocate_puffin_footer(path):
+        """Rewrite the footer's data-file URI along with the Avro metadata."""
+        encoded = path.read_bytes()
+        footer_length = struct.unpack("<i", encoded[-12:-8])[0]
+        footer_start = len(encoded) - 12 - footer_length
+        footer = json.loads(encoded[footer_start : footer_start + footer_length])
+        relocated = relocate(footer)
+        payload = json.dumps(relocated, separators=(",", ":")).encode()
+        path.write_bytes(
+            encoded[:footer_start]
+            + payload
+            + struct.pack("<i", len(payload))
+            + encoded[-8:]
+        )
+
+    for path in out.rglob("*.json"):
+        path.write_text(json.dumps(relocate(json.loads(path.read_text())), indent=2))
+    for path in out.rglob("*.puffin"):
+        relocate_puffin_footer(path)
+    # Rewrite data/delete manifests before recording their new sizes in manifest lists.
+    avro = list(out.rglob("*.avro"))
+    for path in sorted(avro, key=lambda p: p.name.startswith("snap-")):
+        schema, metadata, rows = read(path)
+        if rows and "manifest_path" in rows[0]:
+            for row in rows:
+                row["manifest_length"] = Path(row["manifest_path"]).stat().st_size
+        write(path, schema, metadata, relocate(rows))
+
 print(out)

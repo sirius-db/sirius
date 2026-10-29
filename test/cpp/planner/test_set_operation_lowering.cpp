@@ -130,7 +130,7 @@ duckdb::unique_ptr<sirius_physical_operator> plan_set_operation(duckdb::Connecti
   auto& context = *con.context;
   planning_scope const scope(con);
 
-  duckdb::Parser parser(context.GetParserOptions());
+  duckdb::Parser parser(context);
   parser.ParseQuery(query);
   REQUIRE(parser.statements.size() == 1);
 
@@ -354,7 +354,7 @@ TEST_CASE_METHOD(set_operation_lowering_fixture,
   for (std::string const keyword : {"EXCEPT", "INTERSECT"}) {
     REQUIRE_THROWS_WITH(
       plan_set_operation(*con, "SELECT k FROM ia " + keyword + " SELECT k FROM ib", true),
-      ContainsSubstring("only the ALL forms"));
+      ContainsSubstring(keyword + " (distinct) not supported"));
     auto const plan =
       plan_set_operation(*con, "SELECT k FROM ia " + keyword + " ALL SELECT k FROM ib", true);
     CHECK(plan->type == SiriusPhysicalOperatorType::REPLICATE);

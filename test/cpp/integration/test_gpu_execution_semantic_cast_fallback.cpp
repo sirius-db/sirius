@@ -227,9 +227,8 @@ TEST_CASE_METHOD(SemanticCastFixture,
     run_ok("SET gpu_execution = true;");
     REQUIRE(cpu_result);
     REQUIRE_FALSE(cpu_result->HasError());
-    auto rows = SemanticCastFixture::collect_rows(result->Cast<duckdb::MaterializedQueryResult>());
-    auto cpu_rows =
-      SemanticCastFixture::collect_rows(cpu_result->Cast<duckdb::MaterializedQueryResult>());
+    auto rows     = SemanticCastFixture::collect_rows(*result);
+    auto cpu_rows = SemanticCastFixture::collect_rows(*cpu_result);
     REQUIRE(rows == cpu_rows);
   }
 }
@@ -245,7 +244,8 @@ TEST_CASE_METHOD(SemanticCastFixture,
   auto disabled = con->Query("SELECT current_setting('disabled_optimizers');");
   REQUIRE(disabled);
   REQUIRE_FALSE(disabled->HasError());
-  REQUIRE(disabled->GetValue(0, 0).ToString().find("sum_rewriter") == std::string::npos);
+  REQUIRE(disabled->Collection().GetValue(0, 0).ToString().find("sum_rewriter") ==
+          std::string::npos);
   run_ok("SET enable_duckdb_fallback = false;");
 
   compare_gpu_vs_cpu("SELECT SUM(ResolutionWidth + 1) FROM hits;");

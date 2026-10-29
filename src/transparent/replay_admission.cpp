@@ -89,7 +89,7 @@ replay_admission admit_cpu_replay(duckdb::ClientContext& context,
        context.transaction.ActiveTransaction().transaction_validity.IsInvalidated())) {
     return {false, late_failure_condition::transaction_invalid};
   }
-  if (context.interrupted.load()) { return {false, late_failure_condition::cancelled}; }
+  if (context.IsInterrupted()) { return {false, late_failure_condition::cancelled}; }
   if (non_rollbackable_state) { return {false, late_failure_condition::non_rollbackable}; }
   return {true, std::nullopt};
 }
@@ -105,10 +105,14 @@ failure_cause classify_failure(std::exception_ptr error, late_failure_cause fall
     return {late_failure_cause::physical_input, e.what()};
   } catch (op::scan::certificate_incomplete const& e) {
     return {late_failure_cause::certificate, e.what()};
+  } catch (io::descriptor_mismatch_error const& e) {
+    return {late_failure_cause::reader_io, e.what()};
   } catch (duckdb::IOException const& e) {
     return {late_failure_cause::reader_io, e.what()};
   } catch (io::credential_error const& e) {
     return {late_failure_cause::reader_io, e.what()};
+  } catch (io::object_changed_error const& e) {
+    return {late_failure_cause::object_changed, e.what()};
   } catch (std::exception const& e) {
     return {fallback, e.what()};
   } catch (...) {

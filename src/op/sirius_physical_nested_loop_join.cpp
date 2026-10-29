@@ -17,10 +17,12 @@
 #include "op/sirius_physical_nested_loop_join.hpp"
 
 #include "config.hpp"
+#include "cudf/ast_compat.hpp"
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "expression_evaluator/comparison_expression.hpp"
 #include "expression_evaluator/expression_evaluator.hpp"
 #include "expression_evaluator/gpu_expression_translator_internal.hpp"
 #include "helper/type_conversions.hpp"
@@ -34,7 +36,6 @@
 #include "sirius/exception.hpp"
 #include "telemetry/nvtx.hpp"
 
-#include <cudf/ast/expressions.hpp>
 #include <cudf/column/column.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/filling.hpp>
@@ -51,6 +52,14 @@
 
 namespace sirius {
 namespace op {
+
+std::unique_ptr<pipelineable_operator_data> cross_join_slice_data::with_batches_preserving_rows(
+  std::vector<std::shared_ptr<::cucascade::data_batch>> batches) const
+{
+  auto replacement = std::make_unique<cross_join_slice_data>(std::move(batches), slice, num_slices);
+  replacement->adopt_row_identity(*this);
+  return replacement;
+}
 
 static bool nlj_is_equality(sirius::comparison_type c)
 {
@@ -200,7 +209,9 @@ std::string_view sirius_physical_nested_loop_join::input_port_for(
   sirius_physical_operator const& producer) const
 {
   if (producer.type == SiriusPhysicalOperatorType::CONCAT) {
-    return producer.Cast<sirius_physical_concat>().is_build_concat() ? "build" : "default";
+    if (children.size() == 2 && children[1].get() == &producer) { return "build"; }
+    if (children.size() == 2 && children[0].get() == &producer) { return "default"; }
+    throw std::logic_error("Join CONCAT producer is not a wired input child");
   }
   return sirius_physical_operator::input_port_for(producer);
 }
@@ -226,9 +237,11 @@ bool sirius_physical_nested_loop_join::is_supported(
 partition_strategy sirius_physical_nested_loop_join::get_partition_strategy(
   const partition_sizing_input& /*in*/)
 {
-  // A nested-loop join is never hash-partitioned: it runs on a single partition and streams both
-  // sides through the cross-product, so it never broadcasts or enters build-probe. No GPU state
-  // is shared across tasks; leave the CONCATs and join tasks free to follow input locality.
+  // A nested-loop join is never hash-partitioned: it runs on a single partition and evaluates each
+  // pair of left and right batches as one task, so it never broadcasts or enters build-probe. Join
+  // wrapping folds the side rows are decided against (right for LEFT/SEMI/ANTI/MARK, left for
+  // RIGHT, both for FULL OUTER); INNER streams both. No GPU state is shared across tasks; leave the
+  // CONCATs and join tasks free to follow input locality.
   return partition_strategy{/*num_partitions=*/1,
                             /*broadcast=*/false,
                             /*build_probe=*/false,
@@ -377,23 +390,6 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::get_next_task_i
 }
 
 namespace {
-
-cudf::ast::ast_operator to_ast_operator(sirius::comparison_type comparison)
-{
-  switch (comparison) {
-    using enum sirius::comparison_type;
-    using enum cudf::ast::ast_operator;
-    case equal: return EQUAL;
-    case not_distinct_from: return NULL_EQUAL;
-    case not_equal: return NOT_EQUAL;
-    case distinct_from: break;  // built as NOT(NULL_EQUAL) by the caller
-    case lt: return LESS;
-    case gt: return GREATER;
-    case le: return LESS_EQUAL;
-    case ge: return GREATER_EQUAL;
-  }
-  throw std::runtime_error("sirius_physical_nested_loop_join: unsupported comparison type");
-}
 
 /// @brief Left-associative LOGICAL_AND over @p terms; @p chain owns the AND nodes and must be
 /// pre-reserved to terms.size()-1.
@@ -693,13 +689,12 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
 
     std::vector<cudf::ast::column_reference> left_refs;
     std::vector<cudf::ast::column_reference> right_refs;
-    std::vector<cudf::ast::operation> cond_ops;
-    std::vector<cudf::ast::operation> distinct_inner_ops;  // NULL_EQUAL nodes under distinct_from
+    cudf::ast::tree comparison_tree;
+    std::vector<std::reference_wrapper<const cudf::ast::expression>> cond_terms;
     std::vector<cudf::ast::operation> and_chain;
     left_refs.reserve(conditions.size());
     right_refs.reserve(conditions.size());
-    cond_ops.reserve(conditions.size());
-    distinct_inner_ops.reserve(conditions.size());
+    cond_terms.reserve(conditions.size());
     and_chain.reserve(conditions.size() > 1 ? conditions.size() - 1 : 0);
     std::vector<cudf::column_view> left_col_views, right_col_views;
     std::vector<std::unique_ptr<cudf::table>> evaluated_operands;
@@ -718,7 +713,7 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
       if (expr.holds<sirius::ast::reference>()) {
         auto const& ref   = expr.get<sirius::ast::reference>();
         auto const column = table.column(ref.column_index);
-        if (column.type() == sirius::get_cudf_type(ref.return_type())) {
+        if (column.type() == sirius::require_cudf_type(ref.return_type())) {
           col_views.push_back(column);
           return join_input_index;
         }
@@ -726,7 +721,7 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
       sirius::expression_evaluator evaluator(&expr,
                                              mr,
                                              stream,
-                                             strategy_from_config(),
+                                             expression_policy(),
                                              expression_evaluator::default_min_ast_size,
                                              like_swar_fastpath_enabled(),
                                              like_cache());
@@ -756,23 +751,17 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
       right_refs.emplace_back(
         right_join_input_index,
         swap_sides ? cudf::ast::table_reference::LEFT : cudf::ast::table_reference::RIGHT);
-      if (cond.comparison == sirius::comparison_type::distinct_from) {
-        // IS DISTINCT FROM is null-safe (NULL vs 5 is TRUE, NULL vs NULL is FALSE) but cuDF's
-        // NOT_EQUAL is null-propagating, so build NOT(NULL_EQUAL(l, r)) instead.
-        distinct_inner_ops.emplace_back(
-          cudf::ast::ast_operator::NULL_EQUAL, left_refs.back(), right_refs.back());
-        cond_ops.emplace_back(cudf::ast::ast_operator::NOT, distinct_inner_ops.back());
-      } else {
-        cond_ops.emplace_back(
-          to_ast_operator(cond.comparison), left_refs.back(), right_refs.back());
-      }
+      cond_terms.emplace_back(comparison_expression(
+        comparison_tree,
+        cond.comparison,
+        left_refs.back(),
+        right_refs.back(),
+        floating_comparison(cond.left->return_type(), cond.right->return_type())));
     }
 
     cudf::table_view left_effective(left_col_views);
     cudf::table_view right_effective(right_col_views);
 
-    const std::vector<std::reference_wrapper<const cudf::ast::expression>> cond_terms(
-      cond_ops.begin(), cond_ops.end());
     const cudf::ast::expression& predicate = fold_logical_and(cond_terms, and_chain);
 
     std::pair<std::unique_ptr<rmm::device_uvector<cudf::size_type>>,
@@ -842,21 +831,21 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
         std::vector<cudf::ast::operation> notfalse_or_ops;
         std::vector<cudf::ast::operation> notfalse_and_chain;
         std::vector<std::reference_wrapper<const cudf::ast::expression>> notfalse_terms;
-        isnull_left_ops.reserve(cond_ops.size());
-        isnull_right_ops.reserve(cond_ops.size());
-        notfalse_inner_ops.reserve(cond_ops.size());
-        notfalse_or_ops.reserve(cond_ops.size());
-        notfalse_and_chain.reserve(cond_ops.size() > 1 ? cond_ops.size() - 1 : 0);
-        notfalse_terms.reserve(cond_ops.size());
-        for (size_t i = 0; i < cond_ops.size(); i++) {
+        isnull_left_ops.reserve(cond_terms.size());
+        isnull_right_ops.reserve(cond_terms.size());
+        notfalse_inner_ops.reserve(cond_terms.size());
+        notfalse_or_ops.reserve(cond_terms.size());
+        notfalse_and_chain.reserve(cond_terms.size() > 1 ? cond_terms.size() - 1 : 0);
+        notfalse_terms.reserve(cond_terms.size());
+        for (size_t i = 0; i < cond_terms.size(); i++) {
           if (nlj_is_null_safe(conditions[i].comparison)) {
-            notfalse_terms.emplace_back(cond_ops[i]);
+            notfalse_terms.emplace_back(cond_terms[i].get());
             continue;
           }
           isnull_left_ops.emplace_back(cudf::ast::ast_operator::IS_NULL, left_refs[i]);
           isnull_right_ops.emplace_back(cudf::ast::ast_operator::IS_NULL, right_refs[i]);
           notfalse_inner_ops.emplace_back(
-            cudf::ast::ast_operator::NULL_LOGICAL_OR, cond_ops[i], isnull_left_ops.back());
+            cudf::ast::ast_operator::NULL_LOGICAL_OR, cond_terms[i].get(), isnull_left_ops.back());
           notfalse_or_ops.emplace_back(cudf::ast::ast_operator::NULL_LOGICAL_OR,
                                        notfalse_inner_ops.back(),
                                        isnull_right_ops.back());

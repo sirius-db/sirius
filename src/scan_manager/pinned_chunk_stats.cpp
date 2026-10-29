@@ -16,6 +16,9 @@
 
 #include "scan_manager/pinned_chunk_stats.hpp"
 
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
 #include "log/logging.hpp"
 
 #include <cudf/reduction.hpp>
@@ -28,10 +31,8 @@
 #include <duckdb/common/types/date.hpp>
 #include <duckdb/common/types/timestamp.hpp>
 #include <duckdb/common/types/value.hpp>
-#include <duckdb/planner/filter/conjunction_filter.hpp>
-#include <duckdb/planner/filter/constant_filter.hpp>
-#include <duckdb/planner/filter/in_filter.hpp>
-#include <duckdb/planner/filter/optional_filter.hpp>
+#include <duckdb/planner/expression/bound_operator_expression.hpp>
+#include <duckdb/planner/filter/table_filter_functions.hpp>
 #include <duckdb/storage/statistics/numeric_stats.hpp>
 
 #include <algorithm>
@@ -222,57 +223,89 @@ pinned_zone_maps pinned_zone_maps::remap(pinned_zone_maps incoming,
   return out;
 }
 
+bool filter_safe_for_stats(duckdb::TableFilter const& filter)
+{
+  if (filter.filter_type != duckdb::TableFilterType::EXPRESSION_FILTER) { return false; }
+  auto const& expression = filter.Cast<duckdb::ExpressionFilter>();
+  if (!expression.expr) { return false; }
+  std::optional<duckdb::LogicalType> column_type;
+  std::function<void(duckdb::Expression const&)> find_reference =
+    [&](duckdb::Expression const& expr) {
+      if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+        column_type = expr.GetReturnType();
+      }
+      if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_FUNCTION) {
+        auto const& function = expr.Cast<duckdb::BoundFunctionExpression>();
+        if (function.Function().GetName() == duckdb::OptionalFilterScalarFun::NAME &&
+            function.BindInfo()) {
+          auto const& data = function.BindInfo()->Cast<duckdb::OptionalFilterFunctionData>();
+          if (data.child_filter_expr) { find_reference(*data.child_filter_expr); }
+        }
+      }
+      duckdb::ExpressionIterator::EnumerateChildren(expr, find_reference);
+    };
+  find_reference(*expression.expr);
+  return column_type && filter_safe_for_stats(filter, *column_type);
+}
+
 bool filter_safe_for_stats(duckdb::TableFilter const& filter, duckdb::LogicalType const& stats_type)
 {
-  switch (filter.filter_type) {
-    case duckdb::TableFilterType::CONSTANT_COMPARISON: {
-      auto const& cf = filter.Cast<duckdb::ConstantFilter>();
-      switch (cf.comparison_type) {
-        case duckdb::ExpressionType::COMPARE_EQUAL:
-        case duckdb::ExpressionType::COMPARE_NOTEQUAL:
-        case duckdb::ExpressionType::COMPARE_LESSTHAN:
-        case duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO:
-        case duckdb::ExpressionType::COMPARE_GREATERTHAN:
-        case duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO: break;
-        default: return false;
-      }
-      // ConstantFilter's constructor rejects NULL constants, but the type-match
-      // below is the release-mode safety line (DuckDB only D_ASSERTs it), so
-      // stay defensive on both.
-      return !cf.constant.IsNull() && cf.constant.type() == stats_type;
+  if (filter.filter_type != duckdb::TableFilterType::EXPRESSION_FILTER) { return false; }
+  auto const& expression_filter = filter.Cast<duckdb::ExpressionFilter>();
+  if (!expression_filter.expr || !expression_filter.column_indexes.empty()) { return false; }
+  auto reference = [&](duckdb::Expression const& expr) {
+    return expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF &&
+           expr.Cast<duckdb::BoundReferenceExpression>().Index() == 0 &&
+           expr.GetReturnType() == stats_type;
+  };
+  auto constant = [&](duckdb::Expression const& expr) {
+    return expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_CONSTANT &&
+           expr.GetReturnType() == stats_type &&
+           !expr.Cast<duckdb::BoundConstantExpression>().GetValue().IsNull();
+  };
+  std::function<bool(duckdb::Expression const&)> safe = [&](duckdb::Expression const& expr) {
+    using duckdb::ExpressionClass;
+    using duckdb::ExpressionType;
+    if (duckdb::BoundComparisonExpression::IsComparison(expr)) {
+      if (!duckdb::ExpressionFilter::CanPropagateExpressionStatistics(expr)) { return false; }
+      auto const& cmp   = expr.Cast<duckdb::BoundFunctionExpression>();
+      auto const& left  = duckdb::BoundComparisonExpression::Left(cmp);
+      auto const& right = duckdb::BoundComparisonExpression::Right(cmp);
+      return (reference(left) && constant(right)) || (constant(left) && reference(right));
     }
-    case duckdb::TableFilterType::IS_NULL:
-    case duckdb::TableFilterType::IS_NOT_NULL: return true;
-    case duckdb::TableFilterType::IN_FILTER: {
-      auto const& in = filter.Cast<duckdb::InFilter>();
-      return !in.values.empty() && std::ranges::all_of(in.values, [&](duckdb::Value const& v) {
-        return !v.IsNull() && v.type() == stats_type;
-      });
-    }
-    case duckdb::TableFilterType::CONJUNCTION_AND:
-    case duckdb::TableFilterType::CONJUNCTION_OR: {
-      auto const& children = filter.filter_type == duckdb::TableFilterType::CONJUNCTION_AND
-                               ? filter.Cast<duckdb::ConjunctionAndFilter>().child_filters
-                               : filter.Cast<duckdb::ConjunctionOrFilter>().child_filters;
-      // A childless OR would propagate FILTER_ALWAYS_FALSE and prune unconditionally; a childless
-      // AND is merely vacuous. Neither shape is produced by the binder, so reject both rather than
-      // reason about them.
+    if (expr.GetExpressionClass() == ExpressionClass::BOUND_CONJUNCTION) {
+      auto const& children = expr.Cast<duckdb::BoundConjunctionExpression>().GetChildren();
       return !children.empty() &&
-             std::ranges::all_of(children, [&](duckdb::unique_ptr<duckdb::TableFilter> const& c) {
-               return c && filter_safe_for_stats(*c, stats_type);
+             std::all_of(children.begin(), children.end(), [&](auto const& child) {
+               return child && safe(*child);
              });
     }
-    case duckdb::TableFilterType::OPTIONAL_FILTER: {
-      // OptionalFilter's child may legitimately be nullptr (its constructor defaults it); an empty
-      // optional constrains nothing and cannot prune.
-      auto const& opt = filter.Cast<duckdb::OptionalFilter>();
-      return opt.child_filter && filter_safe_for_stats(*opt.child_filter, stats_type);
+    if (expr.GetExpressionClass() == ExpressionClass::BOUND_OPERATOR) {
+      auto const& children = expr.Cast<duckdb::BoundOperatorExpression>().GetChildren();
+      if (children.empty() || !children[0] || !reference(*children[0])) { return false; }
+      if (expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NULL ||
+          expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NOT_NULL) {
+        return children.size() == 1;
+      }
+      if (expr.GetExpressionType() != ExpressionType::COMPARE_IN || children.size() < 2) {
+        return false;
+      }
+      return std::all_of(children.begin() + 1, children.end(), [&](auto const& child) {
+        return child && constant(*child);
+      });
     }
-    // DYNAMIC (mutable at run time), STRUCT_EXTRACT / EXPRESSION / BLOOM
-    // (shapes CheckStatistics may misread against numeric stats), and any
-    // future filter type default to "keep the chunk".
-    default: return false;
-  }
+    if (expr.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
+      auto const& function = expr.Cast<duckdb::BoundFunctionExpression>();
+      if (function.Function().GetName() == duckdb::OptionalFilterScalarFun::NAME &&
+          function.BindInfo()) {
+        auto const& data = function.BindInfo()->Cast<duckdb::OptionalFilterFunctionData>();
+        return data.child_filter_expr && safe(*data.child_filter_expr);
+      }
+    }
+    // Runtime filters carry mutable state and cannot certify a cached prune decision.
+    return false;
+  };
+  return safe(*expression_filter.expr);
 }
 
 bool chunk_provably_empty(duckdb::TableFilter const& filter,
@@ -283,7 +316,7 @@ bool chunk_provably_empty(duckdb::TableFilter const& filter,
     // CheckStatistics needs a non-const reference to the stats object. Copy instead of const_cast
     // to keep CheckStatistics safe.
     auto local_stats = stats.Copy();
-    return filter.CheckStatistics(local_stats) ==
+    return filter.Cast<duckdb::ExpressionFilter>().CheckStatistics(local_stats) ==
            duckdb::FilterPropagateResult::FILTER_ALWAYS_FALSE;
   } catch (std::exception const& e) {
     // Don't propagate exceptions here on statistics checks; otherwise, a cache miss is generated

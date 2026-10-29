@@ -37,6 +37,7 @@
 #include <duckdb/planner/filter/constant_filter.hpp>
 #include <duckdb/planner/filter/expression_filter.hpp>
 #include <op/scan/scan_filter_analysis.hpp>
+#include <utils/table_filter_test_utils.hpp>
 
 #include <cstdint>
 #include <limits>
@@ -80,10 +81,9 @@ duckdb::unique_ptr<duckdb::TableFilter> cast_cmp_filter(ExpressionType cmp,
 {
   auto cast = cast_expr(date_col_ref());
   auto cst  = ts_const(micros);
-  auto expr =
-    const_on_left
-      ? duckdb::make_uniq<duckdb::BoundComparisonExpression>(cmp, std::move(cst), std::move(cast))
-      : duckdb::make_uniq<duckdb::BoundComparisonExpression>(cmp, std::move(cast), std::move(cst));
+  auto expr = const_on_left
+                ? duckdb::BoundComparisonExpression::Create(cmp, std::move(cst), std::move(cast))
+                : duckdb::BoundComparisonExpression::Create(cmp, std::move(cast), std::move(cst));
   return duckdb::make_uniq<duckdb::ExpressionFilter>(std::move(expr));
 }
 
@@ -92,7 +92,7 @@ sirius::op::scan_filter_analysis run_extraction(
   sirius::logical_type col_type = sirius::logical_type::make(sirius::type_id::DATE))
 {
   duckdb::TableFilterSet filters;
-  filters.PushFilter(duckdb::ColumnIndex(0), std::move(filter));
+  filters.PushFilter(duckdb::ProjectionIndex(0), std::move(filter));
   duckdb::vector<duckdb::ColumnIndex> column_ids;
   column_ids.emplace_back(0ULL);
   duckdb::vector<sirius::logical_type> types;
@@ -301,26 +301,25 @@ TEST_CASE("cast-through range extraction: AND shapes intersect into one range",
 
   SECTION("BoundConjunctionExpression inside a single ExpressionFilter (q6 shape)")
   {
-    auto ge = duckdb::make_uniq<duckdb::BoundComparisonExpression>(
-      ExpressionType::COMPARE_GREATERTHANOREQUALTO,
-      cast_expr(date_col_ref()),
-      ts_const(lo_days * kDayMicros));
-    auto lt = duckdb::make_uniq<duckdb::BoundComparisonExpression>(
+    auto ge =
+      duckdb::BoundComparisonExpression::Create(ExpressionType::COMPARE_GREATERTHANOREQUALTO,
+                                                cast_expr(date_col_ref()),
+                                                ts_const(lo_days * kDayMicros));
+    auto lt = duckdb::BoundComparisonExpression::Create(
       ExpressionType::COMPARE_LESSTHAN, cast_expr(date_col_ref()), ts_const(hi_days * kDayMicros));
     auto conj =
       duckdb::make_uniq<duckdb::BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
-    conj->children.push_back(std::move(ge));
-    conj->children.push_back(std::move(lt));
+    conj->GetChildrenMutable().push_back(std::move(ge));
+    conj->GetChildrenMutable().push_back(std::move(lt));
     expect_range(run_extraction(duckdb::make_uniq<duckdb::ExpressionFilter>(std::move(conj))),
                  lo_days,
                  hi_days - 1);
   }
   SECTION("ConjunctionAndFilter of two ExpressionFilters")
   {
-    auto conj = duckdb::make_uniq<duckdb::ConjunctionAndFilter>();
-    conj->child_filters.push_back(
-      cast_cmp_filter(ExpressionType::COMPARE_GREATERTHANOREQUALTO, lo_days * kDayMicros));
-    conj->child_filters.push_back(
+    auto conj = sirius::test::conjunction_filter(
+      ExpressionType::CONJUNCTION_AND,
+      cast_cmp_filter(ExpressionType::COMPARE_GREATERTHANOREQUALTO, lo_days * kDayMicros),
       cast_cmp_filter(ExpressionType::COMPARE_LESSTHAN, hi_days * kDayMicros));
     expect_range(run_extraction(std::move(conj)), lo_days, hi_days - 1);
   }
@@ -332,9 +331,10 @@ TEST_CASE("to_decoded_bound: timestamp ConstantFilter against a DATE column",
           "[scan][range_pushdown][fused_scan_filter]")
 {
   auto const k = cutoff_days();
-  auto filter  = duckdb::make_uniq<duckdb::ConstantFilter>(
-    ExpressionType::COMPARE_LESSTHANOREQUALTO,
-    duckdb::Value::TIMESTAMP(duckdb::timestamp_t(k * kDayMicros)));
+  auto filter =
+    sirius::test::constant_filter(ExpressionType::COMPARE_LESSTHANOREQUALTO,
+                                  duckdb::Value::TIMESTAMP(duckdb::timestamp_t(k * kDayMicros)),
+                                  duckdb::LogicalType::DATE);
   expect_range(run_extraction(std::move(filter)), kInt64Min, k);
 }
 
@@ -366,7 +366,7 @@ TEST_CASE("cast-through range extraction: TIMESTAMP_S / TIMESTAMP_MS / TIMESTAMP
     {
       // midnight: <= keeps day k; one tick later: <= still keeps day k, >= starts at k+1.
       auto mk = [&](ExpressionType cmp, std::int64_t ticks) {
-        auto expr = duckdb::make_uniq<duckdb::BoundComparisonExpression>(
+        auto expr = duckdb::BoundComparisonExpression::Create(
           cmp,
           cast_expr(date_col_ref(), f.type),
           duckdb::make_uniq<duckdb::BoundConstantExpression>(f.make(ticks)));
@@ -490,7 +490,7 @@ TEST_CASE("cast-through range extraction: ±infinity constants lower to DATE ±i
     for (auto const& f : flavors) {
       DYNAMIC_SECTION("flavor " << f.type.ToString())
       {
-        auto expr = duckdb::make_uniq<duckdb::BoundComparisonExpression>(
+        auto expr = duckdb::BoundComparisonExpression::Create(
           ExpressionType::COMPARE_LESSTHAN,
           cast_expr(date_col_ref(), f.type),
           duckdb::make_uniq<duckdb::BoundConstantExpression>(f.value));
@@ -530,7 +530,7 @@ TEST_CASE("cast-through range extraction: bounds are not clipped to the castable
   // historical dates such as 1500-01-01.
   std::int64_t const castable_max_nanos = (kInt64Max - 1) / duckdb::Interval::NANOS_PER_DAY;
   REQUIRE(castable_max_nanos < duckdb::Date::FromDate(2263, 1, 1).days);
-  auto expr = duckdb::make_uniq<duckdb::BoundComparisonExpression>(
+  auto expr = duckdb::BoundComparisonExpression::Create(
     ExpressionType::COMPARE_LESSTHANOREQUALTO,
     cast_expr(date_col_ref(), duckdb::LogicalType::TIMESTAMP_NS),
     duckdb::make_uniq<duckdb::BoundConstantExpression>(
@@ -550,7 +550,7 @@ TEST_CASE("cast-through range extraction: refused shapes keep the residual filte
 
   SECTION("TRY_CAST is not range-expressible (NULL-on-overflow vs day math)")
   {
-    auto expr = duckdb::make_uniq<duckdb::BoundComparisonExpression>(
+    auto expr = duckdb::BoundComparisonExpression::Create(
       ExpressionType::COMPARE_LESSTHANOREQUALTO,
       cast_expr(date_col_ref(), duckdb::LogicalType::TIMESTAMP, /*try_cast=*/true),
       ts_const(midnight));
@@ -558,7 +558,7 @@ TEST_CASE("cast-through range extraction: refused shapes keep the residual filte
   }
   SECTION("TIMESTAMP_TZ: midnight depends on the session time zone")
   {
-    auto expr = duckdb::make_uniq<duckdb::BoundComparisonExpression>(
+    auto expr = duckdb::BoundComparisonExpression::Create(
       ExpressionType::COMPARE_LESSTHANOREQUALTO,
       cast_expr(date_col_ref(), duckdb::LogicalType::TIMESTAMP_TZ),
       duckdb::make_uniq<duckdb::BoundConstantExpression>(
@@ -572,11 +572,11 @@ TEST_CASE("cast-through range extraction: refused shapes keep the residual filte
   }
   SECTION("NULL constant")
   {
-    auto expr = duckdb::make_uniq<duckdb::BoundComparisonExpression>(
-      ExpressionType::COMPARE_LESSTHANOREQUALTO,
-      cast_expr(date_col_ref()),
-      duckdb::make_uniq<duckdb::BoundConstantExpression>(
-        duckdb::Value(duckdb::LogicalType::TIMESTAMP)));
+    auto expr =
+      duckdb::BoundComparisonExpression::Create(ExpressionType::COMPARE_LESSTHANOREQUALTO,
+                                                cast_expr(date_col_ref()),
+                                                duckdb::make_uniq<duckdb::BoundConstantExpression>(
+                                                  duckdb::Value(duckdb::LogicalType::TIMESTAMP)));
     expect_refusal(run_extraction(duckdb::make_uniq<duckdb::ExpressionFilter>(std::move(expr))));
   }
   SECTION("<> is not a range")
@@ -585,7 +585,7 @@ TEST_CASE("cast-through range extraction: refused shapes keep the residual filte
   }
   SECTION("cast around something that is not the column placeholder")
   {
-    auto expr = duckdb::make_uniq<duckdb::BoundComparisonExpression>(
+    auto expr = duckdb::BoundComparisonExpression::Create(
       ExpressionType::COMPARE_LESSTHANOREQUALTO,
       cast_expr(duckdb::make_uniq<duckdb::BoundConstantExpression>(
         duckdb::Value::DATE(duckdb::Date::FromDate(1998, 9, 20)))),
@@ -594,20 +594,20 @@ TEST_CASE("cast-through range extraction: refused shapes keep the residual filte
   }
   SECTION("no cast side at all (constant vs constant)")
   {
-    auto expr = duckdb::make_uniq<duckdb::BoundComparisonExpression>(
+    auto expr = duckdb::BoundComparisonExpression::Create(
       ExpressionType::COMPARE_LESSTHANOREQUALTO, ts_const(midnight), ts_const(midnight));
     expect_refusal(run_extraction(duckdb::make_uniq<duckdb::ExpressionFilter>(std::move(expr))));
   }
   SECTION("OR conjunction inside the expression")
   {
-    auto a = duckdb::make_uniq<duckdb::BoundComparisonExpression>(
+    auto a = duckdb::BoundComparisonExpression::Create(
       ExpressionType::COMPARE_LESSTHAN, cast_expr(date_col_ref()), ts_const(midnight));
-    auto b = duckdb::make_uniq<duckdb::BoundComparisonExpression>(
+    auto b = duckdb::BoundComparisonExpression::Create(
       ExpressionType::COMPARE_GREATERTHAN, cast_expr(date_col_ref()), ts_const(midnight));
     auto conj =
       duckdb::make_uniq<duckdb::BoundConjunctionExpression>(ExpressionType::CONJUNCTION_OR);
-    conj->children.push_back(std::move(a));
-    conj->children.push_back(std::move(b));
+    conj->GetChildrenMutable().push_back(std::move(a));
+    conj->GetChildrenMutable().push_back(std::move(b));
     expect_refusal(run_extraction(duckdb::make_uniq<duckdb::ExpressionFilter>(std::move(conj))));
   }
   SECTION("cast shape on a non-DATE column type is refused")
@@ -626,10 +626,10 @@ TEST_CASE("cast-through range extraction: unconvertible sibling clears coverage 
   auto const k = cutoff_days();
 
   duckdb::TableFilterSet filters;
-  filters.PushFilter(duckdb::ColumnIndex(0),
+  filters.PushFilter(duckdb::ProjectionIndex(0),
                      cast_cmp_filter(ExpressionType::COMPARE_LESSTHANOREQUALTO, k * kDayMicros));
   // An unconvertible shape on another column: `CAST(d2 AS TIMESTAMP) <> T`.
-  filters.PushFilter(duckdb::ColumnIndex(1),
+  filters.PushFilter(duckdb::ProjectionIndex(1),
                      cast_cmp_filter(ExpressionType::COMPARE_NOTEQUAL, k * kDayMicros));
 
   duckdb::vector<duckdb::ColumnIndex> column_ids;

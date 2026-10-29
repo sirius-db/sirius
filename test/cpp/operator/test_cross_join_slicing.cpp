@@ -16,18 +16,26 @@
 
 /**
  * @file test_cross_join_slicing.cpp
- * @brief Unit tests for the number of tasks a cross product of two batches is split into.
+ * @brief Unit tests for splitting a cross product of two batches into tasks.
  */
 
+#include "data/data_batch_utils.hpp"
+#include "helper/type_conversions.hpp"
 #include "op/cross_join_slicing.hpp"
 #include "op/sirius_physical_nested_loop_join.hpp"
+#include "operator_test_utils.hpp"
 
 #include <cudf/types.hpp>
+#include <cudf/utilities/default_stream.hpp>
 
 #include <catch.hpp>
+#include <duckdb/planner/operator/logical_comparison_join.hpp>
 
+#include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
+#include <vector>
 
 using sirius::batch_rows_and_bytes;
 using sirius::op::cross_join_num_slices;
@@ -110,15 +118,49 @@ TEST_CASE("cross join slicing - the row limit counts whole left rows per task",
         static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max()));
 }
 
-TEST_CASE("cross join slicing - a rebuilt task input keeps its slice",
-          "[cross_product][nested_loop_join]")
+TEST_CASE("cross join slicing - a task input rebuilt by late materialization joins only its slice",
+          "[cross_product][nested_loop_join][late_mat]")
 {
-  // Late materialization rebuilds a task input with restored batches. A slice lost there would
-  // make the task join the whole pair.
-  sirius::op::cross_join_slice_data const input({}, 2, 5);
-  auto const rebuilt = input.with_data_batches({});
-  auto const* slice  = dynamic_cast<sirius::op::cross_join_slice_data const*>(rebuilt.get());
+  using sirius::test::operator_utils::copy_column_to_host;
+  using sirius::test::operator_utils::make_numeric_batch;
+  auto& space       = *sirius::test::operator_utils::get_default_gpu_space();
+  auto const stream = cudf::get_default_stream();
+  std::vector<std::int32_t> const left_rows{0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+  std::vector<std::int32_t> const right_rows{100, 200, 300};
+
+  duckdb::LogicalComparisonJoin logical(duckdb::JoinType::INNER);
+  logical.types    = {duckdb::LogicalType::INTEGER, duckdb::LogicalType::INTEGER};
+  auto const child = [] {
+    return duckdb::make_uniq<sirius::op::sirius_physical_operator>(
+      sirius::op::SiriusPhysicalOperatorType::PROJECTION,
+      sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+      0);
+  };
+  sirius::op::sirius_physical_nested_loop_join join(
+    logical, child(), child(), {}, duckdb::JoinType::INNER, 30);
+
+  // The second of two slices: left rows 5..9 with every right row.
+  auto const left  = make_numeric_batch(space, left_rows, cudf::type_id::INT32);
+  auto const right = make_numeric_batch(space, right_rows, cudf::type_id::INT32);
+  sirius::op::cross_join_slice_data const input({left, right}, 1, 2);
+
+  // Late materialization replaces each batch with one holding the same rows.
+  auto const rebuilt = input.with_batches_preserving_rows(
+    {make_numeric_batch(space, left_rows, cudf::type_id::INT32),
+     make_numeric_batch(space, right_rows, cudf::type_id::INT32)});
+  auto const* slice = dynamic_cast<sirius::op::cross_join_slice_data const*>(rebuilt.get());
   REQUIRE(slice != nullptr);
-  CHECK(slice->slice == 2);
-  CHECK(slice->num_slices == 5);
+  CHECK(slice->slice == 1);
+  CHECK(slice->num_slices == 2);
+  CHECK(slice->original_batch_ids() ==
+        std::vector<std::uint64_t>{left->get_batch_id(), right->get_batch_id()});
+
+  auto const output = join.execute(*rebuilt, stream);
+  auto const& batches =
+    dynamic_cast<sirius::op::pipelineable_operator_data const&>(*output).get_data_batches();
+  REQUIRE(batches.size() == 1);
+  auto const view = sirius::get_cudf_table_view(*batches.front());
+  REQUIRE(view.num_rows() == 15);
+  auto const joined_left = copy_column_to_host<std::int32_t>(view.column(0));
+  CHECK(std::ranges::all_of(joined_left, [](std::int32_t row) { return row >= 5; }));
 }

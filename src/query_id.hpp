@@ -18,6 +18,7 @@
 
 #include <cstdint>
 #include <format>
+#include <stdexcept>
 
 namespace sirius {
 
@@ -58,14 +59,14 @@ enum class query_id_t : std::uint32_t {};
  * within-query pipeline rank makes every task of an earlier query dispatch before any task of
  * a later one, while the low 32 bits preserve pipeline order within a query.
  *
- * Masked to 31 bits because the priority is a SIGNED 64-bit value: an id with bit 31 set would
- * shift into the sign bit and invert the ordering. Scheduling order therefore wraps every 2^31
- * queries in a single process — at that point a fresh query sorts ahead of older in-flight
- * ones. That is a known limitation of packing the id into the priority at all.
+ * The 31-bit range is enforced explicitly. Exhaustion is an error rather than identity reuse
+ * or FIFO inversion in a long-running runtime.
  */
-[[nodiscard]] constexpr std::int64_t query_priority_bits(query_id_t id) noexcept
+inline constexpr std::uint32_t max_query_id = 0x7FFF'FFFFU;
+[[nodiscard]] constexpr std::int64_t query_priority_bits(query_id_t id)
 {
-  return static_cast<std::int64_t>(value_of(id) & 0x7FFF'FFFFU) << 32;
+  if (value_of(id) > max_query_id) { throw std::overflow_error("Sirius query priority exhausted"); }
+  return static_cast<std::int64_t>(value_of(id)) << 32;
 }
 
 }  // namespace sirius

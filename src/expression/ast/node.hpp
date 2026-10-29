@@ -194,6 +194,25 @@ struct node {
   [[nodiscard]] sirius::logical_type return_type() const;
 };
 
+// Match the already-bound signature.
+inline std::optional<date_arithmetic_operation> function_call::date_operation() const
+{
+  using enum date_arithmetic_operation;
+  if (arguments().size() != 2) { return std::nullopt; }
+  auto const left   = arguments()[0]->return_type().id();
+  auto const right  = arguments()[1]->return_type().id();
+  auto const output = return_type().id();
+  if (function() == function_id::add && output == type_id::DATE) {
+    if (left == type_id::DATE && right == type_id::INTEGER) { return date_add_days; }
+    if (left == type_id::INTEGER && right == type_id::DATE) { return days_add_date; }
+  }
+  if (function() == function_id::sub && left == type_id::DATE) {
+    if (right == type_id::INTEGER && output == type_id::DATE) { return date_sub_days; }
+    if (right == type_id::DATE && output == type_id::BIGINT) { return date_difference; }
+  }
+  return std::nullopt;
+}
+
 /// Strict accessors for operator boundaries: return the held alternative or throw
 /// not_implemented_exception (with `context`) when `n` is null or holds a different type.
 [[nodiscard]] reference const& require_reference(node const* n, std::string_view context);

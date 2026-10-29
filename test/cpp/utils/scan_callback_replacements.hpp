@@ -21,12 +21,12 @@ inline duckdb::unique_ptr<duckdb::LocalTableFunctionState> fake_local(
 }
 inline void fake_serialize(duckdb::Serializer&,
                            duckdb::optional_ptr<duckdb::FunctionData>,
-                           duckdb::TableFunction const&)
+                           duckdb::BoundTableFunction const&)
 {
   throw duckdb::NotImplementedException("replacement serializer");
 }
 inline duckdb::unique_ptr<duckdb::FunctionData> fake_deserialize(duckdb::Deserializer&,
-                                                                 duckdb::TableFunction&)
+                                                                 duckdb::BoundTableFunction&)
 {
   throw duckdb::NotImplementedException("replacement deserializer");
 }
@@ -45,8 +45,8 @@ inline void replace_callback(duckdb::TableFunction& function, std::string_view p
     function.function = fake_scan;
 }
 
-inline void require_registered_callbacks(duckdb::TableFunction const& actual,
-                                         duckdb::TableFunction const& expected)
+inline void require_registered_callbacks(duckdb::BaseTableFunction const& actual,
+                                         duckdb::BaseTableFunction const& expected)
 {
   REQUIRE(actual.function == expected.function);
   REQUIRE(actual.init_global == expected.init_global);

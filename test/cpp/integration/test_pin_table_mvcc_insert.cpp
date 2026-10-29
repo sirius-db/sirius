@@ -57,10 +57,8 @@ void expect_fallback_matches_cpu(sirius::test::GpuExecutionFixture& fx, const st
   REQUIRE(cpu_result);
   REQUIRE_FALSE(cpu_result->HasError());
 
-  auto gpu_rows = sirius::test::GpuExecutionFixture::collect_rows(
-    gpu_result->Cast<duckdb::MaterializedQueryResult>());
-  auto cpu_rows = sirius::test::GpuExecutionFixture::collect_rows(
-    cpu_result->Cast<duckdb::MaterializedQueryResult>());
+  auto gpu_rows = sirius::test::GpuExecutionFixture::collect_rows(*gpu_result);
+  auto cpu_rows = sirius::test::GpuExecutionFixture::collect_rows(*cpu_result);
   REQUIRE(gpu_rows == cpu_rows);
 }
 
@@ -95,10 +93,8 @@ void compare_gpu_vs_cpu_on(duckdb::Connection& con, const std::string& query)
   run_ok_on(con, "SET gpu_execution = true;");
   REQUIRE(cpu_result);
   REQUIRE_FALSE(cpu_result->HasError());
-  auto gpu_rows = sirius::test::GpuExecutionFixture::collect_rows(
-    gpu_result->Cast<duckdb::MaterializedQueryResult>());
-  auto cpu_rows = sirius::test::GpuExecutionFixture::collect_rows(
-    cpu_result->Cast<duckdb::MaterializedQueryResult>());
+  auto gpu_rows = sirius::test::GpuExecutionFixture::collect_rows(*gpu_result);
+  auto cpu_rows = sirius::test::GpuExecutionFixture::collect_rows(*cpu_result);
   REQUIRE(gpu_rows == cpu_rows);
 }
 
@@ -204,13 +200,11 @@ TEST_CASE_METHOD(PinMvccInsertFixture,
 }
 
 TEST_CASE_METHOD(PinMvccInsertFixture,
-                 "mvcc insert: appends into an indexed tail row group keep per-segment constants",
+                 "mvcc insert: indexed appends keep per-segment constants",
                  "[integration][gpu_execution][pin_table_mvcc_insert]")
 {
-  // With a PRIMARY KEY, DuckDB appends into the existing tail row group
-  // instead of opening a fresh one, so the bulk-flushed CONSTANT segment's
-  // row group later gains rows with a different value: the row-group-level
-  // stats drift (min drops to 7) while the segment's own constant stays 9.
+  // A bulk-flushed CONSTANT segment retains 9 after a later append of 7.
+  // V2 opens a fresh row group for the append, including for indexed tables.
   run_ok("CREATE TABLE t (k INTEGER PRIMARY KEY, v INTEGER);");
   run_ok("INSERT INTO t SELECT range::INTEGER, range::INTEGER FROM range(20000);");
   run_ok("CHECKPOINT;");
@@ -425,9 +419,8 @@ TEST_CASE_METHOD(PinMvccInsertFixture,
   run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu');");
 
   run_ok("INSERT INTO t VALUES (30000);");
-  // Bare count(*) binds only rowid, which is never cached, so the
-  // column-mismatch guard declines; the fallback must still count the delta row.
-  expect_fallback_matches_cpu(*this, "SELECT count(*) FROM t;");
+  // Keep a rowid-dependent predicate so v2 cannot answer COUNT from metadata.
+  expect_fallback_matches_cpu(*this, "SELECT count(*) FROM t WHERE rowid % 2 = 0;");
   run_ok("CALL unpin_table('t');");
 }
 

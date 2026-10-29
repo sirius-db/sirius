@@ -17,11 +17,12 @@
 #include "planner/decimal_sum_input_bounds.hpp"
 
 #include "expression/aggregate_id.hpp"
-#include "helper/logical_type.hpp"
+#include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "planner/scan_column_origin.hpp"
 
+#include <duckdb/common/types/hugeint.hpp>
 #include <duckdb/common/types/value.hpp>
 #include <duckdb/function/table_function.hpp>
 #include <duckdb/planner/expression/bound_aggregate_expression.hpp>
@@ -46,6 +47,15 @@ std::optional<std::uint64_t> unscaled_magnitude(duckdb::Value const& value)
     case duckdb::PhysicalType::INT16: return op::decimal_magnitude(value.GetValueUnsafe<int16_t>());
     case duckdb::PhysicalType::INT32: return op::decimal_magnitude(value.GetValueUnsafe<int32_t>());
     case duckdb::PhysicalType::INT64: return op::decimal_magnitude(value.GetValueUnsafe<int64_t>());
+    case duckdb::PhysicalType::INT128: {
+      // A bound beyond 64 bits proves nothing useful: such a column can be neither widened nor
+      // narrowed by it.
+      int64_t narrow = 0;
+      if (!duckdb::Hugeint::TryCast(value.GetValueUnsafe<duckdb::hugeint_t>(), narrow)) {
+        return std::nullopt;
+      }
+      return op::decimal_magnitude(narrow);
+    }
     default: return std::nullopt;
   }
 }
@@ -89,7 +99,7 @@ std::optional<std::uint64_t> scan_column_max_abs(duckdb::ClientContext& context,
 
 }  // namespace
 
-std::vector<std::optional<std::uint64_t>> resolve_decimal_sum_input_bounds(
+std::vector<std::optional<std::uint64_t>> resolve_sum_input_bounds(
   duckdb::ClientContext& context, duckdb::LogicalAggregate const& op)
 {
   std::vector<std::optional<std::uint64_t>> bounds(op.expressions.size());
@@ -101,22 +111,24 @@ std::vector<std::optional<std::uint64_t>> resolve_decimal_sum_input_bounds(
     auto const& expression = *op.expressions[i];
     if (expression.GetExpressionClass() != duckdb::ExpressionClass::BOUND_AGGREGATE) { continue; }
     auto const& aggregate = expression.Cast<duckdb::BoundAggregateExpression>();
-    auto const id         = sirius::from_duckdb_aggregate_name(aggregate.function.name);
+    auto const id =
+      sirius::from_duckdb_aggregate_name(aggregate.Function().GetName().GetIdentifierName());
     if (!id || (*id != sirius::aggregate_id::sum && *id != sirius::aggregate_id::sum_no_overflow &&
                 *id != sirius::aggregate_id::avg)) {
       continue;
     }
-    if (aggregate.children.size() != 1) { continue; }
-    auto const& input = *aggregate.children[0];
-    auto const& type  = input.return_type;
-    // Wider decimals already run as DECIMAL128 and are never widened.
-    if (type.id() != duckdb::LogicalTypeId::DECIMAL ||
-        duckdb::DecimalType::GetWidth(type) > sirius::logical_type::decimal_max_precision_int64) {
-      continue;
-    }
+    if (aggregate.GetChildren().size() != 1) { continue; }
+    auto const& input = *aggregate.GetChildren()[0];
+    auto const& type  = input.GetReturnType();
+    // DECIMAL32/64 inputs use the bound to skip widening; DECIMAL128 inputs use it to narrow. Of
+    // the wide integer sums only BIGINT can overflow INT64 within one batch: INTEGER cannot, and
+    // HUGEINT statistics carry no INT64 bound.
+    bool const wide_bigint = type.id() == duckdb::LogicalTypeId::BIGINT &&
+                             op::is_wide_integer_sum(*id, sirius::from_duckdb(type));
+    if (type.id() != duckdb::LogicalTypeId::DECIMAL && !wide_bigint) { continue; }
     if (input.GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) { continue; }
     auto const ordinal =
-      static_cast<std::size_t>(input.Cast<duckdb::BoundReferenceExpression>().index);
+      static_cast<std::size_t>(input.Cast<duckdb::BoundReferenceExpression>().Index());
     auto const origin = resolve_scan_column_origin(child, ordinal, origin_policy::value_preserving);
     if (!origin) { continue; }
     auto const known = std::find_if(memo.begin(), memo.end(), [&](auto const& entry) {
@@ -129,9 +141,9 @@ std::vector<std::optional<std::uint64_t>> resolve_decimal_sum_input_bounds(
     bounds[i] = scan_column_max_abs(context, *origin, type);
     memo.emplace_back(*origin, bounds[i]);
     if (bounds[i]) {
-      SIRIUS_LOG_DEBUG("decimal sum bound: aggregate {} ({}) has |unscaled value| <= {}",
+      SIRIUS_LOG_DEBUG("sum input bound: aggregate {} ({}) has |unscaled value| <= {}",
                        i,
-                       aggregate.function.name,
+                       aggregate.Function().GetName().GetIdentifierName(),
                        *bounds[i]);
     }
   }

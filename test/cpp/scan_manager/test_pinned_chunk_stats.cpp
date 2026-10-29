@@ -63,6 +63,7 @@
 #include <duckdb/storage/statistics/numeric_stats.hpp>
 #include <scan_manager/pinned_chunk_stats.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
+#include <utils/table_filter_test_utils.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -86,45 +87,34 @@ namespace {
 
 using filter_ptr = duckdb::unique_ptr<duckdb::TableFilter>;
 
-template <class FILTER, class... ARGS>
-filter_ptr make_filter(ARGS&&... args)
-{
-  filter_ptr filter = duckdb::make_uniq<FILTER>(std::forward<ARGS>(args)...);
-  return filter;
-}
-
 filter_ptr cmp(ExpressionType comparison, Value constant)
 {
-  return make_filter<duckdb::ConstantFilter>(comparison, std::move(constant));
+  return sirius::test::constant_filter(comparison, std::move(constant));
 }
 
 filter_ptr in_list(duckdb::vector<Value> values)
 {
-  return make_filter<duckdb::InFilter>(std::move(values));
+  return sirius::test::in_filter(std::move(values));
 }
 
 filter_ptr and_of(filter_ptr a, filter_ptr b)
 {
-  auto conj = duckdb::make_uniq<duckdb::ConjunctionAndFilter>();
-  conj->child_filters.push_back(std::move(a));
-  conj->child_filters.push_back(std::move(b));
-  return filter_ptr{std::move(conj)};
+  return sirius::test::conjunction_filter(
+    ExpressionType::CONJUNCTION_AND, std::move(a), std::move(b));
 }
 
 filter_ptr or_of(filter_ptr a, filter_ptr b)
 {
-  auto conj = duckdb::make_uniq<duckdb::ConjunctionOrFilter>();
-  conj->child_filters.push_back(std::move(a));
-  conj->child_filters.push_back(std::move(b));
-  return filter_ptr{std::move(conj)};
+  return sirius::test::conjunction_filter(
+    ExpressionType::CONJUNCTION_OR, std::move(a), std::move(b));
 }
 
 filter_ptr optional_of(filter_ptr child)
 {
-  return make_filter<duckdb::OptionalFilter>(std::move(child));
+  return sirius::test::optional_filter(std::move(child), LogicalType::INTEGER);
 }
 
-filter_ptr dynamic_placeholder() { return make_filter<duckdb::DynamicFilter>(); }
+filter_ptr dynamic_placeholder() { return sirius::test::dynamic_filter(LogicalType::INTEGER); }
 
 /// Stats exactly as compute_pinned_chunk_stats builds them: CreateUnknown +
 /// bounds + exact chunk-level null flags.
@@ -164,18 +154,31 @@ TEST_CASE("pinned_chunk_stats - classifier accepts allowed static shapes", "[pin
   }
 
   REQUIRE(filter_safe_for_stats(*in_list({Value::INTEGER(1), Value::INTEGER(2)}), type));
-  REQUIRE(filter_safe_for_stats(duckdb::IsNullFilter{}, type));
-  REQUIRE(filter_safe_for_stats(duckdb::IsNotNullFilter{}, type));
+  REQUIRE(filter_safe_for_stats(*sirius::test::null_filter(LogicalType::INTEGER), type));
+  REQUIRE(filter_safe_for_stats(*sirius::test::null_filter(LogicalType::INTEGER, true), type));
 
   auto conjunctions = and_of(cmp(ExpressionType::COMPARE_GREATERTHAN, Value::INTEGER(1)),
                              cmp(ExpressionType::COMPARE_LESSTHAN, Value::INTEGER(10)));
   REQUIRE(filter_safe_for_stats(*conjunctions, type));
 
   auto nested = optional_of(
-    or_of(make_filter<duckdb::IsNullFilter>(),
+    or_of(sirius::test::null_filter(type),
           and_of(cmp(ExpressionType::COMPARE_EQUAL, Value::INTEGER(5)),
                  cmp(ExpressionType::COMPARE_GREATERTHANOREQUALTO, Value::INTEGER(0)))));
   REQUIRE(filter_safe_for_stats(*nested, type));
+}
+
+TEST_CASE("pinned_chunk_stats - inferred type handles optional expression variants",
+          "[pinned_chunk_stats]")
+{
+  auto conjunction =
+    and_of(optional_of(cmp(ExpressionType::COMPARE_GREATERTHAN, Value::INTEGER(1))),
+           optional_of(cmp(ExpressionType::COMPARE_LESSTHAN, Value::INTEGER(10))));
+  REQUIRE(filter_safe_for_stats(*conjunction));
+  auto child = cmp(ExpressionType::COMPARE_EQUAL, Value::INTEGER(5));
+  duckdb::ExpressionFilter selectivity(duckdb::CreateSelectivityOptionalFilterExpression(
+    std::move(child->Cast<duckdb::ExpressionFilter>().expr), LogicalType::INTEGER, 0.5f, 10));
+  REQUIRE_FALSE(filter_safe_for_stats(selectivity));
 }
 
 // ============================================================================
@@ -189,11 +192,11 @@ TEST_CASE("pinned_chunk_stats - classifier rejects dynamic filters at any depth"
 
   REQUIRE_FALSE(filter_safe_for_stats(*dynamic_placeholder(), type));
   REQUIRE_FALSE(filter_safe_for_stats(*optional_of(dynamic_placeholder()), type));
-  REQUIRE_FALSE(filter_safe_for_stats(
-    *or_of(make_filter<duckdb::IsNullFilter>(), dynamic_placeholder()), type));
+  REQUIRE_FALSE(
+    filter_safe_for_stats(*or_of(sirius::test::null_filter(type), dynamic_placeholder()), type));
   // The shape a runtime join filter actually arrives in.
   REQUIRE_FALSE(filter_safe_for_stats(
-    *optional_of(or_of(make_filter<duckdb::IsNullFilter>(), dynamic_placeholder())), type));
+    *optional_of(or_of(sirius::test::null_filter(type), dynamic_placeholder())), type));
   // Deep nesting: one dynamic leaf poisons the whole tree.
   REQUIRE_FALSE(filter_safe_for_stats(
     *and_of(or_of(cmp(ExpressionType::COMPARE_EQUAL, Value::INTEGER(1)), dynamic_placeholder()),
@@ -210,35 +213,28 @@ TEST_CASE("pinned_chunk_stats - classifier rejects unsupported shapes and malfor
 {
   auto const type = LogicalType::INTEGER;
 
-  // Distinct-from comparisons have NULL semantics CheckStatistics ignores.
   REQUIRE_FALSE(
     filter_safe_for_stats(*cmp(ExpressionType::COMPARE_DISTINCT_FROM, Value::INTEGER(1)), type));
-
-  REQUIRE_FALSE(filter_safe_for_stats(
-    duckdb::StructFilter{0, "child", cmp(ExpressionType::COMPARE_EQUAL, Value::INTEGER(1))}, type));
-
-  duckdb::ExpressionFilter expression_filter{
+  duckdb::ExpressionFilter constant_filter{
     duckdb::make_uniq<duckdb::BoundConstantExpression>(Value::BOOLEAN(true))};
-  REQUIRE_FALSE(filter_safe_for_stats(expression_filter, type));
+  REQUIRE_FALSE(filter_safe_for_stats(constant_filter, type));
 
-  // Childless conjunctions cannot occur from the binder; both reject (a
-  // childless OR would fold to FILTER_ALWAYS_FALSE and prune unconditionally).
-  REQUIRE_FALSE(filter_safe_for_stats(duckdb::ConjunctionAndFilter{}, type));
-  REQUIRE_FALSE(filter_safe_for_stats(duckdb::ConjunctionOrFilter{}, type));
+  auto wrong_index = cmp(ExpressionType::COMPARE_EQUAL, Value::INTEGER(1));
+  auto& function =
+    wrong_index->Cast<duckdb::ExpressionFilter>().expr->Cast<duckdb::BoundFunctionExpression>();
+  duckdb::BoundComparisonExpression::LeftMutable(function)
+    ->Cast<duckdb::BoundReferenceExpression>()
+    .IndexMutable() = 1;
+  REQUIRE_FALSE(filter_safe_for_stats(*wrong_index, type));
 
-  // OptionalFilter's child defaults to nullptr; its CheckStatistics derefs the
-  // child unconditionally, so the classifier must reject childless optionals.
-  REQUIRE_FALSE(filter_safe_for_stats(duckdb::OptionalFilter{}, type));
+  auto multi = cmp(ExpressionType::COMPARE_EQUAL, Value::INTEGER(1));
+  multi->Cast<duckdb::ExpressionFilter>().column_indexes.emplace_back(0);
+  REQUIRE_FALSE(filter_safe_for_stats(*multi, type));
 
-  // InFilter's constructor bans null/empty values, so violate the invariants
-  // by mutating the public field — the classifier must stay total anyway.
-  auto in_with_null = in_list({Value::INTEGER(1)});
-  in_with_null->Cast<duckdb::InFilter>().values.emplace_back(LogicalType::INTEGER);  // NULL value
-  REQUIRE_FALSE(filter_safe_for_stats(*in_with_null, type));
-
-  auto in_emptied = in_list({Value::INTEGER(1)});
-  in_emptied->Cast<duckdb::InFilter>().values.clear();
-  REQUIRE_FALSE(filter_safe_for_stats(*in_emptied, type));
+  duckdb::ExpressionFilter missing_expression{
+    duckdb::make_uniq<duckdb::BoundConstantExpression>(Value::BOOLEAN(true))};
+  missing_expression.expr.reset();
+  REQUIRE_FALSE(filter_safe_for_stats(missing_expression, type));
 }
 
 // ============================================================================
@@ -335,9 +331,10 @@ TEST_CASE("pinned_chunk_stats - prune handles null-based proofs", "[pinned_chunk
   auto const with_nulls =
     make_stats(LogicalType::INTEGER, Value::INTEGER(10), Value::INTEGER(20), /*has_null=*/true);
 
-  REQUIRE(chunk_provably_empty(duckdb::IsNullFilter{}, no_nulls));
-  REQUIRE_FALSE(chunk_provably_empty(duckdb::IsNullFilter{}, with_nulls));
-  REQUIRE_FALSE(chunk_provably_empty(duckdb::IsNotNullFilter{}, with_nulls));
+  REQUIRE(chunk_provably_empty(*sirius::test::null_filter(LogicalType::INTEGER), no_nulls));
+  REQUIRE_FALSE(chunk_provably_empty(*sirius::test::null_filter(LogicalType::INTEGER), with_nulls));
+  REQUIRE_FALSE(
+    chunk_provably_empty(*sirius::test::null_filter(LogicalType::INTEGER, true), with_nulls));
 
   // All-null statistics: compute_pinned_chunk_stats never produces these
   // (all-null columns get a null stats cell), but the prune check's contract
@@ -345,7 +342,7 @@ TEST_CASE("pinned_chunk_stats - prune handles null-based proofs", "[pinned_chunk
   auto all_null = duckdb::NumericStats::CreateUnknown(LogicalType::INTEGER);
   all_null.Set(duckdb::StatsInfo::CANNOT_HAVE_VALID_VALUES);
   all_null.SetHasNull();
-  REQUIRE(chunk_provably_empty(duckdb::IsNotNullFilter{}, all_null));
+  REQUIRE(chunk_provably_empty(*sirius::test::null_filter(LogicalType::INTEGER, true), all_null));
   // Constant comparisons need a non-null row to match, so all-null prunes too.
   REQUIRE(chunk_provably_empty(*cmp(ExpressionType::COMPARE_EQUAL, Value::INTEGER(15)), all_null));
 }
@@ -366,7 +363,7 @@ TEST_CASE("pinned_chunk_stats - prune is conservative on unsafe input", "[pinned
   REQUIRE_FALSE(
     chunk_provably_empty(*cmp(ExpressionType::COMPARE_GREATERTHAN, Value::INTEGER(1)), date_stats));
   REQUIRE_FALSE(chunk_provably_empty(*dynamic_placeholder(), date_stats));
-  REQUIRE_FALSE(chunk_provably_empty(duckdb::OptionalFilter{}, date_stats));
+  REQUIRE_FALSE(chunk_provably_empty(*optional_of(dynamic_placeholder()), date_stats));
 }
 
 // ============================================================================
@@ -829,7 +826,7 @@ pinned_entry make_plan_entry(std::size_t n_chunks, std::vector<duckdb::idx_t> co
 duckdb::TableFilterSet make_filter_set(duckdb::idx_t key, filter_ptr f)
 {
   duckdb::TableFilterSet fs;
-  fs.filters[key] = std::move(f);
+  fs.SetFilterByColumnIndex(duckdb::ProjectionIndex(key), std::move(f));
   return fs;
 }
 
@@ -940,10 +937,12 @@ TEST_CASE("build_cached_scan_plan - identity plan whenever pruning is not provab
   SECTION("dynamic filter rejects; a usable sibling filter still prunes")
   {
     duckdb::TableFilterSet fs;
-    fs.filters[0] = dynamic_placeholder();
+    fs.SetFilterByColumnIndex(duckdb::ProjectionIndex(0), dynamic_placeholder());
     duckdb::vector<duckdb::ColumnIndex> two_cols{duckdb::ColumnIndex(3), duckdb::ColumnIndex(3)};
-    fs.filters[1] = cmp(ExpressionType::COMPARE_GREATERTHANOREQUALTO, Value::INTEGER(1000));
-    auto plan     = build_cached_scan_plan(entry, &fs, &two_cols);
+    fs.SetFilterByColumnIndex(
+      duckdb::ProjectionIndex(1),
+      cmp(ExpressionType::COMPARE_GREATERTHANOREQUALTO, Value::INTEGER(1000)));
+    auto plan = build_cached_scan_plan(entry, &fs, &two_cols);
     REQUIRE(plan.survivor_chunk_indices == survivors_t{1, 2});
     REQUIRE(plan.pruned == 1);
   }

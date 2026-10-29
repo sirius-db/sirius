@@ -63,10 +63,7 @@ duckdb::JoinCondition make_condition(
   duckdb::unique_ptr<duckdb::Expression> right,
   duckdb::ExpressionType comparison = duckdb::ExpressionType::COMPARE_EQUAL)
 {
-  duckdb::JoinCondition condition;
-  condition.left       = std::move(left);
-  condition.right      = std::move(right);
-  condition.comparison = comparison;
+  duckdb::JoinCondition condition(std::move(left), std::move(right), comparison);
   return condition;
 }
 
@@ -274,7 +271,8 @@ TEST_CASE("admission never admits an inequality condition", "[dynamic_filter][ke
   REQUIRE(admitted == std::vector<dynamic_filter_publish_plan::admitted_key>{expected_key(0)});
 }
 
-TEST_CASE("admission never admits a null-equal condition", "[dynamic_filter][key_admission]")
+TEST_CASE("admission preserves NULLs for a wrapped null-equal condition",
+          "[dynamic_filter][key_admission]")
 {
   duckdb::vector<duckdb::JoinCondition> raw;
   raw.push_back(
@@ -282,8 +280,10 @@ TEST_CASE("admission never admits a null-equal condition", "[dynamic_filter][key
   auto const conditions = sirius::wrap_join_conditions(std::move(raw));
   std::vector<dynamic_filter_condition_shape> const shapes(1, kDirectDirect);
 
-  auto const admitted = admit_dynamic_filter_keys(conditions, shapes, {});
-  REQUIRE(admitted.empty());
+  auto const admitted     = admit_dynamic_filter_keys(conditions, shapes, {});
+  auto expected           = expected_key(0);
+  expected.preserve_nulls = true;
+  REQUIRE(admitted == std::vector<dynamic_filter_publish_plan::admitted_key>{expected});
 }
 
 TEST_CASE("admitted keys without any target build a valid but disabled plan",
@@ -430,7 +430,7 @@ TEST_CASE("join-edge route accepts only direct matching membership-supported equ
     REQUIRE_FALSE(
       direct_route_admissible(duckdb::JoinType::ANTI, equal, kDirectDirect, kInt32, kInt32));
     REQUIRE_FALSE(direct_route_admissible(duckdb::JoinType::INNER,
-                                          sirius::comparison_type::not_distinct_from,
+                                          sirius::comparison_type::distinct_from,
                                           kDirectDirect,
                                           kInt32,
                                           kInt32));
@@ -531,7 +531,8 @@ TEST_CASE("publish plan rejects inconsistent admitted-key metadata",
                  probe_storage_type,
                  key_shape,
                  domain,
-                 unique] = expected_key(3);
+                 unique,
+                 preserve_nulls] = expected_key(3);
     (void)planner_condition_index;
     (void)build_key_ordinal;
     (void)probe_key_ordinal;
@@ -540,9 +541,13 @@ TEST_CASE("publish plan rejects inconsistent admitted-key metadata",
     (void)key_shape;
     (void)domain;
     (void)unique;
+    (void)preserve_nulls;
 
     auto const base = expected_key(3);
     REQUIRE(base == expected_key(3));
+    auto vary_null_policy           = base;
+    vary_null_policy.preserve_nulls = true;
+    REQUIRE_FALSE(base == vary_null_policy);
 
     auto vary_planner_condition_index                    = base;
     vary_planner_condition_index.planner_condition_index = 4;
@@ -575,5 +580,28 @@ TEST_CASE("publish plan rejects inconsistent admitted-key metadata",
     auto vary_proven_unique                    = base;
     vary_proven_unique.build_key_proven_unique = true;
     REQUIRE_FALSE(base == vary_proven_unique);
+  }
+}
+
+TEST_CASE("key comparison determines NULL preservation independently for each key",
+          "[dynamic_filter][key_admission]")
+{
+  auto conditions          = make_wrapped_equalities(3);
+  conditions[0].comparison = sirius::comparison_type::not_distinct_from;
+  conditions[1].comparison = sirius::comparison_type::distinct_from;
+  std::vector<dynamic_filter_condition_shape> const shapes(3, kDirectDirect);
+  auto const keys = admit_dynamic_filter_keys(conditions, shapes, {});
+  REQUIRE(keys.size() == 2);
+  CHECK(keys[0].planner_condition_index == 0);
+  CHECK(keys[0].preserve_nulls);
+  CHECK(keys[1].planner_condition_index == 2);
+  CHECK_FALSE(keys[1].preserve_nulls);
+  for (auto join_type : {duckdb::JoinType::INNER,
+                         duckdb::JoinType::SEMI,
+                         duckdb::JoinType::RIGHT,
+                         duckdb::JoinType::RIGHT_SEMI,
+                         duckdb::JoinType::RIGHT_ANTI}) {
+    CHECK(direct_route_admissible(
+      join_type, sirius::comparison_type::not_distinct_from, kDirectDirect, kInt32, kInt32));
   }
 }

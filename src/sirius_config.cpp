@@ -18,6 +18,7 @@
 
 #include "exec/config.hpp"
 #include "log/logging.hpp"
+#include "memory/size_arithmetic.hpp"
 #include "yaml_reader.hpp"
 
 #include <cuda_runtime_api.h>
@@ -79,7 +80,8 @@ constexpr batch_setting batch_settings[] = {
   {"concat_batch_bytes", &operator_params::concat_batch_bytes, 1},
   {"cross_join_task_bytes", &operator_params::cross_join_task_bytes, 1},
   {"sort_sample_bytes", &operator_params::sort_sample_bytes, 1},
-  {"max_build_hash_table_bytes", &operator_params::max_build_hash_table_bytes, 2}};
+  {"max_build_hash_table_bytes", &operator_params::max_build_hash_table_bytes, 8},
+  {"max_build_probe_resident_bytes", &operator_params::max_build_probe_resident_bytes, 8}};
 
 }  // namespace
 
@@ -293,6 +295,50 @@ static void from_yaml(const YAML::Node& node, scan_manager::memory_prefetcher_co
   r.reject_unknown();
 }
 
+static void from_yaml(const YAML::Node& node, scan_manager::preparation_config& opt)
+{
+  yaml::reader r(node, "preparation");
+  auto limit = [&](char const* key, std::optional<size_t>& out, bool allow_zero = false) {
+    // Parse signed first so negative values cannot wrap into a large size_t.
+    std::optional<int64_t> value;
+    r.optional(key, value);
+    if (!value) return;
+    if (*value < 0 || (!allow_zero && *value == 0) ||
+        static_cast<uint64_t>(*value) > std::numeric_limits<size_t>::max())
+      throw std::runtime_error(std::string("preparation.") + key +
+                               (allow_zero ? ": must be a nonnegative integer that fits size_t"
+                                           : ": must be a positive integer that fits size_t"));
+    out = static_cast<size_t>(*value);
+  };
+  limit("max_inflight_metadata_jobs", opt.max_inflight_metadata_jobs, true);
+  limit("max_inflight_dv_jobs", opt.max_inflight_dv_jobs, true);
+  limit("lookahead_batches", opt.lookahead_batches);
+  limit("max_control_work", opt.max_control_work);
+  limit("drain_quantum", opt.drain_quantum);
+  limit("coordinator_workers", opt.coordinator_workers, true);
+  limit("native_reader_workers", opt.native_reader_workers);
+  limit("max_native_readers", opt.max_native_readers);
+  if (opt.resolved_native_readers() < opt.resolved_native_workers())
+    throw std::runtime_error(
+      "preparation.max_native_readers must be at least native_reader_workers");
+  if (auto node = r.optional_node("partial_batch")) {
+    auto& policy = opt.partial_batch.emplace();
+    yaml::reader partial(*node, "preparation.partial_batch");
+    int64_t fill = policy.min_fill_percent;
+    partial.optional(
+      "min_fill_percent", fill, [](auto value) { return value >= 1 && value <= 100; });
+    policy.min_fill_percent = static_cast<size_t>(fill);
+    partial.optional("min_residence", policy.min_residence);
+    partial.optional("max_residence", policy.max_residence);
+    policy.validate();
+    partial.reject_unknown();
+  }
+  r.optional("interrupt_check_interval", opt.interrupt_check_interval, [](auto value) {
+    return value.count() > 0;
+  });
+  r.reject_unknown();
+}
+
 static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config& opt)
 {
   yaml::reader r(node, "scan_manager");
@@ -301,9 +347,10 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
       "'sirius.executor.scan_manager.object_store': no longer YAML-loadable; use "
       "CREATE SECRET (TYPE SIRIUS_S3, ...) or sirius_config::set_object_store_config()");
   }
-  r.optional("num_threads", opt.thread_pool.num_threads, yaml::greater_than<int>{2});
+  r.optional("num_threads", opt.thread_pool.num_threads, yaml::greater_than<int>{0});
   r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
   r.optional("backend", opt.backend);
+  r.optional("max_concurrent_queries", opt.max_concurrent_queries, yaml::greater_than<int>{0});
   r.optional("uring_n_reactors", opt.uring_n_reactors, yaml::greater_than<std::size_t>{0});
   r.optional("rest_n_reactors", opt.rest_n_reactors, yaml::greater_than<std::size_t>{0});
   r.optional("max_readahead_scans", opt.max_readahead_scans);
@@ -313,6 +360,7 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   if (auto n = r.optional_node("kvikio")) sirius::from_yaml(*n, opt.kvikio);
   if (auto n = r.optional_node("cache")) sirius::from_yaml(*n, opt.cache);
   if (auto n = r.optional_node("memory_prefetcher")) from_yaml(*n, opt.memory_prefetcher);
+  if (auto n = r.optional_node("preparation")) from_yaml(*n, opt.preparation);
   r.reject_unknown();
   // Stamped here rather than by the caller: `cache` and the `uring` sub-config
   // it overrides have both been read by now.
@@ -338,6 +386,7 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.optional("cross_join_task_bytes", yaml::bytes(opt.cross_join_task_bytes));
   r.optional("sort_sample_bytes", yaml::bytes(opt.sort_sample_bytes));
   r.optional("max_build_hash_table_bytes", yaml::bytes(opt.max_build_hash_table_bytes));
+  r.optional("max_build_probe_resident_bytes", yaml::bytes(opt.max_build_probe_resident_bytes));
   r.optional("max_broadcast_join_size", yaml::bytes(opt.max_broadcast_join_size));
   r.optional("mark_join_build_switch_ratio",
              opt.mark_join_build_switch_ratio,
@@ -393,11 +442,10 @@ static void from_yaml(const YAML::Node& node, telemetry_config& opt)
 {
   yaml::reader r(node, "telemetry");
   r.optional("enable_quent", opt.enable_quent);
-  r.optional("enable_batch_events", opt.enable_batch_events);
   r.optional("enable_nvtx", opt.enable_nvtx);
   r.optional("exporter", opt.exporter, [](std::string const& value) {
-    if (value == "ndjson" || value == "msgpack" || value == "postcard") return true;
-    throw std::runtime_error("must be one of ndjson, msgpack, postcard");
+    if (value == QUENT_NDJSON_EXPORTER) { return true; }
+    throw std::runtime_error("must be ndjson");
   });
   r.optional("output_directory", opt.output_directory, [](std::string const& value) {
     if (!value.empty()) return true;
@@ -420,6 +468,14 @@ static void from_yaml(const YAML::Node& node, compression_config& opt)
     return std::isfinite(value) && value >= 0.0;
   });
   r.optional("input_plan_dir", opt.input_plan_dir);
+  r.optional("enable_spill_compression", opt.enable_spill_compression);
+  r.optional("spill_min_batch_bytes", yaml::bytes(opt.spill_min_batch_bytes));
+  r.optional("spill_max_compressed_fraction", opt.spill_max_compressed_fraction, [](double value) {
+    return std::isfinite(value) && value >= 0.0;
+  });
+  r.optional("spill_encode_reserve_fraction", opt.spill_encode_reserve_fraction, [](double value) {
+    return std::isfinite(value) && value >= 0.0 && value <= 1.0;
+  });
   r.reject_unknown();
 }
 
@@ -809,16 +865,32 @@ try {
     mr.reject_unknown();
   }
 
+  int query_limit            = 1;
+  bool const has_query_limit = r.has_value("max_concurrent_queries");
+  r.optional("max_concurrent_queries", query_limit, yaml::greater_than<int>{0});
+  bool has_scan_limit = false;
   // Executors
   if (auto exec_node = r.optional_node("executor")) {
     yaml::reader er(*exec_node, "sirius.executor");
     if (auto n = er.optional_node("task_creator")) from_yaml(*n, settings._task_creator_config);
-    if (auto n = er.optional_node("scan_manager")) from_yaml(*n, settings._scan_manager_config);
+    if (auto n = er.optional_node("scan_manager")) {
+      yaml::reader scan_reader(*n, "sirius.executor.scan_manager");
+      has_scan_limit = scan_reader.has_value("max_concurrent_queries");
+      from_yaml(*n, settings._scan_manager_config);
+    }
     if (auto n = er.optional_node("pipeline"))
       from_yaml(*n, settings._gpu_pipeline_executor_config);
     if (auto n = er.optional_node("downgrade")) from_yaml(*n, settings._downgrade_executor_config);
     er.reject_unknown();
   }
+
+  if (has_query_limit && has_scan_limit &&
+      query_limit != settings._scan_manager_config.max_concurrent_queries)
+    throw std::runtime_error(
+      "conflicting sirius.max_concurrent_queries and deprecated "
+      "executor.scan_manager.max_concurrent_queries");
+  if (has_query_limit) settings._scan_manager_config.max_concurrent_queries = query_limit;
+  // Both YAML names share one stored authority.
 
   // Parse operator settings below and record which batch sizes are explicit,
   // so hardware resolution only fills in omitted values.
@@ -921,12 +993,23 @@ try {
 
   const auto defaults =
     operator_defaults_for(settings._memory_space_configs, impl_->use_effective_gpu_capacity);
+  auto const is_explicit = [&](uint64_t operator_params::* member) {
+    return std::find(impl_->explicit_batch_settings.begin(),
+                     impl_->explicit_batch_settings.end(),
+                     member) != impl_->explicit_batch_settings.end();
+  };
   for (const auto& setting : batch_settings) {
-    if (std::find(impl_->explicit_batch_settings.begin(),
-                  impl_->explicit_batch_settings.end(),
-                  setting.member) == impl_->explicit_batch_settings.end()) {
+    if (!is_explicit(setting.member)) {
       settings._operator_params.*setting.member = defaults.*setting.member;
     }
+  }
+  // Derive the index budget from the startup partition size, preserving YAML tuning.
+  // The former payload limit was 2x partitions; 4-byte rows need a 4x larger index estimate
+  // (16 bytes/row). The independent resident budget remains batch-derived.
+  // SET hash_partition_bytes does not re-derive either budget.
+  if (!is_explicit(&operator_params::max_build_hash_table_bytes)) {
+    settings._operator_params.max_build_hash_table_bytes =
+      sirius::memory::saturating_mul(8, settings._operator_params.hash_partition_bytes);
   }
   settings.finalize_derived_config();
   return settings;

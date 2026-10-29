@@ -31,7 +31,13 @@ TEST_CASE("dispatcher settles a refused pool submission", "[scoped_dispatcher]")
 {
   sirius::exec::static_thread_pool pool(1);
   sirius::exec::scoped_dispatcher dispatcher(pool);
+  unsigned notifications = 0;
+  dispatcher.set_stop_drain_callback([&] {
+    dispatcher.wait_for_all();  // Notification runs outside the dispatcher mutex.
+    ++notifications;
+  });
   pool.stop();
+  SECTION("empty") { dispatcher.request_stop(); }
   SECTION("enqueue")
   {
     CHECK_THROWS_WITH(dispatcher.enqueue([] {}), "thread pool is stopped");
@@ -46,6 +52,8 @@ TEST_CASE("dispatcher settles a refused pool submission", "[scoped_dispatcher]")
   CHECK_NOTHROW(dispatcher.enqueue([&] { executed = true; }));
   dispatcher.wait_for_all();
   CHECK_FALSE(executed);
+  dispatcher.request_stop();
+  CHECK(notifications == 1);
 }
 
 TEST_CASE("failed dispatcher submission discards pending work without executing it inline",
@@ -181,6 +189,14 @@ TEST_CASE("cancellation keeps a queued continuation outstanding", "[scoped_dispa
   auto released        = release.get_future();
   auto blocker_release = release_blocker.get_future();
   unsigned executed = 0, destroyed = 0;
+  std::promise<void> notification;
+  auto notified                      = notification.get_future();
+  unsigned destroyed_at_notification = 0;
+  dispatcher.set_stop_drain_callback([&] {
+    dispatcher.wait_for_all();
+    destroyed_at_notification = destroyed;
+    notification.set_value();
+  });
   dispatcher.enqueue([&] {
     entered.set_value();
     released.wait();
@@ -203,9 +219,13 @@ TEST_CASE("cancellation keeps a queued continuation outstanding", "[scoped_dispa
   dispatcher.request_stop();
   auto drained      = std::async(std::launch::async, [&] { dispatcher.wait_for_all(); });
   auto const status = drained.wait_for(std::chrono::milliseconds(50));
+  auto const notification_status = notified.wait_for(std::chrono::milliseconds(0));
   release_blocker.set_value();
   drained.get();
   CHECK(status == std::future_status::timeout);
+  CHECK(notification_status == std::future_status::timeout);
+  REQUIRE(notified.wait_for(std::chrono::seconds(1)) == std::future_status::ready);
+  CHECK(destroyed_at_notification == 1);
   CHECK(executed == 0);
   CHECK(destroyed == 1);
 }
@@ -244,4 +264,59 @@ TEST_CASE("refused dispatcher handoff drains pending work on the current worker"
   CHECK(destroyed == 3);
   CHECK(same_worker);
   CHECK(worker != std::this_thread::get_id());
+}
+
+TEST_CASE("dispatcher bounded stop retains cleanup ownership until the last capture",
+          "[scoped_dispatcher]")
+{
+  sirius::exec::static_thread_pool pool(1);
+  sirius::exec::scoped_dispatcher dispatcher(pool);
+  std::promise<void> entered, release, drained;
+  auto done     = drained.get_future();
+  auto released = release.get_future();
+  std::atomic<unsigned> disposed{0}, executed{0}, notified{0}, disposed_at_notification{0};
+  dispatcher.set_stop_drain_callback([&] {
+    disposed_at_notification = disposed.load();
+    ++notified;
+    drained.set_value();
+  });
+  dispatcher.enqueue([&] {
+    entered.set_value();
+    released.wait();
+  });
+  entered.get_future().wait();
+  bool released_running = false;
+  auto cleanup          = std::shared_ptr<void>(nullptr, [&](void*) {
+    if (!released_running) release.set_value();
+    dispatcher.request_stop();
+    dispatcher.wait_for_all();
+  });
+  for (unsigned i = 0; i < 5; ++i) {
+    auto capture = std::shared_ptr<int>(new int{}, [&](int* value) {
+      delete value;
+      ++disposed;
+      dispatcher.enqueue([&] { ++executed; });  // Destruction remains outside the mutex.
+    });
+    dispatcher.enqueue([capture] {});
+  }
+  CHECK_FALSE(dispatcher.request_stop(2));
+  CHECK(disposed == 2);
+  release.set_value();
+  released_running = true;
+  std::promise<void> worker_idle;
+  auto idle = worker_idle.get_future();
+  pool.schedule([&] { worker_idle.set_value(); });
+  idle.wait();  // The running slot is gone; queued captures alone must prevent drain.
+  CHECK(notified == 0);
+  CHECK_FALSE(dispatcher.request_stop(2));
+  CHECK(disposed == 4);
+  CHECK(notified == 0);
+  CHECK(dispatcher.request_stop(2));
+  CHECK(disposed == 5);
+  CHECK(notified == 1);
+  cleanup.reset();
+  REQUIRE(done.wait_for(std::chrono::seconds{2}) == std::future_status::ready);
+  CHECK(notified == 1);
+  CHECK(disposed_at_notification == 5);
+  CHECK(executed == 0);
 }

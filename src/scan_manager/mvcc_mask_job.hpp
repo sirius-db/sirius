@@ -113,7 +113,7 @@ struct mvcc_mask_work {
   mvcc_chunk_mask_set* masks{nullptr};  ///< the request's set; slot chunk_index holds the words
   std::size_t chunk_index{0};
   std::span<op::scan::mvcc_row_group_slice const> slices;  ///< into the workset's plans
-  duckdb::TransactionData transaction{duckdb::TransactionData::Committed()};
+  duckdb::TransactionData transaction{duckdb::TransactionData::Unversioned()};
   std::atomic<bool> any_deleted{false};  ///< set by fill tasks; finalize resets clean slots
 };
 

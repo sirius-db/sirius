@@ -34,7 +34,7 @@ unzip = "*"
 clang = "21.*"
 wget = "*"
 pre-commit = "*"
-identify = ">=2.6"
+identify = "2.*"
 clang-tools = "21.*"
 # Provides llvm-symbolizer (and friends) matching the clang version above, so
 # ASan/TSan reports are symbolized. Kept in lockstep with `clang` at 21.*.
@@ -42,13 +42,12 @@ llvm-tools = "21.*"
 lld = "21.*"
 pkg-config = "*"
 mold = "*"
-libprotobuf = "*"
 rust = "*"
 cuda-nvrtc-dev = "*"
 croaring = "*"
 
 [pypi-dependencies]
-rumdl = "==0.2.44"
+rumdl = ">=0.2.44"
 
 [feature.dev-libs.dependencies]
 catch2 = "3.*"
@@ -56,8 +55,9 @@ librmm = "*"
 libcurand-dev = "*"
 yaml-cpp = "*"
 libabseil = "*"
-duckdb = "=1.5.6"
-spdlog = "1.8.*"
+# Fixture/data-generation Python client; the engine and LOAD tests use the pinned v2 source.
+duckdb = "=2.0.0"
+spdlog = "1.*"
 sqlite = "3.*"
 rust-src = "*"
 liburing = "*"
@@ -68,9 +68,15 @@ pnpm = "*"
 python = "3.14.*"
 pyarrow = ">=14"
 seaweedfs = ">=4.48"
-fastavro = "1.12.2.*"
+liblzma-devel = "*"
+jansson = "*"
+snappy = "*"
+fastavro = "1.*"
 
 [tasks]
+# Differential fuzzer; see test/fuzz/README.md. Drives the DuckDB shell from the build.
+fuzz = { cmd = "PYTHONPATH=$PIXI_PROJECT_ROOT/test/fuzz python -m siriusfuzz", description = "Sirius fuzzer: run|doctor|replay|recheck|show-config|selftest (paths resolve from the current directory)" }
+fuzz-test = { cmd = "python -m unittest discover -s tests -t .", cwd = "test/fuzz", description = "Unit tests for the fuzzer harness (no GPU needed)" }
 
 [tasks.duckdb]
 description = "Start the local DuckDB shell with Sirius loaded."
@@ -91,8 +97,8 @@ platforms = ["linux-64-cuda13", "linux-aarch64-cuda13"]
 
 [feature.cuda13.dependencies]
 cuda-version = "13.4.*"
-libcudf = "==26.08.01"
-libcuvs = "==26.08.01"
+libcudf = "==26.10.02"
+libcuvs = "==26.10.00"
 
 [feature.cuda13.activation.env]
 # GPU architectures: Turing through Blackwell (75, 80, 86, 89, 90a, 100f, 120a, 120)
@@ -104,12 +110,12 @@ platforms = ["linux-64-cuda12", "linux-aarch64-cuda12"]
 
 [feature.cuda12.dependencies]
 cuda-version = "12.*"
-libcudf = "==26.08.01"
-libcuvs = "==26.08.01"
+libcudf = "==26.10.02"
+libcuvs = "==26.10.00"
 
 [feature.cuda12.activation.env]
-# GPU architectures: Turing through Hopper (75, 80, 86, 89, 90a)
-CUDAARCHS = "75-real;80-real;86-real;89-real;90a-real"
+# GPU architectures: Turing through Blackwell (requires CUDA 12.8 or newer)
+CUDAARCHS = "75-real;80-real;86-real;89-real;90a-real;100-real;120-real"
 VCPKG_CUDA_VERSION = "12"
 
 [feature.vcpkg.dependencies]
@@ -130,7 +136,7 @@ scripts = ["scripts/vcpkg.sh"]
 platforms = ["linux-64-cuda13", "linux-aarch64-cuda13"]
 
 [feature.nightly-runner.dependencies]
-pixi = "0.78.*"
+pixi = ">=0.78"
 
 [feature.nightly-runner.tasks]
 nightly-shell = "scripts/generate_nightly_env.sh && env -u PIXI_ENVIRONMENT_NAME pixi shell --manifest-path envs/nightly/pixi.toml"
@@ -151,7 +157,7 @@ platforms = ["linux-64", "linux-aarch64", "osx-arm64"]
 coreutils = "9.*"
 curl = "8.*"
 cxx-compiler = "*"
-doxygen = "1.13.*"
+doxygen = "1.*"
 rust = "1.*"
 
 [feature.docs.tasks.docs-rust]
@@ -170,12 +176,17 @@ tar -xzf build/docs/theme.tar.gz --strip-components=1 -C build/docs/theme doxyge
 inputs = ["pixi.toml"]
 outputs = ["build/docs/theme/doxygen-awesome.css", "build/docs/theme/LICENSE"]
 
+[feature.docs.tasks.docs-c]
+description = "Build the Sirius public C API reference in build/docs/c/html."
+cmd = "rm -rf build/docs/c && doxygen docs/c/Doxyfile"
+depends-on = ["docs-theme"]
+
 [feature.docs.tasks.docs-cpp]
 description = "Build the Sirius public C++ API reference in build/docs/html."
 cmd = "rm -rf build/docs/html && doxygen docs/api/Doxyfile"
 depends-on = ["docs-theme"]
 
 [feature.docs.tasks.docs]
-description = "Build the combined C++ and Rust documentation site in build/docs/site."
-cmd = "rm -rf build/docs/site && mkdir -p build/docs/site && cp -R build/docs/html build/docs/site/cpp && cp -R build/docs/rust-target/doc build/docs/site/rust && cp docs/site/index.html build/docs/site/index.html && cp docs/site/rust/index.html build/docs/site/rust/index.html"
-depends-on = ["docs-cpp", "docs-rust"]
+description = "Build the combined C, C++ and Rust documentation site in build/docs/site."
+cmd = "rm -rf build/docs/site && mkdir -p build/docs/site && cp -R build/docs/c/html build/docs/site/c && cp -R build/docs/html build/docs/site/cpp && cp -R build/docs/rust-target/doc build/docs/site/rust && cp docs/site/index.html build/docs/site/index.html && cp docs/site/rust/index.html build/docs/site/rust/index.html"
+depends-on = ["docs-c", "docs-cpp", "docs-rust"]

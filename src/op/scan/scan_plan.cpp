@@ -25,10 +25,12 @@
 #include <duckdb/common/multi_file/multi_file_reader.hpp>
 
 // cudf
+#include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/cudf_utils.hpp>
 #include <cudf/filling.hpp>
 #include <cudf/scalar/scalar.hpp>
+#include <cudf/table/table.hpp>
 
 // standard library
 #include <algorithm>
@@ -66,14 +68,20 @@ std::string scan_plan::batch_column_name(duckdb::idx_t batch_position) const
   return data_columns.at(batch_position).name;
 }
 
-std::unordered_set<std::size_t> scan_plan::pure_filter_batch_positions() const
+std::unordered_set<std::size_t> scan_plan::filter_only_batch_positions() const
 {
   std::unordered_set<std::size_t> positions;
-  for (std::size_t d = 0; d < data_columns.size(); ++d) {
-    positions.insert(d);
+  for (std::size_t d = 0; d < columns.data_roles.size(); ++d) {
+    if (columns.data_roles[d] == scan_column_layout::data_role::FILTER_ONLY) positions.insert(d);
   }
-  for (auto const& entry : output_layout) {
-    if (entry.source == output_entry::DATA) { positions.erase(entry.idx); }
+  return positions;
+}
+
+std::unordered_set<std::size_t> scan_plan::non_output_batch_positions() const
+{
+  std::unordered_set<std::size_t> positions;
+  for (std::size_t d = 0; d < columns.data_roles.size(); ++d) {
+    if (columns.data_roles[d] != scan_column_layout::data_role::OUTPUT) positions.insert(d);
   }
   return positions;
 }
@@ -92,55 +100,26 @@ bool needs_output_assembly(scan_plan const& plan)
   // output_layout also implies no partitions to inject.
   if (plan.output_layout.empty()) { return false; }
 
-  // Trivial identity: no partitions and output_layout covers data_columns 1:1
-  // in order. The reader's natural output already matches what the pipeline
-  // expects.
-  if (plan.has_partitions() || plan.output_layout.size() != plan.data_columns.size()) {
-    return true;
-  }
-  for (std::size_t i = 0; i < plan.output_layout.size(); ++i) {
-    if (plan.output_layout[i].source != scan_plan::output_entry::DATA ||
-        plan.output_layout[i].idx != i) {
-      return true;
-    }
-  }
-  return false;
+  return !plan.columns.output_is_identity ||
+         plan.columns.output_data_positions.size() != plan.columns.data_roles.size();
 }
 
 std::optional<std::size_t> output_prefix_width(scan_plan const& plan) noexcept
 {
-  std::optional<std::size_t> width;
-  for (auto const& entry : plan.output_layout) {
-    if (entry.source == scan_plan::output_entry::DATA) {
-      width = std::max(width.value_or(0), entry.idx + 1);
-    }
-  }
-  return width;
+  return plan.columns.output_prefix_width;
 }
 
 bool output_is_leading_prefix(scan_plan const& plan) noexcept
 {
-  if (plan.has_partitions() || plan.output_layout.empty() ||
-      plan.output_layout.size() > plan.data_columns.size()) {
-    return false;
-  }
-  for (std::size_t k = 0; k < plan.output_layout.size(); ++k) {
-    if (plan.output_layout[k].source != scan_plan::output_entry::DATA ||
-        plan.output_layout[k].idx != k) {
-      return false;
-    }
-  }
-  return true;
+  return plan.columns.output_is_identity;
 }
 
 std::vector<cudf::size_type> output_data_positions(scan_plan const& plan)
 {
   std::vector<cudf::size_type> positions;
-  positions.reserve(plan.output_layout.size());
-  for (auto const& entry : plan.output_layout) {
-    if (entry.source == scan_plan::output_entry::DATA) {
-      positions.push_back(static_cast<cudf::size_type>(entry.idx));
-    }
+  positions.reserve(plan.columns.output_data_positions.size());
+  for (auto const pos : plan.columns.output_data_positions) {
+    positions.push_back(static_cast<cudf::size_type>(pos));
   }
   return positions;
 }
@@ -162,6 +141,16 @@ std::unique_ptr<cudf::table> append_parquet_virtual_columns(std::unique_ptr<cudf
   std::vector<std::unique_ptr<cudf::column>> columns = table->release();
   columns.reserve(columns.size() + plan.virtual_columns.size());
   for (auto const& virtual_column : plan.virtual_columns) {
+    if (rows == 0) {
+      auto const type =
+        virtual_column.kind == scan_plan::parquet_virtual_column_kind::FILENAME
+          ? cudf::type_id::STRING
+        : virtual_column.kind == scan_plan::parquet_virtual_column_kind::FILE_ROW_NUMBER
+          ? cudf::type_id::INT64
+          : cudf::type_id::UINT64;
+      columns.push_back(cudf::make_empty_column(type));
+      continue;
+    }
     switch (virtual_column.kind) {
       case scan_plan::parquet_virtual_column_kind::FILENAME: {
         cudf::string_scalar value(file_path, true, stream, mr);
@@ -185,10 +174,48 @@ std::unique_ptr<cudf::table> append_parquet_virtual_columns(std::unique_ptr<cudf
   return std::make_unique<cudf::table>(std::move(columns));
 }
 
+owning_table_view select_scan_columns(owning_table_view&& table,
+                                      std::span<std::size_t const> positions,
+                                      ::cuda::stream_ref stream,
+                                      rmm::device_async_resource_ref mr)
+{
+  auto const repeats_earlier = [&](std::size_t k) {
+    return std::find(positions.begin(), positions.begin() + k, positions[k]) !=
+           positions.begin() + k;
+  };
+  std::vector<std::size_t> unique;
+  unique.reserve(positions.size());
+  for (std::size_t k = 0; k < positions.size(); ++k) {
+    if (!repeats_earlier(k)) { unique.push_back(positions[k]); }
+  }
+  if (unique.size() == positions.size()) {
+    table.select_columns(positions);
+    return std::move(table);
+  }
+
+  // Copy each repeat while `table` still owns the source it reads, so a failed copy leaves the
+  // caller holding everything submitted work may read.
+  std::vector<std::unique_ptr<cudf::column>> output(positions.size());
+  auto const source = table.view();
+  for (std::size_t k = 0; k < positions.size(); ++k) {
+    if (repeats_earlier(k)) {
+      output[k] = std::make_unique<cudf::column>(source.column(positions[k]), stream, mr);
+    }
+  }
+  table.select_columns(unique);
+  auto selected = table.release(stream, mr)->release();
+  auto next     = selected.begin();
+  for (auto& column : output) {
+    if (!column) { column = std::move(*next++); }
+  }
+  return owning_table_view{std::make_unique<cudf::table>(std::move(output))};
+}
+
 owning_table_view assemble_scan_output(scan_plan const& plan,
                                        owning_table_view&& table,
                                        std::vector<std::string> const& partition_values,
-                                       ::cuda::stream_ref stream)
+                                       ::cuda::stream_ref stream,
+                                       rmm::device_async_resource_ref mr)
 {
   if (!table) { return std::move(table); }
 
@@ -196,44 +223,21 @@ owning_table_view assemble_scan_output(scan_plan const& plan,
   // 0-column table would erase the row count downstream aggregations consume.
   if (plan.output_layout.empty()) { return std::move(table); }
 
-  // No partition columns: unique outputs use a non-owning view selection, while
-  // repeated outputs need copies. Every output_entry is DATA here (including
-  // synthesized virtual columns), and entry.idx addresses the materialized
-  // M-order view. Pure-filter columns are dropped from the output and freed
-  // when the owning table is released.
+  // No partition columns: every output_entry is DATA here (including synthesized virtual columns),
+  // and entry.idx addresses the materialized M-order view. Pure-filter columns are dropped from the
+  // output and freed when the owning table is released.
   if (!plan.has_partitions()) {
     std::vector<std::size_t> positions;
     positions.reserve(plan.output_layout.size());
-    std::unordered_set<std::size_t> seen;
-    bool has_duplicates = false;
     for (auto const& entry : plan.output_layout) {
       positions.push_back(entry.idx);
-      has_duplicates = !seen.insert(entry.idx).second || has_duplicates;
     }
-    if (!has_duplicates) {
-      table.select_columns(positions);
-      return std::move(table);
-    }
-
-    auto materialized = table.release(stream);
-    auto source       = materialized->release();
-    std::vector<std::unique_ptr<cudf::column>> output;
-    output.reserve(positions.size());
-    std::unordered_map<std::size_t, std::size_t> first_output;
-    for (auto const position : positions) {
-      auto [it, inserted] = first_output.emplace(position, output.size());
-      if (inserted) {
-        output.push_back(std::move(source.at(position)));
-      } else {
-        output.push_back(std::make_unique<cudf::column>(output.at(it->second)->view(), stream));
-      }
-    }
-    return owning_table_view{std::make_unique<cudf::table>(std::move(output))};
+    return select_scan_columns(std::move(table), positions, stream, mr);
   }
 
   // Partition columns present: materialize the reader batch and rebuild, moving
   // DATA columns out and synthesizing constant PARTITION columns from the path.
-  auto reader_output  = table.release(stream);
+  auto reader_output  = table.release(stream, mr);
   auto const num_rows = reader_output->num_rows();
   auto data_cols      = reader_output->release();  // move columns out, no GPU copy
 
@@ -247,7 +251,8 @@ owning_table_view assemble_scan_output(scan_plan const& plan,
       if (inserted) {
         out_cols.push_back(std::move(data_cols.at(entry.idx)));
       } else {
-        out_cols.push_back(std::make_unique<cudf::column>(out_cols.at(it->second)->view(), stream));
+        out_cols.push_back(
+          std::make_unique<cudf::column>(out_cols.at(it->second)->view(), stream, mr));
       }
     } else {
       auto const& pcol = plan.partition_columns.at(entry.idx);
@@ -258,7 +263,7 @@ owning_table_view assemble_scan_output(scan_plan const& plan,
       auto duckdb_val = duckdb::Value(duckdb::HivePartitioning::Unescape(pval))
                           .DefaultCastAs(sirius::to_duckdb(pcol.type));
       auto scalar = sirius::value_to_cudf_scalar(duckdb_val, pcol.type, stream);
-      out_cols.push_back(cudf::make_column_from_scalar(*scalar, num_rows, stream));
+      out_cols.push_back(cudf::make_column_from_scalar(*scalar, num_rows, stream, mr));
     }
   }
 
@@ -272,9 +277,9 @@ owning_table_view assemble_scan_output(scan_plan const& plan,
 //===----------------------------------------------------------------------===//
 namespace {
 
-bool is_output_position(std::size_t i, std::size_t output_types_size)
+bool is_output_position(std::size_t i, std::size_t projected_output_count)
 {
-  return i < output_types_size;
+  return i < projected_output_count;
 }
 
 }  // namespace
@@ -306,9 +311,10 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
                           duckdb::vector<duckdb::idx_t> const& projection_ids,
                           duckdb::vector<std::string> const& names,
                           duckdb::vector<sirius::logical_type> const& returned_types,
-                          std::size_t output_types_size,
+                          std::size_t projected_output_count,
                           duckdb::vector<duckdb::HivePartitioningIndex> const& partition_indices,
-                          std::vector<bound_virtual_column> const& virtual_columns)
+                          std::vector<bound_virtual_column> const& virtual_columns,
+                          bool allow_metadata_only)
 {
   scan_plan plan;
 
@@ -333,7 +339,7 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
   }
 
   // Walk positions in output-first order. When projection_ids is non-empty the
-  // first output_types_size entries are the output columns in output order;
+  // first projected_output_count entries are the output columns in output order;
   // the remaining entries are pure-filter columns that must be read but not
   // emitted. When projection_ids is empty, column_ids is both the read list
   // and the output (no pure-filter columns).
@@ -423,8 +429,14 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
       if (inserted) {
         std::string col_name = names.empty() ? std::string{} : names.at(primary_idx);
         plan.data_columns.push_back(scan_plan::data_column{primary_idx, std::move(col_name)});
+        plan.columns.data_roles.push_back(is_output ? scan_column_layout::data_role::OUTPUT
+                                                    : scan_column_layout::data_role::FILTER_ONLY);
+        plan.columns.materialized_primary_indices.push_back(primary_idx);
       }
-      if (is_output) { output_requests.push_back({output_request::kind::DATA, primary_idx}); }
+      if (is_output) {
+        plan.columns.data_roles[it->second] = scan_column_layout::data_role::OUTPUT;
+        output_requests.push_back({output_request::kind::DATA, primary_idx});
+      }
     }
   };
 
@@ -435,7 +447,7 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
     }
   } else {
     for (std::size_t i = 0; i < projection_ids.size(); ++i) {
-      handle_position(projection_ids[i], is_output_position(i, output_types_size));
+      handle_position(projection_ids[i], is_output_position(i, projected_output_count));
     }
   }
 
@@ -468,17 +480,21 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
       plan.carrier_batch_index   = plan.data_columns.size();
       primary_to_batch[*carrier] = plan.data_columns.size();
       plan.data_columns.push_back(scan_plan::data_column{*carrier, names.at(*carrier)});
+      plan.columns.data_roles.push_back(scan_column_layout::data_role::ROW_COUNT_CARRIER);
+      plan.columns.materialized_primary_indices.push_back(*carrier);
       plan.needs_reader_projection = true;
     }
   }
 
-  if (plan.has_user_virtual_columns() && plan.data_columns.empty()) {
+  if (plan.has_user_virtual_columns() && plan.data_columns.empty() && !allow_metadata_only) {
     throw duckdb::NotImplementedException(
       "parquet virtual scan: no supported physical row-count carrier");
   }
 
   for (std::size_t v = 0; v < plan.virtual_columns.size(); ++v) {
     plan.virtual_columns[v].materialized_idx = plan.data_columns.size() + v;
+    plan.columns.materialized_primary_indices.push_back(
+      static_cast<std::size_t>(plan.virtual_columns[v].column_id));
   }
 
   for (auto const& request : output_requests) {
@@ -492,6 +508,25 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
       auto const ordinal = virtual_to_ordinal.at(static_cast<duckdb::column_t>(request.key));
       plan.output_layout.push_back(
         {scan_plan::output_entry::DATA, plan.virtual_columns.at(ordinal).materialized_idx});
+    }
+  }
+
+  for (auto const& entry : plan.output_layout) {
+    if (entry.source == scan_plan::output_entry::DATA) {
+      plan.columns.output_data_positions.push_back(entry.idx);
+      plan.columns.output_prefix_width =
+        std::max(plan.columns.output_prefix_width.value_or(0), entry.idx + 1);
+    }
+  }
+  plan.columns.output_is_identity = !plan.has_partitions() && !plan.output_layout.empty() &&
+                                    plan.output_layout.size() <= plan.data_columns.size();
+  if (plan.columns.output_is_identity) {
+    for (std::size_t k = 0; k < plan.output_layout.size(); ++k) {
+      if (plan.output_layout[k].source != scan_plan::output_entry::DATA ||
+          plan.output_layout[k].idx != k) {
+        plan.columns.output_is_identity = false;
+        break;
+      }
     }
   }
 

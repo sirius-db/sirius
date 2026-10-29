@@ -56,17 +56,42 @@ void require_dropped_layout(gpu_ingestible const& ingestible,
 
 }  // namespace
 
+void gpu_ingestible::attach_preparation_ledger(std::shared_ptr<scan_manager::preparation_ledger>)
+{
+  throw std::logic_error("scan does not support preparation ledger installation");
+}
+
+std::vector<gpu_ingestible::preparation_source> gpu_ingestible::make_preparation_sources(
+  io::ioctx_resolver resolve)
+{
+  std::vector<preparation_source> sources;
+  sources.push_back(make_preparation_source(std::move(resolve)));
+  return sources;
+}
+
+gpu_ingestible::preparation_source gpu_ingestible::make_preparation_source(
+  io::ioctx_resolver resolve)
+{
+  preparation_source source;
+  source.try_claim   = [this, resolve = std::move(resolve)] { return try_claim_split(resolve); };
+  source.bind_wakeup = [this](scan_manager::preparation_wakeup wake) {
+    bind_preparation_wakeup(std::move(wake));
+  };
+  return source;
+}
+
 filtered_table gpu_ingestible::materialize_table(
   const op::scan::scan_operator_input& split,
   ::cuda::stream_ref stream,
   bool like_swar_fastpath,
-  std::shared_ptr<const like_multiliteral_cache> like_cache)
+  std::shared_ptr<const like_multiliteral_cache> like_cache,
+  expression_query_policy policy)
 {
   auto* mem_space = split.gpu_memory_space;
   if (split.has_scan_metadata()) [[likely]] {
     split.update(io::cache::scan_stage::reading);
     auto materialized = materialize_metadata_to_table(
-      split.get_scan_info(), *mem_space, stream, like_swar_fastpath, std::move(like_cache));
+      split.get_scan_info(), *mem_space, stream, like_swar_fastpath, std::move(like_cache), policy);
     if (split.mvcc_keep_mask.has_mask()) {
       // Only insert-delta splits carry a visibility mask here; disk-walk
       // splits never do. Sync before returning for the same reason as the
@@ -135,10 +160,12 @@ filtered_table gpu_ingestible::materialize_table(
       stream.sync();
       return {.table = owning_table_view{std::move(masked)}, .state = filter_state::UNFILTERED};
     }
+    auto const stored_bytes = rbatch.get_data()->get_size_in_bytes();
     return {.table               = owning_table_view{std::move(rbatch), view},
             .state               = decoded_state,
             .predicate_columns   = split.pushdown_predicate_columns,
-            .predicates_enforced = split.pushdown_predicates_enforced};
+            .predicates_enforced = split.pushdown_predicates_enforced,
+            .stored_bytes        = stored_bytes};
   }
 }
 

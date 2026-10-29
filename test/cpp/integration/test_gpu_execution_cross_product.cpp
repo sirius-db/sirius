@@ -182,9 +182,9 @@ TEST_CASE_METHOD(CrossProductFixture,
   INFO(result->ToString());
   REQUIRE_FALSE(result->HasError());
   // Each value of 0..49999 appears 50000 times.
-  CHECK(result->GetValue(0, 0).ToString() == "2500000000");
-  CHECK(result->GetValue(1, 0).ToString() == "62498750000000");
-  CHECK(result->GetValue(2, 0).ToString() == "62498750000000");
+  CHECK(result->Collection().GetValue(0, 0).ToString() == "2500000000");
+  CHECK(result->Collection().GetValue(1, 0).ToString() == "62498750000000");
+  CHECK(result->Collection().GetValue(2, 0).ToString() == "62498750000000");
 }
 
 TEST_CASE_METHOD(CrossProductFixture,
@@ -225,4 +225,24 @@ TEST_CASE_METHOD(CrossProductFixture,
   REQUIRE(result->HasError());
   INFO(result->GetError());
   REQUIRE(result->GetError().find("Cross join of 20000 x 100000 rows needs") != std::string::npos);
+}
+
+TEST_CASE_METHOD(CrossProductFixture,
+                 "cross product - correlated count(*) runs on the GPU",
+                 "[integration][gpu_execution][cross_product][single_join]")
+{
+  // The shape of TPC-DS Q41. DuckDB flattens a correlated scalar count(*) into a SINGLE join over
+  // a LEFT join with no conditions, which arrives as a LogicalComparisonJoin rather than a
+  // LogicalCrossProduct and glues a one-row `count(*) = 0` default onto every row.
+  create_cross_tables(*this);
+  SECTION("count > 0 as a predicate")
+  {
+    compare_gpu_vs_cpu(
+      "SELECT x FROM cp_a a WHERE (SELECT count(*) FROM cp_b b WHERE b.y = a.x AND "
+      "(b.s = 'b0' OR b.s = 'b2')) > 0;");
+  }
+  SECTION("count as a column, unmatched rows read 0")
+  {
+    compare_gpu_vs_cpu("SELECT x, (SELECT count(*) FROM cp_b b WHERE b.y = a.x) c FROM cp_a a;");
+  }
 }

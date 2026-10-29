@@ -248,18 +248,17 @@ void metadata_overwrite(sirius::io::cache::cache_mode mode)
   cfg.uring_n_reactors           = 1;
   cfg.rest_n_reactors            = 1;
   cfg.apply_cache_mode();
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
   sirius::scan_manager::sirius_scan_manager manager{
-    cfg, *memory, sirius::test::s3::single_gpu_index(0)};
+    scan_lifecycle, cfg, *memory, sirius::test::s3::single_gpu_index(0)};
   auto first_shape = manager.describe_parquet(objects.uri);
   REQUIRE(first_shape.names.size() == 1);
   CHECK(first_shape.names.front() == "column_a");
   auto first        = manager.create_datasource(objects.uri);
   auto old_metadata = first->metadata();
   REQUIRE(old_metadata != nullptr);
-  auto const old_key = first->get_io_object().raw_file_cache_id();
   auto const old_tag = std::string(first->get_io_object().validation_tag());
   REQUIRE_FALSE(old_tag.empty());
-  CHECK(old_key == rest_io_object::generation_key(objects.uri, old_tag));
   auto& store = first->io_ctx()->metadata_store();
   CHECK(store.has_path(objects.uri));
   objects.publish(objects.second);
@@ -268,9 +267,7 @@ void metadata_overwrite(sirius::io::cache::cache_mode mode)
   CHECK(second_shape.names.front() == "column_b");
   auto second = manager.create_datasource(objects.uri);
   REQUIRE(second->get_io_object().validation_tag() != old_tag);
-  CHECK(second->get_io_object().raw_file_cache_id() != old_key);
   CHECK(store.has_path(objects.uri));
-  CHECK(store.get_metadata(old_key) == nullptr);
   CHECK(second->metadata() != nullptr);
   auto parsed = std::dynamic_pointer_cast<sirius::op::scan::parquet_metadata>(old_metadata);
   REQUIRE(parsed != nullptr);
@@ -603,12 +600,14 @@ TEST_CASE("cache identity retains a retired generation until a held fill release
   held_request old_fill;
   held_request new_fill;
   advise(*first, chunk_bytes);
-  REQUIRE(first->prefetch_async([&](bool) noexcept { first_completions.fetch_add(1); }) ==
-          sirius::io::prefetch_refusal::issued);
+  REQUIRE(first->prefetch_async([&](sirius::io::cache::prefetch_result) noexcept {
+    first_completions.fetch_add(1);
+  }) == sirius::io::prefetch_refusal::issued);
   old_fill.request = context->backend().take();
   REQUIRE(old_fill.request != nullptr);
   advise(*second, chunk_bytes);
-  REQUIRE(second->prefetch_async([&](bool ok) noexcept {
+  REQUIRE(second->prefetch_async([&](sirius::io::cache::prefetch_result result) noexcept {
+    bool const ok = result.ok;
     second_ok.store(ok);
     second_completions.fetch_add(1);
   }) == sirius::io::prefetch_refusal::issued);
@@ -870,12 +869,14 @@ TEST_CASE("cache identity publishes prefetch failure before notifying the consum
   auto observer     = std::make_shared<prefetch_observer>();
   auto completed    = observer->completed.get_future();
   auto const before = fixture.authorizer->gets.load();
-  REQUIRE(source->prefetch_async([observer, source](bool ok) noexcept {
-    std::exception_ptr failure = source->prefetch_failure();
-    if (observer->calls.fetch_add(1) == 0) {
-      observer->completed.set_value(prefetch_outcome{ok, std::move(failure)});
-    }
-  }) == sirius::io::prefetch_refusal::issued);
+  REQUIRE(
+    source->prefetch_async([observer, source](sirius::io::cache::prefetch_result result) noexcept {
+      bool const ok              = result.ok;
+      std::exception_ptr failure = source->prefetch_failure();
+      if (observer->calls.fetch_add(1) == 0) {
+        observer->completed.set_value(prefetch_outcome{ok, std::move(failure)});
+      }
+    }) == sirius::io::prefetch_refusal::issued);
   REQUIRE(completed.wait_for(5s) == std::future_status::ready);
   auto outcome = completed.get();
   CHECK_FALSE(outcome.ok);

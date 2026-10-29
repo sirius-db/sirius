@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
-# Builds the DuckDB substrait consumer Sirius uses (the repo's `substrait/` submodule,
-# `SubstraitToDuckDB` in src/from_substrait.cpp — the same reader `src/sirius_ffi.cpp`
-# compiles into libsirius) as a loadable DuckDB extension, plus a DuckDB shell with it
-# linked in. This is what the CPU differential (scripts/validate_tpch_results.py consume)
-# feeds the translator's plans to on a machine without a GPU.
+# Builds the pinned pre-v2 Substrait reader as a loadable DuckDB extension and
+# a DuckDB shell with it linked in. The CPU differential feeds translator plans
+# to this consumer without a GPU; Sirius embeds the v2 reader separately.
 #
 #   scripts/build-duckdb-substrait.sh            # configure + build (idempotent)
 #   scripts/build-duckdb-substrait.sh --clean    # wipe the build directory first
@@ -12,30 +10,33 @@
 #   build/duckdb                                          shell with the extension linked in
 #   build/extension/substrait/substrait.duckdb_extension  loadable extension (unsigned)
 #
-# DuckDB itself is a shallow clone of the upstream tag the extension is pinned to
-# (`substrait/.gitmodules` duckdb → v1.5.5). Keep DUCKDB_TAG in sync with `python-duckdb` in
-# pixi.toml's `check` feature: a loadable extension only loads into the exact same version.
+# Keep DUCKDB_TAG in sync with python-duckdb in pixi.toml's check feature:
+# a loadable extension only loads into the exact same version. SUBSTRAIT_COMMIT
+# must also support that DuckDB version.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
-REPO_ROOT="$(cd ../.. && pwd)"
 DUCKDB_TAG="${DUCKDB_TAG:-v1.5.5}"
 WORK="${ROOT}/.duckdb-substrait"
 SRC="${WORK}/duckdb"
 BUILD="${WORK}/build"
-EXT_SRC="${REPO_ROOT}/substrait"
+EXT_SRC="${WORK}/substrait"
+SUBSTRAIT_COMMIT=a7e045befd5479569f0a84b241868253cdfde0b3
 
 if [ "${1:-}" = "--clean" ]; then
     rm -rf "${BUILD}"
 fi
 
-if [ ! -f "${EXT_SRC}/src/from_substrait.cpp" ]; then
-    echo "error: ${EXT_SRC} is empty; run 'git submodule update --init --depth=1 substrait' at the repo root" >&2
-    exit 1
-fi
-
 mkdir -p "${WORK}"
+if [ ! -d "${EXT_SRC}/.git" ]; then
+    git init -q "${EXT_SRC}"
+    git -C "${EXT_SRC}" remote add origin https://github.com/sirius-db/duckdb-substrait-extension.git
+fi
+if [ "$(git -C "${EXT_SRC}" rev-parse HEAD 2>/dev/null || true)" != "${SUBSTRAIT_COMMIT}" ]; then
+    git -C "${EXT_SRC}" fetch -q --depth=1 origin "${SUBSTRAIT_COMMIT}"
+    git -C "${EXT_SRC}" checkout -q --detach "${SUBSTRAIT_COMMIT}"
+fi
 if [ ! -d "${SRC}/.git" ]; then
     echo "==> cloning duckdb ${DUCKDB_TAG} into ${SRC}"
     git clone -q --depth=1 --branch "${DUCKDB_TAG}" https://github.com/duckdb/duckdb.git "${SRC}"

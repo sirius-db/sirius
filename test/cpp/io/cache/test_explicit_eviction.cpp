@@ -28,9 +28,16 @@
 #include "io/io_context.hpp"
 #include "io/sirius_datasource.hpp"
 #include "memory/topology_index.hpp"
+#include "op/scan/gpu_ingestible_types.hpp"
+#include "op/sirius_physical_operator.hpp"
+#include "pipeline/pipeline_build_context.hpp"
+#include "pipeline/sirius_pipeline.hpp"
+#include "planner/query.hpp"
 #include "scan/test_utils.hpp"
 #include "scan_manager/config.hpp"
+#include "scan_manager/readahead_scan_manager.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
+#include "utils/telemetry_utils.hpp"
 
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_space.hpp>
@@ -152,7 +159,9 @@ TEST_CASE("claimed_bytes tracks the staging memory the cache is holding",
   auto memory   = initialize_memory_manager(1);
   auto topology = single_gpu_index_for_evict();
 
-  sirius_scan_manager manager{lru_config(), *memory, topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+
+  sirius_scan_manager manager{scan_lifecycle, lru_config(), *memory, topology};
   auto* cache = manager.io_ctx()->cache();
   REQUIRE(cache != nullptr);
   REQUIRE(cache->is_armed());
@@ -181,7 +190,9 @@ TEST_CASE("an explicit evict reclaims a disposed request the pressure rule would
   auto memory   = initialize_memory_manager(1);
   auto topology = single_gpu_index_for_evict();
 
-  sirius_scan_manager manager{lru_config(), *memory, topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+
+  sirius_scan_manager manager{scan_lifecycle, lru_config(), *memory, topology};
   auto* cache = manager.io_ctx()->cache();
   REQUIRE(cache != nullptr);
   REQUIRE(cache->is_armed());
@@ -218,7 +229,9 @@ TEST_CASE("blocking prepare waits for earlier asynchronous eviction before retry
   auto memory   = constrained_memory_manager();
   auto topology = single_gpu_index_for_evict();
 
-  sirius_scan_manager manager{constrained_lru_config(), *memory, topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+
+  sirius_scan_manager manager{scan_lifecycle, constrained_lru_config(), *memory, topology};
   auto* cache = manager.io_ctx()->cache();
   REQUIRE(cache != nullptr);
 
@@ -250,12 +263,15 @@ TEST_CASE("blocking prepare waits for earlier asynchronous eviction before retry
 TEST_CASE("failed nonblocking preparation starts eviction without waiting",
           "[cache][eviction][explicit][prepare]")
 {
+  auto cancel_failed        = GENERATE(false, true);
   constexpr std::size_t mib = 1ull << 20;
   temp_data_file file(1ull << 30);
   auto memory   = constrained_memory_manager();
   auto topology = single_gpu_index_for_evict();
 
-  sirius_scan_manager manager{constrained_lru_config(), *memory, topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+
+  sirius_scan_manager manager{scan_lifecycle, constrained_lru_config(), *memory, topology};
   auto* cache = manager.io_ctx()->cache();
   REQUIRE(cache != nullptr);
 
@@ -282,6 +298,12 @@ TEST_CASE("failed nonblocking preparation starts eviction without waiting",
     auto const before = cache->claimed_bytes();
     if (filler->prepare_prefetch(false) == sirius::io::prepare_result::allocation_failed) {
       exhausted = true;
+      if (cancel_failed) {
+        filler->update(sirius::io::cache::scan_stage::disposed);
+        filler->update(sirius::io::cache::scan_stage::disposed);
+        CHECK(filler->prepare_prefetch(false) == sirius::io::prepare_result::fallen_behind);
+        filler.reset();
+      }
       // No explicit evict() or blocking prepare(true): the failed attempt
       // itself must have woken the evictor.
       CHECK(claimed_drops_below(*cache, before, std::chrono::milliseconds(2000)));
@@ -290,6 +312,11 @@ TEST_CASE("failed nonblocking preparation starts eviction without waiting",
     fillers.push_back(std::move(filler));
   }
   REQUIRE(exhausted);
+  fillers.clear();
+  cache->evict_sync(1ull << 30);
+  CHECK(cache->claimed_bytes() == 0);
+  cache->evict_sync(1ull << 30);
+  CHECK(cache->claimed_bytes() == 0);
 }
 
 TEST_CASE("prepare does not publish a request the retry's eviction left short of buffers",
@@ -300,7 +327,9 @@ TEST_CASE("prepare does not publish a request the retry's eviction left short of
   auto memory   = constrained_memory_manager();
   auto topology = single_gpu_index_for_evict();
 
-  sirius_scan_manager manager{constrained_lru_config(), *memory, topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+
+  sirius_scan_manager manager{scan_lifecycle, constrained_lru_config(), *memory, topology};
   auto* cache = manager.io_ctx()->cache();
   REQUIRE(cache != nullptr);
 
@@ -365,7 +394,9 @@ TEST_CASE("prepare abandons immediately after the consumer reaches the split",
   auto memory   = initialize_memory_manager(1);
   auto topology = single_gpu_index_for_evict();
 
-  sirius_scan_manager manager{lru_config(), *memory, topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+
+  sirius_scan_manager manager{scan_lifecycle, lru_config(), *memory, topology};
   auto ds = manager.create_datasource(file.path.string());
   REQUIRE(ds != nullptr);
 
@@ -384,7 +415,9 @@ TEST_CASE("an explicit evict frees at least what was asked for", "[cache][evicti
   auto memory   = initialize_memory_manager(1);
   auto topology = single_gpu_index_for_evict();
 
-  sirius_scan_manager manager{lru_config(), *memory, topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+
+  sirius_scan_manager manager{scan_lifecycle, lru_config(), *memory, topology};
   auto* cache = manager.io_ctx()->cache();
   REQUIRE(cache != nullptr);
 
@@ -413,7 +446,9 @@ TEST_CASE("a zero-byte evict is a no-op", "[cache][eviction][explicit]")
   auto memory   = initialize_memory_manager(1);
   auto topology = single_gpu_index_for_evict();
 
-  sirius_scan_manager manager{lru_config(), *memory, topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+
+  sirius_scan_manager manager{scan_lifecycle, lru_config(), *memory, topology};
   auto* cache = manager.io_ctx()->cache();
   REQUIRE(cache != nullptr);
 
@@ -441,7 +476,9 @@ TEST_CASE("the evictor retires disposed requests while the pool is under its thr
   auto memory   = initialize_memory_manager(1);
   auto topology = single_gpu_index_for_evict();
 
-  sirius_scan_manager manager{lru_config(), *memory, topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+
+  sirius_scan_manager manager{scan_lifecycle, lru_config(), *memory, topology};
   auto* cache = manager.io_ctx()->cache();
   REQUIRE(cache != nullptr);
   REQUIRE(cache->is_armed());
@@ -475,4 +512,114 @@ TEST_CASE("the evictor retires disposed requests while the pool is under its thr
   }
   INFO("cache: " << cache->summary());
   CHECK(tracked <= max_tracked);
+}
+
+TEST_CASE("readahead bounds memory retries and returns capacity on abandonment",
+          "[cache][eviction][readahead][retry]")
+{
+  using namespace std::chrono_literals;
+  using sirius::io::cache::scan_stage;
+  using sirius::op::scan::scan_info;
+  using sirius::scan_manager::prefetch_outcome_kind;
+  using sirius::scan_manager::readahead_scan_manager;
+  using sirius::scan_manager::shared_scan_budget;
+
+  // The cache reserves 64 MiB at construction. Exhaust the remaining tier and
+  // ask for more than that reserve so preparation really encounters pressure.
+  constexpr std::int64_t request_bytes = 96ll << 20;
+  temp_data_file file(2 * request_bytes);
+  auto memory = constrained_memory_manager();
+  sirius::exec::query_lifecycle_registry lifecycle;
+  sirius_scan_manager scans{
+    lifecycle, constrained_lru_config(), *memory, single_gpu_index_for_evict()};
+  auto host     = memory->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST).front();
+  auto* host_mr = host->get_memory_resource_of<cucascade::memory::Tier::HOST>();
+  auto pressure = host_mr->allocate_multiple_blocks(host_mr->get_available_memory());
+  REQUIRE(pressure);
+  REQUIRE(host_mr->get_available_memory() == 0);
+
+  // A real query order and real cache pressure exercise the production worker,
+  // preparation, eviction and completion paths without injected allocation failures.
+  struct scan_operator : sirius::op::sirius_physical_operator {
+    scan_operator()
+      : sirius_physical_operator(sirius::op::SiriusPhysicalOperatorType::GPU_SCAN, {}, 0)
+    {
+      operator_id = 1;
+    }
+  } op;
+  auto telemetry = sirius::test::make_test_telemetry_context();
+  sirius::pipeline::pipeline_build_context ctx{nullptr, true};
+  auto pipeline = std::make_shared<sirius::pipeline::sirius_pipeline>(ctx);
+  sirius::pipeline::sirius_pipeline_build_state build;
+  build.set_pipeline_source(*pipeline, op);
+  auto id = sirius::make_query_id(1);
+  sirius::planner::query query(
+    {pipeline},
+    telemetry->context(),
+    id,
+    sirius::telemetry::query_telemetry_info{quent::now_v7(), telemetry->worker_id().raw(), id});
+  auto publisher = std::make_shared<sirius::event::query_event_publisher>();
+  auto budget    = std::make_shared<shared_scan_budget>();
+  auto readahead = std::make_shared<readahead_scan_manager>(*publisher, 1, budget, 1);
+  readahead->prepare_for_query(query);
+  auto make_split = [&](std::int64_t offset) {
+    auto ds = scans.create_datasource(file.path.string());
+    std::vector<cudf::io::text::byte_range_info> ranges{{offset, request_bytes}};
+    ds->fadvise(ranges, 0);
+    return std::make_shared<scan_info>(std::vector<scan_info::fadvise_entry>{{ds, ranges}});
+  };
+  auto split = make_split(0);
+  readahead->register_scan_task(split, op.get_operator_id());
+  auto backend = reinterpret_cast<std::uintptr_t>(scans.io_ctx());
+  auto await   = [](auto predicate) {
+    auto deadline = std::chrono::steady_clock::now() + 5s;
+    while (!predicate() && std::chrono::steady_clock::now() < deadline)
+      std::this_thread::sleep_for(1ms);
+    return predicate();
+  };
+
+  SECTION("persistent pressure is accounted once and a later candidate can progress")
+  {
+    readahead->start();
+    REQUIRE(await([&] {
+      return readahead->counters().outcome(prefetch_outcome_kind::skipped_memory_pressure) == 1;
+    }));
+    CHECK(readahead->counters().candidates_taken == 1);
+    CHECK(readahead->counters().memory_retries == 2);
+    CHECK(budget->active(backend) == 0);
+    // Returning memory lets a subsequent candidate prove both capacity tickets
+    // were released and that exhaustion did not stop the prefetch worker.
+    pressure.reset();
+    auto next = make_split(request_bytes);
+    readahead->register_scan_task(next, op.get_operator_id());
+    REQUIRE(
+      await([&] { return readahead->counters().outcome(prefetch_outcome_kind::prefetched) == 1; }));
+    readahead->stop();
+    CHECK(readahead->counters().candidates_taken == 2);
+    CHECK(readahead->counters().outcome(prefetch_outcome_kind::skipped_memory_pressure) == 1);
+    // The IO completion returns its shared ticket after recording the outcome.
+    CHECK(await([&] { return budget->active(backend) == 0; }));
+  }
+  SECTION("stop during memory retries settles the candidate exactly once")
+  {
+    readahead->start();
+    REQUIRE(await([&] { return readahead->counters().memory_retries >= 1; }));
+    readahead->stop();
+    CHECK(readahead->counters().candidates_taken == 1);
+    CHECK(readahead->counters().memory_retries <= 2);
+    CHECK(readahead->counters().outcome(prefetch_outcome_kind::skipped_memory_pressure) == 1);
+    CHECK(budget->active(backend) == 0);
+  }
+  SECTION("cancellation while waiting leaves another reader's debt intact")
+  {
+    auto demand = budget->acquire({{backend, 1}}, sirius::make_query_id(2), {}, true);
+    readahead->start();
+    REQUIRE(await([&] { return budget->pending() == 1; }));
+    readahead->stop();
+    CHECK(readahead->counters().candidates_taken == 1);
+    CHECK(readahead->counters().memory_retries == 0);
+    CHECK(readahead->counters().outcome(prefetch_outcome_kind::skipped_memory_pressure) == 1);
+    CHECK(budget->pending() == 0);
+    CHECK(budget->active(backend) == 1);
+  }
 }

@@ -257,15 +257,19 @@ TEST_CASE_METHOD(DenseCountJoinFixture,
 }
 
 TEST_CASE_METHOD(DenseCountJoinFixture,
-                 "gpu_execution dense count-join: delim join below the preserved input's root",
+                 "gpu_execution dense count-join: correlated join below the preserved input's root",
                  "[integration][gpu_execution][dense_count_join]")
 {
-  // A correlated EXISTS compared as a value keeps a MARK delim join under the input's FILTER root;
+  // Exercise both correlated-join representations, including v2's default CTE rewrite.
+  // A correlated EXISTS compared as a value keeps a MARK join under the input's FILTER root;
   // the planner declines the fused shape, so both runs execute the unfused GPU join plan and the
   // second is a control on a plan expected to be identical to the first. The build/probe-side
   // optimizer is disabled so the delim subtree stays on the outer join's build side, where its
   // sizing partitions run before the join's task hint polls the MARK join; on the probe side the
   // hint reaches the unsized MARK join and the process aborts.
+  auto const as_cte = GENERATE(false, true);
+  CAPTURE(as_cte);
+  sirius::test::scoped_sirius_setting representation{*con, "delim_join_as_cte", as_cte};
   sirius::test::disabled_optimizers_guard build_side_pin{*con, "build_side_probe_side"};
   compare_fused_and_unfused(
     "SELECT c.c_id, count(o_id) AS c_count FROM ord RIGHT JOIN ("

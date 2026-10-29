@@ -25,11 +25,20 @@
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_ungrouped_aggregate.hpp"
 
+#include <atomic>
 #include <memory>
 
 namespace sirius {
 namespace op {
 
+/**
+ * @brief Finalize one ungrouped aggregate result after its entire input finishes.
+ *
+ * A single task merges all partials, or produces the SQL empty-input row when no batches arrived.
+ * Scheduling claims are atomic; the inherited mutex serializes input handout. Pending finalization
+ * keeps @c all_ports_empty() false until the descriptor is handed to the task creator, whose
+ * pipeline lock protects the transition to task accounting.
+ */
 class sirius_physical_ungrouped_aggregate_merge : public sirius_physical_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE =
@@ -48,18 +57,29 @@ class sirius_physical_ungrouped_aggregate_merge : public sirius_physical_operato
   //! The aggregates that have to be computed
   duckdb::vector<std::unique_ptr<sirius::ast::node>> aggregates;
 
-  sirius_physical_operator* child_op;
+  sirius_physical_operator* child_op = nullptr;
   sirius_physical_operator* get_child_op() const { return child_op; }
 
   bool is_source() const override { return true; }
 
+  std::optional<task_creation_hint> get_next_task_hint() override;
+  [[nodiscard]] bool all_ports_empty() override;
   std::unique_ptr<operator_data> get_next_task_input_data() override;
+
+  [[nodiscard]] std::size_t no_history_peak_memory_estimate(
+    const input_stats& stats) const override;
 
  public:
   bool is_sink() const override { return true; }
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          ::cuda::stream_ref stream) override;
+
+ private:
+  [[nodiscard]] std::size_t empty_input_size_estimate() const;
+
+  std::atomic<bool> _task_claimed{false};
+  std::atomic<bool> _input_handed_out{false};
 };
 
 }  // namespace op

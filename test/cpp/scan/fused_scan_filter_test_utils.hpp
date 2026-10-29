@@ -19,10 +19,12 @@
 /**
  * @file fused_scan_filter_test_utils.hpp
  * @brief Fixtures shared by the filtered-decode tests: the env-gate armer, device upload and
- * readback of plain columns, the synthetic source tables, and exact membership sets with the probe
- * directives that consult them.
+ * readback of plain columns, the synthetic source tables, the range source with the engine request
+ * that carries its whole filter, and exact membership sets with the probe directives that consult
+ * them.
  */
 
+#include "api/simpatico_codegen.hpp"
 #include "codegen/selection/selection.hpp"
 
 #include <cudf/column/column_factories.hpp>
@@ -31,15 +33,21 @@
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
+#include <cudf/utilities/span.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
 #include <rmm/device_buffer.hpp>
 
+#include <cuda/std/utility>
 #include <cuda_runtime.h>
 
 #include <catch.hpp>
+#include <compression/compressed_scan.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 
+#include <array>
+#include <concepts>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
@@ -91,37 +99,35 @@ inline std::unique_ptr<cudf::column> upload_strings(std::vector<std::string> con
 {
   auto const mr = cudf::get_current_device_resource_ref();
   auto const n  = static_cast<cudf::size_type>(host.size());
-  std::vector<cudf::size_type> offsets(static_cast<std::size_t>(n) + 1, 0);
   std::string chars;
+  std::vector<std::size_t> offsets;
+  offsets.reserve(host.size());
+  std::vector<::cuda::std::pair<char const*, cudf::size_type>> strings;
+  strings.reserve(host.size());
   for (std::size_t i = 0; i < host.size(); ++i) {
+    offsets.push_back(chars.size());
     chars += host[i];
-    offsets[i + 1] = static_cast<cudf::size_type>(chars.size());
+    strings.emplace_back(nullptr, static_cast<cudf::size_type>(host[i].size()));
   }
-  auto offsets_col = upload_column(offsets, stream);
-  rmm::device_buffer chars_buf{chars.data(), chars.size(), stream, mr};
-  if (valid.empty()) {
-    stream.sync();
-    return cudf::make_strings_column(
-      n,
-      std::move(offsets_col),
-      std::move(chars_buf),
-      0,
-      cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr));
+  rmm::device_buffer chars_buf{chars.empty() ? 1 : chars.size(), stream, mr};
+  if (!chars.empty()) {
+    REQUIRE(cudaMemcpyAsync(
+              chars_buf.data(), chars.data(), chars.size(), cudaMemcpyHostToDevice, stream.get()) ==
+            cudaSuccess);
   }
-  REQUIRE(valid.size() == host.size());
-  std::vector<cudf::bitmask_type> words(cudf::num_bitmask_words(n), cudf::bitmask_type{0});
-  cudf::size_type null_count = 0;
-  for (std::size_t i = 0; i < valid.size(); ++i) {
-    if (valid[i]) {
-      words[i / 32] |= cudf::bitmask_type{1} << (i % 32);
-    } else {
-      ++null_count;
-    }
+  REQUIRE((valid.empty() || valid.size() == host.size()));
+  for (std::size_t i = 0; i < host.size(); ++i) {
+    strings[i].first =
+      valid.empty() || valid[i] ? static_cast<char const*>(chars_buf.data()) + offsets[i] : nullptr;
   }
-  rmm::device_buffer mask{words.data(), words.size() * sizeof(cudf::bitmask_type), stream, mr};
+  rmm::device_buffer strings_buf{
+    strings.data(), strings.size() * sizeof(decltype(strings)::value_type), stream, mr};
   stream.sync();
-  return cudf::make_strings_column(
-    n, std::move(offsets_col), std::move(chars_buf), null_count, std::move(mask));
+  auto const device_strings =
+    cudf::device_span<::cuda::std::pair<char const*, cudf::size_type> const>{
+      static_cast<::cuda::std::pair<char const*, cudf::size_type> const*>(strings_buf.data()),
+      static_cast<std::size_t>(n)};
+  return cudf::make_strings_column(device_strings, stream, mr);
 }
 
 /// The STRING key of row @p i: "item_<i % 50>".
@@ -204,6 +210,70 @@ std::unique_ptr<cudf::table> make_source_table(
   return std::make_unique<cudf::table>(std::move(cols));
 }
 
+/// The range source: "v" = i % 100 and "k" = i % 50 are its output columns, and "f" = i % 1000 is a
+/// column only the scan's filter reads. All three are bitpacked, so the range on "f" is evaluated
+/// while decoding.
+inline constexpr char const* kRangeSourcePlans =
+  "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
+  "---\n"
+  "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
+  "---\n"
+  "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n";
+
+/// "f" = i % 1000 under [0, 49] keeps 250 of the 4096 rows, below every selectivity ceiling.
+inline constexpr std::int32_t kFilterModulus = 1000;
+inline constexpr std::int64_t kFilterLo      = 0;
+inline constexpr std::int64_t kFilterHi      = 49;
+
+inline constexpr std::size_t kOutputWidth = 2;
+inline constexpr std::array<std::size_t, 3> kSelected{0, 1, 2};
+
+inline bool in_filter_range(cudf::size_type i)
+{
+  auto const f = i % kFilterModulus;
+  return f >= kFilterLo && f <= kFilterHi;
+}
+
+inline simpatico::compressed_table compress_range_source(::cuda::stream_ref stream)
+{
+  auto table = make_source_table(
+    stream, cudf::data_type{cudf::type_id::INT32}, std::optional<std::int32_t>{kFilterModulus});
+  return simpatico::compress_with_plan(
+    table->view(), kRangeSourcePlans, stream, cudf::get_current_device_resource_ref());
+}
+
+/// The "v", "k" and "f" values of the rows @p keep selects, column by column.
+struct source_rows {
+  std::vector<std::int32_t> v;
+  std::vector<std::int32_t> k;
+  std::vector<std::int32_t> f;
+};
+
+inline source_rows rows_where(std::predicate<cudf::size_type> auto keep)
+{
+  source_rows rows;
+  for (cudf::size_type i = 0; i < kRows; ++i) {
+    if (keep(i)) {
+      rows.v.push_back(i % 100);
+      rows.k.push_back(i % 50);
+      rows.f.push_back(i % kFilterModulus);
+    }
+  }
+  return rows;
+}
+
+/// An engine request that carries the scan's whole filter -- the range on "f" -- and says the
+/// output reads only the leading @p output_prefix_width slots.
+inline sirius::pushdown_request covered_request(std::optional<std::size_t> output_prefix_width)
+{
+  sirius::pushdown_request request;
+  request.columns.resize(kSelected.size());
+  request.columns[2].range          = sirius::decode_range{kFilterLo, kFilterHi};
+  request.ranges_cover_whole_filter = true;
+  request.output_prefix_width       = output_prefix_width;
+  return request;
+}
+
 /// INT64-built exact membership set over the multiples of @p step in [0, 50) -- the probe column
 /// decodes as INT32, so the probe exercises the heterogeneous (cast-free) path.
 inline std::shared_ptr<sirius::op::sirius_dynamic_in_list_filter> make_key_set(
@@ -226,6 +296,13 @@ inline std::shared_ptr<sirius::op::sirius_dynamic_in_list_filter> make_key_set(
                           stream.get()) == cudaSuccess);
   stream.sync();
   return std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(col->view(), stream, mr);
+}
+
+/// Whether @p value is in the set `make_key_set` builds with @p step: the multiples of @p step in
+/// [0, 50).
+inline bool in_key_set(std::int32_t value, std::int32_t step = 5)
+{
+  return value < 50 && value % step == 0;
 }
 
 inline sirius::codegen::membership_filter_directive make_probe_directive(

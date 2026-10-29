@@ -24,32 +24,55 @@
 namespace sirius::planner {
 
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
-sirius_physical_plan_generator::create_plan(duckdb::LogicalCrossProduct& op)
+sirius_physical_plan_generator::make_cross_product_join(
+  duckdb::LogicalOperator& op,
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> left,
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> right,
+  duckdb::JoinType join_type,
+  std::size_t lhs_cardinality,
+  std::size_t rhs_cardinality,
+  duckdb::vector<std::size_t> left_projection_map,
+  duckdb::vector<std::size_t> right_projection_map)
 {
-  D_ASSERT(op.children.size() == 2);
-
   // A cross product runs as a nested loop join without conditions, which splits each pair of
   // input batches into tasks small enough for cudf::cross_join. Its estimate is the product of the
   // child estimates. The generic create_plan() has already set op.estimated_cardinality to the
   // larger child when the join order optimizer set none.
-  op.estimated_cardinality = memory::saturating_mul(op.children[0]->EstimateCardinality(context),
-                                                    op.children[1]->EstimateCardinality(context));
+  op.estimated_cardinality = memory::saturating_mul(lhs_cardinality, rhs_cardinality);
 
-  auto left  = create_plan(*op.children[0]);
-  auto right = create_plan(*op.children[1]);
-  auto join  = duckdb::make_uniq<sirius::op::sirius_physical_nested_loop_join>(
+  auto join = duckdb::make_uniq<sirius::op::sirius_physical_nested_loop_join>(
     op,
     std::move(left),
     std::move(right),
     duckdb::vector<sirius::join_condition>{},
-    duckdb::JoinType::INNER,
-    op.estimated_cardinality);
+    join_type,
+    op.estimated_cardinality,
+    std::move(left_projection_map),
+    std::move(right_projection_map));
   // The output of each task aims for cross_join_task_bytes.
   if (auto sirius_context = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")) {
-    join->set_cross_join_task_bytes(
-      sirius_context->get_config().get_operator_params().cross_join_task_bytes);
+    join->set_cross_join_task_bytes(duckdb::query_operator_options(context)->cross_join_task_bytes);
   }
   return join;
+}
+
+duckdb::unique_ptr<sirius::op::sirius_physical_operator>
+sirius_physical_plan_generator::create_plan(duckdb::LogicalCrossProduct& op)
+{
+  D_ASSERT(op.children.size() == 2);
+
+  auto const lhs_cardinality = op.children[0]->EstimateCardinality(context);
+  auto const rhs_cardinality = op.children[1]->EstimateCardinality(context);
+  auto left                  = create_plan(*op.children[0]);
+  auto right                 = create_plan(*op.children[1]);
+  return make_cross_product_join(op,
+                                 std::move(left),
+                                 std::move(right),
+                                 duckdb::JoinType::INNER,
+                                 lhs_cardinality,
+                                 rhs_cardinality,
+                                 /*left_projection_map=*/{},
+                                 /*right_projection_map=*/{});
 }
 
 }  // namespace sirius::planner
