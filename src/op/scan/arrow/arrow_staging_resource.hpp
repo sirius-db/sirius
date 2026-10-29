@@ -15,14 +15,15 @@
  */
 
 #pragma once
+#include <cstddef>
 #include <memory_resource>
 #include <mutex>
-namespace sirius::ducklake {
+namespace sirius::op::scan {
 // Fixed, admitted storage. Reuse starts only after every allocation from the
 // previous import is retired; release may run on a different host thread.
-class inline_staging_resource final : public std::pmr::memory_resource {
+class arrow_staging_resource final : public std::pmr::memory_resource {
  public:
-  inline_staging_resource(void* buffer, size_t bytes)
+  arrow_staging_resource(void* buffer, size_t bytes)
     : storage_(buffer, bytes, std::pmr::null_memory_resource())
   {
   }
@@ -53,4 +54,4 @@ class inline_staging_resource final : public std::pmr::memory_resource {
   std::pmr::monotonic_buffer_resource storage_;
   size_t outstanding_ = 0;
 };
-}  // namespace sirius::ducklake
+}  // namespace sirius::op::scan

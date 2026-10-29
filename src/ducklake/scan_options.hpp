@@ -16,7 +16,8 @@
 
 #pragma once
 #include "ducklake/preparation_gate.hpp"
-#include "ducklake/preparation_identity.hpp"
+#include "scan_manager/preparation_identity.hpp"
+#include "scan_manager/preparation_slot.hpp"
 #include "sirius_config.hpp"
 
 #include <duckdb/planner/filter/expression_filter.hpp>
@@ -29,7 +30,8 @@ namespace sirius::op::scan {
 struct physical_profile_table;
 }
 namespace sirius::ducklake {
-class preparation_slot;
+using scan_manager::preparation_identity;
+using scan_manager::preparation_slot;
 // Filters and output positions index the selected required_columns, not the
 // original table or physical file. Omitted output means all selected columns;
 // an empty output retains only a row carrier after filtering.

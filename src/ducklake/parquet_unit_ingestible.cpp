@@ -20,12 +20,12 @@
 #include "ducklake/dv_visibility.hpp"
 #include "ducklake/field_mapping.hpp"
 #include "ducklake/preparation_gate.hpp"
-#include "ducklake/preparation_slot.hpp"
 #include "helper/type_conversions.hpp"
 #include "io/io_errors.hpp"
 #include "op/scan/parquet_batch_layout.hpp"
 #include "op/scan/positional_visibility.hpp"
 #include "op/scan/table_scan/split_validation.hpp"
+#include "scan_manager/preparation_slot.hpp"
 
 #include <cudf/io/parquet_schema.hpp>
 #include <cudf/table/table.hpp>

@@ -16,6 +16,8 @@
 
 #include "op/scan/arrow/arrow_batch_producer.hpp"
 
+#include "op/scan/arrow/arrow_staging_resource.hpp"
+
 #include <cudf/utilities/traits.hpp>
 
 #include <duckdb/common/exception.hpp>
@@ -44,33 +46,6 @@ int32_t offset_at(void const* data, int64_t i)
   std::memcpy(&result, static_cast<std::byte const*>(data) + i * sizeof(result), sizeof(result));
   return result;
 }
-class copy_staging final : public std::pmr::memory_resource {
- public:
-  copy_staging(void* data, size_t bytes) : storage_(data, bytes, std::pmr::null_memory_resource())
-  {
-  }
-
- private:
-  void* do_allocate(size_t bytes, size_t alignment) override
-  {
-    std::lock_guard lock(mutex_);
-    auto* value = storage_.allocate(bytes, alignment);
-    ++outstanding_;
-    return value;
-  }
-  void do_deallocate(void*, size_t, size_t) override
-  {
-    std::lock_guard lock(mutex_);
-    if (!--outstanding_) storage_.release();
-  }
-  bool do_is_equal(std::pmr::memory_resource const& other) const noexcept override
-  {
-    return this == &other;
-  }
-  std::mutex mutex_;
-  std::pmr::monotonic_buffer_resource storage_;
-  size_t outstanding_ = 0;
-};
 struct copied_column {
   ArrowSchema schema{};
   ArrowArray array{};
@@ -106,7 +81,7 @@ uint64_t copy_size(offered_arrow_input const& input, std::vector<cudf::data_type
 struct copy_owner {
   std::shared_ptr<void> claim;
   sm::charged_block block;
-  copy_staging staging;
+  arrow_staging_resource staging;
   copy_owner(std::shared_ptr<void> c, sm::charged_block b, size_t copy_bytes, size_t staging_bytes)
     : claim(std::move(c)), block(std::move(b)), staging(block.data() + copy_bytes, staging_bytes)
   {

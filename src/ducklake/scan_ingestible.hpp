@@ -16,7 +16,7 @@
 
 #pragma once
 #include "ducklake/scan_options.hpp"
-#include "op/scan/gpu_ingestible.hpp"
+#include "op/scan/composite_scan_driver.hpp"
 #include "op/scan/table_scan/materializer_capabilities.hpp"
 #include "scan_manager/preparation_ledger.hpp"
 namespace sirius::ducklake {
@@ -68,5 +68,6 @@ class scan_ingestible final : public op::scan::gpu_ingestible {
  private:
   struct impl;
   std::shared_ptr<impl> impl_;
+  std::unique_ptr<op::scan::composite_scan_driver> driver_;
 };
 }  // namespace sirius::ducklake

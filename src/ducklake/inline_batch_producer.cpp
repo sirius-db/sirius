@@ -19,11 +19,11 @@
 #include "ducklake/binding_bridge.hpp"
 #include "ducklake/field_mapping.hpp"
 #include "ducklake/inline_reader.hpp"
-#include "ducklake/inline_staging.hpp"
 #include "ducklake/inline_varchar.hpp"
 #include "ducklake/preparation_gate.hpp"
 #include "expression/ast/from_duckdb.hpp"
 #include "helper/type_conversions.hpp"
+#include "op/scan/arrow/arrow_staging_resource.hpp"
 #include "op/scan/scan_plan.hpp"
 #include "op/scan/scan_utils.hpp"
 #include "op/scan/table_scan/owned_arrow_scan.hpp"
@@ -94,7 +94,7 @@ void copy_fixed_scalar(std::byte* output, size_t row, duckdb::Value const& value
 struct arrow_capacity {
   std::shared_ptr<void> claim;
   sm::charged_block backing, characters;
-  inline_staging_resource staging;
+  op::scan::arrow_staging_resource staging;
   arrow_capacity(std::shared_ptr<void> owner,
                  sm::charged_block b,
                  sm::charged_block chars,

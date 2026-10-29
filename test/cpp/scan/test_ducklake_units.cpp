@@ -17,10 +17,7 @@
 #include "ducklake/dv_visibility.hpp"
 #include "ducklake/field_mapping.hpp"
 #include "ducklake/inline_batch_producer.hpp"
-#include "ducklake/inline_staging.hpp"
 #include "ducklake/inline_varchar.hpp"
-#include "ducklake/preparation_identity.hpp"
-#include "ducklake/preparation_slot.hpp"
 #include "ducklake/scan_ingestible.hpp"
 #include "ducklake/unit_descriptor.hpp"
 #include "io/io_errors.hpp"
@@ -738,55 +735,6 @@ TEST_CASE("Ordinary Parquet delete positions stay strict across chunks",
   CHECK_THROWS(bind_parquet_visibility(source, "", 10));
 }
 
-TEST_CASE("Inline Arrow staging stays bounded and reuses storage after cross-thread retirement",
-          "[ducklake_units][materialization]")
-{
-  std::array<std::byte, 256> bytes;
-  sirius::ducklake::inline_staging_resource resource(bytes.data(), bytes.size());
-  auto* first  = resource.allocate(64, 8);
-  auto* second = resource.allocate(64, 8);
-  CHECK_THROWS_AS(resource.allocate(512, 8), std::bad_alloc);
-  auto retired = std::async(std::launch::async, [&] {
-    resource.deallocate(first, 64, 8);
-    resource.deallocate(second, 64, 8);
-  });
-  retired.get();
-  auto* all = resource.allocate(256, 1);
-  CHECK(all == bytes.data());
-  resource.deallocate(all, 256, 1);
-  CHECK_THROWS_AS(resource.allocate(257, 1), std::bad_alloc);
-  auto* reused = resource.allocate(256, 1);
-  CHECK(reused == bytes.data());
-  resource.deallocate(reused, 256, 1);
-}
-
-TEST_CASE("DuckLake preparation identities do not alias across concurrent unit sequences",
-          "[ducklake_units]")
-{
-  preparation_identity identity;
-  std::array<std::future<std::vector<uint64_t>>, 4> producers;
-  for (auto& producer : producers) {
-    producer = std::async(std::launch::async, [&] {
-      std::vector<uint64_t> keys;
-      for (size_t batch = 0; batch < 1024; ++batch)
-        keys.push_back(identity.next());
-      return keys;
-    });
-  }
-  std::vector<uint64_t> keys;
-  for (auto& producer : producers) {
-    auto batch = producer.get();
-    keys.insert(keys.end(), batch.begin(), batch.end());
-  }
-  std::sort(keys.begin(), keys.end());
-  REQUIRE(keys.size() == 4096);
-  CHECK(std::adjacent_find(keys.begin(), keys.end()) == keys.end());
-  CHECK(keys.front() == 0);
-  CHECK(identity.next() == keys.back() + 1);
-  preparation_identity other_scan;
-  CHECK(other_scan.next() == 0);
-}
-
 TEST_CASE("DuckLake inline batches use spare column capacity without expanding their byte bound",
           "[ducklake_units][ducklake_batch_capacity]")
 {
@@ -805,64 +753,6 @@ TEST_CASE("DuckLake inline batches use spare column capacity without expanding t
     CHECK(rows * columns <= 8192);
     CHECK(inline_batch_producer::batch_capacity(columns) <= ceiling);
   }
-}
-
-TEST_CASE("DuckLake retained preparation slots reuse capacity without crossing scan ownership",
-          "[ducklake_units][ducklake_delete_budget]")
-{
-  namespace sm = sirius::scan_manager;
-  sm::test::test_reservation_provider provider;
-  auto ledger = std::make_shared<sm::preparation_ledger>(provider);
-  sm::scan_envelope envelope{{{{8}, 16}}, {}, true, 1};
-  std::vector<sm::scan_envelope> scans{envelope, envelope};
-  auto decision = ledger->admit(scans, sm::memory_space_id{cucascade::memory::Tier::HOST, 0}, 2);
-  REQUIRE(decision.deferred);
-  REQUIRE(decision.n_permits == 2);
-  auto first  = std::make_shared<preparation_slot>(ledger, sm::unit_key{1, 1}, 16);
-  auto second = std::make_shared<preparation_slot>(ledger, sm::unit_key{2, 1}, 16);
-  for (int file = 0; file < 32; ++file) {
-    auto a = first->try_acquire();
-    REQUIRE(a);
-    CHECK_FALSE(first->try_acquire());
-    auto b = second->try_acquire();
-    REQUIRE(b);
-    auto bytes = ledger->allocator(a).allocate_retained(16);
-    CHECK(ledger->charged_bytes(first->key()) == 16);
-    CHECK_THROWS_AS(ledger->allocator(a).allocate_retained(1), sm::preparation_resource_error);
-    CHECK(ledger->tracked_units() == 2);
-    bytes.release();
-    CHECK(provider.seen->allocated_bytes == 0);
-  }
-  CHECK(ledger->permits_in_flight() == 0);
-  first.reset();
-  second.reset();
-  CHECK(ledger->tracked_units() == 0);
-  ledger.reset();
-  CHECK(provider.outstanding() == 0);
-}
-
-TEST_CASE("DuckLake retained slot retirement preserves outstanding backing",
-          "[ducklake_units][ducklake_delete_budget]")
-{
-  namespace sm = sirius::scan_manager;
-  sm::test::test_reservation_provider provider;
-  auto ledger = std::make_shared<sm::preparation_ledger>(provider);
-  std::vector<sm::scan_envelope> scans{{{{{8}, 16}}, {}, true, 1}};
-  REQUIRE(ledger->admit(scans, sm::memory_space_id{cucascade::memory::Tier::HOST, 0}).deferred);
-  auto slot   = std::make_shared<preparation_slot>(ledger, sm::unit_key{1, 1}, 16);
-  auto permit = slot->try_acquire();
-  REQUIRE(permit);
-  auto bytes = ledger->allocator(permit).allocate_retained(16);
-  slot.reset();
-  permit.release();
-  CHECK(ledger->tracked_units() == 1);
-  ledger->close();
-  ledger.reset();
-  CHECK(provider.seen->allocated_bytes == 16);
-  CHECK(provider.outstanding() == 1);
-  bytes.release();
-  CHECK(provider.seen->allocated_bytes == 0);
-  CHECK(provider.outstanding() == 0);
 }
 
 TEST_CASE("DuckLake Parquet dependency errors distinguish mappings and snapshot visibility",

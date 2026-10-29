@@ -17,7 +17,7 @@
 #pragma once
 #include "scan_manager/preparation_ledger.hpp"
 
-namespace sirius::ducklake {
+namespace sirius::scan_manager {
 // Register one retained budget for a scan whose files are discovered lazily.
 // A file keeps its permit until every consumer of its visibility has finished.
 class preparation_slot {
@@ -27,7 +27,7 @@ class preparation_slot {
                    uint64_t retained_limit)
     : ledger_(std::move(ledger)), key_(key)
   {
-    if (!ledger_) throw std::invalid_argument("DuckLake preparation slot requires a ledger");
+    if (!ledger_) throw std::invalid_argument("Scan preparation slot requires a ledger");
     ledger_->register_unit(key_, retained_limit);
   }
   preparation_slot(preparation_slot const&)            = delete;
@@ -40,4 +40,4 @@ class preparation_slot {
   std::shared_ptr<scan_manager::preparation_ledger> ledger_;
   scan_manager::unit_key key_;
 };
-}  // namespace sirius::ducklake
+}  // namespace sirius::scan_manager

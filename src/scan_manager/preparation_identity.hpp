@@ -19,7 +19,7 @@
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
-namespace sirius::ducklake {
+namespace sirius::scan_manager {
 // Shared by the units of one bound scan. File indices and inline batch indices
 // remain separate semantic coordinates; preparation credits need unique keys.
 class preparation_identity {
@@ -29,7 +29,7 @@ class preparation_identity {
     auto value = next_.load(std::memory_order_relaxed);
     for (;;) {
       if (value == std::numeric_limits<uint64_t>::max())
-        throw std::overflow_error("DuckLake preparation identity exhausted");
+        throw std::overflow_error("Scan preparation identity exhausted");
       if (next_.compare_exchange_weak(value, value + 1, std::memory_order_relaxed)) return value;
     }
   }
@@ -37,4 +37,4 @@ class preparation_identity {
  private:
   std::atomic<uint64_t> next_{0};
 };
-}  // namespace sirius::ducklake
+}  // namespace sirius::scan_manager

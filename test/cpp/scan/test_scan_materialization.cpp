@@ -1758,3 +1758,82 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   CHECK(batch.table.view().num_columns() == 1);
   stream.synchronize();
 }
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "Scalar mapping preserves temporal defaults beside nested fields",
+                 "[materialization][scan][mapping]")
+{
+  namespace pq = cudf::io::parquet;
+  auto footer  = std::make_shared<pq::FileMetaData>();
+  footer->schema.resize(4);
+  footer->schema[0].num_children = 2;
+  footer->schema[1].name         = "nested";
+  footer->schema[1].field_id     = 1;
+  footer->schema[1].num_children = 1;
+  footer->schema[2].name         = "child";
+  footer->schema[2].field_id     = 2;
+  footer->schema[2].type         = pq::Type::INT32;
+  footer->schema[3].name         = "carrier";
+  footer->schema[3].field_id     = 3;
+  footer->schema[3].type         = pq::Type::INT32;
+  auto metadata                  = std::make_shared<parquet_metadata>(footer,
+                                                     0,
+                                                     parquet_encryption_evidence{},
+                                                     std::vector<uint8_t>{},
+                                                     std::string{},
+                                                     std::vector<uint8_t>{},
+                                                     "object");
+  materialization_program program;
+  program.contract     = 1;
+  program.generation   = 1;
+  program.output_types = {cudf::data_type{cudf::type_id::TIMESTAMP_DAYS},
+                          cudf::data_type{cudf::type_id::TIMESTAMP_MICROSECONDS}};
+  program.input_types  = program.output_types;
+  bool null            = GENERATE(false, true);
+  std::vector<field_requirement> fields{
+    {4,
+     duckdb::LogicalType::DATE,
+     null ? duckdb::Value(duckdb::LogicalType::DATE) : duckdb::Value::DATE(duckdb::date_t(-1))},
+    {5,
+     duckdb::LogicalType::TIMESTAMP,
+     null ? duckdb::Value(duckdb::LogicalType::TIMESTAMP)
+          : duckdb::Value::TIMESTAMP(duckdb::timestamp_t(-1))}};
+  auto compile = [&] {
+    return field_id_mapping::compile(
+      metadata, "object", program, fields, field_mapping_scope::top_level_scalars);
+  };
+  CHECK_THROWS(field_id_mapping::compile(metadata, "object", program, fields));
+  auto mapping = compile();
+  CHECK(mapping.read_indices() == std::vector<cudf::size_type>{1});
+  CHECK(mapping.metadata()->file_metadata().get() == footer.get());
+  CHECK_FALSE(mapping.statistics_name(0));
+  rmm::cuda_stream stream;
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(constant(7, 3, stream));
+  auto batch = mapping.apply(owning_table_view{std::make_unique<cudf::table>(std::move(columns))},
+                             3,
+                             stream,
+                             cudf::get_current_device_resource_ref());
+  stream.synchronize();
+  REQUIRE(batch.table.view().num_columns() == 2);
+  for (int i = 0; i < 2; ++i) {
+    auto column = batch.table.view().column(i);
+    CHECK(column.type() == program.output_types[i]);
+    CHECK(column.null_count() == (null ? 3 : 0));
+    if (!null) {
+      int64_t value = 0;
+      REQUIRE(cudaMemcpy(&value, column.head(), i == 0 ? 4 : 8, cudaMemcpyDeviceToHost) ==
+              cudaSuccess);
+      CHECK((i == 0 ? static_cast<int32_t>(value) : value) == -1);
+    }
+  }
+  footer->schema[0].children_idx = {3, 1};
+  footer->schema[1].children_idx = {2};
+  CHECK(compile().read_indices() == std::vector<cudf::size_type>{0});
+  fields[0].id = 2;
+  CHECK_THROWS(compile());
+  fields[0].id = 1;
+  CHECK_THROWS(compile());
+  footer->schema[0].children_idx = {1, 1};
+  CHECK_THROWS(compile());
+}
