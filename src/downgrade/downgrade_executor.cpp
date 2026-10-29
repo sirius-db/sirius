@@ -353,7 +353,7 @@ void downgrade_executor::processing_loop()
           req->target_bytes.has_value()
             ? *req->target_bytes - req->bytes_freed.load(std::memory_order_relaxed)
             : std::numeric_limits<std::size_t>::max();
-        auto const freed = _fs_cache->reclaim(cucascade::io::cache::reclaim_mode::idle, target);
+        auto const freed = reclaim_fs_cache(cucascade::io::cache::reclaim_mode::idle, target);
         req->bytes_freed.fetch_add(freed, std::memory_order_relaxed);
         planned_bytes.fetch_add(freed, std::memory_order_relaxed);
         predicate_satisfied(req.get());
@@ -583,8 +583,7 @@ void downgrade_executor::processing_loop()
       try {
         auto const remaining =
           *req->target_bytes - req->bytes_freed.load(std::memory_order_relaxed);
-        auto const freed =
-          _fs_cache->reclaim(cucascade::io::cache::reclaim_mode::forced, remaining);
+        auto const freed = reclaim_fs_cache(cucascade::io::cache::reclaim_mode::forced, remaining);
         req->bytes_freed.fetch_add(freed, std::memory_order_relaxed);
         planned_bytes.fetch_add(freed, std::memory_order_relaxed);
         predicate_satisfied(req.get());
@@ -701,6 +700,17 @@ void downgrade_executor::maybe_fail_stream_acquisition(stream_acquisition_site s
   std::rethrow_exception(fault.error);
 }
 
+std::size_t downgrade_executor::reclaim_fs_cache(cucascade::io::cache::reclaim_mode mode,
+                                                 std::size_t deficit)
+{
+  auto const numa       = _space_id.device_id;
+  auto const releasable = _fs_cache->releasable_bytes(numa);
+  if (releasable == 0) { return 0; }
+  auto const freed = _fs_cache->reclaim(mode, std::min(deficit, releasable), numa);
+  // Only the overflow above the reservation returns to this HOST space.
+  return std::min(freed, releasable);
+}
+
 bool downgrade_executor::has_disk_tier() const
 {
   return !_reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::DISK).empty();
@@ -713,8 +723,11 @@ bool downgrade_executor::has_viable_downgrade_target() const
   // DISK is an effectively unbounded sink and a valid target for any source tier.
   if (has_disk_tier()) { return true; }
 
-  // HOST cache reclaim returns staging buffers without requiring a DISK spill target.
-  if (_space_id.tier == Tier::HOST) { return _fs_cache && _fs_cache->claimed_bytes() != 0; }
+  // HOST cache reclaim needs no DISK target, but chunks inside the prefetch reservation
+  // do not relieve pressure. Only overflow on this executor's NUMA space counts.
+  if (_space_id.tier == Tier::HOST) {
+    return _fs_cache && _fs_cache->releasable_bytes(_space_id.device_id) != 0;
+  }
 
   // Without a disk tier, only a GPU source has a lower tier to downgrade to (HOST).
   if (_space_id.tier != Tier::GPU) { return false; }

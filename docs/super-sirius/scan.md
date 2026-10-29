@@ -706,12 +706,19 @@ Metadata opens advance a per-path observation fence using the existing monotonic
 
 #### HOST downgrade reclaim
 
-HOST downgrade executors call `fs_cache::reclaim(reclaim_mode::idle, target_bytes)` before
-repository/task spilling. Only if a known byte target remains unmet after dispatched spills
-settle do they call `reclaim(reclaim_mode::forced, remaining_bytes)`. Idle reclaim preserves
-subscribed chunks; forced reclaim may discard their cached staging buffers. Both modes leave
-pinned readers and in-flight loads untouched. Only the default local ioctx cache is bound to
-HOST executors; caches on routed remote contexts are not swept by this path.
+HOST downgrade executors reclaim only cache bytes above the prefetch reservation on their
+own NUMA space: `reclaim(mode, min(deficit, releasable_bytes(numa)), numa)`. Before
+repository/task spilling they use `reclaim_mode::idle`; only if a known byte target remains
+unmet after dispatched spills settle do they use `reclaim_mode::forced`. Predicate-only
+requests use an unbounded deficit, still capped at releasable bytes. Credit is capped at the
+pre-pass releasable snapshot, since only overflow above the reservation relieves HOST
+pressure. Chunks inside the reservation are kept; with no DISK target, a cache with no such
+overflow makes the HOST monitor back off.
+
+Idle reclaim preserves subscribed chunks; forced reclaim may discard their cached staging
+buffers. Both modes leave pinned readers and in-flight loads untouched. Only the default
+local ioctx cache is bound to HOST executors; caches on routed remote contexts are not swept
+by this path.
 
 `reset_sirius_cache()` delegates to `SiriusContext::reset_caches()`: it pauses HOST processing
 and monitoring, clears their borrowed cache pointers, rebuilds scan-manager caches, binds the
