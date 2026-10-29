@@ -356,14 +356,18 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           ERRORS=$(tail -n +2 "$RUN_DIR/validation.csv" | grep -cE ',error$' || true)
-          [ "$ERRORS" -gt 0 ] && echo "::warning::TPC-H shadow snapshot: $ERRORS queries errored (non-blocking)"
-          true
+          if [ "$ERRORS" -gt 0 ]; then
+            echo "::error::TPC-H snapshot: $ERRORS queries errored"
+            if [ "${{ github.event_name }}" = "merge_group" ]; then
+              exit 1
+            fi
+          fi
 
-      - name: Upload TPC-H shadow run artifacts
+      - name: Upload TPC-H run artifacts
         if: always() && steps.tpch.outputs.run_dir != ''
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: shadow-tpch-run-${{ github.run_id }}-cuda-${{ matrix.cuda.version }}
+          name: tpch-run-${{ github.run_id }}-cuda-${{ matrix.cuda.version }}
           path: ${{ steps.tpch.outputs.run_dir }}
           retention-days: 14
 
@@ -396,12 +400,12 @@ jobs:
 
   test:
     runs-on: ubuntu-slim
-    needs: test-run
+    needs: [test-run, test-benchmarks]
     if: always()
     steps:
       - name: Test workflow ok
-        if: ${{ needs['test-run'].result == 'success' }}
+        if: ${{ needs['test-run'].result == 'success' && needs['test-benchmarks'].result == 'success' }}
         run: exit 0
       - name: Test workflow failed
-        if: ${{ needs['test-run'].result != 'success' }}
+        if: ${{ needs['test-run'].result != 'success' || needs['test-benchmarks'].result != 'success' }}
         run: exit 1
