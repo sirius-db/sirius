@@ -21,7 +21,6 @@ bool key_has_unstable_segment(std::string_view uri);
 /// has an unstable segment (above) or a `%` byte the store might decode.
 bool key_defeats_prefix_match(std::string_view uri);
 
-
 /// @p uri as an error message may name it, without the authentication material a URI can
 /// carry: user-info, query (presigned `X-Amz-*` parameters live there) and fragment. Text
 /// without an `@` loses only its query and fragment, so plain paths and plain URIs come back

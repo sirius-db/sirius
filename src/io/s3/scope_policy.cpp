@@ -67,7 +67,6 @@ bool key_defeats_prefix_match(std::string_view uri)
   return object_key(uri).find('%') != std::string_view::npos;
 }
 
-
 std::string redacted_uri(std::string_view uri)
 {
   constexpr std::string_view kPlaceholder = "<redacted-uri>";

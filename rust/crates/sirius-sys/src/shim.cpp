@@ -42,7 +42,7 @@ void drop_object_store_prefix(const Context& ctx, const std::string& uri_prefix)
 }
 
 std::shared_ptr<ObjectStoreConfig> object_store_config_for_uri(const Context& ctx,
-                                                                const std::string& uri)
+                                                               const std::string& uri)
 {
   return ctx.object_store_config_for(uri);
 }
