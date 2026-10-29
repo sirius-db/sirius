@@ -128,9 +128,11 @@ std::unique_ptr<chunked_join> make_chunked_join(duckdb::JoinType join_type)
   attach("default", f->probe_repo, f->probe_pipeline);
 
   // Above the small-table threshold, so no broadcast; well under the BUILD_PROBE budget.
+  // BUILD_PROBE admission needs a measured row count; model an INTEGER build.
   uint64_t const build_bytes = 64ULL << 20;
-  auto const strategy        = f->join->get_partition_strategy(
-    partition_sizing_input{build_bytes, true, true, build_bytes, 0});
+  uint64_t const build_rows  = build_bytes / sizeof(int32_t);
+  auto const strategy        = f->join->get_partition_strategy(partition_sizing_input{
+    build_bytes, true, true, build_bytes, build_rows, build_rows, build_bytes});
   REQUIRE(strategy.build_probe);
   REQUIRE_FALSE(strategy.broadcast);
   REQUIRE(strategy.num_partitions == 1);
