@@ -2742,7 +2742,7 @@ scan_execution_record parquet_scan_core::decoded_execution(bool static_filter_ap
   record.contract                = execution_contract();
   record.generation              = 1;
   record.producer                = execution_record_producer::parquet;
-  record.authoritative           = false;
+  record.authoritative           = true;
   record.logical_schema_complete = true;
   record.visibility_complete     = !_requires_file_visibility;
   record.projection_complete     = assembled;
