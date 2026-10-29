@@ -112,8 +112,8 @@ struct preload_counters {
 /**
  * @brief Promotes spilled inputs of queued tasks, driven by two events.
  *
- * - @c task_downgraded: the downgrade executor moved inputs of a queued task off the GPU; the
- *   task becomes a candidate.
+ * - @c task_downgraded: inputs of a queued task are off the GPU, moved there by the downgrade
+ *   executor or already there when the scheduler queued the task; the task becomes a candidate.
  * - @c task_popped for GPU g: the task leaves the candidates and releases its budget, and g
  *   gets one credit. g's worker spends each credit on at most one promotion: the first input,
  *   in pop order, of a candidate that may run on g and passes the gate (g's queue is short, or

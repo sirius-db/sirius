@@ -17,7 +17,10 @@
 #include "pipeline/task_scheduler.hpp"
 
 #include "creator/task_creator.hpp"
+#include "data/convertible_gpu_pipeline_task.hpp"
+#include "data/data_batch_utils.hpp"
 #include "downgrade/downgrade_executor.hpp"
+#include "event/downgraded_task.hpp"
 #include "exec/config.hpp"
 #include "exec/multi_index_priority_queue.hpp"
 #include "log/logging.hpp"
@@ -32,6 +35,7 @@
 #include "telemetry-bridge/gen/quent.hpp"
 #include "telemetry/telemetry_context.hpp"
 
+#include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
@@ -72,6 +76,41 @@ void publish_task_popped(event::query_event_publisher& publisher,
                             queue.size(exec::gpu_index{exec::no_preferred_device});
     publisher.publish_task_popped(
       pipe->get_query_id(), task.get_task_id(), pipe->get_pipeline_id(), device_id, tasks_left);
+  } catch (...) {
+  }
+}
+
+/**
+ * @brief Report a task about to be queued with inputs off the GPU as one @c task_downgraded event.
+ *
+ * Covers inputs spilled before their task existed, for example out of a data repository: they
+ * reach the queue on HOST or DISK inside a new task, and no downgrade of a queued task reports
+ * them. Lists each input batch that is not on a GPU, where it is, and its device size estimate.
+ * Each batch is read through a non-blocking read-only accessor; a busy one is skipped. Never
+ * throws: the event is advisory, so a lost one costs a promotion, never the task.
+ */
+void publish_off_gpu_inputs(event::query_event_publisher& publisher,
+                            sirius::parallel::itask& task) noexcept
+{
+  try {
+    auto const* data = convertible_gpu_pipeline_task::get_pipelineable_data(task);
+    if (data == nullptr) { return; }
+    std::vector<event::downgraded_input> inputs;
+    for (auto const& batch : data->get_data_batches()) {
+      if (!batch) { continue; }
+      auto const ro     = batch->try_to_read_only();
+      auto const* space = ro ? ro->get_memory_space() : nullptr;
+      if (space == nullptr || space->get_tier() == cucascade::memory::Tier::GPU) { continue; }
+      inputs.push_back({.batch     = batch,
+                        .batch_id  = batch->get_batch_id(),
+                        .to        = space->get_id(),
+                        .gpu_bytes = sirius::peak_materialization_bytes(ro->get_data())});
+    }
+    if (inputs.empty()) { return; }
+    auto record = convertible_gpu_pipeline_task::downgraded_task_identity(task);
+    if (!record) { return; }
+    record->second.inputs = std::move(inputs);
+    publisher.publish_task_downgraded(record->first, std::move(record->second));
   } catch (...) {
   }
 }
@@ -172,6 +211,12 @@ void task_scheduler::schedule(std::unique_ptr<sirius::parallel::itask> input)
     if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
       pipeline_task->telemetry_fsm().queued(
         {.queue = {.target = _task_queue_telemetry.id(), .data = {.entries = 1}}});
+    }
+    // Before the push, so its event id precedes the task's task_popped, as tier 2's does. A failed
+    // push orphans the candidate as a refused tier-2 re-push does; preload drops it once its
+    // batches expire or its query retires.
+    if (task && _query_event_publisher->has_subscribers(event::event_type::task_downgraded)) {
+      publish_off_gpu_inputs(*_query_event_publisher, *task);
     }
     // Read before the move: reporting a drop needs the query, and `task` is gone after push().
     const auto pushed_query =

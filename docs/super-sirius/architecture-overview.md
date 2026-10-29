@@ -27,7 +27,7 @@ graph TD
     DE["downgrade_executor(s)"] -->|"monitor pressure"| MRM
     DE -->|"move GPU→Host"| DRM
     DE -.->|"task_downgraded"| PL["preload_executor (optional)"]
-    PE -.->|"task_popped"| PL
+    PE -.->|"task_popped, task_downgraded"| PL
     PL -->|"move Host/Disk→GPU, Disk→Host"| DRM
 
     subgraph SiriusContext

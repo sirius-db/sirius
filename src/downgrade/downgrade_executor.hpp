@@ -162,7 +162,8 @@ class downgrade_executor {
    * @brief Attach the query-event publisher that receives one @c task_downgraded event per
    *        queued task whose inputs this executor moves off the GPU (tier 2).
    *
-   * Tier-1 (repository) downgrades publish nothing. Shares ownership, so the handle cannot
+   * Tier-1 (repository) downgrades publish nothing; the scheduler reports such a batch once a
+   * task is queued with it (task_scheduler::schedule). Shares ownership, so the handle cannot
    * dangle. Precondition: the executor is not running (call before start() or after stop()); the
    * processing thread reads the handle unsynchronized. Without a publisher nothing is recorded or
    * published. Whether tier 2 records and publishes is decided once per downgrade request from

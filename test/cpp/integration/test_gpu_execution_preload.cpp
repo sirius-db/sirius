@@ -16,7 +16,8 @@
 
 // The preload executor end to end: spill-heavy parquet queries through Sirius on a GPU limited to
 // 1 GiB, with preload off and on, against plain DuckDB. Results must match the CPU's with preload
-// on and off, and with preload on, the engine's spills and pops must reach preload.
+// on and off, and with preload on, the engine's spills and pops must reach preload and preload
+// must promote.
 
 #include "catch.hpp"
 #include "preload/preload_executor.hpp"
@@ -189,10 +190,9 @@ digest query_digest(duckdb::Connection& con, spill_query const& q)
   return d;
 }
 
-// Preload promotes only inputs that the downgrade executor spilled out of queued tasks, so a
-// query feeds it only when tasks wait in the queue with GPU inputs under memory pressure. These
-// two do; an aggregate whose partials are spilled from a repository before their tasks exist
-// gives preload nothing to do.
+// Preload promotes only inputs of queued tasks that are off the GPU: the downgrade executor spilled
+// them out of the queued task, or they were spilled from a repository before the task was queued
+// with them. Both queries below spill under memory pressure while their tasks queue.
 
 /// Joins the table with itself on its unique id: both sides are partitioned and spill, and the
 /// join tasks queue with their inputs.
@@ -238,8 +238,8 @@ std::string report(preload_counters const& c)
 }
 
 /// Runs @p queries with preload off and then on, on a configuration with @p host_bytes of HOST.
-/// Checks that every result matches DuckDB's both ways, that no query fell back to the CPU, and
-/// that preload received both events from the engine.
+/// Checks that every result matches DuckDB's both ways, that no query fell back to the CPU, that
+/// preload received both events from the engine, and that it promoted inputs.
 void run_off_and_on(sirius::test::scratch_dir const& dir,
                     std::string const& file,
                     std::uint64_t host_bytes,
@@ -294,15 +294,12 @@ void run_off_and_on(sirius::test::scratch_dir const& dir,
     counters = preload->counters();
   } while (preload->events_handled_for_testing() != handled);
   INFO(report(counters) << " events_handled=" << handled);
-  // The scheduler's pops reached preload, and so did the downgrade executor's task_downgraded
-  // events, which made candidates that some pops found. Whether a candidate is then promoted
-  // depends on when the GPU drops below its ceiling while the candidate is still queued, so it is
-  // not checked here; the unit tests cover it.
+  // The scheduler's pops reached preload, and so did the task_downgraded events of the downgrade
+  // executor and the scheduler, which made candidates that some pops promoted: both queries queue
+  // tasks with spilled inputs, many of them spilled from repositories before their task existed.
   CHECK(counters.pops > 0);
   CHECK(handled > counters.pops);
-  CHECK(counters.gated + counters.no_room + counters.not_needed + counters.failed +
-          counters.promoted_to_gpu + counters.promoted_to_host >
-        0);
+  CHECK(counters.promoted_to_gpu + counters.promoted_to_host > 0);
 }
 
 }  // namespace

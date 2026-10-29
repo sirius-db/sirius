@@ -264,6 +264,7 @@ sub-executor or scan-priority queue owned here.
 |--------|---------|
 | `start()` | Starts every GPU executor, then launches the management thread |
 | `stop()` | Interrupts/closes scheduler channels, joins the management thread, then stops GPU executors |
+| `schedule(task)` | Admits the task through its query's lifecycle gate and pushes it into the queue. While anyone subscribes to `task_downgraded` (the preload executor), it first publishes one for a task whose input batches are not all on a GPU, listing those inputs; see [Memory Management](memory-management.md#events) |
 | `start_query(query)` | Schedules `query.get_scan_operators().front()` through `task_creator` |
 | `terminate_query(handler, exception)` | Reports an error to that query's completion handler |
 | `validate_query_complete(query_id)` | Checks execution queues after the owner settles publication; does not wait |

@@ -97,6 +97,9 @@ class task_scheduler {
    * behavior for GPU pipeline operations, including resource allocation and
    * GPU context management.
    *
+   * While anyone subscribes to @c task_downgraded, a task queued with input batches off the GPU
+   * is reported as one such event before it is pushed (see the preload executor).
+   *
    * @param task The task to schedule (must be a gpu_pipeline_task)
    */
   void schedule(std::unique_ptr<sirius::parallel::itask> task);

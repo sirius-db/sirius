@@ -162,7 +162,7 @@ Candidates are fetched lazily via `convertible_data_provider` implementations:
 
 Candidates are converted individually via `convertible_data::convert()`, which handles state locking, memory reservation, tier conversion, and failure rollback atomically.
 
-When anyone subscribes to `task_downgraded` (the [preload executor](#preload-executor)), tier 2 also records each task's moves and publishes one `task_downgraded` per converted task, while it still owns the task, so before the task goes back into the queue. Tier 1 publishes nothing. Without a subscriber nothing is recorded and the check costs one atomic load per request.
+When anyone subscribes to `task_downgraded` (the [preload executor](#preload-executor)), tier 2 also records each task's moves and publishes one `task_downgraded` per converted task, while it still owns the task, so before the task goes back into the queue. Tier 1 publishes nothing: a batch it spilled is reported by the scheduler once a task is queued with it (see [Events](#events)). Without a subscriber nothing is recorded and the check costs one atomic load per request.
 
 ## Preload Executor
 
@@ -170,20 +170,21 @@ When anyone subscribes to `task_downgraded` (the [preload executor](#preload-exe
 
 The preload executor moves the spilled inputs of queued tasks back up before the tasks run: HOST→GPU or DISK→GPU (`convert_to<gpu_table_representation>`), else DISK→HOST (`convert_to<host_data_representation>`). It promotes only `host_data_representation` and `disk_data_representation` sources and never moves a batch between GPUs. It runs only when `device_budget` or `host_budget` is > 0 ([configuration](configuration.md#siriusexecutorpreload)). It is advisory: `lock_and_prepare_batch` still moves every input a task needs, so a refused, failed or missed promotion costs performance only.
 
-**Limitation.** Its only candidates are inputs of tasks that tier 2 spilled out of the task queue. Batches tier 1 spilled from data repositories before their task existed never become candidates, so on workloads that mostly spill from repositories preload has little to do.
+**Scope.** Its candidates are the inputs of queued tasks only. A batch tier 1 spilled from a data repository is not a candidate while it sits there; it becomes one when a task that reads it is queued.
 
 ### Events
 
-Two `query_event_publisher` events drive it; both are published only while someone subscribes.
+Two `query_event_publisher` events drive it; both are published only while someone subscribes. `task_downgraded` has two producers.
 
 | Event | Published by | When | Payload |
 |---|---|---|---|
 | `task_downgraded` | downgrade executor, tier 2 | once per task it converted, before the task is pushed back | query, task id, pipeline id, preferred device, queue priority, and each input moved off a GPU: weak batch pointer, batch id, the space it moved to, its size on the GPU |
+| `task_downgraded` | scheduler, `schedule()` | once per task queued with inputs off the GPU, before the push | the same, for each input not on a GPU: the space it is in, and its `peak_materialization_bytes` as its size on the GPU. Each input is read through a non-blocking read-only accessor; a busy one is skipped |
 | `task_popped` | scheduler matcher | right after it pops a task for GPU `g`, before dispatch | query, task id, pipeline id, `g`, and `tasks_left`: the tasks `g` can still pop (its own bucket plus the no-preference bucket; an advisory snapshot) |
 
 A `task_downgraded` makes the task a candidate, or adds to the one it already is; a task of a query that grants no work lease is ignored. A `task_popped` removes the task from the candidates, releases the budget its inputs hold, and gives `g` one credit.
 
-The two events come from different threads into one mailbox in no guaranteed order, so a `task_downgraded` can arrive after its task's `task_popped`. The executor therefore remembers the last 4096 popped tasks with the id of their `task_popped` event (recent-pop tombstones) and drops a `task_downgraded` whose event id is smaller than its task's pop (`stale_event`). What that window misses is cleaned up later: inputs whose batch expired are dropped at the next selection, and `retire_query` drops the rest.
+The two events come from different threads into one mailbox in no guaranteed order, so a `task_downgraded` can arrive after its task's `task_popped`. Both producers publish `task_downgraded` before the task enters the queue, so its event id is smaller than that of the task's pop. The executor therefore remembers the last 4096 popped tasks with the id of their `task_popped` event (recent-pop tombstones) and drops a `task_downgraded` whose event id is smaller than its task's pop (`stale_event`). What that window misses is cleaned up later: inputs whose batch expired are dropped at the next selection, and `retire_query` drops the rest.
 
 ### Pop-time rule
 
@@ -195,7 +196,7 @@ Each GPU has one worker thread (`preload-<device>`) that spends each credit on a
    - to `g`, if `device_budget > 0` and it fits `g`'s budget and ceiling;
    - else, if it is on DISK, to `g`'s NUMA-local HOST space (the first HOST space when the node has none or is unknown), if it fits that space's budget and ceiling.
 
-An input's estimate is its size on the GPU before the spill plus slack (the larger of 1 MiB and 1/64).
+An input's estimate is its size on the GPU from the event (before the spill, or the peak materialization bytes for an input the task was queued with) plus slack (the larger of 1 MiB and 1/64).
 
 ### Budget and ceilings
 
@@ -217,7 +218,7 @@ A GPU copy runs on a stream from preload's own per-GPU `exclusive_stream_pool` (
 
 Logs use the `[preload]` prefix: an INFO line at start with each space's budget and ceiling in bytes, and an INFO line at stop with the counters (`preload_executor::counters()`): `pops`, promotions and bytes to GPU and to HOST, `gated` (candidates for the GPU, none past the gate), `no_candidate`, `no_room`, `not_needed`, `failed` and `stale_event`.
 
-**Verified.** Unit tests in `test/cpp/preload/` drive the executor through both events and cover `promote_one`; `test/cpp/integration/test_gpu_execution_preload.cpp` runs spill-heavy queries with preload off and on and checks that the results match DuckDB's and that the engine's pops and tier-2 spills reach preload.
+**Verified.** Unit tests in `test/cpp/preload/` drive the executor through both events, feed it `task_downgraded` from the real tier 2 and `schedule()`, and cover `promote_one`; `test/cpp/integration/test_gpu_execution_preload.cpp` runs spill-heavy queries with preload off and on and checks that the results match DuckDB's, that the engine's pops and `task_downgraded` events reach preload, and that preload promotes.
 
 ## Memory Consumption History
 

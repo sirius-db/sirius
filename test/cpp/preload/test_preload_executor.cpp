@@ -15,18 +15,28 @@
  */
 
 // The preload executor driven by the two events it consumes, task_downgraded and task_popped,
-// published by hand: no scheduler, no downgrade executor. Each test waits until every event it
-// published has been handled and the workers are idle, then reads the counters, the budget and
-// where the batches are.
+// published by hand, and, at the end, fed task_downgraded by its real producers: the downgrade
+// executor's tier 2 and the scheduler. Each test waits until every event it published has been
+// handled and the workers are idle, then reads the counters, the budget and where the batches are.
 
 #include "catch.hpp"
 #include "data/data_batch_utils.hpp"
+#include "data/data_repository_manager_registry.hpp"
 #include "data/sirius_converter_registry.hpp"
+#include "downgrade/downgrade_executor.hpp"
 #include "event/downgraded_task.hpp"
 #include "event/query_event_publisher.hpp"
 #include "event/query_event_subscriber.hpp"
+#include "exec/config.hpp"
+#include "exec/multi_index_priority_queue.hpp"
 #include "exec/query_lifecycle_registry.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
+#include "op/sirius_physical_operator.hpp"
+#include "pipeline/gpu_pipeline_task.hpp"
+#include "pipeline/pipeline_build_context.hpp"
+#include "pipeline/sirius_pipeline.hpp"
+#include "pipeline/sirius_pipeline_task_states.hpp"
+#include "pipeline/task_scheduler.hpp"
 #include "preload/config.hpp"
 #include "preload/preload_executor.hpp"
 #include "preload/preload_streams.hpp"
@@ -35,6 +45,7 @@
 #include "utils/log_test_utils.hpp"
 #include "utils/parquet_fixture_utils.hpp"
 #include "utils/sirius_test_env.hpp"
+#include "utils/telemetry_utils.hpp"
 #include "utils/utils.hpp"
 
 #include <cudf/types.hpp>
@@ -1042,6 +1053,119 @@ TEST_CASE("preload executor: a query that grants no work lease adds no candidate
   CHECK(f.exec->candidate_count_for_testing() == 0);
   CHECK(f.exec->counters().no_candidate == 1);
   CHECK(tier_of(*a) == Tier::HOST);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The real producers
+// ---------------------------------------------------------------------------------------------
+
+namespace {
+
+/**
+ * The global state of the queued tasks of pipeline candidate_pipeline of the fixture's query, with
+ * the priority of the task that pops first and a preference for GPU 0. The pipeline has no
+ * operators, so it cannot account a task's completion: it is detached on destruction, and must
+ * therefore be declared after whatever destroys the tasks.
+ */
+struct queued_task_state {
+  std::shared_ptr<sirius::pipeline::gpu_pipeline_task_global_state> state;
+
+  explicit queued_task_state(executor_fixture const& f)
+  {
+    auto pipeline = std::make_shared<sirius::pipeline::sirius_pipeline>(
+      sirius::pipeline::pipeline_build_context{nullptr, true});
+    pipeline->set_query_id(f.query);
+    pipeline->set_pipeline_id(candidate_pipeline);
+    state = std::make_shared<sirius::pipeline::gpu_pipeline_task_global_state>(
+      std::move(pipeline), sirius::test::make_test_telemetry_context());
+    state->set_priority(f.priority(1));
+    state->set_preferred_device_id(0);
+  }
+
+  ~queued_task_state() { state->set_pipeline(nullptr); }
+
+  queued_task_state(queued_task_state const&)            = delete;
+  queued_task_state& operator=(queued_task_state const&) = delete;
+
+  [[nodiscard]] std::unique_ptr<sirius::pipeline::gpu_pipeline_task> make_task(
+    std::uint64_t task_id, std::vector<batch_ptr> batches) const
+  {
+    auto local = std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(
+      std::make_unique<sirius::op::pipelineable_operator_data>(std::move(batches)));
+    return std::make_unique<sirius::pipeline::gpu_pipeline_task>(
+      task_id, std::vector<cucascade::shared_data_repository*>{}, std::move(local), state);
+  }
+};
+
+/// A real producer has published one task_downgraded for a queued task whose input @p batch is
+/// off the GPU. Once the executor has handled it, the pop of another task on GPU 0 with a short
+/// queue must promote @p batch.
+void check_promoted_by_another_pop(executor_fixture& f, batch_ptr const& batch)
+{
+  ++f.published;
+  REQUIRE(f.handled());
+  REQUIRE(f.exec->candidate_count_for_testing() == 1);
+  REQUIRE(tier_of(*batch) != Tier::GPU);
+
+  f.popped(100, short_queue);
+  f.settle();
+  auto const c = f.exec->counters();
+  CHECK(f.exec->events_handled_for_testing() == 2);
+  CHECK(c.pops == 1);
+  CHECK(c.stale_event == 0);
+  CHECK(c.promoted_to_gpu == 1);
+  CHECK(tier_of(*batch) == Tier::GPU);
+  CHECK(space_of(*batch) == f.gpu().get_id());
+  CHECK(f.outstanding(f.gpu()) == c.bytes_to_gpu);
+}
+
+}  // namespace
+
+TEST_CASE("preload executor: a queued input tier 2 spills is promoted back by another task's pop",
+          "[preload][preload_executor][downgrade_task_events]")
+{
+  executor_fixture f;
+  f.build(executor_fixture::config());
+  sirius::data::data_repository_manager_registry repositories;
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(
+    &sirius::pipeline::index_keys_for);
+  // Declared after the queue so the pipeline is detached before the queue destroys the task.
+  queued_task_state const tasks(f);
+  auto const batch = f.make_gpu_batch();
+  REQUIRE(queue.push(tasks.make_task(1, {batch})));
+
+  sirius::exec::downgrade_executor_config const config{
+    .thread_pool    = {.num_threads = 1, .thread_name_prefix = "downgrade"},
+    .monitor_period = std::chrono::milliseconds{0}};
+  sirius::parallel::downgrade_executor downgrades(
+    f.lifecycle, config, repositories, f.gpu().get_id(), &f.gpu(), *f.mgr, &queue);
+  downgrades.set_query_event_publisher(*f.publisher);
+  downgrades.start();
+  REQUIRE(downgrades.request_free_memory_and_wait(gib) > 0);
+  downgrades.stop();
+  REQUIRE(tier_of(*batch) == Tier::HOST);
+  REQUIRE(queue.size() == 1);
+
+  check_promoted_by_another_pop(f, batch);
+}
+
+TEST_CASE("preload executor: a task scheduled with a HOST input is promoted by another task's pop",
+          "[preload][preload_executor][task_scheduler]")
+{
+  executor_fixture f;
+  f.build(executor_fixture::config());
+  // Never started: the only pop is the one the test publishes.
+  sirius::pipeline::task_scheduler scheduler(
+    f.lifecycle, {1}, *f.mgr, sirius::test::make_test_telemetry_context());
+  scheduler.set_query_event_publisher(*f.publisher);
+  // Declared after the scheduler so the pipeline is detached before the scheduler destroys the
+  // task.
+  queued_task_state const tasks(f);
+  auto const batch = f.spilled(*f.host);
+  scheduler.schedule(tasks.make_task(1, {batch}));
+  REQUIRE(scheduler.get_pipeline_task_queue()->size() == 1);
+
+  check_promoted_by_another_pop(f, batch);
 }
 
 // ---------------------------------------------------------------------------------------------

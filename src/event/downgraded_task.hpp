@@ -32,20 +32,25 @@ class data_batch;
 
 namespace sirius::event {
 
-/// One input of a queued task that the downgrade executor moved off the GPU.
+/// One input of a queued task that is off the GPU: the downgrade executor moved it there, or it
+/// was already there when the task was queued.
 struct downgraded_input {
-  /// The batch that was moved. Never extends its lifetime.
+  /// The batch. Never extends its lifetime.
   std::weak_ptr<cucascade::data_batch> batch;
   std::uint64_t batch_id{0};
-  /// Memory space the batch is in after the move (HOST or DISK).
+  /// Memory space the batch is in (HOST or DISK).
   cucascade::memory::memory_space_id to{cucascade::memory::Tier::SIZE, -1};
-  /// Size of the batch on the GPU before the move: preload's device-size estimate.
+  /// Preload's device-size estimate: the batch's size on the GPU before the move, or, for a task
+  /// queued with the batch already off the GPU, its peak_materialization_bytes() there.
   std::size_t gpu_bytes{0};
 };
 
 /**
  * @brief Payload of a @c task_downgraded event: a queued task some of whose
- *        inputs were moved off the GPU.
+ *        inputs are off the GPU.
+ *
+ * Published by the downgrade executor's tier 2 for the inputs it moved, and by
+ * the task scheduler for a task queued with inputs already off the GPU.
  *
  * The batches are held weakly so an event sitting in a subscriber's mailbox
  * never extends their lifetime: a subscriber must expect any of them to have
@@ -57,7 +62,8 @@ struct downgraded_task {
   /// Device the task prefers; empty when any GPU may run it.
   std::optional<int> preferred_device;
   exec::queue_priority priority{};
-  /// Only the inputs that moved, in the order they moved.
+  /// Only the inputs off the GPU: those a downgrade moved, in the order they
+  /// moved, or those a task was queued with, in input order.
   std::vector<downgraded_input> inputs;
 };
 

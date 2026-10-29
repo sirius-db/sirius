@@ -214,10 +214,11 @@ class query_event_subscriber {
                                              compressed_materialization_activity,
                                              std::uint64_t count) noexcept;
 
-  /// The downgrade executor moved inputs of a queued task of @p query_id off
-  /// the GPU to HOST or DISK.  One event per converted task;
-  /// @c downgraded_task::inputs lists only the inputs that moved, held weakly,
-  /// so any may already be gone.
+  /// Inputs of a queued task of @p query_id are off the GPU, on HOST or DISK:
+  /// the downgrade executor moved them (one event per converted task), or the
+  /// scheduler is queuing the task with them there (one event per such task).
+  /// @c downgraded_task::inputs lists only those inputs, held weakly, so any
+  /// may already be gone.
   virtual void on_task_downgraded(event_id_t,
                                   timestamp_t,
                                   query_id_t query_id,

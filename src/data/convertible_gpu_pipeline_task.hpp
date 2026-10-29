@@ -234,13 +234,41 @@ class convertible_gpu_pipeline_task : public convertible_data {
   }
 
   /**
+   * @brief A @c task_downgraded payload naming @p task, with no inputs yet.
+   *
+   * Shared by both producers of the event: @ref downgraded_task_record and the scheduler, which
+   * reports a task queued with inputs already off the GPU. The pipeline and query are read through
+   * a checked cast of the global state rather than gpu_pipeline_task::get_pipeline(), which assumes
+   * the global state is a gpu_pipeline_task_global_state and would dereference a foreign one.
+   *
+   * @param task The task to name.
+   * @return The query to report the payload under, and the payload with its task id, pipeline id,
+   *         preferred device and priority set; nullopt when @p task is not a gpu_pipeline_task or
+   *         has no pipeline.
+   */
+  [[nodiscard]] static std::optional<std::pair<query_id_t, event::downgraded_task>>
+  downgraded_task_identity(sirius::parallel::itask& task)
+  {
+    auto* gpt = task.as<sirius::pipeline::gpu_pipeline_task>();
+    if (!gpt) { return std::nullopt; }
+    auto const* gs =
+      dynamic_cast<const sirius::pipeline::gpu_pipeline_task_global_state*>(gpt->global_state());
+    auto const* pipe = gs ? gs->get_pipeline() : nullptr;
+    if (!pipe) { return std::nullopt; }
+    return std::pair{pipe->get_query_id(),
+                     event::downgraded_task{.task_id          = gpt->get_task_id(),
+                                            .pipeline_id      = pipe->get_pipeline_id(),
+                                            .preferred_device = gpt->get_preferred_device_id(),
+                                            .priority         = gpt->get_priority(),
+                                            .inputs           = {}}};
+  }
+
+  /**
    * @brief The owned task's moves off the GPU, as one @c task_downgraded payload.
    *
    * One input per record in converted_batches() whose source is a GPU space, in the order the
    * moves completed. Read once convert() has returned or thrown, while this wrapper still owns the
-   * task. The pipeline and query are read through a checked cast of the global state rather than
-   * gpu_pipeline_task::get_pipeline(), which assumes the global state is a
-   * gpu_pipeline_task_global_state and would dereference a foreign one.
+   * task.
    *
    * Never throws: a lost record costs a promotion, never correctness.
    *
@@ -251,27 +279,18 @@ class convertible_gpu_pipeline_task : public convertible_data {
   downgraded_task_record() const noexcept
   {
     try {
-      auto* gpt = _task ? _task->as<sirius::pipeline::gpu_pipeline_task>() : nullptr;
-      if (!gpt) { return std::nullopt; }
-      auto const* gs =
-        dynamic_cast<const sirius::pipeline::gpu_pipeline_task_global_state*>(gpt->global_state());
-      auto const* pipe = gs ? gs->get_pipeline() : nullptr;
-      if (!pipe) { return std::nullopt; }
-
+      auto record = _task ? downgraded_task_identity(*_task) : std::nullopt;
+      if (!record) { return std::nullopt; }
       auto const records = converted_batches();
-      event::downgraded_task task;
-      task.inputs.reserve(records.size());
+      auto& inputs       = record->second.inputs;
+      inputs.reserve(records.size());
       for (auto const& rec : records) {
         if (rec.from.tier != cucascade::memory::Tier::GPU) { continue; }
-        task.inputs.push_back(event::downgraded_input{
+        inputs.push_back(event::downgraded_input{
           .batch = rec.batch, .batch_id = rec.batch_id, .to = rec.to, .gpu_bytes = rec.bytes});
       }
-      if (task.inputs.empty()) { return std::nullopt; }
-      task.task_id          = gpt->get_task_id();
-      task.pipeline_id      = pipe->get_pipeline_id();
-      task.preferred_device = gpt->get_preferred_device_id();
-      task.priority         = gpt->get_priority();
-      return std::pair{pipe->get_query_id(), std::move(task)};
+      if (inputs.empty()) { return std::nullopt; }
+      return record;
     } catch (...) {
       return std::nullopt;
     }
