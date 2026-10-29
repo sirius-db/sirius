@@ -1,4 +1,5 @@
 /* Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0 */
+#include "op/scan/arrow/arrow_staging_resource.hpp"
 #include "op/scan/arrow_materializer.hpp"
 #include "op/scan/table_scan/owned_arrow_scan.hpp"
 
@@ -16,6 +17,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <future>
 #include <limits>
 #include <memory_resource>
 #include <thread>
@@ -23,7 +25,7 @@
 using namespace sirius::op::scan;
 
 namespace {
-// Migrated from2216's resource controls; copies of the CUDA resource facade share observations.
+// Copies of the CUDA resource facade share observations.
 class observed_device_resource {
  public:
   struct observations {
@@ -876,4 +878,28 @@ TEST_CASE("Arrow migration final quiesce covers frees queued after failed commit
   CHECK(device.state->completed_deallocations == device.state->deallocations);
   CHECK(cudaStreamQuery(stream.value()) == cudaSuccess);
   CHECK(host.used == 0);
+}
+
+TEST_CASE("Arrow staging stays bounded and reuses storage after cross-thread retirement",
+          "[arrow_driver][arrow_staging]")
+{
+  std::array<std::byte, 256> bytes;
+  arrow_staging_resource resource(bytes.data(), bytes.size());
+  auto* first                      = resource.allocate(64, 8);
+  auto* second                     = resource.allocate(64, 8);
+  *static_cast<std::byte*>(second) = std::byte{42};
+  CHECK_THROWS_AS(resource.allocate(512, 8), std::bad_alloc);
+  auto retired = std::async(std::launch::async, [&] { resource.deallocate(first, 64, 8); });
+  retired.get();
+  CHECK_THROWS_AS(resource.allocate(192, 8), std::bad_alloc);
+  CHECK(*static_cast<std::byte*>(second) == std::byte{42});
+  auto last = std::async(std::launch::async, [&] { resource.deallocate(second, 64, 8); });
+  last.get();
+  auto* all = resource.allocate(256, 1);
+  CHECK(all == bytes.data());
+  resource.deallocate(all, 256, 1);
+  CHECK_THROWS_AS(resource.allocate(257, 1), std::bad_alloc);
+  auto* reused = resource.allocate(256, 1);
+  CHECK(reused == bytes.data());
+  resource.deallocate(reused, 256, 1);
 }
