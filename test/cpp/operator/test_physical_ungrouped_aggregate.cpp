@@ -493,3 +493,42 @@ TEST_CASE("FIRST skips empty partials and preserves a real NULL",
   REQUIRE(copy_column_to_host<int64_t>(view.column(1))[0] ==
           ((scenario == 2 || scenario == 3 || scenario == 7) ? 0 : 1));
 }
+
+TEST_CASE("Empty scalar aggregates reserve memory for every partial result",
+          "[ungrouped_aggregate][empty_aggregate_budget]")
+{
+  auto defs = sirius::test::create_aggregate_expressions<gpu_type_traits<double>>(
+    {}, {"sum", "count", "first", "avg", "stddev_samp"}, {0, 0, 0, 0, 0});
+  sirius_physical_ungrouped_aggregate local(std::move(defs.output_types),
+                                            std::move(defs.aggregates),
+                                            1,
+                                            duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES);
+  auto manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space  = manager->get_memory_space(Tier::GPU, 0);
+  REQUIRE(space);
+  auto n        = GENERATE(std::size_t{1}, std::size_t{3});
+  auto estimate = local.no_history_peak_memory_estimate({n, 0});
+  REQUIRE(estimate > 0);
+  std::vector<std::shared_ptr<data_batch>> batches;
+  for (size_t i = 0; i < n; ++i)
+    batches.push_back(make_numeric_batch<double>(*space, {}, cudf::type_id::FLOAT64));
+  auto reservation = space->make_reservation_or_null(estimate);
+  REQUIRE(reservation);
+  auto* allocator = reservation->get_memory_resource_as<reservation_aware_resource_adaptor>();
+  REQUIRE(allocator);
+  allocator->attach_reservation_to_tracker(default_stream(),
+                                           std::move(reservation),
+                                           std::make_unique<fail_reservation_limit_policy>(),
+                                           nullptr);
+  auto reset = std::shared_ptr<void>(
+    nullptr, [&](void*) { allocator->reset_stream_reservation(default_stream()); });
+  auto result         = local.execute(pipelineable_operator_data(batches), default_stream());
+  auto const& outputs = dynamic_cast<pipelineable_operator_data&>(*result).get_data_batches();
+  REQUIRE(outputs.size() == n);
+  for (auto const& batch : outputs) {
+    auto view = sirius::get_cudf_table_view(*batch);
+    CHECK(view.num_rows() == 1);
+    CHECK(view.column(0).null_count() == 1);
+    CHECK(copy_column_to_host<int64_t>(view.column(1))[0] == 0);
+  }
+}

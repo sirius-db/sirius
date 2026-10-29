@@ -400,6 +400,19 @@ duckdb::vector<sirius::logical_type> sirius_physical_ungrouped_aggregate::get_lo
   return local_types;
 }
 
+std::size_t sirius_physical_ungrouped_aggregate::no_history_peak_memory_estimate(
+  const input_stats& stats) const
+{
+  // Empty inputs still allocate scalar results, validity masks and partial states.
+  // Allow sixteen aligned allocations per aggregate and input batch, including
+  // the three scalar states and temporary columns used by STDDEV.
+  constexpr std::size_t scalar_state_bytes = 16 * 256;
+  auto const partials =
+    memory::saturating_mul(aggregates.size(), std::max(stats.num_batches, std::size_t{1}));
+  return std::max(sirius_physical_operator::no_history_peak_memory_estimate(stats),
+                  memory::saturating_mul(partials, scalar_state_bytes));
+}
+
 std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
   const operator_data& input_data, ::cuda::stream_ref stream)
 {
