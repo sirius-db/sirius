@@ -92,16 +92,37 @@ mod ffi {
             new_session_token: &CxxString,
         ) -> SharedPtr<ObjectStoreConfig>;
 
-        /// The context's current snapshot, or a null pointer when it has none. A returned
-        /// snapshot stays valid after a later replacement.
+        /// The supplied snapshot when exactly one is published, otherwise the default-scope
+        /// snapshot or null. A nonempty set with several scoped-only entries therefore returns
+        /// null; use per-URI lookup to select among them. Returned snapshots remain valid after
+        /// replacement.
         fn object_store_config(self: &Context) -> SharedPtr<ObjectStoreConfig>;
 
-        /// Atomically replace the context's snapshot; a null pointer clears it. Fails (leaving
-        /// the previous snapshot active) when a required field is empty, the endpoint is
-        /// malformed, a value is outside its set, the CA bundle is unreadable, or the
-        /// configured IO backend does not honor an option. No network access. Executions that
-        /// already captured a snapshot keep it. Thread-safe; may be called while queries run.
+        /// Atomically replace every published snapshot with `cfg` alone; null clears all
+        /// scopes. Fails (leaving the previous set active) when a required field is empty,
+        /// the endpoint is malformed, a value is outside its set, the CA bundle is unreadable,
+        /// or the configured IO backend does not honor an option. No network access.
+        /// Executions that already captured a snapshot keep it. Thread-safe; may be called
+        /// while queries run.
         fn set_object_store(self: &Context, cfg: SharedPtr<ObjectStoreConfig>) -> Result<()>;
+
+        /// Publish `cfg` for the scope named by its `uri_prefix`, replacing the snapshot
+        /// published for exactly that prefix (the empty prefix is the default scope). Other
+        /// scopes are untouched. Same checks, failure behaviour and thread-safety as
+        /// `set_object_store`; a null pointer is rejected.
+        fn put_object_store(self: &Context, cfg: SharedPtr<ObjectStoreConfig>) -> Result<()>;
+
+        /// Remove the snapshot published for exactly `uri_prefix`; removing an absent prefix
+        /// is a no-op. Fails on a malformed prefix without changing the published set.
+        fn drop_object_store_prefix(ctx: &Context, uri_prefix: &CxxString) -> Result<()>;
+
+        /// The snapshot that would serve `uri`: the longest matching published prefix, then
+        /// the default scope; null when none matches. Fails when the selected scope cannot
+        /// serve the key (an unstable key or a key containing `%`), as an execution would.
+        fn object_store_config_for_uri(
+            ctx: &Context,
+            uri: &CxxString,
+        ) -> Result<SharedPtr<ObjectStoreConfig>>;
 
         /// Construct an initialized [`Context`] from the YAML config file at `config_path`
         /// (empty = built-in defaults) with `cfg` as its object-store snapshot (null = none).
@@ -131,6 +152,7 @@ impl std::fmt::Debug for ffi::ObjectStoreConfigArgs {
 }
 
 pub use ffi::{
-    Context, ObjectStoreConfig, ObjectStoreConfigArgs, make_context, make_context_from_config,
-    make_context_from_config_with_object_store, make_object_store_config,
+    Context, ObjectStoreConfig, ObjectStoreConfigArgs, drop_object_store_prefix, make_context,
+    make_context_from_config, make_context_from_config_with_object_store, make_object_store_config,
+    object_store_config_for_uri,
 };

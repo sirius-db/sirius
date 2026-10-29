@@ -36,4 +36,15 @@ std::unique_ptr<Context> make_context_from_config_with_object_store(
   return make_context_from_config(config_path, std::move(cfg));
 }
 
+void drop_object_store_prefix(const Context& ctx, const std::string& uri_prefix)
+{
+  ctx.drop_object_store(uri_prefix);
+}
+
+std::shared_ptr<ObjectStoreConfig> object_store_config_for_uri(const Context& ctx,
+                                                                const std::string& uri)
+{
+  return ctx.object_store_config_for(uri);
+}
+
 }  // namespace sirius::ffi
