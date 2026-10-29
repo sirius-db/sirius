@@ -14,7 +14,8 @@
 
 # name: test/sql/aggregate-filter.test
 # description: Aggregate FILTER (WHERE ...) correctness. Supported shapes run on the GPU via the
-#              mask-to-null projection rewrite; DISTINCT and first() with FILTER fall back to CPU.
+#              mask-to-null projection rewrite; DISTINCT aggregates other than COUNT(DISTINCT) and
+#              first() with FILTER fall back to CPU.
 # group: [sirius]
 
 # Load required extensions
@@ -120,12 +121,13 @@ SELECT sum(d) FILTER (WHERE k=2), avg(d) FILTER (WHERE k=2) FROM t5;
 ----
 12.5	6.25
 
-# 9. Rejected shapes still produce correct results via transparent CPU fallback.
+# 9. COUNT(DISTINCT) with FILTER counts each passing value once.
 query I
 SELECT count(DISTINCT x) FILTER (WHERE x<100) FROM t;
 ----
 100
 
+# Rejected shapes still produce correct results via transparent CPU fallback.
 # Deterministic because every qualifying value equals 42.
 query I
 SELECT first(x) FILTER (WHERE x=42) FROM t;
