@@ -13,4 +13,10 @@ namespace sirius::ffi::testing {
 /// executing except through thread-safe members (`object_store_config`, `set_object_store`).
 void set_capture_pause_hook(std::function<void()> hook);
 
+/// Install a process-wide hook invoked before each in_transaction attempt, before conn_mutex is
+/// acquired. This includes execute_substrait, Fragment::build and Fragment::run; run uses its
+/// existing capture. The same installation and callback restrictions as the capture-pause hook
+/// apply. An empty hook clears the installed slot.
+void set_transaction_entry_hook(std::function<void()> hook);
+
 }  // namespace sirius::ffi::testing

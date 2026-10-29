@@ -34,13 +34,14 @@
 #include "duckdb/parser/statement/relation_statement.hpp"  // duckdb::RelationStatement
 #include "duckdb/planner/planner.hpp"                      // duckdb::Planner
 #include "exec/arrow_result_stream.hpp"
-#include "exec/stream_bind_catalog.hpp"       // sirius::exec::stream_bind_catalog
-#include "exec/stream_plan_bindings.hpp"      // sirius::exec::register_stream_source_function
-#include "exec/streaming_fragment.hpp"        // sirius::exec::streaming_fragment, fragment_spec
-#include "from_substrait.hpp"                 // duckdb::SubstraitToDuckDB (compiled into libsirius)
-#include "helper/type_conversions.hpp"        // sirius::from_duckdb
-#include "io/io_errors.hpp"                   // sirius::io::credential_error
-#include "io/rest/s3/endpoint.hpp"            // sirius::io::rest::s3::parse_endpoint
+#include "exec/stream_bind_catalog.hpp"   // sirius::exec::stream_bind_catalog
+#include "exec/stream_plan_bindings.hpp"  // sirius::exec::register_stream_source_function
+#include "exec/streaming_fragment.hpp"    // sirius::exec::streaming_fragment, fragment_spec
+#include "from_substrait.hpp"             // duckdb::SubstraitToDuckDB (compiled into libsirius)
+#include "helper/type_conversions.hpp"    // sirius::from_duckdb
+#include "io/io_errors.hpp"               // sirius::io::credential_error
+#include "io/rest/s3/endpoint.hpp"        // sirius::io::rest::s3::parse_endpoint
+#include "io/s3/scope_policy.hpp"
 #include "log/logging.hpp"                    // SIRIUS_LOG_INFO
 #include "parquet_extension.hpp"              // duckdb::ParquetExtension
 #include "planner/substrait_scan_ranges.hpp"  // sirius::planner::scan_byte_ranges_state
@@ -65,6 +66,7 @@
 #include <set>
 #include <stdexcept>
 #include <string_view>
+#include <utility>
 
 namespace sirius::ffi {
 
@@ -122,17 +124,23 @@ double elapsed_ms(std::chrono::steady_clock::time_point since)
 std::mutex capture_pause_mutex;
 std::shared_ptr<const std::function<void()>> capture_pause_hook;
 
+std::mutex transaction_entry_mutex;
+std::shared_ptr<const std::function<void()>> transaction_entry_hook;
+
 // Runs the installed hook (if any) outside the hook mutex, so the hook may itself install or
 // clear hooks or touch the Context's thread-safe members.
-void run_capture_pause_hook()
+void run_hook(std::mutex& mutex, std::shared_ptr<const std::function<void()>> const& slot)
 {
   std::shared_ptr<const std::function<void()>> hook;
   {
-    std::lock_guard lock(capture_pause_mutex);
-    hook = capture_pause_hook;
+    std::lock_guard lock(mutex);
+    hook = slot;
   }
   if (hook) { (*hook)(); }
 }
+
+void run_capture_pause_hook() { run_hook(capture_pause_mutex, capture_pause_hook); }
+void run_transaction_entry_hook() { run_hook(transaction_entry_mutex, transaction_entry_hook); }
 
 // --- ObjectStoreConfig checks ------------------------------------------------------------------
 //
@@ -186,6 +194,21 @@ void check_endpoint(const std::string& endpoint)
   }
 }
 
+// "s3://bucket/" or "s3://bucket/prefix/": scheme s3, a bucket, a trailing slash, no query. The
+// same rule admits a scope key to publication (put/set) and to removal (drop).
+void check_uri_prefix_shape(std::string_view prefix)
+{
+  constexpr std::string_view kScheme = "s3://";
+  if (prefix.substr(0, kScheme.size()) != kScheme || prefix.size() == kScheme.size() ||
+      prefix[kScheme.size()] == '/') {
+    invalid_field("uri_prefix", "must be s3://bucket/ or s3://bucket/prefix/");
+  }
+  if (prefix.back() != '/') { invalid_field("uri_prefix", "must end with '/'"); }
+  if (prefix.find_first_of("?#") != std::string_view::npos) {
+    invalid_field("uri_prefix", "must not contain a query or fragment");
+  }
+}
+
 void check_intrinsic(const ObjectStoreConfig& cfg)
 {
   check_endpoint(cfg.endpoint);
@@ -204,56 +227,11 @@ void check_intrinsic(const ObjectStoreConfig& cfg)
     std::ifstream bundle(cfg.ca_bundle_path);
     if (!bundle.good()) { invalid_field("ca_bundle_path", "file is not readable"); }
   }
-  if (!cfg.uri_prefix.empty()) {
-    // "s3://bucket/" or "s3://bucket/prefix/": scheme s3, a bucket, a trailing slash, no query.
-    constexpr std::string_view kScheme = "s3://";
-    std::string_view prefix{cfg.uri_prefix};
-    if (prefix.substr(0, kScheme.size()) != kScheme || prefix.size() == kScheme.size() ||
-        prefix[kScheme.size()] == '/') {
-      invalid_field("uri_prefix", "must be s3://bucket/ or s3://bucket/prefix/");
-    }
-    if (prefix.back() != '/') { invalid_field("uri_prefix", "must end with '/'"); }
-    if (prefix.find_first_of("?#") != std::string_view::npos) {
-      invalid_field("uri_prefix", "must not contain a query or fragment");
-    }
-  }
+  if (!cfg.uri_prefix.empty()) { check_uri_prefix_shape(cfg.uri_prefix); }
 }
 
-// Scheme-only canonicalization for prefix matching: bucket and key bytes compare exactly.
-std::string lowercase_scheme(std::string_view uri)
-{
-  std::string out{uri};
-  auto const sep = out.find("://");
-  if (sep == std::string::npos) { return out; }
-  for (std::size_t i = 0; i < sep; ++i) {
-    out[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(out[i])));
-  }
-  return out;
-}
-
-// With a namespace in force, an object key is matched byte-for-byte against the prefix, so a key
-// the transport or store could normalize to a different object (empty, `.` or `..` segments) or
-// decode (`%xx`) is refused rather than normalized: libcurl squashes dot segments after this
-// check, and S3 fronts differ on how they alias them.
-bool key_defeats_prefix_match(std::string_view path)
-{
-  auto const sep = path.find("://");
-  auto const bucket_end =
-    sep == std::string_view::npos ? std::string_view::npos : path.find('/', sep + 3);
-  if (bucket_end == std::string_view::npos) { return false; }
-  auto key = path.substr(bucket_end + 1);
-  // A configured namespace excludes empty keys and empty path segments, including a final one.
-  if (key.empty() || key.back() == '/') { return true; }
-  if (key.find('%') != std::string_view::npos) { return true; }
-  while (!key.empty()) {
-    auto const slash   = key.find('/');
-    auto const segment = key.substr(0, slash);
-    if (segment.empty() || segment == "." || segment == "..") { return true; }
-    if (slash == std::string_view::npos) { break; }
-    key.remove_prefix(slash + 1);
-  }
-  return false;
-}
+using sirius::io::s3::key_defeats_prefix_match;
+using sirius::io::s3::lowercase_scheme;
 
 // Identify an offending plan item in an error without echoing authentication material a URI can
 // carry: user-info, query (e.g. presigned X-Amz-* parameters) and fragment are dropped.
@@ -274,6 +252,32 @@ std::string redacted_uri(std::string_view uri)
   return out;
 }
 
+// The published snapshots, ordered longest uri_prefix first (the default scope, empty prefix,
+// last). Immutable once published: put/drop build a new set, so a captured set never changes.
+using ObjectStoreScopeSet = std::vector<std::shared_ptr<ObjectStoreConfig>>;
+
+// The snapshot serving `uri`: the first (longest) prefix the scheme-lowered URI starts with; the
+// default scope matches every URI. nullptr when nothing matches. A key the selected scoped
+// prefix cannot match byte-for-byte is refused outright, never retried against a shorter prefix
+// or the default, so the per-URI getter and the execution guard answer alike.
+std::shared_ptr<ObjectStoreConfig> resolve_scope(const ObjectStoreScopeSet& set,
+                                                 std::string_view uri)
+{
+  auto const lowered = lowercase_scheme(uri);
+  for (const auto& snapshot : set) {
+    if (snapshot->uri_prefix.empty() || lowered.starts_with(snapshot->uri_prefix)) {
+      if (!snapshot->uri_prefix.empty() && key_defeats_prefix_match(uri)) {
+        throw sirius::invalid_input_exception(
+          "object_store_scope: '{}' names a key segment that cannot be matched against the "
+          "selected uri_prefix",
+          redacted_uri(uri));
+      }
+      return snapshot;
+    }
+  }
+  return nullptr;
+}
+
 // A plan that reads from an object store is refused here, before DuckDB's consumer can bind the
 // read: without a snapshot there is nothing to serve it with; outside the snapshot's namespace
 // the read is out of scope; and until the native object-store route lands, a configured context
@@ -281,24 +285,21 @@ std::string redacted_uri(std::string_view uri)
 // is named in redacted form; no secret lookup and no network access happen. Each message starts
 // with a stable reason token.
 void refuse_remote_reads(const std::vector<std::string>& remote_paths,
-                         const std::shared_ptr<ObjectStoreConfig>& snapshot)
+                         const ObjectStoreScopeSet& set)
 {
   if (remote_paths.empty()) { return; }
-  if (!snapshot) {
+  if (set.empty()) {
     throw sirius::invalid_input_exception(
       "object_store_unconfigured: the plan reads '{}' from an object store, but this Context "
       "has no object-store snapshot (Context::set_object_store)",
       redacted_uri(remote_paths.front()));
   }
-  if (!snapshot->uri_prefix.empty()) {
-    for (const auto& path : remote_paths) {
-      if (!lowercase_scheme(path).starts_with(snapshot->uri_prefix) ||
-          key_defeats_prefix_match(path)) {
-        throw sirius::invalid_input_exception(
-          "object_store_scope: the plan reads '{}', outside the snapshot's uri_prefix (or with a "
-          "key segment that cannot be matched against it)",
-          redacted_uri(path));
-      }
+  // Every item is checked before any is served: a plan is refused whole.
+  for (const auto& path : remote_paths) {
+    if (!resolve_scope(set, path)) {
+      throw sirius::invalid_input_exception(
+        "object_store_scope: the plan reads '{}', outside every published uri_prefix",
+        redacted_uri(path));
     }
   }
   throw sirius::invalid_input_exception(
@@ -333,11 +334,11 @@ void check_object_store(const ObjectStoreConfig& cfg,
   check_backend_support(cfg, scan_manager);
 }
 
-// Lower a Substrait plan to a bound+optimized DuckDB LogicalOperator. `snapshot` is the
-// object-store snapshot the execution captured when its binding began (null = none).
+// Lower a Substrait plan to a bound+optimized DuckDB LogicalOperator. `scopes` is the set of
+// object-store snapshots the execution captured when its binding began (empty = none).
 sirius::exec::bound_plan lower_substrait(duckdb::Connection& conn,
                                          const std::string& substrait_plan,
-                                         const std::shared_ptr<ObjectStoreConfig>& snapshot)
+                                         const ObjectStoreScopeSet& scopes)
 {
   auto& client = *conn.context;
 
@@ -348,7 +349,7 @@ sirius::exec::bound_plan lower_substrait(duckdb::Connection& conn,
   // plan's remote reads, which are refused or scoped before anything binds them.
   client.registered_state->Remove(sirius::planner::scan_byte_ranges_state::kStateKey);
   auto inputs = sirius::planner::inspect_scan_plan_inputs(substrait_plan);
-  refuse_remote_reads(inputs.remote_paths, snapshot);
+  refuse_remote_reads(inputs.remote_paths, scopes);
   if (!inputs.byte_ranges.empty()) {
     client.registered_state->Insert(
       sirius::planner::scan_byte_ranges_state::kStateKey,
@@ -388,6 +389,7 @@ sirius::exec::bound_plan lower_substrait(duckdb::Connection& conn,
 template <typename Body>
 void in_transaction(std::mutex& serial, duckdb::Connection& conn, Body&& body)
 {
+  run_transaction_entry_hook();
   std::lock_guard<std::mutex> lock(serial);
   conn.BeginTransaction();
   try {
@@ -412,17 +414,56 @@ struct Context::Impl {
   duckdb::unique_ptr<duckdb::Connection> conn;
   // Serializes transactions on `conn`; see in_transaction().
   std::mutex conn_mutex;
-  // Current configuration, atomically replaced under its own mutex. Executions already
-  // capture an owning copy before binding; object-store I/O routing is not implemented here.
+  // The published scope set, replaced as a whole under its own mutex (copy-on-write). An
+  // execution captures the current set when its binding begins, inside the connection
+  // transaction; object-store I/O routing is not implemented here. Writers additionally hold
+  // object_store_update_mutex across copy, edit and publish, so concurrent put/drop/set compose
+  // like sequential ones; captures and getters never take it. Lock order: update, then
+  // object_store_mutex; neither is held while conn_mutex is taken.
+  std::mutex object_store_update_mutex;
   mutable std::mutex object_store_mutex;
-  std::shared_ptr<ObjectStoreConfig> object_store;
+  std::shared_ptr<const ObjectStoreScopeSet> object_store =
+    std::make_shared<const ObjectStoreScopeSet>();
 
-  // The snapshot an execution captures when its binding begins: one owning copy per
-  // execution, unaffected by later set_object_store() calls.
-  std::shared_ptr<ObjectStoreConfig> capture_object_store() const
+  std::shared_ptr<const ObjectStoreScopeSet> capture_object_store() const
   {
     std::lock_guard lock(object_store_mutex);
     return object_store;
+  }
+
+  // Replace the publication by `make(current)`; `make` returns null to leave it unchanged.
+  // The retired set is released only after both locks are gone, and callers keep an owner of
+  // any incoming configuration outside this call (`make` works on copies), so a caller-supplied
+  // deleter can never run under a mutex a getter or another writer takes, neither for a retired
+  // set nor for a candidate whose construction failed. Returns whether a new set was published.
+  template <typename Make>
+  bool update_object_store(Make&& make)
+  {
+    std::shared_ptr<const ObjectStoreScopeSet> retired;
+    {
+      std::lock_guard update(object_store_update_mutex);
+      std::shared_ptr<const ObjectStoreScopeSet> next = make(*capture_object_store());
+      if (!next) { return false; }
+      std::lock_guard lock(object_store_mutex);
+      object_store.swap(next);
+      retired = std::move(next);
+    }
+    return true;
+  }
+
+  // A sorted copy of `current` with `key` replaced by `cfg` (or removed when null).
+  static std::shared_ptr<const ObjectStoreScopeSet> with_scope(
+    const ObjectStoreScopeSet& current,
+    std::string_view key,
+    std::shared_ptr<ObjectStoreConfig> cfg)
+  {
+    auto next = std::make_shared<ObjectStoreScopeSet>(current);
+    std::erase_if(*next, [&](const auto& s) { return s->uri_prefix == key; });
+    if (cfg) { next->push_back(std::move(cfg)); }
+    std::stable_sort(next->begin(), next->end(), [](const auto& a, const auto& b) {
+      return a->uri_prefix.size() > b->uri_prefix.size();
+    });
+    return next;
   }
 
   void bring_up(const sirius::parsed_sirius_config& config)
@@ -491,20 +532,57 @@ Context::Context(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 
 std::shared_ptr<ObjectStoreConfig> Context::object_store_config() const
 {
-  std::lock_guard lock(impl_->object_store_mutex);
-  return impl_->object_store;
+  auto const set = impl_->capture_object_store();
+  // Single-snapshot use (set_object_store) returns the supplied pointer whatever its prefix;
+  // with several scopes published, the default scope is the one this getter names.
+  if (set->size() == 1) { return set->front(); }
+  for (const auto& snapshot : *set) {
+    if (snapshot->uri_prefix.empty()) { return snapshot; }
+  }
+  return nullptr;
+}
+
+std::shared_ptr<ObjectStoreConfig> Context::object_store_config_for(std::string_view uri) const
+{
+  auto const set = impl_->capture_object_store();
+  return resolve_scope(*set, uri);
+}
+
+void Context::put_object_store(std::shared_ptr<ObjectStoreConfig> cfg) const
+{
+  if (!cfg) { throw std::invalid_argument("object_store: put_object_store requires a snapshot"); }
+  check_object_store(*cfg, impl_->context->get_config().get_scan_manager_config());
+  std::string const key = cfg->uri_prefix;
+  impl_->update_object_store(
+    [&](const ObjectStoreScopeSet& current) { return Impl::with_scope(current, key, cfg); });
+  SIRIUS_LOG_INFO("[sirius_ffi] object store snapshot published for {} scope",
+                  key.empty() ? "the default" : "a prefixed");
+}
+
+void Context::drop_object_store(std::string_view uri_prefix) const
+{
+  if (!uri_prefix.empty()) { check_uri_prefix_shape(uri_prefix); }
+  bool const dropped = impl_->update_object_store(
+    [&](const ObjectStoreScopeSet& current) -> std::shared_ptr<const ObjectStoreScopeSet> {
+      bool const present = std::any_of(
+        current.begin(), current.end(), [&](const auto& s) { return s->uri_prefix == uri_prefix; });
+      return present ? Impl::with_scope(current, uri_prefix, nullptr) : nullptr;
+    });
+  if (dropped) {
+    SIRIUS_LOG_INFO("[sirius_ffi] object store snapshot dropped for {} scope",
+                    uri_prefix.empty() ? "the default" : "a prefixed");
+  }
 }
 
 void Context::set_object_store(std::shared_ptr<ObjectStoreConfig> cfg) const
 {
   if (cfg) { check_object_store(*cfg, impl_->context->get_config().get_scan_manager_config()); }
   bool const published = cfg != nullptr;
-  {
-    std::lock_guard lock(impl_->object_store_mutex);
-    // swap, not assign: the retired snapshot (now in `cfg`) is released after the lock, so a
-    // caller-supplied deleter can never run under the mutex the getter takes.
-    impl_->object_store.swap(cfg);
-  }
+  impl_->update_object_store([&](const ObjectStoreScopeSet&) {
+    auto next = std::make_shared<ObjectStoreScopeSet>();
+    if (cfg) { next->push_back(cfg); }
+    return next;
+  });
   SIRIUS_LOG_INFO("[sirius_ffi] object store snapshot {}", published ? "published" : "cleared");
 }
 
@@ -539,14 +617,17 @@ void Context::execute_substrait(const std::string& plan, std::uintptr_t out_stre
   // Phase timings (lowering / physical planning / GPU execution), logged per query: the embedder
   // only sees the total, and the query window in the telemetry covers execution alone.
   double lower_ms = 0, plan_ms = 0, execute_ms = 0;
-  auto const snapshot = impl_->capture_object_store();
-  run_capture_pause_hook();
+  std::shared_ptr<const ObjectStoreScopeSet> snapshot;
   in_transaction(impl_->conn_mutex, *impl_->conn, [&] {
+    // Captured once the transaction is held and before any binding consumes credentials: a
+    // call still queued before this boundary may observe a later publication.
+    snapshot = impl_->capture_object_store();
+    run_capture_pause_hook();
     // The same result path as a zero-output Fragment.
     sirius::exec::fragment_spec spec;
     spec.plan_source = [&](duckdb::ClientContext&) {
       auto const lower_started = std::chrono::steady_clock::now();
-      auto bound               = lower_substrait(*impl_->conn, plan, snapshot);
+      auto bound               = lower_substrait(*impl_->conn, plan, *snapshot);
       lower_ms                 = elapsed_ms(lower_started);
       return bound;
     };
@@ -587,7 +668,11 @@ std::unique_ptr<Context> make_context_from_config(const std::string& config_path
   if (cfg) { check_object_store(*cfg, config.get_scan_manager_config()); }
   auto impl = std::make_unique<Context::Impl>();
   impl->bring_up(config);
-  impl->object_store = std::move(cfg);
+  if (cfg) {
+    auto set = std::make_shared<ObjectStoreScopeSet>();
+    set->push_back(std::move(cfg));
+    impl->object_store = std::move(set);
+  }
   return std::unique_ptr<Context>(new Context(std::move(impl)));
 }
 
@@ -617,8 +702,9 @@ struct Fragment::Impl {
 
   // One streaming_fragment for both terminals. Empty outputs is a RESULT_COLLECTOR.
   std::unique_ptr<sirius::exec::streaming_fragment> fragment;
-  // Object-store snapshot captured at build() for this execution; null = none.
-  std::shared_ptr<ObjectStoreConfig> object_store;
+  // Scope set captured for this execution. An empty set is unconfigured; a null handle
+  // means no capture has been stored.
+  std::shared_ptr<const ObjectStoreScopeSet> object_store;
 
   void require_not_built(const char* what) const
   {
@@ -734,17 +820,22 @@ void Fragment::build(const std::string& substrait_plan)
   impl_->require_not_built("build");
 
   std::unique_ptr<sirius::exec::streaming_fragment> fragment;
-  impl_->object_store = impl_->ctx.capture_object_store();
-  run_capture_pause_hook();
+  // The attempt owns its capture and its partial fragment: both outlive the transaction below
+  // and are committed to the Fragment only after it succeeds, so a failed attempt never leaves
+  // a stored capture behind and nothing captured earlier is released under conn_mutex.
+  std::shared_ptr<const ObjectStoreScopeSet> captured;
   // Type-name parsing, CREATE VIEW, and Substrait lowering all need an active transaction. A
   // failure rolls back the views, so a half-declared fragment leaves nothing behind.
   in_transaction(impl_->ctx.conn_mutex, *impl_->ctx.conn, [&] {
+    // Captured once the transaction is held and before any binding consumes credentials.
+    captured = impl_->ctx.capture_object_store();
+    run_capture_pause_hook();
     sirius::exec::fragment_spec spec;
     spec.inputs      = impl_->resolve_inputs();
     spec.outputs     = impl_->outputs;
-    spec.plan_source = [this, &substrait_plan](duckdb::ClientContext&) {
+    spec.plan_source = [this, &substrait_plan, captured](duckdb::ClientContext&) {
       impl_->create_stream_views();
-      return lower_substrait(*impl_->ctx.conn, substrait_plan, impl_->object_store);
+      return lower_substrait(*impl_->ctx.conn, substrait_plan, *captured);
     };
     // streaming_fragment rejects a partition mode on fewer than two outputs.
     if (impl_->broadcast_outputs) {
@@ -763,7 +854,8 @@ void Fragment::build(const std::string& substrait_plan)
                                                                   std::move(spec));
     fragment->build();
   });
-  impl_->fragment = std::move(fragment);
+  impl_->object_store = std::move(captured);
+  impl_->fragment     = std::move(fragment);
 }
 
 std::size_t Fragment::relay_from(Fragment& source,
@@ -849,6 +941,16 @@ void set_capture_pause_hook(std::function<void()> hook)
     capture_pause_hook.swap(replacement);
   }
   // `replacement` now owns the retired callable and releases it here, after the lock.
+}
+
+void set_transaction_entry_hook(std::function<void()> hook)
+{
+  auto next = hook ? std::make_shared<const std::function<void()>>(std::move(hook)) : nullptr;
+  std::shared_ptr<const std::function<void()>> retired;
+  {
+    std::lock_guard lock(transaction_entry_mutex);
+    retired = std::exchange(transaction_entry_hook, std::move(next));
+  }
 }
 
 }  // namespace testing

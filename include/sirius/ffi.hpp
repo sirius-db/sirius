@@ -32,6 +32,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #ifndef SIRIUS_FFI_EXPORT
@@ -115,11 +116,23 @@ class SIRIUS_FFI_EXPORT Context {
   /// released; its last release can tear down the engine on the releasing thread.
   void execute_substrait(const std::string& plan, std::uintptr_t out_stream_addr);
 
-  /// The current object-store snapshot, or nullptr when the context has none. Thread-safe. A
+  /// The current snapshot when exactly one is published (whatever its `uri_prefix`), otherwise
+  /// the default-scope snapshot (empty `uri_prefix`) or nullptr when none. Thread-safe. A
   /// returned snapshot stays valid and unchanged after a later replacement.
   [[nodiscard]] std::shared_ptr<ObjectStoreConfig> object_store_config() const;
 
-  /// Atomically replace the current object-store snapshot; nullptr clears it. Checks `cfg`
+  /// The published snapshot that would serve `uri`: the one with the longest `uri_prefix` the
+  /// URI starts with (scheme compared case-insensitively, the rest byte-exact; the default scope
+  /// matches any URI — which schemes a route supports is decided by the route), or nullptr when
+  /// none matches. Administrative observation only: executions resolve against the set they
+  /// captured when their binding began. Thread-safe.
+  /// @throws std::runtime_error (`object_store_scope:`) when the selected non-default scope
+  /// cannot serve the key: an empty, `.` or `..` segment or a `%` byte.
+  [[nodiscard]] std::shared_ptr<ObjectStoreConfig> object_store_config_for(
+    std::string_view uri) const;
+
+  /// Atomically replace every published snapshot with `cfg` alone (its `uri_prefix` names the
+  /// scope); nullptr clears all scopes. Checks `cfg`
   /// (required fields non-empty, endpoint shape, `transport`/`signing_mode` value sets,
   /// `ca_bundle_path` readable, `uri_prefix` shape) and that the configured IO backend honors
   /// every option — an option the backend would ignore is refused, nothing is silently dropped.
@@ -131,6 +144,18 @@ class SIRIUS_FFI_EXPORT Context {
   /// @throws std::invalid_argument naming the offending field; the message never carries a
   ///         field value.
   void set_object_store(std::shared_ptr<ObjectStoreConfig> cfg) const;
+
+  /// Publish `cfg` for the scope named by its `uri_prefix` (exact bytes; empty = the default
+  /// scope), atomically replacing a snapshot already published for that key and leaving other
+  /// keys unchanged. Same checks as set_object_store(). Executions that already captured their
+  /// set are unaffected. Thread-safe.
+  /// @throws std::invalid_argument for a null `cfg` or an offending field (never a value).
+  void put_object_store(std::shared_ptr<ObjectStoreConfig> cfg) const;
+
+  /// Remove the snapshot published for `uri_prefix` (exact bytes; empty = the default scope);
+  /// no-op when none is published for it. Thread-safe.
+  /// @throws std::invalid_argument for a malformed prefix (never a value); the set is unchanged.
+  void drop_object_store(std::string_view uri_prefix) const;
 
  private:
   struct Impl;
