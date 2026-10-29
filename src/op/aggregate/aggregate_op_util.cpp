@@ -26,6 +26,7 @@
 #include <cudf/fixed_point/fixed_point.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
+#include <cudf/sorting.hpp>
 #include <cudf/unary.hpp>
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/pinned_memory.hpp>
@@ -45,6 +46,12 @@
 
 namespace sirius {
 namespace op {
+
+bool keys_ascending(cudf::column_view const& keys, ::cuda::stream_ref stream)
+{
+  return cudf::is_sorted(
+    cudf::table_view({keys}), {cudf::order::ASCENDING}, {cudf::null_order::AFTER}, stream);
+}
 
 namespace {
 

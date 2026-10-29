@@ -7,6 +7,7 @@ target_sources(
           merge/gpu_merge_impl.cpp
           order/gpu_order_impl.cpp
           partition/gpu_partition_impl.cpp
+          partition/stable_hash_partition.cpp
           partition/partition_exchange.cpp
           partition/consumer_partition_policy.cpp
           dynamic_filter/hash_join_partition_observer.cpp

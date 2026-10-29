@@ -155,7 +155,7 @@ Two fast paths live inside the dense path. When every slot in the domain is occu
 
 **Motivation:** cuDF's hash group-by pays for a hash table and global atomics even when a batch's keys are already in order. TPC-H q18 groups lineitem by `l_orderkey`, which a table pinned in key order delivers sorted, with about four rows per key; the per-batch partial aggregation was 631 ms of q18's kernel time at SF1000.
 
-**Mechanism:** Before building the `cudf::groupby` object, `grouped_aggregate_table()` checks whether the batch has a single fixed-width, null-free, non-dictionary key and no COLLECT_SET aggregate. If so, it verifies with `keys_ascending()` (`src/cuda/sorted_keys.cu`) that the key is ascending and, when it is, constructs the group-by with `cudf::sorted::YES`, so cuDF finds runs of equal keys and reduces each run instead of hashing. The check runs on every eligible batch; an unsorted batch keeps the hash path, so correctness never depends on the data layout. For a null-free integer, boolean, timestamp, duration or fixed-point key, the check is one typed pass that compares adjacent values, which is cheaper than `cudf::is_sorted`'s generic row comparator (TPC-H SF1000 q18: 24 ms). Floating-point and nullable keys use `cudf::is_sorted`. When the keys are verified sorted, the stable STDDEV_SAMP path skips its own sort. Keys of parquet tables are sorted in practice when the table was pinned in key order (see [Natural-Order Parquet Pinning](#natural-order-parquet-pinning)).
+**Mechanism:** Before building the `cudf::groupby` object, `grouped_aggregate_table()` checks whether the batch has a single fixed-width, null-free, non-dictionary key and no COLLECT_SET aggregate. If so, it verifies with `keys_ascending()` (`cudf::is_sorted`) that the key is ascending and, when it is, constructs the group-by with `cudf::sorted::YES`, so cuDF finds runs of equal keys and reduces each run instead of hashing. The check runs on every eligible batch; an unsorted batch keeps the hash path, so correctness never depends on the data layout. When the keys are verified sorted, the stable STDDEV_SAMP path skips its own sort. Keys of parquet tables are sorted in practice when the table was pinned in key order (see [Natural-Order Parquet Pinning](#natural-order-parquet-pinning)).
 
 **Code path:** `src/op/aggregate/gpu_aggregate_impl.cpp` — `grouped_aggregate_table()`
 
@@ -165,16 +165,16 @@ Two fast paths live inside the dense path. When every slot in the domain is occu
 
 **Motivation:** After a sorted-key partial aggregation, each partial result is sorted, and with a table pinned in key order the partials cover consecutive key ranges. `cudf::hash_partition` scatters rows without keeping their order, so the merge still had to hash and re-aggregate everything (q18: 352 ms of merge kernels at SF1000).
 
-**Mechanism:** Two parts behind one option, so every producer and consumer agree on each key's partition:
-1. **Partition:** `stable_hash_partition()` assigns rows to partitions by MurmurHash3 row hash modulo the partition count, but keeps the input order within each partition (stable radix sort of partition id and row index, then a gather). PARTITION and the partitioned streaming sink read the option from the query's operator-options snapshot, so every hash partition of a query switches together.
+**Mechanism:** Both parts decide from the data, so there is no setting:
+1. **Partition:** `gpu_partition_impl::hash_partition()` checks whether a single INT64 partition key is ascending. If so it uses `stable_hash_partition()` (`cudf::stable_sorted_order` of the partition ids, then a gather), which keeps the input order within each partition. Otherwise it uses `unordered_hash_partition()` (`cudf::partition` by the same ids). Both assign a row to the MurmurHash3 row hash modulo the partition count, so batches of one input may take either path and every key still lands in one partition.
 2. **Merge:** for a single INT64 group key, `merge_grouped_aggregate()` orders the incoming partials by their first key before concatenating, verifies the concatenation with `keys_ascending()`, and uses the sorted-keys group-by when the check passes. Any other input keeps the hash merge.
 
 **Code path:**
-- `src/cuda/stable_hash_partition.cu`, `src/op/partition/stable_hash_partition.hpp` — order-preserving partition
-- `src/op/partition/gpu_partition_impl.cpp` — dispatch in `hash_partition()`
+- `src/op/partition/stable_hash_partition.cpp` — the two partitions
+- `src/op/partition/gpu_partition_impl.cpp` — the choice in `hash_partition()`
 - `src/op/merge/gpu_merge_impl.cpp` — `merge_grouped_aggregate()`
 
-**Config:** `enable_order_preserving_partition` (default: `true`, under `sirius.operator_params`; see [Configuration](configuration.md#operator-parameters)). TPC-H SF1000 on a GB300, on top of the sorted-key aggregation: q18 0.830 s → 0.639 s; no other query moved by more than run-to-run noise.
+**Config:** None. TPC-H SF1000 on a GB300, on top of the sorted-key aggregation: q18 0.830 s → 0.639 s; no other query moved by more than run-to-run noise.
 
 ### Distinct Hash Join (PR #558)
 
@@ -377,7 +377,7 @@ result materialization restore native carriers.
 
 **Code path:** `src/sirius_extension.cpp` — pin file list; `src/helper/natural_sort.hpp` — `natural_less()`
 
-**Config:** Always on. On its own it changes little; it lets the sorted aggregation paths apply, with which all 39 q18 batches are sorted.
+**Config:** Always on. On its own it changes little; it lets the sorted aggregation paths apply, with which all 39 q18 batches are sorted. Without it q18 takes 1.21 s instead of 0.57 s (SF1000, GB300).
 
 ### Late Materialization (unreleased, experimental)
 

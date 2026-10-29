@@ -129,3 +129,22 @@ TEST_CASE("stable_hash_partition handles a table with no rows",
   CHECK(partitioned->num_rows() == 0);
   CHECK(offsets == std::vector<cudf::size_type>{0, 0, 0});
 }
+
+TEST_CASE("unordered_hash_partition places every key where stable_hash_partition does",
+          "[partition][stable_hash_partition]")
+{
+  // Batches of one input may take either path, so both must agree on each key's partition.
+  auto const table            = make_table(60'000, 3'000, 3);
+  auto const stable_placement = partition_and_check(table->view(), 5);
+  auto [partitioned, offsets] = sirius::op::unordered_hash_partition(
+    table->view(), {0}, 5, cudf::get_default_stream(), cudf::get_current_device_resource_ref());
+  REQUIRE(partitioned->num_rows() == table->view().num_rows());
+  REQUIRE(offsets.size() == 5);
+  auto const keys = to_host<int64_t>(partitioned->get_column(0));
+  for (int partition = 0; partition < 5; ++partition) {
+    auto const end = partition + 1 < 5 ? offsets[partition + 1] : partitioned->num_rows();
+    for (auto row = offsets[partition]; row < end; ++row) {
+      CHECK(stable_placement.at(keys[row]) == partition);
+    }
+  }
+}

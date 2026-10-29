@@ -21,8 +21,7 @@
 #include "scan/test_utils.hpp"
 #include "utils/utils.hpp"
 
-#include <cudf/filling.hpp>
-#include <cudf/scalar/scalar.hpp>
+#include <cudf/column/column_factories.hpp>
 
 #include <cucascade/memory/memory_space.hpp>
 
@@ -172,52 +171,95 @@ TEST_CASE("Hash partition basic", "[operator][hash_partition]")
   validate_hash_partition(*input_batch, output_batches, num_partitions);
 }
 
-TEST_CASE("Hash partition keeps the input order when asked", "[operator][hash_partition]")
-{
-  auto* mem_space                           = get_shared_mem_space();
-  constexpr int num_input_rows              = 1000;
-  constexpr int num_partitions              = 4;
-  std::vector<cudf::data_type> column_types = {cudf::data_type{cudf::type_id::INT64},
-                                               cudf::data_type{cudf::type_id::INT32}};
-  // Column 0 is replaced with the row index below, so its range does not matter.
-  std::vector<std::optional<std::pair<int, int>>> ranges = {std::nullopt, std::pair{0, 50}};
-  auto random_batch =
-    create_batch_with_random_data(num_input_rows, column_types, ranges, *mem_space);
-  auto stream = cudf::get_default_stream();
-  auto row_index =
-    cudf::sequence(num_input_rows, cudf::numeric_scalar<int64_t>(0, true, stream), stream);
-  std::vector<std::unique_ptr<cudf::column>> columns;
-  columns.push_back(std::move(row_index));
-  columns.push_back(
-    std::make_unique<cudf::column>(sirius::get_cudf_table_view(*random_batch).column(1), stream));
-  auto input_batch = sirius::make_data_batch(std::make_unique<cudf::table>(std::move(columns)),
-                                             *mem_space,
-                                             stream,
-                                             sirius::telemetry::batch_telemetry_info{});
+namespace {
 
+/// A batch of [key INT64, row INT64] where key = row / 5, in ascending or descending row order.
+std::shared_ptr<data_batch> make_key_row_batch(int num_rows,
+                                               bool descending,
+                                               memory_space& mem_space)
+{
+  std::vector<int64_t> keys;
+  std::vector<int64_t> rows;
+  for (int i = 0; i < num_rows; ++i) {
+    int const row = descending ? num_rows - 1 - i : i;
+    keys.push_back(row / 5);
+    rows.push_back(row);
+  }
+  auto stream = cudf::get_default_stream();
+  auto make   = [&](std::vector<int64_t> const& values) {
+    auto column = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT64},
+                                            num_rows,
+                                            cudf::mask_state::UNALLOCATED,
+                                            stream,
+                                            mem_space.get_default_allocator());
+    cudaMemcpyAsync(column->mutable_view().data<int64_t>(),
+                    values.data(),
+                    values.size() * sizeof(int64_t),
+                    cudaMemcpyHostToDevice,
+                    stream.get());
+    stream.sync();
+    return column;
+  };
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(make(keys));
+  columns.push_back(make(rows));
+  return sirius::make_data_batch(std::make_unique<cudf::table>(std::move(columns)),
+                                 mem_space,
+                                 stream,
+                                 sirius::telemetry::batch_telemetry_info{});
+}
+
+/// Partitions @p batch by column 0 and returns, per partition, its rows as [key, row].
+std::vector<std::vector<std::vector<int64_t>>> partition_by_key(data_batch& batch,
+                                                                int num_partitions,
+                                                                memory_space& mem_space)
+{
   std::vector<std::shared_ptr<data_batch>> output_batches;
   {
-    auto ro        = input_batch->to_read_only();
-    output_batches = gpu_partition_impl::hash_partition(ro,
-                                                        /*partition_key_idx=*/{1},
-                                                        /*partition_key_cast_types=*/{},
-                                                        num_partitions,
-                                                        /*preserve_input_order=*/true,
-                                                        stream,
-                                                        *mem_space);
+    auto ro        = batch.to_read_only();
+    output_batches = gpu_partition_impl::hash_partition(
+      ro, {0}, num_partitions, cudf::get_default_stream(), mem_space);
   }
-  validate_hash_partition(*input_batch, output_batches, num_partitions);
+  validate_hash_partition(batch, output_batches, num_partitions);
+  std::vector<std::vector<std::vector<int64_t>>> partitions(num_partitions);
+  for (int partition_idx = 0; partition_idx < num_partitions; ++partition_idx) {
+    copy_data_to_host_by_rows(sirius::get_cudf_table_view(*output_batches[partition_idx]),
+                              partitions[partition_idx]);
+  }
+  return partitions;
+}
 
+}  // namespace
+
+TEST_CASE("Hash partition keeps the order of a sorted key and places keys consistently",
+          "[operator][hash_partition]")
+{
+  auto* mem_space              = get_shared_mem_space();
+  constexpr int num_input_rows = 1000;
+  constexpr int num_partitions = 4;
+
+  // A sorted key takes the order-preserving path: rows stay in input order within a partition.
+  auto sorted_batch = make_key_row_batch(num_input_rows, /*descending=*/false, *mem_space);
+  auto sorted       = partition_by_key(*sorted_batch, num_partitions, *mem_space);
   std::map<int64_t, int> partition_of_key;
   for (int partition_idx = 0; partition_idx < num_partitions; ++partition_idx) {
-    std::vector<std::vector<int64_t>> rows;
-    copy_data_to_host_by_rows(sirius::get_cudf_table_view(*output_batches[partition_idx]), rows);
+    auto const& rows = sorted[partition_idx];
     for (std::size_t row_idx = 1; row_idx < rows.size(); ++row_idx) {
-      REQUIRE(rows[row_idx - 1][0] < rows[row_idx][0]);
+      REQUIRE(rows[row_idx - 1][1] < rows[row_idx][1]);
     }
     for (auto const& row : rows) {
-      auto const [it, inserted] = partition_of_key.emplace(row[1], partition_idx);
+      auto const [it, inserted] = partition_of_key.emplace(row[0], partition_idx);
       REQUIRE(it->second == partition_idx);
+    }
+  }
+
+  // A descending key takes the unordered path, but each key must land in the same partition as
+  // in the sorted batch: batches of one input may take different paths.
+  auto descending_batch = make_key_row_batch(num_input_rows, /*descending=*/true, *mem_space);
+  auto descending       = partition_by_key(*descending_batch, num_partitions, *mem_space);
+  for (int partition_idx = 0; partition_idx < num_partitions; ++partition_idx) {
+    for (auto const& row : descending[partition_idx]) {
+      REQUIRE(partition_of_key.at(row[0]) == partition_idx);
     }
   }
 }

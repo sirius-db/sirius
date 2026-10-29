@@ -20,7 +20,6 @@
 #include "log/logging.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/aggregate/group_key_labels.hpp"
-#include "op/aggregate/sorted_keys.hpp"
 #include "op/aggregate/stddev.hpp"
 
 #include <cudf/column/column_factories.hpp>

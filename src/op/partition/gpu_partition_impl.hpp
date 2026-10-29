@@ -53,9 +53,6 @@ class gpu_partition_impl {
    * @param partition_key_idx Column ids of the partitioning columns.
    * @param partition_key_cast_types Per-key target types for the partition hash.
    * @param num_partitions Number of partitions.
-   * @param preserve_input_order Whether rows keep their input order within each partition. Every
-   * producer feeding one consumer must pass the same value, because the two orders do not
-   * guarantee the same partition for a key.
    * @param stream CUDA stream used for device memory operations and kernel launches.
    * @param memory_space The memory space used to allocate memory for the output data batch.
    *
@@ -66,13 +63,11 @@ class gpu_partition_impl {
     const std::vector<int>& partition_key_idx,
     const std::vector<cudf::data_type>& partition_key_cast_types,
     int num_partitions,
-    bool preserve_input_order,
     ::cuda::stream_ref stream,
     cucascade::memory::memory_space& memory_space,
     const telemetry::batch_telemetry_info& telemetry_info = {});
 
-  /// Overload without cast types (all keys hashed as-is) that does not preserve the input order.
-  /// Kept for backward compatibility.
+  /// Overload without cast types (all keys hashed as-is). Kept for backward compatibility.
   static std::vector<std::shared_ptr<cucascade::data_batch>> hash_partition(
     const cucascade::read_only_data_batch& input,
     const std::vector<int>& partition_key_idx,
@@ -81,14 +76,8 @@ class gpu_partition_impl {
     cucascade::memory::memory_space& memory_space,
     const telemetry::batch_telemetry_info& telemetry_info = {})
   {
-    return hash_partition(input,
-                          partition_key_idx,
-                          {},
-                          num_partitions,
-                          /*preserve_input_order=*/false,
-                          stream,
-                          memory_space,
-                          telemetry_info);
+    return hash_partition(
+      input, partition_key_idx, {}, num_partitions, stream, memory_space, telemetry_info);
   }
 
   /**

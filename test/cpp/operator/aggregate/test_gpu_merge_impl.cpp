@@ -713,13 +713,8 @@ TEST_CASE("Grouped merge aggregate of min/max/count/sum", "[operator][merge_grou
   for (auto& b : input.batches) {
     ro_batches.push_back(b->to_read_only());
   }
-  bool const try_sorted_keys = GENERATE(false, true);
-  auto output_batch          = gpu_merge_impl::merge_grouped_aggregate(ro_batches,
-                                                              group_idx.size(),
-                                                              aggregates,
-                                                              try_sorted_keys,
-                                                              cudf::get_default_stream(),
-                                                              *mem_space);
+  auto output_batch = gpu_merge_impl::merge_grouped_aggregate(
+    ro_batches, group_idx.size(), aggregates, cudf::get_default_stream(), *mem_space);
   ro_batches.clear();
   validate_grouped_aggregate(input.batches, *output_batch, group_idx.size(), aggregates);
 }
@@ -749,12 +744,8 @@ TEST_CASE("Grouped merge aggregate with invalid input", "[operator][merge_groupe
     for (auto& b : input.batches) {
       ro.push_back(b->to_read_only());
     }
-    REQUIRE_THROWS_AS(gpu_merge_impl::merge_grouped_aggregate(ro,
-                                                              group_idx.size(),
-                                                              aggregates,
-                                                              /*try_sorted_keys=*/true,
-                                                              cudf::get_default_stream(),
-                                                              *mem_space),
+    REQUIRE_THROWS_AS(gpu_merge_impl::merge_grouped_aggregate(
+                        ro, group_idx.size(), aggregates, cudf::get_default_stream(), *mem_space),
                       std::runtime_error);
   }
 
@@ -769,12 +760,8 @@ TEST_CASE("Grouped merge aggregate with invalid input", "[operator][merge_groupe
     for (auto& b : input2.batches) {
       ro.push_back(b->to_read_only());
     }
-    REQUIRE_THROWS_AS(gpu_merge_impl::merge_grouped_aggregate(ro,
-                                                              group_idx.size(),
-                                                              aggregates,
-                                                              /*try_sorted_keys=*/true,
-                                                              cudf::get_default_stream(),
-                                                              *mem_space),
+    REQUIRE_THROWS_AS(gpu_merge_impl::merge_grouped_aggregate(
+                        ro, group_idx.size(), aggregates, cudf::get_default_stream(), *mem_space),
                       std::runtime_error);
   }
 }
@@ -810,13 +797,8 @@ TEST_CASE("Grouped merge aggregate with empty local aggregate results",
   for (auto& b : input.batches) {
     ro_batches.push_back(b->to_read_only());
   }
-  bool const try_sorted_keys = GENERATE(false, true);
-  auto output_batch          = gpu_merge_impl::merge_grouped_aggregate(ro_batches,
-                                                              group_idx.size(),
-                                                              aggregates,
-                                                              try_sorted_keys,
-                                                              cudf::get_default_stream(),
-                                                              *mem_space);
+  auto output_batch = gpu_merge_impl::merge_grouped_aggregate(
+    ro_batches, group_idx.size(), aggregates, cudf::get_default_stream(), *mem_space);
   ro_batches.clear();
   validate_grouped_aggregate(input.batches, *output_batch, group_idx.size(), aggregates);
 }
@@ -854,13 +836,8 @@ TEST_CASE("Grouped merge aggregate with mixed empty and non-empty local aggregat
   for (auto& b : input.batches) {
     ro_batches.push_back(b->to_read_only());
   }
-  bool const try_sorted_keys = GENERATE(false, true);
-  auto output_batch          = gpu_merge_impl::merge_grouped_aggregate(ro_batches,
-                                                              group_idx.size(),
-                                                              aggregates,
-                                                              try_sorted_keys,
-                                                              cudf::get_default_stream(),
-                                                              *mem_space);
+  auto output_batch = gpu_merge_impl::merge_grouped_aggregate(
+    ro_batches, group_idx.size(), aggregates, cudf::get_default_stream(), *mem_space);
   ro_batches.clear();
   validate_grouped_aggregate(input.batches, *output_batch, group_idx.size(), aggregates);
 }
@@ -1161,14 +1138,34 @@ TEST_CASE("Grouped merge aggregate of sorted partials that arrive out of order",
     make_partial({12, 13}, {7, 8}, *mem_space)};
   std::vector<cudf::aggregation::Kind> aggregates = {cudf::aggregation::Kind::SUM};
 
-  bool const try_sorted_keys = GENERATE(false, true);
   std::vector<read_only_data_batch> ro_batches;
   for (auto& batch : batches) {
     ro_batches.push_back(batch->to_read_only());
   }
   auto output_batch = gpu_merge_impl::merge_grouped_aggregate(
-    ro_batches, 1, aggregates, try_sorted_keys, cudf::get_default_stream(), *mem_space);
+    ro_batches, 1, aggregates, cudf::get_default_stream(), *mem_space);
   ro_batches.clear();
   validate_grouped_aggregate(batches, *output_batch, 1, aggregates);
   REQUIRE(sirius::get_cudf_table_view(*output_batch).num_rows() == 7);
+}
+
+TEST_CASE("Grouped merge aggregate of partials that are not sorted",
+          "[operator][merge_grouped_agg]")
+{
+  // Overlapping, unsorted partials fail the sortedness check, so the hash group-by runs.
+  auto* mem_space                                  = get_shared_mem_space();
+  std::vector<std::shared_ptr<data_batch>> batches = {
+    make_partial({5, 1, 9, 1}, {1, 2, 3, 4}, *mem_space),
+    make_partial({9, 5, 0}, {5, 6, 7}, *mem_space)};
+  std::vector<cudf::aggregation::Kind> aggregates = {cudf::aggregation::Kind::SUM};
+
+  std::vector<read_only_data_batch> ro_batches;
+  for (auto& batch : batches) {
+    ro_batches.push_back(batch->to_read_only());
+  }
+  auto output_batch = gpu_merge_impl::merge_grouped_aggregate(
+    ro_batches, 1, aggregates, cudf::get_default_stream(), *mem_space);
+  ro_batches.clear();
+  validate_grouped_aggregate(batches, *output_batch, 1, aggregates);
+  REQUIRE(sirius::get_cudf_table_view(*output_batch).num_rows() == 4);
 }
