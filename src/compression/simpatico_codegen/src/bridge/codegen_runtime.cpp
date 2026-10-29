@@ -635,8 +635,8 @@ void launch_rendered_decode(jit::FusedTree const& tree,
 {
   auto const num_chunks =
     static_cast<std::int32_t>(std::max<std::int64_t>(1, (num_rows + kChunkSize - 1) / kChunkSize));
-  auto const spec = cdj::render(
-    tree, cxx_dtype, num_chunks, va.shape, va.out_dtype != nullptr ? va.out_dtype : "");
+  auto const spec =
+    cdj::render(tree, cxx_dtype, num_chunks, va.shape, va.out_dtype != nullptr ? va.out_dtype : "");
   std::vector<CUdeviceptr> pointers;
   pointers.reserve(spec.buffers.size());
   for (auto const& buffer : spec.buffers) {
