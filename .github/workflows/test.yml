@@ -390,11 +390,11 @@ jobs:
           [ "$ERRORS" -gt 0 ] && echo "::warning::TPC-DS snapshot: $ERRORS queries errored (non-blocking)"
           true
 
-      - name: Upload TPC-DS shadow run artifacts
+      - name: Upload TPC-DS run artifacts
         if: always() && steps.tpcds.outputs.run_dir != ''
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: shadow-tpcds-run-${{ github.run_id }}-cuda-${{ matrix.cuda.version }}
+          name: tpcds-run-${{ github.run_id }}-cuda-${{ matrix.cuda.version }}
           path: ${{ steps.tpcds.outputs.run_dir }}
           retention-days: 14
 
