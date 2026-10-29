@@ -272,6 +272,23 @@ TEST_CASE("accumulation never starts without a usable geometry or inventory",
   REQUIRE(snapshot.empty());
 }
 
+TEST_CASE("a build too large for the cap accumulates a Bloom cut to the cap",
+          "[dynamic_filter][multi_partition]")
+{
+  acc::fixture fixture;
+  // 1000 rows need 2 KiB per key; a 1 KiB cap gives each of the two keys 512 bytes.
+  auto const batch = fixture.make_batch(0, 0, 1000);
+  REQUIRE(fixture.begin({batch}, 1024));
+  fixture.contribute(batch);
+  fixture.publish(0, batch->get_batch_id());
+  auto const counters = fixture.stats.snapshot();
+  REQUIRE(counters.keys_skipped_bloom_size_gate == 0);
+  REQUIRE(counters.accumulation_publications_finished == 1);
+  CHECK(fixture.published_bloom(0).storage_bytes() == 512);
+  // Overloaded, it has more false positives, never a false negative.
+  fixture.require_members({batch});
+}
+
 TEST_CASE("contributions enqueue without a host wait and publish from another stream",
           "[dynamic_filter][multi_partition]")
 {

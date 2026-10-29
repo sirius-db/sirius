@@ -106,6 +106,7 @@ class bounded_thread_pool {
 
     auto* init_fn_ptr = per_thread_init ? &per_thread_init : nullptr;
     auto* latch_ptr   = init_latch.get();
+    if (cpu_ids.empty()) { cpu_ids = sirius::exec::thread_util::get_process_affinity(); }
 
     for (int i = 0; i < capacity; ++i) {
       auto& t = threads_.emplace_back([this, init_fn_ptr, latch_ptr]() {

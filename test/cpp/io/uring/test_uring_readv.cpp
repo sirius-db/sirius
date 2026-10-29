@@ -24,6 +24,7 @@
 #include <io/uring/types.hpp>
 #include <io/uring/uring_reactor.hpp>
 #include <sys/uio.h>
+#include <unistd.h>
 
 #include <array>
 #include <chrono>
@@ -34,6 +35,7 @@
 #include <memory>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <system_error>
 #include <thread>
 #include <type_traits>
@@ -381,4 +383,66 @@ TEST_CASE("io_uring cancels rejected work outside the enqueue lock", "[uring_rea
   REQUIRE(watchdog.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
   CHECK(*outer_canceled);
   CHECK(*inner_canceled);
+}
+
+TEST_CASE("io_uring small-read cap still completes every read", "[uring_readv]")
+{
+  // A cap of one keeps a single small read in flight at a time. Every read, small or
+  // large, must still complete with the file's bytes, without stalling the reactor.
+  constexpr std::size_t block_size = 1UL << 20;
+  constexpr std::size_t capacity   = 128UL << 20;
+  constexpr std::size_t small      = 16UL << 10;
+  constexpr std::size_t large      = 256UL << 10;
+  constexpr std::size_t pairs      = 24;
+  constexpr std::size_t file_bytes = pairs * (small + large);
+
+  char path[]  = "/tmp/sirius_uring_small_cap_XXXXXX";
+  int const fd = ::mkstemp(path);
+  REQUIRE(fd >= 0);
+  std::vector<std::uint8_t> expected(file_bytes);
+  for (std::size_t i = 0; i < file_bytes; ++i) {
+    expected[i] = static_cast<std::uint8_t>((i * 131) ^ (i >> 9));
+  }
+  REQUIRE(::write(fd, expected.data(), file_bytes) == static_cast<ssize_t>(file_bytes));
+  ::close(fd);
+
+  auto actual   = std::make_shared<std::vector<std::uint8_t>>(file_bytes, 0);
+  auto finished = std::make_shared<std::promise<std::size_t>>();
+  auto watchdog = finished->get_future();
+
+  std::thread([path = std::string{path}, actual, finished] {
+    cucascade::memory::numa_region_pinned_host_memory_resource upstream{0};
+    cucascade::memory::fixed_size_host_memory_resource mr{
+      0, upstream, capacity, capacity, block_size, 4, 0};
+
+    sirius::io::uring::config cfg{};
+    cfg.max_inflight_small_reads = 1;
+    cfg.small_read_bytes         = 64UL << 10;
+    auto ctx                     = std::make_shared<uring_reactor::reactor_context>(cfg, &mr);
+    uring_reactor reactor{ctx, ""};
+    reactor.start();
+
+    std::shared_ptr<local_io_object const> object = uring_reactor::create_io_object(path);
+    std::vector<prepared_io_slice> slices;
+    std::size_t offset = 0;
+    for (std::size_t i = 0; i < pairs; ++i) {
+      for (auto const bytes : {small, large}) {
+        slices.emplace_back(range{offset, bytes}, host_buffer{actual->data() + offset});
+        offset += bytes;
+      }
+    }
+    auto coordinator =
+      std::make_shared<grouped_coordinator>(std::size_t{file_bytes}, slices.size());
+    auto future = coordinator->get_future();
+    reactor.enqueue(
+      grouped_io_request::create(std::move(object), std::move(slices), std::move(coordinator)));
+    auto const read = std::move(future).get_try().get();
+    reactor.shutdown();
+    finished->set_value(read);
+  }).detach();
+
+  REQUIRE(watchdog.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
+  CHECK(watchdog.get() == file_bytes);
+  CHECK(*actual == expected);
+  ::unlink(path);
 }

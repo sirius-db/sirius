@@ -171,3 +171,22 @@ endif()
 add_subdirectory(rust/crates/telemetry/bridge)
 
 find_package(kvikio REQUIRED CONFIG)
+
+if(SIRIUS_WITH_NIXL)
+  find_path(
+    NIXL_INCLUDE_DIR nixl.h
+    PATHS ${SIRIUS_NIXL_PREFIX}/include
+    NO_DEFAULT_PATH REQUIRED)
+  find_library(
+    NIXL_LIBRARY nixl
+    PATHS ${SIRIUS_NIXL_PREFIX}/lib
+    PATH_SUFFIXES aarch64-linux-gnu x86_64-linux-gnu
+    NO_DEFAULT_PATH REQUIRED)
+  # The descriptor lists live in libnixl_build.
+  find_library(
+    NIXL_BUILD_LIBRARY nixl_build
+    PATHS ${SIRIUS_NIXL_PREFIX}/lib
+    PATH_SUFFIXES aarch64-linux-gnu x86_64-linux-gnu
+    NO_DEFAULT_PATH REQUIRED)
+  message(STATUS "Exchange NIXL fabric: ${NIXL_LIBRARY}")
+endif()

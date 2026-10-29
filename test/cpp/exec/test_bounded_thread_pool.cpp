@@ -21,6 +21,7 @@
 
 #include <absl/cleanup/cleanup.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <future>
@@ -581,4 +582,32 @@ TEST_CASE("leased callables retain captures on exception and discard",
   CHECK(observed == 1);
   lifecycle.wait_for_work(q);
   lifecycle.close(q);
+}
+
+TEST_CASE("bounded_thread_pool given no CPUs runs on the process's CPUs, not its creator's",
+          "[bounded_thread_pool]")
+{
+  // DuckDB pins each worker to one core on hosts with more than 64 cores; a pool started from such
+  // a worker used to inherit that one core for all its threads.
+  auto const process = thread_util::get_process_affinity();
+  REQUIRE_FALSE(process.empty());
+  if (process.size() < 2) { return; }
+
+  bool pinned = false;
+  std::vector<int> seen;
+  std::thread creator([&] {
+    std::array<int, 1> one{process.front()};
+    pinned = thread_util::set_current_thread_affinity(one) &&
+             thread_util::get_current_thread_affinity().size() == 1;
+    bounded_thread_pool pool(1, "affinity");
+    std::promise<std::vector<int>> affinity;
+    auto future = affinity.get_future();
+    pool.dispatch(pool.reserve(),
+                  [&affinity] { affinity.set_value(thread_util::get_current_thread_affinity()); });
+    seen = future.get();
+  });
+  creator.join();
+
+  REQUIRE(pinned);
+  CHECK(seen == process);
 }

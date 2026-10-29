@@ -52,6 +52,13 @@ set(TEST_SOURCES
     test/cpp/downgrade/test_downgrade_executor.cpp
     test/cpp/downgrade/test_downgrade_lifecycle.cpp
     test/cpp/downgrade/test_spill_policy.cpp
+    test/cpp/exchange/test_exchange_batch_io.cpp
+    test/cpp/exchange/test_exchange_byte_ranges.cpp
+    test/cpp/exchange/test_exchange_collectives.cpp
+    test/cpp/exchange/test_exchange_operators.cpp
+    test/cpp/exchange/test_exchange_query_windows.cpp
+    test/cpp/exchange/test_exchange_transport.cpp
+    test/cpp/exchange/test_exchange_wire.cpp
     test/cpp/exec/test_arrow_result_stream.cpp
     test/cpp/exec/test_batch_stream.cpp
     test/cpp/exec/test_bounded_thread_pool.cpp
@@ -214,6 +221,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_partition_memspace_mgpu.cpp
     test/cpp/memory/test_multiple_blocks_allocation_accessor.cpp
     test/cpp/memory/test_topology_index.cpp
+    test/cpp/operator/test_build_probe_chunked.cpp
     test/cpp/operator/test_build_probe_scheduling.cpp
     test/cpp/operator/test_build_probe_reclaim.cpp
     test/cpp/operator/test_ungrouped_aggregate_empty_input.cpp
@@ -380,3 +388,7 @@ set(TEST_SOURCES
 # caught by the check-orphan-tests pre-commit hook
 # (scripts/check_orphan_tests.py) rather than a configure-time glob — see
 # test/cpp/orphan_test_allowlist.txt.
+
+if(SIRIUS_WITH_NIXL)
+  list(APPEND TEST_SOURCES test/cpp/exchange/test_exchange_nixl.cpp)
+endif()

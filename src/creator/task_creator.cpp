@@ -703,7 +703,8 @@ void task_creator::manager_loop()
               auto* pipelineable_input =
                 dynamic_cast<op::pipelineable_operator_data*>(input_data.get());
               if (!input_data ||
-                  (pipelineable_input && pipelineable_input->get_data_batches().empty())) {
+                  (pipelineable_input && pipelineable_input->get_data_batches().empty() &&
+                   !node->runs_without_input())) {
                 // no data to create task for
                 break;
               }

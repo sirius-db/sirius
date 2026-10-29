@@ -377,3 +377,36 @@ TEST_CASE("Evenly partition basic with num partitions larger than input size",
   }
   validate_evenly_partition(*input_batch, output_batches, num_partitions);
 }
+
+TEST_CASE("Hash partition after a partitioning with the same seed leaves buckets empty",
+          "[operator][hash_partition]")
+{
+  // An exchange routes rows to 2 ranks; PARTITION then splits one rank's share into 4.
+  auto* mem_space                                        = get_shared_mem_space();
+  std::vector<cudf::data_type> column_types              = {cudf::data_type{cudf::type_id::INT64},
+                                                            cudf::data_type{cudf::type_id::INT32}};
+  std::vector<std::optional<std::pair<int, int>>> ranges = {
+    std::optional<std::pair<int, int>>({0, 100000}), std::nullopt};
+  auto input_batch = create_batch_with_random_data(4000, column_types, ranges, *mem_space);
+
+  auto count_empty_buckets = [&](uint32_t exchange_seed) {
+    std::shared_ptr<data_batch> rank_share;
+    {
+      auto ro    = input_batch->to_read_only();
+      rank_share = gpu_partition_impl::hash_partition(
+        ro, {0}, {}, 2, cudf::get_default_stream(), *mem_space, {}, exchange_seed)[0];
+    }
+    auto ro = rank_share->to_read_only();
+    auto buckets =
+      gpu_partition_impl::hash_partition(ro, {0}, 4, cudf::get_default_stream(), *mem_space);
+    validate_hash_partition(*rank_share, buckets, 4);
+    int empty = 0;
+    for (auto const& bucket : buckets) {
+      if (sirius::get_cudf_table_view(*bucket).num_rows() == 0) { ++empty; }
+    }
+    return empty;
+  };
+
+  CHECK(count_empty_buckets(cudf::DEFAULT_HASH_SEED) == 2);
+  CHECK(count_empty_buckets(0x9e3779b9u) == 0);
+}

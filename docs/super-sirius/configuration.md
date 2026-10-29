@@ -390,6 +390,13 @@ Six optional nested sub-configs tune the individual backends, the cache, and the
 There are no static chunk-size or `readv`-fusion knobs. The worker chooses physical
 operation sizes dynamically from backlog pressure, available slots, and the pinned block size.
 
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `max_inflight_small_reads` | int | 0 (no cap) | Most reads smaller than `small_read_bytes` that one reactor keeps in flight. Larger reads are bounded only by the staging slots. |
+| `small_read_bytes` | bytes | `1MiB` | Physical read size below which `max_inflight_small_reads` applies. |
+
+On a parallel filesystem such as GPFS, dozens of concurrent small `O_DIRECT` reads into neighbouring blocks contend when the storage has not cached them. At TPC-H SF10000 on 4× GB200 over GPFS (16 MiB blocks), `max_inflight_small_reads: 16` with `small_read_bytes: 4MiB` cut the 22-query cold total from 2,128 s to 807 s and the warm total from 685 s to 507 s. Local NVMe has not been measured with a cap, so it stays off by default.
+
 ### `scan_manager.rest` — REST / S3 backend (`io/rest/config.hpp`)
 
 TLS verification policy and the CA bundle are configured only under
@@ -896,7 +903,7 @@ rejected as unknown, and the old `SET` variables no longer exist.
 | `enable_dynamic_filter` | true | Enable runtime filters for eligible hash joins. Plan-time wiring admits keys by join type (not join mode); at delivery, any join whose build side arrives as one whole batch publishes — a single-partition or broadcast `BUILD_PROBE` build, and a single-partition `STANDARD`/`MIXED_JOIN` build on the same terms. Targets may be probe scans or join-edge endpoints. An eligible build selects a raw exact IN-list for 1–12 supported build rows, otherwise a hash IN-list within the L2 budget or a Bloom. |
 | `enable_dynamic_zone_map_filter` | false | Publish build-key min/max filters in addition to membership filters. Parquet scans use them for row-group pruning; duckdb-native scans apply them post-decode. Requires `enable_dynamic_filter`; intended for clustered-keyset workloads. |
 | `enable_dynamic_filter_multi_partition` | true | Accumulate a Bloom filter for a non-broadcast HASH build with more than one partition. Requires `enable_dynamic_filter`, a build fed through a FULL barrier (an `ORDER BY`-fed build never accumulates), and working peer DMA between every pair of replica GPUs. |
-| `max_dynamic_filter_bloom_bytes_per_gpu` | 256 MiB | Cap on the accumulated Bloom arrays of one join on each GPU: the active keys times the array size rounded up to 256 bytes. Must be greater than zero: YAML loading and `SET` reject zero, and `enable_dynamic_filter_multi_partition` is the only switch that disables accumulation. A cap smaller than the required arrays records a size refusal. Whole-build publication is unaffected. |
+| `max_dynamic_filter_bloom_bytes_per_gpu` | 256 MiB | Cap on the accumulated Bloom arrays of one join on each GPU: the active keys times the array size rounded up to 256 bytes. Must be greater than zero: YAML loading and `SET` reject zero, and `enable_dynamic_filter_multi_partition` is the only switch that disables accumulation. A build whose arrays would exceed the cap gets arrays cut to it, which raises the false-positive rate; only a cap too small for one 256-byte array per key records a size refusal. Whole-build publication is unaffected. |
 | `dynamic_filter_domain_coverage_threshold` | 0.9 | Positive finite threshold. Before constructing either a membership filter or zone map, skip the key when the complete build covers at least this fraction of the key's unfiltered base-table row bound. Applies only to build keys proven unique in their base relation, with evidence from DuckDB-native scans. Values above 1.0 disable the gate; exactly 1.0 fires only at full coverage. |
 | `dynamic_filter_inlist_max_l2_fraction` | 0.125 | Finite threshold in [0, 1]: maximum estimated cuco-set size for the exact hash IN-list, as a fraction of the smallest probe-GPU L2. Larger sets use Bloom when supported. For keys not handled by the raw IN-list, 0 selects Bloom when supported, while 1.0 reproduces the legacy L2-fit rule only when L2 size is known. If L2 size is unknown, the hash IN-list is ineligible and selection falls back to Bloom or no membership filter. The 0.125 default comes from a GB300 residency sweep: hash-set probe cost is flat below ~0.28 of L2 and degrades beyond it, while Bloom was at least 2.2x faster at every swept set size. |
 | `dynamic_filter_keep_threshold` | 0.9 | Finite threshold in [0, 1] for disabling post-decode filtering once a measured split keeps more than this fraction of its rows; 1.0 keeps filtering always on. |
@@ -906,6 +913,16 @@ Accumulation holds each GPU's arrays, at most the cap, until safe release after 
 The direct DuckDB session overrides are registered only when the process
 explicitly enables Sirius test options; they are not part of the normal user
 surface.
+
+### Distributed Execution
+
+See [Distributed Execution](distributed-sirius.md). Both settings must be set before the connection's first
+distributed query and cannot change after it.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `sirius_exchange_peers` | `''` | `host:port` of every rank's exchange listener, comma-separated in rank order. Empty runs in one process. Needs a build with `-DSIRIUS_WITH_NIXL=ON`. |
+| `sirius_exchange_rank` | 0 | This process's position in `sirius_exchange_peers`. |
 
 ### Pinned Tables
 
@@ -1003,6 +1020,12 @@ Static constants from `namespace duckdb::Config` and `namespace sirius::Config`:
 | `NUM_GPU` | 1 | `sirius::Config` |
 
 These are compile-time defaults. Runtime configuration via `sirius_config` and DuckDB SET variables takes precedence.
+
+### CMake options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `SIRIUS_WITH_NIXL` | OFF | Build the exchange's NIXL fabric for [distributed execution](distributed-sirius.md), linking the NIXL install at `SIRIUS_NIXL_PREFIX` (default: the `NIXL_PREFIX` environment variable). |
 
 ## Key Files
 

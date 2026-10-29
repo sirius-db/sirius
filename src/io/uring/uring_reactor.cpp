@@ -220,6 +220,8 @@ struct io_slot {
   int index;
   bool fixed_supported;
   bool used_fixed{false};
+  // Counted against config::max_inflight_small_reads while reading.
+  bool small_read{false};
   std::size_t bytes_read{0};
   slot_state state{slot_state::idle};
   std::unique_ptr<uring_io_op> op;
@@ -493,8 +495,14 @@ void uring_reactor::start()
   std::lock_guard lock(_enqueue_mutex);
   try {
     _accepting.store(true, std::memory_order_release);
-    _worker = std::jthread([this](std::stop_token stop_token) { worker_loop(stop_token); },
-                           _stop_source.get_token());
+    _worker = std::jthread(
+      [this](std::stop_token stop_token) {
+        // Before the first submission: io_uring's own workers inherit this thread's mask.
+        std::ignore = sirius::exec::thread_util::set_current_thread_affinity(
+          sirius::exec::thread_util::get_process_affinity());
+        worker_loop(stop_token);
+      },
+      _stop_source.get_token());
   } catch (...) {
     _accepting.store(false, std::memory_order_release);
     _bounce_storage.reset();
@@ -743,7 +751,20 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
     std::unique_ptr<grouped_io_request> active;
     std::size_t inflight = 0;
 
-    auto reset_slot = [&](io_slot& slot) noexcept { slot.reset(); };
+    // Reads below small_read_bytes currently in flight; see config::max_inflight_small_reads.
+    std::size_t small_inflight = 0;
+    auto const small_cap       = _config.max_inflight_small_reads;
+    auto const small_bytes     = _config.small_read_bytes;
+    auto stop_reading          = [&](io_slot& slot) noexcept {
+      if (!slot.small_read) return;
+      slot.small_read = false;
+      --small_inflight;
+    };
+
+    auto reset_slot = [&](io_slot& slot) noexcept {
+      stop_reading(slot);
+      slot.reset();
+    };
 
     auto settle_slot_error = [&](io_slot& slot,
                                  grouped_coordinator::error_type const& error,
@@ -775,6 +796,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
           settle_slot_error(slot, status, true);
           return;
         }
+        stop_reading(slot);
         slot.state = slot_state::copying;
         copying.push_back(slot.index);
       } catch (...) {
@@ -942,6 +964,8 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
 
         auto const needed = std::max<std::size_t>(1, candidate->staging_blocks);
         if (available_slots.approx_free() < needed) break;
+        bool const small = small_cap != 0 && candidate->request.io_rng.size < small_bytes;
+        if (small && small_inflight >= small_cap) break;
 
         auto lease = std::make_shared<staging_lease>();
         lease->tokens.reserve(needed);
@@ -976,6 +1000,10 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
           slot.op         = std::move(op);
           slot.state      = slot_state::reading;
           slot.bytes_read = 0;
+          if (small) {
+            slot.small_read = true;
+            ++small_inflight;
+          }
 
           slot.prepare_remaining_iovecs();
           auto* sqe = ring.get_sqe();

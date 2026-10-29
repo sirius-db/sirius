@@ -268,7 +268,11 @@ std::vector<descent_step> descent_steps(sirius::op::sirius_physical_operator con
     case SiriusPhysicalOperatorType::GPU_VALUES:
     case SiriusPhysicalOperatorType::GPU_SCAN:
     case SiriusPhysicalOperatorType::STREAMING_SOURCE:
-    case SiriusPhysicalOperatorType::STREAMING_SINK: return {};
+    case SiriusPhysicalOperatorType::STREAMING_SINK:
+    // Below a hash or range exchange, this rank's build holds only its share of the keys: a filter
+    // there would drop rows other ranks' builds match.
+    case SiriusPhysicalOperatorType::EXCHANGE_SINK:
+    case SiriusPhysicalOperatorType::EXCHANGE_SOURCE: return {};
   }
   return {};  // unreachable
 }

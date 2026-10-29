@@ -17,10 +17,13 @@
 #include "op/sirius_physical_concat.hpp"
 
 #include "data/data_batch_utils.hpp"
+#include "log/logging.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
+#include "op/sirius_physical_hash_join.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "telemetry/nvtx.hpp"
 
+#include <algorithm>
 #include <limits>
 
 namespace sirius {
@@ -29,12 +32,15 @@ namespace op {
 sirius_physical_concat::sirius_physical_concat(duckdb::vector<sirius::logical_type> types,
                                                std::size_t estimated_cardinality,
                                                bool concat_all,
-                                               uint64_t concat_batch_bytes)
+                                               uint64_t concat_batch_bytes,
+                                               uint64_t build_chunk_max_rows)
   : sirius_physical_partition_consumer_operator(
       SiriusPhysicalOperatorType::CONCAT, std::move(types), estimated_cardinality)
 {
-  _concat_all         = concat_all;
-  _concat_batch_bytes = concat_batch_bytes;
+  _concat_all           = concat_all;
+  _concat_batch_bytes   = concat_batch_bytes;
+  _build_chunk_max_rows = std::clamp<uint64_t>(
+    build_chunk_max_rows, 1, static_cast<uint64_t>(std::numeric_limits<cudf::size_type>::max()));
 }
 
 std::optional<std::vector<uint64_t>> sirius_physical_concat::plan_pull_for_partition(
@@ -51,16 +57,22 @@ std::optional<std::vector<uint64_t>> sirius_physical_concat::plan_pull_for_parti
   std::vector<uint64_t> group;
   std::size_t total_batch_size = 0;
   std::size_t total_rows       = 0;
+  // Past the limit, a split build stops counting: execute() packs the partition by actual rows.
+  bool split_build         = false;
   constexpr auto row_limit = static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max());
   for (auto const batch_id : batch_ids) {
     auto batch_idle  = repo.get_data_batch_by_id(batch_id, partition_idx);
     auto const stats = get_batch_rows_and_bytes(*batch_idle);
-    if (stats.rows.has_value()) {
+    if (stats.rows.has_value() && !split_build) {
       if (*stats.rows > row_limit - total_rows) {
         if (!_concat_all && !group.empty()) { return group; }
-        throw std::overflow_error("CONCAT partition exceeds the cuDF row-count limit");
+        if (!_concat_all || !_build_split_allowed) {
+          throw std::overflow_error("CONCAT partition exceeds the cuDF row-count limit");
+        }
+        split_build = true;
+      } else {
+        total_rows += *stats.rows;
       }
-      total_rows += *stats.rows;
     }
     // Unknown row counts are checked against the actual tables after preparation. The byte count
     // is the decoded size: a compressed batch occupies a fraction of what the task will decode.
@@ -176,25 +188,53 @@ std::unique_ptr<operator_data> sirius_physical_concat::execute(const operator_da
   // Validate the actual GPU tables even when callers supply plain partitioned_operator_data
   // or a representation had no row-count metadata during group selection.
   constexpr auto row_limit = static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max());
+  bool const split_build   = _concat_all && _build_split_allowed;
   std::size_t rows         = 0;
-  for (auto const& batch : input_batches) {
+  // Batch indices of each output batch. A split build closes a chunk before the batch that would
+  // take it past `_build_chunk_max_rows`; anything else is one chunk under the cuDF limit.
+  std::vector<std::vector<std::size_t>> chunks{{}};
+  std::size_t chunk_rows = 0;
+  for (std::size_t i = 0; i < input_batches.size(); ++i) {
+    auto const& batch = input_batches[i];
     if (batch.get_memory_space() != space) {
       throw std::runtime_error("CONCAT input was not prepared on one memory space");
     }
     auto const batch_rows = static_cast<std::size_t>(get_cudf_table_view(batch).num_rows());
-    if (batch_rows > row_limit - rows) {
-      throw std::overflow_error("CONCAT partition exceeds the cuDF row-count limit");
+    if (!split_build) {
+      if (batch_rows > row_limit - rows) {
+        throw std::overflow_error("CONCAT partition exceeds the cuDF row-count limit");
+      }
+      rows += batch_rows;
+    } else if (!chunks.back().empty() && batch_rows > _build_chunk_max_rows - chunk_rows) {
+      chunks.emplace_back();
+      chunk_rows = 0;
     }
-    rows += batch_rows;
+    chunks.back().push_back(i);
+    // A batch above the chunk bound alone stays one chunk; it is within the cuDF limit.
+    chunk_rows = std::min<std::size_t>(chunk_rows + batch_rows, _build_chunk_max_rows);
   }
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
-  output_batches.reserve(1);
-  if (input_batches.size() == 1) {
-    // Forward the owned input batch (idle at park); no read lock carried.
-    output_batches.push_back(partitioned_input_data->get_data_batches()[0]);
-  } else {
-    auto merged_batch = gpu_merge_impl::concat(input_batches, stream, *space, batch_telemetry());
-    output_batches.push_back(std::move(merged_batch));
+  output_batches.reserve(chunks.size());
+  for (auto const& chunk : chunks) {
+    if (chunk.size() == 1) {
+      // Forward the owned input batch (idle at park); no read lock carried.
+      output_batches.push_back(partitioned_input_data->get_data_batches()[chunk[0]]);
+      continue;
+    }
+    std::vector<cucascade::read_only_data_batch> chunk_batches;
+    chunk_batches.reserve(chunk.size());
+    for (auto const i : chunk) {
+      chunk_batches.push_back(input_batches[i]);
+    }
+    output_batches.push_back(
+      gpu_merge_impl::concat(chunk_batches, stream, *space, batch_telemetry()));
+  }
+  if (output_batches.size() > 1) {
+    SIRIUS_LOG_INFO("CONCAT id {}: split partition {} build side into {} chunks of at most {} rows",
+                    get_operator_id(),
+                    partition_idx,
+                    output_batches.size(),
+                    _build_chunk_max_rows);
   }
   return std::make_unique<partitioned_operator_data>(output_batches, partition_idx, *placement);
 }
@@ -210,8 +250,19 @@ void sirius_physical_concat::sink(const operator_data& output_data, ::cuda::stre
   if (!partition_idx_opt.has_value()) {
     throw std::runtime_error("sirius_physical_concat: output_data carries no partition index");
   }
-  auto partition_idx = *partition_idx_opt;
-  for (auto& batch : partitioned_output_data->get_data_batches()) {
+  auto partition_idx         = *partition_idx_opt;
+  auto const& output_batches = partitioned_output_data->get_data_batches();
+  if (output_batches.size() > 1 && _concat_all && _build_split_allowed) {
+    // A split build: tell the join before it can see the first chunk, so it waits for all of them
+    // and does not treat one chunk as the whole build.
+    auto* join = get_parent_op();
+    if (join == nullptr || join->type != SiriusPhysicalOperatorType::HASH_JOIN ||
+        join->input_port_for(*this) != "build") {
+      throw std::logic_error("CONCAT split a build side that does not feed a hash join build");
+    }
+    join->Cast<sirius_physical_hash_join>().note_build_chunked();
+  }
+  for (auto& batch : output_batches) {
     for (auto& next_port_info : next_port_after_sink) {
       next_port_info.next_operator->push_data_batch_partitioned(
         next_port_info.next_operator_port_name, batch, partition_idx);
@@ -236,6 +287,15 @@ MemoryBarrierType sirius_physical_concat::input_barrier_for(
   return sirius_physical_operator::input_barrier_for(producer);
 }
 
+void sirius_physical_concat::set_build_split_allowed(bool allowed)
+{
+  std::lock_guard<std::mutex> lg(lock);
+  if (_input_claimed && _build_split_allowed != allowed) {
+    throw std::logic_error("CONCAT split permission changed after the first input claim");
+  }
+  _build_split_allowed = allowed;
+}
+
 void sirius_physical_concat::set_concat_all(bool concat_all)
 {
   std::lock_guard<std::mutex> lg(lock);
@@ -250,6 +310,20 @@ std::size_t sirius_physical_concat::no_history_peak_memory_estimate(
 {
   if (stats.num_batches <= 1) { return 0; }
   return stats.bytes;
+}
+
+void sirius_physical_concat::on_finalize_operator()
+{
+  // The build side has ended. A rank whose build did not arrive as one whole batch (an empty one,
+  // say) owes its peers its share of each filter merge; left to the join's own finalize, after its
+  // probe side, that share would wait on probe rows from a peer whose publication waits on it.
+  auto* join = get_parent_op();
+  if (join == nullptr || join->type != SiriusPhysicalOperatorType::HASH_JOIN ||
+      join->input_port_for(*this) != "build") {
+    return;
+  }
+  auto& session = join->Cast<sirius_physical_hash_join>().dynamic_filter_session();
+  if (session.plan().distributed() != nullptr) { session.finish_input(); }
 }
 
 }  // namespace op

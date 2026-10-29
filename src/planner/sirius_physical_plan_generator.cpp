@@ -79,6 +79,7 @@
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
 #include "op/sirius_physical_union.hpp"
 #include "planner/connector_registry.hpp"
+#include "planner/distributed_plan.hpp"
 #include "planner/sirius_plan_compressed_schema.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "planner/substrait_scan_ranges.hpp"
@@ -93,9 +94,11 @@
 #include <duckdb/common/serializer/binary_serializer.hpp>
 #include <duckdb/common/serializer/memory_stream.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <filesystem>
 #include <limits>
 #include <numeric>
 #include <set>
@@ -214,6 +217,46 @@ void wrap_above(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
 {
   auto original = std::move(slot);
   slot          = std::forward<WrapperFactory>(factory)(std::move(original));
+}
+
+//! Distributed: every rank binds every file of a table and scans its share of them. Local files
+//! are split by byte range (`byte_ranges_for_rank`); remote ones, which take no byte ranges,
+//! whole, files rank, rank + world, ...
+void assign_files_to_rank(sirius::op::scan::parquet_ingestible_table_info& info,
+                          std::vector<std::string> files,
+                          const sirius::operator_params& op_params)
+{
+  auto const world = op_params.exchange_peers.size();
+  auto const rank  = op_params.exchange_rank;
+  if (world <= 1) {
+    info.resolved_file_paths = std::move(files);
+    return;
+  }
+  auto const remote = std::any_of(
+    files.begin(), files.end(), [](auto const& f) { return f.find("://") != std::string::npos; });
+  if (remote) {
+    if (files.size() < world) {
+      throw sirius::not_implemented_exception(
+        "distributed execution: a remote table of {} files across {} ranks; each rank needs one. "
+        "Split it into at least {} files, or read it from local files, which split by byte range",
+        files.size(),
+        world,
+        world);
+    }
+    for (std::size_t i = rank; i < files.size(); i += world) {
+      info.resolved_file_paths.push_back(std::move(files[i]));
+    }
+    return;
+  }
+  std::vector<std::uint64_t> bytes;
+  bytes.reserve(files.size());
+  for (auto const& f : files) {
+    bytes.push_back(std::filesystem::file_size(f));
+  }
+  for (auto const& r : sirius::planner::byte_ranges_for_rank(bytes, rank, world)) {
+    info.resolved_file_paths.push_back(std::move(files[r.file]));
+    info.resolved_file_ranges.push_back({{r.start, r.length}});
+  }
 }
 
 //! Attach the plan-carried byte ranges to the scan's files, claiming each file's ranges from the
@@ -338,7 +381,7 @@ void populate_parquet_table_info(sirius::op::scan::parquet_ingestible_table_info
       throw std::runtime_error(
         "[sirius_physical_plan_generator::build_parquet_table_info] No input files to scan");
     }
-    info->resolved_file_paths = std::move(resolved_file_paths);
+    assign_files_to_rank(*info, std::move(resolved_file_paths), op_params);
   }
 
   info->approximate_batch_size = op_params.scan_task_batch_size;
@@ -1570,7 +1613,8 @@ void wrap_join_child(sirius::op::sirius_physical_operator& join_op,
             (join.join_type == duckdb::JoinType::RIGHT_SEMI ||
              join.join_type == duckdb::JoinType::RIGHT_ANTI) &&
             join.publishes_dynamic_filters() &&
-            join.dynamic_filter_plan().multi_partition_enabled()) {
+            join.dynamic_filter_plan().multi_partition_enabled() &&
+            op_params.exchange_peers.empty()) {
           auto publish = duckdb::make_uniq<sirius::op::sirius_physical_build_filter>(
             child_types, est_card, join.dynamic_filter_session());
           if (!child_physical.empty()) { publish->set_physical_types(child_physical); }
@@ -1579,8 +1623,12 @@ void wrap_join_child(sirius::op::sirius_physical_operator& join_op,
         }
       }
 
-      auto concat = duckdb::make_uniq<sirius::op::sirius_physical_concat>(
-        child_types, est_card, join_concat_all(join_op, is_build), op_params.concat_batch_bytes);
+      auto concat =
+        duckdb::make_uniq<sirius::op::sirius_physical_concat>(child_types,
+                                                              est_card,
+                                                              join_concat_all(join_op, is_build),
+                                                              op_params.concat_batch_bytes,
+                                                              op_params.build_chunk_max_rows);
       auto partition = duckdb::make_uniq<sirius::op::sirius_physical_partition>(
         std::move(child_types),
         est_card,
@@ -2233,6 +2281,14 @@ void sirius_physical_plan_generator::insert_gpu_pipeline_operators(
   prepare_iceberg_statement(*plan, op_params, context);
   insert_gpu_pipeline_operators_recursive(
     plan, op_params, context, sirius_ctx.get(), contract_provenance);
+  if (sirius_ctx && !op_params.exchange_peers.empty()) {
+    auto* gpu = sirius_ctx->get_memory_manager().get_memory_space(cucascade::memory::Tier::GPU, 0);
+    sirius::planner::distribute_plan(plan,
+                                     sirius_ctx->get_exchange_service(op_params),
+                                     *gpu,
+                                     sirius_ctx->next_distributed_query(context),
+                                     sirius_ctx->get_query_lifecycle_registry());
+  }
 }
 
 sirius::OrderPreservationType sirius_physical_plan_generator::order_preservation_recursive(

@@ -31,6 +31,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace YAML {
 class Node;
@@ -69,6 +70,10 @@ constexpr uint64_t DEFAULT_MAX_BROADCAST_JOIN_SIZE        = 256ULL * 1024 * 1024
 /// Approximate cuco hash-table bytes per build row: 8-byte hash/index slots at 0.5 occupancy.
 /// Capacity rounding and auxiliary allocations are excluded; this is an admission estimate.
 constexpr uint64_t BUILD_PROBE_HASH_TABLE_BYTES_PER_ROW = 16;
+
+/// cuDF's row-count limit (`std::numeric_limits<cudf::size_type>::max()`): the most rows one
+/// BUILD_PROBE build chunk may hold.
+constexpr uint64_t DEFAULT_BUILD_CHUNK_MAX_ROWS = 2147483647ULL;
 
 /// Multi-GPU small-table threshold, charged per GPU. A partition-sizing consumer (hash join,
 /// merge_group_by) keeps inputs below `num_gpus * this` on a single GPU (one partition) to avoid
@@ -167,6 +172,12 @@ struct operator_params {
   /// Target size (bytes) for the concat operator output batch.
   uint64_t concat_batch_bytes = config::DEFAULT_CONCAT_BATCH_BYTES;
 
+  /// Most rows in one build chunk of a BUILD_PROBE MARK/SEMI/ANTI/INNER join. A partition whose
+  /// build side has more rows is split into several chunks, one hash table each, instead of
+  /// failing on cuDF's row-count limit. At most (and by default) that limit; lower values exist
+  /// to exercise the split in tests.
+  uint64_t build_chunk_max_rows = config::DEFAULT_BUILD_CHUNK_MAX_ROWS;
+
   /// Target output size (bytes) of each cross product task. A pair of input batches whose cross
   /// join is larger is split into tasks over row ranges of the left batch.
   uint64_t cross_join_task_bytes = config::derived_default_batch_size();
@@ -216,6 +227,12 @@ struct operator_params {
   /// Aggregate aligned Bloom-array budget per GPU for accumulation; must be greater than zero.
   uint64_t max_dynamic_filter_bloom_bytes_per_gpu =
     sirius::op::default_max_dynamic_filter_bloom_bytes_per_gpu;
+  /// Distributed execution: "host:port" of every rank's exchange listener, indexed by rank.
+  /// Empty runs in one process. Every rank runs the same SQL over every file of each table and
+  /// scans its own share of the files; rank 0 returns the result.
+  std::vector<std::string> exchange_peers;
+  /// This process's rank among exchange_peers.
+  uint32_t exchange_rank = 0;
 
   /// Emit build-key min/max filters in addition to membership filters.
   bool enable_dynamic_zone_map_filter = false;

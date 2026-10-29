@@ -321,6 +321,11 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     _dynamic_filter_session.restrict_replicas_to(admitted_gpu_ids);
   }
 
+  void set_distributed_dynamic_filters(dynamic_filter_publish_plan::distributed_merge merge)
+  {
+    _dynamic_filter_session.set_distributed(std::move(merge));
+  }
+
   void seal_dynamic_filter_plan() noexcept { _dynamic_filter_session.seal_plan(); }
   void cancel_dynamic_filter_publication() noexcept { _dynamic_filter_session.cancel(); }
 
@@ -406,6 +411,15 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   {
     _build_observer_attached.store(true, std::memory_order_release);
   }
+
+  /// @brief Whether a BUILD_PROBE build partition may arrive as several row-bounded chunks: true
+  /// for MARK, SEMI, ANTI and INNER, which combine per-chunk probe results exactly.
+  [[nodiscard]] bool build_probe_can_chunk() const noexcept;
+
+  /// @brief Called by the build CONCAT before it delivers a partition as several chunks. From then
+  /// on a partition is built only once the build producer has finished (so every chunk has
+  /// arrived), and no delivery counts as the whole build for dynamic-filter publication.
+  void note_build_chunked();
 
   /// @brief True when this join runs in build-then-probe mode (see `get_partition_strategy`).
   [[nodiscard]] bool is_build_probe_mode();
@@ -513,8 +527,11 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   // Whether any build-side join key column contains a NULL. Used exclusively for MARK join
   // three-valued logic in BUILD_PROBE mode when the build is NOT hash-partitioned (one slot or
   // broadcast), so every slot holds the whole build and all slots agree. Sentinel -1 = unset,
-  // 0 = false, 1 = true.
+  // 0 = false, 1 = true. A chunked build sets it once from the OR over its chunks.
   std::atomic<int> _build_has_null{-1};
+
+  // Set by the build CONCAT (note_build_chunked) before it delivers a partition as several chunks.
+  std::atomic<bool> _build_chunked{false};
 
   // Set at sizing when a MARK build is hash-partitioned (more than one non-broadcast partition);
   // its marks then use the join-wide observation below. That observation is final before any build
@@ -548,8 +565,10 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   // single SCHEDULED build task release-stores BUILT — and then probed by many streamed probe tasks
   // that only read the table. `build_state` is atomic so get_next_task_hint can observe a slot's
   // progress without holding op_state_mutex while execute() flips it.
-  struct per_partition_build_state {
-    std::atomic<BUILD_HASH_TABLE_STATE> build_state{BUILD_HASH_TABLE_STATE::NOT_BUILT};
+  // A partition's build side normally arrives as one batch, built into one chunk. A build above
+  // operator_params::build_chunk_max_rows rows arrives as several batches, one chunk each; probes
+  // combine the chunks' results (see execute).
+  struct build_chunk {
     std::unique_ptr<cudf::hash_join> hash_table;  // general path (INNER/LEFT/OUTER)
     std::unique_ptr<cudf::distinct_hash_join>
       distinct_hash_table;  // used instead of hash_table when build keys are proven unique
@@ -559,12 +578,27 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
       build_table;  // owned build table, to materialize build-side results at probe time
     std::vector<std::unique_ptr<cudf::column>>
       built_table_cast_columns;  // scope holder for columns cast for the build table's lifetime
-    int device_id = -1;          // GPU this slot's table was built on; guards teardown frees
+  };
+  struct per_partition_build_state {
+    std::atomic<BUILD_HASH_TABLE_STATE> build_state{BUILD_HASH_TABLE_STATE::NOT_BUILT};
+    std::vector<build_chunk> chunks;
+    int device_id = -1;  // GPU this slot's tables were built on; guards teardown frees
   };
   // Sized to num_partitions when BUILD_PROBE is entered (see get_partition_strategy). Elements are
   // non-movable (atomic member), so the vector is default-constructed at the target size and only
   // ever whole-move-assigned — never resized or push_back'd — so element moves are never required.
   std::vector<per_partition_build_state> _partition_build_states;
+
+  /// BUILD_PROBE probe of a partition built from several chunks. A probe row of a MARK/SEMI/ANTI
+  /// join matches when any chunk holds its key: the per-chunk matches are OR'ed into one mask, so
+  /// SEMI emits each row once and ANTI only rows no chunk matches. INNER concatenates the per-chunk
+  /// joins, whose build rows are disjoint.
+  std::unique_ptr<operator_data> probe_chunked_build(
+    per_partition_build_state const& slot,
+    ::cucascade::read_only_data_batch const& probe_batch,
+    cudf::table_view const& left_full,
+    cudf::table_view const& probe_keys,
+    ::cuda::stream_ref stream);
   //
   // Number of equality conditions after reordering; inequality conditions follow at higher indices.
   std::size_t num_equality_conditions = 0;

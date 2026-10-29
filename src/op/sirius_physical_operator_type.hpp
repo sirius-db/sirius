@@ -152,7 +152,9 @@ enum class SiriusPhysicalOperatorType : uint8_t {
   STREAMING_SOURCE,
   STREAMING_SINK,
   DENSE_COUNT_JOIN,
-  BUILD_FILTER
+  BUILD_FILTER,
+  EXCHANGE_SINK,
+  EXCHANGE_SOURCE
 };
 
 std::string SiriusPhysicalOperatorToString(SiriusPhysicalOperatorType type);

@@ -1795,3 +1795,61 @@ TEST_CASE("sirius_physical_concat counts compressed batches at their decoded siz
   REQUIRE(hint.has_value());
   CHECK(hint->hint == TaskCreationHint::READY);
 }
+
+TEST_CASE("split CONCAT packs a complete partition into row-bounded chunks", "[physical_concat]")
+{
+  bool const split_allowed = GENERATE(false, true);
+  auto* space              = get_shared_mem_space();
+  auto const types =
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER});
+  sirius_physical_concat concat(types, 0, true, std::numeric_limits<uint64_t>::max(), 3);
+  concat.operator_id = 1;
+  concat.set_build_split_allowed(split_allowed);
+  concat.set_placement(
+    std::make_shared<const partition_placement>(partition_placement::unpinned(1)));
+  std::vector<std::shared_ptr<data_batch>> batches{
+    make_numeric_batch<int32_t>(*space, {1, 2}, cudf::type_id::INT32),
+    make_numeric_batch<int32_t>(*space, {3, 4}, cudf::type_id::INT32),
+    make_numeric_batch<int32_t>(*space, {5}, cudf::type_id::INT32),
+    make_numeric_batch<int32_t>(*space, {6, 7, 8, 9}, cudf::type_id::INT32)};
+  auto input      = unpinned_partition(batches, 0);
+  auto output     = concat.execute(input, default_stream());
+  auto const& out = dynamic_cast<partitioned_operator_data&>(*output).get_data_batches();
+  auto values     = [](std::shared_ptr<data_batch> const& batch) {
+    return copy_column_to_host<int32_t>(
+      sirius::get_cudf_table_view(batch->to_read_only()).column(0));
+  };
+  if (!split_allowed) {
+    // Without the consumer's permission, the row bound does not apply: one batch, as before.
+    REQUIRE(out.size() == 1);
+    CHECK(values(out[0]) == std::vector<int32_t>{1, 2, 3, 4, 5, 6, 7, 8, 9});
+    return;
+  }
+  // A chunk closes before the batch that would pass 3 rows; a batch above the bound by itself
+  // is its own chunk. Single-batch chunks are forwarded, and row order is kept.
+  REQUIRE(out.size() == 3);
+  CHECK(out[0] == batches[0]);
+  CHECK(values(out[1]) == std::vector<int32_t>{3, 4, 5});
+  CHECK(out[2] == batches[3]);
+}
+
+TEST_CASE("split CONCAT claims a complete partition above the cuDF row-count limit",
+          "[physical_concat]")
+{
+  auto const types =
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER});
+  sirius_physical_concat concat(types, 0, true);
+  concat.set_build_split_allowed(true);
+  concat.set_placement(
+    std::make_shared<const partition_placement>(partition_placement::unpinned(1)));
+  cucascade::shared_data_repository repo;
+  // Metadata-only payloads: the claim must not execute against them.
+  std::vector<std::shared_ptr<data_batch>> batches{
+    make_host_metadata_batch(std::numeric_limits<cudf::size_type>::max()),
+    make_host_metadata_batch(1),
+    make_host_metadata_batch(1)};
+  auto input = claim_concat_input(concat, repo, batches, 0);
+  CHECK(dynamic_cast<pipelineable_operator_data&>(*input).get_data_batches() == batches);
+  CHECK(repo.total_size() == 0);
+  CHECK_THROWS_AS(concat.set_build_split_allowed(false), std::logic_error);
+}

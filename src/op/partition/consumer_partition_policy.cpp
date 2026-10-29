@@ -82,6 +82,8 @@ void bind_partition_inputs(sirius_physical_hash_join& join,
       if (strategy.build_probe) {
         if (!build_concat) { throw std::logic_error("BUILD_PROBE requires a bound build CONCAT"); }
         build_concat->set_concat_all(true);
+        // A partition above cuDF's row-count limit arrives as several chunks the join combines.
+        build_concat->set_build_split_allowed(join.build_probe_can_chunk());
         build_arrives_whole = strategy.num_partitions == 1 || strategy.broadcast;
       } else if (!empty && in.is_build_side && strategy.num_partitions == 1 &&
                  join.publishes_dynamic_filters() &&
