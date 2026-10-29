@@ -104,8 +104,7 @@ struct input_rows {
   }
 };
 
-//! Emits a boundary only when its preceding output copy crosses a global byte
-//! target.
+/// @brief Emits a boundary only when its preceding output copy crosses a global byte target.
 template <typename Index>
 struct output_boundary_cut {
   std::int64_t const* row_prefix;
