@@ -21,6 +21,7 @@
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/aggregate/group_key_labels.hpp"
 #include "op/aggregate/stddev.hpp"
+#include "op/aggregate/wide_integer_sum.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
@@ -303,7 +304,11 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
   // (see sums_to_widen) is computed over the column widened to the next decimal type. It uses the
   // key column index + widened_sum_key_offset, which keeps it in a request of its own. Every other
   // decimal SUM runs at the input width and its result is widened below. A wide integer SUM over
-  // INT64 is gated the same way and widened to DECIMAL128; one proven safe stays INT64 end to
+  // INT64 is gated the same way. When widened, it is not summed over DECIMAL128: its high and low
+  // 32-bit halves are summed in INT64 instead (split_int64_halves), the low half in a request of
+  // its own appended after the others, and the halves are combined into the exact DECIMAL128 sum
+  // below. Both use native 64-bit atomics, where a DECIMAL128 SUM contends on cuDF's 128-bit
+  // compare-and-swap loop when few groups share many rows. One proven safe stays INT64 end to
   // end, so its per-group result is not widened and the merge decides for itself (see
   // gpu_merge_impl::merge_grouped_aggregate). A wide SUM over INT32 cannot overflow INT64 within
   // one batch (fewer than 2^31 rows of magnitude at most 2^31) and is never a candidate.
@@ -398,6 +403,8 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
   std::vector<std::unique_ptr<cudf::column>> temp_struct_cols;
 
   std::vector<cudf::groupby::aggregation_request> requests;
+  // Widened INT64 SUM key -> its low-half column; the requests for these are appended below.
+  std::vector<std::pair<int, cudf::column_view>> low_half_inputs;
   for (int aggregate_col_id : input_col_order) {
     cudf::groupby::aggregation_request request;
     if (aggregate_col_id < 0) {
@@ -426,15 +433,33 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
       request.values = narrow_col->view();
       temp_struct_cols.push_back(std::move(narrow_col));
     } else if (aggregate_col_id >= widened_sum_key_offset) {
-      auto const& col  = input_table.column(aggregate_col_id - widened_sum_key_offset);
-      auto widened_col = cudf::cast(
-        col, *widened_sum_type(col.type()), stream, memory_space.get_default_allocator());
-      request.values = widened_col->view();
-      temp_struct_cols.push_back(std::move(widened_col));
+      auto const& col = input_table.column(aggregate_col_id - widened_sum_key_offset);
+      if (col.type().id() == cudf::type_id::INT64) {
+        auto [high, low] = split_int64_halves(col, stream, memory_space.get_default_allocator());
+        request.values   = high->view();
+        low_half_inputs.emplace_back(aggregate_col_id, low->view());
+        temp_struct_cols.push_back(std::move(high));
+        temp_struct_cols.push_back(std::move(low));
+      } else {
+        auto widened_col = cudf::cast(
+          col, *widened_sum_type(col.type()), stream, memory_space.get_default_allocator());
+        request.values = widened_col->view();
+        temp_struct_cols.push_back(std::move(widened_col));
+      }
     } else {
       request.values = input_table.column(aggregate_col_id);
     }
     request.aggregations = std::move(input_col_to_agg[aggregate_col_id]);
+    requests.push_back(std::move(request));
+  }
+  // The low halves follow every request in input_col_order, so the result loop below, which walks
+  // input_col_order, sees only the high halves and fetches the matching low half from here.
+  std::unordered_map<int, size_t> low_half_request_idx;
+  for (auto const& [key, low] : low_half_inputs) {
+    cudf::groupby::aggregation_request request;
+    request.values = low;
+    request.aggregations.push_back(cudf::make_sum_aggregation<cudf::groupby_aggregation>());
+    low_half_request_idx.emplace(key, requests.size());
     requests.push_back(std::move(request));
   }
 
@@ -525,6 +550,17 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
         if (auto widened_type = widened_decimal_sum_type(requests[i].values.type())) {
           aggregation_result.results[k] =
             cudf::cast(aggregation_result.results[k]->view(), *widened_type, stream, mr);
+        }
+      }
+      // A split INT64 SUM summed its high half here; add the low half for the exact DECIMAL128 sum.
+      if (requests[i].aggregations[k]->kind == cudf::aggregation::Kind::SUM) {
+        if (auto const low = low_half_request_idx.find(aggregate_col_id);
+            low != low_half_request_idx.end()) {
+          aggregation_result.results[k] =
+            combine_int64_halves(aggregation_result.results[k]->view(),
+                                 groupby_result.second[low->second].results[0]->view(),
+                                 stream,
+                                 mr);
         }
       }
       // A narrowed SUM returns to the DECIMAL128 type of its input column.
