@@ -137,8 +137,8 @@ bool key_needs_collation(duckdb::ClientContext& context,
   return duckdb::ExpressionBinder::PushCollation(context, key, type);
 }
 
-//! The types an ALL plan carries: per column, the type both planned inputs share, which must be
-//! the declared type or, for an aggregate result, `planned_aggregate_type` of it.
+//! The types an ALL plan carries: per column, the type both planned inputs share, or the narrowed
+//! type when one input plans the declared type and the other `planned_aggregate_type` of it.
 duckdb::vector<sirius::logical_type> reconcile_input_types(
   std::array<duckdb::unique_ptr<sirius::op::sirius_physical_operator>, 2> const& arms,
   duckdb::vector<duckdb::LogicalType> const& declared_types,
@@ -148,38 +148,17 @@ duckdb::vector<sirius::logical_type> reconcile_input_types(
     return arms[arm]->get_output_types();
   };
   for (duckdb::idx_t arm = 0; arm < arms.size(); ++arm) {
-    if (planned_types(arm).size() != declared_types.size()) {
-      throw sirius::not_implemented_exception("{} input {} is planned with {} columns, not {}",
-                                              name,
-                                              arm,
-                                              static_cast<duckdb::idx_t>(planned_types(arm).size()),
-                                              static_cast<duckdb::idx_t>(declared_types.size()));
-    }
+    sirius_physical_plan_generator::require_planned_schema(
+      planned_types(arm), declared_types, name + " input " + std::to_string(arm));
   }
   duckdb::vector<sirius::logical_type> key_types;
   for (duckdb::idx_t i = 0; i < declared_types.size(); ++i) {
-    auto const declared = sirius::from_duckdb(declared_types[i]);
-    auto const narrowed = sirius::from_duckdb(
-      sirius_physical_plan_generator::planned_aggregate_type(declared_types[i]));
-    for (duckdb::idx_t arm = 0; arm < arms.size(); ++arm) {
-      auto const& planned = planned_types(arm)[i];
-      if (planned != declared && planned != narrowed) {
-        throw sirius::not_implemented_exception("{} input {} plans column {} as {}, not {}",
-                                                name,
-                                                arm,
-                                                i,
-                                                planned.to_string(),
-                                                declared.to_string());
-      }
-    }
-    if (planned_types(0)[i] != planned_types(1)[i]) {
-      throw sirius::not_implemented_exception("{} inputs plan column {} as {} and {}",
-                                              name,
-                                              i,
-                                              planned_types(0)[i].to_string(),
-                                              planned_types(1)[i].to_string());
-    }
-    key_types.push_back(planned_types(0)[i]);
+    // Inputs that differ here differ only by that narrowing, which keeps the physical type.
+    key_types.push_back(
+      planned_types(0)[i] == planned_types(1)[i]
+        ? planned_types(0)[i]
+        : sirius::from_duckdb(
+            sirius_physical_plan_generator::planned_aggregate_type(declared_types[i])));
   }
   return key_types;
 }
@@ -374,6 +353,14 @@ sirius_physical_plan_generator::plan_except_intersect(duckdb::LogicalSetOperatio
 
   for (duckdb::idx_t i = 0; i < op.types.size(); ++i) {
     reject_nested_column_type(op.types[i], "column " + std::to_string(i), name);
+    // An ARRAY is a cuDF LIST column on the GPU, which no grouping key path supports.
+    if (op.types[i].id() == duckdb::LogicalTypeId::ARRAY) {
+      throw duckdb::NotImplementedException(
+        "%s on column %d (%s): ARRAY keys not supported on the GPU path",
+        name,
+        i,
+        op.types[i].ToString());
+    }
     // DuckDB compares such a key through its collation or normalization; the GPU would compare raw
     // values.
     if (key_needs_collation(context, op.types[i], i)) {

@@ -86,10 +86,10 @@ A `LOGICAL_CROSS_PRODUCT` (`CROSS JOIN`, a comma join without a join predicate, 
 The builder throws `NotImplementedException`, so the query falls back to CPU, for:
 
 - the distinct forms of `EXCEPT` and `INTERSECT`;
-- nested-type columns;
+- nested-type and `ARRAY` columns;
 - keys DuckDB compares through a collation or normalization, such as a collated `VARCHAR` or an `INTERVAL`, because the GPU would compare raw values;
 - `FLOAT` and `DOUBLE` keys, because a group keeps only one of its `-0.0` and `+0.0` rows, where DuckDB returns each input's own rows;
-- inputs whose planned column types differ from each other or from the declared types. The one allowed difference is an aggregate result DuckDB types as `HUGEINT` and Sirius plans as `BIGINT`.
+- an input whose planned column type differs from the declared type. The one allowed difference is an aggregate result DuckDB types as `HUGEINT` and Sirius plans as `BIGINT`; when only one input narrows it, the plan carries `BIGINT`.
 
 ### Distinct Planning
 

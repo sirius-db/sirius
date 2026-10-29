@@ -795,7 +795,7 @@ TEST_CASE("a second placement descends past the endpoint the first placed",
 // ---------------------------------------------------------------------------------------------
 
 TEST_CASE("descent_steps maps a REPLICATE output to the same input column",
-          "[dynamic_filter][placement][discovery]")
+          "[dynamic_filter][placement][discovery][replicate]")
 {
   auto const plan = make_set_operation_all(/*tag_count=*/1);
 
@@ -809,7 +809,7 @@ TEST_CASE("descent_steps maps a REPLICATE output to the same input column",
 }
 
 TEST_CASE("trace_probe_key reaches both arms of an INTERSECT ALL or EXCEPT ALL probe side",
-          "[dynamic_filter][placement][discovery]")
+          "[dynamic_filter][placement][discovery][replicate]")
 {
   for (std::size_t const tag_count : {std::size_t{2}, std::size_t{1}}) {
     INFO("tag_count = " << tag_count);
@@ -827,7 +827,7 @@ TEST_CASE("trace_probe_key reaches both arms of an INTERSECT ALL or EXCEPT ALL p
 }
 
 TEST_CASE("place_endpoint splices one endpoint below each arm of an EXCEPT ALL",
-          "[dynamic_filter][placement][discovery]")
+          "[dynamic_filter][placement][discovery][replicate]")
 {
   auto plan        = make_set_operation_all(/*tag_count=*/1);
   auto* const root = plan.root.get();
@@ -845,7 +845,7 @@ TEST_CASE("place_endpoint splices one endpoint below each arm of an EXCEPT ALL",
 }
 
 TEST_CASE("descent below REPLICATE refuses the copy count and the tag columns",
-          "[dynamic_filter][placement][discovery]")
+          "[dynamic_filter][placement][discovery][replicate]")
 {
   constexpr std::size_t tag_count = 2;
   auto const plan                 = make_set_operation_all(tag_count);
