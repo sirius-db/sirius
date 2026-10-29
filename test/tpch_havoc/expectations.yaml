@@ -20,10 +20,24 @@ expectations:
               Q11_V07, Q12_V07, Q13_V07, Q14_V07, Q15_V07, Q16_V07, Q17_V07, Q18_V07]
 
   - outcome: plan_rejected
-    reason: Window not supported
+    reason: "Unsupported whole-partition window: FILTER"
     issue: 1745
-    queries: [Q02_V07, Q02_V09, Q03_V09, Q04_V09, Q05_V09, Q06_V09, Q07_V09, Q08_V09, Q09_V09,
-              Q10_V09, Q11_V09, Q12_V09, Q13_V09, Q14_V09, Q15_V09, Q18_V09]
+    queries: [Q02_V07]
+
+  - outcome: plan_rejected
+    reason: "Unsupported whole-partition window: only SUM, AVG, COUNT, MIN and MAX aggregates are planned"
+    issue: 1745
+    queries: [Q03_V09]
+
+  - outcome: plan_rejected
+    reason: "Unsupported whole-partition window: ranking without PARTITION BY"
+    issue: 1745
+    queries: [Q15_V09, Q18_V09]
+
+  - outcome: plan_rejected
+    reason: "Unsupported whole-partition window: expressions over integer SUM results require an exact HUGEINT consumer"
+    issue: 1745
+    queries: [Q12_V09]
 
   - outcome: plan_rejected
     reason: Any join not supported

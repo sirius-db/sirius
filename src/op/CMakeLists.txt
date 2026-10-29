@@ -4,6 +4,7 @@ target_sources(
           aggregate/stddev.cpp
           aggregate/group_key_labels.cpp
           aggregate/gpu_aggregate_impl.cpp
+          window/ranking.cpp
           window/whole_partition.cpp
           merge/gpu_merge_impl.cpp
           order/gpu_order_impl.cpp
@@ -87,6 +88,7 @@ target_sources(
           sirius_physical_top_n.cpp
           sirius_physical_ungrouped_aggregate.cpp
           sirius_physical_union.cpp
+          sirius_physical_window.cpp
           aggregate/wide_integer_sum.cu
           partition/crc32_partition_hash.cu
           scan/equality_delete_mask.cu)

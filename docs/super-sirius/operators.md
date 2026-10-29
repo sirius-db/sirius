@@ -431,6 +431,11 @@ sizing partitions have run.
 
 `evaluate_whole_partition_window()` computes `SUM`, `AVG`, `COUNT`, `COUNT(*)`, `MIN` and `MAX` over the whole partition of one table. It runs a `cudf::groupby()` (a reduction when there are no partition columns) and joins the per-partition values back to the input rows with `cudf::distinct_hash_join`, so it does no sort and the results keep the input row order. `SUM` accumulates exactly in `DECIMAL128` and throws on overflow.
 
+### Ranking window evaluator
+**File:** `src/op/window/ranking.hpp`, `src/op/window/ranking.cpp`
+
+`evaluate_ranking_window()` computes `rank`, `dense_rank` and `row_number` over the window `ORDER BY` of one table. It sorts the partition columns and order keys with `cudf::stable_sorted_order()`, gathers only those key columns, runs a sorted `cudf::groupby` scan with the rank (`MIN` or `DENSE`) or count aggregation, and scatters the `INT64` results back to the input row order. The payload columns are neither sorted nor copied. All order keys share one direction and NULL placement.
+
 ## Pipeline Breakers (Sirius-Specific)
 
 These operators are injected during pipeline splitting. They don't map to DuckDB logical operators.
