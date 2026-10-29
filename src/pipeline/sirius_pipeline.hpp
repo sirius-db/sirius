@@ -240,6 +240,7 @@ class sirius_pipeline : public std::enable_shared_from_this<sirius_pipeline> {
 
   // Serializes input claims without blocking task completion while a source waits.
   // The guard prevents finalization across the input-pop / task-construction gap.
+  // Normal creation exits must recheck status after release; exceptions fail the query.
   class task_creation_guard {
    public:
     ~task_creation_guard();
