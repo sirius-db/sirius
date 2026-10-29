@@ -42,6 +42,10 @@
 #include <thread>
 #include <vector>
 
+namespace cucascade::io::cache {
+class fs_cache;
+}  // namespace cucascade::io::cache
+
 namespace sirius {
 namespace parallel {
 
@@ -116,6 +120,15 @@ class downgrade_executor {
   void start();
   void stop();
   void drain();
+
+  /// Quiesce processing, monitoring and workers; cancel queued requests. Idempotent.
+  /// The executor remains started, but accepts no requests until resume().
+  void pause();
+  void resume();
+
+  /// Non-owning default-local ioctx cache, used only by HOST executors. Wire before start()
+  /// or while paused; the owner must pause before replacing/destroying a bound cache.
+  void set_fs_cache(cucascade::io::cache::fs_cache* cache);
 
   /**
    * @brief Get the memory space this executor is responsible for.
@@ -207,9 +220,10 @@ class downgrade_executor {
   /**
    * @brief Whether a downgrade from this executor's source tier could plausibly free memory.
    *
-   * DISK is an effectively unbounded sink, so if it is configured a downgrade can always make
-   * progress. Otherwise progress is only possible if some HOST space still has capacity to accept
-   * data. Re-evaluated on every monitor cycle so the monitor backs off when stuck and resumes the
+   * GPU/HOST sources can spill to configured DISK spaces or REMOTE spaces with an attached I/O
+   * context. Without a spill sink, GPU progress requires HOST reservation capacity; HOST can still
+   * reclaim a bound fs_cache's staging buffers. DISK/REMOTE are never downgrade sources.
+   * Re-evaluated on every monitor cycle so the monitor backs off when stuck and resumes the
    * instant conditions change -- no latched state, no missed wakeup.
    */
   bool has_viable_downgrade_target() const;
@@ -222,6 +236,9 @@ class downgrade_executor {
   std::thread _monitor_thread;
   std::atomic<bool> _monitor_request_enqueued{false};
   std::atomic<bool> _running{false};
+  std::atomic<bool> _paused{false};
+  // Serializes lifecycle changes and cache rebinding, never acquired by executor threads.
+  std::mutex _lifecycle_mutex;
   std::atomic<size_t> _monitor_requests_issued{0};
   std::unique_ptr<cucascade::memory::exclusive_stream_pool> _stream_pool;
 
@@ -240,6 +257,7 @@ class downgrade_executor {
   sirius::exec::multi_index_priority_queue<sirius::parallel::itask>* _pipeline_task_queue{nullptr};
   /// Non-owning; the runtime or test fixture must outlive this executor.
   sirius::exec::query_lifecycle_registry& _query_lifecycle;
+  cucascade::io::cache::fs_cache* _fs_cache{nullptr};
 };
 
 }  // namespace parallel

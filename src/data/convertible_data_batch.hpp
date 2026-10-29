@@ -31,6 +31,7 @@
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
 #include <cucascade/data/disk_data_representation.hpp>
+#include <cucascade/data/remote_data_representation.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
@@ -127,6 +128,12 @@ class convertible_data_batch : public convertible_data {
       const auto* space = target_spaces[idx];
       auto* mem_space   = res_mgr.get_memory_space(space->get_tier(), space->get_id().device_id);
       if (!mem_space) { continue; }
+      // REMOTE has no default context and only supports raw GPU/HOST representations.
+      if (space->get_tier() == cucascade::memory::Tier::REMOTE &&
+          (!mem_space->get_io_context() ||
+           is_simpatico_compressed_representation(mut.get_data()))) {
+        continue;
+      }
 
       // Non-blocking reservation
       auto reservation = mem_space->make_reservation_or_null(data_size);
@@ -177,6 +184,10 @@ class convertible_data_batch : public convertible_data {
           }
           if (is_simpatico_compressed_representation(mut.get_data())) { continue; }
           mut.convert_to<cucascade::disk_data_representation>(
+            converter_registry, *reservation, stream);
+          break;
+        case cucascade::memory::Tier::REMOTE:
+          mut.convert_to<cucascade::remote_data_representation>(
             converter_registry, *reservation, stream);
           break;
         default: continue;

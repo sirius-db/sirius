@@ -16,15 +16,17 @@
 
 #pragma once
 
-#include <absl/functional/any_invocable.h>
+#include <cucascade/exec/invocable.hpp>
+
+#ifndef CUCASCADE_USE_ABSEIL_INVOCABLE
+// Enabled by set(CUCASCADE_USE_ABSEIL_INVOCABLE ON) in cmake/sirius-dependencies.cmake.
+#error "sirius::exec::invocable requires cucascade::exec::invocable to be absl::AnyInvocable"
+#endif
 
 namespace sirius::exec {
 
-/// Move-only type-erased callable. Unlike @c std::function it accepts move-only
-/// targets, and unlike @c std::move_only_function (C++23) it is available today.
-/// Supports @c noexcept- and ref-qualified signatures, both of which the
-/// pipeline and future primitives rely on.
+/// Move-only type-erased callable; the same absl::AnyInvocable cuCascade's exec/io layers use.
 template <typename Signature>
-using invocable = absl::AnyInvocable<Signature>;
+using invocable = cucascade::exec::invocable<Signature>;
 
 }  // namespace sirius::exec

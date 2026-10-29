@@ -62,6 +62,7 @@
 
 namespace cucascade::memory {
 class small_pinned_host_memory_resource;
+class topology_index;
 }  // namespace cucascade::memory
 
 namespace sirius::vss {
@@ -70,7 +71,7 @@ class cuvs_index_cache;
 
 namespace sirius::memory {
 class numa_small_pinned_mr;
-class topology_index;
+using cucascade::memory::topology_index;
 }  // namespace sirius::memory
 
 namespace sirius {
@@ -474,6 +475,11 @@ class SiriusContext : public ClientContextState {
   /// \brief Initialize the Sirius context with the given configuration.
   void initialize(const sirius::parsed_sirius_config& config);
 
+  /// Set before initialize(); invoked after remote attachment and after workers start.
+  /// Tests may throw here to exercise rollback of partially initialized resources.
+  std::function<void(std::string_view, const sirius::memory::sirius_memory_reservation_manager&)>
+    initialization_hook_for_testing;
+
   /**
    * @brief Suppress QueryBegin/QueryEnd side-effects for internal DuckDB connections.
    *
@@ -761,6 +767,10 @@ class SiriusContext : public ClientContextState {
   [[nodiscard]] sirius::scan_manager::sirius_scan_manager& get_scan_manager();
   [[nodiscard]] const sirius::scan_manager::sirius_scan_manager& get_scan_manager() const;
 
+  /// Rebuild scan caches with HOST downgrade borrowers quiesced, then rebind and resume them.
+  /// The caller must hold exclusive maintenance admission, as for scan-manager cache resets.
+  void reset_caches();
+
   /// \brief Get the session's cuVS ANN index cache (GPU-resident, pinned indexes).
   [[nodiscard]] sirius::vss::cuvs_index_cache& get_cuvs_index_cache();
   [[nodiscard]] const sirius::vss::cuvs_index_cache& get_cuvs_index_cache() const;
@@ -871,6 +881,9 @@ class SiriusContext : public ClientContextState {
 
  private:
   void throw_if_not_initialized() const;
+  /// Stop partial-startup borrowers and release their resources, including REMOTE contexts.
+  void rollback_initialization() noexcept;
+  void rebind_fs_cache_on_host_executors();
   /// Acquire the slot. Errors on same-thread reacquire — a nested acquire on
   /// one thread would otherwise be a silent permanent wait. After acquiring
   /// (and before returning) re-checks BOTH runtime health and the acquiring
@@ -964,9 +977,11 @@ class SiriusContext : public ClientContextState {
   // destroys scan_manager_, creator, and downgrade executors before the scheduler if initialize()
   // throws before terminate() can run; terminate() also stops their threads before reset.
   std::unique_ptr<sirius::pipeline::task_scheduler> task_scheduler_;
+  // HOST downgrade executors borrow the default ioctx's cache. Declare its owner before
+  // them so initialize() failure also stops/destroys the borrowers before the cache.
+  std::unique_ptr<sirius::scan_manager::sirius_scan_manager> scan_manager_;
   std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>> downgrade_executors_;
   std::unique_ptr<sirius::creator::task_creator> task_creator_;
-  std::unique_ptr<sirius::scan_manager::sirius_scan_manager> scan_manager_;
 
   std::shared_ptr<sirius::event::query_event_publisher> event_publisher_{
     std::make_shared<sirius::event::query_event_publisher>()};

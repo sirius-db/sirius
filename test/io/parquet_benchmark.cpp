@@ -1,8 +1,3 @@
-#include "io/cache/prefetching_cache.hpp"
-#include "io/sirius_datasource.hpp"
-#include "io/types.hpp"
-#include "io/uring/uring_ioctx.hpp"
-
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet.hpp>
@@ -17,6 +12,8 @@
 #include <rmm/mr/cuda_async_memory_resource.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
+#include <cucascade/cudf/datasource.hpp>
+#include <cucascade/io/uring/uring_ioctx.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 #include <fcntl.h>
@@ -306,17 +303,18 @@ int main(int argc, char** argv)
                                                                CHUNKS_PER_SLAB,  // pool_size
                                                                1);               // initial_pools
 
-    auto uring_ctx = std::make_shared<sirius::io::uring::uring_reactor::reactor_context>(
-      sirius::io::uring::uring_reactor::reactor_config_type{}, &host_mr);
+    auto uring_ctx = std::make_shared<cucascade::io::uring::uring_reactor::reactor_context>(
+      cucascade::io::uring::uring_reactor::reactor_config_type{}, &host_mr);
+    // n_reactors = runner threads that start() spawns.
     auto io_ctx =
-      std::make_shared<sirius::io::uring::uring_ioctx>(n_reactors, std::move(uring_ctx));
+      std::make_shared<cucascade::io::uring::uring_ioctx>(n_reactors, std::move(uring_ctx));
     io_ctx->start();
     // io_ctx->initialize_cache(pool, INFLIGHT_BUDGET_CHUNKS);
 
     std::vector<std::unique_ptr<cudf::io::datasource>> sources;
     sources.reserve(paths.size());
     for (auto const& path : paths) {
-      sources.push_back(io_ctx->open_datasource(path));
+      sources.push_back(cucascade::io::open_datasource(io_ctx, path));
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(1200));
 

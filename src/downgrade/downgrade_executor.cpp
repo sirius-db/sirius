@@ -25,12 +25,16 @@
 #include <nvtx3/nvtx3.hpp>
 
 #include <absl/cleanup/cleanup.h>
+#include <cucascade/io/cache/fs_cache.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <exception>
+#include <limits>
 #include <optional>
 #include <ranges>
+#include <stdexcept>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -44,6 +48,7 @@ static std::string tier_to_string(cucascade::memory::Tier tier)
     case cucascade::memory::Tier::GPU: return "GPU";
     case cucascade::memory::Tier::HOST: return "HOST";
     case cucascade::memory::Tier::DISK: return "DISK";
+    case cucascade::memory::Tier::REMOTE: return "REMOTE";
     default: return "UNKNOWN";
   }
 }
@@ -71,8 +76,29 @@ downgrade_executor::~downgrade_executor() { stop(); }
 
 void downgrade_executor::start()
 {
+  std::lock_guard lock(_lifecycle_mutex);
   bool expected = false;
   if (!_running.compare_exchange_strong(expected, true)) { return; }
+  _paused.store(false);
+
+  absl::Cleanup rollback = [this]() {
+    {
+      std::lock_guard monitor_lock(_monitor_cv_mutex);
+      _running.store(false);
+    }
+    _request_queue.interrupt();
+    _monitor_cv.notify_all();
+    if (_pool) { _pool->interrupt(); }
+    if (_monitor_thread.joinable()) { _monitor_thread.join(); }
+    if (_processing_thread.joinable()) { _processing_thread.join(); }
+    if (_pool) {
+      _pool->wait_all();
+      _pool->stop();
+      _pool.reset();
+    }
+    cancel_pending_requests();
+    _stream_pool.reset();
+  };
 
   // HOST/DISK tier memory_spaces return device_id == -1; passing that to
   // rmm::cuda_device_id or cudaSetDevice fails with cudaErrorInvalidDevice.
@@ -115,12 +141,16 @@ void downgrade_executor::start()
   if (_memory_space && _config.monitor_period > std::chrono::milliseconds::zero()) {
     _monitor_thread = std::thread(&downgrade_executor::monitor_loop, this);
   }
+  std::move(rollback).Cancel();
 }
 
 void downgrade_executor::stop()
 {
-  bool expected = true;
-  if (!_running.compare_exchange_strong(expected, false)) { return; }
+  std::lock_guard lock(_lifecycle_mutex);
+  {
+    std::lock_guard monitor_lock(_monitor_cv_mutex);
+    if (!_running.exchange(false)) { return; }
+  }
 
   _pool->interrupt();
   _request_queue.interrupt();
@@ -134,21 +164,76 @@ void downgrade_executor::stop()
   _pool->stop();
   _pool.reset();
   _stream_pool.reset();
+  _paused.store(false);
 }
 
-void downgrade_executor::drain()
+void downgrade_executor::pause()
 {
+  std::lock_guard lock(_lifecycle_mutex);
+  if (!_running.load() || _paused.load()) { return; }
+  {
+    // Change the wait predicate under its mutex so a long monitor sleep cannot miss the wakeup.
+    std::lock_guard monitor_lock(_monitor_cv_mutex);
+    _paused.store(true);
+  }
+
   _pool->interrupt();
   _request_queue.interrupt();
+  _monitor_cv.notify_all();
 
+  // The monitor also borrows the cache for its viability check. Join it as well as the
+  // processing thread before permitting a rebind, and stop it from publishing while paused.
+  if (_monitor_thread.joinable()) { _monitor_thread.join(); }
   if (_processing_thread.joinable()) { _processing_thread.join(); }
 
   _pool->wait_all();
   cancel_pending_requests();
+}
+
+void downgrade_executor::resume()
+{
+  std::lock_guard lock(_lifecycle_mutex);
+  if (!_running.load() || !_paused.load()) { return; }
+
   _pool->resume();
   _request_queue.reactivate();
+  _paused.store(false);
+  try {
+    _processing_thread = std::thread(&downgrade_executor::processing_loop, this);
+    if (_memory_space && _config.monitor_period > std::chrono::milliseconds::zero()) {
+      _monitor_thread = std::thread(&downgrade_executor::monitor_loop, this);
+    }
+  } catch (...) {
+    // A thread-creation failure leaves a quiescent, rebindable executor, not a half-live
+    // borrower of a cache its owner may replace while unwinding.
+    {
+      std::lock_guard monitor_lock(_monitor_cv_mutex);
+      _paused.store(true);
+    }
+    _pool->interrupt();
+    _request_queue.interrupt();
+    _monitor_cv.notify_all();
+    if (_monitor_thread.joinable()) { _monitor_thread.join(); }
+    if (_processing_thread.joinable()) { _processing_thread.join(); }
+    _pool->wait_all();
+    cancel_pending_requests();
+    throw;
+  }
+}
 
-  _processing_thread = std::thread(&downgrade_executor::processing_loop, this);
+void downgrade_executor::drain()
+{
+  pause();
+  resume();
+}
+
+void downgrade_executor::set_fs_cache(cucascade::io::cache::fs_cache* cache)
+{
+  std::lock_guard lock(_lifecycle_mutex);
+  if (_running.load() && !_paused.load()) {
+    throw std::logic_error("fs_cache must be rebound before start() or while paused");
+  }
+  _fs_cache = cache;
 }
 
 void downgrade_executor::processing_loop()
@@ -168,17 +253,20 @@ void downgrade_executor::processing_loop()
     };
     source_stats repo_stats, pipeline_queue_stats;
 
-    // Per-target-tier tracking (host vs disk)
+    // Index by the actual target tier: fallbacks after HOST are not necessarily DISK.
     struct target_tier_stats {
       std::atomic<size_t> batches{0};
       std::atomic<size_t> bytes{0};
     };
-    target_tier_stats host_target_stats, disk_target_stats;
+    std::array<target_tier_stats, static_cast<size_t>(cucascade::memory::Tier::SIZE)>
+      target_stats{};
+    auto& host_target_stats   = target_stats[static_cast<size_t>(cucascade::memory::Tier::HOST)];
+    auto& disk_target_stats   = target_stats[static_cast<size_t>(cucascade::memory::Tier::DISK)];
+    auto& remote_target_stats = target_stats[static_cast<size_t>(cucascade::memory::Tier::REMOTE)];
 
     cucascade::memory::memory_space* source_space = nullptr;
     std::vector<const cucascade::memory::memory_space*> target_spaces;
-    size_t host_end_idx      = 0;
-    bool disk_not_configured = false;
+    bool spill_not_configured = true;
     std::mutex failed_pipeline_candidates_mutex;
     std::vector<std::unique_ptr<convertible_data>> failed_pipeline_candidates;
     std::exception_ptr dispatch_error;
@@ -229,8 +317,8 @@ void downgrade_executor::processing_loop()
       // Resolve the source memory space for filtering candidates
       source_space = _reservation_manager.get_memory_space(_space_id.tier, _space_id.device_id);
 
-      // Build target spaces list: for GPU->HOST downgrade, target is HOST tier followed by DISK
-      // tier. NUMA preference (from downgrade_executor_config, v1.0 dd86dd0 intent re-authored on
+      // GPU targets prefer HOST, then DISK, then usable REMOTE; HOST sources skip HOST.
+      // NUMA preference (from downgrade_executor_config, v1.0 dd86dd0 intent re-authored on
       // the post-#637 architecture): if preferred_numa_node is set, stable_partition the matching
       // HOST space(s) to the front of target_spaces so cand->convert() tries the NUMA-local space
       // first.
@@ -253,12 +341,37 @@ void downgrade_executor::processing_loop()
           target_spaces.push_back(hs);
         }
       }
-      host_end_idx = target_spaces.size();
-      auto disk_spaces =
-        _reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::DISK);
-      disk_not_configured = disk_spaces.empty();
-      for (auto* ds : disk_spaces) {
-        target_spaces.push_back(ds);
+      if (_space_id.tier == cucascade::memory::Tier::GPU ||
+          _space_id.tier == cucascade::memory::Tier::HOST) {
+        for (auto* ds :
+             _reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::DISK)) {
+          target_spaces.push_back(ds);
+          spill_not_configured = false;
+        }
+        for (auto* rs :
+             _reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::REMOTE)) {
+          // Unlike DISK, REMOTE has no lazy default: credentials/context attachment may have
+          // been unavailable at startup. Never reserve or dispatch a conversion to that space.
+          if (rs && rs->get_io_context()) {
+            target_spaces.push_back(rs);
+            spill_not_configured = false;
+          }
+        }
+      }
+
+      // === TIER 0: default-local fs_cache (HOST only, idle chunks first) ===
+      // Return unused staging buffers before spilling repository data. Credit both the
+      // completed and planned totals so byte-target requests do not over-dispatch batches.
+      if (_space_id.tier == cucascade::memory::Tier::HOST && _fs_cache &&
+          !predicate_satisfied(req.get()) && !target_completed()) {
+        auto const target =
+          req->target_bytes.has_value()
+            ? *req->target_bytes - req->bytes_freed.load(std::memory_order_relaxed)
+            : std::numeric_limits<std::size_t>::max();
+        auto const freed = _fs_cache->reclaim(cucascade::io::cache::reclaim_mode::idle, target);
+        req->bytes_freed.fetch_add(freed, std::memory_order_relaxed);
+        planned_bytes.fetch_add(freed, std::memory_order_relaxed);
+        predicate_satisfied(req.get());
       }
 
       // === TIER 1: Data repositories ===
@@ -346,11 +459,9 @@ void downgrade_executor::processing_loop()
                &targets   = target_spaces,
                exc_stream = std::move(exc_stream),
                candidate_bytes,
-               host_end_idx,
                &planned_bytes,
                &repo_stats,
-               &host_target_stats,
-               &disk_target_stats,
+               &target_stats,
                predicate_satisfied]() mutable {
                 absl::Cleanup rollback = [&planned_bytes, candidate_bytes]() {
                   planned_bytes.fetch_sub(candidate_bytes, std::memory_order_relaxed);
@@ -367,13 +478,9 @@ void downgrade_executor::processing_loop()
                     repo_stats.bytes.fetch_add(candidate_bytes, std::memory_order_relaxed);
                     for (size_t i = 0; i < result->size(); ++i) {
                       if ((*result)[i] == 0) continue;
-                      if (i < host_end_idx) {
-                        host_target_stats.batches.fetch_add(1, std::memory_order_relaxed);
-                        host_target_stats.bytes.fetch_add((*result)[i], std::memory_order_relaxed);
-                      } else {
-                        disk_target_stats.batches.fetch_add(1, std::memory_order_relaxed);
-                        disk_target_stats.bytes.fetch_add((*result)[i], std::memory_order_relaxed);
-                      }
+                      auto& stats = target_stats[static_cast<size_t>(targets[i]->get_tier())];
+                      stats.batches.fetch_add(1, std::memory_order_relaxed);
+                      stats.bytes.fetch_add((*result)[i], std::memory_order_relaxed);
                     }
                     predicate_satisfied(req_ptr);
                   }
@@ -424,13 +531,11 @@ void downgrade_executor::processing_loop()
              &targets   = target_spaces,
              exc_stream = std::move(exc_stream),
              candidate_bytes,
-             host_end_idx,
              &planned_bytes,
              &failed_pipeline_candidates_mutex,
              &failed_pipeline_candidates,
              &pipeline_queue_stats,
-             &host_target_stats,
-             &disk_target_stats,
+             &target_stats,
              predicate_satisfied]() mutable {
               absl::Cleanup rollback = [&]() {
                 planned_bytes.fetch_sub(candidate_bytes, std::memory_order_relaxed);
@@ -449,13 +554,9 @@ void downgrade_executor::processing_loop()
                   pipeline_queue_stats.bytes.fetch_add(candidate_bytes, std::memory_order_relaxed);
                   for (size_t i = 0; i < result->size(); ++i) {
                     if ((*result)[i] == 0) continue;
-                    if (i < host_end_idx) {
-                      host_target_stats.batches.fetch_add(1, std::memory_order_relaxed);
-                      host_target_stats.bytes.fetch_add((*result)[i], std::memory_order_relaxed);
-                    } else {
-                      disk_target_stats.batches.fetch_add(1, std::memory_order_relaxed);
-                      disk_target_stats.bytes.fetch_add((*result)[i], std::memory_order_relaxed);
-                    }
+                    auto& stats = target_stats[static_cast<size_t>(targets[i]->get_tier())];
+                    stats.batches.fetch_add(1, std::memory_order_relaxed);
+                    stats.bytes.fetch_add((*result)[i], std::memory_order_relaxed);
                   }
                   predicate_satisfied(req_ptr);
                 }
@@ -476,6 +577,25 @@ void downgrade_executor::processing_loop()
     // until it returns.
     _pool->wait_all();
     failed_pipeline_candidates.clear();
+
+    // === TIER 3: default-local fs_cache (HOST only, forced final pass) ===
+    // Only a known, still-unmet byte target justifies dropping subscribed cache warmth.
+    // All workers have settled, so the deficit reflects actual rather than planned releases.
+    if (!dispatch_error && _space_id.tier == cucascade::memory::Tier::HOST && _fs_cache &&
+        req->target_bytes.has_value() && !predicate_satisfied(req.get()) && !target_completed()) {
+      try {
+        auto const remaining =
+          *req->target_bytes - req->bytes_freed.load(std::memory_order_relaxed);
+        auto const freed =
+          _fs_cache->reclaim(cucascade::io::cache::reclaim_mode::forced, remaining);
+        req->bytes_freed.fetch_add(freed, std::memory_order_relaxed);
+        planned_bytes.fetch_add(freed, std::memory_order_relaxed);
+        predicate_satisfied(req.get());
+      } catch (...) {
+        dispatch_error = std::current_exception();
+      }
+    }
+
     if (req->is_monitor_request) {
       _monitor_request_enqueued.store(false, std::memory_order_relaxed);
     }
@@ -498,11 +618,10 @@ void downgrade_executor::processing_loop()
         // Monitor requests are gated by has_viable_downgrade_target() and warn once per stall
         // episode in monitor_loop(); only warn here for one-shot (external) requests to avoid log
         // spam.
-        if (disk_not_configured && !req->satisfied.load() && !req->is_monitor_request) {
+        if (spill_not_configured && !req->satisfied.load() && !req->is_monitor_request) {
           SIRIUS_LOG_WARN(
-            "[downgrade] [{}] downgrade request not satisfied and disk memory space is not "
-            "configured; "
-            "data cannot be spilled to disk. Consider configuring a disk memory space to enable "
+            "[downgrade] [{}] downgrade request not satisfied and no disk or usable remote "
+            "memory space is configured. Configure a disk or remote memory space to enable "
             "spilling.",
             _source_label);
         }
@@ -525,7 +644,8 @@ void downgrade_executor::processing_loop()
           SIRIUS_LOG_INFO(
             "[downgrade][monitor] [{}] request done: {} batches, {} bytes in {:.2f} ms ({:.1f} "
             "MB/s), "
-            "satisfied={} | to_host: {}/{} batches/bytes, to_disk: {}/{} batches/bytes",
+            "satisfied={} | to_host: {}/{} batches/bytes, to_disk: {}/{} batches/bytes, "
+            "to_remote: {}/{} batches/bytes",
             _source_label,
             total_batches,
             total_bytes,
@@ -535,14 +655,17 @@ void downgrade_executor::processing_loop()
             host_target_stats.batches.load(std::memory_order_relaxed),
             host_target_stats.bytes.load(std::memory_order_relaxed),
             disk_target_stats.batches.load(std::memory_order_relaxed),
-            disk_target_stats.bytes.load(std::memory_order_relaxed));
+            disk_target_stats.bytes.load(std::memory_order_relaxed),
+            remote_target_stats.batches.load(std::memory_order_relaxed),
+            remote_target_stats.bytes.load(std::memory_order_relaxed));
         }
 
         SIRIUS_LOG_DEBUG(
           "[downgrade] [{}] request {}done: {} batches, {} bytes (target {}, planned {}) in "
           "{:.2f} ms ({:.1f} MB/s) | "
           "repos: {}/{} batches/bytes, pipeline_queue: {}/{} | "
-          "to_host: {}/{} batches/bytes, to_disk: {}/{} batches/bytes",
+          "to_host: {}/{} batches/bytes, to_disk: {}/{} batches/bytes, "
+          "to_remote: {}/{} batches/bytes",
           _source_label,
           request_label,
           total_batches,
@@ -558,7 +681,9 @@ void downgrade_executor::processing_loop()
           host_target_stats.batches.load(std::memory_order_relaxed),
           host_target_stats.bytes.load(std::memory_order_relaxed),
           disk_target_stats.batches.load(std::memory_order_relaxed),
-          disk_target_stats.bytes.load(std::memory_order_relaxed));
+          disk_target_stats.bytes.load(std::memory_order_relaxed),
+          remote_target_stats.batches.load(std::memory_order_relaxed),
+          remote_target_stats.bytes.load(std::memory_order_relaxed));
       });
     }
 
@@ -593,21 +718,28 @@ bool downgrade_executor::has_viable_downgrade_target() const
 {
   using cucascade::memory::Tier;
 
-  // DISK is an effectively unbounded sink and a valid target for any source tier.
-  if (has_disk_tier()) { return true; }
+  // Only GPU/HOST sources have supported lower-tier converters. DISK->REMOTE is deferred.
+  if (_space_id.tier != Tier::GPU && _space_id.tier != Tier::HOST) { return false; }
 
-  // Without a disk tier, only a GPU source has a lower tier to downgrade to (HOST). processing_loop
-  // only adds HOST target spaces when the source is GPU, so a HOST (or other) source has no target
-  // at all and can never free anything -- it must back off rather than re-fire.
+  // DISK adopts its default ioctx lazily. REMOTE is viable only with an attached context.
+  if (has_disk_tier()) { return true; }
+  for (auto* remote : _reservation_manager.get_memory_spaces_for_tier(Tier::REMOTE)) {
+    if (remote && remote->get_io_context()) { return true; }
+  }
+
+  // HOST cache reclaim returns staging buffers without requiring a DISK spill target.
+  if (_space_id.tier == Tier::HOST) { return _fs_cache && _fs_cache->claimed_bytes() != 0; }
+
+  // Without a usable spill sink, only a GPU source can downgrade to HOST.
   if (_space_id.tier != Tier::GPU) { return false; }
 
-  // GPU source, no disk: viable iff some HOST space can currently accept a reservation. Probe with
-  // exactly the operation a downgrade performs -- make_reservation_or_null of one chunk, released
-  // immediately (RAII). This is the ground truth: HOST reserve() is bounded by _allocated_bytes,
-  // which reflects BOTH live reservations AND already-stored downgraded data, so neither
-  // get_total_reserved_memory nor get_available_memory alone captures whether a downgrade can land.
-  // (The chunk-sized probe matches the chunked allocator's rounding; a sub-chunk request would
-  // succeed against a remainder that no real batch could use.)
+  // GPU source, no spill sink: viable iff some HOST space can currently accept a reservation.
+  // Probe with exactly the operation a downgrade performs -- make_reservation_or_null of one chunk,
+  // released immediately (RAII). This is the ground truth: HOST reserve() is bounded by
+  // _allocated_bytes, which reflects BOTH live reservations AND already-stored downgraded data, so
+  // neither get_total_reserved_memory nor get_available_memory alone captures whether a downgrade
+  // can land. (The chunk-sized probe matches the chunked allocator's rounding; a sub-chunk request
+  // would succeed against a remainder that no real batch could use.)
   for (const auto* hs : _reservation_manager.get_memory_spaces_for_tier(Tier::HOST)) {
     if (!hs) { continue; }
     // The manager owns these spaces mutably; the span just exposes them as const. make_reservation
@@ -637,11 +769,11 @@ void downgrade_executor::monitor_loop()
   // Monitor-thread-local; throttles the back-off warning to once per stall episode.
   bool backed_off = false;
 
-  while (_running.load()) {
+  while (_running.load() && !_paused.load()) {
     if (_memory_space && _memory_space->should_downgrade_memory() &&
         !_monitor_request_enqueued.load(std::memory_order_relaxed)) {
       // Stateless viability gate: only issue a downgrade request when one could plausibly free
-      // memory. When idle GPU batches' only lower tier is a full HOST and no DISK is configured,
+      // memory. When idle GPU batches' only lower tier is a full HOST and no spill sink is usable,
       // re-firing would just re-scan every repository and the task queue, free nothing, and spam
       // the log every monitor_period (~100x/s by default) forever. Skipping the cycle backs
       // off cleanly; because this is re-checked every cycle the monitor resumes the instant host
@@ -676,8 +808,8 @@ void downgrade_executor::monitor_loop()
       } else if (!backed_off) {
         SIRIUS_LOG_WARN(
           "[downgrade] [{}] memory pressure but no viable downgrade target (host full, no disk "
-          "configured); backing off until memory is released. Consider configuring a disk memory "
-          "space to enable spilling.",
+          "or usable remote configured); backing off until memory is released. Consider "
+          "configuring a disk or remote memory space to enable spilling.",
           _source_label);
         backed_off = true;
       }
@@ -687,8 +819,9 @@ void downgrade_executor::monitor_loop()
     }
     // Wait for the monitor period, but wake immediately on shutdown.
     std::unique_lock<std::mutex> lock(_monitor_cv_mutex);
-    _monitor_cv.wait_for(
-      lock, _config.monitor_period, [this]() { return !_running.load(std::memory_order_relaxed); });
+    _monitor_cv.wait_for(lock, _config.monitor_period, [this]() {
+      return !_running.load(std::memory_order_relaxed) || _paused.load(std::memory_order_relaxed);
+    });
   }
 }
 
@@ -702,6 +835,9 @@ void downgrade_executor::cancel_pending_requests()
       // Promise may already be fulfilled — safe to ignore
     }
   }
+  // All producers/consumers are joined by callers. A cancelled queued monitor request must not
+  // leave the monitor permanently believing that a request is still in flight after resume().
+  _monitor_request_enqueued.store(false, std::memory_order_relaxed);
 }
 
 void downgrade_executor::set_pipeline_task_queue(

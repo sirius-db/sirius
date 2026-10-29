@@ -97,10 +97,11 @@ class parquet_scan_core {
   /// per-row-group byte accounting. Returns a single @c parquet_file_scan_info.
   /// Runs on a scan-manager dispatcher thread (the task returned by
   /// @ref next_split_provider).
-  std::unique_ptr<scan_info> build_file_scan_info(std::string const& file_path,
-                                                  std::size_t file_index,
-                                                  std::shared_ptr<io::ioctx> const& io_ctx,
-                                                  std::stop_token stop = {});
+  std::unique_ptr<scan_info> build_file_scan_info(
+    std::string const& file_path,
+    std::size_t file_index,
+    std::shared_ptr<cucascade::io::ioctx> const& io_ctx,
+    std::stop_token stop = {});
 
   /// Add the carrier and user-requested virtual columns to a decoded parquet batch.
   [[nodiscard]] std::unique_ptr<cudf::table> append_virtual_columns(

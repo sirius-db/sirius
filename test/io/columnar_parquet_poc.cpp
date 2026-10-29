@@ -39,10 +39,6 @@
 #include "exec/semi_future.hpp"
 #include "exec/thread_pool.hpp"
 #include "exec/try.hpp"
-#include "io/io_context.hpp"
-#include "io/sirius_datasource.hpp"
-#include "io/types.hpp"
-#include "io/uring/uring_ioctx.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 
 #include <cudf/column/column.hpp>
@@ -58,6 +54,10 @@
 
 #include <rmm/device_buffer.hpp>
 
+#include <cucascade/cudf/datasource.hpp>
+#include <cucascade/io/io_context.hpp>
+#include <cucascade/io/types.hpp>
+#include <cucascade/io/uring/uring_ioctx.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <cucascade/memory/stream_pool.hpp>
 #include <glob.h>
@@ -217,7 +217,7 @@ std::vector<std::string> const COLUMNS = {
 
 struct file_info {
   std::string path;
-  std::unique_ptr<sirius::io::sirius_datasource> ds;
+  std::unique_ptr<cucascade::io::datasource> ds;
   // Column-chunk byte ranges grouped BY COLUMN — col_ranges[i] holds every
   // chunk of column i across all row groups.  This grouping is the whole point:
   // it is what lets each column be read and decoded independently.
@@ -273,11 +273,10 @@ std::vector<std::string> glob_parquet_files(std::string const& dir, std::size_t 
 
 // ---- baseline --------------------------------------------------------------
 
-// Parse a single parquet file using the sirius_datasource already backed by
+// Parse a single parquet file using the cucascade::io::datasource already backed by
 // the uring io_ctx.  source_info takes a raw (non-owning) datasource* so no
 // shim or ownership transfer is needed.
-std::unique_ptr<cudf::table> parse_parquet(sirius::io::sirius_datasource& ds,
-                                           ::cuda::stream_ref stream)
+std::unique_ptr<cudf::table> parse_parquet(cucascade::io::datasource& ds, ::cuda::stream_ref stream)
 {
   auto opts = cudf::io::parquet_reader_options::builder(cudf::io::source_info{&ds})
                 .column_names(COLUMNS)
@@ -341,7 +340,7 @@ void run_baseline(std::vector<file_info>& files,
  *       it is waiting for may never get one.  Call it from the main thread.
  */
 std::unique_ptr<cudf::table> columnar_parquet_parser(
-  sirius::io::sirius_datasource& ds,
+  cucascade::io::datasource& ds,
   std::vector<std::vector<byte_range>> const& col_ranges,
   std::vector<cudf::io::parquet_reader_options> const& col_opts,
   std::vector<cudf::io::parquet::FileMetaData const*> const& decode_metadata,
@@ -383,7 +382,7 @@ std::unique_ptr<cudf::table> columnar_parquet_parser(
       buffers.emplace_back(static_cast<std::size_t>(r.size()), stream.get(), mr);
     }
 
-    std::vector<sirius::io::slice> reads;
+    std::vector<cucascade::io::slice> reads;
     reads.reserve(ranges.size());
     for (std::size_t c = 0; c < ranges.size(); ++c) {
       reads.emplace_back(static_cast<std::size_t>(ranges[c].offset()),
@@ -621,9 +620,9 @@ int main(int argc, char** argv)
   auto* bounce_mr  = host_space->get_memory_resource_of<cucascade::memory::Tier::HOST>();
 
   // ---- io context ----------------------------------------------------------
-  auto ctx = std::make_shared<sirius::io::uring::uring_reactor::reactor_context>(
-    sirius::io::uring::uring_reactor::reactor_config_type{}, bounce_mr);
-  auto io_ctx = std::make_shared<sirius::io::uring::uring_ioctx>(1, std::move(ctx));
+  auto ctx = std::make_shared<cucascade::io::uring::uring_reactor::reactor_context>(
+    cucascade::io::uring::uring_reactor::reactor_config_type{}, bounce_mr);
+  auto io_ctx = std::make_shared<cucascade::io::uring::uring_ioctx>(1, std::move(ctx));
   io_ctx->start();
 
   // ---- thread pool + dispatcher --------------------------------------------
@@ -663,7 +662,7 @@ int main(int argc, char** argv)
   for (auto const& path : paths) {
     file_info fi;
     fi.path = path;
-    fi.ds   = io_ctx->open_datasource(path);
+    fi.ds   = cucascade::io::open_datasource(io_ctx, path);
 
     auto footer = cudf::io::parquet::fetch_footer_to_host(*fi.ds);
     hybrid_scan_reader reader(cudf::host_span<uint8_t const>(footer->data(), footer->size()),

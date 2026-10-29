@@ -37,6 +37,7 @@ class DataTable;
 namespace cucascade::memory {
 class memory_reservation_manager;
 class memory_space;
+class topology_index;
 }  // namespace cucascade::memory
 
 namespace sirius::exec {
@@ -44,7 +45,7 @@ class scoped_dispatcher;
 }  // namespace sirius::exec
 
 namespace sirius::memory {
-class topology_index;
+using cucascade::memory::topology_index;
 }  // namespace sirius::memory
 
 namespace sirius::scan_manager {

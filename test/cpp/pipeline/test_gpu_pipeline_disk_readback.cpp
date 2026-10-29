@@ -25,6 +25,7 @@
 
 #include <rmm/cuda_stream.hpp>
 
+#include <cucascade/cudf/disk_io_context.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
@@ -130,6 +131,9 @@ TEST_CASE("DISK->GPU round-trip conversion via converter registry", "[gpu_pipeli
   auto batch = make_gpu_batch(*gpu_space);
   REQUIRE(batch->to_read_only().get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
 
+  // The three-argument configurator leaves DISK unbound until its first conversion.
+  REQUIRE(disk_space->get_io_context() == nullptr);
+
   // --- GPU -> DISK ---
   {
     auto mut = batch->to_mutable();
@@ -138,6 +142,13 @@ TEST_CASE("DISK->GPU round-trip conversion via converter registry", "[gpu_pipeli
   }
 
   REQUIRE(batch->to_read_only().get_memory_space()->get_tier() == cucascade::memory::Tier::DISK);
+  auto const adopted_context = disk_space->get_io_context();
+  REQUIRE(adopted_context != nullptr);
+  CHECK(adopted_context == cucascade::default_disk_io_context());
+  {
+    auto ro = batch->to_read_only();
+    REQUIRE(dynamic_cast<cucascade::disk_data_representation const*>(ro.get_data()) != nullptr);
+  }
 
   // --- DISK -> GPU ---
   // This mirrors exactly what lock_or_prepare_batch Tier::GPU arm does when the batch is
@@ -149,6 +160,7 @@ TEST_CASE("DISK->GPU round-trip conversion via converter registry", "[gpu_pipeli
   }
 
   REQUIRE(batch->to_read_only().get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
+  CHECK(disk_space->get_io_context() == adopted_context);
 }
 
 TEST_CASE("DISK->GPU conversion preserves data correctness", "[gpu_pipeline_disk]")

@@ -15,9 +15,6 @@
  */
 
 #include "catch.hpp"
-#include "io/rest/rest_ioctx.hpp"
-#include "io/sirius_datasource.hpp"
-#include "io/types.hpp"
 #include "memory/topology_index.hpp"
 #include "op/scan/parquet_metadata.hpp"
 #include "scan/test_utils.hpp"
@@ -25,6 +22,9 @@
 #include "utils/s3_backend.hpp"
 #include "utils/s3_test_env.hpp"
 
+#include <cucascade/cudf/datasource.hpp>
+#include <cucascade/io/rest/rest_ioctx.hpp>
+#include <cucascade/io/types.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
 #include <duckdb.hpp>
 
@@ -40,7 +40,7 @@
 
 namespace {
 
-using sirius::io::rest::rest_ioctx;
+using cucascade::io::rest::rest_ioctx;
 using sirius::scan_manager::parquet_bind_result;
 using sirius::scan_manager::scan_manager_config;
 using sirius::scan_manager::sirius_scan_manager;
@@ -62,7 +62,7 @@ struct scan_manager_fixture {
 scan_manager_config make_s3_rest_config()
 {
   scan_manager_config cfg{};
-  cfg.backend                 = sirius::scan_manager::io_backend::sirius;
+  cfg.backend                 = sirius::scan_manager::io_backend::native;
   cfg.object_store.endpoint   = require_env("SIRIUS_TEST_S3_ENDPOINT");
   cfg.object_store.region     = env_or("SIRIUS_TEST_S3_REGION", "us-east-1");
   cfg.object_store.access_key = require_env("SIRIUS_TEST_S3_ACCESS_KEY");
@@ -71,7 +71,7 @@ scan_manager_config make_s3_rest_config()
   cfg.rest.request_timeout_s  = 30;
   cfg.rest.max_connections    = 8;
   cfg.rest_n_reactors         = 1;
-  cfg.cache.mode              = sirius::io::cache::cache_mode::none;
+  cfg.cache.mode              = cucascade::io::cache::cache_mode::none;
   return cfg;
 }
 
@@ -213,7 +213,7 @@ TEST_CASE("describe_parquet maps nested local parquet bind shape like DuckDB CPU
 {
   scan_manager_fixture fixture;
   scan_manager_config cfg{};
-  cfg.backend = sirius::scan_manager::io_backend::sirius;
+  cfg.backend = sirius::scan_manager::io_backend::native;
   sirius::exec::query_lifecycle_registry scan_lifecycle;
   sirius_scan_manager manager{scan_lifecycle, std::move(cfg), *fixture.memory, fixture.topology};
 

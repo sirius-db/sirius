@@ -100,6 +100,8 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/main/connection_manager.hpp"
 #include "exec/stream_plan_bindings.hpp"
 #include "helper/type_conversions.hpp"
+#include "io/s3/duckdb_secret_config.hpp"
+#include "io/s3/sirius_httpfs.hpp"  // sirius::io::s3::sirius_httpfs
 #include "late_mat/pin_uniqueness.hpp"
 #include "log/logging.hpp"
 #include "op/result/host_table_chunk_reader.hpp"
@@ -123,24 +125,6 @@ extern "C" int cudaProfilerStop();
 
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
-
-// PinTableFunction routes parquet reads through the scan manager's ioctx
-// instead of cudf's bundled file_source factory (which uses kvikio internally
-// and binds to a single CUDA context). This is mandatory in multi-GPU
-// configurations (enforced by sirius_config::enforce_sirius_backend_for_multi_gpu()).
-// Single-GPU users may still opt out via backend=kvikio; the
-// pin pipeline always routes through ioctx when one is available.
-//
-// Ordering rule: include uring_reactor LAST among sirius headers — liburing.h
-// transitively pulled by uring_reactor.hpp defines a BLOCK_SIZE preprocessor
-// macro that collides with the BLOCK_SIZE static member in
-// <blockingconcurrentqueue.h> (used by pipeline / duckdb
-// connection_manager). All consumers of blockingconcurrentqueue.h must
-// precede this include.
-#include "io/s3/duckdb_secret_config.hpp"
-#include "io/s3/sirius_httpfs.hpp"     // sirius::io::s3::sirius_httpfs
-#include "io/types.hpp"                // sirius::io::ioctx
-#include "io/uring/uring_reactor.hpp"  // sirius::io::uring_io_object
 
 #include <dlfcn.h>
 
@@ -1360,6 +1344,9 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
       return metadata;
     };
 
+    // Every tier materializes through the scan manager's ioctx rather than cuDF's bundled
+    // file_source factory, which binds to a single CUDA context.
+    // That is mandatory on multi-GPU.
     if (data.args.tier == "host") {
       // Stream each batch GPU->host: materialize one batch on its round-robin GPU, convert it
       // to a pinned host representation (compressed when it qualifies) on that GPU's NUMA-local
@@ -1543,7 +1530,7 @@ void SiriusRegistration::ResetSiriusCacheFunction(ClientContext& context,
     // rebuilding a cache creates no per-query runtime state to clean up.
     duckdb::SiriusContext::SlotGuard slot(
       *sirius_ctx, context, sirius::exec::query_admission::access::maintenance);
-    sirius_ctx->get_scan_manager().reset_caches();
+    sirius_ctx->reset_caches();
   }
 
   output.data[0].Append(Value::BOOLEAN(true));

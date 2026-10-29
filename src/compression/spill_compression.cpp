@@ -19,6 +19,7 @@
 #include "compressed_disk_representation.hpp"
 #include "compressed_representation.hpp"
 #include "sirius_config.hpp"
+#include "spill_io.hpp"
 #include "telemetry/nvtx.hpp"
 
 #include <cudf/copying.hpp>
@@ -26,6 +27,7 @@
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/traits.hpp>
 
+#include <rmm/cuda_device.hpp>
 #include <rmm/resource_ref.hpp>
 
 #include <absl/cleanup/cleanup.h>
@@ -33,7 +35,7 @@
 #include <api/simpatico_codegen.hpp>
 #include <codegen/util/stream_pool.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
-#include <cucascade/data/disk_io_backend.hpp>
+#include <cucascade/error.hpp>
 #include <cucascade/memory/disk_table.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
@@ -444,7 +446,7 @@ std::unique_ptr<cucascade::idata_representation> compress_gpu_to_host(
 }
 
 /// gpu_table to compressed_disk: encode on the device, write the .hpln file through the
-/// disk space's I/O backend.
+/// disk space's I/O context.
 std::unique_ptr<cucascade::idata_representation> compress_gpu_to_disk(
   const cucascade::idata_representation& source,
   const cucascade::memory::memory_space* target_memory_space,
@@ -452,37 +454,52 @@ std::unique_ptr<cucascade::idata_representation> compress_gpu_to_disk(
   [[maybe_unused]] cucascade::memory::reservation* reservation)
 {
   nvtx_scoped_range nvtx_range{"sirius::compression::gpu_to_compressed_disk"};
-  auto const& gpu   = source.cast<cucascade::gpu_table_representation>();
-  auto encoded      = encode_for_spill(gpu, stream);
-  auto& backend     = target_memory_space->get_io_backend();
+  auto const& gpu          = source.cast<cucascade::gpu_table_representation>();
+  auto const source_device = gpu.get_memory_space().get_device_id();
+  rmm::cuda_set_device_raii const device_guard{rmm::cuda_device_id{source_device}};
+  int stream_device = -1;
+  CUCASCADE_CUDA_TRY(cudaStreamGetDevice(stream.get(), &stream_device));
+  if (stream_device != source_device) {
+    throw std::invalid_argument("compressed spill: stream belongs to a different GPU");
+  }
+  auto encoded = encode_for_spill(gpu, stream);
+  auto ctx     = compression::detail::spill_context(*target_memory_space);
+  if (!ctx->supports_write() || !ctx->supports_device_write()) {
+    throw std::logic_error("compressed spill: DISK context cannot write host and device memory");
+  }
   auto const header = encoded.header.size();
-  spill_file file(*target_memory_space);
-
-  backend.write(file.path(), encoded.header.data(), header, 0);
-  std::vector<cucascade::io_batch_entry> entries;
-  entries.reserve(encoded.buffers.size());
+  auto const bytes  = header + static_cast<std::size_t>(encoded.payload_bytes);
+  std::vector<cucascade::io::write_slice> host_slices{{0, header, encoded.header.data()}};
+  std::vector<cucascade::io::write_slice> device_slices;
+  device_slices.reserve(encoded.buffers.size());
   for (auto const& buffer : encoded.buffers) {
     if (buffer.size_bytes > 0 && buffer.device_ptr != nullptr) {
-      entries.push_back({.ptr         = buffer.device_ptr,
-                         .size        = static_cast<std::size_t>(buffer.size_bytes),
-                         .file_offset = header + static_cast<std::size_t>(buffer.offset)});
+      device_slices.emplace_back(header + static_cast<std::size_t>(buffer.offset),
+                                 static_cast<std::size_t>(buffer.size_bytes),
+                                 static_cast<std::uint8_t const*>(buffer.device_ptr));
     }
   }
-  backend.write_batch(file.path(), entries, stream);
-  // The device buffers go with `encoded` at return.
-  stream.sync();
+  spill_file file(*target_memory_space);
+  auto object =
+    ctx->open_io_object_for_write(file.path(), compression::detail::spill_open_options(bytes));
+  compression::detail::spill_request request{
+    ctx->mixed_writev_async(*object, host_slices, device_slices, stream)};
+  compression::detail::check_spill_bytes(request.get(), bytes);
+  // Completion is host-observed and drains device transfers before encoded buffers die.
 
-  return std::make_unique<compressed_disk_representation>(
+  auto result = std::make_unique<compressed_disk_representation>(
     *const_cast<cucascade::memory::memory_space*>(target_memory_space),
-    file.release(),
+    file.path(),
     header,
-    header + static_cast<std::size_t>(encoded.payload_bytes),
+    bytes,
     encoded.uncompressed_bytes,
     encoded.num_rows);
+  (void)file.release();
+  return result;
 }
 
-/// compressed_host to compressed_disk: write the pinned header and payload as an .hpln
-/// file through the disk space's I/O backend, with no decode and no device work.
+/// compressed_host to compressed_disk: write the header and pinned payload as an .hpln
+/// file through the disk space's I/O context, with no decode and no device work.
 std::unique_ptr<cucascade::idata_representation> flush_host_to_disk(
   const cucascade::idata_representation& source,
   const cucascade::memory::memory_space* target_memory_space,
@@ -500,24 +517,33 @@ std::unique_ptr<cucascade::idata_representation> flush_host_to_disk(
   auto const& payload      = host.payload();
   auto const payload_bytes = host.get_size_in_bytes();
   auto const block_size    = payload.block_size();
-  auto& backend            = target_memory_space->get_io_backend();
-
-  spill_file file(*target_memory_space);
-  backend.write(file.path(), header.data(), header.size(), 0);
+  auto ctx                 = compression::detail::spill_context(*target_memory_space);
+  if (!ctx->supports_write()) {
+    throw std::logic_error("compressed spill: DISK context cannot write host memory");
+  }
+  std::vector<cucascade::io::write_slice> slices{{0, header.size(), header.data()}};
   std::size_t written = 0;
   for (std::size_t block = 0; written < payload_bytes; ++block) {
     auto const n = std::min(block_size, payload_bytes - written);
-    backend.write(file.path(), payload.at(block).data(), n, header.size() + written);
+    slices.emplace_back(
+      header.size() + written, n, reinterpret_cast<std::uint8_t const*>(payload.at(block).data()));
     written += n;
   }
+  spill_file file(*target_memory_space);
+  auto object = ctx->open_io_object_for_write(
+    file.path(), compression::detail::spill_open_options(header.size() + payload_bytes));
+  compression::detail::spill_request request{ctx->host_writev_async(*object, slices)};
+  compression::detail::check_spill_bytes(request.get(), header.size() + payload_bytes);
 
-  return std::make_unique<compressed_disk_representation>(
+  auto result = std::make_unique<compressed_disk_representation>(
     *const_cast<cucascade::memory::memory_space*>(target_memory_space),
-    file.release(),
+    file.path(),
     header.size(),
     header.size() + payload_bytes,
     host.get_uncompressed_data_size_in_bytes(),
     host.num_rows());
+  (void)file.release();
+  return result;
 }
 
 }  // namespace

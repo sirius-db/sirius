@@ -23,15 +23,20 @@ KvikIO (pronounced "quick I/O") is a RAPIDS library providing GPU-accelerated fi
 
 ## Our Usage Summary
 
-We use **0 of 7 modules**. libkvikio is a **transitive dependency** — it is pulled in by libcudf via the RAPIDS conda ecosystem but is not directly referenced anywhere in the Sirius codebase (`src/`, `test/`, `cucascade/`, or CMake files).
+This is a historical module inventory for the version listed above. Sirius and
+cuCascade no longer provide a kvikIO backend and use **0 of 7 modules** directly.
+libkvikio remains a **transitive libcudf dependency** in the RAPIDS conda ecosystem;
+the vcpkg cudf/cuvs ports also retain their kvikio dependency and its build/cache
+configuration. These package references do not enable a Sirius kvikIO backend.
 
 ### Why it's installed
 - libcudf depends on libkvikio for its Parquet/ORC I/O subsystem (`cudf::io`)
 - The dependency is declared in the pixi lock file but not in our direct dependencies
 
-### Potential relevance
-- If Sirius ever needs to read Parquet files directly on GPU (bypassing DuckDB's scanner), kvikio's `FileHandle` could enable GDS-accelerated reads
-- The `RemoteHandle` module could enable direct GPU reads from S3/HTTP without staging through CPU
+### Current Sirius I/O
+- Local GDS reads and writes use cuCascade's cuFile backend and private cuFile loader.
+- Object-store I/O uses cuCascade's native io_uring REST backend with TLS.
+- `scan_manager.backend: kvikio` and the removed kvikIO configuration block are rejected.
 
 ## Files That Reference This Library
 
@@ -39,4 +44,7 @@ We use **0 of 7 modules**. libkvikio is a **transitive dependency** — it is pu
 |-------------|---------|-------|
 | `pixi.lock` | Transitive dependency | Pulled in by libcudf |
 | `test/tpch_performance/pixi.lock` | Transitive dependency | Same |
-| `cucascade/.clang-format` | Include ordering regex | Groups kvikio with other RAPIDS libs |
+| `cucascade/.clang-format` | Include ordering regex | Historical RAPIDS include grouping |
+| `sirius-duckdb/vcpkg_ports/{cudf,cuvs}/vcpkg.json` | Transitive dependency | Their upstream implementations still require kvikio |
+| `sirius-duckdb/vcpkg_ports/kvikio/` | Transitive port | Builds the dependency for libcudf/cuvs, not a Sirius backend |
+| `sirius-duckdb/vcpkg_triplets/{x64,arm64}-linux.cmake` | Binary cache key | Tracks the shared RAPIDS input used by the transitive kvikio port |

@@ -27,8 +27,10 @@
 #include <cucascade/memory/topology_discovery.hpp>
 
 #include <cmath>
+#include <cstddef>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -356,6 +358,16 @@ class configuration_input_error : public std::runtime_error {
 
 class parsed_sirius_config;
 
+/// Transport overrides for remote spill. Credentials and TLS trust remain in the
+/// programmatically supplied object_store_config, never in YAML.
+struct remote_spill_config {
+  std::string endpoint;
+  std::string region;
+  std::optional<cucascade::io::object_store_config::signing_mode> signing_mode;
+  std::size_t n_reactors{2};
+  std::size_t staging_bytes{256UL << 20};  // Per reactor, pinned host memory.
+};
+
 struct sirius_config {
   sirius_config()  = default;
   ~sirius_config() = default;
@@ -387,7 +399,7 @@ struct sirius_config {
   /// @c sirius.executor.scan_manager.cache YAML block).  Stored inside the
   /// scan_manager config, which is its only consumer, so the two can never
   /// disagree.
-  [[nodiscard]] const io::cache::config& get_cache_config() const noexcept
+  [[nodiscard]] const cucascade::io::cache::config& get_cache_config() const noexcept
   {
     return _scan_manager_config.cache;
   }
@@ -397,9 +409,14 @@ struct sirius_config {
   /// get_scan_manager_config() reflects the actual scan_manager state.
   void set_scan_manager_config(scan_manager::scan_manager_config config) noexcept;
 
+  [[nodiscard]] const remote_spill_config& get_remote_spill_config() const noexcept
+  {
+    return _remote_spill_config;
+  }
+
   /// Set the in-memory S3 fallback. Credentials are never loaded from YAML.
   /// Set this before initializing consumers of the scan-manager configuration.
-  void set_object_store_config(io::object_store_config config) noexcept;
+  void set_object_store_config(cucascade::io::object_store_config config) noexcept;
 
   [[nodiscard]] const exec::thread_pool_config& get_gpu_pipeline_executor_config() const noexcept;
 
@@ -437,16 +454,17 @@ struct sirius_config {
   friend class parsed_sirius_config;
 
   /// Apply the knobs derived from the rest of the configuration: the readahead
-  /// scan budgets, the @c pipeline_width stamp and the multi-GPU backend
-  /// override, in that order. Called by parsed_sirius_config::resolve after
-  /// memory capacities and operator defaults are resolved.
+  /// scan budgets, the @c pipeline_width stamp, the multi-GPU backend
+  /// override and the uring prefetch reactors, in that order. Called by
+  /// parsed_sirius_config::resolve after memory capacities and operator
+  /// defaults are resolved.
   void finalize_derived_config();
 
   /// When @c _memory_space_configs contains more than one GPU memory space,
-  /// force @c _scan_manager_config.backend to @c io_backend::sirius (the
-  /// sirius backend is required for multi-GPU IO routing). Emits a WARNING when
+  /// force @c _scan_manager_config.backend to @c io_backend::native (the
+  /// native backend is required for multi-GPU IO routing). Emits a WARNING when
   /// the override takes effect. Called from @ref finalize_derived_config.
-  void enforce_sirius_backend_for_multi_gpu();
+  void enforce_native_backend_for_multi_gpu();
 
   /// Re-default @c _scan_manager_config.rest.n_max_concurrent_scans to a
   /// multiple of the configured pipeline pool size. Object-store reads are
@@ -460,6 +478,7 @@ struct sirius_config {
   std::vector<cucascade::memory::memory_space_config> _memory_space_configs;
   creator::task_creator_config _task_creator_config;
   scan_manager::scan_manager_config _scan_manager_config{};
+  remote_spill_config _remote_spill_config{};
   exec::thread_pool_config _gpu_pipeline_executor_config{
     .num_threads = exec::default_gpu_pipeline_num_threads, .thread_name_prefix = "gpu_pipeline"};
   exec::downgrade_executor_config _downgrade_executor_config;

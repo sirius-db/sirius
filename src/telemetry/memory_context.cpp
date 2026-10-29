@@ -29,6 +29,7 @@ inline std::string tier_to_string(cucascade::memory::Tier tier)
     case cucascade::memory::Tier::GPU: return "gpu";
     case cucascade::memory::Tier::HOST: return "host";
     case cucascade::memory::Tier::DISK: return "disk";
+    case cucascade::memory::Tier::REMOTE: return "remote";
     default: return "unknown";
   }
 }
