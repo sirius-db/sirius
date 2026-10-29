@@ -15,7 +15,9 @@
  */
 
 #include "io/cache/types.hpp"
+#include "op/scan/gpu_row_positions.hpp"
 #include "op/scan/owning_table_view.hpp"
+#include "op/scan/scan_execution_record.hpp"
 #include "op/scan/table_scan/scan_contract.hpp"
 
 #include <expression/ast/node.hpp>
@@ -393,6 +395,10 @@ struct filtered_table {
   /// Bytes the cached batch behind a resident view stores, read through the lease @c table holds;
   /// zero on every other path.
   std::size_t stored_bytes{0};
+  /// Additive during migration; a producer must qualify before this drives decisions.
+  std::optional<scan_execution_record> execution;
+  /// Present only while an internal positional consumer still needs reader survivors.
+  std::unique_ptr<gpu_row_positions> row_positions;
 };
 
 /**

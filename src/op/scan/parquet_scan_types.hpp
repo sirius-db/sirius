@@ -244,6 +244,8 @@ class parquet_split_info : public scan_info {
   /// row-group stats cudf cannot compare against an AST literal. The
   /// filter still applies post-decode via @c expression_evaluator.
   bool disable_filter_pushdown = false;
+  // Internal visibility demand. Virtual-column requests are computed independently.
+  bool requires_row_positions = false;
   /// Hive partition values for this split, in @c scan_plan::partition_columns
   /// order. Empty when the plan has no partition columns. Kept on the split so
   /// @ref materialize_table can call @c assemble_scan_output inline on the
@@ -353,6 +355,9 @@ class parquet_file_scan_info : public scan_info {
   /// cannot compare against an AST literal — reader-side pushdown must be
   /// disabled for any split that includes it.
   bool disable_filter_pushdown = false;
+  // Set by the core only for a route/expression with qualified original positions.
+  bool position_filter_eligible = false;
+  bool requires_row_positions   = false;
   /// No projected carrier was resolved (for example an empty footer). Reader mode
   /// retains the natural-schema fallback if neither a per-file virtual-scan
   /// carrier nor the bind-selected carrier is available. Metadata-only mode does

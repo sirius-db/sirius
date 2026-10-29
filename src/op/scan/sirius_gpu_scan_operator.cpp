@@ -548,7 +548,10 @@ row_selection select_rows(sirius_gpu_scan_operator const& scan,
   }
   if (assembly.output) { return selection; }
   auto const& space = *input.gpu_memory_space;
-  if (source.state == filter_state::ROW_FILTERED_AND_PROJECTED) {
+  // Migrated producers pass through their bound record consumer, including
+  // already assembled outputs. Legacy producers retain their old fast path.
+  if (source.state == filter_state::ROW_FILTERED_AND_PROJECTED &&
+      (!source.execution || !source.execution->authoritative)) {
     assembly.output = source.table.release(stream, space.get_default_allocator());
     return selection;
   }

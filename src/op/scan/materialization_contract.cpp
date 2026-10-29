@@ -58,17 +58,16 @@ void validate_materialized_batch(materialized_batch const& batch,
       if (width != static_cast<cudf::size_type>(expected.size()) || batch.row_count_carrier)
         throw std::invalid_argument("materialized input width mismatch");
       for (std::size_t i = 0; i < expected.size(); ++i) {
-        bool answer =
-          std::any_of(batch.predicates.begin(), batch.predicates.end(), [&](auto const& p) {
-            return p.stage == predicate_stage::answer && p.answer_slot == i;
-          });
-        auto type = answer ? cudf::data_type{cudf::type_id::BOOL8} : expected[i];
+        bool answer = std::any_of(batch.predicates.begin(),
+                                  batch.predicates.end(),
+                                  [&](auto const& p) { return p.answer_slot == i; });
+        auto type   = answer ? cudf::data_type{cudf::type_id::BOOL8} : expected[i];
         if (batch.table.view().column(i).type() != type)
           throw std::invalid_argument("materialized input type mismatch");
       }
     }
   }
-  std::vector<bool> seen(program.predicates);
+  std::vector<bool> seen(batch.predicates.empty() ? 0 : program.predicates);
   for (auto const& p : batch.predicates) {
     if (p.conjunct >= seen.size() || seen[p.conjunct])
       throw std::invalid_argument("unknown or duplicate materialized predicate");
@@ -76,7 +75,9 @@ void validate_materialized_batch(materialized_batch const& batch,
     if (p.stage != predicate_stage::untouched && p.stage != predicate_stage::pruning_only &&
         p.stage != predicate_stage::answer && p.stage != predicate_stage::enforced)
       throw std::invalid_argument("unknown predicate stage");
-    if ((p.stage == predicate_stage::answer) != p.answer_slot.has_value())
+    if ((p.stage == predicate_stage::answer && !p.answer_slot) ||
+        (p.answer_slot && p.stage != predicate_stage::answer &&
+         p.stage != predicate_stage::enforced))
       throw std::invalid_argument("invalid predicate answer report");
     if (p.answer_slot &&
         (*p.answer_slot >= static_cast<std::size_t>(batch.table.view().num_columns()) ||
@@ -108,18 +109,32 @@ materialized_batch finish_materialization(materialized_batch batch,
   std::size_t enforced      = 0;
   for (auto const& p : batch.predicates)
     enforced += p.stage == predicate_stage::enforced;
-  if (enforced != program.predicates) {
+  if (!batch.whole_static_complete && enforced != program.predicates) {
     if (!steps.residual) throw std::invalid_argument("missing residual step");
     steps.residual(batch);
-    batch.predicates.clear();
+    batch.whole_static_complete = true;
+    // Retain answer layout until projection consumes it, even after enforcing it.
+    std::vector<predicate_progress> completed;
+    completed.reserve(program.predicates);
     for (std::size_t i = 0; i < program.predicates; ++i)
-      batch.predicates.push_back({i, predicate_stage::enforced, {}});
+      completed.push_back({i, predicate_stage::enforced, {}});
+    for (auto const& p : batch.predicates) {
+      if (p.conjunct >= completed.size())
+        throw std::invalid_argument("residual step reported an unknown predicate");
+      completed[p.conjunct].answer_slot = p.answer_slot;
+    }
+    batch.predicates = std::move(completed);
     validate_materialized_batch(batch, program);
   }
+  batch.whole_static_complete = true;
   if (!batch.projection_complete) {
     if (!steps.projection) throw std::invalid_argument("missing projection step");
     steps.projection(batch);
     batch.projection_complete = true;
+    for (auto& p : batch.predicates) {
+      p.stage = predicate_stage::enforced;
+      p.answer_slot.reset();
+    }
     validate_materialized_batch(batch, program);
   }
   if (program.validate_output_schema && program.output_types.empty()) {

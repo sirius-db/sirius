@@ -347,6 +347,7 @@ set(TEST_SOURCES
     test/cpp/scan/test_parquet_schema_mapping.cpp
     test/cpp/scan/test_parquet_null_count_pruning.cpp
     test/cpp/scan/test_residual_filter.cpp
+    test/cpp/scan/test_scan_execution.cpp
     test/cpp/scan/test_scan_materialization.cpp
     test/cpp/scan/test_arrow_import_resources.cpp
     test/cpp/scan/test_scan_filter_cast_ranges.cpp

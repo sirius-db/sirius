@@ -89,6 +89,10 @@ class parquet_scan_core {
   [[nodiscard]] scan_filter_analysis const& filter_analysis() const { return _filter_analysis; }
 
  private:
+  [[nodiscard]] uint64_t execution_contract() const noexcept;
+  [[nodiscard]] scan_execution_record execution_progress(filtered_table const&) const;
+  [[nodiscard]] scan_execution_record decoded_execution(bool static_filter_applied,
+                                                        bool assembled) const;
   [[nodiscard]] std::unique_ptr<sirius::ast::node> remaining_residual(
     filtered_table const& input) const;
 
@@ -119,6 +123,7 @@ class parquet_scan_core {
   std::once_flag _evidence_index_once;
   std::vector<std::size_t> _evidence_index_by_file;
   const parquet_source_kind _source_kind;
+  const bool _requires_file_visibility;
   parquet_read_mode _read_mode = parquet_read_mode::READER;
 
   // Canonical scan plan — built once in the constructor, shared by every
@@ -145,6 +150,8 @@ class parquet_scan_core {
   // so post_filter_and_project assembles the residual from what the batch
   // reports rather than from anything precomputed here.
   residual_filter _residual;
+  // IDs in the full catalogue, fixed before any reader/statistics exclusions.
+  std::vector<std::size_t> _reader_conjuncts;
 
   // The part of _duckdb_filter_expression safe to push into the reader: the
   // full predicate minus any top-level AND conjunct that cuDF's row-group

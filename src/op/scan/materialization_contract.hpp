@@ -53,6 +53,7 @@ struct materialized_batch {
   bool row_count_carrier       = false;
   std::vector<predicate_progress> predicates;
   row_domain lineage;
+  bool whole_static_complete = false;
 };
 
 // Each step consumes/updates the owned batch on the caller's task stream. Row-changing

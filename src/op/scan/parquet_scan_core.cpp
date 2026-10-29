@@ -249,6 +249,17 @@ bool has_unreliable_bloom_filter_equality(duckdb::Expression const& expr)
   return found;
 }
 
+void top_level_conjuncts(duckdb::Expression const& expression,
+                         std::vector<duckdb::Expression const*>& result)
+{
+  if (expression.GetExpressionType() == duckdb::ExpressionType::CONJUNCTION_AND) {
+    for (auto const& child : expression.Cast<duckdb::BoundConjunctionExpression>().GetChildren())
+      top_level_conjuncts(*child, result);
+  } else {
+    result.push_back(&expression);
+  }
+}
+
 /// @p expr minus every top-level AND conjunct for which @p is_dropped holds;
 /// nullptr when none survive. A non-AND @p expr is a single conjunct.
 ///
@@ -460,6 +471,7 @@ class parquet_batch_coalescer : public batch_coalescer {
                          : std::shared_ptr<io::sirius_datasource>{},
         file->partition_values,
         file->disable_filter_pushdown,
+        file->requires_row_positions,
         file->reader_options,
         file->field_mapping,
         file->file_index,
@@ -489,6 +501,7 @@ class parquet_batch_coalescer : public batch_coalescer {
     if (!_slices.empty() &&
         (schema_changed || _partition_values != file->partition_values ||
          _disable_pushdown != file->disable_filter_pushdown ||
+         _requires_row_positions != file->requires_row_positions ||
          (_run_reader_options != file->reader_options && !same_virtual_projection) ||
          mapping_changed)) {
       auto batch = emit_current();
@@ -500,10 +513,11 @@ class parquet_batch_coalescer : public batch_coalescer {
       _run_original_schema = file->original_schema;
       _run_arrow_schema    = file->arrow_schema;
     }
-    _run_reader_options = file->reader_options;
-    _run_mapping        = file->field_mapping;
-    _partition_values   = file->partition_values;
-    _disable_pushdown   = file->disable_filter_pushdown;
+    _run_reader_options     = file->reader_options;
+    _run_mapping            = file->field_mapping;
+    _partition_values       = file->partition_values;
+    _disable_pushdown       = file->disable_filter_pushdown;
+    _requires_row_positions = file->requires_row_positions;
 
     std::vector<cudf::size_type> cur_rgs;
     std::size_t cur_output      = 0;
@@ -614,12 +628,13 @@ class parquet_batch_coalescer : public batch_coalescer {
                            /*reserved_compressed_bytes=*/0,
                            _empty_split_fallback->datasource,
                            _empty_split_fallback->file_index);
-      _partition_values   = _empty_split_fallback->partition_values;
-      _disable_pushdown   = _empty_split_fallback->disable_filter_pushdown;
-      _run_reader_options = _empty_split_fallback->reader_options;
-      _run_mapping        = _empty_split_fallback->field_mapping;
-      _certificates       = _empty_split_fallback->certificates;
-      _dependencies       = _empty_split_fallback->dependencies;
+      _partition_values       = _empty_split_fallback->partition_values;
+      _disable_pushdown       = _empty_split_fallback->disable_filter_pushdown;
+      _requires_row_positions = _empty_split_fallback->requires_row_positions;
+      _run_reader_options     = _empty_split_fallback->reader_options;
+      _run_mapping            = _empty_split_fallback->field_mapping;
+      _certificates           = _empty_split_fallback->certificates;
+      _dependencies           = _empty_split_fallback->dependencies;
       for (auto& certificate : _certificates) {
         certificate.split_id = _next_split_id++;
       }
@@ -647,6 +662,7 @@ class parquet_batch_coalescer : public batch_coalescer {
     split->source_kind             = _source_kind;
     split->read_mode               = _read_mode;
     split->disable_filter_pushdown = _disable_pushdown;
+    split->requires_row_positions  = _requires_row_positions;
     split->needs_assembly          = _needs_assembly;
     split->partition_values        = _partition_values;
     split->set_contract_payload(_contract_id, std::move(_certificates), std::move(_dependencies));
@@ -679,7 +695,8 @@ class parquet_batch_coalescer : public batch_coalescer {
   std::size_t _acc_run_count     = 0;
   int64_t _acc_rows              = 0;
   std::vector<std::string> _partition_values;
-  bool _disable_pushdown = false;
+  bool _disable_pushdown       = false;
+  bool _requires_row_positions = false;
   /// Reader options of the current run. Projected and natural reads cannot share
   /// a split.
   std::shared_ptr<cudf::io::parquet_reader_options> _run_reader_options;
@@ -694,6 +711,7 @@ class parquet_batch_coalescer : public batch_coalescer {
     std::shared_ptr<io::sirius_datasource> datasource;
     std::vector<std::string> partition_values;
     bool disable_filter_pushdown;
+    bool requires_row_positions;
     std::shared_ptr<cudf::io::parquet_reader_options> reader_options;
     std::shared_ptr<field_id_mapping const> field_mapping;
     std::size_t file_index;
@@ -806,7 +824,8 @@ parquet_scan_core::parquet_scan_core(std::unique_ptr<parquet_ingestible_table_in
   : _info(std::move(info)),
     _source_kind(_info->physical_schema || _info->field_mapping_requirements
                    ? parquet_source_kind::ICEBERG
-                   : source_kind)
+                   : source_kind),
+    _requires_file_visibility(source_kind == parquet_source_kind::ICEBERG)
 {
   auto const& bind = static_cast<parquet_ingestible_table_info const&>(table_info());
 
@@ -876,6 +895,20 @@ parquet_scan_core::parquet_scan_core(std::unique_ptr<parquet_ingestible_table_in
                                                            _plan->batch_position_by_column_id,
                                                            _plan->partition_primary_indices);
 
+    // Catalogue order is fixed from the complete bound filter, before exclusions.
+    auto groups = sirius::op::decompose_table_filters(*bind.table_filters,
+                                                      bind.column_ids,
+                                                      bind.returned_types,
+                                                      _plan->batch_position_by_column_id,
+                                                      _plan->partition_primary_indices,
+                                                      _virtual_types);
+    std::vector<table_filter_conjunct> catalogue;
+    for (auto const& group : groups) {
+      std::vector<duckdb::Expression const*> conjuncts;
+      top_level_conjuncts(*group.expr, conjuncts);
+      for (auto const* expression : conjuncts)
+        catalogue.push_back({group.primary_index, group.batch_position, expression->Copy()});
+    }
     auto duckdb_expression =
       sirius::op::convert_table_filters_to_expression(*bind.table_filters,
                                                       bind.column_ids,
@@ -940,6 +973,19 @@ parquet_scan_core::parquet_scan_core(std::unique_ptr<parquet_ingestible_table_in
         _duckdb_filter_expression->ToString());
     }
 
+    // Match complete catalogue items against the actual reader subset. In
+    // particular, a safe child of a discarded compound item was NOT executed.
+    if (_reader_pushdown_expression) {
+      std::vector<duckdb::Expression const*> reader_conjuncts;
+      top_level_conjuncts(*_reader_pushdown_expression, reader_conjuncts);
+      for (std::size_t id = 0; id < catalogue.size(); ++id)
+        if (std::any_of(
+              reader_conjuncts.begin(), reader_conjuncts.end(), [&](auto const* expression) {
+                return catalogue[id].expr->Equals(*expression);
+              }))
+          _reader_conjuncts.push_back(id);
+    }
+
     // Digest the pushed-down filter once: which pure-filter string columns a
     // dictionary-compressed source could answer without decoding them, and
     // which conjuncts a decoder could use to drop rows. This records only what
@@ -971,14 +1017,7 @@ parquet_scan_core::parquet_scan_core(std::unique_ptr<parquet_ingestible_table_in
       // batch has to rebuild a filter expression: each conjunct is lowered to
       // Sirius AST once, and a conjunct whose column can arrive as the answer
       // records where to read it instead.
-      _residual = sirius::op::residual_filter(
-        sirius::op::decompose_table_filters(*bind.table_filters,
-                                            bind.column_ids,
-                                            bind.returned_types,
-                                            _plan->batch_position_by_column_id,
-                                            _plan->partition_primary_indices,
-                                            _virtual_types),
-        answerable_positions);
+      _residual = sirius::op::residual_filter(std::move(catalogue), answerable_positions);
     }
   }
 
@@ -2250,7 +2289,8 @@ std::unique_ptr<cudf::table> normalize_provenance(
   std::vector<row_group_slice const*> const& sources,
   provenance_columns flags,
   ::cuda::stream_ref stream,
-  rmm::device_async_resource_ref mr)
+  rmm::device_async_resource_ref mr,
+  gpu_row_positions* positions = nullptr)
 {
   auto const rows            = decoded->num_rows();
   auto input                 = decoded->release();
@@ -2320,6 +2360,28 @@ std::unique_ptr<cudf::table> normalize_provenance(
                                  mr);
     auto columns    = gathered->release();
     output.push_back(std::move(columns.front()));
+  }
+  if (positions) {
+    positions->rows           = std::move(row);
+    positions->source_indices = std::move(source);
+    for (auto const* slice : sources) {
+      gpu_row_positions::source binding;
+      binding.file      = slice->file_path;
+      binding.file_rows = slice->file_metadata->num_rows;
+      uint64_t offset   = 0;
+      std::size_t next  = 0;
+      for (auto group : slice->row_group_indices) {
+        if (group < 0 || static_cast<std::size_t>(group) < next ||
+            static_cast<std::size_t>(group) >= slice->file_metadata->row_groups.size())
+          throw sirius::internal_exception("parquet provenance: invalid input row groups");
+        while (next < static_cast<std::size_t>(group))
+          offset += slice->file_metadata->row_groups[next++].num_rows;
+        auto const count = slice->file_metadata->row_groups[next++].num_rows;
+        if (count > 0) binding.ranges.emplace_back(offset, offset + count);
+        offset += count;
+      }
+      positions->sources.push_back(std::move(binding));
+    }
   }
   return std::make_unique<cudf::table>(std::move(output));
 }
@@ -2411,6 +2473,7 @@ filtered_table parquet_scan_core::materialize_metadata_to_table(
 
   rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
   std::unique_ptr<cudf::table> table;
+  std::unique_ptr<gpu_row_positions> positions;
   if (split.read_mode == parquet_read_mode::METADATA_ONLY) {
     if (split.source_kind != parquet_source_kind::PLAIN_PARQUET ||
         !_plan->has_user_virtual_columns() || _sirius_dynamic_filters ||
@@ -2418,9 +2481,17 @@ filtered_table parquet_scan_core::materialize_metadata_to_table(
       throw sirius::internal_exception("parquet metadata scan: ineligible split");
     }
     table = synthesize_metadata_rows(*_plan, split, stream, mr_ref);
-  } else if (_plan->has_user_virtual_columns() && !all_slices_pruned &&
-             split.source_kind == parquet_source_kind::PLAIN_PARQUET) {
+  } else if (!all_slices_pruned && (split.requires_row_positions ||
+                                    (_plan->has_user_virtual_columns() &&
+                                     split.source_kind == parquet_source_kind::PLAIN_PARQUET))) {
     auto flags = requested_provenance(*_plan);
+    // Unfiltered batches retain their cheaper interval mapping. Only actual reader
+    // selection creates a new need for per-row positions at the delete boundary.
+    if (split.requires_row_positions && reader_filter_root) {
+      positions    = std::make_unique<gpu_row_positions>();
+      flags.row    = true;
+      flags.source = true;
+    }
     std::vector<row_group_slice const*> bindings;
     std::vector<std::unique_ptr<cudf::io::datasource>> sources;
     std::vector<cudf::io::parquet::FileMetaData> metadatas;
@@ -2438,6 +2509,9 @@ filtered_table parquet_scan_core::materialize_metadata_to_table(
     if (bindings.size() == 1) { flags.source = false; }
     opts.enable_prepend_source_index_column(flags.source);
     opts.enable_prepend_row_index_column(flags.row);
+    if (auto const& counters = _info->profiles->counters;
+        counters && counters->track_units && counters->parquet_positions_for_testing)
+      counters->parquet_positions_for_testing(flags.row, flags.source);
     opts.set_row_groups(std::move(row_groups));
     _reader_calls.fetch_add(1, std::memory_order_relaxed);
     if (_info->profiles->counters)
@@ -2445,7 +2519,8 @@ filtered_table parquet_scan_core::materialize_metadata_to_table(
         _info->profiles->counters->reader_call(slice->file_path);
     auto result =
       cudf::io::read_parquet(std::move(sources), std::move(metadatas), opts, stream, mr_ref);
-    table = normalize_provenance(std::move(result.tbl), *_plan, bindings, flags, stream, mr_ref);
+    table = normalize_provenance(
+      std::move(result.tbl), *_plan, bindings, flags, stream, mr_ref, positions.get());
     if (_info->profiles->counters)
       for (auto const* slice : bindings)
         _info->profiles->counters->parquet_phase(slice->file_path, false);
@@ -2578,8 +2653,8 @@ filtered_table parquet_scan_core::materialize_metadata_to_table(
   // (carried on parquet_split_info) and do not travel to the pipeline-shared
   // post_filter info. Apply the row filter first when pushdown did not, then
   // inject the partition columns and project to the output layout, so the
-  // result is fully ROW_FILTERED_AND_PROJECTED and post_filter_and_project is
-  // skipped. `sirius_filter_ast` must outlive `exec` — the evaluator borrows it.
+  // result is fully ROW_FILTERED_AND_PROJECTED and the shared consumer skips
+  // completed work. `sirius_filter_ast` must outlive `exec` — the evaluator borrows it.
 
   // The reader discharged the row filter only if it pushed the WHOLE predicate.
   // After a partial push the dropped conjuncts still have to be applied below.
@@ -2604,13 +2679,24 @@ filtered_table parquet_scan_core::materialize_metadata_to_table(
     }
     auto assembled =
       assemble_scan_output(*_plan, std::move(view), split.partition_values, stream, mr_ref);
-    return op::scan::filtered_table{std::move(assembled),
-                                    op::scan::filter_state::ROW_FILTERED_AND_PROJECTED};
+    auto result                    = op::scan::filtered_table{std::move(assembled),
+                                           op::scan::filter_state::ROW_FILTERED_AND_PROJECTED};
+    result.execution               = decoded_execution(ast_expression.has_value(), true);
+    result.execution->layout_width = result.table.n_columns();
+    return result;
   }
 
   auto const state = reader_applied_full_filter ? op::scan::filter_state::ROW_FILTERED
                                                 : op::scan::filter_state::UNFILTERED;
-  return op::scan::filtered_table{owning_table_view{std::move(table)}, state};
+  auto result      = op::scan::filtered_table{owning_table_view{std::move(table)}, state};
+  result.execution = decoded_execution(ast_expression.has_value(), false);
+  result.execution->layout_width = result.table.n_columns();
+  result.execution->positions    = positions                   ? row_position_state::per_row
+                                   : reader_filter_root        ? row_position_state::lost
+                                   : _requires_file_visibility ? row_position_state::runs
+                                                               : row_position_state::none;
+  result.row_positions           = std::move(positions);
+  return result;
 }
 
 //===----------------------------------------------------------------------===//
@@ -2643,14 +2729,60 @@ std::vector<std::size_t> unelided_output_positions(scan_plan const& plan,
 
 }  // namespace
 
+uint64_t parquet_scan_core::execution_contract() const noexcept
+{
+  return _info->physical_contract.contract_id ? _info->physical_contract.contract_id
+                                              : reinterpret_cast<uintptr_t>(this);
+}
+
+scan_execution_record parquet_scan_core::decoded_execution(bool static_filter_applied,
+                                                           bool assembled) const
+{
+  scan_execution_record record;
+  record.contract                = execution_contract();
+  record.generation              = 1;
+  record.producer                = execution_record_producer::parquet;
+  record.authoritative           = false;
+  record.logical_schema_complete = true;
+  record.visibility_complete     = !_requires_file_visibility;
+  record.projection_complete     = assembled;
+  record.whole_static_complete =
+    assembled || _residual.empty() || (static_filter_applied && _reader_pushdown_is_complete);
+  // Whole completion needs no per-conjunct allocation. Partial coverage retains IDs.
+  if (static_filter_applied && !record.whole_static_complete)
+    for (auto id : _reader_conjuncts)
+      record.predicates.push_back({id, predicate_stage::enforced, {}});
+  return record;
+}
+
 std::unique_ptr<sirius::ast::node> parquet_scan_core::remaining_residual(
   filtered_table const& input) const
 {
-  if (input.state == filter_state::ROW_FILTERED ||
-      input.state == filter_state::ROW_FILTERED_AND_PROJECTED || _residual.empty()) {
-    return nullptr;
+  auto const progress = execution_progress(input);
+  return progress.whole_static_complete ? nullptr : _residual.against_progress(progress.predicates);
+}
+
+scan_execution_record parquet_scan_core::execution_progress(filtered_table const& input) const
+{
+  auto selected =
+    select_execution_record(input.execution ? &*input.execution : nullptr,
+                            {input.state, input.predicate_columns, input.predicates_enforced},
+                            _residual,
+                            execution_contract(),
+                            1);
+  if (selected.used_producer &&
+      (!selected.facts.layout_width || *selected.facts.layout_width != input.table.n_columns()))
+    throw std::invalid_argument("scan execution record layout mismatch");
+  if (!selected.used_producer && input.execution && input.execution->layout_width &&
+      *input.execution->layout_width != input.table.n_columns())
+    selected.shadow_mismatch = true;
+  if (auto const& counters = _info->profiles->counters) {
+    if (selected.shadow_mismatch)
+      counters->execution_record_shadow_mismatches.fetch_add(1, std::memory_order_relaxed);
+    if (counters->track_units && counters->scan_execution_for_testing)
+      counters->scan_execution_for_testing(selected.used_producer, selected.facts);
   }
-  return _residual.against(input.predicate_columns, input.predicates_enforced);
+  return std::move(selected.facts);
 }
 
 bool parquet_scan_core::can_serve_cached_view() const noexcept
@@ -2665,9 +2797,10 @@ bool parquet_scan_core::can_serve_cached_view() const noexcept
 std::optional<cached_view_layout> parquet_scan_core::view_layout(
   filtered_table const& input, std::span<std::size_t const> elided) const
 {
-  if (!can_serve_cached_view() || input.state == filter_state::ROW_FILTERED_AND_PROJECTED) {
-    return std::nullopt;
-  }
+  bool const assembled = input.execution && input.execution->authoritative
+                           ? input.execution->projection_complete
+                           : input.state == filter_state::ROW_FILTERED_AND_PROJECTED;
+  if (!can_serve_cached_view() || assembled) { return std::nullopt; }
   auto const width  = input.table.n_columns();
   auto const prefix = output_prefix_width();
   if (width != _plan->data_columns.size() &&
@@ -2720,27 +2853,24 @@ std::unique_ptr<cudf::table> parquet_scan_core::post_filter_and_project(
   state->input        = std::move(source);
   auto& input         = state->input;
 
-  // The legacy filter state is translated once at this boundary. Its residual
-  // owns the conjunct-level answer binding; the finish program tracks completion
-  // of that bound expression without maintaining a second mutable coverage map.
+  // Legacy producers retain their authority. Migrated producers carry their own
+  // record for the exact catalogue and delivered layout.
   materialization_program program;
-  program.contract = _info->physical_contract.contract_id;
-  // Legacy standalone test bindings predate physical contract IDs. The core
-  // lifetime is their query-local identity; it never escapes this synchronous call.
-  if (!program.contract) program.contract = reinterpret_cast<uintptr_t>(this);
+  program.contract               = execution_contract();
   program.generation             = 1;
   program.validate_output_schema = false;  // scan_plan owns the legacy output schema.
-  program.predicates             = _residual.empty() ? 0 : 1;
+  program.predicates             = _residual.size();
+  auto const progress            = execution_progress(input);
   materialized_batch batch;
   batch.contract                = program.contract;
   batch.generation              = program.generation;
   batch.rows                    = input.table.num_rows();
   batch.logical_schema_complete = true;
   batch.visibility_complete     = true;  // Adapter visibility runs before this legacy bridge.
-  if (program.predicates && (input.state == filter_state::ROW_FILTERED ||
-                             input.state == filter_state::ROW_FILTERED_AND_PROJECTED))
-    batch.predicates.push_back({0, predicate_stage::enforced, {}});
-  batch.table = std::move(input.table);
+  batch.whole_static_complete   = progress.whole_static_complete;
+  batch.predicates              = progress.predicates;
+  batch.projection_complete     = progress.projection_complete;
+  batch.table                   = std::move(input.table);
   materialization_steps steps;
   steps.residual = [&](materialized_batch& batch) {
     input.table = std::move(batch.table);
@@ -2749,15 +2879,14 @@ std::unique_ptr<cudf::table> parquet_scan_core::post_filter_and_project(
     // ROW_FILTERED / ROW_FILTERED_AND_PROJECTED state means the reader already
     // applied it. `sirius_filter_ast` must outlive `exec` — the evaluator only
     // borrows the AST.
-    if (input.state != filter_state::ROW_FILTERED &&
-        input.state != filter_state::ROW_FILTERED_AND_PROJECTED && !_residual.empty()) {
+    if (!batch.whole_static_complete && !_residual.empty()) {
       // The decoder may have answered some pure-filter columns for this batch.
       // Where it also APPLIED those answers, the surviving rows already satisfy
       // the conjunct and it leaves the residual entirely; where it only answered
       // them, the conjunct becomes a reference to the BOOL8 rather than a
       // re-comparison. The residual owns the per-conjunct forms and must outlive
       // `exec`, which only borrows the AST.
-      state->residual = remaining_residual(input);
+      state->residual = _residual.against_progress(batch.predicates);
       if (state->residual) {
         state->evaluator = std::make_unique<sirius::expression_evaluator>(
           state->residual.get(),
@@ -2791,6 +2920,9 @@ std::unique_ptr<cudf::table> parquet_scan_core::post_filter_and_project(
         // The select only enqueued its reads; record before the reassignment drops the read lock.
         detail::check_read_checkpoint(detail::read_checkpoint::READER_EVENT);
         input.table.record_reader_event(stream);
+        if (project_output)
+          for (auto& p : batch.predicates)
+            p.answer_slot.reset();
         input = filtered_table{owning_table_view{std::move(filtered)}, filter_state::ROW_FILTERED};
         SIRIUS_LOG_DEBUG(
           "[parquet_scan_core::post_filter_and_project] Applied the residual filter "
