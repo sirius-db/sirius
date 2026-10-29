@@ -18,6 +18,7 @@
 
 #include "log/logging.hpp"
 #include "memory/pool_peer_access_detail.hpp"
+#include "memory/pool_peer_access_scan.hpp"
 
 #include <rmm/mr/cuda_async_memory_resource.hpp>
 
