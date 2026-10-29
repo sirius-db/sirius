@@ -19,11 +19,13 @@
 #include "io/io_context.hpp"
 #include "io/kvikio/kvikio_context.hpp"
 #include "io/object_store_config.hpp"
+#include "io/reactor_placement.hpp"
 #include "io/rest/rest_ioctx.hpp"
 #include "io/rest/s3/sigv4_authorizer.hpp"
 #include "io/rest/s3/static_credentials.hpp"
 #include "io/uring/uring_ioctx.hpp"
 #include "log/logging.hpp"
+#include "memory/topology_index.hpp"
 #include "scan_manager/config.hpp"
 
 #include <cudf/io/datasource.hpp>
@@ -35,6 +37,7 @@
 #include <algorithm>
 #include <cctype>
 #include <exception>
+#include <format>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -175,15 +178,54 @@ namespace {
   return out;
 }
 
-/// First HOST-tier pinned staging resource, or nullptr when none exists.  The
-/// uring / rest reactors stage device reads through it and size their bounce
-/// slots from its block size.
-cucascade::memory::fixed_size_host_memory_resource* first_host_resource(
-  cucascade::memory::memory_reservation_manager& rm)
+// Build one context per participating host pool, keeping its staging resource
+// alive through the reservation manager. Reactor count remains a total budget,
+// raised only when necessary to give every participating NUMA domain a worker.
+template <class Context, class MakeContext>
+std::shared_ptr<Context> make_placed_ioctx(cucascade::memory::memory_reservation_manager& rm,
+                                           memory::topology_index const* topology,
+                                           std::size_t count,
+                                           MakeContext make_context)
 {
-  auto host_spaces = rm.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
-  if (host_spaces.empty()) { return nullptr; }
-  return host_spaces.front()->get_memory_resource_of<cucascade::memory::Tier::HOST>();
+  using Reactor     = typename Context::reactor_type;
+  auto const spaces = rm.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+  std::vector<int> nodes;
+  for (auto* space : spaces)
+    nodes.push_back(space->get_device_id());
+  std::vector<std::pair<int, int>> gpu_nodes;
+  if (topology) {
+    for (int gpu : topology->gpu_ids())
+      gpu_nodes.emplace_back(gpu, topology->numa_node_of(gpu));
+  }
+  // REST supports metadata-only contexts without a host pool. Its existing
+  // device-read validation remains responsible for rejecting unstaged reads.
+  auto placement = nodes.empty() ? reactor_placement{std::vector<std::size_t>(count, 0), {}}
+                                 : place_reactors(count, nodes, gpu_nodes);
+  if (placement.host_indices.size() > count) {
+    SIRIUS_LOG_INFO("I/O reactor count raised from {} to {} for NUMA-local staging",
+                    count,
+                    placement.host_indices.size());
+  }
+  std::vector<std::shared_ptr<typename Reactor::reactor_context>> contexts(
+    std::max<std::size_t>(1, spaces.size()));
+  std::vector<std::unique_ptr<Reactor>> reactors;
+  for (auto host : placement.host_indices) {
+    if (!contexts[host]) {
+      auto* mr       = spaces.empty()
+                         ? nullptr
+                         : spaces[host]->template get_memory_resource_of<cucascade::memory::Tier::HOST>();
+      contexts[host] = make_context(mr);
+    }
+    reactors.push_back(std::make_unique<Reactor>(
+      contexts[host], std::format("io-{}-{}", nodes.empty() ? -1 : nodes[host], reactors.size())));
+  }
+  for (auto const& [gpu, indices] : placement.devices) {
+    SIRIUS_LOG_INFO("I/O staging GPU {} -> HOST:{} ({} reactors)",
+                    gpu,
+                    nodes[placement.host_indices[indices.front()]],
+                    indices.size());
+  }
+  return std::make_shared<Context>(std::move(reactors), std::move(placement.devices));
 }
 
 /// Build a SigV4 authorizer from the object-store credentials, or nullptr when
@@ -224,20 +266,21 @@ factory_type make_kvikio_ioctx_factory()
 }
 
 factory_type make_uring_ioctx_factory(
-  cucascade::memory::memory_reservation_manager& reservation_manager)
+  cucascade::memory::memory_reservation_manager& reservation_manager,
+  std::shared_ptr<const memory::topology_index> topology)
 {
-  return [&reservation_manager](
+  return [&reservation_manager, topology = std::move(topology)](
            const scan_manager::scan_manager_config& config) -> std::shared_ptr<ioctx> {
     try {
-      auto* host_mr = first_host_resource(reservation_manager);
-      if (host_mr == nullptr) {
+      if (reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST).empty()) {
         SIRIUS_LOG_ERROR(
           "make_uring_ioctx_factory: no HOST-tier memory resource for the reactor staging");
         return nullptr;
       }
-      // One reactor_context shares config and the pinned staging resource.
-      auto ctx = std::make_shared<uring::uring_reactor::reactor_context>(config.uring, host_mr);
-      return std::make_shared<uring::uring_ioctx>(config.uring_n_reactors, std::move(ctx));
+      return make_placed_ioctx<uring::uring_ioctx>(
+        reservation_manager, topology.get(), config.uring_n_reactors, [&](auto* mr) {
+          return std::make_shared<uring::uring_reactor::reactor_context>(config.uring, mr);
+        });
     } catch (const std::exception& e) {
       SIRIUS_LOG_ERROR("make_uring_ioctx_factory: construction failed: {}", e.what());
       return nullptr;
@@ -246,9 +289,10 @@ factory_type make_uring_ioctx_factory(
 }
 
 factory_type make_rest_ioctx_factory(
-  cucascade::memory::memory_reservation_manager& reservation_manager)
+  cucascade::memory::memory_reservation_manager& reservation_manager,
+  std::shared_ptr<const memory::topology_index> topology)
 {
-  return [&reservation_manager](
+  return [&reservation_manager, topology = std::move(topology)](
            const scan_manager::scan_manager_config& config) -> std::shared_ptr<ioctx> {
     try {
       auto authorizer = make_s3_authorizer(config.object_store);
@@ -258,16 +302,16 @@ factory_type make_rest_ioctx_factory(
           "region missing); REST backend disabled");
         return nullptr;
       }
-      auto* host_mr = first_host_resource(reservation_manager);
       auto rest_cfg = config.rest;
       // The object store owns the endpoint and its TLS trust; the reactor's
       // curl GETs must verify against the same CA bundle / policy the authorizer
       // presigns for, so source these from object_store rather than rest config.
       rest_cfg.ca_bundle_path = config.object_store.ca_bundle_path;
       rest_cfg.tls_verify     = config.object_store.tls_verify;
-      auto ctx                = std::make_shared<rest::rest_reactor::reactor_context>(
-        std::move(rest_cfg), std::move(authorizer), host_mr);
-      return std::make_shared<rest::rest_ioctx>(config.rest_n_reactors, std::move(ctx));
+      return make_placed_ioctx<rest::rest_ioctx>(
+        reservation_manager, topology.get(), config.rest_n_reactors, [&](auto* mr) {
+          return std::make_shared<rest::rest_reactor::reactor_context>(rest_cfg, authorizer, mr);
+        });
     } catch (const std::exception& e) {
       SIRIUS_LOG_ERROR("make_rest_ioctx_factory: construction failed: {}", e.what());
       return nullptr;
@@ -280,7 +324,9 @@ factory_type make_rest_ioctx_factory(
 // ---------------------------------------------------------------------------
 
 io_context_registry::io_context_registry(
-  config_type config, cucascade::memory::memory_reservation_manager& reservation_manager)
+  config_type config,
+  cucascade::memory::memory_reservation_manager& reservation_manager,
+  std::shared_ptr<const memory::topology_index> topology)
   : _config(std::move(config)),
     _reservation_manager(reservation_manager),
     _prefer_kvikio(_config.backend == scan_manager::io_backend::kvikio)
@@ -295,11 +341,11 @@ io_context_registry::io_context_registry(
   _entries.emplace(io_context_type::uring,
                    entry{io_context_type::uring,
                          &uring::uring_reactor::supports,
-                         make_uring_ioctx_factory(_reservation_manager)});
+                         make_uring_ioctx_factory(_reservation_manager, topology)});
   _entries.emplace(io_context_type::restful,
                    entry{io_context_type::restful,
                          &rest::rest_reactor::supports,
-                         make_rest_ioctx_factory(_reservation_manager)});
+                         make_rest_ioctx_factory(_reservation_manager, topology)});
 }
 
 void io_context_registry::register_ioctx(io_context_type type,

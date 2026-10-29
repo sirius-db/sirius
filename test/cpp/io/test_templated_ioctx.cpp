@@ -69,7 +69,7 @@ class fake_reactor {
 
   [[nodiscard]] std::size_t queued_bytes() const noexcept { return backlog; }
 
-  [[nodiscard]] std::size_t staging_block_size() const noexcept { return 0; }
+  [[nodiscard]] std::size_t staging_block_size() const noexcept { return block_size; }
 
   std::size_t host_read(fake_object const&, std::size_t, std::size_t size, std::uint8_t*) const
   {
@@ -94,6 +94,7 @@ class fake_reactor {
   }
 
   fake_config config;
+  std::size_t block_size{0};
   std::size_t backlog;
   std::vector<std::unique_ptr<sirius::io::grouped_io_request>> requests;
 };
@@ -211,4 +212,104 @@ TEST_CASE("mixed dispatch reports failure for a dropped fragmented slice past EO
   CHECK(callback_count.load(std::memory_order_acquire) == 1);
   REQUIRE(future.is_ready());
   CHECK(std::move(future).get() == 0);
+}
+
+TEST_CASE("reactor placement covers NUMA domains without multiplying the worker budget",
+          "[io][ioctx][numa]")
+{
+  using sirius::io::place_reactors;
+  // Sparse, deliberately reversed host and device IDs must not be treated as indices.
+  auto placement = place_reactors(4, {9, 3}, {{2, 3}, {7, 3}, {5, 9}, {8, 9}});
+  CHECK(placement.host_indices == std::vector<std::size_t>{0, 1, 0, 1});
+  CHECK(placement.devices.at(2) == std::vector<std::size_t>{1, 3});
+  CHECK(placement.devices.at(7) == placement.devices.at(2));
+  CHECK(placement.devices.at(5) == std::vector<std::size_t>{0, 2});
+  CHECK(placement.devices.at(8) == placement.devices.at(5));
+
+  auto minimum = place_reactors(1, {9, 3}, {{2, 3}, {5, 9}});
+  CHECK(minimum.host_indices.size() == 2);
+  CHECK(minimum.devices.at(2).size() == 1);
+  CHECK(minimum.devices.at(5).size() == 1);
+
+  auto fallback = place_reactors(3, {9, 3}, {{2, -1}, {7, 99}});
+  CHECK(fallback.host_indices == std::vector<std::size_t>{0, 0, 0});
+  CHECK(fallback.devices.at(2) == fallback.devices.at(7));
+  CHECK(place_reactors(2, {9, 3}, {}).host_indices == std::vector<std::size_t>{0, 0});
+  CHECK_THROWS_AS(place_reactors(0, {9}, {}), std::invalid_argument);
+  CHECK_THROWS_AS(place_reactors(1, {}, {}), std::invalid_argument);
+}
+
+TEST_CASE("device reads stay on local staging reactors even when remote workers are idle",
+          "[io][ioctx][numa]")
+{
+  std::vector<std::unique_ptr<fake_reactor>> reactors;
+  std::vector<fake_reactor*> raw;
+  for (auto backlog : {900U, 0U, 500U, 0U}) {
+    reactors.push_back(std::make_unique<fake_reactor>(backlog));
+    raw.push_back(reactors.back().get());
+  }
+  fake_context context{std::move(reactors), {{2, {0, 2}}, {7, {1, 3}}}};
+  auto object = std::make_shared<fake_object>("fake", 4096);
+  auto local  = context.next_reactor(*object, 8, fake_context::io_op_type::device_async, 2);
+  REQUIRE(local.size() == 2);
+  CHECK(local[0] == raw[2]);
+  CHECK(local[1] == raw[0]);
+
+  // Explicit destinations require no CUDA context lookup. The fake backend never
+  // dereferences the device buffers, allowing a multi-GPU routing test on CPU CI.
+  std::uint8_t byte{};
+  std::vector<sirius::io::prepared_io_slice> slices;
+  for (int gpu : {2, 7, 2, 7}) {
+    slices.emplace_back(sirius::io::range{0, 64},
+                        sirius::io::device_buffer{&byte, cudaStream_t{nullptr}, gpu});
+  }
+  auto future = context.mixed_readv_async_io(*object, std::move(slices));
+  std::shared_ptr<sirius::io::grouped_coordinator> coordinator;
+  for (std::size_t i = 0; i < raw.size(); ++i) {
+    REQUIRE(raw[i]->requests.size() == 1);
+    auto& request = *raw[i]->requests.front();
+    if (!coordinator) coordinator = request.coordinator;
+    CHECK(request.coordinator == coordinator);
+    auto slice = request.take_front();
+    CHECK(slice.d_buffer.device_id == (i % 2 == 0 ? 2 : 7));
+    CHECK(request.empty());
+    request.coordinator->on_complete();
+  }
+  REQUIRE(future.is_ready());
+  CHECK(std::move(future).get() == 256);
+}
+
+TEST_CASE("reactor routing falls back for host reads and validates device assignments",
+          "[io][ioctx][numa]")
+{
+  auto make_reactors = [] {
+    std::vector<std::unique_ptr<fake_reactor>> reactors;
+    reactors.push_back(std::make_unique<fake_reactor>(100));
+    reactors.push_back(std::make_unique<fake_reactor>(0));
+    return reactors;
+  };
+  CHECK_THROWS_AS((fake_context{make_reactors(), {{2, {2}}}}), std::invalid_argument);
+  CHECK_THROWS_AS((fake_context{make_reactors(), {{2, {}}}}), std::invalid_argument);
+  auto reactors = make_reactors();
+  auto* remote  = reactors[1].get();
+  fake_context context{std::move(reactors), {{2, {0}}}};
+  fake_object object{"fake", 4096};
+  CHECK(context.next_reactor(object, 1, fake_context::io_op_type::host).front() == remote);
+  CHECK(context.next_reactor(object, 1, fake_context::io_op_type::device_async, 99).front() ==
+        remote);
+  auto local = context.next_reactor(object, 1, fake_context::io_op_type::device_async, 2);
+  CHECK(local.size() == 1);
+  CHECK(local.front() != remote);
+}
+
+TEST_CASE("NUMA reactor groups must share the cache staging block size", "[io][ioctx][numa]")
+{
+  std::vector<std::unique_ptr<fake_reactor>> reactors;
+  for (auto size : {1024U, 2048U}) {
+    auto reactor        = std::make_unique<fake_reactor>();
+    reactor->block_size = size;
+    reactors.push_back(std::move(reactor));
+  }
+  CHECK_THROWS_WITH((fake_context{std::move(reactors), {{0, {0}}, {1, {1}}}}),
+                    "I/O host pools must have equal staging block sizes");
 }

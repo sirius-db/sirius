@@ -349,10 +349,20 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 | `num_threads` | int (**> 0**) | remaining cores (min 4) | Metadata-producer worker threads. |
 | `cpu_affinity` | list of int | — | Cores to pin scan-manager threads to. |
 | `backend` | enum: `sirius`, `kvikio` | `sirius` | IO backend for reads. `sirius` uses the Sirius IO stack (`io_uring` for local paths, REST for `s3://`); `kvikio` serves both local files and `s3://` objects through kvikIO (local files through its file handle, objects through its remote handle); listing and glob expansion of `s3://` still go through the REST backend. Single-GPU only: a multi-GPU configuration is forced back to `sirius`. Values are lowercase. |
-| `uring_n_reactors` | int (**> 0**) | 1 | Number of io_uring reactor threads for local-disk reads. |
-| `rest_n_reactors` | int (**> 0**) | 2 | Number of REST reactor threads for object-store (`s3://`) reads. |
+| `uring_n_reactors` | int (**> 0**) | 1 | Total io_uring reactor thread budget for local-disk reads; at least one per participating host NUMA pool. |
+| `rest_n_reactors` | int (**> 0**) | 2 | Total REST reactor thread budget for object-store (`s3://`) reads; at least one per participating host NUMA pool. |
 | `max_readahead_scans` | int | — (unset) | Scans the readahead may keep in flight, and the switch that runs it at all. See below. |
 | `readahead_strategy` | enum: `eager`, `opportunistic` | — (unset) | When the readahead issues. Unset takes the serving backend's own preference: `eager` for object-store (REST) reads, `opportunistic` for local (uring) ones. Values are lowercase. |
+
+Device reads are dispatched only to reactors backed by the destination GPU's NUMA-local
+HOST pool. The configured reactor total is distributed across participating pools; it is
+raised to the number of pools if necessary (for example, a budget of 1 becomes 2 on two
+participating NUMA domains). A budget of 4 on two domains gives two workers to each,
+not four per GPU. Missing or unknown GPU-to-host mappings use the first configured HOST
+pool. Host-only reads and devices outside the configured topology use ordinary load
+balancing. All participating HOST pools must use the same block size, matching the
+ioctx/cache staging-block contract. Startup logs report GPU-to-HOST routing and any
+increase in reactor count.
 
 Caching itself is configured in the [`cache`](#scan_managercache--read-path-caching-iocacheconfighpp)
 sub-config below.

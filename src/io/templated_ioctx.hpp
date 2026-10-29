@@ -19,6 +19,7 @@
 #include "exec/semi_future.hpp"
 #include "io/io_context.hpp"
 #include "io/io_request.hpp"
+#include "io/reactor_placement.hpp"
 #include "io/types.hpp"
 #include "log/logging.hpp"
 
@@ -128,10 +129,23 @@ class templated_ioctx : public ioctx {
 
   enum class io_op_type { host, host_async, device_async, host_vector_async };
 
-  explicit templated_ioctx(std::vector<std::unique_ptr<Reactor>> reactors)
-    : _reactors(std::move(reactors))
+  explicit templated_ioctx(std::vector<std::unique_ptr<Reactor>> reactors,
+                           device_reactor_indices devices = {})
+    : _reactors(std::move(reactors)), _device_reactors(std::move(devices))
   {
     if (!_reactors.empty()) _config = _reactors.front()->get_config();
+    for (auto const& [device, indices] : _device_reactors) {
+      if (indices.empty()) throw std::invalid_argument("device has no I/O reactors");
+      for (auto index : indices) {
+        if (index >= _reactors.size()) throw std::invalid_argument("invalid I/O reactor index");
+      }
+    }
+    // The cache contract exposes one staging block size per ioctx.
+    for (auto const& reactor : _reactors) {
+      if (reactor->staging_block_size() != staging_block_size()) {
+        throw std::invalid_argument("I/O host pools must have equal staging block sizes");
+      }
+    }
   }
 
   template <class Factory>
@@ -219,8 +233,7 @@ class templated_ioctx : public ioctx {
     return _config.n_max_concurrent_scans;
   }
 
-  /// Every reactor in the pool shares one reactor_context, so the first one's
-  /// staging block size is the pool's.
+  /// NUMA-local contexts must agree on the staging block size (checked at construction).
   [[nodiscard]] std::size_t staging_block_size() const noexcept final
   {
     return _reactors.empty() ? 0 : _reactors.front()->staging_block_size();
@@ -234,7 +247,7 @@ class templated_ioctx : public ioctx {
   }
 
   /**
-   * @brief Select at most two least-backlogged reactors.
+   * @brief Select at most two least-backlogged reactors in the device's staging group.
    *
    * Rotation breaks load ties and keeps synchronous reads from sticking to
    * reactor zero. queued_bytes is advisory; slot limits remain authoritative.
@@ -245,24 +258,24 @@ class templated_ioctx : public ioctx {
                                              [[maybe_unused]] int device_id = -1)
   {
     constexpr std::size_t dispatch_fanout = 2;
-    auto const count                      = _reactors.size();
+    auto const locality                   = _device_reactors.find(device_id);
+    auto const* indices = locality == _device_reactors.end() ? nullptr : &locality->second;
+    auto const count    = indices ? indices->size() : _reactors.size();
     if (count == 0) return {};
-
-    auto const start = _next.fetch_add(1, std::memory_order_relaxed) % count;
+    auto const reactor_index = [&](std::size_t i) { return indices ? (*indices)[i] : i; };
+    auto const start         = _next.fetch_add(1, std::memory_order_relaxed) % count;
     std::vector<std::pair<std::size_t, std::size_t>> ranked;
     ranked.reserve(count);
     for (std::size_t distance = 0; distance < count; ++distance) {
-      auto const index = (start + distance) % count;
+      auto const index = reactor_index((start + distance) % count);
       ranked.emplace_back(_reactors[index]->queued_bytes(), distance);
     }
-
     auto const selected = std::min(count, dispatch_fanout);
     std::partial_sort(ranked.begin(), ranked.begin() + selected, ranked.end());
-
     std::vector<Reactor*> result;
     result.reserve(selected);
     for (std::size_t i = 0; i < selected; ++i) {
-      result.push_back(_reactors[(start + ranked[i].second) % count].get());
+      result.push_back(_reactors[reactor_index((start + ranked[i].second) % count)].get());
     }
     return result;
   }
@@ -322,57 +335,63 @@ class templated_ioctx : public ioctx {
         total_bytes += slice.rng.size;
 
         if (slice.has_device_request()) {
-          if (device_id < 0) device_id = detail::current_cuda_device();
-          if (slice.d_buffer.device_id < 0) slice.d_buffer.device_id = device_id;
+          if (slice.d_buffer.device_id < 0) {
+            if (device_id < 0) device_id = detail::current_cuda_device();
+            slice.d_buffer.device_id = device_id;
+          }
         }
         slices.push_back(std::move(slice));
       }
 
       if (slices.empty()) return exec::make_semi_future<std::size_t>(0);
 
-      auto reactors = next_reactor(typed, slices.size(), io_op_type::host_vector_async, device_id);
       auto coordinator = std::make_shared<grouped_coordinator>(total_bytes, slices.size());
       auto future      = coordinator->get_future();
-
-      if (reactors.empty()) {
-        auto error = std::make_exception_ptr(
-          std::runtime_error("mixed_readv_async_io: no available reactors"));
-        for (auto& slice : slices) {
-          if (slice.on_complete != nullptr) {
-            (*slice.on_complete)(slice.h_buffer.fragments(), false);
-          }
-          coordinator->report_error(error);
-        }
-        return future;
-      }
-
       try {
-        auto const partition_count = std::min(reactors.size(), slices.size());
-        std::vector<std::vector<prepared_io_slice>> partitions(partition_count);
-        std::vector<std::size_t> partition_bytes(partition_count, 0);
-
-        // Keep the originals until every queue entry has been allocated. If an
-        // allocation fails, their callbacks can still release all claimed cache
-        // chunks and every coordinator credit can be settled.
+        // A mixed request can name several GPUs. Resolve and balance each device's
+        // slices separately, retaining one coordinator and atomic publication.
+        std::unordered_map<int, std::vector<Reactor*>> choices;
+        std::vector<Reactor*> reactors;
+        std::vector<std::vector<prepared_io_slice>> partitions;
+        std::vector<std::size_t> partition_bytes;
         for (auto const& slice : slices) {
-          auto const smallest = static_cast<std::size_t>(
-            std::min_element(partition_bytes.begin(), partition_bytes.end()) -
-            partition_bytes.begin());
+          int const target    = slice.has_device_request() ? slice.d_buffer.device_id : -1;
+          auto [it, inserted] = choices.try_emplace(target);
+          if (inserted) {
+            it->second = next_reactor(typed, slices.size(), io_op_type::host_vector_async, target);
+          }
+          if (it->second.empty()) {
+            throw std::runtime_error("mixed_readv_async_io: no available reactors");
+          }
+          std::size_t smallest = 0;
+          std::size_t least    = std::numeric_limits<std::size_t>::max();
+          for (auto* reactor : it->second) {
+            auto found = std::find(reactors.begin(), reactors.end(), reactor);
+            auto index = std::size_t(found - reactors.begin());
+            if (found == reactors.end()) {
+              reactors.push_back(reactor);
+              partitions.emplace_back();
+              partition_bytes.push_back(0);
+            }
+            if (partition_bytes[index] < least) {
+              smallest = index;
+              least    = partition_bytes[index];
+            }
+          }
           partition_bytes[smallest] += slice.size();
           partitions[smallest].push_back(slice);
         }
-
-        std::vector<std::unique_ptr<grouped_io_request>> requests;
-        requests.reserve(partition_count);
-        for (std::size_t i = 0; i < partition_count; ++i) {
-          requests.push_back(
-            grouped_io_request::create(owner, std::move(partitions[i]), coordinator));
+        std::vector<std::unique_ptr<grouped_io_request>> requests(reactors.size());
+        for (std::size_t i = 0; i < reactors.size(); ++i) {
+          if (!partitions[i].empty()) {
+            requests[i] = grouped_io_request::create(owner, std::move(partitions[i]), coordinator);
+          }
         }
 
         // enqueue is noexcept by reactor contract, so once publication starts
         // ownership cannot be stranded between reactors.
-        for (std::size_t i = 0; i < partition_count; ++i) {
-          reactors[i]->enqueue(std::move(requests[i]));
+        for (std::size_t i = 0; i < reactors.size(); ++i) {
+          if (requests[i]) reactors[i]->enqueue(std::move(requests[i]));
         }
         return future;
       } catch (...) {
@@ -409,6 +428,7 @@ class templated_ioctx : public ioctx {
 
   reactor_config_type _config{};
   std::vector<std::unique_ptr<Reactor>> _reactors;
+  device_reactor_indices _device_reactors;
   std::atomic<std::size_t> _next{0};
   bool _started{false};
 
