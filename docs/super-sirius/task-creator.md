@@ -242,14 +242,18 @@ while running:
     5. Schedule work on the thread pool. Every source — a GPU_SCAN scan or any
        GPU operator with buffered input — drives the same loop:
            - Loop while (!node.all_ports_empty()):
-             - pipeline.mark_task_created()  // BEFORE popping data
-             - data = node.get_next_task_input_data()  // a GPU_SCAN blocks on its split_connector
-             - If data: create a gpu_pipeline_task, dispatch to task_scheduler
-             - If no data: pipeline.mark_task_completed()
+             - Acquire the pipeline's task_creation_guard
+             - data = node.get_next_task_input_data()  // may wait for source input
+             - If no data: leave the loop; the scoped guard releases automatically
+             - Otherwise construct gpu_pipeline_task, which calls mark_task_created()
+             - Release the guard, then dispatch to task_scheduler
              - If the request was a look-ahead: break after one task
+           - Recheck pipeline status with update_pipeline_status(false)
 ```
 
-The `mark_task_created()` call before data popping prevents a race condition where the pipeline could appear finished between data check and task creation.
+The creation guard serializes input claims with a separate mutex. It marks creation active under the pipeline status mutex, then releases that mutex before reading input. Existing tasks can therefore complete while a source waits. Status checks defer finalization until the guard releases, protecting the gap between taking the last input and registering its task.
+
+Releasing the guard does not recheck status. Every normal exit from the creation loop must call `update_pipeline_status(false)`, including an empty input or exhausted source. This rechecks deferred completion and schedules downstream consumers when the pipeline closes. Exceptions release the guard and fail the query through the creator's error handler.
 
 ### Look-ahead task creation
 
