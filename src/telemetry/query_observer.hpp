@@ -52,6 +52,8 @@ class query_observer {
   query_observer(query_observer&& other) noexcept
     : context_(std::move(other.context_)),
       handle_(std::exchange(other.handle_, std::nullopt)),
+      details_handle_(std::exchange(other.details_handle_, std::nullopt)),
+      metadata_revision_(std::exchange(other.metadata_revision_, 0)),
       finished_(std::exchange(other.finished_, true))
   {
   }
@@ -62,9 +64,12 @@ class query_observer {
       finish();
       // Release the old handle while its context is still alive.
       handle_.reset();
-      context_  = std::move(other.context_);
-      handle_   = std::exchange(other.handle_, std::nullopt);
-      finished_ = std::exchange(other.finished_, true);
+      details_handle_.reset();
+      context_           = std::move(other.context_);
+      handle_            = std::exchange(other.handle_, std::nullopt);
+      details_handle_    = std::exchange(other.details_handle_, std::nullopt);
+      metadata_revision_ = std::exchange(other.metadata_revision_, 0);
+      finished_          = std::exchange(other.finished_, true);
     }
     return *this;
   }
@@ -77,6 +82,18 @@ class query_observer {
   {
     if (!handle_) { return std::nullopt; }
     return handle_->id().raw();
+  }
+
+  /// Publish a complete snapshot without changing lifecycle state or query identity.
+  /// Revisions belong to this owner and survive moves. Metadata may arrive after Finished.
+  void update_metadata(quent::records::QueryMetadata metadata)
+  {
+    if (!details_handle_) {
+      details_handle_.emplace(context_->context().query_details_observer()->handle());
+    }
+    details_handle_->update({.query_id = handle_->id(),
+                             .revision = ++metadata_revision_,
+                             .metadata = std::move(metadata)});
   }
 
   void planning()
@@ -103,7 +120,9 @@ class query_observer {
  private:
   std::shared_ptr<const telemetry_context> context_;
   std::optional<quent::DynamicFsmHandle<quent::Query>> handle_;
-  bool finished_ = false;
+  std::optional<quent::Handle<quent::QueryDetails>> details_handle_;
+  uint64_t metadata_revision_ = 0;
+  bool finished_              = false;
 };
 
 }  // namespace sirius::telemetry

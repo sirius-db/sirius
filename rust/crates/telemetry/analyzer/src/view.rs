@@ -264,6 +264,13 @@ impl QueryEngineModel for SiriusModelQueryView<'_> {
             .ok_or(AnalyzerError::InvalidId(query_id))
     }
 
+    fn query_plans(&self, query_id: Uuid) -> AnalyzerResult<impl Iterator<Item = &Plan>> {
+        self.query(query_id)?;
+        // try_new already selected and validated this query's plans. An empty
+        // view is valid and must not require a synthetic analyzer plan tree.
+        Ok(self.plans.values().copied())
+    }
+
     fn worker(&self, worker_id: Uuid) -> AnalyzerResult<&Worker> {
         self.workers
             .get(&worker_id)

@@ -656,7 +656,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
         .into_iter()
         .collect();
 
-        let entities = QueryEntities {
+        let mut entities = QueryEntities {
             engine,
             query,
             workers,
@@ -671,7 +671,34 @@ impl UiAnalyzer for SiriusUiAnalyzer {
         };
 
         debug!("deriving plan tree");
-        let plan_tree = view.plan_tree(query_id)?.to_ui();
+        let plan_tree = if entities.plans.is_empty() {
+            // The pinned viewer requires a root plan. This is presentation only:
+            // no plan event, operator, worker, task, or execution window is invented.
+            let id = Uuid::new_v5(&query_id, b"sirius/query-lifecycle-placeholder-plan");
+            entities.plans.insert(
+                id,
+                quent_query_engine_ui::Plan {
+                    id,
+                    instance_name: Some("No execution plan - query lifecycle only".into()),
+                    parent: Some(query_id),
+                    worker_id: None,
+                    edges: Vec::new(),
+                },
+            );
+            entities.query.custom_attributes.push(
+                quent_dynamic_attributes::DynamicAttribute::string(
+                    "plan_representation",
+                    "query_lifecycle_placeholder",
+                ),
+            );
+            quent_query_engine_ui::PlanTree {
+                id,
+                worker: None,
+                children: Vec::new(),
+            }
+        } else {
+            view.plan_tree(query_id)?.to_ui()
+        };
 
         debug!("deriving resource tree");
         let engine = view.engine()?;

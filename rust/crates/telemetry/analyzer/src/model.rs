@@ -193,6 +193,27 @@ impl QueryEngineModel for SiriusModel {
             .ok_or(AnalyzerError::InvalidId(query_id))
     }
 
+    fn query_plans(&self, query_id: Uuid) -> AnalyzerResult<impl Iterator<Item = &Self::Plan>> {
+        self.query(query_id)?;
+        let ids = if self
+            .plans
+            .values()
+            .any(|plan| plan.parent_query_id() == Some(query_id))
+        {
+            self.plan_tree(query_id)?
+                .iter()
+                .map(|plan| plan.id)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        Ok(ids
+            .into_iter()
+            .map(|id| self.plan(id))
+            .collect::<AnalyzerResult<Vec<_>>>()?
+            .into_iter())
+    }
+
     fn worker(&self, worker_id: Uuid) -> AnalyzerResult<&Worker> {
         self.workers
             .get(&worker_id)
@@ -669,6 +690,17 @@ impl SiriusModelBuilder {
                     }
                 }
                 Ok(())
+            }
+            SiriusEvent::QueryDetails(sirius_telemetry_store::QueryDetailsEvent::Update {
+                query_id,
+                revision,
+                metadata,
+            }) => {
+                let builder = match self.queries.entry(query_id.target) {
+                    Entry::Occupied(entry) => entry.into_mut(),
+                    Entry::Vacant(entry) => entry.insert(QueryBuilder::try_new(query_id.target)?),
+                };
+                builder.push_metadata(id, revision, metadata)
             }
             SiriusEvent::Plan(event) => {
                 let event = Event::new(id, timestamp, event);

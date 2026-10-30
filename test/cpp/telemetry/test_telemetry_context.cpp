@@ -403,6 +403,8 @@ TEST_CASE("query observer with disabled exporting retains a valid context and id
     observer = std::move(moved);
     REQUIRE(observer.shared_context() == context);
     REQUIRE(uuid_str(observer.uuid().value()) == id);
+    REQUIRE_NOTHROW(observer.update_metadata(
+      {.instance_name = "disabled late label", .disposition = "cpu_only"}));
     REQUIRE_NOTHROW(observer.planning());
     REQUIRE_NOTHROW(observer.executing());
     observer.finish();
@@ -494,5 +496,44 @@ TEST_CASE("move assignment completes the replaced query and transfers the source
   REQUIRE(count_events(replaced_id, "Finished") == 1);
   REQUIRE(count_events(transferred_id, "Executing") == 1);
   REQUIRE(count_events(transferred_id, "Finished") == 1);
+  std::filesystem::remove_all(output);
+}
+
+TEST_CASE("query metadata survives moves without adding lifecycle transitions",
+          "[query_observer][telemetry_context]")
+{
+  auto const output = std::filesystem::temp_directory_path() /
+                      ("sirius_query_metadata_" + std::to_string(::getpid()));
+  std::filesystem::remove_all(output);
+  telemetry_config config;
+  config.enable_quent     = true;
+  config.output_directory = output.string();
+  std::string id;
+  {
+    auto context = telemetry_context::create(make_quent_context(config), config);
+    query_observer source(context);
+    id = uuid_str(source.uuid().value());
+    source.update_metadata({.instance_name       = "bound-label",
+                            .connection_id       = 17,
+                            .query_ordinal       = 42,
+                            .planning_generation = 3});
+    query_observer observer(std::move(source));
+    observer.planning();
+    observer.finish();
+    observer.update_metadata({.instance_name       = "bound-label",
+                              .connection_id       = 17,
+                              .query_ordinal       = 42,
+                              .planning_generation = 3,
+                              .disposition         = "cpu_only",
+                              .outcome             = "failed"});
+    REQUIRE(uuid_str(observer.uuid().value()) == id);
+  }
+  auto const lifecycle = read_all_telemetry_lines(output, "Query");
+  REQUIRE(lifecycle.size() == 3);
+  REQUIRE(lifecycle.back().find("Finished") != std::string::npos);
+  auto const metadata = read_all_telemetry_lines(output, "QueryDetails");
+  REQUIRE(metadata.size() == 2);
+  REQUIRE(any_line_with_all(metadata, {id, "bound-label", "\"revision\":1"}));
+  REQUIRE(any_line_with_all(metadata, {id, "cpu_only", "failed", "\"revision\":2"}));
   std::filesystem::remove_all(output);
 }

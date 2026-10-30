@@ -63,6 +63,67 @@ CALL gpu_execution(
 `gpu_execution(...)` call, an inline `query_label` parameter takes precedence over a pending label set
 with `sirius_set_query_label`. Unlabeled queries are reported as `unnamed_query`.
 
+### Query lifecycle metadata
+
+The query UUID identifies one observation. `Init`, `Planning`, `Executing`, and
+`Finished` remain its lifecycle transitions. Completion is read from `Finished`
+explicitly, including `Init -> Finished` and `Planning -> Finished`; completion
+alone does not imply success. The pinned FSM analyzer still omits truncated or
+invalid lifecycles with a warning, rather than synthesizing a terminal event.
+
+`QueryDetails.update` carries a query reference, a positive revision, and a complete
+`QueryMetadata` snapshot. One observer owns this metadata stream; its revision and
+handle survive moves. The analyzer selects the highest revision, independently of
+file/arrival ordering and lifecycle timestamps. Metadata may arrive after `Finished`
+without extending the query duration. Duplicate/older revisions are ignored. Mixing
+metadata streams for one query is rejected.
+
+The optional fields are `instance_name`, `connection_id`, `query_ordinal`,
+`planning_generation`, `execution_query_id`, `worker_id`, `disposition`, and `outcome`.
+Snapshots replace previous metadata rather than patching it, so producers must
+include all currently known fields. An absent execution ID remains unknown; no
+runtime window is invented for a query that never executes. An absent late name
+retains the name from `Init`. Correlation and outcome appear in the query's custom
+attributes, preserving numeric IDs as unsigned integers.
+
+Disposition describes the path (`cpu_only`, `gpu`, `gpu_to_cpu`); outcome describes
+the outer invocation (`success`, `failed`, `cancelled`, `abandoned`). These are
+independent, extensible string vocabularies. In particular, a failed GPU attempt
+followed by successful CPU replay has disposition `gpu_to_cpu` and outcome
+`success`. Existing traces lacking metadata retain their initial name/group and
+have unknown correlation, disposition, and outcome.
+
+The pinned Quent viewer requires a root plan. For a query with no stored plan,
+Sirius adds a deterministic, empty **presentation-only** plan to `QueryBundle`,
+labelled `No execution plan - query lifecycle only`. Its query has the custom
+attribute `plan_representation=query_lifecycle_placeholder`. This placeholder is
+absent from the trace and analyzed model; it has no worker, edges, operators, tasks,
+or execution window. Nonempty execution plans still pass normal plan-tree
+validation. This preserves the pinned viewer response shape without claiming GPU
+execution. The pinned single-plan picker displays the plan UUID with a generic
+`Query:` prefix.
+
+This schema/projection support does **not** enable observation at DuckDB query
+begin yet. Current producer boundaries and label consumption stay unchanged:
+
+- Transparent SQL consumes a pending label in the GPU wrapper's
+  `GetGlobalSourceState`; explicit `gpu_execution` consumes it during binding.
+- An explicit inline label takes precedence, while still consuming the pending
+  label at the existing explicit-bind boundary.
+- Ordinary CPU statements, SET, and label-setting statements do not consume a
+  pending label. The session label is sticky.
+- When early observation is introduced, select the initial query group from the
+  session-label snapshot at the outer `QueryBegin`. Freeze that group for the
+  invocation; session-label changes within the statement affect later invocations.
+  Observing a statement must not itself consume a pending query label. Attach a
+  late label to the existing UUID when the existing consumption boundary is reached.
+
+The existing lifecycle event payloads are unchanged. Producers emitting the new
+`QueryDetails` entity require this schema-aware analyzer; older analyzers cannot
+import those records. Use matching Sirius producer/analyzer revisions for new
+captures and the Quent revision pinned by their `model.qmi`. No Quent dependency
+update is required for the presentation placeholder.
+
 ## 3. Generate telemetry
 
 Run any query with the exporter enabled and telemetry files appear under `output_directory`.
