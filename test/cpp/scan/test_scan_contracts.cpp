@@ -1340,3 +1340,17 @@ TEST_CASE("Sorted read-view files use an implicit evidence index", "[scan][contr
                         std::vector<std::string>{"a", "a", "b", "b"});
   CHECK(make_read_view_evidence_index(paths).empty());
 }
+
+TEST_CASE("Generic temporal mapping does not widen Iceberg admission", "[scan][contracts]")
+{
+  using duckdb::LogicalType;
+  duckdb::MultiFileBindData bind;
+  bind.columns.emplace_back("x", LogicalType::INTEGER);
+  bind.columns.back().identifier = duckdb::Value::INTEGER(1);
+  CHECK(sirius::planner::iceberg_flat_mapping_supported(&bind));
+  for (auto const& type : std::vector<LogicalType>{
+         LogicalType::DATE, LogicalType::TIMESTAMP, LogicalType::DECIMAL(18, 2)}) {
+    bind.columns.back().type = type;
+    CHECK_FALSE(sirius::planner::iceberg_flat_mapping_supported(&bind));
+  }
+}

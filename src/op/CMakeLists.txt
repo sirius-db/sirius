@@ -4,6 +4,7 @@ target_sources(
           aggregate/stddev.cpp
           aggregate/group_key_labels.cpp
           aggregate/gpu_aggregate_impl.cpp
+          window/whole_partition.cpp
           merge/gpu_merge_impl.cpp
           order/gpu_order_impl.cpp
           partition/gpu_partition_impl.cpp
@@ -24,6 +25,7 @@ target_sources(
           scan/owning_table_view.cpp
           scan/parquet_batch_layout.cpp
           scan/parquet_byte_range.cpp
+          scan/parquet_source_filter.cpp
           scan/parquet_schema_mapping.cpp
           scan/scan_plan.cpp
           scan/scan_filter_analysis.cpp
@@ -79,6 +81,7 @@ target_sources(
           sirius_physical_partition_consumer_operator.cpp
           sirius_physical_passthrough_sink.cpp
           sirius_physical_projection.cpp
+          sirius_physical_replicate.cpp
           sirius_physical_result_collector.cpp
           sirius_physical_sort_partition.cpp
           sirius_physical_sort_sample.cpp
@@ -88,4 +91,5 @@ target_sources(
           sirius_physical_union.cpp
           aggregate/wide_integer_sum.cu
           partition/crc32_partition_hash.cu
+          replicate/gpu_replicate_impl.cu
           scan/equality_delete_mask.cu)

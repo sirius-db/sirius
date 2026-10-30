@@ -31,7 +31,7 @@
 #include <cuco/operator.hpp>
 #include <cuco/static_set.cuh>
 #include <cuco/storage.cuh>
-#include <cuda/dynamic_filter_probe.cuh>
+#include <cuda/dynamic_filter_fused_probe.cuh>
 #include <cuda/sirius_rmm_cuco_allocator.cuh>
 #include <cuda/std/functional>
 #include <cuda/std/limits>
@@ -60,15 +60,6 @@ namespace {
 constexpr std::size_t kCapacityFactor = 2;
 constexpr double kLoadFactor          = 1.0 / kCapacityFactor;
 
-// Threads per key probe.
-constexpr std::size_t kCgSize = 1;
-static_assert(kCgSize == 1, "cuco::static_set requires kCgSize==1 for device_for bulk iteration");
-
-// Keys per bucket. Sized for a double-hashed probe, where each step is a random fetch and a
-// wider bucket retires several dependent fetches in one; the right value depends on the probing
-// scheme, not on the key type.
-constexpr std::int32_t kBucketSize = 4;
-
 // Largest capacity multiplier whose table still fits `budget`, else the baseline. Growth only
 // makes an already-chosen set sparser: estimated_set_bytes (and so IN-list vs Bloom selection)
 // is always evaluated at the baseline factor.
@@ -93,17 +84,8 @@ constexpr std::size_t kGrowthCandidates[] = {4, 3};
 // Minimum set capacity.
 constexpr std::size_t kMinCapacity = 8;
 
-template <class KeyT>
-using set_alloc = sirius::rmm_cuco_allocator<KeyT>;
-
-template <class KeyT>
-using set_type = cuco::static_set<KeyT,
-                                  cuco::extent<std::size_t>,
-                                  cuda::thread_scope_device,
-                                  cuda::std::equal_to<KeyT>,
-                                  cuco::double_hashing<kCgSize, cuco::default_hash_function<KeyT>>,
-                                  set_alloc<KeyT>,
-                                  cuco::storage<kBucketSize>>;
+using detail::set_alloc;
+using detail::set_type;
 
 template <class KeyT>
 using set_owner = std::unique_ptr<set_type<KeyT>>;
@@ -153,20 +135,6 @@ set_owner<KeyT> build_set(membership_key_domain const& domain,
   return set;
 }
 
-// The filter-specific half of detail::membership_probe_functor: a converted key is a member when
-// the set contains it. A key equal to the set's reserved sentinel cannot be stored (cuco's insert
-// of its empty key is a no-op), so such a probe is kept conservatively; for the string family that
-// is a probe whose fingerprint is UINT64_MAX, which therefore always passes.
-template <class SetRef>
-struct set_lookup {
-  using key_type = typename SetRef::key_type;
-  SetRef set;
-  __device__ __forceinline__ bool operator()(key_type key) const noexcept
-  {
-    return set.contains(key) || key == detail::set_sentinel<key_type>::value;
-  }
-};
-
 }  // namespace
 
 struct set_replica {
@@ -204,6 +172,20 @@ struct sirius_dynamic_in_list_filter::set_impl {
       });
     return it == replicas.end() ? nullptr : it->get();
   }
+
+  /// @brief The `Store` interface of detail::compute_membership_mask.
+  template <class Fn>
+  void with_lookup(membership_key_domain const&, int device_id, Fn&& fn) const
+  {
+    auto const* replica = find(device_id);
+    if (!replica || !replica->has_set()) { return; }
+    std::visit(
+      [&](auto const& set) {
+        auto ref = set->ref(cuco::contains);
+        fn(detail::set_lookup<decltype(ref)>{ref});
+      },
+      replica->set);
+  }
 };
 
 sirius_dynamic_in_list_filter::sirius_dynamic_in_list_filter(cudf::column_view const& keys,
@@ -231,7 +213,7 @@ sirius_dynamic_in_list_filter::sirius_dynamic_in_list_filter(cudf::column_view c
     "[sirius_dynamic_in_list_filter] built set: {} keys, bucket_size={}, capacity_factor={}, "
     "capacity={} slots ({} bytes).",
     _num_keys,
-    kBucketSize,
+    detail::kBucketSize,
     factor,
     capacity,
     capacity * rep_bytes);
@@ -277,6 +259,7 @@ void sirius_dynamic_in_list_filter::replicate_to_devices(
     pending;
   pending.reserve(spaces.size());
   _set->replicas.reserve(_set->replicas.size() + spaces.size());
+  detail::replica_fanout_failures failures;
   for (auto const& target : spaces) {
     auto const& target_space = target.get_gpu_space();
     auto const device_id     = target_space.get_device_id();
@@ -308,7 +291,7 @@ void sirius_dynamic_in_list_filter::replicate_to_devices(
           auto destination_set =
             make_set<key_type>(capacity, reservation->allocator(), cuda::stream_ref{stream.get()});
           if (destination_set->capacity() != capacity) {
-            throw std::runtime_error("destination static_set capacity changed during replication");
+            throw std::logic_error("destination static_set capacity changed during replication");
           }
           auto result       = std::make_unique<set_replica>(device_id, std::move(destination_set));
           auto& destination = *std::get<set_owner<key_type>>(result->set);
@@ -332,14 +315,13 @@ void sirius_dynamic_in_list_filter::replicate_to_devices(
         continue;
       }
       pending.emplace_back(std::move(replica), std::move(stream_lease));
-    } catch (std::exception const& e) {
-      SIRIUS_LOG_WARN(
-        "[sirius_dynamic_in_list_filter] replica GPU {} -> GPU {} unavailable: {}. "
-        "That GPU will skip this optional filter.",
-        _set->source_device,
-        device_id,
-        e.what());
-      continue;
+    } catch (...) {
+      if (failures.skip_if_recoverable(
+            "[sirius_dynamic_in_list_filter]", _set->source_device, device_id)) {
+        continue;
+      }
+      // Earlier destinations still own asynchronous copies; drain them before propagating.
+      break;
     }
     SIRIUS_LOG_DEBUG("[sirius_dynamic_in_list_filter] queued {}-byte replica GPU {} -> GPU {}.",
                      bytes,
@@ -352,16 +334,14 @@ void sirius_dynamic_in_list_filter::replicate_to_devices(
     auto const device_id = replica->device_id;
     try {
       rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
-      stream.sync();
-      _set->replicas.push_back(std::move(replica));
-    } catch (std::exception const& e) {
-      SIRIUS_LOG_WARN(
-        "[sirius_dynamic_in_list_filter] replica GPU {} -> GPU {} unavailable: {}. "
-        "That GPU will skip this optional filter.",
-        _set->source_device,
-        device_id,
-        e.what());
+      CUCASCADE_CUDA_TRY(cudaStreamSynchronize(stream.get()));
+    } catch (...) {
+      failures.record_fatal("[sirius_dynamic_in_list_filter]", _set->source_device, device_id);
     }
+  }
+  failures.rethrow_if_fatal();
+  for (auto& [replica, stream_lease] : pending) {
+    _set->replicas.push_back(std::move(replica));
   }
 }
 
@@ -404,19 +384,23 @@ std::unique_ptr<cudf::column> sirius_dynamic_in_list_filter::compute_mask_impl(
   ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr) const
 {
-  auto const* replica =
-    _set ? _set->find(detail::resolve_dynamic_filter_device_id(device_id)) : nullptr;
-  if (!replica) { return nullptr; }
+  return detail::compute_membership_mask(_set.get(),
+                                         _domain,
+                                         probe,
+                                         prior_mask_words,
+                                         prior_keep,
+                                         device_id,
+                                         stream,
+                                         mr,
+                                         preserves_nulls());
+}
 
-  return std::visit(
-    [&](auto const& set) {
-      using owner_type = std::decay_t<decltype(set)>;
-      using key_type   = typename owner_type::element_type::key_type;
-      auto ref         = set->ref(cuco::contains);
-      return detail::run_membership_probe<key_type>(
-        _domain, probe, prior_mask_words, stream, mr, set_lookup<decltype(ref)>{ref}, prior_keep);
-    },
-    replica->set);
+bool sirius_dynamic_in_list_filter::prepare_fused_probe(cudf::column_view const& probe,
+                                                        int device_id,
+                                                        detail::fused_probe& out) const
+{
+  return detail::prepare_fused_membership_probe(
+    _set.get(), _domain, probe, device_id, out, preserves_nulls());
 }
 
 std::size_t sirius_dynamic_in_list_filter::size() const noexcept { return _num_keys; }

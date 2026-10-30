@@ -19,10 +19,7 @@ The original multi-partition PR head is `7a5d6068`; the measured integration is
 `c560b286`. These are implementation references, not branches to replay wholesale:
 the earlier SIP work already exists in current `dev`.
 
-Sirius currently pins cuCascade at `e9929fff5847f34d2eed91e29847181d638dc258`.
-The inspected cuCascade `main` is `edd15e0b390ea9baa17ede51669af4d3402c240a`.
-Neither revision supplies the per-pair grant/result API and public adaptor pool
-accessor required by the manifest's H02 integration.
+Sirius pins a merged cuCascade revision that supplies the per-pair grant/result API and public adaptor pool accessor required by the manifest's H02 integration. `sirius_memory_reservation_manager` grants its managed pools, and existing callers check actual-pool permission; S4 builds on that and does not own the dependency.
 
 The source manifests are `MANIFEST-sirius.md` and `MANIFEST-cucascade.md`, assembled
 2026-09-17 in the campaign's `iter3/50-manifest` directory. The scope and acceptance
@@ -82,7 +79,7 @@ seventh branch in the Sirius stack.
 | S1 | `df/01-publication-lifecycle` | Sirius `origin/dev` | Owned one-shot session and coherent channel lifecycle |
 | S2 | `df/02-multibatch-bloom` | `df/01-publication-lifecycle` | Complete-inventory multi-partition Bloom with serial publication |
 | S3 | `df/03-scan-consumer` | `df/02-multibatch-bloom` | Shared scan application, one gather, and fused membership masks |
-| S4 | `df/04-peer-pipelined-publication` | `df/03-scan-consumer` | Merged cuCascade dependency, Sirius H02, and pipelined publication |
+| S4 | `df/04-peer-pipelined-publication` | `df/03-scan-consumer` | Bounded accumulated staging and publication validation |
 | S5 | `df/05-domain-evidence` | `df/04-peer-pipelined-publication` | Pinned-domain usefulness evidence and measured coverage profile |
 | S6 | `df/06-early-probe` | `df/05-domain-evidence` | Optional early probe activation with preserved progress |
 | C1 | `memory/pool-peer-access` | cuCascade `main` | Safe per-pair pool grant and borrowed pool accessor |
@@ -117,7 +114,7 @@ flowchart LR
     DEV["Sirius dev"] --> S1 --> S2 --> S3 --> S4 --> S5 --> S6
     MAIN["cuCascade main"] --> C1["C1: separate cuCascade PR"]
     C1 --> MERGED["Merged upstream commit"]
-    MERGED --> PIN["S4 pins merged cuCascade revision"]
+    MERGED --> PIN["Sirius pins merged cuCascade revision"]
     PIN --> S4
 ```
 
@@ -125,7 +122,7 @@ flowchart LR
 
 | Manifest item | Owner | Required outcome |
 | --- | --- | --- |
-| H02: Sirius pool peer access | C1 + S4 | Initialize and verify access for actual allocation pools and configured GPU pairs |
+| H02: Sirius pool peer access | C1 + memory manager + S4 | The manager grants existing managed pools; S4 covers any additional allocation domains and validates its publication paths |
 | Scan-filter-on-view | S3 | Apply residual and membership filters to the cached view before one survivor gather |
 | Fused membership-mask kernel | S3 | Preserve the selected program's mask and marginal-count semantics with fewer launches |
 | Pipelined-publish-g | S4 | Overlap chunk reduction and replication when pool capability and memory admission permit |
@@ -138,34 +135,9 @@ production default `0.9` unless broader evidence justifies a separate decision.
 Algorithm selectors and ablation switches remain internal/test-oriented rather
 than becoming supported user configuration without a concrete operational need.
 
-## C1: the separate cuCascade prerequisite
+## C1: merged cuCascade prerequisite
 
-Proposed title: **Expose safe per-pool peer access for configured GPU pairs**.
-
-Reauthor the real API delta represented by campaign commits `2d484a0` and
-`31155d6` on current cuCascade `main`. Adapt to its newer APIs. Do not bring over
-the campaign branch ancestry: it contains driver shim `8bf19f1`. The API proposal is:
-
-- A borrowed `reservation_aware_resource_adaptor::pool_handle()` accessor, including
-  its implementation wrapper; null when the upstream has no known CUDA pool.
-- A per-owner/accessor `grant_pool_peer_access` operation with explicit granted,
-  unsupported, empirically broken, and runtime-failure outcomes. Final spelling is
-  subject to the cuCascade review; the contract is the dependency.
-- One implementation shared with the existing all-visible helper. Direct-access
-  eligibility requires the relevant empirical peer-DMA evidence in both directions.
-- No pool ownership transfer, allocator-policy redesign, or driver compatibility
-  shim. Document initialization-time probing, its synchronization/peer-state side
-  effects, caller-device restoration, and the borrowed handle's lifetime.
-
-Do not hide invalid CUDA execution state as benign lack of capability. A failed
-grant does not prove that access is disabled, and does not prove which route a later
-copy will take. Return enough information for the caller to verify actual access.
-
-Acceptance includes library-owned tests for pool accessor variants; self/idempotent
-grants; permission queries and byte-verified transfers in both directions; no-peer,
-asymmetric-probe, and CUDA failure paths; device restoration; and borrowed-pool
-lifetime. Deterministic error cases may use a narrow test seam. Required hardware
-coverage and any skipped cases must be explicit in the PR evidence.
+The dependency is merged upstream. `reservation_aware_resource_adaptor::pool_handle()` returns a nullable borrowed handle. `grant_pool_peer_access` returns `GRANTED`, `UNSUPPORTED`, `VERIFICATION_FAILED`, or `CUDA_ERROR` through `status()`, `error()`, and `granted()` methods. Private ordinary async pools establish bidirectional byte-verification evidence; the grant then configures the supplied actual pool. The mechanism restores the calling device and leaves ordinary peer state and unrelated pools unchanged. CUDA errors remain errors, and a failed grant does not revoke permissions or establish a later copy route. Sirius integrates this contract without a driver shim or environment bump.
 
 ## S1: publication ownership and channel lifecycle
 
@@ -217,19 +189,11 @@ Acceptance: fused/unfused mask and conditional-count parity; residual/no-op/empt
 cases; more than one kernel round; multiple bindings of one filter; late arrivals;
 gate reopen; no duplicate application; and cached-view unwind after GPU submission.
 
-## S4: H02 and pipelined publication -- blocked on C1
+## S4: accumulated transport and publication validation
 
-S4 consumes C1 only after its PR is reviewed and merged into cuCascade `main`.
-Advance Sirius's gitlink to that merged commit or a reviewed descendant containing
-it. Never pin the campaign `31155d66` revision or an unmerged dependency head as the
-final merge-ready state. S1-S3 retain the existing dependency and can land first.
+Sirius pins the merged dependency, grants its managed ordinary async pools to configured GPU accessors before installing resource references, and checks actual-pool permission at existing callers. S4 covers every additional allocation domain it introduces, including a device-default pool if used; a managed-pool grant cannot stand in for it. No current production allocation requires such a domain.
 
-Initialize pool access once resources and configured devices are known. Capability
-is associated with the actual owner pool/allocation domain, accessor, and context
-lifetime. Track cuCascade-pool and device-default-pool outcomes independently;
-success for one pool cannot stand in for another. Clear evidence on teardown or
-reinitialization. The device-pair copy probe alone is insufficient evidence for
-this decision.
+S4 implements an explicit bounded host-staged accumulated-Bloom fallback. The ordinary-replica staging path reserves host blocks for the whole payload and does not satisfy that obligation; declining an optional accumulated filter does not satisfy it either. The following validation and performance work belongs to S4.
 
 The chunk strategy stays behind the same completed-or-safely-retired publication
 contract as serial. Reuse the final contributor's existing root reservation; reserve
@@ -247,7 +211,7 @@ Merge gate:
 
 - [ ] C1 PR is merged upstream, with its final API and tests reviewed.
 - [ ] The Sirius gitlink contains that merged commit and no campaign shim.
-- [ ] Every pool needed by the optimized path has its actual capability verified.
+- [ ] Every pool needed by the optimized path has a grant in its established allocation domain, with byte correctness tested separately.
 - [ ] Direct-capable, unknown/no-peer, allocation-failure, two-key relayout, and
   submitted-work failure paths are validated with correct result/retirement evidence.
 - [ ] No compound claim of a driver-staged route is inferred solely from grant failure.

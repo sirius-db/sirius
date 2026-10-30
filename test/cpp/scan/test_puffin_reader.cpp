@@ -28,6 +28,7 @@
 #include "op/scan/iceberg_delete_set.hpp"
 #include "op/scan/puffin_reader.hpp"
 #include "scan_manager/preparation_test_support.hpp"
+#include "utils/puffin_test_utils.hpp"
 
 #include <catch.hpp>
 #include <roaring/roaring.hh>
@@ -82,33 +83,7 @@ std::string require_fixture(std::string path)
   return path;
 }
 
-class vector_puffin_source final : public puffin_byte_source {
- public:
-  explicit vector_puffin_source(std::vector<std::byte> bytes) : bytes_(std::move(bytes)) {}
-  bool seek(std::streamoff offset) override
-  {
-    if (offset < 0 || static_cast<std::uint64_t>(offset) > bytes_.size()) return false;
-    offset_ = offset;
-    return true;
-  }
-  bool read(std::span<std::byte> destination) override
-  {
-    if (offset_ < 0 || static_cast<std::uint64_t>(offset_) > bytes_.size() ||
-        destination.size() > bytes_.size() - static_cast<std::uint64_t>(offset_))
-      return false;
-    std::copy_n(bytes_.data() + offset_, destination.size(), destination.data());
-    offset_ += static_cast<std::streamoff>(destination.size());
-    return true;
-  }
-  [[nodiscard]] std::streamoff size() const override
-  {
-    return static_cast<std::streamoff>(bytes_.size());
-  }
-
- private:
-  std::vector<std::byte> bytes_;
-  std::streamoff offset_ = 0;
-};
+using vector_puffin_source = sirius::test::memory_puffin_source;
 
 class identity_changing_puffin_source final : public puffin_byte_source {
  public:
@@ -254,7 +229,7 @@ std::vector<int64_t> read_for_test(DeletionVectorRef ref,
   auto parser          = static_cast<uint64_t>(ref.file_size_in_bytes) * 14 + 512;
   provider.grant_bytes = positions + blob + parser;
   preparation_ledger ledger(provider);
-  std::array scans{scan_envelope{{{blob, parser, 0, positions}}, 0, 0, true}};
+  std::array scans{scan_envelope{{{{blob, parser, 0}, positions}}, {}, true}};
   REQUIRE(ledger.admit(scans, memory_space_id(cucascade::memory::Tier::HOST, 0)).deferred);
   ledger.register_unit({1, 1}, positions);
   auto permit = ledger.acquire_permit({1, 1});
@@ -401,8 +376,7 @@ std::string write_puffin(std::vector<uint8_t> const& blob,
                          int64_t cardinality,
                          std::string const& fields_json = "[]")
 {
-  static constexpr char kMagic[4] = {'P', 'F', 'A', '1'};
-  auto const offset               = static_cast<int64_t>(sizeof(kMagic));
+  constexpr int64_t offset = 4;
 
   std::string const footer_payload =
     std::string(R"({"blobs":[{"type":"deletion-vector-v1","fields":)") + fields_json +
@@ -411,13 +385,7 @@ std::string write_puffin(std::vector<uint8_t> const& blob,
     fixture_data_file_path() + R"(","cardinality":")" + std::to_string(cardinality) +
     R"("}}],"properties":{}})";
 
-  std::vector<uint8_t> out(std::begin(kMagic), std::end(kMagic));
-  out.insert(out.end(), blob.begin(), blob.end());
-  out.insert(out.end(), std::begin(kMagic), std::end(kMagic));
-  out.insert(out.end(), footer_payload.begin(), footer_payload.end());
-  push_u32_le(out, static_cast<uint32_t>(footer_payload.size()));
-  push_u32_le(out, 0);  // flags: bit 0 clear = uncompressed footer
-  out.insert(out.end(), std::begin(kMagic), std::end(kMagic));
+  auto out = sirius::test::puffin_container(std::as_bytes(std::span{blob}), footer_payload);
 
   auto const path = fs::temp_directory_path() / ("sirius_puffin_" + name + ".puffin");
   std::ofstream f(path, std::ios::binary | std::ios::trunc);
@@ -681,7 +649,7 @@ TEST_CASE(
   preparation_ledger ledger(provider);
   auto ref               = fixture_ref();
   ref.file_size_in_bytes = fs::file_size(ref.puffin_path);
-  std::array scans{scan_envelope{{{44, 64 * 1024, 0, 16}}, 0, 0, true}};
+  std::array scans{scan_envelope{{{{44, 64 * 1024, 0}, 16}}, {}, true}};
   REQUIRE(ledger.admit(scans, memory_space_id(cucascade::memory::Tier::HOST, 0)).deferred);
   ledger.register_unit({1, 1}, 16);
   auto permit = ledger.acquire_permit({1, 1});
@@ -927,4 +895,360 @@ TEST_CASE("Charged Puffin matches legacy Roaring validation and diagnostics",
     REQUIRE_FALSE(legacy.empty());
     CHECK(error(true) == legacy);
   }
+}
+
+TEST_CASE("Neutral DV payload retains only actual decoded positions without a manifest",
+          "[scan_preparation][dv_payload]")
+{
+  using namespace sirius::scan_manager;
+  auto shape = GENERATE(0, 1, 2, 3, 4);
+  roaring::Roaring bitmap;
+  if (shape == 0)
+    for (auto v : {1u, 5u, 65537u, 0xfffffffeu})
+      bitmap.add(v);
+  if (shape == 1)
+    for (uint32_t v = 0; v < 65536; v += 2)
+      bitmap.add(v);
+  if (shape == 2) {
+    bitmap.addRange(0, 65536);
+    REQUIRE(bitmap.runOptimize());
+  }
+  if (shape == 4) bitmap.add(5);
+  std::vector<uint8_t> serial(bitmap.getSizeInBytes());
+  REQUIRE(bitmap.write(reinterpret_cast<char*>(serial.data())) == serial.size());
+  std::vector<uint8_t> checksummed{0xD1, 0xD3, 0x39, 0x64};
+  for (int i = 0; i < 8; ++i)
+    checksummed.push_back(i == 0 ? (shape == 4 ? 2 : 1) : 0);
+  for (int i = 0; i < (shape == 4 ? 2 : 1); ++i) {
+    push_u32_le(checksummed, 1);
+    checksummed.insert(checksummed.end(), serial.begin(), serial.end());
+  }
+  std::vector<uint8_t> blob;
+  push_u32_be(blob, checksummed.size());
+  blob.insert(blob.end(), checksummed.begin(), checksummed.end());
+  push_u32_be(blob, crc32_of(checksummed));
+  test::test_reservation_provider provider;
+  provider.grant_bytes = 1024 * 1024;
+  preparation_ledger ledger(provider);
+  auto bytes = bitmap.cardinality() * sizeof(int64_t) * (shape == 4 ? 2 : 1);
+  std::array scans{scan_envelope{{{{0, 0, 0}, bytes}}, {}, true}};
+  REQUIRE(ledger.admit(scans, memory_space_id(cucascade::memory::Tier::HOST, 0)).deferred);
+  ledger.register_unit({1, 1}, bytes);
+  auto permit = ledger.acquire_permit({1, 1});
+  REQUIRE(permit);
+  auto allocator = ledger.allocator(permit);
+  auto result    = decode_deletion_vector_payload(blob, allocator);
+  auto positions = result->positions();
+  CHECK(positions.size() == bitmap.cardinality());
+  size_t index = 0;
+  for (auto low : bitmap)
+    REQUIRE(positions[index++] == ((int64_t{1} << 32) | low));
+  CHECK(ledger.charged_bytes({1, 1}) == bytes);
+  CHECK(provider.seen->allocations == (bytes ? 1 : 0));
+  permit.release();
+  CHECK(provider.seen->allocated_bytes == bytes);
+  result.reset();
+  CHECK(provider.seen->allocated_bytes == 0);
+  CHECK(ledger.charged_bytes({1, 1}) == 0);
+}
+
+TEST_CASE("Neutral DV payload validates corruption before allocating positions",
+          "[scan_preparation][dv_payload][failure]")
+{
+  using namespace sirius::scan_manager;
+  auto mode = GENERATE("short",
+                       "magic",
+                       "crc",
+                       "length",
+                       "trailing",
+                       "inner_trailing",
+                       "negative_key",
+                       "bitmap",
+                       "negative_count");
+  INFO(mode);
+  auto blob = build_dv_blob(0);
+  if (std::string_view(mode) == "short") blob.resize(11);
+  if (std::string_view(mode) == "magic") blob[4] ^= 1;
+  if (std::string_view(mode) == "crc") blob.back() ^= 1;
+  if (std::string_view(mode) == "length") blob[0] = 0x7f;
+  if (std::string_view(mode) == "trailing") blob.push_back(0);
+  if (std::string_view(mode) == "negative_key") blob = build_dv_blob(-1);
+  if (std::string_view(mode) == "bitmap") blob = build_dv_blob_bitset(4098, 1);
+  if (std::string_view(mode) == "inner_trailing" || std::string_view(mode) == "negative_count") {
+    std::vector<uint8_t> data(blob.begin() + 4, blob.end() - 4);
+    if (std::string_view(mode) == "inner_trailing")
+      data.push_back(0);
+    else
+      data[11] = 0x80;
+    blob.clear();
+    push_u32_be(blob, data.size());
+    blob.insert(blob.end(), data.begin(), data.end());
+    push_u32_be(blob, crc32_of(data));
+  }
+  test::test_reservation_provider provider;
+  preparation_ledger ledger(provider);
+  std::array scans{scan_envelope{{{{0, 0, 0}, 16}}, {}, true}};
+  REQUIRE(ledger.admit(scans, memory_space_id(cucascade::memory::Tier::HOST, 0)).deferred);
+  ledger.register_unit({1, 1}, 16);
+  auto permit = ledger.acquire_permit({1, 1});
+  REQUIRE(permit);
+  auto allocator = ledger.allocator(permit);
+  CHECK_THROWS_AS(decode_deletion_vector_payload(blob, allocator), std::runtime_error);
+  CHECK(provider.seen->allocations == 0);
+  CHECK(ledger.charged_bytes({1, 1}) == 0);
+}
+
+TEST_CASE("Neutral DV payload obeys independent limits and retained grant",
+          "[scan_preparation][dv_payload][failure]")
+{
+  using namespace sirius::scan_manager;
+  test::test_reservation_provider provider;
+  preparation_ledger ledger(provider);
+  std::array scans{scan_envelope{{{{0, 0, 0}, 8}}, {}, true}};
+  REQUIRE(ledger.admit(scans, memory_space_id(cucascade::memory::Tier::HOST, 0)).deferred);
+  ledger.register_unit({1, 1}, 8);
+  auto permit = ledger.acquire_permit({1, 1});
+  REQUIRE(permit);
+  auto allocator = ledger.allocator(permit);
+  auto blob      = build_dv_blob(0);
+  CHECK_THROWS_AS(decode_deletion_vector_payload(blob, allocator, {blob.size() - 1, 1}),
+                  preparation_resource_error);
+  CHECK_THROWS_MATCHES(
+    decode_deletion_vector_payload(blob, allocator, {blob.size(), 0}),
+    preparation_resource_error,
+    Catch::Matchers::Message("roaring: decoded positions exceed the configured limit of 0"));
+  CHECK_THROWS_AS(
+    decode_deletion_vector_payload(blob, allocator, {kMaxDeletionVectorPayloadBytes + 1, 1}),
+    std::invalid_argument);
+  CHECK_THROWS_AS(
+    decode_deletion_vector_payload(blob, allocator, {blob.size(), kMaxDeletionVectorPositions + 1}),
+    std::invalid_argument);
+  CHECK(provider.seen->allocations == 0);
+  auto result = decode_deletion_vector_payload(blob, allocator, {blob.size(), 1});
+  CHECK(result->positions().size() == 1);
+  CHECK_THROWS_AS(decode_deletion_vector_payload(blob, allocator), preparation_resource_error);
+  CHECK(ledger.charged_bytes({1, 1}) == 8);
+  result.reset();
+  provider.seen->fail_allocation = true;
+  CHECK_THROWS_AS(decode_deletion_vector_payload(blob, allocator), preparation_resource_error);
+  CHECK(ledger.charged_bytes({1, 1}) == 0);
+}
+
+namespace {
+std::vector<std::byte> metadata_container(std::string const& footer, uint32_t flags = 0)
+{
+  std::array<std::byte, 128> opaque{};
+  return sirius::test::puffin_container(opaque, footer, flags);
+}
+std::string metadata_descriptor(std::string extra = {}, int64_t offset = 4, int64_t length = 20)
+{
+  return "{\"type\":\"deletion-vector-v1\",\"fields\":[1,2],\"snapshot-id\":-1,\"sequence-number\":"
+         "-1,\"offset\":" +
+         std::to_string(offset) + ",\"length\":" + std::to_string(length) + extra + "}";
+}
+class metadata_only_source final : public puffin_byte_source {
+ public:
+  explicit metadata_only_source(std::vector<std::byte> bytes) : inner_(std::move(bytes)) {}
+  bool seek(std::streamoff offset) override
+  {
+    offset_ = offset;
+    return inner_.seek(offset);
+  }
+  bool read(std::span<std::byte> output) override
+  {
+    if (offset_ < 132 && offset_ + static_cast<std::streamoff>(output.size()) > 4) ++data_reads;
+    auto result = inner_.read(output);
+    offset_ += output.size();
+    return result;
+  }
+  std::streamoff size() const override { return inner_.size(); }
+  size_t data_reads = 0;
+
+ private:
+  vector_puffin_source inner_;
+  std::streamoff offset_ = 0;
+};
+}  // namespace
+
+TEST_CASE("Neutral Puffin metadata preserves blob properties and charged ownership",
+          "[scan_preparation][puffin_metadata]")
+{
+  using namespace sirius::scan_manager;
+  test::test_reservation_provider provider;
+  provider.grant_bytes = 1024 * 1024;
+  preparation_ledger ledger(provider);
+  std::array scans{scan_envelope{{{{0, 0, 0}, 512 * 1024}}, {}, true}};
+  REQUIRE(ledger.admit(scans, memory_space_id(cucascade::memory::Tier::HOST, 0)).deferred);
+  ledger.register_unit({1, 1}, 512 * 1024);
+  auto permit = ledger.acquire_permit({1, 1});
+  REQUIRE(permit);
+  auto allocator = ledger.allocator(permit);
+  std::shared_ptr<puffin_container_metadata const> metadata;
+  {
+    auto footer =
+      std::string(
+        R"({"properties":{"created-by":"test","empty":"","":"empty-key","nul":"a\u0000b"},"blobs":[)") +
+      metadata_descriptor(
+        R"(,"properties":{"cardinality":"not-an-integer","custom-snapshot":"7","empty":""})") +
+      "," +
+      R"({"type":"unknown-blob","offset":40,"length":20,"fields":[],"snapshot-id":12,"sequence-number":34,"compression-codec":"zstd"}]})";
+    metadata_only_source source(metadata_container(footer));
+    metadata = read_puffin_metadata(source, allocator);
+    CHECK(source.data_reads == 0);
+    CHECK(metadata->file_size() == source.size());
+    CHECK(metadata->footer_start() == 132);
+  }
+  REQUIRE(metadata->blob_count() == 2);
+  CHECK(metadata->blob(0).type == "deletion-vector-v1");
+  CHECK(metadata->blob(0).offset == 4);
+  CHECK(metadata->blob(0).length == 20);
+  CHECK(metadata->blob(0).snapshot_id == -1);
+  CHECK_FALSE(metadata->blob(0).compression_codec);
+  CHECK(metadata->field_count(0) == 2);
+  CHECK(metadata->field(0, 1) == 2);
+  CHECK(metadata->property(0, "cardinality") == "not-an-integer");
+  CHECK(metadata->property(0, "custom-snapshot") == "7");
+  CHECK(metadata->property(0, "empty") == "");
+  CHECK_FALSE(metadata->property(0, "absent"));
+  CHECK_FALSE(metadata->property(1, "cardinality"));
+  CHECK(metadata->blob(1).snapshot_id == 12);
+  CHECK(metadata->blob(1).sequence_number == 34);
+  CHECK(metadata->blob(1).compression_codec == "zstd");
+  CHECK(metadata->file_property("created-by") == "test");
+  CHECK(metadata->file_property({}) == "empty-key");
+  CHECK(metadata->file_property("nul") == std::string_view("a\0b", 3));
+  CHECK_THROWS_AS(metadata->blob(2), std::out_of_range);
+  CHECK_THROWS_AS(metadata->field(0, 2), std::out_of_range);
+  auto charged = ledger.charged_bytes({1, 1});
+  REQUIRE(charged > 0);
+  permit.release();
+  CHECK(provider.seen->allocated_bytes == charged);
+  metadata.reset();
+  CHECK(provider.seen->allocated_bytes == 0);
+  CHECK(ledger.charged_bytes({1, 1}) == 0);
+}
+
+TEST_CASE("Neutral Puffin metadata rejects malformed structure and releases its backing",
+          "[scan_preparation][puffin_metadata][failure]")
+{
+  using namespace sirius::scan_manager;
+  auto mode = GENERATE("json",
+                       "root",
+                       "blobs",
+                       "duplicate_root",
+                       "duplicate_blob",
+                       "duplicate_property",
+                       "offset",
+                       "length",
+                       "overlap",
+                       "repeat_offset",
+                       "integer_overflow",
+                       "fields",
+                       "codec",
+                       "properties",
+                       "property_value",
+                       "trailing_magic",
+                       "leading_magic",
+                       "footer_magic",
+                       "compressed",
+                       "flags",
+                       "footer_length");
+  INFO(mode);
+  std::string m          = mode;
+  std::string descriptor = metadata_descriptor();
+  if (m == "duplicate_blob") descriptor = metadata_descriptor(",\"offset\":40");
+  if (m == "duplicate_property")
+    descriptor = metadata_descriptor(R"(,"properties":{"x":"a","x":"b"})");
+  if (m == "offset") descriptor = metadata_descriptor({}, 3);
+  if (m == "length") descriptor = metadata_descriptor({}, 4, INT64_MAX);
+  if (m == "integer_overflow")
+    descriptor =
+      R"({"type":"x","offset":18446744073709551615,"length":0,"fields":[],"snapshot-id":-1,"sequence-number":-1})";
+  if (m == "fields")
+    descriptor =
+      R"({"type":"x","offset":4,"length":0,"fields":["1"],"snapshot-id":-1,"sequence-number":-1})";
+  if (m == "codec") descriptor = metadata_descriptor(",\"compression-codec\":1");
+  if (m == "properties") descriptor = metadata_descriptor(",\"properties\":[]");
+  if (m == "property_value") descriptor = metadata_descriptor(R"(,"properties":{"cardinality":1})");
+  auto footer = "{\"blobs\":[" + descriptor +
+                ((m == "overlap" || m == "repeat_offset")
+                   ? "," + metadata_descriptor({}, m == "overlap" ? 10 : 4)
+                   : "") +
+                "]}";
+  if (m == "json") footer = "{";
+  if (m == "root") footer = "[]";
+  if (m == "blobs") footer = "{\"blobs\":{}}";
+  if (m == "duplicate_root") footer = "{\"blobs\":[],\"blobs\":[]}";
+  auto bytes = metadata_container(footer, m == "compressed" ? 1 : m == "flags" ? 256 : 0);
+  if (m == "trailing_magic") bytes.back() = std::byte{0};
+  if (m == "leading_magic") bytes.front() = std::byte{0};
+  if (m == "footer_magic") bytes[132] = std::byte{0};
+  if (m == "footer_length") bytes[bytes.size() - 9] = std::byte{0x7f};
+  metadata_only_source source(std::move(bytes));
+  test::test_reservation_provider provider;
+  provider.grant_bytes = 1024 * 1024;
+  preparation_ledger ledger(provider);
+  std::array scans{scan_envelope{{{{0, 0, 0}, 512 * 1024}}, {}, true}};
+  REQUIRE(ledger.admit(scans, memory_space_id(cucascade::memory::Tier::HOST, 0)).deferred);
+  ledger.register_unit({1, 1}, 512 * 1024);
+  auto permit = ledger.acquire_permit({1, 1});
+  REQUIRE(permit);
+  auto allocator = ledger.allocator(permit);
+  CHECK_THROWS_AS(read_puffin_metadata(source, allocator), std::runtime_error);
+  CHECK(source.data_reads == 0);
+  CHECK(ledger.charged_bytes({1, 1}) == 0);
+  CHECK(provider.seen->allocated_bytes == 0);
+}
+
+TEST_CASE("Neutral Puffin metadata has independent limits and preserves source failures",
+          "[scan_preparation][puffin_metadata][failure]")
+{
+  using namespace sirius::scan_manager;
+  test::test_reservation_provider provider;
+  provider.grant_bytes = 1024 * 1024;
+  preparation_ledger ledger(provider);
+  std::array scans{scan_envelope{{{{0, 0, 0}, 512 * 1024}}, {}, true}};
+  REQUIRE(ledger.admit(scans, memory_space_id(cucascade::memory::Tier::HOST, 0)).deferred);
+  ledger.register_unit({1, 1}, 512 * 1024);
+  auto permit = ledger.acquire_permit({1, 1});
+  REQUIRE(permit);
+  auto allocator = ledger.allocator(permit);
+  auto footer    = "{\"blobs\":[" + metadata_descriptor() + "]}";
+  vector_puffin_source source(metadata_container(footer));
+  CHECK_THROWS_AS(read_puffin_metadata(source, allocator, {8 * 1024 * 1024 + 1, 1}),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(read_puffin_metadata(source, allocator, {1000, 4097}), std::invalid_argument);
+  CHECK_THROWS_AS(read_puffin_metadata(source, allocator, {1, 1}), preparation_resource_error);
+  CHECK(provider.seen->allocations == 0);
+  CHECK_THROWS_AS(read_puffin_metadata(source, allocator, {1000, 0}), preparation_resource_error);
+  CHECK(provider.seen->allocated_bytes == 0);
+  provider.seen->fail_allocation = true;
+  CHECK_THROWS_AS(read_puffin_metadata(source, allocator), preparation_resource_error);
+  provider.seen->fail_allocation = false;
+  CHECK(ledger.charged_bytes({1, 1}) == 0);
+  identity_changing_puffin_source changed(source.size(), "object");
+  CHECK_THROWS_AS(read_puffin_metadata(changed, allocator), sirius::io::object_changed_error);
+  cancelling_puffin_source cancelled(source.size());
+  CHECK_THROWS_AS(read_puffin_metadata(cancelled, allocator), std::system_error);
+  std::string many_keys = "{";
+  for (int i = 0; i < 129; ++i) {
+    if (i) many_keys += ",";
+    many_keys += "\"k" + std::to_string(i) + "\":\"v\"";
+  }
+  many_keys += "}";
+  vector_puffin_source keys(metadata_container(many_keys));
+  CHECK_THROWS_AS(read_puffin_metadata(keys, allocator), preparation_resource_error);
+  auto many_fields   = metadata_descriptor();
+  std::string fields = "[0";
+  for (int i = 0; i < 4096; ++i)
+    fields += ",0";
+  fields += "]";
+  many_fields.replace(many_fields.find("[1,2]"), 5, fields);
+  vector_puffin_source fields_source(metadata_container("{\"blobs\":[" + many_fields + "]}"));
+  CHECK_THROWS_AS(read_puffin_metadata(fields_source, allocator), preparation_resource_error);
+  CHECK(provider.seen->allocated_bytes == 0);
+  vector_puffin_source empty(metadata_container("{\"blobs\":[]}"));
+  auto metadata = read_puffin_metadata(empty, allocator, {1000, 0});
+  CHECK(metadata->blob_count() == 0);
+  CHECK_FALSE(metadata->file_property("absent"));
 }

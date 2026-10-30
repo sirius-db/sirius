@@ -76,6 +76,9 @@ class gpu_merge_impl {
    * @param stream CUDA stream used for device memory operations and kernel launches.
    * @param memory_space The memory space used to allocate memory for the output data batch.
    *
+   * @param first_row_counts Optional mapping from FIRST value columns to their input-row-count
+   * columns. Partials with zero input rows are excluded without dropping real NULL values.
+   *
    * @return The output data batch.
    */
   static std::shared_ptr<cucascade::data_batch> merge_ungrouped_aggregate(
@@ -84,7 +87,8 @@ class gpu_merge_impl {
     const std::vector<std::optional<cudf::size_type>>& merge_nth_index,
     ::cuda::stream_ref stream,
     cucascade::memory::memory_space& memory_space,
-    const telemetry::batch_telemetry_info& telemetry_info = {});
+    const telemetry::batch_telemetry_info& telemetry_info               = {},
+    const std::vector<std::optional<cudf::size_type>>& first_row_counts = {});
 
   /**
    * @brief Perform grouped merge aggregate on multiple data batches.

@@ -118,12 +118,12 @@ inline child_result run_test_child(std::string const& test_name, std::string con
 
 // Concurrency regressions must fail within a bounded time even when std::future destruction joins
 // a deadlocked worker. The parent kills/reaps the whole isolated child after the deadline.
-inline bool run_isolated()
+inline bool run_isolated(std::string const& variant = {})
 {
   auto const name   = Catch::getResultCapture().getCurrentTestName();
   auto const* child = std::getenv("SIRIUS_NATIVE_LEASE_CHILD_CASE");
   if (child && name == child) { return false; }
-  auto result = run_test_child(name);
+  auto result = run_test_child(name, variant);
   INFO(result.output);
   REQUIRE_FALSE(result.timed_out);
   REQUIRE(result.signal == -1);

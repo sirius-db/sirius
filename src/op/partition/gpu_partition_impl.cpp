@@ -16,12 +16,14 @@
 
 #include "op/partition/gpu_partition_impl.hpp"
 
+#include "cudf/hugeint_carrier.hpp"
 #include "data/data_batch_utils.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/key_preparation.hpp"
 #include "op/partition/stable_hash_partition.hpp"
 
 #include <cudf/partitioning.hpp>
+#include <cudf/unary.hpp>
 
 #include <cuda_runtime.h>
 
@@ -58,10 +60,17 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::hash_par
   std::vector<int> effective_key_idx = partition_key_idx;
   for (size_t i = 0; i < partition_key_cast_types.size(); i++) {
     if (partition_key_cast_types[i].id() != cudf::type_id::EMPTY) {
-      auto cast_col = restore_prepared_key(input_table.column(partition_key_idx[i]),
-                                           partition_key_cast_types[i],
-                                           stream,
-                                           memory_space.get_default_allocator());
+      auto const key = input_table.column(partition_key_idx[i]);
+      // A HUGEINT key (DECIMAL128, scale 0) hashes as its INT64 wrap, like a BIGINT key; that is
+      // a hash-only conversion, not a carrier restore.
+      bool const hugeint_to_int64 = key.type() == hugeint_carrier_type() &&
+                                    partition_key_cast_types[i].id() == cudf::type_id::INT64;
+      auto cast_col =
+        hugeint_to_int64
+          ? cudf::cast(
+              key, partition_key_cast_types[i], stream, memory_space.get_default_allocator())
+          : restore_prepared_key(
+              key, partition_key_cast_types[i], stream, memory_space.get_default_allocator());
       if (!cast_col) { continue; }
       effective_key_idx[i] = static_cast<int>(all_col_views.size());
       all_col_views.push_back(cast_col->view());

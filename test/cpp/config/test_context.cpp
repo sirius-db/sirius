@@ -66,38 +66,6 @@
 #include <vector>
 
 namespace {
-// MGPU-06 test helper: enable CUDA driver-level peer access for every GPU
-// pair, idempotently, with sticky-error consumption (matches Plan 07-01's
-// enable-loop pattern at sirius_context.cpp). Test-scope because this
-// TEST_CASE builds a bare memory manager rather than going through
-// SiriusContext::initialize() — without this the peer-async convert path
-// hits cudaErrorIllegalAddress on the return leg. Returns true if at
-// least one pair is bidirectionally P2P-capable.
-bool enable_p2p_for_test(int num_gpus)
-{
-  bool any_enabled = false;
-  for (int i = 0; i < num_gpus; ++i) {
-    for (int j = 0; j < num_gpus; ++j) {
-      if (i == j) { continue; }
-      int can_access = 0;
-      if (cudaDeviceCanAccessPeer(&can_access, i, j) != cudaSuccess || !can_access) {
-        (void)cudaGetLastError();
-        continue;
-      }
-      cudaError_t prev_dev_err = cudaSetDevice(i);
-      (void)prev_dev_err;
-      cudaError_t enable_err = cudaDeviceEnablePeerAccess(j, 0);
-      (void)cudaGetLastError();  // consume sticky state (see 07-01 SUMMARY)
-      if (enable_err == cudaSuccess || enable_err == cudaErrorPeerAccessAlreadyEnabled) {
-        any_enabled = true;
-      }
-    }
-  }
-  cudaSetDevice(0);
-  (void)cudaGetLastError();
-  return any_enabled;
-}
-
 // Data integrity guard: FNV-1a checksum over a packed batch payload.
 // Duplicated here because the
 // equivalent helper in test/cpp/downgrade/test_downgrade_executor.cpp lives
@@ -970,7 +938,8 @@ void require_shared_operator_defaults(const sirius::operator_params& params, uin
   REQUIRE(params.concat_batch_bytes == batch);
   REQUIRE(params.cross_join_task_bytes == batch);
   REQUIRE(params.sort_sample_bytes == batch);
-  REQUIRE(params.max_build_hash_table_bytes == 2 * batch);
+  REQUIRE(params.max_build_hash_table_bytes == 8 * batch);
+  REQUIRE(params.max_build_probe_resident_bytes == 8 * batch);
 }
 
 fs::path config_fixture(std::string const& name)
@@ -1075,6 +1044,72 @@ TEST_CASE("explicit operator batch values override effective-capacity defaults",
   REQUIRE(params.sort_sample_bytes == 4 * mib);
   REQUIRE(params.max_build_hash_table_bytes == 5 * mib);
   REQUIRE(params.cross_join_task_bytes == 6 * mib);
+  REQUIRE(params.max_build_probe_resident_bytes == 7 * mib);
+}
+
+TEST_CASE(
+  "BUILD_PROBE index budget follows startup hash partitions and residency stays batch-derived",
+  "[sirius][config][operator_defaults]")
+{
+  sirius::sirius_config config;
+  config.load_from_file(config_fixture("operator_defaults_hash_partition_only.yaml"));
+
+  constexpr uint64_t mib = 1024ULL * 1024;
+  auto const& params     = config.get_operator_params();
+  REQUIRE(params.hash_partition_bytes == 3 * mib);
+  REQUIRE(params.max_build_hash_table_bytes == 24 * mib);
+  REQUIRE(params.max_build_probe_resident_bytes == 8 * expected_effective_batch(config));
+}
+
+TEST_CASE("startup BUILD_PROBE budgets remain independent through SET and RESET",
+          "[sirius][config][operator_defaults][isolated_context]")
+{
+  finally cleanup_env{[]() {
+    unsetenv("SIRIUS_CONFIG_FILE");
+    setenv("SIRIUS_DISABLE", "1", 1);
+  }};
+  auto const cfg = config_fixture("operator_defaults_hash_partition_only.yaml");
+  unsetenv("SIRIUS_DISABLE");
+  setenv("SIRIUS_CONFIG_FILE", cfg.string().c_str(), 1);
+
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  constexpr uint64_t mib              = 1024ULL * 1024;
+  constexpr uint64_t index_default    = 24 * mib;
+  constexpr uint64_t resident_default = 8 * ((256 * mib) / 40);
+  auto execute                        = [&](char const* sql) {
+    auto result = con.Query(sql);
+    REQUIRE(result != nullptr);
+    if (result->HasError()) { INFO(result->GetError()); }
+    REQUIRE_FALSE(result->HasError());
+  };
+  auto require_budgets = [&](uint64_t index, uint64_t resident) {
+    auto result = con.Query(R"(
+      SELECT current_setting('max_build_hash_table_bytes')::UBIGINT,
+             current_setting('max_build_probe_resident_bytes')::UBIGINT
+    )");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->Collection().GetValue(0, 0).GetValue<uint64_t>() == index);
+    REQUIRE(result->Collection().GetValue(1, 0).GetValue<uint64_t>() == resident);
+    auto const& params = duckdb::session_operator_params(*con.context);
+    REQUIRE(params.max_build_hash_table_bytes == index);
+    REQUIRE(params.max_build_probe_resident_bytes == resident);
+  };
+
+  require_budgets(index_default, resident_default);
+  execute("SET hash_partition_bytes = 99");
+  require_budgets(index_default, resident_default);
+  execute("SET max_build_hash_table_bytes = 123");
+  execute("SET max_build_probe_resident_bytes = 456");
+  require_budgets(123, 456);
+  execute("RESET max_build_hash_table_bytes");
+  execute("RESET max_build_probe_resident_bytes");
+  require_budgets(index_default, resident_default);
+  REQUIRE(duckdb::session_operator_params(*con.context).hash_partition_bytes == 99);
+  execute("RESET hash_partition_bytes");
+  REQUIRE(duckdb::session_operator_params(*con.context).hash_partition_bytes == 3 * mib);
+  require_budgets(index_default, resident_default);
 }
 
 TEST_CASE("ordinary defaults stay physical-memory-derived without an explicit GPU cap",
@@ -1149,7 +1184,8 @@ TEST_CASE("effective-capacity defaults seed DuckDB SET and RESET",
            current_setting('hash_partition_bytes')::UBIGINT,
            current_setting('concat_batch_bytes')::UBIGINT,
            current_setting('sort_sample_bytes')::UBIGINT,
-           current_setting('max_build_hash_table_bytes')::UBIGINT
+           current_setting('max_build_hash_table_bytes')::UBIGINT,
+           current_setting('max_build_probe_resident_bytes')::UBIGINT
   )");
   REQUIRE(settings != nullptr);
   REQUIRE_FALSE(settings->HasError());
@@ -1157,7 +1193,8 @@ TEST_CASE("effective-capacity defaults seed DuckDB SET and RESET",
   REQUIRE(settings->Collection().GetValue(1, 0).GetValue<uint64_t>() == expected_batch);
   REQUIRE(settings->Collection().GetValue(2, 0).GetValue<uint64_t>() == expected_batch);
   REQUIRE(settings->Collection().GetValue(3, 0).GetValue<uint64_t>() == expected_batch);
-  REQUIRE(settings->Collection().GetValue(4, 0).GetValue<uint64_t>() == 2 * expected_batch);
+  REQUIRE(settings->Collection().GetValue(4, 0).GetValue<uint64_t>() == 8 * expected_batch);
+  REQUIRE(settings->Collection().GetValue(5, 0).GetValue<uint64_t>() == 8 * expected_batch);
 
   require_shared_operator_defaults(duckdb::session_operator_params(*con.context), expected_batch);
 
@@ -1475,6 +1512,7 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
       current_setting('dynamic_filter_inlist_max_l2_fraction')::DOUBLE,
       current_setting('enable_dynamic_filter_multi_partition')::BOOLEAN,
       current_setting('max_dynamic_filter_bloom_bytes_per_gpu')::UBIGINT,
+      current_setting('max_build_probe_resident_bytes')::UBIGINT,
       current_setting('spill_compression')::BOOLEAN
   )");
   REQUIRE(settings != nullptr);
@@ -1504,7 +1542,23 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   REQUIRE(settings->Collection().GetValue(19, 0).GetValue<double>() == Approx(0.4));
   REQUIRE(settings->Collection().GetValue(20, 0).GetValue<bool>());
   REQUIRE(settings->Collection().GetValue(21, 0).GetValue<uint64_t>() == 17 * mib);
-  REQUIRE(settings->Collection().GetValue(22, 0).GetValue<bool>());
+  REQUIRE(settings->Collection().GetValue(22, 0).GetValue<uint64_t>() == 9 * mib);
+  auto require_resident_budget = [&](uint64_t value) {
+    auto result = con.Query("SELECT current_setting('max_build_probe_resident_bytes')::UBIGINT");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->Collection().GetValue(0, 0).GetValue<uint64_t>() == value);
+    REQUIRE(duckdb::session_operator_params(*con.context).max_build_probe_resident_bytes == value);
+  };
+  auto resident_set = con.Query("SET max_build_probe_resident_bytes = 99");
+  REQUIRE(resident_set != nullptr);
+  REQUIRE_FALSE(resident_set->HasError());
+  require_resident_budget(99);
+  auto resident_reset = con.Query("RESET max_build_probe_resident_bytes");
+  REQUIRE(resident_reset != nullptr);
+  REQUIRE_FALSE(resident_reset->HasError());
+  require_resident_budget(9 * mib);
+  REQUIRE(settings->Collection().GetValue(23, 0).GetValue<bool>());
 
   for (auto const* invalid_budget : {"-1", "0", "18446744073709551616"}) {
     auto rejected =
@@ -1675,6 +1729,7 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
 
   auto const& params = duckdb::session_operator_params(*con.context);
   REQUIRE(params.scan_task_batch_size == 1 * mib);
+  REQUIRE(params.max_build_probe_resident_bytes == 9 * mib);
   REQUIRE(params.max_sort_partition_memory_fraction == Approx(0.25));
   REQUIRE_FALSE(params.enable_dynamic_filter);
   auto const& compression = duckdb::session_compression_config(*con.context);
@@ -2305,13 +2360,6 @@ TEST_CASE("gpu_to_gpu round-trip preserves bytes on N>=2 hosts (MGPU-04 + MGPU-0
   auto* gpu1 = const_cast<cucascade::memory::memory_space*>(gpu_spaces[1]);
   REQUIRE(gpu0->get_device_id() == 0);
   REQUIRE(gpu1->get_device_id() == 1);
-
-  // Enable CUDA driver-level peer access for every GPU pair — Plan 07-01's
-  // enable loop normally runs inside SiriusContext::initialize(), but this
-  // TEST_CASE builds a bare memory manager and bypasses that seam. Without
-  // the enable call cucascade's peer-async convert_gpu_to_gpu triggers
-  // cudaErrorIllegalAddress on the GPU1 -> GPU0 return leg (MGPU-06 bug).
-  enable_p2p_for_test(2);
 
   // Build a minimal GPU-resident batch on gpu0. The make_gpu_batch helper in
   // test_downgrade_executor.cpp lives in an anonymous namespace and is not

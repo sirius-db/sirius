@@ -28,8 +28,10 @@
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/aggregate/stddev.hpp"
 #include "op/aggregate/wide_integer_sum.hpp"
+#include "op/input_free_operator_data.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
+#include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
 #include "telemetry/nvtx.hpp"
 
@@ -128,6 +130,12 @@ struct aggregate_spec {
   /// SUM or AVG that DuckDB accumulates in HUGEINT (is_wide_integer_sum). Its one-row partial
   /// sum is DECIMAL128 with scale 0 so that the merge cannot overflow INT64.
   bool wide_integer_sum = false;
+  /// The DuckDB result is HUGEINT, carried as DECIMAL128 with scale 0. An integer input reduced in
+  /// INT64 has its one-row partial widened to that carrier, so the merge sums DECIMAL128 partials.
+  bool returns_hugeint = false;
+  /// SUM or AVG over HUGEINT: its DECIMAL128 partials can approach 2^127, so the merge checks their
+  /// total cannot pass it.
+  bool sums_hugeint_input = false;
 };
 
 struct aggregate_layout {
@@ -136,10 +144,10 @@ struct aggregate_layout {
   std::vector<cudf::aggregation::Kind> merge_kinds;
   std::vector<std::optional<cudf::size_type>>
     merge_nth_index;  // when merge_kinds[i] == NTH_ELEMENT
-  bool has_avg              = false;
-  bool has_count_distinct   = false;
-  bool has_stddev           = false;
-  bool has_wide_integer_sum = false;
+  bool has_first          = false;
+  bool has_avg            = false;
+  bool has_count_distinct = false;
+  bool has_stddev         = false;
 };
 
 /// The local (partial) sum type of a wide integer SUM or AVG: DECIMAL(38, 0), carried on the GPU
@@ -179,7 +187,11 @@ aggregate_layout build_aggregate_layout(
     spec.local_count_idx = std::numeric_limits<size_t>::max();
     spec.wide_integer_sum =
       !children.empty() && is_wide_integer_sum(agg.function(), children[0]->return_type());
-    layout.has_wide_integer_sum |= spec.wide_integer_sum;
+    spec.returns_hugeint    = agg_return_type.id() == duckdb::LogicalTypeId::HUGEINT;
+    spec.sums_hugeint_input = (agg.function() == sirius::aggregate_id::sum ||
+                               agg.function() == sirius::aggregate_id::avg) &&
+                              !children.empty() &&
+                              children[0]->return_type().id() == sirius::type_id::HUGEINT;
 
     switch (agg.function()) {
       case sirius::aggregate_id::count_star:
@@ -296,6 +308,12 @@ aggregate_layout build_aggregate_layout(
         layout.local_types.push_back(agg_return_type);
         layout.merge_kinds.push_back(cudf::aggregation::Kind::NTH_ELEMENT);
         layout.merge_nth_index.push_back(0);  // first element
+        // A NULL first row is a value; an empty partial has no first row.
+        spec.local_count_idx = local_idx++;
+        layout.local_types.push_back(duckdb::LogicalType::BIGINT);
+        layout.merge_kinds.push_back(cudf::aggregation::Kind::SUM);
+        layout.merge_nth_index.push_back(std::nullopt);
+        layout.has_first = true;
         break;
       default:
         throw not_implemented_exception(
@@ -498,6 +516,9 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
               cudf::get_element(col, 0, stream, cudf::get_current_device_resource_ref());
           }
           cols.push_back(cudf::make_column_from_scalar(*first_scalar, 1, stream));
+          auto count = make_numeric_scalar_with_value<int64_t>(
+            cudf::data_type{cudf::type_id::INT64}, static_cast<int64_t>(view.num_rows()), stream);
+          cols.push_back(cudf::make_column_from_scalar(*count, 1, stream));
           break;
         }
         case aggregate_kind::SUM:
@@ -526,10 +547,16 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
           std::optional<cudf::data_type> widen_partial_to;
           std::unique_ptr<cudf::column> partial;
           if (spec.wide_integer_sum) {
-            // INTEGER, or BIGINT and HUGEINT carried as INT64: aggregate inputs keep their native
-            // carriers, and wide_integer_sum rejects any other type.
+            // INTEGER or BIGINT: aggregate inputs keep their native carriers, and
+            // wide_integer_sum rejects any other type.
             partial = wide_integer_sum(col, stream, space->get_default_allocator());
           } else {
+            if (spec.returns_hugeint && !is_decimal) {
+              // cuDF cannot reduce integers into a decimal: sum_no_overflow and SMALLINT or
+              // BOOLEAN inputs are reduced in INT64 and the partial widened to HUGEINT's carrier.
+              out_type         = cudf::data_type{cudf::type_id::INT64};
+              widen_partial_to = wide_integer_sum_type();
+            }
             if (spec.kind == aggregate_kind::SUM || spec.kind == aggregate_kind::AVG) {
               if (col.type().id() == cudf::type_id::DECIMAL32 ||
                   col.type().id() == cudf::type_id::DECIMAL64) {
@@ -652,22 +679,54 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
   const operator_data& input_data, ::cuda::stream_ref stream)
 {
   nvtx_scoped_range nvtx_range{"sirius_physical_ungrouped_aggregate_merge::execute"};
-  auto& input        = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  auto input_batches = input.get_read_only_batches();
   if (aggregates.empty()) {
     return std::make_unique<pipelineable_operator_data>(
       std::vector<std::shared_ptr<cucascade::data_batch>>{});
   }
 
-  if (input_batches.empty()) {
+  if (auto const* empty = dynamic_cast<input_free_operator_data const*>(&input_data)) {
+    auto const layout = build_aggregate_layout(aggregates);
+    auto& space       = empty->get_gpu_memory_space();
+    auto const mr     = space.get_default_allocator();
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.reserve(layout.aggregates.size());
+    for (std::size_t i = 0; i < layout.aggregates.size(); ++i) {
+      auto const kind = layout.aggregates[i].kind;
+      auto const physical_type =
+        has_physical_overrides() ? get_physical_types()[i] : sirius::require_cudf_type(types[i]);
+      if (kind == aggregate_kind::COUNT_STAR || kind == aggregate_kind::COUNT ||
+          kind == aggregate_kind::COUNT_DISTINCT) {
+        auto zero = sirius::make_constant_column<int64_t>(0, 1, stream, mr);
+        if (zero->type() != physical_type) {
+          zero = cudf::cast(zero->view(), physical_type, stream, mr);
+        }
+        columns.push_back(std::move(zero));
+      } else if (cudf::is_fixed_width(physical_type)) {
+        columns.push_back(
+          cudf::make_fixed_width_column(physical_type, 1, cudf::mask_state::ALL_NULL, stream, mr));
+      } else {
+        auto prototype = sirius::make_empty_table(duckdb::vector<sirius::logical_type>{types[i]});
+        columns.push_back(sirius::make_null_column(prototype->view().column(0), 1, stream, mr));
+      }
+    }
+    auto table = std::make_unique<cudf::table>(std::move(columns));
     return std::make_unique<pipelineable_operator_data>(
-      std::vector<std::shared_ptr<cucascade::data_batch>>{});
+      std::vector<std::shared_ptr<cucascade::data_batch>>{
+        sirius::make_data_batch(std::move(table), space, stream, batch_telemetry())});
+  }
+
+  auto const& input  = dynamic_cast<pipelineable_operator_data const&>(input_data);
+  auto input_batches = input.get_read_only_batches();
+  if (input_batches.empty()) {
+    throw sirius::internal_exception(
+      "[sirius_physical_ungrouped_aggregate_merge::execute] empty input must arrive as "
+      "input_free_operator_data");
   }
 
   cucascade::memory::memory_space* space = input_batches[0].get_memory_space();
   if (space == nullptr) {
-    return std::make_unique<pipelineable_operator_data>(
-      std::vector<std::shared_ptr<cucascade::data_batch>>{});
+    throw sirius::internal_exception(
+      "[sirius_physical_ungrouped_aggregate_merge::execute] input batch has no memory space");
   }
 
   auto layout = build_aggregate_layout(aggregates);
@@ -675,12 +734,32 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
   if (input_batches.size() == 1) {
     merged_batch = input.get_data_batches()[0];  // forward the owned input batch (idle at park)
   } else {
-    merged_batch = gpu_merge_impl::merge_ungrouped_aggregate(
-      input_batches, layout.merge_kinds, layout.merge_nth_index, stream, *space, batch_telemetry());
+    std::vector<std::optional<cudf::size_type>> first_row_counts(layout.local_types.size());
+    for (auto const& spec : layout.aggregates) {
+      if (spec.kind == aggregate_kind::FIRST)
+        first_row_counts[spec.local_sum_idx] = spec.local_count_idx;
+    }
+    // cuDF's SUM wraps past 128 bits; a HUGEINT input's partials can get there.
+    for (auto const& spec : layout.aggregates) {
+      if (!spec.sums_hugeint_input) { continue; }
+      std::vector<cudf::column_view> partials;
+      for (auto const& batch : input_batches) {
+        partials.push_back(
+          batch.get_data()->cast<cucascade::gpu_table_representation>().get_table_view().column(
+            static_cast<cudf::size_type>(spec.local_sum_idx)));
+      }
+      require_decimal128_partial_sums_in_range(partials, stream, space->get_default_allocator());
+    }
+    merged_batch = gpu_merge_impl::merge_ungrouped_aggregate(input_batches,
+                                                             layout.merge_kinds,
+                                                             layout.merge_nth_index,
+                                                             stream,
+                                                             *space,
+                                                             batch_telemetry(),
+                                                             first_row_counts);
   }
 
-  if (!layout.has_avg && !layout.has_stddev && !layout.has_count_distinct &&
-      !layout.has_wide_integer_sum) {
+  if (!layout.has_first && !layout.has_avg && !layout.has_stddev && !layout.has_count_distinct) {
     return std::make_unique<pipelineable_operator_data>(
       std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(merged_batch)});
   }
@@ -706,13 +785,6 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
     } else if (spec.kind == aggregate_kind::STDDEV_SAMP) {
       output_cols.push_back(finalize_stddev(
         merged_view.column(spec.local_sum_idx), stream, space->get_default_allocator()));
-    } else if (spec.wide_integer_sum) {
-      // The DECIMAL128 total becomes the INT64 result, or the query falls back if it overflows.
-      auto const& col_view = merged_view.column(static_cast<cudf::size_type>(spec.local_sum_idx));
-      output_cols.push_back(
-        narrow_wide_integer_sum(std::make_unique<cudf::column>(col_view, stream),
-                                stream,
-                                cudf::get_current_device_resource_ref()));
     } else {
       auto const& col_view = merged_view.column(static_cast<cudf::size_type>(spec.local_sum_idx));
       output_cols.push_back(std::make_unique<cudf::column>(col_view, stream));
@@ -737,23 +809,67 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
     std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(output_batch)});
 }
 
-std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::get_next_task_input_data()
+std::optional<task_creation_hint> sirius_physical_ungrouped_aggregate_merge::get_next_task_hint()
 {
-  // we need to lock, then pull all the batches from one partition and return them, and increment
-  // the partition index
-  std::lock_guard<std::mutex> lg(lock);
-  std::vector<::std::shared_ptr<::cucascade::data_batch>> input_batch;
-  bool found_batch = true;
-  while (found_batch) {
-    auto batch = ports.begin()->second->repo->pop_next_data_batch();
-    if (batch) {
-      input_batch.push_back(std::move(batch));
-    } else {
-      found_batch = false;
+  if (ports.empty() || _task_claimed.load(std::memory_order_acquire)) { return std::nullopt; }
+  for (auto const& [name, port] : ports) {
+    if (port->src_pipeline && !port->src_pipeline->is_pipeline_finished()) {
+      auto source    = port->src_pipeline->get_source();
+      auto* producer = source ? source.get() : &port->src_pipeline->get_operators().front().get();
+      return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
     }
   }
-  if (input_batch.empty()) { return nullptr; }
-  return std::make_unique<pipelineable_operator_data>(input_batch);
+  bool expected = false;
+  if (!_task_claimed.compare_exchange_strong(expected, true)) { return std::nullopt; }
+  return task_creation_hint{TaskCreationHint::READY, this};
+}
+
+bool sirius_physical_ungrouped_aggregate_merge::all_ports_empty()
+{
+  return _input_handed_out.load(std::memory_order_acquire);
+}
+
+std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::get_next_task_input_data()
+{
+  std::lock_guard<std::mutex> guard(lock);
+  if (!_task_claimed.load(std::memory_order_acquire) ||
+      _input_handed_out.load(std::memory_order_acquire) || !is_source_pipeline_finished()) {
+    return nullptr;
+  }
+  std::vector<std::shared_ptr<cucascade::data_batch>> batches;
+  for (auto const& [name, port] : ports) {
+    if (!port->repo) { continue; }
+    while (auto batch = port->repo->pop_next_data_batch()) {
+      batches.push_back(std::move(batch));
+    }
+  }
+  std::unique_ptr<operator_data> input;
+  if (batches.empty()) {
+    input = std::make_unique<input_free_operator_data>(empty_input_size_estimate());
+  } else {
+    input = std::make_unique<pipelineable_operator_data>(std::move(batches));
+  }
+  _input_handed_out.store(true, std::memory_order_release);
+  return input;
+}
+
+std::size_t sirius_physical_ungrouped_aggregate_merge::empty_input_size_estimate() const
+{
+  // Per-column allowance includes masks, nested offsets, and allocation rounding.
+  std::size_t columns = types.size();
+  for (auto const& type : types) {
+    if (type.is_array() || type.is_varchar()) { columns = memory::saturating_add(columns, 2); }
+  }
+  return std::max(memory::saturating_mul(columns, std::size_t{4096}), std::size_t{1} << 20);
+}
+
+std::size_t sirius_physical_ungrouped_aggregate_merge::no_history_peak_memory_estimate(
+  input_stats const& stats) const
+{
+  auto const ordinary = sirius_physical_operator::no_history_peak_memory_estimate(stats);
+  return stats.type == operator_data_type::INPUT_FREE
+           ? std::max(ordinary, empty_input_size_estimate())
+           : ordinary;
 }
 
 }  // namespace op

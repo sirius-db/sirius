@@ -18,6 +18,10 @@ on:
   merge_group:
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }} # cancel only existing PR runs
+
 jobs:
   lint:
     runs-on: ubuntu-24.04
@@ -254,13 +258,15 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE="$PWD/sirius-duckdb/vcpkg/scripts/buildsystems/vcpkg.cmake" \
             -DVCPKG_INSTALLED_DIR="$PWD/build/static-install" -DVCPKG_MANIFEST_INSTALL=OFF
           pixi run --locked -e vcpkg cmake --build build/static-consumer
-          readelf -d build/static-consumer/consumer > build/static-consumer/dynamic.txt
-          while read -r library; do
-            case "$library" in
-              libcuda.so.1|libnvidia-ml.so.1|libc.so.6|libm.so.6|libdl.so.2|libpthread.so.0|librt.so.1|ld-linux*.so.*) ;;
-              *) echo "Unexpected runtime dependency: $library"; exit 1 ;;
-            esac
-          done < <(sed -n 's/.*(NEEDED).*\[\(.*\)\].*/\1/p' build/static-consumer/dynamic.txt)
+          for consumer in consumer c_consumer; do
+            readelf -d "build/static-consumer/$consumer" > "build/static-consumer/$consumer.dynamic.txt"
+            while read -r library; do
+              case "$library" in
+                libcuda.so.1|libnvidia-ml.so.1|libc.so.6|libm.so.6|libdl.so.2|libpthread.so.0|librt.so.1|ld-linux*.so.*) ;;
+                *) echo "$consumer: unexpected runtime dependency: $library"; exit 1 ;;
+              esac
+            done < <(sed -n 's/.*(NEEDED).*\[\(.*\)\].*/\1/p' "build/static-consumer/$consumer.dynamic.txt")
+          done
 
       - name: Surface build errors (vcpkg)
         if: failure() && matrix.build.environment == 'vcpkg'

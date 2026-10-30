@@ -16,12 +16,14 @@
 
 #include "op/merge/gpu_merge_impl.hpp"
 
+#include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
 #include "log/logging.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/aggregate/stddev.hpp"
 
 #include <cudf/aggregation.hpp>
+#include <cudf/binaryop.hpp>
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/dictionary/dictionary_column_view.hpp>
@@ -70,7 +72,8 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_ungrouped_aggregate
   const std::vector<std::optional<cudf::size_type>>& merge_nth_index,
   ::cuda::stream_ref stream,
   cucascade::memory::memory_space& memory_space,
-  const telemetry::batch_telemetry_info& telemetry_info)
+  const telemetry::batch_telemetry_info& telemetry_info,
+  const std::vector<std::optional<cudf::size_type>>& first_row_counts)
 {
   // Sanity check.
   if (input.size() < 2) {
@@ -81,6 +84,9 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_ungrouped_aggregate
     throw std::runtime_error(
       "`merge_nth_index` must have the same size as `aggregates` in `merge_ungrouped_aggregate()`");
   }
+
+  if (!first_row_counts.empty() && first_row_counts.size() != aggregates.size())
+    throw std::invalid_argument("FIRST row-count mapping must match aggregate columns");
 
   // Pull input cudf tables and concatenate.
   std::vector<cudf::table_view> input_cudf_table_views;
@@ -159,11 +165,26 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_ungrouped_aggregate
           "Unsupported cudf aggregate kind in `merge_ungrouped_aggregate()`: " +
           std::to_string(static_cast<int>(aggregates[c])));
     }
-    auto output_scalar = cudf::reduce(concatenated->get_column(c),
-                                      *reduce_aggregation,
-                                      output_type,
-                                      stream,
-                                      memory_space.get_default_allocator());
+    auto values = concatenated->get_column(c).view();
+    std::unique_ptr<cudf::table> nonempty_partials;
+    if (!first_row_counts.empty() && first_row_counts[c]) {
+      auto count_index = *first_row_counts[c];
+      if (aggregates[c] != cudf::aggregation::Kind::NTH_ELEMENT || count_index < 0 ||
+          count_index >= concatenated->num_columns())
+        throw std::invalid_argument("Invalid FIRST row-count column");
+      cudf::numeric_scalar<int64_t> zero(0, true, stream, memory_space.get_default_allocator());
+      auto keep         = cudf::binary_operation(concatenated->get_column(count_index).view(),
+                                         zero,
+                                         cudf::binary_operator::GREATER,
+                                         cudf::data_type{cudf::type_id::BOOL8},
+                                         stream,
+                                         memory_space.get_default_allocator());
+      nonempty_partials = sirius::apply_retention_mask(
+        cudf::table_view{{values}}, keep->view(), stream, memory_space.get_default_allocator());
+      values = nonempty_partials->view().column(0);
+    }
+    auto output_scalar = cudf::reduce(
+      values, *reduce_aggregation, output_type, stream, memory_space.get_default_allocator());
     output_cudf_cols.push_back(cudf::make_column_from_scalar(
       *output_scalar, 1, stream, memory_space.get_default_allocator()));
   }

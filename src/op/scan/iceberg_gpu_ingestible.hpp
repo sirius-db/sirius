@@ -74,7 +74,6 @@ class iceberg_gpu_ingestible : public gpu_ingestible {
   explicit iceberg_gpu_ingestible(std::unique_ptr<iceberg_ingestible_table_info> info);
 
   metadata_scan_task_t next_split_provider(io::ioctx_resolver resolve) override;
-  stoppable_metadata_scan_task_t next_split_provider_with_stop(io::ioctx_resolver resolve) override;
   void set_execution_completion(std::shared_ptr<pipeline::completion_handler> c) override
   {
     gpu_ingestible::set_execution_completion(c);
@@ -114,12 +113,10 @@ class iceberg_gpu_ingestible : public gpu_ingestible {
     return _core.post_filter_and_project(
       std::move(input), space, stream, like, std::move(cache), survivors, elided, policy);
   }
-  bool can_claim_preparation() override;
+  metadata_claim try_claim_split(io::ioctx_resolver) override;
+  void bind_preparation_wakeup(scan_manager::preparation_wakeup) override;
   std::shared_ptr<scan_manager::preparation_admission> preparation_admission() const override;
   void attach_preparation_ledger(std::shared_ptr<scan_manager::preparation_ledger>) override;
-  void begin_preparation(std::shared_ptr<iceberg_dv_attempt> attempt);
-  preparation_claim claim_preparation(io::ioctx_resolver resolve) override;
-  scan_manager::unit_key next_preparation_unit() const;
   void stop_preparation() noexcept override;
   void finish_preparation() noexcept override;
 
@@ -145,9 +142,6 @@ class iceberg_gpu_ingestible : public gpu_ingestible {
   std::shared_ptr<iceberg_delete_sets const> _delete_sets;
   std::shared_ptr<iceberg_dv_preparation> _deferred;
   std::shared_ptr<iceberg_dv_attempt> _attempt;
-  scan_manager::w_permit _next_permit;
-  size_t _next_preparation = 0;
-  bool _next_registered    = false;
   std::string _table_path;
   /// Scan path -> delete-map key, only for the paths where the two spellings differ.
   std::unordered_map<std::string, std::string> _delete_key_by_scan_path;

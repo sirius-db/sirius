@@ -23,6 +23,7 @@
 
 #include <cudf/copying.hpp>
 #include <cudf/reduction/distinct_count.hpp>
+#include <cudf/utilities/error.hpp>
 #include <cudf/utilities/traits.hpp>
 
 #include <rmm/resource_ref.hpp>
@@ -44,6 +45,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -96,6 +98,14 @@ namespace {
 
 constexpr char const* kBitpackPlan =
   "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n";
+constexpr char const* kDeltaBitpackPlan =
+  "input -> delta -> differences\n"
+  "delta.differences -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n";
+constexpr char const* kDeltaRleBitpackPlan =
+  "input -> delta -> differences\n"
+  "delta.differences -> rle -> runs, values\n"
+  "delta.differences.runs -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
+  "delta.differences.values -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n";
 constexpr char const* kDictionaryPlan =
   "input -> dictionary -> keys_offsets, keys_chars, indices\n"
   "dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n";
@@ -115,10 +125,113 @@ constexpr double kMaxDictionaryDistinctFraction = 0.1;
 /// Largest fixed-width column bitpack accepts. Its encode scratch holds the column at
 /// full width as 32-bit words in a cudf column, which caps it at 2^31 words.
 constexpr std::size_t kMaxBitpackColumnBytes = std::size_t{1} << 33;  // 8 GiB
+/// Rows sampled to choose an integer column's plan.
+constexpr cudf::size_type kIntegerSampleRows = 64 * 1024;
+/// Values per bitpack chunk; each chunk is packed at the bit width of its own range.
+constexpr std::size_t kBitpackChunk = 1024;
+/// A delta plan replaces plain bitpack only when it is estimated this much smaller.
+constexpr double kMinDeltaSaving = 0.9;
+
+/// Estimated bitpack size of a stream of values pushed one at a time: each chunk at the
+/// bit width of its range, plus its min/count/width header.
+class bitpack_size_estimate {
+ public:
+  void push(__int128 value)
+  {
+    lo_ = count_ == 0 ? value : std::min(lo_, value);
+    hi_ = count_ == 0 ? value : std::max(hi_, value);
+    if (++count_ == kBitpackChunk) { close_chunk(); }
+  }
+
+  /// The estimate, counting a partial last chunk.
+  double finish()
+  {
+    close_chunk();
+    return bytes_;
+  }
+
+ private:
+  void close_chunk()
+  {
+    if (count_ == 0) { return; }
+    auto range = static_cast<unsigned __int128>(hi_ - lo_);
+    int bits   = 0;
+    for (; range != 0; range >>= 1) {
+      ++bits;
+    }
+    bytes_ += static_cast<double>(count_) * bits / 8 + 16;
+    count_ = 0;
+  }
+
+  __int128 lo_{0};
+  __int128 hi_{0};
+  std::size_t count_{0};
+  double bytes_{0};
+};
+
+/// Integer-valued columns (integers, decimals up to 64 bits, dates and times) choose
+/// between bitpack, delta -> bitpack and delta -> rle -> bitpack by estimating each one's
+/// size on a prefix sample. Sorted keys, which often reach a spill still in order, pack
+/// far smaller as differences, and runs of equal keys smaller still as runs. The sample
+/// is bounded (kIntegerSampleRows), so estimating it on the host costs little next to
+/// the GPU encode that follows.
+std::string integer_spill_plan(cudf::column_view const& column, ::cuda::stream_ref stream)
+{
+  auto const width = cudf::size_of(column.type());
+  auto const rows  = static_cast<std::size_t>(std::min(column.size(), kIntegerSampleRows));
+  std::vector<std::uint8_t> raw(rows * width);
+  CUDF_CUDA_TRY(cudaMemcpyAsync(raw.data(),
+                                column.head<std::uint8_t>() + column.offset() * width,
+                                raw.size(),
+                                cudaMemcpyDeviceToHost,
+                                stream.get()));
+  stream.sync();
+
+  bool const is_unsigned = cudf::is_unsigned(column.type());
+  auto const shift       = 64 - 8 * static_cast<int>(width);
+  bitpack_size_estimate values;
+  bitpack_size_estimate deltas;
+  bitpack_size_estimate run_lengths;
+  bitpack_size_estimate run_values;
+  __int128 previous      = 0;
+  __int128 run_value     = 0;
+  std::size_t run_length = 0;
+  for (std::size_t i = 0; i < rows; ++i) {
+    // Widened to 128 bits so differences cannot overflow.
+    std::uint64_t bits = 0;
+    std::memcpy(&bits, raw.data() + i * width, width);
+    __int128 const value =
+      is_unsigned ? static_cast<__int128>(bits) : static_cast<std::int64_t>(bits << shift) >> shift;
+    // The first value is its own difference, as delta stores it.
+    __int128 const delta = i == 0 ? value : value - previous;
+    previous             = value;
+    values.push(value);
+    deltas.push(delta);
+    if (run_length > 0 && delta == run_value) {
+      ++run_length;
+      continue;
+    }
+    if (run_length > 0) {
+      run_lengths.push(static_cast<__int128>(run_length));
+      run_values.push(run_value);
+    }
+    run_value  = delta;
+    run_length = 1;
+  }
+  run_lengths.push(static_cast<__int128>(run_length));
+  run_values.push(run_value);
+
+  auto const bitpack = values.finish();
+  auto const delta   = deltas.finish();
+  auto const rle     = run_lengths.finish() + run_values.finish();
+  if (rle < kMinDeltaSaving * std::min(bitpack, delta)) { return kDeltaRleBitpackPlan; }
+  if (delta < kMinDeltaSaving * bitpack) { return kDeltaBitpackPlan; }
+  return kBitpackPlan;
+}
 
 }  // namespace
 
-std::string default_spill_plan(cudf::column_view const& column, rmm::cuda_stream_view stream)
+std::string default_spill_plan(cudf::column_view const& column, ::cuda::stream_ref stream)
 {
   if (column.type().id() == cudf::type_id::STRING) {
     if (column.size() < kMinDictionaryRows) { return kStoredPlan; }
@@ -133,8 +246,15 @@ std::string default_spill_plan(cudf::column_view const& column, rmm::cuda_stream
              : kStringSplitPlan;
   }
   if (!cudf::is_fixed_width(column.type())) { return kStoredPlan; }
-  auto const bytes = static_cast<std::size_t>(column.size()) * cudf::size_of(column.type());
-  return bytes <= kMaxBitpackColumnBytes ? kBitpackPlan : kStoredPlan;
+  auto const type  = column.type();
+  auto const bytes = static_cast<std::size_t>(column.size()) * cudf::size_of(type);
+  if (bytes > kMaxBitpackColumnBytes) { return kStoredPlan; }
+  bool const integer_valued =
+    cudf::is_integral_not_bool(type) || cudf::is_chrono(type) || cudf::is_fixed_point(type);
+  if (integer_valued && cudf::size_of(type) <= sizeof(std::int64_t) && column.size() > 0) {
+    return integer_spill_plan(column, stream);
+  }
+  return kBitpackPlan;
 }
 
 }  // namespace sirius::compression
@@ -176,6 +296,7 @@ encoded_batch encode_for_spill(const cucascade::gpu_table_representation& source
                                ::cuda::stream_ref stream)
 {
   nvtx_scoped_range nvtx_range{"sirius::compression::spill_encode"};
+  source.wait_for_writer(stream);
   auto const settings = compression::get_spill_compression_settings();
   auto const view     = source.get_table_view();
 

@@ -178,6 +178,10 @@ class scan_operator_input : public op::operator_data {
   /// Initialize hints, buffers and readahead before exposing this input to consumers.
   /// Single-owner, at most once; an exception requires discarding the input, not retrying it.
   void initialize_prefetch();
+  // Single-owner stages: prepare may call datasources and must run outside the publication gate.
+  // Publish only registers the prepared input with readahead; it never calls datasource hooks.
+  void prepare_prefetch();
+  void publish_prefetch();
 
   explicit scan_operator_input(
     std::shared_ptr<cucascade::data_batch> cached_batch,
@@ -373,6 +377,10 @@ class scan_operator_input : public op::operator_data {
   bool cached_view_possible{false};
   /// Possible membership applications attached to this split's current decoded rows.
   std::vector<applied_entry> decode_attached;
+  /// The scan's per-output-column normalization targets, set when the scan's output assembly is a
+  /// leading identity, so a compacted decode may write restored columns directly in their target
+  /// type. Empty otherwise.
+  std::vector<cudf::data_type> decode_restore_types;
   /// Operator-shared latch for "compacting this scan's batches during decode
   /// does not pay off", stamped by
   /// sirius_gpu_scan_operator::get_next_task_input_data on every split it hands
@@ -437,7 +445,8 @@ class scan_operator_input : public op::operator_data {
   std::shared_ptr<scan_manager::readahead_scan_manager> _readahead;
   /// Operator id this split was emitted under, the key @ref _readahead uses.
   std::size_t _operator_id{0};
-  bool _prefetch_started{false};
+  enum class prefetch_phase { idle, preparing, prepared, published };
+  prefetch_phase _prefetch_phase{prefetch_phase::idle};
 };
 
 }  // namespace sirius::op::scan

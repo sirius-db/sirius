@@ -33,9 +33,10 @@ struct node;
  *
  * Mirrors function_call (variadic arguments + return_type) and adds a
  * `distinct` flag capturing duckdb::BoundAggregateExpression::IsDistinct().
- * The filter and order-by clauses that DuckDB carries on the bound expression
- * are hoisted away upstream by extract_aggregate_expressions and are NOT
- * represented here.
+ * The planner consumes supported FILTER clauses into nullable CASE projections, sharing identical
+ * safe masked inputs, and rebinds filtered COUNT(*) to COUNT(mask). Generic translation rejects
+ * every surviving FILTER. DuckDB's order-by clause is hoisted upstream by
+ * extract_aggregate_expressions and is not represented here.
  *
  * No default state: the only way to construct an `aggregate` is via the
  * four-argument constructor. Move-only (the arguments vector holds

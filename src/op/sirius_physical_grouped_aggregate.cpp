@@ -130,15 +130,21 @@ std::vector<std::optional<cudf::data_type>>
 sirius_physical_grouped_aggregate::wide_integer_sum_partial_types() const
 {
   auto const aggregate_offset = num_output_group_columns();
-  if (std::ranges::none_of(cudf_aggregate_is_wide_integer_sum, std::identity{}) ||
+  auto const has_two_carriers = [](AggregateSlot const& slot) {
+    return slot.is_wide_integer_sum || slot.returns_hugeint;
+  };
+  if (std::ranges::none_of(aggregate_slots, has_two_carriers) ||
       types.size() != aggregate_offset + cudf_aggregates.size()) {
     return {};
   }
+  // The partial is INT64 or DECIMAL128 with scale 0; the alternate is whichever is not native.
   std::vector<std::optional<cudf::data_type>> alternates(types.size());
-  for (size_t i = 0; i < cudf_aggregate_is_wide_integer_sum.size(); ++i) {
-    if (cudf_aggregate_is_wide_integer_sum[i]) {
-      alternates[aggregate_offset + i] = wide_integer_sum_type();
-    }
+  for (auto const& slot : aggregate_slots) {
+    if (!has_two_carriers(slot)) { continue; }
+    auto const column  = aggregate_offset + slot.cudf_idx;
+    alternates[column] = sirius::require_cudf_type(types[column]) == wide_integer_sum_type()
+                           ? cudf::data_type{cudf::type_id::INT64}
+                           : wide_integer_sum_type();
   }
   return alternates;
 }
@@ -169,7 +175,10 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
                                                           cudf_aggregate_is_wide_integer_sum));
       continue;
     }
-    auto result = gpu_aggregate_impl::local_grouped_aggregate(input_batch,
+    auto const last_groups     = _last_batch_groups.load(std::memory_order_relaxed);
+    bool const split_wide_sums = last_groups <= split_wide_sum_max_groups;
+    cudf::size_type num_groups = 0;
+    auto result                = gpu_aggregate_impl::local_grouped_aggregate(input_batch,
                                                               group_idx,
                                                               cudf_aggregates,
                                                               cudf_aggregate_idx,
@@ -178,7 +187,10 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
                                                               *space,
                                                               batch_telemetry(),
                                                               cudf_aggregate_input_max_abs,
-                                                              cudf_aggregate_is_wide_integer_sum);
+                                                              cudf_aggregate_is_wide_integer_sum,
+                                                              split_wide_sums,
+                                                              &num_groups);
+    _last_batch_groups.store(num_groups, std::memory_order_relaxed);
     results.push_back(std::move(result));
   }
   return std::make_unique<pipelineable_operator_data>(results);

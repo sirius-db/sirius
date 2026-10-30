@@ -281,9 +281,7 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
   };
 
   // Materialize one coalesced batch into a GPU-resident cudf::table and hand it to on_batch
-  // together with its GPU placement + the decode stream. Mirrors
-  // load_balancing_scan_batch_coalescer::process_provider_inputs, minus the connector/balancer
-  // and the post-decode step: there is no downstream scan operator at pin time, so the
+  // together with its GPU placement and decode stream. There is no downstream scan operator, so the
   // unfiltered table is delivered to the sink directly. The device guard stays in scope across
   // the on_batch call, so the sink runs on the correct device.
   auto handle_batch = [&](std::unique_ptr<op::scan::scan_info> batch) {

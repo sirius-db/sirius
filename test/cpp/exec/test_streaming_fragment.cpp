@@ -139,18 +139,19 @@ std::size_t drain_row_count(streaming_fragment& fragment, stream_id_t id)
   return rows;
 }
 
-//! region → SUM(amount) from a gather stream of VARCHAR + BIGINT.
+//! region → SUM(amount) from a gather stream of VARCHAR + HUGEINT (DECIMAL128 with scale 0).
 std::map<std::string, std::int64_t> drain_groups(streaming_fragment& fragment, stream_id_t id)
 {
   std::map<std::string, std::int64_t> groups;
   while (auto batch = fragment.pull(id)) {
     auto view = sirius::get_cudf_table_view(**batch);
     REQUIRE(view.num_columns() == 2);
+    REQUIRE(view.column(1).type() == cudf::data_type{cudf::type_id::DECIMAL128, 0});
     auto regions = sirius::test::operator_utils::copy_column_to_host<std::string>(view.column(0));
-    auto amounts = sirius::test::operator_utils::copy_column_to_host<std::int64_t>(view.column(1));
+    auto amounts = sirius::test::operator_utils::copy_column_to_host<__int128_t>(view.column(1));
     REQUIRE(regions.size() == amounts.size());
     for (std::size_t i = 0; i < regions.size(); ++i) {
-      groups[regions[i]] += amounts[i];
+      groups[regions[i]] += static_cast<std::int64_t>(amounts[i]);
     }
   }
   return groups;
@@ -804,7 +805,7 @@ TEST_CASE_METHOD(fragment_fixture,
       require_window_free();
     }
 
-    SECTION("a HUGEINT prepared column over a BIGINT plan column, as DuckDB types SUM(BIGINT)")
+    SECTION("a HUGEINT prepared column over a BIGINT plan column")
     {
       fragment_spec spec;
       spec.plan_source =
@@ -817,17 +818,23 @@ TEST_CASE_METHOD(fragment_fixture,
           bound.prepared->types = {duckdb::LogicalType::HUGEINT};
           return bound;
         };
+      // The planner keeps SUM's HUGEINT, so a BIGINT plan column under it is a real mismatch.
       streaming_fragment fragment(*con->context, std::move(spec));
-      fragment.build();
-      fragment.run();
-      auto result = fragment.take_result();
+      REQUIRE_THROWS_AS(fragment.build(), sirius::invalid_input_exception);
+      require_window_free();
+    }
+
+    SECTION("a SUM result keeps DuckDB's HUGEINT type")
+    {
+      auto fragment = make_fragment("SELECT sum(a::BIGINT) AS s FROM (VALUES (-7), (2)) t(a)", {});
+      fragment->build();
+      fragment->run();
+      auto result = fragment->take_result();
       REQUIRE(result->GetTypes() ==
               duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::HUGEINT});
-      REQUIRE(result->RowCount() == 2);
-      // A sign-dropping widen would turn -7 into a value no int64 holds.
-      REQUIRE(result->Collection().GetValue(0, 0).GetValue<std::int64_t>() +
-                result->Collection().GetValue(0, 1).GetValue<std::int64_t>() ==
-              -5);
+      REQUIRE(result->RowCount() == 1);
+      // A sign-dropping widen would turn -5 into a value no int64 holds.
+      REQUIRE(result->Collection().GetValue(0, 0).GetValue<std::int64_t>() == -5);
     }
 
     SECTION("a failed run() poisons outputs, refuses a retry, and frees the window")
@@ -940,11 +947,12 @@ TEST_CASE_METHOD(fragment_fixture,
 // ============================================================================
 
 TEST_CASE_METHOD(fragment_fixture,
-                 "FRAG-9b: an INTEGER and a BIGINT sender route each key to the same destination",
+                 "FRAG-9b: INTEGER, BIGINT and HUGEINT senders route each key to the same "
+                 "destination",
                  "[integration][streaming_fragment]")
 {
-  // cuDF hashes raw bytes, so without the INT32 -> INT64 key cast the two senders would split
-  // matching keys across destinations.
+  // cuDF hashes raw bytes, so without the per-type key cast the senders would split matching
+  // keys across destinations. The HUGEINT sender partitions on a SUM output.
   std::string keys;
   for (int k = 1; k <= 20; ++k) {
     keys += (k > 1 ? ", (" : "(") + std::to_string(k) + ")";
@@ -964,8 +972,11 @@ TEST_CASE_METHOD(fragment_fixture,
     };
     auto narrow = make_sender("SELECT a FROM (VALUES " + keys + ") t(a)");
     auto wide   = make_sender("SELECT a::BIGINT AS a FROM (VALUES " + keys + ") t(a)");
+    auto summed =
+      make_sender("SELECT sum(a::BIGINT) AS a FROM (VALUES " + keys + ") t(a) GROUP BY a");
     REQUIRE(narrow->sink_types()[0].id() == sirius::type_id::INTEGER);
     REQUIRE(wide->sink_types()[0].id() == sirius::type_id::BIGINT);
+    REQUIRE(summed->sink_types()[0].id() == sirius::type_id::HUGEINT);
 
     auto drain_keys = [](streaming_fragment& sender, stream_id_t destination) {
       std::vector<std::int64_t> values;
@@ -983,9 +994,11 @@ TEST_CASE_METHOD(fragment_fixture,
     for (stream_id_t destination : {0, 1}) {
       auto const from_narrow = drain_keys(*narrow, destination);
       auto const from_wide   = drain_keys(*wide, destination);
+      auto const from_summed = drain_keys(*summed, destination);
       // Both destinations get keys, so matching sets are not just "everything went to one".
       REQUIRE_FALSE(from_narrow.empty());
       REQUIRE(from_narrow == from_wide);
+      REQUIRE(from_narrow == from_summed);
       routed += from_narrow.size();
     }
     REQUIRE(routed == 20);
@@ -1335,7 +1348,7 @@ TEST_CASE_METHOD(fragment_fixture,
 
     REQUIRE(leaf0->sink_types().size() == 2);
     REQUIRE(leaf0->sink_types()[0].id() == sirius::type_id::VARCHAR);
-    REQUIRE(leaf0->sink_types()[1].id() == sirius::type_id::BIGINT);
+    REQUIRE(leaf0->sink_types()[1].id() == sirius::type_id::HUGEINT);
     REQUIRE(leaf1->sink_types() == leaf0->sink_types());
 
     // Stream names match the root SQL (`SUM(amount)`); types come from the leaf sink
