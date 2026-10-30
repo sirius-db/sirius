@@ -287,6 +287,13 @@ BIGINT. These operations materialize under every evaluator strategy; standalone
 cuDF AST translation declines them because it cannot implement the checks.
 The existing reference evaluator restores compressed operands before execution.
 
+### DECIMAL to integer casts
+
+DECIMAL-to-integer casts round to the nearest integer, with ties away from zero, then check the
+destination range. NULLs remain NULL. On overflow, `TRY_CAST` returns NULL and `CAST` replays on
+the CPU. A UHUGEINT result above UINT64 also replays on the CPU, including under `TRY_CAST`.
+Tests are tagged `[decimal_integer_cast]`.
+
 ### Arity and negation
 
 `from_duckdb_function_name` resolves a (name, argument count) pair against one signature table
