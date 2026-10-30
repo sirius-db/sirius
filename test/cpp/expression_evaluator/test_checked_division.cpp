@@ -158,3 +158,87 @@ TEST_CASE("checked division - HUGEINT column division preserves wide values",
   CHECK(bool(values[0] == (function == sirius::function_id::int_div ? value / 3 : value % 3)));
   CHECK(bool(values[1] == (function == sirius::function_id::int_div ? -value / -3 : -value % -3)));
 }
+
+TEST_CASE("checked division - scalar numerator preserves NULLs and checks column divisors",
+          "[expression_evaluator][checked_division]")
+{
+  auto const strategy  = GENERATE(expression_evaluator_strategy::MATERIALIZE,
+                                 expression_evaluator_strategy::AST_INTERPRET,
+                                 expression_evaluator_strategy::AST_JIT);
+  auto const function  = GENERATE(sirius::function_id::int_div, sirius::function_id::mod);
+  auto const numerator = GENERATE(12, std::numeric_limits<int32_t>::min());
+  auto const is_null   = GENERATE(false, true);
+  auto const type      = logical_type::make(type_id::INTEGER);
+  std::vector<std::unique_ptr<ast_node>> args;
+  args.push_back(is_null ? make_null_const(type) : make_int_const(numerator));
+  args.push_back(make_ref_typed(0, type));
+  auto expr = make_func(function, std::move(args), type);
+
+  auto right  = column<int32_t>(cudf::data_type{cudf::type_id::INT32}, {0, 5, -5, 0}, {3});
+  auto slice  = cudf::slice(right->view(), {1, 4})[0];
+  auto result = evaluate(*expr, cudf::table_view{{slice}}, strategy);
+  CHECK(copy_valids_to_host(result->view().column(0)) ==
+        std::vector<bool>{!is_null, !is_null, false});
+  if (!is_null) {
+    auto values = copy_column_to_host<int32_t>(result->view().column(0));
+    CHECK(values[0] == (function == sirius::function_id::int_div ? numerator / 5 : numerator % 5));
+    CHECK(values[1] ==
+          (function == sirius::function_id::int_div ? numerator / -5 : numerator % -5));
+  }
+
+  auto zero = column<int32_t>(cudf::data_type{cudf::type_id::INT32}, {0});
+  if (is_null) {
+    CHECK(
+      evaluate(*expr, cudf::table_view{{zero->view()}}, strategy)->view().column(0).null_count() ==
+      1);
+  } else {
+    REQUIRE_THROWS_WITH(
+      evaluate(*expr, cudf::table_view{{zero->view()}}, strategy),
+      Catch::Matchers::ContainsSubstring("Division by zero or signed division overflow"));
+  }
+  auto minus_one = column<int32_t>(cudf::data_type{cudf::type_id::INT32}, {-1});
+  if (!is_null && numerator == std::numeric_limits<int32_t>::min()) {
+    REQUIRE_THROWS_WITH(
+      evaluate(*expr, cudf::table_view{{minus_one->view()}}, strategy),
+      Catch::Matchers::ContainsSubstring("Division by zero or signed division overflow"));
+  } else {
+    CHECK(evaluate(*expr, cudf::table_view{{minus_one->view()}}, strategy)
+            ->view()
+            .column(0)
+            .null_count() == (is_null ? 1 : 0));
+  }
+  auto empty = cudf::slice(right->view(), {0, 0})[0];
+  CHECK(evaluate(*expr, cudf::table_view{{empty}}, strategy)->num_rows() == 0);
+}
+
+TEST_CASE("checked division - scalar divisor preserves sliced and all-NULL numerators",
+          "[expression_evaluator][checked_division]")
+{
+  auto const strategy = GENERATE(expression_evaluator_strategy::MATERIALIZE,
+                                 expression_evaluator_strategy::AST_INTERPRET,
+                                 expression_evaluator_strategy::AST_JIT);
+  auto const function = GENERATE(sirius::function_id::int_div, sirius::function_id::mod);
+  auto const type     = logical_type::make(type_id::INTEGER);
+  auto input          = column<int32_t>(
+    cudf::data_type{cudf::type_id::INT32},
+    {std::numeric_limits<int32_t>::min(), 12, -12, std::numeric_limits<int32_t>::min()},
+    {3});
+  auto slice  = cudf::slice(input->view(), {1, 4})[0];
+  auto expr   = division(function, type, make_int_const(-1));
+  auto result = evaluate(*expr, cudf::table_view{{slice}}, strategy);
+  CHECK(copy_valids_to_host(result->view().column(0)) == std::vector<bool>{true, true, false});
+  auto values = copy_column_to_host<int32_t>(result->view().column(0));
+  CHECK(values[0] == (function == sirius::function_id::int_div ? -12 : 0));
+  CHECK(values[1] == (function == sirius::function_id::int_div ? 12 : 0));
+
+  auto by_null = division(function, type, make_null_const(type));
+  CHECK(evaluate(*by_null, cudf::table_view{{slice}}, strategy)->view().column(0).null_count() ==
+        3);
+  auto nulls = column<int32_t>(
+    cudf::data_type{cudf::type_id::INT32}, {0, std::numeric_limits<int32_t>::min()}, {0, 1});
+  auto by_zero = division(function, type, make_int_const(0));
+  CHECK(evaluate(*by_zero, cudf::table_view{{nulls->view()}}, strategy)
+          ->view()
+          .column(0)
+          .null_count() == 2);
+}
