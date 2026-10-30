@@ -120,8 +120,10 @@ std::unique_ptr<cudf::table> apply_positional_visibility(
     auto const deletes = lookup(source.file);
     // Transfer only deletes in selected row groups, never a long file's full list.
     for (auto const& [first, end] : source.ranges) {
-      auto lo = std::lower_bound(deletes.begin(), deletes.end(), first);
-      auto hi = std::lower_bound(lo, deletes.end(), end);
+      // Validated source bounds fit int64_t. Signed searches exclude legacy
+      // negative positions before the GPU's unsigned lookup.
+      auto lo = std::lower_bound(deletes.begin(), deletes.end(), static_cast<int64_t>(first));
+      auto hi = std::lower_bound(lo, deletes.end(), static_cast<int64_t>(end));
       work->deletes.insert(work->deletes.end(), lo, hi);
     }
     binding.delete_end = work->deletes.size();

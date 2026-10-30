@@ -2065,8 +2065,8 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
   // Virtual scans avoid per-RG reads through positions. Internal-only positions
   // qualify after legacy grouping, so their workspace cannot force extra splits.
   out->position_filter_eligible =
-    (_reader_pushdown_expression || _sirius_dynamic_filters) && !stats_filter_unsafe &&
-    !mapping && !metadata_only && !_plan->has_partitions() &&
+    (_reader_pushdown_expression || _sirius_dynamic_filters) && !stats_filter_unsafe && !mapping &&
+    !metadata_only && !_plan->has_partitions() &&
     (!out->datasource || !out->datasource->prefers_bulk_io()) &&
     (!_duckdb_filter_expression || safe_before_file_visibility(*_duckdb_filter_expression));
   out->defer_position_filter = !_plan->has_user_virtual_columns();

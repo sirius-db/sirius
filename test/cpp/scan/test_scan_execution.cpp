@@ -30,6 +30,7 @@
 
 #include <array>
 #include <fstream>
+#include <limits>
 #include <numeric>
 
 using namespace sirius::op::scan;
@@ -107,6 +108,52 @@ TEST_CASE("Reader positions retain noncontiguous file rows and source context",
                         : deletion == "no_intersection"
                           ? (multi ? std::vector<int32_t>{0, 1, 2, 3} : std::vector<int32_t>{0, 1})
                           : (multi ? std::vector<int32_t>{0, 3} : std::vector<int32_t>{0});
+  CHECK(host_column<int32_t>(result->view().column(0), stream) == expected);
+}
+
+TEST_CASE("Reader positions preserve interval deletion with negative legacy positions",
+          "[scan][row_positions]")
+{
+  rmm::cuda_stream stream;
+  auto const base = GENERATE(int64_t{0}, std::numeric_limits<int64_t>::max() - 23);
+  auto const deletion =
+    std::string(GENERATE("mixed", "duplicates_and_gaps", "negative_only", "outside_only"));
+  CAPTURE(base, deletion);
+  std::vector<int64_t> deletes{-1, base + 5};
+  std::vector<int32_t> expected{0, 2, 3, 4};
+  if (deletion == "duplicates_and_gaps") {
+    deletes = {
+      -4, -1, base, base + 5, base + 5, base + 10, base + 19, base + 20, base + 22, base + 23};
+    expected = {2};
+  } else if (deletion == "negative_only") {
+    deletes  = {-3, -1};
+    expected = {0, 1, 2, 3, 4};
+  } else if (deletion == "outside_only") {
+    deletes  = {-1, base + 10, base + 19, base + 23};
+    expected = {0, 1, 2, 3, 4};
+  }
+  iceberg_delete_set const delete_set(
+    "a", std::make_shared<std::vector<int64_t> const>(std::move(deletes)));
+  position_lookup lookup = [&](std::string const&) { return delete_set.positions; };
+  auto const first       = static_cast<uint64_t>(base);
+  std::vector<uint64_t> const rows{first, first + 5, first + 9, first + 20, first + 22};
+  auto positions     = std::make_unique<gpu_row_positions>();
+  positions->sources = {{"a", first + 23, {{first, first + 10}, {first + 20, first + 23}}}};
+  positions->rows    = device_column(rows, cudf::type_id::UINT64, stream);
+  auto result        = apply_positional_visibility(row_payload(rows.size(), stream),
+                                            std::move(positions),
+                                            lookup,
+                                            stream,
+                                            cudf::get_current_device_resource_ref());
+  std::vector<batch_row_run> runs;
+  for (std::size_t i = 0; i < rows.size(); ++i)
+    runs.push_back({"a", static_cast<int64_t>(rows[i]), static_cast<int64_t>(i), 1});
+  auto legacy = apply_positional_visibility(row_payload(rows.size(), stream),
+                                            runs,
+                                            lookup,
+                                            stream,
+                                            cudf::get_current_device_resource_ref());
+  CHECK(host_column<int32_t>(legacy->view().column(0), stream) == expected);
   CHECK(host_column<int32_t>(result->view().column(0), stream) == expected);
 }
 
