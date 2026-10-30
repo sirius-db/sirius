@@ -10,12 +10,45 @@ use quent_ui::{
     fsm::{FsmStateTypeDecl, FsmTransitionDecl, FsmTypeDecl, FsmTypeDeclaration},
 };
 
-pub(crate) type QueryActivityBuilder = AnalyzedFsmBuilder<schema::QueryActivityEvent>;
+pub(crate) struct QueryActivityBuilder {
+    fsm: AnalyzedFsmBuilder<schema::QueryActivityEvent>,
+    source_track: Option<Uuid>,
+}
+impl QueryActivityBuilder {
+    pub(crate) fn try_new(id: Uuid) -> AnalyzerResult<Self> {
+        Ok(Self {
+            fsm: AnalyzedFsmBuilder::try_new(id)?,
+            source_track: None,
+        })
+    }
+    pub(crate) fn push_transition(&mut self, mut event: Event<schema::QueryActivityEvent>) {
+        if let schema::QueryActivityEvent::Started {
+            query_id, track, ..
+        } = &mut event.data
+        {
+            self.source_track.get_or_insert(track.target);
+            track.target = QueryActivity::preparation_track_id(query_id.target);
+        }
+        self.fsm.push_transition(event);
+    }
+}
 #[derive(Debug)]
-pub(crate) struct QueryActivity(AnalyzedFsm<schema::QueryActivityEvent>);
+pub(crate) struct QueryActivity(AnalyzedFsm<schema::QueryActivityEvent>, Uuid);
 impl QueryActivity {
     pub(crate) fn from_builder(builder: QueryActivityBuilder) -> AnalyzerResult<Self> {
-        Ok(Self(builder.try_build()?))
+        let fsm = builder.fsm.try_build()?;
+        Ok(Self(
+            fsm,
+            builder
+                .source_track
+                .expect("validated activity has a start"),
+        ))
+    }
+    pub(crate) fn preparation_track_id(query_id: Uuid) -> Uuid {
+        Uuid::new_v5(&query_id, b"sirius/query-preparation-track")
+    }
+    pub(crate) fn source_track_id(&self) -> Uuid {
+        self.1
     }
     fn start(&self) -> &schema::QueryActivityEvent {
         &self.0.transitions()[0].data

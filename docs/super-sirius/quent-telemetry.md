@@ -81,7 +81,7 @@ The TPC-DS runner labels each execution as `tpcds_q<N>_run1` and
 The query UUID identifies one observation. `Init`, `Planning`, `Executing`, and
 `Finished` remain its lifecycle transitions. Completion is read from `Finished`
 explicitly, including `Init -> Finished` and `Planning -> Finished`; completion
-alone does not imply success. The pinned FSM analyzer still omits truncated or
+alone does not imply success. The FSM analyzer omits truncated or
 invalid lifecycles with a warning, rather than synthesizing a terminal event.
 
 `QueryDetails.update` carries a query reference, a positive revision, and a complete
@@ -106,14 +106,13 @@ followed by successful CPU replay has disposition `gpu_to_cpu`; a separate
 terminal outcome describes the outer result when known. Existing traces lacking metadata retain their initial name/group and
 have unknown correlation, disposition, and outcome.
 
-The pinned Quent viewer requires a root plan. For a query with no stored plan,
+The Quent viewer requires a root plan. For a query with no stored plan,
 Sirius adds a deterministic, empty **presentation-only** plan to `QueryBundle`,
 labelled `No execution plan - query lifecycle only`. Its query has the custom
 attribute `plan_representation=query_lifecycle_placeholder`. This placeholder is
 absent from the trace and analyzed model; it has no worker, edges, operators, tasks,
 or execution window. Nonempty execution plans still pass normal plan-tree
-validation. This preserves the pinned viewer response shape without claiming GPU
-execution. The pinned single-plan picker displays the plan UUID with a generic
+validation. The single-plan picker displays the plan UUID with a generic
 `Query:` prefix.
 
 Observation starts at the outer DuckDB `QueryBegin`, once the shared telemetry
@@ -130,12 +129,11 @@ failures before engine construction. A CPU query has no invented window or worke
 CPU replay changes disposition to `gpu_to_cpu` and remains inside the observation.
 
 Errors at query end produce `failed` or `cancelled` (DuckDB INTERRUPT). **With the
-pinned DuckDB callback, no error means unknown outcome:** it passes the same null
+DuckDB QueryEnd callback, no error means unknown outcome:** it passes the same null
 error for successful completion and abandonment, after clearing the active query.
 Sirius leaves outcome absent for both, including successful CPU replay, rather
 than claiming success for abandoned results. Replacement, connection-state
 teardown, and observers destroyed without explicit completion report `abandoned`.
-A future DuckDB callback exposing the completion reason can remove this limitation.
 
 SQL PREPARE, C++ `Connection::Prepare`, and every subsequent EXECUTE have distinct
 outer invocations. Prepared plans retain no live observer. Each outer bind/rebind
@@ -161,12 +159,12 @@ and rejected calls to `run()` are outside that interval. The observer outlives
 the retained engine; an engine's later destruction cannot extend completion.
 Disabled telemetry retains a valid no-op context and emits no records.
 
-Label consumption stays unchanged:
+Labels are consumed at the following boundaries:
 
 - Transparent SQL consumes a pending label in the GPU wrapper's
   `GetGlobalSourceState`; explicit `gpu_execution` consumes it during binding.
 - An explicit inline label takes precedence, while still consuming the pending
-  label at the existing explicit-bind boundary.
+  label at the explicit-bind boundary.
 - Ordinary CPU statements, SET, and label-setting statements do not consume a
   pending label. The session label is sticky.
 - The initial query group uses the session-label snapshot at the outer
@@ -176,11 +174,9 @@ Label consumption stays unchanged:
   the consumption boundary; reusable explicit bind data also supplies that label
   to subsequent executions without retaining a live observer.
 
-The existing lifecycle event payloads are unchanged. Producers emitting the new
-`QueryDetails` entity require this schema-aware analyzer; older analyzers cannot
-import those records. Use matching Sirius producer/analyzer revisions for new
-captures and the Quent revision pinned by their `model.qmi`. No Quent dependency
-update is required for the presentation placeholder.
+Use matching Sirius producer/analyzer revisions and the Quent revision pinned by
+their `model.qmi`. Analyzers must support every entity type emitted by the producer,
+including `QueryDetails`, to import a capture.
 
 ## 3. Generate telemetry
 
@@ -263,15 +259,18 @@ duration), grouped and sortable, to, for example, quickly find the most expensiv
 outer query UUID. Each invocation of a phase gets a fresh activity ID; optional parent
 IDs describe nesting, while generation and execution-window fields correlate the
 interval with preparation and admission. They are separate from GPU tasks and operators.
-The existing viewer renders each activity as a group with its own interval lane and
-nested child groups. Activity rows follow their recorded start timestamps; repeated phases
-retain separate rows. No Quent dependency update is needed.
+The viewer projects all of a query's activities onto one **Preparation** lane. Expand
+that lane to see the named steps as compact Gantt bars, like the operator timeline;
+overlapping and nested intervals stack within that chart. Repeated phases remain separate
+bars, and parent IDs, waits, and outcomes remain available in the activity details.
+The analyzer validates recorded per-activity track references before mapping them
+to the shared presentation lane. This projection adds no GPU operators or tasks.
 
-The lane's `working` or `waiting` state runs from the recorded Started timestamp to
+Each interval's `working` or `waiting` state runs from the recorded Started timestamp to
 Finished. Click an interval to inspect its phase, kind, correlations, and recorded
 outcome. Parent durations are inclusive: do not add them to child durations. No timing
 is inferred from phase names or callback order. Planning-only queries have the same
-activity tree, even when they have no execution plan.
+Preparation lane, even when they have no execution plan.
 
 Scoped cleanup closes an interval on normal return or exception (`success` or `failed`).
 Query completion closes any remaining intervals with the available terminal outcome;
@@ -294,66 +293,5 @@ A reuse decision does not create a synthetic translation interval. Callback inte
 are observed elapsed time, potentially including other extensions and caller latency;
 activity trees do not claim an exclusive partition of DuckDB's internal phases.
 `wrapper_installed_to_execution` is latency, not a CPU-planning measurement. The coarse
-query-list Planning field remains a phase-start offset in the pinned viewer; inspect
+query-list Planning field displays a phase-start offset in the viewer; inspect
 activity interval lengths on the timeline for measured costs.
-
-The generated-schema fixture exercises a completed planless query with nested and
-repeated work, waits, failure, and a truncated activity. The C++ invocation test checks
-closure, parent containment and same-query ownership across CPU decline, PREPARE and
-repeated EXECUTE, invalidation, forced rebuild and SQL replan, replay and native errors,
-cancellation, abandonment, connection isolation, and disabled exporting. Existing
-admission and retirement tests continue to exercise the underlying resource barriers.
-
-Measure total telemetry overhead with the same configuration and workload, changing only
-exporting, and report warmup, repetitions, elapsed-time distribution, and event volume.
-An enabled/disabled comparison includes existing task and batch telemetry as well as the
-new activities; it does not isolate the incremental activity cost. The performance budget
-is deferred to review, so functional coverage alone does not qualify overhead.
-
-### Local validation: 2026-10-30
-
-The activity model is commit `291ad2a9`; these captures use the instrumentation in this
-change. The measured producer/analyzer snapshot (before the final analyzer-only row ordering)
-has `src`/`rust` diff SHA-256 against that base
-`b84ff02d86604fc33953deabe425cbb6507cbbd6110643bd46f6e4cb428c840b`.
-The Release build, 27 Rust store/analyzer tests, Clippy with warnings denied, formatting,
-and 11 focused GPU lifecycle cases (3,393 assertions) passed.
-
-All four default GPU shards and both CUDA fault processes passed. The first combined
-multi-GPU run passed 135/140 cases and hit five approximately 20 GB CUDA pool-allocation
-failures. All five passed in fresh individual processes. A complete lexical-order rerun
-passed all 140 multi-GPU cases, followed by all 140 late-materialization and two fused
-cases. The initial allocation failures remain a validation limitation for review.
-
-The real viewer capture contains Q9 reuse (28 activities), forced Q9 rebuild (35), a
-successful small SQL replan (35), and a named planning-only failure (4). Forced full SQL
-replanning of Q9 is refused by the existing read-view correspondence check; its 32
-activities retain that native failure. Every interval closed, nested intervals remained
-within their parents under the same query UUID, and all five timelines rendered without
-browser or API errors. The normal Q9 capture retains one execution plan per invocation.
-
-Measurements used two NVIDIA RTX A6000 GPUs (49,140 MiB each), driver 615.71.10, with
-one GPU selected by the unchanged `test/tpcds_performance/config.yaml` settings:
-Sirius scan backend and OS cache. Data was TPC-DS SF50 Parquet. Each workload ran in four
-fresh CLI processes ordered disabled/enabled/enabled/disabled, toggling Quent NDJSON
-exporting with NVTX disabled. Setup, warmup, and exporter shutdown are outside the query
-timers. Q9 used two warmups and seven measured repetitions per process; the short query,
-`SELECT sum(d_date_sk) FROM date_dim`, used five warmups and 30 measurements per process.
-Enabled runs' execution transitions confirmed every warmup and measured query executed.
-
-| Workload / telemetry | Samples | Median | Interquartile range | Min–max |
-|----------------------|---------|--------|---------------------|---------|
-| Q9 / disabled | 14 | 1.753 s | 1.711–1.788 s | 1.645–1.829 s |
-| Q9 / enabled | 14 | 1.775 s | 1.749–1.797 s | 1.735–1.811 s |
-| Short / disabled | 60 | 11 ms | 11–11 ms | 8–12 ms |
-| Short / enabled | 60 | 11 ms | 11–12 ms | 9–13 ms |
-
-The Q9 median difference was +1.23%; the overlapping distributions do not establish a
-statistically significant change. CLI timers have 1 ms resolution, so the equal short-query
-medians do not establish zero overhead. No performance budget has been accepted.
-
-Each enabled Q9 process emitted 16,314–16,402 NDJSON events (3.88–3.90 MB); each enabled
-short-query process emitted 7,453 events (1.85 MB). These volumes include setup, label
-calls, and warmups, as well as measured queries. Disabled processes emitted no records.
-The local raw samples and exact SQL/configuration are in `tmp/query-activity-overhead/`;
-the five-path viewer capture is in `tmp/query-activity-scenarios-verified/`.

@@ -187,15 +187,9 @@ impl<'a> SiriusModelQueryView<'a> {
             }
 
             let group = model
-                .activities
+                .gpu_devices
                 .get(&parent_id)
                 .map(|group| group as &dyn RefTreeEntity)
-                .or_else(|| {
-                    model
-                        .gpu_devices
-                        .get(&parent_id)
-                        .map(|group| group as &dyn RefTreeEntity)
-                })
                 .or_else(|| {
                     model
                         .thread_groups
@@ -213,28 +207,8 @@ impl<'a> SiriusModelQueryView<'a> {
         }
     }
 
-    /// Activity rows follow producer timestamps, independent of hash-map and UUID order.
-    /// Keep the existing ordering of shared GPU resources outside the query subtree.
     pub(crate) fn resource_tree(&self) -> AnalyzerResult<ResourceTreeNode> {
-        fn order(node: &mut ResourceTreeNode, model: &SiriusModel, query_id: Uuid) {
-            for child in &mut node.children {
-                order(child, model, query_id);
-            }
-            if node.entity_id == query_id || model.activities.contains_key(&node.entity_id) {
-                node.children.sort_by_key(|child| {
-                    (
-                        model
-                            .activities
-                            .get(&child.entity_id)
-                            .map_or(0, Entity::earliest_timestamp),
-                        child.entity_id,
-                    )
-                });
-            }
-        }
-        let mut tree = ResourceTreeNode::try_new(self)?;
-        order(&mut tree, self.model, self.query.id());
-        Ok(tree)
+        ResourceTreeNode::try_new(self)
     }
 
     pub(crate) fn activities(&self) -> impl Iterator<Item = &'a QueryActivity> + '_ {
@@ -389,6 +363,16 @@ impl Model for SiriusModelQueryView<'_> {
             Ok(EntityRef::Resource(entity_id))
         } else if self.resource_groups.contains_key(&entity_id) {
             Ok(EntityRef::ResourceGroup(entity_id))
+        } else if let Some(activity) = self
+            .model
+            .activities
+            .get(&entity_id)
+            .filter(|activity| activity.query_id() == self.query.id())
+        {
+            Ok(EntityRef::Application {
+                type_name: activity.type_name().into(),
+                id: entity_id,
+            })
         } else {
             self.tasks
                 .get(&entity_id)

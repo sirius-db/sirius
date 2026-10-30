@@ -49,7 +49,7 @@ See [Quent telemetry](quent-telemetry.md#query-activity-timelines) for viewer an
 | `finalize_prepare` | Setup, optional parse/bind/optimize, validation copy, planning admission, read views, GPU translation/validation and wrapper installation |
 | `wrapper_installed_to_execution` | Latency between wrapper installation and execution entry; separate from CPU planning work |
 | `execution_preparation` | Execution admission and the actual reuse/rebuild path; Finished records the reuse decision |
-| `pipeline_construction` | Engine pipeline construction, including work after the old execution-entry checkpoint |
+| `pipeline_construction` | Engine pipeline construction |
 | `gpu_execution` | Engine execution, including runtime startup and waiting for completion; existing task telemetry describes individual pipeline work |
 | `runtime_retirement` | Quiescing and retiring asynchronous runtime work |
 | `runtime_window_cleanup` | Mandatory execution-window cleanup and release before result exposure or CPU replay |
@@ -59,8 +59,7 @@ Admission and retirement intervals have kind `wait`; other owned intervals have 
 Parents include their children. Callback-spanning intervals describe observed boundaries,
 not exclusive DuckDB phases. When a hook is skipped, the initial interval remains broadly
 named rather than claiming unobserved planning work. QueryBegin does not cover extension
-initialization or promise to include all parsing. The temporary `SIRIUS_FRONTEND_TIMING`
-checkpoint implementation has been removed.
+initialization or promise to include all parsing.
 
 ## Step 1b: Explicit Table Function Path
 

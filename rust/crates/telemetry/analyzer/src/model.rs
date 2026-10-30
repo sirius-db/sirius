@@ -154,8 +154,12 @@ impl Model for SiriusModel {
             Ok(EntityRef::Port(entity_id))
         } else if self.resource(entity_id).is_ok() {
             Ok(EntityRef::Resource(entity_id))
-        } else if self.activities.contains_key(&entity_id)
-            || self.gpu_devices.contains_key(&entity_id)
+        } else if let Some(activity) = self.activities.get(&entity_id) {
+            Ok(EntityRef::Application {
+                type_name: activity.type_name().into(),
+                id: entity_id,
+            })
+        } else if self.gpu_devices.contains_key(&entity_id)
             || self.thread_groups.contains_key(&entity_id)
         {
             Ok(EntityRef::ResourceGroup(entity_id))
@@ -317,11 +321,6 @@ impl SiriusModel {
         self.query_groups
             .get(&entity_id)
             .and_then(|group| group.data().instance_name.as_deref())
-            .or_else(|| {
-                self.activities
-                    .get(&entity_id)
-                    .map(QueryActivity::instance_name)
-            })
             .or_else(|| {
                 self.gpu_devices
                     .get(&entity_id)
@@ -981,23 +980,33 @@ impl SiriusModelBuilder {
             }
             model.activities.retain(|id, _| !invalid.contains(id));
         }
-        model.activity_tracks = self.activity_tracks;
-        model.activity_tracks.retain(|_, t| {
-            t.parent_id()
-                .is_some_and(|id| model.activities.contains_key(&id))
-        });
-        for a in model.activities.values() {
-            for u in a.usages() {
-                if model
-                    .activity_tracks
-                    .get(&u.resource_id())
-                    .is_none_or(|track| track.parent_id() != Some(a.id()))
-                {
-                    return Err(AnalyzerError::Validation(
-                        "query activity has no matching track".into(),
-                    ));
-                }
+        for activity in model.activities.values() {
+            // Validate original producer references before projecting all intervals
+            // onto one query-scoped lane. Recorded events and parent IDs stay intact.
+            if self
+                .activity_tracks
+                .get(&activity.source_track_id())
+                .is_none_or(|track| track.parent_id() != Some(activity.id()))
+            {
+                return Err(AnalyzerError::Validation(
+                    "query activity has no matching track".into(),
+                ));
             }
+            let query_id = activity.query_id();
+            let track_id = QueryActivity::preparation_track_id(query_id);
+            model
+                .activity_tracks
+                .entry(track_id)
+                .and_modify(|track| {
+                    track.include(activity.earliest_timestamp(), activity.latest_timestamp())
+                })
+                .or_insert_with(|| {
+                    QueryActivityTrack::preparation(
+                        query_id,
+                        activity.earliest_timestamp(),
+                        activity.latest_timestamp(),
+                    )
+                });
         }
         model
             .resource_types

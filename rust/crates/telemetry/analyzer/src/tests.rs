@@ -1372,78 +1372,162 @@ fn nested_query_activities_render_without_execution_and_keep_repeated_phases() {
             ));
         }
     }
+    // A second overlapping query must get its own lane and retain its own users.
+    events.extend([
+        ev(
+            200,
+            0,
+            E::Query(s::QueryEvent::Init {
+                seq: 0,
+                instance_name: "other".into(),
+                query_group_id: EntityRef::new(id(3), ()),
+            }),
+        ),
+        ev(200, 10, E::Query(s::QueryEvent::Finished { seq: 1 })),
+        ev(
+            301,
+            1,
+            E::QueryActivityTrack(s::QueryActivityTrackEvent::Declaration {
+                activity_id: EntityRef::new(id(300), ()),
+                label: "other".into(),
+            }),
+        ),
+        ev(
+            300,
+            1,
+            E::QueryActivity(s::QueryActivityEvent::Started {
+                seq: 0,
+                query_id: EntityRef::new(id(200), ()),
+                parent_activity_id: None,
+                track: EntityRef::new(id(301), s::QueryActivityTrackUsage {}),
+                phase: "copy".into(),
+                kind: "work".into(),
+                planning_generation: Some(99),
+                execution_query_id: None,
+            }),
+        ),
+        ev(
+            300,
+            8,
+            E::QueryActivity(s::QueryActivityEvent::Finished {
+                seq: 1,
+                outcome: Some("success".into()),
+                decision: None,
+            }),
+        ),
+    ]);
     events.reverse(); // ingestion order cannot determine nesting or duration
     let analyzer = SiriusUiAnalyzer::try_new(id(1), events.into_iter()).unwrap();
     let bundle = analyzer.query_bundle(id(4)).unwrap();
     assert!(analyzer.model.plans.is_empty());
-    assert_eq!(analyzer.model.activities.len(), 3);
+    assert_eq!(analyzer.model.activities.len(), 4);
+    let track_id = crate::boilerplate::QueryActivity::preparation_track_id(id(4));
+    let other_track_id = crate::boilerplate::QueryActivity::preparation_track_id(id(200));
+    assert_ne!(track_id, other_track_id);
     let view = analyzer.model.query_view(id(4)).unwrap();
     let tree = view.resource_tree().unwrap();
-    let children = &tree.find(id(100)).unwrap().children;
-    // Own interval first, then children by timestamp even when UUID order disagrees.
-    assert_eq!(
-        children
-            .iter()
-            .map(|node| node.entity_id)
-            .collect::<Vec<_>>(),
-        vec![id(101), id(104), id(102)]
-    );
+    assert!(tree.find(id(100)).is_none());
+    assert_eq!(tree.find(id(4)).unwrap().children.len(), 1);
+    assert_eq!(tree.find(id(4)).unwrap().children[0].entity_id, track_id);
     assert_eq!(
         analyzer.model.activities[&id(102)].parent_id(),
         Some(id(100))
     );
-    assert_eq!(bundle.entities.resources.len(), 3);
+    assert_eq!(bundle.entities.resources.len(), 1);
+    assert_eq!(
+        bundle.entities.resources[&track_id].instance_name,
+        "Preparation"
+    );
     assert!(bundle.entities.resource_groups.contains_key(&id(3)));
-    let listed = analyzer.list_entities(serde_json::from_value(serde_json::json!({
+    assert!(!bundle.entities.resource_groups.contains_key(&id(100)));
+    assert!(!bundle.entities.resources.contains_key(&other_track_id));
+    let list = |resource_id| {
+        analyzer.list_entities(serde_json::from_value(serde_json::json!({
         "entry": {
             "window": {"start": 0, "end": 10},
-            "filter": {"scope": {"Resource": {"resource_id": id(101)}}, "entity_type_name": null, "min_usage_s": 0.005},
+            "filter": {"scope": {"Resource": {"resource_id": resource_id}}, "entity_type_name": null, "min_usage_s": 0.005},
             "sort": {"key": "UsageDuration", "dir": "Desc"}, "page": null,
             "application": {"operator_ids": []}
         }, "app_params": {"query_id": id(4)}
-    })).unwrap()).unwrap();
-    assert_eq!(listed.total, 1);
-    assert_eq!(listed.items[0].entity.fsm.type_name, "query_activity");
-    assert_eq!(listed.items[0].entity.fsm.id, id(100));
-
-    assert!(bundle.entities.fsm_types.contains_key("query_activity"));
-    for (n, state, duration) in [
+    })).unwrap()).unwrap()
+    };
+    let listed = list(track_id);
+    assert_eq!(listed.total, 3);
+    assert_eq!(list(other_track_id).total, 0);
+    for (item, (n, state, duration)) in listed.items.iter().zip([
         (100, "working", 7.0),
         (102, "waiting", 3.0),
         (104, "working", 1.0),
-    ] {
-        for entity_type_name in [None, Some("query_activity".into())] {
-            let result = analyzer
-                .single_resource_timeline(SingleTimelineRequest {
+    ]) {
+        let fsm = &item.entity.fsm;
+        assert_eq!(fsm.id, id(n));
+        assert_eq!(fsm.instance_name, "copy"); // repeated names are distinct intervals
+        assert_eq!(fsm.type_name, "query_activity");
+        assert_eq!(fsm.transitions[0].name, state);
+        assert_eq!(fsm.transitions[0].usages[0].resource, track_id);
+        assert_eq!(
+            fsm.transitions[1].timestamp - fsm.transitions[0].timestamp,
+            duration
+        );
+    }
+
+    assert!(bundle.entities.fsm_types.contains_key("query_activity"));
+    for entity_type_name in [None, Some("query_activity".into())] {
+        let entry = TimelineRequest::Resource(ResourceTimelineRequest {
+            resource_id: track_id,
+            long_entities_threshold_s: Some(0.0),
+            entity_filter: EntityFilter { entity_type_name },
+            application: OperatorFilter {
+                operator_ids: vec![],
+            },
+            config: TimelineConfig {
+                start: 0.0,
+                end: 10.0,
+                num_bins: 10,
+            },
+        });
+        let result = analyzer
+            .single_resource_timeline(SingleTimelineRequest {
+                app_params: QueryFilter { query_id: id(4) },
+                entry: entry.clone(),
+            })
+            .unwrap();
+        let fsms = match result.data {
+            ResourceTimeline::Binned(data) => data.long_fsms,
+            ResourceTimeline::BinnedByState(data) => {
+                assert!(data.capacities_states_values["unit"].contains_key("working"));
+                assert!(data.capacities_states_values["unit"].contains_key("waiting"));
+                data.long_fsms
+            }
+        };
+        assert_eq!(fsms.len(), 3);
+        assert!(
+            fsms.iter()
+                .all(|fsm| fsm.transitions[0].usages[0].resource == track_id)
+        );
+        let bulk = analyzer
+            .bulk_resource_timeline(quent_ui::timeline::request::BulkTimelineRequest {
+                app_params: QueryFilter { query_id: id(4) },
+                entries: [("preparation".into(), entry.clone())].into(),
+            })
+            .unwrap();
+        let chunks = analyzer
+            .bulk_chunked_resource_timeline(
+                quent_ui::timeline::request::BulkChunkedTimelineRequest {
                     app_params: QueryFilter { query_id: id(4) },
-                    entry: TimelineRequest::Resource(ResourceTimelineRequest {
-                        resource_id: id(n + 1),
-                        long_entities_threshold_s: Some(0.0),
-                        entity_filter: EntityFilter { entity_type_name },
-                        application: OperatorFilter {
-                            operator_ids: vec![],
-                        },
-                        config: TimelineConfig {
-                            start: 0.0,
-                            end: 10.0,
-                            num_bins: 10,
-                        },
-                    }),
-                })
-                .unwrap();
-            let fsms = match result.data {
-                ResourceTimeline::Binned(data) => data.long_fsms,
-                ResourceTimeline::BinnedByState(data) => {
-                    assert!(data.capacities_states_values["unit"].contains_key(state));
-                    data.long_fsms
-                }
-            };
-            assert_eq!(fsms.len(), 1);
-            assert_eq!(fsms[0].type_name, "query_activity");
-            assert_eq!(
-                fsms[0].transitions[1].timestamp - fsms[0].transitions[0].timestamp,
-                duration
-            );
-        }
+                    entries: [("preparation".into(), entry)].into(),
+                    configs: vec![TimelineConfig {
+                        start: 0.0,
+                        end: 10.0,
+                        num_bins: 10,
+                    }],
+                },
+            )
+            .unwrap();
+        // All three APIs must agree, including the remapped resources in returned FSMs.
+        assert_eq!(
+            serde_json::to_value(&bulk.entries["preparation"]).unwrap(),
+            serde_json::to_value(&chunks.entries["preparation"][0]).unwrap()
+        );
     }
 }
