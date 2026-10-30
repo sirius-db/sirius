@@ -166,6 +166,18 @@ class query_event_publisher : public std::enable_shared_from_this<query_event_pu
   void publish_compressed_materialization(compressed_materialization_activity activity,
                                           std::uint64_t count = 1) noexcept;
 
+  void publish_batch_downgraded(query_id_t query_id, downgraded_batch const& batch) noexcept;
+
+  void publish_task_completed(query_id_t query_id,
+                              std::size_t operator_id,
+                              int gpu_id,
+                              task_outcome outcome) noexcept;
+
+  void publish_memory_wait_ended_for_task(query_id_t query_id,
+                                          std::size_t operator_id,
+                                          int gpu_id,
+                                          std::size_t granted_bytes) noexcept;
+
  private:
   friend class query_event_subscriber;
   friend struct query_event_test_access;
@@ -174,8 +186,8 @@ class query_event_publisher : public std::enable_shared_from_this<query_event_pu
   /// the routing table.  Called by the subscriber base in its constructor.
   ///
   /// Publishing walks one subscriber list per event, so a subscriber that
-  /// names two events is skipped outright by the other six rather than being
-  /// handed a payload it will drop.  With a handful of subscribers that is a
+  /// names two events is skipped outright by every other event rather than
+  /// being handed a payload it will drop.  With a handful of subscribers that is a
   /// rounding error; it is worth having because the cost grows with
   /// subscribers x events while the useful work does not.
   ///

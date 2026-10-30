@@ -54,12 +54,14 @@
 #include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <future>
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -108,11 +110,9 @@ struct batch_lock_utils_fixture {
 
   ~batch_lock_utils_fixture()
   {
-    // The registry is initialized right after the manager is built, so both exist or neither.
-    if (manager) {
-      manager->shutdown();
-      sirius::converter_registry::shutdown();
-    }
+    // The converter registry is process-global and stateless; leave it initialized for the test
+    // cases that cache a memory manager across cases.
+    if (manager) { manager->shutdown(); }
   }
 
   /// Single INT64 column of random data, resident on `space`.
@@ -450,6 +450,38 @@ TEST_CASE("lock_or_prepare_batch host to GPU keeps move semantics", "[batch_lock
   REQUIRE(upgraded_values == source_values);
 }
 
+TEST_CASE("lock_and_prepare_batch reports whether it upgraded the batch", "[batch_lock_utils]")
+{
+  batch_lock_utils_fixture f;
+  REQUIRE(f.setup(1));
+
+  rmm::cuda_stream stream;
+  auto batch = f.make_gpu_batch(kNumRows, *f.gpu0, stream);
+
+  // Already on the target GPU: no upgrade.
+  {
+    sirius::pipeline::lock_and_prepare_trace trace;
+    auto prepared = sirius::pipeline::lock_and_prepare_batch(batch, f.gpu0, stream, &trace);
+    REQUIRE(prepared.has_value());
+    CHECK_FALSE(trace.upgraded_to_gpu);
+  }
+
+  {
+    auto mut = batch->to_mutable();
+    mut.convert_to<cucascade::host_data_representation>(
+      sirius::converter_registry::get(), f.host0, stream);
+  }
+  stream.synchronize();
+
+  // On HOST: this call does the upgrade.
+  sirius::pipeline::lock_and_prepare_trace trace;
+  auto prepared = sirius::pipeline::lock_and_prepare_batch(batch, f.gpu0, stream, &trace);
+  REQUIRE(prepared.has_value());
+  CHECK(trace.upgraded_to_gpu);
+  auto lock = std::get<sirius::pipeline::lock_to_existing_batch>(*prepared);
+  CHECK(lock.ro_lock.get_current_tier() == cucascade::memory::Tier::GPU);
+}
+
 TEST_CASE("concurrent same-GPU upgrades of a shared spilled batch race safely",
           "[batch_lock_utils]")
 {
@@ -752,4 +784,222 @@ TEST_CASE("cached scan assigned away from its pin clones and reserves on the tar
   scan->prepare_for_processing(f.gpu1, target_stream);
   CHECK(scan->get_cached_batch() == clone);
   target_stream.synchronize();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Reader-side writer-event ordering (order_after_writer in lock_and_prepare_batch).
+//
+// A "gated" writer is a stream whose queue starts with a host function that blocks until the test
+// opens the gate; a writer event recorded on that stream behind the gate stays incomplete until
+// then. A sentinel host function enqueued on the consumer's task stream after
+// lock_and_prepare_batch returns must therefore not run while the gate is closed, if (and only if)
+// lock_and_prepare_batch ordered the task stream after the writer event.
+// ---------------------------------------------------------------------------------------------
+
+namespace {
+
+constexpr auto kGateTimeout = std::chrono::seconds(60);  // the gate opens itself; never hangs
+
+/// A stream blocked behind a closed gate. The destructor opens the gate and drains the stream, so
+/// a failing assertion (exception) can never leave the device stuck.
+struct stream_gate {
+  std::atomic<bool> open{false};
+  rmm::cuda_stream stream;
+
+  stream_gate()
+  {
+    REQUIRE(cudaLaunchHostFunc(stream.value(), &stream_gate::block, this) == cudaSuccess);
+  }
+  ~stream_gate()
+  {
+    release();
+    (void)cudaStreamSynchronize(stream.value());
+  }
+  stream_gate(stream_gate const&)            = delete;
+  stream_gate& operator=(stream_gate const&) = delete;
+
+  void release() { open.store(true); }
+
+  static void block(void* self)
+  {
+    auto* gate          = static_cast<stream_gate*>(self);
+    auto const deadline = std::chrono::steady_clock::now() + kGateTimeout;
+    while (!gate->open.load() && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  }
+};
+
+/// Re-record `batch`'s writer event on `gate`'s stream, i.e. behind the closed gate. Done before
+/// the consumer runs, as an asynchronous producer (preload) would have.
+void record_writer_event_behind(std::shared_ptr<cucascade::data_batch> const& batch,
+                                stream_gate& gate)
+{
+  auto mut = batch->to_mutable();
+  mut.get_data()->record_writer_event(::cuda::stream_ref{gate.stream.value()});
+  REQUIRE(mut.get_data()->get_writer_event() != nullptr);
+}
+
+/// An event recorded on a stream at construction: done() says whether everything enqueued on the
+/// stream before it has completed.
+struct stream_sentinel {
+  cudaEvent_t event{};
+
+  explicit stream_sentinel(rmm::cuda_stream const& stream)
+  {
+    REQUIRE(cudaEventCreateWithFlags(&event, cudaEventDisableTiming) == cudaSuccess);
+    REQUIRE(cudaEventRecord(event, stream.value()) == cudaSuccess);
+  }
+  ~stream_sentinel() { (void)cudaEventDestroy(event); }
+  stream_sentinel(stream_sentinel const&)            = delete;
+  stream_sentinel& operator=(stream_sentinel const&) = delete;
+
+  [[nodiscard]] bool done() const
+  {
+    auto const status = cudaEventQuery(event);
+    if (status == cudaErrorNotReady) { (void)cudaGetLastError(); }
+    return status == cudaSuccess;
+  }
+
+  /// Poll until done or `timeout` elapses; never blocks on the device.
+  [[nodiscard]] bool wait_done(std::chrono::seconds timeout) const
+  {
+    auto const deadline = std::chrono::steady_clock::now() + timeout;
+    while (!done()) {
+      if (std::chrono::steady_clock::now() >= deadline) { return false; }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return true;
+  }
+};
+
+/// The sentinel on `task_stream` must be held back while the gate is closed and complete once it
+/// opens.
+void require_held_until_released(rmm::cuda_stream const& task_stream,
+                                 stream_sentinel const& sentinel,
+                                 stream_gate& gate)
+{
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  CHECK_FALSE(sentinel.done());
+  CHECK(cudaStreamQuery(task_stream.value()) == cudaErrorNotReady);
+  (void)cudaGetLastError();  // cudaErrorNotReady is not sticky, but leave no residue
+
+  gate.release();
+  CHECK(sentinel.wait_done(std::chrono::seconds(30)));
+}
+
+/// A GPU batch whose representation has NO writer event (writer unknown), complete on return.
+std::shared_ptr<cucascade::data_batch> make_gpu_batch_without_writer_event(
+  batch_lock_utils_fixture& f, ::cuda::stream_ref stream)
+{
+  auto table = sirius::create_cudf_table_with_random_data(kNumRows,
+                                                          {cudf::data_type{cudf::type_id::INT64}},
+                                                          {std::make_pair(0, 1000000)},
+                                                          stream,
+                                                          f.gpu0->get_default_allocator());
+  stream.sync();
+  auto repr = std::make_unique<cucascade::gpu_table_representation>(
+    std::move(table), *f.gpu0, ::cuda::stream_ref{cudaStream_t{nullptr}});
+  REQUIRE(repr->get_writer_event() == nullptr);
+  return cucascade::data_batch::make(sirius::get_next_batch_id(), std::move(repr));
+}
+
+}  // namespace
+
+TEST_CASE("lock_and_prepare_batch orders the task stream after the writer event (rebind path)",
+          "[batch_lock_utils][writer_event]")
+{
+  batch_lock_utils_fixture f;
+  REQUIRE(f.setup(1));
+  rmm::cuda_stream task_stream;
+  auto batch = f.make_gpu_batch(kNumRows, *f.gpu0, task_stream);
+
+  // Idle batch: try_to_mutable() succeeds, so the wait runs before the rebind, and again under
+  // the returned read lock.
+  stream_gate gate;
+  record_writer_event_behind(batch, gate);
+
+  auto prepared = sirius::pipeline::lock_and_prepare_batch(batch, f.gpu0, task_stream);
+  REQUIRE(prepared.has_value());
+  REQUIRE(std::holds_alternative<sirius::pipeline::lock_to_existing_batch>(*prepared));
+  stream_sentinel sentinel(task_stream);
+
+  require_held_until_released(task_stream, sentinel, gate);
+}
+
+TEST_CASE("lock_and_prepare_batch orders the task stream after the writer event (no rebind)",
+          "[batch_lock_utils][writer_event]")
+{
+  batch_lock_utils_fixture f;
+  REQUIRE(f.setup(1));
+  rmm::cuda_stream task_stream;
+  auto batch = f.make_gpu_batch(kNumRows, *f.gpu0, task_stream);
+
+  stream_gate gate;
+  record_writer_event_behind(batch, gate);
+
+  // Another reader holds the batch, so try_to_mutable() fails and the opportunistic rebind (and
+  // its wait) is skipped; the wait under the returned read lock must still happen. The call runs
+  // on another thread: try_to_mutable() on a mutex this thread already holds is not defined.
+  auto other_reader   = std::make_optional(batch->to_read_only());
+  auto fut            = std::async(std::launch::async, [&]() {
+    return sirius::pipeline::lock_and_prepare_batch(batch, f.gpu0, task_stream);
+  });
+  bool const returned = fut.wait_for(std::chrono::seconds(30)) == std::future_status::ready;
+  if (!returned) { gate.release(); }  // never leave a blocked call behind
+  REQUIRE(returned);
+  auto prepared = fut.get();
+  REQUIRE(prepared.has_value());
+  REQUIRE(std::holds_alternative<sirius::pipeline::lock_to_existing_batch>(*prepared));
+  stream_sentinel sentinel(task_stream);
+
+  require_held_until_released(task_stream, sentinel, gate);
+  other_reader.reset();
+}
+
+TEST_CASE("lock_and_prepare_batch with a null writer event neither waits nor syncs the device",
+          "[batch_lock_utils][writer_event]")
+{
+  batch_lock_utils_fixture f;
+  REQUIRE(f.setup(1));
+  rmm::cuda_stream task_stream;
+  auto batch = make_gpu_batch_without_writer_event(f, task_stream);
+
+  // Unrelated work, gated on another stream: a device-wide synchronization (what
+  // gpu_table_representation::wait_for_writer does on a null event) would block behind it.
+  stream_gate unrelated;
+
+  auto fut            = std::async(std::launch::async, [&]() {
+    return sirius::pipeline::lock_and_prepare_batch(batch, f.gpu0, task_stream);
+  });
+  bool const returned = fut.wait_for(std::chrono::seconds(30)) == std::future_status::ready;
+  if (!returned) { unrelated.release(); }  // unblock a regressed device sync, then fail below
+  REQUIRE(returned);
+  auto prepared = fut.get();
+  REQUIRE(prepared.has_value());
+  CHECK(std::get<sirius::pipeline::lock_to_existing_batch>(*prepared).ro_lock.get_writer_event() ==
+        nullptr);
+
+  // The task stream has no dependency on the unrelated stream: its work completes while that
+  // stream is still gated.
+  stream_sentinel sentinel(task_stream);
+  CHECK(sentinel.wait_done(std::chrono::seconds(10)));
+  CHECK(cudaStreamQuery(unrelated.stream.value()) == cudaErrorNotReady);
+  (void)cudaGetLastError();
+}
+
+TEST_CASE("lock_and_prepare_batch does not hold the task stream for a completed writer event",
+          "[batch_lock_utils][writer_event]")
+{
+  batch_lock_utils_fixture f;
+  REQUIRE(f.setup(1));
+  rmm::cuda_stream task_stream;
+  auto batch = f.make_gpu_batch(kNumRows, *f.gpu0, task_stream);  // event already complete
+
+  // Unrelated gated stream: the wait is on the writer event only, not on the device.
+  stream_gate unrelated;
+  auto prepared = sirius::pipeline::lock_and_prepare_batch(batch, f.gpu0, task_stream);
+  REQUIRE(prepared.has_value());
+  stream_sentinel sentinel(task_stream);
+  CHECK(sentinel.wait_done(std::chrono::seconds(10)));
 }

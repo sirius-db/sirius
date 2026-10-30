@@ -17,6 +17,7 @@
 #pragma once
 
 #include "config.hpp"
+#include "memory/memory_wait_board.hpp"
 #include "memory/size_arithmetic.hpp"
 #include "parallel/task_executor.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -93,6 +94,10 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_task_local_state {
   uint32_t retry_count = 0;
   /// Task ID of the original (non-retried) task; only meaningful when retry_count > 0.
   std::optional<uint64_t> original_task_id = std::nullopt;
+  /// Set when this task was rescheduled after running out of memory, and carried across later
+  /// contention reschedules: counts the task as an OOM retry pending on its device in the
+  /// memory_wait_board until the task is destroyed. Empty when no board is installed.
+  std::optional<memory::memory_wait_board::oom_token> oom_holdoff;
 
   /// Request-size fallback used when an OOM does not expose the failed allocation size.
   static constexpr std::size_t kDefaultRetryRequestBytes = 1024 * 1024;

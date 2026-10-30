@@ -1,0 +1,6 @@
+sirius:
+  topology:
+    num_gpus: 1
+  executor:
+    preload:
+      device_preloading_budget: 1.5

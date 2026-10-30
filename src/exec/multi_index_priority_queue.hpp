@@ -30,6 +30,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -364,6 +365,30 @@ class multi_index_priority_queue {
       }
     }
     return std::nullopt;
+  }
+
+  /// Calls `v(const Task&)` on the tasks of one device bucket in the order
+  /// try_pop_from(idx) would pop them (lowest priority first, FIFO within a
+  /// priority), stopping as soon as `v` returns false. Removes nothing.
+  /// gpu_index{no_preferred_device} (-1) selects tasks with no preferred device.
+  ///
+  /// `v` runs under the queue lock, so the lock is held for O(tasks visited); `v`
+  /// must not touch the queue (that self-deadlocks) and must not block. A task
+  /// reference is valid only for the duration of the call that receives it. If `v`
+  /// throws, the exception propagates and the queue is unchanged.
+  template <typename V>
+  void visit_in_pop_order(const gpu_index& idx, V&& v) const
+  {
+    static_assert(std::is_invocable_r_v<bool, V&, const Task&>,
+                  "visitor must be callable as bool(const Task&)");
+    std::lock_guard<std::mutex> lock(_mutex);
+    const auto it = _by_device.find(idx.id);
+    if (it == _by_device.end()) { return; }
+    for (const auto& [prio, bucket] : it->second) {
+      for (const node* n : bucket) {
+        if (!v(static_cast<const Task&>(*n->task))) { return; }
+      }
+    }
   }
 
   /// Removes and returns the first task satisfying `pred`, scanning the whole

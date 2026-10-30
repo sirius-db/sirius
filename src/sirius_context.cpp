@@ -35,12 +35,16 @@
 #include "log/logging.hpp"
 #include "log/noop_sink.hpp"
 #include "log/spdlog_owning_sink.hpp"
+#include "memory/device_preload_budget.hpp"
+#include "memory/memory_wait_board.hpp"
 #include "memory/numa_small_pinned_mr.hpp"
 #include "memory/resource_ref_utils.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "memory/topology_index.hpp"
 #include "op/scan/iceberg_metadata_reader.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "preload/preload_executor.hpp"
+#include "preload/preload_streams.hpp"
 #include "sirius_sql_rewrite.hpp"
 #include "transparent/connection_provenance.hpp"
 #include "transparent/physical_sirius_execution.hpp"
@@ -251,6 +255,9 @@ SiriusContext::~SiriusContext() noexcept
     } catch (...) {
     }
   }
+  // A terminate() that threw stopped before restoring cuDF's pinned resource; the slab allocator
+  // it points at is destroyed with the members below. No-op after a complete terminate().
+  restore_cudf_pinned_memory_resource();
   event_publisher_->stop();
 }
 
@@ -605,6 +612,9 @@ void SiriusContext::retire_query_work(sirius::query_id_t query_id, query_retirem
   if (mode == query_retirement_mode::cancelled && task_scheduler_) {
     task_scheduler_->discard_query_tasks(query_id);
   }
+  // Preload holds no lease between promotions, and the gate above refuses new ones, so it can
+  // drop the query now; a promotion still running is covered by the barrier below.
+  if (preload_executor_) { preload_executor_->retire_query(query_id); }
   // The sole query-wide work barrier: includes manager-held tasks, callbacks and spill victims.
   query_lifecycle_.wait_for_work(query_id);
 }
@@ -662,6 +672,8 @@ std::size_t SiriusContext::release_query_state(sirius::query_id_t query_id, bool
     } catch (...) {  // best-effort observability
     }
   }
+  // Its repositories are gone: preload forgets the query and re-plans for the memory freed.
+  if (preload_executor_) { preload_executor_->forget_query(query_id); }
 
   // Drop scan-manager providers for this query. Repositories are already
   // cleared above, so downstream data_batches that referenced sliced
@@ -1170,15 +1182,101 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
   scan_manager_->set_query_event_publisher(*query_event_publisher_);
 
   // Wire the pipeline task queue into downgrade executors now that task_scheduler_
-  // has been constructed.
+  // has been constructed, and let them report the batches they move.
   for (auto& executor : downgrade_executors_) {
     executor->set_pipeline_task_queue(task_scheduler_->get_pipeline_task_queue());
+    executor->set_query_event_publisher(*query_event_publisher_);
+  }
+
+  if (auto const& preload_config = config_.get_preload_executor_config();
+      !sirius::preload::preload_disabled_by_zero(preload_config)) {
+    // Existence (see docs/super-sirius/configuration.md): the executor is created only when it
+    // has work. Device preloading needs a budget > 0 and GPU spaces that do not track
+    // reservations per stream; an explicit concurrent_preloads > 0 with budget 0 is the
+    // DISK->HOST staging-only mode, created only when there is something to stage.
+    bool const wants_device = sirius::preload::wants_device_preloading(preload_config);
+    bool any_per_stream     = false;
+    for (auto const& space : config_.get_memory_space_configs()) {
+      if (auto const* g = std::get_if<cucascade::memory::gpu_memory_space_config>(&space);
+          g != nullptr && g->per_stream_reservation) {
+        any_per_stream = true;
+      }
+    }
+    bool const device_preloading = wants_device && !any_per_stream;
+    bool const has_disk =
+      !memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::DISK).empty();
+    bool const explicit_width =
+      preload_config.concurrent_preloads.has_value() && *preload_config.concurrent_preloads > 0;
+    // Staging-only runs whenever device preloading is NOT effectively enabled (budget 0, or
+    // per-stream tracking disabled it) but an explicit width gives DISK->HOST staging work.
+    bool const staging_only_has_work =
+      !device_preloading && explicit_width && preload_config.stage_to_host && has_disk;
+
+    if (wants_device && any_per_stream) {
+      SIRIUS_LOG_WARN(
+        "[preload] device_preloading_budget is set but a GPU space tracks reservations per stream "
+        "(per_stream_reservation: true); device preloading is disabled, DISK->HOST staging only");
+    }
+
+    if (!device_preloading && !staging_only_has_work) {
+      SIRIUS_LOG_INFO(
+        "[preload] not started: {}",
+        wants_device ? "device preloading unavailable (per-stream reservation) and nothing to stage"
+                     : "no device preloading budget and no DISK->HOST staging to do");
+    } else {
+      // Before the scheduler starts, so its GPU executors never run without the board.
+      memory_wait_board_ = std::make_shared<sirius::memory::memory_wait_board>(
+        active_gpu_ids.empty() ? -1 : active_gpu_ids.back());
+      task_scheduler_->set_memory_wait_board(memory_wait_board_);
+      // The exclusive streams and the budget board exist only with device preloading.
+      if (device_preloading) {
+        preload_streams_ = std::make_shared<sirius::preload::preload_streams>(active_gpu_ids);
+        device_preload_budget_ =
+          std::make_shared<sirius::memory::device_preload_budget>(active_gpu_ids);
+        task_scheduler_->set_device_preload_budget(device_preload_budget_);
+      }
+      preload_executor_ = std::make_unique<sirius::preload::preload_executor>(
+        *query_event_publisher_,
+        preload_config,
+        sirius::preload::preload_dependencies{
+          .lifecycle                = query_lifecycle_,
+          .memory                   = *memory_manager_,
+          .topology                 = topology_index_,
+          .task_queue               = task_scheduler_->get_pipeline_task_queue(),
+          .wait_board               = memory_wait_board_,
+          .streams                  = preload_streams_,
+          .device_budget            = device_preload_budget_,
+          .pipeline_threads_per_gpu = config_.get_gpu_pipeline_executor_config().num_threads,
+          // The pinned cuCascade exposes no get_capacity()/get_downgrade_stop_threshold(); derive
+          // both from Sirius's own memory configuration so preload computes the same byte ceilings.
+          .space_capacity =
+            [configs = config_.get_memory_space_configs()](
+              cucascade::memory::memory_space_id id) -> sirius::preload::space_capacity_info {
+            for (auto const& space : configs) {
+              if (id.tier == cucascade::memory::Tier::GPU) {
+                if (auto const* g = std::get_if<cucascade::memory::gpu_memory_space_config>(&space);
+                    g != nullptr && g->device_id == id.device_id) {
+                  return {g->memory_capacity, g->downgrade_stop_fraction};
+                }
+              } else if (id.tier == cucascade::memory::Tier::HOST) {
+                if (auto const* h =
+                      std::get_if<cucascade::memory::host_memory_space_config>(&space);
+                    h != nullptr && h->numa_id == id.device_id) {
+                  return {h->memory_capacity, h->downgrade_stop_fraction};
+                }
+              }
+            }
+            return {};
+          }});
+    }
   }
 
   // Start everything -- downgrade executors deferred until now
   for (auto& executor : downgrade_executors_) {
     executor->start();
   }
+  if (preload_executor_) { preload_executor_->start(); }
+  if (after_executor_start_hook_for_testing) { after_executor_start_hook_for_testing(); }
   task_creator_->start_thread_pool();
   scan_manager_->start();
   task_scheduler_->start();
@@ -1189,6 +1287,10 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
 
 void SiriusContext::terminate()
 {
+  // A terminate() that throws leaves the context initialized, and ~SiriusContext runs it again:
+  // every step before the throw must therefore be safe to repeat (stops, resets and the cuDF
+  // pinned-resource restore are idempotent, and members a first run already reset are
+  // null-guarded). The lifecycle clear() test relies on this.
   throw_if_not_initialized();
   admission_.close();
   mark_runtime_unavailable();
@@ -1207,18 +1309,21 @@ void SiriusContext::terminate()
 
   // Stop every producer and every borrower BEFORE destroying the task_scheduler.
   // Creation workers and downgrade executors borrow the scheduler and its task queue.
-  task_scheduler_->stop();
+  if (task_scheduler_) { task_scheduler_->stop(); }
   if (scan_manager_) { scan_manager_->stop(); }
-  task_creator_->stop_thread_pool();
+  if (task_creator_) { task_creator_->stop_thread_pool(); }
+  // Joins a promotion still copying; before clear(), so a throw there leaves preload stopped.
+  if (preload_executor_) { preload_executor_->stop(); }
   for (auto& executor : downgrade_executors_) {
     executor->stop();
   }
   // Drop any per-query state a window failed to clean up (e.g. a latched-unavailable path whose
   // best-effort reset threw). Doing it here, rather than letting ~task_creator do it, keeps the
   // DuckTableScanState/BlockHandle releases inside the window where DuckDB is still intact.
-  task_creator_->reset_all();
+  if (task_creator_) { task_creator_->reset_all(); }
   query_lifecycle_.clear();
   task_creator_.reset();
+  preload_executor_.reset();
   downgrade_executors_.clear();
   task_scheduler_.reset();
   telemetry_context_.reset();
@@ -1243,6 +1348,10 @@ void SiriusContext::terminate()
   // downgrade executors (the only other holders of a manager reference) were stopped above, so
   // no borrower can outlive this.
   data_repository_registry_.clear();
+  // Only now: buffers in the repositories just dropped may have been freed on preload streams.
+  preload_streams_.reset();
+  device_preload_budget_.reset();
+  memory_wait_board_.reset();
 
   // Restore the previous cuDF pinned memory resource and threshold before destroying the
   // slab allocator — cuDF holds a non-owning reference and would dangle after reset().
@@ -1253,8 +1362,10 @@ void SiriusContext::terminate()
   small_pinned_allocator_view_.reset();
   small_pinned_allocator_.reset();
 
-  memory_manager_->shutdown();
-  memory_manager_.reset();
+  if (memory_manager_) {
+    memory_manager_->shutdown();
+    memory_manager_.reset();
+  }
 
   // Owns only a topology copy (no device resources); drop after the components
   // that held shared_ptr copies of it are gone.
@@ -1325,6 +1436,30 @@ SiriusContext::get_downgrade_executors() const
 {
   throw_if_not_initialized();
   return downgrade_executors_;
+}
+
+sirius::preload::preload_executor* SiriusContext::get_preload_executor() const
+{
+  throw_if_not_initialized();
+  return preload_executor_.get();
+}
+
+std::weak_ptr<sirius::preload::preload_streams const> SiriusContext::preload_streams_for_testing()
+  const noexcept
+{
+  return preload_streams_;
+}
+
+std::weak_ptr<sirius::memory::memory_wait_board const>
+SiriusContext::memory_wait_board_for_testing() const noexcept
+{
+  return memory_wait_board_;
+}
+
+std::weak_ptr<sirius::memory::device_preload_budget const>
+SiriusContext::device_preload_budget_for_testing() const noexcept
+{
+  return device_preload_budget_;
 }
 
 sirius::creator::task_creator& SiriusContext::get_task_creator()
@@ -1400,6 +1535,15 @@ duckdb::shared_ptr<sirius::planner::query> SiriusContext::create_query(
     task_creator_->get_active_gpu_ids(query_id),
     handler,
     std::move(interrupted));
+  if (preload_executor_) {
+    // Advisory: a query preload cannot track still runs, its spilled batches just stay put.
+    try {
+      preload_executor_->prepare_for_query(
+        query_id, *query, task_creator_->get_active_gpu_ids(query_id));
+    } catch (std::exception const& e) {
+      SIRIUS_LOG_WARN("[preload] query {}: not tracked: {}", query_id, e.what());
+    }
+  }
   return query;
 }
 

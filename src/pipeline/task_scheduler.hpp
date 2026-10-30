@@ -21,6 +21,8 @@
 #include "exec/config.hpp"
 #include "exec/multi_index_priority_queue.hpp"
 #include "exec/query_lifecycle_registry.hpp"
+#include "memory/device_preload_budget.hpp"
+#include "memory/memory_wait_board.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "parallel/task.hpp"
 #include "pipeline/completion_handler.hpp"
@@ -35,6 +37,7 @@
 #include <future>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <unordered_map>
 
 namespace sirius::parallel {
@@ -139,6 +142,44 @@ class task_scheduler {
   }
 
   /**
+   * @brief Install the board on which every GPU executor reports its stalled reserve phases and
+   *        its OOM-rescheduled tasks; null removes it.
+   *
+   * The executors are all created by the constructor, so every one of them receives the board.
+   *
+   * @pre The scheduler is not running.
+   * @throws std::logic_error if the scheduler is running.
+   */
+  void set_memory_wait_board(std::shared_ptr<sirius::memory::memory_wait_board> board)
+  {
+    if (_running.load(std::memory_order_acquire)) {
+      throw std::logic_error("task_scheduler: memory wait board set while running");
+    }
+    for (auto& [_, executor] : _gpu_executors) {
+      if (executor) { executor->set_memory_wait_board(board); }
+    }
+  }
+
+  /**
+   * @brief Install the device preloading budget board the matcher releases a claimed task's
+   *        charges against; null removes it.
+   *
+   * The matcher releases each popped task's preloaded input charges before it publishes
+   * @c task_deployed, so the preload planner pass that event triggers already sees the freed
+   * budget.
+   *
+   * @pre The scheduler is not running.
+   * @throws std::logic_error if the scheduler is running.
+   */
+  void set_device_preload_budget(std::shared_ptr<sirius::memory::device_preload_budget> budget)
+  {
+    if (_running.load(std::memory_order_acquire)) {
+      throw std::logic_error("task_scheduler: device preload budget set while running");
+    }
+    _device_preload_budget = std::move(budget);
+  }
+
+  /**
    * @brief Get a pointer to the pipeline-level task queue.
    */
   [[nodiscard]] exec::multi_index_priority_queue<sirius::parallel::itask>*
@@ -225,6 +266,9 @@ class task_scheduler {
   /// Non-owning; the runtime registry outlives the scheduler.
   sirius::exec::query_lifecycle_registry& _query_lifecycle;
   std::shared_ptr<const telemetry::telemetry_context> _telemetry_context;
+  /// Device preloading budget board, or null. The matcher releases a claimed task's preloaded
+  /// input charges against it before publishing @c task_deployed.
+  std::shared_ptr<sirius::memory::device_preload_budget> _device_preload_budget;
 };
 
 }  // namespace pipeline

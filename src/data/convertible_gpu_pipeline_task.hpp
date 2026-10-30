@@ -25,6 +25,7 @@
 #include "op/sirius_physical_operator.hpp"
 #include "parallel/task.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
+#include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/task_submission.hpp"
 
 #include <cuda/stream>
@@ -41,6 +42,7 @@
 #include <cstddef>
 #include <memory>
 #include <optional>
+#include <utility>
 #include <vector>
 
 namespace sirius {
@@ -117,6 +119,9 @@ class convertible_gpu_pipeline_task : public convertible_data {
    * which acquires a mutable_data_batch (blocking or non-blocking), attempts the conversion,
    * and releases automatically via RAII.
    *
+   * While recording is on, each batch moved yields one record tagged with this task's priority,
+   * preferred device and query.
+   *
    * @param target_spaces  Candidate destination memory spaces (tried in order).
    * @param stream         CUDA stream for asynchronous memory operations.
    * @param res_mgr        Reservation manager for acquiring memory in the target space.
@@ -158,11 +163,21 @@ class convertible_gpu_pipeline_task : public convertible_data {
 
       // Delegate to convertible_data_batch which handles to_mutable() internally
       sirius::convertible_data_batch batch_converter(batch);
+      batch_converter.record_conversions(recording());
       auto result = batch_converter.convert(target_spaces, stream, res_mgr, blocking);
       if (result) {
         any_converted = true;
         for (std::size_t i = 0; i < result->size(); ++i) {
           totals[i] += (*result)[i];
+        }
+        // Store each batch's record as soon as it moves, so batches moved before a later batch's
+        // convert() throws stay reported. Recording never fails a conversion.
+        try {
+          for (auto rec : batch_converter.converted_batches()) {
+            tag_with_task(rec);
+            note_converted(std::move(rec));
+          }
+        } catch (...) {
         }
       }
     }
@@ -202,7 +217,8 @@ class convertible_gpu_pipeline_task : public convertible_data {
    * gpu_pipeline_task, or has no pipelineable operator_data input data).
    *
    * Public and static so that both the wrapper and the provider can share this
-   * logic without duplicating the dynamic_cast chain.
+   * logic without duplicating the dynamic_cast chain. The non-const overload
+   * delegates to the const one, so the chain is defined in exactly one place.
    *
    * @param task The task to inspect.
    * @return Pointer to pipelineable_operator_data, or nullptr if unreachable.
@@ -210,19 +226,59 @@ class convertible_gpu_pipeline_task : public convertible_data {
   static sirius::op::pipelineable_operator_data* get_pipelineable_data(
     sirius::parallel::itask& task)
   {
-    auto* gpt = dynamic_cast<sirius::pipeline::gpu_pipeline_task*>(&task);
+    // Safe: every object on the chain is reached from the non-const `task`, so none is a const
+    // object; the const overload only walks it through const accessors.
+    return const_cast<sirius::op::pipelineable_operator_data*>(
+      get_pipelineable_data(static_cast<const sirius::parallel::itask&>(task)));
+  }
+
+  /**
+   * @brief Read-only form of get_pipelineable_data(itask&), and the single definition of the
+   * dynamic_cast chain both overloads use.
+   *
+   * Follows the chain through const accessors only, so it can be used where only a
+   * `const itask&` is available (e.g. a visitor running under a task queue's lock).
+   *
+   * @param task The task to inspect.
+   * @return Pointer to pipelineable_operator_data, or nullptr if unreachable.
+   */
+  static const sirius::op::pipelineable_operator_data* get_pipelineable_data(
+    const sirius::parallel::itask& task)
+  {
+    auto const* gpt = dynamic_cast<const sirius::pipeline::gpu_pipeline_task*>(&task);
     if (!gpt) { return nullptr; }
 
-    auto* ls = gpt->local_state();
+    auto const* ls = gpt->local_state();
     if (!ls) { return nullptr; }
 
-    auto* gpt_ls = dynamic_cast<sirius::pipeline::gpu_pipeline_task_local_state*>(ls);
+    auto const* gpt_ls = dynamic_cast<const sirius::pipeline::gpu_pipeline_task_local_state*>(ls);
     if (!gpt_ls) { return nullptr; }
 
-    return dynamic_cast<sirius::op::pipelineable_operator_data*>(gpt_ls->_input_data.get());
+    return dynamic_cast<const sirius::op::pipelineable_operator_data*>(gpt_ls->_input_data.get());
   }
 
  private:
+  /**
+   * @brief Attribute a conversion record to the owned task.
+   *
+   * The query id is read through a checked cast of the global state rather than
+   * gpu_pipeline_task::get_pipeline(), which assumes the global state is a
+   * gpu_pipeline_task_global_state and would dereference a foreign one.
+   */
+  void tag_with_task(event::downgraded_batch& rec) const
+  {
+    rec.source = event::downgrade_source::task_queue;
+    auto* gpt  = _task ? _task->as<sirius::pipeline::gpu_pipeline_task>() : nullptr;
+    if (!gpt) { return; }
+    rec.task_priority    = gpt->get_priority();
+    rec.preferred_device = gpt->get_preferred_device_id();
+    auto const* gs =
+      dynamic_cast<const sirius::pipeline::gpu_pipeline_task_global_state*>(gpt->global_state());
+    if (auto const* pipe = gs ? gs->get_pipeline() : nullptr) {
+      rec.task_query_id = pipe->get_query_id();
+    }
+  }
+
   /// @brief Convenience overload for the owned task.
   sirius::op::pipelineable_operator_data* get_pipelineable_data() const
   {

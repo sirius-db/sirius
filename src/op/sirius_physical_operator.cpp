@@ -22,6 +22,7 @@
 #include "pipeline/batch_lock_utils.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
+#include "preload/consumption_tracker.hpp"
 #include "sirius/exception.hpp"
 #include "telemetry/data_batch_probe.hpp"
 
@@ -29,6 +30,7 @@
 #include <cucascade/memory/error.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -139,6 +141,11 @@ void pipelineable_operator_data::prepare_for_processing(
   std::vector<cucascade::read_only_data_batch> ro_batches;
   ro_batches.reserve(_data_batches.size());
 
+  // Whether preload had downgraded inputs back on the GPU before this task asked for them.
+  auto& readiness   = preload::consumption_tracker::instance();
+  bool const to_gpu = requested_memory_space != nullptr &&
+                      requested_memory_space->get_tier() == cucascade::memory::Tier::GPU;
+
   for (std::size_t position = 0; position < _data_batches.size(); ++position) {
     auto& batch = _data_batches[position];
     if (not batch) {
@@ -146,8 +153,20 @@ void pipelineable_operator_data::prepare_for_processing(
         "pipelineable_operator_data: null batch encountered during prepare_for_processing");
     }
     try {
+      auto const batch_id = batch->get_batch_id();
+      auto const tracked  = to_gpu ? readiness.begin_input(batch_id) : std::nullopt;
+      pipeline::lock_and_prepare_trace trace;
+      auto const prepare_start = std::chrono::steady_clock::now();
       if (std::optional<pipeline::lock_and_prepare_batch_result> maybe_result =
-            pipeline::lock_and_prepare_batch(batch, requested_memory_space, stream)) {
+            pipeline::lock_and_prepare_batch(
+              batch, requested_memory_space, stream, tracked ? &trace : nullptr)) {
+        if (tracked) {
+          readiness.end_input(batch_id,
+                              *tracked,
+                              trace.upgraded_to_gpu,
+                              trace.lock_wait_ns,
+                              pipeline::detail::elapsed_ns(prepare_start));
+        }
         pipeline::lock_and_prepare_batch_result result = *maybe_result;
 
         std::visit(

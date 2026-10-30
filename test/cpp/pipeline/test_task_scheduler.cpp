@@ -16,8 +16,12 @@
 
 #include "catch.hpp"
 #include "data/convertible_gpu_pipeline_task.hpp"
+#include "data/data_batch_utils.hpp"
+#include "event/query_event_publisher.hpp"
+#include "event/query_event_subscriber.hpp"
 #include "exec/config.hpp"
 #include "exec/query_lifecycle_registry.hpp"
+#include "memory/device_preload_budget.hpp"
 #include "pipeline/completion_handler.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/query_retirement_test_utils.hpp"
@@ -26,18 +30,31 @@
 #include "scan/test_utils.hpp"
 #include "utils/sirius_test_env.hpp"
 #include "utils/telemetry_utils.hpp"
+#include "utils/utils.hpp"
+
+#include <cudf/types.hpp>
+
+#include <rmm/cuda_stream.hpp>
 
 #include <cuda/stream>
 #include <cuda_runtime_api.h>
 
+#include <cucascade/data/data_batch.hpp>
+#include <cucascade/memory/memory_space.hpp>
+
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <exception>
 #include <future>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
+#include <vector>
 
 using namespace sirius::pipeline;
 using namespace sirius::parallel;
@@ -67,6 +84,17 @@ class mock_gpu_pipeline_task_local_state : public gpu_pipeline_task_local_state 
   mock_gpu_pipeline_task_local_state(int task_id, int expected_gpu_id)
     : gpu_pipeline_task_local_state(std::make_unique<pipelineable_operator_data>(
         std::vector<std::shared_ptr<cucascade::data_batch>>{})),
+      _task_id(task_id),
+      _expected_gpu_id(expected_gpu_id)
+  {
+  }
+
+  mock_gpu_pipeline_task_local_state(
+    int task_id,
+    int expected_gpu_id,
+    std::vector<std::shared_ptr<cucascade::data_batch>> input_batches)
+    : gpu_pipeline_task_local_state(
+        std::make_unique<pipelineable_operator_data>(std::move(input_batches))),
       _task_id(task_id),
       _expected_gpu_id(expected_gpu_id)
   {
@@ -106,6 +134,127 @@ class mock_gpu_pipeline_task : public gpu_pipeline_task {
     }
   }
 };
+
+/// Snapshots the device preloading budget the moment a task_deployed event is delivered, so a test
+/// can assert the matcher released the task's charges before publishing the event.
+class deploy_board_recorder final : public sirius::event::query_event_subscriber {
+ public:
+  deploy_board_recorder(sirius::event::query_event_publisher& publisher,
+                        sirius::memory::device_preload_budget const& board)
+    : query_event_subscriber(publisher, {sirius::event::event_type::task_deployed}, false),
+      _board(board)
+  {
+    start();
+  }
+  ~deploy_board_recorder() override { stop(); }
+
+  [[nodiscard]] std::string_view name() const noexcept override { return "deploy-recorder"; }
+
+  bool wait(std::chrono::milliseconds limit = std::chrono::seconds(10))
+  {
+    std::unique_lock lock(_mu);
+    return _cv.wait_for(lock, limit, [&] { return _seen; });
+  }
+  [[nodiscard]] std::size_t outstanding(int device) const
+  {
+    std::lock_guard lock(_mu);
+    return device == 0 ? _out0 : _out1;
+  }
+
+ private:
+  void on_task_deployed(sirius::event::event_id_t,
+                        sirius::event::timestamp_t,
+                        sirius::query_id_t,
+                        std::size_t,
+                        sirius::op::SiriusPhysicalOperatorType,
+                        int) noexcept override
+  {
+    try {
+      {
+        std::lock_guard lock(_mu);
+        _out0 = _board.outstanding(0);
+        _out1 = _board.outstanding(1);
+        _seen = true;
+      }
+      _cv.notify_all();
+    } catch (...) {
+    }
+  }
+
+  sirius::memory::device_preload_budget const& _board;
+  mutable std::mutex _mu;
+  std::condition_variable _cv;
+  bool _seen{false};
+  std::size_t _out0{~std::size_t{0}};
+  std::size_t _out1{~std::size_t{0}};
+};
+
+TEST_CASE("Task scheduler releases the device preloading budget before publishing task_deployed",
+          "[task_scheduler]")
+{
+  int devices = 0;
+  REQUIRE(cudaGetDeviceCount(&devices) == cudaSuccess);
+  if (devices < 1) { SKIP("needs a GPU"); }
+
+  sirius::exec::query_lifecycle_registry lifecycle;
+  auto const query = sirius::make_query_id(0);
+  lifecycle.open_query(query);
+  auto manager = initialize_memory_manager(1);
+  auto* gpu    = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(gpu != nullptr);
+  rmm::cuda_stream stream_owner;
+  ::cuda::stream_ref stream{stream_owner.value()};
+
+  auto make_batch = [&]() {
+    std::vector<cudf::data_type> types{cudf::data_type{cudf::type_id::INT32}};
+    std::vector<std::optional<std::pair<int, int>>> ranges{std::make_pair(0, 1000)};
+    auto table = sirius::create_cudf_table_with_random_data(
+      16, types, ranges, stream, gpu->get_default_allocator());
+    stream.sync();
+    return sirius::make_data_batch(
+      std::move(table), *gpu, stream, sirius::telemetry::batch_telemetry_info{});
+  };
+  auto batch_a = make_batch();
+  auto batch_b = make_batch();
+
+  // The budget board spans two devices; charge one input on GPU 0 and one on GPU 1 (the matcher
+  // must release whatever device holds a charge). The task's inputs include a duplicate id.
+  std::array<int const, 2> const gpu_ids{0, 1};
+  auto board = std::make_shared<sirius::memory::device_preload_budget>(gpu_ids);
+  board->watch(batch_a->get_batch_id());
+  REQUIRE(board->charge(batch_a->get_batch_id(), 1, /*device=*/0, false, 1000));
+  board->watch(batch_b->get_batch_id());
+  REQUIRE(board->charge(batch_b->get_batch_id(), 2, /*device=*/1, false, 2000));
+  REQUIRE(board->outstanding(0) == 1000);
+  REQUIRE(board->outstanding(1) == 2000);
+
+  // The publisher must be shared_ptr-managed: set_query_event_publisher takes shared_from_this().
+  auto publisher = std::make_shared<sirius::event::query_event_publisher>();
+  deploy_board_recorder recorder{*publisher, *board};
+
+  sirius::exec::thread_pool_config gpu_config{1};
+  task_scheduler scheduler(
+    lifecycle, gpu_config, *manager, sirius::test::make_test_telemetry_context());
+  scheduler.set_query_event_publisher(*publisher);
+  scheduler.set_device_preload_budget(board);
+  scheduler.start();
+
+  auto global_state = std::make_shared<mock_gpu_pipeline_task_global_state>();
+  auto local_state  = std::make_unique<mock_gpu_pipeline_task_local_state>(
+    0, 0, std::vector<std::shared_ptr<cucascade::data_batch>>{batch_a, batch_a, batch_b});
+  scheduler.schedule(
+    std::make_unique<mock_gpu_pipeline_task>(0, std::move(local_state), global_state));
+
+  // When task_deployed is published, the matcher has already released every charge of the task's
+  // inputs (whatever device held them), including the duplicate, which it released once.
+  REQUIRE(recorder.wait());
+  CHECK(recorder.outstanding(0) == 0);
+  CHECK(recorder.outstanding(1) == 0);
+  CHECK(board->claimed_releases() == 2);
+  CHECK(board->claimed_bytes_released() == 3000);
+
+  scheduler.stop();
+}
 
 TEST_CASE("Task scheduler can start and stop gracefully", "[task_scheduler]")
 {

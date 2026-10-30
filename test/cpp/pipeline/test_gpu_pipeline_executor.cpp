@@ -15,9 +15,14 @@
  */
 
 #include "catch.hpp"
+#include "data/data_repository_manager_registry.hpp"
+#include "downgrade/downgrade_executor.hpp"
+#include "event/query_event_publisher.hpp"
 #include "exec/channel.hpp"
 #include "exec/config.hpp"
 #include "log/logging.hpp"
+#include "memory/memory_wait_board.hpp"
+#include "pipeline/executor_event_recorder.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/pipeline_build_context.hpp"
@@ -25,6 +30,8 @@
 #include "pipeline/task_request.hpp"
 #include "scan/test_utils.hpp"
 #include "utils/telemetry_utils.hpp"
+
+#include <rmm/cuda_stream.hpp>
 
 #include <absl/cleanup/cleanup.h>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
@@ -35,6 +42,7 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <utility>
@@ -69,6 +77,9 @@ class test_gpu_pipeline_task_global_state
 
   std::mutex memory_mutex;
   std::vector<std::size_t> memory_consumption;
+
+  /// Size of the reservation the last task executed with.
+  std::atomic<std::size_t> granted_bytes{0};
 };
 
 class test_gpu_pipeline_task_local_state : public sirius::pipeline::gpu_pipeline_task_local_state {
@@ -238,6 +249,150 @@ class paused_gpu_executor : public sirius::pipeline::gpu_pipeline_executor {
   std::future<void> ready_to_run_{resume_.get_future()};
   bool resumed_{false};
 };
+
+// Asks for a fixed reservation and records the size it was granted; allocates nothing.
+class sized_reservation_task : public sirius_pipeline_task {
+ public:
+  sized_reservation_task(uint64_t task_id,
+                         std::shared_ptr<test_gpu_pipeline_task_global_state> global_state,
+                         std::size_t reservation_bytes)
+    : sirius_pipeline_task(task_id,
+                           std::make_unique<test_gpu_pipeline_task_local_state>(
+                             std::make_unique<sirius::op::pipelineable_operator_data>(
+                               std::vector<std::shared_ptr<cucascade::data_batch>>{})),
+                           std::move(global_state)),
+      reservation_bytes_(reservation_bytes)
+  {
+  }
+
+  void execute(::cuda::stream_ref) override
+  {
+    auto& global     = _global_state->cast<test_gpu_pipeline_task_global_state>();
+    auto& local      = _local_state->cast<test_gpu_pipeline_task_local_state>();
+    auto reservation = local.release_reservation();
+    global.granted_bytes.store(reservation ? reservation->size() : 0);
+    global.executed_count.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  sirius::pipeline::reservation_size_info get_estimated_reservation_size_info(
+    const cucascade::memory::memory_space*) const override
+  {
+    sirius::pipeline::reservation_size_info info;
+    info.reservation_size = reservation_bytes_;
+    return info;
+  }
+
+ private:
+  std::size_t reservation_bytes_;
+};
+
+template <typename Pred>
+bool wait_until(Pred&& done, std::chrono::milliseconds limit = std::chrono::seconds(10))
+{
+  auto const deadline = std::chrono::steady_clock::now() + limit;
+  while (!done()) {
+    if (std::chrono::steady_clock::now() > deadline) { return false; }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  return true;
+}
+
+// GPU memory counted against the space but held by no reservation, so it holds no notifier:
+// a blocking reservation that cannot be met then ends in a partial grant at once.
+struct untracked_allocation {
+  cucascade::memory::reservation_aware_resource_adaptor* mr{nullptr};
+  rmm::cuda_stream stream;
+  void* ptr{nullptr};
+  std::size_t bytes{0};
+
+  void allocate(cucascade::memory::memory_space& space, std::size_t size)
+  {
+    mr = space.get_memory_resource_as<cucascade::memory::reservation_aware_resource_adaptor>();
+    REQUIRE(mr != nullptr);
+    ptr   = mr->allocate(::cuda::stream_ref{stream.value()}, size, alignof(std::max_align_t));
+    bytes = size;
+  }
+
+  ~untracked_allocation()
+  {
+    if (ptr != nullptr) {
+      mr->deallocate(::cuda::stream_ref{stream.value()}, ptr, bytes, alignof(std::max_align_t));
+      stream.synchronize();
+    }
+  }
+};
+
+// One GPU executor with a 256 MiB space, a recorder on its events and, optionally, a wait board
+// and a downgrade executor that is left unstarted until the test starts it.
+struct stall_fixture {
+  std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> manager = [] {
+    cucascade::memory::reservation_manager_configurator builder;
+    builder.set_number_of_gpus(1)
+      .set_gpu_usage_limit(256ULL * 1024 * 1024)
+      .set_reservation_fraction_per_gpu(0.75)
+      .set_per_numa_region_capacity(1ULL * 1024 * 1024 * 1024)
+      .use_gpu_id_as_host_id()
+      .track_reservation_per_stream(false)
+      .set_reservation_fraction_per_numa_region(0.75);
+    return std::make_unique<sirius::memory::sirius_memory_reservation_manager>(builder.build());
+  }();
+  cucascade::memory::memory_space* space =
+    manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  untracked_allocation pressure;
+  sirius::exec::query_lifecycle_registry lifecycle;
+  std::shared_ptr<sirius::event::query_event_publisher> publisher =
+    std::make_shared<sirius::event::query_event_publisher>();
+  sirius::test::executor_event_recorder recorder{*publisher};
+  std::shared_ptr<sirius::memory::memory_wait_board> board;
+  sirius::data::data_repository_manager_registry repositories;
+  sirius::parallel::downgrade_executor downgrade{
+    lifecycle,
+    sirius::exec::downgrade_executor_config{
+      .thread_pool    = {.num_threads = 1, .thread_name_prefix = "stall-downgrade"},
+      .monitor_period = std::chrono::milliseconds{0}},
+    repositories,
+    cucascade::memory::memory_space_id{cucascade::memory::Tier::GPU, 0},
+    nullptr,
+    *manager};
+  std::shared_ptr<sirius::pipeline::completion_handler> completion =
+    std::make_shared<sirius::pipeline::completion_handler>();
+  std::shared_ptr<test_gpu_pipeline_task_global_state> global =
+    std::make_shared<test_gpu_pipeline_task_global_state>();
+  sirius::exec::channel<std::unique_ptr<sirius::pipeline::task_request>> requests;
+  std::optional<sirius::pipeline::gpu_pipeline_executor> executor;
+
+  stall_fixture()
+  {
+    REQUIRE(space != nullptr);
+    lifecycle.open_query(sirius::make_query_id(0));
+    global->set_completion_handler(completion);
+  }
+
+  ~stall_fixture()
+  {
+    if (executor) { executor->stop(); }
+  }
+
+  void start(bool use_board, bool with_downgrade, int threads = 1)
+  {
+    executor.emplace(lifecycle,
+                     sirius::exec::thread_pool_config{threads, "stall-test"},
+                     space,
+                     requests.make_publisher(),
+                     with_downgrade ? &downgrade : nullptr,
+                     sirius::test::make_test_telemetry_context());
+    executor->set_query_event_publisher(*publisher);
+    if (use_board) {
+      board = std::make_shared<sirius::memory::memory_wait_board>(0);
+      executor->set_memory_wait_board(board);
+    }
+    executor->start();
+  }
+
+  [[nodiscard]] int waiting() const { return board ? board->waiting(0) : 0; }
+};
+
+using recorder_log = sirius::test::executor_event_recorder::log;
 
 }  // namespace
 
@@ -552,4 +707,203 @@ TEST_CASE("bounded pool survives a throwing error sink and releases its slot",
   pool.dispatch(pool.reserve(), [&] { ran = true; });
   pool.wait_all();
   CHECK(ran);
+}
+
+TEST_CASE("GPU executor publishes one task_completed per successful task",
+          "[gpu_pipeline_executor][memory_wait_board]")
+{
+  bool const use_board = GENERATE(true, false);
+  stall_fixture f;
+
+  // One task carries a pipeline, so its event names the real query and the source operator.
+  auto const piped_query = sirius::make_query_id(7);
+  f.lifecycle.open_query(piped_query);
+  sirius::op::sirius_physical_operator source(
+    sirius::op::SiriusPhysicalOperatorType::FILTER, {}, 0);
+  source.operator_id = 5;
+  auto pipe          = std::make_shared<sirius::pipeline::sirius_pipeline>(
+    sirius::pipeline::pipeline_build_context{sirius::test::make_test_telemetry_context()});
+  sirius::pipeline::sirius_pipeline_build_state build_state;
+  build_state.set_pipeline_source(*pipe, source);
+  build_state.set_pipeline_sink(*pipe, &source, 1);
+  pipe->set_query_id(piped_query);
+  auto piped_state = std::make_shared<test_gpu_pipeline_task_global_state>();
+  piped_state->set_pipeline(pipe);
+
+  f.start(use_board, /*with_downgrade=*/false, /*threads=*/2);
+  constexpr int plain_tasks = 4;
+  for (int i = 0; i < plain_tasks; ++i) {
+    REQUIRE(f.executor->schedule(
+      std::make_unique<sized_reservation_task>(i, f.global, 8ULL * 1024 * 1024)));
+  }
+  REQUIRE(f.executor->schedule(
+    std::make_unique<sized_reservation_task>(plain_tasks, piped_state, 8ULL * 1024 * 1024)));
+
+  REQUIRE(f.recorder.wait_for(
+    [](recorder_log const& l) { return l.completions.size() == plain_tasks + 1; }));
+  f.executor->stop();
+  auto const log = f.recorder.snapshot();
+
+  CHECK(log.completions.size() == plain_tasks + 1);
+  CHECK(log.count(sirius::event::task_outcome::succeeded) == plain_tasks + 1);
+  int piped = 0;
+  for (auto const& c : log.completions) {
+    CHECK(c.gpu == 0);
+    if (c.query == piped_query) {
+      ++piped;
+      CHECK(c.operator_id == 5);
+    } else {
+      CHECK(c.query == sirius::make_query_id(0));
+      CHECK(c.operator_id == sirius::op::sirius_physical_operator::invalid_operator_id);
+    }
+  }
+  CHECK(piped == 1);
+  CHECK(f.global->executed_count.load() == plain_tasks);
+  CHECK(piped_state->executed_count.load() == 1);
+  // Nothing stalled, so no reserve phase was announced or ended.
+  CHECK(log.waits.empty());
+  CHECK(log.downgrades.empty());
+  CHECK(log.ends.empty());
+  CHECK(f.waiting() == 0);
+  if (use_board) { CHECK(f.board->oom_pending(0) == 0); }
+}
+
+TEST_CASE("A stalled reserve phase stays on the wait board from the partial grant into downgrade",
+          "[gpu_pipeline_executor][memory_wait_board]")
+{
+  bool const use_board = GENERATE(true, false);
+  stall_fixture f;
+  auto const limit = f.space->get_max_memory();
+  auto const need  = limit / 2;
+  // About a quarter of the limit stays reservable, so the task's blocking reservation ends in a
+  // partial grant (no reservation is alive to wait for) and the executor turns to downgrade.
+  f.pressure.allocate(*f.space, limit - limit / 4);
+  f.start(use_board, /*with_downgrade=*/true);
+  REQUIRE(f.executor->schedule(std::make_unique<sized_reservation_task>(1, f.global, need)));
+
+  // The downgrade executor is not running, so its request stays queued and the task stays parked
+  // inside its reserve phase, past both stall announcements.
+  REQUIRE(f.recorder.wait_for([](recorder_log const& l) { return !l.downgrades.empty(); }));
+  auto const parked = f.recorder.snapshot();
+  REQUIRE(parked.waits.size() == 1);
+  REQUIRE(parked.downgrades.size() == 1);
+  CHECK(parked.waits[0].bytes == need);
+  CHECK(parked.downgrades[0].bytes < need);
+  CHECK(parked.ends.empty());
+  CHECK(parked.completions.empty());
+  if (use_board) { CHECK(f.waiting() == 1); }
+
+  SECTION("the downgrade returns and the task runs on its partial grant")
+  {
+    f.downgrade.start();
+    REQUIRE(f.recorder.wait_for(
+      [](recorder_log const& l) { return !l.ends.empty() && !l.completions.empty(); }));
+    auto const done = f.recorder.snapshot();
+    REQUIRE(done.ends.size() == 1);
+    CHECK(done.ends[0].query == done.waits[0].query);
+    CHECK(done.ends[0].operator_id == done.waits[0].operator_id);
+    CHECK(done.ends[0].gpu == 0);
+    CHECK(done.ends[0].bytes > 0);
+    CHECK(done.ends[0].bytes < need);
+    CHECK(f.global->granted_bytes.load() == done.ends[0].bytes);
+    REQUIRE(done.completions.size() == 1);
+    CHECK(done.completions[0].outcome == sirius::event::task_outcome::succeeded);
+    CHECK(f.global->executed_count.load() == 1);
+    CHECK_FALSE(f.completion->has_error());
+  }
+
+  SECTION("the space shuts down during the downgrade and the task gives up")
+  {
+    f.space->shutdown();
+    f.downgrade.start();
+    REQUIRE(f.recorder.wait_for([](recorder_log const& l) { return !l.ends.empty(); }));
+    REQUIRE(wait_until([&] { return f.completion->has_error(); }));
+    auto const done = f.recorder.snapshot();
+    REQUIRE(done.ends.size() == 1);
+    CHECK(done.ends[0].bytes == 0);
+    CHECK(done.completions.empty());
+    CHECK(f.global->executed_count.load() == 0);
+  }
+
+  f.executor->stop();
+  auto const final_log = f.recorder.snapshot();
+  CHECK(final_log.waits.size() == 1);
+  CHECK(final_log.downgrades.size() == 1);
+  CHECK(final_log.ends.size() == 1);
+  CHECK(f.waiting() == 0);
+}
+
+TEST_CASE("A cancelled downgrade ends the stalled reserve phase",
+          "[gpu_pipeline_executor][memory_wait_board]")
+{
+  bool const use_board = GENERATE(true, false);
+  stall_fixture f;
+  auto const limit = f.space->get_max_memory();
+  f.pressure.allocate(*f.space, limit - limit / 4);
+  // A stopped downgrade executor refuses the request, which the task sees as a cancellation.
+  f.downgrade.start();
+  f.downgrade.stop();
+  f.start(use_board, /*with_downgrade=*/true);
+  REQUIRE(f.executor->schedule(std::make_unique<sized_reservation_task>(1, f.global, limit / 2)));
+
+  REQUIRE(f.recorder.wait_for([](recorder_log const& l) { return !l.ends.empty(); }));
+  REQUIRE(wait_until([&] { return f.completion->has_error(); }));
+  f.executor->stop();
+  auto const log = f.recorder.snapshot();
+  CHECK(log.waits.size() == 1);
+  CHECK(log.downgrades.size() == 1);
+  REQUIRE(log.ends.size() == 1);
+  CHECK(log.ends[0].bytes == 0);
+  CHECK(log.ends[0].query == log.waits[0].query);
+  CHECK(log.completions.empty());
+  CHECK(f.global->executed_count.load() == 0);
+  CHECK(f.waiting() == 0);
+}
+
+TEST_CASE("A blocking reserve wait ends exactly once, with or without a grant",
+          "[gpu_pipeline_executor][memory_wait_board]")
+{
+  bool const use_board = GENERATE(true, false);
+  stall_fixture f;
+  auto const limit = f.space->get_max_memory();
+  auto const need  = limit / 2;
+  // A live reservation makes the task's reservation wait rather than settle for a partial grant.
+  auto holder = f.space->make_reservation_or_null(limit - limit / 4);
+  REQUIRE(holder);
+  f.start(use_board, /*with_downgrade=*/false);
+  REQUIRE(f.executor->schedule(std::make_unique<sized_reservation_task>(1, f.global, need)));
+
+  REQUIRE(f.recorder.wait_for([](recorder_log const& l) { return !l.waits.empty(); }));
+  CHECK(f.recorder.snapshot().ends.empty());
+  if (use_board) { CHECK(f.waiting() == 1); }
+
+  SECTION("the holder releases its reservation and the task gets all it asked for")
+  {
+    holder.reset();
+    REQUIRE(f.recorder.wait_for(
+      [](recorder_log const& l) { return !l.ends.empty() && !l.completions.empty(); }));
+    auto const log = f.recorder.snapshot();
+    REQUIRE(log.ends.size() == 1);
+    CHECK(log.ends[0].bytes == need);
+    CHECK(f.global->granted_bytes.load() == need);
+    CHECK(log.downgrades.empty());
+    REQUIRE(log.completions.size() == 1);
+    CHECK(log.completions[0].outcome == sirius::event::task_outcome::succeeded);
+  }
+
+  SECTION("the space shuts down and the task gives up")
+  {
+    f.space->shutdown();
+    REQUIRE(f.recorder.wait_for([](recorder_log const& l) { return !l.ends.empty(); }));
+    REQUIRE(wait_until([&] { return f.completion->has_error(); }));
+    auto const log = f.recorder.snapshot();
+    REQUIRE(log.ends.size() == 1);
+    CHECK(log.ends[0].bytes == 0);
+    CHECK(log.completions.empty());
+    CHECK(f.global->executed_count.load() == 0);
+  }
+
+  f.executor->stop();
+  CHECK(f.recorder.snapshot().ends.size() == 1);
+  CHECK(f.waiting() == 0);
 }

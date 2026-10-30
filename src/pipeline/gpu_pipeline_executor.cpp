@@ -21,6 +21,7 @@
 #include "cuda/device_health.hpp"
 #include "cuda_runtime_api.h"
 #include "downgrade/downgrade_executor.hpp"
+#include "event/event.hpp"
 #include "exec/leased_callable.hpp"
 #include "log/logging.hpp"
 #include "op/scan/table_scan/scan_contract.hpp"
@@ -43,10 +44,72 @@
 #include <format>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <utility>
 namespace sirius {
 namespace pipeline {
+
+namespace {
+
+/**
+ * One stalled reserve phase of one task: from the first time the executor announces that the
+ * task is waiting for memory until the task holds its final reservation or gives up.
+ *
+ * Construction enters a waiter on the memory_wait_board (when one is installed) BEFORE the stall
+ * is announced and before the task blocks, so a reader of the board sees the stall without
+ * waiting for event delivery. One scope covers the whole phase: the blocking wait, a partial
+ * grant, the downgrade request and the final reservation attempt, so the hold is continuous
+ * across the hand-off from waiting to downgrading.
+ *
+ * Destruction releases the waiter and then publishes exactly one memory_wait_ended_for_task,
+ * under the same masked query id as the stall events it closes. It runs on every exit, early
+ * returns and exceptions included; the event is only a wake-up, so losing it costs latency, never
+ * a stuck hold.
+ */
+class memory_wait_scope {
+ public:
+  memory_wait_scope(event::query_event_publisher& publisher,
+                    memory::memory_wait_board* board,
+                    query_id_t masked_query_id,
+                    std::size_t operator_id,
+                    int gpu)
+    : _publisher(publisher), _query_id(masked_query_id), _operator_id(operator_id), _gpu(gpu)
+  {
+    if (board != nullptr) { _waiter.emplace(board->enter_wait(gpu)); }
+  }
+
+  memory_wait_scope(memory_wait_scope const&)            = delete;
+  memory_wait_scope& operator=(memory_wait_scope const&) = delete;
+  memory_wait_scope(memory_wait_scope&&)                 = delete;
+  memory_wait_scope& operator=(memory_wait_scope&&)      = delete;
+
+  /// Bytes the phase ended up holding; stays 0 when the phase gives up.
+  void set_granted(std::size_t bytes) noexcept { _granted = bytes; }
+
+  ~memory_wait_scope()
+  {
+    _waiter.reset();
+    _publisher.publish_memory_wait_ended_for_task(_query_id, _operator_id, _gpu, _granted);
+  }
+
+ private:
+  event::query_event_publisher& _publisher;
+  std::optional<memory::memory_wait_board::waiter> _waiter;
+  query_id_t _query_id;
+  std::size_t _operator_id;
+  int _gpu;
+  std::size_t _granted{0};
+};
+
+/// Operator id of @p pipeline's source operator, or the invalid id when there is no pipeline.
+std::size_t source_operator_id(sirius_pipeline const* pipeline) noexcept
+{
+  return pipeline != nullptr ? pipeline->get_source_operator().first
+                             : op::sirius_physical_operator::invalid_operator_id;
+}
+
+}  // namespace
 
 gpu_pipeline_executor::gpu_pipeline_executor(
   sirius::exec::query_lifecycle_registry& lifecycle,
@@ -229,6 +292,16 @@ void gpu_pipeline_executor::process_task(
     // only once it returns learns nothing it can act on -- by then the stall it
     // would have exploited is over.  A reservation that succeeds outright is the
     // common case and raises nothing.
+    //
+    // Declared before the reservation so an early return releases a partial grant before the
+    // stall's board hold, never after.
+    std::optional<memory_wait_scope> stall;
+    auto enter_stall = [&](query_id_t masked_query_id, std::size_t operator_id, int gpu) {
+      if (!stall) {
+        stall.emplace(
+          *_query_event_publisher, _memory_wait_board.get(), masked_query_id, operator_id, gpu);
+      }
+    };
     auto reservation = _memory_space->make_reservation_or_null(bytes_needs);
     exec::query_lifecycle_registry::memory_wait_guard memory_wait_activity;
     if (!reservation || reservation->size() < bytes_needs) {
@@ -236,18 +309,14 @@ void gpu_pipeline_executor::process_task(
         _query_lifecycle.begin_memory_wait(pipe ? pipe->get_query_id() : make_query_id(0));
     }
     if (!reservation) {
-      if (_query_event_publisher) {
-        auto const* pipe               = gpu_task->get_pipeline();
-        auto const stalled_operator_id = pipe != nullptr
-                                           ? pipe->get_source_operator().first
-                                           : op::sirius_physical_operator::invalid_operator_id;
-        _query_event_publisher->publish_wait_for_memory_for_task(
-          make_query_id(
-            static_cast<std::uint32_t>(static_cast<std::uint64_t>(gpu_task->get_priority()) >> 32)),
-          stalled_operator_id,
-          _memory_space != nullptr ? _memory_space->get_device_id() : -1,
-          bytes_needs);
-      }
+      auto const* stalled_pipe       = gpu_task->get_pipeline();
+      auto const stalled_operator_id = source_operator_id(stalled_pipe);
+      auto const stalled_query_id    = make_query_id(
+        static_cast<std::uint32_t>(static_cast<std::uint64_t>(gpu_task->get_priority()) >> 32));
+      auto const stalled_gpu = _memory_space != nullptr ? _memory_space->get_device_id() : -1;
+      enter_stall(stalled_query_id, stalled_operator_id, stalled_gpu);
+      _query_event_publisher->publish_wait_for_memory_for_task(
+        stalled_query_id, stalled_operator_id, stalled_gpu, bytes_needs);
       reservation = _memory_space->make_reservation(bytes_needs);
     }
     if (!reservation) {
@@ -283,15 +352,15 @@ void gpu_pipeline_executor::process_task(
       // knowing is that the GPU is about to stall, and a listener told only once
       // it has finished learns nothing it can act on.
       auto const* downgrade_pipe     = gpu_task->get_pipeline();
-      auto const stalled_operator_id = downgrade_pipe != nullptr
-                                         ? downgrade_pipe->get_source_operator().first
-                                         : op::sirius_physical_operator::invalid_operator_id;
+      auto const stalled_operator_id = source_operator_id(downgrade_pipe);
+      auto const stalled_query_id    = make_query_id(
+        static_cast<std::uint32_t>(static_cast<std::uint64_t>(gpu_task->get_priority()) >> 32));
+      auto const stalled_gpu = _memory_space != nullptr ? _memory_space->get_device_id() : -1;
+      // Usually already engaged by the blocking wait above, whose partial grant led here; the
+      // same scope then carries on through the downgrade.
+      enter_stall(stalled_query_id, stalled_operator_id, stalled_gpu);
       _query_event_publisher->publish_memory_downgrade_for_task(
-        make_query_id(
-          static_cast<std::uint32_t>(static_cast<std::uint64_t>(gpu_task->get_priority()) >> 32)),
-        stalled_operator_id,
-        _memory_space != nullptr ? _memory_space->get_device_id() : -1,
-        shortfall);
+        stalled_query_id, stalled_operator_id, stalled_gpu, shortfall);
 
       reservation.reset();  // release partial reservation before downgrade
 
@@ -388,6 +457,11 @@ void gpu_pipeline_executor::process_task(
         reservation->size());
     }
     memory_wait_activity.reset();
+    // The reserve phase is over and the task holds its reservation.
+    if (stall) {
+      stall->set_granted(reservation ? reservation->size() : 0);
+      stall.reset();
+    }
     if (auto* local_state = dynamic_cast<sirius::pipeline::sirius_pipeline_task_local_state*>(
           gpu_task->local_state())) {
       local_state->set_reservation(std::move(reservation), reservation_info);
@@ -411,6 +485,7 @@ void gpu_pipeline_executor::process_task(
     // blocks below still have it if dispatch itself throws.
     auto completion = iteration_completion;
     auto work       = pipeline_task->take_work_lease();
+    auto const gpu  = _memory_space != nullptr ? _memory_space->get_device_id() : -1;
     exec::dispatch_with_work(
       *_bounded_pool,
       std::move(slot),
@@ -426,7 +501,8 @@ void gpu_pipeline_executor::process_task(
        exc_stream = std::move(exc_stream),
        consumers  = std::move(output_consumers),
        completion = std::move(completion),
-       pipeline]() mutable {
+       pipeline,
+       gpu]() mutable {
         // The enclosing leased callable retains all captures through this error boundary.
         try {
           try {
@@ -437,7 +513,8 @@ void gpu_pipeline_executor::process_task(
             // Only THIS query's error state suppresses the reschedule. Previously one query's
             // failure silently stopped every other query's tasks from rescheduling.
             if (completion && completion->has_error()) { return; }
-            auto* gpu_task = cast_to_gpu_pipeline_task(task.get());
+            bool const oom_reschedule = dynamic_cast<oom_reschedule_exception*>(&ex) != nullptr;
+            auto* gpu_task            = cast_to_gpu_pipeline_task(task.get());
             if (!gpu_task) {
               SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to cast task for reschedule");
               if (completion) {
@@ -485,13 +562,13 @@ void gpu_pipeline_executor::process_task(
                 ex.get_resume_operator_index(),
                 ex.what());
               if (completion) {
-                completion->report_error(std::make_exception_ptr(std::runtime_error(
-                                           "GPU pipeline task exceeded maximum retry limit (" +
-                                           std::to_string(MAX_RETRIES) + ") for original task " +
-                                           std::to_string(orig_task_id) + ": " + ex.what())),
-                                         dynamic_cast<oom_reschedule_exception*>(&ex)
-                                           ? transparent::late_failure_cause::oom_exhausted
-                                           : transparent::late_failure_cause::retry_exhausted);
+                completion->report_error(
+                  std::make_exception_ptr(
+                    std::runtime_error("GPU pipeline task exceeded maximum retry limit (" +
+                                       std::to_string(MAX_RETRIES) + ") for original task " +
+                                       std::to_string(orig_task_id) + ": " + ex.what())),
+                  oom_reschedule ? transparent::late_failure_cause::oom_exhausted
+                                 : transparent::late_failure_cause::retry_exhausted);
               }
               return;
             }
@@ -530,6 +607,20 @@ void gpu_pipeline_executor::process_task(
                 cur_local->get_preferred_device_id().value());
             }
 
+            // An OOM retry counts as pending on this device until the retried task is destroyed.
+            // A later retry of the same task carries its token over rather than adding a second
+            // one, so one retry chain counts once; a new token is taken only for an OOM on a task
+            // that holds none, or holds one for another device.
+            if (_memory_wait_board) {
+              auto holdoff = cur_local != nullptr
+                               ? std::exchange(cur_local->oom_holdoff, std::nullopt)
+                               : std::nullopt;
+              if (oom_reschedule && (!holdoff || holdoff->device() != gpu)) {
+                holdoff = _memory_wait_board->hold_oom(gpu);
+              }
+              new_local_state->oom_holdoff = std::move(holdoff);
+            }
+
             auto new_task_id =
               _task_creator ? _task_creator->get_next_task_id() : gpu_task->get_task_id();
             auto new_task =
@@ -554,7 +645,22 @@ void gpu_pipeline_executor::process_task(
               });
             }
             if (!_task_creator) { throw std::logic_error("GPU retry requires a task creator"); }
+            bool const report_reschedule =
+              _query_event_publisher->has_subscribers(event::event_type::task_completed);
+            auto const rescheduled_operator_id =
+              report_reschedule ? source_operator_id(pipeline)
+                                : op::sirius_physical_operator::invalid_operator_id;
             _task_creator->reschedule(std::move(new_task));
+            // Not a memory-freed signal: this attempt's task, and so its reservation, is still
+            // captured here and is released only when this callable is destroyed.
+            if (report_reschedule) {
+              _query_event_publisher->publish_task_completed(
+                query_id,
+                rescheduled_operator_id,
+                gpu,
+                oom_reschedule ? event::task_outcome::oom_rescheduled
+                               : event::task_outcome::rescheduled);
+            }
             return;
           }
           if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
@@ -563,8 +669,18 @@ void gpu_pipeline_executor::process_task(
               .success = true,
             });
           }
+          bool const report_completion =
+            _query_event_publisher->has_subscribers(event::event_type::task_completed);
+          auto const completed_operator_id = report_completion
+                                               ? source_operator_id(pipeline)
+                                               : op::sirius_physical_operator::invalid_operator_id;
           // The enclosing leased callable protects the epilogue after task destruction.
           task.reset();
+          // The task's reservation, its inputs and any OOM hold-off it carried are released now.
+          if (report_completion) {
+            _query_event_publisher->publish_task_completed(
+              query_id, completed_operator_id, gpu, event::task_outcome::succeeded);
+          }
 
           // Check if query is complete BEFORE scheduling downstream tasks.
           // mark_completed() signals the future that engine.execute() is waiting on,

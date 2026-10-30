@@ -20,6 +20,7 @@
 
 #include <cuda/stream>
 
+#include <cucascade/cuda/event.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
@@ -27,6 +28,8 @@
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
 
+#include <chrono>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <tuple>
@@ -47,6 +50,62 @@ struct lock_to_new_batch {
 };
 
 using lock_and_prepare_batch_result = std::variant<lock_to_existing_batch, lock_to_new_batch>;
+
+/// What @ref lock_and_prepare_batch did with one batch, for callers that measure how ready their
+/// inputs were.
+struct lock_and_prepare_trace {
+  /// Nanoseconds spent waiting for the batch's locks. An exclusive holder, such as a promotion
+  /// copying the batch to the GPU, makes the caller wait here.
+  std::uint64_t lock_wait_ns{0};
+  /// The batch was on HOST or DISK and this call converted it to the target GPU.
+  bool upgraded_to_gpu{false};
+};
+
+namespace detail {
+
+/// Nanoseconds since @p start.
+[[nodiscard]] inline std::uint64_t elapsed_ns(std::chrono::steady_clock::time_point start) noexcept
+{
+  return static_cast<std::uint64_t>(
+    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start)
+      .count());
+}
+
+}  // namespace detail
+
+/**
+ * @brief Order @p stream after the writes that produced a GPU representation, on the device.
+ *
+ * Enqueues `cudaStreamWaitEvent(stream, writer_event)` when @p data is GPU-resident and carries a
+ * writer event, so that everything later enqueued on @p stream (a dealloc-stream rebind, kernels
+ * reading the table) runs after the producer's writes, whichever stream or device produced them.
+ * Never blocks the host.
+ *
+ * Writer-event invariant: a GPU representation published WITHOUT a writer event must be complete
+ * by the time its batch lock is released. Every existing Sirius producer host-syncs its stream
+ * before publishing, so a null event means "nothing to wait for" here, and this helper
+ * deliberately does NOT fall back to `gpu_table_representation::wait_for_writer`, which would
+ * `cudaDeviceSynchronize` the whole device on a null event. A producer that may publish before its
+ * writes complete (e.g. an asynchronous preload copy on its own stream) must record a writer event
+ * instead; this wait is what orders the consumer after it.
+ *
+ * Call only while an accessor (mutable or read-only) on the owning batch is held, so the
+ * representation and its event cannot be re-recorded or destroyed concurrently. The raw event must
+ * never be stashed for a later unlocked wait. Once the wait is enqueued, CUDA has captured the
+ * event's recording, so a later re-record or destruction does not retarget it.
+ *
+ * @param data    The representation the accessor pins; nullptr and non-GPU tiers are no-ops (HOST
+ *                and DISK representations need no ordering).
+ * @param stream  The stream that is about to rebind to or read @p data.
+ */
+inline void order_after_writer(const cucascade::idata_representation* data,
+                               ::cuda::stream_ref stream)
+{
+  if (data == nullptr || data->get_current_tier() != cucascade::memory::Tier::GPU) { return; }
+  if (cudaEvent_t const writer_event = data->get_writer_event(); writer_event != nullptr) {
+    cucascade::cuda::cuda_event_view{writer_event}.wait(stream);
+  }
+}
 
 /**
  * @brief Lock or prepare a single data batch for processing in the requested memory space.
@@ -70,10 +129,17 @@ using lock_and_prepare_batch_result = std::variant<lock_to_existing_batch, lock_
  *   the exclusive lock is re-dispatched: same space -> no-op; a different GPU -> clone (a
  *   GPU-resident batch is never moved cross-device); still host/disk -> move as planned.
  *
+ * Every returned accessor on a GPU-resident batch in the target space has `stream` ordered after
+ * that batch's writer event (@ref order_after_writer) before the deallocation-stream rebind and
+ * before the caller can read it, so a producer's (or preload's) still-in-flight writes are never
+ * read early. Cross-GPU clones keep the ordering done by the clone itself.
+ *
  * @param batch                   The batch to lock/prepare.
  * @param requested_memory_space  Target memory space; may be nullptr to use the batch's current
  *                                space.
  * @param stream                  CUDA stream used for any data-movement kernels.
+ * @param trace                   When set, receives the lock wait and whether the batch was
+ * upgraded to the GPU.
  * @return A read_only_data_batch holding the shared lock (on the clone for cross-GPU inputs),
  *         or std::nullopt on failure.
  * @throws rmm::out_of_memory  If a GPU memory allocation fails during the conversion or clone.
@@ -81,7 +147,8 @@ using lock_and_prepare_batch_result = std::variant<lock_to_existing_batch, lock_
 inline std::optional<lock_and_prepare_batch_result> lock_and_prepare_batch(
   const std::shared_ptr<cucascade::data_batch>& batch,
   const cucascade::memory::memory_space* requested_memory_space,
-  ::cuda::stream_ref stream)
+  ::cuda::stream_ref stream,
+  lock_and_prepare_trace* trace = nullptr)
 {
   if (!batch) { return std::nullopt; }
 
@@ -94,6 +161,11 @@ inline std::optional<lock_and_prepare_batch_result> lock_and_prepare_batch(
   // space match guarantees the stream and the data live on the same device (important for
   // multi-GPU). The mismatch case below converts via `stream`, which already allocates the new
   // table on it, so no rebind is needed there.
+  //
+  // rebind_stream() inserts no cross-stream ordering, so under the same mutable lock and BEFORE
+  // the rebind we order `stream` after the writer event: the rebound buffers are then freed (and
+  // their address possibly reused) only after the producer's writes. This wait is independent of
+  // the read-lock waits below, which must also run when try_to_mutable() fails.
   if (std::optional<cucascade::mutable_data_batch> mut = batch->try_to_mutable()) {
     const auto* current_space = mut->get_memory_space();
     const auto* rebind_target =
@@ -101,21 +173,27 @@ inline std::optional<lock_and_prepare_batch_result> lock_and_prepare_batch(
     if (current_space != nullptr && rebind_target != nullptr &&
         current_space->get_id() == rebind_target->get_id() &&
         rebind_target->get_tier() == cucascade::memory::Tier::GPU) {
+      order_after_writer(mut->get_data(), stream);
       mut->rebind_stream(stream);
     }
   }
 
   // Acquire a read-only lock
+  auto const wait_start                         = std::chrono::steady_clock::now();
   cucascade::read_only_data_batch read_accessor = batch->to_read_only();
+  if (trace != nullptr) { trace->lock_wait_ns += detail::elapsed_ns(wait_start); }
 
   // Determine the target memory space
   const auto* target_space =
     requested_memory_space != nullptr ? requested_memory_space : read_accessor.get_memory_space();
   if (target_space == nullptr) { return std::nullopt; }
 
-  // Memory space matches — return the read-only accessor directly
+  // Memory space matches — return the read-only accessor directly. The representation can change
+  // between the opportunistic mutable block and this read lock, so the writer wait is repeated on
+  // the representation actually being returned (a no-op for non-GPU tiers).
   if (read_accessor.get_memory_space() != nullptr &&
       read_accessor.get_memory_space()->get_id() == target_space->get_id()) {
+    order_after_writer(read_accessor.get_data(), stream);
     return lock_to_existing_batch{.ro_lock = std::move(read_accessor)};
   }
 
@@ -147,7 +225,9 @@ inline std::optional<lock_and_prepare_batch_result> lock_and_prepare_batch(
       {
         std::ignore =
           cucascade::data_batch::to_idle(std::move(read_accessor));  // release the read lock
+        auto const mut_wait_start                  = std::chrono::steady_clock::now();
         cucascade::mutable_data_batch mut_accessor = batch->to_mutable();
+        if (trace != nullptr) { trace->lock_wait_ns += detail::elapsed_ns(mut_wait_start); }
 
         // this upgrade to mutable is not atomic (shared released, then exclusive acquire): a
         // concurrent consumer of a shared spilled batch may have converted it in the gap.
@@ -157,9 +237,10 @@ inline std::optional<lock_and_prepare_batch_result> lock_and_prepare_batch(
           // Already in the target space — skip the wasteful same-space deep copy.
           std::ignore = cucascade::data_batch::to_idle(
             std::move(mut_accessor));  // release the exclusive write lock
-          return lock_to_existing_batch{
-            .ro_lock = batch->to_read_only(),
-          };
+          // Order after the writer under the read lock that is returned.
+          cucascade::read_only_data_batch ro_lock = batch->to_read_only();
+          order_after_writer(ro_lock.get_data(), stream);
+          return lock_to_existing_batch{.ro_lock = std::move(ro_lock)};
         }
 
         if (mut_accessor.get_current_tier() == cucascade::memory::Tier::GPU) {
@@ -178,13 +259,16 @@ inline std::optional<lock_and_prepare_batch_result> lock_and_prepare_batch(
         }
         mut_accessor.convert_to<cucascade::gpu_table_representation>(
           registry, target_space, stream);
+        if (trace != nullptr) { trace->upgraded_to_gpu = true; }
 
         // exclusive mutable access dropped.
       }
 
-      return lock_to_existing_batch{
-        .ro_lock = batch->to_read_only(),
-      };
+      // The converted representation carries its own writer event (the converter's copy stream
+      // may differ from `stream`); order after it under the read lock that is returned.
+      cucascade::read_only_data_batch ro_lock = batch->to_read_only();
+      order_after_writer(ro_lock.get_data(), stream);
+      return lock_to_existing_batch{.ro_lock = std::move(ro_lock)};
     }
     case cucascade::memory::Tier::HOST: {
       {

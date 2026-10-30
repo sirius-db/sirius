@@ -214,6 +214,41 @@ class query_event_subscriber {
                                              compressed_materialization_activity,
                                              std::uint64_t count) noexcept;
 
+  /// The downgrade executor moved one batch of @p query_id to a lower tier.
+  /// One event per conversion: a batch spilled twice is reported twice, and
+  /// @c downgraded_batch::conversion_seq orders the two whatever order they
+  /// arrive in.  The batch is held weakly and may already be gone.
+  virtual void on_batch_downgraded(event_id_t,
+                                   timestamp_t,
+                                   query_id_t query_id,
+                                   downgraded_batch const& batch) noexcept;
+
+  /// A task from @p operator_id left the executor for @p gpu_id with
+  /// @p outcome.  On @c task_outcome::succeeded the task's reservation and
+  /// inputs have already been released, so memory on @p gpu_id has freed up.
+  /// A rescheduled task is still alive and still holds what it reserved, so the
+  /// other outcomes say the queue changed, not that memory freed.
+  /// @p query_id is the query's real id.
+  virtual void on_task_completed(event_id_t,
+                                 timestamp_t,
+                                 query_id_t query_id,
+                                 std::size_t operator_id,
+                                 int gpu_id,
+                                 task_outcome outcome) noexcept;
+
+  /// The reserve phase of a task from @p operator_id on @p gpu_id that was
+  /// announced by @ref on_wait_for_memory_for_task or @ref
+  /// on_memory_downgrade_for_task has ended, with @p granted_bytes reserved (0
+  /// if it gave up).  Exactly one per stalled reserve phase, however many
+  /// stalls it announced.  @p query_id is derived the same way as for those two
+  /// events, so it matches them rather than the query's real id.
+  virtual void on_memory_wait_ended_for_task(event_id_t,
+                                             timestamp_t,
+                                             query_id_t query_id,
+                                             std::size_t operator_id,
+                                             int gpu_id,
+                                             std::size_t granted_bytes) noexcept;
+
  protected:
   /// Inspect after stop() joins the worker to reject incomplete observations.
   [[nodiscard]] bool delivery_failed() const noexcept { return _queue->failed(); }
