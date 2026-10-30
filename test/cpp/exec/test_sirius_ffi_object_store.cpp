@@ -31,6 +31,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <array>
 #include <atomic>
 #include <barrier>
 #include <cerrno>
@@ -88,7 +89,7 @@ void check_no_sentinels(std::string const& message)
 }
 
 template <typename Operation>
-void check_invalid(Operation&& operation, std::string const& field)
+void check_invalid(Operation&& operation, std::string const& field, char const* reason = nullptr)
 {
   bool invalid_argument = false;
   std::string message;
@@ -103,6 +104,7 @@ void check_invalid(Operation&& operation, std::string const& field)
   INFO("exception text: " << message);
   CHECK(invalid_argument);
   if (invalid_argument) { CHECK(message.starts_with("ObjectStoreConfig." + field + ":")); }
+  if (reason) { CHECK(message.find(reason) != std::string::npos); }
   check_no_sentinels(message);
 }
 
@@ -124,6 +126,7 @@ struct invalid_input {
   std::string object_store_inputs::* member;
   std::string value;
   char const* field;
+  char const* reason = nullptr;
 };
 
 std::vector<invalid_input> invalid_inputs()
@@ -131,6 +134,8 @@ std::vector<invalid_input> invalid_inputs()
   auto const missing_ca =
     fixture_path("missing_" + std::string(object_store_sentinels[2]) + ".pem");
   REQUIRE_FALSE(fs::exists(missing_ca));
+  auto const ca_directory = fixture_path("");
+  REQUIRE(fs::is_directory(ca_directory));
   return {
     {"empty endpoint", &object_store_inputs::endpoint, "", "endpoint"},
     {"empty region", &object_store_inputs::region, "", "region"},
@@ -152,6 +157,14 @@ std::vector<invalid_input> invalid_inputs()
     {"unsupported scheme", &object_store_inputs::endpoint, "ftp://localhost", "endpoint"},
     {"missing host", &object_store_inputs::endpoint, "https://", "endpoint"},
     {"port without host", &object_store_inputs::endpoint, "https://:443", "endpoint"},
+    {"zero port", &object_store_inputs::endpoint, "https://h:0", "endpoint"},
+    {"out-of-range port", &object_store_inputs::endpoint, "https://h:65536", "endpoint"},
+    {"nondecimal port", &object_store_inputs::endpoint, "https://h:12a", "endpoint"},
+    {"empty port", &object_store_inputs::endpoint, "https://h:", "endpoint"},
+    {"endpoint control byte", &object_store_inputs::endpoint, "https://h\x01", "endpoint"},
+    {"endpoint DEL byte", &object_store_inputs::endpoint, "https://h\x7f", "endpoint"},
+    {"endpoint space", &object_store_inputs::endpoint, "https://h ost", "endpoint"},
+    {"unterminated IPv6 literal", &object_store_inputs::endpoint, "https://[::1", "endpoint"},
     {"empty transport", &object_store_inputs::transport, "", "transport"},
     {"internal transport alias", &object_store_inputs::transport, "https", "transport"},
     {"unknown transport",
@@ -167,11 +180,20 @@ std::vector<invalid_input> invalid_inputs()
      &object_store_inputs::ca_bundle_path,
      missing_ca.string(),
      "ca_bundle_path"},
+    {"CA directory",
+     &object_store_inputs::ca_bundle_path,
+     ca_directory.string(),
+     "ca_bundle_path",
+     "is not a regular file"},
     {"non-S3 prefix", &object_store_inputs::uri_prefix, "http://b/", "uri_prefix"},
     {"empty prefix bucket", &object_store_inputs::uri_prefix, "s3://", "uri_prefix"},
     {"missing prefix bucket", &object_store_inputs::uri_prefix, "s3:///p/", "uri_prefix"},
     {"bucket without separator", &object_store_inputs::uri_prefix, "s3://b", "uri_prefix"},
     {"prefix without separator", &object_store_inputs::uri_prefix, "s3://b/p", "uri_prefix"},
+    {"empty prefix segment", &object_store_inputs::uri_prefix, "s3://b/a//", "uri_prefix"},
+    {"parent prefix segment", &object_store_inputs::uri_prefix, "s3://b/../", "uri_prefix"},
+    {"dot prefix segment", &object_store_inputs::uri_prefix, "s3://b/./", "uri_prefix"},
+    {"percent prefix segment", &object_store_inputs::uri_prefix, "s3://b/%41/", "uri_prefix"},
     {"prefix query", &object_store_inputs::uri_prefix, "s3://b/p/?x", "uri_prefix"},
     {"prefix fragment", &object_store_inputs::uri_prefix, "s3://b/p/#f", "uri_prefix"},
     {"prefix query with credential",
@@ -531,7 +553,8 @@ TEST_CASE("FFI object store factory rejects invalid configuration without leakin
     inputs.*(item.member) = item.value;
     // No other Context is alive, even if a broken validator unexpectedly constructs this one.
     check_invalid([&] { (void)make_context_from_config(memory_config(), inputs.snapshot()); },
-                  item.field);
+                  item.field,
+                  item.reason);
   }
 }
 
@@ -544,10 +567,29 @@ TEST_CASE("FFI object store setter rejects invalid configuration and preserves i
     CAPTURE(item.name);
     object_store_inputs inputs;
     inputs.*(item.member) = item.value;
-    check_invalid([&] { context->set_object_store(inputs.snapshot()); }, item.field);
+    check_invalid([&] { context->set_object_store(inputs.snapshot()); }, item.field, item.reason);
     CHECK(context->object_store_config().get() == original.get());
     // Keep later matrix entries independent after an unexpected successful publication.
     context->set_object_store(original);
+  }
+}
+
+TEST_CASE("FFI object store accepts IPv6 literals and decimal endpoint ports",
+          "[isolated_context][ffi][object_store]")
+{
+  auto context = make_context_from_config(memory_config());
+  for (auto const* endpoint : {"https://h:9000",
+                               "https://[::1]:9000",
+                               "https://[::1]",
+                               "https://h:0080",
+                               "https://h:1",
+                               "https://h:65535"}) {
+    CAPTURE(endpoint);
+    object_store_inputs inputs;
+    inputs.endpoint = endpoint;
+    auto snapshot   = inputs.snapshot();
+    REQUIRE_NOTHROW(context->set_object_store(snapshot));
+    CHECK(context->object_store_config().get() == snapshot.get());
   }
 }
 
@@ -778,7 +820,7 @@ TEST_CASE("FFI object store clears without invalidating retained snapshots",
 TEST_CASE("FFI object store accepts bucket and nested URI prefixes",
           "[isolated_context][ffi][object_store]")
 {
-  for (auto const* prefix : {"s3://b/", "s3://b/p/q/"}) {
+  for (auto const* prefix : {"s3://b/", "s3://b/p/q/", "s3://b/a/b/"}) {
     CAPTURE(prefix);
     object_store_inputs inputs;
     inputs.uri_prefix     = prefix;
@@ -856,8 +898,8 @@ TEST_CASE("FFI object store scopes bare empty and trailing object keys",
       {"s3://bucket/", "s3://bucket/allowed/k.parquet", true},
       {"s3://bucket/allowed/", "s3://bucket/allowed/", false},
       {"s3://bucket/allowed/", "s3://bucket/allowed/k.parquet", true},
-      {"", "s3://bucket/", true},
-      {"", "s3://bucket/allowed/", true},
+      {"", "s3://bucket/", false},
+      {"", "s3://bucket/allowed/", false},
     };
     for (auto const& item : cases) {
       inputs.uri_prefix = item.prefix;
@@ -1053,6 +1095,7 @@ TEST_CASE("FFI object store redacts credential-bearing URI forms at both entries
     std::string uri;
     std::string display;
     bool iceberg{};
+    char const* default_token = "object_store_route_unavailable:";
   };
   // Explicit protocol examples, not an oracle computed by the production formatter.
   std::vector<row> const cases{
@@ -1063,17 +1106,17 @@ TEST_CASE("FFI object store redacts credential-bearing URI forms at both entries
     {"//u:" + secret + "@host/k?next=https://x@y", "<redacted-uri>", true},
     {"s3://bucket/k@part.parquet", "s3://part.parquet"},
     {"s3://bucket/k", "s3://bucket/k"},
-    {"s3://bucket/k%40part", "s3://bucket/k%40part"},
+    {"s3://bucket/k%40part", "s3://bucket/k%40part", false, "object_store_scope:"},
   };
   auto context = make_context_from_config(memory_config());
   for (int state = 0; state != 3; ++state) {
     inputs.uri_prefix = state == 1 ? "s3://bucket/allowed/" : "";
     context->set_object_store(state == 0 ? nullptr : inputs.snapshot());
-    std::string const token = state == 0   ? "object_store_unconfigured:"
-                              : state == 1 ? "object_store_scope:"
-                                           : "object_store_route_unavailable:";
     for (auto const& item : cases) {
-      auto const plan = item.iceberg ? iceberg_plan(item.uri) : read_plan({{item.uri}});
+      std::string const token = state == 0   ? "object_store_unconfigured:"
+                                : state == 1 ? "object_store_scope:"
+                                             : item.default_token;
+      auto const plan         = item.iceberg ? iceberg_plan(item.uri) : read_plan({{item.uri}});
       for (auto entry : {entry_point::execute, entry_point::fragment_build}) {
         CAPTURE(state, item.uri, entry == entry_point::execute);
         check_refusal([&] { invoke_plan(*context, entry, plan); }, token, item.display);
@@ -1184,6 +1227,101 @@ TEST_CASE("FFI object store scoped sets preserve longest matches and supplied po
   CHECK(context->object_store_config_for("s3://b/x/y/f") == nullptr);
 }
 
+TEST_CASE("FFI object store applies the raw-key gate before selecting a scope",
+          "[isolated_context][ffi][object_store]")
+{
+  enum class resolution { none, scoped, fallback, refused };
+  struct scope_state {
+    char const* name;
+    bool has_prefix;
+    bool has_default;
+  };
+  std::array<scope_state, 4> const states{{
+    {"empty", false, false},
+    {"default only", false, true},
+    {"prefix only", true, false},
+    {"prefix and default", true, true},
+  }};
+  struct scope_case {
+    char const* uri;
+    std::array<resolution, 4> expected;
+  };
+  std::vector<scope_case> const cases{
+    {"s3://b/allowed/x",
+     {resolution::none, resolution::fallback, resolution::scoped, resolution::scoped}},
+    {"s3://b/other/x",
+     {resolution::none, resolution::fallback, resolution::none, resolution::fallback}},
+    {"s3://b", {resolution::none, resolution::fallback, resolution::none, resolution::fallback}},
+    {"S3://b/allowed/x",
+     {resolution::none, resolution::fallback, resolution::scoped, resolution::scoped}},
+    {"s3://b/other/../allowed/x",
+     {resolution::none, resolution::refused, resolution::refused, resolution::refused}},
+    {"s3://b/./x",
+     {resolution::none, resolution::refused, resolution::refused, resolution::refused}},
+    {"s3://b//x",
+     {resolution::none, resolution::refused, resolution::refused, resolution::refused}},
+    {"s3://b/%61llowed/x",
+     {resolution::none, resolution::refused, resolution::refused, resolution::refused}},
+    {"s3://b/allowed/report%202026.parquet",
+     {resolution::none, resolution::refused, resolution::refused, resolution::refused}},
+    {"s3://b/allowed/x/",
+     {resolution::none, resolution::refused, resolution::refused, resolution::refused}},
+    {"s3://b/", {resolution::none, resolution::refused, resolution::refused, resolution::refused}},
+  };
+
+  connection_observer observer;
+  observer.positive_control();
+  {
+    auto context = make_context_from_config(memory_config());
+    object_store_inputs inputs;
+    inputs.endpoint   = observer.endpoint();
+    inputs.uri_prefix = "s3://b/allowed/";
+    auto scoped       = inputs.snapshot();
+    inputs.uri_prefix.clear();
+    inputs.access_key += "_default";
+    auto fallback = inputs.snapshot();
+
+    for (std::size_t index = 0; index < states.size(); ++index) {
+      auto const& state = states[index];
+      context->set_object_store(nullptr);
+      if (state.has_prefix) { context->put_object_store(scoped); }
+      if (state.has_default) { context->put_object_store(fallback); }
+      for (auto const& item : cases) {
+        CAPTURE(state.name, item.uri);
+        auto const expected = item.expected[index];
+        if (expected == resolution::refused) {
+          check_refusal([&] { (void)context->object_store_config_for(item.uri); },
+                        "object_store_scope:",
+                        item.uri);
+        } else {
+          ObjectStoreConfig const* snapshot = nullptr;
+          if (expected == resolution::scoped) { snapshot = scoped.get(); }
+          if (expected == resolution::fallback) { snapshot = fallback.get(); }
+          CHECK(context->object_store_config_for(item.uri).get() == snapshot);
+        }
+
+        auto const empty = !state.has_prefix && !state.has_default;
+        auto const token = empty ? "object_store_unconfigured:"
+                           : expected == resolution::none || expected == resolution::refused
+                             ? "object_store_scope:"
+                             : "object_store_route_unavailable:";
+        auto const plan  = read_plan({{item.uri}});
+        for (auto const entry : {entry_point::execute, entry_point::fragment_build}) {
+          CAPTURE(entry == entry_point::execute);
+          auto const message =
+            check_refusal([&] { invoke_plan(*context, entry, plan); }, token, item.uri);
+          if (empty) {
+            CHECK(message.find("or through an Iceberg metadata path") != std::string::npos);
+          }
+        }
+      }
+    }
+  }
+  observer.finish();
+  CHECK(observer.error() == 0);
+  CHECK(observer.accepted() == 1);  // Only the positive control.
+}
+
 TEST_CASE("FFI object store getters and execution refuse invalid selected keys without fallback",
           "[isolated_context][ffi][object_store]")
 {
@@ -1221,8 +1359,14 @@ TEST_CASE("FFI object store drop validates keys and leaves absent keys unchanged
   inputs.uri_prefix = "s3://bucket/allowed/";
   auto original     = inputs.snapshot();
   auto context      = make_context_from_config(memory_config(), original);
-  for (auto const* key :
-       {"s3://bucket/allowed", "S3://bucket/allowed/", "http://b/p/", "s3://b/p/?x"}) {
+  for (auto const* key : {"s3://bucket/allowed",
+                          "S3://bucket/allowed/",
+                          "http://b/p/",
+                          "s3://b/p/?x",
+                          "s3://b/a//",
+                          "s3://b/../",
+                          "s3://b/%41/",
+                          "s3://b/./"}) {
     CAPTURE(key);
     check_invalid([&] { context->drop_object_store(key); }, "uri_prefix");
     CHECK(context->object_store_config().get() == original.get());

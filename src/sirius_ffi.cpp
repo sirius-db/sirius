@@ -57,6 +57,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <map>
@@ -163,7 +164,7 @@ bool one_of(std::string_view value, auto const& allowed)
 }
 
 // Shape of an S3 service endpoint: value-free checks first, then the SigV4 authorizer's own
-// parser, so the two can never disagree on what is accepted.
+// parser, so nothing admitted here is later rejected by the parser (one-way agreement).
 void check_endpoint(const std::string& endpoint)
 {
   if (endpoint.empty()) { invalid_field("endpoint", "required"); }
@@ -178,6 +179,9 @@ void check_endpoint(const std::string& endpoint)
   if (scheme != "http" && scheme != "https") {
     invalid_field("endpoint", "scheme must be http or https");
   }
+  for (unsigned char const c : endpoint) {
+    if (c <= 0x20 || c == 0x7F) { invalid_field("endpoint", "must not contain control bytes or spaces"); }
+  }
   auto const remainder = std::string_view{endpoint}.substr(sep + 3);
   // A port-only authority ("https://:443") has no host either.
   if (remainder.empty() || remainder.front() == ':') { invalid_field("endpoint", "missing host"); }
@@ -187,6 +191,27 @@ void check_endpoint(const std::string& endpoint)
   if (remainder.find('@') != std::string_view::npos) {
     invalid_field("endpoint", "must not contain user-info");
   }
+  // host[:port]: an optional explicit port is decimal 1..65535. An IPv6 literal keeps its colons
+  // inside the brackets; the port, if any, follows "]:".
+  auto port_sep = std::string_view::npos;
+  if (remainder.front() == '[') {
+    auto const close = remainder.find(']');
+    if (close == std::string_view::npos) { invalid_field("endpoint", "unterminated IPv6 literal"); }
+    if (close + 1 < remainder.size()) {
+      if (remainder[close + 1] != ':') { invalid_field("endpoint", "malformed"); }
+      port_sep = close + 1;
+    }
+  } else {
+    port_sep = remainder.find(':');
+  }
+  if (port_sep != std::string_view::npos) {
+    auto const port = remainder.substr(port_sep + 1);
+    bool const digits = !port.empty() && port.size() <= 5 &&
+                        std::all_of(port.begin(), port.end(), [](char c) { return c >= '0' && c <= '9'; });
+    if (!digits || std::stoi(std::string{port}) < 1 || std::stoi(std::string{port}) > 65535) {
+      invalid_field("endpoint", "port must be a decimal number in 1..65535");
+    }
+  }
   try {
     (void)sirius::io::rest::s3::parse_endpoint(endpoint);
   } catch (sirius::io::credential_error const&) {
@@ -195,7 +220,9 @@ void check_endpoint(const std::string& endpoint)
 }
 
 // "s3://bucket/" or "s3://bucket/prefix/": scheme s3, a bucket, a trailing slash, no query. The
-// same rule admits a scope key to publication (put/set) and to removal (drop).
+// same rule admits a scope key to publication (put/set) and to removal (drop). A prefix no key
+// can match byte-for-byte (an empty, "." or ".." segment, or a raw `%` byte) is refused
+// with the same rule that refuses such keys at resolution, so a published scope is never dead.
 void check_uri_prefix_shape(std::string_view prefix)
 {
   constexpr std::string_view kScheme = "s3://";
@@ -206,6 +233,17 @@ void check_uri_prefix_shape(std::string_view prefix)
   if (prefix.back() != '/') { invalid_field("uri_prefix", "must end with '/'"); }
   if (prefix.find_first_of("?#") != std::string_view::npos) {
     invalid_field("uri_prefix", "must not contain a query or fragment");
+  }
+  // Re-check the key part as a key: drop the mandatory trailing slash and let the shared rule
+  // classify the remaining segments ("s3://bucket/" has no key and is always fine).
+  auto const bucket_end = prefix.find('/', kScheme.size());
+  if (bucket_end != std::string_view::npos && bucket_end + 1 < prefix.size()) {
+    std::string const as_key{prefix.substr(0, prefix.size() - 1)};
+    if (sirius::io::s3::key_defeats_prefix_match(as_key)) {
+      invalid_field("uri_prefix",
+                    "contains a segment no key can match byte-for-byte (empty, '.', '..' or "
+                    "percent-encoded)");
+    }
   }
 }
 
@@ -224,6 +262,11 @@ void check_intrinsic(const ObjectStoreConfig& cfg)
     invalid_field("signing_mode", "must be one of presigned, header");
   }
   if (!cfg.ca_bundle_path.empty()) {
+    // ifstream opens a directory on Linux; require a regular file before the readability probe.
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(cfg.ca_bundle_path, ec)) {
+      invalid_field("ca_bundle_path", "is not a regular file");
+    }
     std::ifstream bundle(cfg.ca_bundle_path);
     if (!bundle.good()) { invalid_field("ca_bundle_path", "file is not readable"); }
   }
@@ -239,21 +282,25 @@ using sirius::io::s3::redacted_uri;
 using ObjectStoreScopeSet = std::vector<std::shared_ptr<ObjectStoreConfig>>;
 
 // The snapshot serving `uri`: the first (longest) prefix the scheme-lowered URI starts with; the
-// default scope matches every URI. nullptr when nothing matches. A key the selected scoped
-// prefix cannot match byte-for-byte is refused outright, never retried against a shorter prefix
-// or the default, so the per-URI getter and the execution guard answer alike.
+// default scope matches every URI. nullptr when nothing matches. A key that cannot be matched
+// byte-for-byte (an empty, "." or ".." segment, or a raw `%` byte) is refused before any
+// prefix is consulted — including when only the default scope would serve it: the store or
+// libcurl may normalize such a key into a published prefix's namespace, which the default scope
+// must not serve. Key bytes are never rewritten here (only the scheme is case-folded) and a
+// refused key is never retried, so the per-URI getter and the execution guard answer alike.
 std::shared_ptr<ObjectStoreConfig> resolve_scope(const ObjectStoreScopeSet& set,
                                                  std::string_view uri)
 {
+  if (set.empty()) { return nullptr; }
+  if (key_defeats_prefix_match(uri)) {
+    throw sirius::invalid_input_exception(
+      "object_store_scope: '{}' names a key segment that cannot be matched byte-for-byte "
+      "against the published uri_prefix set",
+      redacted_uri(uri));
+  }
   auto const lowered = lowercase_scheme(uri);
   for (const auto& snapshot : set) {
     if (snapshot->uri_prefix.empty() || lowered.starts_with(snapshot->uri_prefix)) {
-      if (!snapshot->uri_prefix.empty() && key_defeats_prefix_match(uri)) {
-        throw sirius::invalid_input_exception(
-          "object_store_scope: '{}' names a key segment that cannot be matched against the "
-          "selected uri_prefix",
-          redacted_uri(uri));
-      }
       return snapshot;
     }
   }
@@ -272,8 +319,8 @@ void refuse_remote_reads(const std::vector<std::string>& remote_paths,
   if (remote_paths.empty()) { return; }
   if (set.empty()) {
     throw sirius::invalid_input_exception(
-      "object_store_unconfigured: the plan reads '{}' from an object store, but this Context "
-      "has no object-store snapshot (Context::set_object_store)",
+      "object_store_unconfigured: the plan reads '{}' from an object store or through an Iceberg "
+      "metadata path, but this Context has no object-store snapshot (Context::set_object_store)",
       redacted_uri(remote_paths.front()));
   }
   // Every item is checked before any is served: a plan is refused whole.

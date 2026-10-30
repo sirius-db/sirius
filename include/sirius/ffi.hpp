@@ -72,10 +72,16 @@ struct SIRIUS_FFI_EXPORT ObjectStoreConfig {
   /// PEM CA bundle used to verify the endpoint's TLS certificate; empty uses the system trust
   /// store.
   const std::string ca_bundle_path;
-  /// Namespace this snapshot may read: empty = any `s3://` object at the endpoint;
-  /// `"s3://bucket/"` or `"s3://bucket/prefix/"` limits reads to that prefix.
-  /// With a non-empty prefix, an item outside it, an empty object key, or a key containing an
-  /// empty, `.` or `..` segment or a percent byte is refused before binding (`object_store_scope`).
+  /// Namespace this snapshot may read: empty = the default scope, serving any `s3://` object at
+  /// the endpoint that no published prefix claims; `"s3://bucket/"` or `"s3://bucket/prefix/"`
+  /// limits reads to that prefix. Whenever at least one snapshot is published, a key that cannot
+  /// be matched byte-for-byte — an empty object key, an empty, `.` or `..` segment, or a raw `%`
+  /// byte — is refused before binding (`object_store_scope`) regardless of which scope would
+  /// serve it: the store or transport may normalize such a key into a published prefix's
+  /// namespace, so even the default scope does not serve it. The gate classifies the raw key
+  /// suffix when a scheme and bucket/key separator are present; scope resolution is not full URI
+  /// validation. URI key spellings containing `%` are unsupported by this resolver. Key bytes are
+  /// never rewritten, and only the scheme is case-folded for matching.
   const std::string uri_prefix;
 
   /// A new snapshot with these credentials and every other field copied from `*this`, which is
@@ -121,13 +127,15 @@ class SIRIUS_FFI_EXPORT Context {
   /// returned snapshot stays valid and unchanged after a later replacement.
   [[nodiscard]] std::shared_ptr<ObjectStoreConfig> object_store_config() const;
 
-  /// The published snapshot that would serve `uri`: the one with the longest `uri_prefix` the
-  /// URI starts with (scheme compared case-insensitively, the rest byte-exact; the default scope
-  /// matches any URI — which schemes a route supports is decided by the route), or nullptr when
-  /// none matches. Administrative observation only: executions resolve against the set they
-  /// captured when their binding began. Thread-safe.
-  /// @throws std::runtime_error (`object_store_scope:`) when the selected non-default scope
-  /// cannot serve the key: an empty, `.` or `..` segment or a `%` byte.
+  /// The published snapshot that would serve `uri`: after the key gate below, the one with the
+  /// longest `uri_prefix` the URI starts with (scheme compared case-insensitively, the rest
+  /// byte-exact; the default scope matches any remaining URI — which schemes a route supports is
+  /// decided by the route), or nullptr when nothing is published or no scope matches.
+  /// Administrative observation only: executions resolve against the set they captured when
+  /// their binding began. Thread-safe.
+  /// @throws std::runtime_error (`object_store_scope:`) when at least one snapshot is published
+  /// and the key cannot be matched byte-for-byte (an empty key, an empty, `.` or `..` segment, or
+  /// a raw `%` byte) — checked before any scope is selected, default scope included.
   [[nodiscard]] std::shared_ptr<ObjectStoreConfig> object_store_config_for(
     std::string_view uri) const;
 
