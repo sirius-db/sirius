@@ -480,6 +480,9 @@ class parsed_sirius_config {
   [[nodiscard]] const telemetry_config& get_telemetry_config() const noexcept;
   [[nodiscard]] const operator_params& get_operator_params() const noexcept;
   [[nodiscard]] const compression_config& get_compression_config() const noexcept;
+  /// The scan-manager settings as parsed (backend selection, REST tuning, cache). Lets an
+  /// embedder check backend-dependent options before the engine is brought up.
+  [[nodiscard]] const scan_manager::scan_manager_config& get_scan_manager_config() const noexcept;
   [[nodiscard]] sirius_config resolve(
     const cucascade::memory::system_topology_info& topology) const;
 

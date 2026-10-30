@@ -773,6 +773,11 @@ const telemetry_config& parsed_sirius_config::get_telemetry_config() const noexc
 {
   return impl_->settings.get_telemetry_config();
 }
+const scan_manager::scan_manager_config& parsed_sirius_config::get_scan_manager_config()
+  const noexcept
+{
+  return impl_->settings.get_scan_manager_config();
+}
 
 namespace {
 // Compatibility for internal callers explicitly requesting a resolved configuration.

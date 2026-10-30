@@ -1,0 +1,4 @@
+sirius:
+  executor:
+    scan_manager:
+      object_store: {}
