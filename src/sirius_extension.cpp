@@ -18,6 +18,7 @@
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/open_file_info.hpp"
 #include "duckdb/main/database.hpp"
+#include "exchange/exchange_runtime.hpp"
 #include "expression_evaluator/expression_evaluator_strategy.hpp"
 #include "telemetry/nvtx.hpp"
 
@@ -2686,6 +2687,13 @@ static void SetExchangePeers(ClientContext& context, SetScope scope, Value& para
   get_operator_params(context, scope)->exchange_peers = std::move(peers);
 }
 
+static void SetExchangeHostStaging(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto value = StringValue::Get(parameter);
+  static_cast<void>(sirius::exchange::parse_host_staging(value));
+  get_operator_params(context, scope)->exchange_host_staging = std::move(value);
+}
+
 static void SetExchangeRank(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params          = get_operator_params(context, scope);
@@ -3531,6 +3539,14 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                             LogicalType::UBIGINT,
                             Value::UBIGINT(0),
                             SetExchangeRank);
+  config.AddExtensionOption(
+    "sirius_exchange_host_staging",
+    "Distributed execution: auto, always or never send the exchange's writes to a peer through "
+    "its pinned host mirror instead of NIXL; auto does so where GPUs lack peer access. Set "
+    "before sirius_exchange_rank, which connects",
+    LogicalType::VARCHAR,
+    Value("auto"),
+    SetExchangeHostStaging);
 
   config.AddExtensionOption("hash_partition_bytes",
                             "Target size in bytes per hash partition",

@@ -1346,9 +1346,11 @@ std::shared_ptr<sirius::exchange::exchange_service> SiriusContext::get_exchange_
 {
   std::lock_guard lock{exchange_mutex_};
   if (exchange_service_) {
-    if (params.exchange_peers != exchange_peers_ || params.exchange_rank != exchange_rank_) {
+    if (params.exchange_peers != exchange_peers_ || params.exchange_rank != exchange_rank_ ||
+        params.exchange_host_staging != exchange_host_staging_) {
       throw sirius::invalid_input_exception(
-        "sirius_exchange_peers and sirius_exchange_rank cannot change once connected");
+        "sirius_exchange_peers, sirius_exchange_rank and sirius_exchange_host_staging cannot "
+        "change once connected");
     }
     return exchange_service_;
   }
@@ -1359,10 +1361,13 @@ std::shared_ptr<sirius::exchange::exchange_service> SiriusContext::get_exchange_
   auto& memory = get_memory_manager();
   auto* gpu    = memory.get_memory_space(cucascade::memory::Tier::GPU, 0);
   auto* host   = memory.get_memory_space(cucascade::memory::Tier::HOST, 0);
-  exchange_service_ =
-    sirius::exchange::make_nixl_exchange(params.exchange_rank, params.exchange_peers, *gpu, host);
-  exchange_peers_ = params.exchange_peers;
-  exchange_rank_  = params.exchange_rank;
+  sirius::exchange::nixl_exchange_options opts;
+  opts.staging      = sirius::exchange::parse_host_staging(params.exchange_host_staging);
+  exchange_service_ = sirius::exchange::make_nixl_exchange(
+    params.exchange_rank, params.exchange_peers, *gpu, host, opts);
+  exchange_peers_        = params.exchange_peers;
+  exchange_rank_         = params.exchange_rank;
+  exchange_host_staging_ = params.exchange_host_staging;
   return exchange_service_;
 }
 

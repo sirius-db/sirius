@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace cucascade::memory {
@@ -32,6 +33,14 @@ namespace sirius::exchange {
 
 class exchange_service;
 
+/// Whether writes to a peer go through its pinned host mirror instead of NIXL. automatic: only to
+/// peers whose GPU lacks peer access to this one (NVML).
+enum class host_staging { automatic, always, never };
+
+/// "auto", "always" or "never", as the sirius_exchange_host_staging setting takes it.
+/// @throws sirius::invalid_input_exception on any other value.
+[[nodiscard]] host_staging parse_host_staging(std::string_view value);
+
 /// Ring sizing: @p send_frames staging frames shared by all peers, and @p recv_frames_per_peer
 /// frames (credits) for each peer, each @p frame_bytes, a positive multiple of 256. 8 MiB frames
 /// keep NIXL writes large enough to reach link bandwidth. The sizing is fixed until credits are
@@ -40,6 +49,7 @@ struct nixl_exchange_options {
   std::size_t frame_bytes            = std::size_t{8} * 1024 * 1024;  // 8 MiB
   std::uint32_t send_frames          = 16;
   std::uint32_t recv_frames_per_peer = 8;
+  host_staging staging               = host_staging::automatic;
 };
 
 /**
@@ -50,8 +60,7 @@ struct nixl_exchange_options {
  * so they outlive every plan that still holds it.
  *
  * @param peers "host:port" of every rank's listener, indexed by rank.
- * @throws sirius::invalid_input_exception when Sirius was built without SIRIUS_WITH_NIXL, or
- *         SIRIUS_EXCHANGE_HOST_STAGING has an unknown value.
+ * @throws sirius::invalid_input_exception when Sirius was built without SIRIUS_WITH_NIXL.
  * @throws sirius::internal_exception when NIXL fails or a peer is not reached within two minutes.
  */
 [[nodiscard]] std::shared_ptr<exchange_service> make_nixl_exchange(

@@ -311,17 +311,6 @@ nixl_fabric::nixl_fabric(config cfg, frame_ring& send, frame_ring& recv)
   std::move(release_on_throw).Cancel();
 }
 
-nixl_fabric::host_staging nixl_fabric::staging_from_env()
-{
-  char const* value = std::getenv("SIRIUS_EXCHANGE_HOST_STAGING");
-  std::string_view const v{value != nullptr ? value : ""};
-  if (v.empty() || v == "auto") { return host_staging::automatic; }
-  if (v == "always") { return host_staging::always; }
-  if (v == "never") { return host_staging::never; }
-  throw sirius::invalid_input_exception(
-    "SIRIUS_EXCHANGE_HOST_STAGING must be auto, always or never, not '{}'", v);
-}
-
 void nixl_fabric::map_mirror(rank_t r)
 {
   auto& p = _peers[r];

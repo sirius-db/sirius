@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "exchange/exchange_runtime.hpp"
 #include "exchange/fabric.hpp"
 
 #include <chrono>
@@ -54,18 +55,13 @@ namespace sirius::exchange {
  */
 class nixl_fabric : public fabric {
  public:
-  enum class host_staging { automatic, always, never };
-
-  /// SIRIUS_EXCHANGE_HOST_STAGING: auto (or unset), always or never.
-  /// @throws sirius::invalid_input_exception on any other value.
-  [[nodiscard]] static host_staging staging_from_env();
+  using host_staging = exchange::host_staging;
 
   struct config {
     rank_t rank{0};
     /// "host:port" of every rank's listener, indexed by rank; its size is the world size.
     std::vector<std::string> peers;
     std::chrono::milliseconds connect_timeout{std::chrono::minutes{2}};
-    /// automatic: host-stage writes to peers whose GPU lacks peer access to this one (NVML).
     host_staging staging{host_staging::automatic};
   };
 
