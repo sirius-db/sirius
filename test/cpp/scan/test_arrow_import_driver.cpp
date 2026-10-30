@@ -18,6 +18,7 @@
 #include "data/data_batch_utils.hpp"
 #include "helper/type_conversions.hpp"
 #include "op/scan/arrow/arrow_import_ingestible.hpp"
+#include "op/scan/detail/read_retirement.hpp"
 #include "operator/operator_test_utils.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "scan_manager/preparation_fixture.hpp"
@@ -160,10 +161,11 @@ struct harness {
   std::shared_ptr<void const> identity             = std::make_shared<int>(4);
   std::unique_ptr<arrow_import_ingestible> driver;
   harness(std::shared_ptr<arrow_batch_producer> producer,
-          materialization_program program = integer_program(),
-          bool empty_source               = true)
+          materialization_program program    = integer_program(),
+          bool empty_source                  = true,
+          sm::reservation_provider* external = nullptr)
   {
-    auto unique   = std::make_unique<sm::preparation_ledger>(backing);
+    auto unique   = std::make_unique<sm::preparation_ledger>(external ? *external : backing);
     auto envelope = producer->limits().envelope;
     backing.grant_bytes =
       std::accumulate(envelope.temporary.begin(), envelope.temporary.end(), envelope.retained);
@@ -1151,4 +1153,48 @@ TEST_CASE("Arrow outputs survive input retirement through task success and sink 
   // Destruction may enqueue frees. Keep the caller's allocator and stream alive for that
   // completion.
   REQUIRE(cudaStreamSynchronize(stream.value()) == cudaSuccess);
+}
+
+TEST_CASE("Arrow failed completion retains real backing and its caller resource owner",
+          "[arrow_driver][arrow_ownership][arrow_failed_completion]")
+{
+  auto import_throws = GENERATE(false, true);
+  struct caller_resources {
+    decltype(sirius::test::operator_utils::initialize_memory_manager()) manager =
+      sirius::test::operator_utils::initialize_memory_manager();
+    rmm::cuda_stream stream;
+  };
+  auto caller                              = std::make_shared<caller_resources>();
+  std::weak_ptr<caller_resources> lifetime = caller;
+  auto* space = caller->manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  auto* allocator =
+    space->get_memory_resource_as<cucascade::memory::reservation_aware_resource_adaptor>();
+  REQUIRE(allocator);
+  auto baseline = allocator->get_total_allocated_bytes();
+  {
+    auto provider = std::make_unique<sm::host_reservation_provider>(*caller->manager, caller);
+    auto producer = std::make_shared<pull_producer>();
+    if (import_throws) producer->on_normalize = [] { throw std::runtime_error("staging failure"); };
+    auto h     = std::make_unique<harness>(producer, integer_program(), true, provider.get());
+    auto input = h->next();
+    // Reuse the scan retirement fault seam. It reports a failed join only after
+    // real completion, so the test can eventually destroy retained resources safely.
+    sirius::op::scan::detail::read_retirement_test_hooks hooks(std::nullopt, true);
+    CHECK_THROWS_AS(h->driver->materialize_metadata_to_table(*input, *space, caller->stream),
+                    sirius::unjoined_gpu_work);
+    REQUIRE(hooks.retained.has_value());
+    input.reset();
+    h->driver->stop_preparation();
+    CHECK(h->ledger->permits_in_flight() == 1);
+    CHECK(h->profiles->counters->arrow_batches_imported == 0);
+    if (!import_throws) CHECK(allocator->get_total_allocated_bytes() > baseline);
+    h.reset();
+    producer.reset();
+    provider.reset();
+    caller.reset();
+    CHECK_FALSE(lifetime.expired());
+    // The retained import now owns the only path to the caller's allocator and stream.
+    // Its table is destroyed before the retirement lane's final barrier and input owner.
+  }
+  CHECK(lifetime.expired());
 }
