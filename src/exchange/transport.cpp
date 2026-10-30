@@ -152,6 +152,8 @@ struct transport::engine {
     bool asked_for_room{false};
   };
   std::map<landing_key, landing> landings;
+  /// Landings that found no room are retried no sooner than this.
+  clock::time_point next_land_try{};
 
   struct copy_out {
     cudaEvent_t copied;
@@ -317,8 +319,18 @@ struct transport::engine {
   bool receive()
   {
     bool progress = false;
-    for (auto& [key, l] : landings) {
-      if (!l.in && try_land(key, l)) { progress = true; }
+    if (auto const now = clock::now(); now >= next_land_try) {
+      bool no_room = false;
+      for (auto& [key, l] : landings) {
+        if (l.in || !l.header || l.waiting.empty()) { continue; }
+        if (try_land(key, l)) {
+          progress = true;
+        } else {
+          no_room = true;
+        }
+      }
+      // Room appears as other work frees memory, not within microseconds.
+      if (no_room) { next_land_try = now + std::chrono::milliseconds{1}; }
     }
     while (!copies.empty() && events.done(copies.front().copied)) {
       auto const c = copies.front();
