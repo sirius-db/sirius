@@ -106,40 +106,14 @@ std::vector<int> compute_admission_gpu_ids(const op::sirius_physical_operator& p
   return gpu_ids;
 }
 
-std::shared_ptr<const telemetry::telemetry_context> get_telemetry_context_from_client_context(
-  duckdb::ClientContext& context)
-{
-  if (not context.registered_state) {
-    throw invalid_input_exception("Sirius context is not registered.");
-  }
-
-  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  if (not sirius_ctx or not sirius_ctx->is_initialized()) {
-    throw invalid_input_exception("Sirius context is not initialized.");
-  }
-
-  return sirius_ctx->get_telemetry_context();
-}
-
 }  // namespace
 
 sirius_engine::sirius_engine(duckdb::ClientContext& context,
                              sirius::query_id_t query_id,
-                             const std::optional<std::string>& query_label,
-                             const std::optional<std::string>& session_label)
-  : context(context),
-    query_id_(query_id),
-    telemetry_context_(get_telemetry_context_from_client_context(this->context)),
-    query_handle_(telemetry_context_->context()
-                    .query_observer()
-                    ->handle()
-                    .init({
-                      .instance_name  = query_label.value_or("unnamed_query"),
-                      .query_group_id = quent::query_group::QueryGroupId(
-                        telemetry_context_->query_group_id_for(session_label)),
-                    })
-                    .into_dynamic())
+                             telemetry::query_observer observer)
+  : context(context), query_id_(query_id), observer_(std::move(observer))
 {
+  D_ASSERT(observer_.shared_context());
 }
 
 sirius_engine::~sirius_engine()
@@ -159,11 +133,7 @@ sirius_engine::~sirius_engine()
       runtime->mark_runtime_unavailable();
     }
   }
-  try {
-    query_handle_.finished();
-  } catch (std::exception const& e) {
-    SIRIUS_LOG_ERROR("query telemetry finish failed: {}", e.what());
-  }
+  observer_.finish();
 }
 
 void sirius_engine::quiesce_plan_users()
@@ -244,7 +214,7 @@ void sirius_engine::initialize(duckdb::unique_ptr<op::sirius_physical_operator> 
 void sirius_engine::execute()
 {
   nvtx_scoped_range nvtx_range{"sirius::query"};
-  query_handle_.executing();
+  observer_.executing();
 
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (sirius_ctx == nullptr) {
@@ -254,7 +224,7 @@ void sirius_engine::execute()
   // Quent mints its own UUID for the query and its Init struct takes no caller-supplied id, so
   // telemetry stays UUID-native while the engine uses the numeric window id. Emit the mapping
   // once so log lines (keyed by query id) and telemetry (keyed by UUID) can be joined.
-  auto const telemetry_uuid = query_handle_.id().raw();
+  auto const telemetry_uuid = observer_.uuid().value();
   SIRIUS_LOG_INFO("query {} telemetry_query={:016x}{:016x}",
                   query_id_,
                   telemetry_uuid.high_bits,
@@ -278,8 +248,8 @@ void sirius_engine::execute()
                                       completion_handler_,
                                       telemetry::query_telemetry_info{
                                         .telemetry_query_id = telemetry_uuid,
-                                        .worker_id          = telemetry_context_->worker_id().raw(),
-                                        .query_id           = query_id_,
+                                        .worker_id = observer_.shared_context()->worker_id().raw(),
+                                        .query_id  = query_id_,
                                       },
                                       [&client = context] { return client.IsInterrupted(); });
     sirius_ctx->get_task_scheduler().start_query(*query_);
@@ -342,7 +312,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
       "and review extension loading logs for errors.");
   }
 
-  query_handle_.planning();
+  observer_.planning();
 
   sirius_physical_plan = &plan;
 

@@ -332,8 +332,9 @@ void streaming_fragment::run()
         "streaming_fragment: a table was pinned or unpinned between build() and run(); "
         "create a new fragment");
     }
+    telemetry::query_observer observer(sirius_ctx.get_telemetry_context(), kFragmentQueryLabel);
     _engine =
-      std::make_unique<sirius::sirius_engine>(_context, window->query_id(), kFragmentQueryLabel);
+      std::make_unique<sirius::sirius_engine>(_context, window->query_id(), std::move(observer));
     _engine->initialize(std::move(_plan_root));
     _engine->execute();
     if (is_result()) { _result = _engine->get_result(); }

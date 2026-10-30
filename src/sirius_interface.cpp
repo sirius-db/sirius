@@ -99,8 +99,17 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_interface::sirius_execute_query(
     duckdb::identifier_map_t<duckdb::BoundParameterData> empty_parameters;
     prepared.prepared->Bind(context, empty_parameters);
 
+    if (!context.registered_state) {
+      throw invalid_input_exception("Sirius context is not registered.");
+    }
+    auto runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    if (!runtime || !runtime->is_initialized()) {
+      throw invalid_input_exception("Sirius context is not initialized.");
+    }
+    telemetry::query_observer observer(
+      runtime->get_telemetry_context(), query_label, session_label);
     sirius_active_query->engine =
-      duckdb::make_uniq<sirius_engine>(context, query_id, query_label, session_label);
+      duckdb::make_uniq<sirius_engine>(context, query_id, std::move(observer));
     auto& engine = *sirius_active_query->engine;
     auto collector =
       duckdb::make_uniq<op::sirius_physical_materialized_collector>(prepared, context);

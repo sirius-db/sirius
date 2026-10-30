@@ -20,6 +20,7 @@
 #include "sirius_config.hpp"
 #include "sirius_extension.hpp"
 #include "telemetry/nvtx_injection.hpp"
+#include "telemetry/query_observer.hpp"
 #include "telemetry/telemetry_context.hpp"
 #include "utils/child_process_environment.hpp"
 #include "utils/sirius_test_env.hpp"
@@ -28,6 +29,7 @@
 #include <spawn.h>
 #include <sys/wait.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <csignal>
@@ -36,9 +38,12 @@
 #include <fstream>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 using namespace sirius;
@@ -314,4 +319,180 @@ TEST_CASE("telemetry_context nests threads under per-GPU device groups",
   REQUIRE(any_line_with_all(lines, {"gpu_pipeline-task-queue", gpu0_id}));
 
   std::filesystem::remove_all(out_dir);
+}
+
+TEST_CASE("query observer completes once at the existing lifecycle boundary",
+          "[query_observer][telemetry_context]")
+{
+  auto const phase = GENERATE(0, 1, 2);
+  CAPTURE(phase);
+  auto const output = std::filesystem::temp_directory_path() /
+                      ("sirius_query_observer_" + std::to_string(::getpid()));
+  std::filesystem::remove_all(output);
+  telemetry_config config;
+  config.enable_quent     = true;
+  config.output_directory = output.string();
+  std::string id;
+  {
+    auto context = telemetry_context::create(make_quent_context(config), config);
+    query_observer observer(context, "observer-test", "session-test");
+    id = uuid_str(observer.uuid().value());
+    // The observer keeps the exporter alive after its creator releases it.
+    context.reset();
+    if (phase >= 1) { observer.planning(); }
+    if (phase >= 2) { observer.executing(); }
+    observer.finish();
+    observer.finish();
+  }
+  auto const lines = read_all_telemetry_lines(output, "Query");
+  REQUIRE(lines.size() == static_cast<size_t>(phase + 2));
+  REQUIRE(any_line_with_all(lines, {id, "observer-test"}));
+  // Exporter order is producer order: Init, optional Planning/Executing, Finished.
+  REQUIRE(lines.front().find("Init") != std::string::npos);
+  if (phase >= 1) { REQUIRE(lines[1].find("Planning") != std::string::npos); }
+  if (phase >= 2) { REQUIRE(lines[2].find("Executing") != std::string::npos); }
+  REQUIRE(lines.back().find("Finished") != std::string::npos);
+  std::filesystem::remove_all(output);
+}
+
+TEST_CASE("query observer closes partial initialization on unwind",
+          "[query_observer][telemetry_context]")
+{
+  auto const output = std::filesystem::temp_directory_path() /
+                      ("sirius_query_observer_unwind_" + std::to_string(::getpid()));
+  std::filesystem::remove_all(output);
+  telemetry_config config;
+  config.enable_quent     = true;
+  config.output_directory = output.string();
+  {
+    auto context = telemetry_context::create(make_quent_context(config), config);
+    REQUIRE_THROWS_AS(
+      [&] {
+        query_observer observer(context);
+        observer.planning();
+        throw std::runtime_error("original initialization failure");
+      }(),
+      std::runtime_error);
+  }
+  auto const lines = read_all_telemetry_lines(output, "Query");
+  REQUIRE(lines.size() == 3);
+  REQUIRE(lines.back().find("Finished") != std::string::npos);
+  std::filesystem::remove_all(output);
+}
+
+TEST_CASE("query observer requires a telemetry context", "[query_observer]")
+{
+  REQUIRE_THROWS_AS(query_observer(nullptr), std::invalid_argument);
+}
+
+TEST_CASE("query observer with disabled exporting retains a valid context and identity",
+          "[query_observer][telemetry_context]")
+{
+  auto const output = std::filesystem::temp_directory_path() /
+                      ("sirius_query_observer_disabled_" + std::to_string(::getpid()));
+  std::filesystem::remove_all(output);
+  telemetry_config config;
+  config.enable_quent     = false;
+  config.output_directory = output.string();
+  {
+    auto context = telemetry_context::create(make_quent_context(config), config);
+    query_observer observer(context);
+    auto const id = uuid_str(observer.uuid().value());
+    query_observer moved(std::move(observer));
+    // Reassigning a moved-from observer restores its ownership.
+    observer = std::move(moved);
+    REQUIRE(observer.shared_context() == context);
+    REQUIRE(uuid_str(observer.uuid().value()) == id);
+    REQUIRE_NOTHROW(observer.planning());
+    REQUIRE_NOTHROW(observer.executing());
+    observer.finish();
+    observer.finish();
+  }
+  REQUIRE_FALSE(std::filesystem::exists(output));
+}
+
+static_assert(!std::is_copy_constructible_v<query_observer>);
+static_assert(!std::is_copy_assignable_v<query_observer>);
+static_assert(std::is_nothrow_move_constructible_v<query_observer>);
+static_assert(std::is_nothrow_move_assignable_v<query_observer>);
+
+TEST_CASE("moving a query observer transfers identity and completion responsibility",
+          "[query_observer][telemetry_context]")
+{
+  auto const phase = GENERATE(0, 1, 2, 3);
+  CAPTURE(phase);
+  auto const output = std::filesystem::temp_directory_path() /
+                      ("sirius_query_observer_move_" + std::to_string(::getpid()));
+  std::filesystem::remove_all(output);
+  telemetry_config config;
+  config.enable_quent     = true;
+  config.output_directory = output.string();
+  std::string id;
+  std::optional<query_observer> destination;
+  {
+    auto context = telemetry_context::create(make_quent_context(config), config);
+    query_observer source(context);
+    id = uuid_str(source.uuid().value());
+    if (phase >= 1) { source.planning(); }
+    if (phase >= 2) { source.executing(); }
+    if (phase >= 3) { source.finish(); }
+    destination.emplace(std::move(source));
+    REQUIRE(uuid_str(destination->uuid().value()) == id);
+    REQUIRE(destination->shared_context() == context);
+    REQUIRE_FALSE(source.uuid());
+    REQUIRE_FALSE(source.shared_context());
+    context.reset();
+  }
+  // The source has been destroyed, and only the destination retains the exporter.
+  destination->finish();
+  destination.reset();
+  auto const lines = read_all_telemetry_lines(output, "Query");
+  REQUIRE(lines.size() == static_cast<size_t>(std::min(phase, 2) + 2));
+  for (auto const& line : lines) {
+    REQUIRE(line.find(id) != std::string::npos);
+  }
+  REQUIRE(lines.back().find("Finished") != std::string::npos);
+  std::filesystem::remove_all(output);
+}
+
+TEST_CASE("move assignment completes the replaced query and transfers the source",
+          "[query_observer][telemetry_context]")
+{
+  auto const output = std::filesystem::temp_directory_path() /
+                      ("sirius_query_observer_assign_" + std::to_string(::getpid()));
+  std::filesystem::remove_all(output);
+  telemetry_config config;
+  config.enable_quent     = true;
+  config.output_directory = output.string();
+  std::string replaced_id, transferred_id;
+  {
+    auto context = telemetry_context::create(make_quent_context(config), config);
+    query_observer target(context);
+    target.planning();
+    replaced_id = uuid_str(target.uuid().value());
+    query_observer source(context);
+    source.planning();
+    transferred_id = uuid_str(source.uuid().value());
+    target         = std::move(source);
+    REQUIRE_FALSE(source.uuid());
+    REQUIRE_FALSE(source.shared_context());
+    // Self-move must retain the query and its completion responsibility.
+    auto& same = target;
+    target     = std::move(same);
+    REQUIRE(uuid_str(target.uuid().value()) == transferred_id);
+    REQUIRE(target.shared_context() == context);
+    target.executing();
+  }
+  auto const lines  = read_all_telemetry_lines(output, "Query");
+  auto count_events = [&](const std::string& id, std::string_view event) {
+    return std::count_if(lines.begin(), lines.end(), [&](auto const& line) {
+      return line.find(id) != std::string::npos && line.find(event) != std::string::npos;
+    });
+  };
+  REQUIRE(lines.size() == 7);
+  REQUIRE(count_events(replaced_id, "Planning") == 1);
+  REQUIRE(count_events(replaced_id, "Finished") == 1);
+  REQUIRE(count_events(transferred_id, "Executing") == 1);
+  REQUIRE(count_events(transferred_id, "Finished") == 1);
+  std::filesystem::remove_all(output);
 }
