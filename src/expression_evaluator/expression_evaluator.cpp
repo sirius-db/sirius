@@ -343,8 +343,10 @@ expression_evaluator::try_evaluate_nvrtc_with_boundaries(
 {
   if (expressions.empty()) { return std::nullopt; }
   if (nvrtc::can_compile_project_sink(expressions, _input_table)) {
-    return nvrtc::evaluate_project_sink(
-      expressions, _input_table, _stream, _mr, &_narrow_domain_comparison_count);
+    auto result =
+      nvrtc::evaluate_project_sink(expressions, _input_table, _stream, _mr, nvrtc_sink_options());
+    _narrow_domain_comparison_count += result.narrow_domain_comparison_count;
+    return std::move(result.table);
   }
 
   auto state = evaluate_materialization_boundaries(expressions);
@@ -354,12 +356,16 @@ expression_evaluator::try_evaluate_nvrtc_with_boundaries(
   if (!nvrtc::can_compile_project_sink(expressions, combined_table, &state->boundary_map)) {
     return std::nullopt;
   }
-  return nvrtc::evaluate_project_sink(expressions,
-                                      combined_table,
-                                      _stream,
-                                      _mr,
-                                      &_narrow_domain_comparison_count,
-                                      &state->boundary_map);
+  auto result = nvrtc::evaluate_project_sink(
+    expressions, combined_table, _stream, _mr, nvrtc_sink_options(&state->boundary_map));
+  _narrow_domain_comparison_count += result.narrow_domain_comparison_count;
+  return std::move(result.table);
+}
+
+nvrtc::sink_options expression_evaluator::nvrtc_sink_options(
+  nvrtc::boundary_column_map const* boundary_map) const noexcept
+{
+  return nvrtc::sink_options{boundary_map, _like_swar_fastpath, _like_cache.get()};
 }
 
 std::unique_ptr<cudf::table> expression_evaluator::evaluate(cudf::table_view input)
@@ -395,6 +401,7 @@ std::unique_ptr<cudf::table> expression_evaluator::evaluate(cudf::table_view inp
     }
   }
 
+  //===----------NVRTC_JIT mode----------===//
   if (_policy.strategy == expression_evaluator_strategy::NVRTC_JIT) {
     if (auto table = try_evaluate_nvrtc_with_boundaries(_ast_expressions)) {
       _temp_scalars.clear();
@@ -467,18 +474,18 @@ std::optional<std::unique_ptr<cudf::table>> expression_evaluator::try_select_nvr
   _temp_columns.clear();
   _input_table = input;
 
-  auto const* pred = _ast_expressions[0];
-  if (nvrtc::can_compile_filter_sink(*pred, _input_table)) {
-    auto out = nvrtc::evaluate_filter_sink(*pred,
-                                           _input_table,
-                                           projected_input,
-                                           _stream,
-                                           _mr,
-                                           out_survivors,
-                                           &_narrow_domain_comparison_count);
+  auto const* pred  = _ast_expressions[0];
+  auto const finish = [&](nvrtc::filter_sink_result result) {
+    _narrow_domain_comparison_count += result.narrow_domain_comparison_count;
+    if (out_survivors != nullptr) { *out_survivors = std::move(result.survivors); }
     _temp_scalars.clear();
     _temp_columns.clear();
-    return out;
+    return std::move(result.table);
+  };
+  bool const want_survivors = out_survivors != nullptr;
+  if (nvrtc::can_compile_filter_sink(*pred, _input_table)) {
+    return finish(nvrtc::evaluate_filter_sink(
+      *pred, _input_table, projected_input, want_survivors, _stream, _mr, nvrtc_sink_options()));
   }
 
   std::array<sirius::ast::node const*, 1> const pred_span{pred};
@@ -489,17 +496,13 @@ std::optional<std::unique_ptr<cudf::table>> expression_evaluator::try_select_nvr
   if (!nvrtc::can_compile_filter_sink(*pred, combined_table, &state->boundary_map)) {
     return std::nullopt;
   }
-  auto out = nvrtc::evaluate_filter_sink(*pred,
-                                         combined_table,
-                                         projected_input,
-                                         _stream,
-                                         _mr,
-                                         out_survivors,
-                                         &_narrow_domain_comparison_count,
-                                         &state->boundary_map);
-  _temp_scalars.clear();
-  _temp_columns.clear();
-  return out;
+  return finish(nvrtc::evaluate_filter_sink(*pred,
+                                            combined_table,
+                                            projected_input,
+                                            want_survivors,
+                                            _stream,
+                                            _mr,
+                                            nvrtc_sink_options(&state->boundary_map)));
 }
 
 std::unique_ptr<cudf::column> expression_evaluator::compute_mask(cudf::table_view input)

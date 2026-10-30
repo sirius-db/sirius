@@ -498,7 +498,30 @@ std::uint64_t checksum_table(cudf::table_view const& tv, rmm::cuda_stream_view s
   for (cudf::size_type c = 0; c < tv.num_columns(); ++c) {
     auto const col = tv.column(c);
     mix(static_cast<std::uint64_t>(col.null_count()));
-    if (col.type().id() == cudf::type_id::STRING || col.size() == 0) { continue; }
+    if (col.size() == 0) { continue; }
+    if (col.type().id() == cudf::type_id::STRING) {
+      // Strings: hash the row lengths, so a wrong gather of string rows fails verification.
+      cudf::strings_column_view const scv(col);
+      auto const offsets = scv.offsets();
+      std::vector<std::int64_t> host_offsets(static_cast<std::size_t>(col.size()) + 1);
+      if (offsets.type().id() == cudf::type_id::INT64) {
+        cudaMemcpy(host_offsets.data(),
+                   offsets.data<std::int64_t>() + col.offset(),
+                   host_offsets.size() * sizeof(std::int64_t),
+                   cudaMemcpyDeviceToHost);
+      } else {
+        std::vector<std::int32_t> narrow(host_offsets.size());
+        cudaMemcpy(narrow.data(),
+                   offsets.data<std::int32_t>() + col.offset(),
+                   narrow.size() * sizeof(std::int32_t),
+                   cudaMemcpyDeviceToHost);
+        std::copy(narrow.begin(), narrow.end(), host_offsets.begin());
+      }
+      for (std::size_t i = 0; i + 1 < host_offsets.size(); ++i) {
+        mix(static_cast<std::uint64_t>(host_offsets[i + 1] - host_offsets[i]));
+      }
+      continue;
+    }
     auto const width = cudf::size_of(col.type());
     std::vector<std::uint8_t> host(static_cast<std::size_t>(col.size()) * width);
     cudaMemcpyAsync(
@@ -580,7 +603,8 @@ measurement run_case(bench_case const& bc,
   {
     nvtx3::scoped_range cold_range{"cold"};
     // The process-wide kernel cache would otherwise serve a kernel compiled for an earlier case
-    // or row count with the same generated source.
+    // or row count with the same generated source. Safe here because run_once synchronizes the
+    // stream, so no launch from the previous case still uses a cached kernel.
     if (strategy == strategy_t::NVRTC_JIT) { codegen::jit::KernelCache::instance().clear(); }
     double const t0 = now_ms();
     auto out        = run_once();
@@ -663,7 +687,8 @@ TEST_CASE("bench expression evaluator strategies", "[!benchmark][expr_bench]")
     bool const exists = std::ifstream(csv_path).good();
     csv.open(csv_path, std::ios::app);
     if (!exists) {
-      csv << "case,kind,rows,strategy,cold_ms,median_ms,min_ms,gbps,rows_out,checksum,match\n";
+      csv
+        << "case,kind,rows,strategy,cold_ms,median_ms,min_ms,input_gbps,rows_out,checksum,match\n";
     }
   }
 
@@ -736,7 +761,7 @@ TEST_CASE("bench expression evaluator strategies", "[!benchmark][expr_bench]")
         double const gbps = (bytes_in / 1e9) / (m.median_ms / 1e3);
         std::printf(
           "[expr_bench] case=%-24s rows=%9d strategy=%-13s cold_ms=%9.3f med_ms=%8.3f min_ms=%8.3f "
-          "gbps=%7.1f rows_out=%9d chk=%016llx %s\n",
+          "input_gbps=%7.1f rows_out=%9d chk=%016llx %s\n",
           bc.name.c_str(),
           rows,
           strategy_name(strategy),

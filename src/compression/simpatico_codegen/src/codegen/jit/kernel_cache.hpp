@@ -5,6 +5,7 @@
 #include "jit/cache_identity.hpp"
 #include "nvrtc_compiler.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -27,8 +28,9 @@ void clear_jit_disk_cache();
  * @brief Deduplicates compiled kernels while sharing their ownership with callers.
  *
  * Returned handles keep the CUDA library loaded independently of cache membership. Callers must
- * retain a handle until every launch using it completes; `clear()` releases only cache ownership.
- * Cache operations are thread-safe.
+ * retain a handle until every launch using it completes; `clear()` releases only cache ownership
+ * and advances `generation()`, so a caller that memoizes handles can tell that its copies are no
+ * longer the cache's. Cache operations are thread-safe.
  */
 class KernelCache {
  public:
@@ -40,6 +42,8 @@ class KernelCache {
 
   std::size_t size() const;
   void clear();
+  // Number of clear() calls so far.
+  std::uint64_t generation() const noexcept;
 
   KernelCache(const KernelCache&)            = delete;
   KernelCache& operator=(const KernelCache&) = delete;
@@ -49,6 +53,7 @@ class KernelCache {
   ~KernelCache() = default;
 
   mutable std::mutex mu_;
+  std::atomic<std::uint64_t> generation_{0};
   std::unordered_map<detail::Digest, std::shared_ptr<const CompiledKernel>, detail::DigestHash>
     table_;
 };

@@ -258,9 +258,10 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::unary_op const& alt,
     sirius::ast::node temp_node{sirius::ast::unary_op{alt.op, sirius::ast::clone(*alt.child)}};
     std::array<sirius::ast::node const*, 1> exprs{&temp_node};
     if (nvrtc::can_compile_project_sink(exprs, _input_table)) {
-      auto table = nvrtc::evaluate_project_sink(
-        exprs, _input_table, _stream, _mr, &_narrow_domain_comparison_count);
-      auto col = std::move(table->release()[0]);
+      auto result =
+        nvrtc::evaluate_project_sink(exprs, _input_table, _stream, _mr, nvrtc_sink_options());
+      _narrow_domain_comparison_count += result.narrow_domain_comparison_count;
+      auto col = std::move(result.table->release()[0]);
       if (mode == evaluation_mode::AST) { return materialize_as_ast_column(std::move(col)); }
       return evaluate_result(std::move(col));
     }

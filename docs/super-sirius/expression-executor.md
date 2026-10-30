@@ -151,10 +151,14 @@ The evaluator supports four strategies, selected via `policy.strategy` in the `e
 
 ### NVRTC_JIT kernels
 
-**Files:** `src/expression_evaluator/nvrtc/` (`translation_context` emits per-row CUDA
-statements over `(value, valid, overflow)` Register Values; `nvrtc_project_sink.cpp` wraps them
-in the `ProjectSink` and `FilterSink` kernels). Design background is in
-[ADR 0001](../adr/0001-nvrtc-expression-and-pipeline-compilation.md).
+**Files:** `src/expression_evaluator/nvrtc/`. `supportability.cpp` decides what compiles;
+`translation_context.cpp` emits per-row CUDA statements over `(value, valid, overflow)` Register
+Values; `kernel_abi.cpp` derives both the kernel signature and the `cuLaunchKernel` argument
+array from one parameter table; `sink_launch.cpp` compiles, launches and reads status back;
+`project_sink.cpp` and `filter_sink.cpp` wrap the statements in the `ProjectSink` and
+`FilterSink` kernels. The device runtime the kernels are compiled behind lives in
+`device_runtime/*.cuh` (embedded at build time and also compiled by nvcc as a syntax check).
+Design background is in [ADR 0001](../adr/0001-nvrtc-expression-and-pipeline-compilation.md).
 
 - **Kernel shape.** Blocks of 256 threads process a tile of rows, each thread handling several
   rows strided by the block width (4 per thread for projections, 16 for filters) so loads and
@@ -167,8 +171,10 @@ in the `ProjectSink` and `FilterSink` kernels). Design background is in
   non-null: no mask is allocated and no null count is read back.
 - **Constants** travel as kernel parameters so one compiled kernel serves every literal value;
   only a constant's NULL-ness is baked into the source. Overflow and the null counts are read
-  back once per evaluation through a pinned staging slab (`copy_status_words_from_device`), which
-  is the one host synchronization of an evaluation.
+  back once per evaluation through a pinned staging slab (`read_status_words`), which is the one
+  host synchronization of an evaluation; a projection whose outputs are statically non-null and
+  cannot overflow does not synchronize at all. Binding a string column reads nothing from the
+  device: the end of its characters is derived in-kernel from `offsets[num_rows]`.
 - **Filters** compact survivors in a single pass for a one-tile batch, otherwise in three
   launches: the predicate kernel writes a survivor count per tile plus the per-warp ballot words,
   a one-block scan turns the counts into tile offsets, and a scatter kernel writes the surviving
@@ -176,7 +182,9 @@ in the `ProjectSink` and `FilterSink` kernels). Design background is in
   returned to late materialization).
 - **Strings** are `str_view{ptr, len, limit}` registers; `limit` bounds word-at-a-time loads.
   `%lit1%...%litN%` LIKE patterns and `contains` use a SWAR digram matcher (the literal
-  descriptor is a kernel parameter); other patterns use a byte-wise backtracking matcher.
+  descriptor is a kernel parameter) when the `like_swar_fastpath` setting is on, classified once
+  per query through the evaluator's shared LIKE cache and capped at eight descriptors per kernel;
+  other patterns use a byte-wise backtracking matcher.
 - **Compile time.** The device runtime preamble is self-contained (its own limits, traits,
   checked 128-bit arithmetic and civil-calendar helpers; no CCCL includes), because parsing
   `<cuda/std/chrono>` and `<cuda/numeric>` dominated every kernel compile. Compiled kernels are
@@ -276,7 +284,9 @@ the helpers do not depend on DuckDB types or a frontend identity.
 
 `cast_to_microseconds_checked()` converts second, millisecond, and nanosecond
 columns to microseconds. It checks finite values before multiplying, preserves
-infinity, and truncates nanoseconds toward zero. Overflow raises
+infinity, and rounds nanoseconds to the nearest microsecond with ties away from the
+epoch, as DuckDB's `TryCastTimestampBase` does for every precision decrease (the
+`NVRTC_JIT` kernels apply the same rule to every fine-to-coarse timestamp cast). Overflow raises
 `sirius::invalid_input_exception`; reading the overflow result synchronizes the
 supplied stream. The cast evaluator dispatches to this helper for semantic casts.
 

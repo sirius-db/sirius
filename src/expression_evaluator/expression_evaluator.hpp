@@ -21,6 +21,7 @@
 #include <expression/ast/node.hpp>  // sirius::ast::node + 11 alternative types
 #include <expression_evaluator/expression_evaluator_strategy.hpp>
 #include <expression_evaluator/like_multiliteral.hpp>
+#include <expression_evaluator/nvrtc/nvrtc_project_sink.hpp>
 
 // cudf
 #include <cudf/ast/expressions.hpp>
@@ -471,6 +472,10 @@ class expression_evaluator {
   // std::nullopt if no boundaries exist.
   [[nodiscard]] std::optional<materialized_boundary_state> evaluate_materialization_boundaries(
     std::span<sirius::ast::node const* const> expressions);
+
+  // The boundary map and this evaluator's LIKE policy, as the NVRTC_JIT sinks take them.
+  [[nodiscard]] nvrtc::sink_options nvrtc_sink_options(
+    nvrtc::boundary_column_map const* boundary_map = nullptr) const noexcept;
 
   // Attempt to evaluate a batch of fixed-width expressions via a single fused NVRTC_JIT kernel,
   // pre-evaluating any in-tree Materialization Boundaries into synthetic input columns.

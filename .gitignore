@@ -32,6 +32,8 @@ cufile.log
 # pixi environments
 .pixi/*
 !.pixi/config.toml
+# Local symlink so clangd can see the pixi CUDA toolkit. Recreated at configure.
+tools/clangd/cuda-toolkit
 # Generated nightly environment
 envs/
 compile_commands.json

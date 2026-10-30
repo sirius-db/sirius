@@ -27,6 +27,7 @@
 // cudf
 #include <cudf/column/column_factories.hpp>
 #include <cudf/cudf_utils.hpp>
+#include <cudf/round.hpp>
 #include <cudf/unary.hpp>
 
 // standard library
@@ -106,6 +107,12 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::cast const& alt, eva
              return_type.id() == cudf::type_id::TIMESTAMP_MICROSECONDS) {
     // Carrier restores were handled above; only semantic casts reach this branch.
     result_column = temporal::cast_to_microseconds_checked(input, _stream, _mr);
+  } else if (cudf::is_floating_point(input.type()) && cudf::is_integral(return_type) &&
+             !cudf::is_boolean(return_type)) {
+    // DuckDB rounds FLOAT/DOUBLE to the nearest integer (ties to even) before the range check;
+    // cudf::cast alone would truncate toward zero.
+    auto const rounded = cudf::round(input, 0, cudf::rounding_method::HALF_EVEN, _stream, _mr);
+    result_column      = cudf::cast(rounded->view(), return_type, _stream, _mr);
   } else {
     result_column = cudf::cast(input, return_type, _stream, _mr);
   }

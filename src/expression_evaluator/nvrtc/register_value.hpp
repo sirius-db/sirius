@@ -56,7 +56,10 @@ namespace sirius::nvrtc {
 
 /**
  * @brief Returns whether a cuDF data type can be held as a Register Value in GPU registers
- * (fixed-width types plus non-owning `str_view` slices for `STRING`).
+ *        (fixed-width types plus non-owning @c str_view slices for STRING).
+ *
+ * @param type The cuDF data type to check.
+ * @return True if the type can be held as a @c register_value, false otherwise.
  */
 [[nodiscard]] inline bool is_supported_register_type(cudf::data_type type) noexcept
 {
@@ -64,7 +67,41 @@ namespace sirius::nvrtc {
 }
 
 /**
+ * @brief Returns whether @p type is an integer or floating-point type (not BOOL8, DECIMAL, or
+ *        temporal).
+ */
+[[nodiscard]] inline bool is_integer_or_float(cudf::data_type type) noexcept
+{
+  switch (type.id()) {
+    case cudf::type_id::INT8:
+    case cudf::type_id::INT16:
+    case cudf::type_id::INT32:
+    case cudf::type_id::INT64:
+    case cudf::type_id::UINT8:
+    case cudf::type_id::UINT16:
+    case cudf::type_id::UINT32:
+    case cudf::type_id::UINT64:
+    case cudf::type_id::FLOAT32:
+    case cudf::type_id::FLOAT64: return true;
+    default: return false;
+  }
+}
+
+/**
+ * @brief Returns whether a reference carries no declared SQL type, so its column's physical type
+ *        is its type.
+ */
+[[nodiscard]] inline bool is_untyped_reference_type(sirius::logical_type const& type) noexcept
+{
+  return type.id() == sirius::type_id::INVALID || type.id() == sirius::type_id::SQLNULL;
+}
+
+/**
  * @brief Returns the CUDA C++ storage type name for a register-supported cuDF data type.
+ *
+ * @param type The cuDF data type to convert.
+ * @return The CUDA C++ storage type name for the type.
+ * @throws @c not_implemented_exception if the type is not supported.
  */
 [[nodiscard]] inline std::string cuda_type_name(cudf::data_type type)
 {
@@ -96,23 +133,18 @@ namespace sirius::nvrtc {
 }
 
 /**
- * @brief Compile-time descriptor of a per-row Register Value in generated CUDA device code.
+ * @brief Compile-time descriptor of a per-row @c register_value in generated CUDA device code.
  *
- * Each Register Value corresponds to a local `reg_val<T>` variable holding `(val, valid, overflow)`
- * in Thread-Private Registers for the current row, together with static guarantees used to elide
- * redundant null masks or overflow checks at the Sink Consumer.
+ * Each @c register_value corresponds to a local @c reg_val<T> variable holding (val, valid,
+ * overflow) in thread-private registers for the current row, together with static guarantees used
+ * to elide redundant null masks or overflow checks at the Sink Consumer.
  */
 struct register_value {
-  /** @brief Identifier of the local `reg_val<T>` variable in CUDA code. */
-  std::string var_name;
-  /** @brief Declared SQL logical type of the expression. */
-  sirius::logical_type sql_type;
-  /** @brief Physical cuDF type of the register payload. */
-  cudf::data_type device_type;
-  /** @brief True if `valid` is guaranteed true for all rows in batch. */
-  bool is_statically_non_null{false};
-  /** @brief True if `overflow` may become true on any valid row. */
-  bool can_overflow{false};
+  std::string var_name;         ///< Identifier of the local @c reg_val<T> variable in CUDA code.
+  cudf::data_type device_type;  ///< Physical cuDF type of the register payload.
+  bool is_statically_non_null{false};  ///< True if `valid` is guaranteed true for all rows in
+                                       ///< batch.
+  bool can_overflow{false};            ///< True if `overflow` may become true on any valid row.
 };
 
 }  // namespace sirius::nvrtc

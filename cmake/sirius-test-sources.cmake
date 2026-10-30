@@ -73,6 +73,7 @@ set(TEST_SOURCES
     test/cpp/expression_evaluator/test_expression_evaluator_ast_equivalence.cpp
     test/cpp/expression_evaluator/test_gpu_expression_translator.cpp
     test/cpp/expression_evaluator/test_like_multiliteral.cpp
+    test/cpp/expression_evaluator/test_nvrtc_translation.cpp
     test/cpp/expression_evaluator/test_round_floating_point.cpp
     test/cpp/expression_evaluator/test_nonduckdb_frontend_proof.cpp
     test/cpp/helper/test_cudf_utils.cpp

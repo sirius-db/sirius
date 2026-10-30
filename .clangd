@@ -12,13 +12,38 @@ If:
 
 ---
 
-# Apply a config conditionally to all CUDA files
+# Apply a config conditionally to all CUDA files.
+# nvcc flags in compile_commands.json are not a CUDA toolchain clang can use:
+# clang defaults to sm_52 (no libdevice in CUDA 13), does not read nvcc.profile
+# (so libcudf's prefix include is missing), and rejects nvcc's unannotated
+# specializations of __host__ __device__ templates. tools/clangd/cuda-toolkit is
+# a symlink root created by cmake/sirius-clangd-cuda.cmake. Paths are relative
+# to the compilation database directory (build/release).
 If:
-  PathMatch: .*\.cuh?
+  PathMatch: .*\.(cu|cuh)$
 CompileFlags:
   Add:
-    # Allow variadic CUDA functions
     - "-Xclang=-fcuda-allow-variadic-functions"
+    - "--cuda-path=../../tools/clangd/cuda-toolkit"
+    - "--cuda-gpu-arch=sm_80"
+    - "-Wno-unknown-cuda-version"
+    - "-foffload-implicit-host-device-templates"
+    - "-I../../.pixi/envs/default/include"
+    - "-I../../tools/clangd/cuda-compat"
+    - "-imacros../../tools/clangd/cuda-compat/nv_rsqrt_specifier.h"
+    - "-include../../tools/clangd/cuda-compat/cudf_type_mapping.h"
+
+---
+
+# Device-runtime fragments do not include their siblings; the umbrella header
+# includes them in order. Force that umbrella in front of an opened fragment so
+# clang sees the same preamble as device_runtime_check.cu. #pragma once makes the
+# second read of the fragment a no-op.
+If:
+  PathMatch: .*/expression_evaluator/nvrtc/device_runtime/.*\.cuh$
+CompileFlags:
+  Add:
+    - "-include../../src/expression_evaluator/nvrtc/device_runtime/device_runtime.cuh"
 
 ---
 
