@@ -33,6 +33,7 @@ SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 | [Streaming Fragments](streaming-fragments.md) | Building and running one fragment: `stream_bind_catalog`, `exec::streaming_fragment`, and the embedder API (`sirius::ffi::Context` plus `Fragment`) |
 | [Data Size Estimation](data-size-estimation.md) | Runtime projection of the total bytes that will reach an operator's input port |
 | [Configuration](configuration.md) | sirius_config, operator_params, SET variables |
+| [REST Redirect Policy](../io/rest-redirect-policy.md) | Admission, per-open publications, recovery, connection retention, records and replay qualification |
 | [Optimizations](optimizations.md) | Performance optimizations with PRs, code paths, configs |
 | [Compressed Pinning](compressed-pinning.md) | Simpatico-compressed pin_table on host/GPU tiers — which tier to compress on, plan selection vs the H2D link, GB300 SF1000 results |
 | [Compressed Materialization](compressed-materialization.md) | Value-preserving narrow integer and DECIMAL carriers, restoration boundaries, and pin-cache invariants |

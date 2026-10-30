@@ -273,13 +273,15 @@ std::shared_ptr<io_object> rest_ioctx::create_footer_probe_object(std::string pa
                                                              head.object_size,
                                                              std::move(head.etag)));
   }
-  return note_unqualified(std::make_shared<rest_io_object>(std::move(path),
-                                                           std::move(parsed.host),
-                                                           std::move(parsed.path),
-                                                           probe.object_size,
-                                                           probe.window_lo,
-                                                           probe.bytes,
-                                                           std::move(probe.etag)));
+  auto obj = std::make_shared<rest_io_object>(std::move(path),
+                                              std::move(parsed.host),
+                                              std::move(parsed.path),
+                                              probe.object_size,
+                                              probe.window_lo,
+                                              probe.bytes,
+                                              std::move(probe.etag));
+  _reactors.front()->seed_route(*obj, probe.delegated_route);
+  return note_unqualified(std::move(obj));
 }
 
 }  // namespace sirius::io::rest

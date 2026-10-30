@@ -224,6 +224,44 @@ static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
   r.optional("footer_probe_bytes", yaml::bytes(opt.footer_probe_bytes));
   r.optional("list_max_matches", opt.list_max_matches);
   r.optional("list_max_scanned", opt.list_max_scanned);
+  r.optional("request_log", opt.request_log);
+  if (auto n = r.optional_node("cluster_redirect")) {
+    yaml::reader cr(*n, "rest.cluster_redirect");
+    cr.optional("enabled", opt.cluster_redirect.enabled);
+    cr.optional("origin", opt.cluster_redirect.origin);
+    cr.optional("allowed_targets", opt.cluster_redirect.allowed_targets);
+    std::string retention;
+    cr.optional("retention", retention);
+    if (!retention.empty()) {
+      if (retention == "expanded") {
+        opt.cluster_redirect.retention = io::rest::redirect_retention::expanded;
+      } else if (retention == "legacy") {
+        opt.cluster_redirect.retention = io::rest::redirect_retention::legacy;
+      } else {
+        throw std::runtime_error("'rest.cluster_redirect.retention': invalid enum value '" +
+                                 retention + "' (expected expanded or legacy)");
+      }
+    }
+    std::string route_reuse;
+    cr.optional("route_reuse", route_reuse);
+    if (!route_reuse.empty()) {
+      if (route_reuse == "off") {
+        opt.cluster_redirect.route_reuse = io::rest::redirect_route_reuse::off;
+      } else if (route_reuse == "same_open") {
+        opt.cluster_redirect.route_reuse = io::rest::redirect_route_reuse::same_open;
+      } else {
+        throw std::runtime_error("'rest.cluster_redirect.route_reuse': invalid enum value '" +
+                                 route_reuse + "' (expected off or same_open)");
+      }
+    }
+    cr.reject_unknown();
+    if (opt.cluster_redirect.enabled &&
+        (opt.cluster_redirect.origin.empty() || opt.cluster_redirect.allowed_targets.empty())) {
+      throw std::runtime_error(
+        "'sirius.executor.scan_manager.rest.cluster_redirect': enabled requires a non-empty "
+        "'origin' and at least one 'allowed_targets' entry");
+    }
+  }
   r.reject_unknown();
 }
 

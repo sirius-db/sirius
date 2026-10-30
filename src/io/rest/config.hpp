@@ -21,8 +21,49 @@
 
 #include <chrono>
 #include <cstddef>
+#include <string>
+#include <vector>
 
 namespace sirius::io::rest {
+
+/// Connection-cache retention policy; active-transfer limits are unchanged.
+enum class redirect_retention { legacy, expanded };
+
+/// Whether a storage node's admitted Location may be reused for later ranged
+/// GETs of the same open instead of asking the gateway again for each one.
+enum class redirect_route_reuse {
+  /// Every physical GET starts at the gateway; delegation depends on its response.
+  off,
+  /// Reuse only this open's validated GET route within its policy context.
+  /// Requires a qualified same-object, cross-range replay contract.
+  /// Refusal may re-resolve once within the operation's retry budget.
+  same_open,
+};
+
+/// Scoped delegation of HTTP 307 to a storage node, off by default.
+///
+/// Some S3-compatible front ends (AIStore) answer an object GET / HEAD at
+/// their gateway with a 307 whose Location names the node that holds the
+/// object; following that one hop is the only way to the direct data path.
+/// It is never a blanket follow: Amazon S3 itself answers 307 for region and
+/// service routing, and a presigned URL is signed for one host, so the reactor
+/// still refuses every redirect except a 307 that (a) answers a request sent to
+/// @c origin and (b) names one of @c allowed_targets.  The delegated request
+/// repeats the same method, Range and If-Match against the Location as
+/// received (path untouched; it may carry the gateway's own authorization),
+/// without invoking the authorizer or forwarding its credential headers; it is
+/// one hop per physical HEAD / suffix GET / ranged GET, kept across that
+/// operation's retries, and a second 307 or a 401/403 from the target is
+/// terminal.  A 307 the policy refuses stays the error it is today.
+struct cluster_redirect_config {
+  bool enabled{false};
+  /// `host[:port]` of the gateway, spelled as in the object-store endpoint.
+  std::string origin;
+  /// `host[:port]` authorities a Location may name (exact, host case-insensitive).
+  std::vector<std::string> allowed_targets;
+  redirect_retention retention{redirect_retention::expanded};
+  redirect_route_reuse route_reuse{redirect_route_reuse::off};
+};
 
 struct config {
   /// An object store addresses single bytes: a ranged GET for an odd offset
@@ -136,6 +177,17 @@ struct config {
   /// two axes diverge when a prefix is huge but few keys match, so both exist.
   std::size_t list_max_matches{s3::default_max_list_objects};     // 100'000
   std::size_t list_max_scanned{s3::default_max_scanned_objects};  // 1'000'000
+
+  /// See @c cluster_redirect_config.  Applies to object HEAD / suffix GET /
+  /// ranged GET only.  LIST keeps its existing HTTP-error/retry path and
+  /// connection warm-up stays best effort; neither delegates or contributes to
+  /// the redirect counters.
+  cluster_redirect_config cluster_redirect;
+
+  /// Opt-in measurement records for REST attempts and redirect decisions.
+  /// Only sanitized authority, structural range and fixed outcome/attempt/timing fields are
+  /// allowed.
+  bool request_log{false};
 };
 
 }  // namespace sirius::io::rest

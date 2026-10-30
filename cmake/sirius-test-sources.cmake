@@ -190,6 +190,9 @@ set(TEST_SOURCES
     test/cpp/io/test_templated_ioctx.cpp
     test/cpp/io/test_uri_parser.cpp
     test/cpp/io/uring/test_uring_readv.cpp
+    test/cpp/io/rest/test_redirect_policy.cpp
+    test/cpp/io/rest/test_redirect_route_state.cpp
+    test/cpp/io/rest/test_redirect_retention_record.cpp
     test/cpp/io/rest/test_rest_reactor.cpp
     test/cpp/log/test_duckdb_sink.cpp
     test/cpp/log/test_logging.cpp

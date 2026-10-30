@@ -19,6 +19,7 @@
 #include "io/cache/types.hpp"
 #include "io/rest/authorizer.hpp"
 #include "io/rest/config.hpp"
+#include "io/rest/redirect_policy.hpp"
 #include "io/rest/types.hpp"
 #include "io/types.hpp"
 
@@ -26,6 +27,7 @@
 
 #include <blockingconcurrentqueue.h>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <curl/curl.h>
 
 #include <atomic>
 #include <cstddef>
@@ -106,6 +108,9 @@ struct footer_probe {
   shared_byte_span bytes;
   // ETag from the verified 206, quotes preserved; empty otherwise.
   std::string etag;
+  /// The admitted Location the verified 206 came from when the probe was
+  /// delegated (config::cluster_redirect); empty when the gateway served it.
+  std::string delegated_route;
 };
 
 /// Result of a blocking HEAD: the object's size plus its ETag when the server
@@ -209,6 +214,34 @@ class rest_io_object : public io_object {
   [[nodiscard]] shared_byte_span const& stash() const noexcept { return _stash; }
   [[nodiscard]] size_t stash_window_lo() const noexcept { return _window_lo; }
 
+  /// The storage-node route this open's ranged GETs may take directly
+  /// (config::cluster_redirect_config::route_reuse), bound to the policy
+  /// context that admitted it.  One slot per open: the first validated
+  /// delegated GET seeds it, a refused cached attempt drops exactly the
+  /// snapshot it used, and a later success may seed again.  Workers of one
+  /// reactor context share the open, hence the lock; a worker keeps the
+  /// snapshot it read for the whole attempt.  @p owner is the context's
+  /// identity; a route is visible only while that context is alive and is
+  /// the caller's, so a route can never be consumed through another policy
+  /// context.
+  [[nodiscard]] std::shared_ptr<const std::string> route(
+    std::shared_ptr<const void> const& owner) const
+  {
+    return _routes.route(owner);
+  }
+  bool seed_route(std::shared_ptr<const std::string> route, std::weak_ptr<const void> owner) const
+  {
+    return _routes.seed_route(std::move(route), std::move(owner));
+  }
+  void drop_route(std::shared_ptr<const std::string> const& stale) const
+  {
+    _routes.drop_route(stale);
+  }
+  bool try_seed_route(std::string_view route, std::weak_ptr<const void> owner) const noexcept
+  {
+    return _routes.try_seed_route(route, std::move(owner));
+  }
+
  private:
   [[nodiscard]] static std::string make_cache_id(std::string const& path, std::string const& etag)
   {
@@ -225,6 +258,7 @@ class rest_io_object : public io_object {
   shared_byte_span _stash;
   std::string _etag;
   std::string _cache_id;
+  redirect_routes::route_cache _routes;
 };
 
 // ---------------------------------------------------------------------------
@@ -238,8 +272,9 @@ class rest_io_object : public io_object {
  * loop (curl_multi_socket_action), a pool of reusable easy handles, dynamic
  * CuCascade staging for device reads, a timerfd + min-heap retry
  * scheduler, and an MPSC request queue.  Models the reactor concept consumed
- * by @c templated_ioctx.  Presigned GET/HEAD URLs come from a
- * @c request_authorizer, re-issued on every attempt.
+ * by @c templated_ioctx.  Origin attempts obtain their URLs from
+ * @c request_authorizer; delegated attempts (config::cluster_redirect) reuse
+ * the admitted Location without re-authorization.
  */
 class rest_reactor {
  public:
@@ -383,6 +418,42 @@ class rest_reactor {
                         std::string_view prefix,
                         std::string_view canonical_query);
 
+  /// Per-reactor 307 policy decisions since construction: @c followed counts
+  /// approved delegations, before the target request is submitted; @c refused
+  /// counts policy rejections (each also the request's terminal error).  HEAD,
+  /// suffix and worker GET paths contribute; LIST / warm-up and other status
+  /// codes do not.  The counter reads are independent observations, not
+  /// proof that a target request was sent (an approval followed by
+  /// cancellation or an allocation failure still counts).
+  struct redirect_counters {
+    std::uint64_t followed{0};
+    std::uint64_t refused{0};
+    /// Route publications, cached-route selections at first submission, and
+    /// refresh decisions admitted by the operation budget. These independent
+    /// observations do not prove wire submission or completion.
+    std::uint64_t route_seeds{0};
+    std::uint64_t route_hits{0};
+    std::uint64_t route_refreshes{0};
+  };
+  [[nodiscard]] redirect_counters redirects() const noexcept
+  {
+    return {_redirects_followed.load(std::memory_order_relaxed),
+            _redirects_refused.load(std::memory_order_relaxed),
+            _route_seeds.load(std::memory_order_relaxed),
+            _route_hits.load(std::memory_order_relaxed),
+            _route_refreshes.load(std::memory_order_relaxed)};
+  }
+
+  /// Store @p route on @p obj as its direct route, bound to this reactor's
+  /// context, when the policy allows it: route reuse on, a strong validator on
+  /// the open, a route of bounded length and no route stored yet.  Returns
+  /// whether it was stored; never throws past an optional seed.
+  bool seed_route(io_object const& obj, std::string_view route) noexcept;
+
+  /// Cache-local refusal candidates; protected local failures take precedence.
+  /// Re-resolution, if admitted, still consumes the shared attempt budget.
+  [[nodiscard]] static bool cached_route_refused(CURLcode rc, long status) noexcept;
+
   // -- capabilities / factory ----------------------------------------------
 
   /// True iff @p path is an s3:// URL this reactor can serve.
@@ -403,7 +474,7 @@ class rest_reactor {
   void worker_loop(const std::stop_token& stop_token);
 
   // Shared services + tunables for the whole reactor pool; kept alive for this
-  // reactor's lifetime (the authorizer is used on every request).
+  // reactor's lifetime (the authorizer serves origin attempts).
   std::shared_ptr<reactor_context> _ctx;
   config _config;  // copy of _ctx->cfg() for hot-path access
   // Thread name prefix captured at construction; applied to the worker in start().
@@ -430,6 +501,25 @@ class rest_reactor {
   // Logical bytes not yet assigned to a curl slot. Retries are already claimed
   // work and therefore never get counted a second time.
   std::atomic<std::size_t> _queued_bytes{0};
+
+  // See redirects(); bumped by the blocking HEAD / suffix paths on their
+  // caller's thread and by the worker for ranged GETs.
+  std::atomic<std::uint64_t> _redirects_followed{0};
+  std::atomic<std::uint64_t> _redirects_refused{0};
+  std::atomic<std::uint64_t> _route_seeds{0};
+  std::atomic<std::uint64_t> _route_hits{0};
+  std::atomic<std::uint64_t> _route_refreshes{0};
+
+  /// Decide one 307 for @p obj: on follow, count it and return true; otherwise
+  /// count the refusal, WARN with the reason, and return false.  @p reason_out
+  /// receives the refusal text for the caller's error message.  May throw
+  /// (allocation, logging); callers treat that like any other failure.
+  bool delegate_redirect(object_ref const& obj,
+                         std::string_view request_url,
+                         bool already_delegated,
+                         long status,
+                         std::string_view location,
+                         std::string& reason_out);
 
   std::jthread _worker;
 };
