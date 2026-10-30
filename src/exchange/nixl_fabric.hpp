@@ -47,8 +47,9 @@ namespace sirius::exchange {
  *
  * **Host staging.** UCX moves GPU memory between processes with `cuda_ipc`, which needs peer
  * access between the two GPUs. Without it (GPUs under different PCIe switches on many hosts) UCX
- * falls back to a far slower path. Every rank therefore also keeps a pinned host mirror of its
- * receive ring in POSIX shared memory. A write to a peer whose GPU this GPU cannot reach directly
+ * falls back to a far slower path. A rank therefore also keeps a pinned host mirror of its
+ * receive ring in POSIX shared memory, when NVML reports a GPU on its host without peer access to
+ * its own (or staging is always). A write to a peer whose GPU this GPU cannot reach directly
  * is a device-to-host copy into that peer's mirror, followed by a notification naming the bytes;
  * the peer copies them host-to-device into its receive ring and only then hands the write's own
  * notification on. One PCIe crossing each way, no copy through the CPU.

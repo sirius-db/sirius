@@ -42,6 +42,7 @@
 #include <mutex>
 #include <string_view>
 #include <thread>
+#include <utility>
 
 namespace sirius::exchange {
 namespace {
@@ -76,13 +77,18 @@ std::string mirror_name(std::uint32_t pid, rank_t rank)
 /// Whether the GPUs at PCI bus ids @p a and @p b can reach each other's memory directly, by
 /// NVML's peer-to-peer read and write status (NVML sees every GPU, whatever CUDA_VISIBLE_DEVICES
 /// hides). True when NVML cannot tell, which keeps the NIXL path.
+bool nvml_up()
+{
+  static bool const up = nvmlInit_v2() == NVML_SUCCESS;
+  return up;
+}
+
 bool peer_access(std::string const& a, std::string const& b)
 {
   if (a == b) { return true; }
-  static bool const nvml_up = nvmlInit_v2() == NVML_SUCCESS;
   nvmlDevice_t da{};
   nvmlDevice_t db{};
-  if (!nvml_up || nvmlDeviceGetHandleByPciBusId_v2(a.c_str(), &da) != NVML_SUCCESS ||
+  if (!nvml_up() || nvmlDeviceGetHandleByPciBusId_v2(a.c_str(), &da) != NVML_SUCCESS ||
       nvmlDeviceGetHandleByPciBusId_v2(b.c_str(), &db) != NVML_SUCCESS) {
     SIRIUS_LOG_WARN("exchange: NVML cannot compare GPUs {} and {}; assuming peer access", a, b);
     return true;
@@ -95,6 +101,34 @@ bool peer_access(std::string const& a, std::string const& b)
     }
   }
   return true;
+}
+
+/// Whether some GPU on this host lacks peer access to the one at @p bus_id, either way, so that a
+/// rank on it would stage its writes to this rank through the host (see peer_access). True when
+/// NVML cannot tell.
+bool some_gpu_lacks_peer_access(std::string const& bus_id)
+{
+  nvmlDevice_t mine{};
+  unsigned count = 0;
+  if (!nvml_up() || nvmlDeviceGetHandleByPciBusId_v2(bus_id.c_str(), &mine) != NVML_SUCCESS ||
+      nvmlDeviceGetCount_v2(&count) != NVML_SUCCESS) {
+    return true;
+  }
+  for (unsigned i = 0; i < count; ++i) {
+    nvmlDevice_t other{};
+    if (nvmlDeviceGetHandleByIndex_v2(i, &other) != NVML_SUCCESS) { return true; }
+    if (other == mine) { continue; }
+    for (auto const index : {NVML_P2P_CAPS_INDEX_READ, NVML_P2P_CAPS_INDEX_WRITE}) {
+      for (auto const [from, to] : {std::pair{mine, other}, std::pair{other, mine}}) {
+        nvmlGpuP2PStatus_t status{};
+        if (nvmlDeviceGetP2PStatus(from, to, index, &status) != NVML_SUCCESS ||
+            status != NVML_P2P_STATUS_OK) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
 }
 
 /// Maps @p bytes of the shared-memory object @p name, creating it when @p create.
@@ -215,10 +249,23 @@ nixl_fabric::nixl_fabric(config cfg, frame_ring& send, frame_ring& recv)
   RMM_CUDA_TRY(cudaDeviceGetPCIBusId(bus_id, sizeof(bus_id), _device));
   _peers[_rank].pci_bus_id = bus_id;
   _peers[_rank].pid        = static_cast<std::uint32_t>(::getpid());
-  // The mirror exists before the hello names it, so a peer that hears the hello can map it.
-  if (cfg.staging != host_staging::never && _peers.size() > 1) {
+  // The mirror exists before the hello names it, so a peer that hears the hello can map it. In
+  // automatic mode only a same-host GPU without peer access to this one would stage to it.
+  bool const mirror = _peers.size() > 1 && (cfg.staging == host_staging::always ||
+                                            (cfg.staging == host_staging::automatic &&
+                                             some_gpu_lacks_peer_access(_peers[_rank].pci_bus_id)));
+  if (mirror) {
     _mirror_name = mirror_name(_peers[_rank].pid, _rank);
-    _mirror      = map_shared(_mirror_name, _recv.bytes(), true);
+    try {
+      _mirror = map_shared(_mirror_name, _recv.bytes(), true);
+    } catch (std::exception const& e) {
+      if (cfg.staging == host_staging::always) { throw; }
+      SIRIUS_LOG_WARN("exchange: no receive mirror ({}); a peer that must stage to rank {} fails",
+                      e.what(),
+                      _rank);
+      ::shm_unlink(_mirror_name.c_str());
+      _mirror_name.clear();
+    }
   }
 
   // UCX parses its global configuration unsafely: two backends created at once in one process
@@ -247,7 +294,8 @@ nixl_fabric::nixl_fabric(config cfg, frame_ring& send, frame_ring& recv)
              static_cast<std::uint32_t>(_device),
              reinterpret_cast<std::uint64_t>(_recv.base()),
              _recv.bytes(),
-             _peers[_rank].pid,
+             // 0: no mirror, which map_mirror() on a peer reports.
+             _mirror != nullptr ? _peers[_rank].pid : 0u,
              {}};
   std::memcpy(mine.pci_bus_id, bus_id, sizeof(mine.pci_bus_id));
   auto const me = encode_hello(mine);

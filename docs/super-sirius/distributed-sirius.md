@@ -113,9 +113,12 @@ host, UCX picks `cuda_ipc` zero-copy.
 
 **Host staging.** `cuda_ipc` needs peer access between the two GPUs. Where there is none (GPUs
 under different PCIe switches, which `nvidia-smi topo -p2p r` shows as `NS`), UCX falls back to
-staging through the host over TCP, at about 1 GB/s. So each rank also keeps a pinned mirror of its
-receive ring in POSIX shared memory (`/dev/shm/sirius-exchange-<pid>-<rank>`), and its hello
-carries its PID and its GPU's PCI bus id. For a peer whose GPU NVML reports without peer read and
+staging through the host over TCP, at about 1 GB/s. So a rank also keeps a pinned mirror of its
+receive ring in POSIX shared memory (`/dev/shm/sirius-exchange-<pid>-<rank>`) when NVML reports a
+GPU on its host without peer access to its own, and its hello carries its PID (0 without a
+mirror) and its GPU's PCI bus id. If `auto` cannot create the mirror (a small `/dev/shm`), the
+rank logs a warning and goes on without one; a peer that must stage to it then fails to connect,
+saying so. For a peer whose GPU NVML reports without peer read and
 write access, a write is one device-to-host copy into that peer's mirror, then a notification
 naming the offset and size; the peer copies the bytes host-to-device into its receive ring and
 only then passes the write's own notification to the transport. Credits are unchanged: a mirror
