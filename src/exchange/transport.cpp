@@ -28,6 +28,7 @@
 #include <cuda_runtime_api.h>
 
 #include <cucascade/data/data_batch.hpp>
+#include <cucascade/memory/memory_space.hpp>
 
 #include <deque>
 #include <map>
@@ -501,8 +502,17 @@ void transport::send(stream_id stream, rank_t to, std::shared_ptr<cucascade::dat
     e.cb.on_batch(stream, to, index, std::move(batch));
     return;
   }
-  auto out = outgoing_batch::make(std::move(batch), e.send_stream.view());
+  // Not on send_stream: planning reads string sizes back, which there would wait behind every
+  // frame the engine has staged. send_stream waits for the planning instead (the producer's
+  // writes and any unslice copy) before the engine stages from the batch.
+  rmm::cuda_stream_view const plan_stream{e.gpu.acquire_stream()};
+  auto out = outgoing_batch::make(std::move(batch), plan_stream);
   if (!out) { return; }
+  cudaEvent_t planned{};
+  RMM_CUDA_TRY(cudaEventCreateWithFlags(&planned, cudaEventDisableTiming));
+  RMM_CUDA_TRY(cudaEventRecord(planned, plan_stream.value()));
+  RMM_CUDA_TRY(cudaStreamWaitEvent(e.send_stream.value(), planned, 0));
+  RMM_CUDA_TRY(cudaEventDestroy(planned));
   auto const bytes = out->stream_bytes();
   // Counted before the deleter can run, on any path that drops the batch.
   auto const query = query_of(stream);
