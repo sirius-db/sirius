@@ -132,11 +132,11 @@ struct merge_fixture {
     sirius_pipeline_build_state state;
     state.set_pipeline_source(*upstream, producer);
     state.set_pipeline_operators(*upstream, {producer});
-    state.set_pipeline_sink(*upstream, &producer);
+    state.set_pipeline_sink(*upstream, &producer, 0);
     upstream->set_pipeline_id(0);
     state.set_pipeline_source(*pipeline, merge);
     state.set_pipeline_operators(*pipeline, {merge, collector});
-    state.set_pipeline_sink(*pipeline, &collector);
+    state.set_pipeline_sink(*pipeline, &collector, 0);
     pipeline->set_pipeline_id(1);
     pipeline->add_dependency(upstream);
     producer.set_pipeline(upstream);

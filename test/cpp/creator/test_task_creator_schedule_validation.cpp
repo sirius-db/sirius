@@ -67,7 +67,7 @@ struct schedule_fixture {
     auto pipeline = std::make_shared<sirius::pipeline::sirius_pipeline>(build_ctx);
     sirius::pipeline::sirius_pipeline_build_state build_state;
     build_state.set_pipeline_source(*pipeline, op);
-    build_state.set_pipeline_sink(*pipeline, &op);
+    build_state.set_pipeline_sink(*pipeline, &op, /*sink_pipeline_count=*/1);
     pipeline->set_query_id(query_id);
     pipeline->set_priority(3);
     op.set_pipeline(pipeline);

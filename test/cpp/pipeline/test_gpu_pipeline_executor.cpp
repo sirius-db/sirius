@@ -261,7 +261,7 @@ TEST_CASE("GPU cancellation preserves staged work until the manager restores rea
     sirius::pipeline::pipeline_build_context{sirius::test::make_test_telemetry_context()});
   sirius::pipeline::sirius_pipeline_build_state build_state;
   build_state.set_pipeline_source(*pipe, source);
-  build_state.set_pipeline_sink(*pipe, &source);
+  build_state.set_pipeline_sink(*pipe, &source, 1);
   pipe->set_query_id(cancelled_query);
   auto cancelled_state = std::make_shared<test_gpu_pipeline_task_global_state>();
   cancelled_state->set_pipeline(pipe);
@@ -474,7 +474,7 @@ TEST_CASE("GPU errors precede terminal task destruction even when logging throws
     sirius::pipeline::pipeline_build_context{sirius::test::make_test_telemetry_context()});
   sirius::pipeline::sirius_pipeline_build_state build_state;
   build_state.set_pipeline_source(*pipe, terminal);
-  build_state.set_pipeline_sink(*pipe, &terminal);
+  build_state.set_pipeline_sink(*pipe, &terminal, 1);
   pipe->set_query_id(failed_query);
   pipe->set_completion_handler(completion);
   auto global = std::make_shared<test_gpu_pipeline_task_global_state>();

@@ -94,7 +94,7 @@ static std::shared_ptr<sirius::pipeline::sirius_pipeline> make_single_op_pipelin
   auto pipeline = std::make_shared<sirius::pipeline::sirius_pipeline>(build_ctx);
   sirius::pipeline::sirius_pipeline_build_state build_state;
   build_state.set_pipeline_source(*pipeline, op);
-  build_state.set_pipeline_sink(*pipeline, &op);
+  build_state.set_pipeline_sink(*pipeline, &op, 1);
   op.set_pipeline(pipeline);
   return pipeline;
 }

@@ -51,6 +51,7 @@ class sirius_physical_order : public sirius_physical_operator {
 
   bool is_source() const override { return true; }
   bool is_sink() const override { return true; }
+  bool sink_order_dependent() const override { return false; }
 
   sirius::OrderPreservationType source_order() const override
   {

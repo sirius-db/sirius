@@ -263,7 +263,7 @@ struct harness {
     pl::sirius_pipeline_build_state state;
     state.set_pipeline_source(*pipeline, *partition);
     state.set_pipeline_operators(*pipeline, {*partition});
-    state.set_pipeline_sink(*pipeline, partition);
+    state.set_pipeline_sink(*pipeline, partition, 1);
     partition->set_pipeline(pipeline);
     auto upstream          = std::make_unique<op::sirius_physical_operator::port>();
     upstream->type         = op::MemoryBarrierType::FULL;
@@ -448,7 +448,7 @@ void require_worker_reuse(harness& test)
   pl::sirius_pipeline_build_state state;
   state.set_pipeline_source(*pipeline, next);
   state.set_pipeline_operators(*pipeline, {next});
-  state.set_pipeline_sink(*pipeline, &next);
+  state.set_pipeline_sink(*pipeline, &next, 1);
   auto global = std::make_shared<pl::sirius_pipeline_task_global_state>(
     pipeline, sirius::test::make_test_telemetry_context());
   auto completion = std::make_shared<pl::completion_handler>();

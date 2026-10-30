@@ -64,7 +64,9 @@ void sirius_physical_union::build_pipelines(pipeline::sirius_pipeline& current,
   // Every arm reaches UNION through a plan-gen PASSTHROUGH_SINK wrap. Create a child meta per arm
   // terminating in that sink, then recurse *past* it so it does not redundantly create its own.
   // A throw rather than a D_ASSERT, because a release build would otherwise index an empty
-  // `children` and read past the end silently.
+  // `children` and read past the end silently. The other two preconditions already fail loudly
+  // elsewhere: arity in the plan builder (`sirius_plan_set_operation.cpp`), and a non-sink
+  // pipeline sink in `sirius_pipeline::reset_sink`.
   // The converter schedules child metas last-created-first, so the last arm created here becomes
   // pipeline #0: the seeded scan and the top execution priority. Reverse, so that is arm 0.
   for (auto& child_slot : std::views::reverse(children)) {

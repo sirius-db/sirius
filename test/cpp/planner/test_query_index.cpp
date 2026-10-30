@@ -64,7 +64,7 @@ class dag_builder {
     auto op       = std::make_unique<test_operator>(type);
     op->set_pipeline(pipeline);
     _bs.set_pipeline_source(*pipeline, *op);
-    _bs.set_pipeline_sink(*pipeline, sirius::optional_ptr<sirius_physical_operator>(op.get()));
+    _bs.set_pipeline_sink(*pipeline, sirius::optional_ptr<sirius_physical_operator>(op.get()), 0);
     _ids[pipeline.get()] = id;
     _ops.push_back(std::move(op));
     _pipelines.push_back(pipeline);

@@ -202,6 +202,10 @@ std::string sirius_physical_operator::get_name() const
   return SiriusPhysicalOperatorToString(type);
 }
 
+std::string sirius_physical_operator::to_string() const { return get_name() + params_to_string(); }
+
+void sirius_physical_operator::print() const { std::cout << to_string() << std::endl; }
+
 duckdb::vector<duckdb::const_reference<sirius_physical_operator>>
 sirius_physical_operator::get_children() const
 {
@@ -461,6 +465,14 @@ bool sirius_physical_operator::is_source_pipeline_finished()
     if (port_ptr->src_pipeline && !port_ptr->src_pipeline->is_pipeline_finished()) { return false; }
   }
   return true;
+}
+
+bool sirius_physical_operator::has_full_barrier_from(const pipeline::sirius_pipeline* src) const
+{
+  for (auto& p : _ports_list) {
+    if (p->src_pipeline.get() == src && p->type == MemoryBarrierType::FULL) { return true; }
+  }
+  return false;
 }
 
 std::shared_ptr<pipeline::sirius_pipeline> sirius_physical_operator::get_pipeline() const noexcept

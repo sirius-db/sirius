@@ -63,7 +63,7 @@ struct task_fixture {
 
     sirius::pipeline::sirius_pipeline_build_state build_state;
     build_state.set_pipeline_source(*pipeline, op);
-    build_state.set_pipeline_sink(*pipeline, &op);
+    build_state.set_pipeline_sink(*pipeline, &op, /*sink_pipeline_count=*/1);
 
     pipeline->set_query_id(query_id);
     pipeline->set_priority(priority);

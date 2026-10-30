@@ -1421,7 +1421,7 @@ TEST_CASE(
     sirius::pipeline::pipeline_build_context{nullptr});
   sirius::pipeline::sirius_pipeline_build_state build_state;
   build_state.set_pipeline_source(*source, producer);
-  build_state.set_pipeline_sink(*source, &producer);
+  build_state.set_pipeline_sink(*source, &producer, 0);
   build_state.add_pipeline_operator(*source, producer);
   source->mark_task_created();
   source->mark_task_created();

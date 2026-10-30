@@ -620,8 +620,8 @@ struct partition_sizing_fixture {
     sirius::pipeline::sirius_pipeline_build_state build_state;
     build_state.set_pipeline_source(*producer, source);
     build_state.set_pipeline_operators(*producer, {source});
-    build_state.set_pipeline_sink(*producer,
-                                  sirius::optional_ptr<sirius_physical_operator>(&source));
+    build_state.set_pipeline_sink(
+      *producer, sirius::optional_ptr<sirius_physical_operator>(&source), 0);
     auto port          = std::make_unique<sirius_physical_operator::port>();
     port->type         = enabled ? MemoryBarrierType::PARTIAL : MemoryBarrierType::FULL;
     port->repo         = &repo;

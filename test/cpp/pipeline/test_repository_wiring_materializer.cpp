@@ -77,7 +77,7 @@ std::shared_ptr<sirius_pipeline> build_pipeline(
 {
   auto pipeline = env.make_pipeline();
   sirius_pipeline_build_state build_state;
-  build_state.set_pipeline_sink(*pipeline, sink);
+  build_state.set_pipeline_sink(*pipeline, sink, /*pipeline_idx=*/0);
   for (auto* op : operators) {
     build_state.add_pipeline_operator(*pipeline, *op);
   }
