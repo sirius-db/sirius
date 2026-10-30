@@ -151,6 +151,38 @@ Two fast paths live inside the dense path. When every slot in the domain is occu
 
 **Config:** `enable_dense_count_join` (default: `true`, see [Configuration](configuration.md)); the histogram byte budget is engine-internal and not user-tunable. Operator entry: [Operators](operators.md).
 
+### Sorted-Key Grouped Aggregation
+
+**Motivation:** cuDF's hash group-by pays for a hash table and global atomics even when a batch's keys are already in order. TPC-H q18 groups lineitem by `l_orderkey`, which a table pinned in key order delivers sorted; its per-batch partial aggregation was 631 ms of q18's kernel time at SF1000.
+
+**Mechanism:** For a batch with a single fixed-width, null-free, non-dictionary key and no COLLECT_SET aggregate, `grouped_aggregate_table()` verifies with `keys_ascending()` (`src/cuda/sorted_keys.cu`) that the key is ascending and, if so, builds the group-by with `cudf::sorted::YES`, so cuDF reduces runs of equal keys instead of hashing. Unsorted batches keep the hash path, so correctness never depends on the data layout. For integer, boolean, timestamp, duration and fixed-point keys the check is one `thrust::is_sorted` pass that stops at the first descent; `cudf::is_sorted`'s generic row comparator is about 2.4 times slower on a sorted INT64 column (SF1000 q18: 0.620 s with it, 0.597 s with the typed pass). Other keys use `cudf::is_sorted`. Verified-sorted keys also let the stable STDDEV_SAMP path skip its own sort.
+
+**Code path:** `src/op/aggregate/gpu_aggregate_impl.cpp` — `grouped_aggregate_table()`
+
+**Config:** Always on. TPC-H SF1000 on a GB300, together with natural-order pinning: q18 1.148 s → 0.830 s.
+
+### Order-Preserving Partition and Sorted Merge
+
+**Motivation:** After a sorted-key partial aggregation each partial is sorted, and with a table pinned in key order the partials cover consecutive key ranges. `cudf::hash_partition` does not keep row order, so the merge had to hash and re-aggregate everything (q18: 352 ms of merge kernels at SF1000).
+
+**Mechanism:** Both parts decide from the data, so there is no setting:
+1. **Partition:** `hash_partition()` checks whether a single INT64 partition key is ascending. If so it uses a stable partition (`cudf::stable_sorted_order` of the partition ids, then a gather) that keeps the input order within each partition; otherwise it calls `cudf::hash_partition` as before. Both assign a row by its MurmurHash3 row hash modulo the partition count, so batches of one input may take either path and a key still lands in one partition.
+2. **Merge:** for a single INT64 group key, `merge_grouped_aggregate()` orders the incoming partials by their first key, concatenates them, verifies the result with `keys_ascending()`, and uses the sorted-keys group-by if it passes. Any other input keeps the hash merge.
+
+**Code path:** `src/op/partition/gpu_partition_impl.cpp` — `hash_partition()`; `src/op/merge/gpu_merge_impl.cpp` — `merge_grouped_aggregate()`
+
+**Config:** None. TPC-H SF1000 on a GB300, on top of the sorted-key aggregation: q18 0.830 s → 0.639 s; no other query moved by more than run-to-run noise.
+
+### Natural-Order Parquet Pinning
+
+**Motivation:** `pin_table` lists local parquet files in directory order, and each pinned chunk packs several files, so a table stored sorted across numbered files (`part.0`, `part.1`, …) pinned into chunks whose rows are out of order: at TPC-H SF1000 only 3 of q18's 39 lineitem batches were in `l_orderkey` order.
+
+**Mechanism:** `pin_table` sorts the file list with glibc `strverscmp` (digit runs compared numerically, so `part.2` precedes `part.10`) before materializing, so chunks hold consecutive files. Nothing relies on the order for correctness: the consumers verify sortedness themselves, and matching a scan's files to a pinned entry ignores order.
+
+**Code path:** `src/sirius_extension.cpp` — pin file list
+
+**Config:** Always on. On its own it changes little; it lets the sorted aggregation paths apply.
+
 ### Distinct Hash Join (PR #558)
 
 **Motivation:** `cudf::hash_join` does not exploit build-side uniqueness, performing unnecessary work for 1:1 joins.

@@ -148,6 +148,7 @@ extern "C" int cudaProfilerStop();
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <span>
 #include <string_view>
@@ -1208,6 +1209,15 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
       if (file_paths.empty()) {
         throw InvalidInputException("pin_table: no parquet files matched path: " + data.args.path);
       }
+      // GlobFiles returns local files in directory order, and pinned chunks pack several
+      // files each, so a table stored sorted across numbered files (part.0, part.1, ...) would
+      // pin into chunks whose rows are not in order. Sorting the names with digit runs compared
+      // numerically (part.2 before part.10) keeps such tables sorted within and across chunks,
+      // which lets sorted-key aggregation apply to their scans. Nothing relies on this order for
+      // correctness.
+      std::sort(file_paths.begin(), file_paths.end(), [](auto const& lhs, auto const& rhs) {
+        return strverscmp(lhs.c_str(), rhs.c_str()) < 0;
+      });
 
       // tier='parquet' pins the undecoded bytes and stops there: there is no
       // decode, no GPU materialisation and no pinned_entry, because the residency

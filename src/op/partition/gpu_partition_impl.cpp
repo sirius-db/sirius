@@ -18,15 +18,97 @@
 
 #include "cudf/hugeint_carrier.hpp"
 #include "data/data_batch_utils.hpp"
+#include "op/aggregate/aggregate_op_util.hpp"
 #include "op/key_preparation.hpp"
 
+#include <cudf/binaryop.hpp>
+#include <cudf/copying.hpp>
+#include <cudf/filling.hpp>
+#include <cudf/hashing.hpp>
 #include <cudf/partitioning.hpp>
+#include <cudf/scalar/scalar.hpp>
+#include <cudf/search.hpp>
+#include <cudf/sorting.hpp>
 #include <cudf/unary.hpp>
+#include <cudf/utilities/error.hpp>
 
 #include <cuda_runtime.h>
 
 namespace sirius {
 namespace op {
+
+namespace {
+
+/// The reordered table and the start offset of each partition, as `cudf::hash_partition` returns
+/// them.
+using hash_partition_result = std::pair<std::unique_ptr<cudf::table>, std::vector<cudf::size_type>>;
+
+/// Partition number of each row: the MurmurHash3 row hash modulo @p num_partitions.
+std::unique_ptr<cudf::column> partition_ids(cudf::table_view const& input,
+                                            std::vector<cudf::size_type> const& key_indices,
+                                            int num_partitions,
+                                            ::cuda::stream_ref stream)
+{
+  CUDF_EXPECTS(num_partitions > 0, "hash partition: num_partitions must be positive");
+  auto const temp_mr = cudf::get_current_device_resource_ref();
+  auto const hashes  = cudf::hashing::murmurhash3_x86_32(
+    input.select(key_indices), cudf::DEFAULT_HASH_SEED, stream, temp_mr);
+  cudf::numeric_scalar<uint32_t> const partition_count(
+    static_cast<uint32_t>(num_partitions), true, stream, temp_mr);
+  auto const ids = cudf::binary_operation(hashes->view(),
+                                          partition_count,
+                                          cudf::binary_operator::MOD,
+                                          cudf::data_type{cudf::type_id::UINT32},
+                                          stream,
+                                          temp_mr);
+  return cudf::cast(ids->view(), cudf::data_type{cudf::type_id::INT32}, stream, temp_mr);
+}
+
+/// Hash-partitions @p input and keeps the input order within each partition, which lets a merge of
+/// partitions of sorted inputs treat them as sorted. A row's partition is its MurmurHash3 row hash
+/// modulo @p num_partitions, which is how `cudf::hash_partition` assigns rows too, so equal keys
+/// land in the same partition whichever of the two partitions a batch.
+hash_partition_result stable_hash_partition(cudf::table_view const& input,
+                                            std::vector<cudf::size_type> const& key_indices,
+                                            int num_partitions,
+                                            ::cuda::stream_ref stream,
+                                            rmm::device_async_resource_ref mr)
+{
+  auto const temp_mr = cudf::get_current_device_resource_ref();
+  auto const ids     = partition_ids(input, key_indices, num_partitions, stream);
+
+  // The stable sort of the partition numbers is the gather map, so rows of one partition keep
+  // their input order.
+  auto const row_order = cudf::stable_sorted_order(
+    cudf::table_view({ids->view()}), {cudf::order::ASCENDING}, {}, stream, temp_mr);
+  auto reordered =
+    cudf::gather(input, row_order->view(), cudf::out_of_bounds_policy::DONT_CHECK, stream, mr);
+
+  // Partition start offsets: the first row of each partition number in the sorted ids.
+  auto const sorted_ids = cudf::gather(cudf::table_view({ids->view()}),
+                                       row_order->view(),
+                                       cudf::out_of_bounds_policy::DONT_CHECK,
+                                       stream,
+                                       temp_mr);
+  cudf::numeric_scalar<int32_t> const first_partition(0, true, stream, temp_mr);
+  auto const needles        = cudf::sequence(num_partitions, first_partition, stream, temp_mr);
+  auto const device_offsets = cudf::lower_bound(sorted_ids->view(),
+                                                cudf::table_view({needles->view()}),
+                                                {cudf::order::ASCENDING},
+                                                {cudf::null_order::AFTER},
+                                                stream,
+                                                temp_mr);
+  std::vector<cudf::size_type> offsets(num_partitions);
+  CUDF_CUDA_TRY(cudaMemcpyAsync(offsets.data(),
+                                device_offsets->view().data<cudf::size_type>(),
+                                num_partitions * sizeof(cudf::size_type),
+                                cudaMemcpyDeviceToHost,
+                                stream.get()));
+  stream.sync();
+  return {std::move(reordered), std::move(offsets)};
+}
+
+}  // namespace
 
 std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::hash_partition(
   const cucascade::read_only_data_batch& input,
@@ -82,13 +164,27 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::hash_par
   // error from an earlier call would be misattributed to the scan inside hash_partition.
   (void)cudaGetLastError();
 
-  auto partition_result = cudf::hash_partition(effective_table,
-                                               effective_key_idx,
-                                               num_partitions,
-                                               cudf::hash_id::HASH_MURMUR3,
-                                               cudf::DEFAULT_HASH_SEED,
-                                               stream,
-                                               memory_space.get_default_allocator());
+  // A sorted single INT64 key is the shape of a sorted-key partial aggregate, whose merge uses
+  // the sorted-keys group-by when its partials stay in order. Only then is the stable partition
+  // worth its sort. Both partitions assign a key to the same partition, so batches of one input
+  // may take different paths. Any other input is partitioned as before.
+  bool const keep_input_order =
+    effective_key_idx.size() == 1 &&
+    effective_table.column(effective_key_idx[0]).type().id() == cudf::type_id::INT64 &&
+    keys_ascending(effective_table.column(effective_key_idx[0]), stream);
+  auto partition_result = keep_input_order
+                            ? stable_hash_partition(effective_table,
+                                                    effective_key_idx,
+                                                    num_partitions,
+                                                    stream,
+                                                    memory_space.get_default_allocator())
+                            : cudf::hash_partition(effective_table,
+                                                   effective_key_idx,
+                                                   num_partitions,
+                                                   cudf::hash_id::HASH_MURMUR3,
+                                                   cudf::DEFAULT_HASH_SEED,
+                                                   stream,
+                                                   memory_space.get_default_allocator());
 
   // Build a column-index list for the original (non-cast) columns.
   std::vector<cudf::size_type> orig_col_indices;

@@ -3,6 +3,7 @@ target_sources(
   PRIVATE date_cast.cu
           decimal_integer_cast.cu
           dense_count_join_impl.cu
+          sorted_keys.cu
           device_copy_batch.cpp
           device_transfer.cpp
           dynamic_filter_mask_ops.cu

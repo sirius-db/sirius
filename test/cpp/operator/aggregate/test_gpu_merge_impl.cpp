@@ -20,7 +20,9 @@
 #include "op/aggregate/gpu_aggregate_impl.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
 #include "op/order/gpu_order_impl.hpp"
+#include "operator/operator_type_traits.hpp"
 #include "scan/test_utils.hpp"
+#include "utils/data_utils.hpp"
 #include "utils/utils.hpp"
 
 #include <cudf/utilities/bit.hpp>
@@ -1087,4 +1089,69 @@ TEST_CASE("Merge order-by with mixed empty and non-empty local order-by results"
                                                      *mem_space);
   ro_batches.clear();
   validate_order_by(input.batches, *output_batch, order_key_idx, column_order);
+}
+
+namespace {
+
+using sirius::test::vector_to_cudf_column;
+using sirius::test::operator_utils::gpu_type_traits;
+
+std::shared_ptr<data_batch> make_partial(std::vector<int64_t> const& keys,
+                                         std::vector<int64_t> const& sums,
+                                         memory_space& mem_space)
+{
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(vector_to_cudf_column<gpu_type_traits<int64_t>>(keys));
+  columns.push_back(vector_to_cudf_column<gpu_type_traits<int64_t>>(sums));
+  return sirius::make_data_batch(std::make_unique<cudf::table>(std::move(columns)),
+                                 mem_space,
+                                 cudf::get_default_stream(),
+                                 sirius::telemetry::batch_telemetry_info{});
+}
+
+}  // namespace
+
+TEST_CASE("Grouped merge aggregate of sorted partials that arrive out of order",
+          "[operator][merge_grouped_agg]")
+{
+  // Partials of a table pinned in key order: each is sorted, they cover consecutive key ranges,
+  // and neighbours may share a boundary key. They arrive out of order, so only ordering them by
+  // their first key makes the concatenation sorted.
+  auto* mem_space                                  = get_shared_mem_space();
+  std::vector<std::shared_ptr<data_batch>> batches = {
+    make_partial({10, 11, 12}, {1, 2, 3}, *mem_space),
+    make_partial({0, 1, 2}, {4, 5, 6}, *mem_space),
+    make_partial({12, 13}, {7, 8}, *mem_space)};
+  std::vector<cudf::aggregation::Kind> aggregates = {cudf::aggregation::Kind::SUM};
+
+  std::vector<read_only_data_batch> ro_batches;
+  for (auto& batch : batches) {
+    ro_batches.push_back(batch->to_read_only());
+  }
+  auto output_batch = gpu_merge_impl::merge_grouped_aggregate(
+    ro_batches, 1, aggregates, cudf::get_default_stream(), *mem_space);
+  ro_batches.clear();
+  validate_grouped_aggregate(batches, *output_batch, 1, aggregates);
+  REQUIRE(sirius::get_cudf_table_view(*output_batch).num_rows() == 7);
+}
+
+TEST_CASE("Grouped merge aggregate of partials that are not sorted",
+          "[operator][merge_grouped_agg]")
+{
+  // Overlapping, unsorted partials fail the sortedness check, so the hash group-by runs.
+  auto* mem_space                                  = get_shared_mem_space();
+  std::vector<std::shared_ptr<data_batch>> batches = {
+    make_partial({5, 1, 9, 1}, {1, 2, 3, 4}, *mem_space),
+    make_partial({9, 5, 0}, {5, 6, 7}, *mem_space)};
+  std::vector<cudf::aggregation::Kind> aggregates = {cudf::aggregation::Kind::SUM};
+
+  std::vector<read_only_data_batch> ro_batches;
+  for (auto& batch : batches) {
+    ro_batches.push_back(batch->to_read_only());
+  }
+  auto output_batch = gpu_merge_impl::merge_grouped_aggregate(
+    ro_batches, 1, aggregates, cudf::get_default_stream(), *mem_space);
+  ro_batches.clear();
+  validate_grouped_aggregate(batches, *output_batch, 1, aggregates);
+  REQUIRE(sirius::get_cudf_table_view(*output_batch).num_rows() == 4);
 }
