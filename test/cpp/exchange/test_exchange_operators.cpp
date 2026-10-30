@@ -516,6 +516,47 @@ TEST_CASE("a failed exchange tells a later query to restart every rank", "[excha
                     Catch::Matchers::ContainsSubstring("restart every rank"));
 }
 
+TEST_CASE("a retired query's late arrivals are dropped, a later query's still kept",
+          "[exchange][operators]")
+{
+  ranks c(2);
+  using sirius::exchange::query_stream_bits;
+  stream_id const retired = (std::uint64_t{1} << query_stream_bits) | 1;
+  stream_id const later   = (std::uint64_t{2} << query_stream_bits) | 1;
+  {
+    sirius_physical_exchange_source gone(
+      key_value_types(), 0, c.all[1].service, retired, {0}, false);
+  }
+  c.all[1].service->forget(1);
+  auto& sender = *c.all[0].service;
+  sender.send(retired, 1, key_value_batch(0, 0));
+  sender.close(retired, 1);
+  sender.send(later, 1, key_value_batch(0, 1));
+  sender.close(later, 1);
+  // Attached late, so its batch was kept; one sender's batches land in order, so the retired
+  // query's arrived first.
+  sirius_physical_exchange_source kept(key_value_types(), 0, c.all[1].service, later, {0}, false);
+  CHECK(flat(drain(kept)).size() == rows_per_batch);
+  sirius_physical_exchange_source fresh(
+    key_value_types(), 0, c.all[1].service, retired, {0}, false);
+  CHECK(fresh.get_next_task_hint()->hint != sirius::op::TaskCreationHint::READY);
+  CHECK_FALSE(fresh.all_ports_empty());
+}
+
+TEST_CASE("queries retiring out of order are each forgotten", "[exchange][operators]")
+{
+  ranks c(2);
+  using sirius::exchange::query_stream_bits;
+  auto& service = *c.all[1].service;
+  // Query 2 retires before query 1 (planned first, run later).
+  service.forget(2);
+  stream_id const first = (std::uint64_t{1} << query_stream_bits) | 1;
+  c.all[0].service->send(first, 1, key_value_batch(0, 0));
+  c.all[0].service->close(first, 1);
+  sirius_physical_exchange_source source(key_value_types(), 0, c.all[1].service, first, {0}, false);
+  CHECK(flat(drain(source)).size() == rows_per_batch);
+}
+
 TEST_CASE("a shut-down exchange service stops its transport and refuses later sends",
           "[exchange][operators]")
 {
