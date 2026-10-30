@@ -127,8 +127,15 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
   // Source interface
   bool is_source() const override { return true; }
 
+  sirius::OrderPreservationType source_order() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
+
   // Sink interface
   bool is_sink() const override { return true; }
+
+  bool sink_order_dependent() const override { return false; }
 
   //! Whether this merge joins its downstream pipeline.
   [[nodiscard]] bool fuse_into_parent() const noexcept { return _fuse_into_parent; }

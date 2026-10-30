@@ -724,9 +724,21 @@ class sirius_physical_operator {
   virtual std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                                  ::cuda::stream_ref stream);
 
+  //! The influence the operator has on order (insertion order means no influence)
+  virtual sirius::OrderPreservationType operator_order() const
+  {
+    return sirius::OrderPreservationType::INSERTION_ORDER;
+  }
+
  public:
   // Source interface
   virtual bool is_source() const { return false; }
+
+  //! The type of order emitted by the operator (as a source)
+  virtual sirius::OrderPreservationType source_order() const
+  {
+    return sirius::OrderPreservationType::INSERTION_ORDER;
+  }
 
   // Data-size estimator hooks. nullopt means unavailable; see
   // docs/super-sirius/data-size-estimation.md.
@@ -774,6 +786,10 @@ class sirius_physical_operator {
             _parent_op->type == SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN ||
             _parent_op->type == SiriusPhysicalOperatorType::DENSE_COUNT_JOIN);
   }
+
+  //! Whether or not the sink operator depends on the order of the input chunks
+  //! If this is set to true, we cannot do things like caching intermediate vectors
+  virtual bool sink_order_dependent() const { return false; }
 
  public:
   // Pipeline construction

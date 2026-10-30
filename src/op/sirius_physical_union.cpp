@@ -40,6 +40,11 @@ std::string sirius_physical_union::get_name() const { return "UNION"; }
 
 bool sirius_physical_union::is_source() const { return true; }
 
+sirius::OrderPreservationType sirius_physical_union::source_order() const
+{
+  return sirius::OrderPreservationType::NO_ORDER;
+}
+
 void sirius_physical_union::build_pipelines(pipeline::sirius_pipeline& current,
                                             pipeline::sirius_meta_pipeline& meta_pipeline)
 {

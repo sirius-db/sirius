@@ -54,6 +54,9 @@ class sirius_physical_union : public sirius_physical_operator {
 
   bool is_source() const override;
 
+  //! The union source does not guarantee an output order.
+  sirius::OrderPreservationType source_order() const override;
+
   //! The base throws for a non-sink operator with more than one child.
   void build_pipelines(pipeline::sirius_pipeline& current,
                        pipeline::sirius_meta_pipeline& meta_pipeline) override;

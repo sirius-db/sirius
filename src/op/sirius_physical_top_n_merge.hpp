@@ -62,6 +62,10 @@ class sirius_physical_top_n_merge : public sirius_physical_operator {
 
  public:
   bool is_source() const override { return true; }
+  sirius::OrderPreservationType source_order() const override
+  {
+    return sirius::OrderPreservationType::FIXED_ORDER;
+  }
 
  public:
   bool is_sink() const override { return true; }

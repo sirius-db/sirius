@@ -127,8 +127,15 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   // Source interface
   bool is_source() const override { return true; }
 
+  sirius::OrderPreservationType source_order() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
+
   // Sink interface
   bool is_sink() const override { return true; }
+
+  bool sink_order_dependent() const override { return false; }
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          ::cuda::stream_ref stream) override;
