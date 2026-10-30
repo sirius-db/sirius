@@ -79,17 +79,46 @@ using evaluate_result = expression_evaluator::evaluate_result;
 
 namespace {
 
-// Check before DIV/MOD: cuDF leaves zero divisors undefined and does not implement DuckDB's
-// signed-minimum/-1 overflow error (which applies to both // and %). CPU replay also preserves
-// error_on_division_by_zero=false and CASE branches that the GPU evaluates eagerly.
-void require_safe_division(cudf::column_view const& left,
-                           cudf::column_view const& right,
+/**
+ * @brief Read-only preflight for // and %; the caller performs the arithmetic.
+ *
+ * Safe pairs and pairs containing NULL return normally. A valid zero divisor or
+ * signed-minimum/-1 pair throws not_implemented_exception before cuDF arithmetic,
+ * requesting runtime CPU replay when enabled or safe query failure otherwise.
+ * This guard neither mutates operands nor produces an arithmetic result. Replay
+ * supplies DuckDB's errors/settings and guarded CASE semantics; the guard does not.
+ */
+void require_safe_division(evaluate_result const& left_result,
+                           evaluate_result const& right_result,
                            ::cuda::stream_ref stream,
                            rmm::device_async_resource_ref mr)
 {
-  if (left.is_empty()) { return; }
+  if ((!left_result.is_scalar() && left_result.get_column_view().is_empty()) ||
+      (!right_result.is_scalar() && right_result.get_column_view().is_empty())) {
+    return;
+  }
+  // Comparisons need a column on one side. Retain only one row for a scalar; the caller
+  // keeps the original scalar for cuDF's scalar-column arithmetic overload.
+  auto left_scalar        = left_result.is_scalar()
+                              ? cudf::make_column_from_scalar(left_result.get_scalar(), 1, stream, mr)
+                              : nullptr;
+  auto right_scalar       = right_result.is_scalar()
+                              ? cudf::make_column_from_scalar(right_result.get_scalar(), 1, stream, mr)
+                              : nullptr;
+  auto const left         = left_scalar ? left_scalar->view() : left_result.get_column_view();
+  auto const right        = right_scalar ? right_scalar->view() : right_result.get_column_view();
   auto const boolean_type = cudf::data_type{cudf::type_id::BOOL8};
-  auto const zero         = cudf::numeric_scalar<int32_t>(0, true, stream, mr);
+  // A one-row predicate represents a scalar operand. Broadcast it with the scalar overload,
+  // preserving its validity; scalar_column_view is supported by transform, not binary_operation.
+  auto combine = [&](cudf::column_view lhs, cudf::column_view rhs, cudf::binary_operator op) {
+    if (lhs.size() == rhs.size()) {
+      return cudf::binary_operation(lhs, rhs, op, boolean_type, stream, mr);
+    }
+    auto const scalar = cudf::get_element(lhs.size() == 1 ? lhs : rhs, 0, stream, mr);
+    return lhs.size() == 1 ? cudf::binary_operation(*scalar, rhs, op, boolean_type, stream, mr)
+                           : cudf::binary_operation(lhs, *scalar, op, boolean_type, stream, mr);
+  };
+  auto const zero = cudf::numeric_scalar<int32_t>(0, true, stream, mr);
   auto invalid =
     cudf::binary_operation(right, zero, cudf::binary_operator::EQUAL, boolean_type, stream, mr);
 
@@ -115,28 +144,14 @@ void require_safe_division(cudf::column_view const& left,
       left, *minimum, cudf::binary_operator::EQUAL, boolean_type, stream, mr);
     auto is_minus_one = cudf::binary_operation(
       right, minus_one, cudf::binary_operator::EQUAL, boolean_type, stream, mr);
-    auto overflow = cudf::binary_operation(is_minimum->view(),
-                                           is_minus_one->view(),
-                                           cudf::binary_operator::LOGICAL_AND,
-                                           boolean_type,
-                                           stream,
-                                           mr);
-    invalid       = cudf::binary_operation(invalid->view(),
-                                     overflow->view(),
-                                     cudf::binary_operator::LOGICAL_OR,
-                                     boolean_type,
-                                     stream,
-                                     mr);
+    auto overflow =
+      combine(is_minimum->view(), is_minus_one->view(), cudf::binary_operator::LOGICAL_AND);
+    invalid = combine(invalid->view(), overflow->view(), cudf::binary_operator::LOGICAL_OR);
   }
   // A zero divisor is harmless when the numerator is NULL. Right-side NULLs have already
   // propagated through the comparisons; contains ignores every invalid predicate row.
-  auto left_valid       = cudf::is_valid(left, stream, mr);
-  invalid               = cudf::binary_operation(invalid->view(),
-                                   left_valid->view(),
-                                   cudf::binary_operator::LOGICAL_AND,
-                                   boolean_type,
-                                   stream,
-                                   mr);
+  auto left_valid = cudf::is_valid(left, stream, mr);
+  invalid = combine(invalid->view(), left_valid->view(), cudf::binary_operator::LOGICAL_AND);
   auto const true_value = cudf::numeric_scalar<bool>(true, true, stream, mr);
   if (cudf::contains(invalid->view(), true_value, stream)) {
     throw not_implemented_exception(
@@ -428,18 +443,7 @@ evaluate_result expression_evaluator::evaluate_function_kernel(
     // cuDF has no scalar-scalar binary operation; broadcast one side when both are constants.
     auto right = left.is_scalar() ? evaluate_as_column(*args[1])
                                   : evaluate(*args[1], evaluation_mode::MATERIALIZE);
-    if (division_requires_check(alt)) {
-      // Checked column pairs preserve NULL validity, including a NULL numerator above a zero.
-      if (left.is_scalar()) {
-        left = evaluate_result(
-          cudf::make_column_from_scalar(left.get_scalar(), _input_table.num_rows(), _stream, _mr));
-      }
-      if (right.is_scalar()) {
-        right = evaluate_result(
-          cudf::make_column_from_scalar(right.get_scalar(), _input_table.num_rows(), _stream, _mr));
-      }
-      require_safe_division(left.get_column_view(), right.get_column_view(), _stream, _mr);
-    }
+    if (division_requires_check(alt)) { require_safe_division(left, right, _stream, _mr); }
     if (alt.return_type().id() == type_id::HUGEINT &&
         (op == cudf::binary_operator::ADD || op == cudf::binary_operator::SUB ||
          op == cudf::binary_operator::MUL)) {
