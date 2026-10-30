@@ -1232,6 +1232,15 @@ void SiriusContext::terminate()
   for (auto& executor : downgrade_executors_) {
     executor->stop();
   }
+  // The exchange's engine thread lands batches in memory_manager_'s spaces and calls into sources
+  // and the components above: stop it while they all still exist. Plans can hold the service past
+  // terminate() (a prepared statement), so dropping this reference alone would not stop it.
+  std::shared_ptr<sirius::exchange::exchange_service> exchange;
+  {
+    std::lock_guard lock{exchange_mutex_};
+    exchange = std::move(exchange_service_);
+  }
+  if (exchange) { exchange->shutdown(); }
   // Drop any per-query state a window failed to clean up (e.g. a latched-unavailable path whose
   // best-effort reset threw). Doing it here, rather than letting ~task_creator do it, keeps the
   // DuckTableScanState/BlockHandle releases inside the window where DuckDB is still intact.

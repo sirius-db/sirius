@@ -1042,7 +1042,7 @@ class SiriusContext : public ClientContextState {
   std::array<std::atomic<uint64_t>, transparent_execution_stats::semantic_reason_count>
     semantic_decline_counts_{};
 
-  // Last, so it goes first: its transport uses the memory spaces above.
+  // terminate() shuts the service down before the memory manager: its transport uses its spaces.
   std::mutex exchange_mutex_;
   std::vector<std::string> exchange_peers_;
   uint32_t exchange_rank_{0};
