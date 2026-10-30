@@ -20,10 +20,11 @@
 #include "op/aggregate/gpu_aggregate_impl.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
 #include "op/order/gpu_order_impl.hpp"
+#include "operator/operator_type_traits.hpp"
 #include "scan/test_utils.hpp"
+#include "utils/data_utils.hpp"
 #include "utils/utils.hpp"
 
-#include <cudf/column/column_factories.hpp>
 #include <cudf/utilities/bit.hpp>
 
 #include <cucascade/memory/memory_space.hpp>
@@ -1092,31 +1093,16 @@ TEST_CASE("Merge order-by with mixed empty and non-empty local order-by results"
 
 namespace {
 
-std::unique_ptr<cudf::column> make_int64_column(std::vector<int64_t> const& values,
-                                                memory_space& mem_space)
-{
-  auto stream = cudf::get_default_stream();
-  auto column = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT64},
-                                          static_cast<cudf::size_type>(values.size()),
-                                          cudf::mask_state::UNALLOCATED,
-                                          stream,
-                                          mem_space.get_default_allocator());
-  cudaMemcpyAsync(column->mutable_view().data<int64_t>(),
-                  values.data(),
-                  values.size() * sizeof(int64_t),
-                  cudaMemcpyHostToDevice,
-                  stream.get());
-  stream.sync();
-  return column;
-}
+using sirius::test::vector_to_cudf_column;
+using sirius::test::operator_utils::gpu_type_traits;
 
 std::shared_ptr<data_batch> make_partial(std::vector<int64_t> const& keys,
                                          std::vector<int64_t> const& sums,
                                          memory_space& mem_space)
 {
   std::vector<std::unique_ptr<cudf::column>> columns;
-  columns.push_back(make_int64_column(keys, mem_space));
-  columns.push_back(make_int64_column(sums, mem_space));
+  columns.push_back(vector_to_cudf_column<gpu_type_traits<int64_t>>(keys));
+  columns.push_back(vector_to_cudf_column<gpu_type_traits<int64_t>>(sums));
   return sirius::make_data_batch(std::make_unique<cudf::table>(std::move(columns)),
                                  mem_space,
                                  cudf::get_default_stream(),

@@ -459,7 +459,7 @@ Complex join keys are materialized into columns before this description is const
 - **Routing:** hash, single-destination, replication, and resident-device selection use a resolved
   `partition_layout`. Sort range routing retains its separate implementation pending the ordered
   repository work.
-- **Order-preserving hash partition:** a `HASH` partition whose single INT64 key is ascending uses `stable_hash_partition()` (`src/op/partition/stable_hash_partition.cpp`), so rows keep their input order within each partition and sorted partials stay sorted for the merge; any other input uses `unordered_hash_partition()`. Both assign rows by MurmurHash3 row hash modulo the partition count, so a key lands in one partition whichever path a batch takes. See [Order-Preserving Partition and Sorted Merge](optimizations.md#order-preserving-partition-and-sorted-merge).
+- **Order-preserving hash partition:** a `HASH` partition whose single INT64 key is ascending uses `stable_hash_partition()` (`src/op/partition/gpu_partition_impl.cpp`), so rows keep their input order within each partition and sorted partials stay sorted for the merge; any other input uses `unordered_hash_partition()`. Both assign rows by MurmurHash3 row hash modulo the partition count, so a key lands in one partition whichever path a batch takes. See [Order-Preserving Partition and Sorted Merge](optimizations.md#order-preserving-partition-and-sorted-merge).
 - **Fixed layout:** `set_fixed_layout()` supplies the destination count/placement without a sizing
   consumer. Conflicting changes to an installed layout are rejected.
 - **Adaptive layout:** explicitly bound input policies resolve count, placement, and consumer

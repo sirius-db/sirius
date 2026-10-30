@@ -99,7 +99,6 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/main/connection_manager.hpp"
 #include "exec/stream_plan_bindings.hpp"
-#include "helper/natural_sort.hpp"
 #include "helper/type_conversions.hpp"
 #include "late_mat/pin_uniqueness.hpp"
 #include "log/logging.hpp"
@@ -149,6 +148,7 @@ extern "C" int cudaProfilerStop();
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <span>
 #include <string_view>
@@ -1211,11 +1211,12 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
       }
       // GlobFiles returns local files in directory order, and pinned chunks pack several
       // files each, so a table stored sorted across numbered files (part.0, part.1, ...) would
-      // pin into chunks whose rows are not in order. A natural sort, comparing digit runs
-      // numerically, keeps such tables sorted within and across chunks, which lets sorted-key
-      // aggregation apply to their scans. Nothing relies on this order for correctness.
+      // pin into chunks whose rows are not in order. Sorting the names with digit runs compared
+      // numerically (part.2 before part.10) keeps such tables sorted within and across chunks,
+      // which lets sorted-key aggregation apply to their scans. Nothing relies on this order for
+      // correctness.
       std::sort(file_paths.begin(), file_paths.end(), [](auto const& lhs, auto const& rhs) {
-        return sirius::natural_less(lhs, rhs);
+        return strverscmp(lhs.c_str(), rhs.c_str()) < 0;
       });
 
       // tier='parquet' pins the undecoded bytes and stops there: there is no

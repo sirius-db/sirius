@@ -18,10 +18,10 @@
 #include "data/data_batch_utils.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/partition/gpu_partition_impl.hpp"
+#include "operator/operator_type_traits.hpp"
 #include "scan/test_utils.hpp"
+#include "utils/data_utils.hpp"
 #include "utils/utils.hpp"
-
-#include <cudf/column/column_factories.hpp>
 
 #include <cucascade/memory/memory_space.hpp>
 
@@ -173,6 +173,9 @@ TEST_CASE("Hash partition basic", "[operator][hash_partition]")
 
 namespace {
 
+using sirius::test::vector_to_cudf_column;
+using sirius::test::operator_utils::gpu_type_traits;
+
 /// A batch of [key INT64, row INT64] where key = row / 5, in ascending or descending row order.
 std::shared_ptr<data_batch> make_key_row_batch(int num_rows,
                                                bool descending,
@@ -185,27 +188,12 @@ std::shared_ptr<data_batch> make_key_row_batch(int num_rows,
     keys.push_back(row / 5);
     rows.push_back(row);
   }
-  auto stream = cudf::get_default_stream();
-  auto make   = [&](std::vector<int64_t> const& values) {
-    auto column = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT64},
-                                            num_rows,
-                                            cudf::mask_state::UNALLOCATED,
-                                            stream,
-                                            mem_space.get_default_allocator());
-    cudaMemcpyAsync(column->mutable_view().data<int64_t>(),
-                    values.data(),
-                    values.size() * sizeof(int64_t),
-                    cudaMemcpyHostToDevice,
-                    stream.get());
-    stream.sync();
-    return column;
-  };
   std::vector<std::unique_ptr<cudf::column>> columns;
-  columns.push_back(make(keys));
-  columns.push_back(make(rows));
+  columns.push_back(vector_to_cudf_column<gpu_type_traits<int64_t>>(keys));
+  columns.push_back(vector_to_cudf_column<gpu_type_traits<int64_t>>(rows));
   return sirius::make_data_batch(std::make_unique<cudf::table>(std::move(columns)),
                                  mem_space,
-                                 stream,
+                                 cudf::get_default_stream(),
                                  sirius::telemetry::batch_telemetry_info{});
 }
 
@@ -261,6 +249,17 @@ TEST_CASE("Hash partition keeps the order of a sorted key and places keys consis
     for (auto const& row : descending[partition_idx]) {
       REQUIRE(partition_of_key.at(row[0]) == partition_idx);
     }
+  }
+}
+
+TEST_CASE("Hash partition of a batch with no rows", "[operator][hash_partition]")
+{
+  auto* mem_space = get_shared_mem_space();
+  auto empty      = make_key_row_batch(0, /*descending=*/false, *mem_space);
+  auto partitions = partition_by_key(*empty, 3, *mem_space);
+  REQUIRE(partitions.size() == 3);
+  for (auto const& rows : partitions) {
+    CHECK(rows.empty());
   }
 }
 

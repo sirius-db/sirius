@@ -67,81 +67,55 @@ bool check(cudf::column_view const& column)
   return typed;
 }
 
-}  // namespace
-
-TEST_CASE("keys_ascending - integer keys", "[aggregate][sorted_keys]")
+/// An ascending and a descending column of one type: keys_ascending() must tell them apart.
+template <typename T>
+void check_pair(cudf::type_id id,
+                std::vector<T> const& ascending,
+                std::vector<T> const& descending,
+                int scale = 0)
 {
-  auto const int64 = cudf::data_type{cudf::type_id::INT64};
-  SECTION("empty and single row")
-  {
-    CHECK(check(*make_column<int64_t>(int64, {})));
-    CHECK(check(*make_column<int64_t>(int64, {7})));
-  }
-  SECTION("ascending with runs of equal keys")
-  {
-    CHECK(check(*make_column<int64_t>(int64, {-5, -5, 0, 1, 1, 1, 9})));
-  }
-  SECTION("a descent at the first pair")
-  {
-    CHECK_FALSE(check(*make_column<int64_t>(int64, {2, 1, 3})));
-  }
-  SECTION("a descent at the last pair, past one grid stride")
-  {
-    std::vector<int64_t> values(3'000'000);
-    for (std::size_t i = 0; i < values.size(); ++i) {
-      values[i] = static_cast<int64_t>(i / 4);
-    }
-    CHECK(check(*make_column<int64_t>(int64, values)));
-    values.back() = -1;
-    CHECK_FALSE(check(*make_column<int64_t>(int64, values)));
-  }
-  SECTION("signed comparison")
-  {
-    CHECK(check(*make_column<int32_t>(cudf::data_type{cudf::type_id::INT32}, {-2, -1, 0, 1})));
-    CHECK_FALSE(check(*make_column<int32_t>(cudf::data_type{cudf::type_id::INT32}, {0, -1})));
-  }
-  SECTION("unsigned comparison")
-  {
-    auto const uint32 = cudf::data_type{cudf::type_id::UINT32};
-    CHECK(check(*make_column<uint32_t>(uint32, {1, 2, 0x80000000u, 0xffffffffu})));
-    CHECK_FALSE(check(*make_column<uint32_t>(uint32, {0x80000000u, 1})));
-  }
-  SECTION("sliced column")
-  {
-    auto const column = make_column<int64_t>(int64, {9, 1, 2, 3, 0});
-    CHECK(check(cudf::slice(column->view(), {1, 4})[0]));
-    CHECK_FALSE(check(cudf::slice(column->view(), {0, 3})[0]));
-  }
+  CHECK(check(*make_column<T>(cudf::data_type{id, scale}, ascending)));
+  CHECK_FALSE(check(*make_column<T>(cudf::data_type{id, scale}, descending)));
 }
 
-TEST_CASE("keys_ascending - fixed-point and chrono keys", "[aggregate][sorted_keys]")
+}  // namespace
+
+TEST_CASE("keys_ascending - fixed-width keys", "[aggregate][sorted_keys]")
 {
-  auto const decimal64 = cudf::data_type{cudf::type_id::DECIMAL64, -2};
-  CHECK(check(*make_column<int64_t>(decimal64, {-100, 0, 0, 250})));
-  CHECK_FALSE(check(*make_column<int64_t>(decimal64, {250, -100})));
+  using cudf::type_id;
+  __int128_t const big = static_cast<__int128_t>(1) << 100;
+  check_pair<int64_t>(type_id::INT64, {-5, -5, 0, 1, 1, 9}, {2, 1, 3});
+  check_pair<int32_t>(type_id::INT32, {-2, -1, 0, 1}, {0, -1});
+  check_pair<uint32_t>(type_id::UINT32, {1, 2, 0x80000000u, 0xffffffffu}, {0x80000000u, 1});
+  check_pair<int64_t>(type_id::DECIMAL64, {-100, 0, 0, 250}, {250, -100}, -2);
+  check_pair<__int128_t>(type_id::DECIMAL128, {-big, 0, big}, {big, -big}, -2);
+  check_pair<int32_t>(type_id::TIMESTAMP_DAYS, {-1, 0, 10000}, {10000, 0});
 
-  auto const decimal128 = cudf::data_type{cudf::type_id::DECIMAL128, -2};
-  __int128_t const big  = static_cast<__int128_t>(1) << 100;
-  CHECK(check(*make_column<__int128_t>(decimal128, {-big, 0, big})));
-  CHECK_FALSE(check(*make_column<__int128_t>(decimal128, {big, -big})));
+  auto const int64 = cudf::data_type{type_id::INT64};
+  CHECK(check(*make_column<int64_t>(int64, {})));
+  CHECK(check(*make_column<int64_t>(int64, {7})));
 
-  auto const days = cudf::data_type{cudf::type_id::TIMESTAMP_DAYS};
-  CHECK(check(*make_column<int32_t>(days, {-1, 0, 10000})));
-  CHECK_FALSE(check(*make_column<int32_t>(days, {10000, 0})));
+  auto const sliced = make_column<int64_t>(int64, {9, 1, 2, 3, 0});
+  CHECK(check(cudf::slice(sliced->view(), {1, 4})[0]));
+  CHECK_FALSE(check(cudf::slice(sliced->view(), {0, 3})[0]));
+
+  // A descent in the last pair, past one grid stride.
+  std::vector<int64_t> values(3'000'000);
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    values[i] = static_cast<int64_t>(i / 4);
+  }
+  CHECK(check(*make_column<int64_t>(int64, values)));
+  values.back() = -1;
+  CHECK_FALSE(check(*make_column<int64_t>(int64, values)));
 }
 
 TEST_CASE("keys_ascending - keys checked by cuDF", "[aggregate][sorted_keys]")
 {
-  SECTION("nullable keys")
-  {
-    auto const int64 = cudf::data_type{cudf::type_id::INT64};
-    CHECK(check(*make_column<int64_t>(int64, {1, 2, 0}, 2)));
-    CHECK_FALSE(check(*make_column<int64_t>(int64, {1, 0, 2}, 1)));
-  }
-  SECTION("floating-point keys")
-  {
-    auto const float64 = cudf::data_type{cudf::type_id::FLOAT64};
-    CHECK(check(*make_column<double>(float64, {-1.5, 0.0, 2.0, std::nan("")})));
-    CHECK_FALSE(check(*make_column<double>(float64, {std::nan(""), 0.0})));
-  }
+  auto const int64 = cudf::data_type{cudf::type_id::INT64};
+  CHECK(check(*make_column<int64_t>(int64, {1, 2, 0}, 2)));
+  CHECK_FALSE(check(*make_column<int64_t>(int64, {1, 0, 2}, 1)));
+
+  auto const float64 = cudf::data_type{cudf::type_id::FLOAT64};
+  CHECK(check(*make_column<double>(float64, {-1.5, 0.0, 2.0, std::nan("")})));
+  CHECK_FALSE(check(*make_column<double>(float64, {std::nan(""), 0.0})));
 }
