@@ -360,10 +360,8 @@ std::unique_ptr<cudf::table> try_low_cardinality_groupby(
   rmm::device_uvector<int> flags(2, stream, mr);
   check_cuda(cudaMemsetAsync(
     present_codes.data(), 0, present_codes.size() * sizeof(uint32_t), stream.get()));
-  check_cuda(cudaMemsetAsync(representative_rows.data(),
-                             0xFF,
-                             representative_rows.size() * sizeof(int32_t),
-                             stream.get()));
+  check_cuda(cudaMemsetAsync(
+    representative_rows.data(), 0xFF, representative_rows.size() * sizeof(int32_t), stream.get()));
   check_cuda(cudaMemsetAsync(flags.data(), 0, flags.size() * sizeof(int), stream.get()));
 
   int device_id = 0;
@@ -445,38 +443,36 @@ std::unique_ptr<cudf::table> try_low_cardinality_groupby(
       keys, num_rows, group_of_code.data(), group_ids.data());
     check_cuda(cudaGetLastError());
     if (num_groups <= 4) {
-      aggregate_columns_kernel<4>
-        <<<num_blocks, block_size, 0, stream.get()>>>(group_ids.data(),
-                                                        num_rows,
-                                                        num_groups,
-                                                        sum_columns.data(),
-                                                        num_sum_columns,
-                                                        max_abs_value,
-                                                        block_totals.data(),
-                                                        flags.data() + 1);
+      aggregate_columns_kernel<4><<<num_blocks, block_size, 0, stream.get()>>>(group_ids.data(),
+                                                                               num_rows,
+                                                                               num_groups,
+                                                                               sum_columns.data(),
+                                                                               num_sum_columns,
+                                                                               max_abs_value,
+                                                                               block_totals.data(),
+                                                                               flags.data() + 1);
     } else {
-      aggregate_columns_kernel<8>
-        <<<num_blocks, block_size, 0, stream.get()>>>(group_ids.data(),
-                                                        num_rows,
-                                                        num_groups,
-                                                        sum_columns.data(),
-                                                        num_sum_columns,
-                                                        max_abs_value,
-                                                        block_totals.data(),
-                                                        flags.data() + 1);
+      aggregate_columns_kernel<8><<<num_blocks, block_size, 0, stream.get()>>>(group_ids.data(),
+                                                                               num_rows,
+                                                                               num_groups,
+                                                                               sum_columns.data(),
+                                                                               num_sum_columns,
+                                                                               max_abs_value,
+                                                                               block_totals.data(),
+                                                                               flags.data() + 1);
     }
     check_cuda(cudaGetLastError());
     // group_ids is freed at the end of this scope; the stream orders the free after its readers.
   } else {
     aggregate_kernel<<<num_blocks, block_size, shared_size, stream.get()>>>(keys,
-                                                                              num_rows,
-                                                                              group_of_code.data(),
-                                                                              num_groups,
-                                                                              sum_columns.data(),
-                                                                              num_sum_columns,
-                                                                              max_abs_value,
-                                                                              block_totals.data(),
-                                                                              flags.data() + 1);
+                                                                            num_rows,
+                                                                            group_of_code.data(),
+                                                                            num_groups,
+                                                                            sum_columns.data(),
+                                                                            num_sum_columns,
+                                                                            max_abs_value,
+                                                                            block_totals.data(),
+                                                                            flags.data() + 1);
   }
   check_cuda(cudaGetLastError());
   rmm::device_uvector<__int128_t> slot_totals(slots_per_copy, stream, mr);
@@ -521,21 +517,21 @@ std::unique_ptr<cudf::table> try_low_cardinality_groupby(
                         output_type, num_groups, cudf::mask_state::UNALLOCATED, stream, mr);
     int const extract_blocks = (num_groups + block_size - 1) / block_size;
     if (is_decimal_sum) {
-      extract_kernel<__int128_t><<<extract_blocks, block_size, 0, stream.get()>>>(
-        slot_totals.data(),
-        num_groups,
-        slot_stride,
-        aggregate_slot[agg_idx],
-        output->mutable_view().data<__int128_t>(),
-        flags.data() + 1);
+      extract_kernel<__int128_t>
+        <<<extract_blocks, block_size, 0, stream.get()>>>(slot_totals.data(),
+                                                          num_groups,
+                                                          slot_stride,
+                                                          aggregate_slot[agg_idx],
+                                                          output->mutable_view().data<__int128_t>(),
+                                                          flags.data() + 1);
     } else {
       extract_kernel<int64_t>
         <<<extract_blocks, block_size, 0, stream.get()>>>(slot_totals.data(),
-                                                            num_groups,
-                                                            slot_stride,
-                                                            aggregate_slot[agg_idx],
-                                                            output->mutable_view().data<int64_t>(),
-                                                            flags.data() + 1);
+                                                          num_groups,
+                                                          slot_stride,
+                                                          aggregate_slot[agg_idx],
+                                                          output->mutable_view().data<int64_t>(),
+                                                          flags.data() + 1);
     }
     check_cuda(cudaGetLastError());
     output_columns.push_back(std::move(output));
