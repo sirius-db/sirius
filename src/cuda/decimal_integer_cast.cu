@@ -32,6 +32,7 @@
 
 #include <cstdint>
 #include <limits>
+#include <type_traits>
 
 namespace sirius {
 namespace {
@@ -63,15 +64,24 @@ integer_bounds target_bounds(logical_type const& target)
   }
 }
 
-template <typename Rep>
+template <
+  typename Rep,
+  typename Compute = std::conditional_t<(sizeof(Rep) <= sizeof(int64_t)), int64_t, __int128_t>>
 std::unique_ptr<cudf::column> convert(cudf::column_view const& input,
                                       logical_type const& target,
                                       bool try_cast,
-                                      __int128_t divisor,
+                                      __int128_t wide_divisor,
                                       ::cuda::stream_ref stream,
                                       rmm::device_async_resource_ref mr)
 {
-  auto const bounds = target_bounds(target);
+  // Narrowed cuDF carriers can retain scales above 18. Keep those large divisors exact.
+  if constexpr (sizeof(Compute) < sizeof(__int128_t)) {
+    if (wide_divisor > std::numeric_limits<Compute>::max()) {
+      return convert<Rep, __int128_t>(input, target, try_cast, wide_divisor, stream, mr);
+    }
+  }
+  auto const divisor = static_cast<Compute>(wide_divisor);
+  auto const bounds  = target_bounds(target);
   // Rounding to an integer never needs a wider representation than the input. Keep that width
   // until the checked final cast; widening every DECIMAL32/64 to DECIMAL128 is unnecessary.
   auto rounded = cudf::make_fixed_point_column(
@@ -94,7 +104,7 @@ std::unique_ptr<cudf::column> convert(cudf::column_view const& input,
                     [=] __device__(cudf::size_type i) -> Rep {
                       valid[i] = false;
                       if (mask && !cudf::bit_is_set(mask, offset + i)) { return 0; }
-                      auto const raw       = static_cast<__int128_t>(data[i]);
+                      auto const raw       = static_cast<Compute>(data[i]);
                       auto result          = raw / divisor;
                       auto const remainder = raw % divisor;
                       // Quotient/remainder avoids adding half a divisor to a value near its

@@ -114,6 +114,72 @@ TEMPLATE_TEST_CASE("decimal integer casts round ties away from zero under every 
   }
 }
 
+TEMPLATE_TEST_CASE("decimal integer casts preserve narrow scale limits and raw extrema",
+                   "[expression_evaluator][decimal_integer_cast]",
+                   int32_t,
+                   int64_t)
+{
+  constexpr int32_t scale   = sizeof(TestType) == 4 ? 9 : 18;
+  constexpr int64_t divisor = sizeof(TestType) == 4 ? 1000000000LL : 1000000000000000000LL;
+  constexpr auto half       = static_cast<TestType>(divisor / 2);
+  auto ties   = decimals<TestType>({-half - 1, -half, -half + 1, half - 1, half, half + 1}, scale);
+  auto result = sirius::cast_decimal_to_integer(
+    ties->view(), logical_type::make(type_id::BIGINT), false, stream, mr);
+  REQUIRE(integers(result->view()) == std::vector<__int128_t>{-1, -1, 0, 0, 1, 1});
+
+  constexpr auto minimum = std::numeric_limits<TestType>::min();
+  constexpr auto maximum = std::numeric_limits<TestType>::max();
+  auto whole             = decimals<TestType>({minimum, maximum}, 0);
+  result                 = sirius::cast_decimal_to_integer(
+    whole->view(), logical_type::make(type_id::BIGINT), false, stream, mr);
+  REQUIRE(integers(result->view()) == std::vector<__int128_t>{minimum, maximum});
+
+  auto tenths = decimals<TestType>({minimum, maximum}, 1);
+  result      = sirius::cast_decimal_to_integer(
+    tenths->view(), logical_type::make(type_id::BIGINT), false, stream, mr);
+  constexpr int64_t rounded_maximum = sizeof(TestType) == 4 ? 214748365LL : 922337203685477581LL;
+  REQUIRE(integers(result->view()) == std::vector<__int128_t>{-rounded_maximum, rounded_maximum});
+}
+
+TEMPLATE_TEST_CASE("decimal integer casts preserve high scales in narrow carriers",
+                   "[expression_evaluator][decimal_integer_cast]",
+                   int32_t,
+                   int64_t)
+{
+  constexpr auto minimum  = std::numeric_limits<TestType>::min();
+  constexpr auto maximum  = std::numeric_limits<TestType>::max();
+  constexpr int32_t scale = sizeof(TestType) == 4 ? 10 : 19;
+  auto input              = decimals<TestType>({minimum, maximum}, scale);
+  auto result             = sirius::cast_decimal_to_integer(
+    input->view(), logical_type::make(type_id::BIGINT), false, stream, mr);
+  constexpr int64_t rounded_maximum = sizeof(TestType) == 4 ? 0 : 1;
+  REQUIRE(integers(result->view()) == std::vector<__int128_t>{-rounded_maximum, rounded_maximum});
+
+  if constexpr (sizeof(TestType) == 8) {
+    constexpr int64_t half = 5000000000000000000LL;
+    auto ties = decimals<int64_t>({-half - 1, -half, -half + 1, half - 1, half, half + 1}, 19);
+    result    = sirius::cast_decimal_to_integer(
+      ties->view(), logical_type::make(type_id::BIGINT), false, stream, mr);
+    REQUIRE(integers(result->view()) == std::vector<__int128_t>{-1, -1, 0, 0, 1, 1});
+  }
+
+  auto tiny = decimals<TestType>({minimum, maximum}, 38);
+  result    = sirius::cast_decimal_to_integer(
+    tiny->view(), logical_type::make(type_id::BIGINT), false, stream, mr);
+  REQUIRE(integers(result->view()) == std::vector<__int128_t>{0, 0});
+
+  for (auto mode : {strategy::MATERIALIZE, strategy::AST_INTERPRET, strategy::AST_JIT}) {
+    CAPTURE(mode);
+    auto expr = make_cast(make_ref_typed(0, logical_type::make_decimal(38, 38)),
+                          logical_type::make(type_id::BIGINT),
+                          false);
+    sirius::expression_evaluator evaluator(
+      *expr, mr, stream, sirius::expression_query_policy{mode}, 1);
+    auto evaluated = evaluator.evaluate(cudf::table_view{{tiny->view()}});
+    REQUIRE(integers(evaluated->view().column(0)) == std::vector<__int128_t>{0, 0});
+  }
+}
+
 TEST_CASE("decimal integer casts preserve wide integers and scale 38",
           "[expression_evaluator][decimal_integer_cast]")
 {
