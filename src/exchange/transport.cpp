@@ -148,6 +148,7 @@ struct transport::engine {
     std::vector<bool> seen;
     std::uint32_t copied{0};
     std::vector<frame_message> waiting;
+    bool asked_for_room{false};
   };
   std::map<landing_key, landing> landings;
 
@@ -173,7 +174,7 @@ struct transport::engine {
          cucascade::memory::memory_space* h,
          callbacks c,
          options o)
-    : fab(f), send_ring(s), recv_ring(r), gpu(g), host(h), cb(std::move(c)), opts(o)
+    : fab(f), send_ring(s), recv_ring(r), gpu(g), host(h), cb(std::move(c)), opts(std::move(o))
   {
     if (!cb.on_batch || !cb.on_end || !cb.on_error || !cb.on_abort) {
       throw sirius::invalid_input_exception("exchange: every transport callback must be set");
@@ -257,7 +258,11 @@ struct transport::engine {
     if (!l.header || l.waiting.empty()) { return false; }
     if (!l.in) {
       l.in = incoming_batch::land(*l.header, gpu, host, recv_stream.view());
-      if (!l.in) { return false; }
+      if (!l.in) {
+        if (!l.asked_for_room && opts.request_room) { opts.request_room(l.header->stream_bytes); }
+        l.asked_for_room = true;
+        return false;
+      }
     }
     for (auto const& m : l.waiting) {
       auto const at = static_cast<std::uint64_t>(m.k) * frame_bytes();
