@@ -45,8 +45,6 @@ struct unit_scan_options {
   std::shared_ptr<preparation_gate> inline_gate;
   std::shared_ptr<preparation_slot> parquet_slot;
   bool owns_admission = true;
-  // Test-only snapshot visibility; no SQL/public setting enables this profile.
-  bool snapshot_visibility_probe = false;
 };
 
 inline void validate_scan_options(unit_scan_options const& options, size_t width)

@@ -44,8 +44,6 @@ char const* parquet_dependency_error(unit_descriptor const& unit)
         return "DuckLake encrypted data is outside the local scan profile";
       case unit_gate_reason::encrypted_delete:
         return "DuckLake encrypted deletes are outside the local scan profile";
-      case unit_gate_reason::partial_data:
-        return "DuckLake per-row snapshot-filtered data is outside the local scan profile";
       case unit_gate_reason::invalid_snapshot_range:
         return "DuckLake data snapshot range is invalid";
       case unit_gate_reason::unknown_delete_format:
@@ -116,8 +114,7 @@ std::shared_ptr<dv_visibility const> prepare_dv_visibility(unit_descriptor const
                                                            scan::puffin_byte_source& source,
                                                            sm::charging_allocator& allocator,
                                                            sm::preparation_stop_token stop,
-                                                           std::string delete_identity,
-                                                           dv_snapshot_policy snapshots)
+                                                           std::string delete_identity)
 {
   (void)parquet_unit_envelope(unit);
   if (unit.deletes != delete_format::puffin || file_rows < 0 || data_identity.empty())
@@ -147,9 +144,6 @@ std::shared_ptr<dv_visibility const> prepare_dv_visibility(unit_descriptor const
       if (blob.compression_codec || blob.snapshot_id != -1 || blob.sequence_number != -1)
         throw std::runtime_error("DuckLake DV blob profile is unqualified");
       if (auto value = metadata->property(i, "ducklake-snapshot-id")) {
-        if (snapshots != dv_snapshot_policy::bound_table_scan_probe)
-          throw std::runtime_error(
-            "DuckLake snapshot-bearing DV is outside the local scan profile");
         uint64_t snapshot = 0;
         auto parsed       = std::from_chars(value->data(), value->data() + value->size(), snapshot);
         if (value->empty() || parsed.ec != std::errc{} ||
@@ -251,13 +245,14 @@ void parquet_delete_accumulator::stage(size_t offset,
 {
   if (!position) throw std::runtime_error("DuckLake Parquet delete position cannot be NULL");
   if (*position < 0)
-    throw std::runtime_error("DuckLake Parquet delete positions must be nonnegative and strictly increasing");
+    throw std::runtime_error(
+      "DuckLake Parquet delete positions must be nonnegative and strictly increasing");
   if (offset >= output_.size())
     throw std::runtime_error("DuckLake Parquet deletes exceed footer coverage");
   if (embedded_ && (!snapshot || *snapshot < 0))
     throw std::runtime_error("DuckLake Parquet delete snapshot must be nonnegative and non-NULL");
   // Use the sign bit to mark future deletes within the existing position budget.
-  bool visible = !embedded_ || local_ || static_cast<uint64_t>(*snapshot) <= snapshot_;
+  bool visible    = !embedded_ || local_ || static_cast<uint64_t>(*snapshot) <= snapshot_;
   output_[offset] = visible ? *position : ~*position;
 }
 void parquet_delete_accumulator::consume_staged(size_t offset)
@@ -344,15 +339,7 @@ std::shared_ptr<dv_visibility const> read_dv_visibility(unit_descriptor const& u
   }
   auto identity = datasource->get_io_object().identity_cache_key();
   auto source   = scan::make_puffin_byte_source(std::move(datasource));
-  return prepare_dv_visibility(unit,
-                               file_rows,
-                               std::move(data_identity),
-                               *source,
-                               allocator,
-                               stop,
-                               std::move(identity),
-                               unit.snapshot_visibility_probe
-                                 ? dv_snapshot_policy::bound_table_scan_probe
-                                 : dv_snapshot_policy::snapshot_free);
+  return prepare_dv_visibility(
+    unit, file_rows, std::move(data_identity), *source, allocator, stop, std::move(identity));
 }
 }  // namespace sirius::ducklake

@@ -19,7 +19,6 @@
 #include "ducklake/inline_reader.hpp"
 #include "ducklake/parquet_unit_ingestible.hpp"
 #include "ducklake/scan_ingestible.hpp"
-#include "ducklake/snapshot_visibility_test_scope.hpp"
 #include "exec/streaming_fragment.hpp"
 #include "io/sirius_datasource.hpp"
 #include "op/scan/arrow/arrow_import_ingestible.hpp"
@@ -50,6 +49,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdlib>
 #include <filesystem>
@@ -2720,8 +2720,6 @@ TEST_CASE("DuckLake snapshot visibility native compaction and snapshot deletes m
       query(con, "SET gpu_execution=false");
       auto expected = ducklake_result_bag(*query(con, sql));
       query(con, "SET gpu_execution=true");
-      sirius::ducklake::testing::scoped_snapshot_visibility_probe probe(
-        duckdb::DatabaseInstance::GetDatabase(*con.context));
       for (auto const& statement :
            {sql, "CALL gpu_execution(" + duckdb::Value(sql).ToSQLString() + ")"}) {
         auto before = runtime->get_transparent_execution_stats();
@@ -2735,46 +2733,6 @@ TEST_CASE("DuckLake snapshot visibility native compaction and snapshot deletes m
       }
     }
   }
-  CHECK_FALSE(sirius::ducklake::testing::snapshot_visibility_probe_enabled(
-    duckdb::DatabaseInstance::GetDatabase(*con.context)));
-  // No profile leaks after the scoped test, including through explicit replay.
-  auto partial_version = interleaved ? versions.at(2) : versions.front();
-  for (auto const& version : {partial_version, versions.back()}) {
-    auto sql = "SELECT id FROM lake.q AT (VERSION => " + version + ")";
-    CHECK(con.Query(sql)->HasError());
-    CHECK(con.Query("CALL gpu_execution(" + duckdb::Value(sql).ToSQLString() + ")")->HasError());
-  }
-}
-
-TEST_CASE("DuckLake snapshot visibility scope is isolated and survives nested cross-thread probes",
-          "[ducklake_snapshot_visibility_scope][ducklake_units]")
-{
-  duckdb::DuckDB first(nullptr), second(nullptr);
-  duckdb::Connection connection(first), other(second);
-  auto& database  = duckdb::DatabaseInstance::GetDatabase(*connection.context);
-  auto& unrelated = duckdb::DatabaseInstance::GetDatabase(*other.context);
-  using namespace sirius::ducklake::testing;
-  CHECK_FALSE(snapshot_visibility_probe_enabled(database));
-  {
-    scoped_snapshot_visibility_probe outer(database);
-    CHECK(snapshot_visibility_probe_enabled(database));
-    CHECK_FALSE(snapshot_visibility_probe_enabled(unrelated));
-    auto worker = std::async(std::launch::async, [&] {
-      scoped_snapshot_visibility_probe inner(database);
-      return snapshot_visibility_probe_enabled(database) &&
-             !snapshot_visibility_probe_enabled(unrelated);
-    });
-    CHECK(worker.get());
-    CHECK(snapshot_visibility_probe_enabled(database));
-    try {
-      scoped_snapshot_visibility_probe inner(database);
-      throw std::runtime_error("scope unwind");
-    } catch (std::runtime_error const&) {
-    }
-    CHECK(snapshot_visibility_probe_enabled(database));
-  }
-  CHECK_FALSE(snapshot_visibility_probe_enabled(database));
-  CHECK_FALSE(snapshot_visibility_probe_enabled(unrelated));
 }
 
 TEST_CASE("DuckLake snapshot visibility pruned row groups retain original delete positions",
@@ -2831,8 +2789,6 @@ TEST_CASE("DuckLake snapshot visibility pruned row groups retain original delete
     auto expected = ducklake_result_bag(*query(con, sql));
     REQUIRE(expected.size() == (i == 2 ? 10 : 11));
     query(con, "SET gpu_execution=true");
-    sirius::ducklake::testing::scoped_snapshot_visibility_probe probe(
-      duckdb::DatabaseInstance::GetDatabase(*con.context));
     for (auto const& statement :
          {sql, "CALL gpu_execution(" + duckdb::Value(sql).ToSQLString() + ")"}) {
       auto before      = runtime->get_transparent_execution_stats();
@@ -2912,8 +2868,6 @@ TEST_CASE(
     initial[i] = ducklake_result_bag(*run(prefixes[i] + "0"));
   run("SET gpu_execution=true");
   run("SET enable_duckdb_fallback=false");
-  sirius::ducklake::testing::scoped_snapshot_visibility_probe probe(
-    duckdb::DatabaseInstance::GetDatabase(*con.context));
   auto before_prepare         = runtime->get_transparent_execution_stats();
   auto imports_before_prepare = counters->arrow_rows_imported.load();
   auto current                = con.Prepare(prefixes[0] + "?");
@@ -3099,8 +3053,6 @@ TEST_CASE(
   run("SET scan_task_batch_size=1");
   run("SET sirius_test_sync_cpu_replay=true");
   run("SET enable_duckdb_fallback=false");
-  sirius::ducklake::testing::scoped_snapshot_visibility_probe probe(
-    duckdb::DatabaseInstance::GetDatabase(*con.context));
   auto prepared = con.Prepare(prefix + "?");
   REQUIRE_FALSE(prepared->HasError());
   auto execute = [&](int64_t parameter) {
@@ -3218,8 +3170,6 @@ TEST_CASE(
   run("SET scan_task_batch_size=1");
   run("SET enable_duckdb_fallback=true");
   run("SET sirius_test_sync_cpu_replay=true");
-  sirius::ducklake::testing::scoped_snapshot_visibility_probe probe(
-    duckdb::DatabaseInstance::GetDatabase(*con.context));
   auto statement =
     explicit_entry ? "CALL gpu_execution(" + duckdb::Value(sql).ToSQLString() + ")" : sql;
   auto before   = runtime->get_transparent_execution_stats();
@@ -3454,8 +3404,6 @@ TEST_CASE(
   run("SET gpu_execution=true");
   run("SET enable_duckdb_fallback=false");
   run("SET sirius_test_sync_cpu_replay=true");
-  sirius::ducklake::testing::scoped_snapshot_visibility_probe probe(
-    duckdb::DatabaseInstance::GetDatabase(*con.context));
   auto prepared = con.Prepare(sql);
   REQUIRE_FALSE(prepared->HasError());
   auto execute = [&] {
@@ -3596,8 +3544,6 @@ TEST_CASE(
   run("SET gpu_execution=true");
   run("SET enable_duckdb_fallback=false");
   run("SET scan_task_batch_size=1");
-  sirius::ducklake::testing::scoped_snapshot_visibility_probe probe(
-    duckdb::DatabaseInstance::GetDatabase(*con.context));
   auto current = con.Prepare(prefixes[0] + "?");
   auto frozen  = con.Prepare(prefixes[1] + "?");
   REQUIRE_FALSE(current->HasError());
@@ -3764,8 +3710,6 @@ TEST_CASE_METHOD(
   };
   auto clear =
     std::shared_ptr<void>(nullptr, [&](void*) { counters->parquet_filter_for_testing = {}; });
-  sirius::ducklake::testing::scoped_snapshot_visibility_probe probe(
-    duckdb::DatabaseInstance::GetDatabase(*con.context));
   auto check = [&](std::string const& suffix, int64_t count, int64_t sum) {
     auto sql = "SELECT count(*), sum(id)::BIGINT FROM lake.t" + suffix;
     INFO(sql);
@@ -3821,8 +3765,6 @@ TEST_CASE(
   };
   auto clear =
     std::shared_ptr<void>(nullptr, [&](void*) { counters->parquet_filter_for_testing = {}; });
-  sirius::ducklake::testing::scoped_snapshot_visibility_probe probe(
-    duckdb::DatabaseInstance::GetDatabase(*con.context));
   run("SET enable_duckdb_fallback=false");
   std::vector<std::string> queries{"SELECT id,value,extra FROM lake.q",
                                    historical,
@@ -3936,8 +3878,6 @@ TEST_CASE(
     counters->parquet_filter_for_testing = {};
     counters->after_certify_for_testing  = {};
   });
-  sirius::ducklake::testing::scoped_snapshot_visibility_probe probe(
-    duckdb::DatabaseInstance::GetDatabase(*con.context));
   run("SET gpu_execution=true");
   run("SET enable_duckdb_fallback=false");
   run("SET scan_task_batch_size=1");
@@ -4015,8 +3955,6 @@ TEST_CASE(
   auto historical = snapshot_visibility_recovery_query(con, vectors) + "0";
   std::string sql =
     "SELECT value,COUNT(*),SUM(id) FROM (" + historical + ") q WHERE id%3<>0 GROUP BY value";
-  sirius::ducklake::testing::scoped_snapshot_visibility_probe probe(
-    duckdb::DatabaseInstance::GetDatabase(*con.context));
   auto expected = ducklake_result_bag(*run(sql));
   run("SET gpu_execution=true");
   auto runtime = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
@@ -4124,8 +4062,6 @@ TEST_CASE(
   attach_lake(con, disk.directory);
   run("SET gpu_execution=false");
   auto historical = snapshot_visibility_recovery_query(con, vectors) + "0";
-  sirius::ducklake::testing::scoped_snapshot_visibility_probe probe(
-    duckdb::DatabaseInstance::GetDatabase(*con.context));
   run("ATTACH '" + (std::filesystem::path(disk.directory) / "keys.db").string() +
       "' AS native_store");
   run("CREATE TABLE native_store.keys AS SELECT range::BIGINT k FROM range(7)");
@@ -4179,9 +4115,7 @@ TEST_CASE(
   if (!load_ducklake(con)) return;
   query(con, "SET gpu_execution=false");
   attach_lake(con, disk.directory);
-  auto sql = snapshot_visibility_recovery_query(con, vectors) + "0";
-  sirius::ducklake::testing::scoped_snapshot_visibility_probe probe(
-    duckdb::DatabaseInstance::GetDatabase(*con.context));
+  auto sql      = snapshot_visibility_recovery_query(con, vectors) + "0";
   auto expected = ducklake_result_bag(*query(con, sql));
   auto runtime  = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
   REQUIRE(runtime);
@@ -4317,8 +4251,6 @@ TEST_CASE(
     runtime->cpu_replay_hook_for_testing = {};
     counters->parquet_filter_for_testing = {};
   });
-  sirius::ducklake::testing::scoped_snapshot_visibility_probe probe(
-    duckdb::DatabaseInstance::GetDatabase(*con.context));
   run("SET gpu_execution=true");
   run("SET sirius_test_sync_cpu_replay=true");
   run(std::string("SET enable_duckdb_fallback=") + (mode == 1 ? "false" : "true"));
@@ -4445,8 +4377,6 @@ TEST_CASE(
     counters->parquet_filter_for_testing = {};
     runtime->cpu_replay_hook_for_testing = {};
   });
-  sirius::ducklake::testing::scoped_snapshot_visibility_probe probe(
-    duckdb::DatabaseInstance::GetDatabase(*con.context));
   run("SET gpu_execution=true");
   run("SET enable_duckdb_fallback=false");
   run("SET sirius_test_sync_cpu_replay=true");
@@ -4551,8 +4481,6 @@ TEST_CASE(
   auto historical = snapshot_visibility_recovery_query(con, vectors) + "0";
   std::string sql = "SELECT a.id AS left_id,b.id AS right_id FROM (" + historical + ") a JOIN (" +
                     historical + ") b ON a.id=b.id";
-  sirius::ducklake::testing::scoped_snapshot_visibility_probe probe(
-    duckdb::DatabaseInstance::GetDatabase(*con.context));
   auto expected = ducklake_result_bag(*run(sql));
   run("SET gpu_execution=true");
   auto runtime = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
@@ -4622,8 +4550,6 @@ TEST_CASE(
   attach_lake(con, disk.directory);
   run("SET gpu_execution=false");
   auto prefix = snapshot_visibility_recovery_query(con, vectors);
-  sirius::ducklake::testing::scoped_snapshot_visibility_probe probe(
-    duckdb::DatabaseInstance::GetDatabase(*con.context));
   std::array<int64_t, 4> limits{0, 1000, 4096, 6000};
   std::vector<std::vector<std::string>> expected;
   for (auto v : limits)
@@ -4727,8 +4653,6 @@ TEST_CASE("DuckLake snapshot visibility joint visibility executes and recovers a
   CAPTURE(vectors);
   auto historical = snapshot_visibility_recovery_query(con, vectors, 327680) + "0";
   std::string sql = "SELECT value,COUNT(*),SUM(id) FROM (" + historical + ") q GROUP BY value";
-  sirius::ducklake::testing::scoped_snapshot_visibility_probe probe(
-    duckdb::DatabaseInstance::GetDatabase(*con.context));
   run("SET scan_task_batch_size=4096");
   auto expected = ducklake_result_bag(*run(sql));
   run("SET gpu_execution=true");

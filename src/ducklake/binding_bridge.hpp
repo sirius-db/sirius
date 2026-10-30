@@ -33,7 +33,6 @@ namespace sirius::ducklake {
 class parquet_unit_ingestible;
 class inline_reader;
 struct dv_visibility;
-enum class dv_snapshot_policy;
 // Only the implementation may include provider-private headers. Availability
 // permits source verification; each scan still requires contract certification.
 bool bridge_available() noexcept;
@@ -75,12 +74,6 @@ class binding_handle : public std::enable_shared_from_this<binding_handle> {
   std::shared_ptr<dv_visibility const> read_parquet_deletes(uint64_t original_file_index,
                                                             scan_manager::charging_allocator&,
                                                             scan_manager::preparation_stop_token);
-
-  // Test-only snapshot visibility; ordinary callers use the snapshot-free overload.
-  std::shared_ptr<dv_visibility const> read_parquet_deletes(uint64_t original_file_index,
-                                                            scan_manager::charging_allocator&,
-                                                            scan_manager::preparation_stop_token,
-                                                            dv_snapshot_policy);
 
   op::scan::bound_read_view const& view() const noexcept;
   void validate_statement() const;

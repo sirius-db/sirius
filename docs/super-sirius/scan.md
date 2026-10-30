@@ -851,30 +851,13 @@ See [DuckLake support and limits](scan-contracts-design.md#ducklake-private-bind
 
 ### Snapshot visibility
 
-The test-only `testing::scoped_snapshot_visibility_probe` enables snapshot-bearing
-deletes and partial-data visibility for scans prepared within its database scope.
-The scope uses a mutex-protected, per-database reference count to support nested
-scopes and cross-thread planning. Its exported registry has a single implementation
-so shared-library clients observe the same state. The database must outlive every
-scope; each scan captures the policy during preparation. There is no SQL setting.
+Ordinary SQL and `CALL gpu_execution(...)` support snapshot-bearing Parquet and Puffin deletes and per-row snapshot-filtered data through the bound table scan. Snapshot visibility follows the original statement binding without an additional setting.
 
-For bound table scans, every referenced delete payload is validated before selecting
-positions visible at the bound snapshot. Transaction-local deletes bypass the
-committed-snapshot filter. Parquet deletes read positions and snapshots together,
-validate strict position ordering across batches, and check the original row domain
-even for future deletes. Validated rows and effective deletions have separate counts;
-inline deletes are combined after snapshot selection.
+For bound table scans, every referenced delete payload is validated before selecting positions visible at the bound snapshot. Transaction-local deletes bypass the committed-snapshot filter only when the bound read view includes local changes; explicit historical snapshots exclude those changes. Parquet deletes read positions and snapshots together, validate strict position ordering across batches, and check the original row domain even for future deletes. Validated rows and effective deletions have separate counts; inline deletes are combined after snapshot selection.
 
-Partial data requires the exact BIGINT field ID and physical name of
-`_ducklake_internal_snapshot_id`, without a missing-column default. This hidden column
-is retained for zero-user-column scans and excluded from output. Inclusive snapshot
-bounds use shared residual predicates. Reader row-filter pushdown is disabled so
-positional deletes operate on original file positions before residual filtering and
-projection; row-group pruning preserves that lineage.
+Partial data requires the exact BIGINT field ID and physical name of `_ducklake_internal_snapshot_id`, without a missing-column default. This hidden column is retained for zero-user-column scans and excluded from output. Inclusive snapshot bounds use shared residual predicates. Reader row-filter pushdown is disabled so positional deletes operate on original file positions before residual filtering and projection; row-group pruning preserves that lineage.
 
-Before decoding data, the adapter compares the opened object's size and parsed
-footer length with the bound catalog descriptor. A physical-cache identity match
-does not establish agreement with the statement's descriptor.
+Before decoding data, the adapter compares the opened object's size and parsed footer length with the bound catalog descriptor. A physical-cache identity match does not establish agreement with the statement's descriptor.
 
 ## Key Files
 

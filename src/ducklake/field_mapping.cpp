@@ -171,8 +171,6 @@ bool add_partial_data_filter(unit_descriptor const& unit,
 {
   validate_scan_options(options, fields.size());
   if (!unit.snapshot_min && !unit.snapshot_max) return false;
-  if (!unit.snapshot_visibility_probe)
-    throw std::invalid_argument("DuckLake partial data requires the snapshot visibility probe");
   if ((unit.snapshot_min && *unit.snapshot_min > INT64_MAX) ||
       (unit.snapshot_max && *unit.snapshot_max > INT64_MAX) ||
       (unit.snapshot_min && unit.snapshot_max && *unit.snapshot_min > *unit.snapshot_max))

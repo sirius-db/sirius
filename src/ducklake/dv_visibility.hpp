@@ -77,18 +77,14 @@ std::shared_ptr<dv_visibility const> combine_inline_visibility(std::shared_ptr<d
                                                                std::span<uint64_t const>,
                                                                int64_t file_rows,
                                                                scan_manager::charging_allocator&);
-// Snapshot-bearing deletes require an explicit test policy.
-enum class dv_snapshot_policy { snapshot_free, bound_table_scan_probe };
 // Structural/source seam for adapter tests; it cannot publish a scan certificate.
-std::shared_ptr<dv_visibility const> prepare_dv_visibility(
-  unit_descriptor const&,
-  int64_t file_rows,
-  std::string data_identity,
-  op::scan::puffin_byte_source&,
-  scan_manager::charging_allocator&,
-  scan_manager::preparation_stop_token,
-  std::string delete_identity  = {},
-  dv_snapshot_policy snapshots = dv_snapshot_policy::snapshot_free);
+std::shared_ptr<dv_visibility const> prepare_dv_visibility(unit_descriptor const&,
+                                                           int64_t file_rows,
+                                                           std::string data_identity,
+                                                           op::scan::puffin_byte_source&,
+                                                           scan_manager::charging_allocator&,
+                                                           scan_manager::preparation_stop_token,
+                                                           std::string delete_identity = {});
 std::shared_ptr<dv_visibility const> read_dv_visibility(unit_descriptor const&,
                                                         int64_t file_rows,
                                                         std::string data_identity,

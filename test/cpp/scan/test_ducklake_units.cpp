@@ -75,13 +75,12 @@ TEST_CASE("DuckLake unit scope preserves inline visibility dependencies", "[duck
   }
 }
 
-TEST_CASE("DuckLake local scans refuse partial snapshots", "[ducklake_units]")
+TEST_CASE("DuckLake local scans admit valid partial snapshots", "[ducklake_units]")
 {
   auto unit         = local();
   unit.snapshot_min = 0;
   auto gate         = assess_local_scope(unit);
-  CHECK(gate.outside_local_scope);
-  CHECK(contains(gate, unit_gate_reason::partial_data));
+  CHECK_FALSE(gate.outside_local_scope);
   unit.snapshot_min = 9;
   unit.snapshot_max = 8;
   gate              = assess_local_scope(unit);
@@ -674,7 +673,10 @@ TEST_CASE("DuckLake DV bounded profile keeps adjacent dependencies unqualified",
   auto mode = GENERATE(3, 5, 6);
   if (mode == 3) unit.mapping_id = 1;
   if (mode == 5) unit.delete_path = "s3://bucket/delete";
-  if (mode == 6) unit.snapshot_min = 1;
+  if (mode == 6) {
+    unit.snapshot_min = 1;
+    unit.snapshot_max = 0;
+  }
   CHECK_FALSE(parquet_unit_dependencies_supported(unit));
   CHECK_THROWS(parquet_unit_envelope(unit));
   unit                  = dv_test_unit(source);
@@ -771,10 +773,13 @@ TEST_CASE("DuckLake Parquet dependency errors distinguish mappings and snapshot 
                     "DuckLake external field mappings are outside the supported scan profile");
   unit.mapping_id.reset();
   unit.snapshot_min = 0;
-  CHECK_FALSE(parquet_unit_dependencies_supported(unit));
-  CHECK_THROWS_WITH(parquet_unit_envelope(unit),
-                    "DuckLake per-row snapshot-filtered data is outside the local scan profile");
+  CHECK(parquet_unit_dependencies_supported(unit));
+  CHECK_NOTHROW(parquet_unit_envelope(unit));
+  unit.snapshot_min = 9;
+  unit.snapshot_max = 8;
+  CHECK_THROWS_WITH(parquet_unit_envelope(unit), "DuckLake data snapshot range is invalid");
   unit.snapshot_min.reset();
+  unit.snapshot_max.reset();
   unit.delete_path = "/tmp/deletes";
   for (auto format : {delete_format::parquet, delete_format::puffin}) {
     unit.deletes = format;
@@ -948,7 +953,7 @@ TEST_CASE("DuckLake scalar layouts preserve decimal Boolean and temporal vector 
   }
 }
 
-TEST_CASE("DuckLake snapshot DV probe validates every blob before selecting visibility",
+TEST_CASE("DuckLake snapshot DV validates every blob before selecting visibility",
           "[ducklake_units][ducklake_dv][ducklake_snapshot_visibility]")
 {
   auto snapshot       = GENERATE(uint64_t{9}, uint64_t{10}, uint64_t{15}, uint64_t{20});
@@ -961,17 +966,15 @@ TEST_CASE("DuckLake snapshot DV probe validates every blob before selecting visi
   unit.bound_snapshot = snapshot;
   unit.transaction_local_delete = local_delete;
   dv_test_budget budget(unit);
-  auto allocator = budget.ledger.allocator(budget.permit);
-  CHECK_THROWS(prepare_dv_visibility(unit, 5, "data", source, allocator, {}));
-  auto visibility = prepare_dv_visibility(
-    unit, 5, "data", source, allocator, {}, "delete", dv_snapshot_policy::bound_table_scan_probe);
+  auto allocator  = budget.ledger.allocator(budget.permit);
+  auto visibility = prepare_dv_visibility(unit, 5, "data", source, allocator, {}, "delete");
   CHECK(visibility->validated_blobs == 2);
   CHECK(visibility->positions.size() == ((local_delete || snapshot >= 10) ? 2 : 0));
   visibility.reset();
   CHECK(budget.provider.seen->allocated_bytes == 0);
 }
 
-TEST_CASE("DuckLake snapshot DV probe rejects invalid future dependencies",
+TEST_CASE("DuckLake snapshot DV rejects invalid future dependencies",
           "[ducklake_units][ducklake_dv][ducklake_snapshot_visibility]")
 {
   auto mode  = GENERATE(std::string("crc"),
@@ -993,14 +996,8 @@ TEST_CASE("DuckLake snapshot DV probe rejects invalid future dependencies",
   auto allocator = budget.ledger.allocator(budget.permit);
   std::stop_source stop;
   if (mode == "cancel") stop.request_stop();
-  CHECK_THROWS(prepare_dv_visibility(unit,
-                                     5,
-                                     "data",
-                                     source,
-                                     allocator,
-                                     sm::preparation_stop_token(stop.get_token()),
-                                     "delete",
-                                     dv_snapshot_policy::bound_table_scan_probe));
+  CHECK_THROWS(prepare_dv_visibility(
+    unit, 5, "data", source, allocator, sm::preparation_stop_token(stop.get_token()), "delete"));
   CHECK(budget.provider.seen->allocated_bytes == 0);
   CHECK(budget.ledger.charged_bytes({1, 1}) == 0);
 }
@@ -1043,8 +1040,7 @@ TEST_CASE("DuckLake snapshot DV selects earliest deletes and preserves visible i
   unit.bound_snapshot = snapshot;
   dv_test_budget budget(unit);
   auto allocator  = budget.ledger.allocator(budget.permit);
-  auto visibility = prepare_dv_visibility(
-    unit, 6, "data", source, allocator, {}, "delete", dv_snapshot_policy::bound_table_scan_probe);
+  auto visibility = prepare_dv_visibility(unit, 6, "data", source, allocator, {}, "delete");
   CHECK(visibility->validated_blobs == 2);
   std::vector<int64_t> expected = snapshot < 10   ? std::vector<int64_t>{}
                                   : snapshot < 20 ? std::vector<int64_t>{1, 2}
@@ -1128,10 +1124,9 @@ TEST_CASE("DuckLake ordinary Parquet deletes do not require snapshot values",
 TEST_CASE("DuckLake partial data adds an inclusive hidden snapshot filter",
           "[ducklake_units][ducklake_snapshot_visibility]")
 {
-  auto count_only                = GENERATE(false, true);
-  auto bounds                    = GENERATE(0, 1, 2);
-  auto unit                      = local();
-  unit.snapshot_visibility_probe = true;
+  auto count_only = GENERATE(false, true);
+  auto bounds     = GENERATE(0, 1, 2);
+  auto unit       = local();
   if (bounds != 1) unit.snapshot_min = 10;
   if (bounds != 0) unit.snapshot_max = 20;
   std::vector<scan::field_requirement> fields;
@@ -1173,9 +1168,6 @@ TEST_CASE("DuckLake partial data preserves user projection and rejects unqualifi
                             bind_field(9, duckdb::LogicalType::BIGINT, duckdb::Value())};
   unit_scan_options options;
   options.output_columns = std::vector<size_t>{1, 0, 1};
-  CHECK_THROWS(add_partial_data_filter(unit, fields, options));
-  CHECK(assess_local_scope(unit).outside_local_scope);
-  unit.snapshot_visibility_probe = true;
   CHECK_FALSE(assess_local_scope(unit).outside_local_scope);
   REQUIRE(add_partial_data_filter(unit, fields, options));
   CHECK(*options.output_columns == std::vector<size_t>{1, 0, 1});
