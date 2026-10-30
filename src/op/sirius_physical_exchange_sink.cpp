@@ -18,6 +18,7 @@
 
 #include "data/data_batch_utils.hpp"
 #include "exchange/exchange_service.hpp"
+#include "exchange/wire.hpp"
 #include "log/logging.hpp"
 #include "op/partition/gpu_partition_impl.hpp"
 #include "sirius/exception.hpp"
@@ -192,13 +193,22 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_exchange_sin
   using mode       = exchange_spec::mode;
   auto const ranks = _service->world_size();
   std::vector<std::shared_ptr<cucascade::data_batch>> slices(ranks);
+  // The transport sends whole buffers: a sliced batch going to a peer is copied here, once,
+  // under the task's reservation, rather than by the transport once per peer.
+  auto const whole = [&]() -> std::shared_ptr<cucascade::data_batch> {
+    auto const view = get_cudf_table_view(batch);
+    if (!exchange::is_sliced(view)) { return handle; }
+    auto* space = batch.get_memory_space();
+    auto owned  = std::make_unique<cudf::table>(view, stream, space->get_default_allocator());
+    return make_data_batch(std::move(owned), *space, stream, batch_telemetry());
+  };
   if (_spec.routing == mode::gather) {
-    slices[_spec.target] = handle;
+    slices[_spec.target] = _spec.target == _service->rank() ? handle : whole();
     return slices;
   }
   if (_spec.routing == mode::broadcast || ranks == 1) {
     // Each rank's transport copies what it sends; this rank keeps the batch itself.
-    std::fill(slices.begin(), slices.end(), handle);
+    std::fill(slices.begin(), slices.end(), ranks == 1 ? handle : whole());
     return slices;
   }
   auto* space = batch.get_memory_space();
