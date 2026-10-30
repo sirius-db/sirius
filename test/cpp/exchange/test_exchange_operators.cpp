@@ -32,6 +32,7 @@
 #include "pipeline/sirius_pipeline.hpp"
 #include "planner/distributed_plan.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "sirius/exception.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
@@ -608,6 +609,77 @@ TEST_CASE("a retired query's late arrivals are dropped, a later query's still ke
     key_value_types(), 0, c.all[1].service, retired, {0}, false);
   CHECK(fresh.get_next_task_hint()->hint != sirius::op::TaskCreationHint::READY);
   CHECK_FALSE(fresh.all_ports_empty());
+}
+
+TEST_CASE("a stream detached before its peer sends drops what arrives for it",
+          "[exchange][operators]")
+{
+  ranks c(2);
+  stream_id const detached = sirius::exchange::make_stream_id(1, 1);
+  stream_id const later    = sirius::exchange::make_stream_id(1, 2);
+  {
+    // Its query is not retired: the source goes with its plan, which detaches it.
+    sirius_physical_exchange_source gone(
+      key_value_types(), 0, c.all[1].service, detached, {0}, false);
+  }
+  auto& sender = *c.all[0].service;
+  sender.send(detached, 1, key_value_batch(0, 0));
+  sender.close(detached, 1);
+  sender.send(later, 1, key_value_batch(0, 1));
+  sender.close(later, 1);
+  // One sender's batches land in order: once the later stream's has, the detached one's had.
+  sirius_physical_exchange_source kept(key_value_types(), 0, c.all[1].service, later, {0}, false);
+  CHECK(flat(drain(kept)).size() == rows_per_batch);
+  sirius_physical_exchange_source fresh(
+    key_value_types(), 0, c.all[1].service, detached, {0}, false);
+  CHECK(fresh.get_next_task_hint()->hint != sirius::op::TaskCreationHint::READY);
+  CHECK_FALSE(fresh.all_ports_empty());
+}
+
+TEST_CASE("a stream takes a second receiver only once its first has detached",
+          "[exchange][operators]")
+{
+  struct ignoring : sirius::exchange::inbound {
+    void on_batch(rank_t, std::uint64_t, std::shared_ptr<cucascade::data_batch>) override {}
+    void on_end(rank_t) override {}
+    void on_error(std::exception_ptr) override {}
+  };
+  ranks c(1);
+  auto& service          = *c.all[0].service;
+  stream_id const stream = sirius::exchange::make_stream_id(1, 1);
+  {
+    sirius_physical_exchange_source first(
+      key_value_types(), 0, c.all[0].service, stream, {0}, false);
+    CHECK_THROWS_AS(service.attach(stream, std::make_shared<ignoring>()),
+                    sirius::invalid_input_exception);
+    // The first receiver keeps the stream.
+    service.send(stream, 0, key_value_batch(0, 0));
+    service.close(stream, 0);
+    CHECK(flat(drain(first)).size() == rows_per_batch);
+  }
+  CHECK_NOTHROW(service.attach(stream, std::make_shared<ignoring>()));
+}
+
+TEST_CASE("a rank stops sending for a query a peer aborted, and still closes its streams",
+          "[exchange][operators]")
+{
+  ranks c(2);
+  stream_id const stream = sirius::exchange::make_stream_id(5, 1);
+  sirius_physical_exchange_source there(
+    key_value_types(), 0, c.all[1].service, stream, {0, 1}, false);
+  c.all[0].service->abort(5, "injected failure");
+  auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds{30};
+  while (there.get_next_task_hint()->hint != sirius::op::TaskCreationHint::READY) {
+    REQUIRE(std::chrono::steady_clock::now() < deadline);
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+  }
+  auto& service = *c.all[1].service;
+  CHECK_THROWS_WITH(service.send(stream, 0, key_value_batch(1, 0)),
+                    Catch::Matchers::ContainsSubstring("failed on rank 0: injected failure"));
+  CHECK_THROWS_WITH(service.send(stream + 1, 1, key_value_batch(1, 1)),
+                    Catch::Matchers::ContainsSubstring("failed on rank 0: injected failure"));
+  CHECK_NOTHROW(service.close(stream, 0));
+  CHECK_NOTHROW(service.close(stream, 1));
 }
 
 TEST_CASE("queries retiring out of order are each forgotten", "[exchange][operators]")

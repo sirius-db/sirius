@@ -217,6 +217,44 @@ TEST_CASE("a fabric that cannot reach its peer leaves nothing in /dev/shm", "[ex
   CHECK_FALSE(std::filesystem::exists(mirror));
 }
 
+TEST_CASE(
+  "a NIXL fabric refuses an address that is not host:port, a rank out of range, and a "
+  "listen port in use",
+  "[exchange][nixl]")
+{
+  // Each is refused before any connection, so no peer is needed; the timeout bounds a miss.
+  frame_ring send(4, 64 * KiB);
+  frame_ring recv(4, 64 * KiB);
+  auto const mine   = "127.0.0.1:" + std::to_string(free_port());
+  auto const config = [](rank_t rank, std::vector<std::string> peers) {
+    nixl_fabric::config cfg{rank, std::move(peers)};
+    cfg.connect_timeout = std::chrono::milliseconds{500};
+    return cfg;
+  };
+  for (std::string const bad :
+       {"127.0.0.1", "127.0.0.1:", "127.0.0.1:27000x", "127.0.0.1:0", "127.0.0.1:70000"}) {
+    CHECK_THROWS_AS(nixl_fabric(config(0, {mine, bad}), send, recv),
+                    sirius::invalid_input_exception);
+  }
+  CHECK_THROWS_AS(nixl_fabric(config(2, {mine, mine}), send, recv),
+                  sirius::invalid_input_exception);
+  CHECK_THROWS_AS(nixl_fabric(config(0, {}), send, recv), sirius::invalid_input_exception);
+
+  int const port = free_port();
+  int const fd   = ::socket(AF_INET, SOCK_STREAM, 0);
+  REQUIRE(fd >= 0);
+  sockaddr_in at{};
+  at.sin_family      = AF_INET;
+  at.sin_addr.s_addr = htonl(INADDR_ANY);
+  at.sin_port        = htons(static_cast<std::uint16_t>(port));
+  REQUIRE(::bind(fd, reinterpret_cast<sockaddr*>(&at), sizeof(at)) == 0);
+  REQUIRE(::listen(fd, 1) == 0);
+  auto const taken = config(0, {"127.0.0.1:" + std::to_string(port), mine});
+  CHECK_THROWS_AS(nixl_fabric(taken, send, recv), sirius::invalid_input_exception);
+  CHECK_THROWS_WITH(nixl_fabric(taken, send, recv), Catch::Matchers::ContainsSubstring("in use"));
+  ::close(fd);
+}
+
 TEST_CASE("two ranks connect through make_nixl_exchange and exchange a batch", "[exchange][nixl]")
 {
   using sirius::exchange::exchange_service;

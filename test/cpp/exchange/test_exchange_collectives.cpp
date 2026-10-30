@@ -30,6 +30,7 @@
 #include "op/sirius_physical_exchange_sink.hpp"
 #include "op/sirius_physical_exchange_source.hpp"
 #include "op/sirius_physical_sort_sample.hpp"
+#include "sirius/exception.hpp"
 
 #include <cudf/table/table.hpp>
 
@@ -289,6 +290,59 @@ TEST_CASE("an aborted query wakes an all-gather waiting on its peer", "[exchange
                                             std::chrono::minutes{2}));
   peer.join();
   CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds{30});
+}
+
+TEST_CASE("an all-gather that times out leaves its stream free to attach again",
+          "[exchange][collectives]")
+{
+  struct ignoring : sirius::exchange::inbound {
+    void on_batch(rank_t, std::uint64_t, std::shared_ptr<cucascade::data_batch>) override {}
+    void on_end(rank_t) override {}
+    void on_error(std::exception_ptr) override {}
+  };
+  ranks c(2);
+  auto const stream = sirius::exchange::make_stream_id(8, 1);
+  // Rank 1 never takes part.
+  CHECK_THROWS_AS(sirius::exchange::all_gather(*c.all[0].service,
+                                               stream,
+                                               keys_batch(0, 1, 10),
+                                               *env().gpu,
+                                               utils::default_stream(),
+                                               std::chrono::milliseconds{200}),
+                  sirius::internal_exception);
+  CHECK_NOTHROW(c.all[0].service->attach(stream, std::make_shared<ignoring>()));
+}
+
+TEST_CASE("all-gather brings tables that landed on host back to the GPU", "[exchange][collectives]")
+{
+  ranks c(2);
+  std::vector<std::shared_ptr<cucascade::data_batch>> mine;
+  std::vector<table_digest> want;
+  for (rank_t r = 0; r < 2; ++r) {
+    mine.push_back(gpu_batch(sample_table(1'000 + r)));
+    want.push_back(digest(mine.back()));
+  }
+  std::vector<std::vector<std::shared_ptr<cucascade::data_batch>>> got(2);
+  {
+    // With no GPU room, each peer's table lands on host.
+    auto const hold = hold_gpu();
+    on_every_rank(2, [&](rank_t r) {
+      got[r] = sirius::exchange::all_gather(*c.all[r].service,
+                                            13,
+                                            mine[r],
+                                            *env().gpu,
+                                            utils::default_stream(),
+                                            std::chrono::seconds{30});
+    });
+  }
+  for (rank_t r = 0; r < 2; ++r) {
+    REQUIRE(got[r].size() == 2);
+    for (rank_t from = 0; from < 2; ++from) {
+      REQUIRE(got[r][from] != nullptr);
+      CHECK(got[r][from]->to_read_only().get_current_tier() == Tier::GPU);
+      CHECK(digest(got[r][from]) == want[from]);
+    }
+  }
 }
 
 TEST_CASE("a rank that leaves an all-gather does not wait, and the others go on without it",
