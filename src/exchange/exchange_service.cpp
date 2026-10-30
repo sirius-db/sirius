@@ -92,7 +92,9 @@ std::shared_ptr<inbound> exchange_service::receiver_of(stream_id stream, held ev
   std::lock_guard lock{_mutex};
   if (_aborted.contains(query_of(stream))) { return nullptr; }
   if (auto it = _receivers.find(stream); it != _receivers.end()) { return it->second; }
-  if (!_detached.contains(stream)) { _held[stream].push_back(std::move(event)); }
+  if (!retired(query_of(stream)) && !_detached.contains(stream)) {
+    _held[stream].push_back(std::move(event));
+  }
   return nullptr;
 }
 
@@ -101,7 +103,7 @@ bool exchange_service::end_query(std::uint64_t query, std::exception_ptr error)
   std::vector<std::shared_ptr<inbound>> receivers;
   {
     std::lock_guard lock{_mutex};
-    if (!_aborted.emplace(query, error).second) { return false; }
+    if (retired(query) || !_aborted.emplace(query, error).second) { return false; }
     for (auto const& [stream, r] : _receivers) {
       if (query_of(stream) == query) { receivers.push_back(r); }
     }
@@ -196,7 +198,27 @@ void exchange_service::detach(stream_id stream)
   std::lock_guard lock{_mutex};
   _receivers.erase(stream);
   _held.erase(stream);
-  _detached[stream] = true;
+  // Sources go with their plan, which can outlive the query's retirement.
+  if (!retired(query_of(stream))) { _detached.insert(stream); }
+}
+
+bool exchange_service::retired(std::uint64_t query) const
+{
+  // Queries are numbered from 1; streams of query 0 belong to no query and never retire.
+  return query != 0 && (query <= _retired || _retired_above.contains(query));
+}
+
+void exchange_service::forget(std::uint64_t query)
+{
+  std::lock_guard lock{_mutex};
+  if (retired(query)) { return; }
+  _retired_above.insert(query);
+  while (_retired_above.erase(_retired + 1) > 0) {
+    ++_retired;
+  }
+  std::erase_if(_detached, [query](stream_id stream) { return query_of(stream) == query; });
+  std::erase_if(_held, [query](auto const& h) { return query_of(h.first) == query; });
+  _aborted.erase(query);
 }
 
 }  // namespace sirius::exchange
