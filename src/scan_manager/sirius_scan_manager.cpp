@@ -1349,7 +1349,7 @@ sirius_scan_manager::sirius_scan_manager(
     _native_readers(_config.preparation.resolved_native_workers(),
                     _config.preparation.resolved_native_readers()),
     _coordinators(_config.preparation.resolved_coordinator_workers()),
-    _ioctx_registry(_config, reservation_manager)
+    _ioctx_registry(_config, reservation_manager, _topology_index)
 {
   if (!_topology_index) {
     throw std::invalid_argument("[sirius_scan_manager] topology_index must be non-null");

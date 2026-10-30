@@ -48,6 +48,8 @@ namespace sirius::io::rest {
  */
 class rest_ioctx : public templated_ioctx<rest_reactor> {
  public:
+  using templated_ioctx<rest_reactor>::templated_ioctx;
+
   /// Build a pool of @p n_reactors reactors, all sharing @p ctx (one context per
   /// pool: it carries the per-reactor @c config, the presigning authorizer, and
   /// the pinned bounce-staging resource — all of which must outlive this ioctx).
