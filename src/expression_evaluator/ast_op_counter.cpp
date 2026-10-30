@@ -127,11 +127,7 @@ std::size_t in_list::cudf_ast_op_count() const
 
 std::size_t function_call::cudf_ast_op_count() const
 {
-  if (date_operation().has_value() || has_fixed_point_operand(*this)) { return 0; }
-  bool const supported =
-    std::find(supported_ast_functions.begin(), supported_ast_functions.end(), function()) !=
-    supported_ast_functions.end();
-  if (!supported) { return 0; }
+  if (!ast_supports_function(*this)) { return 0; }
   std::size_t count = 1;
   for (auto const& a : arguments()) {
     count += a->cudf_ast_op_count();
