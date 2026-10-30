@@ -15,10 +15,14 @@
  */
 
 #include "catch.hpp"
+#include "data/data_batch_utils.hpp"
+#include "helper/type_conversions.hpp"
 #include "op/scan/arrow/arrow_import_ingestible.hpp"
 #include "operator/operator_test_utils.hpp"
+#include "pipeline/gpu_pipeline_task.hpp"
 #include "scan_manager/preparation_fixture.hpp"
 #include "scan_manager/preparation_test_support.hpp"
+#include "utils/telemetry_utils.hpp"
 
 #include <cudf/strings/strings_column_view.hpp>
 
@@ -111,6 +115,7 @@ class pull_producer final : public arrow_batch_producer {
  public:
   std::vector<int> rows{3};
   std::function<void()> on_normalize;
+  std::function<void(ArrowSchema&, ArrowArray&)> observe_tree;
   size_t cursor  = 0;
   int preflights = 0, calls = 0, closes = 0;
   bool ready = true, cancelled = false, wrong_schema = false, fail_read = false;
@@ -136,6 +141,7 @@ class pull_producer final : public arrow_batch_producer {
     auto capacity = std::make_shared<pull_capacity>(std::move(admitted), on_normalize);
     auto* tree    = new (capacity->block.data()) integer_tree(rows[cursor++]);
     if (wrong_schema) tree->field.format = "f";
+    if (observe_tree) observe_tree(tree->schema, tree->array);
     return produced_arrow_input{
       std::make_shared<owned_arrow_batch>(tree->schema, tree->array, capacity, capacity->staging),
       {}};
@@ -359,8 +365,8 @@ TEST_CASE("Arrow push queue wakes an empty source and copies through admitted ba
   queue_guard guard{q};
   await_ready(*q);
   {
-    std::lock_guard lock(gate->mutex);
-    CHECK(gate->wake_generation > 0);
+    std::unique_lock lock(gate->mutex);
+    REQUIRE(gate->cv.wait_for(lock, 5s, [&] { return gate->wake_generation > 0; }));
   }
   // Concurrent offers never retain a second waiting root.
   CHECK_FALSE(q->offer(offered));
@@ -766,4 +772,335 @@ TEST_CASE("Arrow rootless empty source supports a zero-column binding", "[arrow_
   CHECK(h.profiles->counters->arrow_batches_imported == 0);
   CHECK(h.backing.seen->allocations == 0);
   stream.synchronize();
+}
+
+TEST_CASE("Arrow imported input retires only after its final descriptor owner",
+          "[arrow_driver][arrow_ownership]")
+{
+  auto cancelled = GENERATE(false, true);
+  auto producer  = std::make_shared<pull_producer>();
+  producer->rows = {3, 3};
+  harness h(producer);
+  auto manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space  = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  rmm::cuda_stream stream;
+  auto input    = h.next();
+  auto retained = dynamic_cast<owned_arrow_scan_info&>(*input).coalesced_copy();
+  auto output   = h.driver->materialize_metadata_to_table(*input, *space, stream);
+  CHECK(h.profiles->counters->arrow_batches_imported == 1);
+  input.reset();
+  CHECK(h.ledger->permits_in_flight() == 1);
+  CHECK(std::holds_alternative<sm::preparation_pending>(h.driver->try_claim_split({})));
+  if (cancelled) h.driver->stop_preparation();
+  CHECK(h.ledger->permits_in_flight() == 1);
+  retained.reset();
+  CHECK(h.ledger->permits_in_flight() == 0);
+  CHECK(h.backing.seen->allocated_bytes == 0);
+  // The detached GPU output remains usable after every host input owner has gone.
+  std::array<int32_t, 3> actual{};
+  REQUIRE(cudaMemcpyAsync(actual.data(),
+                          output.table.view().column(0).head<int32_t>(),
+                          sizeof(actual),
+                          cudaMemcpyDeviceToHost,
+                          stream.value()) == cudaSuccess);
+  stream.synchronize();
+  CHECK(actual == std::array<int32_t, 3>{11, 22, 33});
+  if (!cancelled) {
+    // Dropping a claimed job must also return capacity without running the producer.
+    {
+      auto abandoned = h.driver->try_claim_split({});
+      REQUIRE(std::holds_alternative<sm::preparation_job>(abandoned));
+    }
+    CHECK(h.ledger->permits_in_flight() == 0);
+    CHECK(producer->calls == 1);
+    auto next = h.next();
+    REQUIRE(next);
+    CHECK(producer->calls == 2);
+    next.reset();
+    CHECK(h.ledger->permits_in_flight() == 0);
+  } else {
+    CHECK_THROWS_AS(h.driver->try_claim_split({}), duckdb::InterruptException);
+  }
+}
+
+TEST_CASE("Arrow push copy retains foreign backing after a cancelled offer returns",
+          "[arrow_driver][arrow_ownership]")
+{
+  auto cancelled = GENERATE(false, true);
+  auto q         = queue();
+  harness h(q);
+  sirius::test::preparation::hold copying;
+  h.backing.seen->before_allocate = [&] { copying.wait(); };
+  std::promise<std::thread::id> foreign_release;
+  auto released = foreign_release.get_future();
+  auto owner    = std::shared_ptr<integer_tree>(new integer_tree, [&](integer_tree* tree) {
+    delete tree;
+    foreign_release.set_value(std::this_thread::get_id());
+  });
+  std::weak_ptr<integer_tree> weak = owner;
+  auto submitting = std::async(std::launch::async, [q, owner = std::move(owner)]() mutable {
+    auto id       = std::this_thread::get_id();
+    bool accepted = q->offer(owner->offer(owner));
+    owner.reset();
+    return std::pair{accepted, id};
+  });
+  queue_guard guard{q};
+  await_ready(*q);
+  auto claim = h.driver->try_claim_split({});
+  REQUIRE(std::holds_alternative<sm::preparation_job>(claim));
+  auto copying_job = std::async(std::launch::async,
+                                [job = std::get<sm::preparation_job>(std::move(claim))]() mutable {
+                                  auto id = std::this_thread::get_id();
+                                  try {
+                                    return std::pair{job.run({}), id};
+                                  } catch (duckdb::InterruptException const&) {
+                                    return std::pair{std::unique_ptr<scan_info>{}, id};
+                                  }
+                                });
+  // Declared after both futures so failed assertions unblock before joining them.
+  struct unblock {
+    sirius::test::preparation::hold& hold;
+    ~unblock() { hold.release(); }
+  } unblocker{copying};
+  REQUIRE(copying.await());
+  std::thread::id submit_thread;
+  if (cancelled) {
+    q->cancel();
+    REQUIRE(submitting.wait_for(5s) == std::future_status::ready);
+    auto submitted = submitting.get();
+    submit_thread  = submitted.second;
+    CHECK_FALSE(submitted.first);
+    CHECK(copying_job.wait_for(0ms) == std::future_status::timeout);
+    CHECK(released.wait_for(0ms) == std::future_status::timeout);
+    auto still_readable = weak.lock();
+    REQUIRE(still_readable);
+    CHECK(still_readable->values[2] == 33);
+  }
+  copying.release();
+  REQUIRE(copying_job.wait_for(5s) == std::future_status::ready);
+  auto [input, copy_thread] = copying_job.get();
+  if (!cancelled) {
+    REQUIRE(submitting.wait_for(5s) == std::future_status::ready);
+    auto submitted = submitting.get();
+    submit_thread  = submitted.second;
+    CHECK(submitted.first);
+    REQUIRE(input);
+    CHECK(input->preparation_bytes() > 0);
+  } else {
+    CHECK_FALSE(input);
+  }
+  REQUIRE(released.wait_for(5s) == std::future_status::ready);
+  auto final_thread = released.get();
+  CHECK((final_thread == copy_thread || final_thread == submit_thread));
+  if (cancelled) CHECK(final_thread == copy_thread);
+  CHECK(weak.expired());
+  input.reset();
+  CHECK(h.ledger->permits_in_flight() == 0);
+  CHECK(h.backing.seen->allocated_bytes == 0);
+}
+
+TEST_CASE("Arrow returned tree callbacks run once on the final retaining thread",
+          "[arrow_driver][arrow_ownership]")
+{
+  auto producer = std::make_shared<pull_producer>();
+  std::thread::id schema_thread, array_thread;
+  int schemas = 0, arrays = 0;
+  struct observation {
+    std::thread::id* thread;
+    int* count;
+  } schema{&schema_thread, &schemas}, array{&array_thread, &arrays};
+  producer->observe_tree = [&](ArrowSchema& s, ArrowArray& a) {
+    s.private_data = &schema;
+    a.private_data = &array;
+    s.release      = [](ArrowSchema* value) {
+      auto& seen   = *static_cast<observation*>(value->private_data);
+      *seen.thread = std::this_thread::get_id();
+      ++*seen.count;
+      value->release = nullptr;
+    };
+    a.release = [](ArrowArray* value) {
+      auto& seen   = *static_cast<observation*>(value->private_data);
+      *seen.thread = std::this_thread::get_id();
+      ++*seen.count;
+      value->release = nullptr;
+    };
+  };
+  harness h(producer);
+  auto input    = h.next();
+  auto retained = dynamic_cast<owned_arrow_scan_info&>(*input).coalesced_copy();
+  auto manager  = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space   = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  rmm::cuda_stream stream;
+  auto output = h.driver->materialize_metadata_to_table(*input, *space, stream);
+  REQUIRE(output.table.num_rows() == 3);
+  input.reset();
+  CHECK(schemas == 0);
+  CHECK(arrays == 0);
+  auto disposing = std::async(std::launch::async, [retained = std::move(retained)]() mutable {
+    retained.reset();
+    return std::this_thread::get_id();
+  });
+  auto thread    = disposing.get();
+  CHECK(thread != std::this_thread::get_id());
+  CHECK(schema_thread == thread);
+  CHECK(array_thread == thread);
+  CHECK(schemas == 1);
+  CHECK(arrays == 1);
+  CHECK(h.ledger->permits_in_flight() == 0);
+}
+
+namespace {
+// Keep the production task's reservation, execution, sink and exception cleanup paths.
+// Only the operator boundary is supplied by the fixture.
+class arrow_task_operator final : public sirius::op::sirius_physical_operator {
+ public:
+  arrow_import_ingestible& driver;
+  cucascade::memory::memory_space& space;
+  int mode;
+  int32_t* actual = nullptr;
+  std::shared_ptr<cucascade::data_batch> published;
+  bool reached_sink = false;
+  sirius::test::preparation::hold pending_read;
+  std::atomic<bool> read_timed_out{false};
+  arrow_task_operator(arrow_import_ingestible& d, cucascade::memory::memory_space& s, int m)
+    : sirius_physical_operator(
+        sirius::op::SiriusPhysicalOperatorType::GPU_SCAN,
+        sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+        3),
+      driver(d),
+      space(s),
+      mode(m)
+  {
+    if (cudaMallocHost(reinterpret_cast<void**>(&actual), 3 * sizeof(int32_t)) != cudaSuccess)
+      throw std::runtime_error("sink observation allocation failed");
+    std::fill_n(actual, 3, 0);
+  }
+  ~arrow_task_operator() override { cudaFreeHost(actual); }
+  std::unique_ptr<sirius::op::operator_data> execute(sirius::op::operator_data const& input,
+                                                     ::cuda::stream_ref stream) override
+  {
+    auto const& split = dynamic_cast<scan_operator_input const&>(input);
+    auto result       = driver.materialize_metadata_to_table(split.get_scan_info(), space, stream);
+    auto table        = driver.post_filter_and_project(std::move(result), space, stream);
+    return std::make_unique<sirius::op::pipelineable_operator_data>(
+      std::vector<std::shared_ptr<cucascade::data_batch>>{
+        sirius::make_data_batch(std::move(table), space, stream, batch_telemetry())});
+  }
+  void sink(sirius::op::operator_data const& input, ::cuda::stream_ref stream) override
+  {
+    reached_sink        = true;
+    auto const& batches = dynamic_cast<sirius::op::pipelineable_operator_data const&>(input);
+    auto const& batch   = batches.get_data_batches().front();
+    auto view           = sirius::get_cudf_table_view(*batch);
+    auto status         = cudaLaunchHostFunc(
+      stream.get(),
+      [](void* data) {
+        auto& self = *static_cast<arrow_task_operator*>(data);
+        try {
+          self.pending_read.wait();
+        } catch (...) {
+          self.read_timed_out = true;
+        }
+      },
+      this);
+    if (status != cudaSuccess) throw std::runtime_error("sink hold failed");
+    status = cudaMemcpyAsync(actual,
+                             view.column(0).head<int32_t>(),
+                             3 * sizeof(int32_t),
+                             cudaMemcpyDeviceToHost,
+                             stream.get());
+    if (status != cudaSuccess) throw std::runtime_error("sink copy failed");
+    if (mode == 1) throw std::runtime_error("sink failure after enqueue");
+    if (mode == 2) {
+      driver.stop_preparation();
+      throw duckdb::InterruptException();
+    }
+    published = batch;
+  }
+};
+}  // namespace
+
+TEST_CASE("Arrow outputs survive input retirement through task success and sink failure",
+          "[arrow_driver][arrow_ownership][arrow_task_lifetime]")
+{
+  auto mode     = GENERATE(0, 1, 2);
+  auto producer = std::make_shared<pull_producer>();
+  harness h(producer);
+  auto manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space  = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  auto* allocator =
+    space->get_memory_resource_as<cucascade::memory::reservation_aware_resource_adaptor>();
+  REQUIRE(allocator);
+  auto baseline = allocator->get_total_allocated_bytes();
+  rmm::cuda_stream stream;
+  arrow_task_operator op(*h.driver, *space, mode);
+  op.operator_id = 1;
+  namespace pl   = sirius::pipeline;
+  auto pipeline  = std::make_shared<pl::sirius_pipeline>(pl::pipeline_build_context{nullptr, true});
+  pipeline->set_pipeline_id(71);
+  pl::sirius_pipeline_build_state build;
+  build.set_pipeline_source(*pipeline, op);
+  build.add_pipeline_operator(*pipeline, op);
+  build.set_pipeline_sink(*pipeline, op, 1);
+  auto global = std::make_shared<pl::sirius_pipeline_task_global_state>(
+    pipeline, sirius::test::make_test_telemetry_context());
+  auto input = std::make_unique<scan_operator_input>(h.next());
+  auto local = std::make_unique<pl::gpu_pipeline_task_local_state>(std::move(input));
+  auto task  = std::make_unique<pl::gpu_pipeline_task>(
+    1, std::vector<cucascade::shared_data_repository*>{}, std::move(local), global);
+  auto info        = task->get_estimated_reservation_size_info(space);
+  auto reservation = space->make_reservation_or_null(1 << 20);
+  REQUIRE(reservation);
+  task->local_state()->cast<pl::gpu_pipeline_task_local_state>().set_reservation(
+    std::move(reservation), info);
+  task->telemetry_fsm().queued(
+    {.queue = {.target = quent::task_queue::TaskQueueId{quent::nil_uuid()},
+               .data   = {.entries = 1}}});
+  task->telemetry_fsm().reserving(
+    {.requested_bytes      = 0,
+     .input_basis          = 0,
+     .peak_estimate        = 0,
+     .bytes_to_materialize = 0,
+     .manager_thread       = {
+             .target = quent::task_manager_loop_thread::TaskManagerLoopThreadId{quent::nil_uuid()},
+             .data   = {}}});
+  auto executing = std::async(std::launch::async, [&] {
+    if (cudaSetDevice(0) != cudaSuccess) throw std::runtime_error("task device unavailable");
+    task->execute(stream);
+  });
+  struct release_read {
+    sirius::test::preparation::hold& hold;
+    ~release_read() { hold.release(); }
+  } release{op.pending_read};
+  REQUIRE(op.pending_read.await());
+  CHECK(executing.wait_for(50ms) == std::future_status::timeout);
+  CHECK(h.ledger->permits_in_flight() == 0);
+  CHECK(allocator->get_total_allocated_bytes() > baseline);
+  op.pending_read.release();
+  REQUIRE(executing.wait_for(5s) == std::future_status::ready);
+  if (mode == 0) REQUIRE_NOTHROW(executing.get());
+  if (mode == 1) REQUIRE_THROWS_WITH(executing.get(), "sink failure after enqueue");
+  if (mode == 2) REQUIRE_THROWS_AS(executing.get(), duckdb::InterruptException);
+  CHECK_FALSE(op.read_timed_out.load());
+  // No fixture synchronization before these observations: execute must join the sink copy.
+  REQUIRE(op.reached_sink);
+  CHECK(std::array<int32_t, 3>{op.actual[0], op.actual[1], op.actual[2]} ==
+        std::array<int32_t, 3>{11, 22, 33});
+  CHECK(h.profiles->counters->arrow_batches_imported == 1);
+  CHECK(h.ledger->permits_in_flight() == 0);
+  CHECK(h.backing.seen->allocated_bytes == 0);
+  task.reset();
+  CHECK_FALSE(allocator->is_stream_tracked(stream));
+  if (mode == 0) {
+    REQUIRE(op.published);
+    CHECK(allocator->get_total_allocated_bytes() > baseline);
+    CHECK(sirius::get_cudf_table_view(*op.published).num_rows() == 3);
+    op.published.reset();
+  } else {
+    CHECK_FALSE(op.published);
+  }
+  CHECK(allocator->get_total_allocated_bytes() == baseline);
+  // Destruction may enqueue frees. Keep the caller's allocator and stream alive for that
+  // completion.
+  REQUIRE(cudaStreamSynchronize(stream.value()) == cudaSuccess);
 }

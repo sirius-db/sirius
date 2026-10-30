@@ -68,7 +68,10 @@ scan_manager::scan_envelope arrow_preparation_envelope(arrow_batch_producer cons
 
 // Views and their complete backing must remain immutable and readable until the
 // owner is released. retained_bytes includes parent extents and control storage,
-// not just the selected slice. Rejection leaves the offered input caller-owned.
+// not just the selected slice. Final release may occur on any retaining thread;
+// owners and callbacks must be thread-neutral. There is no affine reclamation handshake.
+// A false offer result does not join an in-progress copy: retained views and backing
+// must remain readable and immutable until their last retained use ends.
 struct offered_arrow_input {
   ArrowSchema const* schema;
   ArrowArray const* array;
