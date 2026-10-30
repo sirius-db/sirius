@@ -1,0 +1,192 @@
+# name: test/sql/sirius_gateway.test
+# description: the gateway over CPU ranks: plain DuckDB with quack_serve, no Sirius
+# group: [sirius_gateway]
+
+require sirius_gateway
+
+require quack
+
+statement ok
+SET GLOBAL sirius_gateway_duckdb_binary = '{BUILD_DIRECTORY}/duckdb';
+
+# CPU ranks have no sirius_distributed_query_id; a variable shows the number each rank got.
+statement ok
+SET GLOBAL sirius_gateway_query_id_setting = 'VARIABLE sirius_query_id';
+
+statement ok
+SET GLOBAL sirius_gateway_log_dir = '{TEST_DIR}/sirius_gateway';
+
+statement error
+FROM sirius_gateway_run('SELECT 1');
+----
+no ranks
+
+query I
+SELECT count(*) FROM sirius_gateway_start(2, quack_base_port := 19500) WHERE state = 'up';
+----
+2
+
+# Every rank runs every statement, numbered in order; rank 0's result comes back.
+statement ok
+FROM sirius_gateway_run('CREATE VIEW v AS SELECT 42 AS x');
+
+query II
+FROM sirius_gateway_run('SELECT getvariable(''sirius_query_id''), (FROM v)');
+----
+2	42
+
+query II
+FROM sirius_gateway_log();
+----
+1	CREATE VIEW v AS SELECT 42 AS x
+
+# Failing on every rank is an ordinary error, and the ranks keep serving.
+statement error
+FROM sirius_gateway_run('FROM missing_table');
+----
+missing_table
+
+query I
+SELECT count(*) FROM sirius_gateway_status() WHERE state = 'up';
+----
+2
+
+# Statements from concurrent connections run one at a time, each with its own number.
+statement ok
+FROM sirius_gateway_run('CREATE TABLE t (k BIGINT)');
+
+concurrentloop i 0 4
+
+loop j 0 5
+
+statement ok
+FROM sirius_gateway_run('INSERT INTO t VALUES (getvariable(''sirius_query_id''))');
+
+endloop
+
+endloop
+
+query II
+FROM sirius_gateway_run('SELECT count(*), count(DISTINCT k) FROM t');
+----
+20	20
+
+# A statement that succeeds on some ranks only leaves them out of step: the gateway reports it,
+# then restarts the ranks and replays the DDL log before the next statement.
+statement error
+FROM sirius_gateway_run('SELECT CASE WHEN (SELECT port FROM quack_server_list()) = 19501 THEN error(''only rank 1'') ELSE 1 END');
+----
+ranks disagree
+
+query II
+FROM sirius_gateway_run('SELECT (FROM v), (SELECT count(*) FROM t)');
+----
+42	20
+
+statement ok
+FROM sirius_gateway_restart();
+
+query I
+FROM sirius_gateway_run('FROM v');
+----
+42
+
+# A statement past the timeout is cancelled on every rank; the ranks keep serving.
+statement ok
+SET sirius_gateway_statement_timeout = 1;
+
+statement error
+FROM sirius_gateway_run('SELECT sum(i) FROM range(1000000000000) r(i)');
+----
+timed out
+
+statement ok
+SET sirius_gateway_statement_timeout = 0;
+
+query I
+SELECT count(*) FROM sirius_gateway_status() WHERE state = 'up';
+----
+2
+
+# Clients reach the gateway over Quack; the router sends their statements to every rank.
+statement ok
+SET GLOBAL quack_authorization_function = 'sirius_gateway_route';
+
+statement ok
+CALL quack_serve('quack:127.0.0.1:19510', token := 'gateway-token');
+
+statement ok con2
+ATTACH 'quack:127.0.0.1:19510' AS gw (TOKEN 'gateway-token');
+
+statement ok con2
+CONNECT gw;
+
+query I con2
+FROM v;
+----
+42
+
+query I con2
+SELECT count(*) FROM sirius_gateway_status();
+----
+2
+
+statement error con2
+SET sirius_exchange_rank = 1;
+----
+set on every rank by the gateway
+
+statement error con2
+SET gpu_execution = false;
+----
+set on every rank by the gateway
+
+statement error con2
+SET sirius_exchange_host_staging = 'always';
+----
+set on every rank by the gateway
+
+# A client's transaction stays in its own gateway session; the shared rank sessions never see it.
+query I
+SELECT sirius_gateway_route('', 'BEGIN TRANSACTION; SELECT 1; COMMIT') = 'BEGIN TRANSACTION;' || chr(10) || 'FROM sirius_gateway_run(''SELECT 1'');' || chr(10) || 'COMMIT;' || chr(10);
+----
+true
+
+statement ok con2
+BEGIN TRANSACTION;
+
+query I con2
+FROM v;
+----
+42
+
+statement ok con2
+COMMIT;
+
+statement error con2
+PREPARE p AS SELECT 1;
+----
+not supported through the gateway
+
+statement error con2
+FROM sirius_gateway_stop();
+----
+gateway's console
+
+statement error con2
+FROM quack_query('quack:127.0.0.1:19500', 'SELECT 1');
+----
+gateway's console
+
+statement ok con2
+DISCONNECT;
+
+query I
+SELECT state FROM sirius_gateway_stop();
+----
+stopped
+
+statement error
+FROM sirius_gateway_run('SELECT 1');
+----
+stopped
