@@ -109,7 +109,9 @@ using wait_for_memory_for_task_event =
 using compressed_materialization_event =
   event<event_type::compressed_materialization, compressed_materialization_activity, std::uint64_t>;
 
-/// One per queued task the downgrade executor converted; lists only the inputs that moved.
+/// A queued task with inputs off the GPU, listing only those inputs. Published by the downgrade
+/// executor's tier 2, once per task it converted, and by task_scheduler::schedule() for a task
+/// queued with inputs already off the GPU.
 using task_downgraded_event = event<event_type::task_downgraded, query_id_t, downgraded_task>;
 
 /// Published by the scheduler right after it pops a task for @c gpu; @c tasks_left is the

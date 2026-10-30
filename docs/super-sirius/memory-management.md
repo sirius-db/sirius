@@ -184,14 +184,14 @@ Two `query_event_publisher` events drive it; both are published only while someo
 
 A `task_downgraded` makes the task a candidate, or adds to the one it already is; a task of a query that grants no work lease is ignored. A `task_popped` removes the task from the candidates, releases the budget its inputs hold, and gives `g` one credit.
 
-The two events come from different threads into one mailbox in no guaranteed order, so a `task_downgraded` can arrive after its task's `task_popped`. Both producers publish `task_downgraded` before the task enters the queue, so its event id is smaller than that of the task's pop. The executor therefore remembers the last 4096 popped tasks with the id of their `task_popped` event (recent-pop tombstones) and drops a `task_downgraded` whose event id is smaller than its task's pop (`stale_event`). What that window misses is cleaned up later: inputs whose batch expired are dropped at the next selection, and `retire_query` drops the rest.
+The two events come from different threads into one mailbox in no guaranteed order, so a `task_downgraded` can arrive after its task's `task_popped`. Both producers publish `task_downgraded` before the task enters the queue, so its event id is smaller than that of the task's pop. The executor therefore remembers the last 4096 popped tasks with the id of their `task_popped` event (recent-pop tombstones) and drops a `task_downgraded` whose event id is smaller than its task's pop (`stale_event`). What that window misses is cleaned up later: inputs whose batch expired are dropped when a selection walks past them, and `retire_query` drops the rest.
 
 ### Pop-time rule
 
 Each GPU has one worker thread (`preload-<device>`) that spends each credit on at most one promotion. Pops that arrive while it is busy wait as credits, at most `executor.pipeline.num_threads` per GPU; past that the oldest is dropped. For a credit from a pop on GPU `g`:
 
 1. **Candidates for `g`:** tasks that prefer `g` or have no preference (promoted to `g`).
-2. **Gate:** a candidate is eligible if `tasks_left <= executor.pipeline.num_threads` (`g`'s queue is nearly drained) or it belongs to the popped task's pipeline.
+2. **Gate:** a candidate is eligible if `tasks_left <= executor.pipeline.num_threads` (`g`'s queue is nearly drained) or it belongs to the popped task's pipeline (the same query and pipeline id: pipeline ids are per query).
 3. **Selection:** eligible candidates in pop order (ascending queue priority); the first input that is not on a GPU, not being promoted and not skipped, and that fits, wins:
    - to `g`, if `device_budget > 0` and it fits `g`'s budget and ceiling;
    - else, if it is on DISK, to `g`'s NUMA-local HOST space (the first HOST space when the node has none or is unknown), if it fits that space's budget and ceiling.

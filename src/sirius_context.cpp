@@ -253,9 +253,6 @@ SiriusContext::~SiriusContext() noexcept
     } catch (...) {
     }
   }
-  // A terminate() that threw stopped before restoring cuDF's pinned resource; the slab allocator
-  // it points at is destroyed with the members below. No-op after a complete terminate().
-  restore_cudf_pinned_memory_resource();
   event_publisher_->stop();
 }
 
@@ -1173,7 +1170,7 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
   scan_manager_->set_query_event_publisher(*query_event_publisher_);
 
   // Wire the pipeline task queue into downgrade executors now that task_scheduler_
-  // has been constructed, and let them report the batches they move.
+  // has been constructed, and let them report each queued task they downgrade.
   for (auto& executor : downgrade_executors_) {
     executor->set_pipeline_task_queue(task_scheduler_->get_pipeline_task_queue());
     executor->set_query_event_publisher(*query_event_publisher_);
@@ -1252,10 +1249,6 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
 
 void SiriusContext::terminate()
 {
-  // A terminate() that throws leaves the context initialized, and ~SiriusContext runs it again:
-  // every step before the throw must therefore be safe to repeat (stops, resets and the cuDF
-  // pinned-resource restore are idempotent, and members a first run already reset are
-  // null-guarded).
   throw_if_not_initialized();
   admission_.close();
   mark_runtime_unavailable();
@@ -1274,10 +1267,11 @@ void SiriusContext::terminate()
 
   // Stop every producer and every borrower BEFORE destroying the task_scheduler.
   // Creation workers and downgrade executors borrow the scheduler and its task queue.
-  if (task_scheduler_) { task_scheduler_->stop(); }
+  task_scheduler_->stop();
   if (scan_manager_) { scan_manager_->stop(); }
-  if (task_creator_) { task_creator_->stop_thread_pool(); }
-  // Joins a promotion still copying; before clear(), so a throw there leaves preload stopped.
+  task_creator_->stop_thread_pool();
+  // Null when preload is off. Joins a promotion still running: before clear(), which requires
+  // the work lease that promotion holds to be released.
   if (preload_executor_) { preload_executor_->stop(); }
   for (auto& executor : downgrade_executors_) {
     executor->stop();
@@ -1285,7 +1279,7 @@ void SiriusContext::terminate()
   // Drop any per-query state a window failed to clean up (e.g. a latched-unavailable path whose
   // best-effort reset threw). Doing it here, rather than letting ~task_creator do it, keeps the
   // DuckTableScanState/BlockHandle releases inside the window where DuckDB is still intact.
-  if (task_creator_) { task_creator_->reset_all(); }
+  task_creator_->reset_all();
   query_lifecycle_.clear();
   task_creator_.reset();
   preload_executor_.reset();
@@ -1325,10 +1319,8 @@ void SiriusContext::terminate()
   small_pinned_allocator_view_.reset();
   small_pinned_allocator_.reset();
 
-  if (memory_manager_) {
-    memory_manager_->shutdown();
-    memory_manager_.reset();
-  }
+  memory_manager_->shutdown();
+  memory_manager_.reset();
 
   // Owns only a topology copy (no device resources); drop after the components
   // that held shared_ptr copies of it are gone.

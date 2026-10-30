@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <cassert>
 #include <format>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -42,6 +43,9 @@ using cucascade::memory::Tier;
 
 /// Popped tasks remembered to recognize a task_downgraded delivered after its task's pop.
 constexpr std::size_t recent_pops_cap = 4096;
+
+/// No estimate is smaller: a space that cannot fit this can fit no input.
+constexpr std::size_t smallest_estimate = with_slack(1);
 
 std::vector<cucascade::memory::memory_space*> spaces_of(
   memory::sirius_memory_reservation_manager& memory, Tier tier)
@@ -220,12 +224,7 @@ void preload_executor::retire_query(query_id_t q) noexcept
 {
   std::lock_guard const lk{_mu};
   for (auto it = _candidates.begin(); it != _candidates.end();) {
-    if (it->second.query == q) {
-      release_all(it->second);
-      it = _candidates.erase(it);
-    } else {
-      ++it;
-    }
+    it = it->second.query == q ? drop(it) : std::next(it);
   }
 }
 
@@ -259,26 +258,26 @@ void preload_executor::on_task_downgraded(event::event_id_t event_id,
     // once the query refuses leases, so either it sees this candidate or this sees the refusal.
     if (!_lifecycle.try_acquire_work(query_id)) { return; }
 
-    auto& c            = _candidates[task.task_id];
+    auto& c            = upsert(task.task_id, task.priority);
     c.query            = query_id;
     c.pipeline_id      = task.pipeline_id;
     c.preferred_device = task.preferred_device;
-    c.priority         = task.priority;
     for (auto const& moved : task.inputs) {
-      auto in = std::find_if(c.inputs.begin(), c.inputs.end(), [&](input_state const& i) {
+      auto const est = with_slack(std::max<std::size_t>(moved.gpu_bytes, 1));
+      auto in        = std::find_if(c.inputs.begin(), c.inputs.end(), [&](input_state const& i) {
         return i.batch_id == moved.batch_id;
       });
       if (in == c.inputs.end()) {
         c.inputs.push_back({.batch     = moved.batch,
                             .batch_id  = moved.batch_id,
                             .location  = moved.to.tier,
-                            .gpu_bytes = moved.gpu_bytes});
+                            .est_bytes = est});
         continue;
       }
       // Moved back down: a promotion it held budget for is undone.
       release(in->held);
       in->location  = moved.to.tier;
-      in->gpu_bytes = std::max(in->gpu_bytes, moved.gpu_bytes);
+      in->est_bytes = std::max(in->est_bytes, est);
       in->skip      = false;
     }
   } catch (...) {
@@ -288,7 +287,7 @@ void preload_executor::on_task_downgraded(event::event_id_t event_id,
 
 void preload_executor::on_task_popped(event::event_id_t event_id,
                                       event::timestamp_t,
-                                      query_id_t,
+                                      query_id_t query_id,
                                       std::uint64_t task_id,
                                       std::size_t pipeline_id,
                                       int gpu,
@@ -299,16 +298,14 @@ void preload_executor::on_task_popped(event::event_id_t event_id,
   ++_counters.pops;
   try {
     // The task runs now: its inputs leave preload's budget.
-    if (auto const it = _candidates.find(task_id); it != _candidates.end()) {
-      release_all(it->second);
-      _candidates.erase(it);
-    }
+    if (auto const it = find_candidate(task_id); it != _candidates.end()) { drop(it); }
     auto const g = std::find_if(
       _gpus.begin(), _gpus.end(), [gpu](gpu_state const& s) { return s.device == gpu; });
     if (g != _gpus.end()) {
       // Pops that arrive while the worker is busy wait as credits; past the cap the oldest go.
       if (g->credits.size() >= _pipeline_threads) { g->credits.pop_front(); }
-      g->credits.push_back({tasks_left, pipeline_id});
+      g->credits.push_back(
+        {.tasks_left = tasks_left, .query = query_id, .pipeline_id = pipeline_id});
       _work_cv.notify_all();
     }
     // Last, so a throw here skips neither the release nor the credit.
@@ -372,10 +369,18 @@ void preload_executor::worker_loop(std::size_t g, std::stop_token const& st) noe
 
 std::optional<promotion_job> preload_executor::select(std::size_t g, pop_credit const& credit)
 {
-  auto& gpu              = _gpus[g];
+  auto& gpu        = _gpus[g];
+  auto* const host = gpu.local_host ? &_hosts[*gpu.local_host] : nullptr;
+  // Neither target can take even the smallest input (a zero budget takes none): no walk.
+  if (!fits(gpu, smallest_estimate) && (host == nullptr || !fits(*host, smallest_estimate))) {
+    ++_counters.no_room;
+    return std::nullopt;
+  }
+
   bool const short_queue = credit.tasks_left <= _pipeline_threads;
   bool any_for_gpu       = false;
-  std::vector<std::pair<std::pair<exec::queue_priority, std::uint64_t>, candidate_task*>> eligible;
+  bool any_eligible      = false;
+  // In pop order: the inputs of the task that runs first are needed first.
   for (auto it = _candidates.begin(); it != _candidates.end();) {
     auto& c = it->second;
     for (auto in = c.inputs.begin(); in != c.inputs.end();) {
@@ -387,60 +392,50 @@ std::optional<promotion_job> preload_executor::select(std::size_t g, pop_credit 
       }
     }
     if (c.inputs.empty()) {
-      it = _candidates.erase(it);
+      it = drop(it);
       continue;
     }
-    if (!c.preferred_device || *c.preferred_device == gpu.device) {
-      any_for_gpu = true;
-      if (short_queue || c.pipeline_id == credit.pipeline_id) {
-        eligible.push_back({{c.priority, it->first}, &c});
+    bool const for_gpu = !c.preferred_device || *c.preferred_device == gpu.device;
+    // Pipeline ids are per query.
+    bool const open =
+      short_queue || (c.query == credit.query && c.pipeline_id == credit.pipeline_id);
+    any_for_gpu = any_for_gpu || for_gpu;
+    if (for_gpu && open) {
+      any_eligible = true;
+      for (auto& in : c.inputs) {
+        if (in.in_flight || in.skip || in.location == Tier::GPU) { continue; }
+        std::optional<charge> target;
+        if (_cfg.device_budget > 0.0 && fits(gpu, in.est_bytes)) {
+          target = charge{Tier::GPU, g, in.est_bytes};
+        } else if (in.location == Tier::DISK && _cfg.host_budget > 0.0 && host != nullptr &&
+                   fits(*host, in.est_bytes)) {
+          target = charge{Tier::HOST, *gpu.local_host, in.est_bytes};
+        }
+        if (!target) { continue; }
+        auto const& s = state_of(*target);
+        promotion_job job{.batch         = in.batch,
+                          .batch_id      = in.batch_id,
+                          .task_id       = it->first.second,
+                          .query         = c.query,
+                          .tier          = target->tier,
+                          .space         = target->space,
+                          .target        = s.space,
+                          .est_bytes     = in.est_bytes,
+                          .ceiling_bytes = s.ceiling_bytes};
+        add(*target);
+        in.in_flight = true;
+        return job;
       }
     }
     ++it;
   }
-  if (eligible.empty()) {
-    ++(any_for_gpu ? _counters.gated : _counters.no_candidate);
-    return std::nullopt;
-  }
-  // Neither target has budget left (a zero budget has none): nothing can fit.
-  auto const has_room = [](space_state const& s) { return s.outstanding < s.budget_bytes; };
-  if (!has_room(gpu) && !(gpu.local_host && has_room(_hosts[*gpu.local_host]))) {
+  if (any_eligible) {
     ++_counters.no_room;
-    return std::nullopt;
+  } else if (any_for_gpu) {
+    ++_counters.gated;
+  } else {
+    ++_counters.no_candidate;
   }
-
-  // Pop order: the inputs of the task that runs first are needed first.
-  std::sort(eligible.begin(), eligible.end(), [](auto const& a, auto const& b) {
-    return a.first < b.first;
-  });
-  for (auto const& [key, c] : eligible) {
-    for (auto& in : c->inputs) {
-      if (in.in_flight || in.skip || in.location == Tier::GPU) { continue; }
-      auto const est = with_slack(std::max<std::size_t>(in.gpu_bytes, 1));
-      std::optional<charge> target;
-      if (_cfg.device_budget > 0.0 && fits(gpu, est)) {
-        target = charge{Tier::GPU, g, est};
-      } else if (in.location == Tier::DISK && _cfg.host_budget > 0.0 && gpu.local_host &&
-                 fits(_hosts[*gpu.local_host], est)) {
-        target = charge{Tier::HOST, *gpu.local_host, est};
-      }
-      if (!target) { continue; }
-      auto const& s = state_of(*target);
-      promotion_job job{.batch         = in.batch,
-                        .batch_id      = in.batch_id,
-                        .task_id       = key.second,
-                        .query         = c->query,
-                        .tier          = target->tier,
-                        .space         = target->space,
-                        .target        = s.space,
-                        .est_bytes     = est,
-                        .ceiling_bytes = s.ceiling_bytes};
-      add(*target);
-      in.in_flight = true;
-      return job;
-    }
-  }
-  ++_counters.no_room;
   return std::nullopt;
 }
 
@@ -465,7 +460,7 @@ void preload_executor::apply(promotion_job const& job, promotion_result const& r
   }
 
   // Popped or retired while the job ran: nothing to record.
-  auto const task = _candidates.find(job.task_id);
+  auto const task = find_candidate(job.task_id);
   if (task == _candidates.end()) { return; }
   auto& inputs  = task->second.inputs;
   auto const in = std::find_if(
@@ -492,15 +487,61 @@ void preload_executor::apply(promotion_job const& job, promotion_result const& r
       break;
     case promotion_outcome::failed: in->skip = true; break;
     case promotion_outcome::no_room:
-      // The exact need, when known: fits() refuses the input until that much is free.
-      in->gpu_bytes = std::max(in->gpu_bytes, result.bytes);
+      // The exact need, when known, slack included: fits() refuses the input until that much is
+      // free.
+      in->est_bytes = std::max(in->est_bytes, result.bytes);
       break;
   }
   if (in->batch.expired()) {
     release(in->held);
     inputs.erase(in);
-    if (inputs.empty()) { _candidates.erase(task); }
+    if (inputs.empty()) { drop(task); }
   }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Candidates
+// ---------------------------------------------------------------------------------------------
+
+preload_executor::candidate_task& preload_executor::upsert(std::uint64_t task_id,
+                                                           exec::queue_priority priority)
+{
+  candidate_key const key{priority, task_id};
+  auto const [k, added] = _candidate_keys.try_emplace(task_id, key);
+  if (added) {
+    // Undone if the insertion throws, so the two maps never disagree.
+    try {
+      return _candidates[key];
+    } catch (...) {
+      _candidate_keys.erase(k);
+      throw;
+    }
+  }
+  auto it = _candidates.find(k->second);
+  if (k->second != key) {
+    // Published again with another priority: move it, inputs and charges, to its new place.
+    auto node  = _candidates.extract(it);
+    node.key() = key;
+    it         = _candidates.insert(std::move(node)).position;
+    k->second  = key;
+  }
+  return it->second;
+}
+
+preload_executor::candidate_map::iterator preload_executor::find_candidate(std::uint64_t task_id)
+{
+  auto const k = _candidate_keys.find(task_id);
+  return k == _candidate_keys.end() ? _candidates.end() : _candidates.find(k->second);
+}
+
+preload_executor::candidate_map::iterator preload_executor::drop(
+  candidate_map::iterator it) noexcept
+{
+  for (auto& in : it->second.inputs) {
+    release(in.held);
+  }
+  _candidate_keys.erase(it->first.second);
+  return _candidates.erase(it);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -533,13 +574,6 @@ void preload_executor::release(charge& c) noexcept
   assert(s.outstanding >= c.bytes);
   s.outstanding -= std::min(s.outstanding, c.bytes);
   c = {};
-}
-
-void preload_executor::release_all(candidate_task& c) noexcept
-{
-  for (auto& in : c.inputs) {
-    release(in.held);
-  }
 }
 
 bool preload_executor::idle() const noexcept
@@ -591,6 +625,7 @@ std::size_t preload_executor::outstanding_for_testing(cucascade::memory::memory_
 std::size_t preload_executor::candidate_count_for_testing() const
 {
   std::lock_guard const lk{_mu};
+  assert(_candidate_keys.size() == _candidates.size());
   return _candidates.size();
 }
 

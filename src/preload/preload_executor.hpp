@@ -37,6 +37,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -44,6 +45,7 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace cucascade {
@@ -103,7 +105,8 @@ struct preload_counters {
   std::uint64_t bytes_to_host{0};
   std::uint64_t gated{0};         ///< pops with candidates for the GPU but none past the gate
   std::uint64_t no_candidate{0};  ///< pops with no candidate for the GPU at all
-  std::uint64_t no_room{0};       ///< nothing fit a budget or a ceiling, or a reservation failed
+  std::uint64_t no_room{0};       ///< nothing fit a budget or a ceiling (checked first), or a
+                                  ///< reservation failed
   std::uint64_t not_needed{0};    ///< the batch was gone, busy or already promoted
   std::uint64_t failed{0};        ///< unsupported representation or an error during the copy
   std::uint64_t stale_event{0};   ///< task_downgraded delivered after its task was popped
@@ -117,8 +120,9 @@ struct preload_counters {
  * - @c task_popped for GPU g: the task leaves the candidates and releases its budget, and g
  *   gets one credit. g's worker spends each credit on at most one promotion: the first input,
  *   in pop order, of a candidate that may run on g and passes the gate (g's queue is short, or
- *   the candidate belongs to the popped pipeline), moved to g if it fits g's budget and ceiling,
- *   else, from DISK, to g's local HOST space if it fits that space's budget and ceiling.
+ *   the candidate belongs to the popped task's query and pipeline), moved to g if it fits g's
+ *   budget and ceiling, else, from DISK, to g's local HOST space if it fits that space's budget
+ *   and ceiling.
  *
  * Concurrency: one mutex guards all state. The event hooks run on the subscriber thread; each GPU
  * has one worker thread. A worker selects a job under the mutex and runs @ref promote_one
@@ -202,10 +206,11 @@ class preload_executor final : public event::query_event_subscriber {
     std::uint64_t batch_id{0};
     /// Last known tier: HOST or DISK from the event, GPU or HOST after a promotion.
     cucascade::memory::Tier location{cucascade::memory::Tier::SIZE};
-    /// Device size estimate (the largest reported: the GPU size before a spill, or the peak to
-    /// materialize it for an input queued off the GPU): the reservation estimate. Raised
-    /// to the exact need of a promotion that found no room, so it is not retried until that fits.
-    std::size_t gpu_bytes{0};
+    /// The budget and reservation estimate, slack included: the largest device size reported
+    /// (the GPU size before a spill, or the peak to materialize it for an input queued off the
+    /// GPU) with slack. Raised to the exact need of a promotion that found no room, so it is not
+    /// retried until that fits.
+    std::size_t est_bytes{0};
     /// A worker is promoting it; the job, not this input, holds that charge.
     bool in_flight{false};
     /// Its last promotion failed or found the batch busy; not retried until downgraded again.
@@ -219,13 +224,18 @@ class preload_executor final : public event::query_event_subscriber {
     query_id_t query{};
     std::size_t pipeline_id{0};
     std::optional<int> preferred_device;
-    exec::queue_priority priority{};
     std::vector<input_state> inputs;
   };
+
+  /// Pop order: queue priority, then task id.
+  using candidate_key = std::pair<exec::queue_priority, std::uint64_t>;
+  using candidate_map = std::map<candidate_key, candidate_task>;
 
   /// One pop on a GPU, waiting for that GPU's worker.
   struct pop_credit {
     std::size_t tasks_left{0};
+    /// The popped task's query and pipeline: pipeline ids are per query.
+    query_id_t query{};
     std::size_t pipeline_id{0};
   };
 
@@ -252,11 +262,16 @@ class preload_executor final : public event::query_event_subscriber {
   [[nodiscard]] std::optional<promotion_job> select(std::size_t g, pop_credit const& credit);
   /// Settle the charge of a finished @p job against its input, if that is still a candidate.
   void apply(promotion_job const& job, promotion_result const& result) noexcept;
+  /// The candidate of task @p task_id, added if new, at its place for @p priority.
+  [[nodiscard]] candidate_task& upsert(std::uint64_t task_id, exec::queue_priority priority);
+  /// The candidate of task @p task_id, or the end of @c _candidates.
+  [[nodiscard]] candidate_map::iterator find_candidate(std::uint64_t task_id);
+  /// Release the budget @p it holds and erase it. @return the next candidate.
+  candidate_map::iterator drop(candidate_map::iterator it) noexcept;
   [[nodiscard]] bool fits(space_state const& s, std::size_t bytes) const;
   [[nodiscard]] space_state& state_of(charge const& c) noexcept;
   void add(charge const& c) noexcept;
   void release(charge& c) noexcept;
-  void release_all(candidate_task& c) noexcept;
   void remember_pop(std::uint64_t task_id, event::event_id_t event_id);
   [[nodiscard]] bool idle() const noexcept;
   void log_unexpected(std::string_view where) noexcept;
@@ -283,17 +298,19 @@ class preload_executor final : public event::query_event_subscriber {
   std::vector<gpu_state> _gpus;
   std::vector<space_state> _hosts;
   /**
-   * Candidates by task id. Budget invariant: a space's @c outstanding is the sum of the charges
-   * of running jobs targeting it plus the @c held charges of inputs here. @ref select adds a
-   * job's charge; @ref apply releases it or moves it, trued up, into @c held, releasing what was
-   * held before; a popped, retired, re-downgraded or expired input releases its @c held.
+   * Candidates in pop order; @c _candidate_keys holds the key of each by task id. Budget
+   * invariant: a space's @c outstanding is the sum of the charges of running jobs targeting it
+   * plus the @c held charges of inputs here. @ref select adds a job's charge; @ref apply releases
+   * it or moves it, trued up, into @c held, releasing what was held before; a popped, retired,
+   * re-downgraded or expired input releases its @c held.
    *
    * A task_downgraded delivered after its task's task_popped is dropped by @c _recent_pops; for
    * what that window misses, and for a task never popped because its query is tearing down,
-   * @ref select drops inputs whose batch expired and candidates left empty, and
-   * @ref retire_query drops the rest.
+   * @ref select drops the inputs whose batch expired, and candidates left empty, that it walks
+   * past, and @ref retire_query drops the rest.
    */
-  std::unordered_map<std::uint64_t, candidate_task> _candidates;
+  candidate_map _candidates;
+  std::unordered_map<std::uint64_t, candidate_key> _candidate_keys;
   /// Recently popped tasks and the id of their task_popped event, oldest first in
   /// @c _recent_pop_order; bounded.
   std::unordered_map<std::uint64_t, event::event_id_t> _recent_pops;

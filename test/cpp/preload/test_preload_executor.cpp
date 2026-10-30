@@ -545,6 +545,31 @@ TEST_CASE("preload executor: a pop promotes only past the queue-depth gate",
   CHECK(f.exec->counters().no_candidate == 1);
 }
 
+TEST_CASE("preload executor: the same-pipeline gate opens only for the popped task's query",
+          "[preload][preload_executor]")
+{
+  executor_fixture f;
+  auto const other = sirius::make_query_id(2);
+  f.lifecycle.open_query(other);
+  f.build(executor_fixture::config());
+  auto const a = f.spilled(*f.host);
+  f.downgraded(1, {a}, candidate_pipeline, 0, other);
+
+  // Pipeline ids are per query: the fixture's query's pipeline is not the other query's.
+  f.popped(100, deep_queue, candidate_pipeline);
+  f.settle();
+  CHECK(f.exec->counters().gated == 1);
+  CHECK(f.exec->counters().promoted_to_gpu == 0);
+  CHECK(tier_of(*a) == Tier::HOST);
+  CHECK(f.outstanding(f.gpu()) == 0);
+
+  ++f.published;
+  f.publisher->publish_task_popped(other, 101, candidate_pipeline, 0, deep_queue);
+  f.settle();
+  CHECK(f.exec->counters().promoted_to_gpu == 1);
+  CHECK(tier_of(*a) == Tier::GPU);
+}
+
 TEST_CASE("preload executor: one pop promotes at most one input", "[preload][preload_executor]")
 {
   executor_fixture f;
@@ -592,6 +617,34 @@ TEST_CASE("preload executor: the task that pops first goes up first, whenever it
   f.settle();
   CHECK(f.exec->counters().promoted_to_gpu == 2);
   CHECK(tier_of(*runs_later) == Tier::GPU);
+}
+
+TEST_CASE("preload executor: a task published again with another priority moves in pop order",
+          "[preload][preload_executor]")
+{
+  executor_fixture f;
+  f.build(executor_fixture::config());
+  auto const a = f.spilled(*f.host);
+  auto const b = f.spilled(*f.host);
+  f.downgraded(1, {a});
+  auto moved     = f.task(2, {b});
+  moved.priority = f.priority(9);
+  f.downgraded(moved);
+  // Now it pops first.
+  moved.priority = f.priority(0);
+  f.downgraded(std::move(moved));
+
+  f.popped(100, short_queue);
+  f.settle();
+  CHECK(tier_of(*b) == Tier::GPU);
+  CHECK(tier_of(*a) == Tier::HOST);
+  REQUIRE(f.outstanding(f.gpu()) > 0);
+
+  // Found by its task id at its new place: its pop releases what it holds.
+  f.popped(2, deep_queue);
+  f.settle();
+  CHECK(f.outstanding(f.gpu()) == 0);
+  CHECK(f.exec->candidate_count_for_testing() == 1);
 }
 
 TEST_CASE("preload executor: pops during a promotion wait as credits, capped at the threads",
@@ -915,13 +968,13 @@ TEST_CASE("preload executor: an input with no room for its exact need waits unti
   // Big is reported as 1 byte, so it is first selected with the 1 MiB minimum estimate.
   auto const first_estimate = with_slack(1);
   auto const big_need       = gpu_need(*big);
-  auto const raised         = with_slack(big_need);
   auto const small_estimate = estimate(*small);
   auto const small_need     = gpu_need(*small);
   auto const below_big      = std::max({first_estimate, small_estimate, small_need});
   REQUIRE(below_big < big_need);
-  // Room in the budget for both first estimates, not for big's raised one.
-  std::size_t const budget = (std::max(first_estimate, small_estimate) + raised) / 2;
+  // Room in the budget for both first estimates, not for big's exact need, which already
+  // carries its slack and becomes its estimate as is.
+  std::size_t const budget = (std::max(first_estimate, small_estimate) + big_need) / 2;
   auto cfg                 = executor_fixture::config();
   cfg.device_budget        = static_cast<double>(budget) / static_cast<double>(f.opts.gpu_capacity);
   f.build(cfg);
