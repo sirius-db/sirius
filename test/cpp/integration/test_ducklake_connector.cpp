@@ -3725,6 +3725,69 @@ TEST_CASE(
   CHECK(hosts[0]->get_total_reserved_memory() == reserved);
 }
 
+TEST_CASE_METHOD(
+  ducklake_fixture,
+  "DuckLake historical deletes exclude newer snapshots during local deletion",
+  "[ducklake_snapshot_visibility_gpu][ducklake_snapshot_delete_locality][isolated_context]")
+{
+  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
+  auto vectors        = GENERATE(false, true);
+  auto explicit_entry = GENERATE(false, true);
+  CAPTURE(vectors, explicit_entry);
+  run("SET gpu_execution=false");
+  attach_lake(con, disk.directory);
+  run("CALL lake.set_option('data_inlining_row_limit',10)");
+  run(std::string("CALL lake.set_option('write_deletion_vectors',") +
+      (vectors ? "true)" : "false)"));
+  run("CREATE TABLE lake.t AS SELECT i::BIGINT id FROM range(100) r(i)");
+  run("DELETE FROM lake.t WHERE id=0");
+  auto snapshot = run(
+    "SELECT snapshot_id, snapshot_time FROM ducklake_snapshots('lake') "
+    "ORDER BY snapshot_id DESC LIMIT 1");
+  auto version   = snapshot->Collection().GetValue(0, 0).ToString();
+  auto timestamp = snapshot->Collection().GetValue(1, 0).ToSQLString();
+  run("DELETE FROM lake.t WHERE id=2");
+  run("CALL ducklake_flush_inlined_data('lake')");
+  auto format = run(
+    "SELECT format FROM __ducklake_metadata_lake.ducklake_delete_file "
+    "WHERE end_snapshot IS NULL");
+  REQUIRE(format->RowCount() == 1);
+  REQUIRE(format->Collection().GetValue(0, 0).ToString() == (vectors ? "puffin" : "parquet"));
+  run("BEGIN");
+  run("DELETE FROM lake.t WHERE id>=50 AND id<80");
+  auto runtime          = sirius::test::get_registered_sirius_context(con);
+  auto counters         = runtime->physical_counters();
+  counters->track_units = true;
+  std::atomic<unsigned> decoded{0};
+  counters->parquet_filter_for_testing = [&](bool, uint64_t rows) {
+    if (rows) ++decoded;
+  };
+  auto clear =
+    std::shared_ptr<void>(nullptr, [&](void*) { counters->parquet_filter_for_testing = {}; });
+  sirius::ducklake::testing::scoped_snapshot_visibility_probe probe(
+    duckdb::DatabaseInstance::GetDatabase(*con.context));
+  auto check = [&](std::string const& suffix, int64_t count, int64_t sum) {
+    auto sql = "SELECT count(*), sum(id)::BIGINT FROM lake.t" + suffix;
+    INFO(sql);
+    run("SET gpu_execution=false");
+    auto native = run(sql);
+    REQUIRE(native->Collection().GetValue(0, 0).GetValue<int64_t>() == count);
+    REQUIRE(native->Collection().GetValue(1, 0).GetValue<int64_t>() == sum);
+    auto reads = decoded.load();
+    check_gpu_result(sql, ducklake_result_bag(*native), explicit_entry);
+    CHECK(decoded.load() > reads);
+  };
+  for (int repeat = 0; repeat < 2; ++repeat) {
+    check("", 68, 3013);
+    check(" AT (VERSION => " + version + ")", 99, 4950);
+    check(" AT (TIMESTAMP => " + timestamp + ")", 99, 4950);
+  }
+  run("SET gpu_execution=false");
+  run("ROLLBACK");
+  check("", 98, 4948);
+  check(" AT (VERSION => " + version + ")", 99, 4950);
+}
+
 TEST_CASE(
   "DuckLake snapshot visibility combines historical partial visibility with local overlays and "
   "defaults",
