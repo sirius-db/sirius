@@ -1,0 +1,58 @@
+# name: test/sql/sirius_gateway_hosts.test
+# description: per-rank hosts, and ranks on other hosts started by the rank launcher
+# group: [sirius_gateway]
+
+require sirius_gateway
+
+require quack
+
+statement ok
+SET GLOBAL sirius_gateway_duckdb_binary = '{BUILD_DIRECTORY}/duckdb';
+
+statement ok
+SET GLOBAL sirius_gateway_query_id_setting = 'VARIABLE sirius_query_id';
+
+statement ok
+SET GLOBAL sirius_gateway_log_dir = '{TEST_DIR}/sirius_gateway_hosts';
+
+statement error
+FROM sirius_gateway_start(2, hosts := '127.0.0.1');
+----
+hosts lists 1 hosts for 2 ranks
+
+# 127.0.0.2 is not an address of any interface, so the rank counts as remote.
+statement error
+FROM sirius_gateway_start(2, hosts := '127.0.0.1,127.0.0.2', quack_base_port := 19600);
+----
+SET sirius_gateway_rank_launcher
+
+statement ok
+SET GLOBAL sirius_gateway_rank_launcher = '{BUILD_DIRECTORY}/../../test/sql/local_rank_launcher.sh';
+
+query IT
+SELECT rank, host FROM sirius_gateway_start(2, hosts := '127.0.0.1,127.0.0.2', quack_base_port := 19600) WHERE state = 'up' ORDER BY rank;
+----
+0	127.0.0.1
+1	127.0.0.2
+
+statement ok
+FROM sirius_gateway_run('CREATE VIEW v AS SELECT 42 AS x');
+
+query II
+FROM sirius_gateway_run('SELECT getvariable(''sirius_query_id''), (FROM v)');
+----
+2	42
+
+# The launched rank restarts like a local one, and the DDL log is replayed on it.
+statement ok
+FROM sirius_gateway_restart();
+
+query I
+FROM sirius_gateway_run('FROM v');
+----
+42
+
+query I
+SELECT state FROM sirius_gateway_stop();
+----
+stopped
