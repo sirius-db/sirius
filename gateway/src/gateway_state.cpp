@@ -218,6 +218,10 @@ void gateway_state::start_locked(ClientContext& context, start_options options)
     throw InvalidInputException(
       "gpus lists %d GPUs for %d ranks", options.gpus.size(), options.ranks);
   }
+  if (!options.hosts.empty() && options.hosts.size() != options.ranks) {
+    throw InvalidInputException(
+      "hosts lists %d hosts for %d ranks", options.hosts.size(), options.ranks);
+  }
   if (options.duckdb_binary.empty()) {
     throw InvalidInputException(
       "SET sirius_gateway_duckdb_binary to the DuckDB that runs each rank");
@@ -227,13 +231,22 @@ void gateway_state::start_locked(ClientContext& context, start_options options)
   std::vector<rank> ranks(options.ranks);
   std::string peers;
   for (uint32_t i = 0; i < options.ranks; ++i) {
-    auto& r   = ranks[i];
-    r.index   = i;
-    r.gpu     = options.gpus.empty() ? std::to_string(i) : options.gpus[i];
+    auto& r  = ranks[i];
+    r.index  = i;
+    r.gpu    = options.gpus.empty() ? std::to_string(i) : options.gpus[i];
+    r.host   = options.hosts.empty() ? "127.0.0.1" : options.hosts[i];
+    r.remote = !is_local_host(r.host);
+    if (r.remote && options.rank_launcher.empty()) {
+      throw InvalidInputException(
+        "rank %d's host %s is not this machine: SET sirius_gateway_rank_launcher to the program "
+        "that starts ranks there",
+        i,
+        r.host);
+    }
+    // A remote rank's launcher forwards this port to the rank's own 127.0.0.1.
     r.uri     = "quack:127.0.0.1:" + std::to_string(options.quack_base_port + i);
     r.catalog = "sirius_rank_" + std::to_string(i);
-    peers +=
-      (i ? "," : "") + std::string("127.0.0.1:") + std::to_string(options.exchange_base_port + i);
+    peers += (i ? "," : "") + r.host + ":" + std::to_string(options.exchange_base_port + i);
   }
   auto const token = random_token();
   try {
@@ -251,12 +264,17 @@ void gateway_state::start_locked(ClientContext& context, start_options options)
     }
 
     // Each session's setup. With Sirius, SET sirius_exchange_rank connects NIXL and waits for
-    // every peer, so the ranks run it in parallel.
+    // every peer, so the ranks run it in parallel. Shared-memory staging reaches only processes
+    // on one host, and 'auto' can take a GPU on another host for one here, so ranks on several
+    // hosts never stage.
+    auto const several_hosts = std::any_of(
+      ranks_.begin(), ranks_.end(), [&](rank const& r) { return r.host != ranks_[0].host; });
     std::vector<std::vector<std::string>> setup(ranks_.size());
     for (auto& r : ranks_) {
       auto& sql = setup[r.index];
       if (!options_.sirius_extension.empty()) {
         sql.push_back("SET enable_duckdb_fallback = false");
+        if (several_hosts) { sql.push_back("SET sirius_exchange_host_staging = 'never'"); }
         sql.push_back("SET sirius_exchange_peers = " + KeywordHelper::WriteQuoted(peers));
         sql.push_back("SET sirius_exchange_rank = " + std::to_string(r.index));
       }
@@ -495,9 +513,9 @@ std::vector<gateway_state::rank_status> gateway_state::status()
   std::vector<rank_status> rows;
   for (auto const& r : ranks_) {
     auto const state = r.pid < 0 ? "exited" : !broken_.empty() ? "broken" : "up";
-    rows.push_back({r.index, r.pid, r.gpu, r.uri, state, broken_});
+    rows.push_back({r.index, r.pid, r.gpu, r.host, r.uri, state, broken_});
   }
-  if (rows.empty() && !broken_.empty()) { rows.push_back({0, -1, "", "", "stopped", broken_}); }
+  if (rows.empty() && !broken_.empty()) { rows.push_back({0, -1, "", "", "", "stopped", broken_}); }
   return rows;
 }
 

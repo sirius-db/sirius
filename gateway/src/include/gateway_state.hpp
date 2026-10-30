@@ -21,6 +21,10 @@ struct start_options {
   uint32_t ranks = 0;
   /// `CUDA_VISIBLE_DEVICES` per rank; empty: rank i on GPU i.
   std::vector<std::string> gpus;
+  /// Exchange address per rank, as the other ranks reach it; empty: every rank on 127.0.0.1.
+  std::vector<std::string> hosts;
+  /// Program that starts a rank whose host is not this one (`sirius_gateway_rank_launcher`).
+  std::string rank_launcher;
   uint32_t exchange_base_port = 27000;
   uint32_t quack_base_port    = 9500;
   std::string duckdb_binary;
@@ -38,6 +42,9 @@ struct rank {
   /// The rank reads its stdin until EOF, so closing this ends it.
   int stdin_fd = -1;
   std::string gpu;
+  std::string host;
+  /// Started through the rank launcher, which forwards `uri` to the rank's host.
+  bool remote = false;
   std::string uri;
   std::string catalog;
   /// The only user of `catalog`, CONNECTed to it: the rank's persistent session.
@@ -69,6 +76,7 @@ class gateway_state {
     uint32_t index;
     int64_t pid;
     std::string gpu;
+    std::string host;
     std::string uri;
     std::string state;
     std::string error;
@@ -119,7 +127,11 @@ class gateway_state {
 };
 
 /// Rank process lifecycle; `rank_supervisor.cpp`.
+/// A local rank runs the DuckDB binary itself; a remote one runs
+/// `<rank_launcher> <host> <gpu> <quack port> <duckdb binary> <init file>`.
 void spawn_rank(start_options const& options, std::string const& token, rank& r);
+/// Whether @p host names an address of one of this machine's interfaces.
+bool is_local_host(std::string const& host);
 /// Closes the rank's stdin, waits briefly for it to exit, then kills it.
 void end_rank(rank& r);
 /// Whether the rank's process is gone; reaps it.
