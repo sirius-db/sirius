@@ -1283,9 +1283,8 @@ TEST_CASE("engine retires non-Iceberg preparation before releasing an unstarted 
   source->admission = make_test_admission(provider);
   scan_query query{window.query_id(), {source}};
   {
-    sirius::sirius_engine engine(*fixture.con->context,
-                                 window.query_id(),
-                                 sirius::telemetry::query_observer(state->get_telemetry_context()));
+    sirius::telemetry::query_observer observer(state->get_telemetry_context());
+    sirius::sirius_engine engine(*fixture.con->context, window.query_id(), observer);
     engine.sirius_physical_plan = query.operators.front().get();
   }
   CHECK(source->finished);

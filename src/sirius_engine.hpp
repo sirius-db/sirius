@@ -60,11 +60,11 @@ class sirius_engine {
   friend class pipeline::sirius_meta_pipeline;
 
  public:
-  /// Takes exclusive ownership of the observer until engine destruction.
+  /// Borrows the invocation observer, which must outlive this engine.
   /// @pre observer has not been moved from.
   sirius_engine(duckdb::ClientContext& context,
                 sirius::query_id_t query_id,
-                telemetry::query_observer observer);
+                telemetry::query_observer& observer);
   ~sirius_engine();
 
   /// \brief The query_id this engine belongs to.
@@ -124,7 +124,7 @@ class sirius_engine {
   /// (in sirius_interface::cleanup_internal) before the query's cleanup drains the task queues,
   /// so a task still unwinding must be able to report without touching freed memory.
   std::shared_ptr<pipeline::completion_handler> completion_handler_;
-  telemetry::query_observer observer_;
+  telemetry::query_observer& observer_;
 };
 
 }  // namespace sirius

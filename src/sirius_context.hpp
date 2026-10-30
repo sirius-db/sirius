@@ -33,7 +33,7 @@
 #include "planner/query.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_config.hpp"
-#include "telemetry/telemetry_context.hpp"
+#include "telemetry/query_observer.hpp"
 #include "transparent/connection_provenance.hpp"
 #include "util/env_guard.hpp"
 
@@ -94,6 +94,7 @@ class QueryResult;
 class SiriusConnectionState : public ClientContextState {
  public:
   SiriusConnectionState();
+  ~SiriusConnectionState() override;
 
   /// DuckDB calls CanRequestRebind on every registered state before each
   /// CreatePreparedStatement bind/optimize pass. That makes it the natural
@@ -109,21 +110,12 @@ class SiriusConnectionState : public ClientContextState {
   }
 
   /// A new query on this connection invalidates any leftover capture.
-  void QueryBegin(ClientContext& context) final
-  {
-    if (is_internal_query_active()) return;
-    captured_plan_.reset();
-    captured_original_views_.reset();
-    // DuckDB has finished/abandoned the previous statement before starting another.
-    // Backstop a missing QueryEnd without releasing an outer writer during internal SQL.
-    pinned_update_guard_.reset();
-    std::lock_guard lock(cpu_replay_error_mutex_);
-    cpu_replay_error_.reset();
-  }
+  void QueryBegin(ClientContext& context) final;
 
   void QueryEnd() final
   {
     if (is_internal_query_active()) return;
+    finish_observation("abandoned");
     pinned_update_guard_.reset();
     execution_options.reset();
   }
@@ -156,8 +148,16 @@ class SiriusConnectionState : public ClientContextState {
     pinned_update_guard_ = std::move(guard);
   }
 
-  /// \brief Per-connection monotonic query ordinal, advanced by the shared
-  /// SiriusContext's QueryBegin for SQL↔(instance, connection, query) log
+  /// The ClientContext serializes begin/end and source-state creation. Execution workers
+  /// retain this observer explicitly; its mutations have their own lock. QueryEnd runs
+  /// after DuckDB cancels/joins tasks, including the nested CPU replay executor.
+  [[nodiscard]] std::shared_ptr<sirius::telemetry::query_observer> query_observer() const
+  {
+    return observer_;
+  }
+
+  /// \brief Per-connection monotonic query ordinal, advanced by
+  /// this state's QueryBegin for SQL↔(instance, connection, query) log
   /// correlation.
   uint64_t next_query_ordinal() noexcept { return ++query_ordinal_; }
   [[nodiscard]] uint64_t current_query_ordinal() const noexcept { return query_ordinal_; }
@@ -165,7 +165,9 @@ class SiriusConnectionState : public ClientContextState {
   /// \brief Start a planning generation, discarding the previous capture and decline.
   void begin_planning_attempt() noexcept
   {
+    if (is_internal_query_active()) return;
     ++planning_generation_;
+    if (observer_) { observer_->planning_generation(planning_generation_); }
     captured_plan_.reset();
     captured_original_views_.reset();
     decline_reason_ = sirius::transparent::decline_reason::none;
@@ -307,6 +309,8 @@ class SiriusConnectionState : public ClientContextState {
   [[nodiscard]] uint64_t connection_id() const noexcept { return connection_id_; }
 
  private:
+  void finish_observation(const char* outcome) noexcept;
+  std::shared_ptr<sirius::telemetry::query_observer> observer_;
   uint64_t planning_generation_   = 0;
   uint64_t captured_generation_   = 0;
   uint64_t declined_generation_   = 0;
@@ -435,25 +439,6 @@ class SiriusContext : public ClientContextState {
   SiriusContext& operator=(const SiriusContext&) = delete;
   SiriusContext(SiriusContext&&)                 = delete;
   SiriusContext& operator=(SiriusContext&&)      = delete;
-
-  /// \brief Called at the beginning of a query execution. Holds no lock and
-  /// performs no shared mutations (those run inside the execution windows);
-  /// it only logs the SQL for log-analysis correlation.
-  /// \param context The client context.
-  void QueryBegin(ClientContext& context) final;
-
-  /// \brief Called at the end of a query execution. Releases nothing; slot
-  /// ownership is scope-bound (StandaloneQueryScope/SlotGuard).
-  void QueryEnd() final;
-
-  /// \brief Called at the end of a query execution with context.
-  /// \param context The client context.
-  void QueryEnd(ClientContext& context) final;
-
-  /// \brief Called at the end of a query execution with context and error data.
-  /// \param context The client context.
-  /// \param error Optional error data.
-  void QueryEnd(ClientContext& context, optional_ptr<ErrorData> error) final;
 
   /// \brief Must return true for OnFinalizePrepare to be called by DuckDB.
   bool CanRequestRebind() final { return true; }

@@ -18,14 +18,16 @@
 
 #include "telemetry/telemetry_context.hpp"
 
+#include <mutex>
 #include <stdexcept>
 #include <utility>
 
 namespace sirius::telemetry {
 
-/// One query observer. The invocation's synchronous owner alone mutates it;
+/// One query observer. The invocation owner controls completion;
 /// consumers receive the UUID, never the mutable Quent FSM. Retains the exporter
-/// through completion. Requires a context even when exporting is disabled.
+/// through completion. Mutations are serialized for DuckDB execution workers; moves
+/// require exclusive access. Requires a context even when exporting is disabled.
 class query_observer {
  public:
   explicit query_observer(std::shared_ptr<const telemetry_context> context,
@@ -44,13 +46,15 @@ class query_observer {
                       .into_dynamic());
   }
 
-  ~query_observer() noexcept { finish(); }
+  ~query_observer() noexcept { complete("abandoned"); }
   query_observer(const query_observer&)            = delete;
   query_observer& operator=(const query_observer&) = delete;
 
   /// Transfer completion responsibility; the source may be destroyed or reassigned.
   query_observer(query_observer&& other) noexcept
-    : context_(std::move(other.context_)),
+    : metadata_(std::move(other.metadata_)),
+      phase_(other.phase_),
+      context_(std::move(other.context_)),
       handle_(std::exchange(other.handle_, std::nullopt)),
       details_handle_(std::exchange(other.details_handle_, std::nullopt)),
       metadata_revision_(std::exchange(other.metadata_revision_, 0)),
@@ -61,7 +65,7 @@ class query_observer {
   query_observer& operator=(query_observer&& other) noexcept
   {
     if (this != &other) {
-      finish();
+      complete("abandoned");
       // Release the old handle while its context is still alive.
       handle_.reset();
       details_handle_.reset();
@@ -69,6 +73,8 @@ class query_observer {
       handle_            = std::exchange(other.handle_, std::nullopt);
       details_handle_    = std::exchange(other.details_handle_, std::nullopt);
       metadata_revision_ = std::exchange(other.metadata_revision_, 0);
+      metadata_          = std::move(other.metadata_);
+      phase_             = other.phase_;
       finished_          = std::exchange(other.finished_, true);
     }
     return *this;
@@ -80,6 +86,7 @@ class query_observer {
   }
   [[nodiscard]] std::optional<quent::Uuid> uuid() const
   {
+    std::lock_guard lock(mutex_);
     if (!handle_) { return std::nullopt; }
     return handle_->id().raw();
   }
@@ -88,36 +95,144 @@ class query_observer {
   /// Revisions belong to this owner and survive moves. Metadata may arrive after Finished.
   void update_metadata(quent::records::QueryMetadata metadata)
   {
-    if (!details_handle_) {
-      details_handle_.emplace(context_->context().query_details_observer()->handle());
-    }
-    details_handle_->update({.query_id = handle_->id(),
-                             .revision = ++metadata_revision_,
-                             .metadata = std::move(metadata)});
+    std::lock_guard lock(mutex_);
+    metadata_ = std::move(metadata);
+    publish_metadata();
   }
 
-  void planning()
+  void correlate(uint64_t connection, uint64_t ordinal) noexcept
   {
-    if (handle_ && !finished_) { handle_->planning(); }
+    observe([&] {
+      metadata_.connection_id = connection;
+      metadata_.query_ordinal = ordinal;
+      metadata_.disposition   = "cpu_only";
+      publish_metadata();
+    });
   }
-  void executing()
+
+  void label(const std::optional<std::string>& name) noexcept
   {
-    if (handle_ && !finished_) { handle_->executing(); }
+    if (!name) return;
+    observe([&] {
+      metadata_.instance_name = name;
+      publish_metadata();
+    });
+  }
+
+  void planning_generation(uint64_t generation) noexcept
+  {
+    observe([&] {
+      metadata_.planning_generation = generation;
+      publish_metadata();
+    });
+  }
+
+  /// An admitted GPU attempt, including failures before engine construction.
+  void execution_window(sirius::query_id_t id) noexcept
+  {
+    observe([&] {
+      metadata_.execution_query_id = sirius::value_of(id);
+      metadata_.worker_id          = context_->worker_id();
+      if (metadata_.disposition != "gpu_to_cpu") { metadata_.disposition = "gpu"; }
+      publish_metadata();
+    });
+  }
+
+  void cpu_replay() noexcept
+  {
+    observe([&] {
+      metadata_.disposition = "gpu_to_cpu";
+      publish_metadata();
+    });
+  }
+
+  void planning() noexcept
+  {
+    observe([&] {
+      if (phase_ == phase::initial) {
+        phase_ = phase::planning;
+        handle_->planning();
+      }
+    });
+  }
+  void executing() noexcept
+  {
+    observe([&] {
+      if (phase_ != phase::executing) {
+        phase_ = phase::executing;
+        handle_->executing();
+      }
+    });
+  }
+
+  /// Complete after the outer query's final error (including CPU replay) is known.
+  /// A null outcome means the callback cannot distinguish success from abandonment.
+  void complete(const char* outcome) noexcept
+  {
+    std::lock_guard lock(mutex_);
+    if (!handle_ || finished_) return;
+    try {
+      if (outcome) {
+        metadata_.outcome = outcome;
+      } else {
+        metadata_.outcome.reset();
+      }
+      publish_metadata();
+    } catch (...) {
+      report_failure();
+    }
+    finish_locked();
   }
 
   /// At most one terminal emission attempt, including destructor backstops.
   void finish() noexcept
   {
-    if (!handle_ || finished_) { return; }
+    std::lock_guard lock(mutex_);
+    finish_locked();
+  }
+
+ private:
+  static void report_failure() noexcept
+  {
+    sirius::log::log_noexcept([] { SIRIUS_LOG_ERROR("query telemetry emission failed"); });
+  }
+
+  template <class F>
+  void observe(F&& emit) noexcept
+  {
+    std::lock_guard lock(mutex_);
+    if (!handle_ || finished_) return;
+    try {
+      emit();
+    } catch (...) {
+      report_failure();
+    }
+  }
+
+  void publish_metadata()
+  {
+    if (!details_handle_) {
+      details_handle_.emplace(context_->context().query_details_observer()->handle());
+    }
+    details_handle_->update(
+      {.query_id = handle_->id(), .revision = ++metadata_revision_, .metadata = metadata_});
+  }
+
+  void finish_locked() noexcept
+  {
+    if (!handle_ || finished_) return;
     finished_ = true;
     try {
       handle_->finished();
     } catch (...) {
-      sirius::log::log_noexcept([] { SIRIUS_LOG_ERROR("query telemetry finish failed"); });
+      report_failure();
     }
   }
 
- private:
+  enum class phase { initial, planning, executing };
+  mutable std::mutex mutex_;
+  quent::records::QueryMetadata metadata_;
+  phase phase_ = phase::initial;
   std::shared_ptr<const telemetry_context> context_;
   std::optional<quent::DynamicFsmHandle<quent::Query>> handle_;
   std::optional<quent::Handle<quent::QueryDetails>> details_handle_;

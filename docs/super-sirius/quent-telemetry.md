@@ -89,8 +89,8 @@ attributes, preserving numeric IDs as unsigned integers.
 Disposition describes the path (`cpu_only`, `gpu`, `gpu_to_cpu`); outcome describes
 the outer invocation (`success`, `failed`, `cancelled`, `abandoned`). These are
 independent, extensible string vocabularies. In particular, a failed GPU attempt
-followed by successful CPU replay has disposition `gpu_to_cpu` and outcome
-`success`. Existing traces lacking metadata retain their initial name/group and
+followed by successful CPU replay has disposition `gpu_to_cpu`; a separate
+terminal outcome describes the outer result when known. Existing traces lacking metadata retain their initial name/group and
 have unknown correlation, disposition, and outcome.
 
 The pinned Quent viewer requires a root plan. For a query with no stored plan,
@@ -103,8 +103,52 @@ validation. This preserves the pinned viewer response shape without claiming GPU
 execution. The pinned single-plan picker displays the plan UUID with a generic
 `Query:` prefix.
 
-This schema/projection support does **not** enable observation at DuckDB query
-begin yet. Current producer boundaries and label consumption stay unchanged:
+Observation starts at the outer DuckDB `QueryBegin`, once the shared telemetry
+context is initialized. `SiriusConnectionState` owns begin and end, including SQL
+correlation logging. DuckDB dispatches registered states from an unordered map;
+Sirius therefore restores the final CPU replay error and completes telemetry in
+the **same** callback, without depending on another state's callback order.
+
+Each invocation enters coarse `Planning` immediately; `Executing` still starts
+in the engine. The engine borrows the observer and never completes it. GPU plan
+and task references use the outer UUID, and an admitted GPU window attaches its
+numeric execution ID and worker. `gpu` denotes an admitted GPU attempt, including
+failures before engine construction. A CPU query has no invented window or worker.
+CPU replay changes disposition to `gpu_to_cpu` and remains inside the observation.
+
+Errors at query end produce `failed` or `cancelled` (DuckDB INTERRUPT). **With the
+pinned DuckDB callback, no error means unknown outcome:** it passes the same null
+error for successful completion and abandonment, after clearing the active query.
+Sirius leaves outcome absent for both, including successful CPU replay, rather
+than claiming success for abandoned results. Replacement, connection-state
+teardown, and observers destroyed without explicit completion report `abandoned`.
+A future DuckDB callback exposing the completion reason can remove this limitation.
+
+SQL PREPARE, C++ `Connection::Prepare`, and every subsequent EXECUTE have distinct
+outer invocations. Prepared plans retain no live observer. Each outer bind/rebind
+attempt publishes the connection's monotonic planning generation. Internal-query
+guards suppress lifecycle callbacks and generation changes; intentional internal
+replanning does not replace the outer identity. Parsing or preprocessing failures
+before DuckDB calls `QueryBegin`, extension initialization, and standalone
+`ExtractPlan` calls without an outer invocation are outside this coverage.
+
+DuckDB serializes connection callbacks and source-state initialization under its
+ClientContext lock. Execution can run on a worker thread: invocation consumers
+retain the observer explicitly, and its mutations (FSM and complete metadata
+snapshots together) are mutex protected. End runs after DuckDB drains tasks.
+Moves require exclusive access; runtime workers only receive UUIDs. Completion
+is idempotent and telemetry transitions/cleanup cannot replace native errors.
+Admission and retirement barriers retain their existing owners and ordering.
+
+Explicit `gpu_execution(...)` SQL uses its CALL invocation, including replay.
+Non-SQL streaming/FFI fragments own an independent observer once `run()` passes
+its state and closed-input checks, before admission, through execution-window
+cleanup. Success/error is known at that boundary. Fragment build, input staging,
+and rejected calls to `run()` are outside that interval. The observer outlives
+the retained engine; an engine's later destruction cannot extend completion.
+Disabled telemetry retains a valid no-op context and emits no records.
+
+Label consumption stays unchanged:
 
 - Transparent SQL consumes a pending label in the GPU wrapper's
   `GetGlobalSourceState`; explicit `gpu_execution` consumes it during binding.
@@ -112,11 +156,12 @@ begin yet. Current producer boundaries and label consumption stay unchanged:
   label at the existing explicit-bind boundary.
 - Ordinary CPU statements, SET, and label-setting statements do not consume a
   pending label. The session label is sticky.
-- When early observation is introduced, select the initial query group from the
-  session-label snapshot at the outer `QueryBegin`. Freeze that group for the
-  invocation; session-label changes within the statement affect later invocations.
-  Observing a statement must not itself consume a pending query label. Attach a
-  late label to the existing UUID when the existing consumption boundary is reached.
+- The initial query group uses the session-label snapshot at the outer
+  `QueryBegin` and remains frozen for that invocation. Session-label changes
+  within a statement affect subsequent invocations. Observation itself never
+  consumes a pending query label. A late label updates the existing UUID at
+  the consumption boundary; reusable explicit bind data also supplies that label
+  to subsequent executions without retaining a live observer.
 
 The existing lifecycle event payloads are unchanged. Producers emitting the new
 `QueryDetails` entity require this schema-aware analyzer; older analyzers cannot

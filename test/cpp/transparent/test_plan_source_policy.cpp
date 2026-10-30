@@ -27,6 +27,7 @@
 #include "utils/isolated_checkpoint_test.hpp"
 #include "utils/sirius_test_env.hpp"
 
+#include <absl/cleanup/cleanup.h>
 #include <catch.hpp>
 #include <cucascade/data/data_repository.hpp>
 #include <duckdb/catalog/catalog.hpp>
@@ -815,6 +816,13 @@ TEST_CASE("Transparent execution preserves GPU errors before non-S3 replay vetoe
         // Fail parsing before any remote access; the SQL-text S3 veto must still win.
         query = "SELECT FROM read_parquet('s3://bucket/data.parquet')";
       }
+      // This test invokes the physical operator directly, outside DuckDB's query
+      // dispatcher. Supply its invocation owner explicitly, as the dispatcher does.
+      auto connection_state = duckdb::get_sirius_connection_state(*con.context);
+      REQUIRE(connection_state);
+      duckdb::ErrorData error;
+      connection_state->QueryBegin(*con.context);
+      absl::Cleanup query_end = [&] { connection_state->QueryEnd(*con.context, &error); };
       duckdb::PhysicalPlan plan(duckdb::Allocator::Get(*con.context));
       auto cpu = duckdb::make_shared_ptr<duckdb::PreparedStatementData>(
         duckdb::StatementType::SELECT_STATEMENT);
@@ -838,7 +846,6 @@ TEST_CASE("Transparent execution preserves GPU errors before non-S3 replay vetoe
       duckdb::InterruptState interrupt;
       duckdb::OperatorSourceInput input{*global, *local, interrupt};
       duckdb::DataChunk output;
-      duckdb::ErrorData error;
       try {
         op.GetDataInternal(execution, output, input);
       } catch (std::exception& e) {

@@ -110,8 +110,8 @@ std::vector<int> compute_admission_gpu_ids(const op::sirius_physical_operator& p
 
 sirius_engine::sirius_engine(duckdb::ClientContext& context,
                              sirius::query_id_t query_id,
-                             telemetry::query_observer observer)
-  : context(context), query_id_(query_id), observer_(std::move(observer))
+                             telemetry::query_observer& observer)
+  : context(context), query_id_(query_id), observer_(observer)
 {
   D_ASSERT(observer_.shared_context());
 }
@@ -133,7 +133,6 @@ sirius_engine::~sirius_engine()
       runtime->mark_runtime_unavailable();
     }
   }
-  observer_.finish();
 }
 
 void sirius_engine::quiesce_plan_users()

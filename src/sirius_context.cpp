@@ -291,29 +291,43 @@ void SiriusContext::log_pool_stats(std::string_view tag) const
   }
 }
 
-void SiriusContext::QueryBegin(ClientContext& context)
+SiriusConnectionState::~SiriusConnectionState() { finish_observation("abandoned"); }
+
+void SiriusConnectionState::finish_observation(const char* outcome) noexcept
 {
-  // Suppress logging for internal connections (e.g. internal metadata lookups).
-  if (is_internal_query_active(context)) { return; }
+  if (auto observer = std::exchange(observer_, nullptr)) { observer->complete(outcome); }
+}
 
-  // Advance the per-connection query ordinal FIRST, before any best-effort
-  // observation: even if the SQL capture or logging below fails, the next
-  // execution window must see a FRESH ordinal — a stale one would correlate
-  // that window to the PREVIOUS query's SQL line instead of standing alone as
-  // a window without SQL. next_query_ordinal() is noexcept.
-  shared_ptr<SiriusConnectionState> conn_state;
-  uint64_t query_ordinal = 0;
-  try {
-    conn_state = get_sirius_connection_state(context);
-  } catch (...) {  // resolution failure: fall through to keyless logging
+void SiriusConnectionState::QueryBegin(ClientContext& context)
+{
+  if (is_internal_query_active()) return;
+  finish_observation("abandoned");
+  captured_plan_.reset();
+  captured_original_views_.reset();
+  pinned_update_guard_.reset();
+  {
+    std::lock_guard lock(cpu_replay_error_mutex_);
+    cpu_replay_error_.reset();
   }
-  if (conn_state) { query_ordinal = conn_state->next_query_ordinal(); }
+  auto const query_ordinal = next_query_ordinal();
+  shared_ptr<SiriusContext> runtime;
+  try {
+    runtime = context.registered_state->Get<SiriusContext>("sirius_state");
+  } catch (...) {  // Best-effort observation, including registry lookup.
+  }
+  try {
+    if (runtime && runtime->is_initialized()) {
+      observer_ = std::make_shared<sirius::telemetry::query_observer>(
+        runtime->get_telemetry_context(), std::nullopt, session_label_);
+      observer_->correlate(connection_id(), query_ordinal);
+      observer_->planning();
+    }
+  } catch (...) {  // Observation must not fail the query it decorates.
+  }
 
-  // QueryBegin holds no lock and mutates no shared state: slot ownership is
-  // scope-bound (StandaloneQueryScope/SlotGuard) and the begin mutations run
-  // inside the execution window. Everything below is observation only and
-  // best-effort; a logging or allocation failure must not fail the query it
-  // decorates.
+  // No admission or runtime work is acquired here. Execution-window mutations
+  // remain scope-bound (StandaloneQueryScope/SlotGuard). Logging below is
+  // best-effort; a logging or allocation failure must not fail the query it decorates.
   try {
     auto query = context.GetCurrentQuery();
     // Collapse every run of whitespace (incl. newlines/tabs) to a single space,
@@ -339,10 +353,10 @@ void SiriusContext::QueryBegin(ClientContext& context)
     // could interleave with another connection's logging); execution windows and
     // pool lines carry the same instance/connection key. The trailing
     // "SQL: <sql>" form is preserved for log-analyzer text correlation.
-    if (conn_state) {
+    if (runtime) {
       SIRIUS_LOG_INFO("QueryBegin: instance={} connection={} query={} SQL: {}",
-                      static_cast<const void*>(this),
-                      conn_state->connection_id(),
+                      static_cast<const void*>(runtime.get()),
+                      connection_id(),
                       query_ordinal,
                       normalized_query);
     } else {
@@ -350,24 +364,6 @@ void SiriusContext::QueryBegin(ClientContext& context)
     }
   } catch (...) {  // best-effort observability
   }
-}
-
-void SiriusContext::QueryEnd()
-{
-  // The DuckDB query-end callback releases no slot or repository state: slot ownership is
-  // scope-bound and the mandatory cleanup runs inside the execution window
-  // (StandaloneQueryScope::finish), before the result is exposed.
-}
-
-void SiriusContext::QueryEnd(ClientContext& context)
-{
-  if (is_internal_query_active(context)) { return; }
-  QueryEnd();
-}
-
-void SiriusContext::QueryEnd(ClientContext& context, optional_ptr<ErrorData> error)
-{
-  QueryEnd(context);
 }
 
 bool SiriusContext::is_internal_query_active(ClientContext& context) noexcept
@@ -1424,6 +1420,7 @@ void SiriusConnectionState::record_cpu_replay_error(ErrorData error, string quer
 
 void SiriusConnectionState::QueryEnd(ClientContext& context, optional_ptr<ErrorData> error)
 {
+  if (is_internal_query_active()) return;
   std::optional<cpu_replay_error> replay;
   {
     std::lock_guard lock(cpu_replay_error_mutex_);
@@ -1438,6 +1435,11 @@ void SiriusConnectionState::QueryEnd(ClientContext& context, optional_ptr<ErrorD
       // Keep the interrupt: DuckDB must still end the query.
     }
   }
+  // DuckDB supplies a null error for both success and abandonment, after clearing
+  // the active query. Leave the outcome unknown in that case.
+  finish_observation(error && error->HasError()
+                       ? (error->Type() == ExceptionType::INTERRUPT ? "cancelled" : "failed")
+                       : nullptr);
   ClientContextState::QueryEnd(context, error);
 }
 

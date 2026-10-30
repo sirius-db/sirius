@@ -500,6 +500,9 @@ unique_ptr<FunctionData> SiriusRegistration::GPUExecutionBind(ClientContext& con
   // Stored on the bind data; each execution builds its own sirius_interface
   // from it (execution state is per-execution, not bind-held).
   result->query_label = std::move(query_label);
+  if (auto state = get_sirius_connection_state(context)) {
+    if (auto observer = state->query_observer()) { observer->label(result->query_label); }
+  }
 
   if (input.inputs[0].IsNull()) {
     throw BinderException("gpu_execution cannot be called with a NULL parameter");
@@ -573,10 +576,11 @@ void SiriusRegistration::GPUExecutionFunction(ClientContext& context,
   if (gstate.finished) { return; }
 
   if (!gstate.res) {
-    auto conn_state    = get_sirius_connection_state(context);
-    auto session_label = conn_state ? conn_state->session_label() : std::optional<std::string>{};
-    auto start         = std::chrono::high_resolution_clock::now();
-    auto sirius_ctx    = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    auto conn_state = get_sirius_connection_state(context);
+    auto observer   = conn_state ? conn_state->query_observer() : nullptr;
+    if (observer) { observer->label(data.query_label); }
+    auto start      = std::chrono::high_resolution_clock::now();
+    auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
     ErrorData gpu_error;
     bool statement_read_only       = data.statement_read_only;
     bool gpu_failed                = false;
@@ -602,6 +606,7 @@ void SiriusRegistration::GPUExecutionFunction(ClientContext& context,
             sirius_ctx->mark_runtime_unavailable();
           }
           window.emplace(*sirius_ctx, context, "gpu_execution");
+          if (observer) { observer->execution_window(window->query_id()); }
         }
 
         unique_ptr<LogicalOperator> query_plan;
@@ -621,9 +626,8 @@ void SiriusRegistration::GPUExecutionFunction(ClientContext& context,
         auto gpu_prepared = make_shared_ptr<::sirius::sirius_prepared_statement_data>(
           std::move(prepared), std::move(sirius_physical_plan));
 
-        gstate.sirius_iface =
-          make_uniq<::sirius::sirius_interface>(context, data.query_label, session_label);
-        gstate.res = gstate.sirius_iface->sirius_execute_query(
+        gstate.sirius_iface = make_uniq<::sirius::sirius_interface>(context, observer);
+        gstate.res          = gstate.sirius_iface->sirius_execute_query(
           context, data.query, std::move(gpu_prepared), window->query_id());
         if (gstate.res->HasError()) {
           gpu_error = gstate.res->GetErrorObject();
@@ -707,6 +711,7 @@ void SiriusRegistration::GPUExecutionFunction(ClientContext& context,
       }
       SIRIUS_LOG_ERROR("SiriusExecuteQuery error: {}", gpu_error.RawMessage());
       print_cpu_fallback_banner();
+      if (observer) { observer->cpu_replay(); }
       auto cpu_replay = run_internal_cpu_fallback_query(
         context, *gstate.conn, data.cpu_fallback_query, gpu_error.RawMessage(), sirius_ctx.get());
       if (cpu_replay.policy_refused) {

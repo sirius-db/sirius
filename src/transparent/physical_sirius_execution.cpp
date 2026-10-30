@@ -176,9 +176,9 @@ duckdb::unique_ptr<duckdb::GlobalSourceState> PhysicalSiriusExecution::GetGlobal
   auto conn_state = duckdb::get_sirius_connection_state(context);
   auto query_label =
     conn_state ? conn_state->take_pending_query_label() : std::optional<std::string>{};
-  auto session_label = conn_state ? conn_state->session_label() : std::optional<std::string>{};
-  state->iface       = duckdb::make_uniq<sirius::sirius_interface>(
-    context, std::move(query_label), std::move(session_label));
+  state->iface = duckdb::make_uniq<sirius::sirius_interface>(
+    context, conn_state ? conn_state->query_observer() : nullptr);
+  state->iface->observer->label(query_label);
   state->sirius_context = sirius_ctx.get();
   return std::move(state);
 }
@@ -235,6 +235,7 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
           state.sirius_context->mark_runtime_unavailable();
         }
         window.emplace(*state.sirius_context, context.client, "transparent_execution");
+        state.iface->observer->execution_window(window->query_id());
       }
       if (!validated_sirius_plan_ && !logical_plan_ && query_sql_.empty()) {
         throw duckdb::ExecutorException(
@@ -514,6 +515,7 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
       // CpuFallbackGuard marks the replay so sirius_httpfs refuses to serve s3://
       // reached indirectly (e.g. through a view) to the CPU plan. Binds to the
       // TARGET executing connection's state.
+      state.iface->observer->cpu_replay();
       duckdb::SiriusContext::CpuFallbackGuard fallback_guard(context.client);
       state.result =
         run_cpu_fallback_plan(context.client, *cpu_fallback_prepared_, state.cpu_executor);

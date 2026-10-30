@@ -267,11 +267,10 @@ void with_initialized_engine(duckdb::Connection& con,
       duckdb::make_uniq_base<op::sirius_physical_result_collector,
                              op::sirius_physical_materialized_collector>(*prepared, context);
 
-    sirius_engine engine(
-      context,
-      *query_id,
-      telemetry::query_observer(context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
-                                  ->get_telemetry_context()));
+    telemetry::query_observer observer(
+      context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
+        ->get_telemetry_context());
+    sirius_engine engine(context, *query_id, observer);
     engine.initialize(std::move(collector));
     consume(engine);
 
@@ -348,8 +347,8 @@ void with_initialized_streaming_fragment(
     }
     sink->children.push_back(std::move(sirius_plan));
 
-    sirius_engine engine(
-      context, window.query_id(), telemetry::query_observer(sirius_ctx->get_telemetry_context()));
+    telemetry::query_observer observer(sirius_ctx->get_telemetry_context());
+    sirius_engine engine(context, window.query_id(), observer);
     // The fragment owns the plan; the engine borrows it. initialize() would take ownership and
     // destroy the sink with the engine, leaving nothing to pull from afterwards.
     engine.initialize_internal(*sink);
