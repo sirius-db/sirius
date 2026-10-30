@@ -30,7 +30,6 @@
 #include "memory/size_arithmetic.hpp"
 #include "op/cross_join_slicing.hpp"
 #include "op/sirius_physical_concat.hpp"
-#include "op/sirius_physical_hash_join.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
@@ -57,6 +56,16 @@ std::unique_ptr<pipelineable_operator_data> cross_join_slice_data::with_batches_
   std::vector<std::shared_ptr<::cucascade::data_batch>> batches) const
 {
   auto replacement = std::make_unique<cross_join_slice_data>(std::move(batches), slice, num_slices);
+  replacement->adopt_row_identity(*this);
+  return replacement;
+}
+
+std::unique_ptr<pipelineable_operator_data>
+nested_loop_join_orphan_data::with_batches_preserving_rows(
+  std::vector<std::shared_ptr<cucascade::data_batch>> batches) const
+{
+  auto replacement =
+    std::make_unique<nested_loop_join_orphan_data>(std::move(batches), present_is_build);
   replacement->adopt_row_identity(*this);
   return replacement;
 }
@@ -290,103 +299,132 @@ void sirius_physical_nested_loop_join::build_pipelines(
   probe_meta.build(*probe_child.children[0]);
 }
 
+MemoryBarrierType sirius_physical_nested_loop_join::input_barrier_for(
+  sirius_physical_operator const& producer) const
+{
+  return producer.type == SiriusPhysicalOperatorType::CONCAT
+           ? MemoryBarrierType::PARTIAL
+           : sirius_physical_operator::input_barrier_for(producer);
+}
+
+std::pair<bool, bool> sirius_physical_nested_loop_join::refresh_cross_schedule()
+{
+  auto* probe = get_port("default");
+  auto* build = get_port("build");
+  if (!probe || !probe->repo || !probe->src_pipeline || !build || !build->repo ||
+      !build->src_pipeline) {
+    throw std::logic_error("Nested loop join requires two wired input ports");
+  }
+  if (probe->repo->num_partitions() != 1 || build->repo->num_partitions() != 1) {
+    throw std::logic_error("Nested loop join requires a single partition on each input");
+  }
+  bool const probe_finished = probe->src_pipeline->is_pipeline_finished();
+  bool const build_finished = build->src_pipeline->is_pipeline_finished();
+  if (cross_schedule.empty()) { cross_schedule.resize(1); }
+  auto& c = cross_schedule.front();
+  merge_cross_schedule_batch_ids(c, probe->repo->get_batch_ids(0), build->repo->get_batch_ids(0));
+
+  // CONCAT must fold the opposite side before we can decide unmatched / existential rows.
+  // Check on every pull as well as every hint: task creation can drain several pairs per hint.
+  bool const whole_probe =
+    join_type == duckdb::JoinType::RIGHT || join_type == duckdb::JoinType::OUTER;
+  bool const whole_build =
+    join_type != duckdb::JoinType::INNER && join_type != duckdb::JoinType::RIGHT;
+  if ((whole_probe && c.probe_ids.size() > 1) || (whole_build && c.build_ids.size() > 1)) {
+    throw std::logic_error(
+      "Nested loop join requires a single concat-folded batch on the whole input side");
+  }
+
+  // The shared scheduler counts a pair when claimed. NLJ may still have unissued slices of that
+  // pair, so defer repository retirement until they all own their task inputs. Task references
+  // keep already-issued inputs alive after the repository releases its reference.
+  if (pending.num_slices == 0) {
+    for (auto const& discard :
+         collect_cross_schedule_discards(cross_schedule, probe_finished, build_finished)) {
+      auto* port = discard.is_build ? build : probe;
+      port->repo->pop_data_batch_by_id(discard.batch_id, discard.partition);
+    }
+  }
+  return {probe_finished, build_finished};
+}
+
+std::optional<task_creation_hint> sirius_physical_nested_loop_join::get_next_task_hint()
+{
+  std::lock_guard<std::mutex> guard(batches_to_processed_mutex);
+  auto const [probe_finished, build_finished] = refresh_cross_schedule();
+  if (pending.num_slices != 0) { return task_creation_hint{TaskCreationHint::READY, this}; }
+  auto kind = peek_cross_schedule_kind(cross_schedule, probe_finished, build_finished);
+  // Demand-driven startup must activate the missing side once build data is available, rather
+  // than exhausting the build CONCAT before requesting the first probe batch.
+  auto const& c = cross_schedule.front();
+  if (kind == cross_schedule_kind::wait_build && !c.build_ids.empty() && c.probe_ids.empty() &&
+      !probe_finished) {
+    kind = cross_schedule_kind::wait_probe;
+  }
+  switch (kind) {
+    case cross_schedule_kind::emit_pair: return task_creation_hint{TaskCreationHint::READY, this};
+    case cross_schedule_kind::wait_build:
+    case cross_schedule_kind::wait_probe: {
+      auto* port = get_port(kind == cross_schedule_kind::wait_build ? "build" : "default");
+      return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA,
+                                &port->src_pipeline->get_operators()[0].get()};
+    }
+    case cross_schedule_kind::done: return std::nullopt;
+  }
+  return std::nullopt;
+}
+
 std::unique_ptr<operator_data> sirius_physical_nested_loop_join::get_next_task_input_data()
 {
-  // Hold the mutex for the entire operation to prevent concurrent pop/get races.
-  // A pop on one thread must not remove a batch that another thread's get expects to find.
-  std::lock_guard<std::mutex> lg(batches_to_processed_mutex);
-  auto* default_port = get_port("default");
-  auto* build_port   = get_port("build");
-
-  // One-time initialization: snapshot all batch IDs from both ports.
-  if (left_batch_ids.empty() && right_batch_ids.empty()) {
-    if (!default_port || !default_port->repo || !build_port || !build_port->repo) {
-      return nullptr;
-    }
-    if (default_port->repo->num_partitions() != build_port->repo->num_partitions()) {
-      throw std::runtime_error(
-        "sirius_physical_nested_loop_join: number of partitions for default and build ports must "
-        "match");
-    }
-    auto const sizes = [&](cucascade::shared_data_repository& repo,
-                           std::vector<uint64_t> const& ids,
-                           std::size_t partition_idx) {
-      std::vector<batch_rows_and_bytes> result;
-      result.reserve(ids.size());
-      for (uint64_t id : ids) {
-        auto batch = repo.get_data_batch_by_id(id, partition_idx);
-        // Takes a read lock on the batch while batches_to_processed_mutex is held. It runs before
-        // the join has tasks, so the only exclusive holder can be a spill, which never takes this
-        // mutex, and the wait is at most one spill copy. A non-blocking read would leave the pair
-        // unsplit.
-        result.push_back(batch ? get_batch_rows_and_bytes(*batch) : batch_rows_and_bytes{});
+  std::lock_guard<std::mutex> guard(batches_to_processed_mutex);
+  auto const [probe_finished, build_finished] = refresh_cross_schedule();
+  auto* probe                                 = get_port("default");
+  auto* build                                 = get_port("build");
+  if (pending.num_slices == 0) {
+    auto const pair = next_cross_schedule_pair(cross_schedule, probe_finished, build_finished);
+    if (pair.kind == cross_schedule_kind::emit_pair) {
+      auto const& c = cross_schedule[pair.partition];
+      pending.left = probe->repo->get_data_batch_by_id(c.probe_ids[pair.probe_idx], pair.partition);
+      pending.right =
+        build->repo->get_data_batch_by_id(c.build_ids[pair.build_idx], pair.partition);
+      if (!pending.left || !pending.right) {
+        throw std::logic_error("Nested loop join lost an input batch before scheduling its pair");
       }
-      return result;
-    };
-    auto const num_partitions = default_port->repo->num_partitions();
-    left_batch_ids.reserve(num_partitions);
-    right_batch_ids.reserve(num_partitions);
-    for (size_t p = 0; p < num_partitions; p++) {
-      left_batch_ids.push_back(default_port->repo->get_batch_ids(p));
-      right_batch_ids.push_back(build_port->repo->get_batch_ids(p));
-      // Only a cross product is split, so only its batch sizes are read.
-      if (conditions.empty()) {
-        left_batch_sizes.push_back(sizes(*default_port->repo, left_batch_ids[p], p));
-        right_batch_sizes.push_back(sizes(*build_port->repo, right_batch_ids[p], p));
-      }
+      pending.slice      = 0;
+      // Here when we call get_batch_rows_and_bytes we need to get read_only lock on the batch.
+      // Simulatenously we also have a lock on task creation. 
+      // This is not ideal, but it only happens once per pair, only for cross joins and it is a bounded lock.
+      // We should make all data_batches be able to report size in bytes and num rows without locking the batch.
+      pending.num_slices = conditions.empty()
+                             ? cross_join_num_slices(get_batch_rows_and_bytes(*pending.left),
+                                                     get_batch_rows_and_bytes(*pending.right),
+                                                     cross_join_task_bytes)
+                             : 1;
+    } else {
+      // No batch is different from a zero-row batch. Once BOTH producers close, turn a surviving
+      // batch into an orphan task so execute() applies join-type-correct empty semantics.
+      auto const orphan =
+        next_cross_schedule_orphan(cross_schedule, probe_finished, build_finished);
+      if (!orphan.found) { return nullptr; }
+      auto* present_port = orphan.present_is_build ? build : probe;
+      auto present = present_port->repo->pop_data_batch_by_id(orphan.batch_id, orphan.partition);
+      if (!present) { throw std::logic_error("Nested loop join lost an orphan input batch"); }
+      return std::make_unique<nested_loop_join_orphan_data>(
+        std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(present)},
+        orphan.present_is_build);
     }
   }
 
-  // Skip partitions without a pair of batches.
-  while (
-    next_task.partition < left_batch_ids.size() &&
-    (left_batch_ids[next_task.partition].empty() || right_batch_ids[next_task.partition].empty())) {
-    next_task.partition++;
-  }
-  if (next_task.partition >= left_batch_ids.size()) { return nullptr; }
-
-  auto const& left_ids  = left_batch_ids[next_task.partition];
-  auto const& right_ids = right_batch_ids[next_task.partition];
-  if (next_task.num_slices == 0) {
-    next_task.num_slices =
-      conditions.empty()
-        ? cross_join_num_slices(left_batch_sizes[next_task.partition][next_task.left],
-                                right_batch_sizes[next_task.partition][next_task.right],
-                                cross_join_task_bytes)
-        : std::size_t{1};
-  }
-  auto const task = next_task;
-  if (++next_task.slice == next_task.num_slices) {
-    next_task.slice      = 0;
-    next_task.num_slices = 0;
-    if (++next_task.right == right_ids.size()) {
-      next_task.right = 0;
-      if (++next_task.left == left_ids.size()) {
-        next_task.left = 0;
-        next_task.partition++;
-      }
-    }
-  }
-
-  // Tasks are handed out in order, so a left batch is last used by the last slice of its pair with
-  // the last right batch, and a right batch by the last slice of its pair with the last left batch.
-  bool const last_slice = task.slice + 1 == task.num_slices;
-  bool const pop_left   = last_slice && task.right + 1 == right_ids.size();
-  bool const pop_right  = last_slice && task.left + 1 == left_ids.size();
-
-  std::vector<std::shared_ptr<cucascade::data_batch>> input_batch;
-  input_batch.reserve(2);
-  input_batch.push_back(
-    pop_left ? default_port->repo->pop_data_batch_by_id(left_ids[task.left], task.partition)
-             : default_port->repo->get_data_batch_by_id(left_ids[task.left], task.partition));
-  input_batch.push_back(
-    pop_right ? build_port->repo->pop_data_batch_by_id(right_ids[task.right], task.partition)
-              : build_port->repo->get_data_batch_by_id(right_ids[task.right], task.partition));
+  std::vector<std::shared_ptr<cucascade::data_batch>> inputs{pending.left, pending.right};
+  std::unique_ptr<operator_data> result;
   if (conditions.empty()) {
-    return std::make_unique<cross_join_slice_data>(
-      std::move(input_batch), task.slice, task.num_slices);
+    result =
+      std::make_unique<cross_join_slice_data>(std::move(inputs), pending.slice, pending.num_slices);
+  } else {
+    result = std::make_unique<pipelineable_operator_data>(std::move(inputs));
   }
-  return std::make_unique<pipelineable_operator_data>(input_batch);
+  if (++pending.slice == pending.num_slices) { pending = {}; }
+  return result;
 }
 
 namespace {
@@ -596,6 +634,25 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
                                                          : static_cast<size_t>(-1);
   SIRIUS_LOG_DEBUG(
     "Pipeline {}: nested loop join, {} input batches", pipeline_id, input_batches.size());
+
+  if (auto const* orphan = dynamic_cast<nested_loop_join_orphan_data const*>(&input_data)) {
+    if (input_batches.size() != 1) {
+      throw std::logic_error("Nested loop join orphan expects one input");
+    }
+    auto const& present_batch = input_batches.front();
+    auto* space               = present_batch.get_memory_space();
+    if (!space) { throw std::logic_error("Nested loop join orphan has no memory space"); }
+    auto const present = get_cudf_table_view(present_batch);
+    auto const& absent = *children[orphan->present_is_build ? 0 : 1];
+    auto empty         = absent.has_physical_overrides()
+                           ? sirius::make_empty_table(absent.get_physical_types())
+                           : sirius::make_empty_table(absent.get_types());
+    return emit_one_side_empty_result(orphan->present_is_build ? empty->view() : present,
+                                      orphan->present_is_build ? present : empty->view(),
+                                      orphan->present_is_build,
+                                      *space,
+                                      stream);
+  }
 
   if (input_batches.size() != 2) {
     throw std::runtime_error(

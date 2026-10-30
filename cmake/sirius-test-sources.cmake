@@ -225,6 +225,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_join_empty_sides.cpp
     test/cpp/operator/test_partition_placement.cpp
     test/cpp/operator/test_partition_exchange.cpp
+    test/cpp/operator/test_nested_loop_join_schedule.cpp
     test/cpp/operator/test_cross_schedule.cpp
     test/cpp/operator/test_cross_join_slicing.cpp
     test/cpp/operator/window/test_whole_partition.cpp
