@@ -84,6 +84,7 @@ set(TEST_SOURCES
     test/cpp/expression_evaluator/test_gpu_expression_translator.cpp
     test/cpp/expression_evaluator/test_like_multiliteral.cpp
     test/cpp/expression_evaluator/test_round_floating_point.cpp
+    test/cpp/expression_evaluator/test_decimal_integer_cast.cpp
     test/cpp/expression_evaluator/test_nonduckdb_frontend_proof.cpp
     test/cpp/helper/test_cudf_utils.cpp
     test/cpp/helper/test_logical_type.cpp
@@ -100,6 +101,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_cross_product.cpp
     test/cpp/integration/test_gpu_execution_scalar_subquery.cpp
     test/cpp/integration/test_gpu_execution_decimal_sum_overflow.cpp
+    test/cpp/integration/test_gpu_execution_decimal_integer_cast.cpp
     test/cpp/integration/test_gpu_execution_dense_count_join.cpp
     test/cpp/integration/test_gpu_execution_distinct.cpp
     test/cpp/integration/test_gpu_execution_distinct_aggregate_fallback.cpp

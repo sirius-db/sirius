@@ -18,6 +18,7 @@
 #include <expression/ast/node.hpp>
 #include <expression_evaluator/ast_supported_types.hpp>
 #include <expression_evaluator/date_cast.hpp>
+#include <expression_evaluator/decimal_integer_cast.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <helper/logical_type.hpp>
 #include <helper/numeric_narrowing.hpp>
@@ -158,6 +159,8 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::cast const& alt, eva
   if (alt.kind == sirius::ast::cast_kind::carrier_restore) {
     // Only planner-certified carrier restoration may tunnel through the representation.
     result_column = sirius::cast_through_rep(input, return_type, _stream, _mr);
+  } else if (alt.child->return_type().is_decimal() && alt.target_type.is_integer()) {
+    result_column = cast_decimal_to_integer(input, alt.target_type, alt.try_cast, _stream, _mr);
   } else if (return_type.id() == cudf::type_id::STRING &&
              cudf::is_integral_not_bool(input.type())) {
     result_column = cudf::strings::from_integers(input, _stream, _mr);

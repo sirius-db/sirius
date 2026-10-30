@@ -287,6 +287,20 @@ BIGINT. These operations materialize under every evaluator strategy; standalone
 cuDF AST translation declines them because it cannot implement the checks.
 The existing reference evaluator restores compressed operands before execution.
 
+### DECIMAL to integer casts
+
+Semantic casts from DECIMAL to an integer round to the nearest integer, with ties away from
+zero, before checking the destination range. `cast_decimal_to_integer()` uses exact integer
+quotient/remainder arithmetic for DECIMAL32/64/128, including scale 38. It preserves NULLs and
+returns NULL only for overflowing rows under `TRY_CAST`. Ordinary `CAST` requests CPU replay on
+overflow, preserving DuckDB's conversion error and conditional-expression behavior. UHUGEINT
+still uses UINT64 on the GPU; a positive result beyond that carrier requests replay even under
+`TRY_CAST`, since it is a valid SQL UHUGEINT value.
+
+These casts materialize under every evaluator strategy; `ast_supports_cast()` also prevents the
+standalone cuDF translator from bypassing rounding and range checks. Internal carrier restores
+retain their separate representation-preserving path. Tests are tagged `[decimal_integer_cast]`.
+
 ### Arity and negation
 
 `from_duckdb_function_name` resolves a (name, argument count) pair against one signature table
