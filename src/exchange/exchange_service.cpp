@@ -20,7 +20,9 @@
 
 #include <cucascade/data/data_batch.hpp>
 
+#include <algorithm>
 #include <exception>
+#include <iterator>
 #include <string>
 #include <utility>
 #include <vector>
@@ -213,20 +215,46 @@ void exchange_service::detach(stream_id stream)
 bool exchange_service::retired(distributed_query_id query) const
 {
   // Queries are numbered from 1; streams of query 0 belong to no query and never retire.
-  return query != 0 && (query <= _retired || _retired_above.contains(query));
+  if (query == 0) { return false; }
+  if (query <= _retired) { return true; }
+  auto const after = _retired_above.upper_bound(query);
+  return after != _retired_above.begin() && query <= std::prev(after)->second;
 }
 
-void exchange_service::forget(distributed_query_id query)
+void exchange_service::forget(distributed_query_id query) { forget_range(query, query); }
+
+void exchange_service::forget_range(distributed_query_id first, distributed_query_id last)
 {
+  first = std::max<distributed_query_id>(first, 1);
+  if (first > last) { return; }
   std::lock_guard lock{_mutex};
-  if (retired(query)) { return; }
-  _retired_above.insert(query);
-  while (_retired_above.erase(_retired + 1) > 0) {
-    ++_retired;
+  // Merge [first, last] with the ranges it overlaps or touches, then advance the watermark.
+  // Numbers stay below distributed_query_limit, so hi + 1 cannot wrap.
+  auto lo = first;
+  auto hi = last;
+  auto it = _retired_above.upper_bound(lo);
+  if (it != _retired_above.begin()) {
+    if (auto const before = std::prev(it); before->second + 1 >= lo) {
+      lo = before->first;
+      hi = std::max(hi, before->second);
+      it = _retired_above.erase(before);
+    }
   }
-  std::erase_if(_detached, [query](stream_id stream) { return query_of(stream) == query; });
-  std::erase_if(_held, [query](auto const& h) { return query_of(h.first) == query; });
-  _aborted.erase(query);
+  while (it != _retired_above.end() && it->first <= hi + 1) {
+    hi = std::max(hi, it->second);
+    it = _retired_above.erase(it);
+  }
+  if (lo <= _retired + 1) {
+    _retired = std::max(_retired, hi);
+  } else {
+    _retired_above.emplace(lo, hi);
+  }
+  auto const in_range = [first, last](distributed_query_id query) {
+    return query >= first && query <= last;
+  };
+  std::erase_if(_detached, [&](stream_id stream) { return in_range(query_of(stream)); });
+  std::erase_if(_held, [&](auto const& h) { return in_range(query_of(h.first)); });
+  _aborted.erase(_aborted.lower_bound(first), _aborted.upper_bound(last));
 }
 
 }  // namespace sirius::exchange

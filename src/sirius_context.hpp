@@ -817,8 +817,13 @@ class SiriusContext : public ClientContextState {
   /// connection's execution window. Every rank runs the same statements, so the same query gets
   /// the same number, and its exchanges the same stream ids. That holds for one statement stream
   /// only, so one connection per process runs distributed queries.
-  /// @throws sirius::invalid_input_exception when another connection already runs them.
-  [[nodiscard]] uint64_t next_distributed_query(ClientContext& context);
+  /// @param assigned Nonzero: the number to use, chosen by whoever sends every rank its
+  /// statements (`sirius_distributed_query_id`). Gaps are fine: the numbers skipped here are
+  /// retired at once, since this rank never hands them out.
+  /// @throws sirius::invalid_input_exception when another connection already runs them, or
+  /// when @p assigned does not exceed the last number used (a plan rebuilt within the statement
+  /// that numbered it).
+  [[nodiscard]] uint64_t next_distributed_query(ClientContext& context, uint64_t assigned = 0);
 
   /// \brief @p context is closing: if it runs distributed queries, the next connection to plan
   /// one takes over, and numbering continues where it stopped.
@@ -838,6 +843,11 @@ class SiriusContext : public ClientContextState {
   /// \brief Window @p window's query failed with @p error: if it is a distributed query, every
   /// peer's run of it fails too, rather than waiting for this rank's batches.
   void abort_distributed_query(sirius::query_id_t window, std::exception_ptr const& error) noexcept;
+
+  /// \brief Window @p window failed to begin with @p error: aborts its distributed query on every
+  /// rank, retires it here, and unties it from the window, whose destructor does not run.
+  void fail_distributed_window_begin(sirius::query_id_t window,
+                                     std::exception_ptr const& error) noexcept;
 
   /// \brief Whether the Sirius context has been initialized (config loaded, GPU ready).
   [[nodiscard]] bool is_initialized() const noexcept { return is_initialized_; }
@@ -1060,6 +1070,8 @@ class SiriusContext : public ClientContextState {
   std::string exchange_host_staging_;
   std::shared_ptr<sirius::exchange::exchange_service> exchange_service_;
   uint64_t distributed_queries_{0};
+  /// Numbers skipped before the exchange connected (first, last), retired once it does.
+  std::vector<std::pair<uint64_t, uint64_t>> skipped_before_connect_;
   /// The connection that runs this process's distributed queries.
   std::optional<connection_t> distributed_connection_;
   /// Each open execution window's distributed query. A window may retire while another

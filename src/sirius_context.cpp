@@ -846,6 +846,7 @@ SiriusContext::StandaloneQueryScope::StandaloneQueryScope(
     // Both the initial health check and a refused lifecycle registration precede
     // query resource registration. Preserve the typed refusal for CPU fallback.
     state_ = scope_state::FAILED;
+    ctx_.fail_distributed_window_begin(window_id_, std::current_exception());
     {
       std::lock_guard lock(ctx_.window_completions_mutex_);
       ctx_.window_completions_.erase(sirius::value_of(window_id_));
@@ -864,6 +865,7 @@ SiriusContext::StandaloneQueryScope::StandaloneQueryScope(
     }
     lease_release_.state = lease_release_state::begin_failed;
     ctx_.query_lifecycle_.report_failure(std::current_exception(), window_id_);
+    ctx_.fail_distributed_window_begin(window_id_, std::current_exception());
     ctx_.run_mandatory_cleanup_backstop(window_id_, end_tag_);
     log_window_event("end", "begin_failed");
     release();
@@ -877,6 +879,7 @@ SiriusContext::StandaloneQueryScope::StandaloneQueryScope(
     state_               = scope_state::FAILED;
     lease_release_.state = lease_release_state::begin_failed;
     ctx_.query_lifecycle_.report_failure(std::current_exception(), window_id_);
+    ctx_.fail_distributed_window_begin(window_id_, std::current_exception());
     ctx_.run_mandatory_cleanup_backstop(window_id_, end_tag_);
     log_window_event("end", "begin_failed");
     release();
@@ -1293,9 +1296,9 @@ void SiriusContext::terminate()
   is_initialized_ = false;
 }
 
-uint64_t SiriusContext::next_distributed_query(ClientContext& context)
+uint64_t SiriusContext::next_distributed_query(ClientContext& context, uint64_t assigned)
 {
-  std::lock_guard lock{exchange_mutex_};
+  std::unique_lock lock{exchange_mutex_};
   auto const connection = context.GetConnectionId();
   if (!distributed_connection_) { distributed_connection_ = connection; }
   if (*distributed_connection_ != connection) {
@@ -1305,7 +1308,34 @@ uint64_t SiriusContext::next_distributed_query(ClientContext& context)
       *distributed_connection_,
       connection);
   }
-  auto const query = ++distributed_queries_;
+  if (assigned != 0 && assigned == distributed_queries_) {
+    throw sirius::invalid_input_exception(
+      "distributed query {} was already planned on this rank, and its plan must be rebuilt; "
+      "retry the statement, which numbers it again",
+      assigned);
+  }
+  if (assigned != 0 && assigned < distributed_queries_) {
+    throw sirius::invalid_input_exception(
+      "sirius_distributed_query_id {} must exceed the last distributed query, {}",
+      assigned,
+      distributed_queries_);
+  }
+  auto const query = assigned != 0 ? assigned : distributed_queries_ + 1;
+  if (query >= sirius::exchange::distributed_query_limit) {
+    throw sirius::invalid_input_exception(
+      "distributed query {} is not below {}", query, sirius::exchange::distributed_query_limit);
+  }
+  // This rank never hands out the numbers between the last one and this one.
+  auto const skipped_first = distributed_queries_ + 1;
+  std::shared_ptr<sirius::exchange::exchange_service> service;
+  if (query > skipped_first) {
+    if (exchange_service_) {
+      service = exchange_service_;
+    } else {
+      skipped_before_connect_.emplace_back(skipped_first, query - 1);
+    }
+  }
+  distributed_queries_ = query;
   if (auto state = get_sirius_connection_state(context)) {
     if (state->active_window != 0) {
       distributed_by_window_[state->active_window] = query;
@@ -1313,6 +1343,8 @@ uint64_t SiriusContext::next_distributed_query(ClientContext& context)
       state->planned_distributed_query = query;
     }
   }
+  lock.unlock();
+  if (service) { service->forget_range(skipped_first, query - 1); }
   return query;
 }
 
@@ -1327,6 +1359,11 @@ void SiriusContext::set_exchange_service_for_testing(
 {
   std::lock_guard lock{exchange_mutex_};
   exchange_service_ = std::move(service);
+  if (exchange_service_) {
+    for (auto const& [first, last] : std::exchange(skipped_before_connect_, {})) {
+      exchange_service_->forget_range(first, last);
+    }
+  }
 }
 
 void SiriusContext::adopt_distributed_query(ClientContext& context, uint64_t query)
@@ -1376,6 +1413,27 @@ void SiriusContext::abort_distributed_query(sirius::query_id_t window,
   }
 }
 
+void SiriusContext::fail_distributed_window_begin(sirius::query_id_t window,
+                                                  std::exception_ptr const& error) noexcept
+{
+  abort_distributed_query(window, error);
+  try {
+    uint64_t query = 0;
+    std::shared_ptr<sirius::exchange::exchange_service> service;
+    {
+      std::lock_guard lock{exchange_mutex_};
+      if (auto const it = distributed_by_window_.find(sirius::value_of(window));
+          it != distributed_by_window_.end()) {
+        query = it->second;
+        distributed_by_window_.erase(it);
+      }
+      service = exchange_service_;
+    }
+    if (query != 0 && service) { service->forget(query); }
+  } catch (...) {  // best effort, like abort_distributed_query
+  }
+}
+
 std::shared_ptr<sirius::exchange::exchange_service> SiriusContext::get_exchange_service(
   sirius::operator_params const& params)
 {
@@ -1410,6 +1468,9 @@ std::shared_ptr<sirius::exchange::exchange_service> SiriusContext::get_exchange_
   exchange_peers_        = params.exchange_peers;
   exchange_rank_         = params.exchange_rank;
   exchange_host_staging_ = params.exchange_host_staging;
+  for (auto const& [first, last] : std::exchange(skipped_before_connect_, {})) {
+    exchange_service_->forget_range(first, last);
+  }
   return exchange_service_;
 }
 

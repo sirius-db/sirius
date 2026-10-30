@@ -66,3 +66,22 @@ TEST_CASE("distributed queries are numbered on one connection and tied to their 
     std::make_unique<duckdb::Connection>(sirius::test::g_integration_env->make_connection());
   CHECK_THROWS_AS(ctx->next_distributed_query(*later->context), sirius::invalid_input_exception);
 }
+
+TEST_CASE("a gateway-assigned query number is used and must increase", "[exchange][query_windows]")
+{
+  REQUIRE(sirius::test::g_integration_env != nullptr);
+  if (!sirius::test::g_integration_env->is_active()) { sirius::test::g_integration_env->resume(); }
+  auto conn = sirius::test::g_integration_env->make_connection();
+  auto ctx  = conn.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(ctx);
+
+  auto const last = ctx->next_distributed_query(*conn.context);
+  // Gaps are fine: statements that never plan a distributed query still use up a number.
+  CHECK(ctx->next_distributed_query(*conn.context, last + 10) == last + 10);
+  CHECK_THROWS_AS(ctx->next_distributed_query(*conn.context, last + 10),
+                  sirius::invalid_input_exception);
+  CHECK_THROWS_AS(ctx->next_distributed_query(*conn.context, last + 5),
+                  sirius::invalid_input_exception);
+  // Without one, numbering continues after the assigned number.
+  CHECK(ctx->next_distributed_query(*conn.context) == last + 11);
+}
