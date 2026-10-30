@@ -83,12 +83,16 @@ duckdb::vector<std::unique_ptr<sirius::ast::node>> translate_expressions(
 }
 
 // Policy gate for the aggregate FILTER clause. Mask-to-null lowering supports unordered
-// NULL-skipping aggregates only. Reject ORDER BY before child planning and sorted binding can
-// append sort keys to the aggregate arguments.
+// NULL-skipping aggregates only. COUNT(DISTINCT) is one: its COLLECT_SET excludes NULLs, so the
+// masked rows never reach the set. The GPU runs no other DISTINCT aggregate. The mask's ELSE
+// branch is a NULL of the input type, and the GPU evaluator has no scalar of a nested type, such
+// as the STRUCT input of COUNT(DISTINCT (a, b)). Reject ORDER BY before child planning and sorted
+// binding can append sort keys to the aggregate arguments.
 void throw_if_aggregate_filter_unsupported(duckdb::BoundAggregateExpression const& aggr)
 {
   auto const id = sirius::from_duckdb_aggregate_name(aggr.Function().GetName().GetIdentifierName());
-  bool supported = id.has_value() && !aggr.IsDistinct() && !aggr.GetOrderBys();
+  bool supported = id.has_value() && !aggr.GetOrderBys() &&
+                   (!aggr.IsDistinct() || *id == sirius::aggregate_id::count);
   if (supported) {
     switch (*id) {
       case sirius::aggregate_id::count_star: supported = aggr.GetChildren().empty(); break;
@@ -101,6 +105,10 @@ void throw_if_aggregate_filter_unsupported(duckdb::BoundAggregateExpression cons
       default: supported = false; break;  // first, and any future id
     }
   }
+  supported =
+    supported && std::none_of(aggr.GetChildren().begin(),
+                              aggr.GetChildren().end(),
+                              [](auto const& child) { return child->GetReturnType().IsNested(); });
   if (!supported) {
     throw duckdb::NotImplementedException(
       "Aggregate FILTER not supported on GPU (falling back to CPU): " + aggr.ToString());
