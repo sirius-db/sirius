@@ -1392,6 +1392,14 @@ TEST_CASE("Parquet binding verification rejects altered nested readers",
   wrapper->function             = function;
   wrapper->settings.claim_batch = nullptr;
   CHECK_FALSE(verify());
+  wrapper->settings = settings;
+  REQUIRE(settings.prepare_batch != nullptr);
+  wrapper->settings.prepare_batch = nullptr;
+  CHECK_FALSE(verify());
+  wrapper->settings               = settings;
+  wrapper->settings.prepare_batch = [](duckdb::ClientContext&, duckdb::TableFunctionInput&) {};
+  REQUIRE(wrapper->settings.prepare_batch != settings.prepare_batch);
+  CHECK_FALSE(verify());
   wrapper->settings                    = settings;
   wrapper->settings.reuses_local_state = !settings.reuses_local_state;
   CHECK_FALSE(verify());

@@ -74,7 +74,9 @@ struct connector {
                                             op::sirius_physical_table_scan const&,
                                             duckdb::ClientContext&,
                                             scan_contract_provenance&) = nullptr;
-  // A private bridge validates provider-owned function_info and binding together.
+  // On success, lookup delegates the bound candidate's function_info validation to
+  // this hook. The bridge must verify its provider-owned function_info and binding
+  // identity together; verifying only the nested Parquet wrapper is insufficient.
   bool (*verify_binding)(duckdb::BaseTableFunction const&,
                          duckdb::FunctionData const*,
                          duckdb::ClientContext&) = nullptr;
@@ -145,7 +147,8 @@ duckdb::unique_ptr<op::sirius_physical_operator> lower_iceberg_scan(
 op::scan::pre_capture_result registered_iceberg_decline_reason(duckdb::LogicalGet&,
                                                                duckdb::ClientContext&,
                                                                scan_contract_provenance&);
-/// Verify the bound multi-file wrapper against this host's Parquet implementation.
+/// Verify the nested multi-file wrapper against this host's Parquet implementation.
+/// Does not verify the outer provider's function_info or binding identity.
 bool verified_parquet_interface(duckdb::FunctionData const*, duckdb::ClientContext&);
 
 }  // namespace sirius::planner
