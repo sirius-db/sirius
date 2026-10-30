@@ -16,43 +16,22 @@
 
 #include "pipeline/sirius_pipeline.hpp"
 
-#include "config.hpp"
 #include "creator/task_creator.hpp"
-#include "duckdb/main/client_context.hpp"
-#include "duckdb/main/settings.hpp"
-#include "duckdb/parallel/task_scheduler.hpp"
 #include "log/logging.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
-#include "pipeline/sirius_meta_pipeline.hpp"
 #include "sirius/exception.hpp"
 #include "telemetry/nvtx.hpp"
 
+#include <algorithm>
 #include <format>
 
 namespace sirius {
 namespace pipeline {
 
 sirius_pipeline::sirius_pipeline(const pipeline_build_context& ctx)
-  : ready(false), initialized(false), source(nullptr), sink(nullptr), build_ctx_(ctx)
+  : ready(false), source(nullptr), sink(nullptr), build_ctx_(ctx)
 {
-}
-
-bool sirius_pipeline::is_order_dependent() const
-{
-  if (source) {
-    auto source_order = source->source_order();
-    if (source_order == sirius::OrderPreservationType::FIXED_ORDER) { return true; }
-    if (source_order == sirius::OrderPreservationType::NO_ORDER) { return false; }
-  }
-  for (auto& op_ref : operators) {
-    auto& op = op_ref.get();
-    if (op.operator_order() == sirius::OrderPreservationType::NO_ORDER) { return false; }
-    if (op.operator_order() == sirius::OrderPreservationType::FIXED_ORDER) { return true; }
-  }
-  if (!build_ctx_.preserve_insertion_order()) { return false; }
-  if (sink && sink->sink_order_dependent()) { return true; }
-  return false;
 }
 
 std::vector<op::sirius_physical_operator::next_port_info>
@@ -96,43 +75,6 @@ std::vector<sirius_pipeline::port_barrier_info> sirius_pipeline::get_egress_port
   return result;
 }
 
-void sirius_pipeline::reset_sink()
-{
-  if (sink) {
-    if (!sink->is_sink()) {
-      throw internal_exception("Sink of pipeline does not have is_sink set");
-    }
-    std::lock_guard<std::mutex> guard(sink->lock);
-    // if (!sink->sink_state) { sink->sink_state =
-    // sink->get_global_sink_state(get_client_context()); }
-  }
-}
-
-void sirius_pipeline::reset()
-{
-  reset_sink();
-  for (auto& op_ref : operators) {
-    auto& op = op_ref.get();
-    std::lock_guard<std::mutex> guard(op.lock);
-    // if (!op.op_state) { op.op_state = op.get_global_operator_state(get_client_context()); }
-  }
-  reset_source(false);
-  // we no longer reset source here because this function is no longer guaranteed to be called by
-  // the main thread source reset needs to be called by the main thread because resetting a source
-  // may call into clients like R
-  initialized = true;
-}
-
-void sirius_pipeline::reset_source(bool force)
-{
-  if (source && !source->is_source()) {
-    throw internal_exception("Source of pipeline does not have is_source set");
-  }
-  if (force || !source_state) {
-    // source_state = source->get_global_source_state(get_client_context());
-  }
-}
-
 void sirius_pipeline::is_ready()
 {
   if (ready) { return; }
@@ -152,21 +94,6 @@ void sirius_pipeline::add_dependency(std::shared_ptr<sirius_pipeline>& pipeline)
   dependencies.push_back(pipeline);
   pipeline->parents.push_back(std::weak_ptr<sirius_pipeline>(shared_from_this()));
 }
-
-// std::string sirius_pipeline::to_string() const {
-// 	TreeRenderer renderer;
-// 	return renderer.ToString(*this);
-// }
-
-// void sirius_pipeline::print() const {
-// 	duckdb::Printer::Print(to_string());
-// }
-
-// void sirius_pipeline::print_dependencies() const {
-// 	for (auto &dep : dependencies) {
-// 		std::shared_ptr<sirius_pipeline>(dep)->print();
-// 	}
-// }
 
 std::vector<std::reference_wrapper<op::sirius_physical_operator>> sirius_pipeline::get_operators()
 {
@@ -193,38 +120,6 @@ std::vector<sirius_pipeline*> sirius_pipeline::get_parents() const
   return result;
 }
 
-void sirius_pipeline::clear_source()
-{
-  source_state.reset();
-  batch_indexes.clear();
-}
-
-std::size_t sirius_pipeline::register_new_batch_index()
-{
-  std::lock_guard<std::mutex> l(batch_lock);
-  std::size_t minimum = batch_indexes.empty() ? base_batch_index : *batch_indexes.begin();
-  batch_indexes.insert(minimum);
-  return minimum;
-}
-
-std::size_t sirius_pipeline::update_batch_index(std::size_t old_index, std::size_t new_index)
-{
-  std::lock_guard<std::mutex> l(batch_lock);
-  if (new_index < *batch_indexes.begin()) {
-    throw internal_exception("Processing batch index {}, but previous min batch index was {}",
-                             new_index,
-                             *batch_indexes.begin());
-  }
-  auto entry = batch_indexes.find(old_index);
-  if (entry == batch_indexes.end()) {
-    throw internal_exception("Batch index {} was not found in set of active batch indexes",
-                             old_index);
-  }
-  batch_indexes.erase(entry);
-  batch_indexes.insert(new_index);
-  return *batch_indexes.begin();
-}
-
 //===--------------------------------------------------------------------===//
 // GPU Pipeline Build State
 //===--------------------------------------------------------------------===//
@@ -236,17 +131,12 @@ void sirius_pipeline_build_state::set_pipeline_source(sirius_pipeline& pipeline,
 }
 
 void sirius_pipeline_build_state::set_pipeline_sink(
-  sirius_pipeline& pipeline,
-  sirius::optional_ptr<op::sirius_physical_operator> op,
-  std::size_t sink_pipeline_count)
+  sirius_pipeline& pipeline, sirius::optional_ptr<op::sirius_physical_operator> op)
 {
   pipeline.sink = op;
   if (pipeline.sink)
     SIRIUS_LOG_DEBUG("Setting pipeline sink {}",
                      op::SiriusPhysicalOperatorToString((*pipeline.sink).type));
-  // set the base batch index of this pipeline based on how many other pipelines have this node as
-  // their sink
-  pipeline.base_batch_index = BATCH_INCREMENT * sink_pipeline_count;
 }
 
 void sirius_pipeline_build_state::add_pipeline_operator(sirius_pipeline& pipeline,
@@ -254,12 +144,6 @@ void sirius_pipeline_build_state::add_pipeline_operator(sirius_pipeline& pipelin
 {
   SIRIUS_LOG_DEBUG("Adding operator to pipeline {}", op::SiriusPhysicalOperatorToString(op.type));
   pipeline.operators.push_back(op);
-}
-
-sirius::optional_ptr<op::sirius_physical_operator> sirius_pipeline_build_state::get_pipeline_source(
-  sirius_pipeline& pipeline)
-{
-  return pipeline.source;
 }
 
 sirius::optional_ptr<op::sirius_physical_operator> sirius_pipeline_build_state::get_pipeline_sink(
@@ -273,32 +157,6 @@ void sirius_pipeline_build_state::set_pipeline_operators(
   std::vector<std::reference_wrapper<op::sirius_physical_operator>> operators)
 {
   pipeline.operators = std::move(operators);
-}
-
-std::shared_ptr<sirius_pipeline> sirius_pipeline_build_state::create_child_pipeline(
-  const pipeline_build_context& ctx, sirius_pipeline& pipeline, op::sirius_physical_operator& op)
-{
-  D_ASSERT(!pipeline.operators.empty());
-  D_ASSERT(op.is_source());
-  // found another operator that is a source, schedule a child pipeline
-  // 'op' is the source, and the sink is the same
-  auto child_pipeline    = std::make_shared<sirius_pipeline>(ctx);
-  child_pipeline->sink   = pipeline.get_sink();
-  child_pipeline->source = &op;
-
-  // the child pipeline has the same operators up until 'op'
-  for (auto current_op : pipeline.get_operators()) {
-    if (&current_op.get() == &op) { break; }
-    child_pipeline->operators.push_back(current_op);
-  }
-
-  return child_pipeline;
-}
-
-std::vector<std::reference_wrapper<op::sirius_physical_operator>>
-sirius_pipeline_build_state::get_pipeline_operators(sirius_pipeline& pipeline)
-{
-  return pipeline.operators;
 }
 
 bool sirius_pipeline::is_pipeline_finished() const

@@ -64,8 +64,6 @@ class sirius_physical_replicate : public sirius_physical_operator {
     return _output_limits;
   }
 
-  std::string params_to_string() const override;
-
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          ::cuda::stream_ref stream) override;
 

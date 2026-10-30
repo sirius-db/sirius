@@ -18,8 +18,6 @@
 
 #include "common/optional_ptr.hpp"
 #include "common/reference_map.hpp"
-#include "duckdb/parallel/pipeline.hpp"
-#include "duckdb/parallel/task_scheduler.hpp"
 #include "exec/queue_priority.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_operator_type.hpp"
@@ -29,6 +27,7 @@
 #include "query_id.hpp"
 #include "telemetry/nvtx.hpp"
 
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <utility>
@@ -53,10 +52,6 @@ class sirius_meta_pipeline;
 
 class sirius_pipeline_build_state {
  public:
-  //! How much to increment batch indexes when multiple pipelines share the same source
-  constexpr static std::size_t BATCH_INCREMENT = 10000000000000;
-
- public:
   //! Duplicate eliminated join scan dependencies
   sirius::reference_map_t<const op::sirius_physical_operator,
                           std::reference_wrapper<sirius_pipeline>>
@@ -75,20 +70,12 @@ class sirius_pipeline_build_state {
  public:
   void set_pipeline_source(sirius_pipeline& pipeline, op::sirius_physical_operator& op);
   void set_pipeline_sink(sirius_pipeline& pipeline,
-                         sirius::optional_ptr<op::sirius_physical_operator> op,
-                         std::size_t sink_pipeline_count);
+                         sirius::optional_ptr<op::sirius_physical_operator> op);
   void set_pipeline_operators(
     sirius_pipeline& pipeline,
     std::vector<std::reference_wrapper<op::sirius_physical_operator>> operators);
   void add_pipeline_operator(sirius_pipeline& pipeline, op::sirius_physical_operator& op);
-  std::shared_ptr<sirius_pipeline> create_child_pipeline(const pipeline_build_context& ctx,
-                                                         sirius_pipeline& pipeline,
-                                                         op::sirius_physical_operator& op);
-
-  sirius::optional_ptr<op::sirius_physical_operator> get_pipeline_source(sirius_pipeline& pipeline);
   sirius::optional_ptr<op::sirius_physical_operator> get_pipeline_sink(sirius_pipeline& pipeline);
-  std::vector<std::reference_wrapper<op::sirius_physical_operator>> get_pipeline_operators(
-    sirius_pipeline& pipeline);
 };
 
 //! The sirius_pipeline class represents an execution pipeline starting at a
@@ -106,12 +93,6 @@ class sirius_pipeline : public std::enable_shared_from_this<sirius_pipeline> {
   void add_dependency(std::shared_ptr<sirius_pipeline>& pipeline);
 
   void is_ready();
-  void reset();
-  void reset_sink();
-  void reset_source(bool force);
-  void clear_source();
-  void schedule(std::shared_ptr<duckdb::Event>& event);
-
   //! Returns a list of all operators (including source and sink) involved in this pipeline
   std::vector<std::reference_wrapper<op::sirius_physical_operator>> get_operators();
   std::vector<std::reference_wrapper<const op::sirius_physical_operator>> get_operators() const;
@@ -192,15 +173,6 @@ class sirius_pipeline : public std::enable_shared_from_this<sirius_pipeline> {
   //! update_pipeline_status. If it is, we dont want to schedule tasks for its consumers, that will
   //! be done later.
   void notify_downstream_pipelines(bool original_pipeline);
-
-  //! Returns whether any of the operators in the pipeline care about preserving order
-  bool is_order_dependent() const;
-
-  //! Registers a new batch index for a pipeline executor - returns the current minimum batch index
-  std::size_t register_new_batch_index();
-
-  //! Updates the batch index of a pipeline (and returns the new minimum batch index)
-  std::size_t update_batch_index(std::size_t old_index, std::size_t new_index);
 
   //! The dependencies of this pipeline
   std::vector<std::shared_ptr<sirius_pipeline>> dependencies;
@@ -288,8 +260,6 @@ class sirius_pipeline : public std::enable_shared_from_this<sirius_pipeline> {
  private:
   //! Whether or not the pipeline has been readied
   bool ready;
-  //! Whether or not the pipeline has been initialized
-  std::atomic<bool> initialized;
   //! The source of this pipeline
   sirius::optional_ptr<op::sirius_physical_operator> source;
   //! The chain of intermediate operators
@@ -297,25 +267,8 @@ class sirius_pipeline : public std::enable_shared_from_this<sirius_pipeline> {
   //! The sink (i.e. destination) for data; this is e.g. a hash table to-be-built
   sirius::optional_ptr<op::sirius_physical_operator> sink;
 
-  //! The global source state
-  duckdb::unique_ptr<duckdb::GlobalSourceState> source_state;
   //! The parent pipelines (i.e. pipelines that are dependent on this pipeline to finish)
   std::vector<std::weak_ptr<sirius_pipeline>> parents;
-
-  //! The base batch index of this pipeline
-  std::size_t base_batch_index = 0;
-  //! Lock for accessing the set of batch indexes
-  std::mutex batch_lock;
-  //! The set of batch indexes that are currently being processed
-  //! Despite batch indexes being unique - this is a multiset
-  //! The reason is that when we start a new pipeline we insert the current minimum batch index as a
-  //! placeholder Which leads to duplicate entries in the set of active batch indexes
-  std::multiset<std::size_t> batch_indexes;
-
-  void schedule_sequential_task(std::shared_ptr<duckdb::Event>& event);
-  bool launch_scan_tasks(std::shared_ptr<duckdb::Event>& event, std::size_t max_threads);
-
-  bool schedule_parallel(std::shared_ptr<duckdb::Event>& event);
 
   //! Task creator pointer for scheduling downstream consumers when this pipeline finishes
   sirius::creator::task_creator* _task_creator{nullptr};

@@ -257,15 +257,6 @@ sirius_physical_dense_count_join::sirius_physical_dense_count_join(
   D_ASSERT(this->types.size() == 2);  // [group key, BIGINT count]
 }
 
-std::string sirius_physical_dense_count_join::params_to_string() const
-{
-  return " (preserved_key=" + std::to_string(_preserved_key_idx) +
-         ", counted_key=" + std::to_string(_counted_key_idx) +
-         (_counted_value_idx ? ", count_col=" + std::to_string(*_counted_value_idx)
-                             : std::string(", count_star")) +
-         ", max_bins_bytes=" + std::to_string(_max_bins_bytes) + ")";
-}
-
 std::string_view sirius_physical_dense_count_join::input_port_for(
   sirius_physical_operator const& producer) const
 {

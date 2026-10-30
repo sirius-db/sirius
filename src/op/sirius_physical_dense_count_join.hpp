@@ -145,8 +145,6 @@ class sirius_physical_dense_count_join : public sirius_physical_partition_consum
     uint64_t planned_counted_rows    = 0,
     uint64_t hash_partition_bytes    = config::DEFAULT_HASH_PARTITION_BYTES);
 
-  std::string params_to_string() const override;
-
   /**
    * @brief Map a direct child to its normalized preserved or counted input port
    *

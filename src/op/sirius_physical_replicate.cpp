@@ -44,12 +44,6 @@ sirius_physical_replicate::sirius_physical_replicate(duckdb::vector<sirius::logi
   }
 }
 
-std::string sirius_physical_replicate::params_to_string() const
-{
-  return " (max_rows=" + std::to_string(_output_limits.max_rows) +
-         ", max_bytes=" + std::to_string(_output_limits.max_bytes) + ")";
-}
-
 std::unique_ptr<operator_data> sirius_physical_replicate::execute(const operator_data& input_data,
                                                                   ::cuda::stream_ref stream)
 {

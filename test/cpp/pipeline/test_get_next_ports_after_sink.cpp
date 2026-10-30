@@ -78,7 +78,7 @@ TEST_CASE("returns sink ports for standard (non-delim) sink",
   sink_op.add_next_port_after_sink({&consumer_b, "port_b"});
 
   sirius_pipeline_build_state build_state;
-  build_state.set_pipeline_sink(pipeline, &sink_op, 0);
+  build_state.set_pipeline_sink(pipeline, &sink_op);
 
   std::vector<sirius_physical_operator::next_port_info> ports;
   for (const auto& port : pipeline.get_next_ports_after_sink()) {
@@ -97,7 +97,7 @@ TEST_CASE("yields nothing for standard sink with no ports", "[pipeline][get_next
 
   sirius_physical_operator sink_op;
   sirius_pipeline_build_state build_state;
-  build_state.set_pipeline_sink(pipeline, &sink_op, 0);
+  build_state.set_pipeline_sink(pipeline, &sink_op);
 
   for ([[maybe_unused]] const auto& port : pipeline.get_next_ports_after_sink()) {
     FAIL("port found");
@@ -127,7 +127,7 @@ TEST_CASE("RIGHT_DELIM_JOIN: returns its own fan-out ports",
   right_delim->add_next_port_after_sink({&distinct_branch, "default"});
 
   sirius_pipeline_build_state build_state;
-  build_state.set_pipeline_sink(pipeline, right_delim.get(), 0);
+  build_state.set_pipeline_sink(pipeline, right_delim.get());
 
   std::vector<sirius_physical_operator::next_port_info> ports;
   for (const auto& port : pipeline.get_next_ports_after_sink()) {
@@ -156,7 +156,7 @@ TEST_CASE("LEFT_DELIM_JOIN: returns its own fan-out ports", "[pipeline][get_next
   left_delim->add_next_port_after_sink({&distinct_branch, "default"});
 
   sirius_pipeline_build_state build_state;
-  build_state.set_pipeline_sink(pipeline, left_delim.get(), 0);
+  build_state.set_pipeline_sink(pipeline, left_delim.get());
 
   std::vector<sirius_physical_operator::next_port_info> ports;
   for (const auto& port : pipeline.get_next_ports_after_sink()) {

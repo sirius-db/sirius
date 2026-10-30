@@ -538,12 +538,6 @@ class sirius_physical_operator {
  public:
   virtual std::string get_name() const;
 
-  virtual std::string params_to_string() const { return ""; }
-
-  virtual std::string to_string() const;
-
-  void print() const;
-
   virtual duckdb::vector<duckdb::const_reference<sirius_physical_operator>> get_children() const;
 
   //! Return a vector of the types that will be returned by this operator
@@ -677,8 +671,6 @@ class sirius_physical_operator {
     _owning_delim_join = delim;
   }
 
-  virtual bool equals(const sirius_physical_operator& other) const { return false; }
-
   virtual void verify();
   /** @brief Return the receiving port for @p producer; the default is `"default"`. */
   [[nodiscard]] virtual std::string_view input_port_for(
@@ -714,12 +706,6 @@ class sirius_physical_operator {
 
   virtual std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                                  ::cuda::stream_ref stream);
-
-  //! The influence the operator has on order (insertion order means no influence)
-  virtual sirius::OrderPreservationType operator_order() const
-  {
-    return sirius::OrderPreservationType::INSERTION_ORDER;
-  }
 
  public:
   // Source interface
@@ -777,10 +763,6 @@ class sirius_physical_operator {
             _parent_op->type == SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN ||
             _parent_op->type == SiriusPhysicalOperatorType::DENSE_COUNT_JOIN);
   }
-
-  //! Whether or not the sink operator depends on the order of the input chunks
-  //! If this is set to true, we cannot do things like caching intermediate vectors
-  virtual bool sink_order_dependent() const { return false; }
 
  public:
   // Pipeline construction
@@ -884,8 +866,6 @@ class sirius_physical_operator {
   [[nodiscard]] const std::list<std::unique_ptr<port>>& get_ports() const { return _ports_list; }
   //! Check if the source pipeline is finished
   bool is_source_pipeline_finished();
-  //! Returns true if any FULL-barrier port has src_pipeline == src
-  bool has_full_barrier_from(const pipeline::sirius_pipeline* src) const;
   //! Add a next port after sink
   void add_next_port_after_sink(next_port_info port_info);
   //! Get the next ports after sink
@@ -916,8 +896,6 @@ class sirius_physical_operator {
 
   //! Check if all ports are empty
   [[nodiscard]] virtual bool all_ports_empty();
-  //! Check if the pipeline is finished
-  bool check_pipeline_finished();
 
   //! Get pipeline
   std::shared_ptr<pipeline::sirius_pipeline> get_pipeline() const noexcept;

@@ -100,7 +100,7 @@ class estimator_dag {
     auto op       = std::make_unique<test_source_operator>();
     op->set_pipeline(pipeline);
     _bs.set_pipeline_source(*pipeline, *op);
-    _bs.set_pipeline_sink(*pipeline, sirius::optional_ptr<sirius_physical_operator>(op.get()), 0);
+    _bs.set_pipeline_sink(*pipeline, sirius::optional_ptr<sirius_physical_operator>(op.get()));
     auto& ref = *pipeline;
     _ops.push_back(std::move(op));
     _pipelines.push_back(std::move(pipeline));
@@ -146,7 +146,7 @@ class estimator_dag {
   {
     auto op = std::make_unique<test_source_operator>();
     op->set_pipeline(shared_for(pipeline));
-    _bs.set_pipeline_sink(pipeline, sirius::optional_ptr<sirius_physical_operator>(op.get()), 0);
+    _bs.set_pipeline_sink(pipeline, sirius::optional_ptr<sirius_physical_operator>(op.get()));
     auto& ref = *op;
     _ops.push_back(std::move(op));
     return ref;

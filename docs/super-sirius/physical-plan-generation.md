@@ -150,7 +150,6 @@ Key methods:
 - `mark_task_completed()` — increments `tasks_completed`, calls `update_pipeline_status()`
 - `update_pipeline_status()` — checks completion: a pipeline finishes when any of its operators has exhausted a limit, or when its first node reports `is_source_pipeline_finished()` and `all_ports_empty()`, and `tasks_created == tasks_completed`. Source-specific completion (a drained DuckDB source vs. a closed/drained scan `split_connector`) is encapsulated behind the operator's `is_source_pipeline_finished()` rather than a per-operator-type switch.
 - `is_ready()` — marks pipeline ready and reverses operators to execution order
-- `register_new_batch_index()` / `update_batch_index()` — batch ordering for order-preserving execution
 
 ### `sirius_meta_pipeline`
 

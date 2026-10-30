@@ -45,8 +45,6 @@ class sirius_physical_passthrough_sink : public sirius_physical_operator {
 
   std::string get_name() const override;
 
-  //! Both, as CONCAT is. `is_source()` also satisfies `sirius_pipeline::reset_source` for an arm
-  //! whose root is itself an unconditional sink, leaving this operator alone in its pipeline.
   bool is_source() const override;
   bool is_sink() const override;
 

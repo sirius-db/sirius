@@ -329,7 +329,7 @@ two_operator_pipeline_context create_two_operator_pipeline_context()
   build_state.set_pipeline_source(*ctx.pipeline, *ctx.stub_source);
   build_state.add_pipeline_operator(*ctx.pipeline, *ctx.first_op);
   build_state.add_pipeline_operator(*ctx.pipeline, *ctx.second_op);
-  build_state.set_pipeline_sink(*ctx.pipeline, *ctx.second_op, 1);
+  build_state.set_pipeline_sink(*ctx.pipeline, *ctx.second_op);
 
   // Number the stubs as the converter does in production; task execution reads operator ids.
   std::vector<std::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines{ctx.pipeline};
@@ -349,7 +349,7 @@ pipeline_context create_pipeline_context()
   sirius::pipeline::sirius_pipeline_build_state build_state;
   build_state.set_pipeline_source(*ctx.pipeline, *ctx.stub_source);
   build_state.add_pipeline_operator(*ctx.pipeline, *ctx.stub_op);
-  build_state.set_pipeline_sink(*ctx.pipeline, *ctx.stub_op, 1);
+  build_state.set_pipeline_sink(*ctx.pipeline, *ctx.stub_op);
 
   // Number the stubs as the converter does in production; task execution reads operator ids.
   std::vector<std::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines{ctx.pipeline};

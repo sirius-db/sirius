@@ -66,7 +66,7 @@ std::shared_ptr<sirius_pipeline> make_finishable_pipeline(sirius_physical_operat
   auto pipeline =
     std::make_shared<sirius_pipeline>(sirius::pipeline::pipeline_build_context{nullptr});
   sirius_pipeline_build_state build_state;
-  build_state.set_pipeline_sink(*pipeline, &sink_op, 0);
+  build_state.set_pipeline_sink(*pipeline, &sink_op);
   return pipeline;
 }
 

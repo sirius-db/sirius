@@ -58,8 +58,6 @@ class sirius_physical_cte : public sirius_physical_operator {
   // Sink interface
   bool is_sink() const override { return true; }
 
-  bool sink_order_dependent() const override { return false; }
-
   // execute() forwards producer batches; types describes the consumer subtree's result.
   [[nodiscard]] bool declared_output_schema_is_runtime_schema() const noexcept override
   {

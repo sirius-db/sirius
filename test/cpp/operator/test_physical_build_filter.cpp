@@ -335,7 +335,7 @@ TEST_CASE("an empty build filter pipeline finishes without tasks and releases it
   auto publication_pipeline = std::make_shared<sirius::pipeline::sirius_pipeline>(
     sirius::pipeline::pipeline_build_context{nullptr});
   state.set_pipeline_source(*publication_pipeline, *publication_ptr);
-  state.set_pipeline_sink(*publication_pipeline, publication_ptr, 1);
+  state.set_pipeline_sink(*publication_pipeline, publication_ptr);
   state.add_pipeline_operator(*publication_pipeline, *publication_ptr);
   publication_ptr->set_pipeline(publication_pipeline);
   cucascade::shared_data_repository partition_repository;

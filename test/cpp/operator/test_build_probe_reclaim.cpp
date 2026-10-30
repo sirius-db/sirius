@@ -149,7 +149,7 @@ std::unique_ptr<reclaim_join_harness> make_reclaim_join_harness(duckdb::JoinType
                         std::size_t pipeline_id) {
     auto pipeline = std::make_shared<finished_stub_pipeline>(h->build_ctx);
     sirius_pipeline_build_state build_state;
-    build_state.set_pipeline_sink(*pipeline, sink, /*pipeline_idx=*/0);
+    build_state.set_pipeline_sink(*pipeline, sink);
     for (auto* op : operators) {
       build_state.add_pipeline_operator(*pipeline, *op);
     }
@@ -162,7 +162,7 @@ std::unique_ptr<reclaim_join_harness> make_reclaim_join_harness(duckdb::JoinType
   {
     auto pipeline = std::make_shared<sirius_pipeline>(h->build_ctx);
     sirius_pipeline_build_state build_state;
-    build_state.set_pipeline_sink(*pipeline, &h->dest_sink, /*pipeline_idx=*/0);
+    build_state.set_pipeline_sink(*pipeline, &h->dest_sink);
     build_state.add_pipeline_operator(*pipeline, *h->hash_join);
     pipeline->set_pipeline_id(2);
     h->pipelines.push_back(pipeline);
