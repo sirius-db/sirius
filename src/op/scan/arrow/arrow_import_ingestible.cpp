@@ -349,8 +349,16 @@ scan::filtered_table arrow_import_ingestible::materialize_metadata_to_table(
     scan::materialized_batch batch;
     explicit import_state(cudaStream_t stream) : lane(stream) {}
   };
-  auto imported   = std::make_unique<import_state>(stream.get());
-  imported->input = arrow.coalesced_copy();
+  auto imported       = std::make_unique<import_state>(stream.get());
+  imported->input     = arrow.coalesced_copy();
+  auto quiesce_import = [&] {
+    auto status = imported->lane.quiesce();
+    if (status == cudaSuccess && !scan::detail::no_retirement_faults::fails_join(true)) return;
+    // Test-owned retention is allowed only after a real successful barrier.
+    if (status == cudaSuccess) scan::detail::no_retirement_faults::retain(imported);
+    imported.release();
+    std::rethrow_exception(unjoined);
+  };
   try {
     if (arrow.rootless()) {
       std::vector<std::unique_ptr<cudf::column>> columns;
@@ -368,16 +376,10 @@ scan::filtered_table arrow_import_ingestible::materialize_metadata_to_table(
   } catch (...) {
     // Import unwinding may enqueue output frees after commit recovery. Always
     // establish another barrier while the caller's output reservation is alive.
-    if (imported->lane.quiesce() != cudaSuccess) {
-      imported.release();
-      std::rethrow_exception(unjoined);
-    }
+    quiesce_import();
     throw;
   }
-  if (imported->lane.quiesce() != cudaSuccess) {
-    imported.release();
-    std::rethrow_exception(unjoined);
-  }
+  quiesce_import();
   if (auto counters = impl_->info.profiles->counters;
       counters && counters->track_units && !arrow.rootless()) {
     ++counters->arrow_batches_imported;
