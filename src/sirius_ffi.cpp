@@ -150,7 +150,6 @@ void run_transaction_entry_hook() { run_hook(transaction_entry_mutex, transactio
 // Errors name the field and a fixed reason, never its value. Authentication, TLS and
 // network failures are reported when a snapshot is used.
 
-
 [[noreturn]] void invalid_field(const char* field, const char* reason)
 {
   throw std::invalid_argument(std::string("ObjectStoreConfig.") + field + ": " + reason);
@@ -173,7 +172,9 @@ void check_endpoint(const std::string& endpoint)
     invalid_field("endpoint", "scheme must be http or https");
   }
   for (unsigned char const c : endpoint) {
-    if (c <= 0x20 || c == 0x7F) { invalid_field("endpoint", "must not contain control bytes or spaces"); }
+    if (c <= 0x20 || c == 0x7F) {
+      invalid_field("endpoint", "must not contain control bytes or spaces");
+    }
   }
   auto const remainder = std::string_view{endpoint}.substr(sep + 3);
   // A port-only authority ("https://:443") has no host either.
@@ -199,8 +200,9 @@ void check_endpoint(const std::string& endpoint)
   }
   if (port_sep != std::string_view::npos) {
     auto const port = remainder.substr(port_sep + 1);
-    bool const digits = !port.empty() && port.size() <= 5 &&
-                        std::all_of(port.begin(), port.end(), [](char c) { return c >= '0' && c <= '9'; });
+    bool const digits =
+      !port.empty() && port.size() <= 5 &&
+      std::all_of(port.begin(), port.end(), [](char c) { return c >= '0' && c <= '9'; });
     if (!digits || std::stoi(std::string{port}) < 1 || std::stoi(std::string{port}) > 65535) {
       invalid_field("endpoint", "port must be a decimal number in 1..65535");
     }
