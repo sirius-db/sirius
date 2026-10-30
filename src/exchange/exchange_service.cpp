@@ -82,7 +82,9 @@ exchange_service::exchange_service(fabric& fabric,
                               std::make_exception_ptr(sirius::internal_exception(
                                 "exchange: query {} failed on rank {}: {}", query, from, what)));
                           }};
-  _transport = std::make_unique<transport>(fabric, send, recv, gpu, host, std::move(cb), opts);
+  _transport  = std::make_unique<transport>(fabric, send, recv, gpu, host, std::move(cb), opts);
+  _rank       = _transport->rank();
+  _world_size = _transport->world_size();
 }
 
 std::shared_ptr<inbound> exchange_service::receiver_of(stream_id stream, held event)
@@ -115,7 +117,35 @@ void exchange_service::abort(std::uint64_t query, std::string const& what)
 {
   auto error = std::make_exception_ptr(
     sirius::internal_exception("exchange: query {} failed on rank {}: {}", query, rank(), what));
-  if (end_query(query, std::move(error))) { _transport->abort(query, what); }
+  if (!end_query(query, std::move(error))) { return; }
+  std::lock_guard lock{_mutex};
+  if (_transport) { _transport->abort(query, what); }
+}
+
+bool exchange_service::wait_sent(std::uint64_t query, std::chrono::milliseconds timeout)
+{
+  {
+    std::lock_guard lock{_mutex};
+    if (!_transport) { return true; }
+  }
+  return _transport->wait_sent(query, timeout);
+}
+
+void exchange_service::shutdown()
+{
+  std::unique_ptr<transport> stopped;
+  {
+    std::lock_guard lock{_mutex};
+    if (!_error) {
+      _error = std::make_exception_ptr(
+        sirius::internal_exception("exchange: shut down with the Sirius context"));
+    }
+    stopped = std::move(_transport);
+    _held.clear();
+    _receivers.clear();
+  }
+  // Outside the lock: the engine thread calls back into this service until it is joined.
+  stopped.reset();
 }
 
 void exchange_service::attach(stream_id stream, std::shared_ptr<inbound> receiver)

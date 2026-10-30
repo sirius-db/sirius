@@ -67,19 +67,16 @@ class exchange_service {
   {
   }
 
-  [[nodiscard]] rank_t rank() const noexcept { return _transport->rank(); }
-  [[nodiscard]] rank_t world_size() const noexcept { return _transport->world_size(); }
+  [[nodiscard]] rank_t rank() const noexcept { return _rank; }
+  [[nodiscard]] rank_t world_size() const noexcept { return _world_size; }
 
   /// @throws the exchange's error once it has failed.
   void send(stream_id stream, rank_t to, std::shared_ptr<cucascade::data_batch> batch);
   /// @throws the exchange's error once it has failed.
   void close(stream_id stream, rank_t to);
 
-  /// See transport::wait_sent.
-  [[nodiscard]] bool wait_sent(std::uint64_t query, std::chrono::milliseconds timeout)
-  {
-    return _transport->wait_sent(query, timeout);
-  }
+  /// See transport::wait_sent. True once shut down: the transport freed what it held.
+  [[nodiscard]] bool wait_sent(std::uint64_t query, std::chrono::milliseconds timeout);
 
   /// Routes @p stream to @p receiver, replaying what arrived for it before.
   /// @throws sirius::invalid_input_exception when the stream already has a receiver.
@@ -90,6 +87,11 @@ class exchange_service {
   /// This rank's run of @p query failed with @p what: fails its streams here and on every peer,
   /// so no rank waits for the others. Once per query; a query a peer aborted is not re-sent.
   void abort(std::uint64_t query, std::string const& what);
+
+  /// Stops the transport, joining its engine thread and freeing the batches it and this service
+  /// hold, while the memory spaces they live in still exist. Plans may keep the service alive
+  /// past that point; their later send() and close() throw.
+  void shutdown();
 
  private:
   struct held {
@@ -103,6 +105,8 @@ class exchange_service {
   /// Fails @p query's receivers with @p error. @return false if it had already ended.
   bool end_query(std::uint64_t query, std::exception_ptr error);
 
+  rank_t _rank;
+  rank_t _world_size;
   std::mutex _mutex;
   std::map<stream_id, std::shared_ptr<inbound>> _receivers;
   std::map<stream_id, std::vector<held>> _held;
@@ -110,7 +114,8 @@ class exchange_service {
   std::map<std::uint64_t, std::exception_ptr> _aborted;
   /// The transport's failure, worded for the queries after it.
   std::exception_ptr _error;
-  // Last: its engine thread calls back into the members above until it is destroyed.
+  // Last: its engine thread calls back into the members above until it is destroyed. Null once
+  // shut down.
   std::unique_ptr<transport> _transport;
 };
 
