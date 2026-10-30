@@ -68,6 +68,12 @@ class sirius_physical_delim_join : public sirius_physical_operator {
   {
     return false;
   }
+
+  sirius::OrderPreservationType source_order() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
+  bool sink_order_dependent() const override { return false; }
 };
 
 //! sirius_physical_right_delim_join represents a join where the RHS will be duplicate eliminated
