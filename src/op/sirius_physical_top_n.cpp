@@ -20,6 +20,7 @@
 #include "duckdb/common/value_operations/value_operations.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/filter/table_filter_functions.hpp"
+#include "helper/cudf_scalar_to_value.hpp"
 #include "op/cudf_sort_order.hpp"
 #include "op/sirius_physical_order.hpp"
 #include "op/sirius_physical_top_n_merge.hpp"
@@ -33,7 +34,6 @@
 #include <cudf/cudf_utils.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/sorting.hpp>
-#include <cudf/wrappers/timestamps.hpp>
 
 #include <rmm/resource_ref.hpp>
 
@@ -54,61 +54,19 @@ duckdb::Value top_n_boundary(cudf::scalar const& scalar, ::cuda::stream_ref stre
   if (!scalar.is_valid(stream)) return duckdb::Value();
   switch (scalar.type().id()) {
     case cudf::type_id::INT8:
-      return duckdb::Value::TINYINT(
-        static_cast<cudf::numeric_scalar<int8_t> const&>(scalar).value(stream));
     case cudf::type_id::INT16:
-      return duckdb::Value::SMALLINT(
-        static_cast<cudf::numeric_scalar<int16_t> const&>(scalar).value(stream));
     case cudf::type_id::INT32:
-      return duckdb::Value::INTEGER(
-        static_cast<cudf::numeric_scalar<int32_t> const&>(scalar).value(stream));
     case cudf::type_id::INT64:
-      return duckdb::Value::BIGINT(
-        static_cast<cudf::numeric_scalar<int64_t> const&>(scalar).value(stream));
     case cudf::type_id::UINT8:
-      return duckdb::Value::UTINYINT(
-        static_cast<cudf::numeric_scalar<uint8_t> const&>(scalar).value(stream));
     case cudf::type_id::UINT16:
-      return duckdb::Value::USMALLINT(
-        static_cast<cudf::numeric_scalar<uint16_t> const&>(scalar).value(stream));
     case cudf::type_id::UINT32:
-      return duckdb::Value::UINTEGER(
-        static_cast<cudf::numeric_scalar<uint32_t> const&>(scalar).value(stream));
     case cudf::type_id::UINT64:
-      return duckdb::Value::UBIGINT(
-        static_cast<cudf::numeric_scalar<uint64_t> const&>(scalar).value(stream));
     case cudf::type_id::TIMESTAMP_DAYS:
-      return duckdb::Value::DATE(
-        duckdb::date_t{static_cast<cudf::timestamp_scalar<cudf::timestamp_D> const&>(scalar)
-                         .value(stream)
-                         .time_since_epoch()
-                         .count()});
     case cudf::type_id::TIMESTAMP_SECONDS:
-      return duckdb::Value::TIMESTAMPSEC(duckdb::timestamp_sec_t{
-        static_cast<cudf::timestamp_scalar<cudf::timestamp_s> const&>(scalar)
-          .value(stream)
-          .time_since_epoch()
-          .count()});
     case cudf::type_id::TIMESTAMP_MILLISECONDS:
-      return duckdb::Value::TIMESTAMPMS(duckdb::timestamp_ms_t{
-        static_cast<cudf::timestamp_scalar<cudf::timestamp_ms> const&>(scalar)
-          .value(stream)
-          .time_since_epoch()
-          .count()});
     case cudf::type_id::TIMESTAMP_MICROSECONDS:
-      return duckdb::Value::TIMESTAMP(
-        duckdb::timestamp_t{static_cast<cudf::timestamp_scalar<cudf::timestamp_us> const&>(scalar)
-                              .value(stream)
-                              .time_since_epoch()
-                              .count()});
     case cudf::type_id::TIMESTAMP_NANOSECONDS:
-      return duckdb::Value::TIMESTAMPNS(duckdb::timestamp_ns_t{
-        static_cast<cudf::timestamp_scalar<cudf::timestamp_ns> const&>(scalar)
-          .value(stream)
-          .time_since_epoch()
-          .count()});
-    case cudf::type_id::STRING:
-      return duckdb::Value(static_cast<cudf::string_scalar const&>(scalar).to_string(stream));
+    case cudf::type_id::STRING: return cudf_scalar_to_value(scalar, stream);
     default: return duckdb::Value();
   }
 }
