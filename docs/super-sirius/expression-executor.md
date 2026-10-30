@@ -267,9 +267,8 @@ tagged `[timestamp_extraction]`.
 HUGEINT is carried as cuDF DECIMAL128 with scale 0, an exact 128-bit integer with the layout of
 `duckdb::hugeint_t`; its constants are `sirius::decimal128` values with scale 0. Like DECIMAL
 (`logical_type::has_fixed_point_carrier`), HUGEINT arithmetic is materialized rather than lowered
-to the cuDF AST. `//` and `%` with a HUGEINT result run on the GPU only by a nonzero constant
-divisor (cuDF leaves a zero divisor's row undefined, where DuckDB raises an error), and other
-divisors stay on the CPU. A cast from HUGEINT to a narrower integer or DECIMAL first checks the
+to the cuDF AST. `//` and `%` accept column divisors on the GPU after the checks described below.
+A cast from HUGEINT to a narrower integer or DECIMAL first checks the
 column's range and throws `not_implemented_exception` when a value does not fit, so the query falls
 back and DuckDB raises its conversion error (or returns NULL under `TRY_CAST`). Such casts never
 lower to the AST, whose integer casts wrap (`ast_supports_cast`); a cast to DOUBLE does. A cast to
@@ -286,6 +285,21 @@ collisions. Date differences widen both day counts before subtraction and return
 BIGINT. These operations materialize under every evaluator strategy; standalone
 cuDF AST translation declines them because it cannot implement the checks.
 The existing reference evaluator restores compressed operands before execution.
+
+### Division and modulo
+
+`//` and `%` check valid operand pairs for zero divisors and signed-minimum/-1 overflow before
+calling cuDF. Both operators raise for the latter pair in the pinned DuckDB version. NULLs in
+either operand suppress the check for that row. A detected exceptional pair triggers CPU replay,
+which preserves DuckDB's `error_on_division_by_zero` setting and guarded `CASE` semantics. With
+fallback disabled, the GPU reports the unsupported exceptional pair without executing it.
+`TRY(...)` continues to use plan-time CPU fallback.
+
+A proven nonzero constant divisor other than -1 can use the existing cuDF AST path. Other divisors
+materialize under every evaluation strategy; the standalone translator declines them as well, so
+join and scan predicates cannot bypass the checks. The shared `ast_supports_function` predicate
+keeps those decisions aligned. Ordinary floating-point `/` retains its existing route. Regression
+tests are tagged `[checked_division]`.
 
 ### Arity and negation
 

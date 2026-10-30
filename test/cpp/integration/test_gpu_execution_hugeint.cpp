@@ -126,18 +126,16 @@ TEST_CASE_METHOD(HugeintFixture,
     "SELECT k, TRY_CAST(s * 3000000000000000000 AS DECIMAL(38, 0)) "
     "c FROM " +
     std::string{sums} + ";");
-  // HUGEINT_MIN // -1 overflows, so a -1 divisor stays on the CPU.
-  expect_plan_fallback_matches_cpu("SELECT k, s // -1 q, s % -1 r FROM " + std::string{sums} + ";");
+  // These sums are not HUGEINT_MIN, so dividing by -1 is safe on the GPU.
+  compare_gpu_vs_cpu("SELECT k, s // -1 q, s % -1 r FROM " + std::string{sums} + ";");
 }
 
 TEST_CASE_METHOD(HugeintFixture,
-                 "hugeint - division by a column stays on the CPU",
-                 "[integration][gpu_execution][hugeint]")
+                 "hugeint - division by a column stays on the GPU",
+                 "[integration][gpu_execution][hugeint][checked_division]")
 {
-  // cuDF leaves a zero divisor's row undefined, so only a nonzero constant divisor runs on the GPU.
-  run_ok("SET enable_duckdb_fallback = true;");
-  expect_plan_fallback_matches_cpu("SELECT k, SUM(x) // COUNT(*) a FROM h GROUP BY k;");
-  expect_plan_fallback_matches_cpu("SELECT k, SUM(x) % COUNT(*) a FROM h GROUP BY k;");
+  compare_gpu_vs_cpu("SELECT k, SUM(x) // COUNT(*) a FROM h GROUP BY k;");
+  compare_gpu_vs_cpu("SELECT k, SUM(x) % COUNT(*) a FROM h GROUP BY k;");
 }
 
 TEST_CASE_METHOD(HugeintFixture,
