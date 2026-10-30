@@ -162,6 +162,14 @@ Adapters using this driver must also handle the following integration responsibi
 | Composite scans | Admit the combined resource requirements and minimum progress permits before data work. Coordinate child gates and emit whole-scan emptiness once. |
 | Producer progress | Producer work and descriptor creation share a preparation source. Do not make release of an active input depend on accepting another input through the same gate. |
 
+### Composite scan integration
+
+| When | Requirement |
+|---|---|
+| Wrapping a preparation result | Use `preparation_job::map_output()` and preserve the result's dependencies. Leave completion and failure reporting to `run()`. |
+| Sharing a contract across slots and Arrow children | Use one `preparation_identity` for all slot keys and Arrow `next_unit_id` callbacks. Independent counters can produce duplicate keys. |
+| Reusing retained budget across files | Create fixed `preparation_slot` objects and reuse their permits. Keep each permit until the last consumer releases its backing. Retiring a slot does not refund its registered allowance, so creating a new slot per file can exhaust admission even after memory is released. |
+
 ### Execution and ownership
 
 The coordinator claims work, coalesces results and publishes batches after GPU consumers are ready. Metadata-only attempts advance on the query owner without another thread. An attempt with query-owner or native-reader sources runs coordination independently of reader calls: on the manager's shared pool by default, or on a dedicated thread when `coordinator_workers` is `0`. All drivers use the same bounded control steps, publication gate and retirement path. Sources choose where their jobs run:

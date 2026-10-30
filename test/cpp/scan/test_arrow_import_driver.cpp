@@ -22,6 +22,8 @@
 #include "operator/operator_test_utils.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "scan_manager/preparation_fixture.hpp"
+#include "scan_manager/preparation_identity.hpp"
+#include "scan_manager/preparation_slot.hpp"
 #include "scan_manager/preparation_test_support.hpp"
 #include "utils/telemetry_utils.hpp"
 
@@ -1284,4 +1286,67 @@ TEST_CASE("Arrow producers cannot borrow another scans larger temporary envelope
   CHECK(h.ledger->permits_in_flight() == 0);
   CHECK(h.ledger->tracked_units() == 0);
   CHECK(h.backing.seen->allocated_bytes == 0);
+}
+
+TEST_CASE("Arrow children share preparation identities with retained slots",
+          "[arrow_driver][composite_scan]")
+{
+  bool shared_ids = GENERATE(false, true);
+  sm::test::test_reservation_provider provider;
+  provider.grant_bytes = 3 * 8192 + 16;
+  auto ledger          = std::make_unique<sm::preparation_ledger>(provider);
+  auto first           = std::make_shared<pull_producer>();
+  auto second          = std::make_shared<pull_producer>();
+  std::vector<sm::scan_envelope> scans{arrow_preparation_envelope(*first),
+                                       arrow_preparation_envelope(*second),
+                                       sm::scan_envelope{{{{8}, 16}}, {}, true, 1}};
+  auto decision = ledger->admit(scans, sm::memory_space_id{cucascade::memory::Tier::HOST, 0}, 3);
+  REQUIRE(decision.deferred);
+  auto admission     = std::make_shared<sm::preparation_admission>(std::move(ledger), decision);
+  auto shared_ledger = std::shared_ptr<sm::preparation_ledger>(admission->consume());
+  auto ids           = std::make_shared<sm::preparation_identity>();
+  auto program       = integer_program();
+  sm::preparation_slot slot(shared_ledger, {program.contract, ids->next()}, 16);
+  auto make_child = [&](auto producer) {
+    arrow_import_binding binding;
+    binding.program        = program;
+    binding.profiles       = std::make_shared<physical_profile_table>();
+    binding.read_identity  = std::make_shared<int>(4);
+    binding.column_names   = {"value"};
+    binding.output_columns = {0};
+    binding.admission      = admission;
+    binding.owns_admission = false;
+    if (shared_ids) binding.next_unit_id = [ids] { return ids->next(); };
+    auto child = std::make_unique<arrow_import_ingestible>(std::move(binding), producer);
+    child->attach_preparation_ledger(shared_ledger);
+    return child;
+  };
+  auto a = make_child(first), b = make_child(second);
+  if (!shared_ids) {
+    CHECK_THROWS_WITH(a->try_claim_split({}), "duplicate preparation unit");
+    CHECK(first->calls == 0);
+  } else {
+    auto claim_a = a->try_claim_split({});
+    auto claim_b = b->try_claim_split({});
+    REQUIRE(std::holds_alternative<sm::preparation_job>(claim_a));
+    REQUIRE(std::holds_alternative<sm::preparation_job>(claim_b));
+    auto input_a = std::get<sm::preparation_job>(claim_a).run({});
+    auto input_b = std::get<sm::preparation_job>(claim_b).run({});
+    REQUIRE(input_a);
+    REQUIRE(input_b);
+    REQUIRE(input_a->certificates().size() == 1);
+    REQUIRE(input_b->certificates().size() == 1);
+    CHECK(input_a->certificates().front().split_id == 1);
+    CHECK(input_b->certificates().front().split_id == 2);
+    CHECK(shared_ledger->tracked_units() == 3);
+    input_a.reset();
+    input_b.reset();
+    CHECK(shared_ledger->tracked_units() == 1);
+    auto permit = slot.try_acquire();
+    REQUIRE(permit);
+    auto bytes = shared_ledger->allocator(permit).allocate_retained(16);
+    CHECK(shared_ledger->charged_bytes(slot.key()) == 16);
+  }
+  a->finish_preparation();
+  b->finish_preparation();
 }

@@ -22,6 +22,8 @@
 namespace sirius::scan_manager {
 // Shared by the units of one bound scan. File indices and inline batch indices
 // remain separate semantic coordinates; preparation credits need unique keys.
+// Use the same instance for every slot key and every Arrow child's next_unit_id
+// within one contract. Per-child counters can collide with slots or other children.
 class preparation_identity {
  public:
   uint64_t next()
