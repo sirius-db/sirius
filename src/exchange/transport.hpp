@@ -147,8 +147,9 @@ class transport {
   void abort(std::uint64_t query, std::string what);
 
   /// Waits until this rank holds no batch it sent on a stream of @p query: the transport keeps a
-  /// sent batch until its last frame is staged, and its memory may belong to the query.
-  /// @return false after @p timeout, or once the transport has failed with batches still held.
+  /// sent batch until its last frame is staged, or until it fails, and its memory may belong to
+  /// the query.
+  /// @return false after @p timeout.
   [[nodiscard]] bool wait_sent(std::uint64_t query, std::chrono::milliseconds timeout);
 
  private:
