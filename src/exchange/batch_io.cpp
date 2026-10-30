@@ -47,7 +47,7 @@ using cucascade::memory::Tier;
 
 namespace {
 
-/// Copies between the device range [@p device, +@p size) and host blocks @p blocks at logical
+/// Copies the device range [@p device, +@p size) to or from host blocks @p blocks at logical
 /// offset @p at, one piece per block the range touches.
 void add_block_copies(
   sirius::cuda::device_copy_batch& copies,

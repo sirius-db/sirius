@@ -69,8 +69,8 @@ class nixl_fabric : public fabric {
     host_staging staging{host_staging::automatic};
   };
 
-  /// Registers @p send and @p recv, which must outlive the fabric, on the current device, and
-  /// blocks until every peer has said hello or cfg.connect_timeout passes.
+  /// Blocks until every peer is reached or @p cfg.connect_timeout passes. @p send and @p recv must
+  /// be allocated on the current device and outlive the fabric.
   /// @throws sirius::invalid_input_exception on a bad config.
   /// @throws sirius::internal_exception when NIXL fails, or a peer is not reached in time.
   nixl_fabric(config cfg, frame_ring& send, frame_ring& recv);
@@ -134,7 +134,8 @@ class nixl_fabric : public fabric {
   /// throws.
   void release() noexcept;
 
-  /// Receives notifications into _backlog, taking hellos out.
+  /// Receives notifications into _backlog, taking hellos out and starting each host-staged
+  /// write's copy into the receive ring (its notification waits in _landings).
   void receive();
 
   rank_t _rank;

@@ -63,8 +63,8 @@ constexpr unsigned query_stream_bits = 20;
  *
  * **Credits.** The receive ring is split evenly among the peers: each owns
  * receive frames / (world size - 1) of them, fixed at start. A sender writes only into frames it
- * holds as credits; the receiver hands a frame back once it has copied it out. There is no lane
- * set-up and no grant.
+ * holds as credits; the receiver hands a frame back once it has copied it out.
+ * TODO(#2371): grant credits on demand, so ring memory does not grow with the world size.
  *
  * **Landing.** A received batch lands on the GPU under a reservation if one is free now, else in
  * host memory. With no room in either, its frames stay in the receive ring, holding their
@@ -73,18 +73,20 @@ constexpr unsigned query_stream_bits = 20;
  * **End of stream.** close() sends the number of batches sent; the receiver calls on_end() once
  * it has delivered that many, whatever order the notifications arrived in.
  *
- * **Failure.** Fail-stop: a failed write, a malformed notification, a peer's error or a stall
- * longer than options::stall_timeout calls on_error() once, tells every peer, and ends the
- * transport; send() and close() then rethrow. A failed query is narrower: abort() tells every
- * peer, whose on_abort() ends that query's streams, and the transport carries on. So does an
- * on_batch() or on_end() that throws on the engine thread: it aborts its stream's query here and
- * on every peer.
+ * **Failure.** Fail-stop (TODO(#2373): survive a lost peer): a failed write, a malformed
+ * notification, a peer's error or a stall longer than options::stall_timeout calls on_error() once,
+ * tells every peer, and ends the transport; send() and close() then rethrow. A failed query is
+ * narrower: abort() tells every peer, whose on_abort() ends that query's streams, and the transport
+ * carries on. So does an on_batch() or on_end() that throws on the engine thread: it aborts its
+ * stream's query here and on every peer.
  *
  * One engine thread drives the fabric and calls on_batch(), on_end() and on_error() for remote
  * senders; for this rank's own batches they run on the caller's thread.
  */
 class transport {
  public:
+  /// Called from the engine thread and from send()/close() callers at the same time, so they must
+  /// be thread-safe, and must not call send() or close(): the engine thread would wait on itself.
   struct callbacks {
     /// @p batch numbers the batches of one stream from one sender, from 0, in send() order.
     std::function<void(
@@ -97,19 +99,23 @@ class transport {
   };
 
   struct options {
-    /// send() blocks while batches queued for peers hold more than this.
+    /// send() blocks while its batch would put more than this in flight to peers; a larger batch
+    /// still goes once nothing else is queued. Bounds how long senders' batches stay pinned in
+    /// the queue (they are already in GPU memory, under their producers' reservations).
     std::size_t max_queued_bytes = std::size_t{1} << 30;
+    /// How long the engine may hold work without progress before it fails: a lost peer is
+    /// fail-stop (#2373), so this bounds how long one hangs a query.
     std::chrono::milliseconds stall_timeout{std::chrono::minutes{10}};
   };
 
   /**
    * @param fabric Its rank and world size are the transport's; its writes go between @p send and
-   *        @p recv, which it registered.
+   *        @p recv, which it registered. All referenced objects must outlive the transport.
+   *        Construct on the device of @p gpu: the engine thread it starts runs on the current one.
    * @param gpu Where received batches land first, and @p host (may be null) where they land when
    *        the GPU has no room.
-   * Its streams and engine thread use the current device. @p fabric, the rings and the spaces
-   * must outlive the transport.
-   * @throws sirius::invalid_input_exception when the receive ring has fewer frames than peers.
+   * @throws sirius::invalid_input_exception when the receive ring has fewer frames than peers, or
+   *         its frames differ in size from the send ring's.
    */
   transport(fabric& fabric,
             frame_ring& send,
@@ -138,12 +144,13 @@ class transport {
   [[nodiscard]] rank_t world_size() const noexcept;
 
   /// Sends @p batch, on the GPU, to rank @p to on @p stream. Batches of one stream to one rank
-  /// may be delivered in any order.
+  /// may be delivered in any order. A batch with no rows is dropped for a peer and not counted.
   /// @throws the transport's error once it has failed.
   void send(stream_id stream, rank_t to, std::shared_ptr<cucascade::data_batch> batch);
 
-  /// No more batches of @p stream to rank @p to. Once per stream and rank: the stream's count of
-  /// batches sent to @p to goes with it.
+  /// No more batches of @p stream to rank @p to. Call once per stream and rank, after its last
+  /// send(): a second close, or a send after it, fails the transport on the peer. The stream's
+  /// count of batches sent to @p to goes with it.
   /// @throws the transport's error once it has failed.
   void close(stream_id stream, rank_t to);
 

@@ -32,8 +32,12 @@ namespace sirius::exchange {
 
 class exchange_service;
 
+/// Ring sizing: @p send_frames staging frames shared by all peers, and @p recv_frames_per_peer
+/// frames (credits) for each peer, each @p frame_bytes, a positive multiple of 256. 8 MiB frames
+/// keep NIXL writes large enough to reach link bandwidth. The sizing is fixed until credits are
+/// granted on demand (#2371).
 struct nixl_exchange_options {
-  std::size_t frame_bytes            = std::size_t{8} << 20;
+  std::size_t frame_bytes            = std::size_t{8} * 1024 * 1024;  // 8 MiB
   std::uint32_t send_frames          = 16;
   std::uint32_t recv_frames_per_peer = 8;
 };
@@ -46,7 +50,9 @@ struct nixl_exchange_options {
  * so they outlive every plan that still holds it.
  *
  * @param peers "host:port" of every rank's listener, indexed by rank.
- * @throws sirius::invalid_input_exception when Sirius was built without SIRIUS_WITH_NIXL.
+ * @throws sirius::invalid_input_exception when Sirius was built without SIRIUS_WITH_NIXL, or
+ *         SIRIUS_EXCHANGE_HOST_STAGING has an unknown value.
+ * @throws sirius::internal_exception when NIXL fails or a peer is not reached within two minutes.
  */
 [[nodiscard]] std::shared_ptr<exchange_service> make_nixl_exchange(
   rank_t rank,

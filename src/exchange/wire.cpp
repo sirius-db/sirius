@@ -42,7 +42,8 @@ using cucascade::memory::column_metadata;
 // column: i32 type | i32 rows | i32 nulls | i32 scale | u8 has mask | u64 mask offset |
 //         u64 mask size | u8 has data | u64 data offset | u64 data size | u32 n | n x column
 constexpr std::array<char, 4> magic{'S', 'X', 'E', '1'};
-constexpr std::size_t min_column_bytes = 4 * 4 + 2 * 1 + 4 * 8 + 4;
+constexpr std::size_t min_column_bytes = 4 * sizeof(std::int32_t) + 2 * sizeof(std::uint8_t) +
+                                         4 * sizeof(std::uint64_t) + sizeof(std::uint32_t);
 // STRING is the deepest column sent: one level of children.
 constexpr int max_depth = 1;
 
@@ -131,7 +132,8 @@ void require_inside(std::size_t offset, std::size_t size, std::uint64_t stream_b
   require(offset <= stream_bytes && size <= stream_bytes - offset, "buffer outside the stream");
 }
 
-/// Checks one flat buffer (a mask or data) of @p c; @p need is the bytes its type requires.
+/// Checks one flat buffer (a mask or data); @p need is the bytes its type requires, @p what the
+/// error.
 void check_buffer(bool has,
                   std::size_t offset,
                   std::size_t size,
@@ -183,6 +185,7 @@ void check_column(column_metadata const& c, std::uint64_t rows, std::uint64_t st
                  (rows + 1) * width,
                  stream_bytes,
                  "string offsets too small");
+    // The offsets' values are on the device: the last one is not checked against the chars size.
     if (c.has_data) { require_inside(c.data_offset, c.data_size, stream_bytes); }
     require(offsets.type_id == static_cast<std::int32_t>(cudf::type_id::INT64) ||
               c.data_size <= static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()),

@@ -121,7 +121,10 @@ naming the offset and size; the peer copies the bytes host-to-device into its re
 only then passes the write's own notification to the transport. Credits are unchanged: a mirror
 frame is reused only after the transport has copied its receive frame out.
 `SIRIUS_EXCHANGE_HOST_STAGING=always|never` overrides the choice (default `auto`). Each rank logs
-its path to every peer at start.
+its path to every peer at start. Staging maps the peer's mirror from this host's `/dev/shm`, so it
+works only between ranks on one host that share `/dev/shm`; ranks on several hosts, or in separate
+IPC namespaces, need `never` until #2372. A rank that crashes leaves its mirror in `/dev/shm`;
+the launchers in `scripts/` remove mirrors whose process is gone before they start.
 
 ### Operators (`src/op/sirius_physical_exchange_{sink,source}.*`)
 
@@ -272,7 +275,7 @@ NIXL is an optional build dependency, linked from an out-of-tree install:
 
 ```bash
 pixi run cmake --preset release -DSIRIUS_DUCKDB_SOURCE_DIR=$PWD/duckdb \
-  -DSIRIUS_WITH_NIXL=ON -DSIRIUS_NIXL_PREFIX=$HOME/tools/nvda_nixl
+  -DSIRIUS_WITH_NIXL=ON -DSIRIUS_NIXL_PREFIX=<NIXL install prefix>
 pixi run make
 ```
 
@@ -344,7 +347,9 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
 - **Hosts:** every run so far used one host. Ranks on several hosts, and networks without RDMA,
   are untested.
 - **Credits:** each peer gets a fixed share of the receive ring (8 frames of 8 MiB by default).
-  Clusters much larger than 8 ranks would need credits granted on demand.
+  Clusters much larger than 8 ranks would need credits granted on demand (#2371).
+- **CI:** no CI job builds with `-DSIRIUS_WITH_NIXL=ON`, so the NIXL fabric and the
+  `[exchange][nixl]` tests run only on developer machines.
 
 ## Tests
 
@@ -355,7 +360,7 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
 | `[exchange][operators]` | Hash, range, broadcast, gather, ordered gather, early arrivals, hints, failure; NULL keys to every rank; `VALUES` on rank 0 |
 | `[exchange][byte_range]` | Byte spans tile every file exactly once across ranks; one file split in two; balance by bytes |
 | `[exchange][collectives]` | All-gather; distributed `SORT_SAMPLE` on skewed and empty inputs; `SORT_SAMPLE` feeding a range exchange |
-| `[exchange][nixl]` | Two ranks in one process over NIXL (NIXL builds only) |
+| `[exchange][nixl]` | Two ranks in one process over NIXL (NIXL builds only; CI does not build NIXL yet) |
 | `[nixl_multiprocess]` (hidden) | One rank per process and GPU: `pixi run scripts/distributed_test_nixl.sh 4` |
 | `[dynamic_filter][probe]` | Merging two Blooms of one capacity |
 
