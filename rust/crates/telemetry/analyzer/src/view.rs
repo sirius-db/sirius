@@ -4,7 +4,9 @@
 use quent_analyzer::{
     AnalyzerError, AnalyzerResult, Entity, Model, RefTreeEntity,
     ref_tree::RefTreeCollection,
-    resource::{Resource, ResourceTypeDecl, collection::ResourceCollection},
+    resource::{
+        Resource, ResourceTypeDecl, collection::ResourceCollection, tree::ResourceTreeNode,
+    },
 };
 use quent_query_engine_analyzer::{QueryEngineModel, plan_tree::PlanTree};
 use quent_query_engine_ui::EntityRef;
@@ -209,6 +211,30 @@ impl<'a> SiriusModelQueryView<'a> {
             };
             parent_id = next_parent_id;
         }
+    }
+
+    /// Activity rows follow producer timestamps, independent of hash-map and UUID order.
+    /// Keep the existing ordering of shared GPU resources outside the query subtree.
+    pub(crate) fn resource_tree(&self) -> AnalyzerResult<ResourceTreeNode> {
+        fn order(node: &mut ResourceTreeNode, model: &SiriusModel, query_id: Uuid) {
+            for child in &mut node.children {
+                order(child, model, query_id);
+            }
+            if node.entity_id == query_id || model.activities.contains_key(&node.entity_id) {
+                node.children.sort_by_key(|child| {
+                    (
+                        model
+                            .activities
+                            .get(&child.entity_id)
+                            .map_or(0, Entity::earliest_timestamp),
+                        child.entity_id,
+                    )
+                });
+            }
+        }
+        let mut tree = ResourceTreeNode::try_new(self)?;
+        order(&mut tree, self.model, self.query.id());
+        Ok(tree)
     }
 
     pub(crate) fn activities(&self) -> impl Iterator<Item = &'a QueryActivity> + '_ {

@@ -162,6 +162,27 @@ class SiriusConnectionState : public ClientContextState {
   uint64_t next_query_ordinal() noexcept { return ++query_ordinal_; }
   [[nodiscard]] uint64_t current_query_ordinal() const noexcept { return query_ordinal_; }
 
+  /// Explicit callback-spanning interval, confined to this connection's invocation.
+  /// Internal metadata SQL cannot advance it. Nested outer replans pass a parent explicitly.
+  [[nodiscard]] sirius::telemetry::query_activity activity(
+    const char* phase,
+    const char* kind                                                 = "work",
+    std::optional<sirius::telemetry::query_activity::id_type> parent = std::nullopt) const noexcept
+  {
+    if (!observer_ || (is_internal_query_active() && !parent)) return {};
+    return observer_->activity(phase, kind, parent);
+  }
+  void frontend_interval(const char* phase, const char* kind = "work") noexcept
+  {
+    if (is_internal_query_active()) return;
+    end_frontend_interval();
+    frontend_interval_ = activity(phase, kind);
+  }
+  void end_frontend_interval() noexcept
+  {
+    if (!is_internal_query_active()) frontend_interval_.finish();
+  }
+
   /// \brief Start a planning generation, discarding the previous capture and decline.
   void begin_planning_attempt() noexcept
   {
@@ -311,6 +332,7 @@ class SiriusConnectionState : public ClientContextState {
  private:
   void finish_observation(const char* outcome) noexcept;
   std::shared_ptr<sirius::telemetry::query_observer> observer_;
+  sirius::telemetry::query_activity frontend_interval_;
   uint64_t planning_generation_   = 0;
   uint64_t captured_generation_   = 0;
   uint64_t declined_generation_   = 0;

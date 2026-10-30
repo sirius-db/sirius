@@ -296,6 +296,7 @@ SiriusConnectionState::~SiriusConnectionState() { finish_observation("abandoned"
 void SiriusConnectionState::finish_observation(const char* outcome) noexcept
 {
   if (auto observer = std::exchange(observer_, nullptr)) { observer->complete(outcome); }
+  frontend_interval_.finish(outcome);
 }
 
 void SiriusConnectionState::QueryBegin(ClientContext& context)
@@ -321,6 +322,7 @@ void SiriusConnectionState::QueryBegin(ClientContext& context)
         runtime->get_telemetry_context(), std::nullopt, session_label_);
       observer_->correlate(connection_id(), query_ordinal);
       observer_->planning();
+      frontend_interval("query_begin_to_pre_hook_or_end");
     }
   } catch (...) {  // Observation must not fail the query it decorates.
   }
@@ -1772,6 +1774,16 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
   }
   if (is_internal_query_active(context)) { return RebindQueryInfo::DO_NOT_REBIND; }
   auto conn_state = get_sirius_connection_state(context);
+  if (conn_state) conn_state->end_frontend_interval();
+  auto observe = [&](const char* phase,
+                     const char* kind = "work",
+                     std::optional<sirius::telemetry::query_activity::id_type> parent =
+                       std::nullopt) {
+    return conn_state ? conn_state->activity(phase, kind, parent)
+                      : sirius::telemetry::query_activity{};
+  };
+  auto finalize = observe("finalize_prepare");
+  auto setup    = observe("finalize_setup", "work", finalize.id());
 
   // If the optimizer hook captured a plan FOR THIS planning attempt, use it.
   // A generation mismatch (e.g. a leftover from Connection::ExtractPlan, which
@@ -1834,9 +1846,11 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
                                                   prepared.physical_plan->Root(), context)
                                               : sirius::transparent::plan_source_policy{{}, false};
 
+  setup.finish();
   if (!logical_plan) {
     if (current_query_sql.empty()) { return RebindQueryInfo::DO_NOT_REBIND; }
     try {
+      auto replan = observe("finalize_replan", "work", finalize.id());
       InternalQueryGuard guard(context);  // suppress recursive optimizer hooks
       duckdb::Value churn_setting;
       if (context.TryGetCurrentSetting("sirius_test_read_view_churn_path", churn_setting) &&
@@ -1856,12 +1870,18 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
         std::filesystem::copy_file(*source, destination);
       }
       Parser parser(context);
+      auto parse = observe("parse", "work", replan.id());
       parser.ParseQuery(current_query_sql);
+      parse.finish();
       if (parser.statements.size() != 1) { return RebindQueryInfo::DO_NOT_REBIND; }
       Planner planner(context);
+      auto bind = observe("bind", "work", replan.id());
       planner.CreatePlan(std::move(parser.statements[0]));
+      bind.finish();
       Optimizer optimizer(*planner.binder, context);
-      logical_plan = optimizer.Optimize(std::move(planner.plan));
+      auto optimize = observe("optimize", "work", replan.id());
+      logical_plan  = optimizer.Optimize(std::move(planner.plan));
+      optimize.finish();
     } catch (InterruptException&) {
       // Cancellation is never a fallback candidate — propagate as-is.
       throw;
@@ -1911,7 +1931,8 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     duckdb::unique_ptr<duckdb::LogicalOperator> validation_plan;
     bool plan_is_copyable = true;
     try {
-      validation_plan = sirius::transparent::copy_logical_plan(*logical_plan, context);
+      validation_plan =
+        sirius::transparent::copy_logical_plan(*logical_plan, context, finalize.id());
     } catch (NotImplementedException&) {
       plan_is_copyable = false;
     }
@@ -1919,11 +1940,16 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     // Protect pin-registry reads and GPU plan validation against maintenance. Both SQL
     // replanning and logical-plan copying must finish before entering this window.
     // Keep acquisition inside this try so runtime-unavailable errors use the fallback below.
+    auto admission = observe("planning_admission", "wait", finalize.id());
     SlotGuard plan_window(*this, context, sirius::exec::query_admission::access::planning);
+    admission.finish();
+    auto physical_views = observe("physical_read_view_capture", "work", finalize.id());
     auto physical_original_views =
       prepared.physical_plan
         ? sirius::op::scan::capture_bound_read_views(prepared.physical_plan->Root(), context)
         : std::vector<sirius::op::scan::bound_read_view>{};
+    physical_views.finish();
+    auto translation = observe("gpu_translation", "work", finalize.id());
     // Validate that the captured logical plan is GPU-translatable before we
     // install a reusable transparent execution operator for prepared statements.
     //
@@ -1952,6 +1978,9 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
       validated_sirius_plan = planner->create_plan(std::move(logical_plan));
       logical_plan.reset();  // signal PhysicalSiriusExecution to use the SQL replan path
     }
+
+    translation.finish();
+    auto validation = observe("read_view_validation", "work", finalize.id());
 
     duckdb::Value read_view_injection;
     if (context.TryGetCurrentSetting("sirius_test_inject_read_view_mismatch",
@@ -1986,6 +2015,8 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
       comparison.correspondence,
       physical_original_views);
 
+    validation.finish();
+    auto installation = observe("wrapper_installation", "work", finalize.id());
     SIRIUS_LOG_INFO("Transparent execution: Sirius physical plan generated successfully");
 
     // Stash DuckDB's CPU plan before overwriting it, wrapped in a minimal
@@ -2019,6 +2050,9 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     // Replace the DuckDB CPU physical plan.
     prepared.physical_plan = std::move(new_physical_plan);
     record_transparent_rebind_success();
+    installation.finish();
+    finalize.finish();
+    if (conn_state) conn_state->frontend_interval("wrapper_installed_to_execution", "wait");
 
     SIRIUS_LOG_INFO("Transparent execution: physical plan replaced with GPU operator");
   } catch (InterruptException&) {

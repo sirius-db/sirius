@@ -264,7 +264,8 @@ outer query UUID. Each invocation of a phase gets a fresh activity ID; optional 
 IDs describe nesting, while generation and execution-window fields correlate the
 interval with preparation and admission. They are separate from GPU tasks and operators.
 The existing viewer renders each activity as a group with its own interval lane and
-nested child groups. No Quent dependency update is needed.
+nested child groups. Activity rows follow their recorded start timestamps; repeated phases
+retain separate rows. No Quent dependency update is needed.
 
 The lane's `working` or `waiting` state runs from the recorded Started timestamp to
 Finished. Click an interval to inspect its phase, kind, correlations, and recorded
@@ -277,3 +278,82 @@ Query completion closes any remaining intervals with the available terminal outc
 DuckDB's ambiguous null-error completion remains unknown. A trace missing Finished is
 incomplete: the analyzer warns and omits that activity and its descendants rather than
 inventing a duration. Disabled telemetry skips activity allocation and emission.
+
+### Coverage and interpretation
+
+Transparent SQL records eligibility, observed work between DuckDB hooks, optimizer
+capture, finalize validation, execution admission and preparation, pipeline construction,
+runtime retirement/window cleanup, and CPU replay. Copies and intentional outer replans
+have explicit parents even while internal SQL callbacks are suppressed. Explicit
+`gpu_execution` calls also record their bind and execution-time parse/bind/optimize work.
+Streaming fragment observations start at `run()` and include execution admission;
+fragment building and input staging remain outside that invocation's coverage.
+
+`execution_preparation` ends with decision `validated_plan_reused` or `plan_rebuilt`.
+A reuse decision does not create a synthetic translation interval. Callback intervals
+are observed elapsed time, potentially including other extensions and caller latency;
+activity trees do not claim an exclusive partition of DuckDB's internal phases.
+`wrapper_installed_to_execution` is latency, not a CPU-planning measurement. The coarse
+query-list Planning field remains a phase-start offset in the pinned viewer; inspect
+activity interval lengths on the timeline for measured costs.
+
+The generated-schema fixture exercises a completed planless query with nested and
+repeated work, waits, failure, and a truncated activity. The C++ invocation test checks
+closure, parent containment and same-query ownership across CPU decline, PREPARE and
+repeated EXECUTE, invalidation, forced rebuild and SQL replan, replay and native errors,
+cancellation, abandonment, connection isolation, and disabled exporting. Existing
+admission and retirement tests continue to exercise the underlying resource barriers.
+
+Measure total telemetry overhead with the same configuration and workload, changing only
+exporting, and report warmup, repetitions, elapsed-time distribution, and event volume.
+An enabled/disabled comparison includes existing task and batch telemetry as well as the
+new activities; it does not isolate the incremental activity cost. The performance budget
+is deferred to review, so functional coverage alone does not qualify overhead.
+
+### Local validation: 2026-10-30
+
+The activity model is commit `291ad2a9`; these captures use the instrumentation in this
+change. The measured producer/analyzer snapshot (before the final analyzer-only row ordering)
+has `src`/`rust` diff SHA-256 against that base
+`b84ff02d86604fc33953deabe425cbb6507cbbd6110643bd46f6e4cb428c840b`.
+The Release build, 27 Rust store/analyzer tests, Clippy with warnings denied, formatting,
+and 11 focused GPU lifecycle cases (3,393 assertions) passed.
+
+All four default GPU shards and both CUDA fault processes passed. The first combined
+multi-GPU run passed 135/140 cases and hit five approximately 20 GB CUDA pool-allocation
+failures. All five passed in fresh individual processes. A complete lexical-order rerun
+passed all 140 multi-GPU cases, followed by all 140 late-materialization and two fused
+cases. The initial allocation failures remain a validation limitation for review.
+
+The real viewer capture contains Q9 reuse (28 activities), forced Q9 rebuild (35), a
+successful small SQL replan (35), and a named planning-only failure (4). Forced full SQL
+replanning of Q9 is refused by the existing read-view correspondence check; its 32
+activities retain that native failure. Every interval closed, nested intervals remained
+within their parents under the same query UUID, and all five timelines rendered without
+browser or API errors. The normal Q9 capture retains one execution plan per invocation.
+
+Measurements used two NVIDIA RTX A6000 GPUs (49,140 MiB each), driver 615.71.10, with
+one GPU selected by the unchanged `test/tpcds_performance/config.yaml` settings:
+Sirius scan backend and OS cache. Data was TPC-DS SF50 Parquet. Each workload ran in four
+fresh CLI processes ordered disabled/enabled/enabled/disabled, toggling Quent NDJSON
+exporting with NVTX disabled. Setup, warmup, and exporter shutdown are outside the query
+timers. Q9 used two warmups and seven measured repetitions per process; the short query,
+`SELECT sum(d_date_sk) FROM date_dim`, used five warmups and 30 measurements per process.
+Enabled runs' execution transitions confirmed every warmup and measured query executed.
+
+| Workload / telemetry | Samples | Median | Interquartile range | Min–max |
+|----------------------|---------|--------|---------------------|---------|
+| Q9 / disabled | 14 | 1.753 s | 1.711–1.788 s | 1.645–1.829 s |
+| Q9 / enabled | 14 | 1.775 s | 1.749–1.797 s | 1.735–1.811 s |
+| Short / disabled | 60 | 11 ms | 11–11 ms | 8–12 ms |
+| Short / enabled | 60 | 11 ms | 11–12 ms | 9–13 ms |
+
+The Q9 median difference was +1.23%; the overlapping distributions do not establish a
+statistically significant change. CLI timers have 1 ms resolution, so the equal short-query
+medians do not establish zero overhead. No performance budget has been accepted.
+
+Each enabled Q9 process emitted 16,314–16,402 NDJSON events (3.88–3.90 MB); each enabled
+short-query process emitted 7,453 events (1.85 MB). These volumes include setup, label
+calls, and warmups, as well as measured queries. Disabled processes emitted no records.
+The local raw samples and exact SQL/configuration are in `tmp/query-activity-overhead/`;
+the five-path viewer capture is in `tmp/query-activity-scenarios-verified/`.

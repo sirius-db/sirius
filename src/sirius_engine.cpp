@@ -118,6 +118,8 @@ sirius_engine::sirius_engine(duckdb::ClientContext& context,
 
 sirius_engine::~sirius_engine()
 {
+  auto retirement = plan_users_quiescent_ ? telemetry::query_activity{}
+                                          : observer_.activity("runtime_retirement", "wait");
   // The engine is the execution owner of the physical plan. Retire asynchronous users here,
   // including partially initialized executions, before member destruction can release operators.
   cancel_dynamic_filter_publications();
@@ -131,6 +133,7 @@ sirius_engine::~sirius_engine()
       // The registry retains the plan if retirement fails. Do not free resources whose
       // borrowers cannot be proved idle; the shutdown path retires them after worker joins.
       runtime->mark_runtime_unavailable();
+      retirement.finish("failed");
     }
   }
 }
@@ -138,6 +141,7 @@ sirius_engine::~sirius_engine()
 void sirius_engine::quiesce_plan_users()
 {
   if (plan_users_quiescent_) return;
+  auto retirement = observer_.activity("runtime_retirement", "wait");
   if (auto ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")) {
     ctx->retire_query_work(query_id_, duckdb::SiriusContext::query_retirement_mode::cancelled);
   }
@@ -213,6 +217,7 @@ void sirius_engine::initialize(duckdb::unique_ptr<op::sirius_physical_operator> 
 void sirius_engine::execute()
 {
   nvtx_scoped_range nvtx_range{"sirius::query"};
+  auto execution = observer_.activity("gpu_execution");
   observer_.executing();
 
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
@@ -267,6 +272,7 @@ void sirius_engine::execute()
       });
     if (sirius_ctx->get_runtime_health() == duckdb::SiriusContext::runtime_health::UNAVAILABLE)
       sirius_ctx->throw_runtime_unavailable();
+    auto retirement = observer_.activity("runtime_retirement", "wait", execution.id());
     sirius_ctx->retire_query_work(query_id_,
                                   duckdb::SiriusContext::query_retirement_mode::completed);
     finish_scan_preparation(sirius_physical_plan.get());
@@ -304,6 +310,7 @@ void sirius_engine::execute()
 
 void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
 {
+  auto construction   = observer_.activity("pipeline_construction");
   auto sirius_ctx_ptr = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!sirius_ctx_ptr) {
     throw invalid_input_exception(

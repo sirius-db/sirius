@@ -715,8 +715,8 @@ impl UiAnalyzer for SiriusUiAnalyzer {
 
         debug!("deriving resource tree");
         let engine = view.engine()?;
-        let resource_tree = convert_resource_tree(ResourceTreeNode::try_new(&view)?, &view)?
-            .unwrap_or_else(|| {
+        let resource_tree =
+            convert_resource_tree(view.resource_tree()?, &view)?.unwrap_or_else(|| {
                 ResourceTree::ResourceGroup(ResourceGroupNode {
                     id: EntityRef::Engine(engine.id()),
                     children: vec![],
@@ -986,7 +986,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                 let long_entities_threshold = req.long_entities_threshold_s.map(to_nanosecs);
                 let fsm_filter = req.app_params;
 
-                let resource_tree = ResourceTreeNode::try_new(&view)?;
+                let resource_tree = view.resource_tree()?;
                 let tree = resource_tree
                     .find(req.resource_group_id)
                     .ok_or(AnalyzerError::InvalidId(req.resource_group_id))?;
@@ -1136,7 +1136,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
         let view = self.model.query_view(request.app_params.query_id)?;
         // Prepare resource tree, we'll reuse this as it is potentially
         // expensive to build for every entry.
-        let resource_tree = ResourceTreeNode::try_new(&view)?;
+        let resource_tree = view.resource_tree()?;
 
         // Prepare builders, resource id filters, and operator filters, one for
         // each bulk entry. After populating this, we'll build a reverse index,
@@ -1344,7 +1344,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             .query_engine_model()
             .query_epoch(request.app_params.query_id)?;
         let view = self.model.query_view(request.app_params.query_id)?;
-        let resource_tree = ResourceTreeNode::try_new(&view)?;
+        let resource_tree = view.resource_tree()?;
 
         let n_configs = request.configs.len();
 

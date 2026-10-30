@@ -329,7 +329,9 @@ void streaming_fragment::run()
     _observer = std::make_unique<telemetry::query_observer>(sirius_ctx.get_telemetry_context(),
                                                             kFragmentQueryLabel);
     _observer->planning();
+    auto admission = _observer->activity("execution_admission", "wait");
     window.emplace(sirius_ctx, _context, kFragmentQueryLabel);
+    admission.finish();
     _observer->execution_window(window->query_id());
     if (sirius_ctx.get_scan_manager().pin_registry_epoch() != _planned_pin_epoch) {
       throw sirius::invalid_input_exception(
@@ -340,7 +342,9 @@ void streaming_fragment::run()
     _engine->initialize(std::move(_plan_root));
     _engine->execute();
     if (is_result()) { _result = _engine->get_result(); }
+    auto cleanup = _observer->activity("runtime_window_cleanup", "wait");
     window->finish();
+    cleanup.finish();
   } catch (...) {
     // Fail every output before the window closes. Otherwise a peer in wait() blocks forever.
     poison_outputs(std::current_exception());

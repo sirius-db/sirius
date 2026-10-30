@@ -1334,8 +1334,8 @@ fn nested_query_activities_render_without_execution_and_keep_repeated_phases() {
     events.push(ev(4, 10, E::Query(s::QueryEvent::Finished { seq: 1 })));
     for (n, parent, kind, start, end, outcome) in [
         (100, None, "work", 1, Some(8), "success"),
-        (102, Some(100), "wait", 2, Some(3), "success"),
-        (104, Some(100), "work", 4, Some(7), "failed"),
+        (102, Some(100), "wait", 4, Some(7), "success"),
+        (104, Some(100), "work", 2, Some(3), "failed"),
         (106, Some(100), "work", 5, None, "success"),
     ] {
         events.push(ev(
@@ -1377,6 +1377,17 @@ fn nested_query_activities_render_without_execution_and_keep_repeated_phases() {
     let bundle = analyzer.query_bundle(id(4)).unwrap();
     assert!(analyzer.model.plans.is_empty());
     assert_eq!(analyzer.model.activities.len(), 3);
+    let view = analyzer.model.query_view(id(4)).unwrap();
+    let tree = view.resource_tree().unwrap();
+    let children = &tree.find(id(100)).unwrap().children;
+    // Own interval first, then children by timestamp even when UUID order disagrees.
+    assert_eq!(
+        children
+            .iter()
+            .map(|node| node.entity_id)
+            .collect::<Vec<_>>(),
+        vec![id(101), id(104), id(102)]
+    );
     assert_eq!(
         analyzer.model.activities[&id(102)].parent_id(),
         Some(id(100))
@@ -1398,8 +1409,8 @@ fn nested_query_activities_render_without_execution_and_keep_repeated_phases() {
     assert!(bundle.entities.fsm_types.contains_key("query_activity"));
     for (n, state, duration) in [
         (100, "working", 7.0),
-        (102, "waiting", 1.0),
-        (104, "working", 3.0),
+        (102, "waiting", 3.0),
+        (104, "working", 1.0),
     ] {
         for entity_type_name in [None, Some("query_activity".into())] {
             let result = analyzer

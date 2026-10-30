@@ -199,6 +199,14 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
 
   // Lazy execution: run the GPU query on first GetData call.
   if (!state.result) {
+    if (auto connection = duckdb::get_sirius_connection_state(context.client)) {
+      connection->end_frontend_interval();
+    }
+    auto observe = [&](const char* phase,
+                       const char* kind                                         = "work",
+                       std::optional<telemetry::query_activity::id_type> parent = std::nullopt) {
+      return state.iface->observer->activity(phase, kind, parent);
+    };
     SIRIUS_LOG_INFO("Transparent GPU execution: executing query");
     if (state.sirius_context) { state.sirius_context->record_transparent_execution(); }
 
@@ -219,6 +227,7 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
     // first Fetch exposes the result, so an abandoned result holds nothing.
     std::optional<duckdb::SiriusContext::StandaloneQueryScope> window;
     try {
+      auto preparation = observe("execution_preparation");
       if (state.sirius_context) {
         state.sirius_context->observe_native_checkpoint_for_testing(context.client,
                                                                     "before_window");
@@ -234,6 +243,7 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
             !mark_unavailable.IsNull() && mark_unavailable.GetValue<bool>()) {
           state.sirius_context->mark_runtime_unavailable();
         }
+        auto admission = observe("execution_admission", "wait", preparation.id());
         window.emplace(*state.sirius_context, context.client, "transparent_execution");
         state.iface->observer->execution_window(window->query_id());
       }
@@ -294,7 +304,9 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
         SIRIUS_LOG_INFO("Transparent execution: rebuilding Sirius plan at execute ({})",
                         logical_plan_ ? "from logical plan template" : "from SQL replan");
       }
+      const bool reused = bool(sirius_plan);
       if (!sirius_plan) {
+        auto rebuild = observe("execution_rebuild", "work", preparation.id());
         if (state.sirius_context) { state.sirius_context->record_transparent_execution_rebuild(); }
         // Rebuild a fresh Sirius physical plan for this execution. DuckDB may reuse
         // the same prepared physical operator across multiple EXECUTE calls.
@@ -310,7 +322,8 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
             if (read_view_injection_stage == "execute_copy_fails") {
               throw duckdb::NotImplementedException("injected logical-plan copy failure");
             }
-            fresh_plan     = sirius::transparent::copy_logical_plan(*logical_plan_, context.client);
+            fresh_plan =
+              sirius::transparent::copy_logical_plan(*logical_plan_, context.client, rebuild.id());
             rebuild_origin = logical_plan_origin_;
           } catch (duckdb::NotImplementedException&) {
             // Drop logical_plan_ — we know it can't be copied, so future executes
@@ -322,20 +335,29 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
           // Suppress the optimizer hooks for this nested replan (the guard is a
           // no-op when Sirius has no per-connection state registered).
           duckdb::SiriusContext::InternalQueryGuard guard(context.client);
+          auto replan = observe("execution_replan", "work", rebuild.id());
           duckdb::Parser parser(context.client);
+          auto parse = observe("parse", "work", replan.id());
           parser.ParseQuery(query_sql_);
+          parse.finish();
           if (parser.statements.size() != 1) {
             throw duckdb::ExecutorException(
               "Transparent GPU execution: replan expected exactly one statement");
           }
           duckdb::Planner duckdb_planner(context.client);
+          auto bind = observe("bind", "work", replan.id());
           duckdb_planner.CreatePlan(std::move(parser.statements[0]));
+          bind.finish();
           duckdb::Optimizer optimizer(*duckdb_planner.binder, context.client);
-          fresh_plan = optimizer.Optimize(std::move(duckdb_planner.plan));
+          auto optimize = observe("optimize", "work", replan.id());
+          fresh_plan    = optimizer.Optimize(std::move(duckdb_planner.plan));
         }
+        auto translation = observe("gpu_translation", "work", rebuild.id());
         sirius::planner::sirius_physical_plan_generator planner(
           context.client, {{sirius::value_of(window->query_id())}, 0});
         sirius_plan = planner.create_plan(std::move(fresh_plan));
+        translation.finish();
+        auto validation = observe("read_view_validation", "work", rebuild.id());
         if (read_view_injection_stage == "execute") {
           planner.read_views->inject_mismatch_for_testing(false);
         }
@@ -377,6 +399,8 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
           throw duckdb::ExecutorException("injected transparent GPU failure: " + inject.ToString());
         }
       }
+
+      preparation.finish("success", reused ? "validated_plan_reused" : "plan_rebuilt");
 
       // Execute via the standard sirius_interface path.
       state.result = state.iface->sirius_execute_query(
@@ -425,6 +449,7 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
       non_rollbackable_state = window->non_rollbackable_state();
       if (gpu_failed && state.sirius_context)
         state.sirius_context->record_late_failure(failure.cause);
+      auto cleanup = observe("runtime_window_cleanup", "wait");
       window->finish();
       lease_release = window->lease_release();
       window.reset();
@@ -517,8 +542,10 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
       // TARGET executing connection's state.
       state.iface->observer->cpu_replay();
       duckdb::SiriusContext::CpuFallbackGuard fallback_guard(context.client);
+      auto replay = observe("cpu_replay");
       state.result =
         run_cpu_fallback_plan(context.client, *cpu_fallback_prepared_, state.cpu_executor);
+      if (state.result->HasError()) replay.finish("failed");
     }
 
     SIRIUS_LOG_INFO("Transparent GPU execution: query completed");

@@ -37,6 +37,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -714,6 +715,12 @@ TEST_CASE("outer query observations cover CPU, prepared execution, replay and co
     // Force catalog invalidation and a fresh planning generation on the reused statement.
     ok("ALTER TABLE numbers ADD COLUMN extra INTEGER DEFAULT 1");
     execution_ids.push_back(run(con, "EXECUTE telemetry_prepared", "gpu", true));
+    ok("SET sirius_test_inject_pin_registry_change = true");
+    run(con, "SELECT sum(i) FROM numbers", "gpu", true);
+    ok("SET sirius_test_inject_pin_registry_change = false");
+    ok("SET sirius_test_inject_read_view_mismatch = 'execute_copy_fails'");
+    run(con, "SELECT sum(i) FROM numbers", "gpu", true);
+    ok("SET sirius_test_inject_read_view_mismatch = 'off'");
     auto prepared = con.Prepare("SELECT sum(i) FROM numbers");
     REQUIRE_FALSE(prepared->HasError());
     REQUIRE_FALSE(state->query_observer());
@@ -833,8 +840,57 @@ TEST_CASE("outer query observations cover CPU, prepared execution, replay and co
   REQUIRE(prepare_id != execution_ids[0]);
   REQUIRE(execution_ids[0] != execution_ids[1]);
   REQUIRE(execution_ids[1] != execution_ids[2]);
+  auto const activities = read_all_telemetry_lines(output, "QueryActivity");
+  std::map<std::string, std::pair<uint64_t, uint64_t>> activity_times;
+  std::map<std::string, std::string> activity_queries;
+  for (auto const& line : activities) {
+    auto const id_offset        = line.find("\"id\":\"") + 6;
+    auto const id               = line.substr(id_offset, 36);
+    auto const timestamp_offset = line.find("\"timestamp\":") + 12;
+    auto const timestamp        = std::stoull(line.substr(timestamp_offset));
+    auto& times                 = activity_times[id];
+    if (line.find("\"Started\"") != std::string::npos) {
+      REQUIRE(times.first == 0);
+      times.first             = timestamp;
+      auto const query_offset = line.find("\"query_id\":{\"target\":\"") + 22;
+      activity_queries[id]    = line.substr(query_offset, 36);
+    } else {
+      REQUIRE(times.second == 0);
+      times.second = timestamp;
+    }
+  }
+  REQUIRE_FALSE(activity_times.empty());
+  REQUIRE(any_line_with_all(activities, {"validated_plan_reused"}));
+  REQUIRE(any_line_with_all(activities, {"plan_rebuilt"}));
+  REQUIRE(any_line_with_all(activities, {"execution_rebuild"}));
+  REQUIRE(any_line_with_all(activities, {"execution_replan"}));
+  for (auto const& [id, times] : activity_times) {
+    CAPTURE(id);
+    REQUIRE(times.first > 0);
+    REQUIRE(times.second >= times.first);
+  }
+  for (auto const& line : activities) {
+    auto const parent_key = std::string{"\"parent_activity_id\":{\"target\":\""};
+    auto const pos        = line.find(parent_key);
+    if (pos == std::string::npos) continue;
+    auto const child  = line.substr(line.find("\"id\":\"") + 6, 36);
+    auto const parent = line.substr(pos + parent_key.size(), 36);
+    REQUIRE(activity_queries.at(child) == activity_queries.at(parent));
+    REQUIRE(activity_times.at(parent).first <= activity_times.at(child).first);
+    REQUIRE(activity_times.at(parent).second >= activity_times.at(child).second);
+  }
   for (auto const& query : expected) {
     CAPTURE(query.id, query.disposition, query.ordinal);
+    auto const starts = lines_for_query(output, "QueryActivity", query.id);
+    REQUIRE_FALSE(starts.empty());
+    if (query.executed) {
+      REQUIRE(any_line_with_all(starts, {"pipeline_construction"}));
+      REQUIRE(any_line_with_all(starts, {"gpu_execution"}));
+      REQUIRE(any_line_with_all(starts, {"runtime_retirement", "wait"}));
+      REQUIRE(any_line_with_all(starts, {"execution_preparation"}));
+      REQUIRE(any_line_with_all(starts, {"execution_admission", "wait"}));
+    }
+    if (query.disposition == "gpu_to_cpu") REQUIRE(any_line_with_all(starts, {"cpu_replay"}));
     auto const lifecycle = lines_for_query(output, "Query", query.id);
     REQUIRE(lifecycle.size() == (query.executed ? 4 : 3));
     REQUIRE(any_line_with_all(lifecycle, {"Init"}));
