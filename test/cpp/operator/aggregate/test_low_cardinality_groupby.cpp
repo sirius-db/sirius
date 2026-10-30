@@ -202,3 +202,38 @@ TEST_CASE("low-cardinality group-by declines inputs it does not handle",
     CHECK(run(input.table->view(), {2}, {Kind::SUM}, {3}) == nullptr);
   }
 }
+
+TEST_CASE("low-cardinality group-by declines an INT64 SUM that overflows INT64",
+          "[aggregate][low_cardinality]")
+{
+  // Each value fits the 64-bit per-warp partial sums, but 1000 of them exceed INT64.
+  constexpr int num_rows = 1'000;
+  auto const make_table  = [](int64_t value) {
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(
+      vector_to_cudf_column<gpu_type_traits<string_tag>>(std::vector<std::string>(num_rows, "A")));
+    columns.push_back(
+      vector_to_cudf_column<gpu_type_traits<int64_t>>(std::vector<int64_t>(num_rows, value)));
+    return std::make_unique<cudf::table>(std::move(columns));
+  };
+
+  SECTION("a total within INT64 is kept")
+  {
+    int64_t const value = int64_t{1} << 40;
+    auto const table    = make_table(value);
+    auto result         = run(table->view(), {0}, {Kind::SUM}, {1});
+    REQUIRE(result != nullptr);
+    CHECK(result->get_column(1).type() == cudf::data_type{cudf::type_id::INT64});
+    CHECK(to_host<int64_t>(result->get_column(1)) == std::vector<int64_t>{value * num_rows});
+  }
+  SECTION("a total beyond INT64 is declined")
+  {
+    auto const table = make_table(int64_t{1} << 56);
+    CHECK(run(table->view(), {0}, {Kind::SUM}, {1}) == nullptr);
+  }
+  SECTION("a total below INT64 is declined")
+  {
+    auto const table = make_table(-(int64_t{1} << 56));
+    CHECK(run(table->view(), {0}, {Kind::SUM}, {1}) == nullptr);
+  }
+}

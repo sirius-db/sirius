@@ -25,6 +25,7 @@
 
 #include <rmm/device_uvector.hpp>
 
+#include <cuda/std/limits>
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
@@ -266,14 +267,26 @@ __global__ void combine_kernel(__int128_t const* block_totals,
   if (threadIdx.x == 0) { slot_totals[blockIdx.x] = partial[0]; }
 }
 
-/// Copies one output column's per-group values out of the slot totals.
+/// Copies one output column's per-group values out of the slot totals, raising @p overflow_flag
+/// when a total does not fit in Output.
 template <typename Output>
-__global__ void extract_kernel(
-  __int128_t const* slot_totals, int num_groups, int slot_stride, int column_slot, Output* output)
+__global__ void extract_kernel(__int128_t const* slot_totals,
+                               int num_groups,
+                               int slot_stride,
+                               int column_slot,
+                               Output* output,
+                               int* overflow_flag)
 {
   int const group = blockIdx.x * blockDim.x + threadIdx.x;
   if (group < num_groups) {
-    output[group] = static_cast<Output>(slot_totals[group * slot_stride + column_slot]);
+    __int128_t const total = slot_totals[group * slot_stride + column_slot];
+    if constexpr (sizeof(Output) < sizeof(__int128_t)) {
+      if (total > cuda::std::numeric_limits<Output>::max() ||
+          total < cuda::std::numeric_limits<Output>::lowest()) {
+        atomicOr(overflow_flag, 1);
+      }
+    }
+    output[group] = static_cast<Output>(total);
   }
 }
 
@@ -513,20 +526,27 @@ std::unique_ptr<cudf::table> try_low_cardinality_groupby(
         num_groups,
         slot_stride,
         aggregate_slot[agg_idx],
-        output->mutable_view().data<__int128_t>());
+        output->mutable_view().data<__int128_t>(),
+        flags.data() + 1);
     } else {
       extract_kernel<int64_t>
         <<<extract_blocks, block_size, 0, stream.value()>>>(slot_totals.data(),
                                                             num_groups,
                                                             slot_stride,
                                                             aggregate_slot[agg_idx],
-                                                            output->mutable_view().data<int64_t>());
+                                                            output->mutable_view().data<int64_t>(),
+                                                            flags.data() + 1);
     }
     check_cuda(cudaGetLastError());
     output_columns.push_back(std::move(output));
   }
-  // The device buffers above are freed on return; make sure their last readers have finished.
+  // An INT64 SUM whose total does not fit in INT64 falls back to the general path, which widens
+  // it or matches cuDF's semantics. The synchronize also keeps the device buffers above alive
+  // until their last readers have finished.
+  check_cuda(cudaMemcpyAsync(
+    host_flags.data() + 1, flags.data() + 1, sizeof(int), cudaMemcpyDeviceToHost, stream.value()));
   stream.synchronize();
+  if (host_flags[1] != 0) { return nullptr; }
   return std::make_unique<cudf::table>(std::move(output_columns));
 }
 
