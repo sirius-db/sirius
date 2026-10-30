@@ -960,6 +960,16 @@ Five further `SIRIUS_EXP_LATE_MAT_*` knobs tune the deferral floors and the coun
 path; see [Late Materialization](late-materialization.md#turning-it-on-experimental) for the full
 gate table, the mechanism, and results.
 
+### Grouped Aggregation (experimental)
+
+Off by default, and gated by an environment variable rather than `sirius_config`/`SET`, like late materialization. The path applies only to batches it can handle and falls back to cuDF's group-by for anything else, so the variable never changes query results.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SIRIUS_EXP_LOWCARD_GROUPBY` | off | Grouped aggregation with at most 64 groups over one or two one-character string keys uses a dedicated kernel instead of cuDF's hash group-by. Set to `1` to enable; any other value leaves it off. |
+
+See [Low-Cardinality Grouped Aggregation](optimizations.md#low-cardinality-grouped-aggregation-experimental) for the mechanism and its measured effect.
+
 ### Runtime Data Size Estimation
 
 Runtime estimation projects the total bytes that will reach an input port from measured upstream
