@@ -47,9 +47,16 @@ std::shared_ptr<exchange_service> distributed_session::service(
     }
   }
   auto connected = connect();
-  std::lock_guard lock{_mutex};
-  _service  = connected;
-  _settings = wanted;
+  std::vector<std::pair<std::uint64_t, std::uint64_t>> skipped;
+  {
+    std::lock_guard lock{_mutex};
+    _service  = connected;
+    _settings = wanted;
+    skipped   = std::exchange(_skipped_before_connect, {});
+  }
+  for (auto const& [first, last] : skipped) {
+    connected->forget_range(first, last);
+  }
   return connected;
 }
 
@@ -61,14 +68,23 @@ std::shared_ptr<exchange_service> distributed_session::service() const
 
 void distributed_session::set_service_for_testing(std::shared_ptr<exchange_service> service)
 {
-  std::lock_guard lock{_mutex};
-  _service = std::move(service);
-  _settings.reset();
+  std::vector<std::pair<std::uint64_t, std::uint64_t>> skipped;
+  std::shared_ptr<exchange_service> connected;
+  {
+    std::lock_guard lock{_mutex};
+    _service = std::move(service);
+    _settings.reset();
+    connected = _service;
+    if (connected) { skipped = std::exchange(_skipped_before_connect, {}); }
+  }
+  for (auto const& [first, last] : skipped) {
+    connected->forget_range(first, last);
+  }
 }
 
-std::uint64_t distributed_session::next_query(std::uint64_t connection)
+std::uint64_t distributed_session::next_query(std::uint64_t connection, std::uint64_t assigned)
 {
-  std::lock_guard lock{_mutex};
+  std::unique_lock lock{_mutex};
   if (!_connection) { _connection = connection; }
   if (*_connection != connection) {
     throw sirius::invalid_input_exception(
@@ -77,7 +93,37 @@ std::uint64_t distributed_session::next_query(std::uint64_t connection)
       *_connection,
       connection);
   }
-  return ++_queries;
+  if (assigned != 0 && assigned == _queries) {
+    throw sirius::invalid_input_exception(
+      "distributed query {} was already planned on this rank, and its plan must be rebuilt; "
+      "retry the statement, which numbers it again",
+      assigned);
+  }
+  if (assigned != 0 && assigned < _queries) {
+    throw sirius::invalid_input_exception(
+      "sirius_distributed_query_id {} must exceed the last distributed query, {}",
+      assigned,
+      _queries);
+  }
+  auto const query = assigned != 0 ? assigned : _queries + 1;
+  if (query >= distributed_query_limit) {
+    throw sirius::invalid_input_exception(
+      "distributed query {} is not below {}", query, distributed_query_limit);
+  }
+  // This rank never hands out the numbers between the last one and this one.
+  auto const skipped_first = _queries + 1;
+  std::shared_ptr<exchange_service> service;
+  if (query > skipped_first) {
+    if (_service) {
+      service = _service;
+    } else {
+      _skipped_before_connect.emplace_back(skipped_first, query - 1);
+    }
+  }
+  _queries = query;
+  lock.unlock();
+  if (service) { service->forget_range(skipped_first, query - 1); }
+  return query;
 }
 
 void distributed_session::release_connection(std::uint64_t connection)

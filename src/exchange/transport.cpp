@@ -630,10 +630,10 @@ void transport::cancel(distributed_query_id query)
   _room.notify_all();
 }
 
-void transport::forget(distributed_query_id query)
+void transport::forget(distributed_query_id first, distributed_query_id last)
 {
   std::lock_guard lock{_mutex};
-  _cancelled.erase(query);
+  _cancelled.erase(_cancelled.lower_bound(first), _cancelled.upper_bound(last));
 }
 
 void transport::run()

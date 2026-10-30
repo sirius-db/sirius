@@ -851,8 +851,13 @@ class SiriusContext : public ClientContextState {
   /// connection's execution window. Every rank runs the same statements, so the same query gets
   /// the same number, and its exchanges the same stream ids. That holds for one statement stream
   /// only, so one connection per process runs distributed queries.
-  /// @throws sirius::invalid_input_exception when another connection already runs them.
-  [[nodiscard]] uint64_t next_distributed_query(ClientContext& context);
+  /// @param assigned Nonzero: the number to use, chosen by whoever sends every rank its
+  /// statements (`sirius_distributed_query_id`). Gaps are fine: the numbers skipped here are
+  /// retired at once, since this rank never hands them out.
+  /// @throws sirius::invalid_input_exception when another connection already runs them, or
+  /// when @p assigned does not exceed the last number used (a plan rebuilt within the statement
+  /// that numbered it).
+  [[nodiscard]] uint64_t next_distributed_query(ClientContext& context, uint64_t assigned = 0);
 
   /// \brief @p context is closing: if it runs distributed queries, the next connection to plan
   /// one takes over, and numbering continues where it stopped.

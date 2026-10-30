@@ -1291,10 +1291,10 @@ sirius::exchange::distributed_session& SiriusContext::distributed_session_for_us
   return *distributed_owner_;
 }
 
-uint64_t SiriusContext::next_distributed_query(ClientContext& context)
+uint64_t SiriusContext::next_distributed_query(ClientContext& context, uint64_t assigned)
 {
   // The connection state is read outside the session's lock, which never nests DuckDB's.
-  auto const query = distributed_session_for_use().next_query(context.GetConnectionId());
+  auto const query = distributed_session_for_use().next_query(context.GetConnectionId(), assigned);
   if (auto state = get_sirius_connection_state(context)) {
     if (state->active_window != 0) {
       distributed()->tie(state->active_window, query);

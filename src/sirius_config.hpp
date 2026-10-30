@@ -249,6 +249,10 @@ struct operator_params {
   /// Distributed execution: whether the exchange host-stages its writes to peers.
   exchange::host_staging exchange_host_staging = exchange::host_staging::automatic;
 
+  /// Nonzero: the number of the next distributed query, set by a gateway that numbers every
+  /// rank's queries. Must increase; zero numbers queries per process.
+  uint64_t distributed_query_id = 0;
+
   /// More than one rank: plans are split across processes and exchange rows.
   [[nodiscard]] bool distributed() const noexcept { return exchange_peers.size() > 1; }
 
