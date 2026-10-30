@@ -222,7 +222,9 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
   const duckdb::vector<std::unique_ptr<sirius::ast::node>>& expressions);
 
 /// Whether @p keys is in ascending order with nulls last, i.e. valid input for
-/// `cudf::sorted::YES` with `cudf::null_order::AFTER`. Synchronizes @p stream.
+/// `cudf::sorted::YES` with `cudf::null_order::AFTER`. Null-free fixed-width integer, boolean,
+/// timestamp, duration and fixed-point columns take one typed pass that stops at the first
+/// descent; every other column uses `cudf::is_sorted`. Synchronizes @p stream.
 bool keys_ascending(cudf::column_view const& keys, ::cuda::stream_ref stream);
 
 }  // namespace op
