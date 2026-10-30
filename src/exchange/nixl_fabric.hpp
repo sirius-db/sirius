@@ -130,6 +130,9 @@ class nixl_fabric : public fabric {
   /// Maps rank @p r's receive mirror and registers it with CUDA.
   void map_mirror(rank_t r);
   CUevent_st* take_event();
+  /// Frees what the constructor acquired so far: for the destructor, and a constructor that
+  /// throws.
+  void release() noexcept;
 
   /// Receives notifications into _backlog, taking hellos out.
   void receive();

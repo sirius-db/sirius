@@ -20,6 +20,7 @@
 #include "catch.hpp"
 #include "exchange/nixl_fabric.hpp"
 #include "exchange/transport_test_utils.hpp"
+#include "sirius/exception.hpp"
 
 #include <cudf/copying.hpp>
 
@@ -32,6 +33,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <random>
@@ -165,6 +167,19 @@ TEST_CASE("two ranks in one process exchange batches through host staging", "[ex
   send_all(*r1->t, {1, 2}, 2, 20'000);
   check_all(r0->got, 0, 2, {1, 2}, 2, 20'000);
   check_all(r1->got, 1, 2, {1, 2}, 2, 20'000);
+}
+
+TEST_CASE("a fabric that cannot reach its peer leaves nothing in /dev/shm", "[exchange][nixl]")
+{
+  nixl_fabric::config cfg{
+    0, {"127.0.0.1:" + std::to_string(free_port()), "127.0.0.1:" + std::to_string(free_port())}};
+  cfg.connect_timeout = std::chrono::milliseconds{500};
+  cfg.staging         = nixl_fabric::host_staging::always;
+  frame_ring send(4, 64 * KiB);
+  frame_ring recv(4, 64 * KiB);
+  auto const mirror = "/dev/shm/sirius-exchange-" + std::to_string(::getpid()) + "-0";
+  CHECK_THROWS_AS(nixl_fabric(cfg, send, recv), sirius::internal_exception);
+  CHECK_FALSE(std::filesystem::exists(mirror));
 }
 
 TEST_CASE("one rank per process exchanges batches over NIXL", "[.][nixl_multiprocess]")

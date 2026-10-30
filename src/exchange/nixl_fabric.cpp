@@ -23,6 +23,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include <absl/cleanup/cleanup.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -110,7 +111,11 @@ std::byte* map_shared(std::string const& name, std::size_t bytes, bool create)
     throw sirius::internal_exception(
       "exchange: mapping {} ({} bytes) failed: {}", name, bytes, std::strerror(errno));
   }
-  RMM_CUDA_TRY(cudaHostRegister(at, bytes, cudaHostRegisterPortable));
+  if (auto const status = cudaHostRegister(at, bytes, cudaHostRegisterPortable);
+      status != cudaSuccess) {
+    ::munmap(at, bytes);
+    RMM_CUDA_TRY(status);
+  }
   return static_cast<std::byte*>(at);
 }
 
@@ -193,6 +198,10 @@ nixl_fabric::nixl_fabric(config cfg, frame_ring& send, frame_ring& recv)
     _rank_of[p.agent] = r;
   }
 
+  require_free_port(_peers[_rank].port);
+  // A destructor does not run for a constructor that throws, and a peer starting late is enough
+  // to throw: the mirror would stay in /dev/shm.
+  absl::Cleanup release_on_throw = [this] { release(); };
   RMM_CUDA_TRY(cudaStreamCreateWithFlags(&_d2h, cudaStreamNonBlocking));
   RMM_CUDA_TRY(cudaStreamCreateWithFlags(&_h2d, cudaStreamNonBlocking));
   char bus_id[20] = {};
@@ -205,7 +214,6 @@ nixl_fabric::nixl_fabric(config cfg, frame_ring& send, frame_ring& recv)
     _mirror      = map_shared(_mirror_name, _recv.bytes(), true);
   }
 
-  require_free_port(_peers[_rank].port);
   // UCX parses its global configuration unsafely: two backends created at once in one process
   // can read a garbled setting and fail.
   static std::mutex creating;
@@ -299,6 +307,7 @@ nixl_fabric::nixl_fabric(config cfg, frame_ring& send, frame_ring& recv)
                     p.pci_bus_id,
                     p.staged ? "host-staged through pinned shared memory" : "NIXL");
   }
+  std::move(release_on_throw).Cancel();
 }
 
 nixl_fabric::host_staging nixl_fabric::staging_from_env()
@@ -333,13 +342,26 @@ CUevent_st* nixl_fabric::take_event()
   return e;
 }
 
-nixl_fabric::~nixl_fabric()
+nixl_fabric::~nixl_fabric() { release(); }
+
+void nixl_fabric::release() noexcept
 {
-  for (auto& [id, req] : _writes) {
-    static_cast<void>(_agent->releaseXferReq(req));
+  if (_agent) {
+    // A write still in flight reads the send ring: give it a moment before deregistering.
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds{1};
+    for (auto& [id, req] : _writes) {
+      while (_agent->getXferStatus(req) == NIXL_IN_PROG &&
+             std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::microseconds{100});
+      }
+      if (auto const s = _agent->releaseXferReq(req); s != NIXL_SUCCESS) {
+        SIRIUS_LOG_WARN(
+          "exchange NIXL: releasing write {} failed: {}", id, nixlEnumStrings::statusStr(s));
+      }
+    }
+    static_cast<void>(_agent->deregisterMem(ring_descs(_send, _device)));
+    static_cast<void>(_agent->deregisterMem(ring_descs(_recv, _device)));
   }
-  static_cast<void>(_agent->deregisterMem(ring_descs(_send, _device)));
-  static_cast<void>(_agent->deregisterMem(ring_descs(_recv, _device)));
   // Copies still in flight read or write the mirrors: let them finish first.
   if (_d2h != nullptr) { static_cast<void>(cudaStreamSynchronize(_d2h)); }
   if (_h2d != nullptr) { static_cast<void>(cudaStreamSynchronize(_h2d)); }
