@@ -706,8 +706,9 @@ lookup_outcome lookup_connector_classified_impl(Function const& function,
         if (entry.function_name == "seq_scan" || entry.function_name == "parquet_scan" ||
             entry.function_name == "read_parquet") {
           requirement =
-            "An external DuckDB host must export "
-            "TableScanFunction::GetFunction and duckdb_extension_parquet_describe.";
+            "An external DuckDB host must provide TableScanFunction::GetFunction and "
+            "duckdb_extension_parquet_describe through its dynamic exports or its static "
+            "symbol table (a stripped host has neither).";
         }
         SIRIUS_LOG_WARN(
           "GPU scan source '{}' has no trusted reference definition; GPU lowering "
