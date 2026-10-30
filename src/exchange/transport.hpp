@@ -76,7 +76,9 @@ constexpr unsigned query_stream_bits = 20;
  * **Failure.** Fail-stop: a failed write, a malformed notification, a peer's error or a stall
  * longer than options::stall_timeout calls on_error() once, tells every peer, and ends the
  * transport; send() and close() then rethrow. A failed query is narrower: abort() tells every
- * peer, whose on_abort() ends that query's streams, and the transport carries on.
+ * peer, whose on_abort() ends that query's streams, and the transport carries on. So does an
+ * on_batch() or on_end() that throws on the engine thread: it aborts its stream's query here and
+ * on every peer.
  *
  * One engine thread drives the fabric and calls on_batch(), on_end() and on_error() for remote
  * senders; for this rank's own batches they run on the caller's thread.

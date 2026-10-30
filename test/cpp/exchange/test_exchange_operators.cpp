@@ -42,6 +42,7 @@
 #include <chrono>
 #include <memory>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -477,6 +478,39 @@ TEST_CASE("an aborted query fails its streams on every rank, and only its stream
   sirius_physical_exchange_source late(
     key_value_types(), 0, c.all[1].service, aborted + 1, {0, 1}, false);
   CHECK_THROWS(late.get_next_task_input_data());
+}
+
+TEST_CASE("a receiver that throws aborts its query on every rank, and the next query runs",
+          "[exchange][operators]")
+{
+  struct throwing : sirius::exchange::inbound {
+    void on_batch(rank_t, std::uint64_t, std::shared_ptr<cucascade::data_batch>) override
+    {
+      throw std::runtime_error("receiver failed");
+    }
+    void on_end(rank_t) override {}
+    void on_error(std::exception_ptr) override {}
+  };
+  ranks c(2);
+  using sirius::exchange::query_stream_bits;
+  stream_id const failing = (std::uint64_t{1} << query_stream_bits) | 1;
+  stream_id const next    = (std::uint64_t{2} << query_stream_bits) | 1;
+  c.all[1].service->attach(failing, std::make_shared<throwing>());
+  sirius_physical_exchange_source here(
+    key_value_types(), 0, c.all[0].service, failing + 1, {0, 1}, false);
+  c.all[0].service->send(failing, 1, key_value_batch(0, 0));
+  auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds{30};
+  while (here.get_next_task_hint()->hint != sirius::op::TaskCreationHint::READY) {
+    REQUIRE(std::chrono::steady_clock::now() < deadline);
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+  }
+  CHECK_THROWS_WITH(here.get_next_task_input_data(),
+                    Catch::Matchers::ContainsSubstring("failed on rank 1: receiver failed"));
+
+  sirius_physical_exchange_source source(key_value_types(), 0, c.all[1].service, next, {0}, false);
+  c.all[0].service->send(next, 1, key_value_batch(0, 1));
+  c.all[0].service->close(next, 1);
+  CHECK(flat(drain(source)).size() == rows_per_batch);
 }
 
 TEST_CASE("a failed exchange fails the next task of its sources", "[exchange][operators]")
