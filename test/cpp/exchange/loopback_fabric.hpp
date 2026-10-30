@@ -76,7 +76,8 @@ class loopback_hub {
     {
       _stream.synchronize_no_throw();
       for (auto& [id, w] : _writes) {
-        static_cast<void>(cudaEventDestroy(w.done));
+        // A failed write has no event: destroying null would leave an error for the next check.
+        if (w.done != nullptr) { static_cast<void>(cudaEventDestroy(w.done)); }
       }
     }
 

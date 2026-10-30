@@ -157,6 +157,19 @@ TEST_CASE("a failed write fails the sender and its peer", "[exchange][transport]
   CHECK_THROWS(c.ranks[1].t->close(3, 0));
 }
 
+TEST_CASE("a failed transport frees the batches it held before reporting", "[exchange][transport]")
+{
+  // About 1 MiB: 16 frames of 64 KiB, more than the 4 send frames, so the batch is still held
+  // when the first write fails.
+  cluster c(2, 4, 4, {.fail_after_writes = 0}, env().host);
+  auto& sender           = *c.ranks[0].t;
+  stream_id const stream = (stream_id{5} << sirius::exchange::query_stream_bits) | 1;
+  sender.send(stream, 1, gpu_batch(sample_table(30'000)));
+  auto& got = *c.ranks[0].got;
+  REQUIRE(got.wait_for([&] { return got.error != nullptr; }));
+  CHECK(sender.wait_sent(5, std::chrono::seconds{5}));
+}
+
 TEST_CASE("exchange messages round-trip and refuse malformed bytes", "[exchange][transport]")
 {
   using namespace sirius::exchange;
