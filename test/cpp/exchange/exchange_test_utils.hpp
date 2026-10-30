@@ -115,7 +115,7 @@ inline std::unique_ptr<cudf::column> numeric_column(cudf::data_type type,
   return column;
 }
 
-/// INT64s, nullable INT32s, DECIMAL(38,2) and strings.
+/// INT64s, then nullable INT32s, DECIMAL(38,2)s and strings.
 inline std::unique_ptr<cudf::table> sample_table(std::size_t rows)
 {
   auto stream = utils::default_stream();
@@ -134,7 +134,9 @@ inline std::unique_ptr<cudf::table> sample_table(std::size_t rows)
   columns.push_back(numeric_column(cudf::data_type{cudf::type_id::INT32}, small));
   null_every_seventh(*columns.back(), stream);
   columns.push_back(numeric_column(cudf::data_type{cudf::type_id::DECIMAL128, -2}, amounts));
+  null_every_seventh(*columns.back(), stream);
   columns.push_back(utils::make_string_column(flags, stream, utils::get_resource_ref(*env().gpu)));
+  null_every_seventh(*columns.back(), stream);
   return std::make_unique<cudf::table>(std::move(columns));
 }
 

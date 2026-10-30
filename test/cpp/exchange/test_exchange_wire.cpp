@@ -21,13 +21,18 @@
 #include "operator/operator_test_utils.hpp"
 #include "sirius/exception.hpp"
 
+#include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/table/table.hpp>
 
+#include <rmm/device_buffer.hpp>
+
 #include <cstdint>
 #include <cstring>
+#include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -111,6 +116,10 @@ constexpr std::size_t stream_at = 12;
 constexpr std::size_t body_at   = 20;
 // Within the first column, after the u32 column count.
 constexpr std::size_t first_type_at = body_at + 4;
+// Past its four i32s: type, rows, nulls, scale.
+constexpr std::size_t first_has_mask_at = first_type_at + 16;
+// Past its mask and data: two u8 flags, four u64s.
+constexpr std::size_t first_children_at = first_has_mask_at + 34;
 
 }  // namespace
 
@@ -218,6 +227,105 @@ TEST_CASE("exchange headers refuse what they cannot rebuild", "[exchange][wire]"
     b.columns[1].children[0].children.push_back(int64_column(0));
     refuse(encode_header(b), "nest too deep");
   }
+  SECTION("a flag that is not 0 or 1")
+  {
+    auto bytes = good;
+    poke<std::uint8_t>(bytes, first_has_mask_at, 2);
+    refuse(bytes, "flag is not 0 or 1");
+  }
+  SECTION("a forged child count")
+  {
+    auto bytes = good;
+    poke<std::uint32_t>(bytes, first_children_at, 1000);
+    refuse(bytes, "child count out of range");
+  }
+  SECTION("no columns")
+  {
+    auto b = columns_batch();
+    b.columns.clear();
+    refuse(encode_header(b), "column count out of range");
+  }
+  SECTION("more rows than string offsets can count")
+  {
+    auto b = columns_batch();
+    b.rows = std::numeric_limits<std::int32_t>::max();
+    refuse(encode_header(b), "row count out of range");
+  }
+  SECTION("a type id out of range")
+  {
+    auto b               = columns_batch();
+    b.columns[0].type_id = static_cast<std::int32_t>(cudf::type_id::NUM_TYPE_IDS);
+    refuse(encode_header(b), "type id out of range");
+  }
+  SECTION("more nulls than rows")
+  {
+    auto b                  = columns_batch();
+    b.columns[0].null_count = static_cast<std::int32_t>(rows + 1);
+    refuse(encode_header(b), "null count out of range");
+  }
+  SECTION("a scale on a type that is not fixed-point")
+  {
+    auto b             = columns_batch();
+    b.columns[0].scale = -2;
+    refuse(encode_header(b), "scale on a type that is not fixed-point");
+  }
+  SECTION("a fixed-width column with rows and no data")
+  {
+    auto b                = columns_batch();
+    b.columns[0].has_data = false;
+    refuse(encode_header(b), "data too small");
+  }
+  SECTION("a fixed-width column with children")
+  {
+    auto b = columns_batch();
+    b.columns[0].children.push_back(int64_column(0));
+    refuse(encode_header(b), "a fixed-width column has children");
+  }
+  SECTION("STRING offsets neither INT32 nor INT64")
+  {
+    auto b                           = columns_batch();
+    b.columns[1].children[0].type_id = static_cast<std::int32_t>(cudf::type_id::INT16);
+    refuse(encode_header(b), "not INT32 or INT64");
+  }
+  SECTION("STRING offsets with a mask")
+  {
+    auto b                                 = columns_batch();
+    b.columns[1].children[0].has_null_mask = true;
+    refuse(encode_header(b), "string offsets have a mask or children");
+  }
+  SECTION("STRING offsets too small for their rows")
+  {
+    auto b                             = columns_batch();
+    b.columns[1].children[0].data_size = rows * 4;
+    refuse(encode_header(b), "string offsets too small");
+  }
+  SECTION("STRING chars outside the stream")
+  {
+    auto b                 = columns_batch();
+    b.columns[1].data_size = b.stream_bytes;
+    refuse(encode_header(b), "outside the stream");
+  }
+}
+
+TEST_CASE("exchange headers take chars past INT32 only with INT64 string offsets",
+          "[exchange][wire]")
+{
+  // 2 GiB of chars at 8448, then the offsets.
+  constexpr std::size_t chars          = std::size_t{1} << 31;
+  constexpr std::size_t offsets_at     = 8448 + chars;
+  auto b                               = columns_batch();
+  b.columns[1].data_size               = chars;
+  b.columns[1].children[0].data_offset = offsets_at;
+  b.stream_bytes                       = offsets_at + (rows + 1) * 8;
+  CHECK_THROWS_WITH(decode_header(encode_header(b)),
+                    Catch::Matchers::ContainsSubstring("chars overflow INT32 offsets"));
+
+  b.columns[1].children[0].type_id   = static_cast<std::int32_t>(cudf::type_id::INT64);
+  b.columns[1].children[0].data_size = (rows + 1) * 8;
+  auto const decoded                 = decode_header(encode_header(b));
+  REQUIRE(decoded.columns.size() == 2);
+  CHECK(same(decoded.columns[0], b.columns[0]));
+  CHECK(same(decoded.columns[1], b.columns[1]));
 }
 
 TEST_CASE("stream_map walks masks, data, then children", "[exchange][wire]")
@@ -301,4 +409,38 @@ TEST_CASE("plan_stream lays a table out aligned, in walk order", "[exchange][wir
   auto const sliced = cudf::slice(table.view().column(0), {2, 5}).front();
   CHECK_THROWS_WITH(plan_stream(cudf::table_view{{sliced}}, stream, bytes),
                     Catch::Matchers::ContainsSubstring("sliced"));
+}
+
+TEST_CASE("plan_stream refuses a type it cannot send, and sizes INT64 string offsets",
+          "[exchange][wire]")
+{
+  auto stream       = utils::default_stream();
+  std::size_t bytes = 0;
+  auto const lists  = cudf::make_empty_lists_column(cudf::data_type{cudf::type_id::INT32});
+  CHECK_THROWS_WITH(plan_stream(cudf::table_view{{lists->view()}}, stream, bytes),
+                    Catch::Matchers::ContainsSubstring("cannot send type id"));
+
+  // "a", "bc", "".
+  std::vector<std::int64_t> const offsets{0, 1, 3, 3};
+  std::string const chars = "abc";
+  auto offsets_column     = std::make_unique<cudf::column>(
+    cudf::data_type{cudf::type_id::INT64},
+    static_cast<cudf::size_type>(offsets.size()),
+    rmm::device_buffer(offsets.data(), offsets.size() * sizeof(std::int64_t), stream),
+    rmm::device_buffer{},
+    0);
+  auto const strings =
+    cudf::make_strings_column(3,
+                              std::move(offsets_column),
+                              rmm::device_buffer(chars.data(), chars.size(), stream),
+                              0,
+                              rmm::device_buffer{});
+  auto const meta = plan_stream(cudf::table_view{{strings->view()}}, stream, bytes);
+  REQUIRE(meta.size() == 1);
+  CHECK(meta[0].data_size == chars.size());
+  REQUIRE(meta[0].children.size() == 1);
+  CHECK(meta[0].children[0].type_id == static_cast<std::int32_t>(cudf::type_id::INT64));
+  CHECK(meta[0].children[0].num_rows == 4);
+  CHECK(meta[0].children[0].data_size == offsets.size() * sizeof(std::int64_t));
+  CHECK(decode_header(encode_header({3, bytes, meta})).columns.size() == 1);
 }
