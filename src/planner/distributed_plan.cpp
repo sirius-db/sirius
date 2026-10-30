@@ -109,7 +109,7 @@ struct rewriter {
   /// Each CTE_SCAN's rows are where its CTE's materialization put them.
   std::map<op::sirius_physical_operator const*, placement> cte_scans;
 
-  exchange::stream_id stream() { return (query << exchange::query_stream_bits) | next_stream++; }
+  exchange::stream_id stream() { return exchange::make_stream_id(query, next_stream++); }
 
   op::sirius_physical_operator& expect(op::sirius_physical_operator& node, T type)
   {

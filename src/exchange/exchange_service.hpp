@@ -79,7 +79,7 @@ class exchange_service {
   void close(stream_id stream, rank_t to);
 
   /// See transport::wait_sent. True once shut down: the transport freed what it held.
-  [[nodiscard]] bool wait_sent(std::uint64_t query, std::chrono::milliseconds timeout);
+  [[nodiscard]] bool wait_sent(distributed_query_id query, std::chrono::milliseconds timeout);
 
   /// Routes @p stream to @p receiver, replaying what arrived for it before.
   /// @throws sirius::invalid_input_exception when the stream already has a receiver.
@@ -89,7 +89,7 @@ class exchange_service {
 
   /// This rank's run of @p query failed with @p what: fails its streams here and on every peer,
   /// so no rank waits for the others. Once per query; a query a peer aborted is not re-sent.
-  void abort(std::uint64_t query, std::string const& what);
+  void abort(distributed_query_id query, std::string const& what);
 
   /// Stops the transport, joining its engine thread and freeing the batches it and this service
   /// hold, while the memory spaces they live in still exist. Plans may keep the service alive
@@ -99,7 +99,7 @@ class exchange_service {
   /// This rank has retired @p query: drops what is kept for it, and what arrives for it from now
   /// on. Queries are numbered when planned, so one run later (a prepared statement) can retire
   /// after higher-numbered ones.
-  void forget(std::uint64_t query);
+  void forget(distributed_query_id query);
 
  private:
   struct held {
@@ -111,8 +111,8 @@ class exchange_service {
   [[nodiscard]] std::shared_ptr<inbound> receiver_of(stream_id stream, held event);
   void throw_if_failed();
   /// Fails @p query's receivers with @p error. @return false if it had already ended.
-  bool end_query(std::uint64_t query, std::exception_ptr error);
-  [[nodiscard]] bool retired(std::uint64_t query) const;
+  bool end_query(distributed_query_id query, std::exception_ptr error);
+  [[nodiscard]] bool retired(distributed_query_id query) const;
 
   rank_t _rank;
   rank_t _world_size;
@@ -121,10 +121,10 @@ class exchange_service {
   /// TODO(#2376): held batches sit outside any repository, so they cannot spill.
   std::map<stream_id, std::vector<held>> _held;
   std::set<stream_id> _detached;
-  std::map<std::uint64_t, std::exception_ptr> _aborted;
+  std::map<distributed_query_id, std::exception_ptr> _aborted;
   /// Every query from 1 to this one has retired here, and so has each in _retired_above.
-  std::uint64_t _retired{0};
-  std::set<std::uint64_t> _retired_above;
+  distributed_query_id _retired{0};
+  std::set<distributed_query_id> _retired_above;
   /// The transport's failure, worded for the queries after it.
   std::exception_ptr _error;
   // Last: its engine thread calls back into the members above until it is destroyed. Null once

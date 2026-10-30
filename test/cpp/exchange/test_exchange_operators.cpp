@@ -453,9 +453,8 @@ TEST_CASE("an aborted query fails its streams on every rank, and only its stream
           "[exchange][operators]")
 {
   ranks c(2);
-  using sirius::exchange::query_stream_bits;
-  stream_id const aborted = (std::uint64_t{5} << query_stream_bits) | 1;
-  stream_id const other   = (std::uint64_t{6} << query_stream_bits) | 1;
+  stream_id const aborted = sirius::exchange::make_stream_id(5, 1);
+  stream_id const other   = sirius::exchange::make_stream_id(6, 1);
   sirius_physical_exchange_source here(
     key_value_types(), 0, c.all[0].service, aborted, {0, 1}, false);
   sirius_physical_exchange_source there(
@@ -492,9 +491,8 @@ TEST_CASE("a receiver that throws aborts its query on every rank, and the next q
     void on_error(std::exception_ptr) override {}
   };
   ranks c(2);
-  using sirius::exchange::query_stream_bits;
-  stream_id const failing = (std::uint64_t{1} << query_stream_bits) | 1;
-  stream_id const next    = (std::uint64_t{2} << query_stream_bits) | 1;
+  stream_id const failing = sirius::exchange::make_stream_id(1, 1);
+  stream_id const next    = sirius::exchange::make_stream_id(2, 1);
   c.all[1].service->attach(failing, std::make_shared<throwing>());
   sirius_physical_exchange_source here(
     key_value_types(), 0, c.all[0].service, failing + 1, {0, 1}, false);
@@ -554,9 +552,8 @@ TEST_CASE("a retired query's late arrivals are dropped, a later query's still ke
           "[exchange][operators]")
 {
   ranks c(2);
-  using sirius::exchange::query_stream_bits;
-  stream_id const retired = (std::uint64_t{1} << query_stream_bits) | 1;
-  stream_id const later   = (std::uint64_t{2} << query_stream_bits) | 1;
+  stream_id const retired = sirius::exchange::make_stream_id(1, 1);
+  stream_id const later   = sirius::exchange::make_stream_id(2, 1);
   {
     sirius_physical_exchange_source gone(
       key_value_types(), 0, c.all[1].service, retired, {0}, false);
@@ -580,11 +577,10 @@ TEST_CASE("a retired query's late arrivals are dropped, a later query's still ke
 TEST_CASE("queries retiring out of order are each forgotten", "[exchange][operators]")
 {
   ranks c(2);
-  using sirius::exchange::query_stream_bits;
   auto& service = *c.all[1].service;
   // Query 2 retires before query 1 (planned first, run later).
   service.forget(2);
-  stream_id const first = (std::uint64_t{1} << query_stream_bits) | 1;
+  stream_id const first = sirius::exchange::make_stream_id(1, 1);
   c.all[0].service->send(first, 1, key_value_batch(0, 0));
   c.all[0].service->close(first, 1);
   sirius_physical_exchange_source source(key_value_types(), 0, c.all[1].service, first, {0}, false);
@@ -595,8 +591,7 @@ TEST_CASE("a shut-down exchange service stops its transport and refuses later se
           "[exchange][operators]")
 {
   ranks c(2);
-  using sirius::exchange::query_stream_bits;
-  stream_id const stream = (std::uint64_t{3} << query_stream_bits) | 1;
+  stream_id const stream = sirius::exchange::make_stream_id(3, 1);
   // Rank 1 holds what arrives for a stream nobody attached; shutting down frees it.
   c.all[0].service->send(stream, 1, key_value_batch(0, 0));
   c.all[0].service->close(stream, 1);

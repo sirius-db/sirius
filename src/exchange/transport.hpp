@@ -18,6 +18,7 @@
 
 #include "exchange/fabric.hpp"
 #include "exchange/messages.hpp"
+#include "sirius/exception.hpp"
 
 #include <rmm/cuda_stream.hpp>
 
@@ -46,12 +47,27 @@ namespace sirius::exchange {
 /// The exchange's id for one logical flow of batches, the same on every rank.
 using stream_id = std::uint64_t;
 
+/// A distributed query's number, the same on every rank, from 1; not a sirius::query_id_t window.
+using distributed_query_id = std::uint64_t;
+
 /// A stream id's bits above these number its query, the same on every rank.
 constexpr unsigned query_stream_bits = 20;
 
-[[nodiscard]] constexpr std::uint64_t query_of(stream_id stream) noexcept
+[[nodiscard]] constexpr distributed_query_id query_of(stream_id stream) noexcept
 {
   return stream >> query_stream_bits;
+}
+
+/// Stream @p n of query @p query.
+/// @throws sirius::invalid_input_exception when @p n does not fit below query_stream_bits.
+[[nodiscard]] inline stream_id make_stream_id(distributed_query_id query, std::uint64_t n)
+{
+  if (n >= (std::uint64_t{1} << query_stream_bits)) {
+    throw sirius::invalid_input_exception("exchange: query {} needs more than {} streams",
+                                          query,
+                                          std::uint64_t{1} << query_stream_bits);
+  }
+  return (query << query_stream_bits) | n;
 }
 
 /**
@@ -95,7 +111,7 @@ class transport {
     std::function<void(stream_id, rank_t from)> on_end;
     std::function<void(std::exception_ptr)> on_error;
     /// Rank @p from's run of query @p query failed with @p what.
-    std::function<void(std::uint64_t query, rank_t from, std::string what)> on_abort;
+    std::function<void(distributed_query_id query, rank_t from, std::string what)> on_abort;
   };
 
   struct options {
@@ -156,26 +172,26 @@ class transport {
 
   /// Tells every peer that this rank's run of @p query failed with @p what. Does nothing once the
   /// transport has failed: its peers have heard of that.
-  void abort(std::uint64_t query, std::string what);
+  void abort(distributed_query_id query, std::string what);
 
   /// Waits until this rank holds no batch it sent on a stream of @p query: the transport keeps a
   /// sent batch until its last frame is staged, or until it fails, and its memory may belong to
   /// the query.
   /// @return false after @p timeout.
-  [[nodiscard]] bool wait_sent(std::uint64_t query, std::chrono::milliseconds timeout);
+  [[nodiscard]] bool wait_sent(distributed_query_id query, std::chrono::milliseconds timeout);
 
  private:
   struct engine;
 
   void run();
   /// A batch of @p query sent to a peer was freed.
-  void released(std::uint64_t query);
+  void released(distributed_query_id query);
 
   std::unique_ptr<engine> _engine;
   std::mutex _mutex;
   std::condition_variable _room;
   /// Sent batches not yet freed, by query; _released is notified as they are.
-  std::map<std::uint64_t, std::size_t> _held;
+  std::map<distributed_query_id, std::size_t> _held;
   std::condition_variable _released;
   std::exception_ptr _error;
   /// abort() notices for the engine thread to send to every peer.

@@ -516,7 +516,7 @@ void transport::send(stream_id stream, rank_t to, std::shared_ptr<cucascade::dat
   e.queues[to].push_back({stream, e.sent[to][stream]++, std::move(held)});
 }
 
-void transport::released(std::uint64_t query)
+void transport::released(distributed_query_id query)
 {
   {
     std::lock_guard lock{_mutex};
@@ -525,7 +525,7 @@ void transport::released(std::uint64_t query)
   _released.notify_all();
 }
 
-bool transport::wait_sent(std::uint64_t query, std::chrono::milliseconds timeout)
+bool transport::wait_sent(distributed_query_id query, std::chrono::milliseconds timeout)
 {
   std::unique_lock lock{_mutex};
   _released.wait_for(lock, timeout, [&] { return !_held.contains(query); });
@@ -551,7 +551,7 @@ void transport::close(stream_id stream, rank_t to)
   e.cb.on_end(stream, to);
 }
 
-void transport::abort(std::uint64_t query, std::string what)
+void transport::abort(distributed_query_id query, std::string what)
 {
   std::lock_guard lock{_mutex};
   if (_error) { return; }
