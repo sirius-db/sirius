@@ -178,6 +178,17 @@ std::unique_ptr<incoming_batch> incoming_batch::land(batch_header header,
   for (auto const& b : out->_buffers) {
     gpu_need += rmm::align_up(b.size, rmm::CUDA_ALLOCATION_ALIGNMENT);
   }
+  auto* const host_mr =
+    host != nullptr
+      ? host->get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>()
+      : nullptr;
+  if (gpu_need > gpu.get_max_memory() &&
+      (host_mr == nullptr || out->_header.stream_bytes > host->get_max_memory())) {
+    throw sirius::internal_exception(
+      "exchange: a {}-byte batch can land neither on the GPU ({} bytes) nor in host memory",
+      out->_header.stream_bytes,
+      gpu.get_max_memory());
+  }
   if (auto reservation = gpu.make_reservation_or_null(gpu_need)) {
     auto* tracker = gpu.get_memory_resource_of<Tier::GPU>();
     if (tracker->attach_reservation_to_tracker(
@@ -198,13 +209,11 @@ std::unique_ptr<incoming_batch> incoming_batch::land(batch_header header,
   }
 
   // 2. Host blocks, laid out at the stream's own offsets.
-  if (host == nullptr) { return nullptr; }
+  if (host_mr == nullptr) { return nullptr; }
   auto const bytes = out->_header.stream_bytes;
   if (auto reservation = host->make_reservation_or_null(bytes)) {
-    auto* mr = host->get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
-    if (mr == nullptr) { return nullptr; }
     try {
-      out->_host_blocks = mr->allocate_multiple_blocks(bytes, reservation.get());
+      out->_host_blocks = host_mr->allocate_multiple_blocks(bytes, reservation.get());
       out->_tier        = Tier::HOST;
       out->_space       = host;
       return out;
