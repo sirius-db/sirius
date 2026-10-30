@@ -17,6 +17,7 @@
 #include "catch.hpp"
 #include "op/scan/composite_scan_driver.hpp"
 #include "operator/operator_test_utils.hpp"
+#include "scan_manager/preparation_fixture.hpp"
 #include "scan_manager/preparation_identity.hpp"
 #include "scan_manager/preparation_slot.hpp"
 #include "scan_manager/preparation_test_support.hpp"
@@ -97,6 +98,7 @@ struct test_child : gpu_ingestible {
   int claims = 0, closes = 0, stops = 0, finishes = 0, preflights = 0, projections = 0;
   bool ready = true, empty = false, buffered = false, fail_close = false, fail_bind = false;
   bool fail_read = false, already_projected = false;
+  bool required_job = false, missing_dependencies = false;
   std::shared_ptr<void> retained;
   void preflight_for_query() override { ++preflights; }
   void attach_preparation_ledger(std::shared_ptr<sm::preparation_ledger>) override {}
@@ -122,11 +124,24 @@ struct test_child : gpu_ingestible {
       source.try_claim = [this]() -> metadata_claim {
         if (!ready) return sm::preparation_pending{};
         if (claims++) return sm::preparation_exhausted{};
-        return metadata_job{[this](sm::preparation_stop_token stop) -> std::unique_ptr<scan_info> {
+        metadata_job work{[this](sm::preparation_stop_token stop) -> std::unique_ptr<scan_info> {
           if (stop.stop_requested()) throw duckdb::InterruptException();
           if (fail_read) throw std::runtime_error("child read failed");
-          return empty ? nullptr : std::make_unique<test_split>();
+          if (empty) return nullptr;
+          auto input = std::make_unique<test_split>();
+          if (required_job && !missing_dependencies) {
+            split_dependencies deps;
+            deps.checkpoint_iteration = 7;
+            input->set_contract_payload(split_contract, {{split_contract, 42}}, {deps});
+          }
+          return input;
         }};
+        if (required_job) {
+          sm::required_input_set required;
+          required.set(static_cast<size_t>(sm::required_input::checkpoint_iteration));
+          work.requirement = sm::preparation_unit_requirement{{split_contract, 42}, required};
+        }
+        return work;
       };
       source.close = [this] {
         ++closes;
@@ -521,4 +536,162 @@ TEST_CASE("Composite routing cannot hide a child contract mismatch", "[composite
   CHECK(output->contract_id() == 77);
   CHECK_THROWS_WITH(h.driver.validator()->inspect({77, {}, {}}, *output),
                     "scan split contract mismatch: expected 77, got 78");
+}
+
+TEST_CASE("Composite required child jobs settle through coordinator admission",
+          "[composite_scan][coordinator]")
+{
+  namespace prep = sirius::test::preparation;
+  auto execution = GENERATE(domain::query_owner, domain::metadata_worker);
+  auto failure   = GENERATE(0, 1, 2);
+  CAPTURE(execution, failure);
+  prep::fixture f(2, 4);
+  auto child                  = std::make_shared<test_child>();
+  child->execution            = execution;
+  child->required_job         = true;
+  child->fail_read            = failure == 1;
+  child->missing_dependencies = failure == 2;
+  harness h({child});
+  std::atomic<size_t> publications{0};
+  std::shared_ptr<sm::preparation_unit> admitted;
+  f.coordinator.before_submission_for_testing([&] {
+    // Retain the unit assigned by dispatch; the coordinator retires its map entry
+    // once coalescing finishes, before the publication observer runs.
+    if (f.coordinator.unit_state_snapshot({77, 42})) {
+      sm::required_input_set required;
+      required.set(static_cast<size_t>(sm::required_input::checkpoint_iteration));
+      admitted = f.coordinator.admit_unit({77, 42}, required);
+    }
+  });
+  f.coordinator.after_publication_for_testing([&](size_t, auto const&, size_t) { ++publications; });
+  auto guard = f.shutdown_guard();
+  f.start([&] {
+    std::vector<sm::preparation_coordinator::source> sources;
+    auto destination = std::make_shared<sm::split_connector>();
+    for (auto& lane : h.sources) {
+      sm::preparation_coordinator::source source;
+      source.execution   = lane.execution;
+      source.coalescer   = std::move(lane.coalescer);
+      source.try_claim   = std::move(lane.try_claim);
+      source.close       = std::move(lane.close);
+      source.bind_wakeup = std::move(lane.bind_wakeup);
+      source.destination = destination;
+      source.construct   = [](auto input) { return prep::make_publication(std::move(input)); };
+      sources.push_back(std::move(source));
+    }
+    f.coordinator.add_sources(std::move(sources));
+  });
+  f.finish();
+  REQUIRE_FALSE(f.owner_error);
+  REQUIRE(admitted);
+  if (failure) {
+    REQUIRE(f.completion.has_error());
+    CHECK_THROWS_WITH(
+      std::rethrow_exception(f.completion.terminal_error()),
+      failure == 1 ? "child read failed" : "preparation unit requires one dependency record");
+    CHECK(publications == 0);
+    CHECK(admitted->record().state == sm::unit_state::failed);
+  } else {
+    CHECK_FALSE(f.completion.has_error());
+    CHECK(publications == 1);
+    auto record = admitted->record();
+    CHECK(record.state == sm::unit_state::ready);
+    REQUIRE(record.deps);
+    CHECK(record.deps->checkpoint_iteration == 7);
+  }
+  CHECK(child->closes == 1);
+  CHECK(f.coordinator.snapshot().phase == sm::preparation_coordinator::lifecycle::quiescent);
+}
+
+TEST_CASE("Preparation output mapping settles only after transformation succeeds",
+          "[composite_scan][preparation_job]")
+{
+  auto failure  = GENERATE(0, 1, 2);
+  bool prebound = GENERATE(false, true);
+  sm::required_input_set required;
+  required.set(static_cast<size_t>(sm::required_input::checkpoint_iteration));
+  auto unit = std::make_shared<sm::preparation_unit>(sm::unit_key{77, 42}, required);
+  int reads = 0, mappings = 0;
+  auto lifetime           = std::make_shared<int>(1);
+  std::weak_ptr<int> weak = lifetime;
+  sm::preparation_job work{[&, lifetime](sm::preparation_stop_token) {
+                             ++reads;
+                             if (failure == 1) throw duckdb::InterruptException();
+                             auto input = std::make_unique<test_split>();
+                             split_dependencies deps;
+                             deps.checkpoint_iteration = 7;
+                             input->set_contract_payload(77, {{77, 42}}, {deps});
+                             return input;
+                           },
+                           sm::preparation_unit_requirement{{77, 42}, required}};
+  if (prebound) work.unit = unit;
+  auto mapped = std::move(work).map_output([&](std::unique_ptr<scan_info> input) {
+    ++mappings;
+    CHECK(unit->record().state == sm::unit_state::pending);
+    if (failure == 2) throw std::runtime_error("output mapping failed");
+    return input;
+  });
+  // Admission happens after wrapping, as it does in the coordinator.
+  CHECK(mapped.unit == (prebound ? unit : nullptr));
+  REQUIRE(mapped.requirement);
+  CHECK(mapped.requirement->key == sm::unit_key{77, 42});
+  CHECK(mapped.requirement->required == required);
+  mapped.unit = unit;
+  lifetime.reset();
+  if (failure) {
+    CHECK_THROWS(mapped.run({}));
+    CHECK(unit->record().state == sm::unit_state::failed);
+  } else {
+    REQUIRE(mapped.run({}));
+    CHECK(unit->record().state == sm::unit_state::ready);
+  }
+  CHECK(reads == 1);
+  CHECK(mappings == (failure == 1 ? 0 : 1));
+  CHECK(weak.expired());
+  CHECK_THROWS_AS(mapped.run({}), std::logic_error);
+  CHECK_THROWS_AS(std::move(mapped).map_output([](auto input) { return input; }), std::logic_error);
+}
+
+TEST_CASE("Abandoned mapped preparation jobs release both operations without running",
+          "[composite_scan][preparation_job]")
+{
+  auto input = std::make_shared<int>(0), output = std::make_shared<int>(0);
+  std::weak_ptr<int> input_weak = input, output_weak = output;
+  int calls = 0;
+  {
+    sm::preparation_job work{[&, input]() -> std::unique_ptr<scan_info> {
+      ++calls;
+      return nullptr;
+    }};
+    auto mapped = std::move(work).map_output([&, output](auto result) {
+      ++calls;
+      return result;
+    });
+    input.reset();
+    output.reset();
+    CHECK_FALSE(input_weak.expired());
+    CHECK_FALSE(output_weak.expired());
+  }
+  CHECK(calls == 0);
+  CHECK(input_weak.expired());
+  CHECK(output_weak.expired());
+}
+
+TEST_CASE("Retired slots do not refund the cumulative registered allowance",
+          "[composite_scan][preparation_ledger]")
+{
+  sm::test::test_reservation_provider provider;
+  auto ledger = std::make_shared<sm::preparation_ledger>(provider);
+  std::vector<sm::scan_envelope> scans{{{{{8}, 16}}, {}, true, 1}};
+  REQUIRE(ledger->admit(scans, sm::memory_space_id{cucascade::memory::Tier::HOST, 0}).deferred);
+  {
+    sm::preparation_slot slot(ledger, {77, 0}, 16);
+    auto permit = slot.try_acquire();
+    REQUIRE(permit);
+    auto bytes = ledger->allocator(permit).allocate_retained(16);
+  }
+  CHECK(ledger->tracked_units() == 0);
+  CHECK(provider.seen->allocated_bytes == 0);
+  CHECK_THROWS_WITH(sm::preparation_slot(ledger, {77, 1}, 16),
+                    "unit retained budgets exceed admission");
 }

@@ -328,9 +328,7 @@ struct composite_scan_driver::impl : std::enable_shared_from_this<impl> {
         continue;
       }
       if (std::holds_alternative<sm::preparation_pending>(claim)) continue;
-      auto work        = std::move(std::get<job>(claim));
-      auto readiness   = work.unit;
-      auto requirement = work.requirement;
+      auto work = std::move(std::get<job>(claim));
       ++state->jobs;
       struct pending_job {
         std::shared_ptr<unit_state> state;
@@ -347,16 +345,13 @@ struct composite_scan_driver::impl : std::enable_shared_from_this<impl> {
       };
       auto pending    = std::make_shared<pending_job>(state, wake);
       auto* coalescer = lane->source.coalescer.get();
-      job result{[owner = owner, state, coalescer, pending, work = std::move(work)](
-                   sm::preparation_stop_token stop) mutable {
-                   auto input = work.run(stop);
-                   return input ? std::make_unique<unit_split>(
-                                    owner, state, std::move(input), coalescer, false)
-                                : nullptr;
-                 },
-                 readiness};
-      result.requirement = requirement;
-      return result;
+      return std::move(work).map_output(
+        [owner = owner, state, coalescer, pending](
+          std::unique_ptr<scan::scan_info> input) -> std::unique_ptr<scan::scan_info> {
+          return input
+                   ? std::make_unique<unit_split>(owner, state, std::move(input), coalescer, false)
+                   : nullptr;
+        });
     }
     if (std::all_of(state->lanes.begin(), state->lanes.end(), [](auto const& lane) {
           return lane->exhausted.load();
