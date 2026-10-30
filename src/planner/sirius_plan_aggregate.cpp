@@ -22,8 +22,13 @@
 #include "duckdb/function/function_binder.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/settings.hpp"
+#include "duckdb/parser/expression_map.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+#include "duckdb/planner/expression/bound_case_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "expression/aggregate_id.hpp"
@@ -77,11 +82,129 @@ duckdb::vector<std::unique_ptr<sirius::ast::node>> translate_expressions(
   return out;
 }
 
-// File-local helper (formerly sirius_physical_plan_generator::extract_aggregate_expressions).
-// Pulls aggregate child / filter sub-expressions out of the aggregate list and groups into a
-// projection fed upstream of the aggregate. Operates on raw DuckDB expressions so the hoist
-// is straightforward; the caller translates the resulting groups/aggregates into Sirius AST
-// nodes when constructing the aggregate operator.
+// Policy gate for the aggregate FILTER clause. Mask-to-null lowering supports unordered
+// NULL-skipping aggregates only. Reject ORDER BY before child planning and sorted binding can
+// append sort keys to the aggregate arguments.
+void throw_if_aggregate_filter_unsupported(duckdb::BoundAggregateExpression const& aggr)
+{
+  auto const id = sirius::from_duckdb_aggregate_name(aggr.Function().GetName().GetIdentifierName());
+  bool supported = id.has_value() && !aggr.IsDistinct() && !aggr.GetOrderBys();
+  if (supported) {
+    switch (*id) {
+      case sirius::aggregate_id::count_star: supported = aggr.GetChildren().empty(); break;
+      case sirius::aggregate_id::count:
+      case sirius::aggregate_id::sum:
+      case sirius::aggregate_id::sum_no_overflow:
+      case sirius::aggregate_id::min:
+      case sirius::aggregate_id::max:
+      case sirius::aggregate_id::avg: supported = aggr.GetChildren().size() == 1; break;
+      default: supported = false; break;  // first, and any future id
+    }
+  }
+  if (!supported) {
+    throw duckdb::NotImplementedException(
+      "Aggregate FILTER not supported on GPU (falling back to CPU): " + aggr.ToString());
+  }
+}
+
+// CASE WHEN <filter> THEN <value> ELSE NULL END. SQL FILTER passes only TRUE; the CASE lowering
+// (cudf::copy_if_else) routes both FALSE and NULL mask entries to the ELSE branch, so
+// three-valued filters (e.g. mark-join columns) mask out correctly.
+duckdb::unique_ptr<duckdb::Expression> make_filter_mask(
+  duckdb::unique_ptr<duckdb::Expression> filter, duckdb::unique_ptr<duckdb::Expression> value)
+{
+  auto null_else =
+    duckdb::make_uniq<duckdb::BoundConstantExpression>(duckdb::Value(value->GetReturnType()));
+  return duckdb::make_uniq<duckdb::BoundCaseExpression>(
+    std::move(filter), std::move(value), std::move(null_else));
+}
+
+// Recurse through expression tree at root @p expression to find any ordered functions
+bool has_ordered_function(duckdb::Expression const& expression)
+{
+  if (expression.GetExpressionClass() == duckdb::ExpressionClass::BOUND_FUNCTION &&
+      expression.Cast<duckdb::BoundFunctionExpression>().Function().RequiresOrderedExecution()) {
+    return true;
+  }
+  bool ordered = false;
+  duckdb::ExpressionIterator::EnumerateChildren(expression, [&](duckdb::Expression const& child) {
+    ordered = ordered || has_ordered_function(child);
+  });
+  return ordered;
+}
+
+bool can_share_expression(duckdb::Expression const& expression)
+{
+  return expression.IsConsistent() && !expression.IsVolatile() && !has_ordered_function(expression);
+}
+
+// Only generated mask predicates are considered here. Group expressions and user CASE inputs retain
+// their evaluation boundaries. Discover matches before changing any borrowed expression-map keys.
+duckdb::unique_ptr<sirius::op::sirius_physical_operator> project_shared_filter_predicates(
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> child,
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>& expressions,
+  duckdb::vector<duckdb::idx_t> const& masked_columns)
+{
+  // Deduplicate the mask predicates into @c groups
+  duckdb::expression_map_t<duckdb::idx_t> predicates;
+  duckdb::vector<duckdb::vector<duckdb::idx_t>> groups;
+  for (auto const column : masked_columns) {
+    auto const& mask = expressions[column]->Cast<duckdb::BoundCaseExpression>();
+    D_ASSERT(mask.CaseChecks().size() == 1);
+    auto const& predicate = *mask.CaseChecks()[0].when_expr;
+    if (predicate.GetExpressionClass() == duckdb::ExpressionClass::BOUND_CONSTANT ||
+        predicate.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF ||
+        !can_share_expression(predicate)) {
+      continue;
+    }
+    auto const [entry, inserted] = predicates.try_emplace(predicate, groups.size());
+    if (inserted) { groups.emplace_back(); }
+    groups[entry->second].push_back(column);
+  }
+  predicates.clear();
+
+  auto const input_width = child->types.size();
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> shared_predicates;
+  for (auto const& group : groups) {
+    if (group.size() < 2) { continue; }
+    auto const index = input_width + shared_predicates.size();
+    auto& first      = expressions[group[0]]->Cast<duckdb::BoundCaseExpression>();
+    shared_predicates.push_back(std::move(first.CaseChecksMutable()[0].when_expr));
+    for (auto const column : group) {
+      auto& mask = expressions[column]->Cast<duckdb::BoundCaseExpression>();
+      mask.CaseChecksMutable()[0].when_expr =
+        duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::BOOLEAN, index);
+    }
+  }
+  if (shared_predicates.empty()) { return child; }
+
+  auto types = child->types;
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> projected;
+  projected.reserve(input_width + shared_predicates.size());
+  for (std::size_t index = 0; index < input_width; ++index) {
+    projected.push_back(std::make_unique<sirius::ast::node>(
+      sirius::ast::reference{static_cast<uint32_t>(index), types[index]}));
+  }
+  for (auto& predicate : translate_expressions(std::move(shared_predicates))) {
+    types.push_back(sirius::logical_type::make(sirius::type_id::BOOLEAN));
+    projected.push_back(std::move(predicate));
+  }
+  auto const estimated_cardinality = child->estimated_cardinality;
+  return push_projection(
+    std::move(child), std::move(types), std::move(projected), estimated_cardinality);
+}
+
+duckdb::AggregateFunctionCatalogEntry& builtin_count_entry(duckdb::ClientContext& context)
+{
+  auto& catalog = duckdb::Catalog::GetSystemCatalog(context);
+  return catalog.GetEntry<duckdb::AggregateFunctionCatalogEntry>(
+    context, duckdb::QualifiedName(catalog.GetName(), DEFAULT_SCHEMA, "count"));
+}
+
+// Hoist groups and aggregate inputs, consuming every supported FILTER into a nullable CASE input.
+// Structurally equal generated masks share one projected column only when the whole expression is
+// consistent, nonvolatile, and does not require ordered execution. Filtered COUNT(*) is rebound to
+// COUNT over its boolean mask before generic expression translation.
 duckdb::unique_ptr<sirius::op::sirius_physical_operator> extract_aggregate_expressions(
   duckdb::ClientContext& context,
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> child,
@@ -91,6 +214,23 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> extract_aggregate_expre
 {
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions;
   duckdb::vector<duckdb::LogicalType> types;
+  duckdb::vector<duckdb::idx_t> masked_columns;
+  // Keys borrow immutable heap nodes owned by expressions; moving their unique_ptrs does not move
+  // the nodes. Clear the map before translation drains those owners.
+  duckdb::expression_map_t<duckdb::idx_t> masked_inputs;
+  auto project_input = [&](duckdb::unique_ptr<duckdb::Expression> expression, bool masked) {
+    bool const shareable = masked && can_share_expression(*expression);
+    if (shareable) {
+      auto const found = masked_inputs.find(*expression);
+      if (found != masked_inputs.end()) { return found->second; }
+    }
+    auto const index = expressions.size();
+    types.push_back(expression->GetReturnType());
+    expressions.push_back(std::move(expression));
+    if (masked) { masked_columns.push_back(index); }
+    if (shareable) { masked_inputs.emplace(*expressions.back(), index); }
+    return index;
+  };
 
   // bind sorted aggregates
   for (auto& aggr : aggregates) {
@@ -108,23 +248,40 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> extract_aggregate_expre
   }
   for (auto& aggr : aggregates) {
     auto& bound_aggr = aggr->Cast<duckdb::BoundAggregateExpression>();
+    if (bound_aggr.GetFilterMutable()) { throw_if_aggregate_filter_unsupported(bound_aggr); }
+    auto filter = std::move(bound_aggr.GetFilterMutable());  // consumes the filter
+
+    // aggregates that have an argument
     for (auto& child_expr : bound_aggr.GetChildrenMutable()) {
-      auto ref = duckdb::make_uniq<duckdb::BoundReferenceExpression>(child_expr->GetReturnType(),
-                                                                     expressions.size());
-      types.push_back(child_expr->GetReturnType());
-      expressions.push_back(std::move(child_expr));
-      child_expr = std::move(ref);
+      if (filter) { child_expr = make_filter_mask(filter->Copy(), std::move(child_expr)); }
+      auto const type  = child_expr->GetReturnType();
+      auto const index = project_input(std::move(child_expr), filter != nullptr);
+      child_expr       = duckdb::make_uniq<duckdb::BoundReferenceExpression>(type, index);
     }
-    if (bound_aggr.GetFilterMutable()) {
-      auto& filter = bound_aggr.GetFilterMutable();
-      auto ref     = duckdb::make_uniq<duckdb::BoundReferenceExpression>(filter->GetReturnType(),
-                                                                     expressions.size());
-      types.push_back(filter->GetReturnType());
-      expressions.push_back(std::move(filter));
-      bound_aggr.GetFilterMutable() = std::move(ref);
+
+    // FILTERed aggregates with  no argument (currently, only COUNT(*))
+    if (filter && bound_aggr.GetChildren().empty()) {
+      auto mask = make_filter_mask(
+        std::move(filter),
+        duckdb::make_uniq<duckdb::BoundConstantExpression>(duckdb::Value::BOOLEAN(true)));
+      auto const index = project_input(std::move(mask), true);
+      // Convert filter expression into: CASE WHEN keep THEN TRUE ELSE NULL END
+      duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> arguments;
+      arguments.push_back(
+        duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::BOOLEAN, index));
+      auto& count = builtin_count_entry(context);
+      auto function =
+        count.functions.GetFunctionByArguments(context, {duckdb::LogicalType::BOOLEAN});
+      duckdb::FunctionBinder binder(context);
+      auto normalized = binder.BindAggregateFunction(std::move(function), std::move(arguments));
+      normalized->SetAlias(bound_aggr.GetAlias());
+      normalized->SetQueryLocation(bound_aggr.GetQueryLocation());
+      aggr = std::move(normalized);
     }
   }
+  masked_inputs.clear();
   if (expressions.empty()) { return child; }
+  child = project_shared_filter_predicates(std::move(child), expressions, masked_columns);
   auto const estimated_cardinality = child->estimated_cardinality;
   return push_projection(std::move(child),
                          sirius::from_duckdb_vec(types),
@@ -252,11 +409,8 @@ static bool is_host_builtin_count(duckdb::ClientContext& context,
                                   duckdb::BoundAggregateFunction const& function,
                                   std::size_t arity)
 {
-  auto const& overloads =
-    duckdb::Catalog::GetSystemCatalog(context)
-      .GetEntry<duckdb::AggregateFunctionCatalogEntry>(context, DEFAULT_SCHEMA, "count")
-      .functions.functions;
-  auto const canonical = std::ranges::find_if(overloads, [arity](auto const& candidate) {
+  auto const& overloads = builtin_count_entry(context).functions.functions;
+  auto const canonical  = std::ranges::find_if(overloads, [arity](auto const& candidate) {
     return candidate->GetSignature().GetParameters().size() == arity;
   });
   return canonical != overloads.end() && function.GetCallbacks() == (*canonical)->GetCallbacks();
@@ -672,23 +826,6 @@ static bool can_use_perfect_hash_aggregate(duckdb::ClientContext& context,
   return true;
 }
 
-/// cuDF does not support HUGEINT (int128). DuckDB widens aggregates like sum(int32) to HUGEINT
-/// to avoid overflow. We downcast to BIGINT at the plan level so all downstream operators
-/// (including the result collector) use the correct type. The aggregate operators still sum
-/// such inputs without wrapping (op::is_wide_integer_sum): over DECIMAL128 where INT64 could
-/// overflow, and a SUM whose total does not fit BIGINT falls back to DuckDB at runtime.
-static void downcast_hugeint_types(duckdb::vector<duckdb::LogicalType>& types,
-                                   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>& exprs)
-{
-  for (auto& type : types) {
-    type = sirius_physical_plan_generator::planned_aggregate_type(type);
-  }
-  for (auto& expr : exprs) {
-    expr->SetReturnType(
-      sirius_physical_plan_generator::planned_aggregate_type(expr->GetReturnType()));
-  }
-}
-
 /// Plan an aggregate with several grouping sets or GROUPING() functions on top of @p child.
 ///
 /// The plan is a grouped aggregate with a projection on top:
@@ -759,12 +896,6 @@ bool decimal_sum_stats_bound_enabled(duckdb::ClientContext& context)
 
 }  // namespace
 
-duckdb::LogicalType sirius_physical_plan_generator::planned_aggregate_type(
-  duckdb::LogicalType const& type)
-{
-  return type == duckdb::LogicalType::HUGEINT ? duckdb::LogicalType::BIGINT : type;
-}
-
 void sirius_physical_plan_generator::require_planned_schema(
   std::span<sirius::logical_type const> planned,
   duckdb::vector<duckdb::LogicalType> const& declared,
@@ -777,12 +908,7 @@ void sirius_physical_plan_generator::require_planned_schema(
       std::to_string(declared.size()) + " (falling back to CPU)");
   }
   for (duckdb::idx_t i = 0; i < declared.size(); i++) {
-    // BIGINT may stand for a declared HUGEINT: the aggregate builder narrows its own output types
-    // and its parents keep DuckDB's.
-    if (planned[i] == sirius::from_duckdb(declared[i]) ||
-        planned[i] == sirius::from_duckdb(planned_aggregate_type(declared[i]))) {
-      continue;
-    }
+    if (planned[i] == sirius::from_duckdb(declared[i])) { continue; }
     throw duckdb::NotImplementedException(
       std::string(subject) + ": the planned input has " + planned[i].to_string() + " for column " +
       std::to_string(i) + " but the node declares " + sirius::from_duckdb(declared[i]).to_string() +
@@ -794,9 +920,6 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
 {
   D_ASSERT(op.children.size() == 1);
-
-  // Downcast HUGEINT to BIGINT since cuDF does not support int128
-  downcast_hugeint_types(op.types, op.expressions);
 
   // Reject nested GROUP BY keys before extract_aggregate_expressions rewrites
   // groups into bare references (which lose the name needed for the error).
@@ -810,12 +933,10 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
       "Grouping sets without GROUP BY keys are not supported in GPU aggregates");
   }
 
-  // The GPU aggregates do not apply FILTER clauses, and support DISTINCT only in COUNT.
+  // Validate FILTER lowering before child planning; DISTINCT remains supported only in COUNT.
   for (auto const& expression : op.expressions) {
     auto const& aggregate = expression->Cast<duckdb::BoundAggregateExpression>();
-    if (aggregate.GetFilter()) {
-      throw duckdb::NotImplementedException("Aggregates with a FILTER clause not supported in GPU");
-    }
+    if (aggregate.GetFilter()) { throw_if_aggregate_filter_unsupported(aggregate); }
     if (!aggregate.IsDistinct()) { continue; }
     if (sirius::from_duckdb_aggregate_name(aggregate.Function().GetName().GetIdentifierName()) !=
         sirius::aggregate_id::count) {

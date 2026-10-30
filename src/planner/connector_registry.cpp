@@ -96,7 +96,24 @@ bool iceberg_mapping_leaf_types_supported(
       continue;
     }
     saw_leaf = true;
-    if (!op::scan::field_mapping_type(column.type)) return false;
+    // Generic mapping codecs do not widen this connector's qualified profile.
+    // Temporal/decimal support requires separate Iceberg policy and evidence.
+    using D = duckdb::LogicalTypeId;
+    switch (column.type.id()) {
+      case D::BOOLEAN:
+      case D::TINYINT:
+      case D::SMALLINT:
+      case D::INTEGER:
+      case D::BIGINT:
+      case D::UTINYINT:
+      case D::USMALLINT:
+      case D::UINTEGER:
+      case D::UBIGINT:
+      case D::FLOAT:
+      case D::DOUBLE:
+      case D::VARCHAR: break;
+      default: return false;
+    }
   }
   return true;
 }

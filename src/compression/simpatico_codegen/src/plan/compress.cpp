@@ -665,9 +665,9 @@ std::unique_ptr<PlanTree> compress_column(cudf::column_view input,
 namespace {
 
 // Which output channels a fused preprocessing op MATERIALISES as Raw passthrough
-// streams (delta.differences, rle.runs/values, for.deltas) versus which live
-// directly on the op node's own rep as BOUNDARY outputs (for.references).
-// Empty for ops whose rep already exposes canonical channels (bitpack, zigzag).
+// streams (delta.differences, rle.runs/values, for.deltas, zigzag.zigzag) versus
+// which live directly on the op node's own rep as BOUNDARY outputs (for.references).
+// Empty for ops whose rep already exposes canonical channels (bitpack).
 struct fused_op_channels {
   std::vector<std::string> materialized;  // drained to an identity leaf to store
   std::vector<std::string> boundary;      // already carried on the op node rep
@@ -679,7 +679,8 @@ fused_op_channels canonical_fused_channels(std::string const& op)
   if (op == "delta") return {{"differences"}, {}};
   if (op == "rle") return {{"runs", "values"}, {}};
   if (op == "for") return {{"deltas"}, {"references"}};
-  return {};  // bitpack / zigzag: rep->named_channels() are already canonical
+  if (op == "zigzag") return {{"zigzag"}, {}};
+  return {};  // bitpack: rep->named_channels() are already canonical
 }
 
 // Trial result for a single fused op: exposes the op's canonical output channels
@@ -781,7 +782,7 @@ std::unique_ptr<compressed_representation> compress_single_op(std::string const&
     return nullptr;
   }
 
-  // bitpack / zigzag: the op rep already exposes canonical channels — return it
+  // bitpack: the op rep already exposes canonical channels — return it
   // (or, defensively, the first parked channel rep) as before.
   if (fused.empty()) {
     if (op_node->rep) return std::move(op_node->rep);

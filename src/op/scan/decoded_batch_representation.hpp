@@ -52,6 +52,7 @@ class decompression_pushdown_batch_representation final
     : ::cucascade::gpu_table_representation(std::move(table), memory_space, writer_stream),
       _outcome(outcome)
   {
+    if (writer_stream.get() == nullptr) { record_writer_event(writer_stream); }
   }
 
   [[nodiscard]] const pushdown_outcome& outcome() const noexcept { return _outcome; }

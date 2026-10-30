@@ -19,6 +19,7 @@
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
+#include <cudf/types.hpp>
 #include <cudf/utilities/traits.hpp>
 
 #include <rmm/device_buffer.hpp>
@@ -32,6 +33,7 @@
 #include <limits>
 #include <optional>
 #include <stdexcept>
+#include <unordered_map>
 
 // The high-level JIT decode bridge is defined here alongside DecodeWalk because
 // buffer binding may recursively materialize entropy tails. Its low-level
@@ -229,26 +231,20 @@ std::unordered_map<std::string, cudf::column_view> channels_by_name(
 //   parent's output value. The result is a view into the shared memo, which keeps it until the walk
 //   ends.
 //
-// Element size for the data slot:
-//   rle.runs  -> always sizeof(int32_t) (run counts are int32 regardless of
-//               the column's original type).
-//   all others -> element_size (original column element size).
+// `data_elem_size` is the leaf's lane width (see lane_elem_sizes).
 void bind_raw_passthrough_buffers(std::int32_t node_id,
                                   NodeId parent_id,
                                   std::string const& parent_op,
                                   std::string const& parent_channel,
                                   PlanTree const& tree,
-                                  std::size_t element_size,
+                                  std::size_t data_elem_size,
                                   ::cuda::stream_ref stream,
                                   codegen::jit::LabeledBuffers& labeled,
                                   DecodeWalk& walk)
 {
   // The fused-tree builder always records the materialized channel name on the
-  // raw-passthrough origin (differences / runs / values / deltas).
+  // raw-passthrough origin (differences / runs / values / deltas / zigzag).
   std::string const& channel_name = parent_channel;
-
-  // run-count elements are always int32, regardless of the original column type.
-  const std::size_t data_elem_size = (channel_name == "runs") ? sizeof(std::int32_t) : element_size;
 
   // Locate the RawFused rep in the parent's channels.
   compressed_representation const* rep = nullptr;
@@ -387,6 +383,24 @@ void bind_real_node_buffers(std::int32_t node_id,
   }
 }
 
+// Each fused node's lane width, as both renderers type it: Rle's `runs` are int32 run
+// counts, and every other child inherits its parent's width (the root's is the column's).
+std::unordered_map<codegen::jit::FusedTree const*, std::size_t> lane_elem_sizes(
+  codegen::jit::FusedTree const& root, std::size_t element_size)
+{
+  std::unordered_map<codegen::jit::FusedTree const*, std::size_t> sizes;
+  auto const visit =
+    [&](auto const& self, codegen::jit::FusedTree const& node, std::size_t width) -> void {
+    sizes.emplace(&node, width);
+    for (auto const& [name, child] : node.children) {
+      bool const runs = node.op == codegen::OpKind::Rle && name == "runs";
+      self(self, *child, runs ? sizeof(std::int32_t) : width);
+    }
+  };
+  visit(visit, root, element_size);
+  return sizes;
+}
+
 // Bind every node's device buffers from an already-built fused subtree in the
 // builder's DFS-preorder (preorder index == rendered kernel node_id). The
 // structural shape (op kinds, children, node-id order) is the builder's
@@ -399,23 +413,21 @@ void bind_fused_subtree(BuiltFusedTree const& built,
                         codegen::jit::LabeledBuffers& labeled,
                         DecodeWalk& walk)
 {
+  auto const lane_sizes = lane_elem_sizes(*built.tree, element_size);
   for (std::int32_t node_id = 0; node_id < static_cast<std::int32_t>(built.preorder.size());
        ++node_id) {
     auto const& origin = built.preorder[node_id];
-    // Transformer-mode ZigZag stores nothing (it rewrites the lane value
-    // inline and recurses); the decode renderer emits no params for it, so
-    // there is no buffer to bind. Skip it — the child binds its own buffers.
-    if (origin.node != nullptr && origin.node->op == codegen::OpKind::Zigzag &&
-        !origin.node->children.empty()) {
-      continue;
-    }
+    // ZigZag stores nothing (it rewrites the lane value inline and recurses);
+    // the decode renderer emits no params for it, so there is no buffer to
+    // bind. Skip it — the child binds its own buffers.
+    if (origin.node != nullptr && origin.node->op == codegen::OpKind::Zigzag) { continue; }
     if (origin.is_raw_passthrough) {
       bind_raw_passthrough_buffers(node_id,
                                    origin.parent_node,
                                    origin.parent_op,
                                    origin.parent_channel,
                                    tree,
-                                   element_size,
+                                   lane_sizes.at(origin.node),
                                    stream,
                                    labeled,
                                    walk);
@@ -456,12 +468,24 @@ bound_fused_region bind_fused_region(PlanTree const& tree,
 
   compressed_representation const* root_repr = node_rep(root_nid, tree);
   if (root_repr == nullptr) {
-    // Transformer-mode root (e.g. ZigZag with a codegen child) stores no rep;
-    // find the first non-null rep in the already-built preorder for metadata.
+    // A ZigZag root stores no rep; find the first non-null rep in the
+    // already-built preorder for metadata, else a Raw passthrough's rep parked
+    // in its parent's channels (ZigZag over a Raw leaf owns no other).
     for (auto const& origin : built->preorder) {
       if (!origin.is_raw_passthrough && origin.plan_node < tree.nodes.size()) {
         root_repr = node_rep(origin.plan_node, tree);
         if (root_repr) break;
+      }
+    }
+    for (auto const& origin : built->preorder) {
+      if (root_repr != nullptr) break;
+      if (!origin.is_raw_passthrough || origin.parent_node >= tree.nodes.size()) continue;
+      auto const& parent = tree.nodes[origin.parent_node];
+      for (auto const& [path, crep] : parent.channels) {
+        if (crep && port_for_output_path(parent, path) == origin.parent_channel) {
+          root_repr = crep.get();
+          break;
+        }
       }
     }
     if (root_repr == nullptr) {
@@ -486,6 +510,38 @@ bound_fused_region bind_fused_region(PlanTree const& tree,
 
 bool uses_index_walk(PlanTree const& tree, decode_selection const& sel);
 
+/// The element type to store when a column decoded as @p decoded may be written directly as
+/// @p target, or nullptr when it may not. Allowed: a strictly wider signed integer, a DECIMAL of
+/// the same scale and greater width, or a wider DECIMAL or TIMESTAMP_DAYS from a narrower raw
+/// signed integer (the decode's representation of a stored DECIMAL or narrowed DATE; the caller
+/// checks the stored type's scale, see decompress_scan_filter). Each is a lossless sign-extending
+/// widening, so the stored value keeps its meaning.
+char const* widened_element_dtype(cudf::data_type decoded, cudf::data_type target)
+{
+  auto const is_signed_int = [](cudf::type_id id) {
+    return id == cudf::type_id::INT8 || id == cudf::type_id::INT16 || id == cudf::type_id::INT32 ||
+           id == cudf::type_id::INT64;
+  };
+  auto const is_decimal = [](cudf::type_id id) {
+    return id == cudf::type_id::DECIMAL32 || id == cudf::type_id::DECIMAL64;
+  };
+  if (!cudf::is_fixed_width(decoded) || !cudf::is_fixed_width(target) ||
+      cudf::size_of(target) <= cudf::size_of(decoded)) {
+    return nullptr;
+  }
+  bool const same_family =
+    (is_signed_int(decoded.id()) && is_signed_int(target.id())) ||
+    (is_decimal(decoded.id()) && is_decimal(target.id()) && decoded.scale() == target.scale()) ||
+    (is_signed_int(decoded.id()) &&
+     (is_decimal(target.id()) || target.id() == cudf::type_id::TIMESTAMP_DAYS));
+  if (!same_family) { return nullptr; }
+  switch (cudf::size_of(target)) {
+    case 4: return "int32_t";
+    case 8: return "int64_t";
+    default: return nullptr;
+  }
+}
+
 // Bind one region, allocate its output, and queue the decode launch.
 std::unique_ptr<cudf::column> decode_fused_subtree_impl(PlanTree const& tree,
                                                         NodeId root_nid,
@@ -500,8 +556,16 @@ std::unique_ptr<cudf::column> decode_fused_subtree_impl(PlanTree const& tree,
     throw std::runtime_error("decode selection exceeds the column row count");
   }
   auto const out_rows = masked ? static_cast<cudf::size_type>(sel->survivor_count) : num_rows;
-  auto output         = cudf::make_fixed_width_column(
-    region.root_type, out_rows, cudf::mask_state::UNALLOCATED, frame.stream(), frame.mr());
+  // A bitpack-rooted compacted decode can store each value directly in the wider type the caller
+  // will restore the column to, which saves a separate widening pass over the column.
+  char const* const out_dtype    = masked && root_nid < tree.nodes.size() &&
+                                    tree.nodes[root_nid].op == "bitpack" &&
+                                    sel->output_type.has_value()
+                                     ? widened_element_dtype(region.root_type, *sel->output_type)
+                                     : nullptr;
+  cudf::data_type const out_type = out_dtype != nullptr ? *sel->output_type : region.root_type;
+  auto output                    = cudf::make_fixed_width_column(
+    out_type, out_rows, cudf::mask_state::UNALLOCATED, frame.stream(), frame.mr());
   if (out_rows == 0) return output;
   auto const& built   = region.built;
   auto const& labeled = region.labeled;
@@ -525,7 +589,8 @@ std::unique_ptr<cudf::column> decode_fused_subtree_impl(PlanTree const& tree,
                                        hollow,
                                        row_enumeration{nullptr, sel->rows},
                                        out,
-                                       frame);
+                                       frame,
+                                       out_dtype);
     return output;
   }
   bool const by_index = uses_index_walk(tree, *sel);
@@ -537,7 +602,8 @@ std::unique_ptr<cudf::column> decode_fused_subtree_impl(PlanTree const& tree,
     *sel->mask,
     row_enumeration{by_index ? sel->survivor_indices.data<std::int32_t>() : nullptr, nullptr},
     out,
-    frame);
+    frame,
+    out_dtype);
   return output;
 }
 

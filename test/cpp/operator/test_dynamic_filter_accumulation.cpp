@@ -18,9 +18,11 @@
 #include "op/dynamic_filter/detail/accumulated_bloom_builder.hpp"
 #include "op/dynamic_filter/detail/accumulation_failure.hpp"
 #include "op/dynamic_filter/dynamic_filter_replica_reservation.hpp"
+#include "op/scan/dynamic_filter_merge.hpp"
 #include "sirius/exception.hpp"
 #include "utils/host_allocation_fault.hpp"
 #include "utils/sirius_test_env.hpp"
+#include "utils/test_validation_utility.hpp"
 
 #include <cudf/column/column_view.hpp>
 #include <cudf/copying.hpp>
@@ -333,13 +335,14 @@ TEST_CASE("publication waits for contributions still queued on every GPU",
 {
   if (!sirius::test::has_gpus(2)) { return; }
   auto const gpus = std::min(acc::visible_gpus(), 3);
-  if (!acc::has_peer_connected_gpus(gpus)) { return; }
+  if (!sirius::test::has_gpus(gpus)) { return; }
   // "sources": GPU 1 contributes, so the root merges it (fold, source-ready wait, merge, egress).
   // "root only": only the root contributes, so every other GPU copies the root's array directly
   // (fold, root-ready wait, egress). With three GPUs, GPU 2 is a target that contributes nothing.
   bool const with_sources = GENERATE(true, false);
   acc::load_accumulation_kernels(static_cast<std::size_t>(gpus));
   acc::fixture fixture({.devices = static_cast<std::size_t>(gpus)});
+  if (!acc::has_pool_access(fixture.spaces)) { return; }
   auto const settled = fixture.make_batch(with_sources ? 1 : 0, 0, 4000);
   auto const on_root = fixture.make_batch(0, 10'000, 4000);
   auto const queued  = fixture.make_batch(with_sources ? 1 : 0, 20'000, 4000);
@@ -368,7 +371,7 @@ TEST_CASE("the chunk pipeline publishes the exact union to every GPU",
 {
   if (!sirius::test::has_gpus(2)) { return; }
   auto const gpus = std::min(acc::visible_gpus(), 4);
-  if (!acc::has_peer_connected_gpus(gpus)) { return; }
+  if (!sirius::test::has_gpus(gpus)) { return; }
   // 4'718'593 rows give 9'437'216-byte arrays: five 2 MiB chunks per key with a short last chunk,
   // so two keys cross both scratch buffers several times.
   constexpr cudf::size_type rows_per_batch = 1'179'649;
@@ -396,6 +399,7 @@ TEST_CASE("the chunk pipeline publishes the exact union to every GPU",
   }
 
   acc::fixture fixture({.devices = static_cast<std::size_t>(gpus), .gpu_bytes = 2048 * mib});
+  if (!acc::has_pool_access(fixture.spaces)) { return; }
   // GPU 0 holds two batches. With more than two GPUs the last GPU holds none, so it is a target
   // that is not a source.
   std::array<int, 4> const device_of{0, 0, 1, gpus > 2 ? 2 : 1};
@@ -439,7 +443,7 @@ TEST_CASE("the chunk pipeline publishes the exact union to every GPU",
 TEST_CASE("non-aligned geometries publish with exactly the scratch lease free",
           "[dynamic_filter][multi_partition][mgpu][multi_gpu]")
 {
-  if (!acc::has_peer_connected_gpus(2)) { return; }
+  if (!sirius::test::has_gpus(2)) { return; }
   struct case_shape {
     cudf::size_type first_rows;
     cudf::size_type second_rows;
@@ -451,6 +455,7 @@ TEST_CASE("non-aligned geometries publish with exactly the scratch lease free",
   auto const shape_case = GENERATE(case_shape{500'000, 500'000, 1, 16 * mib},
                                    case_shape{10'485'768, 10'485'768, 0, 96 * mib});
   acc::fixture fixture({.devices = 2, .gpu_bytes = 4096 * mib});
+  if (!acc::has_pool_access(fixture.spaces)) { return; }
   auto const first    = fixture.make_batch(0, 0, shape_case.first_rows);
   auto const second   = fixture.make_batch(1, 100'000'000, shape_case.second_rows);
   auto const extra    = fixture.make_batch(1, 200'000'000, shape_case.extra_rows);
@@ -540,8 +545,9 @@ TEST_CASE("duplicates and retries count once and only the final original ID publ
 TEST_CASE("a refused task scratch allocation skips publication before enqueueing anything",
           "[dynamic_filter][multi_partition][mgpu][multi_gpu]")
 {
-  if (!acc::has_peer_connected_gpus(2)) { return; }
+  if (!sirius::test::has_gpus(2)) { return; }
   acc::fixture fixture({.devices = 2});
+  if (!acc::has_pool_access(fixture.spaces)) { return; }
   auto const first  = fixture.make_batch(0, 0, 4000);
   auto const second = fixture.make_batch(1, 10'000, 4000);
   REQUIRE(fixture.begin({first, second}));
@@ -676,8 +682,9 @@ TEST_CASE("a tracked task thread publishes without releasing partial storage",
 TEST_CASE("a tracked task thread charges the merge scratch to its own reservation",
           "[dynamic_filter][multi_partition][mgpu][multi_gpu]")
 {
-  if (!acc::has_peer_connected_gpus(2)) { return; }
+  if (!sirius::test::has_gpus(2)) { return; }
   acc::fixture fixture({.devices = 2});
+  if (!acc::has_pool_access(fixture.spaces)) { return; }
   auto const first    = fixture.make_batch(1, 0, 4000);
   auto const second   = fixture.make_batch(0, 10'000, 4000);
   auto const baseline = fixture.allocated_bytes();
@@ -714,8 +721,9 @@ TEST_CASE(
   "a tracked task thread admits a merge scratch larger than its reservation as its task would",
   "[dynamic_filter][multi_partition][mgpu][multi_gpu]")
 {
-  if (!acc::has_peer_connected_gpus(2)) { return; }
+  if (!sirius::test::has_gpus(2)) { return; }
   acc::fixture fixture({.devices = 2});
+  if (!acc::has_pool_access(fixture.spaces)) { return; }
   // One million rows: one 2,000,128-byte chunk per key, so the root's double-buffered scratch
   // for its one source exceeds a 1 MiB task reservation.
   auto const first    = fixture.make_batch(1, 0, 500'000);
@@ -796,6 +804,7 @@ TEST_CASE("a contribution that does not match its partial's GPU fails the attemp
 {
   if (!sirius::test::has_gpus(2)) { return; }
   acc::fixture fixture({.devices = 2});
+  if (!acc::has_pool_access(fixture.spaces)) { return; }
   auto const first  = fixture.make_batch(0, 0, 300);
   auto const remote = fixture.make_batch(1, 900, 300);
   REQUIRE(fixture.begin({first, remote},
@@ -936,6 +945,7 @@ void exercise_pending_cuda_error(bool per_stream, bool reduction)
   CAPTURE(per_stream, reduction);
   {
     acc::fixture fixture({.devices = reduction ? 2U : 1U, .per_stream_tracking = per_stream});
+    if (!acc::has_pool_access(fixture.spaces)) { return; }
     auto const first    = fixture.make_batch(0, 0, 300);
     auto const second   = fixture.make_batch(reduction ? 1 : 0, 900, 300);
     auto const baseline = fixture.allocated_bytes();
@@ -1005,7 +1015,7 @@ TEST_CASE("a pending CUDA error propagates from contribution", "[dynamic_filter]
 TEST_CASE("a pending CUDA error propagates from reduction",
           "[dynamic_filter][multi_partition][mgpu][multi_gpu]")
 {
-  if (!acc::has_peer_connected_gpus(2)) { return; }
+  if (!sirius::test::has_gpus(2)) { return; }
   exercise_pending_cuda_error(GENERATE(false, true), true);
 }
 
@@ -1062,8 +1072,9 @@ TEST_CASE("a tracked thread never releases partial storage", "[dynamic_filter][m
 TEST_CASE("a refused partial lease on a later GPU rolls back every partial",
           "[dynamic_filter][multi_partition][mgpu][multi_gpu]")
 {
-  if (!acc::has_peer_connected_gpus(2)) { return; }
+  if (!sirius::test::has_gpus(2)) { return; }
   acc::fixture fixture({.devices = 2});
+  if (!acc::has_pool_access(fixture.spaces)) { return; }
   auto const first    = fixture.make_batch(0, 0, 300'000);
   auto const second   = fixture.make_batch(1, 900'000, 300'000);
   auto const baseline = fixture.allocated_bytes();
@@ -1086,6 +1097,7 @@ TEST_CASE("a publication root without a partial declines and settles",
 {
   if (!sirius::test::has_gpus(2)) { return; }
   acc::fixture fixture({.devices = 2});
+  if (!acc::has_pool_access(fixture.spaces)) { return; }
   auto const first    = fixture.make_batch(0, 0, 300);
   auto const second   = fixture.make_batch(0, 900, 300);
   auto const baseline = fixture.allocated_bytes();
@@ -1113,6 +1125,7 @@ TEST_CASE("a publication on another GPU's stream fails before it enqueues anythi
 {
   if (!sirius::test::has_gpus(2)) { return; }
   acc::fixture fixture({.devices = 2});
+  if (!acc::has_pool_access(fixture.spaces)) { return; }
   auto const first    = fixture.make_batch(0, 0, 300);
   auto const second   = fixture.make_batch(0, 900, 300);
   auto const baseline = fixture.allocated_bytes();
@@ -1699,4 +1712,208 @@ TEST_CASE("fatal accumulation diagnostics do not allocate during host OOM",
   }
   REQUIRE(preserved);
   REQUIRE(allocations == 0);
+}
+
+TEST_CASE("cached fusion probes accumulated Bloom replicas through narrower carriers",
+          "[dynamic_filter][multi_partition][fused_consumer]")
+{
+  acc::fixture fixture;
+  auto first  = fixture.make_batch(0, 0, 300);
+  auto second = fixture.make_batch(0, 900, 300);
+  REQUIRE(fixture.begin({first, second}));
+  fixture.contribute(first);
+  fixture.contribute(second);
+  fixture.publish(0, second->get_batch_id());
+  auto const stream = fixture.task_stream(0);
+  auto const mr     = fixture.gpu(0).get_default_allocator();
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(
+    make_probe<int16_t>({0, 1, 299, 500, 900}, stream, {true, false, true, true, true}));
+  columns.push_back(make_probe<int32_t>({1, 4, 898, 1501, 2701}, stream));
+  auto source = sirius::make_data_batch(
+    std::make_unique<cudf::table>(std::move(columns)), fixture.gpu(0), stream, {});
+  auto const view = sirius::get_cudf_table_view(*source);
+  op::scan::dynamic_filter_consumer ordinary(
+    fixture.channel, {.force_counts = true, .fused_membership = false}, {});
+  op::scan::dynamic_filter_consumer fused(
+    fixture.channel, {.force_counts = true, .fused_membership = true}, {});
+  std::array bindings{op::scan::binding{0, 0}, op::scan::binding{1, 1}};
+  op::scan::cached_view_layout layout;
+  layout.output_columns    = {0, 1};
+  layout.projected_columns = {1, 0};
+  op::scan::application_input input{
+    .source = view, .bindings = bindings, .cached_layout = &layout, .want_row_positions = true};
+  auto a = ordinary.prepare(input);
+  auto b = fused.prepare(input);
+  REQUIRE(a);
+  REQUIRE(b);
+  REQUIRE(op::scan::detail::consumer_test_access::same_selection(*a, *b));
+  auto left = ordinary.apply(
+    std::move(*a), op::scan::owning_table_view{source->to_read_only(), view}, stream, mr);
+  auto right = fused.apply(
+    std::move(*b), op::scan::owning_table_view{source->to_read_only(), view}, stream, mr);
+  REQUIRE(op::scan::detail::consumer_test_access::storage(left).fused_rounds == 0);
+  REQUIRE(op::scan::detail::consumer_test_access::storage(right).fused_rounds == 1);
+  REQUIRE(std::vector<cudf::size_type>(left.prefix_counts().begin(), left.prefix_counts().end()) ==
+          std::vector<cudf::size_type>(right.prefix_counts().begin(), right.prefix_counts().end()));
+  auto output_a = left.take_output();
+  auto output_b = right.take_output();
+  REQUIRE(sirius::test::expect_tables_equivalent_impl(output_a->view(), output_b->view(), stream));
+  auto positions_a = left.take_row_positions();
+  auto positions_b = right.take_row_positions();
+  REQUIRE(sirius::test::operator_utils::copy_column_to_host<int32_t>(positions_a->view(), stream) ==
+          sirius::test::operator_utils::copy_column_to_host<int32_t>(positions_b->view(), stream));
+  REQUIRE(ordinary.finish(std::move(left), 1).applied == fused.finish(std::move(right), 1).applied);
+}
+
+TEST_CASE("cached fusion finds device-local replicas when a second GPU applies",
+          "[dynamic_filter][multi_partition][fused_consumer][mgpu][multi_gpu]")
+{
+  if (!sirius::test::has_gpus(2)) { return; }
+  // Replicas live in each GPU's own memory pool, and GPU 1 loses access to GPU 0's pool once
+  // replication completes. With replicas on both GPUs, a fused path that reads another GPU's
+  // replica then faults with an illegal address; this is the only arm that catches a lookup on the
+  // source or root device (GPU 0). With every replica on GPU 1 alone, the source, root, and
+  // applying GPU are all GPU 1, so a GPU 0 lookup finds no replica and fusion declines.
+  bool const remote_only = GENERATE(false, true);
+  CAPTURE(remote_only);
+  int const home = remote_only ? 1 : 0;
+  acc::fixture fixture({.devices = 2});
+  if (!acc::has_pool_access(fixture.spaces)) { return; }
+  auto const remote = fixture.make_batch(1, 900, 300);
+  auto const local  = fixture.make_batch(home, 0, 300);
+  REQUIRE(fixture.begin({remote, local},
+                        fixture.make_plan(256 * mib,
+                                          {cudf::data_type{cudf::type_id::INT32},
+                                           cudf::data_type{cudf::type_id::INT64}},
+                                          remote_only ? std::vector<int>{1} : std::vector<int>{})));
+  fixture.contribute(remote);
+  fixture.contribute(local);
+  fixture.publish(home, local->get_batch_id());
+  REQUIRE(fixture.stats.snapshot().accumulation_publications_finished == 1);
+
+  // Two exact-set filters for the INT64 key, so the one fused round reads all three replica stores.
+  std::shared_ptr<op::sirius_dynamic_in_list_filter> in_list;
+  std::shared_ptr<op::sirius_dynamic_small_in_list_filter> needles;
+  {
+    rmm::cuda_set_device_raii const on_home{rmm::cuda_device_id{home}};
+    auto const stream      = fixture.task_stream(home);
+    auto const mr          = fixture.gpu(home).get_default_allocator();
+    auto const set_keys    = make_probe<std::int64_t>({1, 4, 7, 2701}, stream);
+    auto const needle_keys = make_probe<std::int64_t>({4, 898, 2701}, stream);
+    in_list = std::make_shared<op::sirius_dynamic_in_list_filter>(set_keys->view(), stream, mr);
+    needles =
+      std::make_shared<op::sirius_dynamic_small_in_list_filter>(needle_keys->view(), stream, mr);
+    stream.sync();
+    if (!remote_only) {
+      in_list->replicate_to_devices(fixture.spaces);
+      needles->replicate_to_devices(fixture.spaces);
+    }
+  }
+  std::size_t const replicas = remote_only ? 1 : 2;
+  for (std::size_t key : {0, 1}) {
+    REQUIRE(fixture.published_bloom(key).replica_count() == replicas);
+    REQUIRE(fixture.published_bloom(key).is_available_on_device(1));
+    REQUIRE(fixture.published_bloom(key).is_available_on_device(0) == !remote_only);
+  }
+  REQUIRE(in_list->replica_count() == replicas);
+  REQUIRE(needles->replica_count() == replicas);
+  REQUIRE(in_list->is_available_on_device(1));
+  REQUIRE(needles->is_available_on_device(1));
+  REQUIRE(in_list->is_available_on_device(0) == !remote_only);
+  REQUIRE(needles->is_available_on_device(0) == !remote_only);
+  // The memory manager grants every GPU access to every pool, under which a remote replica read
+  // would silently succeed. The fixture owns the pool, so the revocation ends with it.
+  {
+    auto const pool = fixture.allocator(0).pool_handle();
+    REQUIRE(pool != nullptr);
+    cudaMemLocation accessor{};
+    accessor.type = cudaMemLocationTypeDevice;
+    accessor.id   = 1;
+    cudaMemAccessDesc const revoke{.location = accessor, .flags = cudaMemAccessFlagsProtNone};
+    REQUIRE(cudaMemPoolSetAccess(pool, &revoke, 1) == cudaSuccess);
+    cudaMemAccessFlags flags{};
+    REQUIRE(cudaMemPoolGetAccess(&flags, pool, &accessor) == cudaSuccess);
+    REQUIRE(flags == cudaMemAccessFlagsProtNone);
+  }
+
+  auto channel  = std::make_shared<op::sirius_dynamic_filter_set>();
+  auto producer = channel->register_producer({0, 1, 2, 3});
+  REQUIRE(producer.push_filter(0, acc::filters_on_column(*fixture.channel, 0).front()));
+  REQUIRE(producer.push_filter(1, acc::filters_on_column(*fixture.channel, 1).front()));
+  REQUIRE(producer.push_filter(2, in_list));
+  REQUIRE(producer.push_filter(3, needles));
+
+  // Every result, column, and batch below is destroyed while GPU 1 is current.
+  rmm::cuda_set_device_raii const on_remote{rmm::cuda_device_id{1}};
+  using access      = op::scan::detail::consumer_test_access;
+  auto const stream = fixture.task_stream(1);
+  auto const mr     = fixture.gpu(1).get_default_allocator();
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(
+    make_probe<int16_t>({0, 1, 299, 100, 900}, stream, {true, false, true, true, true}));
+  columns.push_back(
+    make_probe<int32_t>({1, 4, 898, 0, 2701}, stream, {true, true, true, false, true}));
+  auto source = sirius::make_data_batch(
+    std::make_unique<cudf::table>(std::move(columns)), fixture.gpu(1), stream, {});
+  auto const view = sirius::get_cudf_table_view(*source);
+  op::scan::dynamic_filter_consumer ordinary(
+    channel, {.force_counts = true, .fused_membership = false}, {});
+  op::scan::dynamic_filter_consumer fused(
+    channel, {.force_counts = true, .fused_membership = true}, {});
+  std::array bindings{op::scan::binding{0, 0},
+                      op::scan::binding{1, 1},
+                      op::scan::binding{2, 1},
+                      op::scan::binding{3, 1}};
+  op::scan::cached_view_layout layout;
+  layout.output_columns    = {0, 1};
+  layout.projected_columns = {1, 0};
+  // The default device ID resolves to the current GPU 1, as production's does.
+  op::scan::application_input input{
+    .source = view, .bindings = bindings, .cached_layout = &layout, .want_row_positions = true};
+  auto a = ordinary.prepare(input);
+  auto b = fused.prepare(input);
+  REQUIRE(a);
+  REQUIRE(b);
+  REQUIRE(access::same_selection(*a, *b));
+  auto left = ordinary.apply(
+    std::move(*a), op::scan::owning_table_view{source->to_read_only(), view}, stream, mr);
+  auto right = fused.apply(
+    std::move(*b), op::scan::owning_table_view{source->to_read_only(), view}, stream, mr);
+  REQUIRE(left.completed());
+  REQUIRE(right.completed());
+  REQUIRE(access::storage(left).fused_rounds == 0);
+  REQUIRE(access::storage(right).fused_rounds == 1);
+  auto const counts =
+    std::vector<cudf::size_type>(right.prefix_counts().begin(), right.prefix_counts().end());
+  REQUIRE(std::vector<cudf::size_type>(left.prefix_counts().begin(), left.prefix_counts().end()) ==
+          counts);
+  auto output_a = left.take_output();
+  auto output_b = right.take_output();
+  REQUIRE(sirius::test::expect_tables_equivalent_impl(output_a->view(), output_b->view(), stream));
+  auto positions_a = left.take_row_positions();
+  auto positions_b = right.take_row_positions();
+  auto const host_a =
+    sirius::test::operator_utils::copy_column_to_host<int32_t>(positions_a->view(), stream);
+  REQUIRE(host_a ==
+          sirius::test::operator_utils::copy_column_to_host<int32_t>(positions_b->view(), stream));
+  REQUIRE(host_a == std::vector<int32_t>{4});
+  auto const receipt_a = ordinary.finish(std::move(left), 1);
+  auto const receipt_b = fused.finish(std::move(right), 1);
+  REQUIRE(receipt_a.applied == receipt_b.applied);
+  REQUIRE(receipt_b.applied.size() == 4);
+  // The rows each channel ordinal keeps. Every Bloom probe value is a build key or null, so no
+  // false positive can change a count.
+  std::array<std::vector<int32_t>, 4> const keeps{
+    {{0, 2, 3, 4}, {0, 1, 2, 4}, {0, 1, 4}, {1, 2, 4}}};
+  // The receipt lists the filters in probe order, which follows the channel snapshot.
+  std::vector<int32_t> survivors{0, 1, 2, 3, 4};
+  std::vector<cudf::size_type> expected{5};
+  for (auto const& applied : receipt_b.applied) {
+    auto const& keep = keeps.at(applied.output_ordinal);
+    std::erase_if(survivors,
+                  [&](int32_t row) { return std::ranges::find(keep, row) == keep.end(); });
+    expected.push_back(static_cast<cudf::size_type>(survivors.size()));
+  }
+  REQUIRE(counts == expected);
 }

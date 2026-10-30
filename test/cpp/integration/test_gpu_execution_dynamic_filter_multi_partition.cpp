@@ -18,6 +18,7 @@
 #include <catch.hpp>
 #include <cucascade/memory/common.hpp>
 #include <duckdb.hpp>
+#include <memory/pool_peer_access.hpp>
 #include <unistd.h>
 #include <utils/dynamic_filter_test_utils.hpp>
 #include <utils/gpu_execution_fixture.hpp>
@@ -83,9 +84,9 @@ void require_complete_publication(observed_run const& run, result_rows const& cp
 
 /**
  * @brief Checks a run whose accumulation declined at start because a pair of its GPUs has no
- * working peer DMA: the results still match the CPU and nothing else ended the attempt.
+ * available pool access: the results still match the CPU and nothing else ended the attempt.
  */
-void require_peerless_decline(observed_run const& run, result_rows const& cpu_rows)
+void require_pool_access_decline(observed_run const& run, result_rows const& cpu_rows)
 {
   REQUIRE(run.rows == cpu_rows);
   REQUIRE(run.after.accumulations_started == run.before.accumulations_started);
@@ -118,16 +119,17 @@ result_rows run_on_cpu(duckdb::Connection& con, std::string const& query)
  * port of the union operator, so the build PARTITION still has one finished source pipeline, and a
  * probe-side union exposes one scan target per arm.
  *
- * @param peer_dma Whether every pair of the session's GPUs has working peer DMA; without it the
- * accumulation declines by design and only the results and the decline are checked
+ * @param pool_access Whether each of the session's GPUs was granted access to every other GPU's
+ * allocation pool; without it the accumulation declines by design and only the results and the
+ * decline are checked
  */
-void check_union_all_accumulation(duckdb::Connection& con, bool peer_dma = true)
+void check_union_all_accumulation(duckdb::Connection& con, bool pool_access = true)
 {
-  auto const require_outcome = [peer_dma](observed_run const& run, result_rows const& cpu_rows) {
-    if (peer_dma) {
+  auto const require_outcome = [pool_access](observed_run const& run, result_rows const& cpu_rows) {
+    if (pool_access) {
       require_complete_publication(run, cpu_rows);
     } else {
-      require_peerless_decline(run, cpu_rows);
+      require_pool_access_decline(run, cpu_rows);
     }
   };
   scoped_sirius_setting gpu_on(con, "gpu_execution", true);
@@ -172,7 +174,7 @@ void check_union_all_accumulation(duckdb::Connection& con, bool peer_dma = true)
     auto const cpu_rows = run_on_cpu(con, query);
     auto const run      = run_on_gpu(con, query);
     require_outcome(run, cpu_rows);
-    if (peer_dma) { REQUIRE(run.after.filters_pushed - run.before.filters_pushed >= 2); }
+    if (pool_access) { REQUIRE(run.after.filters_pushed - run.before.filters_pushed >= 2); }
   }
 }
 
@@ -194,13 +196,6 @@ TEST_CASE("gpu_execution - multi-partition accumulation through UNION ALL on two
   auto* env = sirius::test::acquire_integration_env_for(2);
   REQUIRE(env != nullptr);
   REQUIRE(env->is_active());
-  // Accumulation reduces the per-GPU arrays over peer DMA and declines to start without it.
-  bool const peer_dma =
-    cucascade::memory::probe_peer_dma_works(0, 1) && cucascade::memory::probe_peer_dma_works(1, 0);
-  if (!peer_dma) {
-    WARN("no working peer DMA between GPUs 0 and 1; checking only results and the decline");
-  }
-
   auto const database = std::filesystem::temp_directory_path() /
                         ("sirius_df_union_mgpu_" + std::to_string(::getpid()) + ".db");
   absl::Cleanup remove_database = [&database] {
@@ -209,10 +204,17 @@ TEST_CASE("gpu_execution - multi-partition accumulation through UNION ALL on two
     std::filesystem::remove(database.string() + ".wal", ignored);
   };
   {
-    auto con = std::make_unique<duckdb::Connection>(env->make_connection());
+    auto con      = std::make_unique<duckdb::Connection>(env->make_connection());
+    auto& manager = sirius::test::get_registered_sirius_context(*con)->get_memory_manager();
+    bool const pool_access = !sirius::memory::find_pair_without_pool_access(
+      manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU));
+    if (!pool_access) {
+      WARN("pool access unavailable; checking SQL results and admission decline");
+    }
+
     run_ok(*con, "ATTACH '" + database.string() + "' AS df_union_mgpu;");
     run_ok(*con, "USE df_union_mgpu;");
-    check_union_all_accumulation(*con, peer_dma);
+    check_union_all_accumulation(*con, pool_access);
     con->Query("USE memory;");
     con->Query("DETACH df_union_mgpu;");
   }

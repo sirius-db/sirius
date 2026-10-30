@@ -51,6 +51,7 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/assert.hpp"
 #include "duckdb/common/limits.hpp"
+#include "duckdb/common/multi_file/multi_file_reader.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
@@ -315,6 +316,22 @@ unique_ptr<FunctionData> SiriusReadParquetBind(ClientContext& context,
     uri, bind_result.total_num_rows, return_types, IdentifiersToStrings(names));
 }
 
+virtual_column_map_t SiriusReadParquetVirtualColumns(ClientContext&, optional_ptr<FunctionData>)
+{
+  // Match the native Parquet binder's identities and types. These are virtual
+  // bindings, not footer columns: SELECT * and physical name collisions remain
+  // governed by DuckDB's normal table-function binding rules.
+  virtual_column_map_t columns;
+  columns.emplace(MultiFileReader::COLUMN_IDENTIFIER_FILENAME,
+                  TableColumn("filename", LogicalType::VARCHAR));
+  columns.emplace(MultiFileReader::COLUMN_IDENTIFIER_FILE_INDEX,
+                  TableColumn("file_index", LogicalType::UBIGINT));
+  columns.emplace(MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER,
+                  TableColumn("file_row_number", LogicalType::BIGINT));
+  columns.emplace(COLUMN_IDENTIFIER_EMPTY, TableColumn("", LogicalType::BOOLEAN));
+  return columns;
+}
+
 // Execute callback for sirius_read_parquet. The real scan runs through the
 // Sirius GPU pipeline; this table function is an internal rewrite target for
 // read_parquet('s3://...') inside gpu_execution, NOT a user-facing function.
@@ -347,6 +364,7 @@ TableFunction GetSiriusReadParquetFunction()
                                     SiriusReadParquetFunction,
                                     SiriusReadParquetBind);
   sirius_read_parquet.cardinality         = SiriusReadParquetCardinality;
+  sirius_read_parquet.get_virtual_columns = SiriusReadParquetVirtualColumns;
   sirius_read_parquet.projection_pushdown = true;
   sirius_read_parquet.filter_pushdown     = true;
   sirius_read_parquet.filter_prune        = true;
@@ -712,7 +730,7 @@ void SiriusRegistration::GPUExecutionFunction(ClientContext& context,
   auto result_chunk = gstate.res->Fetch();
   if (result_chunk == nullptr) {
     gstate.finished = true;
-    output.SetCardinality(0);
+    output.CheckCardinality(0);
     return;
   }
 
@@ -876,8 +894,8 @@ std::unique_ptr<sirius::op::scan::duckdb_native_ingestible_table_info> build_duc
   // templated Catalog::GetEntry<DuckTableEntry> would ODR-use DuckTableEntry::Name
   // (a static constexpr inherited from TableCatalogEntry), emitting a duplicate
   // symbol against libduckdb_static at link time.
-  auto& entry_base =
-    duckdb::Catalog::GetEntry(context, duckdb::CatalogType::TABLE_ENTRY, catalog, schema, table);
+  auto& entry_base = duckdb::Catalog::GetEntry(
+    context, duckdb::CatalogType::TABLE_ENTRY, duckdb::QualifiedName(catalog, schema, table));
   auto& entry         = entry_base.Cast<duckdb::DuckTableEntry>();
   auto& storage       = entry.GetStorage();
   auto const& columns = entry.GetColumns();
@@ -1200,8 +1218,8 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
       if (data.args.tier == "parquet") {
         scan_mgr.pin_parquet_ranges(data.args.name, file_paths, data.args.cols);
         window.finish();
-        output.SetCardinality(1);
-        output.SetValue(0, 0, Value::BOOLEAN(true));
+        output.data[0].Append(Value::BOOLEAN(true));
+        output.CheckCardinality(1);
         data.finished = true;
         return;
       }
@@ -1431,8 +1449,8 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
         pin_metadata(mat.unique_verdicts, std::move(base_row_count_per_chunk)));
     }
 
-    output.SetCardinality(1);
-    output.SetValue(0, 0, Value::BOOLEAN(true));
+    output.data[0].Append(Value::BOOLEAN(true));
+    output.CheckCardinality(1);
     data.finished = true;
     window.finish();
   } catch (...) {
@@ -1484,8 +1502,8 @@ void SiriusRegistration::UnpinTableFunction(ClientContext& context,
     sirius_ctx->get_scan_manager().remove_pinned_entry(data.name);
   }
 
-  output.SetCardinality(1);
-  output.SetValue(0, 0, Value::BOOLEAN(true));
+  output.data[0].Append(Value::BOOLEAN(true));
+  output.CheckCardinality(1);
   data.finished = true;
 }
 
@@ -1528,8 +1546,8 @@ void SiriusRegistration::ResetSiriusCacheFunction(ClientContext& context,
     sirius_ctx->get_scan_manager().reset_caches();
   }
 
-  output.SetCardinality(1);
-  output.SetValue(0, 0, Value::BOOLEAN(true));
+  output.data[0].Append(Value::BOOLEAN(true));
+  output.CheckCardinality(1);
   data.finished = true;
 }
 
@@ -1550,8 +1568,8 @@ static void ProfilerStartFunction(ClientContext& context,
   auto& data = data_p.global_state->Cast<ProfilerFunctionData>();
   if (data.finished) return;
   cudaProfilerStart();
-  output.SetCardinality(1);
-  output.SetValue(0, 0, Value::BOOLEAN(true));
+  output.data[0].Append(Value::BOOLEAN(true));
+  output.CheckCardinality(1);
   data.finished = true;
 }
 
@@ -1562,8 +1580,8 @@ static void ProfilerStopFunction(ClientContext& context,
   auto& data = data_p.global_state->Cast<ProfilerFunctionData>();
   if (data.finished) return;
   cudaProfilerStop();
-  output.SetCardinality(1);
-  output.SetValue(0, 0, Value::BOOLEAN(true));
+  output.data[0].Append(Value::BOOLEAN(true));
+  output.CheckCardinality(1);
   data.finished = true;
 }
 
@@ -1598,8 +1616,8 @@ static void SiriusSetQueryLabelFunction(ClientContext& context,
     conn_state->set_pending_query_label(data.label);
   }
 
-  output.SetCardinality(1);
-  output.SetValue(0, 0, Value::BOOLEAN(true));
+  output.data[0].Append(Value::BOOLEAN(true));
+  output.CheckCardinality(1);
   data.finished = true;
 }
 
@@ -1713,8 +1731,9 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
   auto const catalog = qname.Catalog();  // empty => search path
   auto const schema  = !qname.Schema().empty() ? qname.Schema() : Identifier(data.schema_name);
   auto const& table  = qname.Name();
-  auto& entry_base   = Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, catalog, schema, table);
-  auto& entry        = entry_base.Cast<DuckTableEntry>();
+  auto& entry_base =
+    Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, QualifiedName(catalog, schema, table));
+  auto& entry             = entry_base.Cast<DuckTableEntry>();
   auto& entry_catalog     = entry.ParentCatalog().GetName().GetIdentifierName();
   auto& entry_schema      = entry.ParentSchema().name.GetIdentifierName();
   auto const& table_name  = entry.name.GetIdentifierName();
@@ -1938,8 +1957,8 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
   index_cache.insert(
     std::move(index_name), std::move(meta), std::move(handle), std::move(build_stream));
 
-  output.SetCardinality(1);
-  output.SetValue(0, 0, Value::BOOLEAN(true));
+  output.data[0].Append(Value::BOOLEAN(true));
+  output.CheckCardinality(1);
   gstate.finished = true;
 }
 
@@ -2023,8 +2042,9 @@ static void SiriusDropAnnIndexFunction(ClientContext& context,
   auto const catalog = qname.Catalog();  // empty => search path
   auto const schema  = !qname.Schema().empty() ? qname.Schema() : Identifier(data.schema_name);
   auto const& table  = qname.Name();
-  auto& entry_base   = Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, catalog, schema, table);
-  auto& entry        = entry_base.Cast<DuckTableEntry>();
+  auto& entry_base =
+    Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, QualifiedName(catalog, schema, table));
+  auto& entry         = entry_base.Cast<DuckTableEntry>();
   auto& entry_catalog = entry.ParentCatalog().GetName().GetIdentifierName();
   auto& entry_schema  = entry.ParentSchema().name.GetIdentifierName();
 
@@ -2035,8 +2055,8 @@ static void SiriusDropAnnIndexFunction(ClientContext& context,
   std::size_t const removed = index_cache.erase_by_column(
     entry_catalog, entry_schema, entry.name.GetIdentifierName(), data.column_name, metric);
 
-  output.SetCardinality(1);
-  output.SetValue(0, 0, Value::BOOLEAN(removed > 0));
+  output.data[0].Append(Value::BOOLEAN(removed > 0));
+  output.CheckCardinality(1);
   gstate.finished = true;
 }
 
@@ -2154,8 +2174,8 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
   auto const qname   = QualifiedName::Parse(req.table_name);
   auto const catalog = qname.Catalog();
   auto const schema  = !qname.Schema().empty() ? qname.Schema() : Identifier(schema_name);
-  auto& entry_base =
-    Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, catalog, schema, qname.Name());
+  auto& entry_base   = Catalog::GetEntry(
+    context, CatalogType::TABLE_ENTRY, QualifiedName(catalog, schema, qname.Name()));
   auto& entry = entry_base.Cast<DuckTableEntry>();
   req.catalog = entry.ParentCatalog().GetName().GetIdentifierName();
   req.schema  = entry.ParentSchema().name.GetIdentifierName();
@@ -2273,7 +2293,8 @@ static unique_ptr<GlobalTableFunctionState> SiriusVectorSearchInit(ClientContext
   // were also fixed at bind time and may no longer describe the current table.
   auto const& req = bind_data.req;
   auto& entry     = Catalog::GetEntry<TableCatalogEntry>(
-    context, Identifier(req.catalog), Identifier(req.schema), Identifier(req.table_name));
+    context,
+    QualifiedName(Identifier(req.catalog), Identifier(req.schema), Identifier(req.table_name)));
   if (!entry.IsDuckTable() ||
       !req.table_identity.matches({entry.oid, entry.GetStorage().GetRowGroupCollection()})) {
     throw InvalidInputException(
@@ -2324,8 +2345,8 @@ static void SiriusSetSessionLabelFunction(ClientContext& context,
     conn_state->set_session_label(data.label);
   }
 
-  output.SetCardinality(1);
-  output.SetValue(0, 0, Value::BOOLEAN(true));
+  output.data[0].Append(Value::BOOLEAN(true));
+  output.CheckCardinality(1);
   data.finished = true;
 }
 
@@ -2701,6 +2722,14 @@ static void SetMaxBuildHashTableBytes(ClientContext& context, SetScope scope, Va
   params->max_build_hash_table_bytes = UBigIntValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config MAX_BUILD_HASH_TABLE_BYTES to {}",
                    params->max_build_hash_table_bytes);
+}
+
+static void SetMaxBuildProbeResidentBytes(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params                           = get_operator_params(context, scope);
+  params->max_build_probe_resident_bytes = UBigIntValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config MAX_BUILD_PROBE_RESIDENT_BYTES to {}",
+                   params->max_build_probe_resident_bytes);
 }
 
 static void SetMaxBroadcastJoinSize(ClientContext& context, SetScope scope, Value& parameter)
@@ -3386,11 +3415,20 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                             SetSortSampleBytes);
 
   config.AddExtensionOption("max_build_hash_table_bytes",
-                            "Maximum size a build-side table can be where it will create a "
-                            "reusable hash table for hash joins (i.e. BUILD_PROBE mode)",
+                            "Maximum per-GPU estimated BUILD_PROBE hash-table bytes (measured "
+                            "build rows x 16 B) for a hash join to build a reusable hash table "
+                            "(i.e. BUILD_PROBE mode)",
                             LogicalType::UBIGINT,
                             Value::UBIGINT(operator_defaults.max_build_hash_table_bytes),
                             SetMaxBuildHashTableBytes);
+
+  config.AddExtensionOption(
+    "max_build_probe_resident_bytes",
+    "Maximum per-GPU decoded folded build-side bytes a BUILD_PROBE hash join may "
+    "keep GPU-resident (un-spillable) for the whole probe stream",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(operator_defaults.max_build_probe_resident_bytes),
+    SetMaxBuildProbeResidentBytes);
 
   config.AddExtensionOption("max_broadcast_join_size",
                             "Maximum build-side size in bytes for a broadcast join, where the "

@@ -285,7 +285,9 @@ void populate_parquet_schema(sirius::op::scan::parquet_ingestible_table_info& ou
           id, scan_op.names[primary_idx], scan_op.returned_types[primary_idx], kind});
       }
     };
-    if (bind_data.reader_bind.filename_idx.IsValid()) {
+    if (bind_data.reader_bind.filename_idx.IsValid() &&
+        bind_data.reader_bind.filename_idx.GetIndex() !=
+          duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILENAME) {
       add_legacy_virtual(bind_data.reader_bind.filename_idx.GetIndex(),
                          sirius::op::scan::scan_plan::parquet_virtual_column_kind::FILENAME);
     }
@@ -551,7 +553,7 @@ void prepare_iceberg_statement(sirius::op::sirius_physical_operator& root,
     remote_puffins.push_back({contract, dv.file_path, std::move(scheme), backend_available});
   };
   std::vector<scan_dv_count> counts;
-  std::vector<scan_envelope> envelopes;
+  std::vector<preparation_request> requests;
   bool qualified = true;
   for (auto const& c : scans) {
     if (c.discovery->positional_delete_files.empty()) validate_deletion_vector_claims(*c.discovery);
@@ -581,7 +583,20 @@ void prepare_iceberg_statement(sirius::op::sirius_physical_operator& root,
     try {
       auto e = iceberg_dv_preparation::envelope(*c.discovery, c.info->resolved_file_paths);
       qualified &= e.qualified;
-      envelopes.push_back(std::move(e));
+      auto* candidate = &c;
+      requests.push_back({std::move(e),
+                          [candidate](preparation_ledger& ledger) {
+                            candidate->info->deferred = std::make_shared<iceberg_dv_preparation>(
+                              candidate->scan->contract_id,
+                              candidate->info->table_path,
+                              candidate->info->resolved_file_paths,
+                              candidate->discovery,
+                              ledger);
+                          },
+                          [candidate](std::shared_ptr<preparation_admission> admission) {
+                            candidate->info->deferred->bind_admission(std::move(admission));
+                          },
+                          [candidate]() noexcept { candidate->info->deferred.reset(); }});
     } catch (std::overflow_error const&) {
       qualified = false;
     }
@@ -602,15 +617,15 @@ void prepare_iceberg_statement(sirius::op::sirius_physical_operator& root,
                      ? counters->preparation_provider_for_testing.get()
                      : &provider;
   if (counters->track_units && counters->preparation_envelope_for_testing)
-    for (auto& envelope : envelopes)
-      counters->preparation_envelope_for_testing(envelope);
-  auto ledger = std::make_unique<preparation_ledger>(*selected);
+    for (auto& request : requests)
+      counters->preparation_envelope_for_testing(request.envelope);
   admission_decision decision;
+  bool arena_failed = false;
   bool route_allowed =
     counters->track_units && counters->statement_dv_limit_for_testing
       ? statement_dv_route_allowed(counts, *counters->statement_dv_limit_for_testing)
       : statement_dv_route_allowed(counts);
-  if (qualified && route_allowed && !envelopes.empty()) {
+  if (qualified && route_allowed && !requests.empty()) {
     auto spaces =
       sirius_ctx->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
     if (!spaces.empty()) {
@@ -618,47 +633,22 @@ void prepare_iceberg_statement(sirius::op::sirius_physical_operator& root,
       auto limits        = config.preparation.resolve(config.thread_pool.num_threads);
       auto permits       = static_cast<size_t>(config.thread_pool.num_threads);
       if (limits.max_inflight_dv_jobs) permits = std::min(permits, limits.max_inflight_dv_jobs);
-      decision = ledger->admit(envelopes, spaces.front()->get_id(), static_cast<uint32_t>(permits));
+      try {
+        decision = prepare_statement_resources(
+          *selected, requests, spaces.front()->get_id(), static_cast<uint32_t>(permits));
+      } catch (preparation_resource_error const&) {
+        arena_failed = true;
+      } catch (std::bad_alloc const&) {
+        arena_failed = true;
+      }
     }
   }
   std::string_view route_reason = !qualified           ? "unqualified_envelope"
                                   : !route_allowed     ? "statement_dv_limit"
-                                  : envelopes.empty()  ? "no_deferred_dv_work"
+                                  : requests.empty()   ? "no_deferred_dv_work"
+                                  : arena_failed       ? "arena_allocation"
                                   : !decision.deferred ? "host_admission"
                                                        : "deferred";
-  std::shared_ptr<preparation_admission> admission;
-  if (decision.deferred) {
-    // Construct all arenas before consuming the plan's one owning admission.
-    try {
-      for (auto& c : scans) {
-        if (!c.discovery->positional_delete_files.empty() ||
-            !c.discovery->equality_delete_entries.empty() ||
-            c.discovery->deletion_vector_entries.empty())
-          continue;
-        c.info->deferred = std::make_shared<iceberg_dv_preparation>(c.scan->contract_id,
-                                                                    c.info->table_path,
-                                                                    c.info->resolved_file_paths,
-                                                                    c.discovery,
-                                                                    *ledger);
-      }
-      admission = std::make_shared<preparation_admission>(std::move(ledger), decision);
-    } catch (preparation_resource_error const&) {
-      route_reason = "arena_allocation";
-      for (auto& c : scans)
-        c.info->deferred.reset();
-      ledger.reset();
-      // The admission decision is only valid while all deferred arenas exist.
-      // Clear it with the ledger so a remote Puffin cannot fall through to the
-      // eager payload path after a deferred allocation failure.
-      decision = {};
-    } catch (std::bad_alloc const&) {
-      route_reason = "arena_allocation";
-      for (auto& c : scans)
-        c.info->deferred.reset();
-      ledger.reset();
-      decision = {};
-    }
-  }
   if (!remote_puffins.empty()) {
     // Check each remote scan's final route; statement-level admission can leave a
     // mixed positional/DV statement partly eager.
@@ -682,9 +672,7 @@ void prepare_iceberg_statement(sirius::op::sirius_physical_operator& root,
       counters->iceberg_preparation_route_for_testing(c.scan->contract_id, bool(c.info->deferred));
   }
   for (auto& c : scans) {
-    if (c.info->deferred) {
-      c.info->deferred->bind_admission(admission);
-    } else {
+    if (!c.info->deferred) {
       duckdb::SiriusContext::InternalQueryGuard guard(context);
       auto started = std::chrono::steady_clock::now();
       auto sid =
@@ -786,6 +774,10 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_gpu_scan_leaf(
   duckdb::SiriusContext* sirius_ctx)
 {
   auto dynamic_filters = scan.sirius_dynamic_filters;
+  // Join construction registered every producer before collect_semantic_lineage(). Its
+  // no-producer check and this normalization therefore agree. An unpublished producer still
+  // blocks metadata-only reads; has_filters() cannot be used here. Direct ingestible callers
+  // may register later and must retain their non-null channel instead of normalizing it there.
   if (dynamic_filters && !dynamic_filters->has_producers()) { dynamic_filters.reset(); }
   // Parquet also prunes with its own snapshot of the channel.
   if constexpr (requires { info->sirius_dynamic_filters; }) {
@@ -803,6 +795,24 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_gpu_scan_leaf(
   }
 
   auto ingestible = sirius::op::scan::make_ingestible(std::move(info));
+  if constexpr (std::is_same_v<InfoT, op::scan::parquet_ingestible_table_info>) {
+    if (ingestible->source_selection_empty()) {
+      // Reuse EMPTY_RESULT's typed empty input. A zero-split scan can complete,
+      // but does not run its in-pipeline ungrouped aggregate (COUNT must emit 0).
+      // No execution-time resolver, datasource or footer is needed, and no
+      // physical-input certificate is fabricated for an eliminated file.
+      // The exact DuckDB schema retains LIST/STRUCT child metadata that the
+      // flat Sirius types omit. An owned empty collection carries it without IO.
+      auto schema = duckdb::make_uniq<duckdb::ColumnDataCollection>(
+        duckdb::Allocator::DefaultAllocator(), scan.duckdb_types);
+      auto empty = duckdb::make_uniq<op::sirius_physical_gpu_values>(
+        scan.types,
+        0,
+        duckdb::optionally_owned_ptr<duckdb::ColumnDataCollection>(std::move(schema)));
+      if (scan.has_physical_overrides()) { empty->set_physical_types(scan.get_physical_types()); }
+      return empty;
+    }
+  }
   auto consumer =
     dynamic_filters
       ? sirius::op::scan::make_dynamic_filter_consumer(
@@ -906,13 +916,23 @@ plan_lineage collect_semantic_lineage(
     if (scan.function.GetName() != "seq_scan" && scan.children.empty() && !scan.pre_declined) {
       op::scan::parquet_ingestible_table_info info;
       populate_parquet_schema(info, scan, context);
+      // Lineage must permit the same carrier-free virtual layout as the plain
+      // Parquet metadata reader. The ingestible still checks its final physical
+      // dependencies and read-mode eligibility before producing any split.
+      auto const& function_name = scan.function.GetName();
+      bool const allow_metadata_only =
+        (function_name == "parquet_scan" || function_name == "read_parquet" ||
+         function_name == "sirius_read_parquet") &&
+        info.has_requested_user_virtual_columns() &&
+        (!scan.sirius_dynamic_filters || !scan.sirius_dynamic_filters->has_producers());
       auto layout = op::scan::build_scan_plan(info.column_ids,
                                               info.projection_ids,
                                               info.names,
                                               info.returned_types,
                                               info.projected_output_count,
                                               info.partition_indices,
-                                              info.virtual_columns);
+                                              info.virtual_columns,
+                                              allow_metadata_only);
       scan.semantic_columns.assign(layout.data_columns.size(), false);
       for (std::size_t d = 0; d < layout.data_columns.size(); ++d)
         result.inputs.push_back({&scan, d});
@@ -1500,14 +1520,17 @@ bool join_concat_all(sirius::op::sirius_physical_operator const& join, bool is_b
   auto const& hash_join = join.Cast<sirius::op::sirius_physical_hash_join>();
   switch (hash_join.join_type) {
     case duckdb::JoinType::LEFT:
+    case duckdb::JoinType::SINGLE:
     case duckdb::JoinType::SEMI:
-    case duckdb::JoinType::ANTI: return is_build;
+    case duckdb::JoinType::ANTI:
+    // Every probe row must see its partition's whole build to get one mark; MARK may run
+    // hash-partitioned STANDARD, like SEMI.
+    case duckdb::JoinType::MARK: return is_build;
     case duckdb::JoinType::RIGHT:
     case duckdb::JoinType::RIGHT_SEMI:
     case duckdb::JoinType::RIGHT_ANTI: return !is_build;
     case duckdb::JoinType::OUTER: return true;
-    case duckdb::JoinType::INNER:
-    case duckdb::JoinType::MARK: return false;
+    case duckdb::JoinType::INNER: return false;
     default:
       throw duckdb::NotImplementedException("sirius_physical_hash_join: unsupported join type: " +
                                             duckdb::JoinTypeToString(hash_join.join_type));
@@ -2424,8 +2447,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalOperator& op)
       plan = create_plan(op.Cast<duckdb::LogicalDummyScan>());
       break;
     case duckdb::LogicalOperatorType::LOGICAL_ANY_JOIN:
-      throw duckdb::NotImplementedException("Any join not supported");
-      // plan = create_plan(op.Cast<duckdb::LogicalAnyJoin>());
+      plan = create_plan(op.Cast<duckdb::LogicalAnyJoin>());
       break;
     case duckdb::LogicalOperatorType::LOGICAL_ASOF_JOIN:
       throw duckdb::NotImplementedException("Asof join not supported");
@@ -2443,9 +2465,10 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalOperator& op)
       break;
     case duckdb::LogicalOperatorType::LOGICAL_UNION:
     case duckdb::LogicalOperatorType::LOGICAL_EXCEPT:
-    case duckdb::LogicalOperatorType::LOGICAL_INTERSECT:
+    case duckdb::LogicalOperatorType::LOGICAL_INTERSECT: {
       plan = create_plan(op.Cast<duckdb::LogicalSetOperation>());
       break;
+    }
     case duckdb::LogicalOperatorType::LOGICAL_INSERT:
       throw duckdb::NotImplementedException("Insert not supported");
       // plan = create_plan(op.Cast<duckdb::LogicalInsert>());

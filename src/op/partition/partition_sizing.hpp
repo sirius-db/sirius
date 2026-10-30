@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -42,6 +43,10 @@ struct partition_sizing_input {
   /// the bytes are a projection). Best effort: batches whose representation does not record a
   /// row count are counted at the bytes-per-row of the batches that do.
   uint64_t total_rows = 0;
+  /// Exact metadata row count for BUILD_PROBE admission; absent when any count is unavailable.
+  std::optional<uint64_t> measured_rows = std::nullopt;
+  /// Decoded payload bytes for the resident BUILD_PROBE bound; absent in unwired callers.
+  std::optional<uint64_t> resident_bytes = std::nullopt;
 };
 
 /// Consumer policy decision. Consumer-specific input bindings translate this into physical
