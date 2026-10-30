@@ -471,19 +471,28 @@ TEST_CASE("DuckLake temporal defaults preserve units and reject adjacent logical
     CHECK_THROWS(bind_field(99, type, Value(type)));
   }
 }
-TEST_CASE("Generic temporal mapping does not widen Iceberg admission",
-          "[ducklake_units][contracts]")
+TEST_CASE("DuckLake temporal files retain a carrier for defaults and zero-output scans",
+          "[ducklake_units][carrier_policy]")
 {
-  using duckdb::LogicalType;
-  duckdb::MultiFileBindData bind;
-  bind.columns.emplace_back("x", LogicalType::INTEGER);
-  bind.columns.back().identifier = duckdb::Value::INTEGER(1);
-  CHECK(sirius::planner::iceberg_flat_mapping_supported(&bind));
-  for (auto const& type : std::vector<LogicalType>{
-         LogicalType::DATE, LogicalType::TIMESTAMP, LogicalType::DECIMAL(18, 2)}) {
-    bind.columns.back().type = type;
-    CHECK_FALSE(sirius::planner::iceberg_flat_mapping_supported(&bind));
-  }
+  auto const timestamp = GENERATE(false, true);
+  auto const missing   = GENERATE(false, true);
+  CAPTURE(timestamp, missing);
+  auto footer = mapping_footer();
+  footer->schema.resize(2);
+  footer->schema[0].num_children = 1;
+  footer->schema[1].type         = timestamp ? pq::Type::INT64 : pq::Type::INT32;
+  footer->schema[1].converted_type =
+    timestamp ? pq::ConvertedType::TIMESTAMP_MICROS : pq::ConvertedType::DATE;
+  std::vector<scan::field_requirement> fields;
+  if (missing)
+    fields.push_back(bind_field(99, duckdb::LogicalType::INTEGER, duckdb::Value::INTEGER(7)));
+  auto mapping = compile_test(footer, fields);
+  CHECK(mapping.read_indices() == std::vector<cudf::size_type>{0});
+  CHECK(mapping.read_types() == std::vector<duckdb::LogicalType>{timestamp
+                                                                   ? duckdb::LogicalType::TIMESTAMP
+                                                                   : duckdb::LogicalType::DATE});
+  REQUIRE(mapping.program().input_types);
+  CHECK(mapping.program().input_types->size() == fields.size());
 }
 
 TEST_CASE("DuckLake temporal fields require matching physical annotations and units",

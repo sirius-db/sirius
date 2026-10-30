@@ -147,6 +147,7 @@ scan::field_id_mapping compile_field_mapping(std::shared_ptr<scan::parquet_metad
                                          identity,
                                          std::move(program),
                                          std::move(fields),
-                                         scan::field_mapping_scope::top_level_scalars);
+                                         scan::field_mapping_scope::top_level_scalars,
+                                         scan::row_count_carrier_policy::include_temporal);
 }
 }  // namespace sirius::ducklake
