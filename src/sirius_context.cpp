@@ -612,6 +612,7 @@ void SiriusContext::retire_query_work(sirius::query_id_t query_id, query_retirem
       SIRIUS_LOG_WARN("Distributed query {}: sent batches still held by the exchange after 1 min",
                       distributed);
     }
+    if (service) { service->forget(distributed); }
   }
 }
 

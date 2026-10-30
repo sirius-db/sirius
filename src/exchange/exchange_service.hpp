@@ -22,6 +22,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -93,6 +94,11 @@ class exchange_service {
   /// past that point; their later send() and close() throw.
   void shutdown();
 
+  /// This rank has retired @p query: drops what is kept for it, and what arrives for it from now
+  /// on. Queries are numbered when planned, so one run later (a prepared statement) can retire
+  /// after higher-numbered ones.
+  void forget(std::uint64_t query);
+
  private:
   struct held {
     rank_t from;
@@ -104,14 +110,18 @@ class exchange_service {
   void throw_if_failed();
   /// Fails @p query's receivers with @p error. @return false if it had already ended.
   bool end_query(std::uint64_t query, std::exception_ptr error);
+  [[nodiscard]] bool retired(std::uint64_t query) const;
 
   rank_t _rank;
   rank_t _world_size;
   std::mutex _mutex;
   std::map<stream_id, std::shared_ptr<inbound>> _receivers;
   std::map<stream_id, std::vector<held>> _held;
-  std::map<stream_id, bool> _detached;
+  std::set<stream_id> _detached;
   std::map<std::uint64_t, std::exception_ptr> _aborted;
+  /// Every query from 1 to this one has retired here, and so has each in _retired_above.
+  std::uint64_t _retired{0};
+  std::set<std::uint64_t> _retired_above;
   /// The transport's failure, worded for the queries after it.
   std::exception_ptr _error;
   // Last: its engine thread calls back into the members above until it is destroyed. Null once
