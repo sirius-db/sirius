@@ -18,6 +18,8 @@
 // scripts/distributed_test_nixl.sh) one rank per process and GPU.
 
 #include "catch.hpp"
+#include "exchange/exchange_runtime.hpp"
+#include "exchange/exchange_service.hpp"
 #include "exchange/nixl_fabric.hpp"
 #include "exchange/transport_test_utils.hpp"
 #include "sirius/exception.hpp"
@@ -106,6 +108,32 @@ int free_port()
   return 0;
 }
 
+/// Records what one stream's receiver is handed into @p got.
+struct recording_inbound : sirius::exchange::inbound {
+  recording_inbound(received& got, stream_id stream) : got(got), stream(stream) {}
+  void on_batch(rank_t from, std::uint64_t, std::shared_ptr<cucascade::data_batch> data) override
+  {
+    auto d = digest(data);
+    std::lock_guard lock{got.mutex};
+    got.batches[{from, stream}].push_back(std::move(d));
+    got.changed.notify_all();
+  }
+  void on_end(rank_t from) override
+  {
+    std::lock_guard lock{got.mutex};
+    got.ended.insert({from, stream});
+    got.changed.notify_all();
+  }
+  void on_error(std::exception_ptr error) override
+  {
+    std::lock_guard lock{got.mutex};
+    got.error = error;
+    got.changed.notify_all();
+  }
+  received& got;
+  stream_id stream;
+};
+
 /// Two ranks in this process, both on its GPU, connected with @p staging.
 std::pair<std::unique_ptr<nixl_rank>, std::unique_ptr<nixl_rank>> two_ranks(
   nixl_fabric::host_staging staging)
@@ -180,6 +208,57 @@ TEST_CASE("a fabric that cannot reach its peer leaves nothing in /dev/shm", "[ex
   auto const mirror = "/dev/shm/sirius-exchange-" + std::to_string(::getpid()) + "-0";
   CHECK_THROWS_AS(nixl_fabric(cfg, send, recv), sirius::internal_exception);
   CHECK_FALSE(std::filesystem::exists(mirror));
+}
+
+TEST_CASE("two ranks connect through make_nixl_exchange and exchange a batch", "[exchange][nixl]")
+{
+  using sirius::exchange::exchange_service;
+  std::vector<std::string> const peers{"127.0.0.1:" + std::to_string(free_port()),
+                                       "127.0.0.1:" + std::to_string(free_port())};
+  sirius::exchange::nixl_exchange_options const opts{
+    .frame_bytes = 64 * KiB, .send_frames = 4, .recv_frames_per_peer = 4};
+  // Each waits for the other's hello.
+  std::shared_ptr<exchange_service> s0;
+  std::exception_ptr s0_error;
+  std::thread other([&] {
+    try {
+      s0 = sirius::exchange::make_nixl_exchange(0, peers, *env().gpu, env().host, opts);
+    } catch (...) {
+      s0_error = std::current_exception();
+    }
+  });
+  std::shared_ptr<exchange_service> s1;
+  try {
+    s1 = sirius::exchange::make_nixl_exchange(1, peers, *env().gpu, env().host, opts);
+  } catch (...) {
+    other.join();
+    throw;
+  }
+  other.join();
+  if (s0_error) { std::rethrow_exception(s0_error); }
+
+  stream_id const stream = (stream_id{1} << sirius::exchange::query_stream_bits) | 1;
+  std::vector<std::shared_ptr<exchange_service>> services{s0, s1};
+  std::vector<received> got(2);
+  for (rank_t r = 0; r < 2; ++r) {
+    services[r]->attach(stream, std::make_shared<recording_inbound>(got[r], stream));
+  }
+  for (rank_t r = 0; r < 2; ++r) {
+    services[r]->send(stream, 1 - r, exchange_batch(r, 1 - r, 0, 20'000));
+    services[r]->close(stream, 1 - r);
+  }
+  for (rank_t r = 0; r < 2; ++r) {
+    auto& g = got[r];
+    REQUIRE(g.wait_for([&] { return g.error != nullptr || !g.ended.empty(); }));
+    std::lock_guard lock{g.mutex};
+    REQUIRE_FALSE(g.error);
+    CHECK(g.batches[{1 - r, stream}] ==
+          std::vector<table_digest>{digest(exchange_batch(1 - r, r, 0, 20'000))});
+  }
+  // The last reference tears down the service, then the fabric and the rings.
+  services.clear();
+  s0.reset();
+  s1.reset();
 }
 
 TEST_CASE("one rank per process exchanges batches over NIXL", "[.][nixl_multiprocess]")
