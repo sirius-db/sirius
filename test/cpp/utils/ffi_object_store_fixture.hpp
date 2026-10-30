@@ -41,8 +41,8 @@ struct object_store_inputs {
   std::string access_key{object_store_sentinels[0]};
   std::string secret_key{object_store_sentinels[1]};
   std::string session_token{object_store_sentinels[2]};
-  std::string transport{"auto"};
-  std::string signing_mode{"presigned"};
+  sirius::ffi::Transport transport{sirius::ffi::Transport::kAuto};
+  sirius::ffi::SigningMode signing_mode{sirius::ffi::SigningMode::kPresigned};
   std::string ca_bundle_path;
   std::string uri_prefix{"s3://bucket/prefix/"};
 

@@ -22,10 +22,27 @@
 #[allow(clippy::missing_safety_doc)]
 #[cxx::bridge(namespace = "sirius::ffi")]
 mod ffi {
+    /// Wire transport of an object-store snapshot (mirrors `sirius::ffi::Transport`).
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    #[repr(u8)]
+    enum Transport {
+        #[default]
+        kAuto,
+        kHttp,
+        kRdma,
+    }
+    /// SigV4 placement (mirrors `sirius::ffi::SigningMode`).
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    #[repr(u8)]
+    enum SigningMode {
+        #[default]
+        kPresigned,
+        kHeader,
+    }
+
     /// Named fields for building an [`ObjectStoreConfig`] snapshot; see the C++ struct for
-    /// the meaning and value sets of each field. `transport` and `signing_mode` take the C++
-    /// defaults (`"auto"`, `"presigned"`) when left empty. `Debug` is implemented by hand and
-    /// redacts the three credential fields.
+    /// the meaning of each field. `Debug` is implemented by hand and redacts the three
+    /// credential fields.
     #[derive(Clone, Default)]
     struct ObjectStoreConfigArgs {
         endpoint: String,
@@ -33,8 +50,8 @@ mod ffi {
         access_key: String,
         secret_key: String,
         session_token: String,
-        transport: String,
-        signing_mode: String,
+        transport: Transport,
+        signing_mode: SigningMode,
         ca_bundle_path: String,
         uri_prefix: String,
     }
@@ -42,6 +59,11 @@ mod ffi {
     unsafe extern "C++" {
         include!("sirius/ffi.hpp");
         include!("sirius-sys/src/shim.hpp");
+
+        // The enums are defined by the C++ header; these declarations make CXX check the shared
+        // declarations above against them instead of emitting a second definition.
+        type Transport;
+        type SigningMode;
 
         /// RAII handle to an initialized Sirius engine context.
         type Context;
@@ -92,24 +114,15 @@ mod ffi {
             new_session_token: &CxxString,
         ) -> SharedPtr<ObjectStoreConfig>;
 
-        /// The supplied snapshot when exactly one is published, otherwise the default-scope
-        /// snapshot or null. A nonempty set with several scoped-only entries therefore returns
-        /// null; use per-URI lookup to select among them. Returned snapshots remain valid after
-        /// replacement.
-        fn object_store_config(self: &Context) -> SharedPtr<ObjectStoreConfig>;
 
-        /// Atomically replace every published snapshot with `cfg` alone; null clears all
-        /// scopes. Fails (leaving the previous set active) when a required field is empty,
-        /// the endpoint is malformed, a value is outside its set, the CA bundle is unreadable,
-        /// or the configured IO backend does not honor an option. No network access.
-        /// Executions that already captured a snapshot keep it. Thread-safe; may be called
-        /// while queries run.
-        fn set_object_store(self: &Context, cfg: SharedPtr<ObjectStoreConfig>) -> Result<()>;
 
         /// Publish `cfg` for the scope named by its `uri_prefix`, replacing the snapshot
         /// published for exactly that prefix (the empty prefix is the default scope). Other
-        /// scopes are untouched. Same checks, failure behaviour and thread-safety as
-        /// `set_object_store`; a null pointer is rejected.
+        /// scopes are untouched. Fails (leaving the set unchanged) when a required field is
+        /// empty, the endpoint is malformed, the CA bundle is not a readable regular file, the
+        /// prefix is malformed, or the configured IO backend does not honor an option. No network
+        /// access; executions that already captured a set keep it. Thread-safe; a null pointer
+        /// is rejected.
         fn put_object_store(self: &Context, cfg: SharedPtr<ObjectStoreConfig>) -> Result<()>;
 
         /// Remove the snapshot published for exactly `uri_prefix`; removing an absent prefix
@@ -117,8 +130,10 @@ mod ffi {
         fn drop_object_store_prefix(ctx: &Context, uri_prefix: &CxxString) -> Result<()>;
 
         /// The snapshot that would serve `uri`: the longest matching published prefix, then
-        /// the default scope; null when none matches. Fails when the selected scope cannot
-        /// serve the key (an unstable key or a key containing `%`), as an execution would.
+        /// the default scope; null when nothing is published or no scope matches. Whenever at
+        /// least one snapshot is published, a key that cannot be matched byte-for-byte (an
+        /// empty, `.` or `..` segment, or a raw `%` byte) fails before any scope is selected,
+        /// default scope included, as an execution would.
         fn object_store_config_for_uri(
             ctx: &Context,
             uri: &CxxString,
@@ -152,7 +167,8 @@ impl std::fmt::Debug for ffi::ObjectStoreConfigArgs {
 }
 
 pub use ffi::{
-    Context, ObjectStoreConfig, ObjectStoreConfigArgs, drop_object_store_prefix, make_context,
+    Context, ObjectStoreConfig, ObjectStoreConfigArgs, SigningMode, Transport, drop_object_store_prefix,
+    make_context,
     make_context_from_config, make_context_from_config_with_object_store, make_object_store_config,
     object_store_config_for_uri,
 };

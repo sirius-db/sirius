@@ -145,22 +145,15 @@ void run_transaction_entry_hook() { run_hook(transaction_entry_mutex, transactio
 
 // --- ObjectStoreConfig checks ------------------------------------------------------------------
 //
-// Run at set_object_store() and at the object-store factory without object-store network
+// Run at put_object_store() and at the object-store factory without object-store network
 // access or backend-resource creation. CA readability may access the local filesystem.
 // Errors name the field and a fixed reason, never its value. Authentication, TLS and
 // network failures are reported when a snapshot is used.
 
-constexpr std::array<std::string_view, 3> kTransports{"auto", "http", "rdma"};
-constexpr std::array<std::string_view, 2> kSigningModes{"presigned", "header"};
 
 [[noreturn]] void invalid_field(const char* field, const char* reason)
 {
   throw std::invalid_argument(std::string("ObjectStoreConfig.") + field + ": " + reason);
-}
-
-bool one_of(std::string_view value, auto const& allowed)
-{
-  return std::find(allowed.begin(), allowed.end(), value) != allowed.end();
 }
 
 // Shape of an S3 service endpoint: value-free checks first, then the SigV4 authorizer's own
@@ -253,13 +246,14 @@ void check_intrinsic(const ObjectStoreConfig& cfg)
   if (cfg.region.empty()) { invalid_field("region", "required"); }
   if (cfg.access_key.empty()) { invalid_field("access_key", "required"); }
   if (cfg.secret_key.empty()) { invalid_field("secret_key", "required"); }
-  // The public value sets are exact: the engine's parser also knows an internal "https" alias
-  // for the HTTP transport, which is deliberately not accepted here.
-  if (!one_of(cfg.transport, kTransports)) {
-    invalid_field("transport", "must be one of auto, http, rdma");
+  // The enums have a fixed underlying byte; a value outside the declared set (a C++ cast or a
+  // raw bridge representation) is refused here, before backend support is consulted.
+  if (cfg.transport != Transport::kAuto && cfg.transport != Transport::kHttp &&
+      cfg.transport != Transport::kRdma) {
+    invalid_field("transport", "must be one of Transport::kAuto, kHttp, kRdma");
   }
-  if (!one_of(cfg.signing_mode, kSigningModes)) {
-    invalid_field("signing_mode", "must be one of presigned, header");
+  if (cfg.signing_mode != SigningMode::kPresigned && cfg.signing_mode != SigningMode::kHeader) {
+    invalid_field("signing_mode", "must be one of SigningMode::kPresigned, kHeader");
   }
   if (!cfg.ca_bundle_path.empty()) {
     // ifstream opens a directory on Linux; require a regular file before the readability probe.
@@ -320,7 +314,7 @@ void refuse_remote_reads(const std::vector<std::string>& remote_paths,
   if (set.empty()) {
     throw sirius::invalid_input_exception(
       "object_store_unconfigured: the plan reads '{}' from an object store or through an Iceberg "
-      "metadata path, but this Context has no object-store snapshot (Context::set_object_store)",
+      "metadata path, but this Context has no object-store snapshot (Context::put_object_store)",
       redacted_uri(remote_paths.front()));
   }
   // Every item is checked before any is served: a plan is refused whole.
@@ -343,11 +337,11 @@ void refuse_remote_reads(const std::vector<std::string>& remote_paths,
 void check_backend_support(const ObjectStoreConfig& cfg,
                            const sirius::scan_manager::scan_manager_config& scan_manager)
 {
-  if (cfg.transport == "rdma") {
+  if (cfg.transport == Transport::kRdma) {
     invalid_field("transport", "no S3-over-RDMA backend is registered in this build");
   }
   if (scan_manager.backend == sirius::scan_manager::io_backend::kvikio) {
-    if (cfg.signing_mode != "presigned") {
+    if (cfg.signing_mode != SigningMode::kPresigned) {
       invalid_field("signing_mode", "the configured kvikio backend does not honor a signing mode");
     }
     if (!cfg.ca_bundle_path.empty()) {
@@ -446,7 +440,7 @@ struct Context::Impl {
   // The published scope set, replaced as a whole under its own mutex (copy-on-write). An
   // execution captures the current set when its binding begins, inside the connection
   // transaction; object-store I/O routing is not implemented here. Writers additionally hold
-  // object_store_update_mutex across copy, edit and publish, so concurrent put/drop/set compose
+  // object_store_update_mutex across copy, edit and publish, so concurrent put/drop compose
   // like sequential ones; captures and getters never take it. Lock order: update, then
   // object_store_mutex; neither is held while conn_mutex is taken.
   std::mutex object_store_update_mutex;
@@ -559,18 +553,6 @@ Context::Context(const std::string& config_path) : impl_(std::make_unique<Impl>(
 
 Context::Context(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 
-std::shared_ptr<ObjectStoreConfig> Context::object_store_config() const
-{
-  auto const set = impl_->capture_object_store();
-  // Single-snapshot use (set_object_store) returns the supplied pointer whatever its prefix;
-  // with several scopes published, the default scope is the one this getter names.
-  if (set->size() == 1) { return set->front(); }
-  for (const auto& snapshot : *set) {
-    if (snapshot->uri_prefix.empty()) { return snapshot; }
-  }
-  return nullptr;
-}
-
 std::shared_ptr<ObjectStoreConfig> Context::object_store_config_for(std::string_view uri) const
 {
   auto const set = impl_->capture_object_store();
@@ -601,18 +583,6 @@ void Context::drop_object_store(std::string_view uri_prefix) const
     SIRIUS_LOG_INFO("[sirius_ffi] object store snapshot dropped for {} scope",
                     uri_prefix.empty() ? "the default" : "a prefixed");
   }
-}
-
-void Context::set_object_store(std::shared_ptr<ObjectStoreConfig> cfg) const
-{
-  if (cfg) { check_object_store(*cfg, impl_->context->get_config().get_scan_manager_config()); }
-  bool const published = cfg != nullptr;
-  impl_->update_object_store([&](const ObjectStoreScopeSet&) {
-    auto next = std::make_shared<ObjectStoreScopeSet>();
-    if (cfg) { next->push_back(cfg); }
-    return next;
-  });
-  SIRIUS_LOG_INFO("[sirius_ffi] object store snapshot {}", published ? "published" : "cleared");
 }
 
 std::shared_ptr<ObjectStoreConfig> ObjectStoreConfig::with_credentials(

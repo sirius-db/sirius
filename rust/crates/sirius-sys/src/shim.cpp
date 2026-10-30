@@ -6,16 +6,6 @@
 
 namespace sirius::ffi {
 
-namespace {
-
-// Empty `transport` / `signing_mode` take the C++ defaults, so Rust callers need not spell them.
-std::string or_default(const rust::String& value, const char* fallback)
-{
-  return value.empty() ? std::string(fallback) : std::string(value);
-}
-
-}  // namespace
-
 std::shared_ptr<ObjectStoreConfig> make_object_store_config(const ObjectStoreConfigArgs& args)
 {
   return std::make_shared<ObjectStoreConfig>(
@@ -24,8 +14,8 @@ std::shared_ptr<ObjectStoreConfig> make_object_store_config(const ObjectStoreCon
                       .access_key     = std::string(args.access_key),
                       .secret_key     = std::string(args.secret_key),
                       .session_token  = std::string(args.session_token),
-                      .transport      = or_default(args.transport, "auto"),
-                      .signing_mode   = or_default(args.signing_mode, "presigned"),
+                      .transport      = args.transport,
+                      .signing_mode   = args.signing_mode,
                       .ca_bundle_path = std::string(args.ca_bundle_path),
                       .uri_prefix     = std::string(args.uri_prefix)});
 }

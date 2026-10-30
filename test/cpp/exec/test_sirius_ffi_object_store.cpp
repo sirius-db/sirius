@@ -48,6 +48,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <thread>
 #include <type_traits>
@@ -57,10 +58,14 @@ namespace {
 
 using sirius::ffi::make_context_from_config;
 using sirius::ffi::ObjectStoreConfig;
+using sirius::ffi::SigningMode;
+using sirius::ffi::Transport;
 using sirius::test::object_store_inputs;
 using sirius::test::object_store_sentinels;
 using namespace std::chrono_literals;
 namespace fs = std::filesystem;
+
+constexpr char kFixtureUri[] = "s3://bucket/prefix/object";
 
 static_assert(std::is_aggregate_v<ObjectStoreConfig>);
 static_assert(std::is_const_v<decltype(ObjectStoreConfig::endpoint)> &&
@@ -89,7 +94,9 @@ void check_no_sentinels(std::string const& message)
 }
 
 template <typename Operation>
-void check_invalid(Operation&& operation, std::string const& field, char const* reason = nullptr)
+std::string check_invalid(Operation&& operation,
+                          std::string const& field,
+                          char const* reason = nullptr)
 {
   bool invalid_argument = false;
   std::string message;
@@ -106,6 +113,7 @@ void check_invalid(Operation&& operation, std::string const& field, char const* 
   if (invalid_argument) { CHECK(message.starts_with("ObjectStoreConfig." + field + ":")); }
   if (reason) { CHECK(message.find(reason) != std::string::npos); }
   check_no_sentinels(message);
+  return message;
 }
 
 void check_fields(ObjectStoreConfig const& actual, object_store_inputs const& expected)
@@ -165,17 +173,6 @@ std::vector<invalid_input> invalid_inputs()
     {"endpoint DEL byte", &object_store_inputs::endpoint, "https://h\x7f", "endpoint"},
     {"endpoint space", &object_store_inputs::endpoint, "https://h ost", "endpoint"},
     {"unterminated IPv6 literal", &object_store_inputs::endpoint, "https://[::1", "endpoint"},
-    {"empty transport", &object_store_inputs::transport, "", "transport"},
-    {"internal transport alias", &object_store_inputs::transport, "https", "transport"},
-    {"unknown transport",
-     &object_store_inputs::transport,
-     std::string(object_store_sentinels[0]),
-     "transport"},
-    {"empty signing mode", &object_store_inputs::signing_mode, "", "signing_mode"},
-    {"unknown signing mode",
-     &object_store_inputs::signing_mode,
-     std::string(object_store_sentinels[1]),
-     "signing_mode"},
     {"missing CA file",
      &object_store_inputs::ca_bundle_path,
      missing_ca.string(),
@@ -558,7 +555,7 @@ TEST_CASE("FFI object store factory rejects invalid configuration without leakin
   }
 }
 
-TEST_CASE("FFI object store setter rejects invalid configuration and preserves its snapshot",
+TEST_CASE("FFI object store publication rejects invalid configuration and preserves its snapshot",
           "[isolated_context][ffi][object_store]")
 {
   auto const original = object_store_inputs{}.snapshot();
@@ -567,10 +564,44 @@ TEST_CASE("FFI object store setter rejects invalid configuration and preserves i
     CAPTURE(item.name);
     object_store_inputs inputs;
     inputs.*(item.member) = item.value;
-    check_invalid([&] { context->set_object_store(inputs.snapshot()); }, item.field, item.reason);
-    CHECK(context->object_store_config().get() == original.get());
+    check_invalid([&] { context->put_object_store(inputs.snapshot()); }, item.field, item.reason);
+    CHECK(context->object_store_config_for(kFixtureUri).get() == original.get());
     // Keep later matrix entries independent after an unexpected successful publication.
-    context->set_object_store(original);
+    context->put_object_store(original);
+  }
+}
+
+TEST_CASE("FFI object store rejects undeclared enum values before publication",
+          "[isolated_context][ffi][object_store]")
+{
+  for (bool invalid_transport : {true, false}) {
+    auto const* field = invalid_transport ? "transport" : "signing_mode";
+    CAPTURE(field);
+    object_store_inputs inputs;
+    if (invalid_transport) {
+      inputs.transport = static_cast<Transport>(255);
+    } else {
+      inputs.signing_mode = static_cast<SigningMode>(255);
+    }
+    auto const rejected = inputs.snapshot();
+    // A broken factory validator must not bring up a second live engine.
+    auto const factory_error =
+      check_invalid([&] { (void)make_context_from_config(memory_config(), rejected); }, field);
+    CHECK(factory_error.find("255") == std::string::npos);
+    CHECK(factory_error.find("0xff") == std::string::npos);
+
+    auto const original = object_store_inputs{}.snapshot();
+    auto context        = make_context_from_config(memory_config(), original);
+    object_store_inputs fallback_inputs;
+    fallback_inputs.uri_prefix.clear();
+    auto const fallback = fallback_inputs.snapshot();
+    context->put_object_store(fallback);
+    auto const publication_error =
+      check_invalid([&] { context->put_object_store(rejected); }, field);
+    CHECK(publication_error.find("255") == std::string::npos);
+    CHECK(publication_error.find("0xff") == std::string::npos);
+    CHECK(context->object_store_config_for(kFixtureUri).get() == original.get());
+    CHECK(context->object_store_config_for("s3://other/object").get() == fallback.get());
   }
 }
 
@@ -588,8 +619,8 @@ TEST_CASE("FFI object store accepts IPv6 literals and decimal endpoint ports",
     object_store_inputs inputs;
     inputs.endpoint = endpoint;
     auto snapshot   = inputs.snapshot();
-    REQUIRE_NOTHROW(context->set_object_store(snapshot));
-    CHECK(context->object_store_config().get() == snapshot.get());
+    REQUIRE_NOTHROW(context->put_object_store(snapshot));
+    CHECK(context->object_store_config_for(kFixtureUri).get() == snapshot.get());
   }
 }
 
@@ -598,22 +629,25 @@ TEST_CASE("FFI object store backend policy rejects RDMA and kvikIO options",
 {
   auto const ca = fixture_path("ffi_object_store_test_ca.pem");
   REQUIRE(fs::is_regular_file(ca));
-  for (auto const& item : std::vector<invalid_input>{
-         {"RDMA", &object_store_inputs::transport, "rdma", "transport"},
-         {"kvikIO header", &object_store_inputs::signing_mode, "header", "signing_mode"},
-         {"kvikIO CA", &object_store_inputs::ca_bundle_path, ca.string(), "ca_bundle_path"}}) {
-    CAPTURE(item.name);
-    auto const config = item.member == &object_store_inputs::transport
+  for (auto const field : {"transport", "signing_mode", "ca_bundle_path"}) {
+    CAPTURE(field);
+    auto const config = std::string_view(field) == "transport"
                           ? memory_config()
                           : fixture_path("ffi_object_store_kvikio.yaml").string();
     object_store_inputs inputs;
-    auto const original   = inputs.snapshot();
-    inputs.*(item.member) = item.value;
-    auto const rejected   = inputs.snapshot();
-    check_invalid([&] { (void)make_context_from_config(config, rejected); }, item.field);
+    auto const original = inputs.snapshot();
+    if (std::string_view(field) == "transport") {
+      inputs.transport = Transport::kRdma;
+    } else if (std::string_view(field) == "signing_mode") {
+      inputs.signing_mode = SigningMode::kHeader;
+    } else {
+      inputs.ca_bundle_path = ca.string();
+    }
+    auto const rejected = inputs.snapshot();
+    check_invalid([&] { (void)make_context_from_config(config, rejected); }, field);
     auto context = make_context_from_config(config, original);
-    check_invalid([&] { context->set_object_store(rejected); }, item.field);
-    CHECK(context->object_store_config().get() == original.get());
+    check_invalid([&] { context->put_object_store(rejected); }, field);
+    CHECK(context->object_store_config_for(kFixtureUri).get() == original.get());
   }
 }
 
@@ -625,26 +659,26 @@ TEST_CASE("FFI object store factories preserve pointers without network access",
   object_store_inputs inputs;
   inputs.endpoint = observer.endpoint();
   inputs.endpoint.replace(0, 4, "https");
-  inputs.transport      = "http";
-  inputs.signing_mode   = "header";
+  inputs.transport      = Transport::kHttp;
+  inputs.signing_mode   = SigningMode::kHeader;
   inputs.ca_bundle_path = fixture_path("ffi_object_store_test_ca.pem").string();
   auto const config     = inputs.snapshot();
   {
     auto context = make_context_from_config("", nullptr);
     REQUIRE(context);
-    CHECK(context->object_store_config() == nullptr);
-    context->set_object_store(config);
-    CHECK(context->object_store_config().get() == config.get());
-    REQUIRE(context->object_store_config());
-    check_fields(*context->object_store_config(), inputs);
+    CHECK(context->object_store_config_for(kFixtureUri) == nullptr);
+    context->put_object_store(config);
+    CHECK(context->object_store_config_for(kFixtureUri).get() == config.get());
+    REQUIRE(context->object_store_config_for(kFixtureUri));
+    check_fields(*context->object_store_config_for(kFixtureUri), inputs);
   }
   {
     auto context = make_context_from_config("", config);
     REQUIRE(context);
-    CHECK(context->object_store_config().get() == config.get());
-    REQUIRE(context->object_store_config());
-    check_fields(*context->object_store_config(), inputs);
-    context->set_object_store(nullptr);
+    CHECK(context->object_store_config_for(kFixtureUri).get() == config.get());
+    REQUIRE(context->object_store_config_for(kFixtureUri));
+    check_fields(*context->object_store_config_for(kFixtureUri), inputs);
+    context->drop_object_store(config->uri_prefix);
   }
   observer.finish();
   CHECK(observer.error() == 0);
@@ -662,7 +696,7 @@ TEST_CASE("FFI object store factory refusal leaves the next context usable",
     auto const valid = object_store_inputs{}.snapshot();
     auto context     = make_context_from_config(memory_config(), valid);
     REQUIRE(context);
-    CHECK(context->object_store_config().get() == valid.get());
+    CHECK(context->object_store_config_for(kFixtureUri).get() == valid.get());
   }
 
   auto const missing_config = fixture_path("ffi_object_store_missing_config.yaml");
@@ -696,7 +730,7 @@ TEST_CASE("FFI object store publishes complete snapshots atomically",
   std::atomic<std::size_t> invalid{}, seen_first{}, seen_second{};
   std::jthread reader([&](std::stop_token stop) {
     auto observe = [&] {
-      auto snapshot = context->object_store_config();
+      auto snapshot = context->object_store_config_for(kFixtureUri);
       if (snapshot.get() == first.get()) {
         ++seen_first;
       } else if (snapshot.get() == second.get()) {
@@ -714,10 +748,10 @@ TEST_CASE("FFI object store publishes complete snapshots atomically",
   });
   started.wait();
   for (std::size_t i = 0; i < 256; ++i) {
-    context->set_object_store(i % 2 == 0 ? second : first);
+    context->put_object_store(i % 2 == 0 ? second : first);
     std::this_thread::yield();
   }
-  context->set_object_store(second);
+  context->put_object_store(second);
   auto const deadline = std::chrono::steady_clock::now() + 2s;
   while (seen_second.load() == 0 && std::chrono::steady_clock::now() < deadline) {
     std::this_thread::yield();
@@ -727,7 +761,7 @@ TEST_CASE("FFI object store publishes complete snapshots atomically",
   CHECK(seen_first.load() > 0);
   CHECK(seen_second.load() > 0);
   CHECK(invalid.load() == 0);
-  CHECK(context->object_store_config().get() == second.get());
+  CHECK(context->object_store_config_for(kFixtureUri).get() == second.get());
   check_fields(*first, object_store_inputs{});
   check_fields(*second, inputs);
 }
@@ -736,8 +770,8 @@ TEST_CASE("FFI object store credentials derive an immutable snapshot",
           "[isolated_context][ffi][object_store]")
 {
   ObjectStoreConfig defaults{};
-  CHECK(defaults.transport == "auto");
-  CHECK(defaults.signing_mode == "presigned");
+  CHECK(defaults.transport == Transport::kAuto);
+  CHECK(defaults.signing_mode == SigningMode::kPresigned);
   CHECK(defaults.session_token.empty());
   CHECK(defaults.ca_bundle_path.empty());
   CHECK(defaults.uri_prefix.empty());
@@ -746,8 +780,8 @@ TEST_CASE("FFI object store credentials derive an immutable snapshot",
   observer.positive_control();
   object_store_inputs inputs;
   inputs.endpoint       = observer.endpoint();
-  inputs.transport      = "http";
-  inputs.signing_mode   = "header";
+  inputs.transport      = Transport::kHttp;
+  inputs.signing_mode   = SigningMode::kHeader;
   inputs.ca_bundle_path = fixture_path("ffi_object_store_test_ca.pem").string();
   auto const original   = inputs.snapshot();
   auto const unchanged  = inputs;
@@ -796,18 +830,18 @@ TEST_CASE("FFI object store clears without invalidating retained snapshots",
   std::shared_ptr<ObjectStoreConfig> retained;
   {
     auto context = make_context_from_config(memory_config(), original);
-    retained     = context->object_store_config();
+    retained     = context->object_store_config_for(kFixtureUri);
 
     auto const equal_values = inputs.snapshot();
     REQUIRE(equal_values.get() != original.get());
-    context->set_object_store(equal_values);
-    CHECK(context->object_store_config().get() == equal_values.get());
-    context->set_object_store(nullptr);
-    CHECK(context->object_store_config() == nullptr);
+    context->put_object_store(equal_values);
+    CHECK(context->object_store_config_for(kFixtureUri).get() == equal_values.get());
+    context->drop_object_store(inputs.uri_prefix);
+    CHECK(context->object_store_config_for(kFixtureUri) == nullptr);
     REQUIRE(retained);
     check_fields(*retained, inputs);
-    context->set_object_store(retained);
-    CHECK(context->object_store_config().get() == retained.get());
+    context->put_object_store(retained);
+    CHECK(context->object_store_config_for(kFixtureUri).get() == retained.get());
   }
   CHECK(retained.get() == original.get());
   check_fields(*retained, inputs);
@@ -826,14 +860,15 @@ TEST_CASE("FFI object store accepts bucket and nested URI prefixes",
     inputs.uri_prefix     = prefix;
     auto const configured = inputs.snapshot();
     auto context          = make_context_from_config(memory_config(), configured);
-    CHECK(context->object_store_config().get() == configured.get());
-    REQUIRE(context->object_store_config());
-    check_fields(*context->object_store_config(), inputs);
-    context->set_object_store(nullptr);
-    context->set_object_store(configured);
-    CHECK(context->object_store_config().get() == configured.get());
-    REQUIRE(context->object_store_config());
-    check_fields(*context->object_store_config(), inputs);
+    auto const uri        = inputs.uri_prefix + "object";
+    CHECK(context->object_store_config_for(uri).get() == configured.get());
+    REQUIRE(context->object_store_config_for(uri));
+    check_fields(*context->object_store_config_for(uri), inputs);
+    context->drop_object_store(prefix);
+    context->put_object_store(configured);
+    CHECK(context->object_store_config_for(uri).get() == configured.get());
+    REQUIRE(context->object_store_config_for(uri));
+    check_fields(*context->object_store_config_for(uri), inputs);
   }
 }
 
@@ -902,8 +937,9 @@ TEST_CASE("FFI object store scopes bare empty and trailing object keys",
       {"", "s3://bucket/allowed/", false},
     };
     for (auto const& item : cases) {
+      context->drop_object_store(inputs.uri_prefix);
       inputs.uri_prefix = item.prefix;
-      context->set_object_store(inputs.snapshot());
+      context->put_object_store(inputs.snapshot());
       for (auto const entry : {entry_point::execute, entry_point::fragment_build}) {
         CAPTURE(item.prefix, item.path, entry == entry_point::execute);
         auto const plan = read_plan({{item.path}});
@@ -930,7 +966,11 @@ TEST_CASE("FFI object store refuses remote plans before range validation without
     auto const configured = inputs.snapshot();
     auto context          = make_context_from_config(memory_config(), nullptr);
     for (bool const has_snapshot : {false, true}) {
-      context->set_object_store(has_snapshot ? configured : nullptr);
+      if (has_snapshot) {
+        context->put_object_store(configured);
+      } else {
+        context->drop_object_store("");
+      }
       std::string const token =
         has_snapshot ? "object_store_route_unavailable:" : "object_store_unconfigured:";
       for (auto const entry : {entry_point::execute, entry_point::fragment_build}) {
@@ -998,9 +1038,9 @@ TEST_CASE("FFI object store failed fragment builds recapture on retry",
     auto const plan = read_plan({{"s3://bucket/k.parquet" + authentication_suffix()}});
     auto build      = [&] { fragment->build(plan); };
     check_refusal(build, "object_store_unconfigured:", "s3://bucket/k.parquet");
-    context->set_object_store(inputs.snapshot());
+    context->put_object_store(inputs.snapshot());
     check_refusal(build, "object_store_route_unavailable:", "s3://bucket/k.parquet");
-    context->set_object_store(nullptr);
+    context->drop_object_store("");
     check_refusal(build, "object_store_unconfigured:", "s3://bucket/k.parquet");
   }
   observer.finish();
@@ -1032,7 +1072,8 @@ TEST_CASE("FFI object store preserves captured snapshots across publication chan
       for (int action = 0; action != 4; ++action) {
         CAPTURE(entry == entry_point::execute, action);
         auto context = make_context_from_config(memory_config(), inputs_a.snapshot());
-        std::weak_ptr<ObjectStoreConfig> captured = context->object_store_config();
+        std::weak_ptr<ObjectStoreConfig> captured =
+          context->object_store_config_for("s3://bucket/k.parquet");
         auto const next = action == 1 ? snapshot_b : action == 2 ? replacement_b : nullptr;
         capture_pause_guard pause;
         sirius::ffi::testing::set_capture_pause_hook([&] { pause.pause(); });
@@ -1045,14 +1086,18 @@ TEST_CASE("FFI object store preserves captured snapshots across publication chan
         });
         auto const worker_id = pause.worker.get_id();
         REQUIRE(pause.wait_until_paused());
-        if (action == 2) {
-          context->put_object_store(next);
-        } else if (action == 3) {
+        if (action == 1) {
+          // The execution already holds its capture; finish both scoped edits before resuming it.
           context->drop_object_store("");
+          context->put_object_store(next);
+        } else if (action == 2) {
+          context->put_object_store(next);
         } else {
-          context->set_object_store(next);
+          context->drop_object_store("");
         }
-        CHECK(context->object_store_config().get() == next.get());
+        auto const* observed_uri =
+          action == 1 ? "s3://other-bucket/object" : "s3://bucket/k.parquet";
+        CHECK(context->object_store_config_for(observed_uri).get() == next.get());
         CHECK_FALSE(captured.expired());
 
         pause.finish();
@@ -1110,8 +1155,10 @@ TEST_CASE("FFI object store redacts credential-bearing URI forms at both entries
   };
   auto context = make_context_from_config(memory_config());
   for (int state = 0; state != 3; ++state) {
+    context->drop_object_store("s3://bucket/allowed/");
+    context->drop_object_store("");
     inputs.uri_prefix = state == 1 ? "s3://bucket/allowed/" : "";
-    context->set_object_store(state == 0 ? nullptr : inputs.snapshot());
+    if (state != 0) { context->put_object_store(inputs.snapshot()); }
     for (auto const& item : cases) {
       std::string const token = state == 0   ? "object_store_unconfigured:"
                                 : state == 1 ? "object_store_scope:"
@@ -1154,8 +1201,10 @@ TEST_CASE("FFI object store inventories direct and nested Iceberg metadata befor
   inputs.endpoint = observer.endpoint();
   auto context    = make_context_from_config(memory_config());
   for (int state = 0; state != 3; ++state) {
+    context->drop_object_store("s3://bucket/allowed/");
+    context->drop_object_store("");
     inputs.uri_prefix = state == 1 ? "s3://bucket/allowed/" : "";
-    context->set_object_store(state == 0 ? nullptr : inputs.snapshot());
+    if (state != 0) { context->put_object_store(inputs.snapshot()); }
     std::string const token = state == 0   ? "object_store_unconfigured:"
                               : state == 1 ? "object_store_scope:"
                                            : "object_store_route_unavailable:";
@@ -1196,13 +1245,13 @@ TEST_CASE("FFI object store scoped sets preserve longest matches and supplied po
   inputs.uri_prefix.clear();
   auto d = inputs.snapshot();
   context->put_object_store(a);
-  CHECK(context->object_store_config().get() == a.get());
+  CHECK(context->object_store_config_for("s3://b/x/object").get() == a.get());
   CHECK(context->object_store_config_for("s3://b/x/f").get() == a.get());
   CHECK(context->object_store_config_for("s3://other/f") == nullptr);
   context->put_object_store(b);
-  CHECK(context->object_store_config() == nullptr);
+  CHECK(context->object_store_config_for("s3://unclaimed/object") == nullptr);
   context->put_object_store(d);
-  CHECK(context->object_store_config().get() == d.get());
+  CHECK(context->object_store_config_for("s3://unclaimed/object").get() == d.get());
   CHECK(context->object_store_config_for("s3://b/x/f").get() == a.get());
   CHECK(context->object_store_config_for("s3://b/x/y/f").get() == b.get());
   CHECK(context->object_store_config_for("S3://b/x/y/f").get() == b.get());
@@ -1219,11 +1268,12 @@ TEST_CASE("FFI object store scoped sets preserve longest matches and supplied po
   CHECK(context->object_store_config_for("s3://b/x/y/f").get() == a.get());
   context->drop_object_store("");
   CHECK(context->object_store_config_for("s3://other/f") == nullptr);
-  context->set_object_store(b);
-  CHECK(context->object_store_config().get() == b.get());
+  context->drop_object_store(a->uri_prefix);
+  context->put_object_store(b);
+  CHECK(context->object_store_config_for("s3://b/x/y/object").get() == b.get());
   CHECK(context->object_store_config_for("s3://b/x/f") == nullptr);
-  context->set_object_store(nullptr);
-  CHECK(context->object_store_config() == nullptr);
+  context->drop_object_store(b->uri_prefix);
+  CHECK(context->object_store_config_for("s3://unclaimed/object") == nullptr);
   CHECK(context->object_store_config_for("s3://b/x/y/f") == nullptr);
 }
 
@@ -1283,7 +1333,8 @@ TEST_CASE("FFI object store applies the raw-key gate before selecting a scope",
 
     for (std::size_t index = 0; index < states.size(); ++index) {
       auto const& state = states[index];
-      context->set_object_store(nullptr);
+      context->drop_object_store(scoped->uri_prefix);
+      context->drop_object_store("");
       if (state.has_prefix) { context->put_object_store(scoped); }
       if (state.has_default) { context->put_object_store(fallback); }
       for (auto const& item : cases) {
@@ -1333,7 +1384,10 @@ TEST_CASE("FFI object store getters and execution refuse invalid selected keys w
     inputs.uri_prefix = prefix;
     auto scoped       = inputs.snapshot();
     for (bool with_default : {false, true}) {
-      context->set_object_store(scoped);
+      context->drop_object_store("s3://bucket/");
+      context->drop_object_store("s3://bucket/allowed/");
+      context->drop_object_store("");
+      context->put_object_store(scoped);
       if (with_default) { context->put_object_store(fallback); }
       for (auto const* suffix : {"", ".", "..", "./f", "../f", "a//f", "/f", "a%2fb", "f/"}) {
         std::string const uri = std::string(prefix) + suffix;
@@ -1369,7 +1423,7 @@ TEST_CASE("FFI object store drop validates keys and leaves absent keys unchanged
                           "s3://b/./"}) {
     CAPTURE(key);
     check_invalid([&] { context->drop_object_store(key); }, "uri_prefix");
-    CHECK(context->object_store_config().get() == original.get());
+    CHECK(context->object_store_config_for("s3://bucket/allowed/object").get() == original.get());
     CHECK(context->object_store_config_for("s3://bucket/allowed/f").get() == original.get());
   }
   operation_deadline deadline("absent drop while a capture is retained");
@@ -1389,7 +1443,7 @@ TEST_CASE("FFI object store drop validates keys and leaves absent keys unchanged
   CHECK_NOTHROW(context->drop_object_store("s3://bucket/missing/"));
   CHECK_NOTHROW(context->drop_object_store(""));
   CHECK(original.use_count() == owners);
-  CHECK(context->object_store_config().get() == original.get());
+  CHECK(context->object_store_config_for("s3://bucket/allowed/object").get() == original.get());
   CHECK(context->object_store_config_for("s3://bucket/allowed/f").get() == original.get());
   pause.finish();
   check_refusal(
@@ -1419,14 +1473,18 @@ TEST_CASE("FFI object store concurrent writers have serializable membership and 
   for (int round = 0; round != 16; ++round) {
     for (int pair = 0; pair != 4; ++pair) {
       CAPTURE(round, pair);
-      context->set_object_store(a);
+      context->drop_object_store(a->uri_prefix);
+      context->drop_object_store(b->uri_prefix);
+      context->drop_object_store(c->uri_prefix);
+      context->put_object_store(a);
       std::barrier start(3);
       std::exception_ptr first_error, second_error;
       std::jthread first([&] {
         start.arrive_and_wait();
         try {
           if (pair == 3) {
-            context->set_object_store(nullptr);
+            // Race a same-key drop against put, keeping unrelated A published.
+            context->drop_object_store(b->uri_prefix);
           } else {
             context->put_object_store(b);
           }
@@ -1456,7 +1514,7 @@ TEST_CASE("FFI object store concurrent writers have serializable membership and 
       REQUIRE_FALSE(first_error);
       REQUIRE_FALSE(second_error);
       CHECK(context->object_store_config_for("s3://b/a/f").get() ==
-            ((pair == 0 || pair == 2) ? a.get() : nullptr));
+            (pair == 1 ? nullptr : a.get()));
       auto const observed_b = context->object_store_config_for("s3://b/b/f");
       if (pair == 3) {
         CHECK((observed_b == nullptr || observed_b.get() == b.get()));
@@ -1485,17 +1543,21 @@ TEST_CASE("FFI object store retired owners can reenter publication methods",
       std::atomic<bool> deleted{}, saw_new{}, failed{};
     };
     auto state        = std::make_shared<result>();
-    inputs.uri_prefix = "s3://b/old/";
+    inputs.uri_prefix = replacement->uri_prefix;
     auto old          = std::shared_ptr<ObjectStoreConfig>(
       new ObjectStoreConfig(*inputs.snapshot()),
       [weak_context, state, replacement, extra, operation](ObjectStoreConfig* raw) {
         std::unique_ptr<ObjectStoreConfig> reclaim(raw);
         if (auto owner = weak_context.lock()) {
           try {
-            bool saw_new = owner->object_store_config().get() == replacement.get();
+            bool saw_new =
+              owner->object_store_config_for("s3://b/new/object").get() == replacement.get();
             if (operation == 0) { owner->put_object_store(extra); }
             if (operation == 1) { owner->drop_object_store(replacement->uri_prefix); }
-            if (operation == 2) { owner->set_object_store(extra); }
+            if (operation == 2) {
+              owner->drop_object_store(replacement->uri_prefix);
+              owner->put_object_store(extra);
+            }
             if (operation == 3) {
               saw_new = saw_new &&
                         owner->object_store_config_for("s3://b/new/f").get() == replacement.get();
@@ -1507,9 +1569,9 @@ TEST_CASE("FFI object store retired owners can reenter publication methods",
           state->deleted = true;
         }
       });
-    context->set_object_store(old);
+    context->put_object_store(old);
     old.reset();
-    context->set_object_store(replacement);
+    context->put_object_store(replacement);
     CAPTURE(operation);
     CHECK(state->deleted.load());
     CHECK(state->saw_new.load());
@@ -1518,7 +1580,8 @@ TEST_CASE("FFI object store retired owners can reenter publication methods",
           ((operation == 0 || operation == 3) ? replacement.get() : nullptr));
     CHECK(context->object_store_config_for("s3://b/extra/f").get() ==
           ((operation == 0 || operation == 2) ? extra.get() : nullptr));
-    context->set_object_store(nullptr);
+    context->drop_object_store(replacement->uri_prefix);
+    context->drop_object_store(extra->uri_prefix);
   }
 }
 
@@ -1568,8 +1631,10 @@ TEST_CASE("FFI object store queued binding captures after transaction admission"
       }
     });
     REQUIRE(queue.wait(queue.second_entered));
-    context->set_object_store(b);
-    CHECK(context->object_store_config().get() == b.get());
+    // The first query is paused with A captured, and the second is still awaiting admission.
+    context->drop_object_store(a->uri_prefix);
+    context->put_object_store(b);
+    CHECK(context->object_store_config_for("s3://b/b/f").get() == b.get());
     queue.finish();
     CHECK(queue.captures == 2);
     check_refusal(
@@ -1613,7 +1678,7 @@ TEST_CASE("FFI object store failed execution attempts release captures before re
           deleted = true;
         }
       });
-    context->set_object_store(a);
+    context->put_object_store(a);
     std::weak_ptr<ObjectStoreConfig> weak_a = a;
     a.reset();
     operation_deadline deadline("failed execution capture cleanup");
@@ -1636,7 +1701,7 @@ TEST_CASE("FFI object store failed execution attempts release captures before re
       }
     });
     REQUIRE(pause.wait_until_paused());
-    context->set_object_store(nullptr);
+    context->drop_object_store(inputs.uri_prefix);
     CHECK_FALSE(weak_a.expired());
     pause.finish();
     check_refusal(
@@ -1671,7 +1736,7 @@ TEST_CASE("FFI object store successful local fragments retain captures through r
   auto context  = make_context_from_config(memory_config(), std::move(a));
   auto fragment = sirius::ffi::make_fragment(*context);
   fragment->build(read_plan({{files.file("one.parquet")}}));
-  context->set_object_store(nullptr);
+  context->drop_object_store("s3://bucket/prefix/");
   CHECK_FALSE(retained.expired());
   fragment->run();
   CHECK_FALSE(retained.expired());
