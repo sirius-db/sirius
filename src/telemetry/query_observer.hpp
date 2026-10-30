@@ -16,8 +16,9 @@
 
 #pragma once
 
-#include "telemetry/telemetry_context.hpp"
+#include "telemetry/query_activity.hpp"
 
+#include <algorithm>
 #include <mutex>
 #include <stdexcept>
 #include <utility>
@@ -54,6 +55,7 @@ class query_observer {
   query_observer(query_observer&& other) noexcept
     : metadata_(std::move(other.metadata_)),
       phase_(other.phase_),
+      activities_(std::move(other.activities_)),
       context_(std::move(other.context_)),
       handle_(std::exchange(other.handle_, std::nullopt)),
       details_handle_(std::exchange(other.details_handle_, std::nullopt)),
@@ -75,6 +77,7 @@ class query_observer {
       metadata_revision_ = std::exchange(other.metadata_revision_, 0);
       metadata_          = std::move(other.metadata_);
       phase_             = other.phase_;
+      activities_        = std::move(other.activities_);
       finished_          = std::exchange(other.finished_, true);
     }
     return *this;
@@ -89,6 +92,37 @@ class query_observer {
     std::lock_guard lock(mutex_);
     if (!handle_) { return std::nullopt; }
     return handle_->id().raw();
+  }
+
+  /// No implicit current-query or current-parent state. Callers propagate parents.
+  [[nodiscard]] query_activity activity(
+    const char* phase,
+    const char* kind                              = "work",
+    std::optional<query_activity::id_type> parent = std::nullopt) noexcept
+  {
+    std::lock_guard lock(mutex_);
+    if (!context_ || !context_->enabled() || !handle_ || finished_) return {};
+    try {
+      auto handle = context_->context().query_activity_observer()->handle();
+      auto track  = context_->context().query_activity_track_observer()->handle();
+      track.declaration({.activity_id = handle.id(), .label = phase});
+      auto active = std::move(handle)
+                      .started({.query_id            = handle_->id(),
+                                .parent_activity_id  = parent,
+                                .track               = {.target = track.id(), .data = {}},
+                                .phase               = phase,
+                                .kind                = kind,
+                                .planning_generation = metadata_.planning_generation,
+                                .execution_query_id  = metadata_.execution_query_id})
+                      .into_dynamic();
+      auto state = std::make_shared<query_activity::state>(context_, std::move(active));
+      std::erase_if(activities_, [](auto const& weak) { return weak.expired(); });
+      activities_.push_back(state);
+      return query_activity(std::move(state));
+    } catch (...) {
+      report_failure();
+      return {};
+    }
   }
 
   /// Publish a complete snapshot without changing lifecycle state or query identity.
@@ -181,6 +215,7 @@ class query_observer {
     } catch (...) {
       report_failure();
     }
+    finish_activities(outcome);
     finish_locked();
   }
 
@@ -221,6 +256,7 @@ class query_observer {
   void finish_locked() noexcept
   {
     if (!handle_ || finished_) return;
+    finish_activities("abandoned");
     finished_ = true;
     try {
       handle_->finished();
@@ -229,10 +265,19 @@ class query_observer {
     }
   }
 
+  void finish_activities(const char* outcome) noexcept
+  {
+    for (auto it = activities_.rbegin(); it != activities_.rend(); ++it) {
+      if (auto active = it->lock()) active->finish(outcome);
+    }
+    activities_.clear();
+  }
+
   enum class phase { initial, planning, executing };
   mutable std::mutex mutex_;
   quent::records::QueryMetadata metadata_;
   phase phase_ = phase::initial;
+  std::vector<std::weak_ptr<query_activity::state>> activities_;
   std::shared_ptr<const telemetry_context> context_;
   std::optional<quent::DynamicFsmHandle<quent::Query>> handle_;
   std::optional<quent::Handle<quent::QueryDetails>> details_handle_;

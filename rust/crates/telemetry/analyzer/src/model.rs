@@ -26,7 +26,8 @@ pub use crate::boilerplate::{Engine, Operator, Plan, Port, Query, QueryGroup, Wo
 use crate::{
     boilerplate::{
         Channel, DataBatch, DataBatchBuilder, DataBatchExt, ExecutorThread, GpuDevice, Memory,
-        QueryBuilder, Task, TaskBuilder, TaskExt, TaskManagerLoopThread, TaskQueue, ThreadGroup,
+        QueryActivity, QueryActivityBuilder, QueryActivityTrack, QueryBuilder, Task, TaskBuilder,
+        TaskExt, TaskManagerLoopThread, TaskQueue, ThreadGroup,
     },
     view::SiriusModelQueryView,
 };
@@ -121,6 +122,8 @@ pub struct SiriusModel {
     pub(crate) task_queues: HashMap<Uuid, TaskQueue>,
     pub(crate) task_manager_loop_threads: HashMap<Uuid, TaskManagerLoopThread>,
     pub(crate) executor_threads: HashMap<Uuid, ExecutorThread>,
+    pub(crate) activities: HashMap<Uuid, QueryActivity>,
+    pub(crate) activity_tracks: HashMap<Uuid, QueryActivityTrack>,
     pub(crate) tasks: HashMap<Uuid, Task>,
     pub(crate) data_batches: HashMap<Uuid, DataBatch>,
     /// Engine-native batch numbers are only unique per worker process, so the index is keyed
@@ -151,7 +154,8 @@ impl Model for SiriusModel {
             Ok(EntityRef::Port(entity_id))
         } else if self.resource(entity_id).is_ok() {
             Ok(EntityRef::Resource(entity_id))
-        } else if self.gpu_devices.contains_key(&entity_id)
+        } else if self.activities.contains_key(&entity_id)
+            || self.gpu_devices.contains_key(&entity_id)
             || self.thread_groups.contains_key(&entity_id)
         {
             Ok(EntityRef::ResourceGroup(entity_id))
@@ -287,9 +291,10 @@ impl SiriusModel {
     }
 
     pub(crate) fn resource_instance_name(&self, resource_id: Uuid) -> Option<&str> {
-        self.memories
+        self.activity_tracks
             .get(&resource_id)
-            .map(Memory::instance_name)
+            .map(QueryActivityTrack::instance_name)
+            .or_else(|| self.memories.get(&resource_id).map(Memory::instance_name))
             .or_else(|| self.channels.get(&resource_id).map(Channel::instance_name))
             .or_else(|| {
                 self.task_queues
@@ -309,9 +314,19 @@ impl SiriusModel {
     }
 
     pub(crate) fn resource_scope_instance_name(&self, entity_id: Uuid) -> Option<&str> {
-        self.gpu_devices
+        self.query_groups
             .get(&entity_id)
-            .map(GpuDevice::instance_name)
+            .and_then(|group| group.data().instance_name.as_deref())
+            .or_else(|| {
+                self.activities
+                    .get(&entity_id)
+                    .map(QueryActivity::instance_name)
+            })
+            .or_else(|| {
+                self.gpu_devices
+                    .get(&entity_id)
+                    .map(GpuDevice::instance_name)
+            })
             .or_else(|| {
                 self.thread_groups
                     .get(&entity_id)
@@ -320,9 +335,14 @@ impl SiriusModel {
     }
 
     fn sirius_resource(&self, resource_id: Uuid) -> Option<&dyn Resource> {
-        self.memories
+        self.activity_tracks
             .get(&resource_id)
             .map(|resource| resource as &dyn Resource)
+            .or_else(|| {
+                self.memories
+                    .get(&resource_id)
+                    .map(|resource| resource as &dyn Resource)
+            })
             .or_else(|| {
                 self.channels
                     .get(&resource_id)
@@ -346,9 +366,14 @@ impl SiriusModel {
     }
 
     fn sirius_resources(&self) -> impl Iterator<Item = &dyn Resource> {
-        self.memories
+        self.activity_tracks
             .values()
             .map(|resource| resource as &dyn Resource)
+            .chain(
+                self.memories
+                    .values()
+                    .map(|resource| resource as &dyn Resource),
+            )
             .chain(
                 self.channels
                     .values()
@@ -427,7 +452,15 @@ impl FsmCollection for SiriusModel {
 
 impl RefTreeCollection for SiriusModel {
     fn ref_tree_entities(&self) -> impl Iterator<Item = &dyn RefTreeEntity> {
-        std::iter::once(&self.engine as &dyn RefTreeEntity)
+        self.activities
+            .values()
+            .map(|entity| entity as &dyn RefTreeEntity)
+            .chain(
+                self.activity_tracks
+                    .values()
+                    .map(|entity| entity as &dyn RefTreeEntity),
+            )
+            .chain(std::iter::once(&self.engine as &dyn RefTreeEntity))
             .chain(
                 self.workers
                     .values()
@@ -508,6 +541,10 @@ impl RefTreeCollection for SiriusModel {
     fn ref_tree_entity(&self, entity_id: Uuid) -> AnalyzerResult<&dyn RefTreeEntity> {
         if self.engine.id() == entity_id {
             Ok(&self.engine)
+        } else if let Some(entity) = self.activities.get(&entity_id) {
+            Ok(entity)
+        } else if let Some(entity) = self.activity_tracks.get(&entity_id) {
+            Ok(entity)
         } else if let Some(entity) = self.workers.get(&entity_id) {
             Ok(entity)
         } else if let Some(entity) = self.query_groups.get(&entity_id) {
@@ -577,6 +614,8 @@ pub struct SiriusModelBuilder {
     task_queues: HashMap<Uuid, TaskQueue>,
     task_manager_loop_threads: HashMap<Uuid, TaskManagerLoopThread>,
     executor_threads: HashMap<Uuid, ExecutorThread>,
+    activities: HashMap<Uuid, QueryActivityBuilder>,
+    activity_tracks: HashMap<Uuid, QueryActivityTrack>,
     tasks: HashMap<Uuid, TaskBuilder>,
     data_batches: HashMap<Uuid, DataBatchBuilder>,
     /// Ids of resources and resource groups whose declaration event was ingested. Tracked
@@ -608,6 +647,8 @@ impl SiriusModelBuilder {
             task_queues: HashMap::default(),
             task_manager_loop_threads: HashMap::default(),
             executor_threads: HashMap::default(),
+            activities: HashMap::default(),
+            activity_tracks: HashMap::default(),
             tasks: HashMap::default(),
             data_batches: HashMap::default(),
             declared: HashSet::default(),
@@ -646,6 +687,26 @@ impl SiriusModelBuilder {
         }
 
         match data {
+            SiriusEvent::QueryActivity(event) => {
+                let builder = match self.activities.entry(id) {
+                    Entry::Occupied(entry) => entry.into_mut(),
+                    Entry::Vacant(entry) => entry.insert(QueryActivityBuilder::try_new(id)?),
+                };
+                builder.push_transition(Event::new(id, timestamp, event));
+                Ok(())
+            }
+            SiriusEvent::QueryActivityTrack(event) => {
+                if !self.declared.insert(id) {
+                    return Err(AnalyzerError::Validation(format!(
+                        "duplicate activity track {id}"
+                    )));
+                }
+                self.activity_tracks.insert(
+                    id,
+                    QueryActivityTrack::try_from_event(Event::new(id, timestamp, event))?,
+                );
+                Ok(())
+            }
             SiriusEvent::Engine(event) => {
                 if id != self.engine_id {
                     return Err(AnalyzerError::Validation(format!(
@@ -853,6 +914,7 @@ impl SiriusModelBuilder {
         drop_orphans(&mut ports, &dropped_operators);
 
         let resource_types = [
+            QueryActivityTrack::resource_type_decl(),
             Memory::resource_type_decl(),
             Channel::resource_type_decl(),
             TaskQueue::resource_type_decl(),
@@ -879,11 +941,70 @@ impl SiriusModelBuilder {
             task_queues: self.task_queues,
             task_manager_loop_threads: self.task_manager_loop_threads,
             executor_threads: self.executor_threads,
+            activities: HashMap::default(),
+            activity_tracks: HashMap::default(),
             tasks: HashMap::default(),
             data_batches: HashMap::default(),
             batch_by_number: HashMap::default(),
             resource_group_types: HashMap::default(),
         };
+
+        // Truncated activities have no measured duration; omit them and their lanes.
+        // Explicit exception/abandonment finishes remain visible with their recorded outcome.
+        for (id, builder) in self.activities {
+            match QueryActivity::from_builder(builder) {
+                Ok(activity) if model.queries.contains_key(&activity.query_id()) => {
+                    model.activities.insert(id, activity);
+                }
+                Ok(_) => (),
+                Err(err) => tracing::warn!(%id, %err, "skipping incomplete query activity"),
+            }
+        }
+        // A missing parent must not orphan a surviving child or contaminate another query.
+        loop {
+            let invalid: HashSet<_> = model
+                .activities
+                .values()
+                .filter(|a| {
+                    a.parent_id().is_some_and(|p| {
+                        p != a.query_id()
+                            && model
+                                .activities
+                                .get(&p)
+                                .is_none_or(|parent| parent.query_id() != a.query_id())
+                    })
+                })
+                .map(Entity::id)
+                .collect();
+            if invalid.is_empty() {
+                break;
+            }
+            model.activities.retain(|id, _| !invalid.contains(id));
+        }
+        model.activity_tracks = self.activity_tracks;
+        model.activity_tracks.retain(|_, t| {
+            t.parent_id()
+                .is_some_and(|id| model.activities.contains_key(&id))
+        });
+        for a in model.activities.values() {
+            for u in a.usages() {
+                if model
+                    .activity_tracks
+                    .get(&u.resource_id())
+                    .is_none_or(|track| track.parent_id() != Some(a.id()))
+                {
+                    return Err(AnalyzerError::Validation(
+                        "query activity has no matching track".into(),
+                    ));
+                }
+            }
+        }
+        model
+            .resource_types
+            .get_mut("query_activity_track")
+            .unwrap()
+            .used_by
+            .insert("query_activity".into());
 
         for (task_id, task_builder) in self.tasks {
             let task = match Task::from_builder(task_builder) {

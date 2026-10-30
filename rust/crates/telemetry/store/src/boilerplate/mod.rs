@@ -17,3 +17,5 @@ use crate::{DataBatchEvent, QueryEvent, TaskEvent};
 mod data_batch;
 mod query;
 mod task;
+
+mod query_activity;

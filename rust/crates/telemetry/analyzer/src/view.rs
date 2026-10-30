@@ -14,8 +14,8 @@ use uuid::Uuid;
 
 use crate::{
     boilerplate::{
-        DataBatch, DataBatchExt, Engine, Operator, Plan, Port, Query, QueryGroup, Task, TaskExt,
-        Worker,
+        DataBatch, DataBatchExt, Engine, Operator, Plan, Port, Query, QueryActivity, QueryGroup,
+        Task, TaskExt, Worker,
     },
     model::SiriusModel,
 };
@@ -87,6 +87,10 @@ impl<'a> SiriusModelQueryView<'a> {
             )? {
                 resources.insert(resource.id(), resource);
             }
+        }
+
+        if !resources.is_empty() && model.activities.values().any(|a| a.query_id() == query_id) {
+            resource_groups.insert(query_group.id(), query_group as &dyn RefTreeEntity);
         }
 
         let pipeline_ids = operators.keys().copied().collect::<HashSet<_>>();
@@ -181,9 +185,15 @@ impl<'a> SiriusModelQueryView<'a> {
             }
 
             let group = model
-                .gpu_devices
+                .activities
                 .get(&parent_id)
                 .map(|group| group as &dyn RefTreeEntity)
+                .or_else(|| {
+                    model
+                        .gpu_devices
+                        .get(&parent_id)
+                        .map(|group| group as &dyn RefTreeEntity)
+                })
                 .or_else(|| {
                     model
                         .thread_groups
@@ -199,6 +209,13 @@ impl<'a> SiriusModelQueryView<'a> {
             };
             parent_id = next_parent_id;
         }
+    }
+
+    pub(crate) fn activities(&self) -> impl Iterator<Item = &'a QueryActivity> + '_ {
+        self.model
+            .activities
+            .values()
+            .filter(|activity| activity.query_id() == self.query.id())
     }
 
     pub(crate) fn tasks(&self) -> impl Iterator<Item = &'a Task> + '_ {

@@ -256,3 +256,24 @@ timeline, so you can see exactly when and where it ran across the resources.
 duration), grouped and sortable, to, for example, quickly find the most expensive operators in the query.
 
 ![Quent operator stats view](quent-screenshots/operator-stats-view.png)
+
+## Query activity timelines
+
+`QueryActivity` records describe producer-defined work and wait intervals under the
+outer query UUID. Each invocation of a phase gets a fresh activity ID; optional parent
+IDs describe nesting, while generation and execution-window fields correlate the
+interval with preparation and admission. They are separate from GPU tasks and operators.
+The existing viewer renders each activity as a group with its own interval lane and
+nested child groups. No Quent dependency update is needed.
+
+The lane's `working` or `waiting` state runs from the recorded Started timestamp to
+Finished. Click an interval to inspect its phase, kind, correlations, and recorded
+outcome. Parent durations are inclusive: do not add them to child durations. No timing
+is inferred from phase names or callback order. Planning-only queries have the same
+activity tree, even when they have no execution plan.
+
+Scoped cleanup closes an interval on normal return or exception (`success` or `failed`).
+Query completion closes any remaining intervals with the available terminal outcome;
+DuckDB's ambiguous null-error completion remains unknown. A trace missing Finished is
+incomplete: the analyzer warns and omits that activity and its descendants rather than
+inventing a duration. Disabled telemetry skips activity allocation and emission.

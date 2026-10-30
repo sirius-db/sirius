@@ -909,3 +909,51 @@ TEST_CASE("query observer serializes worker mutations and closes once",
   REQUIRE(metadata.find("gpu_to_cpu") != std::string::npos);
   std::filesystem::remove_all(output);
 }
+
+TEST_CASE("query activities preserve nesting and finish once on unwind or query end",
+          "[query_observer][query_activity]")
+{
+  auto const output = std::filesystem::temp_directory_path() /
+                      ("sirius_query_activity_" + std::to_string(::getpid()));
+  std::filesystem::remove_all(output);
+  telemetry_config config;
+  config.enable_quent     = true;
+  config.output_directory = output.string();
+  {
+    auto context = telemetry_context::create(make_quent_context(config), config);
+    query_observer observer(context);
+    observer.correlate(12, 3);
+    observer.planning_generation(7);
+    auto parent = observer.activity("preparation");
+    REQUIRE(parent.id().has_value());
+    {
+      auto child = observer.activity("admission", "wait", parent.id());
+      child.finish();
+      child.finish();
+    }
+    REQUIRE_THROWS_AS(
+      [&] {
+        auto child = observer.activity("copy", "work", parent.id());
+        throw std::runtime_error("native error");
+      }(),
+      std::runtime_error);
+    // A live scope cannot emit again after query-end backstop completion.
+    observer.complete("cancelled");
+    REQUIRE_FALSE(observer.activity("late").id().has_value());
+  }
+  auto const lines = read_all_telemetry_lines(output, "QueryActivity");
+  REQUIRE(lines.size() == 6);
+  REQUIRE(any_line_with_all(lines, {"admission", "wait"}));
+  REQUIRE(any_line_with_all(lines, {"Finished", "failed"}));
+  REQUIRE(any_line_with_all(lines, {"Finished", "cancelled"}));
+  std::filesystem::remove_all(output);
+}
+
+TEST_CASE("disabled telemetry has an inactive query activity fast path", "[query_activity]")
+{
+  telemetry_config config;
+  config.enable_quent = false;
+  auto context        = telemetry_context::create(make_quent_context(config), config);
+  query_observer observer(context);
+  REQUIRE_FALSE(observer.activity("copy").id().has_value());
+}

@@ -25,6 +25,15 @@ records:
       target: { ref: Port }
 
 entities:
+  QueryActivityTrack:
+    doc: A query activity timeline lane; never a GPU execution resource.
+    resource: true
+    events:
+      declaration:
+        attributes:
+          activity_id: { scope-ref: QueryActivity }
+          label: string
+
   QueryDetails:
     doc: Revisioned metadata snapshots, independent of the query lifecycle FSM.
     events:
@@ -179,6 +188,25 @@ entities:
           label: string
 
 fsms:
+  QueryActivity:
+    doc: One producer-defined work or wait interval, with explicit nesting.
+    states:
+      started:
+        initial: true
+        attributes:
+          query_id: { scope-ref: Query }
+          parent_activity_id: { option: { ref: QueryActivity } }
+          track: { uses: QueryActivityTrack }
+          phase: string
+          kind: string
+          planning_generation: { option: u64 }
+          execution_query_id: { option: u64 }
+        to: [ finished ]
+      finished:
+        attributes:
+          outcome: { option: string }
+          decision: { option: string }
+
   Query:
     doc: A query progressing through planning and execution.
     states:

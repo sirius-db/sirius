@@ -1322,3 +1322,117 @@ fn query_list_visibility_uses_the_final_snapshot_not_any_previous_label() {
     assert_eq!(analyzer.query_engine_model().queries().count(), 0);
     assert!(analyzer.query_bundle(id(4)).is_ok());
 }
+
+#[test]
+fn nested_query_activities_render_without_execution_and_keep_repeated_phases() {
+    use quent_analyzer::RefTreeEntity;
+    use quent_ui::timeline::{
+        request::{EntityFilter, ResourceTimelineRequest, SingleTimelineRequest, TimelineRequest},
+        response::ResourceTimeline,
+    };
+    let mut events = planless_fixture();
+    events.push(ev(4, 10, E::Query(s::QueryEvent::Finished { seq: 1 })));
+    for (n, parent, kind, start, end, outcome) in [
+        (100, None, "work", 1, Some(8), "success"),
+        (102, Some(100), "wait", 2, Some(3), "success"),
+        (104, Some(100), "work", 4, Some(7), "failed"),
+        (106, Some(100), "work", 5, None, "success"),
+    ] {
+        events.push(ev(
+            n + 1,
+            start,
+            E::QueryActivityTrack(s::QueryActivityTrackEvent::Declaration {
+                activity_id: EntityRef::new(id(n), ()),
+                label: "copy".into(),
+            }),
+        ));
+        events.push(ev(
+            n,
+            start,
+            E::QueryActivity(s::QueryActivityEvent::Started {
+                seq: 0,
+                query_id: EntityRef::new(id(4), ()),
+                parent_activity_id: parent.map(|n| EntityRef::new(id(n), ())),
+                track: EntityRef::new(id(n + 1), s::QueryActivityTrackUsage {}),
+                phase: "copy".into(),
+                kind: kind.into(),
+                planning_generation: Some(7),
+                execution_query_id: None,
+            }),
+        ));
+        if let Some(end) = end {
+            events.push(ev(
+                n,
+                end,
+                E::QueryActivity(s::QueryActivityEvent::Finished {
+                    seq: 1,
+                    decision: None,
+                    outcome: Some(outcome.into()),
+                }),
+            ));
+        }
+    }
+    events.reverse(); // ingestion order cannot determine nesting or duration
+    let analyzer = SiriusUiAnalyzer::try_new(id(1), events.into_iter()).unwrap();
+    let bundle = analyzer.query_bundle(id(4)).unwrap();
+    assert!(analyzer.model.plans.is_empty());
+    assert_eq!(analyzer.model.activities.len(), 3);
+    assert_eq!(
+        analyzer.model.activities[&id(102)].parent_id(),
+        Some(id(100))
+    );
+    assert_eq!(bundle.entities.resources.len(), 3);
+    assert!(bundle.entities.resource_groups.contains_key(&id(3)));
+    let listed = analyzer.list_entities(serde_json::from_value(serde_json::json!({
+        "entry": {
+            "window": {"start": 0, "end": 10},
+            "filter": {"scope": {"Resource": {"resource_id": id(101)}}, "entity_type_name": null, "min_usage_s": 0.005},
+            "sort": {"key": "UsageDuration", "dir": "Desc"}, "page": null,
+            "application": {"operator_ids": []}
+        }, "app_params": {"query_id": id(4)}
+    })).unwrap()).unwrap();
+    assert_eq!(listed.total, 1);
+    assert_eq!(listed.items[0].entity.fsm.type_name, "query_activity");
+    assert_eq!(listed.items[0].entity.fsm.id, id(100));
+
+    assert!(bundle.entities.fsm_types.contains_key("query_activity"));
+    for (n, state, duration) in [
+        (100, "working", 7.0),
+        (102, "waiting", 1.0),
+        (104, "working", 3.0),
+    ] {
+        for entity_type_name in [None, Some("query_activity".into())] {
+            let result = analyzer
+                .single_resource_timeline(SingleTimelineRequest {
+                    app_params: QueryFilter { query_id: id(4) },
+                    entry: TimelineRequest::Resource(ResourceTimelineRequest {
+                        resource_id: id(n + 1),
+                        long_entities_threshold_s: Some(0.0),
+                        entity_filter: EntityFilter { entity_type_name },
+                        application: OperatorFilter {
+                            operator_ids: vec![],
+                        },
+                        config: TimelineConfig {
+                            start: 0.0,
+                            end: 10.0,
+                            num_bins: 10,
+                        },
+                    }),
+                })
+                .unwrap();
+            let fsms = match result.data {
+                ResourceTimeline::Binned(data) => data.long_fsms,
+                ResourceTimeline::BinnedByState(data) => {
+                    assert!(data.capacities_states_values["unit"].contains_key(state));
+                    data.long_fsms
+                }
+            };
+            assert_eq!(fsms.len(), 1);
+            assert_eq!(fsms[0].type_name, "query_activity");
+            assert_eq!(
+                fsms[0].transitions[1].timestamp - fsms[0].transitions[0].timestamp,
+                duration
+            );
+        }
+    }
+}
