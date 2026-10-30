@@ -35,4 +35,5 @@ target_sources(
           sirius_plan_projection_utils.cpp
           sirius_plan_recursive_cte.cpp
           sirius_plan_set_operation.cpp
-          sirius_plan_top_n.cpp)
+          sirius_plan_top_n.cpp
+          sirius_plan_window.cpp)
