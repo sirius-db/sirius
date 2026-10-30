@@ -1554,3 +1554,65 @@ TEST_CASE("Input accounting includes temporary and retained allocations from its
   permit.release();
   CHECK_THROWS_AS(ledger.charged_bytes(permit), std::logic_error);
 }
+
+TEST_CASE("Per-permit temporary budgets preserve rounded accounting and rollback",
+          "[scan_preparation][ledger]")
+{
+  test_reservation_provider provider;
+  provider.quantum     = 8;
+  provider.grant_bytes = 136;
+  preparation_ledger ledger(provider);
+  unit_envelope small{{9, 1}, 8}, large{{64}, 0};
+  std::array scans{scan_envelope{{small}, {}, true}, scan_envelope{{large}, {}, true}};
+  auto decision = ledger.admit(scans, host, 2);
+  REQUIRE(decision.deferred);
+  REQUIRE(decision.w == 64);
+  REQUIRE(small.temporary_charge(provider.quantum) == 24);
+  CHECK_THROWS_AS(ledger.try_acquire_unit({1, 0}, 8, 65), std::invalid_argument);
+  CHECK(ledger.tracked_units() == 0);
+  CHECK(ledger.permits_in_flight() == 0);
+  auto permit = ledger.try_acquire_unit({1, 0}, 8, small.temporary_charge(provider.quantum));
+  REQUIRE(permit);
+  auto allocator                 = ledger.allocator(permit);
+  auto retained                  = allocator.allocate_retained(8);
+  auto first                     = allocator.allocate(9);
+  provider.seen->fail_allocation = true;
+  CHECK_THROWS_AS(allocator.allocate(1), preparation_resource_error);
+  CHECK(ledger.charged_bytes(permit) == 24);  // 16 temporary + 8 retained
+  provider.seen->fail_allocation = false;
+  auto second                    = allocator.allocate(1);
+  CHECK(ledger.charged_bytes(permit) == 32);
+  auto allocations = provider.seen->allocations.load();
+  CHECK_THROWS_AS(allocator.allocate(1), preparation_resource_error);
+  CHECK(provider.seen->allocations == allocations);
+  CHECK(ledger.bound_exceeded() == 1);
+  CHECK(ledger.allocation_failures() == 1);
+  first.release();
+  auto reused = allocator.allocate(16);
+  CHECK(ledger.charged_bytes(permit) == 32);
+  ledger.retire_unit({1, 0});
+  permit.release();
+  CHECK(ledger.permits_in_flight() == 1);
+  CHECK_THROWS_AS(allocator.allocate(1), std::logic_error);
+  retained.release();
+  second.release();
+  reused.release();
+  CHECK(ledger.permits_in_flight() == 0);
+  CHECK(ledger.tracked_units() == 0);
+  CHECK(provider.seen->allocated_bytes == 0);
+  auto zero = ledger.try_acquire_unit({2, 0}, 0, 0);
+  REQUIRE(zero);
+  CHECK_FALSE(ledger.allocator(zero).allocate(0));
+  CHECK_THROWS_AS(ledger.allocator(zero).allocate(1), preparation_resource_error);
+  ledger.retire_unit({2, 0});
+  zero.release();
+  CHECK(ledger.permits_in_flight() == 0);
+}
+
+TEST_CASE("Temporary envelope rounding rejects arithmetic overflow", "[scan_preparation][ledger]")
+{
+  unit_envelope rounding{{UINT64_MAX}, 0};
+  CHECK_THROWS_AS(rounding.temporary_charge(8), std::overflow_error);
+  unit_envelope sum{{UINT64_MAX - 7, 8}, 0};
+  CHECK_THROWS_AS(sum.temporary_charge(8), std::overflow_error);
+}

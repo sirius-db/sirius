@@ -149,6 +149,8 @@ Import completes on the caller's task stream before returning independently owne
 
 The push adapter retains at most one offered root. Concurrent offers return false without retaining another root. The submitting thread must hold no engine resource needed for progress. Foreign owners and returned Arrow release callbacks must be thread-neutral; there is no submitting-thread release guarantee or affine reclamation handshake. A false `offer()` return does not join an in-progress copy: retained source views and backing must remain readable and immutable until their final use ends.
 
+Each Arrow input permit enforces its producer's temporary envelope at allocation time, with each declared block rounded independently to the admission allocation granularity. Another scan's larger query-wide W cannot increase that local allowance.
+
 The admitted job copies the selected window into charged storage. Preparation covers detached Arrow storage and bounded staging; the queue separately bounds foreign-input/copy overlap without adopting foreign backing into its allocator. GPU outputs use task reservations. Neither the input gate nor this ledger bounds all output retention or total host/device memory. `finish()` drains queued input before EOS.
 
 Adapters using this driver must also handle the following integration responsibilities:

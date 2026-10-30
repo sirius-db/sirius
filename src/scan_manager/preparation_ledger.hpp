@@ -43,6 +43,8 @@ struct unit_envelope {
   // Independently allocated blocks are rounded separately by the backing allocator.
   std::vector<uint64_t> temporary;
   uint64_t retained = 0;
+  // Sum independently rounded blocks, matching admission and runtime accounting.
+  uint64_t temporary_charge(uint64_t allocation_granularity) const;
 };
 struct scan_envelope {
   std::vector<unit_envelope> units;
@@ -189,7 +191,11 @@ class preparation_ledger {
   w_permit acquire_permit(
     unit_key);  // Nonblocking; empty means coordinator must wait for an event.
   // Atomically register and acquire. Pending leaves neither registration nor budget changes.
-  w_permit try_acquire_unit(unit_key, uint64_t retained_limit);
+  // temporary_limit is already rounded to the admission allocation granularity.
+  // Omission preserves the query-wide W limit for existing callers.
+  w_permit try_acquire_unit(unit_key,
+                            uint64_t retained_limit,
+                            std::optional<uint64_t> temporary_limit = std::nullopt);
   // One query coordinator per ledger; callback runs after the ledger lock is released.
   void bind_wakeup(preparation_wakeup);
   charging_allocator allocator(w_permit const&);
