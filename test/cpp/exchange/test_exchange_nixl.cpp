@@ -108,6 +108,13 @@ int free_port()
   return 0;
 }
 
+/// SIRIUS_EXCHANGE_HOST_STAGING for the hidden one-rank-per-process tests (default auto).
+nixl_fabric::host_staging staging_from_env()
+{
+  auto const* value = std::getenv("SIRIUS_EXCHANGE_HOST_STAGING");
+  return sirius::exchange::parse_host_staging(value != nullptr ? value : "auto");
+}
+
 /// Records what one stream's receiver is handed into @p got.
 struct recording_inbound : sirius::exchange::inbound {
   recording_inbound(received& got, stream_id stream) : got(got), stream(stream) {}
@@ -274,7 +281,7 @@ TEST_CASE("one rank per process exchanges batches over NIXL", "[.][nixl_multipro
     cfg.peers.push_back(peer);
   }
   auto const world = static_cast<rank_t>(cfg.peers.size());
-  cfg.staging      = nixl_fabric::staging_from_env();
+  cfg.staging      = staging_from_env();
 
   // 1 MiB frames; batches of about 7 MiB take several.
   nixl_rank r(cfg, KiB * KiB);
@@ -299,7 +306,7 @@ TEST_CASE("one rank per process measures exchange bandwidth", "[.][nixl_bandwidt
   for (std::string peer; std::getline(list, peer, ',');) {
     cfg.peers.push_back(peer);
   }
-  cfg.staging      = nixl_fabric::staging_from_env();
+  cfg.staging      = staging_from_env();
   auto const world = static_cast<rank_t>(cfg.peers.size());
   frame_ring send(16, 8 * KiB * KiB);
   frame_ring recv(8 * (world - 1), 8 * KiB * KiB);

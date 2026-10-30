@@ -18,6 +18,7 @@
 // credits, landing, end of stream, notifications in any order, and failure.
 
 #include "catch.hpp"
+#include "exchange/exchange_runtime.hpp"
 #include "exchange/loopback_fabric.hpp"
 #include "exchange/messages.hpp"
 #include "exchange/transport_test_utils.hpp"
@@ -248,4 +249,15 @@ TEST_CASE("exchange messages round-trip and refuse malformed bytes", "[exchange]
                   sirius::invalid_input_exception);
   CHECK_THROWS_AS(decode(encode(frame_message{1, 1, 0, 0, 8, {}})),
                   sirius::invalid_input_exception);
+}
+
+TEST_CASE("sirius_exchange_host_staging takes auto, always or never", "[exchange][transport]")
+{
+  using sirius::exchange::host_staging;
+  using sirius::exchange::parse_host_staging;
+  CHECK(parse_host_staging("auto") == host_staging::automatic);
+  CHECK(parse_host_staging("always") == host_staging::always);
+  CHECK(parse_host_staging("never") == host_staging::never);
+  CHECK_THROWS_AS(parse_host_staging(""), sirius::invalid_input_exception);
+  CHECK_THROWS_AS(parse_host_staging("Always"), sirius::invalid_input_exception);
 }

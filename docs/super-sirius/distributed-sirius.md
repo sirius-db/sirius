@@ -120,7 +120,7 @@ write access, a write is one device-to-host copy into that peer's mirror, then a
 naming the offset and size; the peer copies the bytes host-to-device into its receive ring and
 only then passes the write's own notification to the transport. Credits are unchanged: a mirror
 frame is reused only after the transport has copied its receive frame out.
-`SIRIUS_EXCHANGE_HOST_STAGING=always|never` overrides the choice (default `auto`). Each rank logs
+`SET sirius_exchange_host_staging = 'always'` (or `'never'`) overrides the choice (default `auto`). Each rank logs
 its path to every peer at start. Staging maps the peer's mirror from this host's `/dev/shm`, so it
 works only between ranks on one host that share `/dev/shm`; ranks on several hosts, or in separate
 IPC namespaces, need `never` until #2372. A rank that crashes leaves its mirror in `/dev/shm`;
@@ -266,6 +266,7 @@ correctness.
 |---|---|---|
 | `sirius_exchange_peers` | `''` | `host:port` of every rank's listener, comma-separated in rank order. Empty runs in one process. |
 | `sirius_exchange_rank` | 0 | This process's position in `sirius_exchange_peers`. |
+| `sirius_exchange_host_staging` | `auto` | `always` or `never` overrides the host-staging choice; set it before `sirius_exchange_rank`. |
 
 The exchange connects on the connection's first distributed query; the settings cannot change
 after that. Set `enable_duckdb_fallback = false` on every rank: one rank falling back to the CPU
