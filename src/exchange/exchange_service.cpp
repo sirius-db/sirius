@@ -177,7 +177,15 @@ void exchange_service::send(stream_id stream,
                             rank_t to,
                             std::shared_ptr<cucascade::data_batch> batch)
 {
-  throw_if_failed();
+  {
+    std::lock_guard lock{_mutex};
+    if (_error) { std::rethrow_exception(_error); }
+    // A peer failed this query: stop producing for it. close() still goes through, since sinks
+    // and all-gathers close their streams on the way out.
+    if (auto it = _aborted.find(query_of(stream)); it != _aborted.end()) {
+      std::rethrow_exception(it->second);
+    }
+  }
   _transport->send(stream, to, std::move(batch));
 }
 
