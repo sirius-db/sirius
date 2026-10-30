@@ -94,6 +94,19 @@ TEST_CASE("every rank sends to every rank, itself included", "[exchange][transpo
   all_to_all(c, {7, 9}, 3, 5'000);
 }
 
+TEST_CASE("a transport keeps nothing for a stream once it has ended", "[exchange][transport]")
+{
+  // The same ids carry a second round only if both ends forgot the first: its end and its counts.
+  cluster c(3, /*send_frames=*/4, /*recv_frames=*/8);
+  all_to_all(c, {7, 9}, 2, 5'000);
+  for (auto& r : c.ranks) {
+    std::lock_guard lock{r.got->mutex};
+    r.got->batches.clear();
+    r.got->ended.clear();
+  }
+  all_to_all(c, {7, 9}, 2, 5'000);
+}
+
 TEST_CASE("one credit per peer and one send frame still deliver many-frame batches",
           "[exchange][transport]")
 {

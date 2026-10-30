@@ -157,7 +157,6 @@ struct transport::engine {
   struct stream_end {
     std::uint64_t delivered{0};
     std::optional<std::uint64_t> expected;
-    bool ended{false};
   };
   std::map<std::pair<rank_t, stream_id>, stream_end> ends;
   std::vector<bool> recv_in_use;
@@ -273,9 +272,11 @@ struct transport::engine {
 
   void check_end(rank_t from, stream_id stream)
   {
-    auto& e = ends[{from, stream}];
-    if (e.ended || !e.expected || e.delivered != *e.expected) { return; }
-    e.ended = true;
+    auto const it = ends.find({from, stream});
+    if (it == ends.end() || !it->second.expected || it->second.delivered != *it->second.expected) {
+      return;
+    }
+    ends.erase(it);
     cb.on_end(stream, from);
   }
 
@@ -512,8 +513,10 @@ void transport::close(stream_id stream, rank_t to)
   {
     std::lock_guard lock{_mutex};
     if (_error) { std::rethrow_exception(_error); }
+    // The count goes with the stream's end: nothing is sent on it after close().
+    auto const sent = e.sent[to].extract(stream);
     if (to != rank()) {
-      e.queues[to].push_back({stream, e.sent[to][stream], nullptr});
+      e.queues[to].push_back({stream, sent.empty() ? 0 : sent.mapped(), nullptr});
       return;
     }
   }
