@@ -1177,8 +1177,8 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
 {
   bool const hive = GENERATE(false, true);
   bool const bulk = GENERATE(false, true);
-  // No predicate, full/partial reader pushdown, and a residual-only predicate.
-  int const filter_kind = GENERATE(0, 1, 2, 3);
+  // No predicate, full/partial pushdown, residual only, dynamic only and zero survivors.
+  int const filter_kind = GENERATE(0, 1, 2, 3, 4, 5);
   CAPTURE(hive, bulk, filter_kind);
   sirius::test::scratch_dir directory("hive_execution_record");
   std::filesystem::create_directories(directory.path() / "year=2024");
@@ -1207,31 +1207,45 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   }
   if (filter_kind) {
     info->table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
-    if (filter_kind != 3)
+    if (filter_kind != 3 && filter_kind != 4)
       info->table_filters->PushFilter(
         duckdb::ProjectionIndex(1),
         sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_GREATERTHAN,
-                                      duckdb::Value::INTEGER(100)));
-    if (filter_kind >= 2)
+                                      duckdb::Value::INTEGER(filter_kind == 5 ? 10000 : 100)));
+    if (filter_kind >= 2 && filter_kind != 5)
       info->table_filters->PushFilter(
         duckdb::ProjectionIndex(2), sirius::test::null_filter(duckdb::LogicalType::INTEGER, true));
+  }
+  std::optional<sirius::op::sirius_dynamic_filter_set::producer> dynamic_producer;
+  if (filter_kind == 4) {
+    using namespace sirius::op;
+    info->sirius_dynamic_filters = std::make_shared<sirius_dynamic_filter_set>();
+    dynamic_producer.emplace(info->sirius_dynamic_filters->register_producer({0}));
+    std::vector<zone_map_entry> zones;
+    zones.push_back({std::make_unique<cudf::numeric_scalar<int32_t>>(11, true),
+                     std::make_unique<cudf::numeric_scalar<int32_t>>(301, true)});
+    REQUIRE(dynamic_producer->push_filter(
+      0, std::make_shared<sirius_dynamic_zone_map_filter>(std::move(zones))));
+    dynamic_producer->finish(sirius_dynamic_filter_set::completion::PUBLISHED);
   }
   auto counters            = std::make_shared<physical_check_counters>();
   counters->track_units    = true;
   info->profiles->counters = counters;
   int residual_calls = 0, decisions = 0;
   counters->parquet_filter_for_testing = [&](bool filtered, uint64_t rows) {
-    CHECK(filtered == (filter_kind == 1 || filter_kind == 2));
-    CHECK(rows == (filter_kind == 1 || filter_kind == 2 ? 2 : 1000));
+    CHECK(filtered == (filter_kind == 1 || filter_kind == 2 || filter_kind == 4));
+    CHECK(rows == (filter_kind == 5                       ? 0
+                   : filter_kind == 4                     ? 291
+                   : filter_kind == 1 || filter_kind == 2 ? 2
+                                                          : 1000));
   };
   counters->scan_residual_for_testing = [&](auto const& pending) {
     ++residual_calls;
-    // Both bulk routes retain legacy authority, including the inline Hive decision.
-    REQUIRE(pending.size() == (bulk && filter_kind == 2 ? 2 : 1));
+    REQUIRE(pending.size() == 1);
   };
   counters->scan_execution_for_testing = [&](bool authority, auto const& facts) {
     ++decisions;
-    CHECK(authority == !bulk);
+    CHECK(authority);
     CHECK(facts.whole_static_complete == (hive || filter_kind < 2));
     CHECK(facts.projection_complete == hive);
   };
@@ -1252,8 +1266,10 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   auto batch =
     reader->materialize_metadata_to_table(*splits.front(), *space, stream, false, nullptr);
   REQUIRE(batch.execution);
-  CHECK(batch.execution->authoritative == !bulk);
-  auto const input_rows = filter_kind == 0           ? 1000
+  CHECK(batch.execution->authoritative);
+  auto const input_rows = filter_kind == 5           ? 0
+                          : filter_kind == 4         ? (hive ? 290 : 291)
+                          : filter_kind == 0         ? 1000
                           : filter_kind == 3         ? (hive ? 999 : 1000)
                           : hive && filter_kind == 2 ? 1
                                                      : 2;
@@ -1269,6 +1285,11 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     std::iota(expected.begin(), expected.end(), 0);
     if (filter_kind == 3) expected.erase(expected.begin() + 301);
   }
+  if (filter_kind == 4) {
+    expected.resize(290);
+    std::iota(expected.begin(), expected.end(), 11);
+  }
+  if (filter_kind == 5) expected.clear();
   CHECK(host_column<int32_t>(output->view().column(0), stream) == expected);
   if (hive)
     CHECK(host_column<int32_t>(output->view().column(1), stream) ==

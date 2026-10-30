@@ -981,7 +981,8 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
 {
   auto defect = std::string{GENERATE(
     "valid", "foreign_contract", "foreign_metadata", "missing_datasource", "foreign_identity")};
-  CAPTURE(defect);
+  bool const multiple_files = GENERATE(false, true);
+  CAPTURE(defect, multiple_files);
   sirius::test::scratch_dir directory("materialization_adapter_mapping");
   auto path = directory.file("input.parquet");
   auto written =
@@ -989,9 +990,14 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
                " (FORMAT PARQUET, FIELD_IDS {old_id: 1})");
   REQUIRE(written);
   REQUIRE_FALSE(written->HasError());
-  auto info                    = std::make_unique<parquet_ingestible_table_info>();
-  info->contract_id            = 92;
-  info->resolved_file_paths    = {path};
+  auto info                 = std::make_unique<parquet_ingestible_table_info>();
+  info->contract_id         = 92;
+  info->resolved_file_paths = {path};
+  if (multiple_files) {
+    auto second = directory.file("second.parquet");
+    std::filesystem::copy_file(path, second);
+    info->resolved_file_paths.push_back(second);
+  }
   info->names                  = {"renamed"};
   info->returned_types         = {sirius::logical_type::make(sirius::type_id::BIGINT)};
   info->column_ids             = {duckdb::ColumnIndex(0)};
@@ -1016,9 +1022,16 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   CHECK(file.field_mapping->read_names() == std::vector<std::string>{"old_id"});
   auto coalescer = ingestible->create_batch_coalescer();
   auto splits    = coalescer->push(std::move(prepared));
+  if (multiple_files) {
+    auto second = prepare({});
+    REQUIRE(second);
+    for (auto& split : coalescer->push(std::move(second)))
+      splits.push_back(std::move(split));
+  }
   for (auto& split : coalescer->flush())
     splits.push_back(std::move(split));
-  REQUIRE(splits.size() == 1);
+  // File-specific mapped reader options retain the production grouping boundary.
+  REQUIRE(splits.size() == (multiple_files ? 2 : 1));
   auto& split = dynamic_cast<parquet_split_info&>(*splits.front());
   REQUIRE(split.field_mapping);
   REQUIRE(split.rg_slices.size() == 1);
@@ -1061,13 +1074,14 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     }
     return;
   }
-  auto batch =
-    ingestible->materialize_metadata_to_table(*splits.front(), *space, stream, false, nullptr);
-  REQUIRE(batch.execution);
-  CHECK_FALSE(batch.execution->authoritative);
-  auto output = ingestible->post_filter_and_project(std::move(batch), *space, stream);
-  CHECK(output->num_rows() == 1);
-  CHECK(output->view().column(0).type().id() == cudf::type_id::INT64);
+  for (auto const& split : splits) {
+    auto batch = ingestible->materialize_metadata_to_table(*split, *space, stream, false, nullptr);
+    REQUIRE(batch.execution);
+    CHECK(batch.execution->authoritative);
+    auto output = ingestible->post_filter_and_project(std::move(batch), *space, stream);
+    CHECK(output->num_rows() == 1);
+    CHECK(output->view().column(0).type().id() == cudf::type_id::INT64);
+  }
 }
 
 TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
