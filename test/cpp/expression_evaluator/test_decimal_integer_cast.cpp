@@ -75,12 +75,6 @@ std::unique_ptr<cudf::column> decimals(std::vector<Rep> const& raw,
   return result;
 }
 
-std::vector<uint8_t> validity(cudf::column_view input)
-{
-  auto valid = cudf::is_valid(input, stream, mr);
-  return copy_bool_column_to_host(valid->view());
-}
-
 std::vector<__int128_t> integers(cudf::column_view input)
 {
   auto widened = cudf::cast(input, cudf::data_type{cudf::type_id::DECIMAL128, 0}, stream, mr);
@@ -114,8 +108,9 @@ TEMPLATE_TEST_CASE("decimal integer casts round ties away from zero under every 
     for (std::size_t i = 0; i + 1 < expected.size(); ++i) {
       REQUIRE(actual[i] == expected[i]);
     }
-    REQUIRE(validity(result->view().column(0)) ==
-            std::vector<uint8_t>{1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0});
+    REQUIRE(
+      copy_valids_to_host(result->view().column(0)) ==
+      std::vector<bool>{true, true, true, true, true, true, true, true, true, true, true, false});
   }
 }
 
@@ -151,7 +146,8 @@ TEST_CASE("decimal integer casts check rounded signed and unsigned boundaries",
     decimals<int32_t>({12749, 12750, -12849, -12850, 0}, 2, {true, true, true, true, false});
   auto result = sirius::cast_decimal_to_integer(
     signed_input->view(), logical_type::make(type_id::TINYINT), true, stream, mr);
-  REQUIRE(validity(result->view()) == std::vector<uint8_t>{1, 0, 1, 0, 0});
+  REQUIRE(copy_valids_to_host(result->view()) ==
+          std::vector<bool>{true, false, true, false, false});
   auto values = integers(result->view());
   CHECK(values[0] == 127);
   CHECK(values[2] == -128);
@@ -168,7 +164,7 @@ TEST_CASE("decimal integer casts check rounded signed and unsigned boundaries",
     auto negative = decimals<int32_t>({-49, -50, 49, 50}, 2);
     result        = sirius::cast_decimal_to_integer(
       negative->view(), logical_type::make(target), true, stream, mr);
-    REQUIRE(validity(result->view()) == std::vector<uint8_t>{1, 0, 1, 1});
+    REQUIRE(copy_valids_to_host(result->view()) == std::vector<bool>{true, false, true, true});
     values = integers(result->view());
     CHECK(values[0] == 0);
     CHECK(values[2] == 0);
@@ -178,7 +174,7 @@ TEST_CASE("decimal integer casts check rounded signed and unsigned boundaries",
   auto unsigned_input = decimals<__int128_t>({maximum * 100 + 49, maximum * 100 + 50}, 2);
   result              = sirius::cast_decimal_to_integer(
     unsigned_input->view(), logical_type::make(type_id::UBIGINT), true, stream, mr);
-  REQUIRE(validity(result->view()) == std::vector<uint8_t>{1, 0});
+  REQUIRE(copy_valids_to_host(result->view()) == std::vector<bool>{true, false});
   CHECK(integers(result->view())[0] == maximum);
   // The second row is valid UHUGEINT, so TRY_CAST must replay, never replace it with NULL.
   REQUIRE_THROWS_AS(
@@ -195,7 +191,7 @@ TEST_CASE("decimal integer casts handle sliced masks empty columns and all NULLs
   auto slice = cudf::slice(input->view(), {1, 5}, stream).front();
   auto result =
     sirius::cast_decimal_to_integer(slice, logical_type::make(type_id::BIGINT), false, stream, mr);
-  REQUIRE(validity(result->view()) == std::vector<uint8_t>{1, 1, 0, 1});
+  REQUIRE(copy_valids_to_host(result->view()) == std::vector<bool>{true, true, false, true});
   auto values = integers(result->view());
   CHECK(values[0] == 2);
   CHECK(values[1] == -2);

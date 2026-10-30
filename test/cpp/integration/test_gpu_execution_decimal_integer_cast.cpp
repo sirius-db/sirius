@@ -17,8 +17,8 @@
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <utils/gpu_execution_fixture.hpp>
+#include <utils/parquet_fixture_utils.hpp>
 
-#include <filesystem>
 #include <string>
 
 struct DecimalIntegerCastFixture : sirius::test::GpuExecutionFixture {
@@ -97,15 +97,16 @@ TEST_CASE_METHOD(DecimalIntegerCastFixture,
                  "decimal128 integer casts retain precision past BIGINT",
                  "[integration][gpu_execution][parquet][decimal_integer_cast]")
 {
-  auto const path = temp_db_path + ".decimal_cast.parquet";
+  sirius::test::scratch_dir scratch{"decimal_integer_cast"};
+  auto const path = scratch.file_literal("decimal_cast.parquet");
   run_ok(
     "COPY (SELECT id, v::DECIMAL(38,2) AS v FROM (VALUES "
     "(1,'18446744073709551615.49'), (2,'18446744073709551615.50'), "
     "(3,'9223372036854775807.49'), (4,'9223372036854775807.50'), "
     "(5,'-9223372036854775808.49'), (6,'-9223372036854775808.50'), (7,NULL)) t(id,v)) "
-    "TO '" +
-    path + "' (FORMAT PARQUET);");
-  auto const source = "read_parquet('" + path + "')";
+    "TO " +
+    path + " (FORMAT PARQUET);");
+  auto const source = "read_parquet(" + path + ")";
   for (auto const* strategy : {"materialize", "ast_interpret", "ast_jit"}) {
     run_ok("SET expression_evaluator_strategy = '" + std::string(strategy) + "';");
     compare_gpu_vs_cpu(
@@ -113,5 +114,4 @@ TEST_CASE_METHOD(DecimalIntegerCastFixture,
     run_ok("SET enable_duckdb_fallback = true;");
     expect_runtime_fallback_matches_cpu("SELECT id, TRY_CAST(v AS UHUGEINT) FROM " + source);
   }
-  std::filesystem::remove(path);
 }
