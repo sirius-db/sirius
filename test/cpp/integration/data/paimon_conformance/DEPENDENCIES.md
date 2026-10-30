@@ -9,7 +9,7 @@ pins or enabled build options change.
 ## Top-level sources
 
 The recipe records full commits, archive sizes and SHA256 values for DuckDB
-`88ecd0a49d7d3d838e002b2fbc0ce91ccf74110e`, duckdb-paimon
+`d54cbbe3df17e8e5ce68312f483b4155836112aa`, duckdb-paimon
 `307fc34c04623fe18f0ac39125b6319ea0013c0f`, and paimon-cpp
 `53f9c86d45aabb0a6f1a379271da07d7a9f27a3d`. The extension comes from maintainer mrdrivingduck's v2 adaptation; the native
 Paimon pin and enabled native dependencies remain unchanged. The Python builder checks size and SHA256
