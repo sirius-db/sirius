@@ -354,11 +354,13 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
                    concatenated->num_rows(),
                    input.size(),
                    keys_sorted);
+  std::vector<cudf::order> const key_order(group_cols.size(), cudf::order::ASCENDING);
+  std::vector<cudf::null_order> const key_null_order(group_cols.size(), cudf::null_order::AFTER);
   cudf::groupby::groupby grpby_obj(cudf::table_view(group_cols),
                                    cudf::null_policy::INCLUDE,
                                    keys_sorted ? cudf::sorted::YES : cudf::sorted::NO,
-                                   {cudf::order::ASCENDING},
-                                   {cudf::null_order::AFTER});
+                                   key_order,
+                                   key_null_order);
   std::vector<cudf::groupby::aggregation_request> requests;
   for (size_t i = 0; i < aggregates.size(); ++i) {
     int aggregate_col_id = num_group_cols + static_cast<int>(i);
