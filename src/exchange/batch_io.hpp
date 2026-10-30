@@ -87,6 +87,8 @@ class incoming_batch {
   /// Reserves room for a batch described by @p header in @p gpu, else in @p host (which may be
   /// null). Allocations are ordered on @p stream.
   /// @return nullptr when neither tier has room now.
+  /// @throws sirius::internal_exception when the batch is larger than the GPU space, and no host
+  ///         space could hold it either: it would never land.
   [[nodiscard]] static std::unique_ptr<incoming_batch> land(batch_header header,
                                                             cucascade::memory::memory_space& gpu,
                                                             cucascade::memory::memory_space* host,
