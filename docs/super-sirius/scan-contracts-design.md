@@ -299,6 +299,8 @@ A late GPU, physical-input, certificate, or exhausted-retry failure stops and dr
 
 The policy checks bound sources, including those hidden behind views. Transparent execution retains the original CPU plan. Explicit `gpu_execution()` checks its bind-time policy and validates the newly bound CPU plan before replay, so a replaced view cannot inherit stale permission. SQL-text and filesystem checks also block S3 replay.
 
+Source discovery retains its first failure while continuing to check siblings. Known S3 and stream restrictions take precedence. If discovery failure prevents replay, the query error includes both the discovery failure and the underlying GPU error. Non-standard C++ exceptions are converted to ordinary query errors; cancellation still propagates immediately.
+
 On the explicit path, the rebound validator returns a policy refusal separately from the CPU result. Such a refusal counts as no replay; an admitted CPU execution counts as replay even if it returns an ordinary error or no rows.
 
 Iceberg metadata queries use a separate read-only connection with recursive GPU execution disabled and complete planning before native leases are acquired.
