@@ -249,7 +249,7 @@ TEST_CASE("logical_type - fixed_width_byte_size() returns correct sizes", "[logi
 
   REQUIRE(logical_type::make(type_id::BIGINT).fixed_width_byte_size() == 8);
   REQUIRE(logical_type::make(type_id::UBIGINT).fixed_width_byte_size() == 8);
-  REQUIRE(logical_type::make(type_id::HUGEINT).fixed_width_byte_size() == 8);   // mapped to INT64
+  REQUIRE(logical_type::make(type_id::HUGEINT).fixed_width_byte_size() == 16);  // DECIMAL128
   REQUIRE(logical_type::make(type_id::UHUGEINT).fixed_width_byte_size() == 8);  // mapped to UINT64
   REQUIRE(logical_type::make(type_id::DOUBLE).fixed_width_byte_size() == 8);
   REQUIRE(logical_type::make(type_id::TIMESTAMP_SEC).fixed_width_byte_size() == 8);

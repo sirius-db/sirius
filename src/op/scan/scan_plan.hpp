@@ -68,10 +68,11 @@ struct scan_column_layout {
  * injection, post-filter output assembly — read from this single structure
  * instead of maintaining parallel vectors.
  *
- * Three index spaces appear throughout the scan pipeline:
+ * The scan plan maps the following spaces (R additionally contains optional
+ * cuDF provenance columns before the physical D suffix):
  *   P = primary index       (position in DuckDB's full schema @c names / @c returned_types)
  *   C = column_ids position (position in the operator's @c column_ids list)
- *   D = batch position      (position in the reader's output table, after hive removal)
+ *   D = physical position   (position in the reader's physical suffix, after hive removal)
  *   M = materialized pos.   (D followed by synthesized parquet virtual columns)
  *
  * Hive-partition columns live in P-space but are not in the parquet file, so
@@ -236,7 +237,7 @@ struct bound_virtual_column {
 /// emitting a 0-column table would erase the row count downstream aggregations
 /// consume).
 ///
-/// @param table             The reader's D-order batch to reshape (consumed).
+/// @param table             The materialized M-order batch to reshape (consumed).
 /// @param plan              The scan plan describing the layout.
 /// @param partition_values  Partition values for this split, in
 ///                          @c partition_columns order. Empty when the plan has
@@ -288,7 +289,8 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
                           duckdb::vector<sirius::logical_type> const& returned_types,
                           std::size_t projected_output_count,
                           duckdb::vector<duckdb::HivePartitioningIndex> const& partition_indices,
-                          std::vector<bound_virtual_column> const& virtual_columns = {});
+                          std::vector<bound_virtual_column> const& virtual_columns = {},
+                          bool allow_metadata_only                                 = false);
 
 /// True when @p column_ids is a pruned or reordered subset of the full schema (of
 /// size @p full_schema_size) — a non-identity projection the cuDF reader must

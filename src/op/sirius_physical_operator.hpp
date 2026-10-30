@@ -112,7 +112,7 @@ enum class operator_data_type : uint8_t {
   PIPELINEABLE,
   PARTITIONED,
   GPU_SCAN,
-  GPU_VALUES,
+  INPUT_FREE,
 };
 
 /**
@@ -548,6 +548,13 @@ class sirius_physical_operator {
 
   //! Return a vector of the types that will be returned by this operator
   const duckdb::vector<sirius::logical_type>& get_types() const { return types; }
+
+  //! Schema of the rows this operator's parent receives; defaults to `types`. The materialized CTE
+  //! delegates to its consumer subtree.
+  [[nodiscard]] virtual const duckdb::vector<sirius::logical_type>& get_output_types() const
+  {
+    return types;
+  }
 
   //! Whether `get_types()` describes the batches returned directly by execute(). Most operators
   //! materialize their declared logical schema. Structural pass-through stages may instead carry

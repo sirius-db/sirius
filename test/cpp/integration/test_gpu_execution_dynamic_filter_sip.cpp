@@ -687,3 +687,128 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   dynamic_filter_switch_guard switch_on(*con, /*enabled=*/true);
   compare_gpu_vs_cpu(query);
 }
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "gpu_execution - reverse RF preserves nullable mixed semi and anti joins",
+                 "[integration][gpu_execution][dynamic_filter][reverse_rf]")
+{
+  run_ok("CREATE TABLE candidates(k INTEGER, s INTEGER, active INTEGER)");
+  run_ok(
+    "INSERT INTO candidates VALUES (NULL,1,1),(NULL,1,1),(1,1,1),(2,2,1),"
+    "(3,NULL,1),(4,4,0),(5,5,1),(500,5,1)");
+  run_ok("CREATE TABLE matching(k INTEGER, s INTEGER)");
+  run_ok("INSERT INTO matching SELECT (i % 100)::INTEGER, (i % 7)::INTEGER FROM range(10000) t(i)");
+  run_ok("INSERT INTO matching VALUES (NULL,2),(NULL,NULL),(3,NULL)");
+  run_ok("CHECKPOINT");
+  sirius::test::coverage_gate_disable_guard gate_off(*con);
+  sirius::test::scoped_sirius_setting zone_maps(*con, "enable_dynamic_zone_map_filter", true);
+  for (auto const* comparison : {"=", "IS NOT DISTINCT FROM"}) {
+    for (auto const* join_type : {"SEMI", "ANTI"}) {
+      for (auto const* active : {"1", "99"}) {
+        // Explicit joins avoid the MARK/CTE rewrite of nullable correlated NOT EXISTS.
+        std::string query = "SELECT c.k,c.s FROM candidates c ";
+        query += join_type;
+        query += " JOIN matching m ON m.k ";
+        query += comparison;
+        query += " c.k AND m.s IS DISTINCT FROM c.s WHERE c.active=";
+        query += active;
+        INFO(query);
+        auto const deltas = require_switch_result_equivalence(*con, query);
+        compare_gpu_vs_cpu(query);
+        // The nonempty candidate set must actually produce a filter, not merely match results.
+        if (std::string{active} == "1") { CHECK(deltas.on.filters_pushed > 0); }
+      }
+    }
+  }
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "gpu_execution - null-safe RF across producer join types",
+                 "[integration][gpu_execution][dynamic_filter][null_safe_rf]")
+{
+  std::string const join_type = GENERATE("INNER", "SEMI", "RIGHT", "LEFT", "ANTI", "FULL OUTER");
+  bool const composite_key    = GENERATE(false, true);
+  CAPTURE(join_type, composite_key);
+  run_ok("SET gpu_execution = false");
+  run_ok("CREATE TABLE rf_probe(k INTEGER, id INTEGER)");
+  run_ok("INSERT INTO rf_probe VALUES (NULL,1),(NULL,2),(1,3),(2,4),(99,5)");
+  run_ok("CREATE TABLE rf_build(k INTEGER, keep INTEGER)");
+  run_ok("INSERT INTO rf_build VALUES (NULL,1),(NULL,1),(1,1),(3,1),(99,0)");
+  run_ok("CHECKPOINT");
+  sirius::test::disabled_optimizers_guard shape(
+    *con, "statistics_propagation,join_order,build_side_probe_side");
+  sirius::test::coverage_gate_disable_guard gate_off(*con);
+  for (auto const* predicate : {"keep = 1", "keep = 1 AND k IS NOT NULL", "keep = 99"}) {
+    std::string const query = "SELECT p.k,p.id FROM rf_probe p " + join_type +
+                              " JOIN (SELECT k,keep FROM rf_build WHERE " + predicate +
+                              ") b ON p.k IS NOT DISTINCT FROM b.k" +
+                              (composite_key ? " AND p.id = b.keep" : "");
+    INFO(query);
+    auto const deltas = require_switch_result_equivalence(*con, query);
+    compare_gpu_vs_cpu(query);
+    if (join_type == "INNER" || join_type == "SEMI" || join_type == "RIGHT") {
+      if (std::string{predicate} != "keep = 99") { CHECK(deltas.on.producers_enabled > 0); }
+    } else {
+      CHECK(deltas.on.producers_enabled == 0);
+    }
+  }
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "gpu_execution - null-safe RF cannot manufacture outer join NULL matches",
+                 "[integration][gpu_execution][dynamic_filter][null_safe_rf]")
+{
+  run_ok("SET gpu_execution = false");
+  run_ok("CREATE TABLE rf_outer_a(id INTEGER)");
+  run_ok("INSERT INTO rf_outer_a VALUES (1)");
+  run_ok("CREATE TABLE rf_outer_b(id INTEGER, k INTEGER)");
+  run_ok("INSERT INTO rf_outer_b VALUES (1,7)");
+  run_ok("CREATE TABLE rf_outer_keys(k INTEGER, keep INTEGER)");
+  run_ok("INSERT INTO rf_outer_keys VALUES (NULL,1),(10,1),(7,0)");
+  run_ok("CHECKPOINT");
+  sirius::test::disabled_optimizers_guard shape(
+    *con, "statistics_propagation,join_order,build_side_probe_side");
+  sirius::test::coverage_gate_disable_guard gate_off(*con);
+  for (auto const* join_type : {"INNER", "SEMI"}) {
+    std::string const query =
+      "SELECT p.id,p.k FROM "
+      "(SELECT a.id,b.k FROM rf_outer_a a LEFT JOIN rf_outer_b b ON a.id=b.id) p " +
+      std::string(join_type) +
+      " JOIN (SELECT k FROM rf_outer_keys WHERE keep=1) c ON p.k IS NOT DISTINCT FROM c.k";
+    INFO(query);
+    auto const deltas = require_switch_result_equivalence(*con, query);
+    CHECK(deltas.rows.empty());
+    CHECK(deltas.on.producers_enabled > 0);
+    compare_gpu_vs_cpu(query);
+  }
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "gpu_execution - null-safe reverse RF filters a CTE consumer",
+                 "[integration][gpu_execution][dynamic_filter][null_safe_rf][null_safe_direct]")
+{
+  std::string const join_type = GENERATE("SEMI", "ANTI");
+  CAPTURE(join_type);
+  run_ok("SET gpu_execution = false");
+  run_ok("CREATE TABLE rf_candidates(k INTEGER, keep INTEGER)");
+  run_ok("INSERT INTO rf_candidates VALUES (NULL,1),(1,1),(500,1),(2,0)");
+  run_ok("CREATE TABLE rf_matches AS SELECT (range % 100)::INTEGER k FROM range(10000)");
+  run_ok("INSERT INTO rf_matches VALUES (NULL)");
+  run_ok("CHECKPOINT");
+  sirius::test::disabled_optimizers_guard shape(*con, "statistics_propagation");
+  sirius::test::coverage_gate_disable_guard gate_off(*con);
+  sirius::test::scoped_sirius_setting accumulation(
+    *con, "enable_dynamic_filter_multi_partition", true);
+  auto const query =
+    "WITH matches AS MATERIALIZED (SELECT k FROM rf_matches) SELECT c.k FROM rf_candidates c " +
+    join_type + " JOIN matches m ON c.k IS NOT DISTINCT FROM m.k WHERE c.keep=1";
+  auto explanation = con->Query("EXPLAIN " + query);
+  REQUIRE(explanation);
+  REQUIRE_FALSE(explanation->HasError());
+  INFO(explanation->ToString());
+  REQUIRE(explanation->ToString().find("Join Type: RIGHT_" + join_type) != std::string::npos);
+  auto const deltas = require_switch_result_equivalence(*con, query);
+  CHECK(deltas.on.producers_enabled > 0);
+  CHECK(deltas.on.filters_pushed > 0);
+  compare_gpu_vs_cpu(query);
+}

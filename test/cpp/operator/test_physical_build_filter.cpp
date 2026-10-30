@@ -229,8 +229,9 @@ TEST_CASE("a build filter budgets scratch rather than its resident input",
 TEST_CASE("a build filter scratch bound covers peer reduction",
           "[dynamic_filter][build_filter][memory_estimate][multi_gpu]")
 {
-  if (!acc::has_peer_connected_gpus(2)) { return; }
+  if (!sirius::test::has_gpus(2)) { return; }
   acc::fixture fixture({.devices = 2});
+  if (!acc::has_pool_access(fixture.spaces)) { return; }
   fixture.session = std::make_unique<op::dynamic_filter_publication_session>(
     fixture.make_plan(256 * acc::mib), &fixture.stats);
   op::sirius_physical_build_filter filter{build_types(), 100, *fixture.session};

@@ -59,28 +59,34 @@ class UnsignedNarrowingFixture : public sirius::test::GpuExecutionFixture {
 };
 }  // namespace
 
+// DuckDB widens UBIGINT and BIGINT operands to HUGEINT, whose DECIMAL128 carrier holds every
+// UBIGINT value, so these run exactly on the GPU.
 TEST_CASE_METHOD(UnsignedNarrowingFixture,
-                 "mixed unsigned joins reject lossy HUGEINT keys before execution",
+                 "mixed unsigned joins widen to exact HUGEINT keys on the GPU",
                  "[integration][gpu_execution][unsigned_narrowing]")
 {
+  run_ok("SET enable_duckdb_fallback=false;");
   for (auto join : {"JOIN", "LEFT JOIN", "RIGHT JOIN", "FULL OUTER JOIN"}) {
-    check_rejection("SELECT u.id,s.id FROM u " + std::string(join) + " s ON u.k=s.k");
+    compare_gpu_vs_cpu("SELECT u.id,s.id FROM u " + std::string(join) + " s ON u.k=s.k");
   }
-  check_rejection("SELECT u.id,s.id FROM u LEFT JOIN s ON u.k IS NOT DISTINCT FROM s.k");
-  check_rejection("SELECT u.id,s.id FROM u JOIN s ON u.k>s.k");
-  check_rejection("SELECT u.id,s.id FROM u JOIN s ON (u.k % 3::INTEGER)=s.k");
-  check_rejection("SELECT u.id FROM u WHERE EXISTS (SELECT 1 FROM s WHERE s.k=u.k)");
+  compare_gpu_vs_cpu("SELECT u.id,s.id FROM u LEFT JOIN s ON u.k IS NOT DISTINCT FROM s.k");
+  compare_gpu_vs_cpu("SELECT u.id,s.id FROM u JOIN s ON u.k>s.k");
+  compare_gpu_vs_cpu("SELECT u.id,s.id FROM u JOIN s ON (u.k % 3::INTEGER)=s.k");
+  compare_gpu_vs_cpu("SELECT u.id FROM u WHERE EXISTS (SELECT 1 FROM s WHERE s.k=u.k)");
+  run_ok("SET enable_duckdb_fallback=true;");
 }
 
 TEST_CASE_METHOD(UnsignedNarrowingFixture,
-                 "mixed unsigned expressions reject lossy HUGEINT operands",
+                 "mixed unsigned expressions widen to exact HUGEINT operands on the GPU",
                  "[integration][gpu_execution][unsigned_narrowing]")
 {
-  check_rejection("SELECT id,k = -1::BIGINT,k > 9223372036854775807::BIGINT FROM u");
-  check_rejection("SELECT id FROM u WHERE k > -1::BIGINT");
-  check_rejection("SELECT k % 3::INTEGER,COUNT(*) FROM u GROUP BY k % 3::INTEGER");
-  check_rejection("SELECT id,CASE WHEN id=1 THEN -1::BIGINT ELSE k END FROM u");
-  check_rejection("SELECT id,TRY_CAST(k AS HUGEINT) FROM u");
+  run_ok("SET enable_duckdb_fallback=false;");
+  compare_gpu_vs_cpu("SELECT id,k = -1::BIGINT,k > 9223372036854775807::BIGINT FROM u");
+  compare_gpu_vs_cpu("SELECT id FROM u WHERE k > -1::BIGINT");
+  compare_gpu_vs_cpu("SELECT k % 3::INTEGER,COUNT(*) FROM u GROUP BY k % 3::INTEGER");
+  compare_gpu_vs_cpu("SELECT id,CASE WHEN id=1 THEN -1::BIGINT ELSE k END FROM u");
+  compare_gpu_vs_cpu("SELECT id,TRY_CAST(k AS HUGEINT) FROM u");
+  run_ok("SET enable_duckdb_fallback=true;");
 }
 
 TEST_CASE_METHOD(UnsignedNarrowingFixture,

@@ -33,6 +33,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <exception>
 #include <functional>
 #include <future>
 #include <memory>
@@ -76,6 +77,10 @@ struct downgrade_request {
  * candidate batches, and dispatches downgrade tasks to the thread pool.
  *
  * This is a standalone class with its own thread pool and request queue.
+ * Request futures become ready only after dispatched workers release their captures and extracted
+ * candidates are returned or retired. Dispatch failures, including stream acquisition failures,
+ * reach the future as the original exception, even if earlier workers freed memory. The executor
+ * can serve subsequent requests.
  */
 class downgrade_executor {
  public:
@@ -180,6 +185,21 @@ class downgrade_executor {
   }
 
  private:
+  friend struct downgrade_executor_test_access;
+
+  enum class stream_acquisition_site { repository, pipeline_queue };
+
+  // Tests arm this only while request processing is idle, before publishing the request. The
+  // processing thread consumes it once, before acquiring a stream.
+  struct stream_acquisition_fault {
+    stream_acquisition_site site;
+    size_t skip;
+    std::exception_ptr error;
+    std::function<void()> before_failure;
+  };
+  std::optional<stream_acquisition_fault> _stream_acquisition_fault;
+  void maybe_fail_stream_acquisition(stream_acquisition_site site);
+
   void processing_loop();
   void monitor_loop();
   void cancel_pending_requests();

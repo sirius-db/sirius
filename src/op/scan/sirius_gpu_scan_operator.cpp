@@ -709,6 +709,12 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::get_next_task_input
     scan_input->pushdown_selection_unprofitable = _decode_selection_unprofitable;
     scan_input->consumer                        = decode_consumer();
     scan_input->cached_view_possible            = cached_view_possible();
+    // A compacted decode may write a column directly in the type this scan would restore it to,
+    // which saves the scan's widening cast. Slot i of the decode is output column i only when the
+    // output assembly is a leading identity, so the targets are passed on only then.
+    if (_ingestible->output_assembly_is_leading_identity()) {
+      scan_input->decode_restore_types = normalization_targets();
+    }
     scan_input->update(io::cache::scan_stage::queued);
   }
   return std::move(*next);

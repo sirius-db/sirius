@@ -29,6 +29,7 @@
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/sirius_physical_operator.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <numeric>
@@ -80,6 +81,17 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   /// (AggregateSlot::is_wide_integer_sum), whose partial result may be DECIMAL128.
   std::vector<bool> cudf_aggregate_is_wide_integer_sum;
 
+  /// Max groups in the previous batch for a widened BIGINT SUM to be summed as two INT64 halves
+  /// instead of over DECIMAL128. From a group-count sweep on an RTX PRO 6000: the halves win up to
+  /// 10K groups (contention on cuDF's 128-bit CAS), tie at 100K-300K, and lose from 1M on (a second
+  /// atomic per row). 64K sits inside the tie range, well below the losses.
+  static constexpr std::int64_t split_wide_sum_max_groups = 1 << 16;
+
+  /// Groups in the most recent batch this operator aggregated; -1 until the first one. Batches
+  /// that start before any count is known split: a wasted split costs a few percent at most,
+  /// while a wasted DECIMAL128 sum with few groups costs up to 3x.
+  std::atomic<std::int64_t> _last_batch_groups{-1};
+
   // Partial aggregate layout and finalization metadata
   std::vector<AggregateSlot> aggregate_slots;
   duckdb::vector<sirius::logical_type> local_types;
@@ -113,10 +125,11 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
 
   [[nodiscard]] bool has_stddev_samp() const;
 
-  //! Alternate carriers of the local output, for set_alternate_physical_types(): DECIMAL128 for
-  //! the column of each wide integer SUM, whose partial is INT64 or, where the batch could
-  //! overflow INT64, DECIMAL128. Empty when no SUM is wide or `types` is not one column per cuDF
-  //! aggregate after the group columns.
+  //! Alternate carriers of the local output, for set_alternate_physical_types(). The partial of a
+  //! wide integer SUM, or of an aggregate whose result is HUGEINT, is INT64 or DECIMAL128 with
+  //! scale 0; its column's alternate is whichever of the two is not its native carrier. Empty when
+  //! no slot has two carriers or `types` is not one column per cuDF aggregate after the group
+  //! columns.
   [[nodiscard]] std::vector<std::optional<cudf::data_type>> wide_integer_sum_partial_types() const;
 
   // Source interface
