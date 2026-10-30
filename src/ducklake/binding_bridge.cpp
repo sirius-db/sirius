@@ -411,6 +411,7 @@ std::optional<unit_descriptor> binding_handle::unit_at(uint64_t index) const
   auto transaction           = impl_->transaction.lock();
   if (!transaction) throw std::runtime_error("DuckLake transaction expired during discovery");
   result.transaction_local_delete =
+    info.include_local_changes &&
     transaction->HasLocalDeleteForFile(info.table_id, entry.file.path);
   bool inlined = false, local = false;
   uint64_t schema_version;

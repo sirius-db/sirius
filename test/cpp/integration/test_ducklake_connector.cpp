@@ -341,6 +341,75 @@ TEST_CASE("DuckLake flush preserves rows and file paths after closing every conn
 }
 
 TEST_CASE_METHOD(ducklake_fixture,
+                 "DuckLake bound deletion locality follows the selected read view",
+                 "[isolated_context][ducklake][ducklake_delete_locality]")
+{
+  if (!sirius::ducklake::bridge_available()) SKIP("DuckLake private binding bridge is disabled");
+  query(con, "SET gpu_execution=false");
+  attach_lake(con, disk.directory);
+  query(con, "CALL lake.set_option('data_inlining_row_limit',10)");
+  query(con, "CREATE TABLE lake.t AS SELECT i::BIGINT id FROM range(100) r(i)");
+  query(con, "DELETE FROM lake.t WHERE id=0");
+  auto snapshot  = query(con,
+                        "SELECT snapshot_id, snapshot_time FROM ducklake_snapshots('lake') "
+                         "ORDER BY snapshot_id DESC LIMIT 1");
+  auto version   = snapshot->Collection().GetValue(0, 0).ToString();
+  auto timestamp = snapshot->Collection().GetValue(1, 0).ToSQLString();
+  query(con, "DELETE FROM lake.t WHERE id=2");
+  query(con, "CALL ducklake_flush_inlined_data('lake')");
+  query(con, "BEGIN");
+  query(con, "DELETE FROM lake.t WHERE id>=50 AND id<80");
+
+  auto observer = duckdb::make_shared_ptr<provider_query_observer>();
+  std::vector<bool> local_deletes;
+  bool inside            = false;
+  observer->inspect_plan = [&](duckdb::ClientContext& context, duckdb::LogicalOperator& plan) {
+    if (&context != con.context.get() || inside) return;
+    inside     = true;
+    auto leave = std::shared_ptr<void>(nullptr, [&](void*) { inside = false; });
+    auto visit = [&](auto&& self, duckdb::LogicalOperator& op) -> void {
+      if (op.type == duckdb::LogicalOperatorType::LOGICAL_GET) {
+        auto& get = op.Cast<duckdb::LogicalGet>();
+        if (get.function.GetName() == "ducklake_scan") {
+          auto binding =
+            sirius::ducklake::binding_handle::capture(get.function, get.bind_data.get(), context);
+          for (uint64_t index = 0;; ++index) {
+            auto unit = binding->unit_at(index);
+            if (!unit) break;
+            if (unit->kind != sirius::ducklake::unit_kind::parquet) continue;
+            local_deletes.push_back(unit->transaction_local_delete);
+          }
+        }
+      }
+      for (auto& child : op.children)
+        self(self, *child);
+    };
+    visit(visit, plan);
+  };
+  duckdb::OptimizerExtension hook;
+  hook.optimizer_info        = observer;
+  hook.pre_optimize_function = observe_provider_query;
+  duckdb::OptimizerExtension::Register(duckdb::DBConfig::GetConfig(*con.context), std::move(hook));
+  auto clear = std::shared_ptr<void>(nullptr, [&](void*) { observer->inspect_plan = {}; });
+  auto check = [&](std::string const& suffix, bool expected_local, int64_t count, int64_t sum) {
+    CAPTURE(suffix, expected_local);
+    local_deletes.clear();
+    auto result = query(con, "SELECT count(*), sum(id)::BIGINT FROM lake.t" + suffix);
+    REQUIRE_FALSE(local_deletes.empty());
+    for (auto local : local_deletes)
+      CHECK(local == expected_local);
+    CHECK(result->Collection().GetValue(0, 0).GetValue<int64_t>() == count);
+    CHECK(result->Collection().GetValue(1, 0).GetValue<int64_t>() == sum);
+  };
+  check("", true, 68, 3013);
+  check(" AT (VERSION => " + version + ")", false, 99, 4950);
+  check(" AT (TIMESTAMP => " + timestamp + ")", false, 99, 4950);
+  check("", true, 68, 3013);
+  query(con, "ROLLBACK");
+  check("", false, 98, 4948);
+}
+
+TEST_CASE_METHOD(ducklake_fixture,
                  "DuckLake SQL preserves snapshot and transaction visibility",
                  "[transparent][provenance][ducklake][isolated_context]")
 {
