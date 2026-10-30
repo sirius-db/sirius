@@ -39,7 +39,9 @@ class exchange_service;
  * @brief Every rank contributes one small table on @p stream; each gets all of them.
  *
  * Blocks until every rank's table has arrived, so every rank must call it with the same stream
- * id. Meant for small tables, such as sort samples and filters.
+ * id. Meant for small tables, such as sort samples and filters. Never call it on the transport's
+ * engine thread (e.g. from an inbound callback or a finalize it triggers): that thread delivers
+ * the tables this waits for. Tables copied back from host are ordered on @p cuda_stream.
  *
  * @param mine This rank's table, on the GPU; null or empty to contribute nothing.
  * @param gpu Where tables that landed elsewhere are brought before they are returned.

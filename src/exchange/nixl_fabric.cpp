@@ -46,7 +46,8 @@ namespace {
 
 static_assert(std::endian::native == std::endian::little, "the hello is little-endian");
 
-// A notification's first byte names its kind; the transport's kinds are 1 to 4.
+// A notification's first byte names its kind; the transport's kinds are 1 to 5 (messages.cpp:
+// enum class kind); these stay clear of them.
 constexpr char hello_kind = '\x7f';
 // A host-staged write landed in the receiver's mirror: kind | u64 offset | u64 bytes | the
 // write's own notification.
