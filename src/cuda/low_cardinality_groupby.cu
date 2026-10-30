@@ -299,7 +299,7 @@ std::unique_ptr<cudf::table> try_low_cardinality_groupby(
   std::vector<int> const& group_idx,
   std::vector<cudf::aggregation::Kind> const& aggregates,
   std::vector<int> const& aggregate_idx,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
   int64_t const num_rows = input.num_rows();
