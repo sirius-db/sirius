@@ -122,6 +122,9 @@ class transport {
     /// How long the engine may hold work without progress before it fails: a lost peer is
     /// fail-stop (#2373), so this bounds how long one hangs a query.
     std::chrono::milliseconds stall_timeout{std::chrono::minutes{10}};
+    /// Called on the engine thread, once per batch, when a batch of this many bytes finds no room
+    /// on either tier. Must not block. Unset: the batch waits for room to appear.
+    std::function<void(std::size_t bytes)> request_room;
   };
 
   /**

@@ -50,6 +50,7 @@ struct nixl_exchange_options {
   std::uint32_t send_frames          = 16;
   std::uint32_t recv_frames_per_peer = 8;
   host_staging staging               = host_staging::automatic;
+  transport::options transport_options;
 };
 
 /**
