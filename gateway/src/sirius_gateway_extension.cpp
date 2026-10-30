@@ -65,22 +65,24 @@ unique_ptr<FunctionData> status_rows(gateway_state& gateway,
                                      vector<LogicalType>& types,
                                      vector<Identifier>& names)
 {
-  names             = {"rank", "pid", "gpu", "uri", "state", "error", "last_query_id", "queued"};
-  types             = {LogicalType::UINTEGER,
-                       LogicalType::BIGINT,
-                       LogicalType::VARCHAR,
-                       LogicalType::VARCHAR,
-                       LogicalType::VARCHAR,
-                       LogicalType::VARCHAR,
-                       LogicalType::UBIGINT,
-                       LogicalType::UBIGINT};
-  auto data         = make_uniq<rows_data>();
+  names     = {"rank", "pid", "gpu", "host", "uri", "state", "error", "last_query_id", "queued"};
+  types     = {LogicalType::UINTEGER,
+               LogicalType::BIGINT,
+               LogicalType::VARCHAR,
+               LogicalType::VARCHAR,
+               LogicalType::VARCHAR,
+               LogicalType::VARCHAR,
+               LogicalType::VARCHAR,
+               LogicalType::UBIGINT,
+               LogicalType::UBIGINT};
+  auto data = make_uniq<rows_data>();
   auto const last   = Value::UBIGINT(gateway.last_query_id());
   auto const queued = Value::UBIGINT(gateway.waiting());
   for (auto const& r : gateway.status()) {
     data->rows.push_back({Value::UINTEGER(r.index),
                           Value::BIGINT(r.pid),
                           Value(r.gpu),
+                          Value(r.host),
                           Value(r.uri),
                           Value(r.state),
                           r.error.empty() ? Value(LogicalType::VARCHAR) : Value(r.error),
@@ -104,13 +106,21 @@ unique_ptr<FunctionData> start_bind(ClientContext& context,
 {
   sirius_gateway::start_options options;
   options.ranks = input.inputs[0].GetValue<uint32_t>();
+  auto list     = [](Value const& value) {
+    std::vector<std::string> items;
+    if (value.IsNull() || value.ToString().empty()) { return items; }
+    for (auto item : StringUtil::Split(value.ToString(), ',')) {
+      StringUtil::Trim(item);
+      items.push_back(item);
+    }
+    return items;
+  };
   for (auto const& [name, value] : input.named_parameters) {
     auto const key = StringUtil::Lower(name.GetIdentifierName());
-    if (key == "gpus" && !value.IsNull() && !value.ToString().empty()) {
-      for (auto gpu : StringUtil::Split(value.ToString(), ',')) {
-        StringUtil::Trim(gpu);
-        options.gpus.push_back(gpu);
-      }
+    if (key == "gpus") {
+      options.gpus = list(value);
+    } else if (key == "hosts") {
+      options.hosts = list(value);
     } else if (key == "exchange_base_port") {
       options.exchange_base_port = value.GetValue<uint32_t>();
     } else if (key == "quack_base_port") {
@@ -120,6 +130,7 @@ unique_ptr<FunctionData> start_bind(ClientContext& context,
   options.duckdb_binary    = string_setting(context, "sirius_gateway_duckdb_binary");
   options.sirius_extension = string_setting(context, "sirius_gateway_sirius_extension");
   options.rank_init        = string_setting(context, "sirius_gateway_rank_init");
+  options.rank_launcher    = string_setting(context, "sirius_gateway_rank_launcher");
   options.log_dir          = string_setting(context, "sirius_gateway_log_dir");
   if (options.log_dir.empty()) {
     options.log_dir =
@@ -227,6 +238,7 @@ void LoadInternal(ExtensionLoader& loader)
   auto start = add("sirius_gateway_start", {}, scan_rows, start_bind);
   start.GetSignature().AddParameter("ranks", LogicalType::INTEGER);
   start.GetSignature().AddKeywordOnly("gpus", LogicalType::VARCHAR, Value(""));
+  start.GetSignature().AddKeywordOnly("hosts", LogicalType::VARCHAR, Value(""));
   start.GetSignature().AddKeywordOnly(
     "exchange_base_port", LogicalType::INTEGER, Value::INTEGER(27000));
   start.GetSignature().AddKeywordOnly(
@@ -261,6 +273,11 @@ void LoadInternal(ExtensionLoader& loader)
                             "SQL each rank's session runs after the exchange settings",
                             LogicalType::VARCHAR,
                             Value(""));
+  config.AddExtensionOption(
+    "sirius_gateway_rank_launcher",
+    "Program that starts a rank on another host: <host> <gpu> <quack port> <duckdb> <init file>",
+    LogicalType::VARCHAR,
+    Value(""));
   config.AddExtensionOption("sirius_gateway_log_dir",
                             "Directory for rank init files and logs; empty uses a temporary one",
                             LogicalType::VARCHAR,

@@ -2,8 +2,12 @@
 #include "gateway_state.hpp"
 
 #include <fcntl.h>
+#include <ifaddrs.h>
+#include <netdb.h>
+#include <netinet/in.h>
 #include <signal.h>
 #include <spawn.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -58,7 +62,14 @@ void spawn_rank(start_options const& options, std::string const& token, rank& r)
     if (std::strncmp(*e, "CUDA_VISIBLE_DEVICES=", 21) != 0) { env.emplace_back(*e); }
   }
   env.push_back("CUDA_VISIBLE_DEVICES=" + r.gpu);
-  std::vector<std::string> args{options.duckdb_binary, "-unsigned", "-init", init};
+  auto args     = r.remote
+                    ? std::vector<std::string>{options.rank_launcher,
+                                               r.host,
+                                               r.gpu,
+                                               std::to_string(options.quack_base_port + r.index),
+                                               options.duckdb_binary,
+                                               init}
+                    : std::vector<std::string>{options.duckdb_binary, "-unsigned", "-init", init};
   auto pointers = [](std::vector<std::string>& strings) {
     std::vector<char*> result;
     for (auto& s : strings) {
@@ -70,17 +81,47 @@ void spawn_rank(start_options const& options, std::string const& token, rank& r)
   auto argv = pointers(args);
   auto envp = pointers(env);
   int const rc =
-    posix_spawn(&r.pid, options.duckdb_binary.c_str(), &actions, nullptr, argv.data(), envp.data());
+    posix_spawn(&r.pid, args.front().c_str(), &actions, nullptr, argv.data(), envp.data());
   posix_spawn_file_actions_destroy(&actions);
   close(in[0]);
   close(log);
   if (rc != 0) {
     close(in[1]);
     r.pid = -1;
-    throw IOException(
-      "cannot start rank %d with %s: %s", r.index, options.duckdb_binary, std::strerror(rc));
+    throw IOException("cannot start rank %d with %s: %s", r.index, args.front(), std::strerror(rc));
   }
   r.stdin_fd = in[1];
+}
+
+bool is_local_host(std::string const& host)
+{
+  addrinfo hints{};
+  hints.ai_family   = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+  addrinfo* found   = nullptr;
+  if (getaddrinfo(host.c_str(), nullptr, &hints, &found) != 0) { return false; }
+  ifaddrs* interfaces = nullptr;
+  if (getifaddrs(&interfaces) != 0) {
+    freeaddrinfo(found);
+    return false;
+  }
+  bool local = false;
+  for (auto* a = found; a != nullptr && !local; a = a->ai_next) {
+    for (auto* i = interfaces; i != nullptr && !local; i = i->ifa_next) {
+      if (i->ifa_addr == nullptr || i->ifa_addr->sa_family != a->ai_family) { continue; }
+      if (a->ai_family == AF_INET) {
+        local = reinterpret_cast<sockaddr_in const*>(a->ai_addr)->sin_addr.s_addr ==
+                reinterpret_cast<sockaddr_in const*>(i->ifa_addr)->sin_addr.s_addr;
+      } else if (a->ai_family == AF_INET6) {
+        local = std::memcmp(&reinterpret_cast<sockaddr_in6 const*>(a->ai_addr)->sin6_addr,
+                            &reinterpret_cast<sockaddr_in6 const*>(i->ifa_addr)->sin6_addr,
+                            sizeof(in6_addr)) == 0;
+      }
+    }
+  }
+  freeifaddrs(interfaces);
+  freeaddrinfo(found);
+  return local;
 }
 
 bool rank_exited(rank& r)
