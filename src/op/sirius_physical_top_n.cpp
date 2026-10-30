@@ -144,6 +144,10 @@ void publish_top_n_boundary(cudf::table_view sorted,
                       : (comparison == duckdb::ExpressionType::COMPARE_GREATERTHAN ||
                          comparison == duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO);
   if (!compatible) return;
+  // A leading-key-only bound must retain ties for the remaining ordering keys.
+  if (orders.size() > 1 && (comparison == duckdb::ExpressionType::COMPARE_LESSTHAN ||
+                            comparison == duckdb::ExpressionType::COMPARE_GREATERTHAN))
+    return;
   if (!filter->initialized ||
       (ascending ? duckdb::ValueOperations::LessThan(value, filter->constant)
                  : duckdb::ValueOperations::GreaterThan(value, filter->constant))) {
