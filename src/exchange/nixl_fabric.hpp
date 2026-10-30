@@ -96,7 +96,7 @@ class nixl_fabric : public fabric {
  private:
   struct peer {
     std::string host;
-    int port{0};
+    std::uint16_t port{0};
     std::string agent;
     std::uintptr_t recv_base{0};
     std::size_t recv_bytes{0};
