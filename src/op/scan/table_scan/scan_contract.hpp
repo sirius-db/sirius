@@ -17,6 +17,7 @@
 #pragma once
 
 #include "op/scan/table_scan/bound_read_view.hpp"
+#include "op/scan/table_scan/mapping_rules.hpp"
 #include "op/scan/table_scan/materializer_capabilities.hpp"
 
 #include <duckdb/common/column_index.hpp>
@@ -217,6 +218,20 @@ struct scan_publication_observation {
 };
 
 struct physical_check_counters {
+  std::array<std::array<std::atomic<uint64_t>, 11>, 3> mapper_refusals{};
+  void record_mapper_refusal(rule_set_id rules, refusal_rule rule) noexcept
+  {
+    mapper_refusals[static_cast<std::size_t>(rules)][static_cast<std::size_t>(rule)].fetch_add(
+      1, std::memory_order_relaxed);
+  }
+  [[nodiscard]] std::array<std::array<uint64_t, 11>, 3> mapper_refusal_snapshot() const noexcept
+  {
+    std::array<std::array<uint64_t, 11>, 3> result{};
+    for (std::size_t i = 0; i < result.size(); ++i)
+      for (std::size_t j = 0; j < result[i].size(); ++j)
+        result[i][j] = mapper_refusals[i][j].load(std::memory_order_relaxed);
+    return result;
+  }
   std::atomic<uint64_t> split_flushed_for_schema{0};
   std::atomic<uint64_t> iceberg_manifest_walks{0};
   std::atomic<uint64_t> iceberg_dv_manifest_reads{0};

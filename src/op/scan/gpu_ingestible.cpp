@@ -111,6 +111,10 @@ filtered_table gpu_ingestible::materialize_table(
     }
     return materialized;
   } else {
+    auto finish = [this](filtered_table result) {
+      record_resident_execution(result);
+      return result;
+    };
     // A decode-row-filtered batch already had the split's whole table-filter
     // conjunction applied during decompression: rows are compacted to the
     // survivors, but the batch still carries the materialized column order.
@@ -123,11 +127,16 @@ filtered_table gpu_ingestible::materialize_table(
       // prepare_for_processing took ownership of the wrapper batch's per-query
       // table; move it straight into the scan output — the owned-table
       // owning_table_view releases by moving columns, so no copy is made.
+      // Allocate shadow facts before consuming the transactional source. A host
+      // allocation failure must leave the stolen table available for retry.
+      auto result =
+        finish(filtered_table{.state               = decoded_state,
+                              .predicate_columns   = split.pushdown_predicate_columns,
+                              .predicates_enforced = split.pushdown_predicates_enforced});
+      if (result.execution) result.execution->layout_width = split.stolen_table->num_columns();
+      result.table                = owning_table_view{std::move(split.stolen_table)};
       split.stolen_table_consumed = true;
-      return {.table               = owning_table_view{std::move(split.stolen_table)},
-              .state               = decoded_state,
-              .predicate_columns   = split.pushdown_predicate_columns,
-              .predicates_enforced = split.pushdown_predicates_enforced};
+      return result;
     }
     if (split.stolen_table_consumed) {
       throw std::runtime_error(
@@ -158,14 +167,15 @@ filtered_table gpu_ingestible::materialize_table(
       // discipline the duckdb-native decoder uses for its staging buffers
       // (submit_and_await).
       stream.sync();
-      return {.table = owning_table_view{std::move(masked)}, .state = filter_state::UNFILTERED};
+      return finish(filtered_table{.table = owning_table_view{std::move(masked)},
+                                   .state = filter_state::UNFILTERED});
     }
     auto const stored_bytes = rbatch.get_data()->get_size_in_bytes();
-    return {.table               = owning_table_view{std::move(rbatch), view},
-            .state               = decoded_state,
-            .predicate_columns   = split.pushdown_predicate_columns,
-            .predicates_enforced = split.pushdown_predicates_enforced,
-            .stored_bytes        = stored_bytes};
+    return finish(filtered_table{.table               = owning_table_view{std::move(rbatch), view},
+                                 .state               = decoded_state,
+                                 .predicate_columns   = split.pushdown_predicate_columns,
+                                 .predicates_enforced = split.pushdown_predicates_enforced,
+                                 .stored_bytes        = stored_bytes});
   }
 }
 

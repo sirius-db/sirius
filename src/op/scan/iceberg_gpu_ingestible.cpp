@@ -18,6 +18,7 @@
 #include "op/scan/iceberg_dv_preparation.hpp"
 #include "op/scan/positional_visibility.hpp"
 #include "op/scan/puffin_reader.hpp"
+#include "op/scan/shared_materializer.hpp"
 #include "sirius/exception.hpp"
 #include "transparent/read_view_registry.hpp"
 
@@ -591,18 +592,51 @@ filtered_table iceberg_gpu_ingestible::materialize_metadata_to_table(
   // about deletes. The check below is what guards the case that matters -- if they cause the
   // reader to filter rows, positions stop identifying file rows and we refuse rather than
   // delete the wrong ones.
-  auto base = _core.materialize_metadata_to_table(
-    info, mem_space, stream, like_swar_fastpath, std::move(like_cache), policy);
+  std::vector<required_visibility_input> visibility_owners;
+  for (auto const& binding : *requirements)
+    visibility_owners.push_back({binding, sets.at(binding.file)});
+  auto base = _core.materialize_metadata_to_table(info,
+                                                  mem_space,
+                                                  stream,
+                                                  like_swar_fastpath,
+                                                  std::move(like_cache),
+                                                  policy,
+                                                  requirements,
+                                                  std::move(visibility_owners));
 
   base.required_visibility = std::move(requirements);
   if (!base.execution) throw sirius::internal_exception("Iceberg decode omitted execution facts");
   if (!has_deletes) base.execution->positions = row_position_state::none;
-  finish_visibility(
+  apply_materialization_visibility(
     *base.required_visibility,
     base.execution->visibility_applied,
     base.execution->visibility_complete,
     [&](std::span<applied_visibility const> pending) {
       if (!has_deletes) return;
+      if (base.lineage_record) {
+        auto lineage = *base.lineage_record;
+        rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
+        for (auto const& binding : pending)
+          if (!lineage.domain ||
+              std::none_of(
+                lineage.domain->files.begin(), lineage.domain->files.end(), [&](auto const& file) {
+                  return delete_key_for(file.identity) == binding.file;
+                }))
+            throw std::invalid_argument("visibility file is outside decoder input domain");
+        apply_lineage_visibility(
+          base.table,
+          lineage,
+          [&](auto const& file) -> std::span<int64_t const> {
+            for (auto const& binding : pending)
+              if (binding.file == delete_key_for(file)) return sets.at(binding.file)->positions;
+            return {};
+          },
+          stream,
+          mr_ref);
+        base.lineage_record       = std::make_shared<row_lineage const>(std::move(lineage));
+        base.execution->positions = base.lineage_record->state;
+        return;
+      }
       iceberg_delete_sets pending_sets;
       for (auto const& binding : pending)
         pending_sets.emplace(binding.file, sets.at(binding.file));
@@ -694,7 +728,10 @@ filtered_table iceberg_gpu_ingestible::materialize_metadata_to_table(
       base.table = owning_table_view{std::move(filtered)};
       if (base.execution) base.execution->positions = row_position_state::lost;
       return;
-    });
+    },
+    base.execution->contract,
+    base.attempt,
+    base.logical_input);
   return base;
 }
 

@@ -839,6 +839,36 @@ without an Arrow or CPU-vector round trip. These helpers do not register a new S
 source adapter or relax the existing Iceberg equality-delete, snapshot or
 remote-DV gates. Schema evolution is limited to the qualified flat profile described above.
 
+## Shared GPU decoder boundary
+
+`materialize_shared` accepts an owned prepared input, a program-bound mapping
+certificate and a `decode_fn`. Parquet calls this boundary before its existing
+pipeline finish; an independent GPU decoder can call it directly without Arrow
+or a Parquet footer. Complete materialization runs normalization and virtual
+column assembly, pending file visibility, residual predicates and output assembly
+in that order. Parquet's inline Hive and deferred residual paths use the same
+semantic functions. Caller expression policy, stream and allocator are preserved.
+`scoped_step_observer` observes actual work under a test-only opt-in; it cannot
+replace work or propagate callback exceptions into a query.
+
+The program shares the full immutable predicate catalogue, including expressions,
+materialized slots and answer eligibility. `row_lineage` separately retains an
+immutable input domain and identity, interval or device ordinal selection.
+Composition preserves the original domain; concatenation shifts by input length,
+not survivor count. `none` and `lost` never imply identity. Reader positions are
+converted only for a canonical-lineage consumer, reusing the row buffer and
+releasing source indices; ordinary Iceberg interval/reader-position deletion
+keeps its existing representation. A legacy `row_domain` view can be generated
+explicitly from the canonical record; independently authoritative copies are
+rejected. Unqualified bulk/Hive, mapped, metadata-only and resident producers
+retain legacy authority. Resident/decompression results also carry shadow facts;
+native MVCC continues to use its separate visibility contract.
+
+`table_scan/field_mapper.hpp` wraps the existing name, Iceberg field-ID and flat
+compatibility rules. It returns immutable mapping results or structured refusals,
+retains original physical-check evidence and diagnostics, and counts only rules
+actually attempted. Preparation still reads and certifies each footer once.
+
 ## Key Files
 
 | File | Purpose |

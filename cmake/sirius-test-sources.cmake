@@ -350,6 +350,8 @@ set(TEST_SOURCES
     test/cpp/scan/test_residual_filter.cpp
     test/cpp/scan/test_scan_execution.cpp
     test/cpp/scan/test_scan_materialization.cpp
+    test/cpp/scan/test_row_lineage.cpp
+    test/cpp/scan/test_shared_materializer.cpp
     test/cpp/scan/test_arrow_import_resources.cpp
     test/cpp/scan/test_scan_filter_cast_ranges.cpp
     test/cpp/scan/test_scan_filter_ranges.cpp

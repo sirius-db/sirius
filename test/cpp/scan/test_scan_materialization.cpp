@@ -7,6 +7,7 @@
 #include "op/scan/iceberg_gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "op/scan/positional_visibility.hpp"
+#include "op/scan/table_scan/field_mapper.hpp"
 #include "scan_manager/preparation_test_support.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
@@ -431,6 +432,24 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     {9, duckdb::LogicalType::BIGINT, {}, true},
     {4, duckdb::LogicalType::INTEGER, {}, false},
     {12, duckdb::LogicalType::INTEGER, duckdb::Value(duckdb::LogicalType::INTEGER), false}};
+  scan_plan mapped_layout;
+  mapped_layout.data_columns = {{0, "renamed_right"}, {1, "renamed_left"}, {2, "added"}};
+  physical_check_counters mapper_counts;
+  mapping_request request{
+    rule_set_id::iceberg_flat_v1, resolved.artifact, path, mapped_layout, program};
+  request.requirements = fields;
+  auto refused         = map_file(request, &mapper_counts);
+  REQUIRE(std::holds_alternative<mapping_refusal>(refused));
+  CHECK(std::get<mapping_refusal>(refused).rule == refusal_rule::partition_constant_unproved);
+  CHECK(mapper_counts.mapper_refusals[2][10].load() == 1);
+  std::unordered_set<std::string> proof{path};
+  request.files_without_partition_values = &proof;
+  auto accepted                          = map_file(request, &mapper_counts);
+  REQUIRE(std::holds_alternative<std::shared_ptr<mapping_result const>>(accepted));
+  auto const& mapped = *std::get<std::shared_ptr<mapping_result const>>(accepted);
+  CHECK(mapped.compiled->read_names() == std::vector<std::string>{"right", "old.dot"});
+  CHECK(mapped.leaves == std::vector<std::vector<std::size_t>>{{1}, {0}});
+  CHECK(mapper_counts.mapper_refusals[2][10].load() == 1);
   auto mapping = field_id_mapping::compile(resolved.artifact, resolved.identity, program, fields);
   CHECK_FALSE(mapping.statistics_name(0));  // Widened value.
   CHECK_FALSE(mapping.statistics_name(1));  // Literal dot is not a nested path.

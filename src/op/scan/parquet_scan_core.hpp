@@ -16,6 +16,7 @@
 
 #pragma once
 #include "op/scan/parquet_scan_types.hpp"
+#include "op/scan/shared_materializer.hpp"
 namespace sirius::op::scan {
 class parquet_scan_core {
  public:
@@ -53,7 +54,9 @@ class parquet_scan_core {
     ::cuda::stream_ref stream,
     bool like_swar_fastpath,
     std::shared_ptr<const sirius::like_multiliteral_cache> like_cache,
-    expression_query_policy policy = {});
+    expression_query_policy policy                           = {},
+    std::shared_ptr<visibility_bindings const> visibility    = {},
+    std::vector<required_visibility_input> visibility_owners = {});
 
   std::unique_ptr<cudf::table> post_filter_and_project(
     filtered_table&& table,
@@ -89,8 +92,17 @@ class parquet_scan_core {
   [[nodiscard]] bool can_report_survivors() const noexcept { return true; }
 
   [[nodiscard]] scan_filter_analysis const& filter_analysis() const { return _filter_analysis; }
+  void record_resident_execution(filtered_table&) const;
+  void set_decode_override(decode_fn decode) { _decode_override = std::move(decode); }
 
  private:
+  filtered_table decode_metadata_to_table(scan_info const&,
+                                          cucascade::memory::memory_space const&,
+                                          ::cuda::stream_ref,
+                                          bool,
+                                          std::shared_ptr<like_multiliteral_cache const>,
+                                          expression_query_policy);
+  decode_fn _decode_override;
   [[nodiscard]] uint64_t execution_contract() const noexcept;
   [[nodiscard]] scan_execution_record execution_progress(filtered_table const&) const;
   [[nodiscard]] scan_execution_record decoded_execution(bool static_filter_applied,
@@ -144,7 +156,7 @@ class parquet_scan_core {
   // column only when its plan can, and the same scan's disk splits never do —
   // so post_filter_and_project assembles the residual from what the batch
   // reports rather than from anything precomputed here.
-  residual_filter _residual;
+  std::shared_ptr<static_predicate_catalogue const> _catalogue;
   // IDs in the full catalogue, fixed before any reader/statistics exclusions.
   std::vector<std::size_t> _reader_conjuncts;
 
