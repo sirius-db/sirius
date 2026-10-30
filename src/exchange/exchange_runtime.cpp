@@ -53,6 +53,7 @@ std::shared_ptr<exchange_service> make_nixl_exchange(rank_t rank,
   // The rings, the fabric's registrations and streams, and the transport's streams and engine
   // thread all take the current device.
   rmm::cuda_set_device_raii const device{rmm::cuda_device_id{gpu.get_device_id()}};
+  // A one-rank world has no peers; still give the receive ring frames, since frame_ring needs one.
   auto const peer_count = static_cast<std::uint32_t>(peers.size() > 1 ? peers.size() - 1 : 1);
   auto b                = std::make_shared<bundle>();
   b->send               = std::make_unique<frame_ring>(opts.send_frames, opts.frame_bytes);

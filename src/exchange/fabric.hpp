@@ -73,7 +73,8 @@ struct fabric_notification {
  * @brief What the exchange needs from NIXL: one-sided writes into a peer's receive ring, and
  * small notifications.
  *
- * The transport's engine thread is the only caller. Nothing here blocks.
+ * The transport's engine thread is the only caller, except rank() and world_size(), which may be
+ * called from any thread. Nothing here blocks.
  */
 class fabric {
  public:

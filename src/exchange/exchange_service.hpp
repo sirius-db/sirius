@@ -28,7 +28,9 @@
 
 namespace sirius::exchange {
 
-/// Where an exchange stream's batches arrive: its EXCHANGE_SOURCE. Called from any thread.
+/// Where an exchange stream's batches arrive: its EXCHANGE_SOURCE. Called from any thread, possibly
+/// under the service's lock (on attach() replay), so a callback must not call into
+/// exchange_service.
 class inbound {
  public:
   virtual ~inbound() = default;
@@ -116,6 +118,7 @@ class exchange_service {
   rank_t _world_size;
   std::mutex _mutex;
   std::map<stream_id, std::shared_ptr<inbound>> _receivers;
+  /// TODO(#2376): held batches sit outside any repository, so they cannot spill.
   std::map<stream_id, std::vector<held>> _held;
   std::set<stream_id> _detached;
   std::map<std::uint64_t, std::exception_ptr> _aborted;

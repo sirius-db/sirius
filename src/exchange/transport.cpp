@@ -138,6 +138,8 @@ struct transport::engine {
   std::vector<posted_write> writes;
 
   using landing_key = std::tuple<rank_t, stream_id, std::uint64_t>;
+  /// A batch being received. Frames that arrive before its header (frame 0) or before a tier has
+  /// room wait, holding their receive frames; seen and copied count frames by index.
   struct landing {
     std::optional<batch_header> header;
     std::unique_ptr<incoming_batch> in;
@@ -505,6 +507,7 @@ void transport::send(stream_id stream, rank_t to, std::shared_ptr<cucascade::dat
                                        });
   std::unique_lock lock{_mutex};
   _room.wait(lock, [&] {
+    // A batch larger than the cap goes alone, else it would never fit.
     return _error || _stop || e.queued_bytes == 0 ||
            e.queued_bytes + bytes <= e.opts.max_queued_bytes;
   });
@@ -603,7 +606,10 @@ void transport::run()
         throw sirius::internal_exception("exchange: no progress for {} ms",
                                          e.opts.stall_timeout.count());
       }
-      std::this_thread::sleep_for(std::chrono::microseconds{e.busy() ? 20 : 200});
+      // The fabric has no blocking wait: poll often while frames are in flight, less when idle.
+      constexpr std::chrono::microseconds busy_poll_interval{20};
+      constexpr std::chrono::microseconds idle_poll_interval{200};
+      std::this_thread::sleep_for(e.busy() ? busy_poll_interval : idle_poll_interval);
     }
   } catch (...) {
     auto const error = std::current_exception();
