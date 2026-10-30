@@ -122,6 +122,9 @@ struct transport::engine {
     std::uint32_t frames{0};
   };
   std::vector<peer_out> out;
+  /// stage() starts at this peer, one further each pass, so low ranks get no head start on the
+  /// shared send frames.
+  rank_t first_peer{0};
   std::vector<std::uint32_t> free_send;
 
   struct staged_frame {
@@ -365,9 +368,12 @@ struct transport::engine {
   /// Stages the next frames of each peer's current batch, while send frames and credits last.
   bool stage(std::mutex& mutex)
   {
-    bool progress = false;
-    for (rank_t peer = 0; peer < out.size(); ++peer) {
-      auto& p = out[peer];
+    bool progress    = false;
+    auto const peers = static_cast<rank_t>(out.size());
+    first_peer       = (first_peer + 1) % peers;
+    for (rank_t i = 0; i < peers; ++i) {
+      auto const peer = (first_peer + i) % peers;
+      auto& p         = out[peer];
       if (!p.current) {
         std::lock_guard lock{mutex};
         if (queues[peer].empty()) { continue; }
