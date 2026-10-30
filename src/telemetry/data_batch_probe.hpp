@@ -80,7 +80,7 @@ class quent_data_batch_probe : public cucascade::idata_batch_probe {
   ~quent_data_batch_probe() override
   {
     try {
-      handle_.destructed();
+      batch_handle_.destructed();
     } catch (...) {
       log_current_exception("destructor");
     }
@@ -97,7 +97,7 @@ class quent_data_batch_probe : public cucascade::idata_batch_probe {
         return;
       }
 
-      handle_.stationary({
+      batch_handle_.stationary({
         .memory = {.target = {(*maybe_memory_handle).get().id()},
                    .data   = {.bytes = data.get_size_in_bytes()}},
       });
@@ -137,7 +137,7 @@ class quent_data_batch_probe : public cucascade::idata_batch_probe {
         return;
       }
 
-      handle_.in_transit({
+      batch_handle_.in_transit({
         .source_memory = {.target = {(*maybe_source_memory_handle).get().id()},
                           .data   = {.bytes = data_size}},
         .dest_memory   = {.target = {(*maybe_dest_memory_handle).get().id()},
@@ -160,7 +160,7 @@ class quent_data_batch_probe : public cucascade::idata_batch_probe {
         return;
       }
 
-      handle_.stationary({
+      batch_handle_.stationary({
         .memory = {.target = {(*maybe_memory_handle).get().id()},
                    .data   = {.bytes = data.get_size_in_bytes()}},
       });
@@ -180,12 +180,68 @@ class quent_data_batch_probe : public cucascade::idata_batch_probe {
                         new_data.get_memory_space().to_string());
         return;
       }
-      handle_.stationary({
+      batch_handle_.stationary({
         .memory = {.target = {(*maybe_memory_handle).get().id()},
                    .data   = {.bytes = new_data.get_size_in_bytes()}},
       });
     } catch (...) {
       log_current_exception("data_replaced");
+    }
+  }
+
+  void clone_started([[maybe_unused]] const uint64_t clone_id,
+                     [[maybe_unused]] const cucascade::idata_representation& source_data,
+                     [[maybe_unused]] const cucascade::memory::memory_space* target_memory_space,
+                     [[maybe_unused]] const uint64_t new_batch_id) const noexcept override
+  {
+    try {
+      const size_t data_size = source_data.get_size_in_bytes();
+
+      auto maybe_source_memory_handle =
+        memory_context_->get_memory_handle(source_data.get_memory_space().get_id());
+      if (not maybe_source_memory_handle) {
+        SIRIUS_LOG_WARN("No quent memory handle found for {}",
+                        source_data.get_memory_space().to_string());
+        return;
+      }
+
+      auto maybe_dest_memory_handle =
+        memory_context_->get_memory_handle(target_memory_space->get_id());
+      if (not maybe_dest_memory_handle) {
+        SIRIUS_LOG_WARN("No quent memory handle found for {}", target_memory_space->to_string());
+        return;
+      }
+
+      // auto maybe_channel_handle = memory_context_->get_channel_handle(
+      //   source_data.get_memory_space().get_id(), target_memory_space->get_id());
+      // if (not maybe_channel_handle) {
+      //   SIRIUS_LOG_WARN("No quent channel handle found for the channel between {} and {}",
+      //                   source_data.get_memory_space().to_string(),
+      //                   target_memory_space->to_string());
+      //   return;
+      // }
+
+      batch_clone_op_handle_.started({
+        .clone_id         = clone_id,
+        .source_tier      = (*maybe_source_memory_handle).get().id(),
+        .destination_tier = (*maybe_dest_memory_handle).get().id(),
+        // .channel                   = (*maybe_channel_handle).get().id(),
+        .source_data_batch         = batch_handle_.id(),
+        .destination_data_batch_id = new_batch_id,
+        .bytes                     = data_size,
+      });
+    } catch (...) {
+      log_current_exception("clone_started");
+    }
+  }
+
+  void clone_completed([[maybe_unused]] const uint64_t clone_id,
+                       [[maybe_unused]] const bool success) const noexcept override
+  {
+    try {
+      batch_clone_op_handle_.completed({.clone_id = clone_id, .success = success});
+    } catch (...) {
+      log_current_exception("clone_completed");
     }
   }
 
@@ -214,19 +270,22 @@ class quent_data_batch_probe : public cucascade::idata_batch_probe {
   quent_data_batch_probe(const telemetry_context& ctx,
                          const uint64_t batch_id,
                          quent::Uuid producer_pipeline_uuid)
-    : handle_(ctx.context()
-                .data_batch_observer()
-                ->handle()
-                .constructed({
-                  .data_batch_id        = batch_id,
-                  .producer_pipeline_id = quent::operator_::OperatorId(producer_pipeline_uuid),
-                })
-                .into_dynamic()),
+    : batch_handle_(
+        ctx.context()
+          .data_batch_observer()
+          ->handle()
+          .constructed({
+            .data_batch_id        = batch_id,
+            .producer_pipeline_id = quent::operator_::OperatorId(producer_pipeline_uuid),
+          })
+          .into_dynamic()),
+      batch_clone_op_handle_(ctx.context().batch_clone_observer()->handle()),
       memory_context_(ctx.get_memory_context())
   {
   }
 
-  quent::DynamicFsmHandle<quent::DataBatch> handle_;
+  quent::DynamicFsmHandle<quent::DataBatch> batch_handle_;
+  quent::Handle<quent::BatchClone> batch_clone_op_handle_;
   std::shared_ptr<const memory_context> memory_context_;
 };
 

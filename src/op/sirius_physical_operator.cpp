@@ -42,6 +42,12 @@ namespace op {
 // operator_data
 //===--------------------------------------------------------------------===//
 
+void operator_data::prepare_for_processing(
+  const ::cucascade::memory::memory_space* requested_memory_space, ::cuda::stream_ref stream)
+{
+  prepare_for_processing(requested_memory_space, stream, {});
+}
+
 std::uint64_t pipelineable_operator_data::original_batch_id_at(std::size_t position) const
 {
   auto const replaced =
@@ -132,7 +138,9 @@ std::vector<::cucascade::read_only_data_batch> pipelineable_operator_data::get_r
 }
 
 void pipelineable_operator_data::prepare_for_processing(
-  const ::cucascade::memory::memory_space* requested_memory_space, ::cuda::stream_ref stream)
+  const ::cucascade::memory::memory_space* requested_memory_space,
+  ::cuda::stream_ref stream,
+  const telemetry::batch_telemetry_info& clone_telemetry)
 {
   remove_read_only_lock();
 
@@ -147,7 +155,8 @@ void pipelineable_operator_data::prepare_for_processing(
     }
     try {
       if (std::optional<pipeline::lock_and_prepare_batch_result> maybe_result =
-            pipeline::lock_and_prepare_batch(batch, requested_memory_space, stream)) {
+            pipeline::lock_and_prepare_batch(
+              batch, requested_memory_space, stream, clone_telemetry)) {
         pipeline::lock_and_prepare_batch_result result = *maybe_result;
 
         std::visit(

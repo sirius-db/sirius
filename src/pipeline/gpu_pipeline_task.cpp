@@ -488,17 +488,24 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(::cuda::strea
         }
       }
 
-      this->telemetry_fsm().computing(
-        {.current_operator_id = static_cast<uint32_t>(
-           op.get_operator_id()),  // TODO(dhruv9vats): look into possible overflow
-         .input_bytes          = operator_input_output_data->get_estimated_size_in_bytes(),
-         .input_batch_ids      = batch_ids,
-         .peak_allocated_bytes = _allocator ? _allocator->get_peak_allocated_bytes(stream) : 0,
-         .executor_thread      = {.target = executor_thread_resource_id, .data = {}},
-         .reservation          = {
-                    .target = quent::memory_space::MemorySpaceId{_reservation_memory_resource_id},
-                    .data   = {.bytes = _reservation_bytes},
-         }});
+      {
+        // Exclude input materialization, which batch residency accounts for.
+        const uint64_t compute_memory_estimate = _local_state->cast<gpu_pipeline_task_local_state>()
+                                                   .get_reservation_size_info()
+                                                   ->peak_memory_estimate;
+        this->telemetry_fsm().computing(
+          {.current_operator_id = static_cast<uint32_t>(
+             op.get_operator_id()),  // TODO(dhruv9vats): look into possible overflow
+           .input_bytes          = operator_input_output_data->get_estimated_size_in_bytes(),
+           .input_batch_ids      = batch_ids,
+           .peak_allocated_bytes = _allocator ? _allocator->get_peak_allocated_bytes(stream) : 0,
+           .executor_thread      = {.target = executor_thread_resource_id, .data = {}},
+           .reservation          = {
+                      .target = quent::memory_space::MemorySpaceId{_reservation_memory_resource_id},
+                      .data   = {.bytes = compute_memory_estimate},
+           }});
+      }
+
       if (auto completion = get_completion_handler(); completion && completion->injections) {
         auto const& inject = *completion->injections;
         if (inject.gpu_task_oom &&
@@ -722,17 +729,27 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
                                  ->get_memory_handle(requested_memory_space->get_id());
     if (memory_handle) { _reservation_memory_resource_id = memory_handle->get().id().raw(); }
   }
-  telemetry_fsm().preparing(
-    {.origin_tier     = local_state._input_data->get_origin_tiers(),
-     .target_tier     = "GPU",
-     .input_bytes     = local_state._input_data->get_estimated_size_in_bytes(),
-     .executor_thread = {.target = executor_thread_resource_id, .data = {}},
-     .reservation     = {
-           .target = quent::memory_space::MemorySpaceId{_reservation_memory_resource_id},
-           .data   = {.bytes = _reservation_bytes},
-     }});
+
+  {
+    const auto compute_memory_estimate =
+      local_state.get_reservation_size_info()->peak_memory_estimate;
+    telemetry_fsm().preparing(
+      {.origin_tier     = local_state._input_data->get_origin_tiers(),
+       .target_tier     = "GPU",
+       .input_bytes     = local_state._input_data->get_estimated_size_in_bytes(),
+       .executor_thread = {.target = executor_thread_resource_id, .data = {}},
+       .reservation     = {
+             .target = quent::memory_space::MemorySpaceId{_reservation_memory_resource_id},
+             .data   = {.bytes = compute_memory_estimate},
+       }});
+  }
   try {
-    local_state._input_data->prepare_for_processing(requested_memory_space, stream);
+    // Attribute prepared clones to this task's operator, including sink-only retries.
+    const auto* prepare_op = first_op != nullptr ? first_op : pipeline->get_sink().get();
+    const auto clone_telemetry =
+      prepare_op != nullptr ? prepare_op->batch_telemetry() : telemetry::batch_telemetry_info{};
+    local_state._input_data->prepare_for_processing(
+      requested_memory_space, stream, clone_telemetry);
     // synchronizing here to ensure the timing collected by Quent and logging for preparing the task
     // is accurate.
     stream.sync();

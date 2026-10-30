@@ -4,8 +4,9 @@
 use std::collections::{BTreeSet, hash_map::Entry};
 
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use sirius_telemetry_store::SiriusEvent;
+use sirius_telemetry_store::{self as schema, SiriusEvent};
 
+pub use crate::boilerplate::{Engine, Operator, Plan, Port, Query, QueryGroup, Worker};
 use quent_analyzer::{
     AnalyzerError, AnalyzerResult, Entity, Model, RefTreeEntity,
     fsm::collection::FsmCollection,
@@ -21,12 +22,11 @@ use quent_query_engine_ui::EntityRef;
 use quent_ui::ResourceGroupTypeDecl;
 use uuid::Uuid;
 
-pub use crate::boilerplate::{Engine, Operator, Plan, Port, Query, QueryGroup, Worker};
-
 use crate::{
     boilerplate::{
-        Channel, DataBatch, DataBatchBuilder, DataBatchExt, ExecutorThread, GpuDevice, Memory,
-        QueryBuilder, Task, TaskBuilder, TaskExt, TaskManagerLoopThread, TaskQueue, ThreadGroup,
+        BatchClone, Channel, DataBatch, DataBatchBuilder, DataBatchExt, ExecutorThread, GpuDevice,
+        Memory, QueryBuilder, Task, TaskBuilder, TaskExt, TaskManagerLoopThread, TaskQueue,
+        ThreadGroup,
     },
     view::SiriusModelQueryView,
 };
@@ -123,6 +123,7 @@ pub struct SiriusModel {
     pub(crate) executor_threads: HashMap<Uuid, ExecutorThread>,
     pub(crate) tasks: HashMap<Uuid, Task>,
     pub(crate) data_batches: HashMap<Uuid, DataBatch>,
+    pub(crate) batch_clones: HashMap<Uuid, BatchClone>,
     /// Engine-native batch numbers are only unique per worker process, so the index is keyed
     /// by (worker, number). `None` marks a number seen twice on one worker (ambiguous).
     // TODO(dhruv9vats): drop this index once Task.computing references DataBatch entities
@@ -167,6 +168,14 @@ impl Model for SiriusModel {
                         .get(&entity_id)
                         .map(|data_batch| EntityRef::Application {
                             type_name: data_batch.type_name().to_owned(),
+                            id: entity_id,
+                        })
+                })
+                .or_else(|| {
+                    self.batch_clones
+                        .get(&entity_id)
+                        .map(|copy| EntityRef::Application {
+                            type_name: copy.type_name().to_owned(),
                             id: entity_id,
                         })
                 })
@@ -478,6 +487,11 @@ impl RefTreeCollection for SiriusModel {
                     .values()
                     .map(|entity| entity as &dyn RefTreeEntity),
             )
+            .chain(
+                self.batch_clones
+                    .values()
+                    .map(|entity| entity as &dyn RefTreeEntity),
+            )
     }
 
     fn ref_tree_entity(&self, entity_id: Uuid) -> AnalyzerResult<&dyn RefTreeEntity> {
@@ -513,6 +527,8 @@ impl RefTreeCollection for SiriusModel {
             Ok(entity)
         } else if let Some(entity) = self.data_batches.get(&entity_id) {
             Ok(entity)
+        } else if let Some(entity) = self.batch_clones.get(&entity_id) {
+            Ok(entity)
         } else {
             Err(AnalyzerError::InvalidId(entity_id))
         }
@@ -536,6 +552,19 @@ impl ResourceCollection for SiriusModel {
     }
 }
 
+#[derive(Eq, Hash, PartialEq)]
+struct DataBatchCloneOpKey {
+    // One emitter can perform concurrent copies with out-of-order completion.
+    entity_id: Uuid,
+    clone_op_id: u64,
+}
+
+#[derive(Default)]
+struct CloneParts {
+    start: Option<Event<schema::BatchCloneEvent>>,
+    end: Option<Event<schema::BatchCloneEvent>>,
+}
+
 pub struct SiriusModelBuilder {
     engine_id: Uuid,
     engine: Option<Engine>,
@@ -554,6 +583,7 @@ pub struct SiriusModelBuilder {
     executor_threads: HashMap<Uuid, ExecutorThread>,
     tasks: HashMap<Uuid, TaskBuilder>,
     data_batches: HashMap<Uuid, DataBatchBuilder>,
+    data_batch_clone_ops: HashMap<DataBatchCloneOpKey, CloneParts>,
     /// Ids of resources and resource groups whose declaration event was ingested. Tracked
     /// explicitly (not via map membership) so an `exit` arriving before the declaration is not
     /// mistaken for a second declaration.
@@ -585,6 +615,7 @@ impl SiriusModelBuilder {
             executor_threads: HashMap::default(),
             tasks: HashMap::default(),
             data_batches: HashMap::default(),
+            data_batch_clone_ops: HashMap::default(),
             declared: HashSet::default(),
         })
     }
@@ -781,6 +812,32 @@ impl SiriusModelBuilder {
                 data_batch_builder.push_transition(Event::new(id, timestamp, event));
                 Ok(())
             }
+            SiriusEvent::BatchClone(event) => {
+                let (clone_id, is_start) = match &event {
+                    schema::BatchCloneEvent::Started { clone_id, .. } => (*clone_id, true),
+                    schema::BatchCloneEvent::Completed { clone_id, .. } => (*clone_id, false),
+                };
+                let parts = self
+                    .data_batch_clone_ops
+                    .entry(DataBatchCloneOpKey {
+                        entity_id: id,
+                        clone_op_id: clone_id,
+                    })
+                    .or_default();
+
+                let slot = if is_start {
+                    &mut parts.start
+                } else {
+                    &mut parts.end
+                };
+                if slot.is_some() {
+                    return Err(AnalyzerError::Validation(
+                        "Duplicate clone event under an entity with the same id".into(),
+                    ));
+                }
+                *slot = Some(Event::new(id, timestamp, event));
+                Ok(())
+            }
         }
     }
 
@@ -845,6 +902,7 @@ impl SiriusModelBuilder {
             executor_threads: self.executor_threads,
             tasks: HashMap::default(),
             data_batches: HashMap::default(),
+            batch_clones: HashMap::default(),
             batch_by_number: HashMap::default(),
             resource_group_types: HashMap::default(),
         };
@@ -953,7 +1011,76 @@ impl SiriusModelBuilder {
             }
         }
 
+        // Ambiguous declarations cannot identify a copy's channel.
+        let mut channel_by_endpoints = HashMap::default();
+        for channel in model.channels.values() {
+            if let Some(endpoints) = channel.endpoints() {
+                channel_by_endpoints
+                    .entry(endpoints)
+                    .and_modify(|id| *id = None)
+                    .or_insert(Some(channel.id()));
+            }
+        }
+
+        // Resolve logical copy channels after all declarations and batches exist.
+        for (key, parts) in self.data_batch_clone_ops {
+            let source_batch_id = parts.start.as_ref().and_then(|event| match &event.data {
+                schema::BatchCloneEvent::Started {
+                    source_data_batch, ..
+                } => Some(source_data_batch.target),
+                _ => None,
+            });
+            let parent_id = source_batch_id
+                .filter(|id| model.data_batches.contains_key(id))
+                .unwrap_or_else(|| model.engine.id());
+            let endpoints = parts.start.as_ref().and_then(|event| match &event.data {
+                schema::BatchCloneEvent::Started {
+                    source_tier,
+                    destination_tier,
+                    ..
+                } => Some((source_tier.target, destination_tier.target)),
+                _ => None,
+            });
+            let channel_id = endpoints
+                .and_then(|endpoints| channel_by_endpoints.get(&endpoints).copied().flatten());
+            let destination_batch_uuid = source_batch_id
+                .and_then(|id| model.data_batches.get(&id))
+                .and_then(|batch| {
+                    let worker = model.pipeline_worker_id(batch.producer_pipeline_uuid());
+                    if worker.is_nil() {
+                        return None;
+                    }
+
+                    let number = parts.start.as_ref().and_then(|event| match &event.data {
+                        schema::BatchCloneEvent::Started {
+                            destination_data_batch_id,
+                            ..
+                        } => Some(*destination_data_batch_id),
+                        _ => None,
+                    })?;
+                    model.data_batch_on_worker(worker, number).map(Entity::id)
+                });
+            let copy = match BatchClone::try_new(
+                key.entity_id,
+                key.clone_op_id,
+                parent_id,
+                parts.start,
+                parts.end,
+                channel_id,
+                destination_batch_uuid,
+            ) {
+                Ok(copy) => copy,
+                Err(err) => {
+                    tracing::warn!(%err, "skipping invalid copy operation");
+                    continue;
+                }
+            };
+            model.add_resource_users(copy.type_name(), copy.usages())?;
+            model.batch_clones.insert(copy.id(), copy);
+        }
+
         model.resource_group_types = derive_resource_scope_types(&model)?;
+
         Ok(model)
     }
 }

@@ -181,8 +181,14 @@ class operator_data {
    * that own no data requiring locking and need no per-task setup.
    * Override when either condition changes.
    */
+  // Preserve telemetry-free callers while dispatching preparation through the traced path.
+  void prepare_for_processing(const ::cucascade::memory::memory_space* requested_memory_space,
+                              ::cuda::stream_ref stream);
+
   virtual void prepare_for_processing(
-    const ::cucascade::memory::memory_space* requested_memory_space, ::cuda::stream_ref stream) {};
+    const ::cucascade::memory::memory_space* requested_memory_space,
+    ::cuda::stream_ref stream,
+    const telemetry::batch_telemetry_info& clone_telemetry) {};
 
   /**
    * @brief Estimate the uncompressed GPU memory footprint of this data.
@@ -328,8 +334,10 @@ class pipelineable_operator_data : public operator_data {
    * storing the results in _read_only_data_batches. Throws sirius::internal_exception
    * if any batch pointer is null or any batch fails to lock. Propagates rmm::out_of_memory.
    */
+  using operator_data::prepare_for_processing;
   void prepare_for_processing(const ::cucascade::memory::memory_space* requested_memory_space,
-                              ::cuda::stream_ref stream) override;
+                              ::cuda::stream_ref stream,
+                              const telemetry::batch_telemetry_info& clone_telemetry) override;
 
   [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override
   {
