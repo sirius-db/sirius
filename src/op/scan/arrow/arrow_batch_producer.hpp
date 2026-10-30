@@ -24,6 +24,8 @@
 
 namespace sirius::op::scan {
 // Shared by producers whose retained inputs must not occupy two temporary permits.
+// One coordinator performs claims through a shared gate. Bind wake before execution;
+// do not rebind it while claims or final-owner releases can run.
 struct arrow_input_gate {
   std::atomic<bool> active{false};
   scan_manager::preparation_wakeup wake;
@@ -68,8 +70,9 @@ scan_manager::scan_envelope arrow_preparation_envelope(arrow_batch_producer cons
 
 // Views and their complete backing must remain immutable and readable until the
 // owner is released. retained_bytes includes parent extents and control storage,
-// not just the selected slice. Final release may occur on any retaining thread;
-// owners and callbacks must be thread-neutral. There is no affine reclamation handshake.
+// not just the selected slice. Final release may occur on any retaining thread,
+// including the worker or cancelling thread. Owners and callbacks must be thread-neutral;
+// there is no submitting-thread or affine reclamation handshake.
 // A false offer result does not join an in-progress copy: retained views and backing
 // must remain readable and immutable until their last retained use ends.
 struct offered_arrow_input {

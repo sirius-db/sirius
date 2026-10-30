@@ -136,7 +136,7 @@ struct arrow_import_ingestible::impl {
   std::shared_ptr<sm::preparation_ledger> ledger;
   std::shared_ptr<source_state> state = std::make_shared<source_state>();
   std::optional<uint64_t> pending_identity;
-  uint64_t sequence = 0, bytes = 0;
+  uint64_t sequence = 0, bytes = 0, temporary_limit = 0;
   impl(arrow_import_binding b, std::shared_ptr<arrow_batch_producer> p)
     : binding(std::move(b)), producer(std::move(p))
   {
@@ -162,7 +162,9 @@ struct arrow_import_ingestible::impl {
       if (n > UINT64_MAX - bytes) throw std::overflow_error("Arrow envelope overflow");
       bytes += n;
     }
-    if (!bytes || bytes > binding.admission->decision.w ||
+    temporary_limit =
+      limits.envelope.temporary_charge(binding.admission->decision.allocation_granularity);
+    if (!bytes || temporary_limit > binding.admission->decision.w ||
         limits.envelope.retained > binding.admission->decision.sigma_retained)
       throw std::invalid_argument("Arrow producer exceeds sealed admission");
     if (!binding.gate) binding.gate = std::make_shared<arrow_input_gate>();
@@ -253,7 +255,8 @@ arrow_import_ingestible::metadata_claim arrow_import_ingestible::try_claim_split
     impl_->pending_identity =
       impl_->binding.next_unit_id ? impl_->binding.next_unit_id() : impl_->sequence;
   claim->key    = {impl_->info.contract_id, *impl_->pending_identity};
-  claim->permit = claim->ledger->try_acquire_unit(claim->key, impl_->limits.envelope.retained);
+  claim->permit = claim->ledger->try_acquire_unit(
+    claim->key, impl_->limits.envelope.retained, impl_->temporary_limit);
   if (!claim->permit) return sm::preparation_pending{};
   claim->acquired     = true;
   claim->gate->active = true;

@@ -117,13 +117,15 @@ class pull_producer final : public arrow_batch_producer {
   std::vector<int> rows{3};
   std::function<void()> on_normalize;
   std::function<void(ArrowSchema&, ArrowArray&)> observe_tree;
+  sm::unit_envelope envelope{{8192}, 0};
+  uint64_t temporary_probe_before = 0, temporary_probe_after = 0;
   size_t cursor  = 0;
   int preflights = 0, calls = 0, closes = 0;
   bool ready = true, cancelled = false, wrong_schema = false, fail_read = false;
   sm::preparation_execution_domain domain = sm::preparation_execution_domain::query_owner;
   std::thread::id owner                   = std::this_thread::get_id();
   sm::preparation_execution_domain execution_domain() const noexcept override { return domain; }
-  arrow_producer_limits limits() const override { return {3, {{8192}, 0}}; }
+  arrow_producer_limits limits() const override { return {3, envelope}; }
   void preflight() override { ++preflights; }
   arrow_readiness readiness() const noexcept override
   {
@@ -139,8 +141,14 @@ class pull_producer final : public arrow_batch_producer {
     if (cancelled || stop.stop_requested()) throw duckdb::InterruptException();
     if (fail_read) throw std::runtime_error("pull failed");
     if (cursor == rows.size()) return arrow_end_of_stream{};
-    auto capacity = std::make_shared<pull_capacity>(std::move(admitted), on_normalize);
-    auto* tree    = new (capacity->block.data()) integer_tree(rows[cursor++]);
+    // Probes retire before next() returns: post-return accounting cannot catch them.
+    if (temporary_probe_before) {
+      auto probe = admitted.allocator.allocate(temporary_probe_before);
+    }
+    auto allocator = admitted.allocator;
+    auto capacity  = std::make_shared<pull_capacity>(std::move(admitted), on_normalize);
+    if (temporary_probe_after) { auto probe = allocator.allocate(temporary_probe_after); }
+    auto* tree = new (capacity->block.data()) integer_tree(rows[cursor++]);
     if (wrong_schema) tree->field.format = "f";
     if (observe_tree) observe_tree(tree->schema, tree->array);
     return produced_arrow_input{
@@ -160,20 +168,31 @@ struct harness {
   std::shared_ptr<physical_profile_table> profiles = std::make_shared<physical_profile_table>();
   std::shared_ptr<void const> identity             = std::make_shared<int>(4);
   std::unique_ptr<arrow_import_ingestible> driver;
+  std::shared_ptr<arrow_input_gate> gate = std::make_shared<arrow_input_gate>();
   harness(std::shared_ptr<arrow_batch_producer> producer,
-          materialization_program program    = integer_program(),
-          bool empty_source                  = true,
-          sm::reservation_provider* external = nullptr)
+          materialization_program program             = integer_program(),
+          bool empty_source                           = true,
+          sm::reservation_provider* external          = nullptr,
+          std::shared_ptr<arrow_batch_producer> other = {},
+          uint64_t quantum                            = 1)
   {
-    auto unique   = std::make_unique<sm::preparation_ledger>(external ? *external : backing);
-    auto envelope = producer->limits().envelope;
-    backing.grant_bytes =
-      std::accumulate(envelope.temporary.begin(), envelope.temporary.end(), envelope.retained);
-    auto scan = arrow_preparation_envelope(*producer);
+    auto unique     = std::make_unique<sm::preparation_ledger>(external ? *external : backing);
+    auto envelope   = producer->limits().envelope;
+    backing.quantum = quantum;
+    std::vector scans{arrow_preparation_envelope(*producer)};
+    auto w        = envelope.temporary_charge(quantum);
+    auto retained = envelope.retained;
+    if (other) {
+      scans.push_back(arrow_preparation_envelope(*other));
+      w = std::max(w, other->limits().envelope.temporary_charge(quantum));
+      retained += other->limits().envelope.retained;
+    }
+    backing.grant_bytes = w * scans.size() + retained;
     auto decision =
-      unique->admit(std::array{scan}, sm::memory_space_id{cucascade::memory::Tier::HOST, 0});
+      unique->admit(scans, sm::memory_space_id{cucascade::memory::Tier::HOST, 0}, scans.size());
     REQUIRE(decision.deferred);
     arrow_import_binding binding;
+    binding.gate          = gate;
     binding.program       = program;
     binding.profiles      = profiles;
     binding.read_identity = identity;
@@ -831,6 +850,13 @@ TEST_CASE("Arrow imported input retires only after its final descriptor owner",
   auto producer  = std::make_shared<pull_producer>();
   producer->rows = {3, 3};
   harness h(producer);
+  // Observe only input-gate returns; ledger wakeups are a separate event.
+  auto returned = std::make_shared<sm::preparation_gate>();
+  h.gate->wake  = sm::preparation_wakeup(returned);
+  auto returns  = [&] {
+    std::lock_guard lock(returned->mutex);
+    return returned->wake_generation;
+  };
   auto manager = sirius::test::operator_utils::initialize_memory_manager();
   auto* space  = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   rmm::cuda_stream stream;
@@ -839,11 +865,17 @@ TEST_CASE("Arrow imported input retires only after its final descriptor owner",
   auto output   = h.driver->materialize_metadata_to_table(*input, *space, stream);
   CHECK(h.profiles->counters->arrow_batches_imported == 1);
   input.reset();
+  CHECK(h.gate->active.load());
+  CHECK(returns() == 0);
   CHECK(h.ledger->permits_in_flight() == 1);
   CHECK(std::holds_alternative<sm::preparation_pending>(h.driver->try_claim_split({})));
   if (cancelled) h.driver->stop_preparation();
   CHECK(h.ledger->permits_in_flight() == 1);
   retained.reset();
+  CHECK_FALSE(h.gate->active.load());
+  CHECK(returns() == 1);
+  retained.reset();
+  CHECK(returns() == 1);
   CHECK(h.ledger->permits_in_flight() == 0);
   CHECK(h.backing.seen->allocated_bytes == 0);
   // The detached GPU output remains usable after every host input owner has gone.
@@ -1197,4 +1229,59 @@ TEST_CASE("Arrow failed completion retains real backing and its caller resource 
     // Its table is destroyed before the retirement lane's final barrier and input owner.
   }
   CHECK(lifetime.expired());
+}
+
+TEST_CASE("Arrow producers cannot borrow another scans larger temporary envelope",
+          "[arrow_driver][arrow_envelope]")
+{
+  auto small = std::make_shared<pull_producer>();
+  auto large = std::make_shared<pull_producer>();
+  // Individually rounded blocks permit 12288 bytes, not round(4098) == 8192.
+  small->envelope.temporary = {4097, 1};
+  large->envelope.temporary = {32768};
+  bool exceeds              = false;
+  auto tested               = small;
+  auto other                = large;
+  SECTION("independent rounding permits the declared simultaneous allocations")
+  {
+    small->temporary_probe_after = 4096;
+  }
+  SECTION("rounded cumulative allocation exceeds the smaller envelope")
+  {
+    small->temporary_probe_after = 4097;
+    exceeds                      = true;
+  }
+  SECTION("oversized transient allocation cannot disappear before acceptance")
+  {
+    small->temporary_probe_before = 12289;
+    exceeds                       = true;
+  }
+  SECTION("larger producer retains its own allowance")
+  {
+    tested                       = large;
+    other                        = small;
+    large->temporary_probe_after = 16384;
+  }
+  harness h(tested, integer_program(), true, nullptr, other, 4096);
+  if (exceeds) {
+    try {
+      h.next();
+      FAIL("producer exceeded its temporary envelope");
+    } catch (sm::preparation_resource_error const& error) {
+      CHECK(error.bound_exceeded);
+      CHECK(error.original == nullptr);
+    }
+    CHECK(h.ledger->bound_exceeded() == 1);
+    CHECK(h.ledger->allocation_failures() == 0);
+  } else {
+    auto input = h.next();
+    REQUIRE(input);
+    CHECK(h.ledger->bound_exceeded() == 0);
+    CHECK(h.ledger->permits_in_flight() == 1);
+    input.reset();
+  }
+  CHECK_FALSE(h.gate->active.load());
+  CHECK(h.ledger->permits_in_flight() == 0);
+  CHECK(h.ledger->tracked_units() == 0);
+  CHECK(h.backing.seen->allocated_bytes == 0);
 }
