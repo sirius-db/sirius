@@ -27,8 +27,10 @@
 #include <utils/sirius_test_env.hpp>
 
 #include <chrono>
+#include <condition_variable>
 #include <exception>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <vector>
 
@@ -105,6 +107,97 @@ TEST_CASE("a failed distributed window aborts its query on the other ranks",
                                                  std::chrono::seconds{60}),
                     Catch::Matchers::ContainsSubstring("rank 0 failed"));
   CHECK(std::chrono::steady_clock::now() - started < std::chrono::seconds{30});
+
+  ctx->set_exchange_service_for_testing(nullptr);
+  services.clear();
+}
+
+namespace {
+
+/// Counts the ends a stream's senders sent; waits for the first.
+struct counting_inbound : sirius::exchange::inbound {
+  std::mutex mutex;
+  std::condition_variable ended;
+  int ends = 0;
+  void on_batch(sirius::exchange::rank_t,
+                std::uint64_t,
+                std::shared_ptr<cucascade::data_batch>) override
+  {
+  }
+  void on_end(sirius::exchange::rank_t) override
+  {
+    std::lock_guard lock{mutex};
+    ++ends;
+    ended.notify_all();
+  }
+  void on_error(std::exception_ptr) override {}
+  bool wait_end()
+  {
+    std::unique_lock lock{mutex};
+    return ended.wait_for(lock, std::chrono::seconds{30}, [this] { return ends > 0; });
+  }
+  int count()
+  {
+    std::lock_guard lock{mutex};
+    return ends;
+  }
+};
+
+}  // namespace
+
+TEST_CASE("numbers a gateway skips retire on this rank; a prepared query's number does not",
+          "[exchange][query_windows]")
+{
+  using namespace sirius::test::exchange_utils;
+  REQUIRE(sirius::test::g_integration_env != nullptr);
+  if (!sirius::test::g_integration_env->is_active()) { sirius::test::g_integration_env->resume(); }
+  auto con = sirius::test::g_integration_env->make_connection();
+  auto ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(ctx);
+  auto& gpu = *ctx->get_memory_manager().get_memory_space(cucascade::memory::Tier::GPU, 0);
+
+  // Skipped before the exchange connects: retired once it does.
+  auto const base           = ctx->next_distributed_query(*con.context);
+  auto const before_connect = base + 2;
+  auto const prepared       = ctx->next_distributed_query(*con.context, base + 3);
+
+  loopback_hub hub(2);
+  std::vector<std::unique_ptr<frame_ring>> rings;
+  std::vector<std::unique_ptr<fabric>> fabrics;
+  std::vector<std::shared_ptr<sirius::exchange::exchange_service>> services;
+  for (rank_t r = 0; r < 2; ++r) {
+    rings.push_back(std::make_unique<frame_ring>(4, 64 << 10));
+    rings.push_back(std::make_unique<frame_ring>(8, 64 << 10));
+    fabrics.push_back(hub.attach(r, *rings[2 * r], *rings[2 * r + 1]));
+    services.push_back(std::make_shared<sirius::exchange::exchange_service>(
+      *fabrics.back(), *rings[2 * r], *rings[2 * r + 1], gpu, nullptr));
+  }
+  ctx->set_exchange_service_for_testing(services[0]);
+
+  // The prepared statement runs later; the statements in between skip numbers here.
+  REQUIRE_FALSE(con.Query("SELECT 42")->HasError());
+  auto const skipped = prepared + 4;
+  auto const later   = ctx->next_distributed_query(*con.context, prepared + 10);
+
+  // Rank 1 ends a stream of each; rank 0 attaches late, after they have all landed.
+  for (auto query : {before_connect, skipped, prepared, later}) {
+    services[1]->close(sirius::exchange::make_stream_id(query, 1), 0);
+  }
+  auto const last_landed = std::make_shared<counting_inbound>();
+  services[0]->attach(sirius::exchange::make_stream_id(later, 1), last_landed);
+  REQUIRE(last_landed->wait_end());
+  auto const count_ends = [&](std::uint64_t query) {
+    auto const receiver = std::make_shared<counting_inbound>();
+    services[0]->attach(sirius::exchange::make_stream_id(query, 1), receiver);
+    return receiver->count();
+  };
+  CHECK(count_ends(before_connect) == 0);
+  CHECK(count_ends(skipped) == 0);
+  CHECK(count_ends(prepared) == 1);
+
+  // A plan rebuilt within the statement that numbered it gets a clear error.
+  CHECK_THROWS_WITH(ctx->next_distributed_query(*con.context, later),
+                    Catch::Matchers::ContainsSubstring("retry the statement"));
 
   ctx->set_exchange_service_for_testing(nullptr);
   services.clear();

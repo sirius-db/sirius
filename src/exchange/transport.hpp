@@ -56,10 +56,19 @@ constexpr unsigned query_stream_bits = 20;
   return stream >> query_stream_bits;
 }
 
+/// Queries are numbered below this, so a stream id keeps every bit of its query's number.
+constexpr distributed_query_id distributed_query_limit = distributed_query_id{1}
+                                                         << (64 - query_stream_bits);
+
 /// Stream @p n of query @p query.
-/// @throws sirius::invalid_input_exception when @p n does not fit below query_stream_bits.
+/// @throws sirius::invalid_input_exception when @p n does not fit below query_stream_bits, or
+/// @p query is not below distributed_query_limit.
 [[nodiscard]] inline stream_id make_stream_id(distributed_query_id query, std::uint64_t n)
 {
+  if (query >= distributed_query_limit) {
+    throw sirius::invalid_input_exception(
+      "exchange: distributed query {} is not below {}", query, distributed_query_limit);
+  }
   if (n >= (std::uint64_t{1} << query_stream_bits)) {
     throw sirius::invalid_input_exception("exchange: query {} needs more than {} streams",
                                           query,
@@ -182,8 +191,8 @@ class transport {
   /// callback may call it.
   void cancel(distributed_query_id query);
 
-  /// This rank retired @p query: drops its cancellation.
-  void forget(distributed_query_id query);
+  /// This rank retired every query from @p first to @p last: drops their cancellations.
+  void forget(distributed_query_id first, distributed_query_id last);
 
   /// Waits until this rank holds no batch it sent on a stream of @p query: the transport keeps a
   /// sent batch until its last frame is staged, or until it fails, and its memory may belong to
