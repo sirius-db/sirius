@@ -56,6 +56,28 @@ cudf::data_type flat_type(duckdb::LogicalType const& type)
   }
 }
 
+bool carrier_type(duckdb::LogicalType const& type, row_count_carrier_policy policy)
+{
+  using D = duckdb::LogicalTypeId;
+  switch (type.id()) {
+    case D::BOOLEAN:
+    case D::TINYINT:
+    case D::SMALLINT:
+    case D::INTEGER:
+    case D::BIGINT:
+    case D::UTINYINT:
+    case D::USMALLINT:
+    case D::UINTEGER:
+    case D::UBIGINT:
+    case D::FLOAT:
+    case D::DOUBLE:
+    case D::VARCHAR: return true;
+    case D::DATE:
+    case D::TIMESTAMP: return policy == row_count_carrier_policy::include_temporal;
+    default: return false;
+  }
+}
+
 bool same_default(duckdb::Value const& a, duckdb::Value const& b)
 {
   if (a.IsNull() || b.IsNull()) return a.IsNull() && b.IsNull();
@@ -143,8 +165,12 @@ field_id_mapping field_id_mapping::compile(std::shared_ptr<parquet_metadata cons
                                            std::string const& opened_identity,
                                            materialization_program program,
                                            std::vector<field_requirement> fields,
-                                           field_mapping_scope scope)
+                                           field_mapping_scope scope,
+                                           row_count_carrier_policy carrier_policy)
 {
+  if (carrier_policy != row_count_carrier_policy::legacy_scalars &&
+      carrier_policy != row_count_carrier_policy::include_temporal)
+    throw std::invalid_argument("unknown row-count carrier policy");
   if (!metadata || opened_identity.empty() || metadata->built_for_identity != opened_identity ||
       !program.contract || !program.generation)
     throw std::invalid_argument("field mapping has no matching source or program identity");
@@ -208,7 +234,7 @@ field_id_mapping field_id_mapping::compile(std::shared_ptr<parquet_metadata cons
     // All requested fields may be absent. Read one approved physical column as
     // a row-count carrier rather than decoding the entire file for its cardinality.
     for (std::size_t i = 0; i < schema.names.size(); ++i) {
-      if (!field_mapping_type(schema.types[i])) continue;
+      if (!carrier_type(schema.types[i], carrier_policy)) continue;
       result.read_names_.push_back(schema.names[i]);
       result.read_types_.push_back(schema.types[i]);
       result.read_indices_.push_back(static_cast<cudf::size_type>(i));

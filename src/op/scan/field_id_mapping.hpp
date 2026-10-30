@@ -13,7 +13,7 @@ namespace sirius::op::scan {
 std::unordered_map<int32_t, std::size_t> index_parquet_field_ids(
   cudf::io::parquet::FileMetaData const&);
 
-// The qualified flat scalar mapping profile; nested transformations remain separate.
+// Available scalar codecs; adapters qualify their own logical type profiles.
 std::optional<cudf::data_type> field_mapping_type(duckdb::LogicalType const&);
 
 struct field_requirement {
@@ -27,15 +27,21 @@ struct field_requirement {
 // Opt-in applies only to top-level scalar selections; nested output is not mapped.
 enum class field_mapping_scope { flat_file, top_level_scalars };
 
+// Carrier eligibility is independent of schema scope and available mapping codecs.
+// Existing routes keep their original physical read layout unless they explicitly opt in.
+enum class row_count_carrier_policy { legacy_scalars, include_temporal };
+
 // Immutable, scan-local approval. Only compile() can mint its operations; callers cannot
 // attach a cast to an unrelated footer or change its target after physical validation.
 class field_id_mapping {
  public:
-  static field_id_mapping compile(std::shared_ptr<parquet_metadata const> metadata,
-                                  std::string const& opened_identity,
-                                  materialization_program program,
-                                  std::vector<field_requirement> fields,
-                                  field_mapping_scope scope = field_mapping_scope::flat_file);
+  static field_id_mapping compile(
+    std::shared_ptr<parquet_metadata const> metadata,
+    std::string const& opened_identity,
+    materialization_program program,
+    std::vector<field_requirement> fields,
+    field_mapping_scope scope               = field_mapping_scope::flat_file,
+    row_count_carrier_policy carrier_policy = row_count_carrier_policy::legacy_scalars);
   [[nodiscard]] std::vector<std::string> const& read_names() const { return read_names_; }
   [[nodiscard]] std::vector<cudf::size_type> const& read_indices() const { return read_indices_; }
   [[nodiscard]] std::vector<duckdb::LogicalType> const& read_types() const { return read_types_; }

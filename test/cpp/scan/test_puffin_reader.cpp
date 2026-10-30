@@ -1013,8 +1013,10 @@ TEST_CASE("Neutral DV payload obeys independent limits and retained grant",
   auto blob      = build_dv_blob(0);
   CHECK_THROWS_AS(decode_deletion_vector_payload(blob, allocator, {blob.size() - 1, 1}),
                   preparation_resource_error);
-  CHECK_THROWS_AS(decode_deletion_vector_payload(blob, allocator, {blob.size(), 0}),
-                  preparation_resource_error);
+  CHECK_THROWS_MATCHES(
+    decode_deletion_vector_payload(blob, allocator, {blob.size(), 0}),
+    preparation_resource_error,
+    Catch::Matchers::Message("roaring: decoded positions exceed the configured limit of 0"));
   CHECK_THROWS_AS(
     decode_deletion_vector_payload(blob, allocator, {kMaxDeletionVectorPayloadBytes + 1, 1}),
     std::invalid_argument);

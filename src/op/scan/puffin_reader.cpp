@@ -307,8 +307,7 @@ size_t walk_roaring32(const uint8_t* data, size_t len, size_t max_out, Emit&& em
   auto const cardinality = walk(false);
   if (cardinality > max_out)
     throw deletion_vector_expansion_limit(
-      "roaring: decoded positions exceed the " + std::to_string(max_out) +
-      " this deletion vector declares; the blob is corrupt or was crafted to expand");
+      "roaring: decoded positions exceed the configured limit of " + std::to_string(max_out));
   walk(true);
   return consumed;
 }

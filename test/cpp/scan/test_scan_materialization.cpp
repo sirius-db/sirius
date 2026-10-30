@@ -1476,3 +1476,70 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   footer->schema[0].children_idx = {1, 1};
   CHECK_THROWS(compile());
 }
+
+TEST_CASE("Default field mapping preserves row-count carrier eligibility",
+          "[materialization][scan][mapping][carrier_policy]")
+{
+  namespace pq           = cudf::io::parquet;
+  auto const timestamp   = GENERATE(false, true);
+  auto const has_integer = GENERATE(false, true);
+  CAPTURE(timestamp, has_integer);
+  auto footer = std::make_shared<pq::FileMetaData>();
+  footer->schema.resize(has_integer ? 3 : 2);
+  footer->schema[0].num_children = has_integer ? 2 : 1;
+  auto& temporal                 = footer->schema[1];
+  temporal.name                  = "temporal";
+  temporal.field_id              = 1;
+  temporal.type                  = timestamp ? pq::Type::INT64 : pq::Type::INT32;
+  temporal.converted_type =
+    timestamp ? pq::ConvertedType::TIMESTAMP_MICROS : pq::ConvertedType::DATE;
+  if (has_integer) {
+    footer->schema[2].name     = "integer";
+    footer->schema[2].field_id = 2;
+    footer->schema[2].type     = pq::Type::INT32;
+  }
+  auto metadata = std::make_shared<parquet_metadata>(footer,
+                                                     0,
+                                                     parquet_encryption_evidence{},
+                                                     std::vector<uint8_t>{},
+                                                     std::string{},
+                                                     std::vector<uint8_t>{},
+                                                     "object");
+  materialization_program program;
+  program.contract     = 1;
+  program.generation   = 1;
+  program.output_types = {cudf::data_type{cudf::type_id::INT32}};
+  program.input_types  = program.output_types;
+  std::vector<field_requirement> fields{
+    {99, duckdb::LogicalType::INTEGER, duckdb::Value::INTEGER(7)}};
+  auto compile = [&] { return field_id_mapping::compile(metadata, "object", program, fields); };
+  if (has_integer) {
+    auto mapping = compile();
+    CHECK(mapping.read_indices() == std::vector<cudf::size_type>{1});
+    CHECK(mapping.read_names() == std::vector<std::string>{"integer"});
+    CHECK(mapping.read_types() == std::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER});
+  } else {
+    CHECK_THROWS_WITH(compile(), "field mapping has no qualified row-count carrier");
+  }
+  // Schema scope alone must not widen carrier admission.
+  auto scoped = [&] {
+    return field_id_mapping::compile(
+      metadata, "object", program, fields, field_mapping_scope::top_level_scalars);
+  };
+  if (has_integer) {
+    CHECK(scoped().read_indices() == std::vector<cudf::size_type>{1});
+  } else {
+    CHECK_THROWS_WITH(scoped(), "field mapping has no qualified row-count carrier");
+  }
+  auto opted_in = field_id_mapping::compile(metadata,
+                                            "object",
+                                            program,
+                                            fields,
+                                            field_mapping_scope::flat_file,
+                                            row_count_carrier_policy::include_temporal);
+  CHECK(opted_in.read_indices() == std::vector<cudf::size_type>{0});
+  CHECK(opted_in.read_names() == std::vector<std::string>{"temporal"});
+  CHECK(opted_in.read_types() == std::vector<duckdb::LogicalType>{timestamp
+                                                                    ? duckdb::LogicalType::TIMESTAMP
+                                                                    : duckdb::LogicalType::DATE});
+}
