@@ -18,15 +18,22 @@
 // credits, landing, end of stream, notifications in any order, and failure.
 
 #include "catch.hpp"
+#include "exchange/batch_io.hpp"
 #include "exchange/exchange_runtime.hpp"
 #include "exchange/loopback_fabric.hpp"
 #include "exchange/messages.hpp"
 #include "exchange/transport_test_utils.hpp"
 #include "sirius/exception.hpp"
 
+#include <rmm/cuda_stream.hpp>
+
 #include <chrono>
+#include <cstdint>
+#include <functional>
 #include <future>
+#include <limits>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace {
@@ -76,6 +83,43 @@ struct cluster {
     }
   }
 };
+
+/// Rank 0's transport, and rank 1 as a bare fabric endpoint that notifies rank 0 what it likes.
+struct forged_peer {
+  loopback_hub hub{2};
+  frame_ring send{4, 64 * KiB};
+  frame_ring recv{4, 64 * KiB};
+  frame_ring peer_send{4, 64 * KiB};
+  frame_ring peer_recv{4, 64 * KiB};
+  std::unique_ptr<fabric> fab  = hub.attach(0, send, recv);
+  std::unique_ptr<fabric> peer = hub.attach(1, peer_send, peer_recv);
+  received got;
+  std::unique_ptr<transport> t =
+    std::make_unique<transport>(*fab, send, recv, *env().gpu, env().host, recording(got));
+
+  ~forged_peer() { t.reset(); }
+
+  void forge(sirius::exchange::message const& m) { peer->notify(0, sirius::exchange::encode(m)); }
+
+  /// Waits for rank 0 to fail, and checks its error says @p why.
+  void fails_with(std::string const& why)
+  {
+    REQUIRE(got.wait_for([&] { return got.error != nullptr; }, std::chrono::seconds{30}));
+    CHECK_THROWS_WITH(std::rethrow_exception(got.error), Catch::Matchers::ContainsSubstring(why));
+  }
+};
+
+/// The encoded header of a batch of about 1 MiB: its frame 0 alone does not complete it, so a
+/// receiver keeps it landing.
+std::vector<std::uint8_t> many_frame_header()
+{
+  rmm::cuda_stream stream;
+  auto const out =
+    sirius::exchange::outgoing_batch::make(gpu_batch(sample_table(30'000)), stream.view());
+  REQUIRE(out.has_value());
+  REQUIRE(out->stream_bytes() > 64 * KiB);
+  return sirius::exchange::encode_header(out->header());
+}
 
 /// Every rank sends to every rank, itself included; checks what each received.
 void all_to_all(cluster& c, std::vector<stream_id> const& streams, int per_stream, std::size_t rows)
@@ -249,6 +293,121 @@ TEST_CASE("exchange messages round-trip and refuse malformed bytes", "[exchange]
                   sirius::invalid_input_exception);
   CHECK_THROWS_AS(decode(encode(frame_message{1, 1, 0, 0, 8, {}})),
                   sirius::invalid_input_exception);
+  // A frame and an end with a byte too many, a credit with one too few.
+  auto frame = encode(frame_message{7, 3, 0, 5, 1024, {1, 2, 3}});
+  frame.push_back('\0');
+  CHECK_THROWS_AS(decode(frame), sirius::invalid_input_exception);
+  auto credit = encode(credit_message{{1, 2, 3}});
+  credit.pop_back();
+  CHECK_THROWS_AS(decode(credit), sirius::invalid_input_exception);
+  auto ended = encode(end_message{7, 12});
+  ended.push_back('\0');
+  CHECK_THROWS_AS(decode(ended), sirius::invalid_input_exception);
+  // The kind and 7 of the query's 8 bytes.
+  auto const aborted = encode(abort_message{3, ""}).substr(0, 8);
+  CHECK_THROWS_AS(decode(aborted), sirius::invalid_input_exception);
+}
+
+TEST_CASE(
+  "a frame ring refuses no frames, frames of no or unaligned size, and a size that "
+  "overflows",
+  "[exchange][transport]")
+{
+  CHECK_THROWS_AS(frame_ring(0, 256), sirius::invalid_input_exception);
+  CHECK_THROWS_AS(frame_ring(1, 100), sirius::invalid_input_exception);
+  CHECK_THROWS_AS(frame_ring(1, 0), sirius::invalid_input_exception);
+  auto const huge_frame = std::numeric_limits<std::size_t>::max() & ~std::size_t{255};
+  CHECK_THROWS_AS(frame_ring(std::numeric_limits<std::uint32_t>::max(), huge_frame),
+                  sirius::invalid_input_exception);
+  CHECK_THROWS_WITH(frame_ring(std::numeric_limits<std::uint32_t>::max(), huge_frame),
+                    Catch::Matchers::ContainsSubstring("overflow"));
+}
+
+TEST_CASE(
+  "a transport refuses fewer receive frames than peers, frames of two sizes, and an unset "
+  "callback",
+  "[exchange][transport]")
+{
+  loopback_hub hub(3);
+  frame_ring send(4, 64 * KiB);
+  received got;
+  SECTION("one receive frame for two peers")
+  {
+    frame_ring recv(1, 64 * KiB);
+    auto fab = hub.attach(0, send, recv);
+    CHECK_THROWS_AS(transport(*fab, send, recv, *env().gpu, env().host, recording(got)),
+                    sirius::invalid_input_exception);
+  }
+  SECTION("receive frames larger than send frames")
+  {
+    frame_ring recv(8, 128 * KiB);
+    auto fab = hub.attach(0, send, recv);
+    CHECK_THROWS_AS(transport(*fab, send, recv, *env().gpu, env().host, recording(got)),
+                    sirius::invalid_input_exception);
+  }
+  SECTION("a callback left unset")
+  {
+    frame_ring recv(8, 64 * KiB);
+    auto fab = hub.attach(0, send, recv);
+    std::vector<std::function<void(transport::callbacks&)>> const unset{
+      [](transport::callbacks& cb) { cb.on_batch = nullptr; },
+      [](transport::callbacks& cb) { cb.on_end = nullptr; },
+      [](transport::callbacks& cb) { cb.on_error = nullptr; },
+      [](transport::callbacks& cb) { cb.on_abort = nullptr; }};
+    for (auto const& clear : unset) {
+      auto cb = recording(got);
+      clear(cb);
+      CHECK_THROWS_WITH(transport(*fab, send, recv, *env().gpu, env().host, std::move(cb)),
+                        Catch::Matchers::ContainsSubstring("every transport callback must be set"));
+    }
+  }
+}
+
+TEST_CASE("a malformed notification from a peer fails the receiver", "[exchange][transport]")
+{
+  using namespace sirius::exchange;
+  forged_peer c;
+  constexpr stream_id stream = 5;
+  // Rank 1 holds rank 0's receive frames 0 to 3 as credits, and rank 0 holds rank 1's 0 to 3.
+  SECTION("bytes that are not a message")
+  {
+    c.peer->notify(0, std::string(1, '\x09'));
+    c.fails_with("unknown kind");
+  }
+  SECTION("a write into a receive frame the sender does not hold")
+  {
+    c.forge(frame_message{stream, 0, 1, 4, 8, {}});
+    c.fails_with("which it does not hold");
+  }
+  SECTION("a credit for a frame that is not the receiver's")
+  {
+    c.forge(credit_message{{4}});
+    c.fails_with("not one of ours");
+  }
+  SECTION("a stream ended twice")
+  {
+    // One batch expected, none sent: the first end stays open.
+    c.forge(end_message{stream, 1});
+    c.forge(end_message{stream, 1});
+    c.fails_with("ended stream 5 twice");
+  }
+  SECTION("the peer's own failure")
+  {
+    c.forge(error_message{"forged failure"});
+    c.fails_with("rank 1 failed: forged failure");
+  }
+  SECTION("a batch's frame 0 twice")
+  {
+    auto const header = many_frame_header();
+    c.forge(frame_message{stream, 0, 0, 0, 64 * KiB, header});
+    c.forge(frame_message{stream, 0, 0, 1, 64 * KiB, header});
+    c.fails_with("sent batch 0 of stream 5 twice");
+  }
+  SECTION("a frame of more bytes than its place in the batch")
+  {
+    c.forge(frame_message{stream, 0, 0, 0, 64 * KiB + 1, many_frame_header()});
+    c.fails_with("does not fit");
+  }
 }
 
 TEST_CASE("sirius_exchange_host_staging takes auto, always or never", "[exchange][transport]")
