@@ -1177,14 +1177,14 @@ std::optional<accumulated_bloom_builder::publication> accumulated_bloom_builder:
                     bytes,
                     true);
               stage(*root, static_cast<std::byte*>(scratch->data()), bytes, false);
+              // No wait follows the merge: the next write to scratch and the copy out of
+              // `root_chunk` run after it on the root stream.
               enqueue_or_chunk(root_chunk,
                                static_cast<std::byte const*>(scratch->data()),
                                geometry.chunk_bytes,
                                1,
                                bytes,
                                root->stream->value());
-              check_cuda(cudaStreamSynchronize(root->stream->value()),
-                         "cudaStreamSynchronize(staged merge)");
             }
             if (!targets.empty()) {
               stage(*root, root_chunk, bytes, true);

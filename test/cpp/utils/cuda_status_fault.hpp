@@ -57,8 +57,11 @@ class scoped_cuda_status_fault {
     create_event                = 11,
     synchronize_stream_unjoined = 12
   };
-  // A nonzero @p delay first queues a host wait of that length on the faulting call's stream; a
-  // delayed fault whose @p status is cudaSuccess then performs the real call.
+  // When the faulting call has a non-null stream, @p delay queues a host callback that sleeps for
+  // that duration, holding up later work on the stream. Most wrappers queue the callback before
+  // calling CUDA; synchronize_stream queues it after the real wait. create_event and
+  // synchronize_device ignore @p delay, and acquire_stream requires it to be zero. Passing
+  // cudaSuccess as @p status injects no error and requires a nonzero @p delay.
   scoped_cuda_status_fault(operation op,
                            cudaError_t status,
                            std::size_t skip                = 0,

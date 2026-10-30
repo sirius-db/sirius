@@ -47,7 +47,7 @@ struct failure_point {
 }  // namespace
 
 TEST_CASE("accumulated publication faults drain all registered streams and retain the CUDA cause",
-          "[dynamic_filter][accumulation_fault][multi_gpu]")
+          "[dynamic_filter][accumulation_fault][multi_gpu][cuda_status_fault]")
 {
   if (!has_two_gpus()) { return; }
   auto const point = GENERATE(failure_point{fault::copy_peer, 1, false},
@@ -59,7 +59,7 @@ TEST_CASE("accumulated publication faults drain all registered streams and retai
                               failure_point{fault::enqueue_copy_batch, 1, true},
                               failure_point{fault::enqueue_copy_batch, 3, true},
                               failure_point{fault::enqueue_copy_batch, 12, true},
-                              failure_point{fault::synchronize_stream_unjoined, 5, true});
+                              failure_point{fault::synchronize_stream_unjoined, 4, true});
   CAPTURE(point.operation, point.skip, point.staged);
   acc::fixture fixture({.devices = 2});
   if (!point.staged && !acc::has_pool_access(fixture.spaces)) { return; }
@@ -105,7 +105,7 @@ TEST_CASE("accumulated publication faults drain all registered streams and retai
 }
 
 TEST_CASE("accumulation preparation event failure preserves partials and retires scratch",
-          "[dynamic_filter][accumulation_fault][multi_gpu]")
+          "[dynamic_filter][accumulation_fault][multi_gpu][cuda_status_fault]")
 {
   if (!has_two_gpus()) { return; }
   auto const skip = GENERATE(std::size_t{0}, std::size_t{6});
@@ -134,7 +134,7 @@ TEST_CASE("accumulation preparation event failure preserves partials and retires
 
 TEST_CASE(
   "delayed accumulation ingress merge and egress preserve every bitmap byte across halves and keys",
-  "[dynamic_filter][accumulation_fault][multi_gpu]")
+  "[dynamic_filter][accumulation_fault][multi_gpu][cuda_status_fault]")
 {
   if (!has_two_gpus()) { return; }
   auto const point = GENERATE(failure_point{fault::copy_peer, 0, false},
@@ -172,7 +172,7 @@ TEST_CASE(
 }
 
 TEST_CASE("HOST exhaustion refuses preparation without changing any partial",
-          "[dynamic_filter][multi_partition][accumulation_fault][multi_gpu]")
+          "[dynamic_filter][multi_partition][accumulation_fault][multi_gpu][cuda_status_fault]")
 {
   if (!has_two_gpus()) { return; }
   acc::fixture fixture({.devices = 2});
