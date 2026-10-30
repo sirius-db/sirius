@@ -232,6 +232,8 @@ struct operator_params {
   std::vector<std::string> exchange_peers;
   /// This process's rank among exchange_peers.
   uint32_t exchange_rank = 0;
+  /// Distributed execution: "auto", "always" or "never" host-stage the exchange's writes to peers.
+  std::string exchange_host_staging = "auto";
 
   /// Emit build-key min/max filters in addition to membership filters.
   bool enable_dynamic_zone_map_filter = false;

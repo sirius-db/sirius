@@ -964,13 +964,14 @@ surface.
 
 ### Distributed Execution
 
-See [Distributed Execution](distributed-sirius.md). Both settings must be set before the connection's first
+See [Distributed Execution](distributed-sirius.md). These settings must be set before the connection's first
 distributed query and cannot change after it.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `sirius_exchange_peers` | `''` | `host:port` of every rank's exchange listener, comma-separated in rank order. Empty runs in one process. Needs a build with `-DSIRIUS_WITH_NIXL=ON`. |
 | `sirius_exchange_rank` | 0 | This process's position in `sirius_exchange_peers`. |
+| `sirius_exchange_host_staging` | `auto` | `auto`, `always` or `never` send exchange writes to a peer through its pinned host mirror instead of NIXL; `auto` does so where the GPUs lack peer access. Set it before `sirius_exchange_rank`, which connects. |
 
 ### Pinned Tables
 
