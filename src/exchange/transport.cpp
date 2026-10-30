@@ -499,7 +499,7 @@ void transport::released(std::uint64_t query)
 bool transport::wait_sent(std::uint64_t query, std::chrono::milliseconds timeout)
 {
   std::unique_lock lock{_mutex};
-  _released.wait_for(lock, timeout, [&] { return _error || !_held.contains(query); });
+  _released.wait_for(lock, timeout, [&] { return !_held.contains(query); });
   return !_held.contains(query);
 }
 
@@ -593,10 +593,25 @@ void transport::run()
       } catch (...) {
       }
     }
+    // Freed now, not at ~transport: wait_sent() lets their query release its memory once they
+    // are gone. send() and close() queue nothing once _error is set.
+    std::vector<std::deque<engine::queued>> queued(e.queues.size());
     {
       std::lock_guard lock{_mutex};
       _error = error;
+      for (std::size_t peer = 0; peer < queued.size(); ++peer) {
+        queued[peer].swap(e.queues[peer]);
+      }
     }
+    e.send_stream.synchronize_no_throw();
+    queued.clear();
+    for (auto& p : e.out) {
+      p.current.reset();
+    }
+    for (auto const& f : e.staged) {
+      static_cast<void>(cudaEventDestroy(f.copied));
+    }
+    e.staged.clear();
     _room.notify_all();
     _released.notify_all();
     e.cb.on_error(error);
