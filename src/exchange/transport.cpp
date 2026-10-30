@@ -277,7 +277,28 @@ struct transport::engine {
       return;
     }
     ends.erase(it);
-    cb.on_end(stream, from);
+    try {
+      cb.on_end(stream, from);
+    } catch (...) {
+      fail_query(stream, std::current_exception());
+    }
+  }
+
+  /// A receiver of @p stream threw: fails its query here and on every peer, not the transport.
+  void fail_query(stream_id stream, std::exception_ptr error)
+  {
+    auto const query = query_of(stream);
+    std::string what = "unknown error";
+    try {
+      std::rethrow_exception(error);
+    } catch (std::exception const& ex) {
+      what = ex.what();
+    } catch (...) {
+    }
+    cb.on_abort(query, fab.rank(), what);
+    for (rank_t peer = 0; peer < fab.world_size(); ++peer) {
+      if (peer != fab.rank()) { fab.notify(peer, encode(abort_message{query, what})); }
+    }
   }
 
   bool receive()
@@ -298,7 +319,11 @@ struct transport::engine {
       if (++l.copied < l.seen.size()) { continue; }
       auto received = l.in->seal(recv_stream.view());
       landings.erase(it);
-      cb.on_batch(stream, from, batch, std::move(received));
+      try {
+        cb.on_batch(stream, from, batch, std::move(received));
+      } catch (...) {
+        fail_query(stream, std::current_exception());
+      }
       ++ends[{from, stream}].delivered;
       check_end(from, stream);
     }
