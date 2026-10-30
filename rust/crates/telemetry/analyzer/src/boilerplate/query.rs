@@ -69,6 +69,36 @@ impl Query {
         self.group_label = label;
     }
 
+    /// The catalog shows named queries and queries that reached execution. Keep
+    /// unnamed setup observations in the model for direct lookup and diagnostics.
+    pub(crate) fn show_in_query_list(&self) -> bool {
+        let named = match self
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.instance_name.as_deref())
+        {
+            // This is an explicit label, even if it equals the default placeholder.
+            Some(name) => !name.trim().is_empty(),
+            None => self
+                .initial_name()
+                .is_some_and(|name| !name.trim().is_empty() && name != "unnamed_query"),
+        };
+        named
+            || self
+                .transitions()
+                .iter()
+                .any(|transition| matches!(transition.data, schema::QueryEvent::Executing { .. }))
+    }
+
+    fn initial_name(&self) -> Option<&String> {
+        self.transitions()
+            .first()
+            .and_then(|transition| match &transition.data {
+                schema::QueryEvent::Init { instance_name, .. } => Some(instance_name),
+                _ => None,
+            })
+    }
+
     pub(crate) fn transitions(&self) -> &[AnalyzedTransition<schema::QueryEvent>] {
         self.fsm.transitions()
     }
@@ -187,17 +217,11 @@ impl QueryEntity for Query {
                 ));
             }
         }
-        let initial_name = transitions
-            .first()
-            .and_then(|transition| match &transition.data {
-                schema::QueryEvent::Init { instance_name, .. } => Some(instance_name),
-                _ => None,
-            });
         let name = self
             .metadata
             .as_ref()
             .and_then(|metadata| metadata.instance_name.as_ref())
-            .or(initial_name);
+            .or_else(|| self.initial_name());
         Ok(query_engine_ui::Query {
             id: self.id(),
             custom_attributes,

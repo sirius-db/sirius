@@ -239,7 +239,11 @@ impl QueryEngineModel for SiriusModel {
     }
 
     fn queries(&self) -> impl Iterator<Item = &Query> {
-        self.queries.values()
+        // The server uses this iterator for its query catalog. Direct query lookup
+        // and scoped views still expose every retained observation.
+        self.queries
+            .values()
+            .filter(|query| query.show_in_query_list())
     }
 
     fn workers(&self) -> impl Iterator<Item = &Worker> {

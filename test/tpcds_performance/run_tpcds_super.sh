@@ -64,6 +64,10 @@ if [ ${#QUERIES[@]} -eq 0 ]; then
     QUERIES=($(seq 1 99))
 fi
 
+for q in "${QUERIES[@]}"; do
+    [[ "$q" =~ ^[0-9]+$ ]] || { echo "Invalid query number: $q" >&2; exit 1; }
+done
+
 if [ -z "$OUTPUT_DIR" ]; then
     OUTPUT_DIR="$PROJECT_DIR/tpcds_super_results"
 fi
@@ -144,6 +148,15 @@ parse_timer_output() {
     echo "$1" | grep -oP 'Run Time \(s\): real \K[0-9]+\.[0-9]+'
 }
 
+# Keep label-setting calls outside the two query timing measurements.
+emit_query_runs() {
+    local query_number="$1" query_sql="$2" run_number
+    for run_number in 1 2; do
+        printf ".timer off\n.once /dev/null\nCALL sirius_set_query_label('tpcds_q%s_run%s');\n.timer on\n%s;\n" \
+            "$query_number" "$run_number" "$query_sql"
+    done
+}
+
 # --- Run each query ---
 for q in "${QUERIES[@]}"; do
     QUERY_FILE="$QUERY_DIR/q${q}.sql"
@@ -171,8 +184,7 @@ for q in "${QUERIES[@]}"; do
     {
         printf '%s\n' "$VIEW_SQL"
         printf ".timer on\n"
-        printf '%s;\n' "$CLEANED_SQL"
-        printf '%s;\n' "$CLEANED_SQL"
+        emit_query_runs "$q" "$CLEANED_SQL"
     } > "$TEMP_SQL"
 
     Q_RESULT_FILE="$OUTPUT_DIR/result_q${q}.txt"

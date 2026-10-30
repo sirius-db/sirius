@@ -1249,3 +1249,76 @@ fn a_malformed_real_plan_is_not_replaced_by_a_viewer_placeholder() {
     assert!(analyzer.query_bundle(id(4)).is_err());
     assert_eq!(analyzer.model.plans.len(), 1);
 }
+
+#[test]
+fn query_list_hides_unnamed_observations_that_never_executed() {
+    for (initial_name, late_name, executing, expected) in [
+        ("unnamed_query", None, false, false),
+        ("", None, false, false),
+        ("  ", None, false, false),
+        ("legacy label", None, false, true),
+        ("unnamed_query", Some("late label"), false, true),
+        ("unnamed_query", Some("unnamed_query"), false, true),
+        ("unnamed_query", Some(""), false, false),
+        ("unnamed_query", Some("  "), false, false),
+        ("unnamed_query", None, true, true),
+        ("unnamed_query", Some(""), true, true),
+    ] {
+        let mut events = planless_fixture();
+        for event in &mut events {
+            if let E::Query(s::QueryEvent::Init { instance_name, .. }) = &mut event.data {
+                *instance_name = initial_name.into();
+            }
+        }
+        events.push(ev(4, 1, E::Query(s::QueryEvent::Planning { seq: 1 })));
+        if executing {
+            events.push(ev(4, 2, E::Query(s::QueryEvent::Executing { seq: 2 })));
+        }
+        events.push(ev(
+            4,
+            4,
+            E::Query(s::QueryEvent::Finished {
+                seq: if executing { 3 } else { 2 },
+            }),
+        ));
+        // A failed admitted attempt is not execution. A late explicit label still
+        // keeps that planning-only failure visible, including after Finished.
+        let mut metadata = query_metadata(late_name, Some("failed"));
+        metadata.execution_query_id = Some(123);
+        metadata.disposition = Some("gpu".into());
+        events.push(metadata_event(1, metadata));
+        let analyzer = SiriusUiAnalyzer::try_new(id(1), events.into_iter()).unwrap();
+        let listed = analyzer
+            .query_engine_model()
+            .queries()
+            .map(Entity::id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            listed,
+            if expected { vec![id(4)] } else { vec![] },
+            "initial={initial_name:?}, late={late_name:?}, executing={executing}"
+        );
+        // Visibility never discards events/entities or prevents direct inspection.
+        assert!(analyzer.model.query(id(4)).is_ok());
+        assert!(analyzer.query_bundle(id(4)).is_ok());
+    }
+}
+
+#[test]
+fn query_list_visibility_uses_the_final_snapshot_not_any_previous_label() {
+    let mut events = planless_fixture();
+    for event in &mut events {
+        if let E::Query(s::QueryEvent::Init { instance_name, .. }) = &mut event.data {
+            *instance_name = "unnamed_query".into();
+        }
+    }
+    events.push(ev(4, 1, E::Query(s::QueryEvent::Planning { seq: 1 })));
+    events.push(ev(4, 4, E::Query(s::QueryEvent::Finished { seq: 2 })));
+    // Highest revision clears the label. Out-of-order delivery of the older
+    // label cannot make an unnamed planning-only query reappear in the catalog.
+    events.push(metadata_event(2, query_metadata(None, Some("cancelled"))));
+    events.push(metadata_event(1, query_metadata(Some("old"), None)));
+    let analyzer = SiriusUiAnalyzer::try_new(id(1), events.into_iter()).unwrap();
+    assert_eq!(analyzer.query_engine_model().queries().count(), 0);
+    assert!(analyzer.query_bundle(id(4)).is_ok());
+}

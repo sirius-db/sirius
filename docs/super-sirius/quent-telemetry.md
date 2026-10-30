@@ -63,6 +63,19 @@ CALL gpu_execution(
 `gpu_execution(...)` call, an inline `query_label` parameter takes precedence over a pending label set
 with `sirius_set_query_label`. Unlabeled queries are reported as `unnamed_query`.
 
+The UI query list shows explicitly named queries and queries that reached the
+`Executing` state. Unnamed observations that never executed (for example, setup
+SET and CREATE VIEW statements) are omitted from that list. Their events remain
+in the capture and their query bundles remain available by UUID. Named
+planning-only, failed, and cancelled queries remain visible. Selection uses the
+final metadata snapshot, so a label attached after preparation preserves the
+whole preparation interval. Existing traces with a nonempty initial name other
+than `unnamed_query` remain visible; an explicit late label literally equal to
+`unnamed_query` also counts as named.
+
+The TPC-DS runner labels each execution as `tpcds_q<N>_run1` and
+`tpcds_q<N>_run2`, with label-setting calls excluded from its SQL timer output.
+
 ### Query lifecycle metadata
 
 The query UUID identifies one observation. `Init`, `Planning`, `Executing`, and
