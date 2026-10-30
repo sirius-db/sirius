@@ -26,6 +26,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace sirius {
@@ -82,9 +83,12 @@ class distributed_session {
    * @brief Numbers a distributed query of connection @p connection, from 1. Every rank runs the
    * same statements, so the same query gets the same number, and its exchanges the same stream
    * ids. That holds for one statement stream only, so one connection per process runs them.
-   * @throws sirius::invalid_input_exception when another connection already runs them.
+   * @param assigned Nonzero: the number to use, chosen by whoever sends every rank its
+   * statements. The numbers skipped are retired at once, or when the exchange connects.
+   * @throws sirius::invalid_input_exception when another connection already runs them, or when
+   * @p assigned does not exceed the last number used.
    */
-  [[nodiscard]] std::uint64_t next_query(std::uint64_t connection);
+  [[nodiscard]] std::uint64_t next_query(std::uint64_t connection, std::uint64_t assigned = 0);
 
   /// Connection @p connection is closing: the next to number a query takes over, and the
   /// numbering continues.
@@ -120,6 +124,8 @@ class distributed_session {
   std::shared_ptr<exchange_service> _service;
   std::optional<settings> _settings;
   std::uint64_t _queries = 0;
+  /// Numbers skipped before the exchange connected (first, last), retired once it does.
+  std::vector<std::pair<std::uint64_t, std::uint64_t>> _skipped_before_connect;
   /// The connection that runs this process's distributed queries.
   std::optional<std::uint64_t> _connection;
   /// Each open execution window's distributed query. A window may retire while another

@@ -277,7 +277,7 @@ TEST_CASE("a cancelled query's sender stops waiting for room, and the transport 
   }
 
   // Once forgotten, the number carries batches again.
-  sender.forget(query);
+  sender.forget(query, query);
   stream_id const again = sirius::exchange::make_stream_id(5, 2);
   sender.send(again, 1, gpu_batch(sample_table(5'000)));
   sender.close(again, 1);
