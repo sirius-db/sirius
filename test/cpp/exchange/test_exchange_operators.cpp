@@ -516,6 +516,27 @@ TEST_CASE("a failed exchange tells a later query to restart every rank", "[excha
                     Catch::Matchers::ContainsSubstring("restart every rank"));
 }
 
+TEST_CASE("a shut-down exchange service stops its transport and refuses later sends",
+          "[exchange][operators]")
+{
+  ranks c(2);
+  using sirius::exchange::query_stream_bits;
+  stream_id const stream = (std::uint64_t{3} << query_stream_bits) | 1;
+  // Rank 1 holds what arrives for a stream nobody attached; shutting down frees it.
+  c.all[0].service->send(stream, 1, key_value_batch(0, 0));
+  c.all[0].service->close(stream, 1);
+  REQUIRE(c.all[0].service->wait_sent(3, std::chrono::seconds{30}));
+  auto& service = *c.all[1].service;
+  service.shutdown();
+  CHECK(service.rank() == 1);
+  CHECK(service.world_size() == 2);
+  CHECK(service.wait_sent(3, std::chrono::milliseconds{0}));
+  CHECK_THROWS_WITH(service.send(stream + 1, 0, key_value_batch(1, 0)),
+                    Catch::Matchers::ContainsSubstring("shut down"));
+  CHECK_THROWS_WITH(service.close(stream + 1, 0), Catch::Matchers::ContainsSubstring("shut down"));
+  service.abort(3, "after shutdown");
+}
+
 TEST_CASE("a hash exchange with null keys to every rank sends rows with a NULL key to every rank",
           "[exchange][operators]")
 {
