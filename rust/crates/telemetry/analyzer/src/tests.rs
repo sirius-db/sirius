@@ -2,7 +2,7 @@
 
 use quent_analyzer::{Entity, Model};
 use quent_events::{EntityRef, Event};
-use quent_query_engine_analyzer::ui::UiAnalyzer;
+use quent_query_engine_analyzer::{QueryEngineModel, QueryEntity, ui::UiAnalyzer};
 use quent_query_engine_ui::{OperatorFilter, QueryFilter};
 use quent_ui::timeline::{categorical::CategoricalTimelineRequest, request::TimelineConfig};
 use sirius_telemetry_store::{self as s, SiriusEvent as E};
@@ -872,6 +872,40 @@ fn generated_ndjson_imports_into_analyzer() {
         )
         .unwrap();
 
+        let details = context.observer::<instrumentation::QueryDetails>().handle();
+        details
+            .update(
+                query.as_entity_ref(),
+                1,
+                instrumentation::QueryMetadata {
+                    instance_name: Some("ndjson early label".into()),
+                    connection_id: Some(17),
+                    query_ordinal: Some(42),
+                    planning_generation: None,
+                    execution_query_id: None,
+                    worker_id: None,
+                    disposition: None,
+                    outcome: None,
+                },
+            )
+            .unwrap();
+        details
+            .update(
+                query.as_entity_ref(),
+                2,
+                instrumentation::QueryMetadata {
+                    instance_name: Some("ndjson late label".into()),
+                    connection_id: Some(17),
+                    query_ordinal: Some(42),
+                    planning_generation: Some(3),
+                    execution_query_id: Some(123),
+                    worker_id: Some(worker.as_entity_ref()),
+                    disposition: Some("gpu".into()),
+                    outcome: Some("success".into()),
+                },
+            )
+            .unwrap();
+
         (context_id, engine_id, query_id)
     };
 
@@ -880,7 +914,7 @@ fn generated_ndjson_imports_into_analyzer() {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(stored.len(), 8);
+    assert_eq!(stored.len(), 10);
 
     let context_dir = output.path().join(context_id.to_string());
     let inventory = crate::Viewer::context_inventory(&context_dir).unwrap();
@@ -888,7 +922,12 @@ fn generated_ndjson_imports_into_analyzer() {
     let imported: ViewerEventStream<SiriusUiAnalyzer> =
         crate::Viewer::import_events(&context_dir).unwrap();
     let analyzer = SiriusUiAnalyzer::try_new(engine_id, imported).unwrap();
-    assert_eq!(analyzer.query_bundle(query_id).unwrap().query_id, query_id);
+    let bundle = analyzer.query_bundle(query_id).unwrap();
+    assert_eq!(bundle.query_id, query_id);
+    assert_eq!(
+        bundle.entities.query.instance_name.as_deref(),
+        Some("ndjson late label")
+    );
 
     let worker_context_id = {
         let context = instrumentation::Context::<instrumentation::Sirius>::try_new(
@@ -918,7 +957,7 @@ fn generated_ndjson_imports_into_analyzer() {
     );
     assert_eq!(
         crate::Viewer::import_events(&context_dir).unwrap().count(),
-        8
+        10
     );
 
     let engine_events = crate::Viewer::import_events(&context_dir).unwrap();
@@ -966,4 +1005,529 @@ fn query_groups_use_ui_attributes() {
         analyzer.query_initial_group_by_attribute().as_deref(),
         Some(crate::boilerplate::QUERY_GROUP_ATTRIBUTE)
     );
+}
+
+fn query_metadata(name: Option<&str>, outcome: Option<&str>) -> s::QueryMetadata {
+    s::QueryMetadata {
+        instance_name: name.map(str::to_owned),
+        connection_id: Some(17),
+        query_ordinal: Some(42),
+        planning_generation: Some(3),
+        execution_query_id: None,
+        worker_id: None,
+        disposition: Some("cpu_only".into()),
+        outcome: outcome.map(str::to_owned),
+    }
+}
+
+fn metadata_event(revision: u64, metadata: s::QueryMetadata) -> Event<E> {
+    ev(
+        100,
+        20,
+        E::QueryDetails(s::QueryDetailsEvent::Update {
+            query_id: EntityRef::new(id(4), ()),
+            revision,
+            metadata,
+        }),
+    )
+}
+
+fn planless_fixture() -> Vec<Event<E>> {
+    // The engine may have GPU workers/resources from other queries. None of
+    // those become associated with this query just because it lacks a plan.
+    fixture()
+        .into_iter()
+        .filter(|event| match &event.data {
+            E::Plan(_) | E::Operator(_) | E::Port(_) | E::Task(_) | E::DataBatch(_) => false,
+            E::Query(data) => matches!(data, s::QueryEvent::Init { .. }),
+            _ => true,
+        })
+        .collect()
+}
+
+#[test]
+fn query_completion_uses_finished_and_preserves_incomplete_trace_policy() {
+    for (planning, executing, finished) in [
+        (false, false, true),
+        (true, false, true),
+        (true, true, true),
+        (false, false, false),
+        (true, false, false),
+        (true, true, false),
+    ] {
+        let mut events = planless_fixture();
+        if planning {
+            events.push(ev(4, 1, E::Query(s::QueryEvent::Planning { seq: 1 })));
+        }
+        if executing {
+            events.push(ev(4, 2, E::Query(s::QueryEvent::Executing { seq: 2 })));
+        }
+        if finished {
+            events.push(ev(4, 4, E::Query(s::QueryEvent::Finished { seq: 3 })));
+        }
+        let analyzer = SiriusUiAnalyzer::try_new(id(1), events.into_iter()).unwrap();
+        if !finished {
+            // Preserve the pinned FSM analyzer's truncated-trace policy: omit
+            // unfinished queries rather than inventing a terminal transition.
+            assert!(analyzer.model.query(id(4)).is_err());
+            assert!(analyzer.query_bundle(id(4)).is_err());
+            continue;
+        }
+        let query = analyzer.model.query(id(4)).unwrap().to_ui().unwrap();
+        assert_eq!(query.planning_s, planning.then_some(1.0));
+        assert_eq!(query.executing_s, executing.then_some(2.0));
+        assert_eq!(query.completed_s, finished.then_some(4.0));
+        assert!(
+            query
+                .custom_attributes
+                .iter()
+                .all(|attr| attr.key != "outcome")
+        );
+        assert_eq!(analyzer.model.query_plans(id(4)).unwrap().count(), 0);
+        assert_eq!(analyzer.model.query_workers(id(4)).unwrap().count(), 0);
+        let view = analyzer.model.query_view(id(4)).unwrap();
+        assert_eq!(view.query_plans(id(4)).unwrap().count(), 0);
+        assert_eq!(view.query_workers(id(4)).unwrap().count(), 0);
+        let bundle = analyzer.query_bundle(id(4)).unwrap();
+        assert_eq!(bundle.duration_s, 4.0);
+        assert_eq!(bundle.entities.plans.len(), 1);
+        let placeholder = &bundle.entities.plans[&bundle.plan_tree.id];
+        assert_eq!(
+            placeholder.instance_name.as_deref(),
+            Some("No execution plan - query lifecycle only")
+        );
+        assert!(placeholder.worker_id.is_none());
+        assert!(placeholder.edges.is_empty());
+        assert!(bundle.plan_tree.worker.is_none());
+        assert!(bundle.entities.workers.is_empty());
+        assert!(bundle.entities.operators.is_empty());
+        assert!(bundle.entities.ports.is_empty());
+        assert!(bundle.entities.resources.is_empty());
+        assert!(analyzer.model.tasks.is_empty());
+        assert!(analyzer.model.plans.is_empty());
+        assert_eq!(
+            bundle.plan_tree.id,
+            analyzer.query_bundle(id(4)).unwrap().plan_tree.id
+        );
+    }
+}
+
+#[test]
+fn late_metadata_uses_revision_without_changing_identity_group_or_completion() {
+    let mut events = planless_fixture();
+    events.push(ev(4, 1, E::Query(s::QueryEvent::Planning { seq: 1 })));
+    events.push(ev(4, 4, E::Query(s::QueryEvent::Finished { seq: 2 })));
+    // Metadata can arrive before Init, out of revision order, or after Finished.
+    events.insert(
+        0,
+        metadata_event(2, query_metadata(Some("late label"), Some("failed"))),
+    );
+    events.push(metadata_event(1, query_metadata(Some("old label"), None)));
+    let analyzer = SiriusUiAnalyzer::try_new(id(1), events.into_iter()).unwrap();
+    let query = analyzer.model.query(id(4)).unwrap();
+    assert_eq!(query.id(), id(4));
+    assert_eq!(query.query_group_id(), Some(id(3)));
+    let ui = query.to_ui().unwrap();
+    assert_eq!(ui.instance_name.as_deref(), Some("late label"));
+    assert_eq!(ui.completed_s, Some(4.0));
+    assert_eq!(analyzer.query_bundle(id(4)).unwrap().duration_s, 4.0);
+    let attrs = ui
+        .custom_attributes
+        .iter()
+        .map(|attr| (attr.key.as_str(), &attr.value))
+        .collect::<std::collections::HashMap<_, _>>();
+    use quent_dynamic_attributes::DynamicValue;
+    assert_eq!(
+        attrs["query_group"],
+        &Some(DynamicValue::String("group".into()))
+    );
+    assert_eq!(attrs["connection_id"], &Some(DynamicValue::U64(17)));
+    assert_eq!(attrs["query_ordinal"], &Some(DynamicValue::U64(42)));
+    assert_eq!(attrs["planning_generation"], &Some(DynamicValue::U64(3)));
+    assert_eq!(
+        attrs["outcome"],
+        &Some(DynamicValue::String("failed".into()))
+    );
+    assert_eq!(
+        attrs["disposition"],
+        &Some(DynamicValue::String("cpu_only".into()))
+    );
+    assert!(!attrs.contains_key("execution_query_id"));
+    // Keep a real bundle for manual/browser checks of the pinned viewer.
+    if let Ok(path) = std::env::var("SIRIUS_PLANLESS_BUNDLE") {
+        std::fs::write(
+            path,
+            serde_json::to_vec_pretty(&analyzer.query_bundle(id(4)).unwrap()).unwrap(),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn execution_metadata_does_not_turn_a_failed_gpu_attempt_into_a_failed_outer_query() {
+    let mut events = fixture();
+    for event in &mut events {
+        if let E::Task(s::TaskEvent::Finalizing { success, .. }) = &mut event.data {
+            *success = false;
+        }
+    }
+    let mut metadata = query_metadata(Some("replayed"), Some("success"));
+    metadata.execution_query_id = Some(123);
+    metadata.worker_id = Some(EntityRef::new(id(2), ()));
+    metadata.disposition = Some("gpu_to_cpu".into());
+    events.push(metadata_event(1, metadata));
+    let analyzer = SiriusUiAnalyzer::try_new(id(1), events.into_iter()).unwrap();
+    let bundle = analyzer.query_bundle(id(4)).unwrap();
+    assert_eq!(bundle.plan_tree.id, id(5));
+    assert_eq!(bundle.entities.plans.len(), 1);
+    let attrs = &bundle.entities.query.custom_attributes;
+    assert!(attrs.iter().any(|attr| attr.key == "execution_query_id"
+        && attr.value == Some(quent_dynamic_attributes::DynamicValue::U64(123))));
+    assert!(attrs.iter().any(|attr| attr.key == "outcome"
+        && attr.value
+            == Some(quent_dynamic_attributes::DynamicValue::String(
+                "success".into()
+            ))));
+    assert!(attrs.iter().any(|attr| attr.key == "disposition"
+        && attr.value
+            == Some(quent_dynamic_attributes::DynamicValue::String(
+                "gpu_to_cpu".into()
+            ))));
+}
+
+#[test]
+fn query_metadata_rejects_invalid_revisions_and_multiple_owners() {
+    let mut events = planless_fixture();
+    events.push(metadata_event(0, query_metadata(None, None)));
+    assert!(SiriusUiAnalyzer::try_new(id(1), events.into_iter()).is_err());
+    let mut events = planless_fixture();
+    events.push(metadata_event(1, query_metadata(None, None)));
+    let mut other = metadata_event(2, query_metadata(None, None));
+    other.id = id(101);
+    events.push(other);
+    assert!(SiriusUiAnalyzer::try_new(id(1), events.into_iter()).is_err());
+}
+
+#[test]
+fn metadata_snapshots_replace_fields_and_keep_the_initial_name_as_fallback() {
+    let mut events = planless_fixture();
+    events.push(ev(4, 4, E::Query(s::QueryEvent::Finished { seq: 1 })));
+    events.push(metadata_event(
+        1,
+        query_metadata(Some("previous label"), Some("failed")),
+    ));
+    events.push(metadata_event(
+        2,
+        s::QueryMetadata {
+            instance_name: None,
+            connection_id: None,
+            query_ordinal: None,
+            planning_generation: None,
+            execution_query_id: None,
+            worker_id: None,
+            disposition: None,
+            outcome: None,
+        },
+    ));
+    let analyzer = SiriusUiAnalyzer::try_new(id(1), events.into_iter()).unwrap();
+    let query = analyzer.model.query(id(4)).unwrap().to_ui().unwrap();
+    assert_eq!(query.id, id(4));
+    assert_eq!(query.instance_name.as_deref(), Some("select"));
+    assert_eq!(query.custom_attributes.len(), 1);
+    assert_eq!(query.custom_attributes[0].key, "query_group");
+}
+
+#[test]
+fn a_malformed_real_plan_is_not_replaced_by_a_viewer_placeholder() {
+    let mut events = fixture();
+    for event in &mut events {
+        if let E::Plan(s::PlanEvent::Declaration { worker_id, .. }) = &mut event.data {
+            *worker_id = None;
+        }
+    }
+    let analyzer = SiriusUiAnalyzer::try_new(id(1), events.into_iter()).unwrap();
+    assert!(analyzer.query_bundle(id(4)).is_err());
+    assert_eq!(analyzer.model.plans.len(), 1);
+}
+
+#[test]
+fn query_list_hides_unnamed_observations_that_never_executed() {
+    for (initial_name, late_name, executing, expected) in [
+        ("unnamed_query", None, false, false),
+        ("", None, false, false),
+        ("  ", None, false, false),
+        ("legacy label", None, false, true),
+        ("unnamed_query", Some("late label"), false, true),
+        ("unnamed_query", Some("unnamed_query"), false, true),
+        ("unnamed_query", Some(""), false, false),
+        ("unnamed_query", Some("  "), false, false),
+        ("unnamed_query", None, true, true),
+        ("unnamed_query", Some(""), true, true),
+    ] {
+        let mut events = planless_fixture();
+        for event in &mut events {
+            if let E::Query(s::QueryEvent::Init { instance_name, .. }) = &mut event.data {
+                *instance_name = initial_name.into();
+            }
+        }
+        events.push(ev(4, 1, E::Query(s::QueryEvent::Planning { seq: 1 })));
+        if executing {
+            events.push(ev(4, 2, E::Query(s::QueryEvent::Executing { seq: 2 })));
+        }
+        events.push(ev(
+            4,
+            4,
+            E::Query(s::QueryEvent::Finished {
+                seq: if executing { 3 } else { 2 },
+            }),
+        ));
+        // A failed admitted attempt is not execution. A late explicit label still
+        // keeps that planning-only failure visible, including after Finished.
+        let mut metadata = query_metadata(late_name, Some("failed"));
+        metadata.execution_query_id = Some(123);
+        metadata.disposition = Some("gpu".into());
+        events.push(metadata_event(1, metadata));
+        let analyzer = SiriusUiAnalyzer::try_new(id(1), events.into_iter()).unwrap();
+        let listed = analyzer
+            .query_engine_model()
+            .queries()
+            .map(Entity::id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            listed,
+            if expected { vec![id(4)] } else { vec![] },
+            "initial={initial_name:?}, late={late_name:?}, executing={executing}"
+        );
+        // Visibility never discards events/entities or prevents direct inspection.
+        assert!(analyzer.model.query(id(4)).is_ok());
+        assert!(analyzer.query_bundle(id(4)).is_ok());
+    }
+}
+
+#[test]
+fn query_list_visibility_uses_the_final_snapshot_not_any_previous_label() {
+    let mut events = planless_fixture();
+    for event in &mut events {
+        if let E::Query(s::QueryEvent::Init { instance_name, .. }) = &mut event.data {
+            *instance_name = "unnamed_query".into();
+        }
+    }
+    events.push(ev(4, 1, E::Query(s::QueryEvent::Planning { seq: 1 })));
+    events.push(ev(4, 4, E::Query(s::QueryEvent::Finished { seq: 2 })));
+    // Highest revision clears the label. Out-of-order delivery of the older
+    // label cannot make an unnamed planning-only query reappear in the catalog.
+    events.push(metadata_event(2, query_metadata(None, Some("cancelled"))));
+    events.push(metadata_event(1, query_metadata(Some("old"), None)));
+    let analyzer = SiriusUiAnalyzer::try_new(id(1), events.into_iter()).unwrap();
+    assert_eq!(analyzer.query_engine_model().queries().count(), 0);
+    assert!(analyzer.query_bundle(id(4)).is_ok());
+}
+
+#[test]
+fn nested_query_activities_render_without_execution_and_keep_repeated_phases() {
+    use quent_analyzer::RefTreeEntity;
+    use quent_ui::timeline::{
+        request::{EntityFilter, ResourceTimelineRequest, SingleTimelineRequest, TimelineRequest},
+        response::ResourceTimeline,
+    };
+    let mut events = planless_fixture();
+    events.push(ev(4, 10, E::Query(s::QueryEvent::Finished { seq: 1 })));
+    for (n, parent, kind, start, end, outcome) in [
+        (100, None, "work", 1, Some(8), "success"),
+        (102, Some(100), "wait", 4, Some(7), "success"),
+        (104, Some(100), "work", 2, Some(3), "failed"),
+        (106, Some(100), "work", 5, None, "success"),
+    ] {
+        events.push(ev(
+            n + 1,
+            start,
+            E::QueryActivityTrack(s::QueryActivityTrackEvent::Declaration {
+                activity_id: EntityRef::new(id(n), ()),
+                label: "copy".into(),
+            }),
+        ));
+        events.push(ev(
+            n,
+            start,
+            E::QueryActivity(s::QueryActivityEvent::Started {
+                seq: 0,
+                query_id: EntityRef::new(id(4), ()),
+                parent_activity_id: parent.map(|n| EntityRef::new(id(n), ())),
+                track: EntityRef::new(id(n + 1), s::QueryActivityTrackUsage {}),
+                phase: "copy".into(),
+                kind: kind.into(),
+                planning_generation: Some(7),
+                execution_query_id: None,
+            }),
+        ));
+        if let Some(end) = end {
+            events.push(ev(
+                n,
+                end,
+                E::QueryActivity(s::QueryActivityEvent::Finished {
+                    seq: 1,
+                    decision: None,
+                    outcome: Some(outcome.into()),
+                }),
+            ));
+        }
+    }
+    // A second overlapping query must get its own lane and retain its own users.
+    events.extend([
+        ev(
+            200,
+            0,
+            E::Query(s::QueryEvent::Init {
+                seq: 0,
+                instance_name: "other".into(),
+                query_group_id: EntityRef::new(id(3), ()),
+            }),
+        ),
+        ev(200, 10, E::Query(s::QueryEvent::Finished { seq: 1 })),
+        ev(
+            301,
+            1,
+            E::QueryActivityTrack(s::QueryActivityTrackEvent::Declaration {
+                activity_id: EntityRef::new(id(300), ()),
+                label: "other".into(),
+            }),
+        ),
+        ev(
+            300,
+            1,
+            E::QueryActivity(s::QueryActivityEvent::Started {
+                seq: 0,
+                query_id: EntityRef::new(id(200), ()),
+                parent_activity_id: None,
+                track: EntityRef::new(id(301), s::QueryActivityTrackUsage {}),
+                phase: "copy".into(),
+                kind: "work".into(),
+                planning_generation: Some(99),
+                execution_query_id: None,
+            }),
+        ),
+        ev(
+            300,
+            8,
+            E::QueryActivity(s::QueryActivityEvent::Finished {
+                seq: 1,
+                outcome: Some("success".into()),
+                decision: None,
+            }),
+        ),
+    ]);
+    events.reverse(); // ingestion order cannot determine nesting or duration
+    let analyzer = SiriusUiAnalyzer::try_new(id(1), events.into_iter()).unwrap();
+    let bundle = analyzer.query_bundle(id(4)).unwrap();
+    assert!(analyzer.model.plans.is_empty());
+    assert_eq!(analyzer.model.activities.len(), 4);
+    let track_id = crate::boilerplate::QueryActivity::preparation_track_id(id(4));
+    let other_track_id = crate::boilerplate::QueryActivity::preparation_track_id(id(200));
+    assert_ne!(track_id, other_track_id);
+    let view = analyzer.model.query_view(id(4)).unwrap();
+    let tree = view.resource_tree().unwrap();
+    assert!(tree.find(id(100)).is_none());
+    assert_eq!(tree.find(id(4)).unwrap().children.len(), 1);
+    assert_eq!(tree.find(id(4)).unwrap().children[0].entity_id, track_id);
+    assert_eq!(
+        analyzer.model.activities[&id(102)].parent_id(),
+        Some(id(100))
+    );
+    assert_eq!(bundle.entities.resources.len(), 1);
+    assert_eq!(
+        bundle.entities.resources[&track_id].instance_name,
+        "Preparation"
+    );
+    assert!(bundle.entities.resource_groups.contains_key(&id(3)));
+    assert!(!bundle.entities.resource_groups.contains_key(&id(100)));
+    assert!(!bundle.entities.resources.contains_key(&other_track_id));
+    let list = |resource_id| {
+        analyzer.list_entities(serde_json::from_value(serde_json::json!({
+        "entry": {
+            "window": {"start": 0, "end": 10},
+            "filter": {"scope": {"Resource": {"resource_id": resource_id}}, "entity_type_name": null, "min_usage_s": 0.005},
+            "sort": {"key": "UsageDuration", "dir": "Desc"}, "page": null,
+            "application": {"operator_ids": []}
+        }, "app_params": {"query_id": id(4)}
+    })).unwrap()).unwrap()
+    };
+    let listed = list(track_id);
+    assert_eq!(listed.total, 3);
+    assert_eq!(list(other_track_id).total, 0);
+    for (item, (n, state, duration)) in listed.items.iter().zip([
+        (100, "working", 7.0),
+        (102, "waiting", 3.0),
+        (104, "working", 1.0),
+    ]) {
+        let fsm = &item.entity.fsm;
+        assert_eq!(fsm.id, id(n));
+        assert_eq!(fsm.instance_name, "copy"); // repeated names are distinct intervals
+        assert_eq!(fsm.type_name, "query_activity");
+        assert_eq!(fsm.transitions[0].name, state);
+        assert_eq!(fsm.transitions[0].usages[0].resource, track_id);
+        assert_eq!(
+            fsm.transitions[1].timestamp - fsm.transitions[0].timestamp,
+            duration
+        );
+    }
+
+    assert!(bundle.entities.fsm_types.contains_key("query_activity"));
+    for entity_type_name in [None, Some("query_activity".into())] {
+        let entry = TimelineRequest::Resource(ResourceTimelineRequest {
+            resource_id: track_id,
+            long_entities_threshold_s: Some(0.0),
+            entity_filter: EntityFilter { entity_type_name },
+            application: OperatorFilter {
+                operator_ids: vec![],
+            },
+            config: TimelineConfig {
+                start: 0.0,
+                end: 10.0,
+                num_bins: 10,
+            },
+        });
+        let result = analyzer
+            .single_resource_timeline(SingleTimelineRequest {
+                app_params: QueryFilter { query_id: id(4) },
+                entry: entry.clone(),
+            })
+            .unwrap();
+        let fsms = match result.data {
+            ResourceTimeline::Binned(data) => data.long_fsms,
+            ResourceTimeline::BinnedByState(data) => {
+                assert!(data.capacities_states_values["unit"].contains_key("working"));
+                assert!(data.capacities_states_values["unit"].contains_key("waiting"));
+                data.long_fsms
+            }
+        };
+        assert_eq!(fsms.len(), 3);
+        assert!(
+            fsms.iter()
+                .all(|fsm| fsm.transitions[0].usages[0].resource == track_id)
+        );
+        let bulk = analyzer
+            .bulk_resource_timeline(quent_ui::timeline::request::BulkTimelineRequest {
+                app_params: QueryFilter { query_id: id(4) },
+                entries: [("preparation".into(), entry.clone())].into(),
+            })
+            .unwrap();
+        let chunks = analyzer
+            .bulk_chunked_resource_timeline(
+                quent_ui::timeline::request::BulkChunkedTimelineRequest {
+                    app_params: QueryFilter { query_id: id(4) },
+                    entries: [("preparation".into(), entry)].into(),
+                    configs: vec![TimelineConfig {
+                        start: 0.0,
+                        end: 10.0,
+                        num_bins: 10,
+                    }],
+                },
+            )
+            .unwrap();
+        // All three APIs must agree, including the remapped resources in returned FSMs.
+        assert_eq!(
+            serde_json::to_value(&bulk.entries["preparation"]).unwrap(),
+            serde_json::to_value(&chunks.entries["preparation"][0]).unwrap()
+        );
+    }
 }

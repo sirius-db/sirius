@@ -61,3 +61,8 @@ pub(crate) use task_manager_loop_thread::TaskManagerLoopThread;
 pub(crate) use task_queue::TaskQueue;
 pub(crate) use thread_group::ThreadGroup;
 pub use worker::Worker;
+
+mod query_activity;
+mod query_activity_track;
+pub(crate) use query_activity::{QueryActivity, QueryActivityBuilder};
+pub(crate) use query_activity_track::QueryActivityTrack;

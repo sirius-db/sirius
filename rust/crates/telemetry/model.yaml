@@ -3,6 +3,21 @@ model: sirius
 doc: Sirius engine event model
 
 records:
+  QueryMetadata:
+    doc: Complete query metadata snapshot; absent fields are unknown, not inferred.
+    fields:
+      instance_name: { option: string }
+      connection_id: { option: u64 }
+      query_ordinal: { option: u64 }
+      planning_generation: { option: u64 }
+      execution_query_id: { option: u64 }
+      worker_id: { option: { ref: Worker } }
+      # Extensible vocabulary: cpu_only, gpu, gpu_to_cpu.
+      disposition: { option: string }
+      # Extensible vocabulary: success, failed, cancelled, abandoned.
+      # Finished means lifecycle completion, not success.
+      outcome: { option: string }
+
   Edge:
     doc: A directed edge between two operator ports.
     fields:
@@ -10,6 +25,25 @@ records:
       target: { ref: Port }
 
 entities:
+  QueryActivityTrack:
+    doc: A query activity timeline lane; never a GPU execution resource.
+    resource: true
+    events:
+      declaration:
+        attributes:
+          activity_id: { scope-ref: QueryActivity }
+          label: string
+
+  QueryDetails:
+    doc: Revisioned metadata snapshots, independent of the query lifecycle FSM.
+    events:
+      update:
+        multi: true
+        attributes:
+          query_id: { scope-ref: Query }
+          revision: u64
+          metadata: QueryMetadata
+
   Engine:
     doc: A Sirius engine instance and the root of the resource tree
     events:
@@ -154,6 +188,25 @@ entities:
           label: string
 
 fsms:
+  QueryActivity:
+    doc: One producer-defined work or wait interval, with explicit nesting.
+    states:
+      started:
+        initial: true
+        attributes:
+          query_id: { scope-ref: Query }
+          parent_activity_id: { option: { ref: QueryActivity } }
+          track: { uses: QueryActivityTrack }
+          phase: string
+          kind: string
+          planning_generation: { option: u64 }
+          execution_query_id: { option: u64 }
+        to: [ finished ]
+      finished:
+        attributes:
+          outcome: { option: string }
+          decision: { option: string }
+
   Query:
     doc: A query progressing through planning and execution.
     states:

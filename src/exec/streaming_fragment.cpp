@@ -320,31 +320,41 @@ void streaming_fragment::run()
   }
   std::optional<duckdb::SiriusContext::StandaloneQueryScope> window;
   try {
+    _observer = std::make_unique<telemetry::query_observer>(sirius_ctx.get_telemetry_context(),
+                                                            kFragmentQueryLabel);
+    _observer->planning();
+    auto admission = _observer->activity("execution_admission", "wait");
     window.emplace(sirius_ctx, _context, kFragmentQueryLabel);
+    admission.finish();
+    _observer->execution_window(window->query_id());
     if (sirius_ctx.get_scan_manager().pin_registry_epoch() != _planned_pin_epoch) {
       throw sirius::invalid_input_exception(
         "streaming_fragment: a table was pinned or unpinned between build() and run(); "
         "create a new fragment");
     }
-    _engine =
-      std::make_unique<sirius::sirius_engine>(_context, window->query_id(), kFragmentQueryLabel);
+    _engine = std::make_unique<sirius::sirius_engine>(_context, window->query_id(), *_observer);
     _engine->initialize(std::move(_plan_root));
     _engine->execute();
     if (is_result()) { _result = _engine->get_result(); }
+    auto cleanup = _observer->activity("runtime_window_cleanup", "wait");
     window->finish();
+    cleanup.finish();
   } catch (...) {
     // Fail every output before the window closes. Otherwise a peer in wait() blocks forever.
     poison_outputs(std::current_exception());
     _result.reset();
     _phase = phase::run_failed;
     window.reset();
+    if (_observer) { _observer->complete(_context.IsInterrupted() ? "cancelled" : "failed"); }
     throw;
   }
   if (_result && _result->HasError()) {
     _phase      = phase::run_failed;
     auto failed = std::move(_result);
+    _observer->complete("failed");
     failed->ThrowError();
   }
+  _observer->complete("success");
   _phase = phase::ran;
 }
 

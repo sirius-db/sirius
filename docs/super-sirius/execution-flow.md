@@ -16,7 +16,8 @@ The explicit `CALL gpu_execution('...')` function is also still supported.
 
 **Files:** `src/transparent/sirius_optimizer_extension.cpp`, `src/sirius_context.cpp`
 
-DuckDB's optimizer calls one Sirius hook registered via `OptimizerExtension`:
+DuckDB's optimizer invokes Sirius pre- and post-optimization hooks registered via
+`OptimizerExtension`. The pre-hook classifies eligibility before optimization can remove scans:
 
 1. **Optimizer mask (at extension load, not per query)**: `IN_CLAUSE`, `COMPRESSED_MATERIALIZATION`, `LATE_MATERIALIZATION`, and the [shared aggregate and scan exclusions](../../src/planner/unsupported_optimizers.hpp) are unioned into `disabled_optimizers` once when the extension loads, because those can produce DuckDB-internal plan shapes the transparent rebind path cannot yet execute. `STATISTICS_PROPAGATION` remains enabled; its folded `EXPRESSION_GET`/`COLUMN_DATA_SCAN` and `DUMMY_SCAN` sources are translated to `GPU_VALUES`.
 
@@ -30,14 +31,44 @@ DuckDB's optimizer calls one Sirius hook registered via `OptimizerExtension`:
 
 4. DuckDB's executor runs `PhysicalSiriusExecution::GetData()`, which delegates to the Sirius GPU engine (Step 3 below).
 
+## Query preparation on the timeline
+
+`SiriusConnectionState` owns one observer from outer `QueryBegin` through `QueryEnd`.
+Frontend, plan, execution and CPU replay records share that query UUID. Internal metadata
+SQL cannot reset or advance it. Prepared statements retain plans, never invocation observers.
+See [Quent telemetry](quent-telemetry.md#query-activity-timelines) for viewer and outcome details.
+
+| Activity | Measured boundary |
+|----------|-------------------|
+| `query_begin_to_pre_hook_or_end` | Observed time from QueryBegin to the pre-hook, execution entry, or outer completion; includes binding when the hook runs, but is not a parser timer |
+| `eligibility` | Sirius pre-hook classification |
+| `between_optimizer_hooks` | DuckDB optimization and any intervening extension hooks |
+| `optimizer_capture` | Post-hook checks, logical read views, logical-plan copy |
+| `logical_copy` | Copy with nested serialization/deserialization, binding preservation and cardinality restoration; explicitly parented to capture, finalize, or execution rebuild |
+| `remaining_duckdb_preparation` | Post-hook return to finalize entry; includes CPU physical planning when present |
+| `finalize_prepare` | Setup, optional parse/bind/optimize, validation copy, planning admission, read views, GPU translation/validation and wrapper installation |
+| `wrapper_installed_to_execution` | Latency between wrapper installation and execution entry; separate from CPU planning work |
+| `execution_preparation` | Execution admission and the actual reuse/rebuild path; Finished records the reuse decision |
+| `pipeline_construction` | Engine pipeline construction |
+| `gpu_execution` | Engine execution, including runtime startup and waiting for completion; existing task telemetry describes individual pipeline work |
+| `runtime_retirement` | Quiescing and retiring asynchronous runtime work |
+| `runtime_window_cleanup` | Mandatory execution-window cleanup and release before result exposure or CPU replay |
+| `cpu_replay` | CPU execution after the GPU attempt and execution-window cleanup |
+
+Admission and retirement intervals have kind `wait`; other owned intervals have kind `work`.
+Parents include their children. Callback-spanning intervals describe observed boundaries,
+not exclusive DuckDB phases. When a hook is skipped, the initial interval remains broadly
+named rather than claiming unobserved planning work. QueryBegin does not cover extension
+initialization or promise to include all parsing.
+
 ## Step 1b: Explicit Table Function Path
 
 **File:** `src/sirius_extension.cpp`
 
 When using `CALL gpu_execution('SELECT ...')`, the flow is different:
 
-1. `GPUExecutionBind()` re-parses the inner SQL, optimizes it, and generates the Sirius physical plan
-2. `GPUExecutionFunction()` creates a `sirius_interface` and calls `sirius_execute_query()`
+1. `GPUExecutionBind()` parses and binds the inner SQL to discover the result schema
+2. `GPUExecutionFunction()` obtains execution admission, builds a fresh logical and GPU physical plan, creates a `sirius_interface`, and calls `sirius_execute_query()`
 3. On failure (if fallback enabled), gracefully falls back to DuckDB CPU execution
 
 This path is still supported but is no longer the primary way to use Sirius.
@@ -59,7 +90,7 @@ If GPU execution fails at runtime (and `enable_duckdb_fallback` is true), the op
 1. `sirius_pending_statement_or_prepared_statement()`:
    - Calls `begin_query_internal()` to set up the active query context
    - Calls `sirius_pending_statement_internal()` which:
-     - Creates a `sirius_engine(context, query_id, query_label, session_label)` (the labels are optional telemetry names)
+     - Creates a `sirius_engine(context, query_id, observer)` borrowing the current invocation observer
      - Creates a `sirius_physical_materialized_collector` as the result sink
      - Calls `engine.initialize(collector)` to build pipelines (see Step 4)
      - Returns a `PendingQueryResult`

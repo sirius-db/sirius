@@ -4,7 +4,9 @@
 use quent_analyzer::{
     AnalyzerError, AnalyzerResult, Entity, Model, RefTreeEntity,
     ref_tree::RefTreeCollection,
-    resource::{Resource, ResourceTypeDecl, collection::ResourceCollection},
+    resource::{
+        Resource, ResourceTypeDecl, collection::ResourceCollection, tree::ResourceTreeNode,
+    },
 };
 use quent_query_engine_analyzer::{QueryEngineModel, plan_tree::PlanTree};
 use quent_query_engine_ui::EntityRef;
@@ -14,8 +16,8 @@ use uuid::Uuid;
 
 use crate::{
     boilerplate::{
-        DataBatch, DataBatchExt, Engine, Operator, Plan, Port, Query, QueryGroup, Task, TaskExt,
-        Worker,
+        DataBatch, DataBatchExt, Engine, Operator, Plan, Port, Query, QueryActivity, QueryGroup,
+        Task, TaskExt, Worker,
     },
     model::SiriusModel,
 };
@@ -87,6 +89,10 @@ impl<'a> SiriusModelQueryView<'a> {
             )? {
                 resources.insert(resource.id(), resource);
             }
+        }
+
+        if !resources.is_empty() && model.activities.values().any(|a| a.query_id() == query_id) {
+            resource_groups.insert(query_group.id(), query_group as &dyn RefTreeEntity);
         }
 
         let pipeline_ids = operators.keys().copied().collect::<HashSet<_>>();
@@ -201,6 +207,17 @@ impl<'a> SiriusModelQueryView<'a> {
         }
     }
 
+    pub(crate) fn resource_tree(&self) -> AnalyzerResult<ResourceTreeNode> {
+        ResourceTreeNode::try_new(self)
+    }
+
+    pub(crate) fn activities(&self) -> impl Iterator<Item = &'a QueryActivity> + '_ {
+        self.model
+            .activities
+            .values()
+            .filter(|activity| activity.query_id() == self.query.id())
+    }
+
     pub(crate) fn tasks(&self) -> impl Iterator<Item = &'a Task> + '_ {
         self.tasks.values().copied()
     }
@@ -262,6 +279,13 @@ impl QueryEngineModel for SiriusModelQueryView<'_> {
         (self.query.id() == query_id)
             .then_some(self.query)
             .ok_or(AnalyzerError::InvalidId(query_id))
+    }
+
+    fn query_plans(&self, query_id: Uuid) -> AnalyzerResult<impl Iterator<Item = &Plan>> {
+        self.query(query_id)?;
+        // try_new already selected and validated this query's plans. An empty
+        // view is valid and must not require a synthetic analyzer plan tree.
+        Ok(self.plans.values().copied())
     }
 
     fn worker(&self, worker_id: Uuid) -> AnalyzerResult<&Worker> {
@@ -339,6 +363,16 @@ impl Model for SiriusModelQueryView<'_> {
             Ok(EntityRef::Resource(entity_id))
         } else if self.resource_groups.contains_key(&entity_id) {
             Ok(EntityRef::ResourceGroup(entity_id))
+        } else if let Some(activity) = self
+            .model
+            .activities
+            .get(&entity_id)
+            .filter(|activity| activity.query_id() == self.query.id())
+        {
+            Ok(EntityRef::Application {
+                type_name: activity.type_name().into(),
+                id: entity_id,
+            })
         } else {
             self.tasks
                 .get(&entity_id)
