@@ -32,6 +32,7 @@
 
 #include <cucascade/cudf/host_data_representation.hpp>
 
+#include <algorithm>
 #include <memory>
 
 namespace {
@@ -118,6 +119,22 @@ TEST_CASE("a landing with no room anywhere is refused, not waited for", "[exchan
   REQUIRE(out.has_value());
   auto const hold = hold_gpu();
   CHECK(incoming_batch::land(out->header(), *env().gpu, nullptr, stream.view()) == nullptr);
+}
+
+TEST_CASE("a batch no tier could ever hold fails at once, naming its size", "[exchange][batch_io]")
+{
+  rmm::cuda_stream stream;
+  auto out = outgoing_batch::make(gpu_batch(sample_table(1000)), stream.view());
+  REQUIRE(out.has_value());
+  auto header = out->header();
+  auto column = std::find_if(
+    header.columns.begin(), header.columns.end(), [](auto const& c) { return c.has_data; });
+  REQUIRE(column != header.columns.end());
+  auto const too_big  = env().gpu->get_max_memory() + 1;
+  column->data_size   = too_big;
+  header.stream_bytes = too_big;
+  CHECK_THROWS_WITH(incoming_batch::land(header, *env().gpu, nullptr, stream.view()),
+                    Catch::Matchers::ContainsSubstring("can land neither"));
 }
 
 TEST_CASE("a sliced batch is sent as its rows only", "[exchange][batch_io]")
