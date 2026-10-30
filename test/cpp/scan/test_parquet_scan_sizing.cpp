@@ -1922,7 +1922,7 @@ TEST_CASE_METHOD(carrier_file_fixture,
     auto decoded = reader->materialize_metadata_to_table(
       *split, *space, cudf::get_default_stream(), false, nullptr);
     REQUIRE(decoded.execution);
-    CHECK(decoded.execution->authoritative == !metadata_only);
+    CHECK(decoded.execution->authoritative);
     auto table = reader->post_filter_and_project(
       std::move(decoded), *space, cudf::get_default_stream(), false, nullptr, nullptr, {});
     CHECK(table->num_columns() == 1);

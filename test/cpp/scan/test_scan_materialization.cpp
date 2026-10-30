@@ -977,6 +977,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
                  "Adapter mapping hook runs without an Iceberg physical schema",
                  "[materialization][scan][mapping][adapter][integration]")
 {
+  bool const multiple_files = GENERATE(false, true);
   sirius::test::scratch_dir directory("materialization_adapter_mapping");
   auto path = directory.file("input.parquet");
   auto written =
@@ -984,9 +985,14 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
                " (FORMAT PARQUET, FIELD_IDS {old_id: 1})");
   REQUIRE(written);
   REQUIRE_FALSE(written->HasError());
-  auto info                    = std::make_unique<parquet_ingestible_table_info>();
-  info->contract_id            = 92;
-  info->resolved_file_paths    = {path};
+  auto info                 = std::make_unique<parquet_ingestible_table_info>();
+  info->contract_id         = 92;
+  info->resolved_file_paths = {path};
+  if (multiple_files) {
+    auto second = directory.file("second.parquet");
+    std::filesystem::copy_file(path, second);
+    info->resolved_file_paths.push_back(second);
+  }
   info->names                  = {"renamed"};
   info->returned_types         = {sirius::logical_type::make(sirius::type_id::BIGINT)};
   info->column_ids             = {duckdb::ColumnIndex(0)};
@@ -1011,21 +1017,29 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   CHECK(file.field_mapping->read_names() == std::vector<std::string>{"old_id"});
   auto coalescer = ingestible->create_batch_coalescer();
   auto splits    = coalescer->push(std::move(prepared));
+  if (multiple_files) {
+    auto second = prepare({});
+    REQUIRE(second);
+    for (auto& split : coalescer->push(std::move(second)))
+      splits.push_back(std::move(split));
+  }
   for (auto& split : coalescer->flush())
     splits.push_back(std::move(split));
-  REQUIRE(splits.size() == 1);
+  // File-specific mapped reader options retain the production grouping boundary.
+  REQUIRE(splits.size() == (multiple_files ? 2 : 1));
   auto context = sirius::test::get_registered_sirius_context(*con);
   auto* space  = context->get_memory_manager().get_memory_space(
     cucascade::memory::Tier::GPU, rmm::get_current_cuda_device().value());
   REQUIRE(space);
   rmm::cuda_stream stream;
-  auto batch =
-    ingestible->materialize_metadata_to_table(*splits.front(), *space, stream, false, nullptr);
-  REQUIRE(batch.execution);
-  CHECK_FALSE(batch.execution->authoritative);
-  auto output = ingestible->post_filter_and_project(std::move(batch), *space, stream);
-  CHECK(output->num_rows() == 1);
-  CHECK(output->view().column(0).type().id() == cudf::type_id::INT64);
+  for (auto const& split : splits) {
+    auto batch = ingestible->materialize_metadata_to_table(*split, *space, stream, false, nullptr);
+    REQUIRE(batch.execution);
+    CHECK(batch.execution->authoritative);
+    auto output = ingestible->post_filter_and_project(std::move(batch), *space, stream);
+    CHECK(output->num_rows() == 1);
+    CHECK(output->view().column(0).type().id() == cudf::type_id::INT64);
+  }
 }
 
 TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,

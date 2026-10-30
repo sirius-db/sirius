@@ -2515,10 +2515,19 @@ filtered_table parquet_scan_core::materialize_metadata_to_table(
   prepared.logical_input    = reinterpret_cast<uintptr_t>(&info);
   if (_decode_override) {
     auto domain = std::make_shared<lineage_domain>();
+    std::unordered_map<std::string, std::size_t> files;
+    bool unambiguous_indices = true;
     for (auto const& slice : physical.rg_slices) {
-      auto index = domain->files.size();
-      domain->files.push_back({slice.file_path, slice.file_metadata->num_rows});
-      prepared.virtual_file_indices.push_back(slice.file_index);
+      auto [entry, inserted] = files.emplace(slice.file_path, domain->files.size());
+      auto const index       = entry->second;
+      if (inserted) {
+        domain->files.push_back({slice.file_path, slice.file_metadata->num_rows});
+        prepared.virtual_file_indices.push_back(slice.file_index);
+      } else {
+        if (domain->files[index].rows != slice.file_metadata->num_rows)
+          throw std::invalid_argument("repeated input file has inconsistent row count");
+        unambiguous_indices &= prepared.virtual_file_indices[index] == slice.file_index;
+      }
       int64_t offset    = 0;
       std::size_t group = 0;
       for (auto selected : slice.row_group_indices) {
@@ -2529,6 +2538,9 @@ filtered_table parquet_scan_core::materialize_metadata_to_table(
         offset += count;
       }
     }
+    // A repeated file can have different query source indices. In that case a
+    // decoder must supply FILE_INDEX itself; physical file identity cannot prove it.
+    if (!unambiguous_indices) prepared.virtual_file_indices.clear();
     prepared.input_domain = std::move(domain);
   }
   materializer_inputs inputs;
@@ -2652,9 +2664,6 @@ filtered_table parquet_scan_core::decode_metadata_to_table(
   rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
   std::unique_ptr<cudf::table> table;
   std::unique_ptr<gpu_row_positions> positions;
-  // Bulk/hybrid, mapped and metadata-only producers keep legacy authority until
-  // they have their own execution-record and shared-decision equivalence evidence.
-  bool qualified_execution = !split.field_mapping && split.read_mode == parquet_read_mode::READER;
   if (split.read_mode == parquet_read_mode::METADATA_ONLY) {
     if (split.source_kind != parquet_source_kind::PLAIN_PARQUET ||
         !_plan->has_user_virtual_columns() || _sirius_dynamic_filters ||
@@ -2727,8 +2736,7 @@ filtered_table parquet_scan_core::decode_metadata_to_table(
       for (auto const& slice : split.rg_slices)
         _info->profiles->counters->reader_call(slice.file_path);
     _reader_calls.fetch_add(1, std::memory_order_relaxed);
-    bool const bulk     = !all_slices_pruned && prefers_bulk_materialize(sources, opts);
-    qualified_execution = qualified_execution && !bulk;
+    bool const bulk = !all_slices_pruned && prefers_bulk_materialize(sources, opts);
     if (bulk) {
       table = materialize_parquet(sources, opts, split.column_chunk_byte_ranges(), stream, mr_ref);
     } else {
@@ -2780,16 +2788,7 @@ filtered_table parquet_scan_core::decode_metadata_to_table(
     ast_expression.has_value() && _reader_pushdown_is_complete;
 
   if (_plan->has_partitions()) {
-    auto progress =
-      qualified_execution
-        ? decoded_execution(ast_expression.has_value(), false)
-        : translate_legacy_execution(
-            {reader_applied_full_filter ? filter_state::ROW_FILTERED : filter_state::UNFILTERED,
-             {},
-             false},
-            _catalogue->residual(),
-            execution_contract(),
-            1);
+    auto progress = decoded_execution(ast_expression.has_value(), false);
     materialization_program program;
     program.contract               = execution_contract();
     program.generation             = 1;
@@ -2830,9 +2829,8 @@ filtered_table parquet_scan_core::decode_metadata_to_table(
       throw;
     }
     auto result = filtered_table{std::move(batch->table), filter_state::ROW_FILTERED_AND_PROJECTED};
-    result.execution                = decoded_execution(ast_expression.has_value(), true);
-    result.execution->authoritative = qualified_execution;
-    result.execution->layout_width  = result.table.n_columns();
+    result.execution               = decoded_execution(ast_expression.has_value(), true);
+    result.execution->layout_width = result.table.n_columns();
     return result;
   }
 
@@ -2840,13 +2838,12 @@ filtered_table parquet_scan_core::decode_metadata_to_table(
                                                 : op::scan::filter_state::UNFILTERED;
   auto result      = op::scan::filtered_table{owning_table_view{std::move(table)}, state};
   result.execution = decoded_execution(ast_expression.has_value(), false);
-  result.execution->authoritative = qualified_execution;
-  result.execution->layout_width  = result.table.n_columns();
-  result.execution->positions     = positions                   ? row_position_state::per_row
-                                    : reader_filter_root        ? row_position_state::lost
-                                    : _requires_file_visibility ? row_position_state::runs
-                                                                : row_position_state::none;
-  result.row_positions            = std::move(positions);
+  result.execution->layout_width = result.table.n_columns();
+  result.execution->positions    = positions                   ? row_position_state::per_row
+                                   : reader_filter_root        ? row_position_state::lost
+                                   : _requires_file_visibility ? row_position_state::runs
+                                                               : row_position_state::none;
+  result.row_positions           = std::move(positions);
   return result;
 }
 
@@ -2866,9 +2863,11 @@ void parquet_scan_core::record_resident_execution(filtered_table& batch) const
                             _catalogue->residual(),
                             execution_contract(),
                             1);
-  auto& record               = translated.facts;
-  record.producer            = execution_record_producer::resident;
-  record.authoritative       = false;
+  auto& record    = translated.facts;
+  record.producer = execution_record_producer::resident;
+  // Invalid legacy answers retain their established fallback. Qualified resident
+  // facts otherwise drive the same shared decision as freshly decoded batches.
+  record.authoritative       = !translated.shadow_mismatch;
   record.visibility_complete = true;
   record.layout              = execution_layout(record.projection_complete);
   record.layout_width        = batch.table.n_columns();

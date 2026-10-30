@@ -756,13 +756,12 @@ and projection remain independent. Pruning and dynamic filters do not complete
 static predicates. Answers retain their slots until projection, and
 `residual_filter::against_progress()` rejects unknown IDs or unavailable inputs.
 
-Unmapped `read_parquet` results, including Iceberg and qualified Hive inline
-assembly, use validated producer records to execute only pending work. Bulk/hybrid,
-mapped, metadata-only, cached and compressed producers retain translated legacy
-authority. Their shadow records report discrepancies without changing decisions;
-unqualified Hive still evaluates the full residual unless the whole predicate
-was completed. Invalid authoritative records fail before publication. Required
-and applied delete-set identities are compared so completed deletions are skipped.
+Parquet reader, bulk/hybrid, mapped, metadata-only and Hive inline results use
+validated producer records to execute only pending work. Resident/stolen results
+use the same decisions after translating their observed decode facts; malformed
+legacy answer reports retain the old fallback and report a shadow mismatch.
+Invalid authoritative records fail before publication. Required and applied
+delete-set identities are compared so completed deletions are skipped.
 
 Source lineage is either original-file runs, explicit original positions, or
 unavailable. Runs retain offsets across pruned row groups. Visibility requires
@@ -860,9 +859,8 @@ converted only for a canonical-lineage consumer, reusing the row buffer and
 releasing source indices; ordinary Iceberg interval/reader-position deletion
 keeps its existing representation. A legacy `row_domain` view can be generated
 explicitly from the canonical record; independently authoritative copies are
-rejected. Unqualified bulk/Hive, mapped, metadata-only and resident producers
-retain legacy authority. Resident/decompression results also carry shadow facts;
-native MVCC continues to use its separate visibility contract.
+rejected. Resident/decompression records preserve actual answers and whole-filter
+completion; native MVCC continues to use its separate visibility contract.
 
 `table_scan/field_mapper.hpp` wraps the existing name, Iceberg field-ID and flat
 compatibility rules. It returns immutable mapping results or structured refusals,

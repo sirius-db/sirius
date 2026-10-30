@@ -8,6 +8,8 @@
 
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
+#include <cudf/concatenate.hpp>
+#include <cudf/copying.hpp>
 #include <cudf/cudf_utils.hpp>
 #include <cudf/scalar/scalar.hpp>
 
@@ -18,10 +20,18 @@
 #include <duckdb/common/multi_file/multi_file_reader.hpp>
 #include <duckdb/planner/expression/bound_comparison_expression.hpp>
 #include <duckdb/planner/expression/bound_constant_expression.hpp>
+#include <duckdb/planner/expression/bound_function_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/parquet_fixture_utils.hpp>
+#include <utils/scan_resource_test_utils.hpp>
 #include <utils/table_filter_test_utils.hpp>
+#include <utils/tracking_kvikio_context.hpp>
+
+#include <atomic>
+#include <chrono>
+#include <future>
+#include <thread>
 
 using namespace sirius::op::scan;
 namespace {
@@ -43,7 +53,21 @@ std::unique_ptr<cudf::column> upload(std::vector<T> const& values,
   }
   return result;
 }
-std::shared_ptr<static_predicate_catalogue const> catalogue()
+template <class T>
+std::vector<T> download(cudf::column_view column, ::cuda::stream_ref stream)
+{
+  std::vector<T> result(column.size());
+  if (!result.empty()) {
+    REQUIRE(cudaMemcpyAsync(result.data(),
+                            column.data<T>(),
+                            result.size() * sizeof(T),
+                            cudaMemcpyDeviceToHost,
+                            stream.get()) == cudaSuccess);
+    stream.sync();
+  }
+  return result;
+}
+std::shared_ptr<static_predicate_catalogue const> catalogue(bool answers = false)
 {
   std::vector<sirius::op::table_filter_conjunct> terms;
   for (std::size_t i = 0; i < 2; ++i)
@@ -54,7 +78,11 @@ std::shared_ptr<static_predicate_catalogue const> catalogue()
          duckdb::ExpressionType::COMPARE_GREATERTHAN,
          duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, i),
          duckdb::make_uniq<duckdb::BoundConstantExpression>(duckdb::Value::INTEGER(100)))});
-  return std::make_shared<static_predicate_catalogue const>(77, 1, std::move(terms));
+  return std::make_shared<static_predicate_catalogue const>(
+    77,
+    1,
+    std::move(terms),
+    answers ? std::unordered_set<std::size_t>{1} : std::unordered_set<std::size_t>{});
 }
 struct recorder : step_observer {
   std::vector<std::size_t> terms;
@@ -174,7 +202,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
       return test.decode(s, resource);
     },
     *space,
-    stream.view(),
+    static_cast<::cuda::stream_ref>(stream),
     mr);
   REQUIRE(output.batch.table.num_rows() == 1);
   int32_t value = 0;
@@ -185,7 +213,8 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
                           stream.value()) == cudaSuccess);
   stream.synchronize();
   CHECK(value == 300);
-  CHECK(output.lineage.ordinals_on(stream.view()) == std::vector<int64_t>{3});
+  CHECK(output.lineage.ordinals_on(static_cast<::cuda::stream_ref>(stream)) ==
+        std::vector<int64_t>{3});
   CHECK(observer.files == std::vector<std::string>{"A"});
   CHECK(observer.terms == std::vector<std::size_t>{1});
   CHECK(observer.assemblies == 1);
@@ -201,7 +230,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     test.inputs,
     [&](auto const&, auto const&, auto const&, auto, auto) { return std::move(*completed); },
     *space,
-    stream.view(),
+    static_cast<::cuda::stream_ref>(stream),
     mr);
   CHECK(again.batch.table.num_rows() == 1);
   CHECK(observer.files.size() == 1);
@@ -221,6 +250,17 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   auto mr = rmm::device_async_resource_ref(space->get_default_allocator());
   scenario test;
   std::function<void(decode_result&)> corrupt;
+  std::optional<std::string> expected_error;
+  SECTION("assembled output cannot use an unfinished input mapping")
+  {
+    expected_error = "decoder assembled output before logical normalization";
+    corrupt        = [&](auto& r) {
+      r.batch.execution->projection_complete     = true;
+      r.batch.execution->whole_static_complete   = true;
+      r.batch.execution->logical_schema_complete = false;
+      r.batch.execution->layout                  = test.program->output_layout;
+    };
+  }
   SECTION("unknown predicate")
   {
     corrupt = [](auto& r) { r.batch.execution->predicates[0].conjunct = 9; };
@@ -263,21 +303,58 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
       r.batch.execution->visibility_applied = {{"A", std::make_shared<int const>(0)}};
     };
   }
+  SECTION("duplicate ordinals")
+  {
+    corrupt = [&](auto& r) {
+      r.lineage.per_row = upload<int64_t>({1, 1, 3, 4}, cudf::type_id::INT64, stream, mr);
+    };
+  }
+  SECTION("out-of-range ordinals")
+  {
+    corrupt = [&](auto& r) {
+      r.lineage.per_row = upload<int64_t>({1, 2, 3, 5}, cudf::type_id::INT64, stream, mr);
+    };
+  }
+  SECTION("wrong generation")
+  {
+    corrupt = [](auto& r) { ++r.batch.execution->generation; };
+  }
+  SECTION("answer in a value column")
+  {
+    corrupt = [](auto& r) {
+      r.batch.execution->predicates = {{1, sirius::op::predicate_stage::answer, 1}};
+    };
+  }
+  SECTION("dropped residual input")
+  {
+    corrupt = [&](auto& r) {
+      auto cols = r.batch.table.release(stream, mr)->release();
+      cols.pop_back();
+      r.batch.table = owning_table_view{std::make_unique<cudf::table>(std::move(cols))};
+      r.batch.execution->layout_width = 1;
+    };
+  }
   SECTION("missing deletion")
   {
     corrupt = [](auto& r) { r.batch.execution->visibility_complete = true; };
   }
-  REQUIRE_THROWS(materialize_shared(
-    test.split,
-    test.inputs,
-    [&](auto const&, auto const&, auto const&, auto s, auto resource) {
-      auto result = test.decode(s, resource);
-      corrupt(result);
-      return result;
-    },
-    *space,
-    stream.view(),
-    mr));
+  auto run = [&] {
+    return materialize_shared(
+      test.split,
+      test.inputs,
+      [&](auto const&, auto const&, auto const&, auto s, auto resource) {
+        auto result = test.decode(s, resource);
+        corrupt(result);
+        return result;
+      },
+      *space,
+      static_cast<::cuda::stream_ref>(stream),
+      mr);
+  };
+  if (expected_error)
+    REQUIRE_THROWS_WITH(run(), Catch::Matchers::ContainsSubstring(*expected_error));
+  else
+    REQUIRE_THROWS(run());
 }
 
 TEST_CASE_METHOD(
@@ -309,6 +386,24 @@ TEST_CASE_METHOD(
     REQUIRE_THROWS(materialize_shared(test.split, test.inputs, decode, *space, stream, mr));
     CHECK(calls == 0);
   }
+  SECTION("a foreign generation cannot reuse certification")
+  {
+    ++test.program->generation;
+    REQUIRE_THROWS(materialize_shared(test.split, test.inputs, decode, *space, stream, mr));
+    CHECK(calls == 0);
+  }
+  SECTION("wrong visibility file is rejected before decode")
+  {
+    test.inputs.visibility.front().binding.file = "B";
+    REQUIRE_THROWS(materialize_shared(test.split, test.inputs, decode, *space, stream, mr));
+    CHECK(calls == 0);
+  }
+  SECTION("another delete set cannot reuse its binding")
+  {
+    test.inputs.visibility.front().owner = std::make_shared<iceberg_delete_set const>("A");
+    REQUIRE_THROWS(materialize_shared(test.split, test.inputs, decode, *space, stream, mr));
+    CHECK(calls == 0);
+  }
   SECTION("cancelled attempt does not decode")
   {
     std::stop_source stop;
@@ -316,6 +411,42 @@ TEST_CASE_METHOD(
     test.split.stop = stop.get_token();
     REQUIRE_THROWS(materialize_shared(test.split, test.inputs, decode, *space, stream, mr));
     CHECK(calls == 0);
+  }
+  SECTION("cancellation during decode retires submitted work before publishing")
+  {
+    test.inputs.phase = GENERATE(materialization_phase::complete, materialization_phase::decoded);
+    bool const needs_mapping = GENERATE(false, true);
+    CAPTURE(test.inputs.phase, needs_mapping);
+    if (needs_mapping) {
+      auto plan = std::make_shared<scan_plan>(*test.split.plan);
+      plan->virtual_columns.push_back({999,
+                                       "row",
+                                       sirius::logical_type::make(sirius::type_id::BIGINT),
+                                       scan_plan::parquet_virtual_column_kind::FILE_ROW_NUMBER,
+                                       2});
+      test.program->input_types->push_back(cudf::data_type{cudf::type_id::INT64});
+      test.split.plan = plan;
+      test.inputs.mapping.evidence =
+        std::make_shared<mapping_certification const>(*test.program, plan, test.split.input_domain);
+    }
+    std::stop_source stop;
+    test.split.stop = stop.get_token();
+    sirius::test::tracked_scan_resource tracked{mr, stream};
+    REQUIRE_THROWS_WITH(materialize_shared(
+                          test.split,
+                          test.inputs,
+                          [&](auto const&, auto const&, auto const&, auto s, auto resource) {
+                            auto decoded = test.decode(s, resource);
+                            decoded.batch.execution->logical_schema_complete = !needs_mapping;
+                            stop.request_stop();
+                            return decoded;
+                          },
+                          *space,
+                          stream,
+                          rmm::device_async_resource_ref{tracked}),
+                        Catch::Matchers::ContainsSubstring("cancelled"));
+    CHECK(cudaStreamQuery(stream.value()) == cudaSuccess);
+    CHECK(tracked.state->live == 0);
   }
   SECTION("empty deletion requires no positions")
   {
@@ -355,19 +486,34 @@ TEST_CASE_METHOD(
   "Parquet decoder override uses certified preparation and deferred production finish",
   "[scan][shared_materializer][integration]")
 {
-  bool const hive = GENERATE(false, true);
+  bool const hive      = GENERATE(false, true);
+  bool const positions = GENERATE(false, true);
+  bool const mapped    = GENERATE(false, true);
+  bool const repeated  = !hive && !mapped ? GENERATE(false, true) : false;
   sirius::test::scratch_dir dir("decoder_override");
   std::filesystem::create_directories(dir.path() / "part=7");
   auto path = dir.file("part=7/input.parquet");
-  run_ok("COPY (SELECT * FROM (VALUES (1,1000),(101,5),(102,200),(103,300),(104,50)) t(a,b)) TO " +
-         dir.file_literal("part=7/input.parquet") + " (FORMAT PARQUET)");
+  run_ok(
+    "COPY (SELECT * FROM (VALUES (1,1000),(101,5),(102,200),(103,300),(104,50)) t(pa,pb)) TO " +
+    dir.file_literal("part=7/input.parquet") + " (FORMAT PARQUET, FIELD_IDS {pa: 1, pb: 2})");
   auto info                 = std::make_unique<parquet_ingestible_table_info>();
   info->resolved_file_paths = {path};
-  info->names               = {"a", "b", "part"};
+  if (repeated) info->resolved_file_paths.push_back(path);
+  info->names = {mapped ? "a" : "pa", mapped ? "b" : "pb", "part"};
   info->returned_types.assign(3, sirius::logical_type::make(sirius::type_id::INTEGER));
   info->column_ids             = {duckdb::ColumnIndex(0), duckdb::ColumnIndex(1)};
   info->projection_ids         = {1, 0};
   info->projected_output_count = 1;
+  if (mapped) {
+    info->contract_id                = 77;
+    info->returned_types[0]          = sirius::logical_type::make(sirius::type_id::BIGINT);
+    info->field_mapping_requirements = std::vector<field_requirement>{
+      {1, duckdb::LogicalType::BIGINT, {}, true}, {2, duckdb::LogicalType::INTEGER, {}, false}};
+    info->prepare_field_mapping = [](auto metadata, auto identity, auto program, auto fields) {
+      return std::make_shared<field_id_mapping const>(field_id_mapping::compile(
+        std::move(metadata), identity, std::move(program), std::move(fields)));
+    };
+  }
   if (hive) {
     info->column_ids.emplace_back(2);
     info->projection_ids         = {1, 2, 0};
@@ -381,17 +527,24 @@ TEST_CASE_METHOD(
       sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_GREATERTHAN,
                                     duckdb::Value::INTEGER(100)));
   parquet_scan_core core(std::move(info));
-  auto ioctx   = std::make_shared<sirius::io::kvikio_context>();
-  auto prepare = core.next_split_provider(
-    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+  auto ioctx    = std::make_shared<sirius::test::tracking_kvikio_context>();
+  auto resolver = [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; };
+  auto prepare  = core.next_split_provider(resolver);
   REQUIRE(prepare);
   auto coalescer = core.create_batch_coalescer();
   auto splits    = coalescer->push(prepare({}));
+  if (repeated) {
+    auto next = core.next_split_provider(resolver);
+    REQUIRE(next);
+    for (auto& split : coalescer->push(next({})))
+      splits.push_back(std::move(split));
+  }
   for (auto& split : coalescer->flush())
     splits.push_back(std::move(split));
   REQUIRE(splits.size() == 1);
-  auto context = sirius::test::get_registered_sirius_context(*con);
-  auto* space  = context->get_memory_manager().get_memory_space(
+  auto const prepared_reads = ioctx->counts->calls.load();
+  auto context              = sirius::test::get_registered_sirius_context(*con);
+  auto* space               = context->get_memory_manager().get_memory_space(
     cucascade::memory::Tier::GPU, rmm::get_current_cuda_device().value());
   REQUIRE(space);
   rmm::cuda_stream stream;
@@ -403,14 +556,33 @@ TEST_CASE_METHOD(
                                auto mr) {
     ++calls;
     scenario source;
-    auto result                                 = source.decode(s, mr);
-    result.lineage.domain                       = split.input_domain;
-    result.batch.execution->contract            = inputs.mapping.program->contract;
-    result.batch.execution->layout              = inputs.mapping.program->input_layout;
-    result.batch.execution->visibility_complete = true;
-    auto columns                                = result.batch.table.release(s, mr)->release();
-    std::size_t a_slot                          = 0;
-    if (split.plan->data_columns.front().name == "b") {
+    ioctx->metadata_store().clear();  // Retained approvals must survive eviction during decode.
+    auto result                      = source.decode(s, mr);
+    result.lineage.domain            = split.input_domain;
+    result.batch.execution->contract = inputs.mapping.program->contract;
+    result.batch.execution->layout   = inputs.mapping.program->input_layout;
+    result.batch.execution->visibility_complete =
+      false;  // No file deletes: shared entry completes it.
+    result.batch.execution->logical_schema_complete = !mapped;
+    if (repeated) {
+      REQUIRE(split.input_domain->files.size() == 1);
+      REQUIRE(split.input_domain->file_runs.size() == 2);
+      auto payload = result.batch.table.release(s, mr);
+      auto twice =
+        cudf::concatenate(std::vector<cudf::table_view>{payload->view(), payload->view()}, s, mr);
+      s.sync();
+      result.batch.table = owning_table_view{std::move(twice)};
+      result.lineage.per_row =
+        upload<int64_t>({1, 2, 3, 4, 6, 7, 8, 9}, cudf::type_id::INT64, s, mr);
+    }
+    if (!positions) {
+      result.lineage                    = {};
+      result.batch.execution->positions = row_position_state::none;
+    }
+    auto columns       = result.batch.table.release(s, mr)->release();
+    std::size_t a_slot = 0;
+    if (split.plan->data_columns.front().name == "b" ||
+        split.plan->data_columns.front().name == "pb") {
       std::swap(columns[0], columns[1]);
       a_slot = 1;
     }
@@ -425,19 +597,661 @@ TEST_CASE_METHOD(
   auto batch = core.materialize_metadata_to_table(*splits.front(), *space, stream, false, nullptr);
   auto output =
     core.post_filter_and_project(std::move(batch), *space, stream, false, nullptr, nullptr, {});
-  REQUIRE(output->num_rows() == 2);
+  REQUIRE(output->num_rows() == (repeated ? 4 : 2));
   REQUIRE(output->num_columns() == (hive ? 2 : 1));
-  std::vector<int32_t> values(2);
+  std::vector<int32_t> values(output->num_rows());
   REQUIRE(cudaMemcpyAsync(values.data(),
                           output->view().column(0).data<int32_t>(),
-                          2 * sizeof(int32_t),
+                          values.size() * sizeof(int32_t),
                           cudaMemcpyDeviceToHost,
                           stream.value()) == cudaSuccess);
   stream.synchronize();
-  CHECK(values == std::vector<int32_t>{200, 300});
+  CHECK(values ==
+        (repeated ? std::vector<int32_t>{200, 300, 200, 300} : std::vector<int32_t>{200, 300}));
   CHECK(calls == 1);
-  auto& physical = dynamic_cast<parquet_split_info&>(*splits.front());
+  CHECK(ioctx->counts->calls.load() == prepared_reads);
+  if (mapped && positions && !hive) {
+    sirius::test::tracked_scan_resource tracked(space->get_default_allocator(), stream);
+    cucascade::memory::memory_space counted(cucascade::memory::gpu_memory_space_config{
+      .device_id       = space->get_device_id(),
+      .memory_capacity = space->get_max_memory(),
+      .mr_factory_fn   = [&](int, std::size_t) {
+        return cuda::mr::any_resource<cuda::mr::device_accessible>{tracked};
+      }});
+    auto run = [&] {
+      auto decoded =
+        core.materialize_metadata_to_table(*splits.front(), counted, stream, false, nullptr);
+      return core.post_filter_and_project(
+        std::move(decoded), counted, stream, false, nullptr, nullptr, {});
+    };
+    {
+      auto checked = run();
+      CHECK(checked->num_rows() == 2);
+    }
+    stream.synchronize();
+    auto attempts = tracked.state->attempts;
+    REQUIRE(attempts > 0);
+    for (std::size_t fail = 0; fail < attempts; ++fail) {
+      CAPTURE(fail, attempts);
+      tracked.state->attempts = 0;
+      tracked.state->fail_at  = fail;
+      REQUIRE_THROWS(run());
+      stream.synchronize();
+      CHECK(tracked.state->live == 0);
+      CHECK_FALSE(tracked.state->wrong_stream);
+    }
+  }
+  auto const completed_calls = calls;
+  auto& physical             = dynamic_cast<parquet_split_info&>(*splits.front());
+  if (mapped) {
+    auto original = physical.rg_slices.front().file_metadata;
+    physical.rg_slices.front().file_metadata =
+      std::make_shared<cudf::io::parquet::FileMetaData const>(*original);
+    REQUIRE_THROWS(core.materialize_metadata_to_table(physical, *space, stream, false, nullptr));
+    CHECK(calls == completed_calls);
+    CHECK(ioctx->counts->calls.load() == prepared_reads);
+    physical.rg_slices.front().file_metadata = original;
+  }
   physical.set_contract_payload(physical.contract_id(), {}, {});
   REQUIRE_THROWS(core.materialize_metadata_to_table(physical, *space, stream, false, nullptr));
-  CHECK(calls == 1);
+  CHECK(calls == completed_calls);
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "Shared decoder completes visibility and predicate states independently",
+                 "[scan][shared_materializer][integration]")
+{
+  auto context = sirius::test::get_registered_sirius_context(*con);
+  auto* space  = context->get_memory_manager().get_memory_space(
+    cucascade::memory::Tier::GPU, rmm::get_current_cuda_device().value());
+  REQUIRE(space);
+  rmm::cuda_stream stream;
+  auto mr = rmm::device_async_resource_ref(space->get_default_allocator());
+  scenario test;
+  sirius::util::env_guard opt("SIRIUS_ENABLE_TEST_OPTIONS", "1");
+  recorder observed;
+  scoped_step_observer scope(observed);
+  std::vector<int32_t> expected{300};
+  int mode = 0;
+  SECTION("no visibility consumer and no lineage")
+  {
+    mode     = 1;
+    expected = {200, 300};
+    test.inputs.visibility.clear();
+    test.program->required_visibility.reset();
+  }
+  SECTION("zero rows need no lineage")
+  {
+    mode = 2;
+    expected.clear();
+  }
+  SECTION("all rows deleted")
+  {
+    expected.clear();
+    auto all = std::make_shared<iceberg_delete_set const>(
+      "A",
+      std::make_shared<std::vector<int64_t> const>(std::initializer_list<int64_t>{1, 2, 3, 4}));
+    test.inputs.visibility = {{{"A", all}, all}};
+    test.program->required_visibility =
+      std::make_shared<visibility_bindings const>(visibility_bindings{{"A", all}});
+  }
+  SECTION("answered condition is evaluated from BOOL8")
+  {
+    mode                    = 3;
+    test.program->catalogue = catalogue(true);
+  }
+  SECTION("an enforced answer must not be evaluated twice")
+  {
+    mode                    = 4;
+    test.program->catalogue = catalogue(true);
+  }
+  SECTION("pruning is not static enforcement")
+  {
+    mode = 5;
+    expected.clear();
+  }
+  SECTION("requested coverage is not static enforcement")
+  {
+    mode = 6;
+    expected.clear();
+    test.inputs.coverage = {test.program->catalogue, {0, 1}, true};
+  }
+  if (mode == 3 || mode == 4) {
+    auto plan           = std::make_shared<scan_plan>(*test.split.plan);
+    plan->output_layout = {{scan_plan::output_entry::DATA, 0}};
+    test.split.plan     = plan;
+    test.inputs.mapping.evidence =
+      std::make_shared<mapping_certification const>(*test.program, plan, test.split.input_domain);
+  }
+  auto result = materialize_shared(
+    test.split,
+    test.inputs,
+    [&](auto const&, auto const&, auto const&, auto s, auto resource) {
+      auto decoded = test.decode(s, resource);
+      if (mode == 1 || mode == 2) {
+        decoded.lineage                    = {};
+        decoded.batch.execution->positions = row_position_state::none;
+      }
+      if (mode == 2) {
+        std::vector<std::unique_ptr<cudf::column>> columns;
+        for (int i = 0; i < 2; ++i)
+          columns.push_back(cudf::make_empty_column(cudf::type_id::INT32));
+        decoded.batch.table = owning_table_view{std::make_unique<cudf::table>(std::move(columns))};
+      }
+      if (mode == 3 || mode == 4) {
+        auto columns = decoded.batch.table.release(s, resource)->release();
+        cudf::numeric_scalar<int32_t> cutoff(100, true, s, resource);
+        auto answer = cudf::binary_operation(columns[1]->view(),
+                                             cutoff,
+                                             cudf::binary_operator::GREATER,
+                                             cudf::data_type{cudf::type_id::BOOL8},
+                                             s,
+                                             resource);
+        if (mode == 4) {
+          std::vector<cudf::column_view> views{
+            columns[0]->view(), answer->view(), decoded.lineage.per_row->view()};
+          auto selected =
+            sirius::apply_retention_mask(cudf::table_view{views}, answer->view(), s, resource);
+          s.sync();
+          columns                 = selected->release();
+          decoded.lineage.per_row = std::move(columns.back());
+          columns.pop_back();
+          // Completed BOOL8 answers are kept for layout validation but are never re-applied.
+          columns[1] = upload<int8_t>({0, 0}, cudf::type_id::BOOL8, s, resource);
+        } else
+          columns[1] = std::move(answer);
+        decoded.batch.table = owning_table_view{std::make_unique<cudf::table>(std::move(columns))};
+        decoded.batch.execution->predicates.push_back(
+          {1,
+           mode == 3 ? sirius::op::predicate_stage::answer : sirius::op::predicate_stage::enforced,
+           1});
+      }
+      if (mode == 5)
+        decoded.batch.execution->predicates[0].stage = sirius::op::predicate_stage::pruning_only;
+      if (mode == 6) decoded.batch.execution->predicates.clear();
+      return decoded;
+    },
+    *space,
+    stream,
+    mr);
+  if (mode == 3 || mode == 4) expected = {0};
+  CHECK(download<int32_t>(result.batch.table.view().column(0), stream) == expected);
+  CHECK(result.batch.execution->visibility_complete);
+  CHECK(result.batch.execution->whole_static_complete);
+  CHECK(result.batch.execution->projection_complete);
+  CHECK(observed.assemblies == 1);
+  if (mode == 4)
+    CHECK(observed.terms.empty());
+  else if (mode != 5 && mode != 6)
+    CHECK(observed.terms == std::vector<std::size_t>{1});
+  else
+    CHECK(observed.terms == std::vector<std::size_t>{0, 1});
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "Shared visibility skips an applied file and deletes remaining file rows",
+                 "[scan][shared_materializer][integration]")
+{
+  auto context = sirius::test::get_registered_sirius_context(*con);
+  auto* space  = context->get_memory_manager().get_memory_space(
+    cucascade::memory::Tier::GPU, rmm::get_current_cuda_device().value());
+  REQUIRE(space);
+  rmm::cuda_stream stream;
+  auto mr = rmm::device_async_resource_ref(space->get_default_allocator());
+  scenario test;
+  auto domain = std::make_shared<lineage_domain>(*test.split.input_domain);
+  domain->files.push_back({"B", 2});
+  domain->file_runs.push_back({1, 0, 2});
+  test.split.input_domain = domain;
+  auto second             = std::make_shared<iceberg_delete_set const>(
+    "B", std::make_shared<std::vector<int64_t> const>(std::initializer_list<int64_t>{0}));
+  test.inputs.visibility.push_back({{"B", second}, second});
+  auto required = *test.program->required_visibility;
+  required.push_back({"B", second});
+  test.program->required_visibility = std::make_shared<visibility_bindings const>(required);
+  sirius::util::env_guard opt("SIRIUS_ENABLE_TEST_OPTIONS", "1");
+  recorder observed;
+  scoped_step_observer scope(observed);
+  auto result = materialize_shared(
+    test.split,
+    test.inputs,
+    [&](auto const&, auto const&, auto const&, auto s, auto resource) {
+      auto decoded = test.decode(s, resource);
+      std::vector<std::unique_ptr<cudf::column>> columns;
+      columns.push_back(upload<int32_t>({0, 0, 0, 0, 0, 0}, cudf::type_id::INT32, s, resource));
+      columns.push_back(
+        upload<int32_t>({5, 200, 300, 50, 500, 600}, cudf::type_id::INT32, s, resource));
+      decoded.batch.table = owning_table_view{std::make_unique<cudf::table>(std::move(columns))};
+      decoded.lineage.per_row =
+        upload<int64_t>({1, 2, 3, 4, 5, 6}, cudf::type_id::INT64, s, resource);
+      apply_lineage_visibility(
+        decoded.batch.table,
+        decoded.lineage,
+        [&](auto const& file) -> std::span<int64_t const> {
+          return file == "A" ? test.inputs.visibility[0].owner->positions
+                             : std::span<int64_t const>{};
+        },
+        s,
+        resource);
+      decoded.batch.execution->visibility_applied = {required[0]};
+      return decoded;
+    },
+    *space,
+    stream,
+    mr);
+  CHECK(download<int32_t>(result.batch.table.view().column(0), stream) ==
+        std::vector<int32_t>{300, 600});
+  CHECK(result.lineage.ordinals_on(stream) == std::vector<int64_t>{3, 6});
+  CHECK(observed.files == std::vector<std::string>{"B"});
+  CHECK(observed.terms == std::vector<std::size_t>{1});
+  CHECK(result.batch.execution->visibility_applied.size() == 2);
+}
+
+TEST_CASE("Scan observers preserve nested scopes and wait for in-flight callbacks",
+          "[scan][shared_observer]")
+{
+  sirius::util::env_guard opt("SIRIUS_ENABLE_TEST_OPTIONS", "1");
+  auto owner = std::make_shared<int const>(1);
+  visibility_bindings required{{"A", owner}};
+  auto apply = [&](uint64_t attempt, uint64_t input) {
+    visibility_bindings applied;
+    bool complete = false;
+    apply_materialization_visibility(required, applied, complete, [](auto) {}, 77, attempt, input);
+    REQUIRE(complete);
+    REQUIRE(applied.size() == 1);
+  };
+  SECTION("non-LIFO removal does not restore a dead scope")
+  {
+    recorder first, second;
+    auto a = std::make_unique<scoped_step_observer>(first);
+    apply(1, 11);
+    auto b = std::make_unique<scoped_step_observer>(second);
+    apply(2, 12);
+    a.reset();
+    apply(3, 13);
+    b.reset();
+    apply(4, 14);
+    CHECK(first.files.size() == 1);
+    CHECK(second.files.size() == 2);
+    CHECK(second.identities[0].attempt == 2);
+    CHECK(second.identities[1].logical_input == 13);
+  }
+  SECTION("removal waits for a callback on another thread")
+  {
+    struct blocking : step_observer {
+      std::promise<void> entered;
+      std::shared_future<void> release;
+      explicit blocking(std::shared_future<void> release) : release(std::move(release)) {}
+      void on_visibility(step_identity const&, applied_visibility const&) override
+      {
+        entered.set_value();
+        release.wait();
+      }
+    };
+    std::promise<void> release;
+    blocking observer(release.get_future().share());
+    auto scope   = std::make_unique<scoped_step_observer>(observer);
+    auto entered = observer.entered.get_future();
+    std::atomic<bool> worker_ok{false};
+    std::thread worker([&] {
+      visibility_bindings applied;
+      bool complete = false;
+      apply_materialization_visibility(required, applied, complete, [](auto) {}, 77, 1, 1);
+      worker_ok = complete && applied.size() == 1;
+    });
+    entered.wait();
+    auto removal = std::async(std::launch::async, [&] { scope.reset(); });
+    CHECK(removal.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout);
+    release.set_value();
+    worker.join();
+    removal.get();
+    CHECK(worker_ok.load());
+  }
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "Shared materialization retires every failing allocation on its task stream",
+                 "[scan][shared_materializer][integration]")
+{
+  auto context = sirius::test::get_registered_sirius_context(*con);
+  auto* space  = context->get_memory_manager().get_memory_space(
+    cucascade::memory::Tier::GPU, rmm::get_current_cuda_device().value());
+  REQUIRE(space);
+  rmm::cuda_stream stream;
+  sirius::test::tracked_scan_resource resource(space->get_default_allocator(), stream);
+  rmm::device_async_resource_ref mr{resource};
+  scenario test;
+  auto plan           = std::make_shared<scan_plan>(*test.split.plan);
+  bool const virtuals = GENERATE(false, true);
+  if (virtuals) {
+    plan->virtual_columns.push_back({999,
+                                     "row",
+                                     sirius::logical_type::make(sirius::type_id::BIGINT),
+                                     scan_plan::parquet_virtual_column_kind::FILE_ROW_NUMBER,
+                                     2});
+    test.program->input_types->push_back(cudf::data_type{cudf::type_id::INT64});
+  }
+  plan->output_layout = {{scan_plan::output_entry::DATA, 1}, {scan_plan::output_entry::DATA, 1}};
+  test.split.plan     = plan;
+  test.program->output_types.push_back(cudf::data_type{cudf::type_id::INT32});
+  test.inputs.mapping.evidence =
+    std::make_shared<mapping_certification const>(*test.program, plan, test.split.input_domain);
+  auto run = [&] {
+    return materialize_shared(
+      test.split,
+      test.inputs,
+      [&](auto const&, auto const&, auto const&, auto s, auto memory) {
+        auto decoded                                     = test.decode(s, memory);
+        decoded.batch.execution->logical_schema_complete = !virtuals;
+        return decoded;
+      },
+      *space,
+      stream,
+      mr);
+  };
+  {
+    auto result = run();
+    CHECK(result.batch.table.num_rows() == 1);
+  }
+  stream.synchronize();
+  auto const attempts = resource.state->attempts;
+  REQUIRE(attempts > 0);
+  CHECK(resource.state->live == 0);
+  CHECK_FALSE(resource.state->wrong_stream);
+  // Includes decoder buffers in addition to the shared workspace estimate.
+  CHECK(resource.state->peak <=
+        shared_materialization_workspace_bytes(5, 5 * (virtuals ? 16 : 8), 1, 1) +
+          5 * 2 * sizeof(int32_t));
+  for (std::size_t fail = 0; fail < attempts; ++fail) {
+    CAPTURE(fail, attempts);
+    resource.state->attempts = 0;
+    resource.state->fail_at  = fail;
+    REQUIRE_THROWS(run());
+    stream.synchronize();
+    CHECK(resource.state->live == 0);
+    CHECK_FALSE(resource.state->wrong_stream);
+  }
+  resource.state->attempts = 0;
+  resource.state->fail_at  = std::numeric_limits<std::size_t>::max();
+  {
+    sirius::op::scan::detail::read_retirement_test_hooks hooks(
+      sirius::op::scan::detail::read_checkpoint::BATCH, true);
+    REQUIRE_THROWS_AS(run(), sirius::unjoined_gpu_work);
+    CHECK(hooks.retained.has_value());
+    CHECK(resource.state->live > 0);
+    stream.synchronize();
+  }
+  CHECK(resource.state->live == 0);
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "Shared decoder synthesizes virtual predicate inputs before evaluation",
+                 "[scan][shared_materializer][integration]")
+{
+  auto context = sirius::test::get_registered_sirius_context(*con);
+  auto* space  = context->get_memory_manager().get_memory_space(
+    cucascade::memory::Tier::GPU, rmm::get_current_cuda_device().value());
+  REQUIRE(space);
+  rmm::cuda_stream stream;
+  auto mr = rmm::device_async_resource_ref(space->get_default_allocator());
+  scenario test;
+  auto plan = std::make_shared<scan_plan>(*test.split.plan);
+  plan->virtual_columns.push_back({999,
+                                   "row",
+                                   sirius::logical_type::make(sirius::type_id::BIGINT),
+                                   scan_plan::parquet_virtual_column_kind::FILE_ROW_NUMBER,
+                                   2});
+  plan->output_layout = {{scan_plan::output_entry::DATA, 2}, {scan_plan::output_entry::DATA, 1}};
+  test.split.plan     = plan;
+  test.program->input_types->push_back(cudf::data_type{cudf::type_id::INT64});
+  test.program->output_types = {cudf::data_type{cudf::type_id::INT64},
+                                cudf::data_type{cudf::type_id::INT32}};
+  std::vector<sirius::op::table_filter_conjunct> terms;
+  for (std::size_t id = 0; id < 3; ++id) {
+    auto const slot = id == 1 ? 2 : id == 2 ? 1 : 0;
+    auto const type = id == 1 ? duckdb::LogicalType::BIGINT : duckdb::LogicalType::INTEGER;
+    auto value      = id == 1 ? duckdb::Value::BIGINT(2) : duckdb::Value::INTEGER(100);
+    terms.push_back({id,
+                     static_cast<std::size_t>(slot),
+                     duckdb::BoundComparisonExpression::Create(
+                       duckdb::ExpressionType::COMPARE_GREATERTHAN,
+                       duckdb::make_uniq<duckdb::BoundReferenceExpression>(type, slot),
+                       duckdb::make_uniq<duckdb::BoundConstantExpression>(value))});
+  }
+  test.program->catalogue =
+    std::make_shared<static_predicate_catalogue const>(77, 1, std::move(terms));
+  test.program->predicates = 3;
+  test.inputs.mapping.evidence =
+    std::make_shared<mapping_certification const>(*test.program, plan, test.split.input_domain);
+  test.inputs.expression_policy.strategy =
+    GENERATE(sirius::expression_evaluator_strategy::MATERIALIZE,
+             sirius::expression_evaluator_strategy::AST_INTERPRET,
+             sirius::expression_evaluator_strategy::AST_JIT);
+  test.inputs.expression_policy.regex_jit = false;
+  auto output                             = materialize_shared(
+    test.split,
+    test.inputs,
+    [&](auto const&, auto const&, auto const&, auto s, auto resource) {
+      auto decoded                                     = test.decode(s, resource);
+      decoded.batch.execution->logical_schema_complete = false;
+      return decoded;
+    },
+    *space,
+    stream,
+    mr);
+  REQUIRE(output.batch.table.n_columns() == 2);
+  CHECK(download<int64_t>(output.batch.table.view().column(0), stream) == std::vector<int64_t>{3});
+  CHECK(download<int32_t>(output.batch.table.view().column(1), stream) ==
+        std::vector<int32_t>{300});
+  CHECK(output.lineage.ordinals_on(stream) == std::vector<int64_t>{3});
+  CHECK(output.lineage.resolve(3) == std::pair<std::size_t, int64_t>{0, 3});
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "Independent oracle detects plausible decoder omissions and false coverage",
+                 "[scan][shared_materializer][integration]")
+{
+  auto context = sirius::test::get_registered_sirius_context(*con);
+  auto* space  = context->get_memory_manager().get_memory_space(
+    cucascade::memory::Tier::GPU, rmm::get_current_cuda_device().value());
+  REQUIRE(space);
+  rmm::cuda_stream stream;
+  auto mr = rmm::device_async_resource_ref(space->get_default_allocator());
+  scenario test;
+  bool const omission = GENERATE(false, true);
+  // CPU oracle starts from the original input, independently of reported coverage.
+  std::vector<int32_t> oracle;
+  std::vector<int32_t> a{1, 101, 102, 103, 104}, b{1000, 5, 200, 300, 50};
+  for (std::size_t row = 0; row < a.size(); ++row)
+    if (a[row] > 100 && b[row] > 100 && row != 2) oracle.push_back(b[row]);
+  auto output = materialize_shared(
+    test.split,
+    test.inputs,
+    [&](auto const&, auto const&, auto const&, auto s, auto resource) {
+      auto decoded = test.decode(s, resource);
+      if (omission) {
+        // A structurally valid subset silently omits the only valid final row.
+        auto kept     = upload<int64_t>({0, 1, 3}, cudf::type_id::INT64, s, resource);
+        auto selected = cudf::gather(decoded.batch.table.view(),
+                                     kept->view(),
+                                     cudf::out_of_bounds_policy::DONT_CHECK,
+                                     s,
+                                     resource);
+        auto lineage  = decoded.lineage.select(kept->view(), s, resource);
+        s.sync();
+        decoded.batch.table = owning_table_view{std::move(selected)};
+        decoded.lineage     = std::move(lineage);
+      } else {
+        decoded.batch.execution->whole_static_complete = true;
+      }
+      return decoded;
+    },
+    *space,
+    stream,
+    mr);
+  CHECK(download<int32_t>(output.batch.table.view().column(0), stream) != oracle);
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "Shared LIKE cache and observer identities survive separate attempts",
+                 "[scan][shared_materializer][integration]")
+{
+  auto context = sirius::test::get_registered_sirius_context(*con);
+  auto* space  = context->get_memory_manager().get_memory_space(
+    cucascade::memory::Tier::GPU, rmm::get_current_cuda_device().value());
+  REQUIRE(space);
+  rmm::cuda_stream stream;
+  auto mr = rmm::device_async_resource_ref(space->get_default_allocator());
+  scenario test;
+  auto domain               = std::make_shared<lineage_domain>(*test.split.input_domain);
+  domain->files[0].identity = "AA";
+  test.split.input_domain   = domain;
+  auto deleted              = std::make_shared<iceberg_delete_set const>(
+    "AA", std::make_shared<std::vector<int64_t> const>(std::initializer_list<int64_t>{2}));
+  test.inputs.visibility = {{{"AA", deleted}, deleted}};
+  test.program->required_visibility =
+    std::make_shared<visibility_bindings const>(visibility_bindings{{"AA", deleted}});
+  auto plan = std::make_shared<scan_plan>(*test.split.plan);
+  plan->virtual_columns.push_back({999,
+                                   "filename",
+                                   sirius::logical_type::make(sirius::type_id::VARCHAR),
+                                   scan_plan::parquet_virtual_column_kind::FILENAME,
+                                   2});
+  test.split.plan = plan;
+  test.program->input_types->push_back(cudf::data_type{cudf::type_id::STRING});
+  std::vector<sirius::op::table_filter_conjunct> terms;
+  for (std::size_t id = 0; id < 2; ++id)
+    terms.push_back(
+      {id,
+       id,
+       duckdb::BoundComparisonExpression::Create(
+         duckdb::ExpressionType::COMPARE_GREATERTHAN,
+         duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, id),
+         duckdb::make_uniq<duckdb::BoundConstantExpression>(duckdb::Value::INTEGER(100)))});
+  auto like = duckdb::make_uniq<duckdb::BoundFunctionExpression>(
+    duckdb::BoundScalarFunction(
+      duckdb::ScalarFunction("~~",
+                             {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR},
+                             duckdb::LogicalType::BOOLEAN,
+                             nullptr)),
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{},
+    nullptr);
+  like->GetChildrenMutable().push_back(
+    duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::VARCHAR, 2));
+  like->GetChildrenMutable().push_back(
+    duckdb::make_uniq<duckdb::BoundConstantExpression>(duckdb::Value("%A%A%")));
+  terms.push_back({2, 2, std::move(like)});
+  test.program->catalogue =
+    std::make_shared<static_predicate_catalogue const>(77, 1, std::move(terms));
+  test.program->predicates = 3;
+  test.inputs.mapping.evidence =
+    std::make_shared<mapping_certification const>(*test.program, plan, domain);
+  auto cache                     = std::make_shared<sirius::like_multiliteral_cache>();
+  test.inputs.like_swar_fastpath = true;
+  test.inputs.like_cache         = cache;
+  test.inputs.expression_policy  = {sirius::expression_evaluator_strategy::AST_JIT, false};
+  sirius::util::env_guard opt("SIRIUS_ENABLE_TEST_OPTIONS", "1");
+  recorder observed;
+  scoped_step_observer scope(observed);
+  for (uint64_t attempt : {3, 4}) {
+    test.split.attempt       = attempt;
+    test.split.logical_input = 26 + attempt;
+    auto output              = materialize_shared(
+      test.split,
+      test.inputs,
+      [&](auto const&, auto const&, auto const&, auto s, auto resource) {
+        auto decoded                                     = test.decode(s, resource);
+        decoded.batch.execution->logical_schema_complete = false;
+        return decoded;
+      },
+      *space,
+      stream,
+      mr);
+    CHECK(download<int32_t>(output.batch.table.view().column(0), stream) ==
+          std::vector<int32_t>{300});
+  }
+  CHECK(cache->classification_count_for_testing() == 1);
+  CHECK(observed.files == std::vector<std::string>{"AA", "AA"});
+  CHECK(observed.terms == std::vector<std::size_t>{1, 2, 1, 2});
+  REQUIRE(observed.identities.size() == 8);
+  for (std::size_t i = 0; i < observed.identities.size(); ++i) {
+    CHECK(observed.identities[i].contract == 77);
+    CHECK(observed.identities[i].attempt == (i < 4 ? 3 : 4));
+    CHECK(observed.identities[i].logical_input == (i < 4 ? 29 : 30));
+  }
+}
+
+TEST_CASE_METHOD(
+  sirius::test::GpuExecutionFixture,
+  "Shared legacy completion binds the delivered output and preserves visibility gates",
+  "[scan][shared_materializer][integration]")
+{
+  auto context = sirius::test::get_registered_sirius_context(*con);
+  auto* space  = context->get_memory_manager().get_memory_space(
+    cucascade::memory::Tier::GPU, rmm::get_current_cuda_device().value());
+  REQUIRE(space);
+  rmm::cuda_stream stream;
+  auto mr = rmm::device_async_resource_ref(space->get_default_allocator());
+  scenario test;
+  test.inputs.validation         = validation_policy::legacy_iceberg;
+  test.inputs.diagnostic_context = "legacy-file";
+  test.split.input_domain.reset();
+  bool const nonempty  = GENERATE(false, true);
+  bool const assembled = GENERATE(false, true);
+  bool const deferred  = GENERATE(false, true);
+  if (!nonempty) {
+    auto empty             = std::make_shared<iceberg_delete_set const>("A");
+    test.inputs.visibility = {{{"A", empty}, empty}};
+    test.program->required_visibility =
+      std::make_shared<visibility_bindings const>(visibility_bindings{{"A", empty}});
+  }
+  if (deferred) test.inputs.phase = materialization_phase::decoded;
+  sirius::util::env_guard opt("SIRIUS_ENABLE_TEST_OPTIONS", "1");
+  recorder observed;
+  scoped_step_observer scope(observed);
+  auto run = [&] {
+    return materialize_shared(
+      test.split,
+      test.inputs,
+      [&](auto const&, auto const&, auto const&, auto s, auto resource) {
+        // The legacy producer already enforced both predicates. Changed values
+        // would remove all rows if the shared consumer re-evaluated them.
+        std::vector<std::unique_ptr<cudf::column>> columns;
+        if (!assembled)
+          columns.push_back(upload<int32_t>({0, 0}, cudf::type_id::INT32, s, resource));
+        columns.push_back(upload<int32_t>({200, 300}, cudf::type_id::INT32, s, resource));
+        decode_result result;
+        result.batch.table = owning_table_view{std::make_unique<cudf::table>(std::move(columns))};
+        result.batch.state =
+          assembled ? filter_state::ROW_FILTERED_AND_PROJECTED : filter_state::ROW_FILTERED;
+        return result;
+      },
+      *space,
+      stream,
+      mr);
+  };
+  if (nonempty && !deferred) {
+    REQUIRE_THROWS_AS(run(), sirius::internal_exception);
+    REQUIRE_THROWS_WITH(
+      run(),
+      Catch::Matchers::ContainsSubstring(
+        "decode returned a filtered table, so row positions no longer identify file rows"));
+    CHECK(observed.files.empty());
+    CHECK(observed.terms.empty());
+    CHECK(observed.assemblies == 0);
+  } else {
+    auto result = run();
+    REQUIRE(result.batch.execution);
+    CHECK(result.batch.execution->projection_complete == (assembled || !deferred));
+    CHECK(result.batch.execution->layout ==
+          (assembled || !deferred ? test.program->output_layout : test.program->input_layout));
+    CHECK(result.batch.execution->visibility_complete == !deferred);
+    CHECK(observed.terms.empty());
+    CHECK(observed.assemblies == (!assembled && !deferred ? 1 : 0));
+    if (!deferred) {
+      CHECK(download<int32_t>(result.batch.table.view().column(0), stream) ==
+            std::vector<int32_t>{200, 300});
+      CHECK(result.lineage.state == row_position_state::none);
+    }
+  }
 }

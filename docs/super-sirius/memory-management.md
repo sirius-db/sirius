@@ -95,7 +95,6 @@ also budget their decoder, mapping and requested virtual-column outputs. Neither
 estimate changes the additive preparation ledger or timed batch-fill measure,
 and default Parquet/Iceberg scans do not reserve canonical-lineage scratch.
 
-
 Metadata-only scans reserve synthesized columns and temporary buffers, but no compressed data or data prefetch. Typed empty virtual columns allocate no scalar buffers. The coalescer and execution task use the same read mode for their estimates.
 
 ## Memory Reservations

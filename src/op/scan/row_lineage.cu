@@ -7,6 +7,7 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/cudf_utils.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/unary.hpp>
@@ -227,11 +228,12 @@ void row_lineage::validate_on(int64_t rows,
 std::size_t lineage_conversion_workspace_bytes(std::size_t rows, std::size_t intervals)
 {
   auto const max = std::numeric_limits<std::size_t>::max();
-  // Validation owns a sorted copy and sort scratch; conversion reuses UINT64 storage.
-  if (rows > (max - sizeof(int)) / 32 ||
-      intervals > (max - rows * 32 - sizeof(int)) / sizeof(physical_run))
+  // Validation owns a sorted copy and sort scratch, including the pinned
+  // Thrust implementation's fixed small-sort bookkeeping. Row storage is reused.
+  constexpr std::size_t fixed = 256 + 2 * sizeof(int);
+  if (rows > (max - fixed) / 32 || intervals > (max - rows * 32 - fixed) / sizeof(physical_run))
     return max;
-  return rows * 32 + intervals * sizeof(physical_run) + sizeof(int);
+  return rows * 32 + intervals * sizeof(physical_run) + fixed;
 }
 
 row_lineage consume_reader_positions(std::unique_ptr<gpu_row_positions> positions,
@@ -255,14 +257,19 @@ row_lineage consume_reader_positions(std::unique_ptr<gpu_row_positions> position
     std::unique_ptr<rmm::device_scalar<int>> invalid;
     row_lineage result;
   };
-  auto state     = std::make_unique<conversion_state>();
-  state->input   = std::move(positions);
-  auto domain    = std::make_shared<lineage_domain>();
+  auto state   = std::make_unique<conversion_state>();
+  state->input = std::move(positions);
+  auto domain  = std::make_shared<lineage_domain>();
+  std::unordered_map<std::string, std::size_t> files;
   int64_t offset = 0;
   for (std::size_t i = 0; i < state->input->sources.size(); ++i) {
     auto const& source = state->input->sources[i];
     if (source.file_rows > INT64_MAX) throw std::invalid_argument("reader file length overflow");
-    domain->files.push_back({source.file, static_cast<int64_t>(source.file_rows)});
+    auto [file, inserted] = files.emplace(source.file, domain->files.size());
+    if (inserted)
+      domain->files.push_back({source.file, static_cast<int64_t>(source.file_rows)});
+    else if (domain->files[file->second].rows != static_cast<int64_t>(source.file_rows))
+      throw std::invalid_argument("reader sources disagree on file length");
     uint64_t prior = 0;
     for (auto [first, end] : source.ranges) {
       if (first < prior || end < first || end > source.file_rows ||
@@ -271,7 +278,7 @@ row_lineage consume_reader_positions(std::unique_ptr<gpu_row_positions> position
       prior = end;
       if (first == end) continue;
       domain->file_runs.push_back(
-        {i, static_cast<int64_t>(first), static_cast<int64_t>(end - first)});
+        {file->second, static_cast<int64_t>(first), static_cast<int64_t>(end - first)});
       state->host.push_back({offset,
                              static_cast<int64_t>(i),
                              static_cast<int64_t>(first),
@@ -300,7 +307,7 @@ row_lineage consume_reader_positions(std::unique_ptr<gpu_row_positions> position
         rows,
         state->device->data(),
         state->device->size(),
-        domain->files.size(),
+        state->input->sources.size(),
         state->invalid->data());
       CUDF_CUDA_TRY(cudaGetLastError());
       if (state->invalid->value(stream))
@@ -665,11 +672,12 @@ void append_lineage_virtual_columns(owning_table_view& table,
       std::unique_ptr<cudf::column> dictionary;
       if (col.kind == kind::FILE_INDEX) {
         std::vector<uint64_t> indices(file_indices.begin(), file_indices.end());
-        dictionary = std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::UINT64},
-                                                    indices.size(),
-                                                    upload(indices),
-                                                    rmm::device_buffer{},
-                                                    0);
+        dictionary = std::make_unique<cudf::column>(
+          cudf::data_type{cudf::type_id::UINT64},
+          indices.size(),
+          upload(indices),
+          cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr),
+          0);
       } else {
         std::string chars;
         std::vector<int64_t> offsets{0};
@@ -677,16 +685,18 @@ void append_lineage_virtual_columns(owning_table_view& table,
           chars += file.identity;
           offsets.push_back(chars.size());
         }
-        auto offset_col = std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::INT64},
-                                                         offsets.size(),
-                                                         upload(offsets),
-                                                         rmm::device_buffer{},
-                                                         0);
-        dictionary      = cudf::make_strings_column(lineage.domain->files.size(),
-                                               std::move(offset_col),
-                                               upload(chars),
-                                               0,
-                                               rmm::device_buffer{});
+        auto offset_col = std::make_unique<cudf::column>(
+          cudf::data_type{cudf::type_id::INT64},
+          offsets.size(),
+          upload(offsets),
+          cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr),
+          0);
+        dictionary = cudf::make_strings_column(
+          lineage.domain->files.size(),
+          std::move(offset_col),
+          upload(chars),
+          0,
+          cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr));
       }
       auto output = cudf::gather(cudf::table_view{{dictionary->view()}},
                                  state->files->view(),
