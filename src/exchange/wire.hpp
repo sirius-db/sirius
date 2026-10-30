@@ -18,6 +18,7 @@
 
 #include <cudf/table/table_view.hpp>
 
+#include <rmm/aligned.hpp>
 #include <rmm/cuda_stream_view.hpp>
 
 #include <cucascade/memory/column_metadata.hpp>
@@ -92,7 +93,7 @@ struct stream_piece {
                                                   std::size_t end);
 
 /// Stream buffers are aligned to this, so every copy into and out of a frame is aligned.
-constexpr std::size_t stream_alignment = 256;
+constexpr std::size_t stream_alignment = rmm::CUDA_ALLOCATION_ALIGNMENT;
 
 /**
  * @brief Lays @p table out as a stream: each buffer in walk order, aligned to stream_alignment.

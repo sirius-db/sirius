@@ -18,6 +18,8 @@
 
 #include "exchange/batch_io.hpp"
 #include "exchange/messages.hpp"
+#include "helper/utils.hpp"
+#include "log/logging.hpp"
 #include "sirius/exception.hpp"
 
 #include <rmm/cuda_device.hpp>
@@ -44,7 +46,7 @@ std::uint32_t slot_of(rank_t from, rank_t to) { return from < to ? from : from -
 
 std::uint32_t frames_for(std::uint64_t stream_bytes, std::size_t frame_bytes)
 {
-  return static_cast<std::uint32_t>((stream_bytes + frame_bytes - 1) / frame_bytes);
+  return static_cast<std::uint32_t>(utils::ceil_div<std::uint64_t>(stream_bytes, frame_bytes));
 }
 
 /// cudaEvent_t, created once and reused.
@@ -173,6 +175,9 @@ struct transport::engine {
          options o)
     : fab(f), send_ring(s), recv_ring(r), gpu(g), host(h), cb(std::move(c)), opts(o)
   {
+    if (!cb.on_batch || !cb.on_end || !cb.on_error || !cb.on_abort) {
+      throw sirius::invalid_input_exception("exchange: every transport callback must be set");
+    }
     RMM_CUDA_TRY(cudaGetDevice(&device));
     auto const world = fab.world_size();
     auto const peers = world - 1;
@@ -624,7 +629,10 @@ void transport::run()
       if (peer == e.fab.rank()) { continue; }
       try {
         e.fab.notify(peer, encode(error_message{what}));
+      } catch (std::exception const& ex) {
+        SIRIUS_LOG_WARN("exchange: could not tell rank {} of the failure: {}", peer, ex.what());
       } catch (...) {
+        SIRIUS_LOG_WARN("exchange: could not tell rank {} of the failure", peer);
       }
     }
     // Freed now, not at ~transport: wait_sent() lets their query release its memory once they

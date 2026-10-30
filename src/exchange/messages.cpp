@@ -52,6 +52,11 @@ T take(std::string_view& in)
   return value;
 }
 
+template <typename... F>
+struct overloaded : F... {
+  using F::operator()...;
+};
+
 void require_end(std::string_view in)
 {
   if (!in.empty()) { throw sirius::invalid_input_exception("exchange message: trailing bytes"); }
@@ -62,33 +67,39 @@ void require_end(std::string_view in)
 std::string encode(message const& m)
 {
   std::string out;
-  if (auto const* f = std::get_if<frame_message>(&m)) {
-    put(out, kind::frame);
-    put(out, f->stream);
-    put(out, f->batch);
-    put(out, f->k);
-    put(out, f->recv_frame);
-    put(out, f->bytes);
-    put(out, static_cast<std::uint32_t>(f->header.size()));
-    out.append(reinterpret_cast<char const*>(f->header.data()), f->header.size());
-  } else if (auto const* c = std::get_if<credit_message>(&m)) {
-    put(out, kind::credit);
-    put(out, static_cast<std::uint32_t>(c->frames.size()));
-    for (auto const frame : c->frames) {
-      put(out, frame);
-    }
-  } else if (auto const* e = std::get_if<end_message>(&m)) {
-    put(out, kind::end);
-    put(out, e->stream);
-    put(out, e->batches);
-  } else if (auto const* a = std::get_if<abort_message>(&m)) {
-    put(out, kind::abort);
-    put(out, a->query);
-    out.append(a->what);
-  } else {
-    put(out, kind::error);
-    out.append(std::get<error_message>(m).what);
-  }
+  std::visit(overloaded{[&](frame_message const& f) {
+                          put(out, kind::frame);
+                          put(out, f.stream);
+                          put(out, f.batch);
+                          put(out, f.k);
+                          put(out, f.recv_frame);
+                          put(out, f.bytes);
+                          put(out, static_cast<std::uint32_t>(f.header.size()));
+                          out.append(reinterpret_cast<char const*>(f.header.data()),
+                                     f.header.size());
+                        },
+                        [&](credit_message const& c) {
+                          put(out, kind::credit);
+                          put(out, static_cast<std::uint32_t>(c.frames.size()));
+                          for (auto const frame : c.frames) {
+                            put(out, frame);
+                          }
+                        },
+                        [&](end_message const& e) {
+                          put(out, kind::end);
+                          put(out, e.stream);
+                          put(out, e.batches);
+                        },
+                        [&](abort_message const& a) {
+                          put(out, kind::abort);
+                          put(out, a.query);
+                          out.append(a.what);
+                        },
+                        [&](error_message const& e) {
+                          put(out, kind::error);
+                          out.append(e.what);
+                        }},
+             m);
   return out;
 }
 

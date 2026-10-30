@@ -30,6 +30,7 @@
 #include <cstring>
 #include <limits>
 #include <string_view>
+#include <type_traits>
 
 namespace sirius::exchange {
 namespace {
@@ -230,7 +231,7 @@ std::vector<std::uint8_t> encode_header(batch_header const& header)
 
 batch_header decode_header(std::span<std::uint8_t const> in)
 {
-  require(take<std::array<char, 4>>(in) == magic, "bad magic");
+  require(take<std::remove_const_t<decltype(magic)>>(in) == magic, "bad magic");
   batch_header header;
   header.rows         = take<std::uint64_t>(in);
   header.stream_bytes = take<std::uint64_t>(in);
