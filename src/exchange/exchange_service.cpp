@@ -76,7 +76,7 @@ exchange_service::exchange_service(fabric& fabric,
                               r->on_error(error);
                             }
                           },
-                          [this](std::uint64_t query, rank_t from, std::string what) {
+                          [this](distributed_query_id query, rank_t from, std::string what) {
                             end_query(
                               query,
                               std::make_exception_ptr(sirius::internal_exception(
@@ -98,7 +98,7 @@ std::shared_ptr<inbound> exchange_service::receiver_of(stream_id stream, held ev
   return nullptr;
 }
 
-bool exchange_service::end_query(std::uint64_t query, std::exception_ptr error)
+bool exchange_service::end_query(distributed_query_id query, std::exception_ptr error)
 {
   std::vector<std::shared_ptr<inbound>> receivers;
   {
@@ -115,7 +115,7 @@ bool exchange_service::end_query(std::uint64_t query, std::exception_ptr error)
   return true;
 }
 
-void exchange_service::abort(std::uint64_t query, std::string const& what)
+void exchange_service::abort(distributed_query_id query, std::string const& what)
 {
   auto error = std::make_exception_ptr(
     sirius::internal_exception("exchange: query {} failed on rank {}: {}", query, rank(), what));
@@ -124,7 +124,7 @@ void exchange_service::abort(std::uint64_t query, std::string const& what)
   if (_transport) { _transport->abort(query, what); }
 }
 
-bool exchange_service::wait_sent(std::uint64_t query, std::chrono::milliseconds timeout)
+bool exchange_service::wait_sent(distributed_query_id query, std::chrono::milliseconds timeout)
 {
   {
     std::lock_guard lock{_mutex};
@@ -202,13 +202,13 @@ void exchange_service::detach(stream_id stream)
   if (!retired(query_of(stream))) { _detached.insert(stream); }
 }
 
-bool exchange_service::retired(std::uint64_t query) const
+bool exchange_service::retired(distributed_query_id query) const
 {
   // Queries are numbered from 1; streams of query 0 belong to no query and never retire.
   return query != 0 && (query <= _retired || _retired_above.contains(query));
 }
 
-void exchange_service::forget(std::uint64_t query)
+void exchange_service::forget(distributed_query_id query)
 {
   std::lock_guard lock{_mutex};
   if (retired(query)) { return; }

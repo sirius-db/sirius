@@ -244,7 +244,7 @@ TEST_CASE("two ranks connect through make_nixl_exchange and exchange a batch", "
   other.join();
   if (s0_error) { std::rethrow_exception(s0_error); }
 
-  stream_id const stream = (stream_id{1} << sirius::exchange::query_stream_bits) | 1;
+  stream_id const stream = sirius::exchange::make_stream_id(1, 1);
   std::vector<std::shared_ptr<exchange_service>> services{s0, s1};
   std::vector<received> got(2);
   for (rank_t r = 0; r < 2; ++r) {

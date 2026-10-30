@@ -149,7 +149,7 @@ TEST_CASE("a sender holds a batch of a query until its last frame is staged",
   cluster c(2, 4, 4, loopback_hub::options{}, /*host=*/nullptr);
   auto& sender           = *c.ranks[0].t;
   auto& got              = *c.ranks[1].got;
-  stream_id const stream = (stream_id{5} << sirius::exchange::query_stream_bits) | 1;
+  stream_id const stream = sirius::exchange::make_stream_id(5, 1);
   {
     auto const hold = hold_gpu();
     sender.send(stream, 1, gpu_batch(sample_table(30'000)));
@@ -219,7 +219,7 @@ TEST_CASE("a failed transport frees the batches it held before reporting", "[exc
   // when the first write fails.
   cluster c(2, 4, 4, {.fail_after_writes = 0}, env().host);
   auto& sender           = *c.ranks[0].t;
-  stream_id const stream = (stream_id{5} << sirius::exchange::query_stream_bits) | 1;
+  stream_id const stream = sirius::exchange::make_stream_id(5, 1);
   sender.send(stream, 1, gpu_batch(sample_table(30'000)));
   auto& got = *c.ranks[0].got;
   REQUIRE(got.wait_for([&] { return got.error != nullptr; }));
