@@ -114,8 +114,6 @@ mod ffi {
             new_session_token: &CxxString,
         ) -> SharedPtr<ObjectStoreConfig>;
 
-
-
         /// Publish `cfg` for the scope named by its `uri_prefix`, replacing the snapshot
         /// published for exactly that prefix (the empty prefix is the default scope). Other
         /// scopes are untouched. Fails (leaving the set unchanged) when a required field is
@@ -167,8 +165,8 @@ impl std::fmt::Debug for ffi::ObjectStoreConfigArgs {
 }
 
 pub use ffi::{
-    Context, ObjectStoreConfig, ObjectStoreConfigArgs, SigningMode, Transport, drop_object_store_prefix,
-    make_context,
-    make_context_from_config, make_context_from_config_with_object_store, make_object_store_config,
+    Context, ObjectStoreConfig, ObjectStoreConfigArgs, SigningMode, Transport,
+    drop_object_store_prefix, make_context, make_context_from_config,
+    make_context_from_config_with_object_store, make_object_store_config,
     object_store_config_for_uri,
 };
