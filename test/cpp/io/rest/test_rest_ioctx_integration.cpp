@@ -244,6 +244,7 @@ struct range_fault_policy {
   std::string successful_get_etag;
   std::string successful_head_etag;
   bool truncate_error_body{false};
+  std::string required_if_match;
 };
 
 struct listed_object {
@@ -592,6 +593,13 @@ class range_http_server {
       interim += "\r\n\r\n";
       send_all(fd, interim);
     }
+    if (!_fault.required_if_match.empty() && !is_suffix_range(request) &&
+        request.find("If-Match: " + _fault.required_if_match + "\r\n") == std::string::npos) {
+      send_all(
+        fd, "HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+      return;
+    }
+
     if (auto range = parse_range(request)) {
       auto const [start, end] = *range;
       if (_fault.fail_suffix_with_416 && is_suffix_range(request)) {
@@ -1730,7 +1738,8 @@ TEST_CASE("rest cache fill at the object tail is clipped to EOF", "[s3][integrat
   scan_manager_fixture fixture;
   auto cfg       = make_fake_rest_config(server.endpoint());
   cfg.cache.mode = sirius::io::cache::cache_mode::sirius;
-  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, cfg, *fixture.memory, fixture.topology};
   auto datasource = manager.create_datasource("s3://tail-cache-bucket/object.bin");
   REQUIRE(datasource != nullptr);
 
@@ -1927,13 +1936,19 @@ TEST_CASE("describe_parquet over S3 uses footer probe and preserves schema",
           "[s3][integration][rest][footerbind]")
 {
   auto const parquet = read_binary_file(committed_parquet_fixture("nation.parquet"));
-  range_fault_policy fault;
-  fault.successful_head_etag = "\"nation-generation\"";
-  fault.successful_get_etag  = fault.successful_head_etag;
+  bool has_validator = false;
+  SECTION("ETag permits cross-open footer reuse") { has_validator = true; }
+  SECTION("missing ETag requires a fresh suffix probe") {}
+  range_fault_policy fault{};
+  if (has_validator) {
+    fault.successful_get_etag  = "\"footer-v1\"";
+    fault.successful_head_etag = "\"footer-v1\"";
+  }
   range_http_server server(parquet, fault);
   scan_manager_fixture fixture;
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
   sirius_scan_manager manager{
-    make_fake_rest_config(server.endpoint()), *fixture.memory, fixture.topology};
+    scan_lifecycle, make_fake_rest_config(server.endpoint()), *fixture.memory, fixture.topology};
 
   auto result = manager.describe_parquet("s3://footer-bucket/nation.parquet");
 
@@ -1951,8 +1966,8 @@ TEST_CASE("describe_parquet over S3 uses footer probe and preserves schema",
   CHECK(second.object_size == result.object_size);
   CHECK(second.total_num_rows == result.total_num_rows);
   CHECK(second.names == result.names);
-  CHECK(server.head_count() == 1);
-  CHECK(server.get_count() == 1);
+  CHECK(server.head_count() == (has_validator ? 1 : 0));
+  CHECK(server.get_count() == (has_validator ? 1 : 2));
 }
 
 TEST_CASE("footer suffix probe falls back safely on unusable suffix responses",
@@ -2385,7 +2400,9 @@ TEST_CASE("rest_ioctx reads the SeaweedFS hello fixture through scan_manager cre
 
   auto const bucket = require_env("SIRIUS_TEST_S3_BUCKET");
   scan_manager_fixture fixture;
-  sirius_scan_manager manager{make_s3_rest_config(), *fixture.memory, fixture.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{
+    scan_lifecycle, make_s3_rest_config(), *fixture.memory, fixture.topology};
 
   auto datasource = manager.create_datasource("s3://" + bucket + "/hello.txt");
 
@@ -2416,7 +2433,9 @@ TEST_CASE("rest_ioctx reads exact host ranges and clips EOF on SeaweedFS fixture
   auto const bucket = require_env("SIRIUS_TEST_S3_BUCKET");
   auto const small  = read_binary_file(local_fixture_path("small.bin"));
   scan_manager_fixture fixture;
-  sirius_scan_manager manager{make_s3_rest_config(), *fixture.memory, fixture.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{
+    scan_lifecycle, make_s3_rest_config(), *fixture.memory, fixture.topology};
   auto datasource = manager.create_datasource("s3://" + bucket + "/small.bin");
   require_rest_ioctx(datasource);
 
@@ -2458,7 +2477,8 @@ TEST_CASE("rest_ioctx fans out host_readv_async_io ranges against the SeaweedFS 
   auto cfg                 = make_s3_rest_config();
   cfg.rest.max_connections = 4;
   cfg.rest.merge_max_gap   = 0;  // one GET per range: no bridging across the gaps
-  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, cfg, *fixture.memory, fixture.topology};
   auto datasource = manager.create_datasource("s3://" + bucket + "/medium.bin");
   require_rest_ioctx(datasource);
 
@@ -2573,7 +2593,8 @@ TEST_CASE(
   scan_manager_fixture fixture;
   auto cfg                 = make_s3_rest_config();
   cfg.rest.max_connections = 4;
-  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, cfg, *fixture.memory, fixture.topology};
 
   SECTION("single chunk")
   {
@@ -2618,7 +2639,8 @@ TEST_CASE("rest_ioctx retries transient fake-server failures and reports termina
     range_http_server server(payload, fault);
     auto cfg                    = make_fake_rest_config(server.endpoint());
     cfg.rest.max_retry_attempts = 4;
-    sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+    sirius::exec::query_lifecycle_registry scan_lifecycle;
+    sirius_scan_manager manager{scan_lifecycle, cfg, *fixture.memory, fixture.topology};
 
     auto datasource = manager.create_datasource("s3://retry-bucket/object.bin");
     require_rest_ioctx(datasource);
@@ -2636,7 +2658,8 @@ TEST_CASE("rest_ioctx retries transient fake-server failures and reports termina
     range_http_server server(payload, fault);
     auto cfg                    = make_fake_rest_config(server.endpoint());
     cfg.rest.max_retry_attempts = 2;
-    sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+    sirius::exec::query_lifecycle_registry scan_lifecycle;
+    sirius_scan_manager manager{scan_lifecycle, cfg, *fixture.memory, fixture.topology};
 
     auto datasource = manager.create_datasource("s3://retry-bucket/object.bin");
     require_rest_ioctx(datasource);
@@ -2657,7 +2680,8 @@ TEST_CASE("rest_ioctx honors max_connections under concurrent fake range reads",
   auto cfg                 = make_fake_rest_config(server.endpoint());
   cfg.rest.max_connections = 2;
   cfg.rest.merge_max_gap   = 0;  // keep the 8 segments as 8 separate GETs
-  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, cfg, *fixture.memory, fixture.topology};
 
   auto datasource = manager.create_datasource("s3://concurrency-bucket/object.bin");
   require_rest_ioctx(datasource);
@@ -2701,7 +2725,8 @@ TEST_CASE("rest_ioctx spreads one batched range read across the reactor pool",
   cfg.rest_n_reactors      = 4;
   cfg.rest.max_connections = 1;
   cfg.rest.merge_max_gap   = 0;  // keep the 8 segments as 8 separate GETs
-  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, cfg, *fixture.memory, fixture.topology};
 
   auto datasource = manager.create_datasource("s3://fanout-bucket/object.bin");
   require_rest_ioctx(datasource);
@@ -2742,7 +2767,9 @@ TEST_CASE("rest_ioctx reads through the TLS SeaweedFS endpoint with the harness 
 
   auto const bucket = require_env("SIRIUS_TEST_S3_BUCKET");
   scan_manager_fixture fixture;
-  sirius_scan_manager manager{make_tls_s3_rest_config(), *fixture.memory, fixture.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{
+    scan_lifecycle, make_tls_s3_rest_config(), *fixture.memory, fixture.topology};
   auto datasource = manager.create_datasource("s3://" + bucket + "/hello.txt");
   require_rest_ioctx(datasource);
 
@@ -2766,7 +2793,9 @@ TEST_CASE("rest_ioctx teardown resolves an in-flight async read without hanging"
   auto fixture             = std::make_unique<scan_manager_fixture>();
   auto cfg                 = make_fake_rest_config(server->endpoint());
   cfg.rest.max_connections = 1;
-  auto manager    = std::make_unique<sirius_scan_manager>(cfg, *fixture->memory, fixture->topology);
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  auto manager =
+    std::make_unique<sirius_scan_manager>(scan_lifecycle, cfg, *fixture->memory, fixture->topology);
   auto datasource = manager->create_datasource("s3://lifecycle-bucket/object.bin");
   require_rest_ioctx(datasource);
   auto future = datasource->host_read_async(0, got.size(), got.data());
@@ -2802,4 +2831,62 @@ TEST_CASE("rest_ioctx teardown resolves an in-flight async read without hanging"
     INFO("teardown completed in-flight request with exception: " << e.what());
     SUCCEED("future resolved with an exception during teardown");
   }
+}
+
+TEST_CASE("rest range reads bind to the identity captured by HEAD or footer probe",
+          "[s3][integration][rest][object_identity]")
+{
+  using namespace sirius::io::rest;
+  auto payload           = deterministic_payload(4096);
+  bool const from_footer = GENERATE(false, true);
+  range_fault_policy fault{};
+  fault.successful_head_etag = "\"v1\"";
+  fault.successful_get_etag  = "\"v1\"";
+  fault.required_if_match    = "\"v1\"";
+  bool replaced              = false;
+  SECTION("unchanged object accepts the captured tag") {}
+  SECTION("replacement rejects the captured tag without retry")
+  {
+    fault.required_if_match = "\"v2\"";
+    replaced                = true;
+  }
+  range_http_server server(payload, fault);
+  auto context = std::make_shared<rest_reactor::reactor_context>(
+    direct_rest_test_config(), std::make_shared<fixed_url_authorizer>(server.endpoint()), nullptr);
+  rest_reactor reactor(context, "identity-test");
+  reactor.start();
+  std::shared_ptr<rest_io_object> file;
+  if (from_footer) {
+    auto probe = reactor.fetch_footer_suffix("identity-bucket", "object.bin", 64);
+    REQUIRE(probe.bytes);
+    file = std::make_shared<rest_io_object>("s3://identity-bucket/object.bin",
+                                            "identity-bucket",
+                                            "object.bin",
+                                            probe.object_size,
+                                            probe.window_lo,
+                                            probe.bytes,
+                                            probe.etag);
+  } else {
+    auto head = reactor.head_object("identity-bucket", "object.bin");
+    file      = std::make_shared<rest_io_object>("s3://identity-bucket/object.bin",
+                                            "identity-bucket",
+                                            "object.bin",
+                                            head.object_size,
+                                            head.etag);
+  }
+  CHECK(file->validation_tag() == "\"v1\"");
+  std::vector<std::uint8_t> destination(128);
+  if (replaced) {
+    require_conditional_error<sirius::io::object_changed_error>(
+      [&] { reactor.host_read(*file, 0, destination.size(), destination.data()); },
+      file->object_path(),
+      "\"v1\"",
+      {});
+  } else {
+    REQUIRE(reactor.host_read(*file, 0, destination.size(), destination.data()) ==
+            destination.size());
+    CHECK(std::equal(destination.begin(), destination.end(), payload.begin()));
+  }
+  CHECK(server.head_count() == (from_footer ? 0 : 1));
+  CHECK(server.get_count() == (from_footer ? 2 : 1));
 }

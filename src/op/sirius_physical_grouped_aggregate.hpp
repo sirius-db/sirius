@@ -29,9 +29,13 @@
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/sirius_physical_operator.hpp"
 
+#include <atomic>
+#include <cstdint>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <set>
+#include <vector>
 
 namespace sirius {
 namespace op {
@@ -52,10 +56,11 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
     duckdb::vector<std::unique_ptr<sirius::ast::node>> expressions,
     duckdb::vector<std::unique_ptr<sirius::ast::node>> groups,
     duckdb::vector<duckdb::GroupingSet> grouping_sets,
-    duckdb::vector<duckdb::unsafe_vector<std::size_t>> grouping_functions,
+    duckdb::vector<duckdb::unsafe_vector<duckdb::ProjectionIndex>> grouping_functions,
     std::size_t estimated_cardinality,
     duckdb::TupleDataValidityType group_validity,
-    duckdb::TupleDataValidityType distinct_validity);
+    duckdb::TupleDataValidityType distinct_validity,
+    std::vector<std::optional<std::uint64_t>> aggregate_input_max_abs = {});
 
   duckdb::vector<duckdb::GroupingSet> grouping_sets;
 
@@ -69,9 +74,27 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   std::vector<cudf::aggregation::Kind> cudf_aggregates;
   std::vector<int> cudf_aggregate_idx;
   std::vector<std::vector<int>> cudf_aggregate_struct_col_indices;
+  /// Parallel to cudf_aggregates: the plan-time bound on |unscaled value| of a decimal or wide
+  /// integer SUM input (planner::resolve_sum_input_bounds); nullopt when unproven.
+  std::vector<std::optional<std::uint64_t>> cudf_aggregate_input_max_abs;
+  /// Parallel to cudf_aggregates: true for the SUM of a wide integer SUM or AVG
+  /// (AggregateSlot::is_wide_integer_sum), whose partial result may be DECIMAL128.
+  std::vector<bool> cudf_aggregate_is_wide_integer_sum;
 
-  // AVG decomposition metadata
+  /// Max groups in the previous batch for a widened BIGINT SUM to be summed as two INT64 halves
+  /// instead of over DECIMAL128. From a group-count sweep on an RTX PRO 6000: the halves win up to
+  /// 10K groups (contention on cuDF's 128-bit CAS), tie at 100K-300K, and lose from 1M on (a second
+  /// atomic per row). 64K sits inside the tie range, well below the losses.
+  static constexpr std::int64_t split_wide_sum_max_groups = 1 << 16;
+
+  /// Groups in the most recent batch this operator aggregated; -1 until the first one. Batches
+  /// that start before any count is known split: a wasted split costs a few percent at most,
+  /// while a wasted DECIMAL128 sum with few groups costs up to 3x.
+  std::atomic<std::int64_t> _last_batch_groups{-1};
+
+  // Partial aggregate layout and finalization metadata
   std::vector<AggregateSlot> aggregate_slots;
+  duckdb::vector<sirius::logical_type> local_types;
   bool has_avg            = false;
   bool has_count_distinct = false;
 
@@ -99,6 +122,15 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   //! Runtime schema of the local COUNT(DISTINCT) accumulator. The local aggregate and PARTITION
   //! carry LIST sets; MERGE_GROUP_BY later converts those sets to the declared BIGINT count.
   [[nodiscard]] duckdb::vector<sirius::logical_type> get_count_distinct_local_output_types() const;
+
+  [[nodiscard]] bool has_stddev_samp() const;
+
+  //! Alternate carriers of the local output, for set_alternate_physical_types(). The partial of a
+  //! wide integer SUM, or of an aggregate whose result is HUGEINT, is INT64 or DECIMAL128 with
+  //! scale 0; its column's alternate is whichever of the two is not its native carrier. Empty when
+  //! no slot has two carriers or `types` is not one column per cuDF aggregate after the group
+  //! columns.
+  [[nodiscard]] std::vector<std::optional<cudf::data_type>> wide_integer_sum_partial_types() const;
 
   // Source interface
   bool is_source() const override { return true; }

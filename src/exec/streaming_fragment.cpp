@@ -16,6 +16,7 @@
 
 #include "exec/streaming_fragment.hpp"
 
+#include "data/data_batch_utils.hpp"
 #include "helper/type_conversions.hpp"
 #include "op/sirius_physical_result_collector.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
@@ -49,7 +50,10 @@ cudf::data_type derive_key_cast_type(const sirius::logical_type& t)
   switch (t.id()) {
     case sirius::type_id::TINYINT:
     case sirius::type_id::SMALLINT:
-    case sirius::type_id::INTEGER: return cudf::data_type{cudf::type_id::INT64};
+    case sirius::type_id::INTEGER:
+    // HUGEINT's DECIMAL128 carrier hashes 16 bytes; its INT64 wrap matches a BIGINT key exactly for
+    // every value a BIGINT can equal, and equal out-of-range values still wrap alike.
+    case sirius::type_id::HUGEINT: return cudf::data_type{cudf::type_id::INT64};
     case sirius::type_id::BIGINT:
     case sirius::type_id::BOOLEAN:
     case sirius::type_id::VARCHAR: return cudf::data_type{cudf::type_id::EMPTY};
@@ -87,7 +91,7 @@ duckdb::shared_ptr<duckdb::PreparedStatementData> synthesize_prepared(
   prepared->types = sirius::to_duckdb_vec(types);
   prepared->names.reserve(types.size());
   for (duckdb::idx_t i = 0; i < types.size(); ++i) {
-    prepared->names.push_back("col_" + std::to_string(i));
+    prepared->names.emplace_back("col_" + std::to_string(i));
   }
   return prepared;
 }
@@ -204,17 +208,8 @@ duckdb::unique_ptr<op::sirius_physical_operator> streaming_fragment::make_result
   if (!prepared) { prepared = synthesize_prepared(subtree->types); }
   // The collector decodes GPU output with prepared->types; a mismatch would misread it.
   _sink_types = sirius::from_duckdb_vec(prepared->types);
-  // DuckDB types SUM(BIGINT) as HUGEINT while the planner narrows it to BIGINT; the collector
-  // casts the BIGINT column back, so that pair is not a mismatch.
-  auto decodes_as = [](const sirius::logical_type& declared, const sirius::logical_type& planned) {
-    return declared == planned ||
-           (declared.id() == sirius::type_id::HUGEINT && planned.id() == sirius::type_id::BIGINT);
-  };
-  if (!std::equal(_sink_types.begin(),
-                  _sink_types.end(),
-                  subtree->types.begin(),
-                  subtree->types.end(),
-                  decodes_as)) {
+  if (!std::equal(
+        _sink_types.begin(), _sink_types.end(), subtree->types.begin(), subtree->types.end())) {
     throw sirius::invalid_input_exception(
       "streaming_fragment: prepared result types do not match the physical plan's " +
       std::to_string(subtree->types.size()) + " output column(s)");
@@ -260,7 +255,8 @@ void streaming_fragment::build()
                                             input.types,
                                             std::make_shared<cucascade::shared_data_repository>(),
                                             input.expected_senders,
-                                            nullptr});
+                                            nullptr,
+                                            input.estimated_rows});
     }
 
     auto bound = _spec.plan_source(_context);
@@ -272,7 +268,8 @@ void streaming_fragment::build()
     {
       // create_plan reads the pinned-table registry, which only the slot keeps stable. run()
       // opens the window and compares this epoch to detect a stale plan.
-      duckdb::SiriusContext::SlotGuard plan_slot(sirius_ctx, _context);
+      duckdb::SiriusContext::SlotGuard plan_slot(
+        sirius_ctx, _context, sirius::exec::query_admission::access::maintenance);
       _planned_pin_epoch = sirius_ctx.get_scan_manager().pin_registry_epoch();
       sirius::planner::sirius_physical_plan_generator generator(_context);
       // A fragment publishes cuDF batches directly; it has no DuckDB host exporter.
@@ -487,6 +484,33 @@ std::size_t streaming_fragment::output_batch_count(stream_id_t id) const
                                           std::to_string(id));
   }
   return it->second->total_size();
+}
+
+std::uint64_t streaming_fragment::output_row_count(stream_id_t id) const
+{
+  require_built("output_row_count()");
+  auto it = _output_repos.find(id);
+  if (it == _output_repos.end()) {
+    throw sirius::invalid_input_exception("streaming_fragment: no output stream with id " +
+                                          std::to_string(id));
+  }
+  const auto& repository = *it->second;
+
+  std::uint64_t rows = 0;
+  for (std::size_t partition = 0; partition < repository.num_partitions(); ++partition) {
+    for (auto batch_id : repository.get_batch_ids(partition)) {
+      auto batch = repository.get_data_batch_by_id(batch_id, partition);
+      if (!batch) { continue; }
+      auto read_only = batch->to_read_only();
+      if (read_only.get_current_tier() != cucascade::memory::Tier::GPU) {
+        throw sirius::invalid_input_exception(
+          "streaming_fragment: batch on output stream " + std::to_string(id) +
+          " is not GPU-resident; counting a spilled batch's rows is not supported yet");
+      }
+      rows += static_cast<std::uint64_t>(sirius::get_cudf_table_view(read_only).num_rows());
+    }
+  }
+  return rows;
 }
 
 }  // namespace sirius::exec

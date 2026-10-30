@@ -25,7 +25,7 @@ The manual equivalent of `make s3-test` is:
 
 ```bash
 SIRIUS_TEST_S3_AUTO=1 SIRIUS_TEST_S3_STRICT=1 \
-  build/release/extension/sirius/test/cpp/sirius_unittest --order decl "[s3][integration]~[large]~[aws]"
+  build/release/test/cpp/sirius_unittest --order decl "[s3][integration]~[large]~[aws]"
 ```
 
 ## Tags and gates
@@ -100,7 +100,7 @@ selector above. Run one command per selector, keeping the entire
 selector in one quoted argument:
 
 ```bash
-bin=build/release/extension/sirius/test/cpp/sirius_unittest
+bin=build/release/test/cpp/sirius_unittest
 spec='[s3][integration]~[large]~[aws]'
 
 # Catch2 v2
@@ -160,6 +160,10 @@ CPU oracles. `MANIFEST.sha256` is written next to that directory and is
 not uploaded.
 
 Fixtures are uploaded once and are available through both HTTP and HTTPS.
+
+The harness also generates `parquet/virtual_provenance.parquet` (8,193 rows with
+2,048-row groups) for provenance checks, and `parquet/virtual_physical_names.parquet`
+for virtual-column name collision checks.
 
 | Object group | Contents |
 |---|---|

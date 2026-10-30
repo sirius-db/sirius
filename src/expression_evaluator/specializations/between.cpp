@@ -15,12 +15,15 @@
  */
 
 // sirius
+#include "expression_evaluator/comparison_expression.hpp"
+
 #include <expression/ast/node.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <sirius/exception.hpp>
 
 // cudf
 #include <cudf/binaryop.hpp>
+#include <cudf/column/column_factories.hpp>
 #include <cudf/cudf_utils.hpp>
 
 namespace sirius {
@@ -37,24 +40,30 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::between const& alt,
 
   auto const ast_op_count = alt.cudf_ast_op_count();
 
-  if (_strategy != expression_evaluator_strategy::MATERIALIZE &&
-      (mode == evaluation_mode::AST || ast_op_count >= _min_ast_size)) {
-    auto const lower_ast_op = alt.lower_inclusive ? cudf::ast::ast_operator::GREATER_EQUAL
-                                                  : cudf::ast::ast_operator::GREATER;
-    auto const upper_ast_op =
-      alt.upper_inclusive ? cudf::ast::ast_operator::LESS_EQUAL : cudf::ast::ast_operator::LESS;
-
+  auto const floating = floating_comparison(alt.input->return_type(), alt.lower->return_type()) ||
+                        floating_comparison(alt.input->return_type(), alt.upper->return_type());
+  if (floating || (_policy.strategy != expression_evaluator_strategy::MATERIALIZE &&
+                   (mode == evaluation_mode::AST || ast_op_count >= _min_ast_size))) {
     auto input = evaluate_narrow_domain_operand(*alt.input, narrow_carrier, evaluation_mode::AST);
     D_ASSERT(!input.is_scalar());
     auto lower = evaluate_narrow_domain_operand(*alt.lower, narrow_carrier, evaluation_mode::AST);
     auto upper = evaluate_narrow_domain_operand(*alt.upper, narrow_carrier, evaluation_mode::AST);
 
     auto const& lower_expr =
-      _ast_tree.emplace<cudf::ast::operation>(lower_ast_op, input.get_expr(), lower.get_expr());
+      comparison_expression(_ast_tree,
+                            alt.lower_inclusive ? comparison_type::ge : comparison_type::gt,
+                            input.get_expr(),
+                            lower.get_expr(),
+                            floating);
     auto const& upper_expr =
-      _ast_tree.emplace<cudf::ast::operation>(upper_ast_op, input.get_expr(), upper.get_expr());
+      comparison_expression(_ast_tree,
+                            alt.upper_inclusive ? comparison_type::le : comparison_type::lt,
+                            input.get_expr(),
+                            upper.get_expr(),
+                            floating);
+    // SQL BETWEEN is a three-valued conjunction: FALSE AND NULL is FALSE.
     auto const& between_expr = _ast_tree.emplace<cudf::ast::operation>(
-      cudf::ast::ast_operator::LOGICAL_AND, lower_expr, upper_expr);
+      cudf::ast::ast_operator::NULL_LOGICAL_AND, lower_expr, upper_expr);
 
     //===----------1: AST Mode----------===//
     if (mode == evaluation_mode::AST) {
@@ -79,6 +88,10 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::between const& alt,
     evaluate_narrow_domain_operand(*alt.lower, narrow_carrier, evaluation_mode::MATERIALIZE);
   auto upper =
     evaluate_narrow_domain_operand(*alt.upper, narrow_carrier, evaluation_mode::MATERIALIZE);
+  if (input.is_scalar()) {
+    input = evaluate_result(
+      cudf::make_column_from_scalar(input.get_scalar(), _input_table.num_rows(), _stream, _mr));
+  }
   // BETWEEN always returns BOOLEAN.
   auto const output_type = cudf::data_type{cudf::type_id::BOOL8};
 
@@ -100,7 +113,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::between const& alt,
   }
   auto result_column = cudf::binary_operation(lower_cmp->view(),
                                               upper_cmp->view(),
-                                              cudf::binary_operator::LOGICAL_AND,
+                                              cudf::binary_operator::NULL_LOGICAL_AND,
                                               output_type,
                                               _stream,
                                               _mr);

@@ -90,7 +90,7 @@ This configures and builds the `clang-asan` preset (RelWithDebInfo + clang with
 binary is:
 
 ```
-build/clang-asan/extension/sirius/test/cpp/sirius_unittest
+build/clang-asan/test/cpp/sirius_unittest
 ```
 
 ### Run
@@ -100,7 +100,7 @@ memory, so a couple of options are **required** or ASan will fail at startup:
 
 ```bash
 ASAN_OPTIONS="protect_shadow_gap=0:detect_leaks=0:halt_on_error=0:abort_on_error=1" \
-  ./build/clang-asan/extension/sirius/test/cpp/sirius_unittest "<catch2-test-filter>"
+  ./build/clang-asan/test/cpp/sirius_unittest "<catch2-test-filter>"
 ```
 
 ### What the options mean
@@ -134,7 +134,7 @@ Builds the `clang-tsan` preset (RelWithDebInfo + clang with
 `-fsanitize=thread`). Test binary:
 
 ```
-build/clang-tsan/extension/sirius/test/cpp/sirius_unittest
+build/clang-tsan/test/cpp/sirius_unittest
 ```
 
 ### Run
@@ -142,7 +142,7 @@ build/clang-tsan/extension/sirius/test/cpp/sirius_unittest
 ```bash
 export TSAN_OPTIONS="suppressions=$PWD/tsan.supp:ignore_noninstrumented_modules=1:halt_on_error=0:history_size=7:detect_deadlocks=0"
 
-./build/clang-tsan/extension/sirius/test/cpp/sirius_unittest "<catch2-test-filter>"
+./build/clang-tsan/test/cpp/sirius_unittest "<catch2-test-filter>"
 ```
 
 ### What the options mean
@@ -164,7 +164,7 @@ that run. For an intermittent bug, **run it in a loop** until it trips:
 ```bash
 for i in $(seq 1 20); do
   echo "=== run $i ==="
-  ./build/clang-tsan/extension/sirius/test/cpp/sirius_unittest "<filter>" || break
+  ./build/clang-tsan/test/cpp/sirius_unittest "<filter>" || break
 done
 ```
 
@@ -273,7 +273,7 @@ which compute-sanitizer || ls "$CUDA_HOME/bin/compute-sanitizer"
 
 ```bash
 compute-sanitizer --tool memcheck --leak-check full --error-exitcode=1 \
-  ./build/clang-debug/extension/sirius/test/cpp/sirius_unittest "<catch2-test-filter>"
+  ./build/clang-debug/test/cpp/sirius_unittest "<catch2-test-filter>"
 ```
 
 The four tools (select with `--tool`):
@@ -429,7 +429,7 @@ Examples:
 # Unit test, one-off:
 ulimit -c unlimited
 DISABLE_SIRIUS_SIGNAL_HANDLER=true \
-  ./build/clang-relwithdebinfo/extension/sirius/test/cpp/sirius_unittest "<filter>"
+  ./build/clang-relwithdebinfo/test/cpp/sirius_unittest "<filter>"
 
 # Python (export in the same shell before launching python):
 ulimit -c unlimited
@@ -479,7 +479,7 @@ coredumpctl dump sirius_unittest -o core.sirius   # or export it to a file
 ```bash
 gdb path/to/binary path/to/core
 # e.g.
-gdb build/clang-relwithdebinfo/extension/sirius/test/cpp/sirius_unittest core.sirius_unittest.31234
+gdb build/clang-relwithdebinfo/test/cpp/sirius_unittest core.sirius_unittest.31234
 ```
 
 Then the essential commands:
@@ -505,7 +505,7 @@ Often easier than a core file, and it works **even with the Sirius signal
 handler installed** because gdb sees the signal first:
 
 ```bash
-gdb --args ./build/clang-relwithdebinfo/extension/sirius/test/cpp/sirius_unittest "<filter>"
+gdb --args ./build/clang-relwithdebinfo/test/cpp/sirius_unittest "<filter>"
 (gdb) run
 # ... reproduce the crash ...
 # gdb stops at the faulting instruction:

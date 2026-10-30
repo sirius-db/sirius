@@ -23,15 +23,22 @@ git submodule update --init --recursive
 make test
 
 # Run a specific tag or test name
-build/release/extension/sirius/test/cpp/sirius_unittest "[uri_parser]"
-build/release/extension/sirius/test/cpp/sirius_unittest "uri_parser parses bare absolute paths as file URIs"
+build/release/test/cpp/sirius_unittest "[uri_parser]"
+build/release/test/cpp/sirius_unittest "uri_parser parses bare absolute paths as file URIs"
 ```
 
 `make test` builds the release build and runs `scripts/run_unit_tests.py`, which CI also runs.
 See [test/README.md](test/README.md) for its options.
 
-Test logs are written to `build/release/extension/sirius/test/cpp/log/`, one subdirectory per
+Test logs are written to `build/release/test/cpp/log/`, one subdirectory per
 test process.
+
+### On-demand SQL fuzzing
+
+The [Sirius fuzzer guide](test/fuzz/README.md) covers GPU setup, bounded SQL campaigns,
+replayable findings and rechecking them after a fix. Run it directly or use the
+[sirius-fuzz agent skill](.agents/skills/sirius-fuzz/SKILL.md) with an available development GPU.
+Harness unit tests use `pixi run fuzz-test` and do not require a GPU.
 
 ## Code style
 
@@ -52,7 +59,7 @@ Tools enforced: `clang-format` (C++/CUDA), `black` (Python), `cmake-format`, `co
 
 ## Submodules
 
-The `duckdb/` and `vcpkg/` directories are third-party submodules. Their `CONTRIBUTING.md` files apply to contributing to those upstream projects, not to Sirius. Do not modify submodule contents directly.
+The `duckdb/` and `sirius-duckdb/vcpkg/` directories are third-party submodules. Their `CONTRIBUTING.md` files apply to contributing to those upstream projects, not to Sirius. Do not modify submodule contents directly.
 
 ## Migrating your local clone from `dev` to `main`
 

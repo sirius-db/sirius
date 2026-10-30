@@ -25,6 +25,7 @@
 #include <cucascade/data/data_repository.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/common/exception.hpp>
+#include <duckdb/common/operator/comparison_operators.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/operator/logical_comparison_join.hpp>
 #include <op/sirius_physical_hash_join.hpp>
@@ -34,6 +35,8 @@
 
 #include <algorithm>
 #include <limits>
+#include <map>
+#include <optional>
 
 using namespace duckdb;
 using namespace sirius::op;
@@ -113,10 +116,10 @@ mark_join_fixture create_mark_join(
     0);
 
   duckdb::vector<duckdb::JoinCondition> conditions;
-  duckdb::JoinCondition cond;
-  cond.left       = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
-  cond.right      = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
-  cond.comparison = comparison;
+  duckdb::JoinCondition cond(
+    duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0),
+    duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0),
+    comparison);
   conditions.push_back(std::move(cond));
 
   f.hash_join = duckdb::make_uniq<sirius_physical_hash_join>(
@@ -180,10 +183,10 @@ nlj_projection_fixture create_projected_nlj(duckdb::JoinType join_type,
     0);
 
   duckdb::vector<duckdb::JoinCondition> conditions;
-  duckdb::JoinCondition cond;
-  cond.left       = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
-  cond.right      = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
-  cond.comparison = comparison;
+  duckdb::JoinCondition cond(
+    duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0),
+    duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0),
+    comparison);
   conditions.push_back(std::move(cond));
 
   f.nlj = duckdb::make_uniq<sirius_physical_nested_loop_join>(
@@ -223,15 +226,15 @@ nlj_projection_fixture create_projected_nlj_two_cond(duckdb::ExpressionType comp
     0);
 
   duckdb::vector<duckdb::JoinCondition> conditions;
-  duckdb::JoinCondition cond0;
-  cond0.left       = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
-  cond0.right      = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
-  cond0.comparison = comparison0;
+  duckdb::JoinCondition cond0(
+    duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0),
+    duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0),
+    comparison0);
   conditions.push_back(std::move(cond0));
-  duckdb::JoinCondition cond1;
-  cond1.left       = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 2);
-  cond1.right      = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 1);
-  cond1.comparison = comparison1;
+  duckdb::JoinCondition cond1(
+    duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 2),
+    duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 1),
+    comparison1);
   conditions.push_back(std::move(cond1));
 
   f.nlj = duckdb::make_uniq<sirius_physical_nested_loop_join>(
@@ -359,10 +362,13 @@ TEST_CASE("sirius_physical_hash_join mark join - empty right side", "[physical_m
   auto* space = get_shared_mem_space();
   REQUIRE(space);
 
+  const bool null_probe             = GENERATE(false, true);
   std::vector<int32_t> left_ids     = {10, 20, 30};
   std::vector<int32_t> left_payload = {1, 2, 3};
-  auto left_batch                   = make_two_column_batch<int32_t, int32_t>(
-    *space, left_ids, left_payload, cudf::type_id::INT32, std::nullopt, cudf::type_id::INT32);
+  auto left_keys                    = make_numeric_batch_with_nulls<int32_t>(
+    *space, left_ids, {true, !null_probe, true}, cudf::type_id::INT32);
+  auto payload    = make_numeric_batch<int32_t>(*space, left_payload, cudf::type_id::INT32);
+  auto left_batch = concatenate_batches_horizontal({left_keys, payload}, *space);
 
   // Empty right table — semi_indices will be empty, all marks should be false
   std::vector<int32_t> right_ids = {};
@@ -378,8 +384,11 @@ TEST_CASE("sirius_physical_hash_join mark join - empty right side", "[physical_m
     *dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0]);
   REQUIRE(out_view.num_rows() == static_cast<cudf::size_type>(left_ids.size()));
 
-  REQUIRE(copy_column_to_host<int32_t>(out_view.column(0)) == left_ids);
+  REQUIRE(copy_validity_to_host(out_view.column(0)) == std::vector<bool>{true, !null_probe, true});
+  if (!null_probe) { REQUIRE(copy_column_to_host<int32_t>(out_view.column(0)) == left_ids); }
   REQUIRE(copy_column_to_host<int32_t>(out_view.column(1)) == left_payload);
+  // Even NULL IN (empty) is a definite FALSE; NOT IN must therefore be TRUE.
+  REQUIRE(out_view.column(2).null_count() == 0);
   REQUIRE(copy_column_to_host<bool>(out_view.column(2)) == std::vector<bool>{false, false, false});
 }
 
@@ -466,6 +475,85 @@ TEST_CASE("MARK join drains probe batches when its build pipeline emits no batch
   REQUIRE(copy_column_to_host<bool>(second_view.column(2)) == std::vector<bool>{false});
 
   probe_pipeline->finished = true;
+  REQUIRE_FALSE(f.hash_join->get_next_task_hint().has_value());
+}
+
+// get_next_task_hint reads the build pipeline's state twice: the empty-build latch can see it
+// unfinished, then refresh_cross_schedule sees it finished and issues a STANDARD orphan task
+// (probe + synthesized empty build). A later hint latches the empty build before that task runs;
+// the queued task must still produce definite FALSE marks rather than fail the query.
+TEST_CASE("MARK join runs an orphan task issued before the empty-build latch",
+          "[physical_mark_join][cross_schedule]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space);
+
+  auto f          = create_mark_join();
+  auto build_repo = std::make_unique<cucascade::shared_data_repository>();
+  auto probe_repo = std::make_unique<cucascade::shared_data_repository>();
+  sirius::pipeline::pipeline_build_context ctx{nullptr, true};
+  auto build_pipeline = std::make_shared<finishable_mark_pipeline>(ctx);
+  auto probe_pipeline = std::make_shared<finishable_mark_pipeline>(ctx);
+  sirius::pipeline::sirius_pipeline_build_state build_state;
+  build_state.add_pipeline_operator(*build_pipeline, *f.hash_join->children[1]);
+  build_state.add_pipeline_operator(*probe_pipeline, *f.hash_join->children[0]);
+  auto attach_port = [&](std::string_view name,
+                         cucascade::shared_data_repository& repo,
+                         std::shared_ptr<finishable_mark_pipeline> source) {
+    auto port          = std::make_unique<sirius_physical_operator::port>();
+    port->type         = MemoryBarrierType::PARTIAL;
+    port->repo         = &repo;
+    port->src_pipeline = std::move(source);
+    f.hash_join->add_port(name, std::move(port));
+  };
+  attach_port("build", *build_repo, build_pipeline);
+  attach_port("default", *probe_repo, probe_pipeline);
+  f.hash_join->set_placement(
+    std::make_shared<const partition_placement>(partition_placement::unpinned(1)));
+
+  // Two probe batches, the probe finished, the build not yet finished: no hint latches.
+  auto probe_key = make_numeric_batch_with_nulls<int32_t>(
+    *space, {1, 0, 2}, {true, false, true}, cudf::type_id::INT32);
+  probe_repo->add_data_batch(concatenate_batches_horizontal(
+    {probe_key, make_numeric_batch<int32_t>(*space, {10, 20, 30}, cudf::type_id::INT32)}, *space));
+  probe_repo->add_data_batch(make_two_column_batch<int32_t, int32_t>(
+    *space, {7}, {70}, cudf::type_id::INT32, std::nullopt, cudf::type_id::INT32));
+  probe_pipeline->finished = true;
+  auto hint                = f.hash_join->get_next_task_hint();
+  REQUIRE(hint.has_value());
+  REQUIRE(hint->hint == TaskCreationHint::WAITING_FOR_INPUT_DATA);
+  REQUIRE(hint->producer == f.hash_join->children[1].get());
+
+  // The build finishes empty between the latch check and the cross schedule: the issued task is a
+  // STANDARD orphan carrying a synthesized empty build batch.
+  build_pipeline->finished = true;
+  auto orphan              = f.hash_join->get_next_task_input_data();
+  REQUIRE(orphan != nullptr);
+  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*orphan).get_data_batches().size() == 2);
+
+  // The next hint latches the empty build while the orphan task is still queued.
+  hint = f.hash_join->get_next_task_hint();
+  REQUIRE(hint.has_value());
+  REQUIRE(hint->hint == TaskCreationHint::READY);
+
+  auto mark_of = [&](operator_data const& input) {
+    auto output = f.hash_join->execute(input, cudf::get_default_stream());
+    auto view   = sirius::get_cudf_table_view(
+      *dynamic_cast<const pipelineable_operator_data&>(*output).get_data_batches()[0]);
+    auto mark = view.column(view.num_columns() - 1);
+    REQUIRE(mark.null_count() == 0);
+    return copy_column_to_host<bool>(mark);
+  };
+  std::vector<std::vector<bool>> marks;
+  marks.push_back(mark_of(*orphan));
+  auto latched = f.hash_join->get_next_task_input_data();
+  REQUIRE(latched != nullptr);
+  marks.push_back(mark_of(*latched));
+  std::sort(
+    marks.begin(), marks.end(), [](auto const& a, auto const& b) { return a.size() < b.size(); });
+  // Every mark against an empty build is a definite FALSE, NULL probe keys included.
+  REQUIRE(marks[0] == std::vector<bool>{false});
+  REQUIRE(marks[1] == std::vector<bool>{false, false, false});
   REQUIRE_FALSE(f.hash_join->get_next_task_hint().has_value());
 }
 
@@ -658,15 +746,15 @@ TEST_CASE("sirius_physical_hash_join mark join - mixed conditions are unsupporte
 
   // Equality (left.col0 = right.col0) + inequality (left.col1 < right.col0) => mixed shape.
   duckdb::vector<duckdb::JoinCondition> conditions;
-  duckdb::JoinCondition eq;
-  eq.left       = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
-  eq.right      = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
-  eq.comparison = duckdb::ExpressionType::COMPARE_EQUAL;
+  duckdb::JoinCondition eq(
+    duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0),
+    duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0),
+    duckdb::ExpressionType::COMPARE_EQUAL);
   conditions.push_back(std::move(eq));
-  duckdb::JoinCondition lt;
-  lt.left       = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 1);
-  lt.right      = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
-  lt.comparison = duckdb::ExpressionType::COMPARE_LESSTHAN;
+  duckdb::JoinCondition lt(
+    duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 1),
+    duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0),
+    duckdb::ExpressionType::COMPARE_LESSTHAN);
   conditions.push_back(std::move(lt));
 
   REQUIRE_THROWS_AS(duckdb::make_uniq<sirius_physical_hash_join>(
@@ -1022,8 +1110,8 @@ TEST_CASE("sirius_physical_nested_loop_join rejects join types it cannot execute
   }
 }
 
-// SINGLE reaches neither GPU join: both dispatches fall through to a mid-query throw.
-// are_conditions_supported now folds in the join-type screen so the planner rejects it.
+// are_conditions_supported folds in the join-type screen so the planner rejects what no GPU
+// join executes.
 TEST_CASE("sirius_physical_hash_join rejects join types it cannot execute",
           "[physical_hash_join][join_type]")
 {
@@ -1037,19 +1125,20 @@ TEST_CASE("sirius_physical_hash_join rejects join types it cannot execute",
                          JT::RIGHT_SEMI,
                          JT::RIGHT_ANTI,
                          JT::MARK,
-                         JT::OUTER}) {
+                         JT::OUTER,
+                         JT::SINGLE}) {
     INFO("join type " << duckdb::JoinTypeToString(join_type));
     REQUIRE(sirius_physical_hash_join::is_join_type_supported(join_type));
   }
-  REQUIRE_FALSE(sirius_physical_hash_join::is_join_type_supported(JT::SINGLE));
+  REQUIRE_FALSE(sirius_physical_hash_join::is_join_type_supported(JT::INVALID));
 
   // A plain equality condition the hash join would otherwise accept.
   auto make_conditions = [](duckdb::ExpressionType comparison) {
     duckdb::vector<duckdb::JoinCondition> conditions;
-    duckdb::JoinCondition cond;
-    cond.left       = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
-    cond.right      = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
-    cond.comparison = comparison;
+    duckdb::JoinCondition cond(
+      duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0),
+      duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0),
+      comparison);
     conditions.push_back(std::move(cond));
     return sirius::wrap_join_conditions(std::move(conditions));
   };
@@ -1057,8 +1146,9 @@ TEST_CASE("sirius_physical_hash_join rejects join types it cannot execute",
   auto equal_conditions = make_conditions(duckdb::ExpressionType::COMPARE_EQUAL);
   REQUIRE(sirius_physical_hash_join::are_conditions_supported(equal_conditions, JT::INNER));
   REQUIRE(sirius_physical_hash_join::are_conditions_supported(equal_conditions, JT::MARK));
+  REQUIRE(sirius_physical_hash_join::are_conditions_supported(equal_conditions, JT::SINGLE));
   // Rejected on the join type alone, not the conditions.
-  REQUIRE_FALSE(sirius_physical_hash_join::are_conditions_supported(equal_conditions, JT::SINGLE));
+  REQUIRE_FALSE(sirius_physical_hash_join::are_conditions_supported(equal_conditions, JT::INVALID));
 
   // An all-null-safe MARK is supported: one EQUAL covers every key and the marks are definite.
   auto null_safe_conditions = make_conditions(duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM);
@@ -1069,11 +1159,11 @@ TEST_CASE("sirius_physical_hash_join rejects join types it cannot execute",
   duckdb::vector<duckdb::JoinCondition> mixed;
   for (auto comparison :
        {duckdb::ExpressionType::COMPARE_EQUAL, duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM}) {
-    duckdb::JoinCondition cond;
     auto const idx = static_cast<duckdb::idx_t>(mixed.size());
-    cond.left      = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, idx);
-    cond.right     = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, idx);
-    cond.comparison = comparison;
+    duckdb::JoinCondition cond(
+      duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, idx),
+      duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, idx),
+      comparison);
     mixed.push_back(std::move(cond));
   }
   auto mixed_conditions = sirius::wrap_join_conditions(std::move(mixed));
@@ -1112,6 +1202,274 @@ TEST_CASE("sirius_physical_hash_join MARK with all null-safe keys emits definite
   auto mark = view.column(view.num_columns() - 1);
   REQUIRE(mark.null_count() == 0);
   REQUIRE(copy_column_to_host<bool>(mark) == std::vector<bool>{true, true, false});
+}
+
+// A hash-partitioned all-null-safe MARK runs one STANDARD task per partition on the same operator.
+// Partition builds legitimately differ in whether they hold a NULL key; with null-safe keys that
+// is irrelevant (NULL only matches NULL, which hashes to the same partition on both sides), so
+// each probe row's mark depends only on its own partition and is always definite.
+TEST_CASE("sirius_physical_hash_join null-safe MARK is correct across hash partitions",
+          "[physical_hash_join][mark][nulls][partition]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space);
+  auto f = create_mark_join(duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM);
+
+  auto run_partition = [&](std::shared_ptr<cucascade::data_batch> left,
+                           std::shared_ptr<cucascade::data_batch> right) {
+    std::vector<std::shared_ptr<cucascade::data_batch>> inputs{std::move(left), std::move(right)};
+    auto outputs =
+      f.hash_join->execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
+    auto const& output_data = dynamic_cast<const pipelineable_operator_data&>(*outputs);
+    REQUIRE(output_data.get_data_batches().size() == 1);
+    auto view = sirius::get_cudf_table_view(*output_data.get_data_batches()[0]);
+    auto mark = view.column(view.num_columns() - 1);
+    REQUIRE(mark.null_count() == 0);
+    return copy_column_to_host<bool>(mark);
+  };
+
+  // Partition 0: build {NULL, 5}; probe {NULL, 5, 7} -> NULL and 5 match, 7 is a definite miss.
+  auto p0_key = make_numeric_batch_with_nulls<int32_t>(
+    *space, {0, 5, 7}, {false, true, true}, cudf::type_id::INT32);
+  auto p0_left = concatenate_batches_horizontal(
+    {p0_key, make_numeric_batch<int32_t>(*space, {10, 20, 30}, cudf::type_id::INT32)}, *space);
+  auto p0_right =
+    make_numeric_batch_with_nulls<int32_t>(*space, {0, 5}, {false, true}, cudf::type_id::INT32);
+  REQUIRE(run_partition(p0_left, p0_right) == std::vector<bool>{true, true, false});
+
+  // Partition 1: build {8} has no NULL key, unlike partition 0. This used to trip the global
+  // build_has_null consistency check; for null-safe keys it must not, and 9 is FALSE, not NULL.
+  auto p1_left = make_two_column_batch<int32_t, int32_t>(
+    *space, {8, 9}, {40, 50}, cudf::type_id::INT32, std::nullopt, cudf::type_id::INT32);
+  auto p1_right = make_numeric_batch<int32_t>(*space, {8}, cudf::type_id::INT32);
+  REQUIRE(run_partition(p1_left, p1_right) == std::vector<bool>{true, false});
+
+  // Partition 2 received no build rows: every probe row is a definite miss.
+  auto p2_left = make_two_column_batch<int32_t, int32_t>(
+    *space, {11, 12}, {60, 70}, cudf::type_id::INT32, std::nullopt, cudf::type_id::INT32);
+  auto p2_right = make_numeric_batch<int32_t>(*space, {}, cudf::type_id::INT32);
+  REQUIRE(run_partition(p2_left, p2_right) == std::vector<bool>{false, false});
+}
+
+// A null-propagating ('=') MARK on a hash-partitioned build. Each partition holds only its share of
+// the build, but SQL's IN rule is global: an unmatched non-NULL probe key is NULL when ANY build
+// key is NULL, and a NULL probe key is NULL whenever the build is non-empty. The build PARTITION
+// observes every build batch (observe_partitioned_build_batch) before the join sees one, and no
+// pair is scheduled until the whole build pipeline has finished.
+TEST_CASE(
+  "sirius_physical_hash_join null-propagating MARK uses global build facts across partitions",
+  "[physical_hash_join][mark][nulls][partition]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space);
+  // With a NULL build key (in partition 1, away from the probe rows of partitions 0 and 2), or
+  // with none.
+  bool const build_has_null = GENERATE(true, false);
+  CAPTURE(build_has_null);
+
+  auto f          = create_mark_join();
+  auto build_repo = std::make_unique<cucascade::shared_data_repository>();
+  auto probe_repo = std::make_unique<cucascade::shared_data_repository>();
+  sirius::pipeline::pipeline_build_context ctx{nullptr, true};
+  auto build_pipeline = std::make_shared<finishable_mark_pipeline>(ctx);
+  auto probe_pipeline = std::make_shared<finishable_mark_pipeline>(ctx);
+  sirius::pipeline::sirius_pipeline_build_state build_state;
+  build_state.add_pipeline_operator(*build_pipeline, *f.hash_join->children[1]);
+  build_state.add_pipeline_operator(*probe_pipeline, *f.hash_join->children[0]);
+  auto attach_port = [&](std::string_view name,
+                         cucascade::shared_data_repository& repo,
+                         std::shared_ptr<finishable_mark_pipeline> source) {
+    auto port          = std::make_unique<sirius_physical_operator::port>();
+    port->type         = MemoryBarrierType::PARTIAL;
+    port->repo         = &repo;
+    port->src_pipeline = std::move(source);
+    f.hash_join->add_port(name, std::move(port));
+  };
+  attach_port("build", *build_repo, build_pipeline);
+  attach_port("default", *probe_repo, probe_pipeline);
+
+  // Size the join as the build PARTITION would: a build far over the resident budget runs
+  // STANDARD at its natural (multi-partition) count.
+  constexpr uint64_t build_bytes = 8 * sirius::config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES;
+  auto const strategy            = f.hash_join->get_partition_strategy(
+    {build_bytes, true, true, build_bytes, 1000, 1000, build_bytes});
+  REQUIRE(strategy.num_partitions >= 3);
+  REQUIRE_FALSE(strategy.build_probe);
+  REQUIRE_FALSE(strategy.broadcast);
+  f.hash_join->set_placement(std::make_shared<const partition_placement>(strategy.placement));
+  f.hash_join->note_build_observer_attached();
+
+  // The whole build, as the PARTITION saw it before scattering: {2, X} with X = NULL or 5.
+  auto whole_build = make_numeric_batch_with_nulls<int32_t>(
+    *space, {2, 5}, {true, !build_has_null}, cudf::type_id::INT32);
+  f.hash_join->observe_partitioned_build_batch(whole_build->to_read_only());
+
+  // Partition 0: build {2}, probe {1, 2, NULL}. Partition 1: build {X}, probe {3}. Partition 2 has
+  // no build rows at all, probe {4, NULL}.
+  build_repo->add_data_batch(make_numeric_batch<int32_t>(*space, {2}, cudf::type_id::INT32), 0);
+  build_repo->add_data_batch(
+    make_numeric_batch_with_nulls<int32_t>(*space, {5}, {!build_has_null}, cudf::type_id::INT32),
+    1);
+  auto p0_key = make_numeric_batch_with_nulls<int32_t>(
+    *space, {1, 2, 0}, {true, true, false}, cudf::type_id::INT32);
+  probe_repo->add_data_batch(
+    concatenate_batches_horizontal(
+      {p0_key, make_numeric_batch<int32_t>(*space, {10, 20, 30}, cudf::type_id::INT32)}, *space),
+    0);
+  probe_repo->add_data_batch(
+    make_two_column_batch<int32_t, int32_t>(
+      *space, {3}, {40}, cudf::type_id::INT32, std::nullopt, cudf::type_id::INT32),
+    1);
+  auto p2_key =
+    make_numeric_batch_with_nulls<int32_t>(*space, {4, 0}, {true, false}, cudf::type_id::INT32);
+  probe_repo->add_data_batch(
+    concatenate_batches_horizontal(
+      {p2_key, make_numeric_batch<int32_t>(*space, {50, 60}, cudf::type_id::INT32)}, *space),
+    2);
+
+  // Pairs exist, but no mark may be computed before the whole build pipeline has finished.
+  auto hint = f.hash_join->get_next_task_hint();
+  REQUIRE(hint.has_value());
+  REQUIRE(hint->hint == TaskCreationHint::WAITING_FOR_INPUT_DATA);
+  REQUIRE(hint->producer == f.hash_join->children[1].get());
+  REQUIRE(f.hash_join->get_next_task_input_data() == nullptr);
+
+  build_pipeline->finished = true;
+  probe_pipeline->finished = true;
+
+  // Drain every task (two pairs and one orphan probe) and collect marks by partition.
+  std::map<std::size_t, std::pair<std::vector<bool>, std::vector<bool>>> marks;
+  while (auto input = f.hash_join->get_next_task_input_data()) {
+    auto const& partitioned = dynamic_cast<const partitioned_operator_data&>(*input);
+    REQUIRE(partitioned.get_partition_idx().has_value());
+    auto output = f.hash_join->execute(*input, cudf::get_default_stream());
+    auto view   = sirius::get_cudf_table_view(
+      *dynamic_cast<const pipelineable_operator_data&>(*output).get_data_batches()[0]);
+    auto mark                               = view.column(2);
+    marks[*partitioned.get_partition_idx()] = {copy_validity_to_host(mark),
+                                               copy_column_to_host<bool>(mark)};
+  }
+  REQUIRE(marks.size() == 3);
+
+  if (build_has_null) {
+    // Only the matched row is definite; every miss and every NULL probe key is NULL.
+    REQUIRE(marks[0].first == std::vector<bool>{false, true, false});
+    REQUIRE(marks[0].second[1] == true);
+    REQUIRE(marks[1].first == std::vector<bool>{false});
+    REQUIRE(marks[2].first == std::vector<bool>{false, false});
+  } else {
+    // No NULL build key: misses are FALSE; a NULL probe key is NULL (the build is non-empty
+    // globally, even in partition 2 whose own build is empty).
+    REQUIRE(marks[0].first == std::vector<bool>{true, true, false});
+    REQUIRE(marks[0].second[0] == false);
+    REQUIRE(marks[0].second[1] == true);
+    REQUIRE(marks[1].first == std::vector<bool>{true});
+    REQUIRE(marks[1].second[0] == false);
+    REQUIRE(marks[2].first == std::vector<bool>{true, false});
+    REQUIRE(marks[2].second[0] == false);
+  }
+}
+
+// The BUILD_PROBE counterpart: on two GPUs a build that fits one hash table per GPU, but is too
+// large to broadcast, is hash-partitioned into one BUILD_PROBE slot per GPU. Each slot's hash
+// table holds only its share of the build, so its marks must also use the join-wide build facts.
+TEST_CASE(
+  "sirius_physical_hash_join null-propagating MARK uses global build facts across BUILD_PROBE "
+  "partitions",
+  "[physical_hash_join][mark][nulls][partition][build_probe]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space);
+  bool const build_has_null = GENERATE(true, false);
+  CAPTURE(build_has_null);
+
+  auto f          = create_mark_join();
+  auto build_repo = std::make_unique<cucascade::shared_data_repository>();
+  auto probe_repo = std::make_unique<cucascade::shared_data_repository>();
+  sirius::pipeline::pipeline_build_context ctx{nullptr, true};
+  auto build_pipeline = std::make_shared<finishable_mark_pipeline>(ctx);
+  auto probe_pipeline = std::make_shared<finishable_mark_pipeline>(ctx);
+  sirius::pipeline::sirius_pipeline_build_state build_state;
+  build_state.add_pipeline_operator(*build_pipeline, *f.hash_join->children[1]);
+  build_state.add_pipeline_operator(*probe_pipeline, *f.hash_join->children[0]);
+  auto attach_port = [&](std::string_view name,
+                         cucascade::shared_data_repository& repo,
+                         std::shared_ptr<finishable_mark_pipeline> source) {
+    auto port          = std::make_unique<sirius_physical_operator::port>();
+    port->type         = MemoryBarrierType::PARTIAL;
+    port->repo         = &repo;
+    port->src_pipeline = std::move(source);
+    f.hash_join->add_port(name, std::move(port));
+  };
+  attach_port("build", *build_repo, build_pipeline);
+  attach_port("default", *probe_repo, probe_pipeline);
+
+  // Size the join on two GPUs: half the build per GPU fits the hash-table budget, the whole build
+  // is far over the broadcast limit. Tasks run on this test's device; only the sizing is 2-GPU.
+  f.hash_join->set_active_gpu_ids({0, 1});
+  constexpr uint64_t build_bytes = 2 * sirius::config::DEFAULT_HASH_PARTITION_BYTES;
+  auto const strategy            = f.hash_join->get_partition_strategy(
+    {build_bytes, true, true, build_bytes, 1000, 1000, build_bytes});
+  REQUIRE(strategy.num_partitions == 2);
+  REQUIRE(strategy.build_probe);
+  REQUIRE_FALSE(strategy.broadcast);
+  f.hash_join->set_placement(std::make_shared<const partition_placement>(strategy.placement));
+  f.hash_join->note_build_observer_attached();
+
+  // The whole build {2, X} (X = NULL or 5) as the PARTITION saw it; X lands in partition 1.
+  auto whole_build = make_numeric_batch_with_nulls<int32_t>(
+    *space, {2, 5}, {true, !build_has_null}, cudf::type_id::INT32);
+  f.hash_join->observe_partitioned_build_batch(whole_build->to_read_only());
+  build_repo->add_data_batch(make_numeric_batch<int32_t>(*space, {2}, cudf::type_id::INT32), 0);
+  build_repo->add_data_batch(
+    make_numeric_batch_with_nulls<int32_t>(*space, {5}, {!build_has_null}, cudf::type_id::INT32),
+    1);
+  // Partition 0 probes {1, 2, NULL} (1 is an unmatched non-NULL key); partition 1 probes {3}.
+  auto p0_key = make_numeric_batch_with_nulls<int32_t>(
+    *space, {1, 2, 0}, {true, true, false}, cudf::type_id::INT32);
+  probe_repo->add_data_batch(
+    concatenate_batches_horizontal(
+      {p0_key, make_numeric_batch<int32_t>(*space, {10, 20, 30}, cudf::type_id::INT32)}, *space),
+    0);
+  probe_repo->add_data_batch(
+    make_two_column_batch<int32_t, int32_t>(
+      *space, {3}, {40}, cudf::type_id::INT32, std::nullopt, cudf::type_id::INT32),
+    1);
+  build_pipeline->finished = true;
+  probe_pipeline->finished = true;
+
+  // One build-and-probe task per slot.
+  std::map<std::size_t, std::pair<std::vector<bool>, std::vector<bool>>> marks;
+  for (auto hint = f.hash_join->get_next_task_hint();
+       hint.has_value() && hint->hint == TaskCreationHint::READY;
+       hint = f.hash_join->get_next_task_hint()) {
+    auto input = f.hash_join->get_next_task_input_data();
+    REQUIRE(input != nullptr);
+    auto const& partitioned = dynamic_cast<const partitioned_operator_data&>(*input);
+    REQUIRE(partitioned.get_partition_idx().has_value());
+    REQUIRE(partitioned.get_data_batches().size() == 2);
+    auto output = f.hash_join->execute(*input, cudf::get_default_stream());
+    auto view   = sirius::get_cudf_table_view(
+      *dynamic_cast<const pipelineable_operator_data&>(*output).get_data_batches()[0]);
+    auto mark                               = view.column(2);
+    marks[*partitioned.get_partition_idx()] = {copy_validity_to_host(mark),
+                                               copy_column_to_host<bool>(mark)};
+  }
+  REQUIRE(f.hash_join->is_build_probe_mode());
+  REQUIRE(marks.size() == 2);
+
+  if (build_has_null) {
+    // The NULL build key sits in partition 1, yet partition 0's miss (1) and NULL key are NULL.
+    REQUIRE(marks[0].first == std::vector<bool>{false, true, false});
+    REQUIRE(marks[0].second[1] == true);
+    REQUIRE(marks[1].first == std::vector<bool>{false});
+  } else {
+    REQUIRE(marks[0].first == std::vector<bool>{true, true, false});
+    REQUIRE(marks[0].second[0] == false);
+    REQUIRE(marks[0].second[1] == true);
+    REQUIRE(marks[1].first == std::vector<bool>{true});
+    REQUIRE(marks[1].second[0] == false);
+  }
 }
 
 TEST_CASE("sirius_physical_nested_loop_join SEMI and ANTI honor the left projection map",
@@ -1365,4 +1723,136 @@ TEST_CASE("native nested-loop semantic timestamp casts retain checked overflow",
   f.nlj->conditions[0].right =
     std::make_unique<sirius::ast::node>(sirius::ast::reference{0, micros});
   REQUIRE_THROWS_AS(execute_projected_nlj(*f.nlj, left, right), sirius::invalid_input_exception);
+}
+
+TEST_CASE("Nested-loop floating comparisons follow DuckDB NaN and NULL semantics",
+          "[physical_mark_join][nan_comparison]")
+{
+  auto& space           = *get_shared_mem_space();
+  auto single_precision = GENERATE(false, true);
+  auto comparison       = GENERATE(ExpressionType::COMPARE_EQUAL,
+                             ExpressionType::COMPARE_NOTEQUAL,
+                             ExpressionType::COMPARE_GREATERTHAN,
+                             ExpressionType::COMPARE_GREATERTHANOREQUALTO,
+                             ExpressionType::COMPARE_LESSTHAN,
+                             ExpressionType::COMPARE_LESSTHANOREQUALTO,
+                             ExpressionType::COMPARE_DISTINCT_FROM,
+                             ExpressionType::COMPARE_NOT_DISTINCT_FROM);
+  auto join_type        = GENERATE(JoinType::INNER,
+                            JoinType::LEFT,
+                            JoinType::RIGHT,
+                            JoinType::OUTER,
+                            JoinType::SEMI,
+                            JoinType::ANTI,
+                            JoinType::MARK);
+  CAPTURE(single_precision, comparison, join_type);
+  double const inf = std::numeric_limits<double>::infinity();
+  std::vector<double> domain{-inf, -1, 0, inf, std::numeric_limits<double>::quiet_NaN(), 0};
+  std::vector<bool> valid{true, true, true, true, true, false};
+  std::vector<int32_t> ids{0, 1, 2, 3, 4, 5};
+  auto make_input = [&] {
+    auto keys =
+      single_precision
+        ? make_numeric_batch_with_nulls<float>(
+            space, std::vector<float>(domain.begin(), domain.end()), valid, cudf::type_id::FLOAT32)
+        : make_numeric_batch_with_nulls<double>(space, domain, valid, cudf::type_id::FLOAT64);
+    auto payload = make_numeric_batch<int32_t>(space, ids, cudf::type_id::INT32);
+    return concatenate_batches_horizontal({keys, payload}, space);
+  };
+  auto const type = single_precision ? LogicalType::FLOAT : LogicalType::DOUBLE;
+  auto child      = [&] {
+    return duckdb::make_uniq<sirius_physical_operator>(
+      SiriusPhysicalOperatorType::PROJECTION,
+      sirius::from_duckdb_vec(duckdb::vector<LogicalType>{type, LogicalType::INTEGER}),
+      domain.size());
+  };
+  LogicalComparisonJoin logical(join_type);
+  logical.types = {LogicalType::INTEGER};
+  if (join_type == JoinType::MARK)
+    logical.types.push_back(LogicalType::BOOLEAN);
+  else if (join_type != JoinType::SEMI && join_type != JoinType::ANTI)
+    logical.types.push_back(LogicalType::INTEGER);
+  duckdb::vector<JoinCondition> conditions;
+  conditions.emplace_back(duckdb::make_uniq<BoundReferenceExpression>(type, 0),
+                          duckdb::make_uniq<BoundReferenceExpression>(type, 0),
+                          comparison);
+  sirius_physical_nested_loop_join join(logical,
+                                        child(),
+                                        child(),
+                                        sirius::wrap_join_conditions(std::move(conditions)),
+                                        join_type,
+                                        domain.size(),
+                                        duckdb::vector<std::size_t>{1},
+                                        duckdb::vector<std::size_t>{1});
+
+  // Use DuckDB's own floating comparison operators as the oracle. NULL produces UNKNOWN
+  // except for the two null-safe comparisons; NaN remains a valid floating value.
+  auto matches = [&](size_t i, size_t j) -> std::optional<bool> {
+    bool const eq      = Equals::Operation(domain[i], domain[j]);
+    bool const null_eq = (!valid[i] || !valid[j]) ? valid[i] == valid[j] : eq;
+    if (comparison == ExpressionType::COMPARE_NOT_DISTINCT_FROM) return null_eq;
+    if (comparison == ExpressionType::COMPARE_DISTINCT_FROM) return !null_eq;
+    if (!valid[i] || !valid[j]) return std::nullopt;
+    switch (comparison) {
+      case ExpressionType::COMPARE_EQUAL: return eq;
+      case ExpressionType::COMPARE_NOTEQUAL: return !eq;
+      case ExpressionType::COMPARE_GREATERTHAN: return GreaterThan::Operation(domain[i], domain[j]);
+      case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+        return GreaterThanEquals::Operation(domain[i], domain[j]);
+      case ExpressionType::COMPARE_LESSTHAN: return LessThan::Operation(domain[i], domain[j]);
+      case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+        return LessThanEquals::Operation(domain[i], domain[j]);
+      default: FAIL("Unexpected comparison"); return false;
+    }
+  };
+  // Compare projected row identities, so an incorrect match cannot hide behind an equal row count.
+  // -1 denotes NULL or the absent second column of a semi/anti join.
+  std::vector<std::pair<int32_t, int32_t>> expected;
+  std::vector<bool> right_matched(domain.size(), false);
+  for (size_t i = 0; i < domain.size(); ++i) {
+    bool matched = false, unknown = false;
+    for (size_t j = 0; j < domain.size(); ++j) {
+      auto match = matches(i, j);
+      unknown |= !match.has_value();
+      if (!match.value_or(false)) continue;
+      matched          = true;
+      right_matched[j] = true;
+      if (join_type != JoinType::SEMI && join_type != JoinType::ANTI && join_type != JoinType::MARK)
+        expected.emplace_back(ids[i], ids[j]);
+    }
+    if (join_type == JoinType::MARK)
+      expected.emplace_back(ids[i], matched ? 1 : unknown ? -1 : 0);
+    else if ((join_type == JoinType::SEMI && matched) ||
+             (join_type == JoinType::ANTI && !matched) ||
+             ((join_type == JoinType::LEFT || join_type == JoinType::OUTER) && !matched))
+      expected.emplace_back(ids[i], -1);
+  }
+  if (join_type == JoinType::RIGHT || join_type == JoinType::OUTER)
+    for (size_t j = 0; j < domain.size(); ++j)
+      if (!right_matched[j]) expected.emplace_back(-1, ids[j]);
+
+  auto result = execute_projected_nlj(join, make_input(), make_input());
+  REQUIRE(result.view.num_columns() == logical.types.size());
+  auto left_ids   = copy_column_to_host<int32_t>(result.view.column(0));
+  auto left_valid = copy_validity_to_host(result.view.column(0));
+  std::vector<std::pair<int32_t, int32_t>> actual;
+  std::vector<int32_t> right_ids(left_ids.size(), -1);
+  if (result.view.num_columns() == 2) {
+    auto col         = result.view.column(1);
+    auto right_valid = copy_validity_to_host(col);
+    if (join_type == JoinType::MARK) {
+      auto marks = copy_column_to_host<bool>(col);
+      for (size_t i = 0; i < marks.size(); ++i)
+        right_ids[i] = right_valid[i] ? int32_t(marks[i]) : -1;
+    } else {
+      right_ids = copy_column_to_host<int32_t>(col);
+      for (size_t i = 0; i < right_ids.size(); ++i)
+        if (!right_valid[i]) right_ids[i] = -1;
+    }
+  }
+  for (size_t i = 0; i < left_ids.size(); ++i)
+    actual.emplace_back(left_valid[i] ? left_ids[i] : -1, right_ids[i]);
+  std::sort(actual.begin(), actual.end());
+  std::sort(expected.begin(), expected.end());
+  REQUIRE(actual == expected);
 }

@@ -25,15 +25,20 @@
 #include "expression/join_condition.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "sirius_context.hpp"
 #include "utils/sirius_test_env.hpp"
 
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <duckdb/execution/column_binding_resolver.hpp>
 #include <duckdb/main/config.hpp>
+#include <duckdb/main/settings.hpp>
 #include <duckdb/optimizer/optimizer.hpp>
 #include <duckdb/parser/parser.hpp>
+#include <duckdb/planner/expression/bound_comparison_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
+#include <duckdb/planner/operator/logical_comparison_join.hpp>
+#include <duckdb/planner/operator/logical_dummy_scan.hpp>
 #include <duckdb/planner/planner.hpp>
 #include <unistd.h>
 
@@ -90,7 +95,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> generate_sirius_plan(
 
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> result;
   try {
-    Parser parser(context.GetParserOptions());
+    Parser parser(context);
     parser.ParseQuery(query);
     REQUIRE(!parser.statements.empty());
 
@@ -100,7 +105,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> generate_sirius_plan(
 
     auto plan = std::move(planner.plan);
 
-    if (context.config.enable_optimizer) {
+    if (duckdb::Settings::Get<duckdb::EnableOptimizerSetting>(context)) {
       Optimizer optimizer(*planner.binder, context);
       plan = optimizer.Optimize(std::move(plan));
     }
@@ -108,7 +113,8 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> generate_sirius_plan(
     plan->ResolveOperatorTypes();
 
     ColumnBindingResolver resolver;
-    ColumnBindingResolver::Verify(*plan);
+    duckdb::ColumnBindingResolver verifier(true);
+    verifier.VisitOperator(*plan);
     resolver.VisitOperator(*plan);
 
     sirius::planner::sirius_physical_plan_generator gen(context);
@@ -352,4 +358,107 @@ TEST_CASE_METHOD(join_expression_key_fixture,
   REQUIRE(!con->Query("INSERT INTO names VALUES ('Call Center'), (NULL)")->HasError());
   auto plan = generate_sirius_plan(*con, "SELECT lower(name), upper(name) FROM names");
   REQUIRE(plan);
+}
+
+TEST_CASE_METHOD(join_expression_key_fixture,
+                 "DELIM join with an arbitrary condition declines before wrapping the join",
+                 "[join_expression_key][isolated_context]")
+{
+  auto join =
+    make_uniq<LogicalComparisonJoin>(JoinType::INNER, LogicalOperatorType::LOGICAL_DELIM_JOIN);
+  join->delim_flipped = GENERATE(false, true);
+  join->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(0)));
+  join->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(1)));
+  join->conditions.emplace_back(make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 0),
+                                make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 0),
+                                ExpressionType::COMPARE_EQUAL);
+  join->conditions.emplace_back(BoundComparisonExpression::Create(
+    ExpressionType::COMPARE_GREATERTHAN,
+    make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 0),
+    make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 1)));
+  join->ResolveOperatorTypes();
+  sirius::planner::sirius_physical_plan_generator planner(*con->context);
+  CHECK_THROWS_WITH(planner.create_plan(std::move(join)),
+                    Catch::Matchers::ContainsSubstring("arbitrary join conditions"));
+}
+
+TEST_CASE_METHOD(join_expression_key_fixture,
+                 "BUILD_PROBE resident budget stays connection-local through SET and RESET",
+                 "[config][query_options][build_probe][isolated_context]")
+{
+  Connection other(*db);
+  auto runtime = con->context->registered_state->Get<SiriusContext>("sirius_state");
+  REQUIRE(runtime);
+  auto const default_budget =
+    runtime->get_config().get_operator_params().max_build_probe_resident_bytes;
+  REQUIRE(default_budget > 16);
+  auto execute = [](Connection& connection, const char* sql) {
+    auto result = connection.Query(sql);
+    REQUIRE(result);
+    if (result->HasError()) { INFO(result->GetError()); }
+    REQUIRE_FALSE(result->HasError());
+  };
+  auto make_plan = [](Connection& connection) {
+    auto plan = generate_sirius_plan(
+      connection, "SELECT l.val, r.other FROM big_left l JOIN small_right r ON l.id = r.rid");
+    REQUIRE(plan);
+    REQUIRE(find_hash_join(plan.get()));
+    return plan;
+  };
+  auto require_admission =
+    [&](sirius::op::sirius_physical_operator& plan, uint64_t budget, bool admitted) {
+      auto* join = find_hash_join(&plan);
+      REQUIRE(join);
+      CHECK(join->max_build_probe_resident_bytes == budget);
+      // This planner-only fixture bypasses pipeline conversion, which normally assigns IDs.
+      join->operator_id = 0;
+      // Measure a foldable two-row INTEGER build, well within the hash-table budget.
+      auto strategy = join->get_partition_strategy({16, true, true, 16, 2, 2, 16});
+      CHECK(strategy.build_probe == admitted);
+    };
+  auto require_connection = [&](Connection& connection, uint64_t budget, bool admitted) {
+    auto readback =
+      connection.Query("SELECT current_setting('max_build_probe_resident_bytes')::UBIGINT");
+    REQUIRE(readback);
+    REQUIRE_FALSE(readback->HasError());
+    CHECK(readback->Collection().GetValue(0, 0).GetValue<uint64_t>() == budget);
+    auto plan = make_plan(connection);
+    require_admission(*plan, budget, admitted);
+  };
+
+  execute(*con, "SET max_build_probe_resident_bytes = 0");
+  auto disabled_plan = make_plan(*con);
+  require_connection(*con, 0, false);
+  require_connection(other, default_budget, true);
+
+  execute(other, "SET SESSION max_build_probe_resident_bytes = 65536");
+  auto enabled_plan = make_plan(other);
+  require_connection(other, 65536, true);
+  require_connection(*con, 0, false);
+
+  execute(other, "RESET max_build_probe_resident_bytes");
+  require_connection(other, default_budget, true);
+  require_connection(*con, 0, false);
+
+  execute(other, "SET max_build_probe_resident_bytes = 0");
+  execute(*con, "RESET max_build_probe_resident_bytes");
+  require_connection(*con, default_budget, true);
+  require_connection(other, 0, false);
+  // Plans retain their captured budgets across both connections' SET/RESET calls.
+  require_admission(*disabled_plan, 0, false);
+  require_admission(*enabled_plan, 65536, true);
+
+  for (auto sql : {"SET GLOBAL max_build_probe_resident_bytes = 1",
+                   "SET max_build_probe_resident_bytes = -1",
+                   "SET max_build_probe_resident_bytes = 18446744073709551616"}) {
+    auto rejected = con->Query(sql);
+    REQUIRE(rejected);
+    REQUIRE(rejected->HasError());
+  }
+  require_connection(*con, default_budget, true);
+  require_connection(other, 0, false);
+  Connection fresh(*db);
+  require_connection(fresh, default_budget, true);
+  CHECK(runtime->get_config().get_operator_params().max_build_probe_resident_bytes ==
+        default_budget);
 }

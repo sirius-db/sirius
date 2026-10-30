@@ -48,7 +48,7 @@ struct scoped_setting {
     auto current = con.Query("SELECT current_setting('" + name + "');");
     REQUIRE(current);
     REQUIRE_FALSE(current->HasError());
-    original = current->GetValue(0, 0).ToString();
+    original = current->Collection().GetValue(0, 0).ToString();
 
     auto result = con.Query("SET " + name + " = " + std::to_string(value) + ";");
     REQUIRE(result);
@@ -94,7 +94,7 @@ struct disabled_optimizers_guard {
     auto current = con.Query("SELECT current_setting('disabled_optimizers');");
     REQUIRE(current);
     REQUIRE_FALSE(current->HasError());
-    original    = current->GetValue(0, 0).ToString();
+    original    = current->Collection().GetValue(0, 0).ToString();
     auto merged = original.empty() ? optimizers : original + "," + optimizers;
     auto result = con.Query("SET disabled_optimizers = '" + merged + "';");
     REQUIRE(result);

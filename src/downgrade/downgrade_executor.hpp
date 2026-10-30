@@ -21,6 +21,7 @@
 #include "exec/config.hpp"
 #include "exec/interruptible_mpmc.hpp"
 #include "exec/multi_index_priority_queue.hpp"
+#include "exec/query_lifecycle_registry.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "parallel/task.hpp"
 
@@ -32,6 +33,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <exception>
 #include <functional>
 #include <future>
 #include <memory>
@@ -75,6 +77,10 @@ struct downgrade_request {
  * candidate batches, and dispatches downgrade tasks to the thread pool.
  *
  * This is a standalone class with its own thread pool and request queue.
+ * Request futures become ready only after dispatched workers release their captures and extracted
+ * candidates are returned or retired. Dispatch failures, including stream acquisition failures,
+ * reach the future as the original exception, even if earlier workers freed memory. The executor
+ * can serve subsequent requests.
  */
 class downgrade_executor {
  public:
@@ -90,6 +96,7 @@ class downgrade_executor {
    * @param pipeline_task_queue Optional pointer to pipeline task queue for tiered fallback
    */
   explicit downgrade_executor(
+    sirius::exec::query_lifecycle_registry& lifecycle,
     exec::downgrade_executor_config config,
     sirius::data::data_repository_manager_registry& data_repo_registry,
     cucascade::memory::memory_space_id space_id,
@@ -178,6 +185,21 @@ class downgrade_executor {
   }
 
  private:
+  friend struct downgrade_executor_test_access;
+
+  enum class stream_acquisition_site { repository, pipeline_queue };
+
+  // Tests arm this only while request processing is idle, before publishing the request. The
+  // processing thread consumes it once, before acquiring a stream.
+  struct stream_acquisition_fault {
+    stream_acquisition_site site;
+    size_t skip;
+    std::exception_ptr error;
+    std::function<void()> before_failure;
+  };
+  std::optional<stream_acquisition_fault> _stream_acquisition_fault;
+  void maybe_fail_stream_acquisition(stream_acquisition_site site);
+
   void processing_loop();
   void monitor_loop();
   void cancel_pending_requests();
@@ -216,6 +238,8 @@ class downgrade_executor {
   // Non-owning pointer into task_scheduler. SiriusContext stops this executor before destroying
   // the scheduler and its queue.
   sirius::exec::multi_index_priority_queue<sirius::parallel::itask>* _pipeline_task_queue{nullptr};
+  /// Non-owning; the runtime or test fixture must outlive this executor.
+  sirius::exec::query_lifecycle_registry& _query_lifecycle;
 };
 
 }  // namespace parallel

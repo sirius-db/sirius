@@ -16,9 +16,13 @@
 
 #pragma once
 
+#include <cudf/types.hpp>
+
 #include <rmm/resource_ref.hpp>
 
 #include <cuda/stream>
+
+#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -38,6 +42,10 @@ class table;
 namespace simpatico {
 class compressed_table;
 }  // namespace simpatico
+
+namespace cucascade::memory {
+class memory_space;
+}  // namespace cucascade::memory
 
 namespace sirius {
 
@@ -99,6 +107,10 @@ struct membership_probe {
   membership_probe_fn probe;
   std::uint8_t selectivity_rank = 255;
   std::uint64_t num_keys        = 0;
+  /// Echoed with this probe's own keep ratio
+  /// (@ref pushdown_outcome::membership_keep_observation::probes), so the caller can tell which
+  /// filter it measured.
+  std::size_t tag = 0;
 };
 
 /// One chunk's MVCC visibility mask: ceil(row_count / 32) packed words in cuDF bitmask
@@ -109,6 +121,18 @@ struct decode_visibility_mask {
   std::size_t row_count = 0;
 
   [[nodiscard]] bool has_mask() const noexcept { return words != nullptr; }
+};
+
+/// Whether a decode should report how many rows its join filters kept.
+///
+/// A scan asks while it is still deciding whether its join filters are worth applying, or which of
+/// them are. Measuring adds a few counting kernels to the decode, but no host synchronization.
+struct membership_measurement_request {
+  /// Report the keep ratios on @ref pushdown_outcome::membership_keep.
+  bool measure = false;
+  /// The membership probes are every dynamic filter the scan would otherwise apply after decode,
+  /// so a measurement covering every probe describes the whole set.
+  bool complete = false;
 };
 
 /// What one scan asks the decoder to do to one chunk.
@@ -145,6 +169,14 @@ struct pushdown_request {
   /// the request can reconsider when a tighter set arrives.
   std::uint64_t membership_generation = 0;
 
+  /// Types the scan restores each slot to (parallel to @c columns), or empty. A compacted decode
+  /// may write a slot directly in its restore type, saving the scan's widening cast (see
+  /// @ref decompression_pushdown_scan::with_output_types).
+  std::vector<std::optional<cudf::data_type>> output_types;
+  /// Whether the decode reports the @c membership probes' keep ratio. Replaced together with the
+  /// probes.
+  membership_measurement_request membership_measurement;
+
   /// True iff the @c range entries are the scan's WHOLE row-restricting
   /// filter. Only then can a chunk come back needing no filter at all; a
   /// partial request always leaves a residual for the scan to evaluate.
@@ -164,6 +196,12 @@ struct pushdown_request {
   /// copy it along with everything else.
   bool row_selection_disabled = false;
 
+  /// The scan reads VALUES only from slots [0, output_prefix_width); the slots after them are
+  /// pure-filter columns, read only by the scan's filter. Set only when it lies in [1,
+  /// columns.size()); unset means every slot is read. Static knowledge about the projection: it
+  /// adds no conjunct and counts towards neither @ref empty nor @ref selects_rows.
+  std::optional<std::size_t> output_prefix_width;
+
   [[nodiscard]] bool empty() const noexcept;
   /// True iff any entry asks for rows to be DROPPED (as opposed to a column
   /// being answered in place, which changes no row count).
@@ -181,6 +219,10 @@ struct pushdown_outcome {
   /// The decode applied the scan's ENTIRE row filter and every column is
   /// compacted to the surviving rows, so the scan can skip filtering
   /// altogether and only project.
+  ///
+  /// The scan's filter is its own pushed-down filter. Join filters
+  /// (`pushdown_request::column_entry::membership`) are not part of it: they are optional, so
+  /// whether any of them ran on a batch does not bear on this flag.
   ///
   /// A partially applied request must leave this false: the residual conjuncts
   /// still have to run, and re-checking already-applied ones on the surviving
@@ -221,10 +263,50 @@ struct pushdown_outcome {
   /// scan must not re-apply it: a positional mask over a compacted batch selects wrongly.
   bool visibility_mask_applied = false;
 
+  /// The decoded table holds only the request's leading @ref pushdown_request::output_prefix_width
+  /// columns: the pure-filter columns after them were tested while decoding but never delivered.
+  /// Set only together with @ref row_filtered, which is what makes their absence safe -- no
+  /// residual filter is left to read them.
+  bool filter_only_columns_dropped = false;
+
+  /// How many rows the join filters kept, for a request that asked
+  /// (@ref pushdown_request::membership_measurement). Empty when the decode evaluated none of
+  /// its join filters, for example because it declined the request.
+  struct membership_keep_observation {
+    /// @ref pushdown_request::membership_generation of the probes that ran.
+    std::uint64_t generation = 0;
+    /// Rows the probes were evaluated on: the chunk's rows that passed every other row source.
+    std::size_t rows_before = 0;
+    /// Rows among those that every probe that ran kept.
+    std::size_t rows_after = 0;
+    /// Every probe of a complete request ran
+    /// (@ref membership_measurement_request::complete), so the ratio covers the whole set.
+    bool complete = false;
+    /// One join filter's share of the measurement.
+    struct probe_keep {
+      /// @ref membership_probe::tag of the probe.
+      std::size_t tag = 0;
+      /// Rows the probe was evaluated on: those that passed every other row source and every
+      /// join filter that ran before it.
+      std::size_t rows_before = 0;
+      /// Rows among those that the probe kept.
+      std::size_t rows_after = 0;
+    };
+    /// Every probe that ran, in the order they ran.
+    std::vector<probe_keep> probes;
+  };
+  std::optional<membership_keep_observation> membership_keep;
+
+  /// The request carried join filters, but none of them removed rows from this batch: the decode
+  /// refused or declined them, or gave compaction up and returned every row. The batch is then
+  /// as unfiltered by them as one decoded without them.
+  bool membership_skipped = false;
+
   [[nodiscard]] bool any() const noexcept
   {
     return row_filtered || selection_unprofitable || !predicate_columns.empty() ||
-           visibility_mask_applied;
+           visibility_mask_applied || filter_only_columns_dropped || membership_keep.has_value() ||
+           membership_skipped;
   }
 };
 
@@ -255,10 +337,17 @@ class decompression_pushdown_scan {
   /// to ask for.
   [[nodiscard]] std::shared_ptr<const decompression_pushdown_scan> without_row_selection() const;
 
+  /// A copy of this scan whose request carries the scan's per-slot restore types.
+  [[nodiscard]] std::shared_ptr<const decompression_pushdown_scan> with_output_types(
+    std::vector<std::optional<cudf::data_type>> output_types) const;
+
   /// This scan with its join filters replaced by a fresher snapshot. @p probes
-  /// is parallel to the selected column list.
+  /// is parallel to the selected column list; @p measurement says whether the decode reports
+  /// their keep ratio.
   [[nodiscard]] std::shared_ptr<const decompression_pushdown_scan> with_membership_probes(
-    std::vector<std::vector<membership_probe>> probes, std::uint64_t generation) const;
+    std::vector<std::vector<membership_probe>> probes,
+    std::uint64_t generation,
+    membership_measurement_request measurement = {}) const;
 
   /// This scan narrowed to what @p chunk is worth asking: a column is only
   /// answered in place where its compression plan can resolve the predicate
@@ -289,26 +378,30 @@ class decompression_pushdown_scan {
 };
 
 /**
- * @brief Decompress @p selected columns of @p chunk into a cuDF table.
+ * @brief Decompress selected columns and report which scan filters were applied.
  *
- * With @p scan non-null, as much of its request as this chunk's compression
- * plans allow is applied during the decode; the rest is simply not applied,
- * which is always sound — the request is a conjunction, so an unapplied part
- * only means rows the scan must still reject itself. @ref decompress_result::outcome
- * says what happened. With @p scan null this is an ordinary decompress.
+ * Unsupported filters remain for the scan to evaluate. A declined filtering attempt decodes all
+ * selected columns normally. The visibility mask participates only with a supported filter source;
+ * check pushdown_outcome::visibility_mask_applied before omitting it downstream.
  *
- * @p keep_mask is one additional AND source, keeping a masked chunk eligible for
- * compaction. Never a source on its own; only an applied decode consumes it
- * (@c pushdown_outcome::visibility_mask_applied).
+ * @p tracking_scope must match @p space. Per-stream tracking uses @p stream alone; per-thread
+ * tracking may use private streams ordered after its queued input writes. @p space and @p mr must
+ * belong to the current GPU.
  *
- * Never returns a null table: every way the filtering can decline ends in the
- * plain decode of the same columns.
+ * Results are complete on return. Rebind returned buffers and selection storage to @p stream before
+ * they can outlive the calling thread's private streams.
+ *
+ * @throw std::logic_error if @p space is not on the current GPU, lacks a GPU allocator, or the
+ * private pool has too few streams
  */
-decompress_result decompress_chunk(simpatico::compressed_table const& chunk,
-                                   std::span<const std::size_t> selected,
-                                   decompression_pushdown_scan const* scan,
-                                   decode_visibility_mask const& keep_mask,
-                                   ::cuda::stream_ref stream,
-                                   rmm::device_async_resource_ref mr);
+decompress_result decompress_chunk(
+  simpatico::compressed_table const& chunk,
+  std::span<const std::size_t> selected,
+  decompression_pushdown_scan const* scan,
+  decode_visibility_mask const& keep_mask,
+  cucascade::memory::memory_space const& space,
+  cucascade::memory::reservation_aware_resource_adaptor::AllocationTrackingScope tracking_scope,
+  ::cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr);
 
 }  // namespace sirius

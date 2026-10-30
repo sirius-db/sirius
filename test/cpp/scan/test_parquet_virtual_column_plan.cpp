@@ -55,12 +55,14 @@ TEST_CASE("parquet virtual scan plan assigns stable D M C and output positions",
                                           {1, 0, 2, 1, 3},
                                           {"x", "text"},
                                           physical_types(),
-                                          /*output_types_size=*/4,
+                                          /*projected_output_count=*/4,
                                           {},
                                           parquet_virtuals());
 
   REQUIRE(plan.data_columns.size() == 1);
   CHECK(plan.data_columns[0].primary_idx == 0);
+  CHECK((plan.columns.data_roles == std::vector<scan::scan_column_layout::data_role>{
+                                      scan::scan_column_layout::data_role::OUTPUT}));
   REQUIRE(plan.virtual_columns.size() == 3);
   CHECK(plan.virtual_columns[0].materialized_idx == 1);
   CHECK(plan.virtual_columns[1].materialized_idx == 2);
@@ -77,6 +79,10 @@ TEST_CASE("parquet virtual scan plan assigns stable D M C and output positions",
   CHECK(plan.output_layout[1].idx == 0);
   CHECK(plan.output_layout[2].idx == 2);
   CHECK(plan.output_layout[3].idx == 1);
+  CHECK((plan.columns.output_data_positions == std::vector<std::size_t>{1, 0, 2, 1}));
+  CHECK_FALSE(plan.columns.output_is_identity);
+  CHECK_FALSE(scan::output_is_leading_prefix(plan));
+  CHECK(scan::output_prefix_width(plan) == 3);
 }
 
 TEST_CASE("parquet virtual-only plan chooses a VARCHAR carrier before assigning M",

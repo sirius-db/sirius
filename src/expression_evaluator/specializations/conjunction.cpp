@@ -70,7 +70,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::conjunction const& a
   }
   auto const ast_op_count = alt.cudf_ast_op_count();
 
-  if (_strategy != expression_evaluator_strategy::MATERIALIZE &&
+  if (_policy.strategy != expression_evaluator_strategy::MATERIALIZE &&
       (mode == evaluation_mode::AST || ast_op_count >= _min_ast_size)) {
     auto const ast_op = conjunction_op_to_ast(alt.op);
 

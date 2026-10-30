@@ -19,6 +19,7 @@
 #include "data/data_batch_utils.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
+#include "op/aggregate/stddev.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -28,8 +29,29 @@
 #include <cudf/lists/count_elements.hpp>
 #include <cudf/unary.hpp>
 
+#include <algorithm>
+#include <limits>
+
 namespace sirius {
 namespace op {
+
+namespace {
+
+// Target average rows per partition, leaving headroom below cuDF's 2^31 row limit.
+// Hash skew can still put an individual partition over the limit.
+constexpr uint64_t GROUPED_MERGE_TARGET_ROWS_PER_PARTITION = uint64_t{1} << 30;
+
+// max(1, ceil(total_rows / target)), saturating at INT_MAX.
+constexpr int grouped_merge_min_partitions_for_rows(uint64_t total_rows)
+{
+  uint64_t const parts = total_rows / GROUPED_MERGE_TARGET_ROWS_PER_PARTITION +
+                         (total_rows % GROUPED_MERGE_TARGET_ROWS_PER_PARTITION != 0 ? 1 : 0);
+  uint64_t const clamped = std::max<uint64_t>(
+    1, std::min<uint64_t>(parts, static_cast<uint64_t>(std::numeric_limits<int>::max())));
+  return static_cast<int>(clamped);
+}
+
+}  // namespace
 
 // Helpers create_group_chunk_types / copy_expressions were used by the original grouping-sets
 // initialization path (now dead) and by the merge clone-from-parent ctor (which now takes pre-
@@ -101,7 +123,9 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
     cudf_aggregate_struct_col_indices(std::move(cudf_aggregate_struct_col_indices)),
     aggregate_slots(std::move(aggregate_slots)),
     has_avg(has_avg),
-    has_count_distinct(has_count_distinct)
+    has_count_distinct(has_count_distinct),
+    cudf_aggregate_is_wide_integer_sum(
+      wide_integer_sum_mask(this->aggregate_slots, this->cudf_aggregates.size()))
 {
 }
 
@@ -150,30 +174,45 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
   aggregate_slots                   = std::move(cudf_defs.aggregate_slots);
   has_avg                           = cudf_defs.has_avg;
   has_count_distinct                = cudf_defs.has_count_distinct;
+  cudf_aggregate_is_wide_integer_sum =
+    wide_integer_sum_mask(aggregate_slots, cudf_aggregates.size());
 }
 
 partition_strategy sirius_physical_grouped_aggregate_merge::get_partition_strategy(
   const partition_sizing_input& in)
 {
   int const natural = natural_num_partitions(in.total_bytes, _hash_partition_bytes, num_gpus());
+  // The merge concatenates its partition's input and a cuDF column holds fewer than 2^31 rows.
+  // Raise the byte-based count to target at most 2^30 rows per partition on average. This is a
+  // sizing safeguard for large byte targets, not a per-partition bound under hash skew.
+  int const count = std::max(natural, grouped_merge_min_partitions_for_rows(in.total_rows));
+  if (count > natural) {
+    SIRIUS_LOG_DEBUG(
+      "merge_group_by raised the partition count from {} to {} for {} estimated rows, targeting "
+      "at most {} rows per partition on average",
+      natural,
+      count,
+      in.total_rows,
+      GROUPED_MERGE_TARGET_ROWS_PER_PARTITION);
+  }
   // Pre-size this merge's single input repository so every partition slot exists before batches
   // arrive (grouping is never broadcast / build-probe). Guarded on strictly-greater to respect the
   // repository's set_num_partitions contract.
-  if (natural > 1) {
+  if (count > 1) {
     std::lock_guard<std::mutex> lg(lock);
     if (!ports.empty()) {
       auto& repo = ports.begin()->second->repo;
-      if (repo != nullptr && static_cast<std::size_t>(natural) > repo->num_partitions()) {
-        repo->set_num_partitions(static_cast<std::size_t>(natural));
+      if (repo != nullptr && static_cast<std::size_t>(count) > repo->num_partitions()) {
+        repo->set_num_partitions(static_cast<std::size_t>(count));
       }
     }
   }
-  return partition_strategy{natural,
+  return partition_strategy{count,
                             /*broadcast=*/false,
                             /*build_probe=*/false,
-                            natural == 1 ? partition_placement::unpinned(1)
-                                         : partition_placement::round_robin(
-                                             static_cast<std::size_t>(natural), active_gpu_ids())};
+                            count == 1 ? partition_placement::unpinned(1)
+                                       : partition_placement::round_robin(
+                                           static_cast<std::size_t>(count), active_gpu_ids())};
 }
 
 std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::get_next_task_input_data()
@@ -216,8 +255,22 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
       "We expect at least one input batch for grouped aggregate merge operator");
   }
 
+  bool const has_stddev =
+    std::ranges::any_of(aggregate_slots, [](auto const& slot) { return slot.is_stddev_samp; });
+  auto const num_group_cols = static_cast<int>(num_output_group_columns());
+  // An aggregate whose result is HUGEINT but whose sum stayed INT64 is widened to HUGEINT's
+  // DECIMAL128 carrier in the post-merge projection; a DECIMAL128 one passes through.
+  auto const has_int64_hugeint = [&](cudf::table_view const& view) {
+    return std::ranges::any_of(aggregate_slots, [&](auto const& slot) {
+      return slot.returns_hugeint &&
+             view.column(num_group_cols + static_cast<int>(slot.cudf_idx)).type().id() ==
+               cudf::type_id::INT64;
+    });
+  };
+
   // Fast path: single batch with no post-processing needed
-  if (input_batches.size() == 1 && !has_avg && !has_count_distinct) {
+  if (input_batches.size() == 1 && !has_avg && !has_count_distinct && !has_stddev &&
+      !has_int64_hugeint(get_cudf_table_view(input_batches[0]))) {
     return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
   }
 
@@ -230,16 +283,29 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
       stream,
       telemetry::quent_data_batch_probe::create(batch_telemetry(), clone_batch_id));
   } else {
+    // cuDF's SUM wraps past 128 bits; a HUGEINT input's partials can get there.
+    for (auto const& slot : aggregate_slots) {
+      if (!slot.sums_hugeint_input) { continue; }
+      std::vector<cudf::column_view> partials;
+      for (auto const& batch : input_batches) {
+        partials.push_back(
+          get_cudf_table_view(batch).column(num_group_cols + static_cast<int>(slot.cudf_idx)));
+      }
+      require_decimal128_partial_sums_in_range(
+        partials, stream, input_batches[0].get_memory_space()->get_default_allocator());
+    }
     merged = gpu_merge_impl::merge_grouped_aggregate(input_batches,
                                                      static_cast<int>(num_output_group_columns()),
                                                      cudf_aggregates,
                                                      stream,
                                                      *input_batches[0].get_memory_space(),
-                                                     batch_telemetry());
+                                                     batch_telemetry(),
+                                                     cudf_aggregate_is_wide_integer_sum);
   }
 
   // If no post-processing needed, return merged result directly
-  if (!has_avg && !has_count_distinct) {
+  if (!has_avg && !has_count_distinct && !has_stddev &&
+      !has_int64_hugeint(get_cudf_table_view(merged->to_read_only()))) {
     return std::make_unique<pipelineable_operator_data>(
       std::vector<std::shared_ptr<::cucascade::data_batch>>{merged});
   }
@@ -247,12 +313,11 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
   // Post-merge projection: handle AVG (SUM/COUNT) and COUNT DISTINCT (list element count).
   // Release ownership of the merged table's columns so we can move (not copy) them.
   // Acquire EXCLUSIVE lock since release_table() is a mutating operation
-  auto merged_mut    = merged->to_mutable();
-  auto* space        = merged_mut.get_memory_space();
-  auto mr            = space->get_default_allocator();
-  auto& gpu_rep      = merged_mut.get_data()->cast<cucascade::gpu_table_representation>();
-  auto merged_cols   = gpu_rep.release_table(stream)->release();
-  int num_group_cols = static_cast<int>(num_output_group_columns());
+  auto merged_mut  = merged->to_mutable();
+  auto* space      = merged_mut.get_memory_space();
+  auto mr          = space->get_default_allocator();
+  auto& gpu_rep    = merged_mut.get_data()->cast<cucascade::gpu_table_representation>();
+  auto merged_cols = gpu_rep.release_table(stream)->release();
 
   std::vector<std::unique_ptr<cudf::column>> output_cols;
 
@@ -271,7 +336,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
       auto count_view = merged_cols[count_col_idx]->view();
 
       std::unique_ptr<cudf::column> avg_col;
-      bool is_decimal = sirius::IsCudfTypeDecimal(slot.output_type);
+      bool is_decimal = cudf::is_fixed_point(slot.output_type);
       if (is_decimal) {
         // DECIMAL: divide directly in fixed-point to preserve precision
         avg_col = cudf::binary_operation(
@@ -290,6 +355,9 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
       }
 
       output_cols.push_back(std::move(avg_col));
+    } else if (slot.is_stddev_samp) {
+      output_cols.push_back(
+        finalize_stddev(merged_cols[num_group_cols + slot.cudf_idx]->view(), stream, mr));
     } else if (slot.is_count_distinct) {
       // The merged column is a LIST column (output of MERGE_SETS). Count elements per row to
       // produce the final distinct count, then cast to INT64.
@@ -299,6 +367,10 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
       auto count_int64 =
         cudf::cast(count_int32->view(), cudf::data_type{cudf::type_id::INT64}, stream, mr);
       output_cols.push_back(std::move(count_int64));
+    } else if (slot.returns_hugeint) {
+      // INT64 is widened to HUGEINT's carrier; DECIMAL128 passes through.
+      int col_idx = num_group_cols + static_cast<int>(slot.cudf_idx);
+      output_cols.push_back(to_hugeint_carrier(std::move(merged_cols[col_idx]), stream, mr));
     } else {
       // Move non-AVG, non-count-distinct aggregate columns directly (zero-copy)
       int col_idx = num_group_cols + static_cast<int>(slot.cudf_idx);

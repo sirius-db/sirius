@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "exec/query_lifecycle_registry.hpp"
 #include "helper/helper.hpp"
 
 #include <cudf/utilities/default_stream.hpp>
@@ -96,6 +97,18 @@ class itask {
   itask(itask&&)                 = delete;
   itask& operator=(itask&&)      = delete;
 
+  // A task retains its claim through all derived/base destructors, including callbacks.
+  // Transfers between queues must not replace an already held claim.
+  void retain_work(exec::query_lifecycle_registry::work_lease lease) noexcept
+  {
+    if (!_work_lease) { _work_lease = std::move(lease); }
+  }
+
+  exec::query_lifecycle_registry::work_lease take_work_lease() noexcept
+  {
+    return std::move(_work_lease);
+  }
+
   // Execution function.
   virtual void execute(::cuda::stream_ref stream) = 0;
 
@@ -120,6 +133,10 @@ class itask {
   itask_local_state* local_state() noexcept { return _local_state.get(); }
   [[nodiscard]] itask_global_state* global_state() noexcept { return _global_state.get(); }
   [[nodiscard]] uint64_t get_task_id() const noexcept { return _task_id; }
+
+ private:
+  // Declared before task state: released last, after all borrowed state is destroyed.
+  exec::query_lifecycle_registry::work_lease _work_lease;
 
  protected:
   uint64_t _task_id;

@@ -18,13 +18,16 @@
 
 #include "telemetry/data_batch_probe.hpp"
 
+#include <cudf/aggregation.hpp>
 #include <cudf/cudf_utils.hpp>
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
+#include <cstdint>
 #include <memory>
+#include <optional>
 #include <set>
 #include <vector>
 
@@ -80,6 +83,19 @@ class gpu_aggregate_impl {
    *        indices. Empty entries (or an empty outer vector) use `aggregate_idx` directly.
    * @param stream CUDA stream used for device memory operations and kernel launches.
    * @param memory_space The memory space used to allocate memory for the output data batch.
+   * @param telemetry_info Per-batch telemetry sink.
+   * @param aggregate_input_max_abs Parallel to `aggregates`: plan-time |unscaled value| bound of
+   *        a decimal or wide integer SUM input (see sirius_physical_grouped_aggregate); absent
+   *        entries are measured.
+   * @param aggregate_is_wide_integer_sum Parallel to `aggregates`: true for a SUM that DuckDB
+   *        accumulates in HUGEINT (is_wide_integer_sum). Over an INT64 input such a SUM is
+   *        computed over DECIMAL128 with scale 0 when the batch could overflow INT64, and its
+   *        per-group result is then DECIMAL128 instead of INT64. An empty vector marks none.
+   * @param split_wide_integer_sums Whether such a widened SUM is computed as INT64 sums of its
+   *        32-bit halves (split_int64_halves) instead of over DECIMAL128. The caller decides; the
+   *        split is faster with few groups and slower with very many (see
+   *        sirius_physical_grouped_aggregate::split_wide_sum_max_groups).
+   * @param[out] num_groups If not null, receives the number of groups in the output.
    *
    * @return The output data batch.
    */
@@ -91,7 +107,11 @@ class gpu_aggregate_impl {
     const std::vector<std::vector<int>>& aggregate_struct_col_indices,
     ::cuda::stream_ref stream,
     cucascade::memory::memory_space& memory_space,
-    const telemetry::batch_telemetry_info& telemetry_info = {});
+    const telemetry::batch_telemetry_info& telemetry_info                    = {},
+    const std::vector<std::optional<std::uint64_t>>& aggregate_input_max_abs = {},
+    const std::vector<bool>& aggregate_is_wide_integer_sum                   = {},
+    bool split_wide_integer_sums                                             = false,
+    cudf::size_type* num_groups                                              = nullptr);
 
   /**
    * @brief Perform local grouped aggregate over several grouping sets on the input data batch.
@@ -128,6 +148,9 @@ class gpu_aggregate_impl {
    *        `group_idx`.
    * @param stream CUDA stream used for device memory operations and kernel launches.
    * @param memory_space The memory space used to allocate memory for the output data batch.
+   * @param aggregate_input_max_abs See `local_grouped_aggregate()`.
+   * @param aggregate_is_wide_integer_sum See `local_grouped_aggregate()`. Re-aggregating an INT64
+   *        partial for a coarser grouping set cannot overflow: the batch was proven to fit INT64.
    *
    * @return The output data batch.
    */
@@ -141,7 +164,9 @@ class gpu_aggregate_impl {
     const std::vector<std::vector<std::size_t>>& grouping_functions,
     ::cuda::stream_ref stream,
     cucascade::memory::memory_space& memory_space,
-    const telemetry::batch_telemetry_info& telemetry_info = {});
+    const telemetry::batch_telemetry_info& telemetry_info                    = {},
+    const std::vector<std::optional<std::uint64_t>>& aggregate_input_max_abs = {},
+    const std::vector<bool>& aggregate_is_wide_integer_sum                   = {});
 };
 
 }  // namespace op

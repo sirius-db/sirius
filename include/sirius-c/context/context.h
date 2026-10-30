@@ -15,6 +15,9 @@ extern "C" {
  * Do not destroy a context concurrently with its use. Forking with an active
  * context is unsupported.
  *
+ * Spill-compression defaults are process-wide and persist after destruction or
+ * failed creation; the next initialization replaces them from its configuration.
+ *
  * CUDA/NVTX initialization persists even after failed creation; NVTX injection
  * settings must remain unchanged for the process lifetime. Changing
  * sirius.executor.downgrade.copy_chunk_bytes after successful creation is unsupported.

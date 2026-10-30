@@ -22,9 +22,9 @@ num_partitions = max(1, ceil(total_bytes / hash_partition_bytes))
 
 **Motivation:** During pipeline executor drain (e.g., for error recovery or pipeline transitions), in-flight task creation must be safely completed before operator destruction.
 
-**Mechanism:** `drain_pending_tasks()` drains the task creation queue via `_task_creation_queue.drain()` and waits for in-flight task creation lambdas via `_kiosk.wait_all()`.
+**Current mechanism:** `discard_pending_tasks(query_id)` disposes of queued requests/callables. The runtime owner then waits for work leases before `reset(query_id)` releases creator state and lookahead hints. Other queries remain active. See [Query lifetime and retirement](query-lifecycle.md).
 
-**Code path:** `src/creator/task_creator.cpp` — `drain_pending_tasks()`
+**Code path:** `src/creator/task_creator.cpp` — `discard_pending_tasks()` and `reset()`
 
 ### 3-Phase Sort Pipeline (PR #866)
 
@@ -72,7 +72,7 @@ details.
 
 **Motivation:** With demand-driven (`active`) task creation, a drained task queue leaves GPU workers idle even when not-yet-activated scans could already be producing work.
 
-**Mechanism:** The task creator retains a `_lookahead_queue` of candidate operators (built at query start from the plan's scan operators after the first, cleared on drain/restart). When an engine-controlled policy selects the internal `request_type::lookahead` primitive and the task scheduler finds its task queue empty, `schedule_lookahead(device_hint)` emits one speculative request for the next not-yet-activated operator, warming scans up one task at a time. The manager loop creates a single task per look-ahead request rather than draining the source. See [task-creator.md](task-creator.md).
+**Mechanism:** The task creator retains a per-query `lookahead_queue` of candidate operators (built at query start from the plan's scan operators after the first, cleared on query drain/reset). When an engine-controlled policy selects the internal `request_type::lookahead` primitive and the task scheduler finds its task queue empty, `schedule_lookahead(device_hint)` emits one speculative request for the next not-yet-activated operator, warming scans up one task at a time. The manager loop creates a single task per look-ahead request rather than draining the source. See [task-creator.md](task-creator.md).
 
 **Code path:** `src/creator/task_creator.cpp` — `schedule_lookahead()`; `src/pipeline/task_scheduler.cpp` — empty-queue trigger; `src/creator/config.hpp` — `request_type`
 
@@ -100,8 +100,8 @@ look-ahead is not a user-selectable YAML setting.
 
 **Mechanism:** `compute_hash_join_partition_strategy()` selects BUILD_PROBE mode when:
 - `num_partitions <= num_gpus` (one hash table per partition, at most one partition per GPU; reduces to a single partition when `num_gpus == 1`)
-- per-partition average build side < `max_build_hash_table_bytes`, foldable to a single batch per partition
-- the join is neither RIGHT-family nor `MIXED_JOIN`
+- two independent per-GPU bounds hold: the estimated cuco hash-table bytes (measured build rows x 16 B; unavailable row counts decline admission including MARK) stay under `max_build_hash_table_bytes`, and the folded build payload that stays GPU-resident for the whole probe stream stays under `max_build_probe_resident_bytes`; the build must fold to a single batch per partition
+- the join is neither RIGHT-family, `MIXED_JOIN`, nor full `OUTER`
 
 In BUILD_PROBE mode, each partition's first task builds a `cudf::hash_join` hash table and caches it; subsequent tasks for that partition only probe.
 
@@ -109,7 +109,7 @@ In BUILD_PROBE mode, each partition's first task builds a `cudf::hash_join` hash
 
 **Code path:** `src/op/sirius_physical_hash_join.cpp` — `compute_hash_join_partition_strategy()`, `get_partition_strategy()`; `src/op/sirius_physical_partition.cpp` — broadcast slot routing by the join's partition placement
 
-**Config:** `max_build_hash_table_bytes` (default: 500 MB)
+**Config:** `max_build_hash_table_bytes` (estimated hash-table bytes; default: 8× the startup-resolved `hash_partition_bytes`) and `max_build_probe_resident_bytes` (folded resident build payload; default: 8× the derived batch size)
 
 ### COUNT DISTINCT Optimization (PR #414)
 
@@ -174,7 +174,7 @@ Only applies to INNER and LEFT joins with pure equality conditions (excludes IS 
 
 **Code path:** `src/creator/task_creator.cpp` — `manager_loop()`, `src/pipeline/task_scheduler.cpp` — `schedule_next_scan_tasks()`
 
-**Config:** `max_build_hash_table_bytes` (default: 500 MB) — now independent from `concat_batch_bytes`, enabling larger build sides in BUILD_PROBE mode without affecting other joins.
+**Config:** `max_build_hash_table_bytes` (estimated hash-table bytes; default: 8× the startup-resolved `hash_partition_bytes`) — independent from `concat_batch_bytes`, enabling larger build sides in BUILD_PROBE mode without affecting other joins.
 
 ### Zero-Copy Projection Passthrough (PR #991)
 
@@ -213,6 +213,35 @@ Both feed the same `resolve_mark_join_result()`, which scatters the match indice
 - `src/planner/sirius_plan_projection_utils.cpp` — `push_projection()`, `fold_adjacent_projections()`
 - `src/planner/sirius_physical_plan_generator.cpp` — post-pass invocation of `fold_adjacent_projections()`
 - `src/expression/ast/reference_utils.cpp` — `visit_references()`, `substitute_references()`
+
+### Decimal SUM Width Selection
+
+**Motivation:** A decimal SUM must not overflow, but the widest type is also the slowest. cuDF sums
+64-bit decimals much faster than 128-bit ones, especially in a grouped aggregation with few groups,
+where 128-bit accumulation contends on the same groups. DuckDB v2 types some sums wider than their
+values need: the TPC-H Q9 profit `l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity`
+is `DECIMAL(19,4)`, held as DECIMAL128, although every value fits 64 bits. At SF1000 its group-by
+took 3.8 s instead of 28 ms.
+
+**Mechanism:** Per batch, grouped and ungrouped aggregations pick the width of each decimal SUM (and
+of AVG's SUM) from one exact
+proof: a sum of n values of magnitude at most m is at most n * m. A DECIMAL32 or DECIMAL64 input is
+widened to the next type only when rows * max|value| exceeds its storage width. A DECIMAL128 input is
+narrowed to DECIMAL64 at the same scale when rows * max|value| is at most 2^63 - 1, and the result is
+cast back to DECIMAL128, so no value and no partial sum of any group can leave the 64-bit range, and
+the merge combines the per-batch partials at the original 128-bit width. The
+bound comes from base-table statistics when the SUM input is a scan column
+(`planner::resolve_sum_input_bounds`); otherwise the batch is measured with `cudf::minmax`,
+costing one stream synchronization per batch for all measured columns together.
+
+**Code path:**
+- `src/op/aggregate/aggregate_op_util.cpp` — `sums_to_widen`, `decimal_sums_to_narrow`
+- `src/op/aggregate/gpu_aggregate_impl.cpp` — per-batch request rewriting in the grouped aggregation
+- `src/op/sirius_physical_ungrouped_aggregate.cpp` — per-batch input casts in the ungrouped reduction
+- `src/planner/decimal_sum_input_bounds.cpp` — plan-time bounds from scan statistics
+
+**Config:** `enable_decimal_sum_stats_bound` (default: `true`) lets plan-time bounds skip the
+per-batch measurement.
 
 ## Memory Optimizations
 
@@ -315,6 +344,20 @@ result materialization restore native carriers.
 `sirius.operator_params` and the DuckDB SET option. See
 [Compressed Materialization](compressed-materialization.md).
 
+### Decode to Restore Type
+
+**Motivation:** With compressed materialization, a pinned column stored in a narrow carrier is cast back to its native type by the scan whenever a type-sensitive consumer needs it. TPC-H q1 restores four DECIMAL32 columns to DECIMAL64 in every batch: a separate read and write of each column, about 25 ms of cast kernels at SF1000.
+
+**Mechanism:** When the scan's output assembly is a leading identity, it passes its restore targets down to the Simpatico decode (`pushdown_request::output_types` → `scan_filter_request::output_types` → `decode_selection::output_type`). For a compacted (filter-pushdown) decode whose root is a bitpack node, the JIT renderer declares the kernel's output in the wider element type (entry symbol suffix `_to_<type>`), so the kernel widens in its store, and the decode allocates the output column in the target type. The scan's restore cast then finds the column already restored. Supported widenings: signed integer to a wider signed integer, same-scale DECIMAL widening, and a raw signed integer to DECIMAL or `TIMESTAMP_DAYS`. Other decodes keep the restore cast. The JIT decoder only has signed element types (`int8_t` through `__int128`), so unsigned storage is not widened in place, and only a compacted decode with a bitpack root writes in the restore type.
+
+**Code path:**
+- `src/op/scan/sirius_gpu_scan_operator.cpp`, `src/op/scan/sirius_gpu_scan_operator_data.cpp` — restore targets
+- `src/compression/compressed_scan.cpp` — `pushdown_request::output_types`, `decompression_pushdown_scan::with_output_types()`
+- `src/compression/simpatico_codegen/src/plan/decompress.cpp` — `widened_element_dtype()`, `decode_fused_subtree_impl()`
+- `src/compression/simpatico_codegen/src/decode/jit/renderer.cpp` — `out_dtype` rendering
+
+**Config:** Always on. TPC-H SF1000 on a GB300: q1 0.769 s → 0.752 s (−17 ms); the other queries are unchanged within noise.
+
 ### Late Materialization (unreleased, experimental)
 
 **Motivation:** A query that selects wide columns carries them from the scan to whatever finally
@@ -381,9 +424,9 @@ If translation fails, filtering falls back to `expression_evaluator` on the deco
 
 **Motivation:** The scan's post-decode filter path gathered every decoded column and then dropped pure-filter columns (read only for the predicate) during projection — materializing data just to throw it away. The standalone `FILTER` operator had the same waste for columns not needed downstream.
 
-**Mechanism:** `expression_evaluator::select(input, output_indices)` evaluates the predicate over the full input (pure-filter columns stay visible to it) but gathers only the requested output columns. Because `scan_plan::data_columns` is laid out output-first, the kept columns are the contiguous prefix `[0, K)`, so existing assembly and prefix projection apply unchanged. For the FILTER operator, `sirius_plan_filter` translates DuckDB's `LogicalFilter::projection_map` into `output_indices` on `sirius_physical_filter` (empty means keep all). `count(*)`-style filters with no output columns use the all-columns overload, since a 0-column/N-row gather result is unrepresentable.
+**Mechanism:** `expression_evaluator::select(input, output_indices)` evaluates the predicate over the full input (filter-only columns stay visible to it) but gathers only the requested output columns. The planner records the output boundary before appending filter reads. `scan_plan` resolves it into materialized slot roles and ordered output positions; the reader still places outputs before filter-only columns. A row-count carrier has its own role and is retained for column-less scans. For the FILTER operator, `sirius_plan_filter` translates DuckDB's `LogicalFilter::projection_map` into `output_indices` on `sirius_physical_filter` (empty means keep all). `count(*)`-style filters with no output columns use the all-columns overload, since a 0-column/N-row gather result is unrepresentable. On a GPU-pinned Simpatico-compressed chunk whose filtered decode applied the scan's whole filter, the decode itself omits the filter-only slots (`pushdown_outcome::filter_only_columns_dropped`): they are tested while the selection is built but never decoded, and the batch can be taken over by the scan without a copy when its planned output layout is a leading identity (see [Compressed Pinning](compressed-pinning.md)).
 
-**Code path:** `src/expression_evaluator/expression_evaluator.hpp` — `select()` overloads, `compute_mask()`; `src/op/scan/scan_plan.hpp` — `output_data_positions()`; `src/op/scan/parquet_gpu_ingestible.cpp`, `duckdb_native_gpu_ingestible.cpp`; `src/planner/sirius_plan_filter.cpp`
+**Code path:** `src/expression_evaluator/expression_evaluator.hpp` — `select()` overloads, `compute_mask()`; `src/op/scan/scan_plan.hpp` — `output_data_positions()`; `src/op/scan/parquet_gpu_ingestible.cpp`, `duckdb_native_gpu_ingestible.cpp`; `src/planner/sirius_plan_filter.cpp`; decode-time variant: `src/compression/compressed_scan.cpp`, `src/compression/simpatico_codegen/src/simpatico_codegen.cpp`, `src/op/scan/scan_plan.cpp`
 
 **Config:** none
 
@@ -504,7 +547,7 @@ If translation fails, filtering falls back to `expression_evaluator` on the deco
 
 **Motivation:** Scan splits arrive sized by metadata-parse completion rather than by the configured batch size, so batches could come out smaller than requested, and multi-GPU runs need scan inputs spread across devices. Opportunistic prefetch hints issued in metadata-completion order also rob the head-of-line pipeline of lead time.
 
-**Mechanism:** The scan manager owns a `load_balancing_scan_batch_coalescer`. Each scan pipeline registers a per-pipeline slot holding a `batch_coalescer`, a `split_connector`, and a `balancing_strategy`. A single sequencer task drains the slots in registration (execution) order: it coalesces each pipeline's splits to the requested batch size — independent of the configured max batch count — chooses a device via the balancing strategy, issues `fadvise(opportunistic)` / prefetch hints, and pushes the placed split onto the connector, advancing to the next pipeline only after the current one closes. The `balancing_strategy` interface stamps a `preferred_device_id` on each split (which the task creator honors); `round_robin_strategy` hands out GPUs via an atomic cursor and is the default.
+**Mechanism:** The scan manager creates a `load_balancing_scan_batch_coalescer` for each query. Each scan pipeline registers a per-pipeline slot holding a `batch_coalescer`, a `split_connector`, and a `balancing_strategy`. That query's sequencer task drains the slots in registration (execution) order: it coalesces each pipeline's splits to the requested batch size — independent of the configured max batch count — chooses a device via the balancing strategy, issues `fadvise(opportunistic)` / prefetch hints, and pushes the placed split onto the connector, advancing to the next pipeline only after the current one closes. The `balancing_strategy` interface stamps a `preferred_device_id` on each split (which the task creator honors); `round_robin_strategy` hands out GPUs via an atomic cursor and is the default.
 
 **Code path:**
 - `src/scan_manager/load_balancing_scan_batch_coalescer.cpp` — per-pipeline slots, sequencer loop, coalesce + place + push

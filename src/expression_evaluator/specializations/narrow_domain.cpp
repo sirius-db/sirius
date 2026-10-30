@@ -23,7 +23,8 @@
 #include <sirius/exception.hpp>
 
 // cudf
-#include <cudf/ast/expressions.hpp>
+#include "cudf/ast_compat.hpp"
+
 #include <cudf/cudf_utils.hpp>
 #include <cudf/fixed_point/fixed_point.hpp>
 #include <cudf/scalar/scalar.hpp>

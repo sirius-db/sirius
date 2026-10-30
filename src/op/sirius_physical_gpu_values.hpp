@@ -25,50 +25,6 @@
 namespace sirius::op {
 
 /**
- * @brief Task input descriptor for sirius_physical_gpu_values.
- *
- * Source operator data: owns no upstream batches, so prepare_for_processing
- * only captures the task reservation's memory space so
- * sirius_physical_gpu_values::execute knows where to materialize the output
- * table (mirrors scan_operator_input). Deliberately NOT a
- * pipelineable_operator_data: the task creator treats empty-batch
- * pipelineable input as "no data" and would skip task creation.
- */
-class gpu_values_input : public operator_data {
- public:
-  explicit gpu_values_input(std::size_t estimated_bytes) : _estimated_bytes(estimated_bytes) {}
-
-  [[nodiscard]] operator_data_type get_type() const override
-  {
-    return operator_data_type::GPU_VALUES;
-  }
-
-  void prepare_for_processing(const ::cucascade::memory::memory_space* requested_memory_space,
-                              ::cuda::stream_ref /*stream*/) override
-  {
-    _gpu_memory_space = const_cast<::cucascade::memory::memory_space*>(requested_memory_space);
-  }
-
-  /// Feeds the reservation system's input_basis (see
-  /// gpu_pipeline_task_local_state::get_task_consumption_basis).
-  [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override
-  {
-    return _estimated_bytes;
-  }
-
-  /// Memory space captured by prepare_for_processing where execute()
-  /// materializes the output table.
-  [[nodiscard]] ::cucascade::memory::memory_space* get_gpu_memory_space() const
-  {
-    return _gpu_memory_space;
-  }
-
- private:
-  ::cucascade::memory::memory_space* _gpu_memory_space = nullptr;
-  std::size_t _estimated_bytes;
-};
-
-/**
  * @brief GPU source operator for plan-materialized CPU-side data.
  *
  * Replaces DuckDB source operators whose data already exists at plan time —
@@ -139,10 +95,11 @@ class sirius_physical_gpu_values : public sirius_physical_operator {
    *        cannot represent faithfully, triggering DuckDB CPU fallback.
    *
    * Called by the plan generator's replace_with_gpu_values BEFORE the operator
-   * is built and before the source's ColumnDataCollection is moved out. HUGEINT/UHUGEINT
-   * are 16 bytes in DuckDB but map to 8-byte cuDF types (silent value
-   * corruption); sub-int32 decimals and nested types have no cuDF-compatible
-   * layout (get_cudf_type would throw inside the row-copy loop, failing the
+   * is built and before the source's ColumnDataCollection is moved out. UHUGEINT maps to
+   * the 8-byte UINT64 (silent value corruption); HUGEINT has a 16-byte DECIMAL128 carrier,
+   * but this operator's row copy is not validated for it; sub-int32 decimals and nested
+   * types have no cuDF-compatible
+   * layout (conversion would fail inside the row-copy loop, failing the
    * query mid-flight instead of falling back).
    */
   static void throw_if_unsupported_types(const duckdb::vector<sirius::logical_type>& types);

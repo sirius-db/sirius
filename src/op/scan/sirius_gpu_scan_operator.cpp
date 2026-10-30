@@ -22,9 +22,9 @@
 #include <helper/numeric_narrowing.hpp>
 #include <log/logging.hpp>
 #include <memory/size_arithmetic.hpp>
-#include <op/scan/duckdb_native_gpu_ingestible.hpp>
+#include <op/scan/detail/read_retirement.hpp>
 #include <op/scan/gpu_ingestible.hpp>
-#include <op/scan/parquet_gpu_ingestible.hpp>
+#include <op/scan/scan_output_operator_data.hpp>
 #include <op/scan/sirius_gpu_scan_operator.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <op/sirius_physical_operator.hpp>
@@ -43,6 +43,7 @@
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
+#include <cudf/types.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
 // cucascade
@@ -52,6 +53,7 @@
 
 // standard library
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -67,6 +69,12 @@ constexpr std::size_t kMaxNumericCarrierExpansion = 8;
 using sirius::memory::saturating_add;
 using sirius::memory::saturating_mul;
 
+struct scan_assembly_state {
+  std::unique_ptr<cudf::table> output;
+  std::unique_ptr<cudf::column> survivors;
+  std::vector<std::unique_ptr<cudf::column>> columns;
+};
+
 /// Emit the deferred positions as a rowid and placeholders instead of values.
 ///
 /// The ids are a SEQUENCE over the origin's span, which is what makes this
@@ -79,15 +87,15 @@ using sirius::memory::saturating_mul;
 /// This runs on the FINISHED scan output, which is why v1 refuses any scan that
 /// restricts rows (see install_late_materialization). Admitting one means
 /// substituting ahead of the filter's gather so the rowid is carried through it.
-std::unique_ptr<cudf::table> substitute_deferred_columns(
-  std::unique_ptr<cudf::table> output,
-  late_mat::deferred_scan_output const& deferred,
-  late_mat::scan_batch_origin const& origin,
-  cudf::column_view const* survivors,
-  std::size_t arity,
-  ::cuda::stream_ref stream,
-  rmm::device_async_resource_ref mr)
+void substitute_deferred_columns(scan_assembly_state& state,
+                                 late_mat::deferred_scan_output const& deferred,
+                                 late_mat::scan_batch_origin const& origin,
+                                 cudf::column_view const* survivors,
+                                 std::size_t arity,
+                                 ::cuda::stream_ref stream,
+                                 rmm::device_async_resource_ref mr)
 {
+  auto& output    = state.output;
   auto const rows = output->num_rows();
   // Two shapes, and the check is what tells them apart. Unfiltered: the batch
   // IS the chunk, so row k is global row start + k. Filtered: the batch holds
@@ -107,7 +115,8 @@ std::unique_ptr<cudf::table> substitute_deferred_columns(
                              "; the rowid would address rows this batch no longer holds");
   }
 
-  auto columns = output->release();
+  auto& columns = state.columns;
+  columns       = output->release();
   // The scan may have ELIDED the deferred columns from the projection, so that
   // realizing the batch never copied values it was about to replace. Then they
   // are missing rather than present-and-overwritten, and this restores the
@@ -179,7 +188,7 @@ std::unique_ptr<cudf::table> substitute_deferred_columns(
     auto const zero   = cudf::numeric_scalar<std::int8_t>(0, true, stream, mr);
     columns[position] = cudf::make_column_from_scalar(zero, rows, stream, mr);
   }
-  return std::make_unique<cudf::table>(std::move(columns));
+  output = std::make_unique<cudf::table>(std::move(columns));
 }
 
 enum class carrier_conversion_kind : uint8_t { NONE, RESTORE, NARROW };
@@ -305,16 +314,16 @@ void record_carrier_conversions(const std::vector<carrier_conversion_plan>& plan
 /// `deferred` is null unless a late-materialization deferral is installed for this scan; passed
 /// through to preflight_physical_schema so deferred positions are skipped rather than cast (they
 /// hold a rowid/placeholder by the time this runs -- see execute()).
-std::unique_ptr<cudf::table> normalize_physical_schema(
-  std::unique_ptr<cudf::table> table,
-  const std::vector<cudf::data_type>& targets,
-  bool has_explicit_physical_schema,
-  late_mat::deferred_scan_output const* deferred,
-  duckdb::SiriusContext* observer,
-  ::cuda::stream_ref stream,
-  rmm::device_async_resource_ref mr)
+void normalize_physical_schema(scan_assembly_state& state,
+                               const std::vector<cudf::data_type>& targets,
+                               bool has_explicit_physical_schema,
+                               late_mat::deferred_scan_output const* deferred,
+                               duckdb::SiriusContext* observer,
+                               ::cuda::stream_ref stream,
+                               rmm::device_async_resource_ref mr)
 {
-  if (targets.empty()) { return table; }
+  auto& table = state.output;
+  if (targets.empty()) { return; }
 
   // Preflight while every source column remains owned. Without a sidecar, resident batches may
   // only widen a narrow stored carrier to its native type. An explicit sidecar may also narrow a
@@ -323,7 +332,10 @@ std::unique_ptr<cudf::table> normalize_physical_schema(
   auto const plan = preflight_physical_schema(
     table->view(), targets, has_explicit_physical_schema, deferred, stream, mr);
 
-  auto columns = table->release();
+  // Each source is freed as soon as its replacement is installed, so the peak holds one source
+  // beside the casts. A failed cast leaves the sources it has not replaced in the assembly.
+  auto& columns = state.columns;
+  columns       = table->release();
   for (std::size_t column_idx = 0; column_idx < columns.size(); column_idx++) {
     if (plan[column_idx].kind == carrier_conversion_kind::NONE) { continue; }
     // The source's buffers may be dealloc-bound to the pinned-cache upload stream; rebind them
@@ -334,49 +346,313 @@ std::unique_ptr<cudf::table> normalize_physical_schema(
     columns[column_idx] = std::move(casted);
   }
   record_carrier_conversions(plan, observer);
-  return std::make_unique<cudf::table>(std::move(columns));
+  table = std::make_unique<cudf::table>(std::move(columns));
+}
+
+/// The receipt @p scan starts from: the decode history of @p input's in-range output ordinals
+batch_receipt decode_receipt(sirius_gpu_scan_operator const& scan, scan_operator_input const& input)
+{
+  // History describes rows, not column contents: a deferral preserves row positions and restores
+  // the values before the endpoint reads them, so deferred ordinals keep their entries too.
+  batch_receipt receipt;
+  if (scan.consumer()) {
+    receipt.endpoint = scan.consumer()->channel();
+    for (auto const& entry : input.decode_attached) {
+      if (entry.output_ordinal < scan.types.size()) { receipt.decode_attached.push_back(entry); }
+    }
+  }
+  return receipt;
+}
+
+/// @brief Moves the table that `prepare_for_processing` freshly converted out of @p input's cached
+/// wrapper, casting its carriers to @p scan's normalization targets on the way
+///
+/// Returns null, leaving @p input untouched, when @p input is not a candidate.
+std::unique_ptr<cudf::table> transfer_converted_table(sirius_gpu_scan_operator const& scan,
+                                                      scan_operator_input const& input,
+                                                      ::cuda::stream_ref stream)
+{
+  // Only prepare_for_processing arms pending (pipeline contract: prepare runs before execute on
+  // the same task), so a non-candidate split skips the builder lambda entirely. A
+  // decode-row-filtered split may only bypass post_filter_and_project when the assembly it
+  // skips is a leading identity -- its width match alone cannot prove that, because trailing
+  // pure-filter columns can offset synthesized (partition) output columns. An unfiltered split
+  // needs no such proof: it decodes exactly the output columns, so a width match is decisive.
+  // Refused outright when a late-materialization deferral is installed: the transfer bypasses
+  // post_filter_and_project entirely, so it can neither elide the deferred columns from the
+  // projection nor hand substitute_deferred_columns the survivor positions it needs.
+  if (!scan.deferred_output().empty() || !input.converted_table_steal_pending ||
+      (input.pushdown_row_filtered &&
+       !scan.get_ingestible().output_assembly_is_leading_identity())) {
+    return nullptr;
+  }
+  auto const& targets = scan.normalization_targets();
+  auto const mr       = input.gpu_memory_space->get_default_allocator();
+  std::vector<carrier_conversion_plan> plan;
+  auto table = input.transactionally_steal_converted_table(
+    targets.size(),
+    [&](cudf::table_view source) {
+      plan = preflight_physical_schema(
+        source, targets, scan.has_physical_overrides(), /*deferred=*/nullptr, stream, mr);
+      return build_carrier_replacements(source, plan, stream, mr);
+    },
+    stream);
+  // Observation follows the commit so a failed cast attempt cannot be counted twice on retry.
+  if (table) { record_carrier_conversions(plan, scan.certificate_observer()); }
+  return table;
+}
+
+/// @brief Materializes @p input through @p scan's ingestible
+///
+/// A deferring scan's late materialization addresses whole pinned chunks, so its split must carry
+/// an origin and keep every row of that chunk.
+filtered_table materialize_source(sirius_gpu_scan_operator const& scan,
+                                  scan_operator_input const& input,
+                                  ::cuda::stream_ref stream)
+{
+  auto source = scan.get_ingestible().materialize_table(
+    input, stream, scan.like_swar_fastpath_enabled(), scan.like_cache(), scan.expression_policy());
+  if (scan.deferred_output().empty()) { return source; }
+  // Installed only where a served batch is one pinned chunk's whole row span, so a batch arriving
+  // here without an origin means the install-time conditions and the serve-time stamping have
+  // drifted apart -- and emitting values for one batch and rowids for the next hands downstream
+  // two different schemas.
+  if (!input.origin) {
+    throw std::runtime_error(
+      "[sirius_gpu_scan_operator::execute] a deferral is installed but this split carries no "
+      "origin; the scan cannot say where its rows came from");
+  }
+  // Installation refuses static filters on compressed pins, and decode_consumer() withholds
+  // dynamic membership probes, so a deferring scan's decode never removes rows. Survivor positions
+  // from a later filter index the decoded rows, so those rows must be the whole chunk. Membership
+  // compaction can remove rows without reporting pushdown_row_filtered, so the row count is the
+  // evidence.
+  if (std::cmp_not_equal(source.table.num_rows(), input.origin->range.rows)) {
+    throw internal_exception(
+      "[sirius_gpu_scan_operator::execute] the decode removed rows of a scan whose deferral "
+      "addresses whole chunks: {} of {} rows remain (static filter applied: {}, membership "
+      "probes offered: {})",
+      source.table.num_rows(),
+      input.origin->range.rows,
+      input.pushdown_row_filtered,
+      input.decode_attached.size());
+  }
+  return source;
+}
+
+/// The cached checkpoint's application, kept for `dynamic_filter_consumer::finish`, and the
+/// placement counters of one `sirius_gpu_scan_operator::execute`
+struct row_selection {
+  std::optional<application_result> cached;
+  sirius::op::dynamic_filter_stats_snapshot placement;
+};
+
+/// @brief Runs @p scan's cached dynamic-filter checkpoint over the borrowed resident @p source
+///
+/// A selection places the projected survivors, and their positions when a deferral needs them, in
+/// @p assembly. Otherwise @p source gets its rows back for the ordinary projection.
+row_selection run_cached_checkpoint(sirius_gpu_scan_operator const& scan,
+                                    scan_operator_input const& input,
+                                    batch_receipt const& receipt,
+                                    filtered_table& source,
+                                    scan_assembly_state& assembly,
+                                    ::cuda::stream_ref stream)
+{
+  row_selection selection;
+  auto& placement = selection.placement;
+  auto layout = scan.get_ingestible().view_layout(source, scan.deferred_output().output_positions);
+  if (!layout) {
+    placement.cached_declined_no_layout = 1;
+    return selection;
+  }
+  std::vector<binding> bindings;
+  bindings.reserve(layout->output_columns.size());
+  for (std::size_t ordinal = 0; ordinal < layout->output_columns.size(); ++ordinal) {
+    bindings.push_back({ordinal, layout->output_columns[ordinal]});
+  }
+  auto const& consumer = *scan.consumer();
+  auto* const space    = input.gpu_memory_space;
+  auto const view      = source.table.view();
+  auto const input_bytes =
+    sirius::estimate_referenced_column_bytes(view, layout->projected_columns, source.stored_bytes);
+  auto program = consumer.prepare({.source             = view,
+                                   .bindings           = bindings,
+                                   .input_bytes        = input_bytes,
+                                   .prior              = &receipt,
+                                   .device_id          = space->get_device_id(),
+                                   .cached_layout      = &*layout,
+                                   .want_row_positions = !scan.deferred_output().empty()});
+  if (!program) {
+    placement.cached_declined_no_membership = 1;
+    return selection;
+  }
+  auto const input_rows = source.table.num_rows();
+  auto& result          = selection.cached.emplace(consumer.apply(std::move(*program),
+                                                         std::move(source.table),
+                                                         stream,
+                                                         space->get_default_allocator(),
+                                                         scan.like_swar_fastpath_enabled(),
+                                                         scan.like_cache(),
+                                                         scan.expression_policy()));
+  assembly.output       = result.take_output();
+  assembly.survivors    = result.take_row_positions();
+  if (!assembly.output) {
+    source.table = result.take_source();
+    // A batch on another device passed through without running the program; the consumer counts it
+    // in applications_skipped_other_device.
+    if (result.completed()) { placement.cached_declined_no_membership = 1; }
+    return selection;
+  }
+  auto const applied = result.contributing_steps();
+  // Every probe declined, so the residual alone selected the rows: no membership step ran.
+  if (applied == 0) {
+    placement.cached_declined_no_membership = 1;
+    return selection;
+  }
+  placement.cached_placements          = 1;
+  placement.cached_payload_bytes       = assembly.output->alloc_size();
+  placement.cached_position_selections = assembly.survivors ? 1 : 0;
+  SIRIUS_LOG_DEBUG(
+    "[sirius_gpu_scan_operator::execute] cached checkpoint: {} -> {} rows with {} dynamic filters "
+    "folded into the gather",
+    input_rows,
+    assembly.output->num_rows(),
+    applied);
+  return selection;
+}
+
+/// @brief Filters and projects @p input into @p assembly
+///
+/// A split that `scan_operator_input::cached_checkpoint_possible` admits first offers its rows to
+/// the cached dynamic-filter checkpoint; rows it does not select take the ingestible's ordinary
+/// residual filter and projection.
+row_selection select_rows(sirius_gpu_scan_operator const& scan,
+                          scan_operator_input const& input,
+                          batch_receipt const& receipt,
+                          scan_assembly_state& assembly,
+                          ::cuda::stream_ref stream)
+{
+  bool const checkpoint = input.cached_checkpoint_possible();
+  bool const borrowed   = input.borrows_resident_batch();
+  auto source           = materialize_source(scan, input, stream);
+  row_selection selection;
+  if (checkpoint) {
+    selection = run_cached_checkpoint(scan, input, receipt, source, assembly, stream);
+  } else if (auto const& consumer = scan.consumer(); consumer && borrowed) {
+    // The scan cannot describe a cached view of this borrowed batch.
+    if (consumer->cached_placement_enabled()) {
+      selection.placement.cached_declined_no_layout = 1;
+    } else {
+      selection.placement.cached_disabled = 1;
+    }
+  }
+  if (assembly.output) { return selection; }
+  auto const& space = *input.gpu_memory_space;
+  if (source.state == filter_state::ROW_FILTERED_AND_PROJECTED) {
+    assembly.output = source.table.release(stream, space.get_default_allocator());
+    return selection;
+  }
+  // Elide the deferred columns from the projection: realizing the batch would copy values this scan
+  // is about to replace with a rowid.
+  auto const& deferred = scan.deferred_output();
+  assembly.output =
+    scan.get_ingestible().post_filter_and_project(std::move(source),
+                                                  space,
+                                                  stream,
+                                                  scan.like_swar_fastpath_enabled(),
+                                                  scan.like_cache(),
+                                                  deferred.empty() ? nullptr : &assembly.survivors,
+                                                  deferred.output_positions,
+                                                  scan.expression_policy());
+  return selection;
+}
+
+/// @brief Restores @p scan's deferred outputs and normalizes the selected rows of @p input to the
+/// planned carriers
+void finish_assembly(sirius_gpu_scan_operator const& scan,
+                     scan_operator_input const& input,
+                     scan_assembly_state& assembly,
+                     ::cuda::stream_ref stream)
+{
+  auto const mr        = input.gpu_memory_space->get_default_allocator();
+  auto const& deferred = scan.deferred_output();
+  if (!deferred.empty()) {
+    std::optional<cudf::column_view> const survivors =
+      assembly.survivors ? std::optional{assembly.survivors->view()} : std::nullopt;
+    substitute_deferred_columns(assembly,
+                                deferred,
+                                *input.origin,
+                                survivors ? &*survivors : nullptr,
+                                scan.types.size(),
+                                stream,
+                                mr);
+    detail::check_read_checkpoint(detail::read_checkpoint::SUBSTITUTION);
+  }
+  // A resident chunk is normalized even without a sidecar: it may be stored narrow (pinned with the
+  // feature on, queried with it off) and must then restore to native. AFTER substitution: the
+  // deferred positions then hold a rowid and placeholders, which it skips, and the elided columns
+  // are back so the arity check holds.
+  if (scan.has_physical_overrides() || input.is_resident()) {
+    normalize_physical_schema(assembly,
+                              scan.normalization_targets(),
+                              scan.has_physical_overrides(),
+                              deferred.empty() ? nullptr : &deferred,
+                              scan.certificate_observer(),
+                              stream,
+                              mr);
+    detail::check_read_checkpoint(detail::read_checkpoint::NORMALIZATION);
+  }
 }
 
 }  // namespace
 
+std::optional<detail::retained_scan_assembly_storage>
+detail::scan_operator_test_access::retained_assembly(
+  read_retirement_test_hooks const& hooks) noexcept
+{
+  auto const* state = hooks.retained.get<scan_assembly_state>();
+  if (state == nullptr) { return std::nullopt; }
+  return retained_scan_assembly_storage{state->output.get(), state->survivors.get()};
+}
+
 //===----------------------------------------------------------------------===//
 // sirius_gpu_scan_operator
 //===----------------------------------------------------------------------===//
+std::vector<binding> scan_decode_bindings(gpu_ingestible const& ingestible,
+                                          std::size_t output_width)
+{
+  if (!ingestible.output_assembly_is_leading_identity() ||
+      output_width > ingestible.materialized_column_order().size()) {
+    return {};
+  }
+  return identity_bindings(output_width);
+}
+
 sirius_gpu_scan_operator::sirius_gpu_scan_operator(
   duckdb::vector<sirius::logical_type> types,
   duckdb::idx_t estimated_cardinality,
   std::shared_ptr<gpu_ingestible> ingestible,
   scan_contract_id contract_id,
   duckdb::SiriusContext* compressed_materialization_observer,
-  std::shared_ptr<transparent::read_view_registry> read_views)
+  std::shared_ptr<transparent::read_view_registry> read_views,
+  std::shared_ptr<dynamic_filter_consumer> consumer)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::GPU_SCAN, std::move(types), estimated_cardinality),
     _ingestible(std::move(ingestible)),
     _read_views(std::move(read_views)),
     _contract_id(contract_id),
     _split_connector(std::make_shared<scan_manager::split_connector>()),
+    _dynamic_filter_consumer(std::move(consumer)),
     _compressed_materialization_observer(compressed_materialization_observer)
 {
   if (_contract_id == 0) {
     throw std::invalid_argument("GPU scan operator requires a nonzero scan contract ID");
   }
 
-  // Resolve the scan's dynamic-filter channel once (null for formats that carry
-  // none): every split gets it stamped so prepare_for_processing can snapshot
-  // membership filters at decode time.
-  if (_ingestible != nullptr) {
-    auto const& info = _ingestible->table_info();
-    if (auto const* pq = dynamic_cast<parquet_ingestible_table_info const*>(&info)) {
-      _dynamic_filters_channel = pq->sirius_dynamic_filters;
-    } else if (auto const* native =
-                 dynamic_cast<duckdb_native_ingestible_table_info const*>(&info)) {
-      _dynamic_filters_channel = native->sirius_dynamic_filters;
-    }
-  }
   _native_physical_types.reserve(this->types.size());
   for (std::size_t column_idx = 0; column_idx < this->types.size(); ++column_idx) {
     auto const& type  = this->types[column_idx];
-    auto const native = sirius::try_get_cudf_type(type);
+    auto const native = sirius::get_cudf_type(type);
     if (!native) {
       throw internal_exception(
         "[sirius_gpu_scan_operator] output column {} ({}) has no native cuDF carrier",
@@ -431,12 +707,23 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::get_next_task_input
     // scan (uniform per-batch selectivity), and both the working-set estimator
     // and prepare_for_processing consult the latch.
     scan_input->pushdown_selection_unprofitable = _decode_selection_unprofitable;
-    // Membership channel for the decode-time snapshot (join builds publish
-    // during execution — only a snapshot taken at prepare/decode can see them).
-    scan_input->dynamic_filters = _dynamic_filters_channel;
+    scan_input->consumer                        = decode_consumer();
+    scan_input->cached_view_possible            = cached_view_possible();
+    // A compacted decode may write a column directly in the type this scan would restore it to,
+    // which saves the scan's widening cast. Slot i of the decode is output column i only when the
+    // output assembly is a leading identity, so the targets are passed on only then.
+    if (_ingestible->output_assembly_is_leading_identity()) {
+      scan_input->decode_restore_types = normalization_targets();
+    }
     scan_input->update(io::cache::scan_stage::queued);
   }
   return std::move(*next);
+}
+
+bool sirius_gpu_scan_operator::cached_view_possible() const noexcept
+{
+  return _dynamic_filter_consumer && _dynamic_filter_consumer->cached_placement_enabled() &&
+         _ingestible && _ingestible->can_serve_cached_view();
 }
 
 //===----------------------------------------------------------------------===//
@@ -509,7 +796,7 @@ scan_manager::split_connector& sirius_gpu_scan_operator::get_split_connector()
 std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
   const op::operator_data& input_data, ::cuda::stream_ref stream)
 {
-  auto scan_input = dynamic_cast<const scan_operator_input*>(&input_data);
+  auto const* scan_input = dynamic_cast<const scan_operator_input*>(&input_data);
   if (!scan_input) {
     throw std::runtime_error(
       "[sirius_gpu_scan_operator::execute] expected input of type scan_operator_input; got " +
@@ -517,121 +804,59 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
   }
   validate_input(*scan_input, false);
 
-  ::cucascade::memory::memory_space* mem_space = scan_input->gpu_memory_space;
-  auto const has_explicit_physical_schema      = has_physical_overrides();
-  auto const& targets                          = normalization_targets();
-  std::vector<carrier_conversion_plan> transactional_plan;
-  std::unique_ptr<cudf::table> output_table;
-  // A deferral needs to know which rows survived a filter applied here; asking
-  // for them costs one gather over a row-index sequence, so only a deferring
-  // scan asks.
-  std::unique_ptr<cudf::column> survivors;
-  auto const wants_survivors = !deferred_output().empty();
-
-  // Only prepare_for_processing arms pending (pipeline contract: prepare runs before execute on
-  // the same task), so a non-candidate split skips the builder lambda entirely. A
-  // decode-row-filtered split may only bypass post_filter_and_project when the assembly it
-  // skips is a leading identity — its width match alone cannot prove that, because trailing
-  // pure-filter columns can offset synthesized (partition) output columns. An unfiltered split
-  // needs no such proof: it decodes exactly the output columns, so a width match is decisive.
-  // Refused outright when a late-materialization deferral is installed (wants_survivors): the
-  // transactional steal bypasses post_filter_and_project entirely, so it can neither elide the
-  // deferred columns from the projection nor hand substitute_deferred_columns the survivor
-  // positions it needs -- that path always falls through to the branch below instead.
-  if (!wants_survivors && scan_input->converted_table_steal_pending &&
-      (!scan_input->pushdown_row_filtered || _ingestible->output_assembly_is_leading_identity())) {
-    output_table = scan_input->transactionally_steal_converted_table(
-      targets.size(),
-      [&](cudf::table_view source) {
-        transactional_plan = preflight_physical_schema(source,
-                                                       targets,
-                                                       has_explicit_physical_schema,
-                                                       /*deferred=*/nullptr,
-                                                       stream,
-                                                       mem_space->get_default_allocator());
-        return build_carrier_replacements(
-          source, transactional_plan, stream, mem_space->get_default_allocator());
-      },
-      stream);
-  }
-
-  if (output_table) {
-    // Observation follows the commit so a failed cast attempt cannot be counted twice on retry.
-    record_carrier_conversions(transactional_plan, _compressed_materialization_observer);
-  } else {
-    // Every non-candidate path remains unchanged: materialize, filter/project if needed, then
-    // normalize the resulting owned table.
-    auto const like_swar_fastpath = like_swar_fastpath_enabled();
-    auto like_pattern_cache       = like_cache();
-    auto materialized_table =
-      _ingestible->materialize_table(*scan_input, stream, like_swar_fastpath, like_pattern_cache);
-    if (materialized_table.state != filter_state::ROW_FILTERED_AND_PROJECTED) {
-      // Elide the deferred columns from the projection: realizing the batch would
-      // copy values this scan is about to replace with a rowid.
-      output_table = _ingestible->post_filter_and_project(std::move(materialized_table),
-                                                          *mem_space,
-                                                          stream,
-                                                          like_swar_fastpath,
-                                                          std::move(like_pattern_cache),
-                                                          wants_survivors ? &survivors : nullptr,
-                                                          deferred_output().output_positions);
+  auto receipt        = decode_receipt(*this, *scan_input);
+  auto assembly       = std::make_unique<scan_assembly_state>();
+  auto const unjoined = detail::prepare_unjoined_failure();
+  row_selection selection;
+  try {
+    // An owned table, transferred here or stolen by prepare_for_processing, bypasses the cached
+    // checkpoint.
+    assembly->output = transfer_converted_table(*this, *scan_input, stream);
+    if (assembly->output) {
+      selection.placement.cached_bypassed_transfer = 1;
     } else {
-      output_table = materialized_table.table.release(stream, mem_space->get_default_allocator());
+      bool const stolen = scan_input->stolen_table != nullptr;
+      selection         = select_rows(*this, *scan_input, receipt, *assembly, stream);
+      selection.placement.cached_bypassed_transfer = stolen ? 1 : 0;
+      finish_assembly(*this, *scan_input, *assembly, stream);
     }
-
-    // Late materialization, producing half. Installed only where a served batch is
-    // one pinned chunk's whole row span, so a batch arriving here without an
-    // origin means the install-time conditions and the serve-time stamping have
-    // drifted apart — and emitting values for one batch and rowids for the next
-    // hands downstream two different schemas.
-    if (wants_survivors) {
-      if (!scan_input->origin) {
-        throw std::runtime_error(
-          "[sirius_gpu_scan_operator::execute] a deferral is installed but this split carries no "
-          "origin; the scan cannot say where its rows came from");
-      }
-      std::optional<cudf::column_view> const survivor_view =
-        survivors ? std::optional<cudf::column_view>{survivors->view()} : std::nullopt;
-      output_table = substitute_deferred_columns(std::move(output_table),
-                                                 deferred_output(),
-                                                 *scan_input->origin,
-                                                 survivor_view ? &*survivor_view : nullptr,
-                                                 this->types.size(),
-                                                 stream,
-                                                 mem_space->get_default_allocator());
-    }
-
-    // A resident chunk is normalized even without a sidecar: it may be stored narrow (pinned with
-    // the feature on, queried with it off) and must then restore to native. AFTER substitution:
-    // the deferred positions then hold a rowid and placeholders, which it skips, and the elided
-    // columns are back so the arity check holds.
-    if (has_explicit_physical_schema || scan_input->is_resident()) {
-      output_table = normalize_physical_schema(std::move(output_table),
-                                               targets,
-                                               has_explicit_physical_schema,
-                                               wants_survivors ? &deferred_output() : nullptr,
-                                               _compressed_materialization_observer,
-                                               stream,
-                                               mem_space->get_default_allocator());
-    }
+  } catch (...) {
+    detail::retire_reads(assembly, stream, unjoined);
+    throw;
   }
 
   // Read the size before moving the table into a batch to avoid locking the batch. Publish rows
   // and bytes together because they form one sample.
+  auto& output_table       = assembly->output;
   auto const emitted_rows  = static_cast<std::size_t>(output_table->num_rows());
   auto const emitted_bytes = output_table->alloc_size();
-
+  auto* const mem_space    = scan_input->gpu_memory_space;
   auto batch =
     sirius::make_data_batch(std::move(output_table), *mem_space, stream, batch_telemetry());
-  // Published only after make_data_batch succeeds: an OOM there reschedules the task into
-  // re-running the same split, and these bytes floor total_source_output_bytes().
+  detail::check_read_checkpoint(detail::read_checkpoint::BATCH);
+  auto const batch_id = batch->get_batch_id();
+  std::unique_ptr<operator_data> output;
+  if (_dynamic_filter_consumer) {
+    output = std::make_unique<scan_output_operator_data>(std::move(batch));
+  } else {
+    std::vector<std::shared_ptr<::cucascade::data_batch>> batches{std::move(batch)};
+    output = std::make_unique<pipelineable_operator_data>(std::move(batches));
+  }
+  detail::check_read_checkpoint(detail::read_checkpoint::PAYLOAD);
   {
     std::lock_guard<std::mutex> guard(_emitted_mutex);
     _emitted_rows += emitted_rows;
     _emitted_bytes += emitted_bytes;
   }
-  std::vector<std::shared_ptr<::cucascade::data_batch>> batches{std::move(batch)};
-  return std::make_unique<pipelineable_operator_data>(std::move(batches));
+  if (_dynamic_filter_consumer) {
+    _dynamic_filter_consumer->record_placement(selection.placement);
+    receipt.original_batch_id = batch_id;
+    if (selection.cached) {
+      receipt = _dynamic_filter_consumer->finish(std::move(*selection.cached), batch_id);
+    }
+    static_cast<scan_output_operator_data&>(*output).install_receipt(std::move(receipt));
+  }
+  return output;
 }
 
 std::size_t sirius_gpu_scan_operator::resident_carrier_conversion_peak_memory_estimate(

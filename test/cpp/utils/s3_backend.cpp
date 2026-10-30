@@ -28,6 +28,7 @@
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <utils/parquet_fixture_utils.hpp>
 #ifdef __linux__
 #include <sys/prctl.h>
 #endif
@@ -314,6 +315,29 @@ void create_special_key_fixtures(fs::path const& fixture_dir)
   }
 }
 
+void create_virtual_column_fixtures(fs::path const& fixture_dir)
+{
+  scoped_sirius_disable disable;
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  for (auto const& [name, query] : std::vector<std::pair<std::string, std::string>>{
+         {"virtual_provenance",
+          "SELECT range AS marker, (range % 3)::INTEGER AS keep FROM range(8193)"},
+         {"virtual_nested_only", "SELECT [range, range + 1] AS items FROM range(19)"},
+         {"virtual_physical_names",
+          "SELECT range AS marker, CASE WHEN range = 0 THEN NULL WHEN range = 1 THEN 'NULL' "
+          "ELSE 'physical' END AS filename, "
+          "77::BIGINT AS file_index, 88::INTEGER AS file_row_number FROM range(3)"}}) {
+    auto const path = fixture_dir / "parquet" / (name + ".parquet");
+    auto result     = con.Query("COPY (" + query + ") TO " + sql_literal(path.string()) +
+                            " (FORMAT PARQUET, ROW_GROUP_SIZE 2048)");
+    if (!result || result->HasError()) {
+      throw std::runtime_error("failed to generate virtual-column fixture " + name + ": " +
+                               (result ? result->GetError() : "no query result"));
+    }
+  }
+}
+
 void create_edge_types_fixture(fs::path const& fixture_dir)
 {
   auto const output = fixture_dir / "parquet" / "edge_types.parquet";
@@ -548,9 +572,9 @@ void maybe_upload_large_fixture(s3_endpoint const& http, fs::path const& work)
   fs::path parquet = work / "lineitem_sf10.parquet";
   std::error_code ec;
   if (!(fs::exists(parquet, ec) && fs::file_size(parquet, ec) > 0)) {
-    fs::path duckdb_bin =
-      env_or("SIRIUS_TEST_DUCKDB",
-             (fs::path{SIRIUS_PROJECT_ROOT} / "build" / "release" / "duckdb").string());
+    fs::path duckdb_bin = env_or(
+      "SIRIUS_TEST_DUCKDB",
+      (fs::path{SIRIUS_PROJECT_ROOT} / "sirius-duckdb" / "build" / "release" / "duckdb").string());
     fs::path db = work / "tpch_sf10.duckdb";
     // Generate to a temp file and atomically rename, so an interrupted run never
     // leaves a truncated-but-non-empty file that the cache check would reuse.
@@ -567,7 +591,7 @@ void maybe_upload_large_fixture(s3_endpoint const& http, fs::path const& work)
       fs::remove(parquet_tmp, ec);
       throw std::runtime_error("failed to generate SF10 lineitem via DuckDB CLI (" +
                                duckdb_bin.string() +
-                               "); run `make release` or set SIRIUS_TEST_DUCKDB");
+                               "); build sirius-duckdb or set SIRIUS_TEST_DUCKDB");
     }
     fs::rename(parquet_tmp, parquet, ec);
     if (ec) throw std::runtime_error("failed to finalize SF10 parquet cache: " + ec.message());
@@ -615,9 +639,9 @@ void maybe_upload_tpch_sf1_fixture(s3_endpoint const& http, fs::path const& work
   };
 
   if (!fixture_complete()) {
-    fs::path duckdb_bin =
-      env_or("SIRIUS_TEST_DUCKDB",
-             (fs::path{SIRIUS_PROJECT_ROOT} / "build" / "release" / "duckdb").string());
+    fs::path duckdb_bin = env_or(
+      "SIRIUS_TEST_DUCKDB",
+      (fs::path{SIRIUS_PROJECT_ROOT} / "sirius-duckdb" / "build" / "release" / "duckdb").string());
     fs::path db          = work / "tpch_sf1.duckdb";
     fs::path fixture_tmp = work / "tpch_sf1.tmp";
     std::error_code ec;
@@ -795,6 +819,7 @@ bool bring_up()
   create_special_key_fixtures(fixture_dir);
   create_edge_types_fixture(fixture_dir);
   write_s3_identities_config(s3_config);
+  create_virtual_column_fixtures(fixture_dir);
 
   weed_server srv =
     start_weed(data_dir, s3_config, certs_dir / "public.crt", certs_dir / "private.key", weed_log);

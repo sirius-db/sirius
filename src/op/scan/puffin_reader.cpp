@@ -14,28 +14,36 @@
  * limitations under the License.
  */
 
+#include "op/scan/puffin_reader.hpp"
+
+#include "op/scan/iceberg_delete_set.hpp"
+
+#include <io/io_errors.hpp>
+#include <io/sirius_datasource.hpp>
 #include <io/uri_parser.hpp>
 #include <log/logging.hpp>
-#include <op/scan/puffin_reader.hpp>
 
 // Vendored by DuckDB core and already on this target's include path; duckdb_static bundles its
 // objects, so reading the Puffin footer costs no new dependency.
 #include "yyjson.hpp"
 
-// CRoaring: the portable-Roaring reader. duckdb-iceberg decodes this same deletion-vector blob with
-// the same two calls (`roaring_bitmap_portable_deserialize_size` + `Roaring::readSafe`), so the GPU
-// path and DuckDB's own reader agree on a bitmap by construction rather than by our re-derivation.
+// CRoaring: the portable-Roaring reader. The legacy path uses the same two calls as
+// duckdb-iceberg (`roaring_bitmap_portable_deserialize_size` + `Roaring::readSafe`).
+// The charged path shares the size check and expands containers without allocating a bitmap.
 #include <roaring/roaring.h>
 #include <roaring/roaring.hh>
 
 #include <algorithm>
+#include <bit>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <vector>
 
 // The readers below memcpy into the target type, so a big-endian host would decode garbage.
@@ -45,6 +53,101 @@ static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
 namespace sirius::op::scan {
 
 namespace {
+
+class local_puffin_source final : public puffin_byte_source {
+ public:
+  explicit local_puffin_source(std::string_view path)
+    : file_(std::string(path), std::ios::binary), path_(path)
+  {
+    if (file_) {
+      file_.seekg(0, std::ios::end);
+      size_ = static_cast<std::streamoff>(file_.tellg());
+      file_.seekg(0);
+    }
+  }
+  bool seek(std::streamoff offset) override
+  {
+    file_.clear();
+    file_.seekg(offset);
+    if (file_.bad()) {
+      throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
+                                                    "[puffin] Cannot seek local file: " + path_);
+    }
+    return static_cast<bool>(file_);
+  }
+  bool read(std::span<std::byte> destination) override
+  {
+    file_.read(reinterpret_cast<char*>(destination.data()),
+               static_cast<std::streamsize>(destination.size()));
+    if (file_.bad()) {
+      throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
+                                                    "[puffin] Cannot read local file: " + path_);
+    }
+    return static_cast<bool>(file_);
+  }
+  [[nodiscard]] std::streamoff size() const override { return size_; }
+  explicit operator bool() const noexcept { return static_cast<bool>(file_); }
+
+ private:
+  std::ifstream file_;
+  std::string path_;
+  std::streamoff size_{-1};
+};
+
+class datasource_puffin_source final : public puffin_byte_source {
+ public:
+  explicit datasource_puffin_source(std::unique_ptr<io::sirius_datasource> source)
+    : source_(std::move(source))
+  {
+  }
+  bool seek(std::streamoff offset) override
+  {
+    if (offset < 0 || static_cast<std::uint64_t>(offset) > source_->size()) return false;
+    offset_ = offset;
+    return true;
+  }
+  bool read(std::span<std::byte> destination) override
+  {
+    auto const size = source_->size();
+    if (offset_ < 0 || static_cast<std::uint64_t>(offset_) > size ||
+        destination.size() > size - static_cast<std::uint64_t>(offset_))
+      return false;
+    std::size_t read;
+    try {
+      read = source_->host_read(static_cast<std::size_t>(offset_),
+                                destination.size(),
+                                reinterpret_cast<std::uint8_t*>(destination.data()));
+    } catch (transparent::classified_execution_error const&) {
+      throw;
+    } catch (duckdb::InterruptException const&) {
+      throw;
+    } catch (io::object_changed_error const&) {
+      // Preserve the typed version failure until the charged scan wrapper,
+      // which records it and classifies the terminal outcome.
+      throw;
+    } catch (std::bad_alloc const&) {
+      throw;
+    } catch (std::system_error const& error) {
+      if (error.code() == std::errc::operation_canceled) throw;
+      throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
+                                                    error.what());
+    } catch (std::exception const& error) {
+      throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
+                                                    error.what());
+    }
+    if (read != destination.size()) return false;
+    offset_ += static_cast<std::streamoff>(read);
+    return true;
+  }
+  [[nodiscard]] std::streamoff size() const override
+  {
+    return static_cast<std::streamoff>(source_->size());
+  }
+
+ private:
+  std::unique_ptr<io::sirius_datasource> source_;
+  std::streamoff offset_ = 0;
+};
 
 uint32_t read_u32_le(const uint8_t* p)
 {
@@ -98,131 +201,173 @@ uint32_t compute_crc32(const uint8_t* data, size_t length)
   return crc ^ 0xFFFFFFFFu;
 }
 
-/// Decodes one 32-bit portable-Roaring bitmap out of @p data and appends its values to @p out,
-/// returning the bytes consumed.
-///
-/// `roaring_bitmap_portable_deserialize_size` reports how many bytes a VALID bitmap occupies within
-/// @p data_len and returns 0 otherwise, so the read is bounded by the buffer rather than by numbers
-/// the file supplied -- there is no decode ceiling to tune here because the library cannot be made
-/// to over-read or over-expand. The cardinality is known before any position is materialized, so
-/// @p max_out is enforced BEFORE the allocation rather than inside an expansion loop.
+class deletion_vector_expansion_limit : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
+
+/// Walk one 32-bit portable-Roaring bitmap, validating its containers before
+/// materializing values through @p emit. Both eager and charged readers use this
+/// walker so they share the same format and corruption checks.
+template <typename Emit>
+size_t walk_roaring32(const uint8_t* data, size_t len, size_t max_out, Emit&& emit)
+{
+  auto const consumed = roaring::api::roaring_bitmap_portable_deserialize_size(
+    reinterpret_cast<char const*>(data), len);
+  if (!consumed)
+    throw std::runtime_error("roaring: no valid portable-Roaring bitmap in the remaining " +
+                             std::to_string(len) +
+                             " bytes; the deletion vector is truncated or corrupt");
+  auto fail = [](char const* reason) {
+    throw std::runtime_error(std::string("roaring: inconsistent bitmap in the deletion vector: ") +
+                             reason);
+  };
+  auto u16 = [](uint8_t const* p) {
+    uint16_t v;
+    std::memcpy(&v, p, 2);
+    return v;
+  };
+  auto const* end = data + consumed;
+  auto const* p   = data;
+  auto take       = [&](size_t bytes) {
+    if (bytes > static_cast<size_t>(end - p)) fail("container exceeds bitmap bounds");
+    auto result = p;
+    p += bytes;
+    return result;
+  };
+  auto cookie          = read_u32_le(take(4));
+  bool runs            = (cookie & 0xffff) == 12347;
+  uint32_t containers  = runs ? (cookie >> 16) + 1 : read_u32_le(take(4));
+  auto const* run_bits = runs ? take((containers + 7) / 8) : nullptr;
+  auto const* headers  = take(static_cast<size_t>(containers) * 4);
+  if (!runs || containers >= 4) take(static_cast<size_t>(containers) * 4);
+  auto const* payload = p;
+
+  for (uint32_t i = 1; i < containers; ++i)
+    if (u16(headers + i * 4) <= u16(headers + (i - 1) * 4)) fail("keys not strictly increasing");
+
+  auto walk = [&](bool materialize) {
+    p            = payload;
+    size_t total = 0;
+    for (uint32_t i = 0; i < containers; ++i) {
+      auto key         = u16(headers + i * 4);
+      auto cardinality = uint32_t(u16(headers + i * 4 + 2)) + 1;
+      auto append      = [&](uint32_t low) {
+        if (total >= max_out) fail("decoded positions exceed the declared budget");
+        emit((uint32_t(key) << 16) | low);
+        ++total;
+      };
+      if (run_bits && (run_bits[i / 8] & (1u << (i % 8)))) {
+        auto n = u16(take(2));
+        if (!n) fail("zero run count");
+        uint32_t previous_end = 0;
+        for (uint32_t j = 0; j < n; ++j) {
+          auto const* run = take(4);
+          uint32_t first = u16(run), end = first + u16(run + 2) + 1;
+          if (end > 65536) fail("run start + length too large");
+          if (first < previous_end) fail("run start less than last end");
+          if (first == previous_end && previous_end)
+            fail("run start equal to last end, should have combined");
+          previous_end = end;
+          if (materialize)
+            for (uint32_t v = first; v < end; ++v)
+              append(v);
+          else
+            total += end - first;
+        }
+      } else if (cardinality <= 4096) {
+        auto const* values = take(cardinality * 2);
+        for (uint32_t j = 0; j < cardinality; ++j) {
+          auto value = u16(values + j * 2);
+          if (j && value <= u16(values + (j - 1) * 2))
+            fail("array elements not strictly increasing");
+          if (materialize) append(value);
+        }
+        if (!materialize) total += cardinality;
+      } else {
+        auto const* words = take(8192);
+        uint32_t actual   = 0;
+        for (uint32_t j = 0; j < 1024; ++j) {
+          uint64_t word;
+          std::memcpy(&word, words + j * 8, 8);
+          actual += std::popcount(word);
+          if (materialize)
+            while (word) {
+              append(j * 64 + std::countr_zero(word));
+              word &= word - 1;
+            }
+        }
+        if (actual != cardinality) fail("cardinality is incorrect");
+        if (!materialize) total += actual;
+      }
+    }
+    return total;
+  };
+
+  auto const cardinality = walk(false);
+  if (cardinality > max_out)
+    throw deletion_vector_expansion_limit(
+      "roaring: decoded positions exceed the configured limit of " + std::to_string(max_out));
+  walk(true);
+  return consumed;
+}
+
 size_t deserialize_roaring32(const uint8_t* data,
                              size_t data_len,
                              std::vector<uint32_t>& out,
                              size_t max_out)
 {
-  size_t const bitmap_size = roaring::api::roaring_bitmap_portable_deserialize_size(
-    reinterpret_cast<const char*>(data), data_len);
-  if (bitmap_size == 0) {
-    throw std::runtime_error("roaring: no valid portable-Roaring bitmap in the remaining " +
-                             std::to_string(data_len) +
-                             " bytes; the deletion vector is truncated or corrupt");
-  }
+  auto const base = out.size();
+  if (base > max_out)
+    throw std::runtime_error("roaring: decoded positions exceed the declared budget");
+  auto const consumed =
+    walk_roaring32(data, data_len, max_out - base, [&](uint32_t value) { out.push_back(value); });
+  return consumed;
+}
 
-  roaring::Roaring bitmap =
-    roaring::Roaring::readSafe(reinterpret_cast<const char*>(data), bitmap_size);
-
-  // readSafe bounds the READ; it does not check the bitmap's internal invariants. A bitset
-  // container carries its cardinality as a stored number and `bitset_container_read` copies it
-  // without recomputing the popcount, so a declared cardinality that disagrees with the bits is
-  // accepted here and only discovered by what reads it. Both directions are live:
-  // over-declaring leaves a zero-filled tail that materializes as delete position 0 and removes a
-  // row the table keeps, and under-declaring sizes the destination below what `toUint32Array`
-  // emits -- and that call takes no output-capacity argument, so it writes past the end. The
-  // record_count cross-check runs after both.
-  //
-  // The Puffin CRC does not establish trust: the file supplies it alongside the bytes it covers.
-  const char* validation_failure = nullptr;
-  if (!roaring::api::roaring_bitmap_internal_validate(&bitmap.roaring, &validation_failure)) {
-    throw std::runtime_error(
-      "roaring: inconsistent bitmap in the deletion vector: " +
-      std::string(validation_failure == nullptr ? "unknown reason" : validation_failure));
-  }
-
-  uint64_t const cardinality = bitmap.cardinality();
-  if (cardinality > max_out || out.size() > max_out - cardinality) {
-    throw std::runtime_error(
-      "roaring: decoded positions exceed the " + std::to_string(max_out) +
-      " this deletion vector declares; the blob is corrupt or was crafted to expand");
-  }
-
-  size_t const base = out.size();
-  out.resize(base + static_cast<size_t>(cardinality));
-  bitmap.toUint32Array(out.data() + base);
-  return bitmap_size;
+size_t decode_roaring_charged(
+  const uint8_t* data, size_t len, int64_t high, std::span<int64_t> output, size_t& count)
+{
+  auto const consumed = walk_roaring32(
+    data, len, output.size() - count, [&](uint32_t value) { output[count++] = high | value; });
+  return consumed;
 }
 
 using YyjsonDoc =
   std::unique_ptr<duckdb_yyjson::yyjson_doc, decltype(&duckdb_yyjson::yyjson_doc_free)>;
 
 /// Puffin properties are a string->string map, so numbers arrive quoted.
-std::string property_or_empty(duckdb_yyjson::yyjson_val* properties, char const* key)
+std::string_view property_or_empty(duckdb_yyjson::yyjson_val* properties, char const* key)
 {
   if (properties == nullptr) { return {}; }
   auto* val       = duckdb_yyjson::yyjson_obj_get(properties, key);
   auto const* str = duckdb_yyjson::yyjson_get_str(val);
-  return str == nullptr ? std::string{} : std::string{str};
+  return str == nullptr ? std::string_view{} : std::string_view{str};
 }
 
-/// Reads the footer and returns the blob descriptor whose `offset` equals @p content_offset,
-/// checking every property the spec fixes for `deletion-vector-v1`.
-///
-/// The manifest and the footer are written by the same commit but are separate structures, so
-/// agreement between them is what proves the entry points at *its own* vector. The blob's magic
-/// and CRC only prove it is a well-formed vector — a wrong offset landing on a different valid
-/// vector passes both, and passes the cardinality check too whenever the two happen to be the
-/// same size.
-///
-/// Returns the offset of the footer's leading magic, i.e. the first byte past the blob region. The
-/// caller bounds the blob read against it: a manifest and footer are free to agree on a size that
-/// the FILE cannot hold, and believing them is a value-initialized allocation of whatever they say.
-std::streamoff validate_footer_descriptor(std::ifstream& f,
-                                          std::streamoff file_size,
-                                          DeletionVectorRef const& ref,
-                                          char const (&puffin_magic)[4])
+// Shared JSON parser; provider-specific descriptor checks are separate.
+YyjsonDoc parse_footer_json(std::span<char> payload_bytes,
+                            std::string const& path,
+                            duckdb_yyjson::yyjson_alc* pool)
 {
-  // Footer = Magic | Payload | PayloadSize(4, LE) | Flags(4) | Magic
-  static constexpr std::streamoff kFooterTail = 12;  // PayloadSize + Flags + trailing Magic
-  if (file_size < kFooterTail + 8) {
-    throw std::runtime_error("[puffin] File too small to hold a footer: " + ref.puffin_path);
-  }
-
-  f.seekg(file_size - kFooterTail);
-  uint8_t tail[kFooterTail];
-  f.read(reinterpret_cast<char*>(tail), kFooterTail);
-  if (!f) { throw std::runtime_error("[puffin] Cannot read footer tail of " + ref.puffin_path); }
-
-  auto const payload_size = static_cast<int32_t>(read_u32_le(tail));
-  if (payload_size < 0 || static_cast<std::streamoff>(payload_size) + kFooterTail + 4 > file_size) {
-    throw std::runtime_error("[puffin] Footer payload size " + std::to_string(payload_size) +
-                             " does not fit in " + ref.puffin_path);
-  }
-
-  // Bit 0 of the flags means the payload is LZ4-compressed. Nothing here can decompress it, and
-  // guessing would be worse than declining.
-  if ((tail[4] & 0x01u) != 0) {
-    throw std::runtime_error("[puffin] Footer of " + ref.puffin_path +
-                             " is compressed, so its blob descriptors cannot be checked");
-  }
-
-  auto const footer_start = file_size - kFooterTail - payload_size - 4;
-  f.seekg(footer_start);
-  char magic[4];
-  f.read(magic, 4);
-  if (!f || std::memcmp(magic, puffin_magic, 4) != 0) {
-    throw std::runtime_error("[puffin] Missing footer magic in " + ref.puffin_path);
-  }
-
-  std::string payload(static_cast<size_t>(payload_size), '\0');
-  f.read(payload.data(), payload_size);
-  if (!f) { throw std::runtime_error("[puffin] Cannot read footer payload of " + ref.puffin_path); }
-
-  YyjsonDoc doc(duckdb_yyjson::yyjson_read(payload.data(), payload.size(), 0),
+  auto* payload   = payload_bytes.data();
+  auto const size = payload_bytes.size();
+  duckdb_yyjson::yyjson_read_err parse_error{};
+  YyjsonDoc doc(duckdb_yyjson::yyjson_read_opts(payload, size, 0, pool, &parse_error),
                 &duckdb_yyjson::yyjson_doc_free);
   if (!doc) {
-    throw std::runtime_error("[puffin] Footer of " + ref.puffin_path + " is not valid JSON");
+    if (pool && parse_error.code == duckdb_yyjson::YYJSON_READ_ERROR_MEMORY_ALLOCATION)
+      throw sirius::scan_manager::preparation_resource_error("Puffin JSON pool exhausted", true);
+    throw std::runtime_error("[puffin] Footer of " + path + " is not valid JSON");
   }
 
+  return doc;
+}
+
+// Iceberg descriptor profile. The structural reader does not grant these checks.
+template <typename Ref>
+void validate_iceberg_descriptor(YyjsonDoc const& doc, Ref const& ref)
+{
   auto* blobs =
     duckdb_yyjson::yyjson_obj_get(duckdb_yyjson::yyjson_doc_get_root(doc.get()), "blobs");
   if (blobs == nullptr || !duckdb_yyjson::yyjson_is_arr(blobs)) {
@@ -236,7 +381,8 @@ std::streamoff validate_footer_descriptor(std::ifstream& f,
   yyjson_arr_foreach(blobs, idx, max, blob)
   {
     auto* offset = duckdb_yyjson::yyjson_obj_get(blob, "offset");
-    if (offset != nullptr && duckdb_yyjson::yyjson_get_sint(offset) == ref.content_offset) {
+    if (offset != nullptr && duckdb_yyjson::yyjson_is_int(offset) &&
+        duckdb_yyjson::yyjson_get_sint(offset) == ref.content_offset) {
       descriptor = blob;
       break;
     }
@@ -247,20 +393,29 @@ std::streamoff validate_footer_descriptor(std::ifstream& f,
                              "; the manifest entry points into the middle of the file");
   }
 
-  auto const require = [&ref](char const* what, std::string const& got, std::string const& want) {
+  auto const required_sint = [&](char const* field) -> int64_t {
+    auto* value = duckdb_yyjson::yyjson_obj_get(descriptor, field);
+    if (value == nullptr || !duckdb_yyjson::yyjson_is_int(value)) {
+      throw std::runtime_error("[puffin] Blob descriptor in " + ref.puffin_path +
+                               " has no integer '" + field + "'");
+    }
+    return duckdb_yyjson::yyjson_get_sint(value);
+  };
+
+  auto const require = [&ref](char const* what, std::string_view got, std::string_view want) {
     if (got != want) {
       throw std::runtime_error("[puffin] Blob at offset " + std::to_string(ref.content_offset) +
-                               " in " + ref.puffin_path + " has " + what + " '" + got +
-                               "', but its manifest entry requires '" + want + "'");
+                               " in " + ref.puffin_path + " has " + what + " '" + std::string(got) +
+                               "', but its manifest entry requires '" + std::string(want) + "'");
     }
   };
 
   auto const* type =
     duckdb_yyjson::yyjson_get_str(duckdb_yyjson::yyjson_obj_get(descriptor, "type"));
-  require("type", type == nullptr ? std::string{} : std::string{type}, "deletion-vector-v1");
+  require(
+    "type", type == nullptr ? std::string_view{} : std::string_view{type}, "deletion-vector-v1");
 
-  auto const length =
-    duckdb_yyjson::yyjson_get_sint(duckdb_yyjson::yyjson_obj_get(descriptor, "length"));
+  auto const length = required_sint("length");
   if (length != ref.content_size_in_bytes) {
     throw std::runtime_error("[puffin] Blob at offset " + std::to_string(ref.content_offset) +
                              " in " + ref.puffin_path + " is " + std::to_string(length) +
@@ -271,14 +426,10 @@ std::streamoff validate_footer_descriptor(std::ifstream& f,
   // "Snapshot ID and sequence number are not known at the time the Puffin file is created", so the
   // spec fixes both at -1. A real value means the file was not written as a deletion vector.
   for (auto const* field : {"snapshot-id", "sequence-number"}) {
-    auto* val = duckdb_yyjson::yyjson_obj_get(descriptor, field);
-    if (val == nullptr) {
-      throw std::runtime_error("[puffin] Blob descriptor in " + ref.puffin_path + " has no '" +
-                               field + "'");
-    }
-    if (duckdb_yyjson::yyjson_get_sint(val) != -1) {
+    auto const value = required_sint(field);
+    if (value != -1) {
       throw std::runtime_error("[puffin] Blob descriptor in " + ref.puffin_path + " has " + field +
-                               "=" + std::to_string(duckdb_yyjson::yyjson_get_sint(val)) +
+                               "=" + std::to_string(value) +
                                ", but deletion-vector-v1 fixes it at -1");
     }
   }
@@ -318,8 +469,10 @@ std::streamoff validate_footer_descriptor(std::ifstream& f,
   // Compare on the bare path: the manifest and the footer are free to disagree about the URI
   // scheme, and rejecting on `file://` alone would refuse tables that are entirely well formed.
   require("referenced-data-file",
-          sirius::io::strip_file_scheme(referenced),
-          sirius::io::strip_file_scheme(ref.referenced_data_file));
+          referenced.starts_with("file://") ? referenced.substr(7) : referenced,
+          std::string_view(ref.referenced_data_file).starts_with("file://")
+            ? std::string_view(ref.referenced_data_file).substr(7)
+            : std::string_view(ref.referenced_data_file));
 
   auto const cardinality = property_or_empty(properties, "cardinality");
   if (cardinality.empty()) {
@@ -328,102 +481,155 @@ std::streamoff validate_footer_descriptor(std::ifstream& f,
   }
   if (cardinality != std::to_string(ref.record_count)) {
     throw std::runtime_error("[puffin] Blob at offset " + std::to_string(ref.content_offset) +
-                             " in " + ref.puffin_path + " declares cardinality " + cardinality +
-                             ", but its manifest entry records " +
+                             " in " + ref.puffin_path + " declares cardinality " +
+                             std::string(cardinality) + ", but its manifest entry records " +
                              std::to_string(ref.record_count));
   }
+}
 
-  return footer_start;
+/// Bounds discovered from a Puffin footer tail and its leading footer magic.
+struct puffin_footer_bounds {
+  std::streamoff start;
+  std::size_t payload_size;
+};
+
+bool read_puffin_bytes(puffin_byte_source& source,
+                       std::span<std::byte> destination,
+                       std::string_view path)
+{
+  try {
+    return source.read(destination);
+  } catch (sirius::transparent::classified_execution_error const&) {
+    throw;
+  } catch (io::object_changed_error const&) {
+    throw;
+  } catch (std::bad_alloc const&) {
+    // Allocation failures are resource failures, not reader I/O failures.
+    throw;
+  } catch (std::system_error const& error) {
+    if (error.code() == std::errc::operation_canceled) throw;
+    throw sirius::transparent::classified_execution_error(
+      sirius::transparent::late_failure_cause::reader_io,
+      "[puffin] Cannot read " + std::string(path) + ": " + error.what());
+  } catch (std::exception const& error) {
+    throw sirius::transparent::classified_execution_error(
+      sirius::transparent::late_failure_cause::reader_io,
+      "[puffin] Cannot read " + std::string(path) + ": " + error.what());
+  }
+}
+
+puffin_footer_bounds read_footer_bounds(puffin_byte_source& f,
+                                        std::streamoff file_size,
+                                        std::string const& path,
+                                        char const (&puffin_magic)[4],
+                                        bool strict_flags = false)
+{
+  static constexpr std::streamoff kFooterTail = 12;
+  if (file_size < kFooterTail + 8) {
+    throw std::runtime_error("[puffin] File too small to hold a footer: " + path);
+  }
+  if (!f.seek(file_size - kFooterTail))
+    throw sirius::transparent::classified_execution_error(
+      sirius::transparent::late_failure_cause::reader_io,
+      "[puffin] Cannot seek to footer tail of " + path);
+  uint8_t tail[kFooterTail];
+  if (!read_puffin_bytes(f, std::as_writable_bytes(std::span{tail}), "footer tail of " + path))
+    throw sirius::transparent::classified_execution_error(
+      sirius::transparent::late_failure_cause::reader_io,
+      "[puffin] Cannot read footer tail of " + path);
+  auto const payload_size = static_cast<int32_t>(read_u32_le(tail));
+  if (payload_size < 0 || static_cast<std::streamoff>(payload_size) + kFooterTail + 4 > file_size)
+    throw std::runtime_error("[puffin] Footer payload size " + std::to_string(payload_size) +
+                             " does not fit in " + path);
+  if ((tail[4] & 0x01u) != 0)
+    throw std::runtime_error("[puffin] Footer of " + path +
+                             " is compressed, so its blob descriptors cannot be checked");
+  if (strict_flags && (tail[4] || tail[5] || tail[6] || tail[7]))
+    throw std::runtime_error("[puffin] Unsupported footer flags in " + path);
+  auto const footer_start = file_size - kFooterTail - payload_size - 4;
+  if (!f.seek(footer_start))
+    throw sirius::transparent::classified_execution_error(
+      sirius::transparent::late_failure_cause::reader_io,
+      "[puffin] Cannot seek to footer magic of " + path);
+  char magic[4];
+  if (!read_puffin_bytes(f, std::as_writable_bytes(std::span{magic}), "footer magic of " + path))
+    throw std::runtime_error("[puffin] Missing footer magic in " + path);
+  if (std::memcmp(magic, puffin_magic, 4) != 0)
+    throw std::runtime_error("[puffin] Missing footer magic in " + path);
+  return {footer_start, static_cast<std::size_t>(payload_size)};
+}
+
+struct parsed_puffin_footer {
+  scan_manager::charged_block backing;
+  std::string legacy_payload;
+  YyjsonDoc document{nullptr, &duckdb_yyjson::yyjson_doc_free};
+};
+
+// Same bounded text/parser allocation for legacy Iceberg and neutral metadata.
+parsed_puffin_footer read_footer_document(puffin_byte_source& source,
+                                          puffin_footer_bounds bounds,
+                                          std::string const& path,
+                                          scan_manager::charging_allocator* allocator,
+                                          bool retained = false)
+{
+  parsed_puffin_footer result;
+  auto const size = bounds.payload_size;
+  duckdb_yyjson::yyjson_alc pool;
+  char* payload;
+  if (allocator) {
+    auto const text_bytes   = (size + 15) / 16 * 16;
+    auto const parser_bytes = duckdb_yyjson::yyjson_read_max_memory_usage(size, 0);
+    if (!parser_bytes || parser_bytes > std::numeric_limits<size_t>::max() - text_bytes)
+      throw scan_manager::preparation_resource_error("Puffin JSON envelope overflow", true);
+    result.backing = retained ? allocator->allocate_retained(text_bytes + parser_bytes)
+                              : allocator->allocate(text_bytes + parser_bytes);
+    payload        = reinterpret_cast<char*>(result.backing.data());
+    if (!duckdb_yyjson::yyjson_alc_pool_init(&pool, payload + text_bytes, parser_bytes))
+      throw scan_manager::preparation_resource_error("Puffin JSON pool initialization failed",
+                                                     false);
+  } else {
+    result.legacy_payload.resize(size);
+    payload = result.legacy_payload.data();
+  }
+  if (!read_puffin_bytes(
+        source, std::as_writable_bytes(std::span{payload, size}), "footer payload of " + path))
+    throw sirius::transparent::classified_execution_error(
+      sirius::transparent::late_failure_cause::reader_io,
+      "[puffin] Cannot read footer payload of " + path);
+  result.document = parse_footer_json({payload, size}, path, allocator ? &pool : nullptr);
+  return result;
+}
+
+template <typename Ref>
+std::streamoff validate_footer_descriptor(puffin_byte_source& source,
+                                          std::streamoff file_size,
+                                          Ref const& ref,
+                                          char const (&puffin_magic)[4],
+                                          scan_manager::charging_allocator* allocator = nullptr)
+{
+  auto const bounds = read_footer_bounds(source, file_size, ref.puffin_path, puffin_magic);
+  auto footer       = read_footer_document(source, bounds, ref.puffin_path, allocator);
+  validate_iceberg_descriptor(footer.document, ref);
+  return bounds.start;
 }
 
 }  // anonymous namespace
 
-std::vector<int64_t> read_deletion_vector(DeletionVectorRef const& ref)
+namespace {
+struct decoded_positions {
+  std::vector<int64_t> legacy;
+  sirius::scan_manager::charged_block backing;
+  size_t count = 0;
+};
+// Shared DV payload parser. The caller bounds the input span and expansion.
+// Table-specific descriptor and cardinality checks belong to the reader wrapper.
+decoded_positions parse_deletion_vector_blob(std::span<uint8_t const> blob,
+                                             std::string const& puffin_path,
+                                             size_t max_positions,
+                                             sirius::scan_manager::charging_allocator* allocator,
+                                             bool count_only    = false,
+                                             bool exact_payload = false)
 {
-  auto const& puffin_path          = ref.puffin_path;
-  auto const content_offset        = ref.content_offset;
-  auto const content_size_in_bytes = ref.content_size_in_bytes;
-  auto const record_count          = ref.record_count;
-
-  if (content_offset < 0 || content_size_in_bytes <= 0) {
-    throw std::runtime_error(
-      "[puffin] Invalid offset/size: offset=" + std::to_string(content_offset) +
-      " size=" + std::to_string(content_size_in_bytes));
-  }
-
-  // Bound the decode BEFORE opening the file, and on a constant rather than on anything the table
-  // wrote. `record_count` is a required manifest field; absent, both cardinality cross-checks
-  // below are vacuous and the expansion is unbounded.
-  if (record_count < 0) {
-    throw std::runtime_error(
-      "[puffin] Manifest entry for the deletion vector at offset " +
-      std::to_string(content_offset) + " in " + puffin_path +
-      " carries no record_count, so neither its footer cardinality nor its decoded position count "
-      "can be checked against anything, and nothing bounds how far the blob may expand");
-  }
-  if (record_count > kMaxDeletionVectorPositions) {
-    throw std::runtime_error(
-      "[puffin] Deletion vector at offset " + std::to_string(content_offset) + " in " +
-      puffin_path + " declares " + std::to_string(record_count) + " deleted positions, above the " +
-      std::to_string(kMaxDeletionVectorPositions) + " this reader will materialize while planning");
-  }
-
-  // Apache manifests record URIs; this reader bypasses ioctx, so nothing else strips them.
-  auto const local_path = sirius::io::strip_file_scheme(puffin_path);
-
-  std::ifstream f(local_path, std::ios::binary);
-  if (!f) {
-    throw std::runtime_error("[puffin] Cannot open file: " + local_path +
-                             (local_path == puffin_path ? "" : " (from '" + puffin_path + "')"));
-  }
-
-  // The blob's own magic and CRC below cannot catch a bare blob written with no container, so a
-  // wrong offset would silently yield wrong deletes. Check the framing first.
-  static constexpr char kPuffinMagic[4] = {'P', 'F', 'A', '1'};
-  char magic[4];
-  f.read(magic, 4);
-  if (!f || std::memcmp(magic, kPuffinMagic, 4) != 0) {
-    throw std::runtime_error("[puffin] Not a Puffin file (bad leading magic): " + puffin_path);
-  }
-  f.seekg(0, std::ios::end);
-  auto const file_size = static_cast<std::streamoff>(f.tellg());
-  f.seekg(file_size - 4);
-  f.read(magic, 4);
-  if (!f || std::memcmp(magic, kPuffinMagic, 4) != 0) {
-    throw std::runtime_error("[puffin] Not a Puffin file (bad trailing magic): " + puffin_path);
-  }
-
-  auto const footer_start = validate_footer_descriptor(f, file_size, ref, kPuffinMagic);
-
-  // The blob must lie entirely between the leading magic and the footer. Both bounds are compared
-  // by SUBTRACTION against a length the file actually has: `content_offset + content_size` is a
-  // sum of two manifest-supplied numbers and can wrap, and a descriptor that merely agrees with
-  // the manifest proves nothing about the file -- a few-KB Puffin whose manifest and footer both
-  // declare a 40 GiB blob would otherwise allocate 40 GiB here and fail on the read afterwards.
-  static constexpr std::streamoff kLeadingMagic = 4;
-  if (content_offset < kLeadingMagic || content_offset > footer_start ||
-      content_size_in_bytes > footer_start - content_offset) {
-    throw std::runtime_error("[puffin] Deletion vector at offset " +
-                             std::to_string(content_offset) + " size " +
-                             std::to_string(content_size_in_bytes) +
-                             " does not fit between the leading magic and the "
-                             "footer (which starts at " +
-                             std::to_string(footer_start) + ") of " + puffin_path);
-  }
-
-  f.seekg(content_offset);
-  if (!f) {
-    throw std::runtime_error("[puffin] Cannot seek to offset " + std::to_string(content_offset) +
-                             " in " + puffin_path);
-  }
-
-  std::vector<uint8_t> blob(static_cast<size_t>(content_size_in_bytes));
-  f.read(reinterpret_cast<char*>(blob.data()), content_size_in_bytes);
-  if (!f) {
-    throw std::runtime_error("[puffin] Failed to read " + std::to_string(content_size_in_bytes) +
-                             " bytes from " + puffin_path);
-  }
-
   // deletion-vector-v1: [4B BE combined_length][4B magic][roaring_vector][4B BE CRC-32]
   auto const blob_size = blob.size();
   if (blob_size < 12) {
@@ -459,6 +665,9 @@ std::vector<int64_t> read_deletion_vector(DeletionVectorRef const& ref)
       " blob_size=" + std::to_string(blob_size));
   }
 
+  if (exact_payload && 4 + checksummed_len + 4 != blob_size)
+    throw std::runtime_error("[puffin] Trailing bytes after deletion-vector-v1 payload");
+
   const uint8_t* crc_ptr = checksummed_start + checksummed_len;
   uint32_t stored_crc    = read_u32_be(crc_ptr);
   uint32_t computed_crc  = compute_crc32(checksummed_start, checksummed_len);
@@ -484,11 +693,10 @@ std::vector<int64_t> read_deletion_vector(DeletionVectorRef const& ref)
                              ") in " + puffin_path);
   }
 
-  // Validated against kMaxDeletionVectorPositions above, so this is a bounded budget and not a
-  // number the table chose. The decoded count is separately required to EQUAL it.
-  size_t const max_positions = static_cast<size_t>(record_count);
-
-  std::vector<int64_t> positions;
+  decoded_positions result;
+  auto& positions = result.legacy;
+  if (allocator && max_positions)
+    result.backing = allocator->allocate_retained(max_positions * sizeof(int64_t));
 
   for (int64_t bm = 0; bm < num_bitmaps; ++bm) {
     if (roaring_len < 4) { throw std::runtime_error("[puffin] Truncated bitmap key"); }
@@ -509,25 +717,478 @@ std::vector<int64_t> read_deletion_vector(DeletionVectorRef const& ref)
 
     int64_t high = static_cast<int64_t>(static_cast<uint32_t>(key)) << 32;
 
-    std::vector<uint32_t> low_positions;
-    // Shared across bitmaps, so a blob cannot beat the ceiling by splitting across keys.
-    size_t const budget = max_positions - positions.size();
-    size_t consumed     = deserialize_roaring32(p, roaring_len, low_positions, budget);
+    size_t consumed;
+    if (count_only) {
+      consumed = walk_roaring32(
+        p, roaring_len, max_positions - result.count, [&](uint32_t) { ++result.count; });
+    } else if (allocator) {
+      auto output =
+        std::span<int64_t>(reinterpret_cast<int64_t*>(result.backing.data()), max_positions);
+      consumed = decode_roaring_charged(p, roaring_len, high, output, result.count);
+    } else {
+      std::vector<uint32_t> low_positions;
+      // Shared across bitmaps, so a blob cannot beat the ceiling by splitting across keys.
+      size_t const budget = max_positions - positions.size();
+      consumed            = deserialize_roaring32(p, roaring_len, low_positions, budget);
+      for (uint32_t low : low_positions)
+        positions.push_back(high | static_cast<int64_t>(low));
+    }
     p += consumed;
     roaring_len -= consumed;
-
-    for (uint32_t low : low_positions) {
-      positions.push_back(high | static_cast<int64_t>(low));
-    }
   }
 
-  std::sort(positions.begin(), positions.end());
+  if (exact_payload && roaring_len != 0)
+    throw std::runtime_error("[puffin] Unconsumed bytes inside deletion-vector bitmap");
+  if (count_only) return result;
 
-  SIRIUS_LOG_INFO("[puffin] Read deletion vector from '{}': {} deleted position(s).",
-                  puffin_path,
-                  positions.size());
+  if (allocator) {
+    auto* output = reinterpret_cast<int64_t*>(result.backing.data());
+    if (result.count) std::sort(output, output + result.count);
+  } else {
+    std::sort(positions.begin(), positions.end());
+    result.count = positions.size();
+  }
 
-  return positions;
+  SIRIUS_LOG_INFO(
+    "[puffin] Read deletion vector from '{}': {} deleted position(s).", puffin_path, result.count);
+
+  return result;
+}
+
+std::streamoff read_puffin_container_magic(puffin_byte_source& source, std::string const& path)
+{
+  static constexpr char kPuffinMagic[4] = {'P', 'F', 'A', '1'};
+  char magic[4];
+  if (!source.seek(0) ||
+      !read_puffin_bytes(
+        source, std::as_writable_bytes(std::span{magic}), "leading magic of " + path) ||
+      std::memcmp(magic, kPuffinMagic, 4) != 0)
+    throw std::runtime_error("[puffin] Not a Puffin file (bad leading magic): " + path);
+  auto const file_size = source.size();
+  if (file_size < 4 || !source.seek(file_size - 4) ||
+      !read_puffin_bytes(
+        source, std::as_writable_bytes(std::span{magic}), "trailing magic of " + path) ||
+      std::memcmp(magic, kPuffinMagic, 4) != 0)
+    throw std::runtime_error("[puffin] Not a Puffin file (bad trailing magic): " + path);
+  return file_size;
+}
+
+template <typename Ref>
+std::streamoff validate_puffin_container(puffin_byte_source& source,
+                                         Ref const& ref,
+                                         scan_manager::charging_allocator* allocator)
+{
+  static constexpr char kPuffinMagic[4] = {'P', 'F', 'A', '1'};
+  auto const file_size                  = read_puffin_container_magic(source, ref.puffin_path);
+  if (allocator && (ref.file_size_in_bytes < 0 || file_size > ref.file_size_in_bytes))
+    throw scan_manager::preparation_resource_error(
+      "Puffin container exceeds the lowering-time envelope", true);
+  return validate_footer_descriptor(source, file_size, ref, kPuffinMagic, allocator);
+}
+
+template <typename Ref>
+decoded_positions read_deletion_vector_impl(Ref const& ref,
+                                            sirius::scan_manager::charging_allocator* allocator,
+                                            puffin_byte_source* supplied_source = nullptr)
+{
+  auto const& puffin_path          = ref.puffin_path;
+  auto const content_offset        = ref.content_offset;
+  auto const content_size_in_bytes = ref.content_size_in_bytes;
+  auto const record_count          = ref.record_count;
+
+  if (content_offset < 0 || content_size_in_bytes <= 0) {
+    throw std::runtime_error(
+      "[puffin] Invalid offset/size: offset=" + std::to_string(content_offset) +
+      " size=" + std::to_string(content_size_in_bytes));
+  }
+
+  // Bound the decode BEFORE opening the file, and on a constant rather than on anything the table
+  // wrote. `record_count` is a required manifest field; absent, both cardinality cross-checks
+  // below are vacuous and the expansion is unbounded.
+  if (record_count < 0) {
+    throw std::runtime_error(
+      "[puffin] Manifest entry for the deletion vector at offset " +
+      std::to_string(content_offset) + " in " + puffin_path +
+      " carries no record_count, so neither its footer cardinality nor its decoded position count "
+      "can be checked against anything, and nothing bounds how far the blob may expand");
+  }
+  if (record_count > kMaxDeletionVectorPositions) {
+    throw std::runtime_error(
+      "[puffin] Deletion vector at offset " + std::to_string(content_offset) + " in " +
+      puffin_path + " declares " + std::to_string(record_count) + " deleted positions, above the " +
+      std::to_string(kMaxDeletionVectorPositions) + " this reader will materialize while planning");
+  }
+
+  std::string_view local_view(puffin_path);
+  if (local_view.starts_with("file://")) local_view.remove_prefix(7);
+  std::unique_ptr<local_puffin_source> local_source;
+  if (supplied_source == nullptr) local_source = std::make_unique<local_puffin_source>(local_view);
+  auto* source = supplied_source ? supplied_source : local_source.get();
+  if (source == nullptr || (supplied_source == nullptr && !*local_source)) {
+    throw sirius::transparent::classified_execution_error(
+      sirius::transparent::late_failure_cause::reader_io,
+      "[puffin] Cannot open file: " + std::string(local_view) +
+        (local_view == puffin_path ? "" : " (from '" + puffin_path + "')"));
+  }
+
+  auto const footer_start = validate_puffin_container(*source, ref, allocator);
+
+  // The blob must lie entirely between the leading magic and the footer. Both bounds are compared
+  // by SUBTRACTION against a length the file actually has: `content_offset + content_size` is a
+  // sum of two manifest-supplied numbers and can wrap, and a descriptor that merely agrees with
+  // the manifest proves nothing about the file -- a few-KB Puffin whose manifest and footer both
+  // declare a 40 GiB blob would otherwise allocate 40 GiB here and fail on the read afterwards.
+  static constexpr std::streamoff kLeadingMagic = 4;
+  if (content_offset < kLeadingMagic || content_offset > footer_start ||
+      content_size_in_bytes > footer_start - content_offset) {
+    throw std::runtime_error("[puffin] Deletion vector at offset " +
+                             std::to_string(content_offset) + " size " +
+                             std::to_string(content_size_in_bytes) +
+                             " does not fit between the leading magic and the "
+                             "footer (which starts at " +
+                             std::to_string(footer_start) + ") of " + puffin_path);
+  }
+
+  if (!source->seek(content_offset)) {
+    throw sirius::transparent::classified_execution_error(
+      sirius::transparent::late_failure_cause::reader_io,
+      "[puffin] Cannot seek to offset " + std::to_string(content_offset) + " in " + puffin_path);
+  }
+
+  std::vector<uint8_t> legacy_blob;
+  sirius::scan_manager::charged_block charged_blob;
+  std::span<uint8_t> blob;
+  if (allocator) {
+    charged_blob = allocator->allocate(content_size_in_bytes);
+    blob         = {reinterpret_cast<uint8_t*>(charged_blob.data()),
+                    static_cast<size_t>(content_size_in_bytes)};
+  } else {
+    legacy_blob.resize(content_size_in_bytes);
+    blob = legacy_blob;
+  }
+  if (!source->read(std::as_writable_bytes(blob))) {
+    throw sirius::transparent::classified_execution_error(
+      sirius::transparent::late_failure_cause::reader_io,
+      "[puffin] Failed to read " + std::to_string(content_size_in_bytes) + " bytes from " +
+        puffin_path);
+  }
+
+  return parse_deletion_vector_blob(std::span<uint8_t const>{blob},
+                                    ref.puffin_path,
+                                    static_cast<size_t>(ref.record_count),
+                                    allocator);
+}
+}  // namespace
+
+namespace {
+using json_value = duckdb_yyjson::yyjson_val;
+std::string_view json_string(json_value* value)
+{
+  return {duckdb_yyjson::yyjson_get_str(value), duckdb_yyjson::yyjson_get_len(value)};
+}
+json_value* json_member(json_value* object, std::string_view key)
+{
+  return duckdb_yyjson::yyjson_obj_getn(object, key.empty() ? "" : key.data(), key.size());
+}
+void validate_metadata_object(json_value* object)
+{
+  if (!duckdb_yyjson::yyjson_is_obj(object))
+    throw std::runtime_error("[puffin] Metadata entry is not an object");
+  if (duckdb_yyjson::yyjson_obj_size(object) > 128)
+    throw scan_manager::preparation_resource_error("Puffin metadata object exceeds key limit",
+                                                   true);
+  size_t index, count;
+  json_value *key, *value;
+  yyjson_obj_foreach(object, index, count, key, value)
+  {
+    if (json_member(object, json_string(key)) != value)
+      throw std::runtime_error("[puffin] Duplicate metadata key");
+  }
+}
+void validate_properties(json_value* properties)
+{
+  if (!properties) return;
+  validate_metadata_object(properties);
+  size_t index, count;
+  json_value *key, *value;
+  yyjson_obj_foreach(properties, index, count, key, value)
+  {
+    if (!duckdb_yyjson::yyjson_is_str(value))
+      throw std::runtime_error("[puffin] Property is not a string");
+  }
+}
+int64_t metadata_integer(json_value* value)
+{
+  if (!duckdb_yyjson::yyjson_is_int(value) ||
+      (duckdb_yyjson::yyjson_is_uint(value) &&
+       duckdb_yyjson::yyjson_get_uint(value) > static_cast<uint64_t>(INT64_MAX)))
+    throw std::runtime_error("[puffin] Metadata integer is missing or out of range");
+  return duckdb_yyjson::yyjson_get_sint(value);
+}
+std::optional<std::string_view> metadata_property(json_value* properties, std::string_view name)
+{
+  auto* value = json_member(properties, name);
+  if (!value) return std::nullopt;
+  return json_string(value);
+}
+void validate_container_metadata(json_value* root, int64_t footer_start, size_t max_blobs)
+{
+  validate_metadata_object(root);
+  validate_properties(json_member(root, "properties"));
+  auto* blobs = json_member(root, "blobs");
+  if (!duckdb_yyjson::yyjson_is_arr(blobs))
+    throw std::runtime_error("[puffin] Footer has no blobs array");
+  auto count = duckdb_yyjson::yyjson_arr_size(blobs);
+  if (count > max_blobs)
+    throw scan_manager::preparation_resource_error("Puffin metadata exceeds blob limit", true);
+  size_t i, blob_count;
+  json_value* blob;
+  yyjson_arr_foreach(blobs, i, blob_count, blob)
+  {
+    validate_metadata_object(blob);
+    if (!duckdb_yyjson::yyjson_is_str(json_member(blob, "type")))
+      throw std::runtime_error("[puffin] Blob has no string type");
+    auto offset = metadata_integer(json_member(blob, "offset"));
+    auto length = metadata_integer(json_member(blob, "length"));
+    if (offset < 4 || offset > footer_start || length < 0 || length > footer_start - offset)
+      throw std::runtime_error("[puffin] Blob lies outside the container data section");
+    (void)metadata_integer(json_member(blob, "snapshot-id"));
+    (void)metadata_integer(json_member(blob, "sequence-number"));
+    auto* fields = json_member(blob, "fields");
+    if (!duckdb_yyjson::yyjson_is_arr(fields))
+      throw std::runtime_error("[puffin] Blob fields is not an integer array");
+    if (duckdb_yyjson::yyjson_arr_size(fields) > 4096)
+      throw scan_manager::preparation_resource_error("Puffin field list exceeds limit", true);
+    for (size_t j = 0; j < duckdb_yyjson::yyjson_arr_size(fields); ++j)
+      (void)metadata_integer(duckdb_yyjson::yyjson_arr_get(fields, j));
+    auto* codec = json_member(blob, "compression-codec");
+    if (codec && !duckdb_yyjson::yyjson_is_null(codec) && !duckdb_yyjson::yyjson_is_str(codec))
+      throw std::runtime_error("[puffin] Blob compression codec is not a string or null");
+    validate_properties(json_member(blob, "properties"));
+    // No auxiliary uncharged interval inventory. The descriptor count is bounded.
+    size_t j, previous_count;
+    json_value* other;
+    yyjson_arr_foreach(blobs, j, previous_count, other)
+    {
+      if (j == i) break;
+      auto other_offset = metadata_integer(json_member(other, "offset"));
+      auto other_length = metadata_integer(json_member(other, "length"));
+      if (offset == other_offset ||
+          (offset < other_offset + other_length && other_offset < offset + length))
+        throw std::runtime_error("[puffin] Blob descriptors overlap or repeat an offset");
+    }
+  }
+}
+}  // namespace
+
+struct puffin_container_metadata::impl {
+  parsed_puffin_footer footer;
+  int64_t size, start;
+  json_value* root() const { return duckdb_yyjson::yyjson_doc_get_root(footer.document.get()); }
+  json_value* blobs() const { return json_member(root(), "blobs"); }
+  json_value* blob(size_t index) const
+  {
+    if (index >= duckdb_yyjson::yyjson_arr_size(blobs()))
+      throw std::out_of_range("Puffin blob index");
+    return duckdb_yyjson::yyjson_arr_get(blobs(), index);
+  }
+};
+puffin_container_metadata::puffin_container_metadata(std::unique_ptr<impl> value)
+  : impl_(std::move(value))
+{
+}
+puffin_container_metadata::~puffin_container_metadata() = default;
+size_t puffin_container_metadata::blob_count() const
+{
+  return duckdb_yyjson::yyjson_arr_size(impl_->blobs());
+}
+puffin_blob_metadata puffin_container_metadata::blob(size_t index) const
+{
+  auto* value = impl_->blob(index);
+  auto* codec = json_member(value, "compression-codec");
+  return {json_string(json_member(value, "type")),
+          metadata_integer(json_member(value, "offset")),
+          metadata_integer(json_member(value, "length")),
+          metadata_integer(json_member(value, "snapshot-id")),
+          metadata_integer(json_member(value, "sequence-number")),
+          codec && duckdb_yyjson::yyjson_is_str(codec)
+            ? std::optional<std::string_view>{json_string(codec)}
+            : std::nullopt};
+}
+size_t puffin_container_metadata::field_count(size_t index) const
+{
+  return duckdb_yyjson::yyjson_arr_size(json_member(impl_->blob(index), "fields"));
+}
+int64_t puffin_container_metadata::field(size_t blob_index, size_t field_index) const
+{
+  auto* fields = json_member(impl_->blob(blob_index), "fields");
+  if (field_index >= duckdb_yyjson::yyjson_arr_size(fields))
+    throw std::out_of_range("Puffin field index");
+  return metadata_integer(duckdb_yyjson::yyjson_arr_get(fields, field_index));
+}
+std::optional<std::string_view> puffin_container_metadata::property(size_t index,
+                                                                    std::string_view name) const
+{
+  return metadata_property(json_member(impl_->blob(index), "properties"), name);
+}
+std::optional<std::string_view> puffin_container_metadata::file_property(
+  std::string_view name) const
+{
+  return metadata_property(json_member(impl_->root(), "properties"), name);
+}
+int64_t puffin_container_metadata::file_size() const { return impl_->size; }
+int64_t puffin_container_metadata::footer_start() const { return impl_->start; }
+std::shared_ptr<puffin_container_metadata const> read_puffin_metadata(
+  puffin_byte_source& source,
+  scan_manager::charging_allocator& allocator,
+  puffin_metadata_limits limits)
+{
+  if (limits.max_footer_bytes > 8ULL * 1024 * 1024 || limits.max_blobs > 4096)
+    throw std::invalid_argument("Puffin metadata limits exceed independent ceilings");
+  static constexpr char magic[4] = {'P', 'F', 'A', '1'};
+  std::string const label        = "container";
+  auto size                      = read_puffin_container_magic(source, label);
+  auto bounds                    = read_footer_bounds(source, size, label, magic, true);
+  if (bounds.payload_size > limits.max_footer_bytes)
+    throw scan_manager::preparation_resource_error("Puffin footer exceeds byte limit", true);
+  auto data    = std::make_unique<puffin_container_metadata::impl>();
+  data->size   = size;
+  data->start  = bounds.start;
+  data->footer = read_footer_document(source, bounds, label, &allocator, true);
+  validate_container_metadata(data->root(), data->start, limits.max_blobs);
+  return std::shared_ptr<puffin_container_metadata const>(
+    new puffin_container_metadata(std::move(data)));
+}
+
+decoded_delete_positions::decoded_delete_positions(scan_manager::charged_block backing,
+                                                   size_t count)
+  : backing_(std::move(backing)),
+    positions_(reinterpret_cast<int64_t const*>(backing_.data()), count)
+{
+}
+
+std::shared_ptr<decoded_delete_positions const> decode_deletion_vector_payload(
+  std::span<uint8_t const> payload,
+  scan_manager::charging_allocator& allocator,
+  deletion_vector_decode_limits limits)
+{
+  if (limits.max_payload_bytes > kMaxDeletionVectorPayloadBytes ||
+      limits.max_positions > static_cast<size_t>(kMaxDeletionVectorPositions))
+    throw std::invalid_argument("Deletion vector decode limits exceed the independent ceiling");
+  if (payload.size() > limits.max_payload_bytes)
+    throw scan_manager::preparation_resource_error("Deletion vector payload exceeds byte limit",
+                                                   true);
+  // Validate/count without materializing, then reserve the actual encoded count.
+  // No guessed catalog cardinality or max-sized allocation is required for bare blobs.
+  size_t count;
+  try {
+    count =
+      parse_deletion_vector_blob(payload, "payload", limits.max_positions, nullptr, true, true)
+        .count;
+  } catch (deletion_vector_expansion_limit const& error) {
+    throw scan_manager::preparation_resource_error(error.what(), true);
+  }
+  auto decoded = parse_deletion_vector_blob(payload, "payload", count, &allocator, false, true);
+  auto* values = reinterpret_cast<int64_t*>(decoded.backing.data());
+  if (decoded.count) decoded.count = std::unique(values, values + decoded.count) - values;
+  return std::shared_ptr<decoded_delete_positions const>(
+    new decoded_delete_positions(std::move(decoded.backing), decoded.count));
+}
+
+std::vector<int64_t> read_deletion_vector(DeletionVectorRef const& ref)
+{
+  return read_deletion_vector_impl(ref, nullptr).legacy;
+}
+
+std::unique_ptr<puffin_byte_source> make_puffin_byte_source(
+  std::unique_ptr<io::sirius_datasource> source)
+{
+  if (!source) return nullptr;
+  return std::make_unique<datasource_puffin_source>(std::move(source));
+}
+
+std::vector<int64_t> read_deletion_vector(DeletionVectorRef const& ref, puffin_byte_source& source)
+{
+  return read_deletion_vector_impl(ref, nullptr, &source).legacy;
+}
+
+namespace {
+template <typename Ref>
+void check_count(Ref const& ref, size_t count)
+{
+  if (count != static_cast<size_t>(ref.record_count))
+    throw std::runtime_error("[iceberg] Deletion vector for data file '" +
+                             ref.referenced_data_file + "' in '" + ref.puffin_path + "' decoded " +
+                             std::to_string(count) + " positions, but its manifest entry records " +
+                             std::to_string(ref.record_count) + "; the blob at offset " +
+                             std::to_string(ref.content_offset) +
+                             " is not the one this entry describes");
+}
+template <typename Ref>
+decoded_positions read_charged_checked(Ref const& ref,
+                                       sirius::scan_manager::charging_allocator& allocator,
+                                       scan_contract_id contract,
+                                       puffin_byte_source* source = nullptr)
+{
+  try {
+    auto result = read_deletion_vector_impl(ref, &allocator, source);
+    check_count(ref, result.count);
+    return result;
+  } catch (sirius::transparent::classified_execution_error const&) {
+    throw;
+  } catch (io::object_changed_error const&) {
+    // Preserve the typed version failure until the charged scan wrapper.
+    throw;
+  } catch (std::system_error const& error) {
+    // Preserve cancellation; other system errors are reader I/O failures.
+    if (error.code() == std::errc::operation_canceled) throw;
+    throw sirius::transparent::classified_execution_error(
+      sirius::transparent::late_failure_cause::reader_io, error.what());
+  } catch (std::runtime_error const& error) {
+    throw unsupported_physical_input(
+      contract, ref.puffin_path, verdict_reason::iceberg_delete_corrupt, error.what());
+  }
+}
+}  // namespace
+std::shared_ptr<iceberg_delete_set const> read_deletion_vector_charged(
+  DeletionVectorRef const& ref, sirius::scan_manager::charging_allocator& allocator)
+{
+  auto result     = read_charged_checked(ref, allocator, 0);
+  auto* positions = reinterpret_cast<int64_t*>(result.backing.data());
+  // Repeated high keys are permitted by the legacy reader. Deduplicate only after
+  // checking the encoded count, so the immutable result has set semantics.
+  if (result.count) result.count = std::unique(positions, positions + result.count) - positions;
+  return std::make_shared<iceberg_delete_set const>(
+    ref.referenced_data_file, std::move(result.backing), result.count, 1);
+}
+
+std::shared_ptr<iceberg_delete_set const> read_deletion_vector_charged(
+  DeletionVectorRefView const& ref,
+  sirius::scan_manager::charging_allocator& allocator,
+  std::string_view canonical_path,
+  std::shared_ptr<void const> path_owner,
+  scan_contract_id contract)
+{
+  auto result     = read_charged_checked(ref, allocator, contract);
+  auto* positions = reinterpret_cast<int64_t*>(result.backing.data());
+  if (result.count) result.count = std::unique(positions, positions + result.count) - positions;
+  return std::make_shared<iceberg_delete_set const>(
+    canonical_path, std::move(result.backing), result.count, 1, std::move(path_owner));
+}
+
+std::shared_ptr<iceberg_delete_set const> read_deletion_vector_charged(
+  DeletionVectorRefView const& ref,
+  sirius::scan_manager::charging_allocator& allocator,
+  std::string_view canonical_path,
+  std::shared_ptr<void const> path_owner,
+  scan_contract_id contract,
+  puffin_byte_source& source)
+{
+  auto result     = read_charged_checked(ref, allocator, contract, &source);
+  auto* positions = reinterpret_cast<int64_t*>(result.backing.data());
+  if (result.count) result.count = std::unique(positions, positions + result.count) - positions;
+  return std::make_shared<iceberg_delete_set const>(
+    canonical_path, std::move(result.backing), result.count, 1, std::move(path_owner));
 }
 
 }  // namespace sirius::op::scan

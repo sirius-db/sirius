@@ -35,9 +35,10 @@
 # `Host Frame: ... alloc_and_peer_copy_async ...` lines in BOTH contexts:
 #   1) Race findings (headed by `Use-before-alloc on allocation`) — the
 #      ACTUAL gate target; cluster_B must count these.
-#   2) API-error backtraces (headed by `Program hit cuda...`) — emitted
-#      by probe_peer_dma_works during init when cudaMemcpyPeer returns
-#      cudaErrorPeerAccessAlreadyEnabled. NOT a Phase 22 D-07 regression.
+#   2) API-error backtraces (headed by `Program hit cuda...`). Historical
+#      ordinary-peer setup produced cudaErrorPeerAccessAlreadyEnabled entries.
+#      The merged private-pool verifier no longer enables ordinary peers; new
+#      API failures are errors and must be inspected separately from race counts.
 # The cluster_B count uses an awk windowed match (in_race state) instead
 # of a flat grep. See 23-VERDICT.md Section J for the false-positive trail.
 #
@@ -58,7 +59,7 @@
 # Environment overrides (all optional):
 #   P22_SANITIZER_LOG  - log output path (default: /tmp/p22_sanitizer.log)
 #   P22_UNITTEST_BIN   - path to sirius_unittest
-#                        (default: build/release/extension/sirius/test/cpp/sirius_unittest)
+#                        (default: build/release/test/cpp/sirius_unittest)
 #   P22_QUERY          - Catch2 test name to run
 #                        (default: 'gpu_execution - TPC-H Query 11 parquet')
 #   P22_TIMEOUT_SEC    - sanitizer wall-clock budget seconds (default: 600)
@@ -73,7 +74,7 @@ if [[ -z "${CUDA_BIN}" ]]; then
 fi
 
 LOG="${P22_SANITIZER_LOG:-/tmp/p22_sanitizer.log}"
-UNIT="${P22_UNITTEST_BIN:-build/release/extension/sirius/test/cpp/sirius_unittest}"
+UNIT="${P22_UNITTEST_BIN:-build/release/test/cpp/sirius_unittest}"
 SF1_QUERY="${P22_QUERY:-gpu_execution - TPC-H Query 11 parquet}"
 TIMEOUT_SEC="${P22_TIMEOUT_SEC:-600}"
 
@@ -168,9 +169,11 @@ fi
 # pass state for Cluster B), and `set -e` would otherwise abort.
 #
 # Phase 23 gap-closure: cluster_B was a false-positive when total_races=0
-# because alloc_and_peer_copy_async also appears in cudaErrorPeerAccessAlreadyEnabled
-# API-error backtraces emitted by probe_peer_dma_works at init. We now
-# count host-frame mentions ONLY inside race-check sections (headed by
+# because alloc_and_peer_copy_async also appeared in historical ordinary-peer
+# API-error backtraces. The merged verifier uses private pools instead. These
+# cluster counts do not accept or suppress current CUDA API failures; inspect
+# full sanitizer output and process status separately. Count host-frame mentions
+# ONLY inside race-check sections (headed by
 # 'Use-before-alloc on allocation' — same header TOTAL_RACES uses).
 # An API-error section is headed by 'Program hit cuda' (compute-sanitizer
 # boilerplate for cudaError* surfaced via memcheck).

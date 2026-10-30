@@ -25,7 +25,8 @@
 #include <duckdb/common/exception.hpp>
 
 // cudf
-#include <cudf/ast/expressions.hpp>
+#include "cudf/ast_compat.hpp"
+
 #include <cudf/cudf_utils.hpp>
 #include <cudf/fixed_point/fixed_point.hpp>
 #include <cudf/types.hpp>
@@ -51,7 +52,7 @@ using evaluate_result = expression_evaluator::evaluate_result;
 evaluate_result expression_evaluator::evaluate(sirius::ast::constant const& alt,
                                                evaluation_mode mode)
 {
-  auto const cudf_type = sirius::get_cudf_type(alt.return_type());
+  auto const cudf_type = sirius::require_cudf_type(alt.return_type());
   bool const is_valid  = !std::holds_alternative<sirius::null_value>(alt.payload);
 
   switch (cudf_type.id()) {
@@ -169,8 +170,8 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::constant const& alt,
       return finish_scalar(std::move(scalar), mode);
     }
     case cudf::type_id::DECIMAL128: {
-      auto const scale =
-        numeric::scale_type{-static_cast<int32_t>(alt.return_type().decimal_scale())};
+      // From the carrier: HUGEINT is DECIMAL128 with scale 0.
+      auto const scale = numeric::scale_type{cudf_type.scale()};
       __int128_t const rep =
         is_valid ? std::get<sirius::decimal128>(alt.payload).value : __int128_t{};
       auto scalar = std::make_unique<cudf::fixed_point_scalar<numeric::decimal128>>(

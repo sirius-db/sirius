@@ -16,11 +16,15 @@
 
 #pragma once
 
+#include "memory/device_transfer.hpp"
+
 #include <rmm/cuda_device.hpp>
 
 #include <cuda/stream>
 
 #include <cstddef>
+#include <exception>
+#include <string_view>
 
 namespace cucascade::memory {
 class memory_space;
@@ -28,9 +32,12 @@ class memory_space;
 
 namespace sirius::op::detail {
 
-enum class replica_transfer_route { none, local, peer_dma, host_staging };
+/**
+ * @brief Selected copy API; peer_copy means cudaMemcpyPeerAsync, not a measured physical route
+ */
+using replica_transfer_route = sirius::memory::device_transfer_route;
 
-enum class replica_transfer_policy { automatic, force_host_staging };
+using replica_transfer_policy = sirius::memory::device_transfer_policy;
 
 /**
  * @brief Enqueues a finalized replica copy and returns its route
@@ -53,5 +60,46 @@ replica_transfer_route enqueue_replica_copy(
   ::cuda::stream_ref destination_stream,
   cucascade::memory::memory_space const& host_staging_space,
   replica_transfer_policy policy = replica_transfer_policy::automatic);
+
+/**
+ * @brief Keeps the first fatal replica failure while remaining submitted work drains
+ *
+ * Submission may skip recoverable allocation or availability failures. CUDA, programming, and
+ * non-standard exceptions are fatal. Every completion failure is fatal regardless of type. Callers
+ * drain all pending copies, rethrow the first fatal failure, and only then install completed
+ * replicas.
+ */
+class replica_fanout_failures final {
+ public:
+  /**
+   * @brief Classifies the exception currently being handled; call only from a catch handler
+   *
+   * @param filter_name Log prefix naming the filter type
+   * @param source_device GPU holding the source replica
+   * @param destination_device GPU whose copy failed
+   * @return True when the failure was recoverable and has been logged, so the caller continues with
+   * the next GPU; false when it is fatal and the caller must stop queueing
+   */
+  [[nodiscard]] bool skip_if_recoverable(std::string_view filter_name,
+                                         int source_device,
+                                         int destination_device) noexcept;
+
+  /**
+   * @brief Records the current exception as fatal; call only from a catch handler
+   *
+   * Later failures are logged without replacing the first or interrupting cleanup.
+   */
+  void record_fatal(std::string_view filter_name,
+                    int source_device,
+                    int destination_device) noexcept;
+
+  /**
+   * @brief Rethrows the fatal failure, if any
+   */
+  void rethrow_if_fatal() const;
+
+ private:
+  std::exception_ptr _fatal;
+};
 
 }  // namespace sirius::op::detail

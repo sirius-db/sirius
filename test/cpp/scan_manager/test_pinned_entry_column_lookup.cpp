@@ -105,7 +105,8 @@ void pin_metadata_entry(sirius_scan_manager& manager,
 struct split_pin_fixture {
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory =
     initialize_memory_manager(1);
-  sirius_scan_manager manager{scan_manager_config{}, *memory, single_gpu_index()};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, scan_manager_config{}, *memory, single_gpu_index()};
 
   split_pin_fixture()
   {
@@ -161,7 +162,8 @@ void pin_typed_entry(sirius_scan_manager& manager,
 struct type_match_fixture {
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory =
     initialize_memory_manager(1);
-  sirius_scan_manager manager{scan_manager_config{}, *memory, single_gpu_index()};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, scan_manager_config{}, *memory, single_gpu_index()};
   duckdb::vector<duckdb::LogicalType> returned_types{duckdb::LogicalType::BIGINT,
                                                      duckdb::LogicalType::BIGINT};
   std::string matching_name;
@@ -286,7 +288,8 @@ TEST_CASE("type match: when no covering entry still matches, one is returned any
           "[pinned_lookup][scan_manager]")
 {
   auto memory = initialize_memory_manager(1);
-  sirius_scan_manager manager{scan_manager_config{}, *memory, single_gpu_index()};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, scan_manager_config{}, *memory, single_gpu_index()};
   pin_typed_entry(manager, *memory, "orders", {0, 1}, kInt32);
   duckdb::vector<duckdb::LogicalType> const returned_types{duckdb::LogicalType::BIGINT,
                                                            duckdb::LogicalType::BIGINT};
@@ -299,4 +302,26 @@ TEST_CASE("type match: when no covering entry still matches, one is returned any
                                                      sirius::test::test_table_identity(kTableOid),
                                                      &both,
                                                      &returned_types) != nullptr);
+}
+
+TEST_CASE("pin publication includes visibility and uniqueness facts",
+          "[pinned_lookup][scan_manager]")
+{
+  auto memory = initialize_memory_manager(1);
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, scan_manager_config{}, *memory, single_gpu_index()};
+  sirius::scan_manager::pinned_entry_metadata metadata;
+  metadata.mvcc                  = sirius::scan_manager::duckdb_mvcc_metadata{42, {}, 7};
+  metadata.proven_unique_columns = {"c0"};
+  std::ignore                    = manager.insert_pinned_entry(
+    "orders", make_cache_info({0, 1}), {}, {}, {}, {}, {}, std::move(metadata));
+  auto entry = manager.find_pinned_entry_for_duckdb_table(
+    kCatalog, kSchema, kTable, sirius::test::test_table_identity(kTableOid));
+  REQUIRE(entry);
+  REQUIRE(entry->mvcc);
+  CHECK(entry->mvcc->v_base == 42);
+  CHECK(entry->mvcc->checkpoint_iteration == 7);
+  REQUIRE(entry->proven_unique_columns.size() == 2);
+  CHECK(entry->proven_unique_columns[0]);
+  CHECK_FALSE(entry->proven_unique_columns[1]);
 }

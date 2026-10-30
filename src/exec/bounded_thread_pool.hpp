@@ -19,12 +19,15 @@
 #include "exec/invocable.hpp"
 #include "exec/thread_util.hpp"
 #include "log/logging.hpp"
+#include "query_id.hpp"
 
 #include <condition_variable>
 #include <exception>
 #include <latch>
+#include <list>
+#include <memory>
 #include <mutex>
-#include <queue>
+#include <optional>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -63,14 +66,13 @@ class bounded_thread_pool {
    public:
     explicit slot(bounded_thread_pool* pool = nullptr) noexcept : pool_(pool) {}
 
-    slot(slot&& other) noexcept : pool_(other.pool_) { other.pool_ = nullptr; }
+    slot(slot&& other) noexcept : pool_(std::exchange(other.pool_, nullptr)) {}
 
     slot& operator=(slot&& other) noexcept
     {
       if (this != &other) {
         release();
-        pool_       = other.pool_;
-        other.pool_ = nullptr;
+        pool_ = std::exchange(other.pool_, nullptr);
       }
       return *this;
     }
@@ -86,7 +88,7 @@ class bounded_thread_pool {
    private:
     void release()
     {
-      if (auto* p = std::exchange(pool_, nullptr); p != nullptr) { p->release_slot(); }
+      if (auto* p = std::exchange(pool_, nullptr)) { p->release_slot(); }
     }
 
     bounded_thread_pool* pool_{nullptr};
@@ -214,34 +216,60 @@ class bounded_thread_pool {
   /**
    * @brief Dispatch a function using the given slot.
    *
-   * Consumes the slot (it becomes invalid). The function runs on a worker thread;
-   * the slot is released automatically when the task completes.
+   * Consumes the slot and callable only after queue allocation succeeds. On exception both
+   * remain with the caller, which can report failure before destroying captured tasks.
+   * The slot is released after callable destruction. The optional query tag is for queue disposal;
+   * the caller owns query resource lifetime accounting.
    */
-  void dispatch(slot&& s, sirius::exec::invocable<void()> fn)
+  void dispatch(slot&& s,
+                sirius::exec::invocable<void()>&& fn,
+                std::optional<sirius::query_id_t> query = std::nullopt)
   {
     if (not s) { return; }
     {
       std::lock_guard lock(mu_);
-      work_queue_.push([s = std::move(s), fn = std::move(fn)]() mutable noexcept {
-        try {
-          fn();
-        } catch (const std::exception& e) {
-          SIRIUS_LOG_ERROR("Exception in bounded_thread_pool task: {}", e.what());
-        } catch (...) {
-          SIRIUS_LOG_ERROR("Unknown exception in bounded_thread_pool task");
-        }
-        // Destroy before slot is released upon lambda exit.
-        fn = nullptr;
-        // When slot, s, goes out of scope, release_slot is automatically
-        // invoked, clearing the path for another task to pick up that slot.
-      });
+      auto& item = work_queue_.emplace_back();
+      // Commit with nonthrowing transfers only after allocation. Workers cannot see the empty
+      // entry while mu_ is held. No user captures are destroyed under the queue lock.
+      item.query       = query;
+      item.reservation = std::move(s);
+      item.fn          = std::move(fn);
     }
     cv_work_.notify_one();
   }
 
+  /// Dispose of queued callables only. Manager-held/running work is covered by its work lease;
+  /// callers must close publication before disposal and wait for leases before releasing state.
+  /// A manager can still dispatch already-held work after this sweep; disposal is not a barrier.
+  /// Detach under the lock and destroy outside it: captures and slots may reenter the pool.
+  void discard_queued(sirius::query_id_t query_id)
+  {
+    std::list<work_item> dropped;
+    {
+      std::lock_guard lock(mu_);
+      for (auto it = work_queue_.begin(); it != work_queue_.end();) {
+        if (it->query == query_id) {
+          auto next = std::next(it);
+          dropped.splice(dropped.end(), work_queue_, it);
+          it = next;
+        } else {
+          ++it;
+        }
+      }
+    }
+    dropped.clear();  // releases captures and slots outside the lock
+  }
+
  private:
-  // Called exclusively by the slot destructor — covers both the drop-without-dispatch
-  // and post-task-completion cases.
+  /// Query identity is queue metadata only. Idle reservations carry no query or work claim.
+  struct work_item {
+    // Reverse member destruction retires captures before returning execution capacity.
+    slot reservation;
+    std::optional<sirius::query_id_t> query;
+    sirius::exec::invocable<void()> fn;
+  };
+
+  // Capacity covers both undispatched reservations and queued/running worker callables.
   void release_slot()
   {
     {
@@ -255,16 +283,27 @@ class bounded_thread_pool {
   void work_loop()
   {
     while (true) {
-      sirius::exec::invocable<void() noexcept> fn;
+      slot reservation;
+      sirius::exec::invocable<void()> fn;
       {
         std::unique_lock lock(mu_);
         cv_work_.wait(lock, [&] { return !work_queue_.empty() || stop_requested_; });
         if (stop_requested_ && work_queue_.empty()) { break; }
-        fn = std::move(work_queue_.front());
-        work_queue_.pop();
+        reservation = std::move(work_queue_.front().reservation);
+        fn          = std::move(work_queue_.front().fn);
+        work_queue_.pop_front();
       }
       if (fn == nullptr) { break; }
-      fn();
+      try {
+        fn();
+      } catch (const std::exception& e) {
+        log::log_noexcept(
+          [&] { SIRIUS_LOG_ERROR("Exception in bounded_thread_pool task: {}", e.what()); });
+      } catch (...) {
+        log::log_noexcept(
+          [] { SIRIUS_LOG_ERROR("Unknown exception in bounded_thread_pool task"); });
+      }
+      // fn is destroyed before reservation, outside mu_, including after worker exceptions.
     }
   }
 
@@ -278,7 +317,9 @@ class bounded_thread_pool {
   bool interrupted_{false};
   bool stop_requested_{false};
 
-  std::queue<sirius::exec::invocable<void() noexcept>> work_queue_;
+  /// std::list, not std::queue: discard_queued(query_id) removes one query's items from the
+  /// middle without disturbing the ordering of everyone else's.
+  std::list<work_item> work_queue_;
   std::vector<std::thread> threads_;
 };
 

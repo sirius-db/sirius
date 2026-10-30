@@ -47,6 +47,7 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <optional>
 #include <regex>
 #include <set>
 #include <string>
@@ -67,7 +68,11 @@ struct mgpu_env_params {
   uint64_t hash_partition_bytes       = 10'000'000;
   uint64_t concat_batch_bytes         = 100'000'000;
   uint64_t max_build_hash_table_bytes = 90'000'000;
-  double usage_limit_fraction         = 0.4;
+  // Per-GPU BUILD_PROBE resident-payload budget (max_build_probe_resident_bytes). Omitted from
+  // the yaml when unset, leaving the engine default; set it (0 is a valid "disable BUILD_PROBE"
+  // value) to force payload-bound denial explicitly.
+  std::optional<uint64_t> max_build_probe_resident_bytes;
+  double usage_limit_fraction = 0.4;
   // Absolute per-GPU usage cap in bytes. When non-zero this is emitted as
   // `usage_limit_bytes` (mutually exclusive with usage_limit_fraction per
   // sirius_config.cpp:201) so a test can impose a small fixed budget that
@@ -132,6 +137,9 @@ inline void write_mgpu_yaml(std::filesystem::path const& yaml_path,
     << "\n"
        "    max_build_hash_table_bytes: "
     << params.max_build_hash_table_bytes << "\n";
+  if (params.max_build_probe_resident_bytes) {
+    f << "    max_build_probe_resident_bytes: " << *params.max_build_probe_resident_bytes << "\n";
+  }
 }
 
 /**
@@ -397,6 +405,8 @@ inline void require_gpu_matches_cpu(duckdb::Connection& con,
   auto const nrows = gpu_result->RowCount();
   std::vector<std::vector<std::string>> gpu_rows;
   std::vector<std::vector<std::string>> cpu_rows;
+  auto gpu_values = gpu_result->Collection().GetRows();
+  auto cpu_values = cpu_result->Collection().GetRows();
   gpu_rows.reserve(nrows);
   cpu_rows.reserve(nrows);
   for (duckdb::idx_t r = 0; r < nrows; ++r) {
@@ -405,8 +415,8 @@ inline void require_gpu_matches_cpu(duckdb::Connection& con,
     g_row.reserve(ncols);
     c_row.reserve(ncols);
     for (duckdb::idx_t c = 0; c < ncols; ++c) {
-      g_row.push_back(gpu_result->GetValue(c, r).ToString());
-      c_row.push_back(cpu_result->GetValue(c, r).ToString());
+      g_row.push_back(gpu_values.GetValue(c, r).ToString());
+      c_row.push_back(cpu_values.GetValue(c, r).ToString());
     }
     gpu_rows.push_back(std::move(g_row));
     cpu_rows.push_back(std::move(c_row));

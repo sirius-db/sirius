@@ -29,6 +29,9 @@ namespace sirius {
  * Multiple configurations may exist independently of the active context.
  * Destruction does not reset all process-wide settings: changing
  * `sirius.executor.downgrade.copy_chunk_bytes` after a successful creation is unsupported.
+ * Spill-compression defaults are process-wide and persist after destruction or
+ * failed creation; the next initialization replaces them from its configuration.
+ *
  * CUDA/NVTX initialization persists even after failed creation; NVTX injection settings
  * must remain unchanged for the process lifetime.
  * Forking a process with an active context is unsupported.

@@ -1,6 +1,5 @@
 // Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0
 #include "catch.hpp"
-#include "utils/log_test_utils.hpp"
 
 #include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/pinned_memory.hpp>
@@ -123,13 +122,11 @@ TEST_CASE("public context rolls back late initialization failures before retry",
   auto root = YAML::LoadFile(
     (std::filesystem::path(__FILE__).parent_path() / "data" / "init_failure_pinned_rollback.yaml")
       .string());
-  // Exercise global batch telemetry as well as the pinned/device resources.
-  root["sirius"]["telemetry"]["enable_quent"]        = true;
-  root["sirius"]["telemetry"]["enable_batch_events"] = true;
-  root["sirius"]["telemetry"]["enable_nvtx"]         = false;
-  sirius::test::scoped_recording_log_sink logs;
-  auto const threshold = cudf::get_allocate_host_as_pinned_threshold();
-  auto failed          = sirius::Context::create(from_yaml(root));
+  // Exercise telemetry as well as the pinned/device resources.
+  root["sirius"]["telemetry"]["enable_quent"] = true;
+  root["sirius"]["telemetry"]["enable_nvtx"]  = false;
+  auto const threshold                        = cudf::get_allocate_host_as_pinned_threshold();
+  auto failed                                 = sirius::Context::create(from_yaml(root));
   REQUIRE_FALSE(failed.has_value());
   CHECK(failed.error().code == sirius::ErrorCode::context_initialization);
   CHECK(cudf::get_allocate_host_as_pinned_threshold() == threshold);
@@ -143,11 +140,5 @@ TEST_CASE("public context rolls back late initialization failures before retry",
     INFO("error code: " << (retry ? -1 : static_cast<int>(retry.error().code)));
     REQUIRE(retry.has_value());
   }
-  unsigned installations = 0;
-  for (auto const& record : logs.sink().records()) {
-    CHECK(record.message.find("already installed") == std::string::npos);
-    if (record.message.find("Batch telemetry installed") != std::string::npos) { ++installations; }
-  }
-  CHECK(installations == 2);
   check_default_allocators();
 }

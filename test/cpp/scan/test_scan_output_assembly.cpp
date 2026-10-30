@@ -19,15 +19,18 @@
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <cuda_runtime_api.h>
 
 #include <catch.hpp>
 #include <op/scan/scan_plan.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -109,7 +112,8 @@ TEST_CASE("scan output assembly projects and reorders data columns without copyi
   auto const original_pointers = data_pointers(input->view());
   scan::owning_table_view view{std::move(input)};
 
-  auto output = scan::assemble_scan_output(plan, std::move(view), {}, test_stream());
+  auto output = scan::assemble_scan_output(
+    plan, std::move(view), {}, test_stream(), cudf::get_current_device_resource_ref());
 
   REQUIRE(output.num_rows() == 2);
   REQUIRE(output.n_columns() == 2);
@@ -133,7 +137,8 @@ TEST_CASE("scan output assembly copies repeated data columns",
   auto const original_pointers = data_pointers(input->view());
   scan::owning_table_view view{std::move(input)};
 
-  auto output = scan::assemble_scan_output(plan, std::move(view), {}, test_stream());
+  auto output = scan::assemble_scan_output(
+    plan, std::move(view), {}, test_stream(), cudf::get_current_device_resource_ref());
 
   REQUIRE(output.num_rows() == 2);
   REQUIRE(output.n_columns() == 3);
@@ -163,7 +168,8 @@ TEST_CASE("scan output assembly interleaves partition and repeated data columns"
   auto const original_pointers = data_pointers(input->view());
   scan::owning_table_view view{std::move(input)};
 
-  auto output = scan::assemble_scan_output(plan, std::move(view), {"2024"}, test_stream());
+  auto output = scan::assemble_scan_output(
+    plan, std::move(view), {"2024"}, test_stream(), cudf::get_current_device_resource_ref());
 
   REQUIRE(output.num_rows() == 2);
   REQUIRE(output.n_columns() == 4);
@@ -188,7 +194,8 @@ TEST_CASE("scan output assembly preserves the row-count carrier for an empty lay
   auto const original_pointers = data_pointers(input->view());
   scan::owning_table_view view{std::move(input)};
 
-  auto output = scan::assemble_scan_output(plan, std::move(view), {}, test_stream());
+  auto output = scan::assemble_scan_output(
+    plan, std::move(view), {}, test_stream(), cudf::get_current_device_resource_ref());
 
   REQUIRE(output.num_rows() == 3);
   REQUIRE(output.n_columns() == 1);
@@ -196,47 +203,111 @@ TEST_CASE("scan output assembly preserves the row-count carrier for an empty lay
   CHECK(data_pointers(output.view())[0] == original_pointers[0]);
 }
 
-TEST_CASE("scan output assembly routing recognizes pass-through and rebuild layouts",
-          "[scan][parquet][assembly][routing]")
+TEST_CASE("scan column roles are resolved from the planner projection boundary",
+          "[scan][parquet][scan_plan][roles]")
 {
-  scan::scan_plan plan;
+  using role = scan::scan_column_layout::data_role;
+  auto const types =
+    duckdb::vector<sirius::logical_type>(5, sirius::logical_type::make(sirius::type_id::INTEGER));
+  auto const names = duckdb::vector<std::string>{
+    "l_extendedprice", "l_discount", "l_shipdate", "l_quantity", "part"};
+  auto const build = [&](duckdb::vector<duckdb::ColumnIndex> ids,
+                         duckdb::vector<duckdb::idx_t> projections,
+                         std::size_t output_count,
+                         duckdb::vector<duckdb::HivePartitioningIndex> partitions = {}) {
+    return scan::build_scan_plan(ids, projections, names, types, output_count, partitions);
+  };
 
-  SECTION("empty output layout is a pass-through")
+  SECTION("pure projection")
   {
-    plan.data_columns = {data_column(0)};
+    auto const plan = build({duckdb::ColumnIndex(0), duckdb::ColumnIndex(1)}, {0, 1}, 2);
+    CHECK((plan.columns.data_roles == std::vector<role>{role::OUTPUT, role::OUTPUT}));
+    CHECK(plan.filter_only_batch_positions().empty());
+    CHECK(plan.columns.output_is_identity);
+    CHECK(scan::output_is_leading_prefix(plan));
     CHECK_FALSE(scan::needs_output_assembly(plan));
   }
-
-  SECTION("identity data layout is a pass-through")
+  SECTION("q6 output and filter columns")
   {
-    plan.data_columns  = {data_column(0), data_column(1)};
-    plan.output_layout = {{scan::scan_plan::output_entry::DATA, 0},
-                          {scan::scan_plan::output_entry::DATA, 1}};
+    auto const plan = build({duckdb::ColumnIndex(0),
+                             duckdb::ColumnIndex(1),
+                             duckdb::ColumnIndex(2),
+                             duckdb::ColumnIndex(3)},
+                            {0, 1, 2, 3},
+                            2);
+    CHECK((plan.columns.data_roles ==
+           std::vector<role>{role::OUTPUT, role::OUTPUT, role::FILTER_ONLY, role::FILTER_ONLY}));
+    CHECK((plan.columns.output_data_positions == std::vector<std::size_t>{0, 1}));
+    CHECK((plan.filter_only_batch_positions() == std::unordered_set<std::size_t>{2, 3}));
+    CHECK(scan::output_prefix_width(plan) == 2);
+    CHECK(scan::output_is_leading_prefix(plan));
+    CHECK(scan::needs_output_assembly(plan));
+  }
+  SECTION("a projected filter column stays an output")
+  {
+    auto const plan = build({duckdb::ColumnIndex(0), duckdb::ColumnIndex(1)}, {0, 1}, 1);
+    CHECK((plan.columns.data_roles == std::vector<role>{role::OUTPUT, role::FILTER_ONLY}));
+    auto const shared = build({duckdb::ColumnIndex(0)}, {0, 0}, 1);
+    CHECK((shared.columns.data_roles == std::vector<role>{role::OUTPUT}));
+  }
+  SECTION("duplicate outputs share a slot")
+  {
+    auto const plan = build({duckdb::ColumnIndex(0)}, {0, 0}, 2);
+    CHECK((plan.columns.data_roles == std::vector<role>{role::OUTPUT}));
+    CHECK((plan.columns.output_data_positions == std::vector<std::size_t>{0, 0}));
+    CHECK_FALSE(plan.columns.output_is_identity);
+    CHECK_FALSE(scan::output_is_leading_prefix(plan));
+    CHECK(scan::output_prefix_width(plan) == 1);
+    CHECK(scan::needs_output_assembly(plan));
+  }
+  SECTION("reordered outputs retain their materialized positions")
+  {
+    auto const plan = build({duckdb::ColumnIndex(0), duckdb::ColumnIndex(1)}, {1, 0}, 2);
+    CHECK((plan.columns.output_data_positions == std::vector<std::size_t>{0, 1}));
+    CHECK((plan.columns.materialized_primary_indices == std::vector<std::size_t>{1, 0}));
+    CHECK(scan::output_is_leading_prefix(plan));
+  }
+  SECTION("filter-only Hive columns are omitted")
+  {
+    auto const plan = build({duckdb::ColumnIndex(0), duckdb::ColumnIndex(4)},
+                            {0, 1},
+                            1,
+                            {duckdb::HivePartitioningIndex("year", 4)});
+    CHECK((plan.columns.data_roles == std::vector<role>{role::OUTPUT}));
+    CHECK(plan.partition_columns.empty());
+    CHECK(plan.filter_only_batch_positions().empty());
+  }
+  SECTION("Hive output is synthesized beside materialized data")
+  {
+    auto const plan =
+      build({duckdb::ColumnIndex(0), duckdb::ColumnIndex(4), duckdb::ColumnIndex(2)},
+            {0, 1, 2},
+            2,
+            {duckdb::HivePartitioningIndex("year", 4)});
+    CHECK((plan.columns.data_roles == std::vector<role>{role::OUTPUT, role::FILTER_ONLY}));
+    REQUIRE(plan.output_layout.size() == 2);
+    CHECK(plan.output_layout[1].source == scan::scan_plan::output_entry::PARTITION);
+    CHECK_FALSE(plan.columns.output_is_identity);
+    CHECK_FALSE(scan::output_is_leading_prefix(plan));
+    CHECK(scan::output_prefix_width(plan) == 1);
+    CHECK(scan::needs_output_assembly(plan));
+  }
+  SECTION("zero output with a filter uses its filter column for row count")
+  {
+    auto const plan = build({duckdb::ColumnIndex(2)}, {0}, 0);
+    CHECK((plan.columns.data_roles == std::vector<role>{role::FILTER_ONLY}));
+    CHECK_FALSE(plan.carrier_batch_index.has_value());
+    CHECK_FALSE(scan::output_prefix_width(plan).has_value());
+    CHECK_FALSE(scan::output_is_leading_prefix(plan));
     CHECK_FALSE(scan::needs_output_assembly(plan));
   }
-
-  SECTION("reordered data layout requires assembly")
+  SECTION("zero output without a filter adds a carrier")
   {
-    plan.data_columns  = {data_column(0), data_column(1)};
-    plan.output_layout = {{scan::scan_plan::output_entry::DATA, 1},
-                          {scan::scan_plan::output_entry::DATA, 0}};
-    CHECK(scan::needs_output_assembly(plan));
-  }
-
-  SECTION("duplicate data layout requires assembly")
-  {
-    plan.data_columns  = {data_column(0)};
-    plan.output_layout = {{scan::scan_plan::output_entry::DATA, 0},
-                          {scan::scan_plan::output_entry::DATA, 0}};
-    CHECK(scan::needs_output_assembly(plan));
-  }
-
-  SECTION("partition layout requires assembly")
-  {
-    plan.data_columns = {data_column(0)};
-    plan.partition_columns.push_back(
-      {1, "part", sirius::logical_type::make(sirius::type_id::INTEGER)});
-    plan.output_layout = {{scan::scan_plan::output_entry::PARTITION, 0}};
-    CHECK(scan::needs_output_assembly(plan));
+    auto const plan = build({duckdb::ColumnIndex(duckdb::COLUMN_IDENTIFIER_ROW_ID)}, {}, 0);
+    CHECK((plan.columns.data_roles == std::vector<role>{role::ROW_COUNT_CARRIER}));
+    CHECK(plan.filter_only_batch_positions().empty());
+    CHECK((plan.non_output_batch_positions() == std::unordered_set<std::size_t>{0}));
+    CHECK_FALSE(scan::output_prefix_width(plan).has_value());
+    CHECK_FALSE(scan::needs_output_assembly(plan));
   }
 }

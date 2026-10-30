@@ -16,13 +16,29 @@ if(SIRIUS_TARGET STREQUAL "sirius::sirius_static")
   target_link_options(consumer PRIVATE -static-libgcc -static-libstdc++)
 endif()
 
-add_executable(c_consumer config.c)
-set_target_properties(c_consumer PROPERTIES C_STANDARD 99 C_STANDARD_REQUIRED
-                                                          ON)
+add_executable(c_consumer abi.c)
+set_target_properties(
+  c_consumer
+  PROPERTIES C_STANDARD 99
+             C_STANDARD_REQUIRED ON
+             C_EXTENSIONS OFF)
 target_link_libraries(c_consumer PRIVATE ${SIRIUS_TARGET})
 if(SIRIUS_TARGET STREQUAL "sirius::sirius_static")
   set_target_properties(c_consumer PROPERTIES LINKER_LANGUAGE CXX)
   target_link_options(c_consumer PRIVATE -static-libgcc -static-libstdc++)
+endif()
+
+add_executable(c_configuration_consumer config.c)
+set_target_properties(
+  c_configuration_consumer
+  PROPERTIES C_STANDARD 99
+             C_STANDARD_REQUIRED ON
+             C_EXTENSIONS OFF)
+target_link_libraries(c_configuration_consumer PRIVATE ${SIRIUS_TARGET})
+if(SIRIUS_TARGET STREQUAL "sirius::sirius_static")
+  set_target_properties(c_configuration_consumer PROPERTIES LINKER_LANGUAGE CXX)
+  target_link_options(c_configuration_consumer PRIVATE -static-libgcc
+                      -static-libstdc++)
 endif()
 
 add_executable(cpp_configuration_consumer config_cpp.cpp)

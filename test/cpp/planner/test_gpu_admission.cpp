@@ -93,9 +93,9 @@ TEST_CASE("estimate_bytes_per_row sums fixed-width carrier widths", "[admission_
 TEST_CASE("estimate_bytes_per_row charges 128-bit integers their cuDF carrier width",
           "[admission_estimator]")
 {
-  // get_cudf_type has no 128-bit integer carrier and narrows both to a 64-bit one,
-  // so they cost 8 bytes on device rather than their DuckDB width of 16.
-  REQUIRE(estimate_bytes_per_row({logical_type::make(type_id::HUGEINT)}, k_avg_var) == 8);
+  // HUGEINT is carried as DECIMAL128 (16 bytes); get_cudf_type still narrows UHUGEINT to UINT64,
+  // so it costs 8 bytes on device rather than its DuckDB width of 16.
+  REQUIRE(estimate_bytes_per_row({logical_type::make(type_id::HUGEINT)}, k_avg_var) == 16);
   REQUIRE(estimate_bytes_per_row({logical_type::make(type_id::UHUGEINT)}, k_avg_var) == 8);
 }
 

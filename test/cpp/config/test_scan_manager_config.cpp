@@ -20,9 +20,11 @@
 #include "utils/sirius_test_env.hpp"
 
 #include <algorithm>
+#include <array>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <string_view>
 
 using sirius::io::cache::cache_mode;
 using sirius::io::cache::eviction_policy;
@@ -94,6 +96,180 @@ std::string single_gpu_scan_manager_yaml(std::string const& body)
 }
 
 }  // namespace
+
+TEST_CASE("Preparation timing YAML overrides survive configuration resolution",
+          "[scan_manager][config][preparation_config]")
+{
+  auto [body, fill, min_ms, max_ms, interrupt_ms] =
+    GENERATE(table<std::string, int, int, int, int>({
+      {"", 50, 50, 2000, 10},
+      {"      preparation: {}\n", 50, 50, 2000, 10},
+      {"      preparation:\n        max_inflight_metadata_jobs: 0\n", 50, 50, 2000, 10},
+      {"      preparation:\n        max_inflight_dv_jobs: 0\n", 50, 50, 2000, 10},
+      {"      preparation:\n        interrupt_check_interval: 3\n", 50, 50, 2000, 3},
+      {"      preparation:\n        interrupt_check_interval: 1s\n", 50, 50, 2000, 1000},
+      {"      preparation:\n        partial_batch: {}\n", 50, 50, 2000, 10},
+      {"      preparation:\n        partial_batch:\n          min_fill_percent: 25\n",
+       25,
+       50,
+       2000,
+       10},
+      {"      preparation:\n        partial_batch:\n          min_residence: 20\n"
+       "          max_residence: 500ms\n",
+       50,
+       20,
+       500,
+       10},
+      {"      preparation:\n        partial_batch:\n          min_residence: 1s\n"
+       "          max_residence: 1s\n",
+       50,
+       1000,
+       1000,
+       10},
+    }));
+  INFO(body);
+  scoped_yaml yaml("sirius_preparation_timing.yaml", scan_manager_yaml(body));
+  cucascade::memory::system_topology_info topology{};
+  topology.num_gpus       = 1;
+  topology.num_numa_nodes = 1;
+  topology.gpus           = {{.id = 0, .numa_node = 0}};
+  topology.numa_nodes     = {{.id = 0, .memory_capacity = 1ULL << 30, .has_cpus = true}};
+  auto resolved           = sirius::parsed_sirius_config::from_file(yaml.path()).resolve(topology);
+  auto const& config      = resolved.get_scan_manager_config();
+  auto options            = config.preparation.resolve(config.thread_pool.num_threads);
+  REQUIRE(options.partial_batch);
+  CHECK(options.partial_batch->min_fill_percent == static_cast<size_t>(fill));
+  CHECK(options.partial_batch->min_residence == std::chrono::milliseconds{min_ms});
+  CHECK(options.partial_batch->max_residence == std::chrono::milliseconds{max_ms});
+  CHECK(options.interrupt_check_interval == std::chrono::milliseconds{interrupt_ms});
+  CHECK(options.max_inflight_metadata_jobs ==
+        (body.find("max_inflight_metadata_jobs: 0") != std::string::npos ? 0 : 4096));
+  CHECK(options.max_inflight_dv_jobs == 0);
+}
+
+TEST_CASE("Preparation timing YAML rejects invalid values and unknown keys",
+          "[scan_manager][config][preparation_config]")
+{
+  auto field = GENERATE("interrupt_check_interval: 0",
+                        "interrupt_check_interval: -1ms",
+                        "interrupt_check_interval: later",
+                        "interrupt_check_interval: []",
+                        "interrupt_check_interva: 10ms",
+                        "max_inflight_job: 2");
+  INFO(field);
+  scoped_yaml yaml("sirius_preparation_timing_invalid.yaml",
+                   scan_manager_yaml(std::string("      preparation:\n        ") + field + "\n"));
+  CHECK_THROWS_AS(sirius::parsed_sirius_config::from_file(yaml.path()),
+                  sirius::configuration_input_error);
+}
+
+TEST_CASE("Partial batch YAML rejects invalid policies and unknown keys",
+          "[scan_manager][config][preparation_config][partial_batch]")
+{
+  auto field = GENERATE("min_fill_percent: 0",
+                        "min_fill_percent: -1",
+                        "min_fill_percent: 101",
+                        "min_fill_percent: 1.5",
+                        "min_fill_percent: []",
+                        "min_residence: 0ms",
+                        "min_residence: -1ms",
+                        "min_residence: later",
+                        "max_residence: 0",
+                        "max_residence: 49ms",
+                        "max_residence: []",
+                        "min_residence: 3s",
+                        "min_fill: 50");
+  INFO(field);
+  scoped_yaml yaml(
+    "sirius_partial_batch_invalid.yaml",
+    scan_manager_yaml(std::string("      preparation:\n        partial_batch:\n          ") +
+                      field + "\n"));
+  CHECK_THROWS_AS(sirius::parsed_sirius_config::from_file(yaml.path()),
+                  sirius::configuration_input_error);
+}
+
+TEST_CASE("Preparation limit YAML overrides preserve omitted defaults",
+          "[scan_manager][config][preparation_config][native_runtime]")
+{
+  auto selected = GENERATE(0, 1, 2, 3, 4, 5, 6, 7, 8, 9);
+  std::array keys{"max_inflight_metadata_jobs",
+                  "max_inflight_dv_jobs",
+                  "lookahead_batches",
+                  "max_control_work",
+                  "drain_quantum",
+                  "native_reader_workers",
+                  "max_native_readers",
+                  "coordinator_workers"};
+  std::array<size_t, 8> values{1, 2, 7, 4, 5, 5, 8, 3};
+  auto const workers = GENERATE(1, 3);
+  std::string body   = "      num_threads: " + std::to_string(workers) + "\n      preparation:\n";
+  for (size_t i = 0; i < keys.size(); ++i)
+    if (selected == 8 || selected == static_cast<int>(i))
+      body += std::string("        ") + keys[i] + ": " + std::to_string(values[i]) + "\n";
+  if (selected == 9) body += "        coordinator_workers: 0\n";
+  INFO(body);
+  scoped_yaml yaml("sirius_preparation_limits.yaml", scan_manager_yaml(body));
+  cucascade::memory::system_topology_info topology{};
+  topology.num_gpus       = 1;
+  topology.num_numa_nodes = 1;
+  topology.gpus           = {{.id = 0, .numa_node = 0}};
+  topology.numa_nodes     = {{.id = 0, .memory_capacity = 1ULL << 30, .has_cpus = true}};
+  auto resolved           = sirius::parsed_sirius_config::from_file(yaml.path()).resolve(topology);
+  auto const& config      = resolved.get_scan_manager_config();
+  REQUIRE(config.thread_pool.num_threads == workers);
+  auto options = config.preparation.resolve(config.thread_pool.num_threads);
+  std::array actual{options.max_inflight_metadata_jobs,
+                    options.max_inflight_dv_jobs,
+                    options.lookahead_batches,
+                    options.max_control_work,
+                    options.drain_quantum,
+                    config.preparation.resolved_native_workers(),
+                    config.preparation.resolved_native_readers(),
+                    config.preparation.resolved_coordinator_workers()};
+  std::array<size_t, 8> defaults{4096, 0, 2, size_t(workers), size_t(workers), 2, 64, 1};
+  for (size_t i = 0; i < keys.size(); ++i) {
+    INFO(keys[i]);
+    auto expected = (selected == 8 || selected == static_cast<int>(i)) ? values[i] : defaults[i];
+    if (selected == 9 && i == 7) expected = 0;
+    CHECK(actual[i] == expected);
+  }
+  CHECK(options.partial_batch);
+  CHECK(options.interrupt_check_interval == std::chrono::milliseconds{10});
+}
+
+TEST_CASE("Preparation limit YAML rejects invalid values",
+          "[scan_manager][config][preparation_config]")
+{
+  auto key   = GENERATE("max_inflight_metadata_jobs",
+                      "max_inflight_dv_jobs",
+                      "lookahead_batches",
+                      "max_control_work",
+                      "drain_quantum",
+                      "native_reader_workers",
+                      "max_native_readers",
+                      "coordinator_workers");
+  auto value = GENERATE("0", "-1", "1.5", "many", "[]", "18446744073709551616");
+  if ((std::string_view(key) == "max_inflight_metadata_jobs" ||
+       std::string_view(key) == "max_inflight_dv_jobs" ||
+       std::string_view(key) == "coordinator_workers") &&
+      std::string_view(value) == "0")
+    return;
+  INFO(key << ": " << value);
+  scoped_yaml yaml(
+    "sirius_preparation_limit_invalid.yaml",
+    scan_manager_yaml(std::string("      preparation:\n        ") + key + ": " + value + "\n"));
+  CHECK_THROWS_AS(sirius::parsed_sirius_config::from_file(yaml.path()),
+                  sirius::configuration_input_error);
+}
+
+TEST_CASE("Preparation YAML rejects retired keys", "[scan_manager][config][preparation_config]")
+{
+  auto key = GENERATE("max_active_units", "max_pending_results", "max_inflight_jobs");
+  scoped_yaml yaml("sirius_preparation_old_window.yaml",
+                   scan_manager_yaml(std::string("      preparation:\n        ") + key + ": 8\n"));
+  CHECK_THROWS_AS(sirius::parsed_sirius_config::from_file(yaml.path()),
+                  sirius::configuration_input_error);
+}
 
 TEST_CASE("cache_mode string_to_enum accepts known modes", "[scan_manager][config][cache_mode]")
 {
@@ -586,4 +762,16 @@ TEST_CASE("sirius_config forces the sirius backend for multi-GPU",
                                      "      backend: kvikio\n");
 
   CHECK(cfg.backend == io_backend::sirius);
+}
+
+TEST_CASE("Native runtime YAML rejects insufficient reader capacity",
+          "[scan_manager][config][preparation_config][native_runtime]")
+{
+  auto fields = GENERATE("native_reader_workers: 3\n        max_native_readers: 2",
+                         "native_reader_workers: 65",
+                         "max_native_readers: 1");
+  scoped_yaml yaml("sirius_native_runtime_invalid.yaml",
+                   scan_manager_yaml(std::string("      preparation:\n        ") + fields + "\n"));
+  CHECK_THROWS_AS(sirius::parsed_sirius_config::from_file(yaml.path()),
+                  sirius::configuration_input_error);
 }

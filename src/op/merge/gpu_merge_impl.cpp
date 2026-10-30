@@ -16,16 +16,26 @@
 
 #include "op/merge/gpu_merge_impl.hpp"
 
+#include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
 #include "log/logging.hpp"
+#include "op/aggregate/aggregate_op_util.hpp"
+#include "op/aggregate/stddev.hpp"
 
 #include <cudf/aggregation.hpp>
+#include <cudf/binaryop.hpp>
 #include <cudf/concatenate.hpp>
 #include <cudf/dictionary/dictionary_column_view.hpp>
 #include <cudf/dictionary/encode.hpp>
+#include <cudf/groupby.hpp>
 #include <cudf/merge.hpp>
+#include <cudf/reduction.hpp>
 #include <cudf/reduction/approx_distinct_count.hpp>
+#include <cudf/scalar/scalar.hpp>
 #include <cudf/strings/strings_column_view.hpp>
+#include <cudf/unary.hpp>
+
+#include <algorithm>
 
 namespace sirius {
 namespace op {
@@ -60,7 +70,8 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_ungrouped_aggregate
   const std::vector<std::optional<cudf::size_type>>& merge_nth_index,
   ::cuda::stream_ref stream,
   cucascade::memory::memory_space& memory_space,
-  const telemetry::batch_telemetry_info& telemetry_info)
+  const telemetry::batch_telemetry_info& telemetry_info,
+  const std::vector<std::optional<cudf::size_type>>& first_row_counts)
 {
   // Sanity check.
   if (input.size() < 2) {
@@ -71,6 +82,9 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_ungrouped_aggregate
     throw std::runtime_error(
       "`merge_nth_index` must have the same size as `aggregates` in `merge_ungrouped_aggregate()`");
   }
+
+  if (!first_row_counts.empty() && first_row_counts.size() != aggregates.size())
+    throw std::invalid_argument("FIRST row-count mapping must match aggregate columns");
 
   // Pull input cudf tables and concatenate.
   std::vector<cudf::table_view> input_cudf_table_views;
@@ -88,6 +102,11 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_ungrouped_aggregate
   // Aggregate on the concatenated table
   std::vector<std::unique_ptr<cudf::column>> output_cudf_cols;
   for (size_t c = 0; c < aggregates.size(); ++c) {
+    if (aggregates[c] == cudf::aggregation::Kind::M2) {
+      output_cudf_cols.push_back(merge_stddev_states(
+        concatenated->get_column(c).view(), stream, memory_space.get_default_allocator()));
+      continue;
+    }
     std::unique_ptr<cudf::reduce_aggregation> reduce_aggregation = nullptr;
     cudf::data_type output_type = concatenated->get_column(c).type();
     switch (aggregates[c]) {
@@ -144,11 +163,26 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_ungrouped_aggregate
           "Unsupported cudf aggregate kind in `merge_ungrouped_aggregate()`: " +
           std::to_string(static_cast<int>(aggregates[c])));
     }
-    auto output_scalar = cudf::reduce(concatenated->get_column(c),
-                                      *reduce_aggregation,
-                                      output_type,
-                                      stream,
-                                      memory_space.get_default_allocator());
+    auto values = concatenated->get_column(c).view();
+    std::unique_ptr<cudf::table> nonempty_partials;
+    if (!first_row_counts.empty() && first_row_counts[c]) {
+      auto count_index = *first_row_counts[c];
+      if (aggregates[c] != cudf::aggregation::Kind::NTH_ELEMENT || count_index < 0 ||
+          count_index >= concatenated->num_columns())
+        throw std::invalid_argument("Invalid FIRST row-count column");
+      cudf::numeric_scalar<int64_t> zero(0, true, stream, memory_space.get_default_allocator());
+      auto keep         = cudf::binary_operation(concatenated->get_column(count_index).view(),
+                                         zero,
+                                         cudf::binary_operator::GREATER,
+                                         cudf::data_type{cudf::type_id::BOOL8},
+                                         stream,
+                                         memory_space.get_default_allocator());
+      nonempty_partials = sirius::apply_retention_mask(
+        cudf::table_view{{values}}, keep->view(), stream, memory_space.get_default_allocator());
+      values = nonempty_partials->view().column(0);
+    }
+    auto output_scalar = cudf::reduce(
+      values, *reduce_aggregation, output_type, stream, memory_space.get_default_allocator());
     output_cudf_cols.push_back(cudf::make_column_from_scalar(
       *output_scalar, 1, stream, memory_space.get_default_allocator()));
   }
@@ -164,13 +198,16 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
   const std::vector<cudf::aggregation::Kind>& aggregates,
   ::cuda::stream_ref stream,
   cucascade::memory::memory_space& memory_space,
-  const telemetry::batch_telemetry_info& telemetry_info)
+  const telemetry::batch_telemetry_info& telemetry_info,
+  const std::vector<bool>& is_wide_integer_sum)
 {
   // Sanity check.
   if (input.size() < 2) {
     throw std::runtime_error(
       "`input` in `merge_grouped_aggregate()` should at least contain two data batches");
   }
+
+  auto mr = memory_space.get_default_allocator();
 
   // Pull input cudf tables and concatenate.
   std::vector<cudf::table_view> input_cudf_table_views;
@@ -183,10 +220,44 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
     throw std::runtime_error(
       "`num columns = num_group_cols + num aggregates` not true in `merge_grouped_aggregate()`");
   }
-  auto concatenated =
-    cudf::concatenate(input_cudf_table_views, stream, memory_space.get_default_allocator());
 
-  auto mr = memory_space.get_default_allocator();
+  // A wide integer SUM's partials are INT64, or DECIMAL128 where the batch could overflow INT64.
+  // Concatenation needs one type per column, so once any batch carries DECIMAL128 the INT64
+  // partials of that column are widened as well. The casts touch partial rows only.
+  std::vector<cudf::size_type> wide_sum_cols;
+  for (size_t i = 0; i < is_wide_integer_sum.size() && i < aggregates.size(); ++i) {
+    if (is_wide_integer_sum[i]) {
+      wide_sum_cols.push_back(num_group_cols + static_cast<cudf::size_type>(i));
+    }
+  }
+  std::vector<std::unique_ptr<cudf::column>> widened_partials;
+  for (auto const col_id : wide_sum_cols) {
+    auto const has_wide = [&](cudf::table_view const& view) {
+      return view.column(col_id).type() == wide_integer_sum_type();
+    };
+    if (std::ranges::none_of(input_cudf_table_views, has_wide)) { continue; }
+    for (auto& view : input_cudf_table_views) {
+      if (has_wide(view)) { continue; }
+      widened_partials.push_back(
+        cudf::cast(view.column(col_id), wide_integer_sum_type(), stream, mr));
+      std::vector<cudf::column_view> columns(view.begin(), view.end());
+      columns[col_id] = widened_partials.back()->view();
+      view            = cudf::table_view(columns);
+    }
+  }
+  auto concatenated = cudf::concatenate(input_cudf_table_views, stream, mr);
+  widened_partials.clear();
+
+  // INT64 partials of a wide integer SUM are merged in INT64 only while their total magnitude
+  // proves no group can overflow; otherwise the column is merged over DECIMAL128.
+  std::vector<std::unique_ptr<cudf::column>> widened_inputs(aggregates.size());
+  for (auto const col_id : wide_sum_cols) {
+    auto const col = concatenated->view().column(col_id);
+    if (col.type().id() == cudf::type_id::INT64 && partial_sums_may_overflow(col, stream, mr)) {
+      widened_inputs[col_id - num_group_cols] =
+        cudf::cast(col, wide_integer_sum_type(), stream, mr);
+    }
+  }
 
   // Dictionary-encode STRING group keys when:
   //  1. Average string length >= 4 bytes (short strings hash nearly as fast as
@@ -251,7 +322,8 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
   for (size_t i = 0; i < aggregates.size(); ++i) {
     int aggregate_col_id = num_group_cols + static_cast<int>(i);
     cudf::groupby::aggregation_request request;
-    request.values = concatenated->get_column(aggregate_col_id).view();
+    request.values = widened_inputs[i] ? widened_inputs[i]->view()
+                                       : concatenated->get_column(aggregate_col_id).view();
     switch (aggregates[i]) {
       case cudf::aggregation::Kind::MIN: {
         request.aggregations.push_back(cudf::make_min_aggregation<cudf::groupby_aggregation>());
@@ -265,6 +337,11 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
       case cudf::aggregation::Kind::COUNT_ALL:
       case cudf::aggregation::Kind::COUNT_VALID: {
         request.aggregations.push_back(cudf::make_sum_aggregation<cudf::groupby_aggregation>());
+        break;
+      }
+      case cudf::aggregation::Kind::M2: {
+        request.aggregations.push_back(
+          cudf::make_merge_m2_aggregation<cudf::groupby_aggregation>());
         break;
       }
       case cudf::aggregation::Kind::COLLECT_SET: {

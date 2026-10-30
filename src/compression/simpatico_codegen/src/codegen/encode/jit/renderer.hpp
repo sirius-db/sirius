@@ -4,7 +4,7 @@
 //   1. The CUDA-C++ source for a kernel that performs the GPU encode,
 //      ready to hand to `compile_plain_kernel`.
 //   2. The `EncodeBufferSpec` list the caller must allocate before launching
-//      (per-op output buffers in the OverAllocate layout).
+//      (per-op output buffers; see "Buffer layout contract" and EncodeRenderMode).
 //   3. The launch geometry (grid/block/shared) the caller must use.
 //
 // Architectural intent — read this if you are about to add a new op.
@@ -40,14 +40,14 @@
 // Supported ops
 // -------------
 // Bitpack (leaf); Raw (verbatim-passthrough leaf, synthesized for a
-// delta/rle/for channel that isn't further fused); Delta, Rle, For, and
+// delta/rle/for/zigzag channel that isn't further fused); Delta, Rle, For, and
 // Zigzag, composed arbitrarily — the staged-materialisation walker handles
 // nested Rle/Delta/For/Zigzag and Raw children.  An op the renderer can't
 // emit throws a `RenderError` with a clear diagnostic.
 //
 // Buffer layout contract
 // ----------------------
-// The encode kernel always emits the OverAllocate layout: `packed` is sized
+// In full mode (see EncodeRenderMode) the kernel emits the OverAllocate layout: `packed` is sized
 // `num_chunks * kStrideWords` per Bitpack node, and each chunk's words land at
 // the fixed arithmetic offset `chunk_id * kStrideWords` — so no `bp_offsets`
 // and no host cumsum are needed to write. `live_words[c]` reports the actual
@@ -123,6 +123,22 @@ struct EncodeKernelSpec {
 // renderer — see codegen::jit::RenderError.
 using ::codegen::jit::RenderError;
 
+// What a rendered encode kernel does with its Bitpack and Raw leaves.
+//   full    : reduce each chunk's range, write its metadata and its packed words into a
+//             full-width slot (`packed` sized num_chunks * stride), the layout above. A Raw
+//             leaf writes chunk c at data[c * CHUNK].
+//   measure : reduce and write the metadata (chunk_min/count/bits, the live-word counter)
+//             only; no packed words. `packed` is not touched. A Raw leaf writes each
+//             chunk's length to offsets[chunk + 1] and leaves `data` untouched.
+//   pack    : read each chunk's chunk_min and chunk_bits back from a measure pass instead
+//             of reducing, and write its packed words at word offset bp_offsets[chunk] of
+//             a dense, pre-zeroed `packed`, which the caller sizes from the measure pass. A
+//             Raw leaf writes chunk c at data[offsets[c]] of a dense `data`.
+// Every op renders in every mode. Between the two launches the caller inclusive-scans Rle's
+// run offsets and each Raw leaf's offsets in place; pack mode reads them and leaves them as
+// they are.
+enum class EncodeRenderMode { full, measure, pack };
+
 // Render an EncodeKernelSpec for `tree` parametrised over `element_dtype`.
 //
 // `tree`           : the runtime FusedTree (caller-owned).
@@ -135,13 +151,14 @@ using ::codegen::jit::RenderError;
 //                    (no second walk needed at launch time).
 //
 // Throws `RenderError` if `tree` contains an op the renderer can't emit.
-// Supported ops: `Bitpack` (leaf, OverAllocate layout), `Raw` (leaf
-// passthrough), `Delta`, `Rle`, `For`, `Zigzag` — composed arbitrarily.
+// Supported ops: `Bitpack` (leaf), `Raw` (leaf passthrough), `Delta`, `Rle`,
+// `For`, `Zigzag` — composed arbitrarily, in every EncodeRenderMode.
 //
 // Throws `std::invalid_argument` for malformed inputs (empty dtype,
 // num_chunks < 1).
 EncodeKernelSpec render(const ::codegen::jit::FusedTree& tree,
                         const std::string& element_dtype,
-                        int32_t num_chunks);
+                        int32_t num_chunks,
+                        EncodeRenderMode mode = EncodeRenderMode::full);
 
 }  // namespace codegen::encode::jit

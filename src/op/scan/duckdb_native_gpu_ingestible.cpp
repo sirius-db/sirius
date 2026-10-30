@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include "op/scan/duckdb_native_gpu_ingestible.hpp"
+
 #include "transparent/replay_admission.hpp"
 
 // sirius
@@ -27,13 +29,13 @@
 #include <log/logging.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/duckdb_native_decoder.hpp>
-#include <op/scan/duckdb_native_gpu_ingestible.hpp>
 #include <op/scan/scan_plan.hpp>
 #include <op/scan/scan_utils.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <sirius_context.hpp>
 
 // duckdb
+#include <duckdb/main/attached_database.hpp>
 #include <duckdb/storage/single_file_block_manager.hpp>
 #include <duckdb/storage/storage_manager.hpp>
 
@@ -52,6 +54,8 @@
 #include <memory>
 #include <numeric>
 #include <stdexcept>
+#include <stop_token>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -62,6 +66,8 @@ namespace {
 //===----------Batch Coalescer----------===//
 class duckdb_native_batch_coalescer : public batch_coalescer {
  public:
+  std::size_t target_batch_bytes() const noexcept override { return _cap; }
+  std::size_t retained_bytes() const noexcept override { return _acc_bytes; }
   duckdb_native_batch_coalescer(std::size_t approximate_batch_size, std::vector<bool> is_varchar)
     : _cap(approximate_batch_size),
       _is_varchar(std::move(is_varchar)),
@@ -75,9 +81,24 @@ class duckdb_native_batch_coalescer : public batch_coalescer {
   /// been coalesced, each of which represents the metadata for a data batch.
   std::vector<std::unique_ptr<scan_info>> push(std::unique_ptr<scan_info> info) override
   {
-    std::vector<std::unique_ptr<scan_info>> emitted;
-    auto* scan_info = dynamic_cast<duckdb_native_scan_info*>(info.get());
-    if (scan_info == nullptr) { return emitted; }
+    std::vector<std::unique_ptr<scan_info>> out;
+    if (!info) return out;
+    size_t cursor = 0;
+    for (;;) {
+      auto step = advance(*info, cursor, std::numeric_limits<size_t>::max());
+      if (step.batch) out.push_back(std::move(step.batch));
+      if (step.finished) return out;
+    }
+  }
+  std::unique_ptr<scan_info> partial_emit() override
+  {
+    if (_acc.empty()) return {};
+    return emit_current();
+  }
+  cursor_step advance(scan_info& input, size_t& cursor, size_t quantum) override
+  {
+    auto* scan_info = dynamic_cast<duckdb_native_scan_info*>(&input);
+    if (scan_info == nullptr) { return {nullptr, true}; }
 
     if (scan_info->certificates().size() != scan_info->row_groups.size() ||
         scan_info->dependencies().size() != scan_info->row_groups.size()) {
@@ -99,9 +120,10 @@ class duckdb_native_batch_coalescer : public batch_coalescer {
       _have_template = true;
     }
 
-    std::size_t row_group_position = 0;
-    for (auto& rg : scan_info->row_groups) {
-      auto const certificate_position = row_group_position++;
+    size_t processed = 0;
+    for (; cursor < scan_info->row_groups.size() && processed < quantum; ++cursor, ++processed) {
+      auto& rg                        = scan_info->row_groups[cursor];
+      auto const certificate_position = cursor;
       if (rg.row_count == 0) { continue; }
 
       auto const rg_bytes = rg.decoded_bytes_budget;
@@ -117,9 +139,10 @@ class duckdb_native_batch_coalescer : public batch_coalescer {
             }
           }
         }
-        if (exceed_total || exceed_varchar) { emitted.push_back(emit_current()); }
+        if (exceed_total || exceed_varchar) { return {emit_current(), false}; }
       }
 
+      note_retained();
       _acc_bytes += rg_bytes;
       if (_any_varchar) {
         for (std::size_t c = 0; c < _is_varchar.size(); ++c) {
@@ -135,7 +158,7 @@ class duckdb_native_batch_coalescer : public batch_coalescer {
       dependency.datasource = _datasource;
       _dependencies.push_back(std::move(dependency));
     }
-    return emitted;
+    return {nullptr, cursor == scan_info->row_groups.size()};
   }
 
   std::vector<std::unique_ptr<scan_info>> flush() override
@@ -168,6 +191,7 @@ class duckdb_native_batch_coalescer : public batch_coalescer {
     _acc_bytes = 0;
     std::fill(_col_bytes.begin(), _col_bytes.end(), 0);
     _produced_any = true;
+    clear_retained();
     return split;
   }
 
@@ -211,6 +235,25 @@ duckdb_native_gpu_ingestible::duckdb_native_gpu_ingestible(
       "[duckdb_native_gpu_ingestible] projected_cols and projected_types must be parallel");
   }
 
+  auto const& layout_ids  = bind.projection_ids;
+  auto const source_count = layout_ids.empty() ? bind.column_ids.size() : layout_ids.size();
+  _column_layout.data_roles.reserve(source_count);
+  _column_layout.materialized_primary_indices.reserve(source_count);
+  for (std::size_t slot = 0; slot < source_count; ++slot) {
+    auto const column_id = layout_ids.empty() ? slot : layout_ids[slot];
+    _column_layout.materialized_primary_indices.push_back(
+      bind.column_ids[column_id].GetPrimaryIndex());
+    if (slot < bind.projected_output_count) {
+      _column_layout.data_roles.push_back(scan_column_layout::data_role::OUTPUT);
+      _column_layout.output_data_positions.push_back(slot);
+    } else if (layout_ids.empty()) {
+      _column_layout.data_roles.push_back(scan_column_layout::data_role::ROW_COUNT_CARRIER);
+    } else {
+      _column_layout.data_roles.push_back(scan_column_layout::data_role::FILTER_ONLY);
+    }
+  }
+  _column_layout.output_is_identity = true;
+
   // Eager even when the walk is deferred, so an undecodable type still refuses at plan time.
   if (auto reason = unsupported_projected_type_reason(bind.projected_cols, bind.projected_types)) {
     SIRIUS_LOG_DEBUG("[duckdb_native_gpu_ingestible] non-viable: {}", *reason);
@@ -246,7 +289,8 @@ duckdb_native_gpu_ingestible::duckdb_native_gpu_ingestible(
   auto const& source_ids = bind.projection_ids.empty() ? source_ids_fallback : bind.projection_ids;
 
   // Pre-build the coalesced filter expression once.
-  if (bind.table_filters && !bind.table_filters->filters.empty()) {
+  if (bind.table_filters &&
+      (bind.table_filters->HasFilters() || bind.table_filters->HasMultiColumnFilters())) {
     std::vector<std::optional<std::size_t>> emission_order_map(bind.column_ids.size());
     for (std::size_t k = 0; k < source_ids.size(); ++k) {
       emission_order_map[source_ids[k]] = k;
@@ -398,9 +442,14 @@ duckdb_native_gpu_ingestible::next_split_provider(io::ioctx_resolver resolve)
 
   // All ranges read the one `.duckdb` file; the resolver returns a valid ioctx or
   // throws if no backend supports the path.
-  auto io_ctx = resolve(_info->db_path);
   // Runs on a scan-manager dispatcher thread:
-  return [this, rg_begin, rg_end, io_ctx = std::move(io_ctx)]() -> std::unique_ptr<scan_info> {
+  return [this, rg_begin, rg_end, resolve = std::move(resolve)](
+           scan_manager::preparation_stop_token stop) -> std::unique_ptr<scan_info> {
+    if (stop.stop_requested())
+      throw std::system_error(std::make_error_code(std::errc::operation_canceled));
+    auto io_ctx = resolve(_info->db_path);
+    if (stop.stop_requested())
+      throw std::system_error(std::make_error_code(std::errc::operation_canceled));
     duckdb_native_row_group_range range;
     try {
       range = walk_duckdb_native_row_group_range(_plan, rg_begin, rg_end);
@@ -422,6 +471,8 @@ duckdb_native_gpu_ingestible::next_split_provider(io::ioctx_resolver resolve)
                                          std::to_string(rg_begin) + ", " + std::to_string(rg_end) +
                                          ")): " + range.viability_failure_reason);
     }
+    if (stop.stop_requested())
+      throw std::system_error(std::make_error_code(std::errc::operation_canceled));
     auto split = std::make_unique<duckdb_native_scan_info>(
       std::move(range.row_groups), io_ctx->open_datasource(_info->db_path), _block_manager);
     std::vector<split_materializer_certificate> certificates;
@@ -438,7 +489,8 @@ duckdb_native_gpu_ingestible::next_split_provider(io::ioctx_resolver resolve)
          _info->profiles->add(native_row_group_profile(
            row_group,
            _info->projected_types,
-           _info->storage->GetAttached().GetStorageManager().GetStorageVersion())),
+           static_cast<uint64_t>(
+             _info->storage->GetAttached().GetStorageManager().GetStorageVersion()))),
          check_bit(later_check::segments_per_range) | check_bit(later_check::matrix_per_range)});
       dependencies.push_back({nullptr, split->datasource, _checkpoint_iteration, _info->profiles});
     }
@@ -456,7 +508,8 @@ filtered_table duckdb_native_gpu_ingestible::materialize_metadata_to_table(
   ::cucascade::memory::memory_space const& mem_space,
   ::cuda::stream_ref stream,
   bool /*like_swar_fastpath*/,
-  std::shared_ptr<const like_multiliteral_cache> /*like_cache*/)
+  std::shared_ptr<const like_multiliteral_cache> /*like_cache*/,
+  expression_query_policy /*policy*/)
 {
   auto const& split = static_cast<duckdb_native_scan_info const&>(info);
   if (_inject_decode_failure) {
@@ -544,11 +597,11 @@ std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_proje
   bool like_swar_fastpath,
   std::shared_ptr<const like_multiliteral_cache> like_cache,
   std::unique_ptr<cudf::column>* /*survivors*/,
-  std::span<std::size_t const> elided)
+  std::span<std::size_t const> elided,
+  expression_query_policy policy)
 {
-  auto const output_arity = _info->output_types.size();
-  auto const decoded_cols =
-    _info->projection_ids.empty() ? _info->column_ids.size() : _info->projection_ids.size();
+  auto const output_arity        = _column_layout.output_data_positions.size();
+  auto const decoded_cols        = _column_layout.data_roles.size();
   auto const projection_required = (output_arity > 0) && (decoded_cols > output_arity);
 
   rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
@@ -562,7 +615,7 @@ std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_proje
     sirius::expression_evaluator exec(sirius_filter_ast.get(),
                                       mr_ref,
                                       stream,
-                                      strategy_from_config(),
+                                      policy,
                                       sirius::expression_evaluator::default_min_ast_size,
                                       like_swar_fastpath,
                                       std::move(like_cache));
@@ -605,26 +658,7 @@ std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_proje
 //===----------------------------------------------------------------------===//
 std::vector<std::size_t> duckdb_native_gpu_ingestible::materialized_column_order() const
 {
-  // The decoder emits columns in source_ids order (projection_ids, or column_ids order when
-  // projection is empty) — output columns first, pure-filter columns trailing — which is the
-  // layout post_filter_and_project's emission_order_map filter and [0..output_arity)
-  // projection assume. Return the corresponding column primary (storage) indices, matching
-  // how the pin cache keys columns (ColumnIndex::GetPrimaryIndex).
-  auto const& column_ids     = _info->column_ids;
-  auto const& projection_ids = _info->projection_ids;
-  std::vector<std::size_t> order;
-  if (projection_ids.empty()) {
-    order.reserve(column_ids.size());
-    for (auto const& c : column_ids) {
-      order.push_back(c.GetPrimaryIndex());
-    }
-  } else {
-    order.reserve(projection_ids.size());
-    for (auto const pid : projection_ids) {
-      order.push_back(column_ids[pid].GetPrimaryIndex());
-    }
-  }
-  return order;
+  return _column_layout.materialized_primary_indices;
 }
 
 std::shared_ptr<duckdb_native_gpu_ingestible> make_ingestible(

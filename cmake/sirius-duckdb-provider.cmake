@@ -1,12 +1,7 @@
 # DuckDB remains a source dependency until its package exposes the required
 # internal headers and extension libraries. Keep that contract in one place.
-if(PROJECT_IS_TOP_LEVEL)
-  set(_sirius_duckdb_default "${CMAKE_CURRENT_SOURCE_DIR}/duckdb")
-else()
-  set(_sirius_duckdb_default "${CMAKE_SOURCE_DIR}")
-endif()
 set(SIRIUS_DUCKDB_SOURCE_DIR
-    "${_sirius_duckdb_default}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/duckdb"
     CACHE PATH "DuckDB source tree used to build Sirius")
 
 if(NOT EXISTS "${SIRIUS_DUCKDB_SOURCE_DIR}/src/include/duckdb.hpp")
@@ -17,13 +12,19 @@ endif()
 
 function(sirius_add_duckdb_source)
   # Keep DuckDB options scoped to its dependency build.
-  if(NOT DEFINED OVERRIDE_GIT_DESCRIBE)
-    set(OVERRIDE_GIT_DESCRIBE "v1.5.6")
-  endif()
   set(DUCKDB_EXTENSION_CONFIGS "")
   set(BUILD_EXTENSIONS "core_functions;parquet")
   set(BUILD_SHELL OFF)
   set(BUILD_UNITTESTS OFF)
+  if(NOT DEFINED DUCKDB_EXPLICIT_VERSION)
+    execute_process(
+      COMMAND git -C "${SIRIUS_DUCKDB_SOURCE_DIR}" rev-parse HEAD
+      OUTPUT_VARIABLE sirius_duckdb_commit
+      OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    if(sirius_duckdb_commit STREQUAL "d54cbbe3df17e8e5ce68312f483b4155836112aa")
+      set(DUCKDB_EXPLICIT_VERSION "v2.0.0")
+    endif()
+  endif()
   # Root sanitizer presets supply flags to both the library and its dependency.
   set(ENABLE_SANITIZER OFF)
   set(ENABLE_UBSAN OFF)
@@ -31,9 +32,7 @@ function(sirius_add_duckdb_source)
   add_subdirectory("${SIRIUS_DUCKDB_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/duckdb"
                    EXCLUDE_FROM_ALL)
 endfunction()
-if(PROJECT_IS_TOP_LEVEL)
-  sirius_add_duckdb_source()
-endif()
+sirius_add_duckdb_source()
 
 add_library(sirius_duckdb_dependency INTERFACE IMPORTED)
 add_library(sirius::duckdb_dependency ALIAS sirius_duckdb_dependency)
@@ -41,6 +40,7 @@ target_include_directories(
   sirius_duckdb_dependency
   INTERFACE "${SIRIUS_DUCKDB_SOURCE_DIR}/src/include"
             "${SIRIUS_DUCKDB_SOURCE_DIR}/third_party/fmt/include"
+            "${SIRIUS_DUCKDB_SOURCE_DIR}/third_party/re2"
             "${SIRIUS_DUCKDB_SOURCE_DIR}/third_party/concurrentqueue"
             "${SIRIUS_DUCKDB_SOURCE_DIR}/third_party/fastpforlib"
             "${SIRIUS_DUCKDB_SOURCE_DIR}/third_party/yyjson/include"
@@ -66,3 +66,9 @@ endif()
 target_link_libraries(
   sirius_duckdb_dependency INTERFACE duckdb_static core_functions_extension
                                      parquet_extension)
+
+function(sirius_link_duckdb_extensions target)
+  set(DUCKDB_MODULE_BASE_DIR "${SIRIUS_DUCKDB_SOURCE_DIR}")
+  duckdb_link_extensions(${target} ${ARGN} httplib loadable_extensions
+                         core_functions parquet)
+endfunction()
