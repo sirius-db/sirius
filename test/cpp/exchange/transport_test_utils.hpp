@@ -26,6 +26,8 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 /// What exchange tests send through a transport, and the checks on what arrived. Batches are
@@ -74,6 +76,11 @@ inline transport::callbacks recording(received& got)
           [g](std::exception_ptr error) {
             std::lock_guard lock{g->mutex};
             g->error = error;
+            g->changed.notify_all();
+          },
+          [g](std::uint64_t, rank_t, std::string what) {
+            std::lock_guard lock{g->mutex};
+            g->error = std::make_exception_ptr(std::runtime_error(what));
             g->changed.notify_all();
           }};
 }

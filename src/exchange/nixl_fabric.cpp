@@ -33,10 +33,12 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <bit>
 #include <charconv>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <mutex>
 #include <string_view>
 #include <thread>
@@ -51,17 +53,19 @@ static_assert(std::endian::native == std::endian::little, "the hello is little-e
 constexpr char hello_kind = '\x7f';
 // A host-staged write landed in the receiver's mirror: kind | u64 offset | u64 bytes | the
 // write's own notification.
-constexpr char staged_kind = '\x7e';
+constexpr char staged_kind                = '\x7e';
+constexpr std::size_t staged_header_bytes = 1 + 2 * sizeof(std::uint64_t);
+constexpr std::size_t pci_bus_id_bytes    = NVML_DEVICE_PCI_BUS_ID_BUFFER_SIZE;
 
 // kind | u32 rank | u32 device | u64 receive ring base | u64 receive ring bytes | u32 pid |
 // PCI bus id of the GPU, NUL-padded (names the receive mirror and decides host staging)
 struct hello {
-  std::uint32_t rank;
+  rank_t rank;
   std::uint32_t device;
   std::uint64_t base;
   std::uint64_t bytes;
   std::uint32_t pid;
-  char pci_bus_id[20];
+  char pci_bus_id[pci_bus_id_bytes];
 };
 
 std::string mirror_name(std::uint32_t pid, rank_t rank)
@@ -144,7 +148,7 @@ void check(nixl_status_t status, char const* what)
 
 /// NIXL's listener does not report a port it failed to bind: peers would then wait out the
 /// connect timeout. Bind it first to fail now, naming the port.
-void require_free_port(int port)
+void require_free_port(std::uint16_t port)
 {
   int const fd = ::socket(AF_INET, SOCK_STREAM, 0);
   if (fd < 0) { throw sirius::internal_exception("exchange NIXL: socket() failed"); }
@@ -153,7 +157,7 @@ void require_free_port(int port)
   sockaddr_in at{};
   at.sin_family      = AF_INET;
   at.sin_addr.s_addr = htonl(INADDR_ANY);
-  at.sin_port        = htons(static_cast<std::uint16_t>(port));
+  at.sin_port        = htons(port);
   bool const bound   = ::bind(fd, reinterpret_cast<sockaddr*>(&at), sizeof(at)) == 0;
   ::close(fd);
   if (!bound) {
@@ -185,12 +189,14 @@ nixl_fabric::nixl_fabric(config cfg, frame_ring& send, frame_ring& recv)
   RMM_CUDA_TRY(cudaGetDevice(&_device));
   _peers.resize(cfg.peers.size());
   for (rank_t r = 0; r < _peers.size(); ++r) {
-    auto const& address = cfg.peers[r];
-    auto const colon    = address.rfind(':');
-    auto& p             = _peers[r];
-    if (colon == std::string::npos ||
-        std::from_chars(address.data() + colon + 1, address.data() + address.size(), p.port).ec !=
-          std::errc{}) {
+    auto const& address   = cfg.peers[r];
+    auto const colon      = address.rfind(':');
+    auto& p               = _peers[r];
+    auto const* const end = address.data() + address.size();
+    auto const parsed     = colon == std::string::npos
+                              ? std::from_chars_result{nullptr, std::errc::invalid_argument}
+                              : std::from_chars(address.data() + colon + 1, end, p.port);
+    if (parsed.ec != std::errc{} || parsed.ptr != end || p.port == 0) {
       throw sirius::invalid_input_exception("exchange NIXL: peer address '{}' is not host:port",
                                             address);
     }
@@ -205,7 +211,7 @@ nixl_fabric::nixl_fabric(config cfg, frame_ring& send, frame_ring& recv)
   absl::Cleanup release_on_throw = [this] { release(); };
   RMM_CUDA_TRY(cudaStreamCreateWithFlags(&_d2h, cudaStreamNonBlocking));
   RMM_CUDA_TRY(cudaStreamCreateWithFlags(&_h2d, cudaStreamNonBlocking));
-  char bus_id[20] = {};
+  char bus_id[pci_bus_id_bytes] = {};
   RMM_CUDA_TRY(cudaDeviceGetPCIBusId(bus_id, sizeof(bus_id), _device));
   _peers[_rank].pci_bus_id = bus_id;
   _peers[_rank].pid        = static_cast<std::uint32_t>(::getpid());
@@ -221,7 +227,7 @@ nixl_fabric::nixl_fabric(config cfg, frame_ring& send, frame_ring& recv)
   std::unique_lock create_lock{creating};
   nixlAgentConfig agent_cfg(/*use_prog_thread=*/false,
                             /*use_listen_thread=*/true,
-                            static_cast<std::uint16_t>(_peers[_rank].port),
+                            _peers[_rank].port,
                             nixl_thread_sync_t::NIXL_THREAD_SYNC_RW);
   _agent = std::make_unique<nixlAgent>(agent_name(_rank), agent_cfg);
   nixl_mem_list_t mems;
@@ -412,13 +418,13 @@ void nixl_fabric::receive()
       if (!body.empty() && body.front() == staged_kind) {
         std::uint64_t at    = 0;
         std::uint64_t bytes = 0;
-        if (_mirror == nullptr || body.size() < 1 + 2 * sizeof(std::uint64_t)) {
+        if (_mirror == nullptr || body.size() < staged_header_bytes) {
           throw sirius::invalid_input_exception(
             "exchange NIXL: a host-staged write from {} that this rank cannot take", agent);
         }
         std::memcpy(&at, body.data() + 1, sizeof(at));
         std::memcpy(&bytes, body.data() + 1 + sizeof(at), sizeof(bytes));
-        if (at + bytes > _recv.bytes()) {
+        if (bytes > _recv.bytes() || at > _recv.bytes() - bytes) {
           throw sirius::invalid_input_exception(
             "exchange NIXL: a host-staged {}-byte write at {} from {} is outside the ring",
             bytes,
@@ -429,7 +435,7 @@ void nixl_fabric::receive()
           cudaMemcpyAsync(_recv.base() + at, _mirror + at, bytes, cudaMemcpyHostToDevice, _h2d));
         auto* copied = take_event();
         RMM_CUDA_TRY(cudaEventRecord(copied, _h2d));
-        _landings.push_back({copied, it->second, body.substr(1 + 2 * sizeof(std::uint64_t))});
+        _landings.push_back({copied, it->second, body.substr(staged_header_bytes)});
         continue;
       }
       _backlog.push_back({it->second, std::move(body)});
@@ -489,6 +495,8 @@ fabric::write_status nixl_fabric::status(std::uint64_t id)
     _free_events.push_back(w.copied);
     if (copied != cudaSuccess) {
       static_cast<void>(cudaGetLastError());
+      SIRIUS_LOG_ERROR(
+        "exchange NIXL: host-staged write {} failed: {}", id, cudaGetErrorString(copied));
       return write_status::failed;
     }
     // The bytes are in the peer's mirror: tell it, so it copies them into its receive ring.
@@ -503,7 +511,11 @@ fabric::write_status nixl_fabric::status(std::uint64_t id)
   if (s == NIXL_IN_PROG) { return write_status::pending; }
   static_cast<void>(_agent->releaseXferReq(it->second));
   _writes.erase(it);
-  return s == NIXL_SUCCESS ? write_status::done : write_status::failed;
+  if (s != NIXL_SUCCESS) {
+    SIRIUS_LOG_ERROR("exchange NIXL: write {} failed: {}", id, nixlEnumStrings::statusStr(s));
+    return write_status::failed;
+  }
+  return write_status::done;
 }
 
 void nixl_fabric::notify(rank_t peer, std::string notification)
