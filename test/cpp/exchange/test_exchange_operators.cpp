@@ -34,6 +34,7 @@
 #include "planner/sirius_physical_plan_generator.hpp"
 
 #include <cudf/column/column_factories.hpp>
+#include <cudf/copying.hpp>
 #include <cudf/table/table.hpp>
 
 #include <cucascade/data/data_repository.hpp>
@@ -41,6 +42,7 @@
 #include <algorithm>
 #include <chrono>
 #include <memory>
+#include <numeric>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -279,6 +281,40 @@ TEST_CASE("broadcast exchange sends every row to every rank", "[exchange][operat
     auto got = flat(drain(*sources[r]));
     std::sort(got.begin(), got.end());
     CHECK(got == want);
+  }
+}
+
+TEST_CASE("a broadcast of a sliced batch sends just its rows to every rank",
+          "[exchange][operators]")
+{
+  ranks c(2);
+  stream_id const stream = sirius::exchange::make_stream_id(4, 1);
+  std::vector<std::unique_ptr<sirius_physical_exchange_source>> sources;
+  for (rank_t r = 0; r < c.world(); ++r) {
+    sources.push_back(std::make_unique<sirius_physical_exchange_source>(
+      key_value_types(), 0, c.all[r].service, stream, std::set<rank_t>{0}, false));
+  }
+  auto whole  = key_value_batch(0, 0);
+  auto parent = std::make_shared<cudf::table>(sirius::get_cudf_table_view(whole->to_read_only()),
+                                              utils::default_stream());
+  auto const rows = cudf::slice(parent->view(), {100, 350}).front();
+  auto sliced     = sirius::make_data_batch_from_view(rows,
+                                                  parent,
+                                                  0,
+                                                  *env().gpu,
+                                                  utils::default_stream(),
+                                                  sirius::telemetry::batch_telemetry_info{});
+  exchange_spec spec;
+  spec.routing = mode::broadcast;
+  {
+    sirius_physical_exchange_sink sink(key_value_types(), 0, c.all[0].service, stream, spec);
+    sink_batch(sink, sliced);
+    sink.finalize_operator();
+  }
+  std::vector<std::int64_t> want(250);
+  std::iota(want.begin(), want.end(), 100);
+  for (auto& source : sources) {
+    CHECK(flat(drain(*source)) == want);
   }
 }
 
