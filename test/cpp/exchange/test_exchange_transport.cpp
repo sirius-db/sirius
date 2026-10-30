@@ -27,12 +27,14 @@
 
 #include <rmm/cuda_stream.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <functional>
 #include <future>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -227,6 +229,29 @@ TEST_CASE("send blocks while queued bytes exceed the cap, then delivers everythi
   REQUIRE(got.wait_for([&] { return got.ended.size() == 1; }));
   std::lock_guard lock{got.mutex};
   CHECK(got.batches[{0, 5}].size() == 2);
+}
+
+TEST_CASE("a batch with no room asks for it once, and lands once it has it",
+          "[exchange][transport]")
+{
+  // About 1 MiB against a GPU held full and no host tier: it lands only after the hook frees room.
+  std::optional<std::vector<std::unique_ptr<cucascade::memory::reservation>>> hold;
+  std::atomic<int> asked{0};
+  transport::options opts;
+  opts.request_room = [&](std::size_t) {
+    ++asked;
+    hold.reset();
+  };
+  cluster c(2, 4, 4, {}, /*host=*/nullptr, opts);
+  auto& got = *c.ranks[1].got;
+  hold.emplace(hold_gpu());
+  c.ranks[0].t->send(5, 1, gpu_batch(sample_table(30'000)));
+  c.ranks[0].t->close(5, 1);
+  REQUIRE(got.wait_for([&] { return got.error != nullptr || got.ended.size() == 1; }));
+  std::lock_guard lock{got.mutex};
+  CHECK_FALSE(got.error);
+  CHECK(got.batches[{0, 5}].size() == 1);
+  CHECK(asked == 1);
 }
 
 TEST_CASE("a transport that makes no progress for the stall timeout fails both ranks",
