@@ -262,6 +262,54 @@ TEST_CASE("Arrow pull claims retain admission until their last input owner relea
   CHECK_FALSE(h.driver->can_serve_cached_view());
 }
 
+TEST_CASE("Arrow synchronous pinning stays refused across source termination", "[arrow_driver]")
+{
+  auto producer = std::make_shared<pull_producer>();
+  harness h(producer);
+  auto source        = h.driver->make_preparation_source({});
+  auto check_refusal = [&] {
+    CHECK_THROWS_WITH(
+      h.driver->next_split_provider({}),
+      "Arrow import does not support synchronous pinning; admitted claims required");
+    CHECK_FALSE(h.driver->has_processed_all_metadata());
+    CHECK_FALSE(h.driver->can_serve_cached_view());
+  };
+  check_refusal();
+  SECTION("normal exhaustion without an accepted root")
+  {
+    producer->rows.clear();
+    CHECK_FALSE(h.next());
+    auto tail = source.coalescer->flush();
+    REQUIRE(tail.size() == 1);
+    CHECK(dynamic_cast<owned_arrow_scan_info&>(*tail.front()).rootless());
+  }
+  SECTION("normal exhaustion after accepted data")
+  {
+    REQUIRE(h.next());
+    CHECK_FALSE(h.next());
+    CHECK(source.coalescer->flush().empty());
+  }
+  SECTION("descriptor source closed") { source.close(); }
+  SECTION("producer failure")
+  {
+    producer->fail_read = true;
+    CHECK_THROWS_WITH(h.next(), "pull failed");
+    check_refusal();
+    source.close();
+  }
+  SECTION("cancelled with an outstanding input")
+  {
+    auto input = h.next();
+    h.driver->stop_preparation();
+    check_refusal();
+    CHECK(h.ledger->permits_in_flight() == 1);
+    input.reset();
+    CHECK(h.ledger->permits_in_flight() == 0);
+  }
+  SECTION("preparation finished") { h.driver->finish_preparation(); }
+  check_refusal();
+}
+
 TEST_CASE("Arrow driver preserves empty source and zero-row data as distinct states",
           "[arrow_driver]")
 {

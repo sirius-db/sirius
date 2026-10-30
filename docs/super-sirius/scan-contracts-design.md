@@ -135,17 +135,30 @@ The shared host Arrow path has two explicit boundaries. `import_arrow_host()` co
 
 ### Shared Arrow scan driver
 
-`arrow_import_ingestible` drives one `arrow_batch_producer` on its declared execution domain. Trusted planning binds the schema, materialization program, original read identity and optional provider validator. Claims inspect cached readiness and acquire a preparation permit before entering the producer. The accepted root retains its charged backing and permit through GPU completion. Import waits on the borrowed task stream; it does not create a stream or synchronize the whole device.
+`arrow_import_ingestible` drives one `arrow_batch_producer` on its declared execution domain, with one active input per shared gate. Trusted planning binds the schema, materialization program, original read identity and optional provider validator. Claims inspect readiness and acquire preparation capacity before entering the producer; this is not root acceptance. An available root must pass layout, schema and row/byte bounds before acceptance or capacity deferral. Invalid input fails rather than waiting for capacity.
+
+Import completes on the caller's task stream before returning independently owned GPU columns. The input gate and permit return only when the last input owner releases them; another descriptor can retain them after import. The caller's output allocator, backing and stream must survive output destruction and required completion. Unconfirmed completion retains import state under the existing unsafe-completion policy; it does not transfer ownership of caller resources. The driver creates no stream and adds no device-wide synchronization.
 
 | Input or lifecycle event | Behavior |
 |---|---|
-| Open push queue without input | Pending; an offer or terminal transition wakes the coordinator. |
+| Occupied input gate or open push queue without input | Pending; release, input arrival or a terminal transition wakes the coordinator. |
 | Non-null zero-row input | A real batch; validated and imported normally. |
-| Normal EOS without any accepted input | One rootless empty descriptor; no Arrow import or input credit. A mixed outer scan can supply its own empty carrier instead. |
-| Failure or cancellation | Propagates through the attempt; never treated as EOS. |
-| Synchronous pin or cached rows | Unsupported throughout the source lifecycle. |
+| Normal EOS without any accepted input | One rootless empty descriptor; no Arrow import or input credit. A composite scan can disable child empty carriers and supply its own. |
+| Failure or cancellation | Propagates through the attempt; never treated as EOS. Stop prevents new admission and publication. Source close wakes blocked offers. |
+| Synchronous pin or cached rows | Pin throws a named refusal; metadata-complete and cached-view checks remain false, including after EOS, close, failure and cancellation. |
 
-The push adapter accepts one offered root at a time. Concurrent offers return false without retaining another root. The external submitting thread waits until its root is copied or the queue terminates; it must hold no engine resource needed for progress. Offered views stay immutable and their owner covers all referenced buffers, including retained parent extents. Schema, row, copy and staging bounds are checked before ownership is accepted. The admitted job copies the selected window through the charged allocator; foreign backing is not adopted as reservation backing. Admission includes offered-input/copy overlap and normalization storage. `finish()` drains queued input before EOS; failure, cancellation and close release blocked offers.
+The push adapter retains at most one offered root. Concurrent offers return false without retaining another root. The submitting thread must hold no engine resource needed for progress. Foreign owners and returned Arrow release callbacks must be thread-neutral; there is no submitting-thread release guarantee or affine reclamation handshake. A false `offer()` return does not join an in-progress copy: retained source views and backing must remain readable and immutable until their final use ends.
+
+The admitted job copies the selected window into charged storage. Preparation covers detached Arrow storage and bounded staging; the queue separately bounds foreign-input/copy overlap without adopting foreign backing into its allocator. GPU outputs use task reservations. Neither the input gate nor this ledger bounds all output retention or total host/device memory. `finish()` drains queued input before EOS.
+
+Adapters using this driver must also handle the following integration responsibilities:
+
+| Area | Adapter responsibility |
+|---|---|
+| Provider lifetime | Keep the provider context and transaction valid through reader operations and close/drain. Enforce any thread affinity before accessing the provider; detach returned Arrow ownership from reader cleanup. |
+| Field mapping | Resolve provider field identities, defaults and schema evolution before binding the Arrow schema and materialization program. Physical layout and type validation do not establish those provider semantics. |
+| Composite scans | Admit the combined resource requirements and minimum progress permits before data work. Coordinate child gates and emit whole-scan emptiness once. |
+| Producer progress | Producer work and descriptor creation share a preparation source. Do not make release of an active input depend on accepting another input through the same gate. |
 
 ### Execution and ownership
 
