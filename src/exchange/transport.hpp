@@ -138,7 +138,8 @@ class transport {
   /// @throws the transport's error once it has failed.
   void send(stream_id stream, rank_t to, std::shared_ptr<cucascade::data_batch> batch);
 
-  /// No more batches of @p stream to rank @p to.
+  /// No more batches of @p stream to rank @p to. Once per stream and rank: the stream's count of
+  /// batches sent to @p to goes with it.
   /// @throws the transport's error once it has failed.
   void close(stream_id stream, rank_t to);
 
