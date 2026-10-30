@@ -107,6 +107,8 @@ class transport {
    *        @p recv, which it registered.
    * @param gpu Where received batches land first, and @p host (may be null) where they land when
    *        the GPU has no room.
+   * Its streams and engine thread use the current device. @p fabric, the rings and the spaces
+   * must outlive the transport.
    * @throws sirius::invalid_input_exception when the receive ring has fewer frames than peers.
    */
   transport(fabric& fabric,
