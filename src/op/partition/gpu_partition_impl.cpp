@@ -66,8 +66,8 @@ std::unique_ptr<cudf::column> partition_ids(cudf::table_view const& input,
 
 /// Hash-partitions @p input and keeps the input order within each partition, which lets a merge of
 /// partitions of sorted inputs treat them as sorted. A row's partition is its MurmurHash3 row hash
-/// modulo @p num_partitions, the same as in `unordered_hash_partition`, so equal keys land in the
-/// same partition whichever of the two partitions a batch.
+/// modulo @p num_partitions, which is how `cudf::hash_partition` assigns rows too, so equal keys
+/// land in the same partition whichever of the two partitions a batch.
 hash_partition_result stable_hash_partition(cudf::table_view const& input,
                                             std::vector<cudf::size_type> const& key_indices,
                                             int num_partitions,
@@ -106,21 +106,6 @@ hash_partition_result stable_hash_partition(cudf::table_view const& input,
                                 stream.get()));
   stream.sync();
   return {std::move(reordered), std::move(offsets)};
-}
-
-/// Hash-partitions @p input with no ordering guarantee within a partition. It assigns partitions
-/// exactly as `stable_hash_partition` does, but skips its sort.
-hash_partition_result unordered_hash_partition(cudf::table_view const& input,
-                                               std::vector<cudf::size_type> const& key_indices,
-                                               int num_partitions,
-                                               ::cuda::stream_ref stream,
-                                               rmm::device_async_resource_ref mr)
-{
-  auto const ids = partition_ids(input, key_indices, num_partitions, stream);
-  auto result    = cudf::partition(input, ids->view(), num_partitions, stream, mr);
-  // cuDF may append the end offset, which the callers do not use.
-  result.second.resize(num_partitions);
-  return result;
 }
 
 }  // namespace
@@ -182,17 +167,24 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::hash_par
   // A sorted single INT64 key is the shape of a sorted-key partial aggregate, whose merge uses
   // the sorted-keys group-by when its partials stay in order. Only then is the stable partition
   // worth its sort. Both partitions assign a key to the same partition, so batches of one input
-  // may take different paths.
+  // may take different paths. Any other input is partitioned as before.
   bool const keep_input_order =
     effective_key_idx.size() == 1 &&
     effective_table.column(effective_key_idx[0]).type().id() == cudf::type_id::INT64 &&
     keys_ascending(effective_table.column(effective_key_idx[0]), stream);
-  auto partition_result = (keep_input_order ? stable_hash_partition : unordered_hash_partition)(
-    effective_table,
-    effective_key_idx,
-    num_partitions,
-    stream,
-    memory_space.get_default_allocator());
+  auto partition_result = keep_input_order
+                            ? stable_hash_partition(effective_table,
+                                                    effective_key_idx,
+                                                    num_partitions,
+                                                    stream,
+                                                    memory_space.get_default_allocator())
+                            : cudf::hash_partition(effective_table,
+                                                   effective_key_idx,
+                                                   num_partitions,
+                                                   cudf::hash_id::HASH_MURMUR3,
+                                                   cudf::DEFAULT_HASH_SEED,
+                                                   stream,
+                                                   memory_space.get_default_allocator());
 
   // Build a column-index list for the original (non-cast) columns.
   std::vector<cudf::size_type> orig_col_indices;

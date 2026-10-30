@@ -241,8 +241,8 @@ TEST_CASE("Hash partition keeps the order of a sorted key and places keys consis
     }
   }
 
-  // A descending key takes the unordered path, but each key must land in the same partition as
-  // in the sorted batch: batches of one input may take different paths.
+  // A descending key takes the plain `cudf::hash_partition` path, but each key must land in the
+  // same partition as in the sorted batch: batches of one input may take different paths.
   auto descending_batch = make_key_row_batch(num_input_rows, /*descending=*/true, *mem_space);
   auto descending       = partition_by_key(*descending_batch, num_partitions, *mem_space);
   for (int partition_idx = 0; partition_idx < num_partitions; ++partition_idx) {
