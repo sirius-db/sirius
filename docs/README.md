@@ -103,6 +103,12 @@ Execution is out-of-core with tiered memory management (GPU/host/disk), automati
 Use Sirius through DuckDB's Python API: load the extension, execute SQL, and fetch results.
 Supported queries run on the GPU automatically, just as they do in the DuckDB shell.
 
+Sirius supports one active engine context per process; this is not enforced at runtime.
+Connections to the same DuckDB database instance share that context.
+Close all connections to the first database instance and release any objects that
+keep it alive before creating another instance. See the [Context API documentation](../include/sirius/context/context.hpp)
+for process-wide configuration and lifetime restrictions.
+
 The v2 extension requires the exact DuckDB revision pinned in this repository.
 Use the built CLI above. The default environment's DuckDB 1.5 Python package cannot
 load this extension; Python use requires a package built from the matching revision.

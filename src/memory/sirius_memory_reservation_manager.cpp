@@ -63,45 +63,52 @@ sirius_memory_reservation_manager::sirius_memory_reservation_manager(
   if (gpu_spaces.empty()) {
     throw std::runtime_error("At least one GPU memory space must be configured");
   }
-  // Complete grants before installing resource references that constructor unwinding could
-  // invalidate.
+  // Complete grants before installing global resource references.
   for_each_pair_without_pool_access(gpu_spaces, [](int owner_device, int accessor_device) {
     SIRIUS_LOG_INFO(
       "Pool access unavailable: owner GPU {}, accessor GPU {}", owner_device, accessor_device);
     return true;
   });
-  for (const auto* space : gpu_spaces) {
-    runtime_stream_pools_.push_back(runtime_stream_pool::install(*space));
-    auto const device_mr = space->get_default_allocator();
-    rmm::cuda_set_device_raii set_device{rmm::cuda_device_id{space->get_device_id()}};
-    // Capture the old resource by value (not by ref) — see comment in header for why.
-    // Wrap device_async_resource_ref in any_resource to satisfy the non-deprecated API.
-    prev_device_mrs_.push_back(cudf::set_current_device_resource(
-      ::cuda::mr::any_resource<::cuda::mr::device_accessible>{device_mr}));
-  }
-
+  // Allocate bookkeeping before changing process-wide resources.
+  prev_device_mrs_.reserve(gpu_spaces.size());
+  runtime_stream_pools_.reserve(gpu_spaces.size());
   auto& registry = gpu_tracking_scopes();
-  std::unique_lock lock{registry.mutex};
   try {
-    for (auto const& config : configs) {
-      auto const* gpu = std::get_if<cucascade::memory::gpu_memory_space_config>(&config);
-      if (gpu == nullptr) { continue; }
-      registry.scopes.insert_or_assign(
-        get_memory_space(cucascade::memory::Tier::GPU, gpu->device_id),
-        gpu->per_stream_reservation ? allocation_tracking_scope::PER_STREAM
-                                    : allocation_tracking_scope::PER_THREAD);
+    {
+      std::unique_lock lock{registry.mutex};
+      for (auto const& config : configs) {
+        auto const* gpu = std::get_if<cucascade::memory::gpu_memory_space_config>(&config);
+        if (gpu == nullptr) { continue; }
+        registry.scopes.insert_or_assign(
+          get_memory_space(cucascade::memory::Tier::GPU, gpu->device_id),
+          gpu->per_stream_reservation ? allocation_tracking_scope::PER_STREAM
+                                      : allocation_tracking_scope::PER_THREAD);
+      }
+    }
+    for (const auto* space : gpu_spaces) {
+      runtime_stream_pools_.push_back(runtime_stream_pool::install(*space));
+      auto const device_id = space->get_device_id();
+      auto replacement =
+        ::cuda::mr::any_resource<::cuda::mr::device_accessible>{space->get_default_allocator()};
+      auto previous =
+        rmm::mr::set_per_device_resource(rmm::cuda_device_id{device_id}, std::move(replacement));
+      prev_device_mrs_.push_back({device_id, std::move(previous)});
     }
   } catch (...) {
-    for (auto const* space : gpu_spaces) {
-      registry.scopes.erase(space);
+    {
+      std::unique_lock lock{registry.mutex};
+      for (auto const* space : gpu_spaces) {
+        registry.scopes.erase(space);
+      }
     }
+    restore_device_resources();
     throw;
   }
 }
 
 sirius_memory_reservation_manager::~sirius_memory_reservation_manager()
 {
-  auto gpu_spaces = this->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+  auto gpu_spaces = get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
   {
     auto& registry = gpu_tracking_scopes();
     std::unique_lock lock{registry.mutex};
@@ -109,33 +116,32 @@ sirius_memory_reservation_manager::~sirius_memory_reservation_manager()
       registry.scopes.erase(space);
     }
   }
-  // Restore the previous cuDF device resources saved in the constructor.
-  // Calling reset_current_device_resource_ref() would leave cuDF with a null/invalid
-  // resource that crashes subsequent allocations in other tests or code paths.
-  //
-  // Before restoring the device resource refs, drain each GPU so any pending
-  // stream-ordered frees (cudaFreeAsync) against the cuda_async_memory_resource
-  // pool we are about to destroy have completed. Without this drain, callers
-  // that leave async deallocations un-synchronized (e.g., a TEST_CASE that lets
-  // its cuda_stream + data_batches fall out of scope without an explicit sync)
-  // can corrupt the driver's per-device pool list, which then crashes the next
-  // sirius_memory_reservation_manager that constructs a fresh pool on the same
-  // device. The cost is a single device sync per managed GPU at teardown.
-  for (std::size_t i = 0; i < gpu_spaces.size() && i < prev_device_mrs_.size(); ++i) {
-    rmm::cuda_set_device_raii set_device{rmm::cuda_device_id{gpu_spaces[i]->get_device_id()}};
-    auto const status = cudaDeviceSynchronize();
-    if (status != cudaSuccess) {
-      log::log_noexcept([&] {
-        SIRIUS_LOG_ERROR(
-          "GPU {} teardown synchronization failed: {} ({}); continuing best-effort cleanup",
-          gpu_spaces[i]->get_device_id(),
-          cudaGetErrorName(status),
-          cudaGetErrorString(status));
-      });
+  restore_device_resources();
+}
+
+void sirius_memory_reservation_manager::restore_device_resources() noexcept
+{
+  int previous_device = -1;
+  (void)cudaGetDevice(&previous_device);
+  for (std::size_t i = prev_device_mrs_.size(); i > 0; --i) {
+    auto& registration = prev_device_mrs_[i - 1];
+    if (cudaSetDevice(registration.device_id) == cudaSuccess) {
+      auto const status = cudaDeviceSynchronize();
+      if (status != cudaSuccess) {
+        log::log_noexcept([&] {
+          SIRIUS_LOG_ERROR("GPU {} teardown synchronization failed: {}; continuing cleanup",
+                           registration.device_id,
+                           cudaGetErrorString(status));
+        });
+      }
     }
-    runtime_stream_pools_[i].reset();
-    cudf::set_current_device_resource(std::move(prev_device_mrs_[i]));
+    runtime_stream_pools_[i - 1].reset();
+    rmm::mr::set_per_device_resource(rmm::cuda_device_id{registration.device_id},
+                                     std::move(registration.previous));
   }
+  prev_device_mrs_.clear();
+  runtime_stream_pools_.clear();
+  if (previous_device >= 0) { (void)cudaSetDevice(previous_device); }
 }
 
 std::optional<allocation_tracking_scope>

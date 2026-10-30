@@ -226,31 +226,7 @@ SiriusContext::SiriusContext() = default;
 
 SiriusContext::~SiriusContext() noexcept
 {
-  // terminate() may throw during database teardown; a noexcept destructor must contain it.
-  if (!is_initialized_) {
-    // A context that threw during initialize() may have installed the cuDF
-    // pinned resource before failing; restore it before the slab allocator
-    // members unwind so cuDF is not left with a dangling reference. No-op when
-    // nothing was installed, and the in-initialize() rollback already covers
-    // the common path -- this is the backstop for any other drop-while-
-    // uninitialized route.
-    restore_cudf_pinned_memory_resource();
-    event_publisher_->stop();
-    return;
-  }
-  try {
-    terminate();
-  } catch (const std::exception& e) {
-    try {
-      SIRIUS_LOG_ERROR("SiriusContext teardown failed: {}", e.what());
-    } catch (...) {
-    }
-  } catch (...) {
-    try {
-      SIRIUS_LOG_ERROR("SiriusContext teardown failed with an unknown error");
-    } catch (...) {
-    }
-  }
+  release_resources();
   event_publisher_->stop();
 }
 
@@ -931,20 +907,22 @@ void SiriusContext::restore_cudf_pinned_memory_resource() noexcept
 void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
 {
   if (is_initialized_) { throw std::runtime_error("Sirius context is already initialized."); }
+  if (query_lifecycle_.runtime_failed()) {
+    throw std::runtime_error("Cannot reinitialize a context after a fatal runtime failure");
+  }
 
-  // A throw anywhere after the cuDF pinned resource is installed (and before
-  // is_initialized_ is set) must restore cuDF's global pinned resource before
-  // small_pinned_allocator_(_view_) unwind, or cuDF is left holding a dangling
-  // reference to freed slab storage. Idempotent + guarded, so arming it here
-  // (before the install) is safe; dismissed once initialization commits.
-  struct pinned_rollback_guard {
+  // Roll back even when initialize() is called on an existing engine object.
+  struct initialization_guard {
     SiriusContext* self;
-    bool dismissed = false;
-    ~pinned_rollback_guard()
+    bool owns_converter_registry = false;
+    bool committed               = false;
+    ~initialization_guard()
     {
-      if (!dismissed) { self->restore_cudf_pinned_memory_resource(); }
+      if (committed) { return; }
+      self->release_resources();
+      if (owns_converter_registry) { sirius::converter_registry::shutdown(); }
     }
-  } pinned_rollback{this};
+  } rollback{this};
 
   auto quent_context = sirius::telemetry::make_quent_context(config.get_telemetry_config());
   cucascade::memory::topology_discovery discovery;
@@ -959,6 +937,7 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
   // The spill converters run on downgrade threads with no client context, so they
   // read process-wide settings rather than this configuration.
   sirius::compression::apply_spill_compression_config(config_.get_compression_config());
+  admission_ = sirius::exec::query_admission{};
   admission_.configure(config_.max_concurrent_queries());
   if (config_.max_concurrent_queries() > 1) {
     for (auto const& space : config_.get_memory_space_configs()) {
@@ -970,7 +949,8 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
     }
   }
 
-  sirius::converter_registry::initialize(config_.get_downgrade_executor_config().copy_chunk_bytes);
+  rollback.owns_converter_registry = sirius::converter_registry::initialize(
+    config_.get_downgrade_executor_config().copy_chunk_bytes);
 
   // Discovery is shared by all subsystems; execution GPU ids come from the
   // configured memory manager built below.
@@ -992,17 +972,7 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
   cuvs_index_cache_ = std::make_unique<sirius::vss::cuvs_index_cache>(*memory_manager_);
 
   // Declare one telemetry device group per GPU so thread/queue telemetry can
-  // nest under its device instead of piling up flat under the engine. The GPU
-  // memory manager already reflects the configured topology.num_gpus / topology.gpu_ids
-  // selection, unlike the raw hardware topology.
-  std::vector<int> active_gpu_ids;
-  for (auto const* gpu_space :
-       memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
-    if (gpu_space != nullptr) { active_gpu_ids.push_back(gpu_space->get_device_id()); }
-  }
-  std::sort(active_gpu_ids.begin(), active_gpu_ids.end());
-  active_gpu_ids.erase(std::unique(active_gpu_ids.begin(), active_gpu_ids.end()),
-                       active_gpu_ids.end());
+  // nest under its device instead of piling up flat under the engine.
   telemetry_context_ = sirius::telemetry::telemetry_context::create(
     std::move(quent_context), config_.get_telemetry_config(), memory_manager_.get());
 
@@ -1183,18 +1153,42 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
   scan_manager_->start();
   task_scheduler_->start();
 
-  is_initialized_           = true;
-  pinned_rollback.dismissed = true;
+  runtime_unavailable_.store(false, std::memory_order_release);
+  is_initialized_    = true;
+  rollback.committed = true;
 }
 
 void SiriusContext::terminate()
 {
   throw_if_not_initialized();
-  admission_.close();
-  mark_runtime_unavailable();
-  admission_.wait_until_idle();
-  query_lifecycle_.quiesce_all();
+  release_resources();
+}
 
+void SiriusContext::release_resources() noexcept
+{
+  // A failed initialization has admitted no queries and must remain retryable.
+  if (is_initialized_) {
+    admission_.close();
+    mark_runtime_unavailable();
+    admission_.wait_until_idle();
+    query_lifecycle_.quiesce_all();
+  }
+  // Keep independent cleanup stages running if one reports an error.
+  auto cleanup = [](auto&& action) noexcept {
+    try {
+      action();
+    } catch (const std::exception& e) {
+      try {
+        SIRIUS_LOG_ERROR("SiriusContext teardown failed: {}", e.what());
+      } catch (...) {
+      }
+    } catch (...) {
+      try {
+        SIRIUS_LOG_ERROR("SiriusContext teardown failed with an unknown error");
+      } catch (...) {
+      }
+    }
+  };
   // Restore LIBCUDF_HW_DECOMPRESSION to its prior state (unset it if we exported it). Paired with
   // the emplace in initialize(); the RAII env_guard would also restore on destruction, but reset
   // here keeps the variable scoped to the initialized lifetime so a re-initialize starts clean.
@@ -1207,16 +1201,19 @@ void SiriusContext::terminate()
 
   // Stop every producer and every borrower BEFORE destroying the task_scheduler.
   // Creation workers and downgrade executors borrow the scheduler and its task queue.
-  task_scheduler_->stop();
+  if (task_scheduler_) { task_scheduler_->stop(); }
   if (scan_manager_) { scan_manager_->stop(); }
-  task_creator_->stop_thread_pool();
+  if (task_creator_) { task_creator_->stop_thread_pool(); }
   for (auto& executor : downgrade_executors_) {
     executor->stop();
   }
   // Drop any per-query state a window failed to clean up (e.g. a latched-unavailable path whose
   // best-effort reset threw). Doing it here, rather than letting ~task_creator do it, keeps the
   // DuckTableScanState/BlockHandle releases inside the window where DuckDB is still intact.
-  task_creator_->reset_all();
+  if (task_creator_) {
+    cleanup([&] { task_creator_->reset_all(); });
+  }
+  // Outstanding leases make resource destruction unsafe; failure here must be fatal.
   query_lifecycle_.clear();
   task_creator_.reset();
   downgrade_executors_.clear();
@@ -1226,11 +1223,13 @@ void SiriusContext::terminate()
   if (memory_manager_) {
     auto gpu_spaces = memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
     for (auto const* space : gpu_spaces) {
-      rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{space->get_device_id()}};
-      cudaDeviceSynchronize();
+      cleanup([&] {
+        rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{space->get_device_id()}};
+        cudaDeviceSynchronize();
+      });
     }
+    cudaDeviceSynchronize();
   }
-  cudaDeviceSynchronize();
 
   scan_manager_.reset();
 
@@ -1253,7 +1252,6 @@ void SiriusContext::terminate()
   small_pinned_allocator_view_.reset();
   small_pinned_allocator_.reset();
 
-  memory_manager_->shutdown();
   memory_manager_.reset();
 
   // Owns only a topology copy (no device resources); drop after the components

@@ -5,11 +5,13 @@
 # See the LICENSE file at the repo root for the full text.
 """Run the Sirius C++ unit tests.
 
-The run has four steps:
+The run has five steps:
 
   shards     Two Catch2 shards per visible GPU, run in parallel. Each shard sees
-             one GPU and uses integration-shard.yaml. [multi_gpu] and hidden
-             tests are excluded.
+             one GPU and uses integration-shard.yaml. [multi_gpu],
+             [public_context], and hidden tests are excluded.
+  context    The [public_context] lifecycle tests run alone because default
+             contexts reserve most of each GPU's memory.
   cuda_fault Isolated CUDA status-injection tests (Linux only). One GPU is
              visible; the [multi_gpu] ones run in a second process with all
              GPUs visible, skipped when fewer than two are.
@@ -47,9 +49,10 @@ from typing import NamedTuple
 REPO_ROOT = Path(__file__).resolve().parent.parent
 UNITTEST_DIR = Path("test/cpp")
 SHARD_CONFIG = REPO_ROOT / "test/cpp/integration/integration-shard.yaml"
-STEPS = ("shards", "cuda_fault", "multi_gpu", "late_mat")
+STEPS = ("shards", "context", "cuda_fault", "multi_gpu", "late_mat")
 STEP_SPECS = {
-    "shards": "~[.]~[multi_gpu]",
+    "shards": "~[.]~[multi_gpu]~[public_context]",
+    "context": "[public_context]~[.]",
     "cuda_fault": "[cuda_status_fault]~[multi_gpu]",
     "multi_gpu": "[multi_gpu]~[.]",
     "late_mat": "[late_mat]~[late_mat_fused],[deferred_query]~[late_mat_fused],"
@@ -57,7 +60,13 @@ STEP_SPECS = {
 }
 LATE_MAT_FUSED_SPEC = "[late_mat_fused]"
 CUDA_FAULT_MULTI_GPU_SPEC = "[cuda_status_fault][multi_gpu]~[.]"
-TIMEOUT_MIN = {"shards": 45, "cuda_fault": 10, "multi_gpu": 20, "late_mat": 20}
+TIMEOUT_MIN = {
+    "shards": 45,
+    "context": 20,
+    "cuda_fault": 10,
+    "multi_gpu": 20,
+    "late_mat": 20,
+}
 SUMMARY_PREFIXES = ("All tests passed", "test cases:", "No tests ran")
 
 _print_lock = threading.Lock()
@@ -264,7 +273,7 @@ def main() -> int:
                             prefix="[fault_mgpu] ",
                         )
                     )
-            case "multi_gpu":
+            case "context" | "multi_gpu":
                 jobs = [Job(label=step, cmd=cmd, env={}, log_dir=log_root / step)]
             case "late_mat":
                 fused_cmd = cmd[:-1] + [LATE_MAT_FUSED_SPEC]

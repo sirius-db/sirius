@@ -51,6 +51,9 @@ class Fragment;
 /// `LogicalOperator` (the translation step) and to own the catalog. Execution
 /// runs directly on the Sirius engine, not through DuckDB's query pipeline.
 ///
+/// Only one active engine context per process is supported. This restriction is
+/// not enforced; callers must ensure context lifetimes do not overlap.
+///
 /// Held from Rust via `cxx::UniquePtr`; created by `make_context()` /
 /// `make_context_from_config()` and freed when the `UniquePtr` drops. The
 /// constructors can throw (bad config, GPU bring-up failure); the `make_*`

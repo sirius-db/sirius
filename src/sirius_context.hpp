@@ -913,6 +913,7 @@ class SiriusContext : public ClientContextState {
   sirius::exec::query_admission admission_;
   // See runtime_health: latched when a mandatory cleanup step fails.
   std::atomic<bool> runtime_unavailable_{false};
+  void release_resources() noexcept;
   bool is_initialized_ = false;
   sirius::sirius_config config_;
   // Holds LIBCUDF_HW_DECOMPRESSION=ON while the context is initialized, when
