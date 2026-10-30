@@ -390,7 +390,7 @@ std::unique_ptr<cudf::table> try_low_cardinality_groupby(
                              stream.get()));
   check_cuda(cudaMemcpyAsync(
     host_flags.data(), flags.data(), sizeof(int), cudaMemcpyDeviceToHost, stream.get()));
-  check_cuda(cudaStreamSynchronize(stream.get()));
+  stream.sync();
   if (host_flags[0] != 0) { return nullptr; }
 
   std::vector<uint8_t> host_group_of_code(code_space, absent_group);
@@ -481,7 +481,7 @@ std::unique_ptr<cudf::table> try_low_cardinality_groupby(
   check_cuda(cudaGetLastError());
   check_cuda(cudaMemcpyAsync(
     host_flags.data() + 1, flags.data() + 1, sizeof(int), cudaMemcpyDeviceToHost, stream.get()));
-  check_cuda(cudaStreamSynchronize(stream.get()));
+  stream.sync();
   if (host_flags[1] != 0) { return nullptr; }
 
   // Keys: gather one representative row per group from the input key columns.
@@ -541,7 +541,7 @@ std::unique_ptr<cudf::table> try_low_cardinality_groupby(
   // until their last readers have finished.
   check_cuda(cudaMemcpyAsync(
     host_flags.data() + 1, flags.data() + 1, sizeof(int), cudaMemcpyDeviceToHost, stream.get()));
-  check_cuda(cudaStreamSynchronize(stream.get()));
+  stream.sync();
   if (host_flags[1] != 0) { return nullptr; }
   return std::make_unique<cudf::table>(std::move(output_columns));
 }
