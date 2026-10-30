@@ -24,6 +24,7 @@
 #include "sirius/exception.hpp"
 
 #include <chrono>
+#include <future>
 #include <memory>
 #include <vector>
 
@@ -52,7 +53,8 @@ struct cluster {
           std::uint32_t send_frames,
           std::uint32_t recv_frames,
           loopback_hub::options opts,
-          cucascade::memory::memory_space* host)
+          cucascade::memory::memory_space* host,
+          transport::options transport_opts = {})
     : hub(world, opts), ranks(world)
   {
     for (rank_t r = 0; r < world; ++r) {
@@ -60,8 +62,8 @@ struct cluster {
       s.send  = std::make_unique<frame_ring>(send_frames, 64 * KiB);
       s.recv  = std::make_unique<frame_ring>(recv_frames, 64 * KiB);
       s.fab   = hub.attach(r, *s.send, *s.recv);
-      s.t =
-        std::make_unique<transport>(*s.fab, *s.send, *s.recv, *env().gpu, host, recording(*s.got));
+      s.t     = std::make_unique<transport>(
+        *s.fab, *s.send, *s.recv, *env().gpu, host, recording(*s.got), transport_opts);
     }
   }
 
@@ -156,6 +158,46 @@ TEST_CASE("a sender holds a batch of a query until its last frame is staged",
   }
   CHECK(sender.wait_sent(5, std::chrono::seconds{30}));
   REQUIRE(got.wait_for([&] { return got.ended.size() == 1; }));
+}
+
+TEST_CASE("send blocks while queued bytes exceed the cap, then delivers everything",
+          "[exchange][transport]")
+{
+  // About 1 MiB a batch against a 64 KiB cap: the first goes alone, the second waits for it.
+  cluster c(2, 4, 4, {}, /*host=*/nullptr, {.max_queued_bytes = 64 * KiB});
+  auto& sender = *c.ranks[0].t;
+  auto& got    = *c.ranks[1].got;
+  auto first   = gpu_batch(sample_table(30'000));
+  auto second  = gpu_batch(sample_table(30'001));
+  std::future<void> blocked;
+  {
+    auto const hold = hold_gpu();
+    sender.send(5, 1, std::move(first));
+    blocked = std::async(std::launch::async, [&] { sender.send(5, 1, std::move(second)); });
+    CHECK(blocked.wait_for(std::chrono::milliseconds{500}) == std::future_status::timeout);
+  }
+  REQUIRE(blocked.wait_for(std::chrono::seconds{30}) == std::future_status::ready);
+  blocked.get();
+  sender.close(5, 1);
+  REQUIRE(got.wait_for([&] { return got.ended.size() == 1; }));
+  std::lock_guard lock{got.mutex};
+  CHECK(got.batches[{0, 5}].size() == 2);
+}
+
+TEST_CASE("a transport that makes no progress for the stall timeout fails both ranks",
+          "[exchange][transport]")
+{
+  // About 1 MiB: more frames than credits, so the sender still holds the batch, and its memory,
+  // while the receiver waits for room.
+  cluster c(2, 4, 4, {}, /*host=*/nullptr, {.stall_timeout = std::chrono::milliseconds{300}});
+  auto const hold = hold_gpu();
+  c.ranks[0].t->send(5, 1, gpu_batch(sample_table(30'000)));
+  for (auto& r : c.ranks) {
+    auto& got = *r.got;
+    REQUIRE(got.wait_for([&] { return got.error != nullptr; }, std::chrono::seconds{30}));
+  }
+  CHECK_THROWS_WITH(std::rethrow_exception(c.ranks[1].got->error),
+                    Catch::Matchers::ContainsSubstring("no progress"));
 }
 
 TEST_CASE("a failed write fails the sender and its peer", "[exchange][transport]")
