@@ -1506,7 +1506,14 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
     auto const names = _plan->data_column_names();
     scanned_column_names.insert(names.begin(), names.end());
   }
-  bool stats_filter_unsafe = bool(mapping);
+  auto statistics_name = [&](std::size_t batch_index) -> std::optional<std::string> {
+    if (mapping) return mapping->statistics_name(batch_index);
+    return _plan->batch_column_name(batch_index);
+  };
+  bool stats_filter_unsafe =
+    mapping && std::any_of(pruning_columns.begin(), pruning_columns.end(), [&](auto column) {
+      return !statistics_name(column);
+    });
   for (auto const& elem : metadata.schema) {
     if (restrict_to_scanned && !scanned_column_names.contains(elem.name)) { continue; }
     bool const is_decimal = (elem.converted_type.has_value() &&
@@ -1521,17 +1528,21 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
     }
   }
   bool const disable_filter_pushdown =
-    metadata_only ||
-    (_source_kind == parquet_source_kind::ICEBERG && _plan->has_user_virtual_columns()) ||
+    metadata_only || bool(mapping) ||
+    (_source_kind != parquet_source_kind::PLAIN_PARQUET && _plan->has_user_virtual_columns()) ||
     stats_filter_unsafe;
+
+  // Published decoder options must never borrow the temporary statistics AST.
+  auto mapped_reader_options =
+    mapping ? std::make_shared<cudf::io::parquet_reader_options>(opts) : nullptr;
 
   // Translate the filter for reader-side row-group pruning unless disabled. The
   // translated cuDF AST must outlive filter_row_groups_with_stats below.
   // Pushes _static_pushdown_expression, not the full predicate.
   std::optional<gpu_expression_translator::translated_expression> ast_expression = std::nullopt;
   if (_static_pushdown_expression && !stats_filter_unsafe) {
-    auto name_resolver = [this](duckdb::idx_t ref_index) -> std::string {
-      return _plan->batch_column_name(ref_index);
+    auto name_resolver = [&](duckdb::idx_t ref_index) -> std::string {
+      return statistics_name(ref_index).value();
     };
     gpu_expression_translator translator(stream, cudf::get_current_device_resource_ref());
     auto sirius_filter_ast = sirius::ast::from_duckdb(*_static_pushdown_expression);
@@ -1666,7 +1677,7 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
   //
   // null_count is optional in the parquet spec — an absent value means unknown,
   // never zero, so the row group is kept.
-  if (!mapping && !_null_prune_predicates.empty() && !row_group_indices.empty()) {
+  if (!_null_prune_predicates.empty() && !row_group_indices.empty()) {
     struct resolved_predicate {
       std::size_t chunk_index;
       bool expects_null;
@@ -1696,7 +1707,9 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
         continue;
       }
 
-      auto const& leaves = leaves_for(_plan->batch_column_name(pred.batch_index));
+      auto name = statistics_name(batch_index);
+      if (!name) continue;
+      auto const& leaves = leaves_for(*name);
       if (leaves.size() != 1) { continue; }
       auto const chunk_index = leaves.front();
       auto const& first_rg   = metadata.row_groups.front();
@@ -1941,7 +1954,7 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
   out->file_index      = file_index;
   out->datasource      = std::move(sirius_ds);
   out->reader_options  = std::move(file_options);
-  if (mapping) out->reader_options = std::make_shared<cudf::io::parquet_reader_options>(opts);
+  if (mapping) out->reader_options = std::move(mapped_reader_options);
   out->field_mapping           = mapping;
   out->carrier_unavailable     = carrier_unavailable;
   out->disable_filter_pushdown = disable_filter_pushdown;
