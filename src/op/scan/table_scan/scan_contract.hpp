@@ -216,6 +216,7 @@ struct scan_publication_observation {
 
 struct physical_check_counters {
   std::atomic<uint64_t> split_flushed_for_schema{0};
+  std::atomic<uint64_t> arrow_batches_imported{0}, arrow_rows_imported{0};
   std::atomic<uint64_t> iceberg_manifest_walks{0};
   std::atomic<uint64_t> iceberg_dv_manifest_reads{0};
   std::atomic<uint64_t> iceberg_delete_payload_loads{0};

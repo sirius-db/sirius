@@ -89,6 +89,37 @@ Cancellation closes admission and publication and wakes blocked work. Completion
 
 The shared host Arrow path has two explicit boundaries. `import_arrow_host()` consumes one owned `ArrowSchema` plus `ArrowArray` record batch and retains its input capacity through the retirement lane. `materialize_arrow_stream()` consumes a sequential internal `arrow_batch_source`: each item carries an independently owned batch, a contiguous sequence number, and declared row and byte bounds; `nullopt` is the only EOS marker. The verifier compares the declared row count with the imported batch, sends results directly to a bounded sink, and calls `cancel()` on source, validation, import, or sink failure. Producers acquire preparation/output capacity and split oversized input before returning an item. An adapter may bridge an `ArrowArrayStream` one batch at a time, but this interface does not add a public Fragment Arrow-input API or a native Paimon/DuckLake adapter.
 
+### Shared Arrow scan driver
+
+`arrow_import_ingestible` drives one `arrow_batch_producer` on its declared execution domain, with one active input per shared gate. Trusted planning binds the schema, materialization program, original read identity and optional provider validator. Claims inspect readiness and acquire preparation capacity before entering the producer; this is not root acceptance. An available root must pass layout, schema and row/byte bounds before acceptance or capacity deferral. Invalid input fails rather than waiting for capacity.
+
+Import completes on the caller's task stream before returning independently owned GPU columns. The input gate and permit return only when the last input owner releases them; another descriptor can retain them after import. The caller's output allocator, backing and stream must survive output destruction and required completion. Unconfirmed completion retains import state under the existing unsafe-completion policy; it does not transfer ownership of caller resources. The driver creates no stream and adds no device-wide synchronization.
+
+| Input or lifecycle event | Behavior |
+|---|---|
+| Occupied input gate or open push queue without input | Pending; release, input arrival or a terminal transition wakes the coordinator. |
+| Non-null zero-row input | A real batch; validated and imported normally. |
+| Normal EOS without any accepted input | One rootless empty descriptor; no Arrow import or input credit. A composite scan can disable child empty carriers and supply its own. |
+| Failure or cancellation | Propagates through the attempt; never treated as EOS. Stop prevents new admission and publication. Source close wakes blocked offers. |
+| Synchronous pin or cached rows | Pin throws a named refusal; metadata-complete and cached-view checks remain false, including after EOS, close, failure and cancellation. |
+
+The push adapter retains at most one offered root. Concurrent offers return false without retaining another root. The submitting thread must hold no engine resource needed for progress. Foreign owners and returned Arrow release callbacks must be thread-neutral; there is no submitting-thread release guarantee or affine reclamation handshake. A false `offer()` return does not join an in-progress copy: retained source views and backing must remain readable and immutable until their final use ends.
+
+Retained budgets become available for subsequent inputs only after the unit is retired and its final allocation and permit have been released. A coordinator request for normal end of stream discards in-flight results without turning successful completion into a query error; user cancellation and read failures retain their error semantics.
+
+Each Arrow input permit enforces its producer's temporary envelope at allocation time, with each declared block rounded independently to the admission allocation granularity. Admission reserves one permit per output-holding scan plus one circulating permit whenever a scan with units declares no holding minimum, so preparation that releases its permit (for example deletion-vector jobs) can progress while Arrow outputs are held. A producer that observes the stop token inside `next()` and reports it as an interrupt is classified by the driver as the cancellation status; interrupts without a token stop propagate unchanged. Another scan's larger query-wide W cannot increase that local allowance.
+
+The admitted job copies the selected window into charged storage. Preparation covers detached Arrow storage and bounded staging; the queue separately bounds foreign-input/copy overlap without adopting foreign backing into its allocator. GPU outputs use task reservations. Neither the input gate nor this ledger bounds all output retention or total host/device memory. `finish()` drains queued input before EOS.
+
+Adapters using this driver must also handle the following integration responsibilities:
+
+| Area | Adapter responsibility |
+|---|---|
+| Provider lifetime | Keep the provider context and transaction valid through reader operations and close/drain. Enforce any thread affinity before accessing the provider; detach returned Arrow ownership from reader cleanup. |
+| Field mapping | Resolve provider field identities, defaults and schema evolution before binding the Arrow schema and materialization program. Physical layout and type validation do not establish those provider semantics. |
+| Composite scans | Admit the combined resource requirements and minimum progress permits before data work. Coordinate child gates and emit whole-scan emptiness once. |
+| Producer progress | Producer work and descriptor creation share a preparation source. Do not make release of an active input depend on accepting another input through the same gate. |
+
 ### Execution and ownership
 
 The coordinator claims work, coalesces results and publishes batches after GPU consumers are ready. Metadata-only attempts advance on the query owner without another thread. An attempt with query-owner or native-reader sources runs coordination independently of reader calls: on the manager's shared pool by default, or on a dedicated thread when `coordinator_workers` is `0`. All drivers use the same bounded control steps, publication gate and retirement path. Sources choose where their jobs run:

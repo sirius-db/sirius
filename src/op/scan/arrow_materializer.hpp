@@ -11,6 +11,7 @@
 #include <limits>
 #include <memory_resource>
 #include <optional>
+#include <span>
 #include <unordered_map>
 
 namespace sirius::op::scan {
@@ -34,6 +35,9 @@ class owned_arrow_batch {
   owned_arrow_batch& operator=(owned_arrow_batch const&) = delete;
   bool has_capacity() const noexcept { return static_cast<bool>(capacity); }
   std::int64_t row_count() const noexcept { return array.length; }
+  std::vector<cudf::data_type> input_types() const;
+  void validate_for(materialization_program const&) const;
+  std::size_t estimated_device_bytes() const;
 
  private:
   friend materialized_batch import_arrow_host(std::shared_ptr<owned_arrow_batch>,
@@ -51,6 +55,8 @@ class owned_arrow_batch {
 
 std::vector<cudf::data_type> validate_arrow_host_flat(
   ArrowSchema const&, ArrowArray const&, arrow_metadata_lengths const& metadata_lengths = {});
+// Conservative PMR storage for a validated flat input, including allocation alignment.
+std::size_t arrow_import_staging_bytes(ArrowArray const&, std::span<cudf::data_type const>);
 // The caller owns/drains the completion lane and its stream for the entire attempt.
 // Output device reservations are the same task reservation used for Parquet decode.
 // Producer buffers must be readable to their declared Arrow extents. All host

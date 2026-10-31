@@ -76,6 +76,13 @@ class host_backing final : public reservation_backing {
   cucascade::memory::fixed_size_host_memory_resource* resource_;
 };
 }  // namespace
+uint64_t unit_envelope::temporary_charge(uint64_t quantum) const
+{
+  uint64_t total = 0;
+  for (auto bytes : temporary)
+    total = add(total, round(bytes, quantum));
+  return total;
+}
 uint64_t host_reservation_provider::allocation_granularity(memory_space_id space) const
 {
   if (space.tier != cucascade::memory::Tier::HOST)
@@ -129,19 +136,22 @@ void erase_retired(ledger_state& ledger, unit_key key)
 {
   auto it = ledger.units.find(key);
   if (it != ledger.units.end() && it->second.retired && !it->second.retained &&
-      it->second.permit.expired())
+      it->second.permit.expired()) {
+    ledger.registered -= it->second.retained_limit;
     ledger.units.erase(it);
+  }
 }
 }  // namespace
 struct permit_state {
   std::shared_ptr<ledger_state> ledger;
   unit_key key;
-  uint64_t temporary = 0;
-  bool accepting     = true;
+  uint64_t temporary = 0, temporary_limit = 0;
+  bool accepting = true;
   void attach(std::shared_ptr<ledger_state> owner, unit_key unit) noexcept
   {
-    ledger = std::move(owner);
-    key    = unit;
+    ledger          = std::move(owner);
+    key             = unit;
+    temporary_limit = ledger->w;
     ++ledger->active;
   }
   ~permit_state()
@@ -192,21 +202,32 @@ admission_decision preparation_ledger::admit(std::span<scan_envelope const> scan
   try {
     auto quantum             = provider->allocation_granularity(space);
     d.allocation_granularity = quantum;
-    uint64_t units           = 0;
+    uint64_t units = 0, minimum_permits = 0;
+    bool releasing_units = false;
     for (auto const& scan : scans) {
       if (!scan.qualified) return d;
+      minimum_permits = add(minimum_permits, scan.minimum_permits);
+      if (!scan.minimum_permits && !scan.units.empty()) releasing_units = true;
       for (auto bytes : scan.retained)
         d.sigma_retained = add(d.sigma_retained, round(bytes, quantum));
       for (auto const& unit : scan.units) {
-        uint64_t unit_w = 0;
-        for (auto bytes : unit.temporary)
-          unit_w = add(unit_w, round(bytes, quantum));
+        auto unit_w      = unit.temporary_charge(quantum);
         units            = add(units, 1);
         d.sigma_retained = add(d.sigma_retained, round(unit.retained, quantum));
         d.w              = std::max(d.w, unit_w);
       }
     }
-    auto minimum = add(d.sigma_retained, d.w);
+    // Output-holding scans can occupy every permit they declared while they wait for
+    // another scan. Units that release their permit still need one to make progress.
+    if (releasing_units) minimum_permits = add(minimum_permits, 1);
+    if (minimum_permits > max_permits || minimum_permits > units) {
+      d.reason = admission_reason::capacity;
+      return d;
+    }
+    minimum_permits = std::max<uint64_t>(1, minimum_permits);
+    if (d.w > (std::numeric_limits<uint64_t>::max() - d.sigma_retained) / minimum_permits)
+      throw std::overflow_error("preparation minimum progress envelope overflow");
+    auto minimum = d.sigma_retained + minimum_permits * d.w;
     auto permits = std::min<uint64_t>(units, max_permits);
     if (d.w)
       permits = std::min(permits, (std::numeric_limits<uint64_t>::max() - d.sigma_retained) / d.w);
@@ -222,7 +243,7 @@ admission_decision preparation_ledger::admit(std::span<scan_envelope const> scan
       try {
         grant = provider->request(space, d.c_requested);
       } catch (std::bad_alloc const&) {
-        // A smaller reservation can still preserve the original one-permit route.
+        // A smaller reservation must still preserve every scan progress requirement.
       }
       d.reason = grant ? admission_reason::short_grant : admission_reason::no_grant;
       if (grant) {
@@ -242,12 +263,12 @@ admission_decision preparation_ledger::admit(std::span<scan_envelope const> scan
           return d;
         }
       }
-      if (permits <= 1) {
+      if (permits <= minimum_permits) {
         state_.reset();
         return d;
       }
       // Bound admission work even with a very large configured worker count.
-      permits = std::max<uint64_t>(1, permits / 2);
+      permits = std::max<uint64_t>(minimum_permits, permits / 2);
     }
     state_->retained_limit = d.sigma_retained;
     state_->w              = d.w;
@@ -303,17 +324,22 @@ w_permit preparation_ledger::acquire_permit(unit_key key)
   result.state_     = std::move(permit);
   return result;
 }
-w_permit preparation_ledger::try_acquire_unit(unit_key key, uint64_t retained_limit)
+w_permit preparation_ledger::try_acquire_unit(unit_key key,
+                                              uint64_t retained_limit,
+                                              std::optional<uint64_t> temporary_limit)
 {
   if (!state_) throw std::logic_error("preparation is not admitted");
   std::lock_guard lock(state_->mutex);
   if (state_->closed) throw std::logic_error("preparation closed");
   if (state_->active == state_->permits) return {};
+  auto limit = temporary_limit.value_or(state_->w);
+  if (limit > state_->w) throw std::invalid_argument("unit temporary budget exceeds admission");
   auto permit = std::make_shared<permit_state>();
   auto& unit  = state_->register_unit(key, retained_limit);
   // All throwing work precedes permit settlement and installation.
   permit->attach(state_, key);
-  unit.permit = permit;
+  permit->temporary_limit = limit;
+  unit.permit             = permit;
   w_permit result;
   result.state_ = std::move(permit);
   return result;
@@ -374,7 +400,7 @@ charged_block charging_allocator::allocate_impl(uint64_t bytes, bool retained)
     if (overflow || charge < bytes ||
         (retained ? charge > unit.retained_limit - unit.retained ||
                       charge > ledger->retained_limit - ledger->retained
-                  : charge > ledger->w - permit->temporary)) {
+                  : charge > permit->temporary_limit - permit->temporary)) {
       ++ledger->exceeded;
       throw preparation_resource_error("preparation allocation exceeds proved envelope", true);
     }
@@ -418,6 +444,13 @@ uint64_t preparation_ledger::charged_bytes(unit_key key) const
   std::lock_guard lock(state_->mutex);
   auto it = state_->units.find(key);
   return it == state_->units.end() ? 0 : it->second.retained;
+}
+uint64_t preparation_ledger::charged_bytes(w_permit const& permit) const
+{
+  if (!state_ || !permit.state_ || permit.state_->ledger != state_)
+    throw std::logic_error("temporary-memory permit belongs to another ledger");
+  std::lock_guard lock(state_->mutex);
+  return add(permit.state_->temporary, state_->units.at(permit.state_->key).retained);
 }
 uint64_t preparation_ledger::granted_capacity() const
 {
