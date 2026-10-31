@@ -15,6 +15,7 @@
  */
 
 #include "catch.hpp"
+#include "cuda/gpu_completion.hpp"
 #include "data/data_batch_utils.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "helper/type_conversions.hpp"
@@ -1312,6 +1313,11 @@ TEST_CASE("gpu_pipeline_task does not reschedule dynamic filter cleanup with unj
   REQUIRE(local != nullptr);
   local->set_reservation(std::move(reservation), info);
   advance_to_reserving(*task);
+  sirius::gpu_completion_test_hooks completion_hooks;
+  std::vector<std::unique_ptr<void, void (*)(void*)>> retained_inputs;
+  completion_hooks.retain = [&](void* owner, void (*destroy)(void*)) {
+    retained_inputs.emplace_back(owner, destroy);
+  };
   REQUIRE_THROWS_AS(task->execute(stream), sirius::unjoined_gpu_work);
   REQUIRE(execute_calls == 1);
   REQUIRE(sink_calls == 0);
@@ -1325,6 +1331,7 @@ TEST_CASE("gpu_pipeline_task does not reschedule dynamic filter cleanup with unj
                   .has_value());
   task.reset();
   REQUIRE_FALSE(batch->try_to_mutable().has_value());
+  retained_inputs.clear();
   retained.reset();
   REQUIRE(batch->try_to_mutable().has_value());
 }
@@ -2001,4 +2008,59 @@ TEST_CASE(
   }
   retry.reset();
   REQUIRE(source_lifetime.expired());
+}
+
+TEST_CASE("GPU task retains live data when completion cannot be confirmed",
+          "[gpu_pipeline_task][unsafe_completion]")
+{
+  // Prepare, operator completion, operator OOM cleanup, sink completion and sink OOM cleanup.
+  auto mode = GENERATE(0, 1, 2, 3, 4);
+  CAPTURE(mode);
+  pipeline_task_history_fixture f;
+  REQUIRE(f.setup());
+  rmm::cuda_stream stream;
+  auto ctx    = create_pipeline_context();
+  auto global = std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(
+    ctx.pipeline, sirius::test::make_test_telemetry_context());
+  auto batch                                 = f.create_gpu_data_batch(8, stream);
+  std::weak_ptr<cucascade::data_batch> input = batch;
+  std::weak_ptr<cucascade::data_batch> output;
+  int calls = 0;
+  int sinks = 0;
+  ctx.stub_op->on_execute =
+    [&](auto const&, ::cuda::stream_ref task_stream) -> std::unique_ptr<sirius::op::operator_data> {
+    ++calls;
+    if (mode == 2) throw rmm::out_of_memory("operator failed after submitting work");
+    auto result = f.create_gpu_data_batch(8, task_stream);
+    output      = result;
+    return std::make_unique<sirius::op::pipelineable_operator_data>(
+      std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(result)});
+  };
+  ctx.stub_op->on_sink = [&](auto const&, ::cuda::stream_ref) {
+    ++sinks;
+    if (mode == 4) throw rmm::out_of_memory("sink failed after submitting work");
+  };
+  auto task = create_pipeline_task(f, global, std::move(batch), 1ULL << 20, 1);
+  sirius::gpu_completion_test_hooks hooks;
+  std::vector<std::unique_ptr<void, void (*)(void*)>> owners;
+  hooks.fail = [mode](sirius::gpu_completion_point point) {
+    using enum sirius::gpu_completion_point;
+    return point == (mode == 0 ? prepare : mode == 1 ? execute : mode == 3 ? sink : failure);
+  };
+  hooks.retain = [&](void* owner, void (*destroy)(void*)) { owners.emplace_back(owner, destroy); };
+  REQUIRE_THROWS_AS(task->execute(stream), sirius::unjoined_gpu_work);
+  REQUIRE(hooks.joined);
+  REQUIRE_FALSE(owners.empty());
+  CHECK(calls == (mode == 0 ? 0 : 1));
+  CHECK(sinks == (mode >= 3 ? 1 : 0));
+  if (mode <= 2) CHECK_FALSE(input.expired());
+  if (mode == 1 || mode >= 3) CHECK_FALSE(output.expired());
+  CHECK(global->get_memory_history().size() == 0);
+  // The injected failure follows a successful real wait, so tests may explicitly reclaim it.
+  owners.clear();
+  f.gpu_space->get_memory_resource_as<cucascade::memory::reservation_aware_resource_adaptor>()
+    ->reset_stream_reservation(stream);
+  task.reset();
+  CHECK(input.expired());
+  CHECK(output.expired());
 }

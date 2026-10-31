@@ -19,6 +19,7 @@
 #include "creator/task_creator.hpp"
 #include "cucascade/memory/stream_pool.hpp"
 #include "cuda/device_health.hpp"
+#include "cuda/gpu_completion.hpp"
 #include "cuda_runtime_api.h"
 #include "downgrade/downgrade_executor.hpp"
 #include "exec/leased_callable.hpp"
@@ -179,7 +180,10 @@ void gpu_pipeline_executor::process_task(
     auto const* pipe    = gpu_task->get_pipeline();
     auto const query_id = pipe ? pipe->get_query_id() : make_query_id(0);
     iteration_query     = query_id;
-    if (!_query_lifecycle.accepts_work(query_id)) { return; }
+    if (!_query_lifecycle.accepts_work(query_id)) {
+      _query_lifecycle.require_gpu_completion();
+      return;
+    }
     // Pass this executor's memory space so cross-space inputs (host/disk tiers and GPU data on
     // another device, which prepare clones into this space) are counted in the reservation.
     auto reservation_info = gpu_task->get_estimated_reservation_size_info(_memory_space);
@@ -224,11 +228,18 @@ void gpu_pipeline_executor::process_task(
       _memory_space->get_available_memory(),
       _memory_space->get_total_reserved_memory(),
       _memory_space->get_max_memory());
-    // Try without blocking first, purely so the blocking case can be reported.
-    // make_reservation() parks until the memory frees up, and a listener told
-    // only once it returns learns nothing it can act on -- by then the stall it
-    // would have exploited is over.  A reservation that succeeds outright is the
-    // common case and raises nothing.
+    // Retained unsafe work may never return its reservation. Do not enter the allocator's
+    // uncancellable wait: retirement must still drain the manager's host work lease.
+    auto reserve_while_running = [&]() -> std::unique_ptr<cucascade::memory::reservation> {
+      while (_running && _query_lifecycle.accepts_work(query_id)) {
+        auto result = _memory_space->make_reservation_or_null(bytes_needs);
+        if (result) return result;
+        if (_memory_space->get_active_reservation_count() == 0)
+          return _memory_space->make_reservation_upto(bytes_needs);
+        if (_query_lifecycle.wait_for_quiescing(query_id, std::chrono::milliseconds(1))) break;
+      }
+      return nullptr;
+    };
     auto reservation = _memory_space->make_reservation_or_null(bytes_needs);
     exec::query_lifecycle_registry::memory_wait_guard memory_wait_activity;
     if (!reservation || reservation->size() < bytes_needs) {
@@ -248,9 +259,10 @@ void gpu_pipeline_executor::process_task(
           _memory_space != nullptr ? _memory_space->get_device_id() : -1,
           bytes_needs);
       }
-      reservation = _memory_space->make_reservation(bytes_needs);
+      reservation = reserve_while_running();
     }
     if (!reservation) {
+      _query_lifecycle.require_gpu_completion();
       SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to acquire memory reservation for task {}",
                        gpu_task->get_task_id());
       if (auto handler = gpu_task->get_completion_handler()) {
@@ -302,13 +314,15 @@ void gpu_pipeline_executor::process_task(
       try {
         freed =
           _downgrade_executor
-            ->request_downgrade([mem_space, bytes_needs, &new_reservation, &reservation_mutex]() {
-              std::lock_guard<std::mutex> lock(reservation_mutex);
-              if (new_reservation) { return true; }
-              auto res = mem_space->make_reservation_or_null(bytes_needs);
-              if (res && res->size() >= bytes_needs) { new_reservation = std::move(res); }
-              return new_reservation != nullptr;
-            })
+            ->request_downgrade(
+              [this, query_id, mem_space, bytes_needs, &new_reservation, &reservation_mutex]() {
+                std::lock_guard<std::mutex> lock(reservation_mutex);
+                if (!_running || !_query_lifecycle.accepts_work(query_id)) return true;
+                if (new_reservation) { return true; }
+                auto res = mem_space->make_reservation_or_null(bytes_needs);
+                if (res && res->size() >= bytes_needs) { new_reservation = std::move(res); }
+                return new_reservation != nullptr;
+              })
             .get();
       } catch (const std::exception& e) {
         if (_query_lifecycle.report_failure(std::current_exception(),
@@ -333,7 +347,7 @@ void gpu_pipeline_executor::process_task(
         reservation = std::move(new_reservation);
       } else {
         // Predicate never succeeded — try one final reservation attempt
-        reservation = _memory_space->make_reservation(bytes_needs);
+        reservation = reserve_while_running();
       }
 
       // One INFO line per executor-driven (reserve-path) downgrade. The shortfall
@@ -352,6 +366,7 @@ void gpu_pipeline_executor::process_task(
         reservation ? (reservation->size() >= bytes_needs ? "satisfied" : "partial") : "failed");
 
       if (!reservation) {
+        _query_lifecycle.require_gpu_completion();
         SIRIUS_LOG_ERROR(
           "GPU Pipeline Executor: Failed to acquire memory reservation after "
           "downgrade for task {} (freed {} bytes)",
@@ -387,6 +402,12 @@ void gpu_pipeline_executor::process_task(
         gpu_task->get_task_id(),
         reservation->size());
     }
+    if (!_running || !_query_lifecycle.accepts_work(query_id)) {
+      _query_lifecycle.require_gpu_completion();
+      if (iteration_completion)
+        iteration_completion->report_error("GPU task cancelled before dispatch");
+      return;
+    }
     memory_wait_activity.reset();
     if (auto* local_state = dynamic_cast<sirius::pipeline::sirius_pipeline_task_local_state*>(
           gpu_task->local_state())) {
@@ -410,7 +431,28 @@ void gpu_pipeline_executor::process_task(
     // before query cleanup drains the queues. Copied (not moved) into the lambda so the catch
     // blocks below still have it if dispatch itself throws.
     auto completion = iteration_completion;
-    auto work       = pipeline_task->take_work_lease();
+    struct execution_owners {
+      static void* operator new(std::size_t size)
+      {
+        if (auto* hooks = gpu_completion_test_hooks::current;
+            hooks && hooks->before_task_owner_allocation)
+          hooks->before_task_owner_allocation();
+        return ::operator new(size);
+      }
+      static void operator delete(void* owner) noexcept { ::operator delete(owner); }
+      execution_owners(cucascade::memory::borrowed_stream&& stream,
+                       std::unique_ptr<parallel::itask>&& task) noexcept
+        : stream(std::move(stream)), task(std::move(task))
+      {
+      }
+      cucascade::memory::borrowed_stream stream;
+      std::unique_ptr<parallel::itask> task;
+      std::unique_ptr<op::operator_data> retry_input;
+    };
+    // Allocate the retention owner before any task work can be submitted to the GPU.
+    auto owners =
+      std::make_unique<execution_owners>(std::move(exc_stream), std::move(pipeline_task));
+    auto work = owners->task->take_work_lease();
     exec::dispatch_with_work(
       *_bounded_pool,
       std::move(slot),
@@ -422,11 +464,12 @@ void gpu_pipeline_executor::process_task(
       },
       [this,
        query_id,
-       task       = std::move(pipeline_task),
-       exc_stream = std::move(exc_stream),
+       owners     = std::move(owners),
        consumers  = std::move(output_consumers),
        completion = std::move(completion),
        pipeline]() mutable {
+        auto& task       = owners->task;
+        auto& exc_stream = owners->stream;
         // The enclosing leased callable retains all captures through this error boundary.
         try {
           try {
@@ -434,25 +477,18 @@ void gpu_pipeline_executor::process_task(
             task->execute(::cuda::stream_ref{exc_stream.get()});
             _tasks_executed.fetch_add(1, std::memory_order_relaxed);
           } catch (task_reschedule_exception& ex) {
-            // Only THIS query's error state suppresses the reschedule. Previously one query's
-            // failure silently stopped every other query's tasks from rescheduling.
+            // Cancellation may already have won the query result, but it cannot release an
+            // intermediate input until submitted work has completed.
+            if (!join_gpu_work(::cuda::stream_ref{exc_stream.get()}, gpu_completion_point::retry)) {
+              owners->retry_input = ex.release_intermediate_data();
+              throw unjoined_gpu_work{};
+            }
             if (completion && completion->has_error()) { return; }
             auto* gpu_task = cast_to_gpu_pipeline_task(task.get());
             if (!gpu_task) {
-              SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to cast task for reschedule");
-              if (completion) {
-                completion->report_error(
-                  "GPU Pipeline Executor: Failed to cast task for reschedule");
-              }
+              if (completion) completion->report_error("GPU Pipeline Executor: invalid retry task");
               return;
             }
-
-            // Sync the stream to ensure all memory is released before the reschedule.
-            auto const status = cudaStreamSynchronize(exc_stream.get().get());
-            check_cuda_health(status);
-            if (status != cudaSuccess)
-              throw std::runtime_error(std::string("CUDA retry synchronization failed: ") +
-                                       cudaGetErrorName(status));
 
             // Determine retry count and original task ID for this rescheduled attempt.
             auto* cur_local = dynamic_cast<gpu_pipeline_task_local_state*>(gpu_task->local_state());
@@ -593,6 +629,7 @@ void gpu_pipeline_executor::process_task(
         } catch (...) {
           auto error = std::current_exception();
           _query_lifecycle.report_failure(error, query_id);
+          if (is_unjoined_gpu_work(error)) retain_unjoined_owner(owners);
           if (completion)
             completion->report_error(error, transparent::late_failure_cause::gpu_error);
           log::log_noexcept([&] {
