@@ -17,6 +17,7 @@
 #include "pipeline/gpu_pipeline_task.hpp"
 
 #include "cuda/device_health.hpp"
+#include "cuda/gpu_completion.hpp"
 #include "cudf/cudf_utils.hpp"
 #include "helper/cuda_launch_error.hpp"
 #include "late_mat/port_materialize.hpp"
@@ -225,36 +226,31 @@ std::unique_ptr<op::operator_data> materialize_deferred_input(
                              std::to_string(op.get_operator_id()) +
                              " received an input whose leases do not match its batches");
   }
-  std::vector<std::shared_ptr<cucascade::data_batch>> output;
-  output.reserve(originals.size());
-  std::size_t next = 0;
-  for (auto const& original : originals) {
-    if (!original) {
-      output.push_back(nullptr);
-      continue;
+  auto output = std::make_unique<std::vector<std::shared_ptr<cucascade::data_batch>>>();
+  output->reserve(originals.size());
+  try {
+    std::size_t next = 0;
+    for (auto const& original : originals) {
+      if (!original) {
+        output->push_back(nullptr);
+        continue;
+      }
+      auto const i  = next++;
+      auto* space   = batches[i].get_memory_space();
+      auto restored = late_mat::materialize_at_port(
+        directive, views[i], stream, space->get_default_allocator(), {space, host_staging_space});
+      output->push_back(
+        sirius::make_data_batch(std::move(restored), *space, stream, op.batch_telemetry()));
     }
-    auto const i  = next++;
-    auto* space   = batches[i].get_memory_space();
-    auto restored = late_mat::materialize_at_port(
-      directive, views[i], stream, space->get_default_allocator(), {space, host_staging_space});
-    output.push_back(
-      sirius::make_data_batch(std::move(restored), *space, stream, op.batch_telemetry()));
-  }
-  return input->with_batches_preserving_rows(std::move(output));
-}
-
-/// Quiesce work already submitted to a task stream without replacing the exception being handled.
-void synchronize_after_exception(::cuda::stream_ref stream, const sirius_pipeline* pipeline)
-{
-  auto const status = cudaStreamSynchronize(stream.get());
-  check_cuda_health(status);
-  if (status != cudaSuccess) {
-    SIRIUS_LOG_WARN(
-      "Pipeline {}: stream synchronization while handling an exception failed: "
-      "[{}] {}",
-      pipeline->get_pipeline_id(),
-      static_cast<int>(status),
-      cudaGetErrorString(status));
+    // Keep a second owner until construction succeeds, including allocation failures.
+    return input->with_batches_preserving_rows(*output);
+  } catch (...) {
+    if (is_unjoined_gpu_work(std::current_exception()) ||
+        !join_gpu_work(stream, gpu_completion_point::failure)) {
+      retain_unjoined_owner(output);
+      throw unjoined_gpu_work{};
+    }
+    throw;
   }
 }
 
@@ -282,63 +278,21 @@ std::unique_ptr<op::operator_data> run_one_operator(
     materialized = materialize_deferred_input(op, operator_input_data, stream, host_staging_space);
     auto const& effective_input = materialized ? *materialized : operator_input_data;
     operator_output_data        = op.execute(effective_input, stream);
-  } catch (const std::exception& ex) {
-    // Both the original input and any restored deferred input are still alive here. Quiesce the
-    // stream before rethrowing lets their owners unwind only after their last GPU reader finishes.
-    synchronize_after_exception(stream, pipeline);
-    auto sticky_err = cudaGetLastError();
-    check_cuda_health(sticky_err);
-    if (sticky_err != cudaSuccess) {
-      SIRIUS_LOG_WARN("Pipeline {}: {} (id={}) threw + left sticky CUDA error: [{}] {} — clearing",
-                      pipeline->get_pipeline_id(),
-                      op.get_name(),
-                      op.get_operator_id(),
-                      static_cast<int>(sticky_err),
-                      cudaGetErrorString(sticky_err));
-    }
-    SIRIUS_LOG_WARN("Pipeline {}: {} (id={}) threw during input materialization or execute: {}",
-                    pipeline->get_pipeline_id(),
-                    op.get_name(),
-                    op.get_operator_id(),
-                    ex.what());
-    throw;
+    auto sticky                 = cudaGetLastError();
+    if (!join_gpu_work(stream, gpu_completion_point::execute)) throw unjoined_gpu_work{};
+    check_cuda_health(sticky);
+    if (sticky != cudaSuccess)
+      throw std::runtime_error(std::string("CUDA operator failed: ") + cudaGetErrorName(sticky));
   } catch (...) {
-    synchronize_after_exception(stream, pipeline);
-    auto sticky_err = cudaGetLastError();
-    check_cuda_health(sticky_err);
-    if (sticky_err != cudaSuccess) {
-      SIRIUS_LOG_WARN("Pipeline {}: {} (id={}) threw + left sticky CUDA error: [{}] {} — clearing",
-                      pipeline->get_pipeline_id(),
-                      op.get_name(),
-                      op.get_operator_id(),
-                      static_cast<int>(sticky_err),
-                      cudaGetErrorString(sticky_err));
+    auto error = std::current_exception();
+    if (is_unjoined_gpu_work(error) || !join_gpu_work(stream, gpu_completion_point::failure)) {
+      retain_unjoined_owner(operator_output_data);
+      retain_unjoined_owner(materialized);
+      throw unjoined_gpu_work{};
     }
-    SIRIUS_LOG_WARN(
-      "Pipeline {}: {} (id={}) threw a non-standard exception during input materialization or "
-      "execute",
-      pipeline->get_pipeline_id(),
-      op.get_name(),
-      op.get_operator_id());
+    check_cuda_health(cudaGetLastError());
     throw;
   }
-  if (auto sticky_err = cudaGetLastError(); sticky_err != cudaSuccess) {
-    check_cuda_health(sticky_err);
-    SIRIUS_LOG_WARN(
-      "Pipeline {}: {} (id={}) left a sticky CUDA error after execute: [{}] {} — clearing",
-      pipeline->get_pipeline_id(),
-      op.get_name(),
-      op.get_operator_id(),
-      static_cast<int>(sticky_err),
-      cudaGetErrorString(sticky_err));
-    throw std::runtime_error(std::string("CUDA operator failed: ") + cudaGetErrorName(sticky_err));
-  }
-
-  auto const stream_status = cudaStreamSynchronize(stream.get());
-  check_cuda_health(stream_status);
-  if (stream_status != cudaSuccess)
-    throw std::runtime_error(std::string("CUDA stream completion failed: ") +
-                             cudaGetErrorName(stream_status));
   auto end      = std::chrono::high_resolution_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
 
@@ -519,6 +473,10 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(::cuda::strea
         operators.size(),
         _allocator,
         _global_state->cast<gpu_pipeline_task_global_state>().get_host_staging_space());
+    } catch (unjoined_gpu_work const&) {
+      _unsafe_completion = true;
+      retain_unjoined_owner(operator_input_output_data);
+      throw;
     } catch (const rmm::out_of_memory& oom) {
       auto peak_bytes = _allocator ? _allocator->get_peak_allocated_bytes(stream) : 0;
       // Subtract the peak allocated bytes to the input data to get the peak allocated bytes for the
@@ -629,8 +587,19 @@ void gpu_pipeline_task::publish_output(op::operator_data& output_data, ::cuda::s
 {
   // Interface entry point: restore and publish as one step. gpu_pipeline_task::execute takes the
   // two-step overload instead, so it can bound the OOM-reschedule window to the restoration.
-  auto materialized = materialize_sink_input(output_data, stream);
-  publish_output(output_data, materialized.get(), stream);
+  std::unique_ptr<op::operator_data> materialized;
+  try {
+    materialized = materialize_sink_input(output_data, stream);
+    publish_output(output_data, materialized.get(), stream);
+    if (!join_gpu_work(stream, gpu_completion_point::sink)) throw unjoined_gpu_work{};
+  } catch (...) {
+    if (is_unjoined_gpu_work(std::current_exception()) ||
+        !join_gpu_work(stream, gpu_completion_point::failure)) {
+      retain_unjoined_owner(materialized);
+      throw unjoined_gpu_work{};
+    }
+    throw;
+  }
 }
 
 void gpu_pipeline_task::publish_output(op::operator_data& output_data,
@@ -699,8 +668,8 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
   auto* allocator = reservation->get_memory_resource_of<cucascade::memory::Tier::GPU>();
   allocator->attach_reservation_to_tracker(
     stream, std::move(reservation), nullptr, std::make_unique<memory::defragmenter_oom_policy>());
-  absl::Cleanup source_closer = [allocator, stream]() {
-    allocator->reset_stream_reservation(stream);
+  absl::Cleanup source_closer = [this, allocator, stream]() {
+    if (!_unsafe_completion) allocator->reset_stream_reservation(stream);
   };
 
   if (!local_state._input_data) {
@@ -732,10 +701,18 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
            .data   = {.bytes = _reservation_bytes},
      }});
   try {
-    local_state._input_data->prepare_for_processing(requested_memory_space, stream);
-    // synchronizing here to ensure the timing collected by Quent and logging for preparing the task
-    // is accurate.
-    stream.sync();
+    try {
+      local_state._input_data->prepare_for_processing(requested_memory_space, stream);
+      if (!join_gpu_work(stream, gpu_completion_point::prepare)) throw unjoined_gpu_work{};
+    } catch (...) {
+      if (is_unjoined_gpu_work(std::current_exception()) ||
+          !join_gpu_work(stream, gpu_completion_point::failure)) {
+        _unsafe_completion = true;
+        retain_unjoined_owner(local_state._input_data);
+        throw unjoined_gpu_work{};
+      }
+      throw;
+    }
   } catch (const rmm::out_of_memory& oom) {
     auto peak_bytes = allocator->get_peak_allocated_bytes(stream);
     std::optional<std::size_t> retry_requested_bytes;
@@ -803,6 +780,7 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
       try {
         materialized = materialize_sink_input(*output_data, stream);
       } catch (const rmm::out_of_memory& oom) {
+        if (!join_gpu_work(stream, gpu_completion_point::failure)) throw unjoined_gpu_work{};
         auto peak_bytes = _allocator ? _allocator->get_peak_allocated_bytes(stream) : 0;
         auto const bytes_to_materialize_input =
           local_state.get_reservation_size_info()->bytes_to_materialize_input;
@@ -834,6 +812,8 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
       }
       publish_output(*output_data, materialized.get(), stream);
     }
+
+    if (!join_gpu_work(stream, gpu_completion_point::sink)) throw unjoined_gpu_work{};
 
     // Record memory metrics for future reservation estimates. Measured after publish_output, not
     // before: peak_allocated_bytes is a running high-water mark for the whole stream, so recording
@@ -876,16 +856,16 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
         peak_bytes,
         local_state.get_reservation_size_info()->bytes_to_materialize_input);
     }
-
-    stream.sync();
   } catch (...) {
-    // output_data and materialized were declared outside this try, so they remain alive until
-    // every sink/finalization enqueue on the task stream has quiesced.
-    synchronize_after_exception(stream, pipeline);
+    if (is_unjoined_gpu_work(std::current_exception()) ||
+        !join_gpu_work(stream, gpu_completion_point::failure)) {
+      _unsafe_completion = true;
+      retain_unjoined_owner(output_data);
+      retain_unjoined_owner(materialized);
+      throw unjoined_gpu_work{};
+    }
     throw;
   }
-
-  // Both normal and exceptional exits quiesce the stream before task-owned data is destroyed.
 }
 
 std::size_t gpu_pipeline_task::get_input_size() const

@@ -670,3 +670,34 @@ TEST_CASE("first fatal runtime cause survives query retirement without retaining
   CHECK(registry.diagnostics().front().error == "earlier query-local failure");
   CHECK(registry.runtime_failure_message() == cause);
 }
+
+TEST_CASE("unjoined GPU work closes admission without releasing query resources",
+          "[query_lifecycle_gate][device_health][unsafe_completion]")
+{
+  query_lifecycle_registry registry;
+  auto first  = make_query_id(1);
+  auto second = make_query_id(2);
+  registry.open_query(first);
+  registry.open_query(second);
+  auto work               = registry.try_begin_submission(first);
+  auto resource           = std::make_shared<int>(42);
+  std::weak_ptr<int> weak = resource;
+  registry.retain_resources(first, std::move(resource));
+  auto error = std::make_exception_ptr(sirius::unjoined_gpu_work{});
+  REQUIRE(registry.report_failure(error, first));
+  REQUIRE(registry.runtime_failed());
+  REQUIRE(registry.unsafe_completion());
+  REQUIRE_FALSE(registry.runtime_failure_message().empty());
+  REQUIRE_FALSE(registry.accepts_work(first));
+  REQUIRE_FALSE(registry.accepts_work(second));
+  REQUIRE_THROWS_AS(registry.open_query(make_query_id(3)),
+                    query_lifecycle_registry::runtime_unavailable_error);
+  work.finish();
+  registry.wait_for_work(first);
+  // Host workers draining does not prove that their submitted GPU work completed.
+  REQUIRE_THROWS_AS(registry.release_resources(first), sirius::unjoined_gpu_work);
+  REQUIRE_THROWS_AS(registry.close(first), sirius::unjoined_gpu_work);
+  REQUIRE_THROWS_AS(registry.clear(), sirius::unjoined_gpu_work);
+  REQUIRE_FALSE(weak.expired());
+  REQUIRE(registry.size() == 2);
+}
