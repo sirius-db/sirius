@@ -26,6 +26,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <limits>
+#include <system_error>
 
 namespace sirius::op::scan {
 namespace sm = scan_manager;
@@ -323,7 +324,9 @@ arrow_production arrow_push_queue::next(admitted_arrow_input admitted,
   {
     std::lock_guard lock(impl_->mutex);
     if (impl_->error) std::rethrow_exception(impl_->error);
-    if (impl_->cancelled || stop.stop_requested()) throw duckdb::InterruptException();
+    if (stop.stop_requested())
+      throw std::system_error(std::make_error_code(std::errc::operation_canceled));
+    if (impl_->cancelled) throw duckdb::InterruptException();
     if (impl_->closed) throw std::logic_error("Arrow queue is closed");
     if (!impl_->input) {
       if (impl_->finished) return arrow_end_of_stream{};
@@ -337,7 +340,9 @@ arrow_production arrow_push_queue::next(admitted_arrow_input admitted,
     {
       std::lock_guard lock(impl_->mutex);
       if (impl_->error) std::rethrow_exception(impl_->error);
-      if (impl_->cancelled || stop.stop_requested()) throw duckdb::InterruptException();
+      if (stop.stop_requested())
+        throw std::system_error(std::make_error_code(std::errc::operation_canceled));
+      if (impl_->cancelled) throw duckdb::InterruptException();
       if (impl_->closed) throw std::logic_error("Arrow queue closed during copy");
       impl_->consumed = true;
     }
@@ -345,6 +350,12 @@ arrow_production arrow_push_queue::next(admitted_arrow_input admitted,
     return produced_arrow_input{std::move(batch), {}};
   } catch (duckdb::InterruptException const&) {
     cancel();
+    throw;
+  } catch (std::system_error const& error) {
+    if (stop.stop_requested() && error.code() == std::errc::operation_canceled)
+      cancel();
+    else
+      fail(std::current_exception());
     throw;
   } catch (...) {
     fail(std::current_exception());

@@ -56,8 +56,10 @@ class arrow_batch_producer {
   virtual arrow_producer_limits limits() const                                         = 0;
   virtual void preflight()                                                             = 0;
   // Cached host bookkeeping only: neither observation nor wake binding enters a reader.
-  virtual arrow_readiness readiness() const noexcept                                        = 0;
-  virtual void bind_wakeup(scan_manager::preparation_wakeup)                                = 0;
+  virtual arrow_readiness readiness() const noexcept         = 0;
+  virtual void bind_wakeup(scan_manager::preparation_wakeup) = 0;
+  // Token-driven stops use system_error(operation_canceled); the coordinator decides
+  // whether the attempt ended normally or failed.
   virtual arrow_production next(admitted_arrow_input, scan_manager::preparation_stop_token) = 0;
   // Runs on the execution domain (control thread for metadata_worker).
   virtual void close() = 0;
