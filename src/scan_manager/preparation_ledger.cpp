@@ -136,8 +136,10 @@ void erase_retired(ledger_state& ledger, unit_key key)
 {
   auto it = ledger.units.find(key);
   if (it != ledger.units.end() && it->second.retired && !it->second.retained &&
-      it->second.permit.expired())
+      it->second.permit.expired()) {
+    ledger.registered -= it->second.retained_limit;
     ledger.units.erase(it);
+  }
 }
 }  // namespace
 struct permit_state {

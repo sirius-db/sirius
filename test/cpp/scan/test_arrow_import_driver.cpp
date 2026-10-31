@@ -116,6 +116,7 @@ class pull_producer final : public arrow_batch_producer {
  public:
   std::vector<int> rows{3};
   std::function<void()> on_normalize;
+  std::function<void()> before_next;
   std::function<void(ArrowSchema&, ArrowArray&)> observe_tree;
   sm::unit_envelope envelope{{8192}, 0};
   uint64_t temporary_probe_before = 0, temporary_probe_after = 0;
@@ -139,6 +140,7 @@ class pull_producer final : public arrow_batch_producer {
     if (owner != std::this_thread::get_id()) throw std::logic_error("wrong pull owner");
     ++calls;
     if (cancelled || stop.stop_requested()) throw duckdb::InterruptException();
+    if (before_next) before_next();
     if (fail_read) throw std::runtime_error("pull failed");
     if (cursor == rows.size()) return arrow_end_of_stream{};
     // Probes retire before next() returns: post-return accounting cannot catch them.
@@ -412,8 +414,12 @@ TEST_CASE("Arrow driver rejects foreign read identity and schema drift", "[arrow
   {
     std::stop_source stop;
     stop.request_stop();
-    CHECK_THROWS_AS(h.next(sm::preparation_stop_token(stop.get_token())),
-                    duckdb::InterruptException);
+    try {
+      h.next(sm::preparation_stop_token(stop.get_token()));
+      FAIL("stopped input was accepted");
+    } catch (std::system_error const& error) {
+      CHECK(error.code() == std::errc::operation_canceled);
+    }
     CHECK(producer->calls == 0);
     CHECK(h.driver->create_batch_coalescer()->flush().empty());
   }
@@ -1226,7 +1232,8 @@ TEST_CASE("Arrow failed completion retains real backing and its caller resource 
     caller.reset();
     CHECK_FALSE(lifetime.expired());
     // The retained import now owns the only path to the caller's allocator and stream.
-    // Its table is destroyed before the retirement lane's final barrier and input owner.
+    // The injected failure followed a real import barrier. Destruction releases the
+    // table before the lane and input owner; an idle lane adds no final barrier.
   }
   CHECK(lifetime.expired());
 }
@@ -1280,6 +1287,120 @@ TEST_CASE("Arrow producers cannot borrow another scans larger temporary envelope
     CHECK(h.ledger->permits_in_flight() == 1);
     input.reset();
   }
+  CHECK_FALSE(h.gate->active.load());
+  CHECK(h.ledger->permits_in_flight() == 0);
+  CHECK(h.ledger->tracked_units() == 0);
+  CHECK(h.backing.seen->allocated_bytes == 0);
+}
+
+TEST_CASE("Arrow retained budgets are reusable through end of stream",
+          "[arrow_driver][arrow_retained]")
+{
+  auto producer               = std::make_shared<pull_producer>();
+  producer->envelope.retained = 64;
+  producer->rows              = {2, 2};
+  SECTION("one batch") { producer->rows = {2}; }
+  SECTION("multiple batches") {}
+  harness h(producer);
+  for (size_t i = 0; i < producer->rows.size(); ++i) {
+    auto input = h.next();
+    REQUIRE(input);
+    auto retained = dynamic_cast<owned_arrow_scan_info&>(*input).coalesced_copy();
+    input.reset();
+    CHECK(std::holds_alternative<sm::preparation_pending>(h.driver->try_claim_split({})));
+    retained.reset();
+    CHECK(h.ledger->tracked_units() == 0);
+    CHECK(h.ledger->permits_in_flight() == 0);
+  }
+  CHECK_FALSE(h.next());
+  CHECK(h.ledger->tracked_units() == 0);
+  CHECK(h.backing.seen->allocated_bytes == 0);
+}
+
+TEST_CASE("Arrow in-flight reads preserve coordinator stop intent", "[arrow_driver][arrow_stop]")
+{
+  auto push   = GENERATE(false, true);
+  auto reason = GENERATE(
+    sm::stop_reason::normal_eos, sm::stop_reason::user_cancel, sm::stop_reason::failure_induced);
+  auto read_fails = GENERATE(false, true);
+  sirius::test::preparation::hold reading;
+  std::atomic<int> failures{0};
+  auto pull    = std::make_shared<pull_producer>();
+  pull->rows   = {3, 3};
+  pull->domain = sm::preparation_execution_domain::native_reader;
+  auto q       = queue(integer_program(), [&](auto) { ++failures; });
+  std::shared_ptr<arrow_batch_producer> producer =
+    push ? std::static_pointer_cast<arrow_batch_producer>(q)
+         : std::static_pointer_cast<arrow_batch_producer>(pull);
+  harness h(producer);
+  int allocations = 0;
+  auto pause      = [&] {
+    reading.wait();
+    if (read_fails) throw std::runtime_error("read failed after stop");
+  };
+  pull->before_next = [&] {
+    if (pull->calls == 2) pause();
+  };
+  if (push)
+    h.backing.seen->before_allocate = [&] {
+      if (++allocations == 2) pause();
+    };
+  std::future<void> submitting;
+  sirius::exec::static_thread_pool pool(2);
+  sirius::exec::scoped_dispatcher dispatcher(pool);
+  sirius::pipeline::completion_handler completion;
+  sm::native_reader_executor readers(1, 1);
+  sm::preparation_coordinator coordinator(completion, dispatcher, {2, 2, 2, 1}, &readers);
+  auto lane      = h.driver->make_preparation_source({});
+  auto connector = std::make_shared<sm::split_connector>();
+  sm::preparation_coordinator::source source;
+  source.execution   = lane.execution;
+  source.try_claim   = std::move(lane.try_claim);
+  source.close       = std::move(lane.close);
+  source.bind_wakeup = std::move(lane.bind_wakeup);
+  source.coalescer   = std::move(lane.coalescer);
+  source.destination = connector;
+  source.construct   = [](auto metadata) {
+    auto bytes = metadata->preparation_bytes();
+    return sirius::test::preparation::make_publication(std::move(metadata), bytes);
+  };
+  std::atomic<int> publications{0};
+  coordinator.after_publication_for_testing([&](auto, auto const&, auto) { ++publications; });
+  coordinator.add_source(std::move(source));
+  if (push)
+    submitting = std::async(std::launch::async, [&] {
+      auto owner = std::make_shared<integer_tree>();
+      if (q->offer(owner->offer(owner))) (void)q->offer(owner->offer(owner));
+    });
+  coordinator.arm();
+  coordinator.start();
+  bool entered  = false;
+  auto deadline = std::chrono::steady_clock::now() + 4s;
+  while (std::chrono::steady_clock::now() < deadline) {
+    coordinator.advance(1ms);
+    if (connector->has_more_splits()) (void)connector->get_next_split();
+    {
+      std::lock_guard lock(reading.mutex);
+      entered = reading.entered;
+    }
+    if (entered || completion.has_error()) break;
+  }
+  if (reason == sm::stop_reason::failure_induced)
+    completion.report_error(std::make_exception_ptr(std::runtime_error("original failure")));
+  coordinator.request_stop(reason);
+  reading.release();
+  coordinator.drain();
+  q->cancel();
+  if (submitting.valid()) submitting.get();
+  REQUIRE(entered);
+  CHECK(publications == 1);
+  CHECK(completion.has_error() == (read_fails || reason != sm::stop_reason::normal_eos));
+  if (reason == sm::stop_reason::user_cancel)
+    CHECK_THROWS_AS(std::rethrow_exception(completion.terminal_error()),
+                    duckdb::InterruptException);
+  if (reason == sm::stop_reason::failure_induced)
+    CHECK_THROWS_WITH(std::rethrow_exception(completion.terminal_error()), "original failure");
+  CHECK(failures == (push && read_fails ? 1 : 0));
   CHECK_FALSE(h.gate->active.load());
   CHECK(h.ledger->permits_in_flight() == 0);
   CHECK(h.ledger->tracked_units() == 0);

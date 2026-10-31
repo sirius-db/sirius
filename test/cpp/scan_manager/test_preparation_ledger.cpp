@@ -1616,3 +1616,36 @@ TEST_CASE("Temporary envelope rounding rejects arithmetic overflow", "[scan_prep
   unit_envelope sum{{UINT64_MAX - 7, 8}, 0};
   CHECK_THROWS_AS(sum.temporary_charge(8), std::overflow_error);
 }
+
+TEST_CASE("Retirement returns rounded retained allowance after its final owner",
+          "[scan_preparation][ledger][retained_reuse]")
+{
+  auto retained_first = GENERATE(false, true);
+  test_reservation_provider provider;
+  provider.quantum     = 8;
+  provider.grant_bytes = 24;
+  preparation_ledger ledger(provider);
+  std::array scans{scan_envelope{{{{8}, 9}}, {}, true}};
+  REQUIRE(ledger.admit(scans, host).deferred);
+  auto permit   = ledger.try_acquire_unit({1, 0}, 9);
+  auto retained = ledger.allocator(permit).allocate_retained(1);
+  ledger.retire_unit({1, 0});
+  ledger.retire_unit({1, 0});
+  if (retained_first) {
+    retained.release();
+    CHECK(ledger.tracked_units() == 1);
+    permit.release();
+  } else {
+    permit.release();
+    CHECK(ledger.tracked_units() == 1);
+    CHECK_THROWS_AS(ledger.try_acquire_unit({1, 1}, 9), std::invalid_argument);
+    retained.release();
+  }
+  CHECK(ledger.tracked_units() == 0);
+  auto next = ledger.try_acquire_unit({1, 1}, 9);
+  REQUIRE(next);
+  ledger.retire_unit({1, 1});
+  next.release();
+  CHECK(ledger.tracked_units() == 0);
+  CHECK(provider.seen->allocated_bytes == 0);
+}

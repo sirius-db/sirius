@@ -27,6 +27,7 @@
 #include <duckdb/common/exception.hpp>
 
 #include <limits>
+#include <system_error>
 
 namespace sirius::op::scan {
 namespace scan = sirius::op::scan;
@@ -181,12 +182,14 @@ struct arrow_import_ingestible::impl {
   std::unique_ptr<scan_info> produce(std::shared_ptr<input_claim> const& claim,
                                      sm::preparation_stop_token stop)
   {
+    if (stop.stop_requested())
+      throw std::system_error(std::make_error_code(std::errc::operation_canceled));
     check_stop();
-    if (stop.stop_requested()) throw duckdb::InterruptException();
     auto result =
       producer->next({claim->key, claim->ledger->allocator(claim->permit), claim}, stop);
+    if (stop.stop_requested())
+      throw std::system_error(std::make_error_code(std::errc::operation_canceled));
     check_stop();
-    if (stop.stop_requested()) throw duckdb::InterruptException();
     if (std::holds_alternative<arrow_end_of_stream>(result)) {
       state->eos_sequence = claim->key.unit_id;
       state->eos          = true;
