@@ -146,9 +146,9 @@ Plain Parquet virtual-only queries with no physical value dependency or potentia
 
 `iceberg_gpu_ingestible` composes `parquet_scan_core` and supplies schema mapping and delete preparation. Matching schemas retain the existing reader and pruning; eligible evolved files use `iceberg_flat_v1` mapping before deletion and residual filtering. Virtual-column scans use one cuDF read per split, separating reader indices from physical fields before mapping and output assembly.
 
-Positional deletes and deletion vectors identify original rows **within a data file**. Safe reader comparisons or AST-capable dynamic filters can run before deletion using cuDF's original UINT64 row indices. Virtual columns reuse those indices; source indices are needed only for multiple sources, and paths remain per source. The GPU delete operation validates source/range bindings and releases hidden positions before gathering survivors.
+Positional deletes and deletion vectors identify original rows **within a data file**. On qualified virtual-column scans, safe reader comparisons or AST-capable dynamic filters can run before deletion using cuDF's original UINT64 row indices. Virtual columns reuse those indices; source indices are needed only for multiple sources, and paths remain per source. The GPU delete operation validates source/range bindings and releases hidden positions before gathering survivors. A filename-only query may need additional row indices for delete matching after reader filtering.
 
-Without virtual columns, hidden indices require deletes in selected row groups and an actual reader filter. Their workspace qualifies after normal batching only if the estimate fits a finite cap; it does not force extra splits or earlier timed emission. A pending dynamic filter may reserve workspace without allocating indices. Bulk/hybrid, mapped, Hive and unsafe-type routes retain pushdown suppression. Virtual scans preserve unsafe-expression evaluation even with empty delete sets. Without reader selection, deletion uses the existing interval mapping and rejects filtered rows without positions. See [working-set accounting](memory-management.md#parquet-scan-working-sets).
+Without virtual columns, scans carrying deletes suppress reader filtering and use interval deletion before query predicates. They add no internal position columns, alternative position budget or position-filter snapshot. Scans without deletes retain their existing reader filtering. Bulk/hybrid, mapped, Hive and unsafe-type routes retain their existing restrictions. Virtual scans preserve unsafe-expression evaluation even with empty delete sets. Without reader selection, deletion uses the existing interval mapping and rejects filtered rows without positions. See [working-set accounting](memory-management.md#parquet-scan-working-sets).
 
 Row mapping is a **list of runs, not one offset**. `build_batch_layout` emits one `batch_row_run` per (file, row group), because splits span files and pruning leaves gaps; the decoded row count must equal the sum of run rows or it throws.
 
@@ -453,7 +453,7 @@ the direct column-merge API also rejects a merge while readers retain the existi
 
 When many small files (or row-group ranges) each yield a tiny GPU batch, per-task scheduling and kernel-launch overhead dominates. Coalescing is a responsibility of each `gpu_ingestible`, exposed through the `batch_coalescer` interface (`op/scan/batch_coalescer.hpp`): as the metadata side emits per-unit `scan_info`s, the sequencer feeds each one to the coalescer via `push()` (which may buffer and return zero or more ready batches) and `flush()` (remaining buffered batches at end of input).
 
-- **`parquet_batch_coalescer`** (in `parquet_scan_core.cpp`): accumulates each file's pruned row groups into `parquet_split_info` batches sized to `approximate_batch_size` decoded column-buffer bytes, including filter-only columns. A single large file fills multiple batches; several small files bundle into one batch — but only when they share identical hive-partition values and the same pushdown decision (a mismatch on either forces a flush). It also seals a batch before it would exceed `cudf::size_type` rows. The downstream `cudf::io::read_parquet` reads all bundled slices in one invocation, including virtual-column scans. Different internal position demands also separate batches.
+- **`parquet_batch_coalescer`** (in `parquet_scan_core.cpp`): accumulates each file's pruned row groups into `parquet_split_info` batches sized to `approximate_batch_size` decoded column-buffer bytes, including filter-only columns. A single large file fills multiple batches; several small files bundle into one batch — but only when they share identical hive-partition values and the same pushdown decision (a mismatch on either forces a flush). It also seals a batch before it would exceed `cudf::size_type` rows. The downstream `cudf::io::read_parquet` reads all bundled slices in one invocation, including virtual-column scans. Different delete-position demands on virtual scans also separate batches.
 - **`duckdb_native_batch_coalescer`** (in `duckdb_native_gpu_ingestible.cpp`): accumulates row-group ranges up to `approximate_batch_size` decoded bytes, and additionally seals a batch before any VARCHAR column's accumulated bytes would cross the cuDF int32 string-offset threshold.
 
 The coalescer runs inside the per-query sequencer (`load_balancing_scan_batch_coalescer`), so coalescing, device balancing, and prefetch hinting happen at one place per emitted batch.
@@ -732,6 +732,21 @@ The converter builds a `gpu_ingestible` and parks it on the `GPU_SCAN` operator.
 `parquet_gpu_ingestible` and `iceberg_gpu_ingestible` share `parquet_scan_core`.
 Iceberg supplies snapshot/delete applicability and delegates masking to
 `positional_visibility`, using either reader positions or unfiltered input runs.
+Iceberg scans without user-requested virtual columns retain unfiltered reader
+output and apply interval deletion before query predicates whenever deletes are
+present. They request no internal row/source indices or position workspace.
+Virtual-column scans retain one cuDF read per split and request provenance on
+demand; qualified reader filtering may also supply positions for delete matching.
+Position demand follows the split's selected row groups. When their ranges contain
+no deletes, the adapter verifies that fact against the bound delete sets and records
+visibility as complete without hidden indices or a delete mask. Requested virtual
+columns remain independent of this decision. This also preserves eligible reader
+filtering when footer pruning removed every delete-bearing row group.
+These splits capture dynamic filters at emission.
+Admission and decode use that snapshot and the target device's reader capability;
+pending or inapplicable filters add no internal position workspace. Late filters
+remain available to downstream dynamic-filter consumers. Static reader predicates
+and explicitly requested virtual columns continue to drive their own work.
 
 `finish_materialization()` orders mapping, visibility, residual evaluation and
 projection. `scan_execution_record` binds completed work to the scan contract,

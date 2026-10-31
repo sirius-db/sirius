@@ -304,6 +304,13 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
     return estimated_bytes();
   }
 
+  /// Refine execution workspace for the task's target device, without changing
+  /// the additive preparation charge or observing new execution decisions.
+  [[nodiscard]] virtual std::size_t estimated_working_set_bytes_for_device(int) const noexcept
+  {
+    return estimated_working_set_bytes();
+  }
+
  private:
   /// Fan-in for @ref prefetch: counts the per-datasource completions down to a
   /// single report.  Shared by every callback, so it outlives the call that

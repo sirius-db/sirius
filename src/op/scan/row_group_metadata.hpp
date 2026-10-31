@@ -74,8 +74,6 @@ struct row_group_slice {
   std::shared_ptr<io::sirius_datasource> datasource;
   /// Stable position in DuckDB's bound file list.
   std::size_t file_index;
-  // Optional alternative estimate; never controls the legacy grouping boundary.
-  std::size_t estimated_position_working_bytes = 0;
 };
 
 //===----------------------------------------------------------------------===//

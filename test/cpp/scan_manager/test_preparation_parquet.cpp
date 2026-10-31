@@ -24,9 +24,8 @@ using namespace sirius::scan_manager;
 using namespace sirius::test::preparation;
 using namespace std::chrono_literals;
 
-constexpr size_t cap            = size_t{64} << 20;
-constexpr size_t input_bytes    = 26825000;
-constexpr size_t position_bytes = 56150936;
+constexpr size_t cap         = size_t{64} << 20;
+constexpr size_t input_bytes = 26825000;
 
 // Delegate all sizing and batching to production; replace only its retention clock.
 struct clocked_parquet_coalescer : scan::batch_coalescer {
@@ -141,8 +140,6 @@ struct parquet_preparation : fixture {
             1, {{.contract_id = 1, .split_id = 0, .input_identity = file->file_path}}, {{}});
           for (int group : {0, 1}) {
             file->row_groups.push_back({group, input_bytes / 2, input_bytes / 2, 10, 50000});
-            file->row_groups.back().position_working_bytes = (position_bytes + 8 * 100000) / 2;
-            file->row_groups.back().selected_deletes       = 1;
           }
           return file;
         },
@@ -155,7 +152,7 @@ struct parquet_preparation : fixture {
 };
 }  // namespace
 
-TEST_CASE("Iceberg position consumption preserves preparation progress",
+TEST_CASE("Iceberg interval deletion preserves preparation progress",
           "[scan][scan_preparation][coordinator][row_positions]")
 {
   parquet_preparation f(GENERATE(1u, 100u));
@@ -169,8 +166,8 @@ TEST_CASE("Iceberg position consumption preserves preparation progress",
     std::lock_guard lock(f.out->mutex);
     REQUIRE(f.observed.size() == 1);
     CHECK(f.observed[0].preparation == input_bytes);
-    CHECK(f.observed[0].execution == position_bytes);
-    CHECK(f.observed[0].positions);
+    CHECK(f.observed[0].execution == input_bytes);
+    CHECK_FALSE(f.observed[0].positions);
   }
   f.out->consume();
   f.available = 3;  // Permit the next file and EOS only after consuming the first split.
@@ -183,15 +180,15 @@ TEST_CASE("Iceberg position consumption preserves preparation progress",
   std::lock_guard lock(f.out->mutex);
   REQUIRE(f.observed.size() == 2);
   CHECK(f.observed[1].preparation == input_bytes);
-  CHECK(f.observed[1].execution == position_bytes);
-  CHECK(f.observed[1].positions);
+  CHECK(f.observed[1].execution == input_bytes);
+  CHECK_FALSE(f.observed[1].positions);
 }
 
 TEST_CASE("Delayed Iceberg metadata uses legacy fill for timed batching",
           "[scan][scan_preparation][coordinator][row_positions][partial_batch]")
 {
   // Process each two-RG file together: a partial cursor can legitimately reach
-  // half-cap and flush between RGs under both old and new execution strategies.
+  // half-cap and flush between RGs.
   parquet_preparation f(GENERATE(2u, 100u));
   std::promise<void> parked;
   auto reached = parked.get_future();
@@ -202,7 +199,7 @@ TEST_CASE("Delayed Iceberg metadata uses legacy fill for timed batching",
   auto guard = f.shutdown_guard();
   f.start();
   REQUIRE(f.retained->await());
-  f.milliseconds = 150;  // Default 50 ms minimum: only the position peak exceeds half-cap.
+  f.milliseconds = 150;  // Default 50 ms minimum: this batch remains below half-cap.
   watch          = true;
   f.retained->release();
   REQUIRE(reached.wait_for(1s) == std::future_status::ready);
@@ -222,5 +219,5 @@ TEST_CASE("Delayed Iceberg metadata uses legacy fill for timed batching",
   CHECK(f.observed[0].files == 2);
   CHECK(f.observed[0].preparation == 2 * input_bytes);
   CHECK(f.observed[0].execution == 2 * input_bytes);
-  CHECK_FALSE(f.observed[0].positions);  // Combined position workspace cannot fit the cap.
+  CHECK_FALSE(f.observed[0].positions);
 }

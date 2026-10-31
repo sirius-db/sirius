@@ -430,26 +430,24 @@ TEST_CASE("parquet batches are capped by decode working set", "[scan][parquet][s
         2 * 60 + rows + masked.mvcc_keep_mask.view().size_bytes());
 }
 
-TEST_CASE("Internal positions qualify after legacy grouping without extra splits",
+TEST_CASE("Iceberg batches without virtual columns retain interval deletion budgets",
           "[scan][parquet][sizing][row_positions]")
 {
-  auto mode =
-    std::string(GENERATE("wide", "narrow", "cap", "unbounded", "missing", "empty", "overflow"));
+  auto const cap     = GENERATE(std::size_t{0}, std::size_t{100001}, std::size_t{250000});
+  auto const decoded = GENERATE(std::size_t{2000}, std::size_t{50000});
   bool const quantum = GENERATE(false, true);
-  CAPTURE(mode, quantum);
-  auto info                     = std::make_unique<scan::parquet_ingestible_table_info>();
-  info->names                   = {"x"};
-  info->returned_types          = {sirius::logical_type::make(sirius::type_id::INTEGER)};
-  info->column_ids              = {duckdb::ColumnIndex(0)};
-  info->projected_output_count  = 1;
-  info->contract_id             = 1;
-  info->approximate_batch_size  = mode == "cap" ? 100001 : mode == "unbounded" ? 0 : 250000;
-  auto reader                   = std::make_shared<scan::parquet_gpu_ingestible>(std::move(info),
+  CAPTURE(cap, decoded, quantum);
+  auto info                    = std::make_unique<scan::parquet_ingestible_table_info>();
+  info->names                  = {"x"};
+  info->returned_types         = {sirius::logical_type::make(sirius::type_id::INTEGER)};
+  info->column_ids             = {duckdb::ColumnIndex(0)};
+  info->projected_output_count = 1;
+  info->contract_id            = 1;
+  info->approximate_batch_size = cap;
+  auto reader                  = std::make_shared<scan::parquet_gpu_ingestible>(std::move(info),
                                                                scan::parquet_source_kind::ICEBERG);
-  auto coalescer                = reader->create_batch_coalescer();
-  std::size_t const decoded     = mode == "narrow" ? 2000 : 50000;
-  std::size_t const alternative = 2 * decoded + 33 * 100 + 128;
-  auto make_file                = [&](int index) {
+  auto coalescer               = reader->create_batch_coalescer();
+  auto make_file               = [&](int index) {
     auto file                     = std::make_unique<scan::parquet_file_scan_info>();
     file->file_index              = index;
     file->file_path               = std::to_string(index) + ".parquet";
@@ -457,11 +455,6 @@ TEST_CASE("Internal positions qualify after legacy grouping without extra splits
     file->set_contract_payload(
       1, {{.contract_id = 1, .split_id = 0, .input_identity = file->file_path}}, {{}});
     file->row_groups.push_back({0, decoded, decoded, 10, 100});
-    auto& group                  = file->row_groups.back();
-    group.position_working_bytes = mode == "overflow" ? std::numeric_limits<std::size_t>::max()
-                                                  : mode == "missing" && index ? 0
-                                                                               : alternative;
-    group.selected_deletes       = mode == "empty" ? 0 : 1;
     return file;
   };
   std::vector<std::unique_ptr<scan::scan_info>> batches;
@@ -480,24 +473,20 @@ TEST_CASE("Internal positions qualify after legacy grouping without extra splits
     }
   }
   REQUIRE(batches.empty());
-  bool const selected = mode == "wide" || mode == "narrow";
-  auto const expected = selected ? 2 * alternative : 2 * decoded;
   CHECK(coalescer->retained_bytes() == 2 * decoded);
   batches = coalescer->flush();
   REQUIRE(batches.size() == 1);
   auto const& split = dynamic_cast<scan::parquet_split_info const&>(*batches.front());
-  CHECK(split.requires_row_positions == selected);
-  CHECK(split.disable_filter_pushdown == !selected);
+  CHECK_FALSE(split.requires_row_positions);
+  CHECK(split.disable_filter_pushdown);
   CHECK(split.preparation_bytes() == 2 * decoded);
-  CHECK(split.estimated_working_set_bytes() == expected);
+  CHECK(split.estimated_working_set_bytes() == 2 * decoded);
   CHECK(coalescer->retained_bytes() == 0);
   CHECK(coalescer->push(make_file(0)).empty());
   auto tail = coalescer->flush();
   REQUIRE(tail.size() == 1);
-  bool const single_selected = mode == "wide" || mode == "narrow" || mode == "missing";
   CHECK(tail.front()->preparation_bytes() == decoded);
-  CHECK(tail.front()->estimated_working_set_bytes() ==
-        (single_selected ? alternative - 8 * 100 : decoded));
+  CHECK(tail.front()->estimated_working_set_bytes() == decoded);
 }
 
 TEST_CASE("parquet virtual batches reserve one reader result for either source mode",
@@ -527,8 +516,43 @@ TEST_CASE("parquet virtual batches reserve one reader result for either source m
       1, {{.contract_id = 1, .split_id = 0, .input_identity = "sizing.parquet"}}, {{}});
     file->row_groups.push_back({0, 20, 60, 10, 1});
     file->row_groups.push_back({1, 20, 60, 10, 1});
+    for (auto& group : file->row_groups)
+      group.requires_row_positions = reader_positions;
     return file;
   };
+
+  if (reader_positions) {
+    SECTION("split-local delete demand controls fill without changing preparation charges")
+    {
+      bool const delete_first                    = GENERATE(false, true);
+      auto reader                                = make_reader(100);
+      auto coalescer                             = reader->create_batch_coalescer();
+      auto file                                  = make_file();
+      file->static_reader_filter_ready           = true;
+      file->row_groups[0].requires_row_positions = delete_first;
+      file->row_groups[1].requires_row_positions = !delete_first;
+      for (auto& group : file->row_groups)
+        group.unfiltered_working_bytes = 40;
+      auto const registered = file->preparation_bytes();
+      std::size_t cursor    = 0;
+      auto first            = coalescer->advance(*file, cursor, 1);
+      CHECK_FALSE(first.batch);
+      CHECK(coalescer->retained_bytes() == (delete_first ? 60 : 40));
+      auto second = coalescer->advance(*file, cursor, 1);
+      REQUIRE(second.batch);  // A mixed batch would need positions for both groups: 120 > 100.
+      auto const& split = dynamic_cast<scan::parquet_split_info const&>(*second.batch);
+      CHECK(split.requires_row_positions == delete_first);
+      CHECK(split.estimated_working_set_bytes() == (delete_first ? 60 : 40));
+      CHECK(split.preparation_bytes() == 60);
+      CHECK(coalescer->retained_bytes() == 0);
+      CHECK(coalescer->advance(*file, cursor, 1).finished);
+      CHECK(coalescer->retained_bytes() == (delete_first ? 40 : 60));
+      auto tail = coalescer->flush();
+      REQUIRE(tail.size() == 1);
+      CHECK(tail.front()->estimated_working_set_bytes() == (delete_first ? 40 : 60));
+      CHECK(second.batch->preparation_bytes() + tail.front()->preparation_bytes() == registered);
+    }
+  }
 
   SECTION("reservation retains the complete reader working set")
   {

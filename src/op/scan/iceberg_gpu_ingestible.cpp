@@ -282,36 +282,23 @@ void attach_delete_set(parquet_file_scan_info& file,
     // Add 8 B/row selection scratch, a 1 B/row mask and payload coexistence.
     // Charge source indices conservatively: a later coalesced split may need them.
     for (std::size_t i = 0; i < file.row_groups.size(); ++i) {
-      auto& group = file.row_groups[i];
+      auto& group                  = file.row_groups[i];
+      group.requires_row_positions = selected_deletes[i] != 0;
       // Virtual scans already reserve payload coexistence, their requested
       // reader indices and selection scratch. Add only the missing indices.
-      auto const index_bytes = plan.has_user_virtual_columns()
-                                 ? std::size_t{16} * !virtual_row + std::size_t{8} * !virtual_source
-                                 : std::size_t{33};
-      auto const payload_bytes =
-        plan.has_user_virtual_columns()
-          ? group.decode_working_bytes
-          : memory::saturating_mul(group.decode_working_bytes, std::size_t{2});
+      auto const index_bytes    = std::size_t{16} * !virtual_row + std::size_t{8} * !virtual_source;
       auto const position_bytes = memory::saturating_add(
-        payload_bytes,
+        group.decode_working_bytes,
         memory::saturating_add(memory::saturating_mul(group.num_rows, index_bytes),
                                memory::saturating_mul(selected_deletes[i], sizeof(int64_t))));
-      if (file.defer_position_filter) {
-        // Bind the alternative before grouping, but do not split a legacy batch
-        // to accommodate it. The coalescer qualifies the complete working set.
-        group.position_working_bytes = memory::saturating_add(position_bytes, std::size_t{128});
-        group.selected_deletes       = selected_deletes[i];
-      } else {
-        group.decode_working_bytes = position_bytes;
-      }
+      group.unfiltered_working_bytes = group.decode_working_bytes;
+      group.decode_working_bytes     = position_bytes;
     }
-    if (file.defer_position_filter) {
-      file.requires_row_positions  = false;
-      file.disable_filter_pushdown = true;
-    }
-  } else {
+  } else if (!file.position_filter_eligible) {
     file.disable_filter_pushdown |= has_deletes;
   }
+  // Eligible virtual scans keep the reader decision when footer pruning removed
+  // every delete-bearing group. The adapter rechecks the selected split ranges.
   file.set_contract_payload(file.contract_id(),
                             std::vector<split_materializer_certificate>(file.certificates().begin(),
                                                                         file.certificates().end()),
@@ -578,8 +565,19 @@ filtered_table iceberg_gpu_ingestible::materialize_metadata_to_table(
     has_deletes |= !set->positions.empty();
   }
   if (has_deletes && !split.disable_filter_pushdown && !split.requires_row_positions) {
-    throw sirius::internal_exception(
-      "[iceberg_gpu_ingestible] positional deletes require pushdown suppression");
+    // The file's deletes may belong to another split. Independently verify the
+    // selected ranges against the bound sets before allowing selection without
+    // positions; keep those identities in the completion record even for a no-op.
+    auto const layout = build_batch_layout(split);
+    has_deletes       = std::any_of(layout.begin(), layout.end(), [&](auto const& run) {
+      auto const& set = sets.at(delete_key_for(run.data_file_path));
+      auto const pos =
+        std::lower_bound(set->positions.begin(), set->positions.end(), run.file_row_offset);
+      return pos != set->positions.end() && *pos < run.file_row_offset + run.num_rows;
+    });
+    if (has_deletes)
+      throw sirius::internal_exception(
+        "[iceberg_gpu_ingestible] positional deletes require pushdown suppression");
   }
   // Freeze requirements before decode from the independently validated split.
   static auto const empty_requirements = std::make_shared<visibility_bindings const>();
@@ -604,6 +602,7 @@ filtered_table iceberg_gpu_ingestible::materialize_metadata_to_table(
     base.execution->visibility_applied,
     base.execution->visibility_complete,
     [&](std::span<applied_visibility const> pending) {
+      if (!has_deletes) return;
       iceberg_delete_sets pending_sets;
       for (auto const& binding : pending)
         pending_sets.emplace(binding.file, sets.at(binding.file));

@@ -59,10 +59,11 @@ class iceberg_ingestible_table_info : public parquet_ingestible_table_info {
  *
  * The adapter adds two semantic operations around the shared Parquet core:
  *
- * 1. @ref next_split_provider retains reader-side suppression for unqualified routes. Qualified
- *    read_parquet splits may apply safe comparisons before deletes and request cuDF's original
- *    positions on demand. Unfiltered results use the existing interval layout; dynamic filters
- *    never count as static predicate coverage. Row-group pruning retains original file offsets.
+ * 1. @ref next_split_provider suppresses reader filtering when deletes are present, except on
+ *    qualified virtual-column read_parquet routes. Those routes may filter before deletes using
+ *    cuDF's original positions. Scans without virtual columns use unfiltered input intervals;
+ *    they never request indices solely for deletion. Dynamic filters never count as static
+ *    predicate coverage. Row-group pruning retains original file offsets.
  *
  * 2. @ref materialize_metadata_to_table applies each bound delete set using reader positions or
  *    intervals, preserves predicate facts, and releases hidden indices after their last use.

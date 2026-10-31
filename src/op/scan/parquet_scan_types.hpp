@@ -63,6 +63,7 @@ class read_view_registry;
 
 namespace sirius::op {
 class sirius_dynamic_filter_set;
+class dynamic_filter_snapshot;
 }  // namespace sirius::op
 
 namespace sirius::op::scan {
@@ -244,11 +245,22 @@ class parquet_split_info : public scan_info {
   /// row-group stats cudf cannot compare against an AST literal. The
   /// filter still applies post-decode via @c expression_evaluator.
   bool disable_filter_pushdown = false;
-  // Internal visibility demand. Virtual-column requests are computed independently.
+  // Delete matching for qualified virtual-column scans. Without virtual columns,
+  // Iceberg retains unfiltered input runs and applies deletes before predicates.
   bool requires_row_positions = false;
-  // Internal-only positions are selected after legacy grouping. Their execution
-  // peak must not change the additive preparation charge inherited from files.
-  std::optional<std::size_t> deferred_position_working_bytes;
+  // Reader decisions are fixed when the coalescer emits this split. Dynamic
+  // eligibility is subsequently restricted to the task device, never refreshed.
+  bool static_reader_filter_ready = false;
+  std::shared_ptr<sirius::op::dynamic_filter_snapshot const> position_filter_snapshot;
+  std::size_t unfiltered_working_bytes = 0;
+
+  [[nodiscard]] bool position_reader_filter_available(
+    std::optional<int> device = std::nullopt) const noexcept;
+  [[nodiscard]] bool reader_filter_disabled(int device) const noexcept
+  {
+    return disable_filter_pushdown ||
+           (requires_row_positions && !position_reader_filter_available(device));
+  }
   /// Hive partition values for this split, in @c scan_plan::partition_columns
   /// order. Empty when the plan has no partition columns. Kept on the split so
   /// @ref materialize_table can call @c assemble_scan_output inline on the
@@ -269,7 +281,20 @@ class parquet_split_info : public scan_info {
 
   [[nodiscard]] std::size_t estimated_working_set_bytes() const noexcept override
   {
-    if (deferred_position_working_bytes) return *deferred_position_working_bytes;
+    return position_working_set_bytes(std::nullopt);
+  }
+
+  [[nodiscard]] std::size_t estimated_working_set_bytes_for_device(
+    int device) const noexcept override
+  {
+    return position_working_set_bytes(device);
+  }
+
+  [[nodiscard]] std::size_t position_working_set_bytes(std::optional<int> device) const noexcept
+  {
+    if ((requires_row_positions && !position_reader_filter_available(device)) ||
+        (!requires_row_positions && unfiltered_working_bytes))
+      return unfiltered_working_bytes;
     std::size_t total = 0;
     for (auto const& s : rg_slices) {
       total = memory::saturating_add(total, s.estimated_decode_working_bytes);
@@ -278,8 +303,8 @@ class parquet_split_info : public scan_info {
   }
 
   // Keep the additive charge from file preparation until the split is consumed.
-  // Deferred positions are execution peaks, not additional
-  // preparation input; changing this sum would unbalance the coordinator ledger.
+  // Device-specific reader decisions affect execution workspace only, never the
+  // preparation input registered in the coordinator ledger.
   [[nodiscard]] std::size_t preparation_bytes() const noexcept override
   {
     std::size_t total = 0;
@@ -325,10 +350,12 @@ class parquet_file_scan_info : public scan_info {
     std::size_t decode_working_bytes;
     std::size_t compressed_bytes;
     int64_t num_rows;
-    // Alternative only: no-virtual scans keep legacy grouping until the complete
-    // split can qualify the actual position working set.
-    std::size_t position_working_bytes = 0;
-    std::size_t selected_deletes       = 0;
+    // Virtual routes retain their preparation charge, but can omit the extra
+    // deletion-position workspace when no reader predicate is committed.
+    std::optional<std::size_t> unfiltered_working_bytes;
+    // A file may span several splits; only selected groups with deletes need
+    // hidden reader positions. Other groups still budget for a possible merge.
+    bool requires_row_positions = false;
   };
 
   /// Parsed footer metadata for this file.
@@ -355,10 +382,10 @@ class parquet_file_scan_info : public scan_info {
   /// cannot compare against an AST literal — reader-side pushdown must be
   /// disabled for any split that includes it.
   bool disable_filter_pushdown = false;
-  // Set by the core only for a route/expression with qualified original positions.
-  bool position_filter_eligible = false;
-  bool requires_row_positions   = false;
-  bool defer_position_filter    = false;
+  // Set by the core only for a qualified Iceberg virtual-column route/expression.
+  bool position_filter_eligible   = false;
+  bool requires_row_positions     = false;
+  bool static_reader_filter_ready = false;
   /// No projected carrier was resolved (for example an empty footer). Reader mode
   /// retains the natural-schema fallback if neither a per-file virtual-scan
   /// carrier nor the bind-selected carrier is available. Metadata-only mode does
