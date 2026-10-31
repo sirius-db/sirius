@@ -185,8 +185,16 @@ struct arrow_import_ingestible::impl {
     if (stop.stop_requested())
       throw std::system_error(std::make_error_code(std::errc::operation_canceled));
     check_stop();
-    auto result =
-      producer->next({claim->key, claim->ledger->allocator(claim->permit), claim}, stop);
+    arrow_production result;
+    try {
+      result = producer->next({claim->key, claim->ledger->allocator(claim->permit), claim}, stop);
+    } catch (duckdb::InterruptException const&) {
+      // A producer that observes the token inside next() may still report it as an
+      // interrupt; the coordinator classifies only the cancellation status.
+      if (stop.stop_requested())
+        throw std::system_error(std::make_error_code(std::errc::operation_canceled));
+      throw;
+    }
     if (stop.stop_requested())
       throw std::system_error(std::make_error_code(std::errc::operation_canceled));
     check_stop();

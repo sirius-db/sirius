@@ -36,6 +36,7 @@
 #include <cstring>
 #include <future>
 #include <numeric>
+#include <system_error>
 #include <thread>
 
 using namespace sirius::op::scan;
@@ -117,12 +118,15 @@ class pull_producer final : public arrow_batch_producer {
   std::vector<int> rows{3};
   std::function<void()> on_normalize;
   std::function<void()> before_next;
+  std::function<void()> before_stop_check;
   std::function<void(ArrowSchema&, ArrowArray&)> observe_tree;
   sm::unit_envelope envelope{{8192}, 0};
   uint64_t temporary_probe_before = 0, temporary_probe_after = 0;
   size_t cursor  = 0;
   int preflights = 0, calls = 0, closes = 0;
   bool ready = true, cancelled = false, wrong_schema = false, fail_read = false;
+  // Legacy producers reported a token stop as an interrupt; the driver must still classify it.
+  bool legacy_interrupt_on_stop           = false;
   sm::preparation_execution_domain domain = sm::preparation_execution_domain::query_owner;
   std::thread::id owner                   = std::this_thread::get_id();
   sm::preparation_execution_domain execution_domain() const noexcept override { return domain; }
@@ -139,7 +143,12 @@ class pull_producer final : public arrow_batch_producer {
       owner = std::this_thread::get_id();
     if (owner != std::this_thread::get_id()) throw std::logic_error("wrong pull owner");
     ++calls;
-    if (cancelled || stop.stop_requested()) throw duckdb::InterruptException();
+    if (before_stop_check) before_stop_check();
+    if (stop.stop_requested()) {
+      if (legacy_interrupt_on_stop) throw duckdb::InterruptException();
+      throw std::system_error(std::make_error_code(std::errc::operation_canceled));
+    }
+    if (cancelled) throw duckdb::InterruptException();
     if (before_next) before_next();
     if (fail_read) throw std::runtime_error("pull failed");
     if (cursor == rows.size()) return arrow_end_of_stream{};
@@ -1401,6 +1410,84 @@ TEST_CASE("Arrow in-flight reads preserve coordinator stop intent", "[arrow_driv
   if (reason == sm::stop_reason::failure_induced)
     CHECK_THROWS_WITH(std::rethrow_exception(completion.terminal_error()), "original failure");
   CHECK(failures == (push && read_fails ? 1 : 0));
+  CHECK_FALSE(h.gate->active.load());
+  CHECK(h.ledger->permits_in_flight() == 0);
+  CHECK(h.ledger->tracked_units() == 0);
+  CHECK(h.backing.seen->allocated_bytes == 0);
+}
+
+// A pull producer that observes the token inside next() and still reports it as an interrupt
+// must not turn normal shutdown into a query error; an interrupt without a token stop must
+// keep propagating unchanged.
+TEST_CASE("Arrow legacy pull interrupts after an observed stop follow coordinator intent",
+          "[arrow_driver][arrow_stop]")
+{
+  enum class mode { normal_eos, user_cancel, failure_induced, no_token_interrupt };
+  auto which =
+    GENERATE(mode::normal_eos, mode::user_cancel, mode::failure_induced, mode::no_token_interrupt);
+  sirius::test::preparation::hold reading;
+  auto pull                      = std::make_shared<pull_producer>();
+  pull->rows                     = {3, 3};
+  pull->domain                   = sm::preparation_execution_domain::native_reader;
+  pull->legacy_interrupt_on_stop = true;
+  harness h(pull);
+  pull->before_stop_check = [&] {
+    if (pull->calls == 2) {
+      reading.wait();
+      if (which == mode::no_token_interrupt) pull->cancelled = true;
+    }
+  };
+  sirius::exec::static_thread_pool pool(2);
+  sirius::exec::scoped_dispatcher dispatcher(pool);
+  sirius::pipeline::completion_handler completion;
+  sm::native_reader_executor readers(1, 1);
+  sm::preparation_coordinator coordinator(completion, dispatcher, {2, 2, 2, 1}, &readers);
+  auto lane      = h.driver->make_preparation_source({});
+  auto connector = std::make_shared<sm::split_connector>();
+  sm::preparation_coordinator::source source;
+  source.execution   = lane.execution;
+  source.try_claim   = std::move(lane.try_claim);
+  source.close       = std::move(lane.close);
+  source.bind_wakeup = std::move(lane.bind_wakeup);
+  source.coalescer   = std::move(lane.coalescer);
+  source.destination = connector;
+  source.construct   = [](auto metadata) {
+    auto bytes = metadata->preparation_bytes();
+    return sirius::test::preparation::make_publication(std::move(metadata), bytes);
+  };
+  std::atomic<int> publications{0};
+  coordinator.after_publication_for_testing([&](auto, auto const&, auto) { ++publications; });
+  coordinator.add_source(std::move(source));
+  coordinator.arm();
+  coordinator.start();
+  bool entered  = false;
+  auto deadline = std::chrono::steady_clock::now() + 4s;
+  while (std::chrono::steady_clock::now() < deadline) {
+    coordinator.advance(1ms);
+    if (connector->has_more_splits()) (void)connector->get_next_split();
+    {
+      std::lock_guard lock(reading.mutex);
+      entered = reading.entered;
+    }
+    if (entered || completion.has_error()) break;
+  }
+  // The producer is inside next(), before its own stop check: the stop is observed by the
+  // producer, not by the driver's bracketing checks.
+  if (which == mode::failure_induced)
+    completion.report_error(std::make_exception_ptr(std::runtime_error("original failure")));
+  if (which == mode::normal_eos) coordinator.request_stop(sm::stop_reason::normal_eos);
+  if (which == mode::user_cancel) coordinator.request_stop(sm::stop_reason::user_cancel);
+  if (which == mode::failure_induced) coordinator.request_stop(sm::stop_reason::failure_induced);
+  reading.release();
+  coordinator.drain();
+  REQUIRE(entered);
+  CHECK(publications == 1);
+  CHECK(completion.has_error() == (which != mode::normal_eos));
+  if (which == mode::user_cancel || which == mode::no_token_interrupt)
+    CHECK_THROWS_AS(std::rethrow_exception(completion.terminal_error()),
+                    duckdb::InterruptException);
+  if (which == mode::failure_induced)
+    CHECK_THROWS_WITH(std::rethrow_exception(completion.terminal_error()), "original failure");
   CHECK_FALSE(h.gate->active.load());
   CHECK(h.ledger->permits_in_flight() == 0);
   CHECK(h.ledger->tracked_units() == 0);
