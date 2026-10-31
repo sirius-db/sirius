@@ -488,7 +488,7 @@ scan_manager_config constrained_lru_config()
 {
   scan_manager_config cfg;
   cfg.thread_pool.num_threads               = 3;
-  cfg.uring_n_reactors                      = 1;
+  cfg.uring_reactors_per_gpu                = 1;
   cfg.cache.mode                            = cucascade::io::cache::cache_mode::cucs;
   cfg.cache.eviction                        = cucascade::io::cache::eviction_policy::lru;
   cfg.cache.min_prefetching_budget_fraction = 0.25;

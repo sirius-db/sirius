@@ -97,7 +97,7 @@ YAML::Node remote_spill_context_yaml()
           num_threads: 1
         scan_manager:
           num_threads: 1
-          uring_n_reactors: 1
+          uring_reactors_per_gpu: 1
       telemetry:
         enable_quent: false
   )");
@@ -863,8 +863,8 @@ TEST_CASE("SiriusContext init failure restores the cuDF pinned resource",
   auto const prev_threshold = cudf::get_allocate_host_as_pinned_threshold();
 
   // initialize() installs the cuDF pinned resource, then throws starting the
-  // four uring reactors (256 MiB staging) against the config's 160 MB host
-  // pool -- the exact path the 1->4 reactor default change exposes.
+  // four uring reactors of its one GPU (256 MiB staging) against the config's
+  // 160 MB host pool -- a reactor start failure after the pinned install.
   REQUIRE_THROWS(sirius::test::open_sirius_db(nullptr, cfg));
 
   // The rollback must have restored cuDF's threshold. Without the fix it would
@@ -2840,8 +2840,8 @@ TEST_CASE("failed initialization releases a newly installed converter registry",
   CHECK_FALSE(sirius::converter_registry::is_initialized());
 
   // Reuse the same engine object with a different converter configuration.
-  root["sirius"]["executor"]["scan_manager"]["uring_n_reactors"] = 1;
-  root["sirius"]["executor"]["downgrade"]["copy_chunk_bytes"]    = "1Gi";
+  root["sirius"]["executor"]["scan_manager"]["uring_reactors_per_gpu"] = 1;
+  root["sirius"]["executor"]["downgrade"]["copy_chunk_bytes"]          = "1Gi";
   REQUIRE_NOTHROW(engine.initialize(sirius::parsed_sirius_config::from_node(root)));
 }
 

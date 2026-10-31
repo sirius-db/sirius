@@ -37,6 +37,7 @@
 #include <cucascade/io/cufile/cufile_ioctx.hpp>
 #include <cucascade/io/datasource_factory.hpp>
 #include <cucascade/io/io_context.hpp>
+#include <cucascade/io/reactor_placement.hpp>
 #include <cucascade/io/types.hpp>
 
 #include <algorithm>
@@ -79,8 +80,8 @@ scan_manager_config reader_config(io_backend backend)
   scan_manager_config config;
   config.backend                 = backend;
   config.thread_pool.num_threads = 3;
-  config.uring_n_reactors        = 1;
-  config.cufile_n_reactors       = 4;
+  config.uring_reactors_per_gpu  = 1;
+  config.cufile_reactors_per_gpu = 4;
   // Exercise the forced POSIX/compatibility path, not real-GDS acceptance.
   config.cufile.compat_mode = cucascade::io::cufile::compat::on;
   config.cufile.use_odirect = false;
@@ -346,12 +347,19 @@ TEST_CASE("mandatory cuFile construction preserves the actual exception cause",
   auto config = reader_config(io_backend::cufile);
   // Guaranteed to exceed vector::max_size(), without attempting an enormous
   // allocation. Validation accepts positive counts; the backend owns this limit.
-  config.cufile_n_reactors = std::numeric_limits<std::size_t>::max();
+  config.cufile_reactors_per_gpu = std::numeric_limits<std::size_t>::max();
+  auto const index               = single_gpu_index();
   std::string cause;
   try {
+    // The same placed-layout construction the scan manager runs for its one GPU.
+    auto const io_config = config.to_io_config();
     auto context =
       std::make_shared<cucascade::io::cufile::cufile_reactor::reactor_context>(config.cufile);
-    cucascade::io::cufile::cufile_ioctx impossible{config.cufile_n_reactors, std::move(context)};
+    cucascade::io::reactor_layout const layout{
+      cucascade::io::make_reactor_placements(
+        config.cufile_reactors_per_gpu, index.get(), nullptr, io_config.pin_reactor_threads),
+      io_config.reactor_spill};
+    cucascade::io::cufile::cufile_ioctx impossible{layout, std::move(context)};
   } catch (std::exception const& e) {
     cause = e.what();
   }
@@ -359,7 +367,7 @@ TEST_CASE("mandatory cuFile construction preserves the actual exception cause",
   auto memory = initialize_memory_manager(1);
   sirius::exec::query_lifecycle_registry lifecycle;
   REQUIRE_THROWS_WITH(
-    (sirius_scan_manager{lifecycle, config, *memory, single_gpu_index()}),
+    (sirius_scan_manager{lifecycle, config, *memory, index}),
     Catch::Matchers::ContainsSubstring("failed to create cufile io_context: " + cause));
 }
 

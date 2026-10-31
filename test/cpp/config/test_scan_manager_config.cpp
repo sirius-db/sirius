@@ -460,7 +460,7 @@ TEST_CASE("sirius_config defaults the cache mode to none when YAML omits it",
           "[scan_manager][config][cache_mode]")
 {
   auto const cfg = load_scan_manager("sirius_cache_mode_default.yaml",
-                                     scan_manager_yaml("      uring_n_reactors: 2\n"));
+                                     scan_manager_yaml("      uring_reactors_per_gpu: 2\n"));
 
   CHECK(cfg.cache.mode == cache_mode::none);
   CHECK(cfg.cache.eviction == eviction_policy::lru);
@@ -730,7 +730,7 @@ TEST_CASE("scan_manager_config defaults to the native backend", "[scan_manager][
   scan_manager_config cfg{};
 
   CHECK(cfg.backend == io_backend::native);
-  CHECK(cfg.cufile_n_reactors == 4);
+  CHECK(cfg.cufile_reactors_per_gpu == 4);
   CHECK(cfg.cufile.max_inflight == 32);
   CHECK(cfg.cufile.max_op_bytes == (64UL << 20));
   CHECK(cfg.cufile.gds_threshold == (256UL << 10));
@@ -742,7 +742,7 @@ TEST_CASE("cuFile C++ config is validated before starting the scan manager",
           "[scan_manager][config][backend][cufile]")
 {
   scan_manager_config cfg{};
-  SECTION("reactor count") { cfg.cufile_n_reactors = 0; }
+  SECTION("reactor count") { cfg.cufile_reactors_per_gpu = 0; }
   SECTION("inflight window") { cfg.cufile.max_inflight = 0; }
   SECTION("operation bytes") { cfg.cufile.max_op_bytes = 4095; }
   SECTION("direct policy")
@@ -757,16 +757,16 @@ TEST_CASE("to_io_config carries the scan_manager settings into cuCascade's io_co
           "[scan_manager][config][backend]")
 {
   scan_manager_config cfg{};
-  cfg.uring_n_reactors      = 3;
-  cfg.rest_n_reactors       = 5;
-  cfg.cache.mode            = cache_mode::os;
-  cfg.cache.eviction        = eviction_policy::idle;
-  cfg.object_store.endpoint = "http://object-store.test:9000";
-  cfg.rest.max_connections  = 17;
+  cfg.uring_reactors_per_gpu = 3;
+  cfg.rest_n_reactors        = 5;
+  cfg.cache.mode             = cache_mode::os;
+  cfg.cache.eviction         = eviction_policy::idle;
+  cfg.object_store.endpoint  = "http://object-store.test:9000";
+  cfg.rest.max_connections   = 17;
 
   auto const io = cfg.to_io_config();
   CHECK(io.backend == cucascade::io::io_backend::native);
-  CHECK(io.uring_n_reactors == 3);
+  CHECK(io.uring_reactors_per_gpu == 3);
   CHECK(io.rest_n_reactors == 5);
   // A non-default value in each copied sub-config survives the copy.
   CHECK(io.object_store.endpoint == "http://object-store.test:9000");
@@ -795,7 +795,7 @@ TEST_CASE("sirius_config reads the backend from YAML", "[scan_manager][config][b
   CHECK(native.backend == io_backend::native);
 
   auto const omitted = load_scan_manager("sirius_backend_default.yaml",
-                                         scan_manager_yaml("      uring_n_reactors: 2\n"));
+                                         scan_manager_yaml("      uring_reactors_per_gpu: 2\n"));
   CHECK(omitted.backend == io_backend::native);
 }
 
@@ -819,7 +819,7 @@ TEST_CASE("sirius_config reads cuFile read tuning", "[scan_manager][config][back
   auto const cfg =
     load_scan_manager("sirius_backend_cufile.yaml",
                       single_gpu_scan_manager_yaml("      backend: cufile\n"
-                                                   "      cufile_n_reactors: 3\n"
+                                                   "      cufile_reactors_per_gpu: 3\n"
                                                    "      cache:\n"
                                                    "        mode: cucs\n"
                                                    "      cufile:\n"
@@ -833,7 +833,7 @@ TEST_CASE("sirius_config reads cuFile read tuning", "[scan_manager][config][back
   CHECK(cfg.backend == io_backend::cufile);
   auto const io = cfg.to_io_config();
   CHECK(io.backend == cucascade::io::io_backend::cufile);
-  CHECK(cfg.cufile_n_reactors == 3);
+  CHECK(cfg.cufile_reactors_per_gpu == 3);
   CHECK(cfg.cufile.max_inflight == 7);
   CHECK(cfg.cufile.max_op_bytes == (8UL << 20));
   CHECK(cfg.cufile.gds_threshold == (128UL << 10));
@@ -842,7 +842,7 @@ TEST_CASE("sirius_config reads cuFile read tuning", "[scan_manager][config][back
   CHECK(cfg.cufile.poll_interval_us == 50);
   CHECK(cfg.cufile.low_service_interval == 0);
 #ifdef CUCASCADE_HAS_CUFILE
-  CHECK(io.cufile_n_reactors == cfg.cufile_n_reactors);
+  CHECK(io.cufile_reactors_per_gpu == cfg.cufile_reactors_per_gpu);
   CHECK(io.cufile.max_inflight == cfg.cufile.max_inflight);
   CHECK(io.cufile.max_op_bytes == cfg.cufile.max_op_bytes);
   CHECK(io.cufile.gds_threshold == cfg.cufile.gds_threshold);
@@ -868,8 +868,8 @@ TEST_CASE("sirius_config rejects invalid cuFile settings with key context",
           "[scan_manager][config][backend][cufile]")
 {
   for (auto const& [body, key] :
-       {std::pair{"      cufile_n_reactors: 0\n", "scan_manager.cufile_n_reactors"},
-        std::pair{"      cufile_n_reactors: -1\n", "scan_manager.cufile_n_reactors"},
+       {std::pair{"      cufile_reactors_per_gpu: 0\n", "scan_manager.cufile_reactors_per_gpu"},
+        std::pair{"      cufile_reactors_per_gpu: -1\n", "scan_manager.cufile_reactors_per_gpu"},
         std::pair{"      cufile:\n        max_inflight: 0\n", "cufile.max_inflight"},
         std::pair{"      cufile:\n        max_inflight: -1\n", "cufile.max_inflight"},
         std::pair{"      cufile:\n        max_op_bytes: 4095\n", "cufile.max_op_bytes"},
@@ -893,6 +893,32 @@ TEST_CASE("sirius_config rejects invalid cuFile settings with key context",
     sirius::sirius_config cfg;
     REQUIRE_THROWS_WITH(cfg.load_from_file(yaml.path()), Catch::Matchers::ContainsSubstring(key));
   }
+}
+
+TEST_CASE("sirius_config rejects the old total reactor-count keys with their rename",
+          "[scan_manager][config]")
+{
+  for (auto const& [body, renamed] :
+       {std::pair{"      uring_n_reactors: 2\n", "uring_reactors_per_gpu"},
+        std::pair{"      cufile_n_reactors: 2\n", "cufile_reactors_per_gpu"}}) {
+    CAPTURE(body);
+    scoped_yaml yaml("sirius_renamed_reactor_count.yaml", single_gpu_scan_manager_yaml(body));
+    sirius::sirius_config cfg;
+    REQUIRE_THROWS_WITH(cfg.load_from_file(yaml.path()),
+                        Catch::Matchers::ContainsSubstring("renamed to '" + std::string{renamed}));
+  }
+
+  // The REST count is not renamed: it stays a total for the process (REST reactors follow
+  // the egress NIC, not the GPUs), and no per-GPU spelling exists.
+  auto const total = load_scan_manager("sirius_rest_reactor_total.yaml",
+                                       single_gpu_scan_manager_yaml("      rest_n_reactors: 3\n"));
+  CHECK(total.rest_n_reactors == 3);
+  CHECK(total.to_io_config().rest_n_reactors == 3);
+  scoped_yaml per_gpu("sirius_rest_reactors_per_gpu.yaml",
+                      single_gpu_scan_manager_yaml("      rest_reactors_per_gpu: 1\n"));
+  sirius::sirius_config cfg;
+  REQUIRE_THROWS_WITH(cfg.load_from_file(per_gpu.path()),
+                      Catch::Matchers::ContainsSubstring("unknown config key"));
 }
 
 TEST_CASE("the documented cuFile configuration example loads",
@@ -924,7 +950,7 @@ TEST_CASE("the documented cuFile configuration example loads",
   scan_manager_config cfg;
   REQUIRE_NOTHROW(cfg = load_scan_manager("sirius_documented_cufile.yaml", example));
   CHECK(cfg.backend == io_backend::cufile);
-  CHECK(cfg.cufile_n_reactors == 4);
+  CHECK(cfg.cufile_reactors_per_gpu == 4);
   CHECK(cfg.cufile.max_inflight == 32);
   CHECK(cfg.cufile.max_op_bytes == (64UL << 20));
   CHECK(cfg.cufile.gds_threshold == (256UL << 10));
@@ -1540,7 +1566,7 @@ TEST_CASE("sirius_config forces the native backend for multi-GPU",
 TEST_CASE("sirius_config keeps the Sirius scan_manager defaults", "[scan_manager][config][uring]")
 {
   auto const check_defaults = [&](scan_manager_config const& cfg) {
-    CHECK(cfg.uring_n_reactors == 4);
+    CHECK(cfg.uring_reactors_per_gpu == 1);
     CHECK(cfg.rest_n_reactors == 2);
     CHECK(cfg.uring.n_max_concurrent_scans == 0);
     CHECK_FALSE(cfg.uring.n_max_concurrent_scans_explicit);
@@ -1618,7 +1644,7 @@ TEST_CASE("uring prefetch_reactors is accepted as a deprecated no-op",
   CHECK(io.slices_per_pass == baseline_io.slices_per_pass);
   CHECK(io.range_batch_slices == baseline_io.range_batch_slices);
   CHECK(io.use_odirect == baseline_io.use_odirect);
-  CHECK(cfg.uring_n_reactors == baseline.uring_n_reactors);
+  CHECK(cfg.uring_reactors_per_gpu == baseline.uring_reactors_per_gpu);
 
   std::size_t warnings = 0;
   for (auto const& record : logs.records()) {
