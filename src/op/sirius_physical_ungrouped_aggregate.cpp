@@ -400,6 +400,28 @@ duckdb::vector<sirius::logical_type> sirius_physical_ungrouped_aggregate::get_lo
   return local_types;
 }
 
+std::size_t sirius_physical_ungrouped_aggregate::no_history_peak_memory_estimate(
+  const input_stats& stats) const
+{
+  // Empty inputs still allocate scalar results, validity masks and partial states.
+  // Allow sixteen RMM-aligned allocations per aggregate and input batch for fixed-width
+  // states, including STDDEV's three scalar states and temporary columns.
+  constexpr std::size_t rmm_allocation_alignment_bytes = 256;
+  constexpr std::size_t scalar_state_bytes             = 16 * rmm_allocation_alignment_bytes;
+  std::size_t state_units                              = aggregates.size();
+  // Account for offsets and child buffers as in the merge's empty-input estimate.
+  // Inspect local types: COUNT(DISTINCT) returns an integer but carries a LIST partial.
+  for (auto const& type : get_local_output_types()) {
+    if (type.is_varchar() || type.is_array() || type.id() == sirius::type_id::LIST) {
+      state_units = memory::saturating_add(state_units, std::size_t{2});
+    }
+  }
+  auto const partials =
+    memory::saturating_mul(state_units, std::max(stats.num_batches, std::size_t{1}));
+  return std::max(sirius_physical_operator::no_history_peak_memory_estimate(stats),
+                  memory::saturating_mul(partials, scalar_state_bytes));
+}
+
 std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
   const operator_data& input_data, ::cuda::stream_ref stream)
 {
