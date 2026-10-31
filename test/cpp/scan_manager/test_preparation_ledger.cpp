@@ -1531,6 +1531,64 @@ TEST_CASE("Admission preserves output-holding scans minimum progress credits",
   }
 }
 
+// Units that release their permit before anything downstream runs (Iceberg DV jobs) share the
+// ledger with output-holding scans. The minimum must leave them one circulating permit.
+TEST_CASE("Admission keeps a circulating permit for permit-releasing units",
+          "[scan_preparation][ledger]")
+{
+  test_reservation_provider provider;
+  auto holding            = sample().front();
+  holding.minimum_permits = 1;
+  auto releasing          = sample().front();
+  std::array scans{holding, releasing};
+  SECTION("configured limit equal to the holding minimum is refused before any grant")
+  {
+    preparation_ledger ledger(provider);
+    auto decision = ledger.admit(scans, host, 1);
+    CHECK_FALSE(decision.deferred);
+    CHECK(decision.reason == admission_reason::capacity);
+    CHECK(provider.seen->requests == 0);
+  }
+  SECTION("short grant cannot drop the circulating permit")
+  {
+    provider.grant_bytes = 103;
+    preparation_ledger ledger(provider);
+    auto decision = ledger.admit(scans, host, 2);
+    CHECK_FALSE(decision.deferred);
+    CHECK(decision.reason == admission_reason::short_grant);
+    CHECK(provider.seen->requests == 1);
+    CHECK(provider.outstanding() == 0);
+  }
+  SECTION("releasing units progress while the holding scan keeps its output")
+  {
+    provider.grant_bytes = 104;
+    preparation_ledger ledger(provider);
+    auto decision = ledger.admit(scans, host, 2);
+    REQUIRE(decision.deferred);
+    CHECK(decision.n_permits == 2);
+    auto held = ledger.try_acquire_unit({1, 0}, 20);
+    REQUIRE(held);
+    auto output = ledger.allocator(held).allocate(32);
+    held.release();
+    CHECK(ledger.permits_in_flight() == 1);
+    for (uint64_t job = 0; job < 3; ++job) {
+      auto permit = ledger.try_acquire_unit({2, job}, 20);
+      REQUIRE(permit);
+      permit.release();
+      ledger.retire_unit({2, job});
+    }
+    CHECK(ledger.permits_in_flight() == 1);
+  }
+  SECTION("releasing-only admission keeps its single permit")
+  {
+    std::array only{releasing};
+    preparation_ledger ledger(provider);
+    auto decision = ledger.admit(only, host, 1);
+    REQUIRE(decision.deferred);
+    CHECK(decision.n_permits == 1);
+  }
+}
+
 TEST_CASE("Input accounting includes temporary and retained allocations from its permit",
           "[scan_preparation][ledger]")
 {

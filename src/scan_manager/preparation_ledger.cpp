@@ -203,9 +203,11 @@ admission_decision preparation_ledger::admit(std::span<scan_envelope const> scan
     auto quantum             = provider->allocation_granularity(space);
     d.allocation_granularity = quantum;
     uint64_t units = 0, minimum_permits = 0;
+    bool releasing_units = false;
     for (auto const& scan : scans) {
       if (!scan.qualified) return d;
       minimum_permits = add(minimum_permits, scan.minimum_permits);
+      if (!scan.minimum_permits && !scan.units.empty()) releasing_units = true;
       for (auto bytes : scan.retained)
         d.sigma_retained = add(d.sigma_retained, round(bytes, quantum));
       for (auto const& unit : scan.units) {
@@ -215,6 +217,9 @@ admission_decision preparation_ledger::admit(std::span<scan_envelope const> scan
         d.w              = std::max(d.w, unit_w);
       }
     }
+    // Output-holding scans can occupy every permit they declared while they wait for
+    // another scan. Units that release their permit still need one to make progress.
+    if (releasing_units) minimum_permits = add(minimum_permits, 1);
     if (minimum_permits > max_permits || minimum_permits > units) {
       d.reason = admission_reason::capacity;
       return d;
