@@ -1031,6 +1031,11 @@ TEST_CASE("REST and TLS empty YAML blocks preserve cuCascade's transport default
     CHECK(r.fan_out == d.fan_out);
     CHECK(r.interface == d.interface);
     CHECK(r.pin_to_irq_cpus == d.pin_to_irq_cpus);
+    CHECK(r.write_split_bytes == d.write_split_bytes);
+    CHECK(r.expect_continue == d.expect_continue);
+    CHECK(r.continue_timeout == d.continue_timeout);
+    CHECK(r.complete_timeout_s == d.complete_timeout_s);
+    CHECK(r.max_write_connections == d.max_write_connections);
     CHECK(r.max_retry_attempts == d.max_retry_attempts);
     CHECK(r.max_auth_retry_attempts == d.max_auth_retry_attempts);
     CHECK(r.retry_backoff_base == d.retry_backoff_base);
@@ -1098,7 +1103,12 @@ TEST_CASE("sirius_config reads REST transport tuning", "[scan_manager][config][r
                                                        "        iowq_max_unbound: 9\n"
                                                        "        fan_out: 3\n"
                                                        "        interface: eth1\n"
-                                                       "        pin_to_irq_cpus: false\n"));
+                                                       "        pin_to_irq_cpus: false\n"
+                                                       "        write_part_bytes: 10 MiB\n"
+                                                       "        expect_continue: true\n"
+                                                       "        continue_timeout_ms: 250\n"
+                                                       "        complete_timeout_s: 120\n"
+                                                       "        max_write_connections: 4\n"));
   CHECK(cfg.rest_n_reactors == 4);
   auto const check = [](cucascade::io::rest::config const& rest) {
     CHECK(rest.n_max_concurrent_scans == 5);
@@ -1139,6 +1149,11 @@ TEST_CASE("sirius_config reads REST transport tuning", "[scan_manager][config][r
     CHECK(rest.fan_out == 3);
     CHECK(rest.interface == "eth1");
     CHECK_FALSE(rest.pin_to_irq_cpus);
+    CHECK(rest.write_split_bytes == (10UL << 20));
+    CHECK(rest.expect_continue);
+    CHECK(rest.continue_timeout == std::chrono::milliseconds{250});
+    CHECK(rest.complete_timeout_s == 120);
+    CHECK(rest.max_write_connections == 4);
   };
   check(cfg.rest);
   check(cfg.to_io_config().rest);
@@ -1175,6 +1190,10 @@ TEST_CASE("REST transport accepts documented zero sentinels and range boundaries
                                                        "        dns_max_addresses: 4096\n"
                                                        "        footer_probe_bytes: 1 GiB\n"
                                                        "        fan_out: 1\n"
+                                                       "        write_part_bytes: 5 MiB\n"
+                                                       "        continue_timeout_ms: 0\n"
+                                                       "        complete_timeout_s: 0\n"
+                                                       "        max_write_connections: 0\n"
                                                        "        tls:\n"
                                                        "          session_cache: false\n"
                                                        "          session_cache_per_endpoint: 0\n"
@@ -1206,6 +1225,10 @@ TEST_CASE("REST transport accepts documented zero sentinels and range boundaries
   CHECK(cfg.rest.dns_max_addresses == 4096);
   CHECK(cfg.rest.footer_probe_bytes == (1UL << 30));
   CHECK(cfg.rest.fan_out == 1);
+  CHECK(cfg.rest.write_split_bytes == (5UL << 20));
+  CHECK(cfg.rest.continue_timeout.count() == 0);
+  CHECK(cfg.rest.complete_timeout_s == 0);
+  CHECK(cfg.rest.max_write_connections == 0);
   CHECK(cfg.rest.tls.session_cache_per_endpoint == 0);
   CHECK(cfg.rest.tls.max_connection_bytes == 0);
 
@@ -1213,10 +1236,14 @@ TEST_CASE("REST transport accepts documented zero sentinels and range boundaries
                                        rest_yaml("        max_connections: 64\n"
                                                  "        queue_depth: 32768\n"
                                                  "        min_mtu: 65607\n"
-                                                 "        receive_buffer_bytes: 4 MiB\n"));
+                                                 "        receive_buffer_bytes: 4 MiB\n"
+                                                 "        write_part_bytes: 5 GiB\n"
+                                                 "        max_write_connections: 64\n"));
   CHECK(upper.rest.queue_depth == 32768);
   CHECK(upper.rest.min_mtu == 65607);
   CHECK(upper.rest.receive_buffer_bytes == (4UL << 20));
+  CHECK(upper.rest.write_split_bytes == (5UL << 30));
+  CHECK(upper.rest.max_write_connections == 64);
 
   auto const tight =
     load_scan_manager("sirius_rest_queue_tight.yaml",
@@ -1284,7 +1311,16 @@ TEST_CASE("sirius_config rejects invalid REST transport ranges with key context"
         std::pair{"wait_mode: poll", "wait_mode"},
         std::pair{"iowq_max_unbound: -1", "iowq_max_unbound"},
         std::pair{"iowq_max_unbound: 4294967296", "iowq_max_unbound"},
-        std::pair{"fan_out: 0", "fan_out"}}) {
+        std::pair{"fan_out: 0", "fan_out"},
+        std::pair{"write_part_bytes: 0", "write_part_bytes"},
+        std::pair{"write_part_bytes: -1", "write_part_bytes"},
+        std::pair{"write_part_bytes: 4 MiB", "write_part_bytes"},
+        std::pair{"write_part_bytes: 6 GiB", "write_part_bytes"},
+        std::pair{"expect_continue: maybe", "expect_continue"},
+        std::pair{"continue_timeout_ms: -1", "continue_timeout_ms"},
+        std::pair{"complete_timeout_s: -1", "complete_timeout_s"},
+        std::pair{"max_write_connections: -1", "max_write_connections"},
+        std::pair{"max_write_connections: 65", "max_write_connections"}}) {
     CAPTURE(body);
     scoped_yaml yaml("sirius_rest_transport_invalid.yaml",
                      rest_yaml(std::string{"        "} + body + "\n"));
@@ -1319,8 +1355,6 @@ TEST_CASE("sirius_config rejects REST keys the transport does not have",
                           "link_gbps: 100",
                           "tls_handshake_timeout_ms: 3000",
                           "ring_entries: 1024",
-                          "write_part_bytes: 16 MiB",
-                          "expect_continue: true",
                           "sqpoll: true",
                           "defer_taskrun: true"}) {
     CAPTURE(key);
