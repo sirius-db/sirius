@@ -232,8 +232,8 @@ struct harness {
               .per_stream_tracking = per_stream,
               .gpu_resource_factory =
                 [observer = allocations, devices](int device, std::size_t capacity) {
-                  // Accumulation admission requires ordinary RMM async pools; multi-GPU tests use
-                  // `observe_task_allocations` instead.
+                  // Direct accumulation copies require ordinary RMM async pools; multi-GPU tests
+                  // use `observe_task_allocations` instead.
                   if (devices > 1) {
                     return cucascade::memory::make_default_gpu_memory_resource(device, capacity);
                   }
@@ -672,23 +672,36 @@ TEST_CASE("optional publication scratch OOM deposits without rescheduling the PA
           "[pipeline][dynamic_filter][in_task_publication][mgpu][multi_gpu]")
 {
   if (!sirius::test::has_gpus(2)) { return; }
+  bool const refuse_host_scratch = GENERATE(false, true);
+  CAPTURE(refuse_host_scratch);
   harness test{2};
   if (!acc::has_pool_access(test.memory.spaces)) { return; }
   auto const first                = test.memory.make_batch(1, 0, 2000);
   auto const final                = test.memory.make_batch(0, 5000, 2000);
+  auto const baseline             = test.memory.allocated_bytes();
   auto record                     = std::make_shared<retry_record>();
   record->constrain_first_attempt = true;
   auto tasks                      = test.tasks({first, final}, record);
   test.run_inline(std::move(tasks[0]), 1);
+  auto const geometry = acc::bloom_geometry(4000, 2, bloom_cap);
   auto const scratch_bytes =
-    rmm::align_up(acc::merge_scratch_bytes(acc::bloom_geometry(4000, 2, bloom_cap)),
-                  rmm::CUDA_ALLOCATION_ALIGNMENT);
+    rmm::align_up(acc::merge_scratch_bytes(geometry), rmm::CUDA_ALLOCATION_ALIGNMENT);
+  auto const host_scratch_bytes =
+    rmm::align_up(geometry.chunk_bytes, rmm::CUDA_ALLOCATION_ALIGNMENT);
+  REQUIRE(host_scratch_bytes < scratch_bytes);
   std::atomic<std::size_t> scratch_requests{0};
+  std::atomic<std::size_t> host_scratch_requests{0};
   test.partition->before_execute = [&](op::operator_data const&, ::cuda::stream_ref stream) {
     test.observe_task_allocations(0, stream, [&](std::size_t requested) {
       if (requested == scratch_bytes && test.output.deposits.load() == 2) {
         ++scratch_requests;
         throw rmm::out_of_memory{"refused optional merge scratch"};
+      }
+      if (scratch_requests.load() != 0 && requested == host_scratch_bytes) {
+        ++host_scratch_requests;
+        if (refuse_host_scratch) {
+          throw rmm::out_of_memory{"refused optional HOST merge scratch"};
+        }
       }
     });
   };
@@ -699,12 +712,28 @@ TEST_CASE("optional publication scratch OOM deposits without rescheduling the PA
   sirius::test::retire_scheduler_query(
     test.lifecycle, *test.scheduler, test.pipeline->get_query_id(), true, test.creator.get());
   REQUIRE(scratch_requests.load() == 1);
+  REQUIRE(host_scratch_requests.load() == 1);
   REQUIRE(record->retries.load() == 0);
   REQUIRE(test.output.deposits.load() == 4);
   REQUIRE(test.memory.channel->snapshot().terminal());
-  REQUIRE(test.memory.channel->snapshot().empty());
-  REQUIRE(test.memory.stats.snapshot().filters_pushed == 0);
-  REQUIRE(test.memory.stats.snapshot().accumulations_skipped_admission == 1);
+  auto const counters = test.memory.stats.snapshot();
+  if (refuse_host_scratch) {
+    REQUIRE(test.memory.channel->snapshot().empty());
+    REQUIRE(counters.filters_pushed == 0);
+    REQUIRE(counters.accumulations_skipped_admission == 1);
+    REQUIRE(counters.accumulation_publications_finished == 0);
+    test.output.discard_batches();
+    REQUIRE(test.memory.allocated_bytes() == baseline);
+  } else {
+    REQUIRE(test.memory.channel->snapshot().entries().size() == 2);
+    REQUIRE(counters.filters_pushed == 2);
+    REQUIRE(counters.accumulations_skipped_admission == 0);
+    REQUIRE(counters.accumulation_publications_finished == 1);
+    REQUIRE(counters.accumulation_publications_host_staged == 1);
+    test.memory.require_members({first, final});
+  }
+  REQUIRE(test.memory.gpu(0).get_total_reserved_memory() == 0);
+  REQUIRE(test.memory.gpu(1).get_total_reserved_memory() == 0);
   require_worker_reuse(test);
 }
 
@@ -714,16 +743,14 @@ TEST_CASE("publication scratch allocation failure retires ordinary-pool partials
   if (!sirius::test::has_gpus(2)) { return; }
   acc::fixture memory{{.devices = 2}};
   if (!acc::has_pool_access(memory.spaces)) { return; }
-  auto const input          = memory.make_batch(1, 0, 4000);
-  auto const baseline       = memory.allocated_bytes();
-  auto const geometry       = acc::bloom_geometry(4000, 2, bloom_cap);
-  auto const scratch_bytes  = acc::merge_scratch_bytes(geometry);
-  auto observer             = std::make_shared<allocation_observer>();
-  std::size_t requests      = 0;
+  auto const input         = memory.make_batch(1, 0, 4000);
+  auto const baseline      = memory.allocated_bytes();
+  auto const geometry      = acc::bloom_geometry(4000, 2, bloom_cap);
+  auto const scratch_bytes = acc::merge_scratch_bytes(geometry);
+  auto observer            = std::make_shared<allocation_observer>();
+  std::vector<std::pair<int, std::size_t>> requests;
   observer->before_allocate = [&](int device, ::cuda::stream_ref, std::size_t requested) {
-    REQUIRE(device == 0);
-    REQUIRE(requested == scratch_bytes);
-    ++requests;
+    requests.emplace_back(device, requested);
     throw rmm::out_of_memory{"refused optional merge scratch"};
   };
   {
@@ -743,7 +770,8 @@ TEST_CASE("publication scratch allocation failure retires ordinary-pool partials
     rmm::cuda_set_device_raii guard{rmm::cuda_device_id{0}};
     observed_resource scratch{0, 8 * acc::mib, observer};
     REQUIRE_FALSE(builder->finish(rmm::cuda_device_id{0}, memory.task_stream(0), scratch));
-    REQUIRE(requests == 1);
+    REQUIRE((requests == std::vector<std::pair<int, std::size_t>>{{0, scratch_bytes},
+                                                                  {0, geometry.chunk_bytes}}));
   }
   REQUIRE(memory.allocated_bytes() == baseline);
   REQUIRE(memory.gpu(0).get_total_reserved_memory() == 0);

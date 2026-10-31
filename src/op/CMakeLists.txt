@@ -54,7 +54,6 @@ target_sources(
           dynamic_filter/dynamic_filter_key_domain.cpp
           dynamic_filter/dynamic_filter_publish_plan.cpp
           dynamic_filter/complete_build_inventory.cpp
-          dynamic_filter/dynamic_filter_replica_space.cpp
           dynamic_filter/dynamic_filter_publisher.cpp
           dynamic_filter/sirius_physical_build_filter.cpp
           dynamic_filter/sirius_dynamic_filter.cpp

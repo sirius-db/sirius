@@ -64,18 +64,18 @@ using set_alloc = sirius::rmm_cuco_allocator<KeyT>;
 template <class KeyT>
 using set_type = cuco::static_set<KeyT,
                                   cuco::extent<std::size_t>,
-                                  cuda::thread_scope_device,
-                                  cuda::std::equal_to<KeyT>,
+                                  ::cuda::thread_scope_device,
+                                  ::cuda::std::equal_to<KeyT>,
                                   cuco::double_hashing<kCgSize, cuco::default_hash_function<KeyT>>,
                                   set_alloc<KeyT>,
                                   cuco::storage<kBucketSize>>;
 
-using bloom_alloc = sirius::rmm_cuco_allocator<cuda::std::byte>;
+using bloom_alloc = sirius::rmm_cuco_allocator<::cuda::std::byte>;
 
 template <class KeyT>
 using sirius_bloom = cuco::bloom_filter<KeyT,
                                         cuco::extent<std::size_t>,
-                                        cuda::thread_scope_device,
+                                        ::cuda::thread_scope_device,
                                         cuco::bloom_filter_policy<KeyT>,
                                         bloom_alloc>;
 

@@ -19,7 +19,7 @@
 
 #include "cucascade/memory/common.hpp"
 #include "log/logging.hpp"
-#include "memory/pool_peer_access.hpp"
+#include "memory/pool_peer_access_scan.hpp"
 
 #include <cudf/utilities/memory_resource.hpp>
 
