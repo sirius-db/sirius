@@ -677,21 +677,33 @@ TEST_CASE("Abandoned mapped preparation jobs release both operations without run
   CHECK(output_weak.expired());
 }
 
-TEST_CASE("Retired slots do not refund the cumulative registered allowance",
+TEST_CASE("Retired slots return their allowance after the last retained block",
           "[composite_scan][preparation_ledger]")
 {
   sm::test::test_reservation_provider provider;
   auto ledger = std::make_shared<sm::preparation_ledger>(provider);
   std::vector<sm::scan_envelope> scans{{{{{8}, 16}}, {}, true, 1}};
   REQUIRE(ledger->admit(scans, sm::memory_space_id{cucascade::memory::Tier::HOST, 0}).deferred);
+  sm::charged_block retained;
   {
     sm::preparation_slot slot(ledger, {77, 0}, 16);
     auto permit = slot.try_acquire();
     REQUIRE(permit);
+    retained = ledger->allocator(permit).allocate_retained(16);
+  }
+  CHECK(ledger->tracked_units() == 1);
+  CHECK_THROWS_WITH(sm::preparation_slot(ledger, {77, 1}, 16),
+                    "unit retained budgets exceed admission");
+  retained.release();
+  CHECK(ledger->tracked_units() == 0);
+  CHECK(provider.seen->allocated_bytes == 0);
+  {
+    sm::preparation_slot next(ledger, {77, 1}, 16);
+    auto permit = next.try_acquire();
+    REQUIRE(permit);
     auto bytes = ledger->allocator(permit).allocate_retained(16);
+    CHECK(ledger->charged_bytes(next.key()) == 16);
   }
   CHECK(ledger->tracked_units() == 0);
   CHECK(provider.seen->allocated_bytes == 0);
-  CHECK_THROWS_WITH(sm::preparation_slot(ledger, {77, 1}, 16),
-                    "unit retained budgets exceed admission");
 }

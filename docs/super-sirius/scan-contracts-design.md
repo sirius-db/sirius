@@ -170,7 +170,7 @@ Adapters using this driver must also handle the following integration responsibi
 |---|---|
 | Wrapping a preparation result | Use `preparation_job::map_output()` and preserve the result's dependencies. Leave completion and failure reporting to `run()`. |
 | Sharing a contract across slots and Arrow children | Use one `preparation_identity` for all slot keys and Arrow `next_unit_id` callbacks. Independent counters can produce duplicate keys. |
-| Reusing retained budget across files | Create fixed `preparation_slot` objects and reuse their permits. Keep each permit until the last consumer releases its backing. Retiring a slot does not refund its registered allowance, so creating a new slot per file can exhaust admission even after memory is released. |
+| Reusing retained budget across files | Create fixed `preparation_slot` objects and reuse their permits. Keep each permit until the last consumer releases its backing. Retiring a slot returns its registered allowance only after its last permit and charged block are released. |
 
 ### Execution and ownership
 
