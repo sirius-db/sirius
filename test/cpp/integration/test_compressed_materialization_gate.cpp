@@ -163,11 +163,11 @@ TEST_CASE("compressed materialization is enabled by default", "[compressed_mater
   REQUIRE(sirius::operator_params{}.enable_compressed_materialization);
 }
 
-// NB: no [integration]/[shared_context] tag — this TEST_CASE builds its own
-// SiriusContext from a small-batch yaml and manages (pauses) the shared envs
-// itself, mirroring the other isolated-context pin tests.
+// These fixtures own a full SiriusContext, including a 5 GiB initial host pool.
+// The test runner keeps [exclusive_context] cases in a fresh process: pausing
+// shared environments cannot release other cases' static memory managers.
 TEST_CASE("gpu_execution - compressed materialization residency gate states end to end",
-          "[gpu_execution][parquet][compressed_materialization_gate]")
+          "[gpu_execution][parquet][compressed_materialization_gate][exclusive_context]")
 {
   pause_shared_envs();
 
@@ -363,7 +363,7 @@ TEST_CASE("gpu_execution - compressed materialization residency gate states end 
 }
 
 TEST_CASE("gpu_execution - multi-file pinned-narrow serve installs the residency sidecar",
-          "[gpu_execution][parquet][compressed_materialization_gate]")
+          "[gpu_execution][parquet][compressed_materialization_gate][exclusive_context]")
 {
   pause_shared_envs();
 
@@ -451,7 +451,7 @@ TEST_CASE("gpu_execution - multi-file pinned-narrow serve installs the residency
 }
 
 TEST_CASE("gpu_execution - tier policy retracts restore-only columns on GPU tier only",
-          "[gpu_execution][parquet][compressed_materialization_gate]")
+          "[gpu_execution][parquet][compressed_materialization_gate][exclusive_context]")
 {
   pause_shared_envs();
 
@@ -518,7 +518,7 @@ TEST_CASE("gpu_execution - tier policy retracts restore-only columns on GPU tier
 }
 
 TEST_CASE("gpu_execution - zero-benefit pruning stays discriminating on pinned-backed sidecars",
-          "[gpu_execution][parquet][compressed_materialization_gate]")
+          "[gpu_execution][parquet][compressed_materialization_gate][exclusive_context]")
 {
   pause_shared_envs();
 
@@ -607,7 +607,7 @@ TEST_CASE("gpu_execution - zero-benefit pruning stays discriminating on pinned-b
 // happens to it afterwards. Pinning d1 alone makes the counter unambiguous: nothing but the DATE
 // column can answer it.
 TEST_CASE("gpu_execution - a pinned DATE column narrows only with the flag on",
-          "[gpu_execution][parquet][compressed_materialization_gate]")
+          "[gpu_execution][parquet][compressed_materialization_gate][exclusive_context]")
 {
   pause_shared_envs();
 
@@ -664,7 +664,7 @@ TEST_CASE("gpu_execution - a pinned DATE column narrows only with the flag on",
 // chunks widen during scan normalization, while a HOST-tier pin keeps every target and the same
 // restores land downstream in the boundary projections instead.
 TEST_CASE("gpu_execution - a pinned narrow DATE column round-trips through its restore boundaries",
-          "[gpu_execution][parquet][compressed_materialization_gate]")
+          "[gpu_execution][parquet][compressed_materialization_gate][exclusive_context]")
 {
   pause_shared_envs();
 

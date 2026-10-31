@@ -897,7 +897,32 @@ column assembly, pending file visibility, residual predicates and output assembl
 in that order. Parquet's inline Hive and deferred residual paths use the same
 semantic functions. Caller expression policy, stream and allocator are preserved.
 `scoped_step_observer` observes actual work under a test-only opt-in; it cannot
-replace work or propagate callback exceptions into a query.
+replace work or propagate callback exceptions into a query. With no observer
+installed, residual observation skips the predicate/progress traversal.
+
+The certificate pins the exact approved normalization. Replacement results must
+match the bound input/output types, with explicit BOOL8 answer and row-count-carrier
+exceptions. Both materialization phases use the delivered projection state to
+choose the schema: an assembled zero-output result can retain one cardinality
+carrier even when its input schema had filter columns. Feeding a completed result
+back through either phase preserves its row count without repeating semantic work.
+Deferred replacement decoding retires borrowed staging on the caller's
+stream before returning; the default reader keeps its existing completion protocol.
+Only the core can construct the default-reader adapter; an ordinary callback cannot
+claim that protocol. The adapter and the ordinary Parquet program/certification are
+reused per core. File mapping and split visibility still receive their own bound
+inputs. Certification and normalization form one immutable binding, and immutable
+reader requests are validated at construction rather than copied and checked per batch.
+Prepared row-group/dependency views retain shared input without deep copies;
+standalone uniquely owned inputs retain one metadata snapshot for retirement.
+Production task retries preserve logical-input identity and advance the attempt;
+query terminal errors request the decoder's cancellation token.
+
+The operator can pass a single-use, synchronous-call-scoped validation receipt to
+the Parquet core. It binds the exact split object, contract and checked requirements;
+registry and query-key checks still happen in the operator. A different input,
+insufficient check set, repeated use or independent core call runs full validation.
+No receipt is cached on mutable split metadata.
 
 The program shares the full immutable predicate catalogue, including expressions,
 materialized slots and answer eligibility. `row_lineage` separately retains an
@@ -905,7 +930,23 @@ immutable input domain and identity, interval or device ordinal selection.
 Composition preserves the original domain; concatenation shifts by input length,
 not survivor count. `none` and `lost` never imply identity. Reader positions are
 converted only for a canonical-lineage consumer, reusing the row buffer and
-releasing source indices; ordinary Iceberg interval/reader-position deletion
+releasing source indices; unused reader positions are discarded. Conversion checks
+device ordinals once, and the shared boundary then checks their cardinality against
+the delivered table. Decoder-supplied canonical lineage still receives full bounds
+and duplicate validation on every delivery. Raw inputs acquire a private copy of
+their domain and device ordinals; already private storage can be rechecked without
+another ownership copy (strict validation still sorts a temporary copy). Internal
+operations share one immutable selection state with private validation provenance.
+Read-only accessors expose its domain, intervals and device column; replacing any
+part requires constructing a new, unvalidated selection. There are no mutable
+compatibility mirrors or per-use comparisons with a second proof snapshot.
+Selections validate new indices but do not repeatedly sort the proven source, and
+retention masks preserve the uniqueness proof. Metadata uploads, source columns and
+scratch buffers are retained through checked completion, including exception paths;
+composition and virtual-column assembly avoid separate waits for each upload.
+Canonical deletion
+uploads only positions within the original input intervals, preserving eager V2
+signed-position behavior and upstream deferred-DV validation. Ordinary Iceberg interval/reader-position deletion
 keeps its existing representation. A legacy `row_domain` view can be generated
 explicitly from the canonical record; independently authoritative copies are
 rejected. Resident/decompression records preserve actual answers and whole-filter
@@ -914,7 +955,9 @@ completion; native MVCC continues to use its separate visibility contract.
 `table_scan/field_mapper.hpp` wraps the existing name, Iceberg field-ID and flat
 compatibility rules. It returns immutable mapping results or structured refusals,
 retains original physical-check evidence and diagnostics, and counts only rules
-actually attempted. Preparation still reads and certifies each footer once.
+actually attempted. Results distinguish field correspondence from the effective
+reader projection, including a replacement carrier or natural-read fallback.
+Preparation still reads and certifies each footer once.
 
 ## Key Files
 

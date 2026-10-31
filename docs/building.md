@@ -159,3 +159,9 @@ extension-loading checks. Dynamic scan checks run in the DuckDB-only
 `sirius_extension_host` executable; engine tests use static Sirius registration.
 When running `scripts/run_unit_tests.py` or the test
 binary directly, set this variable to the wrapper's absolute path. CI supplies it.
+
+The default runner executes `[exclusive_context]` fixtures in a fresh process after
+the ordinary shards. These fixtures own a complete Sirius context and its memory
+budget; pausing shared environments does not release other tests' static memory
+managers. Use `--steps isolated` to run that stage alone. Its tests and assertions
+remain part of the default workflow.

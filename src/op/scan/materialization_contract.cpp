@@ -40,12 +40,12 @@ void row_domain::validate(int64_t rows) const
 row_domain legacy_row_domain(row_lineage const& lineage, ::cuda::stream_ref stream)
 {
   row_domain result;
-  if (lineage.state == row_position_state::none || lineage.state == row_position_state::lost)
+  if (lineage.state() == row_position_state::none || lineage.state() == row_position_state::lost)
     return result;
   lineage.validate(lineage.output_length());
-  for (auto const& file : lineage.domain->files)
+  for (auto const& file : lineage.domain()->files)
     result.files.push_back({file.identity, file.rows});
-  if (lineage.state == row_position_state::per_row) {
+  if (lineage.state() == row_position_state::per_row) {
     result.positions.emplace();
     std::unordered_set<int64_t> seen;
     for (auto ordinal : lineage.ordinals_on(stream)) {
@@ -54,17 +54,17 @@ row_domain legacy_row_domain(row_lineage const& lineage, ::cuda::stream_ref stre
       result.positions->push_back({file, row});
     }
   } else {
-    auto selections = lineage.runs;
-    if (lineage.state == row_position_state::identity && lineage.output_length())
+    auto selections = lineage.runs();
+    if (lineage.state() == row_position_state::identity && lineage.output_length())
       selections = {{0, lineage.output_length()}};
     int64_t output = 0;
     for (auto [first, count] : selections) {
       int64_t offset = 0;
-      for (auto const& run : lineage.domain->file_runs) {
+      for (auto const& run : lineage.domain()->file_runs) {
         auto start = std::max(first, offset);
         auto end   = std::min(first + count, offset + run.count);
         if (start < end) {
-          result.runs.push_back({lineage.domain->files[run.file].identity,
+          result.runs.push_back({lineage.domain()->files[run.file].identity,
                                  run.first + start - offset,
                                  output,
                                  end - start,
@@ -145,6 +145,16 @@ void validate_materialized_batch(materialized_batch const& batch,
          batch.table.view().column(*p.answer_slot).type().id() != cudf::type_id::BOOL8))
       throw std::invalid_argument("predicate answer is not a boolean slot");
   }
+  if (program.validate_output_schema && batch.projection_complete) {
+    auto expected_width = program.output_types.empty() && batch.row_count_carrier
+                            ? std::size_t{1}
+                            : program.output_types.size();
+    if (batch.table.n_columns() != expected_width)
+      throw std::invalid_argument("materialized output width mismatch");
+    for (std::size_t i = 0; i < program.output_types.size(); ++i)
+      if (batch.table.view().column(i).type() != program.output_types[i])
+        throw std::invalid_argument("materialized output type mismatch");
+  }
 }
 
 void finish_materialization_in_place(materialized_batch& batch,
@@ -154,9 +164,9 @@ void finish_materialization_in_place(materialized_batch& batch,
   validate_materialized_batch(batch, program);
   auto positions_available = [&] {
     if (batch.lineage_record)
-      return batch.lineage_record->state == row_position_state::identity ||
-             batch.lineage_record->state == row_position_state::runs ||
-             batch.lineage_record->state == row_position_state::per_row;
+      return batch.lineage_record->state() == row_position_state::identity ||
+             batch.lineage_record->state() == row_position_state::runs ||
+             batch.lineage_record->state() == row_position_state::per_row;
     return batch.lineage.available();
   };
   auto run = [&](materialization_step const& step) {

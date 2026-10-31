@@ -16,6 +16,7 @@
  */
 
 // sirius
+#include "cudf/cudf_utils.hpp"
 #include "io/path_utils.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "op/scan/owning_table_view.hpp"
@@ -1351,20 +1352,6 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
   }
   if (_info->injections.strip_encryption_evidence) encryption = {};
   auto const& metadata = *file_metadata;
-  materialization_program name_program;
-  name_program.contract   = execution_contract();
-  name_program.generation = 1;
-  mapping_request name_request{
-    rule_set_id::parquet_name_v1, resolved_metadata, file_path, *_plan, std::move(name_program)};
-  name_request.bound_types   = _info->bound_types;
-  auto name_mapping          = map_file(name_request);
-  auto const& name_result    = *std::get<std::shared_ptr<mapping_result const>>(name_mapping);
-  auto const& leaves_by_name = name_result.physical_leaves;
-  auto leaves_for            = [&](std::string const& name) -> std::vector<std::size_t> const& {
-    static std::vector<std::size_t> const empty;
-    auto found = leaves_by_name.find(name);
-    return found == leaves_by_name.end() ? empty : found->second;
-  };
   validation_set schema_validation;
   std::shared_ptr<field_id_mapping const> mapping;
   auto prepare_adapter_mapping = [&](std::vector<field_requirement> requirements,
@@ -1504,34 +1491,32 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
     }
   }
 
+  materialization_program name_program;
+  name_program.contract   = execution_contract();
+  name_program.generation = 1;
+  mapping_request name_request{
+    rule_set_id::parquet_name_v1, resolved_metadata, file_path, *_plan, std::move(name_program)};
+  name_request.bound_types        = _info->bound_types;
+  name_request.bound_names        = _info->names;
+  name_request.metadata_only      = _read_mode == parquet_read_mode::METADATA_ONLY;
+  name_request.allow_file_carrier = _source_kind == parquet_source_kind::PLAIN_PARQUET;
+  auto name_mapping               = map_file(name_request);
+  if (auto refused = std::get_if<mapping_refusal>(&name_mapping))
+    throw std::invalid_argument(refused->text);
+  auto const& name_result    = *std::get<std::shared_ptr<mapping_result const>>(name_mapping);
+  auto const& leaves_by_name = name_result.physical_leaves;
+  auto leaves_for            = [&](std::string const& name) -> std::vector<std::size_t> const& {
+    static std::vector<std::size_t> const empty;
+    auto found = leaves_by_name.find(name);
+    return found == leaves_by_name.end() ? empty : found->second;
+  };
   // Only plain virtual-column scans choose a carrier from each actual file
   // schema. Physical-only and Iceberg scans retain their existing reader path.
-  bool const metadata_only = _read_mode == parquet_read_mode::METADATA_ONLY;
-  std::optional<std::string> file_carrier;
-  std::size_t file_carrier_width = 0;
-  if (!metadata_only && _source_kind == parquet_source_kind::PLAIN_PARQUET &&
-      _plan->has_user_virtual_columns() && _plan->carrier_batch_index &&
-      !metadata.row_groups.empty()) {
-    for (auto const& column : metadata.schema) {
-      bool const partition = std::any_of(
-        _plan->partition_primary_indices.begin(),
-        _plan->partition_primary_indices.end(),
-        [&](auto p) { return p < _info->names.size() && _info->names[p] == column.name; });
-      if (partition) { continue; }
-      auto const width = detail::carrier_decoded_width(column);
-      if (width && (!file_carrier || width < file_carrier_width)) {
-        file_carrier       = column.name;
-        file_carrier_width = width;
-      }
-    }
-  }
-  // Failure to find a narrower supported carrier is not a scan refusal. Keep
-  // the bind-selected carrier (e.g. DECIMAL), or its existing natural-schema
-  // fallback when absent, and use the original decode sizing below.
-  bool const carrier_unavailable =
-    !mapping && !file_carrier && _plan->carrier_batch_index.has_value() &&
-    leaves_for(_plan->data_columns[*_plan->carrier_batch_index].name).empty();
-  auto file_options = _reader_options;
+  bool const metadata_only       = _read_mode == parquet_read_mode::METADATA_ONLY;
+  auto const& file_carrier       = name_result.file_carrier;
+  auto const file_carrier_width  = name_result.file_carrier_width;
+  bool const carrier_unavailable = !mapping && name_result.carrier_unavailable;
+  auto file_options              = _reader_options;
   if (carrier_unavailable || metadata_only) {
     file_options = _natural_reader_options;
   } else if (file_carrier && _reader_options->get_column_names() !=
@@ -1552,25 +1537,12 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
     effective.natural_read = effective.names.empty();
     for (std::size_t i = 0; i < effective.names.size(); ++i)
       effective.projected.push_back(i);
-  } else if (file_carrier) {
-    auto schema = sirius::io::parquet_helpers::extract_schema(
-      metadata, true, resolved_metadata->original_logical_annotations);
-    auto found = std::find(schema.names.begin(), schema.names.end(), *file_carrier);
-    if (found == schema.names.end())
-      throw std::invalid_argument("Parquet carrier missing from physical schema");
-    effective.names       = {*file_carrier};
-    effective.bound_types = {schema.types[std::distance(schema.names.begin(), found)]};
-    effective.projected   = {0};
-  } else if (!metadata_only) {
-    effective.natural_read = !file_projected;
-    for (std::size_t d = 0; d < _plan->data_columns.size(); ++d) {
-      auto const& column = _plan->data_columns[d];
-      effective.names.push_back(column.name);
-      effective.bound_types.push_back(
-        _info->bound_types.empty() ? sirius::to_duckdb(_info->returned_types.at(column.primary_idx))
-                                   : _info->bound_types.at(column.primary_idx));
-      effective.projected.push_back(static_cast<uint32_t>(d));
-    }
+  } else {
+    effective = name_result.reader_projection;
+    if (!metadata_only && !file_carrier && effective.bound_types.empty())
+      for (auto const& column : _plan->data_columns)
+        effective.bound_types.push_back(
+          sirius::to_duckdb(_info->returned_types.at(column.primary_idx)));
   }
   // Metadata-only reads validate footer evidence with an empty physical projection.
   auto physical_contract        = _info->physical_contract;
@@ -2477,7 +2449,8 @@ filtered_table parquet_scan_core::materialize_metadata_to_table(
   std::shared_ptr<like_multiliteral_cache const> cache,
   expression_query_policy policy,
   std::shared_ptr<visibility_bindings const> visibility,
-  std::vector<required_visibility_input> visibility_owners)
+  std::vector<required_visibility_input> visibility_owners,
+  scan_execution_context execution)
 {
   auto const& physical = dynamic_cast<parquet_split_info const&>(info);
   // Reuse the production certificate check before either decoder is dispatched.
@@ -2486,7 +2459,9 @@ filtered_table parquet_scan_core::materialize_metadata_to_table(
     check_bit(later_check::footer_per_file) | check_bit(later_check::profile_per_file);
   if (_info->physical_schema || physical.field_mapping)
     required_checks |= check_bit(later_check::schema_per_file);
-  validate_split_for_gpu(_info->contract_id, required_checks, std::nullopt, info);
+  if (!execution.validation ||
+      !execution.validation->consume(info, _info->contract_id, required_checks))
+    validate_split_for_gpu(_info->contract_id, required_checks, std::nullopt, info);
   if (physical.field_mapping) {
     auto const& mapping = *physical.field_mapping;
     if (mapping.program().contract != _info->contract_id)
@@ -2499,22 +2474,81 @@ filtered_table parquet_scan_core::materialize_metadata_to_table(
           transparent::late_failure_cause::certificate,
           "mapped split does not match its approved file");
   }
-  auto program                    = std::make_shared<materialization_program>();
-  program->contract               = execution_contract();
-  program->generation             = 1;
-  program->catalogue              = _catalogue;
-  program->predicates             = _catalogue->size();
-  program->required_visibility    = visibility;
-  program->input_layout           = execution_layout(false);
-  program->output_layout          = execution_layout(true);
-  program->validate_output_schema = false;
+  std::call_once(_materializer_once, [&] {
+    auto program                    = std::make_shared<materialization_program>();
+    program->contract               = execution_contract();
+    program->generation             = 1;
+    program->catalogue              = _catalogue;
+    program->predicates             = _catalogue->size();
+    program->input_layout           = execution_layout(false);
+    program->output_layout          = execution_layout(true);
+    program->validate_output_schema = false;
+    _default_mapping = std::make_shared<certified_mapping const>(program, _plan, _plan);
+    _coverage        = {_catalogue, _reader_conjuncts};
+    _default_reader  = default_reader{
+      [this](auto const& split, auto const& inputs, auto const& target, auto task_stream, auto)
+        -> decode_result {
+        if (!split.reader_input) throw std::invalid_argument("default reader input missing");
+        return {decode_metadata_to_table(*split.reader_input,
+                                         target,
+                                         task_stream,
+                                         inputs.like_swar_fastpath,
+                                         inputs.like_cache,
+                                         inputs.expression_policy,
+                                          {split.attempt, split.logical_input, split.stop}),
+                {}};
+      }};
+  });
+  auto mapping = _default_mapping;
+  if (_decode_override || physical.field_mapping || visibility || physical.plan != _plan) {
+    auto program = std::make_shared<materialization_program>(*_default_mapping->program);
+    program->required_visibility = visibility;
+    if (_decode_override) {
+      program->input_types.emplace();
+      for (auto const& column : physical.plan->data_columns)
+        program->input_types->push_back(
+          sirius::require_cudf_type(_info->returned_types.at(column.primary_idx)));
+      for (auto const& column : physical.plan->virtual_columns)
+        program->input_types->push_back(sirius::require_cudf_type(column.type));
+      for (auto const& output : physical.plan->output_layout)
+        program->output_types.push_back(
+          output.source == scan_plan::output_entry::DATA
+            ? program->input_types->at(output.idx)
+            : sirius::require_cudf_type(physical.plan->partition_columns.at(output.idx).type));
+      program->validate_output_schema = true;
+    }
+    mapping = std::make_shared<certified_mapping const>(
+      std::move(program),
+      physical.plan,
+      physical.field_mapping ? std::shared_ptr<void const>(physical.field_mapping)
+                             : std::shared_ptr<void const>(_plan),
+      physical.field_mapping);
+  }
   prepared_split prepared;
-  prepared.info   = info.weak_from_this().lock();
-  prepared.plan   = physical.plan;
-  prepared.slices = physical.rg_slices;
-  prepared.dependencies.assign(info.dependencies().begin(), info.dependencies().end());
+  prepared.info         = info.weak_from_this().lock();
+  prepared.reader_input = &info;
+  prepared.plan         = physical.plan;
+  prepared.slices       = physical.rg_slices;
+  prepared.dependencies = info.dependencies();
+  if (!prepared.info) {
+    // Standalone callers can pass uniquely owned metadata. Retain one snapshot
+    // for retirement; production shared scan_info needs no row-group copies.
+    struct metadata_snapshot {
+      std::vector<row_group_slice> slices;
+      std::vector<split_dependencies> dependencies;
+    };
+    auto retained = std::make_shared<metadata_snapshot>(
+      physical.rg_slices,
+      std::vector<split_dependencies>(info.dependencies().begin(), info.dependencies().end()));
+    prepared.slices         = retained->slices;
+    prepared.dependencies   = retained->dependencies;
+    prepared.metadata_owner = std::move(retained);
+  }
   prepared.partition_values = physical.partition_values;
-  prepared.logical_input    = reinterpret_cast<uintptr_t>(&info);
+  prepared.logical_input =
+    execution.logical_input ? execution.logical_input : reinterpret_cast<uintptr_t>(&info);
+  prepared.attempt = execution.attempt;
+  prepared.stop    = execution.stop;
   if (_decode_override) {
     auto domain = std::make_shared<lineage_domain>();
     std::unordered_map<std::string, std::size_t> files;
@@ -2533,6 +2567,10 @@ filtered_table parquet_scan_core::materialize_metadata_to_table(
       int64_t offset    = 0;
       std::size_t group = 0;
       for (auto selected : slice.row_group_indices) {
+        if (selected < 0 || static_cast<std::size_t>(selected) < group ||
+            static_cast<std::size_t>(selected) >= slice.file_metadata->row_groups.size())
+          throw std::invalid_argument(
+            "decoder input row groups must be ordered unique and in range");
         while (group < static_cast<std::size_t>(selected))
           offset += slice.file_metadata->row_groups[group++].num_rows;
         auto count = slice.file_metadata->row_groups[group++].num_rows;
@@ -2546,32 +2584,20 @@ filtered_table parquet_scan_core::materialize_metadata_to_table(
     prepared.input_domain = std::move(domain);
   }
   materializer_inputs inputs;
-  inputs.visibility         = std::move(visibility_owners);
-  inputs.coverage           = {_catalogue, _reader_conjuncts, _reader_pushdown_is_complete};
-  inputs.mapping            = {program,
-                               physical.field_mapping,
-                               std::make_shared<mapping_certification const>(*program, physical.plan, _plan)};
-  inputs.expression_policy  = policy;
-  inputs.like_swar_fastpath = like;
-  inputs.like_cache         = cache;
-  inputs.phase              = materialization_phase::decoded;
-  inputs.validation         = (_decode_override || physical.requires_row_positions)
-                                ? validation_policy::qualified_lineage
-                                : validation_policy::legacy_iceberg;
-  auto reader               = std::make_shared<reader_task>();
-  reader->decode =
-    [this, &info, like, cache, policy](
-      auto const&, auto const&, auto const& target, auto task_stream, auto) -> decode_result {
-    return {decode_metadata_to_table(info, target, task_stream, like, cache, policy), {}};
-  };
-  if (!_decode_override) inputs.reader = std::move(reader);
-  auto result =
-    materialize_shared(prepared,
-                       inputs,
-                       _decode_override ? _decode_override : decode_fn{parquet_cudf_decode},
-                       space,
-                       stream,
-                       rmm::device_async_resource_ref(space.get_default_allocator()));
+  inputs.visibility          = std::move(visibility_owners);
+  inputs.coverage            = _coverage;
+  inputs.mapping             = std::move(mapping);
+  inputs.expression_policy   = policy;
+  inputs.like_swar_fastpath  = like;
+  inputs.like_cache          = cache;
+  inputs.phase               = materialization_phase::decoded;
+  inputs.validation          = (_decode_override || physical.requires_row_positions)
+                                 ? validation_policy::qualified_lineage
+                                 : validation_policy::legacy_iceberg;
+  auto mr                    = rmm::device_async_resource_ref(space.get_default_allocator());
+  auto result                = _decode_override
+                                 ? materialize_shared(prepared, inputs, _decode_override, space, stream, mr)
+                                 : _default_reader->materialize(prepared, inputs, space, stream, mr);
   result.batch.attempt       = prepared.attempt;
   result.batch.logical_input = prepared.logical_input;
   if (_decode_override)
@@ -2589,7 +2615,8 @@ filtered_table parquet_scan_core::decode_metadata_to_table(
   ::cuda::stream_ref stream,
   bool like_swar_fastpath,
   std::shared_ptr<const like_multiliteral_cache> like_cache,
-  expression_query_policy policy)
+  expression_query_policy policy,
+  scan_execution_context execution)
 {
   auto const& split = static_cast<parquet_split_info const&>(info);
   // All-pruned fallback split (parquet_batch_coalescer::flush): every slice
@@ -2810,7 +2837,9 @@ filtered_table parquet_scan_core::decode_metadata_to_table(
     options.policy             = policy;
     options.like_swar_fastpath = like_swar_fastpath;
     options.like_cache         = like_cache;
-    options.logical_input      = reinterpret_cast<uintptr_t>(&info);
+    options.logical_input =
+      execution.logical_input ? execution.logical_input : reinterpret_cast<uintptr_t>(&info);
+    options.attempt = execution.attempt;
     if (can_project_during_filter()) options.filter_projection = output_data_positions(*_plan);
     materialization_steps steps;
     steps.residual = [&](materialized_batch& b) {

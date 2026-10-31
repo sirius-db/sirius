@@ -239,6 +239,23 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   auto carrier             = map();
   CHECK(carrier->leaves == projected->leaves);
   CHECK(carrier->footer == footer);
+  plan.data_columns = {{0, "absent"}};
+  auto fallback     = map();
+  CHECK(fallback->selection == mapping_selection::full_correspondence);
+  CHECK(fallback->reader_projection.natural_read);
+  mapping_request virtual_request{rule_set_id::parquet_name_v1, footer, path, plan, program};
+  plan.virtual_columns               = {{99,
+                                         "file",
+                                         sirius::logical_type::make(sirius::type_id::VARCHAR),
+                                         scan_plan::parquet_virtual_column_kind::FILENAME,
+                                         1}};
+  virtual_request.allow_file_carrier = true;
+  auto virtual_mapping               = map_file(virtual_request);
+  REQUIRE(std::holds_alternative<std::shared_ptr<mapping_result const>>(virtual_mapping));
+  auto actual = std::get<std::shared_ptr<mapping_result const>>(virtual_mapping);
+  CHECK(actual->file_carrier == std::optional<std::string>{"scalar"});
+  CHECK_FALSE(actual->reader_projection.natural_read);
+  CHECK(actual->reader_projection.names == std::vector<std::string>{"scalar"});
   for (auto const& row : counts.mapper_refusals)
     for (auto const& count : row)
       CHECK(count.load() == 0);

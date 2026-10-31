@@ -11,6 +11,32 @@
 #include <unordered_set>
 
 namespace sirius::op::scan {
+row_lineage::row_lineage(row_position_state state,
+                         std::shared_ptr<lineage_domain const> domain,
+                         std::vector<std::pair<int64_t, int64_t>> runs,
+                         std::shared_ptr<cudf::column const> per_row)
+  : _selection(std::make_shared<selection const>(
+      state, std::move(domain), std::move(runs), std::move(per_row), false, nullptr))
+{
+}
+
+std::shared_ptr<lineage_domain const> row_lineage::source_binding() const
+{
+  return is_validated() ? data().binding : domain();
+}
+
+bool row_lineage::matches_domain(std::shared_ptr<lineage_domain const> const& expected) const
+{
+  return domain() == expected || (expected && domain() && is_validated() &&
+                                  data().binding == expected && *domain() == *expected);
+}
+
+void row_lineage::seal_validation(std::shared_ptr<lineage_domain const> binding)
+{
+  _selection = std::make_shared<selection const>(
+    state(), domain(), runs(), per_row(), true, binding ? std::move(binding) : domain());
+}
+
 void validate_lineage_composition(row_lineage const&,
                                   row_lineage const&,
                                   ::cuda::stream_ref,
@@ -39,20 +65,23 @@ row_lineage compact(std::shared_ptr<lineage_domain const> domain,
                     ::cuda::stream_ref stream,
                     rmm::device_async_resource_ref mr)
 {
-  row_lineage result;
-  result.domain = std::move(domain);
-  result.state  = row_position_state::runs;
+  auto state = row_position_state::runs;
+  std::vector<std::pair<int64_t, int64_t>> runs;
+  std::shared_ptr<cudf::column const> per_row;
   for (auto ordinal : ordinals) {
-    if (!result.runs.empty() && result.runs.back().first + result.runs.back().second == ordinal)
-      ++result.runs.back().second;
+    if (!runs.empty() && runs.back().first + runs.back().second == ordinal)
+      ++runs.back().second;
     else
-      result.runs.emplace_back(ordinal, 1);
+      runs.emplace_back(ordinal, 1);
   }
-  if (ordinals.size() == static_cast<std::size_t>(result.input_domain_length()) &&
-      (ordinals.empty() || (result.runs.size() == 1 && result.runs.front().first == 0))) {
-    result.state = row_position_state::identity;
-    result.runs.clear();
-  } else if (result.runs.size() * 2 > ordinals.size() && !ordinals.empty()) {
+  int64_t length = 0;
+  for (auto const& run : domain->file_runs)
+    length = add(length, run.count);
+  if (ordinals.size() == static_cast<std::size_t>(length) &&
+      (ordinals.empty() || (runs.size() == 1 && runs.front().first == 0))) {
+    state = row_position_state::identity;
+    runs.clear();
+  } else if (runs.size() * 2 > ordinals.size() && !ordinals.empty()) {
     if (ordinals.size() > static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max()))
       throw std::invalid_argument("lineage selection exceeds column limit");
     auto column = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT64},
@@ -67,17 +96,18 @@ row_lineage compact(std::shared_ptr<lineage_domain const> domain,
                                   stream.get()));
     // Host selection storage may be released by the caller immediately.
     CUDF_CUDA_TRY(cudaStreamSynchronize(stream.get()));
-    result.per_row = std::move(column);
-    result.runs.clear();
-    result.state = row_position_state::per_row;
+    per_row = std::move(column);
+    runs.clear();
+    state = row_position_state::per_row;
   }
-  return result;
+  return {state, std::move(domain), std::move(runs), std::move(per_row)};
 }
 }  // namespace
 
 int64_t row_lineage::input_domain_length() const
 {
-  int64_t count = 0;
+  auto const& [state, domain, runs, per_row, validated, binding] = data();
+  int64_t count                                                  = 0;
   if (domain)
     for (auto const& run : domain->file_runs)
       count = add(count, run.count);
@@ -86,6 +116,7 @@ int64_t row_lineage::input_domain_length() const
 
 int64_t row_lineage::output_length() const
 {
+  auto const& [state, domain, runs, per_row, validated, binding] = data();
   switch (state) {
     case row_position_state::identity: return input_domain_length();
     case row_position_state::per_row: return per_row ? per_row->size() : 0;
@@ -99,9 +130,17 @@ int64_t row_lineage::output_length() const
   }
 }
 
-void row_lineage::validate(int64_t rows) const
+void row_lineage::validate(int64_t rows) const { validate_impl(rows, false); }
+
+void row_lineage::validate_impl(int64_t rows, bool strict) const
 {
+  auto const& [state, domain, runs, per_row, validated, binding] = data();
   if (rows < 0) throw std::invalid_argument("negative lineage cardinality");
+  if (!strict && is_validated()) {
+    if (recoverable(state) && output_length() != rows)
+      throw std::invalid_argument("lineage cardinality mismatch");
+    return;
+  }
   if (domain) {
     for (auto const& file : domain->files)
       if (file.identity.empty() || file.rows < 0)
@@ -143,7 +182,8 @@ void row_lineage::validate(int64_t rows) const
 
 std::vector<int64_t> row_lineage::ordinals_on(::cuda::stream_ref stream) const
 {
-  auto const count = output_length();
+  auto const& [state, domain, runs, per_row, validated, binding] = data();
+  auto const count                                               = output_length();
   validate(count);
   std::vector<int64_t> values(count);
   if (state == row_position_state::identity) {
@@ -166,6 +206,7 @@ std::vector<int64_t> row_lineage::ordinals_on(::cuda::stream_ref stream) const
 
 std::pair<std::size_t, int64_t> row_lineage::resolve(int64_t ordinal) const
 {
+  auto const& [state, domain, runs, per_row, validated, binding] = data();
   if (!domain || ordinal < 0 || ordinal >= input_domain_length())
     throw std::invalid_argument("lineage ordinal outside input domain");
   for (auto const& run : domain->file_runs) {
@@ -179,6 +220,7 @@ row_lineage row_lineage::select(std::span<int64_t const> selected,
                                 ::cuda::stream_ref stream,
                                 rmm::device_async_resource_ref mr) const
 {
+  auto const& [state, domain, runs, per_row, validated, binding] = data();
   if (!recoverable(state)) return *this;
   validate_on(output_length(), stream, mr);
   if (state == row_position_state::per_row) return select_host_lineage(*this, selected, stream, mr);
@@ -200,7 +242,9 @@ row_lineage row_lineage::select(std::span<int64_t const> selected,
       }
     }
   }
-  return compact(domain, ordinals, stream, mr);
+  auto result = compact(domain, ordinals, stream, mr);
+  if (is_validated()) result.seal_validation(source_binding());
+  return result;
 }
 
 row_lineage row_lineage::compose(row_lineage const& before,
@@ -208,38 +252,34 @@ row_lineage row_lineage::compose(row_lineage const& before,
                                  ::cuda::stream_ref stream,
                                  rmm::device_async_resource_ref mr)
 {
-  if (!recoverable(before.state)) return before;
-  if (!recoverable(step.state)) {
-    row_lineage result;
-    result.state  = row_position_state::lost;
-    result.domain = before.domain;
-    return result;
-  }
+  if (!recoverable(before.state())) return before;
+  if (!recoverable(step.state())) { return {row_position_state::lost, before.domain()}; }
   before.validate_on(before.output_length(), stream, mr);
   step.validate_on(step.output_length(), stream, mr);
   if (step.input_domain_length() != before.output_length())
     throw std::invalid_argument("selection composition input length mismatch");
   // The overwhelmingly common identity composition stays interval-only.
-  if (before.state == row_position_state::identity &&
-      before.domain->files.size() == step.domain->files.size() &&
-      before.domain->file_runs.size() == step.domain->file_runs.size()) {
+  if (before.state() == row_position_state::identity &&
+      before.domain()->files.size() == step.domain()->files.size() &&
+      before.domain()->file_runs.size() == step.domain()->file_runs.size()) {
     bool same = true;
-    for (std::size_t i = 0; i < before.domain->files.size(); ++i)
-      same &= before.domain->files[i].identity == step.domain->files[i].identity &&
-              before.domain->files[i].rows == step.domain->files[i].rows;
-    for (std::size_t i = 0; i < before.domain->file_runs.size(); ++i) {
-      auto const& a = before.domain->file_runs[i];
-      auto const& b = step.domain->file_runs[i];
+    for (std::size_t i = 0; i < before.domain()->files.size(); ++i)
+      same &= before.domain()->files[i].identity == step.domain()->files[i].identity &&
+              before.domain()->files[i].rows == step.domain()->files[i].rows;
+    for (std::size_t i = 0; i < before.domain()->file_runs.size(); ++i) {
+      auto const& a = before.domain()->file_runs[i];
+      auto const& b = step.domain()->file_runs[i];
       same &= a.file == b.file && a.first == b.first && a.count == b.count;
     }
     if (same) {
-      auto result   = step;
-      result.domain = before.domain;
+      row_lineage result{step.state(), before.domain(), step.runs(), step.per_row()};
+      if (before.is_validated() && step.is_validated())
+        result.seal_validation(before.source_binding());
       return result;
     }
   }
   validate_lineage_composition(before, step, stream, mr);
-  if (step.state == row_position_state::identity) return before;
+  if (step.state() == row_position_state::identity) return before;
   auto selected = step.ordinal_column(stream, mr);
   return before.select(selected->view(), stream, mr);
 }
@@ -251,28 +291,28 @@ row_lineage row_lineage::concatenate(std::span<row_lineage const> parts,
   auto domain = std::make_shared<lineage_domain>();
   std::vector<std::pair<int64_t, int64_t>> compact_runs;
   bool has_device  = std::any_of(parts.begin(), parts.end(), [](auto const& part) {
-    return part.state == row_position_state::per_row;
+    return part.state() == row_position_state::per_row;
   });
   int64_t offset   = 0;
   bool unavailable = false, all_none = true;
   for (auto const& part : parts) {
-    part.validate(recoverable(part.state) ? part.output_length() : 0);
-    all_none &= part.state == row_position_state::none;
-    unavailable |= !recoverable(part.state);
-    if (recoverable(part.state)) {
+    part.validate(recoverable(part.state()) ? part.output_length() : 0);
+    all_none &= part.state() == row_position_state::none;
+    unavailable |= !recoverable(part.state());
+    if (recoverable(part.state())) {
       part.validate_on(part.output_length(), stream, mr);
       if (has_device) {
         // Device selections are concatenated without staging per-row values on the host.
-      } else if (part.state == row_position_state::identity) {
+      } else if (part.state() == row_position_state::identity) {
         if (part.output_length()) compact_runs.emplace_back(offset, part.output_length());
       } else {
-        for (auto const& [first, count] : part.runs)
+        for (auto const& [first, count] : part.runs())
           compact_runs.emplace_back(add(offset, first), count);
       }
     }
-    if (part.domain) {
+    if (part.domain()) {
       std::vector<std::size_t> remap;
-      for (auto const& file : part.domain->files) {
+      for (auto const& file : part.domain()->files) {
         auto found = std::find_if(domain->files.begin(), domain->files.end(), [&](auto const& f) {
           return f.identity == file.identity;
         });
@@ -281,41 +321,40 @@ row_lineage row_lineage::concatenate(std::span<row_lineage const> parts,
         remap.push_back(found - domain->files.begin());
         if (found == domain->files.end()) domain->files.push_back(file);
       }
-      for (auto run : part.domain->file_runs) {
+      for (auto run : part.domain()->file_runs) {
         run.file = remap[run.file];
         domain->file_runs.push_back(run);
       }
     }
     offset = add(offset, part.input_domain_length());
   }
-  if (unavailable) {
-    row_lineage result;
-    result.state = all_none ? row_position_state::none : row_position_state::lost;
-    if (!all_none) result.domain = std::move(domain);
-    return result;
-  }
-  if (has_device) {
-    row_lineage result;
-    result.domain  = std::move(domain);
-    result.state   = row_position_state::per_row;
-    result.per_row = concatenate_lineage_ordinals(parts, stream, mr);
-    return result;
-  }
+  if (unavailable)
+    return {all_none ? row_position_state::none : row_position_state::lost,
+            all_none ? nullptr : std::move(domain)};
   row_lineage result;
-  result.domain = std::move(domain);
-  result.state  = row_position_state::runs;
-  for (auto const& run : compact_runs) {
-    if (!result.runs.empty() && result.runs.back().first + result.runs.back().second == run.first)
-      result.runs.back().second += run.second;
-    else
-      result.runs.push_back(run);
+  if (has_device) {
+    result = {row_position_state::per_row,
+              std::move(domain),
+              {},
+              concatenate_lineage_ordinals(parts, stream, mr)};
+  } else {
+    std::vector<std::pair<int64_t, int64_t>> runs;
+    for (auto const& run : compact_runs) {
+      if (!runs.empty() && runs.back().first + runs.back().second == run.first)
+        runs.back().second += run.second;
+      else
+        runs.push_back(run);
+    }
+    auto const identity =
+      (runs.empty() && offset == 0) ||
+      (runs.size() == 1 && runs.front().first == 0 && runs.front().second == offset);
+    if (identity) runs.clear();
+    result = {identity ? row_position_state::identity : row_position_state::runs,
+              std::move(domain),
+              std::move(runs)};
   }
-  if ((result.runs.empty() && offset == 0) ||
-      (result.runs.size() == 1 && result.runs.front().first == 0 &&
-       result.runs.front().second == offset)) {
-    result.state = row_position_state::identity;
-    result.runs.clear();
-  }
+  if (std::all_of(parts.begin(), parts.end(), [](auto const& part) { return part.is_validated(); }))
+    result.seal_validation();
   return result;
 }
 }  // namespace sirius::op::scan
