@@ -636,6 +636,8 @@ class sirius_scan_manager {
   void start();
 
   /// \brief Stop the worker thread pool and the driver. Idempotent.
+  /// Join producers without releasing query providers or checkpoint keys.
+  void stop_workers();
   void stop();
 
   /// \brief Pin (or extend) the GPU-tier entry for a table.

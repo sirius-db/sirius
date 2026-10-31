@@ -2642,16 +2642,27 @@ bool sirius_scan_manager::holds_any_checkpoint_key() const noexcept
 
 void sirius_scan_manager::start() {}
 
+void sirius_scan_manager::stop_workers()
+{
+  // Runtime admission must be closed before taking this snapshot. Retain providers until the
+  // caller has also established GPU completion; host worker retirement alone is insufficient.
+  std::vector<std::shared_ptr<query_scan_manager_state>> states;
+  {
+    std::lock_guard lock(_query_states_mutex);
+    for (auto const& [id, state] : _query_states)
+      states.push_back(state);
+  }
+  for (auto const& state : states)
+    state->drain();
+  _coordinators.stop();
+  _native_readers.stop();
+  _thread_pool.stop();
+}
+
 void sirius_scan_manager::stop()
 {
-  // Every query's scan work must be off the pool before the pool stops: a sequencer parked on
-  // a dequeue that will never be satisfied would otherwise never return.
-  // Requires the runtime owner to prevent new queries and finish preparation construction.
-  // Concurrent prepare/stop is outside this manager shutdown contract.
+  stop_workers();
   reset_all();
-  _coordinators.stop();
-  _native_readers.stop();  // Every accepted reader has closed and returned its lease.
-  _thread_pool.stop();
 }
 
 namespace {

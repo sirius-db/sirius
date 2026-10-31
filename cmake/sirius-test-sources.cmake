@@ -56,6 +56,7 @@ set(TEST_SOURCES
     test/cpp/exec/test_batch_stream.cpp
     test/cpp/exec/test_bounded_thread_pool.cpp
     test/cpp/exec/test_inspectable_mpsc.cpp
+    test/cpp/exec/test_gpu_completion_lifetime.cpp
     test/cpp/exec/test_query_lifecycle_registry.cpp
   test/cpp/exec/test_query_admission.cpp
   test/cpp/exec/test_scoped_dispatcher.cpp
