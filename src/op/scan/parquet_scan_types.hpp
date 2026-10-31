@@ -63,6 +63,7 @@ class read_view_registry;
 
 namespace sirius::op {
 class sirius_dynamic_filter_set;
+class dynamic_filter_snapshot;
 }  // namespace sirius::op
 
 namespace sirius::op::scan {
@@ -186,7 +187,7 @@ struct filename_column_size_estimate {
 [[nodiscard]] filename_column_size_estimate estimate_filename_column_size(std::size_t rows,
                                                                           std::size_t path_bytes);
 
-/// Iceberg keeps its contiguous row-group/delete-layout contract.
+/// Physical source semantics are independent of reader provenance requests.
 enum class parquet_source_kind { PLAIN_PARQUET, ICEBERG };
 enum class parquet_read_mode { READER, METADATA_ONLY };
 
@@ -244,6 +245,22 @@ class parquet_split_info : public scan_info {
   /// row-group stats cudf cannot compare against an AST literal. The
   /// filter still applies post-decode via @c expression_evaluator.
   bool disable_filter_pushdown = false;
+  // Delete matching for qualified virtual-column scans. Without virtual columns,
+  // Iceberg retains unfiltered input runs and applies deletes before predicates.
+  bool requires_row_positions = false;
+  // Reader decisions are fixed when the coalescer emits this split. Dynamic
+  // eligibility is subsequently restricted to the task device, never refreshed.
+  bool static_reader_filter_ready = false;
+  std::shared_ptr<sirius::op::dynamic_filter_snapshot const> position_filter_snapshot;
+  std::size_t unfiltered_working_bytes = 0;
+
+  [[nodiscard]] bool position_reader_filter_available(
+    std::optional<int> device = std::nullopt) const noexcept;
+  [[nodiscard]] bool reader_filter_disabled(int device) const noexcept
+  {
+    return disable_filter_pushdown ||
+           (requires_row_positions && !position_reader_filter_available(device));
+  }
   /// Hive partition values for this split, in @c scan_plan::partition_columns
   /// order. Empty when the plan has no partition columns. Kept on the split so
   /// @ref materialize_table can call @c assemble_scan_output inline on the
@@ -264,24 +281,30 @@ class parquet_split_info : public scan_info {
 
   [[nodiscard]] std::size_t estimated_working_set_bytes() const noexcept override
   {
-    std::size_t total = 0;
-    std::size_t runs  = 0;
-    for (auto const& s : rg_slices) {
-      total = memory::saturating_add(total, s.estimated_decode_working_bytes);
-      runs  = memory::saturating_add(runs, s.row_group_indices.size());
-    }
-    // Iceberg retains the per-row-group virtual path and its pieces/concat peak.
-    // Plain reader and metadata-only modes already charge their different allocation
-    // lifetimes in each row group's decode_working_bytes.
-    return source_kind == parquet_source_kind::ICEBERG && plan &&
-               plan->has_user_virtual_columns() && runs > 1
-             ? memory::saturating_mul(total, std::size_t{2})
-             : total;
+    return position_working_set_bytes(std::nullopt);
   }
 
-  // Preparation retains the decoded inputs until the consumer takes the split.  The
-  // concatenated output is an execution-time peak and must not be charged as another
-  // preparation allocation; otherwise virtual-column batches reserve the same bytes twice.
+  [[nodiscard]] std::size_t estimated_working_set_bytes_for_device(
+    int device) const noexcept override
+  {
+    return position_working_set_bytes(device);
+  }
+
+  [[nodiscard]] std::size_t position_working_set_bytes(std::optional<int> device) const noexcept
+  {
+    if ((requires_row_positions && !position_reader_filter_available(device)) ||
+        (!requires_row_positions && unfiltered_working_bytes))
+      return unfiltered_working_bytes;
+    std::size_t total = 0;
+    for (auto const& s : rg_slices) {
+      total = memory::saturating_add(total, s.estimated_decode_working_bytes);
+    }
+    return total;
+  }
+
+  // Keep the additive charge from file preparation until the split is consumed.
+  // Device-specific reader decisions affect execution workspace only, never the
+  // preparation input registered in the coordinator ledger.
   [[nodiscard]] std::size_t preparation_bytes() const noexcept override
   {
     std::size_t total = 0;
@@ -327,6 +350,12 @@ class parquet_file_scan_info : public scan_info {
     std::size_t decode_working_bytes;
     std::size_t compressed_bytes;
     int64_t num_rows;
+    // Virtual routes retain their preparation charge, but can omit the extra
+    // deletion-position workspace when no reader predicate is committed.
+    std::optional<std::size_t> unfiltered_working_bytes;
+    // A file may span several splits; only selected groups with deletes need
+    // hidden reader positions. Other groups still budget for a possible merge.
+    bool requires_row_positions = false;
   };
 
   /// Parsed footer metadata for this file.
@@ -353,6 +382,10 @@ class parquet_file_scan_info : public scan_info {
   /// cannot compare against an AST literal — reader-side pushdown must be
   /// disabled for any split that includes it.
   bool disable_filter_pushdown = false;
+  // Set by the core only for a qualified Iceberg virtual-column route/expression.
+  bool position_filter_eligible   = false;
+  bool requires_row_positions     = false;
+  bool static_reader_filter_ready = false;
   /// No projected carrier was resolved (for example an empty footer). Reader mode
   /// retains the natural-schema fallback if neither a per-file virtual-scan
   /// carrier nor the bind-selected carrier is available. Metadata-only mode does

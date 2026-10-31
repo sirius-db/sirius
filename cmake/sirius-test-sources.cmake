@@ -6,6 +6,7 @@ set(TEST_SOURCES
     test/cpp/io/cache/test_metadata_store.cpp
     test/cpp/io/test_object_identity.cpp
     test/cpp/scan_manager/test_preparation_readiness.cpp
+    test/cpp/scan_manager/test_preparation_parquet.cpp
     test/cpp/scan_manager/test_coordinator_pool.cpp
     test/cpp/scan_manager/test_preparation_output_lifetime.cpp
     test/cpp/scan_manager/test_native_reader_executor.cpp
@@ -347,7 +348,11 @@ set(TEST_SOURCES
     test/cpp/scan/test_parquet_schema_mapping.cpp
     test/cpp/scan/test_parquet_null_count_pruning.cpp
     test/cpp/scan/test_residual_filter.cpp
+    test/cpp/scan/test_scan_execution.cpp
     test/cpp/scan/test_scan_materialization.cpp
+    test/cpp/scan/test_row_lineage.cpp
+    test/cpp/scan/test_shared_materializer.cpp
+    test/cpp/scan/test_field_mapper.cpp
     test/cpp/scan/test_arrow_import_resources.cpp
     test/cpp/scan/test_scan_filter_cast_ranges.cpp
     test/cpp/scan/test_scan_filter_ranges.cpp

@@ -66,6 +66,10 @@ class parquet_gpu_ingestible : public gpu_ingestible {
     if (!can_serve_cached_view()) return std::nullopt;
     return _core.view_layout(input, elided);
   }
+  void record_resident_execution(filtered_table& result) const override
+  {
+    _core.record_resident_execution(result);
+  }
   bool has_row_filter() const noexcept override { return _core.has_row_filter(); }
   bool can_report_survivors() const noexcept override { return true; }
   scan_filter_analysis const& filter_analysis() const override { return _core.filter_analysis(); }
@@ -92,9 +96,11 @@ class parquet_gpu_ingestible : public gpu_ingestible {
     ::cuda::stream_ref stream,
     bool like,
     std::shared_ptr<const sirius::like_multiliteral_cache> cache,
-    expression_query_policy policy = {}) override
+    expression_query_policy policy   = {},
+    scan_execution_context execution = {}) override
   {
-    return _core.materialize_metadata_to_table(info, space, stream, like, std::move(cache), policy);
+    return _core.materialize_metadata_to_table(
+      info, space, stream, like, std::move(cache), policy, {}, {}, execution);
   }
 
  private:

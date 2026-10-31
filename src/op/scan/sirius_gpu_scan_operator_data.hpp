@@ -157,6 +157,7 @@ void attach_membership_probes(Representation& rep,
  */
 class scan_operator_input : public op::operator_data {
  public:
+  scan_execution_context execution;
   enum class prefetch_start { immediate, deferred };
   /// Hint the IO layer about every range this split will read, then publish it
   /// to @p readahead -- in that order, which is why both belong here.
@@ -301,6 +302,8 @@ class scan_operator_input : public op::operator_data {
   [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override;
 
   [[nodiscard]] std::size_t get_estimated_working_set_size_in_bytes() const override;
+  [[nodiscard]] std::size_t get_estimated_working_set_size_in_bytes(
+    std::optional<int> device) const;
 
   [[nodiscard]] const scan_info& get_scan_info() const
   {

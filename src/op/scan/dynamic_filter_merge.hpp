@@ -545,4 +545,10 @@ struct consumer_test_access {
   scan_plan const& plan,
   int device_id = -1);
 
+/// Whether this frozen snapshot contributes a reader AST. With no target device,
+/// reports potential applicability; admission must supply its actual device.
+[[nodiscard]] bool has_reader_dynamic_filter(sirius::op::dynamic_filter_snapshot const& filters,
+                                             scan_plan const& plan,
+                                             std::optional<int> device_id) noexcept;
+
 }  // namespace sirius::op::scan

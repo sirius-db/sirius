@@ -510,6 +510,16 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(::cuda::strea
                                      thrust::cuda_category(),
                                      "injected GPU task launch failure");
       }
+      if (auto* scan_input =
+            dynamic_cast<op::scan::scan_operator_input*>(operator_input_output_data.get())) {
+        scan_input->execution.attempt = uint64_t{local_state.retry_count} + 1;
+        // Retry tasks retain the original task identity; allocator addresses
+        // can be reused by a later input in the same scan.
+        scan_input->execution.logical_input =
+          local_state.original_task_id.value_or(get_task_id()) + 1;
+        if (auto completion = get_completion_handler())
+          scan_input->execution.stop = completion->execution_stop_token();
+      }
       operator_input_output_data = run_one_operator(
         op,
         *operator_input_output_data,
@@ -926,7 +936,10 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
   // working-set estimate too — it seeds the cold-start guess below via
   // input_stats, so do not gate this on residency.
   if (input_type == op::operator_data_type::GPU_SCAN && ls._input_data) {
-    working_set_bytes = ls._input_data->get_estimated_working_set_size_in_bytes();
+    working_set_bytes =
+      scan_input && target_space
+        ? scan_input->get_estimated_working_set_size_in_bytes(target_space->get_device_id())
+        : ls._input_data->get_estimated_working_set_size_in_bytes();
   }
 
   std::size_t num_batches = 0;

@@ -15,7 +15,9 @@
  */
 
 #include "io/cache/types.hpp"
+#include "op/scan/gpu_row_positions.hpp"
 #include "op/scan/owning_table_view.hpp"
+#include "op/scan/scan_execution_record.hpp"
 #include "op/scan/table_scan/scan_contract.hpp"
 
 #include <expression/ast/node.hpp>
@@ -27,12 +29,18 @@
 #include <memory>
 #include <span>
 #include <stdexcept>
+#include <stop_token>
 #include <utility>
 #include <vector>
 
 #pragma once
 
 namespace sirius::op::scan {
+struct scan_execution_context {
+  uint64_t attempt       = 1;
+  uint64_t logical_input = 0;
+  std::stop_token stop;
+};
 
 //===----------------------------------------------------------------------===//
 // ingestible_table_info
@@ -302,6 +310,13 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
     return estimated_bytes();
   }
 
+  /// Refine execution workspace for the task's target device, without changing
+  /// the additive preparation charge or observing new execution decisions.
+  [[nodiscard]] virtual std::size_t estimated_working_set_bytes_for_device(int) const noexcept
+  {
+    return estimated_working_set_bytes();
+  }
+
  private:
   /// Fan-in for @ref prefetch: counts the per-datasource completions down to a
   /// single report.  Shared by every callback, so it outlives the call that
@@ -377,6 +392,7 @@ enum class filter_state {
  * Bundles the materialized cudf::table with a tag describing how much of
  * the split's filter + projection work was applied during materialization.
  */
+struct row_lineage;
 struct filtered_table {
   owning_table_view table;
   filter_state state{filter_state::UNFILTERED};
@@ -393,6 +409,17 @@ struct filtered_table {
   /// Bytes the cached batch behind a resident view stores, read through the lease @c table holds;
   /// zero on every other path.
   std::size_t stored_bytes{0};
+  /// Additive during migration; a producer must qualify before this drives decisions.
+  std::optional<scan_execution_record> execution;
+  /// Present only while an internal positional consumer still needs reader survivors.
+  std::unique_ptr<gpu_row_positions> row_positions;
+  // Certified batch requirements, not reconstructed from execution.visibility_applied.
+  // Null for ordinary Parquet; Iceberg shares an empty binding when it has no deletes.
+  std::shared_ptr<visibility_bindings const> required_visibility;
+  std::shared_ptr<row_lineage const> lineage_record;
+  uint64_t attempt       = 1;
+  uint64_t logical_input = 0;
+  std::shared_ptr<std::vector<std::string> const> partition_values;
 };
 
 /**

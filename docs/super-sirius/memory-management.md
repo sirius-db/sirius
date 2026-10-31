@@ -70,7 +70,30 @@ memory_capacity = 1TB;          // total spill capacity
 
 ## Parquet scan working sets
 
-Virtual-column reader scans budget selected rows before filtering, including cuDF source/row indexes, output columns and filter/cast scratch. Plain Parquet no longer needs the old per-row-group concatenation allowance; Iceberg still does. Filename estimates include characters, offsets and construction buffers, with saturating arithmetic.
+Index estimates use the input rows in selected row groups, before reader filtering. A cuDF row index is UINT64 (8 B/row); a source index is INT32 (4 B/row), omitted for a single reader source. Estimates allow both pre-filter and filtered index columns to coexist.
+
+Iceberg scans without virtual columns use interval deletion before query predicates when deletes are present. They add no internal row/source index workspace and have no alternative position peak selected at split emission.
+
+Virtual scans already budget their output columns, reader indices and selection/cast scratch; deletion adds only missing index allowances and delete storage. Source costs are conservative before coalescing, so virtual estimates may retain a source allowance for a single-file split. Filename estimates include characters, offsets and construction buffers. Arithmetic saturates on overflow. These are buffer estimates, not an exact bound on all cuDF decoder scratch.
+
+File/split preparation charges retain the same additive row-group estimate from registration through consumption. Batch fill and execution omit the deletion-position allowance when the split's selected row groups contain no deletes. If groups with and without deletes share a filtered split, its position allowance covers every input row. Plain Parquet and Iceberg reader-mode virtual scans reserve one combined reader result rather than per-row-group table concatenation.
+
+Virtual scans eligible for reader-position deletion capture their dynamic-filter snapshot when the split is emitted. Admission
+checks the same snapshot and static reader translation as decode, on the target GPU. Without a
+usable reader predicate, the execution estimate excludes the internal position workspace and
+decode retains interval deletion; filters published later cannot enable positions for that split.
+User-requested virtual columns retain their own workspace. Pipeline memory history and retry
+floors still apply independently; this removes the position estimate, not other measured peaks.
+
+Canonical lineage is opt-in. Identity and interval selections retain host interval
+metadata; device selections use one INT64 ordinal column. Conversion consumes the
+cuDF UINT64 row buffer in place, then releases source indices.
+`lineage_conversion_workspace_bytes()` budgets conversion validation scratch;
+`shared_materialization_workspace_bytes()` provides a conservative additional
+selection/visibility peak for independent decoder adapters. These callers must
+also budget their decoder, mapping and requested virtual-column outputs. Neither
+estimate changes the additive preparation ledger or timed batch-fill measure,
+and default Parquet/Iceberg scans do not reserve canonical-lineage scratch.
 
 Metadata-only scans reserve synthesized columns and temporary buffers, but no compressed data or data prefetch. Typed empty virtual columns allocate no scalar buffers. The coalescer and execution task use the same read mode for their estimates.
 

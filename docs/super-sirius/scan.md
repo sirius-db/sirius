@@ -37,8 +37,8 @@ The single GPU scan source operator. It owns:
 
 **Execution.** `execute(input_data, stream)` runs one split:
 
-1. `gpu_ingestible::materialize_table(split, stream)` produces a `filtered_table` — the materialized `cudf::table` (wrapped in an `owning_table_view`) plus a `filter_state` tag describing how much filter/projection the materialize step already applied.
-2. If the tag is `ROW_FILTERED_AND_PROJECTED` the table is already in final output layout and is released directly; otherwise `gpu_ingestible::post_filter_and_project(...)` applies any pending row filter and projection. The internal resident Parquet checkpoint can instead combine the residual with membership masks before one projected gather; its placement flag is true by default (see [Dynamic Filters](dynamic-filters.md#resident-parquet-checkpoint)).
+1. `gpu_ingestible::materialize_table(split, stream)` produces a `filtered_table` — the materialized `cudf::table` (wrapped in an `owning_table_view`), the retained legacy `filter_state`, and an optional execution record. Migrated Parquet/Iceberg producers report completed work in that record.
+2. A legacy `ROW_FILTERED_AND_PROJECTED` result is released directly. Migrated results pass through `gpu_ingestible::post_filter_and_project(...)`, which validates the record and executes only pending work, including skipping assembly when already complete. The internal resident Parquet checkpoint can instead combine the residual with membership masks before one projected gather; its placement flag is true by default (see [Dynamic Filters](dynamic-filters.md#resident-parquet-checkpoint)).
 3. If the plan carries a compressed-materialization physical sidecar, exact runtime bounds verify wider-to-narrower casts for columns containing non-null values before the table is normalized to that complete physical schema. Such a sidecar exists only for scans the pinned cache serves with pin-time-narrowed columns (the plan-time residency gate); fresh unpinned scans carry no sidecar and skip normalization entirely. A resident cached input without an override is restored to the native schema when its stored numeric carrier is narrow. Fresh feature-off scans retain their existing natural shape and types. See [Compressed Materialization](compressed-materialization.md) for the narrowing/restoration rules and [Compressed Pinning](compressed-pinning.md) for Simpatico-compressed pinned chunks.
 4. The result is wrapped in a `data_batch` tagged with the split's target `memory_space` and returned as a `pipelineable_operator_data` for the downstream pipeline.
 
@@ -100,7 +100,7 @@ Two polymorphic carriers separate per-table from per-split state (`gpu_ingestibl
 | `ROW_FILTERED` | The reader applied the row-level filter (parquet reader-side pushdown). |
 | `ROW_FILTERED_AND_PROJECTED` | Fully assembled to output layout (parquet hive-partition path, or a per-query-cached table). |
 
-The operator skips `post_filter_and_project` when the state is already `ROW_FILTERED_AND_PROJECTED`, a permitted table transfer succeeds, or the enabled resident checkpoint supplies the projected output.
+The operator skips `post_filter_and_project` for a legacy `ROW_FILTERED_AND_PROJECTED` result, when a permitted table transfer succeeds, or when the enabled resident checkpoint supplies the projected output. An authoritative execution record is validated by the shared consumer even when its producer already assembled the output.
 
 Required scan predicates, including `IS NOT NULL` introduced by DuckDB's string-predicate
 rewrites, belong to the scan's row-level evaluator. Native reads and pinned batches retain
@@ -126,7 +126,7 @@ There is no factory class. Each implementation provides a free `make_ingestible(
 
 ### Parquet ingestible
 
-`parquet_gpu_ingestible` prunes files using supported `filename`/`file_index` predicates, then uses footer statistics to select row groups and batch compatible files. Plain Parquet virtual-column scans use one cuDF read per split. cuDF preserves original row positions through filtering; Sirius maps reader-local source indexes back to bound file identities. Partial pushdown keeps the full residual predicate.
+`parquet_gpu_ingestible` prunes files using supported `filename`/`file_index` predicates, then uses footer statistics to select row groups and batch compatible files. Plain Parquet virtual-column scans use one cuDF read per split. cuDF preserves original row positions through filtering; Sirius maps reader-local source indexes back to bound file identities. Partial pushdown reports the stable IDs of complete conjuncts actually executed, and shared filtering evaluates the remaining conjuncts.
 
 The source-pruning helper evaluates these shapes on the bound `filename` (VARCHAR) or `file_index` (UBIGINT):
 
@@ -136,7 +136,7 @@ The source-pruning helper evaluates these shapes on the bound `filename` (VARCHA
 
 Expression comparisons require the column reference on the left and the constant on the right; `BETWEEN` is handled only when lowered to supported comparisons. Only a definite false or SQL NULL result eliminates a file. Unsupported shapes, including `LIKE`, `NOT IN`, casts, and collation expressions, return unknown and conservatively retain files unless another conjunct rules them out. DuckDB may prune filename predicates earlier when selecting the bound file list, independently of this helper. Virtual predicates remain in the residual, and `file_row_number` is not used for source pruning.
 
-Virtual-only queries with no physical value dependency or potential dynamic filter can synthesize rows from footer counts without a data read. Iceberg retains its existing per-row-group layout and delete handling. See [scan_plan](#scan_plan) for column layout and carrier selection.
+Plain Parquet virtual-only queries with no physical value dependency or potential dynamic filter can synthesize rows from footer counts without a data read. See [scan_plan](#scan_plan) for column layout and carrier selection.
 
 ### DuckDB-native ingestible
 
@@ -144,9 +144,11 @@ Virtual-only queries with no physical value dependency or potential dynamic filt
 
 ### Iceberg ingestible
 
-`iceberg_gpu_ingestible` composes `parquet_scan_core`, as does the plain Parquet facade. The adapter supplies Iceberg schema mapping and delete preparation. Files whose schema already matches retain the existing reader route and pruning. Eligible evolved files use the `iceberg_flat_v1` mapping profile before visibility and residual filtering. Files with deletes disable reader-side row filtering so that original row positions remain available.
+`iceberg_gpu_ingestible` composes `parquet_scan_core` and supplies schema mapping and delete preparation. Matching schemas retain the existing reader and pruning; eligible evolved files use `iceberg_flat_v1` mapping before deletion and residual filtering. Virtual-column scans use one cuDF read per split, separating reader indices from physical fields before mapping and output assembly.
 
-Suppressing pushdown is load-bearing, not conservative. Positional deletes and deletion vectors are keyed on a row's position **within its data file**; if cuDF drops rows during decode, decoded positions no longer identify file positions and the mapping is unrecoverable. Materialize therefore returns `UNFILTERED` and `post_filter_and_project` applies the predicate *after* deletes — which is also Iceberg's required order. A non-`UNFILTERED` state from the base throws. Row-group pruning stays on and is safe: it only removes rows the predicate could not have matched, and offsets come from the footer, which lists pruned groups.
+Positional deletes and deletion vectors identify original rows **within a data file**. On qualified virtual-column scans, safe reader comparisons or AST-capable dynamic filters can run before deletion using cuDF's original UINT64 row indices. Virtual columns reuse those indices; source indices are needed only for multiple sources, and paths remain per source. The GPU delete operation validates source/range bindings and releases hidden positions before gathering survivors. A filename-only query may need additional row indices for delete matching after reader filtering.
+
+Without virtual columns, scans carrying deletes suppress reader filtering and use interval deletion before query predicates. They add no internal position columns, alternative position budget or position-filter snapshot. Scans without deletes retain their existing reader filtering. Bulk/hybrid, mapped, Hive and unsafe-type routes retain their existing restrictions. Virtual scans preserve unsafe-expression evaluation even with empty delete sets. Without reader selection, deletion uses the existing interval mapping and rejects filtered rows without positions. See [working-set accounting](memory-management.md#parquet-scan-working-sets).
 
 Row mapping is a **list of runs, not one offset**. `build_batch_layout` emits one `batch_row_run` per (file, row group), because splits span files and pruning leaves gaps; the decoded row count must equal the sum of run rows or it throws.
 
@@ -451,7 +453,7 @@ the direct column-merge API also rejects a merge while readers retain the existi
 
 When many small files (or row-group ranges) each yield a tiny GPU batch, per-task scheduling and kernel-launch overhead dominates. Coalescing is a responsibility of each `gpu_ingestible`, exposed through the `batch_coalescer` interface (`op/scan/batch_coalescer.hpp`): as the metadata side emits per-unit `scan_info`s, the sequencer feeds each one to the coalescer via `push()` (which may buffer and return zero or more ready batches) and `flush()` (remaining buffered batches at end of input).
 
-- **`parquet_batch_coalescer`** (in `parquet_scan_core.cpp`): accumulates each file's pruned row groups into `parquet_split_info` batches sized to `approximate_batch_size` decoded column-buffer bytes, including filter-only columns. A single large file fills multiple batches; several small files bundle into one batch — but only when they share identical hive-partition values and the same pushdown decision (a mismatch on either forces a flush). It also seals a batch before it would exceed `cudf::size_type` rows. The downstream `cudf::io::read_parquet` reads all bundled slices in one invocation. Iceberg virtual-column scans retain per-row-group reads and concatenation for their delete layout.
+- **`parquet_batch_coalescer`** (in `parquet_scan_core.cpp`): accumulates each file's pruned row groups into `parquet_split_info` batches sized to `approximate_batch_size` decoded column-buffer bytes, including filter-only columns. A single large file fills multiple batches; several small files bundle into one batch — but only when they share identical hive-partition values and the same pushdown decision (a mismatch on either forces a flush). It also seals a batch before it would exceed `cudf::size_type` rows. The downstream `cudf::io::read_parquet` reads all bundled slices in one invocation, including virtual-column scans. Different delete-position demands on virtual scans also separate batches.
 - **`duckdb_native_batch_coalescer`** (in `duckdb_native_gpu_ingestible.cpp`): accumulates row-group ranges up to `approximate_batch_size` decoded bytes, and additionally seals a batch before any VARCHAR column's accumulated bytes would cross the cuDF int32 string-offset threshold.
 
 The coalescer runs inside the per-query sequencer (`load_balancing_scan_batch_coalescer`), so coalescing, device balancing, and prefetch hinting happen at one place per emitted batch.
@@ -532,7 +534,7 @@ When filter pushdown is enabled and the `gpu_expression_translator` successfully
 
 Reader-side pushdown is a per-split decision: an FLBA-decimal safety probe can disable it for a file, in which case the cached DuckDB filter expression is evaluated through `expression_evaluator` on the decoded batch in `post_filter_and_project`.
 
-Ordinary Parquet virtual-column scans can use cuDF's source and row index columns to preserve file and row identity during reader filtering. Static `filename`/`file_index` filters can discard whole sources before footer work; row-group statistics pruning remains a separate step. Iceberg retains its existing row layout and positional-delete handling.
+Ordinary Parquet virtual-column scans use cuDF's source and row index columns to preserve identity during reader filtering. Static `filename`/`file_index` filters can discard whole sources before footer work; row-group statistics pruning remains separate. See [Iceberg ingestible](#iceberg-ingestible) for deletion ordering.
 
 **Filter translation path:** `TableFilterSet` -> `convert_table_filters_to_expression()` (skips `OPTIONAL_FILTER` and partition-column filters) -> `gpu_expression_translator` -> cuDF AST tree. Ordinary scans also skip top-level `IS_NOT_NULL`; virtual-column scans retain it in the residual predicate evaluated after decoding. Null-count pruning collects null-test predicates directly from the original `TableFilterSet`, independently of expression translation.
 
@@ -727,20 +729,39 @@ The converter builds a `gpu_ingestible` and parks it on the `GPU_SCAN` operator.
 
 ## Shared materialization components
 
-`parquet_gpu_ingestible` and `iceberg_gpu_ingestible` compose `parquet_scan_core`.
-The core retains file enumeration, footer preparation, coalescing, reader options,
-and the existing bulk/general decoder selection. Iceberg owns snapshot and delete
-applicability, suppresses row filtering during decode when positions are needed,
-and delegates the mask operation to `positional_visibility`.
+`parquet_gpu_ingestible` and `iceberg_gpu_ingestible` share `parquet_scan_core`.
+Iceberg supplies snapshot/delete applicability and delegates masking to
+`positional_visibility`, using either reader positions or unfiltered input runs.
+Iceberg scans without user-requested virtual columns retain unfiltered reader
+output and apply interval deletion before query predicates whenever deletes are
+present. They request no internal row/source indices or position workspace.
+Virtual-column scans retain one cuDF read per split and request provenance on
+demand; qualified reader filtering may also supply positions for delete matching.
+Position demand follows the split's selected row groups. When their ranges contain
+no deletes, the adapter verifies that fact against the bound delete sets and records
+visibility as complete without hidden indices or a delete mask. Requested virtual
+columns remain independent of this decision. This also preserves eligible reader
+filtering when footer pruning removed every delete-bearing row group.
+These splits capture dynamic filters at emission.
+Admission and decode use that snapshot and the target device's reader capability;
+pending or inapplicable filters add no internal position workspace. Late filters
+remain available to downstream dynamic-filter consumers. Static reader predicates
+and explicitly requested virtual columns continue to drive their own work.
 
-`finish_materialization()` orders mapping, visibility, residual evaluation, and
-projection. A batch carries its contract and execution generation, cardinality,
-completion flags, and per-conjunct predicate progress. Pruning is not enforcement;
-an answer is a bound BOOL8 slot. `residual_filter::against_progress()` refuses
-unknown conjuncts and attempts to reconstruct values overwritten by answers.
-The legacy Parquet bridge retains its existing AST, survivor rowid, and scan-plan
-assembly. Its one expression-completion flag is derived from legacy state at the
-bridge; it does not introduce a second mutable conjunct map.
+`finish_materialization()` orders mapping, visibility, residual evaluation and
+projection. `scan_execution_record` binds completed work to the scan contract,
+generation and ordered layout. Stable conjunct IDs are assigned before reader
+exclusions; static coverage, BOOL8 answer bindings, mapping, delete-set bindings
+and projection remain independent. Pruning and dynamic filters do not complete
+static predicates. Answers retain their slots until projection, and
+`residual_filter::against_progress()` rejects unknown IDs or unavailable inputs.
+
+Parquet reader, bulk/hybrid, mapped, metadata-only and Hive inline results use
+validated producer records to execute only pending work. Resident/stolen results
+use the same decisions after translating their observed decode facts; malformed
+legacy answer reports retain the old fallback and report a shadow mismatch.
+Invalid authoritative records fail before publication. Required and applied
+delete-set identities are compared so completed deletions are skipped.
 
 Source lineage is either original-file runs, explicit original positions, or
 unavailable. Runs retain offsets across pruned row groups. Visibility requires
@@ -816,6 +837,48 @@ A direct GPU reader can supply an owning batch to the same validator and finish
 without an Arrow or CPU-vector round trip. These helpers do not register a new SQL
 source adapter or relax the existing Iceberg equality-delete, snapshot or
 remote-DV gates. Schema evolution is limited to the qualified flat profile described above.
+
+## Shared GPU decoder boundary
+
+`materialize_shared` accepts an owned prepared input, a program-bound mapping
+certificate and a `decode_fn`. Parquet calls this boundary before its existing
+pipeline finish; an independent GPU decoder can call it directly without Arrow
+or a Parquet footer. Complete materialization runs normalization and virtual
+column assembly, pending file visibility, residual predicates and output assembly
+in that order. Parquet's inline Hive and deferred residual paths use the same
+semantic functions. Caller expression policy, stream and allocator are preserved.
+`scoped_step_observer` observes actual work under a test-only opt-in; it cannot
+replace work or propagate callback exceptions into a query.
+
+The certificate pins the exact approved normalization. Replacement results must
+match the bound input/output types, with explicit BOOL8 answer and row-count-carrier
+exceptions. Deferred replacement decoding retires borrowed staging on the caller's
+stream before returning; the default reader keeps its existing completion protocol.
+Prepared row-group/dependency views retain shared input without deep copies;
+standalone uniquely owned inputs retain one metadata snapshot for retirement.
+Production task retries preserve logical-input identity and advance the attempt;
+query terminal errors request the decoder's cancellation token.
+
+The program shares the full immutable predicate catalogue, including expressions,
+materialized slots and answer eligibility. `row_lineage` separately retains an
+immutable input domain and identity, interval or device ordinal selection.
+Composition preserves the original domain; concatenation shifts by input length,
+not survivor count. `none` and `lost` never imply identity. Reader positions are
+converted only for a canonical-lineage consumer, reusing the row buffer and
+releasing source indices; unused reader positions are discarded. Canonical deletion
+uploads only positions within the original input intervals, preserving eager V2
+signed-position behavior and upstream deferred-DV validation. Ordinary Iceberg interval/reader-position deletion
+keeps its existing representation. A legacy `row_domain` view can be generated
+explicitly from the canonical record; independently authoritative copies are
+rejected. Resident/decompression records preserve actual answers and whole-filter
+completion; native MVCC continues to use its separate visibility contract.
+
+`table_scan/field_mapper.hpp` wraps the existing name, Iceberg field-ID and flat
+compatibility rules. It returns immutable mapping results or structured refusals,
+retains original physical-check evidence and diagnostics, and counts only rules
+actually attempted. Results distinguish field correspondence from the effective
+reader projection, including a replacement carrier or natural-read fallback.
+Preparation still reads and certifies each footer once.
 
 ## Key Files
 

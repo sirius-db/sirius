@@ -28,6 +28,7 @@ target_sources(
           scan/parquet_schema_mapping.cpp
           scan/scan_plan.cpp
           scan/scan_filter_analysis.cpp
+          scan/scan_execution_record.cpp
           scan/scan_utils.cpp
           scan/sirius_gpu_scan_operator.cpp
           scan/sirius_gpu_scan_operator_data.cpp
@@ -35,12 +36,17 @@ target_sources(
           scan/parquet_gpu_ingestible.cpp
           scan/parquet_scan_core.cpp
           scan/materialization_contract.cpp
+          scan/shared_materializer.cpp
+          scan/row_lineage.cpp
+          scan/row_lineage.cu
           scan/positional_visibility.cpp
+          scan/positional_visibility.cu
           scan/field_id_mapping.cpp
           scan/arrow_materializer.cpp
           scan/parquet_materialize.cpp
           scan/duckdb_native_gpu_ingestible.cpp
           scan/table_scan/bound_read_view.cpp
+          scan/table_scan/field_mapper.cpp
           scan/table_scan/parquet_physical_profile.cpp
           scan/iceberg_metadata_reader.cpp
           scan/puffin_reader.cpp

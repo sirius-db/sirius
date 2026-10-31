@@ -182,6 +182,23 @@ class residual_filter {
   [[nodiscard]] std::unique_ptr<sirius::ast::node> against_progress(
     std::span<predicate_progress const> progress) const;
   [[nodiscard]] std::size_t size() const noexcept { return _conjuncts.size(); }
+  [[nodiscard]] duckdb::Expression const& expression(std::size_t id) const
+  {
+    return *_conjuncts.at(id).expression;
+  }
+  [[nodiscard]] std::span<std::size_t const> columns(std::size_t id) const
+  {
+    return _conjuncts.at(id).value_slots;
+  }
+  [[nodiscard]] bool answerable(std::size_t id) const
+  {
+    return _conjuncts.at(id).answered_at.has_value();
+  }
+  [[nodiscard]] std::vector<predicate_progress> progress_from_answers(
+    std::span<std::size_t const> answered_positions, bool answers_enforced) const;
+  [[nodiscard]] std::vector<predicate_progress> progress_from_legacy_answers(
+    std::span<std::size_t const> answered_positions, bool answers_enforced) const;
+  void validate_progress(std::span<predicate_progress const> progress) const;
 
  private:
   struct conjunct {
@@ -190,6 +207,7 @@ class residual_filter {
     /// position that answer occupies.
     std::optional<std::size_t> answered_at;
     std::vector<std::size_t> value_slots;
+    duckdb::unique_ptr<duckdb::Expression> expression;
   };
   std::vector<conjunct> _conjuncts;
 };
