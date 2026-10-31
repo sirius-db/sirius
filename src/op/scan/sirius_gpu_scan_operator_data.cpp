@@ -254,7 +254,9 @@ void scan_operator_input::update(io::cache::scan_stage site) const
 }
 
 void scan_operator_input::prepare_for_processing(
-  const ::cucascade::memory::memory_space* requested_memory_space, ::cuda::stream_ref stream)
+  const ::cucascade::memory::memory_space* requested_memory_space,
+  ::cuda::stream_ref stream,
+  const telemetry::batch_telemetry_info& clone_telemetry)
 {
   gpu_memory_space = const_cast<::cucascade::memory::memory_space*>(requested_memory_space);
   if (!std::holds_alternative<std::shared_ptr<cucascade::data_batch>>(materialization_info)) {
@@ -284,7 +286,8 @@ void scan_operator_input::prepare_for_processing(
       // clone path: keep shared pin storage on its original GPU, and bind only
       // this input to the copy on the executor's device. The helper rechecks
       // residency under its lock and waits for the source writer before copying.
-      auto prepared = pipeline::lock_and_prepare_batch(batch, requested_memory_space, stream);
+      auto prepared =
+        pipeline::lock_and_prepare_batch(batch, requested_memory_space, stream, clone_telemetry);
       if (!prepared) throw std::runtime_error("Cannot prepare cached scan on its assigned GPU");
       std::visit(
         [&](auto& locked) {

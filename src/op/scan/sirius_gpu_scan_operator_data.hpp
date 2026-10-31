@@ -279,8 +279,10 @@ class scan_operator_input : public op::operator_data {
    *                               null when the caller has no preference.
    * @param stream CUDA stream used for resident conversion.
    */
+  using operator_data::prepare_for_processing;
   void prepare_for_processing(const ::cucascade::memory::memory_space* requested_memory_space,
-                              ::cuda::stream_ref stream) override;
+                              ::cuda::stream_ref stream,
+                              const telemetry::batch_telemetry_info& clone_telemetry) override;
 
   using converted_column_replacements = std::vector<std::unique_ptr<cudf::column>>;
   using converted_table_builder =

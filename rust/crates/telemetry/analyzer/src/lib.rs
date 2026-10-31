@@ -1,7 +1,7 @@
 #[cfg(target_arch = "wasm32")]
 compile_error!("sirius-telemetry-analyzer does not support wasm32");
 
-use quent_dynamic_attributes::DynamicValue;
+use quent_dynamic_attributes::{DynamicAttribute, DynamicValue};
 use quent_events::Event;
 pub use quent_query_engine_analyzer::QueryEngineModel;
 use quent_query_engine_analyzer::entities;
@@ -11,16 +11,18 @@ use quent_query_engine_analyzer::{
     EngineEntity, OperatorEntity, PlanEntity, PortEntity, QueryEntity, WorkerEntity,
 };
 use quent_query_engine_ui::{
-    DataFlowTimelineBinned, EntityRef, OperatorFilter, QueryBundle, QueryEntities, QueryFilter,
+    DataFlowTimelineBinned, EntityListItem, EntityListResponse, EntityRef, OperatorFilter,
+    QueryBundle, QueryEngineFsm, QueryEntities, QueryFilter,
 };
 use quent_store::{
     context::ContextSet,
     event::{CombinedEventLoader, EventLoader, filesystem::Loader},
 };
 use quent_ui::{
-    FiniteStateMachine, Resource as UiResource, ResourceGroup as UiResourceGroup,
-    ResourceGroupNode, ResourceTree, convert_resource_tree,
-    fsm::FsmTypeDeclaration,
+    FiniteStateMachine, FsmTransition, FsmUsage, Resource as UiResource,
+    ResourceGroup as UiResourceGroup, ResourceGroupNode, ResourceTree, convert_resource_tree,
+    entities::request::SortDir,
+    fsm::{FsmStateTypeDecl, FsmTransitionDecl, FsmTypeDecl, FsmTypeDeclaration},
     quantity::{CapacityKind, QuantitySpec},
     timeline::{
         categorical::{
@@ -64,7 +66,7 @@ use quent_analyzer::{
 use quent_time::{SpanNanoSec, TimeNanoSec, TimeUnixNanoSec, Timestamp, to_nanosecs, to_secs};
 use uuid::Uuid;
 
-pub use crate::boilerplate::{DataBatch, DataBatchExt, Task, TaskExt};
+pub use crate::boilerplate::{BatchClone, DataBatch, DataBatchExt, Task, TaskExt};
 use crate::{
     model::{MEMORY_SPACE_BYTES_CAPACITY_NAME, SiriusModel, SiriusModelBuilder},
     view::SiriusModelQueryView,
@@ -78,6 +80,10 @@ pub mod view;
 
 const TASK_TYPE_NAME: &str = "task";
 const DATA_BATCH_TYPE_NAME: &str = "data_batch";
+const BATCH_CLONE_TYPE_NAME: &str = "batch_clone";
+const CLONE_STARTED: &str = "started";
+const CLONE_COMPLETED: &str = "completed";
+const CLONE_FAILED: &str = "failed";
 /// Synthetic series: the memory reservation tasks hold while
 /// preparing/computing (may overlap the input batches' resident bytes).
 const TASK_WORKING_SPACE_STATE: &str = "task_working_space";
@@ -649,9 +655,11 @@ impl UiAnalyzer for SiriusUiAnalyzer {
 
         let task_decl = Task::fsm_type_declaration();
         let data_batch_decl = DataBatch::fsm_type_declaration();
+        let clone_decl = clone_ui_declaration();
         let fsm_types = [
             (task_decl.name.clone(), task_decl),
             (data_batch_decl.name.clone(), data_batch_decl),
+            (clone_decl.name.clone(), clone_decl),
         ]
         .into_iter()
         .collect();
@@ -716,6 +724,10 @@ impl UiAnalyzer for SiriusUiAnalyzer {
         &self,
         request: quent_ui::entities::request::EntityListRequest<QueryFilter, OperatorFilter>,
     ) -> AnalyzerResult<quent_query_engine_ui::EntityListResponse> {
+        if request.entry.filter.entity_type_name.is_none() {
+            return self.list_all_entities(request);
+        }
+
         let query_id = request.app_params.query_id;
         let epoch = self.query_engine_model().query_epoch(query_id)?;
         let entry = request.entry;
@@ -748,10 +760,11 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             epoch,
         };
 
-        // The model holds two distinct FSM types (tasks and data batches), so
-        // dispatch on the requested entity type rather than a single collection.
-        // Absent an explicit type, default to tasks.
+        // The UI displays clone operations separately from batch lifetimes.
         match entry.filter.entity_type_name.as_deref() {
+            Some(BATCH_CLONE_TYPE_NAME) => {
+                self.list_batch_clones(&query_operators, &operator_filter, query)
+            }
             Some(DATA_BATCH_TYPE_NAME) => entities::list_entities(
                 &DataBatchCollection(&self.model.data_batches),
                 |data_batch| {
@@ -762,7 +775,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                 DataBatchExt::try_to_ui_fsm,
                 query,
             ),
-            _ => entities::list_entities(
+            Some(TASK_TYPE_NAME) => entities::list_entities(
                 &TaskCollection(&self.model.tasks),
                 |task| {
                     task.pipeline_uuid()
@@ -779,6 +792,9 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                 },
                 query,
             ),
+            other => Err(AnalyzerError::InvalidArgument(format!(
+                "{other:?} is not a known entity type in this model"
+            ))),
         }
     }
 
@@ -845,6 +861,17 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                                 None,
                             )?;
                         }
+                        Some(BATCH_CLONE_TYPE_NAME) => {
+                            for copy in self.filtered_batch_clones(&view, &fsm_filter, config.span)
+                            {
+                                for usage in copy
+                                    .usages()
+                                    .filter(|usage| usage.resource_id() == req.resource_id)
+                                {
+                                    builder.try_push(CLONE_STARTED, &usage)?;
+                                }
+                            }
+                        }
                         other => {
                             Err(AnalyzerError::InvalidArgument(format!(
                                 "{:?} is not a known entity type in this model",
@@ -884,6 +911,12 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                         .into_iter()
                         .flat_map(|db| db.usages())
                         .filter(|usage| usage.resource_id() == req.resource_id),
+                    )?;
+                    builder.try_extend(
+                        self.filtered_batch_clones(&view, &fsm_filter, config.span)
+                            .into_iter()
+                            .flat_map(|copy| copy.usages())
+                            .filter(|usage| usage.resource_id() == req.resource_id),
                     )?;
                     Ok(SingleTimelineResponse {
                         config: config_secs,
@@ -955,6 +988,17 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                                 None,
                             )?;
                         }
+                        Some(BATCH_CLONE_TYPE_NAME) => {
+                            for copy in self.filtered_batch_clones(&view, &fsm_filter, config.span)
+                            {
+                                for usage in copy
+                                    .usages()
+                                    .filter(|usage| resource_ids.contains(&usage.resource_id()))
+                                {
+                                    builder.try_push(CLONE_STARTED, &usage)?;
+                                }
+                            }
+                        }
                         other => {
                             Err(AnalyzerError::InvalidArgument(format!(
                                 "{:?} is not a known entity type in this model",
@@ -994,6 +1038,12 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                         .into_iter()
                         .flat_map(|db| db.usages())
                         .filter(|usage| resource_ids.contains(&usage.resource_id())),
+                    )?;
+                    builder.try_extend(
+                        self.filtered_batch_clones(&view, &fsm_filter, config.span)
+                            .into_iter()
+                            .flat_map(|copy| copy.usages())
+                            .filter(|usage| resource_ids.contains(&usage.resource_id())),
                     )?;
                     Ok(SingleTimelineResponse {
                         config: config_secs,
@@ -1154,6 +1204,28 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                             && data_batch.matches_filter(&builder.3)
                         {
                             builder.1.try_push(state_name, &usage)?;
+                        }
+                    }
+                }
+            }
+        }
+
+        for copy in view.batch_clones() {
+            for usage in copy.usages() {
+                let resource_id = usage.resource_id();
+                if let Some(indices) = plain_index.get(&resource_id) {
+                    for &index in indices {
+                        let slot = &mut plain_builders[index];
+                        if self.clone_matches(copy, &slot.3) {
+                            slot.1.try_push(&usage)?;
+                        }
+                    }
+                }
+                if let Some(indices) = per_state_index.get(&resource_id) {
+                    for &index in indices {
+                        let slot = &mut per_state_builders[index];
+                        if slot.4 == BATCH_CLONE_TYPE_NAME && self.clone_matches(copy, &slot.3) {
+                            slot.1.try_push(CLONE_STARTED, &usage)?;
                         }
                     }
                 }
@@ -1327,6 +1399,30 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                             && data_batch.matches_filter(&slot.op_filter)
                         {
                             slot.builder.try_push(state_name, &usage)?;
+                        }
+                    }
+                }
+            }
+        }
+
+        for copy in view.batch_clones() {
+            for usage in copy.usages() {
+                let resource_id = usage.resource_id();
+                if let Some(indices) = plain_index.get(&resource_id) {
+                    for &index in indices {
+                        let slot = &mut plain_builders[index];
+                        if self.clone_matches(copy, &slot.op_filter) {
+                            slot.builder.try_push(&usage)?;
+                        }
+                    }
+                }
+                if let Some(indices) = per_state_index.get(&resource_id) {
+                    for &index in indices {
+                        let slot = &mut per_state_builders[index];
+                        if slot.entity_type_name == BATCH_CLONE_TYPE_NAME
+                            && self.clone_matches(copy, &slot.op_filter)
+                        {
+                            slot.builder.try_push(CLONE_STARTED, &usage)?;
                         }
                     }
                 }
@@ -1631,7 +1727,247 @@ impl UiAnalyzer for SiriusUiAnalyzer {
     }
 }
 
+// Quent's detail API uses FSM-shaped timelines; the model remains a copy operation.
+fn clone_ui_declaration() -> FsmTypeDecl {
+    FsmTypeDecl {
+        name: BATCH_CLONE_TYPE_NAME.to_owned(),
+        states: [CLONE_STARTED, CLONE_COMPLETED, CLONE_FAILED]
+            .into_iter()
+            .map(|name| FsmStateTypeDecl {
+                name: name.to_owned(),
+                usages: if name == CLONE_STARTED {
+                    vec!["channel".to_owned()]
+                } else {
+                    Vec::new()
+                },
+            })
+            .collect(),
+        transitions: vec![
+            FsmTransitionDecl::Entry(CLONE_STARTED.to_owned()),
+            FsmTransitionDecl::Transition(CLONE_STARTED.to_owned(), CLONE_COMPLETED.to_owned()),
+            FsmTransitionDecl::Transition(CLONE_STARTED.to_owned(), CLONE_FAILED.to_owned()),
+            FsmTransitionDecl::Exit(CLONE_COMPLETED.to_owned()),
+            FsmTransitionDecl::Exit(CLONE_FAILED.to_owned()),
+        ],
+    }
+}
+
+fn clone_in_window(copy: &BatchClone, window: SpanNanoSec) -> bool {
+    match copy.span() {
+        Some(span) if span.duration() > 0 => span.intersects(&window),
+        // Incomplete and instantaneous copies remain point events.
+        _ => window.contains_timestamp(copy.earliest_timestamp()),
+    }
+}
+
 impl SiriusUiAnalyzer {
+    fn list_all_entities(
+        &self,
+        mut request: quent_ui::entities::request::EntityListRequest<QueryFilter, OperatorFilter>,
+    ) -> AnalyzerResult<EntityListResponse> {
+        let page = request.entry.page.take();
+        let direction = request.entry.sort.dir;
+        let mut items = Vec::new();
+
+        // Query each type without paging, then rank and page the combined matches.
+        for type_name in [TASK_TYPE_NAME, DATA_BATCH_TYPE_NAME, BATCH_CLONE_TYPE_NAME] {
+            request.entry.filter.entity_type_name = Some(type_name.to_owned());
+            items.extend(self.list_entities(request.clone())?.items);
+        }
+        items.sort_by(|a, b| {
+            let order = a.usage_duration_s.total_cmp(&b.usage_duration_s);
+            let order = match direction {
+                SortDir::Asc => order,
+                SortDir::Desc => order.reverse(),
+            };
+            order.then_with(|| a.entity.fsm.id.cmp(&b.entity.fsm.id))
+        });
+
+        let total = items.len() as u32;
+        let skip = page.map_or(0, |page| page.page.saturating_mul(page.max) as usize);
+        let take = page.map_or(usize::MAX, |page| page.max as usize);
+        Ok(EntityListResponse {
+            items: items.into_iter().skip(skip).take(take).collect(),
+            total,
+        })
+    }
+
+    fn clone_matches(&self, copy: &BatchClone, filter: &OperatorFilter) -> bool {
+        filter.operator_ids.is_empty()
+            || copy
+                .source_batch_id()
+                .and_then(|id| self.model.data_batches.get(&id))
+                .is_some_and(|batch| batch.matches_filter(filter))
+    }
+
+    fn filtered_batch_clones<'a>(
+        &self,
+        view: &'a SiriusModelQueryView<'a>,
+        filter: &OperatorFilter,
+        window: SpanNanoSec,
+    ) -> Vec<&'a BatchClone> {
+        view.batch_clones()
+            .filter(|copy| clone_in_window(copy, window))
+            .filter(|copy| self.clone_matches(copy, filter))
+            .collect()
+    }
+
+    fn list_batch_clones(
+        &self,
+        operators: &HashSet<Uuid>,
+        filter: &OperatorFilter,
+        query: entities::ListQuery<'_>,
+    ) -> AnalyzerResult<EntityListResponse> {
+        let mut ranked = self
+            .model
+            .batch_clones
+            .values()
+            .filter_map(|copy| {
+                let batch = self.model.data_batches.get(&copy.source_batch_id()?)?;
+                if !batch.belongs_to(operators)
+                    || !self.clone_matches(copy, filter)
+                    || !clone_in_window(copy, query.window)
+                {
+                    return None;
+                }
+
+                let usage = copy
+                    .usages()
+                    .filter(|usage| {
+                        query
+                            .scope
+                            .is_none_or(|ids| ids.contains(&usage.resource_id()))
+                    })
+                    .filter_map(|usage| usage.span().intersection(&query.window))
+                    .map(|span| span.duration())
+                    .max();
+                if query.scope.is_some() && usage.is_none() {
+                    return None;
+                }
+                let metric = usage.unwrap_or_default();
+                if query
+                    .filter
+                    .min_usage_s
+                    .is_some_and(|threshold| metric < to_nanosecs(threshold))
+                {
+                    return None;
+                }
+                Some((copy, metric, batch.operator_in(operators)))
+            })
+            .collect::<Vec<_>>();
+
+        ranked.sort_by(|(a, a_metric, _), (b, b_metric, _)| {
+            let order = a_metric.cmp(b_metric);
+            let order = match query.sort.dir {
+                SortDir::Asc => order,
+                SortDir::Desc => order.reverse(),
+            };
+            order.then_with(|| a.id().cmp(&b.id()))
+        });
+        let total = ranked.len() as u32;
+        let skip = query
+            .page
+            .map_or(0, |page| page.page.saturating_mul(page.max) as usize);
+        let take = query.page.map_or(usize::MAX, |page| page.max as usize);
+        let items = ranked
+            .into_iter()
+            .skip(skip)
+            .take(take)
+            .map(|(copy, metric, operator_id)| {
+                Ok(EntityListItem {
+                    entity: QueryEngineFsm {
+                        fsm: self.clone_to_ui(copy, query.epoch)?,
+                        operator_id,
+                    },
+                    usage_duration_s: to_secs(metric),
+                })
+            })
+            .collect::<AnalyzerResult<Vec<_>>>()?;
+        Ok(EntityListResponse { items, total })
+    }
+
+    fn clone_to_ui(
+        &self,
+        copy: &BatchClone,
+        epoch: TimeUnixNanoSec,
+    ) -> AnalyzerResult<FiniteStateMachine> {
+        let mut attributes = vec![DynamicAttribute::u64("clone_id", copy.clone_id())];
+        for (name, id) in [
+            ("source_batch_id", copy.source_batch_id()),
+            ("destination_batch_uuid", copy.destination_batch_uuid()),
+            ("source_memory", copy.source_tier()),
+            ("destination_memory", copy.destination_tier()),
+            ("channel_id", copy.channel_id()),
+        ] {
+            if let Some(id) = id {
+                attributes.push(DynamicAttribute::string(name, id.to_string()));
+            }
+        }
+        for (name, value) in [
+            (
+                "source_batch_number",
+                copy.source_batch_id()
+                    .and_then(|id| self.model.data_batches.get(&id))
+                    .and_then(DataBatchExt::numeric_id),
+            ),
+            ("destination_batch_id", copy.destination_batch_id()),
+            ("bytes", copy.bytes()),
+        ] {
+            if let Some(value) = value {
+                attributes.push(DynamicAttribute::u64(name, value));
+            }
+        }
+
+        let mut transitions = Vec::new();
+        if let Some(timestamp) = copy.started_at() {
+            transitions.push(FsmTransition {
+                name: CLONE_STARTED.to_owned(),
+                timestamp: quent_time::to_secs_relative(timestamp, epoch),
+                usages: copy
+                    .usages()
+                    .map(|usage| FsmUsage {
+                        resource: usage.resource_id(),
+                        capacities: usage
+                            .capacities()
+                            .map(|capacity| (capacity.name.to_owned(), capacity.value))
+                            .collect(),
+                    })
+                    .collect(),
+                attributes,
+                derived_attributes: Vec::new(),
+            });
+        }
+        if let Some(timestamp) = copy.completed_at() {
+            let state = if copy.success() == Some(true) {
+                CLONE_COMPLETED
+            } else {
+                CLONE_FAILED
+            };
+            let derived_attributes = copy
+                .span()
+                .map(|span| {
+                    vec![DynamicAttribute::f64(
+                        "call_latency_seconds",
+                        to_secs(span.duration()),
+                    )]
+                })
+                .unwrap_or_default();
+            transitions.push(FsmTransition {
+                name: state.to_owned(),
+                timestamp: quent_time::to_secs_relative(timestamp, epoch),
+                usages: Vec::new(),
+                attributes: vec![DynamicAttribute::string("outcome", state)],
+                derived_attributes,
+            });
+        }
+        Ok(FiniteStateMachine {
+            id: copy.id(),
+            type_name: BATCH_CLONE_TYPE_NAME.to_owned(),
+            instance_name: format!("clone-{}", copy.clone_id()),
+            transitions,
+        })
+    }
+
     /// Return an iterator over all tasks, filtered by time window and operator id.
     fn filtered_tasks<'a>(
         &self,
@@ -1744,7 +2080,7 @@ impl SiriusUiAnalyzer {
         Ok(())
     }
 
-    /// Turn Task and DataBatch ids into UI FSM data.
+    /// Adapt application entities to the UI detail format.
     fn task_entities_to_ui_fsm(
         &self,
         entity_ids: &[Uuid],
@@ -1759,6 +2095,8 @@ impl SiriusUiAnalyzer {
                         .and_then(|id| self.model.operator(id).ok())
                         .and_then(|operator| operator.data().instance_name.as_deref());
                     Some(task.try_to_ui_fsm(epoch, pipeline_name))
+                } else if let Some(copy) = self.model.batch_clones.get(&id) {
+                    Some(self.clone_to_ui(copy, epoch))
                 } else {
                     self.model
                         .data_batches

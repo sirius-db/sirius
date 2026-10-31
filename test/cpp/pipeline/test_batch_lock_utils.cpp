@@ -32,6 +32,7 @@
 #include "pipeline/batch_lock_utils.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
+#include "utils/scoped_temp_directory.hpp"
 #include "utils/sirius_test_env.hpp"
 #include "utils/utils.hpp"
 
@@ -56,10 +57,13 @@
 
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <future>
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -752,4 +756,80 @@ TEST_CASE("cached scan assigned away from its pin clones and reserves on the tar
   scan->prepare_for_processing(f.gpu1, target_stream);
   CHECK(scan->get_cached_batch() == clone);
   target_stream.synchronize();
+}
+
+TEST_CASE("cross-GPU preparation traces destination batches",
+          "[batch_lock_utils][multi_gpu][clone_telemetry]")
+{
+  if (skip_if_not_mgpu()) { return; }
+  enum class prepare_kind { direct, pipeline, cached_scan };
+  const auto kind =
+    GENERATE(prepare_kind::direct, prepare_kind::pipeline, prepare_kind::cached_scan);
+  CAPTURE(kind);
+
+  batch_lock_utils_fixture f;
+  REQUIRE(f.setup(2));
+  sirius::test::scoped_temp_directory output;
+  sirius::telemetry_config config;
+  config.enable_quent     = true;
+  config.output_directory = output.directory;
+  uint64_t clone_id       = 0;
+  std::string producer_id;
+  {
+    auto context = sirius::telemetry::telemetry_context::create(
+      sirius::telemetry::make_quent_context(config), config, f.manager.get());
+    auto producer = context->context().operator_observer()->handle();
+    producer_id   = quent::to_string(producer.id().raw());
+    const sirius::telemetry::batch_telemetry_info telemetry{
+      .context = context.get(), .producer_pipeline_uuid = producer.id().raw()};
+
+    rmm::cuda_set_device_raii source_device{rmm::cuda_device_id{f.gpu0->get_device_id()}};
+    rmm::cuda_stream source_stream;
+    auto source = f.make_gpu_batch(kNumRows, *f.gpu0, source_stream);
+    rmm::cuda_set_device_raii target_device{rmm::cuda_device_id{f.gpu1->get_device_id()}};
+    rmm::cuda_stream target_stream;
+    std::shared_ptr<cucascade::data_batch> clone;
+    if (kind == prepare_kind::direct) {
+      auto prepared =
+        sirius::pipeline::lock_and_prepare_batch(source, f.gpu1, target_stream, telemetry);
+      REQUIRE(prepared.has_value());
+      clone = std::get<sirius::pipeline::lock_to_new_batch>(*prepared).new_batch;
+    } else if (kind == prepare_kind::pipeline) {
+      sirius::op::pipelineable_operator_data input({source});
+      sirius::op::operator_data& base = input;
+      base.prepare_for_processing(f.gpu1, target_stream, telemetry);
+      clone = input.get_data_batches().front();
+    } else {
+      sirius::op::scan::scan_operator_input input(source);
+      sirius::op::operator_data& base = input;
+      base.prepare_for_processing(f.gpu1, target_stream, telemetry);
+      clone = input.get_cached_batch();
+    }
+    REQUIRE(clone != source);
+    clone_id = clone->get_batch_id();
+    REQUIRE(clone->to_read_only().get_memory_space() == f.gpu1);
+  }
+
+  // Context destruction flushes events; inspect the destination lifecycle, not just the copy call.
+  bool traced         = false;
+  const auto batch_id = "\"data_batch_id\":" + std::to_string(clone_id);
+  for (const auto& entry : std::filesystem::recursive_directory_iterator(output.directory)) {
+    if (entry.path().extension() != ".ndjson" ||
+        entry.path().parent_path().filename() != "DataBatch") {
+      continue;
+    }
+    std::ifstream file(entry.path());
+    std::string line;
+    bool constructed = false;
+    bool stationary  = false;
+    bool destructed  = false;
+    while (std::getline(file, line)) {
+      constructed |=
+        line.find(batch_id) != std::string::npos && line.find(producer_id) != std::string::npos;
+      stationary |= line.find("\"Stationary\"") != std::string::npos;
+      destructed |= line.find("\"Destructed\"") != std::string::npos;
+    }
+    traced |= constructed && stationary && destructed;
+  }
+  REQUIRE(traced);
 }
