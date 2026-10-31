@@ -551,10 +551,9 @@ void prepare_iceberg_statement(sirius::op::sirius_physical_operator& root,
       remote = dv.file_path.find("://") != std::string::npos;
     }
     if (!remote) return;
-    auto const backend           = scan_manager.planning_io_backend(dv.file_path);
-    auto const backend_available = scheme == "s3" && backend.has_value() &&
-                                   (*backend == cucascade::io::io_context_type::restful ||
-                                    *backend == cucascade::io::io_context_type::kvikio);
+    auto const backend = scan_manager.planning_io_backend(dv.file_path);
+    auto const backend_available =
+      scheme == "s3" && backend.has_value() && *backend == cucascade::io::io_context_type::restful;
     remote_puffins.push_back({contract, dv.file_path, std::move(scheme), backend_available});
   };
   std::vector<scan_dv_count> counts;

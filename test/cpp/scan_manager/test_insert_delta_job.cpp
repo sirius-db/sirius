@@ -27,7 +27,6 @@
 
 #include <catch.hpp>
 #include <cucascade/cudf/datasource.hpp>
-#include <cucascade/io/kvikio/kvikio_context.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
 #include <duckdb.hpp>
 #include <duckdb/catalog/catalog.hpp>
@@ -46,6 +45,7 @@
 #include <op/scan/table_scan/scan_contract.hpp>
 #include <scan_manager/insert_delta_job.hpp>
 #include <unistd.h>
+#include <utils/local_ioctx.hpp>
 #include <utils/parquet_fixture_utils.hpp>
 
 #include <cstdint>
@@ -377,7 +377,7 @@ TEST_CASE("insert-delta job: file-backed splits each own a duplicated datasource
   auto const& request = requests[0];
   REQUIRE(request.bundles.size() >= 2);
 
-  auto ioctx = std::make_shared<cucascade::io::kvikio_context>();
+  auto ioctx = sirius::test::make_test_local_ioctx();
   std::shared_ptr<cucascade::io::datasource> datasource =
     cucascade::io::open_datasource(ioctx, tdb.path);
 
@@ -430,7 +430,7 @@ TEST_CASE("insert-delta job: blockless-only splits carry no datasource",
   run(requests);
   auto const& request = requests[0];
 
-  auto ioctx = std::make_shared<cucascade::io::kvikio_context>();
+  auto ioctx = sirius::test::make_test_local_ioctx();
   std::shared_ptr<cucascade::io::datasource> datasource =
     cucascade::io::open_datasource(ioctx, tdb.path);
 
@@ -572,7 +572,7 @@ TEST_CASE("insert-delta physical evidence is the union inside a mixed row group"
     mixed |= persistent && transient;
   }
   REQUIRE(mixed);
-  auto ioctx = std::make_shared<cucascade::io::kvikio_context>();
+  auto ioctx = sirius::test::make_test_local_ioctx();
   std::shared_ptr<cucascade::io::datasource> datasource =
     cucascade::io::open_datasource(ioctx, tdb.path);
   std::vector<projected_column> columns{real_col(0), real_col(1)};

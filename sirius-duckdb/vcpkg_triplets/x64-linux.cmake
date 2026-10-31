@@ -27,7 +27,9 @@ set(VCPKG_ENV_PASSTHROUGH VCPKG_CUDA_VERSION VCPKG_CUDA_ARCHITECTURES)
 include("${CMAKE_CURRENT_LIST_DIR}/../vcpkg_ports/sirius/source-inputs.cmake")
 
 # Shared RAPIDS download configuration is outside the individual port
-# directories.
+# directories. kvikio remains a transitive cudf/cuvs port dependency, not a
+# Sirius IO backend; its port also consumes rapids_common.cmake, so its binary
+# cache key must still track changes to that shared input.
 if(PORT MATCHES "^(cudf|cuvs|kvikio|raft|rmm)$")
   list(APPEND VCPKG_HASH_ADDITIONAL_FILES
        "${CMAKE_CURRENT_LIST_DIR}/../vcpkg_ports/rapids_common.cmake")

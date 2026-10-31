@@ -32,7 +32,6 @@
 
 #include <catch.hpp>
 #include <cucascade/cudf/datasource.hpp>
-#include <cucascade/io/kvikio/kvikio_context.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
@@ -60,6 +59,7 @@
 #include <unistd.h>
 #include <utils/child_process_environment.hpp>
 #include <utils/dynamic_filter_test_utils.hpp>
+#include <utils/local_ioctx.hpp>
 #include <utils/log_test_utils.hpp>
 #include <utils/parquet_fixture_utils.hpp>
 #include <utils/pipeline_conversion_test_utils.hpp>
@@ -2095,7 +2095,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
     REQUIRE_FALSE(enabled->HasError());
     REQUIRE(enabled->Collection().GetValue(0, 0).GetValue<bool>());
   }
-  auto ioctx              = std::make_shared<cucascade::io::kvikio_context>();
+  auto ioctx              = sirius::test::make_test_local_ioctx();
   auto const reads_before = sirius::op::scan::iceberg_delete_data_uncached_read_count();
   // Positional deletes read Parquet metadata; deletion vectors also reread their Avro manifest.
   for (auto const* dataset : {"iceberg_snapshot_deletes", "iceberg_v3_deletion_vector"}) {
@@ -3429,7 +3429,7 @@ TEST_CASE_METHOD(
   REQUIRE_FALSE(sibling.Query("SELECT 1")->HasError());
   auto discovery = sirius::op::scan::discover_from_manifests(
     *con->context, v2_path, std::move(*inventory.inventory));
-  auto ioctx = std::make_shared<cucascade::io::kvikio_context>();
+  auto ioctx = sirius::test::make_test_local_ioctx();
   auto data  = sirius::op::scan::load_delete_payload(*con->context, v2_path, ioctx, sid, discovery);
   REQUIRE(data);
   REQUIRE(data->positional_deletes.size() == 1);

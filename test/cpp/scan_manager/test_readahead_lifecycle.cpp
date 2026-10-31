@@ -39,7 +39,6 @@
 #include <cucascade/io/cache/config.hpp>
 #include <cucascade/io/cache/fs_cache.hpp>
 #include <cucascade/io/cache/types.hpp>
-#include <cucascade/io/kvikio/kvikio_context.hpp>
 #include <unistd.h>
 
 #include <array>
@@ -93,11 +92,6 @@ TEST_CASE("each backend publishes its own default scan budget", "[scan_manager][
   // cuCascade's rest::config struct default; sirius_config rescales it to the configured
   // pipeline width at load time unless the config sets it explicitly.
   CHECK(scan_manager_config{}.rest.n_max_concurrent_scans == 8);
-  // kvikIO has no prefetching cache to read ahead into, so it publishes no
-  // depth at all and there is no knob that could give it one.
-  cucascade::io::kvikio_context kvikio;
-  CHECK_FALSE(kvikio.can_use_fs_cache());
-  CHECK(kvikio.n_max_concurrent_scans() == 0);
 }
 
 TEST_CASE("the readahead budget follows the cache mode when unset", "[scan_manager][readahead]")
@@ -147,10 +141,10 @@ TEST_CASE("readahead backend selection considers only the supplied query context
   CHECK(selected.strategy == prefetch_strategy::opportunistic);
 
   // Likewise, a REST context created only to LIST objects must not enable
-  // readahead for a current kvikIO query that publishes no budget.
-  constexpr std::array kvikio_query = {
+  // readahead for a current local query whose backend publishes no budget.
+  constexpr std::array no_budget_query = {
     backend_readahead_policy{.budget = 0, .strategy = prefetch_strategy::opportunistic}};
-  selected = select_readahead_backend(kvikio_query);
+  selected = select_readahead_backend(no_budget_query);
   CHECK(selected.budget == 0);
   CHECK(selected.strategy == prefetch_strategy::opportunistic);
 
@@ -694,43 +688,6 @@ TEST_CASE("a zero readahead budget builds no manager for the query", "[scan_mana
     manager.prepare_for_query(query.get(), false, std::vector<int>{0});
     CHECK_FALSE(manager.has_readahead_for_testing());
   }
-}
-
-TEST_CASE("the kvikIO backend builds no readahead however the cache is configured",
-          "[scan_manager][readahead]")
-{
-  auto memory   = initialize_memory_manager(1);
-  auto topology = single_gpu_index();
-  empty_query query;
-
-  // A prefetching cache is asked for and the readahead is left to the backend.
-  // The kvikIO ioctx cannot use that cache, so it is dropped before backend
-  // selection rather than merely publishing a zero: none of the depths the
-  // sibling backend configs still carry, nor the pipeline width an
-  // opportunistic strategy would schedule against, can reach the plan.
-  scan_manager_config cfg;
-  cfg.thread_pool.num_threads = 2;
-  cfg.uring_n_reactors        = 1;
-  cfg.backend                 = sirius::scan_manager::io_backend::kvikio;
-  cfg.cache.mode              = cache_mode::cucs;
-  cfg.pipeline_width          = PIPELINE_THREADS;
-  // Local readahead is off by default; opt it in so this test still
-  // proves kvikIO is dropped despite a sibling backend carrying positive depth.
-  cfg.uring.n_max_concurrent_scans = PIPELINE_THREADS;
-  cfg.apply_cache_mode();
-  REQUIRE(cfg.uring.n_max_concurrent_scans > 0);
-  REQUIRE(cfg.rest.n_max_concurrent_scans > 0);
-  REQUIRE_FALSE(cfg.max_readahead_scans.has_value());
-  REQUIRE_FALSE(cfg.readahead_strategy.has_value());
-
-  sirius::exec::query_lifecycle_registry scan_lifecycle;
-
-  sirius::scan_manager::sirius_scan_manager manager{scan_lifecycle, cfg, *memory, topology};
-  REQUIRE(manager.io_ctx() != nullptr);
-  REQUIRE_FALSE(manager.io_ctx()->can_use_fs_cache());
-
-  manager.prepare_for_query(query.get(), false, std::vector<int>{0});
-  CHECK_FALSE(manager.has_readahead_for_testing());
 }
 
 // ===========================================================================

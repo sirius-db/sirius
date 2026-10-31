@@ -1084,7 +1084,7 @@ parquet_scan_core::metadata_scan_task_t parquet_scan_core::next_split_provider(
   if (position >= _selected_file_indices.size()) { return nullptr; }
   auto const idx = _selected_file_indices[position];
 
-  // Route each file to its own backend (s3:// -> rest, local -> uring/kvikio) so a
+  // Route each file to its own backend (s3:// -> rest, local -> uring) so a
   // mixed-scheme scan opens every file on the right ioctx.  One metadata-scan task
   // per file; row-group chunking and file bundling happen downstream in
   // parquet_batch_coalescer.
