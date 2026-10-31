@@ -318,6 +318,8 @@ static std::string rest_yaml_key(std::string_view field)
     {"retry_jitter", "retry_jitter_ms"},
     {"connect_timeout", "connect_timeout_ms"},
     {"dns_ttl", "dns_ttl_s"},
+    {"write_split_bytes", "write_part_bytes"},
+    {"continue_timeout", "continue_timeout_ms"},
     {"tls.fallback_rx", "tls.user_space_rx"},
     {"tls.placement", "tls.recv_placement"},
   };
@@ -400,6 +402,15 @@ static void from_yaml(const YAML::Node& node, cucascade::io::rest::config& opt)
   r.optional("interface", opt.interface);
   r.optional("pin_to_irq_cpus", opt.pin_to_irq_cpus);
   r.optional("raise_reactor_priority", opt.raise_reactor_priority);
+
+  // -- S3 writes (PUT / multipart upload through the ioctx write API) ---------------
+  // The ranges (S3's multipart part bounds, non-negative timeouts) and the cap against
+  // max_connections are enforced by validate() below.
+  r.optional("write_part_bytes", yaml::bytes(opt.write_split_bytes));
+  r.optional("expect_continue", opt.expect_continue);
+  r.optional("continue_timeout_ms", opt.continue_timeout);
+  r.optional("complete_timeout_s", opt.complete_timeout_s);
+  read_count(r, "max_write_connections", opt.max_write_connections);
 
   if (auto n = r.optional_node("tls")) sirius::from_yaml(*n, opt.tls);
   r.reject_unknown();
