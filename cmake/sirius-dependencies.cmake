@@ -186,5 +186,3 @@ endif()
 
 # Rust telemetry instrumentation (C++ FFI via Corrosion)
 add_subdirectory(rust/crates/telemetry/bridge)
-
-find_package(kvikio REQUIRED CONFIG)
