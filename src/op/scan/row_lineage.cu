@@ -208,21 +208,82 @@ void row_lineage::validate_on(int64_t rows,
                               ::cuda::stream_ref stream,
                               rmm::device_async_resource_ref mr) const
 {
-  validate(rows);
+  validate_on_impl(rows, stream, mr, false);
+}
+
+void row_lineage::validate_on_impl(int64_t rows,
+                                   ::cuda::stream_ref stream,
+                                   rmm::device_async_resource_ref mr,
+                                   bool strict) const
+{
+  auto const& [state, domain, runs, per_row, validated, binding] = data();
+  validate_impl(rows, strict);
+  if (!strict && is_validated()) return;
   if (state != row_position_state::per_row || !rows) return;
-  rmm::device_uvector<int64_t> sorted(rows, stream, mr);
-  CUDF_CUDA_TRY(cudaMemcpyAsync(sorted.data(),
-                                per_row->view().data<int64_t>(),
-                                rows * sizeof(int64_t),
-                                cudaMemcpyDeviceToDevice,
-                                stream.get()));
-  thrust::sort(rmm::exec_policy(stream, mr), sorted.begin(), sorted.end());
-  int const zero = 0;
-  rmm::device_scalar<int> invalid(zero, stream, mr);
-  check_ordinals<<<(rows + 255) / 256, 256, 0, stream.get()>>>(
-    sorted.data(), rows, input_domain_length(), invalid.data());
-  CUDF_CUDA_TRY(cudaGetLastError());
-  if (invalid.value(stream)) throw std::invalid_argument("invalid or duplicate lineage ordinal");
+  struct validation_state {
+    row_lineage input;
+    std::unique_ptr<rmm::device_uvector<int64_t>> sorted;
+    std::unique_ptr<rmm::device_scalar<int>> invalid;
+  };
+  auto retained       = std::make_unique<validation_state>();
+  retained->input     = *this;
+  auto const unjoined = detail::prepare_unjoined_failure();
+  try {
+    retained->sorted = std::make_unique<rmm::device_uvector<int64_t>>(rows, stream, mr);
+    auto& sorted     = *retained->sorted;
+    CUDF_CUDA_TRY(cudaMemcpyAsync(sorted.data(),
+                                  per_row->view().data<int64_t>(),
+                                  rows * sizeof(int64_t),
+                                  cudaMemcpyDeviceToDevice,
+                                  stream.get()));
+    thrust::sort(rmm::exec_policy(stream, mr), sorted.begin(), sorted.end());
+    retained->invalid = std::make_unique<rmm::device_scalar<int>>(stream, mr);
+    retained->invalid->set_value_to_zero_async(stream);
+    check_ordinals<<<(rows + 255) / 256, 256, 0, stream.get()>>>(
+      sorted.data(), rows, input_domain_length(), retained->invalid->data());
+    CUDF_CUDA_TRY(cudaGetLastError());
+    if (retained->invalid->value(stream))
+      throw std::invalid_argument("invalid or duplicate lineage ordinal");
+  } catch (...) {
+    detail::retire_reads(retained, stream, unjoined);
+    throw;
+  }
+}
+
+row_lineage row_lineage::validated_copy(int64_t rows,
+                                        ::cuda::stream_ref stream,
+                                        rmm::device_async_resource_ref mr) const
+{
+  validate(rows);
+  // A copy of an already sealed object still goes through strict device
+  // validation when it crosses the external decoder boundary again.
+  if (is_validated()) {
+    validate_on_impl(rows, stream, mr, true);
+    return *this;
+  }
+  struct import_state {
+    row_lineage source, output;
+    std::unique_ptr<cudf::column> copied_column;
+    std::shared_ptr<cudf::column const> column;
+  };
+  auto state          = std::make_unique<import_state>();
+  state->source       = *this;
+  auto frozen_domain  = domain() ? std::make_shared<lineage_domain const>(*domain()) : nullptr;
+  auto const unjoined = detail::prepare_unjoined_failure();
+  try {
+    if (per_row()) {
+      state->copied_column = std::make_unique<cudf::column>(per_row()->view(), stream, mr);
+      state->column        = std::move(state->copied_column);
+    }
+    state->output = {this->state(), std::move(frozen_domain), runs(), state->column};
+    state->output.validate_on(rows, stream, mr);
+    // validate_on's device result read joins all preceding copy/validation work.
+    state->output.seal_validation(source_binding());
+    return std::move(state->output);
+  } catch (...) {
+    detail::retire_reads(state, stream, unjoined);
+    throw;
+  }
 }
 
 std::size_t lineage_conversion_workspace_bytes(std::size_t rows, std::size_t intervals)
@@ -238,7 +299,8 @@ std::size_t lineage_conversion_workspace_bytes(std::size_t rows, std::size_t int
 
 row_lineage consume_reader_positions(std::unique_ptr<gpu_row_positions> positions,
                                      ::cuda::stream_ref stream,
-                                     rmm::device_async_resource_ref mr)
+                                     rmm::device_async_resource_ref mr,
+                                     std::shared_ptr<lineage_domain const> expected_domain)
 {
   if (!positions || !positions->rows || positions->rows->type().id() != cudf::type_id::UINT64 ||
       positions->rows->has_nulls() || positions->sources.empty())
@@ -287,12 +349,14 @@ row_lineage consume_reader_positions(std::unique_ptr<gpu_row_positions> position
     }
   }
   row_lineage{row_position_state::identity, domain}.validate(offset);
+  if (expected_domain && *expected_domain != *domain)
+    throw std::invalid_argument("decoder changed its immutable input domain");
   auto const unjoined = detail::prepare_unjoined_failure();
   try {
     state->device =
       std::make_unique<rmm::device_uvector<physical_run>>(state->host.size(), stream, mr);
-    int const zero = 0;
-    state->invalid = std::make_unique<rmm::device_scalar<int>>(zero, stream, mr);
+    state->invalid = std::make_unique<rmm::device_scalar<int>>(stream, mr);
+    state->invalid->set_value_to_zero_async(stream);
     if (!state->host.empty())
       CUDF_CUDA_TRY(cudaMemcpyAsync(state->device->data(),
                                     state->host.data(),
@@ -313,14 +377,17 @@ row_lineage consume_reader_positions(std::unique_ptr<gpu_row_positions> position
       if (state->invalid->value(stream))
         throw std::invalid_argument("reader position outside input domain");
     }
-    auto contents         = state->input->rows->release();
-    state->result         = {row_position_state::per_row, std::move(domain)};
-    state->result.per_row = std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::INT64},
-                                                           rows,
-                                                           std::move(*contents.data),
-                                                           std::move(*contents.null_mask),
-                                                           0);
+    auto contents = state->input->rows->release();
+    state->result = {row_position_state::per_row,
+                     std::move(domain),
+                     {},
+                     std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::INT64},
+                                                    rows,
+                                                    std::move(*contents.data),
+                                                    std::move(*contents.null_mask),
+                                                    0)};
     state->result.validate_on(rows, stream, mr);
+    state->result.seal_validation(std::move(expected_domain));
     detail::retire_reads(state, stream, unjoined);
     return std::move(state->result);
   } catch (...) {
@@ -358,226 +425,298 @@ void validate_lineage_composition(row_lineage const& before,
                                   rmm::device_async_resource_ref mr)
 {
   std::unordered_map<std::string, int64_t> files;
-  for (std::size_t i = 0; i < before.domain->files.size(); ++i)
-    files.emplace(before.domain->files[i].identity, i);
+  for (std::size_t i = 0; i < before.domain()->files.size(); ++i)
+    files.emplace(before.domain()->files[i].identity, i);
   std::vector<int64_t> remap;
-  for (auto const& file : step.domain->files) {
+  for (auto const& file : step.domain()->files) {
     auto it = files.find(file.identity);
-    if (it == files.end() || before.domain->files[it->second].rows != file.rows)
+    if (it == files.end() || before.domain()->files[it->second].rows != file.rows)
       throw std::invalid_argument("selection composition file binding mismatch");
     remap.push_back(it->second);
   }
   std::vector<physical_run> a, b;
   int64_t offset = 0;
-  for (auto const& run : before.domain->file_runs) {
+  for (auto const& run : before.domain()->file_runs) {
     if (run.count) a.push_back({offset, static_cast<int64_t>(run.file), run.first, run.count});
     offset += run.count;
   }
   offset = 0;
-  for (auto const& run : step.domain->file_runs) {
+  for (auto const& run : step.domain()->file_runs) {
     if (run.count) b.push_back({offset, remap[run.file], run.first, run.count});
     offset += run.count;
   }
   if (!before.output_length()) return;
   std::vector<selection_run> selection;
   offset = 0;
-  for (auto const& [first, count] : before.runs) {
+  for (auto const& [first, count] : before.runs()) {
     selection.push_back({offset, first, count});
     offset += count;
   }
-  rmm::device_uvector<physical_run> da(a.size(), stream, mr), db(b.size(), stream, mr);
-  rmm::device_uvector<selection_run> ds(selection.size(), stream, mr);
-  // Finish each small metadata upload before starting an operation that can throw.
-  CUDF_CUDA_TRY(cudaMemcpyAsync(
-    da.data(), a.data(), a.size() * sizeof(physical_run), cudaMemcpyHostToDevice, stream.get()));
-  CUDF_CUDA_TRY(cudaStreamSynchronize(stream.get()));
-  CUDF_CUDA_TRY(cudaMemcpyAsync(
-    db.data(), b.data(), b.size() * sizeof(physical_run), cudaMemcpyHostToDevice, stream.get()));
-  CUDF_CUDA_TRY(cudaStreamSynchronize(stream.get()));
-  if (!selection.empty()) {
-    CUDF_CUDA_TRY(cudaMemcpyAsync(ds.data(),
-                                  selection.data(),
-                                  selection.size() * sizeof(selection_run),
-                                  cudaMemcpyHostToDevice,
-                                  stream.get()));
-    CUDF_CUDA_TRY(cudaStreamSynchronize(stream.get()));
+  struct composition_state {
+    row_lineage input;
+    std::vector<physical_run> a, b;
+    std::vector<selection_run> selection;
+    std::unique_ptr<rmm::device_uvector<physical_run>> da, db;
+    std::unique_ptr<rmm::device_uvector<selection_run>> ds;
+    std::unique_ptr<rmm::device_scalar<int>> invalid;
+  };
+  auto retained       = std::make_unique<composition_state>();
+  retained->input     = before;
+  retained->a         = std::move(a);
+  retained->b         = std::move(b);
+  retained->selection = std::move(selection);
+  auto const unjoined = detail::prepare_unjoined_failure();
+  try {
+    auto upload = [&](auto const& host, auto& output) {
+      using T = typename std::decay_t<decltype(host)>::value_type;
+      output  = std::make_unique<rmm::device_uvector<T>>(host.size(), stream, mr);
+      if (!host.empty())
+        CUDF_CUDA_TRY(cudaMemcpyAsync(output->data(),
+                                      host.data(),
+                                      host.size() * sizeof(T),
+                                      cudaMemcpyHostToDevice,
+                                      stream.get()));
+    };
+    upload(retained->a, retained->da);
+    upload(retained->b, retained->db);
+    upload(retained->selection, retained->ds);
+    retained->invalid = std::make_unique<rmm::device_scalar<int>>(stream, mr);
+    retained->invalid->set_value_to_zero_async(stream);
+    auto rows = before.output_length();
+    check_composition<<<(rows + 255) / 256, 256, 0, stream.get()>>>(
+      rows,
+      before.per_row() ? before.per_row()->view().data<int64_t>() : nullptr,
+      retained->ds->data(),
+      retained->ds->size(),
+      retained->da->data(),
+      retained->da->size(),
+      retained->db->data(),
+      retained->db->size(),
+      retained->invalid->data());
+    CUDF_CUDA_TRY(cudaGetLastError());
+    if (retained->invalid->value(stream))
+      throw std::invalid_argument("selection composition input sequence mismatch");
+  } catch (...) {
+    detail::retire_reads(retained, stream, unjoined);
+    throw;
   }
-  int const zero = 0;
-  rmm::device_scalar<int> invalid(zero, stream, mr);
-  auto rows = before.output_length();
-  check_composition<<<(rows + 255) / 256, 256, 0, stream.get()>>>(
-    rows,
-    before.per_row ? before.per_row->view().data<int64_t>() : nullptr,
-    ds.data(),
-    ds.size(),
-    da.data(),
-    da.size(),
-    db.data(),
-    db.size(),
-    invalid.data());
-  CUDF_CUDA_TRY(cudaGetLastError());
-  if (invalid.value(stream))
-    throw std::invalid_argument("selection composition input sequence mismatch");
 }
 
 std::unique_ptr<cudf::column> concatenate_lineage_ordinals(std::span<row_lineage const> parts,
                                                            ::cuda::stream_ref stream,
                                                            rmm::device_async_resource_ref mr)
 {
+  struct concat_state {
+    std::vector<row_lineage> parts;
+    std::vector<std::vector<selection_run>> runs;
+    std::vector<std::unique_ptr<rmm::device_uvector<selection_run>>> devices;
+    std::unique_ptr<cudf::column> output;
+  };
+  auto retained = std::make_unique<concat_state>();
+  retained->parts.assign(parts.begin(), parts.end());
+  retained->runs.resize(parts.size());
+  retained->devices.resize(parts.size());
   int64_t rows = 0;
-  for (auto const& part : parts) {
-    auto count = part.output_length();
+  for (std::size_t i = 0; i < parts.size(); ++i) {
+    auto const& part = parts[i];
+    auto count       = part.output_length();
     if (count > std::numeric_limits<cudf::size_type>::max() - rows)
       throw std::invalid_argument("concatenated lineage exceeds column limit");
     rows += count;
-  }
-  auto result = cudf::make_numeric_column(
-    cudf::data_type{cudf::type_id::INT64}, rows, cudf::mask_state::UNALLOCATED, stream, mr);
-  int64_t output_offset = 0, domain_offset = 0;
-  for (auto const& part : parts) {
-    auto count = part.output_length();
-    if (count && part.state == row_position_state::per_row) {
-      copy_shift<<<(count + 255) / 256, 256, 0, stream.get()>>>(
-        result->mutable_view().data<int64_t>() + output_offset,
-        part.per_row->view().data<int64_t>(),
-        count,
-        domain_offset);
-    } else if (count) {
-      std::vector<selection_run> host;
-      if (part.state == row_position_state::identity)
-        host.push_back({0, 0, count});
-      else {
-        int64_t offset = 0;
-        for (auto const& [first, size] : part.runs) {
-          host.push_back({offset, first, size});
-          offset += size;
-        }
+    if (part.state() == row_position_state::identity)
+      retained->runs[i].push_back({0, 0, count});
+    else if (part.state() == row_position_state::runs) {
+      int64_t offset = 0;
+      for (auto const& [first, size] : part.runs()) {
+        retained->runs[i].push_back({offset, first, size});
+        offset += size;
       }
-      rmm::device_uvector<selection_run> device(host.size(), stream, mr);
-      CUDF_CUDA_TRY(cudaMemcpyAsync(device.data(),
-                                    host.data(),
-                                    host.size() * sizeof(selection_run),
-                                    cudaMemcpyHostToDevice,
-                                    stream.get()));
-      select_runs<int64_t><<<(count + 255) / 256, 256, 0, stream.get()>>>(
-        result->mutable_view().data<int64_t>() + output_offset,
-        nullptr,
-        count,
-        device.data(),
-        host.size(),
-        domain_offset);
-      CUDF_CUDA_TRY(cudaStreamSynchronize(stream.get()));
     }
-    CUDF_CUDA_TRY(cudaGetLastError());
-    output_offset += count;
-    domain_offset += part.input_domain_length();
   }
-  CUDF_CUDA_TRY(cudaStreamSynchronize(stream.get()));
-  return result;
+  auto const unjoined = detail::prepare_unjoined_failure();
+  try {
+    retained->output = cudf::make_numeric_column(
+      cudf::data_type{cudf::type_id::INT64}, rows, cudf::mask_state::UNALLOCATED, stream, mr);
+    int64_t output_offset = 0, domain_offset = 0;
+    for (std::size_t i = 0; i < parts.size(); ++i) {
+      auto const& part = parts[i];
+      auto count       = part.output_length();
+      if (count && part.state() == row_position_state::per_row) {
+        copy_shift<<<(count + 255) / 256, 256, 0, stream.get()>>>(
+          retained->output->mutable_view().data<int64_t>() + output_offset,
+          part.per_row()->view().data<int64_t>(),
+          count,
+          domain_offset);
+      } else if (count) {
+        auto const& host = retained->runs[i];
+        auto& device     = retained->devices[i];
+        device = std::make_unique<rmm::device_uvector<selection_run>>(host.size(), stream, mr);
+        CUDF_CUDA_TRY(cudaMemcpyAsync(device->data(),
+                                      host.data(),
+                                      host.size() * sizeof(selection_run),
+                                      cudaMemcpyHostToDevice,
+                                      stream.get()));
+        select_runs<int64_t><<<(count + 255) / 256, 256, 0, stream.get()>>>(
+          retained->output->mutable_view().data<int64_t>() + output_offset,
+          nullptr,
+          count,
+          device->data(),
+          host.size(),
+          domain_offset);
+      }
+      CUDF_CUDA_TRY(cudaGetLastError());
+      output_offset += count;
+      domain_offset += part.input_domain_length();
+    }
+    detail::retire_reads(retained, stream, unjoined);
+    return std::move(retained->output);
+  } catch (...) {
+    if (retained) detail::retire_reads(retained, stream, unjoined);
+    throw;
+  }
 }
 
 std::unique_ptr<cudf::column> row_lineage::ordinal_column(::cuda::stream_ref stream,
                                                           rmm::device_async_resource_ref mr) const
 {
-  auto rows = output_length();
+  auto const& [state, domain, runs, per_row, validated, binding] = data();
+  auto rows                                                      = output_length();
   validate(rows);
   if (rows > std::numeric_limits<cudf::size_type>::max())
     throw std::invalid_argument("lineage selection exceeds column limit");
-  if (state == row_position_state::per_row)
-    return std::make_unique<cudf::column>(per_row->view(), stream, mr);
-  std::vector<selection_run> host;
+  struct ordinal_state {
+    row_lineage input;
+    std::vector<selection_run> runs;
+    std::unique_ptr<rmm::device_uvector<selection_run>> device;
+    std::unique_ptr<cudf::column> output;
+  };
+  auto retained   = std::make_unique<ordinal_state>();
+  retained->input = *this;
   if (state == row_position_state::identity)
-    host.push_back({0, 0, rows});
+    retained->runs.push_back({0, 0, rows});
   else {
     int64_t offset = 0;
     for (auto const& [first, count] : runs) {
-      host.push_back({offset, first, count});
+      retained->runs.push_back({offset, first, count});
       offset += count;
     }
   }
-  auto result = cudf::make_numeric_column(
-    cudf::data_type{cudf::type_id::INT64}, rows, cudf::mask_state::UNALLOCATED, stream, mr);
-  if (rows) {
-    rmm::device_uvector<selection_run> device(host.size(), stream, mr);
-    CUDF_CUDA_TRY(cudaMemcpyAsync(device.data(),
-                                  host.data(),
-                                  device.size() * sizeof(selection_run),
-                                  cudaMemcpyHostToDevice,
-                                  stream.get()));
-    fill_ordinals<<<(rows + 255) / 256, 256, 0, stream.get()>>>(
-      result->mutable_view().data<int64_t>(), rows, device.data(), host.size());
-    CUDF_CUDA_TRY(cudaGetLastError());
-    // Retire the pageable interval upload before host storage is destroyed.
-    CUDF_CUDA_TRY(cudaStreamSynchronize(stream.get()));
+  auto const unjoined = detail::prepare_unjoined_failure();
+  try {
+    if (state == row_position_state::per_row)
+      retained->output = std::make_unique<cudf::column>(per_row->view(), stream, mr);
+    else {
+      retained->output = cudf::make_numeric_column(
+        cudf::data_type{cudf::type_id::INT64}, rows, cudf::mask_state::UNALLOCATED, stream, mr);
+      if (rows) {
+        retained->device =
+          std::make_unique<rmm::device_uvector<selection_run>>(retained->runs.size(), stream, mr);
+        CUDF_CUDA_TRY(cudaMemcpyAsync(retained->device->data(),
+                                      retained->runs.data(),
+                                      retained->runs.size() * sizeof(selection_run),
+                                      cudaMemcpyHostToDevice,
+                                      stream.get()));
+        fill_ordinals<<<(rows + 255) / 256, 256, 0, stream.get()>>>(
+          retained->output->mutable_view().data<int64_t>(),
+          rows,
+          retained->device->data(),
+          retained->runs.size());
+        CUDF_CUDA_TRY(cudaGetLastError());
+      }
+    }
+    if (rows) detail::retire_reads(retained, stream, unjoined);
+    return std::move(retained->output);
+  } catch (...) {
+    if (retained) detail::retire_reads(retained, stream, unjoined);
+    throw;
   }
-  return result;
 }
 
 row_lineage row_lineage::select(cudf::column_view selected,
                                 ::cuda::stream_ref stream,
                                 rmm::device_async_resource_ref mr) const
 {
+  auto const& [state, domain, runs, per_row, validated, binding] = data();
   if (state == row_position_state::lost || state == row_position_state::none) return *this;
   if ((selected.type().id() != cudf::type_id::INT32 &&
        selected.type().id() != cudf::type_id::INT64) ||
       selected.has_nulls())
     throw std::invalid_argument("delivered selection requires non-null integer ordinals");
   validate_on(output_length(), stream, mr);
-  // Validate indices before DONT_CHECK gather; selection is independent of the
-  // producer's coverage report and may be supplied by a replacement decoder.
-  auto indices = cudf::cast(selected, cudf::data_type{cudf::type_id::INT64}, stream, mr);
-  row_lineage index_lineage;
+  struct selection_state {
+    row_lineage source, indices, output;
+    std::vector<selection_run> runs;
+    std::unique_ptr<rmm::device_uvector<selection_run>> device;
+    std::unique_ptr<cudf::column> column;
+    std::shared_ptr<cudf::column const> output_column;
+  };
+  auto retained           = std::make_unique<selection_state>();
+  retained->source        = *this;
   auto index_domain       = std::make_shared<lineage_domain>();
   index_domain->files     = {{"delivered selection", output_length()}};
   index_domain->file_runs = {{0, 0, output_length()}};
-  index_lineage.domain    = std::move(index_domain);
-  index_lineage.state     = row_position_state::per_row;
-  index_lineage.per_row   = std::move(indices);
-  index_lineage.validate_on(selected.size(), stream, mr);
-  row_lineage result;
-  result.domain = domain;
-  result.state  = row_position_state::per_row;
-  if (state == row_position_state::identity) {
-    result.per_row = std::move(index_lineage.per_row);
-  } else if (state == row_position_state::per_row) {
-    auto table     = cudf::gather(cudf::table_view{{per_row->view()}},
-                              selected,
-                              cudf::out_of_bounds_policy::DONT_CHECK,
-                              stream,
-                              mr);
-    result.per_row = std::move(table->release().front());
-  } else {
-    std::vector<selection_run> host;
-    int64_t offset = 0;
-    for (auto const& [first, count] : runs) {
-      host.push_back({offset, first, count});
-      offset += count;
+  auto const unjoined     = detail::prepare_unjoined_failure();
+  try {
+    // A selection supplied through the public API remains untrusted. Only the
+    // already sealed source avoids another full copy and sort.
+    retained->column = cudf::cast(selected, cudf::data_type{cudf::type_id::INT64}, stream, mr);
+    // Keep an owner in the retirement state even if allocating the immutable
+    // host record fails after the cast/gather has queued device work.
+    retained->output_column = std::move(retained->column);
+    retained->indices       = {
+      row_position_state::per_row, std::move(index_domain), {}, retained->output_column};
+    retained->indices.validate_on(selected.size(), stream, mr);
+    auto& result = retained->output;
+    if (state == row_position_state::identity) {
+      result = {row_position_state::per_row, domain, {}, retained->indices.per_row()};
+    } else if (state == row_position_state::per_row) {
+      auto table              = cudf::gather(cudf::table_view{{per_row->view()}},
+                                retained->indices.per_row()->view(),
+                                cudf::out_of_bounds_policy::DONT_CHECK,
+                                stream,
+                                mr);
+      retained->column        = std::move(table->release().front());
+      retained->output_column = std::move(retained->column);
+      result                  = {row_position_state::per_row, domain, {}, retained->output_column};
+    } else {
+      int64_t offset = 0;
+      for (auto const& [first, count] : runs) {
+        retained->runs.push_back({offset, first, count});
+        offset += count;
+      }
+      retained->column = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT64},
+                                                   selected.size(),
+                                                   cudf::mask_state::UNALLOCATED,
+                                                   stream,
+                                                   mr);
+      if (selected.size()) {
+        retained->device =
+          std::make_unique<rmm::device_uvector<selection_run>>(retained->runs.size(), stream, mr);
+        CUDF_CUDA_TRY(cudaMemcpyAsync(retained->device->data(),
+                                      retained->runs.data(),
+                                      retained->runs.size() * sizeof(selection_run),
+                                      cudaMemcpyHostToDevice,
+                                      stream.get()));
+        select_runs<int64_t><<<(selected.size() + 255) / 256, 256, 0, stream.get()>>>(
+          retained->column->mutable_view().data<int64_t>(),
+          retained->indices.per_row()->view().data<int64_t>(),
+          selected.size(),
+          retained->device->data(),
+          retained->runs.size());
+        CUDF_CUDA_TRY(cudaGetLastError());
+      }
+      retained->output_column = std::move(retained->column);
+      result                  = {row_position_state::per_row, domain, {}, retained->output_column};
     }
-    auto output = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT64},
-                                            selected.size(),
-                                            cudf::mask_state::UNALLOCATED,
-                                            stream,
-                                            mr);
-    if (selected.size()) {
-      rmm::device_uvector<selection_run> device(host.size(), stream, mr);
-      CUDF_CUDA_TRY(cudaMemcpyAsync(device.data(),
-                                    host.data(),
-                                    host.size() * sizeof(selection_run),
-                                    cudaMemcpyHostToDevice,
-                                    stream.get()));
-      select_runs<int64_t><<<(selected.size() + 255) / 256, 256, 0, stream.get()>>>(
-        output->mutable_view().data<int64_t>(),
-        index_lineage.per_row->view().data<int64_t>(),
-        selected.size(),
-        device.data(),
-        host.size());
-      CUDF_CUDA_TRY(cudaGetLastError());
-      CUDF_CUDA_TRY(cudaStreamSynchronize(stream.get()));
-    }
-    result.per_row = std::move(output);
+    detail::check_read_checkpoint(detail::read_checkpoint::PAYLOAD_GATHER);
+    // One checked lifetime boundary covers the input, uploaded intervals and gather.
+    detail::retire_reads(retained, stream, unjoined);
+    if (is_validated()) result.seal_validation(source_binding());
+    return std::move(result);
+  } catch (...) {
+    if (retained) detail::retire_reads(retained, stream, unjoined);
+    throw;
   }
-  CUDF_CUDA_TRY(cudaStreamSynchronize(stream.get()));
-  return result;
 }
 
 void append_lineage_virtual_columns(owning_table_view& table,
@@ -591,18 +730,19 @@ void append_lineage_virtual_columns(owning_table_view& table,
   if (table.n_columns() != plan.data_columns.size())
     throw std::invalid_argument("virtual assembly requires normalized physical columns");
   lineage.validate_on(table.num_rows(), stream, mr);
-  if (!lineage.domain) throw std::invalid_argument("virtual assembly requires bound file context");
+  if (!lineage.domain())
+    throw std::invalid_argument("virtual assembly requires bound file context");
   using kind     = scan_plan::parquet_virtual_column_kind;
   bool need_rows = false, need_files = false;
   for (auto const& col : plan.virtual_columns) {
     need_rows |= col.kind == kind::FILE_ROW_NUMBER;
     need_files |= col.kind != kind::FILE_ROW_NUMBER;
-    if (col.kind == kind::FILE_INDEX && file_indices.size() != lineage.domain->files.size())
+    if (col.kind == kind::FILE_INDEX && file_indices.size() != lineage.domain()->files.size())
       throw std::invalid_argument("file-index virtual column needs bound file indices");
   }
-  bool const resolve_positions = need_rows || (need_files && lineage.domain->files.size() != 1);
+  bool const resolve_positions = need_rows || (need_files && lineage.domain()->files.size() != 1);
   if (resolve_positions &&
-      (lineage.state == row_position_state::none || lineage.state == row_position_state::lost))
+      (lineage.state() == row_position_state::none || lineage.state() == row_position_state::lost))
     throw std::invalid_argument("virtual assembly requires original positions");
   struct virtual_state {
     row_lineage lineage;
@@ -610,24 +750,34 @@ void append_lineage_virtual_columns(owning_table_view& table,
     std::vector<physical_run> runs;
     std::unique_ptr<rmm::device_uvector<physical_run>> device;
     std::vector<std::unique_ptr<cudf::column>> columns;
+    std::vector<std::unique_ptr<cudf::column>> dictionaries;
+    std::vector<std::shared_ptr<void const>> uploads;
     owning_table_view input;
   };
   auto state       = std::make_unique<virtual_state>();
   state->lineage   = lineage;
   auto const count = table.num_rows();
   int64_t offset   = 0;
-  for (auto const& run : lineage.domain->file_runs) {
+  for (auto const& run : lineage.domain()->file_runs) {
     if (run.count)
       state->runs.push_back({offset, static_cast<int64_t>(run.file), run.first, run.count});
     offset += run.count;
   }
   auto const unjoined = detail::prepare_unjoined_failure();
   try {
-    if (resolve_positions) state->ordinals = lineage.ordinal_column(stream, mr);
+    cudf::column_view ordinal_view;
+    if (count && resolve_positions) {
+      if (lineage.state() == row_position_state::per_row)
+        ordinal_view = lineage.per_row()->view();
+      else {
+        state->ordinals = lineage.ordinal_column(stream, mr);
+        ordinal_view    = state->ordinals->view();
+      }
+    }
     if (need_rows)
       state->rows = cudf::make_numeric_column(
         cudf::data_type{cudf::type_id::INT64}, count, cudf::mask_state::UNALLOCATED, stream, mr);
-    if (need_files && lineage.domain->files.size() > 1)
+    if (need_files && lineage.domain()->files.size() > 1)
       state->files = cudf::make_numeric_column(
         cudf::data_type{cudf::type_id::INT32}, count, cudf::mask_state::UNALLOCATED, stream, mr);
     state->device =
@@ -640,7 +790,7 @@ void append_lineage_virtual_columns(owning_table_view& table,
                                     stream.get()));
     if (count && resolve_positions) {
       physical_positions<<<(count + 255) / 256, 256, 0, stream.get()>>>(
-        state->ordinals->view().data<int64_t>(),
+        ordinal_view.data<int64_t>(),
         count,
         state->device->data(),
         state->device->size(),
@@ -648,20 +798,28 @@ void append_lineage_virtual_columns(owning_table_view& table,
         state->files ? state->files->mutable_view().data<int32_t>() : nullptr);
       CUDF_CUDA_TRY(cudaGetLastError());
     }
-    auto upload = [&](auto const& values) {
-      using T = typename std::decay_t<decltype(values)>::value_type;
-      rmm::device_buffer result(values.data(), values.size() * sizeof(T), stream, mr);
-      stream.sync();
-      return result;
+    auto upload = [&](auto values) {
+      using Values = std::decay_t<decltype(values)>;
+      using T      = typename Values::value_type;
+      auto owner   = std::make_shared<Values const>(std::move(values));
+      state->uploads.push_back(owner);
+      return rmm::device_buffer(owner->data(), owner->size() * sizeof(T), stream, mr);
     };
     for (auto const& col : plan.virtual_columns) {
+      if (!count) {
+        auto type = col.kind == kind::FILENAME     ? cudf::type_id::STRING
+                    : col.kind == kind::FILE_INDEX ? cudf::type_id::UINT64
+                                                   : cudf::type_id::INT64;
+        state->columns.push_back(cudf::make_empty_column(type));
+        continue;
+      }
       if (col.kind == kind::FILE_ROW_NUMBER) {
         state->columns.push_back(std::make_unique<cudf::column>(state->rows->view(), stream, mr));
         continue;
       }
-      if (lineage.domain->files.size() == 1) {
+      if (lineage.domain()->files.size() == 1) {
         if (col.kind == kind::FILENAME) {
-          cudf::string_scalar value(lineage.domain->files[0].identity, true, stream, mr);
+          cudf::string_scalar value(lineage.domain()->files[0].identity, true, stream, mr);
           state->columns.push_back(cudf::make_column_from_scalar(value, count, stream, mr));
         } else {
           cudf::numeric_scalar<uint64_t> value(file_indices[0], true, stream, mr);
@@ -672,38 +830,40 @@ void append_lineage_virtual_columns(owning_table_view& table,
       std::unique_ptr<cudf::column> dictionary;
       if (col.kind == kind::FILE_INDEX) {
         std::vector<uint64_t> indices(file_indices.begin(), file_indices.end());
-        dictionary = std::make_unique<cudf::column>(
+        auto const index_count = indices.size();
+        dictionary             = std::make_unique<cudf::column>(
           cudf::data_type{cudf::type_id::UINT64},
-          indices.size(),
-          upload(indices),
+          index_count,
+          upload(std::move(indices)),
           cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr),
           0);
       } else {
         std::string chars;
         std::vector<int64_t> offsets{0};
-        for (auto const& file : lineage.domain->files) {
+        for (auto const& file : lineage.domain()->files) {
           chars += file.identity;
           offsets.push_back(chars.size());
         }
-        auto offset_col = std::make_unique<cudf::column>(
+        auto const offset_count = offsets.size();
+        auto offset_col         = std::make_unique<cudf::column>(
           cudf::data_type{cudf::type_id::INT64},
-          offsets.size(),
-          upload(offsets),
+          offset_count,
+          upload(std::move(offsets)),
           cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr),
           0);
         dictionary = cudf::make_strings_column(
-          lineage.domain->files.size(),
+          lineage.domain()->files.size(),
           std::move(offset_col),
-          upload(chars),
+          upload(std::move(chars)),
           0,
           cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr));
       }
-      auto output = cudf::gather(cudf::table_view{{dictionary->view()}},
+      state->dictionaries.push_back(std::move(dictionary));
+      auto output = cudf::gather(cudf::table_view{{state->dictionaries.back()->view()}},
                                  state->files->view(),
                                  cudf::out_of_bounds_policy::DONT_CHECK,
                                  stream,
                                  mr);
-      stream.sync();
       state->columns.push_back(std::move(output->release().front()));
     }
     state->input     = std::move(table);
@@ -729,8 +889,8 @@ void apply_lineage_visibility(
 {
   lineage.validate_on(table.num_rows(), stream, mr);
   if (!table.num_rows()) return;
-  if (!lineage.domain || lineage.state == row_position_state::none ||
-      lineage.state == row_position_state::lost)
+  if (!lineage.domain() || lineage.state() == row_position_state::none ||
+      lineage.state() == row_position_state::lost)
     throw std::invalid_argument("visibility requires recoverable row lineage");
   struct visibility_state {
     owning_table_view input;
@@ -744,20 +904,33 @@ void apply_lineage_visibility(
   };
   auto state     = std::make_unique<visibility_state>();
   state->lineage = lineage;
+  std::vector<std::vector<std::pair<int64_t, int64_t>>> ranges(lineage.domain()->files.size());
+  for (auto const& run : lineage.domain()->file_runs)
+    if (run.count) ranges[run.file].emplace_back(run.first, run.first + run.count);
   std::vector<std::pair<int64_t, int64_t>> windows;
-  for (auto const& file : lineage.domain->files) {
-    auto values = lookup(file.identity);
-    if (!std::is_sorted(values.begin(), values.end()) ||
-        std::adjacent_find(values.begin(), values.end()) != values.end() ||
-        (!values.empty() && (values.front() < 0 || values.back() >= file.rows)))
-      throw std::invalid_argument(
-        "lineage visibility requires valid sorted unique delete positions");
-    windows.emplace_back(state->deletes.size(), values.size());
-    state->deletes.insert(state->deletes.end(), values.begin(), values.end());
+  for (std::size_t file = 0; file < lineage.domain()->files.size(); ++file) {
+    auto values = lookup(lineage.domain()->files[file].identity);
+    if (!std::is_sorted(values.begin(), values.end()))
+      throw std::invalid_argument("lineage visibility requires sorted delete positions");
+    auto& selected = ranges[file];
+    std::sort(selected.begin(), selected.end());
+    auto start = state->deletes.size();
+    // Merge repeated/overlapping input intervals. Each file's selected deletes
+    // are uploaded once even when concatenation repeats the same physical rows.
+    for (std::size_t i = 0; i < selected.size();) {
+      auto [first, end] = selected[i++];
+      while (i < selected.size() && selected[i].first <= end)
+        end = std::max(end, selected[i++].second);
+      // Signed searches ignore eager V2 positions outside these intervals.
+      auto lo = std::lower_bound(values.begin(), values.end(), first);
+      auto hi = std::lower_bound(lo, values.end(), end);
+      state->deletes.insert(state->deletes.end(), lo, hi);
+    }
+    windows.emplace_back(start, state->deletes.size() - start);
   }
   if (state->deletes.empty()) return;
   int64_t offset = 0;
-  for (auto const& run : lineage.domain->file_runs) {
+  for (auto const& run : lineage.domain()->file_runs) {
     state->runs.push_back(
       {offset, run.first, run.count, windows[run.file].first, windows[run.file].second});
     offset += run.count;
@@ -780,8 +953,8 @@ void apply_lineage_visibility(
                                   cudaMemcpyHostToDevice,
                                   stream.get()));
     cudf::column_view ordinals;
-    if (lineage.state == row_position_state::per_row)
-      ordinals = lineage.per_row->view();
+    if (lineage.state() == row_position_state::per_row)
+      ordinals = lineage.per_row()->view();
     else {
       state->owned_ordinals = lineage.ordinal_column(stream, mr);
       ordinals              = state->owned_ordinals->view();
@@ -803,11 +976,12 @@ void apply_lineage_visibility(
     state->filtered =
       sirius::apply_retention_mask(cudf::table_view{augmented}, state->mask->view(), stream, mr);
     detail::retire_reads(state, stream, unjoined);
-    auto output     = state->filtered->release();
-    lineage.per_row = std::move(output.back());
+    auto output          = state->filtered->release();
+    bool const validated = lineage.is_validated();
+    auto binding         = lineage.source_binding();
+    lineage = {row_position_state::per_row, lineage.domain(), {}, std::move(output.back())};
     output.pop_back();
-    lineage.state = row_position_state::per_row;
-    lineage.runs.clear();
+    if (validated) lineage.seal_validation(std::move(binding));
     table = owning_table_view{std::make_unique<cudf::table>(std::move(output))};
   } catch (...) {
     if (state) detail::retire_reads(state, stream, unjoined);

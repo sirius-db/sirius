@@ -5,11 +5,15 @@
 # See the LICENSE file at the repo root for the full text.
 """Run the Sirius C++ unit tests.
 
-The run has four steps:
+The run has five steps:
 
-  shards     Two Catch2 shards per visible GPU, run in parallel. Each shard sees
-             one GPU and uses integration-shard.yaml. [multi_gpu] and hidden
-             tests are excluded.
+  shards     Two Catch2 shards per visible GPU. Each shard sees one GPU and
+             uses integration-shard.yaml. [multi_gpu], [exclusive_context] and hidden tests are
+             excluded. Processes sharing a GPU run serially by default;
+             different GPUs can run in parallel.
+  isolated   Tests that own a complete Sirius context run in a fresh process.
+             Pausing shared fixtures does not release other tests' static
+             memory managers. This preserves each fixture's full memory budget.
   cuda_fault Isolated CUDA status-injection tests (Linux only). One GPU is
              visible; the [multi_gpu] ones run in a second process with all
              GPUs visible, skipped when fewer than two are.
@@ -33,6 +37,7 @@ and the Sirius logs to its own subdirectory of
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 import os
 import shutil
 import subprocess
@@ -47,9 +52,10 @@ from typing import NamedTuple
 REPO_ROOT = Path(__file__).resolve().parent.parent
 UNITTEST_DIR = Path("test/cpp")
 SHARD_CONFIG = REPO_ROOT / "test/cpp/integration/integration-shard.yaml"
-STEPS = ("shards", "cuda_fault", "multi_gpu", "late_mat")
+STEPS = ("shards", "isolated", "cuda_fault", "multi_gpu", "late_mat")
 STEP_SPECS = {
-    "shards": "~[.]~[multi_gpu]",
+    "shards": "~[.]~[multi_gpu]~[exclusive_context]",
+    "isolated": "[exclusive_context]~[.]~[multi_gpu]",
     "cuda_fault": "[cuda_status_fault]~[multi_gpu]",
     "multi_gpu": "[multi_gpu]~[.]",
     "late_mat": "[late_mat]~[late_mat_fused],[deferred_query]~[late_mat_fused],"
@@ -57,7 +63,13 @@ STEP_SPECS = {
 }
 LATE_MAT_FUSED_SPEC = "[late_mat_fused]"
 CUDA_FAULT_MULTI_GPU_SPEC = "[cuda_status_fault][multi_gpu]~[.]"
-TIMEOUT_MIN = {"shards": 45, "cuda_fault": 10, "multi_gpu": 20, "late_mat": 20}
+TIMEOUT_MIN = {
+    "shards": 45,
+    "isolated": 10,
+    "cuda_fault": 10,
+    "multi_gpu": 20,
+    "late_mat": 20,
+}
 SUMMARY_PREFIXES = ("All tests passed", "test cases:", "No tests ran")
 
 _print_lock = threading.Lock()
@@ -165,6 +177,33 @@ def run_job(job: Job) -> Result:
     )
 
 
+def run_jobs(jobs: list[Job], gpus: list[str], jobs_per_gpu: int) -> list[Result]:
+    """Keep independent fixture budgets from competing for the same GPU.
+
+    Hold each slot from before process startup until exit, including any child
+    processes. A job without a device override can use every visible GPU and
+    therefore needs a slot on each of them.
+    """
+    slots = {gpu: threading.BoundedSemaphore(jobs_per_gpu) for gpu in gpus}
+
+    def run_with_slots(job: Job) -> Result:
+        devices = job.env.get("CUDA_VISIBLE_DEVICES", ",".join(gpus)).split(",")
+        with ExitStack() as held:
+            # All jobs acquire slots in the same order, including multi-GPU jobs.
+            for gpu in gpus:
+                if gpu in devices:
+                    held.enter_context(slots[gpu])
+            return run_job(job)
+
+    with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+        try:
+            return list(pool.map(run_with_slots, jobs))
+        except KeyboardInterrupt:
+            # Cancel before the executor waits for jobs that hold GPU slots.
+            _launcher.cancel()
+            raise
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -184,6 +223,12 @@ def main() -> int:
         "--shards", type=int, help="number of shards (default: 2 per visible GPU)"
     )
     parser.add_argument(
+        "--jobs-per-gpu",
+        type=int,
+        default=1,
+        help="concurrent test jobs per GPU (default: 1); higher values require fixture memory headroom",
+    )
+    parser.add_argument(
         "--require-gpus",
         type=int,
         default=0,
@@ -192,6 +237,8 @@ def main() -> int:
     )
     parser.add_argument("catch2_args", nargs="*", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.jobs_per_gpu < 1:
+        parser.error("--jobs-per-gpu must be positive")
 
     steps = args.steps.split(",")
     if unknown := [s for s in steps if s not in STEPS]:
@@ -202,6 +249,7 @@ def main() -> int:
     log_root = build_dir / UNITTEST_DIR / "log"
     gpus = visible_gpus()
     print(f"Visible GPUs: {', '.join(gpus) or 'none'}", flush=True)
+    print(f"Concurrent test jobs per GPU: {args.jobs_per_gpu}", flush=True)
     needed = max(args.require_gpus, 1)
     if len(gpus) < needed:
         print(f"error: needs {needed} GPUs, {len(gpus)} visible", file=sys.stderr)
@@ -243,6 +291,20 @@ def main() -> int:
                         prefix=f"[shard {i}] ",
                     )
                     for i in range(count)
+                ]
+            case "isolated":
+                jobs = [
+                    Job(
+                        label=step,
+                        cmd=cmd,
+                        env={
+                            "CUDA_VISIBLE_DEVICES": gpus[0],
+                            "SIRIUS_TEST_SINGLE_GPU": "1",
+                            "SIRIUS_TEST_INTEGRATION_CONFIG": str(SHARD_CONFIG),
+                        },
+                        log_dir=log_root / step,
+                        prefix="[isolated] ",
+                    )
                 ]
             case "cuda_fault":
                 jobs = [
@@ -287,15 +349,11 @@ def main() -> int:
                         prefix="[late_mat_fused] ",
                     ),
                 ]
-        with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
-            try:
-                step_results = list(pool.map(run_job, jobs))
-            except KeyboardInterrupt:
-                # Ctrl-C does not reach the tests in timeout's process group, but timeout
-                # passes SIGTERM on to them.
-                _launcher.cancel()
-                print("Interrupted", file=sys.stderr)
-                return 130
+        try:
+            step_results = run_jobs(jobs, gpus, args.jobs_per_gpu)
+        except KeyboardInterrupt:
+            print("Interrupted", file=sys.stderr)
+            return 130
         results += step_results
         if any(r.status != 0 for r in step_results):
             print(f"Stopping after the failed {step} step", flush=True)

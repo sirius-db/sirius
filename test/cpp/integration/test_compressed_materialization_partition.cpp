@@ -250,12 +250,12 @@ std::size_t count_type(std::vector<cudf::data_type> const& sidecar, cudf::type_i
 }  // namespace
 
 // NB: no [integration]/[shared_context] tag — these TEST_CASEs build their own SiriusContext
-// from a small-partition yaml and manage (pause) the shared envs themselves, mirroring
-// test_compressed_materialization_gate.cpp.
+// from a small-partition yaml. The [exclusive_context] tag keeps these cases
+// with the gate fixtures in a fresh process, without other tests' static managers.
 TEST_CASE(
   "gpu_execution - narrow payloads cross a partitioned exchange with a wired dynamic "
   "filter",
-  "[gpu_execution][parquet][compressed_materialization_partition]")
+  "[gpu_execution][parquet][compressed_materialization_partition][exclusive_context]")
 {
   pause_shared_envs();
 
@@ -338,7 +338,7 @@ TEST_CASE(
 }
 
 TEST_CASE("gpu_execution - outer joins over narrow carriers match the CPU",
-          "[gpu_execution][parquet][compressed_materialization_partition]")
+          "[gpu_execution][parquet][compressed_materialization_partition][exclusive_context]")
 {
   pause_shared_envs();
 
@@ -431,7 +431,7 @@ TEST_CASE("gpu_execution - outer joins over narrow carriers match the CPU",
 }
 
 TEST_CASE("plan shape - dynamic-filter-wired scan keeps narrow payload carriers",
-          "[compressed_materialization_partition][planner]")
+          "[compressed_materialization_partition][exclusive_context][planner]")
 {
   pause_shared_envs();
 
@@ -512,7 +512,7 @@ TEST_CASE("plan shape - dynamic-filter-wired scan keeps narrow payload carriers"
 }
 
 TEST_CASE("gpu_execution - narrow group keys cross the aggregate exchange",
-          "[gpu_execution][parquet][compressed_materialization_partition]")
+          "[gpu_execution][parquet][compressed_materialization_partition][exclusive_context]")
 {
   pause_shared_envs();
 

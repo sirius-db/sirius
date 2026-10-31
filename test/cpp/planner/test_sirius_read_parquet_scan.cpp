@@ -136,7 +136,7 @@ sirius::op::sirius_physical_operator* find_scan(sirius::op::sirius_physical_oper
 }  // namespace
 
 TEST_CASE("parquet all-pruned lowering owns a typed empty source without a scan",
-          "[planner][parquet][source_pruning][tree_pipeline]")
+          "[planner][parquet][source_pruning][tree_pipeline][exclusive_context]")
 {
   using op_type             = sirius::op::SiriusPhysicalOperatorType;
   auto const narrow_carrier = GENERATE(false, true);
@@ -216,10 +216,10 @@ TEST_CASE("parquet all-pruned lowering owns a typed empty source without a scan"
   REQUIRE_FALSE(con.Query("ROLLBACK")->HasError());
 }
 
-// NB: no [integration]/[shared_context] tag — this TEST_CASE builds its own SiriusContext
-// and manages (pauses) the shared envs itself, mirroring the isolated-context pin tests.
+// These fixtures own a full context with a 5 GiB initial host pool. The runner
+// keeps them in a fresh process, without other cases' static memory managers.
 TEST_CASE("tree pipeline build plans sirius_read_parquet scans",
-          "[planner][sirius_read_parquet][tree_pipeline]")
+          "[planner][sirius_read_parquet][tree_pipeline][exclusive_context]")
 {
   pause_shared_envs();
 
@@ -341,7 +341,7 @@ TEST_CASE("tree pipeline build plans sirius_read_parquet scans",
 }
 
 TEST_CASE("parquet lineage and lowering agree on registered dynamic-filter channels",
-          "[planner][parquet][virtual_columns][metadata_only][tree_pipeline]")
+          "[planner][parquet][virtual_columns][metadata_only][tree_pipeline][exclusive_context]")
 {
   namespace scan    = sirius::op::scan;
   using op_type     = sirius::op::SiriusPhysicalOperatorType;

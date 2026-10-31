@@ -64,6 +64,9 @@ jobs:
           environments: ${{ matrix.cuda.pixi-environment }}
           activate-environment: ${{ matrix.cuda.pixi-environment }}
 
+      - name: Test unit test runner scheduling without a GPU
+        run: pixi run -e ${{ matrix.cuda.pixi-environment }} python -B -m unittest discover -s test/scripts -p test_run_unit_tests.py -v
+
       - name: Test Simpatico cache identity without a GPU
         run: |
           pixi run -e ${{ matrix.cuda.pixi-environment }} cmake \

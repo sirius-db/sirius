@@ -1,8 +1,11 @@
 /* Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0 */
 #include "op/scan/table_scan/field_mapper.hpp"
 
+#include "io/parquet_helpers.hpp"
 #include "io/uri_parser.hpp"
+#include "op/scan/parquet_schema_mapping.hpp"
 
+#include <algorithm>
 #include <unordered_map>
 
 namespace sirius::op::scan {
@@ -105,6 +108,65 @@ mapping_outcome map_file(mapping_request const& request, physical_check_counters
       result.leaves.push_back(by_name[column.name]);
   }
   result.physical_leaves = std::move(by_name);
+  if (!result.compiled && request.allow_file_carrier && !request.metadata_only &&
+      request.layout.has_user_virtual_columns() && request.layout.carrier_batch_index &&
+      !metadata.row_groups.empty()) {
+    for (auto const& column : metadata.schema) {
+      bool partition = std::any_of(request.layout.partition_primary_indices.begin(),
+                                   request.layout.partition_primary_indices.end(),
+                                   [&](auto p) {
+                                     return p < request.bound_names.size() &&
+                                            request.bound_names[p] == column.name;
+                                   });
+      if (partition ||
+          std::any_of(request.layout.partition_columns.begin(),
+                      request.layout.partition_columns.end(),
+                      [&](auto const& partition) { return partition.name == column.name; }))
+        continue;
+      auto width = detail::carrier_decoded_width(column);
+      if (width && (!result.file_carrier || width < result.file_carrier_width)) {
+        result.file_carrier       = column.name;
+        result.file_carrier_width = width;
+      }
+    }
+  }
+  if (!result.compiled && !result.file_carrier && request.layout.carrier_batch_index) {
+    auto const& name = request.layout.data_columns.at(*request.layout.carrier_batch_index).name;
+    auto leaves      = result.physical_leaves.find(name);
+    result.carrier_unavailable = leaves == result.physical_leaves.end() || leaves->second.empty();
+  }
+  auto& projection = result.reader_projection;
+  if (request.metadata_only) {
+    result.selection = mapping_selection::full_correspondence;
+  } else if (result.compiled) {
+    projection.names        = result.compiled->read_names();
+    projection.bound_types  = result.compiled->read_types();
+    projection.natural_read = projection.names.empty();
+  } else if (result.file_carrier) {
+    auto schema = sirius::io::parquet_helpers::extract_schema(
+      metadata, true, request.footer->original_logical_annotations);
+    auto found = std::find(schema.names.begin(), schema.names.end(), *result.file_carrier);
+    if (found == schema.names.end())
+      throw std::invalid_argument("Parquet carrier missing from physical schema");
+    projection.names       = {*result.file_carrier};
+    projection.bound_types = {schema.types[std::distance(schema.names.begin(), found)]};
+  } else {
+    projection.natural_read = !request.layout.is_projected() || result.carrier_unavailable;
+    for (auto const& column : request.layout.data_columns) {
+      projection.names.push_back(column.name);
+      if (!request.bound_types.empty()) {
+        if (column.primary_idx >= request.bound_types.size())
+          return refuse(verdict_reason::interface_unavailable,
+                        "field mapping bound type index is out of range",
+                        refusal_rule::program_target_mismatch);
+        projection.bound_types.push_back(request.bound_types[column.primary_idx]);
+      }
+    }
+  }
+  if (!request.metadata_only)
+    for (std::size_t i = 0; i < projection.names.size(); ++i)
+      projection.projected.push_back(i);
+  if (projection.natural_read) result.selection = mapping_selection::full_correspondence;
   return std::make_shared<mapping_result const>(std::move(result));
 }
 }  // namespace sirius::op::scan

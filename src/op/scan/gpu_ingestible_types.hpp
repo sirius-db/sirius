@@ -29,12 +29,62 @@
 #include <memory>
 #include <span>
 #include <stdexcept>
+#include <stop_token>
 #include <utility>
 #include <vector>
 
 #pragma once
 
 namespace sirius::op::scan {
+class scan_info;
+class sirius_gpu_scan_operator;
+class parquet_scan_core;
+class gpu_ingestible;
+
+// Issued only by the scan operator after its certificate and registry checks.
+// Stack-scoped and single-use: it is never cached on mutable split metadata.
+class split_validation {
+ public:
+  split_validation(split_validation const&)            = delete;
+  split_validation& operator=(split_validation const&) = delete;
+  split_validation(split_validation&&)                 = default;
+
+ private:
+  friend class sirius_gpu_scan_operator;
+  friend class parquet_scan_core;
+  split_validation(scan_info const& input, scan_contract_id contract, later_check_set checks)
+    : _input(&input), _contract(contract), _checks(checks)
+  {
+  }
+  bool consume(scan_info const& input, scan_contract_id contract, later_check_set checks) const
+  {
+    if (_consumed || _input != &input || _contract != contract || (checks & ~_checks).any())
+      return false;
+    _consumed = true;
+    return true;
+  }
+  scan_info const* _input;
+  scan_contract_id _contract;
+  later_check_set _checks;
+  mutable bool _consumed = false;
+};
+
+struct scan_execution_context {
+  scan_execution_context(uint64_t attempt       = 1,
+                         uint64_t logical_input = 0,
+                         std::stop_token stop   = {})
+    : attempt(attempt), logical_input(logical_input), stop(stop)
+  {
+  }
+  uint64_t attempt       = 1;
+  uint64_t logical_input = 0;
+  std::stop_token stop;
+
+ private:
+  friend class gpu_ingestible;
+  friend class parquet_scan_core;
+  split_validation const* validation = nullptr;
+};
 
 //===----------------------------------------------------------------------===//
 // ingestible_table_info
@@ -386,7 +436,7 @@ enum class filter_state {
  * Bundles the materialized cudf::table with a tag describing how much of
  * the split's filter + projection work was applied during materialization.
  */
-struct row_lineage;
+class row_lineage;
 struct filtered_table {
   owning_table_view table;
   filter_state state{filter_state::UNFILTERED};

@@ -33,12 +33,24 @@ struct lineage_domain {
   bool operator==(lineage_domain const&) const = default;
 };
 
-struct row_lineage {
-  row_position_state state = row_position_state::none;
-  std::shared_ptr<lineage_domain const> domain;
+class row_lineage {
+ public:
+  row_lineage() = default;
+  row_lineage(row_position_state state,
+              std::shared_ptr<lineage_domain const> domain,
+              std::vector<std::pair<int64_t, int64_t>> runs = {},
+              std::shared_ptr<cudf::column const> per_row   = {});
+  [[nodiscard]] row_position_state state() const { return data().state; }
+  [[nodiscard]] std::shared_ptr<lineage_domain const> const& domain() const
+  {
+    return data().domain;
+  }
   // Selection runs are (input-domain ordinal, count), never file positions.
-  std::vector<std::pair<int64_t, int64_t>> runs;
-  std::shared_ptr<cudf::column const> per_row;  // INT64 input-domain ordinals
+  [[nodiscard]] std::vector<std::pair<int64_t, int64_t>> const& runs() const { return data().runs; }
+  [[nodiscard]] std::shared_ptr<cudf::column const> const& per_row() const
+  {
+    return data().per_row;
+  }
 
   [[nodiscard]] int64_t input_domain_length() const;
   [[nodiscard]] int64_t output_length() const;
@@ -48,6 +60,13 @@ struct row_lineage {
   void validate_on(int64_t output_rows,
                    ::cuda::stream_ref,
                    rmm::device_async_resource_ref = cudf::get_current_device_resource_ref()) const;
+  // Import an external decoder's selection into private, immutable storage.
+  // Copies mutable aliases before strict validation; a caller's validation
+  // report is never a substitute for this boundary.
+  [[nodiscard]] row_lineage validated_copy(int64_t output_rows,
+                                           ::cuda::stream_ref,
+                                           rmm::device_async_resource_ref) const;
+  [[nodiscard]] bool matches_domain(std::shared_ptr<lineage_domain const> const&) const;
   [[nodiscard]] std::pair<std::size_t, int64_t> resolve(int64_t ordinal) const;
   [[nodiscard]] std::vector<int64_t> ordinals_on(::cuda::stream_ref) const;
   [[nodiscard]] row_lineage select(std::span<int64_t const> delivered_ordinals,
@@ -68,12 +87,51 @@ struct row_lineage {
   static row_lineage concatenate(std::span<row_lineage const>,
                                  ::cuda::stream_ref,
                                  rmm::device_async_resource_ref);
+
+ private:
+  // There is one immutable representation, shared by value copies. Only owned
+  // imports and invariant-preserving internal operations can mark it validated.
+  // Raw constructor arguments may still have external mutable aliases and must
+  // cross validated_copy before their validation can be reused.
+  struct selection {
+    row_position_state state = row_position_state::none;
+    std::shared_ptr<lineage_domain const> domain;
+    std::vector<std::pair<int64_t, int64_t>> runs;
+    std::shared_ptr<cudf::column const> per_row;  // INT64 input-domain ordinals
+    bool validated = false;
+    std::shared_ptr<lineage_domain const> binding;
+  };
+  std::shared_ptr<selection const> _selection;
+  [[nodiscard]] selection const& data() const
+  {
+    static selection const empty;
+    return _selection ? *_selection : empty;
+  }
+  [[nodiscard]] bool is_validated() const { return data().validated; }
+  void validate_impl(int64_t output_rows, bool strict) const;
+  void validate_on_impl(int64_t output_rows,
+                        ::cuda::stream_ref,
+                        rmm::device_async_resource_ref,
+                        bool strict) const;
+  [[nodiscard]] std::shared_ptr<lineage_domain const> source_binding() const;
+  void seal_validation(std::shared_ptr<lineage_domain const> binding = {});
+  friend row_lineage consume_reader_positions(std::unique_ptr<gpu_row_positions>,
+                                              ::cuda::stream_ref,
+                                              rmm::device_async_resource_ref,
+                                              std::shared_ptr<lineage_domain const>);
+  friend void apply_lineage_visibility(
+    owning_table_view&,
+    row_lineage&,
+    std::function<std::span<int64_t const>(std::string const&)> const&,
+    ::cuda::stream_ref,
+    rmm::device_async_resource_ref);
 };
 // Consume the reader's row buffer in place; source indices are released after
 // conversion. Only a consumer of canonical ordinals should call this adapter.
 row_lineage consume_reader_positions(std::unique_ptr<gpu_row_positions>,
                                      ::cuda::stream_ref,
-                                     rmm::device_async_resource_ref);
+                                     rmm::device_async_resource_ref,
+                                     std::shared_ptr<lineage_domain const> expected_domain = {});
 // Additional temporary bytes above the existing reader row/source buffers.
 std::size_t lineage_conversion_workspace_bytes(std::size_t rows, std::size_t intervals);
 void append_lineage_virtual_columns(owning_table_view&,

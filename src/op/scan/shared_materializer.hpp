@@ -13,8 +13,11 @@
 namespace sirius::op::scan {
 struct prepared_split {
   std::shared_ptr<scan_info const> info;
-  std::vector<split_dependencies> dependencies;
-  std::vector<row_group_slice> slices;
+  std::shared_ptr<void const> metadata_owner;
+  // Views into info (or the direct caller's retained input); copying the shared
+  // task state must not deep-copy every row-group list.
+  std::span<split_dependencies const> dependencies;
+  std::span<row_group_slice const> slices;
   std::shared_ptr<scan_plan const> plan;
   std::vector<std::string> partition_values;
   std::shared_ptr<lineage_domain const> input_domain;
@@ -23,34 +26,43 @@ struct prepared_split {
   uint64_t attempt       = 1;
   uint64_t logical_input = 0;
   std::stop_token stop;
+
+ private:
+  friend class parquet_scan_core;
+  // Default decoder dispatch only; the caller keeps this object alive through
+  // the synchronous call. Async metadata views retain info/metadata_owner.
+  scan_info const* reader_input = nullptr;
 };
 // Adapter certification is frozen before decode and tied to the exact program
 // and plan. Non-Parquet adapters retain their own proof, without a fake footer.
-class mapping_certification {
+class certified_mapping {
  public:
-  mapping_certification(materialization_program const& program,
-                        std::shared_ptr<scan_plan const> plan,
-                        std::shared_ptr<void const> owner)
-    : contract(program.contract),
-      generation(program.generation),
-      layout(program.input_layout),
+  certified_mapping(std::shared_ptr<materialization_program const> program,
+                    std::shared_ptr<scan_plan const> plan,
+                    std::shared_ptr<void const> owner,
+                    std::shared_ptr<field_id_mapping const> normalization = {})
+    : program(std::move(program)),
+      contract(this->program ? this->program->contract : 0),
+      generation(this->program ? this->program->generation : 0),
+      layout(this->program ? this->program->input_layout : nullptr),
       plan(std::move(plan)),
-      owner(std::move(owner))
+      owner(std::move(owner)),
+      normalization(std::move(normalization))
   {
     if (!contract || !generation || !layout || !this->plan || !this->owner)
       throw std::invalid_argument("mapping certification requires bound evidence");
+    if (this->normalization && (this->normalization->program().contract != contract ||
+                                this->normalization->program().generation != generation))
+      throw std::invalid_argument("shared normalization program binding mismatch");
+    if (this->normalization && this->owner.get() != this->normalization.get())
+      throw std::invalid_argument("shared mapping certification binding mismatch");
   }
+  std::shared_ptr<materialization_program const> const program;
   uint64_t const contract, generation;
   std::shared_ptr<void const> const layout;
   std::shared_ptr<scan_plan const> const plan;
   std::shared_ptr<void const> const owner;
-};
-struct certified_mapping {
-  std::shared_ptr<materialization_program const> program;
-  std::shared_ptr<field_id_mapping const> normalization;
-  // Adapter-owned evidence for independently qualified non-Parquet input.
-  // The default Parquet entry also retains/checks its per-slice approvals.
-  std::shared_ptr<mapping_certification const> evidence;
+  std::shared_ptr<field_id_mapping const> const normalization;
 };
 struct required_visibility_input {
   applied_visibility binding;
@@ -63,28 +75,60 @@ struct decode_result {
   filtered_table batch;
   row_lineage lineage;
 };
+// Borrowed decoder staging must be owned by the prepared input, certification,
+// owned callback or result. Deferred replacement success joins the caller stream before releasing
+// these owners; default readers keep their own completion protocol.
 using decode_fn = std::function<decode_result(prepared_split const&,
                                               materializer_inputs const&,
                                               cucascade::memory::memory_space const&,
                                               ::cuda::stream_ref,
                                               rmm::device_async_resource_ref)>;
-struct reader_task {
-  // Owns the default adapter's options, AST, snapshot and borrowed input owners
-  // through the callback. Only the default decoder consumes this task.
-  decode_fn decode;
+// Only parquet_scan_core can issue the default reader's completion protocol.
+// An ordinary replacement callback always uses the checked retirement entry.
+class default_reader {
+ public:
+  decode_result materialize(prepared_split const&,
+                            materializer_inputs const&,
+                            cucascade::memory::memory_space const&,
+                            ::cuda::stream_ref,
+                            rmm::device_async_resource_ref) const;
+
+ private:
+  friend class parquet_scan_core;
+  explicit default_reader(decode_fn decode) : _decode(std::move(decode)) {}
+  decode_fn _decode;
 };
-struct coverage_facts {
-  std::shared_ptr<static_predicate_catalogue const> catalogue;
-  std::vector<std::size_t> reader_requested;
-  bool reader_pushdown_complete = false;
+class coverage_facts {
+ public:
+  coverage_facts(std::shared_ptr<static_predicate_catalogue const> catalogue = {},
+                 std::vector<std::size_t> requested                          = {})
+    : _catalogue(std::move(catalogue))
+  {
+    std::vector<bool> seen(_catalogue ? _catalogue->size() : 0, false);
+    for (auto term : requested) {
+      if (term >= seen.size() || seen[term])
+        throw std::invalid_argument("invalid requested reader conjunct");
+      seen[term] = true;
+    }
+    if (!requested.empty())
+      _requested = std::make_shared<std::vector<std::size_t> const>(std::move(requested));
+  }
+  [[nodiscard]] auto const& catalogue() const { return _catalogue; }
+  [[nodiscard]] std::span<std::size_t const> reader_requested() const
+  {
+    return _requested ? std::span<std::size_t const>{*_requested} : std::span<std::size_t const>{};
+  }
+
+ private:
+  std::shared_ptr<static_predicate_catalogue const> _catalogue;
+  std::shared_ptr<std::vector<std::size_t> const> _requested;
 };
 struct materializer_inputs {
   coverage_facts coverage;
-  certified_mapping mapping;
+  std::shared_ptr<certified_mapping const> mapping;
   std::vector<required_visibility_input> visibility;
   validation_policy validation = validation_policy::qualified_lineage;
   std::string diagnostic_context;
-  std::shared_ptr<reader_task const> reader;
   bool needs_lineage = false;
   expression_query_policy expression_policy;
   bool like_swar_fastpath = false;
@@ -126,11 +170,6 @@ void apply_materialization_projection(materialized_batch&,
                                       semantic_options const&,
                                       ::cuda::stream_ref,
                                       rmm::device_async_resource_ref);
-decode_result parquet_cudf_decode(prepared_split const&,
-                                  materializer_inputs const&,
-                                  cucascade::memory::memory_space const&,
-                                  ::cuda::stream_ref,
-                                  rmm::device_async_resource_ref);
 decode_result materialize_shared(prepared_split const&,
                                  materializer_inputs const&,
                                  decode_fn const&,

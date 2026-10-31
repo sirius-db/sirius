@@ -28,6 +28,7 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -207,6 +208,10 @@ class completion_handler {
    * @return True if completion has been signaled, false otherwise.
    */
   [[nodiscard]] bool is_completed() const noexcept { return _completed.load(); }
+  [[nodiscard]] std::stop_token execution_stop_token() const noexcept
+  {
+    return execution_stop_.get_token();
+  }
 
   /**
    * @brief Check if the handler has already been completed with an error.
@@ -294,6 +299,7 @@ class completion_handler {
     published_changed_.notify_all();
     auto stop = preparation_stop_;
     terminal_lock.unlock();
+    execution_stop_.request_stop();
     if (on_error_) {
       try {
         on_error_(error);
@@ -324,6 +330,7 @@ class completion_handler {
     }
   }
   std::shared_ptr<std::function<void(bool)> const> preparation_stop_;
+  std::stop_source execution_stop_;
   mutable std::mutex terminal_mutex_;
   std::exception_ptr terminal_error_, preparation_cleanup_error_;
   bool gpu_done_              = false;
