@@ -82,7 +82,7 @@ scan_manager_config config_with_cache(cucascade::io::cache::cache_mode mode)
 {
   scan_manager_config cfg;
   cfg.thread_pool.num_threads = 3;
-  cfg.uring_n_reactors        = 1;
+  cfg.uring_reactors_per_gpu  = 1;
   cfg.cache.mode              = mode;
   cfg.cache.eviction          = cucascade::io::cache::eviction_policy::lru;
   cfg.apply_cache_mode();

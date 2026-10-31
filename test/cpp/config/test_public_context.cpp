@@ -134,7 +134,7 @@ TEST_CASE("public context rolls back late initialization failures before retry",
   check_default_allocators();
 
   // One reactor fits the same host pool; all other settings remain the same.
-  root["sirius"]["executor"]["scan_manager"]["uring_n_reactors"] = 1;
+  root["sirius"]["executor"]["scan_manager"]["uring_reactors_per_gpu"] = 1;
   {
     auto retry = sirius::Context::create(from_yaml(root));
     INFO((retry ? "initialized" : retry.error().message));
