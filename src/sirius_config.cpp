@@ -329,6 +329,8 @@ static std::string rest_yaml_key(std::string_view field)
     {"retry_jitter", "retry_jitter_ms"},
     {"connect_timeout", "connect_timeout_ms"},
     {"dns_ttl", "dns_ttl_s"},
+    {"write_split_bytes", "write_part_bytes"},
+    {"continue_timeout", "continue_timeout_ms"},
     {"tls.fallback_rx", "tls.user_space_rx"},
     {"tls.placement", "tls.recv_placement"},
   };
@@ -434,6 +436,22 @@ static void from_yaml(const YAML::Node& node, cucascade::io::rest::config& opt)
   read_count(r, "fan_out", opt.fan_out, true);
   r.optional("interface", opt.interface);
   r.optional("pin_to_irq_cpus", opt.pin_to_irq_cpus);
+
+  // -- S3 writes (PUT / multipart upload through the ioctx write API) ---------------
+  // S3 caps a multipart upload at 10000 parts of [5 MiB, 5 GiB] (the last part may be smaller).
+  bytes_in("write_part_bytes",
+           opt.write_split_bytes,
+           5 * mib,
+           std::size_t{5} * 1024 * mib,
+           "must be in [5 MiB, 5 GiB]");
+  r.optional("expect_continue", opt.expect_continue);
+  r.optional("continue_timeout_ms", opt.continue_timeout, nonnegative_duration);
+  r.optional("complete_timeout_s", opt.complete_timeout_s, nonnegative);
+  read_count(r, "max_write_connections", opt.max_write_connections);
+  if (opt.max_write_connections > opt.max_connections) {
+    throw std::runtime_error("'rest.max_write_connections': must be <= rest.max_connections (" +
+                             std::to_string(opt.max_connections) + "); 0 = all");
+  }
 
   if (auto n = r.optional_node("tls")) sirius::from_yaml(*n, opt.tls);
   r.reject_unknown();

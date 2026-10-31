@@ -380,7 +380,7 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 | `cpu_affinity` | list of int | — | Cores to pin scan-manager threads to. |
 | `backend` | enum: `native`, `cufile` | `native` | IO backend for reads. `native` uses cuCascade's native IO stack: io_uring for local paths and native REST (HTTP/1.1 over io_uring, with kTLS or user-space TLS) for `s3://`; `cufile` uses cuFile with compatibility/POSIX fallback for local regular files and keeps REST for `s3://`. S3 listing and globs always use REST. cuFile is single-GPU only: a multi-GPU configuration forces `native` with a warning. `sirius` remains a deprecated alias of `native`. `backend: kvikio` and any `scan_manager.kvikio` block are rejected with an error to use `native`; they are not accepted as aliases. Values are lowercase. |
 | `uring_n_reactors` | int (**> 0**) | 4 | Number of uring reactors for local-disk reads. Each reactor is one worker thread with its own io_uring ring and request queue, and allocates its own pinned staging from the host memory space when the IO context starts: 64 MiB of whole host blocks (at most 64 slots, at least one block). |
-| `rest_n_reactors` | int (**>= 0**) | 2 | Number of REST reactors for object-store (`s3://`) reads, each one worker thread with its own io_uring ring and HTTP/1.1 connection pool. A total for the process, never per GPU. `0` sizes the pool from the egress NIC (`rest.interface`, else the default route's interface): when the NIC's queue IRQs are steered to a strict subset of its NUMA node's cores, one reactor per distinct IRQ CPU, each pinned to that CPU (`rest.pin_to_irq_cpus`) at the highest scheduling priority the process may set; otherwise 2 unpinned reactors. Pinning never widens the process's inherited CPU affinity. |
+| `rest_n_reactors` | int (**>= 0**) | 2 | Number of REST reactors for object-store (`s3://`) reads and writes, each one worker thread with its own io_uring ring and HTTP/1.1 connection pool. A total for the process, never per GPU. `0` sizes the pool from the egress NIC (`rest.interface`, else the default route's interface): when the NIC's queue IRQs are steered to a strict subset of its NUMA node's cores, one reactor per distinct IRQ CPU, each pinned to that CPU (`rest.pin_to_irq_cpus`) at the highest scheduling priority the process may set; otherwise 2 unpinned reactors. Pinning never widens the process's inherited CPU affinity. |
 | `cufile_n_reactors` | int (**> 0**) | 4 | Number of cuFile reactors for local reads, each with one worker thread. Single-GPU only. |
 | `max_readahead_scans` | int | — (unset) | Scans the readahead may keep in flight, and the switch that runs it at all. See below. |
 | `readahead_strategy` | enum: `eager`, `opportunistic` | — (unset) | When the readahead issues. Unset takes the serving backend's own preference: `eager` for object-store (REST) reads, `opportunistic` for local (uring) ones. Values are lowercase. |
@@ -454,7 +454,9 @@ and cuCascade's user-space TLS record layer otherwise. It requires Linux 6.1+ wi
 usable io_uring, for plain HTTP endpoints too: a container seccomp policy or
 `kernel.io_uring_disabled` makes S3 unavailable, and there is no alternate
 transport. kTLS additionally needs the `tls` kernel module; without it,
-`tls.ktls: prefer` (the default) falls back to user space.
+`tls.ktls: prefer` (the default) falls back to user space. The same reactors and
+connection pools also serve S3 writes issued through the ioctx write API (single PUT or
+multipart upload, committed on flush); scans only read.
 
 TLS trust is supplied by the resolved `object_store_config`: its
 `ca_bundle_path` and `tls_verify` are applied to transport as well as signing.
@@ -473,8 +475,8 @@ Sirius sets no transport defaults of its own: every default below is cuCascade's
 `rest::config` default (the one exception is `n_max_concurrent_scans`). Each key is
 range-checked when the config loads, and the loaded block is then checked with
 cuCascade's own `rest::config::validate()`, so cross-field rules (`queue_depth`
-against `max_connections`, `max_segment_bytes` against `min_segment_bytes`, the TLS
-session-cache rule) fail at load time, naming the YAML key. Sirius hands the loaded
+against `max_connections`, `max_segment_bytes` against `min_segment_bytes`,
+`max_write_connections` against `max_connections`, the TLS session-cache rule) fail at load time, naming the YAML key. Sirius hands the loaded
 `rest::config` to cuCascade inside a `rest_reactor::reactor_context`, which is
 non-copyable and shared by the pool's reactors through a `shared_ptr`.
 
@@ -483,13 +485,13 @@ non-copyable and shared by the pool's reactors through a `shared_ptr`.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `n_max_concurrent_scans` | int (**>= 0**) | max(8, 2 × `pipeline.num_threads`) | Readahead budget the REST backend publishes, which an unset `max_readahead_scans` defers to. Unset derives it from the pipeline pool, since several splits per pipeline thread give an object-store prefetch time to land; an explicit value wins. |
-| `request_timeout_s` | int (seconds, **>= 0**) | 30 | Whole-exchange timeout of one control-plane request (HEAD / LIST / footer probe / warm-up); retries can extend a call's total time. Also the base of the presigned-URL TTL (this value plus 60 s). `0` = no limit on control requests, and presigned URLs then live 300 s. Data GETs use the stall detector instead. |
-| `stall_speed_limit_bytes` | int (bytes/s, **>= 0**) | 65536 | Stall detector for data GETs: a transfer that received fewer than `stall_speed_limit_bytes` × `stall_time_s` bytes during the last `stall_time_s` seconds fails and is retried. `0` disables the detector. |
+| `request_timeout_s` | int (seconds, **>= 0**) | 30 | Whole-exchange timeout of one control-plane request (HEAD / LIST / footer probe / warm-up, and the S3 write calls CreateMultipartUpload / AbortMultipartUpload); retries can extend a call's total time. Also the base of the presigned-URL TTL (this value plus 60 s). `0` = no limit on control requests, and presigned URLs then live 300 s. Data GETs, PUTs and UploadParts use the stall detector instead; CompleteMultipartUpload uses `complete_timeout_s`. |
+| `stall_speed_limit_bytes` | int (bytes/s, **>= 0**) | 65536 | Stall detector for data requests (GET, PUT, UploadPart): a transfer that moved fewer than `stall_speed_limit_bytes` × `stall_time_s` bytes, sent or received, during the last `stall_time_s` seconds fails and is retried. `0` disables the detector. |
 | `stall_time_s` | int (seconds, **>= 0**) | 30 | Window of the stall detector; `0` disables it. |
 | `retry_backoff_base_ms` | int (ms, **>= 0**) | 50 | Base of the exponential backoff between retries. |
 | `retry_jitter_ms` | int (ms, **>= 0**) | 50 | Random jitter added to each retry backoff. |
 | `max_retry_attempts` | int (**>= 1**) | 10 | Attempt budget (the first attempt included) for transient transport failures and HTTP 408/429/500/502/503/504; `1` = no retry. |
-| `max_auth_retry_attempts` | int (**>= 1**) | 3 | Async data attempt budget for HTTP 403 (an expired presigned URL); each attempt re-authorizes. Kept low so a genuine AccessDenied fails fast. Control requests treat 403 as terminal. |
+| `max_auth_retry_attempts` | int (**>= 1**) | 3 | Attempt budget of data requests (GET, PUT, UploadPart) for HTTP 403 (an expired presigned URL); each attempt re-authorizes, and a part's body is re-sent. Kept low so a genuine AccessDenied fails fast. Control requests (HEAD, LIST, CreateMultipartUpload, CompleteMultipartUpload, AbortMultipartUpload) treat 403 as terminal. |
 | `honor_retry_after` | bool | true | Wait a numeric `Retry-After` instead of the backoff. |
 | `footer_probe_bytes` | bytes (**<= 1Gi**) | 512Ki | Suffix-range window for the parquet footer probe. Must cover the footer, so err large. |
 | `list_max_matches` | int (**> 0**) | 100000 | Cap on files a glob/listing may accumulate (throws "narrow the glob prefix", never truncates). |
@@ -556,6 +558,23 @@ accepted. The REST counters (`rest_ioctx::stats()`) report `mtu_rejects`,
 | `fan_out` | int (**>= 1**) | 2 | Number of least-backlogged reactors one read is split across. With a positive `rest_n_reactors`, a value above it is rejected unless it is the default 2, which is clamped to a one-reactor pool; with `rest_n_reactors: 0` it is clamped to the NIC-sized pool. |
 | `interface` | string | "" | Egress interface whose queue IRQs size the pool when `rest_n_reactors: 0` and place (pin) its reactors; empty = the default route's interface. |
 | `pin_to_irq_cpus` | bool | true | Pin reactors to the NIC's IRQ CPUs, and raise their priority, when the IRQs are steered to a strict subset of the NIC node's cores. With a positive `rest_n_reactors` the configured count is pinned round-robin over those CPUs. |
+
+**S3 writes**
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `write_part_bytes` | bytes (**5Mi..5Gi**) | 16Mi | S3 multipart part size (cuCascade's `write_split_bytes`), rounded down to the write granule; writes are cut at its multiples, so one write never spans two parts. An object of at most one part is a single PUT. An open whose size hint needs more than 10000 parts uses a multiple of it. A part being assembled pins one buffer of this size from the context's host memory resource until it is uploaded or flushed. Applies to ioctx writes only, not to scan GETs. |
+| `expect_continue` | bool | false | Send PUT / UploadPart / CompleteMultipartUpload bodies only after `100 Continue`: an early 4xx / 5xx then costs no body bytes and keeps its `Retry-After`, at one round trip per request. |
+| `continue_timeout_ms` | int (ms, **>= 0**) | 1000 | With `expect_continue`, send the body anyway when the server answered nothing for this long (a server that ignores `Expect`; curl's default). `0` = wait for the answer. |
+| `complete_timeout_s` | int (seconds, **>= 0**) | 300 | Whole-request bound of CompleteMultipartUpload; S3 may assemble a large object for minutes while it trickles whitespace, so neither the stall detector nor `request_timeout_s` applies. `0` = no limit. |
+| `max_write_connections` | int (**0..`max_connections`**) | 0 | Connections of one reactor that write requests may hold at once, so the rest stay free for reads sharing the pool. `0` = all of `max_connections`. |
+
+A write is committed by the object's flush (the remaining parts, then
+CompleteMultipartUpload, or one PUT); an object destroyed uncommitted aborts its upload.
+A conditional commit that lost its answer reports "commit outcome unknown" rather than a
+false success or a false `file_exists`. Write requests are signed afresh per attempt and
+retried like reads (`max_retry_attempts`, backoff, `honor_retry_after`). cuCascade's
+`docs/io/rest-transport.md` ("Writes") describes the protocol in full.
 
 The remaining `rest::config` fields — `max_recv_iovecs`, `recv_waitall`, `sqpoll`,
 `single_issuer`, `defer_taskrun`, `register_ring_fd`, `iowq_max_bound`,
