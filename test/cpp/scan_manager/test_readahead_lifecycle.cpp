@@ -655,7 +655,7 @@ scan_manager_config config_with_readahead_budget(std::size_t budget)
 {
   scan_manager_config cfg;
   cfg.thread_pool.num_threads = 2;
-  cfg.uring_n_reactors        = 1;
+  cfg.uring_reactors_per_gpu  = 1;
   cfg.cache.mode              = cache_mode::cucs;
   cfg.max_readahead_scans     = budget;
   cfg.apply_cache_mode();
@@ -750,7 +750,7 @@ scan_manager_config config_with_uring_budget(cache_mode mode)
 {
   scan_manager_config cfg;
   cfg.thread_pool.num_threads      = 2;
-  cfg.uring_n_reactors             = 1;
+  cfg.uring_reactors_per_gpu       = 1;
   cfg.cache.mode                   = mode;
   cfg.uring.n_max_concurrent_scans = 4;
   cfg.apply_cache_mode();

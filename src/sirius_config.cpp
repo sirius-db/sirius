@@ -559,7 +559,7 @@ static void from_yaml(const YAML::Node& node, cucascade::io::cufile::config& opt
   if (r.has("n_max_concurrent_scans")) {
     throw std::runtime_error(
       "'cufile.n_max_concurrent_scans': not configurable; cuFile cannot "
-      "use fs_cache or scan readahead (use cufile_n_reactors and "
+      "use fs_cache or scan readahead (use cufile_reactors_per_gpu and "
       "cufile.max_inflight for read concurrency)");
   }
   count("max_inflight", opt.max_inflight, true);
@@ -701,13 +701,26 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
       "backend: native instead");
   }
   r.optional("max_concurrent_queries", opt.max_concurrent_queries, yaml::greater_than<int>{0});
-  r.optional("uring_n_reactors", opt.uring_n_reactors, yaml::greater_than<std::size_t>{0});
+  // uring and cuFile reactor counts are per GPU now; an old total-count key is a hard error
+  // rather than an unknown key, so its rename is spelled out.  The REST count stays a total
+  // (rest_n_reactors): REST reactors follow the egress NIC, not the GPUs.
+  for (auto const* renamed : {"uring", "cufile"}) {
+    auto const old_key = std::string(renamed) + "_n_reactors";
+    if (r.has(old_key)) {
+      throw std::runtime_error("'scan_manager." + old_key + "': renamed to '" +
+                               std::string(renamed) +
+                               "_reactors_per_gpu' (reactors per GPU of the topology, each "
+                               "placed on its GPU's NUMA node)");
+    }
+  }
+  r.optional(
+    "uring_reactors_per_gpu", opt.uring_reactors_per_gpu, yaml::greater_than<std::size_t>{0});
   // A total for the process (never per GPU); 0 sizes the pool from the egress NIC's IRQs.
   read_count(r, "rest_n_reactors", opt.rest_n_reactors);
   {
-    std::int64_t reactors = static_cast<std::int64_t>(opt.cufile_n_reactors);
-    r.optional("cufile_n_reactors", reactors, yaml::greater_than<std::int64_t>{0});
-    opt.cufile_n_reactors = static_cast<std::size_t>(reactors);
+    std::int64_t reactors = static_cast<std::int64_t>(opt.cufile_reactors_per_gpu);
+    r.optional("cufile_reactors_per_gpu", reactors, yaml::greater_than<std::int64_t>{0});
+    opt.cufile_reactors_per_gpu = static_cast<std::size_t>(reactors);
   }
   r.optional("max_readahead_scans", opt.max_readahead_scans);
   r.optional("readahead_strategy", opt.readahead_strategy);

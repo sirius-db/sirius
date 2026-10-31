@@ -540,7 +540,7 @@ If translation fails, filtering falls back to `expression_evaluator` on the deco
 - `src/scan_manager/balancing_strategy.hpp`, `src/scan_manager/round_robin_strategy.cpp` — device-distribution interface and default
 - `src/scan_manager/split_connector.hpp` — blocking queue between the coalescer and the scan operator
 
-**Config:** `scan_task_batch_size` (default: 512 MB) is the requested coalesced batch size; `executor.scan_manager` sets the thread pool and the io reactor counts (`uring_n_reactors` / `rest_n_reactors`)
+**Config:** `scan_task_batch_size` (default: 512 MB) is the requested coalesced batch size; `executor.scan_manager` sets the thread pool and the io reactor counts (`uring_reactors_per_gpu` per GPU, `rest_n_reactors` in total)
 
 ### Zone-Map Pruning on Pinned Chunks (PR #1154)
 

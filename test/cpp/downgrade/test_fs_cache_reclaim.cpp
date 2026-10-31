@@ -129,7 +129,7 @@ sirius::scan_manager::scan_manager_config cached_scan_config(double floor_fracti
 {
   sirius::scan_manager::scan_manager_config config;
   config.thread_pool.num_threads               = 1;
-  config.uring_n_reactors                      = 1;
+  config.uring_reactors_per_gpu                = 1;
   config.cache.mode                            = cache::cache_mode::cucs;
   config.cache.eviction                        = cache::eviction_policy::lru;
   config.cache.min_prefetching_budget_fraction = floor_fraction;
@@ -454,7 +454,7 @@ TEST_CASE("SiriusContext reset rebinds HOST reclaim to each rebuilt local cache"
       monitor_period: 60000ms
     scan_manager:
       num_threads: 1
-      uring_n_reactors: 1
+      uring_reactors_per_gpu: 1
       cache:
         mode: cucs
         eviction: lru

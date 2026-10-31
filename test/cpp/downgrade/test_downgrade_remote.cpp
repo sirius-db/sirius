@@ -410,7 +410,7 @@ TEST_CASE("SiriusContext terminate bounds a stalled REMOTE removal",
           num_threads: 1
         scan_manager:
           num_threads: 1
-          uring_n_reactors: 1
+          uring_reactors_per_gpu: 1
       telemetry:
         enable_quent: false
   )");

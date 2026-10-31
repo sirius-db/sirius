@@ -109,7 +109,7 @@ sirius:
     scan_manager:
       num_threads: 4
       backend: native
-      uring_n_reactors: 4
+      uring_reactors_per_gpu: 1
       cache: { mode: none, eviction: lru }
     pipeline:     { num_threads: 4 }
     downgrade:    { num_threads: 1 }
@@ -454,9 +454,9 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 | `num_threads` | int (**> 0**) | remaining cores (min 4) | Metadata-producer worker threads. |
 | `cpu_affinity` | list of int | — | Cores to pin scan-manager threads to. |
 | `backend` | enum: `native`, `cufile` | `native` | IO backend for reads. `native` uses cuCascade's native IO stack: io_uring for local paths and native REST (HTTP/1.1 over io_uring, with kTLS or user-space TLS) for `s3://`; `cufile` uses cuFile with compatibility/POSIX fallback for local regular files and keeps REST for `s3://`. S3 listing and globs always use REST. cuFile is single-GPU only: a multi-GPU configuration forces `native` with a warning. `sirius` remains a deprecated alias of `native`. `backend: kvikio` and any `scan_manager.kvikio` block are rejected with an error to use `native`; they are not accepted as aliases. Values are lowercase. |
-| `uring_n_reactors` | int (**> 0**) | 4 | Number of uring reactors for local-disk reads. Each reactor is one worker thread with its own io_uring ring and request queue, and allocates its own pinned staging from the host memory space when the IO context starts: 64 MiB of whole host blocks (at most 64 slots, at least one block). |
+| `uring_reactors_per_gpu` | int (**> 0**) | 1 | uring reactors per GPU for local-disk reads (4 GPUs and `1` give 4 reactors). Each reactor is one worker thread with its own io_uring ring and request queue, pinned to its GPU's local CPUs, and allocates its own pinned staging from the host memory space of its GPU's NUMA node when the IO context starts: 64 MiB of whole host blocks (at most 64 slots, at least one block). A device read goes to the reactors on its GPU's NUMA node unless they are much busier than the rest (more than 64 MiB queued and twice the least busy other reactor). Replaces `uring_n_reactors`, a total count, which is now rejected. |
 | `rest_n_reactors` | int (**>= 0**) | 2 | Number of REST reactors for object-store (`s3://`) reads and writes, each one worker thread with its own io_uring ring and HTTP/1.1 connection pool. A total for the process, never per GPU. `0` sizes the pool from the egress NIC (`rest.interface`, else the default route's interface): when the NIC's queue IRQs are steered to a strict subset of its NUMA node's cores, one reactor per distinct IRQ CPU, each pinned to that CPU (`rest.pin_to_irq_cpus`) at the highest scheduling priority the process may set; otherwise 2 unpinned reactors. Pinning never widens the process's inherited CPU affinity. |
-| `cufile_n_reactors` | int (**> 0**) | 4 | Number of cuFile reactors for local reads, each with one worker thread. Single-GPU only. |
+| `cufile_reactors_per_gpu` | int (**> 0**) | 4 | cuFile reactors per GPU for local reads, each with one worker thread pinned to the GPU's local CPUs. cuFile is single-GPU only, so this is the pool size. Replaces `cufile_n_reactors`, which is now rejected. |
 | `max_readahead_scans` | int | — (unset) | Scans the readahead may keep in flight, and the switch that runs it at all. See below. |
 | `readahead_strategy` | enum: `eager`, `opportunistic` | — (unset) | When the readahead issues. Unset takes the serving backend's own preference: `eager` for object-store (REST) reads, `opportunistic` for local (uring) ones. Values are lowercase. |
 
@@ -724,7 +724,7 @@ sirius:
   executor:
     scan_manager:
       backend: cufile
-      cufile_n_reactors: 4
+      cufile_reactors_per_gpu: 4
       cache: { mode: none }
       cufile:
         max_inflight: 32
@@ -752,7 +752,7 @@ or scan readahead, **even with `cache.mode: cucs`**. Neither `max_readahead_scan
 per-transfer buffer-registration controls are exposed.
 `cufile.n_max_concurrent_scans` is intentionally not a YAML setting: cuFile cannot
 publish a usable cache/readahead budget. Tune read concurrency with
-`cufile_n_reactors` and `cufile.max_inflight` instead.
+`cufile_reactors_per_gpu` and `cufile.max_inflight` instead.
 
 **Capability and fallback.** cuFile availability depends on the runtime library, GPU,
 filesystem/mount, storage stack, alignment and cuFile configuration. A per-path
@@ -1078,7 +1078,7 @@ per-pool extras.
 | `task_creator` | `executor.task_creator` | 1 | `task_creator` | Task creation from scheduling requests |
 | `gpu_pipeline_executor` | `executor.pipeline` | 4 | `gpu_pipeline` | GPU pipeline task execution |
 | `downgrade_executor` | `executor.downgrade` | 1 | `downgrade` | Data tier migration (GPU→Host) |
-| `scan_manager` | `executor.scan_manager` | remaining cores (min 4) | `scan_manager` | Scan metadata production (the IO reactor threads are separate: `uring_n_reactors`, `rest_n_reactors`, `cufile_n_reactors`) |
+| `scan_manager` | `executor.scan_manager` | remaining cores (min 4) | `scan_manager` | Scan metadata production (the IO reactor threads are separate: `uring_reactors_per_gpu` and `cufile_reactors_per_gpu` per GPU, `rest_n_reactors` in total) |
 
 The task-creator, downgrade, and scan-manager pools support optional CPU affinity lists
 (`cpu_affinity`) for core pinning. GPU pipeline affinity is derived per executor from the selected

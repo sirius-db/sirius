@@ -36,10 +36,9 @@
 
 namespace sirius::scan_manager {
 
-/// Default uring reactor count (matches cuCascade's @c io_config::uring_n_reactors;
-/// one worker thread each);
-/// counted in the scan-manager sizing budget below.
-inline constexpr std::size_t default_uring_n_reactors = 4;
+/// Default uring reactors per GPU (matches cuCascade's @c io_config::uring_reactors_per_gpu;
+/// one worker thread each); counted once in the scan-manager sizing budget below.
+inline constexpr std::size_t default_uring_reactors_per_gpu = 1;
 
 /// Sirius's default uring backend config: cuCascade's struct defaults with
 /// readahead off (@c n_max_concurrent_scans = 0).  cuCascade's own default is
@@ -64,7 +63,7 @@ inline constexpr std::size_t default_uring_n_reactors = 4;
 {
   constexpr int reserved =
     exec::default_downgrade_num_threads + creator::default_task_creator_num_threads +
-    exec::default_gpu_pipeline_num_threads + static_cast<int>(default_uring_n_reactors);
+    exec::default_gpu_pipeline_num_threads + static_cast<int>(default_uring_reactors_per_gpu);
   return std::max(4, static_cast<int>(std::thread::hardware_concurrency()) - reserved);
 }
 
@@ -240,9 +239,10 @@ struct scan_manager_config {
   /// IO backend that serves managed reads.
   io_backend backend{io_backend::native};
 
-  /// Number of uring reactors for the local-disk IO path (each one worker thread
-  /// and one ring; each allocates its pinned staging at @c ioctx::start()).
-  std::size_t uring_n_reactors{default_uring_n_reactors};
+  /// uring reactors per GPU for the local-disk IO path (each one worker thread
+  /// and one ring, pinned to its GPU's local CPUs; each allocates its pinned
+  /// staging from its GPU's NUMA node at @c ioctx::start()).
+  std::size_t uring_reactors_per_gpu{default_uring_reactors_per_gpu};
 
   /// Number of REST reactors for the S3/object-store IO path (each one worker
   /// thread with its own io_uring ring and HTTP/1.1 connection pool).  A total
@@ -252,8 +252,9 @@ struct scan_manager_config {
   /// unpinned reactors otherwise.
   std::size_t rest_n_reactors{2};
 
-  /// Number of local cuFile reader workers (single-GPU only).
-  std::size_t cufile_n_reactors{4};
+  /// Local cuFile reader workers per GPU (single-GPU only, so this is the pool
+  /// size), pinned to the GPU's local CPUs.
+  std::size_t cufile_reactors_per_gpu{4};
 
   /// Scans the readahead scan manager may keep in flight, and the switch that
   /// runs it at all.  Unset (the default) defers to the caching configuration:
@@ -323,11 +324,11 @@ struct scan_manager_config {
       case io_backend::native: out.backend = cucascade::io::io_backend::native; break;
       case io_backend::cufile: out.backend = cucascade::io::io_backend::cufile; break;
     }
-    out.uring_n_reactors = uring_n_reactors;
-    out.rest_n_reactors  = rest_n_reactors;
+    out.uring_reactors_per_gpu = uring_reactors_per_gpu;
+    out.rest_n_reactors        = rest_n_reactors;
 #ifdef CUCASCADE_HAS_CUFILE
-    out.cufile_n_reactors = cufile_n_reactors;
-    out.cufile            = cufile;
+    out.cufile_reactors_per_gpu = cufile_reactors_per_gpu;
+    out.cufile                  = cufile;
 #endif
     out.uring        = uring;
     out.rest         = rest;
@@ -373,8 +374,8 @@ struct scan_manager_config {
 inline scan_manager_config validate_scan_manager_config(scan_manager_config config)
 {
   (void)config.preparation.resolve(config.thread_pool.num_threads);
-  if (config.cufile_n_reactors == 0) {
-    throw std::invalid_argument("'scan_manager.cufile_n_reactors': must be positive");
+  if (config.cufile_reactors_per_gpu == 0) {
+    throw std::invalid_argument("'scan_manager.cufile_reactors_per_gpu': must be positive");
   }
   if (config.cufile.max_inflight == 0) {
     throw std::invalid_argument("'cufile.max_inflight': must be positive");

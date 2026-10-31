@@ -72,6 +72,7 @@
 #include <cucascade/io/cufile/cufile_ioctx.hpp>
 #endif
 #include <cucascade/io/io_context.hpp>
+#include <cucascade/io/reactor_placement.hpp>
 #include <cucascade/io/rest/rest_ioctx.hpp>
 #include <cucascade/io/uring/uring_ioctx.hpp>
 #include <cucascade/memory/column_metadata.hpp>
@@ -1380,7 +1381,10 @@ sirius_scan_manager::sirius_scan_manager(
     _native_readers(_config.preparation.resolved_native_workers(),
                     _config.preparation.resolved_native_readers()),
     _coordinators(_config.preparation.resolved_coordinator_workers()),
-    _ioctx_registry(_config.to_io_config(), reservation_manager)
+    // The registry places the uring and cuFile reactors per GPU of the topology
+    // index (staging from, and workers pinned to, the GPU's NUMA node); the REST
+    // pool stays one total that follows the egress NIC.
+    _ioctx_registry(_config.to_io_config(), reservation_manager, _topology_index)
 {
   if (!_topology_index) {
     throw std::invalid_argument("[sirius_scan_manager] topology_index must be non-null");
@@ -1398,12 +1402,19 @@ sirius_scan_manager::sirius_scan_manager(
     if (type == cucascade::io::io_context_type::cufile) {
       // The registry's noexcept factory discards construction exceptions. This
       // configured local context is mandatory: construct it through the same
-      // public count/config API so its actual failure reaches the caller.
+      // public layout/config API, placed per GPU like the registry's factory
+      // places it, so its actual failure reaches the caller.
       try {
+        auto const io_config = _config.to_io_config();
         auto context =
           std::make_shared<cucascade::io::cufile::cufile_reactor::reactor_context>(_config.cufile);
-        return std::make_shared<cucascade::io::cufile::cufile_ioctx>(_config.cufile_n_reactors,
-                                                                     std::move(context));
+        cucascade::io::reactor_layout const layout{
+          cucascade::io::make_reactor_placements(_config.cufile_reactors_per_gpu,
+                                                 _topology_index.get(),
+                                                 nullptr,
+                                                 io_config.pin_reactor_threads),
+          io_config.reactor_spill};
+        return std::make_shared<cucascade::io::cufile::cufile_ioctx>(layout, std::move(context));
       } catch (std::exception const& e) {
         throw std::runtime_error(std::string{"[sirius_scan_manager] failed to create cufile "
                                              "io_context: "} +
@@ -1430,16 +1441,19 @@ sirius_scan_manager::sirius_scan_manager(
     case scan_manager::io_backend::native:
       _io_ctx = make_default_ioctx(cucascade::io::io_context_type::uring);
       SIRIUS_LOG_DEBUG(
-        "[sirius_scan_manager] default io context: uring n_reactors={} slices_per_pass={} "
-        "range_batch_slices={}",
-        _config.uring_n_reactors,
+        "[sirius_scan_manager] default io context: uring reactors_per_gpu={} gpus={} "
+        "slices_per_pass={} range_batch_slices={}",
+        _config.uring_reactors_per_gpu,
+        _topology_index->gpu_ids().size(),
         _config.uring.slices_per_pass,
         _config.uring.range_batch_slices);
       break;
     case scan_manager::io_backend::cufile:
       _io_ctx = make_default_ioctx(cucascade::io::io_context_type::cufile);
-      SIRIUS_LOG_DEBUG("[sirius_scan_manager] default io context: cufile n_reactors={}",
-                       _config.cufile_n_reactors);
+      SIRIUS_LOG_DEBUG(
+        "[sirius_scan_manager] default io context: cufile reactors_per_gpu={} gpus={}",
+        _config.cufile_reactors_per_gpu,
+        _topology_index->gpu_ids().size());
       break;
   }
 
@@ -2467,7 +2481,7 @@ sirius_scan_manager::ioctx_failure sirius_scan_manager::explain_ioctx_failure(
     case cucascade::io::io_context_type::cufile:
       return {.cause =
                 "cuFile reader could not be constructed (requires cuCascade built with "
-                "CUCASCADE_HAS_CUFILE; check cufile_n_reactors, cufile.max_inflight, "
+                "CUCASCADE_HAS_CUFILE; check cufile_reactors_per_gpu, cufile.max_inflight, "
                 "cufile.max_op_bytes, cufile.use_odirect and cufile.compat_mode). "
                 "Direct reads require libcufile and a compatible GDS path; compat_mode=on "
                 "uses POSIX fallback without requiring GDS availability",
@@ -2486,11 +2500,14 @@ std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::make_ioctx_or_explain
   } else {
     // The shared registry holds only the default config. A path-scoped S3 config
     // builds through a throwaway registry; its constructor only registers the
-    // backend factories, which capture the reservation manager, not the registry.
+    // backend factories, which capture the reservation manager and the topology
+    // index (so its pools match the shared registry's), not the registry.
     auto backend_config         = _config;
     backend_config.object_store = *scoped;
-    io_ctx = cucascade::io::io_context_registry{backend_config.to_io_config(), _reservation_manager}
-               .make_ioctx(type);
+    io_ctx =
+      cucascade::io::io_context_registry{
+        backend_config.to_io_config(), _reservation_manager, _topology_index}
+        .make_ioctx(type);
   }
   if (io_ctx) { return io_ctx; }
   auto const failure = explain_ioctx_failure(type, scoped);
