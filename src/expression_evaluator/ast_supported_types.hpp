@@ -42,15 +42,35 @@ inline constexpr std::array<duckdb::LogicalTypeId, 3> supported_ast_cast_types{
 inline constexpr std::array<sirius::type_id, 3> supported_ast_cast_types_native{
   {sirius::type_id::UBIGINT, sirius::type_id::BIGINT, sirius::type_id::DOUBLE}};
 
-/// Whether a semantic CAST of @p source to @p target lowers to one cuDF AST op. The AST's integer
-/// casts wrap, and DECIMAL-to-integer casts also require rounding. Fixed-point sources therefore
-/// lower only to DOUBLE; integer targets go through the checked materialized conversion.
+/// Whether an integer conversion can lose values through narrowing or a signedness change.
+/// UHUGEINT uses a UINT64 carrier, as reflected by fixed_width_byte_size().
+[[nodiscard]] inline bool integer_cast_requires_range_check(logical_type const& source,
+                                                            logical_type const& target)
+{
+  if (!source.is_integer() || !target.is_integer()) { return false; }
+  auto const is_unsigned = [](type_id id) {
+    return id == type_id::UTINYINT || id == type_id::USMALLINT || id == type_id::UINTEGER ||
+           id == type_id::UBIGINT || id == type_id::UHUGEINT;
+  };
+  auto const source_unsigned = is_unsigned(source.id());
+  auto const target_unsigned = is_unsigned(target.id());
+  auto const source_width    = source.fixed_width_byte_size();
+  auto const target_width    = target.fixed_width_byte_size();
+  if (source_unsigned == target_unsigned) { return source_width > target_width; }
+  // A signed source may be negative; an unsigned source needs an extra sign bit.
+  return !source_unsigned || source_width >= target_width;
+}
+
+/// Whether a semantic CAST lowers to one cuDF AST op. Integer conversions that can overflow
+/// must materialize for range checks. Fixed-point sources lower only to DOUBLE because
+/// DECIMAL-to-integer casts also require rounding and checked materialized conversion.
 [[nodiscard]] inline bool ast_supports_cast(logical_type const& source, logical_type const& target)
 {
   auto const supported = std::find(supported_ast_cast_types_native.begin(),
                                    supported_ast_cast_types_native.end(),
                                    target.id()) != supported_ast_cast_types_native.end();
-  return supported && (!source.has_fixed_point_carrier() || target.id() == type_id::DOUBLE);
+  return supported && !integer_cast_requires_range_check(source, target) &&
+         (!source.has_fixed_point_carrier() || target.id() == type_id::DOUBLE);
 }
 
 /// Whether @p call's result or any argument is DECIMAL or HUGEINT. cuDF AST does not enforce

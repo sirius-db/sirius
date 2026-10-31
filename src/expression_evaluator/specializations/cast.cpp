@@ -66,10 +66,10 @@ constexpr __int128_t power_of_ten(int32_t exponent)
   return result;
 }
 
-// cuDF narrows a DECIMAL128 HUGEINT carrier by wrapping, where DuckDB's CAST raises an error and
+// cuDF narrows integer values by wrapping, where DuckDB's CAST raises an error and
 // TRY_CAST returns NULL. Throw when any value lies outside @p target's SQL range so the query
 // falls back to DuckDB, which gives its exact behavior. Wider targets need no check.
-void require_hugeint_cast_in_range(cudf::column_view const& input,
+void require_integer_cast_in_range(cudf::column_view const& input,
                                    logical_type const& target,
                                    ::cuda::stream_ref stream,
                                    rmm::device_async_resource_ref mr)
@@ -114,7 +114,7 @@ void require_hugeint_cast_in_range(cudf::column_view const& input,
   if (!range) { return; }
   if (range->minimum < minimum || range->maximum > maximum) {
     throw not_implemented_exception(
-      "[expression_evaluator:cast] HUGEINT value out of range for {}; falling back to DuckDB",
+      "[expression_evaluator:cast] Integer value out of range for {}; falling back to DuckDB",
       target.to_string());
   }
 }
@@ -181,8 +181,9 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::cast const& alt, eva
     // Carrier restores were handled above; only semantic casts reach this branch.
     result_column = temporal::cast_to_microseconds_checked(input, _stream, _mr);
   } else {
-    if (alt.child->return_type().id() == type_id::HUGEINT) {
-      require_hugeint_cast_in_range(input, alt.target_type, _stream, _mr);
+    if (alt.child->return_type().id() == type_id::HUGEINT ||
+        integer_cast_requires_range_check(alt.child->return_type(), alt.target_type)) {
+      require_integer_cast_in_range(input, alt.target_type, _stream, _mr);
     }
     result_column = cudf::cast(input, return_type, _stream, _mr);
   }
