@@ -36,7 +36,7 @@ Tools:
   set `LIBCLANG_PATH` if libclang is not on CMake's or the system's search path
 - `xxhsum` (xxHash 0.8) to fingerprint embedded JIT headers
 
-CMake packages: `cudf`, `rmm`, `raft`, `cuvs`, `kvikio`, `nvcomp`, `spdlog`,
+CMake packages: `cudf`, `rmm`, `raft`, `cuvs`, `nvcomp`, `spdlog`,
 `yaml-cpp`, `roaring`, and `absl`, plus `OpenSSL`, `ZLIB`, and `CUDAToolkit`.
 `pkg-config` modules: `numa`, `liburing`, and `libcurl`. Use the RAPIDS versions
 pinned in `pixi.toml`.
