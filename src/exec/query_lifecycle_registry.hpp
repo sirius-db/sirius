@@ -17,6 +17,7 @@
 #pragma once
 
 #include "cuda/device_health.hpp"
+#include "cuda/gpu_completion.hpp"
 #include "query_id.hpp"
 
 #include <array>
@@ -267,15 +268,17 @@ class query_lifecycle_registry {
   bool report_failure(std::exception_ptr error, std::optional<query_id_t> id = {}) noexcept
   {
     if (id) record_error(*id, error);
-    auto status = fatal_device_status(error);
-    if (!status) return false;
+    auto status         = fatal_device_status(error);
+    bool const unjoined = is_unjoined_gpu_work(error);
+    if (!status && !unjoined) return false;
+    if (unjoined) unsafe_completion_.store(true, std::memory_order_release);
     // Format outside the registry lock. Retain text/status, not an exception_ptr
     // whose custom exception could keep query resources alive after retirement.
     auto message = exception_message(error);
     try {
       std::lock_guard lock(mutex_);
       if (!runtime_failed()) {
-        runtime_failure_status_  = *status;
+        runtime_failure_status_  = status.value_or(cudaSuccess);
         runtime_failure_message_ = std::move(message);
         // Publish only after the originating diagnostic is available to health polls.
         runtime_failed_.store(true, std::memory_order_release);
@@ -291,13 +294,21 @@ class query_lifecycle_registry {
     return true;
   }
   bool runtime_failed() const noexcept { return runtime_failed_.load(std::memory_order_acquire); }
+  bool unsafe_completion() const noexcept
+  {
+    return unsafe_completion_.load(std::memory_order_acquire);
+  }
+  void require_gpu_completion() const
+  {
+    if (unsafe_completion()) throw unjoined_gpu_work{};
+  }
 
   /// First fatal cause, including its status even when the exception text omits it.
   /// Survives query retirement; empty when no fatal CUDA failure has been reported.
   std::string runtime_failure_message() const
   {
     std::lock_guard lock(mutex_);
-    if (runtime_failure_status_ == cudaSuccess) return {};
+    if (runtime_failure_status_ == cudaSuccess) return runtime_failure_message_;
     return std::string(cudaGetErrorName(runtime_failure_status_)) + ": " + runtime_failure_message_;
   }
 
@@ -431,6 +442,7 @@ class query_lifecycle_registry {
   /// Run destructors outside both locks: they can invoke callbacks into the runtime.
   void release_resources(query_id_t query_id)
   {
+    require_gpu_completion();
     std::shared_ptr<void> resources;
     if (auto control = find(query_id)) {
       std::lock_guard lock(control->mutex);
@@ -444,6 +456,7 @@ class query_lifecycle_registry {
   /// initialization and repeated cleanup are supported. Existing drains are still mandatory.
   void close(sirius::query_id_t query_id)
   {
+    require_gpu_completion();
     std::shared_ptr<query_control> retired;
     {
       std::lock_guard registry_lock(mutex_);
@@ -463,6 +476,17 @@ class query_lifecycle_registry {
   [[nodiscard]] bool accepts_work(sirius::query_id_t query_id) const
   {
     return state(query_id) == query_lifecycle_state::open;
+  }
+
+  /// Wait between nonblocking reservation attempts; query retirement wakes all waiters.
+  /// The timeout also bounds executor-stop detection and retries after memory is returned.
+  bool wait_for_quiescing(query_id_t query_id, std::chrono::milliseconds timeout) const
+  {
+    auto control = find(query_id);
+    if (!control) return true;
+    std::unique_lock lock(control->mutex);
+    return control->idle.wait_for(
+      lock, timeout, [&] { return control->state != query_lifecycle_state::open; });
   }
 
   [[nodiscard]] std::optional<query_lifecycle_state> state(sirius::query_id_t query_id) const
@@ -504,6 +528,7 @@ class query_lifecycle_registry {
   /// This is an incomplete teardown: settle outstanding users before retrying, never reopen gates.
   void clear()
   {
+    require_gpu_completion();
     decltype(queries_) retired;
     {
       std::lock_guard registry_lock(mutex_);
@@ -547,6 +572,7 @@ class query_lifecycle_registry {
   static void mark_quiescing(query_control& c)
   {
     c.state = query_lifecycle_state::quiescing;
+    c.idle.notify_all();
     if (c.status.retiring == std::chrono::steady_clock::time_point{})
       c.status.retiring = std::chrono::steady_clock::now();
   }
@@ -568,6 +594,7 @@ class query_lifecycle_registry {
   // Lock order: registry -> query control. Handles only lock their control; no queue or callback
   // runs under either mutex. Waiters release the registry lock before waiting on a query's CV.
   std::atomic<bool> runtime_failed_{false};
+  std::atomic<bool> unsafe_completion_{false};
   cudaError_t runtime_failure_status_{cudaSuccess};  // protected by mutex_
   std::string runtime_failure_message_;              // protected by mutex_
   std::array<std::optional<diagnostic>, 128> history_;
