@@ -49,6 +49,7 @@
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "planner/connector_registry.hpp"
+#include "planner/scan_returned_types.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
@@ -1025,7 +1026,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     sirius::from_duckdb_vec(original_types),  // Use original types, not modified
     op.function,
     std::move(op.bind_data),
-    sirius::from_duckdb_vec(op.returned_types),
+    scan_returned_types(op.returned_types, column_ids),
     column_ids,
     duckdb::vector<std::size_t>(op.projection_ids.begin(), op.projection_ids.end()),
     duckdb::IdentifiersToStrings(op.names),

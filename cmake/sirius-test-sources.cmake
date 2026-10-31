@@ -256,6 +256,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_scan_column_origin.cpp
     test/cpp/planner/test_join_key_nullability.cpp
     test/cpp/planner/test_scan_filter_projection.cpp
+    test/cpp/planner/test_scan_returned_types.cpp
     test/cpp/planner/test_dynamic_filter_discovery_parity.cpp
     test/cpp/planner/test_dynamic_filter_key_admission.cpp
     test/cpp/planner/test_dynamic_filter_target_discovery.cpp
