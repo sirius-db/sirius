@@ -594,24 +594,50 @@ residual_filter::residual_filter(std::vector<table_filter_conjunct> conjuncts,
 std::unique_ptr<sirius::ast::node> residual_filter::against(
   std::vector<std::size_t> const& answered_positions, bool answers_enforced) const
 {
-  if (_conjuncts.empty()) { return nullptr; }
+  return against_progress(progress_from_legacy_answers(answered_positions, answers_enforced));
+}
 
+std::vector<predicate_progress> residual_filter::progress_from_legacy_answers(
+  std::span<std::size_t const> answered_positions, bool answers_enforced) const
+{
+  // Preserve the legacy API's conservative treatment of unoffered answer columns.
+  // The record translator validates its report at the migration boundary instead.
+  std::vector<std::size_t> qualified;
+  for (auto position : answered_positions)
+    if (std::any_of(_conjuncts.begin(),
+                    _conjuncts.end(),
+                    [position](auto const& c) { return c.answered_at == position; }) &&
+        std::find(qualified.begin(), qualified.end(), position) == qualified.end())
+      qualified.push_back(position);
+  return progress_from_answers(qualified, answers_enforced);
+}
+
+std::vector<predicate_progress> residual_filter::progress_from_answers(
+  std::span<std::size_t const> answered_positions, bool answers_enforced) const
+{
   std::vector<predicate_progress> progress;
+  std::unordered_set<std::size_t> seen;
+  for (auto position : answered_positions) {
+    if (!seen.insert(position).second ||
+        std::none_of(_conjuncts.begin(), _conjuncts.end(), [position](auto const& c) {
+          return c.answered_at == position;
+        }))
+      throw std::invalid_argument("unknown or duplicate predicate answer column");
+  }
   for (std::size_t i = 0; i < _conjuncts.size(); ++i) {
     auto const position = _conjuncts[i].answered_at;
     if (position && std::find(answered_positions.begin(), answered_positions.end(), *position) !=
                       answered_positions.end()) {
-      progress.push_back({i,
-                          answers_enforced ? predicate_stage::enforced : predicate_stage::answer,
-                          answers_enforced ? std::nullopt : position});
+      progress.push_back(
+        {i, answers_enforced ? predicate_stage::enforced : predicate_stage::answer, position});
     }
   }
-  return against_progress(progress);
+  return progress;
 }
 
-std::unique_ptr<sirius::ast::node> residual_filter::against_progress(
-  std::span<predicate_progress const> progress) const
+void residual_filter::validate_progress(std::span<predicate_progress const> progress) const
 {
+  if (progress.empty()) return;
   std::vector<predicate_progress const*> by_id(_conjuncts.size(), nullptr);
   for (auto const& item : progress) {
     if (item.conjunct >= by_id.size() || by_id[item.conjunct])
@@ -619,12 +645,23 @@ std::unique_ptr<sirius::ast::node> residual_filter::against_progress(
     if (item.stage != predicate_stage::untouched && item.stage != predicate_stage::pruning_only &&
         item.stage != predicate_stage::answer && item.stage != predicate_stage::enforced)
       throw std::invalid_argument("unknown residual predicate stage");
-    if ((item.stage == predicate_stage::answer) != item.answer_slot.has_value())
-      throw std::invalid_argument("residual answer requires exactly one answer slot");
+    if ((item.stage == predicate_stage::answer && !item.answer_slot) ||
+        (item.answer_slot && item.stage != predicate_stage::answer &&
+         item.stage != predicate_stage::enforced))
+      throw std::invalid_argument("invalid residual answer binding");
     if (item.answer_slot && _conjuncts[item.conjunct].answered_at != item.answer_slot)
       throw std::invalid_argument("residual answer is not bound to this conjunct");
     by_id[item.conjunct] = &item;
   }
+}
+
+std::unique_ptr<sirius::ast::node> residual_filter::against_progress(
+  std::span<predicate_progress const> progress) const
+{
+  validate_progress(progress);
+  std::vector<predicate_progress const*> by_id(_conjuncts.size(), nullptr);
+  for (auto const& item : progress)
+    by_id[item.conjunct] = &item;
   std::vector<std::unique_ptr<sirius::ast::node>> children;
   for (std::size_t i = 0; i < _conjuncts.size(); ++i) {
     auto const* item = by_id[i];

@@ -38,6 +38,8 @@ class parquet_scan_core {
 
   std::unique_ptr<batch_coalescer> create_batch_coalescer() const;
 
+  [[nodiscard]] scan_plan const& plan() const noexcept { return *_plan; }
+
   [[nodiscard]] bool has_processed_all_metadata() const;
 
   /// Bind-time file predicates eliminated every file; no physical input is consumed.
@@ -89,6 +91,13 @@ class parquet_scan_core {
   [[nodiscard]] scan_filter_analysis const& filter_analysis() const { return _filter_analysis; }
 
  private:
+  [[nodiscard]] uint64_t execution_contract() const noexcept;
+  [[nodiscard]] scan_execution_record execution_progress(filtered_table const&) const;
+  [[nodiscard]] scan_execution_record decoded_execution(bool static_filter_applied,
+                                                        bool assembled) const;
+  [[nodiscard]] std::shared_ptr<void const> execution_layout(bool assembled) const;
+  [[nodiscard]] std::unique_ptr<sirius::ast::node> residual_against(
+    std::span<predicate_progress const>) const;
   [[nodiscard]] std::unique_ptr<sirius::ast::node> remaining_residual(
     filtered_table const& input) const;
 
@@ -102,16 +111,6 @@ class parquet_scan_core {
                                                   std::shared_ptr<io::ioctx> const& io_ctx,
                                                   std::stop_token stop = {});
 
-  /// Add the carrier and user-requested virtual columns to a decoded parquet batch.
-  [[nodiscard]] std::unique_ptr<cudf::table> append_virtual_columns(
-    std::unique_ptr<cudf::table> decoded,
-    cudf::io::parquet_reader_options const& reader_options,
-    std::string const& file_path,
-    std::size_t file_index,
-    std::int64_t file_row_offset,
-    ::cuda::stream_ref stream,
-    rmm::device_async_resource_ref mr) const;
-
   [[nodiscard]] bool can_project_during_filter() const noexcept;
 
   std::unique_ptr<parquet_ingestible_table_info> _info;
@@ -119,6 +118,7 @@ class parquet_scan_core {
   std::once_flag _evidence_index_once;
   std::vector<std::size_t> _evidence_index_by_file;
   const parquet_source_kind _source_kind;
+  const bool _requires_file_visibility;
   parquet_read_mode _read_mode = parquet_read_mode::READER;
 
   // Canonical scan plan — built once in the constructor, shared by every
@@ -145,6 +145,8 @@ class parquet_scan_core {
   // so post_filter_and_project assembles the residual from what the batch
   // reports rather than from anything precomputed here.
   residual_filter _residual;
+  // IDs in the full catalogue, fixed before any reader/statistics exclusions.
+  std::vector<std::size_t> _reader_conjuncts;
 
   // The part of _duckdb_filter_expression safe to push into the reader: the
   // full predicate minus any top-level AND conjunct that cuDF's row-group

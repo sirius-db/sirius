@@ -32,6 +32,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -59,6 +60,7 @@ class io_object_metadata;
 
 namespace sirius::op::scan {
 class scan_info;
+struct scan_execution_record;
 // Adapter-owned semantic input published by the shared scan preparation path.
 // Concrete connectors extend this type; the preparation coordinator only keeps
 // the lifetime and never interprets connector-specific payloads.
@@ -224,6 +226,8 @@ struct physical_check_counters {
   std::atomic<uint64_t> descriptor_mismatches{0};
   std::atomic<uint64_t> iceberg_delete_corrupt_inputs{0};
   std::atomic<uint64_t> iceberg_inventory_bytes_peak{0};
+  std::atomic<uint64_t> execution_record_shadow_mismatches{0};
+  std::atomic<uint64_t> execution_record_shadow_coverage_added{0};
 
   // Installed before a test query, cleared only after its workers have joined.
   // true = before footer processing, false = after successful cuDF decode.
@@ -231,6 +235,10 @@ struct physical_check_counters {
   std::function<void(std::string const&, bool)> parquet_metadata_for_testing;
   // Per decoded batch, before any residual filter: reader filter present, output rows.
   std::function<void(bool, uint64_t)> parquet_filter_for_testing;
+  std::function<void(bool, scan_execution_record const&)> scan_execution_for_testing;
+  std::function<void(std::vector<std::size_t> const&)> scan_residual_for_testing;
+  // Actual cuDF prepend requests, independently for row and source index.
+  std::function<void(bool, bool)> parquet_positions_for_testing;
   std::function<void()> after_certify_for_testing;
   std::function<void(std::string const&, bool)> iceberg_dv_phase_for_testing;
   std::function<void(scan_contract_id, bool)> iceberg_preparation_route_for_testing;

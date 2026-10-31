@@ -59,13 +59,14 @@ class iceberg_ingestible_table_info : public parquet_ingestible_table_info {
  *
  * The adapter adds two semantic operations around the shared Parquet core:
  *
- * 1. @ref next_split_provider forces reader-side pushdown off for files with deletes. Positional
- *    deletes are keyed on a row's position within its file, so rows dropped during decode make
- *    the mapping unrecoverable. The predicate still runs, in @c post_filter_and_project, after
- *    the deletes — the order Iceberg requires. Row-group PRUNING stays on: it only removes rows
- *    the predicate could not match, and the footer still gives the survivors' offsets.
+ * 1. @ref next_split_provider suppresses reader filtering when deletes are present, except on
+ *    qualified virtual-column read_parquet routes. Those routes may filter before deletes using
+ *    cuDF's original positions. Scans without virtual columns use unfiltered input intervals;
+ *    they never request indices solely for deletion. Dynamic filters never count as static
+ *    predicate coverage. Row-group pruning retains original file offsets.
  *
- * 2. @ref materialize_metadata_to_table decodes through the core, then applies per-file deletes.
+ * 2. @ref materialize_metadata_to_table applies each bound delete set using reader positions or
+ *    intervals, preserves predicate facts, and releases hidden indices after their last use.
  *
  * Equality deletes are declined by the planner: they need their key columns force-projected.
  */

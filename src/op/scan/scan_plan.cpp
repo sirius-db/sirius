@@ -28,7 +28,6 @@
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/cudf_utils.hpp>
-#include <cudf/filling.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/table/table.hpp>
 
@@ -122,56 +121,6 @@ std::vector<cudf::size_type> output_data_positions(scan_plan const& plan)
     positions.push_back(static_cast<cudf::size_type>(pos));
   }
   return positions;
-}
-
-std::unique_ptr<cudf::table> append_parquet_virtual_columns(std::unique_ptr<cudf::table> table,
-                                                            scan_plan const& plan,
-                                                            std::string const& file_path,
-                                                            std::size_t file_index,
-                                                            std::int64_t file_row_offset,
-                                                            ::cuda::stream_ref stream,
-                                                            rmm::device_async_resource_ref mr)
-{
-  if (!table || plan.virtual_columns.empty()) { return table; }
-  if (static_cast<std::size_t>(table->num_columns()) != plan.data_columns.size()) {
-    throw sirius::internal_exception(
-      "parquet virtual scan: decoded column count does not match planned layout");
-  }
-  auto const rows                                    = table->num_rows();
-  std::vector<std::unique_ptr<cudf::column>> columns = table->release();
-  columns.reserve(columns.size() + plan.virtual_columns.size());
-  for (auto const& virtual_column : plan.virtual_columns) {
-    if (rows == 0) {
-      auto const type =
-        virtual_column.kind == scan_plan::parquet_virtual_column_kind::FILENAME
-          ? cudf::type_id::STRING
-        : virtual_column.kind == scan_plan::parquet_virtual_column_kind::FILE_ROW_NUMBER
-          ? cudf::type_id::INT64
-          : cudf::type_id::UINT64;
-      columns.push_back(cudf::make_empty_column(type));
-      continue;
-    }
-    switch (virtual_column.kind) {
-      case scan_plan::parquet_virtual_column_kind::FILENAME: {
-        cudf::string_scalar value(file_path, true, stream, mr);
-        columns.push_back(cudf::make_column_from_scalar(value, rows, stream, mr));
-        break;
-      }
-      case scan_plan::parquet_virtual_column_kind::FILE_INDEX: {
-        cudf::numeric_scalar<std::uint64_t> value(
-          static_cast<std::uint64_t>(file_index), true, stream, mr);
-        columns.push_back(cudf::make_column_from_scalar(value, rows, stream, mr));
-        break;
-      }
-      case scan_plan::parquet_virtual_column_kind::FILE_ROW_NUMBER: {
-        cudf::numeric_scalar<std::int64_t> initial(file_row_offset, true, stream, mr);
-        cudf::numeric_scalar<std::int64_t> step(1, true, stream, mr);
-        columns.push_back(cudf::sequence(rows, initial, step, stream, mr));
-        break;
-      }
-    }
-  }
-  return std::make_unique<cudf::table>(std::move(columns));
 }
 
 owning_table_view select_scan_columns(owning_table_view&& table,

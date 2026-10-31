@@ -3,6 +3,7 @@
 
 #include "op/scan/owning_table_view.hpp"
 #include "op/scan/parquet_batch_layout.hpp"
+#include "op/scan/scan_execution_record.hpp"
 #include "op/scan/scan_filter_analysis.hpp"
 
 #include <functional>
@@ -24,6 +25,9 @@ struct materialization_program {
   // cuDF data_type retains decimal scale, but not bound precision. Arrow imports
   // require this per-input-column binding for decimals (zero for other types).
   std::vector<int32_t> decimal_precisions;
+  std::shared_ptr<visibility_bindings const> required_visibility;
+  std::shared_ptr<void const> input_layout;
+  std::shared_ptr<void const> output_layout;
 };
 
 struct row_origin {
@@ -53,6 +57,9 @@ struct materialized_batch {
   bool row_count_carrier       = false;
   std::vector<predicate_progress> predicates;
   row_domain lineage;
+  bool whole_static_complete = false;
+  visibility_bindings visibility_applied;
+  std::shared_ptr<void const> layout;
 };
 
 // Each step consumes/updates the owned batch on the caller's task stream. Row-changing
@@ -63,6 +70,7 @@ struct materialization_steps {
   materialization_step visibility;
   materialization_step residual;
   materialization_step projection;
+  std::function<void(materialized_batch&, std::span<applied_visibility const>)> bound_visibility;
 };
 
 void validate_materialized_batch(materialized_batch const&, materialization_program const&);

@@ -258,16 +258,6 @@ struct bound_virtual_column {
 /// @param plan  The scan plan describing the layout.
 [[nodiscard]] std::vector<cudf::size_type> output_data_positions(scan_plan const& plan);
 
-/// Append non-null virtual columns to a decoded row group.
-[[nodiscard]] std::unique_ptr<cudf::table> append_parquet_virtual_columns(
-  std::unique_ptr<cudf::table> table,
-  scan_plan const& plan,
-  std::string const& file_path,
-  std::size_t file_index,
-  std::int64_t file_row_offset,
-  ::cuda::stream_ref stream,
-  rmm::device_async_resource_ref mr);
-
 /// Build a scan_plan from DuckDB planner inputs. See @c scan_plan for semantics.
 ///
 /// @param column_ids          Column ids exposed by the table function.
