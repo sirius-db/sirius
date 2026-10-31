@@ -400,3 +400,24 @@ TEST_CASE("Canonical virtual columns resolve each selected file and original row
   CHECK(sirius::test::detail::copy_device_values<char>(names.chars_begin(stream), 2, stream) ==
         std::vector<char>{'A', 'B'});
 }
+
+TEST_CASE("Empty fileless lineage assembles typed empty virtual columns",
+          "[scan][lineage][decoder_boundary]")
+{
+  rmm::cuda_stream stream;
+  auto mr = cudf::get_current_device_resource_ref();
+  row_lineage lineage{row_position_state::identity, std::make_shared<lineage_domain const>()};
+  scan_plan plan;
+  using kind           = scan_plan::parquet_virtual_column_kind;
+  plan.virtual_columns = {
+    {1, "file", sirius::logical_type::make(sirius::type_id::VARCHAR), kind::FILENAME, 0},
+    {2, "index", sirius::logical_type::make(sirius::type_id::UBIGINT), kind::FILE_INDEX, 1},
+    {3, "row", sirius::logical_type::make(sirius::type_id::BIGINT), kind::FILE_ROW_NUMBER, 2}};
+  owning_table_view table;
+  append_lineage_virtual_columns(table, lineage, plan, {}, stream, mr);
+  REQUIRE(table.n_columns() == 3);
+  CHECK(table.num_rows() == 0);
+  CHECK(table.view().column(0).type().id() == cudf::type_id::STRING);
+  CHECK(table.view().column(1).type().id() == cudf::type_id::UINT64);
+  CHECK(table.view().column(2).type().id() == cudf::type_id::INT64);
+}

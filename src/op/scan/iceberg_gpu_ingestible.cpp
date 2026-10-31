@@ -538,7 +538,8 @@ filtered_table iceberg_gpu_ingestible::materialize_metadata_to_table(
   ::cuda::stream_ref stream,
   bool like_swar_fastpath,
   std::shared_ptr<const sirius::like_multiliteral_cache> like_cache,
-  expression_query_policy policy)
+  expression_query_policy policy,
+  scan_execution_context execution)
 {
   auto const& split = dynamic_cast<parquet_split_info const&>(info);
   if (split.dependencies().size() != split.rg_slices.size()) {
@@ -602,7 +603,8 @@ filtered_table iceberg_gpu_ingestible::materialize_metadata_to_table(
                                                   std::move(like_cache),
                                                   policy,
                                                   requirements,
-                                                  std::move(visibility_owners));
+                                                  std::move(visibility_owners),
+                                                  execution);
 
   base.required_visibility = std::move(requirements);
   if (!base.execution) throw sirius::internal_exception("Iceberg decode omitted execution facts");
@@ -616,13 +618,17 @@ filtered_table iceberg_gpu_ingestible::materialize_metadata_to_table(
       if (base.lineage_record) {
         auto lineage = *base.lineage_record;
         rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
-        for (auto const& binding : pending)
-          if (!lineage.domain ||
-              std::none_of(
-                lineage.domain->files.begin(), lineage.domain->files.end(), [&](auto const& file) {
-                  return delete_key_for(file.identity) == binding.file;
-                }))
+        for (auto const& binding : pending) {
+          if (!lineage.domain)
             throw std::invalid_argument("visibility file is outside decoder input domain");
+          auto file = std::find_if(
+            lineage.domain->files.begin(), lineage.domain->files.end(), [&](auto const& file) {
+              return delete_key_for(file.identity) == binding.file;
+            });
+          if (file == lineage.domain->files.end())
+            throw std::invalid_argument("visibility file is outside decoder input domain");
+          sets.at(binding.file)->validate_file_bounds(file->rows);
+        }
         apply_lineage_visibility(
           base.table,
           lineage,

@@ -56,7 +56,8 @@ class parquet_scan_core {
     std::shared_ptr<const sirius::like_multiliteral_cache> like_cache,
     expression_query_policy policy                           = {},
     std::shared_ptr<visibility_bindings const> visibility    = {},
-    std::vector<required_visibility_input> visibility_owners = {});
+    std::vector<required_visibility_input> visibility_owners = {},
+    scan_execution_context execution                         = {});
 
   std::unique_ptr<cudf::table> post_filter_and_project(
     filtered_table&& table,
@@ -101,7 +102,8 @@ class parquet_scan_core {
                                           ::cuda::stream_ref,
                                           bool,
                                           std::shared_ptr<like_multiliteral_cache const>,
-                                          expression_query_policy);
+                                          expression_query_policy,
+                                          scan_execution_context);
   decode_fn _decode_override;
   [[nodiscard]] uint64_t execution_contract() const noexcept;
   [[nodiscard]] scan_execution_record execution_progress(filtered_table const&) const;

@@ -242,7 +242,8 @@ class stub_ingestible final : public sirius::op::scan::gpu_ingestible {
     ::cuda::stream_ref,
     bool,
     std::shared_ptr<const sirius::like_multiliteral_cache>,
-    sirius::expression_query_policy /*policy*/) override
+    sirius::expression_query_policy /*policy*/,
+    sirius::op::scan::scan_execution_context /*execution*/) override
   {
     throw std::logic_error("stub_ingestible: a resident split never decodes scan metadata");
   }
@@ -2147,6 +2148,7 @@ TEST_CASE("resident and stolen Parquet facts preserve actual legacy decisions",
                               {});
     scan::scan_operator_input input(source);
     input.gpu_memory_space                     = e.gpu_space;
+    input.execution                            = {4, 45, {}};
     input.pushdown_row_filtered                = complete;
     input.pushdown_filter_only_columns_dropped = mode == 7;
     if (answered)
@@ -2159,6 +2161,8 @@ TEST_CASE("resident and stolen Parquet facts preserve actual legacy decisions",
     REQUIRE(batch.execution);
     auto const& facts = *batch.execution;
     CHECK(facts.producer == scan::execution_record_producer::resident);
+    CHECK(batch.attempt == 4);
+    CHECK(batch.logical_input == 45);
     CHECK(facts.authoritative == qualified);
     CHECK(facts.whole_static_complete == (mode == 0 || complete));
     CHECK_FALSE(facts.projection_complete);

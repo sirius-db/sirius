@@ -90,8 +90,13 @@ filtered_table gpu_ingestible::materialize_table(
   auto* mem_space = split.gpu_memory_space;
   if (split.has_scan_metadata()) [[likely]] {
     split.update(io::cache::scan_stage::reading);
-    auto materialized = materialize_metadata_to_table(
-      split.get_scan_info(), *mem_space, stream, like_swar_fastpath, std::move(like_cache), policy);
+    auto materialized = materialize_metadata_to_table(split.get_scan_info(),
+                                                      *mem_space,
+                                                      stream,
+                                                      like_swar_fastpath,
+                                                      std::move(like_cache),
+                                                      policy,
+                                                      split.execution);
     if (split.mvcc_keep_mask.has_mask()) {
       // Only insert-delta splits carry a visibility mask here; disk-walk
       // splits never do. Sync before returning for the same reason as the
@@ -111,8 +116,10 @@ filtered_table gpu_ingestible::materialize_table(
     }
     return materialized;
   } else {
-    auto finish = [this](filtered_table result) {
+    auto finish = [this, &split](filtered_table result) {
       record_resident_execution(result);
+      result.attempt       = split.execution.attempt;
+      result.logical_input = split.execution.logical_input;
       return result;
     };
     // A decode-row-filtered batch already had the split's whole table-filter

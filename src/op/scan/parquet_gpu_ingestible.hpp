@@ -96,9 +96,11 @@ class parquet_gpu_ingestible : public gpu_ingestible {
     ::cuda::stream_ref stream,
     bool like,
     std::shared_ptr<const sirius::like_multiliteral_cache> cache,
-    expression_query_policy policy = {}) override
+    expression_query_policy policy   = {},
+    scan_execution_context execution = {}) override
   {
-    return _core.materialize_metadata_to_table(info, space, stream, like, std::move(cache), policy);
+    return _core.materialize_metadata_to_table(
+      info, space, stream, like, std::move(cache), policy, {}, {}, execution);
   }
 
  private:

@@ -850,13 +850,24 @@ semantic functions. Caller expression policy, stream and allocator are preserved
 `scoped_step_observer` observes actual work under a test-only opt-in; it cannot
 replace work or propagate callback exceptions into a query.
 
+The certificate pins the exact approved normalization. Replacement results must
+match the bound input/output types, with explicit BOOL8 answer and row-count-carrier
+exceptions. Deferred replacement decoding retires borrowed staging on the caller's
+stream before returning; the default reader keeps its existing completion protocol.
+Prepared row-group/dependency views retain shared input without deep copies;
+standalone uniquely owned inputs retain one metadata snapshot for retirement.
+Production task retries preserve logical-input identity and advance the attempt;
+query terminal errors request the decoder's cancellation token.
+
 The program shares the full immutable predicate catalogue, including expressions,
 materialized slots and answer eligibility. `row_lineage` separately retains an
 immutable input domain and identity, interval or device ordinal selection.
 Composition preserves the original domain; concatenation shifts by input length,
 not survivor count. `none` and `lost` never imply identity. Reader positions are
 converted only for a canonical-lineage consumer, reusing the row buffer and
-releasing source indices; ordinary Iceberg interval/reader-position deletion
+releasing source indices; unused reader positions are discarded. Canonical deletion
+uploads only positions within the original input intervals, preserving eager V2
+signed-position behavior and upstream deferred-DV validation. Ordinary Iceberg interval/reader-position deletion
 keeps its existing representation. A legacy `row_domain` view can be generated
 explicitly from the canonical record; independently authoritative copies are
 rejected. Resident/decompression records preserve actual answers and whole-filter
@@ -865,7 +876,9 @@ completion; native MVCC continues to use its separate visibility contract.
 `table_scan/field_mapper.hpp` wraps the existing name, Iceberg field-ID and flat
 compatibility rules. It returns immutable mapping results or structured refusals,
 retains original physical-check evidence and diagnostics, and counts only rules
-actually attempted. Preparation still reads and certifies each footer once.
+actually attempted. Results distinguish field correspondence from the effective
+reader projection, including a replacement carrier or natural-read fallback.
+Preparation still reads and certifies each footer once.
 
 ## Key Files
 

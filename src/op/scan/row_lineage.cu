@@ -623,7 +623,7 @@ void append_lineage_virtual_columns(owning_table_view& table,
   }
   auto const unjoined = detail::prepare_unjoined_failure();
   try {
-    if (resolve_positions) state->ordinals = lineage.ordinal_column(stream, mr);
+    if (count && resolve_positions) state->ordinals = lineage.ordinal_column(stream, mr);
     if (need_rows)
       state->rows = cudf::make_numeric_column(
         cudf::data_type{cudf::type_id::INT64}, count, cudf::mask_state::UNALLOCATED, stream, mr);
@@ -655,6 +655,13 @@ void append_lineage_virtual_columns(owning_table_view& table,
       return result;
     };
     for (auto const& col : plan.virtual_columns) {
+      if (!count) {
+        auto type = col.kind == kind::FILENAME     ? cudf::type_id::STRING
+                    : col.kind == kind::FILE_INDEX ? cudf::type_id::UINT64
+                                                   : cudf::type_id::INT64;
+        state->columns.push_back(cudf::make_empty_column(type));
+        continue;
+      }
       if (col.kind == kind::FILE_ROW_NUMBER) {
         state->columns.push_back(std::make_unique<cudf::column>(state->rows->view(), stream, mr));
         continue;
@@ -744,16 +751,29 @@ void apply_lineage_visibility(
   };
   auto state     = std::make_unique<visibility_state>();
   state->lineage = lineage;
+  std::vector<std::vector<std::pair<int64_t, int64_t>>> ranges(lineage.domain->files.size());
+  for (auto const& run : lineage.domain->file_runs)
+    if (run.count) ranges[run.file].emplace_back(run.first, run.first + run.count);
   std::vector<std::pair<int64_t, int64_t>> windows;
-  for (auto const& file : lineage.domain->files) {
-    auto values = lookup(file.identity);
-    if (!std::is_sorted(values.begin(), values.end()) ||
-        std::adjacent_find(values.begin(), values.end()) != values.end() ||
-        (!values.empty() && (values.front() < 0 || values.back() >= file.rows)))
-      throw std::invalid_argument(
-        "lineage visibility requires valid sorted unique delete positions");
-    windows.emplace_back(state->deletes.size(), values.size());
-    state->deletes.insert(state->deletes.end(), values.begin(), values.end());
+  for (std::size_t file = 0; file < lineage.domain->files.size(); ++file) {
+    auto values = lookup(lineage.domain->files[file].identity);
+    if (!std::is_sorted(values.begin(), values.end()))
+      throw std::invalid_argument("lineage visibility requires sorted delete positions");
+    auto& selected = ranges[file];
+    std::sort(selected.begin(), selected.end());
+    auto start = state->deletes.size();
+    // Merge repeated/overlapping input intervals. Each file's selected deletes
+    // are uploaded once even when concatenation repeats the same physical rows.
+    for (std::size_t i = 0; i < selected.size();) {
+      auto [first, end] = selected[i++];
+      while (i < selected.size() && selected[i].first <= end)
+        end = std::max(end, selected[i++].second);
+      // Signed searches ignore eager V2 positions outside these intervals.
+      auto lo = std::lower_bound(values.begin(), values.end(), first);
+      auto hi = std::lower_bound(lo, values.end(), end);
+      state->deletes.insert(state->deletes.end(), lo, hi);
+    }
+    windows.emplace_back(start, state->deletes.size() - start);
   }
   if (state->deletes.empty()) return;
   int64_t offset = 0;

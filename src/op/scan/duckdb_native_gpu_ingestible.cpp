@@ -509,7 +509,8 @@ filtered_table duckdb_native_gpu_ingestible::materialize_metadata_to_table(
   ::cuda::stream_ref stream,
   bool /*like_swar_fastpath*/,
   std::shared_ptr<const like_multiliteral_cache> /*like_cache*/,
-  expression_query_policy /*policy*/)
+  expression_query_policy /*policy*/,
+  scan_execution_context /*execution*/)
 {
   auto const& split = static_cast<duckdb_native_scan_info const&>(info);
   if (_inject_decode_failure) {

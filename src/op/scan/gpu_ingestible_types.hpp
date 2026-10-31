@@ -29,12 +29,18 @@
 #include <memory>
 #include <span>
 #include <stdexcept>
+#include <stop_token>
 #include <utility>
 #include <vector>
 
 #pragma once
 
 namespace sirius::op::scan {
+struct scan_execution_context {
+  uint64_t attempt       = 1;
+  uint64_t logical_input = 0;
+  std::stop_token stop;
+};
 
 //===----------------------------------------------------------------------===//
 // ingestible_table_info

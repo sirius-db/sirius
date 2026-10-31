@@ -24,6 +24,9 @@ struct mapping_request {
                                                         materialization_program,
                                                         std::vector<field_requirement>)>
     prepare;
+  bool metadata_only      = false;
+  bool allow_file_carrier = false;
+  std::span<std::string const> bound_names;
 };
 struct mapping_result {
   physical_profile_result evidence;
@@ -33,8 +36,14 @@ struct mapping_result {
   std::shared_ptr<field_id_mapping const> compiled;
   std::shared_ptr<parquet_metadata const> footer;
   std::vector<duckdb::LogicalType> bound_types;
-  uint64_t contract   = 0;
-  uint64_t generation = 0;
+  // The actual reader choice, separately from logical-to-physical leaf bindings.
+  // natural_read means no physical projection, even when a bound carrier is absent.
+  effective_reader_projection reader_projection;
+  std::optional<std::string> file_carrier;
+  std::size_t file_carrier_width = 0;
+  bool carrier_unavailable       = false;
+  uint64_t contract              = 0;
+  uint64_t generation            = 0;
 };
 struct mapping_refusal {
   std::string file;

@@ -45,6 +45,7 @@ bool available(row_lineage const& lineage)
 struct shared_state {
   prepared_split split;
   materializer_inputs inputs;
+  decode_fn decode;
   decode_result decoded;
   materialized_batch batch;
 };
@@ -219,10 +220,14 @@ decode_result materialize_shared(prepared_split const& split,
 {
   if (!decode || !inputs.mapping.program || !inputs.mapping.evidence || !split.plan)
     throw std::invalid_argument("shared materialization requires certified input and layout");
+  if ((!split.slices.empty() || !split.dependencies.empty()) && !split.info &&
+      !split.metadata_owner)
+    throw std::invalid_argument("prepared metadata views require a retained input owner");
   auto const& program = *inputs.mapping.program;
   auto const& proof   = *inputs.mapping.evidence;
   if (proof.contract != program.contract || proof.generation != program.generation ||
-      proof.layout != program.input_layout || proof.plan != split.plan)
+      proof.layout != program.input_layout || proof.plan != split.plan ||
+      proof.normalization != inputs.mapping.normalization)
     throw std::invalid_argument("shared mapping certification binding mismatch");
   if (inputs.mapping.normalization &&
       (inputs.mapping.normalization->program().contract != program.contract ||
@@ -267,22 +272,12 @@ decode_result materialize_shared(prepared_split const& split,
   auto const unjoined = detail::prepare_unjoined_failure();
   state->split        = split;
   state->inputs       = inputs;
+  state->decode       = decode;
   try {
-    state->decoded  = decode(state->split, state->inputs, space, stream, mr);
+    state->decoded  = state->decode(state->split, state->inputs, space, stream, mr);
     auto& delivered = state->decoded.batch;
     auto& lineage   = state->decoded.lineage;
     auto rows       = delivered.table.num_rows();
-    if (inputs.phase == materialization_phase::complete && delivered.row_positions &&
-        (inputs.needs_lineage || !required.empty())) {
-      if (lineage.state != row_position_state::none)
-        throw std::invalid_argument("decoder returned two canonical position representations");
-      lineage = consume_reader_positions(std::move(delivered.row_positions), stream, mr);
-      if (split.input_domain && *lineage.domain == *split.input_domain)
-        lineage.domain = split.input_domain;
-    }
-    lineage.validate_on(rows, stream, mr);
-    if (split.input_domain && lineage.domain && lineage.domain != split.input_domain)
-      throw std::invalid_argument("decoder changed its immutable input domain");
     scan_execution_record facts;
     if (delivered.execution && delivered.execution->authoritative) {
       validate_execution_record(
@@ -299,6 +294,33 @@ decode_result materialize_shared(prepared_split const& split,
           : translate_legacy_execution(
               legacy, program.catalogue->residual(), program.contract, program.generation);
     }
+    auto pending_visibility =
+      remaining_visibility(required, facts.visibility_applied, facts.visibility_complete);
+    bool const position_consumer =
+      inputs.needs_lineage ||
+      std::any_of(pending_visibility.begin(), pending_visibility.end(), [&](auto const& binding) {
+        return std::any_of(
+          inputs.visibility.begin(), inputs.visibility.end(), [&](auto const& input) {
+            return input.binding.input == binding.input && !input.owner->positions.empty();
+          });
+      });
+    if (inputs.phase == materialization_phase::complete && delivered.row_positions &&
+        position_consumer) {
+      if (lineage.state != row_position_state::none)
+        throw std::invalid_argument("decoder returned two canonical position representations");
+      lineage = consume_reader_positions(std::move(delivered.row_positions), stream, mr);
+      if (split.input_domain && *lineage.domain == *split.input_domain)
+        lineage.domain = split.input_domain;
+    }
+    if (inputs.phase == materialization_phase::complete && !position_consumer &&
+        delivered.row_positions) {
+      delivered.row_positions.reset();
+      facts.positions = lineage.state;
+      if (delivered.execution) delivered.execution->positions = lineage.state;
+    }
+    lineage.validate_on(rows, stream, mr);
+    if (split.input_domain && lineage.domain && lineage.domain != split.input_domain)
+      throw std::invalid_argument("decoder changed its immutable input domain");
     if (facts.projection_complete && !facts.logical_schema_complete)
       throw std::invalid_argument("decoder assembled output before logical normalization");
     if (facts.layout_width &&
@@ -313,8 +335,6 @@ decode_result materialize_shared(prepared_split const& split,
         delivered.execution && delivered.execution->authoritative &&
         delivered.execution->positions != lineage.state)
       throw std::invalid_argument("decoder position facts disagree with lineage");
-    auto pending_visibility =
-      remaining_visibility(required, facts.visibility_applied, facts.visibility_complete);
     // The deferred Parquet entry leaves legacy state/cardinality checks at the
     // adapter's original boundary. Empty sets need no positional proof.
     if (inputs.phase == materialization_phase::complete &&
@@ -333,23 +353,59 @@ decode_result materialize_shared(prepared_split const& split,
           ": decode returned a filtered table, so row positions no longer identify file rows");
     }
     if (inputs.phase == materialization_phase::complete && lineage.domain) {
-      for (auto const& binding : pending_visibility)
-        if (std::none_of(lineage.domain->files.begin(),
-                         lineage.domain->files.end(),
-                         [&](auto const& file) { return file.identity == binding.file; }))
+      for (auto const& binding : pending_visibility) {
+        auto file = std::find_if(lineage.domain->files.begin(),
+                                 lineage.domain->files.end(),
+                                 [&](auto const& file) { return file.identity == binding.file; });
+        if (file == lineage.domain->files.end())
           throw std::invalid_argument("visibility file is outside decoder input domain");
+        for (auto const& input : inputs.visibility)
+          if (input.binding.input == binding.input) input.owner->validate_file_bounds(file->rows);
+      }
     }
     if (required.empty()) {
       facts.visibility_complete = true;
       if (delivered.execution) delivered.execution->visibility_complete = true;
     }
     if (inputs.phase == materialization_phase::decoded && facts.logical_schema_complete) {
+      if (program.input_types || program.validate_output_schema) {
+        materialized_batch checked;
+        checked.contract                = program.contract;
+        checked.generation              = program.generation;
+        checked.rows                    = rows;
+        checked.logical_schema_complete = true;
+        checked.projection_complete     = facts.projection_complete;
+        checked.layout                  = facts.layout                ? facts.layout
+                                          : facts.projection_complete ? program.output_layout
+                                                                      : program.input_layout;
+        checked.predicates              = facts.predicates;
+        checked.visibility_applied      = facts.visibility_applied;
+        checked.visibility_complete     = facts.visibility_complete;
+        checked.row_count_carrier =
+          delivered.table.n_columns() == 1 &&
+          (facts.projection_complete ? program.output_types.empty()
+                                     : program.input_types && program.input_types->empty());
+        checked.table = std::move(delivered.table);
+        try {
+          validate_materialized_batch(checked, program);
+        } catch (...) {
+          delivered.table = std::move(checked.table);
+          throw;
+        }
+        delivered.table = std::move(checked.table);
+      }
       delivered.required_visibility = program.required_visibility;
       if (!delivered.execution) {
         facts.layout = facts.projection_complete ? program.output_layout : program.input_layout;
         facts.layout_width  = delivered.table.n_columns();
         facts.positions     = lineage.state;
         delivered.execution = std::move(facts);
+      }
+      // Replacement decoders may enqueue reads of borrowed staging. The default
+      // reader owns its completion protocol; do not add a wait to that path.
+      if (!inputs.reader) {
+        detail::check_read_checkpoint(detail::read_checkpoint::BATCH);
+        detail::retire_reads(state, stream, unjoined);
       }
       if (split.stop.stop_requested()) throw std::runtime_error("scan materialization cancelled");
       return std::move(state->decoded);

@@ -13,8 +13,11 @@
 namespace sirius::op::scan {
 struct prepared_split {
   std::shared_ptr<scan_info const> info;
-  std::vector<split_dependencies> dependencies;
-  std::vector<row_group_slice> slices;
+  std::shared_ptr<void const> metadata_owner;
+  // Views into info (or the direct caller's retained input); copying the shared
+  // task state must not deep-copy every row-group list.
+  std::span<split_dependencies const> dependencies;
+  std::span<row_group_slice const> slices;
   std::shared_ptr<scan_plan const> plan;
   std::vector<std::string> partition_values;
   std::shared_ptr<lineage_domain const> input_domain;
@@ -30,12 +33,14 @@ class mapping_certification {
  public:
   mapping_certification(materialization_program const& program,
                         std::shared_ptr<scan_plan const> plan,
-                        std::shared_ptr<void const> owner)
+                        std::shared_ptr<void const> owner,
+                        std::shared_ptr<field_id_mapping const> normalization = {})
     : contract(program.contract),
       generation(program.generation),
       layout(program.input_layout),
       plan(std::move(plan)),
-      owner(std::move(owner))
+      owner(std::move(owner)),
+      normalization(std::move(normalization))
   {
     if (!contract || !generation || !layout || !this->plan || !this->owner)
       throw std::invalid_argument("mapping certification requires bound evidence");
@@ -44,6 +49,7 @@ class mapping_certification {
   std::shared_ptr<void const> const layout;
   std::shared_ptr<scan_plan const> const plan;
   std::shared_ptr<void const> const owner;
+  std::shared_ptr<field_id_mapping const> const normalization;
 };
 struct certified_mapping {
   std::shared_ptr<materialization_program const> program;
@@ -63,6 +69,9 @@ struct decode_result {
   filtered_table batch;
   row_lineage lineage;
 };
+// Borrowed decoder staging must be owned by the prepared input, certification,
+// owned callback or result. Deferred replacement success joins the caller stream before releasing
+// these owners; default readers keep their own completion protocol.
 using decode_fn = std::function<decode_result(prepared_split const&,
                                               materializer_inputs const&,
                                               cucascade::memory::memory_space const&,

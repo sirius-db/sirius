@@ -145,6 +145,16 @@ void validate_materialized_batch(materialized_batch const& batch,
          batch.table.view().column(*p.answer_slot).type().id() != cudf::type_id::BOOL8))
       throw std::invalid_argument("predicate answer is not a boolean slot");
   }
+  if (program.validate_output_schema && batch.projection_complete) {
+    auto expected_width = program.output_types.empty() && batch.row_count_carrier
+                            ? std::size_t{1}
+                            : program.output_types.size();
+    if (batch.table.n_columns() != expected_width)
+      throw std::invalid_argument("materialized output width mismatch");
+    for (std::size_t i = 0; i < program.output_types.size(); ++i)
+      if (batch.table.view().column(i).type() != program.output_types[i])
+        throw std::invalid_argument("materialized output type mismatch");
+  }
 }
 
 void finish_materialization_in_place(materialized_batch& batch,
