@@ -1,5 +1,7 @@
 /* Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0 */
+#include "op/scan/arrow/arrow_staging_resource.hpp"
 #include "op/scan/arrow_materializer.hpp"
+#include "op/scan/table_scan/owned_arrow_scan.hpp"
 
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/utilities/memory_resource.hpp>
@@ -15,6 +17,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <future>
 #include <limits>
 #include <memory_resource>
 #include <thread>
@@ -22,7 +25,7 @@
 using namespace sirius::op::scan;
 
 namespace {
-// Migrated from2216's resource controls; copies of the CUDA resource facade share observations.
+// Copies of the CUDA resource facade share observations.
 class observed_device_resource {
  public:
   struct observations {
@@ -581,7 +584,19 @@ TEST_CASE("Arrow import validates only the selected UTF8 window including empty 
     std::make_shared<owned_arrow_batch>(producer->schema, producer->array, producer, host);
   materialization_program program{603, 1, {cudf::data_type{cudf::type_id::STRING}}, 0, false};
   program.input_types = program.output_types;
-  auto batch = import_arrow_host(input, program, lane, cudf::get_current_device_resource_ref());
+  auto profiles       = std::make_shared<physical_profile_table>();
+  owned_arrow_scan_info descriptor(
+    input, program.contract, program.generation, 0, profiles, sizeof(producer_batch));
+  auto validator = owned_arrow_split_validator(program);
+  REQUIRE_NOTHROW(validate_split_for_gpu(program.contract,
+                                         check_bit(later_check::host_staged),
+                                         {},
+                                         descriptor,
+                                         *validator,
+                                         program.generation,
+                                         profiles));
+  auto batch =
+    import_arrow_host(descriptor.batch(), program, lane, cudf::get_current_device_resource_ref());
   REQUIRE(lane.quiesce() == cudaSuccess);
   CHECK(batch.rows == rows);
   CHECK(batch.table.view().column(0).size() == rows);
@@ -863,4 +878,28 @@ TEST_CASE("Arrow migration final quiesce covers frees queued after failed commit
   CHECK(device.state->completed_deallocations == device.state->deallocations);
   CHECK(cudaStreamQuery(stream.value()) == cudaSuccess);
   CHECK(host.used == 0);
+}
+
+TEST_CASE("Arrow staging stays bounded and reuses storage after cross-thread retirement",
+          "[arrow_driver][arrow_staging]")
+{
+  std::array<std::byte, 256> bytes;
+  arrow_staging_resource resource(bytes.data(), bytes.size());
+  auto* first                      = resource.allocate(64, 8);
+  auto* second                     = resource.allocate(64, 8);
+  *static_cast<std::byte*>(second) = std::byte{42};
+  CHECK_THROWS_AS(resource.allocate(512, 8), std::bad_alloc);
+  auto retired = std::async(std::launch::async, [&] { resource.deallocate(first, 64, 8); });
+  retired.get();
+  CHECK_THROWS_AS(resource.allocate(192, 8), std::bad_alloc);
+  CHECK(*static_cast<std::byte*>(second) == std::byte{42});
+  auto last = std::async(std::launch::async, [&] { resource.deallocate(second, 64, 8); });
+  last.get();
+  auto* all = resource.allocate(256, 1);
+  CHECK(all == bytes.data());
+  resource.deallocate(all, 256, 1);
+  CHECK_THROWS_AS(resource.allocate(257, 1), std::bad_alloc);
+  auto* reused = resource.allocate(256, 1);
+  CHECK(reused == bytes.data());
+  resource.deallocate(reused, 256, 1);
 }

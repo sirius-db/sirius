@@ -91,6 +91,7 @@ void discover(plan_source_policy& policy, F&& operation)
     throw;
   } catch (...) {
     policy.discovery_complete = false;
+    if (!policy.discovery_error) policy.discovery_error = std::current_exception();
   }
 }
 
@@ -136,6 +137,7 @@ plan_source_policy derive(Plan const& plan, duckdb::ClientContext& context)
     throw;
   } catch (...) {
     result.discovery_complete = false;
+    if (!result.discovery_error) result.discovery_error = std::current_exception();
   }
   return result;
 }
@@ -174,6 +176,26 @@ void require_cpu_replay(plan_source_policy const& policy,
 
 void require_non_s3_cpu_replay(plan_source_policy const& policy, std::string const& gpu_error)
 {
+  // Known source vetoes still take precedence over an incomplete sibling.
+  bool veto = std::any_of(policy.scans.begin(), policy.scans.end(), [](auto const& scan) {
+    return !scan.permits_cpu_replay;
+  });
+  if (!veto && policy.discovery_error) {
+    // DuckDB's query boundary handles std::exception, not arbitrary C++ exceptions.
+    // Keep both failures visible: discovery explains why CPU replay was refused.
+    std::string discovery_message;
+    try {
+      std::rethrow_exception(policy.discovery_error);
+    } catch (duckdb::InterruptException const&) {
+      throw;
+    } catch (std::exception const& error) {
+      discovery_message = error.what();
+    } catch (...) {
+      discovery_message = "non-standard exception";
+    }
+    throw std::runtime_error("CPU fallback is not supported: source discovery failed: " +
+                             discovery_message + ". Underlying GPU error: " + gpu_error);
+  }
   if (!policy.cpu_replay_permitted()) {
     throw std::runtime_error("CPU fallback is not supported: " + policy.reason() +
                              ". Underlying GPU error: " + gpu_error);

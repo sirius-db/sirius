@@ -26,6 +26,7 @@ set(TEST_SOURCES
     test/cpp/transparent/test_plan_source_policy.cpp
     test/cpp/transparent/test_pre_optimizer_hook.cpp
     test/cpp/scan/test_scan_contracts.cpp
+    test/cpp/scan/test_ducklake_units.cpp
     test/cpp/scan/test_scan_verdicts.cpp
     test/cpp/scan/test_certification_cost.cpp
     test/cpp/integration/test_transparent_verdicts.cpp
@@ -162,6 +163,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_table_gpu_cache_warm_mgpu.cpp
     test/cpp/integration/test_transparent_plan_estimates.cpp
     test/cpp/integration/test_transparent_provider_isolation.cpp
+    test/cpp/integration/test_ducklake_connector.cpp
     test/cpp/integration/test_timestamp_extraction.cpp
     test/cpp/integration/test_transparent_runtime_fallback.cpp
     test/cpp/late_mat/test_column_origin.cpp
@@ -349,6 +351,8 @@ set(TEST_SOURCES
     test/cpp/scan/test_residual_filter.cpp
     test/cpp/scan/test_scan_materialization.cpp
     test/cpp/scan/test_arrow_import_resources.cpp
+    test/cpp/scan/test_composite_scan_driver.cpp
+    test/cpp/scan/test_arrow_import_driver.cpp
     test/cpp/scan/test_scan_filter_cast_ranges.cpp
     test/cpp/scan/test_scan_filter_ranges.cpp
     test/cpp/scan/test_parquet_scan_sizing.cpp

@@ -193,7 +193,14 @@ Any code opening its own `Connection` on this path must bracket it with `SiriusC
 
 Missing-column defaults require proof that partition metadata cannot override them. During lowering, one `LIMIT 0` Avro schema query per distinct data manifest checks for an empty partition record; nonempty or unavailable schemas do not grant this proof. No data-file footer sweep is added. Files with present fields can still map without this proof. This deliberately leaves identity-partition reconstruction outside the profile.
 
-Mapped files disable reader/statistics/null-count pruning and apply residual predicates after normalization. They use per-file reader options, so coalescing ends at their file boundary; row groups within a file still batch normally. Conversion/default buffers are included in the working-set estimate. If every requested field is absent, one physical column carries row count. Unsupported mappings fail before decoding and follow the existing late-failure policy. These choices preserve correctness but add manifest-header work and may reduce pruning/coalescing efficiency; performance acceptance is separate.
+Mapped scans disable reader row filtering, apply residual predicates after normalization and keep original row-group ordinals through pruning. Per-file reader options limit coalescing to one file. Conversion and default buffers count toward the working-set estimate.
+
+| Mapping or statistics | Behavior |
+|---|---|
+| Unchanged scalar field with usable statistics | Prune whole row groups using its physical name. |
+| Cast, default, ambiguous name or missing statistics | Keep affected groups and evaluate residual predicates. |
+| Every requested field is absent | Use a qualified physical row-count carrier and supply defaults; reject if none is available. |
+| Unsupported mapping | Fail before decode and follow the existing recovery policy. |
 
 ## owning_table_view
 
@@ -816,6 +823,12 @@ A direct GPU reader can supply an owning batch to the same validator and finish
 without an Arrow or CPU-vector round trip. These helpers do not register a new SQL
 source adapter or relax the existing Iceberg equality-delete, snapshot or
 remote-DV gates. Schema evolution is limited to the qualified flat profile described above.
+
+## DuckLake scans
+
+Enable `SIRIUS_BUILD_DUCKLAKE_BRIDGE` and load the matching provider to use DuckLake through ordinary SQL or `CALL gpu_execution(...)`. The build option is off by default. Local Parquet and inline data use the original statement binding and the shared scan and recovery paths.
+
+See [DuckLake support and limits](scan-contracts-design.md#ducklake-private-binding-boundary) for supported inputs, schema evolution, memory ownership and failure behavior.
 
 ## Key Files
 

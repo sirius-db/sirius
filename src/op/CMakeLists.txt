@@ -31,6 +31,7 @@ target_sources(
           scan/scan_utils.cpp
           scan/sirius_gpu_scan_operator.cpp
           scan/sirius_gpu_scan_operator_data.cpp
+          scan/composite_scan_driver.cpp
           scan/gpu_ingestible.cpp
           scan/parquet_gpu_ingestible.cpp
           scan/parquet_scan_core.cpp
@@ -40,6 +41,8 @@ target_sources(
           scan/arrow_materializer.cpp
           scan/parquet_materialize.cpp
           scan/duckdb_native_gpu_ingestible.cpp
+          scan/table_scan/owned_arrow_scan.cpp
+          scan/table_scan/split_validation.cpp
           scan/table_scan/bound_read_view.cpp
           scan/table_scan/parquet_physical_profile.cpp
           scan/iceberg_metadata_reader.cpp
@@ -92,3 +95,5 @@ target_sources(
           partition/crc32_partition_hash.cu
           replicate/gpu_replicate_impl.cu
           scan/equality_delete_mask.cu)
+
+add_subdirectory(scan/arrow)

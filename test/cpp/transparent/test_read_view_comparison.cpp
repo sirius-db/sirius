@@ -21,6 +21,7 @@
 
 #include <catch.hpp>
 
+#include <array>
 #include <iomanip>
 #include <memory>
 #include <sstream>
@@ -258,8 +259,7 @@ TEST_CASE("Correspondence preserves a recorded scan refusal", "[transparent][rea
   CHECK(certificate.evidence_scope == certificate_evidence_scope::binding_correspondence);
 }
 
-TEST_CASE("Pre-declined scan receives a contract without a candidate view",
-          "[transparent][read_view]")
+TEST_CASE("Pre-declined scan preserves an available candidate view", "[transparent][read_view]")
 {
   auto registry = std::make_shared<read_view_registry>();
   duckdb::TableFunction function("iceberg_scan", {}, nullptr, nullptr);
@@ -285,12 +285,38 @@ TEST_CASE("Pre-declined scan receives a contract without a candidate view",
   connector.kind             = source_kind::parquet_local;
   connector.registry_profile = "iceberg.v1";
 
+  SECTION("no safe pre-capture") {}
+  SECTION("connector semantic capture") { scan.bound_view = view("refused.parquet"); }
+
   auto id            = registry->allocate_declined_scan(scan, connector);
   auto const& record = registry->entry(id);
-  CHECK(record.contract.view == nullptr);
+  CHECK(record.contract.view == scan.bound_view);
+  CHECK(registry->candidate_bindings().front().view == scan.bound_view);
   CHECK(record.contract.scan_node_id == 77);
   CHECK(record.contract.table_index == 12);
   CHECK(record.finalize_generation == 9);
   CHECK(record.eligibility.materializer.kind == materializer_kind::iceberg);
   CHECK_THROWS_AS(registry->allocate_declined_scan(scan, connector), std::runtime_error);
+}
+
+TEST_CASE("Provider read identities preserve semantics without enumerating files",
+          "[transparent][read_view]")
+{
+  bound_read_identity identity;
+  identity.source      = {"provider", source_kind::parquet_local, "provider.v1"};
+  identity.data_view   = provider_read_identity{"table-uuid/snapshot=12/schema=3"};
+  identity.bound_types = {duckdb::LogicalType::BIGINT};
+  identity.bound_names = {"id"};
+  auto first           = make_bound_read_identity(identity, {});
+  CHECK(first->fingerprint == make_bound_read_identity(identity, {})->fingerprint);
+  identity.data_view = provider_read_identity{"table-uuid/snapshot=13/schema=3"};
+  CHECK_FALSE(first->fingerprint == make_bound_read_identity(identity, {})->fingerprint);
+  identity.data_view = provider_read_identity{"other-uuid/snapshot=12/schema=3"};
+  CHECK_FALSE(first->fingerprint == make_bound_read_identity(identity, {})->fingerprint);
+  identity.data_view = provider_read_identity{"table-uuid/snapshot=12/schema=4"};
+  CHECK_FALSE(first->fingerprint == make_bound_read_identity(identity, {})->fingerprint);
+  std::array<std::string, 1> files{"must-not-be-invented.parquet"};
+  CHECK_THROWS_AS(make_bound_read_identity(identity, files), std::invalid_argument);
+  identity.data_view = provider_read_identity{};
+  CHECK_THROWS_AS(make_bound_read_identity(identity, {}), std::invalid_argument);
 }

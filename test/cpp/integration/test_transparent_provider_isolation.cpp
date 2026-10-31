@@ -20,7 +20,10 @@
 #include "utils/sirius_test_env.hpp"
 #include "utils/transparent_execution_test_utils.hpp"
 
+#include <cuda_runtime_api.h>
+
 #include <catch.hpp>
+#include <cucascade/memory/memory_space.hpp>
 #include <duckdb/common/enums/statement_type.hpp>
 #include <duckdb/main/attached_database.hpp>
 #include <duckdb/main/client_config.hpp>
@@ -29,9 +32,18 @@
 #include <duckdb/main/database_manager.hpp>
 #include <duckdb/optimizer/optimizer_extension.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
+#include <yaml-cpp/yaml.h>
 
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <condition_variable>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <future>
+#include <mutex>
+#include <set>
 #include <string>
 
 namespace {
@@ -601,141 +613,4 @@ TEST_CASE_METHOD(isolation_fixture,
   REQUIRE(connection_state->provenance() == provenance);
   REQUIRE_FALSE(connection_state->attempt_declined());
   REQUIRE(connection_state->attempt_decline_reason() == decline_reason::none);
-}
-
-namespace {
-
-bool load_ducklake(duckdb::Connection& con)
-{
-  auto result = con.Query("LOAD ducklake");
-  if (!result || result->HasError()) {
-    auto required = std::getenv("SIRIUS_TEST_REQUIRE_DUCKLAKE");
-    if (required && std::string(required) == "1") {
-      FAIL("required DuckLake LOAD failed: " << (result ? result->GetError() : "no result"));
-    }
-    WARN("DuckLake not covered");
-    return false;
-  }
-  auto version = query(con,
-                       "SELECT extension_version FROM duckdb_extensions() WHERE extension_name = "
-                       "'ducklake' AND loaded");
-  REQUIRE(version->RowCount() == 1);
-  REQUIRE(version->Collection().GetValue(0, 0).ToString() == "417a9117f5");
-  return true;
-}
-
-void attach_lake(duckdb::Connection& con, std::string const& directory)
-{
-  query(con,
-        "ATTACH 'ducklake:" + directory + "/meta.ducklake' AS lake (DATA_PATH '" + directory +
-          "/data/')");
-}
-
-void populate_lake(duckdb::Connection& con)
-{
-  query(con, "CREATE TABLE lake.t(id INTEGER)");
-  query(con, "INSERT INTO lake.t SELECT i FROM range(100) r(i)");
-  query(con, "INSERT INTO lake.t VALUES (100), (101)");
-  query(con, "DELETE FROM lake.t WHERE id = 5");
-  query(con, "ALTER TABLE lake.t ADD COLUMN extra INTEGER DEFAULT 7");
-  query(con, "INSERT INTO lake.t SELECT i, 7 FROM range(102, 132) r(i)");
-  query(con, "CALL ducklake_flush_inlined_data('lake')");
-}
-
-void check_lake_rows(duckdb::Connection& con)
-{
-  auto rows = query(con, "SELECT id, extra FROM lake.t ORDER BY id");
-  REQUIRE(rows->RowCount() == 131);
-  for (int row = 0; row < 131; ++row) {
-    REQUIRE(rows->Collection().GetValue(0, row).GetValue<int32_t>() == (row < 5 ? row : row + 1));
-    REQUIRE(rows->Collection().GetValue(1, row).GetValue<int32_t>() == 7);
-  }
-  auto aggregates = query(con, "SELECT count(*), sum(id), sum(extra) FROM lake.t");
-  REQUIRE(aggregates->Collection().GetValue(0, 0).GetValue<int64_t>() == 131);
-  REQUIRE(aggregates->Collection().GetValue(1, 0).GetValue<int64_t>() == 8641);
-  REQUIRE(aggregates->Collection().GetValue(2, 0).GetValue<int64_t>() == 917);
-}
-
-auto lake_config() { return sirius::test::integration_config_path(); }
-
-}  // namespace
-
-TEST_CASE("DuckLake provider SQL declines while ordinary user SQL remains GPU eligible",
-          "[transparent][provenance][ducklake]")
-{
-  sirius::test::scoped_temp_directory disk;
-  sirius::test::shared_test_env env(lake_config());
-  auto con = env.make_connection();
-  if (!load_ducklake(con)) { return; }
-  query(con, "SET GLOBAL gpu_execution = true");
-  auto before = get_transparent_execution_stats(con);
-  attach_lake(con, disk.directory);
-  populate_lake(con);
-  query(con, "SELECT id, extra FROM lake.t ORDER BY id");
-  auto after = get_transparent_execution_stats(con);
-  REQUIRE(after.provider_internal_skips > before.provider_internal_skips);
-  REQUIRE(after.successful_rebinds == before.successful_rebinds);
-  REQUIRE(after.executions == before.executions);
-  REQUIRE(after.classification_failures == before.classification_failures);
-  before = after;
-  query(con, "SELECT 42::INTEGER");
-  after = get_transparent_execution_stats(con);
-  sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1);
-  check_lake_rows(con);
-}
-
-TEST_CASE("DuckLake flush preserves rows and file paths after closing every connection",
-          "[transparent][provenance][ducklake]")
-{
-  sirius::test::scoped_temp_directory disk;
-  {
-    sirius::test::shared_test_env env(lake_config());
-    auto con = env.make_connection();
-    if (!load_ducklake(con)) { return; }
-    query(con, "SET GLOBAL gpu_execution = true");
-    attach_lake(con, disk.directory);
-    populate_lake(con);
-    check_lake_rows(con);
-    query(con, "DETACH lake");
-  }
-  {
-    sirius::test::shared_test_env env(lake_config());
-    auto con = env.make_connection();
-    REQUIRE(load_ducklake(con));
-    query(con, "SET GLOBAL gpu_execution = true");
-    attach_lake(con, disk.directory);
-    check_lake_rows(con);
-    auto files = query(con, "SELECT data_file FROM ducklake_list_files('lake', 't')");
-    REQUIRE(files->RowCount() > 0);
-    for (duckdb::idx_t row = 0; row < files->RowCount(); ++row) {
-      REQUIRE_FALSE(files->Collection().GetValue(0, row).IsNull());
-      REQUIRE(std::filesystem::is_regular_file(files->Collection().GetValue(0, row).ToString()));
-    }
-    query(con, "DETACH lake");
-    query(con, "ATTACH '" + disk.directory + "/meta.ducklake' AS meta (READ_ONLY)");
-    query(con, "SET SESSION gpu_execution = false");
-    auto paths = query(
-      con,
-      "SELECT f.path, f.path_is_relative, t.path, t.path_is_relative, s.path, s.path_is_relative "
-      "FROM meta.ducklake_data_file f JOIN meta.ducklake_table t USING (table_id) "
-      "JOIN meta.ducklake_schema s USING (schema_id) "
-      "WHERE t.end_snapshot IS NULL AND s.end_snapshot IS NULL");
-    REQUIRE(paths->RowCount() > 0);
-    for (duckdb::idx_t row = 0; row < paths->RowCount(); ++row) {
-      REQUIRE_FALSE(paths->Collection().GetValue(0, row).IsNull());
-      auto path = std::filesystem::path(paths->Collection().GetValue(0, row).ToString());
-      if (paths->Collection().GetValue(1, row).GetValue<bool>()) {
-        auto table_path = std::filesystem::path(paths->Collection().GetValue(2, row).ToString());
-        if (paths->Collection().GetValue(3, row).GetValue<bool>()) {
-          auto schema_path = std::filesystem::path(paths->Collection().GetValue(4, row).ToString());
-          if (paths->Collection().GetValue(5, row).GetValue<bool>()) {
-            schema_path = std::filesystem::path(disk.directory) / "data" / schema_path;
-          }
-          table_path = schema_path / table_path;
-        }
-        path = table_path / path;
-      }
-      REQUIRE(std::filesystem::is_regular_file(path));
-    }
-  }
 }

@@ -30,7 +30,8 @@
 
 namespace sirius::op::scan {
 class iceberg_ingestible_table_info;
-}
+class gpu_ingestible;
+}  // namespace sirius::op::scan
 
 namespace sirius {
 namespace transparent {
@@ -90,6 +91,7 @@ class sirius_physical_table_scan : public sirius_physical_operator {
   ~sirius_physical_table_scan() override;
 
   std::unique_ptr<scan::iceberg_ingestible_table_info> prepared_iceberg_info;
+  std::shared_ptr<scan::gpu_ingestible> prepared_ingestible;
 
   //! The table function
   duckdb::BoundTableFunction function;

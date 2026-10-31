@@ -39,6 +39,28 @@ Loadable builds require ABI-compatible exports of `duckdb::TableScanFunction::Ge
 
 If a trusted definition is unavailable, Sirius warns once per source and declines its GPU scans. CPU fallback still depends on fallback settings and source policy. Iceberg definitions are established when its extension loads and also require the host Parquet descriptor.
 
+### DuckLake private binding boundary
+
+`SIRIUS_BUILD_DUCKLAKE_BRIDGE` enables the optional connector and is off by default. It requires the pinned, host-patched DuckLake source and matching library. Private provider headers stay inside `binding_bridge.cpp`; installed packages include the matching provider library.
+
+The connector verifies the provider callbacks and reads the original binding's snapshot, schema and transaction-local state. Each execution owns its readers and cursors; the saved CPU reader remains available for replay. Parquet and inline units share the existing preparation coordinator, split validation and query recovery. Discovery is lazy and must cover every unit in the binding. Inline readers supply detached batches to the shared Arrow driver; DuckLake retains transaction and provenance checks, while the driver handles admission, import and batch retirement.
+
+| Input or condition | Behavior |
+|---|---|
+| Local Parquet, inline or mixed data | GPU scan through existing SQL and bound-plan entrypoints. |
+| Selected columns | Up to 32 flat Boolean, integer, FLOAT/DOUBLE, VARCHAR, DATE or microsecond TIMESTAMP columns, including NULLs. |
+| Schema evolution | Match stable field IDs; use typed `initial_default` for missing fields. INTEGER-to-BIGINT and FLOAT-to-DOUBLE widening are supported. |
+| Ordinary Parquet deletes, local DVs and inline deletes | Combine visibility in the original file-row domain before residual filtering and projection. |
+| Nested selections, external name/Hive mappings or other conversions | Reject GPU execution. Unselected nested columns do not prevent scalar reads. |
+| Remote or encrypted inputs; snapshot-bearing deletes or per-row snapshot-filtered data | Reject GPU execution. |
+| Missing statistics, defaults or conversions without usable statistics | Keep affected row groups and evaluate residual filters. |
+| Malformed delete payload or invalid positions | Fail the scan; never treat invalid data as an empty delete set. |
+| Insufficient preparation capacity or an oversized row | Return a resource error without truncation or unbounded allocation. |
+| Cancellation or failure to drain GPU work | Do not replay on CPU. Retain owners needed by unfinished work. |
+| Scan result caching | Disabled. |
+
+Preparation reservations cover detached Arrow storage and retained delete data until their last consumer releases them. Native provider metadata, reader and chunk allocations remain outside that bound. The existing fallback settings and source policy govern SQL recovery; fragment errors propagate without CPU replay.
+
 ## Matching the bound input
 
 Transparent execution compares source, bound schema, reader options, and input:
@@ -71,11 +93,33 @@ Native ranges carry their actual storage version and data and validity codec evi
 
 Cached batches use pin identity, layout, structure, and applicable iteration and visibility checks. The query token and all applicable results are validated before publication to the split connector, so the prefetcher cannot consume an unadmitted batch. Streaming inputs do not produce storage splits.
 
+### Bound split validators
+
+Trusted planning binds a validator before publishing the scan contract. Execution uses that registered validator; an input split cannot supply its own validator. Adding a reader does not require type dispatch in the shared executor.
+
+| Layer | Checks |
+|---|---|
+| `validate_split_for_gpu` | Contract, generation, certificate coverage, dependencies and registry ownership. |
+| Bound materializer validator | Format-specific input identity, layout, visibility and retained owners. |
+| Composite validator | Each input belongs to exactly one child materializer. |
+
+Providers supplying `owned_arrow_scan_info` reuse the shared Arrow validator and retain batch storage through GPU completion. Coalescing must preserve certificates and dependencies.
+
 ## Preparation and publication
 
 Each execution attempt owns its preparation units. A unit identifies one scan input and stays pending until all required evidence is ready: footer approval, native segment checks, row visibility, or checkpoint state. Readiness alone does not authorize publication. The coordinator checks cancellation before preparing prefetch buffers outside the gate. The gate checks again before readahead registration and connector insertion.
 
 Providers declare bounded temporary allocations and retained storage through `preparation_request`. `prepare_statement_resources()` aggregates them into one statement reservation, prepares each provider's descriptors, then binds the shared admission. Failed preparation or binding rolls back all requests; runtime keeps the backing owner, not planning callbacks. Format-specific sizing stays in the adapter.
+
+Shared DV helpers separate container parsing from provider visibility rules:
+
+| Helper | Responsibility |
+|---|---|
+| `read_puffin_metadata` | Validate container framing and metadata; retain blob descriptors and properties without reading payloads. |
+| `decode_deletion_vector_payload` | Validate one immutable deletion-vector-v1 payload and return owned positions within caller limits. |
+| Provider adapter | Check file association, cardinality, snapshot applicability and complete delete coverage before certifying visibility. |
+
+Metadata and decoded positions retain their charged backing. Neither helper grants scan eligibility; Iceberg and DuckLake apply their own provider checks.
 
 Eligible Iceberg deletion-vector scans use this admission. The reservation covers retained descriptors and delete positions plus bounded temporary decode work, including allocation granularity. Buffers use the reserved backing, and immutable per-file delete sets retain it until their last consumer releases it. A prepared execution consumes its admission once; a later execution needs a fresh admission.
 
@@ -88,6 +132,45 @@ Cancellation closes admission and publication and wakes blocked work. Completion
 ### Host Arrow batch source contract
 
 The shared host Arrow path has two explicit boundaries. `import_arrow_host()` consumes one owned `ArrowSchema` plus `ArrowArray` record batch and retains its input capacity through the retirement lane. `materialize_arrow_stream()` consumes a sequential internal `arrow_batch_source`: each item carries an independently owned batch, a contiguous sequence number, and declared row and byte bounds; `nullopt` is the only EOS marker. The verifier compares the declared row count with the imported batch, sends results directly to a bounded sink, and calls `cancel()` on source, validation, import, or sink failure. Producers acquire preparation/output capacity and split oversized input before returning an item. An adapter may bridge an `ArrowArrayStream` one batch at a time, but this interface does not add a public Fragment Arrow-input API or a native Paimon/DuckLake adapter.
+
+### Shared Arrow scan driver
+
+`arrow_import_ingestible` drives one `arrow_batch_producer` on its declared execution domain, with one active input per shared gate. Trusted planning binds the schema, materialization program, original read identity and optional provider validator. Claims inspect readiness and acquire preparation capacity before entering the producer; this is not root acceptance. An available root must pass layout, schema and row/byte bounds before acceptance or capacity deferral. Invalid input fails rather than waiting for capacity.
+
+Import completes on the caller's task stream before returning independently owned GPU columns. The input gate and permit return only when the last input owner releases them; another descriptor can retain them after import. The caller's output allocator, backing and stream must survive output destruction and required completion. Unconfirmed completion retains import state under the existing unsafe-completion policy; it does not transfer ownership of caller resources. The driver creates no stream and adds no device-wide synchronization.
+
+| Input or lifecycle event | Behavior |
+|---|---|
+| Occupied input gate or open push queue without input | Pending; release, input arrival or a terminal transition wakes the coordinator. |
+| Non-null zero-row input | A real batch; validated and imported normally. |
+| Normal EOS without any accepted input | One rootless empty descriptor; no Arrow import or input credit. A composite scan can disable child empty carriers and supply its own. |
+| Failure or cancellation | Propagates through the attempt; never treated as EOS. Stop prevents new admission and publication. Source close wakes blocked offers. |
+| Synchronous pin or cached rows | Pin throws a named refusal; metadata-complete and cached-view checks remain false, including after EOS, close, failure and cancellation. |
+
+The push adapter retains at most one offered root. Concurrent offers return false without retaining another root. The submitting thread must hold no engine resource needed for progress. Foreign owners and returned Arrow release callbacks must be thread-neutral; there is no submitting-thread release guarantee or affine reclamation handshake. A false `offer()` return does not join an in-progress copy: retained source views and backing must remain readable and immutable until their final use ends.
+
+Retained budgets become available for subsequent inputs only after the unit is retired and its final allocation and permit have been released. A coordinator request for normal end of stream discards in-flight results without turning successful completion into a query error; user cancellation and read failures retain their error semantics.
+
+Each Arrow input permit enforces its producer's temporary envelope at allocation time, with each declared block rounded independently to the admission allocation granularity. Another scan's larger query-wide W cannot increase that local allowance.
+
+The admitted job copies the selected window into charged storage. Preparation covers detached Arrow storage and bounded staging; the queue separately bounds foreign-input/copy overlap without adopting foreign backing into its allocator. GPU outputs use task reservations. Neither the input gate nor this ledger bounds all output retention or total host/device memory. `finish()` drains queued input before EOS.
+
+Adapters using this driver must also handle the following integration responsibilities:
+
+| Area | Adapter responsibility |
+|---|---|
+| Provider lifetime | Keep the provider context and transaction valid through reader operations and close/drain. Enforce any thread affinity before accessing the provider; detach returned Arrow ownership from reader cleanup. |
+| Field mapping | Resolve provider field identities, defaults and schema evolution before binding the Arrow schema and materialization program. Physical layout and type validation do not establish those provider semantics. |
+| Composite scans | Admit the combined resource requirements and minimum progress permits before data work. Coordinate child gates and emit whole-scan emptiness once. |
+| Producer progress | Producer work and descriptor creation share a preparation source. Do not make release of an active input depend on accepting another input through the same gate. |
+
+### Composite scan integration
+
+| When | Requirement |
+|---|---|
+| Wrapping a preparation result | Use `preparation_job::map_output()` and preserve the result's dependencies. Leave completion and failure reporting to `run()`. |
+| Sharing a contract across slots and Arrow children | Use one `preparation_identity` for all slot keys and Arrow `next_unit_id` callbacks. Independent counters can produce duplicate keys. |
+| Reusing retained budget across files | Create fixed `preparation_slot` objects and reuse their permits. Keep each permit until the last consumer releases its backing. Retiring a slot returns its registered allowance only after its last permit and charged block are released. |
 
 ### Execution and ownership
 
@@ -240,6 +323,8 @@ A late GPU, physical-input, certificate, or exhausted-retry failure stops and dr
 | Other unclassified sources | Entry-point default. |
 
 The policy checks bound sources, including those hidden behind views. Transparent execution retains the original CPU plan. Explicit `gpu_execution()` checks its bind-time policy and validates the newly bound CPU plan before replay, so a replaced view cannot inherit stale permission. SQL-text and filesystem checks also block S3 replay.
+
+Source discovery retains its first failure while continuing to check siblings. Known S3 and stream restrictions take precedence. If discovery failure prevents replay, the query error includes both the discovery failure and the underlying GPU error. Non-standard C++ exceptions are converted to ordinary query errors; cancellation still propagates immediately.
 
 On the explicit path, the rebound validator returns a policy refusal separately from the CPU result. Such a refusal counts as no replay; an admitted CPU execution counts as replay even if it returns an ordinary error or no rows.
 

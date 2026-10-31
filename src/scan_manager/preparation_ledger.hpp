@@ -43,11 +43,16 @@ struct unit_envelope {
   // Independently allocated blocks are rounded separately by the backing allocator.
   std::vector<uint64_t> temporary;
   uint64_t retained = 0;
+  // Sum independently rounded blocks, matching admission and runtime accounting.
+  uint64_t temporary_charge(uint64_t allocation_granularity) const;
 };
 struct scan_envelope {
   std::vector<unit_envelope> units;
   std::vector<uint64_t> retained;
   bool qualified = false;
+  // Output may retain temporary credit while waiting for another scan to run.
+  // Such scans contribute a minimum that admission must not reduce.
+  uint32_t minimum_permits = 0;
 };
 struct admission_decision {
   bool deferred           = false;
@@ -175,7 +180,7 @@ class preparation_ledger {
   ~preparation_ledger() { close(); }
   preparation_ledger(preparation_ledger const&)            = delete;
   preparation_ledger& operator=(preparation_ledger const&) = delete;
-  // Request bounded parallel work; failed large requests back off to one permit.
+  // Request bounded parallel work; smaller grants must preserve scan progress minima.
   admission_decision admit(std::span<scan_envelope const>,
                            memory_space_id,
                            uint32_t max_permits = 1);
@@ -186,11 +191,17 @@ class preparation_ledger {
   w_permit acquire_permit(
     unit_key);  // Nonblocking; empty means coordinator must wait for an event.
   // Atomically register and acquire. Pending leaves neither registration nor budget changes.
-  w_permit try_acquire_unit(unit_key, uint64_t retained_limit);
+  // temporary_limit is already rounded to the admission allocation granularity.
+  // Omission preserves the query-wide W limit for existing callers.
+  w_permit try_acquire_unit(unit_key,
+                            uint64_t retained_limit,
+                            std::optional<uint64_t> temporary_limit = std::nullopt);
   // One query coordinator per ledger; callback runs after the ledger lock is released.
   void bind_wakeup(preparation_wakeup);
   charging_allocator allocator(w_permit const&);
   uint64_t charged_bytes(unit_key) const;
+  // Live temporary plus retained allocations held by this admitted input.
+  uint64_t charged_bytes(w_permit const&) const;
   uint64_t granted_capacity() const;
   uint32_t permits_in_flight() const;
   uint64_t bound_exceeded() const;
