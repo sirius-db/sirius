@@ -14,6 +14,7 @@
 #include "transparent/replay_admission.hpp"
 
 #include <cudf/column/column_factories.hpp>
+#include <cudf/copying.hpp>
 #include <cudf/scalar/scalar.hpp>
 
 #include <rmm/cuda_device.hpp>
@@ -28,8 +29,10 @@
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/parquet_fixture_utils.hpp>
 #include <utils/table_filter_test_utils.hpp>
+#include <utils/test_validation_utility.hpp>
 #include <utils/tracking_kvikio_context.hpp>
 
+#include <algorithm>
 #include <array>
 #include <fstream>
 #include <limits>
@@ -819,7 +822,8 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     REQUIRE_FALSE(data->HasError());
     auto deletes =
       con->Query("COPY (SELECT " + directory.file_literal("input.parquet") +
-                 " file_path, pos FROM (VALUES (11::BIGINT), (-1::BIGINT)) t(pos)) TO " +
+                 " file_path, pos FROM (VALUES (11::BIGINT), (-1::BIGINT), (11::BIGINT), "
+                 "(-3::BIGINT), (-1::BIGINT)) t(pos)) TO " +
                  directory.file_literal("deletes.parquet") + " (FORMAT PARQUET)");
     REQUIRE(deletes);
     REQUIRE_FALSE(deletes->HasError());
@@ -827,11 +831,11 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   auto ioctx = std::make_shared<sirius::io::kvikio_context>();
   iceberg_delete_discovery discovery;
   discovery.positional_delete_files.push_back(directory.file("deletes.parquet"));
-  // Exercise the real V2 eager loader, including its signed read and sorting,
-  // before either visibility implementation sees these positions.
+  // Exercise the real V2 eager loader with unsorted, duplicate negative and valid
+  // positions before either visibility implementation sees the sorted list.
   auto payload = load_delete_payload(*con->context, "split-ranges", ioctx.get(), {}, discovery);
   REQUIRE(payload);
-  REQUIRE(payload->positional_deletes.at(path) == std::vector<int64_t>{-1, 11});
+  REQUIRE(payload->positional_deletes.at(path) == std::vector<int64_t>{-3, -1, -1, 11, 11});
   auto info                 = std::make_unique<iceberg_ingestible_table_info>();
   info->table_path          = "split-ranges";
   info->delete_data         = payload;
@@ -955,6 +959,187 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     CHECK(row_requests == (pruned     ? std::vector<bool>{virtual_kind == 1}
                            : separate ? std::vector<bool>{true, virtual_kind == 1}
                                       : std::vector<bool>{true}));
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "Iceberg eager duplicate deletes match unique deletes across merged files",
+                 "[scan][execution_record][row_positions][iceberg][eager_delete][integration]")
+{
+  auto const virtual_kind = GENERATE(0, 1, 2);  // none, row number, filename
+  auto const multi        = GENERATE(false, true);
+  CAPTURE(virtual_kind, multi);
+  sirius::test::scratch_dir directory("eager_duplicate_deletes");
+  std::vector<std::string> const names = multi ? std::vector<std::string>{"a.parquet", "b.parquet"}
+                                               : std::vector<std::string>{"a.parquet"};
+  std::vector<std::string> paths;
+  std::vector<int32_t> expected_ids;
+  std::vector<int64_t> expected_rows;
+  for (std::size_t file = 0; file < names.size(); ++file) {
+    paths.push_back(directory.file(names[file]));
+    sirius::test::scoped_setting cpu(*con, "gpu_execution", false);
+    auto written =
+      con->Query("COPY (SELECT (i + " + std::to_string(file * 1000) +
+                 ")::INTEGER id, (i % 2)::INTEGER amount FROM range(64) t(i) ORDER BY i) TO " +
+                 directory.file_literal(names[file]) + " (FORMAT PARQUET)");
+    REQUIRE(written);
+    REQUIRE_FALSE(written->HasError());
+    // Both files delete row 11, but row 5 belongs only to A's delete set and row
+    // 17 only to B's. Distinct payload IDs expose swapped or combined bindings.
+    for (int row = 1; row < 64; row += 2) {
+      if (row == 11 || row == (file == 0 ? 5 : 17)) continue;
+      expected_ids.push_back(static_cast<int32_t>(file * 1000 + row));
+      expected_rows.push_back(row);
+    }
+  }
+  auto ioctx   = std::make_shared<sirius::io::kvikio_context>();
+  auto context = sirius::test::get_registered_sirius_context(*con);
+  auto* space  = context->get_memory_manager().get_memory_space(
+    cucascade::memory::Tier::GPU, rmm::get_current_cuda_device().value());
+  REQUIRE(space);
+  rmm::cuda_stream stream;
+  std::unique_ptr<cudf::table> unique_output;
+  // Keep every position positive so this comparison tests duplicate handling
+  // independently of the signed-bound regression above. Both inputs go through
+  // real delete files and the eager loader; the test does not sort or deduplicate.
+  for (bool duplicates : {false, true}) {
+    CAPTURE(duplicates);
+    auto const delete_name = duplicates ? "duplicates.parquet" : "unique.parquet";
+    std::string values;
+    for (std::size_t file = 0; file < paths.size(); ++file) {
+      auto const positions =
+        file == 0
+          ? (duplicates ? std::vector<int64_t>{11, 5, 11, 5} : std::vector<int64_t>{5, 11})
+          : (duplicates ? std::vector<int64_t>{17, 11, 17, 11} : std::vector<int64_t>{11, 17});
+      for (auto pos : positions) {
+        if (!values.empty()) values += ", ";
+        values +=
+          "(" + sirius::test::sql_literal(paths[file]) + ", " + std::to_string(pos) + "::BIGINT)";
+      }
+    }
+    {
+      sirius::test::scoped_setting cpu(*con, "gpu_execution", false);
+      auto written =
+        con->Query("COPY (SELECT * FROM (VALUES " + values + ") t(file_path, pos)) TO " +
+                   directory.file_literal(delete_name) + " (FORMAT PARQUET)");
+      REQUIRE(written);
+      REQUIRE_FALSE(written->HasError());
+    }
+    iceberg_delete_discovery discovery;
+    discovery.positional_delete_files.push_back(directory.file(delete_name));
+    auto payload = load_delete_payload(*con->context, delete_name, ioctx.get(), {}, discovery);
+    REQUIRE(payload);
+    REQUIRE(payload->positional_deletes.size() == paths.size());
+    for (std::size_t file = 0; file < paths.size(); ++file) {
+      CHECK(
+        payload->positional_deletes.at(paths[file]) ==
+        (file == 0
+           ? (duplicates ? std::vector<int64_t>{5, 5, 11, 11} : std::vector<int64_t>{5, 11})
+           : (duplicates ? std::vector<int64_t>{11, 11, 17, 17} : std::vector<int64_t>{11, 17})));
+    }
+    auto info                 = std::make_unique<iceberg_ingestible_table_info>();
+    info->table_path          = delete_name;
+    info->delete_data         = payload;
+    info->resolved_file_paths = paths;
+    info->names               = {"id", "amount"};
+    info->returned_types.assign(2, sirius::logical_type::make(sirius::type_id::INTEGER));
+    info->column_ids             = {duckdb::ColumnIndex(0), duckdb::ColumnIndex(1)};
+    info->projected_output_count = virtual_kind ? 3 : 2;
+    info->approximate_batch_size = std::size_t{1} << 30;
+    if (virtual_kind) {
+      auto const id = virtual_kind == 1 ? duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER
+                                        : duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILENAME;
+      info->column_ids.emplace_back(id);
+      info->virtual_columns = {
+        {id,
+         virtual_kind == 1 ? "file_row_number" : "filename",
+         sirius::logical_type::make(virtual_kind == 1 ? sirius::type_id::BIGINT
+                                                      : sirius::type_id::VARCHAR),
+         virtual_kind == 1 ? scan_plan::parquet_virtual_column_kind::FILE_ROW_NUMBER
+                           : scan_plan::parquet_virtual_column_kind::FILENAME}};
+    }
+    info->table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
+    info->table_filters->PushFilter(
+      duckdb::ProjectionIndex(1),
+      sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_EQUAL,
+                                    duckdb::Value::INTEGER(1)));
+    auto counters                           = std::make_shared<physical_check_counters>();
+    counters->track_units                   = true;
+    info->profiles->counters                = counters;
+    int position_calls                      = 0;
+    counters->parquet_positions_for_testing = [&](bool row, bool source) {
+      ++position_calls;
+      CHECK(row);
+      CHECK(source == multi);
+    };
+    int reader_calls                     = 0;
+    counters->parquet_filter_for_testing = [&](bool filtered, uint64_t rows) {
+      ++reader_calls;
+      CHECK(filtered == bool(virtual_kind));
+      CHECK(rows == (virtual_kind ? 32 : 64) * paths.size());
+    };
+    auto reader    = make_ingestible(std::move(info));
+    auto coalescer = reader->create_batch_coalescer();
+    std::vector<std::unique_ptr<scan_info>> splits;
+    while (auto prepare = reader->next_split_provider(
+             [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; })) {
+      auto ready = coalescer->push(prepare({}));
+      for (auto& split : ready)
+        splits.push_back(std::move(split));
+    }
+    for (auto& split : coalescer->flush())
+      splits.push_back(std::move(split));
+    REQUIRE(splits.size() == 1);
+    auto const& split = dynamic_cast<parquet_split_info const&>(*splits.front());
+    REQUIRE(split.rg_slices.size() == paths.size());
+    CHECK(split.requires_row_positions == bool(virtual_kind));
+    for (std::size_t file = 0; file < paths.size(); ++file)
+      CHECK(split.rg_slices[file].file_path == paths[file]);
+    auto batch = reader->materialize_metadata_to_table(split, *space, stream, false, nullptr);
+    CHECK(reader_calls == 1);
+    CHECK(position_calls == (virtual_kind ? 1 : 0));
+    REQUIRE(batch.execution);
+    CHECK(batch.execution->visibility_complete);
+    REQUIRE(batch.required_visibility);
+    REQUIRE(batch.required_visibility->size() == paths.size());
+    REQUIRE(batch.execution->visibility_applied.size() == paths.size());
+    for (auto const& path : paths) {
+      auto const matches   = [&](auto const& binding) { return binding.file == path; };
+      auto const& applied  = batch.execution->visibility_applied;
+      auto const& required = *batch.required_visibility;
+      auto actual          = std::find_if(applied.begin(), applied.end(), matches);
+      auto expected        = std::find_if(required.begin(), required.end(), matches);
+      REQUIRE(actual != applied.end());
+      REQUIRE(expected != required.end());
+      CHECK(actual->input == expected->input);
+    }
+    CHECK_FALSE(batch.row_positions);
+    CHECK(batch.table.num_rows() == (virtual_kind ? 30 : 62) * paths.size());
+    auto output = reader->post_filter_and_project(std::move(batch), *space, stream);
+    REQUIRE(output->num_columns() == (virtual_kind ? 3 : 2));
+    CHECK(host_column<int32_t>(output->view().column(0), stream) == expected_ids);
+    CHECK(host_column<int32_t>(output->view().column(1), stream) ==
+          std::vector<int32_t>(expected_ids.size(), 1));
+    if (virtual_kind == 1)
+      CHECK(host_column<int64_t>(output->view().column(2), stream) == expected_rows);
+    if (virtual_kind == 2) {
+      for (std::size_t file = 0; file < paths.size(); ++file) {
+        auto expected =
+          cudf::make_column_from_scalar(cudf::string_scalar(paths[file], true, stream), 30, stream);
+        std::vector<cudf::size_type> const range{static_cast<cudf::size_type>(file * 30),
+                                                 static_cast<cudf::size_type>((file + 1) * 30)};
+        CHECK(sirius::test::columns_logically_equal(
+          cudf::slice(output->view().column(2), range, stream).front(), expected->view(), stream));
+      }
+    }
+    if (duplicates) {
+      REQUIRE(unique_output);
+      for (int column = 0; column < output->num_columns(); ++column)
+        CHECK(sirius::test::columns_logically_equal(
+          output->view().column(column), unique_output->view().column(column), stream));
+    } else {
+      unique_output = std::move(output);
+    }
+  }
 }
 
 TEST_CASE("Shared materialization consumes only pending delete bindings",
