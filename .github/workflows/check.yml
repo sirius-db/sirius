@@ -258,7 +258,7 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE="$PWD/sirius-duckdb/vcpkg/scripts/buildsystems/vcpkg.cmake" \
             -DVCPKG_INSTALLED_DIR="$PWD/build/static-install" -DVCPKG_MANIFEST_INSTALL=OFF
           pixi run --locked -e vcpkg cmake --build build/static-consumer
-          for consumer in consumer c_consumer; do
+          for consumer in consumer c_consumer c_configuration_consumer; do
             readelf -d "build/static-consumer/$consumer" > "build/static-consumer/$consumer.dynamic.txt"
             while read -r library; do
               case "$library" in

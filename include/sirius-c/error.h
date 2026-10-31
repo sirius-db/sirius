@@ -11,12 +11,14 @@ extern "C" {
 
 /** A fixed-width result code. Zero means success; unknown nonzero codes are failures. */
 typedef uint32_t sirius_status;
-/** Status values 1–3 are reserved for configuration errors. */
 enum {
-  SIRIUS_SUCCESS            = 0, /**< The operation succeeded. */
-  SIRIUS_ALLOCATION_FAILURE = 4, /**< Allocation failed; no diagnostic is required. */
-  SIRIUS_INVALID_ARGUMENT   = 5, /**< A required pointer or argument is invalid. */
-  SIRIUS_INTERNAL_ERROR     = 6  /**< An unexpected implementation failure occurred. */
+  SIRIUS_SUCCESS               = 0, /**< The operation succeeded. */
+  SIRIUS_CONFIGURATION_IO      = 1, /**< A configuration file could not be read. */
+  SIRIUS_MALFORMED_YAML        = 2, /**< The input is not valid YAML. */
+  SIRIUS_INVALID_CONFIGURATION = 3, /**< A setting is invalid or conflicting. */
+  SIRIUS_ALLOCATION_FAILURE    = 4, /**< Allocation failed; no diagnostic is required. */
+  SIRIUS_INVALID_ARGUMENT      = 5, /**< A required pointer or argument is invalid. */
+  SIRIUS_INTERNAL_ERROR        = 6  /**< An unexpected implementation failure occurred. */
 };
 /** An owned diagnostic. Release with sirius_error_destroy(), never free().
  * @par Thread safety
