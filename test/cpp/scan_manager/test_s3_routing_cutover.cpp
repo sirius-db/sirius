@@ -299,6 +299,11 @@ class range_s3_server {
 
   /// Every request the server has served, of any method.
   [[nodiscard]] int request_count() const { return _request_count.load(std::memory_order_relaxed); }
+  /// Accepted TCP connections (warm-up exchanges each open a fresh one).
+  [[nodiscard]] int connection_count() const
+  {
+    return _connection_count.load(std::memory_order_relaxed);
+  }
 
   [[nodiscard]] std::size_t head_count() const { return _head_count.load(); }
   [[nodiscard]] std::size_t get_count() const { return _get_count.load(); }
@@ -320,6 +325,7 @@ class range_s3_server {
         if (_stop.load()) { return; }
         continue;
       }
+      _connection_count.fetch_add(1, std::memory_order_relaxed);
       handle_client(fd);
       ::close(fd);
     }
@@ -452,6 +458,7 @@ class range_s3_server {
   range_fault_policy _fault;
   std::atomic<bool> _stop{false};
   std::atomic<int> _request_count{0};
+  std::atomic<int> _connection_count{0};
   std::atomic<std::size_t> _head_count{0};
   std::atomic<std::size_t> _get_count{0};
   std::atomic<std::size_t> _suffix_get_count{0};
@@ -712,12 +719,16 @@ TEST_CASE("warmup opens every reactor's connection pool, and only once per bucke
     return server.request_count();
   };
 
-  int const baseline          = server.request_count();
-  constexpr int expected_warm = 2;  // rest_n_reactors * max_connections
+  int const baseline             = server.request_count();
+  int const baseline_connections = server.connection_count();
+  constexpr int expected_warm    = 2;  // rest_n_reactors * max_connections
 
   // A bucket URL, with no object in it: warm-up traffic never names a data file.
+  // Each idle slot sends one zero-key LIST on a fresh connection, so TCP, TLS
+  // and HTTP are all exercised before the reads arrive.
   io_ctx->warmup("s3://warm-bucket");
   CHECK(wait_for_requests(baseline + expected_warm) >= baseline + expected_warm);
+  CHECK(server.connection_count() >= baseline_connections + expected_warm);
   int const after_warm = server.request_count();
 
   // Warming the same bucket again well inside conn_max_age is redundant — the
@@ -730,6 +741,33 @@ TEST_CASE("warmup opens every reactor's connection pool, and only once per bucke
   io_ctx->warmup("s3://warm-bucket/some/deep/key.parquet");
   std::this_thread::sleep_for(std::chrono::milliseconds(300));
   CHECK(server.request_count() == after_warm);
+}
+
+TEST_CASE("rest_n_reactors 0 sizes the REST pool from the egress NIC", "[s3][routing]")
+{
+  range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{5}));
+  scan_manager_fixture fixture;
+  auto cfg = make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::native);
+  // Loopback has no queue IRQs to size or place the pool from, so the auto pool
+  // falls back to the default count (2), unpinned, whatever this host's real NIC
+  // looks like.  An explicit fan-out is only clamped to an auto-sized pool, so
+  // the clamped value exposes the pool size.
+  cfg.rest_n_reactors = 0;
+  cfg.rest.interface  = "lo";
+  cfg.rest.fan_out    = 64;
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, cfg, *fixture.memory, fixture.topology};
+
+  auto datasource = manager.create_datasource("s3://auto-bucket/data.parquet");
+  REQUIRE(datasource != nullptr);
+  auto rest = std::dynamic_pointer_cast<cucascade::io::rest::rest_ioctx>(datasource->io_ctx());
+  REQUIRE(rest != nullptr);
+  CHECK(rest->dispatch_fanout() == 2);
+
+  CHECK(datasource->size() == 4096);
+  std::vector<std::uint8_t> buffer(256, std::uint8_t{0});
+  CHECK(datasource->host_read(0, buffer.size(), buffer.data()) == buffer.size());
+  CHECK(std::ranges::all_of(buffer, [](std::uint8_t b) { return b == 5; }));
 }
 
 TEST_CASE("warmup is a no-op for backends with nothing to connect", "[s3][routing]")

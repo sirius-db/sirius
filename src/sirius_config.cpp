@@ -23,6 +23,8 @@
 
 #include <cuda_runtime_api.h>
 
+#include <cucascade/io/rest/config.hpp>
+#include <cucascade/io/tls/config.hpp>
 #include <cucascade/io/uring/config.hpp>
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
@@ -30,13 +32,16 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <exception>
+#include <initializer_list>
 #include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -194,8 +199,148 @@ static void from_yaml(const YAML::Node& node, creator::task_creator_config& opt)
   r.reject_unknown();
 }
 
+// Read counts signed first, so negative YAML values cannot wrap into an unsigned field.
+template <typename T>
+static void read_count(yaml::reader& r,
+                       char const* key,
+                       T& out,
+                       bool positive     = false,
+                       std::uint64_t max = std::numeric_limits<T>::max())
+{
+  std::int64_t value{};
+  r.optional(key, value, [=](auto v) {
+    if (v < 0 || (positive && v == 0) || static_cast<std::uint64_t>(v) > max) {
+      std::string text = positive ? "must be a positive integer" : "must be a nonnegative integer";
+      if (max < static_cast<std::uint64_t>(std::numeric_limits<T>::max())) {
+        text += " <= " + std::to_string(max);
+      }
+      throw std::runtime_error(text);
+    }
+    return true;
+  });
+  if (r.has_value(key)) { out = static_cast<T>(value); }
+}
+
+// Read one of a closed set of spellings; anything else names the accepted ones.
+template <typename T>
+static void read_choice(yaml::reader& r,
+                        char const* key,
+                        T& out,
+                        std::initializer_list<std::pair<std::string_view, T>> choices)
+{
+  std::string value;
+  r.optional(key, value, [&](auto const& spelling) {
+    std::string expected;
+    for (auto const& [name, choice] : choices) {
+      if (spelling == name) {
+        out = choice;
+        return true;
+      }
+      expected += (expected.empty() ? "" : ", ") + std::string{name};
+    }
+    throw std::runtime_error("invalid enum value '" + spelling + "' (expected " + expected + ")");
+  });
+}
+
+// A validator that throws @p text when @p ok rejects the value, so the error names the rule.
+template <typename Pred>
+static auto with_rule(Pred ok, char const* text)
+{
+  return [ok, text](auto const& value) {
+    if (!ok(value)) { throw std::runtime_error(text); }
+    return true;
+  };
+}
+
+static void from_yaml(const YAML::Node& node, cucascade::io::tls::config& opt)
+{
+  namespace tls = cucascade::io::tls;
+  yaml::reader r(node, "rest.tls");
+  if (r.has("verify")) {
+    throw std::runtime_error(
+      "'sirius.executor.scan_manager.rest.tls.verify': trust is owned by object_store; set "
+      "VERIFY_SSL on the selected CREATE SECRET (TYPE SIRIUS_S3, ...) or tls_verify through "
+      "sirius_config::set_object_store_config() instead");
+  }
+  for (auto const* key : {"ca_file", "ca_dir", "ca_blob"}) {
+    if (r.has(key)) {
+      throw std::runtime_error(
+        "'sirius.executor.scan_manager.rest.tls." + std::string(key) +
+        "': trust is owned by object_store; set ca_bundle_path through "
+        "sirius_config::set_object_store_config() (kept when a SQL secret is selected), or "
+        "NIX_SSL_CERT_FILE / SSL_CERT_FILE / SSL_CERT_DIR in the process environment "
+        "(a usable NIX_SSL_CERT_FILE takes precedence over SSL_CERT_FILE); SQL secrets carry no "
+        "CA");
+    }
+  }
+  read_choice(r,
+              "ktls",
+              opt.ktls,
+              {{"prefer", tls::ktls_mode::prefer},
+               {"require", tls::ktls_mode::require},
+               {"disable", tls::ktls_mode::disable}});
+  read_choice(
+    r,
+    "user_space_rx",
+    opt.fallback_rx,
+    {{"record_layer", tls::user_space_rx::record_layer}, {"library", tls::user_space_rx::library}});
+  read_choice(r,
+              "recv_placement",
+              opt.placement,
+              {{"automatic", tls::recv_placement::automatic},
+               {"inline", tls::recv_placement::inline_},
+               {"iowq", tls::recv_placement::iowq}});
+  read_choice(r,
+              "min_version",
+              opt.min_version,
+              {{"tls1.2", tls::version_bound::tls1_2}, {"tls1.3", tls::version_bound::tls1_3}});
+  std::optional<tls::version_bound> max_version = opt.max_version;
+  read_choice(r,
+              "max_version",
+              max_version,
+              {{"auto", std::optional<tls::version_bound>{}},
+               {"tls1.2", std::optional{tls::version_bound::tls1_2}},
+               {"tls1.3", std::optional{tls::version_bound::tls1_3}}});
+  opt.max_version = max_version;
+  if (opt.max_version && opt.min_version > *opt.max_version) {
+    throw std::runtime_error("'rest.tls.max_version': must be at least rest.tls.min_version");
+  }
+  r.optional("expect_no_pad", opt.expect_no_pad);
+  r.optional("session_cache", opt.session_cache);
+  // 0 is only meaningful with the cache off; the cross-field rule is checked by the
+  // rest reader through rest::config::validate().
+  read_count(r, "session_cache_per_endpoint", opt.session_cache_per_endpoint);
+  r.optional("max_connection_bytes", yaml::bytes(opt.max_connection_bytes));
+  r.optional("ciphersuites", opt.ciphersuites);
+  r.optional("cipher_list", opt.cipher_list);
+  r.optional("groups", opt.groups);
+  r.optional("sni_override", opt.sni_override);
+  r.optional("allow_tls13_without_rekey", opt.allow_tls13_without_rekey);
+  r.reject_unknown();
+}
+
+// cuCascade's rest::config::validate() names struct fields; report them under their YAML keys.
+static std::string rest_yaml_key(std::string_view field)
+{
+  static constexpr std::pair<std::string_view, std::string_view> renamed[] = {
+    {"upkeep_interval", "upkeep_interval_ms"},
+    {"conn_max_age", "conn_max_age_s"},
+    {"retry_backoff_base", "retry_backoff_base_ms"},
+    {"retry_jitter", "retry_jitter_ms"},
+    {"connect_timeout", "connect_timeout_ms"},
+    {"dns_ttl", "dns_ttl_s"},
+    {"tls.fallback_rx", "tls.user_space_rx"},
+    {"tls.placement", "tls.recv_placement"},
+  };
+  for (auto const& [from, to] : renamed) {
+    if (field == from) { return std::string{to}; }
+  }
+  return std::string{field};
+}
+
 static void from_yaml(const YAML::Node& node, cucascade::io::rest::config& opt)
 {
+  namespace rest = cucascade::io::rest;
   yaml::reader r(node, "rest");
   for (auto const* key : {"ca_bundle_path", "tls_verify"}) {
     if (r.has(key)) {
@@ -203,31 +348,111 @@ static void from_yaml(const YAML::Node& node, cucascade::io::rest::config& opt)
                                "': removed; use sirius_config::set_object_store_config() instead");
     }
   }
-  {
-    // Read through an optional so "set to the struct default" is distinguishable
-    // from "not set" -- see config::n_max_concurrent_scans_explicit.
-    std::optional<std::size_t> n_max;
-    r.optional("n_max_concurrent_scans", n_max);
-    if (n_max.has_value()) {
-      opt.n_max_concurrent_scans          = *n_max;
-      opt.n_max_concurrent_scans_explicit = true;
-    }
-  }
-  r.optional("request_timeout_s", opt.request_timeout_s);
-  r.optional("stall_speed_limit_bytes", opt.stall_speed_limit_bytes);
-  r.optional("stall_time_s", opt.stall_time_s);
+  constexpr std::size_t kib = std::size_t{1} << 10;
+  constexpr std::size_t mib = std::size_t{1} << 20;
+  auto nonnegative_duration = with_rule([](auto v) { return v.count() >= 0; }, "must be >= 0");
+  auto positive_duration    = with_rule([](auto v) { return v.count() > 0; }, "must be > 0");
+  auto nonnegative          = with_rule([](long v) { return v >= 0; }, "must be >= 0");
+  // Byte sizes accept suffixes, so they are range-checked after the read.
+  auto bytes_in =
+    [&r](char const* key, std::size_t& out, std::size_t lo, std::size_t hi, char const* text) {
+      r.optional(key, yaml::bytes(out));
+      if (r.has_value(key) && (out < lo || out > hi)) {
+        throw std::runtime_error("'rest." + std::string{key} + "': " + text);
+      }
+    };
+  constexpr auto no_limit = std::numeric_limits<std::size_t>::max();
+
+  // -- scans and requests ------------------------------------------------------
+  read_count(r, "n_max_concurrent_scans", opt.n_max_concurrent_scans);
+  // Naming even the struct default must prevent pipeline-width default derivation.
+  if (r.has_value("n_max_concurrent_scans")) { opt.n_max_concurrent_scans_explicit = true; }
+  r.optional("request_timeout_s", opt.request_timeout_s, nonnegative);
+  r.optional("stall_speed_limit_bytes", opt.stall_speed_limit_bytes, nonnegative);
+  r.optional("stall_time_s", opt.stall_time_s, nonnegative);
+  // Consumed by the logical range planner, independently of physical GET sizing.
   r.optional("merge_max_gap", yaml::bytes(opt.merge_max_gap));
-  r.optional("upkeep_interval_ms", opt.upkeep_interval);
-  r.optional("conn_max_age_s", opt.conn_max_age);
-  r.optional("retry_backoff_base_ms", opt.retry_backoff_base);
-  r.optional("retry_jitter_ms", opt.retry_jitter);
-  r.optional("max_retry_attempts", opt.max_retry_attempts);
-  r.optional("max_auth_retry_attempts", opt.max_auth_retry_attempts);
+  bytes_in("min_segment_bytes", opt.min_segment_bytes, 1, no_limit, "must be > 0");
+  r.optional("max_segment_bytes", yaml::bytes(opt.max_segment_bytes));
+  if (opt.max_segment_bytes < opt.min_segment_bytes) {
+    throw std::runtime_error("'rest.max_segment_bytes': must be >= rest.min_segment_bytes");
+  }
+  bytes_in("footer_probe_bytes", opt.footer_probe_bytes, 0, 1024 * mib, "must be <= 1 GiB");
+  read_count(r, "list_max_matches", opt.list_max_matches, true);
+  read_count(r, "list_max_scanned", opt.list_max_scanned, true);
+
+  // -- retry policy --------------------------------------------------------------
+  r.optional("retry_backoff_base_ms", opt.retry_backoff_base, nonnegative_duration);
+  r.optional("retry_jitter_ms", opt.retry_jitter, nonnegative_duration);
+  // Attempt budgets count the first attempt, so 0 would never send a request.
+  read_count(
+    r, "max_retry_attempts", opt.max_retry_attempts, true, std::numeric_limits<unsigned>::max());
+  read_count(r,
+             "max_auth_retry_attempts",
+             opt.max_auth_retry_attempts,
+             true,
+             std::numeric_limits<unsigned>::max());
   r.optional("honor_retry_after", opt.honor_retry_after);
-  r.optional("footer_probe_bytes", yaml::bytes(opt.footer_probe_bytes));
-  r.optional("list_max_matches", opt.list_max_matches);
-  r.optional("list_max_scanned", opt.list_max_scanned);
+
+  // -- connection pool -------------------------------------------------------------
+  read_count(r, "max_connections", opt.max_connections, true, 4096);
+  r.optional("conn_max_age_s", opt.conn_max_age, nonnegative_duration);
+  r.optional("upkeep_interval_ms", opt.upkeep_interval, nonnegative_duration);
+  r.optional("upkeep_http1", opt.upkeep_http1);
+  r.optional("connect_timeout_ms", opt.connect_timeout, positive_duration);
+  r.optional("dns_ttl_s", opt.dns_ttl, positive_duration);
+  r.optional("dns_accumulate", opt.dns_accumulate);
+  read_count(r, "dns_max_addresses", opt.dns_max_addresses, true, 4096);
+  read_count(r, "keepalive_idle_s", opt.keepalive_idle_s, true);
+  read_count(r, "keepalive_interval_s", opt.keepalive_interval_s, true);
+  read_count(r, "keepalive_count", opt.keepalive_count);
+  // Largest effective MTU: a 65535-byte MSS plus IPv6/TCP headers (60) and timestamps (12).
+  bytes_in("min_mtu", opt.min_mtu, 0, 65535 + 60 + 12, "must be at most 65607 bytes");
+  read_count(r, "mtu_reject_max_attempts", opt.mtu_reject_max_attempts, true);
+  r.optional("close_with_rst", opt.close_with_rst);
+
+  // -- transport -----------------------------------------------------------------
+  bytes_in("receive_buffer_bytes",
+           opt.receive_buffer_bytes,
+           16 * kib,
+           4 * mib,
+           "must be in [16 KiB, 4 MiB]");
+  read_count(r, "queue_depth", opt.queue_depth, true, 32768);
+  if (opt.queue_depth < 2 * opt.max_connections) {
+    throw std::runtime_error("'rest.queue_depth': must be >= 2 * rest.max_connections (" +
+                             std::to_string(2 * opt.max_connections) + ") and <= 32768");
+  }
+  read_choice(
+    r,
+    "wait_mode",
+    opt.wait_mode,
+    {{"epoll", rest::reactor_wait_mode::epoll}, {"uring", rest::reactor_wait_mode::uring}});
+  read_count(r, "iowq_max_unbound", opt.iowq_max_unbound);
+
+  // -- placement -------------------------------------------------------------------
+  // fan_out vs. rest_n_reactors is checked by the scan_manager reader, which owns the count.
+  read_count(r, "fan_out", opt.fan_out, true);
+  r.optional("interface", opt.interface);
+  r.optional("pin_to_irq_cpus", opt.pin_to_irq_cpus);
+
+  if (auto n = r.optional_node("tls")) sirius::from_yaml(*n, opt.tls);
   r.reject_unknown();
+
+  // The per-key checks above give key context; cuCascade's own validate() then enforces every
+  // rule (cross-field ones included) exactly as the reactors will, reported under YAML names.
+  try {
+    opt.validate();
+  } catch (std::invalid_argument const& e) {
+    std::string_view what = e.what();
+    constexpr std::string_view prefix{"rest::config::"};
+    if (what.starts_with(prefix)) { what.remove_prefix(prefix.size()); }
+    auto const colon = what.find(": ");
+    if (colon == std::string_view::npos) {
+      throw std::runtime_error("'rest': " + std::string{what});
+    }
+    throw std::runtime_error("'rest." + rest_yaml_key(what.substr(0, colon)) +
+                             "': " + std::string{what.substr(colon + 2)});
+  }
 }
 
 // cuCascade does not validate slices_per_pass (a value above the slot count merely acts
@@ -398,11 +623,19 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   }
   r.optional("max_concurrent_queries", opt.max_concurrent_queries, yaml::greater_than<int>{0});
   r.optional("uring_n_reactors", opt.uring_n_reactors, yaml::greater_than<std::size_t>{0});
-  r.optional("rest_n_reactors", opt.rest_n_reactors, yaml::greater_than<std::size_t>{0});
+  // A total for the process (never per GPU); 0 sizes the pool from the egress NIC's IRQs.
+  read_count(r, "rest_n_reactors", opt.rest_n_reactors);
   r.optional("max_readahead_scans", opt.max_readahead_scans);
   r.optional("readahead_strategy", opt.readahead_strategy);
   if (auto n = r.optional_node("uring")) sirius::from_yaml(*n, opt.uring);
   if (auto n = r.optional_node("rest")) sirius::from_yaml(*n, opt.rest);
+  // Same rule as rest_ioctx: the default fan-out is clamped to a smaller pool, any other value
+  // must fit it.  An auto-sized pool (0) is only known when the REST ioctx is built.
+  if (opt.rest_n_reactors > 0 && opt.rest.fan_out > opt.rest_n_reactors &&
+      opt.rest.fan_out != cucascade::io::rest::config{}.fan_out) {
+    throw std::runtime_error("'rest.fan_out': must be at most rest_n_reactors (" +
+                             std::to_string(opt.rest_n_reactors) + ")");
+  }
   if (auto n = r.optional_node("cache")) sirius::from_yaml(*n, opt.cache);
   if (auto n = r.optional_node("memory_prefetcher")) from_yaml(*n, opt.memory_prefetcher);
   if (auto n = r.optional_node("preparation")) from_yaml(*n, opt.preparation);
