@@ -691,7 +691,10 @@ materialized_batch import_arrow_host(std::shared_ptr<owned_arrow_batch> input,
     table =
       detail::import_arrow_device_columns(input->array, *program.arrow_schema, *source, stream, mr);
   } else {
-    (void)validate_arrow_host_flat(input->schema, input->array, input->metadata_lengths);
+    // Legacy inputs were already payload-validated by validate_for(). Qualified
+    // host inputs need that validation only now, after their readiness event.
+    if (source)
+      (void)validate_arrow_host_flat(input->schema, input->array, input->metadata_lengths);
     if (source) {
       for (size_t i = 0; i < types.size(); ++i) {
         if (types[i].id() != cudf::type_id::STRING || !input->array.length) continue;
