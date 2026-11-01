@@ -43,13 +43,14 @@ inline constexpr std::array<sirius::type_id, 3> supported_ast_cast_types_native{
   {sirius::type_id::UBIGINT, sirius::type_id::BIGINT, sirius::type_id::DOUBLE}};
 
 /// Whether a semantic CAST of @p source to @p target lowers to one cuDF AST op. The AST's integer
-/// casts wrap, so a HUGEINT source, which a narrowing cast must range-check, lowers only to DOUBLE.
+/// casts wrap, and DECIMAL-to-integer casts also require rounding. Fixed-point sources therefore
+/// lower only to DOUBLE; integer targets go through the checked materialized conversion.
 [[nodiscard]] inline bool ast_supports_cast(logical_type const& source, logical_type const& target)
 {
   auto const supported = std::find(supported_ast_cast_types_native.begin(),
                                    supported_ast_cast_types_native.end(),
                                    target.id()) != supported_ast_cast_types_native.end();
-  return supported && (source.id() != type_id::HUGEINT || target.id() == type_id::DOUBLE);
+  return supported && (!source.has_fixed_point_carrier() || target.id() == type_id::DOUBLE);
 }
 
 /// Whether @p call's result or any argument is DECIMAL or HUGEINT. cuDF AST does not enforce

@@ -6,6 +6,7 @@ set(TEST_SOURCES
     test/cpp/io/cache/test_metadata_store.cpp
     test/cpp/io/test_object_identity.cpp
     test/cpp/scan_manager/test_preparation_readiness.cpp
+    test/cpp/scan_manager/test_preparation_parquet.cpp
     test/cpp/scan_manager/test_coordinator_pool.cpp
     test/cpp/scan_manager/test_preparation_output_lifetime.cpp
     test/cpp/scan_manager/test_native_reader_executor.cpp
@@ -66,6 +67,7 @@ set(TEST_SOURCES
     test/cpp/exec/test_sirius_ffi_fragment.cpp
     test/cpp/exec/test_sirius_ffi_embedder.cpp
     test/cpp/exec/test_sirius_ffi_byte_ranges.cpp
+    test/cpp/exec/test_sirius_ffi_object_store.cpp
     test/cpp/exec/test_stream_bind_catalog.cpp
     test/cpp/exec/test_cuda_event_completion_poll.cpp
     test/cpp/exec/test_stream_session.cpp
@@ -84,6 +86,7 @@ set(TEST_SOURCES
     test/cpp/expression_evaluator/test_gpu_expression_translator.cpp
     test/cpp/expression_evaluator/test_like_multiliteral.cpp
     test/cpp/expression_evaluator/test_round_floating_point.cpp
+    test/cpp/expression_evaluator/test_decimal_integer_cast.cpp
     test/cpp/expression_evaluator/test_nonduckdb_frontend_proof.cpp
     test/cpp/helper/test_cudf_utils.cpp
     test/cpp/helper/test_logical_type.cpp
@@ -100,6 +103,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_cross_product.cpp
     test/cpp/integration/test_gpu_execution_scalar_subquery.cpp
     test/cpp/integration/test_gpu_execution_decimal_sum_overflow.cpp
+    test/cpp/integration/test_gpu_execution_decimal_integer_cast.cpp
     test/cpp/integration/test_gpu_execution_dense_count_join.cpp
     test/cpp/integration/test_gpu_execution_distinct.cpp
     test/cpp/integration/test_gpu_execution_distinct_aggregate_fallback.cpp
@@ -230,6 +234,7 @@ set(TEST_SOURCES
     test/cpp/operator/aggregate/test_gpu_merge_impl.cpp
     test/cpp/operator/aggregate/test_sorted_keys.cpp
     test/cpp/operator/aggregate/test_group_key_labels.cpp
+    test/cpp/operator/aggregate/test_low_cardinality_groupby.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate_count_distinct.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate_merge.cpp
@@ -344,8 +349,11 @@ set(TEST_SOURCES
     test/cpp/scan/test_parquet_schema_mapping.cpp
     test/cpp/scan/test_parquet_null_count_pruning.cpp
     test/cpp/scan/test_residual_filter.cpp
+    test/cpp/scan/test_scan_execution.cpp
     test/cpp/scan/test_scan_materialization.cpp
     test/cpp/scan/test_arrow_import_resources.cpp
+    test/cpp/scan/test_composite_scan_driver.cpp
+    test/cpp/scan/test_arrow_import_driver.cpp
     test/cpp/scan/test_scan_filter_cast_ranges.cpp
     test/cpp/scan/test_scan_filter_ranges.cpp
     test/cpp/scan/test_parquet_scan_sizing.cpp
