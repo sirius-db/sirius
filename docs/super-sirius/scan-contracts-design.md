@@ -284,6 +284,6 @@ The policy checks bound sources, including those hidden behind views. Transparen
 
 On the explicit path, the rebound validator returns a policy refusal separately from the CPU result. Such a refusal counts as no replay; an admitted CPU execution counts as replay even if it returns an ordinary error or no rows.
 
-Iceberg metadata queries use a separate read-only connection with recursive GPU execution disabled and complete planning before native leases are acquired.
+Iceberg manifest queries use a separate read-only connection with recursive GPU execution disabled and finish before native leases are acquired. Parquet position-delete files use the shared reader in the caller's active transaction, with its filesystem and credentials. Callers must discard partial results if reading fails.
 
 Related documentation: [Scan](scan.md), [Physical Plan Generation](physical-plan-generation.md), and [Streaming Fragments](streaming-fragments.md).

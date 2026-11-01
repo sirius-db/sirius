@@ -35,6 +35,7 @@
 #include <log/logging.hpp>
 #include <op/scan/iceberg_metadata_connection.hpp>
 #include <op/scan/iceberg_metadata_reader.hpp>
+#include <op/scan/parquet_delete_reader.hpp>
 #include <op/scan/puffin_reader.hpp>
 #include <sirius_context.hpp>
 
@@ -428,28 +429,37 @@ void read_positional_delete_file(duckdb::ClientContext& context,
                                  std::string const& delete_file_path,
                                  std::unordered_map<std::string, std::vector<int64_t>>& out_map)
 {
-  auto internal = duckdb::SiriusContext::open_internal_connection(context);
-  auto& conn    = internal;
-
-  auto result = conn.Query("SELECT file_path, pos FROM read_parquet('" +
-                           escape_sql_string(delete_file_path) + "')");
-
-  if (!result || result->HasError()) {
-    throw std::runtime_error("[iceberg] Failed to read positional-delete file '" +
-                             delete_file_path +
-                             "': " + (result ? result->GetError() : "null result"));
-  }
-
-  while (true) {
-    auto chunk = result->Fetch();
-    if (!chunk || chunk->size() == 0) break;
-
-    for (duckdb::idx_t i = 0; i < chunk->size(); ++i) {
-      auto file_path = chunk->GetValue(0, i).ToString();
-      auto pos_val   = chunk->GetValue(1, i).GetValue<int64_t>();
-      out_map[file_path].push_back(pos_val);
-    }
-  }
+  read_parquet_delete_batches(
+    context,
+    duckdb::OpenFileInfo(delete_file_path),
+    {},
+    [](auto const& columns, uint64_t) {
+      std::vector<uint64_t> projection;
+      for (auto const& required : {std::string("file_path"), std::string("pos")}) {
+        std::optional<uint64_t> found;
+        for (uint64_t i = 0; i < columns.size(); ++i) {
+          if (duckdb::StringUtil::CIEquals(columns[i].name, required)) {
+            if (found) throw std::runtime_error("[iceberg] Ambiguous position-delete column");
+            found = i;
+          }
+        }
+        auto type = required == "pos" ? duckdb::LogicalType::BIGINT : duckdb::LogicalType::VARCHAR;
+        if (!found || columns[*found].type != type)
+          throw std::runtime_error(
+            "[iceberg] Position deletes require file_path VARCHAR and pos BIGINT");
+        projection.push_back(*found);
+      }
+      return projection;
+    },
+    [&](duckdb::DataChunk& chunk) {
+      for (duckdb::idx_t i = 0; i < chunk.size(); ++i) {
+        auto path = chunk.GetValue(0, i);
+        auto pos  = chunk.GetValue(1, i);
+        if (path.IsNull() || pos.IsNull() || pos.GetValue<int64_t>() < 0)
+          throw std::runtime_error("[iceberg] Invalid null or negative position delete");
+        out_map[path.GetValue<std::string>()].push_back(pos.GetValue<int64_t>());
+      }
+    });
 }
 
 struct equality_delete_read_result {
