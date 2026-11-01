@@ -510,7 +510,7 @@ op::scan::scan_contract_id read_view_registry::allocate_declined_scan(
                                           scan.contract_window_id,
                                           scan.contract_finalize_generation,
                                           scan.scan_node_id,
-                                          nullptr,
+                                          scan.bound_view,
                                           std::move(columns),
                                           {},
                                           {kind, connector.registry_profile},

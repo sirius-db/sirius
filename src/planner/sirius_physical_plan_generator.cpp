@@ -492,9 +492,9 @@ std::unique_ptr<sirius::op::scan::iceberg_ingestible_table_info> build_iceberg_t
   return info;
 }
 
-void prepare_iceberg_statement(sirius::op::sirius_physical_operator& root,
-                               sirius::operator_params const& params,
-                               duckdb::ClientContext& context)
+void prepare_scan_statement(sirius::op::sirius_physical_operator& root,
+                            sirius::operator_params const& params,
+                            duckdb::ClientContext& context)
 {
   using namespace sirius::op::scan;
   using namespace sirius::scan_manager;
@@ -505,6 +505,7 @@ void prepare_iceberg_statement(sirius::op::sirius_physical_operator& root,
       std::make_shared<iceberg_delete_discovery>();
   };
   std::vector<candidate> scans;
+  std::vector<preparation_request> requests;
   std::function<void(sirius::op::sirius_physical_operator&)> visit = [&](auto& node) {
     using type = sirius::op::SiriusPhysicalOperatorType;
     for (auto& child : node.children)
@@ -516,15 +517,20 @@ void prepare_iceberg_statement(sirius::op::sirius_physical_operator& root,
     }
     if (node.type != type::TABLE_SCAN) return;
     auto& scan = node.template Cast<sirius::op::sirius_physical_table_scan>();
+    if (auto const* connector = lookup_connector(scan.function, scan.bind_data.get(), context);
+        connector && connector->prepare) {
+      if (auto request = connector->prepare(scan, params, context))
+        requests.push_back(std::move(*request));
+    }
     if (scan.function.GetName() != "iceberg_scan") return;
     candidate c{&scan, {}};
     c.info = build_iceberg_table_info(scan, params, context, c.discovery.get());
     scans.push_back(std::move(c));
   };
   visit(root);
-  if (scans.empty()) return;
+  if (scans.empty() && requests.empty()) return;
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  if (!sirius_ctx) throw duckdb::InternalException("iceberg scan requires a SiriusContext");
+  if (!sirius_ctx) throw duckdb::InternalException("scan preparation requires a SiriusContext");
   struct remote_puffin {
     scan_contract_id contract;
     std::string path;
@@ -553,7 +559,6 @@ void prepare_iceberg_statement(sirius::op::sirius_physical_operator& root,
     remote_puffins.push_back({contract, dv.file_path, std::move(scheme), backend_available});
   };
   std::vector<scan_dv_count> counts;
-  std::vector<preparation_request> requests;
   bool qualified = true;
   for (auto const& c : scans) {
     if (c.discovery->positional_delete_files.empty()) validate_deletion_vector_claims(*c.discovery);
@@ -765,6 +770,48 @@ build_duckdb_native_table_info(sirius::op::sirius_physical_table_scan& scan_op,
  * @p mode selects membership-only or AST-plus-membership post-decode filtering. @p sirius_ctx,
  * when not null, observes compressed materialization and receives the dynamic-filter counters.
  */
+duckdb::unique_ptr<sirius::op::sirius_physical_operator> assemble_gpu_scan_leaf(
+  std::shared_ptr<sirius::op::scan::gpu_ingestible> ingestible,
+  const sirius::op::sirius_physical_table_scan& scan,
+  const sirius::operator_params& op_params,
+  sirius::op::scan::dynamic_filter_apply_mode mode,
+  duckdb::SiriusContext* sirius_ctx)
+{
+  auto dynamic_filters = scan.sirius_dynamic_filters;
+  if (dynamic_filters && !dynamic_filters->has_producers()) dynamic_filters.reset();
+  auto consumer =
+    dynamic_filters
+      ? sirius::op::scan::make_dynamic_filter_consumer(
+          dynamic_filters,
+          mode,
+          op_params.dynamic_filter_keep_threshold,
+          ingestible ? sirius::op::scan::scan_decode_bindings(*ingestible, scan.types.size())
+                     : std::vector<sirius::op::scan::binding>{},
+          sirius_ctx ? &sirius_ctx->get_dynamic_filter_stats() : nullptr)
+      : nullptr;
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> leaf =
+    duckdb::make_uniq<sirius::op::scan::sirius_gpu_scan_operator>(scan.types,
+                                                                  scan.estimated_cardinality,
+                                                                  std::move(ingestible),
+                                                                  scan.contract_id,
+                                                                  sirius_ctx,
+                                                                  scan.read_views,
+                                                                  consumer);
+  // Preserve propagated carriers; dynamic-filter targets are already native.
+  if (scan.has_physical_overrides()) { leaf->set_physical_types(scan.get_physical_types()); }
+
+  if (dynamic_filters) {
+    auto dynamic_filter_op = duckdb::make_uniq<sirius::op::scan::sirius_physical_dynamic_filter>(
+      scan.types, scan.estimated_cardinality, std::move(consumer));
+    if (scan.has_physical_overrides()) {
+      dynamic_filter_op->set_physical_types(scan.get_physical_types());
+    }
+    dynamic_filter_op->children.push_back(std::move(leaf));
+    leaf = std::move(dynamic_filter_op);
+  }
+  return leaf;
+}
+
 template <typename InfoT>
 duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_gpu_scan_leaf(
   std::unique_ptr<InfoT> info,
@@ -774,10 +821,6 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_gpu_scan_leaf(
   duckdb::SiriusContext* sirius_ctx)
 {
   auto dynamic_filters = scan.sirius_dynamic_filters;
-  // Join construction registered every producer before collect_semantic_lineage(). Its
-  // no-producer check and this normalization therefore agree. An unpublished producer still
-  // blocks metadata-only reads; has_filters() cannot be used here. Direct ingestible callers
-  // may register later and must retain their non-null channel instead of normalizing it there.
   if (dynamic_filters && !dynamic_filters->has_producers()) { dynamic_filters.reset(); }
   // Parquet also prunes with its own snapshot of the channel.
   if constexpr (requires { info->sirius_dynamic_filters; }) {
@@ -813,37 +856,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_gpu_scan_leaf(
       return empty;
     }
   }
-  auto consumer =
-    dynamic_filters
-      ? sirius::op::scan::make_dynamic_filter_consumer(
-          dynamic_filters,
-          mode,
-          op_params.dynamic_filter_keep_threshold,
-          ingestible ? sirius::op::scan::scan_decode_bindings(*ingestible, scan.types.size())
-                     : std::vector<sirius::op::scan::binding>{},
-          sirius_ctx ? &sirius_ctx->get_dynamic_filter_stats() : nullptr)
-      : nullptr;
-  duckdb::unique_ptr<sirius::op::sirius_physical_operator> leaf =
-    duckdb::make_uniq<sirius::op::scan::sirius_gpu_scan_operator>(scan.types,
-                                                                  scan.estimated_cardinality,
-                                                                  std::move(ingestible),
-                                                                  scan.contract_id,
-                                                                  sirius_ctx,
-                                                                  scan.read_views,
-                                                                  consumer);
-  // Preserve propagated carriers; dynamic-filter targets are already native.
-  if (scan.has_physical_overrides()) { leaf->set_physical_types(scan.get_physical_types()); }
-
-  if (dynamic_filters) {
-    auto dynamic_filter_op = duckdb::make_uniq<sirius::op::scan::sirius_physical_dynamic_filter>(
-      scan.types, scan.estimated_cardinality, std::move(consumer));
-    if (scan.has_physical_overrides()) {
-      dynamic_filter_op->set_physical_types(scan.get_physical_types());
-    }
-    dynamic_filter_op->children.push_back(std::move(leaf));
-    leaf = std::move(dynamic_filter_op);
-  }
-  return leaf;
+  return assemble_gpu_scan_leaf(std::move(ingestible), scan, op_params, mode, sirius_ctx);
 }
 
 // A leaf reference uses reader input identity, never the post-projection output index.
@@ -1179,6 +1192,14 @@ void certify_table_scan(duckdb::unique_ptr<sirius::op::sirius_physical_operator>
   using namespace sirius::op::scan;
   ++contract_provenance.certification_scan_index;
   if (scan.pre_declined) {
+    // A connector-owned capture can retain its original semantic binding without
+    // resolving a file inventory. Keep it even when its GPU profile is closed:
+    // correspondence must not lose the snapshot of a refused scan occurrence.
+    // Other sources keep the existing pre-capture refusal order.
+    if (entry->capture) {
+      scan.bound_view = std::make_shared<bound_read_view const>(
+        entry->capture(scan.function, scan.bind_data.get(), context));
+    }
     scan.contract_id = scan.read_views->allocate_declined_scan(scan, *entry);
     certification_result result;
     result.verdict     = scan.pre_declined->verdict;
@@ -1892,6 +1913,18 @@ bool compressed_materialization_active(duckdb::ClientContext& context)
 
 }  // namespace
 
+duckdb::unique_ptr<op::sirius_physical_operator> lower_prepared_scan(
+  std::shared_ptr<op::scan::gpu_ingestible> ingestible,
+  op::sirius_physical_table_scan const& scan,
+  operator_params const& params,
+  duckdb::ClientContext& context,
+  op::scan::dynamic_filter_apply_mode mode)
+{
+  if (!ingestible) throw std::logic_error("prepared scan has no materializer");
+  auto runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  return assemble_gpu_scan_leaf(std::move(ingestible), scan, params, mode, runtime.get());
+}
+
 duckdb::unique_ptr<sirius::op::sirius_physical_operator> lower_native_scan(
   sirius::op::sirius_physical_table_scan& scan,
   sirius::operator_params const& op_params,
@@ -2230,7 +2263,7 @@ void sirius_physical_plan_generator::insert_gpu_pipeline_operators(
   if (contract_provenance.injections.pause_after_certify_ms)
     std::this_thread::sleep_for(
       std::chrono::milliseconds{contract_provenance.injections.pause_after_certify_ms});
-  prepare_iceberg_statement(*plan, op_params, context);
+  prepare_scan_statement(*plan, op_params, context);
   insert_gpu_pipeline_operators_recursive(
     plan, op_params, context, sirius_ctx.get(), contract_provenance);
 }
