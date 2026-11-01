@@ -33,6 +33,8 @@ struct arrow_import_binding {
   std::function<void(owned_arrow_scan_info const&)> validate_provenance;
   std::shared_ptr<scan_manager::preparation_admission> admission;
   std::shared_ptr<arrow_input_gate> gate;
+  // For a shared contract, use the same preparation_identity as every sibling
+  // Arrow source and retained slot. Use the default local sequence only for an isolated contract.
   std::function<uint64_t()> next_unit_id;
   bool owns_admission = true;
   // A mixed outer scan can supply its own single empty carrier instead.
