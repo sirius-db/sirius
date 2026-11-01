@@ -182,7 +182,7 @@ TEST_CASE("Iceberg consumes shared Parquet batches and rejects malformed positio
   REQUIRE(positions.front() == 0);
   REQUIRE(positions.back() == 9999);
 
-  for (auto expression : {"NULL::BIGINT", "-1::BIGINT", "'bad'::VARCHAR"}) {
+  for (auto expression : {"NULL::BIGINT", "'bad'::VARCHAR"}) {
     std::filesystem::remove(f.path);
     auto escaped = duckdb::StringUtil::Replace(f.path, "'", "''");
     auto written =

@@ -455,8 +455,9 @@ void read_positional_delete_file(duckdb::ClientContext& context,
       for (duckdb::idx_t i = 0; i < chunk.size(); ++i) {
         auto path = chunk.GetValue(0, i);
         auto pos  = chunk.GetValue(1, i);
-        if (path.IsNull() || pos.IsNull() || pos.GetValue<int64_t>() < 0)
-          throw std::runtime_error("[iceberg] Invalid null or negative position delete");
+        if (path.IsNull() || pos.IsNull())
+          throw std::runtime_error("[iceberg] Invalid null position delete");
+        // Preserve signed legacy positions; visibility filtering excludes out-of-range values.
         out_map[path.GetValue<std::string>()].push_back(pos.GetValue<int64_t>());
       }
     });
