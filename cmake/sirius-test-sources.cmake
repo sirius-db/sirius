@@ -373,6 +373,8 @@ set(TEST_SOURCES
     test/cpp/scan/test_shared_materializer.cpp
     test/cpp/scan/test_field_mapper.cpp
     test/cpp/scan/test_arrow_import_resources.cpp
+    test/cpp/scan/test_arrow_input_profile.cpp
+    test/cpp/scan/test_arrow_qualified_import.cpp
     test/cpp/scan/test_composite_scan_driver.cpp
     test/cpp/scan/test_arrow_import_driver.cpp
     test/cpp/scan/test_scan_filter_cast_ranges.cpp

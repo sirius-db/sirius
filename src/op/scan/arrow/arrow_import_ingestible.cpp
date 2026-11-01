@@ -45,14 +45,22 @@ struct input_claim {
   std::shared_ptr<arrow_input_gate> gate;
   sm::unit_key key;
   sm::w_permit permit;
-  bool acquired = false;
+  bool acquired   = false;
+  bool holds_gate = false;
+  void release_gate() noexcept
+  {
+    if (holds_gate) {
+      holds_gate   = false;
+      gate->active = false;
+      gate->wake();
+    }
+  }
   ~input_claim()
   {
     if (acquired) {
       ledger->retire_unit(key);
       permit.release();
-      gate->active = false;
-      gate->wake();
+      release_gate();
     }
   }
 };
@@ -155,18 +163,34 @@ struct arrow_import_ingestible::impl {
             binding.program.input_types->at(binding.output_columns[i]))
         throw std::invalid_argument("Arrow driver output type mismatch");
     limits = producer->limits();
+    producer->bind_allocation_granularity(binding.admission->decision.allocation_granularity);
     if (limits.max_rows < 0 || limits.max_rows > std::numeric_limits<cudf::size_type>::max() ||
         limits.envelope.temporary.empty())
-      throw std::invalid_argument("Arrow producer requires finite input bounds");
+      throw transparent::classified_execution_error(
+        transparent::late_failure_cause::resource,
+        "arrow_envelope_unavailable: Arrow producer requires finite input bounds");
     for (auto n : limits.envelope.temporary) {
-      if (n > UINT64_MAX - bytes) throw std::overflow_error("Arrow envelope overflow");
+      if (n > UINT64_MAX - bytes)
+        throw transparent::classified_execution_error(
+          transparent::late_failure_cause::resource,
+          "arrow_envelope_unavailable: Arrow envelope overflow");
       bytes += n;
     }
     temporary_limit =
       limits.envelope.temporary_charge(binding.admission->decision.allocation_granularity);
     if (!bytes || temporary_limit > binding.admission->decision.w ||
+        producer->minimum_permits() > binding.admission->decision.n_permits ||
         limits.envelope.retained > binding.admission->decision.sigma_retained)
-      throw std::invalid_argument("Arrow producer exceeds sealed admission");
+      throw transparent::classified_execution_error(
+        transparent::late_failure_cause::resource,
+        "arrow_envelope_unavailable: Arrow producer exceeds sealed admission");
+    if (binding.program.required_visibility && !binding.program.required_visibility->empty())
+      throw std::invalid_argument("Arrow driver cannot claim file visibility requirements");
+    binding.program.required_visibility = std::make_shared<visibility_bindings const>();
+    if (!binding.program.input_layout) binding.program.input_layout = std::make_shared<int>(0);
+    if (!binding.program.output_layout) binding.program.output_layout = std::make_shared<int>(1);
+    if (binding.program.arrow_schema)
+      validate_arrow_binding(*binding.program.arrow_schema, binding.program);
     if (!binding.gate) binding.gate = std::make_shared<arrow_input_gate>();
     info.contract_id = binding.program.contract;
     info.profiles    = binding.profiles;
@@ -177,10 +201,19 @@ struct arrow_import_ingestible::impl {
   void check_stop() const
   {
     if (state->stopped) throw duckdb::InterruptException();
+    producer->check_status();
   }
   std::unique_ptr<scan_info> produce(std::shared_ptr<input_claim> const& claim,
                                      sm::preparation_stop_token stop)
   {
+    struct serial_read {
+      input_claim* claim;
+      bool release;
+      ~serial_read()
+      {
+        if (release) claim->release_gate();
+      }
+    } serial{claim.get(), producer->releases_gate_after_next()};
     if (stop.stop_requested())
       throw std::system_error(std::make_error_code(std::errc::operation_canceled));
     check_stop();
@@ -204,8 +237,8 @@ struct arrow_import_ingestible::impl {
     }
     auto input = std::get<produced_arrow_input>(std::move(result));
     try {
-      if (!input.batch || input.batch->row_count() > limits.max_rows)
-        throw std::invalid_argument("Arrow producer exceeded its declared row bound");
+      if (!input.batch)
+        throw std::invalid_argument("arrow_layout_unsupported: Arrow producer returned no batch");
       input.batch->validate_for(binding.program);
     } catch (transparent::arrow_schema_drift_error const& error) {
       if (auto counters = info.profiles->counters)
@@ -217,15 +250,29 @@ struct arrow_import_ingestible::impl {
       throw transparent::classified_execution_error(transparent::late_failure_cause::physical_input,
                                                     error.what());
     }
+    if (input.batch->row_count() > limits.max_rows)
+      throw transparent::classified_execution_error(
+        transparent::late_failure_cause::resource,
+        "arrow_batch_too_large: Arrow producer exceeded its declared row bound");
+    auto host_bytes = claim->ledger->charged_bytes(claim->permit);
+    if (input.batch->source_profile()) {
+      auto estimate = input.batch->estimate();
+      if (host_bytes > bytes || estimate.total() - estimate.staging > bytes - host_bytes)
+        throw transparent::classified_execution_error(
+          transparent::late_failure_cause::resource,
+          "arrow_batch_too_large: source exceeds its admitted envelope");
+      host_bytes += estimate.retained + estimate.control;
+    }
     auto result_info =
       std::make_unique<owned_arrow_scan_info>(std::move(input.batch),
                                               info.contract_id,
                                               binding.program.generation,
                                               claim->key.unit_id,
                                               info.profiles,
-                                              claim->ledger->charged_bytes(claim->permit),
+                                              host_bytes,
                                               binding.read_identity,
-                                              claim);
+                                              claim,
+                                              binding.program.arrow_schema ? bytes : 0);
     auto deps = std::vector(result_info->dependencies().begin(), result_info->dependencies().end());
     deps[0].visibility = std::move(input.provenance);
     result_info->set_contract_payload(
@@ -275,6 +322,7 @@ arrow_import_ingestible::metadata_claim arrow_import_ingestible::try_claim_split
     claim->key, impl_->limits.envelope.retained, impl_->temporary_limit);
   if (!claim->permit) return sm::preparation_pending{};
   claim->acquired     = true;
+  claim->holds_gate   = true;
   claim->gate->active = true;
   impl_->pending_identity.reset();
   ++impl_->sequence;
@@ -393,6 +441,10 @@ scan::filtered_table arrow_import_ingestible::materialize_metadata_to_table(
       imported->batch =
         scan::import_arrow_host(arrow.batch(), impl_->binding.program, imported->lane, mr);
     }
+  } catch (std::invalid_argument const& error) {
+    quiesce_import();
+    throw transparent::classified_execution_error(transparent::late_failure_cause::physical_input,
+                                                  error.what());
   } catch (...) {
     // Import unwinding may enqueue output frees after commit recovery. Always
     // establish another barrier while the caller's output reservation is alive.
@@ -406,7 +458,72 @@ scan::filtered_table arrow_import_ingestible::materialize_metadata_to_table(
     counters->arrow_rows_imported += imported->batch.rows;
   }
   impl_->check_stop();
-  auto batch = std::move(imported->batch);
+  auto& batch               = imported->batch;
+  batch.layout              = impl_->binding.program.input_layout;
+  batch.visibility_complete = true;  // Ordinary Arrow input has no file-delete requirements.
+  scan_execution_record record;
+  record.contract                = batch.contract;
+  record.generation              = batch.generation;
+  record.producer                = execution_record_producer::arrow_import;
+  record.authoritative           = true;
+  record.logical_schema_complete = true;
+  record.visibility_complete     = true;
+  record.layout                  = batch.layout;
+  record.layout_width            = batch.table.n_columns();
+  filtered_table result{std::move(batch.table), filter_state::UNFILTERED};
+  result.execution           = std::move(record);
+  result.required_visibility = impl_->binding.program.required_visibility;
+  return result;
+}
+
+std::unique_ptr<cudf::table> arrow_import_ingestible::post_filter_and_project(
+  scan::filtered_table&& input,
+  cucascade::memory::memory_space const& space,
+  ::cuda::stream_ref stream,
+  bool like,
+  std::shared_ptr<sirius::like_multiliteral_cache const> cache,
+  std::unique_ptr<cudf::column>*,
+  std::span<size_t const> elided,
+  expression_query_policy policy)
+{
+  if (!elided.empty()) throw std::invalid_argument("Arrow import elision is not qualified");
+  impl_->check_stop();
+  auto const& program = impl_->binding.program;
+  if (!input.execution || !input.execution->authoritative ||
+      input.execution->producer != execution_record_producer::arrow_import ||
+      input.execution->contract != program.contract ||
+      input.execution->generation != program.generation || !input.execution->layout_width ||
+      *input.execution->layout_width != input.table.n_columns() ||
+      input.execution->layout !=
+        (input.execution->projection_complete ? program.output_layout : program.input_layout) ||
+      !input.execution->logical_schema_complete || !input.execution->visibility_complete ||
+      input.execution->positions != row_position_state::none ||
+      !input.execution->visibility_applied.empty() || !input.required_visibility ||
+      input.required_visibility != program.required_visibility)
+    throw std::invalid_argument("Arrow execution record does not match its certified input");
+  auto const& record = *input.execution;
+  materialized_batch batch;
+  batch.rows                    = input.table.num_rows();
+  batch.table                   = std::move(input.table);
+  batch.contract                = record.contract;
+  batch.generation              = record.generation;
+  batch.logical_schema_complete = record.logical_schema_complete;
+  batch.visibility_complete     = record.visibility_complete;
+  batch.projection_complete     = record.projection_complete;
+  batch.whole_static_complete   = record.whole_static_complete;
+  batch.predicates              = record.predicates;
+  batch.layout                  = record.layout;
+  batch.row_count_carrier =
+    (batch.projection_complete ? program.output_types.empty() : program.input_types->empty()) &&
+    batch.rows;
+  validate_materialized_batch(batch, program);
+  if (batch.projection_complete && !batch.whole_static_complete)
+    throw std::invalid_argument("Arrow assembled output has unfinished predicates");
+  if (auto counters = impl_->info.profiles->counters;
+      counters && counters->track_units && counters->scan_execution_for_testing)
+    counters->scan_execution_for_testing(true, record);
+  auto mr             = space.get_default_allocator();
+  auto const unjoined = scan::detail::prepare_unjoined_failure();
   struct selection_state {
     scan::owning_table_view input;
     std::shared_ptr<sirius::ast::node const> predicate;
@@ -451,20 +568,22 @@ scan::filtered_table arrow_import_ingestible::materialize_metadata_to_table(
     scan::detail::retire_reads(state, stream, unjoined);
     throw;
   }
-  return {std::move(batch.table), scan::filter_state::ROW_FILTERED_AND_PROJECTED};
-}
-std::unique_ptr<cudf::table> arrow_import_ingestible::post_filter_and_project(
-  scan::filtered_table&& input,
-  cucascade::memory::memory_space const& space,
-  ::cuda::stream_ref stream,
-  bool,
-  std::shared_ptr<sirius::like_multiliteral_cache const>,
-  std::unique_ptr<cudf::column>*,
-  std::span<size_t const> elided,
-  expression_query_policy)
-{
-  if (!elided.empty()) throw std::invalid_argument("Arrow import elision is not qualified");
-  input.table.materialize(stream, space.get_default_allocator());
-  return input.table.release(stream, space.get_default_allocator());
+  scan_execution_record completed;
+  completed.contract                = batch.contract;
+  completed.generation              = batch.generation;
+  completed.producer                = execution_record_producer::arrow_import;
+  completed.authoritative           = true;
+  completed.predicates              = batch.predicates;
+  completed.whole_static_complete   = batch.whole_static_complete;
+  completed.logical_schema_complete = batch.logical_schema_complete;
+  completed.visibility_complete     = batch.visibility_complete;
+  completed.projection_complete     = batch.projection_complete;
+  completed.layout                  = batch.layout;
+  completed.layout_width            = batch.table.n_columns();
+  if (auto counters = impl_->info.profiles->counters;
+      counters && counters->track_units && counters->scan_execution_for_testing)
+    counters->scan_execution_for_testing(true, completed);
+  batch.table.materialize(stream, mr);
+  return batch.table.release(stream, mr);
 }
 }  // namespace sirius::op::scan
