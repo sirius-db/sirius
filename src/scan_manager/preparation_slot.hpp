@@ -20,9 +20,8 @@
 namespace sirius::scan_manager {
 // Register one retained budget for a scan whose files are discovered lazily.
 // A file keeps its permit until every consumer of its visibility has finished.
-// Register a fixed set of slots and reuse their permits across files. Retirement
-// releases the account when unused, but does not refund the ledger's cumulative
-// registered allowance; constructing a fresh slot per file exhausts that allowance.
+// Reuse permits across files. Retirement returns the registered allowance only
+// after the last retained allocation and permit are released.
 class preparation_slot {
  public:
   preparation_slot(std::shared_ptr<scan_manager::preparation_ledger> ledger,

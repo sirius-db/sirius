@@ -677,21 +677,48 @@ TEST_CASE("Abandoned mapped preparation jobs release both operations without run
   CHECK(output_weak.expired());
 }
 
-TEST_CASE("Retired slots do not refund the cumulative registered allowance",
+TEST_CASE("Retired slots return allowance after the last allocation and permit",
           "[composite_scan][preparation_ledger]")
 {
+  bool release_permit_first = GENERATE(false, true);
+  CAPTURE(release_permit_first);
   sm::test::test_reservation_provider provider;
   auto ledger = std::make_shared<sm::preparation_ledger>(provider);
   std::vector<sm::scan_envelope> scans{{{{{8}, 16}}, {}, true, 1}};
   REQUIRE(ledger->admit(scans, sm::memory_space_id{cucascade::memory::Tier::HOST, 0}).deferred);
-  {
-    sm::preparation_slot slot(ledger, {77, 0}, 16);
-    auto permit = slot.try_acquire();
-    REQUIRE(permit);
-    auto bytes = ledger->allocator(permit).allocate_retained(16);
+  auto slot   = std::make_unique<sm::preparation_slot>(ledger, sm::unit_key{77, 0}, 16);
+  auto permit = slot->try_acquire();
+  REQUIRE(permit);
+  auto bytes          = ledger->allocator(permit).allocate_retained(16);
+  auto check_reserved = [&] {
+    CHECK(ledger->tracked_units() == 1);
+    CHECK_THROWS_WITH(sm::preparation_slot(ledger, {77, 1}, 16),
+                      "unit retained budgets exceed admission");
+  };
+  check_reserved();
+  slot.reset();
+  check_reserved();
+  if (release_permit_first) {
+    permit.release();
+    check_reserved();
+    bytes.release();
+  } else {
+    bytes.release();
+    check_reserved();
+    permit.release();
   }
   CHECK(ledger->tracked_units() == 0);
+  CHECK(ledger->permits_in_flight() == 0);
   CHECK(provider.seen->allocated_bytes == 0);
-  CHECK_THROWS_WITH(sm::preparation_slot(ledger, {77, 1}, 16),
-                    "unit retained budgets exceed admission");
+  // Repeated registration must reuse the returned allowance, not accumulate it.
+  for (uint64_t id = 1; id <= 3; ++id) {
+    sm::preparation_slot next(ledger, {77, id}, 16);
+    auto next_permit = next.try_acquire();
+    REQUIRE(next_permit);
+    auto next_bytes = ledger->allocator(next_permit).allocate_retained(16);
+    CHECK(ledger->charged_bytes(next.key()) == 16);
+  }
+  CHECK(ledger->tracked_units() == 0);
+  CHECK(ledger->permits_in_flight() == 0);
+  CHECK(provider.seen->allocated_bytes == 0);
 }
