@@ -153,8 +153,7 @@ std::shared_ptr<owned_arrow_batch> copy_input(offered_arrow_input const& input,
         std::memcpy(chars, static_cast<std::byte const*>(source.buffers[2]) + first, bytes);
       for (uint64_t row = 0; rows && row <= rows; ++row) {
         auto offset = detail::arrow_string_window_size(first, original[begin + row]);
-        // Preserve the Arrow storage format in the detached input. The importer
-        // separately normalizes both formats to its INT32 destination offsets.
+        // Preserve source offset width; the importer rebases to INT32.
         if (original.width() == sizeof(int64_t))
           reinterpret_cast<int64_t*>(offsets)[row] = offset;
         else
@@ -217,8 +216,9 @@ struct arrow_push_queue::impl {
   std::array<allocation_set, 2> live;
   allocation_set offered;
   struct input_credit {
+    static constexpr size_t offered_index = 2;
     std::shared_ptr<impl> state;
-    size_t index = 0;
+    size_t index = offered_index;
     bool armed   = false;
     ~input_credit()
     {
@@ -226,8 +226,13 @@ struct arrow_push_queue::impl {
       sm::preparation_wakeup wake;
       {
         std::lock_guard lock(state->mutex);
-        state->live[index] = {};
-        --state->accepted;
+        if (index == offered_index) {
+          state->offered   = {};
+          state->slot_held = false;
+        } else {
+          state->live[index] = {};
+          --state->accepted;
+        }
         wake = state->wake;
       }
       state->cv.notify_all();
@@ -280,8 +285,7 @@ struct arrow_push_queue::impl {
           program.decimal_precisions[i] != precision)
         throw std::invalid_argument("arrow_schema_drift: Arrow offered decimal precision drift");
     }
-    // An independently malformed root must never become a resource refusal just
-    // because it also exceeds a configured admission limit.
+    // Classify malformed input before admission limits.
     if (value.retained_bytes > bounds.max_offered_bytes || value.array->length > bounds.max_rows ||
         copy_size(value, types) > aligned(bounds.max_copy_bytes) ||
         arrow_import_staging_bytes(*value.array, types) > bounds.staging_bytes)
@@ -308,7 +312,10 @@ arrow_push_queue::arrow_push_queue(materialization_program p,
 }
 arrow_push_queue::~arrow_push_queue() { cancel(); }
 arrow_push_queue::offered_slot::offered_slot(offered_slot&& other) noexcept
-  : state_(std::move(other.state_)), input_(std::move(other.input_)), status_(other.status_)
+  : state_(std::move(other.state_)),
+    credit_(std::move(other.credit_)),
+    input_(std::move(other.input_)),
+    status_(other.status_)
 {
 }
 arrow_push_queue::offered_slot& arrow_push_queue::offered_slot::operator=(
@@ -317,6 +324,7 @@ arrow_push_queue::offered_slot& arrow_push_queue::offered_slot::operator=(
   if (this != &other) {
     reset();
     state_  = std::move(other.state_);
+    credit_ = std::move(other.credit_);
     input_  = std::move(other.input_);
     status_ = other.status_;
   }
@@ -325,15 +333,9 @@ arrow_push_queue::offered_slot& arrow_push_queue::offered_slot::operator=(
 arrow_push_queue::offered_slot::~offered_slot() { reset(); }
 void arrow_push_queue::offered_slot::reset() noexcept
 {
-  input_.reset();  // Foreign callbacks and leases, before returning the offered permit.
-  if (!state_) return;
-  auto state = std::move(state_);
-  {
-    std::lock_guard lock(state->mutex);
-    state->offered   = {};
-    state->slot_held = false;
-  }
-  state->cv.notify_all();
+  input_.reset();
+  credit_.reset();  // A retained root keeps its offered credit after failed synchronization.
+  state_.reset();
 }
 void arrow_push_queue::offered_slot::set_input(ArrowSchema& schema,
                                                ArrowArray& array,
@@ -343,10 +345,11 @@ void arrow_push_queue::offered_slot::set_input(ArrowSchema& schema,
 {
   if (!state_ || input_) throw std::logic_error("Arrow root needs an unused offered slot");
   auto source = std::make_shared<arrow_source_profile const>(std::move(profile));
-  auto input  = std::make_shared<owned_arrow_batch>(
-    schema, array, std::move(owner), *std::pmr::null_memory_resource(), std::move(lengths), source);
-  input_ = std::move(input);
   impl::allocation_set allocation{source->allocations, source->memory, source->device, 0, true};
+  auto input = std::make_shared<owned_arrow_batch>(
+    schema, array, std::move(owner), *std::pmr::null_memory_resource(), std::move(lengths), source);
+  input->bind_credit(credit_);
+  input_ = std::move(input);
   std::lock_guard lock(state_->mutex);
   state_->offered = std::move(allocation);
 }
@@ -360,8 +363,12 @@ arrow_push_queue::offered_slot arrow_push_queue::acquire_offered_slot()
     lock, [&] { return !impl_->slot_held || impl_->terminal() != capacity_result::available; });
   result.status_ = impl_->terminal();
   if (result.status_ == capacity_result::available) {
+    auto credit      = std::make_shared<impl::input_credit>();
+    credit->state    = impl_;
+    credit->armed    = true;
     impl_->slot_held = true;
     result.state_    = impl_;
+    result.credit_   = std::move(credit);
   }
   return result;
 }
@@ -371,8 +378,7 @@ arrow_push_queue::offer_outcome arrow_push_queue::offer(offered_slot& slot)
     throw std::logic_error("Arrow offer has no root/permit");
   arrow_input_estimate estimate;
   impl::allocation_set allocation;
-  auto credit   = std::make_shared<impl::input_credit>();
-  credit->state = impl_;
+  auto credit = std::static_pointer_cast<impl::input_credit>(slot.credit_);
   try {
     slot.input_->validate_for(impl_->program);
     estimate     = slot.input_->estimate();
@@ -430,16 +436,15 @@ arrow_push_queue::offer_outcome arrow_push_queue::offer(offered_slot& slot)
       impl_->offered = std::move(allocation);
       return offer_outcome::capacity_wait;
     }
-    auto index    = impl_->live[0].occupied ? 1U : 0U;
-    credit->index = index;
-    slot.input_->bind_credit(credit);
+    auto index                                        = impl_->live[0].occupied ? 1U : 0U;
+    credit->index                                     = index;
     impl_->live[index]                                = std::move(allocation);
     impl_->pending[(impl_->head + impl_->queued) % 2] = std::move(slot.input_);
     ++impl_->queued;
     ++impl_->accepted;
-    credit->armed    = true;
     impl_->offered   = {};
     impl_->slot_held = false;
+    slot.credit_.reset();
     slot.state_.reset();
     wake = impl_->wake;
   }

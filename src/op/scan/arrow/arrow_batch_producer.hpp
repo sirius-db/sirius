@@ -23,9 +23,7 @@
 #include <variant>
 
 namespace sirius::op::scan {
-// Shared by producers whose retained inputs must not occupy two temporary permits.
-// One coordinator performs claims through a shared gate. Bind wake before execution;
-// do not rebind it while claims or final-owner releases can run.
+// Serializes reader entry. Bind wake before claims or final-owner releases can run.
 struct arrow_input_gate {
   std::atomic<bool> active{false};
   scan_manager::preparation_wakeup wake;
@@ -77,13 +75,9 @@ class arrow_batch_producer {
 // Accepted roots retain temporary permits while downstream consumers run.
 scan_manager::scan_envelope arrow_preparation_envelope(arrow_batch_producer const&);
 
-// Views and their complete backing must remain immutable and readable until the
-// owner is released. retained_bytes includes parent extents and control storage,
-// not just the selected slice. Final release may occur on any retaining thread,
-// including the worker or cancelling thread. Owners and callbacks must be thread-neutral;
-// there is no submitting-thread or affine reclamation handshake.
-// A false offer result does not join an in-progress copy: retained views and backing
-// must remain readable and immutable until their last retained use ends.
+// Legacy immutable views: retained_bytes includes full parents and control storage.
+// Owners/callbacks must be thread-neutral. A false offer does not join an active copy;
+// backing stays readable until its final retained use.
 struct offered_arrow_input {
   ArrowSchema const* schema;
   ArrowArray const* array;
@@ -97,8 +91,7 @@ struct arrow_push_limits {
   uint64_t max_copy_bytes;
   uint64_t staging_bytes;
 };
-// One slot across all submitting threads. Only an external thread may wait in
-// offer(), holding no engine lock/lease needed by consumers to return capacity.
+// Waiters must hold no engine resource needed by consumers to return capacity.
 class arrow_push_queue final : public arrow_batch_producer {
   struct impl;
 
@@ -106,8 +99,7 @@ class arrow_push_queue final : public arrow_batch_producer {
   arrow_push_queue(materialization_program,
                    arrow_push_limits,
                    std::function<void(std::exception_ptr)> report_failure);
-  // The planner passes operator_params::scan_task_batch_size unchanged here.
-  // Q=2 and the single offered slot are fixed, not user tuning parameters.
+  // Fixed Q=2 plus one offered slot; bytes use the existing scan_task_batch_size.
   arrow_push_queue(materialization_program,
                    uint64_t scan_task_batch_size,
                    std::function<void(std::exception_ptr)> report_failure);
@@ -134,6 +126,7 @@ class arrow_push_queue final : public arrow_batch_producer {
     friend class arrow_push_queue;
     void reset() noexcept;
     std::shared_ptr<impl> state_;
+    std::shared_ptr<void> credit_;
     std::shared_ptr<owned_arrow_batch> input_;
     capacity_result status_ = capacity_result::closed;
   };

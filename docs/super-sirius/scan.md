@@ -786,107 +786,77 @@ Two reusable entry points additionally exercise this finish contract:
   reserves decoded memory plus `additional_bytes()` for each admitted run, including
   all results retained in the returned vector. The production Iceberg adapter uses
   the same mapper under its qualified `iceberg_flat_v1` rules.
-- `import_arrow_host()` accepts an owned Arrow C Data tree, its bound input schema,
-  task memory resource, and retirement lane. The qualified flat profile accepts booleans,
-  signed/unsigned integers, FLOAT32/64, UTF8/large UTF8, DATE32, timestamps without
-  timezone in seconds, milliseconds, microseconds or nanoseconds, and DECIMAL128
-  (precision 1–38, with a scale whose negation fits cuDF's signed 32-bit scale).
-  It refuses nested, dictionary, extension, binary and view columns. The top-level
-  record-batch struct is a wrapper, not a nested column.
-  Timestamp units are preserved. Decimal imports preserve their unscaled integers
-  in a DECIMAL128 carrier, including negative scales and scales greater than precision.
-  The planning-owned `arrow_bound_schema` fixes each field's name, nullability,
-  Arrow storage format and cuDF destination type before the first root. An
-  `arrow_source_profile` describes device, pinned-host or pageable-host payloads,
-  retained allocation identities/base addresses/extents, per-buffer byte spans,
-  aliases, selected string windows, and source readiness. A completion declaration
-  or retained CUDA event is mandatory, as are allocator/plugin lifetime leases.
-  Schema/array descriptors and
-  metadata must be readable producer-owned host C Data memory. For every non-null metadata
-  buffer on the root or a child schema, the producer supplies a trusted readable byte
-  length in `arrow_metadata_lengths` and keeps that memory alive through import.
-  Arrow C Data carries no allocation extents: a raw pointer, lengths encoded inside
-  metadata, or `strnlen` cannot establish its readable range, and copying from an
-  unknown range cannot establish one either. The consumer rejects non-null metadata
-  without a trusted length and parses it only within that buffer's supplied bound.
-  The consumer owns extension/profile and bound-schema checks, admission, publication,
-  cancellation, and ownership/retirement. The producer must detach statement-affine
-  callbacks before ownership transfer. Input/staging capacity remains owned through
-  retirement, even if import throws. The caller reserves output/temporary memory and
-  drains the lane.
-  The conversion leaf incorporates the checked host normalization from
-  [#2216](https://github.com/sirius-db/sirius/pull/2216), whose original helper was
-  extracted from [#1965](https://github.com/sirius-db/sirius/pull/1965). It checks the
-  selected host payload before conversion. Device payload validation runs on the
-  assigned task stream, returning only bounded validation status to the host;
-  no device payload takes a host staging path. Conversion builds owning cuDF columns with the
-  supplied device resource and lane stream, without intermediate cuDF Arrow import
-  or decimal casts. Device fixed-width values/characters use D2D copies; boolean
-  expansion, masks and string rebasing use kernels. Pinned-host values use H2D copies.
-  Pageable-host values first use the ledger's charged pinned arena. Both host paths
-  normalize boolean bytes, offsets and masks in that arena. A host readiness event
-  is joined before CPU inspection; device reads wait on it in the task stream.
-  Decimal payloads must fit their declared precision; the output
-  remains DECIMAL128, and zero-column batches retain their separate row count.
-  `owned_arrow_batch` requires an explicit staging PMR. Boolean bytes, rebased UTF8/large UTF8
-  offsets and selected validity bits use that resource; roots, capacity and staging
-  stay retained on the lane until completion, including post-enqueue failures. The
-  capacity owner must keep the PMR alive until those staging buffers are destroyed.
-  An absent bitmap with unknown null count is treated as all-valid; positive null
-  counts without a bitmap are refused. String sources retain their declared 32-bit
-  or 64-bit offset width through the push queue's detached copy. Import rebases the
-  selected window into INT32 destination offsets and refuses a selected character
-  count exceeding that representation before GPU allocation; a large parent origin
-  alone does not make a small selected window unrepresentable. No decimal rescaling
-  is performed. Metadata semantics and the other consumer responsibilities above remain
-  unchanged. Qualified device validation joins the task stream, never the device;
-  neither a
-  returned table nor an exception permits releasing pending inputs or replaying a
-  query before a successful attempt-level drain. A failed drain retains ownership,
-  not permission to release it. After output destruction/unwinding, the caller must
-  call `lane.quiesce()` even if `lane.idle()` or input retirement already completed:
-  commit-error recovery may precede subsequently queued output frees. The output
-  allocator and its backing reservation must outlive that final barrier.
-  No CPU/GPU overlap or throughput guarantee is made. The older trusted-host
-  entry point remains available without a source profile; new bounded push
-  producers use the qualified binding and charged arena.
-  `materialize_arrow_stream()` is the internal sequential verifier above this
-  single-batch importer. Its source returns independently owned batches with a
-  contiguous sequence, declared row/byte envelope, and explicit `nullopt` EOS;
-  zero-row batches remain data. It validates the envelope against the imported
-  batch, sends each result directly to a sink without an unbounded queue, and
-  calls source cancellation on source, import, validation, or sink failure.
-  An adapter may translate an `ArrowArrayStream` one batch at a time, but no
-  public Fragment Arrow-input API or Paimon/DuckLake reader is introduced here.
+- `import_arrow_host()` converts an owned Arrow C Data record batch to independent
+  GPU columns using the caller's device resource and retirement lane. Its producer,
+  admission and lifetime requirements are described below.
 
-The qualified `arrow_push_queue` takes the existing per-scan
-`scan_task_batch_size` as a positive finite hard envelope. Before creating a root,
-the logical producer acquires one shared `offered_slot` across all submitting
-threads. Two accepted roots may be retained, including zero-row roots; dequeuing
-does not return a root credit. A capacity wait retains the single offered root.
-The final input owner returns the credit after release callbacks, source leases
-and staging have retired. `finish`, `fail`, cancellation and returned capacity
-wake waiters; pending input is distinct from EOS. Legacy affine producers retain
-their serial gate through final ownership release.
+### Arrow input contract
 
-Admission checks the whole retained parent allocations, control storage, rounded
-host allocation charge, normalization and private destination together against
-the envelope. Source slice offsets remain 64-bit; destination row admission uses
-cuDF's row limit. Valid row/byte overflow is `arrow_batch_too_large` in the
-`resource` family; unavailable bounds are `arrow_envelope_unavailable`.
-Malformed schema/layout/extent or destination character representation is
-`physical_input`. Observations report unique retained parent bytes separately
-from conservative per-root reservations. Device source affinity is carried through
-scan metadata, composite inputs and task construction.
+The qualified flat profile accepts BOOL, signed/unsigned integers, FLOAT32/64,
+UTF8/large UTF8, DATE32, timezone-free timestamps (s/ms/us/ns), and DECIMAL128
+(precision 1–38). Timestamp units and decimal unscaled values are preserved;
+decimal scale may be negative or greater than precision, provided its negation
+fits cuDF's signed 32-bit scale. Decimal values must fit the declared precision.
+Nested, dictionary, extension, binary and view columns are refused; the root
+record-batch struct is allowed.
 
-`arrow_import_ingestible` returns an authoritative `arrow_import` execution
-record for the raw imported table: logical schema complete, no file visibility
-requirements, no predicate enforcement or projection claimed. The real scan
-operator passes that record to `post_filter_and_project`, which checks its
-contract, generation, ordered layout and visibility requirement identity before
-performing remaining filtering/projection. Both raw and completed records are
-observable by tests. Retry retains the same input; the streaming source's existing
-replay policy remains the authority for refusing CPU replay.
+Planning binds names, nullability, Arrow storage formats and destination types in
+`arrow_bound_schema`. Each batch supplies an `arrow_source_profile` with full
+parent allocation identities/extents, buffer spans, selected string windows,
+control backing (including spare capacity), lifetime leases, and either completed
+production or a retained readiness event. C Data descriptors stay on the host.
+Every non-null schema metadata buffer requires a trusted readable byte length in
+`arrow_metadata_lengths`; embedded lengths alone cannot prove its extent.
+
+| Payload placement | Validation and conversion |
+|---|---|
+| Device | Wait on readiness in the task stream; validate on-device, copy D2D, and normalize booleans, masks and offsets with kernels. No host payload staging. |
+| Pinned host | Join readiness before CPU inspection; normalize in charged pinned storage and copy H2D. |
+| Pageable host | As above, with an additional charged pinned payload copy. |
+
+Source offsets remain 64-bit where declared. String conversion rebases the selected
+character window to INT32 offsets: a large parent origin is allowed, but the
+selected character count must fit. String batches also need one extra destination
+offset, so their row limit is one less than cuDF's maximum row count. An absent
+bitmap with unknown null count means all-valid; positive null counts require a bitmap.
+Zero-row batches remain data; zero-column batches retain their row count.
+
+`arrow_push_queue` uses the positive finite `scan_task_batch_size` as its hard byte
+envelope. Acquire the single shared `offered_slot` before creating a root. At most
+two accepted roots plus one offered root may remain live, including empty batches.
+Dequeue does not return credits; the final owner returns them after callbacks,
+leases and staging retire. Capacity and terminal transitions wake waiters;
+`finish()` drains queued input before EOS. Admission charges full parents, control
+storage, rounded pinned staging/normalization and private destination storage.
+Unique retained parent bytes are reported separately from per-root reservations.
+These input credits do not bound downstream output retention.
+
+Schema/layout/extent errors are `physical_input`. Valid row/byte excess is
+`resource / arrow_batch_too_large`; unavailable or overflowing envelopes are
+`resource / arrow_envelope_unavailable`. Required source devices are checked before
+scan input publication, and the scheduler refuses devices without an executor.
+
+Inputs stay immutable and keep their leases through source readiness, asynchronous
+reads and retries. Cancellation, failure and abandoned offers also wait for source
+readiness before release callbacks; unconfirmed completion retains ownership and
+the root's offered or accepted credit.
+Callbacks must be thread-neutral and run outside queue locks. The staging owner
+keeps its PMR alive through deallocation. After destroying outputs or unwinding,
+the caller must `lane.quiesce()` before releasing the stream, output allocator or
+backing reservation, or allowing CPU replay. A failed barrier never authorizes release.
+
+`arrow_import_ingestible` reuses the shared producer/coordinator path. Its raw
+execution record reports schema completion and no file-visibility requirements;
+the scan consumer validates contract, generation, layout and requirements before
+finishing filtering/projection. Retry keeps the same input. Legacy affine producers
+retain their serial gate until final input release; their trusted-host entry point
+remains available without a source profile.
+
+`materialize_arrow_stream()` verifies a sequential source with contiguous batch
+numbers and declared row/byte bounds, delivering directly to a bounded sink.
+Only `nullopt` means EOS; any source, import, validation or sink failure cancels the
+source. An adapter can bridge `ArrowArrayStream`, but these helpers add no public
+Fragment Arrow-input API or Paimon/DuckLake reader.
 
 A direct GPU reader can supply an owning batch to the same validator and finish
 without an Arrow or CPU-vector round trip. These helpers do not register a new SQL

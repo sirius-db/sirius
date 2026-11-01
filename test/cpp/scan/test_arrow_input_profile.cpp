@@ -149,6 +149,33 @@ TEST_CASE("Arrow string windows check rebased size without allocating their char
   CHECK_THROWS_AS(source[INT64_MAX], std::invalid_argument);
 }
 
+TEST_CASE("Arrow offset iteration checks the whole address window before visiting values",
+          "[arrow_profile][materialization]")
+{
+  auto large = GENERATE(false, true);
+  std::array<int64_t, 3> wide{7, 9, 12};
+  std::array<int32_t, 3> narrow{7, 9, 12};
+  std::array<std::byte, sizeof(wide) + 1> unaligned{};
+  std::memcpy(unaligned.data() + 1,
+              large ? static_cast<void const*>(wide.data()) : narrow.data(),
+              large ? sizeof(wide) : sizeof(narrow));
+  detail::arrow_string_offsets offsets(large ? "U" : "u", unaligned.data() + 1);
+  std::vector<int64_t> actual;
+  offsets.for_each(1, 2, [&](int64_t index, int64_t value) {
+    CHECK(index == static_cast<int64_t>(actual.size()) + 1);
+    actual.push_back(value);
+  });
+  CHECK(actual == std::vector<int64_t>{9, 12});
+  int visits = 0;
+  auto count = [&](int64_t, int64_t) { ++visits; };
+  CHECK_THROWS_AS(offsets.for_each(-1, 2, count), std::invalid_argument);
+  CHECK_THROWS_AS(offsets.for_each(2, 1, count), std::invalid_argument);
+  CHECK_THROWS_AS(offsets.for_each(0, INT64_MAX, count), std::invalid_argument);
+  detail::arrow_string_offsets missing(large ? "U" : "u", nullptr);
+  CHECK_THROWS_AS(missing.for_each(0, 0, count), std::invalid_argument);
+  CHECK(visits == 0);
+}
+
 TEST_CASE("Arrow large UTF8 validates the selected window and estimates destination storage",
           "[arrow_profile][materialization]")
 {

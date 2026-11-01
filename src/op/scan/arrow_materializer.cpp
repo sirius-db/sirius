@@ -18,6 +18,7 @@
 #include <charconv>
 #include <cstring>
 #include <limits>
+#include <new>
 #include <stdexcept>
 #include <string_view>
 
@@ -54,6 +55,25 @@ void owned_arrow_batch::bind_credit(std::shared_ptr<void> value)
 }
 owned_arrow_batch::~owned_arrow_batch()
 {
+  if (source && source->ready_event && cudaEventSynchronize(source->ready_event) != cudaSuccess) {
+    // Unconfirmed source writes require retaining callbacks, backing and credits.
+    struct retained_input {
+      ArrowSchema schema;
+      ArrowArray array;
+      std::shared_ptr<void> credit, staging, capacity;
+      arrow_metadata_lengths lengths;
+      std::shared_ptr<arrow_source_profile const> source;
+    };
+    auto* retained = new (std::nothrow) retained_input{schema,
+                                                       array,
+                                                       std::move(credit),
+                                                       std::move(staging_owner),
+                                                       std::move(capacity),
+                                                       std::move(metadata_lengths),
+                                                       std::move(source)};
+    if (!retained) std::terminate();
+    return;
+  }
   if (array.release) array.release(&array);
   if (schema.release) schema.release(&schema);
 }
@@ -94,8 +114,7 @@ cudf::data_type type_for(std::string_view f)
          std::string_view(s.ptr, f.data() + f.size() - s.ptr) != ",128") ||
         precision < 1 || precision > 38 || scale == std::numeric_limits<int32_t>::min())
       invalid();
-    // Arrow's scale may be negative or greater than precision. Import preserves
-    // the unscaled integer; only negation into cuDF's scale must be representable.
+    // Preserve the unscaled integer; cuDF stores the negated Arrow scale.
     return cudf::data_type{T::DECIMAL128, -scale};
   }
   invalid();
@@ -156,8 +175,10 @@ void normalize_columns(normalized_batch& batch,
       if (array.length) {
         detail::arrow_string_offsets offsets(schema.children[i]->format, child.buffers[1]);
         auto first = offsets[begin];
-        for (int64_t row = 0; row <= array.length; ++row)
-          column.offsets[row] = detail::arrow_string_window_size(first, offsets[begin + row]);
+        // Validated monotonic offsets fit the representable full window.
+        offsets.for_each(begin, end, [&](int64_t row, int64_t offset) {
+          column.offsets[row - begin] = static_cast<int32_t>(offset - first);
+        });
         if (column.offsets.back())
           column.source = static_cast<uint8_t const*>(child.buffers[2]) + first;
       }
@@ -318,7 +339,8 @@ std::vector<cudf::data_type> validate_flat(ArrowSchema const& schema,
       invalid();
     auto type    = type_for(s.format);
     bool strings = type.id() == cudf::type_id::STRING;
-    if (strings && array.length >= std::numeric_limits<cudf::size_type>::max()) invalid();
+    if (payload && strings && array.length >= std::numeric_limits<cudf::size_type>::max())
+      invalid();
     if (a.n_buffers != (strings ? 3 : 2)) invalid();
     if (array.length && !a.buffers[1]) invalid();
     auto const begin = a.offset + array.offset;
@@ -333,11 +355,14 @@ std::vector<cudf::data_type> validate_flat(ArrowSchema const& schema,
       invalid();
     if (strings && array.length) {
       detail::arrow_string_offsets offsets(s.format, a.buffers[1]);
-      if (array.length == std::numeric_limits<cudf::size_type>::max() || offsets[begin] < 0)
-        invalid();
-      for (auto row = begin; row < end; ++row)
-        if (offsets[row + 1] < offsets[row]) invalid();
-      auto bytes = detail::arrow_string_window_size(offsets[begin], offsets[end]);
+      auto first = offsets[begin];
+      if (array.length == std::numeric_limits<cudf::size_type>::max() || first < 0) invalid();
+      auto previous = first;
+      offsets.for_each(begin, end, [&](int64_t, int64_t value) {
+        if (value < previous) invalid();
+        previous = value;
+      });
+      auto bytes = detail::arrow_string_window_size(first, previous);
       if (bytes && !a.buffers[2]) invalid();
     } else if (type.id() == cudf::type_id::DECIMAL128) {
       int precision = 0;
@@ -380,8 +405,7 @@ uint64_t checked_mul(uint64_t a, uint64_t b)
 }
 uint64_t mask_bytes(uint64_t rows)
 {
-  // cuDF pads validity to 64 bytes. Metadata preflight must not narrow rows
-  // before the separate R_max admission check has classified an oversized root.
+  // Pad to 64 bytes without narrowing rows before admission.
   return checked_mul(checked_add(rows, 511) / 512, 64);
 }
 std::string canonical_format(std::string_view format)
@@ -474,8 +498,7 @@ arrow_input_estimate validate_arrow_source(ArrowSchema const& schema,
                                    sizeof(ArrowArray) + sizeof(ArrowSchema) + 256);
   estimate.control = checked_add(
     estimate.control, checked_mul(profile.allocations.capacity(), sizeof(arrow_allocation)));
-  // Queue bookkeeping retains another allocation description. Count capacities
-  // of the supplied vectors as well as their populated entries.
+  // Charge queue copies and spare descriptor capacity.
   estimate.control = checked_add(
     estimate.control, checked_mul(profile.allocations.size(), 2 * sizeof(arrow_allocation)));
   estimate.control = checked_add(
@@ -572,8 +595,7 @@ std::vector<cudf::data_type> owned_arrow_batch::input_types() const
 arrow_input_estimate owned_arrow_batch::estimate() const
 {
   if (!source) throw std::logic_error("Arrow estimate requires an allocation profile");
-  // This descriptor is used for sizing only. validate_for separately compares
-  // every batch, including the first, against the planning-owned binding.
+  // Sizing only; validate_for checks the planning-owned binding.
   arrow_bound_schema actual;
   auto types = input_types();
   for (size_t i = 0; i < types.size(); ++i) {
@@ -643,6 +665,14 @@ void owned_arrow_batch::validate_for(materialization_program const& program) con
       throw std::invalid_argument(
         "arrow_schema_drift: Arrow decimal precision does not match its bound program");
   }
+  if (source && (array.length > std::numeric_limits<cudf::size_type>::max() ||
+                 (array.length == std::numeric_limits<cudf::size_type>::max() &&
+                  std::any_of(types.begin(), types.end(), [](auto type) {
+                    return type.id() == cudf::type_id::STRING;
+                  }))))
+    throw transparent::classified_execution_error(
+      transparent::late_failure_cause::resource,
+      "arrow_batch_too_large: Arrow rows exceed the destination row or string-offset limit");
 }
 
 materialized_batch import_arrow_host(std::shared_ptr<owned_arrow_batch> input,
@@ -653,15 +683,10 @@ materialized_batch import_arrow_host(std::shared_ptr<owned_arrow_batch> input,
   if (!input || !input->capacity || !program.contract || !program.generation)
     throw std::invalid_argument("Arrow import requires admitted input and program");
   input->validate_for(program);
-  if (input->array.length > std::numeric_limits<cudf::size_type>::max())
-    throw transparent::classified_execution_error(
-      transparent::late_failure_cause::resource,
-      "arrow_batch_too_large: Arrow rows exceed the destination row limit");
   auto const& types  = *program.input_types;
   auto const* source = input->source.get();
   auto normalized    = std::make_shared<normalized_batch>(input, *input->staging_resource);
-  // The synchronous legacy host path can fail normalization without submitting
-  // any work or retaining a lane ticket.
+  // Legacy normalization can fail before any lane submission.
   if (!source)
     normalize_columns(*normalized, input->schema, input->array, types, *input->staging_resource);
   auto submission = lane.begin();
