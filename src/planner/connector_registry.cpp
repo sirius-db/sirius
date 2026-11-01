@@ -785,29 +785,6 @@ void register_scan_source_callbacks(duckdb::DatabaseInstance& db)
   initialize_ducklake_callbacks(db);
 }
 
-bool verified_parquet_interface(duckdb::FunctionData const* data, duckdb::ClientContext& context)
-{
-  auto const* bind = dynamic_cast<duckdb::MultiFileBindData const*>(data);
-  auto const* wrapper =
-    bind ? dynamic_cast<duckdb::TableFunctionMultiFileWrapper const*>(bind->interface.get())
-         : nullptr;
-  if (!wrapper) return false;
-  auto& db         = duckdb::DatabaseInstance::GetDatabase(context);
-  auto const* host = detail::host_code_address(duckdb::Catalog::GetSystemCatalog(db));
-  // The host exports its registration entry point, but may hide individual Parquet
-  // factories. Resolve the nested reader through the same independent catalog used
-  // for top-level callbacks, never through the caller's mutable catalog.
-  static accepted_callbacks cache;
-  std::lock_guard lock(cache.mutex);
-  auto const& references = cache.reference.get_or_resolve(
-    host, [&] { return parquet_reference_functions(db, "parquet_scan", true); });
-  duckdb::TableFunctionMultiFileInfo candidate(wrapper->function, wrapper->settings);
-  for (auto const& reference : references) {
-    if (verified_callbacks(reference).matches_info(&candidate, 0)) return true;
-  }
-  return false;
-}
-
 template <class Function>
 lookup_outcome lookup_connector_classified_impl(Function const& function,
                                                 duckdb::FunctionData const* bind,
